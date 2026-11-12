@@ -1,0 +1,330 @@
+## binding-root-proxy-used-in-segment
+file MODULE.bazel
+file .socket/bazel/socket-patch.MODULE.bazel <- MODULE.bazel:7
+module Some("s2") repo_name=None
+proxy #0 ext = //tools:ext.bzl%ext of root (MODULE.bazel:3)
+tag #0 repo(name=a)
+import #0 a = a
+gap Everything .socket/bazel/socket-patch.MODULE.bazel:3: the extension proxy of `use_repo` is computed; write it as a literal
+
+## binding-same-variable-name-both-files
+file MODULE.bazel
+file .socket/bazel/socket-patch.MODULE.bazel <- MODULE.bazel:7
+module Some("s2") repo_name=None
+proxy #0 ext = //tools:ext.bzl%ext of root (MODULE.bazel:3)
+proxy #1 ext = //tools:ext.bzl%ext of root (.socket/bazel/socket-patch.MODULE.bazel:2)
+tag #0 repo(name=a)
+tag #1 repo(name=b)
+import #0 a = a
+import #1 b = b
+
+## binding-segment-proxy-used-in-root
+file MODULE.bazel
+file .socket/bazel/socket-patch.MODULE.bazel <- MODULE.bazel:3
+module Some("s2") repo_name=None
+proxy #0 socket_patch_ext = //tools:ext.bzl%ext of root (.socket/bazel/socket-patch.MODULE.bazel:2)
+tag #0 repo(name=b)
+import #0 b = b
+
+## clash-bazel_dep-twice
+file MODULE.bazel
+file .socket/bazel/socket-patch.MODULE.bazel <- MODULE.bazel:9
+module Some("s2") repo_name=None
+dep rules_x@1.0 as Some("rules_x") (MODULE.bazel:3)
+dep rules_x@1.0 as Some("rules_x") (.socket/bazel/socket-patch.MODULE.bazel:2)
+LocalPath override of rules_x (MODULE.bazel:4)
+
+## clash-renamed-import-ok
+file MODULE.bazel
+file .socket/bazel/socket-patch.MODULE.bazel <- MODULE.bazel:7
+module Some("s2") repo_name=None
+proxy #0 ext = //tools:ext.bzl%ext of root (MODULE.bazel:3)
+proxy #1 socket_patch_ext = //tools:ext.bzl%ext of root (.socket/bazel/socket-patch.MODULE.bazel:2)
+tag #0 repo(name=a)
+import #0 a = a
+import #1 socket_patch_a = a
+
+## clash-repo-rule-vs-bazel_dep
+file MODULE.bazel
+file .socket/bazel/socket-patch.MODULE.bazel <- MODULE.bazel:9
+module Some("s2") repo_name=None
+dep rules_x@1.0 as Some("rules_x") (MODULE.bazel:3)
+rule socket_repo = //.socket/bazel:repo.bzl%socket_repo
+repo Some("rules_x") by socket_repo
+LocalPath override of rules_x (MODULE.bazel:4)
+
+## clash-same-repo-use_repo
+file MODULE.bazel
+file .socket/bazel/socket-patch.MODULE.bazel <- MODULE.bazel:7
+module Some("s2") repo_name=None
+proxy #0 ext = //tools:ext.bzl%ext of root (MODULE.bazel:3)
+proxy #1 socket_patch_ext = //tools:ext.bzl%ext of root (.socket/bazel/socket-patch.MODULE.bazel:2)
+tag #0 repo(name=a)
+import #0 a = a
+import #1 a = a
+
+## dev-root-dev-segment-nondev
+file MODULE.bazel
+file .socket/bazel/socket-patch.MODULE.bazel <- MODULE.bazel:7
+module Some("s2") repo_name=None
+proxy #0 ext = //tools:ext.bzl%ext of root dev (MODULE.bazel:3)
+proxy #1 socket_patch_ext = //tools:ext.bzl%ext of root (.socket/bazel/socket-patch.MODULE.bazel:2)
+tag #0 repo(name=a) dev
+tag #1 repo(name=b)
+import #0 a = a dev
+import #1 b = b
+
+## dev-root-dev-segment-nondev+ignore_dev
+file MODULE.bazel
+file .socket/bazel/socket-patch.MODULE.bazel <- MODULE.bazel:7
+module Some("s2") repo_name=None
+proxy #0 ext = //tools:ext.bzl%ext of root dev (MODULE.bazel:3)
+proxy #1 socket_patch_ext = //tools:ext.bzl%ext of root (.socket/bazel/socket-patch.MODULE.bazel:2)
+tag #0 repo(name=a) dev
+tag #1 repo(name=b)
+import #0 a = a dev
+import #1 b = b
+
+## inject_repo-from-segment
+file MODULE.bazel
+file .socket/bazel/socket-patch.MODULE.bazel <- MODULE.bazel:7
+module Some("s2") repo_name=None
+proxy #0 ext = //tools:ext.bzl%ext of root (MODULE.bazel:3)
+proxy #1 socket_patch_ext = //tools:ext.bzl%ext of root (.socket/bazel/socket-patch.MODULE.bazel:6)
+tag #0 repo(name=a)
+import #0 a = a
+inject #1 injected with socket_patch_a
+rule socket_repo = //.socket/bazel:repo.bzl%socket_repo
+repo Some("socket_patch_a") by socket_repo
+
+## isolate-root-isolated-segment-not
+file MODULE.bazel
+file .socket/bazel/socket-patch.MODULE.bazel <- MODULE.bazel:7
+module Some("s2") repo_name=None
+proxy #0 ext = //tools:ext.bzl%ext of root isolate (MODULE.bazel:3)
+proxy #1 socket_patch_ext = //tools:ext.bzl%ext of root (.socket/bazel/socket-patch.MODULE.bazel:2)
+tag #0 repo(name=a)
+tag #1 repo(name=b)
+import #0 a = a
+import #1 b = b
+
+## merge-basic
+file MODULE.bazel
+file .socket/bazel/socket-patch.MODULE.bazel <- MODULE.bazel:7
+module Some("s2") repo_name=None
+proxy #0 ext = //tools:ext.bzl%ext of root (MODULE.bazel:3)
+proxy #1 socket_patch_ext = //tools:ext.bzl%ext of root (.socket/bazel/socket-patch.MODULE.bazel:2)
+tag #0 repo(name=a)
+tag #1 repo(name=b)
+import #0 a = a
+import #1 b = b
+
+## override-duplicate-root-and-segment
+file MODULE.bazel
+file .socket/bazel/socket-patch.MODULE.bazel <- MODULE.bazel:9
+module Some("s2") repo_name=None
+dep rules_x@1.0 as Some("rules_x") (MODULE.bazel:3)
+LocalPath override of rules_x (MODULE.bazel:4)
+LocalPath override of rules_x (.socket/bazel/socket-patch.MODULE.bazel:2)
+
+## override-local_path-in-segment-dep-in-root
+file MODULE.bazel
+file .socket/bazel/socket-patch.MODULE.bazel <- MODULE.bazel:5
+module Some("s2") repo_name=None
+dep rules_x@1.0 as Some("rules_x") (MODULE.bazel:3)
+LocalPath override of rules_x (.socket/bazel/socket-patch.MODULE.bazel:2)
+
+## override_repo-duplicate-root-and-segment
+file MODULE.bazel
+file .socket/bazel/socket-patch.MODULE.bazel <- MODULE.bazel:12
+module Some("s2") repo_name=None
+proxy #0 ext = //tools:ext.bzl%ext of root (MODULE.bazel:3)
+proxy #1 socket_patch_ext = //tools:ext.bzl%ext of root (.socket/bazel/socket-patch.MODULE.bazel:6)
+tag #0 repo(name=a)
+import #0 a = a
+override #0 a with mine
+override #1 a with socket_patch_a
+rule socket_repo = //.socket/bazel:repo.bzl%socket_repo
+rule socket_repo = //.socket/bazel:repo.bzl%socket_repo
+repo Some("mine") by socket_repo
+repo Some("socket_patch_a") by socket_repo
+
+## override_repo-from-segment
+file MODULE.bazel
+file .socket/bazel/socket-patch.MODULE.bazel <- MODULE.bazel:7
+module Some("s2") repo_name=None
+proxy #0 ext = //tools:ext.bzl%ext of root (MODULE.bazel:3)
+proxy #1 socket_patch_ext = //tools:ext.bzl%ext of root (.socket/bazel/socket-patch.MODULE.bazel:6)
+tag #0 repo(name=a)
+import #0 a = a
+override #1 a with socket_patch_a
+rule socket_repo = //.socket/bazel:repo.bzl%socket_repo
+repo Some("socket_patch_a") by socket_repo
+
+## override_repo-on-7.2-7.3
+file MODULE.bazel
+file .socket/bazel/socket-patch.MODULE.bazel <- MODULE.bazel:7
+module Some("s2") repo_name=None
+proxy #0 ext = //tools:ext.bzl%ext of root (MODULE.bazel:3)
+proxy #1 socket_patch_ext = //tools:ext.bzl%ext of root (.socket/bazel/socket-patch.MODULE.bazel:6)
+tag #0 repo(name=a)
+import #0 a = a
+override #1 a with socket_patch_a
+rule socket_repo = //.socket/bazel:repo.bzl%socket_repo
+repo Some("socket_patch_a") by socket_repo
+
+## override_repo-unknown-repo
+file MODULE.bazel
+file .socket/bazel/socket-patch.MODULE.bazel <- MODULE.bazel:7
+module Some("s2") repo_name=None
+proxy #0 ext = //tools:ext.bzl%ext of root (MODULE.bazel:3)
+proxy #1 socket_patch_ext = //tools:ext.bzl%ext of root (.socket/bazel/socket-patch.MODULE.bazel:6)
+tag #0 repo(name=a)
+import #0 a = a
+override #1 nosuch with socket_patch_a
+rule socket_repo = //.socket/bazel:repo.bzl%socket_repo
+repo Some("socket_patch_a") by socket_repo
+
+## rx-canonical-plus
+file MODULE.bazel
+file .socket/bazel/socket-patch.MODULE.bazel <- MODULE.bazel:13
+module Some("s2") repo_name=None
+dep rules_x@1.0 as Some("rx") (MODULE.bazel:3)
+proxy #0 ext = @rx//:ext.bzl%ext of rules_x (MODULE.bazel:9)
+proxy #1 socket_patch_ext = @@rules_x+//:ext.bzl%ext of ? (.socket/bazel/socket-patch.MODULE.bazel:2)
+tag #0 repo(name=a)
+tag #1 repo(name=b)
+import #0 a = a
+import #1 b = b
+LocalPath override of rules_x (MODULE.bazel:4)
+
+## rx-canonical-tilde
+file MODULE.bazel
+file .socket/bazel/socket-patch.MODULE.bazel <- MODULE.bazel:13
+module Some("s2") repo_name=None
+dep rules_x@1.0 as Some("rx") (MODULE.bazel:3)
+proxy #0 ext = @rx//:ext.bzl%ext of rules_x (MODULE.bazel:9)
+proxy #1 socket_patch_ext = @@rules_x~//:ext.bzl%ext of ? (.socket/bazel/socket-patch.MODULE.bazel:2)
+tag #0 repo(name=a)
+tag #1 repo(name=b)
+import #0 a = a
+import #1 b = b
+LocalPath override of rules_x (MODULE.bazel:4)
+
+## rx-module-name-not-apparent
+file MODULE.bazel
+file .socket/bazel/socket-patch.MODULE.bazel <- MODULE.bazel:13
+module Some("s2") repo_name=None
+dep rules_x@1.0 as Some("rx") (MODULE.bazel:3)
+proxy #0 ext = @rx//:ext.bzl%ext of rules_x (MODULE.bazel:9)
+proxy #1 socket_patch_ext = @rules_x//:ext.bzl%ext of ? (.socket/bazel/socket-patch.MODULE.bazel:2)
+tag #0 repo(name=a)
+tag #1 repo(name=b)
+import #0 a = a
+import #1 b = b
+LocalPath override of rules_x (MODULE.bazel:4)
+
+## rx-same-apparent-name
+file MODULE.bazel
+file .socket/bazel/socket-patch.MODULE.bazel <- MODULE.bazel:13
+module Some("s2") repo_name=None
+dep rules_x@1.0 as Some("rx") (MODULE.bazel:3)
+proxy #0 ext = @rx//:ext.bzl%ext of rules_x (MODULE.bazel:9)
+proxy #1 socket_patch_ext = @rx//:ext.bzl%ext of rules_x (.socket/bazel/socket-patch.MODULE.bazel:2)
+tag #0 repo(name=a)
+tag #1 repo(name=b)
+import #0 a = a
+import #1 b = b
+LocalPath override of rules_x (MODULE.bazel:4)
+
+## rx-second-bazel_dep-in-segment
+file MODULE.bazel
+file .socket/bazel/socket-patch.MODULE.bazel <- MODULE.bazel:13
+module Some("s2") repo_name=None
+dep rules_x@1.0 as Some("rx") (MODULE.bazel:3)
+dep rules_x@1.0 as Some("rules_x") (.socket/bazel/socket-patch.MODULE.bazel:2)
+proxy #0 ext = @rx//:ext.bzl%ext of rules_x (MODULE.bazel:9)
+proxy #1 socket_patch_ext = @rules_x//:ext.bzl%ext of rules_x (.socket/bazel/socket-patch.MODULE.bazel:3)
+tag #0 repo(name=a)
+tag #1 repo(name=b)
+import #0 a = a
+import #1 b = b
+LocalPath override of rules_x (MODULE.bazel:4)
+
+## segment-imports-root-generated-repo-not-imported-by-root
+file MODULE.bazel
+file .socket/bazel/socket-patch.MODULE.bazel <- MODULE.bazel:6
+module Some("s2") repo_name=None
+proxy #0 ext = //tools:ext.bzl%ext of root (MODULE.bazel:3)
+proxy #1 socket_patch_ext = //tools:ext.bzl%ext of root (.socket/bazel/socket-patch.MODULE.bazel:2)
+tag #0 repo(name=a)
+import #1 a = a
+
+## spelling-//tools:ext.bzl-vs-//tools/ext.bzl-pkgless
+file MODULE.bazel
+file .socket/bazel/socket-patch.MODULE.bazel <- MODULE.bazel:7
+module Some("s2") repo_name=None
+proxy #0 ext = //tools:ext.bzl%ext of root (MODULE.bazel:3)
+proxy #1 socket_patch_ext = :tools/ext.bzl%ext of root (.socket/bazel/socket-patch.MODULE.bazel:2)
+tag #0 repo(name=a)
+tag #1 repo(name=b)
+import #0 a = a
+import #1 b = b
+
+## spelling-@//
+file MODULE.bazel
+file .socket/bazel/socket-patch.MODULE.bazel <- MODULE.bazel:7
+module Some("s2") repo_name=None
+proxy #0 ext = //tools:ext.bzl%ext of root (MODULE.bazel:3)
+proxy #1 socket_patch_ext = @//tools:ext.bzl%ext of root (.socket/bazel/socket-patch.MODULE.bazel:2)
+tag #0 repo(name=a)
+tag #1 repo(name=b)
+import #0 a = a
+import #1 b = b
+
+## spelling-@@//
+file MODULE.bazel
+file .socket/bazel/socket-patch.MODULE.bazel <- MODULE.bazel:7
+module Some("s2") repo_name=None
+proxy #0 ext = //tools:ext.bzl%ext of root (MODULE.bazel:3)
+proxy #1 socket_patch_ext = @@//tools:ext.bzl%ext of root (.socket/bazel/socket-patch.MODULE.bazel:2)
+tag #0 repo(name=a)
+tag #1 repo(name=b)
+import #0 a = a
+import #1 b = b
+
+## spelling-@s2//
+file MODULE.bazel
+file .socket/bazel/socket-patch.MODULE.bazel <- MODULE.bazel:7
+module Some("s2") repo_name=None
+proxy #0 ext = //tools:ext.bzl%ext of root (MODULE.bazel:3)
+proxy #1 socket_patch_ext = @s2//tools:ext.bzl%ext of root (.socket/bazel/socket-patch.MODULE.bazel:2)
+tag #0 repo(name=a)
+tag #1 repo(name=b)
+import #0 a = a
+import #1 b = b
+
+## tag-order-include-first
+file MODULE.bazel
+file .socket/bazel/socket-patch.MODULE.bazel <- MODULE.bazel:3
+module Some("s2") repo_name=None
+proxy #0 socket_patch_ext = //tools:ext.bzl%ext of root (.socket/bazel/socket-patch.MODULE.bazel:2)
+proxy #1 ext = //tools:ext.bzl%ext of root (MODULE.bazel:5)
+tag #0 repo(name=b)
+tag #1 repo(name=a)
+import #0 b = b
+import #1 a = a
+
+## tag-order-include-in-middle
+file MODULE.bazel
+file .socket/bazel/socket-patch.MODULE.bazel <- MODULE.bazel:6
+module Some("s2") repo_name=None
+proxy #0 ext = //tools:ext.bzl%ext of root (MODULE.bazel:3)
+proxy #1 socket_patch_ext = //tools:ext.bzl%ext of root (.socket/bazel/socket-patch.MODULE.bazel:2)
+tag #0 repo(name=a)
+tag #1 repo(name=b)
+tag #0 repo(name=c)
+import #1 b = b
+import #0 a = a
+import #0 c = c
+

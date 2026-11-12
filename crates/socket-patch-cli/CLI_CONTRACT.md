@@ -3134,11 +3134,11 @@ was written", and never contains a grant token.
 | `bazel_workspace_version_unsupported` | planned | `warn` | Bazel 4 or older, or Bazel 5 with Bzlmod. | Upgrade Bazel, or patch outside Bazel. |
 | `bazel_workspace_version_untested` | planned | `info` | The Bazel or ruleset version is floating, unknown or newer than the releases socket-patch was tested with. | Pin `.bazelversion` to a tested release. |
 | `bazel_workspace_above_repo` | planned | `warn` | A Bazel workspace file exists above the repository root, where socket-patch does not read. | Run from the repository that holds the Bazel root. |
-| `bazel_workspace_output_tree_skipped` | planned | `info` | A directory that is a Bazel output base, cache or vendor directory was left out of a walk. | - |
-| `bazel_workspace_inside_output_tree` | planned | `warn` | `apply` ran with its working directory inside a Bazel output tree (not given by `--cwd`). Nothing was patched; the exit code stays 0. | Run from the workspace root, or use hosted mode. |
+| `bazel_workspace_output_tree_skipped` | active | `info` | A directory that is a Bazel output base, cache or vendor directory was left out of a walk. | - |
+| `bazel_workspace_inside_output_tree` | active | `warn` | `apply` ran with its working directory inside a Bazel output tree (not given by `--cwd`). Nothing was patched; the exit code stays 0. | Run from the workspace root, or use hosted mode. |
 | `bazel_workspace_rc_unread` | planned | `info` | An rc file import could not be followed, or a `tools/bazel` wrapper exists, so flags may apply that socket-patch cannot see. Names the path. | - |
-| `bazel_workspace_ignore_line_added` | planned | `info` | A line was added to `.bazelignore` so that a `.socket` tree stays out of `//...`. | Commit `.bazelignore`. |
-| `bazel_workspace_ignore_line_needed` | planned | `warn` | A `.socket` tree is visible to `//...` and `.bazelignore` cannot be written. | Add the printed lines to the printed file. |
+| `bazel_workspace_ignore_line_added` | active | `info` | A line was added to `.bazelignore` so that a `.socket` tree stays out of `//...`. | Commit `.bazelignore`. |
+| `bazel_workspace_ignore_line_needed` | active | `warn` | A `.socket` tree is visible to `//...`, or a new one would be, and the `.bazelignore` line that hides it cannot be written. A tree that is already there is reported and the run goes on. A new tree is not created: this is then the code of the refusal, unless a token names the case (`bazel_agent_go_unsupported` and `vendor_bazel_ruleset_unsupported` below). | Add the printed lines to the printed file. |
 | `bazel_workspace_prune_skipped` | planned | `warn` | `scan --prune` could not tell what a lock that Bazel reads resolves, so the records of that ecosystem were kept. | - |
 | `bazel_workspace_unsupported_in_memory` | planned | - | A warning of the in-memory hosted engine, which prints no line for a human and so has no level: it met an ecosystem that a Bazel ruleset governs and left it alone. | Run `socket-patch scan --mode hosted` from a checkout. |
 
@@ -3147,22 +3147,25 @@ was written", and never contains a grant token.
 | Code | Status | Kind | Level | When | Remedy |
 |---|---|---|---|---|---|
 | `bazel_agent_not_consumed` | planned | advisory | `warn` | An agent command, or `apply --check`, touched an ecosystem that a ruleset governs or may govern. The ruleset builds those packages from its lock, not from the installed tree, so the Bazel build does not get the patch. The installed tree is still patched and the exit code is unchanged. | `socket-patch scan --mode hosted` |
-| `bazel_agent_output_tree` | planned | refusal | - | `scan`, or any command with an explicit `--cwd` or `--global-prefix`, where the scope root or a package path is a Bazel output tree or a link into one. | Run from the workspace root, or use hosted mode. |
-| `bazel_agent_go_unsupported` | planned | refusal | - | A Go directory `replace` that this workspace cannot consume safely. `details.token` is the token the vendored refusal carries. | The remedy of the check that failed. |
+| `bazel_agent_output_tree` | active | refusal | - | `scan`, or any command with an explicit `--cwd` or `--global-prefix`, where the scope root or a package path is a Bazel output tree or a link into one. | Run from the workspace root, or use hosted mode. |
+| `bazel_agent_go_unsupported` | active | refusal | - | A Go directory `replace` that this workspace cannot consume safely. `details.token` is the token the vendored refusal carries. In this release it is reported for one case only: the directory tree of the replace would be created where no `.bazelignore` line can keep it out of `//...`, because several Bazel roots lie above the project (`nested_bazel_roots`) or the Bazel root is outside the repository (`bazel_root_outside_repository`). Every other token of this code is reserved. | The remedy of the check that failed. |
 | `bazel_agent_coursier_pin_hazard` | planned | sidecar advisory | - | An agent-patched Coursier or `~/.m2` jar has a coordinate that a rules_jvm_external hub resolves: a later `@<hub>//:pin` would record the patched jar's digest in the lock. | Do not run `@<hub>//:pin` from this cache; use hosted mode. |
 
 ### Hosted and vendored refusals
 
 Hosted and vendored mode refuse for the same reasons. The code is the mode's prefix
 plus the reason, and `details.token` (one of the [tokens](#tokens) below) names the
-case. A `-` means the mode has no such refusal.
+case. A `-` means the mode has no such refusal. The two `ruleset_unsupported` codes are
+the exception: they have a row each for as long as their statuses differ, and the `-`
+in each of those rows stands for the other mode's code.
 
 | Hosted code | Vendored code | Status | When | Remedy |
 |---|---|---|---|---|
 | `redirect_bazel_consumer_undetermined` | `vendor_bazel_consumer_undetermined` | planned | The ruleset is present and its hub or lock label is not a literal, or a file it needs cannot be read. | Names the statement and the argument to make literal. |
 | `redirect_bazel_mode_ambiguous` | `vendor_bazel_mode_ambiguous` | planned | Bzlmod and WORKSPACE may both be in effect, or the candidate declarations name different locks. | Names both declarations and the rc line. |
 | `redirect_bazel_declaration_inactive` | `vendor_bazel_declaration_inactive` | planned | The only declaration that names the lock is dead, shadowed, not imported or in another module, so Bazel does not read the lock through it. | `--enable_workspace` (Bazel 8) or a migration; the shadowing declaration; the missing `use_repo`. |
-| `redirect_bazel_ruleset_unsupported` | `vendor_bazel_ruleset_unsupported` | planned | socket-patch has no lane for this ruleset shape in this mode, or the lane is not enabled. | The mode that works, else the manual snippet. |
+| `redirect_bazel_ruleset_unsupported` | - | planned | socket-patch has no lane for this ruleset shape in this mode, or the lane is not enabled. | The mode that works, else the manual snippet. |
+| - | `vendor_bazel_ruleset_unsupported` | active | The vendored form of the row above. In this release it is reported for one case only: a vendored directory tree would be created where no `.bazelignore` line can keep it out of `//...`, because several Bazel roots lie above the project (`nested_bazel_roots`) or the Bazel root is outside the repository (`bazel_root_outside_repository`). Every other token of this code is reserved. | The `.bazelignore` lines printed with the refusal, where adding them helps; else the mode that works. |
 | `redirect_bazel_ruleset_version_unsupported` | `vendor_bazel_ruleset_version_unsupported` | planned | A ruleset version requirement is not proven, or the Bazel release line is outside what the lane supports. | Commit `MODULE.bazel.lock`, raise the `bazel_dep`, or pin with `single_version_override`. Names the threshold and the evidence found. |
 | `redirect_bazel_lockfile_frozen` | `vendor_bazel_lockfile_frozen` | planned | The edit would make `MODULE.bazel.lock` stale while `--lockfile_mode=error` is set, which fails every build. | Names the rc line and `bazel mod deps --lockfile_mode=update`; followed by the manual snippet. |
 | `redirect_bazel_pin_bypassed` | `vendor_bazel_pin_bypassed` | planned | A repository override, a vendor directory, `--nofetch` or a replacement declaration makes Bazel take the package from where the pin does not reach. | Remove the override, or patch its target. |

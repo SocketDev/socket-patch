@@ -1,0 +1,442 @@
+{
+ "c01": {
+  "built": "v2",
+  "description": "literal(v2) only",
+  "files": {
+   "WORKSPACE": "workspace(name = \"ws_order\")\n\nload(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")\n\nhttp_archive(\n    name = \"dep\",\n    urls = [\"file:///WS/archives/dep-v2.tar.gz\"],\n    sha256 = \"9dc01da0d21ba44475441de3c06a5ed7415bd1b2f8570d3e9419e272912bf7ae\",\n    strip_prefix = \"dep-v2\",\n)\n",
+   "deps_maybe.bzl": "load(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")\nload(\"@bazel_tools//tools/build_defs/repo:utils.bzl\", \"maybe\")\n\ndef dep_deps():\n    maybe(\n        http_archive,\n        name = \"dep\",\n        urls = [\"file:///WS/archives/dep-v1.tar.gz\"],\n        sha256 = \"b73874449991e5ec4475818559550eb63e0be30a992a5ac72e3194ee85b22910\",\n        strip_prefix = \"dep-v1\",\n    )\n",
+   "deps_plain.bzl": "load(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")\n\ndef dep_deps():\n    http_archive(\n        name = \"dep\",\n        urls = [\"file:///WS/archives/dep-v1.tar.gz\"],\n        sha256 = \"b73874449991e5ec4475818559550eb63e0be30a992a5ac72e3194ee85b22910\",\n        strip_prefix = \"dep-v1\",\n    )\n",
+   "macros/deps.bzl": "load(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")\nload(\"@bazel_tools//tools/build_defs/repo:utils.bzl\", \"maybe\")\n\ndef dep_deps():\n    maybe(\n        http_archive,\n        name = \"dep\",\n        urls = [\"file:///WS/archives/dep-v1.tar.gz\"],\n        sha256 = \"b73874449991e5ec4475818559550eb63e0be30a992a5ac72e3194ee85b22910\",\n        strip_prefix = \"dep-v1\",\n    )\n",
+   "noop.bzl": "def noop():\n    pass\n"
+  },
+  "query_shows": "v2",
+  "repo": "dep",
+  "runs": [
+   "5.4.1",
+   "6.6.0",
+   "6.6.0-bzlmod",
+   "7.7.2",
+   "7.7.2-nobzlmod",
+   "8.8.2-ws",
+   "8.8.2-wsonly"
+  ]
+ },
+ "c02": {
+  "built": "v2",
+  "description": "literal(v1); literal(v2) in one chunk",
+  "files": {
+   "WORKSPACE": "workspace(name = \"ws_order\")\n\nload(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")\n\nhttp_archive(\n    name = \"dep\",\n    urls = [\"file:///WS/archives/dep-v1.tar.gz\"],\n    sha256 = \"b73874449991e5ec4475818559550eb63e0be30a992a5ac72e3194ee85b22910\",\n    strip_prefix = \"dep-v1\",\n)\n\nhttp_archive(\n    name = \"dep\",\n    urls = [\"file:///WS/archives/dep-v2.tar.gz\"],\n    sha256 = \"9dc01da0d21ba44475441de3c06a5ed7415bd1b2f8570d3e9419e272912bf7ae\",\n    strip_prefix = \"dep-v2\",\n)\n",
+   "deps_maybe.bzl": "load(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")\nload(\"@bazel_tools//tools/build_defs/repo:utils.bzl\", \"maybe\")\n\ndef dep_deps():\n    maybe(\n        http_archive,\n        name = \"dep\",\n        urls = [\"file:///WS/archives/dep-v1.tar.gz\"],\n        sha256 = \"b73874449991e5ec4475818559550eb63e0be30a992a5ac72e3194ee85b22910\",\n        strip_prefix = \"dep-v1\",\n    )\n",
+   "deps_plain.bzl": "load(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")\n\ndef dep_deps():\n    http_archive(\n        name = \"dep\",\n        urls = [\"file:///WS/archives/dep-v1.tar.gz\"],\n        sha256 = \"b73874449991e5ec4475818559550eb63e0be30a992a5ac72e3194ee85b22910\",\n        strip_prefix = \"dep-v1\",\n    )\n",
+   "macros/deps.bzl": "load(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")\nload(\"@bazel_tools//tools/build_defs/repo:utils.bzl\", \"maybe\")\n\ndef dep_deps():\n    maybe(\n        http_archive,\n        name = \"dep\",\n        urls = [\"file:///WS/archives/dep-v1.tar.gz\"],\n        sha256 = \"b73874449991e5ec4475818559550eb63e0be30a992a5ac72e3194ee85b22910\",\n        strip_prefix = \"dep-v1\",\n    )\n",
+   "noop.bzl": "def noop():\n    pass\n"
+  },
+  "query_shows": "v2",
+  "repo": "dep",
+  "runs": [
+   "5.4.1",
+   "6.6.0",
+   "6.6.0-bzlmod",
+   "7.7.2",
+   "7.7.2-nobzlmod",
+   "8.8.2-ws",
+   "8.8.2-wsonly"
+  ]
+ },
+ "c03": {
+  "built": "v1",
+  "description": "literal(v1); load; literal(v2) (two chunks)",
+  "files": {
+   "WORKSPACE": "workspace(name = \"ws_order\")\n\nload(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")\n\nhttp_archive(\n    name = \"dep\",\n    urls = [\"file:///WS/archives/dep-v1.tar.gz\"],\n    sha256 = \"b73874449991e5ec4475818559550eb63e0be30a992a5ac72e3194ee85b22910\",\n    strip_prefix = \"dep-v1\",\n)\n\nload(\"//:noop.bzl\", \"noop\")\n\nhttp_archive(\n    name = \"dep\",\n    urls = [\"file:///WS/archives/dep-v2.tar.gz\"],\n    sha256 = \"9dc01da0d21ba44475441de3c06a5ed7415bd1b2f8570d3e9419e272912bf7ae\",\n    strip_prefix = \"dep-v2\",\n)\n",
+   "deps_maybe.bzl": "load(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")\nload(\"@bazel_tools//tools/build_defs/repo:utils.bzl\", \"maybe\")\n\ndef dep_deps():\n    maybe(\n        http_archive,\n        name = \"dep\",\n        urls = [\"file:///WS/archives/dep-v1.tar.gz\"],\n        sha256 = \"b73874449991e5ec4475818559550eb63e0be30a992a5ac72e3194ee85b22910\",\n        strip_prefix = \"dep-v1\",\n    )\n",
+   "deps_plain.bzl": "load(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")\n\ndef dep_deps():\n    http_archive(\n        name = \"dep\",\n        urls = [\"file:///WS/archives/dep-v1.tar.gz\"],\n        sha256 = \"b73874449991e5ec4475818559550eb63e0be30a992a5ac72e3194ee85b22910\",\n        strip_prefix = \"dep-v1\",\n    )\n",
+   "macros/deps.bzl": "load(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")\nload(\"@bazel_tools//tools/build_defs/repo:utils.bzl\", \"maybe\")\n\ndef dep_deps():\n    maybe(\n        http_archive,\n        name = \"dep\",\n        urls = [\"file:///WS/archives/dep-v1.tar.gz\"],\n        sha256 = \"b73874449991e5ec4475818559550eb63e0be30a992a5ac72e3194ee85b22910\",\n        strip_prefix = \"dep-v1\",\n    )\n",
+   "noop.bzl": "def noop():\n    pass\n"
+  },
+  "query_shows": "v2",
+  "repo": "dep",
+  "runs": [
+   "5.4.1",
+   "6.6.0",
+   "6.6.0-bzlmod",
+   "7.7.2",
+   "7.7.2-nobzlmod",
+   "8.8.2-ws",
+   "8.8.2-wsonly"
+  ]
+ },
+ "c04": {
+  "built": "v1",
+  "description": "literal(v1); maybe(v2) in one chunk",
+  "files": {
+   "WORKSPACE": "workspace(name = \"ws_order\")\n\nload(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")\nload(\"@bazel_tools//tools/build_defs/repo:utils.bzl\", \"maybe\")\n\nhttp_archive(\n    name = \"dep\",\n    urls = [\"file:///WS/archives/dep-v1.tar.gz\"],\n    sha256 = \"b73874449991e5ec4475818559550eb63e0be30a992a5ac72e3194ee85b22910\",\n    strip_prefix = \"dep-v1\",\n)\n\nmaybe(\n    http_archive,\n    name = \"dep\",\n    urls = [\"file:///WS/archives/dep-v2.tar.gz\"],\n    sha256 = \"9dc01da0d21ba44475441de3c06a5ed7415bd1b2f8570d3e9419e272912bf7ae\",\n    strip_prefix = \"dep-v2\",\n)\n",
+   "deps_maybe.bzl": "load(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")\nload(\"@bazel_tools//tools/build_defs/repo:utils.bzl\", \"maybe\")\n\ndef dep_deps():\n    maybe(\n        http_archive,\n        name = \"dep\",\n        urls = [\"file:///WS/archives/dep-v1.tar.gz\"],\n        sha256 = \"b73874449991e5ec4475818559550eb63e0be30a992a5ac72e3194ee85b22910\",\n        strip_prefix = \"dep-v1\",\n    )\n",
+   "deps_plain.bzl": "load(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")\n\ndef dep_deps():\n    http_archive(\n        name = \"dep\",\n        urls = [\"file:///WS/archives/dep-v1.tar.gz\"],\n        sha256 = \"b73874449991e5ec4475818559550eb63e0be30a992a5ac72e3194ee85b22910\",\n        strip_prefix = \"dep-v1\",\n    )\n",
+   "macros/deps.bzl": "load(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")\nload(\"@bazel_tools//tools/build_defs/repo:utils.bzl\", \"maybe\")\n\ndef dep_deps():\n    maybe(\n        http_archive,\n        name = \"dep\",\n        urls = [\"file:///WS/archives/dep-v1.tar.gz\"],\n        sha256 = \"b73874449991e5ec4475818559550eb63e0be30a992a5ac72e3194ee85b22910\",\n        strip_prefix = \"dep-v1\",\n    )\n",
+   "noop.bzl": "def noop():\n    pass\n"
+  },
+  "query_shows": "v1",
+  "repo": "dep",
+  "runs": [
+   "5.4.1",
+   "6.6.0",
+   "6.6.0-bzlmod",
+   "7.7.2",
+   "7.7.2-nobzlmod",
+   "8.8.2-ws",
+   "8.8.2-wsonly"
+  ]
+ },
+ "c05": {
+  "built": "v2",
+  "description": "maybe(v1); literal(v2) in one chunk",
+  "files": {
+   "WORKSPACE": "workspace(name = \"ws_order\")\n\nload(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")\nload(\"@bazel_tools//tools/build_defs/repo:utils.bzl\", \"maybe\")\n\nmaybe(\n    http_archive,\n    name = \"dep\",\n    urls = [\"file:///WS/archives/dep-v1.tar.gz\"],\n    sha256 = \"b73874449991e5ec4475818559550eb63e0be30a992a5ac72e3194ee85b22910\",\n    strip_prefix = \"dep-v1\",\n)\n\nhttp_archive(\n    name = \"dep\",\n    urls = [\"file:///WS/archives/dep-v2.tar.gz\"],\n    sha256 = \"9dc01da0d21ba44475441de3c06a5ed7415bd1b2f8570d3e9419e272912bf7ae\",\n    strip_prefix = \"dep-v2\",\n)\n",
+   "deps_maybe.bzl": "load(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")\nload(\"@bazel_tools//tools/build_defs/repo:utils.bzl\", \"maybe\")\n\ndef dep_deps():\n    maybe(\n        http_archive,\n        name = \"dep\",\n        urls = [\"file:///WS/archives/dep-v1.tar.gz\"],\n        sha256 = \"b73874449991e5ec4475818559550eb63e0be30a992a5ac72e3194ee85b22910\",\n        strip_prefix = \"dep-v1\",\n    )\n",
+   "deps_plain.bzl": "load(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")\n\ndef dep_deps():\n    http_archive(\n        name = \"dep\",\n        urls = [\"file:///WS/archives/dep-v1.tar.gz\"],\n        sha256 = \"b73874449991e5ec4475818559550eb63e0be30a992a5ac72e3194ee85b22910\",\n        strip_prefix = \"dep-v1\",\n    )\n",
+   "macros/deps.bzl": "load(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")\nload(\"@bazel_tools//tools/build_defs/repo:utils.bzl\", \"maybe\")\n\ndef dep_deps():\n    maybe(\n        http_archive,\n        name = \"dep\",\n        urls = [\"file:///WS/archives/dep-v1.tar.gz\"],\n        sha256 = \"b73874449991e5ec4475818559550eb63e0be30a992a5ac72e3194ee85b22910\",\n        strip_prefix = \"dep-v1\",\n    )\n",
+   "noop.bzl": "def noop():\n    pass\n"
+  },
+  "query_shows": "v2",
+  "repo": "dep",
+  "runs": [
+   "5.4.1",
+   "6.6.0",
+   "6.6.0-bzlmod",
+   "7.7.2",
+   "7.7.2-nobzlmod",
+   "8.8.2-ws",
+   "8.8.2-wsonly"
+  ]
+ },
+ "c06": {
+  "built": "v1",
+  "description": "maybe(v1); load; literal(v2) (two chunks)",
+  "files": {
+   "WORKSPACE": "workspace(name = \"ws_order\")\n\nload(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")\nload(\"@bazel_tools//tools/build_defs/repo:utils.bzl\", \"maybe\")\n\nmaybe(\n    http_archive,\n    name = \"dep\",\n    urls = [\"file:///WS/archives/dep-v1.tar.gz\"],\n    sha256 = \"b73874449991e5ec4475818559550eb63e0be30a992a5ac72e3194ee85b22910\",\n    strip_prefix = \"dep-v1\",\n)\n\nload(\"//:noop.bzl\", \"noop\")\n\nhttp_archive(\n    name = \"dep\",\n    urls = [\"file:///WS/archives/dep-v2.tar.gz\"],\n    sha256 = \"9dc01da0d21ba44475441de3c06a5ed7415bd1b2f8570d3e9419e272912bf7ae\",\n    strip_prefix = \"dep-v2\",\n)\n",
+   "deps_maybe.bzl": "load(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")\nload(\"@bazel_tools//tools/build_defs/repo:utils.bzl\", \"maybe\")\n\ndef dep_deps():\n    maybe(\n        http_archive,\n        name = \"dep\",\n        urls = [\"file:///WS/archives/dep-v1.tar.gz\"],\n        sha256 = \"b73874449991e5ec4475818559550eb63e0be30a992a5ac72e3194ee85b22910\",\n        strip_prefix = \"dep-v1\",\n    )\n",
+   "deps_plain.bzl": "load(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")\n\ndef dep_deps():\n    http_archive(\n        name = \"dep\",\n        urls = [\"file:///WS/archives/dep-v1.tar.gz\"],\n        sha256 = \"b73874449991e5ec4475818559550eb63e0be30a992a5ac72e3194ee85b22910\",\n        strip_prefix = \"dep-v1\",\n    )\n",
+   "macros/deps.bzl": "load(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")\nload(\"@bazel_tools//tools/build_defs/repo:utils.bzl\", \"maybe\")\n\ndef dep_deps():\n    maybe(\n        http_archive,\n        name = \"dep\",\n        urls = [\"file:///WS/archives/dep-v1.tar.gz\"],\n        sha256 = \"b73874449991e5ec4475818559550eb63e0be30a992a5ac72e3194ee85b22910\",\n        strip_prefix = \"dep-v1\",\n    )\n",
+   "noop.bzl": "def noop():\n    pass\n"
+  },
+  "query_shows": "v2",
+  "repo": "dep",
+  "runs": [
+   "5.4.1",
+   "6.6.0",
+   "6.6.0-bzlmod",
+   "7.7.2",
+   "7.7.2-nobzlmod",
+   "8.8.2-ws",
+   "8.8.2-wsonly"
+  ]
+ },
+ "c07": {
+  "built": "v2",
+  "description": "plain macro(v1); literal(v2) in one chunk",
+  "files": {
+   "WORKSPACE": "workspace(name = \"ws_order\")\n\nload(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")\nload(\"//:deps_plain.bzl\", dep_deps_plain = \"dep_deps\")\n\ndep_deps_plain()\n\nhttp_archive(\n    name = \"dep\",\n    urls = [\"file:///WS/archives/dep-v2.tar.gz\"],\n    sha256 = \"9dc01da0d21ba44475441de3c06a5ed7415bd1b2f8570d3e9419e272912bf7ae\",\n    strip_prefix = \"dep-v2\",\n)\n",
+   "deps_maybe.bzl": "load(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")\nload(\"@bazel_tools//tools/build_defs/repo:utils.bzl\", \"maybe\")\n\ndef dep_deps():\n    maybe(\n        http_archive,\n        name = \"dep\",\n        urls = [\"file:///WS/archives/dep-v1.tar.gz\"],\n        sha256 = \"b73874449991e5ec4475818559550eb63e0be30a992a5ac72e3194ee85b22910\",\n        strip_prefix = \"dep-v1\",\n    )\n",
+   "deps_plain.bzl": "load(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")\n\ndef dep_deps():\n    http_archive(\n        name = \"dep\",\n        urls = [\"file:///WS/archives/dep-v1.tar.gz\"],\n        sha256 = \"b73874449991e5ec4475818559550eb63e0be30a992a5ac72e3194ee85b22910\",\n        strip_prefix = \"dep-v1\",\n    )\n",
+   "macros/deps.bzl": "load(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")\nload(\"@bazel_tools//tools/build_defs/repo:utils.bzl\", \"maybe\")\n\ndef dep_deps():\n    maybe(\n        http_archive,\n        name = \"dep\",\n        urls = [\"file:///WS/archives/dep-v1.tar.gz\"],\n        sha256 = \"b73874449991e5ec4475818559550eb63e0be30a992a5ac72e3194ee85b22910\",\n        strip_prefix = \"dep-v1\",\n    )\n",
+   "noop.bzl": "def noop():\n    pass\n"
+  },
+  "query_shows": "v2",
+  "repo": "dep",
+  "runs": [
+   "5.4.1",
+   "6.6.0",
+   "6.6.0-bzlmod",
+   "7.7.2",
+   "7.7.2-nobzlmod",
+   "8.8.2-ws",
+   "8.8.2-wsonly"
+  ]
+ },
+ "c08": {
+  "built": "v1",
+  "description": "plain macro(v1); load; literal(v2) (two chunks)",
+  "files": {
+   "WORKSPACE": "workspace(name = \"ws_order\")\n\nload(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")\nload(\"//:deps_plain.bzl\", dep_deps_plain = \"dep_deps\")\n\ndep_deps_plain()\n\nload(\"//:noop.bzl\", \"noop\")\n\nhttp_archive(\n    name = \"dep\",\n    urls = [\"file:///WS/archives/dep-v2.tar.gz\"],\n    sha256 = \"9dc01da0d21ba44475441de3c06a5ed7415bd1b2f8570d3e9419e272912bf7ae\",\n    strip_prefix = \"dep-v2\",\n)\n",
+   "deps_maybe.bzl": "load(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")\nload(\"@bazel_tools//tools/build_defs/repo:utils.bzl\", \"maybe\")\n\ndef dep_deps():\n    maybe(\n        http_archive,\n        name = \"dep\",\n        urls = [\"file:///WS/archives/dep-v1.tar.gz\"],\n        sha256 = \"b73874449991e5ec4475818559550eb63e0be30a992a5ac72e3194ee85b22910\",\n        strip_prefix = \"dep-v1\",\n    )\n",
+   "deps_plain.bzl": "load(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")\n\ndef dep_deps():\n    http_archive(\n        name = \"dep\",\n        urls = [\"file:///WS/archives/dep-v1.tar.gz\"],\n        sha256 = \"b73874449991e5ec4475818559550eb63e0be30a992a5ac72e3194ee85b22910\",\n        strip_prefix = \"dep-v1\",\n    )\n",
+   "macros/deps.bzl": "load(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")\nload(\"@bazel_tools//tools/build_defs/repo:utils.bzl\", \"maybe\")\n\ndef dep_deps():\n    maybe(\n        http_archive,\n        name = \"dep\",\n        urls = [\"file:///WS/archives/dep-v1.tar.gz\"],\n        sha256 = \"b73874449991e5ec4475818559550eb63e0be30a992a5ac72e3194ee85b22910\",\n        strip_prefix = \"dep-v1\",\n    )\n",
+   "noop.bzl": "def noop():\n    pass\n"
+  },
+  "query_shows": "v2",
+  "repo": "dep",
+  "runs": [
+   "5.4.1",
+   "6.6.0",
+   "6.6.0-bzlmod",
+   "7.7.2",
+   "7.7.2-nobzlmod",
+   "8.8.2-ws",
+   "8.8.2-wsonly"
+  ]
+ },
+ "c09": {
+  "built": "v2",
+  "description": "literal(v2); load macro; plain macro(v1) (two chunks)",
+  "files": {
+   "WORKSPACE": "workspace(name = \"ws_order\")\n\nload(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")\n\nhttp_archive(\n    name = \"dep\",\n    urls = [\"file:///WS/archives/dep-v2.tar.gz\"],\n    sha256 = \"9dc01da0d21ba44475441de3c06a5ed7415bd1b2f8570d3e9419e272912bf7ae\",\n    strip_prefix = \"dep-v2\",\n)\n\nload(\"//:deps_plain.bzl\", dep_deps_plain = \"dep_deps\")\n\ndep_deps_plain()\n",
+   "deps_maybe.bzl": "load(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")\nload(\"@bazel_tools//tools/build_defs/repo:utils.bzl\", \"maybe\")\n\ndef dep_deps():\n    maybe(\n        http_archive,\n        name = \"dep\",\n        urls = [\"file:///WS/archives/dep-v1.tar.gz\"],\n        sha256 = \"b73874449991e5ec4475818559550eb63e0be30a992a5ac72e3194ee85b22910\",\n        strip_prefix = \"dep-v1\",\n    )\n",
+   "deps_plain.bzl": "load(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")\n\ndef dep_deps():\n    http_archive(\n        name = \"dep\",\n        urls = [\"file:///WS/archives/dep-v1.tar.gz\"],\n        sha256 = \"b73874449991e5ec4475818559550eb63e0be30a992a5ac72e3194ee85b22910\",\n        strip_prefix = \"dep-v1\",\n    )\n",
+   "macros/deps.bzl": "load(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")\nload(\"@bazel_tools//tools/build_defs/repo:utils.bzl\", \"maybe\")\n\ndef dep_deps():\n    maybe(\n        http_archive,\n        name = \"dep\",\n        urls = [\"file:///WS/archives/dep-v1.tar.gz\"],\n        sha256 = \"b73874449991e5ec4475818559550eb63e0be30a992a5ac72e3194ee85b22910\",\n        strip_prefix = \"dep-v1\",\n    )\n",
+   "noop.bzl": "def noop():\n    pass\n"
+  },
+  "query_shows": "v1",
+  "repo": "dep",
+  "runs": [
+   "5.4.1",
+   "6.6.0",
+   "6.6.0-bzlmod",
+   "7.7.2",
+   "7.7.2-nobzlmod",
+   "8.8.2-ws",
+   "8.8.2-wsonly"
+  ]
+ },
+ "c10": {
+  "built": "v1",
+  "description": "literal(v2); plain macro(v1) in one chunk",
+  "files": {
+   "WORKSPACE": "workspace(name = \"ws_order\")\n\nload(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")\nload(\"//:deps_plain.bzl\", dep_deps_plain = \"dep_deps\")\n\nhttp_archive(\n    name = \"dep\",\n    urls = [\"file:///WS/archives/dep-v2.tar.gz\"],\n    sha256 = \"9dc01da0d21ba44475441de3c06a5ed7415bd1b2f8570d3e9419e272912bf7ae\",\n    strip_prefix = \"dep-v2\",\n)\n\ndep_deps_plain()\n",
+   "deps_maybe.bzl": "load(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")\nload(\"@bazel_tools//tools/build_defs/repo:utils.bzl\", \"maybe\")\n\ndef dep_deps():\n    maybe(\n        http_archive,\n        name = \"dep\",\n        urls = [\"file:///WS/archives/dep-v1.tar.gz\"],\n        sha256 = \"b73874449991e5ec4475818559550eb63e0be30a992a5ac72e3194ee85b22910\",\n        strip_prefix = \"dep-v1\",\n    )\n",
+   "deps_plain.bzl": "load(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")\n\ndef dep_deps():\n    http_archive(\n        name = \"dep\",\n        urls = [\"file:///WS/archives/dep-v1.tar.gz\"],\n        sha256 = \"b73874449991e5ec4475818559550eb63e0be30a992a5ac72e3194ee85b22910\",\n        strip_prefix = \"dep-v1\",\n    )\n",
+   "macros/deps.bzl": "load(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")\nload(\"@bazel_tools//tools/build_defs/repo:utils.bzl\", \"maybe\")\n\ndef dep_deps():\n    maybe(\n        http_archive,\n        name = \"dep\",\n        urls = [\"file:///WS/archives/dep-v1.tar.gz\"],\n        sha256 = \"b73874449991e5ec4475818559550eb63e0be30a992a5ac72e3194ee85b22910\",\n        strip_prefix = \"dep-v1\",\n    )\n",
+   "noop.bzl": "def noop():\n    pass\n"
+  },
+  "query_shows": "v1",
+  "repo": "dep",
+  "runs": [
+   "5.4.1",
+   "6.6.0",
+   "6.6.0-bzlmod",
+   "7.7.2",
+   "7.7.2-nobzlmod",
+   "8.8.2-ws",
+   "8.8.2-wsonly"
+  ]
+ },
+ "c11": {
+  "built": "v2",
+  "description": "literal(v2); maybe macro(v1) in one chunk",
+  "files": {
+   "WORKSPACE": "workspace(name = \"ws_order\")\n\nload(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")\nload(\"//:deps_maybe.bzl\", dep_deps_maybe = \"dep_deps\")\n\nhttp_archive(\n    name = \"dep\",\n    urls = [\"file:///WS/archives/dep-v2.tar.gz\"],\n    sha256 = \"9dc01da0d21ba44475441de3c06a5ed7415bd1b2f8570d3e9419e272912bf7ae\",\n    strip_prefix = \"dep-v2\",\n)\n\ndep_deps_maybe()\n",
+   "deps_maybe.bzl": "load(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")\nload(\"@bazel_tools//tools/build_defs/repo:utils.bzl\", \"maybe\")\n\ndef dep_deps():\n    maybe(\n        http_archive,\n        name = \"dep\",\n        urls = [\"file:///WS/archives/dep-v1.tar.gz\"],\n        sha256 = \"b73874449991e5ec4475818559550eb63e0be30a992a5ac72e3194ee85b22910\",\n        strip_prefix = \"dep-v1\",\n    )\n",
+   "deps_plain.bzl": "load(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")\n\ndef dep_deps():\n    http_archive(\n        name = \"dep\",\n        urls = [\"file:///WS/archives/dep-v1.tar.gz\"],\n        sha256 = \"b73874449991e5ec4475818559550eb63e0be30a992a5ac72e3194ee85b22910\",\n        strip_prefix = \"dep-v1\",\n    )\n",
+   "macros/deps.bzl": "load(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")\nload(\"@bazel_tools//tools/build_defs/repo:utils.bzl\", \"maybe\")\n\ndef dep_deps():\n    maybe(\n        http_archive,\n        name = \"dep\",\n        urls = [\"file:///WS/archives/dep-v1.tar.gz\"],\n        sha256 = \"b73874449991e5ec4475818559550eb63e0be30a992a5ac72e3194ee85b22910\",\n        strip_prefix = \"dep-v1\",\n    )\n",
+   "noop.bzl": "def noop():\n    pass\n"
+  },
+  "query_shows": "v2",
+  "repo": "dep",
+  "runs": [
+   "5.4.1",
+   "6.6.0",
+   "6.6.0-bzlmod",
+   "7.7.2",
+   "7.7.2-nobzlmod",
+   "8.8.2-ws",
+   "8.8.2-wsonly"
+  ]
+ },
+ "c12": {
+  "built": "v2",
+  "description": "maybe macro(v1); literal(v2) in one chunk",
+  "files": {
+   "WORKSPACE": "workspace(name = \"ws_order\")\n\nload(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")\nload(\"//:deps_maybe.bzl\", dep_deps_maybe = \"dep_deps\")\n\ndep_deps_maybe()\n\nhttp_archive(\n    name = \"dep\",\n    urls = [\"file:///WS/archives/dep-v2.tar.gz\"],\n    sha256 = \"9dc01da0d21ba44475441de3c06a5ed7415bd1b2f8570d3e9419e272912bf7ae\",\n    strip_prefix = \"dep-v2\",\n)\n",
+   "deps_maybe.bzl": "load(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")\nload(\"@bazel_tools//tools/build_defs/repo:utils.bzl\", \"maybe\")\n\ndef dep_deps():\n    maybe(\n        http_archive,\n        name = \"dep\",\n        urls = [\"file:///WS/archives/dep-v1.tar.gz\"],\n        sha256 = \"b73874449991e5ec4475818559550eb63e0be30a992a5ac72e3194ee85b22910\",\n        strip_prefix = \"dep-v1\",\n    )\n",
+   "deps_plain.bzl": "load(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")\n\ndef dep_deps():\n    http_archive(\n        name = \"dep\",\n        urls = [\"file:///WS/archives/dep-v1.tar.gz\"],\n        sha256 = \"b73874449991e5ec4475818559550eb63e0be30a992a5ac72e3194ee85b22910\",\n        strip_prefix = \"dep-v1\",\n    )\n",
+   "macros/deps.bzl": "load(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")\nload(\"@bazel_tools//tools/build_defs/repo:utils.bzl\", \"maybe\")\n\ndef dep_deps():\n    maybe(\n        http_archive,\n        name = \"dep\",\n        urls = [\"file:///WS/archives/dep-v1.tar.gz\"],\n        sha256 = \"b73874449991e5ec4475818559550eb63e0be30a992a5ac72e3194ee85b22910\",\n        strip_prefix = \"dep-v1\",\n    )\n",
+   "noop.bzl": "def noop():\n    pass\n"
+  },
+  "query_shows": "v2",
+  "repo": "dep",
+  "runs": [
+   "5.4.1",
+   "6.6.0",
+   "6.6.0-bzlmod",
+   "7.7.2",
+   "7.7.2-nobzlmod",
+   "8.8.2-ws",
+   "8.8.2-wsonly"
+  ]
+ },
+ "c13": {
+  "built": "v1",
+  "description": "maybe macro(v1); load; literal(v2) (two chunks)",
+  "files": {
+   "WORKSPACE": "workspace(name = \"ws_order\")\n\nload(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")\nload(\"//:deps_maybe.bzl\", dep_deps_maybe = \"dep_deps\")\n\ndep_deps_maybe()\n\nload(\"//:noop.bzl\", \"noop\")\n\nhttp_archive(\n    name = \"dep\",\n    urls = [\"file:///WS/archives/dep-v2.tar.gz\"],\n    sha256 = \"9dc01da0d21ba44475441de3c06a5ed7415bd1b2f8570d3e9419e272912bf7ae\",\n    strip_prefix = \"dep-v2\",\n)\n",
+   "deps_maybe.bzl": "load(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")\nload(\"@bazel_tools//tools/build_defs/repo:utils.bzl\", \"maybe\")\n\ndef dep_deps():\n    maybe(\n        http_archive,\n        name = \"dep\",\n        urls = [\"file:///WS/archives/dep-v1.tar.gz\"],\n        sha256 = \"b73874449991e5ec4475818559550eb63e0be30a992a5ac72e3194ee85b22910\",\n        strip_prefix = \"dep-v1\",\n    )\n",
+   "deps_plain.bzl": "load(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")\n\ndef dep_deps():\n    http_archive(\n        name = \"dep\",\n        urls = [\"file:///WS/archives/dep-v1.tar.gz\"],\n        sha256 = \"b73874449991e5ec4475818559550eb63e0be30a992a5ac72e3194ee85b22910\",\n        strip_prefix = \"dep-v1\",\n    )\n",
+   "macros/deps.bzl": "load(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")\nload(\"@bazel_tools//tools/build_defs/repo:utils.bzl\", \"maybe\")\n\ndef dep_deps():\n    maybe(\n        http_archive,\n        name = \"dep\",\n        urls = [\"file:///WS/archives/dep-v1.tar.gz\"],\n        sha256 = \"b73874449991e5ec4475818559550eb63e0be30a992a5ac72e3194ee85b22910\",\n        strip_prefix = \"dep-v1\",\n    )\n",
+   "noop.bzl": "def noop():\n    pass\n"
+  },
+  "query_shows": "v2",
+  "repo": "dep",
+  "runs": [
+   "5.4.1",
+   "6.6.0",
+   "6.6.0-bzlmod",
+   "7.7.2",
+   "7.7.2-nobzlmod",
+   "8.8.2-ws",
+   "8.8.2-wsonly"
+  ]
+ },
+ "c14": {
+  "built": "v2",
+  "description": "external-repo maybe macro(v1) after its load; literal(v2) same chunk as the call",
+  "files": {
+   "WORKSPACE": "workspace(name = \"ws_order\")\n\nload(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")\n\nlocal_repository(\n    name = \"macros\",\n    path = \"macros\",\n)\n\nload(\"@macros//:deps.bzl\", dep_deps_ext = \"dep_deps\")\n\ndep_deps_ext()\n\nhttp_archive(\n    name = \"dep\",\n    urls = [\"file:///WS/archives/dep-v2.tar.gz\"],\n    sha256 = \"9dc01da0d21ba44475441de3c06a5ed7415bd1b2f8570d3e9419e272912bf7ae\",\n    strip_prefix = \"dep-v2\",\n)\n",
+   "deps_maybe.bzl": "load(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")\nload(\"@bazel_tools//tools/build_defs/repo:utils.bzl\", \"maybe\")\n\ndef dep_deps():\n    maybe(\n        http_archive,\n        name = \"dep\",\n        urls = [\"file:///WS/archives/dep-v1.tar.gz\"],\n        sha256 = \"b73874449991e5ec4475818559550eb63e0be30a992a5ac72e3194ee85b22910\",\n        strip_prefix = \"dep-v1\",\n    )\n",
+   "deps_plain.bzl": "load(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")\n\ndef dep_deps():\n    http_archive(\n        name = \"dep\",\n        urls = [\"file:///WS/archives/dep-v1.tar.gz\"],\n        sha256 = \"b73874449991e5ec4475818559550eb63e0be30a992a5ac72e3194ee85b22910\",\n        strip_prefix = \"dep-v1\",\n    )\n",
+   "macros/deps.bzl": "load(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")\nload(\"@bazel_tools//tools/build_defs/repo:utils.bzl\", \"maybe\")\n\ndef dep_deps():\n    maybe(\n        http_archive,\n        name = \"dep\",\n        urls = [\"file:///WS/archives/dep-v1.tar.gz\"],\n        sha256 = \"b73874449991e5ec4475818559550eb63e0be30a992a5ac72e3194ee85b22910\",\n        strip_prefix = \"dep-v1\",\n    )\n",
+   "noop.bzl": "def noop():\n    pass\n"
+  },
+  "query_shows": "v2",
+  "repo": "dep",
+  "runs": [
+   "5.4.1",
+   "6.6.0",
+   "6.6.0-bzlmod",
+   "7.7.2",
+   "7.7.2-nobzlmod",
+   "8.8.2-ws",
+   "8.8.2-wsonly"
+  ]
+ },
+ "c15": {
+  "built": "v2",
+  "description": "literal(v2); then external-repo macro load + maybe macro(v1) (typical: override before deps macro)",
+  "files": {
+   "WORKSPACE": "workspace(name = \"ws_order\")\n\nload(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")\n\nhttp_archive(\n    name = \"dep\",\n    urls = [\"file:///WS/archives/dep-v2.tar.gz\"],\n    sha256 = \"9dc01da0d21ba44475441de3c06a5ed7415bd1b2f8570d3e9419e272912bf7ae\",\n    strip_prefix = \"dep-v2\",\n)\n\nlocal_repository(\n    name = \"macros\",\n    path = \"macros\",\n)\n\nload(\"@macros//:deps.bzl\", dep_deps_ext = \"dep_deps\")\n\ndep_deps_ext()\n",
+   "deps_maybe.bzl": "load(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")\nload(\"@bazel_tools//tools/build_defs/repo:utils.bzl\", \"maybe\")\n\ndef dep_deps():\n    maybe(\n        http_archive,\n        name = \"dep\",\n        urls = [\"file:///WS/archives/dep-v1.tar.gz\"],\n        sha256 = \"b73874449991e5ec4475818559550eb63e0be30a992a5ac72e3194ee85b22910\",\n        strip_prefix = \"dep-v1\",\n    )\n",
+   "deps_plain.bzl": "load(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")\n\ndef dep_deps():\n    http_archive(\n        name = \"dep\",\n        urls = [\"file:///WS/archives/dep-v1.tar.gz\"],\n        sha256 = \"b73874449991e5ec4475818559550eb63e0be30a992a5ac72e3194ee85b22910\",\n        strip_prefix = \"dep-v1\",\n    )\n",
+   "macros/deps.bzl": "load(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")\nload(\"@bazel_tools//tools/build_defs/repo:utils.bzl\", \"maybe\")\n\ndef dep_deps():\n    maybe(\n        http_archive,\n        name = \"dep\",\n        urls = [\"file:///WS/archives/dep-v1.tar.gz\"],\n        sha256 = \"b73874449991e5ec4475818559550eb63e0be30a992a5ac72e3194ee85b22910\",\n        strip_prefix = \"dep-v1\",\n    )\n",
+   "noop.bzl": "def noop():\n    pass\n"
+  },
+  "query_shows": "v2",
+  "repo": "dep",
+  "runs": [
+   "5.4.1",
+   "6.6.0",
+   "6.6.0-bzlmod",
+   "7.7.2",
+   "7.7.2-nobzlmod",
+   "8.8.2-ws",
+   "8.8.2-wsonly"
+  ]
+ },
+ "r01": {
+  "built": "patched",
+  "description": "REWRITE top-level literal: literal(patched) only",
+  "files": {
+   "WORKSPACE": "workspace(name = \"ws_order\")\n\nload(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")\n\nhttp_archive(\n    name = \"dep\",\n    urls = [\"file:///WS/archives/dep-patched.tar.gz\"],\n    sha256 = \"8a051d910796ba2788d67eaf09df7ccad6ad2e24f3c3f4d7b437781a53e948cb\",\n    strip_prefix = \"dep-patched\",\n)\n",
+   "deps_maybe.bzl": "load(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")\nload(\"@bazel_tools//tools/build_defs/repo:utils.bzl\", \"maybe\")\n\ndef dep_deps():\n    maybe(\n        http_archive,\n        name = \"dep\",\n        urls = [\"file:///WS/archives/dep-v1.tar.gz\"],\n        sha256 = \"b73874449991e5ec4475818559550eb63e0be30a992a5ac72e3194ee85b22910\",\n        strip_prefix = \"dep-v1\",\n    )\n",
+   "deps_plain.bzl": "load(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")\n\ndef dep_deps():\n    http_archive(\n        name = \"dep\",\n        urls = [\"file:///WS/archives/dep-v1.tar.gz\"],\n        sha256 = \"b73874449991e5ec4475818559550eb63e0be30a992a5ac72e3194ee85b22910\",\n        strip_prefix = \"dep-v1\",\n    )\n",
+   "macros/deps.bzl": "load(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")\nload(\"@bazel_tools//tools/build_defs/repo:utils.bzl\", \"maybe\")\n\ndef dep_deps():\n    maybe(\n        http_archive,\n        name = \"dep\",\n        urls = [\"file:///WS/archives/dep-v1.tar.gz\"],\n        sha256 = \"b73874449991e5ec4475818559550eb63e0be30a992a5ac72e3194ee85b22910\",\n        strip_prefix = \"dep-v1\",\n    )\n",
+   "noop.bzl": "def noop():\n    pass\n"
+  },
+  "query_shows": "patched",
+  "repo": "dep",
+  "runs": [
+   "5.4.1",
+   "6.6.0",
+   "6.6.0-bzlmod",
+   "7.7.2",
+   "7.7.2-nobzlmod",
+   "8.8.2-ws",
+   "8.8.2-wsonly"
+  ]
+ },
+ "r02": {
+  "built": "patched",
+  "description": "REWRITE the maybe-wrapped first-chunk def: maybe(patched); load; literal(v2)",
+  "files": {
+   "WORKSPACE": "workspace(name = \"ws_order\")\n\nload(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")\nload(\"@bazel_tools//tools/build_defs/repo:utils.bzl\", \"maybe\")\n\nmaybe(\n    http_archive,\n    name = \"dep\",\n    urls = [\"file:///WS/archives/dep-patched.tar.gz\"],\n    sha256 = \"8a051d910796ba2788d67eaf09df7ccad6ad2e24f3c3f4d7b437781a53e948cb\",\n    strip_prefix = \"dep-patched\",\n)\n\nload(\"//:noop.bzl\", \"noop\")\n\nhttp_archive(\n    name = \"dep\",\n    urls = [\"file:///WS/archives/dep-v2.tar.gz\"],\n    sha256 = \"9dc01da0d21ba44475441de3c06a5ed7415bd1b2f8570d3e9419e272912bf7ae\",\n    strip_prefix = \"dep-v2\",\n)\n",
+   "deps_maybe.bzl": "load(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")\nload(\"@bazel_tools//tools/build_defs/repo:utils.bzl\", \"maybe\")\n\ndef dep_deps():\n    maybe(\n        http_archive,\n        name = \"dep\",\n        urls = [\"file:///WS/archives/dep-v1.tar.gz\"],\n        sha256 = \"b73874449991e5ec4475818559550eb63e0be30a992a5ac72e3194ee85b22910\",\n        strip_prefix = \"dep-v1\",\n    )\n",
+   "deps_plain.bzl": "load(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")\n\ndef dep_deps():\n    http_archive(\n        name = \"dep\",\n        urls = [\"file:///WS/archives/dep-v1.tar.gz\"],\n        sha256 = \"b73874449991e5ec4475818559550eb63e0be30a992a5ac72e3194ee85b22910\",\n        strip_prefix = \"dep-v1\",\n    )\n",
+   "macros/deps.bzl": "load(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")\nload(\"@bazel_tools//tools/build_defs/repo:utils.bzl\", \"maybe\")\n\ndef dep_deps():\n    maybe(\n        http_archive,\n        name = \"dep\",\n        urls = [\"file:///WS/archives/dep-v1.tar.gz\"],\n        sha256 = \"b73874449991e5ec4475818559550eb63e0be30a992a5ac72e3194ee85b22910\",\n        strip_prefix = \"dep-v1\",\n    )\n",
+   "noop.bzl": "def noop():\n    pass\n"
+  },
+  "query_shows": "v2",
+  "repo": "dep",
+  "runs": [
+   "5.4.1",
+   "6.6.0",
+   "6.6.0-bzlmod",
+   "7.7.2",
+   "7.7.2-nobzlmod",
+   "8.8.2-ws",
+   "8.8.2-wsonly"
+  ]
+ },
+ "r03": {
+  "built": "v1",
+  "description": "REWRITE the shadowed later literal: literal(v1); load; literal(patched)",
+  "files": {
+   "WORKSPACE": "workspace(name = \"ws_order\")\n\nload(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")\n\nhttp_archive(\n    name = \"dep\",\n    urls = [\"file:///WS/archives/dep-v1.tar.gz\"],\n    sha256 = \"b73874449991e5ec4475818559550eb63e0be30a992a5ac72e3194ee85b22910\",\n    strip_prefix = \"dep-v1\",\n)\n\nload(\"//:noop.bzl\", \"noop\")\n\nhttp_archive(\n    name = \"dep\",\n    urls = [\"file:///WS/archives/dep-patched.tar.gz\"],\n    sha256 = \"8a051d910796ba2788d67eaf09df7ccad6ad2e24f3c3f4d7b437781a53e948cb\",\n    strip_prefix = \"dep-patched\",\n)\n",
+   "deps_maybe.bzl": "load(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")\nload(\"@bazel_tools//tools/build_defs/repo:utils.bzl\", \"maybe\")\n\ndef dep_deps():\n    maybe(\n        http_archive,\n        name = \"dep\",\n        urls = [\"file:///WS/archives/dep-v1.tar.gz\"],\n        sha256 = \"b73874449991e5ec4475818559550eb63e0be30a992a5ac72e3194ee85b22910\",\n        strip_prefix = \"dep-v1\",\n    )\n",
+   "deps_plain.bzl": "load(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")\n\ndef dep_deps():\n    http_archive(\n        name = \"dep\",\n        urls = [\"file:///WS/archives/dep-v1.tar.gz\"],\n        sha256 = \"b73874449991e5ec4475818559550eb63e0be30a992a5ac72e3194ee85b22910\",\n        strip_prefix = \"dep-v1\",\n    )\n",
+   "macros/deps.bzl": "load(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")\nload(\"@bazel_tools//tools/build_defs/repo:utils.bzl\", \"maybe\")\n\ndef dep_deps():\n    maybe(\n        http_archive,\n        name = \"dep\",\n        urls = [\"file:///WS/archives/dep-v1.tar.gz\"],\n        sha256 = \"b73874449991e5ec4475818559550eb63e0be30a992a5ac72e3194ee85b22910\",\n        strip_prefix = \"dep-v1\",\n    )\n",
+   "noop.bzl": "def noop():\n    pass\n"
+  },
+  "query_shows": "patched",
+  "repo": "dep",
+  "runs": [
+   "5.4.1",
+   "6.6.0",
+   "6.6.0-bzlmod",
+   "7.7.2",
+   "7.7.2-nobzlmod",
+   "8.8.2-ws",
+   "8.8.2-wsonly"
+  ]
+ },
+ "r04": {
+  "built": "v1",
+  "description": "REWRITE a literal that a later plain macro in the same chunk overrides: literal(patched); plain macro(v1)",
+  "files": {
+   "WORKSPACE": "workspace(name = \"ws_order\")\n\nload(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")\nload(\"//:deps_plain.bzl\", dep_deps_plain = \"dep_deps\")\n\nhttp_archive(\n    name = \"dep\",\n    urls = [\"file:///WS/archives/dep-patched.tar.gz\"],\n    sha256 = \"8a051d910796ba2788d67eaf09df7ccad6ad2e24f3c3f4d7b437781a53e948cb\",\n    strip_prefix = \"dep-patched\",\n)\n\ndep_deps_plain()\n",
+   "deps_maybe.bzl": "load(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")\nload(\"@bazel_tools//tools/build_defs/repo:utils.bzl\", \"maybe\")\n\ndef dep_deps():\n    maybe(\n        http_archive,\n        name = \"dep\",\n        urls = [\"file:///WS/archives/dep-v1.tar.gz\"],\n        sha256 = \"b73874449991e5ec4475818559550eb63e0be30a992a5ac72e3194ee85b22910\",\n        strip_prefix = \"dep-v1\",\n    )\n",
+   "deps_plain.bzl": "load(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")\n\ndef dep_deps():\n    http_archive(\n        name = \"dep\",\n        urls = [\"file:///WS/archives/dep-v1.tar.gz\"],\n        sha256 = \"b73874449991e5ec4475818559550eb63e0be30a992a5ac72e3194ee85b22910\",\n        strip_prefix = \"dep-v1\",\n    )\n",
+   "macros/deps.bzl": "load(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")\nload(\"@bazel_tools//tools/build_defs/repo:utils.bzl\", \"maybe\")\n\ndef dep_deps():\n    maybe(\n        http_archive,\n        name = \"dep\",\n        urls = [\"file:///WS/archives/dep-v1.tar.gz\"],\n        sha256 = \"b73874449991e5ec4475818559550eb63e0be30a992a5ac72e3194ee85b22910\",\n        strip_prefix = \"dep-v1\",\n    )\n",
+   "noop.bzl": "def noop():\n    pass\n"
+  },
+  "query_shows": "v1",
+  "repo": "dep",
+  "runs": [
+   "5.4.1",
+   "6.6.0",
+   "6.6.0-bzlmod",
+   "7.7.2",
+   "7.7.2-nobzlmod",
+   "8.8.2-ws",
+   "8.8.2-wsonly"
+  ]
+ },
+ "r05": {
+  "built": "patched",
+  "description": "REWRITE inside deps_plain.bzl (macro-defined http_archive): plain macro(patched)",
+  "files": {
+   "WORKSPACE": "workspace(name = \"ws_order\")\n\nload(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")\nload(\"//:deps_plain.bzl\", dep_deps_plain = \"dep_deps\")\n\ndep_deps_plain()\n",
+   "deps_maybe.bzl": "load(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")\nload(\"@bazel_tools//tools/build_defs/repo:utils.bzl\", \"maybe\")\n\ndef dep_deps():\n    maybe(\n        http_archive,\n        name = \"dep\",\n        urls = [\"file:///WS/archives/dep-patched.tar.gz\"],\n        sha256 = \"8a051d910796ba2788d67eaf09df7ccad6ad2e24f3c3f4d7b437781a53e948cb\",\n        strip_prefix = \"dep-patched\",\n    )\n",
+   "deps_plain.bzl": "load(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")\n\ndef dep_deps():\n    http_archive(\n        name = \"dep\",\n        urls = [\"file:///WS/archives/dep-patched.tar.gz\"],\n        sha256 = \"8a051d910796ba2788d67eaf09df7ccad6ad2e24f3c3f4d7b437781a53e948cb\",\n        strip_prefix = \"dep-patched\",\n    )\n",
+   "macros/deps.bzl": "load(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")\nload(\"@bazel_tools//tools/build_defs/repo:utils.bzl\", \"maybe\")\n\ndef dep_deps():\n    maybe(\n        http_archive,\n        name = \"dep\",\n        urls = [\"file:///WS/archives/dep-patched.tar.gz\"],\n        sha256 = \"8a051d910796ba2788d67eaf09df7ccad6ad2e24f3c3f4d7b437781a53e948cb\",\n        strip_prefix = \"dep-patched\",\n    )\n",
+   "noop.bzl": "def noop():\n    pass\n"
+  },
+  "query_shows": "patched",
+  "repo": "dep",
+  "runs": [
+   "5.4.1",
+   "6.6.0",
+   "6.6.0-bzlmod",
+   "7.7.2",
+   "7.7.2-nobzlmod",
+   "8.8.2-ws",
+   "8.8.2-wsonly"
+  ]
+ }
+}
