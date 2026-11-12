@@ -13,9 +13,12 @@
 //! The bytes are canonical: sorted keys, sorted rows, two-space indent,
 //! one trailing newline. [`parse`] accepts exactly what [`Index::render`]
 //! writes, compared line-ending blind (a checkout may have converted the
-//! file to CRLF, which a rewrite then keeps). Anything else that has the
-//! index's members is [`Parsed::Modified`] and nothing is written over it;
-//! a file of another shape is [`Parsed::Foreign`].
+//! file to CRLF, which a rewrite then keeps). Anything else that holds the
+//! index's row lists, `pins` and `ignoreLines`, is [`Parsed::Modified`]
+//! and nothing is written over it: its rows may still be the only record
+//! of what a rollback must undo. So is text that is not JSON and names
+//! either list (a merge conflict, a truncated write). A file of another
+//! shape is [`Parsed::Foreign`].
 
 use serde_json::{Map, Value};
 
@@ -30,6 +33,12 @@ pub const INDEX_PATH: &str = ".socket/bazel/index.json";
 
 /// The one version this socket-patch writes and reads.
 pub const VERSION: u64 = 1;
+
+/// The members that hold the rows, in file order. A JSON object with both
+/// is the index, read strictly, and so is text that is not JSON and names
+/// either. An object without one of them is not: every index socket-patch
+/// writes has both, empty or not.
+const ROW_LISTS: [&str; 2] = ["ignoreLines", "pins"];
 
 /// One `pins` row: a hosted pin in a file only Bazel's rulesets read, and
 /// what the lane's offline restore undoes.
@@ -94,6 +103,8 @@ impl std::fmt::Display for InvalidRow {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Index {
     pub pins: Vec<IndexRow>,
+    /// One row per line. The rows of an insert are added with
+    /// [`Index::record_lines`], never appended.
     pub ignore_lines: Vec<IgnoreLineRow>,
     /// The file was found with CRLF line endings; a rewrite keeps them.
     pub crlf: bool,
@@ -103,9 +114,10 @@ pub struct Index {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Parsed {
     Ours(Index),
-    /// The index's members are there and the bytes are not what
-    /// socket-patch writes: it was edited, a merge mangled it, or another
-    /// version wrote it. The text says what differs. Nothing is written.
+    /// The index's row lists are there and the bytes are not what
+    /// socket-patch writes: it was edited, a merge mangled it, a write
+    /// was cut short, or another version wrote it. The text says what
+    /// differs. Nothing is written.
     Modified(String),
     /// Not the index: a file of the user's under this name.
     Foreign,
@@ -246,6 +258,23 @@ impl Index {
         self.pins.is_empty() && self.ignore_lines.is_empty()
     }
 
+    /// Records the rows of one [`insert`](super::ignore::insert). A row
+    /// replaces the row already recorded for its line.
+    ///
+    /// `insert` returns a row only for a line the file holds no live copy
+    /// of. When the index has a row for that line all the same, the user
+    /// deleted the line by hand and the insert put it back (repair does
+    /// exactly this), so the recorded row describes an edit that is gone:
+    /// removing by it would find no line and drop it. The new row's flags
+    /// are the ones a removal must undo. Appending instead would record
+    /// the line twice, and [`Index::render`] refuses that.
+    pub fn record_lines(&mut self, rows: Vec<IgnoreLineRow>) {
+        for row in rows {
+            self.ignore_lines.retain(|old| old.line != row.line);
+            self.ignore_lines.push(row);
+        }
+    }
+
     /// The canonical bytes. Refused when a row is not one socket-patch
     /// may record: this is the last guard before a URL, or a path that
     /// leaves the root, reaches a committed file.
@@ -283,6 +312,12 @@ impl Index {
     }
 }
 
+/// Whether text names one of the row lists as a member.
+fn names_a_row_list(text: &str) -> bool {
+    let named = |key: &&str| text.contains(&format!("\"{key}\""));
+    ROW_LISTS.iter().any(named)
+}
+
 /// Reads the bytes found at [`INDEX_PATH`].
 pub fn parse(bytes: &[u8]) -> Parsed {
     let Ok(text) = std::str::from_utf8(bytes) else {
@@ -295,19 +330,18 @@ pub fn parse(bytes: &[u8]) -> Parsed {
         // The index is committed, so two branches can both change it. A
         // merge conflict leaves no JSON, and what it leaves is still the
         // index: the user resolves it, where a foreign file is renamed.
-        Err(_)
-            if ["\"ignoreLines\"", "\"pins\""]
-                .iter()
-                .all(|key| text.contains(key)) =>
-        {
+        // So does a write that was cut short. `pins` is the last list in
+        // the file, so a cut can leave only `ignoreLines`: one of the two
+        // names is enough.
+        Err(_) if names_a_row_list(text) => {
             return Parsed::Modified("it is not valid JSON".to_string());
         }
         Err(_) => return Parsed::Foreign,
     };
-    if !["version", "pins", "ignoreLines"]
-        .iter()
-        .all(|key| doc.contains_key(*key))
-    {
+    // The row lists are what make a file the index. One that holds both
+    // may hold rows a rollback needs, whatever else was edited out of it,
+    // `version` included: it is never taken for a file of the user's.
+    if !ROW_LISTS.iter().all(|key| doc.contains_key(*key)) {
         return Parsed::Foreign;
     }
     match read(text, &doc) {
@@ -316,11 +350,13 @@ pub fn parse(bytes: &[u8]) -> Parsed {
     }
 }
 
+/// Reads an object of any members: a missing one is a reason, never a
+/// panic.
 fn read(text: &str, doc: &Map<String, Value>) -> Result<Index, String> {
     if text.starts_with('\u{feff}') {
         return Err("the file starts with a byte-order mark".to_string());
     }
-    match doc["version"].as_u64() {
+    match doc.get("version").and_then(Value::as_u64) {
         Some(VERSION) => {}
         // Written by another socket-patch: its rows may mean something
         // this one would undo wrongly.
@@ -331,7 +367,7 @@ fn read(text: &str, doc: &Map<String, Value>) -> Result<Index, String> {
         None => return Err("`version` is not a version number".to_string()),
     }
     let rows = |key: &str| {
-        let list = doc[key].as_array();
+        let list = doc.get(key).and_then(Value::as_array);
         list.ok_or_else(|| format!("`{key}` is not a list"))
     };
     let pins = rows("pins")?.iter().enumerate().map(|(at, row)| {
@@ -751,6 +787,25 @@ mod tests {
             );
         }
 
+        // A hand edit that drops `version` and leaves valid JSON leaves
+        // the rows too, and a rollback works from them: the file is still
+        // the index, not a file of the user's.
+        let no_version = SAMPLE.replacen(",\n  \"version\": 1\n", "\n", 1);
+        let doc: Value = serde_json::from_str(&no_version).expect("still JSON");
+        assert!(doc.get("version").is_none() && doc.get("pins").is_some());
+        assert_eq!(modified(&no_version), NOT_VERSION);
+        assert_eq!(modified("{\"ignoreLines\": [], \"pins\": []}"), NOT_VERSION);
+        // Each list is read as a list or named, never indexed blind.
+        for (lists, why) in [
+            ("\"ignoreLines\": [], \"pins\": {}", "`pins` is not a list"),
+            (
+                "\"ignoreLines\": null, \"pins\": []",
+                "`ignoreLines` is not a list",
+            ),
+        ] {
+            assert_eq!(modified(&format!("{{{lists}, \"version\": 1}}")), why);
+        }
+
         // Rows and members out of canonical order.
         let moved = SAMPLE.replacen("  \"version\": 1\n", "", 1);
         let moved = moved.replacen("{\n", "{\n  \"version\": 1,\n", 1);
@@ -806,6 +861,32 @@ mod tests {
             modified(&SAMPLE[..SAMPLE.len() - 3]),
             "it is not valid JSON"
         );
+
+        // `pins` is the last list in the file, so a write cut short
+        // before it leaves `ignoreLines` alone. With no pins to push the
+        // name out, that is most of an index that records only lines.
+        let lines_only = Index {
+            ignore_lines: vec![
+                line_row("", SocketTree::Vendor, true, false),
+                line_row("svc", SocketTree::GoPatches, true, false),
+            ],
+            ..Index::default()
+        };
+        let lines_only = lines_only.render().unwrap();
+        let pins_at = lines_only.find("\"pins\"").expect("the last list");
+        let named = "{\n  \"ignoreLines\"".len();
+        let row_at = lines_only.find("\"line\"").expect("a row");
+        for cut in [named, row_at, pins_at - 1, pins_at, pins_at + 3] {
+            let cut_short = &lines_only[..cut];
+            assert!(!cut_short.contains("\"pins\""), "cut at {cut}");
+            assert_eq!(modified(cut_short), "it is not valid JSON", "cut at {cut}");
+        }
+        // One byte earlier nothing says whose file it is.
+        assert_eq!(parse(lines_only[..named - 1].as_bytes()), Parsed::Foreign);
+        // The other half: what is left when the head of the file is lost.
+        let tail = &SAMPLE[SAMPLE.find("\"pins\"").expect("the last list")..];
+        assert!(!tail.contains("\"ignoreLines\""));
+        assert_eq!(modified(tail), "it is not valid JSON");
     }
 
     #[test]
@@ -819,7 +900,7 @@ mod tests {
         let hash_after =
             |row: &mut IndexRow, hash| row.check.as_mut().unwrap().resolved_hash_after = hash;
         let url = "https://patches.socket.dev/patch/token/abc/lib-1.2.3.jar";
-        let cases: [(Change<'_>, &str); 12] = [
+        let cases: [(Change<'_>, &str); 15] = [
             // Never a URL, in any field.
             (&|row| row.edits[0].new = url.to_string(), NOT_PLAIN),
             (
@@ -839,6 +920,15 @@ mod tests {
                 NOT_PURL,
             ),
             (&|row| row.purl = url.to_string(), NOT_PURL),
+            // Each of these is refused by one rule alone: the `pkg:`
+            // scheme, the space, and the control character in a path
+            // whose every segment is otherwise safe.
+            (&|row| row.purl = "maven/g/a@1".to_string(), NOT_PURL),
+            (&|row| row.purl = "pkg:maven/g/a b@1".to_string(), NOT_PURL),
+            (
+                &|row| row.file = "a\nb/maven_install.json".to_string(),
+                NOT_PATH,
+            ),
             (
                 &|row| row.file = format!("{url}/maven_install.json"),
                 NOT_PATH,
@@ -933,10 +1023,9 @@ mod tests {
             .flat_map(|project| SocketTree::ALL.map(|tree| IgnoreLine::new(project, tree).unwrap()))
             .collect();
         let inserted = insert(&original, &wanted).unwrap().unwrap();
-        let mut index = Index {
-            ignore_lines: inserted.rows,
-            ..Index::default()
-        };
+        let mut index = Index::default();
+        index.record_lines(inserted.rows);
+        assert_eq!(index.ignore_lines.len(), 4);
         let mut file = FileText::Bytes(inserted.bytes);
         let text = index.render().unwrap();
         assert!(
@@ -963,6 +1052,78 @@ mod tests {
         }
         assert!(index.is_empty());
         assert_eq!(file, original);
+    }
+
+    /// Repair's sequence (design section 7): the user deleted a recorded
+    /// line by hand and a later run puts it back while its row is still
+    /// in the index. The index keeps one row for the line, with the flags
+    /// of the insert that is in the file, and still renders.
+    #[test]
+    fn a_line_put_back_replaces_its_recorded_row() {
+        let [go, vendor] = SocketTree::ALL.map(|tree| IgnoreLine::new("", tree).unwrap());
+        let wanted = [go.clone(), vendor.clone()];
+        let row = |line: &IgnoreLine, created_file, added_final_newline| IgnoreLineRow {
+            line: line.clone(),
+            created_file,
+            added_final_newline,
+        };
+
+        let first = insert(&FileText::Absent, &wanted).unwrap().unwrap();
+        let mut index = Index::default();
+        index.record_lines(first.rows.clone());
+        let created = [row(&go, true, false), row(&vendor, true, false)];
+        assert_eq!(index.ignore_lines, created);
+
+        // The user swaps the vendor line for one of their own and leaves
+        // the file without a final newline.
+        let by_hand = FileText::Bytes(b".socket/go-patches\nnode_modules".to_vec());
+        let second = insert(&by_hand, &wanted).unwrap().unwrap();
+        assert_eq!(
+            second.bytes,
+            b".socket/go-patches\nnode_modules\n.socket/vendor\n"
+        );
+        assert_eq!(second.rows, [row(&vendor, false, true)]);
+
+        // Appended, the rows record the line twice and nothing renders:
+        // the index could not be written again.
+        let mut appended = index.clone();
+        appended.ignore_lines.extend(second.rows.clone());
+        assert_eq!(
+            appended.render().unwrap_err().to_string(),
+            "`ignoreLines[2].line` is recorded twice"
+        );
+
+        index.record_lines(second.rows);
+        let replaced = [row(&go, true, false), row(&vendor, false, true)];
+        assert_eq!(index.ignore_lines, replaced);
+        let text = index.render().expect("one row per line");
+        assert_eq!(parse(text.as_bytes()), Parsed::Ours(index.clone()));
+
+        // A rollback by the rows that are recorded now takes both lines
+        // and the newline, and leaves the user's line as they wrote it.
+        let mut file = FileText::Bytes(second.bytes);
+        for line in [&vendor, &go] {
+            let at = index.ignore_lines.iter().position(|row| row.line == *line);
+            let row = index.ignore_lines.remove(at.expect("a recorded line"));
+            let Ok(Removal::Rewritten { bytes, carry }) = remove(&file, &row) else {
+                panic!("{line:?} was not removed");
+            };
+            carry.apply(&mut index.ignore_lines);
+            file = FileText::Bytes(bytes);
+        }
+        assert_eq!(file, FileText::Bytes(b"node_modules".to_vec()));
+
+        // Rows of other lines are kept, and the last row given for a
+        // line is the one recorded.
+        let mut index = Index {
+            ignore_lines: created.to_vec(),
+            ..Index::default()
+        };
+        index.record_lines(vec![row(&go, false, false), row(&go, false, true)]);
+        assert_eq!(
+            index.ignore_lines,
+            [row(&vendor, true, false), row(&go, false, true)]
+        );
     }
 
     /// No edit of the canonical bytes reads as ours unless the bytes
