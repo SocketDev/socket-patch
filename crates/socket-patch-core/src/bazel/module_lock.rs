@@ -149,6 +149,11 @@ pub struct Extensions {
     pub entries: Vec<ExtensionEntry>,
     /// The top-level `facts` (Bazel 8.5 and later), one per extension.
     pub facts: Vec<ExtensionFacts>,
+    /// The lock has a top-level `facts` member, empty or not: the Bazel
+    /// that wrote it stores facts. An extension whose every package is a
+    /// direct reference has no member there, so "no facts for this
+    /// extension" alone does not say that it stores none.
+    pub stores_facts: bool,
 }
 
 /// An extension id as the lock spells it: `<label>%<name>`, with a third
@@ -429,6 +434,7 @@ impl ModuleLock {
         static NOTHING: Extensions = Extensions {
             entries: Vec::new(),
             facts: Vec::new(),
+            stores_facts: false,
         };
         match self {
             Self::Absent => Some(&NOTHING),
@@ -696,6 +702,7 @@ fn extensions(top: &Map<String, Value>) -> Shape<Extensions> {
         }
     }
     if let Some(value) = top.get("facts") {
+        out.stores_facts = true;
         for (raw, facts) in object(value, "facts")? {
             out.facts.push(ExtensionFacts {
                 id: ExtensionId::parse(raw)?,
@@ -2583,6 +2590,27 @@ mod tests {
         };
         assert_eq!(keys("baseline"), ["dep_a@index", "dep_b@index"]);
         assert_eq!(keys("hand-repaired"), ["dep_b@index"]);
+        // A lock says whether its Bazel stores facts at all, apart from
+        // whether any extension has some: Bazel 8.8.2 and 9.3.2 write the
+        // member for a workspace without a fact, 7.7.2 and 8.4.2 none.
+        let stores = |rel: &str| ext(&lock(&format!("module_lock/{rel}"))).stores_facts;
+        assert!(stores("facts/toy/baseline.MODULE.bazel.lock"));
+        for line in ["8.8.2", "9.3.2"] {
+            let lock = lock(&format!(
+                "module_lock/stale-repair/bazel-{line}/baseline.MODULE.bazel.lock"
+            ));
+            assert_eq!(lock.facts(), Some(&[][..]), "{line}");
+            assert!(ext(&lock).stores_facts, "{line}");
+        }
+        for line in ["6.6.0", "7.7.2", "8.4.2"] {
+            assert!(
+                !stores(&format!(
+                    "stale-repair/bazel-{line}/baseline.MODULE.bazel.lock"
+                )),
+                "{line}"
+            );
+        }
+        assert!(!ModuleLock::Absent.extensions().unwrap().stores_facts);
         let id = ExtensionId::parse("//:ext.bzl%toy").unwrap();
         let list = ExtensionFacts {
             id,
