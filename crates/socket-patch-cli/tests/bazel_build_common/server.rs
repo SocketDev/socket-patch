@@ -10,6 +10,7 @@
 //! cell before it opens a twin.
 
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::{Condvar, Mutex, PoisonError};
 use std::thread::ThreadId;
 
@@ -199,13 +200,19 @@ impl Cell {
     /// [`Cell::bazel`] with other command options for this one command.
     /// The startup options are the cell's and cannot be changed.
     pub fn bazel_with(&self, options: &Options, command: &str, args: &[&str]) -> Run {
+        Run::of(self.command_with(options, command, args))
+    }
+
+    /// The command [`Cell::bazel_with`] runs, not yet spawned: for a test
+    /// that asserts on the environment or the options a command gets.
+    pub fn command_with(&self, options: &Options, command: &str, args: &[&str]) -> Command {
         let mut cmd = self.bazel.command(&self.scratch, command);
         let flags = options
             .args(&self.bazel, &self.scratch)
             .unwrap_or_else(|why| panic!("{}: {why}", self.test));
         cmd.args(flags).args(args);
         options.apply_env(&mut cmd);
-        Run::of(cmd)
+        cmd
     }
 
     /// [`Cell::bazel`], asserting success.
@@ -238,16 +245,7 @@ impl Cell {
     }
 
     fn stop(&self) -> Result<(), String> {
-        if self.server_pid().is_none() {
-            return Ok(());
-        }
-        // No command options: `shutdown` needs none, and the startup
-        // options are what address the server.
-        let run = Run::try_of(self.bazel.command(&self.scratch, "shutdown"))?;
-        if !run.ok() {
-            return Err(format!("`bazel shutdown` failed:\n{}", run.dump()));
-        }
-        settle_pid_files(&self.scratch.output_user_root, process_alive)
+        stop_server(&self.bazel, &self.scratch)
     }
 
     /// End the cell: stop the server, remove the scratch root and check
@@ -279,6 +277,22 @@ impl Drop for Cell {
             eprintln!("{}: leaving a Bazel server behind: {why}", self.test);
         }
     }
+}
+
+/// `bazel shutdown` for the server of `scratch`, when its pid file says
+/// one runs, and the check that it is gone. For a [`Cell`], and for a
+/// helper build in a scratch root of its own.
+pub fn stop_server(bazel: &Bazel, scratch: &Scratch) -> Result<(), String> {
+    if pid_files(&scratch.output_user_root).is_empty() {
+        return Ok(());
+    }
+    // No command options: `shutdown` needs none, and the startup options
+    // are what address the server.
+    let run = Run::try_of(bazel.command(scratch, "shutdown"))?;
+    if !run.ok() {
+        return Err(format!("`bazel shutdown` failed:\n{}", run.dump()));
+    }
+    settle_pid_files(&scratch.output_user_root, process_alive)
 }
 
 /// The pid file of every server under `output_user_root`, with the pid it

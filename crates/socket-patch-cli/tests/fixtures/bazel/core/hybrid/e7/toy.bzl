@@ -24,7 +24,7 @@ Three entry points read a lock:
 - `toy`, a module extension (Bzlmod). Bazel records the lock file as an
   input of the extension in `MODULE.bazel.lock`.
 - `toy_facts`, the same hub from an extension that records nothing but
-  facts (Bazel 8.6 and later): one fact per package the toy registry
+  facts (Bazel 8.5.0 and later): one fact per package the toy registry
   serves, none for a package pinned to any other URL.
 - `toy_lock`, a repository rule (WORKSPACE). It writes `@<hub>//:repos.bzl`,
   whose `toy_repos()` declares the spokes. A Bzlmod hub carries an empty

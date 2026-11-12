@@ -138,7 +138,7 @@
   "moduleExtensions": {
     "//:toy.bzl%toy": {
       "general": {
-        "bzlTransitiveDigest": "KcWEKEtX3gADlxofyKgLBHtMUw8ptyb0boNUtY4Acto=",
+        "bzlTransitiveDigest": "ZWAI84kvky/33UNMJY6eLeAXC0d2n3+SYfMctELKnQY=",
         "usagesDigest": "4vD8VlmHLiAoPtYmd8UGzvXu+y9FlTSKDNQAiMMT4Lk=",
         "recordedInputs": [
           "REPO_MAPPING:,bazel_tools bazel_tools",

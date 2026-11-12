@@ -41,9 +41,13 @@ pub struct Report {
     pub system: Option<System>,
     /// Every host the fixture server was asked for, from its request log.
     pub hosts: Vec<String>,
-    /// The test reached hosts directly, with no downloader rewrite, so
-    /// `hosts` is not the whole list. Canaries only: such a cell proves
-    /// nothing about hermeticity.
+    /// A command of the test reached hosts directly, with no downloader
+    /// rewrite, so `hosts` is not the whole list and the report proves
+    /// nothing about hermeticity. Set only when such a command ran: by the
+    /// record-only canaries, and by a toy cell that had to download Bazel's
+    /// own module archives because the line does not commit them and no
+    /// repository cache held them (`toy::open`; with the archives under
+    /// [`env::CACHE_ROOT`] the same cell contacts no host and says `false`).
     pub direct_network: bool,
     /// Ruleset name to the version `bazel mod graph` resolved.
     pub resolved: BTreeMap<String, String>,
@@ -174,8 +178,9 @@ pub fn may_skip(test: &str, why: &str, required: bool) -> Result<(), String> {
     Ok(())
 }
 
-/// The test cannot run here (no Bazel, an unreachable origin): a failure
-/// on a required cell, else `SKIP` and a `skipped` report.
+/// The test cannot run here (no Bazel, an unreachable origin, a fixture or
+/// a registry mirror that is not committed for this Bazel version): a
+/// failure on a required cell, else `SKIP` and a `skipped` report.
 pub fn skip(report: &Report, why: &str) -> PathBuf {
     if let Err(failure) = may_skip(&report.test, why, env::required()) {
         panic!("{failure}");
@@ -187,6 +192,8 @@ pub fn skip(report: &Report, why: &str) -> PathBuf {
 /// The test does not apply to this cell (another fixture group, a
 /// dependency system the Bazel line does not have, an OS the test has no
 /// tool for): `SKIP (n/a)` and a `skipped` report, also on a required cell.
+/// Never for something the cell is merely missing: a required cell whose
+/// test ran nothing must fail, so that is [`skip`].
 pub fn skip_na(report: &Report, why: &str) -> PathBuf {
     println!("SKIP (n/a) {}: {why}", report.test);
     report.write_in(&probe_dir(), Status::Skipped, Some(why))

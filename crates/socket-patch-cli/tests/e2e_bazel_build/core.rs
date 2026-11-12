@@ -5,13 +5,14 @@
 //! write it: the lock's URL moves to the Socket host and its sha256 and
 //! derived hash follow. The tests then show, with Bazel's own output, that
 //! a build consumes the pinned bytes, that other bytes at the pinned URL
-//! fail the build, that a `.bazelignore` line is what keeps a tree out of
-//! `//...`, which lock governs a hub that two dependency systems declare,
-//! and that the fixture builds with no network at all. Every later
-//! `bazel_core_` test stands on these.
+//! fail the build, that a pin without its derived hash does not load, that
+//! a `.bazelignore` line is what keeps a tree out of `//...`, which lock
+//! governs a hub that two dependency systems declare, and that the fixture
+//! builds with no network at all. Every later `bazel_core_` test stands on
+//! these.
 //!
-//! The first three tests run no Bazel: they keep the fixture copies, the
-//! committed payloads and `MATRIX.json` in step.
+//! The first four tests run no Bazel: they keep the fixture copies, the
+//! committed payloads, `MATRIX.json` and the registry manifest in step.
 
 use std::path::{Path, PathBuf};
 
@@ -30,6 +31,8 @@ const DEP_OUT: &str = "dep.sh";
 /// Tier 0 names the package file by this part of its label, whatever the
 /// line calls the spoke repository (`toy_dep`, `_main~toy~toy_dep`, `+toy+toy_dep`).
 const DEP_LABEL: &str = "toy_dep//file:";
+/// Where every proxy of a zero-network cell points: nothing listens there.
+const CLOSED_PORT: &str = "http://127.0.0.1:9";
 
 /// Every fixture workspace: `core/<system>/e<major>`.
 fn fixture_dirs() -> Vec<PathBuf> {
@@ -177,12 +180,35 @@ fn core_matrix_names_real_fixtures_versions_and_tests() {
             let has_fixture = |cell: &serde_json::Value| {
                 cell["bazel"] == *bazel && (system == "any" || !cell["fixtures"][system].is_null())
             };
+            let mut claimed = cells.filter(|cell| has_fixture(cell)).peekable();
             assert!(
-                cells.clone().any(has_fixture),
+                claimed.peek().is_some(),
                 "{name}: no {system} cell on {bazel}"
             );
+            // A claim holds on every OS of its cells, unless it names the
+            // ones it holds on: those are then OSes each of its cells has.
+            let Some(scope) = claim.get("os") else {
+                continue;
+            };
+            let scope = scope.as_array().expect("os");
+            assert!(!scope.is_empty(), "{name}: an empty os list claims nothing");
+            for cell in claimed {
+                let runs_on = cell["os"].as_array().expect("a cell's os");
+                let stray: Vec<_> = scope.iter().filter(|os| !runs_on.contains(os)).collect();
+                assert!(stray.is_empty(), "{name}: no {bazel} cell on {stray:?}");
+            }
         }
     }
+    // The test that kills the server with SIGKILL reports `skipped` off
+    // Unix (launch.rs), so it claims no Windows cell.
+    let unix_only = &tests["bazel_core_shutdown_after_the_server_was_killed"]["os"];
+    let unix_only = unix_only
+        .as_array()
+        .expect("the SIGKILL test names its OSes");
+    assert!(
+        !unix_only.iter().any(|os| os == "windows-latest"),
+        "{unix_only:?}"
+    );
     // And the reverse for this file: each of its real-Bazel tests is listed.
     for line in read(&suite.join("core.rs")).lines() {
         if let Some(name) = line.strip_prefix("fn bazel_core_") {
@@ -190,6 +216,48 @@ fn core_matrix_names_real_fixtures_versions_and_tests() {
             assert!(tests.contains_key(&name), "{name} is not in MATRIX.json");
         }
     }
+}
+
+/// Every cell of `core/MATRIX.json` can open its toy tests: its Bazel
+/// version is in the registry manifest, and where the module archives are
+/// not committed the manifest names them for each dependency system the
+/// cell has a fixture for, which is what a cold cell is given from the
+/// repository cache. No list names a toy package.
+#[test]
+fn every_core_cell_has_its_registry_mirror_and_archives() {
+    let json = |rel: &str| -> serde_json::Value {
+        serde_json::from_str(&read(&fixtures_root().join(rel))).expect(rel)
+    };
+    let (matrix, manifest) = (json("core/MATRIX.json"), json("registry/MANIFEST.json"));
+    let packages = toy::payload_digests();
+    assert!(!packages.is_empty(), "no toy package under core/payloads");
+    let mut gated = 0;
+    for cell in matrix["cells"].as_array().expect("cells") {
+        let bazel = cell["bazel"].as_str().expect("bazel");
+        let version = Version::parse(bazel).expect("a Bazel version");
+        for system in [System::Bzlmod, System::Workspace, System::Hybrid] {
+            let fixture = cell["fixtures"].get(system.name());
+            let present = fixture.is_some();
+            if let Some(fixture) = fixture {
+                assert_eq!(*fixture, toy::fixture_of(&version, system), "{bazel}");
+            }
+            let digests = match toy::gate(&version, system, &manifest, present, false) {
+                toy::Gate::Run(toy::Mirror::Committed) => continue,
+                toy::Gate::Run(toy::Mirror::Cached(digests)) => digests,
+                // A line without the system has no fixture of it either.
+                toy::Gate::NotApplicable(_) if !present => continue,
+                other => panic!("{bazel} {}: {other:?}", system.name()),
+            };
+            assert!(!digests.is_empty(), "{bazel} {}", system.name());
+            let named: Vec<_> = digests.iter().filter(|d| packages.contains(d)).collect();
+            assert!(
+                named.is_empty(),
+                "{bazel}: a list names toy packages {named:?}"
+            );
+            gated += 1;
+        }
+    }
+    assert!(gated > 0, "no cell runs on cached archives: is 8.8.2 gone?");
 }
 
 /// The scenario of design 9.3 with the pin applied by hand: baseline,
@@ -266,10 +334,24 @@ fn toy_pin_tamper_twin(test: &str, system: System) {
     let last = tampered.len() - 2;
     tampered[last] ^= 0x01;
     toy.pin(LOCK, DEP, tampered.clone());
+    let (got, want) = (toy::sha256_hex(&tampered), toy::sha256_hex(&patched));
+    // Neither digest is cached, before the build and after it: the pin is
+    // a request the host answers, and nothing is kept under it.
+    let cached = toy
+        .cell
+        .scratch
+        .repository_cache
+        .join("content_addressable/sha256");
+    let neither_cached = || !cached.join(&want).exists() && !cached.join(&got).exists();
+    assert!(neither_cached(), "{test}: the repository cache is not cold");
+    let early = toy.server.requests();
+    assert!(
+        early.is_empty(),
+        "{test}: requests before the one build: {early:?}"
+    );
 
     let run = toy.cell.failing_fetch("build", &[PROBE]);
     assert!(!run.ok(), "the tampered pin built:\n{}", run.dump());
-    let (got, want) = (toy::sha256_hex(&tampered), toy::sha256_hex(&patched));
     let refusal = format!("Checksum was {got} but wanted {want}");
     assert!(run.stderr().contains(&refusal), "{}", run.dump());
     let requests = toy.server.assert_requested(&DEP.hosted_url(), test);
@@ -277,13 +359,7 @@ fn toy_pin_tamper_twin(test: &str, system: System) {
         requests.iter().all(|request| request.status == 200),
         "{requests:?}"
     );
-    // Nothing was kept under the pinned digest.
-    let cached = toy
-        .cell
-        .scratch
-        .repository_cache
-        .join("content_addressable/sha256");
-    assert!(!cached.join(&want).exists() && !cached.join(&got).exists());
+    assert!(neither_cached(), "{test}: the tampered download was kept");
     toy.finish();
 }
 
@@ -300,6 +376,37 @@ fn bazel_core_toy_pin_tamper_twin_workspace() {
         "bazel_core_toy_pin_tamper_twin_workspace",
         System::Workspace,
     );
+}
+
+/// The derived value is enforced: a toy lock whose sha256 changed while
+/// `pinsHash` stayed does not load, on any entry point (`_packages` in
+/// `toy.bzl` is shared by all three; Bzlmod is the one run here). Every
+/// test that rewrites a pin relies on this check to show that the derived
+/// hash it wrote is the right one. The message carries both values, so
+/// this is also Starlark's `hash()` against the product's own.
+#[test]
+#[ignore = "real Bazel; run with --ignored"]
+fn bazel_core_toy_lock_needs_its_derived_hash() {
+    const TEST: &str = "bazel_core_toy_lock_needs_its_derived_hash";
+    let Some(toy) = toy::open(TEST, System::Bzlmod, false) else {
+        return;
+    };
+    let lock = toy.read(LOCK);
+    let (upstream, patched) = (DEP.upstream(), DEP.patched());
+    let (from, to) = (toy::sha256_hex(&upstream), toy::sha256_hex(&patched));
+    assert_eq!(lock.matches(&from).count(), 1, "{lock}");
+    let edited = lock.replace(&from, &to);
+    toy.cell.write(LOCK, &edited);
+
+    let run = toy.cell.failing_fetch("build", &[PROBE]);
+    assert!(!run.ok(), "the half-edited lock built:\n{}", run.dump());
+    let refusal = format!(
+        "toy lock: pinsHash is {} but the pins hash to {}",
+        toy::pins_hash(&lock),
+        toy::pins_hash(&edited)
+    );
+    assert!(run.stderr().contains(&refusal), "{}", run.dump());
+    toy.finish();
 }
 
 /// A tree under `.socket` that holds a BUILD file Bazel cannot load (an
@@ -374,6 +481,27 @@ fn bazel_core_zero_network() {
     let lock = std::fs::read(committed).expect("read the committed lock");
     toy.cell.write_module_lock(&lock);
     toy.cell.options.lockfile_mode = "error";
+    // The condition the claim names. In a healthy run every request is
+    // rewritten to loopback, which `NO_PROXY` exempts, so no outcome below
+    // would notice a cell that left the proxies alone: it is asserted on
+    // the command every build of this cell is made from.
+    assert!(
+        toy.cell.options.closed_proxies,
+        "{TEST}: the proxies are open"
+    );
+    assert!(
+        toy.cell.options.downloader_config.is_some(),
+        "{TEST}: no downloader rewrite"
+    );
+    let build = toy
+        .cell
+        .command_with(&toy.cell.options, "build", &["//..."]);
+    for proxy in ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"] {
+        let value = build.get_envs().find(|(name, _)| *name == proxy);
+        let value = value.and_then(|(_, value)| value);
+        assert_eq!(value, Some(CLOSED_PORT.as_ref()), "{TEST}: {proxy}");
+    }
+    toy.cell.report.detail("closed_proxies", true);
     let cell = &toy.cell;
 
     cell.bazel_ok("build", &["//..."]);
@@ -506,7 +634,8 @@ fn bazel_core_toy_facts_go_stale() {
     };
     let cell = &toy.cell;
     if !cell.scratch.workspace.join("facts").is_dir() {
-        // `extension_metadata(facts = ...)` arrived in Bazel 8.6.
+        // `extension_metadata(facts = ...)` exists in Bazel 8.5.0 and later
+        // (probed from 8.6.0; 8.4.2 rejects the keyword).
         probe_report::skip_na(&cell.report, "this era's fixture has no facts hub");
         return;
     }
