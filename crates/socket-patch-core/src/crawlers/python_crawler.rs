@@ -3530,6 +3530,18 @@ impl PythonCrawler {
         &self,
         options: &CrawlerOptions,
     ) -> Result<Vec<PathBuf>, std::io::Error> {
+        let var = |name: &str| std::env::var(name).ok();
+        self.get_site_packages_paths_with(options, &var).await
+    }
+
+    /// [`Self::get_site_packages_paths`] over an explicit environment, so
+    /// tests don't depend on (or mutate) the process's `VIRTUAL_ENV`,
+    /// `CONDA_PREFIX` and the rest.
+    async fn get_site_packages_paths_with(
+        &self,
+        options: &CrawlerOptions,
+        var: &impl Fn(&str) -> Option<String>,
+    ) -> Result<Vec<PathBuf>, std::io::Error> {
         if options.global || options.global_prefix.is_some() {
             self.shadowed_lock().clear();
             if let Some(ref custom) = options.global_prefix {
@@ -3537,19 +3549,28 @@ impl PythonCrawler {
             }
             return Ok(get_global_python_site_packages().await);
         }
-        let var = |name: &str| std::env::var(name).ok();
-        let sites = local_site_packages_with(&options.cwd, &var).await;
+        let sites = local_site_packages_with(&options.cwd, var).await;
         self.set_search_order(&sites).await;
         Ok(sites)
     }
 
     /// Crawl all discovered `site-packages` and return every package found.
     pub async fn crawl_all(&self, options: &CrawlerOptions) -> Vec<CrawledPackage> {
+        let var = |name: &str| std::env::var(name).ok();
+        self.crawl_all_with(options, &var).await
+    }
+
+    /// [`Self::crawl_all`] over an explicit environment.
+    async fn crawl_all_with(
+        &self,
+        options: &CrawlerOptions,
+        var: &impl Fn(&str) -> Option<String>,
+    ) -> Vec<CrawledPackage> {
         let mut packages = Vec::new();
         let mut seen = HashSet::new();
 
         let sp_paths = self
-            .get_site_packages_paths(options)
+            .get_site_packages_paths_with(options, var)
             .await
             .unwrap_or_default();
 
@@ -3905,6 +3926,13 @@ mod tests {
         (python, site)
     }
 
+    /// An empty environment: crawl tests that don't set a variable must not
+    /// see the host's (an activated `VIRTUAL_ENV` would replace the
+    /// fixture's `.venv`).
+    fn no_env(_: &str) -> Option<String> {
+        None
+    }
+
     fn env_of(pairs: &[(&str, String)]) -> impl Fn(&str) -> Option<String> {
         let pairs: Vec<(String, String)> = pairs
             .iter()
@@ -4070,7 +4098,10 @@ mod tests {
             cwd: project,
             ..Default::default()
         };
-        let sites = crawler.get_site_packages_paths(&options).await.unwrap();
+        let sites = crawler
+            .get_site_packages_paths_with(&options, &no_env)
+            .await
+            .unwrap();
         assert!(sites.contains(&base_site), "{sites:?}");
         let purl = "pkg:pypi/sp409-six@1.16.0".to_string();
         let found = crawler
@@ -4078,7 +4109,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(found[&purl].path, base_site);
-        let crawled = crawler.crawl_all(&options).await;
+        let crawled = crawler.crawl_all_with(&options, &no_env).await;
         assert!(
             crawled
                 .iter()
@@ -4105,7 +4136,10 @@ mod tests {
             cwd: project,
             ..Default::default()
         };
-        let sites = crawler.get_site_packages_paths(&options).await.unwrap();
+        let sites = crawler
+            .get_site_packages_paths_with(&options, &no_env)
+            .await
+            .unwrap();
         let purls: Vec<String> = [
             "pkg:pypi/sp409-six@1.16.0",
             "pkg:pypi/sp409-idna@3.6",
@@ -4129,7 +4163,7 @@ mod tests {
         );
         let in_venv = crawler.find_by_purls(&venv_site, &purls).await.unwrap();
         assert!(in_venv.contains_key("pkg:pypi/sp409-six@1.16.0"));
-        let crawled = crawler.crawl_all(&options).await;
+        let crawled = crawler.crawl_all_with(&options, &no_env).await;
         assert!(
             !crawled
                 .iter()
@@ -6615,6 +6649,8 @@ G=
         }
         let _guard = Guard::new(&[
             ("VIRTUAL_ENV", None),
+            // Poetry takes a non-base conda env like an activated venv.
+            ("CONDA_PREFIX", None),
             ("POETRY_VIRTUALENVS_PATH", Some(venvs.to_str().unwrap())),
             ("POETRY_VIRTUALENVS_IN_PROJECT", None),
             ("POETRY_VIRTUALENVS_CREATE", None),
@@ -7577,7 +7613,7 @@ G=
             global: false,
             global_prefix: None,
         };
-        let packages = crawler.crawl_all(&options).await;
+        let packages = crawler.crawl_all_with(&options, &no_env).await;
         assert_eq!(packages.len(), 1);
         assert_eq!(packages[0].name, "urllib3");
         assert_eq!(packages[0].version, "2.0.7");
@@ -7616,7 +7652,7 @@ G=
             global: false,
             global_prefix: None,
         };
-        let packages = crawler.crawl_all(&options).await;
+        let packages = crawler.crawl_all_with(&options, &no_env).await;
         assert_eq!(packages.len(), 1);
         assert_eq!(packages[0].name, "flask-sqlalchemy");
         assert_eq!(packages[0].version, "3.0.5");
@@ -7838,7 +7874,7 @@ G=
             global_prefix: None,
         };
 
-        let packages = crawler.crawl_all(&options).await;
+        let packages = crawler.crawl_all_with(&options, &no_env).await;
         assert_eq!(packages.len(), 1);
         assert_eq!(packages[0].name, "requests");
         assert_eq!(packages[0].version, "2.28.0");
