@@ -10,7 +10,9 @@ name: Bazel patch compatibility
 # prints the cells of the event, so a package adds a cell by editing the
 # MATRIX.json of its own fixtures and nobody edits this file. A cell is
 # every test of one (fixture group, Bazel, runner, test-name prefix), run
-# with `--exact`: it runs the tests its matrices list and no other.
+# with `--exact`: it runs the tests its matrices list and no other. The toy
+# group is all in one: its `core` cell also runs the guard tests that use
+# the toy fixture, which ci.yml's `bazel_core_` row does not select.
 #
 # Tiers. A matrix entry is `pr` or `nightly`:
 #   * pull_request (the paths below): the `pr` entries.

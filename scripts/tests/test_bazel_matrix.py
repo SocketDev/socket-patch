@@ -124,7 +124,8 @@ class CommittedMatrices(unittest.TestCase):
         nothing would look covered."""
         files = [rel for rel, _ in tool.matrices()]
         self.assertIn("core/MATRIX.json", files)
-        self.assertGreaterEqual(len(files), 15)
+        self.assertIn("core/guard/MATRIX.json", files)
+        self.assertGreaterEqual(len(files), 16)
         for rel in files:
             with self.subTest(matrix=rel):
                 self.assertTrue([e for e in ENTRIES if e["matrix"] == rel], "plans no entry")
@@ -159,6 +160,29 @@ class CommittedMatrices(unittest.TestCase):
         # a ruleset or a language toolchain.
         self.assertEqual([cell["id"] for cell in PR], ["core-9.3.2-ubuntu-core"])
         self.assertEqual(PR[0]["cache"], "")
+
+    def test_a_toy_cell_is_all_in_one(self):
+        """DESIGN 9.5: a core cell runs every gating test of the toy fixture
+        on its Bazel and runner, whatever the prefix; its canaries keep a
+        record-only cell of their own."""
+        guards = {name for name in TESTS if name.startswith("bazel_guard_ignore_")}
+        self.assertEqual(len(guards), 2)
+        by_id = {cell["id"]: cell for cell in FULL}
+        for cell_id in ("core-9.3.2-ubuntu-core", "core-9.3.2-macos-core", "core-7.7.2-ubuntu-core"):
+            tests = set(by_id[cell_id]["tests"])
+            self.assertLessEqual(guards, tests, cell_id)
+            self.assertIn("bazel_core_zero_network", tests)
+        # Listed for ubuntu and macOS on 9.3.2 and 7.7.2 only.
+        for cell_id in ("core-9.3.2-windows-core", "core-8.8.2-ubuntu-core"):
+            self.assertFalse(guards & set(by_id[cell_id]["tests"]), cell_id)
+        self.assertFalse([cell for cell in FULL if cell["group"] == "core" and cell["mode"] == "guard"])
+        self.assertLessEqual(guards, set(PR[0]["tests"]))
+        self.assertEqual({cell["mode"] for cell in FULL if cell["group"] == "core"}, {"core", "canary"})
+        # A ruleset group keeps one cell per prefix.
+        entry = {"group": "light", "bazel": "9.3.2", "os": "ubuntu-latest", "test": "bazel_guard_x"}
+        self.assertEqual(tool.cell_id(entry), "light-9.3.2-ubuntu-guard")
+        self.assertEqual(tool.cell_id(dict(entry, group="core")), "core-9.3.2-ubuntu-core")
+        self.assertEqual(tool.cell_id(dict(entry, group="core", test="bazel_canary_x")), "core-9.3.2-ubuntu-canary")
 
     def test_cells_carry_what_the_workflow_reads(self):
         ids = [cell["id"] for cell in FULL]

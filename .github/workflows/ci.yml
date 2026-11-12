@@ -1528,8 +1528,9 @@ jobs:
           # loopback fixture server. `bazel:` installs that exact release
           # below (pinned sha256, scripts/bazel-pins.txt) and makes the leg
           # fail instead of skip when Bazel is missing. Claimed on 9.3.2
-          # only. Every other Bazel line, fixture group, OS and the report
-          # audit run in bazel-compatibility.yml, whose cells come from the
+          # only. Every other Bazel line, fixture group and OS, the guard
+          # tests on the toy fixture (`bazel_guard_`) and the report audit
+          # run in bazel-compatibility.yml, whose cells come from the
           # fixtures' MATRIX.json files (scripts/bazel-matrix.py).
           - {os: ubuntu-latest, suite: e2e_bazel_build, bazel: '9.3.2', test_filter: '--ignored bazel_core_'}
     runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS != 'true' && (matrix.os == 'ubuntu-latest' && 'depot-ubuntu-24.04-4' || matrix.os == 'ubuntu-22.04' && 'depot-ubuntu-22.04-4') || matrix.os }}

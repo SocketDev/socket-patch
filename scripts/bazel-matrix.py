@@ -28,10 +28,12 @@ and heavy matrices give one tier per (fixture, Bazel) and name no runner;
 
 A cell is one CI job: every entry of one (group, Bazel, runner, mode), where
 the mode is the test-name prefix (`bazel_core_`, `bazel_guard_`,
-`bazel_agent_`, `bazel_hosted_`, `bazel_vendor_`, `bazel_canary_`). Its
-libtest filter is `--exact` with the full path of each test, so a cell runs
-the tests its matrices list and no other: a prefix would also run the
-nightly tests of the same mode in the pull-request tier.
+`bazel_agent_`, `bazel_hosted_`, `bazel_vendor_`, `bazel_canary_`). The toy
+group is "all in one" (DESIGN 9.5): every gating test of it shares the
+`core` cell of its Bazel and runner, whatever its prefix. A cell's libtest
+filter is `--exact` with the full path of each test, so it runs the tests
+its matrices list and no other: a prefix would also run the nightly tests
+of the same mode in the pull-request tier.
 
   bazel-matrix.py --check
       Hold the matrices to the rules below and to the suite's sources.
@@ -483,8 +485,18 @@ def tiers_of(event, labels=()):
     return TIERS
 
 
+def cell_mode(e):
+    """The cell an entry joins within its (group, Bazel, runner): its
+    test-name prefix, except that the toy group's gating tests all share
+    the `core` cell. A core-group guard test costs seconds on a fixture
+    with no ruleset, and a job of its own would spend most of its time on
+    setup; a canary keeps its own cell, because it is record-only."""
+    mode = mode_of(e["test"])
+    return "core" if e["group"] == "core" and mode not in RECORD_ONLY_MODES else mode
+
+
 def cell_id(e):
-    return "-".join((e["group"], e["bazel"], e["os"].split("-")[0], mode_of(e["test"])))
+    return "-".join((e["group"], e["bazel"], e["os"].split("-")[0], cell_mode(e)))
 
 
 def plan(found, tiers, tests):
@@ -497,7 +509,7 @@ def plan(found, tiers, tests):
     out = []
     for key in sorted(cells):
         members = sorted(cells[key], key=lambda e: e["test"])
-        first, mode = members[0], mode_of(members[0]["test"])
+        first, mode = members[0], cell_mode(members[0])
         prerelease = re.fullmatch(r"\d+\.\d+\.\d+", first["bazel"]) is None
         record_only = mode in RECORD_ONLY_MODES or prerelease
         # DESIGN 9.5: 30 minutes, Windows 60. A baseline cell builds every

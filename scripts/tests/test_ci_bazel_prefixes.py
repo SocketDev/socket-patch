@@ -110,8 +110,12 @@ class CiRow(unittest.TestCase):
         self.assertEqual(selected, set(core["tests"]))
         planned = next(c for c in matrix.plan(matrix.entries(), ("pr",), matrix.suite_tests())
                        if c["id"] == "core-9.3.2-ubuntu-core")
-        self.assertTrue(set(planned["tests"]) <= selected)
-        self.assertGreaterEqual(len(planned["tests"]), 9)
+        # The cell also holds the toy guard tests, which the row's prefix
+        # leaves to bazel-compatibility.yml.
+        in_row = {name for name in planned["tests"] if prefix in name}
+        self.assertTrue(in_row <= selected)
+        self.assertGreaterEqual(len(in_row), 9)
+        self.assertTrue(all(name.startswith("bazel_guard_") for name in set(planned["tests"]) - in_row))
 
     def test_the_install_steps_key_on_the_row(self):
         steps = dict(rows_mod.steps(CI_JOBS["e2e"]))

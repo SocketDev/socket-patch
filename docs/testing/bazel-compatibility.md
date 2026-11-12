@@ -371,8 +371,14 @@ its tests, the Bazel releases each runs on and a tier (`pr` or `nightly`).
 `scripts/bazel-matrix.py` reads all of them and prints the cells of an event:
 one cell per (fixture group, Bazel, runner, test-name prefix), run with
 `--exact` and the full path of each test, so a cell runs the tests its
-matrices list and no other. To add a cell, edit the `MATRIX.json` of your
-fixtures; nobody edits the workflow.
+matrices list and no other. The toy group is all in one: its `core` cell
+also runs the guard tests that use the toy fixture
+(`core/guard/MATRIX.json`), which the `bazel_core_` row of `ci.yml` does not
+select. To add a cell, edit the `MATRIX.json` of your fixtures; nobody edits
+the workflow. A new `#[ignore]` test that no matrix lists fails `--check`: a
+`bazel_core_` test goes into `core/MATRIX.json`, any other test on the toy
+fixture into `core/guard/MATRIX.json` (or a file of the same shape with its
+own `filter`), and a ruleset's test under its fixture in the ruleset's file.
 
 ```sh
 python3 scripts/bazel-matrix.py --check                  # the rules below
