@@ -18,8 +18,12 @@ crate.from_cargo(
     name = "crates",
     cargo_lock = "//:Cargo.lock",
     cargo_toml = "//:Cargo.toml",
+    # Every platform a cell of this fixture runs on: a crate is incompatible
+    # with any target platform that is not listed here.
     platform_triples = [
         "aarch64-apple-darwin",
+        "aarch64-unknown-linux-gnu",
+        "x86_64-pc-windows-msvc",
         "x86_64-unknown-linux-gnu",
     ],
 )

@@ -58,14 +58,16 @@
       "fixture": "heavy/rules_python/bzlmod/e9-compile",
       "test": "bazel_canary_baseline_rules_python_bzlmod_e9_compile",
       "system": "bzlmod",
-      "shape": "pip.parse plus compile_pip_requirements over the same file: the lock check target a rewrite would turn red",
+      "shape": "pip.parse plus compile_pip_requirements over the same file: the lock check target a rewrite would turn red. Bazel's downloader fetches the hub; the check itself resolves with pip, from the pip-mode index",
       "pins": {"rules_python": "2.5.0-rc4"},
-      "registries": ["pypi"],
+      "registries": ["pypi", "pypi-pip"],
       "fetch": "downloader",
       "hosts": ["bcr.bazel.build", "github.com", "pypi.org", "files.pythonhosted.org"],
       "probe": {"label": "spvictim-1.0.0-py3-none-any.whl", "sha256": "cecf23d2e612215c6512613873a29337301ed66f92a1e81810ce20d8f3bab993", "output": "spvictim-1.0.0-py3-none-any.whl"},
       "consumer": "SPVICTIM=vulnerable",
       "toolchains": [],
+      "substitute": ["BUILD.bazel"],
+      "test_targets": ["//:requirements.test"],
       "cells": [
         {"bazel": "9.3.2", "proof": 2, "tier": "nightly", "evidence": "rules-python Y6 (rp2.5.0-index-b9.3.2)"}
       ]
@@ -78,6 +80,7 @@
       "pins": {"rules_python": "1.4.2"},
       "registries": ["pypi-pip"],
       "fetch": "tool",
+      "hosted_fetch": "downloader",
       "hosts": ["bcr.bazel.build", "github.com", "files.pythonhosted.org"],
       "probe": {"label": "spvictim-1.0.0-py3-none-any.whl", "sha256": "cecf23d2e612215c6512613873a29337301ed66f92a1e81810ce20d8f3bab993", "output": "spvictim-1.0.0-py3-none-any.whl"},
       "consumer": "SPVICTIM=vulnerable",
@@ -95,11 +98,13 @@
       "pins": {"rules_python": "1.3.0"},
       "registries": ["pypi-pip"],
       "fetch": "tool",
+      "hosted_fetch": "downloader",
       "hosts": ["bcr.bazel.build", "github.com", "files.pythonhosted.org"],
       "probe": {"label": "spvictim-1.0.0-py3-none-any.whl", "sha256": "cecf23d2e612215c6512613873a29337301ed66f92a1e81810ce20d8f3bab993", "output": "spvictim-1.0.0-py3-none-any.whl"},
       "consumer": "SPVICTIM=vulnerable",
       "toolchains": ["python_3_11"],
       "substitute": ["MODULE.bazel"],
+      "lock": {"records": {"extension": "//python/extensions:pip.bzl%pip", "files": ["requirements.txt"]}},
       "cells": [
         {"bazel": "7.7.2", "proof": 2, "tier": "nightly", "evidence": "rules-python B2 (rp1.3.0-pip-b7.7.2)"}
       ]
