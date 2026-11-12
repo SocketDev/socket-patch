@@ -101,6 +101,18 @@ fn scan_usage_errors_print_the_coded_error() {
         "scan",
         "invalid_env",
     );
+    assert_envelope_usage(
+        &[
+            "scan",
+            "--mode",
+            "agent",
+            "--json",
+            "--selection-filter",
+            "no-such-filter.json",
+        ],
+        "scan",
+        "filter_invalid",
+    );
 }
 
 #[test]

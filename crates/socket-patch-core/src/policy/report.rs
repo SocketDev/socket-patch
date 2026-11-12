@@ -68,7 +68,7 @@ pub fn policy_block(
             })
         })
         .collect();
-    serde_json::json!({
+    let mut block = serde_json::json!({
         "source": policy.source().as_str(),
         "path": path,
         "sha256": sha256,
@@ -80,5 +80,10 @@ pub fn policy_block(
         "counts": { "filtered": filtered.len(), "retained": retained.len() },
         "filtered": filtered,
         "retained": retained,
-    })
+    });
+    // Only on a run given a selection filter (`scan --selection-filter`).
+    if let Some(filter) = policy.filter() {
+        block["selectionFilter"] = filter.summary();
+    }
+    block
 }

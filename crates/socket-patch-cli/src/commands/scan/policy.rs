@@ -27,6 +27,9 @@ use crate::commands::projects_below::{lock_markers, RepoPolicy};
 pub(crate) enum PolicyLoadError {
     /// A malformed flag or env value: exit 2.
     Usage(String),
+    /// A `--selection-filter` file that cannot be honored: exit 2,
+    /// `error.code` `filter_invalid`.
+    Filter(String),
     /// A policy file that cannot be honored: exit 1, `error.code`.
     Policy(PolicyError),
 }
@@ -51,12 +54,21 @@ pub(crate) struct InvocationPolicy {
 }
 
 /// Load the policy for `args` (4.5): `--global` scans have no repo and read
-/// no file; everything else reads the repo root's socket.yml.
+/// no file; everything else reads the repo root's socket.yml. The
+/// invocation's selection filter narrows either.
 pub(crate) fn load_invocation_policy(args: &ScanArgs) -> Result<InvocationPolicy, PolicyLoadError> {
     let overrides = args
         .socket_yml
         .overrides()
         .map_err(PolicyLoadError::Usage)?;
+    let filter = args
+        .socket_yml
+        .load_selection_filter()
+        .map_err(PolicyLoadError::Filter)?;
+    let filtered = |policy: SelectionPolicy| match filter {
+        Some(filter) => policy.with_filter(filter),
+        None => policy,
+    };
     let cwd = std::fs::canonicalize(&args.common.cwd).unwrap_or_else(|_| args.common.cwd.clone());
     if args.common.is_global() {
         let policy = SelectionPolicy::load(
@@ -66,7 +78,7 @@ pub(crate) fn load_invocation_policy(args: &ScanArgs) -> Result<InvocationPolicy
         .map_err(PolicyLoadError::Policy)?
         .0;
         return Ok(InvocationPolicy {
-            policy,
+            policy: filtered(policy),
             repo_root: cwd,
             warnings: Vec::new(),
             warned: Default::default(),
@@ -78,7 +90,7 @@ pub(crate) fn load_invocation_policy(args: &ScanArgs) -> Result<InvocationPolicy
     // project directories reads it.
     let repo = RepoPolicy::load(&cwd, &overrides).map_err(PolicyLoadError::Policy)?;
     Ok(InvocationPolicy {
-        policy: repo.policy,
+        policy: filtered(repo.policy),
         repo_root: repo.repo_root,
         warnings: repo.warnings,
         warned: Default::default(),
@@ -505,11 +517,26 @@ impl ScanPolicy {
     }
 
     /// Steps 5-6: group the tier-accessible offers, keep retained packages
-    /// out, apply the severity floor and pick one patch per package with
-    /// the canonical ranking. With no floor the result is exactly today's
-    /// top-ranked selection. The floor never moves a package off its
-    /// recorded patch unless an admitted patch outranks the recorded one,
-    /// and a recorded package with nothing above the floor keeps its patch.
+    /// out, apply the selection filter and the severity floor, and pick one
+    /// patch per package with the canonical ranking. With neither the
+    /// result is exactly the top-ranked selection.
+    ///
+    /// Both only decide which patches may win, never how they rank. A
+    /// selection filter (`--selection-filter`) withholds a patch when no
+    /// advisory it fixes needs a fix; a patch that fixes one that does is
+    /// admitted whole, a merged patch with its unreachable fixes included.
+    /// Its one preference: when exactly one advisory of the package needs
+    /// a fix, an admitted patch that fixes it and nothing else wins over a
+    /// merged one.
+    ///
+    /// A recorded package with no admitted patch keeps its patch, and a
+    /// recorded patch that outranks every admitted one is kept. Two things
+    /// are particular to the filter. A recorded patch it withholds gives
+    /// way to an admitted one: it fixes nothing that needs a fix
+    /// ([`Offers::withheld`] tells the classification). And a package
+    /// already on a merged patch the filter wants follows the usual
+    /// ranking alone: the preference neither trades it for the smaller
+    /// patch nor holds it back from a better merged one.
     pub(crate) fn select(&self, accessible: Vec<PatchSearchResult>) -> Offers {
         let mut grouped: BTreeMap<String, Vec<PatchSearchResult>> = BTreeMap::new();
         {
@@ -527,10 +554,7 @@ impl ScanPolicy {
         for group in grouped.values_mut() {
             group.sort_by(cmp_search_results);
         }
-        let mut offers = Offers {
-            unfiltered: BTreeMap::new(),
-            selected: BTreeMap::new(),
-        };
+        let mut offers = Offers::default();
         let mut report = self.report();
         for (purl, group) in grouped {
             let recorded = self.recorded_uuid(&purl).map(str::to_string);
@@ -559,28 +583,47 @@ impl ScanPolicy {
                 }
                 continue;
             }
-            let floor_winner = group
-                .iter()
-                .position(|p| self.policy.admits_severity(patch_severity_order(p)).is_ok());
+            // `group` is in canonical order: the first admitted offer is
+            // the usual winner.
+            let judged = self.policy.judge_offers(&group);
+            let withheld = &judged.withheld;
+            let admits = |i: usize| match &withheld[i] {
+                Some(reason) => Err(reason.clone()),
+                None => self.policy.admits_severity(patch_severity_order(&group[i])),
+            };
             let recorded_at = recorded
                 .as_deref()
                 .and_then(|uuid| group.iter().position(|p| p.uuid == uuid));
-            let chosen = match (recorded.is_some(), floor_winner, recorded_at) {
-                // The recorded patch outranks every admitted one: keep it.
-                (true, Some(w), Some(r)) if r < w => Some(r),
+            // The filter's one preference (empty without a filter): the
+            // best-ranked admitted patch for the package's only needed
+            // advisory alone. A package already on a wanted merged patch
+            // is left to the usual ranking.
+            let on_wanted_merged =
+                recorded_at.is_some_and(|r| withheld[r].is_none() && !judged.sole_fix.contains(&r));
+            let preferred = judged
+                .sole_fix
+                .iter()
+                .copied()
+                .filter(|_| !on_wanted_merged)
+                .find(|&i| admits(i).is_ok());
+            let winner = preferred.or_else(|| (0..group.len()).find(|&i| admits(i).is_ok()));
+            let chosen = match (recorded.is_some(), winner, recorded_at) {
+                // The recorded patch outranks every admitted one: keep it,
+                // unless the filter withholds it.
+                (true, Some(w), Some(r)) if r < w && withheld[r].is_none() => Some(r),
                 (_, Some(w), _) => Some(w),
-                // Nothing above the floor: a recorded package keeps its patch.
+                // Nothing admitted: a recorded package keeps its patch.
                 (true, None, Some(r)) => Some(r),
                 (_, None, _) => None,
             };
-            // What the floor hid is reported: the top-ranked patch it withheld
-            // when the package ends up unpatched or held at its recorded patch
-            // (not when a lower-ranked admitted patch simply wins).
-            let top_withheld = self.policy.admits_severity(patch_severity_order(&group[0]));
-            if let Err(reason) = top_withheld {
-                let upgrade_withheld =
-                    chosen.is_some() && chosen == recorded_at && recorded_at != Some(0);
-                if chosen.is_none() || upgrade_withheld {
+            // What was hidden is reported: the top-ranked patch withheld
+            // when nothing was admitted, so the package ends up unpatched
+            // or held at its recorded patch. Not when an admitted patch
+            // wins, whether or not it was recorded already: a re-scan
+            // reports what the first scan did.
+            if let Err(reason) = admits(0) {
+                let held = chosen.is_some() && recorded_at != Some(0);
+                if winner.is_none() && (chosen.is_none() || held) {
                     report.filtered.push(FilteredEntry {
                         purl: Some(PurlKey::new(&purl).into_string()),
                         uuid: Some(group[0].uuid.clone()),
@@ -600,6 +643,11 @@ impl ScanPolicy {
                         .insert(PurlKey::new(&purl).into_string());
                 }
                 offers.selected.insert(purl.clone(), group[i].clone());
+            }
+            for (offer, reason) in group.iter().zip(withheld) {
+                if reason.is_some() {
+                    offers.withheld.insert((purl.clone(), offer.uuid.clone()));
+                }
             }
             offers.unfiltered.insert(purl, group);
         }
@@ -676,10 +724,14 @@ impl ScanPolicy {
         if filtered == 0 && retained == 0 && self.policy.enabled() {
             return;
         }
-        let label = match self.policy.source() {
-            PolicySource::File { path, .. } => format!("Policy ({path})"),
-            PolicySource::Bypassed => "Policy (socket.yml ignored)".to_string(),
-            PolicySource::None => "Policy (built-in defaults)".to_string(),
+        let source = match self.policy.source() {
+            PolicySource::File { path, .. } => path.clone(),
+            PolicySource::Bypassed => "socket.yml ignored".to_string(),
+            PolicySource::None => "built-in defaults".to_string(),
+        };
+        let label = match self.policy.filter() {
+            Some(_) => format!("Policy ({source} + selection filter)"),
+            None => format!("Policy ({source})"),
         };
         let mut line = format!(
             "\n{label}: {} skipped by filters, {} held.",
@@ -985,6 +1037,314 @@ mod tests {
             policy.report().shared_copies.get("pkg:npm/shared@1.0.0"),
             Some(&BTreeSet::from(["services/legacy".to_string()]))
         );
+    }
+
+    const A1: &str = "aaaaaaaa-0000-4000-8000-000000000001";
+    const B1: &str = "bbbbbbbb-0000-4000-8000-000000000001";
+    const CRIT: &str = "GHSA-cccc-cccc-cccc";
+    const HIGH: &str = "GHSA-hhhh-hhhh-hhhh";
+    const LOW: &str = "GHSA-llll-llll-llll";
+    const ALPHA: &str = "pkg:npm/alpha@1.0.0";
+
+    /// An offer for [`ALPHA`] fixing `advisories`: `(id, severity)`.
+    fn offer(uuid: &str, advisories: &[(&str, &str)]) -> PatchSearchResult {
+        offer_published(uuid, "2024-01-01T00:00:00Z", advisories)
+    }
+
+    fn offer_published(
+        uuid: &str,
+        published: &str,
+        advisories: &[(&str, &str)],
+    ) -> PatchSearchResult {
+        let vulnerabilities: serde_json::Map<String, serde_json::Value> = advisories
+            .iter()
+            .map(|(id, severity)| {
+                let advisory = serde_json::json!({
+                    "cves": [], "summary": "s", "severity": severity, "description": "d"
+                });
+                (id.to_string(), advisory)
+            })
+            .collect();
+        serde_json::from_value(serde_json::json!({
+            "uuid": uuid,
+            "purl": ALPHA,
+            "publishedAt": published,
+            "description": "d",
+            "license": "MIT",
+            "tier": "free",
+            "vulnerabilities": vulnerabilities,
+        }))
+        .unwrap()
+    }
+
+    /// A scan root's policy under the selection filter `filter` (and the
+    /// socket.yml `yml`), with `recorded` as [`ALPHA`]'s recorded patch.
+    fn filtered_policy(yml: &str, filter: &str, recorded: Option<&str>) -> ScanPolicy {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = std::fs::canonicalize(tmp.path()).unwrap();
+        project(&repo, true);
+        let mut invocation = invocation(&repo, yml);
+        let filter =
+            socket_patch_core::policy::filter::SelectionFilter::parse(filter.as_bytes()).unwrap();
+        invocation.policy = invocation.policy.with_filter(filter);
+        let mut policy = ScanPolicy::for_root(&invocation, &repo, true, false);
+        if let Some(uuid) = recorded {
+            let manifest: PatchManifest = serde_json::from_value(serde_json::json!({
+                "patches": { ALPHA: {
+                    "uuid": uuid, "exportedAt": "", "files": {}, "vulnerabilities": {},
+                    "description": "", "license": "", "tier": "free"
+                }}
+            }))
+            .unwrap();
+            policy.set_recorded(Some(&manifest));
+        }
+        policy
+    }
+
+    fn unreachable(id: &str) -> String {
+        format!(
+            r#"{{"version": 1, "reachability": [{{"advisory": "{id}", "state": "unreachable"}}]}}"#
+        )
+    }
+
+    fn filtered_entries(policy: &ScanPolicy) -> Vec<(String, String, String)> {
+        policy.json()["filtered"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| {
+                let field = |key: &str| f[key].as_str().unwrap_or_default().to_string();
+                (field("uuid"), field("reason"), field("detail"))
+            })
+            .collect()
+    }
+
+    /// The filter never changes how patches rank: a merged patch that fixes
+    /// one needed advisory is wanted whole, its unreachable critical
+    /// included, and wins as it always would. Only a patch that fixes
+    /// nothing needed steps aside.
+    #[test]
+    fn a_selection_filter_withholds_patches_but_never_reranks_them() {
+        let merged = offer(A1, &[(CRIT, "critical"), (LOW, "low")]);
+        let high = offer(B1, &[(HIGH, "high")]);
+        let plain = filtered_policy("", r#"{"version": 1}"#, None);
+        let offers = plain.select(vec![high.clone(), merged.clone()]);
+        assert_eq!(offers.selected[ALPHA].uuid, A1);
+        assert!(offers.withheld.is_empty());
+
+        // The merged patch's critical is unreachable, its low is not: it is
+        // still the top-ranked patch, and it is applied whole.
+        let policy = filtered_policy("", &unreachable(CRIT), None);
+        let offers = policy.select(vec![high.clone(), merged.clone()]);
+        assert_eq!(offers.selected[ALPHA].uuid, A1);
+        assert_eq!(offers.selected[ALPHA].vulnerabilities.len(), 2);
+        assert!(offers.withheld.is_empty());
+        assert!(filtered_entries(&policy).is_empty());
+
+        // A patch for the unreachable critical alone fixes nothing needed:
+        // the next-ranked patch wins, and the package is patched, so
+        // nothing is reported as skipped.
+        let critical = offer(A1, &[(CRIT, "critical")]);
+        let policy = filtered_policy("", &unreachable(CRIT), None);
+        let offers = policy.select(vec![critical, high]);
+        assert_eq!(offers.selected[ALPHA].uuid, B1);
+        assert_eq!(
+            offers.withheld,
+            BTreeSet::from([(ALPHA.to_string(), A1.to_string())])
+        );
+        assert_eq!(offers.unfiltered[ALPHA].len(), 2);
+        assert!(filtered_entries(&policy).is_empty());
+    }
+
+    /// A package whose every advisory is unreachable or skipped gets no
+    /// patch, and the top-ranked one withheld is reported.
+    #[test]
+    fn a_selection_filter_withholds_patches_nothing_needs() {
+        let filter = format!(
+            r#"{{"version": 1, "skip": {{"advisories": ["{HIGH}"]}},
+                "reachability": [{{"package": "{ALPHA}", "state": "unreachable"}}]}}"#
+        );
+        let policy = filtered_policy("", &filter, None);
+        // The newer patch is the lesser one: with nothing left to rank by,
+        // the one reported is still the best patch withheld.
+        let offers = policy.select(vec![
+            offer_published(B1, "2025-06-01T00:00:00Z", &[(HIGH, "high")]),
+            offer(A1, &[(CRIT, "critical"), (LOW, "low")]),
+        ]);
+        assert!(offers.selected.is_empty());
+        assert_eq!(offers.unfiltered[ALPHA].len(), 2);
+        assert_eq!(
+            filtered_entries(&policy),
+            [(
+                A1.to_string(),
+                "filter_not_needed".to_string(),
+                format!("{CRIT} unreachable, {LOW} unreachable")
+            )]
+        );
+        assert_eq!(policy.report().filtered[0].severity, Some(0));
+
+        // A recorded patch that is the best one withheld is no skip; a
+        // lesser recorded one reports the upgrade it was held from.
+        for (recorded, reported) in [(A1, None), (B1, Some(A1))] {
+            let policy = filtered_policy("", &filter, Some(recorded));
+            let offers = policy.select(vec![
+                offer_published(B1, "2025-06-01T00:00:00Z", &[(HIGH, "high")]),
+                offer(A1, &[(CRIT, "critical"), (LOW, "low")]),
+            ]);
+            assert_eq!(offers.selected[ALPHA].uuid, recorded);
+            let entries = filtered_entries(&policy);
+            assert_eq!(
+                entries.first().map(|e| e.0.as_str()),
+                reported,
+                "{entries:?}"
+            );
+        }
+    }
+
+    /// The filter's one preference: when exactly one advisory of the
+    /// package needs a fix, the patch that fixes it and nothing else wins
+    /// over a merged one. It is a preference among admitted patches, and
+    /// never trades away a recorded patch that fixes the same advisory.
+    #[test]
+    fn a_single_needed_advisory_takes_its_single_advisory_patch() {
+        let merged = offer(A1, &[(CRIT, "critical"), (HIGH, "high")]);
+        let single = offer(B1, &[(HIGH, "high")]);
+        let both = || vec![single.clone(), merged.clone()];
+
+        // Both advisories need a fix: the usual ranking takes the merged
+        // patch, with or without a filter.
+        for filter in [r#"{"version": 1}"#.to_string(), unreachable(LOW)] {
+            let policy = filtered_policy("", &filter, None);
+            assert_eq!(policy.select(both()).selected[ALPHA].uuid, A1);
+        }
+
+        // Only the high needs a fix, and one patch fixes it alone.
+        let policy = filtered_policy("", &unreachable(CRIT), None);
+        let offers = policy.select(both());
+        assert_eq!(offers.selected[ALPHA].uuid, B1);
+        assert!(offers.withheld.is_empty(), "the merged patch is wanted too");
+        assert!(filtered_entries(&policy).is_empty());
+
+        // A re-scan keeps what either earlier run recorded: the single
+        // patch is not upgraded to the merged one, and a recorded merged
+        // patch is not traded for the single one.
+        for recorded in [B1, A1] {
+            let policy = filtered_policy("", &unreachable(CRIT), Some(recorded));
+            assert_eq!(policy.select(both()).selected[ALPHA].uuid, recorded);
+            assert!(filtered_entries(&policy).is_empty());
+        }
+
+        // The floor still judges each patch whole: the single high patch
+        // is below a `critical` floor, the merged patch clears it.
+        let yml = "version: 2\npatches:\n  minSeverity: critical\n";
+        let policy = filtered_policy(yml, &unreachable(CRIT), None);
+        assert_eq!(policy.select(both()).selected[ALPHA].uuid, A1);
+        assert!(filtered_entries(&policy).is_empty());
+
+        // No patch fixes the one needed advisory alone: the merged patch.
+        let policy = filtered_policy("", &unreachable(CRIT), None);
+        let offers = policy.select(vec![merged.clone(), offer(B1, &[(CRIT, "critical")])]);
+        assert_eq!(offers.selected[ALPHA].uuid, A1);
+
+        // A package on an older merged patch follows the usual ranking: the
+        // single-advisory patch neither replaces it nor holds it back from
+        // the newer merged one.
+        const C1: &str = "cccccccc-0000-4000-8000-000000000001";
+        let newer = offer_published(
+            C1,
+            "2025-06-01T00:00:00Z",
+            &[(CRIT, "critical"), (HIGH, "high")],
+        );
+        let offered = || vec![single.clone(), merged.clone(), newer.clone()];
+        let policy = filtered_policy("", &unreachable(CRIT), Some(A1));
+        assert_eq!(policy.select(offered()).selected[ALPHA].uuid, C1);
+        // Unrecorded, the same offers still take the single-advisory patch;
+        // recorded, it stays.
+        for already in [None, Some(B1)] {
+            let policy = filtered_policy("", &unreachable(CRIT), already);
+            assert_eq!(policy.select(offered()).selected[ALPHA].uuid, B1);
+        }
+    }
+
+    /// The severity floor judges the whole patch, as without a filter: an
+    /// unreachable critical still lifts a merged patch over the floor.
+    #[test]
+    fn the_severity_floor_judges_the_whole_patch_under_a_filter() {
+        let yml = "version: 2\npatches:\n  minSeverity: high\n";
+        let merged = offer(A1, &[(CRIT, "critical"), (LOW, "low")]);
+        let policy = filtered_policy(yml, &unreachable(CRIT), None);
+        assert_eq!(policy.select(vec![merged]).selected[ALPHA].uuid, A1);
+        assert!(filtered_entries(&policy).is_empty());
+
+        // Each still withholds on its own: the floor a low patch, the
+        // filter a patch nothing needs (whatever its severity).
+        let policy = filtered_policy(yml, &unreachable(CRIT), None);
+        assert!(policy
+            .select(vec![offer(B1, &[(LOW, "low")])])
+            .selected
+            .is_empty());
+        assert_eq!(
+            filtered_entries(&policy),
+            [(
+                B1.to_string(),
+                "policy_severity".to_string(),
+                "low < high".to_string()
+            )]
+        );
+        let policy = filtered_policy(yml, &unreachable(CRIT), None);
+        assert!(policy
+            .select(vec![offer(A1, &[(CRIT, "critical")])])
+            .selected
+            .is_empty());
+        assert_eq!(
+            filtered_entries(&policy),
+            [(
+                A1.to_string(),
+                "filter_not_needed".to_string(),
+                format!("{CRIT} unreachable")
+            )]
+        );
+    }
+
+    /// Narrowing never removes: a recorded patch the filter withholds
+    /// stays when nothing else is wanted (and is no skip). It gives way to
+    /// a wanted patch even though it ranks higher; a recorded patch that
+    /// fixes something needed is kept as always.
+    #[test]
+    fn a_recorded_patch_the_filter_withholds_gives_way_only_to_a_wanted_one() {
+        let recorded = offer(A1, &[(CRIT, "critical")]);
+        let low = offer(B1, &[(LOW, "low")]);
+        let policy = filtered_policy("", &unreachable(CRIT), Some(A1));
+        let offers = policy.select(vec![recorded.clone()]);
+        assert_eq!(offers.selected[ALPHA].uuid, A1);
+        assert!(filtered_entries(&policy).is_empty());
+
+        let policy = filtered_policy("", &unreachable(CRIT), Some(A1));
+        let offers = policy.select(vec![recorded.clone(), low.clone()]);
+        assert_eq!(offers.selected[ALPHA].uuid, B1);
+        assert!(offers
+            .withheld
+            .contains(&(ALPHA.to_string(), A1.to_string())));
+        assert!(filtered_entries(&policy).is_empty());
+
+        // The recorded patch still fixes something needed: not traded for
+        // a lower-ranked one, with or without a filter entry for the other.
+        let policy = filtered_policy("", &unreachable(LOW), Some(A1));
+        let offers = policy.select(vec![recorded.clone(), low.clone()]);
+        assert_eq!(offers.selected[ALPHA].uuid, A1);
+        let policy = filtered_policy("", r#"{"version": 1}"#, Some(A1));
+        let offers = policy.select(vec![recorded.clone(), low.clone()]);
+        assert_eq!(offers.selected[ALPHA].uuid, A1);
+
+        // A re-scan reports what the first scan did: the wanted patch wins
+        // over a withheld higher-ranked one, recorded already or not, and
+        // nothing is listed as skipped either time.
+        for already in [None, Some(B1)] {
+            let policy = filtered_policy("", &unreachable(CRIT), already);
+            let offers = policy.select(vec![recorded.clone(), low.clone()]);
+            assert_eq!(offers.selected[ALPHA].uuid, B1);
+            assert!(filtered_entries(&policy).is_empty(), "{already:?}");
+        }
     }
 
     /// Without nested roots (hosted / vendored), every copy follows the

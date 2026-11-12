@@ -750,6 +750,7 @@ pub const LOCAL_ARG_ENV_VARS: &[&str] = &[
     "SOCKET_VENDOR_REVERT",
     "SOCKET_BATCH_SIZE",
     "SOCKET_SCAN_PACKAGES",
+    "SOCKET_SELECTION_FILTER",
     "SOCKET_VEX",
     "SOCKET_VEX_OUTPUT",
     "SOCKET_VEX_PRODUCT",
@@ -1638,6 +1639,7 @@ mod tests {
         const VALUE_BINDINGS: &[(&str, &[&str])] = &[
             ("SOCKET_BATCH_SIZE", &["socket-patch", "scan"]),
             ("SOCKET_SCAN_PACKAGES", &["socket-patch", "scan"]),
+            ("SOCKET_SELECTION_FILTER", &["socket-patch", "scan"]),
             ("SOCKET_PATCH_VERSION", &["socket-patch", "self-update"]),
             ("SOCKET_VEX", &["socket-patch", "apply"]),
             ("SOCKET_VEX_OUTPUT", &["socket-patch", "vex"]),
