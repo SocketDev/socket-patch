@@ -18,6 +18,8 @@
 //! be wired and attested each time. Then the marker that makes the tree
 //! Bazel's is deleted and the same commands must withhold every package
 //! again: the fixture is the hazard, and the marker, not a name, lifts it.
+//! The marker lifts it only in a Bazel workspace: with the fixture's
+//! `MODULE.bazel` deleted instead, the packages are withheld as well.
 //!
 //! The link cases are Unix only (a test cannot make a junction without
 //! spawning `cmd`); the vendor-directory case runs everywhere.
@@ -90,8 +92,8 @@ fn write(root: &Path, rel: &str, text: &str) {
 /// An output base as a build leaves it (probes B4, C7, C8): the marker
 /// with the workspace path, `external` with a fetched repository, and an
 /// execution root that mirrors each top-level entry of the workspace as a
-/// link (all but Bazel's own `bazel-*` links) and holds the manifest a
-/// `js_library` copied into `bazel-out`.
+/// link (all but Bazel's own `bazel-*` links) and holds the manifests a
+/// `js_library` copied into `bazel-out`, the member's among them.
 #[cfg(unix)]
 fn output_base(base: &Path, ws: &Path) {
     let execroot = base.join("execroot/_main");
@@ -102,6 +104,11 @@ fn output_base(base: &Path, ws: &Path) {
         "{}",
     );
     write(&execroot, "bazel-out/k8-fastbuild/bin/package.json", "{}");
+    write(
+        &execroot,
+        "bazel-out/k8-fastbuild/bin/app/package.json",
+        "{}",
+    );
     for entry in std::fs::read_dir(ws).unwrap() {
         let name = entry.unwrap().file_name();
         if !name.to_string_lossy().starts_with("bazel-") {
@@ -238,27 +245,37 @@ fn assert_every_package_withheld(ws: &Workspace, api: &MockServer, what: &str) {
 #[tokio::test(flavor = "multi_thread")]
 async fn bazel_links_and_output_bases_are_not_workspace_members() {
     let api = socket_api().await;
-    for (pattern, prefix, in_tree) in [
+    for (pattern, prefix, in_tree, cwd) in [
         // Probe B4: the default links, under each pattern that reaches
         // the workspace root.
-        (Some("*"), "bazel-", false),
-        (Some("**"), "bazel-", false),
+        (Some("*"), "bazel-", false, ""),
+        (Some("**"), "bazel-", false, ""),
         // Probe rules-js B1: `.`, and no `pnpm-workspace.yaml` at all,
         // where the first hosted run writes one whose `packages:` is `.`
         // and so sets the trap for the next run itself.
-        (Some("."), "bazel-", false),
-        (None, "bazel-", false),
+        (Some("."), "bazel-", false, ""),
+        (None, "bazel-", false, ""),
+        // The same root as `--cwd ..` from the member spells it. A path
+        // that holds `..` is classified by where it resolves to, and a
+        // link resolves to its target: the link has to be judged where
+        // it lies.
+        (Some("."), "bazel-", false, "app/.."),
         // Probe B4: `--symlink_prefix=dist/` moves the links into a
         // directory, where no name tells them from the user's own.
-        (Some("**"), "dist/", false),
+        (Some("**"), "dist/", false, ""),
         // Probe C8, `--output_base=<workspace>/out`: a real directory
         // whose execution root links back to the member `app`. Inferred
         // from C8 and B4 and never run on real Bazel: this row is the
         // first evidence for it.
-        (Some("**"), "bazel-", true),
+        (Some("**"), "bazel-", true, ""),
+        // A pattern that names its way through a link, to the copy of
+        // the member a build left in `bazel-bin`: the walk would start
+        // inside Bazel's tree.
+        (Some("bazel-bin/app"), "bazel-", false, ""),
     ] {
-        let what = format!("packages: {pattern:?}, {prefix}*, in-tree base: {in_tree}");
-        let ws = workspace(pattern);
+        let what =
+            format!("packages: {pattern:?}, {prefix}*, in-tree base: {in_tree}, --cwd {cwd:?}");
+        let mut ws = workspace(pattern);
         let base = if in_tree {
             ws.root.join("out")
         } else {
@@ -267,6 +284,9 @@ async fn bazel_links_and_output_bases_are_not_workspace_members() {
         std::fs::create_dir_all(&base).unwrap();
         output_base(&base, &ws.root);
         convenience_links(&ws.root, &base, prefix);
+        if !cwd.is_empty() {
+            ws.root = ws.root.join(cwd);
+        }
         assert_every_package_seen(&ws, &api, &what);
         if pattern.is_none() {
             let written = std::fs::read_to_string(ws.root.join("pnpm-workspace.yaml")).unwrap();
@@ -281,6 +301,11 @@ async fn bazel_links_and_output_bases_are_not_workspace_members() {
 /// test fixtures included: one malformed `package.json` among them used
 /// to protect every npm package. Under either marker Bazel writes (7.1.2
 /// to 7.2.1 write only `.vendorignore`, probe C11).
+///
+/// The marker is an empty file with a name anything may write, so it says
+/// that the directory is Bazel's only in a Bazel workspace. With the
+/// boundary file gone the directory is walked like any other, and what
+/// could not be inspected in it withholds every package again.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_bazel_vendor_directory_is_not_walked() {
     let api = socket_api().await;
@@ -295,6 +320,14 @@ async fn a_bazel_vendor_directory_is_not_walked() {
         );
         write(&ws.root, &format!("third_party/bazel/{marker}"), "");
         assert_every_package_seen(&ws, &api, marker);
+
+        let boundary = ws.root.join("MODULE.bazel");
+        let module = std::fs::read(&boundary).unwrap();
+        std::fs::remove_file(&boundary).unwrap();
+        let what = format!("{marker}, no boundary file");
+        assert_every_package_withheld(&ws, &api, &what);
+        std::fs::write(&boundary, module).unwrap();
+
         std::fs::remove_file(ws.root.join("third_party/bazel").join(marker)).unwrap();
         assert_every_package_withheld(&ws, &api, marker);
     }
