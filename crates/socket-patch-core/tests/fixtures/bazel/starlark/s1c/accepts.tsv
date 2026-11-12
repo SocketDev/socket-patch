@@ -1,0 +1,31 @@
+# Probe S1c: what `bazel mod graph` did with each root MODULE.bazel of `rows/`. One row per file:
+# row, then per distinct outcome `<versions> => ok` (exit 0, the segment's module is in the graph),
+# `<versions> => skipped` (exit 0, the segment was not evaluated) or `<versions> => error`.
+# Derived from the campaign's starlark-include/s1/syntax-<version>.json; see README.md.
+ok-baseline	6.6.0,7.1.2 => error	7.2.0,7.7.2,8.0.0,8.1.0,8.8.2,9.3.2,10.0.0rc3 => ok
+basename-dot-root	6.6.0,7.1.2,8.1.0,8.8.2,9.3.2,10.0.0rc3 => error	7.2.0,7.7.2,8.0.0 => ok
+basename-dot-in-pkg	6.6.0,7.1.2,8.1.0,8.8.2,9.3.2,10.0.0rc3 => error	7.2.0,7.7.2,8.0.0 => ok
+basename-plain-MODULE.bazel	6.6.0,7.1.2,7.2.0,7.7.2,8.0.0,8.1.0,8.8.2,9.3.2,10.0.0rc3 => error
+suffix-.bzl	6.6.0,7.1.2,7.2.0,7.7.2,8.0.0,8.1.0,8.8.2,9.3.2,10.0.0rc3 => error
+suffix-lowercase	6.6.0,7.1.2,7.2.0,7.7.2,8.0.0,8.1.0,8.8.2,9.3.2,10.0.0rc3 => error
+target-with-subdir-name	6.6.0,7.1.2 => error	7.2.0,7.7.2,8.0.0,8.1.0,8.8.2,9.3.2,10.0.0rc3 => ok
+label-at-main	6.6.0,7.1.2,7.2.0,7.7.2,8.0.0,8.1.0,8.8.2,9.3.2,10.0.0rc3 => error
+label-atat-main	6.6.0,7.1.2,7.2.0,7.7.2,8.0.0,8.1.0,8.8.2,9.3.2,10.0.0rc3 => error
+label-at-s1	6.6.0,7.1.2,7.2.0,7.7.2,8.0.0,8.1.0,8.8.2,9.3.2,10.0.0rc3 => error
+label-relative-colon	6.6.0,7.1.2,7.2.0,7.7.2,8.0.0,8.1.0,8.8.2,9.3.2,10.0.0rc3 => error
+label-bare-path	6.6.0,7.1.2,7.2.0,7.7.2,8.0.0,8.1.0,8.8.2,9.3.2,10.0.0rc3 => error
+label-no-colon	6.6.0,7.1.2,7.2.0,7.7.2,8.0.0,8.1.0,8.8.2,9.3.2,10.0.0rc3 => error
+nonliteral-concat	6.6.0,7.1.2 => error	7.2.0,7.7.2,8.0.0,8.1.0,8.8.2,9.3.2,10.0.0rc3 => ok
+nonliteral-variable	6.6.0,7.1.2,7.2.0,7.7.2,8.0.0,8.1.0,8.8.2,9.3.2,10.0.0rc3 => error
+keyword-label	6.6.0,7.1.2,7.2.0,7.7.2,8.0.0,8.1.0,8.8.2,9.3.2,10.0.0rc3 => error
+assigned-result	6.6.0,7.1.2,7.2.0,7.7.2,8.0.0,8.1.0,8.8.2,9.3.2,10.0.0rc3 => error
+single-quotes	6.6.0,7.1.2 => error	7.2.0,7.7.2,8.0.0,8.1.0,8.8.2,9.3.2,10.0.0rc3 => ok
+trailing-comma-multiline	6.6.0,7.1.2 => error	7.2.0,7.7.2,8.0.0,8.1.0,8.8.2,9.3.2,10.0.0rc3 => ok
+trailing-comment	6.6.0,7.1.2 => error	7.2.0,7.7.2,8.0.0,8.1.0,8.8.2,9.3.2,10.0.0rc3 => ok
+dev_dependency-True	6.6.0,7.1.2,7.2.0,7.7.2,8.0.0,8.1.0,8.8.2 => error	9.3.2,10.0.0rc3 => ok
+dev_dependency-False	6.6.0,7.1.2,7.2.0,7.7.2,8.0.0,8.1.0,8.8.2 => error	9.3.2,10.0.0rc3 => ok
+dev_dependency-True+ignore_dev	9.3.2,10.0.0rc3 => skipped
+include-before-module	6.6.0,7.1.2,7.2.0,7.7.2,8.0.0,8.1.0,8.8.2,9.3.2,10.0.0rc3 => error
+no-module-call	6.6.0,7.1.2 => error	7.2.0,7.7.2,8.0.0,8.1.0,8.8.2,9.3.2,10.0.0rc3 => ok
+include-twice-same	6.6.0,7.1.2,7.2.0,7.7.2,8.0.0,8.1.0,8.8.2,9.3.2,10.0.0rc3 => error
+indented-include	6.6.0,7.1.2,7.2.0,7.7.2,8.0.0,8.1.0,8.8.2,9.3.2,10.0.0rc3 => error

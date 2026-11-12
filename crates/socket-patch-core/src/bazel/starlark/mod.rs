@@ -38,7 +38,7 @@ pub const MAX_FILE_BYTES: usize = 1 << 20;
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::fmt::Write as _;
     use std::path::{Path, PathBuf};
 
@@ -248,6 +248,10 @@ mod tests {
     /// - a refusal needs every Bazel to have rejected the file, so the
     ///   reader never loses a file Bazel builds;
     /// - anything else must be opaque.
+    ///
+    /// Every file Bazel ran printed `V`, so the reader must not drop the
+    /// statement that did: it reads the `print` call, or names its place
+    /// as one it has no model of.
     #[test]
     fn s5_verdicts_agree_with_what_bazel_accepts() {
         let dir = fixtures().join("s5");
@@ -280,11 +284,153 @@ mod tests {
                 }
                 _ => assert_eq!(verdict, "opaque"),
             }
+            if let Ok(file) = read(&bytes, dialect) {
+                let print = file.calls("print");
+                let kept = !print.seen().is_empty() || !print.reasons().is_empty();
+                assert!(kept || rejected, "{kind}/{variant}: the print is dropped");
+            }
             let _ = writeln!(out, "{kind}\t{variant}\t{verdict}");
             rows += 1;
         }
         assert_eq!(rows, 301, "60 variants per kind, and one more for .bzl");
         golden(&dir.join("verdicts.golden"), &out);
+    }
+
+    /// What the reader makes of the `include` statements of one file: it
+    /// refuses the file, or says for each statement that calls `include`
+    /// whether it is an include with a known label and `dev_dependency`.
+    fn include_verdict(bytes: &[u8]) -> String {
+        let file = match read(bytes, Dialect::Module) {
+            Ok(file) => file,
+            Err(e) => return format!("refuse {:?}", e.kind),
+        };
+        let calls = file.calls("include");
+        let one = |stmt: &&Stmt| match &stmt.kind {
+            StmtKind::Include(include) => match include.exact() {
+                Some((label, dev)) => format!("include {label:?} dev={dev}"),
+                None => "inexact".to_string(),
+            },
+            _ => "not a statement".to_string(),
+        };
+        let seen: Vec<String> = calls.seen().iter().map(one).collect();
+        match (calls.reasons().is_empty(), seen.is_empty()) {
+            (false, _) => format!("incomplete {}", seen.join("; ")),
+            (true, true) => "none".to_string(),
+            (true, false) => seen.join("; "),
+        }
+    }
+
+    /// Probe S1c ran 27 spellings and placements of `include()` in a root
+    /// `MODULE.bazel` through `bazel mod graph` on nine releases from
+    /// 6.6.0 to 10.0.0rc3 (`s1c/accepts.tsv`). What the reader makes of
+    /// each file is a golden, and is held against what Bazel did:
+    ///
+    /// - a file some Bazel evaluated reads, and every include in it is
+    ///   exact: an include Bazel follows is never lost, which is why a
+    ///   `+` of string literals is folded;
+    /// - `dev_dependency` is read, and only 9.3.2 and 10.0.0rc3 took it.
+    ///
+    /// The reverse is not asked. Bazel rejects labels the statement
+    /// reader has no opinion on (`@//...`, a name that does not end in
+    /// `.MODULE.bazel`); those belong to the label reader.
+    #[test]
+    fn s1c_include_rows_agree_with_what_bazel_accepts() {
+        let dir = fixtures().join("s1c");
+        let accepts = std::fs::read_to_string(dir.join("accepts.tsv")).expect("accepts.tsv");
+        let (mut out, mut exact_rows) = (String::new(), Vec::new());
+        for row in accepts
+            .lines()
+            .filter(|l| !l.starts_with('#') && !l.is_empty())
+        {
+            let mut cols = row.trim_end_matches('\r').split('\t');
+            let name = cols.next().unwrap();
+            let outcomes = cols.map(|c| c.split_once(" => ").unwrap());
+            // The releases that ran the file to the end: `ok`, or
+            // `skipped` under `--ignore_dev_dependency`.
+            let evaluated: Vec<&str> = outcomes
+                .filter(|(_, outcome)| *outcome != "error")
+                .flat_map(|(versions, _)| versions.split(','))
+                .collect();
+            let bytes = std::fs::read(dir.join("rows").join(name)).expect("row");
+            let verdict = include_verdict(&bytes);
+            let exact = verdict.split("; ").all(|v| v.starts_with("include \""));
+            assert!(
+                exact || evaluated.is_empty(),
+                "{name}: Bazel {evaluated:?} follows an include the reader lost: {verdict}"
+            );
+            if bytes.windows(14).any(|w| w == b"dev_dependency") {
+                assert!(exact, "{name}: {verdict}");
+                assert_eq!(evaluated, ["9.3.2", "10.0.0rc3"], "{name}");
+            }
+            if exact {
+                exact_rows.push(name);
+            }
+            let _ = writeln!(out, "{name}\t{verdict}");
+        }
+        assert_eq!(out.lines().count(), 27);
+        // The rows design 2.9 rests on.
+        for name in [
+            "dev_dependency-True",
+            "dev_dependency-False",
+            "dev_dependency-True+ignore_dev",
+            "nonliteral-concat",
+            "single-quotes",
+            "trailing-comma-multiline",
+            "trailing-comment",
+        ] {
+            assert!(exact_rows.contains(&name), "{name}");
+        }
+        golden(&dir.join("verdicts.golden"), &out);
+    }
+
+    /// The inputs are byte-real: line endings, a byte-order mark, a NUL
+    /// and bytes that are not UTF-8 are what several of them test, so a
+    /// checkout that converted one, or an edit, would turn a case into
+    /// another case without failing it. `SHA256SUMS` lists every file but
+    /// itself and the goldens, which are what the reader produces.
+    #[test]
+    fn the_fixture_inputs_are_the_bytes_that_were_committed() {
+        fn files(dir: &Path, out: &mut BTreeSet<PathBuf>) {
+            for entry in std::fs::read_dir(dir).expect("fixture directory") {
+                let path = entry.expect("directory entry").path();
+                if path.is_dir() {
+                    files(&path, out);
+                } else {
+                    out.insert(path);
+                }
+            }
+        }
+        let dir = fixtures();
+        let mut on_disk = BTreeSet::new();
+        files(&dir, &mut on_disk);
+        assert!(on_disk.remove(&dir.join("SHA256SUMS")));
+        on_disk.retain(|path| path.extension().is_none_or(|ext| ext != "golden"));
+
+        let sums = std::fs::read_to_string(dir.join("SHA256SUMS")).expect("SHA256SUMS");
+        let mut listed = BTreeSet::new();
+        for line in sums.lines() {
+            let (digest, rel) = line.split_once("  ").expect("`<sha256>  <path>`");
+            let bytes = std::fs::read(dir.join(rel)).unwrap_or_else(|e| panic!("{rel}: {e}"));
+            assert_eq!(crate::utils::digest::sha256_hex_of(&bytes), digest, "{rel}");
+            listed.insert(dir.join(rel));
+        }
+        assert_eq!(listed, on_disk);
+        assert_eq!(listed.len(), 238);
+        // No fixture has the name of a file Bazel takes for a boundary.
+        let boundary = [
+            "MODULE.bazel",
+            "MODULE.bazel.lock",
+            "WORKSPACE",
+            "WORKSPACE.bazel",
+            "WORKSPACE.bzlmod",
+            "REPO.bazel",
+            "BUILD",
+            "BUILD.bazel",
+        ];
+        let name = |path: &PathBuf| path.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(!on_disk
+            .iter()
+            .any(|path| boundary.contains(&name(path).as_str())));
     }
 
     /// Everything the reader hands out must index the file it read.
@@ -372,20 +518,23 @@ mod tests {
     }
 
     /// No input makes the reader panic, loop or hand out a span outside
-    /// the file: every corpus file and S5 vector, truncated at random
-    /// offsets and with random bytes replaced, inserted and removed.
+    /// the file: every corpus file, S5 vector and S1c row, truncated at
+    /// random offsets and with random bytes replaced, inserted and removed.
     #[test]
     fn truncated_and_mutated_inputs_never_panic() {
         // Bytes that change what the lexer is doing when they appear.
         const BYTES: &[u8] =
             b"\"'\\#()[]{},=:;.*+-\n\r\t \0\x0c\x80\xe9\xef\xbb\xbfrdefilambda0x9_";
         let mut inputs: Vec<Vec<u8>> = corpus().into_iter().map(|(_, bytes)| bytes).collect();
-        for set in ["module", "workspace", "bare"] {
-            for entry in std::fs::read_dir(fixtures().join("s5").join(set)).expect("s5 set") {
-                inputs.push(std::fs::read(entry.expect("s5 entry").path()).expect("s5 vector"));
-            }
+        for set in ["s5/module", "s5/workspace", "s5/bare", "s1c/rows"] {
+            // Sorted: the order a directory lists its entries in is the
+            // file system's, and the cases drawn below follow it.
+            let entries = std::fs::read_dir(fixtures().join(set)).expect("vector set");
+            let mut paths: Vec<PathBuf> = entries.map(|e| e.expect("entry").path()).collect();
+            paths.sort();
+            inputs.extend(paths.iter().map(|p| std::fs::read(p).expect("vector")));
         }
-        assert_eq!(inputs.len(), 25 + 181);
+        assert_eq!(inputs.len(), 25 + 181 + 27);
         let mut rng = Rng::new(0x5714);
         let mut cases = 0;
         for bytes in &inputs {

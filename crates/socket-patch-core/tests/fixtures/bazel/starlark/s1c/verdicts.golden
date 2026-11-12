@@ -1,0 +1,27 @@
+ok-baseline	include "//.socket/bazel:socket-patch.MODULE.bazel" dev=false
+basename-dot-root	include "//:.socket-patch.MODULE.bazel" dev=false
+basename-dot-in-pkg	include "//.socket/bazel:.hidden.MODULE.bazel" dev=false
+basename-plain-MODULE.bazel	include "//.socket/bazel:MODULE.bazel" dev=false
+suffix-.bzl	include "//.socket/bazel:socket-patch.bzl" dev=false
+suffix-lowercase	include "//.socket/bazel:socket-patch.module.bazel" dev=false
+target-with-subdir-name	include "//.socket:bazel/socket-patch.MODULE.bazel" dev=false
+label-at-main	include "@//.socket/bazel:socket-patch.MODULE.bazel" dev=false
+label-atat-main	include "@@//.socket/bazel:socket-patch.MODULE.bazel" dev=false
+label-at-s1	include "@s1//.socket/bazel:socket-patch.MODULE.bazel" dev=false
+label-relative-colon	include ":socket-patch.MODULE.bazel" dev=false
+label-bare-path	include ".socket/bazel/socket-patch.MODULE.bazel" dev=false
+label-no-colon	include "//.socket/bazel/socket-patch.MODULE.bazel" dev=false
+nonliteral-concat	include "//.socket/bazel:socket-patch.MODULE.bazel" dev=false
+nonliteral-variable	inexact
+keyword-label	inexact
+assigned-result	not a statement
+single-quotes	include "//.socket/bazel:socket-patch.MODULE.bazel" dev=false
+trailing-comma-multiline	include "//.socket/bazel:socket-patch.MODULE.bazel" dev=false
+trailing-comment	include "//.socket/bazel:socket-patch.MODULE.bazel" dev=false
+dev_dependency-True	include "//.socket/bazel:socket-patch.MODULE.bazel" dev=true
+dev_dependency-False	include "//.socket/bazel:socket-patch.MODULE.bazel" dev=false
+dev_dependency-True+ignore_dev	include "//.socket/bazel:socket-patch.MODULE.bazel" dev=true
+include-before-module	include "//.socket/bazel:socket-patch.MODULE.bazel" dev=false
+no-module-call	include "//.socket/bazel:socket-patch.MODULE.bazel" dev=false
+include-twice-same	include "//.socket/bazel:socket-patch.MODULE.bazel" dev=false; include "//.socket/bazel:socket-patch.MODULE.bazel" dev=false
+indented-include	refuse Indent

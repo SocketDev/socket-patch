@@ -8,7 +8,17 @@ Bazel workspace.
 
 `.gitattributes` marks the directory `-text`. Line endings, a byte-order mark, a NUL and
 bytes that are not UTF-8 are what several of these files test, and a conversion on checkout
-would change them.
+would change them. `SHA256SUMS` lists every input here (`shasum -a 256 -c SHA256SUMS`): every
+file but itself and the `*.golden` files, which are what the reader produces. The test
+`the_fixture_inputs_are_the_bytes_that_were_committed` compares each file with its line, so
+a changed or added input needs its line there.
+
+`s5/` and `s1c/` come from the probe group `starlark-include` of the Bazel-support campaign:
+2026-11-11, one macOS arm64 machine (Darwin 27.0.0), bazelisk 1.30.0; nothing ran on Linux or
+Windows. The group's drivers, per-cell logs and report (`starlark-include/RESULTS.md`) are in
+the campaign's probe directory, outside this repository. `reduce.py <campaign probes
+directory> .` is how the two directories and `SHA256SUMS` were made: run again on the
+campaign's files it rewrites them byte for byte.
 
 ## `corpus/`: real files and the model they read to
 
@@ -75,5 +85,32 @@ The test `s5_verdicts_agree_with_what_bazel_accepts` holds the two together: a v
 be the one every Bazel printed, a refusal needs every Bazel to have rejected the file, and
 everything else must be opaque.
 
-The S1c rows of the same probe (`include()` syntax) are small enough to be written out in
-the test `include_rows_of_probe_s1c` in `stmt.rs`.
+## `s1c/`: `include()` in a root `MODULE.bazel`
+
+Probe S1c ran 35 root-module layouts through `bazel mod graph` on Bazel 6.6.0, 7.1.2, 7.2.0,
+7.7.2, 8.0.0, 8.1.0, 8.8.2, 9.3.2 and 10.0.0rc3 (`RESULTS.md` section "S1c include syntax and
+placement"). Here are the 27 whose root `MODULE.bazel` is the thing varied: how the label is
+spelled, how the statement is written, `dev_dependency`, and where the statement stands. The
+other eight vary the included segment, nest includes or use a non-root module; their root file
+is the baseline's.
+
+- `rows/<row>`: the byte-exact root `MODULE.bazel` the probe wrote for the row. The file is
+  named after the probe's row, except `label-at-main`, `label-atat-main` and `label-at-s1`,
+  which are its rows `label-@//`, `label-@@//` and `label-@s1//`. In every row the segment
+  `.socket/bazel/socket-patch.MODULE.bazel` declares one `bazel_dep`, and the row is `ok` when
+  that module shows in the graph. `dev_dependency-True+ignore_dev` is the file of
+  `dev_dependency-True` run with `--ignore_dev_dependency`.
+- `accepts.tsv`: what Bazel did, one row per file: for each distinct outcome the versions
+  that had it. `ok` is exit 0 with the segment evaluated, `skipped` exit 0 without it, `error`
+  any other exit. 6.6.0 and 7.1.2 have no `include` and reject every row. Derived from the
+  probe's `s1/syntax-<version>.json`.
+- `verdicts.golden`: what the reader makes of the `include` statements of each file:
+  `include "<label>" dev=<bool>` for one that is read in full, `inexact` for one whose label
+  or keywords are not, `not a statement` for a call of `include` that is no statement of its
+  own, or `refuse <kind>`.
+
+The test `s1c_include_rows_agree_with_what_bazel_accepts` holds the two together: in a file
+some Bazel evaluated, every include is read in full, and only 9.3.2 and 10.0.0rc3 take
+`dev_dependency`. Bazel also rejects rows the statement reader reads in full (a label that
+starts with `@`, a file name that does not end in `.MODULE.bazel`): those are the label
+reader's to refuse.

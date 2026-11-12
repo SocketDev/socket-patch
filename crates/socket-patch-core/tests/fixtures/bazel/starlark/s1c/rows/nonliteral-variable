@@ -1,0 +1,5 @@
+module(name = "s1", version = "0.0.0")
+
+SEG = "//.socket/bazel:socket-patch.MODULE.bazel"
+
+include(SEG)
