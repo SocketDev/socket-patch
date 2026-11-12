@@ -1,8 +1,192 @@
 8a517a2b003d4cc15c630a7b3be9e16848f2a64a9e142022a8a899c2da15d04e  .gitattributes
-9a7da574b2b4d5e8358f0a4b55ef1a3f12ccc23e2bdc04841d84034344e8e97a  README.md
+114c16e60af465f4eb03bbe3dfee022dc37669617fd744f9ca8c444c264d2bb6  README.md
+9ada141de8b8b0e2ecbd3724343df2e3bd7053a1612a60176d0889a52f19ee3e  check.py
+a06841bae347dc1a62e0993147fb81c16a09ed30c01d53fa1988b9eeccf20e9d  lockfile/l6-crlf-pair/bazel-7.0.2/crlf/dep.lock
+bef94a3ce27f7bbe3e6d4b0396b65b1ba3ca9a6017c835ed92fd4645639e7ab2  lockfile/l6-crlf-pair/bazel-7.0.2/crlf/root.MODULE.bazel.lock
+e8416e29516964fe181293c389328c5eb829d92391d5fed444df3a5ba74cf535  lockfile/l6-crlf-pair/bazel-7.0.2/lf/dep.lock
+193ce944647afbf5e8008e3da72d51e5484200ec70b2a55c01ac4c702a8dcb39  lockfile/l6-crlf-pair/bazel-7.0.2/lf/root.MODULE.bazel.lock
+59f829836ae534547a765d00024d008374bde50d479b0aad235d20721d91b03a  lockfile/l6-crlf-pair/bazel-7.0.2/root.MODULE.bazel
+e8416e29516964fe181293c389328c5eb829d92391d5fed444df3a5ba74cf535  lockfile/recorded-inputs/bazel-10.0.0rc3/fresh/dep.lock
+ab449a549f2075e1f4abb292983b139b9d6b021d5b6738a99bd61e739bbaa434  lockfile/recorded-inputs/bazel-10.0.0rc3/fresh/expected.json
+9cca1a08c2a0502e6864c96f0743a50a24adbcc6b2cf7be4d84f633f438288c7  lockfile/recorded-inputs/bazel-10.0.0rc3/fresh/root.MODULE.bazel
+55882b0bc5468cfae848b991e934c87e3bac65ca0d1988102470194546689a20  lockfile/recorded-inputs/bazel-10.0.0rc3/fresh/root.MODULE.bazel.lock
+8d2646542de1053ebd2f2f0253b0bbca4715e520f5527178d13191a2a9cf4996  lockfile/recorded-inputs/bazel-10.0.0rc3/fresh/third_party/py/requirements lock.txt
+e8416e29516964fe181293c389328c5eb829d92391d5fed444df3a5ba74cf535  lockfile/recorded-inputs/bazel-10.0.0rc3/stale/dep.lock
+55ed41728cef2abe2689b7fcf3691b67c9cce4676a207d47aeff7902d2a8f481  lockfile/recorded-inputs/bazel-10.0.0rc3/stale/expected.json
+9cca1a08c2a0502e6864c96f0743a50a24adbcc6b2cf7be4d84f633f438288c7  lockfile/recorded-inputs/bazel-10.0.0rc3/stale/root.MODULE.bazel
+55882b0bc5468cfae848b991e934c87e3bac65ca0d1988102470194546689a20  lockfile/recorded-inputs/bazel-10.0.0rc3/stale/root.MODULE.bazel.lock
+080f0d61fb0d72c4250e11d6be7f78ff4470c471d26d48ded06d3c26fdb8e952  lockfile/recorded-inputs/bazel-10.0.0rc3/stale/third_party/py/requirements lock.txt
+e8416e29516964fe181293c389328c5eb829d92391d5fed444df3a5ba74cf535  lockfile/recorded-inputs/bazel-6.5.0/fresh/dep.lock
+c875003435178e0985ddd54fd2b3791bf01d4d6f9c6280193cb91f005bc4b000  lockfile/recorded-inputs/bazel-6.5.0/fresh/expected.json
+9cca1a08c2a0502e6864c96f0743a50a24adbcc6b2cf7be4d84f633f438288c7  lockfile/recorded-inputs/bazel-6.5.0/fresh/root.MODULE.bazel
+ced18a08da21a222159229922ad8c1d4b6c680d3e7735f56dcd6bb28829d6efb  lockfile/recorded-inputs/bazel-6.5.0/fresh/root.MODULE.bazel.lock
+8d2646542de1053ebd2f2f0253b0bbca4715e520f5527178d13191a2a9cf4996  lockfile/recorded-inputs/bazel-6.5.0/fresh/third_party/py/requirements lock.txt
+e8416e29516964fe181293c389328c5eb829d92391d5fed444df3a5ba74cf535  lockfile/recorded-inputs/bazel-6.5.0/stale/dep.lock
+1fcbaa1e70c8a2faaa51f326289ae4fa36c8a7dc340472a7e4e8442d7f4c2626  lockfile/recorded-inputs/bazel-6.5.0/stale/expected.json
+9cca1a08c2a0502e6864c96f0743a50a24adbcc6b2cf7be4d84f633f438288c7  lockfile/recorded-inputs/bazel-6.5.0/stale/root.MODULE.bazel
+ced18a08da21a222159229922ad8c1d4b6c680d3e7735f56dcd6bb28829d6efb  lockfile/recorded-inputs/bazel-6.5.0/stale/root.MODULE.bazel.lock
+080f0d61fb0d72c4250e11d6be7f78ff4470c471d26d48ded06d3c26fdb8e952  lockfile/recorded-inputs/bazel-6.5.0/stale/third_party/py/requirements lock.txt
+e8416e29516964fe181293c389328c5eb829d92391d5fed444df3a5ba74cf535  lockfile/recorded-inputs/bazel-6.6.0/fresh/dep.lock
+e393dbb3f868f41881a8016ab1ee8dbf96a96c206995e433ee0d09d18c95d140  lockfile/recorded-inputs/bazel-6.6.0/fresh/expected.json
+9cca1a08c2a0502e6864c96f0743a50a24adbcc6b2cf7be4d84f633f438288c7  lockfile/recorded-inputs/bazel-6.6.0/fresh/root.MODULE.bazel
+ced18a08da21a222159229922ad8c1d4b6c680d3e7735f56dcd6bb28829d6efb  lockfile/recorded-inputs/bazel-6.6.0/fresh/root.MODULE.bazel.lock
+8d2646542de1053ebd2f2f0253b0bbca4715e520f5527178d13191a2a9cf4996  lockfile/recorded-inputs/bazel-6.6.0/fresh/third_party/py/requirements lock.txt
+e8416e29516964fe181293c389328c5eb829d92391d5fed444df3a5ba74cf535  lockfile/recorded-inputs/bazel-6.6.0/stale/dep.lock
+2a27253a8349dea6583deb65e2e55fbca0a8add2bfdb416de9511b7b80d51ac5  lockfile/recorded-inputs/bazel-6.6.0/stale/expected.json
+9cca1a08c2a0502e6864c96f0743a50a24adbcc6b2cf7be4d84f633f438288c7  lockfile/recorded-inputs/bazel-6.6.0/stale/root.MODULE.bazel
+ced18a08da21a222159229922ad8c1d4b6c680d3e7735f56dcd6bb28829d6efb  lockfile/recorded-inputs/bazel-6.6.0/stale/root.MODULE.bazel.lock
+080f0d61fb0d72c4250e11d6be7f78ff4470c471d26d48ded06d3c26fdb8e952  lockfile/recorded-inputs/bazel-6.6.0/stale/third_party/py/requirements lock.txt
+e8416e29516964fe181293c389328c5eb829d92391d5fed444df3a5ba74cf535  lockfile/recorded-inputs/bazel-7.0.2/fresh/dep.lock
+5e9db9364fa97f2ee910583026b6745955f6d99a26a705e0aa611f94fa7ecb19  lockfile/recorded-inputs/bazel-7.0.2/fresh/expected.json
+9cca1a08c2a0502e6864c96f0743a50a24adbcc6b2cf7be4d84f633f438288c7  lockfile/recorded-inputs/bazel-7.0.2/fresh/root.MODULE.bazel
+381d9c448027fe4e1e57147d1dc0088485040b59dc82367cded8777d694b0676  lockfile/recorded-inputs/bazel-7.0.2/fresh/root.MODULE.bazel.lock
+8d2646542de1053ebd2f2f0253b0bbca4715e520f5527178d13191a2a9cf4996  lockfile/recorded-inputs/bazel-7.0.2/fresh/third_party/py/requirements lock.txt
+e8416e29516964fe181293c389328c5eb829d92391d5fed444df3a5ba74cf535  lockfile/recorded-inputs/bazel-7.0.2/stale/dep.lock
+7f61e0af393c445c4b1acdaccc5d93edf3ab6c4e5a42f043bb94959ab82bfbc8  lockfile/recorded-inputs/bazel-7.0.2/stale/expected.json
+9cca1a08c2a0502e6864c96f0743a50a24adbcc6b2cf7be4d84f633f438288c7  lockfile/recorded-inputs/bazel-7.0.2/stale/root.MODULE.bazel
+381d9c448027fe4e1e57147d1dc0088485040b59dc82367cded8777d694b0676  lockfile/recorded-inputs/bazel-7.0.2/stale/root.MODULE.bazel.lock
+080f0d61fb0d72c4250e11d6be7f78ff4470c471d26d48ded06d3c26fdb8e952  lockfile/recorded-inputs/bazel-7.0.2/stale/third_party/py/requirements lock.txt
+e8416e29516964fe181293c389328c5eb829d92391d5fed444df3a5ba74cf535  lockfile/recorded-inputs/bazel-7.1.2/fresh/dep.lock
+e6ed3417460fe74e307e4d9e84ff3a85e5a5007f5ef8b647938cfb592a837dd9  lockfile/recorded-inputs/bazel-7.1.2/fresh/expected.json
+9cca1a08c2a0502e6864c96f0743a50a24adbcc6b2cf7be4d84f633f438288c7  lockfile/recorded-inputs/bazel-7.1.2/fresh/root.MODULE.bazel
+4b60c37bc7f473847bb1d20745c7096ef1975f6a08291fefb3ab276cae04b411  lockfile/recorded-inputs/bazel-7.1.2/fresh/root.MODULE.bazel.lock
+8d2646542de1053ebd2f2f0253b0bbca4715e520f5527178d13191a2a9cf4996  lockfile/recorded-inputs/bazel-7.1.2/fresh/third_party/py/requirements lock.txt
+e8416e29516964fe181293c389328c5eb829d92391d5fed444df3a5ba74cf535  lockfile/recorded-inputs/bazel-7.1.2/stale/dep.lock
+af7bc9118edbd7c25eeb983a35e1d612c54426622b0d4c07f42471fda4326da3  lockfile/recorded-inputs/bazel-7.1.2/stale/expected.json
+9cca1a08c2a0502e6864c96f0743a50a24adbcc6b2cf7be4d84f633f438288c7  lockfile/recorded-inputs/bazel-7.1.2/stale/root.MODULE.bazel
+4b60c37bc7f473847bb1d20745c7096ef1975f6a08291fefb3ab276cae04b411  lockfile/recorded-inputs/bazel-7.1.2/stale/root.MODULE.bazel.lock
+080f0d61fb0d72c4250e11d6be7f78ff4470c471d26d48ded06d3c26fdb8e952  lockfile/recorded-inputs/bazel-7.1.2/stale/third_party/py/requirements lock.txt
+e8416e29516964fe181293c389328c5eb829d92391d5fed444df3a5ba74cf535  lockfile/recorded-inputs/bazel-7.2.0/fresh/dep.lock
+8ea6016d5ce0ccab201c0abfb9804faccde0d1dd9cec1120cadf43d48b530bd7  lockfile/recorded-inputs/bazel-7.2.0/fresh/expected.json
+9cca1a08c2a0502e6864c96f0743a50a24adbcc6b2cf7be4d84f633f438288c7  lockfile/recorded-inputs/bazel-7.2.0/fresh/root.MODULE.bazel
+09b5f8b14100b11f998025b55b91c95c572f9a8d1befb5663e8efd2e7bdfd36d  lockfile/recorded-inputs/bazel-7.2.0/fresh/root.MODULE.bazel.lock
+8d2646542de1053ebd2f2f0253b0bbca4715e520f5527178d13191a2a9cf4996  lockfile/recorded-inputs/bazel-7.2.0/fresh/third_party/py/requirements lock.txt
+e8416e29516964fe181293c389328c5eb829d92391d5fed444df3a5ba74cf535  lockfile/recorded-inputs/bazel-7.2.0/stale/dep.lock
+9c55499e63df22e9ad3f0fea7b40347b95b5469ef3e524849deb750496302b8c  lockfile/recorded-inputs/bazel-7.2.0/stale/expected.json
+9cca1a08c2a0502e6864c96f0743a50a24adbcc6b2cf7be4d84f633f438288c7  lockfile/recorded-inputs/bazel-7.2.0/stale/root.MODULE.bazel
+09b5f8b14100b11f998025b55b91c95c572f9a8d1befb5663e8efd2e7bdfd36d  lockfile/recorded-inputs/bazel-7.2.0/stale/root.MODULE.bazel.lock
+080f0d61fb0d72c4250e11d6be7f78ff4470c471d26d48ded06d3c26fdb8e952  lockfile/recorded-inputs/bazel-7.2.0/stale/third_party/py/requirements lock.txt
+e8416e29516964fe181293c389328c5eb829d92391d5fed444df3a5ba74cf535  lockfile/recorded-inputs/bazel-7.4.1/fresh/dep.lock
+b51950d8039d9afda991445915b83f2c07fc9944803e49e8ea82d906e49a9ae9  lockfile/recorded-inputs/bazel-7.4.1/fresh/expected.json
+9cca1a08c2a0502e6864c96f0743a50a24adbcc6b2cf7be4d84f633f438288c7  lockfile/recorded-inputs/bazel-7.4.1/fresh/root.MODULE.bazel
+cffb577a766e31df662218b31377aef15ee9030b48dbc3e4d8355c0da5684248  lockfile/recorded-inputs/bazel-7.4.1/fresh/root.MODULE.bazel.lock
+8d2646542de1053ebd2f2f0253b0bbca4715e520f5527178d13191a2a9cf4996  lockfile/recorded-inputs/bazel-7.4.1/fresh/third_party/py/requirements lock.txt
+e8416e29516964fe181293c389328c5eb829d92391d5fed444df3a5ba74cf535  lockfile/recorded-inputs/bazel-7.4.1/stale/dep.lock
+0ff8fdf94ac70c6eb2a13c7978c5c5664990de17c590d68cb60bed197846abf2  lockfile/recorded-inputs/bazel-7.4.1/stale/expected.json
+9cca1a08c2a0502e6864c96f0743a50a24adbcc6b2cf7be4d84f633f438288c7  lockfile/recorded-inputs/bazel-7.4.1/stale/root.MODULE.bazel
+cffb577a766e31df662218b31377aef15ee9030b48dbc3e4d8355c0da5684248  lockfile/recorded-inputs/bazel-7.4.1/stale/root.MODULE.bazel.lock
+080f0d61fb0d72c4250e11d6be7f78ff4470c471d26d48ded06d3c26fdb8e952  lockfile/recorded-inputs/bazel-7.4.1/stale/third_party/py/requirements lock.txt
+e8416e29516964fe181293c389328c5eb829d92391d5fed444df3a5ba74cf535  lockfile/recorded-inputs/bazel-7.7.2/fresh/dep.lock
+dc64faafeb4ecbbfe48f96fed223bee27e99b0b3556e0191d99f7989b42ba5b7  lockfile/recorded-inputs/bazel-7.7.2/fresh/expected.json
+9cca1a08c2a0502e6864c96f0743a50a24adbcc6b2cf7be4d84f633f438288c7  lockfile/recorded-inputs/bazel-7.7.2/fresh/root.MODULE.bazel
+d2761c3bc066b31cc83fbeb4f4601d3ce2aba10244f9dd94f9125ab7cbecba8b  lockfile/recorded-inputs/bazel-7.7.2/fresh/root.MODULE.bazel.lock
+8d2646542de1053ebd2f2f0253b0bbca4715e520f5527178d13191a2a9cf4996  lockfile/recorded-inputs/bazel-7.7.2/fresh/third_party/py/requirements lock.txt
+e8416e29516964fe181293c389328c5eb829d92391d5fed444df3a5ba74cf535  lockfile/recorded-inputs/bazel-7.7.2/stale/dep.lock
+2fa04a52d6b63bcdfa71d77471191f8e0680c0975f33c3f592fcd4e735dfe8da  lockfile/recorded-inputs/bazel-7.7.2/stale/expected.json
+9cca1a08c2a0502e6864c96f0743a50a24adbcc6b2cf7be4d84f633f438288c7  lockfile/recorded-inputs/bazel-7.7.2/stale/root.MODULE.bazel
+d2761c3bc066b31cc83fbeb4f4601d3ce2aba10244f9dd94f9125ab7cbecba8b  lockfile/recorded-inputs/bazel-7.7.2/stale/root.MODULE.bazel.lock
+080f0d61fb0d72c4250e11d6be7f78ff4470c471d26d48ded06d3c26fdb8e952  lockfile/recorded-inputs/bazel-7.7.2/stale/third_party/py/requirements lock.txt
+e8416e29516964fe181293c389328c5eb829d92391d5fed444df3a5ba74cf535  lockfile/recorded-inputs/bazel-8.0.0/fresh/dep.lock
+4b664acaa4e9bba7a83f1cdfbf7ec41f6873a8fb73047113f741a2f97b6b26ff  lockfile/recorded-inputs/bazel-8.0.0/fresh/expected.json
+9cca1a08c2a0502e6864c96f0743a50a24adbcc6b2cf7be4d84f633f438288c7  lockfile/recorded-inputs/bazel-8.0.0/fresh/root.MODULE.bazel
+56681b89b97048aed014c6a4d382e7e629a45a3768a3f6a2d1095c5d9c61e9f0  lockfile/recorded-inputs/bazel-8.0.0/fresh/root.MODULE.bazel.lock
+8d2646542de1053ebd2f2f0253b0bbca4715e520f5527178d13191a2a9cf4996  lockfile/recorded-inputs/bazel-8.0.0/fresh/third_party/py/requirements lock.txt
+e8416e29516964fe181293c389328c5eb829d92391d5fed444df3a5ba74cf535  lockfile/recorded-inputs/bazel-8.0.0/stale/dep.lock
+91f672d2b4d1e68347af2857d1d0303843b4549566d820b5443d71be1a72c70a  lockfile/recorded-inputs/bazel-8.0.0/stale/expected.json
+9cca1a08c2a0502e6864c96f0743a50a24adbcc6b2cf7be4d84f633f438288c7  lockfile/recorded-inputs/bazel-8.0.0/stale/root.MODULE.bazel
+56681b89b97048aed014c6a4d382e7e629a45a3768a3f6a2d1095c5d9c61e9f0  lockfile/recorded-inputs/bazel-8.0.0/stale/root.MODULE.bazel.lock
+080f0d61fb0d72c4250e11d6be7f78ff4470c471d26d48ded06d3c26fdb8e952  lockfile/recorded-inputs/bazel-8.0.0/stale/third_party/py/requirements lock.txt
+e8416e29516964fe181293c389328c5eb829d92391d5fed444df3a5ba74cf535  lockfile/recorded-inputs/bazel-8.1.0/fresh/dep.lock
+fb726b99a75b2d84c56bd135d4f9ebdb38c9cd72b1e9be6415ee4fa529aeb64f  lockfile/recorded-inputs/bazel-8.1.0/fresh/expected.json
+9cca1a08c2a0502e6864c96f0743a50a24adbcc6b2cf7be4d84f633f438288c7  lockfile/recorded-inputs/bazel-8.1.0/fresh/root.MODULE.bazel
+6f16fe100a8942776f3ad6c7e3f27d1d424c58720c9b465d5751594152eef657  lockfile/recorded-inputs/bazel-8.1.0/fresh/root.MODULE.bazel.lock
+8d2646542de1053ebd2f2f0253b0bbca4715e520f5527178d13191a2a9cf4996  lockfile/recorded-inputs/bazel-8.1.0/fresh/third_party/py/requirements lock.txt
+e8416e29516964fe181293c389328c5eb829d92391d5fed444df3a5ba74cf535  lockfile/recorded-inputs/bazel-8.1.0/stale/dep.lock
+6c5275ea98a2686065009259d665d10f00ad29cf74c209e58b1f3f27a41e687f  lockfile/recorded-inputs/bazel-8.1.0/stale/expected.json
+9cca1a08c2a0502e6864c96f0743a50a24adbcc6b2cf7be4d84f633f438288c7  lockfile/recorded-inputs/bazel-8.1.0/stale/root.MODULE.bazel
+6f16fe100a8942776f3ad6c7e3f27d1d424c58720c9b465d5751594152eef657  lockfile/recorded-inputs/bazel-8.1.0/stale/root.MODULE.bazel.lock
+080f0d61fb0d72c4250e11d6be7f78ff4470c471d26d48ded06d3c26fdb8e952  lockfile/recorded-inputs/bazel-8.1.0/stale/third_party/py/requirements lock.txt
+e8416e29516964fe181293c389328c5eb829d92391d5fed444df3a5ba74cf535  lockfile/recorded-inputs/bazel-8.4.2/fresh/dep.lock
+8568c69ebb20c2222a49731d3d9f0119f4330814da0255193db8192ce68d2cce  lockfile/recorded-inputs/bazel-8.4.2/fresh/expected.json
+9cca1a08c2a0502e6864c96f0743a50a24adbcc6b2cf7be4d84f633f438288c7  lockfile/recorded-inputs/bazel-8.4.2/fresh/root.MODULE.bazel
+0086ba0e111031500d01a4f3d412938e594956afcf05faa2f38e1115ab69e564  lockfile/recorded-inputs/bazel-8.4.2/fresh/root.MODULE.bazel.lock
+8d2646542de1053ebd2f2f0253b0bbca4715e520f5527178d13191a2a9cf4996  lockfile/recorded-inputs/bazel-8.4.2/fresh/third_party/py/requirements lock.txt
+e8416e29516964fe181293c389328c5eb829d92391d5fed444df3a5ba74cf535  lockfile/recorded-inputs/bazel-8.4.2/stale/dep.lock
+5fdbb167e6a6500f8c9f0239f3c8d9909f58ae13e368de78fd7149aa36f2dc88  lockfile/recorded-inputs/bazel-8.4.2/stale/expected.json
+9cca1a08c2a0502e6864c96f0743a50a24adbcc6b2cf7be4d84f633f438288c7  lockfile/recorded-inputs/bazel-8.4.2/stale/root.MODULE.bazel
+0086ba0e111031500d01a4f3d412938e594956afcf05faa2f38e1115ab69e564  lockfile/recorded-inputs/bazel-8.4.2/stale/root.MODULE.bazel.lock
+080f0d61fb0d72c4250e11d6be7f78ff4470c471d26d48ded06d3c26fdb8e952  lockfile/recorded-inputs/bazel-8.4.2/stale/third_party/py/requirements lock.txt
+e8416e29516964fe181293c389328c5eb829d92391d5fed444df3a5ba74cf535  lockfile/recorded-inputs/bazel-8.6.0/fresh/dep.lock
+c84f99ac992c6110a19dd8d791b5f3cf9fd69fee68bea073314daa3b93d74e79  lockfile/recorded-inputs/bazel-8.6.0/fresh/expected.json
+9cca1a08c2a0502e6864c96f0743a50a24adbcc6b2cf7be4d84f633f438288c7  lockfile/recorded-inputs/bazel-8.6.0/fresh/root.MODULE.bazel
+3be90ab95478f7053510481b7441fbbf58766ab1670624ac4815b5d5265c472b  lockfile/recorded-inputs/bazel-8.6.0/fresh/root.MODULE.bazel.lock
+8d2646542de1053ebd2f2f0253b0bbca4715e520f5527178d13191a2a9cf4996  lockfile/recorded-inputs/bazel-8.6.0/fresh/third_party/py/requirements lock.txt
+e8416e29516964fe181293c389328c5eb829d92391d5fed444df3a5ba74cf535  lockfile/recorded-inputs/bazel-8.6.0/stale/dep.lock
+9bdbb2538a98cb13ef2be2d93293f694446e62d961251e540097d71540773c0b  lockfile/recorded-inputs/bazel-8.6.0/stale/expected.json
+9cca1a08c2a0502e6864c96f0743a50a24adbcc6b2cf7be4d84f633f438288c7  lockfile/recorded-inputs/bazel-8.6.0/stale/root.MODULE.bazel
+3be90ab95478f7053510481b7441fbbf58766ab1670624ac4815b5d5265c472b  lockfile/recorded-inputs/bazel-8.6.0/stale/root.MODULE.bazel.lock
+080f0d61fb0d72c4250e11d6be7f78ff4470c471d26d48ded06d3c26fdb8e952  lockfile/recorded-inputs/bazel-8.6.0/stale/third_party/py/requirements lock.txt
+e8416e29516964fe181293c389328c5eb829d92391d5fed444df3a5ba74cf535  lockfile/recorded-inputs/bazel-8.7.0/fresh/dep.lock
+8e8e6d2062ac765e7c9c77d57e38a1e681cd4e8d888cd4422e8b15ab730257eb  lockfile/recorded-inputs/bazel-8.7.0/fresh/expected.json
+9cca1a08c2a0502e6864c96f0743a50a24adbcc6b2cf7be4d84f633f438288c7  lockfile/recorded-inputs/bazel-8.7.0/fresh/root.MODULE.bazel
+3be90ab95478f7053510481b7441fbbf58766ab1670624ac4815b5d5265c472b  lockfile/recorded-inputs/bazel-8.7.0/fresh/root.MODULE.bazel.lock
+8d2646542de1053ebd2f2f0253b0bbca4715e520f5527178d13191a2a9cf4996  lockfile/recorded-inputs/bazel-8.7.0/fresh/third_party/py/requirements lock.txt
+e8416e29516964fe181293c389328c5eb829d92391d5fed444df3a5ba74cf535  lockfile/recorded-inputs/bazel-8.7.0/stale/dep.lock
+242699f374ba156f593a4ab5f46277f2ab6af0b315a930b0ff15bc3e80ec6eb7  lockfile/recorded-inputs/bazel-8.7.0/stale/expected.json
+9cca1a08c2a0502e6864c96f0743a50a24adbcc6b2cf7be4d84f633f438288c7  lockfile/recorded-inputs/bazel-8.7.0/stale/root.MODULE.bazel
+3be90ab95478f7053510481b7441fbbf58766ab1670624ac4815b5d5265c472b  lockfile/recorded-inputs/bazel-8.7.0/stale/root.MODULE.bazel.lock
+080f0d61fb0d72c4250e11d6be7f78ff4470c471d26d48ded06d3c26fdb8e952  lockfile/recorded-inputs/bazel-8.7.0/stale/third_party/py/requirements lock.txt
+e8416e29516964fe181293c389328c5eb829d92391d5fed444df3a5ba74cf535  lockfile/recorded-inputs/bazel-8.8.2/fresh/dep.lock
+9e88243693eb2ff6789aab6318eb0248e6856d1f70a845d6caf6b7bfb1acaf6e  lockfile/recorded-inputs/bazel-8.8.2/fresh/expected.json
+9cca1a08c2a0502e6864c96f0743a50a24adbcc6b2cf7be4d84f633f438288c7  lockfile/recorded-inputs/bazel-8.8.2/fresh/root.MODULE.bazel
+e185613172ec28ee27e7adad604624385d73e6dca3b09e52f6f3db3ccd3e5142  lockfile/recorded-inputs/bazel-8.8.2/fresh/root.MODULE.bazel.lock
+8d2646542de1053ebd2f2f0253b0bbca4715e520f5527178d13191a2a9cf4996  lockfile/recorded-inputs/bazel-8.8.2/fresh/third_party/py/requirements lock.txt
+e8416e29516964fe181293c389328c5eb829d92391d5fed444df3a5ba74cf535  lockfile/recorded-inputs/bazel-8.8.2/stale/dep.lock
+996475f387b19171a5a9f9ad94751898b42f4373c21405e42d9e9d9e2e43defd  lockfile/recorded-inputs/bazel-8.8.2/stale/expected.json
+9cca1a08c2a0502e6864c96f0743a50a24adbcc6b2cf7be4d84f633f438288c7  lockfile/recorded-inputs/bazel-8.8.2/stale/root.MODULE.bazel
+e185613172ec28ee27e7adad604624385d73e6dca3b09e52f6f3db3ccd3e5142  lockfile/recorded-inputs/bazel-8.8.2/stale/root.MODULE.bazel.lock
+080f0d61fb0d72c4250e11d6be7f78ff4470c471d26d48ded06d3c26fdb8e952  lockfile/recorded-inputs/bazel-8.8.2/stale/third_party/py/requirements lock.txt
+e8416e29516964fe181293c389328c5eb829d92391d5fed444df3a5ba74cf535  lockfile/recorded-inputs/bazel-9.0.2/fresh/dep.lock
+a32eab01b8bb7c075516673cea048eeaef66273f4ad548a212a66974cfaf1b95  lockfile/recorded-inputs/bazel-9.0.2/fresh/expected.json
+9cca1a08c2a0502e6864c96f0743a50a24adbcc6b2cf7be4d84f633f438288c7  lockfile/recorded-inputs/bazel-9.0.2/fresh/root.MODULE.bazel
+0c8709716820c9ccc05f77d86cb96de19d9e6377d7767e67863eada48002eb53  lockfile/recorded-inputs/bazel-9.0.2/fresh/root.MODULE.bazel.lock
+8d2646542de1053ebd2f2f0253b0bbca4715e520f5527178d13191a2a9cf4996  lockfile/recorded-inputs/bazel-9.0.2/fresh/third_party/py/requirements lock.txt
+e8416e29516964fe181293c389328c5eb829d92391d5fed444df3a5ba74cf535  lockfile/recorded-inputs/bazel-9.0.2/stale/dep.lock
+944a5501ab7fd7fdcf28becf4c3a10cac9bac61be0c5a1edbec1204e111589fc  lockfile/recorded-inputs/bazel-9.0.2/stale/expected.json
+9cca1a08c2a0502e6864c96f0743a50a24adbcc6b2cf7be4d84f633f438288c7  lockfile/recorded-inputs/bazel-9.0.2/stale/root.MODULE.bazel
+0c8709716820c9ccc05f77d86cb96de19d9e6377d7767e67863eada48002eb53  lockfile/recorded-inputs/bazel-9.0.2/stale/root.MODULE.bazel.lock
+080f0d61fb0d72c4250e11d6be7f78ff4470c471d26d48ded06d3c26fdb8e952  lockfile/recorded-inputs/bazel-9.0.2/stale/third_party/py/requirements lock.txt
+e8416e29516964fe181293c389328c5eb829d92391d5fed444df3a5ba74cf535  lockfile/recorded-inputs/bazel-9.1.1/fresh/dep.lock
+c5c9e8e47df9fa36e5f7711e73a4337ceecbb1b5461900e5ee9a3693010a113a  lockfile/recorded-inputs/bazel-9.1.1/fresh/expected.json
+9cca1a08c2a0502e6864c96f0743a50a24adbcc6b2cf7be4d84f633f438288c7  lockfile/recorded-inputs/bazel-9.1.1/fresh/root.MODULE.bazel
+9b509cdcb7546900998017cf88961c5fa78057d4100708b3f64879e2b1ba8729  lockfile/recorded-inputs/bazel-9.1.1/fresh/root.MODULE.bazel.lock
+8d2646542de1053ebd2f2f0253b0bbca4715e520f5527178d13191a2a9cf4996  lockfile/recorded-inputs/bazel-9.1.1/fresh/third_party/py/requirements lock.txt
+e8416e29516964fe181293c389328c5eb829d92391d5fed444df3a5ba74cf535  lockfile/recorded-inputs/bazel-9.1.1/stale/dep.lock
+65fa93f61aed76dad782a9c43901de98f4c9656e55d6047a297fcf069ea0539c  lockfile/recorded-inputs/bazel-9.1.1/stale/expected.json
+9cca1a08c2a0502e6864c96f0743a50a24adbcc6b2cf7be4d84f633f438288c7  lockfile/recorded-inputs/bazel-9.1.1/stale/root.MODULE.bazel
+9b509cdcb7546900998017cf88961c5fa78057d4100708b3f64879e2b1ba8729  lockfile/recorded-inputs/bazel-9.1.1/stale/root.MODULE.bazel.lock
+080f0d61fb0d72c4250e11d6be7f78ff4470c471d26d48ded06d3c26fdb8e952  lockfile/recorded-inputs/bazel-9.1.1/stale/third_party/py/requirements lock.txt
+e8416e29516964fe181293c389328c5eb829d92391d5fed444df3a5ba74cf535  lockfile/recorded-inputs/bazel-9.3.2/fresh/dep.lock
+40f5f00c1970688bb8fc7673971eede0a0280a5e253b95fe1fecf4eb2e37c608  lockfile/recorded-inputs/bazel-9.3.2/fresh/expected.json
+9cca1a08c2a0502e6864c96f0743a50a24adbcc6b2cf7be4d84f633f438288c7  lockfile/recorded-inputs/bazel-9.3.2/fresh/root.MODULE.bazel
+2582bd4cd188efb97dcd9ef5e5dda1e65c536c49cc3a8e6c889ab25e4ae20536  lockfile/recorded-inputs/bazel-9.3.2/fresh/root.MODULE.bazel.lock
+8d2646542de1053ebd2f2f0253b0bbca4715e520f5527178d13191a2a9cf4996  lockfile/recorded-inputs/bazel-9.3.2/fresh/third_party/py/requirements lock.txt
+e8416e29516964fe181293c389328c5eb829d92391d5fed444df3a5ba74cf535  lockfile/recorded-inputs/bazel-9.3.2/stale/dep.lock
+36f25f58e654f8f803feed36a7f02e47c3c8d21233aa88e08598d792b8a6ee7a  lockfile/recorded-inputs/bazel-9.3.2/stale/expected.json
+9cca1a08c2a0502e6864c96f0743a50a24adbcc6b2cf7be4d84f633f438288c7  lockfile/recorded-inputs/bazel-9.3.2/stale/root.MODULE.bazel
+2582bd4cd188efb97dcd9ef5e5dda1e65c536c49cc3a8e6c889ab25e4ae20536  lockfile/recorded-inputs/bazel-9.3.2/stale/root.MODULE.bazel.lock
+080f0d61fb0d72c4250e11d6be7f78ff4470c471d26d48ded06d3c26fdb8e952  lockfile/recorded-inputs/bazel-9.3.2/stale/third_party/py/requirements lock.txt
+e505e55a7499253d4d83487359ebf6d33e1ec836b5e6a89dddaf619035f9bb70  lockfile/vectors.json
+e64f1d515b36e38c1d73d1965e8f9d54665aa733e7757ba5f558953af8456000  lockfile/workspace/a.patch
+2f3f2241036ebca8a305bb4a315b1a0914e8b499960a69027f311d8b254a8ffa  lockfile/workspace/dep2.lock
+28d4338acc141d6acdb0de4dbca695bce70c92c43484fb718a69c17f49c0af5e  lockfile/workspace/ext.bzl
+1212bfd85656e1ea16504e7035cd3f7a144616b4f65342d53d348e9c00d1777d  lockfile/workspace/other.BUILD.bazel
+ecfc0ae67c1b4a17dbbfd9d25320e1be24b8e448951916699524e59e5ccb6e02  lockfile/workspace/root.BUILD.bazel
+de68664a47cd76b5aaca5eb38dac15b086235d64ca8bb38f7fab9cc7cd286891  lockfile/workspace/third_party-py.BUILD.bazel
 36d9b0810ad6bbb35db31b524d4eb7eb66ad98a8cc6f520cf87d5d03703b0a43  x2/cargo-bazel-lock.json
 716d7d03490f3c377242cc98ebb8276396833d4817726f3a3c6c7371cc4dbc6b  x2/hub.BUILD.bazel
 e9559f9612b94de0c7620864f39a3894f31dacb5f36e31376accbf0bd0773be7  x2/hub.defs.bzl
+c2af1c9450c73b903bffe374a7c7d87b3a7190c2fed1ed6ea36edfa36e9da773  x2/locks/rr0.75.0-b9.3.2.baseline.MODULE.bazel.lock
 c5d9df693a0851b51b39cd5f4d2cec66d734491fb91b34952cc03b5c1816cf8a  x2/module/dep-override-use-repo.MODULE.bazel
 a4047006d562784e3b60ccb15c6c2fc85ae09605381fb34cf474773b7a657bb1  x2/module/dep-override.MODULE.bazel
 4b438440fde23a06d45ef3a6ec0fe0f391e0171163cbc990cfc985a7288ab208  x2/module/override-http-archive.MODULE.bazel
@@ -10,14 +194,18 @@ a4047006d562784e3b60ccb15c6c2fc85ae09605381fb34cf474773b7a657bb1  x2/module/dep-
 6df8177eaaaab5b25fd4ba341fed8341c5bd2b4751af1c12b52fdb864d55d1ea  x2/module/override-own-build-file.MODULE.bazel
 071edf8f80cabb9b259530a4620877c85fbe8ec8b666d114ff2766d8dc45e04d  x2/spoke.cfg-if-1.0.0.BUILD.bazel
 4d27fd0fcdc5ef68bed715c3fff794704bd862501e628b49bf7048895e777f2a  x2/spoke.instant-0.1.13.BUILD.bazel
-c1feeb2f0b3bb26ebee77721adf85d5c1e46a338fb8be77dabcc97410ed808d6  x2/vectors.json
+bc692b54694822da78a06f67225baa7d0e81fb799200dd70a0f611ca0409c448  x2/vectors.json
 224888d21e902b9f9898e68dbe22efb5be7a5f8eba6752609799556f39f9e86b  x3/fixture/baseline.go.mod
 d1c4c025da50168e31fba018a902bdf6909c3aa21002e264e8613d081f525903  x3/fixture/baseline.go.sum
 6057e59c8fd5d6da86cffecfb0a7f18a1eea8be2062c96c44a7c1bfa9fe4be7b  x3/fixture/dir.go.mod
 94f69a8520879fb7d1ab78837628a6d03f31e5446617fc882a74a71b99d9ccb9  x3/fixture/dir.go.sum
 d80cbfb457154a529fc967f0bf4212c4a53d688dd9d31fdf9633aba9612c6f26  x3/fixture/hosted.go.mod
 32ebf33065ae32c04db5f4f81c2b5d43fe5433298e9a637446cc606eeec7befb  x3/fixture/hosted.go.sum
+73e22ed3787ce546d26e495cc9efc9f11ef8ba72798e1649f48b6d8eadedce7e  x3/fixture/hosted.gz2.0.0-beta.2.MODULE.bazel
 c6ab75f225085d3af9e8ac0a2908cd7133cff6272b9d2b37277c844d5980b1a5  x3/fixture/othermod.go.mod
+4a03a26472c5df773653cf10ce6f08f1bbb7689138893bd0d39d0ffc67d36a28  x3/fixture/othermod.go.sum
+8a823f2cd0c16917a4f72435c56d4a1463573bf96465515c20f4e8f1a5cb2680  x3/fixture/othermod.gz2.0.0-beta.2.MODULE.bazel
+8df283213a4da4714b563ac3de43c04cb799c9f0c217d34c6e2b0a50b7c33ff7  x3/fixture/skew.gz2.0.0-beta.2.MODULE.bazel
 c4758b129c6cc9d32a9280d6c51bab1979819e99473ed90d4002a2ccf9e7775f  x3/hidden/gz0.54.0-b8.8.2.baseline.reduced.json
 ac5693b100f49f38d8aa47da5b52135ad123a931fbaf89326db1fb8ffc968f21  x3/hidden/gz0.54.0-b8.8.2.dir.reduced.json
 cc4e850c4844437427c4a1a5f8c3e7fa67aa20eb6ce8fcdac4acd9f2a150cfdc  x3/hidden/gz0.54.0-b8.8.2.hosted.reduced.json
@@ -35,7 +223,7 @@ e8ba34c2edb70fcd46b2a79cdf237d32caab80d7bf9520367768cb4b7247914f  x3/hidden/gz2.
 878e13a86cbdfa9adc9a437a57fc9e537b5e02ea60a1a0e27d7a043314ba9550  x3/hidden/gz2.0.0-beta.2-b9.3.2.hosted.reduced.json
 7f467236016f21b8fda4ed6b9d5e081d5a270b6cf6f845e5352d60398e16da76  x3/hidden/gz2.0.0-beta.2-b9.3.2.skew.reduced.json
 35dce6fcb49f52650f2ae51ccfab4586d17db3054e251ec4fe8ebb9bdda73ac8  x3/locks/gz2.0.0-beta.2-b9.3.2.skew.MODULE.bazel.lock
-a243297c6a25aa894eea5b0a814daaa51fbf316ae7dc56c9bcc1a50f4a719529  x3/vectors.json
+539638508df8b6bc0d51315703b349e1190724c3a087816bc91ae85743ed1785  x3/vectors.json
 f6e4c0f3791f70e1c754d786734dadec1a96452f19b0dc921743a80fca38f052  x4/inputs/bom-crlf.lock
 028ba78e3f48e6cccae57550b1e2fc9d67767fd9b7d2ba0ce1815cac0d400f00  x4/inputs/crlf.lock
 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  x4/inputs/empty.lock
@@ -51,7 +239,10 @@ aeefd032b6bdddc6a619a2b69952d62d8a7873adb24a9037444acbfafca287c5  x4/inputs/with
 e1b4dfc9f284b947a6d9eb576ea27e61d5003fcddbc4d5c4051c4629183a84f4  x4/locks/8.8.2.MODULE.bazel.lock
 770ec67d50ce371104384201fa5a263fe3b3e157d5a740a478db5f0fb52f32f6  x4/locks/9.1.1.MODULE.bazel.lock
 831b09921309ffdf1fb466df204142362000c18d9efc58118707032db4a41224  x4/locks/9.3.2.MODULE.bazel.lock
-5204504073ceda49a32572a880a1ff0eb1aaa4ec6d1a09239921ce74ffca3ad5  x4/vectors.json
+572d38d640fd2e62e77a6f51f12fae9a7f922d185088670404619e523dd4c8d7  x4/locks/9.3.2.digest-blake3.MODULE.bazel.lock
+a98c2995ceb0bf13590c8f89a841ba01d4b6ce87a665157e787deaaf4c1934fd  x4/locks/9.3.2.digest-sha1.MODULE.bazel.lock
+5d62cd1b65c73c8336f8e7de44a68f1b2f6ff051c32ef30e1ce3bbe595dc563d  x4/vectors.json
 d5a8e67da1a694fb1c12040bf6a2b539a4bb3852fe875add99c48b979366b4d6  x4/workspace/ext.bzl
 5c6d2a9911998364d4cd43739714d1a22c41ea82a93132d7dc7bfe7360ad26cf  x4/workspace/root.BUILD.bazel
+73d778e49177e136f79a04e00dd54bb5a8a41849f08597024f59cd99292e36e8  x4/workspace/sub-pkg.BUILD.bazel
 3c6f345c8c99a2bf27ebe8418a27dc8345900c704ad70fdeae4d4c3c6d7047ee  x4/workspace/x4.MODULE.bazel

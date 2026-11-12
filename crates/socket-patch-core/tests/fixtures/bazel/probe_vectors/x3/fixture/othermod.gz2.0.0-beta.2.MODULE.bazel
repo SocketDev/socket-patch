@@ -1,0 +1,8 @@
+module(name = "othermod", version = "0.0.0")
+
+bazel_dep(name = "rules_go", version = "0.65.0")
+bazel_dep(name = "gazelle", version = "2.0.0-beta.2")
+
+go_deps = use_extension("@gazelle//:extensions.bzl", "go_deps")
+go_deps.from_file(go_mod = "//:go.mod")
+use_repo(go_deps, "com_github_jackc_pgx_v5")

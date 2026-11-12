@@ -1,0 +1,5 @@
+genrule(
+    name = "unrelated",
+    outs = ["unrelated.txt"],
+    cmd = "echo unrelated-other-package > $@",
+)

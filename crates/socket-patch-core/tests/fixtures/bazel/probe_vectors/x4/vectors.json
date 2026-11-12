@@ -4,6 +4,17 @@
   "verdict": "CONFIRMED under the default digest function on every version run; REFUTED under a non-default --digest_function startup option",
   "host": "macOS arm64 (Darwin 27.0.0), 2026-11-11 / 2026-11-12",
   "extension": "//:ext.bzl%x4 (root module, not reproducible, module_ctx.read(label) per file)",
+  "workspace": {
+    "files": {
+      "workspace/x4.MODULE.bazel": "MODULE.bazel",
+      "workspace/ext.bzl": "ext.bzl",
+      "workspace/root.BUILD.bazel": "BUILD.bazel",
+      "workspace/sub-pkg.BUILD.bazel": "sub/pkg/BUILD.bazel"
+    },
+    "inputs": "inputs/<path> goes to <path> (the workspace root holds lf.lock, sub/pkg/nested.lock, ...)",
+    "bazel_6": "6.6.0 also needs an empty WORKSPACE file at the root and --enable_bzlmod on every command",
+    "command": "`bazel mod deps --lockfile_mode=update` in that workspace writes the MODULE.bazel.lock committed as locks/<bazel>.MODULE.bazel.lock"
+  },
   "key_rules": {
     "accumulatedFileDigests": "key is '@@' + label, colon kept ('@@//sub/pkg:deep/dir/file.lock'); a space is written as is",
     "recordedFileInputs": "key is '@@//' + workspace-relative path; a space is written as is",
@@ -13,6 +24,7 @@
     "sha1": "f9970c154d890b6cd10a5375b0d578a1ee1fdc9c",
     "note": "the sha1 cells recorded exactly this value; the blake3 value is in digest_function[]"
   },
+  "digest_function_note": "digest_function[] rows with a lock_file have the lock Bazel wrote under that startup option, byte for byte; the others have rows only. A sha1 value is 40 hex digits. A blake3 value is 64, the length of a SHA-256, so length cannot tell the two apart: the SHA-256 comparison fails for every input, the empty file included. The option is set on the command line or by a `startup` line in an rc file; the lock does not name it",
   "inputs": [
     {
       "label": "//:lf.lock",
@@ -1867,7 +1879,10 @@
       "update_mode_exit": 0,
       "recorded_value_for_lf_lock": "f9970c154d890b6cd10a5375b0d578a1ee1fdc9c",
       "recorded_value_hex_length": 40,
-      "equals_sha256_of_bytes": false
+      "equals_sha256_of_bytes": false,
+      "lock_file": null,
+      "lock_sha256": "8f14f5b3a947db881a8571090ae757c6aff3f40a655489383280a408ba56260a",
+      "lock_size": 107463
     },
     {
       "bazel": "7.7.2",
@@ -1877,7 +1892,10 @@
       "update_mode_exit": 0,
       "recorded_value_for_lf_lock": "42d752d7cca97561f9bd173afd9c90f1196f708272ba872435a98d5277c5b72a",
       "recorded_value_hex_length": 64,
-      "equals_sha256_of_bytes": false
+      "equals_sha256_of_bytes": false,
+      "lock_file": null,
+      "lock_sha256": "310a995baf2e1a8473dbc909e3db38ace8e06b932813bc670135b14687e39051",
+      "lock_size": 107703
     },
     {
       "bazel": "8.8.2",
@@ -1887,7 +1905,10 @@
       "update_mode_exit": 0,
       "recorded_value_for_lf_lock": "f9970c154d890b6cd10a5375b0d578a1ee1fdc9c",
       "recorded_value_hex_length": 40,
-      "equals_sha256_of_bytes": false
+      "equals_sha256_of_bytes": false,
+      "lock_file": null,
+      "lock_sha256": "481eb27ca11749429a0af49a89b23756e232dd17b0855112d707088e96d876b6",
+      "lock_size": 164264
     },
     {
       "bazel": "8.8.2",
@@ -1897,7 +1918,10 @@
       "update_mode_exit": 0,
       "recorded_value_for_lf_lock": "42d752d7cca97561f9bd173afd9c90f1196f708272ba872435a98d5277c5b72a",
       "recorded_value_hex_length": 64,
-      "equals_sha256_of_bytes": false
+      "equals_sha256_of_bytes": false,
+      "lock_file": null,
+      "lock_sha256": "a0ec774b7335d6ad343fe6e691cc52239fb95cfa0abdc5ed99e9e9e978da54a9",
+      "lock_size": 164576
     },
     {
       "bazel": "9.3.2",
@@ -1907,7 +1931,10 @@
       "update_mode_exit": 0,
       "recorded_value_for_lf_lock": "f9970c154d890b6cd10a5375b0d578a1ee1fdc9c",
       "recorded_value_hex_length": 40,
-      "equals_sha256_of_bytes": false
+      "equals_sha256_of_bytes": false,
+      "lock_file": "locks/9.3.2.digest-sha1.MODULE.bazel.lock",
+      "lock_sha256": "a98c2995ceb0bf13590c8f89a841ba01d4b6ce87a665157e787deaaf4c1934fd",
+      "lock_size": 51844
     },
     {
       "bazel": "9.3.2",
@@ -1917,7 +1944,10 @@
       "update_mode_exit": 0,
       "recorded_value_for_lf_lock": "42d752d7cca97561f9bd173afd9c90f1196f708272ba872435a98d5277c5b72a",
       "recorded_value_hex_length": 64,
-      "equals_sha256_of_bytes": false
+      "equals_sha256_of_bytes": false,
+      "lock_file": "locks/9.3.2.digest-blake3.MODULE.bazel.lock",
+      "lock_sha256": "572d38d640fd2e62e77a6f51f12fae9a7f922d185088670404619e523dd4c8d7",
+      "lock_size": 52084
     }
   ],
   "real_ruleset_crosscheck": {

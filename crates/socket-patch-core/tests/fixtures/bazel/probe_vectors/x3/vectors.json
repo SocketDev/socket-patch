@@ -3,13 +3,14 @@
  "question": "Where do reproducible extensions' results live in the output base, in what format, and do they name the selected Go module version; what do gazelle facts record for a replaced module?",
  "verdict": {
   "hidden_lockfile": "CONFIRMED on 8.8.2 and 9.3.2 (<output_base>/MODULE.bazel.lock, the workspace lock's own JSON format, names the selected version of every go_deps repository); absent on 7.7.2, where nothing in the output base names the version",
-  "facts_as_selection_proof": "REFUTED: required_mod_files_v1 lists the .mod files `go list` was fed, not the selected versions; it names the Socket module at the pin while Bazel builds an unpatched higher version (state skew) and after the replace is gone (state restored)"
+  "facts_as_selection_proof": "REFUTED: required_mod_files_v1 lists the .mod files `go list` was fed, not the selected versions; it names the Socket module at the pin while Bazel builds an unpatched higher version (state skew) and after the replace is gone (state restored)",
+  "freshness_by_root_go_mod_digest": "REFUTED as sufficient: the hosted and skew entries of every cell record identical root go.mod / go.sum digests and name different selected versions (v5.7.0-socketpatch.1 with the Socket replace, fetched tree patched; upstream v5.7.1, fetched tree unpatched). The two states differ on disk in MODULE.bazel alone (a bazel_dep on a second module whose go.mod requires v5.7.1: fixture/hosted.gz*.MODULE.bazel against fixture/skew.gz*.MODULE.bazel; that module's directory is beside the workspace in every state). Every recorded input of the hosted entry is also in the skew entry, so a hosted entry left on disk after that edit has no row that fails. What tells them apart is usagesDigest, which a static reader cannot recompute, and the two FILE:@@othermod+// rows that only the skew entry has. See freshness_by_root_go_mod_digest[] and hidden/<cell>.hosted.reduced.json against hidden/<cell>.skew.reduced.json. Derived from the recorded rows: no cell left a stale hidden lockfile on disk and read it back"
  },
  "host": "macOS arm64 (Darwin 27.0.0), 2026-11-12",
  "fixture": {
   "root": "example.com/x3 requires github.com/jackc/pgx/v5 v5.7.0 and github.com/google/go-cmp v0.5.9",
   "socket_module": "patch.socket.dev/gopatch/d8941a4c-4bcd-4756-b0aa-239ec9c81b0f/v5 v5.7.0-socketpatch.1 (production free patch, through proxy.golang.org)",
-  "othermod": "a second Bazel module (local_path_override) whose go.mod requires pgx v5.7.1",
+  "othermod": "a second Bazel module whose go.mod requires pgx v5.7.1. The root reaches it with local_path_override(path = \"../othermod\"): it sits beside the workspace, not in the output base, and the lock has no registryFileHashes key for it",
   "states_in_order": [
    "baseline",
    "dir",
@@ -17,8 +18,186 @@
    "skew",
    "restored"
   ],
-  "patched_bytes_marker": "pgproto3/function_call_decode_test.go"
+  "patched_bytes_marker": "pgproto3/function_call_decode_test.go",
+  "files": {
+   "fixture/<state>.go.mod, fixture/<state>.go.sum": "go.mod, go.sum of the root (skew uses hosted's, restored uses baseline's)",
+   "fixture/hosted.gz2.0.0-beta.2.MODULE.bazel": "MODULE.bazel of the root with gazelle 2.0.0-beta.2, every state but skew",
+   "fixture/skew.gz2.0.0-beta.2.MODULE.bazel": "MODULE.bazel of the root with gazelle 2.0.0-beta.2, state skew; the file the committed workspace lock was written for",
+   "fixture/othermod.go.mod, fixture/othermod.go.sum": "../othermod/go.mod, ../othermod/go.sum",
+   "fixture/othermod.gz2.0.0-beta.2.MODULE.bazel": "../othermod/MODULE.bazel"
+  },
+  "not_committed": "main.go, ../othermod/lib.go and the BUILD files: no lock records them"
  },
+ "freshness_by_root_go_mod_digest": [
+  {
+   "bazel": "8.8.2",
+   "gazelle": "0.54.0",
+   "reduced_copies": {
+    "hosted": "hidden/gz0.54.0-b8.8.2.hosted.reduced.json",
+    "skew": "hidden/gz0.54.0-b8.8.2.skew.reduced.json"
+   },
+   "root_rows_in_both_entries": [
+    "FILE:@@//go.mod d80cbfb457154a529fc967f0bf4212c4a53d688dd9d31fdf9633aba9612c6f26",
+    "FILE:@@//go.sum 32ebf33065ae32c04db5f4f81c2b5d43fe5433298e9a637446cc606eeec7befb"
+   ],
+   "rows_of_the_hosted_entry_missing_from_the_skew_entry": [],
+   "rows_only_in_the_skew_entry": [
+    "FILE:@@othermod+//go.mod c6ab75f225085d3af9e8ac0a2908cd7133cff6272b9d2b37277c844d5980b1a5",
+    "FILE:@@othermod+//go.sum 4a03a26472c5df773653cf10ce6f08f1bbb7689138893bd0d39d0ffc67d36a28"
+   ],
+   "recorded_input_count": {
+    "hosted": 17,
+    "skew": 19
+   },
+   "usagesDigest": {
+    "hosted": "NzAIFf6ZCLmgGWHmhEOOYSin1KPkhRN4hYLTbqU+DnE=",
+    "skew": "fVfKQdI8vOEaVaB4sd7v/rj7Let/a33zeuHrG+BP82Y="
+   },
+   "bzlTransitiveDigest_equal": true,
+   "registryFileHashes_equal": true,
+   "selected_pgx": {
+    "hosted": {
+     "replace": "patch.socket.dev/gopatch/d8941a4c-4bcd-4756-b0aa-239ec9c81b0f/v5",
+     "version": "v5.7.0-socketpatch.1",
+     "sum": "h1:gR/c/AlF3QdC7jqzW7DTXmKzYaNTFHD6MMmBuMntE2g="
+    },
+    "skew": {
+     "version": "v5.7.1",
+     "sum": "h1:x7SYsPBYDkHDksogeSmZZ5xzThcTgRz++I5E+ePFUcs="
+    }
+   },
+   "patched_marker_file_present": {
+    "hosted": true,
+    "skew": false
+   }
+  },
+  {
+   "bazel": "8.8.2",
+   "gazelle": "2.0.0-beta.2",
+   "reduced_copies": {
+    "hosted": "hidden/gz2.0.0-beta.2-b8.8.2.hosted.reduced.json",
+    "skew": "hidden/gz2.0.0-beta.2-b8.8.2.skew.reduced.json"
+   },
+   "root_rows_in_both_entries": [
+    "FILE:@@//go.mod d80cbfb457154a529fc967f0bf4212c4a53d688dd9d31fdf9633aba9612c6f26",
+    "FILE:@@//go.sum 32ebf33065ae32c04db5f4f81c2b5d43fe5433298e9a637446cc606eeec7befb"
+   ],
+   "rows_of_the_hosted_entry_missing_from_the_skew_entry": [],
+   "rows_only_in_the_skew_entry": [
+    "FILE:@@othermod+//go.mod c6ab75f225085d3af9e8ac0a2908cd7133cff6272b9d2b37277c844d5980b1a5",
+    "FILE:@@othermod+//go.sum 4a03a26472c5df773653cf10ce6f08f1bbb7689138893bd0d39d0ffc67d36a28"
+   ],
+   "recorded_input_count": {
+    "hosted": 18,
+    "skew": 20
+   },
+   "usagesDigest": {
+    "hosted": "8QIWaIkYtmCGpiSLnAhDTcG+HpxyxeZ3BSPznuESWwo=",
+    "skew": "A1cfLT9sNkiRPfD/L/vpR5Ssrffh9DDEMhW/WHRwaRU="
+   },
+   "bzlTransitiveDigest_equal": true,
+   "registryFileHashes_equal": true,
+   "selected_pgx": {
+    "hosted": {
+     "version": "v5.7.0-socketpatch.1",
+     "sum": "h1:gR/c/AlF3QdC7jqzW7DTXmKzYaNTFHD6MMmBuMntE2g=",
+     "replace": "patch.socket.dev/gopatch/d8941a4c-4bcd-4756-b0aa-239ec9c81b0f/v5"
+    },
+    "skew": {
+     "version": "v5.7.1",
+     "sum": "h1:x7SYsPBYDkHDksogeSmZZ5xzThcTgRz++I5E+ePFUcs="
+    }
+   },
+   "patched_marker_file_present": {
+    "hosted": true,
+    "skew": false
+   }
+  },
+  {
+   "bazel": "9.3.2",
+   "gazelle": "0.54.0",
+   "reduced_copies": {
+    "hosted": "hidden/gz0.54.0-b9.3.2.hosted.reduced.json",
+    "skew": "hidden/gz0.54.0-b9.3.2.skew.reduced.json"
+   },
+   "root_rows_in_both_entries": [
+    "FILE:@@//go.mod d80cbfb457154a529fc967f0bf4212c4a53d688dd9d31fdf9633aba9612c6f26",
+    "FILE:@@//go.sum 32ebf33065ae32c04db5f4f81c2b5d43fe5433298e9a637446cc606eeec7befb"
+   ],
+   "rows_of_the_hosted_entry_missing_from_the_skew_entry": [],
+   "rows_only_in_the_skew_entry": [
+    "FILE:@@othermod+//go.mod c6ab75f225085d3af9e8ac0a2908cd7133cff6272b9d2b37277c844d5980b1a5",
+    "FILE:@@othermod+//go.sum 4a03a26472c5df773653cf10ce6f08f1bbb7689138893bd0d39d0ffc67d36a28"
+   ],
+   "recorded_input_count": {
+    "hosted": 17,
+    "skew": 19
+   },
+   "usagesDigest": {
+    "hosted": "NzAIFf6ZCLmgGWHmhEOOYSin1KPkhRN4hYLTbqU+DnE=",
+    "skew": "fVfKQdI8vOEaVaB4sd7v/rj7Let/a33zeuHrG+BP82Y="
+   },
+   "bzlTransitiveDigest_equal": true,
+   "registryFileHashes_equal": true,
+   "selected_pgx": {
+    "hosted": {
+     "replace": "patch.socket.dev/gopatch/d8941a4c-4bcd-4756-b0aa-239ec9c81b0f/v5",
+     "version": "v5.7.0-socketpatch.1",
+     "sum": "h1:gR/c/AlF3QdC7jqzW7DTXmKzYaNTFHD6MMmBuMntE2g="
+    },
+    "skew": {
+     "version": "v5.7.1",
+     "sum": "h1:x7SYsPBYDkHDksogeSmZZ5xzThcTgRz++I5E+ePFUcs="
+    }
+   },
+   "patched_marker_file_present": {
+    "hosted": true,
+    "skew": false
+   }
+  },
+  {
+   "bazel": "9.3.2",
+   "gazelle": "2.0.0-beta.2",
+   "reduced_copies": {
+    "hosted": "hidden/gz2.0.0-beta.2-b9.3.2.hosted.reduced.json",
+    "skew": "hidden/gz2.0.0-beta.2-b9.3.2.skew.reduced.json"
+   },
+   "root_rows_in_both_entries": [
+    "FILE:@@//go.mod d80cbfb457154a529fc967f0bf4212c4a53d688dd9d31fdf9633aba9612c6f26",
+    "FILE:@@//go.sum 32ebf33065ae32c04db5f4f81c2b5d43fe5433298e9a637446cc606eeec7befb"
+   ],
+   "rows_of_the_hosted_entry_missing_from_the_skew_entry": [],
+   "rows_only_in_the_skew_entry": [
+    "FILE:@@othermod+//go.mod c6ab75f225085d3af9e8ac0a2908cd7133cff6272b9d2b37277c844d5980b1a5",
+    "FILE:@@othermod+//go.sum 4a03a26472c5df773653cf10ce6f08f1bbb7689138893bd0d39d0ffc67d36a28"
+   ],
+   "recorded_input_count": {
+    "hosted": 18,
+    "skew": 20
+   },
+   "usagesDigest": {
+    "hosted": "8QIWaIkYtmCGpiSLnAhDTcG+HpxyxeZ3BSPznuESWwo=",
+    "skew": "A1cfLT9sNkiRPfD/L/vpR5Ssrffh9DDEMhW/WHRwaRU="
+   },
+   "bzlTransitiveDigest_equal": true,
+   "registryFileHashes_equal": true,
+   "selected_pgx": {
+    "hosted": {
+     "version": "v5.7.0-socketpatch.1",
+     "sum": "h1:gR/c/AlF3QdC7jqzW7DTXmKzYaNTFHD6MMmBuMntE2g=",
+     "replace": "patch.socket.dev/gopatch/d8941a4c-4bcd-4756-b0aa-239ec9c81b0f/v5"
+    },
+    "skew": {
+     "version": "v5.7.1",
+     "sum": "h1:x7SYsPBYDkHDksogeSmZZ5xzThcTgRz++I5E+ePFUcs="
+    }
+   },
+   "patched_marker_file_present": {
+    "hosted": true,
+    "skew": false
+   }
+  }
+ ],
  "cells": [
   {
    "bazel": "7.7.2",

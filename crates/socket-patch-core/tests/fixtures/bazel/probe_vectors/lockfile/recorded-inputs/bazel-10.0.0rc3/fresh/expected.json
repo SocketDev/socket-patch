@@ -1,0 +1,30 @@
+{
+ "bazel": "10.0.0rc3",
+ "lockFileVersion": 28,
+ "bazel_error_mode_build_exit": 0,
+ "prototype": {
+  "lockFileVersion": 28,
+  "inputs": [
+   {
+    "extension": "//:ext.bzl%toy",
+    "factor": "general",
+    "key": "@@//dep.lock",
+    "path": "dep.lock",
+    "recorded": "e8416e29516964fe181293c389328c5eb829d92391d5fed444df3a5ba74cf535",
+    "actual": "e8416e29516964fe181293c389328c5eb829d92391d5fed444df3a5ba74cf535",
+    "state": "fresh"
+   },
+   {
+    "extension": "//:ext.bzl%toy",
+    "factor": "general",
+    "key": "@@//third_party/py/requirements lock.txt",
+    "path": "third_party/py/requirements lock.txt",
+    "recorded": "8d2646542de1053ebd2f2f0253b0bbca4715e520f5527178d13191a2a9cf4996",
+    "actual": "8d2646542de1053ebd2f2f0253b0bbca4715e520f5527178d13191a2a9cf4996",
+    "state": "fresh"
+   }
+  ]
+ },
+ "prototype_predicts_stale": false,
+ "matches_bazel": true
+}
