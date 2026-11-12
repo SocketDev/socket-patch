@@ -89,6 +89,30 @@ pub struct RootRef {
     pub root: PathBuf,
     /// The project relative to `root`: forward slashes, `""` at the root.
     pub project_rel: String,
+    /// How many directory levels the read boundary (the git checkout
+    /// root) lies above `root`; 0 when the root is the boundary. `probe`
+    /// sets it. It is what lets a pure reader walk the ancestors of the
+    /// root without asking for a file past the boundary.
+    pub boundary_levels: usize,
+}
+
+impl RootRef {
+    /// Every directory from the project up to the read boundary, nearest
+    /// first, as a [`FileView`] path: `svc/api`, `svc`, `""` (the root),
+    /// `..`, `../..`. bazelisk takes the `.bazelversion` nearest the
+    /// working directory, and one above the root applies when the root
+    /// has none (design 2.4), so the version reader looks in each.
+    pub fn dirs_to_boundary(&self) -> Vec<String> {
+        let mut dirs = Vec::new();
+        let mut below = self.project_rel.as_str();
+        while !below.is_empty() {
+            dirs.push(below.to_string());
+            below = below.rsplit_once('/').map_or("", |(parent, _)| parent);
+        }
+        dirs.push(String::new());
+        dirs.extend((1..=self.boundary_levels).map(|up| vec![".."; up].join("/")));
+        dirs
+    }
 }
 
 /// What a read of one workspace file found. A file that exists and cannot
@@ -96,14 +120,47 @@ pub struct RootRef {
 /// folded into `Absent`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FileText {
-    Text(String),
+    /// The file's bytes, undecoded. Bazel accepts bytes that are not UTF-8
+    /// inside Starlark comments and string literals (design 2.2), so
+    /// whether a file must be UTF-8 is each reader's decision: the
+    /// Starlark lexer takes the bytes, and the readers of JSON, TOML and
+    /// YAML locks ask for [`FileText::as_str`]. Decoding lossily here
+    /// would shift every later [`Site::span`].
+    Bytes(Vec<u8>),
     Absent,
     Unreadable,
 }
 
-/// Read access to the files under one Bazel root, by forward-slash path
-/// relative to it. The disk and in-memory engines each implement it, which
-/// is what keeps this layer free of IO.
+impl FileText {
+    /// The bytes of a file that was read.
+    pub fn as_bytes(&self) -> Option<&[u8]> {
+        match self {
+            Self::Bytes(bytes) => Some(bytes),
+            Self::Absent | Self::Unreadable => None,
+        }
+    }
+
+    /// The text of a file that was read and is valid UTF-8. `None` does
+    /// not mean absent: a reader that needs text treats a file that is
+    /// present and not UTF-8 as one it could not read.
+    pub fn as_str(&self) -> Option<&str> {
+        std::str::from_utf8(self.as_bytes()?).ok()
+    }
+}
+
+/// Read access to the files a Bazel root can see. The disk and in-memory
+/// engines each implement it, which is what keeps this layer free of IO.
+///
+/// A path is relative to the Bazel root and normalised: forward slashes,
+/// no empty or `.` segment, no trailing slash, `""` for the root itself.
+/// It may start with `..` segments, and only there, to name a file between
+/// the root and the read boundary: a `.bazelversion` above the root, an rc
+/// file imported as `%workspace%/../shared.bazelrc`. [`Gap::file`] and
+/// [`Site::file`] name a file the same way.
+///
+/// A path that leaves the read boundary (more leading `..` segments than
+/// [`RootRef::boundary_levels`]) is `Unreadable` and cannot be listed. It
+/// is never `Absent`: socket-patch does not look there, so it cannot know.
 pub trait FileView {
     fn read(&self, rel: &str) -> FileText;
     /// Children of a directory (`""` = the root): bare names, directories
@@ -520,11 +577,31 @@ pub enum AttestBasis {
     GoRule,
 }
 
-/// What the one command of a works-after outcome refreshes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RunKind {
-    Lockfile,
-    UpdateRepos,
+listed_enum! {
+    /// What the one command of a `*_bazel_run_required` advisory
+    /// refreshes.
+    pub enum RunKind {
+        /// `MODULE.bazel.lock`.
+        Lockfile,
+        /// The `go_repository` rules, through the user's own
+        /// `update-repos`.
+        UpdateRepos,
+        /// The crate lock digest of a crate_universe hub with a
+        /// `lockfile`: after a restore the build fails with `Digests do
+        /// not match` until the repin (design 7).
+        Repin,
+    }
+}
+
+impl RunKind {
+    /// The advisory's `kind` detail (design 6).
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Lockfile => "lockfile",
+            Self::UpdateRepos => "update_repos",
+            Self::Repin => "repin",
+        }
+    }
 }
 
 /// The one command the user runs after a works-after write. The build and
@@ -545,8 +622,12 @@ pub struct RunRequired {
 /// keeps its output inside the allowed classes (owner decision D4).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PlannedWrite {
-    /// A native lock a live hub names, its paired manifest or an existing
-    /// side file: the native rewriter's output, unchanged.
+    /// A native lock a live hub names, its paired manifest or a side file:
+    /// the native rewriter's output, unchanged. A side file exists
+    /// already, except the `pnpm-workspace.yaml` beside a governed pnpm
+    /// lock, which is created as native hosted mode creates it (owner
+    /// decision O14). `.npmrc` is never one: a created `.npmrc` fails
+    /// rules_js 3.x.
     NativeLock { path: String },
     /// One value in a file a tool generates.
     GeneratedValue { path: String, key: String },
@@ -709,9 +790,12 @@ pub enum RestoreOutcome {
     Refused(Refusal),
 }
 
-/// Candidate file texts by root-relative path.
+/// Candidate file texts by root-relative path: the files a lane edits.
+/// They are text, so a file that is not valid UTF-8 never enters the map:
+/// it is read (as [`FileText::Bytes`]) and never edited.
 pub type Files = BTreeMap<String, String>;
-/// A text read by root-relative path; `None` = missing or unreadable.
+/// A text read by root-relative path; `None` = missing, unreadable or not
+/// valid UTF-8.
 pub type TextRead<'a> = &'a dyn Fn(&str) -> Option<String>;
 
 /// The pre-write proof.
@@ -858,6 +942,48 @@ mod tests {
                 "{shape:?}"
             );
         }
+    }
+
+    /// A Starlark file with a Latin-1 byte in a comment builds on every
+    /// Bazel line. A view that could only hand over a `String` would have
+    /// to call it unreadable, or decode it lossily and shift every span.
+    #[test]
+    fn a_file_that_is_not_utf8_is_read_as_its_bytes() {
+        let latin1 = b"# caf\xe9\nmodule(name = \"m\")\n".to_vec();
+        let read = FileText::Bytes(latin1.clone());
+        assert_eq!(read.as_bytes(), Some(latin1.as_slice()));
+        assert_eq!(read.as_str(), None);
+        let text = FileText::Bytes(b"{}\n".to_vec());
+        assert_eq!(text.as_str(), Some("{}\n"));
+        for missing in [FileText::Absent, FileText::Unreadable] {
+            assert_eq!((missing.as_bytes(), missing.as_str()), (None, None));
+        }
+    }
+
+    /// The version reader collects every `.bazelversion` from the project
+    /// up to the read boundary, the ones above the root included, and
+    /// asks for nothing past it.
+    #[test]
+    fn a_root_lists_the_directories_up_to_the_read_boundary() {
+        let root = |project_rel: &str, boundary_levels| RootRef {
+            root: PathBuf::from("/repo/ws"),
+            project_rel: project_rel.to_string(),
+            boundary_levels,
+        };
+        assert_eq!(root("", 0).dirs_to_boundary(), [""]);
+        assert_eq!(root("svc", 0).dirs_to_boundary(), ["svc", ""]);
+        assert_eq!(
+            root("svc/api", 2).dirs_to_boundary(),
+            ["svc/api", "svc", "", "..", "../.."]
+        );
+    }
+
+    /// Design 6 lists the advisory's `kind` values. `repin` is the
+    /// crate_universe case of design 7.
+    #[test]
+    fn a_required_run_has_the_three_kinds_of_the_contract() {
+        let kinds: Vec<&str> = RunKind::ALL.iter().map(|kind| kind.as_str()).collect();
+        assert_eq!(kinds, ["lockfile", "update_repos", "repin"]);
     }
 
     #[test]
