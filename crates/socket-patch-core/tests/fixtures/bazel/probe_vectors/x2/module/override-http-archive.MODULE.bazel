@@ -1,0 +1,25 @@
+module(name = "sp_probe")
+
+bazel_dep(name = "rules_rust", version = "0.75.0")
+
+crate = use_extension("@rules_rust//crate_universe:extensions.bzl", "crate")
+crate.from_cargo(
+    name = "crates",
+    cargo_lockfile = "//:Cargo.lock",
+    lockfile = "//:cargo-bazel-lock.json",
+    manifests = ["//:Cargo.toml"],
+)
+use_repo(crate, "crates")
+
+http_archive = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
+
+http_archive(
+    name = "socket_patch_crate_cfg_if_1_0_0",
+    build_file = "//:.socket/vendor/cargo/6b7c8d9e-0f1a-4a1b-8c2d-3e4f5a6b7c8d/BUILD.cfg-if-1.0.0.bazel",
+    sha256 = "dac2fcadde4a1faf10ed5411ef89c616f7aead6cd4783db8992cba4106e445a1",
+    strip_prefix = "cfg-if-1.0.0",
+    type = "tar.gz",
+    urls = ["file://<PROBE>/x2/cells/rr0.75.0-b9.3.2/served/cfg-if-1.0.0.crate"],
+)
+
+override_repo(crate, **{"crates__cfg-if-1.0.0": "socket_patch_crate_cfg_if_1_0_0"})

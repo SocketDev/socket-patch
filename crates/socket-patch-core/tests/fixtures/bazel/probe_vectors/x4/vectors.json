@@ -1,0 +1,2118 @@
+{
+  "probe": "X4",
+  "question": "Is the recorded MODULE.bazel.lock input digest the SHA-256 of the on-disk bytes, in every lock family, for LF and CRLF files?",
+  "verdict": "CONFIRMED under the default digest function on every version run; REFUTED under a non-default --digest_function startup option",
+  "host": "macOS arm64 (Darwin 27.0.0), 2026-11-11 / 2026-11-12",
+  "extension": "//:ext.bzl%x4 (root module, not reproducible, module_ctx.read(label) per file)",
+  "key_rules": {
+    "accumulatedFileDigests": "key is '@@' + label, colon kept ('@@//sub/pkg:deep/dir/file.lock'); a space is written as is",
+    "recordedFileInputs": "key is '@@//' + workspace-relative path; a space is written as is",
+    "recordedInputs": "list of strings 'FILE:' + escaped('@@//' + path) + ' ' + value; the escape writes backslash as two backslashes, newline as backslash n, space as backslash s"
+  },
+  "other_digests_of_lf_lock": {
+    "sha1": "f9970c154d890b6cd10a5375b0d578a1ee1fdc9c",
+    "note": "the sha1 cells recorded exactly this value; the blake3 value is in digest_function[]"
+  },
+  "inputs": [
+    {
+      "label": "//:lf.lock",
+      "path": "inputs/lf.lock",
+      "what": "LF line endings",
+      "size": 50,
+      "sha256": "01450cb0373fea20f4f045a9cdd7d9bd2bccedd73eddb6c73414d9cad11fa4c4"
+    },
+    {
+      "label": "//:crlf.lock",
+      "path": "inputs/crlf.lock",
+      "what": "CRLF line endings (lf.lock with every LF made CRLF)",
+      "size": 53,
+      "sha256": "028ba78e3f48e6cccae57550b1e2fc9d67767fd9b7d2ba0ce1815cac0d400f00"
+    },
+    {
+      "label": "//:bom-crlf.lock",
+      "path": "inputs/bom-crlf.lock",
+      "what": "UTF-8 BOM, CRLF",
+      "size": 56,
+      "sha256": "f6e4c0f3791f70e1c754d786734dadec1a96452f19b0dc921743a80fca38f052"
+    },
+    {
+      "label": "//:no-eol.lock",
+      "path": "inputs/no-eol.lock",
+      "what": "no final newline",
+      "size": 49,
+      "sha256": "e874d90dd09e4d7b492f1a182b2bb894f377efc3596f122ca7b31a9d8a960ba2"
+    },
+    {
+      "label": "//:empty.lock",
+      "path": "inputs/empty.lock",
+      "what": "zero bytes",
+      "size": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "label": "//:latin1.lock",
+      "path": "inputs/latin1.lock",
+      "what": "bytes that are not UTF-8",
+      "size": 20,
+      "sha256": "b794909ab657f08226fbfb823080724554b5edea8b75dc6d906abb5f8628a79e"
+    },
+    {
+      "label": "//sub/pkg:nested.lock",
+      "path": "inputs/sub/pkg/nested.lock",
+      "what": "file in a subpackage",
+      "size": 22,
+      "sha256": "7b9597c0073c645e2789c65be87c300b033d847808faba8486813a3b64423b6d"
+    },
+    {
+      "label": "//sub/pkg:deep/dir/file.lock",
+      "path": "inputs/sub/pkg/deep/dir/file.lock",
+      "what": "file in a subdirectory of a package",
+      "size": 20,
+      "sha256": "b6014d17ce7375782a6a4b324d2ee2b800d39e9d3fd58f5482a7fc9e63fac1d6"
+    },
+    {
+      "label": "//:with space.lock",
+      "path": "inputs/with space.lock",
+      "what": "space in the file name",
+      "size": 23,
+      "sha256": "aeefd032b6bdddc6a619a2b69952d62d8a7873adb24a9037444acbfafca287c5"
+    }
+  ],
+  "cells": [
+    {
+      "bazel": "6.6.0",
+      "lockFileVersion": 3,
+      "family": "A",
+      "top_level_keys": [
+        "lockFileVersion",
+        "moduleFileHash",
+        "flags",
+        "localOverrideHashes",
+        "moduleDepGraph",
+        "moduleExtensions"
+      ],
+      "container": "accumulatedFileDigests",
+      "lock_file": "locks/6.6.0.MODULE.bazel.lock",
+      "lock_sha256": "3dfc4486a222bb68760f092212150ce1caa917e53a771494a7a5948832f30a3b",
+      "lock_size": 73895,
+      "recorded": [
+        {
+          "path": "lf.lock",
+          "json_path": [
+            "moduleExtensions",
+            "//:ext.bzl%x4",
+            "general",
+            "accumulatedFileDigests"
+          ],
+          "key": "@@//:lf.lock",
+          "value": "01450cb0373fea20f4f045a9cdd7d9bd2bccedd73eddb6c73414d9cad11fa4c4",
+          "sha256_on_disk": "01450cb0373fea20f4f045a9cdd7d9bd2bccedd73eddb6c73414d9cad11fa4c4",
+          "match": true
+        },
+        {
+          "path": "crlf.lock",
+          "json_path": [
+            "moduleExtensions",
+            "//:ext.bzl%x4",
+            "general",
+            "accumulatedFileDigests"
+          ],
+          "key": "@@//:crlf.lock",
+          "value": "028ba78e3f48e6cccae57550b1e2fc9d67767fd9b7d2ba0ce1815cac0d400f00",
+          "sha256_on_disk": "028ba78e3f48e6cccae57550b1e2fc9d67767fd9b7d2ba0ce1815cac0d400f00",
+          "match": true
+        },
+        {
+          "path": "bom-crlf.lock",
+          "json_path": [
+            "moduleExtensions",
+            "//:ext.bzl%x4",
+            "general",
+            "accumulatedFileDigests"
+          ],
+          "key": "@@//:bom-crlf.lock",
+          "value": "f6e4c0f3791f70e1c754d786734dadec1a96452f19b0dc921743a80fca38f052",
+          "sha256_on_disk": "f6e4c0f3791f70e1c754d786734dadec1a96452f19b0dc921743a80fca38f052",
+          "match": true
+        },
+        {
+          "path": "no-eol.lock",
+          "json_path": [
+            "moduleExtensions",
+            "//:ext.bzl%x4",
+            "general",
+            "accumulatedFileDigests"
+          ],
+          "key": "@@//:no-eol.lock",
+          "value": "e874d90dd09e4d7b492f1a182b2bb894f377efc3596f122ca7b31a9d8a960ba2",
+          "sha256_on_disk": "e874d90dd09e4d7b492f1a182b2bb894f377efc3596f122ca7b31a9d8a960ba2",
+          "match": true
+        },
+        {
+          "path": "empty.lock",
+          "json_path": [
+            "moduleExtensions",
+            "//:ext.bzl%x4",
+            "general",
+            "accumulatedFileDigests"
+          ],
+          "key": "@@//:empty.lock",
+          "value": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "sha256_on_disk": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "match": true
+        },
+        {
+          "path": "latin1.lock",
+          "json_path": [
+            "moduleExtensions",
+            "//:ext.bzl%x4",
+            "general",
+            "accumulatedFileDigests"
+          ],
+          "key": "@@//:latin1.lock",
+          "value": "b794909ab657f08226fbfb823080724554b5edea8b75dc6d906abb5f8628a79e",
+          "sha256_on_disk": "b794909ab657f08226fbfb823080724554b5edea8b75dc6d906abb5f8628a79e",
+          "match": true
+        },
+        {
+          "path": "sub/pkg/nested.lock",
+          "json_path": [
+            "moduleExtensions",
+            "//:ext.bzl%x4",
+            "general",
+            "accumulatedFileDigests"
+          ],
+          "key": "@@//sub/pkg:nested.lock",
+          "value": "7b9597c0073c645e2789c65be87c300b033d847808faba8486813a3b64423b6d",
+          "sha256_on_disk": "7b9597c0073c645e2789c65be87c300b033d847808faba8486813a3b64423b6d",
+          "match": true
+        },
+        {
+          "path": "sub/pkg/deep/dir/file.lock",
+          "json_path": [
+            "moduleExtensions",
+            "//:ext.bzl%x4",
+            "general",
+            "accumulatedFileDigests"
+          ],
+          "key": "@@//sub/pkg:deep/dir/file.lock",
+          "value": "b6014d17ce7375782a6a4b324d2ee2b800d39e9d3fd58f5482a7fc9e63fac1d6",
+          "sha256_on_disk": "b6014d17ce7375782a6a4b324d2ee2b800d39e9d3fd58f5482a7fc9e63fac1d6",
+          "match": true
+        },
+        {
+          "path": "with space.lock",
+          "json_path": [
+            "moduleExtensions",
+            "//:ext.bzl%x4",
+            "general",
+            "accumulatedFileDigests"
+          ],
+          "key": "@@//:with space.lock",
+          "value": "aeefd032b6bdddc6a619a2b69952d62d8a7873adb24a9037444acbfafca287c5",
+          "sha256_on_disk": "aeefd032b6bdddc6a619a2b69952d62d8a7873adb24a9037444acbfafca287c5",
+          "match": true
+        }
+      ],
+      "all_match": true,
+      "build_in_error_mode_exit": 0,
+      "after_lf_to_crlf": {
+        "mod_deps_error_mode_exit": 2,
+        "first_error": "ERROR: Lock file is no longer up-to-date because: One or more files the extension 'ModuleExtensionId{bzlFileLabel=//:ext.bzl, extensionName=x4, isolationKey=Optional.empty}' is using have changed. Please run `bazel mod deps --lockfile_mode=update` to update your lockfile. Type 'bazel help mod' for syntax and help.",
+        "lock_untouched_by_error_mode": true,
+        "update_mode_exit": 0,
+        "recorded_lf_equals_recorded_crlf": true
+      },
+      "after_byte_exact_restore": {
+        "mod_deps_error_mode_exit": 0,
+        "lock_untouched": true
+      }
+    },
+    {
+      "bazel": "7.0.2",
+      "lockFileVersion": 3,
+      "family": "A",
+      "top_level_keys": [
+        "lockFileVersion",
+        "moduleFileHash",
+        "flags",
+        "localOverrideHashes",
+        "moduleDepGraph",
+        "moduleExtensions"
+      ],
+      "container": "accumulatedFileDigests",
+      "lock_file": "locks/7.0.2.MODULE.bazel.lock",
+      "lock_sha256": "09882973f63cbc16869766628f89b6e7696a5762493c462dc807de06d1aa1972",
+      "lock_size": 144956,
+      "recorded": [
+        {
+          "path": "lf.lock",
+          "json_path": [
+            "moduleExtensions",
+            "//:ext.bzl%x4",
+            "general",
+            "accumulatedFileDigests"
+          ],
+          "key": "@@//:lf.lock",
+          "value": "01450cb0373fea20f4f045a9cdd7d9bd2bccedd73eddb6c73414d9cad11fa4c4",
+          "sha256_on_disk": "01450cb0373fea20f4f045a9cdd7d9bd2bccedd73eddb6c73414d9cad11fa4c4",
+          "match": true
+        },
+        {
+          "path": "crlf.lock",
+          "json_path": [
+            "moduleExtensions",
+            "//:ext.bzl%x4",
+            "general",
+            "accumulatedFileDigests"
+          ],
+          "key": "@@//:crlf.lock",
+          "value": "028ba78e3f48e6cccae57550b1e2fc9d67767fd9b7d2ba0ce1815cac0d400f00",
+          "sha256_on_disk": "028ba78e3f48e6cccae57550b1e2fc9d67767fd9b7d2ba0ce1815cac0d400f00",
+          "match": true
+        },
+        {
+          "path": "bom-crlf.lock",
+          "json_path": [
+            "moduleExtensions",
+            "//:ext.bzl%x4",
+            "general",
+            "accumulatedFileDigests"
+          ],
+          "key": "@@//:bom-crlf.lock",
+          "value": "f6e4c0f3791f70e1c754d786734dadec1a96452f19b0dc921743a80fca38f052",
+          "sha256_on_disk": "f6e4c0f3791f70e1c754d786734dadec1a96452f19b0dc921743a80fca38f052",
+          "match": true
+        },
+        {
+          "path": "no-eol.lock",
+          "json_path": [
+            "moduleExtensions",
+            "//:ext.bzl%x4",
+            "general",
+            "accumulatedFileDigests"
+          ],
+          "key": "@@//:no-eol.lock",
+          "value": "e874d90dd09e4d7b492f1a182b2bb894f377efc3596f122ca7b31a9d8a960ba2",
+          "sha256_on_disk": "e874d90dd09e4d7b492f1a182b2bb894f377efc3596f122ca7b31a9d8a960ba2",
+          "match": true
+        },
+        {
+          "path": "empty.lock",
+          "json_path": [
+            "moduleExtensions",
+            "//:ext.bzl%x4",
+            "general",
+            "accumulatedFileDigests"
+          ],
+          "key": "@@//:empty.lock",
+          "value": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "sha256_on_disk": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "match": true
+        },
+        {
+          "path": "latin1.lock",
+          "json_path": [
+            "moduleExtensions",
+            "//:ext.bzl%x4",
+            "general",
+            "accumulatedFileDigests"
+          ],
+          "key": "@@//:latin1.lock",
+          "value": "b794909ab657f08226fbfb823080724554b5edea8b75dc6d906abb5f8628a79e",
+          "sha256_on_disk": "b794909ab657f08226fbfb823080724554b5edea8b75dc6d906abb5f8628a79e",
+          "match": true
+        },
+        {
+          "path": "sub/pkg/nested.lock",
+          "json_path": [
+            "moduleExtensions",
+            "//:ext.bzl%x4",
+            "general",
+            "accumulatedFileDigests"
+          ],
+          "key": "@@//sub/pkg:nested.lock",
+          "value": "7b9597c0073c645e2789c65be87c300b033d847808faba8486813a3b64423b6d",
+          "sha256_on_disk": "7b9597c0073c645e2789c65be87c300b033d847808faba8486813a3b64423b6d",
+          "match": true
+        },
+        {
+          "path": "sub/pkg/deep/dir/file.lock",
+          "json_path": [
+            "moduleExtensions",
+            "//:ext.bzl%x4",
+            "general",
+            "accumulatedFileDigests"
+          ],
+          "key": "@@//sub/pkg:deep/dir/file.lock",
+          "value": "b6014d17ce7375782a6a4b324d2ee2b800d39e9d3fd58f5482a7fc9e63fac1d6",
+          "sha256_on_disk": "b6014d17ce7375782a6a4b324d2ee2b800d39e9d3fd58f5482a7fc9e63fac1d6",
+          "match": true
+        },
+        {
+          "path": "with space.lock",
+          "json_path": [
+            "moduleExtensions",
+            "//:ext.bzl%x4",
+            "general",
+            "accumulatedFileDigests"
+          ],
+          "key": "@@//:with space.lock",
+          "value": "aeefd032b6bdddc6a619a2b69952d62d8a7873adb24a9037444acbfafca287c5",
+          "sha256_on_disk": "aeefd032b6bdddc6a619a2b69952d62d8a7873adb24a9037444acbfafca287c5",
+          "match": true
+        }
+      ],
+      "all_match": true,
+      "build_in_error_mode_exit": 0,
+      "after_lf_to_crlf": {
+        "mod_deps_error_mode_exit": 2,
+        "first_error": "ERROR: MODULE.bazel.lock is no longer up-to-date because: One or more files the extension 'ModuleExtensionId{bzlFileLabel=//:ext.bzl, extensionName=x4, isolationKey=Optional.empty}' is using have changed. Please run `bazel mod deps --lockfile_mode=update` to update your lockfile. Type 'bazel help mod' for syntax and help.",
+        "lock_untouched_by_error_mode": true,
+        "update_mode_exit": 0,
+        "recorded_lf_equals_recorded_crlf": true
+      },
+      "after_byte_exact_restore": {
+        "mod_deps_error_mode_exit": 0,
+        "lock_untouched": true
+      }
+    },
+    {
+      "bazel": "7.1.2",
+      "lockFileVersion": 6,
+      "family": "A",
+      "top_level_keys": [
+        "lockFileVersion",
+        "moduleFileHash",
+        "flags",
+        "localOverrideHashes",
+        "moduleDepGraph",
+        "moduleExtensions"
+      ],
+      "container": "recordedFileInputs",
+      "lock_file": null,
+      "lock_sha256": "c5270772c6b360b5e5a259449a785616d79bc0c53ea26599c2f50f73e21a502a",
+      "lock_size": 247809,
+      "recorded": [
+        {
+          "path": "lf.lock",
+          "json_path": [
+            "moduleExtensions",
+            "//:ext.bzl%x4",
+            "general",
+            "recordedFileInputs"
+          ],
+          "key": "@@//lf.lock",
+          "value": "01450cb0373fea20f4f045a9cdd7d9bd2bccedd73eddb6c73414d9cad11fa4c4",
+          "sha256_on_disk": "01450cb0373fea20f4f045a9cdd7d9bd2bccedd73eddb6c73414d9cad11fa4c4",
+          "match": true
+        },
+        {
+          "path": "crlf.lock",
+          "json_path": [
+            "moduleExtensions",
+            "//:ext.bzl%x4",
+            "general",
+            "recordedFileInputs"
+          ],
+          "key": "@@//crlf.lock",
+          "value": "028ba78e3f48e6cccae57550b1e2fc9d67767fd9b7d2ba0ce1815cac0d400f00",
+          "sha256_on_disk": "028ba78e3f48e6cccae57550b1e2fc9d67767fd9b7d2ba0ce1815cac0d400f00",
+          "match": true
+        },
+        {
+          "path": "bom-crlf.lock",
+          "json_path": [
+            "moduleExtensions",
+            "//:ext.bzl%x4",
+            "general",
+            "recordedFileInputs"
+          ],
+          "key": "@@//bom-crlf.lock",
+          "value": "f6e4c0f3791f70e1c754d786734dadec1a96452f19b0dc921743a80fca38f052",
+          "sha256_on_disk": "f6e4c0f3791f70e1c754d786734dadec1a96452f19b0dc921743a80fca38f052",
+          "match": true
+        },
+        {
+          "path": "no-eol.lock",
+          "json_path": [
+            "moduleExtensions",
+            "//:ext.bzl%x4",
+            "general",
+            "recordedFileInputs"
+          ],
+          "key": "@@//no-eol.lock",
+          "value": "e874d90dd09e4d7b492f1a182b2bb894f377efc3596f122ca7b31a9d8a960ba2",
+          "sha256_on_disk": "e874d90dd09e4d7b492f1a182b2bb894f377efc3596f122ca7b31a9d8a960ba2",
+          "match": true
+        },
+        {
+          "path": "empty.lock",
+          "json_path": [
+            "moduleExtensions",
+            "//:ext.bzl%x4",
+            "general",
+            "recordedFileInputs"
+          ],
+          "key": "@@//empty.lock",
+          "value": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "sha256_on_disk": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "match": true
+        },
+        {
+          "path": "latin1.lock",
+          "json_path": [
+            "moduleExtensions",
+            "//:ext.bzl%x4",
+            "general",
+            "recordedFileInputs"
+          ],
+          "key": "@@//latin1.lock",
+          "value": "b794909ab657f08226fbfb823080724554b5edea8b75dc6d906abb5f8628a79e",
+          "sha256_on_disk": "b794909ab657f08226fbfb823080724554b5edea8b75dc6d906abb5f8628a79e",
+          "match": true
+        },
+        {
+          "path": "sub/pkg/nested.lock",
+          "json_path": [
+            "moduleExtensions",
+            "//:ext.bzl%x4",
+            "general",
+            "recordedFileInputs"
+          ],
+          "key": "@@//sub/pkg/nested.lock",
+          "value": "7b9597c0073c645e2789c65be87c300b033d847808faba8486813a3b64423b6d",
+          "sha256_on_disk": "7b9597c0073c645e2789c65be87c300b033d847808faba8486813a3b64423b6d",
+          "match": true
+        },
+        {
+          "path": "sub/pkg/deep/dir/file.lock",
+          "json_path": [
+            "moduleExtensions",
+            "//:ext.bzl%x4",
+            "general",
+            "recordedFileInputs"
+          ],
+          "key": "@@//sub/pkg/deep/dir/file.lock",
+          "value": "b6014d17ce7375782a6a4b324d2ee2b800d39e9d3fd58f5482a7fc9e63fac1d6",
+          "sha256_on_disk": "b6014d17ce7375782a6a4b324d2ee2b800d39e9d3fd58f5482a7fc9e63fac1d6",
+          "match": true
+        },
+        {
+          "path": "with space.lock",
+          "json_path": [
+            "moduleExtensions",
+            "//:ext.bzl%x4",
+            "general",
+            "recordedFileInputs"
+          ],
+          "key": "@@//with space.lock",
+          "value": "aeefd032b6bdddc6a619a2b69952d62d8a7873adb24a9037444acbfafca287c5",
+          "sha256_on_disk": "aeefd032b6bdddc6a619a2b69952d62d8a7873adb24a9037444acbfafca287c5",
+          "match": true
+        }
+      ],
+      "all_match": true,
+      "build_in_error_mode_exit": 0,
+      "after_lf_to_crlf": {
+        "mod_deps_error_mode_exit": 2,
+        "first_error": "ERROR: MODULE.bazel.lock is no longer up-to-date because: One or more files the extension 'ModuleExtensionId{bzlFileLabel=//:ext.bzl, extensionName=x4, isolationKey=Optional.empty}' is using have changed. Please run `bazel mod deps --lockfile_mode=update` to update your lockfile. Type 'bazel help mod' for syntax and help.",
+        "lock_untouched_by_error_mode": true,
+        "update_mode_exit": 0,
+        "recorded_lf_equals_recorded_crlf": true
+      },
+      "after_byte_exact_restore": {
+        "mod_deps_error_mode_exit": 0,
+        "lock_untouched": true
+      }
+    },
+    {
+      "bazel": "7.4.1",
+      "lockFileVersion": 11,
+      "family": "B",
+      "top_level_keys": [
+        "lockFileVersion",
+        "registryFileHashes",
+        "selectedYankedVersions",
+        "moduleExtensions"
+      ],
+      "container": "recordedFileInputs",
+      "lock_file": null,
+      "lock_sha256": "d21e6cac78e299961b73aef6a290f9e211f15a6be9fb35dc180160a513f1a579",
+      "lock_size": 108249,
+      "recorded": [
+        {
+          "path": "lf.lock",
+          "json_path": [
+            "moduleExtensions",
+            "//:ext.bzl%x4",
+            "general",
+            "recordedFileInputs"
+          ],
+          "key": "@@//lf.lock",
+          "value": "01450cb0373fea20f4f045a9cdd7d9bd2bccedd73eddb6c73414d9cad11fa4c4",
+          "sha256_on_disk": "01450cb0373fea20f4f045a9cdd7d9bd2bccedd73eddb6c73414d9cad11fa4c4",
+          "match": true
+        },
+        {
+          "path": "crlf.lock",
+          "json_path": [
+            "moduleExtensions",
+            "//:ext.bzl%x4",
+            "general",
+            "recordedFileInputs"
+          ],
+          "key": "@@//crlf.lock",
+          "value": "028ba78e3f48e6cccae57550b1e2fc9d67767fd9b7d2ba0ce1815cac0d400f00",
+          "sha256_on_disk": "028ba78e3f48e6cccae57550b1e2fc9d67767fd9b7d2ba0ce1815cac0d400f00",
+          "match": true
+        },
+        {
+          "path": "bom-crlf.lock",
+          "json_path": [
+            "moduleExtensions",
+            "//:ext.bzl%x4",
+            "general",
+            "recordedFileInputs"
+          ],
+          "key": "@@//bom-crlf.lock",
+          "value": "f6e4c0f3791f70e1c754d786734dadec1a96452f19b0dc921743a80fca38f052",
+          "sha256_on_disk": "f6e4c0f3791f70e1c754d786734dadec1a96452f19b0dc921743a80fca38f052",
+          "match": true
+        },
+        {
+          "path": "no-eol.lock",
+          "json_path": [
+            "moduleExtensions",
+            "//:ext.bzl%x4",
+            "general",
+            "recordedFileInputs"
+          ],
+          "key": "@@//no-eol.lock",
+          "value": "e874d90dd09e4d7b492f1a182b2bb894f377efc3596f122ca7b31a9d8a960ba2",
+          "sha256_on_disk": "e874d90dd09e4d7b492f1a182b2bb894f377efc3596f122ca7b31a9d8a960ba2",
+          "match": true
+        },
+        {
+          "path": "empty.lock",
+          "json_path": [
+            "moduleExtensions",
+            "//:ext.bzl%x4",
+            "general",
+            "recordedFileInputs"
+          ],
+          "key": "@@//empty.lock",
+          "value": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "sha256_on_disk": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "match": true
+        },
+        {
+          "path": "latin1.lock",
+          "json_path": [
+            "moduleExtensions",
+            "//:ext.bzl%x4",
+            "general",
+            "recordedFileInputs"
+          ],
+          "key": "@@//latin1.lock",
+          "value": "b794909ab657f08226fbfb823080724554b5edea8b75dc6d906abb5f8628a79e",
+          "sha256_on_disk": "b794909ab657f08226fbfb823080724554b5edea8b75dc6d906abb5f8628a79e",
+          "match": true
+        },
+        {
+          "path": "sub/pkg/nested.lock",
+          "json_path": [
+            "moduleExtensions",
+            "//:ext.bzl%x4",
+            "general",
+            "recordedFileInputs"
+          ],
+          "key": "@@//sub/pkg/nested.lock",
+          "value": "7b9597c0073c645e2789c65be87c300b033d847808faba8486813a3b64423b6d",
+          "sha256_on_disk": "7b9597c0073c645e2789c65be87c300b033d847808faba8486813a3b64423b6d",
+          "match": true
+        },
+        {
+          "path": "sub/pkg/deep/dir/file.lock",
+          "json_path": [
+            "moduleExtensions",
+            "//:ext.bzl%x4",
+            "general",
+            "recordedFileInputs"
+          ],
+          "key": "@@//sub/pkg/deep/dir/file.lock",
+          "value": "b6014d17ce7375782a6a4b324d2ee2b800d39e9d3fd58f5482a7fc9e63fac1d6",
+          "sha256_on_disk": "b6014d17ce7375782a6a4b324d2ee2b800d39e9d3fd58f5482a7fc9e63fac1d6",
+          "match": true
+        },
+        {
+          "path": "with space.lock",
+          "json_path": [
+            "moduleExtensions",
+            "//:ext.bzl%x4",
+            "general",
+            "recordedFileInputs"
+          ],
+          "key": "@@//with space.lock",
+          "value": "aeefd032b6bdddc6a619a2b69952d62d8a7873adb24a9037444acbfafca287c5",
+          "sha256_on_disk": "aeefd032b6bdddc6a619a2b69952d62d8a7873adb24a9037444acbfafca287c5",
+          "match": true
+        }
+      ],
+      "all_match": true,
+      "build_in_error_mode_exit": 0,
+      "after_lf_to_crlf": {
+        "mod_deps_error_mode_exit": 2,
+        "first_error": "ERROR: MODULE.bazel.lock is no longer up-to-date because: One or more files the extension 'ModuleExtensionId{bzlFileLabel=//:ext.bzl, extensionName=x4, isolationKey=Optional.empty}' is using have changed. Please run `bazel mod deps --lockfile_mode=update` to update your lockfile. Type 'bazel help mod' for syntax and help.",
+        "lock_untouched_by_error_mode": true,
+        "update_mode_exit": 0,
+        "recorded_lf_equals_recorded_crlf": true
+      },
+      "after_byte_exact_restore": {
+        "mod_deps_error_mode_exit": 0,
+        "lock_untouched": true
+      }
+    },
+    {
+      "bazel": "7.7.2",
+      "lockFileVersion": 13,
+      "family": "B",
+      "top_level_keys": [
+        "lockFileVersion",
+        "registryFileHashes",
+        "selectedYankedVersions",
+        "moduleExtensions"
+      ],
+      "container": "recordedFileInputs",
+      "lock_file": "locks/7.7.2.MODULE.bazel.lock",
+      "lock_sha256": "42de05c8483e55c0ae2ad6889a55b4c2bdbfef2900931279ddeb0bce82feefed",
+      "lock_size": 107703,
+      "recorded": [
+        {
+          "path": "lf.lock",
+          "json_path": [
+            "moduleExtensions",
+            "//:ext.bzl%x4",
+            "general",
+            "recordedFileInputs"
+          ],
+          "key": "@@//lf.lock",
+          "value": "01450cb0373fea20f4f045a9cdd7d9bd2bccedd73eddb6c73414d9cad11fa4c4",
+          "sha256_on_disk": "01450cb0373fea20f4f045a9cdd7d9bd2bccedd73eddb6c73414d9cad11fa4c4",
+          "match": true
+        },
+        {
+          "path": "crlf.lock",
+          "json_path": [
+            "moduleExtensions",
+            "//:ext.bzl%x4",
+            "general",
+            "recordedFileInputs"
+          ],
+          "key": "@@//crlf.lock",
+          "value": "028ba78e3f48e6cccae57550b1e2fc9d67767fd9b7d2ba0ce1815cac0d400f00",
+          "sha256_on_disk": "028ba78e3f48e6cccae57550b1e2fc9d67767fd9b7d2ba0ce1815cac0d400f00",
+          "match": true
+        },
+        {
+          "path": "bom-crlf.lock",
+          "json_path": [
+            "moduleExtensions",
+            "//:ext.bzl%x4",
+            "general",
+            "recordedFileInputs"
+          ],
+          "key": "@@//bom-crlf.lock",
+          "value": "f6e4c0f3791f70e1c754d786734dadec1a96452f19b0dc921743a80fca38f052",
+          "sha256_on_disk": "f6e4c0f3791f70e1c754d786734dadec1a96452f19b0dc921743a80fca38f052",
+          "match": true
+        },
+        {
+          "path": "no-eol.lock",
+          "json_path": [
+            "moduleExtensions",
+            "//:ext.bzl%x4",
+            "general",
+            "recordedFileInputs"
+          ],
+          "key": "@@//no-eol.lock",
+          "value": "e874d90dd09e4d7b492f1a182b2bb894f377efc3596f122ca7b31a9d8a960ba2",
+          "sha256_on_disk": "e874d90dd09e4d7b492f1a182b2bb894f377efc3596f122ca7b31a9d8a960ba2",
+          "match": true
+        },
+        {
+          "path": "empty.lock",
+          "json_path": [
+            "moduleExtensions",
+            "//:ext.bzl%x4",
+            "general",
+            "recordedFileInputs"
+          ],
+          "key": "@@//empty.lock",
+          "value": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "sha256_on_disk": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "match": true
+        },
+        {
+          "path": "latin1.lock",
+          "json_path": [
+            "moduleExtensions",
+            "//:ext.bzl%x4",
+            "general",
+            "recordedFileInputs"
+          ],
+          "key": "@@//latin1.lock",
+          "value": "b794909ab657f08226fbfb823080724554b5edea8b75dc6d906abb5f8628a79e",
+          "sha256_on_disk": "b794909ab657f08226fbfb823080724554b5edea8b75dc6d906abb5f8628a79e",
+          "match": true
+        },
+        {
+          "path": "sub/pkg/nested.lock",
+          "json_path": [
+            "moduleExtensions",
+            "//:ext.bzl%x4",
+            "general",
+            "recordedFileInputs"
+          ],
+          "key": "@@//sub/pkg/nested.lock",
+          "value": "7b9597c0073c645e2789c65be87c300b033d847808faba8486813a3b64423b6d",
+          "sha256_on_disk": "7b9597c0073c645e2789c65be87c300b033d847808faba8486813a3b64423b6d",
+          "match": true
+        },
+        {
+          "path": "sub/pkg/deep/dir/file.lock",
+          "json_path": [
+            "moduleExtensions",
+            "//:ext.bzl%x4",
+            "general",
+            "recordedFileInputs"
+          ],
+          "key": "@@//sub/pkg/deep/dir/file.lock",
+          "value": "b6014d17ce7375782a6a4b324d2ee2b800d39e9d3fd58f5482a7fc9e63fac1d6",
+          "sha256_on_disk": "b6014d17ce7375782a6a4b324d2ee2b800d39e9d3fd58f5482a7fc9e63fac1d6",
+          "match": true
+        },
+        {
+          "path": "with space.lock",
+          "json_path": [
+            "moduleExtensions",
+            "//:ext.bzl%x4",
+            "general",
+            "recordedFileInputs"
+          ],
+          "key": "@@//with space.lock",
+          "value": "aeefd032b6bdddc6a619a2b69952d62d8a7873adb24a9037444acbfafca287c5",
+          "sha256_on_disk": "aeefd032b6bdddc6a619a2b69952d62d8a7873adb24a9037444acbfafca287c5",
+          "match": true
+        }
+      ],
+      "all_match": true,
+      "build_in_error_mode_exit": 0,
+      "after_lf_to_crlf": {
+        "mod_deps_error_mode_exit": 2,
+        "first_error": "ERROR: MODULE.bazel.lock is no longer up-to-date because: One or more files the extension 'ModuleExtensionId{bzlFileLabel=//:ext.bzl, extensionName=x4, isolationKey=Optional.empty}' is using have changed. Please run `bazel mod deps --lockfile_mode=update` to update your lockfile. Type 'bazel help mod' for syntax and help.",
+        "lock_untouched_by_error_mode": true,
+        "update_mode_exit": 0,
+        "recorded_lf_equals_recorded_crlf": true
+      },
+      "after_byte_exact_restore": {
+        "mod_deps_error_mode_exit": 0,
+        "lock_untouched": true
+      }
+    },
+    {
+      "bazel": "8.0.0",
+      "lockFileVersion": 16,
+      "family": "B",
+      "top_level_keys": [
+        "lockFileVersion",
+        "registryFileHashes",
+        "selectedYankedVersions",
+        "moduleExtensions"
+      ],
+      "container": "recordedFileInputs",
+      "lock_file": null,
+      "lock_sha256": "64b0c480ca1916fec28e4e7d34b6b8fef93ca4e35a4292815409684c060ae00b",
+      "lock_size": 167358,
+      "recorded": [
+        {
+          "path": "lf.lock",
+          "json_path": [
+            "moduleExtensions",
+            "//:ext.bzl%x4",
+            "general",
+            "recordedFileInputs"
+          ],
+          "key": "@@//lf.lock",
+          "value": "01450cb0373fea20f4f045a9cdd7d9bd2bccedd73eddb6c73414d9cad11fa4c4",
+          "sha256_on_disk": "01450cb0373fea20f4f045a9cdd7d9bd2bccedd73eddb6c73414d9cad11fa4c4",
+          "match": true
+        },
+        {
+          "path": "crlf.lock",
+          "json_path": [
+            "moduleExtensions",
+            "//:ext.bzl%x4",
+            "general",
+            "recordedFileInputs"
+          ],
+          "key": "@@//crlf.lock",
+          "value": "028ba78e3f48e6cccae57550b1e2fc9d67767fd9b7d2ba0ce1815cac0d400f00",
+          "sha256_on_disk": "028ba78e3f48e6cccae57550b1e2fc9d67767fd9b7d2ba0ce1815cac0d400f00",
+          "match": true
+        },
+        {
+          "path": "bom-crlf.lock",
+          "json_path": [
+            "moduleExtensions",
+            "//:ext.bzl%x4",
+            "general",
+            "recordedFileInputs"
+          ],
+          "key": "@@//bom-crlf.lock",
+          "value": "f6e4c0f3791f70e1c754d786734dadec1a96452f19b0dc921743a80fca38f052",
+          "sha256_on_disk": "f6e4c0f3791f70e1c754d786734dadec1a96452f19b0dc921743a80fca38f052",
+          "match": true
+        },
+        {
+          "path": "no-eol.lock",
+          "json_path": [
+            "moduleExtensions",
+            "//:ext.bzl%x4",
+            "general",
+            "recordedFileInputs"
+          ],
+          "key": "@@//no-eol.lock",
+          "value": "e874d90dd09e4d7b492f1a182b2bb894f377efc3596f122ca7b31a9d8a960ba2",
+          "sha256_on_disk": "e874d90dd09e4d7b492f1a182b2bb894f377efc3596f122ca7b31a9d8a960ba2",
+          "match": true
+        },
+        {
+          "path": "empty.lock",
+          "json_path": [
+            "moduleExtensions",
+            "//:ext.bzl%x4",
+            "general",
+            "recordedFileInputs"
+          ],
+          "key": "@@//empty.lock",
+          "value": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "sha256_on_disk": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "match": true
+        },
+        {
+          "path": "latin1.lock",
+          "json_path": [
+            "moduleExtensions",
+            "//:ext.bzl%x4",
+            "general",
+            "recordedFileInputs"
+          ],
+          "key": "@@//latin1.lock",
+          "value": "b794909ab657f08226fbfb823080724554b5edea8b75dc6d906abb5f8628a79e",
+          "sha256_on_disk": "b794909ab657f08226fbfb823080724554b5edea8b75dc6d906abb5f8628a79e",
+          "match": true
+        },
+        {
+          "path": "sub/pkg/nested.lock",
+          "json_path": [
+            "moduleExtensions",
+            "//:ext.bzl%x4",
+            "general",
+            "recordedFileInputs"
+          ],
+          "key": "@@//sub/pkg/nested.lock",
+          "value": "7b9597c0073c645e2789c65be87c300b033d847808faba8486813a3b64423b6d",
+          "sha256_on_disk": "7b9597c0073c645e2789c65be87c300b033d847808faba8486813a3b64423b6d",
+          "match": true
+        },
+        {
+          "path": "sub/pkg/deep/dir/file.lock",
+          "json_path": [
+            "moduleExtensions",
+            "//:ext.bzl%x4",
+            "general",
+            "recordedFileInputs"
+          ],
+          "key": "@@//sub/pkg/deep/dir/file.lock",
+          "value": "b6014d17ce7375782a6a4b324d2ee2b800d39e9d3fd58f5482a7fc9e63fac1d6",
+          "sha256_on_disk": "b6014d17ce7375782a6a4b324d2ee2b800d39e9d3fd58f5482a7fc9e63fac1d6",
+          "match": true
+        },
+        {
+          "path": "with space.lock",
+          "json_path": [
+            "moduleExtensions",
+            "//:ext.bzl%x4",
+            "general",
+            "recordedFileInputs"
+          ],
+          "key": "@@//with space.lock",
+          "value": "aeefd032b6bdddc6a619a2b69952d62d8a7873adb24a9037444acbfafca287c5",
+          "sha256_on_disk": "aeefd032b6bdddc6a619a2b69952d62d8a7873adb24a9037444acbfafca287c5",
+          "match": true
+        }
+      ],
+      "all_match": true,
+      "build_in_error_mode_exit": 0,
+      "after_lf_to_crlf": {
+        "mod_deps_error_mode_exit": 2,
+        "first_error": "ERROR: MODULE.bazel.lock is no longer up-to-date because: One or more files the extension 'ModuleExtensionId[bzlFileLabel=//:ext.bzl, extensionName=x4, isolationKey=Optional.empty]' is using have changed. Please run `bazel mod deps --lockfile_mode=update` to update your lockfile.",
+        "lock_untouched_by_error_mode": true,
+        "update_mode_exit": 0,
+        "recorded_lf_equals_recorded_crlf": true
+      },
+      "after_byte_exact_restore": {
+        "mod_deps_error_mode_exit": 0,
+        "lock_untouched": true
+      }
+    },
+    {
+      "bazel": "8.4.2",
+      "lockFileVersion": 18,
+      "family": "B",
+      "top_level_keys": [
+        "lockFileVersion",
+        "registryFileHashes",
+        "selectedYankedVersions",
+        "moduleExtensions"
+      ],
+      "container": "recordedFileInputs",
+      "lock_file": null,
+      "lock_sha256": "418d37a1dad287555907aca4d15ab32e72615cfca7c62022fbd1bf339da8205e",
+      "lock_size": 166332,
+      "recorded": [
+        {
+          "path": "lf.lock",
+          "json_path": [
+            "moduleExtensions",
+            "//:ext.bzl%x4",
+            "general",
+            "recordedFileInputs"
+          ],
+          "key": "@@//lf.lock",
+          "value": "01450cb0373fea20f4f045a9cdd7d9bd2bccedd73eddb6c73414d9cad11fa4c4",
+          "sha256_on_disk": "01450cb0373fea20f4f045a9cdd7d9bd2bccedd73eddb6c73414d9cad11fa4c4",
+          "match": true
+        },
+        {
+          "path": "crlf.lock",
+          "json_path": [
+            "moduleExtensions",
+            "//:ext.bzl%x4",
+            "general",
+            "recordedFileInputs"
+          ],
+          "key": "@@//crlf.lock",
+          "value": "028ba78e3f48e6cccae57550b1e2fc9d67767fd9b7d2ba0ce1815cac0d400f00",
+          "sha256_on_disk": "028ba78e3f48e6cccae57550b1e2fc9d67767fd9b7d2ba0ce1815cac0d400f00",
+          "match": true
+        },
+        {
+          "path": "bom-crlf.lock",
+          "json_path": [
+            "moduleExtensions",
+            "//:ext.bzl%x4",
+            "general",
+            "recordedFileInputs"
+          ],
+          "key": "@@//bom-crlf.lock",
+          "value": "f6e4c0f3791f70e1c754d786734dadec1a96452f19b0dc921743a80fca38f052",
+          "sha256_on_disk": "f6e4c0f3791f70e1c754d786734dadec1a96452f19b0dc921743a80fca38f052",
+          "match": true
+        },
+        {
+          "path": "no-eol.lock",
+          "json_path": [
+            "moduleExtensions",
+            "//:ext.bzl%x4",
+            "general",
+            "recordedFileInputs"
+          ],
+          "key": "@@//no-eol.lock",
+          "value": "e874d90dd09e4d7b492f1a182b2bb894f377efc3596f122ca7b31a9d8a960ba2",
+          "sha256_on_disk": "e874d90dd09e4d7b492f1a182b2bb894f377efc3596f122ca7b31a9d8a960ba2",
+          "match": true
+        },
+        {
+          "path": "empty.lock",
+          "json_path": [
+            "moduleExtensions",
+            "//:ext.bzl%x4",
+            "general",
+            "recordedFileInputs"
+          ],
+          "key": "@@//empty.lock",
+          "value": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "sha256_on_disk": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "match": true
+        },
+        {
+          "path": "latin1.lock",
+          "json_path": [
+            "moduleExtensions",
+            "//:ext.bzl%x4",
+            "general",
+            "recordedFileInputs"
+          ],
+          "key": "@@//latin1.lock",
+          "value": "b794909ab657f08226fbfb823080724554b5edea8b75dc6d906abb5f8628a79e",
+          "sha256_on_disk": "b794909ab657f08226fbfb823080724554b5edea8b75dc6d906abb5f8628a79e",
+          "match": true
+        },
+        {
+          "path": "sub/pkg/nested.lock",
+          "json_path": [
+            "moduleExtensions",
+            "//:ext.bzl%x4",
+            "general",
+            "recordedFileInputs"
+          ],
+          "key": "@@//sub/pkg/nested.lock",
+          "value": "7b9597c0073c645e2789c65be87c300b033d847808faba8486813a3b64423b6d",
+          "sha256_on_disk": "7b9597c0073c645e2789c65be87c300b033d847808faba8486813a3b64423b6d",
+          "match": true
+        },
+        {
+          "path": "sub/pkg/deep/dir/file.lock",
+          "json_path": [
+            "moduleExtensions",
+            "//:ext.bzl%x4",
+            "general",
+            "recordedFileInputs"
+          ],
+          "key": "@@//sub/pkg/deep/dir/file.lock",
+          "value": "b6014d17ce7375782a6a4b324d2ee2b800d39e9d3fd58f5482a7fc9e63fac1d6",
+          "sha256_on_disk": "b6014d17ce7375782a6a4b324d2ee2b800d39e9d3fd58f5482a7fc9e63fac1d6",
+          "match": true
+        },
+        {
+          "path": "with space.lock",
+          "json_path": [
+            "moduleExtensions",
+            "//:ext.bzl%x4",
+            "general",
+            "recordedFileInputs"
+          ],
+          "key": "@@//with space.lock",
+          "value": "aeefd032b6bdddc6a619a2b69952d62d8a7873adb24a9037444acbfafca287c5",
+          "sha256_on_disk": "aeefd032b6bdddc6a619a2b69952d62d8a7873adb24a9037444acbfafca287c5",
+          "match": true
+        }
+      ],
+      "all_match": true,
+      "build_in_error_mode_exit": 0,
+      "after_lf_to_crlf": {
+        "mod_deps_error_mode_exit": 2,
+        "first_error": "ERROR: MODULE.bazel.lock is no longer up-to-date because: One or more files the extension '@@//:ext.bzl%x4' is using have changed. Please run `bazel mod deps --lockfile_mode=update` to update your lockfile.",
+        "lock_untouched_by_error_mode": true,
+        "update_mode_exit": 0,
+        "recorded_lf_equals_recorded_crlf": true
+      },
+      "after_byte_exact_restore": {
+        "mod_deps_error_mode_exit": 0,
+        "lock_untouched": true
+      }
+    },
+    {
+      "bazel": "8.7.0",
+      "lockFileVersion": 24,
+      "family": "B",
+      "top_level_keys": [
+        "lockFileVersion",
+        "registryFileHashes",
+        "selectedYankedVersions",
+        "moduleExtensions",
+        "facts"
+      ],
+      "container": "recordedFileInputs",
+      "lock_file": null,
+      "lock_sha256": "4064b0a6cc84e0d19553c35f8a9998dfccd9161c2234d41e0db6500d9f60373b",
+      "lock_size": 166347,
+      "recorded": [
+        {
+          "path": "lf.lock",
+          "json_path": [
+            "moduleExtensions",
+            "//:ext.bzl%x4",
+            "general",
+            "recordedFileInputs"
+          ],
+          "key": "@@//lf.lock",
+          "value": "01450cb0373fea20f4f045a9cdd7d9bd2bccedd73eddb6c73414d9cad11fa4c4",
+          "sha256_on_disk": "01450cb0373fea20f4f045a9cdd7d9bd2bccedd73eddb6c73414d9cad11fa4c4",
+          "match": true
+        },
+        {
+          "path": "crlf.lock",
+          "json_path": [
+            "moduleExtensions",
+            "//:ext.bzl%x4",
+            "general",
+            "recordedFileInputs"
+          ],
+          "key": "@@//crlf.lock",
+          "value": "028ba78e3f48e6cccae57550b1e2fc9d67767fd9b7d2ba0ce1815cac0d400f00",
+          "sha256_on_disk": "028ba78e3f48e6cccae57550b1e2fc9d67767fd9b7d2ba0ce1815cac0d400f00",
+          "match": true
+        },
+        {
+          "path": "bom-crlf.lock",
+          "json_path": [
+            "moduleExtensions",
+            "//:ext.bzl%x4",
+            "general",
+            "recordedFileInputs"
+          ],
+          "key": "@@//bom-crlf.lock",
+          "value": "f6e4c0f3791f70e1c754d786734dadec1a96452f19b0dc921743a80fca38f052",
+          "sha256_on_disk": "f6e4c0f3791f70e1c754d786734dadec1a96452f19b0dc921743a80fca38f052",
+          "match": true
+        },
+        {
+          "path": "no-eol.lock",
+          "json_path": [
+            "moduleExtensions",
+            "//:ext.bzl%x4",
+            "general",
+            "recordedFileInputs"
+          ],
+          "key": "@@//no-eol.lock",
+          "value": "e874d90dd09e4d7b492f1a182b2bb894f377efc3596f122ca7b31a9d8a960ba2",
+          "sha256_on_disk": "e874d90dd09e4d7b492f1a182b2bb894f377efc3596f122ca7b31a9d8a960ba2",
+          "match": true
+        },
+        {
+          "path": "empty.lock",
+          "json_path": [
+            "moduleExtensions",
+            "//:ext.bzl%x4",
+            "general",
+            "recordedFileInputs"
+          ],
+          "key": "@@//empty.lock",
+          "value": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "sha256_on_disk": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "match": true
+        },
+        {
+          "path": "latin1.lock",
+          "json_path": [
+            "moduleExtensions",
+            "//:ext.bzl%x4",
+            "general",
+            "recordedFileInputs"
+          ],
+          "key": "@@//latin1.lock",
+          "value": "b794909ab657f08226fbfb823080724554b5edea8b75dc6d906abb5f8628a79e",
+          "sha256_on_disk": "b794909ab657f08226fbfb823080724554b5edea8b75dc6d906abb5f8628a79e",
+          "match": true
+        },
+        {
+          "path": "sub/pkg/nested.lock",
+          "json_path": [
+            "moduleExtensions",
+            "//:ext.bzl%x4",
+            "general",
+            "recordedFileInputs"
+          ],
+          "key": "@@//sub/pkg/nested.lock",
+          "value": "7b9597c0073c645e2789c65be87c300b033d847808faba8486813a3b64423b6d",
+          "sha256_on_disk": "7b9597c0073c645e2789c65be87c300b033d847808faba8486813a3b64423b6d",
+          "match": true
+        },
+        {
+          "path": "sub/pkg/deep/dir/file.lock",
+          "json_path": [
+            "moduleExtensions",
+            "//:ext.bzl%x4",
+            "general",
+            "recordedFileInputs"
+          ],
+          "key": "@@//sub/pkg/deep/dir/file.lock",
+          "value": "b6014d17ce7375782a6a4b324d2ee2b800d39e9d3fd58f5482a7fc9e63fac1d6",
+          "sha256_on_disk": "b6014d17ce7375782a6a4b324d2ee2b800d39e9d3fd58f5482a7fc9e63fac1d6",
+          "match": true
+        },
+        {
+          "path": "with space.lock",
+          "json_path": [
+            "moduleExtensions",
+            "//:ext.bzl%x4",
+            "general",
+            "recordedFileInputs"
+          ],
+          "key": "@@//with space.lock",
+          "value": "aeefd032b6bdddc6a619a2b69952d62d8a7873adb24a9037444acbfafca287c5",
+          "sha256_on_disk": "aeefd032b6bdddc6a619a2b69952d62d8a7873adb24a9037444acbfafca287c5",
+          "match": true
+        }
+      ],
+      "all_match": true,
+      "build_in_error_mode_exit": 0,
+      "after_lf_to_crlf": {
+        "mod_deps_error_mode_exit": 2,
+        "first_error": "ERROR: MODULE.bazel.lock is no longer up-to-date because: One or more files the extension '@@//:ext.bzl%x4' is using have changed. Please run `bazel mod deps --lockfile_mode=update` to update your lockfile.",
+        "lock_untouched_by_error_mode": true,
+        "update_mode_exit": 0,
+        "recorded_lf_equals_recorded_crlf": true
+      },
+      "after_byte_exact_restore": {
+        "mod_deps_error_mode_exit": 0,
+        "lock_untouched": true
+      }
+    },
+    {
+      "bazel": "8.8.2",
+      "lockFileVersion": 28,
+      "family": "B",
+      "top_level_keys": [
+        "lockFileVersion",
+        "registryFileHashes",
+        "selectedYankedVersions",
+        "moduleExtensions",
+        "facts",
+        "factsVersions"
+      ],
+      "container": "recordedInputs",
+      "lock_file": "locks/8.8.2.MODULE.bazel.lock",
+      "lock_sha256": "e1b4dfc9f284b947a6d9eb576ea27e61d5003fcddbc4d5c4051c4629183a84f4",
+      "lock_size": 164576,
+      "recorded": [
+        {
+          "path": "lf.lock",
+          "json_path": [
+            "moduleExtensions",
+            "//:ext.bzl%x4",
+            "general",
+            "recordedInputs"
+          ],
+          "key": "FILE:@@//lf.lock",
+          "value": "01450cb0373fea20f4f045a9cdd7d9bd2bccedd73eddb6c73414d9cad11fa4c4",
+          "sha256_on_disk": "01450cb0373fea20f4f045a9cdd7d9bd2bccedd73eddb6c73414d9cad11fa4c4",
+          "match": true
+        },
+        {
+          "path": "crlf.lock",
+          "json_path": [
+            "moduleExtensions",
+            "//:ext.bzl%x4",
+            "general",
+            "recordedInputs"
+          ],
+          "key": "FILE:@@//crlf.lock",
+          "value": "028ba78e3f48e6cccae57550b1e2fc9d67767fd9b7d2ba0ce1815cac0d400f00",
+          "sha256_on_disk": "028ba78e3f48e6cccae57550b1e2fc9d67767fd9b7d2ba0ce1815cac0d400f00",
+          "match": true
+        },
+        {
+          "path": "bom-crlf.lock",
+          "json_path": [
+            "moduleExtensions",
+            "//:ext.bzl%x4",
+            "general",
+            "recordedInputs"
+          ],
+          "key": "FILE:@@//bom-crlf.lock",
+          "value": "f6e4c0f3791f70e1c754d786734dadec1a96452f19b0dc921743a80fca38f052",
+          "sha256_on_disk": "f6e4c0f3791f70e1c754d786734dadec1a96452f19b0dc921743a80fca38f052",
+          "match": true
+        },
+        {
+          "path": "no-eol.lock",
+          "json_path": [
+            "moduleExtensions",
+            "//:ext.bzl%x4",
+            "general",
+            "recordedInputs"
+          ],
+          "key": "FILE:@@//no-eol.lock",
+          "value": "e874d90dd09e4d7b492f1a182b2bb894f377efc3596f122ca7b31a9d8a960ba2",
+          "sha256_on_disk": "e874d90dd09e4d7b492f1a182b2bb894f377efc3596f122ca7b31a9d8a960ba2",
+          "match": true
+        },
+        {
+          "path": "empty.lock",
+          "json_path": [
+            "moduleExtensions",
+            "//:ext.bzl%x4",
+            "general",
+            "recordedInputs"
+          ],
+          "key": "FILE:@@//empty.lock",
+          "value": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "sha256_on_disk": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "match": true
+        },
+        {
+          "path": "latin1.lock",
+          "json_path": [
+            "moduleExtensions",
+            "//:ext.bzl%x4",
+            "general",
+            "recordedInputs"
+          ],
+          "key": "FILE:@@//latin1.lock",
+          "value": "b794909ab657f08226fbfb823080724554b5edea8b75dc6d906abb5f8628a79e",
+          "sha256_on_disk": "b794909ab657f08226fbfb823080724554b5edea8b75dc6d906abb5f8628a79e",
+          "match": true
+        },
+        {
+          "path": "sub/pkg/nested.lock",
+          "json_path": [
+            "moduleExtensions",
+            "//:ext.bzl%x4",
+            "general",
+            "recordedInputs"
+          ],
+          "key": "FILE:@@//sub/pkg/nested.lock",
+          "value": "7b9597c0073c645e2789c65be87c300b033d847808faba8486813a3b64423b6d",
+          "sha256_on_disk": "7b9597c0073c645e2789c65be87c300b033d847808faba8486813a3b64423b6d",
+          "match": true
+        },
+        {
+          "path": "sub/pkg/deep/dir/file.lock",
+          "json_path": [
+            "moduleExtensions",
+            "//:ext.bzl%x4",
+            "general",
+            "recordedInputs"
+          ],
+          "key": "FILE:@@//sub/pkg/deep/dir/file.lock",
+          "value": "b6014d17ce7375782a6a4b324d2ee2b800d39e9d3fd58f5482a7fc9e63fac1d6",
+          "sha256_on_disk": "b6014d17ce7375782a6a4b324d2ee2b800d39e9d3fd58f5482a7fc9e63fac1d6",
+          "match": true
+        },
+        {
+          "path": "with space.lock",
+          "json_path": [
+            "moduleExtensions",
+            "//:ext.bzl%x4",
+            "general",
+            "recordedInputs"
+          ],
+          "key": "FILE:@@//with\\sspace.lock",
+          "value": "aeefd032b6bdddc6a619a2b69952d62d8a7873adb24a9037444acbfafca287c5",
+          "sha256_on_disk": "aeefd032b6bdddc6a619a2b69952d62d8a7873adb24a9037444acbfafca287c5",
+          "match": true
+        }
+      ],
+      "all_match": true,
+      "build_in_error_mode_exit": 0,
+      "after_lf_to_crlf": {
+        "mod_deps_error_mode_exit": 2,
+        "first_error": "ERROR: MODULE.bazel.lock is no longer up-to-date because an input to the extension '@@//:ext.bzl%x4' changed: file info or contents of @@//lf.lock changed. Please run `bazel mod deps --lockfile_mode=update` to update your lockfile.",
+        "lock_untouched_by_error_mode": true,
+        "update_mode_exit": 0,
+        "recorded_lf_equals_recorded_crlf": true
+      },
+      "after_byte_exact_restore": {
+        "mod_deps_error_mode_exit": 0,
+        "lock_untouched": true
+      }
+    },
+    {
+      "bazel": "9.1.1",
+      "lockFileVersion": 26,
+      "family": "B",
+      "top_level_keys": [
+        "lockFileVersion",
+        "registryFileHashes",
+        "selectedYankedVersions",
+        "moduleExtensions",
+        "facts"
+      ],
+      "container": "recordedInputs",
+      "lock_file": "locks/9.1.1.MODULE.bazel.lock",
+      "lock_sha256": "770ec67d50ce371104384201fa5a263fe3b3e157d5a740a478db5f0fb52f32f6",
+      "lock_size": 52062,
+      "recorded": [
+        {
+          "path": "lf.lock",
+          "json_path": [
+            "moduleExtensions",
+            "//:ext.bzl%x4",
+            "general",
+            "recordedInputs"
+          ],
+          "key": "FILE:@@//lf.lock",
+          "value": "01450cb0373fea20f4f045a9cdd7d9bd2bccedd73eddb6c73414d9cad11fa4c4",
+          "sha256_on_disk": "01450cb0373fea20f4f045a9cdd7d9bd2bccedd73eddb6c73414d9cad11fa4c4",
+          "match": true
+        },
+        {
+          "path": "crlf.lock",
+          "json_path": [
+            "moduleExtensions",
+            "//:ext.bzl%x4",
+            "general",
+            "recordedInputs"
+          ],
+          "key": "FILE:@@//crlf.lock",
+          "value": "028ba78e3f48e6cccae57550b1e2fc9d67767fd9b7d2ba0ce1815cac0d400f00",
+          "sha256_on_disk": "028ba78e3f48e6cccae57550b1e2fc9d67767fd9b7d2ba0ce1815cac0d400f00",
+          "match": true
+        },
+        {
+          "path": "bom-crlf.lock",
+          "json_path": [
+            "moduleExtensions",
+            "//:ext.bzl%x4",
+            "general",
+            "recordedInputs"
+          ],
+          "key": "FILE:@@//bom-crlf.lock",
+          "value": "f6e4c0f3791f70e1c754d786734dadec1a96452f19b0dc921743a80fca38f052",
+          "sha256_on_disk": "f6e4c0f3791f70e1c754d786734dadec1a96452f19b0dc921743a80fca38f052",
+          "match": true
+        },
+        {
+          "path": "no-eol.lock",
+          "json_path": [
+            "moduleExtensions",
+            "//:ext.bzl%x4",
+            "general",
+            "recordedInputs"
+          ],
+          "key": "FILE:@@//no-eol.lock",
+          "value": "e874d90dd09e4d7b492f1a182b2bb894f377efc3596f122ca7b31a9d8a960ba2",
+          "sha256_on_disk": "e874d90dd09e4d7b492f1a182b2bb894f377efc3596f122ca7b31a9d8a960ba2",
+          "match": true
+        },
+        {
+          "path": "empty.lock",
+          "json_path": [
+            "moduleExtensions",
+            "//:ext.bzl%x4",
+            "general",
+            "recordedInputs"
+          ],
+          "key": "FILE:@@//empty.lock",
+          "value": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "sha256_on_disk": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "match": true
+        },
+        {
+          "path": "latin1.lock",
+          "json_path": [
+            "moduleExtensions",
+            "//:ext.bzl%x4",
+            "general",
+            "recordedInputs"
+          ],
+          "key": "FILE:@@//latin1.lock",
+          "value": "b794909ab657f08226fbfb823080724554b5edea8b75dc6d906abb5f8628a79e",
+          "sha256_on_disk": "b794909ab657f08226fbfb823080724554b5edea8b75dc6d906abb5f8628a79e",
+          "match": true
+        },
+        {
+          "path": "sub/pkg/nested.lock",
+          "json_path": [
+            "moduleExtensions",
+            "//:ext.bzl%x4",
+            "general",
+            "recordedInputs"
+          ],
+          "key": "FILE:@@//sub/pkg/nested.lock",
+          "value": "7b9597c0073c645e2789c65be87c300b033d847808faba8486813a3b64423b6d",
+          "sha256_on_disk": "7b9597c0073c645e2789c65be87c300b033d847808faba8486813a3b64423b6d",
+          "match": true
+        },
+        {
+          "path": "sub/pkg/deep/dir/file.lock",
+          "json_path": [
+            "moduleExtensions",
+            "//:ext.bzl%x4",
+            "general",
+            "recordedInputs"
+          ],
+          "key": "FILE:@@//sub/pkg/deep/dir/file.lock",
+          "value": "b6014d17ce7375782a6a4b324d2ee2b800d39e9d3fd58f5482a7fc9e63fac1d6",
+          "sha256_on_disk": "b6014d17ce7375782a6a4b324d2ee2b800d39e9d3fd58f5482a7fc9e63fac1d6",
+          "match": true
+        },
+        {
+          "path": "with space.lock",
+          "json_path": [
+            "moduleExtensions",
+            "//:ext.bzl%x4",
+            "general",
+            "recordedInputs"
+          ],
+          "key": "FILE:@@//with\\sspace.lock",
+          "value": "aeefd032b6bdddc6a619a2b69952d62d8a7873adb24a9037444acbfafca287c5",
+          "sha256_on_disk": "aeefd032b6bdddc6a619a2b69952d62d8a7873adb24a9037444acbfafca287c5",
+          "match": true
+        }
+      ],
+      "all_match": true,
+      "build_in_error_mode_exit": 0,
+      "after_lf_to_crlf": {
+        "mod_deps_error_mode_exit": 2,
+        "first_error": "ERROR: MODULE.bazel.lock is no longer up-to-date because an input to the extension '@@//:ext.bzl%x4' changed: file info or contents of @@//lf.lock changed. Please run `bazel mod deps --lockfile_mode=update` to update your lockfile.",
+        "lock_untouched_by_error_mode": true,
+        "update_mode_exit": 0,
+        "recorded_lf_equals_recorded_crlf": true
+      },
+      "after_byte_exact_restore": {
+        "mod_deps_error_mode_exit": 0,
+        "lock_untouched": true
+      }
+    },
+    {
+      "bazel": "9.3.2",
+      "lockFileVersion": 28,
+      "family": "B",
+      "top_level_keys": [
+        "lockFileVersion",
+        "registryFileHashes",
+        "selectedYankedVersions",
+        "moduleExtensions",
+        "facts",
+        "factsVersions"
+      ],
+      "container": "recordedInputs",
+      "lock_file": "locks/9.3.2.MODULE.bazel.lock",
+      "lock_sha256": "831b09921309ffdf1fb466df204142362000c18d9efc58118707032db4a41224",
+      "lock_size": 52084,
+      "recorded": [
+        {
+          "path": "lf.lock",
+          "json_path": [
+            "moduleExtensions",
+            "//:ext.bzl%x4",
+            "general",
+            "recordedInputs"
+          ],
+          "key": "FILE:@@//lf.lock",
+          "value": "01450cb0373fea20f4f045a9cdd7d9bd2bccedd73eddb6c73414d9cad11fa4c4",
+          "sha256_on_disk": "01450cb0373fea20f4f045a9cdd7d9bd2bccedd73eddb6c73414d9cad11fa4c4",
+          "match": true
+        },
+        {
+          "path": "crlf.lock",
+          "json_path": [
+            "moduleExtensions",
+            "//:ext.bzl%x4",
+            "general",
+            "recordedInputs"
+          ],
+          "key": "FILE:@@//crlf.lock",
+          "value": "028ba78e3f48e6cccae57550b1e2fc9d67767fd9b7d2ba0ce1815cac0d400f00",
+          "sha256_on_disk": "028ba78e3f48e6cccae57550b1e2fc9d67767fd9b7d2ba0ce1815cac0d400f00",
+          "match": true
+        },
+        {
+          "path": "bom-crlf.lock",
+          "json_path": [
+            "moduleExtensions",
+            "//:ext.bzl%x4",
+            "general",
+            "recordedInputs"
+          ],
+          "key": "FILE:@@//bom-crlf.lock",
+          "value": "f6e4c0f3791f70e1c754d786734dadec1a96452f19b0dc921743a80fca38f052",
+          "sha256_on_disk": "f6e4c0f3791f70e1c754d786734dadec1a96452f19b0dc921743a80fca38f052",
+          "match": true
+        },
+        {
+          "path": "no-eol.lock",
+          "json_path": [
+            "moduleExtensions",
+            "//:ext.bzl%x4",
+            "general",
+            "recordedInputs"
+          ],
+          "key": "FILE:@@//no-eol.lock",
+          "value": "e874d90dd09e4d7b492f1a182b2bb894f377efc3596f122ca7b31a9d8a960ba2",
+          "sha256_on_disk": "e874d90dd09e4d7b492f1a182b2bb894f377efc3596f122ca7b31a9d8a960ba2",
+          "match": true
+        },
+        {
+          "path": "empty.lock",
+          "json_path": [
+            "moduleExtensions",
+            "//:ext.bzl%x4",
+            "general",
+            "recordedInputs"
+          ],
+          "key": "FILE:@@//empty.lock",
+          "value": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "sha256_on_disk": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "match": true
+        },
+        {
+          "path": "latin1.lock",
+          "json_path": [
+            "moduleExtensions",
+            "//:ext.bzl%x4",
+            "general",
+            "recordedInputs"
+          ],
+          "key": "FILE:@@//latin1.lock",
+          "value": "b794909ab657f08226fbfb823080724554b5edea8b75dc6d906abb5f8628a79e",
+          "sha256_on_disk": "b794909ab657f08226fbfb823080724554b5edea8b75dc6d906abb5f8628a79e",
+          "match": true
+        },
+        {
+          "path": "sub/pkg/nested.lock",
+          "json_path": [
+            "moduleExtensions",
+            "//:ext.bzl%x4",
+            "general",
+            "recordedInputs"
+          ],
+          "key": "FILE:@@//sub/pkg/nested.lock",
+          "value": "7b9597c0073c645e2789c65be87c300b033d847808faba8486813a3b64423b6d",
+          "sha256_on_disk": "7b9597c0073c645e2789c65be87c300b033d847808faba8486813a3b64423b6d",
+          "match": true
+        },
+        {
+          "path": "sub/pkg/deep/dir/file.lock",
+          "json_path": [
+            "moduleExtensions",
+            "//:ext.bzl%x4",
+            "general",
+            "recordedInputs"
+          ],
+          "key": "FILE:@@//sub/pkg/deep/dir/file.lock",
+          "value": "b6014d17ce7375782a6a4b324d2ee2b800d39e9d3fd58f5482a7fc9e63fac1d6",
+          "sha256_on_disk": "b6014d17ce7375782a6a4b324d2ee2b800d39e9d3fd58f5482a7fc9e63fac1d6",
+          "match": true
+        },
+        {
+          "path": "with space.lock",
+          "json_path": [
+            "moduleExtensions",
+            "//:ext.bzl%x4",
+            "general",
+            "recordedInputs"
+          ],
+          "key": "FILE:@@//with\\sspace.lock",
+          "value": "aeefd032b6bdddc6a619a2b69952d62d8a7873adb24a9037444acbfafca287c5",
+          "sha256_on_disk": "aeefd032b6bdddc6a619a2b69952d62d8a7873adb24a9037444acbfafca287c5",
+          "match": true
+        }
+      ],
+      "all_match": true,
+      "build_in_error_mode_exit": 0,
+      "after_lf_to_crlf": {
+        "mod_deps_error_mode_exit": 2,
+        "first_error": "ERROR: MODULE.bazel.lock is no longer up-to-date because an input to the extension '@@//:ext.bzl%x4' changed: file info or contents of @@//lf.lock changed. Please run `bazel mod deps --lockfile_mode=update` to update your lockfile.",
+        "lock_untouched_by_error_mode": true,
+        "update_mode_exit": 0,
+        "recorded_lf_equals_recorded_crlf": true
+      },
+      "after_byte_exact_restore": {
+        "mod_deps_error_mode_exit": 0,
+        "lock_untouched": true
+      }
+    },
+    {
+      "bazel": "10.0.0rc3",
+      "lockFileVersion": 28,
+      "family": "B",
+      "top_level_keys": [
+        "lockFileVersion",
+        "registryFileHashes",
+        "selectedYankedVersions",
+        "moduleExtensions",
+        "facts",
+        "factsVersions"
+      ],
+      "container": "recordedInputs",
+      "lock_file": null,
+      "lock_sha256": "cc05103a7e335bbababa6c197dad3f5eb63acd47b6f1236405e9fa2553e9bede",
+      "lock_size": 52130,
+      "recorded": [
+        {
+          "path": "lf.lock",
+          "json_path": [
+            "moduleExtensions",
+            "//:ext.bzl%x4",
+            "general",
+            "recordedInputs"
+          ],
+          "key": "FILE:@@//lf.lock",
+          "value": "01450cb0373fea20f4f045a9cdd7d9bd2bccedd73eddb6c73414d9cad11fa4c4",
+          "sha256_on_disk": "01450cb0373fea20f4f045a9cdd7d9bd2bccedd73eddb6c73414d9cad11fa4c4",
+          "match": true
+        },
+        {
+          "path": "crlf.lock",
+          "json_path": [
+            "moduleExtensions",
+            "//:ext.bzl%x4",
+            "general",
+            "recordedInputs"
+          ],
+          "key": "FILE:@@//crlf.lock",
+          "value": "028ba78e3f48e6cccae57550b1e2fc9d67767fd9b7d2ba0ce1815cac0d400f00",
+          "sha256_on_disk": "028ba78e3f48e6cccae57550b1e2fc9d67767fd9b7d2ba0ce1815cac0d400f00",
+          "match": true
+        },
+        {
+          "path": "bom-crlf.lock",
+          "json_path": [
+            "moduleExtensions",
+            "//:ext.bzl%x4",
+            "general",
+            "recordedInputs"
+          ],
+          "key": "FILE:@@//bom-crlf.lock",
+          "value": "f6e4c0f3791f70e1c754d786734dadec1a96452f19b0dc921743a80fca38f052",
+          "sha256_on_disk": "f6e4c0f3791f70e1c754d786734dadec1a96452f19b0dc921743a80fca38f052",
+          "match": true
+        },
+        {
+          "path": "no-eol.lock",
+          "json_path": [
+            "moduleExtensions",
+            "//:ext.bzl%x4",
+            "general",
+            "recordedInputs"
+          ],
+          "key": "FILE:@@//no-eol.lock",
+          "value": "e874d90dd09e4d7b492f1a182b2bb894f377efc3596f122ca7b31a9d8a960ba2",
+          "sha256_on_disk": "e874d90dd09e4d7b492f1a182b2bb894f377efc3596f122ca7b31a9d8a960ba2",
+          "match": true
+        },
+        {
+          "path": "empty.lock",
+          "json_path": [
+            "moduleExtensions",
+            "//:ext.bzl%x4",
+            "general",
+            "recordedInputs"
+          ],
+          "key": "FILE:@@//empty.lock",
+          "value": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "sha256_on_disk": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "match": true
+        },
+        {
+          "path": "latin1.lock",
+          "json_path": [
+            "moduleExtensions",
+            "//:ext.bzl%x4",
+            "general",
+            "recordedInputs"
+          ],
+          "key": "FILE:@@//latin1.lock",
+          "value": "b794909ab657f08226fbfb823080724554b5edea8b75dc6d906abb5f8628a79e",
+          "sha256_on_disk": "b794909ab657f08226fbfb823080724554b5edea8b75dc6d906abb5f8628a79e",
+          "match": true
+        },
+        {
+          "path": "sub/pkg/nested.lock",
+          "json_path": [
+            "moduleExtensions",
+            "//:ext.bzl%x4",
+            "general",
+            "recordedInputs"
+          ],
+          "key": "FILE:@@//sub/pkg/nested.lock",
+          "value": "7b9597c0073c645e2789c65be87c300b033d847808faba8486813a3b64423b6d",
+          "sha256_on_disk": "7b9597c0073c645e2789c65be87c300b033d847808faba8486813a3b64423b6d",
+          "match": true
+        },
+        {
+          "path": "sub/pkg/deep/dir/file.lock",
+          "json_path": [
+            "moduleExtensions",
+            "//:ext.bzl%x4",
+            "general",
+            "recordedInputs"
+          ],
+          "key": "FILE:@@//sub/pkg/deep/dir/file.lock",
+          "value": "b6014d17ce7375782a6a4b324d2ee2b800d39e9d3fd58f5482a7fc9e63fac1d6",
+          "sha256_on_disk": "b6014d17ce7375782a6a4b324d2ee2b800d39e9d3fd58f5482a7fc9e63fac1d6",
+          "match": true
+        },
+        {
+          "path": "with space.lock",
+          "json_path": [
+            "moduleExtensions",
+            "//:ext.bzl%x4",
+            "general",
+            "recordedInputs"
+          ],
+          "key": "FILE:@@//with\\sspace.lock",
+          "value": "aeefd032b6bdddc6a619a2b69952d62d8a7873adb24a9037444acbfafca287c5",
+          "sha256_on_disk": "aeefd032b6bdddc6a619a2b69952d62d8a7873adb24a9037444acbfafca287c5",
+          "match": true
+        }
+      ],
+      "all_match": true,
+      "build_in_error_mode_exit": 0,
+      "after_lf_to_crlf": {
+        "mod_deps_error_mode_exit": 2,
+        "first_error": "ERROR: MODULE.bazel.lock is no longer up-to-date because an input to the extension '@@//:ext.bzl%x4' changed: file info or contents of @@//lf.lock changed. Please run `bazel mod deps --lockfile_mode=update` to update your lockfile.",
+        "lock_untouched_by_error_mode": true,
+        "update_mode_exit": 0,
+        "recorded_lf_equals_recorded_crlf": true
+      },
+      "after_byte_exact_restore": {
+        "mod_deps_error_mode_exit": 0,
+        "lock_untouched": true
+      }
+    }
+  ],
+  "digest_function": [
+    {
+      "bazel": "7.7.2",
+      "startup_option": "--digest_function=sha1",
+      "error_mode_exit_against_default_lock": 2,
+      "first_error": "ERROR: MODULE.bazel.lock is no longer up-to-date because: The implementation of the extension 'ModuleExtensionId{bzlFileLabel=//:ext.bzl, extensionName=x4, isolationKey=Optional.empty}' or one of its transitive .bzl files has changed,One or more files the extension 'ModuleExtensionId{bzlFileLabel=//:ext.bzl, extensionName=x4, isolationKey=Optional.empty}' is using have changed. Please run `bazel mod deps --lockfile_mode=update` to update your lockfile. Type 'bazel help mod' for syntax and help.",
+      "update_mode_exit": 0,
+      "recorded_value_for_lf_lock": "f9970c154d890b6cd10a5375b0d578a1ee1fdc9c",
+      "recorded_value_hex_length": 40,
+      "equals_sha256_of_bytes": false
+    },
+    {
+      "bazel": "7.7.2",
+      "startup_option": "--digest_function=blake3",
+      "error_mode_exit_against_default_lock": 2,
+      "first_error": "ERROR: MODULE.bazel.lock is no longer up-to-date because: The implementation of the extension 'ModuleExtensionId{bzlFileLabel=//:ext.bzl, extensionName=x4, isolationKey=Optional.empty}' or one of its transitive .bzl files has changed,One or more files the extension 'ModuleExtensionId{bzlFileLabel=//:ext.bzl, extensionName=x4, isolationKey=Optional.empty}' is using have changed. Please run `bazel mod deps --lockfile_mode=update` to update your lockfile. Type 'bazel help mod' for syntax and help.",
+      "update_mode_exit": 0,
+      "recorded_value_for_lf_lock": "42d752d7cca97561f9bd173afd9c90f1196f708272ba872435a98d5277c5b72a",
+      "recorded_value_hex_length": 64,
+      "equals_sha256_of_bytes": false
+    },
+    {
+      "bazel": "8.8.2",
+      "startup_option": "--digest_function=sha1",
+      "error_mode_exit_against_default_lock": 2,
+      "first_error": "ERROR: MODULE.bazel.lock is no longer up-to-date because the implementation of the extension '@@//:ext.bzl%x4' or one of its transitive .bzl files has changed,an input to the extension '@@//:ext.bzl%x4' changed: file info or contents of @@//lf.lock changed. Please run `bazel mod deps --lockfile_mode=update` to update your lockfile.",
+      "update_mode_exit": 0,
+      "recorded_value_for_lf_lock": "f9970c154d890b6cd10a5375b0d578a1ee1fdc9c",
+      "recorded_value_hex_length": 40,
+      "equals_sha256_of_bytes": false
+    },
+    {
+      "bazel": "8.8.2",
+      "startup_option": "--digest_function=blake3",
+      "error_mode_exit_against_default_lock": 2,
+      "first_error": "ERROR: MODULE.bazel.lock is no longer up-to-date because the implementation of the extension '@@//:ext.bzl%x4' or one of its transitive .bzl files has changed,an input to the extension '@@//:ext.bzl%x4' changed: file info or contents of @@//lf.lock changed. Please run `bazel mod deps --lockfile_mode=update` to update your lockfile.",
+      "update_mode_exit": 0,
+      "recorded_value_for_lf_lock": "42d752d7cca97561f9bd173afd9c90f1196f708272ba872435a98d5277c5b72a",
+      "recorded_value_hex_length": 64,
+      "equals_sha256_of_bytes": false
+    },
+    {
+      "bazel": "9.3.2",
+      "startup_option": "--digest_function=sha1",
+      "error_mode_exit_against_default_lock": 2,
+      "first_error": "ERROR: MODULE.bazel.lock is no longer up-to-date because the implementation of the extension '@@//:ext.bzl%x4' or one of its transitive .bzl files has changed,an input to the extension '@@//:ext.bzl%x4' changed: file info or contents of @@//lf.lock changed. Please run `bazel mod deps --lockfile_mode=update` to update your lockfile.",
+      "update_mode_exit": 0,
+      "recorded_value_for_lf_lock": "f9970c154d890b6cd10a5375b0d578a1ee1fdc9c",
+      "recorded_value_hex_length": 40,
+      "equals_sha256_of_bytes": false
+    },
+    {
+      "bazel": "9.3.2",
+      "startup_option": "--digest_function=blake3",
+      "error_mode_exit_against_default_lock": 2,
+      "first_error": "ERROR: MODULE.bazel.lock is no longer up-to-date because the implementation of the extension '@@//:ext.bzl%x4' or one of its transitive .bzl files has changed,an input to the extension '@@//:ext.bzl%x4' changed: file info or contents of @@//lf.lock changed. Please run `bazel mod deps --lockfile_mode=update` to update your lockfile.",
+      "update_mode_exit": 0,
+      "recorded_value_for_lf_lock": "42d752d7cca97561f9bd173afd9c90f1196f708272ba872435a98d5277c5b72a",
+      "recorded_value_hex_length": 64,
+      "equals_sha256_of_bytes": false
+    }
+  ],
+  "real_ruleset_crosscheck": {
+    "what": "static check (no Bazel) over the workspaces other probe groups left on this machine: recorded main-repository inputs whose file still holds the recorded bytes. A mismatch is a cell left stale on purpose, not a refutation.",
+    "locks_read": 720,
+    "rows": [
+      {
+        "extension": "gazelle//:extensions.bzl%go_deps",
+        "lockFileVersion": 13,
+        "container": "recordedFileInputs",
+        "file": "go.mod",
+        "match": 2,
+        "mismatch": 0,
+        "missing": 0
+      },
+      {
+        "extension": "gazelle//:extensions.bzl%go_deps",
+        "lockFileVersion": 13,
+        "container": "recordedFileInputs",
+        "file": "go.sum",
+        "match": 2,
+        "mismatch": 0,
+        "missing": 0
+      },
+      {
+        "extension": "gazelle//:extensions.bzl%go_deps",
+        "lockFileVersion": 3,
+        "container": "accumulatedFileDigests",
+        "file": "go.mod",
+        "match": 3,
+        "mismatch": 3,
+        "missing": 0
+      },
+      {
+        "extension": "gazelle//:extensions.bzl%go_deps",
+        "lockFileVersion": 3,
+        "container": "accumulatedFileDigests",
+        "file": "go.sum",
+        "match": 3,
+        "mismatch": 3,
+        "missing": 0
+      },
+      {
+        "extension": "rules_csharp//csharp:extensions.bzl%nuget",
+        "lockFileVersion": 13,
+        "container": "recordedFileInputs",
+        "file": "nuget.config",
+        "match": 0,
+        "mismatch": 1,
+        "missing": 0
+      },
+      {
+        "extension": "rules_csharp//csharp:extensions.bzl%nuget",
+        "lockFileVersion": 13,
+        "container": "recordedFileInputs",
+        "file": "packages.lock.json",
+        "match": 1,
+        "mismatch": 0,
+        "missing": 0
+      },
+      {
+        "extension": "rules_csharp//csharp:extensions.bzl%nuget",
+        "lockFileVersion": 28,
+        "container": "recordedInputs",
+        "file": "nuget.config",
+        "match": 0,
+        "mismatch": 2,
+        "missing": 0
+      },
+      {
+        "extension": "rules_csharp//csharp:extensions.bzl%nuget",
+        "lockFileVersion": 28,
+        "container": "recordedInputs",
+        "file": "packages.lock.json",
+        "match": 2,
+        "mismatch": 0,
+        "missing": 0
+      },
+      {
+        "extension": "rules_csharp//csharp:extensions.bzl%nuget",
+        "lockFileVersion": 6,
+        "container": "recordedFileInputs",
+        "file": "nuget.config",
+        "match": 0,
+        "mismatch": 1,
+        "missing": 0
+      },
+      {
+        "extension": "rules_csharp//csharp:extensions.bzl%nuget",
+        "lockFileVersion": 6,
+        "container": "recordedFileInputs",
+        "file": "packages.lock.json",
+        "match": 1,
+        "mismatch": 0,
+        "missing": 0
+      },
+      {
+        "extension": "rules_jvm_external//:extensions.bzl%maven",
+        "lockFileVersion": 13,
+        "container": "recordedFileInputs",
+        "file": "maven_install.json",
+        "match": 1,
+        "mismatch": 0,
+        "missing": 0
+      },
+      {
+        "extension": "rules_jvm_external//:extensions.bzl%maven",
+        "lockFileVersion": 3,
+        "container": "accumulatedFileDigests",
+        "file": "maven_install.json",
+        "match": 2,
+        "mismatch": 0,
+        "missing": 0
+      },
+      {
+        "extension": "rules_python//python/extensions:pip.bzl%pip",
+        "lockFileVersion": 13,
+        "container": "recordedFileInputs",
+        "file": "requirements_lock.txt",
+        "match": 2,
+        "mismatch": 4,
+        "missing": 0
+      },
+      {
+        "extension": "rules_python//python/extensions:pip.bzl%pip",
+        "lockFileVersion": 3,
+        "container": "accumulatedFileDigests",
+        "file": "requirements_lock.txt",
+        "match": 1,
+        "mismatch": 1,
+        "missing": 0
+      },
+      {
+        "extension": "rules_python//python/extensions:pip.bzl%pip",
+        "lockFileVersion": 6,
+        "container": "recordedFileInputs",
+        "file": "requirements_lock.txt",
+        "match": 1,
+        "mismatch": 1,
+        "missing": 0
+      },
+      {
+        "extension": "rules_rust//crate_universe:extension.bzl%crate",
+        "lockFileVersion": 3,
+        "container": "accumulatedFileDigests",
+        "file": "Cargo.lock",
+        "match": 1,
+        "mismatch": 0,
+        "missing": 0
+      },
+      {
+        "extension": "rules_rust//crate_universe:extension.bzl%crate",
+        "lockFileVersion": 3,
+        "container": "accumulatedFileDigests",
+        "file": "Cargo.toml",
+        "match": 1,
+        "mismatch": 0,
+        "missing": 0
+      },
+      {
+        "extension": "rules_rust//crate_universe:extensions.bzl%crate",
+        "lockFileVersion": 18,
+        "container": "recordedFileInputs",
+        "file": "Cargo.lock",
+        "match": 1,
+        "mismatch": 0,
+        "missing": 0
+      },
+      {
+        "extension": "rules_rust//crate_universe:extensions.bzl%crate",
+        "lockFileVersion": 18,
+        "container": "recordedFileInputs",
+        "file": "Cargo.toml",
+        "match": 1,
+        "mismatch": 0,
+        "missing": 0
+      },
+      {
+        "extension": "rules_rust//crate_universe:extensions.bzl%crate",
+        "lockFileVersion": 28,
+        "container": "recordedInputs",
+        "file": "Cargo.lock",
+        "match": 3,
+        "mismatch": 0,
+        "missing": 0
+      },
+      {
+        "extension": "rules_rust//crate_universe:extensions.bzl%crate",
+        "lockFileVersion": 28,
+        "container": "recordedInputs",
+        "file": "Cargo.toml",
+        "match": 3,
+        "mismatch": 0,
+        "missing": 0
+      }
+    ]
+  }
+}
