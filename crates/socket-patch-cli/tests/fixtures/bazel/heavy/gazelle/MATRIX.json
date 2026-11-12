@@ -80,6 +80,7 @@
       "probe": {"label": "lib.go", "sha256": "9deedc9bf5acbfc8ef4484fc11db8620bb1c1a18e9fb4f998c69d1e9d3a390c0"},
       "consumer": "OUT: PRISTINE",
       "toolchains": ["go_sdk"],
+      "lock": {"not_recorded": "//:extensions.bzl%go_deps"},
       "cells": [
         {"bazel": "7.7.2", "proof": 2, "tier": "nightly", "evidence": "gazelle-go G1 (gz0.36.0-b7.7.2)"}
       ]
@@ -96,6 +97,7 @@
       "probe": {"label": "lib.go", "sha256": "9deedc9bf5acbfc8ef4484fc11db8620bb1c1a18e9fb4f998c69d1e9d3a390c0"},
       "consumer": "OUT: PRISTINE",
       "toolchains": ["go_sdk"],
+      "lock": {"records": {"extension": "//:extensions.bzl%go_deps", "files": ["go.mod", "go.sum"]}},
       "cells": [
         {"bazel": "7.7.2", "proof": 2, "tier": "nightly", "evidence": "gazelle-go G1 (gz0.35.0-b7.7.2)"},
         {"bazel": "8.8.2", "proof": 2, "tier": "nightly", "evidence": "unverified"}

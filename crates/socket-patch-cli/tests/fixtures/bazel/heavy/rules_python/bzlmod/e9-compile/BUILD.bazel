@@ -18,9 +18,17 @@ py_binary(
 )
 
 # The lock check a hosted rewrite turns red: `//:requirements.test` compares
-# the file with a fresh pip-compile of requirements.in.
+# the file with a fresh pip-compile of requirements.in. pip-compile resolves
+# with pip, not with Bazel's downloader, and this release takes the index
+# from extra_args alone (it runs pip without a config file): the harness
+# writes the fixture server's address over the placeholder in the workspace
+# copy. --no-emit-index-url keeps that address out of requirements.txt.
 compile_pip_requirements(
     name = "requirements",
     src = "requirements.in",
+    extra_args = [
+        "--index-url=http://socket-fixture.invalid/pip-mode/simple",
+        "--no-emit-index-url",
+    ],
     requirements_txt = "requirements.txt",
 )

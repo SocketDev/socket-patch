@@ -66,10 +66,10 @@ fn h1(files: &BTreeMap<String, Vec<u8>>) -> String {
     )
 }
 
-/// The `h1:` of a module zip, as `go mod download` computes it. `Err`
-/// for bytes that are no zip, or a zip with an entry outside
-/// `<module>@<version>/`, which `go` rejects.
-pub fn h1_of_zip(zip: &[u8], module: &str, version: &str) -> Result<String, String> {
+/// The files of a module zip, name to content. `Err` for bytes that are
+/// no zip, or a zip with an entry outside `<module>@<version>/`, which
+/// `go` rejects.
+fn zip_files(zip: &[u8], module: &str, version: &str) -> Result<BTreeMap<String, Vec<u8>>, String> {
     let mut archive =
         zip::ZipArchive::new(std::io::Cursor::new(zip)).map_err(|e| format!("not a zip: {e}"))?;
     let prefix = format!("{module}@{version}/");
@@ -86,7 +86,13 @@ pub fn h1_of_zip(zip: &[u8], module: &str, version: &str) -> Result<String, Stri
             .map_err(|e| format!("{name}: {e}"))?;
         files.insert(name, bytes);
     }
-    Ok(h1(&files))
+    Ok(files)
+}
+
+/// The `h1:` of a module zip, as `go mod download` computes it. `Err`
+/// as for [`zip_files`].
+pub fn h1_of_zip(zip: &[u8], module: &str, version: &str) -> Result<String, String> {
+    Ok(h1(&zip_files(zip, module, version)?))
 }
 
 /// The `h1:` of a `.mod` file: the directory hash of one file named `go.mod`.
@@ -211,13 +217,57 @@ pub fn sumdb(server: &FixtureServer) -> String {
     format!("{}/{SUMDB_HOST}", server.loopback_origin())
 }
 
-/// Serve the module's zip with one byte flipped, for a tamper twin. The
-/// length is kept: gazelle accepted a zip with a byte appended.
-pub fn tamper(server: &FixtureServer, module: &Module) {
-    let mut zip = module.zip.clone();
-    let middle = zip.len() / 2;
-    zip[middle] ^= 0x01;
-    server.serve(&module.zip_url, zip);
+/// The module's zip with one byte of one file changed: still a module zip
+/// `go` unpacks, with the same file names, whose `h1:` is no longer the
+/// one `go.sum` pins.
+///
+/// The archive is rebuilt from its files, never edited as bytes. Go's
+/// `h1:` covers the names and contents of the files, not the bytes of the
+/// zip. With go 1.26.3 and the committed zip, a flipped byte in a
+/// compressed stream gives `zip: not a valid zip file` before any
+/// checksum is compared, so the fetch fails whether or not a digest is
+/// enforced; a byte appended after the central directory is accepted with
+/// the pinned `h1:` (it changes no name and no content); and the zip this
+/// returns gives `checksum mismatch ... SECURITY ERROR`. `go.mod` is left
+/// alone: its own `h1:` is a separate `go.sum` line. `Err` when there is
+/// no other file to change.
+pub fn tampered_zip(module: &Module) -> Result<Vec<u8>, String> {
+    use std::io::Write;
+
+    let (path, version) = (&module.path, &module.version);
+    let mut files = zip_files(&module.zip, path, version)?;
+    let go_mod = format!("{path}@{version}/go.mod");
+    let mut victims = files.iter_mut();
+    let victim = victims.find(|(name, bytes)| **name != go_mod && !bytes.is_empty());
+    let (_, bytes) =
+        victim.ok_or_else(|| format!("{path}@{version}: no file beside go.mod to tamper with"))?;
+    let middle = bytes.len() / 2;
+    bytes[middle] ^= 0x01;
+
+    let mut archive = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    let options = zip::write::SimpleFileOptions::default();
+    for (name, bytes) in &files {
+        let written = archive
+            .start_file(name.as_str(), options)
+            .map_err(|e| e.to_string())
+            .and_then(|()| archive.write_all(bytes).map_err(|e| e.to_string()));
+        written.map_err(|why| format!("{name}: {why}"))?;
+    }
+    let tampered = archive.finish().map_err(|e| e.to_string())?.into_inner();
+    // What `go` will compute for it: a real hash, and another one.
+    let h1 = h1_of_zip(&tampered, path, version)?;
+    if h1 == module.zip_h1 {
+        return Err(format!("{path}@{version}: the tampered zip still has {h1}"));
+    }
+    Ok(tampered)
+}
+
+/// Serve [`tampered_zip`] at the module's URL, for a tamper twin: `go`
+/// then fails with its checksum mismatch against `go.sum`. `Err` (the
+/// route keeps the committed zip) when no such zip can be built.
+pub fn tamper(server: &FixtureServer, module: &Module) -> Result<(), String> {
+    server.serve(&module.zip_url, tampered_zip(module)?);
+    Ok(())
 }
 
 #[test]
@@ -276,10 +326,39 @@ fn the_committed_go_proxy_serves_what_go_sum_pins() {
         );
     }
 
-    tamper(&server, upstream);
+    tamper(&server, upstream).unwrap();
     let (_, tampered) = get("example.com/upstream/@v/v1.0.0.zip");
-    assert_eq!(tampered.len(), zip.len());
-    assert_ne!(tampered, zip);
+    // What a tamper twin needs `go` to reach is the comparison with
+    // go.sum: the served bytes are a module zip with another `h1:`. The
+    // length of the zip says nothing (a byte appended to it is accepted).
+    let h1 = h1_of_zip(&tampered, "example.com/upstream", "v1.0.0");
+    assert_ne!(h1.expect("a module zip go unpacks"), upstream.zip_h1);
+    // Same files, one of them changed by one byte, and not go.mod, whose
+    // hash is the other go.sum line.
+    let files = |zip: &[u8]| zip_files(zip, "example.com/upstream", "v1.0.0").unwrap();
+    let (before, after) = (files(&zip), files(&tampered));
+    assert!(before.keys().eq(after.keys()));
+    let changed: Vec<&String> = before
+        .iter()
+        .filter(|(name, bytes)| after[*name] != **bytes)
+        .map(|(name, _)| name)
+        .collect();
+    let [name] = changed[..] else {
+        panic!("one changed file expected: {changed:?}")
+    };
+    assert!(!name.ends_with("/go.mod"), "{name}");
+    let differing = before[name]
+        .iter()
+        .zip(&after[name])
+        .filter(|(a, b)| a != b);
+    assert_eq!(
+        (differing.count(), after[name].len()),
+        (1, before[name].len())
+    );
+    assert_eq!(
+        h1_of_mod(&after["example.com/upstream@v1.0.0/go.mod"]),
+        upstream.mod_h1
+    );
 }
 
 #[test]
@@ -319,6 +398,13 @@ fn a_go_proxy_tree_that_go_would_reject_is_not_mounted() {
         module.zip_url,
         "https://proxy.golang.org/example.com/!mixed/@v/v1.0.0.zip"
     );
+    // A zip that holds go.mod alone has no file a tamper may change: the
+    // helper says so and the committed zip stays served.
+    let refused = tamper(&server, module).unwrap_err();
+    assert!(refused.contains("no file beside go.mod"), "{refused}");
+    let served = super::pypi_files::fetch(&server, &module.zip_url);
+    let committed = std::fs::read(dir.join("v1.0.0.zip")).unwrap();
+    assert_eq!(served, (200, committed));
 
     std::fs::write(dir.join("list"), "v2.0.0\n").unwrap();
     let unlisted = mount(&server, tree.path()).unwrap_err();

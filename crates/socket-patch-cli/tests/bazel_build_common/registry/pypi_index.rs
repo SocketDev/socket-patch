@@ -28,6 +28,11 @@ use super::pypi_files::Distribution;
 pub const HOST: &str = "pypi.org";
 
 /// The route prefix of the pip-mode index: `<loopback origin>/<this>/<project>/`.
+///
+/// It is no host. `FixtureServer::hosts` takes the first path segment of
+/// a request for its host, so a pip request to this index is listed under
+/// the first segment of this prefix: a test that writes that list into a
+/// cell report maps the segment to `127.0.0.1`, where pip sent the request.
 pub const PIP_MODE_PREFIX: &str = "pip-mode/simple";
 
 /// pip accepts an index page only under an HTML or PEP 691 media type.

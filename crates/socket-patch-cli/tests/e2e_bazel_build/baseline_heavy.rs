@@ -16,23 +16,25 @@
 //! packages are synthetic. They are served by the fixture server under
 //! their production URLs, through a downloader rewrite that names exactly
 //! those URLs, or through the lever of the tool that fetches them
-//! (`GOPROXY`, pip's `--index-url`).
+//! (`GOPROXY`, pip's `--index-url`). A baseline therefore has no offline
+//! phase and no real-registry variant: in either cell it prints
+//! `SKIP (n/a)`.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use serde::Deserialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use socket_patch_core::bazel::module_lock::ModuleLock;
 
-use crate::bazel_build_common::env::{Group, System};
+use crate::bazel_build_common::env::{self, Group, System};
 use crate::bazel_build_common::fixture_server::FixtureServer;
 use crate::bazel_build_common::probe_report;
 use crate::bazel_build_common::proof::{Anchor, PROBE};
 use crate::bazel_build_common::registry::{goproxy, pypi_files, pypi_index};
 use crate::bazel_build_common::server::Cell;
-use crate::bazel_build_common::workspace::{fixtures_root, PROBE_BZL};
+use crate::bazel_build_common::workspace::{fixtures_root, MODULE_LOCK, PROBE_BZL};
 
 /// What a committed fixture file writes where a test needs the fixture
 /// server's origin (pip's `--index-url`). The runner replaces it in the
@@ -67,9 +69,16 @@ struct Fixture {
     /// The registry emulations the fixture's packages come from: `pypi`
     /// (Bazel's downloader), `pypi-pip` (pip itself), `goproxy`.
     registries: Vec<String>,
-    /// Who fetches the packages: `downloader` or `tool`. A tool-fetched
-    /// cell needs a loopback origin from the fake Socket API later.
+    /// Who fetches the packages of the fixture as committed: Bazel's
+    /// `downloader`, or a `tool` (pip, go, cargo).
     fetch: String,
+    /// Who fetches a hosted reference once socket-patch has rewritten the
+    /// fixture, where that is not who [`Fixture::fetch`] names: on
+    /// rules_python 1.3.0 and 1.4.2 pip installs a registry requirement
+    /// and Bazel's downloader fetches a hashed direct reference. Read it
+    /// through [`Fixture::hosted_fetch`].
+    #[serde(default)]
+    hosted_fetch: Option<String>,
     /// The hosts a cold run contacts directly, as far as a probe saw them.
     hosts: Vec<String>,
     probe: Probe,
@@ -80,9 +89,100 @@ struct Fixture {
     toolchains: Vec<String>,
     #[serde(default)]
     substitute: Vec<String>,
+    /// The test targets that pass on the fixture as committed (the lock
+    /// check of `compile_pip_requirements`). The baseline runs them, so a
+    /// later test that expects one to turn red starts from a green one.
+    #[serde(default)]
+    test_targets: Vec<String>,
+    /// What `MODULE.bazel.lock` says about the fixture's extension after
+    /// the builds, for a fixture whose shape is a statement about the lock.
+    #[serde(default)]
+    lock: Option<LockSpec>,
     /// What the fixture is for.
     shape: String,
     cells: Vec<CellSpec>,
+}
+
+/// A claim about the lock Bazel writes. An extension is named as
+/// `<label>%<name>` without its repository (`//:extensions.bzl%go_deps`):
+/// the canonical repository name is spelled differently per Bazel line
+/// (`gazelle~`, `gazelle+`).
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "snake_case")]
+enum LockSpec {
+    /// The lock holds the extension's result, and every entry of it lists
+    /// these files of the workspace as recorded inputs: an edit of one
+    /// stales the lock.
+    Records {
+        extension: String,
+        files: Vec<String>,
+    },
+    /// The lock holds neither an entry nor facts of the extension: no
+    /// edit of a file it reads can stale the lock.
+    NotRecorded(String),
+}
+
+impl LockSpec {
+    fn extension(&self) -> &str {
+        match self {
+            LockSpec::Records { extension, .. } | LockSpec::NotRecorded(extension) => extension,
+        }
+    }
+
+    /// `Err` says how `lock` differs from the claim. A lock the reader
+    /// does not understand proves nothing and is an error too.
+    fn check(&self, lock: &ModuleLock) -> Result<(), String> {
+        let extensions = lock
+            .extensions()
+            .ok_or_else(|| format!("the lock cannot be read: {lock:?}"))?;
+        let (label, name) = split_extension(self.extension())?;
+        let entries = extensions.entries_of(label, name);
+        match self {
+            LockSpec::Records { extension, files } => {
+                if entries.is_empty() {
+                    let recorded = recorded_extensions(lock);
+                    return Err(format!("no entry of {extension}; recorded: {recorded:?}"));
+                }
+                for entry in entries {
+                    let listed: Vec<&str> = entry.inputs.iter().map(|i| i.path.as_str()).collect();
+                    if let Some(file) = files.iter().find(|file| !listed.contains(&file.as_str())) {
+                        return Err(format!(
+                            "the {} entry of {extension} does not record {file}: {listed:?}",
+                            entry.platform
+                        ));
+                    }
+                }
+                Ok(())
+            }
+            LockSpec::NotRecorded(extension) => {
+                let facts = extensions.facts_of(label, name);
+                if entries.is_empty() && facts.is_empty() {
+                    return Ok(());
+                }
+                Err(format!(
+                    "{extension} is recorded: {} entries, {} facts",
+                    entries.len(),
+                    facts.len()
+                ))
+            }
+        }
+    }
+}
+
+/// `//pkg:file.bzl%name` as (label, name).
+fn split_extension(id: &str) -> Result<(&str, &str), String> {
+    let split = id.split_once('%');
+    split
+        .filter(|(label, name)| label.starts_with("//") && label.contains(':') && !name.is_empty())
+        .ok_or_else(|| format!("{id:?} is not `//<package>:<file>%<name>`"))
+}
+
+/// The ids of the extensions whose result `lock` holds, as the lock
+/// spells them, sorted. Empty for a lock that could not be read.
+fn recorded_extensions(lock: &ModuleLock) -> Vec<String> {
+    let entries = lock.entries().unwrap_or_default();
+    let ids: BTreeSet<String> = entries.iter().map(|entry| entry.id.raw.clone()).collect();
+    ids.into_iter().collect()
 }
 
 /// The one source file of the package among the sources of
@@ -153,6 +253,14 @@ impl Fixture {
         System::parse(&self.system)
             .unwrap_or_else(|| panic!("{}: system {:?}", self.fixture, self.system))
     }
+
+    /// Who fetches a hosted reference: `downloader` or `tool`. A lane's
+    /// fake Socket API hands out a loopback origin only where this says
+    /// `tool`; a loopback URL must never reach a file Bazel's downloader
+    /// reads or records.
+    fn hosted_fetch(&self) -> &str {
+        self.hosted_fetch.as_deref().unwrap_or(&self.fetch)
+    }
 }
 
 /// What mounting a fixture's registries yields for the Bazel commands.
@@ -161,38 +269,60 @@ struct Levers {
     /// URLs the downloader must fetch from the fixture server.
     rewrites: Vec<String>,
     repo_env: Vec<(String, String)>,
-    /// The package files Bazel's downloader fetches, as (URL, sha256).
-    packages: Vec<(String, String)>,
+    /// The URL of every package file the fixture server serves.
+    packages: Vec<String>,
+    /// The URL of the package file the probe anchors, where the fixture
+    /// server serves that file itself (a wheel). The cell must ask for it.
+    anchored: Option<String>,
+    /// Bazel's downloader fetches the anchored file: a shared repository
+    /// cache can answer for it with no request.
+    downloader: bool,
 }
 
 /// Start the emulations `fixture` names on `server`.
 fn mount(fixture: &Fixture, server: &FixtureServer) -> Levers {
     let tree = heavy_root().join("registry");
     let mut levers = Levers::default();
-    let distributions =
-        || pypi_files::read_tree(&tree.join("pypi")).unwrap_or_else(|why| panic!("{why}"));
+    // Both Python flavours serve the same files under the same routes.
+    let wheels = |levers: &mut Levers| {
+        let distributions =
+            pypi_files::read_tree(&tree.join("pypi")).unwrap_or_else(|why| panic!("{why}"));
+        let urls = pypi_files::mount(server, &distributions);
+        let anchored = distributions
+            .iter()
+            .find(|d| d.sha256 == fixture.probe.sha256);
+        let anchored = anchored.unwrap_or_else(|| {
+            panic!(
+                "{}: the probe anchors no wheel of the tree",
+                fixture.fixture
+            )
+        });
+        levers.anchored = Some(anchored.url());
+        levers.packages.extend(urls.iter().cloned());
+        (distributions, urls)
+    };
     for registry in &fixture.registries {
         match registry.as_str() {
             "pypi" => {
-                let distributions = distributions();
-                let package = |d: &pypi_files::Distribution| (d.url(), d.sha256.clone());
-                levers.packages = distributions.iter().map(package).collect();
-                levers
-                    .rewrites
-                    .extend(pypi_files::mount(server, &distributions));
+                let (distributions, urls) = wheels(&mut levers);
+                levers.downloader = true;
+                levers.rewrites.extend(urls);
                 levers
                     .rewrites
                     .extend(pypi_index::mount(server, &distributions));
             }
             "pypi-pip" => {
-                let distributions = distributions();
-                pypi_files::mount(server, &distributions);
+                let (distributions, _) = wheels(&mut levers);
                 let index = pypi_index::mount_pip_mode(server, &distributions);
                 // For a fixture that reads the index through `envsubst`.
                 levers.repo_env.push(("PIP_INDEX_URL".into(), index));
             }
             "goproxy" => {
-                goproxy::mount(server, &tree.join("goproxy")).unwrap_or_else(|why| panic!("{why}"));
+                let modules = goproxy::mount(server, &tree.join("goproxy"))
+                    .unwrap_or_else(|why| panic!("{why}"));
+                levers
+                    .packages
+                    .extend(modules.into_iter().map(|m| m.zip_url));
                 // The fixture's module from the stub; gazelle's own tool
                 // modules from the real proxy, which `go` tries after a 404.
                 let list = format!("{},https://{}", goproxy::goproxy(server), goproxy::HOST);
@@ -201,48 +331,93 @@ fn mount(fixture: &Fixture, server: &FixtureServer) -> Levers {
             other => panic!("{}: unknown registry {other:?}", fixture.fixture),
         }
     }
+    levers.packages.sort();
+    levers.packages.dedup();
     levers
 }
 
-/// Whether a cell of this process has already fetched the fixture
-/// packages cold; held by that cell while it does.
-static COLD_FETCH: Mutex<bool> = Mutex::new(false);
-
-/// Make the first cell of this process that fetches `packages` through
-/// Bazel's downloader fetch them from the fixture server. A persistent
-/// repository cache answers a checksummed download with no request at
-/// all, so on a warm cache no baseline would ever exercise the rewrite and
-/// the stub, and a broken one would pass.
-///
-/// For that first cell the packages are removed from the cache and the
-/// guard is returned: the caller holds it until its fetch is done and
-/// asserted. Every other such cell waits here meanwhile, so none can read
-/// a file while it is removed or put one back before the first cell asked
-/// for it; they get `None` and may find the packages cached again.
-fn cold_fetch(
-    repository_cache: &Path,
-    packages: &[(String, String)],
-) -> Option<MutexGuard<'static, bool>> {
-    if packages.is_empty() {
-        return None;
-    }
-    let mut done = COLD_FETCH.lock().unwrap_or_else(PoisonError::into_inner);
-    if *done {
-        return None;
-    }
-    for (_, sha256) in packages {
-        let blob = repository_cache
-            .join("content_addressable/sha256")
-            .join(sha256);
-        match std::fs::remove_dir_all(&blob) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => panic!("evict {}: {e}", blob.display()),
-        }
-    }
-    *done = true;
-    Some(done)
+/// Where a Bazel repository cache keeps the download with this digest.
+fn cache_entry(repository_cache: &Path, sha256: &str) -> PathBuf {
+    repository_cache
+        .join("content_addressable/sha256")
+        .join(sha256)
 }
+
+/// One cell's hold on a shared repository cache, from the moment it
+/// removed a download from it until its own fetch of that download is
+/// done and asserted.
+struct ColdFetch {
+    /// The lock is the open file: closing it releases the cache.
+    _lock: std::fs::File,
+}
+
+/// Make this cell fetch the download `sha256` from its origin. A
+/// persistent repository cache answers a checksummed download with no
+/// request at all, so on a warm cache a baseline would exercise neither
+/// the rewrite nor the stub, and a broken one would pass. Every fixture
+/// names its packages in a file of its own (a `uv.lock` states the URL of
+/// each wheel), so every cell proves its own fetch: none rides on what
+/// another one asked for.
+///
+/// A private cache (one under the cell's scratch root) is empty by
+/// construction: `None`, and nothing is touched. On a shared cache the
+/// one download is removed and the cache is held until the returned value
+/// is dropped: another cell that wants to evict the same download waits
+/// here, so it can neither remove the file while this cell's Bazel reads
+/// it nor find it put back before it asked. The hold is a file lock
+/// beside the cache, so it also covers a second test process on the same
+/// cache root. Only a download that every cell fetches while it holds the
+/// cache may be evicted: a cell that read it later, outside its hold,
+/// would race with the next eviction. (That rules out `spdep`, which the
+/// rules_python fixtures fetch only when the consumer is built.)
+fn cold_fetch(scratch_root: &Path, repository_cache: &Path, sha256: &str) -> Option<ColdFetch> {
+    if repository_cache.starts_with(scratch_root) {
+        return None;
+    }
+    let mut name = repository_cache
+        .file_name()
+        .expect("a named repository cache")
+        .to_os_string();
+    name.push(".evict.lock");
+    let path = repository_cache.with_file_name(name);
+    // Never truncated: another cell may hold the lock on it right now.
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    lock.lock()
+        .unwrap_or_else(|e| panic!("lock {}: {e}", path.display()));
+    let entry = cache_entry(repository_cache, sha256);
+    match std::fs::remove_dir_all(&entry) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => panic!("evict {}: {e}", entry.display()),
+    }
+    Some(ColdFetch { _lock: lock })
+}
+
+/// The `hosts` of a report from the fixture server's own list, which
+/// takes the first path segment of each request for the host. A request
+/// a tool sent straight to the loopback origin has no host segment (pip's
+/// index is at `<origin>/pip-mode/simple/`): it was a request to
+/// `127.0.0.1`, and is reported as that.
+fn reported_hosts(server_hosts: Vec<String>) -> Vec<String> {
+    let pip_root = pypi_index::PIP_MODE_PREFIX.split('/').next();
+    let host = |host: String| {
+        if Some(host.as_str()) == pip_root {
+            LOOPBACK.to_string()
+        } else {
+            host
+        }
+    };
+    let hosts: BTreeSet<String> = server_hosts.into_iter().map(host).collect();
+    hosts.into_iter().collect()
+}
+
+/// How a report names the fixture server where a tool asked it directly.
+const LOOPBACK: &str = "127.0.0.1";
 
 /// A downloader config that sends exactly `urls` to the fixture server on
 /// `port` and leaves every other download alone. The pattern is matched
@@ -391,6 +566,19 @@ fn fetched_toolchains(cell: &Cell, fixture: &Fixture) -> BTreeMap<String, Vec<St
     found
 }
 
+/// Why a baseline does not run in the offline phase or in the
+/// real-registry cell; `None` in an ordinary cell. Its narrow rewrite
+/// leaves every real host reachable, which is what the offline phase
+/// forbids, and its packages exist on no real registry. Without this a
+/// baseline would run as usual there and leave a `ran` report under the
+/// name of the ordinary cell.
+fn no_baseline_cell(offline: bool, real_registries: bool) -> Option<&'static str> {
+    (offline || real_registries).then_some(
+        "a baseline canary fetches its ruleset from the real origins and its packages from \
+         the fixture server",
+    )
+}
+
 /// The baseline of the fixture `test` builds.
 fn baseline(test: &str) {
     let fixture = fixtures().into_iter().find(|f| f.test == test);
@@ -406,6 +594,10 @@ fn baseline(test: &str) {
         );
         return;
     };
+    if let Some(why) = no_baseline_cell(env::offline(), env::real_registries()) {
+        probe_report::skip_na(&cell.report, why);
+        return;
+    }
     cell.copy_fixture(&fixture.fixture);
     let server = FixtureServer::start();
     let levers = mount(&fixture, &server);
@@ -431,7 +623,18 @@ fn baseline(test: &str) {
     }
     cell.options.repo_env.extend(levers.repo_env);
 
-    let cold = cold_fetch(&cell.scratch.repository_cache, &levers.packages);
+    // Where Bazel's downloader fetches the anchored wheel, a shared
+    // repository cache must not answer for it. Held until the fetch is
+    // asserted; a cell that returns early releases it on the way out.
+    let scratch = &cell.scratch;
+    let evict = || {
+        cold_fetch(
+            &scratch.root,
+            &scratch.repository_cache,
+            &fixture.probe.sha256,
+        )
+    };
+    let cold = levers.downloader.then(evict).flatten();
 
     // The first command fetches everything tier 0 needs. A host that does
     // not answer is this machine's network, not the fixture.
@@ -449,12 +652,9 @@ fn baseline(test: &str) {
         sha256: &fixture.probe.sha256,
     };
     cell.tier0(anchor);
-    let fetched_cold = cold.is_some();
-    if fetched_cold {
-        // The cache held none of the packages: Bazel fetched the anchored
-        // file through the rewrite, from the fixture server.
-        let anchored = |(_, sha256): &&(String, String)| *sha256 == fixture.probe.sha256;
-        let (url, _) = levers.packages.iter().find(anchored).expect("the anchor");
+    if let Some(url) = &levers.anchored {
+        // The wheel tier 0 just checked came from the fixture server:
+        // through the rewrite, or because pip was pointed at the stub.
         server.assert_requested(url, test);
     }
     drop(cold);
@@ -475,20 +675,58 @@ fn baseline(test: &str) {
     if spec.proof >= 2 {
         cell.tier2(&fixture.consumer);
     }
+    if !fixture.test_targets.is_empty() {
+        // The tests that must be green before socket-patch runs.
+        let mut args = vec!["--test_output=errors"];
+        args.extend(fixture.test_targets.iter().map(String::as_str));
+        cell.bazel_ok("test", &args);
+    }
+    // The lock as the builds left it. The `mod` oracle below runs with
+    // `--lockfile_mode=off` and does not write it.
+    let lock = (fixture.system() == System::Bzlmod).then(|| {
+        let bytes = cell.module_lock();
+        let bytes = bytes.unwrap_or_else(|| panic!("{test}: Bazel wrote no {MODULE_LOCK}"));
+        let lock = ModuleLock::parse(&bytes);
+        // A lock the reader cannot read would be reported as recording
+        // nothing.
+        assert!(
+            lock.extensions().is_some(),
+            "{test}: {MODULE_LOCK} is not a lock the reader knows: {lock:?}"
+        );
+        lock
+    });
+    if let Some(claim) = &fixture.lock {
+        let lock = lock.as_ref().expect("a lock claim is for a Bzlmod fixture");
+        if let Err(why) = claim.check(lock) {
+            panic!("{test}: {MODULE_LOCK}: {why}");
+        }
+    }
     let resolved = resolved(&cell, &fixture);
 
     let requests = server.requests().len();
-    cell.report.hosts = server.hosts();
+    let asked = |url: &String| !server.requests_for(url).is_empty();
+    let fetched_cold = levers.packages.iter().any(asked);
+    cell.report.hosts = reported_hosts(server.hosts());
     cell.report.direct_network = true;
     cell.report.resolved = resolved;
     cell.report
         .detail("fixture", fixture.fixture.as_str())
         .detail("proof", spec.proof)
         .detail("fetch", fixture.fetch.as_str())
+        .detail("hosted_fetch", fixture.hosted_fetch())
         .detail("declared_hosts", fixture.hosts.clone())
         .detail("toolchains", serde_json::to_value(toolchains).unwrap())
+        .detail("test_targets", fixture.test_targets.clone())
         .detail("packages_fetched_cold", fetched_cold)
         .detail("fixture_server_requests", requests);
+    if let Some(lock) = &lock {
+        let facts = lock.facts().unwrap_or_default();
+        let facts: BTreeSet<&str> = facts.iter().map(|facts| facts.id.raw.as_str()).collect();
+        cell.report
+            .detail("lock_file_version", lock.lock_file_version())
+            .detail("recorded_extensions", recorded_extensions(lock))
+            .detail("lock_facts", serde_json::to_value(facts).unwrap());
+    }
     cell.close().ran();
 }
 
@@ -624,10 +862,51 @@ fn heavy_matrix_lists_every_fixture_and_every_test() {
                 "{at}: {}",
                 fixture.test
             );
+            let fetcher = |who: &str| matches!(who, "downloader" | "tool");
+            assert!(fetcher(&fixture.fetch), "{at}: {name}: fetch");
             assert!(
-                matches!(fixture.fetch.as_str(), "downloader" | "tool"),
-                "{at}: {name}: fetch"
+                fetcher(fixture.hosted_fetch()),
+                "{at}: {name}: hosted_fetch"
             );
+            // Stated only where it differs: one spelling per fact.
+            assert_ne!(
+                fixture.hosted_fetch.as_ref(),
+                Some(&fixture.fetch),
+                "{at}: {name}: hosted_fetch repeats fetch"
+            );
+            for target in &fixture.test_targets {
+                assert!(
+                    target.starts_with("//") && target.contains(':'),
+                    "{at}: {name}: test target {target:?}"
+                );
+            }
+            // A test target and a lock claim are about what a build does:
+            // a cell that stops at the fetch could check neither.
+            let builds = fixture.cells.iter().all(|spec| spec.proof >= 1);
+            assert!(
+                builds || (fixture.test_targets.is_empty() && fixture.lock.is_none()),
+                "{at}: {name}: a fetch-only cell beside test_targets or lock"
+            );
+            if let Some(claim) = &fixture.lock {
+                // Under WORKSPACE the lock is Bazel's placeholder.
+                assert_eq!(system, System::Bzlmod, "{at}: {name}: lock");
+                if let Err(why) = split_extension(claim.extension()) {
+                    panic!("{at}: {name}: lock: {why}");
+                }
+                let files = match claim {
+                    LockSpec::Records { files, .. } => files.as_slice(),
+                    LockSpec::NotRecorded(_) => &[],
+                };
+                assert!(
+                    files.iter().all(|file| fixture.dir().join(file).is_file()),
+                    "{at}: {name}: lock: {files:?}"
+                );
+                assert_eq!(
+                    files.is_empty(),
+                    matches!(claim, LockSpec::NotRecorded(_)),
+                    "{at}: {name}: a recorded extension names the files it records"
+                );
+            }
             assert!(
                 !fixture.cells.is_empty() && !fixture.pins.is_empty() && !fixture.shape.is_empty(),
                 "{at}: {name}"
@@ -679,6 +958,23 @@ fn heavy_matrix_lists_every_fixture_and_every_test() {
     );
 }
 
+/// The Rust target triples of the platforms heavy cells run on: macOS
+/// arm64, Linux x86_64 and Windows x86_64 in CI, and the Linux arm64
+/// containers of a developer's machine.
+const CELL_TRIPLES: &[&str] = &[
+    "aarch64-apple-darwin",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-pc-windows-msvc",
+    "x86_64-unknown-linux-gnu",
+];
+
+/// Whether a `bazel_dep` is a ruleset, whose version the fixture must pin
+/// and the canary must report. `platforms` and the like carry no rules a
+/// lane depends on.
+fn is_ruleset(module: &str) -> bool {
+    module.starts_with("rules_") || matches!(module, "gazelle" | "aspect_rules_py")
+}
+
 #[test]
 fn heavy_fixtures_follow_the_fixture_conventions() {
     let dep =
@@ -687,6 +983,13 @@ fn heavy_fixtures_follow_the_fixture_conventions() {
         r#"single_version_override\(\s*module_name = "([^"]+)",\s*version = "([^"]+)""#,
     )
     .unwrap();
+    // `use_extension("@<repo>//<label>", "<name>")`, as label and name.
+    let extension =
+        regex::Regex::new(r#"use_extension\(\s*"@[^/"]*(//[^"]+)",\s*"([^"]+)""#).unwrap();
+    let compiled = regex::Regex::new(r#"compile_pip_requirements\(\s*name = "([^"]+)""#).unwrap();
+    // Where a committed file points pip: the placeholder origin, then the
+    // route of the pip-mode index.
+    let pip_index = format!("{ORIGIN_PLACEHOLDER}/{}", pypi_index::PIP_MODE_PREFIX);
     for fixture in fixtures() {
         let name = &fixture.fixture;
         let mut tree = Vec::new();
@@ -709,6 +1012,39 @@ fn heavy_fixtures_follow_the_fixture_conventions() {
             assert!(
                 build.contains(target),
                 "{name}: BUILD.bazel has no {target}"
+            );
+        }
+        // A test target is a rule of the root package, or the `.test` a
+        // macro of that name declares (`compile_pip_requirements`).
+        for target in &fixture.test_targets {
+            let rule = target.strip_prefix("//:").unwrap_or_default();
+            let stem = rule.rsplit_once('.').map_or(rule, |(stem, _)| stem);
+            let declared = [rule, stem]
+                .iter()
+                .any(|rule| !rule.is_empty() && build.contains(&format!("name = \"{rule}\"")));
+            assert!(declared, "{name}: BUILD.bazel declares no {target}");
+        }
+        // The lock check of `compile_pip_requirements` is what such a
+        // fixture is for: the baseline runs it. It resolves with pip, which
+        // no downloader rewrite reaches, so the rule names the pip index.
+        for rule in compiled.captures_iter(&build) {
+            let check = format!("//:{}.test", &rule[1]);
+            assert!(
+                fixture.test_targets.contains(&check),
+                "{name}: `test_targets` lacks {check}"
+            );
+            assert!(
+                build.contains(&format!("\"--index-url={pip_index}\"")),
+                "{name}: compile_pip_requirements without the pip index would ask pypi.org"
+            );
+        }
+        // pip is pointed at the index of the fixture server, or it would
+        // look the synthetic packages up on the real one.
+        if fixture.registries.iter().any(|r| r == "pypi-pip") {
+            let indexed = |rel: &String| text(rel).is_some_and(|file| file.contains(&pip_index));
+            assert!(
+                fixture.substitute.iter().any(indexed),
+                "{name}: no substituted file names {pip_index}"
             );
         }
         // Bazel owns the lock and the convenience links.
@@ -759,6 +1095,38 @@ fn heavy_fixtures_follow_the_fixture_conventions() {
                 "{name}: single_version_override of {ruleset}"
             );
         }
+        // Every ruleset the fixture depends on is pinned, not only the one
+        // it is named for: Bazel 9.3.2 lifts a bare `rules_python` 1.0.0
+        // to 1.7.0, and the canary checks and reports the pins alone.
+        for ruleset in deps.keys().filter(|dep| is_ruleset(dep)) {
+            assert!(
+                fixture.pins.contains_key(ruleset),
+                "{name}: bazel_dep {ruleset} has no `pins` entry"
+            );
+        }
+        // rules_rs marks every crate incompatible with a target platform
+        // that `platform_triples` does not list: the list covers every
+        // platform a heavy cell runs on.
+        if module.contains("platform_triples") {
+            for triple in CELL_TRIPLES {
+                assert!(
+                    module.contains(&format!("\"{triple}\"")),
+                    "{name}: platform_triples lacks {triple}"
+                );
+            }
+        }
+        // A lock claim names an extension the fixture uses.
+        if let Some(claim) = &fixture.lock {
+            let used: BTreeSet<String> = extension
+                .captures_iter(&module)
+                .map(|c| format!("{}%{}", &c[1], &c[2]))
+                .collect();
+            assert!(
+                used.contains(claim.extension()),
+                "{name}: lock: MODULE.bazel uses {used:?}, not {}",
+                claim.extension()
+            );
+        }
         // BCR lists no rules_python 2.5.0, only its release candidates.
         assert_ne!(
             fixture.pins.get("rules_python").map(String::as_str),
@@ -797,7 +1165,14 @@ fn heavy_registry_tree_is_the_one_the_fixtures_pin() {
     // every probe anchor of a Python fixture is one too.
     let wheels = pypi_files::read_tree(&registry.join("pypi")).unwrap();
     let known: BTreeSet<&str> = wheels.iter().map(|d| d.sha256.as_str()).collect();
+    let served: BTreeSet<String> = wheels.iter().map(pypi_files::Distribution::url).collect();
     let digest = regex::Regex::new(r"sha256[:=]([0-9a-f]{64})").unwrap();
+    let file_url = regex::Regex::new(&format!(
+        r#"https://{}/[^\s"'#]*"#,
+        regex::escape(pypi_files::HOST)
+    ))
+    .unwrap();
+    let mut urls = 0;
     for fixture in fixtures()
         .into_iter()
         .filter(|f| f.registries.iter().any(|r| r.starts_with("pypi")))
@@ -809,11 +1184,24 @@ fn heavy_registry_tree_is_the_one_the_fixtures_pin() {
         );
         let mut tree = Vec::new();
         files(&fixture.dir(), "", &mut tree);
-        for (path, bytes) in tree
-            .iter()
-            .filter(|(path, _)| path.ends_with(".txt") || path.ends_with(".lock"))
-        {
-            for hit in digest.captures_iter(&String::from_utf8_lossy(bytes)) {
+        for (path, bytes) in &tree {
+            let text = String::from_utf8_lossy(bytes);
+            // A file URL a lock names (a `uv.lock` wheel) is one the
+            // fixture server serves and the narrow rewrite lists: any
+            // other would be fetched from the real host, or not at all.
+            for url in file_url.find_iter(&text) {
+                urls += 1;
+                assert!(
+                    served.contains(url.as_str()),
+                    "{}: {path} names {}, which the registry tree does not serve",
+                    fixture.fixture,
+                    url.as_str()
+                );
+            }
+            if !(path.ends_with(".txt") || path.ends_with(".lock")) {
+                continue;
+            }
+            for hit in digest.captures_iter(&text) {
                 assert!(
                     known.contains(&hit[1]),
                     "{}: {path} pins {}, which the registry tree does not serve",
@@ -823,6 +1211,8 @@ fn heavy_registry_tree_is_the_one_the_fixtures_pin() {
             }
         }
     }
+    // The uv fixtures do name file URLs: the check above saw them.
+    assert!(urls > 0, "no fixture names a {} URL", pypi_files::HOST);
 }
 
 #[test]
@@ -864,4 +1254,213 @@ fn the_narrow_rewrite_names_exact_urls_and_resolved_versions_are_read_strictly()
         &rule.replace("v0.35.0", "v10.35.0"),
         "0.35.0"
     ));
+}
+
+#[test]
+fn a_cold_fetch_evicts_one_download_of_a_shared_cache_and_holds_the_cache() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().unwrap();
+    let scratch = dir.path().join("scratch");
+    let private = scratch.join("cache");
+    let shared = dir.path().join("shared/repos");
+    let (anchored, other) = ("a".repeat(64), "b".repeat(64));
+    let put = |cache: &Path, sha256: &str| {
+        let entry = cache_entry(cache, sha256);
+        std::fs::create_dir_all(&entry).unwrap();
+        std::fs::write(entry.join("file"), b"wheel").unwrap();
+    };
+    let cached = |cache: &Path, sha256: &str| cache_entry(cache, sha256).join("file").is_file();
+    for cache in [&private, &shared] {
+        put(cache, &anchored);
+        put(cache, &other);
+    }
+
+    // A cache under the scratch root is the cell's own: nothing is
+    // removed and nothing is held.
+    assert!(cold_fetch(&scratch, &private, &anchored).is_none());
+    assert!(cached(&private, &anchored));
+
+    // On a shared cache the one download goes, and no other.
+    let first = cold_fetch(&scratch, &shared, &anchored).expect("a hold on the shared cache");
+    assert!(!cached(&shared, &anchored) && cached(&shared, &other));
+    // Its Bazel fetches the file and stores it again.
+    put(&shared, &anchored);
+
+    // A second cell waits for the first: it must not remove the file
+    // while the first one's fetch may be reading it.
+    let (taken, second) = mpsc::channel();
+    let waiter = {
+        let (scratch, shared, anchored) = (scratch.clone(), shared.clone(), anchored.clone());
+        std::thread::spawn(move || {
+            let held = cold_fetch(&scratch, &shared, &anchored);
+            taken.send(held.is_some()).unwrap();
+        })
+    };
+    let early = second.recv_timeout(Duration::from_millis(300));
+    assert!(early.is_err(), "a second cell took the cache while held");
+    assert!(cached(&shared, &anchored));
+    drop(first);
+    let held = second.recv_timeout(Duration::from_secs(60));
+    assert_eq!(held, Ok(true), "the second cell never got the cache");
+    waiter.join().unwrap();
+    assert!(!cached(&shared, &anchored) && cached(&shared, &other));
+
+    // A download that is not in the cache is nothing to evict.
+    assert!(cold_fetch(&scratch, &shared, &anchored).is_some());
+}
+
+#[test]
+fn a_report_lists_hosts_and_never_a_loopback_route_prefix() {
+    use crate::bazel_build_common::registry::pypi_files::fetch;
+
+    let tree = heavy_root().join("registry");
+    let wheels = pypi_files::read_tree(&tree.join("pypi")).unwrap();
+    let server = FixtureServer::start();
+    pypi_files::mount(&server, &wheels);
+    let index = pypi_index::mount(&server, &wheels);
+    let pip_index = pypi_index::mount_pip_mode(&server, &wheels);
+    let modules = goproxy::mount(&server, &tree.join("goproxy")).unwrap();
+    // One request per kind of route a heavy baseline mounts: the two
+    // index flavours, a wheel as pip is linked to it, a Go module, the
+    // checksum database, and a miss.
+    let wheel = wheels[0]
+        .url()
+        .replacen("https://", &format!("{}/", server.loopback_origin()), 1);
+    let sumdb = format!(
+        "{}/lookup/example.com/upstream@v1.0.0",
+        goproxy::sumdb(&server)
+    );
+    let pip_page = format!("{pip_index}/{}/", wheels[0].project);
+    let pip_miss = format!("{pip_index}/requests/");
+    for (url, status) in [
+        (index[0].as_str(), 200),
+        (pip_page.as_str(), 200),
+        (pip_miss.as_str(), 404),
+        (wheel.as_str(), 200),
+        (modules[0].zip_url.as_str(), 200),
+        (sumdb.as_str(), 200),
+    ] {
+        assert_eq!(fetch(&server, url).0, status, "{url}");
+    }
+
+    let raw = server.hosts();
+    let pip_root = pypi_index::PIP_MODE_PREFIX.split('/').next().unwrap();
+    assert!(raw.iter().any(|host| host == pip_root), "{raw:?}");
+    let hosts = reported_hosts(raw);
+    let real = [
+        pypi_index::HOST,
+        pypi_files::HOST,
+        goproxy::HOST,
+        goproxy::SUMDB_HOST,
+    ];
+    let mut expected: Vec<&str> = real.to_vec();
+    expected.push(LOOPBACK);
+    expected.sort_unstable();
+    assert_eq!(hosts, expected);
+    // The mapping is by whole name, and it merges with a loopback host
+    // that is already listed.
+    assert_eq!(
+        reported_hosts(vec![
+            LOOPBACK.into(),
+            pip_root.into(),
+            format!("{pip_root}.example.org")
+        ]),
+        [LOOPBACK.to_string(), format!("{pip_root}.example.org")]
+    );
+}
+
+#[test]
+fn a_lock_claim_is_read_by_label_and_name_on_every_bazel_line() {
+    let sha = "0".repeat(64);
+    // What Bazel 7.7.2 writes (lock version 13) and what 8.x and 9.x
+    // write (`+` names; version 28 keeps the inputs in one list).
+    let v13 = format!(
+        r#"{{"lockFileVersion": 13, "registryFileHashes": {{}}, "moduleExtensions": {{
+            "@@gazelle~//:extensions.bzl%go_deps": {{"general": {{
+                "bzlTransitiveDigest": "d", "usagesDigest": "u",
+                "recordedFileInputs": {{"@@//go.mod": "{sha}", "@@//go.sum": "{sha}",
+                                        "@@rules_go~//go.mod": "{sha}"}},
+                "recordedDirentsInputs": {{}}, "envVariables": {{}},
+                "generatedRepoSpecs": {{}}}}}},
+            "@@rules_go~//go:extensions.bzl%go_sdk": {{"os:osx,arch:aarch64": {{
+                "bzlTransitiveDigest": "d", "usagesDigest": "u",
+                "recordedFileInputs": {{}}, "recordedDirentsInputs": {{}},
+                "envVariables": {{}}, "generatedRepoSpecs": {{}}}}}}}}}}"#
+    );
+    let v28 = format!(
+        r#"{{"lockFileVersion": 28, "registryFileHashes": {{}}, "moduleExtensions": {{
+            "@@gazelle+//:extensions.bzl%go_deps": {{"general": {{
+                "bzlTransitiveDigest": "d", "usagesDigest": "u",
+                "recordedInputs": ["FILE:@@//go.mod {sha}", "FILE:@@//go.sum {sha}",
+                                   "REPO_MAPPING:gazelle+,bazel_tools bazel_tools"],
+                "generatedRepoSpecs": {{}}}}}}}},
+            "facts": {{"@@rules_python+//python/extensions:pip.bzl%pip": {{"fact_version": "v2"}}}}}}"#
+    );
+    let records = |files: &[&str]| LockSpec::Records {
+        extension: "//:extensions.bzl%go_deps".to_string(),
+        files: files.iter().map(|file| file.to_string()).collect(),
+    };
+    let absent = |extension: &str| LockSpec::NotRecorded(extension.to_string());
+    for text in [&v13, &v28] {
+        let lock = ModuleLock::parse(text.as_bytes());
+        assert!(lock.extensions().is_some(), "{lock:?}");
+        records(&["go.mod", "go.sum"]).check(&lock).unwrap();
+        // A file of another module is no record of the workspace's file,
+        // and a file the extension never read is not recorded.
+        let missing = records(&["go.mod", "go.work"]).check(&lock).unwrap_err();
+        assert!(missing.contains("does not record go.work"), "{missing}");
+        let recorded = absent("//:extensions.bzl%go_deps")
+            .check(&lock)
+            .unwrap_err();
+        assert!(recorded.contains("is recorded: 1 entries"), "{recorded}");
+        absent("//crate_universe:extension.bzl%crate")
+            .check(&lock)
+            .unwrap();
+        // The label counts, not the name alone.
+        let other = LockSpec::Records {
+            extension: "//go:extensions.bzl%go_deps".to_string(),
+            files: vec!["go.mod".to_string()],
+        };
+        assert!(other.check(&lock).unwrap_err().contains("no entry of"));
+    }
+    let v13_lock = ModuleLock::parse(v13.as_bytes());
+    assert_eq!(
+        recorded_extensions(&v13_lock),
+        [
+            "@@gazelle~//:extensions.bzl%go_deps",
+            "@@rules_go~//go:extensions.bzl%go_sdk"
+        ]
+    );
+    // Facts alone are a record too.
+    let facts = absent("//python/extensions:pip.bzl%pip")
+        .check(&ModuleLock::parse(v28.as_bytes()))
+        .unwrap_err();
+    assert!(facts.contains("0 entries, 1 facts"), "{facts}");
+    // A lock that cannot be read proves no claim, in either direction.
+    for claim in [records(&["go.mod"]), absent("//:extensions.bzl%go_deps")] {
+        let unread = claim.check(&ModuleLock::parse(b"not json")).unwrap_err();
+        assert!(unread.contains("cannot be read"), "{unread}");
+    }
+    assert!(split_extension("go_deps").is_err());
+    assert!(split_extension("@gazelle//:extensions.bzl%go_deps").is_err());
+
+    // The two spellings of a claim in a MATRIX.json.
+    let parse = |text: &str| serde_json::from_str::<LockSpec>(text);
+    let claim = parse(r#"{"records": {"extension": "//:e.bzl%e", "files": ["go.mod"]}}"#);
+    assert_eq!(claim.unwrap().extension(), "//:e.bzl%e");
+    let claim = parse(r#"{"not_recorded": "//:e.bzl%e"}"#).unwrap();
+    assert!(matches!(claim, LockSpec::NotRecorded(_)));
+    assert!(parse(r#"{"records": {"extension": "//:e.bzl%e"}}"#).is_err());
+    assert!(parse(r#"{"recorded": "//:e.bzl%e"}"#).is_err());
+}
+
+#[test]
+fn a_baseline_has_no_offline_and_no_real_registry_cell() {
+    assert_eq!(no_baseline_cell(false, false), None);
+    for (offline, real_registries) in [(true, false), (false, true), (true, true)] {
+        let why = no_baseline_cell(offline, real_registries);
+        assert!(why.is_some_and(|why| why.contains("fixture server")));
+    }
 }

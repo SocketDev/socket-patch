@@ -7,7 +7,7 @@
       "test": "bazel_canary_baseline_aspect_rules_py_bzlmod_e9",
       "system": "bzlmod",
       "shape": "uv.project(lock =, pyproject =): the watched uv lock of the hub",
-      "pins": {"aspect_rules_py": "1.13.0"},
+      "pins": {"aspect_rules_py": "1.13.0", "rules_python": "1.7.0"},
       "registries": ["pypi"],
       "fetch": "downloader",
       "hosts": ["bcr.bazel.build", "github.com", "pypi.org", "files.pythonhosted.org"],
@@ -16,7 +16,7 @@
       "toolchains": [],
       "cells": [
         {"bazel": "9.3.2", "proof": 2, "tier": "nightly", "evidence": "python-uv-pycross-aspect Y4.a (as113-b9)"},
-        {"bazel": "8.8.2", "proof": 2, "tier": "nightly", "evidence": "python-uv-pycross-aspect Y4.a (as113-b8)"}
+        {"bazel": "8.8.2", "proof": 2, "tier": "nightly", "evidence": "python-uv-pycross-aspect Y4.a (as113-b8) ran with rules_python 1.0.0; unverified with the pinned 1.7.0"}
       ]
     },
     {
@@ -24,7 +24,7 @@
       "test": "bazel_canary_baseline_aspect_rules_py_bzlmod_e8_canary",
       "system": "bzlmod",
       "shape": "uv.lockfile(src =) on a release that never watches the lock: the refused shape, kept for the stale-build canary",
-      "pins": {"aspect_rules_py": "1.8.4"},
+      "pins": {"aspect_rules_py": "1.8.4", "rules_python": "1.0.0"},
       "registries": ["pypi"],
       "fetch": "downloader",
       "hosts": ["bcr.bazel.build", "github.com", "pypi.org", "files.pythonhosted.org"],

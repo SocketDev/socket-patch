@@ -49,6 +49,7 @@
       "probe": {"label": "cfg-if-1.0.0//:src/lib.rs", "sha256": "54b0f108b0dc48a077c52c0bcd22b64ef4de083e5e2b7d405e50ae4d78224f1b"},
       "consumer": "CFG_IF=ok",
       "toolchains": ["rust_host_tools"],
+      "lock": {"not_recorded": "//crate_universe:extensions.bzl%crate"},
       "cells": [
         {"bazel": "7.7.2", "proof": 2, "tier": "nightly", "evidence": "rules-rust B2 cargo (m56-b7)"}
       ]
