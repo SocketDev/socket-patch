@@ -343,8 +343,12 @@ mod tests {
     }
 
     /// The hash file rules_js commits for its own repository at v3.6.0,
-    /// and the 21 files it names, one of them a binary tarball: every
-    /// `path=hash` line is `hash_bytes` of the file.
+    /// and the 21 files it names: every `path=hash` line is `hash_bytes`
+    /// of the file. Two of the files tell the byte model from the UTF-16
+    /// one without any campaign probe. One is a binary tarball, which has
+    /// no UTF-16 reading. The other is a `package.json` with an `ß` in it,
+    /// and the value rules_js stored for it is not its hash over UTF-16
+    /// units.
     #[test]
     fn reproduces_the_21_entries_of_the_upstream_rules_js_hash_file() {
         let dir = hash_file_dir();
@@ -356,17 +360,34 @@ mod tests {
             .map(|line| line.split_once('=').expect("a path=hash line"))
             .collect();
         assert_eq!(entries.len(), 21);
-        let mut binary = 0;
+        let (mut binary, mut non_ascii) = (0, Vec::new());
         for (path, stored) in entries {
             // A fixture is named after its workspace path, `/` as `__`.
             let fixture = dir
                 .join("inputs")
                 .join(format!("{}.in", path.replace('/', "__")));
             let bytes = std::fs::read(&fixture).expect("read a hashed input");
-            binary += usize::from(std::str::from_utf8(&bytes).is_err());
             assert_eq!(hash_bytes(&bytes).to_string(), stored, "{path}");
+            match std::str::from_utf8(&bytes) {
+                Err(_) => binary += 1,
+                Ok(text) if text.is_ascii() => {}
+                Ok(text) => {
+                    let units = text.encode_utf16().fold(0i32, |h, unit| {
+                        h.wrapping_mul(31).wrapping_add(i32::from(unit))
+                    });
+                    assert_ne!(units.to_string(), stored, "{path}");
+                    non_ascii.push((path, units));
+                }
+            }
         }
         assert_eq!(binary, 1, "the tarball is the one input that is not text");
+        assert_eq!(
+            non_ascii,
+            [(
+                "npm/private/test/vendored/is-odd/package.json",
+                -2_025_121_710
+            )]
+        );
 
         // The file's own name is a hash too: base64 of the decimal hash of
         // the hub name joined to the lock label.

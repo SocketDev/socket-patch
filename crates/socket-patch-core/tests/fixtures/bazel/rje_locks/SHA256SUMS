@@ -1,6 +1,6 @@
 1f13769166544b793708a5330bc308adb099240a90bac99ad6134541a8a8fc6a  .gitattributes
-711b79cbe182e5a9bee39949abc99635b5393359aa234b5664d47bf1cfcf8b6c  README.md
-6f99dbf62729aa7167e33a3c4ac861ea637f53026397566d22168ddf96e23b74  expected.tsv
+5eb254e890566c96300879a00b753fc96ba37ff933eb13853f490a5da2c1caa6  README.md
+063fcd32e3e334a8637d150da729a082bdce9373cf82ee67c1673cca7a9cdab1  expected.tsv
 481f82b67800b58a9f8b89032826cb283de66b402ec27a74547fefae03e902e6  hash_file/rules_js-v3.6.0/inputs/.npmrc.in
 eec3dbfd361fb2838a67c96ea287b1d76bc00ff528ea7c48c28b45fd646ba6cb  hash_file/rules_js-v3.6.0/inputs/js__private__coverage__bundle__package.json.in
 af8193dad4f51259916482f60ad257ce3a1e4a80e403a9b7a19143afa912db7b  hash_file/rules_js-v3.6.0/inputs/js__private__devserver__src__package.json.in
@@ -35,6 +35,7 @@ d23c65ec14b05204a87596f4e4a1fc0ade3866d23208c87896bf60ca3a159df5  probe/hosted-r
 7cbe21cb80e188936766aeb370f0481a8b674b83dbe4bfe481256900ed9e41b5  probe/m4-lock-rje4.5-v1-crlf.json
 b8a0308ae16abc41b3963527b7495161ad5dbffc0cd261ee0e8ae28102a9547d  probe/m4-lock-rje5.3-v2-crlf-nonascii.json
 97d3ecd5513827f1bc8abb70db477459eaa465d072e56928ff37cb3dc1d33d59  probe/m4-lock-rje6.5-crlf-nonascii.json
+64ddebc126166358ccd08b17f338b211104f895a2cf7b1140ca9c8cc2b6cbe63  probe/m4-lock-rje7.2-single-crlf-nonascii.json
 823345f38a5e74d4aae2ac346906e85318d9688f66d48e206b29d745633fe6d1  probe/m4-lock-rje7.2-v3-crlf-nonascii.json
 f27fac78892788a44cc97a5b70badfe812a76486e2ec77bd3a181ef5247f3fc8  probe/m4ok-lock-rje6.5-v2-crlf-nonascii.json
 2b882f8fd83edc9ebf3073e08d3e3fbe5e217379174fa99c882a738b93caf78f  probe/m4ok-lock-rje7.2-v3-crlf-nonascii.json

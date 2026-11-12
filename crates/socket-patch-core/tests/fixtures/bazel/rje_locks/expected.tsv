@@ -59,6 +59,7 @@ probe/hosted-rje7.2-lock-rehashed-insertion-ACCEPTED-with-note.json	v3	v3-insert
 probe/m4ok-lock-rje7.2-v3-crlf-nonascii.json	v3	v3-sorted	probe:rules-jvm-external/vectors/m4ok-lock-rje7.2-v3-crlf-nonascii.json
 probe/m4ok-lock-rje6.5-v2-crlf-nonascii.json	v2	v2	probe:rules-jvm-external/vectors/m4ok-lock-rje6.5-v2-crlf-nonascii.json
 probe/m4-lock-rje7.2-v3-crlf-nonascii.json	v3	mismatch	probe:rules-jvm-external/vectors/m4-lock-rje7.2-v3-crlf-nonascii.json
+probe/m4-lock-rje7.2-single-crlf-nonascii.json	v3	mismatch	probe:rules-jvm-external/vectors/m4-lock-rje7.2-single-crlf-nonascii.json
 probe/m4-lock-rje6.5-crlf-nonascii.json	v2	mismatch	probe:rules-jvm-external/vectors/m4-lock-rje6.5-crlf-nonascii.json
 probe/m4-lock-rje5.3-v2-crlf-nonascii.json	v2	mismatch	probe:rules-jvm-external/vectors/m4-lock-rje5.3-v2-crlf-nonascii.json
 probe/m4-lock-rje4.5-v1-crlf.json	v1	v1+v1-legacy	probe:rules-jvm-external/vectors/m4-lock-rje4.5-v1-crlf.json

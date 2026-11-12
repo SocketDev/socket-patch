@@ -346,9 +346,14 @@ impl RjeLock {
         }
     }
 
-    /// `__INPUT_ARTIFACTS_HASH`, opaque: its span is all a caller may use.
-    pub fn input_hash(&self) -> Option<&Node> {
-        self.hash_home().get(INPUT_HASH_KEY)
+    /// Where `__INPUT_ARTIFACTS_HASH` is, and nothing of what it holds.
+    /// The value is opaque: it covers the hub's attributes, which other
+    /// modules add to, so no caller computes it, writes it or compares
+    /// it. The span has one use, to check that an edit left those bytes
+    /// as they were.
+    pub fn input_hash(&self) -> Option<Span> {
+        let input = self.hash_home().get(INPUT_HASH_KEY);
+        input.map(|node| node.span)
     }
 
     /// The content hash rules_jvm_external computes in `flavor`.
@@ -1150,29 +1155,166 @@ mod tests {
 
     /// The root lock of rules_jvm_external 6.10 - 7.2: the netty-tcnative
     /// classifier jars depend on each other in ten pairs, so the stored
-    /// values hold only if the walk through a cycle is reproduced.
+    /// values hold only if the walk through a cycle is reproduced. The
+    /// lock of 6.10 and the one 7.0 - 7.2 share are different files.
     #[test]
     fn the_cyclic_root_lock_is_reproduced() {
-        let text = fixture("upstream/7.2__maven_install.json");
-        let lock = lock(&text);
-        let dependencies = lock.root.get("dependencies").expect("dependencies");
-        let depends = |from: &str, to: &str| {
-            let list = dependencies.get(from).and_then(Node::items);
-            list.is_some_and(|items| items.iter().any(|item| item.as_str() == Some(to)))
-        };
-        let keys: Vec<&str> = dependencies
-            .members()
-            .expect("an object")
-            .iter()
-            .map(|m| m.key.text.as_str())
-            .collect();
-        let pairs = keys.iter().flat_map(|a| keys.iter().map(move |b| (*a, *b)));
-        let mutual = pairs.filter(|(a, b)| a < b && depends(a, b) && depends(b, a));
-        assert_eq!(mutual.count(), 10);
-        assert_eq!(
-            lock.reproduced(),
-            Ok(vec![Flavor::V3Sorted, Flavor::V3Insertion])
-        );
+        let roots = [
+            ("upstream/6.10__maven_install.json", 19),
+            ("upstream/7.2__maven_install.json", 16),
+        ];
+        for (rel, files) in roots {
+            let text = fixture(rel);
+            let lock = lock(&text);
+            let dependencies = lock.root.get("dependencies").expect("dependencies");
+            let depends = |from: &str, to: &str| {
+                let list = dependencies.get(from).and_then(Node::items);
+                list.is_some_and(|items| items.iter().any(|item| item.as_str() == Some(to)))
+            };
+            let keys: Vec<&str> = dependencies
+                .members()
+                .expect("an object")
+                .iter()
+                .map(|m| m.key.text.as_str())
+                .collect();
+            let pairs = keys.iter().flat_map(|a| keys.iter().map(move |b| (*a, *b)));
+            let mutual = pairs.filter(|(a, b)| a < b && depends(a, b) && depends(b, a));
+            assert_eq!(mutual.count(), 10, "{rel}");
+            assert_eq!(
+                lock.reproduced(),
+                Ok(vec![Flavor::V3Sorted, Flavor::V3Insertion]),
+                "{rel}"
+            );
+            assert_eq!(hash_members(&lock, Flavor::V3Sorted).len(), files, "{rel}");
+        }
+    }
+
+    /// The v3 content hash of `lock` in `flavor`.
+    fn hash_members(lock: &RjeLock, flavor: Flavor) -> BTreeMap<String, i32> {
+        match lock.resolved(flavor) {
+            Ok(Resolved::Members(members)) => members,
+            other => panic!("a v3 hash is one int per artifact file: {other:?}"),
+        }
+    }
+
+    /// `text` with each span replaced by the text beside it. The spans do
+    /// not overlap.
+    fn splice(text: &str, edits: &[(Span, String)]) -> String {
+        let mut edits: Vec<&(Span, String)> = edits.iter().collect();
+        edits.sort_by_key(|(span, _)| span.0);
+        let (mut out, mut at) = (String::new(), 0);
+        for ((start, end), new) in edits {
+            assert!(at <= *start && start <= end, "overlapping spans");
+            out.push_str(&text[at..*start]);
+            out.push_str(new);
+            at = *end;
+        }
+        out.push_str(&text[at..]);
+        out
+    }
+
+    /// A rewrite of a v3 lock changes the hash of the artifact it edits
+    /// and of every artifact file that depends on it, so it writes several
+    /// members of the stored hash. Each member has a span of its own for
+    /// that. Here a lock gets another jar for one artifact, the members
+    /// whose value changed are replaced through their spans and no other
+    /// byte is touched, and the lock verifies again in the flavors it had.
+    /// The locks are the cyclic root lock and the two upstream locks that
+    /// verify in one flavor only.
+    #[test]
+    fn a_v3_lock_is_signed_again_through_the_span_of_each_hash_member() {
+        let both = &[Flavor::V3Sorted, Flavor::V3Insertion][..];
+        for (rel, artifact, flavors, dependents) in [
+            // `classes` is a dependency of `boringssl-static` and of each
+            // of its five classifier jars, which depend on each other.
+            (
+                "upstream/7.2__maven_install.json",
+                "io.netty:netty-tcnative-classes",
+                both,
+                6,
+            ),
+            (
+                "upstream/7.2__tests_custom_maven_install_multi_repo_hash_install.json",
+                "org.hamcrest:hamcrest-core",
+                &[Flavor::V3Sorted][..],
+                1,
+            ),
+            (
+                "upstream/7.2__tests_custom_maven_install_legacy_multi_repo_hash_install.json",
+                "org.hamcrest:hamcrest-core",
+                &[Flavor::V3Insertion][..],
+                1,
+            ),
+        ] {
+            let text = fixture(rel);
+            let before = lock(&text);
+            assert_eq!(before.reproduced(), Ok(flavors.to_vec()), "{rel}");
+            let at = |span: Span| &text[span.0..span.1];
+
+            // The stored hash has one member per artifact file. The spans
+            // of a member hold its key and its value, in file order, each
+            // inside the span of the hash.
+            let computed = hash_members(&before, flavors[0]);
+            let stored = before.stored_hash().expect("a stored hash");
+            let stored_members = stored.members().expect("an object");
+            assert_eq!(stored_members.len(), computed.len(), "{rel}");
+            let mut end = stored.span.0;
+            for member in stored_members {
+                let key = &member.key.text;
+                let (key_span, value_span) = (member.key_span, member.value.span);
+                assert!(end < key_span.0 && key_span.1 < value_span.0, "{rel} {key}");
+                assert_eq!(at(key_span), format!("\"{key}\""), "{rel}");
+                assert_eq!(at(value_span), computed[key].to_string(), "{rel} {key}");
+                end = value_span.1;
+            }
+            assert!(end < stored.span.1, "{rel}");
+            let input = |lock: &RjeLock, text: &str| {
+                let span = lock.input_hash().expect("an input hash");
+                text[span.0..span.1].to_string()
+            };
+
+            // Another jar under the same version.
+            let jar = before.root.get("artifacts").and_then(|a| a.get(artifact));
+            let jar = jar
+                .and_then(|a| a.get("shasums"))
+                .and_then(|s| s.get("jar"));
+            let jar = jar.and_then(Node::inner_span).expect("a sha256");
+            let edited = splice(&text, &[(jar, "0".repeat(64))]);
+            let unsigned = lock(&edited);
+            assert_eq!(unsigned.reproduced(), Err(HashError::Mismatch), "{rel}");
+            let dependencies = unsigned.root.get("dependencies").expect("dependencies");
+            let depends = |key: &str| {
+                let list = dependencies.get(key).and_then(Node::items);
+                list.is_some_and(|items| items.iter().any(|item| item.as_str() == Some(artifact)))
+            };
+            let all = unsigned.stored_hash().and_then(Node::members);
+            let all = all.expect("an object");
+            for flavor in flavors {
+                let wanted = hash_members(&unsigned, *flavor);
+                let stale = all
+                    .iter()
+                    .filter(|m| m.value.as_i32() != Some(wanted[&m.key.text]));
+                let stale: Vec<&Member> = stale.collect();
+                // The artifact and the artifact files that depend on it,
+                // and no other member.
+                let keys: Vec<&str> = stale.iter().map(|m| m.key.text.as_str()).collect();
+                let expected = all.iter().map(|m| m.key.text.as_str());
+                let expected: Vec<&str> = expected
+                    .filter(|key| *key == artifact || depends(key))
+                    .collect();
+                assert_eq!(keys, expected, "{rel} {flavor:?}");
+                assert_eq!(stale.len(), dependents + 1, "{rel} {flavor:?}");
+
+                let edits = stale
+                    .iter()
+                    .map(|m| (m.value.span, wanted[&m.key.text].to_string()));
+                let signed = splice(&edited, &edits.collect::<Vec<_>>());
+                let after = lock(&signed);
+                assert_eq!(after.reproduced(), Ok(flavors.to_vec()), "{rel} {flavor:?}");
+                // The input hash is not part of any of it.
+                assert_eq!(input(&after, &signed), input(&before, &text), "{rel}");
+            }
+        }
     }
 
     /// Campaign probe M4: the same lock stored with the UTF-16 value was
@@ -1237,6 +1379,55 @@ mod tests {
             };
             assert_eq!(lock.reproduced(), expected, "{rel}");
         }
+
+        // v3 on Bazel 9.3.2, which ran the lock of the one-repository
+        // fixture with the same repository added and printed the pair
+        // 8.8.2 printed. The added repository lists gson last in file
+        // order and in sorted order, so both flavors give the value Bazel
+        // computed, and with that value in the member's span the lock
+        // verifies: no other member disagrees.
+        let text = fixture("probe/m4-lock-rje7.2-single-crlf-nonascii.json");
+        assert!(text.contains("\r\n") && text.contains("mäven2"));
+        let single = lock(&text);
+        let stored = single.stored_hash().and_then(|hash| hash.get(gson));
+        let stored = stored.expect("a member");
+        assert_eq!(stored.as_i32(), Some(1_490_333_282));
+        let both = [Flavor::V3Sorted, Flavor::V3Insertion];
+        for flavor in both {
+            assert_eq!(
+                hash_members(&single, flavor)[gson],
+                838_865_874,
+                "{flavor:?}"
+            );
+        }
+        assert_eq!(single.reproduced(), Err(HashError::Mismatch));
+        let corrected = splice(&text, &[(stored.span, "838865874".to_string())]);
+        assert_eq!(lock(&corrected).reproduced(), Ok(both.to_vec()));
+
+        // Line ends are not hashed. Each lock a build accepted with CRLF
+        // (5.4.1 the v1 lock, 7.7.2 the v2 lock, 8.8.2 the v3 lock) has
+        // the same hash with LF, in every flavor of its format.
+        for rel in [
+            "probe/m4-lock-rje4.5-v1-crlf.json",
+            "probe/m4ok-lock-rje6.5-v2-crlf-nonascii.json",
+            "probe/m4ok-lock-rje7.2-v3-crlf-nonascii.json",
+        ] {
+            let crlf = fixture(rel);
+            let lf = crlf.replace("\r\n", "\n");
+            assert!(crlf.contains("\r\n") && !lf.contains('\r'), "{rel}");
+            let (crlf, lf) = (lock(&crlf), lock(&lf));
+            assert!(crlf.reproduced().is_ok(), "{rel}");
+            assert_eq!(lf.reproduced(), crlf.reproduced(), "{rel}");
+            for flavor in crlf.format.flavors() {
+                assert_eq!(lf.resolved(*flavor), crlf.resolved(*flavor), "{rel}");
+            }
+        }
+        // The v1 lock is a committed LF lock with nothing but its line
+        // ends changed.
+        assert_eq!(
+            fixture("probe/m4-lock-rje4.5-v1-crlf.json").replace("\r\n", "\n"),
+            fixture("probe/hosted-rje4.5-v1-suffixed.json")
+        );
     }
 
     /// The values a hosted rewrite splices, read from a CRLF lock with
@@ -1287,7 +1478,7 @@ mod tests {
         assert_eq!(at(member.key_span), "\"com.google.code.gson:gson\"");
         assert_eq!(at(member.value.span), "838865874");
         assert_eq!(stored.members().map(<[Member]>::len), Some(10));
-        let input = at(before.input_hash().expect("an input hash").span);
+        let input = at(before.input_hash().expect("an input hash"));
         assert!(
             input.starts_with("{\r\n") && input.ends_with("\"repositories\": 1670674627\r\n  }")
         );
@@ -1297,14 +1488,11 @@ mod tests {
         // one that depends on it, slf4j-simple, and for nothing else.
         let edited = format!("{}{}{}", &text[..jar.0], "0".repeat(64), &text[jar.1..]);
         let after = lock(&edited);
-        let input_after = after.input_hash().expect("an input hash").span;
+        let input_after = after.input_hash().expect("an input hash");
         assert_eq!(&edited[input_after.0..input_after.1], input);
         assert_eq!(after.reproduced(), Err(HashError::Mismatch));
-        let members = |lock: &RjeLock| match lock.resolved(Flavor::V3Sorted) {
-            Ok(Resolved::Members(members)) => members,
-            other => panic!("{other:?}"),
-        };
-        let (old, new) = (members(&before), members(&after));
+        let old = hash_members(&before, Flavor::V3Sorted);
+        let new = hash_members(&after, Flavor::V3Sorted);
         let changed: Vec<&str> = old
             .keys()
             .filter(|k| old[*k] != new[*k])
@@ -1328,8 +1516,8 @@ mod tests {
         // 4.5: the banner is text, and both hashes have their own key.
         let text = fixture("upstream/4.5__maven_install.json");
         let new = lock(&text);
-        let at = |node: Option<&Node>| node.map(|n| &text[n.span.0..n.span.1]);
-        assert_eq!(at(new.stored_hash()), Some("1091951862"));
+        let at = |span: Option<Span>| span.map(|span| &text[span.0..span.1]);
+        assert_eq!(at(new.stored_hash().map(|n| n.span)), Some("1091951862"));
         assert_eq!(at(new.input_hash()), Some("-1485740259"));
 
         // A text banner is no hash: a lock with nothing else has none, and

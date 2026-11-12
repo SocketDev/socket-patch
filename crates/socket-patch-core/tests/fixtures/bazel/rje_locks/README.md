@@ -42,7 +42,7 @@ tree over 45 kB.
 
 ## `probe/`: locks real Bazel wrote, accepted or rejected
 
-22 files from the Bazel-support campaign's rules_jvm_external probe group, run 2026-11-11 on
+23 files from the Bazel-support campaign's rules_jvm_external probe group, run 2026-11-11 on
 one macOS arm64 machine. Nothing ran on Linux or Windows.
 
 | Files | What they are |
@@ -52,7 +52,7 @@ one macOS arm64 machine. Nothing ran on Linux or Windows.
 | `hosted-rje6.10-lock-rehashed-sorted-REJECTED-by-6.10` | a 6.10 lock re-hashed in the sorted flavor: 6.10 fails with `invalid signature` |
 | `hosted-rje7.2-lock-rehashed-insertion-ACCEPTED-with-note` | a 7.2 lock re-hashed in the insertion flavor: 7.2 builds and prints a note |
 | `m4ok-lock-*` | CRLF line endings and a repository URL with non-ASCII characters, hashed over the UTF-8 bytes: accepted by Bazel 8.8.2 (v3) and 7.7.2 (v2) |
-| `m4-lock-*-nonascii` | the same locks with the hash over UTF-16 units stored: rejected, and the message names the value Bazel computed (`1490333282 vs 838865874` on 8.8.2, `expected 1519755856 and got 350241632` on 7.7.2, `expected 385063259 and got 832349099` on 6.6.0; 9.3.2 printed the 8.8.2 pair for a one-repository variant that is not committed) |
+| `m4-lock-*-nonascii` | the same locks with the hash over UTF-16 units stored: rejected, and the message names the value Bazel computed (`1490333282 vs 838865874` on 8.8.2, `expected 1519755856 and got 350241632` on 7.7.2, `expected 385063259 and got 832349099` on 6.6.0). `m4-lock-rje7.2-single-*` is the cell that ran on 9.3.2: the lock of the one-repository fixture with the same non-ASCII repository added, for which 9.3.2 printed the 8.8.2 pair |
 | `m4-lock-rje4.5-v1-crlf` | a v1 lock with CRLF line endings: accepted by Bazel 5.4.1 |
 | `CRASH-rje7.2-v3-dangling-repositories-key` | `repositories` lists a key no artifact produces: rules_jvm_external crashes with `key "org.slf4j:slf4j-api:jar:sources" not found in dictionary` |
 
@@ -75,7 +75,10 @@ the test compares two independent ports with each other and with the stored valu
 tag `v3.6.0` (<https://github.com/aspect-build/rules_js>, Apache-2.0;
 `.aspect/rules/external_repository_action_cache/`). Each of its 21 `path=hash` lines is the
 Java `String.hashCode` of the file, one char per byte. `inputs/` holds those 21 files from
-the same tag, one of them a binary tarball (`lodash-4.17.21.tgz`, MIT). An input is named
+the same tag, one of them a binary tarball (`lodash-4.17.21.tgz`, MIT) and one a text file
+with a character outside ASCII (`npm/private/test/vendored/is-odd/package.json`, an `ß`).
+For that text file the stored value, 1041695223, is the hash over its bytes; over its UTF-16
+units the hash is -2025121710. The other 19 inputs are ASCII. An input is named
 after its path with `/` written as `__` and `.in` appended, so that no file here has the name
 of a package manifest, a lock or an ignored archive:
 `npm/private/test/package.json` is `inputs/npm__private__test__package.json.in`.
