@@ -1,22 +1,27 @@
 load("@rules_rs//rs:rust_binary.bzl", "rust_binary")
 load("//:probe.bzl", "socket_probe")
 
-# Tier 0: the sources of the crate the hub fetched. Tier 1 compiles the
+# Two versions of one crate name. The hub gives the plain alias to the
+# highest version a workspace member depends on, so `@crates//:itoa` is
+# 1.0.15, and 0.4.8 has only its versioned alias.
+#
+# Tier 0: the sources of the crate behind the plain alias. Tier 1 compiles the
 # library: a source file of another repository is not visible on Bazel 9.
 socket_probe(
     name = "socket_probe",
-    srcs = ["@crates//:itoa-1.0.15"],
+    srcs = ["@crates//:itoa"],
 )
 
-# Tier 2: prints ITOA=1015 ITOA04=48. Two versions of one crate name: the hub
-# has no plain `itoa` alias, so every consumer names a versioned one.
+# Tier 2: prints ITOA=1015 ITOA04=48. Vendoring retags a version and with it
+# its versioned alias, never the plain one: a vendored 1.0.15 leaves every
+# label here valid, a vendored 0.4.8 would not.
 rust_binary(
     name = "consumer",
     srcs = ["src/main.rs"],
     aliases = {"@crates//:itoa-0.4.8": "itoa04"},
     edition = "2021",
     deps = [
+        "@crates//:itoa",
         "@crates//:itoa-0.4.8",
-        "@crates//:itoa-1.0.15",
     ],
 )

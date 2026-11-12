@@ -13,13 +13,17 @@
 //! first proxy for about 1,700 files, and a stub that drops connections
 //! fails the whole extension, so the fixture server answers every request
 //! on a thread of its own.
+//!
+//! A fake Socket API that grants one of these modules takes the artifact's
+//! `integrity` from [`Module::grant_integrity`]: a vendored Go grant
+//! without `integrity.sha512` ends in `vendor_prebuilt_required`.
 
 use std::collections::BTreeMap;
 use std::io::Read;
 use std::path::Path;
 
 use base64::Engine as _;
-use sha2::{Digest, Sha256};
+use sha2::{Digest, Sha256, Sha512};
 
 use super::super::fixture_server::FixtureServer;
 
@@ -49,6 +53,24 @@ impl Module {
             format!("{path} {version} {}", self.zip_h1),
             format!("{path} {version}/go.mod {}", self.mod_h1),
         ]
+    }
+
+    /// The `integrity` object of a Socket API grant whose artifact is this
+    /// module's zip, in the field names the service uses.
+    ///
+    /// `sha512` is what vendored mode needs: a Go grant without it stops
+    /// with `vendor_prebuilt_required` (`tarball artifact has no sha512
+    /// integrity`) before anything is downloaded. `dirhashH1` and
+    /// `goModH1` are the two `go.sum` lines of the granted module: the
+    /// hosted rewriter touches nothing unless both are there.
+    pub fn grant_integrity(&self) -> serde_json::Value {
+        let sha512 = base64::engine::general_purpose::STANDARD.encode(Sha512::digest(&self.zip));
+        serde_json::json!({
+            "sha512": format!("sha512-{sha512}"),
+            "sha256": hex::encode(Sha256::digest(&self.zip)),
+            "dirhashH1": self.zip_h1,
+            "goModH1": self.mod_h1,
+        })
     }
 }
 
@@ -359,6 +381,85 @@ fn the_committed_go_proxy_serves_what_go_sum_pins() {
         h1_of_mod(&after["example.com/upstream@v1.0.0/go.mod"]),
         upstream.mod_h1
     );
+}
+
+#[test]
+fn the_go_proxy_answers_a_burst_of_unknown_modules_and_drops_no_connection() {
+    use super::pypi_files::fetch;
+
+    // What the go-list generation of `go_deps` sends the first proxy of
+    // the list on a cold evaluation: about 1,700 `.info` and `.mod`
+    // requests for the module graph of rules_go and gazelle, none of which
+    // this tree holds. One reset connection fails the whole extension.
+    const REQUESTS: usize = 1_700;
+    const CLIENTS: usize = 32;
+    let fixtures = super::super::workspace::fixtures_root().join("heavy");
+    let server = FixtureServer::start();
+    mount(&server, &fixtures.join("registry/goproxy")).unwrap();
+    let proxy = goproxy(&server);
+    let known = format!("{proxy}/example.com/upstream/@v/v1.0.0.info");
+    let request = |n: usize| {
+        // Every hundredth request is for the module the tree does hold.
+        if n.is_multiple_of(100) {
+            return fetch(&server, &known).0;
+        }
+        let file = ["info", "mod"][n % 2];
+        let url = format!("{proxy}/cloud.google.com/go/m{n}/@v/v1.{n}.0.{file}");
+        fetch(&server, &url).0
+    };
+    // `fetch` panics on a refused or reset connection and on an empty
+    // answer, so a dropped request fails its client's `join`.
+    let statuses: Vec<u16> = std::thread::scope(|scope| {
+        let clients: Vec<_> = (0..CLIENTS)
+            .map(|first| {
+                let request = &request;
+                scope.spawn(move || {
+                    let mine = (first..REQUESTS).step_by(CLIENTS);
+                    mine.map(request).collect::<Vec<u16>>()
+                })
+            })
+            .collect();
+        let answers = clients
+            .into_iter()
+            .flat_map(|client| client.join().expect("a client lost a connection"));
+        answers.collect()
+    });
+    let count = |status: u16| statuses.iter().filter(|s| **s == status).count();
+    assert_eq!(statuses.len(), REQUESTS);
+    assert_eq!((count(200), count(404)), (17, REQUESTS - 17));
+    assert_eq!(server.requests().len(), REQUESTS);
+}
+
+#[test]
+fn a_go_module_states_the_integrity_a_grant_needs() {
+    use socket_patch_core::api::types::PackageVendorArtifact;
+
+    let fixtures = super::super::workspace::fixtures_root().join("heavy");
+    let server = FixtureServer::start();
+    let modules = mount(&server, &fixtures.join("registry/goproxy")).unwrap();
+    let upstream = &modules[0];
+    let (_, zip) = super::pypi_files::fetch(&server, &upstream.zip_url);
+
+    // Read through the type socket-patch reads a grant with: a field under
+    // another name would be dropped there, and the grant refused.
+    let artifact: PackageVendorArtifact = serde_json::from_value(serde_json::json!({
+        "kind": "tarball",
+        "url": upstream.zip_url,
+        "integrity": upstream.grant_integrity(),
+    }))
+    .unwrap();
+    let integrity = artifact.integrity;
+    // The SRI of the bytes the server hands out, not of some other encoding.
+    let sha512 = integrity.sha512.expect("integrity.sha512");
+    let digest = sha512.strip_prefix("sha512-").expect("an SRI value");
+    let digest = base64::engine::general_purpose::STANDARD.decode(digest);
+    assert_eq!(digest.unwrap(), Sha512::digest(&zip).to_vec());
+    assert_eq!(integrity.sha256, Some(hex::encode(Sha256::digest(&zip))));
+    // The two go.sum lines, as the real `go` wrote them for this module.
+    let [zip_line, mod_line] = upstream.go_sum_lines();
+    let h1 = |line: &str| line.rsplit(' ').next().map(str::to_string);
+    assert_eq!(integrity.dirhash_h1, h1(&zip_line));
+    assert_eq!(integrity.go_mod_h1, h1(&mod_line));
 }
 
 #[test]

@@ -42,6 +42,23 @@ use crate::bazel_build_common::workspace::{fixtures_root, MODULE_LOCK, PROBE_BZL
 /// loopback port never reaches a committed file.
 const ORIGIN_PLACEHOLDER: &str = "http://socket-fixture.invalid";
 
+/// The variable a pip-mode fixture can read its index from, and the
+/// `--index-url` value such a fixture commits: the variable, with the
+/// production index as its default.
+const PIP_INDEX_VAR: &str = "PIP_INDEX_URL";
+const PIP_INDEX_ENVSUBST: &str = "${PIP_INDEX_URL:-https://pypi.org/simple}";
+
+/// Whether `text` (a `MODULE.bazel` or a `WORKSPACE`) hands pip its index
+/// through `envsubst`: the attribute names the variable and an
+/// `--index-url` value expands it. Only then is `--repo_env=PIP_INDEX_URL=`
+/// a lever. pip runs `--isolated` and never reads the variable itself: a
+/// probe cell that passed it to a fixture without `envsubst` installed
+/// from the real pypi.org and files.pythonhosted.org.
+fn pip_index_from_env(text: &str) -> bool {
+    let names = regex::Regex::new(r#"envsubst\s*=\s*\[[^\]]*"PIP_INDEX_URL""#).unwrap();
+    names.is_match(text) && text.contains(PIP_INDEX_ENVSUBST)
+}
+
 /// One `heavy/<ruleset>/MATRIX.json`.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -261,6 +278,101 @@ impl Fixture {
     fn hosted_fetch(&self) -> &str {
         self.hosted_fetch.as_deref().unwrap_or(&self.fetch)
     }
+
+    /// Whether the fixture's root file reads pip's index from the
+    /// environment ([`pip_index_from_env`]).
+    fn pip_index_from_env(&self) -> bool {
+        let root_file = |name: &str| std::fs::read_to_string(self.dir().join(name));
+        let files = ["MODULE.bazel", "WORKSPACE"];
+        let mut texts = files.into_iter().filter_map(|name| root_file(name).ok());
+        texts.any(|text| pip_index_from_env(&text))
+    }
+}
+
+/// The release of `ruleset` that `pins` names, as (major, minor, patch);
+/// `None` when it is not pinned.
+fn pinned_release(pins: &BTreeMap<String, String>, ruleset: &str) -> Option<(u32, u32, u32)> {
+    let version = env::Version::parse(pins.get(ruleset)?)?;
+    Some((version.major, version.minor, version.patch))
+}
+
+/// Why a fixture with these `pins` may not list a cell on `bazel` with
+/// this `evidence`; `None` for a pairing it may list. Two pairings do not
+/// load at all, and a pairing no probe ran is listed only as `unverified`,
+/// which makes its canary the first evidence:
+///
+/// - rules_pycross 2.x on Bazel 7 fails with `name 'ignore_directories'
+///   is not defined`: its floor is Bazel 8.
+/// - rules_rs does not load below Bazel 8.4. 0.2.2 ran on 8.7.0 and 9.3.2,
+///   so every other line is unverified.
+/// - aspect_rules_py ran on 8.8.2 and 9.3.2 (1.8.4 on 8.8.2 only), and
+///   rules_python 1.9.2 on those two as well.
+fn pairing_refused(
+    pins: &BTreeMap<String, String>,
+    bazel: &env::Version,
+    evidence: &str,
+) -> Option<String> {
+    let on = |lines: &[&str]| lines.contains(&bazel.text.as_str());
+    if pinned_release(pins, "rules_pycross").is_some_and(|v| v.0 >= 2) && !bazel.at_least(8, 0, 0) {
+        return Some("rules_pycross 2.x does not load below Bazel 8".into());
+    }
+    if pins.contains_key("rules_rs") && !bazel.at_least(8, 4, 0) {
+        return Some("rules_rs does not load below Bazel 8.4".into());
+    }
+    let ran = if pins.contains_key("rules_rs") {
+        on(&["9.3.2"])
+    } else if pinned_release(pins, "aspect_rules_py") == Some((1, 8, 4)) {
+        on(&["8.8.2"])
+    } else if pins.contains_key("aspect_rules_py")
+        || pinned_release(pins, "rules_python") == Some((1, 9, 2))
+    {
+        on(&["9.3.2", "8.8.2"])
+    } else {
+        true
+    };
+    (!ran && !evidence.starts_with("unverified")).then(|| {
+        format!(
+            "no probe ran this pairing on Bazel {}: its evidence is `unverified` until the \
+             canary has run",
+            bazel.text
+        )
+    })
+}
+
+/// `Err` unless `rel` (relative to its fixture) is
+/// `locks/v<N>[/<os>]/MODULE.bazel.lock` and `bytes` a lock of that
+/// `lockFileVersion` resolved against the Bazel Central Registry.
+///
+/// A committed lock is written by `bazel mod deps --lockfile_mode=update`
+/// under the exact Bazel release, with every OS key its cells run. It is
+/// never the lock a build left (that one gains hundreds of lines at the
+/// first `mod` command, so a WORKS-AFTER command would not be idempotent)
+/// and never one resolved against a `file://` mirror, whose paths it
+/// records.
+fn check_committed_lock(rel: &str, bytes: &[u8]) -> Result<(), String> {
+    const REGISTRY: &str = "https://bcr.bazel.build/";
+    let parts: Vec<&str> = rel.split('/').collect();
+    let (["locks", version, MODULE_LOCK] | ["locks", version, _, MODULE_LOCK]) = parts[..] else {
+        return Err(format!("not locks/v<N>[/<os>]/{MODULE_LOCK}"));
+    };
+    let stated = version
+        .strip_prefix('v')
+        .and_then(|n| n.parse::<u64>().ok());
+    let stated = stated.ok_or_else(|| format!("{version} is not v<lockFileVersion>"))?;
+    let lock: Value = serde_json::from_slice(bytes).map_err(|e| format!("not a lock: {e}"))?;
+    let written = lock.get("lockFileVersion").and_then(Value::as_u64);
+    if written != Some(stated) {
+        return Err(format!("lockFileVersion is {written:?} under {version}/"));
+    }
+    let hashes = lock.get("registryFileHashes").and_then(Value::as_object);
+    let mut registry_files = hashes.into_iter().flat_map(|hashes| hashes.keys());
+    if let Some(other) = registry_files.find(|url| !url.starts_with(REGISTRY)) {
+        return Err(format!("resolved against {other}, not {REGISTRY}"));
+    }
+    if String::from_utf8_lossy(bytes).contains("file://") {
+        return Err("names a file:// URL".into());
+    }
+    Ok(())
 }
 
 /// What mounting a fixture's registries yields for the Bazel commands.
@@ -314,8 +426,12 @@ fn mount(fixture: &Fixture, server: &FixtureServer) -> Levers {
             "pypi-pip" => {
                 let (distributions, _) = wheels(&mut levers);
                 let index = pypi_index::mount_pip_mode(server, &distributions);
-                // For a fixture that reads the index through `envsubst`.
-                levers.repo_env.push(("PIP_INDEX_URL".into(), index));
+                // The committed `--index-url` is the lever. The variable is
+                // passed only to a fixture that expands it there itself:
+                // to any other it would do nothing, and read as the lever.
+                if fixture.pip_index_from_env() {
+                    levers.repo_env.push((PIP_INDEX_VAR.into(), index));
+                }
             }
             "goproxy" => {
                 let modules = goproxy::mount(server, &tree.join("goproxy"))
@@ -944,6 +1060,35 @@ fn heavy_matrix_lists_every_fixture_and_every_test() {
                     "{at}: {name}: tier {}",
                     spec.tier
                 );
+                // Exactly the pairings that ran, never a blanket list of lines.
+                if let Some(why) = pairing_refused(&fixture.pins, &version, &spec.evidence) {
+                    panic!("{at}: {name}: Bazel {}: {why}", spec.bazel);
+                }
+            }
+            let lists = |host: &str| fixture.hosts.iter().any(|listed| listed == host);
+            let crates_io = lists("index.crates.io") && lists("static.crates.io");
+            // Under crate_universe cargo-bazel's cargo reads the index and
+            // the `.crate` itself, past every downloader rewrite: the
+            // baseline needs the real index reachable, and says so.
+            if fixture.pins.contains_key("rules_rust") {
+                assert_eq!(fixture.fetch, "tool", "{at}: {name}: cargo fetches");
+                assert!(crates_io, "{at}: {name}: `hosts` lacks crates.io");
+            }
+            // rules_rs keeps production URLs and Bazel's downloader fetches them.
+            if fixture.pins.contains_key("rules_rs") {
+                assert_eq!(fixture.fetch, "downloader", "{at}: {name}");
+                assert!(crates_io, "{at}: {name}: `hosts` lacks crates.io");
+            }
+            // rules_python >= 2.0 reads the index pages of its own
+            // `rules_python_publish_deps` hub (about 31) whenever the pip
+            // extension is evaluated. No stub answers them: the narrow
+            // rewrite leaves them to the real index, which is therefore
+            // one of the hosts the cell is allowed (DESIGN 9.3).
+            if pinned_release(&fixture.pins, "rules_python").is_some_and(|v| v.0 >= 2) {
+                assert!(
+                    lists(pypi_index::HOST),
+                    "{at}: {name}: `hosts` lacks pypi.org"
+                );
             }
         }
     }
@@ -1038,22 +1183,28 @@ fn heavy_fixtures_follow_the_fixture_conventions() {
                 "{name}: compile_pip_requirements without the pip index would ask pypi.org"
             );
         }
-        // pip is pointed at the index of the fixture server, or it would
-        // look the synthetic packages up on the real one.
+        // pip is pointed at the index of the fixture server by a committed
+        // `--index-url`, or it would look the synthetic packages up on the
+        // real one: the stub's address written over the placeholder, or
+        // (where the pin has `envsubst`) the variable with the production
+        // index as its default. The variable alone is no lever.
         if fixture.registries.iter().any(|r| r == "pypi-pip") {
             let indexed = |rel: &String| text(rel).is_some_and(|file| file.contains(&pip_index));
             assert!(
-                fixture.substitute.iter().any(indexed),
-                "{name}: no substituted file names {pip_index}"
+                fixture.substitute.iter().any(indexed) || fixture.pip_index_from_env(),
+                "{name}: no substituted file names {pip_index}, and no `envsubst` expands \
+                 {PIP_INDEX_ENVSUBST}"
             );
         }
-        // Bazel owns the lock and the convenience links.
+        // Bazel owns the lock and the convenience links. A lock a test
+        // needs committed sits under `locks/`, out of Bazel's way.
         for (path, bytes) in &tree {
             let leaf = path.rsplit('/').next().unwrap();
-            assert!(
-                leaf != "MODULE.bazel.lock" || path.starts_with("locks/"),
-                "{name}: {path}"
-            );
+            if leaf == MODULE_LOCK {
+                if let Err(why) = check_committed_lock(path, bytes) {
+                    panic!("{name}: {path}: {why}");
+                }
+            }
             assert!(!path.starts_with("bazel-"), "{name}: {path}");
             let content = String::from_utf8_lossy(bytes);
             assert!(
@@ -1102,6 +1253,14 @@ fn heavy_fixtures_follow_the_fixture_conventions() {
             assert!(
                 fixture.pins.contains_key(ruleset),
                 "{name}: bazel_dep {ruleset} has no `pins` entry"
+            );
+        }
+        // rules_go 0.65.0 refuses an SDK older than the `go` line of its
+        // own go.mod (`go version is 1.26.0, but Bazel is using 1.25.0`).
+        if fixture.pins.get("rules_go").map(String::as_str) == Some("0.65.0") {
+            assert!(
+                module.contains("go_sdk.download(version = \"1.26.0\")"),
+                "{name}: rules_go 0.65.0 needs Go SDK 1.26.0"
             );
         }
         // rules_rs marks every crate incompatible with a target platform
@@ -1454,6 +1613,153 @@ fn a_lock_claim_is_read_by_label_and_name_on_every_bazel_line() {
     assert!(matches!(claim, LockSpec::NotRecorded(_)));
     assert!(parse(r#"{"records": {"extension": "//:e.bzl%e"}}"#).is_err());
     assert!(parse(r#"{"recorded": "//:e.bzl%e"}"#).is_err());
+}
+
+#[test]
+fn the_pip_index_variable_goes_only_to_a_fixture_that_expands_it() {
+    // What the one probed `envsubst` pin (rules_python 1.9.2) commits.
+    let expands = r#"pip.parse(
+    envsubst = ["PIP_RETRIES", "PIP_INDEX_URL"],
+    extra_pip_args = ["--index-url", "${PIP_INDEX_URL:-https://pypi.org/simple}"],
+)"#;
+    assert!(pip_index_from_env(expands));
+    // The attribute without the value, the value without the attribute,
+    // another variable, and a fixture that states the index literally:
+    // pip would never see the variable.
+    for text in [
+        r#"pip.parse(envsubst = ["PIP_INDEX_URL"], extra_pip_args = ["--index-url", "https://pypi.org/simple"])"#,
+        r#"pip.parse(extra_pip_args = ["--index-url", "${PIP_INDEX_URL:-https://pypi.org/simple}"])"#,
+        r#"pip.parse(envsubst = ["PIP_RETRIES"], extra_pip_args = ["--index-url", "${PIP_INDEX_URL:-https://pypi.org/simple}"])"#,
+        r#"pip.parse(extra_pip_args = ["--index-url", "http://socket-fixture.invalid/pip-mode/simple"])"#,
+    ] {
+        assert!(!pip_index_from_env(text), "{text}");
+    }
+
+    // Every pip-mode fixture gets the variable exactly when it expands it.
+    // The ones committed here take the stub's address through the
+    // placeholder, so none of them is handed a variable that pip, run
+    // `--isolated`, would ignore.
+    let server = FixtureServer::start();
+    let pip_mode = |fixture: &Fixture| fixture.registries.iter().any(|r| r == "pypi-pip");
+    let fixtures: Vec<Fixture> = fixtures().into_iter().filter(pip_mode).collect();
+    let mut substituted = 0;
+    for fixture in &fixtures {
+        let name = &fixture.fixture;
+        let levers = mount(fixture, &server);
+        let passed = levers.repo_env.iter().any(|(var, _)| var == PIP_INDEX_VAR);
+        assert_eq!(passed, fixture.pip_index_from_env(), "{name}");
+        // One lever per fixture: the placeholder or the variable.
+        assert_ne!(passed, !fixture.substitute.is_empty(), "{name}");
+        substituted += usize::from(!passed);
+    }
+    // rules_python 1.4.2 (both systems) and 1.3.0, and the pip-compile check.
+    assert!(substituted >= 4, "{substituted} pip-mode fixtures");
+    assert!(server.requests().is_empty());
+}
+
+#[test]
+fn a_cell_lists_only_a_pairing_that_loads_and_marks_one_no_probe_ran() {
+    let pins = |pairs: &[(&str, &str)]| -> BTreeMap<String, String> {
+        let owned = |(ruleset, version): &(&str, &str)| (ruleset.to_string(), version.to_string());
+        pairs.iter().map(owned).collect()
+    };
+    let refused = |pairs: &[(&str, &str)], bazel: &str, evidence: &str| {
+        let bazel = env::Version::parse(bazel).unwrap();
+        pairing_refused(&pins(pairs), &bazel, evidence)
+    };
+    let probe = "python-uv-pycross-aspect Y4.a";
+
+    // rules_pycross 2.x has a floor that no evidence lifts; 0.8.3 has none.
+    let pycross2 = [("rules_pycross", "2.0.1"), ("rules_python", "2.0.0")];
+    for evidence in [probe, "unverified"] {
+        let why = refused(&pycross2, "7.7.2", evidence);
+        assert!(why.is_some_and(|why| why.contains("below Bazel 8")));
+    }
+    assert_eq!(refused(&pycross2, "8.8.2", probe), None);
+    assert_eq!(refused(&[("rules_pycross", "0.8.3")], "7.7.2", probe), None);
+
+    // rules_rs: a floor, and one line a probe ran.
+    let rules_rs = [("rules_rs", "0.2.2")];
+    let why = refused(&rules_rs, "7.7.2", "unverified");
+    assert!(why.is_some_and(|why| why.contains("below Bazel 8.4")));
+    assert_eq!(refused(&rules_rs, "9.3.2", "rust-vendor-rules-rs R6"), None);
+    assert_eq!(
+        refused(&rules_rs, "8.8.2", "unverified (ran on 8.7.0)"),
+        None
+    );
+    let why = refused(&rules_rs, "8.8.2", "rust-vendor-rules-rs R6");
+    assert!(why.is_some_and(|why| why.contains("`unverified`")));
+
+    // aspect_rules_py: 8.8.2 and 9.3.2, and the canary pin on 8.8.2 alone.
+    let aspect = [("aspect_rules_py", "1.13.0"), ("rules_python", "1.7.0")];
+    let canary = [("aspect_rules_py", "1.8.4"), ("rules_python", "1.0.0")];
+    assert_eq!(refused(&aspect, "9.3.2", probe), None);
+    assert_eq!(refused(&aspect, "8.8.2", probe), None);
+    assert!(refused(&aspect, "7.7.2", probe).is_some());
+    assert_eq!(refused(&aspect, "7.7.2", "unverified"), None);
+    assert_eq!(refused(&canary, "8.8.2", probe), None);
+    assert!(refused(&canary, "9.3.2", probe).is_some());
+
+    // rules_python 1.9.2 ran on 8.8.2 and 9.3.2 only; the pins of the
+    // 7.7.2 line are not held to that.
+    let envsubst = [("rules_python", "1.9.2")];
+    assert_eq!(refused(&envsubst, "8.8.2", "test-infra-offline 2.9"), None);
+    assert!(refused(&envsubst, "7.7.2", "test-infra-offline 2.9").is_some());
+    for version in ["2.5.0-rc4", "1.4.2", "1.3.0"] {
+        assert_eq!(
+            refused(&[("rules_python", version)], "7.7.2", "rules-python B2"),
+            None
+        );
+    }
+    assert_eq!(
+        pinned_release(&pins(&[("rules_python", "2.5.0-rc4")]), "rules_python"),
+        Some((2, 5, 0))
+    );
+    assert_eq!(pinned_release(&pins(&[]), "rules_python"), None);
+}
+
+#[test]
+fn a_committed_lock_sits_under_locks_and_was_resolved_against_the_registry() {
+    let lock = |version: u32, registry_file: &str| {
+        let text = format!(
+            r#"{{"lockFileVersion": {version}, "registryFileHashes": {{"{registry_file}": "0"}},
+                "moduleExtensions": {{}}}}"#
+        );
+        text.into_bytes()
+    };
+    let bcr = "https://bcr.bazel.build/modules/rules_go/0.44.0/MODULE.bazel";
+    let check = check_committed_lock;
+    check("locks/v13/MODULE.bazel.lock", &lock(13, bcr)).unwrap();
+    // An OS-dependent extension: one lock per OS key the matrix runs.
+    check("locks/v28/linux/MODULE.bazel.lock", &lock(28, bcr)).unwrap();
+    // Lock v3 has no registry hashes at all.
+    check("locks/v3/MODULE.bazel.lock", br#"{"lockFileVersion": 3}"#).unwrap();
+
+    // Where Bazel itself would read and rewrite it.
+    for rel in [
+        "MODULE.bazel.lock",
+        "sub/MODULE.bazel.lock",
+        "locks/MODULE.bazel.lock",
+        "locks/v13/macos/arm64/MODULE.bazel.lock",
+    ] {
+        let why = check(rel, &lock(13, bcr)).unwrap_err();
+        assert!(why.contains("not locks/v<N>"), "{rel}: {why}");
+    }
+    let named = check("locks/e7/MODULE.bazel.lock", &lock(13, bcr)).unwrap_err();
+    assert!(named.contains("is not v<lockFileVersion>"), "{named}");
+    // A lock of another Bazel line than its directory says.
+    let other = check("locks/v13/MODULE.bazel.lock", &lock(28, bcr)).unwrap_err();
+    assert!(other.contains("lockFileVersion is Some(28)"), "{other}");
+    // Resolved against a mirror: what 7.7.0 and a `--registry=file://`
+    // run write, with this machine's paths.
+    let mirror = "file:///Users/dev/registry/modules/rules_go/0.44.0/MODULE.bazel";
+    let mirrored = check("locks/v13/MODULE.bazel.lock", &lock(13, mirror)).unwrap_err();
+    assert!(mirrored.contains("resolved against file:///"), "{mirrored}");
+    let flag = br#"{"lockFileVersion": 6, "flags": {"cmdRegistries": ["file:///r"]}}"#;
+    let flagged = check("locks/v6/MODULE.bazel.lock", flag).unwrap_err();
+    assert!(flagged.contains("file:// URL"), "{flagged}");
+    let unread = check("locks/v13/MODULE.bazel.lock", b"not json").unwrap_err();
+    assert!(unread.contains("not a lock"), "{unread}");
 }
 
 #[test]
