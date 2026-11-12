@@ -1,0 +1,6 @@
+86f0555bccd069ac54e4c54a19a0f1aed9d328e13aa34aa090f3f3d43aaad441  goproxy/example.com/upstream/@v/list
+03860ddbcca086e370df8a6e0148f7d739d7797703ce95b2b009caf988175444  goproxy/example.com/upstream/@v/v1.0.0.info
+ebf2207ac5c40cc73d45656081ab8f074a19c25542fb70b061b6cf2701ec7f49  goproxy/example.com/upstream/@v/v1.0.0.mod
+7748a02f17b2f0cb2dcc752281646a7a7e2638d2445c820f338a709e17a0bb39  goproxy/example.com/upstream/@v/v1.0.0.zip
+ba58fd28227ddfb1aa681e7dd02f1e9eeafff1690bc965f515579f844f6099a1  pypi/spdep/spdep-2.0.0-py3-none-any.whl
+cecf23d2e612215c6512613873a29337301ed66f92a1e81810ce20d8f3bab993  pypi/spvictim/spvictim-1.0.0-py3-none-any.whl

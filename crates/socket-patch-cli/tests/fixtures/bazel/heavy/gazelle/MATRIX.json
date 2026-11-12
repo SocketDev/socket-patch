@@ -1,0 +1,105 @@
+{
+  "group": "heavy",
+  "ruleset": "gazelle",
+  "fixtures": [
+    {
+      "fixture": "heavy/gazelle/bzlmod/e9",
+      "test": "bazel_canary_baseline_gazelle_bzlmod_e9",
+      "system": "bzlmod",
+      "shape": "go_deps.from_file with go_deps.config(check_direct_dependencies = \"error\"): the SP-config selection proof holds",
+      "pins": {"gazelle": "0.54.0", "rules_go": "0.65.0"},
+      "registries": ["goproxy"],
+      "fetch": "tool",
+      "hosts": ["bcr.bazel.build", "github.com", "go.dev", "dl.google.com", "proxy.golang.org"],
+      "probe": {"label": "lib.go", "sha256": "9deedc9bf5acbfc8ef4484fc11db8620bb1c1a18e9fb4f998c69d1e9d3a390c0"},
+      "consumer": "OUT: PRISTINE",
+      "toolchains": ["go_sdk"],
+      "cells": [
+        {"bazel": "9.3.2", "proof": 2, "tier": "nightly", "evidence": "gazelle-go G1 (gz0.54.0-b9.3.2)"},
+        {"bazel": "8.8.2", "proof": 2, "tier": "nightly", "evidence": "gazelle-go B1 (gz0.54.0, 8.8.2)"}
+      ]
+    },
+    {
+      "fixture": "heavy/gazelle/bzlmod/e9-nocheck",
+      "test": "bazel_canary_baseline_gazelle_bzlmod_e9_nocheck",
+      "system": "bzlmod",
+      "shape": "go_deps.from_file without the check_direct_dependencies config: no committed selection proof",
+      "pins": {"gazelle": "0.54.0", "rules_go": "0.65.0"},
+      "registries": ["goproxy"],
+      "fetch": "tool",
+      "hosts": ["bcr.bazel.build", "github.com", "go.dev", "dl.google.com", "proxy.golang.org"],
+      "probe": {"label": "lib.go", "sha256": "9deedc9bf5acbfc8ef4484fc11db8620bb1c1a18e9fb4f998c69d1e9d3a390c0"},
+      "consumer": "OUT: PRISTINE",
+      "toolchains": ["go_sdk"],
+      "cells": [
+        {"bazel": "9.3.2", "proof": 2, "tier": "nightly", "evidence": "gazelle-go G1 (gz0.54.0-b9.3.2)"},
+        {"bazel": "8.8.2", "proof": 2, "tier": "nightly", "evidence": "gazelle-go G2 (gz0.54.0-b8.8.2)"}
+      ]
+    },
+    {
+      "fixture": "heavy/gazelle/bzlmod/e9-beta",
+      "test": "bazel_canary_baseline_gazelle_bzlmod_e9_beta",
+      "system": "bzlmod",
+      "shape": "the go-list generation of go_deps (gazelle >= 1.0.0-beta.1), where every selection is unproven",
+      "pins": {"gazelle": "2.0.0-beta.2", "rules_go": "0.65.0"},
+      "registries": ["goproxy"],
+      "fetch": "tool",
+      "hosts": ["bcr.bazel.build", "github.com", "go.dev", "dl.google.com", "proxy.golang.org"],
+      "probe": {"label": "lib.go", "sha256": "9deedc9bf5acbfc8ef4484fc11db8620bb1c1a18e9fb4f998c69d1e9d3a390c0"},
+      "consumer": "OUT: PRISTINE",
+      "toolchains": ["go_sdk"],
+      "cells": [
+        {"bazel": "9.3.2", "proof": 2, "tier": "nightly", "evidence": "gazelle-go G1 (gz2.0.0-beta.2-b9.3.2)"}
+      ]
+    },
+    {
+      "fixture": "heavy/gazelle/bzlmod/e7",
+      "test": "bazel_canary_baseline_gazelle_bzlmod_e7",
+      "system": "bzlmod",
+      "shape": "the Starlark generation on the 7.x line, with the SP-config selection proof",
+      "pins": {"gazelle": "0.45.0", "rules_go": "0.53.0"},
+      "registries": ["goproxy"],
+      "fetch": "tool",
+      "hosts": ["bcr.bazel.build", "github.com", "go.dev", "dl.google.com", "proxy.golang.org"],
+      "probe": {"label": "lib.go", "sha256": "9deedc9bf5acbfc8ef4484fc11db8620bb1c1a18e9fb4f998c69d1e9d3a390c0"},
+      "consumer": "OUT: PRISTINE",
+      "toolchains": ["go_sdk"],
+      "cells": [
+        {"bazel": "7.7.2", "proof": 2, "tier": "nightly", "evidence": "gazelle-go G1 (gz0.45.0-b7.7.2)"}
+      ]
+    },
+    {
+      "fixture": "heavy/gazelle/bzlmod/e7-refusal",
+      "test": "bazel_canary_baseline_gazelle_bzlmod_e7_refusal",
+      "system": "bzlmod",
+      "shape": "gazelle 0.36.0: a directory replace is refused while hosted works and the lock records nothing",
+      "pins": {"gazelle": "0.36.0", "rules_go": "0.46.0"},
+      "registries": ["goproxy"],
+      "fetch": "tool",
+      "hosts": ["bcr.bazel.build", "github.com", "go.dev", "dl.google.com", "proxy.golang.org"],
+      "probe": {"label": "lib.go", "sha256": "9deedc9bf5acbfc8ef4484fc11db8620bb1c1a18e9fb4f998c69d1e9d3a390c0"},
+      "consumer": "OUT: PRISTINE",
+      "toolchains": ["go_sdk"],
+      "cells": [
+        {"bazel": "7.7.2", "proof": 2, "tier": "nightly", "evidence": "gazelle-go G1 (gz0.36.0-b7.7.2)"}
+      ]
+    },
+    {
+      "fixture": "heavy/gazelle/bzlmod/e7-sp-lock",
+      "test": "bazel_canary_baseline_gazelle_bzlmod_e7_sp_lock",
+      "system": "bzlmod",
+      "shape": "gazelle 0.35.0: the one pairing on a Supported line whose MODULE.bazel.lock records go_deps with go.mod and go.sum (SP-lock)",
+      "pins": {"gazelle": "0.35.0", "rules_go": "0.44.0"},
+      "registries": ["goproxy"],
+      "fetch": "tool",
+      "hosts": ["bcr.bazel.build", "github.com", "go.dev", "dl.google.com", "proxy.golang.org"],
+      "probe": {"label": "lib.go", "sha256": "9deedc9bf5acbfc8ef4484fc11db8620bb1c1a18e9fb4f998c69d1e9d3a390c0"},
+      "consumer": "OUT: PRISTINE",
+      "toolchains": ["go_sdk"],
+      "cells": [
+        {"bazel": "7.7.2", "proof": 2, "tier": "nightly", "evidence": "gazelle-go G1 (gz0.35.0-b7.7.2)"},
+        {"bazel": "8.8.2", "proof": 2, "tier": "nightly", "evidence": "unverified"}
+      ]
+    }
+  ]
+}

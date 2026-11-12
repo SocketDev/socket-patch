@@ -1,0 +1,2 @@
+# The hub's virtual environment: every Python target of the hub needs it.
+common --@pypi//venv=default

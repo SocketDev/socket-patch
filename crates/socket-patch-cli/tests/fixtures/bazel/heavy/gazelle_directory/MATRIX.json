@@ -1,0 +1,39 @@
+{
+  "group": "heavy",
+  "ruleset": "gazelle_directory",
+  "fixtures": [
+    {
+      "fixture": "heavy/gazelle_directory/bzlmod/e9",
+      "test": "bazel_canary_baseline_gazelle_directory_bzlmod_e9",
+      "system": "bzlmod",
+      "shape": "go_deps over a go.mod that already holds a directory replace: go_deps maps it to go_repository(local_path), the mechanism of the directory lanes",
+      "pins": {"gazelle": "0.54.0", "rules_go": "0.65.0"},
+      "registries": ["goproxy"],
+      "fetch": "tool",
+      "hosts": ["bcr.bazel.build", "github.com", "go.dev", "dl.google.com", "proxy.golang.org"],
+      "probe": {"label": "lib.go", "sha256": "9deedc9bf5acbfc8ef4484fc11db8620bb1c1a18e9fb4f998c69d1e9d3a390c0"},
+      "consumer": "OUT: PRISTINE",
+      "toolchains": ["go_sdk"],
+      "cells": [
+        {"bazel": "9.3.2", "proof": 2, "tier": "nightly", "evidence": "gazelle-go G1 (gz0.54.0-b9.3.2, agent)"},
+        {"bazel": "8.8.2", "proof": 2, "tier": "nightly", "evidence": "gazelle-go B1 (gz0.54.0, 8.8.2, agent)"}
+      ]
+    },
+    {
+      "fixture": "heavy/gazelle_directory/bzlmod/e7",
+      "test": "bazel_canary_baseline_gazelle_directory_bzlmod_e7",
+      "system": "bzlmod",
+      "shape": "go_deps over a go.mod that already holds a directory replace: go_deps maps it to go_repository(local_path), the mechanism of the directory lanes",
+      "pins": {"gazelle": "0.45.0", "rules_go": "0.53.0"},
+      "registries": ["goproxy"],
+      "fetch": "tool",
+      "hosts": ["bcr.bazel.build", "github.com", "go.dev", "dl.google.com", "proxy.golang.org"],
+      "probe": {"label": "lib.go", "sha256": "9deedc9bf5acbfc8ef4484fc11db8620bb1c1a18e9fb4f998c69d1e9d3a390c0"},
+      "consumer": "OUT: PRISTINE",
+      "toolchains": ["go_sdk"],
+      "cells": [
+        {"bazel": "7.7.2", "proof": 2, "tier": "nightly", "evidence": "gazelle-go G1 (gz0.45.0-b7.7.2, agent)"}
+      ]
+    }
+  ]
+}

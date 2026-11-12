@@ -1,0 +1,57 @@
+{
+  "group": "heavy",
+  "ruleset": "rules_rust",
+  "fixtures": [
+    {
+      "fixture": "heavy/rules_rust/bzlmod/e9",
+      "test": "bazel_canary_baseline_rules_rust_bzlmod_e9",
+      "system": "bzlmod",
+      "shape": "crate.from_cargo with a cargo-bazel-lock.json: a hosted rewrite needs a repin",
+      "pins": {"rules_rust": "0.75.0"},
+      "registries": [],
+      "fetch": "tool",
+      "hosts": ["bcr.bazel.build", "github.com", "static.rust-lang.org", "index.crates.io", "static.crates.io"],
+      "probe": {"label": "cfg-if-1.0.0//:src/lib.rs", "sha256": "54b0f108b0dc48a077c52c0bcd22b64ef4de083e5e2b7d405e50ae4d78224f1b"},
+      "consumer": "CFG_IF=ok",
+      "toolchains": ["rust_host_tools"],
+      "cells": [
+        {"bazel": "9.3.2", "proof": 2, "tier": "nightly", "evidence": "rules-rust R1 (m75-b9)"},
+        {"bazel": "8.8.2", "proof": 2, "tier": "nightly", "evidence": "rules-rust R1 (m75-b8)"},
+        {"bazel": "7.7.2", "proof": 2, "tier": "nightly", "evidence": "rules-rust R1 (m75-b7)"}
+      ]
+    },
+    {
+      "fixture": "heavy/rules_rust/bzlmod/e9-nolock",
+      "test": "bazel_canary_baseline_rules_rust_bzlmod_e9_nolock",
+      "system": "bzlmod",
+      "shape": "crate.from_cargo without `lockfile`: every evaluation re-splices and cargo itself reads the index",
+      "pins": {"rules_rust": "0.75.0"},
+      "registries": [],
+      "fetch": "tool",
+      "hosts": ["bcr.bazel.build", "github.com", "static.rust-lang.org", "index.crates.io", "static.crates.io"],
+      "probe": {"label": "cfg-if-1.0.0//:src/lib.rs", "sha256": "54b0f108b0dc48a077c52c0bcd22b64ef4de083e5e2b7d405e50ae4d78224f1b"},
+      "consumer": "CFG_IF=ok",
+      "toolchains": ["rust_host_tools"],
+      "cells": [
+        {"bazel": "9.3.2", "proof": 2, "tier": "nightly", "evidence": "rules-rust R2 (m75nl-b9)"},
+        {"bazel": "8.8.2", "proof": 2, "tier": "nightly", "evidence": "rules-rust R2 (m75nl-b8)"}
+      ]
+    },
+    {
+      "fixture": "heavy/rules_rust/bzlmod/e7",
+      "test": "bazel_canary_baseline_rules_rust_bzlmod_e7",
+      "system": "bzlmod",
+      "shape": "crate.from_cargo without `lockfile` on the 7.x line, where nothing of the extension is recorded in MODULE.bazel.lock",
+      "pins": {"rules_rust": "0.56.0"},
+      "registries": [],
+      "fetch": "tool",
+      "hosts": ["bcr.bazel.build", "github.com", "static.rust-lang.org", "index.crates.io", "static.crates.io"],
+      "probe": {"label": "cfg-if-1.0.0//:src/lib.rs", "sha256": "54b0f108b0dc48a077c52c0bcd22b64ef4de083e5e2b7d405e50ae4d78224f1b"},
+      "consumer": "CFG_IF=ok",
+      "toolchains": ["rust_host_tools"],
+      "cells": [
+        {"bazel": "7.7.2", "proof": 2, "tier": "nightly", "evidence": "rules-rust B2 cargo (m56-b7)"}
+      ]
+    }
+  ]
+}

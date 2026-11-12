@@ -1,0 +1,39 @@
+workspace(name = "socket_fixture")
+
+load("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
+
+http_archive(
+    name = "rules_python",
+    sha256 = "daf1c27517e8526c212195345b4f6f02dd8cad69aa099d3bdb11868458211829",
+    strip_prefix = "rules_python-1.4.2",
+    url = "https://github.com/bazel-contrib/rules_python/releases/download/1.4.2/rules_python-1.4.2.tar.gz",
+)
+
+load("@rules_python//python:repositories.bzl", "py_repositories", "python_register_toolchains")
+
+py_repositories()
+
+python_register_toolchains(
+    name = "python_3_11",
+    python_version = "3.11",
+)
+
+load("@rules_python//python:pip.bzl", "pip_parse")
+
+# pip fetches here, not Bazel's downloader: the index is the test's own, and
+# the harness writes its address over the placeholder in the workspace copy.
+# On macOS requirements_darwin replaces requirements_lock.
+pip_parse(
+    name = "pypi",
+    extra_pip_args = [
+        "--index-url",
+        "http://socket-fixture.invalid/pip-mode/simple",
+    ],
+    python_interpreter_target = "@python_3_11_host//:python",
+    requirements_darwin = "//:requirements_darwin.txt",
+    requirements_lock = "//:requirements.txt",
+)
+
+load("@pypi//:requirements.bzl", "install_deps")
+
+install_deps()

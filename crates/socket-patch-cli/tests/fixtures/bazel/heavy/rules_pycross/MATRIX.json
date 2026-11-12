@@ -1,0 +1,40 @@
+{
+  "group": "heavy",
+  "ruleset": "rules_pycross",
+  "fixtures": [
+    {
+      "fixture": "heavy/rules_pycross/bzlmod/e9",
+      "test": "bazel_canary_baseline_rules_pycross_bzlmod_e9",
+      "system": "bzlmod",
+      "shape": "uv.workspace + uv.repo: the 2.0 tags, where the pyproject.toml beside the lock is a recorded input",
+      "pins": {"rules_pycross": "2.0.1"},
+      "registries": ["pypi"],
+      "fetch": "downloader",
+      "hosts": ["bcr.bazel.build", "github.com", "pypi.org", "files.pythonhosted.org"],
+      "probe": {"label": "spvictim-1.0.0-py3-none-any.whl", "sha256": "cecf23d2e612215c6512613873a29337301ed66f92a1e81810ce20d8f3bab993"},
+      "consumer": "SPVICTIM=vulnerable",
+      "toolchains": ["python_3_"],
+      "cells": [
+        {"bazel": "9.3.2", "proof": 2, "tier": "nightly", "evidence": "python-uv-pycross-aspect Y4.a (px2-uv-b9)"},
+        {"bazel": "8.8.2", "proof": 2, "tier": "nightly", "evidence": "python-uv-pycross-aspect Y4.a (px2-uv-b8)"}
+      ]
+    },
+    {
+      "fixture": "heavy/rules_pycross/bzlmod/e9-0.8.3",
+      "test": "bazel_canary_baseline_rules_pycross_bzlmod_e9_0_8_3",
+      "system": "bzlmod",
+      "shape": "lock_import.import_uv + lock_repos: the 0.x tags, with project_file as the paired manifest",
+      "pins": {"rules_pycross": "0.8.3"},
+      "registries": ["pypi"],
+      "fetch": "downloader",
+      "hosts": ["bcr.bazel.build", "github.com", "pypi.org", "files.pythonhosted.org"],
+      "probe": {"label": "spvictim-1.0.0-py3-none-any.whl", "sha256": "cecf23d2e612215c6512613873a29337301ed66f92a1e81810ce20d8f3bab993"},
+      "consumer": "SPVICTIM=vulnerable",
+      "toolchains": ["python_3_"],
+      "cells": [
+        {"bazel": "9.3.2", "proof": 2, "tier": "nightly", "evidence": "python-uv-pycross-aspect Y4.a (px0-uv-b9)"},
+        {"bazel": "8.8.2", "proof": 2, "tier": "nightly", "evidence": "python-uv-pycross-aspect Y4.a (px0-uv-b8)"}
+      ]
+    }
+  ]
+}

@@ -1,0 +1,26 @@
+load("@rules_python//python:defs.bzl", "py_binary")
+load("@rules_python//python:pip.bzl", "compile_pip_requirements")
+load("//:probe.bzl", "socket_probe")
+
+exports_files(["requirements.txt"])
+
+# Tier 0 and 1: the wheel Bazel fetched for the hub.
+socket_probe(
+    name = "socket_probe",
+    srcs = ["@pypi//spvictim:whl"],
+)
+
+# Tier 2: prints SPVICTIM=vulnerable until the package is patched.
+py_binary(
+    name = "consumer",
+    srcs = ["consumer.py"],
+    deps = ["@pypi//spvictim"],
+)
+
+# The lock check a hosted rewrite turns red: `//:requirements.test` compares
+# the file with a fresh pip-compile of requirements.in.
+compile_pip_requirements(
+    name = "requirements",
+    src = "requirements.in",
+    requirements_txt = "requirements.txt",
+)

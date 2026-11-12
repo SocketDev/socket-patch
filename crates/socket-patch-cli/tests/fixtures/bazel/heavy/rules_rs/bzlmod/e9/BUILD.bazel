@@ -1,0 +1,17 @@
+load("@rules_rs//rs:rust_binary.bzl", "rust_binary")
+load("//:probe.bzl", "socket_probe")
+
+# Tier 0: the sources of the crate the hub fetched. Tier 1 compiles the
+# library: a source file of another repository is not visible on Bazel 9.
+socket_probe(
+    name = "socket_probe",
+    srcs = ["@crates//:cfg-if"],
+)
+
+# Tier 2: prints CFG_IF=ok through the crate's macro.
+rust_binary(
+    name = "consumer",
+    srcs = ["src/main.rs"],
+    edition = "2021",
+    deps = ["@crates//:cfg-if"],
+)

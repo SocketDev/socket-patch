@@ -1,0 +1,39 @@
+{
+  "group": "heavy",
+  "ruleset": "aspect_rules_py",
+  "fixtures": [
+    {
+      "fixture": "heavy/aspect_rules_py/bzlmod/e9",
+      "test": "bazel_canary_baseline_aspect_rules_py_bzlmod_e9",
+      "system": "bzlmod",
+      "shape": "uv.project(lock =, pyproject =): the watched uv lock of the hub",
+      "pins": {"aspect_rules_py": "1.13.0"},
+      "registries": ["pypi"],
+      "fetch": "downloader",
+      "hosts": ["bcr.bazel.build", "github.com", "pypi.org", "files.pythonhosted.org"],
+      "probe": {"label": "spvictim-1.0.0-py3-none-any.whl", "sha256": "cecf23d2e612215c6512613873a29337301ed66f92a1e81810ce20d8f3bab993"},
+      "consumer": "SPVICTIM=vulnerable",
+      "toolchains": [],
+      "cells": [
+        {"bazel": "9.3.2", "proof": 2, "tier": "nightly", "evidence": "python-uv-pycross-aspect Y4.a (as113-b9)"},
+        {"bazel": "8.8.2", "proof": 2, "tier": "nightly", "evidence": "python-uv-pycross-aspect Y4.a (as113-b8)"}
+      ]
+    },
+    {
+      "fixture": "heavy/aspect_rules_py/bzlmod/e8-canary",
+      "test": "bazel_canary_baseline_aspect_rules_py_bzlmod_e8_canary",
+      "system": "bzlmod",
+      "shape": "uv.lockfile(src =) on a release that never watches the lock: the refused shape, kept for the stale-build canary",
+      "pins": {"aspect_rules_py": "1.8.4"},
+      "registries": ["pypi"],
+      "fetch": "downloader",
+      "hosts": ["bcr.bazel.build", "github.com", "pypi.org", "files.pythonhosted.org"],
+      "probe": {"label": "spvictim-1.0.0-py3-none-any.whl", "sha256": "cecf23d2e612215c6512613873a29337301ed66f92a1e81810ce20d8f3bab993"},
+      "consumer": "SPVICTIM=vulnerable",
+      "toolchains": [],
+      "cells": [
+        {"bazel": "8.8.2", "proof": 2, "tier": "nightly", "evidence": "python-uv-pycross-aspect Y4.a (as184-b8)"}
+      ]
+    }
+  ]
+}

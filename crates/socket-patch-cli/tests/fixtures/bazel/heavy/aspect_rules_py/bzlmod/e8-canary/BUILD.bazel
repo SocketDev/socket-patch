@@ -1,0 +1,18 @@
+load("@aspect_rules_py//py:defs.bzl", "py_binary")
+load("//:probe.bzl", "socket_probe")
+
+exports_files(["uv.lock", "pyproject.toml"])
+
+# Tier 0: the wheel behind the hub target. Tier 1 builds the library: the
+# wheel is installed by a build action, so only tier 2 shows what it holds.
+socket_probe(
+    name = "socket_probe",
+    srcs = ["@pypi//spvictim"],
+)
+
+# Tier 2: prints SPVICTIM=vulnerable until the package is patched.
+py_binary(
+    name = "consumer",
+    srcs = ["consumer.py"],
+    deps = ["@pypi//spvictim"],
+)

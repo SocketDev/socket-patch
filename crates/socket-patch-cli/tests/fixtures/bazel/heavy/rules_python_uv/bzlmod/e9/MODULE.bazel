@@ -1,0 +1,20 @@
+module(name = "socket_fixture", version = "0.0.0")
+
+# BCR lists no rules_python 2.5.0, only its release candidates; rc4 is the
+# commit the 2.5.0 tag names. Move the pin when BCR lists the release.
+bazel_dep(name = "rules_python", version = "2.5.0-rc4")
+single_version_override(module_name = "rules_python", version = "2.5.0-rc4")
+
+python = use_extension("@rules_python//python/extensions:python.bzl", "python")
+python.toolchain(
+    is_default = True,
+    python_version = "3.12",
+)
+
+pip = use_extension("@rules_python//python/extensions:pip.bzl", "pip")
+pip.parse(
+    hub_name = "pypi",
+    python_version = "3.12",
+    uv_lock = "//:uv.lock",
+)
+use_repo(pip, "pypi")

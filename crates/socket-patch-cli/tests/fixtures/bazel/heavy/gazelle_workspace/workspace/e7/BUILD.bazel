@@ -1,0 +1,17 @@
+load("@io_bazel_rules_go//go:def.bzl", "go_binary")
+load("//:probe.bzl", "socket_probe")
+
+# gazelle:prefix example.com/consumer
+# Tier 0: the sources of the module go_repository fetched. Tier 1 compiles the
+# library: a source file of another repository is not visible on Bazel 9.
+socket_probe(
+    name = "socket_probe",
+    srcs = ["@com_example_upstream//:upstream"],
+)
+
+# Tier 2: prints OUT: PRISTINE until the module is patched.
+go_binary(
+    name = "consumer",
+    srcs = ["main.go"],
+    deps = ["@com_example_upstream//:upstream"],
+)
