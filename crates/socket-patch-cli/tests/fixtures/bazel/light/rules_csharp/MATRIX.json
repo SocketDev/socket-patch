@@ -1,0 +1,36 @@
+{
+  "group": "light",
+  "ruleset": "rules_csharp",
+  "registries": [
+    "nuget"
+  ],
+  "probe": [
+    {
+      "anchor": "sha256",
+      "label": "SP.Victim.dll",
+      "artifact": "api.nuget.org/v3-flatcontainer/sp.victim/1.0.0/sp.victim.1.0.0.nupkg",
+      "member": "lib/netstandard2.0/SP.Victim.dll"
+    }
+  ],
+  "fixtures": [
+    {
+      "path": "bzlmod/e9",
+      "test": "bazel_canary_baseline_rules_csharp_bzlmod_e9",
+      "system": "bzlmod",
+      "pins": {
+        "rules_csharp": "0.5.0"
+      },
+      "shape": "nuget.from_lock over packages.lock.json and nuget.config",
+      "cells": [
+        {
+          "bazel": "9.3.2",
+          "tier": "nightly"
+        },
+        {
+          "bazel": "8.8.2",
+          "tier": "nightly"
+        }
+      ]
+    }
+  ]
+}

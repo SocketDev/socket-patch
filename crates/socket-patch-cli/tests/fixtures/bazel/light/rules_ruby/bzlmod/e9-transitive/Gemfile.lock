@@ -1,0 +1,23 @@
+GEM
+  remote: https://rubygems.org/
+  specs:
+    sp-other (1.0.0)
+    sp-parent (1.0.0)
+      sp-victim
+    sp-victim (1.0.0)
+
+PLATFORMS
+  arm64-darwin-25
+  ruby
+
+DEPENDENCIES
+  sp-other (= 1.0.0)
+  sp-parent (= 1.0.0)
+
+CHECKSUMS
+  sp-other (1.0.0) sha256=2afcdcb0502f3f62f9c72cc5922b74b0b922095a969cda9f041469fd8240e20c
+  sp-parent (1.0.0) sha256=c7e4124495f37bb2b5ccc7ec8f2abd4213f87bc465c88667e42444ba2bd556de
+  sp-victim (1.0.0) sha256=8d0b87effed74620f9b1b7a9dff03f2fb376f74d9fbc9540a7d7ced335052c70
+
+BUNDLED WITH
+  4.0.15

@@ -1,0 +1,115 @@
+{
+  "group": "light",
+  "ruleset": "rules_jvm_external",
+  "registries": [
+    "maven"
+  ],
+  "probe": [
+    {
+      "anchor": "file_jar",
+      "jar": "slf4j-api-1.7.36.jar",
+      "artifact": "repo1.maven.org/maven2/org/slf4j/slf4j-api/1.7.36/slf4j-api-1.7.36.jar"
+    }
+  ],
+  "fixtures": [
+    {
+      "path": "bzlmod/e9",
+      "test": "bazel_canary_baseline_rules_jvm_external_bzlmod_e9",
+      "system": "bzlmod",
+      "pins": {
+        "rules_jvm_external": "7.2"
+      },
+      "shape": "maven_install.json v3, sorted flavor, two repositories",
+      "cells": [
+        {
+          "bazel": "9.3.2",
+          "tier": "nightly"
+        },
+        {
+          "bazel": "8.8.2",
+          "tier": "nightly"
+        },
+        {
+          "bazel": "7.7.2",
+          "tier": "nightly"
+        }
+      ]
+    },
+    {
+      "path": "bzlmod/e9-two-hubs",
+      "test": "bazel_canary_baseline_rules_jvm_external_bzlmod_e9_two_hubs",
+      "system": "bzlmod",
+      "pins": {
+        "rules_jvm_external": "7.2"
+      },
+      "shape": "two hubs, each with its own v3 lock that pins the same artifacts",
+      "cells": [
+        {
+          "bazel": "9.3.2",
+          "tier": "nightly"
+        },
+        {
+          "bazel": "8.8.2",
+          "tier": "nightly"
+        }
+      ]
+    },
+    {
+      "path": "bzlmod/e8-insertion",
+      "test": "bazel_canary_baseline_rules_jvm_external_bzlmod_e8_insertion",
+      "system": "bzlmod",
+      "pins": {
+        "rules_jvm_external": "6.10"
+      },
+      "shape": "maven_install.json v3, insertion flavor, two repositories",
+      "cells": [
+        {
+          "bazel": "8.8.2",
+          "tier": "nightly"
+        }
+      ]
+    },
+    {
+      "path": "bzlmod/e7-v2",
+      "test": "bazel_canary_baseline_rules_jvm_external_bzlmod_e7_v2",
+      "system": "bzlmod",
+      "pins": {
+        "rules_jvm_external": "6.5"
+      },
+      "shape": "maven_install.json v2",
+      "cells": [
+        {
+          "bazel": "7.7.2",
+          "tier": "nightly"
+        }
+      ]
+    },
+    {
+      "path": "bzlmod/e9-unpinned",
+      "test": "bazel_canary_baseline_rules_jvm_external_bzlmod_e9_unpinned",
+      "system": "bzlmod",
+      "pins": {
+        "rules_jvm_external": "7.2"
+      },
+      "shape": "an unpinned hub: no lock file, Coursier resolves on every cold fetch from a loopback repository; the shape the unpinned_hub guard refuses",
+      "cells": [
+        {
+          "bazel": "9.3.2",
+          "tier": "nightly"
+        },
+        {
+          "bazel": "8.8.2",
+          "tier": "nightly"
+        }
+      ],
+      "probe": [
+        {
+          "anchor": "sha256",
+          "label": "slf4j-api-1.7.36.jar",
+          "artifact": "repo1.maven.org/maven2/org/slf4j/slf4j-api/1.7.36/slf4j-api-1.7.36.jar"
+        }
+      ],
+      "loopback_repository": "http://127.0.0.1:18731/maven2"
+    }
+  ]
+}

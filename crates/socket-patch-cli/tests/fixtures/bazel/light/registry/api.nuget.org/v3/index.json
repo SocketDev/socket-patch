@@ -1,0 +1,10 @@
+{
+  "version": "3.0.0",
+  "resources": [
+    {
+      "@id": "https://api.nuget.org/v3-flatcontainer/",
+      "@type": "PackageBaseAddress/3.0.0",
+      "comment": "Base URL of where NuGet packages are stored, in the format https://api.nuget.org/v3-flatcontainer/{id-lower}/{version-lower}/{id-lower}.{version-lower}.nupkg"
+    }
+  ]
+}

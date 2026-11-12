@@ -1,0 +1,16 @@
+module(name = "socket_fixture_rules_csharp")
+
+bazel_dep(name = "rules_csharp", version = "0.5.0")
+
+# The ruleset under test stays at the version this fixture is written for.
+single_version_override(
+    module_name = "rules_csharp",
+    version = "0.5.0",
+)
+
+nuget = use_extension("@rules_csharp//csharp:extensions.bzl", "nuget")
+nuget.from_lock(
+    nuget_config = "//:nuget.config",
+    packages_lock_json = "//:packages.lock.json",
+)
+use_repo(nuget, "nuget", "nuget_sp_other", "nuget_sp_victim")

@@ -1,0 +1,29 @@
+module(name = "socket_fixture_rules_ruby")
+
+bazel_dep(name = "rules_ruby", version = "1.0.0-rc2")
+
+# The ruleset under test stays at the version this fixture is written for.
+single_version_override(
+    module_name = "rules_ruby",
+    version = "1.0.0-rc2",
+)
+
+ruby = use_extension("@rules_ruby//ruby:extensions.bzl", "ruby")
+ruby.toolchain(
+    name = "ruby",
+    portable_ruby = True,
+    version = "3.4.10",
+)
+ruby.bundle_fetch(
+    name = "bundle",
+    gem_checksums = {
+        "sp-other-1.0.0": "2afcdcb0502f3f62f9c72cc5922b74b0b922095a969cda9f041469fd8240e20c",
+        "sp-parent-1.0.0": "c7e4124495f37bb2b5ccc7ec8f2abd4213f87bc465c88667e42444ba2bd556de",
+        "sp-victim-1.0.0": "8d0b87effed74620f9b1b7a9dff03f2fb376f74d9fbc9540a7d7ced335052c70",
+    },
+    gemfile = "//:Gemfile",
+    gemfile_lock = "//:Gemfile.lock",
+)
+use_repo(ruby, "bundle", "ruby", "ruby_toolchains")
+
+register_toolchains("@ruby_toolchains//:all")

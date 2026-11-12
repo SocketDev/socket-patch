@@ -1,0 +1,5 @@
+framework: net8.0
+source https://api.nuget.org/v3/index.json
+
+nuget SP.Victim 1.0.0
+nuget SP.Other 1.0.0

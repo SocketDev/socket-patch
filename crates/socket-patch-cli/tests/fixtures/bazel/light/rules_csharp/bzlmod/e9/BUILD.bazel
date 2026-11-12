@@ -1,0 +1,24 @@
+load("@rules_csharp//csharp:defs.bzl", "csharp_binary")
+load("//:probe.bzl", "socket_probe")
+
+# The `nuget` extension reads both files by label.
+exports_files([
+    "nuget.config",
+    "packages.lock.json",
+])
+
+# Tiers 0 and 1: the assembly, the one file rules_csharp keeps of the
+# package it unpacked.
+socket_probe(
+    name = "socket_probe",
+    srcs = ["@nuget_sp_victim//:lib/netstandard2.0/SP.Victim.dll"],
+)
+
+# Tier 2: a C# program that prints the marker at the head of the package's
+# assembly. The fixture package holds a placeholder assembly, so the
+# program takes it as data and not as a reference.
+csharp_binary(
+    name = "consumer",
+    srcs = ["Consumer.cs"],
+    data = ["@nuget_sp_victim//:lib/netstandard2.0/SP.Victim.dll"],
+)

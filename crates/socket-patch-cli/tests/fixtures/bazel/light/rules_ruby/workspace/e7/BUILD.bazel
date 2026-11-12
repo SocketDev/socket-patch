@@ -1,0 +1,17 @@
+load("@rules_ruby//ruby:defs.bzl", "rb_binary")
+load("//:probe.bzl", "socket_probe")
+
+# Tiers 0 and 1: the gem file Bazel fetched into the bundle repository.
+socket_probe(
+    name = "socket_probe",
+    srcs = ["@bundle//:sp-victim-1.0.0"],
+)
+
+# Tier 2: Bundler installs the fetched gems in a build action and the
+# program prints a constant from the installed one.
+rb_binary(
+    name = "consumer",
+    srcs = ["consumer.rb"],
+    main = "consumer.rb",
+    deps = ["@bundle"],
+)

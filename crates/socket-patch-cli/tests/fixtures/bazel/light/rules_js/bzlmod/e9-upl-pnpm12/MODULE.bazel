@@ -1,0 +1,26 @@
+module(name = "socket_fixture_rules_js")
+
+bazel_dep(name = "aspect_rules_js", version = "3.6.0")
+
+# The ruleset under test stays at the version this fixture is written for:
+# without the override another module's requirement can lift it.
+single_version_override(
+    module_name = "aspect_rules_js",
+    version = "3.6.0",
+)
+
+npm = use_extension("@aspect_rules_js//npm:extensions.bzl", "npm")
+npm.npm_translate_lock(
+    name = "npm",
+    pnpm_lock = "//:pnpm-lock.yaml",
+    update_pnpm_lock = True,
+)
+use_repo(npm, "npm")
+
+# The pnpm that Bazel runs when the hash file is out of date.
+pnpm = use_extension("@aspect_rules_js//npm:extensions.bzl", "pnpm")
+pnpm.pnpm(
+    name = "pnpm",
+    pnpm_version = "12.17.0",
+)
+use_repo(pnpm, "pnpm")

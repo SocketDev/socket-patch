@@ -1,0 +1,15 @@
+load("//:probe.bzl", "socket_probe")
+
+# The pnpm lock, and with it every linked package, is in the `app` package.
+socket_probe(
+    name = "socket_probe",
+    srcs = [
+        "//app:node_modules/@tootallnate/once/dir",
+        "//app:node_modules/left-pad/dir",
+    ],
+)
+
+alias(
+    name = "consumer",
+    actual = "//app:consumer",
+)
