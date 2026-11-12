@@ -425,6 +425,17 @@ pub async fn apply_go_redirect<'a>(
         return result;
     }
 
+    // Under a Bazel root the copy's upstream BUILD files would join `//...`
+    // and break the build: the root's `.bazelignore` line comes first, and
+    // where it cannot be written the tree is not created.
+    let ignore_note =
+        match crate::utils::bazel_root_writes::before_agent_go_tree(project_root, base_rel).await {
+            Ok(note) => note,
+            Err(refusal) => {
+                return synthesized_result(purl, &copy_dir, Vec::new(), false, Some(refusal))
+            }
+        };
+
     if let Err(e) = crate::patch::copy_tree::fresh_copy(pristine_src.path(), &copy_dir, None).await
     {
         teardown_failed_redirect(project_root, &copy_dir, module, version, base_rel).await;
@@ -484,6 +495,7 @@ pub async fn apply_go_redirect<'a>(
         return result;
     }
 
+    result.error = crate::utils::bazel_root_writes::with_note(result.error.take(), ignore_note);
     result
 }
 

@@ -1440,6 +1440,12 @@ fn skipped_files_note(verified: &[VerifyResult]) -> Option<String> {
 /// `note` (its `error` with `success: true`) carries, by marker. One note
 /// can join several advisories with `"; "`.
 pub fn advisory_warning_codes(note: &str) -> Vec<&'static str> {
+    // A `.bazelignore` line the agent Go writer added, or could not add
+    // for a tree that is already there (`utils::bazel_root_writes`): the
+    // note names the code itself.
+    use crate::bazel::codes::Code;
+    let ignore_line_added = Code::WorkspaceIgnoreLineAdded.as_str();
+    let ignore_line_needed = Code::WorkspaceIgnoreLineNeeded.as_str();
     [
         (OWNERSHIP_NOT_RESTORED_MARKER, "ownership_not_restored"),
         (
@@ -1447,6 +1453,8 @@ pub fn advisory_warning_codes(note: &str) -> Vec<&'static str> {
             "stale_bytecode_not_removed",
         ),
         (FILES_SKIPPED_MARKER, "patch_files_skipped"),
+        (ignore_line_added, ignore_line_added),
+        (ignore_line_needed, ignore_line_needed),
     ]
     .into_iter()
     .filter(|(marker, _)| note.contains(marker))
