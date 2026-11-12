@@ -15,11 +15,13 @@
 //! - the final value decides, never an earlier occurrence;
 //! - a value that only some reading reaches is `Possible`: a `--config`,
 //!   a release of the line (the `always` section exists from 6.3.0,
-//!   `fetch` inherits `test` from 7.0.0, `startup:<os>` applies from
-//!   9.0.0, `try-import-if-bazel-version`), or an import path Bazel
-//!   resolves against the directory it is started in;
+//!   `fetch` inherits `test` on 7.1.0 and from 7.2.0, `vendor` from
+//!   7.3.0, `startup:<os>` applies from 9.0.2,
+//!   `try-import-if-bazel-version`), or an import path Bazel resolves
+//!   against the directory it is started in;
 //! - a file Bazel loads and this reader cannot read is a gap, never
-//!   "not set".
+//!   "not set", and a state says only what the files that were read
+//!   say: [`EffectiveFlags::gaps`] is checked beside every state.
 //!
 //! Only tracked, in-repository rc files are read. The home and system rc,
 //! `$BAZELRC`, `--bazelrc` and the command line are a documented blind
@@ -46,13 +48,16 @@ pub const OTHERWISE: &str = "[otherwise]";
 /// What the tracked rc files say about one flag on one command chain.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FlagState<T> {
-    /// The final value on every reading: no config, release of the line
-    /// or working directory changes it.
+    /// The final value in what was read: no config, release of the line
+    /// or working directory changes it. A file that could not be read
+    /// still may: a hard gap of [`EffectiveFlags::gaps`] overrides it.
     Set(T),
     /// The value depends on the reading. Keys: a config name (the value
     /// under `--config=<name>`), [`PLAIN`], or a bracketed condition such
     /// as `[Bazel 6.3.0 or newer]` or `ci [import user.bazelrc]`. A
-    /// reading no key covers leaves the flag unset.
+    /// config whose name holds `[` or `"` is keyed `config "<name>"`,
+    /// so no config name reads as a bracketed key. A reading no key
+    /// covers leaves the flag unset.
     Possible(BTreeMap<String, T>),
     /// Not set in what was read, and a file Bazel is sure to load could
     /// not be read: hosted writes are refused and VEX is withheld.
@@ -337,7 +342,8 @@ impl Chain {
     }
 }
 
-/// The command each command inherits rc lines from.
+/// The command each command inherits rc lines from. `fetch` and `vendor`
+/// inherit only on some releases: [`sections`] gates them.
 const PARENTS: &[(&str, &str)] = &[
     ("test", "build"),
     ("run", "build"),
@@ -358,9 +364,45 @@ const PARENTS: &[(&str, &str)] = &[
 const OS_CONFIGS: [&str; 5] = ["linux", "macos", "windows", "freebsd", "openbsd"];
 
 const ALWAYS_SINCE: BazelVersion = BazelVersion::new(6, 3, 0);
-const FETCH_INHERITS_SINCE: BazelVersion = BazelVersion::new(7, 0, 0);
-/// Observed on 9.0.2 and not on 8.8.2 (probe S8).
-const STARTUP_OS_SINCE: BazelVersion = BazelVersion::new(9, 0, 0);
+/// `VendorCommand.java` names `TestCommand` from 7.3.0 (7.3.0rc1
+/// included) and not in 7.1.0 to 7.2.1.
+const VENDOR_INHERITS_SINCE: BazelVersion = BazelVersion::new(7, 3, 0);
+/// `option_processor.cc` looks `startup:<os>` up from 9.0.2 (9.0.2rc3
+/// included; not 9.0.0, 9.0.1 or 9.0.2rc1). Observed on 9.0.2 and not on
+/// 8.8.2 (probe S8).
+const STARTUP_OS_SINCE: BazelVersion = BazelVersion::new(9, 0, 2);
+
+/// Whether `line` has a behaviour that final releases have from `first`.
+/// A candidate of `first` itself may or may not have it (7.3.0rc1 has
+/// `vendor` inherit `test`; 9.0.2rc1 lacks `startup:<os>` and 9.0.2rc3
+/// has it), so it is `Maybe` and never `No`: the tokens become
+/// `Possible`, and a hazard flag does not read as absent.
+fn has_since(line: &BazelLine, first: BazelVersion) -> Tri {
+    match line.at_least(first) {
+        Tri::No if line.hi.is_some_and(|hi| hi.release() >= first) => Tri::Maybe,
+        known => known,
+    }
+}
+
+/// Whether `fetch` inherits the `test` rc sections on `line`.
+/// `FetchCommand.java` names `TestCommand` in 7.1.0, not in 7.1.1 or
+/// 7.1.2, and again from 7.2.0. Candidates: 7.1.1rc1 and 7.2.0rc1 have
+/// it and 7.1.0rc1 has not, so a candidate of one of the three releases
+/// is `Maybe`.
+fn fetch_inherits(line: &BazelLine) -> Tri {
+    let first = BazelVersion::new(7, 1, 0);
+    let dropped = BazelVersion::new(7, 1, 1);
+    let again = BazelVersion::new(7, 2, 0);
+    let from = |release| line.lo.is_some_and(|lo| lo >= release);
+    let before = |release| line.hi.is_some_and(|hi| hi.release() < release);
+    if line.exact() == Some(first) || from(again) {
+        Tri::Yes
+    } else if before(first) || (from(dropped) && before(again)) {
+        Tri::No
+    } else {
+        Tri::Maybe
+    }
+}
 
 /// One rc section of a command's chain, and whether it applies on the
 /// line.
@@ -380,10 +422,14 @@ fn sections<'a>(command: &'a str, line: &BazelLine) -> Vec<Section<'a>> {
     }
     let (mut at, mut gate) = (command, Gate::open());
     while let Some((_, parent)) = PARENTS.iter().find(|(child, _)| *child == at) {
-        if at == "fetch" {
-            let since = line.at_least(FETCH_INHERITS_SINCE);
-            gate = gate.and(since, "Bazel 7.0.0 or newer");
-        }
+        gate = match at {
+            "fetch" => gate.and(fetch_inherits(line), "Bazel 7.1.0, or 7.2.0 or newer"),
+            "vendor" => {
+                let since = has_since(line, VENDOR_INHERITS_SINCE);
+                gate.and(since, "Bazel 7.3.0 or newer")
+            }
+            _ => gate,
+        };
         let section = Section {
             name: parent,
             gate: gate.clone(),
@@ -391,7 +437,7 @@ fn sections<'a>(command: &'a str, line: &BazelLine) -> Vec<Section<'a>> {
         out.insert(0, section);
         at = parent;
     }
-    let always = Gate::open().and(line.at_least(ALWAYS_SINCE), "Bazel 6.3.0 or newer");
+    let always = Gate::open().and(has_since(line, ALWAYS_SINCE), "Bazel 6.3.0 or newer");
     let common = Section {
         name: "common",
         gate: Gate::open(),
@@ -516,7 +562,8 @@ pub struct RcGap {
     /// file.
     pub hard: bool,
     /// Root-relative path of the file that was not read, or the
-    /// `file:line` of an import statement Bazel stops on.
+    /// `file:line` of an import statement Bazel stops on or whose path
+    /// this reader cannot name.
     pub file: String,
     pub detail: String,
 }
@@ -708,6 +755,8 @@ impl Default for RcFiles {
 /// the other script readers.
 const MAX_DEPTH: usize = 8;
 const MAX_FILES: usize = 512;
+/// Bazel has no limit on config nesting either (it warns from ten
+/// levels); a chain past this depth is not evaluated.
 const MAX_CONFIG_DEPTH: usize = 50;
 /// Nested configs can expand without bound (`a` twice in `b`, `b` twice
 /// in `c`); past this many tokens a chain is not evaluated.
@@ -795,7 +844,8 @@ impl RcFiles {
         });
         self.reads += 1;
         for (line, text) in logical_lines(bytes) {
-            let words: Vec<String> = tokenize(&text)
+            let raw = tokenize(&text);
+            let words: Vec<String> = raw
                 .iter()
                 .map(|word| String::from_utf8_lossy(word).into_owned())
                 .collect();
@@ -819,15 +869,23 @@ impl RcFiles {
                     continue;
                 }
             };
-            self.import(view, import, args, cond, stack, &format!("{path}:{line}"));
+            // A path is bytes to Bazel and text to a `FileView`.
+            let named: Vec<bool> = raw[1..]
+                .iter()
+                .map(|word| std::str::from_utf8(word).is_ok())
+                .collect();
+            let here = format!("{path}:{line}");
+            self.import(view, import, (args, &named), cond, stack, &here);
         }
     }
 
+    /// One import statement. `args` are its words after the keyword, and
+    /// whether each is UTF-8.
     fn import(
         &mut self,
         view: &dyn FileView,
         kind: Import,
-        args: &[String],
+        (args, named): (&[String], &[bool]),
         mut cond: usize,
         stack: &mut Vec<String>,
         here: &str,
@@ -857,6 +915,13 @@ impl RcFiles {
                 )
             }
         };
+        // Bazel opens the path's bytes. The lossy text names another
+        // file, so a file Bazel may read is one this reader cannot ask
+        // for: never the usual missing per-user file.
+        if named.last() == Some(&false) {
+            let detail = "imports a path that is not UTF-8; socket-patch cannot read it";
+            return self.gap(true, here, detail, cond);
+        }
         let hard = kind == Import::Plain;
         let rel = match target.strip_prefix("%workspace%/") {
             Some(rest) => root_relative(rest),
@@ -877,8 +942,12 @@ impl RcFiles {
         if stack.contains(&rel) {
             return self.gap(true, &rel, "imports itself; Bazel stops on the loop", cond);
         }
-        if stack.len() > MAX_DEPTH || self.reads >= MAX_FILES {
+        if stack.len() > MAX_DEPTH {
             return self.gap(true, &rel, "is nested deeper than socket-patch reads", cond);
+        }
+        if self.reads >= MAX_FILES {
+            let detail = "is one rc file more than socket-patch reads";
+            return self.gap(true, &rel, detail, cond);
         }
         match view.read(&rel) {
             FileText::Bytes(bytes) => {
@@ -895,7 +964,22 @@ impl RcFiles {
                 );
             }
             FileText::Absent => self.gap(false, &rel, "is not in the repository", cond),
-            FileText::Unreadable => self.gap(hard, &rel, "cannot be read", cond),
+            FileText::Unreadable if hard => self.gap(true, &rel, "cannot be read", cond),
+            // Bazel skips a `try-import` target it cannot read, a
+            // directory included. A file that is there and that this
+            // reader cannot read (its size cap, another user's file) may
+            // be one Bazel reads: unreadable is not absent. Past the read
+            // boundary nothing can be listed, and the file is the usual
+            // optional one.
+            FileText::Unreadable => {
+                let (dir, name) = rel.rsplit_once('/').unwrap_or(("", &rel));
+                let listed = view.list(dir).unwrap_or_default();
+                if listed.iter().any(|entry| entry == name) {
+                    self.gap(true, &rel, "exists and cannot be read", cond);
+                } else {
+                    self.gap(false, &rel, "cannot be read", cond);
+                }
+            }
         }
     }
 
@@ -1022,12 +1106,21 @@ struct Options<'a> {
     /// Tokens visited while expanding configs, the ones that expand to
     /// nothing included.
     work: usize,
+    /// A config nested deeper than [`MAX_CONFIG_DEPTH`] was not expanded.
+    too_deep: bool,
 }
 
 impl Options<'_> {
-    /// Whether the expansion was abandoned: the sequence is incomplete.
-    fn cut_short(&self) -> bool {
-        self.work > MAX_OPTIONS
+    /// Why the expansion was abandoned, when it was: the sequence is
+    /// incomplete, and what it lacks may set any flag.
+    fn cut_short(&self) -> Option<&'static str> {
+        if self.work > MAX_OPTIONS {
+            Some("the rc configs expand to more options than socket-patch reads")
+        } else if self.too_deep {
+            Some("the rc configs nest deeper than socket-patch follows")
+        } else {
+            None
+        }
     }
 }
 
@@ -1176,7 +1269,7 @@ impl EffectiveFlags {
         let mut items = items.into_iter();
         while let Some(item) = items.next() {
             out.work += 1;
-            if out.cut_short() {
+            if out.work > MAX_OPTIONS {
                 return;
             }
             let token = item.entry.token.as_str();
@@ -1194,7 +1287,13 @@ impl EffectiveFlags {
                 }
             };
             // Bazel stops on a config that expands to itself.
-            if stack.contains(&name) || stack.len() >= MAX_CONFIG_DEPTH {
+            if stack.contains(&name) {
+                continue;
+            }
+            // Bazel follows a chain of any depth, so what lies below
+            // this one is unread, not absent.
+            if stack.len() >= MAX_CONFIG_DEPTH {
+                out.too_deep = true;
                 continue;
             }
             stack.push(name.clone());
@@ -1226,12 +1325,12 @@ impl EffectiveFlags {
 
     /// What `--config=<name>` on the command line adds after the options
     /// of [`Self::plain`]. For `startup` the only configs are the OS
-    /// names, which Bazel 9 applies by itself on that OS.
+    /// names, which Bazel applies by itself on that OS from 9.0.2.
     fn under_config(&self, command: &str, name: &str) -> Options<'_> {
         let mut out = Options::default();
         if command == "startup" {
-            let since = self.line.at_least(STARTUP_OS_SINCE);
-            let gate = Gate::open().and(since, "Bazel 9.0.0 or newer");
+            let since = has_since(&self.line, STARTUP_OS_SINCE);
+            let gate = Gate::open().and(since, "Bazel 9.0.2 or newer");
             out.items = self.section(&format!("startup:{name}"), &gate);
             return out;
         }
@@ -1269,6 +1368,30 @@ impl EffectiveFlags {
         names
     }
 
+    /// The tracked settings of every command line of `command`: the ones
+    /// each gets, then what each config adds after them. `Err` when an
+    /// expansion was cut short: what it lacks may set any flag.
+    fn sequences(&self, command: &str) -> Result<Sequences<'_>, String> {
+        fn read<'a>(
+            options: Options<'a>,
+            cut_short: &mut Option<&'static str>,
+        ) -> Vec<Setting<'a>> {
+            *cut_short = cut_short.or(options.cut_short());
+            settings(&options.items)
+        }
+        let mut cut_short = None;
+        let plain = read(self.plain(command), &mut cut_short);
+        let mut configs = Vec::new();
+        for config in self.configs(command) {
+            let own = read(self.under_config(command, &config), &mut cut_short);
+            configs.push((config, own));
+        }
+        match cut_short {
+            Some(why) => Err(why.to_string()),
+            None => Ok(Sequences { plain, configs }),
+        }
+    }
+
     /// The state of the value `pick` extracts, last one wins: under no
     /// config, then under each config in turn. A flag set under two
     /// configs at once takes one of the values found here, because the
@@ -1278,28 +1401,24 @@ impl EffectiveFlags {
         chain: Chain,
         pick: impl Fn(&Setting<'_>) -> Option<T>,
     ) -> FlagState<T> {
-        let command = chain.name();
-        let mut cut_short = false;
-        let mut picked = |options: Options<'_>| -> Vec<(T, Gate)> {
-            cut_short |= options.cut_short();
-            let found = settings(&options.items);
+        let sequences = match self.sequences(chain.name()) {
+            Ok(sequences) => sequences,
+            Err(why) => return FlagState::UnknowableHard(why),
+        };
+        let picked = |found: &[Setting<'_>]| -> Vec<(T, Gate)> {
             let values = found
                 .iter()
                 .filter_map(|s| Some((pick(s)?, s.gate.clone())));
             values.collect()
         };
-        let plain = picked(self.plain(command));
+        let plain = picked(&sequences.plain);
         let mut by_reading = BTreeMap::new();
-        finals(&plain, &[], PLAIN, &mut by_reading);
-        for config in self.configs(command) {
-            let own = picked(self.under_config(command, &config));
+        finals(&plain, &[], None, &mut by_reading);
+        for (config, own) in &sequences.configs {
+            let own = picked(own);
             if !own.is_empty() {
-                finals(&plain, &own, &config, &mut by_reading);
+                finals(&plain, &own, Some(config), &mut by_reading);
             }
-        }
-        if cut_short {
-            let why = "the rc configs expand to more options than socket-patch reads";
-            return FlagState::UnknowableHard(why.to_string());
         }
         match by_reading.get(PLAIN) {
             _ if by_reading.is_empty() => self.unseen(),
@@ -1344,35 +1463,85 @@ impl EffectiveFlags {
         })
     }
 
+    fn occurrence(&self, setting: &Setting<'_>, config: &str) -> Occurrence {
+        Occurrence {
+            spelling: setting.spelling,
+            value: setting.value.clone(),
+            config: config.to_string(),
+            certain: setting.gate.applies == Tri::Yes,
+            site: RcSite {
+                file: self.rc.files[setting.entry.file].clone(),
+                line: setting.entry.line,
+            },
+        }
+    }
+
     /// Every occurrence of `flag` some reading of `chain` reaches: the
-    /// rc lines of the chain itself, then each config's expansion.
-    pub fn occurrences(&self, flag: Flag, chain: Chain) -> Vec<Occurrence> {
-        let command = chain.name();
+    /// rc lines of the chain itself, then each config's expansion. `Err`
+    /// when the rc configs expand past what this reader follows: the
+    /// list would be incomplete, and what it lacks is not absent.
+    pub fn occurrences(&self, flag: Flag, chain: Chain) -> Result<Vec<Occurrence>, String> {
+        let sequences = self.sequences(chain.name())?;
+        let configs = sequences.configs.iter();
+        let all = std::iter::once((PLAIN, &sequences.plain))
+            .chain(configs.map(|(config, own)| (config.as_str(), own)));
         let mut out = Vec::new();
-        let mut collect = |options: Options<'_>, config: &str| {
-            for setting in settings(&options.items).iter().filter(|s| s.flag == flag) {
-                out.push(Occurrence {
-                    spelling: setting.spelling,
-                    value: setting.value.clone(),
-                    config: config.to_string(),
-                    certain: setting.gate.applies == Tri::Yes,
-                    site: RcSite {
-                        file: self.rc.files[setting.entry.file].clone(),
-                        line: setting.entry.line,
-                    },
-                });
+        for (config, found) in all {
+            let of_flag = found.iter().filter(|setting| setting.flag == flag);
+            out.extend(of_flag.map(|setting| self.occurrence(setting, config)));
+        }
+        Ok(out)
+    }
+
+    /// What each command line of `chain` reads for `flags` together: the
+    /// command with no `--config` first, then one [`Reading`] per config
+    /// that sets any of them. Separate [`FlagState`]s cannot say which
+    /// values one config sets together. `Err` as for
+    /// [`Self::occurrences`].
+    pub fn readings(&self, flags: &[Flag], chain: Chain) -> Result<Vec<Reading>, String> {
+        let sequences = self.sequences(chain.name())?;
+        let reading = |config: Option<&str>, own: &[Setting<'_>]| {
+            let ends_of = |flag: &Flag| {
+                let of = |found: &[Setting<'_>]| -> Vec<(String, Gate)> {
+                    let set = found.iter().filter(|setting| setting.flag == *flag);
+                    set.map(|s| (s.value.clone(), s.gate.clone())).collect()
+                };
+                let (lower, upper) = (of(&sequences.plain), of(own));
+                let (maybes, definite) = ends(&lower, &upper);
+                let mut values = vec![definite.cloned()];
+                for (_, value) in maybes {
+                    if !values.iter().any(|seen| seen.as_ref() == Some(value)) {
+                        values.push(Some(value.clone()));
+                    }
+                }
+                values
+            };
+            let plain = sequences.plain.iter().map(|setting| (setting, PLAIN));
+            let added = own.iter().map(|setting| (setting, config.unwrap_or(PLAIN)));
+            let seen = plain
+                .chain(added)
+                .filter(|(setting, _)| flags.contains(&setting.flag))
+                .map(|(setting, from)| (setting.flag, self.occurrence(setting, from)));
+            Reading {
+                config: config.map(str::to_string),
+                finals: flags.iter().map(ends_of).collect(),
+                seen: seen.collect(),
             }
         };
-        collect(self.plain(command), PLAIN);
-        for config in self.configs(command) {
-            collect(self.under_config(command, &config), &config);
+        let mut out = vec![reading(None, &[])];
+        for (config, own) in &sequences.configs {
+            if own.iter().any(|setting| flags.contains(&setting.flag)) {
+                out.push(reading(Some(config), own));
+            }
         }
-        out
+        Ok(out)
     }
 
     /// The files this line may load that could not be read, hard ones
     /// included. An unread file is never "not set": a hard gap refuses
-    /// hosted writes whatever the flags that were read say.
+    /// hosted writes whatever the flags that were read say, because a
+    /// [`FlagState`] is the value in what was read and the file may set
+    /// any flag after it.
     pub fn gaps(&self) -> Vec<&RcGap> {
         let reached = |(_, cond): &&(RcGap, usize)| self.rc.presence(*cond, &self.line) != Tri::No;
         let gaps = self.rc.gaps.iter().filter(reached);
@@ -1380,33 +1549,81 @@ impl EffectiveFlags {
     }
 }
 
-/// The values a last-wins flag may end with: `upper` (a config's
-/// expansion) is applied after `lower` (the chain's own lines). Walking
-/// back from the end, every token that only some reading reaches adds a
-/// possible value, and the first token every reading reaches ends the
-/// walk.
-fn finals<T: Clone>(
-    lower: &[(T, Gate)],
-    upper: &[(T, Gate)],
-    config: &str,
-    by_reading: &mut BTreeMap<String, T>,
-) {
+/// The tracked settings of one command's rc options.
+struct Sequences<'a> {
+    /// What every command line gets, lowest priority first.
+    plain: Vec<Setting<'a>>,
+    /// What each config adds after them, in the order the rc files
+    /// define the configs.
+    configs: Vec<(String, Vec<Setting<'a>>)>,
+}
+
+/// What one command line of a chain reads for a set of flags: the
+/// command with no `--config`, or with one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Reading {
+    /// The `--config` on the command line; `None` for the command with
+    /// none.
+    pub config: Option<String>,
+    /// For each flag asked for, in that order: every value it may end
+    /// with on this command line, `None` for "not set". More than one
+    /// where a release of the line or the working directory decides;
+    /// the value of the case no condition covers comes first.
+    pub finals: Vec<Vec<Option<String>>>,
+    /// Every token of those flags the command line parses, overridden or
+    /// not, in Bazel's order: Bazel stops on one it does not know.
+    pub seen: Vec<(Flag, Occurrence)>,
+}
+
+/// Walks a last-wins flag back from its end: `upper` (a config's
+/// expansion) is applied after `lower` (the chain's own lines). Every
+/// token that only some reading reaches gives a possible value under its
+/// condition, and the first token every reading reaches ends the walk:
+/// it is the value of the remaining case, `None` when no token is.
+fn ends<'v, T>(
+    lower: &'v [(T, Gate)],
+    upper: &'v [(T, Gate)],
+) -> (Vec<(&'v str, &'v T)>, Option<&'v T>) {
     let mut maybes: Vec<(&str, &T)> = Vec::new();
-    let mut definite = None;
     for (value, gate) in upper.iter().rev().chain(lower.iter().rev()) {
         if gate.applies == Tri::Yes {
-            definite = Some(value);
-            break;
+            return (maybes, Some(value));
         }
         // A later token under the same condition shadows this one.
         if !maybes.iter().any(|(when, _)| *when == gate.when) {
             maybes.push((&gate.when, value));
         }
     }
-    let key = |when: Option<&str>| match (config, when) {
-        (config, None) => config.to_string(),
-        (PLAIN, Some(when)) => format!("[{when}]"),
-        (config, Some(when)) => format!("{config} [{when}]"),
+    (maybes, None)
+}
+
+/// The [`FlagState::Possible`] key of a config's own value. A name that
+/// holds `[` or `"` is quoted, so no config name reads as a bracketed
+/// key ([`OTHERWISE`], a condition) or as another config's.
+fn config_key(name: &str) -> String {
+    if name.contains(['[', '"']) {
+        format!("config {name:?}")
+    } else {
+        name.to_string()
+    }
+}
+
+/// Files the values a last-wins flag may end with (see [`ends`]) under
+/// their [`FlagState::Possible`] keys; `config` is `None` for the
+/// command with no `--config`.
+fn finals<T: Clone>(
+    lower: &[(T, Gate)],
+    upper: &[(T, Gate)],
+    config: Option<&str>,
+    by_reading: &mut BTreeMap<String, T>,
+) {
+    let (maybes, definite) = ends(lower, upper);
+    let name = config.map(config_key);
+    let key = |when: Option<&str>| match (&name, when) {
+        (None, None) => PLAIN.to_string(),
+        (Some(name), None) => name.clone(),
+        (None, Some(when)) => format!("[{when}]"),
+        (Some(name), Some(when)) => format!("{name} [{when}]"),
     };
     let rest = if maybes.is_empty() {
         None
@@ -1429,49 +1646,72 @@ pub(super) mod testing {
     use crate::bazel::model::{FileText, FileView};
 
     /// Files by root-relative path. A directory exists where a path has
-    /// it as a prefix.
+    /// it as a prefix; a path that is both a file here and such a prefix
+    /// is a directory.
     #[derive(Default)]
-    pub struct Files(pub BTreeMap<String, FileText>);
+    pub struct Files {
+        pub files: BTreeMap<String, FileText>,
+        /// How many levels above the root can be listed; `None` when the
+        /// test does not model the read boundary.
+        boundary_levels: Option<usize>,
+    }
 
     impl Files {
         pub fn of(files: &[(&str, &str)]) -> Self {
             let bytes = |text: &str| FileText::Bytes(text.as_bytes().to_vec());
-            Self(
-                files
-                    .iter()
-                    .map(|(path, text)| (path.to_string(), bytes(text)))
-                    .collect(),
-            )
+            let files = files.iter();
+            Self::from(files.map(|(path, text)| (path.to_string(), bytes(text))))
+        }
+
+        pub fn from(files: impl Iterator<Item = (String, FileText)>) -> Self {
+            Self {
+                files: files.collect(),
+                boundary_levels: None,
+            }
         }
 
         pub fn with(mut self, path: &str, text: FileText) -> Self {
-            self.0.insert(path.to_string(), text);
+            self.files.insert(path.to_string(), text);
+            self
+        }
+
+        /// Puts the read boundary `levels` directories above the root: a
+        /// directory past it cannot be listed.
+        pub fn boundary(mut self, levels: usize) -> Self {
+            self.boundary_levels = Some(levels);
             self
         }
     }
 
     impl FileView for Files {
         fn read(&self, rel: &str) -> FileText {
-            self.0.get(rel).cloned().unwrap_or(FileText::Absent)
+            self.files.get(rel).cloned().unwrap_or(FileText::Absent)
         }
 
         fn list(&self, dir: &str) -> Option<Vec<String>> {
+            let above = dir.split('/').filter(|segment| *segment == "..").count();
+            if self.boundary_levels.is_some_and(|levels| above > levels) {
+                return None;
+            }
             let prefix = if dir.is_empty() {
                 String::new()
             } else {
                 format!("{dir}/")
             };
             let mut names: Vec<String> = Vec::new();
-            for rest in self.0.keys().filter_map(|path| path.strip_prefix(&prefix)) {
+            let below = |path: &'_ String| path.strip_prefix(&prefix).map(str::to_string);
+            for rest in self.files.keys().filter_map(below) {
                 let name = match rest.split_once('/') {
                     Some((child, _)) => format!("{child}/"),
-                    None => rest.to_string(),
+                    None => rest,
                 };
                 if !names.contains(&name) {
                     names.push(name);
                 }
             }
-            Some(names)
+            let directory = |name: &String| names.contains(&format!("{name}/"));
+            let listed = names.iter().filter(|name| !directory(name));
+            Some(listed.cloned().collect())
         }
     }
 }
@@ -1536,11 +1776,7 @@ mod tests {
         let files = case["files"].as_object().expect("files").iter();
         let bytes =
             |text: &Value| FileText::Bytes(text.as_str().expect("text").as_bytes().to_vec());
-        Files(
-            files
-                .map(|(path, text)| (path.clone(), bytes(text)))
-                .collect(),
-        )
+        Files::from(files.map(|(path, text)| (path.clone(), bytes(text))))
     }
 
     /// The fixtures are reductions of what real Bazel did: an edit that
@@ -1683,7 +1919,7 @@ mod tests {
     }
 
     #[test]
-    fn startup_os_sections_apply_from_bazel_9_and_startup_configs_never() {
+    fn startup_os_sections_apply_from_bazel_9_0_2_and_startup_configs_never() {
         let vectors: Value = serde_json::from_str(INVOCATIONS).expect("fixture");
         let cases = vectors["startup"].as_array().expect("startup");
         assert_eq!(cases.len(), 4);
@@ -1711,17 +1947,23 @@ mod tests {
 
         let rc = "startup --output_base=/x\nstartup:linux --output_base=/y\n";
         let base = |line: &BazelLine| flags(rc, line).state(Flag::OutputBase, Chain::Startup);
-        assert_eq!(base(&exact("8.8.2")), set("/x"));
-        assert_eq!(
-            base(&exact("9.3.2")),
-            possible(&[("", "/x"), ("linux", "/y")])
-        );
+        // `option_processor.cc` has no `startup:` lookup before 9.0.2.
+        for before in ["8.8.2", "9.0.0", "9.0.1"] {
+            assert_eq!(base(&exact(before)), set("/x"), "{before}");
+        }
+        for from in ["9.0.2", "9.3.2"] {
+            let both = possible(&[("", "/x"), ("linux", "/y")]);
+            assert_eq!(base(&exact(from)), both, "{from}");
+        }
         let spanning = [
             ("", "/x"),
-            ("linux [Bazel 9.0.0 or newer]", "/y"),
+            ("linux [Bazel 9.0.2 or newer]", "/y"),
             ("linux [otherwise]", "/x"),
         ];
         assert_eq!(base(&majors(8, 9)), possible(&spanning));
+        // 9.0.2rc1 lacks the lookup and 9.0.2rc3 has it: a candidate of
+        // the release is either.
+        assert_eq!(base(&exact("9.0.2rc1")), possible(&spanning));
         // A startup option is not a build option.
         assert_eq!(
             flags(rc, &exact("9.3.2")).state(Flag::OutputBase, Chain::Build),
@@ -1903,21 +2145,80 @@ mod tests {
         assert_eq!(on_six, possible(&[("[Bazel 6.3.0 or newer]", "error")]));
         assert!(on_six.may_be_unset() && on_six.plain().is_none());
         assert_eq!(build(&BazelLine::unknown()), on_six);
+        // A candidate of the release that brought a behaviour may or may
+        // not have it: the hazard value is possible, never absent.
+        assert_eq!(build(&exact("6.3.0rc1")), on_six);
         // `always` comes first in the chain, so any `common` line wins.
         let both = "always --lockfile_mode=error\ncommon --lockfile_mode=off\n";
         assert_eq!(lock_mode(both, &majors(6, 6), Chain::Build), set("off"));
+        // Under one condition the last token wins, as it does without.
+        let twice = "always --lockfile_mode=off\nalways --lockfile_mode=error\n";
+        assert_eq!(lock_mode(twice, &majors(6, 6), Chain::Build), on_six);
+        let imported = [
+            (".bazelrc", "try-import user.bazelrc\n"),
+            (
+                "user.bazelrc",
+                "common --lockfile_mode=off\ncommon --lockfile_mode=error\n",
+            ),
+        ];
+        assert_eq!(
+            flags_of(&imported, &exact("7.7.2")).state(Flag::LockfileMode, Chain::Build),
+            possible(&[("[import user.bazelrc]", "error")])
+        );
 
-        // `fetch` inherits `test` (and with it `build`) from 7.0.0.
+        // `fetch` inherits `test` (and with it `build`) on 7.1.0 and from
+        // 7.2.0: `FetchCommand.java` names `TestCommand` there, and not
+        // in 7.0.x, 7.1.1 or 7.1.2.
         let inherited = "test --lockfile_mode=error\nbuild --vendor_dir=v\n";
         let fetch = |line: &BazelLine| lock_mode(inherited, line, Chain::Fetch);
-        assert_eq!(fetch(&exact("6.6.0")), FlagState::NotSeen);
-        assert_eq!(fetch(&exact("7.7.2")), set("error"));
+        let when = "[Bazel 7.1.0, or 7.2.0 or newer]";
+        for without in ["6.6.0", "7.0.0", "7.0.2", "7.1.1", "7.1.2"] {
+            assert_eq!(fetch(&exact(without)), FlagState::NotSeen, "{without}");
+        }
+        for with in ["7.1.0", "7.2.0", "7.7.2", "9.3.2"] {
+            assert_eq!(fetch(&exact(with)), set("error"), "{with}");
+        }
+        let within = |lo: (u32, u32, u32), hi: (u32, u32, u32)| BazelLine {
+            lo: Some(BazelVersion::new(lo.0, lo.1, lo.2)),
+            hi: Some(BazelVersion::new(hi.0, hi.1, hi.2)),
+            evidence: Vec::new(),
+        };
         assert_eq!(
-            fetch(&majors(6, 7)),
-            possible(&[("[Bazel 7.0.0 or newer]", "error")])
+            fetch(&within((7, 1, 1), (7, 1, u32::MAX))),
+            FlagState::NotSeen
         );
+        for either in [
+            majors(6, 7),
+            majors(7, 7),
+            within((7, 1, 0), (7, 1, 2)),
+            exact("7.1.0rc1"),
+            exact("7.1.1rc1"),
+            exact("7.2.0rc1"),
+            BazelLine::unknown(),
+        ] {
+            assert_eq!(fetch(&either), possible(&[(when, "error")]), "{either}");
+        }
         let vendor = flags(inherited, &majors(6, 7)).state(Flag::VendorDir, Chain::Fetch);
-        assert_eq!(vendor, possible(&[("[Bazel 7.0.0 or newer]", "v")]));
+        assert_eq!(vendor, possible(&[(when, "v")]));
+        // Without the inheritance `bazel fetch` reads its own lines and
+        // `common`: a `build` line does not override them there.
+        let own = "common --nofetch\nbuild --fetch\n";
+        let on = |bazel: &str| flags(own, &exact(bazel)).state(Flag::Fetch, Chain::Fetch);
+        assert_eq!(on("7.0.2"), set("false"));
+        assert_eq!(on("7.2.0"), set("true"));
+
+        // `vendor` inherits `test` from 7.3.0.
+        let vendor = |line: &BazelLine| lock_mode(inherited, line, Chain::Vendor);
+        for without in ["7.1.0", "7.2.1"] {
+            assert_eq!(vendor(&exact(without)), FlagState::NotSeen, "{without}");
+        }
+        for with in ["7.3.0", "7.7.2", "8.8.2"] {
+            assert_eq!(vendor(&exact(with)), set("error"), "{with}");
+        }
+        let later = possible(&[("[Bazel 7.3.0 or newer]", "error")]);
+        for either in [majors(7, 7), exact("7.3.0rc1")] {
+            assert_eq!(vendor(&either), later, "{either}");
+        }
     }
 
     #[test]
@@ -2081,7 +2382,9 @@ mod tests {
         );
 
         // A file between the root and the read boundary is read; one past
-        // the boundary is unreadable, which is never absent.
+        // the boundary is unreadable, which is never absent. Whether it
+        // exists is unknown there, so a `try-import` of it is the usual
+        // optional file.
         let outside = Files::of(&[(
             ".bazelrc",
             "import %workspace%/../shared.rc\ntry-import %workspace%/../../home.rc\n",
@@ -2090,7 +2393,8 @@ mod tests {
             "../shared.rc",
             FileText::Bytes(b"common --lockfile_mode=error\n".to_vec()),
         )
-        .with("../../home.rc", FileText::Unreadable);
+        .with("../../home.rc", FileText::Unreadable)
+        .boundary(1);
         let flags = read(&outside).effective(&line);
         assert_eq!(flags.state(Flag::LockfileMode, Chain::Build), set("error"));
         assert_eq!(flags.gaps().len(), 1);
@@ -2098,6 +2402,55 @@ mod tests {
         let beyond = Files::of(&[(".bazelrc", "import %workspace%/../x.rc\n")])
             .with("../x.rc", FileText::Unreadable);
         assert!(read(&beyond).effective(&line).gaps()[0].hard);
+
+        // A `try-import` target that is there and cannot be read is not
+        // the missing per-user file: Bazel may read what this reader
+        // could not.
+        let optional = "try-import %workspace%/ci.rc\ncommon --vendor_dir=v\n";
+        let unread = Files::of(&[(".bazelrc", optional)]).with("ci.rc", FileText::Unreadable);
+        let flags = read(&unread).effective(&line);
+        let gaps = flags.gaps();
+        assert_eq!(
+            (gaps.len(), gaps[0].hard, gaps[0].file.as_str()),
+            (1, true, "ci.rc")
+        );
+        assert!(gaps[0].detail.starts_with("exists"), "{}", gaps[0].detail);
+        let state = flags.state(Flag::LockfileMode, Chain::Build);
+        assert!(matches!(state, FlagState::UnknowableHard(_)), "{state:?}");
+        // A directory of that name is skipped by Bazel too.
+        let directory = Files::of(&[(".bazelrc", optional), ("ci.rc/README", "")])
+            .with("ci.rc", FileText::Unreadable);
+        let flags = read(&directory).effective(&line);
+        assert_eq!(flags.gaps().len(), 1);
+        assert!(!flags.gaps()[0].hard);
+        let state = flags.state(Flag::LockfileMode, Chain::Build);
+        assert!(matches!(state, FlagState::UnknowableSoft(_)), "{state:?}");
+
+        // A path that is not UTF-8 names a file Bazel can open and this
+        // reader cannot ask for, whatever the kind of import.
+        for statement in [
+            &b"try-import %workspace%/\xff.rc\n"[..],
+            b"import %workspace%/\xff.rc\n",
+            b"try-import \xff.rc\n",
+            b"try-import-if-bazel-version >=6.0.0 %workspace%/\xff.rc\n",
+        ] {
+            let files = Files::default()
+                .with(".bazelrc", FileText::Bytes(statement.to_vec()))
+                // What the lossy path would name.
+                .with(
+                    "\u{fffd}.rc",
+                    FileText::Bytes(b"common --nofetch\n".to_vec()),
+                );
+            let flags = read(&files).effective(&exact("9.3.2"));
+            let gaps: Vec<(bool, &str)> = flags
+                .gaps()
+                .iter()
+                .map(|gap| (gap.hard, gap.file.as_str()))
+                .collect();
+            assert_eq!(gaps, [(true, ".bazelrc:1")], "{statement:?}");
+            let state = flags.state(Flag::Fetch, Chain::Build);
+            assert!(matches!(state, FlagState::UnknowableHard(_)), "{state:?}");
+        }
 
         // The root file itself.
         let unreadable = Files::default().with(".bazelrc", FileText::Unreadable);
@@ -2300,7 +2653,8 @@ mod tests {
                   common --override_repository=broken\n\
                   common --override_module=rules_bar=vendor/bar\n";
         let flags = flags(rc, &exact("7.7.2"));
-        let seen = flags.occurrences(Flag::OverrideRepository, Chain::Build);
+        let occurrences = |flag, chain| flags.occurrences(flag, chain).expect("read in full");
+        let seen = occurrences(Flag::OverrideRepository, Chain::Build);
         let rows: Vec<_> = seen
             .iter()
             .map(|o| {
@@ -2338,17 +2692,10 @@ mod tests {
         );
         assert!(seen.iter().all(|o| o.spelling == "override_repository"));
         // `mod` reads `common` lines and no `build:ci` line.
-        assert_eq!(
-            flags
-                .occurrences(Flag::OverrideRepository, Chain::Mod)
-                .len(),
-            3
-        );
-        let module = flags.occurrences(Flag::OverrideModule, Chain::Build);
+        assert_eq!(occurrences(Flag::OverrideRepository, Chain::Mod).len(), 3);
+        let module = occurrences(Flag::OverrideModule, Chain::Build);
         assert_eq!(module[0].name_and_path(), Some(("rules_bar", "vendor/bar")));
-        assert!(flags
-            .occurrences(Flag::InjectRepository, Chain::Build)
-            .is_empty());
+        assert!(occurrences(Flag::InjectRepository, Chain::Build).is_empty());
     }
 
     #[test]
@@ -2388,7 +2735,9 @@ mod tests {
 
     #[test]
     fn only_an_option_every_build_passes_proves_a_newer_bazel() {
-        let shapes = |rc: &str| read(&Files::of(&[(".bazelrc", rc)])).api_shapes();
+        // `new.rc` is what the cwd-relative `try-import` below reads.
+        let new_rc = ("new.rc", "common --enable_workspace\n");
+        let shapes = |rc: &str| read(&Files::of(&[(".bazelrc", rc), new_rc])).api_shapes();
         assert_eq!(
             shapes("common --enable_workspace\n"),
             [ApiShape::EnableWorkspaceFlag]
@@ -2413,6 +2762,188 @@ mod tests {
         ] {
             assert_eq!(shapes(rc), [], "{rc}");
         }
+        // The same file through a path that does not depend on where
+        // Bazel is started is read by every build.
+        assert_eq!(
+            shapes("try-import %workspace%/new.rc\n"),
+            [ApiShape::EnableWorkspaceFlag]
+        );
+    }
+
+    #[test]
+    fn a_gap_counts_only_where_the_line_reaches_it() {
+        let gaps = |condition: &str, bazel: &str| -> Vec<(bool, String)> {
+            let rc = format!("try-import-if-bazel-version {condition} %workspace%/new.rc\n");
+            let flags = flags(&rc, &exact(bazel));
+            let found = flags.gaps();
+            found
+                .iter()
+                .map(|gap| (gap.hard, gap.file.clone()))
+                .collect()
+        };
+        // 7.7.2 has no such directive and imports nothing, and a false
+        // condition skips the import: no file is missed.
+        assert!(gaps(">=8.0.0", "7.7.2").is_empty());
+        assert!(gaps("<9.0.0", "9.3.2").is_empty());
+        // Where the import is made, its missing target is the usual
+        // optional file.
+        assert_eq!(gaps(">=8.0.0", "9.3.2"), [(false, "new.rc".to_string())]);
+        let state = lock_mode(
+            "try-import-if-bazel-version >=8.0.0 %workspace%/new.rc\n",
+            &exact("9.3.2"),
+            Chain::Build,
+        );
+        assert!(matches!(state, FlagState::UnknowableSoft(_)), "{state:?}");
+        assert_eq!(
+            lock_mode(
+                "try-import-if-bazel-version >=8.0.0 %workspace%/new.rc\n",
+                &exact("7.7.2"),
+                Chain::Build
+            ),
+            FlagState::NotSeen
+        );
+    }
+
+    /// The bracketed keys say what the plain command does, so a config
+    /// must not be able to write one.
+    #[test]
+    fn no_config_name_forges_a_reserved_key() {
+        let line = exact("7.7.2");
+        let state = |rc: &str| flags(rc, &line).state(Flag::EnableBzlmod, Chain::Build);
+        let forged = state("common:[otherwise] --noenable_bzlmod\n");
+        assert_eq!(forged, possible(&[("config \"[otherwise]\"", "false")]));
+        assert!(forged.may_be_unset() && forged.plain().is_none());
+        // The control: an ordinary config reads the same way.
+        let control = state("common:legacy --noenable_bzlmod\n");
+        assert_eq!(control, possible(&[("legacy", "false")]));
+        assert!(control.may_be_unset() && control.plain().is_none());
+
+        // A quoted name with a blank cannot pass for another config's
+        // conditional key either.
+        let files = [
+            (
+                ".bazelrc",
+                "try-import user.bazelrc\ncommon:ci --lockfile_mode=update\n\
+                 common:\"ci [otherwise]\" --lockfile_mode=off\n",
+            ),
+            ("user.bazelrc", "common:ci --lockfile_mode=error\n"),
+        ];
+        let state = flags_of(&files, &line).state(Flag::LockfileMode, Chain::Build);
+        assert_eq!(
+            state,
+            possible(&[("ci", "update"), ("config \"ci [otherwise]\"", "off"),])
+        );
+        let files = [
+            (
+                ".bazelrc",
+                "common:ci --lockfile_mode=update\ntry-import user.bazelrc\n\
+                 common:\"ci [otherwise]\" --lockfile_mode=off\n",
+            ),
+            ("user.bazelrc", "common:ci --lockfile_mode=error\n"),
+        ];
+        let state = flags_of(&files, &line).state(Flag::LockfileMode, Chain::Build);
+        assert_eq!(
+            state,
+            possible(&[
+                ("ci [import user.bazelrc]", "error"),
+                ("ci [otherwise]", "update"),
+                ("config \"ci [otherwise]\"", "off"),
+            ])
+        );
+        assert_eq!(config_key("a\"b"), "config \"a\\\"b\"");
+        assert_eq!(config_key("ci"), "ci");
+    }
+
+    /// Two flags one config sets are read together: the cross product of
+    /// two separate states holds pairs no command line has.
+    #[test]
+    fn readings_pair_the_flags_of_one_command_line() {
+        let both = [Flag::EnableBzlmod, Flag::EnableWorkspace];
+        let finals = |rc: &str, line: &BazelLine, chain: Chain| {
+            let readings = flags(rc, line)
+                .readings(&both, chain)
+                .expect("read in full");
+            let row = |reading: &Reading| (reading.config.clone(), reading.finals.clone());
+            readings.iter().map(row).collect::<Vec<_>>()
+        };
+        let value = |text: &str| Some(text.to_string());
+        let seven = exact("7.7.2");
+        let legacy = "common:legacy --noenable_bzlmod --enable_workspace\n\
+                      common:other --lockfile_mode=off\n";
+        assert_eq!(
+            finals(legacy, &seven, Chain::Build),
+            [
+                (None, vec![vec![None], vec![None]]),
+                (
+                    value("legacy"),
+                    vec![vec![value("false")], vec![value("true")]]
+                ),
+            ]
+        );
+        // A flag the config does not set keeps the plain command's value.
+        let partial = "common --enable_workspace\ncommon:off --noenable_bzlmod\n";
+        assert_eq!(
+            finals(partial, &seven, Chain::Build),
+            [
+                (None, vec![vec![None], vec![value("true")]]),
+                (
+                    value("off"),
+                    vec![vec![value("false")], vec![value("true")]]
+                ),
+            ]
+        );
+        // What a release or the working directory decides stays inside
+        // its command line; the case no condition covers comes first.
+        let conditional = "common --noenable_bzlmod\nalways --enable_workspace\n\
+                           try-import user.bazelrc\n";
+        let files = [
+            (".bazelrc", conditional),
+            ("user.bazelrc", "common --enable_bzlmod\n"),
+        ];
+        let ranged = flags_of(&files, &majors(6, 6));
+        let readings = ranged.readings(&both, Chain::Build).expect("read in full");
+        assert_eq!(readings.len(), 1);
+        assert_eq!(
+            readings[0].finals,
+            [
+                vec![value("false"), value("true")],
+                vec![None, value("true")]
+            ]
+        );
+        // Every token the command line parses is listed, overridden or
+        // not, with whether every reading reaches it.
+        let seen: Vec<_> = readings[0]
+            .seen
+            .iter()
+            .map(|(flag, o)| (*flag, o.spelling, o.value.as_str(), o.certain))
+            .collect();
+        assert_eq!(
+            seen,
+            [
+                (Flag::EnableWorkspace, "enable_workspace", "true", false),
+                (Flag::EnableBzlmod, "enable_bzlmod", "false", true),
+                (Flag::EnableBzlmod, "enable_bzlmod", "true", false),
+            ]
+        );
+        // A config's command line parses the plain tokens as well.
+        let under = "common --experimental_enable_bzlmod\nbuild:ws --noenable_workspace\n";
+        let readings = flags(under, &seven)
+            .readings(&both, Chain::Test)
+            .expect("read in full");
+        let sites: Vec<_> = readings[1]
+            .seen
+            .iter()
+            .map(|(_, o)| (o.spelling, o.config.as_str(), o.site.to_string()))
+            .collect();
+        assert_eq!(
+            sites,
+            [
+                ("experimental_enable_bzlmod", "", ".bazelrc:1".to_string()),
+                ("enable_workspace", "ws", ".bazelrc:2".to_string()),
+            ]
+        );
+        // `query` does not read the `build:ws` section.
+        assert_eq!(finals(under, &seven, Chain::Query).len(), 1);
     }
 
     #[test]
@@ -2452,6 +2983,56 @@ mod tests {
                 "{last:?}: {state:?}"
             );
         }
+        // The same limit is visible wherever a consumer reads the chain:
+        // a list cut short is an error, never a shorter list.
+        let doubled = flags_of(&[(".bazelrc", &doubling)], &exact("7.7.2"));
+        let cut = doubled.occurrences(Flag::DownloaderConfig, Chain::Build);
+        assert!(cut.is_err_and(|why| why.contains("more options")));
+        let joint = doubled.readings(&[Flag::EnableBzlmod], Chain::Test);
+        assert!(joint.is_err_and(|why| why.contains("more options")));
+        // `query` inherits nothing from `build`, so its chain is whole.
+        assert_eq!(
+            doubled.occurrences(Flag::DownloaderConfig, Chain::Query),
+            Ok(Vec::new())
+        );
+
+        // A chain of configs deeper than the reader follows. Bazel has no
+        // such limit and ends with what the last config sets, so what
+        // was read is not the answer.
+        let mut chained = String::from("common --lockfile_mode=error\nbuild --config=c0\n");
+        for level in 0..60 {
+            chained += &format!("build:c{level} --config=c{}\n", level + 1);
+        }
+        chained += "build:c60 --lockfile_mode=off --nofetch\n";
+        let deep = flags_of(&[(".bazelrc", &chained)], &exact("7.7.2"));
+        for flag in [Flag::LockfileMode, Flag::Fetch] {
+            let state = deep.state(flag, Chain::Build);
+            assert!(
+                matches!(&state, FlagState::UnknowableHard(why) if why.contains("nest deeper")),
+                "{flag:?}: {state:?}"
+            );
+        }
+        assert!(deep.occurrences(Flag::Fetch, Chain::Build).is_err());
+        assert_eq!(deep.state(Flag::LockfileMode, Chain::Mod), set("error"));
+        // Forty levels are followed to the end.
+        let shallow = chained.replace("build:c39 --config=c40\n", "build:c39 --nofetch\n");
+        let fetch = flags_of(&[(".bazelrc", &shallow)], &exact("7.7.2"));
+        assert_eq!(fetch.state(Flag::Fetch, Chain::Build), set("false"));
+
+        // One target imported more often than the reader reads files.
+        let many = [
+            (".bazelrc", "import %workspace%/a.rc\n".repeat(600)),
+            ("a.rc", "common --vendor_dir=v\n".to_string()),
+        ];
+        let borrowed: Vec<(&str, &str)> = many.iter().map(|(p, t)| (*p, &t[..])).collect();
+        let rc = read(&Files::of(&borrowed));
+        assert_eq!(rc.reads, MAX_FILES);
+        let capped = rc.effective(&exact("7.7.2"));
+        let gaps = capped.gaps();
+        assert_eq!(gaps.len(), 600 + 1 - MAX_FILES);
+        assert!(gaps.iter().all(|gap| gap.hard && gap.file == "a.rc"));
+        let state = capped.state(Flag::LockfileMode, Chain::Build);
+        assert!(matches!(state, FlagState::UnknowableHard(_)), "{state:?}");
 
         assert_eq!(root_relative("a/./b//c"), Some("a/b/c".to_string()));
         assert_eq!(root_relative("a/../../x/../y"), Some("../y".to_string()));
@@ -2504,6 +3085,7 @@ mod tests {
                 let _ = flags.state(*flag, chains[rng.below(chains.len())]);
             }
             let _ = flags.occurrences(Flag::OverrideRepository, Chain::Build);
+            let _ = flags.readings(&[Flag::EnableBzlmod, Flag::LockfileMode], Chain::Vendor);
             let _ = flags.repo_env("X", Chain::Fetch);
             let _ = flags.gaps();
         }

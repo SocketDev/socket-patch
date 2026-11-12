@@ -11,8 +11,9 @@
 //!
 //! [`verdict`] applies that to the config files the tracked rc files
 //! name. It fails closed: a file that is missing, unreadable or that
-//! Bazel would reject, and a `rewrite` this file cannot evaluate, all
-//! count as blocked.
+//! Bazel would reject, a `rewrite` this file cannot evaluate, and an rc
+//! file that may name a config and could not be read in full, all count
+//! as blocked.
 //!
 //! The `regex` crate cannot evaluate the patterns: they are Java regular
 //! expressions, and the usual recipe needs a lookahead
@@ -25,7 +26,7 @@
 use std::cell::Cell;
 
 use super::model::{FileText, FileView};
-use super::rc::{root_relative, Chain, EffectiveFlags, Flag, Occurrence, PLAIN};
+use super::rc::{root_relative, Chain, EffectiveFlags, Flag, FlagState, Occurrence, PLAIN};
 use super::version::{BazelLine, BazelVersion, Tri};
 
 // ── Patterns ─────────────────────────────────────────────────────────
@@ -543,14 +544,24 @@ impl DownloaderConfig {
     }
 
     /// Adds the lines of one more file (`UrlRewriterConfig.parseConfig`).
-    /// Lines end at LF, CR or CRLF; words are separated by whitespace; a
-    /// line whose first word starts with `#` is a comment. A BOM is not
-    /// skipped, so Bazel rejects the file's first line.
+    /// Lines end at LF, CR or CRLF; a line whose first word starts with
+    /// `#` is a comment. A BOM is not skipped, so Bazel rejects the
+    /// file's first line.
+    ///
+    /// Words are what Bazel's `Splitter.onPattern("\\s+")
+    /// .omitEmptyStrings().trimResults()` gives: split at ASCII blanks,
+    /// then each word trimmed of Unicode white space (Guava's
+    /// `CharMatcher.whitespace()`, the set of `char::is_whitespace`) and
+    /// dropped when nothing is left. So `block patch.socket.dev` followed
+    /// by a no-break space blocks the host.
     pub fn add(&mut self, text: &str) -> Result<(), ConfigError> {
         let unified = text.replace("\r\n", "\n");
         for (index, line) in unified.split(['\n', '\r']).enumerate() {
             let blank = |c: char| matches!(c, ' ' | '\t' | '\x0b' | '\x0c');
-            let words: Vec<&str> = line.split(blank).filter(|word| !word.is_empty()).collect();
+            let trimmed = line
+                .split(blank)
+                .map(|word| word.trim_matches(char::is_whitespace));
+            let words: Vec<&str> = trimmed.filter(|word| !word.is_empty()).collect();
             let error = |detail: &str| ConfigError {
                 line: index + 1,
                 detail: format!("{detail}: {line}"),
@@ -743,7 +754,8 @@ pub enum Verdict {
     /// one of these (the URL itself unless a `rewrite` moves it).
     Fetchable { urls: Vec<String> },
     /// Some config a build may run with blocks the URL, or cannot be
-    /// read or evaluated.
+    /// read or evaluated; or an rc file that may name a config could not
+    /// be read in full, and `config` names that rc file.
     Blocked { config: String, why: String },
 }
 
@@ -755,14 +767,30 @@ pub enum Verdict {
 /// evaluated, and one blocked set blocks: a config that only a
 /// `--config=ci` selects still breaks CI.
 ///
-/// Only what was read is judged: a config named in an rc file that could
-/// not be read is a gap of [`EffectiveFlags::gaps`], not `NoConfig`.
+/// Unreadable is not "no config": with a hard gap in
+/// [`EffectiveFlags::gaps`], or rc configs that expand past what the
+/// reader follows, a config nobody read may block the URL, so the
+/// verdict is `Blocked` and never `NoConfig` or `Fetchable`.
 pub fn verdict(
     flags: &EffectiveFlags,
     line: &BazelLine,
     files: &dyn FileView,
     url: &str,
 ) -> Verdict {
+    if let Some(gap) = flags.gaps().into_iter().find(|gap| gap.hard) {
+        return Verdict::Blocked {
+            config: gap.file.clone(),
+            why: format!(
+                "{} {}; it may name a downloader config",
+                gap.file, gap.detail
+            ),
+        };
+    }
+    // The tracked rc files start at the root `.bazelrc`.
+    let unread = |why: String| Verdict::Blocked {
+        config: ".bazelrc".to_string(),
+        why: format!("{why}; they may name a downloader config"),
+    };
     let candidate = BazelVersion {
         rc: Some(0),
         ..BazelVersion::new(10, 0, 0)
@@ -779,15 +807,21 @@ pub fn verdict(
         }
     };
     for chain in [Chain::Build, Chain::Test, Chain::Fetch] {
+        let state = flags.state(Flag::DownloaderConfig, chain);
+        if let FlagState::UnknowableHard(why) = &state {
+            return unread(why.clone());
+        }
         if last_wins {
-            let state = flags.state(Flag::DownloaderConfig, chain);
             state
                 .values()
                 .into_iter()
                 .for_each(|path| add(vec![path.clone()]));
         }
         if union {
-            let seen = flags.occurrences(Flag::DownloaderConfig, chain);
+            let seen = match flags.occurrences(Flag::DownloaderConfig, chain) {
+                Ok(seen) => seen,
+                Err(why) => return unread(why),
+            };
             let mut configs: Vec<&str> = seen.iter().map(|o| o.config.as_str()).collect();
             configs.dedup();
             for config in configs {
@@ -1031,6 +1065,37 @@ mod tests {
             parsed.all_blocked_message.as_deref(),
             Some(" see  go/bazel-mirror ")
         );
+        // Bazel trims each word of Unicode white space, so a no-break
+        // space or an em space after a host is not part of the host.
+        for space in ['\u{a0}', '\u{2003}', '\u{3000}', '\u{85}'] {
+            for (config, block) in [
+                (
+                    format!("block patch.socket.dev{space}\n"),
+                    "patch.socket.dev",
+                ),
+                (format!("block *{space}\n"), "*"),
+                (format!("block {space}*{space}\n"), "*"),
+                (format!("{space}block {space} *\n"), "*"),
+            ] {
+                let parsed = DownloaderConfig::parse(&config).expect("accepted");
+                assert_eq!(parsed.block, [block], "{config:?}");
+                assert_eq!(parsed.amend(PATCH), Amended::Urls(Vec::new()), "{config:?}");
+            }
+            // The reverse case: the allowance holds, as it does in Bazel.
+            let allowed = format!("allow patch.socket.dev{space}\nblock *\n");
+            assert_eq!(fetched(&allowed, PATCH), [PATCH], "{allowed:?}");
+            // A word that is only such a space is no word.
+            assert_eq!(line(&format!("block a.example {space}b.example\n")), 1);
+            let lone = DownloaderConfig::parse(&format!(" {space} \nblock *\n"));
+            assert_eq!(lone.expect("accepted").block, ["*"]);
+        }
+        // A zero-width space is not white space, to Bazel or here.
+        let zero_width = DownloaderConfig::parse("block patch.socket.dev\u{200b}\n");
+        assert_eq!(
+            zero_width.expect("accepted").amend(PATCH),
+            Amended::Urls(vec![PATCH.to_string()])
+        );
+
         // Two files on Bazel 10: one config.
         let mut union = DownloaderConfig::parse("block *\n").expect("accepted");
         union.add("allow patch.socket.dev\n").expect("accepted");
@@ -1364,6 +1429,144 @@ mod tests {
             ("shut.cfg", "block *\n"),
         ];
         assert_eq!(blocked_by(tracked(&test_only, &nine)).0, "shut.cfg");
+    }
+
+    #[test]
+    fn the_verdict_covers_fetch_the_certain_configs_and_unreadable_files() {
+        let line = |text: &str| BazelLine::of(BazelVersion::parse(text).expect("a release"));
+        let blocked_by = |verdict: Verdict| match verdict {
+            Verdict::Blocked { config, why } => (config, why),
+            other => panic!("{other:?}"),
+        };
+        // A config only `bazel fetch` reads still blocks the fetch.
+        let fetch_only = [
+            (
+                ".bazelrc",
+                "fetch --experimental_downloader_config=shut.cfg\n",
+            ),
+            ("shut.cfg", "block *\n"),
+        ];
+        for bazel in ["6.6.0", "7.7.2"] {
+            assert_eq!(
+                blocked_by(tracked(&fetch_only, &line(bazel))).0,
+                "shut.cfg",
+                "{bazel}"
+            );
+        }
+
+        // Where every config applies together (Bazel 10), a config that
+        // only some working directory reads may be missing from the
+        // union: the set without it is judged too. Here the last config
+        // alone fetches and the whole union fetches; only `a.cfg` with
+        // `c.cfg` blocks.
+        let uncertain = [
+            (
+                ".bazelrc",
+                "common --downloader_config=a.cfg\ntry-import user.bazelrc\n\
+                 common --downloader_config=c.cfg\n",
+            ),
+            ("user.bazelrc", "common --downloader_config=b.cfg\n"),
+            ("a.cfg", "block *\n"),
+            ("b.cfg", "allow patch.socket.dev\n"),
+            ("c.cfg", "block registry.npmjs.org\n"),
+        ];
+        let nine_to_ten = BazelLine {
+            lo: Some(BazelVersion::new(9, 2, 0)),
+            hi: Some(BazelVersion::ceiling(10)),
+            evidence: Vec::new(),
+        };
+        for spanning in [nine_to_ten, line("10.0.0")] {
+            let (config, why) = blocked_by(tracked(&uncertain, &spanning));
+            assert_eq!(config, "a.cfg, c.cfg", "Bazel {spanning}");
+            assert!(why.contains("is blocked"), "{why}");
+        }
+        // Through Bazel 9 the last config replaces the others.
+        assert!(matches!(
+            tracked(&uncertain, &line("9.3.2")),
+            Verdict::Fetchable { .. }
+        ));
+
+        // A config file that is there and cannot be read.
+        let rc = "common --downloader_config=dl.cfg\n";
+        let files = Files::of(&[(".bazelrc", rc)]).with("dl.cfg", FileText::Unreadable);
+        let nine = line("9.3.2");
+        let unread = verdict(&read(&files).effective(&nine), &nine, &files, PATCH);
+        let (config, why) = blocked_by(unread);
+        assert_eq!(config, "dl.cfg");
+        assert!(why.contains("cannot be read"), "{why}");
+    }
+
+    /// An rc file Bazel loads and nobody read may name a config that
+    /// blocks every URL: never `NoConfig`, never `Fetchable`.
+    #[test]
+    fn an_rc_file_that_was_not_read_in_full_blocks() {
+        let line = |text: &str| BazelLine::of(BazelVersion::parse(text).expect("a release"));
+        let open = ("open.cfg", "allow patch.socket.dev\n");
+        for (rc, gap) in [
+            // Nothing names a config in what was read.
+            ("import %workspace%/ci.bazelrc\n", "ci.bazelrc"),
+            ("try-import %workspace%/ci.bazelrc\n", "ci.bazelrc"),
+            // What was read names one that fetches.
+            (
+                "common --downloader_config=open.cfg\nimport %workspace%/ci.bazelrc\n",
+                "ci.bazelrc",
+            ),
+            (
+                "import %workspace%/ci.bazelrc\ncommon --downloader_config=open.cfg\n",
+                "ci.bazelrc",
+            ),
+            // A missing plain import stops Bazel itself.
+            ("import %workspace%/gone.bazelrc\n", "gone.bazelrc"),
+        ] {
+            let files =
+                Files::of(&[(".bazelrc", rc), open]).with("ci.bazelrc", FileText::Unreadable);
+            for bazel in ["7.7.2", "9.3.2", "10.0.0"] {
+                let line = line(bazel);
+                let flags = read(&files).effective(&line);
+                match verdict(&flags, &line, &files, PATCH) {
+                    Verdict::Blocked { config, why } => {
+                        assert_eq!(config, gap, "{rc:?}");
+                        assert!(why.starts_with(gap), "{why}");
+                    }
+                    other => panic!("Bazel {bazel}, {rc:?}: {other:?}"),
+                }
+            }
+        }
+        // The control: the same rc without the import fetches.
+        let control = [(".bazelrc", "common --downloader_config=open.cfg\n"), open];
+        assert!(matches!(
+            tracked(&control, &line("9.3.2")),
+            Verdict::Fetchable { .. }
+        ));
+        // An absent `try-import` target is the usual per-user file.
+        let optional = [(".bazelrc", "try-import %workspace%/user.bazelrc\n")];
+        assert_eq!(tracked(&optional, &line("9.3.2")), Verdict::NoConfig);
+
+        // Configs that expand to more options than the reader follows:
+        // the config the last level names was never reached.
+        let mut doubling = String::from("build --config=c0\n");
+        for level in 0..16 {
+            let next = level + 1;
+            doubling += &format!("build:c{level} --config=c{next} --config=c{next}\n");
+        }
+        doubling += "build:c16 --downloader_config=shut.cfg\n";
+        let cut = [(".bazelrc", &doubling[..]), ("shut.cfg", "block *\n")];
+        for bazel in ["9.3.2", "10.0.0"] {
+            let line = line(bazel);
+            let files = Files::of(&cut);
+            let flags = read(&files).effective(&line);
+            assert!(flags.gaps().is_empty());
+            assert!(flags
+                .occurrences(Flag::DownloaderConfig, Chain::Build)
+                .is_err());
+            match verdict(&flags, &line, &files, PATCH) {
+                Verdict::Blocked { config, why } => {
+                    assert_eq!(config, ".bazelrc");
+                    assert!(why.contains("more options"), "Bazel {bazel}: {why}");
+                }
+                other => panic!("Bazel {bazel}: {other:?}"),
+            }
+        }
     }
 
     /// Probe S8: on Bazel 6.5.0 a second config replaced the first (a
