@@ -3219,6 +3219,7 @@ it is `active`, and is as stable as a code.
 | `lock_path` | The lock a hub names has a file name the rewriter does not handle (for example `Cargo.Bazel.lock`). |
 | `label_not_literal` | A hub name, a lock label or a value to edit is computed, not a plain string literal. |
 | `rc_import_unreadable` | An rc file import could not be followed, so a flag that changes the answer may be set. |
+| `workspace_unreadable` | A Bazel file that can declare a hub exists and cannot be read or parsed, or Bazel itself stops on the tracked rc flags, so which lock Bazel reads is not known. |
 | `workspace_dead` | The declaration is in a WORKSPACE file that this Bazel configuration does not evaluate. |
 | `hub_shadowed` | Another declaration of the same repository name takes precedence. |
 | `hub_not_imported` | The hub is declared and no `use_repo` imports it. |

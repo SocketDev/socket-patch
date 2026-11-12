@@ -1,0 +1,25 @@
+# Design 4.2 row 24: cargo-raze, told by its fetch macro. Bazel builds the
+# generated `crates.bzl`, never `Cargo.lock`.
+
+=== .bazelversion
+6.6.0
+=== WORKSPACE
+workspace(name = "app")
+
+load("//cargo:crates.bzl", "raze_fetch_remote_crates")
+
+raze_fetch_remote_crates()
+=== cargo/crates.bzl
+def raze_fetch_remote_crates():
+    pass
+=== cargo/Cargo.toml
+[package]
+name = "deps"
+version = "0.0.0"
+
+[package.metadata.raze]
+workspace_path = "//cargo"
+=== cargo/Cargo.lock
+version = 3
+=== cargo/BUILD.bazel
+

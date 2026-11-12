@@ -1,0 +1,45 @@
+# Dynamic declarations in a WORKSPACE: a hub rule called with a computed
+# lock, a `pycross_lock_repo` whose lock is an argument of a nested call, and
+# a ruleset whose rule is loaded and never seen called (a signal).
+
+=== .bazelversion
+7.7.2
+=== WORKSPACE
+workspace(name = "app")
+
+load("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
+
+http_archive(
+    name = "rules_python",
+    strip_prefix = "rules_python-0.31.0",
+    url = "https://github.com/bazelbuild/rules_python/releases/download/0.31.0/rules_python-0.31.0.tar.gz",
+)
+
+load("@rules_python//python:pip.bzl", "pip_parse")
+
+LOCKS = ["//:requirements.txt"]
+
+pip_parse(
+    name = "pypi",
+    requirements_lock = LOCKS[0],
+)
+
+load("@rules_jvm_external//:defs.bzl", "maven_install")
+load("@external_macros//:deps.bzl", "java_deps")
+
+java_deps(maven_install)
+
+load("@rules_pycross//pycross:workspace.bzl", "lock_repo_model_uv", "pycross_lock_repo")
+
+pycross_lock_repo(
+    name = "pycross",
+    lock_model = lock_repo_model_uv(lock_file = "//:uv.lock", project_file = "//:pyproject.toml"),
+)
+=== requirements.txt
+six==1.16.0
+=== uv.lock
+version = 1
+=== pyproject.toml
+[project]
+name = "app"
+version = "0"

@@ -1,0 +1,19 @@
+# Design 4.2 row 4: rules_js import mode. `npm_package_lock` makes rules_js
+# generate the pnpm lock from the npm one, so the npm lock is what Bazel reads.
+
+=== .bazelversion
+9.3.2
+=== MODULE.bazel
+bazel_dep(name = "aspect_rules_js", version = "3.6.0")
+
+npm = use_extension("@aspect_rules_js//npm:extensions.bzl", "npm")
+npm.npm_translate_lock(
+    name = "npm",
+    npm_package_lock = "//:package-lock.json",
+    pnpm_lock = "//:pnpm-lock.yaml",
+)
+use_repo(npm, "npm")
+=== package-lock.json
+{"lockfileVersion": 3, "packages": {}}
+=== pnpm-lock.yaml
+lockfileVersion: '9.0'

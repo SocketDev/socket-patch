@@ -222,7 +222,9 @@ pub struct Site {
 
 // ── Workspace, rulesets and hubs ─────────────────────────────────────
 
-/// Everything read from one Bazel root (or the union of nested roots).
+/// Everything read from one Bazel root. Every path in it is relative to
+/// that root, so nested roots are read one each, and
+/// `govern::governance_over` combines their answers.
 #[derive(Debug, Clone, PartialEq)]
 pub struct BazelWorkspace {
     pub root: RootRef,
@@ -241,6 +243,26 @@ pub struct BazelWorkspace {
     pub signals: Vec<RulesetSignal>,
     pub out_of_scope: OutOfScope,
     pub completeness: Completeness,
+    /// What a recognizer could not read exactly, with its ruleset: the
+    /// ecosystem of that ruleset is undetermined (design 2.9). The same
+    /// gaps are in `completeness`, which does not say whose they are.
+    pub ruleset_gaps: Vec<(Ruleset, Gap)>,
+    pub vendor_dirs: CommittedVendorDirs,
+}
+
+/// The vendor directories committed at a root: evidence that some command
+/// line passes `--vendor_dir` even where no tracked rc file does (design
+/// 2.6). Bazel then builds from the directory, and a pin in a lock is a
+/// silent no-op. Only a reader of the disk can fill this in
+/// (`crawlers::bazel_workspace`); the pure reader leaves it empty.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CommittedVendorDirs {
+    /// First-level directories of the root that `bazel vendor` wrote,
+    /// relative to the root, sorted.
+    pub dirs: Vec<String>,
+    /// The root could not be listed to its end: an empty `dirs` does not
+    /// say that there is none.
+    pub cannot_tell: bool,
 }
 
 /// A ruleset `bazel_dep`, archive or `load` with no resolvable hub.

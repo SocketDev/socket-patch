@@ -1,0 +1,143 @@
+== dynamic-bzlmod
+bazel 9.3.2 as Bzlmod, tier Supported, read incomplete (label_not_literal)
+hub 0: rules_js PnpmLock (npm) `npm` in MODULE.bazel [bzlmod], live, not literal, ruleset 3.6.0..?
+  PackageLock  -> <unresolved>
+signal: rules_jvm_external in MODULE.bazel
+npm at ``: undetermined: label_not_literal
+maven at ``: undetermined: label_not_literal
+== dynamic-extension-label
+bazel 9.3.2 as Bzlmod, tier Supported, read incomplete (label_not_literal)
+signal: rules_python in MODULE.bazel
+npm at ``: undetermined: label_not_literal
+pypi at ``: undetermined: label_not_literal
+cargo at ``: undetermined: label_not_literal
+gem at ``: undetermined: label_not_literal
+golang at ``: undetermined: label_not_literal
+maven at ``: undetermined: label_not_literal
+nuget at ``: undetermined: label_not_literal
+== dynamic-workspace
+bazel 7.7.2 as Hybrid, tier Beta, read incomplete (label_not_literal)
+hub 0: rules_python PipParseWorkspace (pypi) `pypi` in WORKSPACE [workspace], live, not literal, ruleset 0.31.0..0.31.0
+  PackageLock  -> <unresolved>
+hub 1: rules_pycross PycrossUnsupported (pypi) `pycross` in WORKSPACE [workspace], live, not literal, ruleset ?..?
+  PackageLock  -> <unresolved>
+signal: rules_jvm_external in WORKSPACE
+pypi at ``: undetermined: label_not_literal
+maven at ``: undetermined: label_not_literal
+== row04-rules_js-import-mode
+bazel 9.3.2 as Bzlmod, tier Supported, read exact
+hub 0: rules_js ImportMode (npm) `npm` in MODULE.bazel [bzlmod], live, ruleset 3.6.0..?
+  PackageLock //:pnpm-lock.yaml -> pnpm-lock.yaml
+  PackageLock //:package-lock.json -> package-lock.json
+npm at ``: governed by 0
+== row05-rules_nodejs-install
+bazel 6.6.0 as Workspace, tier Legacy, read exact
+hub 0: rules_nodejs NodeInstall (npm) `npm` in WORKSPACE [workspace], live, ruleset 5.8.5..5.8.5
+  PackageLock //:package-lock.json -> package-lock.json
+  Config //:package.json -> package.json
+hub 1: rules_nodejs NodeInstall (npm) `web_deps` in WORKSPACE [workspace], live, ruleset 5.8.5..5.8.5
+  PackageLock //web:yarn.lock -> web/yarn.lock
+  Config //web:package.json -> web/package.json
+npm at ``: governed by 0
+npm at `web`: governed by 1
+== row07-rules_python-multi-pip-parse
+bazel 7.7.2 as Hybrid, tier Beta, read exact
+hub 0: rules_python PipParseWorkspace (pypi) `pypi` in WORKSPACE [workspace], live, ruleset 0.31.0..0.31.0
+  PackageLock //:requirements_3_10.txt -> requirements_3_10.txt
+  PackageLock //:requirements_3_11.txt -> requirements_3_11.txt
+hub 1: rules_python PipParseWorkspace (pypi) `tools_pip` in tools/deps.bzl [workspace], live, ruleset 0.31.0..0.31.0
+  PackageLock //tools:requirements.txt -> tools/requirements.txt
+pypi at ``: governed by 0
+pypi at `tools`: governed by 1
+== row08-rules_python-pip-install
+bazel 6.6.0 as Workspace, tier Legacy, read exact
+hub 0: rules_python PipInstall (pypi) `old` in WORKSPACE [workspace], live, ruleset 0.26.0..0.26.0
+  PackageLock //:requirements.txt -> requirements.txt
+pypi at ``: governed by 0
+== row13-rules_pycross-unsupported
+bazel 9.3.2 as Bzlmod, tier Supported, read exact
+hub 0: rules_pycross PycrossUnsupported (pypi) `pdm_deps` in MODULE.bazel [bzlmod], live, ruleset 2.0.1..2.0.1
+  PackageLock //:pdm.lock -> pdm.lock
+  Config //:pyproject.toml -> pyproject.toml
+hub 1: rules_pycross PycrossUnsupported (pypi) `generated` in MODULE.bazel [bzlmod], live, ruleset 2.0.1..2.0.1
+  DerivedValue //third_party:lock.bzl -> third_party/lock.bzl
+pypi at ``: governed by 0,1
+pypi at `third_party`: governed by 1
+== row14-rules_jvm_external-workspace
+bazel 7.7.2 as Hybrid, tier Beta, read exact
+hub 0: rules_jvm_external MavenPinned (maven) `maven` in WORKSPACE [workspace], live, ruleset 5.3..5.3
+  PackageLock //third_party:maven_install.json -> third_party/maven_install.json
+hub 1: rules_jvm_external MavenUnpinned (maven) `unpinned` in WORKSPACE [workspace], live, ruleset 5.3..5.3
+maven at ``: governed by 0,1
+maven at `third_party`: governed by 0
+== row20-rules_rust-workspace
+bazel 6.6.0 as Workspace, tier Legacy, read exact
+hub 0: rules_rust CratesRepositoryUnlocked (cargo) `crate_index` in WORKSPACE [workspace], live, ruleset 0.49.3..0.49.3
+  PackageLock //:Cargo.lock -> Cargo.lock
+  Config //:Cargo.toml -> Cargo.toml
+hub 1: rules_rust CrateUniverseLocked (cargo) `pinned` in WORKSPACE [workspace], live, ruleset 0.49.3..0.49.3
+  PackageLock //tools:Cargo.lock -> tools/Cargo.lock
+  DerivedValue //tools:cargo-bazel-lock.json -> tools/cargo-bazel-lock.json
+  Config //tools:Cargo.toml -> tools/Cargo.toml
+cargo at ``: governed by 0
+cargo at `tools`: governed by 1
+== row22-rules_rust-from-specs-and-vendor
+bazel 9.3.2 as Bzlmod, tier Supported, read exact
+hub 0: rules_rust CrateUniverseUnlocked (cargo) `crates` in MODULE.bazel [bzlmod], live, ruleset 0.75.0..?
+  PackageLock //:Cargo.lock -> Cargo.lock
+  Config //:Cargo.toml -> Cargo.toml
+hub 1: rules_rust FromSpecs (cargo) `specs` in MODULE.bazel [bzlmod], live, ruleset 0.75.0..?
+hub 2: rules_rust CratesVendor (cargo) `crates_vendor` in third_party/BUILD.bazel [bzlmod], live, ruleset 0.75.0..?
+  PackageLock //:Cargo.lock -> Cargo.lock
+  Config //:Cargo.toml -> Cargo.toml
+cargo at ``: governed by 0,1,2
+== row24-cargo-raze
+bazel 6.6.0 as Workspace, tier Legacy, read exact
+hub 0: report_only ReportOnly (cargo) `` in WORKSPACE [workspace], live, ruleset ?..?
+  Config //cargo:Cargo.toml -> cargo/Cargo.toml
+  PackageLock //cargo:Cargo.lock -> cargo/Cargo.lock
+cargo at `cargo`: governed by 0
+== row27-rules_ruby-legacy
+bazel 7.7.2 as Hybrid, tier Beta, read exact
+hub 0: rules_ruby LegacyBundle (gem) `bundle` in WORKSPACE [workspace], live, ruleset 0.4.1..0.4.1
+  PackageLock //app:Gemfile.lock -> app/Gemfile.lock
+  Config //app:Gemfile -> app/Gemfile
+hub 1: rules_ruby LegacyBundle (gem) `legacy_bundle` in WORKSPACE [workspace], live, ruleset ?..?
+  PackageLock //:Gemfile.lock -> Gemfile.lock
+  Config //:Gemfile -> Gemfile
+gem at ``: governed by 1
+gem at `app`: governed by 0
+== row28-rules_dotnet-workspace
+bazel 7.7.2 as Hybrid, tier Beta, read exact
+hub 0: rules_dotnet PaketGroup (nuget) `paket.main` in WORKSPACE [workspace], live, ruleset ?..?
+  PackageLock //deps:paket.main.bzl -> deps/paket.main.bzl
+nuget at ``: governed by 0
+nuget at `deps`: governed by 0
+== row29-rules_dotnet-single-file
+bazel 7.7.2 as Hybrid, tier Beta, read exact
+hub 0: rules_dotnet PaketSingle (nuget) `paket.` in WORKSPACE [workspace], live, ruleset ?..?
+  PackageLock //paket/deps:paket.bzl -> paket/deps/paket.bzl
+nuget at ``: governed by 0
+nuget at `paket/deps`: governed by 0
+== row31-report-only-bzlmod
+bazel 9.3.2 as Bzlmod, tier Supported, read exact
+hub 0: report_only ReportOnly (maven) `guava` in MODULE.bazel [bzlmod], live, ruleset ?..?
+hub 1: report_only ReportOnly (pypi) `req_compile_deps` in MODULE.bazel [bzlmod], live, ruleset ?..?
+  PackageLock //3rdparty:requirements.linux_x86_64.txt -> 3rdparty/requirements.linux_x86_64.txt
+  PackageLock //3rdparty:requirements.macos_aarch64.txt -> 3rdparty/requirements.macos_aarch64.txt
+hub 2: report_only ReportOnly (pypi) `their_pip` in MODULE.bazel [bzlmod], not-root-module, ruleset ?..?
+pypi at ``: governed by 1
+pypi at `3rdparty`: governed by 1
+maven at ``: governed by 0
+== row31-report-only-workspace
+bazel 6.6.0 as Workspace, tier Legacy, read exact
+hub 0: report_only ReportOnly (pypi) `poetry` in WORKSPACE [workspace], live, ruleset ?..?
+  PackageLock //:poetry.lock -> poetry.lock
+  Config //:pyproject.toml -> pyproject.toml
+hub 1: report_only ReportOnly (maven) `maven_dependencies` in WORKSPACE [workspace], live, ruleset ?..?
+  PackageLock //3rdparty:workspace.bzl -> 3rdparty/workspace.bzl
+hub 2: report_only ReportOnly (maven) `junit` in WORKSPACE [workspace], live, ruleset ?..?
+hub 3: report_only ReportOnly (maven) `asm` in WORKSPACE [workspace], live, ruleset ?..?
+pypi at ``: governed by 0
+maven at ``: governed by 1,2,3
+maven at `3rdparty`: governed by 1

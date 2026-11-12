@@ -1,0 +1,49 @@
+# The WORKSPACE signatures of rules_python beside `pip_parse` (design 2.7):
+# `multi_pip_parse`, one lock per Python version, and a `pip_parse` under
+# `maybe` in the body of a main-repository macro.
+
+=== .bazelversion
+7.7.2
+=== WORKSPACE
+workspace(name = "app")
+
+load("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
+
+http_archive(
+    name = "rules_python",
+    strip_prefix = "rules_python-0.31.0",
+    url = "https://github.com/bazelbuild/rules_python/releases/download/0.31.0/rules_python-0.31.0.tar.gz",
+)
+
+load("@rules_python//python:pip.bzl", "multi_pip_parse")
+
+multi_pip_parse(
+    name = "pypi",
+    default_version = "3.11",
+    python_interpreter_target = {
+        "3.10": "@python_3_10_host//:python",
+        "3.11": "@python_3_11_host//:python",
+    },
+    requirements_lock = {
+        "3.10": "//:requirements_3_10.txt",
+        "3.11": "//:requirements_3_11.txt",
+    },
+)
+
+load("//tools:deps.bzl", "tool_deps")
+
+tool_deps()
+=== tools/deps.bzl
+load("@bazel_tools//tools/build_defs/repo:utils.bzl", "maybe")
+load("@rules_python//python:pip.bzl", "pip_parse")
+
+def tool_deps():
+    maybe(pip_parse, name = "tools_pip", requirements_lock = "//tools:requirements.txt")
+=== tools/BUILD.bazel
+
+=== requirements_3_10.txt
+six==1.16.0
+=== requirements_3_11.txt
+six==1.16.0
+=== tools/requirements.txt
+six==1.16.0

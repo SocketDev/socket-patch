@@ -1,0 +1,38 @@
+# The WORKSPACE signature of rules_jvm_external (design 2.7; 4.2 rows 14 and
+# 15): `maven_install` with a lock, and one without.
+
+=== .bazelversion
+7.7.2
+=== WORKSPACE
+workspace(name = "app")
+
+load("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
+
+http_archive(
+    name = "rules_jvm_external",
+    strip_prefix = "rules_jvm_external-5.3",
+    url = "https://github.com/bazelbuild/rules_jvm_external/releases/download/5.3/rules_jvm_external-5.3.tar.gz",
+)
+
+load("@rules_jvm_external//:defs.bzl", "maven_install")
+
+maven_install(
+    name = "maven",
+    artifacts = ["junit:junit:4.13.2"],
+    maven_install_json = "//third_party:maven_install.json",
+    repositories = ["https://repo1.maven.org/maven2"],
+)
+
+load("@maven//:defs.bzl", "pinned_maven_install")
+
+pinned_maven_install()
+
+maven_install(
+    name = "unpinned",
+    artifacts = ["org.slf4j:slf4j-api:1.7.36"],
+    repositories = ["https://repo1.maven.org/maven2"],
+)
+=== third_party/maven_install.json
+{"version": "2", "artifacts": {}}
+=== third_party/BUILD.bazel
+
