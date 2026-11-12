@@ -1,0 +1,7 @@
+{
+    "dependencies": {
+        "@image-test/a": "workspace:*",
+        "@image-test/d": "workspace:*",
+        "acorn": "8.12.1"
+    }
+}

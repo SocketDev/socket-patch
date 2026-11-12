@@ -1,0 +1,9 @@
+{
+    "name": "@image-test/d",
+    "type": "module",
+    "private": true,
+    "dependencies": {
+        "@image-test/a": "workspace:*",
+        "uuid": "8.3.2"
+    }
+}
