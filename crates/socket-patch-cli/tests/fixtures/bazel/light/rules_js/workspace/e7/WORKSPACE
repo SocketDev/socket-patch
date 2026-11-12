@@ -1,0 +1,29 @@
+workspace(name = "socket_fixture_rules_js")
+
+load("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
+
+http_archive(
+    name = "aspect_rules_js",
+    integrity = "sha256-lKPP6aC40ks3OK27IZPjw0vZQEjBhBxgNberPT/mji0=",
+    strip_prefix = "rules_js-2.9.3",
+    url = "https://github.com/aspect-build/rules_js/releases/download/v2.9.3/rules_js-v2.9.3.tar.gz",
+)
+
+load("@aspect_rules_js//js:repositories.bzl", "rules_js_dependencies")
+
+rules_js_dependencies()
+
+load("@aspect_rules_js//js:toolchains.bzl", "DEFAULT_NODE_VERSION", "rules_js_register_toolchains")
+
+rules_js_register_toolchains(node_version = DEFAULT_NODE_VERSION)
+
+load("@aspect_rules_js//npm:repositories.bzl", "npm_translate_lock")
+
+npm_translate_lock(
+    name = "npm",
+    pnpm_lock = "//:pnpm-lock.yaml",
+)
+
+load("@npm//:repositories.bzl", "npm_repositories")
+
+npm_repositories()

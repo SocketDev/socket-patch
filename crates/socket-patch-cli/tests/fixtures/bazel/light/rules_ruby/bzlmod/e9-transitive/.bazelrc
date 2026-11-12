@@ -1,0 +1,3 @@
+# rules_ruby's rules resolve a Java runtime toolchain; with no JDK on the host the
+# build stops at `Cannot find Java binary` unless a remote one is named.
+build --java_runtime_version=remotejdk_21

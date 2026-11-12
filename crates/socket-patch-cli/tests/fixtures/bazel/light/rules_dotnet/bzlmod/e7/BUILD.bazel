@@ -1,0 +1,19 @@
+load("@rules_dotnet//dotnet:defs.bzl", "csharp_binary")
+load("//:probe.bzl", "socket_probe")
+
+# Tiers 0 and 1: the package file Bazel fetched.
+socket_probe(
+    name = "socket_probe",
+    srcs = ["@nuget.sp.victim.v1.0.0//:sp.victim.1.0.0.nupkg"],
+)
+
+# Tier 2: a C# program that prints the status line of the package's
+# license file. The fixture package holds a placeholder assembly, so the
+# program takes the package as data and not as a reference.
+csharp_binary(
+    name = "consumer",
+    srcs = ["Consumer.cs"],
+    data = ["@nuget.sp.victim.v1.0.0//:LICENSE.md"],
+    target_frameworks = ["net6.0"],
+    targeting_packs = ["@paket.rules_dotnet_nuget_packages//microsoft.netcore.app.ref"],
+)

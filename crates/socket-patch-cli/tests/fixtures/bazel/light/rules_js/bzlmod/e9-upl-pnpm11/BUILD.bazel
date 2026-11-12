@@ -1,0 +1,25 @@
+load("@aspect_rules_js//js:defs.bzl", "js_binary")
+load("@npm//:defs.bzl", "npm_link_all_packages")
+load("//:probe.bzl", "socket_probe")
+
+npm_link_all_packages(name = "node_modules")
+
+# Tiers 0 and 1: both registry packages as rules_js links them. Each `dir`
+# is a tree artifact; its one source file is the registry tarball.
+socket_probe(
+    name = "socket_probe",
+    srcs = [
+        ":node_modules/@tootallnate/once/dir",
+        ":node_modules/left-pad/dir",
+    ],
+)
+
+# Tier 2: a program that loads the linked packages.
+js_binary(
+    name = "consumer",
+    data = [
+        ":node_modules/@tootallnate/once",
+        ":node_modules/left-pad",
+    ],
+    entry_point = "consumer.js",
+)

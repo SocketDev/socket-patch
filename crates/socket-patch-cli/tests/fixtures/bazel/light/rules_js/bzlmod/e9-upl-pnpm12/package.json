@@ -1,0 +1,12 @@
+{
+  "name": "sp-bazel-rules-js-probe",
+  "version": "0.0.0",
+  "private": true,
+  "dependencies": {
+    "@tootallnate/once": "2.0.0",
+    "left-pad": "1.3.0"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": []
+  }
+}

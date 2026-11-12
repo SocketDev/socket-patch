@@ -1,0 +1,15 @@
+module(name = "socket_fixture_rules_dotnet")
+
+bazel_dep(name = "rules_dotnet", version = "0.22.2")
+
+# The ruleset under test stays at the version this fixture is written for.
+single_version_override(
+    module_name = "rules_dotnet",
+    version = "0.22.2",
+)
+
+# No `dotnet.toolchain` tag: rules_dotnet registers its own default SDK,
+# and `//:consumer` targets that SDK's framework.
+
+main_extension = use_extension("//deps:paket.main_extension.bzl", "main_extension")
+use_repo(main_extension, "paket.main")

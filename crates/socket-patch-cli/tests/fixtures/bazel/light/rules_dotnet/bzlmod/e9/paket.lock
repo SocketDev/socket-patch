@@ -1,0 +1,5 @@
+RESTRICTION: == net8.0
+NUGET
+  remote: https://api.nuget.org/v3/index.json
+    SP.Other (1.0)
+    SP.Victim (1.0)

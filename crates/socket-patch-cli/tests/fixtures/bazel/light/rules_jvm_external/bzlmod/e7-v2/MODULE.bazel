@@ -1,0 +1,26 @@
+module(name = "socket_fixture_rules_jvm_external")
+
+bazel_dep(name = "rules_jvm_external", version = "6.5")
+bazel_dep(name = "rules_java", version = "7.6.5")
+
+# The ruleset under test stays at the version this fixture is written for.
+single_version_override(
+    module_name = "rules_jvm_external",
+    version = "6.5",
+)
+
+maven = use_extension("@rules_jvm_external//:extensions.bzl", "maven")
+maven.install(
+    artifacts = [
+        "org.slf4j:slf4j-simple:1.7.36",
+        "com.google.code.gson:gson:2.10.1",
+    ],
+    fail_if_repin_required = True,
+    lock_file = "//:maven_install.json",
+    repositories = ["https://repo1.maven.org/maven2"],
+)
+
+# `org_slf4j_slf4j_api_1_7_36` is the artifact repository of slf4j-api: the proof
+# ladder reads the registry jar from its `file` target, because anything
+# built through `@maven//` pulls a JDK and yields a re-stamped jar.
+use_repo(maven, "maven", "org_slf4j_slf4j_api_1_7_36")

@@ -1,0 +1,88 @@
+{
+  "group": "light",
+  "ruleset": "rules_ruby",
+  "registries": [
+    "gem"
+  ],
+  "probe": [
+    {
+      "anchor": "sha256",
+      "label": "sp-victim-1.0.0.gem",
+      "artifact": "rubygems.org/gems/sp-victim-1.0.0.gem"
+    }
+  ],
+  "fixtures": [
+    {
+      "path": "bzlmod/e9",
+      "test": "bazel_canary_baseline_rules_ruby_bzlmod_e9",
+      "system": "bzlmod",
+      "pins": {
+        "rules_ruby": "1.0.0-rc2"
+      },
+      "shape": "bundle_fetch with gem_checksums for every gem",
+      "cells": [
+        {
+          "bazel": "9.3.2",
+          "tier": "nightly"
+        },
+        {
+          "bazel": "8.8.2",
+          "tier": "nightly"
+        }
+      ]
+    },
+    {
+      "path": "bzlmod/e9-nosums",
+      "test": "bazel_canary_baseline_rules_ruby_bzlmod_e9_nosums",
+      "system": "bzlmod",
+      "pins": {
+        "rules_ruby": "1.0.0-rc2"
+      },
+      "shape": "bundle_fetch without gem_checksums: Bazel holds no checksum for a gem",
+      "cells": [
+        {
+          "bazel": "9.3.2",
+          "tier": "nightly"
+        },
+        {
+          "bazel": "8.8.2",
+          "tier": "nightly"
+        }
+      ]
+    },
+    {
+      "path": "bzlmod/e9-transitive",
+      "test": "bazel_canary_baseline_rules_ruby_bzlmod_e9_transitive",
+      "system": "bzlmod",
+      "pins": {
+        "rules_ruby": "1.0.0-rc2"
+      },
+      "shape": "bundle_fetch with gem_checksums; sp-victim arrives only as a dependency of sp-parent",
+      "cells": [
+        {
+          "bazel": "9.3.2",
+          "tier": "nightly"
+        },
+        {
+          "bazel": "8.8.2",
+          "tier": "nightly"
+        }
+      ]
+    },
+    {
+      "path": "workspace/e7",
+      "test": "bazel_canary_baseline_rules_ruby_workspace_e7",
+      "system": "workspace",
+      "pins": {
+        "rules_ruby": "0.21.1"
+      },
+      "shape": "WORKSPACE rb_bundle_fetch (no gem_checksums attribute in this release)",
+      "cells": [
+        {
+          "bazel": "7.7.2",
+          "tier": "nightly"
+        }
+      ]
+    }
+  ]
+}

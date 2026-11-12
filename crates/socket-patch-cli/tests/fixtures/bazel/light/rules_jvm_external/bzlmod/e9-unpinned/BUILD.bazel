@@ -1,0 +1,19 @@
+load("@rules_java//java:defs.bzl", "java_binary")
+load("//:probe.bzl", "socket_probe")
+
+# Tiers 0 and 1: the jar as the hub hands it to Java rules. An unpinned hub
+# has no artifact repository to read the registry jar from, so building this
+# target analyses a `jvm_import` and with it a Java toolchain.
+socket_probe(
+    name = "socket_probe",
+    srcs = ["@unpinned//:org_slf4j_slf4j_api"],
+)
+
+# Tier 2: a program that loads a class from slf4j-api and prints whether the
+# jar it came from carries the patch marker.
+java_binary(
+    name = "consumer",
+    srcs = ["src/Consumer.java"],
+    main_class = "Consumer",
+    deps = ["@unpinned//:org_slf4j_slf4j_api"],
+)

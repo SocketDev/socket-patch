@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "dependencies": {
+    "net8.0": {
+      "SP.Other": {
+        "type": "Direct",
+        "requested": "[1.0.0, )",
+        "resolved": "1.0.0",
+        "contentHash": "UYYndM/8aEsn2NPPHecSroWYSo3HDOkkfkQNjT/ZOD6Bjq/KiIwiAztAkfWyVdctVooIskr8ELkRXrcKGMWyJQ=="
+      },
+      "SP.Victim": {
+        "type": "Direct",
+        "requested": "[1.0.0, )",
+        "resolved": "1.0.0",
+        "contentHash": "fIYTuz3T8aSwai2/N4teNgwbFh7YYi50ptRulds1qeLLcwYgoIxuE+QgjpW8w9BHAD6/mKkGH1qAXgEzOV25KA=="
+      }
+    }
+  }
+}

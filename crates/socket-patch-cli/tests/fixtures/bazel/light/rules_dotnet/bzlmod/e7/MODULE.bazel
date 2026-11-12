@@ -1,0 +1,25 @@
+module(name = "socket_fixture_rules_dotnet")
+
+bazel_dep(name = "rules_dotnet", version = "0.14.0")
+
+# The ruleset under test stays at the version this fixture is written for.
+single_version_override(
+    module_name = "rules_dotnet",
+    version = "0.14.0",
+)
+
+# No `dotnet.toolchain` tag: rules_dotnet registers its own default SDK.
+# This release has no default targeting pack, so `//:consumer` takes the one
+# rules_dotnet resolves for its own tools.
+dotnet_packages = use_extension(
+    "@rules_dotnet//dotnet:paket.rules_dotnet_nuget_packages_extension.bzl",
+    "rules_dotnet_nuget_packages_extension",
+)
+use_repo(dotnet_packages, "paket.rules_dotnet_nuget_packages")
+
+main_extension = use_extension("//deps:paket.main_extension.bzl", "main_extension")
+
+# `nuget.sp.victim.v1.0.0` is the archive repository of the package: the hub
+# of this rules_dotnet has no `files` alias, so the proof ladder reads the
+# package file from the archive itself.
+use_repo(main_extension, "nuget.sp.victim.v1.0.0", "paket.main")

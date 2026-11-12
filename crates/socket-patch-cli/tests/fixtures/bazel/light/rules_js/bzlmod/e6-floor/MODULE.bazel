@@ -1,0 +1,17 @@
+module(name = "socket_fixture_rules_js")
+
+bazel_dep(name = "aspect_rules_js", version = "1.39.1")
+
+# The ruleset under test stays at the version this fixture is written for:
+# without the override another module's requirement can lift it.
+single_version_override(
+    module_name = "aspect_rules_js",
+    version = "1.39.1",
+)
+
+npm = use_extension("@aspect_rules_js//npm:extensions.bzl", "npm")
+npm.npm_translate_lock(
+    name = "npm",
+    pnpm_lock = "//:pnpm-lock.yaml",
+)
+use_repo(npm, "npm")

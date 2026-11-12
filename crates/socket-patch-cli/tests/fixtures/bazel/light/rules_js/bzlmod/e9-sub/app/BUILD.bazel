@@ -1,0 +1,17 @@
+load("@aspect_rules_js//js:defs.bzl", "js_binary")
+load("@npm//:defs.bzl", "npm_link_all_packages")
+
+package(default_visibility = ["//visibility:public"])
+
+npm_link_all_packages(name = "node_modules")
+
+# Tier 2: a program that loads the linked packages. It lives beside the
+# `node_modules` tree it resolves from; `//:consumer` is an alias of it.
+js_binary(
+    name = "consumer",
+    data = [
+        ":node_modules/@tootallnate/once",
+        ":node_modules/left-pad",
+    ],
+    entry_point = "consumer.js",
+)
