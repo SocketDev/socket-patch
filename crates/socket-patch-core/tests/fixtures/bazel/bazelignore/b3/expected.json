@@ -1,0 +1,181 @@
+{
+ "target_dir": ".socket/go-patches",
+ "versions": [
+  "5.4.1",
+  "6.6.0",
+  "7.7.2",
+  "8.8.2",
+  "9.3.2",
+  "10.0.0rc3"
+ ],
+ "cases": {
+  "s6_all_ignore": {
+   "file": "cases/s6_all_ignore.bazelignore",
+   "bytes_repr": ".socket/go-patches\\n",
+   "observed": {
+    "5.4.1": "hidden",
+    "6.6.0": "hidden",
+    "7.7.2": "hidden",
+    "8.8.2": "hidden",
+    "9.3.2": "hidden",
+    "10.0.0rc3": "hidden"
+   }
+  },
+  "s7_all_ignore_bare_socket": {
+   "file": "cases/s7_all_ignore_bare_socket.bazelignore",
+   "bytes_repr": ".socket\\n",
+   "observed": {
+    "5.4.1": "hidden",
+    "6.6.0": "hidden",
+    "7.7.2": "hidden",
+    "8.8.2": "hidden",
+    "9.3.2": "hidden",
+    "10.0.0rc3": "hidden"
+   }
+  },
+  "h1_crlf": {
+   "file": "cases/h1_crlf.bazelignore",
+   "bytes_repr": ".socket/go-patches\\r\\n",
+   "observed": {
+    "5.4.1": "hidden",
+    "6.6.0": "hidden",
+    "7.7.2": "hidden",
+    "8.8.2": "hidden",
+    "9.3.2": "hidden",
+    "10.0.0rc3": "hidden"
+   }
+  },
+  "h1b_crlf_two_lines": {
+   "file": "cases/h1b_crlf_two_lines.bazelignore",
+   "bytes_repr": "node_modules\\r\\n.socket/go-patches\\r\\n",
+   "observed": {
+    "5.4.1": "hidden",
+    "6.6.0": "hidden",
+    "7.7.2": "hidden",
+    "8.8.2": "hidden",
+    "9.3.2": "hidden",
+    "10.0.0rc3": "hidden"
+   }
+  },
+  "h2_no_final_newline": {
+   "file": "cases/h2_no_final_newline.bazelignore",
+   "bytes_repr": ".socket/go-patches",
+   "observed": {
+    "5.4.1": "hidden",
+    "6.6.0": "hidden",
+    "7.7.2": "hidden",
+    "8.8.2": "hidden",
+    "9.3.2": "hidden",
+    "10.0.0rc3": "hidden"
+   }
+  },
+  "h2b_appended_to_unterminated": {
+   "file": "cases/h2b_appended_to_unterminated.bazelignore",
+   "bytes_repr": "node_modules.socket/go-patches\\n",
+   "observed": {
+    "5.4.1": "exposed",
+    "6.6.0": "exposed",
+    "7.7.2": "exposed",
+    "8.8.2": "exposed",
+    "9.3.2": "exposed",
+    "10.0.0rc3": "exposed"
+   }
+  },
+  "h3_trailing_space": {
+   "file": "cases/h3_trailing_space.bazelignore",
+   "bytes_repr": ".socket/go-patches \\n",
+   "observed": {
+    "5.4.1": "exposed",
+    "6.6.0": "exposed",
+    "7.7.2": "exposed",
+    "8.8.2": "exposed",
+    "9.3.2": "exposed",
+    "10.0.0rc3": "exposed"
+   }
+  },
+  "h4_leading_slash": {
+   "file": "cases/h4_leading_slash.bazelignore",
+   "bytes_repr": "/.socket/go-patches\\n",
+   "observed": {
+    "5.4.1": "exposed",
+    "6.6.0": "exposed",
+    "7.7.2": "exposed",
+    "8.8.2": "error",
+    "9.3.2": "error",
+    "10.0.0rc3": "error"
+   }
+  },
+  "h5_dot_slash_trailing_slash": {
+   "file": "cases/h5_dot_slash_trailing_slash.bazelignore",
+   "bytes_repr": "./.socket/go-patches/\\n",
+   "observed": {
+    "5.4.1": "hidden",
+    "6.6.0": "hidden",
+    "7.7.2": "hidden",
+    "8.8.2": "hidden",
+    "9.3.2": "hidden",
+    "10.0.0rc3": "hidden"
+   }
+  },
+  "h6_absolute": {
+   "file": "cases/h6_absolute.bazelignore",
+   "bytes_repr": "<WORKSPACE>/.socket/go-patches\\n",
+   "observed": {
+    "5.4.1": "exposed",
+    "6.6.0": "exposed",
+    "7.7.2": "exposed",
+    "8.8.2": "error",
+    "9.3.2": "error",
+    "10.0.0rc3": "error"
+   }
+  },
+  "h7_comment_blank": {
+   "file": "cases/h7_comment_blank.bazelignore",
+   "bytes_repr": "# added by socket-patch\\n\\n.socket/go-patches\\n",
+   "observed": {
+    "5.4.1": "hidden",
+    "6.6.0": "hidden",
+    "7.7.2": "hidden",
+    "8.8.2": "hidden",
+    "9.3.2": "hidden",
+    "10.0.0rc3": "hidden"
+   }
+  },
+  "h8_leading_space": {
+   "file": "cases/h8_leading_space.bazelignore",
+   "bytes_repr": " .socket/go-patches\\n",
+   "observed": {
+    "5.4.1": "exposed",
+    "6.6.0": "exposed",
+    "7.7.2": "exposed",
+    "8.8.2": "exposed",
+    "9.3.2": "exposed",
+    "10.0.0rc3": "exposed"
+   }
+  },
+  "h9_bom": {
+   "file": "cases/h9_bom.bazelignore",
+   "bytes_repr": "\\xef\\xbb\\xbf.socket/go-patches\\n",
+   "observed": {
+    "5.4.1": "exposed",
+    "6.6.0": "exposed",
+    "7.7.2": "exposed",
+    "8.8.2": "exposed",
+    "9.3.2": "exposed",
+    "10.0.0rc3": "exposed"
+   }
+  },
+  "s5_all": {
+   "file": null,
+   "bytes_repr": null,
+   "observed": {
+    "5.4.1": "exposed",
+    "6.6.0": "exposed",
+    "7.7.2": "exposed",
+    "8.8.2": "exposed",
+    "9.3.2": "exposed",
+    "10.0.0rc3": "exposed"
+   }
+  }
+ }
+}

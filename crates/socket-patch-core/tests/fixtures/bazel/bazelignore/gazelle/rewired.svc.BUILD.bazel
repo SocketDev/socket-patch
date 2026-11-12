@@ -1,0 +1,17 @@
+load("@io_bazel_rules_go//go:def.bzl", "go_binary", "go_library")
+
+# gazelle:prefix example.com/app
+
+go_library(
+    name = "app_lib",
+    srcs = ["main.go"],
+    importpath = "example.com/app",
+    visibility = ["//visibility:private"],
+    deps = ["//svc/.socket/go-patches/example.com/m@v1.0.0:m"],
+)
+
+go_binary(
+    name = "svc",
+    embed = [":app_lib"],
+    visibility = ["//visibility:public"],
+)

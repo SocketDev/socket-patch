@@ -1,0 +1,355 @@
+{
+ "probe": "S9 (rc-ignore-substitution/s9/run.py hyg)",
+ "target_dir": ".socket/vendor/golang/uuid-1/example.com/m@v1.0.0",
+ "absolute_placeholder": "<WORKSPACE>",
+ "cells": 43,
+ "cases": [
+  {
+   "id": "none",
+   "bytes_hex": null,
+   "bytes_repr": null,
+   "observed": {
+    "7.7.2": {
+     "observed": "exposed",
+     "exit": 7
+    },
+    "8.8.2": {
+     "observed": "exposed",
+     "exit": 7
+    },
+    "9.3.2": {
+     "observed": "exposed",
+     "exit": 7
+    }
+   }
+  },
+  {
+   "id": "lf",
+   "bytes_hex": "2e736f636b65742f76656e646f720a",
+   "bytes_repr": ".socket/vendor\\n",
+   "observed": {
+    "7.7.2": {
+     "observed": "hidden",
+     "exit": 0
+    },
+    "8.8.2": {
+     "observed": "hidden",
+     "exit": 0
+    },
+    "9.3.2": {
+     "observed": "hidden",
+     "exit": 0
+    }
+   }
+  },
+  {
+   "id": "no_final_newline",
+   "bytes_hex": "2e736f636b65742f76656e646f72",
+   "bytes_repr": ".socket/vendor",
+   "observed": {
+    "7.7.2": {
+     "observed": "hidden",
+     "exit": 0
+    },
+    "8.8.2": {
+     "observed": "hidden",
+     "exit": 0
+    },
+    "9.3.2": {
+     "observed": "hidden",
+     "exit": 0
+    }
+   }
+  },
+  {
+   "id": "crlf",
+   "bytes_hex": "2e736f636b65742f76656e646f720d0a",
+   "bytes_repr": ".socket/vendor\\r\\n",
+   "observed": {
+    "7.7.2": {
+     "observed": "hidden",
+     "exit": 0
+    },
+    "8.8.2": {
+     "observed": "hidden",
+     "exit": 0
+    },
+    "9.3.2": {
+     "observed": "hidden",
+     "exit": 0
+    }
+   }
+  },
+  {
+   "id": "crlf_two_lines",
+   "bytes_hex": "2320736f636b65742d70617463680d0a2e736f636b65742f76656e646f720d0a",
+   "bytes_repr": "# socket-patch\\r\\n.socket/vendor\\r\\n",
+   "observed": {
+    "8.8.2": {
+     "observed": "hidden",
+     "exit": 0
+    }
+   }
+  },
+  {
+   "id": "crlf_no_final",
+   "bytes_hex": "617070320d0a2e736f636b65742f76656e646f72",
+   "bytes_repr": "app2\\r\\n.socket/vendor",
+   "observed": {
+    "8.8.2": {
+     "observed": "hidden",
+     "exit": 0
+    }
+   }
+  },
+  {
+   "id": "cr_only",
+   "bytes_hex": "617070320d2e736f636b65742f76656e646f720d",
+   "bytes_repr": "app2\\r.socket/vendor\\r",
+   "observed": {
+    "8.8.2": {
+     "observed": "hidden",
+     "exit": 0
+    }
+   }
+  },
+  {
+   "id": "trailing_space",
+   "bytes_hex": "2e736f636b65742f76656e646f72200a",
+   "bytes_repr": ".socket/vendor \\n",
+   "observed": {
+    "7.7.2": {
+     "observed": "exposed",
+     "exit": 7
+    },
+    "8.8.2": {
+     "observed": "exposed",
+     "exit": 7
+    },
+    "9.3.2": {
+     "observed": "exposed",
+     "exit": 7
+    }
+   }
+  },
+  {
+   "id": "trailing_tab",
+   "bytes_hex": "2e736f636b65742f76656e646f72090a",
+   "bytes_repr": ".socket/vendor\\t\\n",
+   "observed": {
+    "8.8.2": {
+     "observed": "exposed",
+     "exit": 7
+    }
+   }
+  },
+  {
+   "id": "leading_space",
+   "bytes_hex": "202e736f636b65742f76656e646f720a",
+   "bytes_repr": " .socket/vendor\\n",
+   "observed": {
+    "8.8.2": {
+     "observed": "exposed",
+     "exit": 7
+    }
+   }
+  },
+  {
+   "id": "leading_slash",
+   "bytes_hex": "2f2e736f636b65742f76656e646f720a",
+   "bytes_repr": "/.socket/vendor\\n",
+   "observed": {
+    "7.7.2": {
+     "observed": "exposed",
+     "exit": 7
+    },
+    "8.8.2": {
+     "observed": "error",
+     "exit": 7
+    },
+    "9.3.2": {
+     "observed": "error",
+     "exit": 7
+    }
+   }
+  },
+  {
+   "id": "absolute_real_path",
+   "bytes_hex": "3c574f524b53504143453e2f2e736f636b65742f76656e646f720a",
+   "bytes_repr": "<WORKSPACE>/.socket/vendor\\n",
+   "observed": {
+    "8.8.2": {
+     "observed": "error",
+     "exit": 7
+    }
+   }
+  },
+  {
+   "id": "dot_slash",
+   "bytes_hex": "2e2f2e736f636b65742f76656e646f720a",
+   "bytes_repr": "./.socket/vendor\\n",
+   "observed": {
+    "7.7.2": {
+     "observed": "hidden",
+     "exit": 0
+    },
+    "8.8.2": {
+     "observed": "hidden",
+     "exit": 0
+    },
+    "9.3.2": {
+     "observed": "hidden",
+     "exit": 0
+    }
+   }
+  },
+  {
+   "id": "trailing_slash",
+   "bytes_hex": "2e736f636b65742f76656e646f722f0a",
+   "bytes_repr": ".socket/vendor/\\n",
+   "observed": {
+    "7.7.2": {
+     "observed": "hidden",
+     "exit": 0
+    },
+    "8.8.2": {
+     "observed": "hidden",
+     "exit": 0
+    },
+    "9.3.2": {
+     "observed": "hidden",
+     "exit": 0
+    }
+   }
+  },
+  {
+   "id": "double_slash",
+   "bytes_hex": "2e736f636b65742f2f76656e646f720a",
+   "bytes_repr": ".socket//vendor\\n",
+   "observed": {
+    "8.8.2": {
+     "observed": "hidden",
+     "exit": 0
+    }
+   }
+  },
+  {
+   "id": "dotdot",
+   "bytes_hex": "6170702f2e2e2f2e736f636b65742f76656e646f720a",
+   "bytes_repr": "app/../.socket/vendor\\n",
+   "observed": {
+    "8.8.2": {
+     "observed": "hidden",
+     "exit": 0
+    }
+   }
+  },
+  {
+   "id": "bare_socket",
+   "bytes_hex": "2e736f636b65740a",
+   "bytes_repr": ".socket\\n",
+   "observed": {
+    "7.7.2": {
+     "observed": "hidden",
+     "exit": 0
+    },
+    "8.8.2": {
+     "observed": "hidden",
+     "exit": 0
+    }
+   }
+  },
+  {
+   "id": "partial_segment",
+   "bytes_hex": "2e736f636b65742f76656e640a",
+   "bytes_repr": ".socket/vend\\n",
+   "observed": {
+    "8.8.2": {
+     "observed": "exposed",
+     "exit": 7
+    }
+   }
+  },
+  {
+   "id": "deeper",
+   "bytes_hex": "2e736f636b65742f76656e646f722f676f6c616e670a",
+   "bytes_repr": ".socket/vendor/golang\\n",
+   "observed": {
+    "8.8.2": {
+     "observed": "hidden",
+     "exit": 0
+    }
+   }
+  },
+  {
+   "id": "exact_package",
+   "bytes_hex": "2e736f636b65742f76656e646f722f676f6c616e672f757569642d312f6578616d706c652e636f6d2f6d4076312e302e300a",
+   "bytes_repr": ".socket/vendor/golang/uuid-1/example.com/m@v1.0.0\\n",
+   "observed": {
+    "8.8.2": {
+     "observed": "hidden",
+     "exit": 0
+    }
+   }
+  },
+  {
+   "id": "glob_star",
+   "bytes_hex": "2e736f636b65742f2a0a",
+   "bytes_repr": ".socket/*\\n",
+   "observed": {
+    "8.8.2": {
+     "observed": "exposed",
+     "exit": 7
+    }
+   }
+  },
+  {
+   "id": "glob_doublestar",
+   "bytes_hex": "2a2a2f76656e646f720a",
+   "bytes_repr": "**/vendor\\n",
+   "observed": {
+    "8.8.2": {
+     "observed": "exposed",
+     "exit": 7
+    }
+   }
+  },
+  {
+   "id": "inline_comment",
+   "bytes_hex": "2e736f636b65742f76656e646f72202320736f636b65742d70617463680a",
+   "bytes_repr": ".socket/vendor # socket-patch\\n",
+   "observed": {
+    "7.7.2": {
+     "observed": "exposed",
+     "exit": 7
+    },
+    "8.8.2": {
+     "observed": "exposed",
+     "exit": 7
+    }
+   }
+  },
+  {
+   "id": "comment_then_line",
+   "bytes_hex": "2320736f636b65742d70617463680a2e736f636b65742f76656e646f720a",
+   "bytes_repr": "# socket-patch\\n.socket/vendor\\n",
+   "observed": {
+    "8.8.2": {
+     "observed": "hidden",
+     "exit": 0
+    }
+   }
+  },
+  {
+   "id": "bom",
+   "bytes_hex": "efbbbf2e736f636b65742f76656e646f720a",
+   "bytes_repr": "\\xef\\xbb\\xbf.socket/vendor\\n",
+   "observed": {
+    "8.8.2": {
+     "observed": "exposed",
+     "exit": 7
+    }
+   }
+  }
+ ]
+}
