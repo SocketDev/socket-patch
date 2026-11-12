@@ -1,3 +1,4 @@
+pub mod bazel_root_writes;
 pub mod cargo_build_cache;
 pub mod cargo_home;
 pub mod cargo_workspace;

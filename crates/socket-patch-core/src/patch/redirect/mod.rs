@@ -33,6 +33,7 @@ use crate::vendor::npm_origin::{
     npm_link_source_identity, npm_non_registry_entries, npm_shrinkwrapped_entries, NpmOverrides,
 };
 
+mod bazel;
 mod bun_binary;
 pub use bun_binary::{preflight_bun_binary, rewrite_bun_binary};
 #[cfg(test)]

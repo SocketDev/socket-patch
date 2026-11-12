@@ -63,6 +63,7 @@ macro_rules! eprint {
 }
 
 pub mod args;
+pub mod bazel_gate;
 pub mod commands;
 pub(crate) mod ecosystem_dispatch;
 pub mod interrupt;

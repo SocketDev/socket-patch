@@ -16,6 +16,7 @@
 //!   subprocesses, environment or telemetry), embedded by the Node addon
 //!   (`socket-patch-node`) and the CLI's hidden `hosted-bundle` harness.
 
+pub mod bazel_reads;
 pub mod engine;
 pub mod governing_root;
 pub mod guidance;

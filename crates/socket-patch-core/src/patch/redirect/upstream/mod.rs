@@ -29,6 +29,7 @@ use std::path::Path;
 
 use crate::vex::discover::{Discovery, PatchedRef, WiringMode};
 
+mod bazel;
 mod bun_lockb;
 pub(super) mod cargo;
 mod client;
