@@ -23,6 +23,17 @@
 //!   alias. [`versioned_alias`] spells both names, a `use_repo` of the
 //!   repository is in [`RulesJvmExternalDetail::other_imports`], and
 //!   [`scan_consumers`] finds the labels.
+//! - **The order of the hubs is the order of the file, not the
+//!   ruleset's.** Bzlmod hubs are listed by the first tag that names
+//!   each, in statement order. rules_jvm_external makes them by tag
+//!   class instead: per module `artifact` tags and then `install` tags
+//!   at 6.5, `from_toml`, `artifact` and then `install` at 7.2 with the
+//!   root's hubs before the others, and it creates the repositories in
+//!   the order of that dict (`private/extensions/maven.bzl`, lines 237,
+//!   275 and 391 at 6.5; 379, 392, 409 and 652 at 7.2). The recognizer
+//!   leaves the release unknown, so the list is not evidence of which
+//!   hub declares a shared artifact repository first. Nothing relies on
+//!   it: every lock that pins a coordinate is rewritten, or none is.
 //! - **A hub another module declares has its lock in that module.** The
 //!   root sees it only as a `use_repo` name with no tag behind it, which
 //!   is also what an imported artifact repository looks like. Both are
@@ -44,20 +55,32 @@
 //! question, and no lane relies on the answer, because every lock that
 //! pins a coordinate is rewritten or none is.
 //!
+//! Any other statement those files run that writes the name of the rule
+//! may declare a hub where this reader sees no call: a comprehension, a
+//! conditional expression, an `if` or `for` block of a macro body, a
+//! function the rule is handed to, an alias. Each is a `RulesetSignal`,
+//! whatever hubs were read beside it: all hubs are pinned or none is, and
+//! a hub that is not listed keeps the unpatched jar. A statement that
+//! does not write the name cannot run the rule, except through another
+//! function of the main repository, which is not followed (design 2.7).
+//!
 //! The ruleset with no hub of the root that was read (a bare `bazel_dep`,
-//! only another module's hub, a `maven_install` behind a function this
-//! reader does not follow) is a `RulesetSignal`: Bazel may build Maven
-//! artifacts from a lock that is not in this tree, or not found.
+//! only another module's hub, an archive or a `load` of the ruleset with
+//! no call that was read) is a `RulesetSignal` as well: Bazel may build
+//! Maven artifacts from a lock that is not in this tree, or not found.
 //!
 //! Nothing here decides liveness or the ruleset version: every hub leaves
 //! with the version unknown, and `govern` decides both from the
 //! dependency system, the module [`MODULE`] and
 //! [`RulesJvmExternalDetail::load_repo`]. Neither does `recognize` read a
 //! lock or a BUILD file: the lane that needs them asks, so a run that
-//! patches nothing for Maven pays for neither.
+//! patches nothing for Maven pays for neither. The one file it reads
+//! again is a `WORKSPACE` or macro file that loads the rule and runs a
+//! statement that was not read as a hub, for the names in that statement.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
+use super::rules_dotnet::{each_statement, names_written};
 use super::{RecognizeInput, Recognized};
 use crate::bazel::derived::DerivedState;
 use crate::bazel::ignore::{self, IgnoreModel};
@@ -68,7 +91,7 @@ use crate::bazel::model::{
 };
 use crate::bazel::module_file::{At, ExtensionProxy, GapScope, Host, ModuleModel, RepoOverride};
 use crate::bazel::ruleset_version::{Unproven, VersionVerdict};
-use crate::bazel::starlark::{self, Call, Dialect, Lookup, StmtKind, Value, ValueKind};
+use crate::bazel::starlark::{self, Call, Dialect, Lookup, Span, StmtKind, Value, ValueKind};
 use crate::bazel::workspace_file::{
     Callee, WorkspaceModel, WsCall, WsFile, WsLoad, WsStmt, WsStmtKind,
 };
@@ -198,7 +221,7 @@ pub fn recognize(input: &RecognizeInput<'_>) -> Recognized {
         bzlmod(module, &mut out);
     }
     for workspace in input.workspace_files {
-        workspace_hubs(workspace, &mut out);
+        workspace_hubs(input.files, workspace, &mut out);
     }
     out
 }
@@ -610,17 +633,10 @@ fn defs_repo(load: &WsLoad) -> Option<&str> {
     repo_module(&label.repo).filter(|_| defs)
 }
 
-/// How a call uses the ruleset's `maven_install`.
-enum Use<'a> {
-    /// It is the call, or `maybe` of it: the repository it is loaded from
-    /// and the positional arguments that are accounted for.
-    Install(&'a str, usize),
-    /// It is handed to some other function, which may call it.
-    Handed,
-    No,
-}
-
-fn install_use<'a>(file: &'a WsFile, call: &WsCall) -> Use<'a> {
+/// When `call` is the ruleset's `maven_install`, or `maybe` of it: the
+/// repository the rule is loaded from, and the positional arguments that
+/// are accounted for.
+fn install_use<'a>(file: &'a WsFile, call: &WsCall) -> Option<(&'a str, usize)> {
     let rule = |callee: &Callee| match callee {
         Callee::Loaded { load, symbol } if symbol == "maven_install" => {
             file.loads.get(*load).and_then(defs_repo)
@@ -628,83 +644,100 @@ fn install_use<'a>(file: &'a WsFile, call: &WsCall) -> Use<'a> {
         _ => None,
     };
     if let Some(repo) = rule(&call.callee) {
-        return Use::Install(repo, 0);
+        return Some((repo, 0));
     }
-    match call.passes.as_ref().and_then(rule) {
-        Some(repo) if call.call.callee == "maybe" => Use::Install(repo, 1),
-        Some(_) => Use::Handed,
-        None => Use::No,
-    }
+    let weak = call.call.callee == "maybe";
+    let handed = call.passes.as_ref().and_then(rule);
+    handed.filter(|_| weak).map(|repo| (repo, 1))
 }
 
-fn workspace_hubs(model: &WorkspaceModel, out: &mut Recognized) {
+/// The names `file` binds to the ruleset's `maven_install`, each with the
+/// `load` that binds it.
+fn rule_names(file: &WsFile) -> Vec<(&str, &WsLoad)> {
+    let ours = file.loads.iter().filter(|load| defs_repo(load).is_some());
+    let bound = ours.flat_map(|load| load.load.symbols.iter().map(move |symbol| (symbol, load)));
+    let rules = bound.filter(|(symbol, _)| symbol.name == "maven_install");
+    rules
+        .map(|(symbol, load)| (symbol.local.as_str(), load))
+        .collect()
+}
+
+fn workspace_hubs(files: &dyn FileView, model: &WorkspaceModel, out: &mut Recognized) {
     // A file that could not be read has no statements to look at; its
     // reader reports it.
-    let Some(root) = model.files.first() else {
+    if model.files.is_empty() {
         return;
-    };
+    }
     let found = out.hubs.len() + out.signals.len();
-    let site_in = |file: &WsFile, stmt: &WsStmt| Site {
+    let site_of = |file: &WsFile, span: Span| Site {
         file: file.path.clone(),
-        span: stmt.span,
+        span,
         system: DeclSystem::Workspace,
     };
     let from_ruleset =
         |load: &WsLoad| load.label.as_ref().and_then(|l| repo_module(&l.repo)) == Some(MODULE);
     let mut present = None;
-    // A macro declares its hubs once, however often it is called.
-    let mut bodies = BTreeSet::new();
-    for stmt in &model.stmts {
-        let call = match &stmt.kind {
-            WsStmtKind::Load(load) if root.loads.get(*load).is_some_and(from_ruleset) => {
-                present.get_or_insert(site_in(root, stmt));
-                continue;
-            }
-            WsStmtKind::Call(call) => call,
-            _ => continue,
+    // The statements that ran and were not read as a hub, by file.
+    let mut unread: BTreeMap<usize, Vec<&WsStmt>> = BTreeMap::new();
+    each_statement(model, &mut |index, stmt| {
+        let Some(file) = model.files.get(index) else {
+            return false;
         };
-        // The archive that defines the ruleset.
-        let named = match call.call.arg("name") {
-            Lookup::Found(name) => root.resolve(name).as_str(),
-            Lookup::Absent | Lookup::Unknown => None,
-        };
-        if named == Some(MODULE) {
-            present.get_or_insert(site_in(root, stmt));
-        }
-        let inner = call.macro_def.and_then(|m| Some((m, model.macros.get(m)?)));
-        match (install_use(root, call), inner) {
-            (Use::Install(repo, skip), _) => {
-                workspace_hub(model, root, stmt, call, repo, skip, out)
+        match &stmt.kind {
+            // Only a top-level statement is a `load`.
+            WsStmtKind::Load(load) => {
+                if file.loads.get(*load).is_some_and(from_ruleset) {
+                    present.get_or_insert(site_of(file, stmt.span));
+                }
+                return false;
             }
-            (Use::Handed, _) => out.signals.push(signal(site_in(root, stmt))),
-            (Use::No, Some((index, made_by))) if bodies.insert(index) => {
-                let Some(file) = model.files.get(made_by.file) else {
-                    continue;
+            WsStmtKind::Call(call) => {
+                // The archive that defines the ruleset.
+                let named = match call.call.arg("name") {
+                    Lookup::Found(name) => file.resolve(name).as_str(),
+                    Lookup::Absent | Lookup::Unknown => None,
                 };
-                for stmt in &made_by.body {
-                    let WsStmtKind::Call(call) = &stmt.kind else {
-                        continue;
-                    };
-                    match install_use(file, call) {
-                        Use::Install(repo, skip) => {
-                            workspace_hub(model, file, stmt, call, repo, skip, out);
-                        }
-                        Use::Handed => out.signals.push(signal(site_in(file, stmt))),
-                        Use::No => {}
-                    }
+                if named == Some(MODULE) {
+                    present.get_or_insert(site_of(file, stmt.span));
+                }
+                if let Some((repo, skip)) = install_use(file, call) {
+                    workspace_hub(model, file, stmt, call, repo, skip, out);
+                    return true;
                 }
             }
-            (Use::No, _) => {}
+            WsStmtKind::Inert | WsStmtKind::Opaque => {}
+        }
+        unread.entry(index).or_default().push(stmt);
+        false
+    });
+    // A statement that was not read as a hub and writes the name of the
+    // rule may run it: a comprehension, a conditional expression, a block
+    // of a macro body, a function the rule is handed to, an alias. The
+    // hub it declares is unknown, whatever else was read.
+    for (index, stmts) in unread {
+        let file = &model.files[index];
+        let rules = rule_names(file);
+        let names: Vec<&str> = rules.iter().map(|(name, _)| *name).collect();
+        let Some((_, first)) = rules.first() else {
+            continue;
+        };
+        match names_written(files, &file.path, index == 0, &stmts, &names) {
+            Some(written) => {
+                let hidden = stmts
+                    .iter()
+                    .zip(written)
+                    .filter(|(_, names)| !names.is_empty());
+                let sites = hidden.map(|(stmt, _)| site_of(file, stmt.span));
+                out.signals.extend(sites.map(signal));
+            }
+            // Any of them may.
+            None => out.signals.push(signal(site_of(file, first.span))),
         }
     }
     // A macro file that loads the ruleset shows it as well.
     for file in model.files.iter().skip(1) {
         if let Some(load) = file.loads.iter().find(|load| from_ruleset(load)) {
-            present.get_or_insert(Site {
-                file: file.path.clone(),
-                span: load.span,
-                system: DeclSystem::Workspace,
-            });
+            present.get_or_insert(site_of(file, load.span));
         }
     }
     if let Some(site) = present.filter(|_| out.hubs.len() + out.signals.len() == found) {
@@ -859,7 +892,9 @@ impl ConsumerScan {
         let dialect = match name {
             "BUILD" | "BUILD.bazel" => Dialect::Build,
             _ if name.ends_with(".bzl") => Dialect::Bzl,
-            // A module or workspace file cannot use an export rule.
+            // A module or workspace file cannot use an export rule, and
+            // the BUILD file of another repository publishes nothing of
+            // this one.
             _ => return,
         };
         match starlark::read(bytes, dialect) {
@@ -934,6 +969,13 @@ fn labels_in(text: &[u8]) -> Vec<(String, String, usize)> {
     out
 }
 
+/// Whether a file of this name may be the BUILD file a repository rule
+/// gives another repository (`build_file = "//third_party:guava.BUILD"`).
+/// No rule fixes the name; these are the forms in use.
+fn is_build_template(name: &str) -> bool {
+    name.starts_with("BUILD.") || name.ends_with(".BUILD") || name.ends_with(".bazel")
+}
+
 /// Reads every BUILD, `.bzl`, module and workspace file of the main
 /// repository, bounded, for the two checks a pin of a hub needs before it
 /// is written: no file names the versioned alias or the artifact
@@ -941,10 +983,21 @@ fn labels_in(text: &[u8]) -> Vec<(String, String, usize)> {
 /// file uses a rule that would publish the pin's version
 /// ([`ConsumerScan::exporters`]).
 ///
+/// For labels it also reads the files a repository rule takes as the
+/// BUILD file of another repository, by the names such templates have:
+/// `BUILD.<x>`, `<x>.BUILD` and `<x>.bazel` (`third_party/guava.BUILD`,
+/// `BUILD.guava.bazel`). A label there breaks the same way when the pin
+/// renames its target. This is wider than the wording of design 4.3 ("a
+/// main-repo BUILD or `.bzl` file") and errs towards a refusal.
+/// `MODULE.bazel.lock` has none of these names and is not read.
+///
 /// Directories the root's `.bazelignore` hides hold no package Bazel
-/// loads and are skipped, and so is `.git`. A directory that cannot be
-/// listed, a file that cannot be read and a repository larger than the
-/// bounds leave the scan [`ConsumerScan::unproven`].
+/// loads and are skipped. So are `.git` and the root's `bazel-*` entries:
+/// those are the convenience links into the output tree, where every
+/// external repository has a BUILD file, and no listing tells a link from
+/// a directory of that name. A directory that cannot be listed, a file
+/// that cannot be read and a repository larger than the bounds leave the
+/// scan [`ConsumerScan::unproven`].
 pub fn scan_consumers(files: &dyn FileView) -> ConsumerScan {
     let hidden = IgnoreModel::read(&files.read(ignore::BAZELIGNORE));
     let mut scan = ConsumerScan::default();
@@ -970,10 +1023,11 @@ pub fn scan_consumers(files: &dyn FileView) -> ConsumerScan {
         for name in names {
             if let Some(child) = name.strip_suffix('/') {
                 let path = below(&dir, child);
-                if child != ".git" && !hidden.covers(&path) {
+                let link = dir.is_empty() && child.starts_with("bazel-");
+                if child != ".git" && !link && !hidden.covers(&path) {
                     children.push(path);
                 }
-            } else if ignore::is_label_scan_file(&name) {
+            } else if ignore::is_label_scan_file(&name) || is_build_template(&name) {
                 read += 1;
                 if read > SCAN_FILES {
                     let why =
@@ -1002,6 +1056,7 @@ mod tests {
     use super::*;
     use crate::bazel::module_file::tests::{fixtures, view};
     use crate::bazel::workspace_file::WORKSPACE_FILES;
+    use std::collections::BTreeSet;
 
     /// What the recognizer finds in a root that holds `files`.
     fn recognized(files: &[(&str, &str)]) -> Recognized {
@@ -1106,9 +1161,13 @@ use_repo(maven, "maven")
         assert_eq!(pin_targets(hub), ["@maven//:pin"]);
     }
 
-    /// The `e9-two-hubs` fixture. The first hub that declares an artifact
-    /// repository decides its bytes for both (probe M2), so the hubs stay
-    /// in the order of their tags.
+    /// The `e9-two-hubs` fixture. Hubs are listed in statement order, by
+    /// the first tag that names each. That is the order of the file and
+    /// not the ruleset's: rules_jvm_external makes its hubs by tag class
+    /// (`artifact` before `install` at 6.5 and 7.2), so the list does not
+    /// say which hub declares a shared artifact repository first (probe
+    /// M2). The mixed shape at the end holds the order to the file's, so
+    /// that a change of it is a deliberate one.
     #[test]
     fn two_hubs_are_listed_in_the_order_of_their_tags() {
         let found = module(
@@ -1142,6 +1201,38 @@ use_repo(maven, "maven", jars = "other")
             .hubs
             .iter()
             .all(|hub| detail(hub).other_imports.is_empty()));
+
+        // rules_jvm_external 6.5 and 7.2 make hub `b` first here: its
+        // `artifact` tag is read before any `install` tag.
+        let mixed = module(
+            r#"
+maven.install(name = "a", lock_file = "//:a.json")
+maven.artifact(name = "b", group = "g", artifact = "x", version = "1")
+maven.install(name = "b", lock_file = "//:b.json")
+"#,
+        );
+        let names: Vec<_> = mixed.hubs.iter().map(|hub| &detail(hub).hub).collect();
+        assert_eq!(names, ["a", "b"]);
+    }
+
+    /// A hub is a dev dependency when its tag or its `use_repo` is: with
+    /// `--ignore_dev_dependency` a hub that only a dev proxy imports is
+    /// one the root no longer sees.
+    #[test]
+    fn a_hub_that_only_a_dev_proxy_imports_is_a_dev_hub() {
+        let dev = "maven_dev = use_extension(\n    \"@rules_jvm_external//:extensions.bzl\",\n    \
+                   \"maven\",\n    dev_dependency = True,\n)\n";
+        let install = "maven.install(lock_file = \"//:maven_install.json\")\n";
+        let found = module(&format!("{install}{dev}use_repo(maven_dev, \"maven\")\n"));
+        let hub = detail(one_hub(&found));
+        assert_eq!(
+            (hub.dev, &hub.imported_as[..]),
+            (true, &["maven".to_string()][..])
+        );
+
+        // The same tag imported through the plain proxy is not.
+        let plain = module(&format!("{install}{dev}use_repo(maven, \"maven\")\n"));
+        assert!(!detail(one_hub(&plain)).dev);
     }
 
     /// The `e9-unpinned` fixture: no lock, so nothing to rewrite and
@@ -1334,6 +1425,15 @@ maven.override(
         );
         assert_eq!(tokens(&computed), [LABEL_NOT_LITERAL]);
         assert!(!one_hub(&computed).decl.literal);
+
+        // An override that names no artifact may replace any of them.
+        let unnamed = module(
+            "maven.install(lock_file = \"//:maven_install.json\")\n\
+             maven.override(target = \"//x\")\n",
+        );
+        assert_eq!(tokens(&unnamed), [LABEL_NOT_LITERAL]);
+        let hub = one_hub(&unnamed);
+        assert!(!hub.decl.literal && hub.user_decls.is_empty());
     }
 
     /// A tag with a computed name may belong to any hub, and a use of the
@@ -1555,9 +1655,36 @@ pinned_maven_install()
         assert_eq!(tokens(&relative), [LOCK_PATH]);
         assert_eq!(one_hub(&relative).locks[0].path, None);
 
+        // The repository of a canonical name is never the main one.
+        let canonical = hub("maven_install_json = \"@@app//:m.json\"");
+        assert_eq!(tokens(&canonical), [LOCK_PATH]);
+        let lock = &one_hub(&canonical).locks[0];
+        assert_eq!((lock.label.as_str(), &lock.path), ("@@app//:m.json", &None));
+
+        // A lock that is computed is still a lock: the hub is pinned,
+        // and which file pins it is not known.
+        let computed =
+            workspace("LOCK = \"//:m.json\"\nmaven_install(maven_install_json = LOCK + \"\")\n");
+        assert_eq!(tokens(&computed), [LABEL_NOT_LITERAL]);
+        let pinned = one_hub(&computed);
+        assert_eq!(
+            (pinned.shape, pinned.decl.literal),
+            (HubShape::MavenPinned, false)
+        );
+        assert_eq!((&pinned.locks[0].path, pinned.derived.len()), (&None, 0));
+
         let overrides = hub("maven_install_json = \"//:m.json\", override_targets = OVERRIDES");
         assert_eq!(tokens(&overrides), [LABEL_NOT_LITERAL]);
         assert!(!one_hub(&overrides).decl.literal);
+
+        // One key that is not a string hides which artifact is replaced.
+        let keyed = hub(
+            "maven_install_json = \"//:m.json\", override_targets = {\"a:b\": \"@//x\", KEY: \"@//y\"}",
+        );
+        assert_eq!(tokens(&keyed), [LABEL_NOT_LITERAL]);
+        let inexact = one_hub(&keyed);
+        assert!(!inexact.decl.literal && inexact.user_decls.is_empty());
+        assert_eq!(inexact.locks[0].path.as_deref(), Some("m.json"));
 
         // A hub whose name is not known is no hub; the ruleset is still
         // there, so Maven is undetermined.
@@ -1650,8 +1777,176 @@ deps()
         let handed = workspace("maven_install()\nwrap(maven_install, name = \"hidden\")\n");
         assert_eq!((handed.hubs.len(), handed.signals.len()), (1, 1));
 
+        // `maven_install` of another file of the ruleset is not the rule
+        // this reader knows the attributes of: no hub, and the ruleset.
+        let private = recognized(&[(
+            "WORKSPACE",
+            "load(\"@rules_jvm_external//private:x.bzl\", \"maven_install\")\n\
+             maven_install(name = \"maven\", maven_install_json = \"//:m.json\")\n",
+        )]);
+        assert!(private.hubs.is_empty() && private.gaps.is_empty());
+        let [at] = &private.signals[..] else {
+            panic!("{:?}", private.signals)
+        };
+        assert_eq!(at.site.span.0, 0);
+
         let plain = recognized(&[("WORKSPACE", "workspace(name = \"app\")\n")]);
         assert_eq!(plain, Recognized::default());
+    }
+
+    /// The `WORKSPACE` file and one macro file it calls `jvm_deps` of.
+    fn with_macros(workspace: &str, macros: &str) -> Recognized {
+        let load = "load(\"//tools:deps.bzl\", \"jvm_deps\")\n\njvm_deps()\n";
+        let workspace = format!("{WS_HEAD}{workspace}{load}");
+        recognized(&[("WORKSPACE", &workspace), ("tools/deps.bzl", macros)])
+    }
+
+    /// The one signal of `found`: its file and where it starts.
+    fn signal_at(found: &Recognized) -> (&str, usize) {
+        match &found.signals[..] {
+            [at] => (at.site.file.as_str(), at.site.span.0),
+            signals => panic!("one signal, not {signals:?}"),
+        }
+    }
+
+    const LITERAL: &str = "maven_install(name = \"maven\", maven_install_json = \"//:m.json\")\n";
+    const RULE: &str = "load(\"@rules_jvm_external//:defs.bzl\", \"maven_install\")\n";
+
+    /// A `maven_install` that runs where this reader sees no call
+    /// declares a hub that is not listed. It is a signal beside a hub
+    /// that was read too: all hubs are pinned or none is, and the hub
+    /// that is not listed would keep the unpatched jar.
+    #[test]
+    fn a_statement_that_names_the_rule_and_is_not_read_is_a_signal() {
+        let unread = [
+            "[maven_install(name = n) for n in [\"hidden\"]]",
+            "maven_install(name = \"hidden\") if True else None",
+            "wrap(rule = maven_install, name = \"hidden\")",
+            "wrap(maven_install, name = \"hidden\")",
+            // Only the rule as the first argument of `maybe` is read.
+            "maybe(repo_rule = maven_install, name = \"hidden\")",
+            "wrap([maven_install], name = \"hidden\")",
+            "install = maven_install",
+        ];
+        for stmt in unread {
+            // Before the hub that is read, and after it.
+            for body in [format!("{stmt}\n{LITERAL}"), format!("{LITERAL}{stmt}\n")] {
+                let found = workspace(&body);
+                let hub = one_hub(&found);
+                assert_eq!(
+                    (hub.decl.apparent_name.as_str(), hub.decl.literal),
+                    ("maven", true),
+                    "{stmt}"
+                );
+                let at = WS_HEAD.len() + body.find(stmt).unwrap();
+                assert_eq!(signal_at(&found), ("WORKSPACE", at), "{stmt}");
+                assert!(found.gaps.is_empty(), "{stmt}");
+            }
+        }
+
+        // In the body of a macro the signal is in the macro file.
+        let blocks = [
+            "if True:\n        maven_install(name = \"hidden\")\n",
+            "for n in [\"hidden\"]:\n        maven_install(name = n)\n",
+            "wrap(maven_install, name = \"h\")\n",
+        ];
+        for block in blocks {
+            let macros = format!("{RULE}\ndef jvm_deps():\n    {block}");
+            let found = with_macros(LITERAL, &macros);
+            assert_eq!(one_hub(&found).decl.site.file, "WORKSPACE", "{block}");
+            let at = macros.find(block).unwrap();
+            assert_eq!(signal_at(&found), ("tools/deps.bzl", at), "{block}");
+        }
+    }
+
+    /// A statement can run the rule only through the name its file binds
+    /// it to. One that is not read and does not write that name hides no
+    /// hub, and neither does one in a file that does not load the rule.
+    #[test]
+    fn a_statement_that_does_not_name_the_rule_hides_no_hub() {
+        let found = workspace(&format!(
+            "load(\"@bazel_skylib//lib:versions.bzl\", \"versions\")\n\
+             versions.check(minimum_bazel_version = \"6.0.0\")\n\
+             [print(n) for n in [\"maven_install\"]]  # maven_install\n\
+             wrap(maven_install = 1)\n{LITERAL}"
+        ));
+        assert_eq!(one_hub(&found).decl.apparent_name, "maven");
+        assert!(found.signals.is_empty(), "{:?}", found.signals);
+
+        // The usual guard of a macro body, beside a call that is read.
+        let guarded = format!(
+            "{RULE}\ndef jvm_deps():\n    if not native.existing_rule(\"x\"):\n        \
+             native.local_repository(name = \"x\", path = \"x\")\n    {LITERAL}"
+        );
+        let found = with_macros("", &guarded);
+        assert_eq!(one_hub(&found).decl.site.file, "tools/deps.bzl");
+        assert!(found.signals.is_empty(), "{:?}", found.signals);
+
+        // The macro file does not load the rule: whatever its block
+        // calls is no `maven_install` of the ruleset.
+        let elsewhere = "def jvm_deps():\n    if True:\n        maven_install(name = \"x\")\n";
+        let found = with_macros(LITERAL, elsewhere);
+        assert_eq!(one_hub(&found).decl.site.file, "WORKSPACE");
+        assert!(found.signals.is_empty(), "{:?}", found.signals);
+    }
+
+    /// The names of a statement are read off its file again. When that
+    /// file is gone, every statement that was not read may run the rule.
+    #[test]
+    fn a_file_that_cannot_be_read_again_is_a_signal_at_the_load() {
+        let text = format!("{WS_HEAD}{LITERAL}[print(n) for n in []]\n");
+        let root = view(&[("WORKSPACE", &text)]);
+        let workspaces = [WorkspaceModel::read(&root, "WORKSPACE").unwrap()];
+        let found = |files: &dyn FileView| {
+            recognize(&RecognizeInput {
+                module: None,
+                workspace_files: &workspaces,
+                module_lock: None,
+                flags: None,
+                line: None,
+                files,
+            })
+        };
+        assert!(found(&root).signals.is_empty());
+        let gone = found(&view(&[]));
+        assert_eq!(gone.hubs.len(), 1);
+        let load = WS_HEAD.find("load(").unwrap();
+        assert_eq!(signal_at(&gone), ("WORKSPACE", load));
+    }
+
+    /// A macro file shows the ruleset as the `WORKSPACE` file does: by a
+    /// `load` from it. With no hub that was read, that is the signal.
+    #[test]
+    fn the_ruleset_in_a_macro_file_alone_is_a_signal() {
+        let workspace = "load(\"//tools:deps.bzl\", \"jvm_deps\")\n\njvm_deps()\n";
+        let found =
+            |macros: &str| recognized(&[("WORKSPACE", workspace), ("tools/deps.bzl", macros)]);
+        // The install is under an `if`: the block is where it hides.
+        let block = "if True:\n        maven_install(name = \"maven\")\n";
+        let hidden = format!("{RULE}\ndef jvm_deps():\n    {block}");
+        let at = hidden.find(block).unwrap();
+        let hidden = found(&hidden);
+        assert!(hidden.hubs.is_empty());
+        assert_eq!(signal_at(&hidden), ("tools/deps.bzl", at));
+
+        // No statement names the rule: the `load` is all there is.
+        let other =
+            "load(\"@rules_jvm_external//:repositories.bzl\", \"rules_jvm_external_deps\")\n";
+        let bare = found(&format!(
+            "{other}\ndef jvm_deps():\n    rules_jvm_external_deps()\n"
+        ));
+        assert!(bare.hubs.is_empty());
+        assert_eq!(signal_at(&bare), ("tools/deps.bzl", 0));
+
+        // The archive of the ruleset in a macro body shows it as well.
+        let archive = "def jvm_deps():\n    native.local_repository(\n        \
+                       name = \"rules_jvm_external\",\n        path = \"third_party/rje\",\n    )\n";
+        let at = archive.find("native.local_repository").unwrap();
+        assert_eq!(signal_at(&found(archive)), ("tools/deps.bzl", at));
+
+        let none =
+            found("def jvm_deps():\n    native.local_repository(name = \"x\", path = \"x\")\n");
+        assert_eq!(none, Recognized::default());
     }
 
     /// Both families are read. Which of them Bazel evaluates is `govern`'s
@@ -1803,6 +2098,12 @@ export(
                 "x.bzl",
                 "def f():\n    not_pom_file()\n    maven_export_all()\n",
             ),
+            // Searched as text as well, and for whole words: neither name
+            // is a rule that publishes.
+            (
+                "tabs/x.bzl",
+                "def f():\n\tnot_pom_file()\n\tmaven_export_all()\n",
+            ),
             (
                 "kt/BUILD",
                 "load(\"@rules_jvm_external//:kt_defs.bzl\", \"kt_jvm_export\")\n",
@@ -1821,7 +2122,10 @@ export(
     }
 
     /// Bazel loads no package from a directory `.bazelignore` hides, and
-    /// `.git` holds none.
+    /// `.git` holds none. The root's `bazel-*` entries are the links into
+    /// the output tree, which holds a BUILD file for every external
+    /// repository; a directory of such a name below the root is a package
+    /// like any other.
     #[test]
     fn the_scan_skips_what_bazel_does_not_load() {
         let old = "x = \"@maven//:g_a_1_0\"\n";
@@ -1830,11 +2134,67 @@ export(
             ("node_modules/pkg/BUILD", old),
             ("third_party/old/BUILD", old),
             (".git/BUILD", old),
+            ("bazel-out/k8/bin/BUILD", old),
+            ("bazel-app/external/hub/BUILD", old),
+            ("bazel-bin/x/BUILD.bazel", old),
+            ("MODULE.bazel.lock", old),
             ("third_party/new/defs.bzl", "x = \"@maven//:g_a_2_0\"\n"),
+            ("pkg/bazel-foo/BUILD", "x = \"@maven//:g_a_3_0\"\n"),
         ]));
         assert_eq!(scan.unproven, None);
         assert_eq!(scan.versioned_label(&["maven"], "g_a_1_0"), None);
         assert!(scan.versioned_label(&["maven"], "g_a_2_0").is_some());
+        let nested = scan.versioned_label(&["maven"], "g_a_3_0");
+        assert_eq!(
+            nested.map(|place| place.file.as_str()),
+            Some("pkg/bazel-foo/BUILD")
+        );
+    }
+
+    /// A repository rule can take its BUILD file from the main
+    /// repository (`build_file = "//third_party:guava.BUILD"`). A label
+    /// in such a file breaks as one in a package does when the pin
+    /// renames its target, so the scan reads the names these files have,
+    /// for labels only.
+    #[test]
+    fn the_scan_reads_the_build_files_of_other_repositories_for_labels() {
+        let deps =
+            |alias: &str| format!("java_library(name = \"x\", deps = [\"@maven//:{alias}\"])\n");
+        let export = "load(\"@rules_jvm_external//:defs.bzl\", \"java_export\")\n";
+        let files = [
+            (
+                "third_party/guava.BUILD",
+                format!("{export}{}", deps("g_a_1_0")),
+            ),
+            ("third_party/BUILD.guava.bazel", deps("g_a_2_0")),
+            ("third_party/x.BUILD.bazel", deps("g_a_3_0")),
+            ("third_party/BUILD.txt", deps("g_a_4_0")),
+            // Not a name of the kind: a document, and the lock of Bazel.
+            ("third_party/README.md", deps("g_a_5_0")),
+            ("third_party/MODULE.bazel.lock", deps("g_a_6_0")),
+        ];
+        let files: Vec<(&str, &str)> = files
+            .iter()
+            .map(|(path, text)| (*path, text.as_str()))
+            .collect();
+        let scan = scan_consumers(&tree(&files));
+        assert_eq!(scan.unproven, None);
+        let read = |alias: &str| {
+            let place = scan.versioned_label(&["maven"], alias);
+            place.map(|place| (place.file.as_str(), place.line))
+        };
+        assert_eq!(read("g_a_1_0"), Some(("third_party/guava.BUILD", 2)));
+        assert_eq!(read("g_a_2_0"), Some(("third_party/BUILD.guava.bazel", 1)));
+        assert_eq!(read("g_a_3_0"), Some(("third_party/x.BUILD.bazel", 1)));
+        assert_eq!(read("g_a_4_0"), Some(("third_party/BUILD.txt", 1)));
+        assert_eq!((read("g_a_5_0"), read("g_a_6_0")), (None, None));
+        // What such a file loads publishes nothing of this repository.
+        assert!(scan.exporters.is_empty(), "{:?}", scan.exporters);
+
+        // The files count against the bound like any other.
+        let many: Vec<String> = (0..=SCAN_FILES).map(|n| format!("d{n}/x.BUILD")).collect();
+        let many: Vec<(&str, &str)> = many.iter().map(|path| (path.as_str(), "")).collect();
+        assert!(scan_consumers(&tree(&many)).unproven.is_some());
     }
 
     /// What the scan could not read proves nothing absent.
