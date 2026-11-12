@@ -21,7 +21,8 @@
 //! modules and source archives have no Socket patches (F93).
 
 use super::rules_rust::{
-    loaded_calls, new_hub, not_literal, usages_of, Args, LabelAttr, LoadedCall,
+    loaded_calls, new_hub, not_literal, proxy_gaps, unread_uses, usages_of, Args, Home, LabelAttr,
+    LoadedCall,
 };
 use super::{RecognizeInput, Recognized};
 use crate::bazel::label::{Label, Repo};
@@ -288,6 +289,9 @@ fn bzlmod(input: &RecognizeInput<'_>, module: &ModuleModel, out: &mut Recognized
         }
     }
     for usage in usages_of(module, "extensions", &["python.bzl"], "requirements") {
+        // This recognizer is the ruleset's own: a tag of the usage that
+        // was not read is a hub nobody else reports.
+        out.gaps.extend(proxy_gaps(module, &usage));
         let hub_tag = |callee: &str| matches!(callee, "parse" | "resolve");
         let tags = module.tags.iter().filter(|tag| usage.contains(&tag.proxy));
         for tag in tags.filter(|tag| hub_tag(&tag.call.callee)) {
@@ -297,6 +301,7 @@ fn bzlmod(input: &RecognizeInput<'_>, module: &ModuleModel, out: &mut Recognized
                 call: &tag.call,
                 resolve: &resolve,
                 package: Some(""),
+                home: Home::Module,
             };
             let what = format!("requirements.{}", tag.call.callee);
             req_compile(out, &args, (module.site(tag.at), tag.at.line, &what));
@@ -306,7 +311,10 @@ fn bzlmod(input: &RecognizeInput<'_>, module: &ModuleModel, out: &mut Recognized
     // modules' tags declare, and those name locks of their own
     // repositories. Where the root has tags of its own, telling its hubs
     // from another module's takes the ruleset's naming, which is not
-    // known here: such an import is not reported.
+    // known here: such an import is not reported. Nor is one of a usage
+    // behind a gap: "no tag was recorded" is then not "the root gives no
+    // tag" (`[pip.parse(hub_name = n) for n in HUBS]` records none), and
+    // the gap is the ruleset's own recognizer's to report.
     for usage in module.usages() {
         let proxy = &module.proxies[usage[0]];
         let known = |l: &Label| {
@@ -318,7 +326,8 @@ fn bzlmod(input: &RecognizeInput<'_>, module: &ModuleModel, out: &mut Recognized
         let Some(ecosystem) = proxy.label.as_ref().and_then(known) else {
             continue;
         };
-        if module.tags.iter().any(|tag| usage.contains(&tag.proxy)) {
+        let gapped = usage.iter().any(|p| module.gaps_for(*p).next().is_some());
+        if gapped || module.tags.iter().any(|tag| usage.contains(&tag.proxy)) {
             continue;
         }
         for import in module.imports.iter().filter(|i| usage.contains(&i.proxy)) {
@@ -329,8 +338,32 @@ fn bzlmod(input: &RecognizeInput<'_>, module: &ModuleModel, out: &mut Recognized
     }
 }
 
+/// Whether a `load` binds the rule of rules_poetry
+/// (`@com_sonia_rules_poetry//rules_poetry:poetry.bzl`, README), under
+/// whatever name the `WORKSPACE` gives the repository. A function of the
+/// same name in the main repository is the user's own code.
+fn is_poetry(label: Option<&Label>, symbol: &str) -> bool {
+    let file = |l: &Label| l.package == "rules_poetry" && l.name == "poetry.bzl";
+    symbol == "poetry" && label.is_some_and(|l| l.repo != Repo::Main && file(l))
+}
+
+/// The same for the `WORKSPACE` rule of rules_req_compile.
+fn is_req_compile(label: Option<&Label>, symbol: &str) -> bool {
+    let file = |l: &Label| l.package.is_empty() && l.name == "defs.bzl";
+    let rule = symbol == "py_requirements_repository";
+    rule && label.is_some_and(|l| l.repo != Repo::Main && file(l))
+}
+
 fn workspace(input: &RecognizeInput<'_>, ws: &WorkspaceModel, out: &mut Recognized) {
-    for found in loaded_calls(ws) {
+    let calls = loaded_calls(ws);
+    // A rule over a lock declares a hub wherever it runs: a use that is
+    // no call the reader follows is a hub that was not read.
+    out.gaps
+        .extend(unread_uses(input, ws, &calls, &is_poetry, "poetry"));
+    let rule = "py_requirements_repository";
+    out.gaps
+        .extend(unread_uses(input, ws, &calls, &is_req_compile, rule));
+    for found in calls {
         let LoadedCall { load, symbol, .. } = found;
         let Some(label) = load.label.as_ref() else {
             continue;
@@ -341,6 +374,7 @@ fn workspace(input: &RecognizeInput<'_>, ws: &WorkspaceModel, out: &mut Recogniz
             call: found.call,
             resolve: &resolve,
             package: None,
+            home: Home::Workspace(ws),
         };
         let name = args.text("name");
         if let Some(rule) = tools_rule(label, symbol) {
@@ -355,8 +389,7 @@ fn workspace(input: &RecognizeInput<'_>, ws: &WorkspaceModel, out: &mut Recogniz
         let main = label.repo == Repo::Main;
         let at = (found.site(), found.stmt.line, symbol);
         let found = match (label.package.as_str(), label.name.as_str(), symbol) {
-            // `@com_sonia_rules_poetry//rules_poetry:poetry.bzl` (README).
-            ("rules_poetry", "poetry.bzl", "poetry") if !main => {
+            _ if is_poetry(Some(label), symbol) => {
                 let lock = args.label("lockfile", LockRole::PackageLock);
                 let manifest = args.label("pyproject", LockRole::Config);
                 let kind = (ReportOnlyKind::RulesPoetry, Ecosystem::Pypi);
@@ -364,7 +397,7 @@ fn workspace(input: &RecognizeInput<'_>, ws: &WorkspaceModel, out: &mut Recogniz
                 lock_hub(out, kind, at, name, &labels, ("", Some(Vec::new())));
                 continue;
             }
-            ("", "defs.bzl", "py_requirements_repository") if !main => {
+            _ if is_req_compile(Some(label), symbol) => {
                 req_compile(out, &args, at);
                 continue;
             }
@@ -375,7 +408,10 @@ fn workspace(input: &RecognizeInput<'_>, ws: &WorkspaceModel, out: &mut Recogniz
                 if !text.starts_with(BAZEL_DEPS_HEADER) {
                     continue;
                 }
-                let artifact = b"\"artifact\":";
+                // One dict per pinned artifact, which the generator writes
+                // on a line of its own. The bare key also names an
+                // attribute of the `jar_artifact` rule the file defines.
+                let artifact = b"{\"artifact\":";
                 let pins = text.windows(artifact.len()).filter(|w| w == artifact);
                 let lock = LockRef {
                     label: load.load.module.clone(),
@@ -627,16 +663,47 @@ mod tests {
         let own =
             workspace("load(\"//rules_poetry:poetry.bzl\", \"poetry\")\npoetry(name = \"p\")\n");
         assert!(own.hubs.is_empty());
+
+        // A use of the rule that is no call the reader follows is a hub
+        // that was not read: a gap, never silence.
+        let found = workspace(
+            "load(\"@com_sonia_rules_poetry//rules_poetry:poetry.bzl\", \"poetry\")\n\
+             poetry(name = \"poetry\", lockfile = \"//:poetry.lock\", pyproject = \"//:pyproject.toml\")\n\
+             [poetry(name = n, lockfile = \"//tools:poetry.lock\") for n in [\"tools\"]]\n",
+        );
+        assert_eq!(found.hubs.len(), 1);
+        let [gap] = &found.gaps[..] else {
+            panic!("one gap: {:?}", found.gaps)
+        };
+        assert_eq!(gap.token, "label_not_literal");
+        assert!(
+            gap.detail
+                .starts_with("WORKSPACE:3: a use of `poetry` is not read: "),
+            "{}",
+            gap.detail
+        );
     }
 
     #[test]
     fn a_bazel_deps_file_is_told_by_its_header() {
         let load =
             "load(\"//3rdparty:workspace.bzl\", \"maven_dependencies\")\nmaven_dependencies()\n";
+        // The parts of bazel-deps@4b583c6 `3rdparty/workspace.bzl` that
+        // name an artifact: the rule the file defines for the pins, its
+        // callback, and the pins themselves, one dict on a line each.
         let generated = "# Do not edit. bazel-deps autogenerates this file from dependencies.yaml.\n\
-             def list_dependencies():\n    return [\n        {\"artifact\": \"com.google.guava:guava:33.0\", \"sha256\": \"aa\"},\n        \
-             {\"artifact\": \"junit:junit:4.13\", \"sha256\": \"bb\"},\n    ]\n\n\
-             def maven_dependencies(callback = None):\n    for hash in list_dependencies():\n        callback(hash)\n";
+             def _jar_artifact_impl(ctx):\n    return None\n\n\
+             jar_artifact = repository_rule(\n    attrs = {\n        \
+             \"artifact\": attr.string(mandatory = True),\n        \
+             \"sha256\": attr.string(mandatory = True),\n        \
+             \"urls\": attr.string_list(mandatory = True),\n    },\n    \
+             implementation = _jar_artifact_impl\n)\n\n\
+             def jar_artifact_callback(hash):\n    jar_artifact(\n        artifact = hash[\"artifact\"],\n        \
+             name = hash[\"name\"],\n        urls = [hash[\"url\"]],\n        sha256 = hash[\"sha256\"],\n    )\n\n\
+             def list_dependencies():\n    return [\n    \
+             {\"artifact\": \"com.google.guava:guava:33.0\", \"lang\": \"java\", \"sha256\": \"aa\"},\n    \
+             {\"artifact\": \"junit:junit:4.13\", \"lang\": \"java\", \"sha256\": \"bb\"},\n    ]\n\n\
+             def maven_dependencies(callback = jar_artifact_callback):\n    for hash in list_dependencies():\n        callback(hash)\n";
         let found = run(
             recognize,
             &[("WORKSPACE", load), ("3rdparty/workspace.bzl", generated)],
@@ -779,5 +846,88 @@ mod tests {
         assert_eq!(kind.token(), "hub_not_root_module");
         assert_eq!(found.out_of_scope.bazel_modules, 2);
         assert_eq!(found.out_of_scope.report_only_pins, 0);
+    }
+
+    /// "No tag was recorded" is not "the root gives no tag": tags behind a
+    /// statement that is not read are the root's own (the idiom of
+    /// protobuf@29.0 `MODULE.bazel`), and their hub is no other module's.
+    #[test]
+    fn a_usage_whose_tags_were_not_read_is_not_another_modules() {
+        let pip = "module(name = \"app\")\nbazel_dep(name = \"rules_python\", version = \"1.4.1\")\n\
+             pip = use_extension(\"@rules_python//python/extensions:pip.bzl\", \"pip\")\n\
+             [pip.parse(hub_name = n, python_version = \"3.12\", requirements_lock = \"//:requirements.txt\") \
+             for n in [\"pypi\"]]\nuse_repo(pip, \"pypi\")\n";
+        let found = run(recognize, &[("MODULE.bazel", pip)]);
+        // The gap is rules_python's to report, which reads the usage.
+        assert!(found.hubs.is_empty() && found.gaps.is_empty(), "{found:?}");
+        let cargo = "module(name = \"app\")\nbazel_dep(name = \"rules_rust\", version = \"0.75.0\")\n\
+             crate = use_extension(\"@rules_rust//crate_universe:extensions.bzl\", \"crate\")\n\
+             [crate.from_cargo(name = n, cargo_lockfile = \"//:Cargo.lock\") for n in [\"crates\"]]\n\
+             use_repo(crate, \"crates\")\n";
+        let found = run(recognize, &[("MODULE.bazel", cargo)]);
+        assert!(found.hubs.is_empty() && found.gaps.is_empty(), "{found:?}");
+
+        // rules_req_compile has no other recognizer: here the tags that
+        // were not read are a gap, with or without an import.
+        let head = "module(name = \"app\")\nbazel_dep(name = \"rules_req_compile\", version = \"1.7.1\")\n\
+             requirements = use_extension(\"@rules_req_compile//extensions:python.bzl\", \"requirements\")\n\
+             [requirements.parse(name = n, requirements_lock = \"//:requirements.txt\") for n in [\"a\"]]\n";
+        for imports in ["", "use_repo(requirements, \"a\")\n"] {
+            let found = run(recognize, &[("MODULE.bazel", &format!("{head}{imports}"))]);
+            assert!(found.hubs.is_empty(), "{imports}: {:?}", found.hubs);
+            let [gap] = &found.gaps[..] else {
+                panic!("{imports}: one gap: {:?}", found.gaps)
+            };
+            assert_eq!(gap.token, "label_not_literal");
+            assert!(
+                gap.detail.starts_with("MODULE.bazel:4: `requirements`: "),
+                "{}",
+                gap.detail
+            );
+        }
+    }
+
+    /// A hub whose name is computed may be any hub: a gap, by name.
+    #[test]
+    fn a_computed_name_of_a_lock_hub_is_a_gap() {
+        let module = "module(name = \"app\")\nbazel_dep(name = \"rules_req_compile\", version = \"1.7.1\")\n\
+             requirements = use_extension(\"@rules_req_compile//extensions:python.bzl\", \"requirements\")\n\
+             requirements.parse(name = NAME, requirements_lock = \"//:requirements.txt\")\n";
+        let found = run(recognize, &[("MODULE.bazel", module)]);
+        let [hub] = &found.hubs[..] else {
+            panic!("one hub: {:?}", found.hubs)
+        };
+        assert!(!hub.decl.literal && hub.decl.apparent_name.is_empty());
+        assert_eq!(paths(hub), [("requirements.txt", LockRole::PackageLock)]);
+        let [gap] = &found.gaps[..] else {
+            panic!("one gap: {:?}", found.gaps)
+        };
+        assert_eq!(gap.token, "label_not_literal");
+        let unread = "MODULE.bazel:4: `requirements.parse`: name cannot be followed";
+        assert!(gap.detail.starts_with(unread), "{}", gap.detail);
+    }
+
+    /// A function of the same name in the main repository is the user's
+    /// own code, as for rules_poetry.
+    #[test]
+    fn a_requirements_rule_of_the_main_repository_is_no_hub() {
+        let own = workspace(
+            "load(\"//:defs.bzl\", \"py_requirements_repository\")\n\
+             py_requirements_repository(name = \"deps\", requirements_lock = \"//:requirements.txt\")\n",
+        );
+        assert!(own.hubs.is_empty() && own.gaps.is_empty());
+
+        // The ruleset's own rule in a statement that is not read.
+        let looped = workspace(
+            "load(\"@rules_req_compile//:defs.bzl\", \"py_requirements_repository\")\n\
+             [py_requirements_repository(name = n, requirements_lock = \"//:requirements.txt\") \
+             for n in [\"deps\"]]\n",
+        );
+        assert!(looped.hubs.is_empty());
+        let [gap] = &looped.gaps[..] else {
+            panic!("one gap: {:?}", looped.gaps)
+        };
+        let unread = "WORKSPACE:2: a use of `py_requirements_repository` is not read: ";
+        assert!(gap.detail.starts_with(unread), "{}", gap.detail);
     }
 }

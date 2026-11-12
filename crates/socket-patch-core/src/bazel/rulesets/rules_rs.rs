@@ -11,21 +11,31 @@
 //! `@<hub>//:<name>-<version>`. A vendored pin retags the version, so the
 //! second label stops existing and a BUILD file that names it fails with
 //! `no such target` (probe R6 V5). A bounded scan of the main repository
-//! therefore lists every versioned label of each hub. The gate that
-//! refuses on one (`versioned_label_used`) is the lane's, as is the
-//! answer to a scan that could not finish.
+//! therefore lists the versioned labels of each hub in every file that
+//! is known to hold labels the root's repository mapping resolves
+//! (`label_scan_file`): BUILD and `.bzl` files, the module and
+//! `WORKSPACE` files (a `build_file_content` there is the BUILD file of a
+//! repository that sees the root's hubs), and `build_file` templates
+//! under their usual names. A template under any other name is not read.
+//! The scan parses nothing, so its only bounds are the ones on listing
+//! and reading ([`SCAN_DIRS`](super::rules_rust::SCAN_DIRS),
+//! [`SCAN_FILES`](super::rules_rust::SCAN_FILES)). The
+//! gate that refuses on a label (`versioned_label_used`) is the lane's,
+//! as is the answer to a scan that could not finish.
 
 use super::rules_rust::{
     declare, hidden_hub, new_hub, not_literal, proxy_gaps, repo_bypasses, repo_of, scan_starlark,
-    usages_of, user_decls, Args, LabelAttr,
+    usages_of, user_decls, Args, Home, LabelAttr, Scan,
 };
 use super::{RecognizeInput, Recognized};
+use crate::bazel::ignore::is_label_scan_file;
 use crate::bazel::model::{HubShape, LockRole, Ruleset, RulesetDetail, RulesetSignal};
-use crate::bazel::module_file::ModuleModel;
+use crate::bazel::module_file::{ModuleModel, Tag};
 use crate::crawlers::types::Ecosystem;
 
-/// One `@<hub>//:<name>-<version>` in a BUILD or `.bzl` file. The scan is
-/// over the bytes, comments included, and errs towards a hit.
+/// One `@<hub>//:<name>-<version>` in a file of the main repository that
+/// the scan reads. The scan is over the bytes, comments included, and
+/// errs towards a hit.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VersionedLabel {
     /// Root-relative.
@@ -62,6 +72,17 @@ pub struct RulesRsDetail {
 }
 
 const RULES_RS: &str = "rules_rs";
+
+/// Whether the label scan reads a file of this name: what the
+/// `.bazelignore` label scan reads (BUILD and `.bzl` files, the module
+/// files and the `WORKSPACE` family), and the names a `build_file`
+/// template goes by (`foo.BUILD`, `BUILD.foo`, `foo.BUILD.bazel`, any
+/// `*.bazel`).
+fn label_scan_file(name: &str) -> bool {
+    let template =
+        name.ends_with(".BUILD") || name.starts_with("BUILD.") || name.ends_with(".bazel");
+    is_label_scan_file(name) || template
+}
 
 /// `<name>-<version>` split at the first `-` that a `major.minor.patch`
 /// follows: a crate name has no `.`, so no name ends where a version
@@ -106,22 +127,36 @@ fn versioned_labels(file: &str, text: &[u8], repo: &str) -> Vec<VersionedLabel> 
 fn hubs(input: &RecognizeInput<'_>, module: &ModuleModel, usage: &[usize], out: &mut Recognized) {
     out.gaps.extend(proxy_gaps(module, usage));
     let tags = || module.tags.iter().filter(|tag| usage.contains(&tag.proxy));
-    for tag in tags().filter(|tag| tag.call.callee == "from_cargo") {
+    // A tag is read where it is written: a name in it is a constant of
+    // its own file, which can be another segment than the hub's.
+    let label_of = |tag: &Tag, attr: &str, role: LockRole| {
         let resolve = |value| module.resolve(tag.at, value);
-        let args = |call| Args {
+        let args = Args {
             input,
-            call,
+            call: &tag.call,
             resolve: &resolve,
             package: Some(""),
+            home: Home::Module,
         };
-        let (mut decl, name, imported_as) = declare(module, usage, tag, &args(&tag.call));
-        let own = args(&tag.call).label("cargo_config", LockRole::Config);
+        args.label(attr, role)
+    };
+    for tag in tags().filter(|tag| tag.call.callee == "from_cargo") {
+        let resolve = |value| module.resolve(tag.at, value);
+        let args = Args {
+            input,
+            call: &tag.call,
+            resolve: &resolve,
+            package: Some(""),
+            home: Home::Module,
+        };
+        let (mut decl, name, imported_as) = declare(module, usage, tag, &args);
+        let own = label_of(tag, "cargo_config", LockRole::Config);
         // `crate.config` is the root's one global tag; a second one is
         // an error in Bazel, and here it leaves the config unknown.
         let mut global = tags().filter(|tag| tag.call.callee == "config");
         let cargo_config = match (own, global.next(), global.next()) {
             (LabelAttr::Absent, Some(config), None) => {
-                args(&config.call).label("cargo_config_toml", LockRole::Config)
+                label_of(config, "cargo_config_toml", LockRole::Config)
             }
             (LabelAttr::Absent, Some(_), Some(_)) => LabelAttr::Computed,
             (own, _, _) => own,
@@ -130,8 +165,8 @@ fn hubs(input: &RecognizeInput<'_>, module: &ModuleModel, usage: &[usize], out: 
         let detail = RulesRsDetail {
             hub_name: name.clone(),
             imported_as,
-            cargo_lock: args(&tag.call).label("cargo_lock", LockRole::PackageLock),
-            cargo_toml: args(&tag.call).label("cargo_toml", LockRole::Config),
+            cargo_lock: label_of(tag, "cargo_lock", LockRole::PackageLock),
+            cargo_toml: label_of(tag, "cargo_toml", LockRole::Config),
             cargo_config,
             versioned_labels: Vec::new(),
             unscanned: None,
@@ -180,13 +215,15 @@ pub fn recognize(input: &RecognizeInput<'_>) -> Recognized {
     // A hub nothing imports has no label a BUILD file could write, so a
     // root without an imported hub is not walked.
     if details.iter().any(|detail| !detail.imported_as.is_empty()) {
-        let stopped = scan_starlark(input.files, &mut |path, bytes| {
+        let scan = Scan::of(&label_scan_file);
+        let stopped = scan_starlark(input.files, &scan, &mut |path, bytes| {
             for detail in details.iter_mut() {
                 for repo in &detail.imported_as {
                     let labels = versioned_labels(path, bytes, repo);
                     detail.versioned_labels.extend(labels);
                 }
             }
+            None
         });
         let stopped = stopped.map(|stop| format!("{}: {}", stop.file, stop.why));
         for detail in details {
@@ -317,9 +354,14 @@ mod tests {
             "name = \"crates\"",
             "name = \"own\", cargo_config = \"//:own.toml\"",
         );
+        // The directory that cannot be listed would stop a walk: the
+        // scan has nothing to say only because it did not run.
         let found = run(
             recognize,
-            &[("MODULE.bazel", &format!("{HEAD}{HUB}{own}{global}"))],
+            &[
+                ("MODULE.bazel", &format!("{HEAD}{HUB}{own}{global}")),
+                ("locked/", ""),
+            ],
         );
         let [inherits, own] = &found.hubs[..] else {
             panic!("two hubs: {:?}", found.hubs)
@@ -338,6 +380,145 @@ mod tests {
         let found = run(recognize, &[("MODULE.bazel", &twice)]);
         assert_eq!(detail(&found.hubs[0]).cargo_config, LabelAttr::Computed);
         assert!(!found.hubs[0].decl.literal);
+    }
+
+    /// Bazel evaluates each segment with its own constants: a name in the
+    /// `crate.config` tag of another segment is that segment's, whatever
+    /// the file of the hub binds the same name to.
+    #[test]
+    fn a_config_tag_is_read_with_the_constants_of_its_own_segment() {
+        let segment = "crate = use_extension(\"@rules_rs//rs:extensions.bzl\", \"crate\")\n\
+                       CFG = \"//seg:config.toml\"\ncrate.config(cargo_config_toml = CFG)\n";
+        let include = "include(\"//:rs.MODULE.bazel\")\n";
+        for root in ["CFG = \"//:root.toml\"\n", ""] {
+            let module = format!("{HEAD}{root}{HUB}{include}");
+            let found = run(
+                recognize,
+                &[("MODULE.bazel", &module), ("rs.MODULE.bazel", segment)],
+            );
+            let [hub] = &found.hubs[..] else {
+                panic!("one hub: {:?}", found.hubs)
+            };
+            let config = lock("//seg:config.toml", "seg/config.toml", LockRole::Config);
+            assert_eq!(detail(hub).cargo_config, LabelAttr::Label(config), "{root}");
+            assert!(hub.decl.literal && found.gaps.is_empty(), "{root}");
+        }
+    }
+
+    /// The patches and overrides of the root are evidence on a rules_rs
+    /// hub as they are on a rules_rust one.
+    #[test]
+    fn annotations_and_repository_overrides_are_evidence_on_the_hub() {
+        let module = format!(
+            "{HEAD}{HUB}crate.annotation(crate = \"x\", patches = [\"//:x.patch\"])\n\
+             use_repo(crate, \"crates\")\noverride_repo(crate, crates = \"mine\")\n"
+        );
+        let found = run(recognize, &[("MODULE.bazel", &module)]);
+        let [hub] = &found.hubs[..] else {
+            panic!("one hub: {:?}", found.hubs)
+        };
+        let [decl] = &hub.user_decls[..] else {
+            panic!("one declaration: {:?}", hub.user_decls)
+        };
+        assert_eq!((decl.package.as_str(), decl.replacement), ("x", false));
+        let [bypass] = &hub.bypasses[..] else {
+            panic!("one bypass: {:?}", hub.bypasses)
+        };
+        assert_eq!(
+            (bypass.token, bypass.what.as_str()),
+            (
+                "repo_override",
+                "`override_repo` replaces `crates` with `mine`"
+            )
+        );
+    }
+
+    /// A versioned label fails wherever the root's repository mapping
+    /// resolves it (probe R6 V5): in the BUILD file of a repository the
+    /// `MODULE.bazel` or `WORKSPACE` declares inline, in a `build_file`
+    /// template, and in a real directory named `bazel-<x>`.
+    #[test]
+    fn the_label_scan_reads_every_file_that_can_name_a_hub_label() {
+        let module = format!(
+            "{HEAD}{HUB}use_repo(crate, \"crates\")\n\
+             http_archive = use_repo_rule(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")\n\
+             http_archive(\n    name = \"tool\",\n    \
+             build_file_content = 'rust_binary(name = \"t\", deps = [\"@crates//:itoa-0.4.8\"])',\n)\n"
+        );
+        let label = |name: &str| format!("DEPS = [\"@crates//:{name}\"]\n");
+        let workspace = "new_local_repository(\n    name = \"x\",\n    path = \"x\",\n    \
+                         build_file_content = 'deps = [\"@crates//:cfg-if-1.0.4\"]',\n)\n";
+        let (serde, ryu, syn, libc, quote) = (
+            label("serde-1.0.200"),
+            label("ryu-1.0.18"),
+            label("syn-2.0.60"),
+            label("libc-0.2.155"),
+            label("quote-1.0.36"),
+        );
+        let found = run(
+            recognize,
+            &[
+                ("MODULE.bazel", &module),
+                ("WORKSPACE", workspace),
+                ("ok/BUILD.bazel", &libc),
+                ("third_party/foo.BUILD.bazel", &serde),
+                ("third_party/BUILD.foo", &ryu),
+                ("third_party/foo.BUILD", &syn),
+                ("bazel-tools/BUILD.bazel", &quote),
+                // Neither is Starlark the build loads.
+                ("MODULE.bazel.lock", &serde),
+                ("notes/README.md", &serde),
+                // The execution root is not the source tree.
+                ("bazel-app/bazel-out/x", ""),
+                ("bazel-app/BUILD.bazel", &serde),
+            ],
+        );
+        let [hub] = &found.hubs[..] else {
+            panic!("one hub: {:?}", found.hubs)
+        };
+        let read = detail(hub);
+        let seen: Vec<(&str, usize, &str, &str)> = read
+            .versioned_labels
+            .iter()
+            .map(|l| (l.file.as_str(), l.line, l.name.as_str(), l.version.as_str()))
+            .collect();
+        assert_eq!(
+            seen,
+            [
+                ("MODULE.bazel", 14, "itoa", "0.4.8"),
+                ("WORKSPACE", 4, "cfg-if", "1.0.4"),
+                ("bazel-tools/BUILD.bazel", 1, "quote", "1.0.36"),
+                ("ok/BUILD.bazel", 1, "libc", "0.2.155"),
+                ("third_party/BUILD.foo", 1, "ryu", "1.0.18"),
+                ("third_party/foo.BUILD", 1, "syn", "2.0.60"),
+                ("third_party/foo.BUILD.bazel", 1, "serde", "1.0.200"),
+            ]
+        );
+        assert_eq!(read.unscanned, None);
+        assert!(found.gaps.is_empty());
+    }
+
+    #[test]
+    fn the_label_scan_reads_starlark_and_build_file_templates() {
+        for name in [
+            "BUILD",
+            "BUILD.bazel",
+            "defs.bzl",
+            "MODULE.bazel",
+            "go.MODULE.bazel",
+            "WORKSPACE",
+            "WORKSPACE.bazel",
+            "WORKSPACE.bzlmod",
+            "zlib.BUILD",
+            "BUILD.zlib",
+            "zlib.BUILD.bazel",
+            "BUILD.zlib.bazel",
+        ] {
+            assert!(label_scan_file(name), "{name}");
+        }
+        for name in ["MODULE.bazel.lock", "README.md", "Cargo.lock", "build.rs"] {
+            assert!(!label_scan_file(name), "{name}");
+        }
     }
 
     #[test]
