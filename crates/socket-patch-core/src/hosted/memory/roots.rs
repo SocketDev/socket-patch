@@ -14,7 +14,7 @@
 //! vendors. Such a tree is known by the marker Bazel wrote into it
 //! (`bazel::output_tree`), on disk and in a path list alike.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -135,50 +135,70 @@ fn allowed(ecosystems: Option<&[String]>, eco: &str) -> bool {
     ecosystems.is_none_or(|list| list.iter().any(|e| e == eco))
 }
 
-/// Whether `dir` is `tree` or lies below it; `""` is the listing's root.
-fn at_or_below(dir: &str, tree: &str) -> bool {
-    tree.is_empty() || strip_root(tree, dir).is_some() || dir == tree
+/// `dir` and the directories above it inside the repository, nearest
+/// first, ending with the repository root (`""`).
+fn at_or_above(dir: &str) -> impl Iterator<Item = &str> {
+    std::iter::once(dir).chain(strict_ancestors(dir))
 }
 
-/// The directories of a path list that are trees Bazel owns (design
-/// 2.11), `/`-separated and sorted: an output base, an entry of either
-/// cache, a vendor directory. A list knows a directory only by the files
-/// in it, so a tree is found as far as its marker is listed.
+/// The directories that are trees Bazel owns (design 2.11) among those of
+/// a path list or below a walked directory: an output base, an entry of
+/// either cache, a vendor directory. `/`-separated and relative; `""` is
+/// the root of the list or the walk.
+///
+/// There can be thousands: a repository cache kept in the checkout is one
+/// tree per download. So a directory is looked up by its own segments
+/// ([`ListedTrees::hold`]), never by a pass over the trees.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(super) struct ListedTrees(BTreeSet<String>);
+
+impl ListedTrees {
+    /// Whether `dir` is one of the trees or lies below one.
+    pub(super) fn hold(&self, dir: &str) -> bool {
+        !self.0.is_empty() && at_or_above(dir).any(|dir| self.0.contains(dir))
+    }
+
+    /// The trees, sorted.
+    fn into_sorted(self) -> Vec<String> {
+        self.0.into_iter().collect()
+    }
+}
+
+/// The directory that the name of `path` marks as the root of a tree, were
+/// the file what Bazel writes under that name ([`output_tree::marked_dir`]).
+fn marked_by(path: &str) -> Option<String> {
+    let (dir, base) = split_path(path);
+    let marked = output_tree::marked_dir(Path::new(dir), OsStr::new(base))?;
+    let segments: Option<Vec<&str>> = marked.iter().map(OsStr::to_str).collect();
+    Some(segments?.join("/"))
+}
+
+/// The trees Bazel owns in a path list. A list knows a directory only by
+/// the files in it, so a tree is found as far as its marker is listed.
 ///
 /// The first pass asks each path whether its name can be a marker at all.
 /// Almost no list has one, and then nothing more is done; the directories
 /// the names point at are judged by the classifier, over the files listed
 /// in and beside them.
-fn bazel_trees_listed<'a>(paths: impl Iterator<Item = &'a str> + Clone) -> Vec<String> {
-    let mut pointed: BTreeSet<String> = BTreeSet::new();
-    for path in paths.clone() {
-        let (dir, base) = split_path(path);
-        if let Some(marked) = output_tree::marked_dir(Path::new(dir), OsStr::new(base)) {
-            let segments: Option<Vec<&str>> = marked.iter().map(OsStr::to_str).collect();
-            pointed.extend(segments.map(|segments| segments.join("/")));
-        }
+pub(super) fn bazel_trees_listed<'a>(paths: impl Iterator<Item = &'a str> + Clone) -> ListedTrees {
+    let pointed = ListedTrees(paths.clone().filter_map(marked_by).collect());
+    if pointed.0.is_empty() {
+        return pointed;
     }
-    if pointed.is_empty() {
-        return Vec::new();
-    }
-    // The marker of a contents-cache entry lies beside it; every other
-    // file a rule asks for lies inside the directory.
-    let near = |path: &str| {
-        pointed.iter().any(|dir| {
-            let (parent, _) = split_path(path);
-            at_or_below(parent, dir)
-                || path
-                    .strip_prefix(dir.as_str())
-                    .is_some_and(|rest| rest.starts_with('.'))
-        })
+    // Every file a rule asks for lies inside the directory, but for the
+    // marker of a contents-cache entry, which lies beside it and whose
+    // name points at the entry.
+    let near = |path: &&str| {
+        pointed.hold(split_path(path).0)
+            || marked_by(path).is_some_and(|dir| pointed.0.contains(&dir))
     };
-    let listing = output_tree::Listing::new(paths.filter(|path| near(path)));
+    let listing = output_tree::Listing::new(paths.filter(near));
     let is_tree = |dir: &String| {
         output_tree::tree_at(&listing, Path::new(dir), &[])
             .tree
             .is_some()
     };
-    pointed.into_iter().filter(is_tree).collect()
+    ListedTrees(pointed.0.into_iter().filter(is_tree).collect())
 }
 
 /// The detected roots (sorted) and the marker paths that did not make one.
@@ -215,7 +235,7 @@ where
             ignore("excluded_dir", &mut ignored);
             continue;
         }
-        if bazel_trees.iter().any(|tree| at_or_below(dir, tree)) {
+        if bazel_trees.hold(dir) {
             ignore(Code::WorkspaceOutputTreeSkipped.as_str(), &mut ignored);
             continue;
         }
@@ -313,10 +333,14 @@ fn is_tree_root(classifier: &Classifier, dir: &Path) -> bool {
 /// one listing. A root with no subdirectory is never asked about that way;
 /// it is known by the marker among its files, whose name points at it
 /// ([`output_tree::marked_dir`]) at no cost, and the classifier decides.
+///
+/// The roots are a set, asked about one directory at a time: a repository
+/// cache kept in the checkout is one root per download, and a pass over
+/// them for every directory the walk meets would cost their square.
 #[derive(Debug, Default)]
 struct BazelTreesMet {
     /// The roots, as the walk spells them.
-    roots: Vec<PathBuf>,
+    roots: HashSet<PathBuf>,
     /// The directories the walk is inside of, outermost first, each with
     /// whether it is a root.
     inside: Vec<(PathBuf, bool)>,
@@ -324,16 +348,17 @@ struct BazelTreesMet {
 
 impl BazelTreesMet {
     fn note(&mut self, root: PathBuf) {
-        if !self.roots.contains(&root) {
-            self.roots.push(root);
-        }
+        self.roots.insert(root);
     }
 
     /// Whether the walk must not enter `subdir`, an entry of a directory
     /// it is listing: that directory is a root, or `subdir` is one a
     /// marker beside it already named.
     fn keeps_out_of(&mut self, classifier: &Classifier, subdir: &Path) -> bool {
-        if self.roots.iter().any(|root| subdir.starts_with(root)) {
+        // No directory above `subdir` needs asking about but the one that
+        // holds it, which is judged below: the walk enters nothing in a
+        // root, so it is never deeper in one than this.
+        if self.roots.contains(subdir) {
             return true;
         }
         let Some(dir) = subdir.parent() else {
@@ -447,15 +472,11 @@ fn marker_paths_below(dir: &Path) -> WalkedMarkers {
         .roots
         .iter()
         .filter_map(|tree| relative_slashed(dir, tree));
-    found.bazel_trees = trees.collect::<BTreeSet<String>>().into_iter().collect();
-    let in_tree = |marker: &String| {
-        let (parent, _) = split_path(marker);
-        found
-            .bazel_trees
-            .iter()
-            .any(|tree| at_or_below(parent, tree))
-    };
-    found.markers.retain(|marker| !in_tree(marker));
+    let trees = ListedTrees(trees.collect());
+    found
+        .markers
+        .retain(|marker| !trees.hold(split_path(marker).0));
+    found.bazel_trees = trees.into_sorted();
     found
 }
 
@@ -947,6 +968,10 @@ mod tests {
         "notes",
     ];
 
+    fn listed_trees(paths: &[&str]) -> Vec<String> {
+        bazel_trees_listed(paths.iter().copied()).into_sorted()
+    }
+
     /// HZ-02 and HZ-03 in a path list: a lockfile inside a tree Bazel owns
     /// makes no root, and each one is reported with the code a disk run
     /// reports the directory under.
@@ -970,7 +995,7 @@ mod tests {
         );
         let code = Code::WorkspaceOutputTreeSkipped.as_str();
         assert!(ignored.iter().all(|i| i.reason == code), "{ignored:?}");
-        assert_eq!(bazel_trees_listed(BAZEL_LAYOUT.into_iter()), BAZEL_TREES);
+        assert_eq!(listed_trees(&BAZEL_LAYOUT), BAZEL_TREES);
 
         // A list of lockfiles alone names no marker, so it prunes nothing
         // (and costs one pass over the names): this is what the disk walk
@@ -978,7 +1003,7 @@ mod tests {
         let locks = BAZEL_LAYOUT
             .into_iter()
             .filter(|path| marker_ecosystem(split_path(path).1).is_some());
-        assert_eq!(bazel_trees_listed(locks.clone()), [""; 0]);
+        assert_eq!(bazel_trees_listed(locks.clone()), ListedTrees::default());
         assert_eq!(detect_roots(locks, None).1.len(), 0);
 
         // A vendor directory at the listing's root: the list is one tree.
@@ -1049,6 +1074,77 @@ mod tests {
         std::fs::remove_file(root.join("out/DO_NOT_BUILD_HERE")).unwrap();
         let entered = marker_paths_below(root);
         assert_eq!((entered.walked, entered.markers.len()), (5 + 3 * 30, 31));
+    }
+
+    /// A repository cache kept in the checkout (`--repository_cache` below
+    /// the workspace) is one tree per download, thousands of them side by
+    /// side. Each costs the walk its directory and its payload, each is
+    /// named once, and what lies beside the cache is still found.
+    #[test]
+    fn a_repository_cache_in_the_checkout_is_walked_once_per_entry() {
+        const ENTRIES: usize = 2_000;
+        let cas = ".cache/repo/content_addressable/sha256";
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(cas)).unwrap();
+        for entry in 0..ENTRIES {
+            let dir = root.join(format!("{cas}/{entry:064x}"));
+            std::fs::create_dir(&dir).unwrap();
+            std::fs::write(dir.join("file"), "x").unwrap();
+        }
+        // An unpacked download would hold lockfiles; one entry does.
+        std::fs::write(root.join(format!("{cas}/{:064x}/yarn.lock", 7)), "x").unwrap();
+        std::fs::create_dir(root.join("web")).unwrap();
+        std::fs::write(root.join("web/yarn.lock"), "x").unwrap();
+
+        let found = marker_paths_below(root);
+        // The walked directory, the four above the entries, `web` and the
+        // two lockfiles; then a directory and a payload per entry.
+        assert_eq!(found.walked, 8 + 2 * ENTRIES);
+        assert_eq!(found.markers, ["web/yarn.lock"]);
+        assert_eq!(found.bazel_trees.len(), ENTRIES);
+        assert_eq!(found.bazel_trees[7], format!("{cas}/{:064x}", 7));
+        assert!(!found.truncated);
+    }
+
+    /// The same cache as a path list, with a contents cache and a vendor
+    /// directory beside it: every tree is found, and the lockfiles in them
+    /// make no root, whatever the number of marker names in the list.
+    #[test]
+    fn thousands_of_listed_cache_entries_are_each_a_tree() {
+        const ENTRIES: usize = 20_000;
+        let mut paths = vec![
+            "pnpm-lock.yaml".to_string(),
+            "apps/web/yarn.lock".into(),
+            "vendor_src/VENDOR.bazel".into(),
+            "vendor_src/+http_archive+dep/yarn.lock".into(),
+            // A payload name outside a cache, and a marker name beside
+            // nothing of a base, mark no tree.
+            "docs/file".into(),
+            "notes/DO_NOT_BUILD_HERE".into(),
+            "notes/go.mod".into(),
+        ];
+        for entry in 0..ENTRIES {
+            let cas = format!(".cache/repo/content_addressable/sha256/{entry:064x}");
+            paths.push(format!("{cas}/file"));
+            paths.push(format!("{cas}/yarn.lock"));
+            let contents = format!(".cache/contents/{entry:08x}");
+            paths.push(format!("{contents}/1.recorded_inputs"));
+            paths.push(format!("{contents}/1/go.mod"));
+        }
+        let listed = || paths.iter().map(String::as_str);
+        let trees = bazel_trees_listed(listed());
+        assert_eq!(trees.0.len(), 2 * ENTRIES + 1);
+        assert!(trees.hold("vendor_src/+http_archive+dep"));
+        assert!(trees.hold(".cache/contents/00000007/1/sub"));
+        assert!(!trees.hold(".cache/contents/00000007"));
+        assert!(!trees.hold("notes") && !trees.hold("docs") && !trees.hold(""));
+
+        let (found, ignored) = detect_roots(listed(), None);
+        assert_eq!(found, ["", "apps/web", "notes"]);
+        assert_eq!(ignored.len(), 2 * ENTRIES + 1);
+        let code = Code::WorkspaceOutputTreeSkipped.as_str();
+        assert!(ignored.iter().all(|i| i.reason == code));
     }
 
     /// A build leaves links into its output base in the workspace. The

@@ -245,6 +245,7 @@ fn apply_in_a_fabricated_external_npm_exits_0_with_and_without_a_manifest() {
         // `--silent` is what a hook passes: nothing at all.
         let quiet = run(&repo, &["apply", "--offline", "--silent"], &[]);
         assert_eq!(quiet, (0, String::new(), String::new()), "{state:?}");
+        stale_vex_is_removed_by_the_warning_run(&repo);
         // `--cwd .` names the directory the process is already in.
         let (code, _, stderr) = run(&repo, &["apply", "--offline", "--cwd", "."], &[]);
         assert!(code == 0 && stderr.starts_with("Warning: "), "{stderr}");
@@ -262,6 +263,68 @@ fn apply_in_a_fabricated_external_npm_exits_0_with_and_without_a_manifest() {
     let (code, stdout, stderr) = run(&root, &["apply", "--offline"], &[]);
     assert_eq!(code, 0, "stdout:\n{stdout}\nstderr:\n{stderr}");
     assert_eq!(std::fs::read(&installed).unwrap(), PATCHED);
+}
+
+/// An OpenVEX document as an earlier `apply --vex` left it.
+const STALE_VEX: &str = r#"{ "@context": "https://openvex.dev/ns/v0.2.0", "statements": [
+  { "status": "not_affected", "products": [{ "@id": "pkg:npm/left-pad@1.3.0" }] } ] }"#;
+
+/// The `apply` in `repo`, a directory in a Bazel tree that holds a
+/// manifest, patched nothing and so attests nothing. A document an earlier
+/// run left at `--vex` must not survive it: exit 0 beside a `not_affected`
+/// document reads as "patched and attested". The document is kept by a dry
+/// run, and so is a file at the path that is not OpenVEX.
+fn stale_vex_is_removed_by_the_warning_run(repo: &Path) {
+    let (_tmp, out) = scratch();
+    let doc = out.join("vex.json");
+    let doc_arg = doc.to_string_lossy();
+    let apply = |flags: &[&str]| {
+        let args = [&["apply", "--offline", "--vex", &*doc_arg], flags].concat();
+        run(repo, &args, &[])
+    };
+    let codes = |stdout: &str| -> Vec<String> {
+        let envelope = parse_json_envelope(stdout);
+        assert_eq!(envelope["status"], "success", "{stdout}");
+        assert_eq!(envelope.get("vex"), None, "{stdout}");
+        let warnings = envelope["warnings"].as_array().expect("warnings");
+        let code = |warning: &Value| warning["code"].as_str().unwrap().to_string();
+        warnings.iter().map(code).collect()
+    };
+    let in_tree = Code::WorkspaceInsideOutputTree.as_str();
+
+    std::fs::write(&doc, STALE_VEX).unwrap();
+    let (code, stdout, _) = apply(&["--json", "--dry-run"]);
+    assert_eq!((code, codes(&stdout)), (0, vec![in_tree.to_string()]));
+    assert_eq!(std::fs::read_to_string(&doc).unwrap(), STALE_VEX);
+
+    let (code, stdout, _) = apply(&["--json"]);
+    assert_eq!(code, 0, "{stdout}");
+    assert_eq!(codes(&stdout), [in_tree, "vex_stale_doc_removed"]);
+    assert!(!doc.exists(), "the stale document survived:\n{stdout}");
+    // Nothing is left to remove, and nothing is written in its place.
+    let (code, stdout, _) = apply(&["--json"]);
+    assert_eq!((code, codes(&stdout)), (0, vec![in_tree.to_string()]));
+    assert!(!doc.exists());
+
+    // Without `--json` the removal is a second warning; `--silent` still
+    // removes, and says nothing.
+    std::fs::write(&doc, STALE_VEX).unwrap();
+    let (code, stdout, stderr) = apply(&[]);
+    assert_eq!((code, stdout.as_str()), (0, ""), "{stderr}");
+    let warnings: Vec<&str> = stderr.lines().collect();
+    assert_eq!(warnings.len(), 2, "{stderr}");
+    assert!(warnings[1].starts_with("Warning: Removed the previous VEX document at "));
+    assert!(!doc.exists());
+    std::fs::write(&doc, STALE_VEX).unwrap();
+    assert_eq!(apply(&["--silent"]), (0, String::new(), String::new()));
+    assert!(!doc.exists());
+
+    // A mistyped `--vex` must not cost the user another file.
+    let other = r#"{ "name": "not a VEX document" }"#;
+    std::fs::write(&doc, other).unwrap();
+    let (code, stdout, _) = apply(&["--json"]);
+    assert_eq!((code, codes(&stdout)), (0, vec![in_tree.to_string()]));
+    assert_eq!(std::fs::read_to_string(&doc).unwrap(), other);
 }
 
 /// A directory the caller chose is refused: `--cwd`, its variable and
@@ -345,6 +408,60 @@ fn a_package_linked_into_an_output_base_is_refused_and_left_alone() {
     assert!(message.ends_with("nothing was written"), "{stdout}");
     assert_eq!(std::fs::read(&stored).unwrap(), UPSTREAM);
     assert_same_tree(&before, &snapshot(&base));
+}
+
+/// `rollback` restores bytes into the package directory, so it is refused
+/// where `apply` is: a patched copy that `node_modules` links into an
+/// output base stays as it is, with its record. No scope root is in a tree
+/// here, so this is the per-package refusal, whatever a rollback aimed at
+/// a tree comes to do. The marker is all that refuses: without it the same
+/// links are an install like any other and the copy is restored.
+#[cfg(unix)]
+#[test]
+fn a_rollback_into_an_output_base_is_refused_and_restores_nothing() {
+    let (_tmp, root) = scratch();
+    let base = root.join("_bazel_u/6d82");
+    lay_base(&base, &root.join("ws"), Base::CleanedAndBuilt);
+    let store = base.join("execroot/_main/bazel-out/k8/bin");
+    let stored = install_left_pad(&store);
+    std::fs::write(&stored, PATCHED).unwrap();
+    let project = root.join("project");
+    npm_project(&project, "left-pad", "1.3.0");
+    std::fs::create_dir_all(project.join("node_modules")).unwrap();
+    let link = project.join("node_modules/left-pad");
+    std::os::unix::fs::symlink(store.join("node_modules/left-pad"), &link).unwrap();
+    stage_patch(&project);
+    // What a rollback restores from.
+    write_blob(&project.join(".socket"), &git_sha256(UPSTREAM), UPSTREAM);
+    let manifest = project.join(".socket/manifest.json");
+    let recorded = std::fs::read(&manifest).unwrap();
+    let before = snapshot(&base);
+
+    for flags in [&[][..], &["--dry-run"]] {
+        let args = [&["rollback", "--offline", "--json"], flags].concat();
+        let (code, stdout, stderr) = run(&project, &args, &[]);
+        assert_eq!(code, 1, "{flags:?}\nstdout:\n{stdout}\nstderr:\n{stderr}");
+        let envelope = parse_json_envelope(&stdout);
+        let failed = &envelope["events"][0];
+        let got = (&failed["action"], &failed["purl"]);
+        assert_eq!(
+            got,
+            (&Value::from("failed"), &Value::from(PURL)),
+            "{stdout}"
+        );
+        let message = failed["error"].as_str().unwrap_or_default();
+        assert!(message.starts_with("Refusing to roll back "), "{stdout}");
+        assert!(message.contains(BAZEL_TREE_REFUSAL_MARKER), "{stdout}");
+        assert!(message.ends_with("nothing was written"), "{stdout}");
+        assert_eq!(std::fs::read(&stored).unwrap(), PATCHED);
+        assert_eq!(std::fs::read(&manifest).unwrap(), recorded);
+        assert_same_tree(&before, &snapshot(&base));
+    }
+
+    std::fs::remove_file(base.join("DO_NOT_BUILD_HERE")).unwrap();
+    let (code, stdout, stderr) = run(&project, &["rollback", "--offline", "--json"], &[]);
+    assert_eq!(code, 0, "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert_eq!(std::fs::read(&stored).unwrap(), UPSTREAM);
 }
 
 /// The directories inside trees that the scans below are aimed at, each
@@ -530,4 +647,97 @@ async fn a_workspace_scan_takes_no_project_from_a_bazel_tree() {
         vec![],
         "no patch was offered, so nothing is written"
     );
+}
+
+/// A checkout with two projects beside an output base and a vendor
+/// directory, each tree holding a project of its own.
+fn lay_checkout(root: &Path) {
+    std::fs::create_dir_all(root.join(".git")).unwrap();
+    npm_project(&root.join("api"), "left-pad", "1.3.0");
+    npm_project(&root.join("web"), "is-odd", "3.0.1");
+    lay_base(&root.join("out"), root, Base::CleanedAndBuilt);
+    npm_project(&root.join("out/external/npm"), "base-only", "7.7.7");
+    put(root, "vendor_src/VENDOR.bazel", "");
+    npm_project(
+        &root.join("vendor_src/+http_archive+dep"),
+        "vendored-only",
+        "9.9.9",
+    );
+}
+
+/// A PATH glob takes every directory it matches, and `*` at a workspace
+/// root matches the trees Bazel keeps there. A matched tree is left out
+/// and named once, the way a bare scan leaves it out, and the projects
+/// beside it are scanned: the command exited 0 before it knew the trees,
+/// and must not start to fail. A tree the user named is still refused,
+/// and so is a glob that matched nothing else.
+#[tokio::test]
+async fn a_path_glob_scans_the_projects_and_leaves_out_the_trees_it_matches() {
+    let (_tmp, root) = scratch();
+    lay_checkout(&root);
+    let before = snapshot(&root);
+    let note = "Note: 5 directories a PATH pattern matched were not scanned (out, \
+                out/external/bazel_tools, out/external/npm, vendor_src, \
+                vendor_src/+http_archive+dep): Bazel owns them";
+    let globs = ["[a-z]*", "out/external/*", "vendor_src/*"];
+
+    for mode in ["hosted", "vendored"] {
+        let api = fake_api().await;
+        let (code, stdout, stderr) = scan(&root, &api, &[&["--mode", mode], &globs[..]].concat());
+        assert_eq!(code, 0, "{mode}\nstdout:\n{stdout}\nstderr:\n{stderr}");
+        let headings: Vec<&str> = stdout.lines().filter(|l| l.starts_with("== ")).collect();
+        assert_eq!(headings, ["== api ==", "== web =="], "{stdout}");
+        assert_eq!(stderr.matches(note).count(), 1, "{stderr}");
+        assert!(!stderr.contains("Refusing"), "{stderr}");
+        assert_eq!(
+            queried(&api).await,
+            ["pkg:npm/is-odd@3.0.1", PURL],
+            "{mode}"
+        );
+    }
+
+    // `--silent` scans the same directories and says nothing of the rest.
+    let api = fake_api().await;
+    let args = [&["--mode", "hosted", "--silent"], &globs[..]].concat();
+    let (code, _, stderr) = scan(&root, &api, &args);
+    assert!(code == 0 && !stderr.contains("Note: "), "{stderr}");
+    assert_eq!(queried(&api).await, ["pkg:npm/is-odd@3.0.1", PURL]);
+
+    // One project left of several matches is still headed by its name.
+    let api = fake_api().await;
+    let (code, stdout, stderr) = scan(&root, &api, &["--mode", "hosted", "ap*", "vendor_s*"]);
+    assert_eq!(code, 0, "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(stdout.contains("== api =="), "{stdout}");
+    let one =
+        "Note: 1 directory a PATH pattern matched was not scanned (vendor_src): Bazel owns it";
+    assert!(stderr.contains(one), "{stderr}");
+    assert_eq!(queried(&api).await, [PURL]);
+
+    // A tree the user named is refused, and the directory named beside it
+    // is scanned: exit 1, with the reason.
+    let api = fake_api().await;
+    let named = ["--mode", "hosted", "api", "vendor_src/+http_archive+dep"];
+    let (code, stdout, stderr) = scan(&root, &api, &named);
+    assert_eq!(code, 1, "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(stderr.contains("Error: Refusing to scan in "), "{stderr}");
+    assert!(stderr.contains("(the directory to scan)"), "{stderr}");
+    assert!(!stderr.contains("were not scanned"), "{stderr}");
+    assert_eq!(queried(&api).await, [PURL]);
+    let api = fake_api().await;
+    let named = ["--mode", "hosted", "--json", "vendor_src"];
+    assert_refused(&scan(&root, &api, &named), "a literal PATH");
+
+    // Globs that match trees alone leave nothing to scan: refused, under
+    // `--json` (one match) and without it.
+    assert_refused(
+        &scan(&root, &api, &["--mode", "hosted", "--json", "vendor_s*"]),
+        "a glob that matches one tree",
+    );
+    let only_trees = ["--mode", "hosted", "vendor_s*", "out/external/n*"];
+    let (code, _, stderr) = scan(&root, &api, &only_trees);
+    assert_eq!(code, 1, "{stderr}");
+    assert_eq!(stderr.matches("Error: Refusing to scan in ").count(), 2);
+    assert_eq!(queried(&api).await, [""; 0], "a refused scan asked the API");
+
+    assert_same_tree(&before, &snapshot(&root));
 }

@@ -261,6 +261,24 @@ pub async fn bazel_tree_of(scope_root: &Path) -> Option<SharedStore> {
     .flatten()
 }
 
+/// Whether each of `scope_roots` is in or links into a Bazel tree
+/// ([`bazel_tree_of`]), for a run that holds several candidate directories
+/// (the matches of a PATH glob). One classifier judges them all, so the
+/// directories above them, which siblings share, are walked once.
+///
+/// A classifier that could not run answers `false` for every directory:
+/// the run that then starts in one still asks [`bazel_tree_of`] about it.
+pub async fn in_bazel_tree(scope_roots: Vec<PathBuf>) -> Vec<bool> {
+    let count = scope_roots.len();
+    tokio::task::spawn_blocking(move || {
+        let bazel = Classifier::new();
+        let in_tree = |root: &PathBuf| bazel.classify(root).class != PathClass::Plain;
+        scope_roots.iter().map(in_tree).collect()
+    })
+    .await
+    .unwrap_or_else(|_| vec![false; count])
+}
+
 /// Classify `pkg_path`: `Some` when its real location is inside a shared
 /// store (see the module docs). A path that does not exist, or cannot be
 /// resolved, is `None`; the normal verify step reports a missing package.
@@ -1640,6 +1658,14 @@ mod tests {
             let found = bazel_tree_of(&root.join(scope_root)).await;
             assert_eq!(found.map(|store| store.kind), want, "{scope_root}");
         }
+        // Several at once, as the matches of a PATH glob are judged.
+        let matched = ["ws/bazel-bin", "ws/dist", "ws/dist/bin", "ws", "base"];
+        let matched = matched.map(|dir| root.join(dir)).to_vec();
+        assert_eq!(
+            in_bazel_tree(matched).await,
+            [true, false, true, false, true]
+        );
+        assert_eq!(in_bazel_tree(Vec::new()).await, [false; 0]);
     }
 
     #[test]

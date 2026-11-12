@@ -474,7 +474,7 @@ pub(crate) struct Advice {
 const SPELLED_OUT: usize = 10;
 
 /// `a, b, c`, or the first [`SPELLED_OUT`] and `and N more`.
-fn spelled_out(names: &[&str]) -> String {
+pub(crate) fn spelled_out(names: &[&str]) -> String {
     match names.len().checked_sub(SPELLED_OUT) {
         Some(more @ 1..) => format!("{}, and {more} more", names[..SPELLED_OUT].join(", ")),
         _ => names.join(", "),
