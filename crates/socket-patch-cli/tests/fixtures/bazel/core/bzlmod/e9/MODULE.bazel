@@ -6,8 +6,8 @@ toy = use_extension("//:toy.bzl", "toy")
 toy.lock(file = "//:toy.lock.json")
 use_repo(toy, "toy")
 
-# The facts-bearing variant (Bazel 8.6 and later): this extension records no
-# input in MODULE.bazel.lock, only one fact per package the toy registry serves.
+# The facts-bearing variant (Bazel 8.5.0 and later; probed from 8.6.0, 8.4.2 rejects the keyword):
+# this extension records no input in MODULE.bazel.lock, only a fact per toy registry package.
 toy_facts = use_extension("//:toy.bzl", "toy_facts")
 toy_facts.lock(file = "//facts:toy.lock.json")
 use_repo(toy_facts, toy_facts = "toy")

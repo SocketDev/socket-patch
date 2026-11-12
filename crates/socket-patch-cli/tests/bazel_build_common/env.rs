@@ -20,7 +20,10 @@ pub const BAZELISK: &str = "SOCKET_PATCH_BAZEL_E2E_BAZELISK";
 pub const BINARY: &str = "SOCKET_PATCH_BAZEL_E2E_BINARY";
 /// Where the per-cell JSON reports go.
 pub const PROBE_DIR: &str = "SOCKET_PATCH_BAZEL_E2E_PROBE_DIR";
-/// A persistent repository cache (`<root>/repos`) shared by every cell.
+/// A persistent repository cache (`<root>/repos`) shared by every cell
+/// but a cold one. A cold toy cell on a line whose module archives are not
+/// committed is given copies of those archives from it and nothing else
+/// (`toy::open`).
 pub const CACHE_ROOT: &str = "SOCKET_PATCH_BAZEL_E2E_CACHE_ROOT";
 /// A short directory for output user roots (Windows path limits).
 pub const OUTPUT_ROOT: &str = "SOCKET_PATCH_BAZEL_E2E_OUTPUT_ROOT";

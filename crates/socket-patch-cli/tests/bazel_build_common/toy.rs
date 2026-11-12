@@ -4,44 +4,51 @@
 //! without the network.
 //!
 //! A workspace with no ruleset still makes Bazel resolve the modules it
-//! brings itself and fetch a few of their archives. Both are committed
+//! brings itself and fetch a few of their archives. Both are described
 //! under `fixtures/bazel/registry` (see `scripts/bazel-fixture-registry.py`):
 //!
 //! - the registry files, read through `--registry=file://` on Unix. On
 //!   Windows, where no cell has proved the `file://` path syntax, the
 //!   fixture server plays `bcr.bazel.build` from the same files.
 //! - the archives of a line whose build fetches few (7.7.2 and 9.3.2: one
-//!   file of 8 KB), passed as `--distdir`. A line whose manifest entry
-//!   says `"distdir": false` (8.8.2 fetches 12.4 MB) fetches them from
-//!   their real hosts into the cell's repository cache before the
-//!   downloader config is switched on, and its report says
-//!   `direct_network`. In the offline phase (`SOCKET_PATCH_BAZEL_E2E_OFFLINE`)
-//!   it fetches nothing and builds from the restored repository cache.
+//!   file of 8 KB), committed and passed as `--distdir`.
+//! - for a line whose manifest entry says `"distdir": false`, only the
+//!   sha256 of each archive (8.8.2 fetches 12.4 MB under Bzlmod and 12.4 MB
+//!   under WORKSPACE, 11.5 MB of that in four archives the Bzlmod build
+//!   does not fetch). The cell's repository cache must hold them: see
+//!   [`module_archives`].
 //!
-//! Two limits follow. A toy cell never runs `bazel mod deps`: that command
-//! evaluates every extension of Bazel's own modules and fetches their
-//! archives (39 MB on 9.3.2), so a test passes `false` to `Cell::baseline`
-//! and refreshes a lock with a build. And a Bazel version the registry
-//! manifest does not list is skipped: 7.0.2, 7.1.2 and 6.6.0 write locks
-//! without `registryFileHashes`, so their module list has to come from a
-//! recorded run before `bazel-fixture-registry.py` can add them.
+//! [`gate`] decides from those files alone whether a test runs in a cell.
+//! A WORKSPACE cell below Bazel 8 runs with Bzlmod off and needs none of
+//! them. Any other cell on a Bazel version the manifest does not list
+//! cannot run, which is a failure where the cell is required: 7.0.2, 7.1.2
+//! and 6.6.0 write locks without `registryFileHashes`, so their module
+//! list has to come from a recorded run before
+//! `bazel-fixture-registry.py` can add them.
+//!
+//! A toy cell never runs `bazel mod deps`: that command evaluates every
+//! extension of Bazel's own modules and fetches their archives (39 MB on
+//! 9.3.2), so a test passes `false` to `Cell::baseline` and refreshes a
+//! lock with a build.
 //!
 //! Every toy lock keeps `https://registry.toy.invalid` URLs and a pin
 //! points at [`HOSTED_ORIGIN`]: both reach the fixture server through the
 //! downloader rewrite, so nothing a test writes carries a loopback URL.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, PoisonError};
 
 use sha2::{Digest, Sha256};
 use socket_patch_core::bazel::java_hash;
 
-use super::env::{self, Group, System};
+use super::env::{self, Group, System, Version};
 use super::fixture_server::{FixtureServer, HOSTED_ORIGIN};
-use super::invoke::Options;
-use super::isolation::OutsideState;
+use super::invoke::{Bazel, Options, Run};
+use super::isolation::{OutsideState, Scratch};
 use super::probe_report;
-use super::server::Cell;
-use super::workspace::fixtures_root;
+use super::server::{self, Cell};
+use super::workspace::{self, fixtures_root};
+use crate::common::fs_tree;
 
 /// The host every toy lock fetches from. `.invalid` never resolves, so a
 /// fetch that got around the downloader rewrite fails instead of leaving
@@ -168,6 +175,195 @@ pub fn file_url(dir: &Path) -> Option<String> {
     (cfg!(unix) && dir.is_absolute() && text.bytes().all(plain)).then(|| format!("file://{text}"))
 }
 
+/// The fixture workspace of a Bazel line: `core/<system>/e<major>`.
+pub fn fixture_of(version: &Version, system: System) -> String {
+    format!("core/{}/e{}", system.name(), version.major)
+}
+
+/// What a toy cell takes from the committed registry subset
+/// (`fixtures/bazel/registry`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Mirror {
+    /// Nothing. The cell runs with Bzlmod off on a line below Bazel 8: it
+    /// resolves no module and fetches no archive of Bazel's own.
+    NotNeeded,
+    /// The registry files, and the module archives as a `--distdir`.
+    Committed,
+    /// The registry files. The module archives are not committed: the
+    /// cell's repository cache must hold the ones with these sha256
+    /// digests ([`module_archives`]).
+    Cached(Vec<String>),
+}
+
+/// Whether a toy test runs in a cell, decided from committed files alone
+/// ([`gate`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Gate {
+    Run(Mirror),
+    /// The test does not apply to the cell: `SKIP (n/a)`, also where the
+    /// cell is required.
+    NotApplicable(String),
+    /// The cell is one the test is written for, and something it needs is
+    /// not committed: `SKIP`, and a failure where the cell is required. A
+    /// run that tested nothing must not pass a required cell.
+    CannotRun(String),
+}
+
+impl Gate {
+    /// How a test this gate keeps from running ends. `None` = it runs;
+    /// `Ok` = it prints SKIP and writes a `skipped` report; `Err` = the
+    /// failure message of a required cell.
+    pub fn declined(&self, test: &str, required: bool) -> Option<Result<(), String>> {
+        match self {
+            Gate::Run(_) => None,
+            Gate::NotApplicable(_) => Some(Ok(())),
+            Gate::CannotRun(why) => Some(probe_report::may_skip(test, why, required)),
+        }
+    }
+}
+
+/// The gate of a toy test on Bazel `version` and `system`. `manifest` is
+/// `registry/MANIFEST.json`, `fixture_present` whether [`fixture_of`]
+/// exists, and `zero_network` whether the test claims that nothing leaves
+/// the machine ([`open_offline`]).
+///
+/// Not applicable: the line lacks the dependency system, or the test
+/// claims zero network on a line whose module archives are not committed.
+/// Cannot run: there is no fixture for the line's major, or the cell needs
+/// the registry mirror and the manifest does not list the version.
+///
+/// The mirror is asked for by need. A WORKSPACE cell below Bazel 8 needs
+/// none (it ran on 7.0.2 and 7.1.2 with `--noenable_bzlmod`, no
+/// `--registry` and no archive), so it runs on a version the manifest
+/// does not list; on a listed one it is given the mirror all the same,
+/// for the one command a test runs under the line's default flags. From
+/// Bazel 8 the WORKSPACE suffix itself fetches archives.
+pub fn gate(
+    version: &Version,
+    system: System,
+    manifest: &serde_json::Value,
+    fixture_present: bool,
+    zero_network: bool,
+) -> Gate {
+    if version.system_flags(system).is_none() {
+        let why = format!("Bazel {} has no {} system", version.text, system.name());
+        return Gate::NotApplicable(why);
+    }
+    if !fixture_present {
+        let why = format!("there is no fixture {}", fixture_of(version, system));
+        return Gate::CannotRun(why);
+    }
+    let Some(entry) = manifest["versions"].get(&version.text) else {
+        if system == System::Workspace && version.major < 8 {
+            return Gate::Run(Mirror::NotNeeded);
+        }
+        let why = format!(
+            "Bazel {} is not in fixtures/bazel/registry (scripts/bazel-fixture-registry.py add)",
+            version.text
+        );
+        return Gate::CannotRun(why);
+    };
+    if entry["distdir"] == true {
+        return Gate::Run(Mirror::Committed);
+    }
+    if zero_network {
+        let why = format!(
+            "the module archives of Bazel {} are not committed",
+            version.text
+        );
+        return Gate::NotApplicable(why);
+    }
+    Gate::Run(Mirror::Cached(archive_digests(entry, system)))
+}
+
+/// The sha256 of every archive a cold build of the `system` fixture
+/// fetches, from a manifest entry: `archives` are the module archives of a
+/// Bzlmod build, `workspace_archives` what Bazel's own WORKSPACE suffix
+/// fetches with Bzlmod off. A hybrid cell reads both files (and its test
+/// also builds the tree as WORKSPACE only), so it needs both lists.
+pub fn archive_digests(entry: &serde_json::Value, system: System) -> Vec<String> {
+    let list = |key: &str| -> Vec<String> {
+        let archives = entry[key].as_array().into_iter().flatten();
+        archives
+            .map(|archive| archive["sha256"].as_str().expect("sha256").to_string())
+            .collect()
+    };
+    let mut digests = match system {
+        System::Bzlmod => list("archives"),
+        System::Workspace => list("workspace_archives"),
+        System::Hybrid => [list("archives"), list("workspace_archives")].concat(),
+    };
+    digests.sort();
+    digests.dedup();
+    digests
+}
+
+/// Where a `--repository_cache` directory keeps the download with this
+/// sha256: the file `file`, and beside it one empty `id-<hash>` marker per
+/// canonical id it was fetched under (for the http rules, the URL list).
+/// Bazel takes a hit only when the marker of the asking repository is
+/// there too, so an entry is copied whole.
+fn cache_entry(cache: &Path, sha256: &str) -> PathBuf {
+    cache.join("content_addressable/sha256").join(sha256)
+}
+
+/// The digests of `digests` that `cache` does not hold. Held means the
+/// file is there; the markers are not compared, because their names are
+/// not committed. An entry that only another repository's fetch left (the
+/// same archive under other URLs) therefore counts, and the cell's build
+/// then asks the fixture server for the archive and fails on its 404,
+/// naming it. [`seed_cache`] completes such an entry whenever the archives
+/// are fetched or copied.
+pub fn cache_lacks(cache: &Path, digests: &[String]) -> Vec<String> {
+    let held = |digest: &&String| cache_entry(cache, digest).join("file").is_file();
+    digests.iter().filter(|d| !held(d)).cloned().collect()
+}
+
+/// Copy the entries of `digests` from the repository cache `from` into
+/// `to`, and nothing else `from` holds. What `to` already has of an entry
+/// stays, and what it lacks is added: the file, or only a marker. Each
+/// file arrives under a temporary name and is renamed, so a cell that
+/// reads `to` at the same time never sees half of one.
+pub fn seed_cache(from: &Path, to: &Path, digests: &[String]) {
+    static COPIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    for digest in digests {
+        let (source, dest) = (cache_entry(from, digest), cache_entry(to, digest));
+        std::fs::create_dir_all(&dest).unwrap_or_else(|e| panic!("create {}: {e}", dest.display()));
+        let entries = std::fs::read_dir(&source)
+            .unwrap_or_else(|e| panic!("read the cache entry {}: {e}", source.display()));
+        let mut names: Vec<_> = entries
+            .map(|e| e.expect("cache entry").file_name())
+            .collect();
+        // The markers first: once `file` is there the entry counts as held.
+        names.sort_by_key(|name| name == "file");
+        for name in names {
+            if dest.join(&name).exists() {
+                continue;
+            }
+            let copy = COPIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let staged = dest.join(format!(".seed-{}-{copy}", std::process::id()));
+            std::fs::copy(source.join(&name), &staged)
+                .unwrap_or_else(|e| panic!("copy {}: {e}", source.join(&name).display()));
+            std::fs::rename(&staged, dest.join(&name))
+                .unwrap_or_else(|e| panic!("place {}: {e}", dest.join(&name).display()));
+        }
+    }
+}
+
+/// The sha256 of every committed toy package file, upstream and patched.
+pub fn payload_digests() -> Vec<String> {
+    let mut digests = Vec::new();
+    for kind in ["upstream", "patched"] {
+        let dir = fixtures_root().join("core/payloads").join(kind);
+        for entry in std::fs::read_dir(&dir).expect("read the toy payloads") {
+            let bytes = std::fs::read(entry.expect("payload").path()).expect("read a toy payload");
+            digests.push(sha256_hex(&bytes));
+        }
+    }
+    digests.sort();
+    digests
+}
+
 /// A cell on a toy workspace, with the fixture server that plays the toy
 /// registry and the Socket host.
 pub struct Toy {
@@ -178,19 +374,27 @@ pub struct Toy {
 
 /// Open a cell on `core/<system>/e<major>` with every upstream package
 /// served. `cold` = an empty repository cache, for a twin. `None` = the
-/// test does not run here; the reason is printed and reported.
+/// test does not run here; the reason is printed and reported ([`gate`]
+/// says which reasons fail a required cell).
+///
+/// The cell is returned in the same state on every line: the fixture and
+/// the probe rule copied in and nothing else. No Bazel command has run in
+/// it, so there is no server, no output base, no `MODULE.bazel.lock` and
+/// no convenience link, and the fixture server's log is empty. A cold
+/// cell's repository cache holds no toy package, and nothing at all but
+/// the module archives of a line that does not commit them.
 pub fn open(test: &str, system: System, cold: bool) -> Option<Toy> {
     open_with(test, system, cold, false)
 }
 
 /// [`open`] on an empty repository cache with the proxies of every Bazel
-/// command at a closed port: for a test that claims zero network. Skipped
-/// on a line whose module archives are not committed.
+/// command at a closed port: for a test that claims zero network. Not
+/// applicable on a line whose module archives are not committed.
 pub fn open_offline(test: &str, system: System) -> Option<Toy> {
     open_with(test, system, true, true)
 }
 
-fn open_with(test: &str, system: System, cold: bool, offline: bool) -> Option<Toy> {
+fn open_with(test: &str, system: System, cold: bool, zero_network: bool) -> Option<Toy> {
     let outside = OutsideState::capture();
     let opened = if cold {
         Cell::open_cold(test, Group::Core, Some(system))
@@ -199,64 +403,68 @@ fn open_with(test: &str, system: System, cold: bool, offline: bool) -> Option<To
     };
     let mut cell = opened?;
     let version = cell.bazel.version.clone();
-    let fixture = format!("core/{}/e{}", system.name(), version.major);
-    if !fixtures_root().join(&fixture).is_dir() {
-        probe_report::skip_na(&cell.report, &format!("there is no fixture {fixture}"));
-        return None;
-    }
+    let fixture = fixture_of(&version, system);
+    let registry = fixtures_root().join("registry");
+    let manifest = std::fs::read(registry.join("MANIFEST.json")).expect("read MANIFEST.json");
+    let manifest: serde_json::Value = serde_json::from_slice(&manifest).expect("MANIFEST.json");
+    let present = fixtures_root().join(&fixture).is_dir();
+    let mirror = match gate(&version, system, &manifest, present, zero_network) {
+        Gate::Run(mirror) => mirror,
+        Gate::NotApplicable(why) => {
+            probe_report::skip_na(&cell.report, &why);
+            return None;
+        }
+        Gate::CannotRun(why) => {
+            probe_report::skip(&cell.report, &why);
+            return None;
+        }
+    };
     cell.copy_fixture(&fixture);
     let server = FixtureServer::start();
     for package in [DEP, DEP_WS, INDEXED] {
         server.serve(&package.upstream_url(), package.upstream());
     }
     cell.use_fixture_server(&server);
-    cell.options.closed_proxies |= offline;
+    cell.options.closed_proxies |= zero_network;
 
-    // The committed registry holds the modules of the Bazel versions its
-    // manifest lists, and of no other: a line outside it would fail on the
-    // first module the mirror lacks.
-    let registry = fixtures_root().join("registry");
-    let manifest = std::fs::read(registry.join("MANIFEST.json")).expect("read MANIFEST.json");
-    let manifest: serde_json::Value = serde_json::from_slice(&manifest).expect("MANIFEST.json");
-    let Some(entry) = manifest["versions"].get(&version.text) else {
-        let why = format!(
-            "Bazel {} is not in fixtures/bazel/registry (scripts/bazel-fixture-registry.py add)",
-            version.text
-        );
-        probe_report::skip_na(&cell.report, &why);
-        return None;
-    };
-    match file_url(&registry) {
-        Some(url) => cell.options.registry = Some(url),
-        None => serve_registry(&server, &registry),
-    }
-    let registry_read = if cell.options.registry.is_some() {
-        "file"
+    if mirror == Mirror::NotNeeded {
+        cell.report.detail("registry", "not needed");
+        cell.report.detail("module_archives", "not needed");
     } else {
-        "served"
-    };
-    cell.report.detail("registry", registry_read);
-
-    if entry["distdir"] == true {
-        cell.options.distdir = Some(registry.join("distdir").join(&version.text));
-        cell.report.detail("module_archives", "committed");
-    } else if offline {
-        let why = format!(
-            "the module archives of Bazel {} are not committed",
-            version.text
+        match file_url(&registry) {
+            Some(url) => cell.options.registry = Some(url),
+            None => serve_registry(&server, &registry),
+        }
+        let registry_read = if cell.options.registry.is_some() {
+            "file"
+        } else {
+            "served"
+        };
+        cell.report.detail("registry", registry_read);
+    }
+    match mirror {
+        Mirror::NotNeeded => {}
+        Mirror::Committed => {
+            cell.options.distdir = Some(registry.join("distdir").join(&version.text));
+            cell.report.detail("module_archives", "committed");
+        }
+        Mirror::Cached(digests) => {
+            if !module_archives(&mut cell, &fixture, &digests) {
+                return None;
+            }
+        }
+    }
+    if cold {
+        // Every package a cold cell builds is then a request in the log.
+        let cache = &cell.scratch.repository_cache;
+        let held: Vec<String> = payload_digests()
+            .into_iter()
+            .filter(|digest| cache_entry(cache, digest).exists())
+            .collect();
+        assert!(
+            held.is_empty(),
+            "{test}: a cold cell holds toy packages: {held:?}"
         );
-        probe_report::skip_na(&cell.report, &why);
-        return None;
-    } else if env::offline() && cold {
-        let why = "the offline phase fetches no module archives for an empty repository cache";
-        probe_report::skip_na(&cell.report, why);
-        return None;
-    } else if env::offline() {
-        // The offline phase never leaves the machine: the archives are in
-        // the restored repository cache, or the first build fails on a 404.
-        cell.report.detail("module_archives", "repository cache");
-    } else if !fetch_module_archives(&mut cell) {
-        return None;
     }
     Some(Toy {
         cell,
@@ -295,29 +503,152 @@ fn serve_registry(server: &FixtureServer, registry: &Path) {
     );
 }
 
-/// A line with no committed archives: build the fixture once with the
-/// downloader config off, so Bazel fetches the archives of its own modules
-/// from their hosts into the cell's repository cache (a hit there when a
-/// restored cache holds them). The toy packages come from the committed
-/// payloads through `--distdir`, so the fixture server sees no request.
-/// `false` = an origin was unreachable and the test was skipped.
-fn fetch_module_archives(cell: &mut Cell) -> bool {
+/// One fetch at a time into the shared repository cache: of two cells that
+/// find it without the archives at once, the second waits and then finds
+/// them there.
+static FETCHING: Mutex<()> = Mutex::new(());
+
+/// Give the cell's repository cache the module archives of a line that
+/// does not commit them (`digests`, from the manifest), without running
+/// anything in the cell itself. In order:
+///
+/// 1. The cell's cache already holds them (a warm cell on a restored
+///    [`env::CACHE_ROOT`]): nothing to do.
+/// 2. The shared cache under [`env::CACHE_ROOT`] holds them and the cell's
+///    own is another directory (a cold cell): those entries are copied,
+///    and no other, so the cold cell still holds no package.
+/// 3. Neither does, and this is not the offline phase:
+///    [`fetch_module_archives`] downloads them in a throwaway workspace,
+///    they are copied from its cache into the shared one and the cell's,
+///    and the report says `direct_network`.
+///
+/// Only case 3 leaves the machine. `false` = the test cannot run (the
+/// offline phase without the archives, or an unreachable host): reported
+/// with [`probe_report::skip`], a failure where the cell is required.
+fn module_archives(cell: &mut Cell, fixture: &str, digests: &[String]) -> bool {
+    let own = cell.scratch.repository_cache.clone();
+    let shared = env::var(env::CACHE_ROOT).map(|root| PathBuf::from(root).join("repos"));
+    let mut one_at_a_time = None;
+    // Asked twice where the cache is shared: before waiting for another
+    // cell's fetch, and after it, when that fetch may have filled it.
+    for waited in [false, true] {
+        if cache_lacks(&own, digests).is_empty() {
+            cell.report.detail("module_archives", "repository cache");
+            return true;
+        }
+        if waited || shared.is_none() {
+            break;
+        }
+        one_at_a_time = Some(FETCHING.lock().unwrap_or_else(PoisonError::into_inner));
+    }
+    let warm = |shared: &&PathBuf| cache_lacks(shared, digests).is_empty();
+    if let Some(shared) = shared.as_ref().filter(warm) {
+        seed_cache(shared, &own, digests);
+        cell.report
+            .detail("module_archives", "seeded from the repository cache");
+        return true;
+    }
+    if env::offline() {
+        let why = format!(
+            "the offline phase fetches nothing, and the module archives of Bazel {} are in no \
+             repository cache (restore one under {})",
+            cell.bazel.version.text,
+            env::CACHE_ROOT
+        );
+        probe_report::skip(&cell.report, &why);
+        return false;
+    }
+    let fetched = match fetch_module_archives(cell, fixture, digests) {
+        Ok(fetched) => fetched,
+        Err(why) => {
+            probe_report::skip(&cell.report, &why);
+            return false;
+        }
+    };
+    for cache in shared.iter().chain([&own]) {
+        seed_cache(&fetched.scratch.repository_cache, cache, digests);
+    }
+    // The throwaway root goes before the test's first command.
+    drop(fetched);
+    drop(one_at_a_time);
+    cell.report.direct_network = true;
+    cell.report.detail("module_archives", "fetched");
+    true
+}
+
+/// A second scratch root for one helper build, with the guard a [`Cell`]
+/// has: the server it started is shut down before the root is removed,
+/// also when the build's own assertion fails.
+struct Throwaway<'a> {
+    bazel: &'a Bazel,
+    scratch: Scratch,
+}
+
+impl Drop for Throwaway<'_> {
+    fn drop(&mut self) {
+        if let Err(why) = server::stop_server(self.bazel, &self.scratch) {
+            eprintln!("leaving a Bazel server behind: {why}");
+        }
+    }
+}
+
+/// Download the module archives of the cell's line: one `build //...` of
+/// `fixture` with the downloader config off, in a workspace copy, output
+/// base and (empty) repository cache of its own, so that the test's cell
+/// stays as [`open`] describes it. The toy packages come from the
+/// committed payloads through `--distdir`; they land in the throwaway
+/// cache and stay there. The server is shut down before this returns: the
+/// test still runs one server at a time.
+///
+/// `Err` = a host was unreachable. A cold build that did not fetch every
+/// archive of `digests` means the manifest is out of date, which fails.
+fn fetch_module_archives<'a>(
+    cell: &'a Cell,
+    fixture: &str,
+    digests: &[String],
+) -> Result<Throwaway<'a>, String> {
+    let fetch = Throwaway {
+        bazel: &cell.bazel,
+        scratch: Scratch::cold(),
+    };
+    let scratch = &fetch.scratch;
+    scratch.assert_path_supported(&cell.bazel.version);
+    fs_tree::copy_tree(&fixtures_root().join(fixture), &scratch.workspace);
+    if let Err(why) = workspace::install_probe_rule(&scratch.workspace) {
+        panic!("{}: {why}", cell.test);
+    }
     let direct = Options {
         downloader_config: None,
         closed_proxies: false,
         distdir: Some(fixtures_root().join("core/payloads/upstream")),
         ..cell.options.clone()
     };
-    let run = cell.bazel_with(&direct, "build", &["//..."]);
+    let flags = direct
+        .args(&cell.bazel, scratch)
+        .unwrap_or_else(|why| panic!("{}: {why}", cell.test));
+    let mut build = cell.bazel.command(scratch, "build");
+    build.args(flags).arg("//...");
+    direct.apply_env(&mut build);
+    let run = Run::of(build);
     if run.origin_unreachable() {
-        let why = format!("a module archive host is unreachable:\n{}", run.stderr());
-        probe_report::skip(&cell.report, &why);
-        return false;
+        return Err(format!(
+            "a module archive host is unreachable:\n{}",
+            run.stderr()
+        ));
     }
     assert!(run.ok(), "{}: {}", cell.test, run.dump());
-    cell.report.direct_network = true;
-    cell.report.detail("module_archives", "fetched");
-    true
+    if let Err(why) = server::stop_server(&cell.bazel, scratch) {
+        panic!("{}: {why}", cell.test);
+    }
+    let missing = cache_lacks(&scratch.repository_cache, digests);
+    assert!(
+        missing.is_empty(),
+        "{}: registry/MANIFEST.json lists archives a cold build of {fixture} on Bazel {} did not \
+         fetch: {missing:?} (scripts/bazel-fixture-registry.py add)",
+        cell.test,
+        cell.bazel.version.text
+    );
+    Ok(fetch)
 }
 
 impl Toy {

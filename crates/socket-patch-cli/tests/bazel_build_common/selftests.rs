@@ -382,6 +382,206 @@ fn a_toy_cell_reads_the_committed_registry_and_archives() {
     );
 }
 
+/// Whether a toy test runs in a cell is decided from committed files, and
+/// a cell that is missing something never passes as "not applicable": a
+/// required cell on a Bazel version with no fixture or no registry mirror
+/// fails instead of reporting `skipped` for every test. The manifest here
+/// has the shape of `registry/MANIFEST.json` and its three kinds of line.
+#[test]
+fn a_toy_cell_runs_or_is_not_applicable_or_cannot_run() {
+    use toy::{Gate, Mirror};
+    let manifest = serde_json::json!({ "versions": {
+        "7.7.2": { "distdir": true, "archives": [{ "sha256": "p7" }] },
+        "8.8.2": {
+            "distdir": false,
+            "archives": [{ "sha256": "both" }, { "sha256": "module" }],
+            "workspace_archives": [{ "sha256": "suffix" }, { "sha256": "both" }],
+        },
+        "9.3.2": { "distdir": true, "archives": [{ "sha256": "p9" }] },
+    }});
+    let gate = |v: &str, system, fixture_present, zero_network| {
+        toy::gate(
+            &version(v),
+            system,
+            &manifest,
+            fixture_present,
+            zero_network,
+        )
+    };
+    let digests = |list: &[&str]| -> Vec<String> { list.iter().map(|d| d.to_string()).collect() };
+
+    // A line that commits its archives runs, zero network included.
+    for (v, system) in [
+        ("9.3.2", System::Bzlmod),
+        ("7.7.2", System::Bzlmod),
+        ("7.7.2", System::Workspace),
+        ("7.7.2", System::Hybrid),
+    ] {
+        for zero_network in [false, true] {
+            let run = Gate::Run(Mirror::Committed);
+            assert_eq!(gate(v, system, true, zero_network), run, "{v} {system:?}");
+        }
+    }
+    // A line that does not runs on the archives of its dependency system,
+    // from a repository cache. A hybrid cell reads both files: both lists.
+    for (system, list) in [
+        (System::Bzlmod, &["both", "module"][..]),
+        (System::Workspace, &["both", "suffix"][..]),
+        (System::Hybrid, &["both", "module", "suffix"][..]),
+    ] {
+        let run = Gate::Run(Mirror::Cached(digests(list)));
+        assert_eq!(gate("8.8.2", system, true, false), run, "{system:?}");
+    }
+
+    // Not applicable, also where the cell is required: the line lacks the
+    // dependency system (whatever else is missing), or the test claims
+    // zero network where the archives are not committed.
+    let not_applicable = [
+        gate("9.3.2", System::Workspace, false, false),
+        gate("9.3.2", System::Hybrid, true, false),
+        gate("5.4.1", System::Bzlmod, false, false),
+        gate("8.8.2", System::Bzlmod, true, true),
+    ];
+    for gate in not_applicable {
+        assert!(matches!(gate, Gate::NotApplicable(_)), "{gate:?}");
+        assert_eq!(gate.declined("bazel_core_x", true), Some(Ok(())));
+    }
+
+    // Cannot run: no fixture for the line's major, or no registry mirror
+    // for the version. That fails a required cell.
+    let unmirrored = |v: &str| format!("Bazel {v} is not in fixtures/bazel/registry");
+    let no_fixture = |fixture: &str| format!("there is no fixture {fixture}");
+    let cannot_run = [
+        (
+            gate("7.1.2", System::Bzlmod, true, false),
+            unmirrored("7.1.2"),
+        ),
+        (
+            gate("7.0.2", System::Hybrid, true, false),
+            unmirrored("7.0.2"),
+        ),
+        (
+            gate("7.1.2", System::Bzlmod, true, true),
+            unmirrored("7.1.2"),
+        ),
+        // From Bazel 8 the WORKSPACE suffix fetches archives of its own.
+        (
+            gate("8.4.2", System::Workspace, true, false),
+            unmirrored("8.4.2"),
+        ),
+        (
+            gate("10.0.0rc3", System::Bzlmod, false, false),
+            no_fixture("core/bzlmod/e10"),
+        ),
+        (
+            gate("6.6.0", System::Bzlmod, false, false),
+            no_fixture("core/bzlmod/e6"),
+        ),
+        (
+            gate("6.6.0", System::Workspace, false, false),
+            no_fixture("core/workspace/e6"),
+        ),
+        // A mirror does not make up for a missing fixture.
+        (
+            gate("8.8.2", System::Bzlmod, false, false),
+            no_fixture("core/bzlmod/e8"),
+        ),
+    ];
+    for (gate, why) in cannot_run {
+        assert!(
+            matches!(&gate, Gate::CannotRun(text) if text.contains(&why)),
+            "{gate:?}"
+        );
+        assert_eq!(gate.declined("bazel_core_x", false), Some(Ok(())));
+        let failure = gate.declined("bazel_core_x", true).unwrap().unwrap_err();
+        assert!(
+            failure.contains(env::REQUIRED) && failure.contains(&why),
+            "{failure}"
+        );
+    }
+
+    // By need: with Bzlmod off below Bazel 8 a WORKSPACE cell resolves no
+    // module and fetches no archive, so it runs on a version without a mirror.
+    for v in ["7.0.2", "7.1.2"] {
+        let run = gate(v, System::Workspace, true, false);
+        assert_eq!(run, Gate::Run(Mirror::NotNeeded), "{v}");
+        assert_eq!(run.declined("bazel_core_x", true), None);
+    }
+}
+
+/// A line that does not commit its module archives takes them from a
+/// repository cache: a cell is given the listed entries, whole, and
+/// nothing else the shared cache holds.
+#[test]
+fn a_cell_is_seeded_with_the_listed_cache_entries_and_no_other() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (shared, own) = (tmp.path().join("shared"), tmp.path().join("own"));
+    let entry = |cache: &Path, digest: &str| cache.join("content_addressable/sha256").join(digest);
+    let put = |cache: &Path, digest: &str, bytes: &[u8]| {
+        std::fs::create_dir_all(entry(cache, digest)).unwrap();
+        std::fs::write(entry(cache, digest).join("file"), bytes).unwrap();
+        // Bazel takes a hit only with the marker of the asking repository.
+        std::fs::write(entry(cache, digest).join("id-0123abcd"), b"").unwrap();
+    };
+    let (first, second) = (
+        toy::sha256_hex(b"first archive"),
+        toy::sha256_hex(b"second archive"),
+    );
+    let package = toy::sha256_hex(b"a toy package an earlier test fetched");
+    put(&shared, &first, b"first archive");
+    put(&shared, &second, b"second archive");
+    put(&shared, &package, b"a toy package an earlier test fetched");
+    let listed = vec![first.clone(), second.clone()];
+
+    assert_eq!(toy::cache_lacks(&own, &listed), listed, "an empty cache");
+    assert_eq!(toy::cache_lacks(&shared, &listed), Vec::<String>::new());
+    toy::seed_cache(&shared, &own, &listed);
+    assert_eq!(toy::cache_lacks(&own, &listed), Vec::<String>::new());
+    for digest in &listed {
+        let mut names: Vec<String> = std::fs::read_dir(entry(&own, digest))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            ["file", "id-0123abcd"],
+            "the whole entry, no staging file"
+        );
+    }
+    assert_eq!(
+        std::fs::read(entry(&own, &first).join("file")).unwrap(),
+        b"first archive"
+    );
+    assert!(!entry(&own, &package).exists(), "a package was copied");
+
+    // A marker without its file is no entry; seeding again restores it and
+    // leaves the entry that is there alone, but for a marker it lacks (the
+    // same archive, fetched before under other URLs).
+    std::fs::remove_file(entry(&own, &first).join("file")).unwrap();
+    std::fs::remove_file(entry(&own, &second).join("id-0123abcd")).unwrap();
+    std::fs::write(entry(&own, &second).join("id-other-urls"), b"").unwrap();
+    assert_eq!(
+        toy::cache_lacks(&own, &listed),
+        std::slice::from_ref(&first)
+    );
+    std::fs::write(entry(&own, &second).join("file"), b"kept").unwrap();
+    toy::seed_cache(&shared, &own, &listed);
+    assert_eq!(toy::cache_lacks(&own, &listed), Vec::<String>::new());
+    assert_eq!(
+        std::fs::read(entry(&own, &second).join("file")).unwrap(),
+        b"kept"
+    );
+    for marker in ["id-0123abcd", "id-other-urls"] {
+        assert!(entry(&own, &second).join(marker).is_file(), "{marker}");
+    }
+    // The shared cache is only read.
+    assert_eq!(
+        std::fs::read(entry(&shared, &second).join("file")).unwrap(),
+        b"second archive"
+    );
+}
+
 #[test]
 fn the_offline_phase_points_every_proxy_at_a_closed_port() {
     let mut cmd = std::process::Command::new("tool");

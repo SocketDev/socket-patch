@@ -66,7 +66,7 @@
   "moduleExtensions": {
     "//:toy.bzl%toy": {
       "general": {
-        "bzlTransitiveDigest": "4K1BGnfS6bki9Mwtskm3O3JpmyBRaSP2SE8x75nNMB8=",
+        "bzlTransitiveDigest": "LS+KyIJzZSDkVvtNOuelrluA8cKwqMcYfNq9oaKJhnc=",
         "usagesDigest": "Ef0LScY1FM+Oc8BCXdH93pZw9/DPcP7VooyxgdDhtCY=",
         "recordedFileInputs": {
           "@@//toy.lock.json": "6e2e6b557ced525989b2ff3c1f4ef65fd82a06b40f257a8c49883977ed26f6c8"

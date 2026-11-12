@@ -190,7 +190,7 @@
   "moduleExtensions": {
     "//:toy.bzl%toy": {
       "general": {
-        "bzlTransitiveDigest": "bJa8XxUGTb1pOBxJWfujPwN5O9vUJeVk/Tg7FSA9Ho8=",
+        "bzlTransitiveDigest": "LhyglIg4wIP3uzIF/4yrnJfNrIjaP4yeKlJ7cVPzZIw=",
         "usagesDigest": "4vD8VlmHLiAoPtYmd8UGzvXu+y9FlTSKDNQAiMMT4Lk=",
         "recordedInputs": [
           "REPO_MAPPING:,bazel_tools bazel_tools",
