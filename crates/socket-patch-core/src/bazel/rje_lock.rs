@@ -29,7 +29,7 @@
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use super::java_hash::{hash_repr, Starlark};
+use super::java_hash::{hash_repr, Hashed, Starlark};
 
 /// A half-open byte range of the lock text.
 pub type Span = (usize, usize);
@@ -186,6 +186,38 @@ pub enum Flavor {
     V3Insertion,
 }
 
+impl Flavor {
+    /// Every flavor, in the order of the formats.
+    pub const ALL: [Self; 5] = [
+        Self::V1,
+        Self::V1Legacy,
+        Self::V2,
+        Self::V3Sorted,
+        Self::V3Insertion,
+    ];
+
+    /// The flavor's name where one is written down. The owned index
+    /// records it beside a rewritten lock (`"flavor": "v3-sorted"`), and a
+    /// restore recomputes the hash in the flavor recorded: these spellings
+    /// are a file format, and a released one is never changed.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::V1 => "v1",
+            Self::V1Legacy => "v1-legacy",
+            Self::V2 => "v2",
+            Self::V3Sorted => "v3-sorted",
+            Self::V3Insertion => "v3-insertion",
+        }
+    }
+
+    /// The flavor [`Flavor::as_str`] names. Any other text is `None`, so
+    /// a record with a flavor this reader does not know is refused instead
+    /// of being recomputed in a guessed one.
+    pub fn parse(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|flavor| flavor.as_str() == name)
+    }
+}
+
 /// A content hash: one int in v1 and v2, one per artifact file in v3.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Resolved {
@@ -199,8 +231,10 @@ pub enum Resolved {
 pub enum ReadError {
     /// Not JSON as every Bazel line reads it: `at` is the byte offset.
     Syntax { at: usize, what: &'static str },
-    /// JSON that no rules_jvm_external reader takes for a lock, or a v1
-    /// lock that carries its hash under both keys.
+    /// JSON that no rules_jvm_external reader takes for a lock, or that
+    /// two releases would check as different locks: a v1 lock that
+    /// carries its hash under both keys, a v2 or v3 lock that also holds a
+    /// valid v1 tree.
     UnknownFormat,
 }
 
@@ -213,15 +247,17 @@ pub enum HashError {
     /// No flavor gives the stored value: the lock was edited by hand, or
     /// was written by an algorithm this reader does not know.
     Mismatch,
-    /// A hashed string is non-ASCII where no real build has shown what
-    /// Bazel hashes: written with a `\u` escape, or anywhere in a v1 lock.
-    /// A lane refuses with `non_ascii`.
+    /// A string the hash or its comparison reads is non-ASCII where no
+    /// real build has shown what Bazel makes of it: written with a `\u`
+    /// escape, or anywhere in a v1 lock. A lane refuses with `non_ascii`.
     NonAscii,
     /// `repositories` lists, or `dependencies` has as a key, an artifact
     /// file that `artifacts` does not produce. rules_jvm_external crashes
     /// on such a lock (`key "..." not found in dictionary`).
     Dangling(String),
-    /// A hashed section does not have the shape the algorithm reads.
+    /// A hashed section does not have the shape the algorithm reads, or a
+    /// v3 lock names more artifact files than a stored hash of it could
+    /// list.
     Shape(String),
 }
 
@@ -242,25 +278,51 @@ pub fn read(text: &str) -> Result<RjeLock, ReadError> {
     Ok(RjeLock { format, root })
 }
 
-/// The format, tried in rules_jvm_external's order: v3, v2, then v1.
+/// The format, when every release that reads the file reads the same one.
+///
+/// The releases do not try the formats in one order. From 6.10 it is v3,
+/// v2, then v1. 5.0 - 6.9 try v1 first: they take any file with a valid
+/// `dependency_tree` for a v1 lock, whatever its `version` says, and read
+/// the artifacts and the hash from the tree. A file with a v2 or v3 header
+/// and a valid tree is therefore two locks, and an edit of its sections
+/// would leave the build of a 5.0 - 6.9 workspace on the tree, green and
+/// unpatched. No release writes one, and it has no format here.
 fn format_of(root: &Node) -> Option<Format> {
     let sections = SECTIONS.iter().all(|key| root.get(key).is_some());
-    match root.get("version").and_then(Node::as_str) {
-        Some("3") if sections => return Some(Format::V3),
-        Some("2") if sections => return Some(Format::V2),
-        _ => {}
-    }
-    let tree = root.get("dependency_tree")?;
-    let artifacts = tree.get("dependencies").and_then(Node::items)?;
-    if tree.get("version").and_then(Node::as_str) != Some("0.1.0") || artifacts.is_empty() {
-        return None;
-    }
+    let header = match root.get("version").and_then(Node::as_str) {
+        Some("3") if sections => Some(Format::V3),
+        Some("2") if sections => Some(Format::V2),
+        _ => None,
+    };
+    // The whole of rules_jvm_external's test for a v1 lock: the version,
+    // and `dependencies` that Starlark counts as true.
+    let tree = root.get("dependency_tree").filter(|tree| {
+        let version = tree.get("version").and_then(Node::as_str);
+        version == Some("0.1.0") && tree.get("dependencies").is_some_and(truthy)
+    });
+    let (Some(tree), None) = (tree, header) else {
+        return header.filter(|_| tree.is_none());
+    };
+    // The v1 hash walks `dependencies` as a list of artifacts.
+    tree.get("dependencies").and_then(Node::items)?;
     // No release writes an int banner beside the hash key. One that reads
     // the banner (up to 4.0) and one that reads the key would each check a
     // different value, and an edit could keep only one of them right.
     let banner = tree.get(BANNER_KEY).is_some_and(|n| n.as_i32().is_some());
     let key = tree.get(RESOLVED_HASH_KEY).is_some_and(|n| !n.is_null());
     (!(banner && key)).then_some(Format::V1)
+}
+
+/// Whether Starlark counts the decoded value as true.
+fn truthy(node: &Node) -> bool {
+    match &node.value {
+        Value::Null => false,
+        Value::Bool(value) => *value,
+        Value::Int(digits) => digits != "0",
+        Value::Str(text) => !text.text.is_empty(),
+        Value::Array(items) => !items.is_empty(),
+        Value::Object(members) => !members.is_empty(),
+    }
 }
 
 impl RjeLock {
@@ -290,6 +352,12 @@ impl RjeLock {
     }
 
     /// The content hash rules_jvm_external computes in `flavor`.
+    ///
+    /// The cost is in proportion to the lock's length, whatever the lock
+    /// holds. For v3 that takes one refusal: a lock whose artifact files
+    /// have names longer in sum than the lock itself is
+    /// [`HashError::Shape`]. Its stored hash would have to list every one
+    /// of those names, so it is a lock that cannot verify.
     pub fn resolved(&self, flavor: Flavor) -> Result<Resolved, HashError> {
         match (self.format, flavor) {
             (Format::V1, Flavor::V1) => self.resolved_v1(false),
@@ -306,10 +374,11 @@ impl RjeLock {
     /// The flavors that reproduce the stored hash, in the order of
     /// [`Format::flavors`]; never empty. An error means the lock must not
     /// be edited or attested: this reader cannot say what value the build
-    /// expects. It is [`HashError::Mismatch`] when some flavor could be
-    /// computed, and otherwise why the first one could not.
+    /// expects. It is [`HashError::NonAscii`] when the stored hash itself
+    /// cannot be compared, [`HashError::Mismatch`] when some flavor could
+    /// be computed, and otherwise why the first one could not.
     pub fn reproduced(&self) -> Result<Vec<Flavor>, HashError> {
-        let stored = stored_value(self.stored_hash().ok_or(HashError::NotStored)?);
+        let stored = stored_value(self.stored_hash().ok_or(HashError::NotStored)?)?;
         let mut reproduced = Vec::new();
         let mut error = None;
         for flavor in self.format.flavors() {
@@ -385,15 +454,23 @@ impl RjeLock {
 
     /// v3 (`v3_lock_file.bzl`): one hash per artifact file, over its
     /// version, sha256, repository, dependencies and their hashes.
+    ///
+    /// rules_jvm_external builds each file's dict from parts that many
+    /// files share and prints it whole for every hash, and it looks through
+    /// a dependency list again each time its artifact waits. Done that way,
+    /// a lock of 1 MiB written for it costs gigabytes or minutes. Here an
+    /// artifact's fields are hashed once however many files have them, a
+    /// repository once however many files it lists, and a dependency list
+    /// is read once.
     fn resolved_v3(&self, sorted_repositories: bool) -> Result<Resolved, HashError> {
         let section = |key: &str| {
             let members = self.root.get(key).and_then(Node::members);
             members.ok_or_else(|| shape(format!("`{key}` is not an object")))
         };
         // One entry per artifact file, in the order the lock lists them.
-        let mut keys: Vec<String> = Vec::new();
         let mut infos: Vec<Info<'_>> = Vec::new();
         let mut index: HashMap<String, usize> = HashMap::new();
+        let mut named = 0;
         for artifact in section("artifacts")? {
             let name = hashable(&artifact.key)?;
             let fields = artifact.value.members();
@@ -403,10 +480,14 @@ impl RjeLock {
             let shasums = shasums.and_then(|f| f.value.members());
             let shasums =
                 shasums.ok_or_else(|| shape(format!("artifact `{name}` has no `shasums`")))?;
+            // The artifact's fields but `shasums`, in file order. Every
+            // file of the artifact has them as the first entry of its
+            // dict, so they are printed and hashed here, once.
             let mut standard = Vec::new();
             for field in fields.iter().filter(|f| f.key.text != "shasums") {
                 standard.push((hashable(&field.key)?, starlark(&field.value, false)?));
             }
+            let standard = Hashed::entry(true, "standard", &Starlark::Dict(standard));
             // `g:a` is a jar, so its other files are `g:a:jar:<classifier>`.
             let packaging = if name.matches(':').count() == 1 {
                 ":jar"
@@ -418,9 +499,9 @@ impl RjeLock {
                     "jar" => name.to_string(),
                     classifier => format!("{name}{packaging}:{classifier}"),
                 };
+                let sha = Hashed::entry(false, "sha", &starlark(&shasum.value, false)?);
                 let info = Info {
-                    standard: standard.clone(),
-                    sha: starlark(&shasum.value, false)?,
+                    head: standard.then(sha),
                     repository: None,
                     dependencies: None,
                 };
@@ -429,8 +510,16 @@ impl RjeLock {
                     // the entry and keeps its place, as a dict does.
                     Some(at) => infos[*at] = info,
                     None => {
-                        index.insert(key.clone(), keys.len());
-                        keys.push(key);
+                        // A stored hash names every artifact file, so in a
+                        // lock that can verify the names add up to less
+                        // than the lock. Past that no stored hash matches,
+                        // and one long name under many classifiers stops
+                        // here instead of being written out for each.
+                        named += key.len();
+                        if named > self.root.span.1 {
+                            return Err(shape("the artifact files' names outgrow the lock"));
+                        }
+                        index.insert(key, infos.len());
                         infos.push(info);
                     }
                 }
@@ -438,6 +527,7 @@ impl RjeLock {
         }
         let at = |key: &str| index.get(key).copied();
         let dangling = |key: &str| HashError::Dangling(key.to_string());
+        let text = |text| Starlark::Str(Cow::Borrowed(text));
 
         // An artifact listed under several repositories keeps the last one,
         // so the order they are walked in is the whole flavor.
@@ -446,16 +536,22 @@ impl RjeLock {
             repositories.sort_by(|a, b| a.key.text.cmp(&b.key.text));
         }
         for repository in repositories {
-            let url = hashable(&repository.key)?;
+            let entry = Hashed::entry(false, "repository", &text(hashable(&repository.key)?));
             for key in key_list(&repository.value)? {
-                infos[at(key).ok_or_else(|| dangling(key))?].repository = Some(url);
+                infos[at(key).ok_or_else(|| dangling(key))?].repository = Some(entry);
             }
         }
         for entry in section("dependencies")? {
             let key = hashable(&entry.key)?;
-            let mut dependencies = key_list(&entry.value)?;
-            dependencies.sort_unstable();
-            infos[at(key).ok_or_else(|| dangling(key))?].dependencies = Some(dependencies);
+            let mut names = key_list(&entry.value)?;
+            names.sort_unstable();
+            let info = &mut infos[at(key).ok_or_else(|| dangling(key))?];
+            let list = Starlark::List(names.iter().copied().map(text).collect());
+            info.dependencies = Some(Dependencies {
+                entry: Hashed::entry(false, "dependencies", &list),
+                files: names.iter().map(|name| at(name)).collect(),
+                names,
+            });
         }
 
         // Dependencies are hashed before their dependents. Starlark has no
@@ -464,12 +560,13 @@ impl RjeLock {
         // before any dependency hash is added. The walk is reproduced step
         // for step: which member of a cycle is finished first decides the
         // values.
-        let backup: Vec<i32> = infos
-            .iter()
-            .map(|info| hash_repr(&info.starlark(None)))
-            .collect();
+        let entries: Vec<Hashed> = infos.iter().map(Info::entries).collect();
+        let backup: Vec<i32> = entries.iter().map(|entries| entries.close()).collect();
         let mut hashes: Vec<Option<i32>> = vec![None; infos.len()];
         let mut remaining = vec![true; infos.len()];
+        // Where in its dependencies each artifact looks next for one to
+        // wait for.
+        let mut next = vec![0; infos.len()];
         let (mut first, mut stack) = (0, Vec::new());
         loop {
             let current = match stack.pop() {
@@ -488,66 +585,78 @@ impl RjeLock {
             if hashes[current].is_some() {
                 continue;
             }
-            let dependencies = infos[current].dependencies.as_deref().unwrap_or_default();
-            let mut known = dependencies.iter().filter_map(|d| at(d));
-            let unprocessed = known.find(|at| remaining[*at]);
-            if let Some(dependency) = unprocessed {
+            let dependencies = infos[current].dependencies.as_ref();
+            let files = dependencies.map_or(&[][..], |d| &d.files[..]);
+            // rules_jvm_external waits for the first dependency that is
+            // still remaining, and looks from the start of the list each
+            // time the artifact comes back off the stack. Nothing is ever
+            // put back among the remaining, so that first one is never
+            // before the one found the time before: looking on from there
+            // finds the same dependency and reads the list once.
+            let waits_for = |file: &Option<usize>| file.is_some_and(|at| remaining[at]);
+            next[current] += files[next[current]..]
+                .iter()
+                .take_while(|file| !waits_for(file))
+                .count();
+            if let Some(Some(dependency)) = files.get(next[current]).copied() {
                 stack.extend([current, dependency]);
                 remaining[dependency] = false;
                 continue;
             }
             let mut dependency_hashes: Vec<(&str, Starlark<'_>)> = Vec::new();
-            for dependency in dependencies.iter().copied() {
+            let names = dependencies.map_or(&[][..], |d| &d.names[..]);
+            for (name, file) in names.iter().copied().zip(files) {
                 // The list is sorted and a dict holds a key once.
                 if dependency_hashes
                     .last()
-                    .is_some_and(|(last, _)| *last == dependency)
+                    .is_some_and(|(last, _)| *last == name)
                 {
                     continue;
                 }
                 // A dependency that is not an artifact file counts as 0.
-                let hash = at(dependency).map_or(0, |at| hashes[at].unwrap_or(backup[at]));
-                dependency_hashes.push((dependency, Starlark::int(hash)));
+                let hash = file.map_or(0, |at| hashes[at].unwrap_or(backup[at]));
+                dependency_hashes.push((name, Starlark::int(hash)));
             }
-            hashes[current] = Some(hash_repr(&infos[current].starlark(Some(dependency_hashes))));
+            let dependency_hashes = Starlark::Dict(dependency_hashes);
+            let last = Hashed::entry(false, "dependency_hashes", &dependency_hashes);
+            hashes[current] = Some(entries[current].then(last).close());
         }
-        let members = keys.into_iter().zip(hashes);
-        let members = members.filter_map(|(key, hash)| Some((key, hash?)));
+        let members = index.into_iter();
+        let members = members.filter_map(|(key, at)| Some((key, hashes[at]?)));
         Ok(Resolved::Members(members.collect()))
     }
 }
 
-/// What the v3 hash knows about one artifact file.
+/// What the v3 hash knows about one artifact file: the entries of the dict
+/// rules_jvm_external hashes for it, each already printed and hashed.
 struct Info<'a> {
-    /// The artifact's fields but `shasums`, in file order.
-    standard: Vec<(&'a str, Starlark<'a>)>,
-    sha: Starlark<'a>,
-    repository: Option<&'a str>,
-    /// Sorted.
-    dependencies: Option<Vec<&'a str>>,
+    /// `{"standard": {...}, "sha": ...`: the artifact's fields but
+    /// `shasums`, and this file's checksum.
+    head: Hashed,
+    /// `, "repository": ...`, when a repository lists the file.
+    repository: Option<Hashed>,
+    dependencies: Option<Dependencies<'a>>,
 }
 
-impl<'a> Info<'a> {
-    /// The dict rules_jvm_external hashes, with its keys in the order the
-    /// Starlark sets them. `dependency_hashes` is absent from the hash an
-    /// artifact has while it is still being walked.
-    fn starlark(&self, dependency_hashes: Option<Vec<(&'a str, Starlark<'a>)>>) -> Starlark<'a> {
-        let text = |text: &'a str| Starlark::Str(Cow::Borrowed(text));
-        let mut dict = vec![
-            ("standard", Starlark::Dict(self.standard.clone())),
-            ("sha", self.sha.clone()),
-        ];
-        if let Some(repository) = self.repository {
-            dict.push(("repository", text(repository)));
-        }
-        if let Some(dependencies) = &self.dependencies {
-            let dependencies = dependencies.iter().copied().map(text);
-            dict.push(("dependencies", Starlark::List(dependencies.collect())));
-        }
-        if let Some(dependency_hashes) = dependency_hashes {
-            dict.push(("dependency_hashes", Starlark::Dict(dependency_hashes)));
-        }
-        Starlark::Dict(dict)
+/// The dependencies of an artifact file.
+struct Dependencies<'a> {
+    /// `, "dependencies": [...]`.
+    entry: Hashed,
+    /// Sorted, as rules_jvm_external hashes and walks them.
+    names: Vec<&'a str>,
+    /// For each name, which artifact file it is, if any.
+    files: Vec<Option<usize>>,
+}
+
+impl Info<'_> {
+    /// The dict as it is hashed for an artifact that is still being
+    /// walked, short of its `}`: the entries in the order the Starlark
+    /// sets them, without the `dependency_hashes` that come last.
+    fn entries(&self) -> Hashed {
+        let repository = self.repository.unwrap_or(Hashed::EMPTY);
+        let dependencies = self.dependencies.as_ref();
+        let dependencies = dependencies.map_or(Hashed::EMPTY, |d| d.entry);
+        self.head.then(repository).then(dependencies)
     }
 }
 
@@ -557,15 +666,24 @@ fn shape(what: impl Into<String>) -> HashError {
 
 /// A stored hash as a value to compare with. `None` when it is not an int
 /// or an object of ints that fit 32 bits: no computed hash can equal it.
-fn stored_value(node: &Node) -> Option<Resolved> {
-    match node.members() {
-        None => node.as_i32().map(Resolved::Int),
-        Some(members) => {
-            let int = |m: &Member| Some((m.key.text.clone(), m.value.as_i32()?));
-            let members: Option<BTreeMap<_, _>> = members.iter().map(int).collect();
-            members.map(Resolved::Members)
+///
+/// The build compares the members of a v3 hash by key, so a key is read
+/// as strictly as a hashed string. One written with a `\u` escape of a
+/// non-ASCII character is the artifact file's name on one Bazel line and
+/// another name on the next.
+fn stored_value(node: &Node) -> Result<Option<Resolved>, HashError> {
+    let Some(members) = node.members() else {
+        return Ok(node.as_i32().map(Resolved::Int));
+    };
+    let (mut ints, mut all) = (BTreeMap::new(), true);
+    for member in members {
+        let key = hashable(&member.key)?;
+        match member.value.as_i32() {
+            Some(hash) => drop(ints.insert(key.to_string(), hash)),
+            None => all = false,
         }
     }
+    Ok(all.then_some(Resolved::Members(ints)))
 }
 
 /// A string every Bazel line hashes alike.
@@ -882,14 +1000,6 @@ mod tests {
     use super::*;
     use crate::test_rng::Rng;
 
-    const FLAVORS: [Flavor; 5] = [
-        Flavor::V1,
-        Flavor::V1Legacy,
-        Flavor::V2,
-        Flavor::V3Sorted,
-        Flavor::V3Insertion,
-    ];
-
     fn dir() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/bazel/rje_locks")
     }
@@ -921,15 +1031,11 @@ mod tests {
             Err(ReadError::UnknownFormat) => return "not-a-lock".to_string(),
             Err(error) => return format!("{error:?}"),
         };
-        let name = |flavor: &Flavor| match flavor {
-            Flavor::V1 => "v1",
-            Flavor::V1Legacy => "v1-legacy",
-            Flavor::V2 => "v2",
-            Flavor::V3Sorted => "v3-sorted",
-            Flavor::V3Insertion => "v3-insertion",
-        };
         match lock.reproduced() {
-            Ok(flavors) => flavors.iter().map(name).collect::<Vec<_>>().join("+"),
+            Ok(flavors) => {
+                let names = flavors.into_iter().map(Flavor::as_str);
+                names.collect::<Vec<_>>().join("+")
+            }
             Err(HashError::Mismatch) => "mismatch".to_string(),
             Err(HashError::Dangling(_)) => "dangling".to_string(),
             Err(error) => format!("{error:?}"),
@@ -1226,6 +1332,15 @@ mod tests {
         assert_eq!(at(new.stored_hash()), Some("1091951862"));
         assert_eq!(at(new.input_hash()), Some("-1485740259"));
 
+        // A text banner is no hash: a lock with nothing else has none, and
+        // rules_jvm_external checks nothing.
+        let unsigned = lock(&v1(
+            "\"__AUTOGENERATED_FILE_DO_NOT_MODIFY_THIS_FILE_MANUALLY\": \"THERE_IS_NO_DATA_ONLY_ZUUL\"",
+            r#"{"coord": "g:a:1", "file": null, "dependencies": []}"#,
+        ));
+        assert!(unsigned.stored_hash().is_none());
+        assert_eq!(unsigned.reproduced(), Err(HashError::NotStored));
+
         // A lock with the hash in both places would be checked against one
         // by old releases and the other by new ones.
         let both = v1("\"__RESOLVED_ARTIFACTS_HASH\": 1, \"__AUTOGENERATED_FILE_DO_NOT_MODIFY_THIS_FILE_MANUALLY\": 1", "{\"coord\": \"g:a:1\"}");
@@ -1421,6 +1536,376 @@ mod tests {
         );
     }
 
+    /// What the v3 hash takes from an artifact, where every committed lock
+    /// is silent: each has `version` as its only field beside `shasums`,
+    /// and none spells an artifact file twice.
+    #[test]
+    fn a_v3_artifact_is_hashed_in_file_order_and_a_respelled_file_replaces_the_first() {
+        // `g:a` has `g:a:jar:sources`, and so has the artifact `g:a:jar`.
+        let text = r#"{"version": "3", "__RESOLVED_ARTIFACTS_HASH": <hash>,
+            "artifacts": {
+                "g:a": {"version": "1", "shasums": {"jar": "aa", "sources": "as"}, "exclusions": {"z": [true], "b": null}},
+                "g:c": {"shasums": {"jar": "cc"}, "version": "3"},
+                "g:a:jar": {"shasums": {"sources": "js"}, "version": "2"}
+            },
+            "dependencies": {"g:a:jar:sources": ["g:c"], "g:c": ["g:a:jar:sources"]},
+            "repositories": {"https://r/": ["g:a", "g:a:jar:sources", "g:c"]}}"#;
+        // The fields but `shasums` in the order the file has them, at every
+        // depth: sorted, `exclusions` would come before `version` and `b`
+        // before `z`.
+        let a = hash(
+            r#"{"standard": {"version": "1", "exclusions": {"z": [True], "b": None}}, "sha": "aa", "repository": "https://r/", "dependency_hashes": {}}"#,
+        );
+        // The file takes the fields and the checksum of the artifact that
+        // names it last, and keeps the place of the first: it is walked
+        // before `g:c`, so `g:c` sees it as it is while it waits. Had it
+        // moved behind `g:c`, it would be the one finished first.
+        let sources = r#"{"standard": {"version": "2"}, "sha": "js", "repository": "https://r/", "dependencies": ["g:c"]"#;
+        let waiting = hash(&format!("{sources}}}"));
+        let c = hash(&format!(
+            r#"{{"standard": {{"version": "3"}}, "sha": "cc", "repository": "https://r/", "dependencies": ["g:a:jar:sources"], "dependency_hashes": {{"g:a:jar:sources": {waiting}}}}}"#
+        ));
+        let sources = hash(&format!(
+            r#"{sources}, "dependency_hashes": {{"g:c": {c}}}}}"#
+        ));
+        let expected = [("g:a", a), ("g:a:jar:sources", sources), ("g:c", c)];
+        let expected: BTreeMap<String, i32> = expected
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v))
+            .collect();
+        let unsigned = lock(&text.replace("<hash>", "null"));
+        assert_eq!(
+            unsigned.resolved(Flavor::V3Sorted),
+            Ok(Resolved::Members(expected.clone()))
+        );
+        assert_eq!(unsigned.reproduced(), Err(HashError::NotStored));
+
+        // A stored hash holds an int for every file. The same digits as a
+        // string are another value to Starlark, so the build rejects them.
+        let signed = |c: &str| {
+            let members = format!(r#"{{"g:a": {a}, "g:a:jar:sources": {sources}, "g:c": {c}}}"#);
+            lock(&text.replace("<hash>", &members)).reproduced()
+        };
+        let both = Ok(vec![Flavor::V3Sorted, Flavor::V3Insertion]);
+        assert_eq!(signed(&c.to_string()), both);
+        assert_eq!(signed(&format!("\"{c}\"")), Err(HashError::Mismatch));
+    }
+
+    /// The `sha` was searched for: with it the hash of `g:a` is 0, the
+    /// value a careless reader gives a member it cannot read.
+    #[test]
+    fn a_stored_v3_member_that_is_not_an_int_is_no_hash_not_even_of_zero() {
+        let repr = r#"{"standard": {"version": "1"}, "sha": "0212811795", "repository": "https://r/", "dependency_hashes": {}}"#;
+        assert_eq!(hash(repr), 0);
+        let signed = |members: &str| {
+            let text = format!(
+                r#"{{"version": "3", "__RESOLVED_ARTIFACTS_HASH": {{{members}}},
+                "artifacts": {{"g:a": {{"shasums": {{"jar": "0212811795"}}, "version": "1"}}}},
+                "dependencies": {{}}, "repositories": {{"https://r/": ["g:a"]}}}}"#
+            );
+            lock(&text).reproduced()
+        };
+        assert_eq!(
+            signed(r#""g:a": 0"#),
+            Ok(vec![Flavor::V3Sorted, Flavor::V3Insertion])
+        );
+        for member in ["null", "false", "\"0\"", "\"\"", "[]", "{}", "[0]"] {
+            let members = format!(r#""g:a": {member}"#);
+            assert_eq!(signed(&members), Err(HashError::Mismatch), "{member}");
+        }
+        // Nor is such a member left out of the comparison: the build
+        // compares the stored dict whole, so a member no artifact file
+        // answers to fails it whatever it holds.
+        for extra in ["null", "0"] {
+            let members = format!(r#""g:a": 0, "g:x": {extra}"#);
+            assert_eq!(signed(&members), Err(HashError::Mismatch), "{extra}");
+        }
+        assert_eq!(signed(""), Err(HashError::Mismatch));
+    }
+
+    /// `template` with every marker `<1>` to `<markers>` spelled as a raw
+    /// `é`, but the one `escaped` as `\u00e9`: the same text once decoded.
+    fn spelled(template: &str, markers: usize, escaped: Option<usize>) -> String {
+        (1..=markers).fold(template.to_string(), |text, marker| {
+            let spelling = if Some(marker) == escaped {
+                "\\u00e9"
+            } else {
+                "é"
+            };
+            let marker = format!("<{marker}>");
+            assert_eq!(text.matches(&marker).count(), 1, "{marker}");
+            text.replace(&marker, spelling)
+        })
+    }
+
+    /// The content hash of `lock` as the JSON a lock stores.
+    fn stored(lock: &RjeLock) -> String {
+        match lock.resolved(lock.format.flavors()[0]).expect("a hash") {
+            Resolved::Int(hash) => hash.to_string(),
+            Resolved::Members(members) => {
+                let members = members
+                    .iter()
+                    .map(|(key, hash)| format!("\"{key}\": {hash}"));
+                format!("{{{}}}", members.collect::<Vec<_>>().join(", "))
+            }
+        }
+    }
+
+    /// Bazel through 8.1.0 decodes `\u00e9` to one char and Bazel from
+    /// 8.4.2 to the two bytes of `é`, so a lock that spells one string
+    /// that way has a hash per Bazel line. Each lock below reproduces with
+    /// every `é` written raw, and is refused once any one of them is
+    /// written as the escape, whichever string of the hash it is in.
+    #[test]
+    fn a_non_ascii_escape_is_refused_in_every_string_the_hash_reads() {
+        // 1 an artifact, 2 a checksum, 3 a classifier, 4 - 7 the keys and
+        // values of the other fields, 8 and 9 `dependencies`, 10 and 11
+        // `repositories`.
+        let v3 = r#"{"version": "3", "__RESOLVED_ARTIFACTS_HASH": <hash>,
+            "artifacts": {"g:<1>": {"shasums": {"jar": "<2>", "c<3>": "s"}, "f<4>": "<5>", "n": {"k<6>": ["<7>"]}}},
+            "dependencies": {"g:<8>": ["d:<9>"]},
+            "repositories": {"https://<10>/": ["g:<11>"]}}"#;
+        let v2 = r#"{"version": "2", "__RESOLVED_ARTIFACTS_HASH": <hash>,
+            "artifacts": {"g:<1>": {"shasums": {"jar": "<2>"}, "version": "<3>"}},
+            "dependencies": {"g:<4>": ["d:<5>"]},
+            "repositories": {"https://<6>/": ["g:<7>"]}}"#;
+        for (template, markers) in [(v3, 11), (v2, 7)] {
+            let raw = spelled(template, markers, None);
+            let hash = stored(&lock(&raw.replace("<hash>", "null")));
+            let signed = lock(&raw.replace("<hash>", &hash));
+            let flavors = signed.format.flavors();
+            assert_eq!(signed.reproduced(), Ok(flavors.to_vec()), "{raw}");
+            for marker in 1..=markers {
+                let text = spelled(template, markers, Some(marker)).replace("<hash>", &hash);
+                let escaped = lock(&text);
+                for flavor in flavors {
+                    assert_eq!(
+                        escaped.resolved(*flavor),
+                        Err(HashError::NonAscii),
+                        "{text}"
+                    );
+                }
+                assert_eq!(escaped.reproduced(), Err(HashError::NonAscii), "{text}");
+            }
+        }
+
+        // v1 is refused for any non-ASCII character, however it is spelled,
+        // in each string of a line and by both algorithms.
+        let artifact = r#"{"coord": "g:a:1", "file": "a<1>.jar", "sha256": "aa<2>", "url": "https://x/a<3>.jar", "dependencies": ["g:b:2<4>"]}"#;
+        let spell = |marker: usize, spelling: &str| {
+            (1..=4).fold(artifact.to_string(), |text, at| {
+                let spelling = if at == marker { spelling } else { "" };
+                text.replace(&format!("<{at}>"), spelling)
+            })
+        };
+        let signed = |hash: &str, artifact: &str| {
+            lock(&v1(
+                &format!("\"__RESOLVED_ARTIFACTS_HASH\": {hash}"),
+                artifact,
+            ))
+        };
+        let hash = stored(&signed("null", &spell(0, "")));
+        let both = Ok(vec![Flavor::V1, Flavor::V1Legacy]);
+        assert_eq!(signed(&hash, &spell(0, "")).reproduced(), both);
+        for marker in 1..=4 {
+            for spelling in ["é", "\\u00e9"] {
+                let artifact = spell(marker, spelling);
+                let lock = signed(&hash, &artifact);
+                for flavor in [Flavor::V1, Flavor::V1Legacy] {
+                    assert_eq!(
+                        lock.resolved(flavor),
+                        Err(HashError::NonAscii),
+                        "{artifact}"
+                    );
+                }
+                assert_eq!(lock.reproduced(), Err(HashError::NonAscii), "{artifact}");
+            }
+        }
+    }
+
+    /// The build compares a stored v3 hash with the computed one as dicts,
+    /// key by key. Bazel through 8.1.0 decodes the stored key `g:\u00e9`
+    /// to one char while the artifact `g:é` is two, the keys differ and
+    /// the lock has an `invalid signature`; from 8.4.2 they are equal.
+    #[test]
+    fn an_escaped_key_of_a_stored_v3_hash_is_refused() {
+        let repr = r#"{"standard": {"version": "1"}, "sha": "aa", "repository": "https://r/", "dependency_hashes": {}}"#;
+        assert_eq!(hash(repr), -818_141_122);
+        let signed = |members: &str| {
+            let text = format!(
+                r#"{{"version":"3","__RESOLVED_ARTIFACTS_HASH":{{{members}}},"artifacts":{{"g:é":{{"shasums":{{"jar":"aa"}},"version":"1"}}}},"dependencies":{{}},"repositories":{{"https://r/":["g:é"]}}}}"#
+            );
+            lock(&text).reproduced()
+        };
+        let both = Ok(vec![Flavor::V3Sorted, Flavor::V3Insertion]);
+        assert_eq!(signed(r#""g:é": -818141122"#), both);
+        assert_eq!(
+            signed(r#""g:\u00e9": -818141122"#),
+            Err(HashError::NonAscii)
+        );
+        // An escape of an ASCII character is that character on every line.
+        assert_eq!(signed(r#""\u0067:é": -818141122"#), both);
+        // The key is refused whatever the member holds, and whichever
+        // member it is.
+        for members in [
+            r#""g:\u00e9": 1"#,
+            r#""g:\u00e9": null"#,
+            r#""g:é": -818141122, "g:\u00e8": 0"#,
+        ] {
+            assert_eq!(signed(members), Err(HashError::NonAscii), "{members}");
+        }
+    }
+
+    /// rules_jvm_external builds the dict of every artifact file from
+    /// parts it shares: the files of an artifact have its fields, the
+    /// files of a repository its URL. Each part is hashed once here. A
+    /// reader that copies or prints the fields for each file needs
+    /// classifiers times field size for this lock, 4,000 times 150,000
+    /// list items: tens of gigabytes, from a file under 1 MiB.
+    #[test]
+    fn what_artifact_files_share_is_hashed_once() {
+        let (classifiers, items) = (4_000, 150_000);
+        // The JSON of a list of ints is also its `repr`.
+        let field = format!("[{}0]", "0, ".repeat(items - 1));
+        let url = format!("https://r/{}/", "é".repeat(100_000));
+        let shasums = (0..classifiers).map(|n| format!("\"c{n}\": \"s{n}\""));
+        let files = (0..classifiers).map(|n| format!("\"g:a:jar:c{n}\""));
+        let text = format!(
+            r#"{{"version": "3",
+            "artifacts": {{"g:a": {{"big": {field}, "shasums": {{{}}}, "version": "1"}}}},
+            "dependencies": {{}},
+            "repositories": {{"{url}": [{}]}}}}"#,
+            shasums.collect::<Vec<_>>().join(", "),
+            files.collect::<Vec<_>>().join(", "),
+        );
+        assert!(text.len() < 1 << 20);
+        let lock = lock(&text);
+        let Ok(Resolved::Members(members)) = lock.resolved(Flavor::V3Sorted) else {
+            panic!("a v3 hash is one int per artifact file");
+        };
+        assert_eq!(members.len(), classifiers);
+        let repr = format!(
+            r#"{{"standard": {{"big": {field}, "version": "1"}}, "sha": "s1234", "repository": "{url}", "dependency_hashes": {{}}}}"#
+        );
+        assert_eq!(members["g:a:jar:c1234"], hash(&repr));
+        assert_eq!(
+            lock.resolved(Flavor::V3Insertion),
+            Ok(Resolved::Members(members))
+        );
+    }
+
+    /// One artifact that depends on thousands. rules_jvm_external looks
+    /// through the whole list each time the artifact comes back off the
+    /// stack; the reader looks on from where it was, and must wait for the
+    /// same dependencies in the same order. Every third dependency depends
+    /// back, so it is finished while `g:a0` waits and sees the hash `g:a0`
+    /// has then. `g:0` is no artifact: it sorts first, is not waited for
+    /// and does not end the waiting.
+    #[test]
+    fn an_artifact_with_thousands_of_dependencies_is_walked_as_rules_jvm_external_walks_it() {
+        let count = 3_000;
+        let artifacts = (0..count)
+            .map(|n| format!(r#""g:a{n}": {{"shasums": {{"jar": "s{n}"}}, "version": "1"}}"#));
+        let names: Vec<String> = (0..count).map(|n| format!("\"g:a{n}\"")).collect();
+        let back = (1..count).filter(|n| n % 3 == 0);
+        let back = back.map(|n| format!(r#", "g:a{n}": ["g:a0"]"#));
+        let text = format!(
+            r#"{{"version": "3",
+            "artifacts": {{{}}},
+            "dependencies": {{"g:a0": [{}, "g:0"]{}}},
+            "repositories": {{"https://r/": [{}]}}}}"#,
+            artifacts.collect::<Vec<_>>().join(", "),
+            names[1..].join(", "),
+            back.collect::<String>(),
+            names.join(", "),
+        );
+        let Ok(Resolved::Members(members)) = lock(&text).resolved(Flavor::V3Sorted) else {
+            panic!("a v3 hash is one int per artifact file");
+        };
+        assert_eq!(members.len(), count);
+
+        // The dependencies are hashed sorted as text: `g:a10` before `g:a2`.
+        let mut sorted = names[1..].to_vec();
+        sorted.push("\"g:0\"".to_string());
+        sorted.sort_unstable();
+        assert_eq!(sorted[..3], ["\"g:0\"", "\"g:a1\"", "\"g:a10\""]);
+        let head = |n: usize| {
+            format!(
+                r#"{{"standard": {{"version": "1"}}, "sha": "s{n}", "repository": "https://r/""#
+            )
+        };
+        let first = format!(r#"{}, "dependencies": [{}]"#, head(0), sorted.join(", "));
+        let waiting = hash(&format!("{first}}}"));
+        let dependency = |n: usize| {
+            let head = head(n);
+            if n % 3 == 0 {
+                hash(&format!(
+                    r#"{head}, "dependencies": ["g:a0"], "dependency_hashes": {{"g:a0": {waiting}}}}}"#
+                ))
+            } else {
+                hash(&format!(r#"{head}, "dependency_hashes": {{}}}}"#))
+            }
+        };
+        assert_eq!(members["g:a1"], dependency(1));
+        assert_eq!(members["g:a2997"], dependency(2997));
+        assert_eq!(members["g:a2999"], dependency(2999));
+        let hashes = sorted.iter().map(|name| {
+            let n = name.trim_matches('"').strip_prefix("g:a");
+            let hash = n.map_or(0, |n| dependency(n.parse().expect("a number")));
+            format!("{name}: {hash}")
+        });
+        let hashes = hashes.collect::<Vec<_>>().join(", ");
+        assert_eq!(
+            members["g:a0"],
+            hash(&format!(r#"{first}, "dependency_hashes": {{{hashes}}}}}"#))
+        );
+    }
+
+    /// A stored hash lists every artifact file by name, so the names of a
+    /// lock that can verify are shorter than the lock. One long artifact
+    /// name under many classifiers makes names that add up to far more,
+    /// and is refused before they are written out.
+    #[test]
+    fn artifact_files_named_with_more_bytes_than_the_lock_has_are_refused() {
+        let v3 = |name: &str, classifiers: usize, stored: &str| {
+            let shasums = (0..classifiers).map(|n| format!("\"c{n}\": \"s{n}\""));
+            format!(
+                r#"{{"version": "3", {stored}"artifacts": {{"{name}": {{"shasums": {{{}}}}}}}, "dependencies": {{}}, "repositories": {{}}}}"#,
+                shasums.collect::<Vec<_>>().join(", ")
+            )
+        };
+        // The bound is the lock's own length, so it never refuses a lock
+        // that stores its hash: three names of 307 bytes outgrow a lock of
+        // 400, and fit one that lists them.
+        let name = format!("g:{}", "a".repeat(300));
+        let unsigned = lock(&v3(&name, 3, ""));
+        assert!(matches!(
+            unsigned.resolved(Flavor::V3Sorted),
+            Err(HashError::Shape(_))
+        ));
+        let members = (0..3).map(|n| {
+            let repr = format!(r#"{{"standard": {{}}, "sha": "s{n}", "dependency_hashes": {{}}}}"#);
+            format!("\"{name}:jar:c{n}\": {}", hash(&repr))
+        });
+        let members = members.collect::<Vec<_>>().join(", ");
+        let stored = format!("\"__RESOLVED_ARTIFACTS_HASH\": {{{members}}}, ");
+        assert_eq!(
+            lock(&v3(&name, 3, &stored)).reproduced(),
+            Ok(vec![Flavor::V3Sorted, Flavor::V3Insertion])
+        );
+
+        // What the bound stops: 4,000 names of 200 kB are 800 MB, from a
+        // lock of 270 kB.
+        let name = format!("g:{}", "a".repeat(200_000));
+        let text = v3(&name, 4_000, "\"__RESOLVED_ARTIFACTS_HASH\": {}, ");
+        assert!(text.len() < 300_000);
+        let hostile = lock(&text);
+        for flavor in [Flavor::V3Sorted, Flavor::V3Insertion] {
+            assert!(matches!(hostile.resolved(flavor), Err(HashError::Shape(_))));
+        }
+        assert!(matches!(hostile.reproduced(), Err(HashError::Shape(_))));
+    }
+
     #[test]
     fn the_reader_refuses_what_bazel_lines_read_differently() {
         let syntax = |text: &str| match parse(text) {
@@ -1488,10 +1973,104 @@ mod tests {
         ] {
             assert_eq!(read(text), Err(ReadError::UnknownFormat), "{text}");
         }
-        // rules_jvm_external tries v3 first, so a v3 lock that also has a
-        // tree is v3.
-        let both = r#"{"version": "3", "artifacts": {}, "dependencies": {}, "repositories": {}, "dependency_tree": {"version": "0.1.0", "dependencies": [{}]}}"#;
-        assert_eq!(read(both).map(|lock| lock.format), Ok(Format::V3));
+    }
+
+    /// rules_jvm_external 5.0 - 6.9 take a file with a valid
+    /// `dependency_tree` for a v1 lock before they look at `version`
+    /// (`coursier.bzl` of 6.9: `v1_lock_file.is_valid_lock_file` first);
+    /// from 6.10 the order is v3, v2, v1. A file that is both would be
+    /// verified and rewritten here in its sections while a 5.0 - 6.9 build
+    /// went on reading the tree.
+    #[test]
+    fn a_header_beside_a_valid_tree_is_two_locks_and_has_no_format() {
+        let empty = hash(r#"{"artifacts": {}, "dependencies": {}, "repositories": {}}"#);
+        assert_eq!(empty, -850_360_666);
+        let with = |version: &str, hash: &str, tree: &str| {
+            let text = format!(
+                r#"{{"version": "{version}", "__RESOLVED_ARTIFACTS_HASH": {hash}, "artifacts": {{}}, "dependencies": {{}}, "repositories": {{}}{tree}}}"#
+            );
+            read(&text).map(|lock| (lock.format, lock.reproduced()))
+        };
+        let headers = [
+            ("2", empty.to_string(), Format::V2),
+            ("3", "{}".to_string(), Format::V3),
+        ];
+        for (version, hash, format) in headers {
+            let alone = Ok((format, Ok(format.flavors().to_vec())));
+            assert_eq!(with(version, &hash, ""), alone);
+            // A tree a 5.0 - 6.9 release would read, and one it would take
+            // and then crash on: its test is the version and a
+            // `dependencies` that Starlark counts as true.
+            for dependencies in [
+                r#"[{"coord": "g:a:1", "file": null, "dependencies": []}]"#,
+                "[{}]",
+                r#"{"a": 1}"#,
+                "\"x\"",
+                "1",
+                "true",
+            ] {
+                let tree = format!(
+                    r#", "dependency_tree": {{"version": "0.1.0", "__RESOLVED_ARTIFACTS_HASH": 1, "dependencies": {dependencies}}}"#
+                );
+                assert_eq!(
+                    with(version, &hash, &tree),
+                    Err(ReadError::UnknownFormat),
+                    "{version} {tree}"
+                );
+            }
+            // A tree no release takes for a lock leaves the header to say
+            // what the file is.
+            for tree in [
+                r#"{"version": "0.2.0", "dependencies": [{}]}"#,
+                r#"{"dependencies": [{}]}"#,
+                r#"{"version": "0.1.0"}"#,
+                r#"{"version": "0.1.0", "dependencies": []}"#,
+                r#"{"version": "0.1.0", "dependencies": null}"#,
+                r#"{"version": "0.1.0", "dependencies": {}}"#,
+                r#"{"version": "0.1.0", "dependencies": ""}"#,
+                r#"{"version": "0.1.0", "dependencies": 0}"#,
+                r#"{"version": "0.1.0", "dependencies": false}"#,
+                "{}",
+                "null",
+            ] {
+                let tree = format!(r#", "dependency_tree": {tree}"#);
+                assert_eq!(with(version, &hash, &tree), alone, "{version} {tree}");
+            }
+        }
+    }
+
+    /// The names are written into the owned index beside a rewritten lock
+    /// and read back to restore it, so each is pinned letter for letter.
+    #[test]
+    fn a_flavor_keeps_its_name() {
+        assert_eq!(
+            Flavor::ALL.map(Flavor::as_str),
+            ["v1", "v1-legacy", "v2", "v3-sorted", "v3-insertion"]
+        );
+        for flavor in Flavor::ALL {
+            assert_eq!(Flavor::parse(flavor.as_str()), Some(flavor));
+        }
+        // `ALL` is every flavor some format has.
+        let formats = [Format::V1, Format::V2, Format::V3];
+        let flavors: Vec<Flavor> = formats
+            .iter()
+            .flat_map(|format| format.flavors().iter().copied())
+            .collect();
+        assert_eq!(flavors, Flavor::ALL);
+        // Nothing else is a flavor: not another case, not a near miss.
+        for name in [
+            "",
+            "v3",
+            "V3-sorted",
+            "v3_sorted",
+            "v3-sorted ",
+            " v2",
+            "v1-Legacy",
+            "V3Sorted",
+            "v3-sorted+v3-insertion",
+        ] {
+            assert_eq!(Flavor::parse(name), None, "{name:?}");
+        }
     }
 
     /// A reader of committed files meets half-written and hand-damaged
@@ -1510,7 +2089,7 @@ mod tests {
                 return 0;
             };
             let _ = (lock.stored_hash(), lock.input_hash(), lock.reproduced());
-            for flavor in FLAVORS {
+            for flavor in Flavor::ALL {
                 let _ = lock.resolved(flavor);
             }
             1

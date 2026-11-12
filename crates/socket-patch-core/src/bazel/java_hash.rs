@@ -63,56 +63,138 @@ pub fn repr(value: &Starlark<'_>) -> String {
     out
 }
 
-/// Starlark `hash(repr(value))`.
+/// Starlark `hash(repr(value))`. The text is hashed as it is printed and
+/// never held, so a large value costs no memory.
 pub fn hash_repr(value: &Starlark<'_>) -> i32 {
-    hash_bytes(repr(value).as_bytes())
+    let mut out = Hashed::EMPTY;
+    write_repr(value, &mut out);
+    out.hash
 }
 
-fn write_repr(value: &Starlark<'_>, out: &mut String) {
-    match value {
-        Starlark::None => out.push_str("None"),
-        Starlark::Bool(true) => out.push_str("True"),
-        Starlark::Bool(false) => out.push_str("False"),
-        Starlark::Int(digits) => out.push_str(digits),
-        Starlark::Str(text) => write_quoted(text, out),
-        Starlark::List(items) => {
-            out.push('[');
-            for (at, item) in items.iter().enumerate() {
-                out.push_str(if at == 0 { "" } else { ", " });
-                write_repr(item, out);
-            }
-            out.push(']');
-        }
-        Starlark::Dict(entries) => {
-            out.push('{');
-            for (at, (key, item)) in entries.iter().enumerate() {
-                out.push_str(if at == 0 { "" } else { ", " });
-                write_quoted(key, out);
-                out.push_str(": ");
-                write_repr(item, out);
-            }
-            out.push('}');
+/// A piece of text as far as `String.hashCode` knows it: enough to hash
+/// the text that pieces make when joined, without holding any of them.
+///
+/// `hashCode` is a polynomial in 31, so for texts `a` and `b`,
+/// `hash(a + b) = hash(a) * 31^len(b) + hash(b)`, wrapping at 32 bits. A
+/// ruleset that hashes many dicts with a shared entry prints that entry
+/// each time; a caller here hashes it once with [`Hashed::entry`] and
+/// joins it to each dict with [`Hashed::then`] in constant time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Hashed {
+    /// [`hash_bytes`] of the piece.
+    hash: i32,
+    /// 31 to the power of the piece's length in bytes, wrapping like the
+    /// hash: what a text before the piece is multiplied by.
+    scale: i32,
+}
+
+impl Hashed {
+    /// The empty text.
+    pub const EMPTY: Self = Self { hash: 0, scale: 1 };
+
+    /// One entry of a dict's `repr` with what comes before it:
+    /// `{"key": value` for the dict's first entry, `, "key": value` for a
+    /// later one. The entries of a dict joined in order and closed with
+    /// [`Hashed::close`] are the `repr` of the dict.
+    pub fn entry(first: bool, key: &str, value: &Starlark<'_>) -> Self {
+        let mut out = Self::EMPTY;
+        write_entry(first, key, value, &mut out);
+        out
+    }
+
+    /// The piece followed by `next`.
+    #[must_use]
+    pub fn then(self, next: Self) -> Self {
+        Self {
+            hash: self.hash.wrapping_mul(next.scale).wrapping_add(next.hash),
+            scale: self.scale.wrapping_mul(next.scale),
         }
     }
+
+    /// Starlark `hash(repr(dict))` of the dict whose entries, at least
+    /// one, are this piece.
+    pub fn close(mut self) -> i32 {
+        self.put("}");
+        self.hash
+    }
+}
+
+/// Where `repr` is written: a `String` keeps the text, a [`Hashed`] only
+/// its hash.
+trait Sink {
+    fn put(&mut self, text: &str);
+}
+
+impl Sink for String {
+    fn put(&mut self, text: &str) {
+        self.push_str(text);
+    }
+}
+
+impl Sink for Hashed {
+    fn put(&mut self, text: &str) {
+        for byte in text.bytes() {
+            self.hash = self.hash.wrapping_mul(31).wrapping_add(i32::from(byte));
+            self.scale = self.scale.wrapping_mul(31);
+        }
+    }
+}
+
+fn write_repr(value: &Starlark<'_>, out: &mut impl Sink) {
+    match value {
+        Starlark::None => out.put("None"),
+        Starlark::Bool(true) => out.put("True"),
+        Starlark::Bool(false) => out.put("False"),
+        Starlark::Int(digits) => out.put(digits),
+        Starlark::Str(text) => write_quoted(text, out),
+        Starlark::List(items) => {
+            out.put("[");
+            for (at, item) in items.iter().enumerate() {
+                out.put(if at == 0 { "" } else { ", " });
+                write_repr(item, out);
+            }
+            out.put("]");
+        }
+        Starlark::Dict(entries) => {
+            for (at, (key, item)) in entries.iter().enumerate() {
+                write_entry(at == 0, key, item, out);
+            }
+            out.put(if entries.is_empty() { "{}" } else { "}" });
+        }
+    }
+}
+
+/// One entry of a dict, with the `{` or `, ` that comes before it.
+fn write_entry(first: bool, key: &str, value: &Starlark<'_>, out: &mut impl Sink) {
+    out.put(if first { "{" } else { ", " });
+    write_quoted(key, out);
+    out.put(": ");
+    write_repr(value, out);
 }
 
 /// A string as `Printer.appendQuoted` writes it. Only `"`, `\` and the
 /// control characters below 0x20 are escaped; DEL and every byte of a
 /// non-ASCII character pass through, which keeps the byte model exact.
-fn write_quoted(text: &str, out: &mut String) {
-    out.push('"');
-    for c in text.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if c < ' ' => out.push_str(&format!("\\x{:02x}", u32::from(c))),
-            c => out.push(c),
+fn write_quoted(text: &str, out: &mut impl Sink) {
+    out.put("\"");
+    // Every escaped character is one ASCII byte, so the text between two
+    // of them is whole characters.
+    let mut rest = text;
+    while let Some(at) = rest.find(|c: char| matches!(c, '"' | '\\') || c < ' ') {
+        let (plain, escaped) = rest.split_at(at);
+        out.put(plain);
+        match escaped.as_bytes()[0] {
+            b'"' => out.put("\\\""),
+            b'\\' => out.put("\\\\"),
+            b'\n' => out.put("\\n"),
+            b'\r' => out.put("\\r"),
+            b'\t' => out.put("\\t"),
+            control => out.put(&format!("\\x{control:02x}")),
         }
+        rest = &escaped[1..];
     }
-    out.push('"');
+    out.put(rest);
+    out.put("\"");
 }
 
 #[cfg(test)]
@@ -191,7 +273,53 @@ mod tests {
         ];
         for (value, expected) in cases {
             assert_eq!(repr(&value), expected);
+            // The hash is taken as the text is printed, with no text kept.
+            assert_eq!(hash_repr(&value), hash_bytes(expected.as_bytes()));
         }
+    }
+
+    /// The entries of a dict, each hashed alone and then joined, hash as
+    /// the dict printed whole. The pieces are long enough for `31^len` to
+    /// wrap many times over, and one holds bytes above 0x7F.
+    #[test]
+    fn dict_entries_hashed_apart_join_to_the_hash_of_the_dict() {
+        let entries = [
+            (
+                "standard",
+                Starlark::Dict(vec![
+                    ("version", text("1.7.36-socket.0b5e1c1e")),
+                    (
+                        "exclusions",
+                        Starlark::List(vec![text("a\"b"), Starlark::None]),
+                    ),
+                ]),
+            ),
+            (
+                "sha",
+                text("489b51c35e393dbd4861a2e8155883f0defdf9243ea0e9e3d82f25caf0878cf5"),
+            ),
+            ("repository", text("https://répo.example.invalid/mäven2/")),
+            ("dependencies", Starlark::List(vec![])),
+            (
+                "dependency_hashes",
+                Starlark::Dict(vec![("g:a", Starlark::int(i32::MIN))]),
+            ),
+        ];
+        for count in 1..=entries.len() {
+            let dict = Starlark::Dict(entries[..count].to_vec());
+            let pieces = entries[..count].iter().enumerate();
+            let pieces = pieces.map(|(at, (key, value))| Hashed::entry(at == 0, key, value));
+            let joined = pieces.fold(Hashed::EMPTY, Hashed::then);
+            assert_eq!(joined.close(), hash_repr(&dict), "{count} entries");
+            assert_eq!(joined.close(), hash_bytes(repr(&dict).as_bytes()));
+        }
+        // Joining is associative, so a shared run of entries can be joined
+        // once and reused.
+        let [a, b, c] = [0, 1, 2].map(|at| Hashed::entry(at == 0, entries[at].0, &entries[at].1));
+        assert_eq!(a.then(b).then(c), a.then(b.then(c)));
+        assert_eq!(a.then(Hashed::EMPTY), a);
+        assert_eq!(Hashed::EMPTY.then(a), a);
+        assert_ne!(a.then(b), b.then(a));
     }
 
     /// rules_jvm_external 7.2 on Bazel 8.8.2 wrote `"repositories":

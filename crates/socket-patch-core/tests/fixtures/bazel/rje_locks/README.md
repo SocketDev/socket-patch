@@ -63,7 +63,9 @@ The `hosted-*` and `m4*` locks name a fixture server on `127.0.0.1` with made-up
 
 One row per lock: path, format, verdict, source. The verdict is the list of hash flavors that
 reproduce the stored value (`v1`, `v1-legacy`, `v2`, `v3-sorted`, `v3-insertion`, joined with
-`+`), or `mismatch`, `dangling` or `not-a-lock`. It was written from the probe group's own
+`+`), or `mismatch`, `dangling` or `not-a-lock`. The flavor names are the ones
+`rje_lock::Flavor::as_str` gives, which are also what the owned index stores beside a
+rewritten lock: the test reads them from there. The table was written from the probe group's own
 Python port of the algorithms (its `MANIFEST.json`, bytes model), not from the Rust reader, so
 the test compares two independent ports with each other and with the stored values.
 
