@@ -114,6 +114,16 @@ pub fn legacy_files_key(package: &Table) -> Option<String> {
     Some(format!("{name}{suffix} {version}"))
 }
 
+/// The package a `[metadata.files]` key is for: [`legacy_files_key`] read
+/// back (`<name> <version>`, or `<name>[<extras>] <version>` for a unit with
+/// extras). A key that is a bare name, as Poetry's are, is its own answer.
+pub fn files_key_package(key: &str) -> &str {
+    let unit = key.split_whitespace().next().unwrap_or_default();
+    unit.strip_suffix(']')
+        .and_then(|open| open.split_once('['))
+        .map_or(unit, |(name, _)| name)
+}
+
 pub fn files_for<'a>(lock: &'a Table, package: &'a Table) -> Option<&'a Array> {
     package.get("files").and_then(Item::as_array).or_else(|| {
         lock.get("metadata")?
@@ -497,7 +507,20 @@ pub(crate) mod tests {
     const WHEEL: &str = "urllib3-1.26.18-py2.py3-none-any.whl";
     const PATH: &str = "./.socket/vendor/pypi/e828efa5-5c6d-43f3-9909-03f5ac232b98/urllib3-1.26.18-py2.py3-none-any.whl";
 
-    fn fixture(name: &str) -> String {
+    /// The native locks the rewriter takes (tests/fixtures/pdm-native).
+    pub(crate) const REWRITABLE: [&str; 9] = [
+        "0.12.3",
+        "2.8.2",
+        "2.9.3",
+        "2.10.4",
+        "2.11.2",
+        "2.17.3",
+        "2.29.2",
+        "0.12.3-extras",
+        "2.29.2-extras",
+    ];
+
+    pub(crate) fn fixture(name: &str) -> String {
         std::fs::read_to_string(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("tests/fixtures/pdm-native")
@@ -508,17 +531,7 @@ pub(crate) mod tests {
 
     #[test]
     fn native_formats_rewrite_and_reverse_byte_exactly() {
-        for version in [
-            "0.12.3",
-            "2.8.2",
-            "2.9.3",
-            "2.10.4",
-            "2.11.2",
-            "2.17.3",
-            "2.29.2",
-            "0.12.3-extras",
-            "2.29.2-extras",
-        ] {
+        for version in REWRITABLE {
             for ending in ["\n", "\r\n"] {
                 let original = fixture(version).replace('\n', ending);
                 for (kind, source) in [("path", PATH), ("path", &PATH.replace('/', "\\")), ("url", "https://patch.socket.dev/patch/pypi/urllib3/1.26.18/7e52b8b6-53f2-4dc8-860a-1ae7ebd8be0e/e828efa5-5c6d-43f3-9909-03f5ac232b98/urllib3-1.26.18-py2.py3-none-any.whl")] {
@@ -542,6 +555,36 @@ pub(crate) mod tests {
                     if ending == "\r\n" { assert!(!rewritten.replace("\r\n", "").contains('\n')); }
                 }
             }
+        }
+    }
+
+    /// The key the writer builds for a unit reads back as the unit's
+    /// package, with extras or without: the revert's confinement check
+    /// depends on it.
+    #[test]
+    fn files_key_package_reads_back_every_legacy_key() {
+        for version in ["0.12.3", "0.12.3-extras"] {
+            let lock: DocumentMut = fixture(version).parse().unwrap();
+            let packages = lock["package"].as_array_of_tables().unwrap();
+            assert!(!packages.is_empty(), "{version}");
+            for package in packages {
+                let key = legacy_files_key(package).unwrap();
+                assert!(lock["metadata"]["files"].get(&key).is_some(), "{key}");
+                assert_eq!(
+                    files_key_package(&key),
+                    pdm_files_key_name(package["name"].as_str().unwrap()),
+                    "{key}"
+                );
+            }
+        }
+        for (key, package) in [
+            ("six", "six"),
+            ("zope.interface 5.0", "zope.interface"),
+            ("urllib3[brotli,socks] 1.26.18", "urllib3"),
+            ("odd] 1.0", "odd]"),
+            ("", ""),
+        ] {
+            assert_eq!(files_key_package(key), package, "{key:?}");
         }
     }
 
