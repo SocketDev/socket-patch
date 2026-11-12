@@ -106,8 +106,13 @@ fn install(decl: &Decl<'_>, symbol: &str, load_repo: Option<String>) -> Hub {
 /// The hubs, signals and gaps of this ruleset in `input`.
 pub fn recognize(input: &RecognizeInput<'_>) -> Recognized {
     let mut out = Recognized::default();
+    // The rules are no repository rules a `MODULE.bazel` can bind; a call
+    // of one through `use_repo_rule` is still no hub this reader resolved.
+    if let Some(module) = input.module {
+        WORKSPACE.module_rule_gaps(module, &mut out.gaps);
+    }
     for model in input.workspace_files {
-        for site in WORKSPACE.hub_sites(model, &mut out.gaps) {
+        for site in WORKSPACE.hub_sites(model, input.files, &mut out.gaps) {
             let hub = install(&site.decl, site.symbol, site.load_repo.clone());
             out.gaps.extend(site.decl.gap(site.symbol));
             out.hubs.push(hub);
@@ -236,6 +241,41 @@ mod tests {
             assert!(gap.detail.contains(unread), "{attrs}: {}", gap.detail);
             assert!(gap.detail.contains("of `npm_install`"), "{}", gap.detail);
         }
+    }
+
+    /// An install rule used where no declaration is read may install from
+    /// a lock nobody saw. Beside a hub that was resolved there is no
+    /// signal, so the use is a gap that names the place.
+    #[test]
+    fn an_install_rule_used_where_no_declaration_is_read_is_a_gap() {
+        let hub = "npm_install(name = \"npm\", package_json = \"//:package.json\", \
+                   package_lock_json = \"//:package-lock.json\")\n";
+        // A `load` starts a chunk, where nothing can replace the hub.
+        let later = "load(\"@bazel_tools//tools/build_defs/repo:utils.bzl\", \"maybe\")\n";
+        for (rest, rule) in [
+            (
+                "[yarn_install(name = n, package_json = \"//\" + n + \":package.json\", \
+                 yarn_lock = \"//\" + n + \":yarn.lock\") for n in [\"a\", \"b\"]]\n",
+                "yarn_install",
+            ),
+            (
+                "maybe(repo_rule = npm_install, name = \"more\")\n",
+                "npm_install",
+            ),
+            ("install_all(yarn_install)\n", "yarn_install"),
+        ] {
+            let text = format!("{SETUP}{hub}{later}{rest}");
+            let found = run(&root(&[("WORKSPACE", &text)]), recognize);
+            assert_eq!((found.hubs.len(), found.signals.len()), (1, 0), "{rest}");
+            let [gap] = found.gaps.as_slice() else {
+                panic!("{rest}: {:?}", found.gaps);
+            };
+            assert_eq!(gap.token, "label_not_literal", "{rest}");
+            let at = format!("WORKSPACE:10: `{rule}` is used where no declaration is read");
+            assert!(gap.detail.starts_with(&at), "{rest}: {}", gap.detail);
+        }
+        let exact = run(&root(&[("WORKSPACE", &format!("{SETUP}{hub}"))]), recognize);
+        assert_eq!((exact.hubs.len(), exact.gaps.as_slice()), (1, &[][..]));
     }
 
     /// The rule is loaded and no call of it was resolved: a signal. The

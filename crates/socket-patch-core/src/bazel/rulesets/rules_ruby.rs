@@ -116,15 +116,34 @@ pub enum GemChecksums {
     },
 }
 
+/// What a `gem_checksums` dict says about one gem.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GemEntry<'a> {
+    /// The dict has no key of the gem: it is not passed, or it is a
+    /// literal whose keys were all read. rules_ruby then checks the gem
+    /// against no digest of its own, and a lane leaves the dict as it is.
+    Absent,
+    /// Whether the dict holds the gem cannot be read: it is not a dict
+    /// literal, or one of its keys is computed and may be the gem's. It is
+    /// not absent: a value that is there and is left as it was fails a
+    /// cold build and serves the upstream gem from a warm one (HZ-14).
+    Unknown,
+    Found(&'a GemChecksum),
+}
+
 impl GemChecksums {
-    /// The entry of the gem `key` (`<name>-<version>`) in a literal dict.
-    /// `None` also means "not known" for a dict with a computed key.
-    pub fn entry(&self, key: &str) -> Option<&GemChecksum> {
-        match self {
-            Self::Literal { entries, .. } => entries
-                .iter()
-                .find(|entry| entry.key.as_deref() == Some(key)),
-            Self::Absent | Self::Dynamic => None,
+    /// What the dict says about the gem `key` (`<name>-<version>`).
+    pub fn entry(&self, key: &str) -> GemEntry<'_> {
+        let entries = match self {
+            Self::Absent => return GemEntry::Absent,
+            Self::Dynamic => return GemEntry::Unknown,
+            Self::Literal { entries, .. } => entries,
+        };
+        let named = |entry: &&GemChecksum| entry.key.as_deref() == Some(key);
+        match entries.iter().find(named) {
+            Some(entry) => GemEntry::Found(entry),
+            None if entries.iter().any(|entry| entry.key.is_none()) => GemEntry::Unknown,
+            None => GemEntry::Absent,
         }
     }
 }
@@ -249,6 +268,9 @@ pub fn recognize(input: &RecognizeInput<'_>) -> Recognized {
         gem_checksums: GemChecksums::Absent,
     };
     if let Some(module) = input.module {
+        // `rb_bundle_fetch` is a repository rule `use_repo_rule` can bind
+        // (`rules_ruby@v0.29.0:ruby/deps.bzl`): a hub no tag declares.
+        WORKSPACE.module_rule_gaps(module, &mut out.gaps);
         for usage in usages(module, EXTENSIONS_BZL, EXTENSION.1, &MODULES) {
             usage.gaps(&mut out.gaps);
             let tags = [
@@ -278,7 +300,7 @@ pub fn recognize(input: &RecognizeInput<'_>) -> Recognized {
         }
     }
     for model in input.workspace_files {
-        for site in WORKSPACE.hub_sites(model, &mut out.gaps) {
+        for site in WORKSPACE.hub_sites(model, input.files, &mut out.gaps) {
             let rule = match site.symbol {
                 "rb_bundle_fetch" => BundleRule::RbBundleFetch,
                 "ruby_bundle" => BundleRule::RubyBundle,
@@ -345,6 +367,14 @@ mod tests {
         }
     }
 
+    /// The entry of the gem `key` in a dict that holds it.
+    fn entry_of<'a>(sums: &'a GemChecksums, key: &str) -> &'a GemChecksum {
+        match sums.entry(key) {
+            GemEntry::Found(entry) => entry,
+            other => panic!("no entry of {key}: {other:?}"),
+        }
+    }
+
     /// The dict decides what a lane must edit with the pin: each key is a
     /// derived value of the lock, and each value is found where a lane
     /// would replace it.
@@ -386,15 +416,16 @@ mod tests {
             panic!("{:?}", found.gem_checksums);
         };
         assert_eq!((file.as_str(), entries.len()), ("MODULE.bazel", 2));
-        let victim = found
-            .gem_checksums
-            .entry("sp-victim-1.0.0")
-            .expect("the gem's entry");
+        let victim = entry_of(&found.gem_checksums, "sp-victim-1.0.0");
         assert_eq!(victim.value.as_deref(), Some(VICTIM));
         let (start, end) = victim.inner.expect("a plain string literal");
         assert_eq!(&text[start..end], VICTIM);
         assert_eq!(&text[victim.span.0..victim.span.1], format!("\"{VICTIM}\""));
-        assert_eq!(found.gem_checksums.entry("sp-victim-1.0.1"), None);
+        // Every key was read and none is this gem's: it has no entry.
+        assert_eq!(
+            found.gem_checksums.entry("sp-victim-1.0.1"),
+            GemEntry::Absent
+        );
 
         let stale = |key: &str| DerivedState::ChecksumValue {
             file: "MODULE.bazel".to_string(),
@@ -418,9 +449,16 @@ mod tests {
         assert_eq!(detail(&hub).gem_checksums, GemChecksums::Absent);
         assert!(hub.derived.is_empty());
         assert_eq!(hub.locks.len(), 2);
-        assert_eq!(detail(&hub).gem_checksums.entry("sp-victim-1.0.0"), None);
+        assert_eq!(
+            detail(&hub).gem_checksums.entry("sp-victim-1.0.0"),
+            GemEntry::Absent
+        );
         // An empty dict is the rule's default.
         let hub = hub_of(&[("MODULE.bazel", &module("", "\n    gem_checksums = {},"))]);
+        assert_eq!(
+            detail(&hub).gem_checksums.entry("sp-victim-1.0.0"),
+            GemEntry::Absent
+        );
         assert!(
             matches!(&detail(&hub).gem_checksums, GemChecksums::Literal { entries, .. } if entries.is_empty())
         );
@@ -435,10 +473,7 @@ mod tests {
         let constant = format!("SUMS = {{\"sp-victim-1.0.0\": \"{VICTIM}\"}}\n");
         let text = module(&constant, "\n    gem_checksums = SUMS,");
         let hub = hub_of(&[("MODULE.bazel", &text)]);
-        let victim = detail(&hub)
-            .gem_checksums
-            .entry("sp-victim-1.0.0")
-            .expect("an entry");
+        let victim = entry_of(&detail(&hub).gem_checksums, "sp-victim-1.0.0");
         let (start, end) = victim.inner.expect("addressable");
         assert_eq!(&text[start..end], VICTIM);
 
@@ -449,6 +484,14 @@ mod tests {
             let hub = hub_of(&[("MODULE.bazel", &module("", attrs))]);
             assert_eq!(detail(&hub).gem_checksums, GemChecksums::Dynamic, "{attrs}");
             assert!(hub.derived.is_empty());
+            // Whether it holds the gem is not known, which is not "it has
+            // no entry": a lane that leaves an entry that is there breaks
+            // the cold build (HZ-14).
+            assert_eq!(
+                detail(&hub).gem_checksums.entry("sp-victim-1.0.0"),
+                GemEntry::Unknown,
+                "{attrs}"
+            );
         }
 
         // A computed key may be any gem; a value built from pieces has no
@@ -481,6 +524,25 @@ mod tests {
             ]
         );
         assert_eq!(hub.derived.len(), 2);
+        // A key that was read is found; any other gem may be behind the
+        // computed key, so its entry is unknown and never absent.
+        let sums = &detail(&hub).gem_checksums;
+        assert_eq!(entry_of(sums, "sp-victim-1.0.0").inner, None);
+        assert_eq!(entry_of(sums, "sp-other-1.0.0").value, None);
+        for key in ["sp-third-1.0.0", "sp-victim-1.0.1"] {
+            assert_eq!(sums.entry(key), GemEntry::Unknown, "{key}");
+        }
+        // The hub itself stays exact: the lane refuses the one gem, and a
+        // gap would make the whole ecosystem undetermined.
+        assert!(hub.decl.literal);
+        let computed =
+            format!("\n    gem_checksums = {{\n        NAME + \"-1.0.0\": \"{VICTIM}\",\n    }},");
+        let hub = hub_of(&[("MODULE.bazel", &module("", &computed))]);
+        assert_eq!(
+            detail(&hub).gem_checksums.entry("sp-victim-1.0.0"),
+            GemEntry::Unknown
+        );
+        assert!(hub.derived.is_empty());
     }
 
     /// The dict lives in the file of its tag: an included segment, and
@@ -612,10 +674,7 @@ mod tests {
             input: "app/Gemfile.lock".to_string(),
         };
         assert_eq!(hub.derived, [stale]);
-        let entry = found
-            .gem_checksums
-            .entry("sp-victim-1.0.0")
-            .expect("an entry");
+        let entry = entry_of(&found.gem_checksums, "sp-victim-1.0.0");
         let (start, end) = entry.inner.expect("addressable");
         assert_eq!(&text[start..end], VICTIM);
 
@@ -704,6 +763,76 @@ mod tests {
         assert_eq!(file.file(), EXTENSIONS_BZL);
     }
 
+    /// A hub rule used where no declaration is read may declare a bundle
+    /// nobody saw. Beside a hub that was resolved there is no signal, so
+    /// the use is a gap: the gem ecosystem is then undetermined, and never
+    /// "not governed" for the lock of the bundle that was not read.
+    #[test]
+    fn a_hub_rule_used_where_no_declaration_is_read_is_a_gap() {
+        let hub = "rb_bundle_fetch(name = \"bundle\", gemfile = \"//:Gemfile\", \
+                   gemfile_lock = \"//:Gemfile.lock\")\n";
+        let workspace = |rest: &str| {
+            format!(
+                "{HTTP}load(\"@rules_ruby//ruby:deps.bzl\", \"rb_bundle_fetch\", \
+                 \"rb_register_toolchains\")\nrb_register_toolchains(version = \"system\")\n\
+                 {hub}{rest}"
+            )
+        };
+        let exact = run(&root(&[("WORKSPACE", &workspace(""))]), recognize);
+        assert_eq!((exact.hubs.len(), exact.gaps.as_slice()), (1, &[][..]));
+        // A `load` starts a chunk, where nothing can replace the hub.
+        let later = "load(\"@bazel_tools//tools/build_defs/repo:utils.bzl\", \"maybe\")\n";
+        for (rest, line) in [
+            (
+                "[rb_bundle_fetch(name = n, gemfile = \"//\" + n + \":Gemfile\", gemfile_lock = \
+                 \"//\" + n + \":Gemfile.lock\") for n in [\"a\", \"b\"]]\n",
+                7,
+            ),
+            ("maybe(repo_rule = rb_bundle_fetch, name = \"more\")\n", 7),
+            ("fetch = rb_bundle_fetch\nfetch(name = \"more\")\n", 7),
+        ] {
+            let text = workspace(&format!("{later}{rest}"));
+            let found = run(&root(&[("WORKSPACE", &text)]), recognize);
+            assert_eq!((found.hubs.len(), found.signals.len()), (1, 0), "{rest}");
+            let [gap] = found.gaps.as_slice() else {
+                panic!("{rest}: {:?}", found.gaps);
+            };
+            assert_eq!(
+                (gap.token, gap.file.as_str()),
+                ("label_not_literal", "WORKSPACE"),
+                "{rest}"
+            );
+            let at = format!("WORKSPACE:{line}: `rb_bundle_fetch` is used where");
+            assert!(gap.detail.starts_with(&at), "{rest}: {}", gap.detail);
+        }
+
+        // In a `MODULE.bazel` the rule is one `use_repo_rule` can bind
+        // (`rules_ruby@v0.29.0:ruby/deps.bzl`): the bundle it declares is
+        // no tag of the extension.
+        let rule = "rb_bundle_fetch = use_repo_rule(\"@rules_ruby//ruby:deps.bzl\", \
+                    \"rb_bundle_fetch\")\nrb_bundle_fetch(name = \"more\", gemfile = \
+                    \"//more:Gemfile\", gemfile_lock = \"//more:Gemfile.lock\")\n";
+        let text = format!("{}{rule}", module("", ""));
+        let found = run(&root(&[("MODULE.bazel", &text)]), recognize);
+        assert_eq!((found.hubs.len(), found.signals.len()), (1, 0));
+        let [gap] = found.gaps.as_slice() else {
+            panic!("{:?}", found.gaps);
+        };
+        assert_eq!(
+            (gap.token, gap.file.as_str()),
+            ("label_not_literal", "MODULE.bazel")
+        );
+        let line = text.lines().count();
+        let at =
+            format!("MODULE.bazel:{line}: `rb_bundle_fetch` is called through `use_repo_rule`");
+        assert!(gap.detail.starts_with(&at), "{}", gap.detail);
+        // Bound and never called, it declares nothing.
+        let (bound, _) = rule.split_once('\n').expect("two statements");
+        let text = format!("{}{bound}\n", module("", ""));
+        let found = run(&root(&[("MODULE.bazel", &text)]), recognize);
+        assert_eq!((found.hubs.len(), found.gaps.as_slice()), (1, &[][..]));
+    }
+
     /// A ruleset that is there with no bundle declares no hub this reader
     /// resolved: the ecosystem is undetermined, never "not governed".
     #[test]
@@ -770,6 +899,11 @@ mod tests {
                 "{name}"
             );
             let entry = detail(hub).gem_checksums.entry("sp-victim-1.0.0");
+            let entry = match entry {
+                GemEntry::Found(entry) => Some(entry),
+                GemEntry::Absent => None,
+                GemEntry::Unknown => panic!("{name}: the dict is not read"),
+            };
             assert_eq!(
                 (entry.is_some(), !hub.derived.is_empty()),
                 (sums, sums),
