@@ -1,0 +1,17 @@
+module(name = "rp_facts_probe", version = "0.0.0")
+
+bazel_dep(name = "rules_python", version = "2.5.0-rc4")
+
+python = use_extension("@rules_python//python/extensions:python.bzl", "python")
+python.toolchain(
+    is_default = True,
+    python_version = "3.11",
+)
+
+pip = use_extension("@rules_python//python/extensions:pip.bzl", "pip")
+pip.parse(
+    hub_name = "pypi",
+    python_version = "3.11",
+    requirements_lock = "//:requirements_lock.txt",
+)
+use_repo(pip, "pypi")

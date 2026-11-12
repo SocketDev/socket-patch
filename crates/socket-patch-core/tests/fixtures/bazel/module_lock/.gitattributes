@@ -1,0 +1,3 @@
+# Byte-real Bazel locks and the inputs whose SHA-256 they record. No
+# conversion on checkout: a changed line ending stales every digest here.
+* -text
