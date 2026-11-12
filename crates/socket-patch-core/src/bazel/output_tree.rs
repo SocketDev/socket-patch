@@ -35,6 +35,17 @@ pub const OUTPUT_BASE_MARKER: &str = "DO_NOT_BUILD_HERE";
 /// segment every convenience link's target passes through.
 const EXECROOT: &str = "execroot";
 
+/// The directories a server keeps beside its marker. Any one of them
+/// makes a directory with a marker an output base. Asking for `execroot`
+/// and nothing else would miss a live base: `bazel clean --async` renames
+/// it to `execroot_tmp_<pid>_<uuid>` and it is not there again until the
+/// next server starts (`CleanCommand.asyncClean`, bazel@9.3.2
+/// `CleanCommand.java:180-188` and `:277-282`; run on 9.3.2, where the
+/// base then held the marker, `external/`, `install`, `server/` and
+/// `sandbox/`). `external` holds the fetched repositories, `install` is a
+/// link to the install base and `server` holds the server's own files.
+const BASE_DIRS: [&str; 4] = [EXECROOT, "external", "install", "server"];
+
 /// `LocalRepoContentsCache.RECORDED_INPUTS_SUFFIX`: a cached repository
 /// `<entry>` has the sibling file `<entry>.recorded_inputs`.
 const RECORDED_INPUTS_SUFFIX: &str = ".recorded_inputs";
@@ -70,13 +81,23 @@ const MEMO_DIRS: usize = 1 << 16;
 pub enum PathClass {
     /// No marker on the path as found or on its resolved form.
     Plain,
-    /// At or below a directory with a regular `DO_NOT_BUILD_HERE` and a
-    /// directory `execroot`. The second marker, in `execroot`, is not
-    /// asked for: `bazel clean` deletes it and no later build on that
+    /// At or below a directory with a regular `DO_NOT_BUILD_HERE` and one
+    /// of the directories `execroot`, `external`, `install` or `server`
+    /// (`install` is a link to a directory). The directory `execroot` is
+    /// not required: `bazel clean --async` renames it away and it is back
+    /// only when the next server starts, while `external/` keeps every
+    /// fetched repository. The second marker, in `execroot`, is not asked
+    /// for either: `bazel clean` deletes it and no later build on that
     /// server writes it again (probe C7), so a live base can lack it for
-    /// hours. The content is not compared either: a shared `--output_base`
-    /// names whichever workspace last started a server (probe C8), and
-    /// another workspace's base is no safer to write into.
+    /// hours. The content is not compared: a shared `--output_base` names
+    /// whichever workspace last started a server (probe C8), and another
+    /// workspace's base is no safer to write into.
+    ///
+    /// Bazel 5 and 6 name the execution root after the workspace. Under a
+    /// workspace named `execroot`, `external`, `install` or `server`, the
+    /// directory `<base>/execroot` passes the same test while it holds
+    /// the second marker. The class of a path below it is still
+    /// `OutputBase`; only [`Tree::root`] is one segment deeper.
     OutputBase,
     /// At or below a directory with a sibling `<dir>.recorded_inputs`. The
     /// entry name is a UUID from 8.4 and a counter on 8.3.x, so the name
@@ -182,9 +203,16 @@ fn recorded_inputs_of(dir: &Path) -> Option<PathBuf> {
     Some(dir.with_file_name(name))
 }
 
-/// The tree `dir` itself is the root of, by its own markers. A walker that
-/// came down from a `Plain` directory needs nothing else to decide whether
-/// to enter `dir`: at most four `stat`s and no walk up.
+/// The tree `dir` itself is the root of, by its own markers: four `stat`s
+/// for a directory that holds none of the marker names, and no walk up.
+///
+/// For a real directory that a walker reached from a `Plain` one, this is
+/// all it takes to decide whether to enter `dir`. It is not enough for a
+/// link: the markers are read through it, so a link to the root of a tree
+/// answers, and a link to a place inside one (every convenience link of a
+/// built workspace) answers "no tree", with nothing below it to stop the
+/// walk either. A link entry, like the root of the walk, is [`classify`]'s
+/// to judge.
 pub fn tree_at(fs: &dyn TreeFs, dir: &Path, vendor_dirs: &[PathBuf]) -> Found {
     let mut unanswered = false;
     let mut is = |path: PathBuf, want: Entry| {
@@ -192,22 +220,24 @@ pub fn tree_at(fs: &dyn TreeFs, dir: &Path, vendor_dirs: &[PathBuf]) -> Found {
         unanswered |= got == Entry::Unknown;
         got == want
     };
-    let class =
-        if is(dir.join(OUTPUT_BASE_MARKER), Entry::File) && is(dir.join(EXECROOT), Entry::Dir) {
-            Some(PathClass::OutputBase)
-        } else if recorded_inputs_of(dir).is_some_and(|sibling| is(sibling, Entry::File)) {
-            Some(PathClass::RepoContentsCache)
-        } else if is_cas_entry(dir) && is(dir.join(CAS_FILE), Entry::File) {
-            Some(PathClass::RepositoryCache)
-        } else if vendor_dirs.iter().any(|tracked| tracked == dir)
-            || VENDOR_MARKERS
-                .iter()
-                .any(|marker| is(dir.join(marker), Entry::File))
-        {
-            Some(PathClass::VendorDir)
-        } else {
-            None
-        };
+    // The directories are asked for only beside a marker.
+    let class = if is(dir.join(OUTPUT_BASE_MARKER), Entry::File)
+        && BASE_DIRS.iter().any(|name| is(dir.join(name), Entry::Dir))
+    {
+        Some(PathClass::OutputBase)
+    } else if recorded_inputs_of(dir).is_some_and(|sibling| is(sibling, Entry::File)) {
+        Some(PathClass::RepoContentsCache)
+    } else if is_cas_entry(dir) && is(dir.join(CAS_FILE), Entry::File) {
+        Some(PathClass::RepositoryCache)
+    } else if vendor_dirs.iter().any(|tracked| tracked == dir)
+        || VENDOR_MARKERS
+            .iter()
+            .any(|marker| is(dir.join(marker), Entry::File))
+    {
+        Some(PathClass::VendorDir)
+    } else {
+        None
+    };
     Found {
         cannot_tell: unanswered && class.is_none(),
         tree: class.map(|class| Tree {
@@ -259,12 +289,19 @@ pub fn enclosing(fs: &dyn TreeFs, path: &Path, memo: &mut Memo) -> Found {
 pub struct Verdict {
     pub class: PathClass,
     /// The tree that decided `class`; for `Link`, the tree the link leads
-    /// into. `None` for `Plain`.
+    /// into. `None` for `Plain`. Its root is spelled the way the path
+    /// reached it, so one tree can have a root per spelling.
     pub tree: Option<Tree>,
     /// The other tree the path resolves into when it is spelled through
     /// one tree and stored in another: `external/<repo>` of an output base
     /// is a link into the contents cache or a vendor directory, where a
     /// write would reach every workspace that shares the entry.
+    ///
+    /// [`classify`] can only compare the two roots as paths. One tree
+    /// reached through a link above it (`/tmp` on macOS), or resolved into
+    /// another spelling (`\\?\C:\` on Windows), has two, and only the
+    /// disk knows they are one directory: `crawlers::bazel_output` clears
+    /// the field then.
     pub resolves_into: Option<Tree>,
     /// `Plain`, but not proven: a marker test went unanswered or the path
     /// could not be resolved. Unreadable is not absent, so the caller can
@@ -297,25 +334,31 @@ pub fn classify(
     // route, which needs no `execroot` directory on disk.
     let target = fs.read_link(found);
     let target = target.map(|to| found.parent().map_or(to.clone(), |dir| dir.join(&to)));
-    let hop = target.as_deref().map(|target| {
-        let mut hop = enclosing(fs, target, memo);
-        let by_route = || {
-            let root = base_of_link_target(fs, target)?;
-            let class = PathClass::OutputBase;
-            Some(Tree { class, root })
+    let mut route_unanswered = false;
+    let hop = target.as_deref().and_then(|target| {
+        let by_route = || match base_of_link_target(fs, target) {
+            LinkRoute::Base(root) => {
+                let class = PathClass::OutputBase;
+                Some(Tree { class, root })
+            }
+            LinkRoute::Unanswered => {
+                route_unanswered = true;
+                None
+            }
+            LinkRoute::NoBase => None,
         };
-        hop.tree = hop.tree.or_else(by_route);
-        hop
+        enclosing(fs, target, memo).tree.or_else(by_route)
     });
     let resolved = canonical.map(|c| enclosing(fs, c, memo));
     // The hop can only add a tree. Where it cannot be walked (a relative
     // target with `..`, as most package-manager links are), the resolved
-    // form has already said where the link leads.
-    let unproven = spelled.cannot_tell || resolved.as_ref().is_none_or(|r| r.cannot_tell);
-    let leads_to = resolved
-        .and_then(|found| found.tree)
-        .or(hop.and_then(|found| found.tree));
+    // form has already said where the link leads. A marker the route
+    // asked for and the disk would not show is doubt all the same.
+    let unproven =
+        spelled.cannot_tell || route_unanswered || resolved.as_ref().is_none_or(|r| r.cannot_tell);
+    let leads_to = resolved.and_then(|found| found.tree).or(hop);
     let (class, tree, resolves_into) = match (spelled.tree, leads_to) {
+        // Roots are compared as spelled: see `Verdict::resolves_into`.
         (Some(tree), other) => (tree.class, Some(tree.clone()), other.filter(|o| *o != tree)),
         (None, Some(tree)) if target.is_some() => (PathClass::Link, Some(tree), None),
         (None, Some(tree)) => (tree.class, Some(tree), None),
@@ -337,14 +380,38 @@ pub fn classify(
 /// The outermost such segment wins: `<base>/execroot` holds a marker of
 /// its own, so under a workspace named `execroot` the inner segment would
 /// name `<base>/execroot` as the base.
-pub fn base_of_link_target(fs: &dyn TreeFs, target: &Path) -> Option<PathBuf> {
+pub fn base_of_link_target(fs: &dyn TreeFs, target: &Path) -> LinkRoute {
+    let mut unanswered = false;
     let dirs: Vec<&Path> = target.ancestors().collect();
-    dirs.into_iter().rev().find_map(|dir| {
-        let base = dir.parent()?;
-        let marked = dir.file_name().is_some_and(|name| name == EXECROOT)
-            && fs.stat(&base.join(OUTPUT_BASE_MARKER)) == Entry::File;
-        marked.then(|| base.to_path_buf())
-    })
+    for dir in dirs.into_iter().rev() {
+        let Some(base) = dir.parent() else { continue };
+        if dir.file_name().is_none_or(|name| name != EXECROOT) {
+            continue;
+        }
+        match fs.stat(&base.join(OUTPUT_BASE_MARKER)) {
+            Entry::File => return LinkRoute::Base(base.to_path_buf()),
+            Entry::Unknown => unanswered = true,
+            Entry::Dir | Entry::Neither => {}
+        }
+    }
+    if unanswered {
+        LinkRoute::Unanswered
+    } else {
+        LinkRoute::NoBase
+    }
+}
+
+/// Where the link route leads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LinkRoute {
+    /// The output base the target passes through.
+    Base(PathBuf),
+    /// No `execroot` segment of the target has a marker beside it.
+    NoBase,
+    /// No base was found, and the disk would not say whether a marker
+    /// sits beside an `execroot` segment (see [`Entry::Unknown`]): "no
+    /// base" is not proven.
+    Unanswered,
 }
 
 /// Whether the bytes of an output base's marker name `canonical_workspace`
@@ -393,7 +460,9 @@ pub enum Unsure {
     /// upgrade moved the default root (7.2 on Linux, 9.0 on macOS), or two
     /// commands differed in a startup option (probe C8).
     SeveralBases,
-    /// No link, and a candidate directory could not be listed in full.
+    /// No link names a base, and the disk kept something back: a candidate
+    /// directory could not be listed in full, or a candidate base, its
+    /// marker or the target of a link could not be read.
     Unlisted,
 }
 
@@ -414,7 +483,8 @@ pub enum Located {
 /// Decide which output base is the workspace's own. `linked` are the bases
 /// its links lead into, `enumerated` the bases found under the candidate
 /// roots, each base in one spelling (resolved); `listed_all` is false when
-/// a candidate directory could not be read to its end.
+/// a candidate directory could not be read to its end, or a candidate
+/// could not be read at all ([`Unsure::Unlisted`]).
 ///
 /// Only a link names the live base, so the links decide alone when there
 /// are any. A marker match is needed as well, and is not enough without a
@@ -447,9 +517,15 @@ pub fn locate(linked: &[Candidate], enumerated: &[Candidate], listed_all: bool) 
 
 /// A tree known only as a list of its files: a repository listing handed
 /// to the in-memory engine, or a path list on its way to root detection.
-/// Paths are relative with forward slashes, `""` being the root. Root
-/// discovery on disk and in memory then prunes the same directories. A
-/// listing has no link targets, so nothing in it classifies `Link`.
+/// Paths are relative with forward slashes, `""` being the root.
+///
+/// A listing knows a directory only through a file below it, so root
+/// discovery in memory prunes the directories a disk walk prunes as far
+/// as their markers hold a listed file: an output base whose `execroot`
+/// a `bazel clean` has emptied is still known by a file under its
+/// `external/`, and one with no listed file beside its marker is not
+/// known at all. A listing has no link targets, so nothing in it
+/// classifies `Link`.
 #[derive(Debug, Default)]
 pub struct Listing {
     files: HashSet<PathBuf>,
@@ -595,13 +671,14 @@ mod tests {
             Some(Tree { class, root })
         }
 
-        /// Asserts the class of each path, and that each answer is proven.
+        /// Asserts the class of each path, that each answer is proven, and
+        /// that no path is stored in another tree than it is spelled in.
         fn expect(&self, cases: &[(&str, PathClass)]) {
             for (path, want) in cases {
                 let verdict = self.verdict(path);
                 assert_eq!(
-                    (verdict.class, verdict.cannot_tell),
-                    (*want, false),
+                    (verdict.class, verdict.cannot_tell, verdict.resolves_into),
+                    (*want, false, None),
                     "{path}"
                 );
             }
@@ -662,6 +739,29 @@ mod tests {
         Fake::new(ws, base).with(BUILT)
     }
 
+    // The install base: `install/<md5>` beside the output bases.
+    const INSTALL: &str = "/home/u/.cache/bazel/_bazel_u/install/7b1f";
+    const WIN_INSTALL: &str = r"c:\users\me\_bazel_me\install\7b1f";
+
+    /// A base as `bazel clean --async` leaves it until the next server
+    /// starts (Bazel 9.3.2): `execroot` is renamed away and deleted in the
+    /// background, the convenience links are removed, and the marker,
+    /// `external/`, `install`, `server/` and `sandbox/` stay. `old-bin` is
+    /// a link an earlier `--symlink_prefix` left behind.
+    fn cleaned_async(ws: &str, base: &str, install: &str) -> Fake {
+        Fake::new(ws, base).with(&format!(
+            "{{ws}}/MODULE.bazel
+             {{ws}}/src/package.json
+             {{base}}/DO_NOT_BUILD_HERE
+             {{base}}/external/rules_x+/pnpm-lock.yaml
+             {{base}}/server/
+             {{base}}/sandbox/
+             {install}/embedded_tools/
+             {{base}}/install -> {install}
+             {{ws}}/old-bin -> {{base}}/execroot/_main/bazel-out/k8/bin"
+        ))
+    }
+
     #[test]
     fn a_base_is_recognized_in_unix_and_windows_spellings() {
         for (ws, base) in [(WS, BASE), (WIN_WS, WIN_BASE)] {
@@ -693,6 +793,65 @@ mod tests {
                 assert_eq!(fs.verdict("{ws}/src").tree, None);
             }
         }
+    }
+
+    #[test]
+    fn a_base_whose_execroot_was_renamed_away_is_still_a_base() {
+        let own = |fs: &Fake, dir: &str| tree_at(fs, &fs.path(dir), &[]);
+        for (ws, base, install) in [(WS, BASE, INSTALL), (WIN_WS, WIN_BASE, WIN_INSTALL)] {
+            let fs = cleaned_async(ws, base, install);
+            fs.expect(&[
+                ("{base}", OutputBase),
+                ("{base}/external/rules_x+", OutputBase),
+                ("{base}/external/rules_x+/pnpm-lock.yaml", OutputBase),
+                ("{base}/external/rules_x+/new/dir/file.js", OutputBase),
+                ("{base}/server", OutputBase),
+                // The link route never needed the directory.
+                ("{ws}/old-bin", Link),
+                ("{ws}/old-bin/node_modules/left-pad", OutputBase),
+                ("{ws}", Plain),
+                ("{ws}/src/package.json", Plain),
+            ]);
+            let root = fs.tree(OutputBase, "{base}");
+            assert_eq!(own(&fs, "{base}").tree, root);
+            assert_eq!(own(&fs, "{base}/external"), Found::default());
+            assert_eq!(fs.verdict("{base}/external/rules_x+").tree, root);
+
+            // Any one of the directories beside the marker is enough,
+            // `install` being a link to one.
+            let marked = || Fake::new(ws, base).with("{base}/DO_NOT_BUILD_HERE");
+            let link = format!("{install}/\n {{base}}/install -> {install}");
+            for beside in [
+                "{base}/execroot/",
+                "{base}/external/",
+                "{base}/server/",
+                link.as_str(),
+            ] {
+                let fs = marked().with(beside);
+                assert_eq!(own(&fs, "{base}").tree, root, "{beside}");
+            }
+            // Nothing else is: another directory, a file under one of the
+            // names, a link to nowhere.
+            for beside in [
+                "{base}/sandbox/",
+                "{base}/server",
+                "{base}/external",
+                "{base}/install -> {base}/gone",
+            ] {
+                let fs = marked().with(beside);
+                assert_eq!(own(&fs, "{base}"), Found::default(), "{beside}");
+            }
+        }
+        // The same on a 5.x or 6.x workspace named after one of the
+        // directories: `execroot` holds the second marker and passes for a
+        // base, one segment below the real one. The class does not change.
+        let fs = built(WS, BASE).with("{base}/execroot/external/bazel-out/k8/bin/");
+        fs.expect(&[
+            ("{base}/execroot/external/bazel-out/k8/bin", OutputBase),
+            ("{base}/external/rules_x+", OutputBase),
+        ]);
+        let inner = fs.verdict("{base}/execroot/external/bazel-out").tree;
+        assert_eq!(inner, fs.tree(OutputBase, "{base}/execroot"));
     }
 
     #[test]
@@ -793,7 +952,6 @@ mod tests {
             // 7.3 and later write `VENDOR.bazel` (probe C11).
             ("{ws}/vendor_src", VendorDir),
             ("{ws}/vendor_src/+http+dep/package-lock.json", VendorDir),
-            ("{ws}/vendor_src/bazel-external", VendorDir),
             // 7.1.2 - 7.2.1 write `.vendorignore` only.
             ("{ws}/third_party/_main~rules~dep/go.mod", VendorDir),
             // Named by a tracked `--vendor_dir` alone: unknown without it.
@@ -809,6 +967,12 @@ mod tests {
             vendored.resolves_into,
             fs.tree(VendorDir, "{ws}/vendor_src")
         );
+
+        // And `bazel-external`, which `bazel vendor` makes, is a link the
+        // other way: out of the vendor directory into the base.
+        let external = fs.verdict("{ws}/vendor_src/bazel-external");
+        assert_eq!(external.class, VendorDir);
+        assert_eq!(external.resolves_into, fs.tree(OutputBase, "{base}"));
 
         let deps = fs.path("{ws}/deps/+x+y");
         let mut tracked = Memo::new(vec![fs.path("{ws}/deps")]);
@@ -899,10 +1063,15 @@ mod tests {
                 (&format!("{cas}/{kind}"), Plain),
             ]);
         }
-        // Not a digest kind Bazel has.
-        let fs = fs.with(&format!("{cas}/md5/{}/file", hex(32)));
+        // Not a digest kind Bazel has, and a name of the right length
+        // that is no digest.
+        let not_hex = format!("{cas}/sha256/{}/file", "g".repeat(64));
+        let fs = fs
+            .with(&format!("{cas}/md5/{}/file", hex(32)))
+            .with(&not_hex);
         fs.expect(&[
             (&format!("{cas}/md5/{}/file", hex(32)), Plain),
+            (&not_hex, Plain),
             (cas, Plain),
         ]);
     }
@@ -958,7 +1127,7 @@ mod tests {
                 let target = fs.read_link(&fs.path("{ws}").join(link)).unwrap();
                 assert_eq!(
                     base_of_link_target(&fs, &target),
-                    Some(fs.path("{base}")),
+                    LinkRoute::Base(fs.path("{base}")),
                     "{link}"
                 );
             }
@@ -970,7 +1139,7 @@ mod tests {
         let route = |target: &str| base_of_link_target(&fs, &fs.path(target));
         assert_eq!(
             route("{base}/execroot/execroot/out"),
-            Some(fs.path("{base}"))
+            LinkRoute::Base(fs.path("{base}"))
         );
         // No `execroot` segment below a base, or no marker beside one.
         for target in [
@@ -978,11 +1147,12 @@ mod tests {
             "/data/execroot/x",
             "/gone/execroot/_main",
         ] {
-            assert_eq!(route(target), None, "{target}");
+            assert_eq!(route(target), LinkRoute::NoBase, "{target}");
         }
-        // The route is enough to make a link Bazel's: a marker whose
-        // `execroot` directory is gone is no base to a path inside it, and
-        // a link through that segment still leads into Bazel's tree.
+        // The route is enough to make a link Bazel's: a marker with none
+        // of a base's directories beside it is no base to a path inside
+        // it, and a link through that segment still leads into Bazel's
+        // tree.
         let fs = Fake::new(WS, "/half").with(
             "{base}/DO_NOT_BUILD_HERE
              {ws}/bazel-out -> {base}/execroot/_main/bazel-out",
@@ -1061,6 +1231,25 @@ mod tests {
         let walked = enclosing(&fs, &dotted, &mut Memo::default());
         assert_eq!((walked.tree, walked.cannot_tell), (None, true));
         assert_eq!(answer(classed(&dotted, Some(&src))), (Plain, true));
+
+        // The link route asks for one marker. Where the disk will not show
+        // it, the route has no answer, and neither has a stale link that
+        // resolves to nothing else.
+        let mut fs = built(WS, "/data/execroot/_bazel_u/abc")
+            .with("{ws}/old-out -> /locked/base/execroot/_main/bazel-out");
+        fs.unknown.insert(p("/locked/base/DO_NOT_BUILD_HERE"));
+        let route = |fs: &Fake, target: &str| base_of_link_target(fs, &fs.path(target));
+        let target = "/locked/base/execroot/_main/bazel-out";
+        assert_eq!(route(&fs, target), LinkRoute::Unanswered);
+        let stale = fs.path("{ws}/old-out");
+        let verdict = classify(&fs, &stale, Some(&stale), &mut Memo::default());
+        assert_eq!(answer(verdict), (Plain, true));
+        // A segment that does answer decides, whatever went unanswered
+        // above it.
+        fs.unknown.insert(p("/data/DO_NOT_BUILD_HERE"));
+        let base = LinkRoute::Base(fs.path("{base}"));
+        assert_eq!(route(&fs, "{base}/execroot/_main/bazel-out"), base);
+        assert_eq!(route(&fs, "/data/execroot/x"), LinkRoute::Unanswered);
     }
 
     #[test]
@@ -1127,6 +1316,27 @@ mod tests {
             });
             assert_eq!((found.tree, found.cannot_tell), (tree, false), "{path:?}");
         }
+        // A base as `bazel clean` leaves it (probe C7: `execroot` emptied,
+        // `external/` kept) has no file under `execroot/` to list. It is
+        // known by the files under `external/`; with none listed beside
+        // the marker, the listing does not know the directory at all.
+        let cleaned = Listing::new([
+            "MODULE.bazel",
+            "out/DO_NOT_BUILD_HERE",
+            "out/external/rules_nodejs~/yarn.lock",
+            "bare/DO_NOT_BUILD_HERE",
+        ]);
+        let lock = Path::new("out/external/rules_nodejs~/yarn.lock");
+        let found = enclosing(&cleaned, lock, &mut Memo::default());
+        let out = Tree {
+            class: OutputBase,
+            root: PathBuf::from("out"),
+        };
+        assert_eq!((found.tree, found.cannot_tell), (Some(out), false));
+        assert_eq!(cleaned.stat(Path::new("out/execroot")), Entry::Neither);
+        let bare = tree_at(&cleaned, Path::new("bare"), &[]);
+        assert_eq!(bare, Found::default());
+
         assert_eq!(listing.stat(Path::new("services")), Entry::Dir);
         assert_eq!(listing.stat(Path::new("")), Entry::Dir);
         assert_eq!(listing.stat(Path::new("services/api/go.mod")), Entry::File);
