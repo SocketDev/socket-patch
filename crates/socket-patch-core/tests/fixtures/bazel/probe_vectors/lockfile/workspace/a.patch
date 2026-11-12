@@ -1,0 +1,5 @@
+--- a/data.txt
++++ b/data.txt
+@@ -1 +1 @@
+-upstream-a-1.0
++patchfile-v1

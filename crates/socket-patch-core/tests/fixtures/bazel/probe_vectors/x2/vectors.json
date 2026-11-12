@@ -1,8 +1,32 @@
 {
   "probe": "X2",
   "question": "Does a crate_universe hub expose BUILD.<name>-<version>.bazel under Bzlmod; does override_repo of a spoke leave the digest untouched; what happens to a stale override after a bump?",
-  "verdict": "hub file: REFUTED; digest untouched: CONFIRMED; stale override: hard error (see cells[].stale_override_after_bump)",
+  "verdict": "hub file: REFUTED; cargo-bazel-lock.json untouched by override_repo: CONFIRMED; MODULE.bazel.lock untouched: only because the crate extension is reproducible in this fixture and has no entry in the lock (see module_lock_note), not shown for a recorded hub; stale override: hard error (see cells[].stale_override_after_bump)",
   "host": "macOS arm64 (Darwin 27.0.0), 2026-11-11 / 2026-11-12",
+  "environment": {
+    "launcher": "at capture time the campaign launcher exported TEST_TMPDIR on every command, which puts the Bazel server in test mode (TestType.isInTest)",
+    "set_in_every_cell": {
+      "ENABLE_BUG_REPORT_LOGGING_IN_TEST": "1",
+      "NO_CRASH_ON_LOGGING_IN_TEST": "1"
+    },
+    "why": "Bazel's own switches for production behaviour in test mode. Without them a failing module extension during `build` on 7.7.2 is `FATAL: bazel crashed due to an internal error`, exit 37, instead of the ordinary error with exit 1",
+    "exit_codes_that_differ_without_them": {
+      "7.7.2": {
+        "Q4a-bump-build-no-repin": {
+          "exit_without": 37,
+          "exit_with": 1
+        },
+        "Q4c-bump-build": {
+          "exit_without": 37,
+          "exit_with": 1
+        }
+      },
+      "8.8.2": {},
+      "9.3.2": {}
+    },
+    "steps": "Q4a-bump-build-no-repin is cells[].stale_override_after_bump.build_without_repin; Q4c-bump-build is cells[].stale_override_after_bump.build. Every other step of every cell has the same exit code in both runs"
+  },
+  "module_lock_note": "Every module_lock_unchanged: true below is about a lock with no entry for the crate extension (cells[].crate_extension_in_module_lock is false, cells[].module_lock names the absent key). For an extension that has an entry, Bazel hashes the repo overrides into usagesDigest: adding override_repo changes that one line and --lockfile_mode=error then fails until the lock is refreshed (campaign probes, toy extensions: rc-ignore-substitution S10 on 7.7.2, lock diff one usagesDigest line; starlark-include lock-touch table on 7.7.2, 8.8.2, 9.3.2 and 10.0.0rc3, `mod deps --lockfile_mode=error` exit 2; source: bazel@8.8.2 SingleExtensionUsagesValue.trimForEvaluation keeps getRepoOverrides()). A hub without `lockfile` or `cargo_lockfile` is not reproducible and has an entry; that case was not run here",
   "fixture": "rust_binary //:app on cfg-if =1.0.0; crate.from_cargo(name = 'crates', cargo_lockfile, manifests, lockfile = '//:cargo-bazel-lock.json'); //:oracle builds only against the patched crate (it calls cfg_if::socket_patched())",
   "identical_on_every_line_sha256": {
     "hub.BUILD.bazel": {
@@ -41,6 +65,18 @@
     {
       "bazel": "7.7.2",
       "rules_rust": "0.75.0",
+      "crate_extension_in_module_lock": false,
+      "crate_extension_in_module_lock_reason": "reproducible: rules_rust 0.75.0 returns extension_metadata(reproducible = True) when every hub tag sets both `lockfile` and `cargo_lockfile` (crate_universe/extensions.bzl:990, 1176-1186, 1223-1224), as this fixture's one tag does, so Bazel writes no entry for it",
+      "module_lock": {
+        "lockFileVersion": 13,
+        "sha256": "7c4382f7958b78af581cdb15d5f7c0cdd0f4a0a3cf98aed3aae33bad4dff0108",
+        "size": 114353,
+        "lock_file": null,
+        "absent_extension_key": "@@rules_rust~//crate_universe:extensions.bzl%crate",
+        "rules_rust_extension_keys": [
+          "@@rules_rust~//crate_universe/private:internal_extensions.bzl%cu_nr"
+        ]
+      },
       "hub": {
         "canonical_name": "rules_rust~~crate~crates",
         "files": [
@@ -164,6 +200,18 @@
     {
       "bazel": "8.8.2",
       "rules_rust": "0.75.0",
+      "crate_extension_in_module_lock": false,
+      "crate_extension_in_module_lock_reason": "reproducible: rules_rust 0.75.0 returns extension_metadata(reproducible = True) when every hub tag sets both `lockfile` and `cargo_lockfile` (crate_universe/extensions.bzl:990, 1176-1186, 1223-1224), as this fixture's one tag does, so Bazel writes no entry for it",
+      "module_lock": {
+        "lockFileVersion": 28,
+        "sha256": "947d9fb9f68bf71ab01bf30c699a2098a97424ee6b7232b66ddf51c3ff0e4f0a",
+        "size": 171645,
+        "lock_file": null,
+        "absent_extension_key": "@@rules_rust+//crate_universe:extensions.bzl%crate",
+        "rules_rust_extension_keys": [
+          "@@rules_rust+//crate_universe/private:internal_extensions.bzl%cu_nr"
+        ]
+      },
       "hub": {
         "canonical_name": "rules_rust++crate+crates",
         "files": [
@@ -286,6 +334,18 @@
     {
       "bazel": "9.3.2",
       "rules_rust": "0.75.0",
+      "crate_extension_in_module_lock": false,
+      "crate_extension_in_module_lock_reason": "reproducible: rules_rust 0.75.0 returns extension_metadata(reproducible = True) when every hub tag sets both `lockfile` and `cargo_lockfile` (crate_universe/extensions.bzl:990, 1176-1186, 1223-1224), as this fixture's one tag does, so Bazel writes no entry for it",
+      "module_lock": {
+        "lockFileVersion": 28,
+        "sha256": "c2af1c9450c73b903bffe374a7c7d87b3a7190c2fed1ed6ea36edfa36e9da773",
+        "size": 58505,
+        "lock_file": "locks/rr0.75.0-b9.3.2.baseline.MODULE.bazel.lock",
+        "absent_extension_key": "@@rules_rust+//crate_universe:extensions.bzl%crate",
+        "rules_rust_extension_keys": [
+          "@@rules_rust+//crate_universe/private:internal_extensions.bzl%cu_nr"
+        ]
+      },
       "hub": {
         "canonical_name": "rules_rust++crate+crates",
         "files": [

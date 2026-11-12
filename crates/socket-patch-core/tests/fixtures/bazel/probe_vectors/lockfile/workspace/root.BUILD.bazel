@@ -1,0 +1,14 @@
+exports_files(["dep.lock", "dep2.lock", "a.patch"])
+
+genrule(
+    name = "consume",
+    srcs = ["@dep_a//:data.txt"],
+    outs = ["consumed.txt"],
+    cmd = "cat $< > $@",
+)
+
+genrule(
+    name = "unrelated",
+    outs = ["unrelated.txt"],
+    cmd = "echo unrelated > $@",
+)

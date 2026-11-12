@@ -1,0 +1,614 @@
+{
+  "group": "lockfile (probes L1 and L6), imported by wp-probe-vectors",
+  "provenance": "<CAMPAIGN>/probes/lockfile/RESULTS.md: verdict rows L1.g and L6.a, section L6, design note D2, section 5 (test vectors). Sources: vectors/recorded-inputs/bazel-<ver>/{fresh,stale}/, cells/vec-<ver>/, cells/l6-<ver>/",
+  "host": "macOS arm64 (Darwin 27.0.0), 2026-11-11, through the campaign launcher with --nohome_rc --nosystem_rc, before it exported TEST_TMPDIR",
+  "file_names": {
+    "root.MODULE.bazel": "MODULE.bazel",
+    "root.MODULE.bazel.lock": "MODULE.bazel.lock",
+    "workspace/ext.bzl": "ext.bzl",
+    "workspace/root.BUILD.bazel": "BUILD.bazel",
+    "workspace/third_party-py.BUILD.bazel": "third_party/py/BUILD.bazel",
+    "workspace/other.BUILD.bazel": "other/BUILD.bazel",
+    "workspace/dep2.lock": "dep2.lock",
+    "workspace/a.patch": "a.patch"
+  },
+  "extension": "//:ext.bzl%toy (root module, not reproducible): toy.from_file(lock = <label>) reads the file with module_ctx.read and makes one repository per `name=content` line",
+  "recorded_inputs": {
+    "what": "per release, the workspace inputs, the lock that release wrote for them (`bazel build //:consume --lockfile_mode=update`) and expected.json, twice: `fresh` as written, `stale` with `third_party/py/requirements lock.txt` rewritten and the lock left alone. expected.json has the lockfile group's static reading of the lock (rows key, path, recorded, actual, state) and bazel_error_mode_build_exit, the exit code of `bazel build //:consume --lockfile_mode=error` in that state",
+    "result": "a row is stale exactly when Bazel's error-mode build fails: 34 of 34. Rechecked at import with a second reader",
+    "second_input": "//third_party/py:requirements lock.txt: a file in a subpackage with a space in its name (key spellings in vectors[].keys)",
+    "lock_versions": [
+      3,
+      6,
+      11,
+      13,
+      16,
+      18,
+      24,
+      26,
+      28
+    ],
+    "vectors": [
+      {
+        "bazel": "6.5.0",
+        "dir": "recorded-inputs/bazel-6.5.0",
+        "lockFileVersion": 3,
+        "family": "A",
+        "container": "accumulatedFileDigests",
+        "keys": {
+          "dep.lock": "@@//:dep.lock",
+          "third_party/py/requirements lock.txt": "@@//third_party/py:requirements lock.txt"
+        },
+        "records_moduleFileHash": true,
+        "fresh": {
+          "bazel_error_mode_build_exit": 0,
+          "stale_inputs": [],
+          "lock_sha256": "ced18a08da21a222159229922ad8c1d4b6c680d3e7735f56dcd6bb28829d6efb",
+          "lock_size": 24008
+        },
+        "stale": {
+          "bazel_error_mode_build_exit": 1,
+          "stale_inputs": [
+            "third_party/py/requirements lock.txt"
+          ],
+          "lock_sha256": "ced18a08da21a222159229922ad8c1d4b6c680d3e7735f56dcd6bb28829d6efb",
+          "lock_size": 24008
+        }
+      },
+      {
+        "bazel": "6.6.0",
+        "dir": "recorded-inputs/bazel-6.6.0",
+        "lockFileVersion": 3,
+        "family": "A",
+        "container": "accumulatedFileDigests",
+        "keys": {
+          "dep.lock": "@@//:dep.lock",
+          "third_party/py/requirements lock.txt": "@@//third_party/py:requirements lock.txt"
+        },
+        "records_moduleFileHash": true,
+        "fresh": {
+          "bazel_error_mode_build_exit": 0,
+          "stale_inputs": [],
+          "lock_sha256": "ced18a08da21a222159229922ad8c1d4b6c680d3e7735f56dcd6bb28829d6efb",
+          "lock_size": 24008
+        },
+        "stale": {
+          "bazel_error_mode_build_exit": 1,
+          "stale_inputs": [
+            "third_party/py/requirements lock.txt"
+          ],
+          "lock_sha256": "ced18a08da21a222159229922ad8c1d4b6c680d3e7735f56dcd6bb28829d6efb",
+          "lock_size": 24008
+        }
+      },
+      {
+        "bazel": "7.0.2",
+        "dir": "recorded-inputs/bazel-7.0.2",
+        "lockFileVersion": 3,
+        "family": "A",
+        "container": "accumulatedFileDigests",
+        "keys": {
+          "dep.lock": "@@//:dep.lock",
+          "third_party/py/requirements lock.txt": "@@//third_party/py:requirements lock.txt"
+        },
+        "records_moduleFileHash": true,
+        "fresh": {
+          "bazel_error_mode_build_exit": 0,
+          "stale_inputs": [],
+          "lock_sha256": "381d9c448027fe4e1e57147d1dc0088485040b59dc82367cded8777d694b0676",
+          "lock_size": 26827
+        },
+        "stale": {
+          "bazel_error_mode_build_exit": 1,
+          "stale_inputs": [
+            "third_party/py/requirements lock.txt"
+          ],
+          "lock_sha256": "381d9c448027fe4e1e57147d1dc0088485040b59dc82367cded8777d694b0676",
+          "lock_size": 26827
+        }
+      },
+      {
+        "bazel": "7.1.2",
+        "dir": "recorded-inputs/bazel-7.1.2",
+        "lockFileVersion": 6,
+        "family": "A",
+        "container": "recordedFileInputs",
+        "keys": {
+          "dep.lock": "@@//dep.lock",
+          "third_party/py/requirements lock.txt": "@@//third_party/py/requirements lock.txt"
+        },
+        "records_moduleFileHash": true,
+        "fresh": {
+          "bazel_error_mode_build_exit": 0,
+          "stale_inputs": [],
+          "lock_sha256": "4b60c37bc7f473847bb1d20745c7096ef1975f6a08291fefb3ab276cae04b411",
+          "lock_size": 43029
+        },
+        "stale": {
+          "bazel_error_mode_build_exit": 1,
+          "stale_inputs": [
+            "third_party/py/requirements lock.txt"
+          ],
+          "lock_sha256": "4b60c37bc7f473847bb1d20745c7096ef1975f6a08291fefb3ab276cae04b411",
+          "lock_size": 43029
+        }
+      },
+      {
+        "bazel": "7.2.0",
+        "dir": "recorded-inputs/bazel-7.2.0",
+        "lockFileVersion": 11,
+        "family": "B",
+        "container": "recordedFileInputs",
+        "keys": {
+          "dep.lock": "@@//dep.lock",
+          "third_party/py/requirements lock.txt": "@@//third_party/py/requirements lock.txt"
+        },
+        "records_moduleFileHash": false,
+        "fresh": {
+          "bazel_error_mode_build_exit": 0,
+          "stale_inputs": [],
+          "lock_sha256": "09b5f8b14100b11f998025b55b91c95c572f9a8d1befb5663e8efd2e7bdfd36d",
+          "lock_size": 9841
+        },
+        "stale": {
+          "bazel_error_mode_build_exit": 1,
+          "stale_inputs": [
+            "third_party/py/requirements lock.txt"
+          ],
+          "lock_sha256": "09b5f8b14100b11f998025b55b91c95c572f9a8d1befb5663e8efd2e7bdfd36d",
+          "lock_size": 9841
+        }
+      },
+      {
+        "bazel": "7.4.1",
+        "dir": "recorded-inputs/bazel-7.4.1",
+        "lockFileVersion": 11,
+        "family": "B",
+        "container": "recordedFileInputs",
+        "keys": {
+          "dep.lock": "@@//dep.lock",
+          "third_party/py/requirements lock.txt": "@@//third_party/py/requirements lock.txt"
+        },
+        "records_moduleFileHash": false,
+        "fresh": {
+          "bazel_error_mode_build_exit": 0,
+          "stale_inputs": [],
+          "lock_sha256": "cffb577a766e31df662218b31377aef15ee9030b48dbc3e4d8355c0da5684248",
+          "lock_size": 9857
+        },
+        "stale": {
+          "bazel_error_mode_build_exit": 1,
+          "stale_inputs": [
+            "third_party/py/requirements lock.txt"
+          ],
+          "lock_sha256": "cffb577a766e31df662218b31377aef15ee9030b48dbc3e4d8355c0da5684248",
+          "lock_size": 9857
+        }
+      },
+      {
+        "bazel": "7.7.2",
+        "dir": "recorded-inputs/bazel-7.7.2",
+        "lockFileVersion": 13,
+        "family": "B",
+        "container": "recordedFileInputs",
+        "keys": {
+          "dep.lock": "@@//dep.lock",
+          "third_party/py/requirements lock.txt": "@@//third_party/py/requirements lock.txt"
+        },
+        "records_moduleFileHash": false,
+        "fresh": {
+          "bazel_error_mode_build_exit": 0,
+          "stale_inputs": [],
+          "lock_sha256": "d2761c3bc066b31cc83fbeb4f4601d3ce2aba10244f9dd94f9125ab7cbecba8b",
+          "lock_size": 10280
+        },
+        "stale": {
+          "bazel_error_mode_build_exit": 1,
+          "stale_inputs": [
+            "third_party/py/requirements lock.txt"
+          ],
+          "lock_sha256": "d2761c3bc066b31cc83fbeb4f4601d3ce2aba10244f9dd94f9125ab7cbecba8b",
+          "lock_size": 10280
+        }
+      },
+      {
+        "bazel": "8.0.0",
+        "dir": "recorded-inputs/bazel-8.0.0",
+        "lockFileVersion": 16,
+        "family": "B",
+        "container": "recordedFileInputs",
+        "keys": {
+          "dep.lock": "@@//dep.lock",
+          "third_party/py/requirements lock.txt": "@@//third_party/py/requirements lock.txt"
+        },
+        "records_moduleFileHash": false,
+        "fresh": {
+          "bazel_error_mode_build_exit": 0,
+          "stale_inputs": [],
+          "lock_sha256": "56681b89b97048aed014c6a4d382e7e629a45a3768a3f6a2d1095c5d9c61e9f0",
+          "lock_size": 20588
+        },
+        "stale": {
+          "bazel_error_mode_build_exit": 1,
+          "stale_inputs": [
+            "third_party/py/requirements lock.txt"
+          ],
+          "lock_sha256": "56681b89b97048aed014c6a4d382e7e629a45a3768a3f6a2d1095c5d9c61e9f0",
+          "lock_size": 20588
+        }
+      },
+      {
+        "bazel": "8.1.0",
+        "dir": "recorded-inputs/bazel-8.1.0",
+        "lockFileVersion": 18,
+        "family": "B",
+        "container": "recordedFileInputs",
+        "keys": {
+          "dep.lock": "@@//dep.lock",
+          "third_party/py/requirements lock.txt": "@@//third_party/py/requirements lock.txt"
+        },
+        "records_moduleFileHash": false,
+        "fresh": {
+          "bazel_error_mode_build_exit": 0,
+          "stale_inputs": [],
+          "lock_sha256": "6f16fe100a8942776f3ad6c7e3f27d1d424c58720c9b465d5751594152eef657",
+          "lock_size": 20724
+        },
+        "stale": {
+          "bazel_error_mode_build_exit": 1,
+          "stale_inputs": [
+            "third_party/py/requirements lock.txt"
+          ],
+          "lock_sha256": "6f16fe100a8942776f3ad6c7e3f27d1d424c58720c9b465d5751594152eef657",
+          "lock_size": 20724
+        }
+      },
+      {
+        "bazel": "8.4.2",
+        "dir": "recorded-inputs/bazel-8.4.2",
+        "lockFileVersion": 18,
+        "family": "B",
+        "container": "recordedFileInputs",
+        "keys": {
+          "dep.lock": "@@//dep.lock",
+          "third_party/py/requirements lock.txt": "@@//third_party/py/requirements lock.txt"
+        },
+        "records_moduleFileHash": false,
+        "fresh": {
+          "bazel_error_mode_build_exit": 0,
+          "stale_inputs": [],
+          "lock_sha256": "0086ba0e111031500d01a4f3d412938e594956afcf05faa2f38e1115ab69e564",
+          "lock_size": 19562
+        },
+        "stale": {
+          "bazel_error_mode_build_exit": 1,
+          "stale_inputs": [
+            "third_party/py/requirements lock.txt"
+          ],
+          "lock_sha256": "0086ba0e111031500d01a4f3d412938e594956afcf05faa2f38e1115ab69e564",
+          "lock_size": 19562
+        }
+      },
+      {
+        "bazel": "8.6.0",
+        "dir": "recorded-inputs/bazel-8.6.0",
+        "lockFileVersion": 24,
+        "family": "B",
+        "container": "recordedFileInputs",
+        "keys": {
+          "dep.lock": "@@//dep.lock",
+          "third_party/py/requirements lock.txt": "@@//third_party/py/requirements lock.txt"
+        },
+        "records_moduleFileHash": false,
+        "fresh": {
+          "bazel_error_mode_build_exit": 0,
+          "stale_inputs": [],
+          "lock_sha256": "3be90ab95478f7053510481b7441fbbf58766ab1670624ac4815b5d5265c472b",
+          "lock_size": 19577
+        },
+        "stale": {
+          "bazel_error_mode_build_exit": 1,
+          "stale_inputs": [
+            "third_party/py/requirements lock.txt"
+          ],
+          "lock_sha256": "3be90ab95478f7053510481b7441fbbf58766ab1670624ac4815b5d5265c472b",
+          "lock_size": 19577
+        }
+      },
+      {
+        "bazel": "8.7.0",
+        "dir": "recorded-inputs/bazel-8.7.0",
+        "lockFileVersion": 24,
+        "family": "B",
+        "container": "recordedFileInputs",
+        "keys": {
+          "dep.lock": "@@//dep.lock",
+          "third_party/py/requirements lock.txt": "@@//third_party/py/requirements lock.txt"
+        },
+        "records_moduleFileHash": false,
+        "fresh": {
+          "bazel_error_mode_build_exit": 0,
+          "stale_inputs": [],
+          "lock_sha256": "3be90ab95478f7053510481b7441fbbf58766ab1670624ac4815b5d5265c472b",
+          "lock_size": 19577
+        },
+        "stale": {
+          "bazel_error_mode_build_exit": 1,
+          "stale_inputs": [
+            "third_party/py/requirements lock.txt"
+          ],
+          "lock_sha256": "3be90ab95478f7053510481b7441fbbf58766ab1670624ac4815b5d5265c472b",
+          "lock_size": 19577
+        }
+      },
+      {
+        "bazel": "8.8.2",
+        "dir": "recorded-inputs/bazel-8.8.2",
+        "lockFileVersion": 28,
+        "family": "B",
+        "container": "recordedInputs",
+        "keys": {
+          "dep.lock": "FILE:@@//dep.lock",
+          "third_party/py/requirements lock.txt": "FILE:@@//third_party/py/requirements\\slock.txt"
+        },
+        "records_moduleFileHash": false,
+        "fresh": {
+          "bazel_error_mode_build_exit": 0,
+          "stale_inputs": [],
+          "lock_sha256": "e185613172ec28ee27e7adad604624385d73e6dca3b09e52f6f3db3ccd3e5142",
+          "lock_size": 19495
+        },
+        "stale": {
+          "bazel_error_mode_build_exit": 1,
+          "stale_inputs": [
+            "third_party/py/requirements lock.txt"
+          ],
+          "lock_sha256": "e185613172ec28ee27e7adad604624385d73e6dca3b09e52f6f3db3ccd3e5142",
+          "lock_size": 19495
+        }
+      },
+      {
+        "bazel": "9.0.2",
+        "dir": "recorded-inputs/bazel-9.0.2",
+        "lockFileVersion": 26,
+        "family": "B",
+        "container": "recordedInputs",
+        "keys": {
+          "dep.lock": "FILE:@@//dep.lock",
+          "third_party/py/requirements lock.txt": "FILE:@@//third_party/py/requirements\\slock.txt"
+        },
+        "records_moduleFileHash": false,
+        "fresh": {
+          "bazel_error_mode_build_exit": 0,
+          "stale_inputs": [],
+          "lock_sha256": "0c8709716820c9ccc05f77d86cb96de19d9e6377d7767e67863eada48002eb53",
+          "lock_size": 26730
+        },
+        "stale": {
+          "bazel_error_mode_build_exit": 1,
+          "stale_inputs": [
+            "third_party/py/requirements lock.txt"
+          ],
+          "lock_sha256": "0c8709716820c9ccc05f77d86cb96de19d9e6377d7767e67863eada48002eb53",
+          "lock_size": 26730
+        }
+      },
+      {
+        "bazel": "9.1.1",
+        "dir": "recorded-inputs/bazel-9.1.1",
+        "lockFileVersion": 26,
+        "family": "B",
+        "container": "recordedInputs",
+        "keys": {
+          "dep.lock": "FILE:@@//dep.lock",
+          "third_party/py/requirements lock.txt": "FILE:@@//third_party/py/requirements\\slock.txt"
+        },
+        "records_moduleFileHash": false,
+        "fresh": {
+          "bazel_error_mode_build_exit": 0,
+          "stale_inputs": [],
+          "lock_sha256": "9b509cdcb7546900998017cf88961c5fa78057d4100708b3f64879e2b1ba8729",
+          "lock_size": 26730
+        },
+        "stale": {
+          "bazel_error_mode_build_exit": 1,
+          "stale_inputs": [
+            "third_party/py/requirements lock.txt"
+          ],
+          "lock_sha256": "9b509cdcb7546900998017cf88961c5fa78057d4100708b3f64879e2b1ba8729",
+          "lock_size": 26730
+        }
+      },
+      {
+        "bazel": "9.3.2",
+        "dir": "recorded-inputs/bazel-9.3.2",
+        "lockFileVersion": 28,
+        "family": "B",
+        "container": "recordedInputs",
+        "keys": {
+          "dep.lock": "FILE:@@//dep.lock",
+          "third_party/py/requirements lock.txt": "FILE:@@//third_party/py/requirements\\slock.txt"
+        },
+        "records_moduleFileHash": false,
+        "fresh": {
+          "bazel_error_mode_build_exit": 0,
+          "stale_inputs": [],
+          "lock_sha256": "2582bd4cd188efb97dcd9ef5e5dda1e65c536c49cc3a8e6c889ab25e4ae20536",
+          "lock_size": 26752
+        },
+        "stale": {
+          "bazel_error_mode_build_exit": 1,
+          "stale_inputs": [
+            "third_party/py/requirements lock.txt"
+          ],
+          "lock_sha256": "2582bd4cd188efb97dcd9ef5e5dda1e65c536c49cc3a8e6c889ab25e4ae20536",
+          "lock_size": 26752
+        }
+      },
+      {
+        "bazel": "10.0.0rc3",
+        "dir": "recorded-inputs/bazel-10.0.0rc3",
+        "lockFileVersion": 28,
+        "family": "B",
+        "container": "recordedInputs",
+        "keys": {
+          "dep.lock": "FILE:@@//dep.lock",
+          "third_party/py/requirements lock.txt": "FILE:@@//third_party/py/requirements\\slock.txt"
+        },
+        "records_moduleFileHash": false,
+        "fresh": {
+          "bazel_error_mode_build_exit": 0,
+          "stale_inputs": [],
+          "lock_sha256": "55882b0bc5468cfae848b991e934c87e3bac65ca0d1988102470194546689a20",
+          "lock_size": 35619
+        },
+        "stale": {
+          "bazel_error_mode_build_exit": 1,
+          "stale_inputs": [
+            "third_party/py/requirements lock.txt"
+          ],
+          "lock_sha256": "55882b0bc5468cfae848b991e934c87e3bac65ca0d1988102470194546689a20",
+          "lock_size": 35619
+        }
+      }
+    ]
+  },
+  "l6_crlf_pair": {
+    "bazel": "7.0.2",
+    "lockFileVersion": 3,
+    "dir": "l6-crlf-pair/bazel-7.0.2",
+    "source_cell": "cells/l6-7.0.2",
+    "module_file": "root.MODULE.bazel (one tag: toy.from_file(lock = \"//:dep.lock\"))",
+    "key": "@@//:dep.lock",
+    "lf": {
+      "input": "lf/dep.lock",
+      "input_sha256": "e8416e29516964fe181293c389328c5eb829d92391d5fed444df3a5ba74cf535",
+      "lock": "lf/root.MODULE.bazel.lock",
+      "lock_sha256": "193ce944647afbf5e8008e3da72d51e5484200ec70b2a55c01ac4c702a8dcb39",
+      "lock_line_endings": "LF",
+      "lock_written_by": "Bazel, step E0 (`build //:consume --lockfile_mode=update`); the cell's snap/baseline.lock",
+      "input_source": "the cell had overwritten its LF input by the time it stopped; these are the bytes of recorded-inputs/bazel-7.0.2/fresh/dep.lock, the same generator's file, and their SHA-256 is the value this lock records"
+    },
+    "crlf": {
+      "input": "crlf/dep.lock",
+      "input_sha256": "a06841bae347dc1a62e0993147fb81c16a09ed30c01d53fa1988b9eeccf20e9d",
+      "lock": "crlf/root.MODULE.bazel.lock",
+      "lock_sha256": "bef94a3ce27f7bbe3e6d4b0396b65b1ba3ca9a6017c835ed92fd4645639e7ab2",
+      "lock_line_endings": "CRLF",
+      "lock_written_by": "Bazel, step E2 (`--lockfile_mode=update` after the input became CRLF); then the probe driver rewrote every LF of the lock to CRLF with the server stopped (step E3)",
+      "accepted_by_bazel": "step E3: `build //:consume --lockfile_mode=error` on a cold server, exit 0"
+    },
+    "difference": "the CRLF lock with its line endings made LF differs from the LF lock in one line, the accumulatedFileDigests value of @@//:dep.lock",
+    "steps_run_in_this_cell": {
+      "E0_baseline_update": 0,
+      "E1_error_after_crlf": 1,
+      "E2_update_after_crlf": 0,
+      "E3_error_with_crlf_lockfile": 0
+    },
+    "cell_note": "L6 widening stopped early (slot waits); only the steps listed ran. The lock-clobber question was rerun as l6c-7.0.2.",
+    "same_steps_on_other_releases": [
+      {
+        "bazel": "6.6.0",
+        "partial": true,
+        "exit": {
+          "E0_baseline_update": 0,
+          "E1_error_after_crlf": 1,
+          "E2_update_after_crlf": 0,
+          "E3_error_with_crlf_lockfile": 0,
+          "E3u_update_with_crlf_lockfile": 0,
+          "E3n_update_lock_without_final_newline": 0
+        }
+      },
+      {
+        "bazel": "7.0.2",
+        "partial": true,
+        "exit": {
+          "E0_baseline_update": 0,
+          "E1_error_after_crlf": 1,
+          "E2_update_after_crlf": 0,
+          "E3_error_with_crlf_lockfile": 0
+        }
+      },
+      {
+        "bazel": "7.1.2",
+        "partial": true,
+        "exit": {
+          "E0_baseline_update": 0,
+          "E1_error_after_crlf": 1,
+          "E2_update_after_crlf": 0,
+          "E3_error_with_crlf_lockfile": 0,
+          "E3u_update_with_crlf_lockfile": 0,
+          "E3n_update_lock_without_final_newline": 0
+        }
+      },
+      {
+        "bazel": "7.7.2",
+        "partial": false,
+        "exit": {
+          "E0_baseline_update": 0,
+          "E1_error_after_crlf": 1,
+          "E2_update_after_crlf": 0,
+          "E3_error_with_crlf_lockfile": 0,
+          "E3u_update_with_crlf_lockfile": 0,
+          "E3n_update_lock_without_final_newline": 0
+        },
+        "sha256_lf": "e8416e29516964fe181293c389328c5eb829d92391d5fed444df3a5ba74cf535",
+        "sha256_crlf": "a06841bae347dc1a62e0993147fb81c16a09ed30c01d53fa1988b9eeccf20e9d",
+        "error_after_crlf": "ERROR: Analysis of target '//:consume' failed; build aborted: MODULE.bazel.lock is no longer up-to-date because: One or more files the extension 'ModuleExtensionId{bzlFileLabel=//:ext.bzl, extensionName=toy, isolationKey=Optional.empty}' is using have changed. Please run `bazel mod deps --lockfile_mode=update` to update your lockfile.",
+        "update_records_crlf_digest": true,
+        "crlf_lock_untouched_by_error_mode": true,
+        "crlf_lock_still_crlf_after_update": true,
+        "lock_without_final_newline_left_as_is": true
+      },
+      {
+        "bazel": "8.4.2",
+        "partial": true,
+        "exit": {
+          "E0_baseline_update": 0
+        }
+      },
+      {
+        "bazel": "8.8.2",
+        "partial": true,
+        "exit": {
+          "E0_baseline_update": 0,
+          "E1_error_after_crlf": 1,
+          "E2_update_after_crlf": 0,
+          "E3_error_with_crlf_lockfile": 0,
+          "E3u_update_with_crlf_lockfile": 0,
+          "E3n_update_lock_without_final_newline": 0
+        }
+      },
+      {
+        "bazel": "9.3.2",
+        "partial": false,
+        "exit": {
+          "E0_baseline_update": 0,
+          "E1_error_after_crlf": 1,
+          "E2_update_after_crlf": 0,
+          "E3_error_with_crlf_lockfile": 0,
+          "E3u_update_with_crlf_lockfile": 0,
+          "E3n_update_lock_without_final_newline": 0
+        },
+        "sha256_lf": "e8416e29516964fe181293c389328c5eb829d92391d5fed444df3a5ba74cf535",
+        "sha256_crlf": "a06841bae347dc1a62e0993147fb81c16a09ed30c01d53fa1988b9eeccf20e9d",
+        "error_after_crlf": "ERROR: Analysis of target '//:consume' failed; build aborted: MODULE.bazel.lock is no longer up-to-date because an input to the extension '@@//:ext.bzl%toy' changed: file info or contents of @@//dep.lock changed. Please run `bazel mod deps --lockfile_mode=update` to update your lockfile.",
+        "update_records_crlf_digest": true,
+        "crlf_lock_untouched_by_error_mode": true,
+        "crlf_lock_still_crlf_after_update": true,
+        "lock_without_final_newline_left_as_is": true
+      },
+      {
+        "bazel": "10.0.0rc3",
+        "partial": true,
+        "exit": {
+          "E0_baseline_update": 0,
+          "E1_error_after_crlf": 1,
+          "E2_update_after_crlf": 0,
+          "E3_error_with_crlf_lockfile": 0,
+          "E3u_update_with_crlf_lockfile": 0
+        }
+      }
+    ]
+  }
+}
