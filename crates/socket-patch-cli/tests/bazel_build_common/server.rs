@@ -124,7 +124,10 @@ impl Cell {
         Self::open_in(test, group, system, Scratch::new, Bazel::detect_launcher)
     }
 
-    fn open_in(
+    /// The body of the three `open` functions. Visible to the harness's
+    /// selftests, which pass a `detect` that probes nothing and so get a
+    /// cell without a Bazel.
+    pub(super) fn open_in(
         test: &str,
         group: Group,
         system: Option<System>,
@@ -160,6 +163,10 @@ impl Cell {
             }
         };
         report.bazel = Some(bazel.version.text.clone());
+        // The cell is now known, and with it the report's file name. What
+        // an earlier run left there goes first: should this run fail, no
+        // `ran` report may remain to be read as its evidence.
+        report.discard_earlier();
         if let Some(system) = system.filter(|s| bazel.version.system_flags(*s).is_none()) {
             let why = format!(
                 "Bazel {} has no {} system",
@@ -214,11 +221,12 @@ impl Cell {
     }
 
     /// The pid of the cell's running server, from its pid file: asking
-    /// costs no Bazel command and cannot start a server.
+    /// costs no Bazel command and cannot start a server. A server that
+    /// was killed or crashed leaves its pid file behind; [`Cell::shutdown`]
+    /// clears it.
     pub fn server_pid(&self) -> Option<u32> {
-        server_pids(&self.scratch.output_user_root)
-            .into_iter()
-            .next()
+        let files = pid_files(&self.scratch.output_user_root);
+        files.into_iter().map(|(_, pid)| pid).next()
     }
 
     /// `bazel shutdown`, when a server runs. Tests call this before they
@@ -239,12 +247,7 @@ impl Cell {
         if !run.ok() {
             return Err(format!("`bazel shutdown` failed:\n{}", run.dump()));
         }
-        match self.server_pid() {
-            Some(pid) => Err(format!(
-                "server {pid} still has its pid file after `bazel shutdown`"
-            )),
-            None => Ok(()),
-        }
+        settle_pid_files(&self.scratch.output_user_root, process_alive)
     }
 
     /// End the cell: stop the server, remove the scratch root and check
@@ -278,16 +281,74 @@ impl Drop for Cell {
     }
 }
 
-/// The pid of every live server under `output_user_root`. A server
-/// removes its pid file when it exits.
-fn server_pids(output_user_root: &Path) -> Vec<u32> {
+/// The pid file of every server under `output_user_root`, with the pid it
+/// names. A server removes its file in a JVM shutdown hook, so a file
+/// outlives a server that was killed (`SIGKILL`, the OOM killer) or that
+/// halted on a crash (exit 37).
+pub fn pid_files(output_user_root: &Path) -> Vec<(PathBuf, u32)> {
     let bases = std::fs::read_dir(output_user_root)
         .into_iter()
         .flatten()
         .flatten();
     let pid_file = |base: PathBuf| base.join("server").join("server.pid.txt");
     bases
-        .filter_map(|base| std::fs::read_to_string(pid_file(base.path())).ok())
-        .filter_map(|text| text.trim().parse().ok())
+        .map(|base| pid_file(base.path()))
+        .filter_map(|file| {
+            let pid = std::fs::read_to_string(&file).ok()?.trim().parse().ok()?;
+            Some((file, pid))
+        })
         .collect()
+}
+
+/// What the pid files still under `output_user_root` after a successful
+/// `bazel shutdown` mean. The client returns at once from `shutdown` when
+/// no server answers, and nothing then removes a dead server's file: a
+/// file whose process `alive` says is gone is stale and is removed here.
+/// `Err` only for a server that is still running.
+pub fn settle_pid_files(
+    output_user_root: &Path,
+    alive: impl Fn(u32) -> bool,
+) -> Result<(), String> {
+    for (file, pid) in pid_files(output_user_root) {
+        if alive(pid) {
+            return Err(format!(
+                "server {pid} is still running after `bazel shutdown` ({})",
+                file.display()
+            ));
+        }
+        match std::fs::remove_file(&file) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(format!("remove the stale {}: {e}", file.display())),
+        }
+    }
+    Ok(())
+}
+
+/// Whether a process with this pid exists and is ours to signal. A pid
+/// reused by another user's process counts as gone: the server was ours.
+#[cfg(unix)]
+pub fn process_alive(pid: u32) -> bool {
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return false;
+    };
+    // Signal 0: the existence and permission checks alone. A pid of 0
+    // would address this process's own group.
+    // SAFETY: `kill` takes two integers and touches no memory.
+    pid > 0 && unsafe { libc::kill(pid, 0) } == 0
+}
+
+/// Whether a process with this pid exists, from `tasklist`. When the
+/// answer cannot be had the process counts as alive: a server must not be
+/// declared gone on a guess.
+#[cfg(not(unix))]
+pub fn process_alive(pid: u32) -> bool {
+    let filter = format!("PID eq {pid}");
+    let listed = crate::common::hermetic::command(Path::new("tasklist"))
+        .args(["/FI", filter.as_str(), "/FO", "CSV", "/NH"])
+        .output();
+    let Ok(out) = listed else { return true };
+    // A match is one CSV row with the pid as a quoted field; no match is
+    // an `INFO:` line.
+    !out.status.success() || String::from_utf8_lossy(&out.stdout).contains(&format!("\"{pid}\""))
 }

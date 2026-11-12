@@ -40,7 +40,7 @@ impl Bazel {
             let found = socket_patch_core::utils::process::resolve_tool("bazel");
             found.map_or_else(|| "bazel".into(), PathBuf::into_os_string)
         };
-        let program = env::var(env::BAZEL).unwrap_or_else(on_path);
+        let program = env::var(env::BAZEL).map_or_else(on_path, absolute_program);
         let bazelisk = named_bazelisk(Path::new(&program));
         Self::probe(scratch, program, bazelisk, env::var(env::VERSION))
     }
@@ -61,7 +61,7 @@ impl Bazel {
             "{} must be an absolute path: bazelisk treats anything else as a version to download",
             env::BINARY
         );
-        Self::probe(scratch, program, true, Some(binary))
+        Self::probe(scratch, absolute_program(program), true, Some(binary))
     }
 
     fn probe(
@@ -138,6 +138,20 @@ impl Bazel {
             .arg(command);
         cmd
     }
+}
+
+/// A program named by a path (anything with a separator) made absolute
+/// against this process's working directory; a bare name is left for
+/// `PATH`. The `--version` probe runs from the test's directory and every
+/// later command from the workspace copy, so a relative path would answer
+/// the probe and then fail to spawn.
+pub fn absolute_program(program: OsString) -> OsString {
+    let path = Path::new(&program);
+    if path.is_absolute() || path.components().count() < 2 {
+        return program;
+    }
+    let absolute = std::path::absolute(path);
+    absolute.map_or(program, PathBuf::into_os_string)
 }
 
 /// The program with the isolated environment and no arguments. Built

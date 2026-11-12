@@ -6,10 +6,12 @@
 //! it: not the developer's `~/.cache/bazel`, not the shared system temp
 //! directory, not the default bazelisk home.
 
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use super::env::{self, Version};
+use crate::common::hermetic;
 
 /// The temp root of one test (`<T>` in the design), with fixed places for
 /// everything a Bazel run writes.
@@ -173,29 +175,75 @@ pub fn remove_tree(dir: &Path) {
     }
 }
 
+/// Whether the default output user root of this OS has the user's name in
+/// a directory the harness must name itself: `/private/var/tmp/_bazel_<user>`
+/// on macOS and `%USERPROFILE%\_bazel_<user>` on Windows. On Linux the root
+/// is `~/.cache/bazel/_bazel_<user>`, which is watched through its parent.
+pub const USER_NAMED_OUTPUT_ROOT: bool = cfg!(any(target_os = "macos", windows));
+
 /// The directories a Bazel or bazelisk that escaped isolation writes: the
 /// default output user roots of every line and OS, and bazelisk's default
 /// home. Read from the test process's own environment, which is the
-/// developer's or the runner's real one.
+/// developer's or the runner's real one. Panics when the user's name is
+/// needed and cannot be found (see [`locations`]): a check that watches
+/// nothing must not pass.
 pub fn default_locations() -> Vec<PathBuf> {
     let var = |name: &str| std::env::var_os(name).filter(|v| !v.is_empty());
-    let mut out = Vec::new();
-    let user = var("USER").or_else(|| var("USERNAME"));
-    if let Some(home) = var("HOME")
-        .or_else(|| var("USERPROFILE"))
-        .map(PathBuf::from)
-    {
-        out.push(home.join(".cache").join("bazel"));
-        out.push(home.join(".cache").join("bazelisk"));
-        out.push(home.join("Library").join("Caches").join("bazel"));
-        out.push(home.join("Library").join("Caches").join("bazelisk"));
-        if let Some(user) = &user {
-            // Windows: the output user root is `%USERPROFILE%\_bazel_<user>`.
-            out.push(home.join(format!("_bazel_{}", user.to_string_lossy())));
-        }
+    locations(&var, passwd_user_name, USER_NAMED_OUTPUT_ROOT).unwrap_or_else(|why| panic!("{why}"))
+}
+
+/// [`default_locations`] for the environment `var` reads. The user's name
+/// is `USER` / `USERNAME` when one is set (Bazel reads `USER` first).
+/// Otherwise, as in a container that sets `HOME` alone, Bazel takes the
+/// name from the passwd entry: the harness then watches the roots of
+/// `LOGNAME` and of what `passwd_name` finds. `Err` when the default
+/// output root cannot be found: no home directory, or no name where
+/// `user_named_root` says the root carries it.
+pub fn locations(
+    var: &dyn Fn(&str) -> Option<OsString>,
+    passwd_name: impl FnOnce() -> Option<String>,
+    user_named_root: bool,
+) -> Result<Vec<PathBuf>, String> {
+    let named = |names: &[&str]| -> Vec<String> {
+        let values = names.iter().filter_map(|name| var(name));
+        values
+            .map(|value| value.to_string_lossy().into_owned())
+            .collect()
+    };
+    let mut users = named(&["USER", "USERNAME"]);
+    if users.is_empty() {
+        users = named(&["LOGNAME"]);
+        users.extend(passwd_name().filter(|name| !name.is_empty()));
     }
-    if let Some(user) = &user {
-        let name = format!("_bazel_{}", user.to_string_lossy());
+    if users.is_empty() && user_named_root {
+        return Err(
+            "cannot watch the default Bazel output root: none of USER, USERNAME and LOGNAME \
+             is set and `id -un` found no name. Set USER to the name of the user running the \
+             tests."
+                .to_string(),
+        );
+    }
+    // Every default location but the macOS output root is under the home
+    // directory (Bazel falls back to the passwd entry's, which the
+    // harness does not read).
+    let home = var("HOME").or_else(|| var("USERPROFILE"));
+    let Some(home) = home.map(PathBuf::from) else {
+        return Err(
+            "cannot watch the default Bazel and bazelisk locations: neither HOME nor \
+             USERPROFILE is set"
+                .to_string(),
+        );
+    };
+    let mut out = vec![
+        home.join(".cache").join("bazel"),
+        home.join(".cache").join("bazelisk"),
+        home.join("Library").join("Caches").join("bazel"),
+        home.join("Library").join("Caches").join("bazelisk"),
+    ];
+    for user in &users {
+        let name = format!("_bazel_{user}");
+        // Windows: the output user root is `%USERPROFILE%\_bazel_<user>`.
+        out.push(home.join(&name));
         out.push(PathBuf::from("/private/var/tmp").join(&name));
         out.push(PathBuf::from("/var/tmp").join(name));
     }
@@ -208,7 +256,19 @@ pub fn default_locations() -> Vec<PathBuf> {
     }
     out.sort();
     out.dedup();
-    out
+    Ok(out)
+}
+
+/// The current user's name from the passwd database (`id -un`), which is
+/// where Bazel and the JVM take it from when `USER` is unset. `None` when
+/// `id` is missing (Windows) or fails.
+pub fn passwd_user_name() -> Option<String> {
+    let out = hermetic::command(Path::new("id"))
+        .arg("-un")
+        .output()
+        .ok()?;
+    let name = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (out.status.success() && !name.is_empty()).then_some(name)
 }
 
 /// What [`default_locations`] looked like at one moment: whether each
@@ -306,14 +366,26 @@ pub fn server_cmdline(output_base: &Path) -> Vec<String> {
 /// ignores `TMPDIR` and uses the per-user directory). Keyed by pid, so
 /// another server on the same machine cannot cause a false alarm.
 pub fn stray_perf_data(server_pid: u32) -> Vec<PathBuf> {
-    let user = std::env::var("USER")
-        .or_else(|_| std::env::var("USERNAME"))
-        .unwrap_or_default();
-    let name = format!("hsperfdata_{user}");
     let mut dirs = vec![PathBuf::from("/tmp"), std::env::temp_dir()];
     dirs.dedup();
-    dirs.into_iter()
-        .map(|dir| dir.join(&name).join(server_pid.to_string()))
-        .filter(|path| path.exists())
-        .collect()
+    stray_perf_data_in(&dirs, server_pid)
+}
+
+/// [`stray_perf_data`] for the temp directories `dirs`. Every
+/// `hsperfdata_*` directory is looked into: HotSpot names it from the
+/// passwd entry, not from `USER`, which a container may not even set.
+pub fn stray_perf_data_in(dirs: &[PathBuf], server_pid: u32) -> Vec<PathBuf> {
+    let pid = server_pid.to_string();
+    let mut found = Vec::new();
+    for dir in dirs {
+        for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            let name = entry.file_name();
+            let file = entry.path().join(&pid);
+            if name.to_string_lossy().starts_with("hsperfdata_") && file.exists() {
+                found.push(file);
+            }
+        }
+    }
+    found.sort();
+    found
 }

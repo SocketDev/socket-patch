@@ -117,9 +117,11 @@ fetch() {
 }
 
 # Both pins are resolved before the first download: an unpinned version or
-# platform costs no network and leaves <dir> untouched.
-bazelisk_sha="$(pin bazelisk "$BAZELISK_VERSION")"
+# platform costs no network and leaves <dir> untouched. The Bazel pin first,
+# so the message names the version that was asked for on every platform,
+# also on one that has no bazelisk pin either.
 bazel_sha="$(pin bazel "$VERSION")"
+bazelisk_sha="$(pin bazelisk "$BAZELISK_VERSION")"
 
 mkdir -p "$DIR"
 DIR="$(cd "$DIR" && pwd)"

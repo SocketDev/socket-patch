@@ -132,19 +132,39 @@ impl System {
     }
 }
 
-/// The group [`GROUP`] selects; `None` = every group. A value that names
-/// no group is a failure, not "every group": a typo in a CI cell must not
-/// turn into a run that skips everything it was meant to cover.
-pub fn selected_group() -> Option<Group> {
-    let text = var(GROUP)?.to_string_lossy().into_owned();
-    Some(Group::parse(&text).unwrap_or_else(|| panic!("{GROUP}={text} names no fixture group")))
+/// What a [`GROUP`] value selects: `None` (unset) = every group. A value
+/// that names no group is an error, not "every group": a typo in a CI cell
+/// must not turn into a run that skips everything it was meant to cover.
+pub fn parse_group(value: Option<&str>) -> Result<Option<Group>, String> {
+    let Some(text) = value else { return Ok(None) };
+    let group = Group::parse(text);
+    group
+        .map(Some)
+        .ok_or_else(|| format!("{GROUP}={text} names no fixture group (core, light, heavy)"))
 }
 
-/// The dependency system [`SYSTEM`] selects; `None` = every system.
+/// What a [`SYSTEM`] value selects: `None` (unset) = every system. An
+/// unknown value is an error, as for [`parse_group`].
+pub fn parse_system(value: Option<&str>) -> Result<Option<System>, String> {
+    let Some(text) = value else { return Ok(None) };
+    let system = System::parse(text);
+    system.map(Some).ok_or_else(|| {
+        format!("{SYSTEM}={text} names no dependency system (bzlmod, workspace, hybrid)")
+    })
+}
+
+/// The group [`GROUP`] selects; `None` = every group. Panics on a value
+/// [`parse_group`] refuses.
+pub fn selected_group() -> Option<Group> {
+    let text = var(GROUP).map(|v| v.to_string_lossy().into_owned());
+    parse_group(text.as_deref()).unwrap_or_else(|why| panic!("{why}"))
+}
+
+/// The dependency system [`SYSTEM`] selects; `None` = every system. Panics
+/// on a value [`parse_system`] refuses.
 pub fn selected_system() -> Option<System> {
-    let text = var(SYSTEM)?.to_string_lossy().into_owned();
-    let system = System::parse(&text);
-    Some(system.unwrap_or_else(|| panic!("{SYSTEM}={text} names no dependency system")))
+    let text = var(SYSTEM).map(|v| v.to_string_lossy().into_owned());
+    parse_system(text.as_deref()).unwrap_or_else(|why| panic!("{why}"))
 }
 
 /// A Bazel release as `bazel --version` prints it.
@@ -222,10 +242,12 @@ impl Version {
         self.at_least(8, 3, 0)
     }
 
-    /// 8.x renamed the flag; the old name still works there but prints a
-    /// deprecation warning on every command.
+    /// 8.2.0 renamed the flag: 8.0.x and 8.1.x know only the experimental
+    /// spelling (`Unrecognized option` for the new one), and from 8.2.0 the
+    /// old name still works but prints a deprecation warning on every
+    /// command.
     pub fn downloader_config_flag(&self) -> &'static str {
-        if self.major >= 8 {
+        if self.at_least(8, 2, 0) {
             "--downloader_config"
         } else {
             "--experimental_downloader_config"

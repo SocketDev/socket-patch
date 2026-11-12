@@ -6,18 +6,19 @@ use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256, Sha512};
 
-use super::env::{System, Version};
+use super::env::{self, Group, System, Version};
 use super::fixture_server::FixtureServer;
-use super::invoke::{Bazel, Options};
+use super::invoke::{absolute_program, Bazel, Options};
 use super::isolation::{self, OutsideState, Scratch};
-use super::probe_report::{Report, Status};
+use super::probe_report::{self, Report, Status};
 use super::proof::{parse_locations, Anchor, SourceFile};
-use super::server::Limiter;
+use super::server::{self, Cell, Limiter};
 use super::workspace;
+use crate::common::hermetic;
 
 fn version(text: &str) -> Version {
     Version::parse(text).unwrap_or_else(|| panic!("{text} parses"))
@@ -30,6 +31,37 @@ fn bazel(text: &str, bazelisk: bool) -> Bazel {
         bazelisk,
         use_version: Some(text.into()),
     }
+}
+
+/// Whether `check` panics.
+fn panics(check: &dyn Fn()) -> bool {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(check)).is_err()
+}
+
+/// The version of the cells the selftests open: no release has it, so
+/// their report names cannot collide with a real cell's.
+const NO_RELEASE: &str = "0.0.0";
+
+/// A [`Cell`] that needs no Bazel: `detect` names a program and probes
+/// nothing. With [`no_bazel`] any command the cell tried to run would fail
+/// to spawn, so a selftest reaches only what works without a server. The
+/// group is the one the environment selects, so the cell is never skipped.
+fn selftest_cell(test: &str, detect: fn(&Scratch) -> Result<Bazel, String>) -> Cell {
+    let group = env::selected_group().unwrap_or(Group::Core);
+    Cell::open_in(test, group, None, Scratch::cold, detect).expect("a cell that needs no Bazel")
+}
+
+fn stand_in(program: &str) -> Result<Bazel, String> {
+    Ok(Bazel {
+        program: program.into(),
+        version: version(NO_RELEASE),
+        bazelisk: false,
+        use_version: None,
+    })
+}
+
+fn no_bazel(_: &Scratch) -> Result<Bazel, String> {
+    stand_in("socket-patch-selftest-no-such-bazel")
 }
 
 fn strings(args: &[OsString]) -> Vec<String> {
@@ -265,6 +297,35 @@ fn command_options_follow_the_bazel_line() {
     assert!(eight.contains(&format!("--downloader_config={}", server_config.display())));
     assert!(eight.contains(&"--enable_workspace".to_string()));
     assert!(eight.contains(&"--repo_contents_cache=".to_string()));
+    // 8.2.0 renamed the downloader flag: 8.0.x and 8.1.x refuse the new
+    // spelling (`Unrecognized option`), every earlier line too.
+    let rewrite = Options {
+        downloader_config: Some(server_config.clone()),
+        ..Options::default()
+    };
+    let experimental = format!(
+        "--experimental_downloader_config={}",
+        server_config.display()
+    );
+    let renamed = format!("--downloader_config={}", server_config.display());
+    for (line, want) in [
+        ("5.4.1", &experimental),
+        ("7.7.2", &experimental),
+        ("8.0.0", &experimental),
+        ("8.1.1", &experimental),
+        ("8.2.0", &renamed),
+        ("8.4.2", &renamed),
+        ("8.8.2", &renamed),
+        ("9.3.2", &renamed),
+        ("10.0.0rc3", &renamed),
+    ] {
+        let all = args(line, &rewrite).unwrap();
+        let flags: Vec<&String> = all
+            .iter()
+            .filter(|a| a.contains("downloader_config="))
+            .collect();
+        assert_eq!(flags, [want], "Bazel {line}");
+    }
     // Only the canary that tests the contents cache leaves it on.
     let canary = Options {
         contents_cache: true,
@@ -320,9 +381,41 @@ fn outside_state_reports_created_changed_and_removed_entries() {
     let present = tmp.path().join("present");
     let absent = tmp.path().join("absent");
     std::fs::create_dir_all(present.join("_bazel_user/old")).unwrap();
+    let keep = present.join("_bazel_user/keep");
+    std::fs::create_dir_all(&keep).unwrap();
     let state = OutsideState::capture_of(&[present.clone(), absent.clone()]);
     assert_eq!(state.changes(), Vec::<String>::new());
     state.assert_untouched("nothing happened");
+
+    // A write three levels down (a new install base under an existing
+    // `_bazel_<user>/install`, a bazelisk download under
+    // `downloads/sha256`) is below what the fingerprint lists. Only the
+    // modification time of the recorded directory above it tells. A
+    // directory's time may not advance within one timestamp tick of its
+    // creation, so entries are added until it does.
+    let changed = format!("changed: {}", keep.display());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    for n in 0.. {
+        std::fs::write(keep.join(format!("x{n}")), "").unwrap();
+        if state.changes().contains(&changed) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "an entry added to a recorded directory was never reported as {changed}: {:?}",
+            state.changes()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let third_level = keep.join("x0").display().to_string();
+    assert!(
+        !state
+            .changes()
+            .iter()
+            .any(|line| line.ends_with(&third_level)),
+        "the third level is not listed: {:?}",
+        state.changes()
+    );
 
     // A stray run creates `<root>/_bazel_<user>/<md5>`, two levels down.
     std::fs::create_dir_all(present.join("_bazel_user/0123abcd")).unwrap();
@@ -374,6 +467,117 @@ fn server_cmdline_is_read_from_the_output_base() {
 }
 
 #[test]
+fn stray_perf_data_is_found_under_any_user_name() {
+    // HotSpot names the directory from the passwd entry; the test process
+    // may have no USER at all (a container that sets HOME only).
+    let tmp = tempfile::tempdir().unwrap();
+    let other = tempfile::tempdir().unwrap();
+    let file = |rel: &str| {
+        let path = tmp.path().join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "").unwrap();
+        path
+    };
+    let server = file("hsperfdata_alice/4242");
+    file("hsperfdata_alice/7");
+    let root_server = file("hsperfdata_root/1");
+    // Not a perf-data directory, whatever it holds.
+    file("bazel-jni.4242/4242");
+    let dirs = [
+        tmp.path().to_path_buf(),
+        other.path().to_path_buf(),
+        tmp.path().join("absent"),
+    ];
+    assert_eq!(isolation::stray_perf_data_in(&dirs, 4242), [server]);
+    assert_eq!(isolation::stray_perf_data_in(&dirs, 1), [root_server]);
+    assert_eq!(
+        isolation::stray_perf_data_in(&dirs, 99),
+        Vec::<PathBuf>::new()
+    );
+}
+
+/// An environment that holds exactly `pairs`.
+fn env_of(pairs: &'static [(&'static str, &'static str)]) -> impl Fn(&str) -> Option<OsString> {
+    move |name| {
+        let hit = pairs.iter().find(|(known, _)| *known == name);
+        hit.map(|(_, value)| OsString::from(value))
+    }
+}
+
+#[test]
+fn the_default_output_roots_are_watched_without_a_user_variable() {
+    let user_root = |home: &str, user: &str| {
+        let name = format!("_bazel_{user}");
+        [
+            Path::new(home).join(&name),
+            Path::new("/private/var/tmp").join(&name),
+            Path::new("/var/tmp").join(&name),
+        ]
+    };
+    let unasked = || -> Option<String> { panic!("USER is set: the passwd entry is not read") };
+
+    let named =
+        isolation::locations(&env_of(&[("HOME", "/h"), ("USER", "alice")]), unasked, true).unwrap();
+    for path in user_root("/h", "alice") {
+        assert!(named.contains(&path), "{}: {named:?}", path.display());
+    }
+    assert!(named.contains(&Path::new("/h").join(".cache").join("bazel")));
+
+    // A container sets HOME alone: Bazel then names its root from the
+    // passwd entry, and so must the watch.
+    let container = env_of(&[("HOME", "/root")]);
+    let watched = isolation::locations(&container, || Some("root".into()), true).unwrap();
+    for path in user_root("/root", "root") {
+        assert!(watched.contains(&path), "{}: {watched:?}", path.display());
+    }
+
+    // LOGNAME can differ from the passwd name: both roots are watched.
+    let login = env_of(&[("HOME", "/h"), ("LOGNAME", "bob")]);
+    let both = isolation::locations(&login, || Some("builder".into()), true).unwrap();
+    for path in user_root("/h", "bob")
+        .iter()
+        .chain(&user_root("/h", "builder"))
+    {
+        assert!(both.contains(path), "{}: {both:?}", path.display());
+    }
+
+    // No name at all. Where the default root carries the name (macOS,
+    // Windows) the check would watch nothing: refused. On Linux the root
+    // is under ~/.cache/bazel, which HOME already covers.
+    let nameless = env_of(&[("HOME", "/h")]);
+    let refused = isolation::locations(&nameless, || None, true).unwrap_err();
+    assert!(refused.contains("USER"), "{refused}");
+    let empty_name = isolation::locations(&nameless, || Some(String::new()), true);
+    assert!(empty_name.is_err(), "an empty name is no name");
+    let linux = isolation::locations(&nameless, || None, false).unwrap();
+    assert!(linux.contains(&Path::new("/h").join(".cache").join("bazel")));
+    let named_roots = |paths: &[PathBuf]| {
+        let has = |p: &&PathBuf| p.to_string_lossy().contains("_bazel_");
+        paths.iter().filter(has).count()
+    };
+    assert_eq!(named_roots(&linux), 0);
+    assert_eq!(named_roots(&named), 3);
+
+    // No home directory: nothing but the macOS root could be watched.
+    let homeless = env_of(&[("USER", "alice"), ("XDG_CACHE_HOME", "/x")]);
+    let refused = isolation::locations(&homeless, || None, false).unwrap_err();
+    assert!(refused.contains("HOME"), "{refused}");
+    let windows = env_of(&[("USERPROFILE", "/u"), ("USERNAME", "alice")]);
+    let watched = isolation::locations(&windows, || None, true).unwrap();
+    assert!(watched.contains(&Path::new("/u").join("_bazel_alice")));
+}
+
+#[cfg(unix)]
+#[test]
+fn the_passwd_entry_names_the_current_user() {
+    let name = isolation::passwd_user_name().expect("`id -un` prints a name");
+    assert!(
+        !name.is_empty() && !name.contains(char::is_whitespace),
+        "{name:?}"
+    );
+}
+
+#[test]
 fn the_limiter_admits_two_and_blocks_the_third() {
     static LIMITER: Limiter = Limiter::new(2);
     let (taken, first_holds) = std::sync::mpsc::channel();
@@ -416,6 +620,17 @@ fn a_test_holds_one_cell_at_a_time() {
 
 /// One request to the fixture server, as (status line, body).
 fn http(server: &FixtureServer, method: &str, target: &str, headers: &str) -> (String, Vec<u8>) {
+    let (head, body) = http_response(server, method, target, headers);
+    (head.lines().next().unwrap().to_string(), body)
+}
+
+/// One request to the fixture server, as (response head, body).
+fn http_response(
+    server: &FixtureServer,
+    method: &str,
+    target: &str,
+    headers: &str,
+) -> (String, Vec<u8>) {
     let mut stream = std::net::TcpStream::connect(("127.0.0.1", server.port())).unwrap();
     write!(
         stream,
@@ -429,10 +644,7 @@ fn http(server: &FixtureServer, method: &str, target: &str, headers: &str) -> (S
         .position(|w| w == b"\r\n\r\n")
         .expect("a header block");
     let head = String::from_utf8_lossy(&response[..split]).into_owned();
-    (
-        head.lines().next().unwrap().to_string(),
-        response[split + 4..].to_vec(),
-    )
+    (head, response[split + 4..].to_vec())
 }
 
 #[test]
@@ -482,35 +694,120 @@ fn fixture_server_serves_by_original_url_and_answers_a_miss_with_404() {
         "https://registry.npmjs.org/other/-/other-1.0.0.tgz",
         "offline",
     );
-    server.assert_no_header("Authorization", "no credential");
-    let asked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        server.assert_not_requested(url, "offline")
-    }));
+    assert_eq!(server.assert_requested(url, "twin").len(), 3);
+    server.assert_no_header("Authorization", url, "no credential");
     assert!(
-        asked.is_err(),
+        panics(&|| server.assert_not_requested(url, "offline")),
         "a requested URL must fail the offline assertion"
     );
 
     http(&server, "GET", target, "Authorization: Bearer secret\r\n");
-    let leaked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        server.assert_no_header("authorization", "no credential")
-    }));
-    assert!(leaked.is_err(), "a credential header must be seen");
+    assert!(
+        panics(&|| server.assert_no_header("authorization", url, "no credential")),
+        "a credential header must be seen"
+    );
 }
 
 #[test]
-fn an_assertion_about_an_unreached_server_fails() {
-    // A warm repository cache sends nothing: "no request for X" would pass
-    // without having tested anything.
+fn the_offline_assertion_has_no_minimum_and_a_cold_one_needs_the_artifact() {
     let server = FixtureServer::start();
-    for check in [
-        Box::new(|| server.assert_not_requested("https://example.invalid/x", "twin"))
-            as Box<dyn Fn()>,
-        Box::new(|| server.assert_no_header("Authorization", "twin")),
-    ] {
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(check));
-        assert!(result.is_err(), "an unreached server proves nothing");
-    }
+    let artifact = "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz";
+    let requested = || drop(server.assert_requested(artifact, "twin"));
+    let no_credential = || server.assert_no_header("Authorization", artifact, "twin");
+
+    // The offline phase runs on a warm cache, where a fully checksummed
+    // fixture sends nothing: zero requests is its expected result.
+    server.assert_not_requested(artifact, "offline");
+    // The same silence proves nothing about what a fetch would send.
+    assert!(panics(&requested), "nothing was requested");
+    assert!(panics(&no_credential), "nothing was requested");
+
+    // A cold cell always asks the server for registry files, also when the
+    // artifact itself was never fetched. "Some request arrived" is not
+    // "the artifact was requested".
+    http(
+        &server,
+        "GET",
+        "/bcr.bazel.build/modules/x/1.0/MODULE.bazel",
+        "",
+    );
+    assert_eq!(server.hosts(), ["bcr.bazel.build"]);
+    server.assert_not_requested(artifact, "offline");
+    assert!(panics(&requested), "only the registry was asked");
+    assert!(
+        panics(&no_credential),
+        "no Authorization on a registry read says nothing about the artifact fetch"
+    );
+
+    server.serve(artifact, b"tarball".to_vec());
+    let target = "/registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz";
+    http(&server, "GET", target, "");
+    let hits = server.assert_requested(artifact, "twin");
+    assert_eq!(
+        hits.iter().map(|r| r.status).collect::<Vec<_>>(),
+        [200],
+        "the twin reads the status from what is returned"
+    );
+    no_credential();
+    assert!(panics(&|| server.assert_not_requested(artifact, "offline")));
+
+    // A credential on any request is a leak, not only on the artifact's.
+    http(
+        &server,
+        "GET",
+        "/bcr.bazel.build/modules/x/1.0/source.json",
+        "Authorization: Basic eDp5\r\n",
+    );
+    assert!(panics(&no_credential), "a credential went to the registry");
+}
+
+#[test]
+fn fixture_server_states_the_content_type_a_route_was_given() {
+    let server = FixtureServer::start();
+    // pip skips an index page that is not text/html or a PyPI simple type.
+    let index = "https://pypi.org/simple/six/";
+    server.serve_as(index, "text/html", "<a href=\"six.whl\">six.whl</a>");
+    server.serve("https://files.pythonhosted.org/six.whl", b"wheel".to_vec());
+    let content_type = |method: &str, target: &str| {
+        let (head, body) = http_response(&server, method, target, "");
+        let value = head
+            .lines()
+            .find_map(|line| line.strip_prefix("Content-Type: "));
+        (value.map(str::to_string), body)
+    };
+    let page = b"<a href=\"six.whl\">six.whl</a>".to_vec();
+    assert_eq!(
+        content_type("GET", "/pypi.org/simple/six/"),
+        (Some("text/html".into()), page)
+    );
+    assert_eq!(
+        content_type("HEAD", "/pypi.org/simple/six/"),
+        (Some("text/html".into()), Vec::new())
+    );
+    let octets = Some("application/octet-stream".to_string());
+    assert_eq!(
+        content_type("GET", "/files.pythonhosted.org/six.whl"),
+        (octets.clone(), b"wheel".to_vec())
+    );
+    assert_eq!(
+        content_type("GET", "/pypi.org/simple/absent/"),
+        (octets, Vec::new())
+    );
+    // A later registration replaces the route, type included.
+    server.serve_as(index, "application/vnd.pypi.simple.v1+json", "{}");
+    assert_eq!(
+        content_type("GET", "/pypi.org/simple/six/"),
+        (
+            Some("application/vnd.pypi.simple.v1+json".into()),
+            b"{}".to_vec()
+        )
+    );
+    // A value that would end the header block is refused.
+    assert!(panics(&|| server.serve_as(
+        index,
+        "text/html\r\nX-Injected: 1",
+        ""
+    )));
 }
 
 #[test]
@@ -690,4 +987,286 @@ fn a_report_carries_the_fields_a_claim_is_audited_on() {
         .to_string_lossy()
         .into_owned();
     assert!(odd.starts_with("a_b_c.10.0.0rc3.any."), "{odd}");
+}
+
+#[test]
+fn a_report_an_earlier_run_left_is_discarded() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut report = Report::new("bazel_core_launch_isolated");
+    report.bazel = Some("9.3.2".into());
+    // Nothing there yet: not an error.
+    report.discard_in(dir.path());
+
+    // An earlier run of this cell passed...
+    let earlier = report.write_in(dir.path(), Status::Ran, None);
+    assert_eq!(earlier, report.path_in(dir.path()));
+    let text = std::fs::read_to_string(&earlier).unwrap();
+    assert!(text.contains(r#""status": "ran""#), "{text}");
+    // ...and so did another cell of the same test, on another Bazel.
+    let mut other_cell = report.clone();
+    other_cell.bazel = Some("7.7.2".into());
+    let other = other_cell.write_in(dir.path(), Status::Ran, None);
+
+    // This run of the cell has not finished: if it now fails, nothing on
+    // disk may still say `ran` for it.
+    report.discard_in(dir.path());
+    assert!(!earlier.exists(), "the earlier `ran` report survived");
+    assert!(other.exists(), "another cell's report is not this run's");
+}
+
+#[test]
+fn opening_a_cell_discards_the_report_an_earlier_run_of_it_left() {
+    const TEST: &str = "harness_selftest_stale_report";
+    // What an earlier run of the cell left in the probe directory. Status
+    // `skipped`, so the selftest itself never puts a `ran` report there.
+    let mut earlier = Report::new(TEST);
+    earlier.bazel = Some(NO_RELEASE.into());
+    let why = Some("selftest: stands in for an earlier run");
+    let stale = earlier.write_in(&probe_report::probe_dir(), Status::Skipped, why);
+
+    let cell = selftest_cell(TEST, no_bazel);
+    assert_eq!(cell.report.path(), stale, "the cell reports to that file");
+    assert!(
+        !stale.exists(),
+        "an earlier report of the cell survived Cell::open: a failing run would keep it"
+    );
+    cell.close();
+}
+
+#[test]
+fn a_required_cell_never_skips() {
+    assert_eq!(
+        probe_report::may_skip("bazel_core_x", "no Bazel", false),
+        Ok(())
+    );
+    let failure = probe_report::may_skip("bazel_core_x", "no Bazel", true).unwrap_err();
+    assert!(
+        failure.contains("bazel_core_x")
+            && failure.contains(env::REQUIRED)
+            && failure.contains("no Bazel"),
+        "{failure}"
+    );
+}
+
+#[test]
+fn an_unknown_group_or_system_is_an_error_not_every_cell() {
+    assert_eq!(env::parse_group(None), Ok(None));
+    assert_eq!(env::parse_system(None), Ok(None));
+    for group in [Group::Core, Group::Light, Group::Heavy] {
+        assert_eq!(env::parse_group(Some(group.name())), Ok(Some(group)));
+    }
+    for system in [System::Bzlmod, System::Workspace, System::Hybrid] {
+        assert_eq!(env::parse_system(Some(system.name())), Ok(Some(system)));
+    }
+    // A typo in a CI cell must not select "everything" (or nothing).
+    for typo in ["Core", "cores", "light ", "all", "bzlmod"] {
+        let refused = env::parse_group(Some(typo)).unwrap_err();
+        assert!(
+            refused.contains(env::GROUP) && refused.contains(typo),
+            "{refused}"
+        );
+    }
+    for typo in ["Bzlmod", "bazelmod", "WORKSPACE", "both", "core"] {
+        let refused = env::parse_system(Some(typo)).unwrap_err();
+        assert!(
+            refused.contains(env::SYSTEM) && refused.contains(typo),
+            "{refused}"
+        );
+    }
+}
+
+#[test]
+fn a_plain_write_never_reaches_the_module_lock_or_leaves_the_workspace() {
+    for rel in [
+        "MODULE.bazel",
+        "BUILD.bazel",
+        "pkg/BUILD.bazel",
+        "./WORKSPACE",
+        "MODULE.bazel.lock.bak",
+        "locks/maven_install.json",
+    ] {
+        assert_eq!(workspace::check_plain_write(rel), Ok(()), "{rel}");
+    }
+    // Bazel owns the lock: only write_module_lock, which stops the server
+    // first, may write it. macOS and Windows fold the case.
+    for rel in [
+        "MODULE.bazel.lock",
+        "./MODULE.bazel.lock",
+        "sub/MODULE.bazel.lock",
+        "module.bazel.LOCK",
+    ] {
+        let refused = workspace::check_plain_write(rel).unwrap_err();
+        assert!(refused.contains("write_module_lock"), "{rel}: {refused}");
+    }
+    for rel in [
+        "",
+        ".",
+        "..",
+        "../outside",
+        "pkg/../../outside",
+        "/etc/passwd",
+    ] {
+        let refused = workspace::check_plain_write(rel).unwrap_err();
+        assert!(
+            refused.contains("inside the workspace copy"),
+            "{rel}: {refused}"
+        );
+    }
+}
+
+#[test]
+fn the_probe_rule_is_installed_once_and_never_over_a_fixtures_own() {
+    let ws = tempfile::tempdir().unwrap();
+    assert_eq!(workspace::install_probe_rule(ws.path()), Ok(()));
+    let shared = workspace::fixtures_root()
+        .join("common")
+        .join(workspace::PROBE_BZL);
+    let installed = ws.path().join(workspace::PROBE_BZL);
+    assert_eq!(
+        std::fs::read(&installed).unwrap(),
+        std::fs::read(shared).unwrap()
+    );
+    let again = workspace::install_probe_rule(ws.path()).unwrap_err();
+    assert!(again.contains("already has a probe.bzl"), "{again}");
+
+    // A fixture that ships its own rule keeps its bytes and is refused.
+    let fixture = tempfile::tempdir().unwrap();
+    std::fs::write(fixture.path().join(workspace::PROBE_BZL), "# unreviewed\n").unwrap();
+    assert!(workspace::install_probe_rule(fixture.path()).is_err());
+    assert_eq!(
+        std::fs::read(fixture.path().join(workspace::PROBE_BZL)).unwrap(),
+        b"# unreviewed\n"
+    );
+}
+
+#[test]
+fn a_cell_keeps_the_lock_rules_without_a_server() {
+    let cell = selftest_cell("harness_selftest_lock_rules", no_bazel);
+    cell.write("MODULE.bazel", "module(name = \"selftest\")\n");
+    cell.write("pkg/BUILD.bazel", "");
+    assert!(cell.scratch.workspace.join("pkg/BUILD.bazel").is_file());
+    assert_eq!(cell.module_lock(), None);
+    assert!(
+        panics(&|| cell.write(workspace::MODULE_LOCK, "{}")),
+        "Cell::write must refuse MODULE.bazel.lock"
+    );
+    assert!(panics(&|| cell.write("../escaped", "")));
+    assert_eq!(cell.module_lock(), None, "the refused write wrote nothing");
+    assert!(!cell.scratch.root.join("escaped").exists());
+
+    // No server runs, so the lock write needs no shutdown (the stand-in
+    // program does not exist: a spawn would panic here).
+    assert_eq!(cell.server_pid(), None);
+    cell.write_module_lock(b"{\"lockFileVersion\": 0}\n");
+    assert_eq!(
+        cell.module_lock().as_deref(),
+        Some(&b"{\"lockFileVersion\": 0}\n"[..])
+    );
+
+    cell.install_probe_rule();
+    assert!(
+        panics(&|| cell.install_probe_rule()),
+        "a second probe.bzl must be refused"
+    );
+    cell.close();
+}
+
+#[test]
+fn a_program_named_by_a_relative_path_is_made_absolute() {
+    // A bare name is resolved on PATH by the spawn itself.
+    assert_eq!(absolute_program("bazel".into()), OsString::from("bazel"));
+    assert_eq!(
+        absolute_program("bazel.exe".into()),
+        OsString::from("bazel.exe")
+    );
+    // A relative path answers `--version` from the test's directory and
+    // then fails to spawn from the workspace copy.
+    let cwd = std::env::current_dir().unwrap();
+    let nested = PathBuf::from(absolute_program("tools/bazel".into()));
+    assert_eq!(nested, cwd.join("tools").join("bazel"));
+    for relative in ["./bazel", "../../../../.bazel/tools/bazel"] {
+        let made = PathBuf::from(absolute_program(relative.into()));
+        assert!(made.is_absolute(), "{relative} became {}", made.display());
+        assert_eq!(made.file_name(), Some("bazel".as_ref()), "{relative}");
+    }
+    let absolute = cwd.join("bazel").into_os_string();
+    assert_eq!(absolute_program(absolute.clone()), absolute);
+}
+
+#[test]
+fn a_dead_servers_pid_file_is_stale_and_a_live_servers_is_an_error() {
+    let root = tempfile::tempdir().unwrap();
+    let file = root.path().join("0123abcd/server/server.pid.txt");
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    std::fs::write(&file, "4242\n").unwrap();
+    // The install base and an output base that never had a server.
+    std::fs::create_dir_all(root.path().join("install")).unwrap();
+    std::fs::create_dir_all(root.path().join("89abcdef/server")).unwrap();
+    assert_eq!(server::pid_files(root.path()), [(file.clone(), 4242)]);
+
+    // The server still runs: `bazel shutdown` did not do its work.
+    let running = server::settle_pid_files(root.path(), |pid| pid == 4242).unwrap_err();
+    assert!(
+        running.contains("server 4242 is still running"),
+        "{running}"
+    );
+    assert!(file.exists(), "a live server's pid file is left alone");
+
+    // The server was killed or crashed: nothing removed its file, and the
+    // client's `shutdown` returned at once. Not a leak, and not an error.
+    assert_eq!(server::settle_pid_files(root.path(), |_| false), Ok(()));
+    assert!(!file.exists(), "the stale pid file was not removed");
+    assert_eq!(server::pid_files(root.path()), []);
+    let unasked = |_: u32| -> bool { panic!("no pid file is left to ask about") };
+    assert_eq!(server::settle_pid_files(root.path(), unasked), Ok(()));
+}
+
+/// The pid of a process that has exited and been reaped.
+fn exited_pid() -> u32 {
+    let (program, args): (&str, &[&str]) = if cfg!(windows) {
+        ("cmd", &["/C", "exit 0"])
+    } else {
+        ("sh", &["-c", "exit 0"])
+    };
+    let mut child = hermetic::command(Path::new(program))
+        .args(args)
+        .spawn()
+        .expect("spawn a short-lived child");
+    let pid = child.id();
+    child.wait().expect("wait for the child");
+    pid
+}
+
+#[test]
+fn process_liveness_tells_this_process_from_one_that_exited() {
+    assert!(server::process_alive(std::process::id()));
+    assert!(!server::process_alive(exited_pid()));
+}
+
+#[cfg(unix)]
+fn true_for_bazel(_: &Scratch) -> Result<Bazel, String> {
+    // `true` exits 0 whatever its arguments: what `bazel shutdown` does
+    // when no server answers.
+    stand_in("true")
+}
+
+#[cfg(unix)]
+#[test]
+fn shutdown_clears_the_pid_file_of_a_server_that_died() {
+    let cell = selftest_cell("harness_selftest_dead_server", true_for_bazel);
+    // A server that was killed: its pid file is there, its process is not.
+    let pid = exited_pid();
+    let file = cell
+        .scratch
+        .output_user_root
+        .join("0123abcd/server/server.pid.txt");
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    std::fs::write(&file, pid.to_string()).unwrap();
+    assert_eq!(cell.server_pid(), Some(pid));
+
+    cell.shutdown();
+    assert_eq!(cell.server_pid(), None);
+    assert!(!file.exists(), "the stale pid file was not removed");
+    // `close` shuts down again and asserts the scratch root is removed.
+    cell.close();
 }
