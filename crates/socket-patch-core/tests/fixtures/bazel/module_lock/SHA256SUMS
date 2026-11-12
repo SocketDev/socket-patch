@@ -1,5 +1,5 @@
 5ec48e92c923e7fa23e437c2934095e705d181c61a256f638508098f0e59d656  .gitattributes
-83021d919db8f02a54acef292b1338322db09e8a27c0cd35b265fd730b5ea280  README.md
+48d34361361fb4bc9bbe0c235d4b1a07e0369a7c9f39ee36633b30bbaad00923  README.md
 1de458ad04adb083e654b1c8ed23347360294ff5ea51da2bf70f805184b45071  eval-factors/9.3.2.after-macos-repair.MODULE.bazel.lock
 83f4fb76d3aaad4a58df3852471a3672fa7b22749f7f8bc2d87ce6bd73f2fcc3  eval-factors/9.3.2.two-platforms.MODULE.bazel.lock
 df9be575826f6ad90f7a8a4e6b0a9915479470bdcffe8831ad15fdc6c8e324f2  facts/go-deps/after-rewrite.go.mod
@@ -23,6 +23,13 @@ e5c509bc11b603bbe3a569275dbac732daa87174cc3a77ca80909262fa0b4f49  facts/toy/ext.
 331fe8cea5c2821ca880ea0cf53741fe412e9443fb359167084e8eee39424831  gv3/fresh.MODULE.bazel
 11ae4c4e3907c2930c479e2316424825e63b7db96de15d8becf309a3509b84f2  gv3/lower.MODULE.bazel
 4d2545ee7573162871278bfc8bf3c0190a5dfbeda0f7c9c5055ad29de9662dae  gv3/raise.MODULE.bazel
+8a4a845f3bfba09d2630aad513bdb0f14964c0767739444c834e8a17178af89d  listing/7.7.2.MODULE.bazel.lock
+65bc48278f690dab392c1343066a0f43624fbcf1461dd8e5ce976fcce80aa823  listing/7.7.2.ext.bzl
+6d76d6d2ed9f91a95844caa2aa227983d43a6cb981bb735b36e8da2477707111  listing/8.7.0.MODULE.bazel.lock
+4e3f8ad4068fce95d4f9ea9fceaf5d8cbe426c49e87c4d0bc6d7847d9e2e2110  listing/9.3.2.MODULE.bazel.lock
+5e81c486956c4f3a36a866b5ec130e68a8902eee38c4f6ec253183e92b54da17  listing/9.3.2.after-root-files.MODULE.bazel.lock
+ffc7b67f8b8d8f757fcb5d7e2437d339f1845d48f2544f1a7759cdfd54ebb187  listing/ext.bzl
+be9a3c9e615e0bc2919e49764fb80efe42f912b0ed42e12ba7cb0ee2feb95aef  listing/root.MODULE.bazel
 c9044089bdda100ff4c2d113dbb7e2f15e66b16d3f1d648cf0aa492dcaad240b  paket/dn-7.7.2-0.14.0.MODULE.bazel
 4c30f265ca04a150a67d3b9fdf066922157c2b5ec6ad2471d39011a8bb96368c  paket/dn-7.7.2-0.14.0.reduced.MODULE.bazel.lock
 1a1777f88d44d2f0d87c8f4aac39d269adafed832607cb964b73455f615c9830  paket/dn-9.3.2-0.22.2.MODULE.bazel

@@ -22,6 +22,22 @@
 //! The file is never searched for a path: a family-A lock also names an
 //! input inside the tags of `moduleDepGraph`, where Bazel does not check
 //! it.
+//!
+//! An extension that lists a directory records the listing, not the
+//! files: [`RecordedDir`]. Creating `.bazelignore` or `.socket/` in a
+//! listed root stales such a record although no recorded file changed.
+//!
+//! "Nothing recorded" and "not known" are different answers, and the
+//! accessors keep them apart in the type: for a lock that is unreadable
+//! or of an unknown shape every query returns `None`, and only an absent
+//! lock answers `Some` of nothing.
+//!
+//! Non-ASCII paths. Bazel up to 8.7 writes its internal strings into the
+//! lock, where each byte of a UTF-8 file name is one character
+//! (`cafÃ©` for `café`); Bazel 8.8 and 9 write Unicode. The two older
+//! containers are decoded when read, so a path here is always the name
+//! on disk. Probed on macOS arm64 with Bazel 7.7.2, 8.7.0 and 9.3.2;
+//! Linux and Windows are unprobed.
 
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
@@ -59,9 +75,33 @@ pub struct FamilyA {
     pub lock_file_version: Option<u64>,
     /// The SHA-256 Bazel recorded for the root `MODULE.bazel`.
     pub module_file_hash: String,
+    /// The flags the graph was resolved under. `None` when the member is
+    /// absent or not the shape Bazel 6.2 - 7.1 writes: nothing then says
+    /// that Bazel reuses the graph.
+    pub flags: Option<GraphFlags>,
+    /// `localOverrideHashes`: the SHA-256 of the `MODULE.bazel` of every
+    /// module that comes from a local path. Bazel's builtin `bazel_tools`
+    /// is one, so a lock Bazel wrote always has that member. `None` as
+    /// for [`Self::flags`].
+    pub local_override_hashes: Option<Vec<(String, String)>>,
     /// Every module of the graph but the root.
     pub modules: Vec<GraphModule>,
     pub extensions: Extensions,
+}
+
+/// The members of a family-A lock's `flags` that decide which versions
+/// Bazel selects. Bazel reuses the locked graph only while every recorded
+/// flag, these included, equals its value on the running command.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GraphFlags {
+    /// `cmdRegistries`: the `--registry` list in order, or Bazel's
+    /// default list when the flag was not given.
+    pub registries: Vec<String>,
+    /// `cmdModuleOverrides`: module name and path of every
+    /// `--override_module`.
+    pub module_overrides: Vec<(String, String)>,
+    /// `ignoreDevDependency`.
+    pub ignore_dev_dependency: bool,
 }
 
 /// One `moduleDepGraph` key.
@@ -171,6 +211,10 @@ pub struct ExtensionEntry {
     pub usages_digest: Option<String>,
     /// The main-repository files the extension read.
     pub inputs: Vec<RecordedInput>,
+    /// The main-repository directories the extension depends on beyond
+    /// the bytes of single files: a file created or removed in one of
+    /// them stales the entry although no recorded file changed.
+    pub dirs: Vec<RecordedDir>,
     /// The repositories the extension generated from those inputs.
     pub repo_specs: Vec<RepoSpec>,
 }
@@ -198,6 +242,74 @@ pub struct RecordedInput {
     /// The recorded value: the SHA-256 of the file's bytes under Bazel's
     /// default digest function.
     pub recorded: String,
+}
+
+/// One main-repository directory an extension depends on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordedDir {
+    /// Relative to the Bazel root, forward slashes; `""` is the root.
+    pub path: String,
+    /// The key as the lock spells it, without the escapes of the
+    /// `recordedInputs` form.
+    pub key: String,
+    pub watch: DirWatch,
+    /// Bazel's digest of the listing or the tree, or `DIR`. It is never
+    /// recomputed here: [`Self::stale_when_created_or_removed`] and
+    /// [`Self::stale_when_edited`] say which changes move it.
+    pub recorded: String,
+}
+
+/// What an extension depends on in a directory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirWatch {
+    /// That the path is a directory (a `FILE` record with the value
+    /// `DIR`): stale when the directory is removed or becomes a file.
+    Exists,
+    /// The names directly inside it (`path.readdir()`; a `DIRENTS` item
+    /// or a `recordedDirentsInputs` key): stale when an entry is created
+    /// or removed there. The bytes of the entries do not count.
+    Entries,
+    /// Everything below it (a `DIRTREE` item): stale on any change under
+    /// the directory. Bazel 10 can leave names out of the watch; they are
+    /// not read here, so every path below counts.
+    Tree,
+}
+
+impl RecordedDir {
+    /// Whether creating or removing `path` (root-relative, a file or a
+    /// directory) stales this record. A caller that creates
+    /// `.socket/bazel/index.json` in a root without `.socket` asks about
+    /// `.socket`: that is the entry the root's listing gains.
+    pub fn stale_when_created_or_removed(&self, path: &str) -> bool {
+        // The directory itself, or one above it, appears or disappears.
+        let own = is_under(&self.path, path);
+        match self.watch {
+            DirWatch::Exists => own,
+            DirWatch::Entries => own || parent_of(path) == Some(self.path.as_str()),
+            DirWatch::Tree => own || is_under(path, &self.path),
+        }
+    }
+
+    /// Whether changing the bytes of the existing file `path` stales
+    /// this record. Only a watched tree digests file contents; such a
+    /// record is never fresh after an edit below it.
+    pub fn stale_when_edited(&self, path: &str) -> bool {
+        self.watch == DirWatch::Tree && is_under(path, &self.path)
+    }
+}
+
+/// Whether `path` is `dir` or lies below it; `""` is the root.
+fn is_under(path: &str, dir: &str) -> bool {
+    let rest = path.strip_prefix(dir);
+    dir.is_empty() || rest.is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+}
+
+/// The directory that holds `path`; `None` for the root itself.
+fn parent_of(path: &str) -> Option<&str> {
+    match path.rsplit_once('/') {
+        Some((parent, _)) => Some(parent),
+        None => (!path.is_empty()).then_some(""),
+    }
 }
 
 /// One `generatedRepoSpecs` member.
@@ -305,66 +417,112 @@ impl ModuleLock {
         }
     }
 
-    /// What the lock records about extensions; `None` when the lock is
-    /// not a known family, which is not "nothing recorded".
+    /// What the lock records about extensions. `None` when that is not
+    /// known (the lock is unreadable or of an unknown shape): the caller
+    /// then treats every record as stale. An absent lock records
+    /// nothing, which is `Some` of nothing.
+    ///
+    /// Every query below goes through here, so none of them can answer
+    /// "not recorded" or "nothing stale" for a lock that was not read.
     pub fn extensions(&self) -> Option<&Extensions> {
+        static NOTHING: Extensions = Extensions {
+            entries: Vec::new(),
+            facts: Vec::new(),
+        };
         match self {
+            Self::Absent => Some(&NOTHING),
             Self::FamilyA(lock) => Some(&lock.extensions),
             Self::FamilyB(lock) => Some(&lock.extensions),
-            Self::Absent | Self::Unreadable | Self::UnknownShape(_) => None,
+            Self::Unreadable | Self::UnknownShape(_) => None,
         }
     }
 
-    /// Every extension entry. Empty for a lock that is not a known
-    /// family, which says nothing about what that lock records: match on
-    /// the variant before reading "no entry" as "nothing stale".
-    pub fn entries(&self) -> &[ExtensionEntry] {
-        self.extensions().map_or(&[], |ext| &ext.entries)
+    /// Every extension entry; `None` as for [`Self::extensions`].
+    pub fn entries(&self) -> Option<&[ExtensionEntry]> {
+        Some(&self.extensions()?.entries)
     }
 
-    /// The facts of every extension, under the caveat of [`Self::entries`].
-    pub fn facts(&self) -> &[ExtensionFacts] {
-        self.extensions().map_or(&[], |ext| &ext.facts)
+    /// The facts of every extension; `None` as for [`Self::extensions`].
+    pub fn facts(&self) -> Option<&[ExtensionFacts]> {
+        Some(&self.extensions()?.facts)
     }
 
-    /// The entries of one extension, one per platform key.
-    pub fn entries_of<'a>(
-        &'a self,
-        label: &'a str,
-        name: &'a str,
-    ) -> impl Iterator<Item = &'a ExtensionEntry> {
-        let entries = self.entries().iter();
-        entries.filter(move |entry| entry.id.matches(label, name))
+    /// The entries of one extension, one per platform key; `None` as for
+    /// [`Self::extensions`].
+    pub fn entries_of(&self, label: &str, name: &str) -> Option<Vec<&ExtensionEntry>> {
+        Some(self.extensions()?.entries_of(label, name))
     }
 
-    /// The facts of one extension.
-    pub fn facts_of<'a>(
-        &'a self,
-        label: &'a str,
-        name: &'a str,
-    ) -> impl Iterator<Item = &'a ExtensionFacts> {
-        let facts = self.facts().iter();
-        facts.filter(move |facts| facts.id.matches(label, name))
+    /// The facts of one extension; `None` as for [`Self::extensions`].
+    pub fn facts_of(&self, label: &str, name: &str) -> Option<Vec<&ExtensionFacts>> {
+        Some(self.extensions()?.facts_of(label, name))
     }
 
     /// Every record of the root-relative file `path`, under every
-    /// extension and platform key.
-    pub fn recorded<'a>(
-        &'a self,
-        path: &'a str,
-    ) -> impl Iterator<Item = (&'a ExtensionEntry, &'a RecordedInput)> {
-        self.entries().iter().flat_map(move |entry| {
-            let inputs = entry.inputs.iter().filter(move |input| input.path == path);
-            inputs.map(move |input| (entry, input))
-        })
+    /// extension and platform key; `None` as for [`Self::extensions`].
+    pub fn recorded(&self, path: &str) -> Option<Vec<(&ExtensionEntry, &RecordedInput)>> {
+        Some(self.extensions()?.recorded(path))
     }
 
-    /// Every recorded input compared with the file `files` holds. A
-    /// `Stale` row predicts that an `error`-mode build which evaluates
-    /// that extension fails.
+    /// Every directory record, under every extension and platform key;
+    /// `None` as for [`Self::extensions`].
+    pub fn recorded_dirs(&self) -> Option<Vec<(&ExtensionEntry, &RecordedDir)>> {
+        Some(self.extensions()?.recorded_dirs())
+    }
+
+    /// Every recorded input compared with the file `files` holds; `None`
+    /// as for [`Self::extensions`]. A `Stale` row predicts that an
+    /// `error`-mode build which evaluates that extension fails.
+    pub fn input_verdicts(&self, files: &dyn FileView) -> Option<Vec<InputVerdict<'_>>> {
+        Some(self.extensions()?.input_verdicts(files))
+    }
+}
+
+impl Extensions {
+    /// The entries of one extension, one per platform key.
+    pub fn entries_of(&self, label: &str, name: &str) -> Vec<&ExtensionEntry> {
+        let entries = self.entries.iter();
+        entries
+            .filter(|entry| entry.id.matches(label, name))
+            .collect()
+    }
+
+    /// The facts of one extension.
+    pub fn facts_of(&self, label: &str, name: &str) -> Vec<&ExtensionFacts> {
+        let facts = self.facts.iter();
+        facts
+            .filter(|facts| facts.id.matches(label, name))
+            .collect()
+    }
+
+    /// Every record of the root-relative file `path`.
+    ///
+    /// A path of an older container that could not be decoded is kept as
+    /// the lock spells it, so a non-ASCII `path` is also looked up in
+    /// that spelling: it never reads as not recorded for its spelling
+    /// alone.
+    pub fn recorded(&self, path: &str) -> Vec<(&ExtensionEntry, &RecordedInput)> {
+        let internal = (!path.is_ascii()).then(|| to_internal(path));
+        let same = |found: &str| found == path || internal.as_deref() == Some(found);
+        let mut records = Vec::new();
+        for entry in &self.entries {
+            let inputs = entry.inputs.iter().filter(|input| same(&input.path));
+            records.extend(inputs.map(|input| (entry, input)));
+        }
+        records
+    }
+
+    /// Every directory record.
+    pub fn recorded_dirs(&self) -> Vec<(&ExtensionEntry, &RecordedDir)> {
+        let entries = self.entries.iter();
+        let dirs = entries.flat_map(|entry| entry.dirs.iter().map(move |dir| (entry, dir)));
+        dirs.collect()
+    }
+
+    /// Every recorded input compared with the file `files` holds.
     pub fn input_verdicts(&self, files: &dyn FileView) -> Vec<InputVerdict<'_>> {
         let mut verdicts = Vec::new();
-        for entry in self.entries() {
+        for entry in &self.entries {
             for input in &entry.inputs {
                 let state = input_state(&input.recorded, &files.read(&input.path));
                 verdicts.push(InputVerdict {
@@ -428,6 +586,8 @@ fn shape(root: &Value) -> Shape<ModuleLock> {
             Ok(ModuleLock::FamilyA(FamilyA {
                 lock_file_version,
                 module_file_hash: hash.ok_or("moduleFileHash is not a string")?.to_string(),
+                flags: graph_flags(top),
+                local_override_hashes: top.get("localOverrideHashes").and_then(string_pairs),
                 modules: graph_modules(object(graph, "moduleDepGraph")?)?,
                 extensions,
             }))
@@ -450,6 +610,25 @@ fn object<'a>(value: &'a Value, what: &str) -> Shape<&'a Map<String, Value>> {
 fn string<'a>(value: &'a Value, what: &str) -> Shape<&'a str> {
     let string = value.as_str();
     string.ok_or_else(|| format!("{what} is not a string"))
+}
+
+/// The members of an object whose values are all strings.
+fn string_pairs(value: &Value) -> Option<Vec<(String, String)>> {
+    let pair = |(key, value): (&String, &Value)| Some((key.clone(), value.as_str()?.to_string()));
+    value.as_object()?.iter().map(pair).collect()
+}
+
+/// The three `flags` members that decide the selection. The other four
+/// (yanked versions, and the modes of two checks) only add errors.
+fn graph_flags(top: &Map<String, Value>) -> Option<GraphFlags> {
+    let flags = top.get("flags")?.as_object()?;
+    let registries = flags.get("cmdRegistries")?.as_array()?.iter();
+    let registries = registries.map(|url| url.as_str().map(str::to_string));
+    Some(GraphFlags {
+        registries: registries.collect::<Option<_>>()?,
+        module_overrides: string_pairs(flags.get("cmdModuleOverrides")?)?,
+        ignore_dev_dependency: flags.get("ignoreDevDependency")?.as_bool()?,
+    })
 }
 
 /// `<root>`, `<name>@<version>` or `<name>@_` keys.
@@ -527,7 +706,7 @@ fn extensions(top: &Map<String, Value>) -> Shape<Extensions> {
 }
 
 fn entry_of(id: &ExtensionId, platform: &str, entry: &Map<String, Value>) -> Shape<ExtensionEntry> {
-    let mut inputs = Vec::new();
+    let mut records = Records::default();
     let mut containers = 0;
     // Lock version 3: label keys, `@@//<pkg>:<name>`.
     if let Some(value) = entry.get("accumulatedFileDigests") {
@@ -543,7 +722,7 @@ fn entry_of(id: &ExtensionId, platform: &str, entry: &Map<String, Value>) -> Sha
                 } else {
                     format!("{package}/{name}")
                 };
-                inputs.push(recorded_input(path, key, recorded)?);
+                records.file(from_internal(&path), key, recorded)?;
             }
         }
     }
@@ -553,7 +732,16 @@ fn entry_of(id: &ExtensionId, platform: &str, entry: &Map<String, Value>) -> Sha
         for (key, recorded) in object(value, "recordedFileInputs")? {
             let recorded = string(recorded, "a recorded digest")?;
             if let Some(path) = main_repo(key) {
-                inputs.push(recorded_input(path.to_string(), key, recorded)?);
+                records.file(from_internal(path), key, recorded)?;
+            }
+        }
+    }
+    // The same lock versions keep directory listings beside the files.
+    if let Some(value) = entry.get("recordedDirentsInputs") {
+        for (key, recorded) in object(value, "recordedDirentsInputs")? {
+            let recorded = string(recorded, "a recorded listing")?;
+            if let Some(path) = main_repo(key) {
+                records.dir(from_internal(path), key, recorded, DirWatch::Entries)?;
             }
         }
     }
@@ -569,17 +757,30 @@ fn entry_of(id: &ExtensionId, platform: &str, entry: &Map<String, Value>) -> Sha
             let parsed = item.split_once(' ').and_then(|(key, recorded)| {
                 let key = unescape(key);
                 let (kind, key) = key.split_once(':')?;
-                Some((kind == "FILE", key.to_string(), unescape(recorded)))
+                Some((kind.to_string(), key.to_string(), unescape(recorded)))
             });
-            let Some((is_file, key, recorded)) = parsed else {
+            let Some((kind, key, recorded)) = parsed else {
                 return Err(format!(
                     "recorded input {item:?} is not `<KIND>:<key> <value>`"
                 ));
             };
-            // Directory listings, environment variables and repository
-            // mappings are other kinds: not files, and not read here.
-            if let Some(path) = main_repo(&key).filter(|_| is_file) {
-                inputs.push(recorded_input(path.to_string(), &key, &recorded)?);
+            // Environment variables, repository mappings, kinds this
+            // reader does not know and keys of other repositories are
+            // not records of a workspace path: skipped, not unknown.
+            match (kind.as_str(), main_repo(&key)) {
+                ("FILE", Some(path)) => records.file(path.to_string(), &key, &recorded)?,
+                ("DIRENTS", Some(path)) => {
+                    records.dir(path.to_string(), &key, &recorded, DirWatch::Entries)?;
+                }
+                ("DIRTREE", Some(path)) => {
+                    // Bazel 10 appends the names it leaves out of the
+                    // watch. A normalised path cannot hold `/../`.
+                    let path = path
+                        .split_once(TREE_EXCLUDES)
+                        .map_or(path, |(path, _)| path);
+                    records.dir(path.to_string(), &key, &recorded, DirWatch::Tree)?;
+                }
+                _ => {}
             }
         }
     }
@@ -598,34 +799,95 @@ fn entry_of(id: &ExtensionId, platform: &str, entry: &Map<String, Value>) -> Sha
         platform: platform.to_string(),
         bzl_transitive_digest: digest("bzlTransitiveDigest"),
         usages_digest: digest("usagesDigest"),
-        inputs,
+        inputs: records.inputs,
+        dirs: records.dirs,
         repo_specs: repo_specs(entry)?,
     })
 }
 
 /// The path part of a main-repository key (`@@//x`, and the `@//x` and
-/// `//x` spellings Bazel also parses as the main repository). `None` for
-/// a file of another repository or an absolute path: no edit of the
-/// workspace changes those.
+/// `//x` spellings Bazel also parses as the main repository); empty for
+/// the root, `@@//`. `None` for a path of another repository or an
+/// absolute path: no edit of the workspace changes those.
 fn main_repo(key: &str) -> Option<&str> {
     let label = key.strip_prefix("@@").or_else(|| key.strip_prefix('@'));
     label.unwrap_or(key).strip_prefix("//")
 }
 
-fn recorded_input(path: String, key: &str, recorded: &str) -> Shape<RecordedInput> {
-    // Bazel writes normalised paths. Anything else cannot be matched with
-    // a workspace file, and matching it loosely could miss the file.
-    let normal = path
-        .split('/')
-        .all(|segment| !matches!(segment, "" | "." | ".."));
-    if !normal {
-        return Err(format!("recorded input {key:?} is not a normalised path"));
+/// The value Bazel records for a path that is a directory.
+const IS_DIRECTORY: &str = "DIR";
+
+/// What follows the path of a `DIRTREE` key that leaves names out.
+const TREE_EXCLUDES: &str = "?/../excludes=";
+
+/// The main-repository records of one entry.
+#[derive(Default)]
+struct Records {
+    inputs: Vec<RecordedInput>,
+    dirs: Vec<RecordedDir>,
+}
+
+impl Records {
+    /// A file record: the digest of a file, or `DIR` for a path that is
+    /// a directory, which is no file an edit could stale.
+    fn file(&mut self, path: String, key: &str, recorded: &str) -> Shape<()> {
+        if recorded == IS_DIRECTORY {
+            // The root is a directory in every workspace: Bazel records
+            // it before it lists the root, and it cannot go stale.
+            if path.is_empty() {
+                return Ok(());
+            }
+            return self.dir(path, key, recorded, DirWatch::Exists);
+        }
+        normalised(&path, key, false)?;
+        self.inputs.push(RecordedInput {
+            path,
+            key: key.to_string(),
+            recorded: recorded.to_string(),
+        });
+        Ok(())
     }
-    Ok(RecordedInput {
-        path,
-        key: key.to_string(),
-        recorded: recorded.to_string(),
-    })
+
+    fn dir(&mut self, path: String, key: &str, recorded: &str, watch: DirWatch) -> Shape<()> {
+        normalised(&path, key, true)?;
+        self.dirs.push(RecordedDir {
+            path,
+            key: key.to_string(),
+            watch,
+            recorded: recorded.to_string(),
+        });
+        Ok(())
+    }
+}
+
+/// Bazel writes normalised paths. Anything else cannot be matched with a
+/// workspace path, and matching it loosely could miss the file. The empty
+/// path is the root, which only a directory record can name.
+fn normalised(path: &str, key: &str, root: bool) -> Shape<()> {
+    let segments = || path.split('/');
+    if (root && path.is_empty()) || segments().all(|s| !matches!(s, "" | "." | "..")) {
+        return Ok(());
+    }
+    Err(format!("recorded input {key:?} is not a normalised path"))
+}
+
+/// The path a key of the two older containers names. Bazel 6.2 - 8.7
+/// writes its internal strings into the lock: each byte of a UTF-8 file
+/// name as one character, so `café` is spelled `cafÃ©`. A path that is
+/// not such a string (a character above U+00FF, or bytes that are not
+/// UTF-8) is kept as found.
+fn from_internal(path: &str) -> String {
+    if path.is_ascii() {
+        return path.to_string();
+    }
+    let bytes: Option<Vec<u8>> = path.chars().map(|c| u8::try_from(c).ok()).collect();
+    let decoded = bytes.and_then(|bytes| String::from_utf8(bytes).ok());
+    decoded.unwrap_or_else(|| path.to_string())
+}
+
+/// `path` as Bazel 6.2 - 8.7 spells it: the inverse of [`from_internal`].
+fn to_internal(path: &str) -> String {
+    path.bytes().map(char::from).collect()
 }
 
 /// Undoes Bazel's escape of one part of a `recordedInputs` item: `\s` is
@@ -727,15 +989,63 @@ impl PipFacts {
     }
 
     /// Whether a distribution of `package` under `index_url` has the
-    /// SHA-256 `sha256` (bare hex), in this fact version's rendering.
-    pub fn holds_digest(&self, index_url: &str, package: &str, sha256: &str) -> bool {
-        let rendered = match self.fact_version {
-            PipFactVersion::V1 => sha256.to_string(),
-            PipFactVersion::V2 => format!("sha256:{sha256}"),
-        };
-        let mut dists = self.dists(index_url, package).iter();
-        is_sha256(sha256) && dists.any(|(_, digest)| *digest == rendered)
+    /// SHA-256 `sha256` (bare lowercase hex).
+    ///
+    /// rules_python stores whatever the index advertises: an empty
+    /// digest when the link has no `#sha256=` fragment (2.0.3) or no
+    /// fragment at all (2.5.0-rc4), and `md5:<hex>` for an index that
+    /// publishes MD5, which is pypiserver's default. Such a distribution
+    /// may be the pinned file, so the answer is then
+    /// [`FactDigest::CannotTell`], and callers treat that as possibly
+    /// stale, like [`FactDigest::Held`].
+    pub fn holds_digest(&self, index_url: &str, package: &str, sha256: &str) -> FactDigest {
+        let dists = self.dists(index_url, package);
+        if dists.is_empty() {
+            return FactDigest::NotHeld;
+        }
+        if !is_lower_sha256(sha256) {
+            return FactDigest::CannotTell;
+        }
+        let mut cannot_tell = false;
+        for (_, digest) in dists {
+            // The SHA-256 of a distribution, in this fact version's
+            // rendering; none for an empty digest or another algorithm.
+            let hex = match self.fact_version {
+                PipFactVersion::V1 => Some(digest.as_str()),
+                PipFactVersion::V2 => digest.strip_prefix("sha256:"),
+            };
+            match hex.filter(|hex| is_lower_sha256(hex)) {
+                Some(hex) if hex == sha256 => return FactDigest::Held,
+                Some(_) => {}
+                None => cannot_tell = true,
+            }
+        }
+        if cannot_tell {
+            FactDigest::CannotTell
+        } else {
+            FactDigest::NotHeld
+        }
     }
+}
+
+/// Whether pip facts hold a pin's digest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FactDigest {
+    /// A distribution of the package has the digest.
+    Held,
+    /// The package has no distribution under that index, or each one has
+    /// a SHA-256 and none is the digest.
+    NotHeld,
+    /// A distribution's digest is empty or not a SHA-256, or the digest
+    /// asked for is not one: the two cannot be compared. Never taken for
+    /// [`Self::NotHeld`].
+    CannotTell,
+}
+
+/// A SHA-256 as an index publishes it and socket-patch renders it.
+fn is_lower_sha256(text: &str) -> bool {
+    let lower_hex = |b: u8| b.is_ascii_digit() || (b'a'..=b'f').contains(&b);
+    text.len() == 64 && text.bytes().all(lower_hex)
 }
 
 /// One member of gazelle's `required_mod_files_v1` list.
@@ -906,6 +1216,14 @@ mod tests {
         }
     }
 
+    /// What a lock of a known family records. The queries on
+    /// `ModuleLock` itself return `None` for any other lock.
+    fn ext(lock: &ModuleLock) -> &Extensions {
+        let known = matches!(lock, ModuleLock::FamilyA(_) | ModuleLock::FamilyB(_));
+        assert!(known, "{lock:?}");
+        lock.extensions().unwrap()
+    }
+
     fn unknown(json: &str) -> bool {
         matches!(
             ModuleLock::parse(json.as_bytes()),
@@ -922,7 +1240,7 @@ mod tests {
     }
 
     fn states(lock: &ModuleLock, files: &dyn FileView) -> Vec<(String, String, InputState)> {
-        let verdicts = lock.input_verdicts(files);
+        let verdicts = ext(lock).input_verdicts(files);
         let row = |v: &InputVerdict<'_>| (v.entry.platform.clone(), v.input.path.clone(), v.state);
         verdicts.iter().map(row).collect()
     }
@@ -959,7 +1277,7 @@ mod tests {
             listed.insert(dir.join(file));
         }
         assert_eq!(listed, on_disk);
-        assert!(listed.len() >= 49);
+        assert!(listed.len() >= 56);
         // No fixture is a file Bazel would take for a workspace boundary.
         let boundary = [
             "MODULE.bazel",
@@ -999,7 +1317,7 @@ mod tests {
                 versions.insert(version.unwrap());
 
                 let rows = expected["prototype"]["inputs"].as_array().unwrap();
-                let verdicts = lock.input_verdicts(&files);
+                let verdicts = ext(&lock).input_verdicts(&files);
                 assert_eq!(verdicts.len(), rows.len(), "{dir}");
                 for (verdict, row) in verdicts.iter().zip(rows) {
                     assert_eq!(verdict.entry.id.raw, text(&row["extension"]), "{dir}");
@@ -1053,7 +1371,7 @@ mod tests {
             let renamed: Vec<_> = renamed.iter().map(|(at, f)| (*at, f.as_str())).collect();
             let files = Workspace::new("probe_vectors/x4/inputs", &renamed);
             let lock = ModuleLock::read(&files);
-            let verdicts = lock.input_verdicts(&files);
+            let verdicts = ext(&lock).input_verdicts(&files);
             let recorded = cell["recorded"].as_array().unwrap();
             assert_eq!(verdicts.len(), 9, "{lock_file}");
             for row in recorded {
@@ -1065,7 +1383,7 @@ mod tests {
                 assert_eq!(verdict.entry.platform, GENERAL);
             }
             // The key spells the same file three ways.
-            let key = |path: &str| lock.recorded(path).next().unwrap().1.key.clone();
+            let key = |path: &str| ext(&lock).recorded(path)[0].1.key.clone();
             let nested = key("sub/pkg/deep/dir/file.lock");
             match text(&cell["container"]) {
                 "accumulatedFileDigests" => assert_eq!(nested, "@@//sub/pkg:deep/dir/file.lock"),
@@ -1112,7 +1430,7 @@ mod tests {
             let lock_file = format!("../locks/9.3.2.digest-{function}.MODULE.bazel.lock");
             let files = Workspace::new("probe_vectors/x4/inputs", &[(MODULE_LOCK, &lock_file)]);
             let lock = ModuleLock::read(&files);
-            let verdicts = lock.input_verdicts(&files);
+            let verdicts = ext(&lock).input_verdicts(&files);
             assert_eq!(verdicts.len(), 9);
             assert!(verdicts.iter().all(|v| v.state == state), "{function}");
         }
@@ -1151,14 +1469,54 @@ mod tests {
         );
     }
 
+    /// A lock that was not read never answers "not recorded" or "nothing
+    /// stale": every query is `None`, which a caller cannot take for an
+    /// empty answer. Only an absent lock records nothing.
     #[test]
-    fn a_lock_file_that_is_absent_or_unreadable_is_not_a_shape() {
-        assert_eq!(ModuleLock::from_file(&FileText::Absent), ModuleLock::Absent);
+    fn a_lock_that_was_not_read_answers_no_query() {
+        let files = Workspace::new("module_lock/stale-repair/bazel-9.3.2", &[]);
         let unreadable = ModuleLock::from_file(&FileText::Unreadable);
         assert_eq!(unreadable, ModuleLock::Unreadable);
-        // Neither has entries, and neither says that nothing is recorded.
-        assert!(unreadable.entries().is_empty() && unreadable.facts().is_empty());
-        assert_eq!(unreadable.lock_file_version(), None);
+        // A lock of a family this reader does not know, which records
+        // the file an edit changes.
+        let future = format!(
+            r#"{{"lockFileVersion": 99, "moduleExtensions": {{"//:ext.bzl%toy": {{"general":
+                {{"recordedInputs": ["FILE:@@//dep.lock {SHA_A}"]}}}}}}}}"#
+        );
+        let future = ModuleLock::parse(future.as_bytes());
+        assert!(matches!(future, ModuleLock::UnknownShape(_)));
+        for lock in [&unreadable, &future] {
+            assert!(lock.extensions().is_none(), "{lock:?}");
+            assert_eq!(lock.recorded("dep.lock"), None);
+            assert_eq!(lock.input_verdicts(&files), None);
+            assert_eq!(lock.recorded_dirs(), None);
+            assert_eq!(lock.entries(), None);
+            assert_eq!(lock.facts(), None);
+            assert_eq!(lock.entries_of("//:ext.bzl", "toy"), None);
+            assert_eq!(lock.facts_of("//:ext.bzl", "toy"), None);
+            assert_eq!(lock.lock_file_version(), None);
+        }
+
+        // No lock file: Bazel resolves afresh, and nothing can be stale.
+        let absent = ModuleLock::from_file(&FileText::Absent);
+        assert_eq!(absent, ModuleLock::Absent);
+        assert_eq!(absent.recorded("dep.lock"), Some(Vec::new()));
+        assert_eq!(absent.input_verdicts(&files), Some(Vec::new()));
+        assert_eq!(absent.recorded_dirs(), Some(Vec::new()));
+        assert_eq!(absent.entries(), Some(&[][..]));
+        assert_eq!(absent.facts(), Some(&[][..]));
+        assert_eq!(absent.entries_of("//:ext.bzl", "toy"), Some(Vec::new()));
+        assert_eq!(absent.facts_of("//:ext.bzl", "toy"), Some(Vec::new()));
+
+        // The same queries on a lock that was read.
+        let read = lock("module_lock/stale-repair/bazel-9.3.2/baseline.MODULE.bazel.lock");
+        assert_eq!(
+            read.recorded("dep.lock").map(|records| records.len()),
+            Some(1)
+        );
+        assert_eq!(read.recorded("other.lock"), Some(Vec::new()));
+        assert_eq!(read.input_verdicts(&files).map(|rows| rows.len()), Some(1));
+        assert_eq!(read.recorded_dirs(), Some(Vec::new()));
     }
 
     /// Unknown shape is `UnknownShape`, never an error and never a
@@ -1205,6 +1563,18 @@ mod tests {
             format!(r#"{{"recordedFileInputs": {{"@@//../dep.lock": "{SHA_A}"}}}}"#),
             format!(r#"{{"recordedFileInputs": {{"@@//a//dep.lock": "{SHA_A}"}}}}"#),
             format!(r#"{{"recordedInputs": ["FILE:@@//a/./dep.lock {SHA_A}"]}}"#),
+            // The root is no file, and a directory path is normalised too.
+            format!(r#"{{"recordedInputs": ["FILE:@@// {SHA_A}"]}}"#),
+            format!(r#"{{"recordedFileInputs": {{"@@//": "{SHA_A}"}}}}"#),
+            r#"{"recordedInputs": ["FILE:@@//. DIR"]}"#.to_string(),
+            r#"{"recordedInputs": ["DIRENTS:@@//a/../b 7f"]}"#.to_string(),
+            r#"{"recordedInputs": ["DIRTREE:@@//a//b 7f"]}"#.to_string(),
+            r#"{"recordedInputs": ["DIRTREE:@@//a/..?/../excludes=x 7f"]}"#.to_string(),
+            r#"{"recordedFileInputs": {}, "recordedDirentsInputs": []}"#.to_string(),
+            r#"{"recordedFileInputs": {}, "recordedDirentsInputs": {"@@//x": 7}}"#.to_string(),
+            r#"{"recordedFileInputs": {}, "recordedDirentsInputs": {"@@//x/": "7f"}}"#.to_string(),
+            // A listing is no file container: the files are elsewhere.
+            r#"{"recordedDirentsInputs": {"@@//x": "7f"}}"#.to_string(),
             r#"{"recordedInputs": [], "generatedRepoSpecs": []}"#.to_string(),
             r#"{"recordedInputs": [], "generatedRepoSpecs": {"dep_a": "spec"}}"#.to_string(),
         ] {
@@ -1212,16 +1582,28 @@ mod tests {
         }
     }
 
-    /// What is not a main-repository file is not an unknown shape: it is
-    /// skipped, because no edit of the workspace changes it.
+    /// What is not a main-repository path is not an unknown shape: it is
+    /// skipped, because no edit of the workspace changes it. A record of
+    /// a main-repository directory is kept, apart from the files.
     #[test]
     fn inputs_of_other_kinds_and_other_repositories_are_skipped() {
+        // The first four items are what Bazel 9.3.2 wrote for an
+        // extension that lists the root and `third_party`.
         let entry = format!(
             r#"{{"recordedInputs": [
+                "FILE:@@// DIR",
+                "DIRENTS:@@// 8a2b",
+                "FILE:@@//third_party DIR",
+                "DIRENTS:@@//third_party 7869",
+                "DIRTREE:@@//vendor 5d41",
+                "DIRTREE:@@//gen?/../excludes=abc%2F**,file%2Cwith%2Ccommas 77aa",
+                "DIRTREE:@@//?/../excludes=bazel-* 0b0b",
                 "REPO_MAPPING:rules_dotnet+,platforms platforms",
                 "ENV:GOPROXY \\0",
-                "DIRENTS:@@//third_party 7f",
+                "FUTURE:@@//x.lock {SHA_A}",
                 "FILE:@@rules_go+//go.mod {SHA_A}",
+                "DIRENTS:@@rules_go+//go 7f",
+                "DIRTREE:/usr/share/zoneinfo 7f",
                 "FILE:/etc/hosts {SHA_A}",
                 "FILE:@@//a\\sb\\\\c.lock {SHA_A}",
                 "FILE:@//single.lock {SHA_A}",
@@ -1229,24 +1611,70 @@ mod tests {
             ]}}"#
         );
         let lock = ModuleLock::parse(with_entry(&entry).as_bytes());
-        let [entry] = lock.entries() else {
+        let [entry] = ext(&lock).entries.as_slice() else {
             panic!("{lock:?}");
         };
         let paths: Vec<&str> = entry.inputs.iter().map(|i| i.path.as_str()).collect();
         assert_eq!(paths, ["a b\\c.lock", "single.lock", "bare.lock"]);
         assert_eq!(entry.inputs[0].key, "@@//a b\\c.lock");
         assert_eq!(entry.inputs[2].recorded, "ENOENT");
+        // The root's own `DIR` record cannot go stale and is dropped; its
+        // listing is kept, with the empty path.
+        let dirs = |entry: &ExtensionEntry| -> Vec<(String, DirWatch, String)> {
+            let row = |d: &RecordedDir| (d.path.clone(), d.watch, d.recorded.clone());
+            entry.dirs.iter().map(row).collect()
+        };
+        let row =
+            |path: &str, watch, recorded: &str| (path.to_string(), watch, recorded.to_string());
+        assert_eq!(
+            dirs(entry),
+            [
+                row("", DirWatch::Entries, "8a2b"),
+                row("third_party", DirWatch::Exists, "DIR"),
+                row("third_party", DirWatch::Entries, "7869"),
+                row("vendor", DirWatch::Tree, "5d41"),
+                row("gen", DirWatch::Tree, "77aa"),
+                row("", DirWatch::Tree, "0b0b"),
+            ]
+        );
+        assert_eq!(entry.dirs[0].key, "@@//");
+        assert_eq!(
+            entry.dirs[4].key,
+            "@@//gen?/../excludes=abc%2F**,file%2Cwith%2Ccommas"
+        );
+        assert_eq!(lock.recorded_dirs().map(|dirs| dirs.len()), Some(6));
 
-        // The older containers skip the same keys.
+        // The older containers skip the same keys, and keep their
+        // listings in a container of their own: Bazel 7.7.2 wrote the
+        // `third_party` key and 8.7.0 the root key as well.
         for container in ["accumulatedFileDigests", "recordedFileInputs"] {
             let entry = format!(
                 r#"{{"{container}": {{"@@gazelle~//:go.mod": "{SHA_A}", "/abs/x": "{SHA_A}"}},
-                    "recordedDirentsInputs": {{"@@//third_party": "7f"}},
+                    "recordedDirentsInputs": {{"@@//": "6187", "@@//third_party": "7869",
+                        "@@gazelle~//internal": "7f", "/abs": "7f"}},
                     "envVariables": {{"GOPROXY": null}}}}"#
             );
             let lock = ModuleLock::parse(with_entry(&entry).as_bytes());
-            assert!(matches!(lock.entries(), [entry] if entry.inputs.is_empty()));
+            let [entry] = ext(&lock).entries.as_slice() else {
+                panic!("{lock:?}");
+            };
+            assert!(entry.inputs.is_empty());
+            assert_eq!(
+                dirs(entry),
+                [
+                    row("", DirWatch::Entries, "6187"),
+                    row("third_party", DirWatch::Entries, "7869"),
+                ]
+            );
         }
+        // A directory an extension watched by hand.
+        let entry = r#"{"recordedFileInputs": {"@@//": "DIR", "@@//third_party": "DIR"}}"#;
+        let lock = ModuleLock::parse(with_entry(entry).as_bytes());
+        let [entry] = ext(&lock).entries.as_slice() else {
+            panic!("{lock:?}");
+        };
+        assert!(entry.inputs.is_empty());
+        assert_eq!(dirs(entry), [row("third_party", DirWatch::Exists, "DIR")]);
 
         // Unknown top-level members are another reader's business, and
         // the first lock version had no `moduleExtensions`.
@@ -1266,7 +1694,7 @@ mod tests {
     fn a_recorded_item_is_split_at_its_first_space() {
         let entry = format!(r#"{{"recordedInputs": ["FILE:@@//a b.lock {SHA_A}"]}}"#);
         let lock = ModuleLock::parse(with_entry(&entry).as_bytes());
-        let [entry] = lock.entries() else {
+        let [entry] = ext(&lock).entries.as_slice() else {
             panic!("{lock:?}");
         };
         let [input] = entry.inputs.as_slice() else {
@@ -1289,6 +1717,256 @@ mod tests {
         assert_eq!(unescape(r"a\xb"), "axb");
         assert_eq!(unescape("trailing\\"), "trailing");
         assert_eq!(unescape("café"), "café");
+    }
+
+    /// A review probe on macOS arm64 (`module_lock/listing/`). A toy
+    /// extension lists `third_party`, finds the directory `café` there
+    /// and reads its `dep.lock`; on 8.7.0 and 9.3.2 it lists the root
+    /// too. Bazel 7.7.2 and 8.7.0 spell the path with one character per
+    /// UTF-8 byte, 9.3.2 in Unicode. Read either way it is the file on
+    /// disk: recorded, and fresh while untouched.
+    #[test]
+    fn a_non_ascii_path_and_a_listed_directory_are_read_from_real_locks() {
+        const INPUT: &str = "third_party/café/dep.lock";
+        const INTERNAL: &str = "third_party/caf\u{c3}\u{a9}/dep.lock";
+        let third_party = "786967d62642dc046d15e40945c82b0bc96178c2a6b5e0a7e9d575c32814bd86";
+        let no_lock_yet = "6187a32bf44b88701ca15f7b79c457d395c2b9cb3d021e255e779f681e8d9472";
+        let with_lock = "8a2b5501a1e470e81ec62ec0fde3d55c0f8b4e79684dc5ed0a58e7449060eafe";
+        let (exists, entries) = (DirWatch::Exists, DirWatch::Entries);
+        type Dirs<'a> = Vec<(&'a str, DirWatch, &'a str)>;
+        let cases: [(&str, u64, &str, Dirs<'_>); 3] = [
+            (
+                "7.7.2",
+                13,
+                INTERNAL,
+                vec![("third_party", entries, third_party)],
+            ),
+            (
+                "8.7.0",
+                24,
+                INTERNAL,
+                vec![
+                    ("", entries, no_lock_yet),
+                    ("third_party", entries, third_party),
+                ],
+            ),
+            (
+                "9.3.2",
+                28,
+                INPUT,
+                vec![
+                    ("", entries, with_lock),
+                    ("third_party", exists, "DIR"),
+                    ("third_party", entries, third_party),
+                ],
+            ),
+        ];
+        for (bazel, version, spelled, dirs) in cases {
+            let lock_file = format!("listing/{bazel}.MODULE.bazel.lock");
+            let workspace = |input: &str| {
+                let renamed = [
+                    (MODULE_LOCK, lock_file.as_str()),
+                    ("MODULE.bazel", "listing/root.MODULE.bazel"),
+                    (INPUT, input),
+                ];
+                Workspace::new("module_lock", &renamed)
+            };
+            let untouched = workspace("stale-repair/bazel-9.3.2/dep.lock.before");
+            let lock = ModuleLock::read(&untouched);
+            assert_eq!(lock.lock_file_version(), Some(version), "{bazel}");
+
+            // One record of the file, under the name it has on disk, with
+            // the key as the lock spells it.
+            let records = lock.recorded(INPUT).unwrap();
+            let [(entry, input)] = records.as_slice() else {
+                panic!("{bazel}: {} records", records.len());
+            };
+            assert!(entry.id.matches("//:ext.bzl", "toy"), "{bazel}");
+            assert_eq!(input.path, INPUT, "{bazel}");
+            assert_eq!(input.key, format!("@@//{spelled}"), "{bazel}");
+            // A directory really named `cafÃ©` would be another file.
+            assert_eq!(lock.recorded(INTERNAL), Some(Vec::new()), "{bazel}");
+
+            // The untouched file is fresh, and an edit of it is stale.
+            let state_of = |files: &Workspace| {
+                let verdicts = lock.input_verdicts(files).unwrap();
+                let of_input = |v: &&InputVerdict<'_>| v.input.path == INPUT;
+                let state = verdicts.iter().find(of_input).unwrap().state;
+                let others = verdicts.iter().filter(|v| v.input.path != INPUT);
+                (state, others.map(|v| v.state).collect::<Vec<_>>())
+            };
+            // 7.7.2 also records the root `MODULE.bazel`, which the
+            // extension names to find the root.
+            let others = vec![InputState::Fresh; usize::from(bazel == "7.7.2")];
+            assert_eq!(state_of(&untouched), (InputState::Fresh, others.clone()));
+            let edited = workspace("stale-repair/bazel-9.3.2/dep.lock.after");
+            assert_eq!(state_of(&edited), (InputState::Stale, others), "{bazel}");
+
+            // The listings are kept apart from the files. A `DIR` record
+            // is no file: it is never a row of `input_verdicts`.
+            let found = lock.recorded_dirs().unwrap();
+            let found: Dirs<'_> = found
+                .iter()
+                .map(|(_, dir)| (dir.path.as_str(), dir.watch, dir.recorded.as_str()))
+                .collect();
+            assert_eq!(found, dirs, "{bazel}");
+
+            // What socket-patch creates in a root (design 5.1) stales a
+            // listing of that root and nothing else; an edit of a file's
+            // bytes stales no listing.
+            let stale_dirs = |path: &str| -> Vec<(String, DirWatch)> {
+                let dirs = lock.recorded_dirs().unwrap();
+                let hit = dirs
+                    .iter()
+                    .filter(|(_, dir)| dir.stale_when_created_or_removed(path));
+                hit.map(|(_, dir)| (dir.path.clone(), dir.watch)).collect()
+            };
+            let root_listing: Vec<_> = dirs.iter().filter(|dir| dir.0.is_empty()).collect();
+            let root_listing = vec![(String::new(), entries); root_listing.len()];
+            assert_eq!(stale_dirs(".bazelignore"), root_listing, "{bazel}");
+            assert_eq!(stale_dirs(".socket"), root_listing, "{bazel}");
+            assert!(stale_dirs(".socket/bazel/index.json").is_empty(), "{bazel}");
+            assert!(stale_dirs(INPUT).is_empty(), "{bazel}");
+            assert_eq!(
+                stale_dirs("third_party/new"),
+                [("third_party".to_string(), entries)],
+                "{bazel}"
+            );
+            let all = lock.recorded_dirs().unwrap();
+            assert!(!all.iter().any(|(_, dir)| dir.stale_when_edited(INPUT)));
+        }
+    }
+
+    /// The same probe on 9.3.2. With the lock above `--lockfile_mode=error`
+    /// builds; after `.bazelignore` and `.socket/bazel/index.json` are
+    /// created it fails with `directory entries of @@// changed`, and
+    /// `update` then rewrites one record: the root's listing.
+    #[test]
+    fn creating_a_root_entry_changes_only_the_roots_listing_record() {
+        let read = |name: &str| lock(&format!("module_lock/listing/{name}.MODULE.bazel.lock"));
+        let (before, after) = (read("9.3.2"), read("9.3.2.after-root-files"));
+        let (before, after) = (ext(&before), ext(&after));
+        let [before] = before.entries.as_slice() else {
+            panic!("{before:?}");
+        };
+        let [after] = after.entries.as_slice() else {
+            panic!("{after:?}");
+        };
+        assert_eq!(before.inputs, after.inputs);
+        assert_eq!(before.repo_specs, after.repo_specs);
+        assert_eq!(before.dirs.len(), 3);
+        for (was, is) in before.dirs.iter().zip(&after.dirs) {
+            assert_eq!((&was.path, was.watch), (&is.path, is.watch));
+            let root_listing = was.path.is_empty() && was.watch == DirWatch::Entries;
+            assert_eq!(was.recorded != is.recorded, root_listing, "{was:?}");
+            assert_eq!(
+                was.stale_when_created_or_removed(".bazelignore"),
+                root_listing
+            );
+        }
+    }
+
+    #[test]
+    fn a_directory_record_says_which_changes_stale_it() {
+        let dir = |path: &str, watch| RecordedDir {
+            path: path.to_string(),
+            key: format!("@@//{path}"),
+            watch,
+            recorded: String::new(),
+        };
+        let created = |dir: &RecordedDir, path: &str| dir.stale_when_created_or_removed(path);
+
+        let listing = dir("third_party", DirWatch::Entries);
+        assert!(created(&listing, "third_party/new") && created(&listing, "third_party/py"));
+        // The directory itself, or one above it, appears or disappears.
+        assert!(created(&listing, "third_party"));
+        assert!(!created(&listing, "third_party/py/requirements.txt"));
+        assert!(!created(&listing, "third_party_2") && !created(&listing, "third"));
+        assert!(!created(&listing, "other/third_party/new"));
+        assert!(!listing.stale_when_edited("third_party/dep.lock"));
+
+        let root = dir("", DirWatch::Entries);
+        assert!(created(&root, ".bazelignore") && created(&root, ".socket"));
+        assert!(!created(&root, ".socket/bazel") && !root.stale_when_edited("dep.lock"));
+
+        let exists = dir("a/b", DirWatch::Exists);
+        assert!(created(&exists, "a/b") && created(&exists, "a"));
+        assert!(!created(&exists, "a/b/c") && !created(&exists, "a/bc"));
+        assert!(!exists.stale_when_edited("a/b/c"));
+
+        // A watched tree digests every name and every file below it.
+        let tree = dir("vendor", DirWatch::Tree);
+        assert!(created(&tree, "vendor/a/b.txt") && created(&tree, "vendor"));
+        assert!(tree.stale_when_edited("vendor/a/b.txt"));
+        assert!(!tree.stale_when_edited("vendored/a.txt") && !created(&tree, "vendored"));
+        let whole = dir("", DirWatch::Tree);
+        assert!(whole.stale_when_edited("any/file") && created(&whole, "any"));
+    }
+
+    /// A path of the two older containers is decoded only when it is
+    /// what Bazel's internal spelling of a UTF-8 name looks like.
+    /// Anything else is kept as found, and still found by a query in
+    /// either spelling.
+    #[test]
+    fn a_path_is_decoded_from_bazels_internal_spelling() {
+        assert_eq!(
+            from_internal("third_party/dep.lock"),
+            "third_party/dep.lock"
+        );
+        assert_eq!(from_internal("caf\u{c3}\u{a9}/dep.lock"), "café/dep.lock");
+        assert_eq!(to_internal("café/dep.lock"), "caf\u{c3}\u{a9}/dep.lock");
+        assert_eq!(
+            from_internal(&to_internal("日本/依存.lock")),
+            "日本/依存.lock"
+        );
+        // A directory really named `cafÃ©` is spelled with four characters.
+        let double = to_internal("caf\u{c3}\u{a9}");
+        assert_eq!(double.chars().count(), 7);
+        assert_eq!(from_internal(&double), "caf\u{c3}\u{a9}");
+        // A Latin-1 byte that is no UTF-8 (a name in another encoding),
+        // and a character no byte can be: kept as found.
+        for kept in [
+            "caf\u{e9}/dep.lock",
+            "日本/dep.lock",
+            "caf\u{c3}\u{a9}/日本",
+        ] {
+            assert_eq!(from_internal(kept), kept);
+        }
+
+        let inputs = |container: &str, key: &str| {
+            let entry = match container {
+                "recordedInputs" => format!(r#"{{"recordedInputs": ["FILE:{key} {SHA_A}"]}}"#),
+                _ => format!(r#"{{"{container}": {{"{key}": "{SHA_A}"}}}}"#),
+            };
+            ModuleLock::parse(with_entry(&entry).as_bytes())
+        };
+        let count = |lock: &ModuleLock, path: &str| lock.recorded(path).unwrap().len();
+        // Label keys of lock version 3 are decoded like path keys.
+        let v3 = inputs("accumulatedFileDigests", "@@//caf\u{c3}\u{a9}:dep.lock");
+        let [(_, input)] = v3.recorded("café/dep.lock").unwrap()[..] else {
+            panic!("{v3:?}");
+        };
+        assert_eq!(input.key, "@@//caf\u{c3}\u{a9}:dep.lock");
+        // A listing key of the same lock versions too.
+        let entry = r#"{"recordedFileInputs": {}, "recordedDirentsInputs": {"@@//cafÃ©": "7f"}}"#;
+        let listed = ModuleLock::parse(with_entry(entry).as_bytes());
+        assert_eq!(listed.recorded_dirs().unwrap()[0].1.path, "café");
+
+        // Kept as found: found by the same spelling.
+        let latin1 = inputs("recordedFileInputs", "@@//caf\u{e9}/dep.lock");
+        assert_eq!(count(&latin1, "caf\u{e9}/dep.lock"), 1);
+        let wide = inputs("recordedFileInputs", "@@//日本/dep.lock");
+        assert_eq!(count(&wide, "日本/dep.lock"), 1);
+        // `recordedInputs` is written in Unicode and is not decoded. If
+        // a release this reader has not probed wrote the internal
+        // spelling there, a query for the name on disk still finds it.
+        let undecoded = inputs("recordedInputs", "@@//caf\u{c3}\u{a9}/dep.lock");
+        assert_eq!(count(&undecoded, "café/dep.lock"), 1);
+        assert_eq!(count(&undecoded, "caf\u{c3}\u{a9}/dep.lock"), 1);
+        assert_eq!(count(&undecoded, "cafe/dep.lock"), 0);
+        let unicode = inputs("recordedInputs", "@@//café/dep.lock");
+        assert_eq!(count(&unicode, "café/dep.lock"), 1);
+        assert_eq!(count(&unicode, "caf\u{c3}\u{a9}/dep.lock"), 0);
     }
 
     /// Probe L7: family A names the selected version in a graph key, and
@@ -1376,7 +2054,7 @@ mod tests {
         ] {
             let lock = lock(&format!("module_lock/paket/{file}.MODULE.bazel.lock"));
             let label = format!("//deps:paket.{extension}.bzl");
-            let entries: Vec<_> = lock.entries_of(&label, extension).collect();
+            let entries = lock.entries_of(&label, extension).unwrap();
             let [entry] = entries.as_slice() else {
                 panic!("{file}: {} entries", entries.len());
             };
@@ -1390,8 +2068,8 @@ mod tests {
             assert!(entry.specs_mention("sha512-HriaeJXKHcyWUUFH7BxRZPyHEZusGmYRbiU3G+RoEG5ZzSVl7M7ue+tuBgA6wEKjJQ3hmnp6Ff5nxjwzuyuWsA=="));
             // Another extension of the same file, or the name alone, is
             // not this entry.
-            assert_eq!(lock.entries_of(&label, "other").count(), 0);
-            assert_eq!(lock.entries_of("//:paket.bzl", extension).count(), 0);
+            assert_eq!(lock.entries_of(&label, "other"), Some(Vec::new()));
+            assert_eq!(lock.entries_of("//:paket.bzl", extension), Some(Vec::new()));
         }
     }
 
@@ -1436,7 +2114,7 @@ mod tests {
             let before = Workspace::new(&dir, &[("dep.lock", "dep.lock.before")]);
             let read = |name: &str| lock(&format!("{dir}/{name}.MODULE.bazel.lock"));
             let state = |lock: &ModuleLock, files: &Workspace| {
-                let verdicts = lock.input_verdicts(files);
+                let verdicts = ext(lock).input_verdicts(files);
                 let [verdict] = verdicts.as_slice() else {
                     panic!("{line}: {} inputs", verdicts.len());
                 };
@@ -1487,11 +2165,7 @@ mod tests {
             assert!(!spec.mentions(needle), "{needle:?}");
         }
         let lock = lock("module_lock/stale-repair/bazel-7.7.2/baseline.MODULE.bazel.lock");
-        let spec = &lock
-            .entries_of("//:ext.bzl", "toy")
-            .next()
-            .unwrap()
-            .repo_specs[0];
+        let spec = &lock.entries_of("//:ext.bzl", "toy").unwrap()[0].repo_specs[0];
         assert_eq!(spec.name, "dep_a");
         assert_eq!(spec.rule.as_deref(), Some("@@//:ext.bzl%toy_repo"));
         let lock = lock_9_3_2_spec_rule();
@@ -1501,8 +2175,8 @@ mod tests {
     /// The rule id of lock version 28, which writes it as one member.
     fn lock_9_3_2_spec_rule() -> Option<String> {
         let lock = lock("module_lock/stale-repair/bazel-9.3.2/baseline.MODULE.bazel.lock");
-        let entry = lock.entries_of("//:ext.bzl", "toy").next().unwrap();
-        entry.repo_specs[0].rule.clone()
+        let entries = lock.entries_of("//:ext.bzl", "toy").unwrap();
+        entries[0].repo_specs[0].rule.clone()
     }
 
     /// Probe L4.a: an entry keyed by OS and architecture is refreshed
@@ -1537,13 +2211,13 @@ mod tests {
             states(&repaired, &after),
             [row(linux, stale), row(osx, fresh)]
         );
-        let records: Vec<_> = repaired.recorded("dep.lock").collect();
+        let records = repaired.recorded("dep.lock").unwrap();
         let patched = |index: usize| records[index].0.specs_mention("socket-patched-a-1.0");
         assert_eq!(records.len(), 2);
         assert!(!patched(0) && patched(1));
-        assert_eq!(repaired.recorded("other.lock").count(), 0);
+        assert_eq!(repaired.recorded("other.lock"), Some(Vec::new()));
         // Four more extensions have a general entry and no file input.
-        assert!(repaired.entries().len() > 2);
+        assert!(repaired.entries().unwrap().len() > 2);
     }
 
     /// Probe L3: pip facts are `dist_hashes[index][package][dist URL]`
@@ -1555,8 +2229,8 @@ mod tests {
     fn pip_facts_are_read_in_both_fact_versions() {
         let read = |dir: &str, name: &str| {
             let lock = lock(&format!("module_lock/facts/{dir}/{name}.MODULE.bazel.lock"));
-            assert_eq!(lock.entries_of(PIP.0, PIP.1).count(), 0);
-            let facts: Vec<_> = lock.facts_of(PIP.0, PIP.1).collect();
+            assert_eq!(lock.entries_of(PIP.0, PIP.1), Some(Vec::new()));
+            let facts = lock.facts_of(PIP.0, PIP.1).unwrap();
             let [facts] = facts.as_slice() else {
                 panic!("{dir}/{name}: {} pip facts", facts.len());
             };
@@ -1571,24 +2245,39 @@ mod tests {
         // Two packages are pinned; other modules' hubs add thirty.
         assert_eq!(baseline.dist_hashes[0].packages.len(), 32);
         assert_eq!(baseline.dists(PYPI, "six").len(), 4);
-        assert!(baseline.holds_digest(PYPI, "six", SIX_1_17));
-        assert!(baseline.holds_digest("https://pypi.org/simple/", "six", SIX_1_17));
-        assert!(!baseline.holds_digest("https://example.test/simple", "six", SIX_1_17));
-        assert!(!baseline.holds_digest(PYPI, "idna", SIX_1_17));
-        assert!(!baseline.holds_digest(PYPI, "six", &format!("sha256:{SIX_1_17}")));
+        let (held, not_held) = (FactDigest::Held, FactDigest::NotHeld);
+        assert_eq!(baseline.holds_digest(PYPI, "six", SIX_1_17), held);
+        let slash = "https://pypi.org/simple/";
+        assert_eq!(baseline.holds_digest(slash, "six", SIX_1_17), held);
+        let other = "https://example.test/simple";
+        assert_eq!(baseline.holds_digest(other, "six", SIX_1_17), not_held);
+        assert_eq!(baseline.holds_digest(PYPI, "idna", SIX_1_17), not_held);
+        // A digest that is not bare lowercase hex cannot be compared
+        // with a package that has distributions, and with none it is
+        // not held.
+        for asked in [format!("sha256:{SIX_1_17}"), SIX_1_17.to_uppercase()] {
+            let cannot_tell = FactDigest::CannotTell;
+            assert_eq!(baseline.holds_digest(PYPI, "six", &asked), cannot_tell);
+            assert_eq!(
+                baseline.holds_digest(PYPI, "no-such-package", &asked),
+                not_held
+            );
+        }
         let repaired = read("pip-v1", "bazel-repaired");
-        assert!(!repaired.holds_digest(PYPI, "six", SIX_1_17));
+        assert_eq!(repaired.holds_digest(PYPI, "six", SIX_1_17), not_held);
         assert_eq!(repaired.dists(PYPI, "six").len(), 2);
 
         // rules_python 2.5.0-rc4 on Bazel 9.3.2: `sha256:<hex>`.
         let baseline = read("pip-v2", "baseline");
         assert_eq!(baseline.fact_version, PipFactVersion::V2);
         assert_eq!(baseline.dists(PYPI, "six").len(), 2);
-        assert!(baseline.holds_digest(PYPI, "six", SIX_1_17));
+        assert_eq!(baseline.holds_digest(PYPI, "six", SIX_1_17), held);
         let digest = &baseline.dists(PYPI, "six")[1].1;
         assert_eq!(*digest, format!("sha256:{SIX_1_17}"));
+        assert_eq!(baseline.holds_digest(PYPI, "six", SHA_A), not_held);
         let repaired = read("pip-v2", "bazel-repaired");
         assert!(repaired.dists(PYPI, "six").is_empty());
+        assert_eq!(repaired.holds_digest(PYPI, "six", SIX_1_17), not_held);
         assert_eq!(repaired.dist_hashes[0].packages.len(), 31);
     }
 
@@ -1613,7 +2302,7 @@ mod tests {
             known.dists(PYPI, "six"),
             [("https://f.test/six.whl".to_string(), String::new())]
         );
-        assert!(!known.holds_digest(PYPI, "six", ""));
+        assert_eq!(known.holds_digest(PYPI, "six", ""), FactDigest::CannotTell);
         assert_eq!(
             known.index_packages,
             [(
@@ -1641,6 +2330,64 @@ mod tests {
         }
     }
 
+    /// rules_python stores the digest the index advertises. 2.0.3 keeps
+    /// what follows `#sha256=`, so a link without it leaves an empty
+    /// value; 2.5.0-rc4 keeps `<algo>:<hex>` for any algorithm and an
+    /// empty value for none. pypi.org always publishes SHA-256;
+    /// pypiserver publishes MD5 by default. Such a distribution may be
+    /// the pinned file, so the lookup never answers "not held" for it.
+    #[test]
+    fn a_pip_digest_that_is_no_sha256_cannot_be_told_from_the_pin() {
+        let pip = |fact_version: &str, dists: Value| {
+            let id = ExtensionId::parse("@@rules_python+//python/extensions:pip.bzl%pip").unwrap();
+            let value = serde_json::json!({
+                "fact_version": fact_version,
+                "dist_hashes": {PYPI: {"six": dists}},
+            });
+            ExtensionFacts { id, value }.pip().unwrap()
+        };
+        let holds = |fact_version: &str, dists: Value| {
+            pip(fact_version, dists).holds_digest(PYPI, "six", SIX_1_17)
+        };
+        let (whl, sdist) = ("https://f.test/six.whl", "https://f.test/six.tar.gz");
+        let md5 = "d41d8cd98f00b204e9800998ecf8427e";
+        let v2_pin = format!("sha256:{SIX_1_17}");
+        let v2_other = format!("sha256:{SHA_A}");
+        let (held, not_held, cannot_tell) = (
+            FactDigest::Held,
+            FactDigest::NotHeld,
+            FactDigest::CannotTell,
+        );
+
+        // An index that advertises no digest.
+        assert_eq!(holds("v1", serde_json::json!({whl: ""})), cannot_tell);
+        assert_eq!(holds("v2", serde_json::json!({whl: ""})), cannot_tell);
+        // An index that advertises MD5.
+        let v2_md5 = format!("md5:{md5}");
+        assert_eq!(holds("v2", serde_json::json!({whl: v2_md5})), cannot_tell);
+        assert_eq!(holds("v1", serde_json::json!({whl: md5})), cannot_tell);
+        // A digest in the other fact version's rendering, or uppercase.
+        assert_eq!(holds("v1", serde_json::json!({whl: v2_pin})), cannot_tell);
+        assert_eq!(holds("v2", serde_json::json!({whl: SIX_1_17})), cannot_tell);
+        let upper = SIX_1_17.to_uppercase();
+        assert_eq!(holds("v1", serde_json::json!({whl: upper})), cannot_tell);
+        // One distribution that cannot be compared is enough, and a
+        // match beside it still holds.
+        let mixed = serde_json::json!({whl: v2_other, sdist: ""});
+        assert_eq!(holds("v2", mixed), cannot_tell);
+        let matched = serde_json::json!({whl: v2_pin, sdist: ""});
+        assert_eq!(holds("v2", matched), held);
+        // Every digest is a SHA-256 and none is the pin: not held.
+        assert_eq!(holds("v2", serde_json::json!({whl: v2_other})), not_held);
+        assert_eq!(holds("v1", serde_json::json!({whl: SHA_A})), not_held);
+        assert_eq!(holds("v1", serde_json::json!({})), not_held);
+        // Another package, or another index, has no distribution here.
+        let empty = pip("v2", serde_json::json!({whl: ""}));
+        assert_eq!(empty.holds_digest(PYPI, "idna", SIX_1_17), not_held);
+        let other = "https://example.test/simple";
+        assert_eq!(empty.holds_digest(other, "six", SIX_1_17), not_held);
+    }
+
     /// Probe L3: gazelle's facts are one ordered list, and a rewrite adds
     /// a member (the replacement's `.mod` file) instead of replacing one.
     #[test]
@@ -1649,16 +2396,12 @@ mod tests {
             let lock = lock(&format!(
                 "module_lock/facts/go-deps/{name}.MODULE.bazel.lock"
             ));
-            assert_eq!(lock.entries_of("//:extensions.bzl", "go_deps").count(), 0);
-            let go_deps = lock
-                .facts_of("//:extensions.bzl", "go_deps")
-                .next()
-                .unwrap();
+            assert!(ext(&lock)
+                .entries_of("//:extensions.bzl", "go_deps")
+                .is_empty());
+            let go_deps = ext(&lock).facts_of("//:extensions.bzl", "go_deps")[0];
             // The Go SDK's facts are another extension's and another shape.
-            let sdk = lock
-                .facts_of("//go:extensions.bzl", "go_sdk")
-                .next()
-                .unwrap();
+            let sdk = ext(&lock).facts_of("//go:extensions.bzl", "go_sdk")[0];
             assert!(sdk.go_deps().is_err() && sdk.pip().is_err());
             assert!(go_deps.pip().is_err());
             go_deps.go_deps().unwrap()
@@ -1715,9 +2458,9 @@ mod tests {
             let raw = bytes(&format!("module_lock/facts/toy/{name}.MODULE.bazel.lock"));
             assert!(raw.windows(14).any(|w| w == b"\"factsVersions"));
             let lock = ModuleLock::parse(&raw);
-            assert!(lock.entries().is_empty());
-            let [facts] = lock.facts() else {
-                panic!("{name}: {} facts", lock.facts().len());
+            assert_eq!(lock.entries(), Some(&[][..]));
+            let Some([facts]) = lock.facts() else {
+                panic!("{name}: {:?}", lock.facts());
             };
             assert!(facts.id.in_root_module() && facts.id.matches("//:ext.bzl", "toy"));
             facts
