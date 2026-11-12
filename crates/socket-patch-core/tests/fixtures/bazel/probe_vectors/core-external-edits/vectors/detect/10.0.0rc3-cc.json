@@ -1,0 +1,289 @@
+{
+ "bazel": "10.0.0rc3",
+ "cfg": "cc",
+ "flags": [
+  "--repo_contents_cache=<CACHE>"
+ ],
+ "workspace_md5_is_output_base_name": "e735afe326e90eb3e1108da0858f0a8b",
+ "workspace_path_hashed": "<CAMPAIGN>/probes/core-external-edits/vec/10.0.0rc3-cc",
+ "tree": [
+  {
+   "path": "<OB>/DO_NOT_BUILD_HERE",
+   "mode": "0o644",
+   "type": "file",
+   "content": "<WS>"
+  },
+  {
+   "path": "<OB>/MODULE.bazel.lock",
+   "mode": "0o644",
+   "type": "file"
+  },
+  {
+   "path": "<OB>/README",
+   "mode": "0o644",
+   "type": "file"
+  },
+  {
+   "path": "<OB>/action_cache",
+   "mode": "0o755",
+   "type": "dir"
+  },
+  {
+   "path": "<OB>/command-44ab5e73-f8f9-4526-a3cb-17e02b38c9ea.profile.gz",
+   "mode": "0o644",
+   "type": "file"
+  },
+  {
+   "path": "<OB>/command.profile.gz",
+   "mode": "0o755",
+   "type": "symlink",
+   "target": "command-44ab5e73-f8f9-4526-a3cb-17e02b38c9ea.profile.gz"
+  },
+  {
+   "path": "<OB>/execroot",
+   "mode": "0o755",
+   "type": "dir"
+  },
+  {
+   "path": "<OB>/external",
+   "mode": "0o755",
+   "type": "dir"
+  },
+  {
+   "path": "<OB>/install",
+   "mode": "0o755",
+   "type": "symlink",
+   "target": "<INSTALL>/7a9f02b699216bb1b550f4f6e07d97c4"
+  },
+  {
+   "path": "<OB>/java.log",
+   "mode": "0o755",
+   "type": "symlink",
+   "target": "java.log.host.user.log.java.20261111-203914.40018"
+  },
+  {
+   "path": "<OB>/java.log.host.user.log.java.20261111-203914.40018",
+   "mode": "0o644",
+   "type": "file"
+  },
+  {
+   "path": "<OB>/javalog.properties",
+   "mode": "0o644",
+   "type": "file"
+  },
+  {
+   "path": "<OB>/lock",
+   "mode": "0o644",
+   "type": "file"
+  },
+  {
+   "path": "<OB>/sandbox",
+   "mode": "0o755",
+   "type": "dir"
+  },
+  {
+   "path": "<OB>/server",
+   "mode": "0o700",
+   "type": "dir"
+  },
+  {
+   "path": "<OB>/execroot/DO_NOT_BUILD_HERE",
+   "mode": "0o644",
+   "type": "file",
+   "content": "<WS>"
+  },
+  {
+   "path": "<OB>/external/+http_archive+dep_http",
+   "mode": "0o755",
+   "type": "symlink",
+   "target": "<CACHE>/8446c71f86e914b9ffe7ae1ab8bacaadec3b7aaa1e448f3eaba0aa25169f76b6/01a95761-0cdf-4489-9715-169f50148e43"
+  },
+  {
+   "path": "<CACHE>/8446c71f86e914b9ffe7ae1ab8bacaadec3b7aaa1e448f3eaba0aa25169f76b6/01a95761-0cdf-4489-9715-169f50148e43",
+   "mode": "0o755",
+   "type": "dir"
+  },
+  {
+   "path": "<CACHE>/8446c71f86e914b9ffe7ae1ab8bacaadec3b7aaa1e448f3eaba0aa25169f76b6/01a95761-0cdf-4489-9715-169f50148e43/BUILD.bazel",
+   "mode": "0o644",
+   "type": "file"
+  },
+  {
+   "path": "<CACHE>/8446c71f86e914b9ffe7ae1ab8bacaadec3b7aaa1e448f3eaba0aa25169f76b6/01a95761-0cdf-4489-9715-169f50148e43/REPO.bazel",
+   "mode": "0o644",
+   "type": "file"
+  },
+  {
+   "path": "<CACHE>/8446c71f86e914b9ffe7ae1ab8bacaadec3b7aaa1e448f3eaba0aa25169f76b6/01a95761-0cdf-4489-9715-169f50148e43/data",
+   "mode": "0o755",
+   "type": "dir"
+  },
+  {
+   "path": "<CACHE>/8446c71f86e914b9ffe7ae1ab8bacaadec3b7aaa1e448f3eaba0aa25169f76b6/01a95761-0cdf-4489-9715-169f50148e43/data/other.txt",
+   "mode": "0o644",
+   "type": "file"
+  },
+  {
+   "path": "<CACHE>/8446c71f86e914b9ffe7ae1ab8bacaadec3b7aaa1e448f3eaba0aa25169f76b6/01a95761-0cdf-4489-9715-169f50148e43/data/payload.txt",
+   "mode": "0o644",
+   "type": "file"
+  },
+  {
+   "path": "<CACHE>/8446c71f86e914b9ffe7ae1ab8bacaadec3b7aaa1e448f3eaba0aa25169f76b6/01a95761-0cdf-4489-9715-169f50148e43/defs.bzl",
+   "mode": "0o644",
+   "type": "file"
+  },
+  {
+   "path": "<CACHE>/8446c71f86e914b9ffe7ae1ab8bacaadec3b7aaa1e448f3eaba0aa25169f76b6/01a95761-0cdf-4489-9715-169f50148e43.recorded_inputs",
+   "mode": "0o644",
+   "type": "file",
+   "content": "8446c71f86e914b9ffe7ae1ab8bacaadec3b7aaa1e448f3eaba0aa25169f76b6\n"
+  },
+  {
+   "path": "<OB>/external/+plain_repo+dep_plain",
+   "mode": "0o755",
+   "type": "dir"
+  },
+  {
+   "path": "<OB>/external/+plain_repo+dep_plain/BUILD.bazel",
+   "mode": "0o644",
+   "type": "file"
+  },
+  {
+   "path": "<OB>/external/+plain_repo+dep_plain/REPO.bazel",
+   "mode": "0o644",
+   "type": "file"
+  },
+  {
+   "path": "<OB>/external/+plain_repo+dep_plain/data",
+   "mode": "0o755",
+   "type": "dir"
+  },
+  {
+   "path": "<OB>/external/+plain_repo+dep_plain/data/other.txt",
+   "mode": "0o644",
+   "type": "file"
+  },
+  {
+   "path": "<OB>/external/+plain_repo+dep_plain/data/payload.txt",
+   "mode": "0o644",
+   "type": "file"
+  },
+  {
+   "path": "<OB>/external/+plain_repo+dep_plain/defs.bzl",
+   "mode": "0o644",
+   "type": "file"
+  },
+  {
+   "path": "<OB>/external/@+plain_repo+dep_plain.marker",
+   "mode": "0o644",
+   "type": "file",
+   "content": "40eb3ff65d58c07063aef6da0ce8a091d6a134c14f3504a67e437c3b8a756a4f\nFILE:<CAMPAIGN>/probes/core-external-edits/archive/dep.tar.gz a01aa6942f76c0f13beab5bd9cb1a0558c7844c3c49dee9e935b2938261fe5f5\n"
+  },
+  {
+   "path": "<OB>/external/@platforms+host_platform+host_platform.marker",
+   "mode": "0o644",
+   "type": "file"
+  },
+  {
+   "path": "<OB>/external/_main",
+   "mode": "0o755",
+   "type": "symlink",
+   "target": "<WS>"
+  },
+  {
+   "path": "<OB>/external/bazel_tools",
+   "mode": "0o755",
+   "type": "symlink",
+   "target": "<INSTALL>/7a9f02b699216bb1b550f4f6e07d97c4/embedded_tools"
+  },
+  {
+   "path": "<OB>/external/platforms",
+   "mode": "0o755",
+   "type": "symlink",
+   "target": "<CACHE>/afc8ea29792f98bfe33f736bf1be7447fea9eb778708c62460c82b2d213b7c5b/0551948b-cac9-41f4-92af-8da2efbd8a17"
+  },
+  {
+   "path": "<OB>/external/platforms+host_platform+host_platform",
+   "mode": "0o755",
+   "type": "dir"
+  },
+  {
+   "path": "<CACHE>/_trash",
+   "mode": "0o755",
+   "type": "dir"
+  },
+  {
+   "path": "<CACHE>/gc_lock",
+   "mode": "0o644",
+   "type": "file"
+  },
+  {
+   "path": "<WS>/bazel-10.0.0rc3-cc",
+   "mode": "0o755",
+   "type": "symlink",
+   "target": "<OB>/execroot/_main"
+  },
+  {
+   "path": "<WS>/bazel-bin",
+   "mode": "0o755",
+   "type": "symlink",
+   "target": "<OB>/execroot/_main/bazel-out/darwin_arm64-fastbuild/bin"
+  },
+  {
+   "path": "<WS>/bazel-out",
+   "mode": "0o755",
+   "type": "symlink",
+   "target": "<OB>/execroot/_main/bazel-out"
+  },
+  {
+   "path": "<WS>/bazel-testlogs",
+   "mode": "0o755",
+   "type": "symlink",
+   "target": "<OB>/execroot/_main/bazel-out/darwin_arm64-fastbuild/testlogs"
+  }
+ ],
+ "expect": [
+  {
+   "query": "<OB>/external/+plain_repo+dep_plain/data/payload.txt",
+   "kinds": [
+    "bazel_output_base"
+   ],
+   "canonical": "<OB>/external/+plain_repo+dep_plain/data/payload.txt",
+   "output_base": "<OB>",
+   "cache_entry": null,
+   "vendor_dir": null
+  },
+  {
+   "query": "<OB>/external/+http_archive+dep_http/data/payload.txt",
+   "kinds": [
+    "via_link",
+    "bazel_output_base",
+    "bazel_repo_contents_cache"
+   ],
+   "canonical": "<CACHE>/8446c71f86e914b9ffe7ae1ab8bacaadec3b7aaa1e448f3eaba0aa25169f76b6/01a95761-0cdf-4489-9715-169f50148e43/data/payload.txt",
+   "output_base": "<OB>",
+   "cache_entry": "<CACHE>/8446c71f86e914b9ffe7ae1ab8bacaadec3b7aaa1e448f3eaba0aa25169f76b6/01a95761-0cdf-4489-9715-169f50148e43",
+   "vendor_dir": null
+  },
+  {
+   "query": "<WS>/bazel-bin/plain_file.out",
+   "kinds": [
+    "via_link",
+    "bazel_output_base"
+   ],
+   "canonical": "<OB>/execroot/_main/bazel-out/darwin_arm64-fastbuild/bin/plain_file.out",
+   "output_base": "<OB>",
+   "cache_entry": null,
+   "vendor_dir": null
+  },
+  {
+   "query": "<WS>/BUILD.bazel",
+   "kinds": [],
+   "canonical": "<WS>/BUILD.bazel",
+   "output_base": null,
+   "cache_entry": null,
+   "vendor_dir": null
+  }
+ ]
+}
