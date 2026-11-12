@@ -25,7 +25,7 @@ use std::cmp::Ordering;
 use std::fmt;
 
 use super::model::{BoundaryFiles, DeclSystem, FileText, FileView, RootRef};
-use super::rc::{Chain, EffectiveFlags, Flag, FlagState, LockfileMode};
+use super::rc::{root_relative, Chain, EffectiveFlags, Flag, LockfileMode, Reading};
 
 /// Whether something holds on every release a line may run, on none of
 /// them, or on some.
@@ -184,8 +184,10 @@ const NEWEST_RELEASE: BazelVersion = v(9, 3, 2);
 pub enum Label {
     /// `X.Y.Z` or `X.Y.ZrcN`.
     Exact(BazelVersion),
-    /// `N.x`, the newest release of N, or `N.*`, which may also be a
-    /// candidate. bazelisk floats both, so a gate must hold for all of N.
+    /// `N.x`, the newest release of N, or `N.*`, the newest release or
+    /// candidate of N (`candidates`). bazelisk floats both, so a gate
+    /// must hold for all of N, and under `N.*` for the candidates of
+    /// `N.0.0` too.
     Track { major: u32, candidates: bool },
     /// A label bazelisk accepts and that names no release socket-patch
     /// can place: `latest`, `latest-N`, `last_rc`, `last_green`,
@@ -320,15 +322,21 @@ pub struct Declared {
     /// the Bazel root, without repeats. bazelisk takes the file nearest
     /// its working directory, so one workspace can run two Bazel versions.
     pub picks: Vec<Pick>,
-    /// Launcher wrappers under `<root>/tools`. bazelisk runs an executable
-    /// one in place of the declared version, even for `--version`. The
-    /// executable bit is not visible to this layer, so every file with a
-    /// wrapper's name is listed: a blind spot, never a refusal.
+    /// Launcher wrappers under `<root>/tools`, and under the directory a
+    /// tracked `.bazeliskrc` names with `BAZELISK_WRAPPER_DIRECTORY`.
+    /// bazelisk runs an executable one in place of the declared version,
+    /// even for `--version`. The executable bit is not visible to this
+    /// layer, so every file with a wrapper's name is listed: a blind
+    /// spot, never a refusal. A wrapper directory that cannot be listed
+    /// (an absolute path, one past the read boundary) is listed as
+    /// `<its value>/bazel`.
     pub wrappers: Vec<String>,
 }
 
 const BAZELISKRC: &str = ".bazeliskrc";
 const BAZELVERSION: &str = ".bazelversion";
+/// bazelisk's `defaultWrapperDirectory`.
+const WRAPPER_DIR: &str = "tools";
 
 /// Reads the launcher files of `root` as bazelisk v1.30.0 does: from each
 /// directory it may be started in, the nearest `.bazeliskrc` with a
@@ -396,16 +404,53 @@ pub fn read_declared(root: &RootRef, files: &dyn FileView) -> Declared {
         }
     }
 
+    // bazelisk looks for the wrapper under `<root>/tools`, or under the
+    // `BAZELISK_WRAPPER_DIRECTORY` of the environment, of the
+    // `.bazeliskrc` nearest its working directory or of the home rc.
+    // Every directory a tracked file names is listed beside the default:
+    // the machine-level settings are never read, `BAZELISK_SKIP_WRAPPER`
+    // included, and one wrapper too many is only a blind spot too many.
+    let mut wrapper_dirs = vec![WRAPPER_DIR.to_string()];
+    for cwd in 0..=at_root {
+        let nearest = rcs[cwd..].iter().flatten().next();
+        let named = nearest.and_then(|file| match files.read(&file.file) {
+            FileText::Bytes(bytes) => bazeliskrc_value(&bytes, "BAZELISK_WRAPPER_DIRECTORY"),
+            FileText::Absent | FileText::Unreadable => None,
+        });
+        wrapper_dirs.extend(named.filter(|dir| !dir.is_empty()));
+    }
+    let mut wrappers: Vec<String> = Vec::new();
+    for dir in &wrapper_dirs {
+        // bazelisk joins the root, the directory and `bazel`.
+        let written = format!("{}/bazel", dir.trim_end_matches('/'));
+        let above = |path: &String| path.split('/').take_while(|s| *s == "..").count();
+        let inside = root_relative(&written).filter(|path| above(path) <= root.boundary_levels);
+        let found: Vec<String> = match inside {
+            // Inside the read boundary a directory that cannot be listed
+            // is not there, like a root with no `tools`.
+            Some(path) => {
+                let within = path.rsplit_once('/').map_or("", |(within, _)| within);
+                let names = files.list(within).unwrap_or_default();
+                let wrappers = names.iter().filter(|name| is_wrapper(name));
+                wrappers.map(|name| join(within, name)).collect()
+            }
+            // An absolute path or a directory past the boundary: nobody
+            // looks there, so the wrapper bazelisk would run is named by
+            // the value as written.
+            None => vec![written],
+        };
+        for wrapper in found {
+            if !wrappers.contains(&wrapper) {
+                wrappers.push(wrapper);
+            }
+        }
+    }
+
     let found = rcs.into_iter().zip(versions).flat_map(|(rc, v)| [rc, v]);
-    let tools = files.list("tools").unwrap_or_default();
     Declared {
         files: found.flatten().collect(),
         picks,
-        wrappers: tools
-            .iter()
-            .filter(|name| is_wrapper(name))
-            .map(|name| format!("tools/{name}"))
-            .collect(),
+        wrappers,
     }
 }
 
@@ -552,7 +597,12 @@ impl fmt::Display for BazelLine {
             (Some(lo), None) => write!(f, "{lo} or newer"),
             (None, Some(hi)) => write!(f, "{hi} or older"),
             (Some(lo), Some(hi)) if lo == hi => write!(f, "{lo}"),
-            (Some(lo), Some(hi)) if lo == v(hi.major, 0, 0) && hi == ceiling(hi.major) => {
+            // A whole major, with or without the candidates of `N.0.0`.
+            (Some(lo), Some(hi))
+                if lo.release() == v(hi.major, 0, 0)
+                    && lo.rc.is_none_or(|rc| rc == 0)
+                    && hi == ceiling(hi.major) =>
+            {
                 write!(f, "{hi}")
             }
             (Some(lo), Some(hi)) => write!(f, "{lo} - {hi}"),
@@ -579,7 +629,16 @@ pub fn line(declared: &Declared, lock_file_version: Option<u64>, shapes: &[ApiSh
         evidence.push(LineEvidence::Declared(pick.clone()));
         let range = match pick.reading {
             Label::Exact(version) => Some((version, version)),
-            Label::Track { major, .. } => Some((v(major, 0, 0), ceiling(major))),
+            // `N.*` also runs a candidate, and while `N.0.0` is one
+            // (10.0.0 is at rc3) it runs below `N.0.0`: the bottom is
+            // the first candidate, so no gate at `N.0.0` is met.
+            Label::Track { major, candidates } => {
+                let first = BazelVersion {
+                    rc: candidates.then_some(0),
+                    ..v(major, 0, 0)
+                };
+                Some((first, ceiling(major)))
+            }
             Label::Floating | Label::Invalid => None,
         };
         match (range, span) {
@@ -649,7 +708,9 @@ pub enum Tier {
 pub enum TierRefusal {
     /// Bazel 4 or older.
     TooOld,
-    /// Bzlmod on Bazel 5, where it is experimental.
+    /// Bzlmod on Bazel 5, where it is experimental: a `MODULE.bazel`
+    /// declaration there, or any declaration once the tracked rc files
+    /// may switch `--experimental_enable_bzlmod` on.
     ExperimentalBzlmod,
     /// A `WORKSPACE` declaration on Bazel 9 or newer, which never reads it.
     WorkspaceRemoved,
@@ -658,10 +719,14 @@ pub enum TierRefusal {
     LineUnknown,
 }
 
-fn tier_at(release: BazelVersion, decl: DeclSystem) -> Tier {
+/// `bzlmod_on` is whether the rc files may switch Bzlmod on.
+fn tier_at(release: BazelVersion, decl: DeclSystem, bzlmod_on: bool) -> Tier {
     match (release.major, decl) {
         (0..=4, _) => Tier::Refused(TierRefusal::TooOld),
         (5, DeclSystem::Bzlmod) => Tier::Refused(TierRefusal::ExperimentalBzlmod),
+        // The hybrid mode of 5.x is the experiment itself, so a
+        // `WORKSPACE` declaration under it is refused with it.
+        (5, DeclSystem::Workspace) if bzlmod_on => Tier::Refused(TierRefusal::ExperimentalBzlmod),
         (5 | 6, _) => Tier::Legacy,
         (7, DeclSystem::Bzlmod) if release.minor < 2 => Tier::Beta,
         // A candidate is no supported release.
@@ -678,27 +743,43 @@ fn tier_at(release: BazelVersion, decl: DeclSystem) -> Tier {
 /// the weakest tier of any release the line may run, because a floating
 /// label runs them all over time. A line with no proven top is evaluated
 /// as the newest audited release ([`BazelLine::untested`] then holds).
-pub fn tier(line: &BazelLine, decl: DeclSystem) -> Tier {
+///
+/// `flags` decide one row (design 2.5): where the line may run 5.x and
+/// some command line of the tracked rc files ends with
+/// `--experimental_enable_bzlmod` on, set outright or only under a
+/// config, the workspace runs the experimental Bzlmod of 5.x and both
+/// file families are refused.
+pub fn tier(line: &BazelLine, decl: DeclSystem, flags: &EffectiveFlags) -> Tier {
     let Some(hi) = line.hi else {
         return match decl {
             DeclSystem::Workspace => Tier::Refused(TierRefusal::LineUnknown),
-            DeclSystem::Bzlmod => tier_at(NEWEST_RELEASE, decl),
+            DeclSystem::Bzlmod => tier_at(NEWEST_RELEASE, decl, false),
         };
     };
     let lo = line.lo.unwrap_or(hi);
     // Where the table changes between `lo` and `hi`.
     let steps = [(5, 0), (6, 0), (7, 0), (7, 2), (8, 0), (9, 0), (10, 0)];
     let steps = steps.iter().map(|(major, minor)| v(*major, *minor, 0));
-    let points = [lo, hi]
+    let points: Vec<BazelVersion> = [lo, hi]
         .into_iter()
-        .chain(steps.filter(|s| lo < *s && *s <= hi));
+        .chain(steps.filter(|s| lo < *s && *s <= hi))
+        .collect();
     let rank = |tier: &Tier| match tier {
         Tier::Refused(_) => 0,
         Tier::Legacy => 1,
         Tier::Beta => 2,
         Tier::Supported => 3,
     };
-    let tiers = points.map(|point| tier_at(point, decl));
+    let on_five = points.iter().any(|point| point.major == 5);
+    let bzlmod_on = on_five
+        && Chain::COMMANDS.iter().any(|chain| {
+            let readings = flags.readings(&[Flag::EnableBzlmod], *chain);
+            // A chain cut short names no value; `dep_system` is
+            // `Unknown` then.
+            let finals = readings.iter().flatten().flat_map(|r| &r.finals[0]);
+            finals.flatten().any(|value| value == "true")
+        });
+    let tiers = points.iter().map(|point| tier_at(*point, decl, bzlmod_on));
     tiers.min_by_key(rank).unwrap_or(Tier::Beta)
 }
 
@@ -775,9 +856,9 @@ pub enum DepSystem {
         systems: Vec<DepSystem>,
         why: String,
     },
-    /// No system can be named: Bazel itself rejects the rc flags on this
-    /// line, or an rc file that sets them cannot be read. `why` names the
-    /// rc line.
+    /// No system can be named: Bazel itself rejects the rc flags on
+    /// every release of the line, or an rc file Bazel loads could not be
+    /// read in full. `why` names the rc line or the file.
     Unknown { why: String },
 }
 
@@ -840,144 +921,160 @@ fn eras(line: &BazelLine) -> Vec<Era> {
     inside.map(|(_, (era, _))| *era).collect()
 }
 
-/// What the rc files say about the two flags on one command chain,
-/// beyond their values.
-struct Spelled {
-    /// `--enable_workspace` appears, in either polarity.
-    workspace: Option<String>,
-    /// `--enable_bzlmod` appears under its non-experimental name.
-    plain_bzlmod: Option<String>,
-    /// Either flag appears at all.
-    any: Option<String>,
-}
-
 /// One row of the table: the system an era runs with these two flag
-/// values (`None` = not set), or why Bazel stops on them. A flag an era
-/// does not know is fatal in either polarity, from a `common` line too
-/// (`ERROR: --enable_workspace :: Unrecognized option`, exit 2).
-fn row(
-    era: Era,
-    bzlmod: Option<bool>,
-    workspace: Option<bool>,
-    spelled: &Spelled,
-) -> Result<DepSystem, String> {
-    let unknown_flag = |site: &String, flag: &str, since: &str| {
-        format!("{site}: Bazel older than {since} stops on `{flag}` (Unrecognized option)")
-    };
-    match era {
-        Era::Pre5 => match &spelled.any {
-            Some(site) => Err(unknown_flag(
-                site,
-                "--experimental_enable_bzlmod` or `--enable_workspace",
-                "5.0.0",
-            )),
-            None => Ok(DepSystem::Workspace),
+/// values (`None` = not set), or why Bazel stops on them. The flags an
+/// era does not know are [`unknown_since`]'s.
+fn row(era: Era, bzlmod: Option<bool>, workspace: Option<bool>) -> Result<DepSystem, &'static str> {
+    Ok(match era {
+        Era::Pre5 => DepSystem::Workspace,
+        // Bzlmod is off by default through 6.x and on from 7.0, and
+        // `WORKSPACE` cannot be switched off before 7.1.
+        Era::V5 | Era::V6 | Era::V70 => match bzlmod.unwrap_or(era == Era::V70) {
+            true => DepSystem::Hybrid,
+            false => DepSystem::Workspace,
         },
-        Era::V5 | Era::V6 | Era::V70 => {
-            if let Some(site) = &spelled.workspace {
-                return Err(unknown_flag(site, "--enable_workspace", "7.1.0"));
-            }
-            if let (Era::V5, Some(site)) = (era, &spelled.plain_bzlmod) {
-                return Err(unknown_flag(site, "--enable_bzlmod", "6.0.0"));
-            }
-            // Bzlmod is off by default through 6.x and on from 7.0.
-            let on = bzlmod.unwrap_or(era == Era::V70);
-            Ok(if on {
-                DepSystem::Hybrid
-            } else {
-                DepSystem::Workspace
-            })
-        }
-        Era::V7 => Ok(match (bzlmod.unwrap_or(true), workspace.unwrap_or(true)) {
+        Era::V7 => match (bzlmod.unwrap_or(true), workspace.unwrap_or(true)) {
             (true, true) => DepSystem::Hybrid,
             (true, false) => DepSystem::Bzlmod,
             (false, true) => DepSystem::Workspace,
             (false, false) => DepSystem::Neither,
-        }),
-        Era::V8 => match (bzlmod.unwrap_or(true), workspace.unwrap_or(false)) {
-            (true, false) => Ok(DepSystem::Bzlmod),
-            (true, true) => Ok(DepSystem::Hybrid),
-            (false, true) => Ok(DepSystem::Workspace),
-            (false, false) => Err(format!(
-                "{}: Bazel 8 stops when `--enable_bzlmod` and `--enable_workspace` are both off",
-                spelled.any.clone().unwrap_or_default()
-            )),
         },
-        Era::V9 => Ok(DepSystem::Bzlmod),
-    }
+        Era::V8 => {
+            match (bzlmod.unwrap_or(true), workspace.unwrap_or(false)) {
+                (true, false) => DepSystem::Bzlmod,
+                (true, true) => DepSystem::Hybrid,
+                (false, true) => DepSystem::Workspace,
+                (false, false) => return Err(
+                    "Bazel 8 stops when `--enable_bzlmod` and `--enable_workspace` are both off",
+                ),
+            }
+        }
+        Era::V9 => DepSystem::Bzlmod,
+    })
 }
 
-/// The values one flag may take on a chain; `None` = not set, so the
-/// era's default applies.
-fn readings(flag: &str, state: &FlagState<String>) -> Result<Vec<Option<bool>>, String> {
-    let parse = |text: &String| match text.as_str() {
-        "true" => Ok(Some(true)),
-        "false" => Ok(Some(false)),
-        other => Err(format!(
-            "`--{flag}={other}` is not a boolean; Bazel stops on it"
-        )),
+/// The first release that knows an option, when `era` is older than it:
+/// such a Bazel stops on the option in either polarity, from a `common`
+/// line too (`ERROR: --enable_workspace :: Unrecognized option`, exit 2).
+fn unknown_since(era: Era, flag: Flag, spelling: &str) -> Option<&'static str> {
+    let since = match (flag, spelling) {
+        (Flag::EnableWorkspace, _) => (Era::V7, "7.1.0"),
+        (Flag::EnableBzlmod, "enable_bzlmod") => (Era::V6, "6.0.0"),
+        (Flag::EnableBzlmod, _) => (Era::V5, "5.0.0"),
+        _ => return None,
     };
-    // The plain command first: its system leads a `DualMode` list.
-    let mut out = Vec::new();
-    if state.may_be_unset() {
-        out.push(None);
+    let at = |era: Era| ERAS.iter().position(|(known, _)| *known == era);
+    (at(era) < at(since.0)).then_some(since.1)
+}
+
+/// What one command line does on one era: the systems it may run, and
+/// why Bazel stops on it, when it does or may.
+///
+/// A flag the era does not know stops Bazel wherever its token is read.
+/// A token every reading reaches leaves no system at all; one that only
+/// some release or working directory reads leaves the systems of the
+/// readings without it, which the flag's possible values already hold.
+fn on_era(era: Era, reading: &Reading) -> (Vec<DepSystem>, Option<String>) {
+    if era == Era::V9 {
+        return (vec![DepSystem::Bzlmod], None);
     }
-    for value in state.values() {
-        let value = parse(value)?;
-        if !out.contains(&value) {
-            out.push(value);
+    let mut stop: Option<String> = None;
+    let mut certain = false;
+    for (flag, seen) in &reading.seen {
+        if let Some(since) = unknown_since(era, *flag, seen.spelling) {
+            certain |= seen.certain;
+            stop.get_or_insert_with(|| {
+                format!(
+                    "{}: Bazel older than {since} stops on `--{}` (Unrecognized option)",
+                    seen.site, seen.spelling
+                )
+            });
         }
     }
-    Ok(out)
+    let mut systems: Vec<DepSystem> = Vec::new();
+    if certain {
+        return (systems, stop);
+    }
+    // The rc line whose token gives `flag` this value.
+    let site = |flag: Flag, value: &str| {
+        let mut tokens = reading.seen.iter().rev();
+        let token = tokens.find(|(of, seen)| *of == flag && seen.value == value);
+        token.map_or(String::new(), |(_, seen)| seen.site.to_string())
+    };
+    let parse = |flag: Flag, name: &str, value: &Option<String>| match value.as_deref() {
+        None => Ok(None),
+        Some("true") => Ok(Some(true)),
+        Some("false") => Ok(Some(false)),
+        Some(other) => Err(format!(
+            "{}: `--{name}={other}` is not a boolean; Bazel stops on it",
+            site(flag, other)
+        )),
+    };
+    let (bzlmod, workspace) = (&reading.finals[0], &reading.finals[1]);
+    for (b, w) in bzlmod
+        .iter()
+        .flat_map(|b| workspace.iter().map(move |w| (b, w)))
+    {
+        let values = parse(Flag::EnableBzlmod, "enable_bzlmod", b)
+            .and_then(|b| Ok((b, parse(Flag::EnableWorkspace, "enable_workspace", w)?)));
+        let system = values.and_then(|(b, w)| {
+            row(era, b, w).map_err(|why| format!("{}: {why}", site(Flag::EnableBzlmod, "false")))
+        });
+        match system {
+            Ok(system) if !systems.contains(&system) => systems.push(system),
+            Ok(_) => {}
+            Err(why) => drop(stop.get_or_insert(why)),
+        }
+    }
+    (systems, stop)
+}
+
+/// What one command chain runs on a line.
+struct ChainSystems {
+    systems: Vec<DepSystem>,
+    /// No config, release of the line or working directory changes
+    /// either flag.
+    fixed: bool,
 }
 
 /// The systems one command chain may run on `eras`, or why Bazel stops.
+///
+/// Each era is judged on its own. An era stops when Bazel stops on some
+/// command line of it, a `--config` one included (design 2.5: `Set` or
+/// `Possible`). Only when every era of the line stops is that the
+/// answer: the line is then proven to lie where the rc files are broken.
+/// Otherwise a command line Bazel stops on builds nothing and adds no
+/// system, and the others give theirs. The two flags are paired per
+/// command line, never crossed between a config and the plain command.
 fn chain_systems(
     eras: &[Era],
     flags: &EffectiveFlags,
     chain: Chain,
-) -> Result<Vec<DepSystem>, String> {
-    if eras.iter().all(|era| *era == Era::V9) {
-        return Ok(vec![DepSystem::Bzlmod]);
-    }
-    let bzlmod = flags.state(Flag::EnableBzlmod, chain);
-    let workspace = flags.state(Flag::EnableWorkspace, chain);
-    // Unreadable is not unset: the import may flip either flag.
-    for state in [&bzlmod, &workspace] {
-        if let FlagState::UnknowableHard(why) = state {
-            return Err(why.clone());
-        }
-    }
-    let site = |flag: Flag, spelling: Option<&str>| {
-        let seen = flags.occurrences(flag, chain);
-        let named = seen
-            .iter()
-            .find(|o| spelling.is_none_or(|s| o.spelling == s));
-        named.map(|o| o.site.to_string())
-    };
-    let workspace_site = site(Flag::EnableWorkspace, None);
-    let spelled = Spelled {
-        plain_bzlmod: site(Flag::EnableBzlmod, Some("enable_bzlmod")),
-        any: workspace_site
-            .clone()
-            .or_else(|| site(Flag::EnableBzlmod, None)),
-        workspace: workspace_site,
-    };
-    let bzlmod = readings("enable_bzlmod", &bzlmod)?;
-    let workspace = readings("enable_workspace", &workspace)?;
+) -> Result<ChainSystems, String> {
+    let readings = flags.readings(&[Flag::EnableBzlmod, Flag::EnableWorkspace], chain)?;
     let mut systems: Vec<DepSystem> = Vec::new();
+    let mut stops: Vec<String> = Vec::new();
     for era in eras {
-        for (b, w) in bzlmod
-            .iter()
-            .flat_map(|b| workspace.iter().map(move |w| (b, w)))
-        {
-            let system = row(*era, *b, *w, &spelled)?;
-            if !systems.contains(&system) {
-                systems.push(system);
+        let mut stop = None;
+        // The plain command first: its system leads a `DualMode` list.
+        for reading in &readings {
+            let (ran, stopped) = on_era(*era, reading);
+            for system in ran {
+                if !systems.contains(&system) {
+                    systems.push(system);
+                }
             }
+            stop = stop.or(stopped);
         }
+        stops.extend(stop);
     }
-    Ok(systems)
+    if !stops.is_empty() && stops.len() == eras.len() {
+        return Err(stops.swap_remove(0));
+    }
+    let plain = &readings[0].finals;
+    let single = plain.iter().all(|values| values.len() == 1);
+    let fixed = single && readings.iter().all(|reading| reading.finals == *plain);
+    Ok(ChainSystems { systems, fixed })
 }
 
 /// The dependency system of a workspace: the table of design 2.5, keyed
@@ -987,9 +1084,29 @@ fn chain_systems(
 /// The result is one system only when every release of the line, every
 /// reading of the flags and every command chain agree. An existing
 /// `MODULE.bazel` proves nothing: Bazel 7 and newer create one.
+///
+/// The rows for a flag a release does not know apply to a line proven to
+/// lie in such releases. Any other line gives the systems of the
+/// releases that accept the rc files: a `7.x` label with
+/// `--noenable_workspace` is `Bzlmod`, because the 7.0.x that would stop
+/// on the flag builds nothing.
 pub fn dep_system(line: &BazelLine, flags: &EffectiveFlags) -> DepSystem {
     let eras = eras(line);
-    let mut by_chain: Vec<(Chain, Vec<DepSystem>)> = Vec::new();
+    if eras.is_empty() {
+        let why = format!("Bazel {line} names no release");
+        return DepSystem::Unknown { why };
+    }
+    // From 9 both flags are accepted and do nothing, whatever sets them.
+    if eras.iter().all(|era| *era == Era::V9) {
+        return DepSystem::Bzlmod;
+    }
+    // Unreadable is not unset: a file Bazel loads and nobody read may
+    // flip either flag, also when the files that were read set both.
+    if let Some(gap) = flags.gaps().into_iter().find(|gap| gap.hard) {
+        let why = format!("{} {}", gap.file, gap.detail);
+        return DepSystem::Unknown { why };
+    }
+    let mut by_chain: Vec<(Chain, ChainSystems)> = Vec::new();
     for chain in Chain::COMMANDS {
         match chain_systems(&eras, flags, *chain) {
             Ok(systems) => by_chain.push((*chain, systems)),
@@ -997,12 +1114,16 @@ pub fn dep_system(line: &BazelLine, flags: &EffectiveFlags) -> DepSystem {
         }
     }
     // `Chain::COMMANDS` starts with the build chain, which governs.
-    let build = by_chain[0].1.clone();
-    let differs = |systems: &Vec<DepSystem>| {
+    let build = by_chain[0].1.systems.clone();
+    let differs = |(_, other): &&(Chain, ChainSystems)| {
+        let systems = &other.systems;
         systems.len() != build.len() || systems.iter().any(|system| !build.contains(system))
     };
-    if let Some((chain, other)) = by_chain.iter().find(|(_, systems)| differs(systems)) {
-        let extra = other.iter().filter(|system| !build.contains(system));
+    if let Some((chain, other)) = by_chain.iter().find(differs) {
+        let extra = other
+            .systems
+            .iter()
+            .filter(|system| !build.contains(system));
         let why = format!(
             "`bazel {}` and `bazel build` read different `--enable_bzlmod` / \
              `--enable_workspace` values from the rc files",
@@ -1015,7 +1136,7 @@ pub fn dep_system(line: &BazelLine, flags: &EffectiveFlags) -> DepSystem {
     }
     match &build[..] {
         [one] => one.clone(),
-        _ if eras.len() > 1 && flags_fixed(flags) => DepSystem::DualMode {
+        _ if eras.len() > 1 && by_chain[0].1.fixed => DepSystem::DualMode {
             why: format!("Bazel {line} spans releases with different defaults"),
             systems: build,
         },
@@ -1026,13 +1147,6 @@ pub fn dep_system(line: &BazelLine, flags: &EffectiveFlags) -> DepSystem {
             systems: build,
         },
     }
-}
-
-/// Whether neither flag depends on a config or on the release.
-fn flags_fixed(flags: &EffectiveFlags) -> bool {
-    [Flag::EnableBzlmod, Flag::EnableWorkspace]
-        .iter()
-        .all(|flag| !matches!(flags.state(*flag, Chain::Build), FlagState::Possible(_)))
 }
 
 // ── Module versions ──────────────────────────────────────────────────
@@ -1099,8 +1213,8 @@ mod tests {
     use serde_json::Value;
 
     use super::*;
-    use crate::bazel::rc::read;
     use crate::bazel::rc::testing::Files;
+    use crate::bazel::rc::{read, RcFiles};
 
     const LAUNCHER: &str = include_str!("../../tests/fixtures/bazel/rc/bazelversion.json");
     const ORDER: &str = include_str!("../../tests/fixtures/bazel/rc/version-order.json");
@@ -1144,8 +1258,17 @@ mod tests {
         line(&read_declared(root, files), None, &[])
     }
 
+    fn flags(rc: &str, line: &BazelLine) -> EffectiveFlags {
+        read(&Files::of(&[(".bazelrc", rc)])).effective(line)
+    }
+
     fn system(rc: &str, line: &BazelLine) -> DepSystem {
-        dep_system(line, &read(&Files::of(&[(".bazelrc", rc)])).effective(line))
+        dep_system(line, &flags(rc, line))
+    }
+
+    /// The tier with no rc file.
+    fn plain_tier(line: &BazelLine, decl: DeclSystem) -> Tier {
+        tier(line, decl, &RcFiles::default().effective(line))
     }
 
     // ── Launcher files (probe C15) ───────────────────────────────────
@@ -1155,6 +1278,8 @@ mod tests {
         let fixture: Value = serde_json::from_str(LAUNCHER).expect("fixture");
         let vectors = fixture["vectors"].as_array().expect("vectors");
         assert_eq!(vectors.len(), 35);
+        // Whether each floating-major vector also takes candidates.
+        let mut tracks = Vec::new();
         for vector in vectors {
             let id = vector["id"].as_str().expect("id");
             let text = |key: &str| vector[key].as_str();
@@ -1218,6 +1343,12 @@ mod tests {
                         declared_line(&root(project, 0), &files).is_unknown(),
                         "{id}"
                     );
+                    if id == "dir-named-bazelversion" {
+                        // Skipped like a missing file: a file bazelisk
+                        // cannot read would be the pick, and stop it.
+                        assert_eq!(pick.file, None, "{id}");
+                        assert!(declared.files.is_empty(), "{id}");
+                    }
                     continue;
                 }
                 file => assert!(named(file), "{id}: {:?}", pick.file),
@@ -1260,12 +1391,19 @@ mod tests {
                     assert_eq!(ran, format!("bazel {version}"), "{id}");
                     assert_eq!(vector["expected_static"], true, "{id}");
                 }
-                (Label::Track { major, .. }, _) => {
-                    assert_eq!(
-                        (line.lo, line.hi),
-                        (Some(v(major, 0, 0)), Some(ceiling(major)))
-                    );
+                (Label::Track { major, candidates }, _) => {
+                    // `7.x` is the releases of 7; `7.*` also its
+                    // candidates, which order below 7.0.0.
+                    let first = BazelVersion {
+                        rc: candidates.then_some(0),
+                        ..v(major, 0, 0)
+                    };
+                    assert_eq!((line.lo, line.hi), (Some(first), Some(ceiling(major))));
+                    let from_release = if candidates { Tri::Maybe } else { Tri::Yes };
+                    assert_eq!(line.at_least(v(major, 0, 0)), from_release, "{id}");
+                    assert_eq!(line.to_string(), "7.x", "{id}");
                     assert_eq!(text("bazelisk_offline"), Some("error: needs the network"));
+                    tracks.push(candidates);
                 }
                 (Label::Invalid, _) => {
                     assert!(line.is_unknown(), "{id}");
@@ -1274,6 +1412,37 @@ mod tests {
                 (Label::Floating, _) => assert!(line.is_unknown(), "{id}"),
             }
         }
+        assert_eq!(tracks, [false, true], "`7.x`, then `7.*`");
+
+        // 10.0.0 is at rc3: `10.*` runs it today, `10.x` nothing yet. A
+        // gate at 10.0.0 must not count the candidate in.
+        let of = |label: &str| {
+            let files = Files::of(&[(".bazelversion", label)]);
+            declared_line(&root("", 0), &files)
+        };
+        let star = of("10.*\n");
+        let first = BazelVersion::parse("10.0.0rc0").expect("a candidate");
+        assert_eq!((star.lo, star.hi), (Some(first), Some(ceiling(10))));
+        assert!(first < NEWEST_AUDITED[5] && NEWEST_AUDITED[5] < v(10, 0, 0));
+        assert_eq!(star.at_least(v(10, 0, 0)), Tri::Maybe);
+        assert_eq!(star.at_least(v(9, 0, 0)), Tri::Yes);
+        assert_eq!(of("10.x\n").at_least(v(10, 0, 0)), Tri::Yes);
+        assert_eq!(
+            (star.to_string(), of("10.x\n").to_string()),
+            ("10.x".to_string(), "10.x".to_string())
+        );
+        // The candidates of 8.0.0 keep `8.*` from the Supported tier.
+        assert_eq!(
+            plain_tier(&of("8.x\n"), DeclSystem::Bzlmod),
+            Tier::Supported
+        );
+        assert_eq!(plain_tier(&of("8.*\n"), DeclSystem::Bzlmod), Tier::Beta);
+        // Its defaults are those of the major either way.
+        assert_eq!(system("", &of("8.*\n")), DepSystem::Bzlmod);
+        assert_eq!(
+            lockfile_mode_default(&of("7.*\n")),
+            Some(LockfileMode::Update)
+        );
     }
 
     #[test]
@@ -1435,17 +1604,34 @@ mod tests {
             ("sub/.bazelversion", "7.7.2\n"),
         ]);
         assert!(declared_line(&root("sub", 0), &floating).is_unknown());
-        let unreadable = Files::of(&[("sub/.bazelversion", "7.7.2\n")])
-            .with(".bazeliskrc", FileText::Unreadable);
+        // A `.bazeliskrc` that cannot be read may hold the version, so it
+        // is the pick, and the `.bazelversion` beside it proves nothing.
+        let unreadable =
+            Files::of(&[(".bazelversion", "7.7.2\n")]).with(".bazeliskrc", FileText::Unreadable);
         let declared = read_declared(&root("", 0), &unreadable);
+        let pick = &declared.picks[0];
         assert_eq!(
-            (
-                declared.picks[0].label.as_deref(),
-                declared.files[0].readable
-            ),
-            (None, false)
+            (pick.file.as_deref(), pick.label.as_deref(), pick.reading),
+            (Some(".bazeliskrc"), None, Label::Floating)
+        );
+        assert_eq!(
+            (declared.files[0].file.as_str(), declared.files[0].readable),
+            (".bazeliskrc", false)
         );
         assert!(line(&declared, None, &[]).is_unknown());
+        // A directory of a launcher file's name is skipped, and bazelisk
+        // keeps walking up to the file above the root.
+        let directory = Files::of(&[
+            (".bazelversion/keep", ""),
+            (".bazeliskrc/keep", ""),
+            ("../.bazelversion", "7.7.2\n"),
+        ])
+        .with(".bazelversion", FileText::Unreadable)
+        .with(".bazeliskrc", FileText::Unreadable);
+        let declared = read_declared(&root("", 1), &directory);
+        assert_eq!(declared.picks[0].file.as_deref(), Some("../.bazelversion"));
+        assert_eq!(line(&declared, None, &[]).exact(), Some(v(7, 7, 2)));
+        assert_eq!(declared.files.len(), 1);
         // An empty first line is `latest`, even with a version below it.
         let empty = Files::of(&[
             (".bazelversion", "\n7.7.2\n"),
@@ -1493,6 +1679,67 @@ mod tests {
             read_declared(&root("", 0), &files).wrappers,
             ["tools/bazel.linux-x86_64"]
         );
+
+        // bazelisk takes the directory from `BAZELISK_WRAPPER_DIRECTORY`
+        // when a `.bazeliskrc` sets it. The environment may set it back,
+        // so `tools` stays listed.
+        let moved = Files::of(&[
+            (
+                ".bazeliskrc",
+                "USE_BAZEL_VERSION=7.7.2\nBAZELISK_WRAPPER_DIRECTORY = scripts/./launch/\n",
+            ),
+            ("scripts/launch/bazel", "#!/bin/sh\n"),
+            ("scripts/launch/bazel.ps1", ""),
+            ("scripts/launch/README", ""),
+            ("tools/bazel", "#!/bin/sh\n"),
+        ]);
+        let declared = read_declared(&root("", 0), &moved);
+        assert_eq!(
+            declared.wrappers,
+            [
+                "tools/bazel",
+                "scripts/launch/bazel",
+                "scripts/launch/bazel.ps1"
+            ]
+        );
+        let ran = line(&declared, None, &[]);
+        assert_eq!(ran.exact(), Some(v(7, 7, 2)));
+        let wrapper = LineEvidence::Wrapper("scripts/launch/bazel".to_string());
+        assert!(ran.evidence.contains(&wrapper));
+        // The `.bazeliskrc` nearest each directory bazelisk may start in
+        // counts, with or without a version in it.
+        let nested = Files::of(&[
+            (".bazelversion", "7.7.2\n"),
+            ("svc/.bazeliskrc", "BAZELISK_WRAPPER_DIRECTORY=ci\n"),
+            ("ci/bazel.arm64", ""),
+        ]);
+        assert_eq!(
+            read_declared(&root("svc", 0), &nested).wrappers,
+            ["ci/bazel.arm64"]
+        );
+        assert!(read_declared(&root("", 0), &nested).wrappers.is_empty());
+        // A directory nobody can list is a blind spot by its own name: an
+        // absolute path, or one past the read boundary. One inside the
+        // boundary is listed, and a missing one holds no wrapper.
+        let wrappers = |dir: &str, levels: usize| {
+            let rc = format!("BAZELISK_WRAPPER_DIRECTORY={dir}\n");
+            let files = Files::of(&[(".bazeliskrc", &rc[..]), ("../shared/bazel", "")]);
+            read_declared(&root("", levels), &files.boundary(levels)).wrappers
+        };
+        assert_eq!(wrappers("/opt/launch", 1), ["/opt/launch/bazel"]);
+        assert_eq!(wrappers("../shared", 0), ["../shared/bazel"]);
+        assert_eq!(wrappers("../../shared/", 1), ["../../shared/bazel"]);
+        assert_eq!(wrappers("../shared", 1), ["../shared/bazel"]);
+        assert!(wrappers("../other", 1).is_empty());
+        assert!(wrappers("nowhere", 0).is_empty());
+        assert!(wrappers("", 0).is_empty());
+        // The root itself is a directory like any other.
+        let at_root = Files::of(&[
+            (".bazeliskrc", "BAZELISK_WRAPPER_DIRECTORY=.\n"),
+            ("bazel", "#!/bin/sh\n"),
+            ("bazel.rc", ""),
+        ]);
+        assert_eq!(read_declared(&root("", 0), &at_root).wrappers, ["bazel"]);
     }
 
     // ── The line ladder ──────────────────────────────────────────────
@@ -1718,7 +1965,7 @@ mod tests {
             // A candidate is never Supported.
             (exact("8.0.0rc1"), Bzlmod, Tier::Beta),
         ] {
-            assert_eq!(tier(&line, decl), expected, "Bazel {line}, {decl:?}");
+            assert_eq!(plain_tier(&line, decl), expected, "Bazel {line}, {decl:?}");
         }
 
         // The advisory of a line no probe ran.
@@ -1780,7 +2027,8 @@ mod tests {
         use DepSystem::{Bzlmod, Hybrid, Neither, Workspace};
         let rows: &[(&str, &str, Option<DepSystem>)] = &[
             ("5.4.1", "", Some(Workspace)),
-            // Experimental Bzlmod on 5: hybrid, and refused by its tier.
+            // Experimental Bzlmod on 5: hybrid, and refused by its tier
+            // (asserted below the table).
             (
                 "5.4.1",
                 "common --experimental_enable_bzlmod\n",
@@ -1859,10 +2107,72 @@ mod tests {
                 }
             }
         }
-        assert_eq!(
-            tier(&exact("5.4.1"), DeclSystem::Bzlmod),
-            Tier::Refused(TierRefusal::ExperimentalBzlmod)
-        );
+        // The row `5.x | --experimental_enable_bzlmod Set or Possible |
+        // Tier::Refused`: with the flag on, the hybrid mode of 5.x is the
+        // experiment, so both file families are refused; without it a
+        // WORKSPACE declaration stays Legacy.
+        let five = exact("5.4.1");
+        let refused = Tier::Refused(TierRefusal::ExperimentalBzlmod);
+        for (rc, workspace_tier, expected) in [
+            ("", Tier::Legacy, DepSystem::Workspace),
+            (
+                "common --noexperimental_enable_bzlmod\n",
+                Tier::Legacy,
+                DepSystem::Workspace,
+            ),
+            ("common --experimental_enable_bzlmod\n", refused, Hybrid),
+            (
+                "common --experimental_enable_bzlmod\ncommon --noexperimental_enable_bzlmod\n",
+                Tier::Legacy,
+                DepSystem::Workspace,
+            ),
+            // Only `bazel query` runs the experiment.
+            (
+                "query --experimental_enable_bzlmod\n",
+                refused,
+                DepSystem::DualMode {
+                    systems: vec![Workspace, Hybrid],
+                    why: String::new(),
+                },
+            ),
+            // Only a config does.
+            (
+                "common:x --experimental_enable_bzlmod\n",
+                refused,
+                DepSystem::DualMode {
+                    systems: vec![Workspace, Hybrid],
+                    why: String::new(),
+                },
+            ),
+        ] {
+            let flags = flags(rc, &five);
+            assert_eq!(
+                tier(&five, DeclSystem::Workspace, &flags),
+                workspace_tier,
+                "{rc:?}"
+            );
+            assert_eq!(tier(&five, DeclSystem::Bzlmod, &flags), refused, "{rc:?}");
+            match (dep_system(&five, &flags), expected) {
+                (DepSystem::DualMode { systems, .. }, DepSystem::DualMode { systems: all, .. }) => {
+                    assert_eq!(systems, all, "{rc:?}");
+                }
+                (found, expected) => assert_eq!(found, expected, "{rc:?}"),
+            }
+        }
+        // The flag refuses only where the line may run 5.x.
+        let on = "common --experimental_enable_bzlmod\n";
+        for (line, expected) in [
+            (exact("6.6.0"), Tier::Legacy),
+            (exact("7.7.2"), Tier::Beta),
+            (range(v(5, 4, 1), v(6, 6, 0)), refused),
+            (
+                range(v(4, 2, 4), v(6, 6, 0)),
+                Tier::Refused(TierRefusal::TooOld),
+            ),
+        ] {
+            let found = tier(&line, DeclSystem::Workspace, &flags(on, &line));
+            assert_eq!(found, expected, "Bazel {line}");
+        }
         // A candidate has its release's defaults.
         assert_eq!(system("", &exact("8.0.0rc1")), Bzlmod);
         assert_eq!(system("", &exact("4.2.4")), Workspace);
@@ -1895,11 +2205,76 @@ mod tests {
         // The token-3 range covers 6.4 - 6.6 and 7.0.x.
         let (three, _) = systems("", &range(v(6, 4, 0), v(7, 0, u32::MAX)));
         assert_eq!(three, [Workspace, Hybrid]);
-        // On a floating 7.x the flag is fatal on 7.0.x.
-        assert!(matches!(
-            system("common --noenable_workspace\n", &major(7)),
-            DepSystem::Unknown { .. }
-        ));
+        // `7.x` is no proof of 7.0.x: bazelisk floats it to the newest 7,
+        // and a 7.0.x that stops on the flag builds nothing.
+        assert_eq!(system("common --noenable_workspace\n", &major(7)), Bzlmod);
+        // A range proven to lie where the flag is unknown is another
+        // matter: token 3 is written by 6.4 - 6.6 and 7.0.x only.
+        let three = line(&Declared::default(), Some(3), &[]);
+        for rc in [
+            "common --enable_workspace\n",
+            "common:ws --noenable_workspace\n",
+        ] {
+            let found = system(rc, &three);
+            let named = matches!(&found, DepSystem::Unknown { why } if why.starts_with(".bazelrc:1: Bazel older than 7.1.0 "));
+            assert!(named, "{rc:?} gave {found:?}");
+        }
+
+        // With no proof of the line a flag only drops the releases that
+        // stop on it. `--enable_bzlmod` is unknown before 6.0.0.
+        let unknown = BazelLine::unknown();
+        let (on, why) = systems("common --enable_bzlmod\n", &unknown);
+        assert_eq!(on, [Hybrid, Bzlmod]);
+        assert!(why.contains("spans releases"), "{why}");
+        // Under a config only that command line stops, so the plain
+        // command still runs what the release does by default.
+        for rc in [
+            "common:ci --enable_bzlmod\n",
+            "common:ws --enable_workspace\n",
+        ] {
+            let (all, why) = systems(rc, &unknown);
+            assert_eq!(all, [Workspace, Hybrid, Bzlmod], "{rc:?}");
+            assert!(why.contains("under a config"), "{rc:?}: {why}");
+        }
+        // A token only some release reads stops only those releases:
+        // `always` is no section before 6.3.0.
+        let (all, _) = systems("always --enable_workspace\n", &unknown);
+        assert_eq!(all, [Workspace, Hybrid, Bzlmod]);
+
+        // The same through the ladder. `--enable_bzlmod` and a flag under
+        // a config are no API shape, so the line stays unknown; a plain
+        // `--enable_workspace` is one, and proves 7.1.0 or newer.
+        let laddered = |rc: &str| {
+            let rc = read(&Files::of(&[(".bazelrc", rc)]));
+            let line = line(&Declared::default(), None, &rc.api_shapes());
+            (dep_system(&line, &rc.effective(&line)), line)
+        };
+        for (rc, expected) in [
+            ("common --enable_bzlmod\n", vec![Hybrid, Bzlmod]),
+            (
+                "common:ci --enable_bzlmod\n",
+                vec![Workspace, Hybrid, Bzlmod],
+            ),
+            (
+                "common:ws --enable_workspace\n",
+                vec![Workspace, Hybrid, Bzlmod],
+            ),
+        ] {
+            let (found, line) = laddered(rc);
+            assert!(line.is_unknown(), "{rc:?}");
+            assert!(
+                matches!(&found, DepSystem::DualMode { systems, .. } if *systems == expected),
+                "{rc:?} gave {found:?}"
+            );
+        }
+        let (found, line) = laddered("common --enable_workspace\n");
+        assert_eq!((line.lo, line.hi), (Some(v(7, 1, 0)), None));
+        assert!(
+            matches!(&found, DepSystem::DualMode { systems, .. } if *systems == [Hybrid, Bzlmod]),
+            "{found:?}"
+        );
+        let (found, _) = laddered("common --noenable_workspace\n");
+        assert_eq!(found, Bzlmod);
     }
 
     #[test]
@@ -1911,12 +2286,35 @@ mod tests {
             other => panic!("{rc:?}: {other:?}"),
         };
         // The corpus shape: a config that switches Bzlmod off.
-        let (systems, why) = dual(
-            "common:legacy --noenable_bzlmod --enable_workspace\n",
-            &seven,
-        );
+        let legacy = "common:legacy --noenable_bzlmod --enable_workspace\n";
+        let (systems, why) = dual(legacy, &seven);
         assert_eq!(systems, [Hybrid, Workspace]);
         assert!(why.contains("under a config"), "{why}");
+        // The two flags of one config are read together. On 8.x that is
+        // the row `--noenable_bzlmod --enable_workspace`; crossing the
+        // config's `--noenable_bzlmod` with the plain command's unset
+        // `--enable_workspace` would invent the both-off error.
+        let (systems, _) = dual(legacy, &exact("8.8.2"));
+        assert_eq!(systems, [Bzlmod, Workspace]);
+        let (systems, _) = dual("common:x --noenable_bzlmod --noenable_workspace\n", &seven);
+        assert_eq!(systems, [Hybrid, DepSystem::Neither]);
+        // A flag the config does not set keeps the plain command's value.
+        let (systems, _) = dual(
+            "common --enable_workspace\ncommon:x --noenable_bzlmod\n",
+            &exact("8.8.2"),
+        );
+        assert_eq!(systems, [Hybrid, Workspace]);
+        // A config that alone switches Bzlmod off stops Bazel 8, and on a
+        // line proven to be 8.x that is the answer.
+        let alone = system("common:a --noenable_bzlmod\n", &exact("8.8.2"));
+        assert!(
+            matches!(&alone, DepSystem::Unknown { why } if why.starts_with(".bazelrc:1: Bazel 8 stops")),
+            "{alone:?}"
+        );
+        // A config named like a reserved state key is a config like any
+        // other.
+        let (systems, _) = dual("common:[otherwise] --noenable_bzlmod\n", &seven);
+        assert_eq!(systems, [Hybrid, Workspace]);
         // A config that repeats the default changes nothing.
         assert_eq!(
             system("common:ci --enable_bzlmod --enable_workspace\n", &seven),
@@ -1956,6 +2354,45 @@ mod tests {
         assert_eq!(
             system("import %workspace%/missing.rc\n", &exact("9.3.2")),
             Bzlmod
+        );
+        // Also when the files that were read set both flags: the unread
+        // import comes after them and may flip either.
+        let both = "common --enable_bzlmod --noenable_workspace\n";
+        for (bazel, import, file) in [
+            ("7.7.2", "import %workspace%/../ci.rc\n", "../ci.rc"),
+            ("8.8.2", "import %workspace%/ci.bazelrc\n", "ci.bazelrc"),
+            ("8.8.2", "try-import %workspace%/ci.bazelrc\n", "ci.bazelrc"),
+            ("9.3.2", "import %workspace%/ci.bazelrc\n", "ci.bazelrc"),
+        ] {
+            let files = Files::of(&[(".bazelrc", &format!("{both}{import}")[..])])
+                .with(file, FileText::Unreadable);
+            let line = exact(bazel);
+            let flags = read(&files).effective(&line);
+            assert!(flags.gaps().iter().any(|gap| gap.hard && gap.file == file));
+            let found = dep_system(&line, &flags);
+            if bazel == "9.3.2" {
+                assert_eq!(found, Bzlmod);
+                continue;
+            }
+            let prefix = format!("{file} ");
+            assert!(
+                matches!(&found, DepSystem::Unknown { why } if why.starts_with(&prefix)),
+                "Bazel {bazel}, {import:?}: {found:?}"
+            );
+            // Without the import the same flags name the system.
+            assert_eq!(system(both, &line), Bzlmod);
+        }
+        // Configs that expand past what the reader follows leave the
+        // flags unread, not unset.
+        let mut doubling = String::from("build --config=c0\n");
+        for level in 0..40 {
+            let next = level + 1;
+            doubling += &format!("build:c{level} --config=c{next} --config=c{next}\n");
+        }
+        let cut = system(&doubling, &seven);
+        assert!(
+            matches!(&cut, DepSystem::Unknown { why } if why.contains("more options")),
+            "{cut:?}"
         );
         // A release-dependent line: `always` is read from 6.3.0.
         let (systems, _) = dual("always --enable_bzlmod\n", &major(6));
@@ -2038,9 +2475,10 @@ mod tests {
             let _ = module_version_cmp(&label, "1.0.0");
             let files = Files::default().with(".bazelversion", FileText::Bytes(text));
             let line = declared_line(&root("", 0), &files);
+            let on = flags("common:x --experimental_enable_bzlmod\n", &line);
             let _ = (
                 line.to_string(),
-                tier(&line, DeclSystem::Bzlmod),
+                tier(&line, DeclSystem::Workspace, &on),
                 lockfile_mode_default(&line),
             );
             let _ = system("common:x --enable_workspace\n", &line);
