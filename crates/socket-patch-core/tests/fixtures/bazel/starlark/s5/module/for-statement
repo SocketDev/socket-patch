@@ -1,0 +1,6 @@
+module(name = "s5", version = "0.0.0")
+
+V = "plain"
+for x in ["a"]:
+    V = x
+print("S5VAL", repr(V), len(V))

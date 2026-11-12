@@ -1,0 +1,4 @@
+# Byte-real Starlark inputs: CRLF, BOM, NUL, lone CR and non-UTF-8 vectors, and
+# real files whose line endings are part of what is tested. No conversion on
+# checkout.
+* -text

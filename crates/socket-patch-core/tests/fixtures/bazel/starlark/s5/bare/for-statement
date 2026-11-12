@@ -1,0 +1,4 @@
+V = "plain"
+for x in ["a"]:
+    V = x
+print("S5VAL", repr(V), len(V))

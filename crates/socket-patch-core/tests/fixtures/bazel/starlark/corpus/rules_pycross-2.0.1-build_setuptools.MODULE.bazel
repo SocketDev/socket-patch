@@ -1,0 +1,104 @@
+include("//shared:llvm.MODULE.bazel")
+
+bazel_dep(name = "rules_cc", version = "0.2.18")
+bazel_dep(name = "rules_python", version = "2.0.0")
+bazel_dep(name = "rules_foreign_cc", version = "0.15.1")
+
+include("//shared:overrides.MODULE.bazel")
+
+bazel_dep(name = "rules_pycross", version = "0.0.0")
+bazel_dep(name = "bazel_lib", version = "3.2.0")
+
+local_path_override(
+    module_name = "rules_pycross",
+    path = "../../..",
+)
+
+# Third party deps
+include("//third_party/openssl:repositories.MODULE.bazel")
+include("//third_party/postgresql:repositories.MODULE.bazel")
+include("//third_party/zlib:repositories.MODULE.bazel")
+
+python = use_extension("@rules_python//python/extensions:python.bzl", "python")
+python.toolchain(
+    is_default = True,
+    python_version = "3.14.2",
+)
+use_repo(python, "python_versions")
+
+pycross = use_extension("@rules_pycross//pycross/extensions:pycross.bzl", "pycross")
+pycross.configure_toolchains(
+    platforms = [
+        "aarch64-apple-darwin",
+        "aarch64-unknown-linux-gnu",
+        "x86_64-unknown-linux-gnu",
+        "x86_64-unknown-linux-musl",
+    ],
+    python_versions = [
+        "3.14.2",
+    ],
+)
+
+uv = use_extension("@rules_pycross//pycross/extensions:uv.bzl", "uv")
+uv.workspace(
+    name = "uv",
+    lock_file = "//:uv.lock",
+)
+uv.repo(
+    dependency_groups = [
+        "default",
+        "transitive",
+    ],
+    workspace = "uv",
+)
+uv.package(
+    name = "psycopg2",
+    build_target = "@//deps/psycopg2:wheel",
+    workspace = "uv",
+)
+uv.package(
+    name = "setproctitle",
+    build_mode = "always",
+    workspace = "uv",
+)
+uv.package(
+    name = "pyyaml",
+    build_mode = "always",
+    workspace = "uv",
+)
+
+setuptools = use_extension("@rules_pycross//pycross/backends:setuptools.bzl", "setuptools")
+
+# Wildcard: default copts for all setuptools-built packages.
+# Tests wildcard+specific merging:
+#   - pyyaml inherits these copts alongside its specific build_env and tool_deps
+#   - zstandard's specific copts replace these
+# (psycopg2 uses a custom build_target, so backend overrides don't apply to it.)
+setuptools.override(
+    name = "*",
+    copts = ["-O2"],
+    workspace = "uv",
+)
+setuptools.override(
+    name = "zstandard",
+    copts = [
+        "-O2",
+        "-Wl,-s",
+    ],
+    workspace = "uv",
+)
+setuptools.override(
+    name = "pyyaml",
+    build_env = {
+        "PYYAML_FORCE_LIBYAML": "0",
+    },
+    # Replaces the default `wheel` tool dep (from the auto-generated uv__build repo);
+    # the setuptools default is kept.
+    tool_deps = {"wheel": "@uv//wheel:pkg"},
+    workspace = "uv",
+)
+
+use_repo(uv, "uv")
+
+zstd = use_extension("//:zstd.bzl", "zstd")
+use_repo(zstd, "zstd")

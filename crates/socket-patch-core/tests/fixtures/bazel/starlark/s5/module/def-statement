@@ -1,0 +1,7 @@
+module(name = "s5", version = "0.0.0")
+
+def f():
+    return "plain"
+
+V = f()
+print("S5VAL", repr(V), len(V))

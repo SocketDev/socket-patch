@@ -1,0 +1,179 @@
+1: call workspace(name="io_bazel")
+3: load "//tools/build_defs/repo:http.bzl" http_archive http_file http_jar
+4: load "//:distdir.bzl" dist_http_archive dist_http_file dist_http_jar distdir_tar
+5: load "//:distdir_deps.bzl" DIST_DEPS
+# These can be used as values for the patch_cmds and patch_cmds_win attributes
+# of http_archive, in order to export the WORKSPACE file from the BUILD or
+# BUILD.bazel file. This is useful for cases like //src:test_repos, where we
+# have to be able to trigger a fetch of a repo by depending on it, but we don't
+# actually want to build anything (so we can't depend on a target inside that
+# repo).
+13: const EXPORT_WORKSPACE_IN_BUILD_FILE = ["test -f BUILD && chmod u+w BUILD || true", "echo >> BUILD", <"echo 'exports_files([\"WORKSPACE\"], visibility = [\"//visibility:public\"])' >> BUILD">]
+19: const EXPORT_WORKSPACE_IN_BUILD_BAZEL_FILE = ["test -f BUILD.bazel && chmod u+w BUILD.bazel || true", "echo >> BUILD.bazel", <"echo 'exports_files([\"WORKSPACE\"], visibility = [\"//visibility:public\"])' >> BUILD.bazel">]
+25: const EXPORT_WORKSPACE_IN_BUILD_FILE_WIN = [<"Add-Content -Path BUILD -Value \"`nexports_files([`\"WORKSPACE`\"], visibility = [`\"//visibility:public`\"])`n\" -Force">]
+29: const EXPORT_WORKSPACE_IN_BUILD_BAZEL_FILE_WIN = [<"Add-Content -Path BUILD.bazel -Value \"`nexports_files([`\"WORKSPACE`\"], visibility = [`\"//visibility:public`\"])`n\" -Force">]
+# Protobuf expects an //external:python_headers label which would contain the
+# Python headers if fast Python protos is enabled. Since we are not using fast
+# Python protos, bind python_headers to a dummy target.
+36: call bind(name="python_headers", actual="//:dummy")
+# Protobuf code generation for GRPC requires three external labels:
+# //external:grpc-java_plugin
+# //external:grpc-jar
+# //external:guava
+45: call bind(name="grpc-java-plugin", actual="//third_party/grpc-java:grpc-java-plugin")
+50: call bind(name="grpc-jar", actual="//third_party/grpc-java:grpc-jar")
+55: call bind(name="guava", actual="//third_party:guava")
+# We must control the version of rules_license we use, so we load ours before
+# any other repo can bring it in through their deps.
+62: call dist_http_archive(name="rules_license")
+# For src/test/shell/bazel:test_srcs
+67: load "//src/test/shell/bazel:list_source_repository.bzl" list_source_repository
+69: call list_source_repository(name="local_bazel_source_list")
+# This allows rules written in Starlark to locate apple build tools.
+88: call bind(name="xcrunwrapper", actual="@bazel_tools//tools/objc:xcrunwrapper")
+93: call dist_http_archive(name="com_google_protobuf", patch_cmds=$EXPORT_WORKSPACE_IN_BUILD_FILE, patch_cmds_win=$EXPORT_WORKSPACE_IN_BUILD_FILE_WIN)
+# This is a mock version of bazelbuild/rules_python that contains only
+# @rules_python//python:defs.bzl. It is used by protobuf.
+# TODO(#9029): We could potentially replace this with the real @rules_python.
+102: call new_local_repository(name="rules_python", build_file="//third_party/rules_python:BUILD", path="./third_party/rules_python", workspace_file="//third_party/rules_python:rules_python.WORKSPACE")
+109: call local_repository(name="googleapis", path="./third_party/googleapis/")
+114: call local_repository(name="remoteapis", path="./third_party/remoteapis/")
+119: call dist_http_archive(name="desugar_jdk_libs")
+123: call distdir_tar(name="additional_distfiles", archives=["android_tools_pkg-0.27.2.tar", "r8-8.0.40.jar"], dirname="derived/distdir", dist_deps=<{dep: attrs for dep, attrs in DIST_DEPS.items() if "additional_distfiles" in attrs["used_in"]}>, sha256={"android_tools_pkg-0.27.2.tar": "5d0f140125afba82603ccd5050c78dd2e2863ca992a17f43f6df9a9119ffcb9b", "r8-8.0.40.jar": "ab1379835c7d3e5f21f80347c3c81e2f762e0b9b02748ae5232c3afa14adf702"}, urls={"android_tools_pkg-0.27.2.tar": ["https://mirror.bazel.build/bazel_android_tools/android_tools_pkg-0.27.2.tar"], "r8-8.0.40.jar": ["https://maven.google.com/com/android/tools/r8/8.0.40/r8-8.0.40.jar"]})
+# OpenJDK distributions used to create a version of Bazel bundled with the OpenJDK.
+148: call http_file(name="openjdk_linux", downloaded_file_path="zulu-linux.tar.gz", sha256="65bfe4e0ffa74a680ee4410db46b17e30cd9397b664a92a886599fe1f3530969", urls=["https://mirror.bazel.build/openjdk/azul-zulu11.37.17-ca-jdk11.0.6/zulu11.37.17-ca-jdk11.0.6-linux_x64-linux_x64-allmodules-b23d4e05466f2aa1fdcd72d3d3a8e962206b64bf-1581689070.tar.gz"])
+155: call dist_http_file(name="openjdk_linux_vanilla", downloaded_file_path="zulu-linux-vanilla.tar.gz")
+160: call http_file(name="openjdk_linux_minimal", downloaded_file_path="zulu-linux-minimal.tar.gz", sha256="91f7d52f695c681d4e21499b4319d548aadef249a6b3053e306308992e1e29ae", urls=["https://mirror.bazel.build/openjdk/azul-zulu11.37.17-ca-jdk11.0.6/zulu11.37.17-ca-jdk11.0.6-linux_x64-minimal-b23d4e05466f2aa1fdcd72d3d3a8e962206b64bf-1581689068.tar.gz"])
+167: call http_file(name="openjdk_linux_aarch64", downloaded_file_path="zulu-linux-aarch64.tar.gz", sha256="6b245793087300db3ee82ab0d165614f193a73a60f2f011e347756c1e6ca5bac", urls=["https://mirror.bazel.build/openjdk/azul-zulu11.37.48-ca-jdk11.0.6/zulu11.37.48-ca-jdk11.0.6-linux_aarch64-allmodules-b23d4e05466f2aa1fdcd72d3d3a8e962206b64bf-1581690750.tar.gz"])
+174: call dist_http_file(name="openjdk_linux_aarch64_vanilla", downloaded_file_path="zulu-linux-aarch64-vanilla.tar.gz")
+179: call http_file(name="openjdk_linux_aarch64_minimal", downloaded_file_path="zulu-linux-aarch64-minimal.tar.gz", sha256="06f6520a877704c77614bcfc4f846cc7cbcbf5eaad149bf7f19f4f16e285c9de", urls=["https://mirror.bazel.build/openjdk/azul-zulu11.37.48-ca-jdk11.0.6/zulu11.37.48-ca-jdk11.0.6-linux_aarch64-minimal-b23d4e05466f2aa1fdcd72d3d3a8e962206b64bf-1581690750.tar.gz"])
+186: call dist_http_file(name="openjdk_linux_ppc64le_vanilla", downloaded_file_path="adoptopenjdk-ppc64le-vanilla.tar.gz")
+191: call dist_http_file(name="openjdk_linux_s390x_vanilla", downloaded_file_path="adoptopenjdk-s390x-vanilla.tar.gz")
+196: call http_file(name="openjdk_macos_x86_64", downloaded_file_path="zulu-macos.tar.gz", sha256="8e283cfd23c7555be8e17295ed76eb8f00324c88ab904b8de37bbe08f90e569b", urls=["https://mirror.bazel.build/openjdk/azul-zulu11.37.17-ca-jdk11.0.6/zulu11.37.17-ca-jdk11.0.6-macosx_x64-allmodules-b23d4e05466f2aa1fdcd72d3d3a8e962206b64bf-1581689066.tar.gz"])
+203: call dist_http_file(name="openjdk_macos_x86_64_vanilla", downloaded_file_path="zulu-macos-vanilla.tar.gz")
+208: call http_file(name="openjdk_macos_x86_64_minimal", downloaded_file_path="zulu-macos-minimal.tar.gz", sha256="1bacb1c07035d4066d79f0b65b4ea0ebd1954f3662bdfe3618da382ac8fd23a6", urls=["https://mirror.bazel.build/openjdk/azul-zulu11.37.17-ca-jdk11.0.6/zulu11.37.17-ca-jdk11.0.6-macosx_x64-minimal-b23d4e05466f2aa1fdcd72d3d3a8e962206b64bf-1581689063.tar.gz"])
+215: call http_file(name="openjdk_macos_aarch64", downloaded_file_path="zulu-macos-aarch64.tar.gz", sha256="a900ef793cb34b03ac5d93ea2f67291b6842e99d500934e19393a8d8f9bfa6ff", urls=["https://mirror.bazel.build/openjdk/azul-zulu11.45.27-ca-jdk11.0.10/zulu11.45.27-ca-jdk11.0.10-macosx_aarch64-allmodules-1611665569.tar.gz"])
+222: call dist_http_file(name="openjdk_macos_aarch64_vanilla", downloaded_file_path="zulu-macos-aarch64-vanilla.tar.gz")
+227: call http_file(name="openjdk_macos_aarch64_minimal", downloaded_file_path="zulu-macos-aarch64-minimal.tar.gz", sha256="f4f606926e6deeaa8b8397e299313d9df87642fe464b0ccf1ed0432aeb00640b", urls=["https://mirror.bazel.build/openjdk/azul-zulu11.45.27-ca-jdk11.0.10/zulu11.45.27-ca-jdk11.0.10-macosx_aarch64-minimal-1611665562.tar.gz"])
+234: call http_file(name="openjdk_win", downloaded_file_path="zulu-win.zip", sha256="8e1604b3a27dcf639bc6d1a73103f1211848139e4cceb081d0a74a99e1e6f995", urls=["https://mirror.bazel.build/openjdk/azul-zulu11.37.17-ca-jdk11.0.6/zulu11.37.17-ca-jdk11.0.6-win_x64-allmodules-b23d4e05466f2aa1fdcd72d3d3a8e962206b64bf-1581689080.zip"])
+241: call dist_http_file(name="openjdk_win_vanilla", downloaded_file_path="zulu-win-vanilla.zip")
+246: call dist_http_file(name="openjdk_win_arm64_vanilla", downloaded_file_path="zulu-win-arm64.zip")
+251: call http_file(name="openjdk_win_minimal", downloaded_file_path="zulu-win-minimal.zip", sha256="b90a713c9c2d9ea23cad44d2c2dfcc9af22faba9bde55dedc1c3bb9f556ac1ae", urls=["https://mirror.bazel.build/openjdk/azul-zulu11.37.17-ca-jdk11.0.6/zulu11.37.17-ca-jdk11.0.6-win_x64-minimal-b23d4e05466f2aa1fdcd72d3d3a8e962206b64bf-1581689080.zip"])
+258: call dist_http_archive(name="bazelci_rules", patch_cmds=$EXPORT_WORKSPACE_IN_BUILD_FILE, patch_cmds_win=$EXPORT_WORKSPACE_IN_BUILD_FILE_WIN)
+264: load "@bazelci_rules//:rbe_repo.bzl" rbe_preconfig
+266: call rbe_preconfig(name="rbe_ubuntu1804_java11", toolchain="ubuntu1804-bazel-java11")
+271: call http_archive(name="com_google_googletest", sha256="81964fe578e9bd7c94dfdb09c8e4d6e6759e19967e397dbea48d1c10e45d0df2", strip_prefix="googletest-release-1.12.1", urls=["https://mirror.bazel.build/github.com/google/googletest/archive/refs/tags/release-1.12.1.tar.gz", "https://github.com/google/googletest/archive/refs/tags/release-1.12.1.tar.gz"])
+281: call dist_http_archive(name="bazel_skylib", patch_cmds=$EXPORT_WORKSPACE_IN_BUILD_FILE, patch_cmds_win=$EXPORT_WORKSPACE_IN_BUILD_FILE_WIN)
+287: call dist_http_archive(name="zstd-jni", build_file="//third_party:zstd-jni/zstd-jni.BUILD", patch_cmds=$EXPORT_WORKSPACE_IN_BUILD_BAZEL_FILE, patch_cmds_win=$EXPORT_WORKSPACE_IN_BUILD_BAZEL_FILE_WIN, strip_prefix="zstd-jni-1.5.2-3")
+295: call dist_http_archive(name="blake3", build_file="//third_party:blake3/blake3.BUILD", patch_cmds=$EXPORT_WORKSPACE_IN_BUILD_BAZEL_FILE, patch_cmds_win=$EXPORT_WORKSPACE_IN_BUILD_BAZEL_FILE_WIN, strip_prefix="BLAKE3-1.3.3")
+303: call http_archive(name="org_snakeyaml", build_file_content=<""" java_library( name = "snakeyaml", srcs = glob(["src/main/**/*.java"]), visibility = [ "@io_bazel//src/main/java/com/google/devtools/build/docgen/release:__pkg__", "@com_google_testparameterinjector//:__pkg__", ], ) """>, sha256="fd0e0cc6c5974fc8f08be3a15fb4a59954c7dd958b5b68186a803de6420b6e40", strip_prefix="asomov-snakeyaml-b28f0b4d87c6", urls=["https://mirror.bazel.build/bitbucket.org/asomov/snakeyaml/get/snakeyaml-1.28.tar.gz"])
+320: call http_archive(name="com_google_testparameterinjector", build_file_content=<""" java_library( name = "testparameterinjector", testonly = True, srcs = glob(["src/main/**/*.java"]), deps = [ "@org_snakeyaml//:snakeyaml", "@//third_party:auto_value", "@//third_party:guava", "@//third_party:junit4", "@//third_party/protobuf:protobuf_java", ], visibility = ["//visibility:public"], ) """>, sha256="562a0e87eb413a7dcad29ebc8d578f6f97503473943585b051c1398a58189b06", strip_prefix="TestParameterInjector-1.0", urls=["https://mirror.bazel.build/github.com/google/TestParameterInjector/archive/v1.0.tar.gz", "https://github.com/google/TestParameterInjector/archive/v1.0.tar.gz"])
+# Used in src/main/java/com/google/devtools/build/lib/bazel/rules/java/jdk.WORKSPACE.
+346: call dist_http_archive(name="rules_cc", patch_cmds=$EXPORT_WORKSPACE_IN_BUILD_FILE, patch_cmds_win=$EXPORT_WORKSPACE_IN_BUILD_FILE_WIN)
+352: call dist_http_archive(name="rules_java", patch_cmds=$EXPORT_WORKSPACE_IN_BUILD_FILE, patch_cmds_win=$EXPORT_WORKSPACE_IN_BUILD_FILE_WIN)
+358: call dist_http_archive(name="rules_proto", patch_cmds=$EXPORT_WORKSPACE_IN_BUILD_BAZEL_FILE, patch_cmds_win=$EXPORT_WORKSPACE_IN_BUILD_BAZEL_FILE_WIN)
+# For testing, have an distdir_tar with all the archives implicit in every
+# WORKSPACE, to that they don't have to be refetched for every test
+# calling `bazel sync`.
+367: call distdir_tar(name="test_WORKSPACE_files", archives=["android_tools_pkg-0.27.2.tar"], dirname="test_WORKSPACE/distdir", dist_deps=<{dep: attrs for dep, attrs in DIST_DEPS.items() if "test_WORKSPACE_files" in attrs["used_in"]}>, sha256={"android_tools_pkg-0.27.2.tar": "5d0f140125afba82603ccd5050c78dd2e2863ca992a17f43f6df9a9119ffcb9b"}, urls={"android_tools_pkg-0.27.2.tar": ["https://mirror.bazel.build/bazel_android_tools/android_tools_pkg-0.27.2.tar"]})
+384: call dist_http_archive(name="io_bazel_skydoc")
+# Stardoc recommends declaring its dependencies via "*_dependencies" functions.
+# This requires that the repositories these functions come from need to be
+# fetched unconditionally for everything (including just building bazel!), so
+# provide them as http_archives that can be shiped in the distdir, to keep the
+# distribution archive self-contained.
+393: call dist_http_archive(name="io_bazel_rules_sass")
+397: call dist_http_archive(name="rules_nodejs")
+401: call dist_http_archive(name="build_bazel_rules_nodejs")
+405: call dist_http_archive(name="platforms")
+# This must be kept in sync with src/main/java/com/google/devtools/build/lib/bazel/rules/android/android_remote_tools.WORKSPACE
+# and tools/android/android_extensions.bzl
+411: call http_archive(name="android_tools_for_testing", patch_cmds=$EXPORT_WORKSPACE_IN_BUILD_FILE, patch_cmds_win=$EXPORT_WORKSPACE_IN_BUILD_FILE_WIN, sha256="5d0f140125afba82603ccd5050c78dd2e2863ca992a17f43f6df9a9119ffcb9b", url="https://mirror.bazel.build/bazel_android_tools/android_tools_pkg-0.27.2.tar")
+# This is here to override the android_gmaven_r8 rule from
+# src/main/java/com/google/devtools/build/lib/bazel/rules/android/android_remote_tools.WORKSPACE
+# so that tests like src/test/java/com/google/devtools/build/android/r8:AllTests
+# use the most recent version of R8 rather than the one might be referenced in a released
+# version of bazel that might have an outdated android_remote_tools.WORKSPACE relative to the tests.
+424: call dist_http_jar(name="android_gmaven_r8")
+428: call dist_http_archive(name="remote_coverage_tools", patch_cmds=$EXPORT_WORKSPACE_IN_BUILD_FILE, patch_cmds_win=$EXPORT_WORKSPACE_IN_BUILD_FILE_WIN)
+434: call dist_http_archive(name="remotejdk11_linux_for_testing", build_file="@local_jdk//:BUILD.bazel", patch_cmds=$EXPORT_WORKSPACE_IN_BUILD_BAZEL_FILE, patch_cmds_win=$EXPORT_WORKSPACE_IN_BUILD_BAZEL_FILE_WIN)
+441: call dist_http_archive(name="remotejdk11_linux_aarch64_for_testing", build_file="@local_jdk//:BUILD.bazel", patch_cmds=$EXPORT_WORKSPACE_IN_BUILD_BAZEL_FILE, patch_cmds_win=$EXPORT_WORKSPACE_IN_BUILD_BAZEL_FILE_WIN)
+448: call dist_http_archive(name="remotejdk11_linux_ppc64le_for_testing", build_file="@local_jdk//:BUILD.bazel", patch_cmds=$EXPORT_WORKSPACE_IN_BUILD_BAZEL_FILE, patch_cmds_win=$EXPORT_WORKSPACE_IN_BUILD_BAZEL_FILE_WIN)
+455: call dist_http_archive(name="remotejdk11_linux_s390x_for_testing", build_file="@local_jdk//:BUILD.bazel", patch_cmds=$EXPORT_WORKSPACE_IN_BUILD_BAZEL_FILE, patch_cmds_win=$EXPORT_WORKSPACE_IN_BUILD_BAZEL_FILE_WIN)
+462: call dist_http_archive(name="remotejdk11_macos_for_testing", build_file="@local_jdk//:BUILD.bazel", patch_cmds=$EXPORT_WORKSPACE_IN_BUILD_BAZEL_FILE, patch_cmds_win=$EXPORT_WORKSPACE_IN_BUILD_BAZEL_FILE_WIN)
+469: call dist_http_archive(name="remotejdk11_macos_aarch64_for_testing", build_file="@local_jdk//:BUILD.bazel", patch_cmds=$EXPORT_WORKSPACE_IN_BUILD_BAZEL_FILE, patch_cmds_win=$EXPORT_WORKSPACE_IN_BUILD_BAZEL_FILE_WIN)
+476: call dist_http_archive(name="remotejdk11_win_for_testing", build_file="@local_jdk//:BUILD.bazel", patch_cmds=$EXPORT_WORKSPACE_IN_BUILD_BAZEL_FILE, patch_cmds_win=$EXPORT_WORKSPACE_IN_BUILD_BAZEL_FILE_WIN)
+483: call dist_http_archive(name="remotejdk11_win_arm64_for_testing", build_file="@local_jdk//:BUILD.bazel", patch_cmds=$EXPORT_WORKSPACE_IN_BUILD_BAZEL_FILE, patch_cmds_win=$EXPORT_WORKSPACE_IN_BUILD_BAZEL_FILE_WIN)
+490: opaque Expression
+# Used in src/main/java/com/google/devtools/build/lib/bazel/rules/java/jdk.WORKSPACE.
+502: call dist_http_archive(name="remote_java_tools_for_testing", patch_cmds=$EXPORT_WORKSPACE_IN_BUILD_FILE, patch_cmds_win=$EXPORT_WORKSPACE_IN_BUILD_FILE_WIN)
+# Used in src/main/java/com/google/devtools/build/lib/bazel/rules/java/jdk.WORKSPACE.
+509: call dist_http_archive(name="remote_java_tools_linux_for_testing", patch_cmds=$EXPORT_WORKSPACE_IN_BUILD_FILE, patch_cmds_win=$EXPORT_WORKSPACE_IN_BUILD_FILE_WIN)
+# Used in src/main/java/com/google/devtools/build/lib/bazel/rules/java/jdk.WORKSPACE.
+516: call dist_http_archive(name="remote_java_tools_windows_for_testing", patch_cmds=$EXPORT_WORKSPACE_IN_BUILD_FILE, patch_cmds_win=$EXPORT_WORKSPACE_IN_BUILD_FILE_WIN)
+# Used in src/main/java/com/google/devtools/build/lib/bazel/rules/java/jdk.WORKSPACE.
+523: call dist_http_archive(name="remote_java_tools_darwin_x86_64_for_testing", patch_cmds=$EXPORT_WORKSPACE_IN_BUILD_FILE, patch_cmds_win=$EXPORT_WORKSPACE_IN_BUILD_FILE_WIN)
+# Used in src/main/java/com/google/devtools/build/lib/bazel/rules/java/jdk.WORKSPACE.
+530: call dist_http_archive(name="remote_java_tools_darwin_arm64_for_testing", patch_cmds=$EXPORT_WORKSPACE_IN_BUILD_FILE, patch_cmds_win=$EXPORT_WORKSPACE_IN_BUILD_FILE_WIN)
+# Used in src/test/shell/bazel/testdata/jdk_http_archives.
+537: call dist_http_archive(name="remote_java_tools_test", patch_cmds=$EXPORT_WORKSPACE_IN_BUILD_FILE, patch_cmds_win=$EXPORT_WORKSPACE_IN_BUILD_FILE_WIN)
+# Used in src/test/shell/bazel/testdata/jdk_http_archives.
+544: call dist_http_archive(name="remote_java_tools_test_linux", patch_cmds=$EXPORT_WORKSPACE_IN_BUILD_FILE, patch_cmds_win=$EXPORT_WORKSPACE_IN_BUILD_FILE_WIN)
+# Used in src/test/shell/bazel/testdata/jdk_http_archives.
+551: call dist_http_archive(name="remote_java_tools_test_windows", patch_cmds=$EXPORT_WORKSPACE_IN_BUILD_FILE, patch_cmds_win=$EXPORT_WORKSPACE_IN_BUILD_FILE_WIN)
+# Used in src/test/shell/bazel/testdata/jdk_http_archives.
+558: call dist_http_archive(name="remote_java_tools_test_darwin_x86_64", patch_cmds=$EXPORT_WORKSPACE_IN_BUILD_FILE, patch_cmds_win=$EXPORT_WORKSPACE_IN_BUILD_FILE_WIN)
+# Used in src/test/shell/bazel/testdata/jdk_http_archives.
+565: call dist_http_archive(name="remote_java_tools_test_darwin_arm64", patch_cmds=$EXPORT_WORKSPACE_IN_BUILD_FILE, patch_cmds_win=$EXPORT_WORKSPACE_IN_BUILD_FILE_WIN)
+571: call dist_http_archive(name="openjdk11_linux_archive", build_file_content=<""" java_runtime(name = 'runtime', srcs = glob(['**']), visibility = ['//visibility:public']) exports_files(["WORKSPACE"], visibility = ["//visibility:public"]) """>)
+# This must be kept in sync with src/test/shell/bazel/testdata/jdk_http_archives.
+580: call dist_http_archive(name="openjdk11_darwin_archive", build_file_content=<""" java_runtime(name = 'runtime', srcs = glob(['**']), visibility = ['//visibility:public']) exports_files(["WORKSPACE"], visibility = ["//visibility:public"]) """>)
+# This must be kept in sync with src/test/shell/bazel/testdata/jdk_http_archives.
+589: call dist_http_archive(name="openjdk11_darwin_aarch64_archive", build_file_content=<""" java_runtime(name = 'runtime', srcs = glob(['**']), visibility = ['//visibility:public']) exports_files(["WORKSPACE"], visibility = ["//visibility:public"]) """>)
+# This must be kept in sync with src/test/shell/bazel/testdata/jdk_http_archives.
+598: call dist_http_archive(name="openjdk11_windows_archive", build_file_content=<""" java_runtime(name = 'runtime', srcs = glob(['**']), visibility = ['//visibility:public']) exports_files(["WORKSPACE"], visibility = ["//visibility:public"]) """>)
+# This must be kept in sync with src/test/shell/bazel/testdata/jdk_http_archives.
+607: call dist_http_archive(name="openjdk11_windows_arm64_archive", build_file_content=<""" java_runtime(name = 'runtime', srcs = glob(['**']), visibility = ['//visibility:public']) exports_files(["WORKSPACE"], visibility = ["//visibility:public"]) """>)
+# This must be kept in sync with src/test/shell/bazel/testdata/jdk_http_archives.
+616: opaque Expression
+628: load "@io_bazel_skydoc//:setup.bzl" stardoc_repositories
+630: call stardoc_repositories()
+632: load "@io_bazel_rules_sass//:package.bzl" rules_sass_dependencies
+634: call rules_sass_dependencies()
+636: load "@build_bazel_rules_nodejs//:repositories.bzl" build_bazel_rules_nodejs_dependencies
+638: call build_bazel_rules_nodejs_dependencies()
+640: load "@build_bazel_rules_nodejs//:index.bzl" node_repositories
+642: call node_repositories()
+644: load "@io_bazel_rules_sass//:defs.bzl" sass_repositories
+646: call sass_repositories()
+648: call register_execution_platforms("//:default_host_platform")  # buildozer: disable=positional-args
+# Tools for building deb, rpm and tar files.
+651: call dist_http_archive(name="rules_pkg")
+655: load "@rules_pkg//:deps.bzl" rules_pkg_dependencies
+657: call rules_pkg_dependencies()
+# Toolchains for Resource Compilation (.rc files on Windows).
+660: load "//src/main/res:winsdk_configure.bzl" winsdk_configure
+662: call winsdk_configure(name="local_config_winsdk")
+664: load "@local_config_winsdk//:toolchains.bzl" register_local_rc_exe_toolchains
+666: call register_local_rc_exe_toolchains()
+668: call register_toolchains("//src/main/res:empty_rc_toolchain")
+670: call dist_http_archive(name="com_github_grpc_grpc")
+# Override the abseil-cpp version defined in grpc_deps(), which doesn't work on latest macOS
+# Fixes https://github.com/bazelbuild/bazel/issues/15168
+676: call dist_http_archive(name="com_google_absl")
+# for patching the "com_github_cncf_udpa" deps loaded by grpc_deps
+681: call dist_http_archive(name="com_envoyproxy_protoc_gen_validate")
+685: call dist_http_archive(name="com_github_cncf_udpa")
+689: call dist_http_archive(name="com_google_googleapis")
+693: call dist_http_archive(name="upb")
+697: call dist_http_archive(name="bazel_gazelle")
+# Projects using gRPC as an external dependency must call both grpc_deps() and
+# grpc_extra_deps().
+703: load "@com_github_grpc_grpc//bazel:grpc_deps.bzl" grpc_deps
+705: call grpc_deps()
+707: load "@com_github_grpc_grpc//bazel:grpc_extra_deps.bzl" grpc_extra_deps
+709: call grpc_extra_deps()
+711: load "//tools/distributions/debian:deps.bzl" debian_deps
+713: call debian_deps()
+715: load "@bazel_skylib//:workspace.bzl" bazel_skylib_workspace
+717: call bazel_skylib_workspace()

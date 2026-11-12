@@ -1,0 +1,5 @@
+workspace(name = "s5")
+
+D = {"a": "plain"}
+V = "{a}".format(**D)
+print("S5VAL", repr(V), len(V))

@@ -1,0 +1,2 @@
+V = "{a}".format(**{"a": "plain"})
+print("S5VAL", repr(V), len(V))

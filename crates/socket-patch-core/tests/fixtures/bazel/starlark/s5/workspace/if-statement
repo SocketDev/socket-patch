@@ -1,0 +1,6 @@
+workspace(name = "s5")
+
+V = "plain"
+if True:
+    V = "plain2"
+print("S5VAL", repr(V), len(V))

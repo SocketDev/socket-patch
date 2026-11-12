@@ -1,0 +1,4 @@
+V = str(
+	"plain",
+)
+print("S5VAL", repr(V), len(V))

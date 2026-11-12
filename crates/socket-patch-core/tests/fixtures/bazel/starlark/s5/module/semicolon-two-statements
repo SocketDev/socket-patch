@@ -1,0 +1,4 @@
+module(name = "s5", version = "0.0.0")
+
+V = "plain"; W = 1
+print("S5VAL", repr(V), len(V))
