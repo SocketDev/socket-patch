@@ -1246,6 +1246,50 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn a_latin_1_marker_of_a_non_ascii_workspace_names_nothing() {
+        // Probe C7, workspace `ws-ünï-é`: Bazel 8.8.2 and later write the
+        // bytes of the resolved path, and 7.7.2 and earlier write the path
+        // as ISO-8859-1, `fc 6e ef 2d e9` for the last five characters.
+        let disk = Scratch::new();
+        let base = disk.at("root/_bazel_u/95de");
+        disk.lay(
+            "ws-ünï-é",
+            "root/_bazel_u/95de",
+            &[BASE, LINKS, "{ws}/MODULE.bazel"].join("\n"),
+        );
+        // The name as the file system keeps it, which is what both sides
+        // of the comparison start from.
+        let ws = fs::canonicalize(disk.at("ws-ünï-é")).unwrap();
+        let (utf8, name) = (bytes(&ws), ws.file_name().unwrap().len());
+        let latin_1 = [&utf8[..utf8.len() - name], b"ws-\xfcn\xef-\xe9"].concat();
+        let (linked, listed) = (Candidates::default(), roots(&disk, &["root"]));
+
+        fs::write(base.join(OUTPUT_BASE_MARKER), utf8).unwrap();
+        let live = found(base.clone(), Route::Link);
+        assert_eq!(locate_output_base(&ws, &linked), live);
+        // The same base, as an older Bazel marked it: the links lead into
+        // a base that cannot be said to be this workspace's, which is an
+        // answer and no error.
+        fs::write(base.join(OUTPUT_BASE_MARKER), &latin_1).unwrap();
+        let mismatch = Located::CannotTell(Unsure::MarkerMismatch);
+        assert_eq!(locate_output_base(&ws, &linked), mismatch);
+        assert_eq!(marker_names_workspace(&base, &ws), Marker::Other);
+        // Refusing and pruning never read the marker.
+        let through = classify(&ws.join("bazel-bin/node_modules"));
+        assert_eq!(through.tree, tree(OutputBase, base.clone()));
+
+        // With no link the base is one of many that name something else.
+        for link in ["bazel-out", "bazel-bin", "bazel-testlogs", "bazel-proj"] {
+            fs::remove_file(ws.join(link)).unwrap();
+        }
+        assert_eq!(locate_output_base(&ws, &listed), Located::NotFound);
+        fs::write(base.join(OUTPUT_BASE_MARKER), utf8).unwrap();
+        let only = found(base, Route::Enumeration);
+        assert_eq!(locate_output_base(&ws, &listed), only);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn the_links_of_a_workspace_name_its_live_base() {
         let disk = Scratch::new();
         let (old, new) = (
@@ -1409,6 +1453,213 @@ mod tests {
             assert_eq!((link.class, link.cannot_tell), (Plain, true));
         }
         assert_eq!(locate_output_base(&built, &none), linked);
+    }
+
+    // ── What real Bazel left on disk (probes C1, C3, C7, C8, C11) ────
+    //
+    // The layouts above are fabricated. These are recorded: the vectors of
+    // two probe groups, as `tests/fixtures/bazel/probe_vectors/` holds them
+    // (its README, "Output-tree layouts"), rebuilt in a temporary
+    // directory.
+
+    #[cfg(unix)]
+    macro_rules! probe_vector {
+        ($path:literal) => {
+            include_str!(concat!("../../tests/fixtures/bazel/probe_vectors/", $path))
+        };
+    }
+
+    /// Ten layouts a build left, each with the answers of the probe's
+    /// reference detector for four or five paths.
+    #[cfg(unix)]
+    const LAYOUTS: [&str; 10] = [
+        probe_vector!("core-external-edits/vectors/detect/5.4.1-default.json"),
+        probe_vector!("core-external-edits/vectors/detect/6.6.0-default.json"),
+        probe_vector!("core-external-edits/vectors/detect/7.7.2-default.json"),
+        probe_vector!("core-external-edits/vectors/detect/7.7.2-vendor.json"),
+        probe_vector!("core-external-edits/vectors/detect/8.3.1-cc.json"),
+        probe_vector!("core-external-edits/vectors/detect/8.8.2-cc.json"),
+        probe_vector!("core-external-edits/vectors/detect/8.8.2-default.json"),
+        probe_vector!("core-external-edits/vectors/detect/9.3.2-cc.json"),
+        probe_vector!("core-external-edits/vectors/detect/9.3.2-vendor.json"),
+        probe_vector!("core-external-edits/vectors/detect/10.0.0rc3-cc.json"),
+    ];
+    /// The convenience links of five built workspaces.
+    #[cfg(unix)]
+    const LINK_ROUTE: &str = probe_vector!("core-output-base/proto/vectors/link_route.json");
+
+    /// Where each token of a recorded path stands under the scratch root.
+    #[cfg(unix)]
+    const TOKENS: [(&str, &str); 5] = [
+        ("<WS>", "ws"),
+        ("<OB>", "out/ob"),
+        ("<CACHE>", "cache/contents"),
+        ("<INSTALL>", "install"),
+        ("<CAMPAIGN>", "campaign"),
+    ];
+
+    #[cfg(unix)]
+    fn vector(text: &str) -> serde_json::Value {
+        serde_json::from_str(text).expect("probe vector")
+    }
+
+    #[cfg(unix)]
+    fn text<'a>(row: &'a serde_json::Value, key: &str) -> &'a str {
+        row[key].as_str().unwrap_or_else(|| panic!("{key}: {row}"))
+    }
+
+    #[cfg(unix)]
+    impl Scratch {
+        /// A recorded path under the root. A recorded link target with no
+        /// token is relative and stays so.
+        fn recorded(&self, path: &str) -> PathBuf {
+            let token = TOKENS.iter().find(|(token, _)| path.starts_with(token));
+            match token {
+                Some((token, dir)) => self.at(&path.replacen(token, dir, 1)),
+                None => PathBuf::from(path),
+            }
+        }
+
+        /// Rebuilds the `tree` of a recorded `detect` vector, without the
+        /// entries `left_out` names: every directory, file and link the
+        /// probe recorded, each link with its stored target. A marker
+        /// holds the workspace path, as it did on the real disk. A vector
+        /// may list an entry twice; the first one is made.
+        fn rebuild(&self, tree: &[serde_json::Value], left_out: &[&str]) {
+            let mut made = std::collections::HashSet::new();
+            for row in tree {
+                let recorded = text(row, "path");
+                if left_out.contains(&recorded) || !made.insert(recorded) {
+                    continue;
+                }
+                let path = self.recorded(recorded);
+                fs::create_dir_all(path.parent().unwrap()).unwrap();
+                let content = row["content"].as_str().unwrap_or("");
+                match text(row, "type") {
+                    "dir" => fs::create_dir_all(&path).unwrap(),
+                    "symlink" => symlink(&self.recorded(text(row, "target")), &path),
+                    "file" if content == "<WS>" => {
+                        fs::write(&path, bytes(&self.recorded(content))).unwrap()
+                    }
+                    "file" => fs::write(&path, content).unwrap(),
+                    other => panic!("{recorded}: {other}"),
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_recorded_layouts_classify_on_disk_as_the_probe_recorded() {
+        let mut queries = 0;
+        for layout in LAYOUTS.map(vector) {
+            let id = format!("{}-{}", text(&layout, "bazel"), text(&layout, "cfg"));
+            // As the build left it, which is what every vector records,
+            // and as `clean` and a build leave it: without the second
+            // marker (probe C7).
+            for left_out in [&[][..], &["<OB>/execroot/DO_NOT_BUILD_HERE"][..]] {
+                let disk = Scratch::new();
+                disk.rebuild(layout["tree"].as_array().expect("tree"), left_out);
+                // The source file the probe asked about is not in its tree.
+                disk.lay("ws", "", "{ws}/BUILD.bazel");
+                let classifier = Classifier::new();
+                for row in layout["expect"].as_array().expect("expect") {
+                    let query = disk.recorded(text(row, "query"));
+                    // The trees the probe's detector named on the live
+                    // disk, the output base first.
+                    let mut trees = Vec::new();
+                    for (class, key) in [
+                        (OutputBase, "output_base"),
+                        (RepoContentsCache, "cache_entry"),
+                        (VendorDir, "vendor_dir"),
+                    ] {
+                        let root = row[key].as_str().map(|root| disk.recorded(root));
+                        trees.extend(root.map(|root| Tree { class, root }));
+                    }
+                    let class = trees.first().map_or(Plain, |tree| tree.class);
+                    let verdict = classifier.classify(&query);
+                    assert_eq!(
+                        (verdict.class, verdict.cannot_tell),
+                        (class, false),
+                        "{id}: {query:?}"
+                    );
+                    assert_eq!(
+                        (verdict.tree, verdict.resolves_into),
+                        (trees.first().cloned(), trees.get(1).cloned()),
+                        "{id}: {query:?}"
+                    );
+                    // The resolved path is the one the probe recorded,
+                    // through links whose targets the tree does not hold.
+                    let canonical = disk.recorded(text(row, "canonical"));
+                    assert_eq!(resolve(&query, MAX_LINK_HOPS), Some(canonical), "{id}");
+                    queries += 1;
+                }
+                // The links the build left in the workspace root name the
+                // base, and its marker names the workspace.
+                let ws = disk.recorded("<WS>");
+                let located = locate_output_base(&ws, &Candidates::default());
+                assert_eq!(located, found(disk.recorded("<OB>"), Route::Link), "{id}");
+            }
+        }
+        assert_eq!(queries, 2 * 42);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_recorded_links_locate_their_base_on_disk() {
+        let links = vector(LINK_ROUTE);
+        let links = links.as_array().expect("links");
+        assert_eq!(links.len(), 24);
+        let disk = Scratch::new();
+        // Workspace, output base and the directories that hold its links.
+        let mut workspaces: Vec<(PathBuf, PathBuf, Vec<PathBuf>)> = Vec::new();
+        for row in links {
+            let ws = disk.recorded(text(row, "workspace"));
+            let base = disk.recorded(text(row, "expected_output_base"));
+            let link = ws.join(text(row, "link"));
+            let link_dir = link.parent().unwrap().to_path_buf();
+            fs::create_dir_all(&link_dir).unwrap();
+            fs::create_dir_all(&base).unwrap();
+            let marker = disk.recorded(text(row, "marker"));
+            fs::write(base.join(OUTPUT_BASE_MARKER), bytes(&marker)).unwrap();
+            symlink(&disk.recorded(text(row, "target")), &link);
+            match workspaces.iter_mut().find(|(known, ..)| *known == ws) {
+                Some((_, known, dirs)) => {
+                    assert_eq!(*known, base, "{ws:?}");
+                    dirs.push(link_dir);
+                }
+                None => workspaces.push((ws, base, vec![link_dir])),
+            }
+        }
+        assert_eq!(workspaces.len(), 5);
+        // After `clean` no target is there, and then with the build's
+        // output back: the answers are the same.
+        for live in [false, true] {
+            for row in links.iter().filter(|_| live) {
+                fs::create_dir_all(disk.recorded(text(row, "target"))).unwrap();
+            }
+            for row in links {
+                let ws = disk.recorded(text(row, "workspace"));
+                let base = tree(OutputBase, disk.recorded(text(row, "expected_output_base")));
+                let link = ws.join(text(row, "link"));
+                let verdict = classify(&link);
+                assert_eq!(
+                    (verdict.class, verdict.tree, verdict.cannot_tell),
+                    (Link, base, false),
+                    "{link:?}, live: {live}"
+                );
+            }
+            for (ws, base, link_dirs) in &workspaces {
+                // Links under `--symlink_prefix=dist/` are where the
+                // caller says; the workspace root is always read.
+                let candidates = Candidates {
+                    link_dirs: link_dirs.clone(),
+                    ..Candidates::default()
+                };
+                let located = locate_output_base(ws, &candidates);
+                assert_eq!(located, found(base.clone(), Route::Link), "{ws:?}");
+            }
+        }
     }
 
     /// A junction is what Bazel makes for every convenience link on
