@@ -37,6 +37,7 @@ use super::module_lock::{
 use super::rc::{Chain, EffectiveFlags, Flag, FlagState, LockfileMode};
 use super::remedy::{self, Remedy};
 use super::version::{lockfile_mode_default, BazelLine, Tri};
+use crate::crawlers::python_crawler::canonicalize_pypi_name;
 
 /// The root module file, whose SHA-256 a family-A lock records.
 const ROOT_MODULE: &str = "MODULE.bazel";
@@ -45,10 +46,114 @@ const ROOT_MODULE: &str = "MODULE.bazel";
 /// repository (`//python/extensions:pip.bzl`) and its name, which is how
 /// the lock is searched: the repository prefix changes with the Bazel
 /// release.
+///
+/// Built only by [`ExtRef::new`], so every value is in the one spelling
+/// the lock is matched on. A label in another spelling would match no
+/// entry, and "no entry" reads as "nothing stale".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExtRef<'a> {
-    pub label: &'a str,
-    pub name: &'a str,
+    label: &'a str,
+    name: &'a str,
+}
+
+impl<'a> ExtRef<'a> {
+    /// The extension `name` of the file `bzl_file`, the label as
+    /// `use_extension` or the lock spells it: `//pkg:file.bzl`, with or
+    /// without a repository in front (`@repo`, `@@repo`, `@`, `@@`), which
+    /// is dropped.
+    ///
+    /// `Err` for every other spelling: a relative label (`:file.bzl`,
+    /// `file.bzl`), one that names no target (`//pkg`, `@repo`), and an
+    /// empty extension name. Bazel resolves those against the file that
+    /// holds them; the caller does that before it asks about the lock.
+    pub const fn new(bzl_file: &'a str, name: &'a str) -> Result<Self, &'static str> {
+        const RELATIVE: &str = "the label of an extension's `.bzl` file must start with `//`, or \
+                                with a repository and `//`: no other spelling matches a lock entry";
+        const NO_TARGET: &str = "the label of an extension's `.bzl` file must name the file \
+                                 after one `:`";
+        let bytes = bzl_file.as_bytes();
+        // The repository, if any, ends where the first `//` starts.
+        let mut at = 0;
+        loop {
+            if at + 1 >= bytes.len() {
+                return Err(RELATIVE);
+            }
+            if bytes[at] == b'/' && bytes[at + 1] == b'/' {
+                break;
+            }
+            let in_repository = bytes[0] == b'@' && bytes[at] != b'/' && bytes[at] != b':';
+            if !in_repository {
+                return Err(RELATIVE);
+            }
+            at += 1;
+        }
+        let (mut colons, mut index) = (0usize, at + 2);
+        while index < bytes.len() {
+            if bytes[index] == b':' {
+                colons += 1;
+            }
+            index += 1;
+        }
+        if colons != 1 || bytes[bytes.len() - 1] == b':' {
+            return Err(NO_TARGET);
+        }
+        if name.is_empty() {
+            return Err("the name of an extension is not empty");
+        }
+        // `at` is the index of an ASCII `/`, so it is a character boundary.
+        let (_, label) = bzl_file.split_at(at);
+        Ok(Self { label, name })
+    }
+
+    /// The label of the `.bzl` file, without a repository.
+    pub const fn label(&self) -> &'a str {
+        self.label
+    }
+
+    /// The name the extension is bound to in that file.
+    pub const fn name(&self) -> &'a str {
+        self.name
+    }
+}
+
+/// Which lock check a [`DerivedState::LockCheck`] is. What its own
+/// regeneration does to the pin decides the remedy (remedy matrix 1.2,
+/// rows 5 to 8 and 14).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LockCheckKind {
+    /// `compile_pip_requirements`: its `.update` keeps only what the `.in`
+    /// source names, so it drops a pin written to the lock alone. The one
+    /// check with a manual procedure a probe ran (Y6). `dot_test`: whether
+    /// rules_python is proven at or above 1.5.0, which names the test
+    /// `<name>.test`.
+    PipCompile { dot_test: Tri },
+    /// `gazelle_python_manifest`: its `.update` rewrites only the
+    /// manifest, whose `integrity` covers the bytes of the lock. The lock
+    /// and the pin in it stay.
+    GazelleManifest,
+    /// A diff test over a checked-in `requirements.bzl`: the file is
+    /// derived from the lock by a target the project defines, and
+    /// regenerating it keeps the pin.
+    RequirementsBzl,
+    /// A rules_uv `pip_compile` or a rules_python `lock`: the update
+    /// resolves the lock again from its source and erases the pin. No
+    /// procedure is known that keeps both the pin and a green check.
+    Erasing,
+}
+
+impl LockCheckKind {
+    /// How hard the check's own update is on the pin, hardest first. Of
+    /// several checks over one lock the hardest decides the remedy: the
+    /// update of a manifest keeps the pin only where no other check then
+    /// erases it (design 6: "for a `gazelle_python_manifest` alone").
+    const fn rank(self) -> u8 {
+        match self {
+            Self::Erasing => 0,
+            Self::PipCompile { .. } => 1,
+            Self::RequirementsBzl => 2,
+            Self::GazelleManifest => 3,
+        }
+    }
 }
 
 /// One piece of state that an edit leaves stale.
@@ -74,6 +179,12 @@ pub enum DerivedState {
     /// "may be": facts are shared by every hub of the extension in the
     /// module graph, so the same member can remain after a refresh.
     Facts { extension: String },
+    /// The lock holds facts for the hub's extension in a shape this
+    /// version does not know (a `fact_version` of the future): a member
+    /// it does not model could go stale unseen. A facts row like
+    /// [`Self::Facts`], so it never gates `vex`: [`evidence`] reads no
+    /// fact, and no command changes the shape.
+    UnknownFactsShape { extension: String, why: String },
     /// The edited `.bzl` file is in the load closure of an extension the
     /// lock has an entry for. The digest differs per Bazel version.
     BzlTransitiveDigest {
@@ -87,9 +198,8 @@ pub enum DerivedState {
     /// A family-B lock has an entry for the extension, and the edit
     /// changes one of its tags.
     UsagesDigest { extension: String, platform: String },
-    /// The lock is unreadable or of a shape this version does not know, or
-    /// the facts of the hub's extension are: evidence degrades to no
-    /// evidence, so what cannot be read is stale.
+    /// The lock is unreadable or of a shape this version does not know:
+    /// evidence degrades to no evidence, so what cannot be read is stale.
     UnknownLockShape { why: String },
     /// Declared by a recognizer: `input` is a manifest or the
     /// `cargo_config` of a crate_universe hub with a `lockfile`. The build
@@ -106,14 +216,12 @@ pub enum DerivedState {
     /// Declared by a recognizer: a lock check (`compile_pip_requirements`,
     /// a rules_uv `pip_compile`, `lock`, `gazelle_python_manifest`, a
     /// `requirements.bzl` diff test) covers `input`. Its test fails after
-    /// the edit and its update command erases the pin.
+    /// the edit. What its own update command then does to the pin differs
+    /// per check ([`LockCheckKind`]): three of them erase it, two do not.
     LockCheck {
         target: String,
         input: String,
-        /// `Some` for a `compile_pip_requirements` target, the one check
-        /// with a manual procedure a probe ran: whether rules_python is
-        /// proven at or above 1.5.0, which names the test `<name>.test`.
-        pip_compile: Option<Tri>,
+        kind: LockCheckKind,
     },
     /// Declared by a recognizer: the rules_js action-cache file `file`
     /// lists `input` with a hash of its bytes.
@@ -155,12 +263,22 @@ impl DerivedState {
     }
 
     /// Whether `vex` waits for committed evidence that the state was
-    /// refreshed. Not for facts and directory records: their refresh
-    /// leaves nothing socket-patch can check, the pin's digest is enforced
-    /// at fetch, and a stale one fails closed or is refreshed by the next
-    /// `update`-mode build.
+    /// refreshed. Not for facts (of a known shape or not) and directory
+    /// records: their refresh leaves nothing socket-patch can check, the
+    /// pin's digest is enforced at fetch, and a stale one fails closed or
+    /// is refreshed by the next `update`-mode build. A row that gates is
+    /// one [`evidence`] can see cleared; anything else would withhold the
+    /// statement for good.
     pub const fn gates_vex(&self) -> bool {
-        !matches!(self, Self::Facts { .. } | Self::RecordedDir { .. })
+        !matches!(
+            self,
+            Self::Facts { .. } | Self::UnknownFactsShape { .. } | Self::RecordedDir { .. }
+        )
+    }
+
+    /// A row about the facts of an extension.
+    const fn is_facts(&self) -> bool {
+        matches!(self, Self::Facts { .. } | Self::UnknownFactsShape { .. })
     }
 
     /// Why an edit that leaves this state stale is refused.
@@ -233,8 +351,12 @@ pub struct Write<'a> {
     pub path: &'a str,
     pub after: After<'a>,
     /// The topmost path the edit creates or removes, when it does: the
-    /// file itself, or the first directory that did not exist. A recorded
-    /// listing of its parent gains or loses that entry.
+    /// file itself, or the first directory that did not exist (or that
+    /// the removal leaves empty and takes with it). A recorded listing of
+    /// its parent gains or loses that entry. [`Write::created`] and
+    /// [`Write::removed`] set it; a removal that leaves it `None` changes
+    /// the listing of the file's own directory all the same, and
+    /// [`stale`] counts it so.
     pub entry_change: Option<&'a str>,
     /// For a `.bzl` file: the extensions whose load closure holds it.
     /// Empty means not known, and then every extension of the root module
@@ -264,15 +386,66 @@ impl<'a> Write<'a> {
             tags_of: &[],
         }
     }
+
+    /// A file the edit creates with these bytes. `topmost` is the first
+    /// directory on the way to it that did not exist; `None` when the
+    /// file's own directory does, and the file is the new entry.
+    pub const fn created(path: &'a str, after: &'a [u8], topmost: Option<&'a str>) -> Self {
+        Self {
+            entry_change: Some(Self::entry(path, topmost)),
+            ..Self::bytes(path, after)
+        }
+    }
+
+    /// A file the edit removes. `topmost` is the highest directory the
+    /// removal takes with it; `None` when the file's own directory stays,
+    /// and the file is the entry that goes.
+    pub const fn removed(path: &'a str, topmost: Option<&'a str>) -> Self {
+        Self {
+            after: After::Removed,
+            entry_change: Some(Self::entry(path, topmost)),
+            ..Self::changed(path)
+        }
+    }
+
+    const fn entry(path: &'a str, topmost: Option<&'a str>) -> &'a str {
+        match topmost {
+            Some(topmost) => topmost,
+            None => path,
+        }
+    }
+
+    /// The entry whose creation or removal changes a recorded listing.
+    /// A removal always changes one, whatever `entry_change` says.
+    fn listing_change(&self) -> Option<&'a str> {
+        let removed = matches!(self.after, After::Removed).then_some(self.path);
+        self.entry_change.or(removed)
+    }
 }
 
 /// Which facts an extension stores, and how to look one package up.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FactsOf<'a> {
     /// rules_python `pip`, for a requirements hub that resolves through a
-    /// simple index: `dist_hashes[index_url][package]`, the package name
-    /// normalized. `removed` and `added` are SHA-256 digests, bare
+    /// simple index. `removed` and `added` are SHA-256 digests, bare
     /// lowercase hex.
+    ///
+    /// The package's distributions are looked up under every index of
+    /// `dist_hashes`, not only under the hub's: rules_python searches
+    /// `extra_index_urls` before the default index, honours
+    /// `index_url_overrides` per package, and files the fact under the
+    /// root of the index that served the package (`simpleapi_download.bzl`
+    /// and `pypi_cache.bzl` at 2.5.0-rc4). A forward edit also stales the
+    /// package's member of `index_urls`, which rules_python drops once the
+    /// package is no longer looked up in an index.
+    ///
+    /// `package` is the name in any spelling. Both sides are compared
+    /// under PEP 503 normalization (lowercase; a run of `-`, `_` and `.`
+    /// is one `-`), so `typing_extensions` and `Typing.Extensions` find
+    /// the fact rules_python keys `typing-extensions`.
+    ///
+    /// `index_url` is the hub's own index, for messages. The verdict
+    /// never depends on it.
     Pip {
         index_url: &'a str,
         package: &'a str,
@@ -313,12 +486,32 @@ impl FactsEdit<'_> {
                 let held = |key: &&str| keys.contains(key);
                 self.removed.iter().any(held) || !self.added.iter().all(held)
             }
-            FactsOf::Pip { index_url, package } => {
+            FactsOf::Pip { package, .. } => {
                 let pip = found.pip()?;
-                let held = |digest: &&str| pip.holds_digest(index_url, package, digest);
+                let wanted = canonicalize_pypi_name(package);
+                let same = |name: &str| canonicalize_pypi_name(name) == wanted;
+                // Under any index: held where one holds the digest, and
+                // not comparable where one cannot be compared.
+                let held = |digest: &&str| {
+                    let mut all = FactDigest::NotHeld;
+                    for index in &pip.dist_hashes {
+                        for member in index.packages.iter().filter(|p| same(&p.name)) {
+                            match pip.holds_digest(&index.url, &member.name, digest) {
+                                FactDigest::Held => return FactDigest::Held,
+                                FactDigest::CannotTell => all = FactDigest::CannotTell,
+                                FactDigest::NotHeld => {}
+                            }
+                        }
+                    }
+                    all
+                };
                 let gone = |digest| held(digest) != FactDigest::NotHeld;
                 let back = |digest| held(digest) != FactDigest::Held;
-                self.removed.iter().any(gone) || self.added.iter().any(back)
+                // Which index serves a package is a fact of its own, and
+                // a package that leaves the index loses it.
+                let mut listed = pip.index_packages.iter().flat_map(|(_, names)| names);
+                let leaves_an_index = !self.removed.is_empty() && listed.any(|name| same(name));
+                leaves_an_index || self.removed.iter().any(gone) || self.added.iter().any(back)
             }
         })
     }
@@ -339,8 +532,10 @@ impl FactsEdit<'_> {
             match self.may_stale(facts) {
                 Ok(may) => stale |= may,
                 Err(why) => {
-                    let why = format!("the facts of {}: {why}", facts.id.raw);
-                    return Some(DerivedState::UnknownLockShape { why });
+                    return Some(DerivedState::UnknownFactsShape {
+                        extension: facts.id.raw.clone(),
+                        why,
+                    });
                 }
             }
         }
@@ -413,7 +608,7 @@ pub fn stale(lock: &ModuleLock, edit: &Edit<'_>) -> Vec<DerivedState> {
                     }
                 }
                 for (entry, dir) in recorded.recorded_dirs() {
-                    let listing = write.entry_change;
+                    let listing = write.listing_change();
                     if listing.is_some_and(|changed| dir.stale_when_created_or_removed(changed))
                         || dir.stale_when_edited(write.path)
                     {
@@ -492,13 +687,40 @@ pub enum LockUse {
     Refreshed,
 }
 
-/// The lock use that the state of `--lockfile_mode` on the build chain
-/// gives on `line`.
+/// The sections `--enable_platform_specific_config` applies by itself,
+/// one per host OS (`build:linux`): the names `rc.rs` keeps for `startup`.
+const OS_SECTIONS: [&str; 5] = ["linux", "macos", "windows", "freebsd", "openbsd"];
+
+/// A [`FlagState::Possible`] key of the command with no `--config`: the
+/// plain reading, or one that only a release of the line or the working
+/// directory decides (a bracketed condition).
+fn plain_reading(key: &str) -> bool {
+    key.is_empty() || key.starts_with('[')
+}
+
+/// A [`FlagState::Possible`] key of an OS section, with or without a
+/// bracketed condition after it.
+fn os_reading(key: &str) -> bool {
+    OS_SECTIONS.iter().any(|os| {
+        let rest = key.strip_prefix(os);
+        rest.is_some_and(|rest| rest.is_empty() || rest.starts_with(" ["))
+    })
+}
+
+/// The lock use that the state of `--lockfile_mode` on one command chain
+/// gives on `line`, read without `--enable_platform_specific_config`.
+/// [`lock_use_of`] is the answer for a workspace.
 ///
 /// A value that only a release of the line or the working directory
-/// decides (a bracketed reading) is a value of the plain build: `error`
+/// decides (a bracketed reading) is a value of the plain command: `error`
 /// there is no named config a user opts into, so it freezes the lock.
 pub fn lock_use(mode: &FlagState<String>, line: &BazelLine) -> LockUse {
+    lock_use_on(mode, line, false)
+}
+
+/// [`lock_use`]; with `os_sections`, a value of an OS section counts as
+/// one of the plain command.
+fn lock_use_on(mode: &FlagState<String>, line: &BazelLine, os_sections: bool) -> LockUse {
     let is = |value: &String, mode| LockfileMode::parse(value) == Some(mode);
     let default_off = lockfile_mode_default(line) == Some(LockfileMode::Off);
     let unused = |all_off: bool, may_be_unset: bool| {
@@ -512,7 +734,7 @@ pub fn lock_use(mode: &FlagState<String>, line: &BazelLine) -> LockUse {
         FlagState::Set(value) if is(value, LockfileMode::Error) => LockUse::Frozen,
         FlagState::Set(value) => unused(is(value, LockfileMode::Off), false),
         FlagState::Possible(by_reading) => {
-            let plain = |key: &String| key.is_empty() || key.starts_with('[');
+            let plain = |key: &String| plain_reading(key) || (os_sections && os_reading(key));
             let mut readings = by_reading.iter();
             if readings.any(|(key, value)| plain(key) && is(value, LockfileMode::Error)) {
                 return LockUse::Frozen;
@@ -526,15 +748,56 @@ pub fn lock_use(mode: &FlagState<String>, line: &BazelLine) -> LockUse {
     }
 }
 
-/// [`lock_use`] of the tracked rc files.
+/// What the plain `bazel build` and `bazel test` of the tracked rc files
+/// do with the lock (D5): frozen when either is, unused only when both
+/// are. `test` inherits `build`, so its own lines can only add to it, and
+/// a `test --lockfile_mode=error` line fails the plain `bazel test` on a
+/// stale lock although the build passes.
+///
+/// Two things a single [`FlagState`] does not say are read here:
+///
+/// - `--enable_platform_specific_config`. Where the plain command sets or
+///   may set it, Bazel applies the section of the host OS (`build:linux`)
+///   with no `--config`, so `error` there freezes the lock on that OS,
+///   and the lock is committed for every OS. Set only under a config, the
+///   flag leaves the OS sections the named configs they are. Bazel expands
+///   the OS section where the flag stands, so a later plain line can
+///   override it; that order is not modelled, which only over-refuses.
+/// - The files that were not read ([`EffectiveFlags::gaps`]). A state is
+///   the value in what was read, and an unread file may set `update` or
+///   `error` after an `off` that was: the lock is then not proven unused,
+///   and the command is named.
 pub fn lock_use_of(flags: &EffectiveFlags, line: &BazelLine) -> LockUse {
-    lock_use(&flags.state(Flag::LockfileMode, Chain::Build), line)
+    let on = |chain| {
+        let os_sections = match flags.state(Flag::PlatformSpecificConfig, chain) {
+            FlagState::Set(value) => value == "true",
+            FlagState::Possible(by_reading) => {
+                let mut readings = by_reading.iter();
+                readings.any(|(key, value)| plain_reading(key) && value == "true")
+            }
+            _ => false,
+        };
+        lock_use_on(&flags.state(Flag::LockfileMode, chain), line, os_sections)
+    };
+    match [on(Chain::Build), on(Chain::Test)] {
+        [LockUse::Frozen, _] | [_, LockUse::Frozen] => LockUse::Frozen,
+        [LockUse::Unused, LockUse::Unused] if flags.gaps().is_empty() => LockUse::Unused,
+        _ => LockUse::Refreshed,
+    }
 }
 
-/// Whether a tracked rc file sets or may set `startup --digest_function`.
+/// Whether a tracked rc file sets or may set `startup --digest_function`
+/// to a function other than SHA-256. Bazel's default is SHA-256 and its
+/// converter takes `SHA-256` and `SHA256` in any case
+/// (`DigestHashFunction.java`), so a line that spells out the default
+/// leaves every recorded digest comparable.
 pub fn digest_function_tracked(flags: &EffectiveFlags) -> bool {
     let state = flags.state(Flag::DigestFunction, Chain::Startup);
-    !state.values().is_empty()
+    let default = |value: &&String| {
+        let name = value.to_ascii_lowercase();
+        name == "sha256" || name == "sha-256"
+    };
+    !state.values().iter().all(default)
 }
 
 /// What the policy decides for one edit.
@@ -588,6 +851,25 @@ impl Decision {
     }
 }
 
+/// Whether `MODULE.bazel.lock` holds facts or can come to hold them, which
+/// is when the refresh advisory carries the conditional sentence about
+/// `bazel clean --expunge` (design 7): the lock cannot be read, the Bazel
+/// that wrote it stores facts (a `facts` member, empty or not), or `stale`
+/// has a facts row. "Holds a fact now" is too narrow: the state those
+/// releases hide needs only an `update`-mode evaluation and an older lock
+/// put back (probe L3.c), and an edit that returns a package to the index
+/// gives a lock with `"facts": {}` its first fact.
+///
+/// The one rule for `remedy::Cx::facts_in_lock`: [`decide`] and
+/// [`Evidence::withhold`] apply it, and a caller that builds a refresh
+/// remedy itself does the same.
+pub fn facts_in_lock(lock: &ModuleLock, stale: &[DerivedState]) -> bool {
+    let stores_facts = lock
+        .extensions()
+        .is_none_or(|recorded| recorded.stores_facts);
+    stores_facts || stale.iter().any(DerivedState::is_facts)
+}
+
 /// The lock-refresh policy for one edit, forward or restoring.
 ///
 /// - Nothing stale: works.
@@ -601,7 +883,8 @@ impl Decision {
 ///   not gate `vex`.
 /// - Under [`LockUse::Unused`]: works.
 ///
-/// `cx.facts_in_lock` is taken from `lock`.
+/// `cx.facts_in_lock` is not read: it is [`facts_in_lock`] of `lock` and
+/// the stale rows.
 pub fn decide(
     lock: &ModuleLock,
     edit: &Edit<'_>,
@@ -609,9 +892,8 @@ pub fn decide(
     cx: &remedy::Cx<'_>,
 ) -> Decision {
     let stale = stale(lock, edit);
-    let facts_in_lock = lock.facts().is_some_and(|facts| !facts.is_empty());
     let cx = remedy::Cx {
-        facts_in_lock,
+        facts_in_lock: facts_in_lock(lock, &stale),
         ..*cx
     };
     let done = |interim, advisory| Decision {
@@ -619,14 +901,23 @@ pub fn decide(
         interim,
         advisory,
     };
-    if let Some(what) = stale.iter().find(|state| !state.in_lock()) {
+    // The first declared row, and of several lock checks the hardest.
+    let declared = stale.iter().filter(|state| !state.in_lock());
+    let hardest = declared.min_by_key(|state| match state {
+        DerivedState::LockCheck { kind, .. } => kind.rank(),
+        _ => 0,
+    });
+    if let Some(what) = hardest {
         let remedy = match what {
             DerivedState::CrateLockDigest { hub, system, .. } => remedy::repin(&cx, hub, *system),
-            DerivedState::LockCheck {
-                target,
-                pip_compile: Some(dot_test),
-                ..
-            } => Some(remedy::pip_compile_snippet(target, *dot_test)),
+            DerivedState::LockCheck { target, kind, .. } => match kind {
+                LockCheckKind::PipCompile { dot_test } => {
+                    Some(remedy::pip_compile_snippet(target, *dot_test))
+                }
+                LockCheckKind::GazelleManifest => Some(remedy::gazelle_manifest(target)),
+                LockCheckKind::RequirementsBzl => Some(remedy::requirements_bzl()),
+                LockCheckKind::Erasing => None,
+            },
             _ => None,
         };
         let remedy = remedy.unwrap_or_else(|| {
@@ -696,29 +987,46 @@ pub enum Evidence {
     /// pin and records no file, where nothing tells a lock that was not
     /// refreshed from one that was merged by hand.
     Pending { platforms: Vec<String>, why: String },
-    /// An entry with a fresh digest and repository specs from before the
-    /// pin, which is what a hand-resolved merge of the lock leaves. It
-    /// passes `--lockfile_mode=error`, builds the unpatched package in
-    /// every mode, and the refresh does not heal it (probe L1.d).
-    DerivedStale { extension: String, platform: String },
+    /// The lock records an input of the lane (or, in family A, the root
+    /// module file it wrote) and a tracked `startup --digest_function`
+    /// line makes Bazel record digests that are not SHA-256. No record can
+    /// be compared with its file and no command changes that (probe X4),
+    /// so `vex` waits for as long as the line is tracked. `why` is the
+    /// whole detail: it names no command.
+    Incomparable { why: String },
+    /// Entries with a fresh digest and repository specs from before the
+    /// pin, which is what a hand-resolved merge of the lock leaves. They
+    /// pass `--lockfile_mode=error`, build the unpatched package in every
+    /// mode, and the refresh does not heal them (probe L1.d). `platforms`
+    /// are the keys of every such entry of `extension`; empty for the one
+    /// entry of an extension that is not keyed by platform.
+    DerivedStale {
+        extension: String,
+        platforms: Vec<String>,
+    },
 }
 
 impl Evidence {
-    /// The withheld statement, with the remedy in its detail.
-    pub fn withhold(&self, cx: &remedy::Cx<'_>) -> Option<VexWithhold> {
-        let keys = |platform: &String| Some(platform.clone()).filter(|key| key != GENERAL);
+    /// The withheld statement, with the remedy in its detail. `lock` is
+    /// the lock the evidence was read from: `cx.facts_in_lock` is not
+    /// read, it is [`facts_in_lock`] of that lock.
+    pub fn withhold(&self, lock: &ModuleLock, cx: &remedy::Cx<'_>) -> Option<VexWithhold> {
+        let cx = remedy::Cx {
+            facts_in_lock: facts_in_lock(lock, &[]),
+            ..*cx
+        };
         let (kind, detail) = match self {
             Self::Holds => return None,
             Self::Pending { platforms, why } => {
-                let command = remedy::lock_refresh(cx, platforms).text();
+                let command = remedy::lock_refresh(&cx, platforms).text();
                 (WithholdKind::RunPending, format!("{why}. {command}"))
             }
+            Self::Incomparable { why } => (WithholdKind::RunPending, why.clone()),
             Self::DerivedStale {
                 extension,
-                platform,
+                platforms,
             } => {
-                let platforms: Vec<String> = keys(platform).into_iter().collect();
-                let remedy = remedy::delete_entry(extension, &platforms);
+                let remedy = remedy::delete_entry(extension, platforms);
                 (WithholdKind::DerivedStale, remedy.text())
             }
         };
@@ -737,11 +1045,6 @@ pub fn evidence(lock: &ModuleLock, files: &dyn FileView, proof: &Proof<'_>) -> E
         let why = "MODULE.bazel.lock cannot be read as a lock, so nothing in it is evidence";
         return pending(Vec::new(), why);
     };
-    if proof.digest_function {
-        let why = "A tracked `startup --digest_function` line makes Bazel record digests that \
-                   cannot be compared with the files";
-        return pending(Vec::new(), why);
-    }
     // The entries that record an input, and the platforms whose record
     // is not the file as found.
     let mut recording: Vec<&ExtensionEntry> = Vec::new();
@@ -758,13 +1061,25 @@ pub fn evidence(lock: &ModuleLock, files: &dyn FileView, proof: &Proof<'_>) -> E
             }
         }
     }
-    let root_behind = match lock {
-        ModuleLock::FamilyA(graph) if proof.inputs.contains(&ROOT_MODULE) => {
-            let root = files.read(ROOT_MODULE);
-            !root.as_bytes().is_some_and(|b| graph.module_file_fresh(b))
-        }
-        _ => false,
+    let root_hash = match lock {
+        ModuleLock::FamilyA(graph) if proof.inputs.contains(&ROOT_MODULE) => Some(graph),
+        _ => None,
     };
+    // Only what the lock records can be out of reach: a lock that records
+    // none of the inputs holds, whatever the digest function.
+    if proof.digest_function && (root_hash.is_some() || !recording.is_empty()) {
+        let why = "A tracked `startup --digest_function` line makes Bazel record digests in \
+                   MODULE.bazel.lock that are not SHA-256, so its records cannot be compared \
+                   with the files. No command changes that: the statement is withheld while \
+                   the line is tracked.";
+        return Evidence::Incomparable {
+            why: why.to_string(),
+        };
+    }
+    let root_behind = root_hash.is_some_and(|graph| {
+        let root = files.read(ROOT_MODULE);
+        !root.as_bytes().is_some_and(|b| graph.module_file_fresh(b))
+    });
     if root_behind || !behind.is_empty() {
         behind.retain(|key| key != GENERAL);
         let why = "MODULE.bazel.lock still records the bytes from before the edit";
@@ -788,10 +1103,20 @@ pub fn evidence(lock: &ModuleLock, files: &dyn FileView, proof: &Proof<'_>) -> E
     // A digest that is current beside specs that are not is the forged
     // state. An entry that records no file shows nothing either way: the
     // refresh has not reached it, as far as the lock says.
-    if let Some(entry) = lacking.clone().find(records_an_input) {
+    let mut forged = lacking.clone().filter(records_an_input);
+    if let Some(first) = forged.next() {
+        // Every forged entry of that extension: the remedy deletes each,
+        // and each is written again only on its own platform (probe L4).
+        let same_extension = forged.filter(|entry| entry.id.raw == first.id.raw);
+        let mut platforms: Vec<String> = Vec::new();
+        for entry in std::iter::once(first).chain(same_extension) {
+            if entry.platform != GENERAL && !platforms.contains(&entry.platform) {
+                platforms.push(entry.platform.clone());
+            }
+        }
         return Evidence::DerivedStale {
-            extension: entry.id.raw.clone(),
-            platform: entry.platform.clone(),
+            extension: first.id.raw.clone(),
+            platforms,
         };
     }
     match lacking.next() {
@@ -817,20 +1142,22 @@ mod tests {
     use super::*;
 
     const PYPI: &str = "https://pypi.org/simple";
-    const PIP: ExtRef<'static> = ExtRef {
-        label: "//python/extensions:pip.bzl",
-        name: "pip",
-    };
-    const TOY: ExtRef<'static> = ExtRef {
-        label: "//:ext.bzl",
-        name: "toy",
-    };
+    const PIP: ExtRef<'static> = ext("//python/extensions:pip.bzl", "pip");
+    const TOY: ExtRef<'static> = ext("//:ext.bzl", "toy");
     const TOY_ID: &str = "//:ext.bzl%toy";
     /// six 1.17.0, the wheel the pip cells replace.
     const SIX: &str = "4721f391ed90541fddacab5acf947aa0d3dc7d27b2e1e8eda2be8970586c3274";
     const LINUX: &str = "os:linux,arch:aarch64";
     const OSX: &str = "os:osx,arch:aarch64";
     const USES: [LockUse; 3] = [LockUse::Frozen, LockUse::Refreshed, LockUse::Unused];
+
+    /// An extension by a label [`ExtRef::new`] takes.
+    const fn ext(label: &'static str, name: &'static str) -> ExtRef<'static> {
+        match ExtRef::new(label, name) {
+            Ok(ext) => ext,
+            Err(_) => panic!("not the label of an extension's `.bzl` file"),
+        }
+    }
 
     fn bytes(rel: &str) -> Vec<u8> {
         let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/bazel");
@@ -997,9 +1324,13 @@ mod tests {
             // never left.
             assert_eq!(state("bazel-repaired", index_url, &[], &[digest]), pip);
             assert_eq!(state("baseline", index_url, &[], &[digest]), [], "{dir}");
-            // Under another index nothing is held.
+            // The hub's own index does not narrow the lookup: the fact is
+            // filed under the index that served the package, which an
+            // extra index or a per-package override makes another one.
             let other = "https://example.test/simple";
-            assert_eq!(state("baseline", other, &[digest], &[]), [], "{dir}");
+            assert_eq!(state("baseline", other, &[digest], &[]), pip, "{dir}");
+            assert_eq!(state("bazel-repaired", other, &[digest], &[]), []);
+            assert_eq!(state("bazel-repaired", other, &[], &[digest]), pip);
             // A `uv_lock` hub has no facts of its own: no probe, no row,
             // whatever the lock holds for rules_python's own hubs.
             let baseline = lock(&format!("module_lock/facts/{dir}/baseline"));
@@ -1010,10 +1341,7 @@ mod tests {
         // refresh does not return it to its first bytes, so the repaired
         // lock stays "possibly stale" where Bazel then passed.
         let go_deps = FactsEdit {
-            extension: ExtRef {
-                label: "//:extensions.bzl",
-                name: "go_deps",
-            },
+            extension: ext("//:extensions.bzl", "go_deps"),
             of: FactsOf::GoDeps,
             removed: &[],
             added: &[],
@@ -1054,10 +1382,7 @@ mod tests {
         assert_eq!(rows(&repaired, TOY, keyed, &[], KEY), 1);
         assert_eq!(rows(&baseline, TOY, keyed, &[], KEY), 0);
         let rules_rs = lock("module_lock/facts/rules-rs/baseline");
-        let crates = ExtRef {
-            label: "//rs:extensions.bzl",
-            name: "crate",
-        };
+        let crates = ext("//rs:extensions.bzl", "crate");
         assert_eq!(rows(&rules_rs, crates, keyed, &["cfg-if_1.0.4"], &[]), 1);
         assert_eq!(rows(&rules_rs, crates, keyed, &["cfg-if_1.0.3"], &[]), 0);
 
@@ -1090,11 +1415,14 @@ mod tests {
         );
         assert_eq!(rows(&md5, PIP, pip, &[SIX], &[]), 1);
         assert_eq!(rows(&md5, PIP, pip, &["not-a-digest"], &[]), 1);
-        // Facts of a shape this reader does not know are an unknown lock
-        // shape, which is stale and not only "possibly": a `fact_version`
-        // of the future, facts that are no object, a list that is none.
+        // Facts of a shape this reader does not know are a facts row of
+        // their own, stale and not only "possibly": a `fact_version` of
+        // the future, facts that are no object, a list that is none. Like
+        // every facts row it never gates `vex`: no fact is part of the
+        // evidence, and no command changes the shape.
         let v3 = holding(r#"{"fact_version": "v3", "dist_hashes": {}}"#);
         let go_deps = FactsOf::GoDeps;
+        let at = line("8.8.2");
         for (extension, of) in [(PIP, pip), (TOY, keyed), (TOY, go_deps), (PIP, go_deps)] {
             let facts = FactsEdit {
                 extension,
@@ -1102,10 +1430,210 @@ mod tests {
                 removed: &[],
                 added: &[],
             };
-            let found = stale(&v3, &with_facts(&dep_lock, facts));
-            let unknown = matches!(&found[..], [DerivedState::UnknownLockShape { why }]
-                if why.starts_with("the facts of ") && found[0].gates_vex());
-            assert!(unknown, "{extension:?} {of:?}: {found:?}");
+            let edit = with_facts(&dep_lock, facts);
+            let found = stale(&v3, &edit);
+            let [DerivedState::UnknownFactsShape { extension: id, why }] = &found[..] else {
+                panic!("{extension:?} {of:?}: {found:?}");
+            };
+            assert!(id.ends_with(&format!("{}%{}", extension.label(), extension.name())));
+            assert!(!why.is_empty() && !found[0].gates_vex() && found[0].in_lock());
+
+            // Refused when frozen; otherwise works with the advisory, and
+            // the advisory says what the evidence says: `vex` does not
+            // wait, because nothing the command writes would end the wait.
+            let [frozen, refreshed, unused] =
+                USES.map(|lock_use| decide(&v3, &edit, lock_use, &cx(&at)));
+            assert_eq!(outcome(&frozen), "refused", "{extension:?} {of:?}");
+            assert_eq!(frozen.reason(), Some(Reason::LockfileFrozen));
+            assert_eq!(
+                outcome(&refreshed),
+                "works, advisory",
+                "{extension:?} {of:?}"
+            );
+            assert_eq!(outcome(&unused), "works", "{extension:?} {of:?}");
+            let gates_vex = refreshed.run_required().unwrap().gates_vex;
+            let hub = [extension];
+            let found = evidence(&v3, &view(&[]), &proof(&["dep.lock"], &hub, Some("pin")));
+            assert_eq!(gates_vex, found != Evidence::Holds, "{extension:?} {of:?}");
+            assert!(!gates_vex);
+        }
+    }
+
+    /// Source-verified on rules_python 2.5.0-rc4: a fact is filed under
+    /// the root of the index that served the package, with the name
+    /// hyphenated, and the index that serves a package is a fact of its
+    /// own (`index_urls`) that goes when the package leaves the index.
+    #[test]
+    fn pip_facts_are_found_under_any_index_and_any_spelling_of_the_name() {
+        const DIGEST: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        const OTHER: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let extra = "https://extra.example/simple";
+        let lock = |index_urls: &str| {
+            ModuleLock::parse(
+                format!(
+                    r#"{{"lockFileVersion": 28, "registryFileHashes": {{}}, "facts": {{
+                    "@@rules_python+//python/extensions:pip.bzl%pip": {{
+                        "fact_version": "v2",
+                        "dist_hashes": {{
+                            "https://pypi.org/simple": {{"six": {{
+                                "https://f.test/six.whl": "sha256:{OTHER}"}}}},
+                            "{extra}": {{"typing-extensions": {{
+                                "https://f.test/te.whl": "sha256:{DIGEST}"}}}}
+                        }}{index_urls}
+                    }}}}}}"#
+                )
+                .as_bytes(),
+            )
+        };
+        let written = [Write::changed("requirements_lock.txt")];
+        let rows = |lock: &ModuleLock, index_url, package, removed: &[&str], added: &[&str]| {
+            let facts = FactsEdit {
+                extension: PIP,
+                of: FactsOf::Pip { index_url, package },
+                removed,
+                added,
+            };
+            stale(lock, &with_facts(&written, facts))
+        };
+        let held = lock("");
+        let at = line("8.8.2");
+        for index_url in [PYPI, extra, "https://unrelated.test/simple"] {
+            for package in [
+                "typing-extensions",
+                "typing_extensions",
+                "Typing.Extensions",
+                "TYPING__EXTENSIONS",
+            ] {
+                let what = format!("{index_url} {package}");
+                let forward = rows(&held, index_url, package, &[DIGEST], &[]);
+                assert!(
+                    matches!(&forward[..], [DerivedState::Facts { .. }]),
+                    "{what}: {forward:?}"
+                );
+                // The restoring edit finds the digest it puts back, and a
+                // digest the lock does not hold is a fact to come.
+                assert_eq!(
+                    rows(&held, index_url, package, &[], &[DIGEST]),
+                    [],
+                    "{what}"
+                );
+                assert_eq!(rows(&held, index_url, package, &[], &[OTHER]).len(), 1);
+                assert_eq!(rows(&held, index_url, package, &[OTHER], &[]), [], "{what}");
+
+                // Under an unconditional `error` the forward edit is
+                // refused, which is what Bazel's `has changed its facts`
+                // would otherwise say after the write.
+                let facts = FactsEdit {
+                    extension: PIP,
+                    of: FactsOf::Pip { index_url, package },
+                    removed: &[DIGEST],
+                    added: &[],
+                };
+                let edit = with_facts(&written, facts);
+                let frozen = decide(&held, &edit, LockUse::Frozen, &cx(&at));
+                assert_eq!(frozen.reason(), Some(Reason::LockfileFrozen), "{what}");
+            }
+            // Another package's fact is not this one's.
+            assert_eq!(rows(&held, index_url, "typing", &[DIGEST], &[]), []);
+            assert_eq!(rows(&held, index_url, "six", &[DIGEST], &[]), []);
+        }
+
+        // `index_urls`: the package leaves the index on a forward edit and
+        // its member goes, whatever digests the lock holds for it.
+        let listed = lock(
+            r#", "index_urls": {"https://extra.example/simple/":
+                {"typing-extensions": "https://extra.example/simple/typing-extensions/"}}"#,
+        );
+        for package in ["typing_extensions", "Typing-Extensions"] {
+            assert_eq!(rows(&listed, PYPI, package, &[OTHER], &[]).len(), 1);
+            assert_eq!(rows(&held, PYPI, package, &[OTHER], &[]), [], "{package}");
+            // Nothing leaves the index on a restoring edit.
+            assert_eq!(
+                rows(&listed, PYPI, package, &[], &[DIGEST]),
+                [],
+                "{package}"
+            );
+        }
+        assert_eq!(rows(&listed, PYPI, "six", &[DIGEST], &[]), []);
+    }
+
+    /// Design 7: the conditional `bazel clean --expunge` sentence rides on
+    /// the advisory wherever the lock holds facts or can come to hold
+    /// them, on a line that includes 8.5 to 9.2. A lock with `"facts": {}`
+    /// gains its first fact when a package returns to the index, and a
+    /// lock that cannot be read may hold any.
+    #[test]
+    fn the_expunge_sentence_follows_the_lock_and_not_the_callers_flag() {
+        const EXPUNGE: &str = "clean --expunge";
+        let parse = |json: &str| ModuleLock::parse(json.as_bytes());
+        let empty_facts =
+            parse(r#"{"lockFileVersion": 28, "registryFileHashes": {}, "facts": {}}"#);
+        let no_facts = parse(r#"{"lockFileVersion": 13, "registryFileHashes": {}}"#);
+        let dep_lock = [Write::changed("dep.lock")];
+        let gains = FactsEdit {
+            extension: TOY,
+            of: FactsOf::Keyed,
+            removed: &[],
+            added: &["dep_a@index"],
+        };
+        let texts = |lock: &ModuleLock, edit: &Edit<'_>, version: &str, caller_says: bool| {
+            let at = line(version);
+            let cx = remedy::Cx {
+                facts_in_lock: caller_says,
+                ..cx(&at)
+            };
+            let refreshed = decide(lock, edit, LockUse::Refreshed, &cx);
+            let advisory = match (&refreshed.interim, &refreshed.advisory) {
+                (InterimState::SelfHealing { command }, None) => command.text(),
+                (InterimState::Green, Some(advisory)) => advisory.text(),
+                other => panic!("{other:?}"),
+            };
+            let frozen = decide(lock, edit, LockUse::Frozen, &cx);
+            let InterimState::Red { remedy, .. } = &frozen.interim else {
+                panic!("{frozen:?}");
+            };
+            [advisory, remedy.text()].map(|text| text.contains(EXPUNGE))
+        };
+        for caller_says in [false, true] {
+            // The lock that gains a fact, and the one that cannot be read.
+            let edit = with_facts(&dep_lock, gains);
+            assert_eq!(stale(&empty_facts, &edit).len(), 1);
+            assert_eq!(texts(&empty_facts, &edit, "8.8.2", caller_says), [true; 2]);
+            let unreadable = ModuleLock::Unreadable;
+            let edit = writes(&dep_lock);
+            assert_eq!(texts(&unreadable, &edit, "8.8.2", caller_says), [true; 2]);
+            // Outside 8.5 to 9.2 nothing is hidden, and a Bazel 7 lock
+            // stores no fact on any line.
+            assert_eq!(texts(&unreadable, &edit, "7.7.2", caller_says), [false; 2]);
+            assert_eq!(texts(&unreadable, &edit, "9.3.2", caller_says), [false; 2]);
+            let toy_lock = lock("module_lock/stale-repair/bazel-7.7.2/baseline");
+            assert_eq!(texts(&toy_lock, &edit, "8.8.2", caller_says), [false; 2]);
+        }
+        assert!(facts_in_lock(&empty_facts, &[]));
+        assert!(facts_in_lock(&ModuleLock::Unreadable, &[]));
+        assert!(facts_in_lock(&ModuleLock::UnknownShape(String::new()), &[]));
+        assert!(!facts_in_lock(&no_facts, &[]) && !facts_in_lock(&ModuleLock::Absent, &[]));
+        let row = DerivedState::Facts {
+            extension: TOY_ID.to_string(),
+        };
+        assert!(facts_in_lock(&no_facts, &[row]));
+
+        // The withheld detail follows the same rule, from the lock the
+        // evidence was read from.
+        let at = line("8.8.2");
+        let pending = Evidence::Pending {
+            platforms: Vec::new(),
+            why: "why".to_string(),
+        };
+        for caller_says in [false, true] {
+            let cx = remedy::Cx {
+                facts_in_lock: caller_says,
+                ..cx(&at)
+            };
+            let detail = |lock: &ModuleLock| pending.withhold(lock, &cx).unwrap().detail;
+            assert!(detail(&empty_facts).contains(EXPUNGE));
+            assert!(detail(&ModuleLock::Unreadable).contains(EXPUNGE));
+            assert!(!detail(&no_facts).contains(EXPUNGE));
         }
     }
 
@@ -1143,9 +1671,18 @@ mod tests {
             let forged = found("forged", &[TOY], pin);
             let entry = Evidence::DerivedStale {
                 extension: TOY_ID.to_string(),
-                platform: GENERAL.to_string(),
+                platforms: Vec::new(),
             };
             assert_eq!(forged, entry, "{release}");
+            // However `use_extension` spells the file, the ref is the one
+            // the lock is searched by; and a ref of another file names no
+            // entry, which holds (a reproducible extension has none).
+            for spelling in ["@@//:ext.bzl", "@//:ext.bzl", "@toy_repo//:ext.bzl"] {
+                let hub = [ExtRef::new(spelling, "toy").unwrap()];
+                assert_eq!(found("forged", &hub, pin), entry, "{release} {spelling}");
+            }
+            let other = [ext("//:other.bzl", "toy")];
+            assert_eq!(found("forged", &other, pin), Evidence::Holds, "{release}");
             // With no hub named, the entry that records the input must
             // carry the pin.
             assert_eq!(found("forged", &[], pin), entry, "{release}");
@@ -1156,30 +1693,26 @@ mod tests {
             assert_eq!(found("updated", &[TOY], Some("")), entry, "{release}");
 
             let at = line(release);
-            let withheld = forged.withhold(&cx(&at)).unwrap();
+            let withheld = forged.withhold(&read("forged"), &cx(&at)).unwrap();
             let code = |kind| Code::withheld(kind).as_str();
             assert_eq!(code(withheld.kind), "vex_bazel_derived_stale");
             let remedy = "Delete the `//:ext.bzl%toy` entry under `moduleExtensions` in \
                           MODULE.bazel.lock. Run `bazel mod deps --lockfile_mode=update`";
             assert!(withheld.detail.starts_with(remedy), "{}", withheld.detail);
-            let waiting = pending.withhold(&cx(&at)).unwrap();
+            let baseline = read("baseline");
+            let waiting = pending.withhold(&baseline, &cx(&at)).unwrap();
             assert_eq!(code(waiting.kind), "vex_bazel_run_pending");
             let command = "Run `bazel mod deps --lockfile_mode=update`";
             assert!(waiting.detail.contains(command), "{}", waiting.detail);
-            assert_eq!(Evidence::Holds.withhold(&cx(&at)), None);
+            assert_eq!(Evidence::Holds.withhold(&baseline, &cx(&at)), None);
 
             // What Bazel's `error` mode sees: the forged lock is current
             // for the pinned file, the first lock is not; and the
             // restoring edit is stale on the refreshed lock alone.
             let toy = vec![input("dep.lock", TOY_ID, GENERAL)];
-            let rows = |name: &str, after| {
-                let write = Write {
-                    after,
-                    ..Write::changed("dep.lock")
-                };
-                stale(&read(name), &writes(&[write]))
-            };
-            let (forward, restore) = (After::Bytes(&after), After::Bytes(&before));
+            let rows = |name: &str, write: Write<'_>| stale(&read(name), &writes(&[write]));
+            let forward = Write::bytes("dep.lock", &after);
+            let restore = Write::bytes("dep.lock", &before);
             assert_eq!(rows("forged", forward), [], "{release}");
             assert_eq!(rows("baseline", forward), toy, "{release}");
             assert_eq!(rows("updated", forward), [], "{release}");
@@ -1188,9 +1721,101 @@ mod tests {
             // A removed file, and an edit whose bytes are not known yet
             // (the gate runs before the rewriter): never fresh.
             for name in ["baseline", "updated", "forged"] {
-                assert_eq!(rows(name, After::Removed), toy, "{release} {name}");
-                assert_eq!(rows(name, After::Changed), toy, "{release} {name}");
+                let removed = Write::removed("dep.lock", None);
+                assert_eq!(rows(name, removed), toy, "{release} {name}");
+                let planned = Write::changed("dep.lock");
+                assert_eq!(rows(name, planned), toy, "{release} {name}");
             }
+
+            // The rows that are found by the extension: a tag edit and an
+            // edit of a `.bzl` file it loads, by any spelling of the ref.
+            let usages = DerivedState::UsagesDigest {
+                extension: TOY_ID.to_string(),
+                platform: GENERAL.to_string(),
+            };
+            let loaded = DerivedState::BzlTransitiveDigest {
+                path: "defs.bzl".to_string(),
+                extension: TOY_ID.to_string(),
+                platform: GENERAL.to_string(),
+            };
+            let baseline = read("baseline");
+            for spelling in ["//:ext.bzl", "@@//:ext.bzl", "@toy_repo//:ext.bzl"] {
+                let refs = [ExtRef::new(spelling, "toy").unwrap()];
+                let tag_edit = Write {
+                    tags_of: &refs,
+                    ..Write::changed("socket.MODULE.bazel")
+                };
+                let bzl_edit = Write {
+                    loaded_by: &refs,
+                    ..Write::changed("defs.bzl")
+                };
+                let found = stale(&baseline, &writes(&[tag_edit, bzl_edit]));
+                let family_b = matches!(baseline, ModuleLock::FamilyB(_));
+                let expected: Vec<DerivedState> = family_b
+                    .then(|| usages.clone())
+                    .into_iter()
+                    .chain([loaded.clone()])
+                    .collect();
+                assert_eq!(found, expected, "{release} {spelling}");
+            }
+        }
+    }
+
+    /// A ref is built in one spelling or not at all: a label that Bazel
+    /// would resolve against the file that holds it matches no lock
+    /// entry, and "no entry" reads as "nothing stale".
+    #[test]
+    fn an_extension_ref_takes_an_absolute_label_and_drops_its_repository() {
+        let same = ext("//python/extensions:pip.bzl", "pip");
+        for spelling in [
+            "//python/extensions:pip.bzl",
+            "@rules_python//python/extensions:pip.bzl",
+            "@@rules_python+//python/extensions:pip.bzl",
+            "@@rules_python~0.31.0//python/extensions:pip.bzl",
+            "@//python/extensions:pip.bzl",
+            "@@//python/extensions:pip.bzl",
+        ] {
+            let built = ExtRef::new(spelling, "pip").expect(spelling);
+            assert_eq!(built, same, "{spelling}");
+            assert_eq!(built.label(), "//python/extensions:pip.bzl");
+            assert_eq!(built.name(), "pip");
+        }
+        assert_eq!(ext("@@//:ext.bzl", "toy"), TOY);
+        assert_eq!(TOY.label(), "//:ext.bzl");
+        for refused in [
+            "",
+            ":ext.bzl",
+            "ext.bzl",
+            "pkg:ext.bzl",
+            "pkg/ext.bzl",
+            "//pkg",
+            "//pkg/ext.bzl",
+            "//pkg:",
+            "//",
+            "@repo",
+            "@repo//pkg",
+            "@repo:ext.bzl",
+            "@re/po//pkg:ext.bzl",
+            "//pkg:a:b",
+            "/pkg:ext.bzl",
+        ] {
+            assert!(ExtRef::new(refused, "toy").is_err(), "{refused:?}");
+        }
+        assert!(ExtRef::new("//:ext.bzl", "").is_err());
+        // A facts row is found by the ref too.
+        let facts = lock("module_lock/facts/toy/baseline");
+        for spelling in ["@@//:ext.bzl", "@toy_repo//:ext.bzl"] {
+            let edit = FactsEdit {
+                extension: ExtRef::new(spelling, "toy").unwrap(),
+                of: FactsOf::Keyed,
+                removed: &["dep_a@index"],
+                added: &[],
+            };
+            let found = stale(&facts, &with_facts(&[Write::changed("dep.lock")], edit));
+            let row = DerivedState::Facts {
+                extension: TOY_ID.to_string(),
+            };
+            assert!(found.contains(&row), "{spelling}: {found:?}");
         }
     }
 
@@ -1230,7 +1855,7 @@ mod tests {
         ] {
             let lock = lock(&format!("module_lock/paket/{file}"));
             let path = label.replace("//deps:", "deps/").replace("_extension", "");
-            let loaders = [ExtRef { label, name }];
+            let loaders = [ExtRef::new(label, name).unwrap()];
             let data_file = [Write {
                 loaded_by: &loaders,
                 ..Write::changed(&path)
@@ -1284,15 +1909,18 @@ mod tests {
             evidence: Vec::new(),
         };
         // `common=error common:ci=off` is an rc file of two lines.
-        let on = |spec: &str, line: &BazelLine| {
+        let rc_of = |spec: &str| -> String {
             let mode =
                 |(section, mode): (&str, &str)| format!("{section} --lockfile_mode={mode}\n");
             let lines = spec
                 .split(' ')
                 .filter_map(|setting| setting.split_once('='));
-            let rc: String = lines.map(mode).collect();
-            let files = Files::of(&[(".bazelrc", rc.as_str())]);
-            lock_use_of(&read_rc(&files).effective(line), line)
+            lines.map(mode).collect()
+        };
+        let of_files =
+            |files: &Files, line: &BazelLine| lock_use_of(&read_rc(files).effective(line), line);
+        let on = |spec: &str, line: &BazelLine| {
+            of_files(&Files::of(&[(".bazelrc", rc_of(spec).as_str())]), line)
         };
         let (frozen, unused, refreshed) = (LockUse::Frozen, LockUse::Unused, LockUse::Refreshed);
         // Nothing set: the default of the line.
@@ -1327,14 +1955,123 @@ mod tests {
                 // at its default; `mod` and `query` lines never reach it.
                 ("common:ci=off", default),
                 ("mod=error query=error", default),
+                // The plain `bazel test` counts as the plain build does
+                // (D5): `test` inherits `build`, and its own line fails
+                // the tests on a stale lock although the build passes.
+                ("test=error", frozen),
+                ("build=update test=error", frozen),
+                ("build=off test=update", refreshed),
+                ("build=off test=off", unused),
+                ("test=off", default),
+                ("test:ci=error", refreshed),
+                ("run=error coverage=error", default),
+                // An OS section is a named config while nothing turns
+                // `--enable_platform_specific_config` on.
+                ("build:linux=error", refreshed),
+                ("common:macos=error common:windows=error", refreshed),
             ] {
                 assert_eq!(on(rc, &at), expected, "{version}: {rc}");
             }
-            // An rc file that was not read may set the flag.
-            let files = Files::of(&[(".bazelrc", "try-import %workspace%/user.bazelrc\n")]);
-            let unread = lock_use_of(&read_rc(&files).effective(&at), &at);
-            assert_eq!(unread, refreshed, "{version}");
+            // With the flag on the plain build, Bazel applies the section
+            // of the host OS by itself: `error` there freezes the lock on
+            // that OS, and the lock is committed for every OS.
+            let platform = "--enable_platform_specific_config";
+            for (flag_line, rc, expected) in [
+                ("build", "build:linux=error", frozen),
+                ("common", "build:linux=error", frozen),
+                ("common", "common:macos=error", frozen),
+                ("build", "common:windows=error", frozen),
+                ("build", "build:freebsd=error", frozen),
+                ("build", "build:openbsd=error", frozen),
+                ("build", "common=update build:linux=error", frozen),
+                (
+                    "build",
+                    "common:linux=error common:macos=error common:windows=error",
+                    frozen,
+                ),
+                ("build", "test:linux=error", frozen),
+                ("test", "test:linux=error", frozen),
+                // Another config stays one, and so does an OS section when
+                // the flag is itself set only under a config or for a
+                // command the build does not inherit from.
+                ("build", "build:ci=error", refreshed),
+                ("build", "build:linux=update", refreshed),
+                ("common:ci", "build:linux=error", refreshed),
+                ("build:linux", "build:linux=error", refreshed),
+                ("query", "build:linux=error", refreshed),
+            ] {
+                let rc = format!("{flag_line} {platform}\n{}", rc_of(rc));
+                let found = of_files(&Files::of(&[(".bazelrc", rc.as_str())]), &at);
+                assert_eq!(found, expected, "{version}:\n{rc}");
+            }
+            let off = format!("build --no{}\n", &platform[2..]);
+            let rc = format!("{off}{}", rc_of("build:linux=error"));
+            let found = of_files(&Files::of(&[(".bazelrc", rc.as_str())]), &at);
+            assert_eq!(found, refreshed, "{version}:\n{rc}");
+
+            // An rc file that was not read may set the flag: after an
+            // `off` that was read too, wherever the import stands. The
+            // lock is then not proven unused, for an optional file and
+            // for one Bazel is sure to load alike.
+            let absent = "try-import %workspace%/user.bazelrc\n";
+            let unreadable = "import %workspace%/ci.bazelrc\n";
+            let off = rc_of("common=off");
+            for rc in [
+                absent.to_string(),
+                unreadable.to_string(),
+                format!("{off}{absent}"),
+                format!("{absent}{off}"),
+                format!("{off}{unreadable}"),
+                format!("{unreadable}{off}"),
+            ] {
+                let files = Files::of(&[(".bazelrc", rc.as_str())])
+                    .with("ci.bazelrc", FileText::Unreadable);
+                assert_eq!(of_files(&files, &at), refreshed, "{version}:\n{rc}");
+            }
+            // Read, the same files prove it, and `error` in what was read
+            // stays frozen whatever was not.
+            let read = Files::of(&[
+                (
+                    ".bazelrc",
+                    "common --lockfile_mode=off\nimport %workspace%/ci.bazelrc\n",
+                ),
+                ("ci.bazelrc", "common:ci --lockfile_mode=off\n"),
+            ]);
+            assert_eq!(of_files(&read, &at), unused, "{version}");
+            let rc = format!("{}{absent}", rc_of("common=error"));
+            let found = of_files(&Files::of(&[(".bazelrc", rc.as_str())]), &at);
+            assert_eq!(found, frozen, "{version}");
         }
+        // The gap rows on the three lines the default differs on.
+        for version in ["6.6.0", "7.7.2", "8.8.2"] {
+            let at = line(version);
+            for import in [
+                "try-import %workspace%/user.bazelrc",
+                "import %workspace%/ci.bazelrc",
+            ] {
+                let rc = format!("common --lockfile_mode=off\n{import}\n");
+                let files = Files::of(&[(".bazelrc", rc.as_str())])
+                    .with("ci.bazelrc", FileText::Unreadable);
+                let flags = read_rc(&files).effective(&at);
+                assert_eq!(flags.gaps().len(), 1, "{version}: {import}");
+                let mode = flags.state(Flag::LockfileMode, Chain::Build);
+                assert_eq!(mode, FlagState::Set("off".to_string()), "{version}");
+                assert_eq!(lock_use(&mode, &at), unused, "{version}: {import}");
+                assert_eq!(lock_use_of(&flags, &at), refreshed, "{version}: {import}");
+            }
+        }
+        // One state alone does not see the test chain or the OS sections.
+        let flags = |rc: &str| {
+            let at = line("8.8.2");
+            read_rc(&Files::of(&[(".bazelrc", rc)])).effective(&at)
+        };
+        let test_only = flags("test --lockfile_mode=error\n");
+        let at = line("8.8.2");
+        let build = test_only.state(Flag::LockfileMode, Chain::Build);
+        assert_eq!(lock_use(&build, &at), refreshed);
+        let test = test_only.state(Flag::LockfileMode, Chain::Test);
+        assert_eq!(lock_use(&test, &at), frozen);
+        assert_eq!(lock_use_of(&test_only, &at), frozen);
         // `always` exists from 6.3.0: on a 6.x range the plain build may
         // run under `error`, which no user opted into by name.
         assert_eq!(on("always=error", &majors(6, 6)), frozen);
@@ -1347,7 +2084,14 @@ mod tests {
         };
         assert!(!digest("") && !digest("build --lockfile_mode=error\n"));
         assert!(digest("startup --digest_function=blake3\n"));
-        assert!(digest("startup --digest_function=sha256\n"));
+        assert!(digest("startup --digest_function=SHA-1\n"));
+        // SHA-256 is Bazel's default, under either of its names and in any
+        // case: a line that spells it out changes no recorded digest.
+        for default in ["sha256", "SHA256", "sha-256", "SHA-256"] {
+            assert!(!digest(&format!("startup --digest_function={default}\n")));
+        }
+        let mixed = "startup --digest_function=sha256\nstartup:linux --digest_function=blake3\n";
+        assert!(digest(mixed));
     }
 
     /// Design 2.10, the lock-refresh table: each kind of lock state
@@ -1374,10 +2118,7 @@ mod tests {
             tags_of: &tags,
             ..Write::changed(ROOT_MODULE)
         }];
-        let created = [Write {
-            entry_change: Some(".bazelignore"),
-            ..Write::bytes(".bazelignore", b".socket/vendor\n")
-        }];
+        let created = [Write::created(".bazelignore", b".socket/vendor\n", None)];
         let facts = FactsEdit {
             extension: TOY,
             of: FactsOf::Keyed,
@@ -1507,9 +2248,86 @@ mod tests {
             panic!("{found:?}");
         };
         assert_eq!(platforms, &[LINUX]);
-        let detail = found.withhold(&cx(&at)).unwrap().detail;
+        let detail = found.withhold(&repaired, &cx(&at)).unwrap().detail;
         assert!(
             detail.contains("entry for (os:linux,arch:aarch64)"),
+            "{detail}"
+        );
+    }
+
+    /// Probes L1.d and L4: a hand-merged lock can hold the forged state
+    /// under one platform key or under each. Every forged key is named,
+    /// only those members are deleted, and the command is named for the
+    /// same keys: a member deleted on another platform would stay missing
+    /// there, and its `error`-mode build would fail.
+    #[test]
+    fn every_forged_platform_member_is_named_and_no_other() {
+        let before = bytes("module_lock/stale-repair/bazel-9.3.2/dep.lock.before");
+        let after = bytes("module_lock/stale-repair/bazel-9.3.2/dep.lock.after");
+        let (stale_digest, pinned_digest) = (
+            crate::bazel::module_lock::sha256_hex(&before),
+            crate::bazel::module_lock::sha256_hex(&after),
+        );
+        let text = |rel: &str| {
+            let lock = bytes(&format!("module_lock/eval-factors/{rel}.MODULE.bazel.lock"));
+            String::from_utf8(lock).expect("the lock is UTF-8")
+        };
+        let pinned = view(&[("dep.lock", &after)]);
+        let proof = proof(&["dep.lock"], &[TOY], Some("socket-patched-a-1.0"));
+        let found = |lock: &str| {
+            let lock = ModuleLock::parse(lock.as_bytes());
+            let found = evidence(&lock, &pinned, &proof);
+            let at = line("9.3.2");
+            let detail = found
+                .withhold(&lock, &cx(&at))
+                .map(|withheld| withheld.detail);
+            (found, detail.unwrap_or_default())
+        };
+        let forged = |platforms: &[&str]| Evidence::DerivedStale {
+            extension: TOY_ID.to_string(),
+            platforms: platforms.iter().map(|key| key.to_string()).collect(),
+        };
+
+        // Both keys record the bytes from before the pin: forge both.
+        let two = text("9.3.2.two-platforms");
+        assert_eq!(two.matches(&stale_digest).count(), 2);
+        let (evidence_of_both, detail) = found(&two.replace(&stale_digest, &pinned_digest));
+        assert_eq!(evidence_of_both, forged(&[LINUX, OSX]));
+        assert!(
+            detail.starts_with(
+                "Delete the `os:linux,arch:aarch64`, `os:osx,arch:aarch64` members of the \
+                 `//:ext.bzl%toy` entry under `moduleExtensions` in MODULE.bazel.lock, and leave \
+                 its other members. Run `bazel mod deps --lockfile_mode=update` on each of those \
+                 platforms and commit the result"
+            ),
+            "{detail}"
+        );
+
+        // macOS was refreshed for real and Linux was merged by hand: only
+        // the Linux member is forged, and only it is deleted.
+        let repaired = text("9.3.2.after-macos-repair");
+        assert_eq!(repaired.matches(&stale_digest).count(), 1);
+        let (evidence_of_one, detail) = found(&repaired.replace(&stale_digest, &pinned_digest));
+        assert_eq!(evidence_of_one, forged(&[LINUX]));
+        assert!(
+            detail.starts_with(
+                "Delete the `os:linux,arch:aarch64` member of the `//:ext.bzl%toy` entry under \
+                 `moduleExtensions` in MODULE.bazel.lock, and leave its other members. Run \
+                 `bazel mod deps --lockfile_mode=update` on that platform and commit the result"
+            ),
+            "{detail}"
+        );
+        assert!(!detail.contains(OSX), "{detail}");
+
+        // One key forged while the other is still behind: the refresh
+        // comes first, and it is named for the platform that lacks it.
+        let (behind, detail) = found(&two.replacen(&stale_digest, &pinned_digest, 1));
+        let Evidence::Pending { platforms, .. } = &behind else {
+            panic!("{behind:?}");
+        };
+        assert_eq!(platforms, &[OSX]);
+        assert!(
+            detail.contains("entry for (os:osx,arch:aarch64)"),
             "{detail}"
         );
     }
@@ -1517,30 +2335,168 @@ mod tests {
     /// Probe X4: under a non-default `--digest_function` no recorded value
     /// is the file's SHA-256. The entry counts as stale and its evidence
     /// stays pending, with the flag tracked or only its trace in the lock.
+    /// With the flag tracked no command ends the wait, and none is named.
     #[test]
     fn a_digest_that_cannot_be_compared_is_stale_and_its_evidence_pending() {
         let file = bytes("probe_vectors/x4/inputs/lf.lock");
         let written = [Write::bytes("lf.lock", &file)];
         let files = view(&[("lf.lock", &file)]);
-        let found = |lock: &ModuleLock, digest_function| {
+        let at = line("9.3.2");
+        // The stale rows, the evidence, and whether the withheld detail
+        // names the refresh.
+        let found = |lock: &ModuleLock, inputs: &[&str], digest_function| {
             let proof = Proof {
                 digest_function,
-                ..proof(&["lf.lock"], &[], None)
+                ..proof(inputs, &[], None)
             };
             let edit = Edit {
                 digest_function,
                 ..writes(&written)
             };
-            let pending = matches!(evidence(lock, &files, &proof), Evidence::Pending { .. });
-            (stale(lock, &edit).len(), pending)
+            let found = evidence(lock, &files, &proof);
+            let detail = found
+                .withhold(lock, &cx(&at))
+                .map(|withheld| withheld.detail);
+            let names_refresh = detail.is_some_and(|detail| detail.contains(remedy::LOCK_REFRESH));
+            let kind = match found {
+                Evidence::Holds => "holds",
+                Evidence::Pending { .. } => "pending",
+                Evidence::Incomparable { .. } => "incomparable",
+                Evidence::DerivedStale { .. } => "derived stale",
+            };
+            (stale(lock, &edit).len(), kind, names_refresh)
         };
+        let input = &["lf.lock"][..];
         let sha256 = lock("probe_vectors/x4/locks/9.3.2");
-        assert_eq!(found(&sha256, false), (0, false));
-        assert_eq!(found(&sha256, true), (1, true));
+        assert_eq!(found(&sha256, input, false), (0, "holds", false));
+        // Tracked: stale, withheld, and no command that could never clear
+        // it. The statement is withheld under the same code.
+        assert_eq!(found(&sha256, input, true), (1, "incomparable", false));
+        let tracked = Proof {
+            digest_function: true,
+            ..proof(input, &[], None)
+        };
+        let withheld = evidence(&sha256, &files, &tracked).withhold(&sha256, &cx(&at));
+        let withheld = withheld.expect("withheld");
+        assert_eq!(
+            Code::withheld(withheld.kind).as_str(),
+            "vex_bazel_run_pending"
+        );
+        assert!(
+            withheld.detail.contains("cannot be compared"),
+            "{}",
+            withheld.detail
+        );
+        assert!(!withheld.detail.contains("bazel "), "{}", withheld.detail);
+        // Only its trace in the lock: nothing says the function is not
+        // SHA-256, and the record reads as the bytes from before the edit.
         for function in ["sha1", "blake3"] {
             let lock = lock(&format!("probe_vectors/x4/locks/9.3.2.digest-{function}"));
-            assert_eq!(found(&lock, false), (1, true), "{function}");
+            assert_eq!(
+                found(&lock, input, false),
+                (1, "pending", true),
+                "{function}"
+            );
+            assert_eq!(
+                found(&lock, input, true),
+                (1, "incomparable", false),
+                "{function}"
+            );
         }
+
+        // What the lock does not record cannot be out of reach: no lock,
+        // and a lock that records none of the lane's inputs, hold under a
+        // tracked digest function too. Withholding there would be for
+        // good, because no refresh adds a record.
+        assert_eq!(found(&ModuleLock::Absent, input, true), (0, "holds", false));
+        let unrecorded = &["other.lock"][..];
+        for digest_function in [false, true] {
+            let found = found(&sha256, unrecorded, digest_function);
+            assert_eq!((found.1, found.2), ("holds", false), "{digest_function}");
+        }
+        let updated = lock("module_lock/stale-repair/bazel-8.8.2/updated");
+        assert_eq!(found(&updated, unrecorded, true).1, "holds");
+        // A family-A lock hashes the root module file, which is a record
+        // of its own.
+        let family_a = lock("probe_vectors/lockfile/recorded-inputs/bazel-6.6.0/fresh/root");
+        let root =
+            bytes("probe_vectors/lockfile/recorded-inputs/bazel-6.6.0/fresh/root.MODULE.bazel");
+        let files = view(&[(ROOT_MODULE, &root)]);
+        let root_proof = |digest_function| Proof {
+            digest_function,
+            ..proof(&[ROOT_MODULE], &[], None)
+        };
+        assert_eq!(
+            evidence(&family_a, &files, &root_proof(false)),
+            Evidence::Holds
+        );
+        let tracked = evidence(&family_a, &files, &root_proof(true));
+        assert!(
+            matches!(tracked, Evidence::Incomparable { .. }),
+            "{tracked:?}"
+        );
+        // And an unreadable lock is evidence of nothing either way.
+        let unreadable = evidence(&ModuleLock::Unreadable, &files, &root_proof(true));
+        assert!(
+            matches!(unreadable, Evidence::Pending { .. }),
+            "{unreadable:?}"
+        );
+    }
+
+    /// A removal always changes the listing of the file's directory, and
+    /// a creation does when the lane says so. On a lock that records the
+    /// listing of the root (`path.readdir()`), both stale the entry
+    /// although no recorded file changes.
+    #[test]
+    fn a_created_or_removed_file_stales_a_recorded_listing() {
+        let listing = lock("module_lock/listing/9.3.2");
+        let listed = |path: &str| DerivedState::RecordedDir {
+            path: path.to_string(),
+            extension: TOY_ID.to_string(),
+            platform: GENERAL.to_string(),
+        };
+        let rows = |write: Write<'_>| stale(&listing, &writes(&[write]));
+        let at = line("9.3.2");
+        let refused = |write: Write<'_>| {
+            let edit = [write];
+            decide(&listing, &writes(&edit), LockUse::Frozen, &cx(&at)).builds_fail()
+        };
+        let root = [listed("")];
+
+        // Removed: the file is the entry that goes, with or without the
+        // lane saying so; or the directory it was the last file of.
+        let removed = Write::removed("requirements.txt", None);
+        assert_eq!(rows(removed), root);
+        assert!(refused(removed));
+        let forgotten = Write {
+            after: After::Removed,
+            ..Write::changed("requirements.txt")
+        };
+        assert_eq!(forgotten.entry_change, None);
+        assert_eq!(rows(forgotten), root);
+        assert!(refused(forgotten));
+        let with_its_directory = Write::removed(".socket/bazel/index.json", Some(".socket"));
+        assert_eq!(rows(with_its_directory), root);
+        // The file's own directory stays, and it is one no listing covers.
+        let below = Write::removed(".socket/bazel/index.json", None);
+        assert_eq!(rows(below), []);
+        assert!(!refused(below));
+        // `third_party` is listed too.
+        let listed_below = Write::removed("third_party/new.lock", None);
+        assert_eq!(rows(listed_below), [listed("third_party")]);
+
+        // Created: the new entry is the file, or the first directory that
+        // did not exist.
+        let created = Write::created("pnpm-workspace.yaml", b"packages: []\n", None);
+        assert_eq!(rows(created), root);
+        assert!(refused(created));
+        let in_a_new_directory = Write::created(".socket/bazel/index.json", b"{}", Some(".socket"));
+        assert_eq!(rows(in_a_new_directory), root);
+        let in_an_old_one = Write::created(".socket/bazel/index.json", b"{}", None);
+        assert_eq!(rows(in_an_old_one), []);
+        // An edit of an existing file changes no listing.
+        assert_eq!(rows(Write::bytes("requirements.txt", b"six==1.17.0\n")), []);
+        assert_eq!(rows(Write::changed("requirements.txt")), []);
     }
 
     /// The rows a recognizer declares. A crate lock digest and a lock
@@ -1555,11 +2511,12 @@ mod tests {
             hub: text("crates"),
             system: DeclSystem::Bzlmod,
         };
-        let check = |pip_compile| DerivedState::LockCheck {
+        let check = |kind| DerivedState::LockCheck {
             target: text("//third_party/py:requirements"),
             input: text("requirements_lock.txt"),
-            pip_compile,
+            kind,
         };
+        let pip_compile = LockCheckKind::PipCompile { dot_test: Tri::No };
         let cache_file = ".aspect/rules/external_repository_action_cache/npm_translate_lock_x";
         let cache_line = DerivedState::ActionCacheLine {
             file: text(cache_file),
@@ -1607,7 +2564,7 @@ mod tests {
         assert_eq!(outcome(&named), "refused");
 
         // A lock check: refused, with the probe's procedure where one ran.
-        let rows = [check(Some(Tri::No))];
+        let rows = [check(pip_compile)];
         let red = edit(&["requirements_lock.txt"], &rows, &[]);
         assert_eq!(red.reason(), Some(Reason::LockCheckPresent));
         let remedy = remedy_of(&red);
@@ -1616,13 +2573,77 @@ mod tests {
             .text()
             .contains("`//third_party/py:requirements_test`"));
         assert_eq!(red.run_required(), None);
-        let rows = [check(None)];
-        let remedy = remedy_of(&edit(&["requirements_lock.txt"], &rows, &[]));
+        // Every lock check is refused, and only the checks whose update
+        // resolves the lock again are said to drop the pin: a rules_uv
+        // `pip_compile` and `lock`.
+        let rows = [check(LockCheckKind::Erasing)];
+        let red = edit(&["requirements_lock.txt"], &rows, &[]);
+        assert_eq!(red.reason(), Some(Reason::LockCheckPresent));
+        let remedy = remedy_of(&red);
         assert!(remedy.command.is_empty() && remedy.snippet().is_none());
         assert!(remedy.text().contains("drops the pin"));
         assert_eq!(
             outcome(&edit(&["requirements_other.txt"], &rows, &[])),
             "works"
+        );
+        // A gazelle manifest: the pin by hand, then the manifest's own
+        // update, which rewrites the manifest alone (design 6).
+        let rows = [check(LockCheckKind::GazelleManifest)];
+        let red = edit(&["requirements_lock.txt"], &rows, &[]);
+        assert_eq!(red.reason(), Some(Reason::LockCheckPresent));
+        let remedy = remedy_of(&red);
+        assert_eq!(
+            remedy,
+            remedy::gazelle_manifest("//third_party/py:requirements")
+        );
+        assert_eq!(
+            remedy.command,
+            "bazel run //third_party/py:requirements.update"
+        );
+        assert_eq!(remedy.steps.len(), 2);
+        assert!(remedy.steps[1].contains("`bazel run //third_party/py:requirements.update`"));
+        assert!(
+            !remedy.text().contains("drops the pin"),
+            "{}",
+            remedy.text()
+        );
+        assert_eq!(red.run_required(), None);
+        // A manifest beside another check is not "a manifest alone": the
+        // check whose update is hardest on the pin decides, in whatever
+        // order the recognizer declares them.
+        let manifest = check(LockCheckKind::GazelleManifest);
+        let generated = check(LockCheckKind::RequirementsBzl);
+        let erasing = check(LockCheckKind::Erasing);
+        for (rows, hardest) in [
+            ([manifest.clone(), check(pip_compile)], check(pip_compile)),
+            ([check(pip_compile), manifest.clone()], check(pip_compile)),
+            ([manifest.clone(), erasing.clone()], erasing.clone()),
+            ([check(pip_compile), erasing.clone()], erasing.clone()),
+            ([manifest.clone(), generated.clone()], generated.clone()),
+            ([generated.clone(), check(pip_compile)], check(pip_compile)),
+        ] {
+            let red = edit(&["requirements_lock.txt"], &rows, &[]);
+            let InterimState::Red { what, .. } = &red.interim else {
+                panic!("{red:?}");
+            };
+            assert_eq!(what, &hardest, "{rows:?}");
+            assert_eq!(red.stale, rows);
+            let alone = edit(&["requirements_lock.txt"], &[hardest], &[]);
+            assert_eq!(remedy_of(&red), remedy_of(&alone), "{rows:?}");
+        }
+        // A checked-in `requirements.bzl`: the project's own target, which
+        // keeps the pin.
+        let rows = [check(LockCheckKind::RequirementsBzl)];
+        let red = edit(&["requirements_lock.txt"], &rows, &[]);
+        assert_eq!(red.reason(), Some(Reason::LockCheckPresent));
+        let remedy = remedy_of(&red);
+        assert_eq!(remedy, remedy::requirements_bzl());
+        assert!(remedy.command.is_empty() && remedy.snippet().is_none());
+        assert!(remedy.text().contains("does not drop the pin"));
+        assert!(
+            !remedy.text().contains("drops the pin"),
+            "{}",
+            remedy.text()
         );
 
         // Values a lane recomputes: stale only when it does not.
@@ -1647,7 +2668,7 @@ mod tests {
                 "{row:?}"
             );
         }
-        assert!(!crate_lock.repairable() && !check(None).repairable());
+        assert!(!crate_lock.repairable() && !check(pip_compile).repairable());
         assert!(crate_lock.gates_vex() && input("a", "b", "c").in_lock());
     }
 }
