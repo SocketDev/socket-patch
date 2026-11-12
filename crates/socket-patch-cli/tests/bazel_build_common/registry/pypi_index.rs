@@ -13,14 +13,21 @@
 //!   WORKSPACE `pip_parse`). pip runs `--isolated` and fetches by itself,
 //!   so no rewrite reaches it: its index sits under a prefix of its own
 //!   and links back to this server. Such a fixture commits `extra_pip_args
-//!   = ["--index-url", ...]`; `--repo_env=PIP_INDEX_URL=` alone leaks to
-//!   pypi.org.
+//!   = ["--index-url", ...]`: with this server's address written over a
+//!   placeholder in the workspace copy, or, where the pin has `envsubst`,
+//!   as `${PIP_INDEX_URL:-https://pypi.org/simple}` beside `envsubst =
+//!   ["PIP_INDEX_URL"]`. Only that second form reads the variable.
+//!   `--repo_env=PIP_INDEX_URL=` without it leaks to pypi.org, so a test
+//!   passes the variable to no other fixture.
 //!
 //! rules_python >= 2.0 also asks the index for the about 31 packages of
 //! its own `rules_python_publish_deps` hub on every evaluation of the
 //! `pip` extension. Those pages are not emulated: a cell rewrites only the
 //! URLs [`mount`] returns and leaves the rest of `pypi.org` on its
-//! allowlist (DESIGN 9.3, the downloader row).
+//! allowlist (DESIGN 9.3, the downloader row), and its fixture lists
+//! `pypi.org` among its hosts. A cell under the rewrite-everything config
+//! needs those pages served; that is the work of the package that adds
+//! such a cell.
 
 use super::super::fixture_server::FixtureServer;
 use super::pypi_files::Distribution;

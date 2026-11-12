@@ -23,7 +23,7 @@
       "fixture": "heavy/rules_rs/bzlmod/e9-multi",
       "test": "bazel_canary_baseline_rules_rs_bzlmod_e9_multi",
       "system": "bzlmod",
-      "shape": "two registry-sourced versions of one crate name, consumed through the versioned hub aliases a vendoring retags",
+      "shape": "two registry-sourced versions of one crate name: 1.0.15 behind the plain hub alias, which survives a vendoring, and 0.4.8 behind the versioned alias a vendoring retags",
       "pins": {"rules_rs": "0.2.2"},
       "registries": [],
       "fetch": "downloader",

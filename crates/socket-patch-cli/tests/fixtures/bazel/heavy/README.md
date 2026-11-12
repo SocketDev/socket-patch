@@ -33,15 +33,35 @@ The tests in `baseline_heavy.rs` that need no Bazel enforce these.
   fixture is named for. Another module can lift a declared version (Bazel 9.3.2
   lifts a bare `rules_python` 1.0.0 to 1.7.0), and Bazel 9.3.2 rejects an
   override below the declared one.
-- No `MODULE.bazel.lock` and no `bazel-*` link in a workspace: Bazel owns both.
+- No `MODULE.bazel.lock` and no `bazel-*` link at the root of a workspace:
+  Bazel owns both. No fixture commits a lock today. One that a test needs goes
+  to `locks/v<lockFileVersion>[/<os>]/MODULE.bazel.lock`. It is written by
+  `bazel mod deps --lockfile_mode=update` under the exact Bazel release, against
+  `https://bcr.bazel.build/`, once per OS key its cells run, and never taken
+  from a build or from a run against a `file://` mirror. Bazel 7.7.0 is never
+  used for it: that release writes absolute `file:///` registry keys.
 - No loopback address in a committed file. Where a tool that is not Bazel's
   downloader needs the fixture server (pip's `--index-url`, also the one
   pip-compile gets through `extra_args`), the file holds
   `http://socket-fixture.invalid` and names itself under `substitute` in
   `MATRIX.json`; the harness writes the server's address into the workspace
   copy.
+- pip gets its index from a committed `--index-url`, never from
+  `--repo_env=PIP_INDEX_URL=` alone: pip runs `--isolated` and ignores the
+  variable. The pip-mode fixtures here use the placeholder above. A pin with
+  `envsubst` (probed on rules_python 1.9.2 only) may instead commit `envsubst =
+  ["PIP_INDEX_URL"]` with `${PIP_INDEX_URL:-https://pypi.org/simple}`; the
+  harness passes the variable to such a fixture and to no other.
 - Locks keep production URLs (`https://pypi.org/simple`,
   `https://files.pythonhosted.org/...`, `proxy.golang.org` through `GOPROXY`).
+- A rules_python >= 2.0 fixture lists `pypi.org` under `hosts`: the pip
+  extension reads the index pages of rules_python's own
+  `rules_python_publish_deps` hub (about 31) from the real index, which no stub
+  serves.
+- A cell is a pairing that ran. rules_pycross 2.x has no cell below Bazel 8 and
+  rules_rs none below 8.4 (neither loads there); a pairing no probe ran
+  (aspect_rules_py outside 8.8.2 and 9.3.2, rules_rs outside 9.3.2) carries the
+  evidence `unverified`. A fixture on rules_go 0.65.0 downloads Go SDK 1.26.0.
 
 ## `MATRIX.json`
 
@@ -96,3 +116,15 @@ digests. The Rust fixtures use the real crates `cfg-if` and `itoa` from
 crates.io, because under crate_universe cargo itself reads the index and no
 rewrite reaches it; `gazelle_workspace/workspace/e7-seed` uses the real module
 `github.com/pmezard/go-difflib`, which is the point of that fixture.
+
+`rules_rs/bzlmod/e9-multi` holds two registry versions of `itoa`. Its targets
+reach 1.0.15 through the plain hub alias `@crates//:itoa`, which rules_rs gives
+to the highest version a workspace member depends on, and 0.4.8 through
+`@crates//:itoa-0.4.8`. Vendoring a crate retags its version and with it the
+versioned alias, so the same tree serves both cells of the vendored lane: a
+vendored 1.0.15 beside a registry 0.4.8 leaves every label valid, and a vendored
+0.4.8 would break one.
+
+A fake Socket API that grants the Go module takes the artifact's `integrity`
+from `goproxy::Module::grant_integrity` (`sha512`, without which a vendored
+grant is refused, and the two `go.sum` hashes the hosted rewriter needs).
