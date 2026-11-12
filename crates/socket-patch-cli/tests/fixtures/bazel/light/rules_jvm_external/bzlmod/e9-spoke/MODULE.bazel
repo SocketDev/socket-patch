@@ -1,0 +1,29 @@
+module(name = "socket_fixture_rules_jvm_external")
+
+bazel_dep(name = "rules_jvm_external", version = "7.2")
+bazel_dep(name = "rules_java", version = "9.3.0")
+
+# The ruleset under test stays at the version this fixture is written for.
+single_version_override(
+    module_name = "rules_jvm_external",
+    version = "7.2",
+)
+
+maven = use_extension("@rules_jvm_external//:extensions.bzl", "maven")
+maven.install(
+    artifacts = [
+        "org.slf4j:slf4j-simple:1.7.36",
+        "com.google.code.gson:gson:2.10.1",
+    ],
+    fail_if_repin_required = True,
+    lock_file = "//:maven_install.json",
+    repositories = ["https://repo1.maven.org/maven2", "https://maven.google.com"],
+)
+
+# The artifact repository of slf4j-api is imported by its versioned name, and
+# `//:socket_probe` reads the registry jar from its `file` target. A rewrite of
+# the lock to another version renames that repository, and this `use_repo`
+# then fails the build (`module extension ... does not generate repository
+# "org_slf4j_slf4j_api_1_7_36", yet it is imported`): the shape a hosted
+# rewrite must refuse.
+use_repo(maven, "maven", "org_slf4j_slf4j_api_1_7_36")

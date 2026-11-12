@@ -1,0 +1,22 @@
+load("@rules_java//java:defs.bzl", "java_binary")
+load("//:probe.bzl", "socket_probe")
+
+# Tiers 0 and 1: the registry jar itself, from the versioned artifact
+# repository. No Java toolchain is involved.
+socket_probe(
+    name = "socket_probe",
+    srcs = ["@org_slf4j_slf4j_api_1_7_36//file"],
+)
+
+# Tier 2: a program that loads a class from slf4j-api and prints whether
+# the jar it came from carries the patch marker.
+java_binary(
+    name = "consumer",
+    srcs = ["src/App.java"],
+    main_class = "App",
+    runtime_deps = ["@maven//:org_slf4j_slf4j_simple"],
+    deps = [
+        "@maven//:com_google_code_gson_gson",
+        "@maven//:org_slf4j_slf4j_api",
+    ],
+)

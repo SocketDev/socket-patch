@@ -1,10 +1,14 @@
 load("@rules_java//java:defs.bzl", "java_binary")
 load("//:probe.bzl", "socket_probe")
 
-# Tiers 0 and 1: the registry jar itself, from the artifact repository.
+# Tier 0: the versionless hub label, the one name of the artifact that a rewrite
+# of the lock leaves alone. A query over it lists the registry jar under the
+# artifact repository's `file/` directory and fetches no other artifact and no
+# JDK. Building this target analyses a `jvm_import`, and with it a Java
+# toolchain, so the proof for this fixture stops at the query.
 socket_probe(
     name = "socket_probe",
-    srcs = ["@org_slf4j_slf4j_api_1_7_36//file"],
+    srcs = ["@maven//:org_slf4j_slf4j_api"],
 )
 
 # Tier 2: a program that loads a class from slf4j-api and prints whether

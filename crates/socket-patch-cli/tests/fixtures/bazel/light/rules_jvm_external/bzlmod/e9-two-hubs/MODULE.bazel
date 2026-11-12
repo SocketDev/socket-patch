@@ -30,7 +30,8 @@ maven.install(
     repositories = ["https://repo1.maven.org/maven2"],
 )
 
-# `org_slf4j_slf4j_api_1_7_36` is the artifact repository of slf4j-api: the proof
-# ladder reads the registry jar from its `file` target, because anything
-# built through `@maven//` pulls a JDK and yields a re-stamped jar.
-use_repo(maven, "maven", "org_slf4j_slf4j_api_1_7_36", "other")
+# Only the hubs are imported. The artifact repository of slf4j-api is named after
+# the version (`org_slf4j_slf4j_api_1_7_36`), so a rewrite of the lock to another
+# version renames it: a `use_repo` of it would then name a repository the
+# extension no longer generates. `e9-spoke` keeps that shape.
+use_repo(maven, "maven", "other")

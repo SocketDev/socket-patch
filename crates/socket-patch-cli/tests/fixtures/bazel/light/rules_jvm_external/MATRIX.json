@@ -23,16 +23,22 @@
       "cells": [
         {
           "bazel": "9.3.2",
+          "proof": 0,
           "tier": "nightly"
         },
         {
           "bazel": "8.8.2",
+          "proof": 0,
           "tier": "nightly"
         },
         {
           "bazel": "7.7.2",
+          "proof": 0,
           "tier": "nightly"
         }
+      ],
+      "tier0_roots": [
+        "@maven//:org_slf4j_slf4j_api"
       ]
     },
     {
@@ -46,12 +52,50 @@
       "cells": [
         {
           "bazel": "9.3.2",
+          "proof": 0,
           "tier": "nightly"
         },
         {
           "bazel": "8.8.2",
+          "proof": 0,
           "tier": "nightly"
         }
+      ],
+      "tier0_roots": [
+        "@maven//:org_slf4j_slf4j_api",
+        "@other//:org_slf4j_slf4j_api"
+      ],
+      "load": [
+        "@other//:all"
+      ]
+    },
+    {
+      "path": "bzlmod/e9-spoke",
+      "test": "bazel_canary_baseline_rules_jvm_external_bzlmod_e9_spoke",
+      "system": "bzlmod",
+      "pins": {
+        "rules_jvm_external": "7.2"
+      },
+      "shape": "maven_install.json v3 whose versioned artifact repository is imported with use_repo and named by //:socket_probe: a rewrite of the lock to another version renames that repository and breaks the build, so this is the input of a refusal, never of a hosted cell",
+      "cells": [
+        {
+          "bazel": "9.3.2",
+          "proof": 1,
+          "tier": "nightly"
+        },
+        {
+          "bazel": "8.8.2",
+          "proof": 1,
+          "tier": "nightly"
+        },
+        {
+          "bazel": "7.7.2",
+          "proof": 1,
+          "tier": "nightly"
+        }
+      ],
+      "versioned_names": [
+        "org_slf4j_slf4j_api_1_7_36"
       ]
     },
     {
@@ -65,8 +109,12 @@
       "cells": [
         {
           "bazel": "8.8.2",
+          "proof": 0,
           "tier": "nightly"
         }
+      ],
+      "tier0_roots": [
+        "@maven//:org_slf4j_slf4j_api"
       ]
     },
     {
@@ -80,8 +128,12 @@
       "cells": [
         {
           "bazel": "7.7.2",
+          "proof": 0,
           "tier": "nightly"
         }
+      ],
+      "tier0_roots": [
+        "@maven//:org_slf4j_slf4j_api"
       ]
     },
     {
@@ -92,13 +144,16 @@
         "rules_jvm_external": "7.2"
       },
       "shape": "an unpinned hub: no lock file, Coursier resolves on every cold fetch from a loopback repository; the shape the unpinned_hub guard refuses",
+      "fetch": "tool",
       "cells": [
         {
           "bazel": "9.3.2",
+          "proof": 1,
           "tier": "nightly"
         },
         {
           "bazel": "8.8.2",
+          "proof": 1,
           "tier": "nightly"
         }
       ],

@@ -3,10 +3,11 @@
 //!
 //! One canary per fixture workspace under `fixtures/bazel/light/<ruleset>/`. It
 //! proves that the untouched fixture is a working build on the Bazel it is listed
-//! for, which every later test of that fixture starts from: `//:socket_probe`
-//! builds, Bazel materialised exactly the mirrored registry artifact (proof tier 0),
-//! `//:consumer` loads, the ruleset resolved to the version `MATRIX.json` pins, and
-//! the build wrote nothing into the workspace but Bazel's own files. The report it
+//! for, which every later test of that fixture starts from: Bazel materialised
+//! exactly the mirrored registry artifact (proof tier 0), `//:socket_probe` builds
+//! where the cell's `proof` says so, `//:consumer` loads, the ruleset resolved to
+//! the version `MATRIX.json` pins, a committed lock passes an `error`-mode build,
+//! and Bazel wrote nothing into the workspace but its own files. The report it
 //! writes carries the resolved versions and the hosts the fixture server was asked
 //! for.
 //!
@@ -21,9 +22,23 @@
 //! therefore needs a warm repository cache: with `SOCKET_PATCH_BAZEL_E2E_OFFLINE`
 //! or `_REAL_REGISTRIES` set a baseline canary does not apply and skips.
 //!
+//! Credentials. A canary proves nothing about them. The package requests its
+//! fixture server logs arrive through a downloader rewrite, and Bazel gives a
+//! rewritten URL no header of the original one (only what the new URL's own
+//! userinfo or a netrc entry says), so that log holds no `Authorization` header
+//! whatever a fixture commits. "No credential left the machine" is a lane's
+//! assertion, on a cold cell, through `FixtureServer::assert_no_header`.
+//!
+//! Other modules of the suite. A lane package owns `light/<ruleset>/` and its own
+//! module here, not this file. It lists the cells of its tests under a fixture's
+//! `lanes` key, which the checks below hold to a shape and no canary runs; for a
+//! fixture it adds, it declares the canary in its own module as a plain
+//! `fn bazel_canary_baseline_<ruleset>_<path>()` that calls [`baseline`]. The
+//! schema, [`mount`] and [`downloader_rules`] are `pub(crate)` for those modules.
+//!
 //! The tests without `#[ignore]` need no Bazel: they hold `MATRIX.json`, the
-//! fixture trees and the registry mirror to each other, and exercise the four
-//! registry modules against a live fixture server.
+//! fixture trees, the committed locks and the registry mirror to each other, and
+//! exercise the four registry modules against a live fixture server.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read as _, Write as _};
@@ -33,23 +48,56 @@ use serde::Deserialize;
 use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 
-use crate::bazel_build_common::env::{self, Group, System};
+use crate::bazel_build_common::env::{self, Group, System, Version};
 use crate::bazel_build_common::fixture_server::FixtureServer;
+use crate::bazel_build_common::invoke::{Options, Run};
 use crate::bazel_build_common::probe_report;
-use crate::bazel_build_common::proof::{Anchor, SourceFile, CONSUMER, PROBE};
+use crate::bazel_build_common::proof::{parse_locations, Anchor, SourceFile, CONSUMER, PROBE};
 use crate::bazel_build_common::registry::{gem, maven, npm, nuget};
 use crate::bazel_build_common::server::Cell;
 use crate::bazel_build_common::workspace::{fixtures_root, MODULE_LOCK, PROBE_BZL};
 use crate::bazel_common::snapshot::{assert_same_tree_but_bazel_owned, snapshot, Entry};
 
+/// The registry modules a matrix may name under `registries`: what [`mount`] serves.
+pub(crate) const REGISTRIES: &[&str] = &["npm", "maven", "gem", "nuget"];
+
+/// The CI tiers a cell may name.
+const TIERS: &[&str] = &["nightly", "pr"];
+
+/// The classes a cell's `outcome` may name.
+const OUTCOMES: &[&str] = &["WORKS", "WORKS-AFTER"];
+
+/// Who fetches a fixture's packages: Bazel's downloader, or a tool it runs.
+const FETCHERS: &[&str] = &["downloader", "tool"];
+
+/// The name every baseline canary starts with.
+const CANARY_PREFIX: &str = "bazel_canary_baseline_";
+
+/// The prefixes a test under a fixture's `lanes` key may have: the real-Bazel
+/// tests of the lane packages.
+const LANE_PREFIXES: &[&str] = &[
+    "bazel_guard_",
+    "bazel_agent_",
+    "bazel_hosted_",
+    "bazel_vendor_",
+    "bazel_canary_",
+];
+
+/// The highest proof tier a baseline canary climbs: it builds the probe and
+/// never runs the consumer.
+const BASELINE_PROOF: u8 = 1;
+
+/// The top of the proof ladder: 0 fetch, 1 build the probe, 2 run the consumer.
+const TOP_PROOF: u8 = 2;
+
 /// `fixtures/bazel/light`.
-fn light() -> PathBuf {
+pub(crate) fn light() -> PathBuf {
     fixtures_root().join("light")
 }
 
 /// The mirror the registry modules serve: `<host>/<path>` for every artifact a
 /// light fixture pins.
-fn mirror() -> PathBuf {
+pub(crate) fn mirror() -> PathBuf {
     light().join("registry")
 }
 
@@ -58,14 +106,14 @@ fn mirror() -> PathBuf {
 /// does not act on cannot sit in a matrix and look honoured.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Matrix {
-    group: String,
-    ruleset: String,
+pub(crate) struct Matrix {
+    pub(crate) group: String,
+    pub(crate) ruleset: String,
     /// The registry modules that serve this ruleset's packages.
-    registries: Vec<String>,
-    /// What `//:socket_probe` of every fixture of the ruleset must hold.
-    probe: Vec<ProbeFile>,
-    fixtures: Vec<Fixture>,
+    pub(crate) registries: Vec<String>,
+    /// What tier 0 must find in every fixture of the ruleset.
+    pub(crate) probe: Vec<ProbeFile>,
+    pub(crate) fixtures: Vec<Fixture>,
 }
 
 /// One file the proof ladder anchors on, by the kind of
@@ -73,7 +121,7 @@ struct Matrix {
 /// `artifact` is its path in the mirror, which is also its URL without the scheme.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields, tag = "anchor", rename_all = "snake_case")]
-enum ProbeFile {
+pub(crate) enum ProbeFile {
     Integrity {
         label: String,
         artifact: String,
@@ -102,70 +150,156 @@ enum ProbeFile {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Fixture {
+pub(crate) struct Fixture {
     /// `<bzlmod|workspace>/<era>[-<variant>]`, under the ruleset's directory.
-    path: String,
+    pub(crate) path: String,
     /// The canary of this fixture.
-    test: String,
-    system: String,
+    pub(crate) test: String,
+    pub(crate) system: String,
     /// Ruleset module (or WORKSPACE repository) name to the version the fixture
     /// is written for.
-    pins: BTreeMap<String, String>,
+    pub(crate) pins: BTreeMap<String, String>,
     /// What sets this fixture apart, for a reader of the matrix.
-    shape: String,
-    cells: Vec<CellSpec>,
+    pub(crate) shape: String,
+    /// Who fetches the fixture's packages: `downloader` (Bazel's, which the
+    /// rewrite reaches) or `tool` (a program Bazel runs, which needs a loopback
+    /// origin of its own).
+    #[serde(default = "downloader")]
+    pub(crate) fetch: String,
+    /// The Bazel versions the baseline canary built the fixture on.
+    pub(crate) cells: Vec<CellSpec>,
+    /// The labels tier 0 queries the dependencies of, where `//:socket_probe`
+    /// is not the root: each must list every probed file.
+    #[serde(default)]
+    pub(crate) tier0_roots: Vec<String>,
+    /// Labels in external repositories the canary also queries, so that a
+    /// repository nothing else loads is fetched (and its pin checked) too.
+    #[serde(default)]
+    pub(crate) load: Vec<String>,
+    /// A text the canary's build must print.
+    #[serde(default)]
+    pub(crate) build_stderr: Option<BuildStderr>,
     /// Bazel version to a committed `MODULE.bazel.lock`, relative to the
     /// fixture, for a fixture whose shape is a fact of that lock.
     #[serde(default)]
-    module_lock: BTreeMap<String, String>,
+    pub(crate) module_lock: BTreeMap<String, String>,
     /// A `moduleExtensions` key the lock must hold after the build: the
     /// extension is recorded, so an edit of the file it reads stales the lock.
     #[serde(default)]
-    recorded_extension: Option<String>,
-    /// What `//:socket_probe` holds in this fixture, where it differs from the
+    pub(crate) recorded_extension: Option<String>,
+    /// A `moduleExtensions` key the lock must not hold after the build: the
+    /// extension is reproducible, so an edit of the file it reads stales nothing.
+    #[serde(default)]
+    pub(crate) not_recorded_extension: Option<String>,
+    /// What tier 0 must find in this fixture, where it differs from the
     /// ruleset's.
     #[serde(default)]
-    probe: Option<Vec<ProbeFile>>,
+    pub(crate) probe: Option<Vec<ProbeFile>>,
     /// The Maven repository URL the fixture commits for a client Bazel's
     /// downloader does not carry (Coursier, in an unpinned hub). It is loopback
     /// on a fixed port; the canary serves the mirror under its own port and
     /// writes that into its copy of `MODULE.bazel`.
     #[serde(default)]
-    loopback_repository: Option<String>,
+    pub(crate) loopback_repository: Option<String>,
+    /// The version-bearing names (`<group>_<artifact>_<version>`: an artifact
+    /// repository, a hub's versioned alias) the workspace's own Starlark files
+    /// use. A rewrite of the lock to another version renames them, so a fixture
+    /// that lists one is the input of a refusal.
+    #[serde(default)]
+    pub(crate) versioned_names: Vec<String>,
+    /// The cells of the lane tests that run on this fixture. Checked for
+    /// shape here; run by the lane's own module, never by the canary.
+    #[serde(default)]
+    pub(crate) lanes: Vec<Lane>,
+}
+
+fn downloader() -> String {
+    "downloader".to_string()
+}
+
+/// One test of a lane package on a fixture, and where it is claimed.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct Lane {
+    /// A `bazel_guard_`, `bazel_agent_`, `bazel_hosted_`, `bazel_vendor_` or
+    /// `bazel_canary_` test, declared in a module of this suite.
+    pub(crate) test: String,
+    /// A subset of the fixture's own Bazel versions: a lane runs where the
+    /// baseline did.
+    pub(crate) cells: Vec<CellSpec>,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct CellSpec {
-    bazel: String,
+pub(crate) struct CellSpec {
+    pub(crate) bazel: String,
+    /// The highest tier of the proof ladder the test climbs here: 0 fetch, 1
+    /// build the probe, 2 run the consumer. A baseline canary stops at 1.
+    pub(crate) proof: u8,
     /// `nightly` or `pr`: which CI tier runs the cell.
-    tier: String,
+    pub(crate) tier: String,
     /// The class the ruleset's hosted lane must reach on this cell, where a
     /// probe fixed it (`WORKS`, `WORKS-AFTER`).
     #[serde(default)]
-    outcome: Option<String>,
+    pub(crate) outcome: Option<String>,
+}
+
+/// What the stderr of a fixture's first build must hold: the evidence that a
+/// ruleset took a path nothing else in the canary can tell apart.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct BuildStderr {
+    pub(crate) contains: String,
+    /// The host systems (`std::env::consts::OS`) on which the ruleset does not
+    /// print it.
+    #[serde(default)]
+    pub(crate) not_on: Vec<String>,
+}
+
+impl BuildStderr {
+    fn applies_on(&self, os: &str) -> bool {
+        !self.not_on.iter().any(|name| name == os)
+    }
 }
 
 impl Matrix {
-    fn load(ruleset: &str) -> Matrix {
+    pub(crate) fn parse(text: &str) -> Result<Matrix, String> {
+        serde_json::from_str(text).map_err(|e| e.to_string())
+    }
+
+    pub(crate) fn load(ruleset: &str) -> Matrix {
         let path = light().join(ruleset).join("MATRIX.json");
         let text = std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
-        let matrix: Matrix =
-            serde_json::from_str(&text).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        let matrix = Matrix::parse(&text).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
         assert_eq!(matrix.ruleset, ruleset, "{}", path.display());
         assert_eq!(matrix.group, Group::Light.name(), "{}", path.display());
         matrix
     }
 
-    fn fixture(&self, path: &str) -> &Fixture {
+    pub(crate) fn fixture(&self, path: &str) -> &Fixture {
         let found = self.fixtures.iter().find(|fixture| fixture.path == path);
         found.unwrap_or_else(|| panic!("{}/MATRIX.json lists no fixture {path}", self.ruleset))
     }
 }
 
+impl Fixture {
+    /// What tier 0 must find: the fixture's own list, or the ruleset's.
+    pub(crate) fn probe<'a>(&'a self, matrix: &'a Matrix) -> &'a [ProbeFile] {
+        self.probe.as_deref().unwrap_or(&matrix.probe)
+    }
+
+    /// The labels tier 0 queries the dependencies of.
+    pub(crate) fn tier0_roots(&self) -> Vec<&str> {
+        if self.tier0_roots.is_empty() {
+            return vec![PROBE];
+        }
+        self.tier0_roots.iter().map(String::as_str).collect()
+    }
+}
+
 impl ProbeFile {
-    fn artifact(&self) -> &str {
+    pub(crate) fn artifact(&self) -> &str {
         match self {
             ProbeFile::Integrity { artifact, .. }
             | ProbeFile::Sha256 { artifact, .. }
@@ -175,35 +309,36 @@ impl ProbeFile {
     }
 
     /// The bytes Bazel must have materialised: the mirrored artifact, or the
-    /// one member of it the ruleset keeps.
-    fn expected(&self) -> Vec<u8> {
+    /// one member of it the ruleset keeps. `Err` when the mirror lacks either.
+    pub(crate) fn expected(&self) -> Result<Vec<u8>, String> {
         let path = mirror().join(self.artifact());
-        let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        let at = |why: String| format!("{}: {why}", path.display());
+        let bytes = std::fs::read(&path).map_err(|e| at(e.to_string()))?;
         let member = match self {
             ProbeFile::Unpacked { member, .. } => {
-                let member = npm::member(&bytes, &format!("package/{member}"));
-                return member.unwrap_or_else(|why| panic!("{}: {why}", path.display()));
+                return npm::member(&bytes, &format!("package/{member}")).map_err(at);
             }
             ProbeFile::Sha256 {
                 member: Some(member),
                 ..
             } => member,
-            _ => return bytes,
+            _ => return Ok(bytes),
         };
-        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes))
-            .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        let mut archive =
+            zip::ZipArchive::new(std::io::Cursor::new(bytes)).map_err(|e| at(e.to_string()))?;
         let mut file = archive
             .by_name(member)
-            .unwrap_or_else(|e| panic!("{}: {member}: {e}", path.display()));
+            .map_err(|e| at(format!("{member}: {e}")))?;
         let mut out = Vec::new();
-        file.read_to_end(&mut out).expect("read a zip member");
-        out
+        file.read_to_end(&mut out)
+            .map_err(|e| at(format!("{member}: {e}")))?;
+        Ok(out)
     }
 
-    /// Tier 0 for this file: exactly one source file of `//:socket_probe` is it,
+    /// Tier 0 for this file: exactly one of the listed source files is it,
     /// with the expected bytes.
-    fn check(&self, sources: &[SourceFile]) -> Result<PathBuf, String> {
-        let bytes = self.expected();
+    pub(crate) fn check(&self, sources: &[SourceFile]) -> Result<PathBuf, String> {
+        let bytes = self.expected()?;
         let sha256 = hex::encode(Sha256::digest(&bytes));
         match self {
             ProbeFile::Integrity { label, .. } => Anchor::Integrity {
@@ -251,7 +386,7 @@ impl ProbeFile {
 /// Mount the registry modules `names` on `server` and return every URL scope they
 /// own. An unknown name is an error: a matrix that names a registry nobody
 /// serves would have its packages fetched from the real one.
-fn mount(server: &FixtureServer, names: &[String]) -> Vec<String> {
+pub(crate) fn mount(server: &FixtureServer, names: &[String]) -> Vec<String> {
     let mirror = mirror();
     let mut scopes = Vec::new();
     for name in names {
@@ -260,29 +395,34 @@ fn mount(server: &FixtureServer, names: &[String]) -> Vec<String> {
             "maven" => maven::mount(server, &mirror),
             "gem" => gem::mount(server, &mirror),
             "nuget" => nuget::mount(server, &mirror),
-            other => Err(format!("MATRIX.json names an unknown registry {other:?}")),
+            other => Err(format!(
+                "MATRIX.json names an unknown registry {other:?} (known: {REGISTRIES:?})"
+            )),
         };
         scopes.extend(mounted.unwrap_or_else(|why| panic!("{why}")));
     }
     scopes
 }
 
+/// The pattern that matches the URLs of `scope` and no other. A scope is a URL
+/// without its scheme; a trailing `*` makes it a prefix. Bazel matches a
+/// `rewrite` pattern against the whole URL without its scheme.
+fn scope_pattern(scope: &str) -> String {
+    let (literal, tail) = match scope.strip_suffix('*') {
+        Some(prefix) => (prefix, ".*"),
+        None => (scope, ""),
+    };
+    format!("{}{tail}", regex::escape(literal))
+}
+
 /// The downloader config that sends `scopes`, and nothing else, to the fixture
-/// server on `port`. A scope is a URL without its scheme; a trailing `*` makes it
-/// a prefix. Bazel matches a `rewrite` pattern against the whole URL, so each
-/// line covers exactly its scope, and there is no `block`: the ruleset itself
-/// still comes from its real origin.
-fn downloader_rules(scopes: &[String], port: u16) -> String {
+/// server on `port`. Each line covers exactly its scope, and there is no
+/// `block`: the ruleset itself still comes from its real origin.
+pub(crate) fn downloader_rules(scopes: &[String], port: u16) -> String {
     let mut rules = String::new();
     for scope in scopes {
-        let (literal, tail) = match scope.strip_suffix('*') {
-            Some(prefix) => (prefix, ".*"),
-            None => (scope.as_str(), ""),
-        };
-        let pattern = regex::escape(literal);
-        rules.push_str(&format!(
-            "rewrite ({pattern}{tail}) http://127.0.0.1:{port}/$1\n"
-        ));
+        let pattern = scope_pattern(scope);
+        rules.push_str(&format!("rewrite ({pattern}) http://127.0.0.1:{port}/$1\n"));
     }
     rules
 }
@@ -367,15 +507,65 @@ fn resolved_versions(
 }
 
 /// The `moduleExtensions` keys of a `MODULE.bazel.lock`: the extensions whose
-/// result Bazel recorded. Empty for a lock that has none or is not JSON.
-fn recorded_extensions(lock: &[u8]) -> Vec<String> {
-    let lock: Value = serde_json::from_slice(lock).unwrap_or(Value::Null);
+/// result Bazel recorded. Empty for a lock that records none; `Err` for a file
+/// that is not a lock, which would otherwise read as "nothing recorded".
+fn recorded_extensions(lock: &[u8]) -> Result<Vec<String>, String> {
+    let lock: Value =
+        serde_json::from_slice(lock).map_err(|e| format!("{MODULE_LOCK} is not JSON: {e}"))?;
+    if !lock.is_object() {
+        return Err(format!("{MODULE_LOCK} is not a JSON object"));
+    }
     let extensions = lock["moduleExtensions"].as_object();
-    extensions.map_or_else(Vec::new, |map| map.keys().cloned().collect())
+    Ok(extensions.map_or_else(Vec::new, |map| map.keys().cloned().collect()))
+}
+
+/// Whether `keys` hold `extension`. The leading `@@` of the main repository
+/// is not compared: the lock versions spell a root extension with and without it.
+fn records(keys: &[String], extension: &str) -> bool {
+    let bare = |key: &str| key.trim_start_matches('@').to_string();
+    keys.iter().any(|key| bare(key) == bare(extension))
+}
+
+/// The tier-0 query over the dependencies of `root`. It is the query of
+/// `Cell::tier0_sources` for a root other than `//:socket_probe`, kept here until
+/// the harness takes one.
+fn tier0_query(cell: &Cell, root: &str) -> Run {
+    let query = format!(r#"kind("source file", deps({root}))"#);
+    let args = [
+        "--noimplicit_deps",
+        "--notool_deps",
+        "--output=location",
+        query.as_str(),
+    ];
+    cell.bazel("query", &args)
+}
+
+/// Whether the top-level directory `name` of a fixture is data about the
+/// fixture and no part of its workspace: the committed locks, and the goldens
+/// a lane freezes (`expected-agent`, `expected-vendored`, `expected-hosted`).
+/// A golden tree holds build files of its own, and a vendored one a tarball.
+fn fixture_data_dir(name: &str) -> bool {
+    name == "locks" || name.starts_with("expected-")
+}
+
+/// Remove the data directories of a fixture from the workspace copy Bazel
+/// builds. `Cell::copy_fixture` copies the fixture whole.
+pub(crate) fn strip_fixture_data(workspace: &Path) {
+    let entries = std::fs::read_dir(workspace)
+        .unwrap_or_else(|e| panic!("read {}: {e}", workspace.display()));
+    for entry in entries {
+        let entry = entry.expect("dir entry");
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let path = entry.path();
+        if path.is_dir() && fixture_data_dir(&name) {
+            std::fs::remove_dir_all(&path)
+                .unwrap_or_else(|e| panic!("remove {}: {e}", path.display()));
+        }
+    }
 }
 
 /// The canary of the fixture `path` of `ruleset`. See the module documentation.
-fn baseline(test: &str, ruleset: &str, path: &str) {
+pub(crate) fn baseline(test: &str, ruleset: &str, path: &str) {
     let matrix = Matrix::load(ruleset);
     let fixture = matrix.fixture(path);
     assert_eq!(fixture.test, test, "{ruleset}/MATRIX.json, fixture {path}");
@@ -396,15 +586,21 @@ fn baseline(test: &str, ruleset: &str, path: &str) {
         probe_report::skip_na(&cell.report, why);
         return;
     }
+    assert!(
+        spec.proof <= BASELINE_PROOF,
+        "{test}: a baseline canary climbs to proof {BASELINE_PROOF}, the cell says {}",
+        spec.proof
+    );
 
     let source = light().join(ruleset).join(path);
     cell.copy_fixture(&format!("light/{ruleset}/{path}"));
-    // The committed locks are fixture data, not part of the workspace.
-    let _ = std::fs::remove_dir_all(cell.scratch.workspace.join("locks"));
-    if let Some(lock) = fixture.module_lock.get(&version) {
-        let lock = source.join(lock);
-        let bytes = std::fs::read(&lock).unwrap_or_else(|e| panic!("{}: {e}", lock.display()));
-        cell.write_module_lock(&bytes);
+    strip_fixture_data(&cell.scratch.workspace);
+    let committed = fixture.module_lock.get(&version).map(|rel| {
+        let lock = source.join(rel);
+        std::fs::read(&lock).unwrap_or_else(|e| panic!("{}: {e}", lock.display()))
+    });
+    if let Some(bytes) = &committed {
+        cell.write_module_lock(bytes);
     }
 
     let server = FixtureServer::start();
@@ -421,26 +617,68 @@ fn baseline(test: &str, ruleset: &str, path: &str) {
     }
 
     let untouched = snapshot(&cell.scratch.workspace);
-    let build = cell.bazel("build", &[PROBE]);
-    if build.origin_unreachable() {
-        let why = format!("an origin is unreachable:\n{}", build.stderr());
+    let roots = fixture.tier0_roots();
+    // The first command fetches. With a committed lock it is the stale-lock
+    // oracle: an `error`-mode build passes only on a lock that already holds
+    // everything the build evaluates, so the committed file carries the proof
+    // and not a lock Bazel would have written anyway.
+    let first = match (&committed, spec.proof) {
+        (Some(_), _) => cell.error_mode_build(&[PROBE]),
+        (None, 0) => tier0_query(&cell, roots[0]),
+        (None, _) => cell.bazel("build", &[PROBE]),
+    };
+    if first.origin_unreachable() {
+        let why = format!("an origin is unreachable:\n{}", first.stderr());
         probe_report::skip(&cell.report, &why);
         return;
     }
-    assert!(build.ok(), "{test}: {}", build.dump());
+    assert!(first.ok(), "{test}: {}", first.dump());
+    if let Some(expected) = &fixture.build_stderr {
+        if expected.applies_on(std::env::consts::OS) {
+            assert!(
+                first.stderr().contains(&expected.contains),
+                "{test}: the build did not print {:?}:\n{}",
+                expected.contains,
+                first.dump()
+            );
+        }
+    }
+    // Whether `bazel mod deps` leaves the committed lock as it is. Recorded, not
+    // asserted: the lock was made on one OS, and a cell on another may add keys.
+    // (The `mod` command ran on 6.6.0 and later.)
+    let reproduced = match &committed {
+        Some(bytes) if cell.bazel.version.at_least(6, 6, 0) => {
+            let options = Options {
+                lockfile_mode: "update",
+                ..cell.options.clone()
+            };
+            let run = cell.bazel_with(&options, "mod", &["deps"]);
+            assert!(run.ok(), "{test}: {}", run.dump());
+            Some(cell.module_lock().as_ref() == Some(bytes))
+        }
+        _ => None,
+    };
 
-    // Tier 0: the files Bazel materialised for the probe are the mirrored ones.
-    let probe = fixture.probe.as_ref().unwrap_or(&matrix.probe);
-    let sources = cell.tier0_sources();
-    for file in probe {
-        if let Err(why) = file.check(&sources) {
-            panic!("{test}: tier 0: {why}");
+    // Tier 0: the files Bazel materialised are the mirrored ones, from every root.
+    let probe = fixture.probe(&matrix);
+    for root in &roots {
+        let listed = tier0_query(&cell, root);
+        assert!(listed.ok(), "{test}: tier 0 from {root}: {}", listed.dump());
+        let sources = parse_locations(&listed.stdout());
+        for file in probe {
+            if let Err(why) = file.check(&sources) {
+                panic!("{test}: tier 0 from {root}: {why}");
+            }
         }
     }
     // Tier 2 is not run here, but its target must exist and its rule must load.
     let consumer = cell.bazel_ok("query", &["--output=label_kind", CONSUMER]);
     let consumer = consumer.stdout().trim().to_string();
     assert!(consumer.ends_with(CONSUMER), "{test}: {consumer:?}");
+    // A repository neither target loads is fetched here, and its pin checked.
+    for label in &fixture.load {
+        cell.bazel_ok("query", &["--output=label", label]);
+    }
 
     let resolved = resolved_versions(&cell, system, &fixture.pins);
     assert_eq!(
@@ -448,12 +686,21 @@ fn baseline(test: &str, ruleset: &str, path: &str) {
         "{test}: Bazel resolved other ruleset versions than {ruleset}/MATRIX.json pins"
     );
 
-    let recorded = cell.module_lock().map(|lock| recorded_extensions(&lock));
-    if let Some(extension) = &fixture.recorded_extension {
-        let recorded = recorded.as_deref().unwrap_or_default();
-        assert!(
-            recorded.iter().any(|key| key == extension),
-            "{test}: {MODULE_LOCK} does not record {extension}: {recorded:?}"
+    let recorded = cell
+        .module_lock()
+        .map(|lock| recorded_extensions(&lock).unwrap_or_else(|why| panic!("{test}: {why}")));
+    for (extension, expected) in [
+        (&fixture.recorded_extension, true),
+        (&fixture.not_recorded_extension, false),
+    ] {
+        let Some(extension) = extension else { continue };
+        let Some(recorded) = &recorded else {
+            panic!("{test}: Bazel left no {MODULE_LOCK} to look for {extension} in");
+        };
+        assert_eq!(
+            records(recorded, extension),
+            expected,
+            "{test}: {MODULE_LOCK} records {extension}: expected {expected}, the lock has {recorded:?}"
         );
     }
 
@@ -487,12 +734,6 @@ fn baseline(test: &str, ruleset: &str, path: &str) {
             server.assert_requested(url.unwrap_or(file.artifact()), test);
         }
     }
-    let authorization = requests.iter().any(|request| {
-        request
-            .headers
-            .iter()
-            .any(|(name, _)| name == "authorization")
-    });
 
     // A request to the loopback repository carries no host of its own.
     let host = |host: String| match host.as_str() {
@@ -505,12 +746,16 @@ fn baseline(test: &str, ruleset: &str, path: &str) {
     cell.report
         .detail("fixture", format!("light/{ruleset}/{path}"))
         .detail("tier", spec.tier.clone())
+        .detail("proof", spec.proof)
+        .detail("fetch", fixture.fetch.clone())
         .detail("outcome", spec.outcome.clone())
+        .detail("tier0_roots", roots)
+        .detail("loaded", fixture.load.clone())
         .detail("consumer", consumer)
         .detail("cold_repository_cache", cold)
         .detail("fixture_server_requests", requests.len())
-        .detail("authorization_header_sent", authorization)
-        .detail("recorded_extensions", recorded);
+        .detail("recorded_extensions", recorded)
+        .detail("committed_lock_reproduced", reproduced);
     let report = cell.close();
     report.ran();
 }
@@ -527,7 +772,7 @@ macro_rules! canaries {
             }
         )*
 
-        /// `(test, ruleset, fixture path)` of every canary.
+        /// `(test, ruleset, fixture path)` of every canary declared here.
         const CANARIES: &[(&str, &str, &str)] =
             &[$((stringify!($test), $ruleset, $path)),*];
     };
@@ -551,6 +796,7 @@ canaries! {
     bazel_canary_baseline_rules_js_workspace_e6 => ("rules_js", "workspace/e6");
     bazel_canary_baseline_rules_jvm_external_bzlmod_e9 => ("rules_jvm_external", "bzlmod/e9");
     bazel_canary_baseline_rules_jvm_external_bzlmod_e9_two_hubs => ("rules_jvm_external", "bzlmod/e9-two-hubs");
+    bazel_canary_baseline_rules_jvm_external_bzlmod_e9_spoke => ("rules_jvm_external", "bzlmod/e9-spoke");
     bazel_canary_baseline_rules_jvm_external_bzlmod_e8_insertion => ("rules_jvm_external", "bzlmod/e8-insertion");
     bazel_canary_baseline_rules_jvm_external_bzlmod_e7_v2 => ("rules_jvm_external", "bzlmod/e7-v2");
     bazel_canary_baseline_rules_jvm_external_bzlmod_e9_unpinned => ("rules_jvm_external", "bzlmod/e9-unpinned");
@@ -566,46 +812,84 @@ canaries! {
 // ---------------------------------------------------------------------------
 // Hermetic checks of the fixtures, the matrices and the registry modules.
 
-/// The rulesets with a directory under `light/`.
-fn rulesets() -> Vec<String> {
-    let mut names: Vec<String> = std::fs::read_dir(light())
-        .expect("read fixtures/bazel/light")
-        .map(|entry| entry.expect("dir entry"))
-        .filter(|entry| entry.path().join("MATRIX.json").is_file())
-        .map(|entry| entry.file_name().to_string_lossy().into_owned())
-        .collect();
+/// The ruleset directories under `root` (`fixtures/bazel/light`): every
+/// directory but the registry mirror. `Err` for one without a `MATRIX.json`:
+/// none of its fixtures would be checked, or run.
+fn rulesets_in(root: &Path) -> Result<Vec<String>, String> {
+    let mut names = Vec::new();
+    let entries = std::fs::read_dir(root).map_err(|e| format!("{}: {e}", root.display()))?;
+    for entry in entries {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let path = entry.path();
+        if !path.is_dir() || name == "registry" {
+            continue;
+        }
+        if !path.join("MATRIX.json").is_file() {
+            return Err(format!("{} has no MATRIX.json", path.display()));
+        }
+        names.push(name);
+    }
     names.sort();
-    names
+    Ok(names)
 }
 
-/// The fixture workspaces on disk under `light/<ruleset>/`, as matrix paths.
-fn fixture_dirs(ruleset: &str) -> BTreeSet<String> {
+fn rulesets() -> Vec<String> {
+    rulesets_in(&light()).unwrap_or_else(|why| panic!("{why}"))
+}
+
+/// The fixture workspaces on disk under one ruleset's directory, as matrix
+/// paths: everything inside each of its sub-directories. `Err` for a
+/// sub-directory that is no dependency system, whose workspaces no test opens.
+fn fixture_dirs_in(ruleset: &Path) -> Result<BTreeSet<String>, String> {
     let mut paths = BTreeSet::new();
-    for system in [System::Bzlmod, System::Workspace] {
-        let dir = light().join(ruleset).join(system.name());
-        for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
-            let era = entry.file_name().to_string_lossy().into_owned();
-            paths.insert(format!("{}/{era}", system.name()));
+    let entries = std::fs::read_dir(ruleset).map_err(|e| format!("{}: {e}", ruleset.display()))?;
+    for entry in entries {
+        let entry = entry.map_err(|e| e.to_string())?;
+        if !entry.path().is_dir() {
+            continue;
+        }
+        let system = entry.file_name().to_string_lossy().into_owned();
+        if System::parse(&system).is_none() {
+            return Err(format!(
+                "{}: not a dependency system (bzlmod, workspace, hybrid)",
+                entry.path().display()
+            ));
+        }
+        let eras = std::fs::read_dir(entry.path()).map_err(|e| e.to_string())?;
+        for era in eras {
+            let era = era.map_err(|e| e.to_string())?;
+            let era = era.file_name().to_string_lossy().into_owned();
+            paths.insert(format!("{system}/{era}"));
         }
     }
-    paths
+    Ok(paths)
 }
 
-/// The text of every file of a fixture except its committed locks, as one
-/// string per file. A fixture holds no binary file.
-fn fixture_texts(ruleset: &str, path: &str) -> BTreeMap<String, String> {
-    let tree = snapshot(&light().join(ruleset).join(path));
-    let text = |(name, entry): (String, Entry)| match entry {
-        Entry::File { bytes, .. } if !name.starts_with("locks/") => {
-            let text = String::from_utf8(bytes);
-            Some((
-                name.clone(),
-                text.unwrap_or_else(|_| panic!("{ruleset}/{path}/{name} is not UTF-8")),
-            ))
+/// The text of every file of the fixture at `dir` that is part of its
+/// workspace, as one string per file. A workspace holds no binary file; the
+/// data directories ([`fixture_data_dir`]) may.
+fn texts_of(dir: &Path) -> Result<BTreeMap<String, String>, String> {
+    let mut texts = BTreeMap::new();
+    for (name, entry) in snapshot(dir) {
+        let Entry::File { bytes, .. } = entry else {
+            continue;
+        };
+        if name
+            .split_once('/')
+            .is_some_and(|(top, _)| fixture_data_dir(top))
+        {
+            continue;
         }
-        _ => None,
-    };
-    tree.into_iter().filter_map(text).collect()
+        let text = String::from_utf8(bytes)
+            .map_err(|_| format!("{}/{name} is not UTF-8", dir.display()))?;
+        texts.insert(name, text);
+    }
+    Ok(texts)
+}
+
+fn fixture_texts(ruleset: &str, path: &str) -> BTreeMap<String, String> {
+    texts_of(&light().join(ruleset).join(path)).unwrap_or_else(|why| panic!("{why}"))
 }
 
 /// The Bazel versions `scripts/bazel-pins.txt` pins.
@@ -619,63 +903,447 @@ fn pinned_bazel_versions() -> BTreeSet<String> {
     text.lines().filter_map(version).collect()
 }
 
-/// The matrices, the fixture directories and the canaries name the same
-/// fixtures, each canary has the name its fixture's path gives it, and every
-/// cell is on a Bazel the installer can provide.
+/// Whether `text` can stand for a label inside a query expression.
+fn is_label(text: &str) -> bool {
+    let rooted = text.starts_with("//") || (text.starts_with('@') && text.contains("//"));
+    rooted && !text.contains(|c: char| c.is_whitespace() || "\"'()".contains(c))
+}
+
+/// What is wrong with a list of cells: of a fixture's baseline (`top` is
+/// [`BASELINE_PROOF`]) or of a lane test ([`TOP_PROOF`]).
+fn cell_problems(
+    cells: &[CellSpec],
+    system: Option<System>,
+    pinned: &BTreeSet<String>,
+    top: u8,
+    ruleset: &str,
+) -> Vec<String> {
+    let mut problems = Vec::new();
+    if cells.is_empty() {
+        problems.push("no cell claims it".to_string());
+    }
+    let mut seen = BTreeSet::new();
+    for spec in cells {
+        let bazel = &spec.bazel;
+        if !seen.insert(bazel) {
+            problems.push(format!("Bazel {bazel} is listed twice"));
+        }
+        if !pinned.contains(bazel) {
+            problems.push(format!("Bazel {bazel} is not in scripts/bazel-pins.txt"));
+        }
+        if let (Some(version), Some(system)) = (Version::parse(bazel), system) {
+            if version.system_flags(system).is_none() {
+                problems.push(format!("Bazel {bazel} has no {} system", system.name()));
+            }
+        }
+        if !TIERS.contains(&spec.tier.as_str()) {
+            problems.push(format!(
+                "Bazel {bazel}: tier {:?} is not one of {TIERS:?}",
+                spec.tier
+            ));
+        }
+        if spec.proof > top {
+            problems.push(format!(
+                "Bazel {bazel}: proof {} is above {top}, the highest tier this test climbs",
+                spec.proof
+            ));
+        }
+        if let Some(outcome) = spec.outcome.as_deref().filter(|o| !OUTCOMES.contains(o)) {
+            problems.push(format!(
+                "Bazel {bazel}: outcome {outcome:?} is not one of {OUTCOMES:?}"
+            ));
+        }
+        // Any build through a rules_jvm_external hub pulls a JDK, up to 418 MB.
+        if ruleset == "rules_jvm_external" && spec.tier == "pr" && spec.proof > 0 {
+            problems.push(format!(
+                "Bazel {bazel}: a rules_jvm_external cell of the PR tier stops at proof 0"
+            ));
+        }
+    }
+    problems
+}
+
+/// What is wrong with one fixture's entry, read without its tree.
+fn fixture_problems(matrix: &Matrix, fixture: &Fixture, pinned: &BTreeSet<String>) -> Vec<String> {
+    let ruleset = matrix.ruleset.as_str();
+    let mut problems = Vec::new();
+
+    let system = match fixture.path.split_once('/') {
+        Some((system, era)) if system == fixture.system && !era.is_empty() => {
+            System::parse(system).filter(|_| !era.contains('/'))
+        }
+        _ => None,
+    };
+    if system.is_none() {
+        problems.push(format!(
+            "the path is not <system>/<era> under the dependency system {:?}",
+            fixture.system
+        ));
+    }
+    let canary = format!(
+        "{CANARY_PREFIX}{ruleset}_{}",
+        fixture.path.replace(['/', '-'], "_")
+    );
+    if fixture.test != canary {
+        problems.push(format!("its test is {}, not {canary}", fixture.test));
+    }
+    if fixture.shape.is_empty() || fixture.pins.is_empty() {
+        problems.push("no shape, or no pins".to_string());
+    }
+    if fixture.probe(matrix).is_empty() {
+        problems.push("nothing to probe: tier 0 would check no file".to_string());
+    }
+    if !FETCHERS.contains(&fixture.fetch.as_str()) {
+        problems.push(format!(
+            "fetch {:?} is not one of {FETCHERS:?}",
+            fixture.fetch
+        ));
+    }
+    if fixture.loopback_repository.is_some() && fixture.fetch != "tool" {
+        problems.push(
+            "a loopback repository serves a tool the downloader does not carry: fetch is \"tool\""
+                .to_string(),
+        );
+    }
+    problems.extend(cell_problems(
+        &fixture.cells,
+        system,
+        pinned,
+        BASELINE_PROOF,
+        ruleset,
+    ));
+    let cell = |bazel: &str| fixture.cells.iter().find(|spec| spec.bazel == bazel);
+    for bazel in fixture.module_lock.keys() {
+        match cell(bazel) {
+            None => problems.push(format!("a lock for Bazel {bazel}, which no cell claims")),
+            Some(spec) if spec.proof < 1 => problems.push(format!(
+                "the lock for Bazel {bazel} is proven by an error-mode build: its cell needs proof 1"
+            )),
+            Some(_) => {}
+        }
+    }
+    if let Some(expected) = &fixture.build_stderr {
+        if expected.contains.is_empty() {
+            problems.push("build_stderr.contains is empty".to_string());
+        }
+        for os in &expected.not_on {
+            if !["linux", "macos", "windows"].contains(&os.as_str()) {
+                problems.push(format!("build_stderr.not_on names no host system: {os:?}"));
+            }
+        }
+        if fixture.cells.iter().any(|spec| spec.proof < 1) {
+            problems
+                .push("build_stderr is read from a build: every cell needs proof 1".to_string());
+        }
+    }
+    let roots: BTreeSet<&String> = fixture.tier0_roots.iter().collect();
+    if roots.len() != fixture.tier0_roots.len() {
+        problems.push("a tier-0 root twice".to_string());
+    }
+    for root in &fixture.tier0_roots {
+        if !is_label(root) {
+            problems.push(format!("the tier-0 root {root:?} is not a label"));
+        }
+    }
+    for label in &fixture.load {
+        if !label.starts_with('@') || !is_label(label) {
+            problems.push(format!(
+                "load names {label:?}, not a label in an external repository"
+            ));
+        }
+    }
+    if fixture.recorded_extension.is_some()
+        && fixture.recorded_extension == fixture.not_recorded_extension
+    {
+        problems.push("one extension is both recorded and not recorded".to_string());
+    }
+    for lane in &fixture.lanes {
+        let test = &lane.test;
+        let lane_test = LANE_PREFIXES.iter().any(|prefix| test.starts_with(prefix));
+        if !lane_test || test.starts_with(CANARY_PREFIX) {
+            problems.push(format!(
+                "the lane test {test} has none of the prefixes {LANE_PREFIXES:?}, or is a baseline"
+            ));
+        }
+        for why in cell_problems(&lane.cells, system, pinned, TOP_PROOF, ruleset) {
+            problems.push(format!("{test}: {why}"));
+        }
+        for spec in &lane.cells {
+            if cell(&spec.bazel).is_none() {
+                problems.push(format!(
+                    "{test}: Bazel {} is no cell of the fixture's baseline",
+                    spec.bazel
+                ));
+            }
+        }
+    }
+    let what = format!("{ruleset}/{}", fixture.path);
+    problems
+        .into_iter()
+        .map(|why| format!("{what}: {why}"))
+        .collect()
+}
+
+/// What is wrong with a matrix, read without the fixture trees.
+fn matrix_problems(matrix: &Matrix, pinned: &BTreeSet<String>) -> Vec<String> {
+    let ruleset = &matrix.ruleset;
+    let mut problems = Vec::new();
+    if matrix.registries.is_empty() {
+        problems.push(format!("{ruleset}: no registry serves its packages"));
+    }
+    for name in &matrix.registries {
+        if !REGISTRIES.contains(&name.as_str()) {
+            problems.push(format!(
+                "{ruleset}: unknown registry {name:?} (known: {REGISTRIES:?})"
+            ));
+        }
+    }
+    let mut paths = BTreeSet::new();
+    for fixture in &matrix.fixtures {
+        if !paths.insert(&fixture.path) {
+            problems.push(format!("{ruleset}: {} is listed twice", fixture.path));
+        }
+        problems.extend(fixture_problems(matrix, fixture, pinned));
+    }
+    problems
+}
+
+/// What is wrong with the committed lock `rel` of `fixture`: its place, its
+/// version, where it was resolved, and the extension entries the fixture's
+/// shape rests on.
+fn lock_problems(fixture: &Fixture, rel: &str, bytes: &[u8]) -> Vec<String> {
+    let mut problems = Vec::new();
+    let place = regex::Regex::new(r"^locks/v(\d+)/(?:[^/]+/)?MODULE\.bazel\.lock$").unwrap();
+    let stated: Option<u64> = place.captures(rel).and_then(|hit| hit[1].parse().ok());
+    if stated.is_none() {
+        problems.push(format!("{rel} is not locks/v<N>[/<os>]/{MODULE_LOCK}"));
+    }
+    // A lock made against a `file://` or loopback registry records that
+    // registry, and Bazel then reads it on every machine.
+    let text = String::from_utf8_lossy(bytes);
+    for host in ["127.0.0.1", "localhost", "file://", ".invalid"] {
+        if text.contains(host) {
+            problems.push(format!("{rel} names {host}"));
+        }
+    }
+    let lock: Value = match serde_json::from_slice(bytes) {
+        Ok(lock) => lock,
+        Err(e) => {
+            problems.push(format!("{rel} is not JSON: {e}"));
+            return problems;
+        }
+    };
+    let version = lock["lockFileVersion"].as_u64();
+    if version.is_none() || version != stated {
+        problems.push(format!(
+            "{rel} has lockFileVersion {version:?}, its directory says {stated:?}"
+        ));
+    }
+    let registry_files = lock["registryFileHashes"].as_object();
+    for url in registry_files.into_iter().flat_map(|files| files.keys()) {
+        if !url.starts_with("https://bcr.bazel.build/") {
+            problems.push(format!(
+                "{rel} resolved {url} outside https://bcr.bazel.build/"
+            ));
+        }
+    }
+    let recorded = match recorded_extensions(bytes) {
+        Ok(recorded) => recorded,
+        Err(why) => {
+            problems.push(format!("{rel}: {why}"));
+            return problems;
+        }
+    };
+    if let Some(extension) = &fixture.recorded_extension {
+        if !records(&recorded, extension) {
+            problems.push(format!("{rel} does not record {extension}"));
+        }
+    }
+    if let Some(extension) = &fixture.not_recorded_extension {
+        if records(&recorded, extension) {
+            problems.push(format!("{rel} records {extension}"));
+        }
+    }
+    problems
+}
+
+/// The names of the functions a Rust source declares with a plain `fn`. A name
+/// a macro builds is not seen.
+fn declared_functions(source: &str) -> Vec<String> {
+    let declaration =
+        regex::Regex::new(r"(?m)^\s*(?:pub(?:\([a-z]+\))?\s+)?fn\s+([A-Za-z0-9_]+)\s*\(").unwrap();
+    let names = declaration.captures_iter(source);
+    names.map(|hit| hit[1].to_string()).collect()
+}
+
+/// Function name to the modules of this suite that declare it, this one
+/// excepted: where a lane package declares the tests a matrix names.
+fn suite_functions() -> BTreeMap<String, Vec<String>> {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/e2e_bazel_build");
+    let mut functions: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for entry in std::fs::read_dir(&dir).expect("read e2e_bazel_build") {
+        let entry = entry.expect("dir entry");
+        let file = entry.file_name().to_string_lossy().into_owned();
+        if !file.ends_with(".rs") || file == "baseline_light.rs" {
+            continue;
+        }
+        let source = std::fs::read_to_string(entry.path()).expect("read a suite module");
+        for name in declared_functions(&source) {
+            functions.entry(name).or_default().push(file.clone());
+        }
+    }
+    functions
+}
+
+/// What is wrong with how the tests the matrices name are declared. `fixtures`
+/// is the `(test, ruleset, path)` of every listed fixture, `lanes` every lane
+/// test, `canaries` the list of `canaries!`, and `declared` the result of
+/// [`suite_functions`]. A fixture's canary is declared once: by `canaries!`
+/// for that fixture, or by another module of the suite. A lane test is
+/// declared once, by another module.
+fn declaration_problems(
+    fixtures: &[(String, String, String)],
+    lanes: &[String],
+    canaries: &[(&str, &str, &str)],
+    declared: &BTreeMap<String, Vec<String>>,
+) -> Vec<String> {
+    let mut problems = Vec::new();
+    let mut named = BTreeSet::new();
+    for test in fixtures.iter().map(|(test, ..)| test).chain(lanes) {
+        if !named.insert(test) {
+            problems.push(format!("{test} is named twice in the matrices"));
+        }
+    }
+    let elsewhere = |test: &str| declared.get(test).map(Vec::as_slice).unwrap_or(&[]);
+    for (test, ruleset, path) in fixtures {
+        let here: Vec<&(&str, &str, &str)> =
+            canaries.iter().filter(|(name, ..)| name == test).collect();
+        match (&here[..], elsewhere(test)) {
+            ([(_, r, p)], []) if r == ruleset && p == path => {}
+            ([(_, r, p)], []) => problems.push(format!(
+                "canaries! declares {test} for {r}/{p}, MATRIX.json lists it for {ruleset}/{path}"
+            )),
+            ([], [_]) => {}
+            ([], []) => problems.push(format!(
+                "{ruleset}/{path} has no canary: add {test} to canaries!, or declare \
+                 `fn {test}()` in the ruleset's module of the suite"
+            )),
+            (_, modules) => problems.push(format!(
+                "{test} is declared more than once: {} time(s) by canaries! and in {modules:?}",
+                here.len()
+            )),
+        }
+    }
+    for (test, ruleset, path) in canaries {
+        if !fixtures.iter().any(|(name, ..)| name == test) {
+            problems.push(format!(
+                "canaries! declares {test} for {ruleset}/{path}, which no MATRIX.json lists"
+            ));
+        }
+    }
+    for test in lanes {
+        match elsewhere(test) {
+            [_] => {}
+            [] => problems.push(format!(
+                "the lane test {test} is declared in no module of the suite"
+            )),
+            modules => problems.push(format!(
+                "the lane test {test} is declared more than once: {modules:?}"
+            )),
+        }
+    }
+    problems
+}
+
+/// rules_jvm_external's name for an artifact at a version: the repository
+/// that holds its jar, and the hub's versioned alias
+/// (`private/extensions/download_pinned_deps.bzl`, `escape`).
+fn rje_versioned_name(coordinate: &str, version: &str) -> String {
+    format!("{coordinate}:{version}").replace(['.', '-', ':', '/', '+'], "_")
+}
+
+/// The version-bearing rules_jvm_external names the Starlark files of a
+/// fixture use outside comments: for every artifact a `maven_install.json`
+/// lock (format v2 or v3) among `texts` pins, the name of
+/// [`rje_versioned_name`] where a `MODULE.bazel`, `WORKSPACE`, `BUILD.bazel`
+/// or `.bzl` file holds it.
+fn versioned_names_used(texts: &BTreeMap<String, String>) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    for text in texts.values() {
+        let Ok(lock) = serde_json::from_str::<Value>(text) else {
+            continue;
+        };
+        let artifacts = lock["artifacts"].as_object();
+        for (coordinate, entry) in artifacts.into_iter().flatten() {
+            if let Some(version) = entry["version"].as_str() {
+                names.insert(rje_versioned_name(coordinate, version));
+            }
+        }
+    }
+    let starlark = |name: &&String| {
+        let leaf = name.rsplit('/').next().unwrap_or(name);
+        leaf.starts_with("MODULE.bazel")
+            || leaf.starts_with("WORKSPACE")
+            || leaf.starts_with("BUILD")
+            || leaf.ends_with(".bzl")
+    };
+    let code: String = texts
+        .iter()
+        .filter(|(name, _)| starlark(name))
+        .flat_map(|(_, text)| text.lines())
+        .map(|line| line.split('#').next().unwrap_or(""))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let used = |name: &String| {
+        let token = regex::Regex::new(&format!(r"\b{}\b", regex::escape(name))).unwrap();
+        token.is_match(&code)
+    };
+    names.into_iter().filter(used).collect()
+}
+
+/// The matrices, the fixture directories and the declared tests name the same
+/// fixtures, every entry has the shape the canary and the CI plan read, and a
+/// committed lock is the lock its fixture claims.
 #[test]
 fn every_light_fixture_has_a_matrix_entry_and_a_canary() {
     let pinned = pinned_bazel_versions();
-    let mut listed = BTreeSet::new();
+    let mut problems = Vec::new();
+    let mut fixtures = Vec::new();
+    let mut lanes = Vec::new();
     for ruleset in rulesets() {
         let matrix = Matrix::load(&ruleset);
-        let paths: BTreeSet<String> = matrix.fixtures.iter().map(|f| f.path.clone()).collect();
-        assert_eq!(
-            paths.len(),
-            matrix.fixtures.len(),
-            "{ruleset}: a path twice"
-        );
-        assert_eq!(
-            paths,
-            fixture_dirs(&ruleset),
-            "{ruleset}: MATRIX.json and the directories differ"
-        );
+        problems.extend(matrix_problems(&matrix, &pinned));
+        let listed: BTreeSet<String> = matrix.fixtures.iter().map(|f| f.path.clone()).collect();
+        let on_disk =
+            fixture_dirs_in(&light().join(&ruleset)).unwrap_or_else(|why| panic!("{why}"));
+        if listed != on_disk {
+            problems.push(format!(
+                "{ruleset}: MATRIX.json lists {listed:?}, the directories are {on_disk:?}"
+            ));
+        }
         for fixture in &matrix.fixtures {
-            let (system, _) = fixture.path.split_once('/').expect("<system>/<era>");
-            assert_eq!(fixture.system, system, "{ruleset}/{}", fixture.path);
-            let name = fixture.path.replace(['/', '-'], "_");
-            assert_eq!(
-                fixture.test,
-                format!("bazel_canary_baseline_{ruleset}_{name}")
-            );
-            assert!(!fixture.shape.is_empty() && !fixture.pins.is_empty());
-            assert!(
-                !fixture.cells.is_empty(),
-                "{}: no cell claims it",
-                fixture.test
-            );
-            for spec in &fixture.cells {
-                assert!(
-                    pinned.contains(&spec.bazel),
-                    "{}: Bazel {} is not in scripts/bazel-pins.txt",
-                    fixture.test,
-                    spec.bazel
-                );
-                assert!(["nightly", "pr"].contains(&spec.tier.as_str()));
+            let what = format!("{ruleset}/{}", fixture.path);
+            for rel in fixture.module_lock.values() {
+                let lock = light().join(&ruleset).join(&fixture.path).join(rel);
+                match std::fs::read(&lock) {
+                    Ok(bytes) => {
+                        let found = lock_problems(fixture, rel, &bytes);
+                        problems.extend(found.into_iter().map(|why| format!("{what}: {why}")));
+                    }
+                    Err(e) => problems.push(format!("{what}: {}: {e}", lock.display())),
+                }
             }
-            for (bazel, lock) in &fixture.module_lock {
-                assert!(fixture.cells.iter().any(|spec| &spec.bazel == bazel));
-                let lock = light().join(&ruleset).join(&fixture.path).join(lock);
-                assert!(lock.is_file(), "{} is missing", lock.display());
-            }
-            listed.insert((fixture.test.clone(), ruleset.clone(), fixture.path.clone()));
+            fixtures.push((fixture.test.clone(), ruleset.clone(), fixture.path.clone()));
+            lanes.extend(fixture.lanes.iter().map(|lane| lane.test.clone()));
         }
     }
-    let canaries: BTreeSet<(String, String, String)> = CANARIES
-        .iter()
-        .map(|(test, ruleset, path)| (test.to_string(), ruleset.to_string(), path.to_string()))
-        .collect();
-    assert_eq!(canaries.len(), CANARIES.len(), "a canary twice");
-    assert_eq!(listed, canaries, "the matrices and the canaries differ");
+    problems.extend(declaration_problems(
+        &fixtures,
+        &lanes,
+        CANARIES,
+        &suite_functions(),
+    ));
+    assert!(problems.is_empty(), "{}", problems.join("\n"));
 }
 
 /// Each fixture is a workspace the harness can run: the two proof targets, no
@@ -714,6 +1382,14 @@ fn every_light_fixture_pins_its_ruleset_and_keeps_production_hosts() {
                     assert!(!text.contains(host), "{what}/{name} names {host}");
                 }
             }
+            // A name that carries a version does not survive a rewrite of the
+            // lock: only a fixture that says so may use one.
+            let versioned: BTreeSet<String> = fixture.versioned_names.iter().cloned().collect();
+            assert_eq!(
+                versioned_names_used(&texts),
+                versioned,
+                "{what}: the versioned names its Starlark files use, and `versioned_names`"
+            );
             for (module, version) in &fixture.pins {
                 if fixture.system == System::Workspace.name() {
                     let workspace = texts.get("WORKSPACE").expect("a WORKSPACE");
@@ -738,17 +1414,24 @@ fn every_light_fixture_pins_its_ruleset_and_keeps_production_hosts() {
 }
 
 /// The mirror holds what the locks pin: each probed artifact's digest, in the
-/// encoding its ecosystem uses, appears in the fixture. A mirror file replaced
-/// without its locks (or the reverse) fails here, not in a Bazel checksum error
-/// a day later. An unpinned hub is the exception that proves the rule: it
-/// commits no digest at all.
+/// encoding its ecosystem uses, appears in the fixture, and its URL is inside a
+/// scope the ruleset's registries own, so the canary's rewrite sends it to the
+/// fixture server. A mirror file replaced without its locks (or the reverse)
+/// fails here, not in a Bazel checksum error a day later. An unpinned hub is the
+/// exception that proves the rule: it commits no digest at all.
 #[test]
 fn every_light_lock_pins_the_mirrored_artifact() {
     for ruleset in rulesets() {
         let matrix = Matrix::load(&ruleset);
+        let server = FixtureServer::start();
+        let owned: Vec<regex::Regex> = mount(&server, &matrix.registries)
+            .iter()
+            .map(|scope| regex::Regex::new(&format!("^(?:{})$", scope_pattern(scope))).unwrap())
+            .collect();
         for fixture in &matrix.fixtures {
             let texts = fixture_texts(&ruleset, &fixture.path);
-            for file in fixture.probe.as_ref().unwrap_or(&matrix.probe) {
+            for file in fixture.probe(&matrix) {
+                let what = format!("light/{ruleset}/{}: {}", fixture.path, file.artifact());
                 let path = mirror().join(file.artifact());
                 let bytes =
                     std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
@@ -763,13 +1446,548 @@ fn every_light_lock_pins_the_mirrored_artifact() {
                 assert_eq!(
                     pinned,
                     fixture.loopback_repository.is_none(),
-                    "light/{ruleset}/{}: a digest of {} is pinned: {pinned}",
-                    fixture.path,
-                    file.artifact()
+                    "{what}: a digest of it is pinned: {pinned}"
                 );
+                assert!(
+                    owned.iter().any(|scope| scope.is_match(file.artifact())),
+                    "{what}: no registry scope covers it"
+                );
+                if let Err(why) = file.expected() {
+                    panic!("{what}: {why}");
+                }
             }
         }
     }
+}
+
+/// A matrix built from `fixture`, the JSON of one fixture entry.
+fn matrix_of(registries: &str, probe: &str, fixture: &str) -> Matrix {
+    let text = format!(
+        r#"{{"group": "light", "ruleset": "rules_x", "registries": {registries},
+            "probe": {probe}, "fixtures": [{fixture}]}}"#
+    );
+    Matrix::parse(&text).unwrap_or_else(|why| panic!("{why}:\n{text}"))
+}
+
+const SOUND_PROBE: &str =
+    r#"[{"anchor": "sha256", "label": "x.gem", "artifact": "rubygems.org/gems/x-1.0.0.gem"}]"#;
+
+/// One fixture entry with `cells` and `extra` (further keys, each ending in a
+/// comma) spliced in.
+fn entry(cells: &str, extra: &str) -> String {
+    format!(
+        r#"{{"path": "bzlmod/e9", "test": "bazel_canary_baseline_rules_x_bzlmod_e9",
+            "system": "bzlmod", "pins": {{"rules_x": "1.0.0"}}, "shape": "a shape", {extra}
+            "cells": {cells}}}"#
+    )
+}
+
+const SOUND_CELLS: &str = r#"[{"bazel": "9.3.2", "proof": 1, "tier": "nightly"}]"#;
+
+#[test]
+fn matrix_checks_refuse_what_a_canary_would_not_notice() {
+    let pinned: BTreeSet<String> = ["9.3.2", "8.8.2", "7.7.2"].map(String::from).into();
+    let problems = |registries: &str, probe: &str, fixture: &str| {
+        matrix_problems(&matrix_of(registries, probe, fixture), &pinned).join("\n")
+    };
+    let of_cells = |cells: &str| problems(r#"["gem"]"#, SOUND_PROBE, &entry(cells, ""));
+    let of_extra = |extra: &str| problems(r#"["gem"]"#, SOUND_PROBE, &entry(SOUND_CELLS, extra));
+    assert_eq!(of_cells(SOUND_CELLS), "");
+
+    // An empty probe list would let tier 0 and the lock check pass on nothing.
+    let empty = problems(r#"["gem"]"#, "[]", &entry(SOUND_CELLS, ""));
+    assert!(empty.contains("nothing to probe"), "{empty}");
+    let emptied = of_extra(r#""probe": [],"#);
+    assert!(emptied.contains("nothing to probe"), "{emptied}");
+    // A registry nobody serves is refused here, not first in a real-Bazel run.
+    let unknown = problems(r#"["gem", "cargo"]"#, SOUND_PROBE, &entry(SOUND_CELLS, ""));
+    assert!(unknown.contains("unknown registry \"cargo\""), "{unknown}");
+    let none = problems("[]", SOUND_PROBE, &entry(SOUND_CELLS, ""));
+    assert!(none.contains("no registry serves"), "{none}");
+
+    for (cells, why) in [
+        ("[]", "no cell claims it"),
+        (
+            r#"[{"bazel": "9.3.2", "proof": 1, "tier": "nightly", "outcome": "WORKS_AFTER"}]"#,
+            "outcome \"WORKS_AFTER\" is not one of",
+        ),
+        (
+            r#"[{"bazel": "9.3.2", "proof": 2, "tier": "nightly"}]"#,
+            "proof 2 is above 1",
+        ),
+        (
+            r#"[{"bazel": "9.3.2", "proof": 1, "tier": "weekly"}]"#,
+            "tier \"weekly\" is not one of",
+        ),
+        (
+            r#"[{"bazel": "9.9.9", "proof": 1, "tier": "nightly"}]"#,
+            "Bazel 9.9.9 is not in scripts/bazel-pins.txt",
+        ),
+        (
+            r#"[{"bazel": "9.3.2", "proof": 1, "tier": "pr"}, {"bazel": "9.3.2", "proof": 0, "tier": "pr"}]"#,
+            "Bazel 9.3.2 is listed twice",
+        ),
+    ] {
+        let found = of_cells(cells);
+        assert!(found.contains(why), "{cells}: {found}");
+    }
+    // A cell without `proof`, and a key nothing reads, do not parse at all.
+    let no_proof = entry(r#"[{"bazel": "9.3.2", "tier": "nightly"}]"#, "");
+    let text = format!(
+        r#"{{"group": "light", "ruleset": "rules_x", "registries": ["gem"],
+            "probe": {SOUND_PROBE}, "fixtures": [{no_proof}]}}"#
+    );
+    assert!(Matrix::parse(&text).is_err_and(|why| why.contains("missing field `proof`")));
+    let stray = text.replace(
+        r#""tier": "nightly""#,
+        r#""tier": "nightly", "proof": 1, "os": []"#,
+    );
+    assert!(Matrix::parse(&stray).is_err_and(|why| why.contains("unknown field `os`")));
+
+    for (extra, why) in [
+        (r#""fetch": "pip","#, "fetch \"pip\" is not one of"),
+        (
+            r#""loopback_repository": "http://127.0.0.1:1/maven2","#,
+            "fetch is \"tool\"",
+        ),
+        (
+            r#""module_lock": {"8.8.2": "locks/v24/MODULE.bazel.lock"},"#,
+            "a lock for Bazel 8.8.2, which no cell claims",
+        ),
+        (
+            r#""build_stderr": {"contains": "", "not_on": ["win32"]},"#,
+            "build_stderr.contains is empty",
+        ),
+        (
+            r#""build_stderr": {"contains": "x", "not_on": ["win32"]},"#,
+            "names no host system: \"win32\"",
+        ),
+        (
+            r#""tier0_roots": ["@maven//:a", "@maven//:a"],"#,
+            "a tier-0 root twice",
+        ),
+        (
+            r#""tier0_roots": ["maven//:a) + deps(//..."],"#,
+            "is not a label",
+        ),
+        (
+            r#""load": ["//:all"],"#,
+            "not a label in an external repository",
+        ),
+        (
+            r#""recorded_extension": "//:e.bzl%e", "not_recorded_extension": "//:e.bzl%e","#,
+            "both recorded and not recorded",
+        ),
+        (
+            r#""lanes": [{"test": "bazel_core_x", "cells": [{"bazel": "9.3.2", "proof": 2, "tier": "pr"}]}],"#,
+            "the lane test bazel_core_x has none of the prefixes",
+        ),
+        (
+            r#""lanes": [{"test": "bazel_canary_baseline_rules_x_other", "cells": []}],"#,
+            "or is a baseline",
+        ),
+        (
+            r#""lanes": [{"test": "bazel_hosted_rules_x_bzlmod", "cells": [{"bazel": "8.8.2", "proof": 3, "tier": "pr"}]}],"#,
+            "bazel_hosted_rules_x_bzlmod: Bazel 8.8.2 is no cell of the fixture's baseline",
+        ),
+    ] {
+        let found = of_extra(extra);
+        assert!(found.contains(why), "{extra}: {found}");
+    }
+    // A lane cell climbs the whole ladder, and no further.
+    let lane = of_extra(
+        r#""lanes": [{"test": "bazel_hosted_rules_x_bzlmod", "cells": [{"bazel": "9.3.2", "proof": 2, "tier": "pr", "outcome": "WORKS-AFTER"}]}],"#,
+    );
+    assert_eq!(lane, "");
+    let above = of_extra(
+        r#""lanes": [{"test": "bazel_hosted_rules_x_bzlmod", "cells": [{"bazel": "9.3.2", "proof": 3, "tier": "pr"}]}],"#,
+    );
+    assert!(above.contains("proof 3 is above 2"), "{above}");
+
+    // The path and the test name follow from each other and from the system.
+    let misnamed = entry(SOUND_CELLS, "").replace("rules_x_bzlmod_e9", "rules_x_e9");
+    let found = problems(r#"["gem"]"#, SOUND_PROBE, &misnamed);
+    assert!(
+        found.contains("its test is bazel_canary_baseline_rules_x_e9"),
+        "{found}"
+    );
+    let elsewhere =
+        entry(SOUND_CELLS, "").replace(r#""system": "bzlmod""#, r#""system": "hybrid""#);
+    let found = problems(r#"["gem"]"#, SOUND_PROBE, &elsewhere);
+    assert!(found.contains("the path is not <system>/<era>"), "{found}");
+    // Bazel 9 has no WORKSPACE system.
+    let workspace = entry(SOUND_CELLS, "")
+        .replace("bzlmod/e9", "workspace/e9")
+        .replace("rules_x_bzlmod_e9", "rules_x_workspace_e9")
+        .replace(r#""system": "bzlmod""#, r#""system": "workspace""#);
+    let found = problems(r#"["gem"]"#, SOUND_PROBE, &workspace);
+    assert!(
+        found.contains("Bazel 9.3.2 has no workspace system"),
+        "{found}"
+    );
+
+    // A PR cell of rules_jvm_external stops at the fetch.
+    let pr = [CellSpec {
+        bazel: "9.3.2".to_string(),
+        proof: 1,
+        tier: "pr".to_string(),
+        outcome: None,
+    }];
+    let found = cell_problems(
+        &pr,
+        Some(System::Bzlmod),
+        &pinned,
+        TOP_PROOF,
+        "rules_jvm_external",
+    );
+    assert!(found[0].contains("stops at proof 0"), "{found:?}");
+    assert!(cell_problems(&pr, Some(System::Bzlmod), &pinned, TOP_PROOF, "rules_js").is_empty());
+}
+
+#[test]
+fn fixture_directories_are_walked_whole() {
+    let tree = tempfile::tempdir().unwrap();
+    let dir = |rel: &str| std::fs::create_dir_all(tree.path().join(rel)).unwrap();
+    let file = |rel: &str| std::fs::write(tree.path().join(rel), "{}").unwrap();
+    dir("registry/rubygems.org");
+    dir("rules_x/bzlmod/e9");
+    dir("rules_x/workspace/e7-variant");
+    dir("rules_x/hybrid/e8");
+    file("rules_x/MATRIX.json");
+    file("README.md");
+    assert_eq!(rulesets_in(tree.path()).unwrap(), ["rules_x"]);
+    let on_disk = fixture_dirs_in(&tree.path().join("rules_x")).unwrap();
+    assert_eq!(
+        on_disk.into_iter().collect::<Vec<_>>(),
+        ["bzlmod/e9", "hybrid/e8", "workspace/e7-variant"]
+    );
+
+    // A workspace outside a dependency-system directory is in no matrix path.
+    dir("rules_x/legacy/e5");
+    let why = fixture_dirs_in(&tree.path().join("rules_x")).unwrap_err();
+    assert!(
+        why.contains("legacy") && why.contains("not a dependency system"),
+        "{why}"
+    );
+    // A ruleset tree without a matrix is not skipped.
+    dir("rules_new/bzlmod/e9");
+    let why = rulesets_in(tree.path()).unwrap_err();
+    assert!(
+        why.contains("rules_new") && why.contains("has no MATRIX.json"),
+        "{why}"
+    );
+}
+
+#[test]
+fn fixture_data_is_no_part_of_the_workspace() {
+    for (name, data) in [
+        ("locks", true),
+        ("expected-hosted", true),
+        ("expected-vendored", true),
+        ("expected-agent", true),
+        ("expected", false),
+        ("deps", false),
+        ("lockspace", false),
+    ] {
+        assert_eq!(fixture_data_dir(name), data, "{name}");
+    }
+    let fixture = tempfile::tempdir().unwrap();
+    let write = |rel: &str, bytes: &[u8]| {
+        let path = fixture.path().join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, bytes).unwrap();
+    };
+    write("BUILD.bazel", b"# root\n");
+    write(
+        "deps/expected-hosted/BUILD.bazel",
+        b"# a package of the workspace\n",
+    );
+    write("locks/v13/MODULE.bazel.lock", b"{}");
+    write("expected-hosted/BUILD.bazel", b"# a golden\n");
+    write(
+        "expected-vendored/.socket/vendor/npm/x.tgz",
+        &[0x1f, 0x8b, 0xff, 0xfe],
+    );
+    write("expected-notes", b"a file, not a golden tree\n");
+
+    // The hermetic checks read the workspace alone; a golden may be binary.
+    let texts = texts_of(fixture.path()).unwrap();
+    let names: Vec<&str> = texts.keys().map(String::as_str).collect();
+    assert_eq!(
+        names,
+        [
+            "BUILD.bazel",
+            "deps/expected-hosted/BUILD.bazel",
+            "expected-notes"
+        ]
+    );
+    write("src/blob.bin", &[0xff, 0xfe]);
+    let why = texts_of(fixture.path()).unwrap_err();
+    assert!(why.contains("src/blob.bin is not UTF-8"), "{why}");
+
+    // And the canary builds the workspace alone.
+    strip_fixture_data(fixture.path());
+    let left: Vec<String> = snapshot(fixture.path())
+        .into_iter()
+        .filter(|(_, entry)| matches!(entry, Entry::File { .. }))
+        .map(|(name, _)| name)
+        .collect();
+    assert_eq!(
+        left,
+        [
+            "BUILD.bazel",
+            "deps/expected-hosted/BUILD.bazel",
+            "expected-notes",
+            "src/blob.bin"
+        ]
+    );
+}
+
+#[test]
+fn a_committed_lock_is_held_to_its_fixture() {
+    let fixture = |extra: &str| {
+        let fixture = entry(
+            r#"[{"bazel": "7.7.2", "proof": 1, "tier": "nightly"}]"#,
+            extra,
+        );
+        matrix_of(r#"["gem"]"#, SOUND_PROBE, &fixture)
+            .fixtures
+            .remove(0)
+    };
+    let recorded = fixture(r#""recorded_extension": "//deps:e.bzl%e","#);
+    let lock = br#"{"lockFileVersion": 13,
+        "registryFileHashes": {"https://bcr.bazel.build/modules/x/1.0/MODULE.bazel": "abc"},
+        "moduleExtensions": {"//deps:e.bzl%e": {"general": {}}}}"#;
+    let rel = "locks/v13/MODULE.bazel.lock";
+    assert_eq!(lock_problems(&recorded, rel, lock), Vec::<String>::new());
+    assert_eq!(
+        lock_problems(&recorded, "locks/v13/linux/MODULE.bazel.lock", lock),
+        Vec::<String>::new()
+    );
+    let text = String::from_utf8_lossy(lock).into_owned();
+    let found = |fixture: &Fixture, rel: &str, lock: &str| {
+        lock_problems(fixture, rel, lock.as_bytes()).join("\n")
+    };
+
+    // The directory states the lock version, so a lock of another Bazel line
+    // cannot sit under this one's key.
+    let why = found(&recorded, "locks/v24/MODULE.bazel.lock", &text);
+    assert!(
+        why.contains("has lockFileVersion Some(13), its directory says Some(24)"),
+        "{why}"
+    );
+    let why = found(&recorded, "locks/MODULE.bazel.lock", &text);
+    assert!(
+        why.contains("is not locks/v<N>[/<os>]/MODULE.bazel.lock"),
+        "{why}"
+    );
+    // The extension entry the fixture's shape rests on is in the committed file.
+    let why = found(
+        &recorded,
+        rel,
+        &text.replace("//deps:e.bzl%e", "//deps:other.bzl%e"),
+    );
+    assert!(why.contains("does not record //deps:e.bzl%e"), "{why}");
+    let unrecorded = fixture(r#""not_recorded_extension": "@@//deps:e.bzl%e","#);
+    let why = found(&unrecorded, rel, &text);
+    assert!(why.contains("records @@//deps:e.bzl%e"), "{why}");
+    // Resolved against the central registry, and nothing else.
+    for (registry, host) in [
+        ("file:///tmp/registry/", "file://"),
+        ("http://127.0.0.1:8080/", "127.0.0.1"),
+        ("http://localhost:8080/", "localhost"),
+        ("https://registry.invalid/", ".invalid"),
+        (
+            "https://mirror.example.com/",
+            "outside https://bcr.bazel.build/",
+        ),
+    ] {
+        let why = found(
+            &recorded,
+            rel,
+            &text.replace("https://bcr.bazel.build/", registry),
+        );
+        assert!(why.contains(host), "{registry}: {why}");
+    }
+    let why = found(&recorded, rel, "not a lock");
+    assert!(why.contains("is not JSON"), "{why}");
+}
+
+#[test]
+fn the_tests_a_matrix_names_are_declared_once() {
+    let source = "fn helper(x: u8) {}\n#[test]\n#[ignore]\nfn bazel_hosted_rules_x_bzlmod() {\n}\n\
+                  \x20   pub(crate) fn shared() {}\npub fn open() {}\n// fn commented() {}\n\
+                  let text = \"fn quoted()\";\n";
+    assert_eq!(
+        declared_functions(source),
+        ["helper", "bazel_hosted_rules_x_bzlmod", "shared", "open"]
+    );
+
+    let fixture =
+        |test: &str, path: &str| (test.to_string(), "rules_x".to_string(), path.to_string());
+    let listed = [
+        fixture("bazel_canary_baseline_rules_x_bzlmod_e9", "bzlmod/e9"),
+        fixture(
+            "bazel_canary_baseline_rules_x_bzlmod_e9_new",
+            "bzlmod/e9-new",
+        ),
+    ];
+    let lanes = ["bazel_hosted_rules_x_bzlmod".to_string()];
+    let canaries = [(
+        "bazel_canary_baseline_rules_x_bzlmod_e9",
+        "rules_x",
+        "bzlmod/e9",
+    )];
+    // Function name to the modules that declare it, space-separated.
+    let modules = |pairs: &[(&str, &str)]| -> BTreeMap<String, Vec<String>> {
+        let files = |at: &str| at.split(' ').map(str::to_string).collect();
+        pairs
+            .iter()
+            .map(|(name, at)| (name.to_string(), files(at)))
+            .collect()
+    };
+    // One canary from `canaries!`, one from the lane's module, and the lane test.
+    let declared = modules(&[
+        ("bazel_canary_baseline_rules_x_bzlmod_e9_new", "rules_x.rs"),
+        ("bazel_hosted_rules_x_bzlmod", "rules_x.rs"),
+    ]);
+    let found = declaration_problems(&listed, &lanes, &canaries, &declared);
+    assert_eq!(found, Vec::<String>::new());
+
+    let found = declaration_problems(&listed, &lanes, &canaries, &BTreeMap::new()).join("\n");
+    assert!(
+        found.contains("rules_x/bzlmod/e9-new has no canary"),
+        "{found}"
+    );
+    assert!(
+        found.contains("bazel_hosted_rules_x_bzlmod is declared in no module"),
+        "{found}"
+    );
+    let twice = modules(&[
+        ("bazel_canary_baseline_rules_x_bzlmod_e9", "rules_x.rs"),
+        (
+            "bazel_canary_baseline_rules_x_bzlmod_e9_new",
+            "rules_x.rs legacy.rs",
+        ),
+        ("bazel_hosted_rules_x_bzlmod", "rules_x.rs guard.rs"),
+    ]);
+    let found = declaration_problems(&listed, &lanes, &canaries, &twice).join("\n");
+    assert_eq!(
+        found.matches("is declared more than once").count(),
+        3,
+        "{found}"
+    );
+    // `canaries!` and the matrix must mean the same fixture, both ways.
+    let moved = [(
+        "bazel_canary_baseline_rules_x_bzlmod_e9",
+        "rules_x",
+        "bzlmod/e8",
+    )];
+    let found = declaration_problems(&listed[..1], &[], &moved, &declared).join("\n");
+    assert!(
+        found.contains("for rules_x/bzlmod/e8, MATRIX.json lists it for"),
+        "{found}"
+    );
+    let found = declaration_problems(&[], &[], &canaries, &declared).join("\n");
+    assert!(found.contains("which no MATRIX.json lists"), "{found}");
+    let again = [listed[0].0.clone()];
+    let found = declaration_problems(&listed, &again, &canaries, &declared).join("\n");
+    assert!(found.contains("is named twice in the matrices"), "{found}");
+}
+
+#[test]
+fn versioned_rje_names_are_found_in_code_and_not_in_comments() {
+    assert_eq!(
+        rje_versioned_name("org.slf4j:slf4j-api", "1.7.36"),
+        "org_slf4j_slf4j_api_1_7_36"
+    );
+    let lock = r#"{"artifacts": {
+        "org.slf4j:slf4j-api": {"shasums": {"jar": "d3"}, "version": "1.7.36"},
+        "com.google.code.gson:gson": {"shasums": {"jar": "4e"}, "version": "2.10.1"}}}"#;
+    let tree = |module: &str, build: &str| -> BTreeMap<String, String> {
+        [
+            ("maven_install.json", lock),
+            ("MODULE.bazel", module),
+            ("app/BUILD.bazel", build),
+            (
+                "README.md",
+                "use_repo(maven, \"com_google_code_gson_gson_2_10_1\")",
+            ),
+        ]
+        .map(|(name, text)| (name.to_string(), text.to_string()))
+        .into()
+    };
+    let hub_only = tree(
+        "# not `org_slf4j_slf4j_api_1_7_36`\nuse_repo(maven, \"maven\")\n",
+        "srcs = [\"@maven//:org_slf4j_slf4j_api\"]  # org_slf4j_slf4j_api_1_7_36\n",
+    );
+    assert_eq!(versioned_names_used(&hub_only), BTreeSet::new());
+    let spoke = tree(
+        "use_repo(maven, \"maven\", \"org_slf4j_slf4j_api_1_7_36\")\n",
+        "srcs = [\"@maven//:org_slf4j_slf4j_api\"]\n",
+    );
+    assert_eq!(
+        versioned_names_used(&spoke).into_iter().collect::<Vec<_>>(),
+        ["org_slf4j_slf4j_api_1_7_36"]
+    );
+    let alias = tree(
+        "use_repo(maven, \"maven\")\n",
+        "deps = [\"@maven//:com_google_code_gson_gson_2_10_1\"]\n",
+    );
+    assert_eq!(
+        versioned_names_used(&alias).into_iter().collect::<Vec<_>>(),
+        ["com_google_code_gson_gson_2_10_1"]
+    );
+    // A longer name that starts with a versioned one is another repository.
+    let renamed = tree(
+        "use_repo(maven, \"org_slf4j_slf4j_api_1_7_36_socket_0b5e1c1e\")\n",
+        "",
+    );
+    assert_eq!(versioned_names_used(&renamed), BTreeSet::new());
+}
+
+/// The undeclared `.npmrc` fixture is the input of a credential refusal: its
+/// token must be one rules_js sends to every registry, and its canary must
+/// show that rules_js read the file.
+#[test]
+fn the_undeclared_npmrc_holds_an_unscoped_credential() {
+    const CREDENTIALS: &[&str] = &["_authToken", "_auth", "username", "_password"];
+    let matrix = Matrix::load("rules_js");
+    let fixture = matrix.fixture("bzlmod/e7-npmrc");
+    let texts = fixture_texts("rules_js", &fixture.path);
+    // The keys of the file as rules_js reads them (`npm/private/npmrc.bzl`).
+    let keys: Vec<&str> = texts[".npmrc"]
+        .lines()
+        .map(|line| line.split([';', '#']).next().unwrap_or("").trim())
+        .filter(|line| !line.is_empty() && !line.starts_with('['))
+        .map(|line| line.split('=').next().unwrap_or("").trim())
+        .collect();
+    // An un-scoped key is the whole key. A scoped one (`//host/:_authToken`)
+    // goes to its own registry alone, which no refusal is about.
+    assert!(
+        keys.iter().any(|key| CREDENTIALS.contains(key)),
+        "the .npmrc holds no un-scoped credential: {keys:?}"
+    );
+    let scoped = |key: &str| {
+        CREDENTIALS
+            .iter()
+            .any(|name| key.ends_with(&format!(":{name}")))
+    };
+    assert!(!keys.iter().any(|key| scoped(key)), "{keys:?}");
+    assert!(
+        !texts["MODULE.bazel"].contains("npmrc"),
+        "the file is declared"
+    );
+
+    // The tree is `e7` plus the file, so only the warning tells the two canaries apart.
+    let mut twin = fixture_texts("rules_js", "bzlmod/e7");
+    twin.insert(".npmrc".to_string(), texts[".npmrc"].clone());
+    assert_eq!(texts, twin);
+    let expected = fixture.build_stderr.as_ref().expect("build_stderr");
+    assert_eq!(expected.contains, "Implicitly using .npmrc file");
+    // rules_js 2.x does not look for the file on Windows.
+    assert!(!expected.applies_on("windows") && expected.applies_on("linux"));
+    assert!(expected.applies_on("macos"));
 }
 
 #[test]
@@ -821,9 +2039,153 @@ fn resolved_versions_are_read_from_the_graph_and_from_a_release_url() {
     );
 
     let lock = br#"{"lockFileVersion": 13, "moduleExtensions": {"//deps:e.bzl%e": {}}}"#;
-    assert_eq!(recorded_extensions(lock), ["//deps:e.bzl%e"]);
-    assert!(recorded_extensions(b"{\"lockFileVersion\": 13}").is_empty());
-    assert!(recorded_extensions(b"not json").is_empty());
+    let recorded = recorded_extensions(lock).unwrap();
+    assert_eq!(recorded, ["//deps:e.bzl%e"]);
+    // Lock versions spell a root extension with and without `@@`.
+    assert!(records(&recorded, "//deps:e.bzl%e") && records(&recorded, "@@//deps:e.bzl%e"));
+    assert!(!records(&recorded, "//deps:e.bzl%other") && !records(&recorded, "deps:e.bzl%e"));
+    assert_eq!(
+        recorded_extensions(b"{\"lockFileVersion\": 13}").unwrap(),
+        Vec::<String>::new()
+    );
+    // A file that is no lock is not "a lock that records nothing".
+    assert!(recorded_extensions(b"not json").is_err());
+    assert!(recorded_extensions(b"[]").is_err());
+    assert!(recorded_extensions(b"").is_err());
+}
+
+/// The tier-0 primitives this file adds to the harness anchors fail closed:
+/// none, several, a missing member and a changed byte are each an error.
+#[test]
+fn probe_files_name_exactly_one_file_and_compare_its_bytes() {
+    const TARBALL: &str = "registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz";
+    const NUPKG: &str = "api.nuget.org/v3-flatcontainer/sp.victim/1.0.0/sp.victim.1.0.0.nupkg";
+    const DLL: &str = "lib/netstandard2.0/SP.Victim.dll";
+    let tmp = tempfile::tempdir().unwrap();
+    let write = |rel: &str, bytes: &[u8]| {
+        let path = tmp.path().join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, bytes).unwrap();
+        path
+    };
+    let source = |path: &Path, label: &str| SourceFile {
+        path: path.to_path_buf(),
+        label: label.to_string(),
+    };
+
+    // rules_js before 1.40: the source file is the directory `package`.
+    let index = npm::member(&mirrored(TARBALL), "package/index.js").unwrap();
+    let unpacked = ProbeFile::Unpacked {
+        label: "left-pad".to_string(),
+        artifact: TARBALL.to_string(),
+        member: "index.js".to_string(),
+    };
+    let good = write("npm__left-pad__1.3.0/package/index.js", &index);
+    let package = source(good.parent().unwrap(), "@@npm__left-pad__1.3.0//:package");
+    let other = source(tmp.path(), "@@npm__once__2.0.0//:package");
+    assert_eq!(
+        unpacked.check(&[package.clone(), other.clone()]),
+        Ok(good.clone())
+    );
+    let why = unpacked.check(std::slice::from_ref(&other)).unwrap_err();
+    assert!(why.contains("found 0"), "{why}");
+    // A label that only contains the name, but is no unpacked package.
+    let tarball = source(&good, "@@npm__left-pad__1.3.0//:package.tgz");
+    let why = unpacked.check(&[tarball]).unwrap_err();
+    assert!(why.contains("found 0"), "{why}");
+    let second = write("npm__left-pad__1.3.0_copy/package/index.js", &index);
+    let copy = source(
+        second.parent().unwrap(),
+        "@@npm__left-pad__1.3.0_copy//:package",
+    );
+    let why = unpacked.check(&[package.clone(), copy]).unwrap_err();
+    assert!(why.contains("found 2"), "{why}");
+    let empty = write(
+        "npm__left-pad__empty/package/README.md",
+        b"no index.js here",
+    );
+    let hollow = source(empty.parent().unwrap(), "@@npm__left-pad__empty//:package");
+    let why = unpacked.check(&[hollow]).unwrap_err();
+    assert!(why.contains("index.js"), "{why}");
+    let mut changed = index.clone();
+    changed[0] ^= 1;
+    write("npm__left-pad__1.3.0/package/index.js", &changed);
+    let why = unpacked.check(&[package]).unwrap_err();
+    assert!(why.contains("has digest"), "{why}");
+    // A member the mirrored tarball lacks is an error of the probe, not a panic.
+    let absent = ProbeFile::Unpacked {
+        label: "left-pad".to_string(),
+        artifact: TARBALL.to_string(),
+        member: "no-such-file.js".to_string(),
+    };
+    let why = absent.check(&[other]).unwrap_err();
+    assert!(why.contains("no member package/no-such-file.js"), "{why}");
+
+    // rules_csharp keeps one member of the package: the anchor is that member.
+    let member = ProbeFile::Sha256 {
+        label: "SP.Victim.dll".to_string(),
+        artifact: NUPKG.to_string(),
+        member: Some(DLL.to_string()),
+    };
+    let dll = member.expected().unwrap();
+    assert_ne!(dll, mirrored(NUPKG), "the member, not the package");
+    let kept = write("nuget_sp_victim/lib/SP.Victim.dll", &dll);
+    let kept_source = source(&kept, "@@nuget_sp_victim//:lib/SP.Victim.dll");
+    let unrelated = source(&good, "@@nuget_sp_other//:lib/SP.Other.dll");
+    assert_eq!(
+        member.check(&[kept_source.clone(), unrelated.clone()]),
+        Ok(kept.clone())
+    );
+    let why = member.check(&[unrelated]).unwrap_err();
+    assert!(why.contains("found 0"), "{why}");
+    let twin = write("nuget_sp_victim_2/lib/SP.Victim.dll", &dll);
+    let twin_source = source(&twin, "@@nuget_sp_victim_2//:lib/SP.Victim.dll");
+    let why = member
+        .check(&[kept_source.clone(), twin_source])
+        .unwrap_err();
+    assert!(why.contains("found 2"), "{why}");
+    // The whole package where the member is expected does not pass.
+    write("nuget_sp_victim/lib/SP.Victim.dll", &mirrored(NUPKG));
+    let why = member
+        .check(std::slice::from_ref(&kept_source))
+        .unwrap_err();
+    assert!(why.contains("has digest"), "{why}");
+    let mut changed = dll.clone();
+    *changed.last_mut().unwrap() ^= 1;
+    write("nuget_sp_victim/lib/SP.Victim.dll", &changed);
+    let why = member
+        .check(std::slice::from_ref(&kept_source))
+        .unwrap_err();
+    assert!(why.contains("has digest"), "{why}");
+    let absent = ProbeFile::Sha256 {
+        label: "SP.Victim.dll".to_string(),
+        artifact: NUPKG.to_string(),
+        member: Some("lib/net48/SP.Victim.dll".to_string()),
+    };
+    let why = absent.check(&[kept_source]).unwrap_err();
+    assert!(why.contains("lib/net48/SP.Victim.dll"), "{why}");
+    let unmirrored = ProbeFile::Sha256 {
+        label: "x".to_string(),
+        artifact: "api.nuget.org/v3-flatcontainer/sp.none/1.0.0/sp.none.1.0.0.nupkg".to_string(),
+        member: None,
+    };
+    assert!(unmirrored.expected().is_err());
+}
+
+#[test]
+fn every_known_registry_mounts_and_each_scope_is_served() {
+    let server = FixtureServer::start();
+    for name in REGISTRIES {
+        let scopes = mount(&server, &[name.to_string()]);
+        assert!(!scopes.is_empty(), "{name} owns no scope");
+    }
+}
+
+#[test]
+#[should_panic(expected = "MATRIX.json names an unknown registry \"cargo\"")]
+fn mounting_an_unknown_registry_is_refused() {
+    let server = FixtureServer::start();
+    mount(&server, &["npm".to_string(), "cargo".to_string()]);
 }
 
 /// `GET /<target>` on the fixture server: the status and the body.
@@ -913,6 +2275,22 @@ fn npm_registry_serves_tarballs_and_package_documents() {
     );
     let why = npm::mount(&server, misnamed.path()).unwrap_err();
     assert!(why.contains("holds \"left-pad\"@\"1.3.0\""), "{why}");
+    // A tarball without a manifest cannot be given a package document.
+    let mut hollow = tar::Builder::new(flate2::write::GzEncoder::new(
+        Vec::new(),
+        flate2::Compression::default(),
+    ));
+    let mut header = tar::Header::new_gnu();
+    header.set_size(1);
+    header.set_mode(0o644);
+    header.set_cksum();
+    hollow
+        .append_data(&mut header, "package/index.js", &b"x"[..])
+        .unwrap();
+    let hollow = hollow.into_inner().unwrap().finish().unwrap();
+    let unmanifested = mirror_of("registry.npmjs.org/hollow/-/hollow-1.0.0.tgz", &hollow);
+    let why = npm::mount(&server, unmanifested.path()).unwrap_err();
+    assert!(why.contains("no member package/package.json"), "{why}");
     assert!(npm::mount(&server, tempfile::tempdir().unwrap().path()).is_err());
 }
 
@@ -954,7 +2332,9 @@ fn maven_registry_serves_sha1_sidecars_and_a_loopback_repository() {
     // The mirrored `.md5` is served as it is and gets no sidecar of its own.
     assert_eq!(get(&server, &format!("maven2/{JAR}.md5")).0, 200);
     assert_eq!(get(&server, &format!("maven2/{JAR}.md5.sha1")).0, 404);
-    assert!(maven::mount(&server, tempfile::tempdir().unwrap().path()).is_err());
+    let empty = tempfile::tempdir().unwrap();
+    assert!(maven::mount(&server, empty.path()).is_err());
+    assert!(maven::mount_loopback(&server, empty.path()).is_err());
 }
 
 #[test]
@@ -990,6 +2370,8 @@ fn gem_registry_serves_gems_and_refuses_one_rules_ruby_would_skip() {
         gem::mount(&server, platform.path()).unwrap(),
         ["rubygems.org/gems/sp-victim-*", "rubygems.org/versions"]
     );
+    let why = gem::mount(&server, tempfile::tempdir().unwrap().path()).unwrap_err();
+    assert!(why.contains("no gem mirror"), "{why}");
 }
 
 #[test]
@@ -1022,8 +2404,52 @@ fn nuget_registry_serves_the_index_the_packages_and_a_refusal() {
     );
     assert_eq!(get(&server, NUPKG), (200, mirrored(NUPKG)));
 
-    nuget::refuse(&server, "SP.Victim", "1.0.0", 403);
-    assert_eq!(get(&server, NUPKG), (403, Vec::new()));
+    // The mirrored feed refusing its own package: a withdrawal.
+    nuget::refuse(
+        &server,
+        nuget::FLAT_CONTAINER_URL,
+        "SP.Victim",
+        "1.0.0",
+        410,
+    );
+    assert_eq!(get(&server, NUPKG), (410, Vec::new()));
+    // Another feed refusing a package it does not hold, at each of the three
+    // URLs a client tries there before it moves to its next source. Unrefused,
+    // each is a 404.
+    const FEED: &str = "patch.socket.dev/patch-registry/nuget/token/uuid/flat";
+    let spellings = [
+        format!("{FEED}/sp.other/1.0.0/sp.other.1.0.0.nupkg"),
+        format!("{FEED}/SP.Other/1.0.0/SP.Other.1.0.0.nupkg"),
+        format!("{FEED}/Download/SP.Other/1.0.0"),
+    ];
+    let base = format!("https://{FEED}/");
+    let asked = nuget::nupkg_spellings(&base, "SP.Other", "1.0.0");
+    assert_eq!(asked, spellings.clone().map(|url| format!("https://{url}")));
+    // The base is the same feed with or without its trailing slash.
+    assert_eq!(
+        nuget::nupkg_spellings(&format!("https://{FEED}"), "SP.Other", "1.0.0"),
+        asked
+    );
+    for spelling in &spellings {
+        assert_eq!(get(&server, spelling).0, 404, "{spelling}");
+    }
+    for status in [403, 503] {
+        nuget::refuse(&server, &base, "SP.Other", "1.0.0", status);
+        for spelling in &spellings {
+            assert_eq!(get(&server, spelling), (status, Vec::new()), "{spelling}");
+        }
+    }
+    // Another version, and the same package on the mirrored feed, are untouched.
+    assert_eq!(
+        get(
+            &server,
+            &format!("{FEED}/sp.other/2.0.0/sp.other.2.0.0.nupkg")
+        )
+        .0,
+        404
+    );
+    let upstream = "api.nuget.org/v3-flatcontainer/sp.other/1.0.0/sp.other.1.0.0.nupkg";
+    assert_eq!(get(&server, upstream), (200, mirrored(upstream)));
 
     let no_index = mirror_of(NUPKG, b"x");
     let why = nuget::mount(&server, no_index.path()).unwrap_err();
@@ -1037,6 +2463,20 @@ fn nuget_registry_serves_the_index_the_packages_and_a_refusal() {
         why.contains("names the flat container http://127.0.0.1:1/flat/"),
         "{why}"
     );
+    let search_only = mirror_of(
+        "api.nuget.org/v3/index.json",
+        br#"{"resources": [{"@id": "https://api.nuget.org/query", "@type": "SearchQueryService"}]}"#,
+    );
+    let why = nuget::mount(&server, search_only.path()).unwrap_err();
+    assert!(
+        why.contains("names no PackageBaseAddress/3.0.0 resource"),
+        "{why}"
+    );
+    let garbled = mirror_of("api.nuget.org/v3/index.json", b"<html>");
+    let why = nuget::mount(&server, garbled.path()).unwrap_err();
+    assert!(why.starts_with("v3/index.json: "), "{why}");
+    let why = nuget::mount(&server, tempfile::tempdir().unwrap().path()).unwrap_err();
+    assert!(why.contains("no NuGet mirror"), "{why}");
     let stray = mirror_of(
         "api.nuget.org/v3-flatcontainer/SP.Victim/1.0.0/SP.Victim.1.0.0.nupkg",
         b"x",

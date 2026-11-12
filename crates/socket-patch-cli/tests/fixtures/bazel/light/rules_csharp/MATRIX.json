@@ -24,10 +24,12 @@
       "cells": [
         {
           "bazel": "9.3.2",
+          "proof": 1,
           "tier": "nightly"
         },
         {
           "bazel": "8.8.2",
+          "proof": 1,
           "tier": "nightly"
         }
       ]

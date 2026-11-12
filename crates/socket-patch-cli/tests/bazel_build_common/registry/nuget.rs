@@ -15,8 +15,10 @@
 //! here cover the index and the mirrored ids, never the host.
 //!
 //! A source that fails is not skipped: a 403 or a 410 on a service index fails the
-//! repository fetch even when another source holds the package. [`refuse`] makes the
-//! server answer that way for one package.
+//! repository fetch even when another source holds the package. [`refuse`] makes a
+//! feed answer a bare status for one package, under any flat container: the mirrored
+//! one, or the feed of another host (the Socket feed asked for a package it does not
+//! hold), at every URL a client tries there ([`nupkg_spellings`]).
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -41,8 +43,24 @@ const FLAT_CONTAINER: &str = "v3-flatcontainer";
 /// The production URL of a package file. Ids and versions are lower-cased in the
 /// flat container whatever case the fixture writes them in.
 pub fn nupkg_url(id: &str, version: &str) -> String {
-    let (id, version) = (id.to_lowercase(), version.to_lowercase());
-    format!("{FLAT_CONTAINER_URL}{id}/{version}/{id}.{version}.nupkg")
+    let [lower, ..] = nupkg_spellings(FLAT_CONTAINER_URL, id, version);
+    lower
+}
+
+/// Every URL a client asks the flat container at `base` for the package file of `id`
+/// at `version`, in the order rules_csharp 0.5.0 tries them
+/// (`csharp/private/nuget_repo.bzl`, `package_urls`): the lower-cased path, which is
+/// the only one rules_dotnet asks for, the path in the case the lock writes, and the
+/// v2 `Download` route. A feed that does not hold a package is asked all three before
+/// the client moves to its next source.
+pub fn nupkg_spellings(base: &str, id: &str, version: &str) -> [String; 3] {
+    let base = base.trim_end_matches('/');
+    let (lower_id, lower_version) = (id.to_lowercase(), version.to_lowercase());
+    [
+        format!("{base}/{lower_id}/{lower_version}/{lower_id}.{lower_version}.nupkg"),
+        format!("{base}/{id}/{version}/{id}.{version}.nupkg"),
+        format!("{base}/Download/{id}/{version}"),
+    ]
 }
 
 /// The `PackageBaseAddress/3.0.0` resource of a service index.
@@ -119,9 +137,17 @@ pub fn mount(server: &FixtureServer, mirror: &Path) -> Result<Vec<String>, Strin
     Ok(scopes)
 }
 
-/// Answer the package file of `id` at `version` with a bare `status` instead (403,
-/// 503, or 410 for a withdrawal): what a feed does for a package it does not hold or
-/// no longer serves. Call it after [`mount`]; it replaces that one route.
-pub fn refuse(server: &FixtureServer, id: &str, version: &str, status: u16) {
-    server.serve_status(&nupkg_url(id, version), status);
+/// Have the flat container at `base` answer a bare `status` (403, 503, or 410 for a
+/// withdrawal) for the package file of `id` at `version`, at every spelling of
+/// [`nupkg_spellings`]: what a feed does for a package it does not hold or no longer
+/// serves. `base` is the URL the client joins a package path to: the feed's
+/// `PackageBaseAddress` for rules_dotnet, the source URL without its `/index.json`
+/// for rules_csharp. That is [`FLAT_CONTAINER_URL`] for the mirrored feed, or the
+/// flat container of another feed, such as the Socket one asked for a foreign
+/// package. Call it after [`mount`]: under the mirrored container it replaces the
+/// package's route.
+pub fn refuse(server: &FixtureServer, base: &str, id: &str, version: &str, status: u16) {
+    for url in nupkg_spellings(base, id, version) {
+        server.serve_status(&url, status);
+    }
 }

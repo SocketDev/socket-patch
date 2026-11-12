@@ -23,15 +23,18 @@
       "cells": [
         {
           "bazel": "9.3.2",
+          "proof": 1,
           "tier": "nightly",
           "outcome": "WORKS"
         },
         {
           "bazel": "8.8.2",
+          "proof": 1,
           "tier": "nightly",
           "outcome": "WORKS"
         }
-      ]
+      ],
+      "not_recorded_extension": "//deps:paket.main_extension.bzl%main_extension"
     },
     {
       "path": "bzlmod/e7",
@@ -44,6 +47,7 @@
       "cells": [
         {
           "bazel": "7.7.2",
+          "proof": 1,
           "tier": "nightly",
           "outcome": "WORKS-AFTER"
         }
