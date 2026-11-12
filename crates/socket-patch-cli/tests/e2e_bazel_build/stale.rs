@@ -18,6 +18,7 @@
 //! every state is then replayed in a fresh workspace copy with a fresh
 //! output base, which is also what a CI machine sees.
 
+use std::collections::BTreeSet;
 use std::path::Path;
 
 use serde_json::{json, Value};
@@ -32,7 +33,7 @@ use socket_patch_core::bazel::version::BazelVersion;
 use crate::bazel_build_common::env::System;
 use crate::bazel_build_common::invoke::Options;
 use crate::bazel_build_common::proof::PROBE;
-use crate::bazel_build_common::toy::{self, Toy, DEP, INDEXED};
+use crate::bazel_build_common::toy::{self, Toy, DEP, INDEXED, REGISTRY};
 
 const TEST: &str = "bazel_core_stale_verdict_matches_bazel";
 /// The input of the hub `toy`, which Bazel records in the lock.
@@ -41,19 +42,22 @@ const LOCK: &str = "toy.lock.json";
 /// records nothing but one fact per package of the toy registry.
 const FACTS_LOCK: &str = "facts/toy.lock.json";
 const FACTS_PROBE: &str = "//facts:socket_probe";
-const TOY_EXTENSION: ExtRef<'static> = ExtRef {
-    label: "//:toy.bzl",
-    name: "toy",
-};
-const FACTS_EXTENSION: ExtRef<'static> = ExtRef {
-    label: "//:toy.bzl",
-    name: "toy_facts",
-};
+const TOY_EXTENSION: ExtRef<'static> = extension("toy");
+const FACTS_EXTENSION: ExtRef<'static> = extension("toy_facts");
 /// What every Bazel line prints for a stale lock, whatever follows it.
 const STALE_LOCK: &str = "is no longer up-to-date";
 /// The start of the line for stale facts. The rest holds both fact dicts
 /// in full.
 const STALE_FACTS: &str = "has changed its facts";
+
+/// The extension `name` of the fixture's `toy.bzl`, by the label its
+/// `MODULE.bazel` passes to `use_extension`.
+const fn extension(name: &'static str) -> ExtRef<'static> {
+    match ExtRef::new("//:toy.bzl", name) {
+        Ok(extension) => extension,
+        Err(_) => panic!("`//:toy.bzl` is the label of an extension's file"),
+    }
+}
 
 /// The workspace copy of a cell as the pure layer reads files.
 struct Disk<'a>(&'a Path);
@@ -168,6 +172,7 @@ fn check(toy: &Toy, inputs: &Inputs, state: &State, when: &str) -> Value {
         let found = match &evidence {
             Evidence::Holds => "holds",
             Evidence::Pending { .. } => "pending",
+            Evidence::Incomparable { .. } => "incomparable",
             Evidence::DerivedStale { .. } => "derived stale",
         };
         assert_eq!(found, state.evidence, "{what}: {evidence:?}");
@@ -268,10 +273,38 @@ fn open() -> Option<Toy> {
     Some(toy)
 }
 
+/// What the cells that leave no report did on the network. The one report
+/// of the test is its last cell's, and by itself that report would say
+/// only what the last cell did. On a cache root that starts empty that is
+/// nothing: the first cell is the one that downloads Bazel's module
+/// archives, and every later cell finds them, and each toy package the
+/// first one fetched, in the shared repository cache.
+#[derive(Default)]
+struct Earlier {
+    /// A cell had to reach hosts directly (`Report::direct_network`).
+    direct_network: bool,
+    /// Every host the fixture server of a cell was asked for.
+    hosts: BTreeSet<String>,
+}
+
+/// Whether the repository cache of the cell holds the download with these
+/// bytes: Bazel then builds it with no request at all.
+fn cached(toy: &Toy, bytes: &[u8]) -> bool {
+    let downloads = toy
+        .cell
+        .scratch
+        .repository_cache
+        .join("content_addressable/sha256");
+    downloads.join(toy::sha256_hex(bytes)).exists()
+}
+
 /// End a cell that is not the test's last one, with every check of
 /// [`Toy::finish`] and without its report: a report of status `ran` is the
-/// evidence a claim rests on, and only the whole test may leave one.
-fn finish_without_report(toy: Toy) {
+/// evidence a claim rests on, and only the whole test may leave one. What
+/// the cell did on the network is kept in `earlier` for that report.
+fn finish_without_report(toy: Toy, earlier: &mut Earlier) {
+    earlier.direct_network |= toy.cell.report.direct_network;
+    earlier.hosts.extend(toy.server.hosts());
     let report = toy.cell.report.path();
     toy.finish();
     std::fs::remove_file(&report).unwrap_or_else(|e| panic!("remove {}: {e}", report.display()));
@@ -289,6 +322,10 @@ fn bazel_core_stale_verdict_matches_bazel() {
     let Some(toy) = open() else {
         return;
     };
+    let mut earlier = Earlier::default();
+    // With the upstream package in the repository cache already (a cache
+    // root an earlier run filled), no cell has to ask the registry for it.
+    let upstream_cached = cached(&toy, &DEP.upstream());
     let has_facts = toy.cell.scratch.workspace.join("facts").is_dir();
     let committed = toy.read(LOCK);
     let facts = has_facts.then(|| toy.read(FACTS_LOCK));
@@ -334,7 +371,7 @@ fn bazel_core_stale_verdict_matches_bazel() {
     let reverse = state("reverse", false, &second, "");
     write_inputs(&toy, &inputs, &reverse);
     note(&reverse, check(&toy, &inputs, &reverse, "where it arose"));
-    finish_without_report(toy);
+    finish_without_report(toy, &mut earlier);
 
     // The forged lock: the first lock with the recorded digest of the
     // input replaced by the pinned file's, and nothing else.
@@ -360,10 +397,26 @@ fn bazel_core_stale_verdict_matches_bazel() {
         let found = check(&toy, &inputs, state, "fresh output base");
         cold.insert(state.name.to_string(), found);
         if index + 1 < states.len() {
-            finish_without_report(toy);
+            finish_without_report(toy, &mut earlier);
             continue;
         }
+        // The report speaks for the whole test: a download any cell made
+        // directly, and the hosts every cell asked its fixture server for.
+        // `hosts` itself stays the last cell's log, which is all a report
+        // can take it from.
+        let mut asked = earlier.hosts.clone();
+        asked.extend(toy.server.hosts());
+        let registry = REGISTRY.trim_start_matches("https://");
+        assert!(
+            upstream_cached || asked.contains(registry),
+            "{TEST}: the repository cache did not hold the upstream package and no cell asked \
+             {registry} for it: {asked:?}"
+        );
         let report = &mut toy.cell.report;
+        report.direct_network |= earlier.direct_network;
+        let earlier_hosts: Vec<&String> = earlier.hosts.iter().collect();
+        report.detail("hosts_of_earlier_cells", json!(earlier_hosts));
+        report.detail("upstream_package_cached_at_start", upstream_cached);
         report.detail("facts_hub", has_facts);
         report.detail("where_it_arose", warm.clone());
         report.detail("fresh_output_base", cold.clone());

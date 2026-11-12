@@ -29,6 +29,7 @@
 //! the hidden stale-facts state on Bazel 8.6 to 9.2.
 
 use super::model::{DeclSystem, RunKind, RunRequired};
+use super::module_lock::GENERAL;
 use super::rc::{Chain, EffectiveFlags, Flag};
 use super::version::{BazelLine, BazelVersion, Tri};
 
@@ -128,7 +129,9 @@ pub struct Cx<'a> {
     /// ([`strict_repo_env`]): a variable in front of the command is then
     /// not seen by a repository rule.
     pub strict_repo_env: bool,
-    /// The lock holds facts.
+    /// The lock holds facts or can come to hold them:
+    /// `derived::facts_in_lock`, which `derived::decide` and
+    /// `Evidence::withhold` apply themselves.
     pub facts_in_lock: bool,
     /// The hub's apparent name (`use_repo`, or the WORKSPACE `name`), for
     /// a ruleset whose real-Bazel cell ran the targeted query refresh
@@ -211,15 +214,48 @@ pub fn lock_refresh(cx: &Cx<'_>, platforms: &[String]) -> Remedy {
 /// leaves (probe L1.d). Bazel trusts such an entry in every mode and the
 /// refresh alone does not heal it; a deleted entry fails closed and the
 /// refresh writes it again in full (probe L1.e).
+///
+/// `platforms` are the keys of the forged members of an entry keyed by OS
+/// and architecture; empty (or `general`) for an entry with one member.
+/// Only those members are deleted, and the command is named for the same
+/// keys: an `error`-mode build fails on a platform whose member is gone,
+/// and the refresh writes back only the member of the platform it runs on
+/// (probe L4), so a member deleted without need would stay missing.
 pub fn delete_entry(extension: &str, platforms: &[String]) -> Remedy {
-    let platforms = platform_keys(platforms);
-    let steps = vec![
-        format!(
-            "Delete the `{}` entry under `moduleExtensions` in MODULE.bazel.lock.",
-            plain(extension, "<extension>")
-        ),
-        run_sentence(LOCK_REFRESH, &platforms),
-    ];
+    let keyed: Vec<String> = platforms
+        .iter()
+        .filter(|k| *k != GENERAL)
+        .cloned()
+        .collect();
+    let platforms = platform_keys(&keyed);
+    let extension = plain(extension, "<extension>");
+    let steps = if platforms.is_empty() {
+        vec![
+            format!(
+                "Delete the `{extension}` entry under `moduleExtensions` in MODULE.bazel.lock."
+            ),
+            run_sentence(LOCK_REFRESH, &platforms),
+        ]
+    } else {
+        let quoted: Vec<String> = platforms.iter().map(|key| format!("`{key}`")).collect();
+        let (members, each) = match quoted.as_slice() {
+            [one] => (format!("{one} member"), "that platform"),
+            many => (
+                format!("{} members", many.join(", ")),
+                "each of those platforms",
+            ),
+        };
+        vec![
+            format!(
+                "Delete the {members} of the `{extension}` entry under `moduleExtensions` in \
+                 MODULE.bazel.lock, and leave its other members."
+            ),
+            format!(
+                "Run `{LOCK_REFRESH}` on {each} and commit the result: an entry keyed by OS \
+                 and architecture is written only on its own platform."
+            ),
+        ]
+    };
     let why = "The entry records the current digest of its input beside repositories from before \
                the pin, so Bazel reuses it and builds the unpatched package, and the refresh alone \
                leaves it as it is.";
@@ -244,10 +280,19 @@ pub fn repin(cx: &Cx<'_>, hub: &str, system: DeclSystem) -> Option<Remedy> {
     let command = match system {
         DeclSystem::Bzlmod => "bazel mod deps".to_string(),
         DeclSystem::Workspace => {
-            if cx.line.at_least(BazelVersion::new(9, 0, 0)) == Tri::Yes {
+            // A candidate orders below its release, and `sync` changed with
+            // the first candidate of each major: 9.0.0rc1 has no such
+            // command, and on 8.0.0rc1 it already fails without the flag.
+            // So each bound counts as the release it is a candidate of.
+            let line = BazelLine {
+                lo: cx.line.lo.map(BazelVersion::release),
+                hi: cx.line.hi.map(BazelVersion::release),
+                evidence: Vec::new(),
+            };
+            if line.at_least(BazelVersion::new(9, 0, 0)) == Tri::Yes {
                 return None;
             }
-            let flag = match cx.line.at_least(BazelVersion::new(8, 0, 0)) {
+            let flag = match line.at_least(BazelVersion::new(8, 0, 0)) {
                 Tri::Yes => " --enable_workspace",
                 Tri::Maybe => {
                     notes.push(
@@ -325,6 +370,45 @@ pub fn pip_compile_check(target: &str, dot_test: Tri) -> String {
     }
 }
 
+/// The manual procedure for a requirements lock that only a
+/// `gazelle_python_manifest` checks (design 6): the pin goes into the lock
+/// by hand, then the manifest's own update runs. That update regenerates
+/// the manifest, whose `integrity` covers the bytes of the lock, and
+/// never writes the lock, so the pin stays (remedy matrix 1.2, row 8).
+pub fn gazelle_manifest(target: &str) -> Remedy {
+    let update = format!("bazel run {}.update", plain(target, "<target>"));
+    let steps = vec![
+        "Write the pin into the lock by hand: replace the package's entry with its direct \
+         reference (its name, ` @ ` and the patch URL)."
+            .to_string(),
+        format!(
+            "Run `{update}`: it rewrites only the manifest, whose `integrity` covers the bytes \
+             of the lock, and leaves the pin in place."
+        ),
+    ];
+    Remedy {
+        kind: None,
+        command: update,
+        platforms: Vec::new(),
+        steps,
+        notes: Vec::new(),
+    }
+}
+
+/// What to do about a diff test over a checked-in `requirements.bzl`
+/// (remedy matrix 1.2, row 14). The file is generated from the lock by a
+/// target the project defines, so no command can be named; unlike the
+/// update of a pip-compile check, that regeneration reads the lock and
+/// keeps the pin.
+pub fn requirements_bzl() -> Remedy {
+    Remedy::unavailable(
+        "A diff test compares the checked-in `requirements.bzl` with this lock. The target that \
+         regenerates the file is the project's own (the rules_python example names it \
+         `//:vendor_requirements`); it reads the lock and does not drop the pin, so write the \
+         pin by hand and then run that target.",
+    )
+}
+
 /// The manual procedure for a requirements file that a
 /// `compile_pip_requirements` target checks (design 4.3): the sequence
 /// probe Y6 ran. pip-compile keeps only what its `.in` source names, so a
@@ -374,16 +458,19 @@ mod tests {
     }
 
     /// Every line the tests print remedies for: the pinned releases, the
-    /// two ends of the hidden-facts range, a floating major and no line.
+    /// first candidates of 8 and 9, the two ends of the hidden-facts
+    /// range, a floating major and no line.
     fn lines() -> Vec<BazelLine> {
         let exact = [
             "5.4.1",
             "6.6.0",
             "7.0.2",
             "7.7.2",
+            "8.0.0rc1",
             "8.4.2",
             "8.5.0",
             "8.8.2",
+            "9.0.0rc1",
             "9.2.0",
             "9.3.0",
             "9.3.2",
@@ -423,6 +510,10 @@ mod tests {
                 let what = format!("{line} {bits:03b}");
                 out.push((what.clone(), lock_refresh(&cx, keys)));
                 out.push((what.clone(), delete_entry("//:ext.bzl%toy", keys)));
+                out.push((
+                    what.clone(),
+                    delete_entry("//:ext.bzl%toy", &keys[..keys.len() / 2]),
+                ));
                 for system in [DeclSystem::Bzlmod, DeclSystem::Workspace] {
                     let what = format!("{what} {system:?}");
                     out.extend(repin(&cx, "crates", system).map(|r| (what.clone(), r)));
@@ -435,6 +526,9 @@ mod tests {
             let remedy = pip_compile_snippet("//third_party/py:requirements", dot_test);
             out.push((format!("pip-compile {dot_test:?}"), remedy));
         }
+        let manifest = gazelle_manifest("//:gazelle_python_manifest");
+        out.push(("gazelle manifest".to_string(), manifest));
+        out.push(("requirements.bzl".to_string(), requirements_bzl()));
         out.push((
             "none".to_string(),
             Remedy::unavailable("Regenerate the file."),
@@ -581,7 +675,15 @@ mod tests {
             let named = with_facts.text().contains(EXPUNGE_COMMAND);
             let expected = !matches!(
                 candidate.to_string().as_str(),
-                "5.4.1" | "6.6.0" | "7.0.2" | "7.7.2" | "8.4.2" | "9.3.0" | "9.3.2" | "10.0.0rc3"
+                "5.4.1"
+                    | "6.6.0"
+                    | "7.0.2"
+                    | "7.7.2"
+                    | "8.0.0rc1"
+                    | "8.4.2"
+                    | "9.3.0"
+                    | "9.3.2"
+                    | "10.0.0rc3"
             );
             assert_eq!(named, expected, "{candidate}");
             if named {
@@ -605,6 +707,43 @@ mod tests {
         );
         assert_eq!(remedy.command, LOCK_REFRESH);
         assert!(remedy.text().contains("builds the unpatched package"));
+        // `general` is the key of an entry with one member: the same text.
+        let general = delete_entry("//:ext.bzl%toy", &[GENERAL.to_string()]);
+        assert_eq!(general, delete_entry("//:ext.bzl%toy", &[]));
+        assert!(general.snippet().unwrap().starts_with(
+            "1. Delete the `//:ext.bzl%toy` entry under `moduleExtensions` in MODULE.bazel.lock.\n"
+        ));
+    }
+
+    /// Probe L4: with a platform's member gone the `error`-mode build of
+    /// that platform fails, and the refresh writes back only the member of
+    /// the platform it runs on. So only the forged members are deleted,
+    /// and the command is named for exactly those platforms.
+    #[test]
+    fn only_the_forged_platform_members_are_deleted_and_refreshed() {
+        let keys = [
+            "os:linux,arch:amd64".to_string(),
+            "os:osx,arch:aarch64".to_string(),
+        ];
+        let one = delete_entry("//:ext.bzl%toy", &keys[..1]);
+        assert_eq!(
+            one.snippet().unwrap(),
+            "1. Delete the `os:linux,arch:amd64` member of the `//:ext.bzl%toy` entry under \
+             `moduleExtensions` in MODULE.bazel.lock, and leave its other members.\n\
+             2. Run `bazel mod deps --lockfile_mode=update` on that platform and commit the \
+             result: an entry keyed by OS and architecture is written only on its own platform."
+        );
+        assert_eq!(one.platforms, keys[..1]);
+        assert!(!one.text().contains("os:osx"), "{}", one.text());
+        let both = delete_entry("//:ext.bzl%toy", &keys);
+        assert!(both.steps[0].starts_with(
+            "Delete the `os:linux,arch:amd64`, `os:osx,arch:aarch64` members of the \
+             `//:ext.bzl%toy` entry"
+        ));
+        assert!(both.steps[1].contains("on each of those platforms"));
+        assert_eq!(both.platforms, keys);
+        assert_eq!(both.run_required(true).unwrap().platforms, keys);
+        assert!(!both.text().contains("Delete the `//:ext.bzl%toy` entry"));
     }
 
     /// Probe R5: the variable in front of the command repins on 7.7.2,
@@ -667,10 +806,48 @@ mod tests {
             .text()
             .contains("On Bazel 8 add `--enable_workspace`"));
         // Bazel 9 has no `sync`: no command is printed for a hub that
-        // cannot be live there.
-        for version in ["9.0.2", "9.3.2", "10.0.0rc3"] {
+        // cannot be live there. A candidate of 9.0.0 has none either
+        // (`SyncCommand.java` is gone at the tag 9.0.0rc1), although it
+        // orders below the release.
+        for version in [
+            "9.0.0rc1",
+            "9.0.0rc3",
+            "9.0.0",
+            "9.0.2",
+            "9.3.2",
+            "10.0.0rc3",
+        ] {
             assert_eq!(command(version, false, workspace), None, "{version}");
         }
+        // On a candidate of 8.0.0 `sync` already fails without the flag.
+        for version in ["8.0.0rc1", "8.0.0rc2", "8.0.0"] {
+            let remedy = remedy(version, false, workspace).unwrap();
+            assert_eq!(
+                remedy.command, "CARGO_BAZEL_REPIN=1 bazel sync --only=crates --enable_workspace",
+                "{version}"
+            );
+            assert!(!remedy.text().contains("On Bazel 8 add"), "{version}");
+        }
+        // A floating major whose bottom is a candidate is that major.
+        let candidates_of = |major: u32| BazelLine {
+            lo: BazelVersion::parse(&format!("{major}.0.0rc1")),
+            hi: Some(BazelVersion::ceiling(major)),
+            evidence: Vec::new(),
+        };
+        let on = |line: &BazelLine| {
+            let cx = Cx {
+                line,
+                strict_repo_env: false,
+                facts_in_lock: false,
+                query_hub: None,
+            };
+            repin(&cx, "crates", workspace).map(|r| r.command)
+        };
+        assert_eq!(on(&candidates_of(9)), None);
+        assert_eq!(
+            on(&candidates_of(8)).as_deref(),
+            Some("CARGO_BAZEL_REPIN=1 bazel sync --only=crates --enable_workspace")
+        );
         for (what, remedy) in every_remedy() {
             let bzlmod_or_nine = what.ends_with("Bzlmod")
                 || ["9.", "10."].iter().any(|major| what.starts_with(major));
@@ -776,6 +953,41 @@ mod tests {
         );
     }
 
+    /// Remedy matrix 1.2, rows 8 and 14: the update of a gazelle manifest
+    /// and the regeneration of a checked-in `requirements.bzl` read the
+    /// lock and leave it alone, so neither text says the pin is dropped.
+    #[test]
+    fn a_manifest_and_a_requirements_bzl_check_keep_the_pin() {
+        let manifest = gazelle_manifest("//:gazelle_python_manifest");
+        let [pin, update] = manifest.steps.as_slice() else {
+            panic!("{:?}", manifest.steps);
+        };
+        assert!(pin.starts_with("Write the pin into the lock by hand"));
+        assert_eq!(
+            update,
+            "Run `bazel run //:gazelle_python_manifest.update`: it rewrites only the manifest, \
+             whose `integrity` covers the bytes of the lock, and leaves the pin in place."
+        );
+        assert_eq!(
+            manifest.command,
+            "bazel run //:gazelle_python_manifest.update"
+        );
+        // It refreshes no state socket-patch tracks: no advisory rides on it.
+        assert_eq!((manifest.kind, manifest.run_required(true)), (None, None));
+
+        let generated = requirements_bzl();
+        assert!(generated.command.is_empty() && generated.snippet().is_none());
+        assert!(generated.text().contains("does not drop the pin"));
+        assert!(generated.text().contains("the project's own"));
+        for remedy in [manifest, generated] {
+            assert!(
+                !remedy.text().contains("drops the pin"),
+                "{}",
+                remedy.text()
+            );
+        }
+    }
+
     /// A grant token is a path segment of a hosted URL. Whatever a caller
     /// hands over, no URL and nothing a shell would act on is printed.
     #[test]
@@ -797,6 +1009,7 @@ mod tests {
                 lock_refresh(&cx, &keys),
                 delete_entry(text, &keys),
                 pip_compile_snippet(text, Tri::Maybe),
+                gazelle_manifest(text),
             ];
             for system in [DeclSystem::Bzlmod, DeclSystem::Workspace] {
                 remedies.extend(repin(&cx, text, system));
