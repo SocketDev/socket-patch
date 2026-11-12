@@ -1,0 +1,3 @@
+# Byte-real Bazel probe evidence: CRLF, BOM and no-final-newline inputs whose
+# SHA-256 the committed MODULE.bazel.lock files record. No conversion on checkout.
+* -text

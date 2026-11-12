@@ -1,0 +1,90 @@
+{
+  "lockFileVersion": 28,
+  "registryFileHashes": {},
+  "selectedYankedVersions": {},
+  "moduleExtensions": {
+    "@@gazelle+//:extensions.bzl%go_deps": {
+      "general": {
+        "bzlTransitiveDigest": "v+KgtpjU6gusXBK+9Ef52y1SufVzeBs110WinoO4RJA=",
+        "usagesDigest": "A1cfLT9sNkiRPfD/L/vpR5Ssrffh9DDEMhW/WHRwaRU=",
+        "recordedInputs": [
+          "FILE:@@//go.mod d80cbfb457154a529fc967f0bf4212c4a53d688dd9d31fdf9633aba9612c6f26",
+          "FILE:@@//go.sum 32ebf33065ae32c04db5f4f81c2b5d43fe5433298e9a637446cc606eeec7befb",
+          "FILE:@@rules_go+//go.mod d364bbfdc94f18fb3c89ff88f68fdbce392aedbac2a266e74f0836635f37e944",
+          "FILE:@@rules_go+//go.sum 39540fd8f25fe4fc8889036c99dcfcff77acd2db368d4a8b53c0bfaf4eca7a6f",
+          "FILE:@@gazelle+//go.mod 1df5817f056bccee14a1fa2bae6ecbceb9ce7720019da2c501d9324782383577",
+          "FILE:@@gazelle+//go.sum 84478dad2d64d71c2a0fb6e5e56bc2efc06d31e8c4bf02903ed2452eeff54e35",
+          "FILE:@@gazelle+//v2/go.mod 07bf6292ce307261f66bba080ce021f635c56e8d9cbf6cfac46548d6d41b4ea2",
+          "FILE:@@gazelle+//v2/go.sum e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "FILE:@@othermod+//go.mod c6ab75f225085d3af9e8ac0a2908cd7133cff6272b9d2b37277c844d5980b1a5",
+          "FILE:@@othermod+//go.sum 4a03a26472c5df773653cf10ce6f08f1bbb7689138893bd0d39d0ffc67d36a28"
+        ],
+        "generatedRepoSpecs": {
+          "com_github_jackc_pgx_v5": {
+            "repoRuleId": "@@gazelle+//internal:go_repository.bzl%go_repository",
+            "attributes": {
+              "importpath": "github.com/jackc/pgx/v5",
+              "debug_mode": false,
+              "internal_only_do_not_use_apparent_name": "com_github_jackc_pgx_v5",
+              "version": "v5.7.1",
+              "sum": "h1:x7SYsPBYDkHDksogeSmZZ5xzThcTgRz++I5E+ePFUcs=",
+              "build_directives": [],
+              "build_file_generation": "auto",
+              "build_extra_args": []
+            }
+          },
+          "com_github_google_go_cmp": {
+            "repoRuleId": "@@gazelle+//internal:go_repository.bzl%go_repository",
+            "attributes": {
+              "importpath": "github.com/google/go-cmp",
+              "debug_mode": false,
+              "internal_only_do_not_use_apparent_name": "com_github_google_go_cmp",
+              "version": "v0.7.0",
+              "sum": "h1:wk8382ETsv4JYUZwIsn6YpYiWiBsYLSJiTsyBybVuN8=",
+              "build_directives": [],
+              "build_file_generation": "auto",
+              "build_extra_args": []
+            }
+          }
+        }
+      }
+    }
+  },
+  "facts": {
+    "@@gazelle+//:extensions.bzl%go_deps": {
+      "required_mod_files_v1": [
+        {
+          "importpath": "github.com/google/go-cmp",
+          "sha256": "e7c7669d4a1dd589ba3e024ba27f43f293db611fe075ce20d7b884370d63febd",
+          "version": "v0.5.9"
+        },
+        {
+          "importpath": "patch.socket.dev/gopatch/d8941a4c-4bcd-4756-b0aa-239ec9c81b0f/v5",
+          "sha256": "7b8ae117eb6a6fe1adda9624971609f505cd4a2d05d6bd89fea78a868c5bbccb",
+          "version": "v5.7.0-socketpatch.1"
+        },
+        {
+          "importpath": "github.com/google/go-cmp",
+          "sha256": "e7c7669d4a1dd589ba3e024ba27f43f293db611fe075ce20d7b884370d63febd",
+          "version": "v0.6.0"
+        },
+        {
+          "importpath": "github.com/jackc/pgx/v5",
+          "sha256": "eb7eee30b5d752dc7e368a22661d91cb25b51bc06141880b5649c468a3c7961f",
+          "version": "v5.7.1"
+        },
+        {
+          "importpath": "github.com/jackc/pgx/v5",
+          "sha256": "7b8ae117eb6a6fe1adda9624971609f505cd4a2d05d6bd89fea78a868c5bbccb",
+          "version": "v5.7.0"
+        },
+        {
+          "importpath": "github.com/google/go-cmp",
+          "sha256": "31c874a1d2a18e62b0550f823ce7a575c8dec7f8fd9d4fa1959bb12d7f7c0f14",
+          "version": "v0.7.0"
+        }
+      ]
+    }
+  },
+  "factsVersions": {}
+}

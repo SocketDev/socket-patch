@@ -1,0 +1,79 @@
+{
+  "checksum": "c31f0851a622dadaea6688dcde0ff3dd93edd86386611310478303c3ffc71880",
+  "conditions": {
+    "aarch64-apple-darwin": [
+      "aarch64-apple-darwin"
+    ],
+    "aarch64-unknown-linux-gnu": [
+      "aarch64-unknown-linux-gnu"
+    ],
+    "wasm32-unknown-unknown": [
+      "wasm32-unknown-unknown"
+    ],
+    "wasm32-wasip1": [
+      "wasm32-wasip1"
+    ],
+    "x86_64-pc-windows-msvc": [
+      "x86_64-pc-windows-msvc"
+    ],
+    "x86_64-unknown-linux-gnu": [
+      "x86_64-unknown-linux-gnu"
+    ],
+    "x86_64-unknown-nixos-gnu": [
+      "x86_64-unknown-nixos-gnu"
+    ]
+  },
+  "crates": {
+    "app 0.1.0": {
+      "common_attrs": {
+        "deps": [
+          {
+            "id": "cfg-if 1.0.0",
+            "target": "cfg_if"
+          }
+        ],
+        "edition": "2021"
+      },
+      "name": "app",
+      "repository": null,
+      "targets": [],
+      "version": "0.1.0"
+    },
+    "cfg-if 1.0.0": {
+      "common_attrs": {
+        "edition": "2018"
+      },
+      "library_target_name": "cfg_if",
+      "license": "MIT/Apache-2.0",
+      "license_file": "LICENSE-APACHE",
+      "license_ids": [
+        "Apache-2.0",
+        "MIT"
+      ],
+      "name": "cfg-if",
+      "package_url": "https://github.com/alexcrichton/cfg-if",
+      "repository": {
+        "Http": {
+          "sha256": "baf1de4339761588bc0619e3cbc0120ee582ebb74b53b4efbf79117bd2da40fd",
+          "url": "https://static.crates.io/crates/cfg-if/1.0.0/download"
+        }
+      },
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "cfg_if",
+            "crate_root": "src/lib.rs"
+          }
+        }
+      ],
+      "version": "1.0.0"
+    }
+  },
+  "direct_deps": [
+    "cfg-if 1.0.0"
+  ],
+  "direct_dev_deps": [],
+  "workspace_members": {
+    "app 0.1.0": ""
+  }
+}

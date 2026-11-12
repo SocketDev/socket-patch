@@ -1,0 +1,409 @@
+{
+  "probe": "X2",
+  "question": "Does a crate_universe hub expose BUILD.<name>-<version>.bazel under Bzlmod; does override_repo of a spoke leave the digest untouched; what happens to a stale override after a bump?",
+  "verdict": "hub file: REFUTED; digest untouched: CONFIRMED; stale override: hard error (see cells[].stale_override_after_bump)",
+  "host": "macOS arm64 (Darwin 27.0.0), 2026-11-11 / 2026-11-12",
+  "fixture": "rust_binary //:app on cfg-if =1.0.0; crate.from_cargo(name = 'crates', cargo_lockfile, manifests, lockfile = '//:cargo-bazel-lock.json'); //:oracle builds only against the patched crate (it calls cfg_if::socket_patched())",
+  "identical_on_every_line_sha256": {
+    "hub.BUILD.bazel": {
+      "7.7.2": "716d7d03490f3c377242cc98ebb8276396833d4817726f3a3c6c7371cc4dbc6b",
+      "8.8.2": "716d7d03490f3c377242cc98ebb8276396833d4817726f3a3c6c7371cc4dbc6b",
+      "9.3.2": "716d7d03490f3c377242cc98ebb8276396833d4817726f3a3c6c7371cc4dbc6b"
+    },
+    "spoke.BUILD.bazel": {
+      "7.7.2": "071edf8f80cabb9b259530a4620877c85fbe8ec8b666d114ff2766d8dc45e04d",
+      "8.8.2": "071edf8f80cabb9b259530a4620877c85fbe8ec8b666d114ff2766d8dc45e04d",
+      "9.3.2": "071edf8f80cabb9b259530a4620877c85fbe8ec8b666d114ff2766d8dc45e04d"
+    },
+    "cargo-bazel-lock.baseline.json": {
+      "7.7.2": "36d9b0810ad6bbb35db31b524d4eb7eb66ad98a8cc6f520cf87d5d03703b0a43",
+      "8.8.2": "36d9b0810ad6bbb35db31b524d4eb7eb66ad98a8cc6f520cf87d5d03703b0a43",
+      "9.3.2": "36d9b0810ad6bbb35db31b524d4eb7eb66ad98a8cc6f520cf87d5d03703b0a43"
+    }
+  },
+  "source_reading": {
+    "claim": "at every Bzlmod tag read the extension passes each spoke its BUILD text as build_file_content and puts only BUILD.bazel and defs.bzl (later also alias_rules.bzl, crates.bzl and per-alias packages) into the hub",
+    "tags": [
+      "0.38.0",
+      "0.49.3",
+      "0.54.1",
+      "0.56.0",
+      "0.57.1",
+      "0.60.0",
+      "0.65.0",
+      "0.70.0",
+      "0.74.0",
+      "0.75.0"
+    ],
+    "where": "rules_rust@<tag>:crate_universe/extension.bzl (<= 0.54.1) or extensions.bzl; 0.75.0 lines 711-729 (hub) and 750-766 (spokes)"
+  },
+  "cells": [
+    {
+      "bazel": "7.7.2",
+      "rules_rust": "0.75.0",
+      "hub": {
+        "canonical_name": "rules_rust~~crate~crates",
+        "files": [
+          "BUILD.bazel",
+          "WORKSPACE.bazel",
+          "alias_rules.bzl",
+          "cfg-if-1.0.0/BUILD.bazel",
+          "cfg-if/BUILD.bazel",
+          "crates.bzl",
+          "defs.bzl"
+        ],
+        "targets": [
+          "@crates//:cfg-if",
+          "@crates//:cfg-if-1.0.0",
+          "@crates//:srcs"
+        ],
+        "has_per_crate_build_file": false,
+        "query_per_crate_build_file": {
+          "exit": 7,
+          "errors": [
+            "ERROR: no such target '@@rules_rust~~crate~crates//:BUILD.cfg-if-1.0.0.bazel': target 'BUILD.cfg-if-1.0.0.bazel' not declared in package '' defined by <OUTPUT_BASE>/external/rules_rust~~crate~crates/BUILD.bazel"
+          ]
+        }
+      },
+      "spoke": {
+        "canonical_name": "rules_rust~~crate~crates__cfg-if-1.0.0",
+        "files": [
+          ".cargo_vcs_info.json",
+          ".github/workflows/main.yml",
+          ".gitignore",
+          "BUILD.bazel",
+          "Cargo.toml",
+          "Cargo.toml.orig",
+          "LICENSE-APACHE",
+          "LICENSE-MIT",
+          "README.md",
+          "REPO.bazel",
+          "WORKSPACE",
+          "src/lib.rs",
+          "tests/xcrate.rs"
+        ]
+      },
+      "baseline": {
+        "build_exit": 0,
+        "oracle_build_exit": 1,
+        "query_deps_exit": 0,
+        "cargo_bazel_lock_sha256": "36d9b0810ad6bbb35db31b524d4eb7eb66ad98a8cc6f520cf87d5d03703b0a43"
+      },
+      "override_with_hub_build_file": {
+        "exit": 1,
+        "cargo_bazel_lock_unchanged": true,
+        "module_lock_unchanged": true,
+        "first_error": "ERROR: no such package '@@_main~_repo_rules~socket_patch_crate_cfg_if_1_0_0//': BUILD file not found in directory '' of external repository @@_main~_repo_rules~socket_patch_crate_cfg_if_1_0_0. Add a BUILD file to a directory to mark it as a package."
+      },
+      "override_with_own_build_file": {
+        "exit": 0,
+        "oracle_prints": "SOCKET-PATCHED=1",
+        "cargo_bazel_lock_unchanged": true,
+        "module_lock_unchanged": true,
+        "repin_asked": false,
+        "after_mod_deps_update": {
+          "exit": 0,
+          "module_lock_unchanged": true,
+          "cargo_bazel_lock_unchanged": true
+        },
+        "query_deps_exit": 7,
+        "query_deps_error": "ERROR: Evaluation of query \"deps(//:oracle)\" failed: preloading transitive closure failed: no such package '@@[unknown repo 'platforms' requested from @@_main~_repo_rules~socket_patch_crate_cfg_if_1_0_0]//': The repository '@@[unknown repo 'platforms' requested from @@_main~_repo_rules~socket_patch_crate_cfg_if_1_0_0]' could not be resolved: No repository visible as '@platforms' from repository '@@_main~_repo_rules~socket_patch_crate_cfg_if_1_0_0'",
+        "query_deps_exit_with_root_platforms_dep": 0
+      },
+      "override_with_bazelignore": {
+        "exit": 0,
+        "oracle_prints": "SOCKET-PATCHED=1",
+        "cargo_bazel_lock_unchanged": true,
+        "module_lock_unchanged": true
+      },
+      "override_with_http_archive": {
+        "exit": 0,
+        "oracle_prints": "SOCKET-PATCHED=1",
+        "cargo_bazel_lock_unchanged": true,
+        "module_lock_unchanged": true
+      },
+      "stale_override_after_bump": {
+        "build_without_repin": {
+          "exit": 1,
+          "error": "Error: Digests do not match: Current Digest(\"c31f0851a622dadaea6688dcde0ff3dd93edd86386611310478303c3ffc71880\") != Expected Digest(\"7e6ce06702e30fc3e4777ad804aa802913996f9b3a9be80824d934c3b5f5044f\")"
+        },
+        "repin_mod_deps": {
+          "exit": 2,
+          "error": "ERROR: module extension \"crate\" from \"@@rules_rust~//crate_universe:extensions.bzl\" does not generate repository \"crates__cfg-if-1.0.0\", yet it is overridden via override_repo() at <PROBE>/x2/cells/rr0.75.0-b7.7.2/MODULE.bazel:22:14. Use inject_repo() instead to inject a new repository. Type 'bazel help mod' for syntax and help.",
+          "cargo_bazel_lock_rewritten_anyway": true
+        },
+        "build": {
+          "exit": 1,
+          "error": "ERROR: Analysis of target '//:app' failed; build aborted: module extension \"crate\" from \"@@rules_rust~//crate_universe:extensions.bzl\" does not generate repository \"crates__cfg-if-1.0.0\", yet it is overridden via override_repo() at <PROBE>/x2/cells/rr0.75.0-b7.7.2/MODULE.bazel:22:14. Use inject_repo() instead to inject a new repository."
+        },
+        "query_all_exit": 0,
+        "after_removing_override_line": {
+          "repin_exit": 0,
+          "build_exit": 0,
+          "new_spoke": "rules_rust~~crate~crates__cfg-if-1.0.4"
+        }
+      },
+      "spoke_with_a_crate_dependency": {
+        "baseline_build_exit": 0,
+        "override_build": {
+          "exit": 1,
+          "error": "ERROR: no such package '@@[unknown repo 'crates__cfg-if-1.0.0' requested from @@_main~_repo_rules~socket_patch_crate_instant_0_1_13]//': The repository '@@[unknown repo 'crates__cfg-if-1.0.0' requested from @@_main~_repo_rules~socket_patch_crate_instant_0_1_13]' could not be resolved: No repository visible as '@crates__cfg-if-1.0.0' from repository '@@_main~_repo_rules~socket_patch_crate_instant_0_1_13'"
+        },
+        "override_build_with_use_repo_of_the_dependency": {
+          "exit": 0,
+          "app_prints": "app: instant ok 0",
+          "cargo_bazel_lock_unchanged": true,
+          "module_lock_unchanged": true
+        },
+        "query_deps": {
+          "exit": 7,
+          "error": "ERROR: Evaluation of query \"deps(//:app)\" failed: preloading transitive closure failed: no such package '@@[unknown repo 'platforms' requested from @@_main~_repo_rules~socket_patch_crate_instant_0_1_13]//': The repository '@@[unknown repo 'platforms' requested from @@_main~_repo_rules~socket_patch_crate_instant_0_1_13]' could not be resolved: No repository visible as '@platforms' from repository '@@_main~_repo_rules~socket_patch_crate_instant_0_1_13'"
+        }
+      }
+    },
+    {
+      "bazel": "8.8.2",
+      "rules_rust": "0.75.0",
+      "hub": {
+        "canonical_name": "rules_rust++crate+crates",
+        "files": [
+          "BUILD.bazel",
+          "WORKSPACE.bazel",
+          "alias_rules.bzl",
+          "cfg-if-1.0.0/BUILD.bazel",
+          "cfg-if/BUILD.bazel",
+          "crates.bzl",
+          "defs.bzl"
+        ],
+        "targets": [
+          "@crates//:cfg-if",
+          "@crates//:cfg-if-1.0.0",
+          "@crates//:srcs"
+        ],
+        "has_per_crate_build_file": false,
+        "query_per_crate_build_file": {
+          "exit": 7,
+          "errors": [
+            "ERROR: no such target '@@rules_rust++crate+crates//:BUILD.cfg-if-1.0.0.bazel': target 'BUILD.cfg-if-1.0.0.bazel' not declared in package '' defined by <OUTPUT_BASE>/external/rules_rust++crate+crates/BUILD.bazel"
+          ]
+        }
+      },
+      "spoke": {
+        "canonical_name": "rules_rust++crate+crates__cfg-if-1.0.0",
+        "files": [
+          ".cargo_vcs_info.json",
+          ".github/workflows/main.yml",
+          ".gitignore",
+          "BUILD.bazel",
+          "Cargo.toml",
+          "Cargo.toml.orig",
+          "LICENSE-APACHE",
+          "LICENSE-MIT",
+          "README.md",
+          "REPO.bazel",
+          "src/lib.rs",
+          "tests/xcrate.rs"
+        ]
+      },
+      "baseline": {
+        "build_exit": 0,
+        "oracle_build_exit": 1,
+        "query_deps_exit": 0,
+        "cargo_bazel_lock_sha256": "36d9b0810ad6bbb35db31b524d4eb7eb66ad98a8cc6f520cf87d5d03703b0a43"
+      },
+      "override_with_hub_build_file": {
+        "exit": 1,
+        "cargo_bazel_lock_unchanged": true,
+        "module_lock_unchanged": true,
+        "first_error": "ERROR: no such package '@@+_repo_rules+socket_patch_crate_cfg_if_1_0_0//': BUILD file not found in directory '' of external repository @@+_repo_rules+socket_patch_crate_cfg_if_1_0_0. Add a BUILD file to a directory to mark it as a package."
+      },
+      "override_with_own_build_file": {
+        "exit": 0,
+        "oracle_prints": "SOCKET-PATCHED=1",
+        "cargo_bazel_lock_unchanged": true,
+        "module_lock_unchanged": true,
+        "repin_asked": false,
+        "after_mod_deps_update": {
+          "exit": 0,
+          "module_lock_unchanged": true,
+          "cargo_bazel_lock_unchanged": true
+        },
+        "query_deps_exit": 7,
+        "query_deps_error": "ERROR: Evaluation of query \"deps(//:oracle)\" failed: preloading transitive closure failed: no such package '@@[unknown repo 'platforms' requested from @@+_repo_rules+socket_patch_crate_cfg_if_1_0_0]//': The repository '@@[unknown repo 'platforms' requested from @@+_repo_rules+socket_patch_crate_cfg_if_1_0_0]' could not be resolved: No repository visible as '@platforms' from repository '@@+_repo_rules+socket_patch_crate_cfg_if_1_0_0'",
+        "query_deps_exit_with_root_platforms_dep": 0
+      },
+      "override_with_bazelignore": {
+        "exit": 0,
+        "oracle_prints": "SOCKET-PATCHED=1",
+        "cargo_bazel_lock_unchanged": true,
+        "module_lock_unchanged": true
+      },
+      "override_with_http_archive": {
+        "exit": 0,
+        "oracle_prints": "SOCKET-PATCHED=1",
+        "cargo_bazel_lock_unchanged": true,
+        "module_lock_unchanged": true
+      },
+      "stale_override_after_bump": {
+        "build_without_repin": {
+          "exit": 1,
+          "error": "Error: Digests do not match: Current Digest(\"c31f0851a622dadaea6688dcde0ff3dd93edd86386611310478303c3ffc71880\") != Expected Digest(\"7e6ce06702e30fc3e4777ad804aa802913996f9b3a9be80824d934c3b5f5044f\")"
+        },
+        "repin_mod_deps": {
+          "exit": 2,
+          "error": "ERROR: module extension @@rules_rust+//crate_universe:extensions.bzl%crate does not generate repository \"crates__cfg-if-1.0.0\", yet it is overridden via override_repo() at <PROBE>/x2/cells/rr0.75.0-b8.8.2/MODULE.bazel:22:14. Use inject_repo() instead to inject a new repository.",
+          "cargo_bazel_lock_rewritten_anyway": true
+        },
+        "build": {
+          "exit": 1,
+          "error": "ERROR: Analysis of target '//:app' failed; build aborted: module extension @@rules_rust+//crate_universe:extensions.bzl%crate does not generate repository \"crates__cfg-if-1.0.0\", yet it is overridden via override_repo() at <PROBE>/x2/cells/rr0.75.0-b8.8.2/MODULE.bazel:22:14. Use inject_repo() instead to inject a new repository."
+        },
+        "query_all_exit": 0,
+        "after_removing_override_line": {
+          "repin_exit": 0,
+          "build_exit": 0,
+          "new_spoke": "rules_rust++crate+crates__cfg-if-1.0.4"
+        }
+      },
+      "spoke_with_a_crate_dependency": {
+        "baseline_build_exit": 0,
+        "override_build": {
+          "exit": 1,
+          "error": "ERROR: no such package '@@[unknown repo 'crates__cfg-if-1.0.0' requested from @@+_repo_rules+socket_patch_crate_instant_0_1_13]//': The repository '@@[unknown repo 'crates__cfg-if-1.0.0' requested from @@+_repo_rules+socket_patch_crate_instant_0_1_13]' could not be resolved: No repository visible as '@crates__cfg-if-1.0.0' from repository '@@+_repo_rules+socket_patch_crate_instant_0_1_13'"
+        },
+        "override_build_with_use_repo_of_the_dependency": {
+          "exit": 0,
+          "app_prints": "app: instant ok 0",
+          "cargo_bazel_lock_unchanged": true,
+          "module_lock_unchanged": true
+        },
+        "query_deps": {
+          "exit": 7,
+          "error": "ERROR: Evaluation of query \"deps(//:app)\" failed: preloading transitive closure failed: no such package '@@[unknown repo 'platforms' requested from @@+_repo_rules+socket_patch_crate_instant_0_1_13]//': The repository '@@[unknown repo 'platforms' requested from @@+_repo_rules+socket_patch_crate_instant_0_1_13]' could not be resolved: No repository visible as '@platforms' from repository '@@+_repo_rules+socket_patch_crate_instant_0_1_13'"
+        }
+      }
+    },
+    {
+      "bazel": "9.3.2",
+      "rules_rust": "0.75.0",
+      "hub": {
+        "canonical_name": "rules_rust++crate+crates",
+        "files": [
+          "BUILD.bazel",
+          "WORKSPACE.bazel",
+          "alias_rules.bzl",
+          "cfg-if-1.0.0/BUILD.bazel",
+          "cfg-if/BUILD.bazel",
+          "crates.bzl",
+          "defs.bzl"
+        ],
+        "targets": [
+          "@crates//:cfg-if",
+          "@crates//:cfg-if-1.0.0",
+          "@crates//:srcs"
+        ],
+        "has_per_crate_build_file": false,
+        "query_per_crate_build_file": {
+          "exit": 7,
+          "errors": [
+            "ERROR: no such target '@@rules_rust++crate+crates//:BUILD.cfg-if-1.0.0.bazel': target 'BUILD.cfg-if-1.0.0.bazel' not declared in package '' defined by <OUTPUT_BASE>/external/rules_rust++crate+crates/BUILD.bazel"
+          ]
+        }
+      },
+      "spoke": {
+        "canonical_name": "rules_rust++crate+crates__cfg-if-1.0.0",
+        "files": [
+          ".cargo_vcs_info.json",
+          ".github/workflows/main.yml",
+          ".gitignore",
+          "BUILD.bazel",
+          "Cargo.toml",
+          "Cargo.toml.orig",
+          "LICENSE-APACHE",
+          "LICENSE-MIT",
+          "README.md",
+          "REPO.bazel",
+          "src/lib.rs",
+          "tests/xcrate.rs"
+        ]
+      },
+      "baseline": {
+        "build_exit": 0,
+        "oracle_build_exit": 1,
+        "query_deps_exit": 0,
+        "cargo_bazel_lock_sha256": "36d9b0810ad6bbb35db31b524d4eb7eb66ad98a8cc6f520cf87d5d03703b0a43"
+      },
+      "override_with_hub_build_file": {
+        "exit": 1,
+        "cargo_bazel_lock_unchanged": true,
+        "module_lock_unchanged": true,
+        "first_error": "ERROR: no such package '@@+new_local_repository+socket_patch_crate_cfg_if_1_0_0//': BUILD file not found in directory '' of external repository @@+new_local_repository+socket_patch_crate_cfg_if_1_0_0. Add a BUILD file to a directory to mark it as a package."
+      },
+      "override_with_own_build_file": {
+        "exit": 0,
+        "oracle_prints": "SOCKET-PATCHED=1",
+        "cargo_bazel_lock_unchanged": true,
+        "module_lock_unchanged": true,
+        "repin_asked": false,
+        "after_mod_deps_update": {
+          "exit": 0,
+          "module_lock_unchanged": true,
+          "cargo_bazel_lock_unchanged": true
+        },
+        "query_deps_exit": 7,
+        "query_deps_error": "ERROR: Evaluation of query \"deps(//:oracle)\" failed: preloading transitive closure failed: no such package '@@[unknown repo 'platforms' requested from @@+new_local_repository+socket_patch_crate_cfg_if_1_0_0]//': The repository '@@[unknown repo 'platforms' requested from @@+new_local_repository+socket_patch_crate_cfg_if_1_0_0]' could not be resolved: No repository visible as '@platforms' from repository '@@+new_local_repository+socket_patch_crate_cfg_if_1_0_0'",
+        "query_deps_exit_with_root_platforms_dep": 0
+      },
+      "override_with_bazelignore": {
+        "exit": 0,
+        "oracle_prints": "SOCKET-PATCHED=1",
+        "cargo_bazel_lock_unchanged": true,
+        "module_lock_unchanged": true
+      },
+      "override_with_http_archive": {
+        "exit": 0,
+        "oracle_prints": "SOCKET-PATCHED=1",
+        "cargo_bazel_lock_unchanged": true,
+        "module_lock_unchanged": true
+      },
+      "stale_override_after_bump": {
+        "build_without_repin": {
+          "exit": 1,
+          "error": "Error: Digests do not match: Current Digest(\"c31f0851a622dadaea6688dcde0ff3dd93edd86386611310478303c3ffc71880\") != Expected Digest(\"7e6ce06702e30fc3e4777ad804aa802913996f9b3a9be80824d934c3b5f5044f\")"
+        },
+        "repin_mod_deps": {
+          "exit": 2,
+          "error": "ERROR: module extension @@rules_rust+//crate_universe:extensions.bzl%crate does not generate repository \"crates__cfg-if-1.0.0\", yet it is overridden via override_repo() at <PROBE>/x2/cells/rr0.75.0-b9.3.2/MODULE.bazel:22:14. Use inject_repo() instead to inject a new repository.",
+          "cargo_bazel_lock_rewritten_anyway": true
+        },
+        "build": {
+          "exit": 1,
+          "error": "ERROR: Analysis of target '//:app' failed; build aborted: module extension @@rules_rust+//crate_universe:extensions.bzl%crate does not generate repository \"crates__cfg-if-1.0.0\", yet it is overridden via override_repo() at <PROBE>/x2/cells/rr0.75.0-b9.3.2/MODULE.bazel:22:14. Use inject_repo() instead to inject a new repository."
+        },
+        "query_all_exit": 0,
+        "after_removing_override_line": {
+          "repin_exit": 0,
+          "build_exit": 0,
+          "new_spoke": "rules_rust++crate+crates__cfg-if-1.0.4"
+        }
+      },
+      "spoke_with_a_crate_dependency": {
+        "baseline_build_exit": 0,
+        "override_build": {
+          "exit": 1,
+          "error": "ERROR: no such package '@@[unknown repo 'crates__cfg-if-1.0.0' requested from @@+new_local_repository+socket_patch_crate_instant_0_1_13]//': The repository '@@[unknown repo 'crates__cfg-if-1.0.0' requested from @@+new_local_repository+socket_patch_crate_instant_0_1_13]' could not be resolved: No repository visible as '@crates__cfg-if-1.0.0' from repository '@@+new_local_repository+socket_patch_crate_instant_0_1_13'"
+        },
+        "override_build_with_use_repo_of_the_dependency": {
+          "exit": 0,
+          "app_prints": "app: instant ok 0",
+          "cargo_bazel_lock_unchanged": true,
+          "module_lock_unchanged": true
+        },
+        "query_deps": {
+          "exit": 7,
+          "error": "ERROR: Evaluation of query \"deps(//:app)\" failed: preloading transitive closure failed: no such package '@@[unknown repo 'platforms' requested from @@+new_local_repository+socket_patch_crate_instant_0_1_13]//': The repository '@@[unknown repo 'platforms' requested from @@+new_local_repository+socket_patch_crate_instant_0_1_13]' could not be resolved: No repository visible as '@platforms' from repository '@@+new_local_repository+socket_patch_crate_instant_0_1_13'"
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,58 @@
+{
+  "lockFileVersion": 28,
+  "registryFileHashes": {},
+  "selectedYankedVersions": {},
+  "moduleExtensions": {
+    "@@gazelle+//:extensions.bzl%go_deps": {
+      "general": {
+        "bzlTransitiveDigest": "wD4ubUAgTvU/4ztpQOgwokoYUcVJ8mYvtIHRbE9g2NU=",
+        "usagesDigest": "NzAIFf6ZCLmgGWHmhEOOYSin1KPkhRN4hYLTbqU+DnE=",
+        "recordedInputs": [
+          "FILE:@@//go.mod 224888d21e902b9f9898e68dbe22efb5be7a5f8eba6752609799556f39f9e86b",
+          "FILE:@@//go.sum d1c4c025da50168e31fba018a902bdf6909c3aa21002e264e8613d081f525903",
+          "FILE:@@rules_go+//go.mod d364bbfdc94f18fb3c89ff88f68fdbce392aedbac2a266e74f0836635f37e944",
+          "FILE:@@rules_go+//go.sum 39540fd8f25fe4fc8889036c99dcfcff77acd2db368d4a8b53c0bfaf4eca7a6f",
+          "FILE:@@gazelle+//go.mod 41ee3d9c845fcc1be23a99b8ca8abf94efb900a71db91d728a83e370ea285f6d",
+          "FILE:@@gazelle+//go.sum f971198c107b00dd2e40c9d859ff85dc1211d889516bc42cf8f3a3ea20652d8b",
+          "FILE:@@gazelle+//v2/go.mod 07bf6292ce307261f66bba080ce021f635c56e8d9cbf6cfac46548d6d41b4ea2"
+        ],
+        "generatedRepoSpecs": {
+          "com_github_jackc_pgx_v5": {
+            "repoRuleId": "@@gazelle+//internal:go_repository.bzl%go_repository",
+            "attributes": {
+              "internal_only_do_not_use_apparent_name": "com_github_jackc_pgx_v5",
+              "importpath": "github.com/jackc/pgx/v5",
+              "build_directives": [],
+              "build_file_generation": "auto",
+              "build_extra_args": [],
+              "patches": [],
+              "patch_args": [],
+              "patch_cmds": [],
+              "debug_mode": false,
+              "version": "v5.7.0",
+              "sum": "h1:FG6VLIdzvAPhnYqP14sQ2xhFLkiUQHCs6ySqO91kF4g="
+            }
+          },
+          "com_github_google_go_cmp": {
+            "repoRuleId": "@@gazelle+//internal:go_repository.bzl%go_repository",
+            "attributes": {
+              "internal_only_do_not_use_apparent_name": "com_github_google_go_cmp",
+              "importpath": "github.com/google/go-cmp",
+              "build_directives": [],
+              "build_file_generation": "auto",
+              "build_extra_args": [],
+              "patches": [],
+              "patch_args": [],
+              "patch_cmds": [],
+              "debug_mode": false,
+              "version": "v0.6.0",
+              "sum": "h1:ofyhxvXcZhMsU5ulbFiLKl/XBFqE1GSq7atu8tAmTRI="
+            }
+          }
+        }
+      }
+    }
+  },
+  "facts": {},
+  "factsVersions": {}
+}

@@ -1,0 +1,4322 @@
+{
+ "probe": "X3",
+ "question": "Where do reproducible extensions' results live in the output base, in what format, and do they name the selected Go module version; what do gazelle facts record for a replaced module?",
+ "verdict": {
+  "hidden_lockfile": "CONFIRMED on 8.8.2 and 9.3.2 (<output_base>/MODULE.bazel.lock, the workspace lock's own JSON format, names the selected version of every go_deps repository); absent on 7.7.2, where nothing in the output base names the version",
+  "facts_as_selection_proof": "REFUTED: required_mod_files_v1 lists the .mod files `go list` was fed, not the selected versions; it names the Socket module at the pin while Bazel builds an unpatched higher version (state skew) and after the replace is gone (state restored)"
+ },
+ "host": "macOS arm64 (Darwin 27.0.0), 2026-11-12",
+ "fixture": {
+  "root": "example.com/x3 requires github.com/jackc/pgx/v5 v5.7.0 and github.com/google/go-cmp v0.5.9",
+  "socket_module": "patch.socket.dev/gopatch/d8941a4c-4bcd-4756-b0aa-239ec9c81b0f/v5 v5.7.0-socketpatch.1 (production free patch, through proxy.golang.org)",
+  "othermod": "a second Bazel module (local_path_override) whose go.mod requires pgx v5.7.1",
+  "states_in_order": [
+   "baseline",
+   "dir",
+   "hosted",
+   "skew",
+   "restored"
+  ],
+  "patched_bytes_marker": "pgproto3/function_call_decode_test.go"
+ },
+ "cells": [
+  {
+   "bazel": "7.7.2",
+   "gazelle": "0.54.0",
+   "rules_go": "0.65.0",
+   "go_sdk": "1.26.0",
+   "restored_lock_equals_baseline_lock": true,
+   "dir_replace_then_error_mode": null,
+   "repo_marker_sample": {
+    "@gazelle~~go_deps~com_github_jackc_pgx_v5.marker": [
+     "99422d6e11e10376d2d0d95f3c0e10ae90c8c82d0729cf0da36405271ee85359",
+     "ENV:GO_REPOSITORY_EPHEMERAL_MODCACHE \\0",
+     "FILE:@@gazelle~~go_deps~bazel_gazelle_go_repository_config//WORKSPACE 8bc182af8d73dbb53f644053efc73c253a46d4ffa4e896b2351402c3ba306c1a",
+     "FILE:@@gazelle~~go_deps~bazel_gazelle_go_repository_config//go.env e28f9bf2f26f4df9b85faf6c5c59ca23fb5eaebe73caf0d7cc5bef64a5c02ad8",
+     "FILE:@@gazelle~~non_module_deps~bazel_gazelle_go_repository_cache//go.env e28f9bf2f26f4df9b85faf6c5c59ca23fb5eaebe73caf0d7cc5bef64a5c02ad8",
+     "FILE:@@gazelle~~non_module_deps~bazel_gazelle_go_repository_tools//bin/fetch_repo cdba63e62e6ac0c6a46834011ea06165ac753353226f19027f60d407c725ff4a",
+     "FILE:@@gazelle~~non_module_deps~bazel_gazelle_go_repository_tools//bin/gazelle 1a1d8cae6acb00d77d56724981024204f1718a6db138c9bfa6cf333a24c68796",
+     "FILE:@@rules_go~~go_sdk~main___download_0_darwin_arm64//ROOT e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+     "REPO_MAPPING:gazelle~,bazel_gazelle_go_repository_cache gazelle~~non_module_deps~bazel_gazelle_go_repository_cache",
+     "REPO_MAPPING:gazelle~,bazel_gazelle_go_repository_tools gazelle~~non_module_deps~bazel_gazelle_go_repository_tools",
+     "REPO_MAPPING:gazelle~,bazel_tools bazel_tools"
+    ]
+   },
+   "states": {
+    "baseline": {
+     "mod_deps_exit": 0,
+     "build_exit": 0,
+     "errors": [],
+     "gazelle_notes": [
+      "DEBUG: <OUTPUT_BASE>/external/gazelle~/internal/bzlmod/go_deps.bzl:738:36: The following Go modules were required by the root module at the given versions, but were implicitly updated to higher versions due to transitive dependencies:"
+     ],
+     "mod_deps_error_mode_first": null,
+     "lock_changed_by_update": true,
+     "hidden_lock": {
+      "exists": false,
+      "recorded_go_mod_inputs_count": 0,
+      "recorded_go_mod_inputs_of_root_and_othermod": [],
+      "reduced_copy": null
+     },
+     "workspace_lock": {
+      "exists": true,
+      "bytes": 117844,
+      "sha256": "d85220df5948a94d0f2728c65c0a89abfaa8867bc6ff6ee75ea0513897eaef0a",
+      "lockFileVersion": 13,
+      "top_level_keys": [
+       "lockFileVersion",
+       "registryFileHashes",
+       "selectedYankedVersions",
+       "moduleExtensions"
+      ],
+      "go_deps_extension_key": null,
+      "facts_key": null
+     },
+     "show_repo": [
+      "## @com_github_jackc_pgx_v5:",
+      "version = \"v5.7.0\",",
+      "sum = \"h1:FG6VLIdzvAPhnYqP14sQ2xhFLkiUQHCs6ySqO91kF4g=\",",
+      "replace = \"\",",
+      "## @com_github_google_go_cmp:",
+      "version = \"v0.6.0\",",
+      "sum = \"h1:ofyhxvXcZhMsU5ulbFiLKl/XBFqE1GSq7atu8tAmTRI=\",",
+      "replace = \"\","
+     ],
+     "repo_dirs": {
+      "gazelle~~go_deps~com_github_jackc_pgx_v5": {
+       "is_symlink": false,
+       "entries_naming_a_version": []
+      },
+      "gazelle~~go_deps~com_github_google_go_cmp": {
+       "is_symlink": false,
+       "entries_naming_a_version": []
+      }
+     },
+     "repo_marker_first_lines": {
+      "@gazelle~~go_deps~com_github_jackc_pgx_v5.marker": "99422d6e11e10376d2d0d95f3c0e10ae90c8c82d0729cf0da36405271ee85359",
+      "@gazelle~~go_deps~com_github_google_go_cmp.marker": "89c6b49bb48b83f00024a9e94b0d2c514ace03873aee128c0dbfa7ae5efaaed7"
+     },
+     "go_repository_config": {
+      "dir": "gazelle~~go_deps~bazel_gazelle_go_repository_config",
+      "files": [
+       "BUILD.bazel",
+       "WORKSPACE",
+       "config.json",
+       "go.env",
+       "go_env.bzl",
+       "go_tools.bzl"
+      ],
+      "lines_naming_pgx": [
+       "    importpath = \"github.com/jackc/pgx/v5\",",
+       "    importpath = \"github.com/jackc/pgx/v5\","
+      ],
+      "names_a_version": false
+     },
+     "fetched_pgx": {
+      "dir": "gazelle~~go_deps~com_github_jackc_pgx_v5",
+      "is_symlink": false,
+      "patched_marker_file_present": false,
+      "function_call_go_sha256": "e0ede408acf1ecaf4dac0359e66301c7c7e86d20fab23a865796bdaa40a6887c",
+      "function_call_go_differs_from_baseline": false
+     },
+     "output_base_top_level": [
+      "DO_NOT_BUILD_HERE",
+      "README",
+      "action_cache",
+      "lock",
+      "modextwd",
+      "sandbox"
+     ]
+    },
+    "dir": {
+     "mod_deps_exit": 0,
+     "build_exit": 0,
+     "errors": [],
+     "gazelle_notes": null,
+     "mod_deps_error_mode_first": null,
+     "lock_changed_by_update": false,
+     "hidden_lock": {
+      "exists": false,
+      "recorded_go_mod_inputs_count": 0,
+      "recorded_go_mod_inputs_of_root_and_othermod": [],
+      "reduced_copy": null
+     },
+     "workspace_lock": {
+      "exists": true,
+      "bytes": 117844,
+      "sha256": "d85220df5948a94d0f2728c65c0a89abfaa8867bc6ff6ee75ea0513897eaef0a",
+      "lockFileVersion": 13,
+      "top_level_keys": [
+       "lockFileVersion",
+       "registryFileHashes",
+       "selectedYankedVersions",
+       "moduleExtensions"
+      ],
+      "go_deps_extension_key": null,
+      "facts_key": null
+     },
+     "show_repo": [
+      "## @com_github_jackc_pgx_v5:",
+      "local_path = \"<PROBE>/x3/cells/gz0.54.0-b7.7.2/ws/.socket/go-patches/github.com/jackc/pgx/v5@v5.7.0\",",
+      "version = \"\",",
+      "## @com_github_google_go_cmp:",
+      "version = \"v0.6.0\",",
+      "sum = \"h1:ofyhxvXcZhMsU5ulbFiLKl/XBFqE1GSq7atu8tAmTRI=\",",
+      "replace = \"\","
+     ],
+     "repo_dirs": {
+      "gazelle~~go_deps~com_github_jackc_pgx_v5": {
+       "is_symlink": false,
+       "entries_naming_a_version": []
+      },
+      "gazelle~~go_deps~com_github_google_go_cmp": {
+       "is_symlink": false,
+       "entries_naming_a_version": []
+      }
+     },
+     "repo_marker_first_lines": {
+      "@gazelle~~go_deps~com_github_jackc_pgx_v5.marker": "66dad2fd808c1e713181af07332f99145dc0d6e0815759387dfe0400035c4025",
+      "@gazelle~~go_deps~com_github_google_go_cmp.marker": "89c6b49bb48b83f00024a9e94b0d2c514ace03873aee128c0dbfa7ae5efaaed7"
+     },
+     "go_repository_config": {
+      "dir": "gazelle~~go_deps~bazel_gazelle_go_repository_config",
+      "files": [
+       "BUILD.bazel",
+       "WORKSPACE",
+       "config.json",
+       "go.env",
+       "go_env.bzl",
+       "go_tools.bzl"
+      ],
+      "lines_naming_pgx": [
+       "    importpath = \"github.com/jackc/pgx/v5\",",
+       "    importpath = \"github.com/jackc/pgx/v5\","
+      ],
+      "names_a_version": false
+     },
+     "fetched_pgx": {
+      "dir": "gazelle~~go_deps~com_github_jackc_pgx_v5",
+      "is_symlink": false,
+      "patched_marker_file_present": true,
+      "function_call_go_sha256": "e780e30ffd3e03b6012243c03b99aef12dfbfe6fa2f063521d52eb7a50b21e97",
+      "function_call_go_differs_from_baseline": true
+     },
+     "output_base_top_level": [
+      "DO_NOT_BUILD_HERE",
+      "README",
+      "action_cache",
+      "lock",
+      "modextwd",
+      "sandbox"
+     ]
+    },
+    "hosted": {
+     "mod_deps_exit": 0,
+     "build_exit": 0,
+     "errors": [],
+     "gazelle_notes": null,
+     "mod_deps_error_mode_first": null,
+     "lock_changed_by_update": false,
+     "hidden_lock": {
+      "exists": false,
+      "recorded_go_mod_inputs_count": 0,
+      "recorded_go_mod_inputs_of_root_and_othermod": [],
+      "reduced_copy": null
+     },
+     "workspace_lock": {
+      "exists": true,
+      "bytes": 117844,
+      "sha256": "d85220df5948a94d0f2728c65c0a89abfaa8867bc6ff6ee75ea0513897eaef0a",
+      "lockFileVersion": 13,
+      "top_level_keys": [
+       "lockFileVersion",
+       "registryFileHashes",
+       "selectedYankedVersions",
+       "moduleExtensions"
+      ],
+      "go_deps_extension_key": null,
+      "facts_key": null
+     },
+     "show_repo": [
+      "## @com_github_jackc_pgx_v5:",
+      "version = \"v5.7.0-socketpatch.1\",",
+      "sum = \"h1:gR/c/AlF3QdC7jqzW7DTXmKzYaNTFHD6MMmBuMntE2g=\",",
+      "replace = \"patch.socket.dev/gopatch/d8941a4c-4bcd-4756-b0aa-239ec9c81b0f/v5\",",
+      "## @com_github_google_go_cmp:",
+      "version = \"v0.6.0\",",
+      "sum = \"h1:ofyhxvXcZhMsU5ulbFiLKl/XBFqE1GSq7atu8tAmTRI=\",",
+      "replace = \"\","
+     ],
+     "repo_dirs": {
+      "gazelle~~go_deps~com_github_jackc_pgx_v5": {
+       "is_symlink": false,
+       "entries_naming_a_version": []
+      },
+      "gazelle~~go_deps~com_github_google_go_cmp": {
+       "is_symlink": false,
+       "entries_naming_a_version": []
+      }
+     },
+     "repo_marker_first_lines": {
+      "@gazelle~~go_deps~com_github_jackc_pgx_v5.marker": "a33ad60534f43e1a461a7849b1ee2f0377bea2b66e36bd7f6d0991b7c18613ad",
+      "@gazelle~~go_deps~com_github_google_go_cmp.marker": "89c6b49bb48b83f00024a9e94b0d2c514ace03873aee128c0dbfa7ae5efaaed7"
+     },
+     "go_repository_config": {
+      "dir": "gazelle~~go_deps~bazel_gazelle_go_repository_config",
+      "files": [
+       "BUILD.bazel",
+       "WORKSPACE",
+       "config.json",
+       "go.env",
+       "go_env.bzl",
+       "go_tools.bzl"
+      ],
+      "lines_naming_pgx": [
+       "    importpath = \"github.com/jackc/pgx/v5\",",
+       "    importpath = \"github.com/jackc/pgx/v5\","
+      ],
+      "names_a_version": false
+     },
+     "fetched_pgx": {
+      "dir": "gazelle~~go_deps~com_github_jackc_pgx_v5",
+      "is_symlink": false,
+      "patched_marker_file_present": true,
+      "function_call_go_sha256": "e780e30ffd3e03b6012243c03b99aef12dfbfe6fa2f063521d52eb7a50b21e97",
+      "function_call_go_differs_from_baseline": true
+     },
+     "output_base_top_level": [
+      "DO_NOT_BUILD_HERE",
+      "README",
+      "action_cache",
+      "lock",
+      "modextwd",
+      "sandbox"
+     ]
+    },
+    "skew": {
+     "mod_deps_exit": 0,
+     "build_exit": 0,
+     "errors": [],
+     "gazelle_notes": [
+      "DEBUG: <OUTPUT_BASE>/external/gazelle~/internal/bzlmod/go_deps.bzl:738:36: The following Go modules were required by the root module at the given versions, but were implicitly updated to higher versions due to transitive dependencies:"
+     ],
+     "mod_deps_error_mode_first": null,
+     "lock_changed_by_update": false,
+     "hidden_lock": {
+      "exists": false,
+      "recorded_go_mod_inputs_count": 0,
+      "recorded_go_mod_inputs_of_root_and_othermod": [],
+      "reduced_copy": null
+     },
+     "workspace_lock": {
+      "exists": true,
+      "bytes": 117844,
+      "sha256": "d85220df5948a94d0f2728c65c0a89abfaa8867bc6ff6ee75ea0513897eaef0a",
+      "lockFileVersion": 13,
+      "top_level_keys": [
+       "lockFileVersion",
+       "registryFileHashes",
+       "selectedYankedVersions",
+       "moduleExtensions"
+      ],
+      "go_deps_extension_key": null,
+      "facts_key": null
+     },
+     "show_repo": [
+      "## @com_github_jackc_pgx_v5:",
+      "version = \"v5.7.1\",",
+      "sum = \"h1:x7SYsPBYDkHDksogeSmZZ5xzThcTgRz++I5E+ePFUcs=\",",
+      "replace = \"\",",
+      "## @com_github_google_go_cmp:",
+      "version = \"v0.6.0\",",
+      "sum = \"h1:ofyhxvXcZhMsU5ulbFiLKl/XBFqE1GSq7atu8tAmTRI=\",",
+      "replace = \"\","
+     ],
+     "repo_dirs": {
+      "gazelle~~go_deps~com_github_jackc_pgx_v5": {
+       "is_symlink": false,
+       "entries_naming_a_version": []
+      },
+      "gazelle~~go_deps~com_github_google_go_cmp": {
+       "is_symlink": false,
+       "entries_naming_a_version": []
+      }
+     },
+     "repo_marker_first_lines": {
+      "@gazelle~~go_deps~com_github_jackc_pgx_v5.marker": "8093719b35b9e491308222a7e6ce777f80a1eb827149f40e55b93822b0531a1a",
+      "@gazelle~~go_deps~com_github_google_go_cmp.marker": "89c6b49bb48b83f00024a9e94b0d2c514ace03873aee128c0dbfa7ae5efaaed7"
+     },
+     "go_repository_config": {
+      "dir": "gazelle~~go_deps~bazel_gazelle_go_repository_config",
+      "files": [
+       "BUILD.bazel",
+       "WORKSPACE",
+       "config.json",
+       "go.env",
+       "go_env.bzl",
+       "go_tools.bzl"
+      ],
+      "lines_naming_pgx": [
+       "    importpath = \"github.com/jackc/pgx/v5\",",
+       "    importpath = \"github.com/jackc/pgx/v5\","
+      ],
+      "names_a_version": false
+     },
+     "fetched_pgx": {
+      "dir": "gazelle~~go_deps~com_github_jackc_pgx_v5",
+      "is_symlink": false,
+      "patched_marker_file_present": false,
+      "function_call_go_sha256": "e0ede408acf1ecaf4dac0359e66301c7c7e86d20fab23a865796bdaa40a6887c",
+      "function_call_go_differs_from_baseline": false
+     },
+     "output_base_top_level": [
+      "DO_NOT_BUILD_HERE",
+      "README",
+      "action_cache",
+      "lock",
+      "modextwd",
+      "sandbox"
+     ]
+    },
+    "restored": {
+     "mod_deps_exit": 0,
+     "build_exit": 0,
+     "errors": [],
+     "gazelle_notes": null,
+     "mod_deps_error_mode_first": {
+      "exit": 0,
+      "first_error": "",
+      "lock_unchanged": true
+     },
+     "lock_changed_by_update": false,
+     "hidden_lock": {
+      "exists": false,
+      "recorded_go_mod_inputs_count": 0,
+      "recorded_go_mod_inputs_of_root_and_othermod": [],
+      "reduced_copy": null
+     },
+     "workspace_lock": {
+      "exists": true,
+      "bytes": 117844,
+      "sha256": "d85220df5948a94d0f2728c65c0a89abfaa8867bc6ff6ee75ea0513897eaef0a",
+      "lockFileVersion": 13,
+      "top_level_keys": [
+       "lockFileVersion",
+       "registryFileHashes",
+       "selectedYankedVersions",
+       "moduleExtensions"
+      ],
+      "go_deps_extension_key": null,
+      "facts_key": null
+     },
+     "show_repo": [
+      "## @com_github_jackc_pgx_v5:",
+      "version = \"v5.7.0\",",
+      "sum = \"h1:FG6VLIdzvAPhnYqP14sQ2xhFLkiUQHCs6ySqO91kF4g=\",",
+      "replace = \"\",",
+      "## @com_github_google_go_cmp:",
+      "version = \"v0.6.0\",",
+      "sum = \"h1:ofyhxvXcZhMsU5ulbFiLKl/XBFqE1GSq7atu8tAmTRI=\",",
+      "replace = \"\","
+     ],
+     "repo_dirs": {
+      "gazelle~~go_deps~com_github_jackc_pgx_v5": {
+       "is_symlink": false,
+       "entries_naming_a_version": []
+      },
+      "gazelle~~go_deps~com_github_google_go_cmp": {
+       "is_symlink": false,
+       "entries_naming_a_version": []
+      }
+     },
+     "repo_marker_first_lines": {
+      "@gazelle~~go_deps~com_github_jackc_pgx_v5.marker": "99422d6e11e10376d2d0d95f3c0e10ae90c8c82d0729cf0da36405271ee85359",
+      "@gazelle~~go_deps~com_github_google_go_cmp.marker": "89c6b49bb48b83f00024a9e94b0d2c514ace03873aee128c0dbfa7ae5efaaed7"
+     },
+     "go_repository_config": {
+      "dir": "gazelle~~go_deps~bazel_gazelle_go_repository_config",
+      "files": [
+       "BUILD.bazel",
+       "WORKSPACE",
+       "config.json",
+       "go.env",
+       "go_env.bzl",
+       "go_tools.bzl"
+      ],
+      "lines_naming_pgx": [
+       "    importpath = \"github.com/jackc/pgx/v5\",",
+       "    importpath = \"github.com/jackc/pgx/v5\","
+      ],
+      "names_a_version": false
+     },
+     "fetched_pgx": {
+      "dir": "gazelle~~go_deps~com_github_jackc_pgx_v5",
+      "is_symlink": false,
+      "patched_marker_file_present": false,
+      "function_call_go_sha256": "e0ede408acf1ecaf4dac0359e66301c7c7e86d20fab23a865796bdaa40a6887c",
+      "function_call_go_differs_from_baseline": false
+     },
+     "output_base_top_level": [
+      "DO_NOT_BUILD_HERE",
+      "README",
+      "action_cache",
+      "lock",
+      "modextwd",
+      "sandbox"
+     ]
+    }
+   }
+  },
+  {
+   "bazel": "7.7.2",
+   "gazelle": "2.0.0-beta.2",
+   "rules_go": "0.65.0",
+   "go_sdk": "1.26.0",
+   "restored_lock_equals_baseline_lock": true,
+   "dir_replace_then_error_mode": null,
+   "repo_marker_sample": {
+    "@gazelle~~go_deps~com_github_jackc_pgx_v5.marker": [
+     "936c9550059a06c2dd95092f56fa3433bf1543077029eafa44ba6d67bf0a0940",
+     "ENV:GO_REPOSITORY_EPHEMERAL_MODCACHE \\0",
+     "FILE:@@gazelle~~go_deps~bazel_gazelle_go_repository_config//WORKSPACE 449b12d4bb586177bc3ad1d48e6e131bb01ef00e43b353e55dd494697a79771b",
+     "FILE:@@gazelle~~go_deps~bazel_gazelle_go_repository_config//go.env c8ca51be3ccef75482a22b66194ba8b14b763566208b09e4f58243a8a68d6e0b",
+     "FILE:@@gazelle~~non_module_deps~bazel_gazelle_go_repository_cache//go.env c8ca51be3ccef75482a22b66194ba8b14b763566208b09e4f58243a8a68d6e0b",
+     "FILE:@@gazelle~~non_module_deps~bazel_gazelle_go_repository_tools//bin/fetch_repo 42138aa55095dac05fc92e59a8d73291934465a308b6850e49c5b054e5572bdf",
+     "FILE:@@gazelle~~non_module_deps~bazel_gazelle_go_repository_tools//bin/gazelle 3e4d428540a40516a3ddfc88ed644ef143fc5178e9b56c4e817c05ff0e9b0b80",
+     "FILE:@@rules_go~~go_sdk~main___download_0_darwin_arm64//ROOT e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+     "REPO_MAPPING:gazelle~,bazel_gazelle_go_repository_cache gazelle~~non_module_deps~bazel_gazelle_go_repository_cache",
+     "REPO_MAPPING:gazelle~,bazel_gazelle_go_repository_tools gazelle~~non_module_deps~bazel_gazelle_go_repository_tools",
+     "REPO_MAPPING:gazelle~,bazel_tools bazel_tools"
+    ]
+   },
+   "states": {
+    "baseline": {
+     "mod_deps_exit": 0,
+     "build_exit": 0,
+     "errors": [],
+     "gazelle_notes": [
+      "DEBUG: <OUTPUT_BASE>/external/gazelle~/internal/bzlmod/go_deps.bzl:1643:25: Version conflict found for Go module github.com/google/go-cmp:\n    requested in root module: v0.5.9\n    selected by Go:           v0.7.0\nTo correct this:\n    1. Set the requested version to v0.7.0.\n    2. Ensure that no higher version is requested in any MODULE.bazel, go.mod,\n       or go.work file. When using go_deps.from_file, you can use 'go get'\n       to downgrade indirect dependencies if needed."
+     ],
+     "mod_deps_error_mode_first": null,
+     "lock_changed_by_update": true,
+     "hidden_lock": {
+      "exists": false,
+      "recorded_go_mod_inputs_count": 0,
+      "recorded_go_mod_inputs_of_root_and_othermod": [],
+      "reduced_copy": null
+     },
+     "workspace_lock": {
+      "exists": true,
+      "bytes": 117856,
+      "sha256": "291cf8d2045f47114bd19b1c26cb61a461fd02dc0e806b9116b7ffd92fd9b75a",
+      "lockFileVersion": 13,
+      "top_level_keys": [
+       "lockFileVersion",
+       "registryFileHashes",
+       "selectedYankedVersions",
+       "moduleExtensions"
+      ],
+      "go_deps_extension_key": null,
+      "facts_key": null
+     },
+     "show_repo": [
+      "## @com_github_jackc_pgx_v5:",
+      "local_path = \"\",",
+      "version = \"v5.7.0\",",
+      "sum = \"h1:FG6VLIdzvAPhnYqP14sQ2xhFLkiUQHCs6ySqO91kF4g=\",",
+      "replace = \"\",",
+      "## @com_github_google_go_cmp:",
+      "local_path = \"\",",
+      "version = \"v0.7.0\",",
+      "sum = \"h1:wk8382ETsv4JYUZwIsn6YpYiWiBsYLSJiTsyBybVuN8=\",",
+      "replace = \"\","
+     ],
+     "repo_dirs": {
+      "gazelle~~go_deps~com_github_jackc_pgx_v5": {
+       "is_symlink": false,
+       "entries_naming_a_version": []
+      },
+      "gazelle~~go_deps~com_github_google_go_cmp": {
+       "is_symlink": false,
+       "entries_naming_a_version": []
+      }
+     },
+     "repo_marker_first_lines": {
+      "@gazelle~~go_deps~com_github_jackc_pgx_v5.marker": "936c9550059a06c2dd95092f56fa3433bf1543077029eafa44ba6d67bf0a0940",
+      "@gazelle~~go_deps~com_github_google_go_cmp.marker": "fdc413ac33bbaf94cabd3f512e2449af9d103fd58d41dd62b4135cc340b29422"
+     },
+     "go_repository_config": {
+      "dir": "gazelle~~go_deps~bazel_gazelle_go_repository_config",
+      "files": [
+       "BUILD.bazel",
+       "WORKSPACE",
+       "config.json",
+       "go.env",
+       "go_env.bzl",
+       "go_tools.bzl"
+      ],
+      "lines_naming_pgx": [
+       "# gazelle:repository go_repository name=com_github_jackc_pgx_v5 importpath=github.com/jackc/pgx/v5",
+       "# gazelle:repository go_repository name=com_github_jackc_pgx_v5 importpath=github.com/jackc/pgx/v5"
+      ],
+      "names_a_version": false
+     },
+     "fetched_pgx": {
+      "dir": "gazelle~~go_deps~com_github_jackc_pgx_v5",
+      "is_symlink": false,
+      "patched_marker_file_present": false,
+      "function_call_go_sha256": "e0ede408acf1ecaf4dac0359e66301c7c7e86d20fab23a865796bdaa40a6887c",
+      "function_call_go_differs_from_baseline": false
+     },
+     "output_base_top_level": [
+      "DO_NOT_BUILD_HERE",
+      "README",
+      "action_cache",
+      "lock",
+      "modextwd",
+      "sandbox"
+     ]
+    },
+    "dir": {
+     "mod_deps_exit": 0,
+     "build_exit": 0,
+     "errors": [],
+     "gazelle_notes": null,
+     "mod_deps_error_mode_first": null,
+     "lock_changed_by_update": false,
+     "hidden_lock": {
+      "exists": false,
+      "recorded_go_mod_inputs_count": 0,
+      "recorded_go_mod_inputs_of_root_and_othermod": [],
+      "reduced_copy": null
+     },
+     "workspace_lock": {
+      "exists": true,
+      "bytes": 117856,
+      "sha256": "291cf8d2045f47114bd19b1c26cb61a461fd02dc0e806b9116b7ffd92fd9b75a",
+      "lockFileVersion": 13,
+      "top_level_keys": [
+       "lockFileVersion",
+       "registryFileHashes",
+       "selectedYankedVersions",
+       "moduleExtensions"
+      ],
+      "go_deps_extension_key": null,
+      "facts_key": null
+     },
+     "show_repo": [
+      "## @com_github_jackc_pgx_v5:",
+      "local_path = \"<PROBE>/x3/cells/gz2.0.0-beta.2-b7.7.2/ws/.socket/go-patches/github.com/jackc/pgx/v5@v5.7.0\",",
+      "version = \"\",",
+      "sum = \"\",",
+      "replace = \"\",",
+      "## @com_github_google_go_cmp:",
+      "local_path = \"\",",
+      "version = \"v0.7.0\",",
+      "sum = \"h1:wk8382ETsv4JYUZwIsn6YpYiWiBsYLSJiTsyBybVuN8=\",",
+      "replace = \"\","
+     ],
+     "repo_dirs": {
+      "gazelle~~go_deps~com_github_jackc_pgx_v5": {
+       "is_symlink": false,
+       "entries_naming_a_version": []
+      },
+      "gazelle~~go_deps~com_github_google_go_cmp": {
+       "is_symlink": false,
+       "entries_naming_a_version": []
+      }
+     },
+     "repo_marker_first_lines": {
+      "@gazelle~~go_deps~com_github_jackc_pgx_v5.marker": "34be6d3a2107d61222e43f66c8d9a9011149d90f6484e00f6896debde2d731ca",
+      "@gazelle~~go_deps~com_github_google_go_cmp.marker": "fdc413ac33bbaf94cabd3f512e2449af9d103fd58d41dd62b4135cc340b29422"
+     },
+     "go_repository_config": {
+      "dir": "gazelle~~go_deps~bazel_gazelle_go_repository_config",
+      "files": [
+       "BUILD.bazel",
+       "WORKSPACE",
+       "config.json",
+       "go.env",
+       "go_env.bzl",
+       "go_tools.bzl"
+      ],
+      "lines_naming_pgx": [
+       "# gazelle:repository go_repository name=com_github_jackc_pgx_v5 importpath=github.com/jackc/pgx/v5",
+       "# gazelle:repository go_repository name=com_github_jackc_pgx_v5 importpath=github.com/jackc/pgx/v5"
+      ],
+      "names_a_version": false
+     },
+     "fetched_pgx": {
+      "dir": "gazelle~~go_deps~com_github_jackc_pgx_v5",
+      "is_symlink": false,
+      "patched_marker_file_present": true,
+      "function_call_go_sha256": "e780e30ffd3e03b6012243c03b99aef12dfbfe6fa2f063521d52eb7a50b21e97",
+      "function_call_go_differs_from_baseline": true
+     },
+     "output_base_top_level": [
+      "DO_NOT_BUILD_HERE",
+      "README",
+      "action_cache",
+      "lock",
+      "modextwd",
+      "sandbox"
+     ]
+    },
+    "hosted": {
+     "mod_deps_exit": 0,
+     "build_exit": 0,
+     "errors": [],
+     "gazelle_notes": null,
+     "mod_deps_error_mode_first": null,
+     "lock_changed_by_update": false,
+     "hidden_lock": {
+      "exists": false,
+      "recorded_go_mod_inputs_count": 0,
+      "recorded_go_mod_inputs_of_root_and_othermod": [],
+      "reduced_copy": null
+     },
+     "workspace_lock": {
+      "exists": true,
+      "bytes": 117856,
+      "sha256": "291cf8d2045f47114bd19b1c26cb61a461fd02dc0e806b9116b7ffd92fd9b75a",
+      "lockFileVersion": 13,
+      "top_level_keys": [
+       "lockFileVersion",
+       "registryFileHashes",
+       "selectedYankedVersions",
+       "moduleExtensions"
+      ],
+      "go_deps_extension_key": null,
+      "facts_key": null
+     },
+     "show_repo": [
+      "## @com_github_jackc_pgx_v5:",
+      "local_path = \"\",",
+      "version = \"v5.7.0-socketpatch.1\",",
+      "sum = \"h1:gR/c/AlF3QdC7jqzW7DTXmKzYaNTFHD6MMmBuMntE2g=\",",
+      "replace = \"patch.socket.dev/gopatch/d8941a4c-4bcd-4756-b0aa-239ec9c81b0f/v5\",",
+      "## @com_github_google_go_cmp:",
+      "local_path = \"\",",
+      "version = \"v0.7.0\",",
+      "sum = \"h1:wk8382ETsv4JYUZwIsn6YpYiWiBsYLSJiTsyBybVuN8=\",",
+      "replace = \"\","
+     ],
+     "repo_dirs": {
+      "gazelle~~go_deps~com_github_jackc_pgx_v5": {
+       "is_symlink": false,
+       "entries_naming_a_version": []
+      },
+      "gazelle~~go_deps~com_github_google_go_cmp": {
+       "is_symlink": false,
+       "entries_naming_a_version": []
+      }
+     },
+     "repo_marker_first_lines": {
+      "@gazelle~~go_deps~com_github_jackc_pgx_v5.marker": "11f54748dc398a9ef0854f2292ece8ee38bd8febae385dd989098e8833e79083",
+      "@gazelle~~go_deps~com_github_google_go_cmp.marker": "fdc413ac33bbaf94cabd3f512e2449af9d103fd58d41dd62b4135cc340b29422"
+     },
+     "go_repository_config": {
+      "dir": "gazelle~~go_deps~bazel_gazelle_go_repository_config",
+      "files": [
+       "BUILD.bazel",
+       "WORKSPACE",
+       "config.json",
+       "go.env",
+       "go_env.bzl",
+       "go_tools.bzl"
+      ],
+      "lines_naming_pgx": [
+       "# gazelle:repository go_repository name=com_github_jackc_pgx_v5 importpath=github.com/jackc/pgx/v5",
+       "# gazelle:repository go_repository name=com_github_jackc_pgx_v5 importpath=github.com/jackc/pgx/v5"
+      ],
+      "names_a_version": false
+     },
+     "fetched_pgx": {
+      "dir": "gazelle~~go_deps~com_github_jackc_pgx_v5",
+      "is_symlink": false,
+      "patched_marker_file_present": true,
+      "function_call_go_sha256": "e780e30ffd3e03b6012243c03b99aef12dfbfe6fa2f063521d52eb7a50b21e97",
+      "function_call_go_differs_from_baseline": true
+     },
+     "output_base_top_level": [
+      "DO_NOT_BUILD_HERE",
+      "README",
+      "action_cache",
+      "lock",
+      "modextwd",
+      "sandbox"
+     ]
+    },
+    "skew": {
+     "mod_deps_exit": 0,
+     "build_exit": 0,
+     "errors": [],
+     "gazelle_notes": [
+      "DEBUG: <OUTPUT_BASE>/external/gazelle~/internal/bzlmod/go_deps.bzl:1643:25: Version conflict found for Go module github.com/google/go-cmp:\n    requested in root module: v0.5.9\n    selected by Go:           v0.7.0\nTo correct this:\n    1. Set the requested version to v0.7.0.\n    2. Ensure that no higher version is requested in any MODULE.bazel, go.mod,\n       or go.work file. When using go_deps.from_file, you can use 'go get'\n       to downgrade indirect dependencies if needed.",
+      "DEBUG: <OUTPUT_BASE>/external/gazelle~/internal/bzlmod/go_deps.bzl:1643:25: Version conflict found for Go module github.com/jackc/pgx/v5:\n    requested in root module: v5.7.0\n    selected by Go:           v5.7.1\nTo correct this:\n    1. Set the requested version to v5.7.1.\n    2. Ensure that no higher version is requested in any MODULE.bazel, go.mod,\n       or go.work file. When using go_deps.from_file, you can use 'go get'\n       to downgrade indirect dependencies if needed."
+     ],
+     "mod_deps_error_mode_first": null,
+     "lock_changed_by_update": false,
+     "hidden_lock": {
+      "exists": false,
+      "recorded_go_mod_inputs_count": 0,
+      "recorded_go_mod_inputs_of_root_and_othermod": [],
+      "reduced_copy": null
+     },
+     "workspace_lock": {
+      "exists": true,
+      "bytes": 117856,
+      "sha256": "291cf8d2045f47114bd19b1c26cb61a461fd02dc0e806b9116b7ffd92fd9b75a",
+      "lockFileVersion": 13,
+      "top_level_keys": [
+       "lockFileVersion",
+       "registryFileHashes",
+       "selectedYankedVersions",
+       "moduleExtensions"
+      ],
+      "go_deps_extension_key": null,
+      "facts_key": null
+     },
+     "show_repo": [
+      "## @com_github_jackc_pgx_v5:",
+      "local_path = \"\",",
+      "version = \"v5.7.1\",",
+      "sum = \"h1:x7SYsPBYDkHDksogeSmZZ5xzThcTgRz++I5E+ePFUcs=\",",
+      "replace = \"\",",
+      "## @com_github_google_go_cmp:",
+      "local_path = \"\",",
+      "version = \"v0.7.0\",",
+      "sum = \"h1:wk8382ETsv4JYUZwIsn6YpYiWiBsYLSJiTsyBybVuN8=\",",
+      "replace = \"\","
+     ],
+     "repo_dirs": {
+      "gazelle~~go_deps~com_github_jackc_pgx_v5": {
+       "is_symlink": false,
+       "entries_naming_a_version": []
+      },
+      "gazelle~~go_deps~com_github_google_go_cmp": {
+       "is_symlink": false,
+       "entries_naming_a_version": []
+      }
+     },
+     "repo_marker_first_lines": {
+      "@gazelle~~go_deps~com_github_jackc_pgx_v5.marker": "74310fca37d198d3b5bbd27ee931bb7c6db2c921e4f2698df1070592565d7426",
+      "@gazelle~~go_deps~com_github_google_go_cmp.marker": "fdc413ac33bbaf94cabd3f512e2449af9d103fd58d41dd62b4135cc340b29422"
+     },
+     "go_repository_config": {
+      "dir": "gazelle~~go_deps~bazel_gazelle_go_repository_config",
+      "files": [
+       "BUILD.bazel",
+       "WORKSPACE",
+       "config.json",
+       "go.env",
+       "go_env.bzl",
+       "go_tools.bzl"
+      ],
+      "lines_naming_pgx": [
+       "# gazelle:repository go_repository name=com_github_jackc_pgx_v5 importpath=github.com/jackc/pgx/v5",
+       "# gazelle:repository go_repository name=com_github_jackc_pgx_v5 importpath=github.com/jackc/pgx/v5"
+      ],
+      "names_a_version": false
+     },
+     "fetched_pgx": {
+      "dir": "gazelle~~go_deps~com_github_jackc_pgx_v5",
+      "is_symlink": false,
+      "patched_marker_file_present": false,
+      "function_call_go_sha256": "e0ede408acf1ecaf4dac0359e66301c7c7e86d20fab23a865796bdaa40a6887c",
+      "function_call_go_differs_from_baseline": false
+     },
+     "output_base_top_level": [
+      "DO_NOT_BUILD_HERE",
+      "README",
+      "action_cache",
+      "lock",
+      "modextwd",
+      "sandbox"
+     ]
+    },
+    "restored": {
+     "mod_deps_exit": 0,
+     "build_exit": 0,
+     "errors": [],
+     "gazelle_notes": null,
+     "mod_deps_error_mode_first": {
+      "exit": 0,
+      "first_error": "",
+      "lock_unchanged": true
+     },
+     "lock_changed_by_update": false,
+     "hidden_lock": {
+      "exists": false,
+      "recorded_go_mod_inputs_count": 0,
+      "recorded_go_mod_inputs_of_root_and_othermod": [],
+      "reduced_copy": null
+     },
+     "workspace_lock": {
+      "exists": true,
+      "bytes": 117856,
+      "sha256": "291cf8d2045f47114bd19b1c26cb61a461fd02dc0e806b9116b7ffd92fd9b75a",
+      "lockFileVersion": 13,
+      "top_level_keys": [
+       "lockFileVersion",
+       "registryFileHashes",
+       "selectedYankedVersions",
+       "moduleExtensions"
+      ],
+      "go_deps_extension_key": null,
+      "facts_key": null
+     },
+     "show_repo": [
+      "## @com_github_jackc_pgx_v5:",
+      "local_path = \"\",",
+      "version = \"v5.7.0\",",
+      "sum = \"h1:FG6VLIdzvAPhnYqP14sQ2xhFLkiUQHCs6ySqO91kF4g=\",",
+      "replace = \"\",",
+      "## @com_github_google_go_cmp:",
+      "local_path = \"\",",
+      "version = \"v0.7.0\",",
+      "sum = \"h1:wk8382ETsv4JYUZwIsn6YpYiWiBsYLSJiTsyBybVuN8=\",",
+      "replace = \"\","
+     ],
+     "repo_dirs": {
+      "gazelle~~go_deps~com_github_jackc_pgx_v5": {
+       "is_symlink": false,
+       "entries_naming_a_version": []
+      },
+      "gazelle~~go_deps~com_github_google_go_cmp": {
+       "is_symlink": false,
+       "entries_naming_a_version": []
+      }
+     },
+     "repo_marker_first_lines": {
+      "@gazelle~~go_deps~com_github_jackc_pgx_v5.marker": "936c9550059a06c2dd95092f56fa3433bf1543077029eafa44ba6d67bf0a0940",
+      "@gazelle~~go_deps~com_github_google_go_cmp.marker": "fdc413ac33bbaf94cabd3f512e2449af9d103fd58d41dd62b4135cc340b29422"
+     },
+     "go_repository_config": {
+      "dir": "gazelle~~go_deps~bazel_gazelle_go_repository_config",
+      "files": [
+       "BUILD.bazel",
+       "WORKSPACE",
+       "config.json",
+       "go.env",
+       "go_env.bzl",
+       "go_tools.bzl"
+      ],
+      "lines_naming_pgx": [
+       "# gazelle:repository go_repository name=com_github_jackc_pgx_v5 importpath=github.com/jackc/pgx/v5",
+       "# gazelle:repository go_repository name=com_github_jackc_pgx_v5 importpath=github.com/jackc/pgx/v5"
+      ],
+      "names_a_version": false
+     },
+     "fetched_pgx": {
+      "dir": "gazelle~~go_deps~com_github_jackc_pgx_v5",
+      "is_symlink": false,
+      "patched_marker_file_present": false,
+      "function_call_go_sha256": "e0ede408acf1ecaf4dac0359e66301c7c7e86d20fab23a865796bdaa40a6887c",
+      "function_call_go_differs_from_baseline": false
+     },
+     "output_base_top_level": [
+      "DO_NOT_BUILD_HERE",
+      "README",
+      "action_cache",
+      "lock",
+      "modextwd",
+      "sandbox"
+     ]
+    }
+   }
+  },
+  {
+   "bazel": "8.8.2",
+   "gazelle": "0.54.0",
+   "rules_go": "0.65.0",
+   "go_sdk": "1.26.0",
+   "restored_lock_equals_baseline_lock": true,
+   "dir_replace_then_error_mode": null,
+   "repo_marker_sample": {
+    "@gazelle++go_deps+com_github_jackc_pgx_v5.marker": [
+     "a05e67d7b6e77ee8dcdef604b6f66b00900f1769ef41cb7945169d89cf1fc70c",
+     "FILE:@@gazelle++go_deps+bazel_gazelle_go_repository_config//go.env 4a90f30f431de158b1a5bd6cd351c2162e7c57708cc708f65aea3f2a26da8a58",
+     "FILE:@@gazelle++non_module_deps+bazel_gazelle_go_repository_cache//go.env 4a90f30f431de158b1a5bd6cd351c2162e7c57708cc708f65aea3f2a26da8a58",
+     "FILE:@@gazelle++non_module_deps+bazel_gazelle_go_repository_tools//bin/fetch_repo cdba63e62e6ac0c6a46834011ea06165ac753353226f19027f60d407c725ff4a",
+     "ENV:GO_REPOSITORY_EPHEMERAL_MODCACHE \\0",
+     "FILE:@@gazelle++non_module_deps+bazel_gazelle_go_repository_tools//bin/gazelle 1a1d8cae6acb00d77d56724981024204f1718a6db138c9bfa6cf333a24c68796",
+     "FILE:@@gazelle++go_deps+bazel_gazelle_go_repository_config//WORKSPACE b72032fe58dab74e2120f4bc8b9bcecf38602b0943fcbe3340e6ba9effb7c458",
+     "REPO_MAPPING:gazelle+,bazel_gazelle_go_repository_cache gazelle++non_module_deps+bazel_gazelle_go_repository_cache",
+     "REPO_MAPPING:gazelle+,bazel_gazelle_go_repository_tools gazelle++non_module_deps+bazel_gazelle_go_repository_tools"
+    ]
+   },
+   "states": {
+    "baseline": {
+     "mod_deps_exit": 0,
+     "build_exit": 0,
+     "errors": [],
+     "gazelle_notes": [
+      "DEBUG: <OUTPUT_BASE>/external/gazelle+/internal/bzlmod/go_deps.bzl:738:36: The following Go modules were required by the root module at the given versions, but were implicitly updated to higher versions due to transitive dependencies:"
+     ],
+     "mod_deps_error_mode_first": null,
+     "lock_changed_by_update": true,
+     "hidden_lock": {
+      "exists": true,
+      "bytes": 574534,
+      "sha256": "1b97c311fe9af43cbe24856138f2d328084ce976d634cc4f88f99bf21292f8d7",
+      "lockFileVersion": 28,
+      "top_level_keys": [
+       "lockFileVersion",
+       "registryFileHashes",
+       "selectedYankedVersions",
+       "moduleExtensions",
+       "facts",
+       "factsVersions"
+      ],
+      "go_deps_extension_key": "@@gazelle+//:extensions.bzl%go_deps",
+      "go_deps_factor_keys": [
+       "general"
+      ],
+      "go_deps_entry_keys": [
+       "bzlTransitiveDigest",
+       "usagesDigest",
+       "recordedInputs",
+       "generatedRepoSpecs",
+       "moduleExtensionMetadata"
+      ],
+      "go_deps_repo_spec_count": 28,
+      "go_deps_repo_specs": {
+       "com_github_jackc_pgx_v5": {
+        "repoRuleId": "@@gazelle+//internal:go_repository.bzl%go_repository",
+        "attributes": {
+         "internal_only_do_not_use_apparent_name": "com_github_jackc_pgx_v5",
+         "importpath": "github.com/jackc/pgx/v5",
+         "build_directives": [],
+         "build_file_generation": "auto",
+         "build_extra_args": [],
+         "patches": [],
+         "patch_args": [],
+         "patch_cmds": [],
+         "debug_mode": false,
+         "replace": "",
+         "version": "v5.7.0",
+         "sum": "h1:FG6VLIdzvAPhnYqP14sQ2xhFLkiUQHCs6ySqO91kF4g="
+        }
+       },
+       "com_github_google_go_cmp": {
+        "repoRuleId": "@@gazelle+//internal:go_repository.bzl%go_repository",
+        "attributes": {
+         "internal_only_do_not_use_apparent_name": "com_github_google_go_cmp",
+         "importpath": "github.com/google/go-cmp",
+         "build_directives": [],
+         "build_file_generation": "auto",
+         "build_extra_args": [],
+         "patches": [],
+         "patch_args": [],
+         "patch_cmds": [],
+         "debug_mode": false,
+         "replace": "",
+         "version": "v0.6.0",
+         "sum": "h1:ofyhxvXcZhMsU5ulbFiLKl/XBFqE1GSq7atu8tAmTRI="
+        }
+       }
+      },
+      "go_deps_recorded_container": "recordedInputs",
+      "go_deps_recorded_input_kinds": [
+       "ENV",
+       "FILE",
+       "REPO_MAPPING"
+      ],
+      "recorded_go_mod_inputs_count": 9,
+      "recorded_go_mod_inputs_of_root_and_othermod": [
+       "FILE:@@//go.mod 224888d21e902b9f9898e68dbe22efb5be7a5f8eba6752609799556f39f9e86b",
+       "FILE:@@//go.sum d1c4c025da50168e31fba018a902bdf6909c3aa21002e264e8613d081f525903"
+      ],
+      "reduced_copy": "hidden/gz0.54.0-b8.8.2.baseline.reduced.json"
+     },
+     "workspace_lock": {
+      "exists": true,
+      "bytes": 177625,
+      "sha256": "f5c8fc21dca8a926913db1c87efb0254e27f0659d6afb74167525684ca65fdee",
+      "lockFileVersion": 28,
+      "top_level_keys": [
+       "lockFileVersion",
+       "registryFileHashes",
+       "selectedYankedVersions",
+       "moduleExtensions",
+       "facts",
+       "factsVersions"
+      ],
+      "go_deps_extension_key": null,
+      "facts_key": null
+     },
+     "show_repo": [
+      "## @com_github_jackc_pgx_v5:",
+      "version = \"v5.7.0\",",
+      "sum = \"h1:FG6VLIdzvAPhnYqP14sQ2xhFLkiUQHCs6ySqO91kF4g=\",",
+      "replace = \"\",",
+      "## @com_github_google_go_cmp:",
+      "version = \"v0.6.0\",",
+      "sum = \"h1:ofyhxvXcZhMsU5ulbFiLKl/XBFqE1GSq7atu8tAmTRI=\",",
+      "replace = \"\","
+     ],
+     "repo_dirs": {
+      "gazelle++go_deps+com_github_jackc_pgx_v5": {
+       "is_symlink": false,
+       "entries_naming_a_version": []
+      },
+      "gazelle++go_deps+com_github_google_go_cmp": {
+       "is_symlink": false,
+       "entries_naming_a_version": []
+      }
+     },
+     "repo_marker_first_lines": {
+      "@gazelle++go_deps+com_github_jackc_pgx_v5.marker": "a05e67d7b6e77ee8dcdef604b6f66b00900f1769ef41cb7945169d89cf1fc70c",
+      "@gazelle++go_deps+com_github_google_go_cmp.marker": "48d42fbec5b5731e899db8457a4826f6e05bd07f63cac0c80f44bab5f4d33f21"
+     },
+     "go_repository_config": {
+      "dir": "gazelle++go_deps+bazel_gazelle_go_repository_config",
+      "files": [
+       "BUILD.bazel",
+       "WORKSPACE",
+       "config.json",
+       "go.env",
+       "go_env.bzl",
+       "go_tools.bzl"
+      ],
+      "lines_naming_pgx": [
+       "    importpath = \"github.com/jackc/pgx/v5\",",
+       "    importpath = \"github.com/jackc/pgx/v5\","
+      ],
+      "names_a_version": false
+     },
+     "fetched_pgx": {
+      "dir": "gazelle++go_deps+com_github_jackc_pgx_v5",
+      "is_symlink": false,
+      "patched_marker_file_present": false,
+      "function_call_go_sha256": "e0ede408acf1ecaf4dac0359e66301c7c7e86d20fab23a865796bdaa40a6887c",
+      "function_call_go_differs_from_baseline": false
+     },
+     "output_base_top_level": [
+      "DO_NOT_BUILD_HERE",
+      "MODULE.bazel.lock",
+      "README",
+      "action_cache",
+      "lock",
+      "modextwd",
+      "sandbox"
+     ]
+    },
+    "dir": {
+     "mod_deps_exit": 0,
+     "build_exit": 0,
+     "errors": [],
+     "gazelle_notes": null,
+     "mod_deps_error_mode_first": null,
+     "lock_changed_by_update": false,
+     "hidden_lock": {
+      "exists": true,
+      "bytes": 574612,
+      "sha256": "7769bf6330f9eca9c03cfc6e751119b1cf5300d4cba330414f6a80003c96aa83",
+      "lockFileVersion": 28,
+      "top_level_keys": [
+       "lockFileVersion",
+       "registryFileHashes",
+       "selectedYankedVersions",
+       "moduleExtensions",
+       "facts",
+       "factsVersions"
+      ],
+      "go_deps_extension_key": "@@gazelle+//:extensions.bzl%go_deps",
+      "go_deps_factor_keys": [
+       "general"
+      ],
+      "go_deps_entry_keys": [
+       "bzlTransitiveDigest",
+       "usagesDigest",
+       "recordedInputs",
+       "generatedRepoSpecs",
+       "moduleExtensionMetadata"
+      ],
+      "go_deps_repo_spec_count": 28,
+      "go_deps_repo_specs": {
+       "com_github_jackc_pgx_v5": {
+        "repoRuleId": "@@gazelle+//internal:go_repository.bzl%go_repository",
+        "attributes": {
+         "internal_only_do_not_use_apparent_name": "com_github_jackc_pgx_v5",
+         "importpath": "github.com/jackc/pgx/v5",
+         "build_directives": [],
+         "build_file_generation": "auto",
+         "build_extra_args": [],
+         "patches": [],
+         "patch_args": [],
+         "patch_cmds": [],
+         "debug_mode": false,
+         "version": "",
+         "local_path": "<PROBE>/x3/cells/gz0.54.0-b8.8.2/ws/.socket/go-patches/github.com/jackc/pgx/v5@v5.7.0"
+        }
+       },
+       "com_github_google_go_cmp": {
+        "repoRuleId": "@@gazelle+//internal:go_repository.bzl%go_repository",
+        "attributes": {
+         "internal_only_do_not_use_apparent_name": "com_github_google_go_cmp",
+         "importpath": "github.com/google/go-cmp",
+         "build_directives": [],
+         "build_file_generation": "auto",
+         "build_extra_args": [],
+         "patches": [],
+         "patch_args": [],
+         "patch_cmds": [],
+         "debug_mode": false,
+         "replace": "",
+         "version": "v0.6.0",
+         "sum": "h1:ofyhxvXcZhMsU5ulbFiLKl/XBFqE1GSq7atu8tAmTRI="
+        }
+       }
+      },
+      "go_deps_recorded_container": "recordedInputs",
+      "go_deps_recorded_input_kinds": [
+       "ENV",
+       "FILE",
+       "REPO_MAPPING"
+      ],
+      "recorded_go_mod_inputs_count": 9,
+      "recorded_go_mod_inputs_of_root_and_othermod": [
+       "FILE:@@//go.mod 6057e59c8fd5d6da86cffecfb0a7f18a1eea8be2062c96c44a7c1bfa9fe4be7b",
+       "FILE:@@//go.sum 94f69a8520879fb7d1ab78837628a6d03f31e5446617fc882a74a71b99d9ccb9"
+      ],
+      "reduced_copy": "hidden/gz0.54.0-b8.8.2.dir.reduced.json"
+     },
+     "workspace_lock": {
+      "exists": true,
+      "bytes": 177625,
+      "sha256": "f5c8fc21dca8a926913db1c87efb0254e27f0659d6afb74167525684ca65fdee",
+      "lockFileVersion": 28,
+      "top_level_keys": [
+       "lockFileVersion",
+       "registryFileHashes",
+       "selectedYankedVersions",
+       "moduleExtensions",
+       "facts",
+       "factsVersions"
+      ],
+      "go_deps_extension_key": null,
+      "facts_key": null
+     },
+     "show_repo": [
+      "## @com_github_jackc_pgx_v5:",
+      "local_path = \"<PROBE>/x3/cells/gz0.54.0-b8.8.2/ws/.socket/go-patches/github.com/jackc/pgx/v5@v5.7.0\",",
+      "version = \"\",",
+      "## @com_github_google_go_cmp:",
+      "version = \"v0.6.0\",",
+      "sum = \"h1:ofyhxvXcZhMsU5ulbFiLKl/XBFqE1GSq7atu8tAmTRI=\",",
+      "replace = \"\","
+     ],
+     "repo_dirs": {
+      "gazelle++go_deps+com_github_jackc_pgx_v5": {
+       "is_symlink": false,
+       "entries_naming_a_version": []
+      },
+      "gazelle++go_deps+com_github_google_go_cmp": {
+       "is_symlink": false,
+       "entries_naming_a_version": []
+      }
+     },
+     "repo_marker_first_lines": {
+      "@gazelle++go_deps+com_github_jackc_pgx_v5.marker": "8b1b41c0cb29ac89f9dc7625a1e1fb2b08f7e12f2b5520327be6d55654aa70c3",
+      "@gazelle++go_deps+com_github_google_go_cmp.marker": "48d42fbec5b5731e899db8457a4826f6e05bd07f63cac0c80f44bab5f4d33f21"
+     },
+     "go_repository_config": {
+      "dir": "gazelle++go_deps+bazel_gazelle_go_repository_config",
+      "files": [
+       "BUILD.bazel",
+       "WORKSPACE",
+       "config.json",
+       "go.env",
+       "go_env.bzl",
+       "go_tools.bzl"
+      ],
+      "lines_naming_pgx": [
+       "    importpath = \"github.com/jackc/pgx/v5\",",
+       "    importpath = \"github.com/jackc/pgx/v5\","
+      ],
+      "names_a_version": false
+     },
+     "fetched_pgx": {
+      "dir": "gazelle++go_deps+com_github_jackc_pgx_v5",
+      "is_symlink": false,
+      "patched_marker_file_present": true,
+      "function_call_go_sha256": "e780e30ffd3e03b6012243c03b99aef12dfbfe6fa2f063521d52eb7a50b21e97",
+      "function_call_go_differs_from_baseline": true
+     },
+     "output_base_top_level": [
+      "DO_NOT_BUILD_HERE",
+      "MODULE.bazel.lock",
+      "README",
+      "action_cache",
+      "lock",
+      "modextwd",
+      "sandbox"
+     ]
+    },
+    "hosted": {
+     "mod_deps_exit": 0,
+     "build_exit": 0,
+     "errors": [],
+     "gazelle_notes": null,
+     "mod_deps_error_mode_first": null,
+     "lock_changed_by_update": false,
+     "hidden_lock": {
+      "exists": true,
+      "bytes": 574612,
+      "sha256": "c7ee5cfae52fe5d983f0283e5727314d6db88d02de900e9f38ca0a2d480c364e",
+      "lockFileVersion": 28,
+      "top_level_keys": [
+       "lockFileVersion",
+       "registryFileHashes",
+       "selectedYankedVersions",
+       "moduleExtensions",
+       "facts",
+       "factsVersions"
+      ],
+      "go_deps_extension_key": "@@gazelle+//:extensions.bzl%go_deps",
+      "go_deps_factor_keys": [
+       "general"
+      ],
+      "go_deps_entry_keys": [
+       "bzlTransitiveDigest",
+       "usagesDigest",
+       "recordedInputs",
+       "generatedRepoSpecs",
+       "moduleExtensionMetadata"
+      ],
+      "go_deps_repo_spec_count": 28,
+      "go_deps_repo_specs": {
+       "com_github_jackc_pgx_v5": {
+        "repoRuleId": "@@gazelle+//internal:go_repository.bzl%go_repository",
+        "attributes": {
+         "internal_only_do_not_use_apparent_name": "com_github_jackc_pgx_v5",
+         "importpath": "github.com/jackc/pgx/v5",
+         "build_directives": [],
+         "build_file_generation": "auto",
+         "build_extra_args": [],
+         "patches": [],
+         "patch_args": [],
+         "patch_cmds": [],
+         "debug_mode": false,
+         "replace": "patch.socket.dev/gopatch/d8941a4c-4bcd-4756-b0aa-239ec9c81b0f/v5",
+         "version": "v5.7.0-socketpatch.1",
+         "sum": "h1:gR/c/AlF3QdC7jqzW7DTXmKzYaNTFHD6MMmBuMntE2g="
+        }
+       },
+       "com_github_google_go_cmp": {
+        "repoRuleId": "@@gazelle+//internal:go_repository.bzl%go_repository",
+        "attributes": {
+         "internal_only_do_not_use_apparent_name": "com_github_google_go_cmp",
+         "importpath": "github.com/google/go-cmp",
+         "build_directives": [],
+         "build_file_generation": "auto",
+         "build_extra_args": [],
+         "patches": [],
+         "patch_args": [],
+         "patch_cmds": [],
+         "debug_mode": false,
+         "replace": "",
+         "version": "v0.6.0",
+         "sum": "h1:ofyhxvXcZhMsU5ulbFiLKl/XBFqE1GSq7atu8tAmTRI="
+        }
+       }
+      },
+      "go_deps_recorded_container": "recordedInputs",
+      "go_deps_recorded_input_kinds": [
+       "ENV",
+       "FILE",
+       "REPO_MAPPING"
+      ],
+      "recorded_go_mod_inputs_count": 9,
+      "recorded_go_mod_inputs_of_root_and_othermod": [
+       "FILE:@@//go.mod d80cbfb457154a529fc967f0bf4212c4a53d688dd9d31fdf9633aba9612c6f26",
+       "FILE:@@//go.sum 32ebf33065ae32c04db5f4f81c2b5d43fe5433298e9a637446cc606eeec7befb"
+      ],
+      "reduced_copy": "hidden/gz0.54.0-b8.8.2.hosted.reduced.json"
+     },
+     "workspace_lock": {
+      "exists": true,
+      "bytes": 177625,
+      "sha256": "f5c8fc21dca8a926913db1c87efb0254e27f0659d6afb74167525684ca65fdee",
+      "lockFileVersion": 28,
+      "top_level_keys": [
+       "lockFileVersion",
+       "registryFileHashes",
+       "selectedYankedVersions",
+       "moduleExtensions",
+       "facts",
+       "factsVersions"
+      ],
+      "go_deps_extension_key": null,
+      "facts_key": null
+     },
+     "show_repo": [
+      "## @com_github_jackc_pgx_v5:",
+      "version = \"v5.7.0-socketpatch.1\",",
+      "sum = \"h1:gR/c/AlF3QdC7jqzW7DTXmKzYaNTFHD6MMmBuMntE2g=\",",
+      "replace = \"patch.socket.dev/gopatch/d8941a4c-4bcd-4756-b0aa-239ec9c81b0f/v5\",",
+      "## @com_github_google_go_cmp:",
+      "version = \"v0.6.0\",",
+      "sum = \"h1:ofyhxvXcZhMsU5ulbFiLKl/XBFqE1GSq7atu8tAmTRI=\",",
+      "replace = \"\","
+     ],
+     "repo_dirs": {
+      "gazelle++go_deps+com_github_jackc_pgx_v5": {
+       "is_symlink": false,
+       "entries_naming_a_version": []
+      },
+      "gazelle++go_deps+com_github_google_go_cmp": {
+       "is_symlink": false,
+       "entries_naming_a_version": []
+      }
+     },
+     "repo_marker_first_lines": {
+      "@gazelle++go_deps+com_github_jackc_pgx_v5.marker": "3ef937cef57c58accf0637110f45ada5e547f8a5ae37aa93a6aa2813c4cd10fd",
+      "@gazelle++go_deps+com_github_google_go_cmp.marker": "48d42fbec5b5731e899db8457a4826f6e05bd07f63cac0c80f44bab5f4d33f21"
+     },
+     "go_repository_config": {
+      "dir": "gazelle++go_deps+bazel_gazelle_go_repository_config",
+      "files": [
+       "BUILD.bazel",
+       "WORKSPACE",
+       "config.json",
+       "go.env",
+       "go_env.bzl",
+       "go_tools.bzl"
+      ],
+      "lines_naming_pgx": [
+       "    importpath = \"github.com/jackc/pgx/v5\",",
+       "    importpath = \"github.com/jackc/pgx/v5\","
+      ],
+      "names_a_version": false
+     },
+     "fetched_pgx": {
+      "dir": "gazelle++go_deps+com_github_jackc_pgx_v5",
+      "is_symlink": false,
+      "patched_marker_file_present": true,
+      "function_call_go_sha256": "e780e30ffd3e03b6012243c03b99aef12dfbfe6fa2f063521d52eb7a50b21e97",
+      "function_call_go_differs_from_baseline": true
+     },
+     "output_base_top_level": [
+      "DO_NOT_BUILD_HERE",
+      "MODULE.bazel.lock",
+      "README",
+      "action_cache",
+      "lock",
+      "modextwd",
+      "sandbox"
+     ]
+    },
+    "skew": {
+     "mod_deps_exit": 0,
+     "build_exit": 0,
+     "errors": [],
+     "gazelle_notes": [
+      "DEBUG: <OUTPUT_BASE>/external/gazelle+/internal/bzlmod/go_deps.bzl:738:36: The following Go modules were required by the root module at the given versions, but were implicitly updated to higher versions due to transitive dependencies:"
+     ],
+     "mod_deps_error_mode_first": null,
+     "lock_changed_by_update": false,
+     "hidden_lock": {
+      "exists": true,
+      "bytes": 574836,
+      "sha256": "88a4304532dcaf2a6e9401f3355843d20747d0136d9bf1940d2e5b09993064d1",
+      "lockFileVersion": 28,
+      "top_level_keys": [
+       "lockFileVersion",
+       "registryFileHashes",
+       "selectedYankedVersions",
+       "moduleExtensions",
+       "facts",
+       "factsVersions"
+      ],
+      "go_deps_extension_key": "@@gazelle+//:extensions.bzl%go_deps",
+      "go_deps_factor_keys": [
+       "general"
+      ],
+      "go_deps_entry_keys": [
+       "bzlTransitiveDigest",
+       "usagesDigest",
+       "recordedInputs",
+       "generatedRepoSpecs",
+       "moduleExtensionMetadata"
+      ],
+      "go_deps_repo_spec_count": 28,
+      "go_deps_repo_specs": {
+       "com_github_jackc_pgx_v5": {
+        "repoRuleId": "@@gazelle+//internal:go_repository.bzl%go_repository",
+        "attributes": {
+         "internal_only_do_not_use_apparent_name": "com_github_jackc_pgx_v5",
+         "importpath": "github.com/jackc/pgx/v5",
+         "build_directives": [],
+         "build_file_generation": "auto",
+         "build_extra_args": [],
+         "patches": [],
+         "patch_args": [],
+         "patch_cmds": [],
+         "debug_mode": false,
+         "replace": "",
+         "version": "v5.7.1",
+         "sum": "h1:x7SYsPBYDkHDksogeSmZZ5xzThcTgRz++I5E+ePFUcs="
+        }
+       },
+       "com_github_google_go_cmp": {
+        "repoRuleId": "@@gazelle+//internal:go_repository.bzl%go_repository",
+        "attributes": {
+         "internal_only_do_not_use_apparent_name": "com_github_google_go_cmp",
+         "importpath": "github.com/google/go-cmp",
+         "build_directives": [],
+         "build_file_generation": "auto",
+         "build_extra_args": [],
+         "patches": [],
+         "patch_args": [],
+         "patch_cmds": [],
+         "debug_mode": false,
+         "replace": "",
+         "version": "v0.6.0",
+         "sum": "h1:ofyhxvXcZhMsU5ulbFiLKl/XBFqE1GSq7atu8tAmTRI="
+        }
+       }
+      },
+      "go_deps_recorded_container": "recordedInputs",
+      "go_deps_recorded_input_kinds": [
+       "ENV",
+       "FILE",
+       "REPO_MAPPING"
+      ],
+      "recorded_go_mod_inputs_count": 11,
+      "recorded_go_mod_inputs_of_root_and_othermod": [
+       "FILE:@@//go.mod d80cbfb457154a529fc967f0bf4212c4a53d688dd9d31fdf9633aba9612c6f26",
+       "FILE:@@//go.sum 32ebf33065ae32c04db5f4f81c2b5d43fe5433298e9a637446cc606eeec7befb",
+       "FILE:@@othermod+//go.mod c6ab75f225085d3af9e8ac0a2908cd7133cff6272b9d2b37277c844d5980b1a5",
+       "FILE:@@othermod+//go.sum 4a03a26472c5df773653cf10ce6f08f1bbb7689138893bd0d39d0ffc67d36a28"
+      ],
+      "reduced_copy": "hidden/gz0.54.0-b8.8.2.skew.reduced.json"
+     },
+     "workspace_lock": {
+      "exists": true,
+      "bytes": 177625,
+      "sha256": "f5c8fc21dca8a926913db1c87efb0254e27f0659d6afb74167525684ca65fdee",
+      "lockFileVersion": 28,
+      "top_level_keys": [
+       "lockFileVersion",
+       "registryFileHashes",
+       "selectedYankedVersions",
+       "moduleExtensions",
+       "facts",
+       "factsVersions"
+      ],
+      "go_deps_extension_key": null,
+      "facts_key": null
+     },
+     "show_repo": [
+      "## @com_github_jackc_pgx_v5:",
+      "version = \"v5.7.1\",",
+      "sum = \"h1:x7SYsPBYDkHDksogeSmZZ5xzThcTgRz++I5E+ePFUcs=\",",
+      "replace = \"\",",
+      "## @com_github_google_go_cmp:",
+      "version = \"v0.6.0\",",
+      "sum = \"h1:ofyhxvXcZhMsU5ulbFiLKl/XBFqE1GSq7atu8tAmTRI=\",",
+      "replace = \"\","
+     ],
+     "repo_dirs": {
+      "gazelle++go_deps+com_github_jackc_pgx_v5": {
+       "is_symlink": false,
+       "entries_naming_a_version": []
+      },
+      "gazelle++go_deps+com_github_google_go_cmp": {
+       "is_symlink": false,
+       "entries_naming_a_version": []
+      }
+     },
+     "repo_marker_first_lines": {
+      "@gazelle++go_deps+com_github_jackc_pgx_v5.marker": "8c414862c8396d3e6914ce539f8ab330034611a7a9ea71bf536f5c3e0bf2fcdc",
+      "@gazelle++go_deps+com_github_google_go_cmp.marker": "48d42fbec5b5731e899db8457a4826f6e05bd07f63cac0c80f44bab5f4d33f21"
+     },
+     "go_repository_config": {
+      "dir": "gazelle++go_deps+bazel_gazelle_go_repository_config",
+      "files": [
+       "BUILD.bazel",
+       "WORKSPACE",
+       "config.json",
+       "go.env",
+       "go_env.bzl",
+       "go_tools.bzl"
+      ],
+      "lines_naming_pgx": [
+       "    importpath = \"github.com/jackc/pgx/v5\",",
+       "    importpath = \"github.com/jackc/pgx/v5\","
+      ],
+      "names_a_version": false
+     },
+     "fetched_pgx": {
+      "dir": "gazelle++go_deps+com_github_jackc_pgx_v5",
+      "is_symlink": false,
+      "patched_marker_file_present": false,
+      "function_call_go_sha256": "e0ede408acf1ecaf4dac0359e66301c7c7e86d20fab23a865796bdaa40a6887c",
+      "function_call_go_differs_from_baseline": false
+     },
+     "output_base_top_level": [
+      "DO_NOT_BUILD_HERE",
+      "MODULE.bazel.lock",
+      "README",
+      "action_cache",
+      "lock",
+      "modextwd",
+      "sandbox"
+     ]
+    },
+    "restored": {
+     "mod_deps_exit": 0,
+     "build_exit": 0,
+     "errors": [],
+     "gazelle_notes": null,
+     "mod_deps_error_mode_first": {
+      "exit": 0,
+      "first_error": "",
+      "lock_unchanged": true
+     },
+     "lock_changed_by_update": false,
+     "hidden_lock": {
+      "exists": true,
+      "bytes": 574534,
+      "sha256": "1b97c311fe9af43cbe24856138f2d328084ce976d634cc4f88f99bf21292f8d7",
+      "lockFileVersion": 28,
+      "top_level_keys": [
+       "lockFileVersion",
+       "registryFileHashes",
+       "selectedYankedVersions",
+       "moduleExtensions",
+       "facts",
+       "factsVersions"
+      ],
+      "go_deps_extension_key": "@@gazelle+//:extensions.bzl%go_deps",
+      "go_deps_factor_keys": [
+       "general"
+      ],
+      "go_deps_entry_keys": [
+       "bzlTransitiveDigest",
+       "usagesDigest",
+       "recordedInputs",
+       "generatedRepoSpecs",
+       "moduleExtensionMetadata"
+      ],
+      "go_deps_repo_spec_count": 28,
+      "go_deps_repo_specs": {
+       "com_github_jackc_pgx_v5": {
+        "repoRuleId": "@@gazelle+//internal:go_repository.bzl%go_repository",
+        "attributes": {
+         "internal_only_do_not_use_apparent_name": "com_github_jackc_pgx_v5",
+         "importpath": "github.com/jackc/pgx/v5",
+         "build_directives": [],
+         "build_file_generation": "auto",
+         "build_extra_args": [],
+         "patches": [],
+         "patch_args": [],
+         "patch_cmds": [],
+         "debug_mode": false,
+         "replace": "",
+         "version": "v5.7.0",
+         "sum": "h1:FG6VLIdzvAPhnYqP14sQ2xhFLkiUQHCs6ySqO91kF4g="
+        }
+       },
+       "com_github_google_go_cmp": {
+        "repoRuleId": "@@gazelle+//internal:go_repository.bzl%go_repository",
+        "attributes": {
+         "internal_only_do_not_use_apparent_name": "com_github_google_go_cmp",
+         "importpath": "github.com/google/go-cmp",
+         "build_directives": [],
+         "build_file_generation": "auto",
+         "build_extra_args": [],
+         "patches": [],
+         "patch_args": [],
+         "patch_cmds": [],
+         "debug_mode": false,
+         "replace": "",
+         "version": "v0.6.0",
+         "sum": "h1:ofyhxvXcZhMsU5ulbFiLKl/XBFqE1GSq7atu8tAmTRI="
+        }
+       }
+      },
+      "go_deps_recorded_container": "recordedInputs",
+      "go_deps_recorded_input_kinds": [
+       "ENV",
+       "FILE",
+       "REPO_MAPPING"
+      ],
+      "recorded_go_mod_inputs_count": 9,
+      "recorded_go_mod_inputs_of_root_and_othermod": [
+       "FILE:@@//go.mod 224888d21e902b9f9898e68dbe22efb5be7a5f8eba6752609799556f39f9e86b",
+       "FILE:@@//go.sum d1c4c025da50168e31fba018a902bdf6909c3aa21002e264e8613d081f525903"
+      ],
+      "reduced_copy": null
+     },
+     "workspace_lock": {
+      "exists": true,
+      "bytes": 177625,
+      "sha256": "f5c8fc21dca8a926913db1c87efb0254e27f0659d6afb74167525684ca65fdee",
+      "lockFileVersion": 28,
+      "top_level_keys": [
+       "lockFileVersion",
+       "registryFileHashes",
+       "selectedYankedVersions",
+       "moduleExtensions",
+       "facts",
+       "factsVersions"
+      ],
+      "go_deps_extension_key": null,
+      "facts_key": null
+     },
+     "show_repo": [
+      "## @com_github_jackc_pgx_v5:",
+      "version = \"v5.7.0\",",
+      "sum = \"h1:FG6VLIdzvAPhnYqP14sQ2xhFLkiUQHCs6ySqO91kF4g=\",",
+      "replace = \"\",",
+      "## @com_github_google_go_cmp:",
+      "version = \"v0.6.0\",",
+      "sum = \"h1:ofyhxvXcZhMsU5ulbFiLKl/XBFqE1GSq7atu8tAmTRI=\",",
+      "replace = \"\","
+     ],
+     "repo_dirs": {
+      "gazelle++go_deps+com_github_jackc_pgx_v5": {
+       "is_symlink": false,
+       "entries_naming_a_version": []
+      },
+      "gazelle++go_deps+com_github_google_go_cmp": {
+       "is_symlink": false,
+       "entries_naming_a_version": []
+      }
+     },
+     "repo_marker_first_lines": {
+      "@gazelle++go_deps+com_github_jackc_pgx_v5.marker": "a05e67d7b6e77ee8dcdef604b6f66b00900f1769ef41cb7945169d89cf1fc70c",
+      "@gazelle++go_deps+com_github_google_go_cmp.marker": "48d42fbec5b5731e899db8457a4826f6e05bd07f63cac0c80f44bab5f4d33f21"
+     },
+     "go_repository_config": {
+      "dir": "gazelle++go_deps+bazel_gazelle_go_repository_config",
+      "files": [
+       "BUILD.bazel",
+       "WORKSPACE",
+       "config.json",
+       "go.env",
+       "go_env.bzl",
+       "go_tools.bzl"
+      ],
+      "lines_naming_pgx": [
+       "    importpath = \"github.com/jackc/pgx/v5\",",
+       "    importpath = \"github.com/jackc/pgx/v5\","
+      ],
+      "names_a_version": false
+     },
+     "fetched_pgx": {
+      "dir": "gazelle++go_deps+com_github_jackc_pgx_v5",
+      "is_symlink": false,
+      "patched_marker_file_present": false,
+      "function_call_go_sha256": "e0ede408acf1ecaf4dac0359e66301c7c7e86d20fab23a865796bdaa40a6887c",
+      "function_call_go_differs_from_baseline": false
+     },
+     "output_base_top_level": [
+      "DO_NOT_BUILD_HERE",
+      "MODULE.bazel.lock",
+      "README",
+      "action_cache",
+      "lock",
+      "modextwd",
+      "sandbox"
+     ]
+    }
+   }
+  },
+  {
+   "bazel": "8.8.2",
+   "gazelle": "2.0.0-beta.2",
+   "rules_go": "0.65.0",
+   "go_sdk": "1.26.0",
+   "restored_lock_equals_baseline_lock": false,
+   "dir_replace_then_error_mode": {
+    "exit": 2,
+    "first_error": "ERROR: MODULE.bazel.lock is no longer up-to-date because the extension '@@gazelle+//:extensions.bzl%go_deps' has changed its facts: {\"required_mod_files_v1\": [{\"importpath\": \"github.com/google/go-cmp\", \"sha256\": \"e7c7669d4a1dd589ba3e024ba27",
+    "lock_unchanged": true
+   },
+   "repo_marker_sample": {
+    "@gazelle++go_deps+com_github_jackc_pgx_v5.marker": [
+     "58a821b55c3af4c3d9f566b21ab88d38cdd744d6d289660d7327d5924a541816",
+     "FILE:@@gazelle++go_deps+bazel_gazelle_go_repository_config//go.env 43ea241c7bfca52c2e14ef0385087167ab664afbe9f8c75402c49abf132699ec",
+     "FILE:@@gazelle++non_module_deps+bazel_gazelle_go_repository_cache//go.env 43ea241c7bfca52c2e14ef0385087167ab664afbe9f8c75402c49abf132699ec",
+     "FILE:@@gazelle++non_module_deps+bazel_gazelle_go_repository_tools//bin/fetch_repo 42138aa55095dac05fc92e59a8d73291934465a308b6850e49c5b054e5572bdf",
+     "ENV:GO_REPOSITORY_EPHEMERAL_MODCACHE \\0",
+     "FILE:@@gazelle++non_module_deps+bazel_gazelle_go_repository_tools//bin/gazelle 3e4d428540a40516a3ddfc88ed644ef143fc5178e9b56c4e817c05ff0e9b0b80",
+     "FILE:@@gazelle++go_deps+bazel_gazelle_go_repository_config//WORKSPACE 7e888b0dae8f99f4f3a65d40a6a3aabde9c2da86acf98436d377897447cdda1d",
+     "REPO_MAPPING:gazelle+,bazel_gazelle_go_repository_cache gazelle++non_module_deps+bazel_gazelle_go_repository_cache",
+     "REPO_MAPPING:gazelle+,bazel_gazelle_go_repository_tools gazelle++non_module_deps+bazel_gazelle_go_repository_tools"
+    ]
+   },
+   "states": {
+    "baseline": {
+     "mod_deps_exit": 0,
+     "build_exit": 0,
+     "errors": [],
+     "gazelle_notes": [
+      "DEBUG: <OUTPUT_BASE>/external/gazelle+/internal/bzlmod/go_deps.bzl:1643:25: Version conflict found for Go module github.com/google/go-cmp:\n    requested in root module: v0.5.9\n    selected by Go:           v0.7.0\nTo correct this:\n    1. Set the requested version to v0.7.0.\n    2. Ensure that no higher version is requested in any MODULE.bazel, go.mod,\n       or go.work file. When using go_deps.from_file, you can use 'go get'\n       to downgrade indirect dependencies if needed."
+     ],
+     "mod_deps_error_mode_first": null,
+     "lock_changed_by_update": true,
+     "hidden_lock": {
+      "exists": true,
+      "bytes": 724140,
+      "sha256": "8a1d205f6b704dec5bfe2e9796dede46fb90c38fa35fe6a957f08f1a1ea9eeee",
+      "lockFileVersion": 28,
+      "top_level_keys": [
+       "lockFileVersion",
+       "registryFileHashes",
+       "selectedYankedVersions",
+       "moduleExtensions",
+       "facts",
+       "factsVersions"
+      ],
+      "go_deps_extension_key": "@@gazelle+//:extensions.bzl%go_deps",
+      "go_deps_factor_keys": [
+       "general"
+      ],
+      "go_deps_entry_keys": [
+       "bzlTransitiveDigest",
+       "usagesDigest",
+       "recordedInputs",
+       "generatedRepoSpecs",
+       "moduleExtensionMetadata"
+      ],
+      "go_deps_repo_spec_count": 191,
+      "go_deps_repo_specs": {
+       "com_github_jackc_pgx_v5": {
+        "repoRuleId": "@@gazelle+//internal:go_repository.bzl%go_repository",
+        "attributes": {
+         "importpath": "github.com/jackc/pgx/v5",
+         "debug_mode": false,
+         "internal_only_do_not_use_apparent_name": "com_github_jackc_pgx_v5",
+         "version": "v5.7.0",
+         "sum": "h1:FG6VLIdzvAPhnYqP14sQ2xhFLkiUQHCs6ySqO91kF4g=",
+         "replace": "",
+         "local_path": "",
+         "build_directives": [],
+         "build_file_generation": "auto",
+         "build_extra_args": []
+        }
+       },
+       "com_github_google_go_cmp": {
+        "repoRuleId": "@@gazelle+//internal:go_repository.bzl%go_repository",
+        "attributes": {
+         "importpath": "github.com/google/go-cmp",
+         "debug_mode": false,
+         "internal_only_do_not_use_apparent_name": "com_github_google_go_cmp",
+         "version": "v0.7.0",
+         "sum": "h1:wk8382ETsv4JYUZwIsn6YpYiWiBsYLSJiTsyBybVuN8=",
+         "replace": "",
+         "local_path": "",
+         "build_directives": [],
+         "build_file_generation": "auto",
+         "build_extra_args": []
+        }
+       }
+      },
+      "go_deps_recorded_container": "recordedInputs",
+      "go_deps_recorded_input_kinds": [
+       "FILE",
+       "REPO_MAPPING"
+      ],
+      "facts_required_mod_files_count": 181,
+      "recorded_go_mod_inputs_count": 10,
+      "recorded_go_mod_inputs_of_root_and_othermod": [
+       "FILE:@@//go.mod 224888d21e902b9f9898e68dbe22efb5be7a5f8eba6752609799556f39f9e86b",
+       "FILE:@@//go.sum d1c4c025da50168e31fba018a902bdf6909c3aa21002e264e8613d081f525903"
+      ],
+      "reduced_copy": "hidden/gz2.0.0-beta.2-b8.8.2.baseline.reduced.json"
+     },
+     "workspace_lock": {
+      "exists": true,
+      "bytes": 213606,
+      "sha256": "47e9ba41b1208adcd3f710b1449d6d104f59917db0a1b2d5ebefc7a68348d682",
+      "lockFileVersion": 28,
+      "top_level_keys": [
+       "lockFileVersion",
+       "registryFileHashes",
+       "selectedYankedVersions",
+       "moduleExtensions",
+       "facts",
+       "factsVersions"
+      ],
+      "go_deps_extension_key": null,
+      "facts_key": "@@gazelle+//:extensions.bzl%go_deps",
+      "facts_keys": [
+       "required_mod_files_v1"
+      ],
+      "facts_required_mod_files_count": 181,
+      "facts_required_mod_files_sha256": "65452e9fcf9ec935d628bc9a70b3f20b275a62f39a1bd515691d9d5c88a19bb3",
+      "facts_watched": [
+       {
+        "importpath": "github.com/google/go-cmp",
+        "sha256": "e7c7669d4a1dd589ba3e024ba27f43f293db611fe075ce20d7b884370d63febd",
+        "version": "v0.5.9"
+       },
+       {
+        "importpath": "github.com/jackc/pgx/v5",
+        "sha256": "7b8ae117eb6a6fe1adda9624971609f505cd4a2d05d6bd89fea78a868c5bbccb",
+        "version": "v5.7.0"
+       },
+       {
+        "importpath": "github.com/google/go-cmp",
+        "sha256": "e7c7669d4a1dd589ba3e024ba27f43f293db611fe075ce20d7b884370d63febd",
+        "version": "v0.6.0"
+       },
+       {
+        "importpath": "github.com/google/go-cmp",
+        "sha256": "31c874a1d2a18e62b0550f823ce7a575c8dec7f8fd9d4fa1959bb12d7f7c0f14",
+        "version": "v0.7.0"
+       }
+      ]
+     },
+     "show_repo": [
+      "## @com_github_jackc_pgx_v5:",
+      "local_path = \"\",",
+      "version = \"v5.7.0\",",
+      "sum = \"h1:FG6VLIdzvAPhnYqP14sQ2xhFLkiUQHCs6ySqO91kF4g=\",",
+      "replace = \"\",",
+      "## @com_github_google_go_cmp:",
+      "local_path = \"\",",
+      "version = \"v0.7.0\",",
+      "sum = \"h1:wk8382ETsv4JYUZwIsn6YpYiWiBsYLSJiTsyBybVuN8=\",",
+      "replace = \"\","
+     ],
+     "repo_dirs": {
+      "gazelle++go_deps+com_github_jackc_pgx_v5": {
+       "is_symlink": false,
+       "entries_naming_a_version": []
+      },
+      "gazelle++go_deps+com_github_google_go_cmp": {
+       "is_symlink": false,
+       "entries_naming_a_version": []
+      }
+     },
+     "repo_marker_first_lines": {
+      "@gazelle++go_deps+com_github_jackc_pgx_v5.marker": "58a821b55c3af4c3d9f566b21ab88d38cdd744d6d289660d7327d5924a541816",
+      "@gazelle++go_deps+com_github_google_go_cmp.marker": "cd10c53eb76c9a22da7b0ea12ca1de4d56d18c50f7a120a487f56ffc5bd5d545"
+     },
+     "go_repository_config": {
+      "dir": "gazelle++go_deps+bazel_gazelle_go_repository_config",
+      "files": [
+       "BUILD.bazel",
+       "WORKSPACE",
+       "config.json",
+       "go.env",
+       "go_env.bzl",
+       "go_tools.bzl"
+      ],
+      "lines_naming_pgx": [
+       "# gazelle:repository go_repository name=com_github_jackc_pgx_v5 importpath=github.com/jackc/pgx/v5",
+       "# gazelle:repository go_repository name=com_github_jackc_pgx_v5 importpath=github.com/jackc/pgx/v5"
+      ],
+      "names_a_version": false
+     },
+     "fetched_pgx": {
+      "dir": "gazelle++go_deps+com_github_jackc_pgx_v5",
+      "is_symlink": false,
+      "patched_marker_file_present": false,
+      "function_call_go_sha256": "e0ede408acf1ecaf4dac0359e66301c7c7e86d20fab23a865796bdaa40a6887c",
+      "function_call_go_differs_from_baseline": false
+     },
+     "output_base_top_level": [
+      "DO_NOT_BUILD_HERE",
+      "MODULE.bazel.lock",
+      "README",
+      "action_cache",
+      "lock",
+      "modextwd",
+      "sandbox"
+     ]
+    },
+    "dir": {
+     "mod_deps_exit": 0,
+     "build_exit": 0,
+     "errors": [],
+     "gazelle_notes": null,
+     "mod_deps_error_mode_first": null,
+     "lock_changed_by_update": true,
+     "hidden_lock": {
+      "exists": true,
+      "bytes": 724246,
+      "sha256": "c8357d1e6590d452521c51c962a5e38a786f6728ea3412b733dec34826d9539b",
+      "lockFileVersion": 28,
+      "top_level_keys": [
+       "lockFileVersion",
+       "registryFileHashes",
+       "selectedYankedVersions",
+       "moduleExtensions",
+       "facts",
+       "factsVersions"
+      ],
+      "go_deps_extension_key": "@@gazelle+//:extensions.bzl%go_deps",
+      "go_deps_factor_keys": [
+       "general"
+      ],
+      "go_deps_entry_keys": [
+       "bzlTransitiveDigest",
+       "usagesDigest",
+       "recordedInputs",
+       "generatedRepoSpecs",
+       "moduleExtensionMetadata"
+      ],
+      "go_deps_repo_spec_count": 191,
+      "go_deps_repo_specs": {
+       "com_github_jackc_pgx_v5": {
+        "repoRuleId": "@@gazelle+//internal:go_repository.bzl%go_repository",
+        "attributes": {
+         "importpath": "github.com/jackc/pgx/v5",
+         "debug_mode": false,
+         "internal_only_do_not_use_apparent_name": "com_github_jackc_pgx_v5",
+         "version": "",
+         "sum": "",
+         "replace": "",
+         "local_path": "<PROBE>/x3/cells/gz2.0.0-beta.2-b8.8.2/ws/.socket/go-patches/github.com/jackc/pgx/v5@v5.7.0",
+         "build_directives": [],
+         "build_file_generation": "auto",
+         "build_extra_args": []
+        }
+       },
+       "com_github_google_go_cmp": {
+        "repoRuleId": "@@gazelle+//internal:go_repository.bzl%go_repository",
+        "attributes": {
+         "importpath": "github.com/google/go-cmp",
+         "debug_mode": false,
+         "internal_only_do_not_use_apparent_name": "com_github_google_go_cmp",
+         "version": "v0.7.0",
+         "sum": "h1:wk8382ETsv4JYUZwIsn6YpYiWiBsYLSJiTsyBybVuN8=",
+         "replace": "",
+         "local_path": "",
+         "build_directives": [],
+         "build_file_generation": "auto",
+         "build_extra_args": []
+        }
+       }
+      },
+      "go_deps_recorded_container": "recordedInputs",
+      "go_deps_recorded_input_kinds": [
+       "FILE",
+       "REPO_MAPPING"
+      ],
+      "facts_required_mod_files_count": 181,
+      "recorded_go_mod_inputs_count": 10,
+      "recorded_go_mod_inputs_of_root_and_othermod": [
+       "FILE:@@//go.mod 6057e59c8fd5d6da86cffecfb0a7f18a1eea8be2062c96c44a7c1bfa9fe4be7b",
+       "FILE:@@//go.sum 94f69a8520879fb7d1ab78837628a6d03f31e5446617fc882a74a71b99d9ccb9"
+      ],
+      "reduced_copy": "hidden/gz2.0.0-beta.2-b8.8.2.dir.reduced.json"
+     },
+     "workspace_lock": {
+      "exists": true,
+      "bytes": 213606,
+      "sha256": "4ef42273ad1c12cd9012127f50ef58c2feb11a7c29cb43ffe63061ed6a6151f3",
+      "lockFileVersion": 28,
+      "top_level_keys": [
+       "lockFileVersion",
+       "registryFileHashes",
+       "selectedYankedVersions",
+       "moduleExtensions",
+       "facts",
+       "factsVersions"
+      ],
+      "go_deps_extension_key": null,
+      "facts_key": "@@gazelle+//:extensions.bzl%go_deps",
+      "facts_keys": [
+       "required_mod_files_v1"
+      ],
+      "facts_required_mod_files_count": 181,
+      "facts_required_mod_files_sha256": "42f26c51a6a1f24700e4b3b5e0829d9ee80ec6249465042be8bc26273f0c28d4",
+      "facts_watched": [
+       {
+        "importpath": "github.com/google/go-cmp",
+        "sha256": "e7c7669d4a1dd589ba3e024ba27f43f293db611fe075ce20d7b884370d63febd",
+        "version": "v0.5.9"
+       },
+       {
+        "importpath": "github.com/google/go-cmp",
+        "sha256": "e7c7669d4a1dd589ba3e024ba27f43f293db611fe075ce20d7b884370d63febd",
+        "version": "v0.6.0"
+       },
+       {
+        "importpath": "github.com/jackc/pgx/v5",
+        "sha256": "7b8ae117eb6a6fe1adda9624971609f505cd4a2d05d6bd89fea78a868c5bbccb",
+        "version": "v5.7.0"
+       },
+       {
+        "importpath": "github.com/google/go-cmp",
+        "sha256": "31c874a1d2a18e62b0550f823ce7a575c8dec7f8fd9d4fa1959bb12d7f7c0f14",
+        "version": "v0.7.0"
+       }
+      ]
+     },
+     "show_repo": [
+      "## @com_github_jackc_pgx_v5:",
+      "local_path = \"<PROBE>/x3/cells/gz2.0.0-beta.2-b8.8.2/ws/.socket/go-patches/github.com/jackc/pgx/v5@v5.7.0\",",
+      "version = \"\",",
+      "sum = \"\",",
+      "replace = \"\",",
+      "## @com_github_google_go_cmp:",
+      "local_path = \"\",",
+      "version = \"v0.7.0\",",
+      "sum = \"h1:wk8382ETsv4JYUZwIsn6YpYiWiBsYLSJiTsyBybVuN8=\",",
+      "replace = \"\","
+     ],
+     "repo_dirs": {
+      "gazelle++go_deps+com_github_jackc_pgx_v5": {
+       "is_symlink": false,
+       "entries_naming_a_version": []
+      },
+      "gazelle++go_deps+com_github_google_go_cmp": {
+       "is_symlink": false,
+       "entries_naming_a_version": []
+      }
+     },
+     "repo_marker_first_lines": {
+      "@gazelle++go_deps+com_github_jackc_pgx_v5.marker": "11ff39c31c41f5d8dfc183f51b2df6095b3f8e34bfc7012cfb675c2c0b446682",
+      "@gazelle++go_deps+com_github_google_go_cmp.marker": "cd10c53eb76c9a22da7b0ea12ca1de4d56d18c50f7a120a487f56ffc5bd5d545"
+     },
+     "go_repository_config": {
+      "dir": "gazelle++go_deps+bazel_gazelle_go_repository_config",
+      "files": [
+       "BUILD.bazel",
+       "WORKSPACE",
+       "config.json",
+       "go.env",
+       "go_env.bzl",
+       "go_tools.bzl"
+      ],
+      "lines_naming_pgx": [
+       "# gazelle:repository go_repository name=com_github_jackc_pgx_v5 importpath=github.com/jackc/pgx/v5",
+       "# gazelle:repository go_repository name=com_github_jackc_pgx_v5 importpath=github.com/jackc/pgx/v5"
+      ],
+      "names_a_version": false
+     },
+     "fetched_pgx": {
+      "dir": "gazelle++go_deps+com_github_jackc_pgx_v5",
+      "is_symlink": false,
+      "patched_marker_file_present": true,
+      "function_call_go_sha256": "e780e30ffd3e03b6012243c03b99aef12dfbfe6fa2f063521d52eb7a50b21e97",
+      "function_call_go_differs_from_baseline": true
+     },
+     "output_base_top_level": [
+      "DO_NOT_BUILD_HERE",
+      "MODULE.bazel.lock",
+      "README",
+      "action_cache",
+      "lock",
+      "modextwd",
+      "sandbox"
+     ]
+    },
+    "hosted": {
+     "mod_deps_exit": 0,
+     "build_exit": 0,
+     "errors": [],
+     "gazelle_notes": null,
+     "mod_deps_error_mode_first": null,
+     "lock_changed_by_update": true,
+     "hidden_lock": {
+      "exists": true,
+      "bytes": 724463,
+      "sha256": "15ef503cc176d06e5c92601c1909cc71f831007a9bb4c8776ae738b7df08c4c6",
+      "lockFileVersion": 28,
+      "top_level_keys": [
+       "lockFileVersion",
+       "registryFileHashes",
+       "selectedYankedVersions",
+       "moduleExtensions",
+       "facts",
+       "factsVersions"
+      ],
+      "go_deps_extension_key": "@@gazelle+//:extensions.bzl%go_deps",
+      "go_deps_factor_keys": [
+       "general"
+      ],
+      "go_deps_entry_keys": [
+       "bzlTransitiveDigest",
+       "usagesDigest",
+       "recordedInputs",
+       "generatedRepoSpecs",
+       "moduleExtensionMetadata"
+      ],
+      "go_deps_repo_spec_count": 191,
+      "go_deps_repo_specs": {
+       "com_github_jackc_pgx_v5": {
+        "repoRuleId": "@@gazelle+//internal:go_repository.bzl%go_repository",
+        "attributes": {
+         "importpath": "github.com/jackc/pgx/v5",
+         "debug_mode": false,
+         "internal_only_do_not_use_apparent_name": "com_github_jackc_pgx_v5",
+         "version": "v5.7.0-socketpatch.1",
+         "sum": "h1:gR/c/AlF3QdC7jqzW7DTXmKzYaNTFHD6MMmBuMntE2g=",
+         "replace": "patch.socket.dev/gopatch/d8941a4c-4bcd-4756-b0aa-239ec9c81b0f/v5",
+         "local_path": "",
+         "build_directives": [],
+         "build_file_generation": "auto",
+         "build_extra_args": []
+        }
+       },
+       "com_github_google_go_cmp": {
+        "repoRuleId": "@@gazelle+//internal:go_repository.bzl%go_repository",
+        "attributes": {
+         "importpath": "github.com/google/go-cmp",
+         "debug_mode": false,
+         "internal_only_do_not_use_apparent_name": "com_github_google_go_cmp",
+         "version": "v0.7.0",
+         "sum": "h1:wk8382ETsv4JYUZwIsn6YpYiWiBsYLSJiTsyBybVuN8=",
+         "replace": "",
+         "local_path": "",
+         "build_directives": [],
+         "build_file_generation": "auto",
+         "build_extra_args": []
+        }
+       }
+      },
+      "go_deps_recorded_container": "recordedInputs",
+      "go_deps_recorded_input_kinds": [
+       "FILE",
+       "REPO_MAPPING"
+      ],
+      "facts_required_mod_files_count": 182,
+      "recorded_go_mod_inputs_count": 10,
+      "recorded_go_mod_inputs_of_root_and_othermod": [
+       "FILE:@@//go.mod d80cbfb457154a529fc967f0bf4212c4a53d688dd9d31fdf9633aba9612c6f26",
+       "FILE:@@//go.sum 32ebf33065ae32c04db5f4f81c2b5d43fe5433298e9a637446cc606eeec7befb"
+      ],
+      "reduced_copy": "hidden/gz2.0.0-beta.2-b8.8.2.hosted.reduced.json"
+     },
+     "workspace_lock": {
+      "exists": true,
+      "bytes": 213851,
+      "sha256": "ddcacc5d09f82a4e5734f2edb0e6a7afc2c23d16c3f2fa4871a8453ae9172ea7",
+      "lockFileVersion": 28,
+      "top_level_keys": [
+       "lockFileVersion",
+       "registryFileHashes",
+       "selectedYankedVersions",
+       "moduleExtensions",
+       "facts",
+       "factsVersions"
+      ],
+      "go_deps_extension_key": null,
+      "facts_key": "@@gazelle+//:extensions.bzl%go_deps",
+      "facts_keys": [
+       "required_mod_files_v1"
+      ],
+      "facts_required_mod_files_count": 182,
+      "facts_required_mod_files_sha256": "18b8087747610ec1e35ddd3d51206eb9155f25ad816926eb28d9b3908469d768",
+      "facts_watched": [
+       {
+        "importpath": "github.com/google/go-cmp",
+        "sha256": "e7c7669d4a1dd589ba3e024ba27f43f293db611fe075ce20d7b884370d63febd",
+        "version": "v0.5.9"
+       },
+       {
+        "importpath": "patch.socket.dev/gopatch/d8941a4c-4bcd-4756-b0aa-239ec9c81b0f/v5",
+        "sha256": "7b8ae117eb6a6fe1adda9624971609f505cd4a2d05d6bd89fea78a868c5bbccb",
+        "version": "v5.7.0-socketpatch.1"
+       },
+       {
+        "importpath": "github.com/google/go-cmp",
+        "sha256": "e7c7669d4a1dd589ba3e024ba27f43f293db611fe075ce20d7b884370d63febd",
+        "version": "v0.6.0"
+       },
+       {
+        "importpath": "github.com/jackc/pgx/v5",
+        "sha256": "7b8ae117eb6a6fe1adda9624971609f505cd4a2d05d6bd89fea78a868c5bbccb",
+        "version": "v5.7.0"
+       },
+       {
+        "importpath": "github.com/google/go-cmp",
+        "sha256": "31c874a1d2a18e62b0550f823ce7a575c8dec7f8fd9d4fa1959bb12d7f7c0f14",
+        "version": "v0.7.0"
+       }
+      ]
+     },
+     "show_repo": [
+      "## @com_github_jackc_pgx_v5:",
+      "local_path = \"\",",
+      "version = \"v5.7.0-socketpatch.1\",",
+      "sum = \"h1:gR/c/AlF3QdC7jqzW7DTXmKzYaNTFHD6MMmBuMntE2g=\",",
+      "replace = \"patch.socket.dev/gopatch/d8941a4c-4bcd-4756-b0aa-239ec9c81b0f/v5\",",
+      "## @com_github_google_go_cmp:",
+      "local_path = \"\",",
+      "version = \"v0.7.0\",",
+      "sum = \"h1:wk8382ETsv4JYUZwIsn6YpYiWiBsYLSJiTsyBybVuN8=\",",
+      "replace = \"\","
+     ],
+     "repo_dirs": {
+      "gazelle++go_deps+com_github_jackc_pgx_v5": {
+       "is_symlink": false,
+       "entries_naming_a_version": []
+      },
+      "gazelle++go_deps+com_github_google_go_cmp": {
+       "is_symlink": false,
+       "entries_naming_a_version": []
+      }
+     },
+     "repo_marker_first_lines": {
+      "@gazelle++go_deps+com_github_jackc_pgx_v5.marker": "629e70198c1bc63771e450085b3d0d16d4cfcf8583bb6d68a4df21bdb2b87d17",
+      "@gazelle++go_deps+com_github_google_go_cmp.marker": "cd10c53eb76c9a22da7b0ea12ca1de4d56d18c50f7a120a487f56ffc5bd5d545"
+     },
+     "go_repository_config": {
+      "dir": "gazelle++go_deps+bazel_gazelle_go_repository_config",
+      "files": [
+       "BUILD.bazel",
+       "WORKSPACE",
+       "config.json",
+       "go.env",
+       "go_env.bzl",
+       "go_tools.bzl"
+      ],
+      "lines_naming_pgx": [
+       "# gazelle:repository go_repository name=com_github_jackc_pgx_v5 importpath=github.com/jackc/pgx/v5",
+       "# gazelle:repository go_repository name=com_github_jackc_pgx_v5 importpath=github.com/jackc/pgx/v5"
+      ],
+      "names_a_version": false
+     },
+     "fetched_pgx": {
+      "dir": "gazelle++go_deps+com_github_jackc_pgx_v5",
+      "is_symlink": false,
+      "patched_marker_file_present": true,
+      "function_call_go_sha256": "e780e30ffd3e03b6012243c03b99aef12dfbfe6fa2f063521d52eb7a50b21e97",
+      "function_call_go_differs_from_baseline": true
+     },
+     "output_base_top_level": [
+      "DO_NOT_BUILD_HERE",
+      "MODULE.bazel.lock",
+      "README",
+      "action_cache",
+      "lock",
+      "modextwd",
+      "sandbox"
+     ]
+    },
+    "skew": {
+     "mod_deps_exit": 0,
+     "build_exit": 0,
+     "errors": [],
+     "gazelle_notes": [
+      "DEBUG: <OUTPUT_BASE>/external/gazelle+/internal/bzlmod/go_deps.bzl:1643:25: Version conflict found for Go module github.com/google/go-cmp:\n    requested in root module: v0.5.9\n    selected by Go:           v0.7.0\nTo correct this:\n    1. Set the requested version to v0.7.0.\n    2. Ensure that no higher version is requested in any MODULE.bazel, go.mod,\n       or go.work file. When using go_deps.from_file, you can use 'go get'\n       to downgrade indirect dependencies if needed.",
+      "DEBUG: <OUTPUT_BASE>/external/gazelle+/internal/bzlmod/go_deps.bzl:1643:25: Version conflict found for Go module github.com/jackc/pgx/v5:\n    requested in root module: v5.7.0\n    selected by Go:           v5.7.1\nTo correct this:\n    1. Set the requested version to v5.7.1.\n    2. Ensure that no higher version is requested in any MODULE.bazel, go.mod,\n       or go.work file. When using go_deps.from_file, you can use 'go get'\n       to downgrade indirect dependencies if needed."
+     ],
+     "mod_deps_error_mode_first": null,
+     "lock_changed_by_update": true,
+     "hidden_lock": {
+      "exists": true,
+      "bytes": 728028,
+      "sha256": "5fb044b8076d15e9a1b7317975185c5f931b42c0760f11d007d962f5cebb7205",
+      "lockFileVersion": 28,
+      "top_level_keys": [
+       "lockFileVersion",
+       "registryFileHashes",
+       "selectedYankedVersions",
+       "moduleExtensions",
+       "facts",
+       "factsVersions"
+      ],
+      "go_deps_extension_key": "@@gazelle+//:extensions.bzl%go_deps",
+      "go_deps_factor_keys": [
+       "general"
+      ],
+      "go_deps_entry_keys": [
+       "bzlTransitiveDigest",
+       "usagesDigest",
+       "recordedInputs",
+       "generatedRepoSpecs",
+       "moduleExtensionMetadata"
+      ],
+      "go_deps_repo_spec_count": 195,
+      "go_deps_repo_specs": {
+       "com_github_jackc_pgx_v5": {
+        "repoRuleId": "@@gazelle+//internal:go_repository.bzl%go_repository",
+        "attributes": {
+         "importpath": "github.com/jackc/pgx/v5",
+         "debug_mode": false,
+         "internal_only_do_not_use_apparent_name": "com_github_jackc_pgx_v5",
+         "version": "v5.7.1",
+         "sum": "h1:x7SYsPBYDkHDksogeSmZZ5xzThcTgRz++I5E+ePFUcs=",
+         "replace": "",
+         "local_path": "",
+         "build_directives": [],
+         "build_file_generation": "auto",
+         "build_extra_args": []
+        }
+       },
+       "com_github_google_go_cmp": {
+        "repoRuleId": "@@gazelle+//internal:go_repository.bzl%go_repository",
+        "attributes": {
+         "importpath": "github.com/google/go-cmp",
+         "debug_mode": false,
+         "internal_only_do_not_use_apparent_name": "com_github_google_go_cmp",
+         "version": "v0.7.0",
+         "sum": "h1:wk8382ETsv4JYUZwIsn6YpYiWiBsYLSJiTsyBybVuN8=",
+         "replace": "",
+         "local_path": "",
+         "build_directives": [],
+         "build_file_generation": "auto",
+         "build_extra_args": []
+        }
+       }
+      },
+      "go_deps_recorded_container": "recordedInputs",
+      "go_deps_recorded_input_kinds": [
+       "FILE",
+       "REPO_MAPPING"
+      ],
+      "facts_required_mod_files_count": 186,
+      "recorded_go_mod_inputs_count": 12,
+      "recorded_go_mod_inputs_of_root_and_othermod": [
+       "FILE:@@//go.mod d80cbfb457154a529fc967f0bf4212c4a53d688dd9d31fdf9633aba9612c6f26",
+       "FILE:@@//go.sum 32ebf33065ae32c04db5f4f81c2b5d43fe5433298e9a637446cc606eeec7befb",
+       "FILE:@@othermod+//go.mod c6ab75f225085d3af9e8ac0a2908cd7133cff6272b9d2b37277c844d5980b1a5",
+       "FILE:@@othermod+//go.sum 4a03a26472c5df773653cf10ce6f08f1bbb7689138893bd0d39d0ffc67d36a28"
+      ],
+      "reduced_copy": "hidden/gz2.0.0-beta.2-b8.8.2.skew.reduced.json"
+     },
+     "workspace_lock": {
+      "exists": true,
+      "bytes": 214606,
+      "sha256": "da8e5a78ec8d2730fd1a5ab8023409ebc47a58f66d563efeffbd7c6f34ffb59c",
+      "lockFileVersion": 28,
+      "top_level_keys": [
+       "lockFileVersion",
+       "registryFileHashes",
+       "selectedYankedVersions",
+       "moduleExtensions",
+       "facts",
+       "factsVersions"
+      ],
+      "go_deps_extension_key": null,
+      "facts_key": "@@gazelle+//:extensions.bzl%go_deps",
+      "facts_keys": [
+       "required_mod_files_v1"
+      ],
+      "facts_required_mod_files_count": 186,
+      "facts_required_mod_files_sha256": "a8441bac55a0e538722f2b9ee418af889f33e1dd8a4ef79121194a8b5cd5e50e",
+      "facts_watched": [
+       {
+        "importpath": "github.com/google/go-cmp",
+        "sha256": "e7c7669d4a1dd589ba3e024ba27f43f293db611fe075ce20d7b884370d63febd",
+        "version": "v0.5.9"
+       },
+       {
+        "importpath": "patch.socket.dev/gopatch/d8941a4c-4bcd-4756-b0aa-239ec9c81b0f/v5",
+        "sha256": "7b8ae117eb6a6fe1adda9624971609f505cd4a2d05d6bd89fea78a868c5bbccb",
+        "version": "v5.7.0-socketpatch.1"
+       },
+       {
+        "importpath": "github.com/google/go-cmp",
+        "sha256": "e7c7669d4a1dd589ba3e024ba27f43f293db611fe075ce20d7b884370d63febd",
+        "version": "v0.6.0"
+       },
+       {
+        "importpath": "github.com/jackc/pgx/v5",
+        "sha256": "eb7eee30b5d752dc7e368a22661d91cb25b51bc06141880b5649c468a3c7961f",
+        "version": "v5.7.1"
+       },
+       {
+        "importpath": "github.com/jackc/pgx/v5",
+        "sha256": "7b8ae117eb6a6fe1adda9624971609f505cd4a2d05d6bd89fea78a868c5bbccb",
+        "version": "v5.7.0"
+       },
+       {
+        "importpath": "github.com/google/go-cmp",
+        "sha256": "31c874a1d2a18e62b0550f823ce7a575c8dec7f8fd9d4fa1959bb12d7f7c0f14",
+        "version": "v0.7.0"
+       }
+      ]
+     },
+     "show_repo": [
+      "## @com_github_jackc_pgx_v5:",
+      "local_path = \"\",",
+      "version = \"v5.7.1\",",
+      "sum = \"h1:x7SYsPBYDkHDksogeSmZZ5xzThcTgRz++I5E+ePFUcs=\",",
+      "replace = \"\",",
+      "## @com_github_google_go_cmp:",
+      "local_path = \"\",",
+      "version = \"v0.7.0\",",
+      "sum = \"h1:wk8382ETsv4JYUZwIsn6YpYiWiBsYLSJiTsyBybVuN8=\",",
+      "replace = \"\","
+     ],
+     "repo_dirs": {
+      "gazelle++go_deps+com_github_jackc_pgx_v5": {
+       "is_symlink": false,
+       "entries_naming_a_version": []
+      },
+      "gazelle++go_deps+com_github_google_go_cmp": {
+       "is_symlink": false,
+       "entries_naming_a_version": []
+      }
+     },
+     "repo_marker_first_lines": {
+      "@gazelle++go_deps+com_github_jackc_pgx_v5.marker": "40874e677194e9c711c992f18c5c965b63fe4054e2c976bfcc9d4c3cb6721298",
+      "@gazelle++go_deps+com_github_google_go_cmp.marker": "cd10c53eb76c9a22da7b0ea12ca1de4d56d18c50f7a120a487f56ffc5bd5d545"
+     },
+     "go_repository_config": {
+      "dir": "gazelle++go_deps+bazel_gazelle_go_repository_config",
+      "files": [
+       "BUILD.bazel",
+       "WORKSPACE",
+       "config.json",
+       "go.env",
+       "go_env.bzl",
+       "go_tools.bzl"
+      ],
+      "lines_naming_pgx": [
+       "# gazelle:repository go_repository name=com_github_jackc_pgx_v5 importpath=github.com/jackc/pgx/v5",
+       "# gazelle:repository go_repository name=com_github_jackc_pgx_v5 importpath=github.com/jackc/pgx/v5"
+      ],
+      "names_a_version": false
+     },
+     "fetched_pgx": {
+      "dir": "gazelle++go_deps+com_github_jackc_pgx_v5",
+      "is_symlink": false,
+      "patched_marker_file_present": false,
+      "function_call_go_sha256": "e0ede408acf1ecaf4dac0359e66301c7c7e86d20fab23a865796bdaa40a6887c",
+      "function_call_go_differs_from_baseline": false
+     },
+     "output_base_top_level": [
+      "DO_NOT_BUILD_HERE",
+      "MODULE.bazel.lock",
+      "README",
+      "action_cache",
+      "lock",
+      "modextwd",
+      "sandbox"
+     ]
+    },
+    "restored": {
+     "mod_deps_exit": 0,
+     "build_exit": 0,
+     "errors": [],
+     "gazelle_notes": null,
+     "mod_deps_error_mode_first": {
+      "exit": 2,
+      "first_error": "ERROR: MODULE.bazel.lock is no longer up-to-date because the extension '@@gazelle+//:extensions.bzl%go_deps' has changed its facts: {\"required_mod_files_v1\": [{\"importpath\": \"github.com/google/go-cmp\"",
+      "lock_unchanged": true
+     },
+     "lock_changed_by_update": true,
+     "hidden_lock": {
+      "exists": true,
+      "bytes": 725140,
+      "sha256": "f9956937ef970347da21ff4ec02e8b025476096f2ddd0531d10c76afac7d9937",
+      "lockFileVersion": 28,
+      "top_level_keys": [
+       "lockFileVersion",
+       "registryFileHashes",
+       "selectedYankedVersions",
+       "moduleExtensions",
+       "facts",
+       "factsVersions"
+      ],
+      "go_deps_extension_key": "@@gazelle+//:extensions.bzl%go_deps",
+      "go_deps_factor_keys": [
+       "general"
+      ],
+      "go_deps_entry_keys": [
+       "bzlTransitiveDigest",
+       "usagesDigest",
+       "recordedInputs",
+       "generatedRepoSpecs",
+       "moduleExtensionMetadata"
+      ],
+      "go_deps_repo_spec_count": 191,
+      "go_deps_repo_specs": {
+       "com_github_jackc_pgx_v5": {
+        "repoRuleId": "@@gazelle+//internal:go_repository.bzl%go_repository",
+        "attributes": {
+         "importpath": "github.com/jackc/pgx/v5",
+         "debug_mode": false,
+         "internal_only_do_not_use_apparent_name": "com_github_jackc_pgx_v5",
+         "version": "v5.7.0",
+         "sum": "h1:FG6VLIdzvAPhnYqP14sQ2xhFLkiUQHCs6ySqO91kF4g=",
+         "replace": "",
+         "local_path": "",
+         "build_directives": [],
+         "build_file_generation": "auto",
+         "build_extra_args": []
+        }
+       },
+       "com_github_google_go_cmp": {
+        "repoRuleId": "@@gazelle+//internal:go_repository.bzl%go_repository",
+        "attributes": {
+         "importpath": "github.com/google/go-cmp",
+         "debug_mode": false,
+         "internal_only_do_not_use_apparent_name": "com_github_google_go_cmp",
+         "version": "v0.7.0",
+         "sum": "h1:wk8382ETsv4JYUZwIsn6YpYiWiBsYLSJiTsyBybVuN8=",
+         "replace": "",
+         "local_path": "",
+         "build_directives": [],
+         "build_file_generation": "auto",
+         "build_extra_args": []
+        }
+       }
+      },
+      "go_deps_recorded_container": "recordedInputs",
+      "go_deps_recorded_input_kinds": [
+       "FILE",
+       "REPO_MAPPING"
+      ],
+      "facts_required_mod_files_count": 186,
+      "recorded_go_mod_inputs_count": 10,
+      "recorded_go_mod_inputs_of_root_and_othermod": [
+       "FILE:@@//go.mod 224888d21e902b9f9898e68dbe22efb5be7a5f8eba6752609799556f39f9e86b",
+       "FILE:@@//go.sum d1c4c025da50168e31fba018a902bdf6909c3aa21002e264e8613d081f525903"
+      ],
+      "reduced_copy": null
+     },
+     "workspace_lock": {
+      "exists": true,
+      "bytes": 214606,
+      "sha256": "3ae485a97c7484bbfd3d2cbc219f0ed2ad19fc9fa811501c74daf15e5438ff3b",
+      "lockFileVersion": 28,
+      "top_level_keys": [
+       "lockFileVersion",
+       "registryFileHashes",
+       "selectedYankedVersions",
+       "moduleExtensions",
+       "facts",
+       "factsVersions"
+      ],
+      "go_deps_extension_key": null,
+      "facts_key": "@@gazelle+//:extensions.bzl%go_deps",
+      "facts_keys": [
+       "required_mod_files_v1"
+      ],
+      "facts_required_mod_files_count": 186,
+      "facts_required_mod_files_sha256": "f773e01be5eb6f7bfb3385f66551fa168d7bda3651549f295935cd50a092fa00",
+      "facts_watched": [
+       {
+        "importpath": "github.com/google/go-cmp",
+        "sha256": "e7c7669d4a1dd589ba3e024ba27f43f293db611fe075ce20d7b884370d63febd",
+        "version": "v0.5.9"
+       },
+       {
+        "importpath": "github.com/jackc/pgx/v5",
+        "sha256": "7b8ae117eb6a6fe1adda9624971609f505cd4a2d05d6bd89fea78a868c5bbccb",
+        "version": "v5.7.0"
+       },
+       {
+        "importpath": "github.com/google/go-cmp",
+        "sha256": "e7c7669d4a1dd589ba3e024ba27f43f293db611fe075ce20d7b884370d63febd",
+        "version": "v0.6.0"
+       },
+       {
+        "importpath": "patch.socket.dev/gopatch/d8941a4c-4bcd-4756-b0aa-239ec9c81b0f/v5",
+        "sha256": "7b8ae117eb6a6fe1adda9624971609f505cd4a2d05d6bd89fea78a868c5bbccb",
+        "version": "v5.7.0-socketpatch.1"
+       },
+       {
+        "importpath": "github.com/jackc/pgx/v5",
+        "sha256": "eb7eee30b5d752dc7e368a22661d91cb25b51bc06141880b5649c468a3c7961f",
+        "version": "v5.7.1"
+       },
+       {
+        "importpath": "github.com/google/go-cmp",
+        "sha256": "31c874a1d2a18e62b0550f823ce7a575c8dec7f8fd9d4fa1959bb12d7f7c0f14",
+        "version": "v0.7.0"
+       }
+      ]
+     },
+     "show_repo": [
+      "## @com_github_jackc_pgx_v5:",
+      "local_path = \"\",",
+      "version = \"v5.7.0\",",
+      "sum = \"h1:FG6VLIdzvAPhnYqP14sQ2xhFLkiUQHCs6ySqO91kF4g=\",",
+      "replace = \"\",",
+      "## @com_github_google_go_cmp:",
+      "local_path = \"\",",
+      "version = \"v0.7.0\",",
+      "sum = \"h1:wk8382ETsv4JYUZwIsn6YpYiWiBsYLSJiTsyBybVuN8=\",",
+      "replace = \"\","
+     ],
+     "repo_dirs": {
+      "gazelle++go_deps+com_github_jackc_pgx_v5": {
+       "is_symlink": false,
+       "entries_naming_a_version": []
+      },
+      "gazelle++go_deps+com_github_google_go_cmp": {
+       "is_symlink": false,
+       "entries_naming_a_version": []
+      }
+     },
+     "repo_marker_first_lines": {
+      "@gazelle++go_deps+com_github_jackc_pgx_v5.marker": "58a821b55c3af4c3d9f566b21ab88d38cdd744d6d289660d7327d5924a541816",
+      "@gazelle++go_deps+com_github_google_go_cmp.marker": "cd10c53eb76c9a22da7b0ea12ca1de4d56d18c50f7a120a487f56ffc5bd5d545"
+     },
+     "go_repository_config": {
+      "dir": "gazelle++go_deps+bazel_gazelle_go_repository_config",
+      "files": [
+       "BUILD.bazel",
+       "WORKSPACE",
+       "config.json",
+       "go.env",
+       "go_env.bzl",
+       "go_tools.bzl"
+      ],
+      "lines_naming_pgx": [
+       "# gazelle:repository go_repository name=com_github_jackc_pgx_v5 importpath=github.com/jackc/pgx/v5",
+       "# gazelle:repository go_repository name=com_github_jackc_pgx_v5 importpath=github.com/jackc/pgx/v5"
+      ],
+      "names_a_version": false
+     },
+     "fetched_pgx": {
+      "dir": "gazelle++go_deps+com_github_jackc_pgx_v5",
+      "is_symlink": false,
+      "patched_marker_file_present": false,
+      "function_call_go_sha256": "e0ede408acf1ecaf4dac0359e66301c7c7e86d20fab23a865796bdaa40a6887c",
+      "function_call_go_differs_from_baseline": false
+     },
+     "output_base_top_level": [
+      "DO_NOT_BUILD_HERE",
+      "MODULE.bazel.lock",
+      "README",
+      "action_cache",
+      "lock",
+      "modextwd",
+      "sandbox"
+     ]
+    }
+   }
+  },
+  {
+   "bazel": "9.3.2",
+   "gazelle": "0.54.0",
+   "rules_go": "0.65.0",
+   "go_sdk": "1.26.0",
+   "restored_lock_equals_baseline_lock": true,
+   "dir_replace_then_error_mode": null,
+   "repo_marker_sample": {},
+   "states": {
+    "baseline": {
+     "mod_deps_exit": 0,
+     "build_exit": 0,
+     "errors": [],
+     "gazelle_notes": [
+      "DEBUG: <OUTPUT_BASE>/external/gazelle+/internal/bzlmod/go_deps.bzl:738:36: The following Go modules were required by the root module at the given versions, but were implicitly updated to higher versions due to transitive dependencies:"
+     ],
+     "mod_deps_error_mode_first": null,
+     "lock_changed_by_update": true,
+     "hidden_lock": {
+      "exists": true,
+      "bytes": 619933,
+      "sha256": "c3101a2b9ae6d06af032915f121cd68d3fdfcc8329a01310341e7b8932f2fc29",
+      "lockFileVersion": 28,
+      "top_level_keys": [
+       "lockFileVersion",
+       "registryFileHashes",
+       "selectedYankedVersions",
+       "moduleExtensions",
+       "facts",
+       "factsVersions"
+      ],
+      "go_deps_extension_key": "@@gazelle+//:extensions.bzl%go_deps",
+      "go_deps_factor_keys": [
+       "general"
+      ],
+      "go_deps_entry_keys": [
+       "bzlTransitiveDigest",
+       "usagesDigest",
+       "recordedInputs",
+       "generatedRepoSpecs",
+       "moduleExtensionMetadata"
+      ],
+      "go_deps_repo_spec_count": 28,
+      "go_deps_repo_specs": {
+       "com_github_jackc_pgx_v5": {
+        "repoRuleId": "@@gazelle+//internal:go_repository.bzl%go_repository",
+        "attributes": {
+         "internal_only_do_not_use_apparent_name": "com_github_jackc_pgx_v5",
+         "importpath": "github.com/jackc/pgx/v5",
+         "build_directives": [],
+         "build_file_generation": "auto",
+         "build_extra_args": [],
+         "patches": [],
+         "patch_args": [],
+         "patch_cmds": [],
+         "debug_mode": false,
+         "version": "v5.7.0",
+         "sum": "h1:FG6VLIdzvAPhnYqP14sQ2xhFLkiUQHCs6ySqO91kF4g="
+        }
+       },
+       "com_github_google_go_cmp": {
+        "repoRuleId": "@@gazelle+//internal:go_repository.bzl%go_repository",
+        "attributes": {
+         "internal_only_do_not_use_apparent_name": "com_github_google_go_cmp",
+         "importpath": "github.com/google/go-cmp",
+         "build_directives": [],
+         "build_file_generation": "auto",
+         "build_extra_args": [],
+         "patches": [],
+         "patch_args": [],
+         "patch_cmds": [],
+         "debug_mode": false,
+         "version": "v0.6.0",
+         "sum": "h1:ofyhxvXcZhMsU5ulbFiLKl/XBFqE1GSq7atu8tAmTRI="
+        }
+       }
+      },
+      "go_deps_recorded_container": "recordedInputs",
+      "go_deps_recorded_input_kinds": [
+       "ENV",
+       "FILE",
+       "REPO_MAPPING"
+      ],
+      "recorded_go_mod_inputs_count": 9,
+      "recorded_go_mod_inputs_of_root_and_othermod": [
+       "FILE:@@//go.mod 224888d21e902b9f9898e68dbe22efb5be7a5f8eba6752609799556f39f9e86b",
+       "FILE:@@//go.sum d1c4c025da50168e31fba018a902bdf6909c3aa21002e264e8613d081f525903"
+      ],
+      "reduced_copy": "hidden/gz0.54.0-b9.3.2.baseline.reduced.json"
+     },
+     "workspace_lock": {
+      "exists": true,
+      "bytes": 64850,
+      "sha256": "1e9e1935164b875d12d957b5ab39e564239321dda6c2dc616c24e9dfbf9fc151",
+      "lockFileVersion": 28,
+      "top_level_keys": [
+       "lockFileVersion",
+       "registryFileHashes",
+       "selectedYankedVersions",
+       "moduleExtensions",
+       "facts",
+       "factsVersions"
+      ],
+      "go_deps_extension_key": null,
+      "facts_key": null
+     },
+     "show_repo": [
+      "## @com_github_jackc_pgx_v5:",
+      "version = \"v5.7.0\",",
+      "sum = \"h1:FG6VLIdzvAPhnYqP14sQ2xhFLkiUQHCs6ySqO91kF4g=\",",
+      "## @com_github_google_go_cmp:",
+      "version = \"v0.6.0\",",
+      "sum = \"h1:ofyhxvXcZhMsU5ulbFiLKl/XBFqE1GSq7atu8tAmTRI=\","
+     ],
+     "repo_dirs": {
+      "gazelle++go_deps+com_github_jackc_pgx_v5": {
+       "is_symlink": true
+      },
+      "gazelle++go_deps+com_github_google_go_cmp": {
+       "is_symlink": true
+      }
+     },
+     "repo_marker_first_lines": {},
+     "go_repository_config": {
+      "dir": "gazelle++go_deps+bazel_gazelle_go_repository_config",
+      "files": [
+       "BUILD.bazel",
+       "WORKSPACE",
+       "config.json",
+       "go.env",
+       "go_env.bzl",
+       "go_tools.bzl"
+      ],
+      "lines_naming_pgx": [
+       "    importpath = \"github.com/jackc/pgx/v5\",",
+       "    importpath = \"github.com/jackc/pgx/v5\","
+      ],
+      "names_a_version": false
+     },
+     "fetched_pgx": {
+      "dir": "gazelle++go_deps+com_github_jackc_pgx_v5",
+      "is_symlink": true,
+      "patched_marker_file_present": false,
+      "function_call_go_sha256": "e0ede408acf1ecaf4dac0359e66301c7c7e86d20fab23a865796bdaa40a6887c",
+      "function_call_go_differs_from_baseline": false
+     },
+     "output_base_top_level": [
+      "DO_NOT_BUILD_HERE",
+      "MODULE.bazel.lock",
+      "README",
+      "action_cache",
+      "lock",
+      "modextwd",
+      "sandbox"
+     ]
+    },
+    "dir": {
+     "mod_deps_exit": 0,
+     "build_exit": 0,
+     "errors": [],
+     "gazelle_notes": null,
+     "mod_deps_error_mode_first": null,
+     "lock_changed_by_update": false,
+     "hidden_lock": {
+      "exists": true,
+      "bytes": 620011,
+      "sha256": "e5ac12fa89ec01b1cd318c1f853b4d059676e8d528d16a0863695a6294c3b4ed",
+      "lockFileVersion": 28,
+      "top_level_keys": [
+       "lockFileVersion",
+       "registryFileHashes",
+       "selectedYankedVersions",
+       "moduleExtensions",
+       "facts",
+       "factsVersions"
+      ],
+      "go_deps_extension_key": "@@gazelle+//:extensions.bzl%go_deps",
+      "go_deps_factor_keys": [
+       "general"
+      ],
+      "go_deps_entry_keys": [
+       "bzlTransitiveDigest",
+       "usagesDigest",
+       "recordedInputs",
+       "generatedRepoSpecs",
+       "moduleExtensionMetadata"
+      ],
+      "go_deps_repo_spec_count": 28,
+      "go_deps_repo_specs": {
+       "com_github_jackc_pgx_v5": {
+        "repoRuleId": "@@gazelle+//internal:go_repository.bzl%go_repository",
+        "attributes": {
+         "internal_only_do_not_use_apparent_name": "com_github_jackc_pgx_v5",
+         "importpath": "github.com/jackc/pgx/v5",
+         "build_directives": [],
+         "build_file_generation": "auto",
+         "build_extra_args": [],
+         "patches": [],
+         "patch_args": [],
+         "patch_cmds": [],
+         "debug_mode": false,
+         "local_path": "<PROBE>/x3/cells/gz0.54.0-b9.3.2/ws/.socket/go-patches/github.com/jackc/pgx/v5@v5.7.0"
+        }
+       },
+       "com_github_google_go_cmp": {
+        "repoRuleId": "@@gazelle+//internal:go_repository.bzl%go_repository",
+        "attributes": {
+         "internal_only_do_not_use_apparent_name": "com_github_google_go_cmp",
+         "importpath": "github.com/google/go-cmp",
+         "build_directives": [],
+         "build_file_generation": "auto",
+         "build_extra_args": [],
+         "patches": [],
+         "patch_args": [],
+         "patch_cmds": [],
+         "debug_mode": false,
+         "version": "v0.6.0",
+         "sum": "h1:ofyhxvXcZhMsU5ulbFiLKl/XBFqE1GSq7atu8tAmTRI="
+        }
+       }
+      },
+      "go_deps_recorded_container": "recordedInputs",
+      "go_deps_recorded_input_kinds": [
+       "ENV",
+       "FILE",
+       "REPO_MAPPING"
+      ],
+      "recorded_go_mod_inputs_count": 9,
+      "recorded_go_mod_inputs_of_root_and_othermod": [
+       "FILE:@@//go.mod 6057e59c8fd5d6da86cffecfb0a7f18a1eea8be2062c96c44a7c1bfa9fe4be7b",
+       "FILE:@@//go.sum 94f69a8520879fb7d1ab78837628a6d03f31e5446617fc882a74a71b99d9ccb9"
+      ],
+      "reduced_copy": "hidden/gz0.54.0-b9.3.2.dir.reduced.json"
+     },
+     "workspace_lock": {
+      "exists": true,
+      "bytes": 64850,
+      "sha256": "1e9e1935164b875d12d957b5ab39e564239321dda6c2dc616c24e9dfbf9fc151",
+      "lockFileVersion": 28,
+      "top_level_keys": [
+       "lockFileVersion",
+       "registryFileHashes",
+       "selectedYankedVersions",
+       "moduleExtensions",
+       "facts",
+       "factsVersions"
+      ],
+      "go_deps_extension_key": null,
+      "facts_key": null
+     },
+     "show_repo": [
+      "## @com_github_jackc_pgx_v5:",
+      "local_path = \"<PROBE>/x3/cells/gz0.54.0-b9.3.2/ws/.socket/go-patches/github.com/jackc/pgx/v5@v5.7.0\",",
+      "## @com_github_google_go_cmp:",
+      "version = \"v0.6.0\",",
+      "sum = \"h1:ofyhxvXcZhMsU5ulbFiLKl/XBFqE1GSq7atu8tAmTRI=\","
+     ],
+     "repo_dirs": {
+      "gazelle++go_deps+com_github_jackc_pgx_v5": {
+       "is_symlink": false,
+       "entries_naming_a_version": []
+      },
+      "gazelle++go_deps+com_github_google_go_cmp": {
+       "is_symlink": true
+      }
+     },
+     "repo_marker_first_lines": {
+      "@gazelle++go_deps+com_github_jackc_pgx_v5.marker": "2602f1d51c4cd6d97413f066b249354450b994726c055da51ebb90549ae1fa69"
+     },
+     "go_repository_config": {
+      "dir": "gazelle++go_deps+bazel_gazelle_go_repository_config",
+      "files": [
+       "BUILD.bazel",
+       "WORKSPACE",
+       "config.json",
+       "go.env",
+       "go_env.bzl",
+       "go_tools.bzl"
+      ],
+      "lines_naming_pgx": [
+       "    importpath = \"github.com/jackc/pgx/v5\",",
+       "    importpath = \"github.com/jackc/pgx/v5\","
+      ],
+      "names_a_version": false
+     },
+     "fetched_pgx": {
+      "dir": "gazelle++go_deps+com_github_jackc_pgx_v5",
+      "is_symlink": false,
+      "patched_marker_file_present": true,
+      "function_call_go_sha256": "e780e30ffd3e03b6012243c03b99aef12dfbfe6fa2f063521d52eb7a50b21e97",
+      "function_call_go_differs_from_baseline": true
+     },
+     "output_base_top_level": [
+      "DO_NOT_BUILD_HERE",
+      "MODULE.bazel.lock",
+      "README",
+      "action_cache",
+      "lock",
+      "modextwd",
+      "sandbox"
+     ]
+    },
+    "hosted": {
+     "mod_deps_exit": 0,
+     "build_exit": 0,
+     "errors": [],
+     "gazelle_notes": null,
+     "mod_deps_error_mode_first": null,
+     "lock_changed_by_update": false,
+     "hidden_lock": {
+      "exists": true,
+      "bytes": 620040,
+      "sha256": "e185dbd4f2d03fb23e2f99043b0cebfb10f515be26849550c5f099b423c681f6",
+      "lockFileVersion": 28,
+      "top_level_keys": [
+       "lockFileVersion",
+       "registryFileHashes",
+       "selectedYankedVersions",
+       "moduleExtensions",
+       "facts",
+       "factsVersions"
+      ],
+      "go_deps_extension_key": "@@gazelle+//:extensions.bzl%go_deps",
+      "go_deps_factor_keys": [
+       "general"
+      ],
+      "go_deps_entry_keys": [
+       "bzlTransitiveDigest",
+       "usagesDigest",
+       "recordedInputs",
+       "generatedRepoSpecs",
+       "moduleExtensionMetadata"
+      ],
+      "go_deps_repo_spec_count": 28,
+      "go_deps_repo_specs": {
+       "com_github_jackc_pgx_v5": {
+        "repoRuleId": "@@gazelle+//internal:go_repository.bzl%go_repository",
+        "attributes": {
+         "internal_only_do_not_use_apparent_name": "com_github_jackc_pgx_v5",
+         "importpath": "github.com/jackc/pgx/v5",
+         "build_directives": [],
+         "build_file_generation": "auto",
+         "build_extra_args": [],
+         "patches": [],
+         "patch_args": [],
+         "patch_cmds": [],
+         "debug_mode": false,
+         "replace": "patch.socket.dev/gopatch/d8941a4c-4bcd-4756-b0aa-239ec9c81b0f/v5",
+         "version": "v5.7.0-socketpatch.1",
+         "sum": "h1:gR/c/AlF3QdC7jqzW7DTXmKzYaNTFHD6MMmBuMntE2g="
+        }
+       },
+       "com_github_google_go_cmp": {
+        "repoRuleId": "@@gazelle+//internal:go_repository.bzl%go_repository",
+        "attributes": {
+         "internal_only_do_not_use_apparent_name": "com_github_google_go_cmp",
+         "importpath": "github.com/google/go-cmp",
+         "build_directives": [],
+         "build_file_generation": "auto",
+         "build_extra_args": [],
+         "patches": [],
+         "patch_args": [],
+         "patch_cmds": [],
+         "debug_mode": false,
+         "version": "v0.6.0",
+         "sum": "h1:ofyhxvXcZhMsU5ulbFiLKl/XBFqE1GSq7atu8tAmTRI="
+        }
+       }
+      },
+      "go_deps_recorded_container": "recordedInputs",
+      "go_deps_recorded_input_kinds": [
+       "ENV",
+       "FILE",
+       "REPO_MAPPING"
+      ],
+      "recorded_go_mod_inputs_count": 9,
+      "recorded_go_mod_inputs_of_root_and_othermod": [
+       "FILE:@@//go.mod d80cbfb457154a529fc967f0bf4212c4a53d688dd9d31fdf9633aba9612c6f26",
+       "FILE:@@//go.sum 32ebf33065ae32c04db5f4f81c2b5d43fe5433298e9a637446cc606eeec7befb"
+      ],
+      "reduced_copy": "hidden/gz0.54.0-b9.3.2.hosted.reduced.json"
+     },
+     "workspace_lock": {
+      "exists": true,
+      "bytes": 64850,
+      "sha256": "1e9e1935164b875d12d957b5ab39e564239321dda6c2dc616c24e9dfbf9fc151",
+      "lockFileVersion": 28,
+      "top_level_keys": [
+       "lockFileVersion",
+       "registryFileHashes",
+       "selectedYankedVersions",
+       "moduleExtensions",
+       "facts",
+       "factsVersions"
+      ],
+      "go_deps_extension_key": null,
+      "facts_key": null
+     },
+     "show_repo": [
+      "## @com_github_jackc_pgx_v5:",
+      "replace = \"patch.socket.dev/gopatch/d8941a4c-4bcd-4756-b0aa-239ec9c81b0f/v5\",",
+      "version = \"v5.7.0-socketpatch.1\",",
+      "sum = \"h1:gR/c/AlF3QdC7jqzW7DTXmKzYaNTFHD6MMmBuMntE2g=\",",
+      "## @com_github_google_go_cmp:",
+      "version = \"v0.6.0\",",
+      "sum = \"h1:ofyhxvXcZhMsU5ulbFiLKl/XBFqE1GSq7atu8tAmTRI=\","
+     ],
+     "repo_dirs": {
+      "gazelle++go_deps+com_github_jackc_pgx_v5": {
+       "is_symlink": true
+      },
+      "gazelle++go_deps+com_github_google_go_cmp": {
+       "is_symlink": true
+      }
+     },
+     "repo_marker_first_lines": {},
+     "go_repository_config": {
+      "dir": "gazelle++go_deps+bazel_gazelle_go_repository_config",
+      "files": [
+       "BUILD.bazel",
+       "WORKSPACE",
+       "config.json",
+       "go.env",
+       "go_env.bzl",
+       "go_tools.bzl"
+      ],
+      "lines_naming_pgx": [
+       "    importpath = \"github.com/jackc/pgx/v5\",",
+       "    importpath = \"github.com/jackc/pgx/v5\","
+      ],
+      "names_a_version": false
+     },
+     "fetched_pgx": {
+      "dir": "gazelle++go_deps+com_github_jackc_pgx_v5",
+      "is_symlink": true,
+      "patched_marker_file_present": true,
+      "function_call_go_sha256": "e780e30ffd3e03b6012243c03b99aef12dfbfe6fa2f063521d52eb7a50b21e97",
+      "function_call_go_differs_from_baseline": true
+     },
+     "output_base_top_level": [
+      "DO_NOT_BUILD_HERE",
+      "MODULE.bazel.lock",
+      "README",
+      "action_cache",
+      "lock",
+      "modextwd",
+      "sandbox"
+     ]
+    },
+    "skew": {
+     "mod_deps_exit": 0,
+     "build_exit": 0,
+     "errors": [],
+     "gazelle_notes": [
+      "DEBUG: <OUTPUT_BASE>/external/gazelle+/internal/bzlmod/go_deps.bzl:738:36: The following Go modules were required by the root module at the given versions, but were implicitly updated to higher versions due to transitive dependencies:"
+     ],
+     "mod_deps_error_mode_first": null,
+     "lock_changed_by_update": false,
+     "hidden_lock": {
+      "exists": true,
+      "bytes": 620235,
+      "sha256": "768817188792e07a28777e43d4683348c2b10253e4943b32af2e2baaf01a5563",
+      "lockFileVersion": 28,
+      "top_level_keys": [
+       "lockFileVersion",
+       "registryFileHashes",
+       "selectedYankedVersions",
+       "moduleExtensions",
+       "facts",
+       "factsVersions"
+      ],
+      "go_deps_extension_key": "@@gazelle+//:extensions.bzl%go_deps",
+      "go_deps_factor_keys": [
+       "general"
+      ],
+      "go_deps_entry_keys": [
+       "bzlTransitiveDigest",
+       "usagesDigest",
+       "recordedInputs",
+       "generatedRepoSpecs",
+       "moduleExtensionMetadata"
+      ],
+      "go_deps_repo_spec_count": 28,
+      "go_deps_repo_specs": {
+       "com_github_jackc_pgx_v5": {
+        "repoRuleId": "@@gazelle+//internal:go_repository.bzl%go_repository",
+        "attributes": {
+         "internal_only_do_not_use_apparent_name": "com_github_jackc_pgx_v5",
+         "importpath": "github.com/jackc/pgx/v5",
+         "build_directives": [],
+         "build_file_generation": "auto",
+         "build_extra_args": [],
+         "patches": [],
+         "patch_args": [],
+         "patch_cmds": [],
+         "debug_mode": false,
+         "version": "v5.7.1",
+         "sum": "h1:x7SYsPBYDkHDksogeSmZZ5xzThcTgRz++I5E+ePFUcs="
+        }
+       },
+       "com_github_google_go_cmp": {
+        "repoRuleId": "@@gazelle+//internal:go_repository.bzl%go_repository",
+        "attributes": {
+         "internal_only_do_not_use_apparent_name": "com_github_google_go_cmp",
+         "importpath": "github.com/google/go-cmp",
+         "build_directives": [],
+         "build_file_generation": "auto",
+         "build_extra_args": [],
+         "patches": [],
+         "patch_args": [],
+         "patch_cmds": [],
+         "debug_mode": false,
+         "version": "v0.6.0",
+         "sum": "h1:ofyhxvXcZhMsU5ulbFiLKl/XBFqE1GSq7atu8tAmTRI="
+        }
+       }
+      },
+      "go_deps_recorded_container": "recordedInputs",
+      "go_deps_recorded_input_kinds": [
+       "ENV",
+       "FILE",
+       "REPO_MAPPING"
+      ],
+      "recorded_go_mod_inputs_count": 11,
+      "recorded_go_mod_inputs_of_root_and_othermod": [
+       "FILE:@@//go.mod d80cbfb457154a529fc967f0bf4212c4a53d688dd9d31fdf9633aba9612c6f26",
+       "FILE:@@//go.sum 32ebf33065ae32c04db5f4f81c2b5d43fe5433298e9a637446cc606eeec7befb",
+       "FILE:@@othermod+//go.mod c6ab75f225085d3af9e8ac0a2908cd7133cff6272b9d2b37277c844d5980b1a5",
+       "FILE:@@othermod+//go.sum 4a03a26472c5df773653cf10ce6f08f1bbb7689138893bd0d39d0ffc67d36a28"
+      ],
+      "reduced_copy": "hidden/gz0.54.0-b9.3.2.skew.reduced.json"
+     },
+     "workspace_lock": {
+      "exists": true,
+      "bytes": 64850,
+      "sha256": "1e9e1935164b875d12d957b5ab39e564239321dda6c2dc616c24e9dfbf9fc151",
+      "lockFileVersion": 28,
+      "top_level_keys": [
+       "lockFileVersion",
+       "registryFileHashes",
+       "selectedYankedVersions",
+       "moduleExtensions",
+       "facts",
+       "factsVersions"
+      ],
+      "go_deps_extension_key": null,
+      "facts_key": null
+     },
+     "show_repo": [
+      "## @com_github_jackc_pgx_v5:",
+      "version = \"v5.7.1\",",
+      "sum = \"h1:x7SYsPBYDkHDksogeSmZZ5xzThcTgRz++I5E+ePFUcs=\",",
+      "## @com_github_google_go_cmp:",
+      "version = \"v0.6.0\",",
+      "sum = \"h1:ofyhxvXcZhMsU5ulbFiLKl/XBFqE1GSq7atu8tAmTRI=\","
+     ],
+     "repo_dirs": {
+      "gazelle++go_deps+com_github_jackc_pgx_v5": {
+       "is_symlink": true
+      },
+      "gazelle++go_deps+com_github_google_go_cmp": {
+       "is_symlink": true
+      }
+     },
+     "repo_marker_first_lines": {},
+     "go_repository_config": {
+      "dir": "gazelle++go_deps+bazel_gazelle_go_repository_config",
+      "files": [
+       "BUILD.bazel",
+       "WORKSPACE",
+       "config.json",
+       "go.env",
+       "go_env.bzl",
+       "go_tools.bzl"
+      ],
+      "lines_naming_pgx": [
+       "    importpath = \"github.com/jackc/pgx/v5\",",
+       "    importpath = \"github.com/jackc/pgx/v5\","
+      ],
+      "names_a_version": false
+     },
+     "fetched_pgx": {
+      "dir": "gazelle++go_deps+com_github_jackc_pgx_v5",
+      "is_symlink": true,
+      "patched_marker_file_present": false,
+      "function_call_go_sha256": "e0ede408acf1ecaf4dac0359e66301c7c7e86d20fab23a865796bdaa40a6887c",
+      "function_call_go_differs_from_baseline": false
+     },
+     "output_base_top_level": [
+      "DO_NOT_BUILD_HERE",
+      "MODULE.bazel.lock",
+      "README",
+      "action_cache",
+      "lock",
+      "modextwd",
+      "sandbox"
+     ]
+    },
+    "restored": {
+     "mod_deps_exit": 0,
+     "build_exit": 0,
+     "errors": [],
+     "gazelle_notes": null,
+     "mod_deps_error_mode_first": {
+      "exit": 0,
+      "first_error": "",
+      "lock_unchanged": true
+     },
+     "lock_changed_by_update": false,
+     "hidden_lock": {
+      "exists": true,
+      "bytes": 619933,
+      "sha256": "c3101a2b9ae6d06af032915f121cd68d3fdfcc8329a01310341e7b8932f2fc29",
+      "lockFileVersion": 28,
+      "top_level_keys": [
+       "lockFileVersion",
+       "registryFileHashes",
+       "selectedYankedVersions",
+       "moduleExtensions",
+       "facts",
+       "factsVersions"
+      ],
+      "go_deps_extension_key": "@@gazelle+//:extensions.bzl%go_deps",
+      "go_deps_factor_keys": [
+       "general"
+      ],
+      "go_deps_entry_keys": [
+       "bzlTransitiveDigest",
+       "usagesDigest",
+       "recordedInputs",
+       "generatedRepoSpecs",
+       "moduleExtensionMetadata"
+      ],
+      "go_deps_repo_spec_count": 28,
+      "go_deps_repo_specs": {
+       "com_github_jackc_pgx_v5": {
+        "repoRuleId": "@@gazelle+//internal:go_repository.bzl%go_repository",
+        "attributes": {
+         "internal_only_do_not_use_apparent_name": "com_github_jackc_pgx_v5",
+         "importpath": "github.com/jackc/pgx/v5",
+         "build_directives": [],
+         "build_file_generation": "auto",
+         "build_extra_args": [],
+         "patches": [],
+         "patch_args": [],
+         "patch_cmds": [],
+         "debug_mode": false,
+         "version": "v5.7.0",
+         "sum": "h1:FG6VLIdzvAPhnYqP14sQ2xhFLkiUQHCs6ySqO91kF4g="
+        }
+       },
+       "com_github_google_go_cmp": {
+        "repoRuleId": "@@gazelle+//internal:go_repository.bzl%go_repository",
+        "attributes": {
+         "internal_only_do_not_use_apparent_name": "com_github_google_go_cmp",
+         "importpath": "github.com/google/go-cmp",
+         "build_directives": [],
+         "build_file_generation": "auto",
+         "build_extra_args": [],
+         "patches": [],
+         "patch_args": [],
+         "patch_cmds": [],
+         "debug_mode": false,
+         "version": "v0.6.0",
+         "sum": "h1:ofyhxvXcZhMsU5ulbFiLKl/XBFqE1GSq7atu8tAmTRI="
+        }
+       }
+      },
+      "go_deps_recorded_container": "recordedInputs",
+      "go_deps_recorded_input_kinds": [
+       "ENV",
+       "FILE",
+       "REPO_MAPPING"
+      ],
+      "recorded_go_mod_inputs_count": 9,
+      "recorded_go_mod_inputs_of_root_and_othermod": [
+       "FILE:@@//go.mod 224888d21e902b9f9898e68dbe22efb5be7a5f8eba6752609799556f39f9e86b",
+       "FILE:@@//go.sum d1c4c025da50168e31fba018a902bdf6909c3aa21002e264e8613d081f525903"
+      ],
+      "reduced_copy": null
+     },
+     "workspace_lock": {
+      "exists": true,
+      "bytes": 64850,
+      "sha256": "1e9e1935164b875d12d957b5ab39e564239321dda6c2dc616c24e9dfbf9fc151",
+      "lockFileVersion": 28,
+      "top_level_keys": [
+       "lockFileVersion",
+       "registryFileHashes",
+       "selectedYankedVersions",
+       "moduleExtensions",
+       "facts",
+       "factsVersions"
+      ],
+      "go_deps_extension_key": null,
+      "facts_key": null
+     },
+     "show_repo": [
+      "## @com_github_jackc_pgx_v5:",
+      "version = \"v5.7.0\",",
+      "sum = \"h1:FG6VLIdzvAPhnYqP14sQ2xhFLkiUQHCs6ySqO91kF4g=\",",
+      "## @com_github_google_go_cmp:",
+      "version = \"v0.6.0\",",
+      "sum = \"h1:ofyhxvXcZhMsU5ulbFiLKl/XBFqE1GSq7atu8tAmTRI=\","
+     ],
+     "repo_dirs": {
+      "gazelle++go_deps+com_github_jackc_pgx_v5": {
+       "is_symlink": true
+      },
+      "gazelle++go_deps+com_github_google_go_cmp": {
+       "is_symlink": true
+      }
+     },
+     "repo_marker_first_lines": {},
+     "go_repository_config": {
+      "dir": "gazelle++go_deps+bazel_gazelle_go_repository_config",
+      "files": [
+       "BUILD.bazel",
+       "WORKSPACE",
+       "config.json",
+       "go.env",
+       "go_env.bzl",
+       "go_tools.bzl"
+      ],
+      "lines_naming_pgx": [
+       "    importpath = \"github.com/jackc/pgx/v5\",",
+       "    importpath = \"github.com/jackc/pgx/v5\","
+      ],
+      "names_a_version": false
+     },
+     "fetched_pgx": {
+      "dir": "gazelle++go_deps+com_github_jackc_pgx_v5",
+      "is_symlink": true,
+      "patched_marker_file_present": false,
+      "function_call_go_sha256": "e0ede408acf1ecaf4dac0359e66301c7c7e86d20fab23a865796bdaa40a6887c",
+      "function_call_go_differs_from_baseline": false
+     },
+     "output_base_top_level": [
+      "DO_NOT_BUILD_HERE",
+      "MODULE.bazel.lock",
+      "README",
+      "action_cache",
+      "lock",
+      "modextwd",
+      "sandbox"
+     ]
+    }
+   }
+  },
+  {
+   "bazel": "9.3.2",
+   "gazelle": "2.0.0-beta.2",
+   "rules_go": "0.65.0",
+   "go_sdk": "1.26.0",
+   "restored_lock_equals_baseline_lock": false,
+   "dir_replace_then_error_mode": {
+    "exit": 2,
+    "first_error": "ERROR: MODULE.bazel.lock is no longer up-to-date because the extension '@@gazelle+//:extensions.bzl%go_deps' has changed its facts: {\"required_mod_files_v1\": [{\"importpath\": \"github.com/google/go-cmp\", \"sha256\": \"e7c7669d4a1dd589ba3e024ba27",
+    "lock_unchanged": true
+   },
+   "repo_marker_sample": {},
+   "states": {
+    "baseline": {
+     "mod_deps_exit": 0,
+     "build_exit": 0,
+     "errors": [],
+     "gazelle_notes": [
+      "DEBUG: <OUTPUT_BASE>/external/gazelle+/internal/bzlmod/go_deps.bzl:1643:25: Version conflict found for Go module github.com/google/go-cmp:\n    requested in root module: v0.5.9\n    selected by Go:           v0.7.0\nTo correct this:\n    1. Set the requested version to v0.7.0.\n    2. Ensure that no higher version is requested in any MODULE.bazel, go.mod,\n       or go.work file. When using go_deps.from_file, you can use 'go get'\n       to downgrade indirect dependencies if needed."
+     ],
+     "mod_deps_error_mode_first": null,
+     "lock_changed_by_update": true,
+     "hidden_lock": {
+      "exists": true,
+      "bytes": 754989,
+      "sha256": "dde6fee33589ab150593a11543fb412fd0e506aa9119758c1751f310d6842025",
+      "lockFileVersion": 28,
+      "top_level_keys": [
+       "lockFileVersion",
+       "registryFileHashes",
+       "selectedYankedVersions",
+       "moduleExtensions",
+       "facts",
+       "factsVersions"
+      ],
+      "go_deps_extension_key": "@@gazelle+//:extensions.bzl%go_deps",
+      "go_deps_factor_keys": [
+       "general"
+      ],
+      "go_deps_entry_keys": [
+       "bzlTransitiveDigest",
+       "usagesDigest",
+       "recordedInputs",
+       "generatedRepoSpecs",
+       "moduleExtensionMetadata"
+      ],
+      "go_deps_repo_spec_count": 191,
+      "go_deps_repo_specs": {
+       "com_github_jackc_pgx_v5": {
+        "repoRuleId": "@@gazelle+//internal:go_repository.bzl%go_repository",
+        "attributes": {
+         "importpath": "github.com/jackc/pgx/v5",
+         "debug_mode": false,
+         "internal_only_do_not_use_apparent_name": "com_github_jackc_pgx_v5",
+         "version": "v5.7.0",
+         "sum": "h1:FG6VLIdzvAPhnYqP14sQ2xhFLkiUQHCs6ySqO91kF4g=",
+         "build_directives": [],
+         "build_file_generation": "auto",
+         "build_extra_args": []
+        }
+       },
+       "com_github_google_go_cmp": {
+        "repoRuleId": "@@gazelle+//internal:go_repository.bzl%go_repository",
+        "attributes": {
+         "importpath": "github.com/google/go-cmp",
+         "debug_mode": false,
+         "internal_only_do_not_use_apparent_name": "com_github_google_go_cmp",
+         "version": "v0.7.0",
+         "sum": "h1:wk8382ETsv4JYUZwIsn6YpYiWiBsYLSJiTsyBybVuN8=",
+         "build_directives": [],
+         "build_file_generation": "auto",
+         "build_extra_args": []
+        }
+       }
+      },
+      "go_deps_recorded_container": "recordedInputs",
+      "go_deps_recorded_input_kinds": [
+       "FILE",
+       "REPO_MAPPING"
+      ],
+      "facts_required_mod_files_count": 181,
+      "recorded_go_mod_inputs_count": 10,
+      "recorded_go_mod_inputs_of_root_and_othermod": [
+       "FILE:@@//go.mod 224888d21e902b9f9898e68dbe22efb5be7a5f8eba6752609799556f39f9e86b",
+       "FILE:@@//go.sum d1c4c025da50168e31fba018a902bdf6909c3aa21002e264e8613d081f525903"
+      ],
+      "reduced_copy": "hidden/gz2.0.0-beta.2-b9.3.2.baseline.reduced.json"
+     },
+     "workspace_lock": {
+      "exists": true,
+      "bytes": 100831,
+      "sha256": "1882e43b0fd5c85a23df562e7cb25c1d5affd3ca661467aec7df05ac16e0dff7",
+      "lockFileVersion": 28,
+      "top_level_keys": [
+       "lockFileVersion",
+       "registryFileHashes",
+       "selectedYankedVersions",
+       "moduleExtensions",
+       "facts",
+       "factsVersions"
+      ],
+      "go_deps_extension_key": null,
+      "facts_key": "@@gazelle+//:extensions.bzl%go_deps",
+      "facts_keys": [
+       "required_mod_files_v1"
+      ],
+      "facts_required_mod_files_count": 181,
+      "facts_required_mod_files_sha256": "65452e9fcf9ec935d628bc9a70b3f20b275a62f39a1bd515691d9d5c88a19bb3",
+      "facts_watched": [
+       {
+        "importpath": "github.com/google/go-cmp",
+        "sha256": "e7c7669d4a1dd589ba3e024ba27f43f293db611fe075ce20d7b884370d63febd",
+        "version": "v0.5.9"
+       },
+       {
+        "importpath": "github.com/jackc/pgx/v5",
+        "sha256": "7b8ae117eb6a6fe1adda9624971609f505cd4a2d05d6bd89fea78a868c5bbccb",
+        "version": "v5.7.0"
+       },
+       {
+        "importpath": "github.com/google/go-cmp",
+        "sha256": "e7c7669d4a1dd589ba3e024ba27f43f293db611fe075ce20d7b884370d63febd",
+        "version": "v0.6.0"
+       },
+       {
+        "importpath": "github.com/google/go-cmp",
+        "sha256": "31c874a1d2a18e62b0550f823ce7a575c8dec7f8fd9d4fa1959bb12d7f7c0f14",
+        "version": "v0.7.0"
+       }
+      ]
+     },
+     "show_repo": [
+      "## @com_github_jackc_pgx_v5:",
+      "version = \"v5.7.0\",",
+      "sum = \"h1:FG6VLIdzvAPhnYqP14sQ2xhFLkiUQHCs6ySqO91kF4g=\",",
+      "## @com_github_google_go_cmp:",
+      "version = \"v0.7.0\",",
+      "sum = \"h1:wk8382ETsv4JYUZwIsn6YpYiWiBsYLSJiTsyBybVuN8=\","
+     ],
+     "repo_dirs": {
+      "gazelle++go_deps+com_github_jackc_pgx_v5": {
+       "is_symlink": true
+      },
+      "gazelle++go_deps+com_github_google_go_cmp": {
+       "is_symlink": true
+      }
+     },
+     "repo_marker_first_lines": {},
+     "go_repository_config": {
+      "dir": "gazelle++go_deps+bazel_gazelle_go_repository_config",
+      "files": [
+       "BUILD.bazel",
+       "WORKSPACE",
+       "config.json",
+       "go.env",
+       "go_env.bzl",
+       "go_tools.bzl"
+      ],
+      "lines_naming_pgx": [
+       "# gazelle:repository go_repository name=com_github_jackc_pgx_v5 importpath=github.com/jackc/pgx/v5",
+       "# gazelle:repository go_repository name=com_github_jackc_pgx_v5 importpath=github.com/jackc/pgx/v5"
+      ],
+      "names_a_version": false
+     },
+     "fetched_pgx": {
+      "dir": "gazelle++go_deps+com_github_jackc_pgx_v5",
+      "is_symlink": true,
+      "patched_marker_file_present": false,
+      "function_call_go_sha256": "e0ede408acf1ecaf4dac0359e66301c7c7e86d20fab23a865796bdaa40a6887c",
+      "function_call_go_differs_from_baseline": false
+     },
+     "output_base_top_level": [
+      "DO_NOT_BUILD_HERE",
+      "MODULE.bazel.lock",
+      "README",
+      "action_cache",
+      "lock",
+      "modextwd",
+      "sandbox"
+     ]
+    },
+    "dir": {
+     "mod_deps_exit": 0,
+     "build_exit": 0,
+     "errors": [],
+     "gazelle_notes": null,
+     "mod_deps_error_mode_first": null,
+     "lock_changed_by_update": true,
+     "hidden_lock": {
+      "exists": true,
+      "bytes": 755073,
+      "sha256": "fa133c397a24ca56785c33c6aad0b5fd313dc6d3243c6e4b801bbeb3e8dc43fc",
+      "lockFileVersion": 28,
+      "top_level_keys": [
+       "lockFileVersion",
+       "registryFileHashes",
+       "selectedYankedVersions",
+       "moduleExtensions",
+       "facts",
+       "factsVersions"
+      ],
+      "go_deps_extension_key": "@@gazelle+//:extensions.bzl%go_deps",
+      "go_deps_factor_keys": [
+       "general"
+      ],
+      "go_deps_entry_keys": [
+       "bzlTransitiveDigest",
+       "usagesDigest",
+       "recordedInputs",
+       "generatedRepoSpecs",
+       "moduleExtensionMetadata"
+      ],
+      "go_deps_repo_spec_count": 191,
+      "go_deps_repo_specs": {
+       "com_github_jackc_pgx_v5": {
+        "repoRuleId": "@@gazelle+//internal:go_repository.bzl%go_repository",
+        "attributes": {
+         "importpath": "github.com/jackc/pgx/v5",
+         "debug_mode": false,
+         "internal_only_do_not_use_apparent_name": "com_github_jackc_pgx_v5",
+         "local_path": "<PROBE>/x3/cells/gz2.0.0-beta.2-b9.3.2/ws/.socket/go-patches/github.com/jackc/pgx/v5@v5.7.0",
+         "build_directives": [],
+         "build_file_generation": "auto",
+         "build_extra_args": []
+        }
+       },
+       "com_github_google_go_cmp": {
+        "repoRuleId": "@@gazelle+//internal:go_repository.bzl%go_repository",
+        "attributes": {
+         "importpath": "github.com/google/go-cmp",
+         "debug_mode": false,
+         "internal_only_do_not_use_apparent_name": "com_github_google_go_cmp",
+         "version": "v0.7.0",
+         "sum": "h1:wk8382ETsv4JYUZwIsn6YpYiWiBsYLSJiTsyBybVuN8=",
+         "build_directives": [],
+         "build_file_generation": "auto",
+         "build_extra_args": []
+        }
+       }
+      },
+      "go_deps_recorded_container": "recordedInputs",
+      "go_deps_recorded_input_kinds": [
+       "FILE",
+       "REPO_MAPPING"
+      ],
+      "facts_required_mod_files_count": 181,
+      "recorded_go_mod_inputs_count": 10,
+      "recorded_go_mod_inputs_of_root_and_othermod": [
+       "FILE:@@//go.mod 6057e59c8fd5d6da86cffecfb0a7f18a1eea8be2062c96c44a7c1bfa9fe4be7b",
+       "FILE:@@//go.sum 94f69a8520879fb7d1ab78837628a6d03f31e5446617fc882a74a71b99d9ccb9"
+      ],
+      "reduced_copy": "hidden/gz2.0.0-beta.2-b9.3.2.dir.reduced.json"
+     },
+     "workspace_lock": {
+      "exists": true,
+      "bytes": 100831,
+      "sha256": "365707172cae510c740648d99b12ace5eab2aede5bcdb1314af1d25664181773",
+      "lockFileVersion": 28,
+      "top_level_keys": [
+       "lockFileVersion",
+       "registryFileHashes",
+       "selectedYankedVersions",
+       "moduleExtensions",
+       "facts",
+       "factsVersions"
+      ],
+      "go_deps_extension_key": null,
+      "facts_key": "@@gazelle+//:extensions.bzl%go_deps",
+      "facts_keys": [
+       "required_mod_files_v1"
+      ],
+      "facts_required_mod_files_count": 181,
+      "facts_required_mod_files_sha256": "42f26c51a6a1f24700e4b3b5e0829d9ee80ec6249465042be8bc26273f0c28d4",
+      "facts_watched": [
+       {
+        "importpath": "github.com/google/go-cmp",
+        "sha256": "e7c7669d4a1dd589ba3e024ba27f43f293db611fe075ce20d7b884370d63febd",
+        "version": "v0.5.9"
+       },
+       {
+        "importpath": "github.com/google/go-cmp",
+        "sha256": "e7c7669d4a1dd589ba3e024ba27f43f293db611fe075ce20d7b884370d63febd",
+        "version": "v0.6.0"
+       },
+       {
+        "importpath": "github.com/jackc/pgx/v5",
+        "sha256": "7b8ae117eb6a6fe1adda9624971609f505cd4a2d05d6bd89fea78a868c5bbccb",
+        "version": "v5.7.0"
+       },
+       {
+        "importpath": "github.com/google/go-cmp",
+        "sha256": "31c874a1d2a18e62b0550f823ce7a575c8dec7f8fd9d4fa1959bb12d7f7c0f14",
+        "version": "v0.7.0"
+       }
+      ]
+     },
+     "show_repo": [
+      "## @com_github_jackc_pgx_v5:",
+      "local_path = \"<PROBE>/x3/cells/gz2.0.0-beta.2-b9.3.2/ws/.socket/go-patches/github.com/jackc/pgx/v5@v5.7.0\",",
+      "## @com_github_google_go_cmp:",
+      "version = \"v0.7.0\",",
+      "sum = \"h1:wk8382ETsv4JYUZwIsn6YpYiWiBsYLSJiTsyBybVuN8=\","
+     ],
+     "repo_dirs": {
+      "gazelle++go_deps+com_github_jackc_pgx_v5": {
+       "is_symlink": false,
+       "entries_naming_a_version": []
+      },
+      "gazelle++go_deps+com_github_google_go_cmp": {
+       "is_symlink": true
+      }
+     },
+     "repo_marker_first_lines": {
+      "@gazelle++go_deps+com_github_jackc_pgx_v5.marker": "f0834bb24f649ba9c0e797480c0ab9575afc3a4218fc21dc3dfeb7e10e42cc31"
+     },
+     "go_repository_config": {
+      "dir": "gazelle++go_deps+bazel_gazelle_go_repository_config",
+      "files": [
+       "BUILD.bazel",
+       "WORKSPACE",
+       "config.json",
+       "go.env",
+       "go_env.bzl",
+       "go_tools.bzl"
+      ],
+      "lines_naming_pgx": [
+       "# gazelle:repository go_repository name=com_github_jackc_pgx_v5 importpath=github.com/jackc/pgx/v5",
+       "# gazelle:repository go_repository name=com_github_jackc_pgx_v5 importpath=github.com/jackc/pgx/v5"
+      ],
+      "names_a_version": false
+     },
+     "fetched_pgx": {
+      "dir": "gazelle++go_deps+com_github_jackc_pgx_v5",
+      "is_symlink": false,
+      "patched_marker_file_present": true,
+      "function_call_go_sha256": "e780e30ffd3e03b6012243c03b99aef12dfbfe6fa2f063521d52eb7a50b21e97",
+      "function_call_go_differs_from_baseline": true
+     },
+     "output_base_top_level": [
+      "DO_NOT_BUILD_HERE",
+      "MODULE.bazel.lock",
+      "README",
+      "action_cache",
+      "lock",
+      "modextwd",
+      "sandbox"
+     ]
+    },
+    "hosted": {
+     "mod_deps_exit": 0,
+     "build_exit": 0,
+     "errors": [],
+     "gazelle_notes": null,
+     "mod_deps_error_mode_first": null,
+     "lock_changed_by_update": true,
+     "hidden_lock": {
+      "exists": true,
+      "bytes": 755341,
+      "sha256": "dda7af343aa0a336c588c438c1c0af25621d1466efa38d0ab5215bc7c5452c3d",
+      "lockFileVersion": 28,
+      "top_level_keys": [
+       "lockFileVersion",
+       "registryFileHashes",
+       "selectedYankedVersions",
+       "moduleExtensions",
+       "facts",
+       "factsVersions"
+      ],
+      "go_deps_extension_key": "@@gazelle+//:extensions.bzl%go_deps",
+      "go_deps_factor_keys": [
+       "general"
+      ],
+      "go_deps_entry_keys": [
+       "bzlTransitiveDigest",
+       "usagesDigest",
+       "recordedInputs",
+       "generatedRepoSpecs",
+       "moduleExtensionMetadata"
+      ],
+      "go_deps_repo_spec_count": 191,
+      "go_deps_repo_specs": {
+       "com_github_jackc_pgx_v5": {
+        "repoRuleId": "@@gazelle+//internal:go_repository.bzl%go_repository",
+        "attributes": {
+         "importpath": "github.com/jackc/pgx/v5",
+         "debug_mode": false,
+         "internal_only_do_not_use_apparent_name": "com_github_jackc_pgx_v5",
+         "version": "v5.7.0-socketpatch.1",
+         "sum": "h1:gR/c/AlF3QdC7jqzW7DTXmKzYaNTFHD6MMmBuMntE2g=",
+         "replace": "patch.socket.dev/gopatch/d8941a4c-4bcd-4756-b0aa-239ec9c81b0f/v5",
+         "build_directives": [],
+         "build_file_generation": "auto",
+         "build_extra_args": []
+        }
+       },
+       "com_github_google_go_cmp": {
+        "repoRuleId": "@@gazelle+//internal:go_repository.bzl%go_repository",
+        "attributes": {
+         "importpath": "github.com/google/go-cmp",
+         "debug_mode": false,
+         "internal_only_do_not_use_apparent_name": "com_github_google_go_cmp",
+         "version": "v0.7.0",
+         "sum": "h1:wk8382ETsv4JYUZwIsn6YpYiWiBsYLSJiTsyBybVuN8=",
+         "build_directives": [],
+         "build_file_generation": "auto",
+         "build_extra_args": []
+        }
+       }
+      },
+      "go_deps_recorded_container": "recordedInputs",
+      "go_deps_recorded_input_kinds": [
+       "FILE",
+       "REPO_MAPPING"
+      ],
+      "facts_required_mod_files_count": 182,
+      "recorded_go_mod_inputs_count": 10,
+      "recorded_go_mod_inputs_of_root_and_othermod": [
+       "FILE:@@//go.mod d80cbfb457154a529fc967f0bf4212c4a53d688dd9d31fdf9633aba9612c6f26",
+       "FILE:@@//go.sum 32ebf33065ae32c04db5f4f81c2b5d43fe5433298e9a637446cc606eeec7befb"
+      ],
+      "reduced_copy": "hidden/gz2.0.0-beta.2-b9.3.2.hosted.reduced.json"
+     },
+     "workspace_lock": {
+      "exists": true,
+      "bytes": 101076,
+      "sha256": "6133143ba3f96679fd3ef4c47bb3c55e2cc2ffdb43448c51f25b4db27694eae7",
+      "lockFileVersion": 28,
+      "top_level_keys": [
+       "lockFileVersion",
+       "registryFileHashes",
+       "selectedYankedVersions",
+       "moduleExtensions",
+       "facts",
+       "factsVersions"
+      ],
+      "go_deps_extension_key": null,
+      "facts_key": "@@gazelle+//:extensions.bzl%go_deps",
+      "facts_keys": [
+       "required_mod_files_v1"
+      ],
+      "facts_required_mod_files_count": 182,
+      "facts_required_mod_files_sha256": "18b8087747610ec1e35ddd3d51206eb9155f25ad816926eb28d9b3908469d768",
+      "facts_watched": [
+       {
+        "importpath": "github.com/google/go-cmp",
+        "sha256": "e7c7669d4a1dd589ba3e024ba27f43f293db611fe075ce20d7b884370d63febd",
+        "version": "v0.5.9"
+       },
+       {
+        "importpath": "patch.socket.dev/gopatch/d8941a4c-4bcd-4756-b0aa-239ec9c81b0f/v5",
+        "sha256": "7b8ae117eb6a6fe1adda9624971609f505cd4a2d05d6bd89fea78a868c5bbccb",
+        "version": "v5.7.0-socketpatch.1"
+       },
+       {
+        "importpath": "github.com/google/go-cmp",
+        "sha256": "e7c7669d4a1dd589ba3e024ba27f43f293db611fe075ce20d7b884370d63febd",
+        "version": "v0.6.0"
+       },
+       {
+        "importpath": "github.com/jackc/pgx/v5",
+        "sha256": "7b8ae117eb6a6fe1adda9624971609f505cd4a2d05d6bd89fea78a868c5bbccb",
+        "version": "v5.7.0"
+       },
+       {
+        "importpath": "github.com/google/go-cmp",
+        "sha256": "31c874a1d2a18e62b0550f823ce7a575c8dec7f8fd9d4fa1959bb12d7f7c0f14",
+        "version": "v0.7.0"
+       }
+      ]
+     },
+     "show_repo": [
+      "## @com_github_jackc_pgx_v5:",
+      "version = \"v5.7.0-socketpatch.1\",",
+      "sum = \"h1:gR/c/AlF3QdC7jqzW7DTXmKzYaNTFHD6MMmBuMntE2g=\",",
+      "replace = \"patch.socket.dev/gopatch/d8941a4c-4bcd-4756-b0aa-239ec9c81b0f/v5\",",
+      "## @com_github_google_go_cmp:",
+      "version = \"v0.7.0\",",
+      "sum = \"h1:wk8382ETsv4JYUZwIsn6YpYiWiBsYLSJiTsyBybVuN8=\","
+     ],
+     "repo_dirs": {
+      "gazelle++go_deps+com_github_jackc_pgx_v5": {
+       "is_symlink": true
+      },
+      "gazelle++go_deps+com_github_google_go_cmp": {
+       "is_symlink": true
+      }
+     },
+     "repo_marker_first_lines": {},
+     "go_repository_config": {
+      "dir": "gazelle++go_deps+bazel_gazelle_go_repository_config",
+      "files": [
+       "BUILD.bazel",
+       "WORKSPACE",
+       "config.json",
+       "go.env",
+       "go_env.bzl",
+       "go_tools.bzl"
+      ],
+      "lines_naming_pgx": [
+       "# gazelle:repository go_repository name=com_github_jackc_pgx_v5 importpath=github.com/jackc/pgx/v5",
+       "# gazelle:repository go_repository name=com_github_jackc_pgx_v5 importpath=github.com/jackc/pgx/v5"
+      ],
+      "names_a_version": false
+     },
+     "fetched_pgx": {
+      "dir": "gazelle++go_deps+com_github_jackc_pgx_v5",
+      "is_symlink": true,
+      "patched_marker_file_present": true,
+      "function_call_go_sha256": "e780e30ffd3e03b6012243c03b99aef12dfbfe6fa2f063521d52eb7a50b21e97",
+      "function_call_go_differs_from_baseline": true
+     },
+     "output_base_top_level": [
+      "DO_NOT_BUILD_HERE",
+      "MODULE.bazel.lock",
+      "README",
+      "action_cache",
+      "lock",
+      "modextwd",
+      "sandbox"
+     ]
+    },
+    "skew": {
+     "mod_deps_exit": 0,
+     "build_exit": 0,
+     "errors": [],
+     "gazelle_notes": [
+      "DEBUG: <OUTPUT_BASE>/external/gazelle+/internal/bzlmod/go_deps.bzl:1643:25: Version conflict found for Go module github.com/google/go-cmp:\n    requested in root module: v0.5.9\n    selected by Go:           v0.7.0\nTo correct this:\n    1. Set the requested version to v0.7.0.\n    2. Ensure that no higher version is requested in any MODULE.bazel, go.mod,\n       or go.work file. When using go_deps.from_file, you can use 'go get'\n       to downgrade indirect dependencies if needed.",
+      "DEBUG: <OUTPUT_BASE>/external/gazelle+/internal/bzlmod/go_deps.bzl:1643:25: Version conflict found for Go module github.com/jackc/pgx/v5:\n    requested in root module: v5.7.0\n    selected by Go:           v5.7.1\nTo correct this:\n    1. Set the requested version to v5.7.1.\n    2. Ensure that no higher version is requested in any MODULE.bazel, go.mod,\n       or go.work file. When using go_deps.from_file, you can use 'go get'\n       to downgrade indirect dependencies if needed."
+     ],
+     "mod_deps_error_mode_first": null,
+     "lock_changed_by_update": true,
+     "hidden_lock": {
+      "exists": true,
+      "bytes": 758533,
+      "sha256": "e7936f5f564b756826fc4e1aa3212bd507b6ab7f0be61fd8219427290581d178",
+      "lockFileVersion": 28,
+      "top_level_keys": [
+       "lockFileVersion",
+       "registryFileHashes",
+       "selectedYankedVersions",
+       "moduleExtensions",
+       "facts",
+       "factsVersions"
+      ],
+      "go_deps_extension_key": "@@gazelle+//:extensions.bzl%go_deps",
+      "go_deps_factor_keys": [
+       "general"
+      ],
+      "go_deps_entry_keys": [
+       "bzlTransitiveDigest",
+       "usagesDigest",
+       "recordedInputs",
+       "generatedRepoSpecs",
+       "moduleExtensionMetadata"
+      ],
+      "go_deps_repo_spec_count": 195,
+      "go_deps_repo_specs": {
+       "com_github_jackc_pgx_v5": {
+        "repoRuleId": "@@gazelle+//internal:go_repository.bzl%go_repository",
+        "attributes": {
+         "importpath": "github.com/jackc/pgx/v5",
+         "debug_mode": false,
+         "internal_only_do_not_use_apparent_name": "com_github_jackc_pgx_v5",
+         "version": "v5.7.1",
+         "sum": "h1:x7SYsPBYDkHDksogeSmZZ5xzThcTgRz++I5E+ePFUcs=",
+         "build_directives": [],
+         "build_file_generation": "auto",
+         "build_extra_args": []
+        }
+       },
+       "com_github_google_go_cmp": {
+        "repoRuleId": "@@gazelle+//internal:go_repository.bzl%go_repository",
+        "attributes": {
+         "importpath": "github.com/google/go-cmp",
+         "debug_mode": false,
+         "internal_only_do_not_use_apparent_name": "com_github_google_go_cmp",
+         "version": "v0.7.0",
+         "sum": "h1:wk8382ETsv4JYUZwIsn6YpYiWiBsYLSJiTsyBybVuN8=",
+         "build_directives": [],
+         "build_file_generation": "auto",
+         "build_extra_args": []
+        }
+       }
+      },
+      "go_deps_recorded_container": "recordedInputs",
+      "go_deps_recorded_input_kinds": [
+       "FILE",
+       "REPO_MAPPING"
+      ],
+      "facts_required_mod_files_count": 186,
+      "recorded_go_mod_inputs_count": 12,
+      "recorded_go_mod_inputs_of_root_and_othermod": [
+       "FILE:@@//go.mod d80cbfb457154a529fc967f0bf4212c4a53d688dd9d31fdf9633aba9612c6f26",
+       "FILE:@@//go.sum 32ebf33065ae32c04db5f4f81c2b5d43fe5433298e9a637446cc606eeec7befb",
+       "FILE:@@othermod+//go.mod c6ab75f225085d3af9e8ac0a2908cd7133cff6272b9d2b37277c844d5980b1a5",
+       "FILE:@@othermod+//go.sum 4a03a26472c5df773653cf10ce6f08f1bbb7689138893bd0d39d0ffc67d36a28"
+      ],
+      "reduced_copy": "hidden/gz2.0.0-beta.2-b9.3.2.skew.reduced.json"
+     },
+     "workspace_lock": {
+      "exists": true,
+      "bytes": 101831,
+      "sha256": "35dce6fcb49f52650f2ae51ccfab4586d17db3054e251ec4fe8ebb9bdda73ac8",
+      "lockFileVersion": 28,
+      "top_level_keys": [
+       "lockFileVersion",
+       "registryFileHashes",
+       "selectedYankedVersions",
+       "moduleExtensions",
+       "facts",
+       "factsVersions"
+      ],
+      "go_deps_extension_key": null,
+      "facts_key": "@@gazelle+//:extensions.bzl%go_deps",
+      "facts_keys": [
+       "required_mod_files_v1"
+      ],
+      "facts_required_mod_files_count": 186,
+      "facts_required_mod_files_sha256": "a8441bac55a0e538722f2b9ee418af889f33e1dd8a4ef79121194a8b5cd5e50e",
+      "facts_watched": [
+       {
+        "importpath": "github.com/google/go-cmp",
+        "sha256": "e7c7669d4a1dd589ba3e024ba27f43f293db611fe075ce20d7b884370d63febd",
+        "version": "v0.5.9"
+       },
+       {
+        "importpath": "patch.socket.dev/gopatch/d8941a4c-4bcd-4756-b0aa-239ec9c81b0f/v5",
+        "sha256": "7b8ae117eb6a6fe1adda9624971609f505cd4a2d05d6bd89fea78a868c5bbccb",
+        "version": "v5.7.0-socketpatch.1"
+       },
+       {
+        "importpath": "github.com/google/go-cmp",
+        "sha256": "e7c7669d4a1dd589ba3e024ba27f43f293db611fe075ce20d7b884370d63febd",
+        "version": "v0.6.0"
+       },
+       {
+        "importpath": "github.com/jackc/pgx/v5",
+        "sha256": "eb7eee30b5d752dc7e368a22661d91cb25b51bc06141880b5649c468a3c7961f",
+        "version": "v5.7.1"
+       },
+       {
+        "importpath": "github.com/jackc/pgx/v5",
+        "sha256": "7b8ae117eb6a6fe1adda9624971609f505cd4a2d05d6bd89fea78a868c5bbccb",
+        "version": "v5.7.0"
+       },
+       {
+        "importpath": "github.com/google/go-cmp",
+        "sha256": "31c874a1d2a18e62b0550f823ce7a575c8dec7f8fd9d4fa1959bb12d7f7c0f14",
+        "version": "v0.7.0"
+       }
+      ]
+     },
+     "show_repo": [
+      "## @com_github_jackc_pgx_v5:",
+      "version = \"v5.7.1\",",
+      "sum = \"h1:x7SYsPBYDkHDksogeSmZZ5xzThcTgRz++I5E+ePFUcs=\",",
+      "## @com_github_google_go_cmp:",
+      "version = \"v0.7.0\",",
+      "sum = \"h1:wk8382ETsv4JYUZwIsn6YpYiWiBsYLSJiTsyBybVuN8=\","
+     ],
+     "repo_dirs": {
+      "gazelle++go_deps+com_github_jackc_pgx_v5": {
+       "is_symlink": true
+      },
+      "gazelle++go_deps+com_github_google_go_cmp": {
+       "is_symlink": true
+      }
+     },
+     "repo_marker_first_lines": {},
+     "go_repository_config": {
+      "dir": "gazelle++go_deps+bazel_gazelle_go_repository_config",
+      "files": [
+       "BUILD.bazel",
+       "WORKSPACE",
+       "config.json",
+       "go.env",
+       "go_env.bzl",
+       "go_tools.bzl"
+      ],
+      "lines_naming_pgx": [
+       "# gazelle:repository go_repository name=com_github_jackc_pgx_v5 importpath=github.com/jackc/pgx/v5",
+       "# gazelle:repository go_repository name=com_github_jackc_pgx_v5 importpath=github.com/jackc/pgx/v5"
+      ],
+      "names_a_version": false
+     },
+     "fetched_pgx": {
+      "dir": "gazelle++go_deps+com_github_jackc_pgx_v5",
+      "is_symlink": true,
+      "patched_marker_file_present": false,
+      "function_call_go_sha256": "e0ede408acf1ecaf4dac0359e66301c7c7e86d20fab23a865796bdaa40a6887c",
+      "function_call_go_differs_from_baseline": false
+     },
+     "output_base_top_level": [
+      "DO_NOT_BUILD_HERE",
+      "MODULE.bazel.lock",
+      "README",
+      "action_cache",
+      "lock",
+      "modextwd",
+      "sandbox"
+     ]
+    },
+    "restored": {
+     "mod_deps_exit": 0,
+     "build_exit": 0,
+     "errors": [],
+     "gazelle_notes": null,
+     "mod_deps_error_mode_first": {
+      "exit": 2,
+      "first_error": "ERROR: MODULE.bazel.lock is no longer up-to-date because the extension '@@gazelle+//:extensions.bzl%go_deps' has changed its facts: {\"required_mod_files_v1\": [{\"importpath\": \"github.com/google/go-cmp\"",
+      "lock_unchanged": true
+     },
+     "lock_changed_by_update": true,
+     "hidden_lock": {
+      "exists": true,
+      "bytes": 755989,
+      "sha256": "33d21d319ca4d922f1c51101bbeab146f39a6d93e253b786ddb1227952396742",
+      "lockFileVersion": 28,
+      "top_level_keys": [
+       "lockFileVersion",
+       "registryFileHashes",
+       "selectedYankedVersions",
+       "moduleExtensions",
+       "facts",
+       "factsVersions"
+      ],
+      "go_deps_extension_key": "@@gazelle+//:extensions.bzl%go_deps",
+      "go_deps_factor_keys": [
+       "general"
+      ],
+      "go_deps_entry_keys": [
+       "bzlTransitiveDigest",
+       "usagesDigest",
+       "recordedInputs",
+       "generatedRepoSpecs",
+       "moduleExtensionMetadata"
+      ],
+      "go_deps_repo_spec_count": 191,
+      "go_deps_repo_specs": {
+       "com_github_jackc_pgx_v5": {
+        "repoRuleId": "@@gazelle+//internal:go_repository.bzl%go_repository",
+        "attributes": {
+         "importpath": "github.com/jackc/pgx/v5",
+         "debug_mode": false,
+         "internal_only_do_not_use_apparent_name": "com_github_jackc_pgx_v5",
+         "version": "v5.7.0",
+         "sum": "h1:FG6VLIdzvAPhnYqP14sQ2xhFLkiUQHCs6ySqO91kF4g=",
+         "build_directives": [],
+         "build_file_generation": "auto",
+         "build_extra_args": []
+        }
+       },
+       "com_github_google_go_cmp": {
+        "repoRuleId": "@@gazelle+//internal:go_repository.bzl%go_repository",
+        "attributes": {
+         "importpath": "github.com/google/go-cmp",
+         "debug_mode": false,
+         "internal_only_do_not_use_apparent_name": "com_github_google_go_cmp",
+         "version": "v0.7.0",
+         "sum": "h1:wk8382ETsv4JYUZwIsn6YpYiWiBsYLSJiTsyBybVuN8=",
+         "build_directives": [],
+         "build_file_generation": "auto",
+         "build_extra_args": []
+        }
+       }
+      },
+      "go_deps_recorded_container": "recordedInputs",
+      "go_deps_recorded_input_kinds": [
+       "FILE",
+       "REPO_MAPPING"
+      ],
+      "facts_required_mod_files_count": 186,
+      "recorded_go_mod_inputs_count": 10,
+      "recorded_go_mod_inputs_of_root_and_othermod": [
+       "FILE:@@//go.mod 224888d21e902b9f9898e68dbe22efb5be7a5f8eba6752609799556f39f9e86b",
+       "FILE:@@//go.sum d1c4c025da50168e31fba018a902bdf6909c3aa21002e264e8613d081f525903"
+      ],
+      "reduced_copy": null
+     },
+     "workspace_lock": {
+      "exists": true,
+      "bytes": 101831,
+      "sha256": "c73f62cfc914e824c1fba923fdd7c6a1f09404c0e7deea790bc4bfa6b5bf90be",
+      "lockFileVersion": 28,
+      "top_level_keys": [
+       "lockFileVersion",
+       "registryFileHashes",
+       "selectedYankedVersions",
+       "moduleExtensions",
+       "facts",
+       "factsVersions"
+      ],
+      "go_deps_extension_key": null,
+      "facts_key": "@@gazelle+//:extensions.bzl%go_deps",
+      "facts_keys": [
+       "required_mod_files_v1"
+      ],
+      "facts_required_mod_files_count": 186,
+      "facts_required_mod_files_sha256": "f773e01be5eb6f7bfb3385f66551fa168d7bda3651549f295935cd50a092fa00",
+      "facts_watched": [
+       {
+        "importpath": "github.com/google/go-cmp",
+        "sha256": "e7c7669d4a1dd589ba3e024ba27f43f293db611fe075ce20d7b884370d63febd",
+        "version": "v0.5.9"
+       },
+       {
+        "importpath": "github.com/jackc/pgx/v5",
+        "sha256": "7b8ae117eb6a6fe1adda9624971609f505cd4a2d05d6bd89fea78a868c5bbccb",
+        "version": "v5.7.0"
+       },
+       {
+        "importpath": "github.com/google/go-cmp",
+        "sha256": "e7c7669d4a1dd589ba3e024ba27f43f293db611fe075ce20d7b884370d63febd",
+        "version": "v0.6.0"
+       },
+       {
+        "importpath": "patch.socket.dev/gopatch/d8941a4c-4bcd-4756-b0aa-239ec9c81b0f/v5",
+        "sha256": "7b8ae117eb6a6fe1adda9624971609f505cd4a2d05d6bd89fea78a868c5bbccb",
+        "version": "v5.7.0-socketpatch.1"
+       },
+       {
+        "importpath": "github.com/jackc/pgx/v5",
+        "sha256": "eb7eee30b5d752dc7e368a22661d91cb25b51bc06141880b5649c468a3c7961f",
+        "version": "v5.7.1"
+       },
+       {
+        "importpath": "github.com/google/go-cmp",
+        "sha256": "31c874a1d2a18e62b0550f823ce7a575c8dec7f8fd9d4fa1959bb12d7f7c0f14",
+        "version": "v0.7.0"
+       }
+      ]
+     },
+     "show_repo": [
+      "## @com_github_jackc_pgx_v5:",
+      "version = \"v5.7.0\",",
+      "sum = \"h1:FG6VLIdzvAPhnYqP14sQ2xhFLkiUQHCs6ySqO91kF4g=\",",
+      "## @com_github_google_go_cmp:",
+      "version = \"v0.7.0\",",
+      "sum = \"h1:wk8382ETsv4JYUZwIsn6YpYiWiBsYLSJiTsyBybVuN8=\","
+     ],
+     "repo_dirs": {
+      "gazelle++go_deps+com_github_jackc_pgx_v5": {
+       "is_symlink": true
+      },
+      "gazelle++go_deps+com_github_google_go_cmp": {
+       "is_symlink": true
+      }
+     },
+     "repo_marker_first_lines": {},
+     "go_repository_config": {
+      "dir": "gazelle++go_deps+bazel_gazelle_go_repository_config",
+      "files": [
+       "BUILD.bazel",
+       "WORKSPACE",
+       "config.json",
+       "go.env",
+       "go_env.bzl",
+       "go_tools.bzl"
+      ],
+      "lines_naming_pgx": [
+       "# gazelle:repository go_repository name=com_github_jackc_pgx_v5 importpath=github.com/jackc/pgx/v5",
+       "# gazelle:repository go_repository name=com_github_jackc_pgx_v5 importpath=github.com/jackc/pgx/v5"
+      ],
+      "names_a_version": false
+     },
+     "fetched_pgx": {
+      "dir": "gazelle++go_deps+com_github_jackc_pgx_v5",
+      "is_symlink": true,
+      "patched_marker_file_present": false,
+      "function_call_go_sha256": "e0ede408acf1ecaf4dac0359e66301c7c7e86d20fab23a865796bdaa40a6887c",
+      "function_call_go_differs_from_baseline": false
+     },
+     "output_base_top_level": [
+      "DO_NOT_BUILD_HERE",
+      "MODULE.bazel.lock",
+      "README",
+      "action_cache",
+      "lock",
+      "modextwd",
+      "sandbox"
+     ]
+    }
+   }
+  }
+ ]
+}

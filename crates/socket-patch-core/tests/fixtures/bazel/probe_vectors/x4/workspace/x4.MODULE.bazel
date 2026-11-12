@@ -1,0 +1,17 @@
+module(name = "x4_probe", version = "0.0.0")
+
+x4 = use_extension("//:ext.bzl", "x4")
+x4.inputs(
+    files = [
+        "//:lf.lock",
+        "//:crlf.lock",
+        "//:bom-crlf.lock",
+        "//:no-eol.lock",
+        "//:empty.lock",
+        "//:latin1.lock",
+        "//sub/pkg:nested.lock",
+        "//sub/pkg:deep/dir/file.lock",
+        "//:with space.lock",
+    ],
+)
+use_repo(x4, "x4_data")

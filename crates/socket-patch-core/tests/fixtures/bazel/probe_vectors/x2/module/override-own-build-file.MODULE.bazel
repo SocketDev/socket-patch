@@ -1,0 +1,22 @@
+module(name = "sp_probe")
+
+bazel_dep(name = "rules_rust", version = "0.75.0")
+
+crate = use_extension("@rules_rust//crate_universe:extensions.bzl", "crate")
+crate.from_cargo(
+    name = "crates",
+    cargo_lockfile = "//:Cargo.lock",
+    lockfile = "//:cargo-bazel-lock.json",
+    manifests = ["//:Cargo.toml"],
+)
+use_repo(crate, "crates")
+
+new_local_repository = use_repo_rule("@bazel_tools//tools/build_defs/repo:local.bzl", "new_local_repository")
+
+new_local_repository(
+    name = "socket_patch_crate_cfg_if_1_0_0",
+    build_file = "//:.socket/vendor/cargo/6b7c8d9e-0f1a-4a1b-8c2d-3e4f5a6b7c8d/BUILD.cfg-if-1.0.0.bazel",
+    path = ".socket/vendor/cargo/6b7c8d9e-0f1a-4a1b-8c2d-3e4f5a6b7c8d/cfg-if-1.0.0",
+)
+
+override_repo(crate, **{"crates__cfg-if-1.0.0": "socket_patch_crate_cfg_if_1_0_0"})
