@@ -13,19 +13,21 @@
 //! `--symlink_prefix`, `startup --output_base`) arrives from the caller,
 //! through [`Classifier::with_vendor_dirs`] and [`Candidates`].
 
+use std::ffi::OsString;
 use std::io::{ErrorKind, Read as _};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Mutex, PoisonError};
 
 use super::coursier_cache::TargetOs;
 use crate::bazel::output_tree::{
-    self, Candidate, Entry, Found, Located, Memo, PathClass, TreeFs, Unsure, Verdict,
-    OUTPUT_BASE_MARKER,
+    self, Candidate, Entry, Found, LinkRoute, Located, Memo, PathClass, Tree, TreeFs, Unsure,
+    Verdict, OUTPUT_BASE_MARKER,
 };
 use crate::utils::fs::open_regular_file_sync;
 
-/// The longest marker read. A marker holds one path, far below this; a
-/// larger `DO_NOT_BUILD_HERE` is not Bazel's and names nothing.
+/// The most that is read of a marker. A marker holds one path, far below
+/// this. A larger `DO_NOT_BUILD_HERE` is not Bazel's: this much of it is
+/// read and compared like any other, and it names nothing.
 const MAX_MARKER_BYTES: u64 = 1 << 16;
 
 /// How many entries of one directory are read when looking for links and
@@ -87,13 +89,16 @@ impl Classifier {
 
     /// A classifier that also knows the directories tracked rc files name
     /// with `--vendor_dir` (absolute paths). Such a directory is a vendor
-    /// directory before `bazel vendor` has written a marker into it.
+    /// directory before `bazel vendor` has written a marker into it, and
+    /// before it exists.
     pub fn with_vendor_dirs(dirs: impl IntoIterator<Item = PathBuf>) -> Self {
         let mut vendor_dirs = Vec::new();
         for dir in dirs {
             // Compared by identity: a query is judged as spelled and as
-            // resolved, so the directory is kept both ways.
-            if let Some(real) = std::fs::canonicalize(&dir).ok().filter(|real| *real != dir) {
+            // resolved, so the directory is kept both ways. `resolve` and
+            // not `canonicalize`, which has no answer for a directory
+            // `bazel vendor` has yet to create.
+            if let Some(real) = resolve(&dir, MAX_LINK_HOPS).filter(|real| *real != dir) {
                 vendor_dirs.push(real);
             }
             vendor_dirs.push(dir);
@@ -116,6 +121,9 @@ impl Classifier {
                 cannot_tell: true,
             };
         };
+        // One spelling per path: `absolute` keeps a trailing separator,
+        // and `<link>/` is not a link to `read_link`. `..` is kept.
+        let found: PathBuf = found.components().collect();
         let canonical = resolve(&found, MAX_LINK_HOPS);
         // Where `a/b/../c` is, only the disk knows, so a path spelled with
         // `..` is judged by its resolved form alone.
@@ -124,22 +132,74 @@ impl Classifier {
             Some(real) if dotted => real.clone(),
             _ => found,
         };
-        // Held across the marker tests: they are a few `stat`s, and two
-        // callers that walked the same ancestors at once would only repeat
-        // them.
-        let mut memo = self.memo.lock().unwrap_or_else(PoisonError::into_inner);
-        output_tree::classify(&Disk, &found, canonical.as_deref(), &mut memo)
+        let mut verdict = {
+            // Held across the marker tests: they are a few `stat`s, and
+            // two callers that walked the same ancestors at once would
+            // only repeat them.
+            let mut memo = self.memo.lock().unwrap_or_else(PoisonError::into_inner);
+            output_tree::classify(&Disk, &found, canonical.as_deref(), &mut memo)
+        };
+        // The rules compare the two roots as paths. One tree spelled two
+        // ways is not "another tree": a base reached through a link above
+        // it or a link to its root, `/tmp` and `/private/tmp`, `C:\` and
+        // `\\?\C:\`.
+        if let (Some(tree), Some(other)) = (&verdict.tree, &verdict.resolves_into) {
+            if same_tree(tree, other) {
+                verdict.resolves_into = None;
+            }
+        }
+        verdict
     }
 
     /// The tree `dir` itself is the root of, by its own markers: the test
-    /// a walker makes before it enters a directory. It costs at most four
-    /// `stat`s, walks nowhere and remembers nothing, because a walker
-    /// meets each directory once and came down from one it already
-    /// entered. The root of the walk is [`Classifier::classify`]'s to
-    /// judge.
+    /// a walker makes before it enters a directory. For a real directory
+    /// it costs a `readlink` and a few `stat`s, walks nowhere and
+    /// remembers nothing, because a walker meets each directory once and
+    /// came down from one it already entered. With a tracked
+    /// `--vendor_dir` a directory that holds no marker is also resolved,
+    /// to compare it with the tracked ones however the walker spells it.
+    ///
+    /// A link is judged in full, by [`Classifier::classify`], and the
+    /// answer is the tree it leads into: the markers of a directory do not
+    /// say that it lies inside a tree, and every convenience link of a
+    /// built workspace leads to such a place, with no marker anywhere
+    /// below it. The root of the walk is `classify`'s to judge as well.
     pub fn tree_at(&self, dir: &Path) -> Found {
-        output_tree::tree_at(&Disk, dir, &self.vendor_dirs)
+        // As in `classify`: `<link>/` is not a link to `read_link`.
+        let dir: PathBuf = dir.components().collect();
+        if Disk.read_link(&dir).is_some() {
+            let verdict = self.classify(&dir);
+            return Found {
+                tree: verdict.tree,
+                cannot_tell: verdict.cannot_tell,
+            };
+        }
+        let own = output_tree::tree_at(&Disk, &dir, &self.vendor_dirs);
+        if own.tree.is_some() || self.vendor_dirs.is_empty() {
+            return own;
+        }
+        // The rules compared `dir` with the tracked directories as it is
+        // spelled. They are kept absolute, as declared and as resolved.
+        let tracked = |at: &PathBuf| self.vendor_dirs.contains(at);
+        let spelled = std::path::absolute(&dir).ok();
+        let real = spelled.as_deref().and_then(|at| resolve(at, MAX_LINK_HOPS));
+        let is_tracked = [&spelled, &real].into_iter().flatten().any(tracked);
+        Found {
+            cannot_tell: !is_tracked && (own.cannot_tell || real.is_none()),
+            tree: is_tracked.then_some(Tree {
+                class: PathClass::VendorDir,
+                root: dir,
+            }),
+        }
     }
+}
+
+/// Whether two trees the rules told apart by their roots' spelling are one
+/// directory of one kind. Where the disk will not resolve a root they stay
+/// two: naming a second tree is the careful answer.
+fn same_tree(one: &Tree, other: &Tree) -> bool {
+    let real = |tree: &Tree| resolve(&tree.root, MAX_LINK_HOPS);
+    one.class == other.class && real(one).zip(real(other)).is_some_and(|(a, b)| a == b)
 }
 
 /// Classify one path with a fresh memo and no tracked vendor directory.
@@ -204,7 +264,9 @@ impl Candidates {
         let passwd_home = crate::utils::fs::passwd_home();
         #[cfg(not(unix))]
         let passwd_home: Option<PathBuf> = None;
-        let env = |name: &str| std::env::var(name).ok();
+        // The bytes, as the Bazel client reads them: a value that is not
+        // UTF-8 is still a path.
+        let env = |name: &str| std::env::var_os(name);
         Self {
             output_roots: default_output_roots(TargetOs::host(), &env, passwd_home.as_deref()),
             ..Self::default()
@@ -221,7 +283,7 @@ impl Candidates {
 /// which the client falls back to when `$HOME` is empty.
 pub fn default_output_roots(
     os: TargetOs,
-    env: &dyn Fn(&str) -> Option<String>,
+    env: &dyn Fn(&str) -> Option<OsString>,
     passwd_home: Option<&Path>,
 ) -> Vec<PathBuf> {
     let var = |name: &str| env(name).filter(|v| !v.is_empty()).map(PathBuf::from);
@@ -281,17 +343,43 @@ fn list(dir: &Path, cap: usize, listed_all: &mut bool) -> Vec<std::fs::DirEntry>
     listed
 }
 
-/// Whether the marker of `base` names `workspace` (canonical). Anything
-/// but a match is unknown: an unreadable marker, an oversized one, another
-/// workspace's path, this path in another encoding.
-fn marker_names_workspace(base: &Path, workspace: &Path) -> bool {
-    let Ok((file, meta)) = open_regular_file_sync(&base.join(OUTPUT_BASE_MARKER)) else {
-        return false;
-    };
+/// What the marker of an output base says about a workspace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Marker {
+    /// Its bytes are the workspace's path.
+    Names,
+    /// It was read and they are not: another workspace's path, this path
+    /// in another encoding, an oversized file. Or there is no regular file
+    /// to read. Either way nothing is known about the base.
+    Other,
+    /// A regular file that could not be opened or read to its end. It may
+    /// name the workspace.
+    Unread,
+}
+
+/// What the marker of `base` says about `workspace` (canonical).
+fn marker_names_workspace(base: &Path, workspace: &Path) -> Marker {
+    let marker = base.join(OUTPUT_BASE_MARKER);
     let mut bytes = Vec::new();
-    meta.len() <= MAX_MARKER_BYTES
-        && file.take(MAX_MARKER_BYTES).read_to_end(&mut bytes).is_ok()
-        && output_tree::marker_names(&bytes, workspace)
+    let read = open_regular_file_sync(&marker)
+        .and_then(|(file, _)| file.take(MAX_MARKER_BYTES).read_to_end(&mut bytes));
+    match read {
+        Ok(_) if output_tree::marker_names(&bytes, workspace) => Marker::Names,
+        Ok(_) => Marker::Other,
+        // The guard's own refusal has no kind of its own and opening a
+        // directory fails by OS, so the entry says which failure this was.
+        Err(_) => match Disk.stat(&marker) {
+            Entry::File | Entry::Unknown => Marker::Unread,
+            Entry::Dir | Entry::Neither => Marker::Other,
+        },
+    }
+}
+
+/// The absolute paths among `dirs`. A relative one would be read from
+/// socket-patch's working directory, not from Bazel's.
+fn absolute_only(dirs: &[PathBuf]) -> Vec<PathBuf> {
+    let kept = dirs.iter().filter(|dir| dir.is_absolute());
+    kept.cloned().collect()
 }
 
 /// Locate the output base of the Bazel workspace rooted at `workspace`
@@ -304,53 +392,69 @@ fn marker_names_workspace(base: &Path, workspace: &Path) -> bool {
 /// this workspace, and two that do make the answer `CannotTell`. A user
 /// name with `/` in it nests the bases one level deeper on Bazel 9 and
 /// earlier; those are not listed and are found by a link or not at all.
+///
+/// What the disk would not show is never read as absent: a directory that
+/// could not be listed, a link target or a candidate base that could not
+/// be read, and a marker that could not be opened each leave the answer
+/// at `CannotTell` where it would have been `NotFound` or the one base
+/// that could be read.
 pub fn locate_output_base(workspace: &Path, candidates: &Candidates) -> Located {
     let Ok(workspace) = std::fs::canonicalize(workspace) else {
         return Located::CannotTell(Unsure::Unlisted);
     };
+    // Cleared by everything the disk kept back, not only by a listing.
     let mut listed_all = true;
-    let candidate = |base: PathBuf| Candidate {
-        names_workspace: marker_names_workspace(&base, &workspace),
-        // One spelling per base, so `/var/tmp` and `/private/var/tmp`
-        // count once.
-        base: std::fs::canonicalize(&base).unwrap_or(base),
-    };
-    let absolute = |dirs: &[PathBuf]| {
-        let kept = dirs.iter().filter(|dir| dir.is_absolute());
-        kept.cloned().collect::<Vec<_>>()
+    let candidate = |base: PathBuf, listed_all: &mut bool| {
+        let marker = marker_names_workspace(&base, &workspace);
+        *listed_all &= marker != Marker::Unread;
+        Candidate {
+            names_workspace: marker == Marker::Names,
+            // One spelling per base, so `/var/tmp` and `/private/var/tmp`
+            // count once.
+            base: std::fs::canonicalize(&base).unwrap_or(base),
+        }
     };
 
     let mut linked = Vec::new();
-    for dir in std::iter::once(workspace.clone()).chain(absolute(&candidates.link_dirs)) {
+    for dir in std::iter::once(workspace.clone()).chain(absolute_only(&candidates.link_dirs)) {
         for entry in list(&dir, MAX_LISTED, &mut listed_all) {
             if !entry.file_type().is_ok_and(|kind| kind.is_symlink()) {
                 continue;
             }
-            let target = Disk.read_link(&entry.path()).map(|target| dir.join(target));
-            let base = target.and_then(|target| output_tree::base_of_link_target(&Disk, &target));
-            linked.extend(base.map(&candidate));
+            let Some(target) = Disk.read_link(&entry.path()) else {
+                continue;
+            };
+            match output_tree::base_of_link_target(&Disk, &dir.join(target)) {
+                LinkRoute::Base(base) => linked.push(candidate(base, &mut listed_all)),
+                LinkRoute::Unanswered => listed_all = false,
+                LinkRoute::NoBase => {}
+            }
         }
     }
     if !linked.is_empty() {
         return output_tree::locate(&linked, &[], listed_all);
     }
 
-    let mut user_roots = absolute(&candidates.output_user_roots);
-    for root in absolute(&candidates.output_roots) {
+    let mut user_roots = absolute_only(&candidates.output_user_roots);
+    for root in absolute_only(&candidates.output_roots) {
         let entries = list(&root, MAX_LISTED, &mut listed_all).into_iter();
         let users = entries.filter(|e| e.file_name().as_encoded_bytes().starts_with(b"_bazel_"));
         user_roots.extend(users.map(|entry| entry.path()));
     }
-    let mut bases = absolute(&candidates.output_bases);
+    let mut bases = absolute_only(&candidates.output_bases);
     for user_root in user_roots {
         let entries = list(&user_root, MAX_LISTED, &mut listed_all);
         bases.extend(entries.iter().map(|entry| entry.path()));
     }
-    let is_base = |dir: &PathBuf| {
-        let own = output_tree::tree_at(&Disk, dir, &[]).tree;
-        own.is_some_and(|tree| tree.class == PathClass::OutputBase)
-    };
-    let enumerated: Vec<Candidate> = bases.into_iter().filter(is_base).map(candidate).collect();
+    let mut enumerated = Vec::new();
+    for dir in bases {
+        let own = output_tree::tree_at(&Disk, &dir, &[]);
+        listed_all &= !own.cannot_tell;
+        let class = own.tree.map(|tree| tree.class);
+        if class == Some(PathClass::OutputBase) {
+            enumerated.push(candidate(dir, &mut listed_all));
+        }
+    }
     output_tree::locate(&[], &enumerated, listed_all)
 }
 
@@ -362,13 +466,23 @@ mod tests {
     use crate::bazel::output_tree::PathClass::{
         Link, OutputBase, Plain, RepoContentsCache, RepositoryCache, VendorDir,
     };
-    use crate::bazel::output_tree::{Route, Tree};
+    use crate::bazel::output_tree::Route;
 
     /// An output base as a server and a build leave it (probe C7).
     const BASE: &str = "
         {base}/DO_NOT_BUILD_HERE
         {base}/external/rules_x+/
         {base}/execroot/_main/bazel-out/k8/bin/node_modules/left-pad/";
+
+    /// An output base as `bazel clean --async` leaves it until the next
+    /// server starts (Bazel 9.3.2): `execroot` is renamed away and deleted
+    /// in the background, and the marker, `external/`, `server/` and
+    /// `sandbox/` stay, with `install`, a link to the install base.
+    const CLEANED_ASYNC: &str = "
+        {base}/DO_NOT_BUILD_HERE
+        {base}/external/rules_x+/pnpm-lock.yaml
+        {base}/server/
+        {base}/sandbox/";
 
     /// The second marker. `bazel clean` deletes it and only a new server
     /// writes it again, so a base that was cleaned and built has none.
@@ -458,6 +572,23 @@ mod tests {
         }
     }
 
+    /// What `read` returns while `path` has no permission bit set, or
+    /// `None` where that hides nothing: root reads everything.
+    #[cfg(unix)]
+    fn while_locked<T>(path: &Path, read: impl FnOnce() -> T) -> Option<T> {
+        use std::os::unix::fs::PermissionsExt;
+        let before = fs::metadata(path).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o000)).unwrap();
+        let hidden = if before.is_dir() {
+            fs::read_dir(path).is_err()
+        } else {
+            fs::File::open(path).is_err()
+        };
+        let got = hidden.then(read);
+        fs::set_permissions(path, before.permissions()).unwrap();
+        got
+    }
+
     #[cfg(unix)]
     #[test]
     fn a_base_is_classified_through_its_links_after_build_and_after_clean() {
@@ -494,7 +625,87 @@ mod tests {
                 );
                 let base = tree(OutputBase, disk.at("root/_bazel_u/6d82"));
                 assert_eq!(verdict.tree, base.filter(|_| want != Plain), "{path}");
+                // Stored where it is spelled: no second tree.
+                assert_eq!(verdict.resolves_into, None, "{path}");
             }
+        }
+    }
+
+    #[test]
+    fn a_base_whose_execroot_was_renamed_away_is_still_a_base() {
+        let disk = Scratch::new();
+        let base = "root/_bazel_u/6d82";
+        disk.lay("ws", base, &[CLEANED_ASYNC, "{ws}/MODULE.bazel"].join("\n"));
+        disk.lay("", "", "root/_bazel_u/install/7b1f/embedded_tools/");
+        if cfg!(unix) {
+            // `old-bin` is a link an earlier `--symlink_prefix` left, in a
+            // checkout of its own so that this workspace has no link.
+            let links = "
+                {base}/install -> root/_bazel_u/install/7b1f
+                {ws}/old-bin -> {base}/execroot/_main/bazel-out/k8/bin";
+            disk.lay("stale", base, links);
+        }
+        let classifier = Classifier::new();
+        let root = tree(OutputBase, disk.at(base));
+        for path in [
+            "root/_bazel_u/6d82",
+            "root/_bazel_u/6d82/external/rules_x+",
+            "root/_bazel_u/6d82/external/rules_x+/pnpm-lock.yaml",
+            "root/_bazel_u/6d82/external/rules_x+/new/file.js",
+            "root/_bazel_u/6d82/server",
+        ] {
+            let verdict = classifier.classify(&disk.at(path));
+            assert_eq!(
+                (verdict.class, verdict.cannot_tell, verdict.resolves_into),
+                (OutputBase, false, None),
+                "{path}"
+            );
+            assert_eq!(verdict.tree, root, "{path}");
+        }
+        if cfg!(unix) {
+            // The link route never needed the directory.
+            let stale = classifier.classify(&disk.at("stale/old-bin"));
+            assert_eq!((stale.class, stale.tree), (Link, root.clone()));
+            let below = classifier.classify(&disk.at("stale/old-bin/node_modules"));
+            assert_eq!((below.class, below.tree), (OutputBase, root.clone()));
+        }
+        assert_eq!(classifier.classify(&disk.at("ws")).class, Plain);
+        // A walker stops at it, and it is this workspace's one base.
+        assert_eq!(classifier.tree_at(&disk.at(base)).tree, root);
+        let located = locate_output_base(&disk.at("ws"), &roots(&disk, &["root"]));
+        assert_eq!(located, found(disk.at(base), Route::Enumeration));
+
+        // Any one of the directories beside the marker is enough, and
+        // nothing else is: another directory, a file under one of the
+        // names.
+        let mut cases = vec![
+            ("{base}/execroot/", true),
+            ("{base}/external/", true),
+            ("{base}/server/", true),
+            ("{base}/install/", true),
+            ("{base}/sandbox/", false),
+            ("{base}/server", false),
+            ("{base}/external", false),
+            ("", false),
+        ];
+        if cfg!(unix) {
+            cases.push(("{base}/install -> root/_bazel_u/install/7b1f", true));
+            cases.push(("{base}/install -> root/_bazel_u/install/gone", false));
+        }
+        for (nth, (beside, is_base)) in cases.into_iter().enumerate() {
+            let base = format!("lone/{nth}");
+            let layout = ["{base}/DO_NOT_BUILD_HERE", beside].join("\n");
+            disk.lay("ws", &base, &layout);
+            let own = Classifier::new().tree_at(&disk.at(&base));
+            let want = tree(OutputBase, disk.at(&base)).filter(|_| is_base);
+            assert_eq!((own.tree, own.cannot_tell), (want, false), "{beside}");
+            let class = if is_base { OutputBase } else { Plain };
+            let inside = classify(&disk.at(&base).join("external/rules_x+/BUILD"));
+            assert_eq!(
+                (inside.class, inside.cannot_tell),
+                (class, false),
+                "{beside}"
+            );
         }
     }
 
@@ -508,6 +719,7 @@ mod tests {
             cache/contents/cd12/6488/package/package.json
             cache/contents/cd12/6488.recorded_inputs
             {base}/external/npm+left-pad -> cache/contents/cd12/6488
+            {ws}/bazel-bin -> {base}/execroot/_main/bazel-out/k8/bin
             {ws}/old-bin -> {base}/execroot/_main/bazel-out/k8-opt/bin
             {ws}/older -> {ws}/old-bin
             {ws}/gone -> nowhere/execroot/_main
@@ -537,6 +749,27 @@ mod tests {
         ] {
             let stale = classify(&disk.at(path));
             assert_eq!((stale.class, stale.tree), (want, base.clone()), "{path}");
+        }
+        // A trailing separator names the same entry, live or stale: the
+        // answer is the one for the path without it.
+        for (path, want) in [
+            ("ws/bazel-bin/", Link),
+            ("ws/old-bin/", Link),
+            ("ws/old-bin/.", Link),
+            ("ws/bazel-bin//", Link),
+            ("ws/old-bin/node_modules/", OutputBase),
+            ("base/external/", OutputBase),
+            ("ws/", Plain),
+        ] {
+            let spelled = disk.at(path);
+            assert!(bytes(&spelled).ends_with(path.as_bytes()), "{path}");
+            let verdict = classify(&spelled);
+            let tree = base.clone().filter(|_| want != Plain);
+            assert_eq!(
+                (verdict.class, verdict.tree, verdict.cannot_tell),
+                (want, tree, false),
+                "{path}"
+            );
         }
         // A link to an ordinary directory is nothing, whatever its name,
         // and so is one to nowhere. Links that never end prove nothing.
@@ -629,6 +862,118 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn a_walker_is_told_where_a_link_leads() {
+        let disk = Scratch::new();
+        // Every built workspace holds four links to places inside its
+        // base. No marker is at or below any of them, so the markers of
+        // the entry alone would send a walker that follows links through
+        // the whole output tree.
+        let more = "
+            {ws}/src/package.json
+            {ws}/store/dep/package.json
+            {ws}/dist/bin -> {base}/execroot/_main/bazel-out/k8/bin
+            {ws}/old-bin -> {base}/execroot/_main/bazel-out/k8-opt/bin
+            {ws}/ob -> {base}
+            {ws}/node_modules/dep -> {ws}/store/dep
+            {ws}/bazel-notes -> {ws}/src
+            {ws}/gone -> nowhere/execroot/_main";
+        disk.lay("ws", "root/_bazel_u/6d82", &[BASE, LINKS, more].join("\n"));
+        let classifier = Classifier::new();
+        let base = tree(OutputBase, disk.at("root/_bazel_u/6d82"));
+        for link in [
+            "ws/bazel-bin",
+            "ws/bazel-out",
+            "ws/bazel-proj",
+            // `--symlink_prefix=dist/`.
+            "ws/dist/bin",
+            // Stale: a configuration `clean` removed, and one never built.
+            "ws/old-bin",
+            "ws/bazel-testlogs",
+            "ws/bazel-bin/",
+        ] {
+            let entry = disk.at(link);
+            let own = classifier.tree_at(&entry);
+            assert_eq!((own.tree, own.cannot_tell), (base.clone(), false), "{link}");
+            // What the markers alone say of a link into a tree.
+            let by_markers = output_tree::tree_at(&Disk, &entry, &[]);
+            assert_eq!(by_markers, Found::default(), "{link}");
+        }
+        // A link to the root of a tree is that tree's root, as spelled.
+        let own = classifier.tree_at(&disk.at("ws/ob"));
+        assert_eq!(own.tree, tree(OutputBase, disk.at("ws/ob")));
+        // A link that leads nowhere near a tree is entered like the
+        // directory it leads to.
+        for link in ["ws/node_modules/dep", "ws/bazel-notes", "ws/gone"] {
+            assert_eq!(
+                classifier.tree_at(&disk.at(link)),
+                Found::default(),
+                "{link}"
+            );
+        }
+        for dir in ["ws", "ws/src", "ws/dist", "ws/not-there"] {
+            assert_eq!(classifier.tree_at(&disk.at(dir)), Found::default(), "{dir}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn one_tree_spelled_two_ways_is_one_tree() {
+        let disk = Scratch::new();
+        // `alias` stands for a link above everything, as `/tmp` and `/var`
+        // are on macOS; `ob` and `vend` are links to the root of a tree.
+        let more = "
+            alias -> real
+            {ws}/ob -> {base}
+            {ws}/vendor_src/VENDOR.bazel
+            {ws}/vendor_src/+http+dep/package.json
+            {ws}/vend -> {ws}/vendor_src
+            second/DO_NOT_BUILD_HERE
+            second/execroot/_main/
+            second/external/rules_y+/
+            {base}/external/borrowed -> second/external/rules_y+";
+        disk.lay("real/ws", "real/base", &[BASE, more].join("\n"));
+        let classifier = Classifier::new();
+        let base = |root: &str| tree(OutputBase, disk.at(root));
+        for (path, root) in [
+            ("real/base/external/rules_x+", "real/base"),
+            ("alias/base", "alias/base"),
+            ("alias/base/external/rules_x+", "alias/base"),
+            ("alias/base/external/rules_x+/new/file.js", "alias/base"),
+            ("real/ws/ob", "real/ws/ob"),
+            ("real/ws/ob/external/rules_x+", "real/ws/ob"),
+            ("alias/ws/ob/external/rules_x+", "alias/ws/ob"),
+        ] {
+            let verdict = classifier.classify(&disk.at(path));
+            assert_eq!(
+                (verdict.class, verdict.tree, verdict.resolves_into),
+                (OutputBase, base(root), None),
+                "{path}"
+            );
+        }
+        for path in ["real/ws/vend", "alias/ws/vend/+http+dep/package.json"] {
+            let verdict = classifier.classify(&disk.at(path));
+            assert_eq!(
+                (verdict.class, verdict.resolves_into),
+                (VendorDir, None),
+                "{path}"
+            );
+        }
+        // Another base is another tree, however the first one is spelled.
+        for path in [
+            "real/base/external/borrowed",
+            "alias/base/external/borrowed",
+        ] {
+            let verdict = classifier.classify(&disk.at(path));
+            assert_eq!(
+                (verdict.class, verdict.resolves_into),
+                (OutputBase, base("second")),
+                "{path}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn a_tracked_vendor_dir_matches_however_the_query_spells_it() {
         let disk = Scratch::new();
         disk.lay("", "", "real/ws/deps/+x+y/\n alias -> real");
@@ -642,6 +987,46 @@ mod tests {
             );
         }
         assert_eq!(classifier.classify(&disk.at("real/ws")).class, Plain);
+
+        // A walker's test agrees, whichever spelling was declared and
+        // whichever the walker came down by.
+        let vendor = |dir: &str| tree(VendorDir, disk.at(dir));
+        for declared in ["alias/ws/deps", "real/ws/deps"] {
+            let classifier = Classifier::with_vendor_dirs([disk.at(declared)]);
+            for dir in ["alias/ws/deps", "real/ws/deps", "real/ws/deps/"] {
+                let own = classifier.tree_at(&disk.at(dir));
+                let want = vendor(dir.trim_end_matches('/'));
+                assert_eq!((own.tree, own.cannot_tell), (want, false), "{dir}");
+            }
+            for dir in ["alias/ws", "real/ws", "real/ws/deps/+x+y", "real/ws/gone"] {
+                assert_eq!(classifier.tree_at(&disk.at(dir)), Found::default(), "{dir}");
+            }
+        }
+
+        // Declared before `bazel vendor` has made it: there is nothing to
+        // canonicalize, and the directory is tracked both ways all the
+        // same, before and after it appears.
+        let classifier = Classifier::with_vendor_dirs([disk.at("alias/ws/third_party")]);
+        for made in [false, true] {
+            if made {
+                fs::create_dir_all(disk.at("real/ws/third_party/+a+b")).unwrap();
+            }
+            for path in [
+                "alias/ws/third_party/+a+b/go.mod",
+                "real/ws/third_party/+a+b/go.mod",
+                "real/ws/third_party",
+            ] {
+                assert_eq!(
+                    classifier.classify(&disk.at(path)).class,
+                    VendorDir,
+                    "{path}, made: {made}"
+                );
+            }
+            for dir in ["alias/ws/third_party", "real/ws/third_party"] {
+                let own = classifier.tree_at(&disk.at(dir));
+                assert_eq!(own.tree, vendor(dir), "{dir}, made: {made}");
+            }
+        }
     }
 
     #[test]
@@ -649,7 +1034,7 @@ mod tests {
         fn roots(os: TargetOs, vars: &[(&str, &str)], passwd_home: Option<&str>) -> Vec<PathBuf> {
             let env = |name: &str| {
                 let var = vars.iter().find(|(key, _)| *key == name);
-                var.map(|(_, value)| value.to_string())
+                var.map(|(_, value)| OsString::from(value))
             };
             default_output_roots(os, &env, passwd_home.map(Path::new))
         }
@@ -701,6 +1086,35 @@ mod tests {
         let want = paths(&["/home/u/.cache/bazel", "/tmp/t"]);
         assert_eq!(roots(linux, &vars, None), want);
 
+        // A value that is not UTF-8 is a path all the same: the client
+        // reads the bytes (`GetPathEnv`, `blaze_util_posix.cc`). It is not
+        // dropped, and the passwd home does not stand in for it.
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt as _;
+            let raw = |bytes: &[u8]| PathBuf::from(OsString::from_vec(bytes.to_vec()));
+            let env = |name: &str| match name {
+                "HOME" => Some(raw(b"/Users/\xff").into_os_string()),
+                "XDG_CACHE_HOME" => Some(raw(b"/xdg\xfe").into_os_string()),
+                "TEST_TMPDIR" => Some(raw(b"/tt\xfd").into_os_string()),
+                _ => None,
+            };
+            let passwd = Some(Path::new("/passwd/u"));
+            let want = vec![
+                raw(b"/xdg\xfe/bazel"),
+                PathBuf::from("/var/tmp"),
+                raw(b"/Users/\xff/Library/Caches/bazel"),
+                raw(b"/tt\xfd"),
+            ];
+            assert_eq!(default_output_roots(mac, &env, passwd), want);
+            let want = vec![
+                raw(b"/xdg\xfe/bazel"),
+                raw(b"/Users/\xff/.cache/bazel"),
+                raw(b"/tt\xfd"),
+            ];
+            assert_eq!(default_output_roots(linux, &env, passwd), want);
+        }
+
         // This process: the table of this host, and nothing an rc file
         // would have to say.
         let process = Candidates::of_process();
@@ -723,13 +1137,19 @@ mod tests {
         let ws = disk.at("ws");
         let mut candidates = roots(&disk, &["home/.cache/bazel", "xdg/bazel", "missing"]);
         candidates.output_roots.push("relative/root".into());
+        // A relative candidate would be read from this process's working
+        // directory, not from Bazel's: none is kept, in any of the lists.
+        let spelled = ["relative/root", "../ws", "./ws", ""].map(PathBuf::from);
+        assert_eq!(absolute_only(&spelled), Vec::<PathBuf>::new());
+        let mixed = [spelled[0].clone(), ws.clone(), spelled[1].clone()];
+        assert_eq!(absolute_only(&mixed), vec![ws.clone()]);
         // Never built: no base anywhere.
         assert_eq!(locate_output_base(&ws, &candidates), Located::NotFound);
 
         // One base names the workspace, after `clean` and a build. Beside
         // it: another workspace's base, the install and cache directories
-        // of the user root, a marker with no `execroot`, and a base that
-        // is not under a `_bazel_<user>` directory.
+        // of the user root, a marker with no directory beside it, and a
+        // base that is not under a `_bazel_<user>` directory.
         let old = "home/.cache/bazel/_bazel_u";
         disk.lay("ws", &format!("{old}/6d82"), BASE);
         disk.lay(
@@ -791,13 +1211,19 @@ mod tests {
             // (probe C7).
             ([named, b"-\xfcn\xef"].concat(), false),
             (bytes(&disk.at("other")).to_vec(), false),
-            // Too large to be a path: it names nothing.
+            // Too large to be a path. No more than the limit is read of
+            // it, and that much is no path either, whatever it starts
+            // with.
             (vec![b'x'; MAX_MARKER_BYTES as usize + 1], false),
+            (
+                [named, &vec![b'/'; MAX_MARKER_BYTES as usize][..]].concat(),
+                false,
+            ),
         ] {
             fs::write(base.join(OUTPUT_BASE_MARKER), &marker).unwrap();
             assert_eq!(
                 marker_names_workspace(&base, &ws),
-                names,
+                if names { Marker::Names } else { Marker::Other },
                 "{} bytes",
                 marker.len()
             );
@@ -811,8 +1237,11 @@ mod tests {
         // marker.
         fs::remove_file(base.join(OUTPUT_BASE_MARKER)).unwrap();
         fs::create_dir(base.join(OUTPUT_BASE_MARKER)).unwrap();
-        assert!(!marker_names_workspace(&base, &ws));
+        assert_eq!(marker_names_workspace(&base, &ws), Marker::Other);
         assert_eq!(classify(&base.join("external")).class, Plain);
+        // Nor is a marker that is not there.
+        let nowhere = disk.at("nowhere");
+        assert_eq!(marker_names_workspace(&nowhere, &ws), Marker::Other);
     }
 
     #[cfg(unix)]
@@ -903,7 +1332,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_directory_that_cannot_be_read_is_not_read_as_empty() {
-        use std::os::unix::fs::PermissionsExt;
         let disk = Scratch::new();
         disk.lay(
             "ws",
@@ -923,18 +1351,64 @@ mod tests {
         assert_eq!(list(&disk.at("missing"), 2, &mut listed_all).len(), 0);
         assert!(listed_all);
 
-        fs::set_permissions(&user_root, fs::Permissions::from_mode(0o000)).unwrap();
-        // Root reads everything: nothing to observe then.
-        if fs::read_dir(&user_root).is_err() {
-            let unlisted = Located::CannotTell(Unsure::Unlisted);
-            assert_eq!(locate_output_base(&ws, &candidates), unlisted);
-            // Nor is a path below it proven plain.
-            let hidden = classify(&user_root.join("6d82/external"));
-            assert_eq!((hidden.class, hidden.cannot_tell), (Plain, true));
+        // The user root cannot be listed.
+        let unlisted = Located::CannotTell(Unsure::Unlisted);
+        let read = || {
+            let located = locate_output_base(&ws, &candidates);
+            let below = classify(&user_root.join("6d82/external"));
+            let own = Classifier::new().tree_at(&user_root);
+            (located, below, classify(&user_root), own)
+        };
+        if let Some((located, below, itself, own)) = while_locked(&user_root, read) {
+            assert_eq!(located, unlisted);
+            // Nor is a path below it proven plain, which cannot even be
+            // resolved; nor the directory itself, which can, and whose
+            // markers no `stat` was allowed to see.
+            assert_eq!((below.class, below.cannot_tell), (Plain, true));
+            assert_eq!((itself.class, itself.cannot_tell), (Plain, true));
+            assert_eq!((own.tree, own.cannot_tell), (None, true));
         }
-        fs::set_permissions(&user_root, fs::Permissions::from_mode(0o755)).unwrap();
-        let base = found(disk.at("root/_bazel_u/6d82"), Route::Enumeration);
-        assert_eq!(locate_output_base(&ws, &candidates), base);
+        let base = disk.at("root/_bazel_u/6d82");
+        let only = found(base.clone(), Route::Enumeration);
+        assert_eq!(locate_output_base(&ws, &candidates), only);
+
+        // A candidate base that cannot be read, or whose marker cannot,
+        // may be this workspace's own. Alone, it is not "never built
+        // here"; beside a base that does name the workspace, that one is
+        // not "the only base".
+        let marker = base.join(OUTPUT_BASE_MARKER);
+        if let Some(says) = while_locked(&marker, || marker_names_workspace(&base, &ws)) {
+            assert_eq!(says, Marker::Unread);
+        }
+        disk.lay("ws", "xdg/bazel/_bazel_u/6d82", BASE);
+        let both = roots(&disk, &["root", "xdg/bazel"]);
+        let several = Located::CannotTell(Unsure::SeveralBases);
+        assert_eq!(locate_output_base(&ws, &both), several);
+        for locked in [&base, &marker] {
+            for listed in [&candidates, &both] {
+                let located = while_locked(locked, || locate_output_base(&ws, listed));
+                let roots = listed.output_roots.len();
+                if let Some(located) = located {
+                    assert_eq!(located, unlisted, "{locked:?}, {roots} root(s)");
+                }
+            }
+        }
+        assert_eq!(locate_output_base(&ws, &both), several);
+
+        // A link whose target cannot be read may lead into a base.
+        disk.lay("built", "locked/base", &[BASE, LINKS].join("\n"));
+        let (built, none) = (disk.at("built"), Candidates::default());
+        let linked = found(disk.at("locked/base"), Route::Link);
+        assert_eq!(locate_output_base(&built, &none), linked);
+        let read = || {
+            let link = classify(&built.join("bazel-bin"));
+            (locate_output_base(&built, &none), link)
+        };
+        if let Some((located, link)) = while_locked(&disk.at("locked"), read) {
+            assert_eq!(located, unlisted);
+            assert_eq!((link.class, link.cannot_tell), (Plain, true));
+        }
+        assert_eq!(locate_output_base(&built, &none), linked);
     }
 
     /// A junction is what Bazel makes for every convenience link on
@@ -950,8 +1424,16 @@ mod tests {
         let bin = base.join("execroot").join("_main").join("bazel-out");
         fs::create_dir_all(&ws).unwrap();
         fs::create_dir_all(bin.join("k8").join("bin").join("node_modules")).unwrap();
-        let marker = fs::canonicalize(&ws).unwrap();
-        fs::write(base.join(OUTPUT_BASE_MARKER), bytes(&marker)).unwrap();
+        // The marker as a Windows server spells it: the workspace path
+        // with forward slashes and no `\\?\` prefix (`BlazeWorkspace`
+        // writes `getWorkspace().toString()`). That spelling comes from
+        // reading the source and gap-output-tree-recognition, not from a
+        // run: no Windows cell has built a base yet. `canonicalize` gives
+        // the `\\?\` form with backslashes, so the bytes differ and the
+        // links lead into a base that cannot be said to be this
+        // workspace's.
+        let marker = ws.to_str().unwrap().replace('\\', "/");
+        fs::write(base.join(OUTPUT_BASE_MARKER), marker).unwrap();
         let link = ws.join("bazel-bin");
         let made = std::process::Command::new("cmd")
             .args(["/C", "mklink", "/J"])
@@ -961,12 +1443,19 @@ mod tests {
             .unwrap();
         assert!(made.success(), "mklink /J failed");
         assert_eq!(classify(&link).class, Link);
-        assert_eq!(classify(&link.join("node_modules")).class, OutputBase);
+        // Neither reads the marker, and neither names a second tree: the
+        // base spelled `C:\..` and resolved to `\\?\C:\..` is one tree.
+        for inside in [link.join("node_modules"), bin.join("k8")] {
+            let verdict = classify(&inside);
+            assert_eq!(
+                (verdict.class, verdict.resolves_into),
+                (OutputBase, None),
+                "{}",
+                inside.display()
+            );
+        }
         assert_eq!(classify(&ws).class, Plain);
         let located = locate_output_base(&ws, &Candidates::default());
-        assert_eq!(
-            located,
-            found(fs::canonicalize(&base).unwrap(), Route::Link)
-        );
+        assert_eq!(located, Located::CannotTell(Unsure::MarkerMismatch));
     }
 }
