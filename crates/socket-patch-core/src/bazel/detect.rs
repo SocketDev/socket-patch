@@ -10,39 +10,99 @@
 //! and nothing is guessed: what a reader could not read is in
 //! `completeness`, and a gap can refuse a write and never permits one.
 //!
-//! The model is read once per root. Reads go through the view, which the
-//! disk side memoizes (`crawlers::bazel_workspace`), and each recognizer
-//! opens lock headers and scans BUILD files only where its ruleset is
-//! declared, so a workspace pays for the rulesets it uses.
+//! The model is read once per root and project: the Bazel line is the span
+//! over the launcher files from the project directory up to the read
+//! boundary (design 2.4), so a model answers for that project and the
+//! directories above it and for no other (`govern::governance`). Reads go
+//! through the view, which the disk side memoizes
+//! (`crawlers::bazel_workspace`): the models of several projects of one
+//! root, read through one view, read each file once. Each recognizer opens
+//! lock headers and scans BUILD files only where its ruleset is declared,
+//! so a workspace pays for the rulesets it uses.
 //!
 //! Nested roots are read one at a time: every path of a model is relative
 //! to its own root. `govern::governance_over` combines their answers.
 
-use super::govern::{self, RC_IMPORT_UNREADABLE, WORKSPACE_UNREADABLE};
+use super::govern::{self, Standing, RC_IMPORT_UNREADABLE, WORKSPACE_UNREADABLE};
 use super::ignore::{IgnoreModel, BAZELIGNORE};
 use super::model::{
     BazelWorkspace, BoundaryFiles, CommittedVendorDirs, Completeness, DeclSystem, FileText,
-    FileView, Gap, Liveness, ModuleLock, ModuleModel, OutOfScope, RootRef, Tier, WorkspaceModel,
+    FileView, Gap, Hub, Liveness, ModuleLock, ModuleModel, OutOfScope, RootRef, Tier,
+    WorkspaceModel,
 };
 use super::rc;
 use super::rulesets::{self, RecognizeInput};
-use super::version::{self, ApiShape, DepSystem};
+use super::version::{self, ApiShape, BazelVersion, DepSystem};
 use super::workspace_file::WORKSPACE_FILES;
 
-/// Whether the root holds the file `name`. A directory of that name is no
-/// boundary file, and a file that cannot be read is one: unreadable is not
-/// absent.
-fn present(files: &dyn FileView, name: &str) -> bool {
+/// What a root holds under the name of a boundary file.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Entry {
+    /// A file. One that cannot be read is a file too: unreadable is not
+    /// absent.
+    File,
+    /// A directory. It is no boundary file, and Bazel builds beside a
+    /// `WORKSPACE/` as beside a `docs/` wherever it does not read the
+    /// path (`detect`).
+    Directory,
+    Absent,
+}
+
+/// What the root holds under the boundary name `name`. A read that fails
+/// names a directory when the root lists a directory of the name and no
+/// file of it. The directory is matched without case: on a disk that
+/// folds case `workspace/` answers a read of `WORKSPACE`, and it is
+/// listed as it is spelled. With no listing nothing says it is a
+/// directory, so it is a file that cannot be read.
+fn entry(files: &dyn FileView, name: &str) -> Entry {
     match files.read(name) {
-        FileText::Bytes(_) => true,
-        FileText::Absent => false,
+        FileText::Bytes(_) => Entry::File,
+        FileText::Absent => Entry::Absent,
         FileText::Unreadable => {
             let listed = files.list("").unwrap_or_default();
-            !listed
-                .iter()
-                .any(|entry| entry.strip_suffix('/') == Some(name))
+            let file = listed.iter().any(|entry| entry == name);
+            let directory = |entry: &String| {
+                let dir = entry.strip_suffix('/');
+                dir.is_some_and(|dir| dir.eq_ignore_ascii_case(name))
+            };
+            match !file && listed.iter().any(directory) {
+                true => Entry::Directory,
+                false => Entry::File,
+            }
         }
     }
+}
+
+/// The vendor directories committed at the root, as the view shows them:
+/// each first-level directory that holds a `VENDOR.bazel` or a
+/// `.vendorignore` (design 2.6; `bazel vendor` writes one of the two into
+/// every directory it fills, probe C11). A marker that is there and
+/// cannot be read is a test that went unanswered, as is a root that
+/// cannot be listed: a directory behind a link out of the read boundary
+/// reads so, and only the disk reader can look there
+/// (`crawlers::bazel_workspace`).
+fn vendor_dirs(files: &dyn FileView) -> CommittedVendorDirs {
+    let Some(listed) = files.list("") else {
+        return CommittedVendorDirs {
+            dirs: Vec::new(),
+            cannot_tell: true,
+        };
+    };
+    let mut found = CommittedVendorDirs::default();
+    for dir in listed.iter().filter_map(|entry| entry.strip_suffix('/')) {
+        let markers = ["VENDOR.bazel", ".vendorignore"];
+        let read = markers.map(|marker| files.read(&format!("{dir}/{marker}")));
+        if read
+            .iter()
+            .any(|marker| matches!(marker, FileText::Bytes(_)))
+        {
+            found.dirs.push(dir.to_string());
+        } else if read.contains(&FileText::Unreadable) {
+            found.cannot_tell = true;
+        }
+    }
+    found.dirs.sort();
+    found
 }
 
 /// The lower bounds `MODULE.bazel` puts on the Bazel line (design 2.4 row
@@ -63,11 +123,21 @@ fn api_shapes(module: Option<&ModuleModel>) -> Vec<ApiShape> {
 /// The weakest tier of the file families that declare something Bazel may
 /// evaluate; of every family that declares anything when none is live;
 /// of the files that exist when nothing is declared.
+///
+/// Bazel may evaluate a hub that is live under one of the dependency
+/// systems the workspace may run and dead under another, and one that a
+/// `MODULE.bazel` statement nobody read may shadow. A `WORKSPACE` hub
+/// whose one doubt is the line nobody pinned is left out: governance
+/// answers `Undetermined` for it, and its family would make the whole
+/// workspace `Refused(LineUnknown)`, which refuses the `MODULE.bazel`
+/// hubs that design 8 lets through on an unknown line.
 fn tier(ws: &BazelWorkspace) -> Tier {
-    let live = ws
-        .hubs
-        .iter()
-        .filter(|hub| !matches!(hub.liveness, Liveness::Dead { .. }));
+    let may_run = |hub: &&Hub| match govern::standing(ws, hub) {
+        Standing::Is(Liveness::Dead { .. }) => false,
+        Standing::Is(_) | Standing::Contested(_) => true,
+        Standing::Unknown(gap) => gap.token != govern::BAZEL_LINE_UNKNOWN,
+    };
+    let live = ws.hubs.iter().filter(may_run);
     let mut families: Vec<DeclSystem> = live.map(|hub| hub.decl.site.system).collect();
     if families.is_empty() {
         families.extend(ws.hubs.iter().map(|hub| hub.decl.site.system));
@@ -95,12 +165,16 @@ fn tier(ws: &BazelWorkspace) -> Tier {
 /// shows no boundary file there: the root the probe found cannot be read,
 /// and "no model" must never be taken for "no Bazel".
 pub fn detect(root: &RootRef, files: &dyn FileView) -> Result<BazelWorkspace, Gap> {
+    // Each name is classified once. A directory of the name is no
+    // boundary file, and has no model unless Bazel stops on it (below).
+    let is_file = |name: &str| entry(files, name) == Entry::File;
+    let (module_entry, workspace_entry) = (entry(files, "MODULE.bazel"), entry(files, "WORKSPACE"));
     let boundary = BoundaryFiles {
-        module_bazel: present(files, "MODULE.bazel"),
-        repo_bazel: present(files, "REPO.bazel"),
-        workspace_bazel: present(files, "WORKSPACE.bazel"),
-        workspace: present(files, "WORKSPACE"),
-        workspace_bzlmod: present(files, "WORKSPACE.bzlmod"),
+        module_bazel: module_entry == Entry::File,
+        repo_bazel: is_file("REPO.bazel"),
+        workspace_bazel: is_file("WORKSPACE.bazel"),
+        workspace: workspace_entry == Entry::File,
+        workspace_bzlmod: is_file("WORKSPACE.bzlmod"),
     };
     let BoundaryFiles {
         module_bazel,
@@ -120,10 +194,15 @@ pub fn detect(root: &RootRef, files: &dyn FileView) -> Result<BazelWorkspace, Ga
             ),
         });
     }
-    let module = ModuleModel::read(files);
-    let workspace_files: Vec<WorkspaceModel> = WORKSPACE_FILES
-        .iter()
-        .filter_map(|path| WorkspaceModel::read(files, path))
+    let mut module = module_bazel.then(|| ModuleModel::read(files)).flatten();
+    let held = [
+        boundary.workspace_bazel,
+        workspace,
+        boundary.workspace_bzlmod,
+    ];
+    let held = WORKSPACE_FILES.iter().zip(held).filter(|(_, file)| *file);
+    let mut workspace_files: Vec<WorkspaceModel> = held
+        .filter_map(|(path, _)| WorkspaceModel::read(files, path))
         .collect();
     let module_lock = ModuleLock::read(files);
     let rc = rc::read(files);
@@ -133,6 +212,33 @@ pub fn detect(root: &RootRef, files: &dyn FileView) -> Result<BazelWorkspace, Ga
     let line = version::line(&declared, module_lock.lock_file_version(), &shapes);
     let flags = rc.effective(&line);
     let system = version::dep_system(&line, &flags);
+    // The directories that count are the ones Bazel stops on. It takes
+    // `WORKSPACE.bazel` and `WORKSPACE.bzlmod` only when they are files,
+    // opens the path `WORKSPACE` where neither outranks it, and stops on
+    // a directory there (`WORKSPACE (Is a directory)` on 7.7.2). From
+    // Bazel 7 it reads the path `MODULE.bazel` whatever the dependency
+    // system, and stops on a directory (`MODULE.bazel expected but not
+    // found`: 7.7.2 with and without `--noenable_bzlmod`, and 9.3.2);
+    // Bazel 6 reads it only with Bzlmod on, and builds beside the
+    // directory without (6.6.0). The model of such a path says that it
+    // was not read, and holds every ecosystem up. Wherever Bazel does not
+    // read the path it builds, and the directory means nothing.
+    if module_entry == Entry::Directory || workspace_entry == Entry::Directory {
+        let worlds = govern::worlds_of(&line, &flags, &system);
+        let since_7 = line.hi.is_none_or(|hi| hi >= BazelVersion::new(7, 0, 0));
+        if module_entry == Entry::Directory && (since_7 || govern::reads_module(&worlds)) {
+            module = ModuleModel::read(files);
+        }
+        let opened = BoundaryFiles {
+            workspace: true,
+            ..boundary
+        };
+        let stops =
+            workspace_entry == Entry::Directory && govern::evaluates(&worlds, &opened, "WORKSPACE");
+        let unread = WorkspaceModel::read(files, "WORKSPACE").filter(|_| stops);
+        let after = usize::from(boundary.workspace_bazel);
+        workspace_files.splice(after..after, unread);
+    }
 
     let (mut hubs, mut signals, mut ruleset_gaps) = (Vec::new(), Vec::new(), Vec::new());
     let mut out_of_scope = OutOfScope::default();
@@ -155,8 +261,19 @@ pub fn detect(root: &RootRef, files: &dyn FileView) -> Result<BazelWorkspace, Ga
             out_of_scope.report_only_pins += found.out_of_scope.report_only_pins;
         }
     }
+    // A macro file is read for every `WORKSPACE`-family file that loads
+    // it, and a recognizer walks each of their models: a statement that
+    // two of the files run is found twice, as two equal hubs. One
+    // declaration is one hub.
+    let mut found: Vec<Hub> = Vec::with_capacity(hubs.len());
+    for hub in hubs {
+        if !found.contains(&hub) {
+            found.push(hub);
+        }
+    }
+    let hubs = found;
 
-    let mut gaps = govern::model_gaps(module.as_ref(), &workspace_files);
+    let mut gaps = govern::model_gaps(module.as_ref(), &workspace_files, &boundary);
     let hard = flags.gaps().into_iter().filter(|gap| gap.hard);
     gaps.extend(hard.map(|gap| Gap {
         token: RC_IMPORT_UNREADABLE,
@@ -191,7 +308,7 @@ pub fn detect(root: &RootRef, files: &dyn FileView) -> Result<BazelWorkspace, Ga
             false => Completeness::Incomplete(gaps),
         },
         ruleset_gaps,
-        vendor_dirs: CommittedVendorDirs::default(),
+        vendor_dirs: vendor_dirs(files),
     };
     govern::settle(&mut ws, files);
     ws.tier = tier(&ws);
@@ -204,9 +321,10 @@ mod tests {
 
     use super::*;
     use crate::bazel::govern::tests::{read, read_at, JS_MODULE, JS_WORKSPACE, PNPM_LOCK};
-    use crate::bazel::model::Ruleset;
+    use crate::bazel::model::{FlagState, Governance, HubId, Ruleset};
     use crate::bazel::rc::testing::Files;
     use crate::bazel::version::{BazelVersion, LineEvidence, TierRefusal};
+    use crate::crawlers::types::Ecosystem;
 
     fn tokens(ws: &BazelWorkspace) -> Vec<&'static str> {
         match &ws.completeness {
@@ -256,6 +374,253 @@ mod tests {
             (all.completeness, all.workspace_files.len()),
             (Completeness::Exact, 3)
         );
+    }
+
+    /// A root that holds a directory where a boundary file is looked for:
+    /// the read of `name` fails, and the listing spells the directory as
+    /// it is on the disk, which on one that folds case need not be how
+    /// Bazel spells the file.
+    struct Directory<'a> {
+        files: Files,
+        name: &'a str,
+    }
+
+    impl FileView for Directory<'_> {
+        fn read(&self, rel: &str) -> FileText {
+            match rel == self.name {
+                true => FileText::Unreadable,
+                false => self.files.read(rel),
+            }
+        }
+
+        fn list(&self, dir: &str) -> Option<Vec<String>> {
+            self.files.list(dir)
+        }
+    }
+
+    fn beside_directory<'a>(files: &[(&str, &str)], name: &'a str, listed: &str) -> Directory<'a> {
+        let inside = format!("{listed}/README.md");
+        let files = Files::of(&[files, &[(inside.as_str(), "")]].concat());
+        Directory { files, name }
+    }
+
+    fn detected(files: &dyn FileView) -> BazelWorkspace {
+        let root = RootRef {
+            root: PathBuf::from("/repo"),
+            project_rel: String::new(),
+            boundary_levels: 0,
+        };
+        detect(&root, files).expect("a workspace")
+    }
+
+    /// A directory named like a boundary file is no boundary file. Real
+    /// Bazel 9.3.2 builds beside `WORKSPACE/` and beside `workspace/`,
+    /// 8.8.2 beside `workspace/`, and 7.7.2 beside `WORKSPACE/` where a
+    /// `WORKSPACE.bazel` or a `WORKSPACE.bzlmod` file outranks it. On a
+    /// disk that folds case the read of `WORKSPACE` fails for
+    /// `workspace/` too, and the listing spells it as it is.
+    #[test]
+    fn a_directory_named_like_a_workspace_file_is_no_boundary_file() {
+        let npm = |ws: &BazelWorkspace| govern::governance(ws, Ecosystem::Npm, "");
+        let governed = Governance::Governed(vec![HubId(0)]);
+        let module = [
+            (".bazelversion", "9.3.2\n"),
+            ("MODULE.bazel", JS_MODULE),
+            PNPM_LOCK,
+        ];
+        for (name, listed) in [
+            ("WORKSPACE", "WORKSPACE"),
+            ("WORKSPACE", "workspace"),
+            ("WORKSPACE.bzlmod", "workspace.bzlmod"),
+            ("WORKSPACE.bazel", "Workspace.Bazel"),
+            ("REPO.bazel", "repo.bazel"),
+        ] {
+            let ws = detected(&beside_directory(&module, name, listed));
+            let what = format!("`{listed}/` on 9.3.2");
+            let only = BoundaryFiles {
+                module_bazel: true,
+                ..BoundaryFiles::default()
+            };
+            assert_eq!(ws.boundary, only, "{what}");
+            assert_eq!(ws.workspace_files, [], "{what}");
+            assert_eq!(ws.completeness, Completeness::Exact, "{what}");
+            assert_eq!(npm(&ws), governed, "{what}");
+            let pypi = govern::governance(&ws, Ecosystem::Pypi, "");
+            assert_eq!(pypi, Governance::NotGoverned, "{what}");
+        }
+        // A `MODULE.bazel/` is no module file either. Bazel 6.6.0 reads
+        // no module file unless Bzlmod is switched on, and builds from
+        // the `WORKSPACE` beside the directory.
+        let files = [
+            (".bazelversion", "6.6.0\n"),
+            (".bazelrc", ""),
+            ("WORKSPACE", JS_WORKSPACE),
+            PNPM_LOCK,
+        ];
+        let ws = detected(&beside_directory(&files, "MODULE.bazel", "module.bazel"));
+        assert!(!ws.boundary.module_bazel && ws.module.is_none());
+        assert_eq!(ws.completeness, Completeness::Exact);
+        assert_eq!(npm(&ws), governed);
+        // From Bazel 7 the path is read whatever the dependency system,
+        // and Bazel stops on the directory (`MODULE.bazel expected but
+        // not found`: 7.7.2 with and without `--noenable_bzlmod`, 9.3.2).
+        // So it does wherever Bazel 6 may run with Bzlmod on.
+        for (version, rc) in [
+            ("7.7.2\n", ""),
+            ("7.7.2\n", "common --noenable_bzlmod\n"),
+            ("9.3.2\n", ""),
+            ("6.6.0\n", "common:mod --enable_bzlmod\n"),
+        ] {
+            let what = format!("Bazel {} with {rc:?}", version.trim());
+            let pinned = [(".bazelversion", version), (".bazelrc", rc)];
+            let files = [&pinned[..], &files[2..]].concat();
+            let ws = detected(&beside_directory(&files, "MODULE.bazel", "MODULE.bazel"));
+            assert!(!ws.boundary.module_bazel, "{what}");
+            assert_eq!(tokens(&ws), [WORKSPACE_UNREADABLE], "{what}");
+            let Governance::Undetermined(gaps) = npm(&ws) else {
+                panic!("{what}: Bazel stops on `MODULE.bazel/`");
+            };
+            assert_eq!(gaps[0].file, "MODULE.bazel", "{what}");
+            assert!(gaps[0].detail.contains("is a directory"), "{:?}", gaps[0]);
+        }
+
+        // Bazel 7 takes `WORKSPACE.bazel` and never opens `WORKSPACE`.
+        let files = [
+            (".bazelversion", "7.7.2\n"),
+            ("WORKSPACE.bazel", JS_WORKSPACE),
+            PNPM_LOCK,
+        ];
+        for listed in ["WORKSPACE", "workspace"] {
+            let ws = detected(&beside_directory(&files, "WORKSPACE", listed));
+            assert!(ws.boundary.workspace_bazel && !ws.boundary.workspace);
+            assert_eq!(ws.workspace_files.len(), 1, "`{listed}/`");
+            assert_eq!(ws.completeness, Completeness::Exact, "`{listed}/`");
+            assert_eq!(npm(&ws), governed, "`{listed}/`");
+        }
+
+        // The one case Bazel itself stops on: it reads the family, no
+        // `WORKSPACE.bazel` or `WORKSPACE.bzlmod` file outranks the path,
+        // and the path is a directory (`WORKSPACE (Is a directory)` on
+        // 7.7.2).
+        let hybrid = [
+            (".bazelversion", "7.7.2\n"),
+            ("MODULE.bazel", JS_MODULE),
+            PNPM_LOCK,
+        ];
+        for listed in ["WORKSPACE", "workspace"] {
+            let ws = detected(&beside_directory(&hybrid, "WORKSPACE", listed));
+            assert!(!ws.boundary.workspace, "`{listed}/`");
+            assert_eq!(tokens(&ws), [WORKSPACE_UNREADABLE], "`{listed}/`");
+            for ecosystem in [Ecosystem::Npm, Ecosystem::Pypi] {
+                let found = govern::governance(&ws, ecosystem, "");
+                let Governance::Undetermined(gaps) = &found else {
+                    panic!("`{listed}/`: {found:?}");
+                };
+                let [gap] = &gaps[..] else {
+                    panic!("`{listed}/`: one gap, not {gaps:?}");
+                };
+                assert_eq!(
+                    (gap.token, gap.file.as_str()),
+                    (WORKSPACE_UNREADABLE, "WORKSPACE")
+                );
+                assert!(gap.detail.contains("is a directory"), "{gap:?}");
+            }
+        }
+        // Under a config that may switch the family on, likewise.
+        let maybe = [
+            &module[1..],
+            &[
+                (".bazelversion", "8.8.2\n"),
+                (".bazelrc", "common:ws --enable_workspace\n"),
+            ],
+        ]
+        .concat();
+        let ws = detected(&beside_directory(&maybe, "WORKSPACE", "WORKSPACE"));
+        assert_eq!(tokens(&ws), [WORKSPACE_UNREADABLE]);
+        assert!(matches!(npm(&ws), Governance::Undetermined(_)));
+        // With `WORKSPACE.bzlmod` Bazel 7 does not open the path at all
+        // while Bzlmod is on.
+        let replaced = [&hybrid[..], &[("WORKSPACE.bzlmod", "")]].concat();
+        let ws = detected(&beside_directory(&replaced, "WORKSPACE", "WORKSPACE"));
+        assert_eq!(ws.completeness, Completeness::Exact);
+        assert_eq!(npm(&ws), governed);
+
+        // A file of the name that cannot be read is a boundary file, and
+        // so is a name the root cannot be asked about.
+        let unread = Files::of(&hybrid).with("WORKSPACE", FileText::Unreadable);
+        let ws = detected(&unread);
+        assert!(ws.boundary.workspace);
+        assert_eq!(tokens(&ws), [WORKSPACE_UNREADABLE]);
+        let Governance::Undetermined(gaps) = npm(&ws) else {
+            panic!("an unreadable WORKSPACE on 7.7.2");
+        };
+        assert!(gaps[0].detail.contains("cannot be read"), "{:?}", gaps[0]);
+        let unlisted = Unlisted(beside_directory(&hybrid, "WORKSPACE", "WORKSPACE"));
+        let root = RootRef {
+            root: PathBuf::from("/repo"),
+            project_rel: String::new(),
+            boundary_levels: 0,
+        };
+        let ws = detect(&root, &unlisted).expect("a workspace");
+        assert!(ws.boundary.workspace);
+        assert!(matches!(npm(&ws), Governance::Undetermined(_)));
+    }
+
+    /// A view whose root cannot be listed.
+    struct Unlisted<V: FileView>(V);
+
+    impl<V: FileView> FileView for Unlisted<V> {
+        fn read(&self, rel: &str) -> FileText {
+            self.0.read(rel)
+        }
+
+        fn list(&self, dir: &str) -> Option<Vec<String>> {
+            self.0.list(dir).filter(|_| !dir.is_empty())
+        }
+    }
+
+    /// Design 2.6: a committed vendor directory is read through the view,
+    /// so a model read from memory answers as one read from disk does.
+    /// "Nobody looked" must never read as "there is none".
+    #[test]
+    fn committed_vendor_directories_are_read_through_the_view() {
+        let fixed = [(".bazelversion", "9.3.2\n"), ("MODULE.bazel", "")];
+        let with = |files: &[(&str, &str)]| Files::of(&[&fixed[..], files].concat());
+        let none = detected(&with(&[("src/BUILD.bazel", ""), ("VENDOR.bazel", "")]));
+        assert_eq!(none.vendor_dirs, CommittedVendorDirs::default());
+        assert_eq!(govern::vendor_dir(&none), FlagState::NotSeen);
+
+        // `VENDOR.bazel` from 7.3, `.vendorignore` alone before it.
+        let ws = detected(&with(&[
+            ("third_party/VENDOR.bazel", ""),
+            ("vendor_src/.vendorignore", ""),
+            ("src/deep/VENDOR.bazel", ""),
+        ]));
+        assert_eq!(ws.vendor_dirs.dirs, ["third_party", "vendor_src"]);
+        assert!(!ws.vendor_dirs.cannot_tell);
+        let FlagState::Possible(readings) = govern::vendor_dir(&ws) else {
+            panic!("a committed vendor directory is `Possible`");
+        };
+        let dirs: Vec<&String> = readings.values().collect();
+        assert_eq!(dirs, ["third_party", "vendor_src"]);
+
+        // A marker that is there and cannot be read, and a root that
+        // cannot be listed: the question went unanswered.
+        let unread = with(&[]).with("deps/VENDOR.bazel", FileText::Unreadable);
+        let unlisted = Unlisted(with(&[("third_party/VENDOR.bazel", "")]));
+        let root = RootRef {
+            root: PathBuf::from("/repo"),
+            project_rel: String::new(),
+            boundary_levels: 0,
+        };
+        for ws in [detected(&unread), detect(&root, &unlisted).unwrap()] {
+            assert_eq!(ws.vendor_dirs.dirs, Vec::<String>::new());
+            assert!(ws.vendor_dirs.cannot_tell);
+            let FlagState::Possible(readings) = govern::vendor_dir(&ws) else {
+                panic!("an unanswered marker test is `Possible`");
+            };
+            assert_eq!(readings.values().collect::<Vec<_>>(), ["?"]);
+        }
     }
 
     /// Design 2.4: the launcher files, then the lock's token, then the
@@ -433,10 +798,7 @@ mod tests {
         );
         assert!(ws.ignore.covers("node_modules/x") && ws.signals.is_empty());
         assert_eq!(ws.out_of_scope.bazel_modules, 1);
-        assert!(
-            ws.vendor_dirs.dirs.is_empty(),
-            "only the disk shows a vendor directory"
-        );
+        assert_eq!(ws.vendor_dirs, CommittedVendorDirs::default());
     }
 
     /// The reader is total: a workspace whose files were cut short or had
@@ -532,5 +894,43 @@ mod tests {
         assert_eq!(tier("8.8.2", &[("WORKSPACE", "")]), Tier::Beta);
         let unpinned = read(&[workspace, PNPM_LOCK]).tier;
         assert_eq!(unpinned, Tier::Refused(TierRefusal::LineUnknown));
+
+        // A hub that is live under one of the systems the workspace may
+        // run counts: a flag under a config leaves the WORKSPACE hub live
+        // on every default command, and its family is the weaker one.
+        let renamed = JS_WORKSPACE.replace("name = \"npm\"", "name = \"npm_ws\"");
+        let both = [module, ("WORKSPACE", renamed.as_str())];
+        for (version, rc) in [
+            ("7.7.2", "common:ci --noenable_workspace\n"),
+            ("8.x", "build:ws --enable_workspace\n"),
+        ] {
+            let files = [
+                &both[..],
+                &[(".bazelversion", version), (".bazelrc", rc), PNPM_LOCK],
+            ];
+            let ws = read(&files.concat());
+            let workspace_hub = &ws.hubs[1];
+            assert_eq!(workspace_hub.decl.site.system, DeclSystem::Workspace);
+            assert!(
+                matches!(workspace_hub.liveness, Liveness::Undecided { .. }),
+                "{version}: {:?}",
+                workspace_hub.liveness
+            );
+            assert_eq!(ws.tier, Tier::Beta, "{version} with {rc:?}");
+            // The same as the WORKSPACE family alone.
+            assert_eq!(tier(version, &[both[1], (".bazelrc", rc)]), Tier::Beta);
+        }
+        assert_eq!(tier("7.7.2", &both), Tier::Beta);
+        // A hub Bazel never evaluates does not.
+        assert_eq!(tier("9.3.2", &both), Tier::Supported);
+        // Nor does a WORKSPACE hub whose one doubt is the line nobody
+        // pinned: governance answers `Undetermined` for it, and design 8
+        // lets the `MODULE.bazel` hubs through on an unknown line.
+        let unpinned = read(&[&both[..], &[PNPM_LOCK]].concat());
+        assert!(matches!(
+            unpinned.hubs[1].liveness,
+            Liveness::Undecided { .. }
+        ));
+        assert_eq!(unpinned.tier, Tier::Supported);
     }
 }

@@ -30,8 +30,8 @@ use std::path::{Path, PathBuf};
 
 use socket_patch_core::bazel::govern::governance;
 use socket_patch_core::bazel::model::{
-    BazelWorkspace, Completeness, DeclSystem, FileText, FileView, Governance, Hub, HubId, HubShape,
-    Liveness, RootRef, Ruleset,
+    BazelWorkspace, Completeness, DeclSystem, FileText, FileView, Gap, Governance, Hub, HubId,
+    HubShape, Liveness, RootRef, Ruleset,
 };
 use socket_patch_core::crawlers::bazel_workspace::{read_workspace, DiskView};
 use socket_patch_core::crawlers::types::Ecosystem;
@@ -46,11 +46,78 @@ fn cli_fixtures() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../socket-patch-cli/tests/fixtures/bazel")
 }
 
-fn root_at(dir: &Path) -> RootRef {
+fn root_at(dir: &Path, project: &str) -> RootRef {
     RootRef {
         root: std::fs::canonicalize(dir).expect("resolve a fixture directory"),
-        project_rel: String::new(),
+        project_rel: project.to_string(),
         boundary_levels: 0,
+    }
+}
+
+/// One fixture workspace: its model as read for the root, and the view to
+/// read it again for another project. A model answers for the project it
+/// was read for (`govern::governance`), and one view per root reads each
+/// file once however many projects are asked about.
+struct Fixture {
+    ws: BazelWorkspace,
+    dir: PathBuf,
+    disk: DiskView,
+    /// The Bazel release a cell fixture is built with.
+    version: Option<&'static str>,
+    /// What keeps a staged shape workspace on disk.
+    _staged: Option<tempfile::TempDir>,
+}
+
+impl std::ops::Deref for Fixture {
+    type Target = BazelWorkspace;
+
+    fn deref(&self) -> &BazelWorkspace {
+        &self.ws
+    }
+}
+
+impl Fixture {
+    fn open(
+        name: &str,
+        dir: &Path,
+        version: Option<&'static str>,
+        staged: Option<tempfile::TempDir>,
+    ) -> Self {
+        let disk = DiskView::new(&root_at(dir, ""));
+        let ws = Self::read(dir, &disk, version, "");
+        Self {
+            ws: ws.unwrap_or_else(|gap| panic!("{name}: {gap:?}")),
+            dir: dir.to_path_buf(),
+            disk,
+            version,
+            _staged: staged,
+        }
+    }
+
+    fn read(
+        dir: &Path,
+        disk: &DiskView,
+        version: Option<&'static str>,
+        project: &str,
+    ) -> Result<BazelWorkspace, Gap> {
+        let root = root_at(dir, project);
+        match version {
+            Some(version) => socket_patch_core::bazel::detect(&root, &Pinned { disk, version }),
+            None => read_workspace(&root, disk),
+        }
+    }
+
+    /// Governance of `ecosystem` at `project`, asked of the model read
+    /// for that project.
+    fn governance(&self, ecosystem: Ecosystem, project: &str) -> Governance {
+        if project.is_empty() {
+            return governance(&self.ws, ecosystem, project);
+        }
+        let ws = Self::read(&self.dir, &self.disk, self.version, project);
+        let ws = ws.unwrap_or_else(|gap| panic!("{}: {gap:?}", self.dir.display()));
+        // Whatever the project, the root holds the same declarations.
+        assert_eq!(ws.hubs.len(), self.ws.hubs.len());
+        governance(&ws, ecosystem, project)
     }
 }
 
@@ -92,7 +159,7 @@ fn era_version(name: &str) -> &'static str {
 
 /// Every workspace of the real-Bazel fixture tree, by its path below it:
 /// `<group>/[<ruleset>/]<system>/<era>`.
-fn cell_workspaces() -> BTreeMap<String, BazelWorkspace> {
+fn cell_workspaces() -> BTreeMap<String, Fixture> {
     fn walk(dir: &Path, top: &Path, out: &mut Vec<PathBuf>) {
         let boundary = ["MODULE.bazel", "WORKSPACE", "WORKSPACE.bazel"];
         if boundary.iter().any(|name| dir.join(name).is_file()) {
@@ -114,17 +181,9 @@ fn cell_workspaces() -> BTreeMap<String, BazelWorkspace> {
     for rel in dirs {
         let name = rel.to_string_lossy().replace('\\', "/");
         let era = name.rsplit('/').next().expect("an era directory");
-        let root = root_at(&top.join(&rel));
-        let disk = DiskView::new(&root);
-        let pinned = Pinned {
-            disk: &disk,
-            version: era_version(era),
-        };
-        let ws = socket_patch_core::bazel::detect(&root, &pinned);
-        read.insert(
-            name.clone(),
-            ws.unwrap_or_else(|gap| panic!("{name}: {gap:?}")),
-        );
+        let version = Some(era_version(era));
+        let fixture = Fixture::open(&name, &top.join(&rel), version, None);
+        read.insert(name, fixture);
     }
     read
 }
@@ -145,7 +204,7 @@ fn bundle(text: &str) -> Vec<(String, String)> {
 }
 
 /// Every workspace of `workspaces/*.txt`, staged on disk and read.
-fn shape_workspaces() -> BTreeMap<String, BazelWorkspace> {
+fn shape_workspaces() -> BTreeMap<String, Fixture> {
     let mut read = BTreeMap::new();
     for entry in std::fs::read_dir(core_fixtures()).expect("read the workspaces directory") {
         let path = entry.expect("a directory entry").path();
@@ -164,12 +223,9 @@ fn shape_workspaces() -> BTreeMap<String, BazelWorkspace> {
             std::fs::create_dir_all(file.parent().expect("a parent")).expect("stage a directory");
             std::fs::write(&file, content).expect("stage a file");
         }
-        let root = root_at(staged.path());
-        let ws = read_workspace(&root, &DiskView::new(&root));
-        read.insert(
-            name.to_string(),
-            ws.unwrap_or_else(|gap| panic!("{name}: {gap:?}")),
-        );
+        let dir = staged.path().to_path_buf();
+        let fixture = Fixture::open(name, &dir, None, Some(staged));
+        read.insert(name.to_string(), fixture);
     }
     read
 }
@@ -189,6 +245,7 @@ fn liveness_name(liveness: &Liveness) -> &'static str {
         Liveness::NotImported => "not-imported",
         Liveness::NotRootModule => "not-root-module",
         Liveness::DevDependencyDropped => "dev-dependency-dropped",
+        Liveness::Undecided { .. } => "undecided",
     }
 }
 
@@ -241,7 +298,8 @@ fn questions(ws: &BazelWorkspace) -> Vec<(Ecosystem, String)> {
     out
 }
 
-fn render(name: &str, ws: &BazelWorkspace) -> String {
+fn render(name: &str, fixture: &Fixture) -> String {
+    let ws = &fixture.ws;
     let mut out = format!("== {name}\n");
     let complete = match &ws.completeness {
         Completeness::Exact => "exact".to_string(),
@@ -297,7 +355,7 @@ fn render(name: &str, ws: &BazelWorkspace) -> String {
         );
     }
     for (ecosystem, project) in questions(ws) {
-        let found = governance(ws, ecosystem, &project);
+        let found = fixture.governance(ecosystem, &project);
         if found != Governance::NotGoverned {
             let _ = writeln!(
                 out,
@@ -331,7 +389,7 @@ fn every_shape_workspace_reads_to_its_golden() {
     );
 }
 
-fn all_workspaces() -> BTreeMap<String, BazelWorkspace> {
+fn all_workspaces() -> BTreeMap<String, Fixture> {
     let mut all = cell_workspaces();
     all.extend(shape_workspaces());
     all
@@ -527,7 +585,7 @@ const ROWS: &[(u8, &str, HubShape)] = &[
     (31, "row31-report-only-bzlmod", S::ReportOnly),
 ];
 
-fn workspace<'a>(all: &'a BTreeMap<String, BazelWorkspace>, name: &str) -> &'a BazelWorkspace {
+fn workspace<'a>(all: &'a BTreeMap<String, Fixture>, name: &str) -> &'a Fixture {
     all.get(name)
         .unwrap_or_else(|| panic!("no fixture workspace {name}"))
 }
@@ -595,7 +653,7 @@ fn a_dynamic_declaration_is_incomplete_and_undetermined() {
         );
         for ecosystem in undetermined {
             for project in ["", "web", "any/other"] {
-                let found = governance(ws, *ecosystem, project);
+                let found = ws.governance(*ecosystem, project);
                 let Governance::Undetermined(gaps) = &found else {
                     panic!("{name}: {ecosystem:?} at `{project}` is {found:?}");
                 };
@@ -659,7 +717,7 @@ fn the_hub_a_cell_builds_from_is_live_and_governs_its_lock() {
         let project = project
             .and_then(|path| path.rsplit_once('/'))
             .map_or("", |(dir, _)| dir);
-        let found = governance(ws, hub.ecosystem, project);
+        let found = ws.governance(hub.ecosystem, project);
         if system == Bzlmod && era.starts_with("e6") {
             assert!(
                 matches!(hub.liveness, Liveness::Dead { .. }),

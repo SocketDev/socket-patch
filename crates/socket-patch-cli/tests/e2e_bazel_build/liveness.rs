@@ -92,6 +92,7 @@ fn standings(ws: &BazelWorkspace) -> [Standing; 3] {
     let decl = |system, file, name| DeclRef {
         system,
         file,
+        span: (0, 0),
         name: Some(name),
         imported: Some(true),
         dev: false,
