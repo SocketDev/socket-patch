@@ -2,9 +2,10 @@
 //! command or lane group. No Bazel, no network: the built binary runs
 //! against a fake Socket API over the same fixture workspaces the
 //! real-Bazel suite (`e2e_bazel_build`) builds, and every test that lets
-//! the binary write asserts `bazel_common::assert_write_policy`: each
-//! changed path must be a write socket-patch may make in a Bazel
-//! repository.
+//! the binary write asserts `bazel_common::assert_write_policy` (or, for a
+//! `rollback` or `remove` run, `assert_restore_policy`): each changed path
+//! must be a write socket-patch may make in a Bazel repository, or the
+//! inverse of one.
 //!
 //! Children are spawned only through `common::run*` /
 //! `hermetic::command`, never a bare `Command::new`, and never `bazel`:
