@@ -375,6 +375,19 @@ pub(crate) async fn dispatch_vendor_one(
             ),
         });
     }
+    // Under a Bazel root an unpacked artifact's upstream BUILD files would
+    // join `//...`: the root's `.bazelignore` line comes before the tree,
+    // and where it cannot be written the tree is not created.
+    let ignored = match socket_patch_core::utils::bazel_root_writes::before_vendor_tree(
+        project_root,
+        eco,
+        dry_run,
+    )
+    .await
+    {
+        Ok(warnings) => warnings,
+        Err(refused) => return Some(refused),
+    };
     // Every backend takes the identical 9-argument tuple.
     macro_rules! vend {
         ($backend:path, $source:expr) => {
@@ -392,7 +405,7 @@ pub(crate) async fn dispatch_vendor_one(
             .await
         };
     }
-    Some(match eco {
+    let mut outcome = match eco {
         // The flavor router probes the project's lockfile (package-lock /
         // yarn / pnpm / bun) and dispatches or refuses per flavor.
         "npm" => vend!(vendor::npm_flavor::vendor_npm_any, pkg_path),
@@ -419,7 +432,11 @@ pub(crate) async fn dispatch_vendor_one(
         "nuget" => vend!(vendor::nuget_feed::vendor_nuget, pkg_path.path()),
         "maven" => vend!(vendor::maven_repo::vendor_maven, pkg_path.path()),
         _ => return None,
-    })
+    };
+    if let VendorOutcome::Done { warnings, .. } = &mut outcome {
+        warnings.extend(ignored);
+    }
+    Some(outcome)
 }
 
 /// Dispatch one recorded entry to its ecosystem's revert.
@@ -452,7 +469,7 @@ pub(crate) async fn dispatch_revert_one_opts(
     if let Some(refusal) = vendor::state::wiring_refusal(entry, project_root).await {
         return RevertOutcome::failed(refusal);
     }
-    match vendor::jvm::layout::ledger_ecosystem(&entry.ecosystem) {
+    let outcome = match vendor::jvm::layout::ledger_ecosystem(&entry.ecosystem) {
         "npm" => vendor::npm_flavor::revert_npm_any_opts(entry, project_root, opts).await,
         "pypi" => vendor::pypi::revert_pypi_opts(entry, project_root, opts).await,
         "gem" => vendor::gem::revert_gem_opts(entry, project_root, opts).await,
@@ -464,7 +481,16 @@ pub(crate) async fn dispatch_revert_one_opts(
         other => RevertOutcome::failed(format!(
             "this build has no vendor backend for ecosystem `{other}`"
         )),
-    }
+    };
+    // The `.bazelignore` line of the vendored trees goes with the last of
+    // them (a line whose tree is still there, or was never recorded, stays).
+    socket_patch_core::utils::bazel_root_writes::after_removal(
+        project_root,
+        socket_patch_core::bazel::ignore::SocketTree::Vendor,
+        opts.dry_run,
+    )
+    .await;
+    outcome
 }
 
 /// The `vendor --check` failure for a ledger entry the liveness rule

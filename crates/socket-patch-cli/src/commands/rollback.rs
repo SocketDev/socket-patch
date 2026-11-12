@@ -3741,6 +3741,13 @@ pub(crate) async fn rollback_patches_inner(
         warnings.extend(
             socket_patch_core::vendor::go_consumer_sync::audit_warnings(&common.cwd, &none).await,
         );
+        // The `.bazelignore` line of the copies goes with the last of them.
+        socket_patch_core::utils::bazel_root_writes::after_removal(
+            &common.cwd,
+            socket_patch_core::bazel::ignore::SocketTree::GoPatches,
+            false,
+        )
+        .await;
     }
 
     // The restored crates' compiled copies in this project's build cache
