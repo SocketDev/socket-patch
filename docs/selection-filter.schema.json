@@ -1,0 +1,123 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/SocketDev/socket-patch/blob/main/docs/selection-filter.schema.json",
+  "title": "socket-patch selection filter",
+  "description": "The file `socket-patch scan --selection-filter <FILE>` reads: what one scan need not patch. See docs/selection-filter.md. The file must also be at most 16 MiB and hold no duplicate keys, which a schema cannot say.",
+  "type": "object",
+  "required": ["version"],
+  "additionalProperties": false,
+  "properties": {
+    "version": {
+      "description": "The format version. This schema describes version 1; a reader refuses any other.",
+      "type": "integer",
+      "const": 1
+    },
+    "skip": {
+      "description": "What to leave alone whatever its reachability.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "paths": {
+          "description": "Project roots to leave alone: gitignore patterns relative to the repository root, matched against each root's lockfiles like socket.yml's `patches.ignorePaths`.",
+          "type": "array",
+          "maxItems": 1000,
+          "items": { "$ref": "#/$defs/pathPattern" }
+        },
+        "packages": {
+          "description": "Packages to leave alone.",
+          "type": "array",
+          "maxItems": 1000,
+          "items": { "$ref": "#/$defs/packageSpec" }
+        },
+        "advisories": {
+          "description": "Advisories that need no fix. A patch is withheld when every advisory it fixes needs none; a patch that also fixes a needed advisory is still applied.",
+          "type": "array",
+          "maxItems": 100000,
+          "items": { "$ref": "#/$defs/advisoryId" }
+        }
+      }
+    },
+    "reachability": {
+      "description": "What the caller's reachability analysis found. An `unreachable` advisory needs no fix; a `reachable` or `unknown` one does.",
+      "type": "array",
+      "maxItems": 100000,
+      "items": { "$ref": "#/$defs/finding" }
+    },
+    "unlistedAdvisories": {
+      "description": "What an advisory no finding covers needs: `patch` treats it as unknown (it needs a fix), `skip` as needing none, which makes the findings an allowlist.",
+      "enum": ["patch", "skip"],
+      "default": "patch"
+    }
+  },
+  "$defs": {
+    "pathPattern": {
+      "description": "A gitignore pattern, at most 1024 bytes, with no `..` segment, drive letter or NUL byte. A leading `!` negates. A leading `#` would make it a comment, so it is refused: write `\\#`.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 1024,
+      "pattern": "^([^#\\s][\\s\\S]*|\\s+\\S[\\s\\S]*)$"
+    },
+    "packageSpec": {
+      "description": "A package in the `--package` grammar, at most 1024 bytes: a name (`lodash`, `@scope/pkg`), or a purl with a version (`pkg:npm/lodash@4.17.20`, that release only) or without one (`pkg:npm/lodash`, every version). Qualifiers are ignored. A bare name matches in every ecosystem, so prefer purls; it takes no version (`lodash@4.17.20` is refused).",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 1024,
+      "pattern": "^\\s*([Pp][Kk][Gg]:[\\s\\S]+|\\S[^@]*)$"
+    },
+    "advisoryId": {
+      "description": "A GHSA or CVE id, in any letter case. It matches an advisory by its id or by one of its CVE aliases.",
+      "type": "string",
+      "pattern": "^([Gg][Hh][Ss][Aa](-[0-9A-Za-z]{4}){3}|[Cc][Vv][Ee]-[0-9]{4}-[0-9]+)$"
+    },
+    "finding": {
+      "description": "One reachability result. It names an advisory, a package, or both: both means that advisory in that package, an advisory alone means it in every package, a package alone means every advisory in it.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["state"],
+      "anyOf": [{ "required": ["advisory"] }, { "required": ["package"] }],
+      "properties": {
+        "advisory": { "$ref": "#/$defs/advisoryId" },
+        "package": { "$ref": "#/$defs/packageSpec" },
+        "state": {
+          "description": "`unknown` counts as reachable: the advisory needs a fix.",
+          "enum": ["reachable", "unreachable", "unknown"]
+        }
+      }
+    }
+  },
+  "examples": [
+    {
+      "version": 1,
+      "skip": {
+        "paths": ["services/legacy/"],
+        "packages": ["pkg:npm/left-pad"],
+        "advisories": ["GHSA-jf85-cpcp-j695", "CVE-2021-23337"]
+      },
+      "reachability": [
+        {
+          "advisory": "GHSA-35jh-r3h4-6jhm",
+          "package": "pkg:npm/lodash@4.17.20",
+          "state": "reachable"
+        },
+        { "advisory": "GHSA-p6mc-m468-83gw", "state": "unreachable" },
+        { "package": "pkg:npm/minimist@1.2.5", "state": "unreachable" }
+      ],
+      "unlistedAdvisories": "patch"
+    },
+    {
+      "version": 1,
+      "reachability": [
+        {
+          "advisory": "GHSA-p6mc-m468-83gw",
+          "package": "pkg:npm/lodash@4.17.20",
+          "state": "unreachable"
+        }
+      ]
+    },
+    {
+      "version": 1,
+      "unlistedAdvisories": "skip",
+      "reachability": [{ "advisory": "GHSA-35jh-r3h4-6jhm", "state": "reachable" }]
+    }
+  ]
+}

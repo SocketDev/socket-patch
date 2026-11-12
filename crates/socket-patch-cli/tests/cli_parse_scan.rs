@@ -756,6 +756,77 @@ fn no_socket_yml_flag_and_env() {
     assert!(parse_scan_with_env(&[], &[("SOCKET_NO_SOCKET_YML", "garbage")]).is_err());
 }
 
+/// `--selection-filter` / `SOCKET_SELECTION_FILTER` (internal): a file
+/// path kept out of `--help`. An empty env value is unset; the file is
+/// read when the policy loads, and one that cannot be honored is refused.
+#[test]
+#[serial_test::serial]
+fn selection_filter_flag_and_env() {
+    use clap::CommandFactory;
+    use std::path::Path;
+    assert_eq!(parse_scan(&[]).socket_yml.selection_filter, None);
+    let flag = parse_scan(&["--selection-filter", "filter.json"]);
+    assert_eq!(
+        flag.socket_yml.selection_filter.as_deref(),
+        Some(Path::new("filter.json"))
+    );
+    let env = parse_scan_with_env(&[], &[("SOCKET_SELECTION_FILTER", "env.json")]).expect("parse");
+    assert_eq!(
+        env.socket_yml.selection_filter.as_deref(),
+        Some(Path::new("env.json"))
+    );
+    let both = parse_scan_with_env(
+        &["--selection-filter", "flag.json"],
+        &[("SOCKET_SELECTION_FILTER", "env.json")],
+    )
+    .expect("parse");
+    assert_eq!(
+        both.socket_yml.selection_filter.as_deref(),
+        Some(Path::new("flag.json"))
+    );
+
+    // `main` drops an exported-but-empty value before clap parses.
+    assert!(socket_patch_cli::args::LOCAL_ARG_ENV_VARS.contains(&"SOCKET_SELECTION_FILTER"));
+    assert!(parse_scan(&[])
+        .socket_yml
+        .load_selection_filter()
+        .unwrap()
+        .is_none());
+
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("filter.json");
+    let load = |text: &str| {
+        std::fs::write(&file, text).unwrap();
+        parse_scan(&["--selection-filter", file.to_str().unwrap()])
+            .socket_yml
+            .load_selection_filter()
+    };
+    let filter = load(r#"{"version": 1, "skip": {"packages": ["lodash"]}}"#)
+        .unwrap()
+        .expect("a filter");
+    assert_eq!(filter.sha256().len(), 64);
+    let err = load(r#"{"version": 1, "skip": {"package": ["lodash"]}}"#).unwrap_err();
+    assert!(err.starts_with("selection filter "), "{err}");
+    assert!(
+        err.contains("filter.json: invalid JSON: unknown field `package`"),
+        "{err}"
+    );
+    let missing = dir.path().join("missing.json");
+    let err = parse_scan(&["--selection-filter", missing.to_str().unwrap()])
+        .socket_yml
+        .load_selection_filter()
+        .unwrap_err();
+    assert!(err.contains("cannot read the file"), "{err}");
+
+    // Internal: parseable, never listed.
+    hermetic::scrub_process_socket_env();
+    let mut cmd = Cli::command();
+    let scan = cmd.find_subcommand_mut("scan").expect("scan subcommand");
+    let long = scan.render_long_help().to_string();
+    assert!(!long.contains("selection-filter"), "{long}");
+    assert!(!long.contains("SOCKET_SELECTION_FILTER"), "{long}");
+}
+
 /// `--min-severity` / `SOCKET_MIN_SEVERITY`: the flag beats the env, the
 /// layer is recorded, `none` lifts the floor, empty env is unset, and a
 /// malformed value is a usage error (the flag at parse time, the env when

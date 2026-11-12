@@ -28,6 +28,10 @@ struct Patch {
     eco: &'static str,
     severities: &'static [&'static str],
     published: &'static str,
+    /// The advisory ids, one per severity; empty for ids of the patch's
+    /// own ([`Patch::ghsa`]). Two patches fix the same advisory only by
+    /// naming it here.
+    ids: &'static [&'static str],
 }
 
 impl Patch {
@@ -44,11 +48,20 @@ impl Patch {
         )
     }
 
+    /// The id of this patch's `i`th advisory (GHSA-shaped: three groups
+    /// of four).
+    fn ghsa(&self, i: usize) -> String {
+        match self.ids.get(i) {
+            Some(id) => id.to_string(),
+            None => format!("GHSA-{}-{}-{i:04}", &self.uuid[..4], &self.uuid[4..8]),
+        }
+    }
+
     fn vulnerabilities(&self) -> Value {
         let mut map = serde_json::Map::new();
         for (i, severity) in self.severities.iter().enumerate() {
             map.insert(
-                format!("GHSA-{}-{i:04}", &self.uuid[..4]),
+                self.ghsa(i),
                 json!({"cves": [], "summary": "s", "severity": severity, "description": "d"}),
             );
         }
@@ -78,6 +91,7 @@ const P_ALPHA: Patch = Patch {
     eco: "npm",
     severities: &["critical"],
     published: "2024-01-01T00:00:00Z",
+    ids: &[],
 };
 const P_BETA: Patch = Patch {
     uuid: "b1b1b1b1-0000-4000-8000-000000000001",
@@ -86,6 +100,7 @@ const P_BETA: Patch = Patch {
     eco: "npm",
     severities: &["low"],
     published: "2024-01-01T00:00:00Z",
+    ids: &[],
 };
 const P_LEFTPAD: Patch = Patch {
     uuid: "c1c1c1c1-0000-4000-8000-000000000001",
@@ -94,6 +109,7 @@ const P_LEFTPAD: Patch = Patch {
     eco: "npm",
     severities: &["high"],
     published: "2024-01-01T00:00:00Z",
+    ids: &[],
 };
 const P_GAMMA: Patch = Patch {
     uuid: "d1d1d1d1-0000-4000-8000-000000000001",
@@ -102,6 +118,7 @@ const P_GAMMA: Patch = Patch {
     eco: "npm",
     severities: &["high"],
     published: "2024-01-01T00:00:00Z",
+    ids: &[],
 };
 const P_DELTA: Patch = Patch {
     uuid: "e1e1e1e1-0000-4000-8000-000000000001",
@@ -110,6 +127,7 @@ const P_DELTA: Patch = Patch {
     eco: "npm",
     severities: &["high"],
     published: "2024-01-01T00:00:00Z",
+    ids: &[],
 };
 const P_RACK: Patch = Patch {
     uuid: "f1f1f1f1-0000-4000-8000-000000000001",
@@ -118,6 +136,7 @@ const P_RACK: Patch = Patch {
     eco: "gem",
     severities: &["high"],
     published: "2024-01-01T00:00:00Z",
+    ids: &[],
 };
 /// A merged (two-advisory) low patch for alpha: ranks below P_ALPHA's
 /// higher severity, even though it fixes more advisories.
@@ -128,6 +147,7 @@ const P_ALPHA_MERGED_LOW: Patch = Patch {
     eco: "npm",
     severities: &["low", "low"],
     published: "2024-02-01T00:00:00Z",
+    ids: &[],
 };
 /// A newer merged patch for alpha (supersedes P_ALPHA).
 const P_ALPHA_MERGED_NEW: Patch = Patch {
@@ -137,6 +157,19 @@ const P_ALPHA_MERGED_NEW: Patch = Patch {
     eco: "npm",
     severities: &["critical", "high"],
     published: "2024-03-01T00:00:00Z",
+    ids: &[],
+};
+
+/// A patch for the second advisory of [`P_ALPHA_MERGED_NEW`] (its high)
+/// alone.
+const P_ALPHA_HIGH_ONLY: Patch = Patch {
+    uuid: "a4a4a4a4-0000-4000-8000-000000000004",
+    name: "alpha",
+    version: "1.0.0",
+    eco: "npm",
+    severities: &["high"],
+    published: "2024-03-01T00:00:00Z",
+    ids: &["GHSA-a3a3-a3a3-0001"],
 };
 
 /// How many hosted pins a run wrote (dry run: would write): its
@@ -1470,4 +1503,692 @@ async fn narrowing_after_vendoring_leaves_the_vendored_package_byte_identical() 
         "{:#}",
         doc["policy"]
     );
+}
+
+// ---------------------------------------------------------------------------
+// Selection filter (`scan --selection-filter`, internal)
+// ---------------------------------------------------------------------------
+
+/// The `i`th advisory id the mock API reports for `patch`.
+fn ghsa(patch: &Patch, i: usize) -> String {
+    patch.ghsa(i)
+}
+
+/// Write a selection filter beside the repository (not inside it) and
+/// return its path.
+fn write_filter(repo: &Repo, filter: Value) -> String {
+    let path = repo.root.parent().unwrap().join("filter.json");
+    std::fs::write(&path, serde_json::to_vec_pretty(&filter).unwrap()).unwrap();
+    path.to_str().unwrap().to_string()
+}
+
+fn package<'a>(doc: &'a Value, purl: &str) -> &'a Value {
+    doc["packages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["purl"] == purl)
+        .unwrap_or_else(|| panic!("{purl} not in packages: {:#}", doc["packages"]))
+}
+
+/// A hosted scan patches only what the filter still wants fixed: a skipped
+/// package is never looked up, and a patch whose every advisory is skipped
+/// or unreachable is withheld and reported.
+#[tokio::test]
+#[serial]
+async fn selection_filter_patches_only_reachable_advisories() {
+    let server = MockServer::start().await;
+    mount_api(&server, catalog()).await;
+    let repo = Repo::new(None);
+    let web = repo.dir("services/web");
+    let filter = write_filter(
+        &repo,
+        json!({
+            "version": 1,
+            "skip": {
+                "packages": ["pkg:npm/left-pad"],
+                "advisories": [ghsa(&P_RACK, 0)],
+            },
+            "reachability": [
+                {"advisory": ghsa(&P_ALPHA, 0), "package": "pkg:npm/alpha@1.0.0", "state": "unreachable"},
+                {"advisory": ghsa(&P_BETA, 0), "state": "reachable"},
+            ],
+        }),
+    );
+    let (code, doc) = scan_json(&web, &server.uri(), &["--selection-filter", &filter], &[]);
+    assert_eq!(code, 0, "{doc:#}");
+
+    let lock = repo.lock("services/web");
+    assert!(
+        lock.contains(&P_BETA.hosted_url()),
+        "beta is reachable:\n{lock}"
+    );
+    assert!(
+        !lock.contains(P_ALPHA.uuid),
+        "alpha is unreachable:\n{lock}"
+    );
+    assert!(
+        !lock.contains(P_LEFTPAD.uuid),
+        "left-pad is skipped:\n{lock}"
+    );
+    assert_eq!(hosted_pinned(&doc), 1, "{doc:#}");
+
+    let alpha = filtered_reason(&doc, "pkg:npm/alpha@1.0.0");
+    assert_eq!(alpha["reason"], "filter_not_needed");
+    assert_eq!(
+        alpha["detail"],
+        format!("{} unreachable", ghsa(&P_ALPHA, 0))
+    );
+    assert_eq!(alpha["uuid"], P_ALPHA.uuid);
+    assert_eq!(alpha["project"], "services/web");
+    let left_pad = filtered_reason(&doc, "pkg:npm/left-pad@1.0.0");
+    assert_eq!(left_pad["reason"], "filter_package_skipped");
+    assert_eq!(left_pad["detail"], "pkg:npm/left-pad (skip.packages)");
+    assert_eq!(left_pad["uuid"], Value::Null, "skipped before any lookup");
+    let rack = filtered_reason(&doc, "pkg:gem/rack@1.0.0");
+    assert_eq!(rack["reason"], "filter_not_needed");
+    assert_eq!(rack["detail"], format!("{} skipped", ghsa(&P_RACK, 0)));
+    assert_eq!(
+        doc["policy"]["counts"]["filtered"], 3,
+        "{:#}",
+        doc["policy"]
+    );
+
+    let echoed = &doc["policy"]["selectionFilter"];
+    assert_eq!(echoed["sha256"].as_str().unwrap().len(), 64);
+    assert_eq!(
+        echoed["skip"],
+        json!({"paths": 0, "packages": 1, "advisories": 1})
+    );
+    assert_eq!(echoed["reachability"], 2);
+    assert_eq!(echoed["unlistedAdvisories"], "patch");
+
+    // The selection is on `packages[]`: only beta got one.
+    assert_eq!(
+        package(&doc, "pkg:npm/beta@1.0.0")["selectedUuids"],
+        json!([P_BETA.uuid])
+    );
+    assert!(package(&doc, "pkg:npm/alpha@1.0.0")
+        .get("selectedUuids")
+        .is_none());
+
+    // Human output names the filter and every critical/high it withheld.
+    let (code, stdout, stderr) = scan(&web, &server.uri(), &["--selection-filter", &filter], &[]);
+    assert_eq!(code, 0, "{stdout}\n{stderr}");
+    assert!(
+        stdout.contains("Policy (built-in defaults + selection filter): 3 skipped by filters"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains(&format!(
+            "skipped pkg:npm/alpha@1.0.0 (critical): {} unreachable",
+            ghsa(&P_ALPHA, 0)
+        )),
+        "{stdout}"
+    );
+
+    // Without the filter the same scan patches all of them; the env var
+    // is the flag's twin.
+    let plain = Repo::new(None);
+    let (code, doc) = scan_json(&plain.dir("services/web"), &server.uri(), &[], &[]);
+    assert_eq!(code, 0, "{doc:#}");
+    assert!(doc["policy"].get("selectionFilter").is_none());
+    assert!(plain.lock("services/web").contains(&P_ALPHA.hosted_url()));
+    let by_env = Repo::new(None);
+    let (code, doc) = scan_json(
+        &by_env.dir("services/web"),
+        &server.uri(),
+        &[],
+        &[("SOCKET_SELECTION_FILTER", &filter)],
+    );
+    assert_eq!(code, 0, "{doc:#}");
+    assert_eq!(by_env.lock("services/web"), lock);
+}
+
+/// One patch is applied per package: a patch that fixes nothing reachable
+/// steps aside for one that does, whether or not the package already
+/// carries it, and a re-scan changes nothing.
+#[tokio::test]
+#[serial]
+async fn selection_filter_picks_the_patch_for_the_reachable_advisory() {
+    let server = MockServer::start().await;
+    mount_api(&server, vec![P_ALPHA, P_ALPHA_MERGED_LOW]).await;
+    let repo = Repo::new(None);
+    let web = repo.dir("services/web");
+    // Unfiltered, the critical patch outranks the two-advisory low one.
+    let filter = write_filter(
+        &repo,
+        json!({
+            "version": 1,
+            "reachability": [{"advisory": ghsa(&P_ALPHA, 0), "state": "unreachable"}],
+        }),
+    );
+    let (code, doc) = scan_json(&web, &server.uri(), &["--selection-filter", &filter], &[]);
+    assert_eq!(code, 0, "{doc:#}");
+    let filtered_lock = repo.lock("services/web");
+    assert!(
+        filtered_lock.contains(&P_ALPHA_MERGED_LOW.hosted_url()),
+        "{filtered_lock}"
+    );
+    assert!(!filtered_lock.contains(P_ALPHA.uuid), "{filtered_lock}");
+    assert_eq!(
+        package(&doc, "pkg:npm/alpha@1.0.0")["selectedUuids"],
+        json!([P_ALPHA_MERGED_LOW.uuid])
+    );
+    assert_eq!(
+        doc["policy"]["counts"]["filtered"], 0,
+        "{:#}",
+        doc["policy"]
+    );
+
+    let first_policy = doc["policy"].clone();
+    let (code, doc) = scan_json(&web, &server.uri(), &["--selection-filter", &filter], &[]);
+    assert_eq!(code, 0, "{doc:#}");
+    assert_eq!(
+        repo.lock("services/web"),
+        filtered_lock,
+        "a re-scan is a no-op"
+    );
+    assert_eq!(doc["updates"], json!([]), "{doc:#}");
+    assert_eq!(
+        doc["policy"], first_policy,
+        "and reports what the first scan did"
+    );
+
+    // Without the filter the critical patch supersedes it, as always.
+    let (code, doc) = scan_json(&web, &server.uri(), &[], &[]);
+    assert_eq!(code, 0, "{doc:#}");
+    let plain_lock = repo.lock("services/web");
+    assert!(plain_lock.contains(&P_ALPHA.hosted_url()), "{plain_lock}");
+    assert_eq!(doc["updates"][0]["newUuid"], P_ALPHA.uuid, "{doc:#}");
+
+    // With it again, the recorded critical patch fixes nothing reachable:
+    // the patch for the reachable advisories replaces it, so the result
+    // does not depend on what was patched before.
+    let (code, doc) = scan_json(&web, &server.uri(), &["--selection-filter", &filter], &[]);
+    assert_eq!(code, 0, "{doc:#}");
+    assert_eq!(repo.lock("services/web"), filtered_lock);
+    assert_eq!(doc["updates"][0]["oldUuid"], P_ALPHA.uuid, "{doc:#}");
+    assert_eq!(
+        doc["updates"][0]["newUuid"], P_ALPHA_MERGED_LOW.uuid,
+        "{doc:#}"
+    );
+}
+
+/// The filter decides whether a package is patched, not what its patch may
+/// contain: a merged patch that fixes one reachable advisory is applied
+/// whole, its unreachable fixes included, and ranks as it always does. A
+/// package goes unpatched only when everything its patches fix is
+/// unreachable.
+#[tokio::test]
+#[serial]
+async fn selection_filter_applies_a_merged_patch_with_its_unreachable_fixes() {
+    let server = MockServer::start().await;
+    mount_api(&server, vec![P_ALPHA_MERGED_NEW, P_ALPHA_MERGED_LOW]).await;
+    let (critical, high) = (ghsa(&P_ALPHA_MERGED_NEW, 0), ghsa(&P_ALPHA_MERGED_NEW, 1));
+
+    // The merged patch's critical is unreachable, its high is not. It is
+    // still the critical patch: it clears a `critical` floor and is pinned.
+    let repo = Repo::new(None);
+    let filter = write_filter(
+        &repo,
+        json!({
+            "version": 1,
+            "reachability": [{"advisory": critical, "state": "unreachable"}],
+        }),
+    );
+    let (code, doc) = scan_json(
+        &repo.dir("services/web"),
+        &server.uri(),
+        &["--selection-filter", &filter, "--min-severity", "critical"],
+        &[],
+    );
+    assert_eq!(code, 0, "{doc:#}");
+    let lock = repo.lock("services/web");
+    assert!(lock.contains(&P_ALPHA_MERGED_NEW.hosted_url()), "{lock}");
+    let alpha = package(&doc, "pkg:npm/alpha@1.0.0");
+    assert_eq!(alpha["selectedUuids"], json!([P_ALPHA_MERGED_NEW.uuid]));
+    assert_eq!(
+        alpha["fixedIds"],
+        json!([critical, high]),
+        "the unreachable fix comes with the patch"
+    );
+    assert_eq!(
+        doc["policy"]["counts"]["filtered"], 0,
+        "{:#}",
+        doc["policy"]
+    );
+
+    // Everything the merged patch fixes is unreachable: it is withheld, and
+    // the package's other patch (unknown reachability) is applied instead.
+    let repo = Repo::new(None);
+    let filter = write_filter(
+        &repo,
+        json!({
+            "version": 1,
+            "reachability": [
+                {"advisory": critical, "state": "unreachable"},
+                {"advisory": high, "state": "unreachable"},
+            ],
+        }),
+    );
+    let (code, doc) = scan_json(
+        &repo.dir("services/web"),
+        &server.uri(),
+        &["--selection-filter", &filter],
+        &[],
+    );
+    assert_eq!(code, 0, "{doc:#}");
+    let lock = repo.lock("services/web");
+    assert!(lock.contains(&P_ALPHA_MERGED_LOW.hosted_url()), "{lock}");
+    assert!(!lock.contains(P_ALPHA_MERGED_NEW.uuid), "{lock}");
+    assert_eq!(
+        doc["policy"]["counts"]["filtered"], 0,
+        "{:#}",
+        doc["policy"]
+    );
+
+    // Everything every patch of the package fixes is unreachable: only now
+    // does the package go unpatched, and the best patch withheld is named.
+    let repo = Repo::new(None);
+    let before = repo.lock("services/web");
+    let filter = write_filter(
+        &repo,
+        json!({
+            "version": 1,
+            "reachability": [{"package": "pkg:npm/alpha@1.0.0", "state": "unreachable"}],
+        }),
+    );
+    let (code, doc) = scan_json(
+        &repo.dir("services/web"),
+        &server.uri(),
+        &["--selection-filter", &filter],
+        &[],
+    );
+    assert_eq!(code, 0, "{doc:#}");
+    assert_eq!(repo.lock("services/web"), before);
+    let withheld = filtered_reason(&doc, "pkg:npm/alpha@1.0.0");
+    assert_eq!(withheld["reason"], "filter_not_needed");
+    assert_eq!(withheld["uuid"], P_ALPHA_MERGED_NEW.uuid);
+    assert_eq!(
+        withheld["detail"],
+        format!("{critical} unreachable, {high} unreachable")
+    );
+}
+
+/// The filter's one preference: when exactly one advisory of a package
+/// needs a fix and a patch fixes it alone, that patch is taken instead of
+/// the merged one. Without the filter the merged patch wins as always, and
+/// a package already on the merged patch stays on it.
+#[tokio::test]
+#[serial]
+async fn selection_filter_prefers_the_single_advisory_patch_for_the_one_needed_advisory() {
+    let server = MockServer::start().await;
+    mount_api(&server, vec![P_ALPHA_MERGED_NEW, P_ALPHA_HIGH_ONLY]).await;
+    let (critical, high) = (ghsa(&P_ALPHA_MERGED_NEW, 0), ghsa(&P_ALPHA_MERGED_NEW, 1));
+    assert_eq!(
+        ghsa(&P_ALPHA_HIGH_ONLY, 0),
+        high,
+        "both patches fix the high"
+    );
+
+    let repo = Repo::new(None);
+    let web = repo.dir("services/web");
+    let filter = write_filter(
+        &repo,
+        json!({
+            "version": 1,
+            "reachability": [{"advisory": critical, "state": "unreachable"}],
+        }),
+    );
+    let (code, doc) = scan_json(&web, &server.uri(), &["--selection-filter", &filter], &[]);
+    assert_eq!(code, 0, "{doc:#}");
+    let lock = repo.lock("services/web");
+    assert!(lock.contains(&P_ALPHA_HIGH_ONLY.hosted_url()), "{lock}");
+    assert!(!lock.contains(P_ALPHA_MERGED_NEW.uuid), "{lock}");
+    let alpha = package(&doc, "pkg:npm/alpha@1.0.0");
+    assert_eq!(alpha["selectedUuids"], json!([P_ALPHA_HIGH_ONLY.uuid]));
+    assert_eq!(alpha["fixedIds"], json!([high]));
+    assert_eq!(
+        alpha["unfixedIds"],
+        json!([critical]),
+        "the unreachable critical is left alone"
+    );
+    assert_eq!(
+        doc["policy"]["counts"]["filtered"], 0,
+        "{:#}",
+        doc["policy"]
+    );
+
+    // A re-scan keeps the single-advisory patch: no upgrade to the merged one.
+    let (code, doc) = scan_json(&web, &server.uri(), &["--selection-filter", &filter], &[]);
+    assert_eq!(code, 0, "{doc:#}");
+    assert_eq!(repo.lock("services/web"), lock);
+    assert_eq!(doc["updates"], json!([]), "{doc:#}");
+
+    // Without the filter both advisories need a fix: the merged patch.
+    let plain = Repo::new(None);
+    let plain_web = plain.dir("services/web");
+    let (code, doc) = scan_json(&plain_web, &server.uri(), &[], &[]);
+    assert_eq!(code, 0, "{doc:#}");
+    let merged_lock = plain.lock("services/web");
+    assert!(
+        merged_lock.contains(&P_ALPHA_MERGED_NEW.hosted_url()),
+        "{merged_lock}"
+    );
+
+    // A package already on the merged patch stays on it under the filter:
+    // it fixes the needed advisory, and nothing is traded away.
+    let filter = write_filter(
+        &plain,
+        json!({
+            "version": 1,
+            "reachability": [{"advisory": critical, "state": "unreachable"}],
+        }),
+    );
+    let (code, doc) = scan_json(
+        &plain_web,
+        &server.uri(),
+        &["--selection-filter", &filter],
+        &[],
+    );
+    assert_eq!(code, 0, "{doc:#}");
+    assert_eq!(plain.lock("services/web"), merged_lock);
+    assert_eq!(doc["updates"], json!([]), "{doc:#}");
+}
+
+/// `unlistedAdvisories: skip` turns the findings into an allowlist: an
+/// agent scan applies only the patch for the advisory it names.
+#[tokio::test]
+#[serial]
+async fn selection_filter_allowlist_patches_only_the_listed_advisories() {
+    let server = MockServer::start().await;
+    mount_api(&server, catalog()).await;
+    let repo = Repo::new(None);
+    let web = repo.dir("services/web");
+    let filter = write_filter(
+        &repo,
+        json!({
+            "version": 1,
+            "unlistedAdvisories": "skip",
+            "reachability": [{"advisory": ghsa(&P_BETA, 0), "state": "reachable"}],
+        }),
+    );
+    let (code, doc) = scan_json(
+        &web,
+        &server.uri(),
+        &["--mode", "agent", "--selection-filter", &filter],
+        &[],
+    );
+    assert_eq!(code, 0, "{doc:#}");
+    let manifest: Value =
+        serde_json::from_str(&std::fs::read_to_string(web.join(".socket/manifest.json")).unwrap())
+            .unwrap();
+    let keys: Vec<&String> = manifest["patches"].as_object().unwrap().keys().collect();
+    assert_eq!(keys, ["pkg:npm/beta@1.0.0"]);
+    assert_eq!(
+        std::fs::read_to_string(web.join("node_modules/beta/index.js")).unwrap(),
+        patched_index("beta")
+    );
+    assert_eq!(
+        std::fs::read_to_string(web.join("node_modules/alpha/index.js")).unwrap(),
+        orig_index("alpha")
+    );
+    let alpha = filtered_reason(&doc, "pkg:npm/alpha@1.0.0");
+    assert_eq!(alpha["reason"], "filter_not_needed");
+    assert_eq!(alpha["detail"], format!("{} unlisted", ghsa(&P_ALPHA, 0)));
+    assert_eq!(
+        doc["policy"]["selectionFilter"]["unlistedAdvisories"],
+        "skip"
+    );
+}
+
+/// Vendored mode selects through the same filter, and it composes with
+/// the socket.yml policy: both narrow.
+#[tokio::test]
+#[serial]
+async fn selection_filter_narrows_a_vendored_preview_beside_socket_yml() {
+    let server = MockServer::start().await;
+    mount_api(&server, catalog()).await;
+    let repo = Repo::new(Some(
+        "version: 2\npatches:\n  ecosystems: [npm]\n  ignorePackages: [\"pkg:npm/beta\"]\n",
+    ));
+    let filter = write_filter(
+        &repo,
+        json!({
+            "version": 1,
+            "reachability": [{"advisory": ghsa(&P_ALPHA, 0), "state": "unreachable"}],
+        }),
+    );
+    let before = repo.snapshot();
+    let (code, doc) = scan_json(
+        &repo.dir("services/web"),
+        &server.uri(),
+        &[
+            "--mode",
+            "vendored",
+            "--dry-run",
+            "--selection-filter",
+            &filter,
+        ],
+        &[],
+    );
+    assert_eq!(code, 0, "{doc:#}");
+    assert_eq!(repo.snapshot(), before);
+    let previewed: Vec<&str> = doc["events"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{doc:#}"))
+        .iter()
+        .filter(|e| e["details"]["mode"] == "vendored")
+        .filter_map(|p| p["purl"].as_str())
+        .collect();
+    assert_eq!(previewed, ["pkg:npm/left-pad@1.0.0"], "{doc:#}");
+    assert_eq!(
+        filtered_reason(&doc, "pkg:npm/alpha@1.0.0")["reason"],
+        "filter_not_needed"
+    );
+    assert_eq!(
+        filtered_reason(&doc, "pkg:npm/beta@1.0.0")["reason"],
+        "policy_package_ignored"
+    );
+    assert_eq!(doc["policy"]["source"], "file");
+    assert!(doc["policy"]["selectionFilter"].is_object());
+}
+
+/// `skip.paths` leaves a whole project root alone, like socket.yml's
+/// `patches.ignorePaths`, and applies to a root the user named.
+#[tokio::test]
+#[serial]
+async fn selection_filter_skips_project_roots_by_path() {
+    let server = MockServer::start().await;
+    mount_api(&server, catalog()).await;
+    let repo = Repo::new(None);
+    let filter = write_filter(
+        &repo,
+        json!({"version": 1, "skip": {"paths": ["/services/legacy/"]}}),
+    );
+    let before = repo.snapshot();
+    let (code, doc) = scan_json(
+        &repo.dir("services/legacy"),
+        &server.uri(),
+        &["--selection-filter", &filter],
+        &[],
+    );
+    assert_eq!(code, 0, "{doc:#}");
+    assert_eq!(
+        repo.snapshot(),
+        before,
+        "nothing in the skipped root changes"
+    );
+    assert_eq!(
+        filtered(&doc),
+        [(None, "filter_path_skipped".to_string())],
+        "{:#}",
+        doc["policy"]
+    );
+    let entry = &doc["policy"]["filtered"][0];
+    assert_eq!(entry["project"], "services/legacy");
+    assert_eq!(entry["detail"], "/services/legacy/ (skip.paths)");
+
+    let (code, doc) = scan_json(
+        &repo.dir("services/web"),
+        &server.uri(),
+        &["--selection-filter", &filter],
+        &[],
+    );
+    assert_eq!(code, 0, "{doc:#}");
+    assert!(repo.lock("services/web").contains(&P_ALPHA.hosted_url()));
+    assert_eq!(repo.lock("services/legacy"), before_lock(&before));
+
+    // An agent scan from the repository root judges each nested project.
+    let fresh = Repo::new(None);
+    let (code, doc) = scan_json(
+        &fresh.root,
+        &server.uri(),
+        &["--mode", "agent", "--selection-filter", &filter],
+        &[],
+    );
+    assert_eq!(code, 0, "{doc:#}");
+    assert_eq!(
+        std::fs::read_to_string(
+            fresh
+                .dir("services/legacy")
+                .join("node_modules/gamma/index.js")
+        )
+        .unwrap(),
+        orig_index("gamma")
+    );
+    assert_eq!(
+        std::fs::read_to_string(
+            fresh
+                .dir("services/web")
+                .join("node_modules/alpha/index.js")
+        )
+        .unwrap(),
+        patched_index("alpha")
+    );
+}
+
+fn before_lock(snapshot: &BTreeMap<String, Vec<u8>>) -> String {
+    let key = Path::new("services")
+        .join("legacy")
+        .join("package-lock.json")
+        .to_string_lossy()
+        .into_owned();
+    String::from_utf8(snapshot[&key].clone()).unwrap()
+}
+
+/// A filter that cannot be honored fails the run before any request or
+/// write: it only narrows, so it never falls back to "no filter".
+#[tokio::test]
+#[serial]
+async fn selection_filter_that_cannot_be_honored_fails_before_any_request_or_write() {
+    let server = MockServer::start().await;
+    mount_api(&server, catalog()).await;
+    let repo = Repo::new(None);
+    let web = repo.dir("services/web");
+    let before = repo.snapshot();
+    let filter = write_filter(
+        &repo,
+        json!({"version": 1, "skip": {"ghsas": ["GHSA-aaaa-bbbb-cccc"]}}),
+    );
+    let (code, doc) = scan_json(&web, &server.uri(), &["--selection-filter", &filter], &[]);
+    assert_eq!(code, 2, "{doc:#}");
+    assert_eq!(doc["status"], "error");
+    assert_eq!(doc["error"]["code"], "filter_invalid");
+    let message = doc["error"]["message"].as_str().unwrap();
+    assert!(message.starts_with("selection filter "), "{message}");
+    assert!(message.contains("unknown field `ghsas`"), "{message}");
+    assert!(doc.get("policy").is_none());
+
+    let (code, _, stderr) = scan(&web, &server.uri(), &["--selection-filter", &filter], &[]);
+    assert_eq!(code, 2);
+    assert!(stderr.contains("unknown field `ghsas`"), "{stderr}");
+
+    let missing = repo.root.parent().unwrap().join("missing.json");
+    let (code, doc) = scan_json(
+        &web,
+        &server.uri(),
+        &[],
+        &[("SOCKET_SELECTION_FILTER", missing.to_str().unwrap())],
+    );
+    assert_eq!(code, 2, "{doc:#}");
+    assert_eq!(doc["error"]["code"], "filter_invalid");
+
+    assert_eq!(repo.snapshot(), before);
+    assert!(
+        server.received_requests().await.unwrap().is_empty(),
+        "no request before the filter loads"
+    );
+}
+
+/// Narrowing never removes: a recorded patch the filter now skips, or
+/// whose advisories it now calls unreachable, stays as it is.
+#[tokio::test]
+#[serial]
+async fn selection_filter_holds_a_recorded_patch_in_place() {
+    let server = MockServer::start().await;
+    mount_api(&server, vec![P_ALPHA]).await;
+    let repo = Repo::new(None);
+    let web = repo.dir("services/web");
+    let (code, doc) = scan_json(&web, &server.uri(), &["--mode", "agent"], &[]);
+    assert_eq!(code, 0, "{doc:#}");
+    let manifest_before = std::fs::read(web.join(".socket/manifest.json")).unwrap();
+    let installed_before = std::fs::read(web.join("node_modules/alpha/index.js")).unwrap();
+
+    server.reset().await;
+    mount_api(&server, vec![P_ALPHA, P_ALPHA_MERGED_NEW]).await;
+    let skip = write_filter(
+        &repo,
+        json!({"version": 1, "skip": {"packages": ["alpha"]}}),
+    );
+    let (code, doc) = scan_json(
+        &web,
+        &server.uri(),
+        &["--mode", "agent", "--selection-filter", &skip],
+        &[],
+    );
+    assert_eq!(code, 0, "{doc:#}");
+    assert_eq!(
+        std::fs::read(web.join(".socket/manifest.json")).unwrap(),
+        manifest_before
+    );
+    assert_eq!(
+        std::fs::read(web.join("node_modules/alpha/index.js")).unwrap(),
+        installed_before
+    );
+    let retained = &doc["policy"]["retained"][0];
+    assert_eq!(retained["reason"], "filter_package_skipped");
+    assert_eq!(retained["recordedUuid"], P_ALPHA.uuid);
+    assert_eq!(retained["upgradeAvailable"], true);
+
+    // Every advisory of the package unreachable: the recorded patch stays,
+    // and the upgrade the filter withheld is reported.
+    let unreachable = write_filter(
+        &repo,
+        json!({
+            "version": 1,
+            "reachability": [{"package": "pkg:npm/alpha@1.0.0", "state": "unreachable"}],
+        }),
+    );
+    let (code, doc) = scan_json(
+        &web,
+        &server.uri(),
+        &["--mode", "agent", "--selection-filter", &unreachable],
+        &[],
+    );
+    assert_eq!(code, 0, "{doc:#}");
+    let manifest: Value =
+        serde_json::from_slice(&std::fs::read(web.join(".socket/manifest.json")).unwrap()).unwrap();
+    assert_eq!(
+        manifest["patches"]["pkg:npm/alpha@1.0.0"]["uuid"],
+        P_ALPHA.uuid
+    );
+    assert_eq!(
+        std::fs::read(web.join("node_modules/alpha/index.js")).unwrap(),
+        installed_before
+    );
+    let withheld = filtered_reason(&doc, "pkg:npm/alpha@1.0.0");
+    assert_eq!(withheld["reason"], "filter_not_needed");
+    assert_eq!(withheld["uuid"], P_ALPHA_MERGED_NEW.uuid);
 }
