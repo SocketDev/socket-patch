@@ -13,7 +13,11 @@
 //! - `WORKSPACE`: `go_repository` rules and no `go.mod` at all. The rules
 //!   of one `WORKSPACE` file and the macros it calls are one hub
 //!   ([`GoRepositories`]). It names no lock and governs every Go project
-//!   under the root, because repository names are global there.
+//!   under the root, because repository names are global there. The hub
+//!   exists with no rule at all when a call whose body is not read may
+//!   declare one: `gazelle_dependencies()` alone declares 37
+//!   `go_repository` rules at v0.35.0 (`deps.bzl`).
+//!   [`GoRepositories::defines`] then answers for one module.
 //!
 //! What gazelle does with a `replace` changes with its release
 //! ([`replace_outcome`]), and so does whether `MODULE.bazel.lock` records
@@ -29,7 +33,8 @@
 //!
 //! Everything read here is evidence that only escalates. A tag, a rule or
 //! a `go.mod` that is not read in full is a gap or an `exact: false`, and a
-//! `WORKSPACE` that loads gazelle's rule and shows none is a signal.
+//! `WORKSPACE` that has gazelle, by a `load` or by its archive, and shows
+//! no rule where a statement of the repository was not read is a signal.
 
 use super::super::label::{main_repo_path, Label, Repo};
 use super::super::model::{
@@ -40,7 +45,7 @@ use super::super::module_file::{
     BazelDep, GapScope, Host, ModuleGap, ModuleModel, ModuleOverride,
     OverrideKind as RootOverrideKind, MODULE_FILE,
 };
-use super::super::module_lock::{GoModFact, ModuleLock, RepoSpec};
+use super::super::module_lock::{ExtensionId, GoModFact, ModuleLock, RepoSpec};
 use super::super::rc::{root_relative, Chain, Flag, FlagState, LockfileMode};
 use super::super::ruleset_version::{
     self, Evidence, LineSpan, LockfileFlag, OverrideKind as Pin, Registries, RootDep, RootOverride,
@@ -49,11 +54,12 @@ use super::super::ruleset_version::{
 use super::super::starlark::{self, Dialect, Lookup, Value, ValueKind};
 use super::super::version::{module_version_cmp, BazelLine, BazelVersion, Tri};
 use super::super::workspace_file::{
-    Callee, Effect, Governing, OrderGap, OrderWhy, Origin, WorkspaceModel, WsFile, WsStmtKind,
+    Callee, Effect, Governing, OrderGap, OrderWhy, Origin, WorkspaceModel, WsCall, WsFile,
+    WsStmtKind,
 };
 use super::{RecognizeInput, Recognized};
 use crate::crawlers::types::Ecosystem;
-use crate::vendor::go_mod_edit::parse_use_dirs;
+use crate::vendor::go_mod_edit::{is_hosted_module_path, parse_use_dirs};
 
 /// Every `details.token` this file emits.
 pub const TOKENS: &[&str] = &["label_not_literal", "repo_override", "go_work"];
@@ -272,6 +278,9 @@ pub struct Replace {
 pub struct GoModFile {
     pub module: String,
     pub requires: Vec<Require>,
+    /// Every `replace` line, in file order. Several may name one path, and
+    /// gazelle does not apply them all: ask [`Self::replace_of`] for the
+    /// one it applies and [`Self::replaces_of`] for how many there are.
     pub replaces: Vec<Replace>,
 }
 
@@ -347,6 +356,28 @@ impl GoModFile {
         let mut rows = self.requires.iter().filter(|row| row.path == path);
         let first = rows.next();
         first.is_some_and(|row| row.version == version && !row.indirect) && rows.next().is_none()
+    }
+
+    /// The `replace` lines that name the module `path`, in file order,
+    /// whatever version each is keyed by.
+    pub fn replaces_of<'a>(&'a self, path: &'a str) -> impl Iterator<Item = &'a Replace> {
+        let replaces = self.replaces.iter();
+        replaces.filter(move |replace| replace.path == path)
+    }
+
+    /// The one `replace` the Starlark generation applies to the module
+    /// `path`: the last line that names it. Below 1.0.0-beta.1 gazelle
+    /// keeps one entry per path and each line overwrites the one before,
+    /// whatever its version key (`state["replace"][from_path] = ...` in
+    /// every branch, `internal/bzlmod/go_mod.bzl` at v0.35.0, v0.37.0 and
+    /// v0.54.0), so an earlier line of the same path is dropped although
+    /// Go would apply it to its own version. The go-list generation hands
+    /// the file to the go tool, which keeps every line and applies a keyed
+    /// one to its own version only: there this is one line of several, and
+    /// [`Self::replaces_of`] gives them all.
+    pub fn replace_of(&self, path: &str) -> Option<&Replace> {
+        let mut latest = self.replaces.iter().rev();
+        latest.find(|replace| replace.path == path)
     }
 }
 
@@ -501,8 +532,13 @@ pub struct GoDeps {
     /// Every `from_file` tag. gazelle fails on a second one, and a
     /// selection proof needs exactly one, naming a `go.mod`.
     pub from_files: Vec<FromFile>,
-    /// The first `config` tag; gazelle fails on a second one.
-    pub config: Option<Config>,
+    /// Every `config` tag, in order. gazelle 0.35.x applies each in turn,
+    /// so the last tag that sets `check_direct_dependencies` decides it
+    /// (`internal/bzlmod/go_deps.bzl` at v0.35.0, lines 232-241); from
+    /// 0.36.0 a second tag fails the extension (v0.36.0, line 317). A
+    /// proof that rests on a setting needs exactly one tag; with none,
+    /// every setting has its default.
+    pub configs: Vec<Config>,
     /// `module_override`, `archive_override` and `gazelle_override` tags.
     pub overrides: Vec<Override>,
     /// Hand-written `go_deps.module` tags: they join version selection
@@ -607,7 +643,8 @@ pub struct Import {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum LockRecord {
     /// The lock was not read, or the usage's entry cannot be told from
-    /// another's (an isolated usage, two repositories). Not "no entry".
+    /// another's: an isolated usage, two repositories, or an entry of a
+    /// repository that is not known to be gazelle's. Not "no entry".
     #[default]
     Unknown,
     /// No lock, or a lock with no entry for the extension.
@@ -732,6 +769,12 @@ impl LockRecord {
 pub struct GoRepositories {
     /// The `WORKSPACE` file, relative to the Bazel root.
     pub file: String,
+    /// The literal rules of the files that were read. It can be empty: a
+    /// dependency macro of gazelle or rules_go, or a function of another
+    /// repository that nobody vouches for, may declare a Go module that
+    /// no rule here shows. A hub with no rule governs like any other, so
+    /// a build from a committed `vendor/` (design 4.3, row 18) is told by
+    /// [`Self::defines`] for the module, not by the absence of a hub.
     pub rules: Vec<GoRepositoryRule>,
     /// The repository names the loads of gazelle's `deps.bzl` use. In a
     /// hybrid workspace a name the root module can see is the Bzlmod
@@ -740,8 +783,13 @@ pub struct GoRepositories {
     /// `go_rules_dependencies` is called with an argument: `force = True`
     /// declares its repositories whatever was declared before.
     pub forced: bool,
-    /// Statements that may declare more rules and were not read, as
-    /// `file:line: why`. When empty, `rules` holds every rule.
+    /// What may declare more rules and was not read, as `file:line: why`:
+    /// a statement of a file that was read, a function of the main
+    /// repository, a `repository_macro` file. When empty, `rules` holds
+    /// every rule the repository's own files write out. A function of
+    /// another repository is never listed, or every `WORKSPACE` that calls
+    /// a dependency macro would be unread: [`Self::position`] and
+    /// [`Self::defines`] weigh each such call for the one name asked.
     pub unread: Vec<String>,
 }
 
@@ -776,8 +824,8 @@ pub struct GoRepositoryRule {
     pub version: Attr<String>,
     pub sum: Attr<String>,
     pub replace: Attr<String>,
-    /// `urls`, `commit`, `tag` or `local_path` is given: the rule does not
-    /// fetch a module version.
+    /// `urls`, `remote`, `commit`, `tag` or `local_path` is given: the
+    /// rule does not fetch a module version.
     pub other_source: bool,
     pub patches: bool,
     pub keep: Option<Keep>,
@@ -800,22 +848,39 @@ pub enum Position {
 }
 
 impl GoRepositories {
-    /// Whether Bazel builds `rule`, by the one owner of the `WORKSPACE`
-    /// order rule. `model` is the model of [`Self::file`].
-    pub fn position(&self, model: &WorkspaceModel, rule: &GoRepositoryRule) -> Position {
+    /// The definition of the repository `name` that Bazel builds, by the
+    /// one owner of the `WORKSPACE` order rule, told what the dependency
+    /// macros of gazelle and rules_go declare. `model` is the model of
+    /// [`Self::file`]; asked of another file's, nothing is proven.
+    ///
+    /// This is the question for a Go module that has no rule in
+    /// [`Self::rules`]. `Undefined` proves that no statement of the file
+    /// declares the name, so Bazel builds the module from somewhere else
+    /// (a committed `vendor/`). `Unknown` is a refusal: a macro whose
+    /// body is not read may declare it (`org_golang_x_sys` after
+    /// `gazelle_dependencies()`), and a `replace` in `go.mod` then
+    /// changes nothing Bazel builds. `Exact` can be a rule of another
+    /// kind, an `http_archive` of that name.
+    pub fn defines(&self, model: &WorkspaceModel, name: &str) -> Governing {
         if model
             .files
             .first()
             .is_none_or(|file| file.path != self.file)
         {
-            return Position::Unknown(OrderGap {
+            return Governing::Unknown(OrderGap {
                 file: self.file.clone(),
                 line: 1,
                 why: OrderWhy::Unreadable,
                 called_at: None,
             });
         }
-        match model.governing_with(&rule.name, &knowledge(&rule.name, self.forced)) {
+        model.governing_with(name, &knowledge(name, self.forced))
+    }
+
+    /// Whether Bazel builds `rule`: [`Self::defines`] for its name, and
+    /// whether the definition found is this one.
+    pub fn position(&self, model: &WorkspaceModel, rule: &GoRepositoryRule) -> Position {
+        match self.defines(model, &rule.name) {
             Governing::Exact(built) => {
                 let at = built
                     .inner
@@ -964,28 +1029,88 @@ fn gazelle_deps(label: &Label) -> bool {
     label.repo != Repo::Main && label.package.is_empty() && label.name == "deps.bzl"
 }
 
+/// The seed list of a dependency macro of gazelle or rules_go: the
+/// function `symbol` of the file `label` in another repository. These two
+/// are the functions known to declare Go modules that no rule of the
+/// `WORKSPACE` shows.
+fn seeds(label: &Label, symbol: &str) -> Option<&'static [&'static str]> {
+    if label.repo == Repo::Main {
+        return None;
+    }
+    match (label.package.as_str(), label.name.as_str(), symbol) {
+        ("", "deps.bzl", "gazelle_dependencies") => Some(GAZELLE_DEPENDENCIES),
+        ("go", "deps.bzl", "go_rules_dependencies") => Some(GO_RULES_DEPENDENCIES),
+        _ => None,
+    }
+}
+
 /// What the functions of gazelle and rules_go declare, for a question
 /// about the repository `name`. Every other loaded function stays opaque.
 fn knowledge(name: &str, forced: bool) -> impl Fn(&Origin<'_>) -> Option<Effect> + '_ {
-    let seeded = move |names: &'static [&'static str], forced: bool| Effect::Macro {
-        names,
-        weak: !forced && !UNCONDITIONAL.contains(&name),
-    };
     move |origin| {
         let label = origin.label.filter(|label| label.repo != Repo::Main)?;
         match (label.package.as_str(), label.name.as_str(), origin.symbol) {
             ("", "deps.bzl", "go_repository") => Some(Effect::Rule),
-            ("", "deps.bzl", "gazelle_dependencies") => Some(seeded(GAZELLE_DEPENDENCIES, false)),
-            ("go", "deps.bzl", "go_rules_dependencies") => {
-                Some(seeded(GO_RULES_DEPENDENCIES, forced))
-            }
             ("go", "deps.bzl", "go_register_toolchains") => Some(Effect::Macro {
                 names: GO_REGISTER_TOOLCHAINS,
                 weak: false,
             }),
-            _ => None,
+            (_, _, symbol) => {
+                // Only `go_rules_dependencies` takes `force`.
+                let forced = forced && symbol == "go_rules_dependencies";
+                let weak = !forced && !UNCONDITIONAL.contains(&name);
+                seeds(label, symbol).map(|names| Effect::Macro { names, weak })
+            }
         }
     }
+}
+
+/// A name no repository can have: Bazel takes word characters and `-`,
+/// `.`, `~`, `+` (`RepositoryName.java` at 7.7.2). No rule that was read
+/// defines it and no seed list holds it, so whether Bazel may define it
+/// is whether something that was not read may define any name at all.
+const NO_REPOSITORY: &str = "\0";
+
+/// The name gazelle's own repository has by convention in a `WORKSPACE`,
+/// and the project name every URL of its archive holds.
+const GAZELLE_REPOSITORY: &str = "bazel_gazelle";
+const GAZELLE_PROJECT: &str = "bazel-gazelle";
+
+/// The rules a `WORKSPACE` fetches a ruleset's archive with, by the name
+/// each has in the file that defines it.
+const ARCHIVE_RULES: [&str; 3] = ["http_archive", "git_repository", "new_git_repository"];
+
+/// Whether `call` declares gazelle's own repository: any rule, called or
+/// handed to `maybe`, whose literal `name` is `bazel_gazelle`, or an
+/// archive rule whose `urls`, `url` or `remote` names `bazel-gazelle`.
+/// The archive says the ruleset is there when the `load` of its rule is in
+/// a file that was not read (design 2.7).
+fn fetches_gazelle(source: &WsFile, call: &WsCall) -> bool {
+    let arg = |name: &str| match call.call.arg(name) {
+        Lookup::Found(value) => Some(source.resolve(value)),
+        Lookup::Absent | Lookup::Unknown => None,
+    };
+    if arg("name").and_then(Value::as_str) == Some(GAZELLE_REPOSITORY) {
+        return true;
+    }
+    let archive = |callee: &Callee| {
+        origin(source, callee).is_some_and(|(_, symbol)| ARCHIVE_RULES.contains(&symbol))
+    };
+    let names = |value: &Value| {
+        let named = |value: &Value| {
+            let url = source.resolve(value).as_str();
+            url.is_some_and(|url| url.contains(GAZELLE_PROJECT))
+        };
+        match &value.kind {
+            ValueKind::List(urls) => urls.iter().any(named),
+            _ => named(value),
+        }
+    };
+    (archive(&call.callee) || call.passes.as_ref().is_some_and(archive))
+        && ["urls", "url", "remote"]
+            .into_iter()
+            .filter_map(arg)
+            .any(names)
 }
 
 // ── Recognition ──────────────────────────────────────────────────────
@@ -1142,9 +1267,12 @@ fn usage_hub(
                     dev: tag.dev,
                     site,
                 };
+                // An environment that was not read may hold `GOPROXY=off` or
+                // `GOFLAGS`: it is not the default one.
                 literal &=
                     !config.check_direct_dependencies.is_computed() && !config.checks.is_computed();
-                detail.config.get_or_insert(config);
+                literal &= !config.go_env.is_computed() && !config.go_env_inherit.is_computed();
+                detail.configs.push(config);
             }
             "module_override" | "archive_override" | "gazelle_override" => {
                 let kind = match name {
@@ -1304,9 +1432,15 @@ fn go_mod_at(input: &RecognizeInput<'_>, path: &str) -> GoModRead {
     }
 }
 
-/// What the lock records for a usage of `go_deps`. Entries are matched by
-/// label path and name, so the root module's own `//:extensions.bzl` is
-/// left out and two other repositories cannot be told apart.
+/// What the lock records for a usage of `go_deps`. Entries are found by
+/// label path and name, and one is gazelle's when its repository is
+/// `gazelle`, alone or followed by `~` or `+` (`gazelle~0.35.0`,
+/// `gazelle~`, `gazelle+`: the spellings of [`ExtensionId::repo`]). The
+/// root module's own `//:extensions.bzl%go_deps` is another extension and
+/// is left out, as it is in `MODULE.bazel`. An entry of any other
+/// repository may be another module's extension of that path and name, or
+/// gazelle under a spelling this reader does not know: nothing is known
+/// then, and that is never "not recorded".
 fn lock_record(lock: Option<&ModuleLock>, isolated: bool) -> (LockRecord, Facts) {
     let Some(lock) = lock else {
         return (LockRecord::NotRecorded, Facts::Absent);
@@ -1324,7 +1458,12 @@ fn lock_record(lock: Option<&ModuleLock>, isolated: bool) -> (LockRecord, Facts)
         .map(|entry| &entry.id)
         .chain(facts.iter().map(|facts| &facts.id));
     let ids: Vec<_> = ids.collect();
-    if isolated || ids.iter().any(|id| id.isolated || id.repo != ids[0].repo) {
+    let gazelle = |id: &ExtensionId| {
+        let version = id.repo.strip_prefix(MODULE);
+        version.is_some_and(|rest| rest.is_empty() || rest.starts_with(['~', '+']))
+    };
+    let told = |id: &&ExtensionId| !id.isolated && gazelle(id) && id.repo == ids[0].repo;
+    if isolated || !ids.iter().all(told) {
         return (LockRecord::Unknown, Facts::Unknown);
     }
     let recorded = entries.iter().map(|entry| RecordedEntry {
@@ -1530,7 +1669,10 @@ fn go_repositories(input: &RecognizeInput<'_>, model: &WorkspaceModel, out: &mut
             }
         }
     }
-    let Some(loaded) = loaded else { return };
+    // No `load` of gazelle in the files read is not "no gazelle": the load
+    // may be in a macro file two levels down, or in one that is missing.
+    // The statements are walked first, for gazelle's archive and for what
+    // was not read.
     let named = model.repository_macros();
     let unread_macros = named.iter().filter(|named| named.macro_def.is_none());
     detail.unread.extend(unread_macros.map(|named| {
@@ -1539,17 +1681,25 @@ fn go_repositories(input: &RecognizeInput<'_>, model: &WorkspaceModel, out: &mut
             named.path, named.def
         )
     }));
-    let files = model.files.iter().enumerate();
-    let keeps: Vec<Option<Vec<usize>>> = files
-        .map(|(index, file)| {
+    // Where the `# keep` comments of each file start: read with the first
+    // rule, so a `WORKSPACE` without one is not read twice.
+    let read_keeps = || {
+        let files = model.files.iter().enumerate();
+        let offsets = |(index, file): (usize, &WsFile)| {
             let dialect = if index == 0 {
                 Dialect::Workspace
             } else {
                 Dialect::Bzl
             };
             keep_offsets(input, &file.path, dialect)
-        })
-        .collect();
+        };
+        files.map(offsets).collect::<Vec<Option<Vec<usize>>>>()
+    };
+    let mut keeps = None;
+    // Where gazelle's own repository is declared, and whether a dependency
+    // macro that declares Go modules of its own is called.
+    let (mut archive, mut seeded) = (None, false);
+    let (mut gaps, mut user_decls) = (Vec::new(), Vec::new());
     let top = model
         .stmts
         .iter()
@@ -1559,7 +1709,6 @@ fn go_repositories(input: &RecognizeInput<'_>, model: &WorkspaceModel, out: &mut
         let body = made.body.iter().enumerate();
         body.map(move |(index, stmt)| (made.file, RuleAt::Macro(m, index), stmt))
     });
-    let mut user_decls = Vec::new();
     for (file, at, stmt) in top.chain(bodies) {
         let source = &model.files[file];
         let unread = |why: &str| format!("{}:{}: {why}", source.path, stmt.line);
@@ -1571,6 +1720,14 @@ fn go_repositories(input: &RecognizeInput<'_>, model: &WorkspaceModel, out: &mut
             }
             WsStmtKind::Load(_) | WsStmtKind::Inert => continue,
         };
+        let site = Site {
+            file: source.path.clone(),
+            span: stmt.span,
+            system: DeclSystem::Workspace,
+        };
+        if archive.is_none() && fetches_gazelle(source, call) {
+            archive = Some(site.clone());
+        }
         let is_rule = |callee: &Callee| match origin(source, callee) {
             Some((Some(label), "go_repository")) => gazelle_deps(label),
             _ => false,
@@ -1594,19 +1751,42 @@ fn go_repositories(input: &RecognizeInput<'_>, model: &WorkspaceModel, out: &mut
             // weigh for each name.
             let foreign =
                 |callee: &Callee| matches!(origin(source, callee), Some((_, "go_repository")));
+            // A label Bazel rejects, or one of a macro file's own package,
+            // names no file of another repository.
+            let main = |label: Option<&Label>| label.is_none_or(|label| label.repo == Repo::Main);
             let own = match loaded_from {
                 Some((label, symbol)) => {
                     detail.forced |=
                         symbol == "go_rules_dependencies" && !call.call.args.is_empty();
-                    label.is_none_or(|label| label.repo == Repo::Main)
+                    seeded |= label.is_some_and(|label| seeds(label, symbol).is_some());
+                    main(label)
                 }
                 None => call.callee == Callee::Unknown,
             };
+            // `maybe(f, ...)` runs `f`. A rule of another repository is
+            // `governing`'s to weigh; a function of the main repository,
+            // a name that names no function and an argument that is no
+            // bare name are not read, as the direct call would not be.
+            let handed = match &call.passes {
+                _ if !wraps => false,
+                Some(passed @ Callee::Loaded { .. }) => {
+                    origin(source, passed).is_none_or(|(label, _)| main(label))
+                }
+                Some(Callee::Builtin) => false,
+                Some(Callee::Unknown) | None => true,
+            };
+            let own = own || handed;
             let own = own || foreign(&call.callee) || call.passes.as_ref().is_some_and(foreign);
             if own && !(matches!(at, RuleAt::Top(_)) && call.macro_def.is_some()) {
+                // The function that is not read: the one `maybe` is handed.
+                let passed = call.call.positional().next().filter(|_| wraps);
+                let function = match passed.map(|passed| &passed.kind) {
+                    Some(ValueKind::Ident(passed)) => passed,
+                    _ => &call.call.callee,
+                };
                 detail
                     .unread
-                    .push(unread(&format!("`{}` is not read", call.call.callee)));
+                    .push(unread(&format!("`{function}` is not read")));
             }
             continue;
         }
@@ -1616,7 +1796,7 @@ fn go_repositories(input: &RecognizeInput<'_>, model: &WorkspaceModel, out: &mut
         let (Attr::Is(name), Attr::Is(importpath)) = (get("name"), get("importpath")) else {
             let why = "the `name` and `importpath` of `go_repository` must be string literals";
             detail.unread.push(unread(why));
-            out.gaps.push(Gap {
+            gaps.push(Gap {
                 token: LABEL_NOT_LITERAL,
                 file: source.path.clone(),
                 detail: unread(why),
@@ -1633,23 +1813,31 @@ fn go_repositories(input: &RecognizeInput<'_>, model: &WorkspaceModel, out: &mut
         } else if stmt.trailing.as_deref().is_some_and(is_keep) {
             Some(Keep::After)
         } else {
-            keeps[file]
+            keeps.get_or_insert_with(read_keeps)[file]
                 .as_ref()
                 .is_none_or(inside)
                 .then_some(Keep::Inside)
         };
-        let site = Site {
-            file: source.path.clone(),
-            span: stmt.span,
-            system: DeclSystem::Workspace,
-        };
+        let replace = get("replace");
         let patches = given("patches") || given("patch_cmds");
-        if patches {
-            let (package, site) = (importpath.clone(), site.clone());
+        // The user's own source for the module, by the list of
+        // gap-ruleset-patch-hooks 2.1: an archive, a directory, a fork's
+        // repository, or another module in its place. Probe G5: the next
+        // `update-repos` rewrites a `urls` rule to the `version` and `sum`
+        // of `go.mod`. A plain `commit` or `tag` is the module's own
+        // repository. The `replace` of a hosted pin is Socket's, not the
+        // user's.
+        let replaced = match &replace {
+            Attr::Is(with) => !with.is_empty() && !is_hosted_module_path(with),
+            Attr::Computed => true,
+            Attr::Absent => false,
+        };
+        let replacement = replaced || ["urls", "local_path", "remote"].into_iter().any(given);
+        if replacement || patches {
             user_decls.push(UserDecl {
-                package,
-                replacement: false,
-                site,
+                package: importpath.clone(),
+                replacement,
+                site: site.clone(),
             });
         }
         detail.rules.push(GoRepositoryRule {
@@ -1657,8 +1845,8 @@ fn go_repositories(input: &RecognizeInput<'_>, model: &WorkspaceModel, out: &mut
             importpath,
             version: get("version"),
             sum: get("sum"),
-            replace: get("replace"),
-            other_source: ["urls", "commit", "tag", "local_path"]
+            replace,
+            other_source: ["urls", "remote", "commit", "tag", "local_path"]
                 .into_iter()
                 .any(given),
             patches,
@@ -1668,17 +1856,38 @@ fn go_repositories(input: &RecognizeInput<'_>, model: &WorkspaceModel, out: &mut
             site,
         });
     }
-    let Some(site) = detail.rules.first().map(|rule| rule.site.clone()) else {
-        // gazelle is loaded and no rule was read. Its rule may hide in
-        // what was not read; with nothing unread, the file declares no Go
-        // module (a `vendor/` build, or gazelle as a BUILD generator).
-        if rule_loaded || !detail.unread.is_empty() {
-            out.signals.push(RulesetSignal {
-                ruleset: Ruleset::Gazelle,
-                site: loaded,
-            });
-        }
+    // gazelle is there by a `load` of its functions or by its archive.
+    let Some(present) = loaded.or(archive) else {
         return;
+    };
+    out.gaps.extend(gaps);
+    let site = match detail.rules.first() {
+        Some(rule) => rule.site.clone(),
+        None => {
+            // gazelle is there and no rule was read. One may hide in what
+            // was not read: nothing says which modules Bazel builds, and
+            // the ruleset is a signal.
+            if rule_loaded || !detail.unread.is_empty() {
+                out.signals.push(RulesetSignal {
+                    ruleset: Ruleset::Gazelle,
+                    site: present,
+                });
+                return;
+            }
+            // Everything of the repository was read, and a function of
+            // another repository may still declare a Go module: a
+            // dependency macro of gazelle or rules_go does (37 rules in
+            // `gazelle_dependencies()` at v0.35.0), and so may any call
+            // `governing` cannot see into. That is a hub with no rule, so
+            // that a lane asks `defines` for each module. With neither,
+            // the file declares no Go module (a `vendor/` build whose
+            // `WORKSPACE` only fetches gazelle).
+            let unseen = detail.defines(model, NO_REPOSITORY);
+            if !seeded && !matches!(unseen, Governing::Unknown(_)) {
+                return;
+            }
+            present
+        }
     };
     out.hubs.push(Hub {
         ruleset: Ruleset::Gazelle,
@@ -1982,6 +2191,31 @@ mod tests {
         assert!(!GoModFile::parse(twice)
             .unwrap()
             .requires_directly("a", "v1.1.0"));
+        // One path replaced on two lines, each keyed by its own version:
+        // the file socket-patch writes beside a user's replace of another
+        // version (`test_upsert_allows_user_replace_at_different_version`).
+        // The Starlark generation keeps one entry per path, the last line,
+        // so which of the two it applies is a matter of their order.
+        let hosted = "replace example.com/a v1.4.2 => \
+                      patch.socket.dev/gopatch/9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f v1.4.2\n";
+        let fork = "replace example.com/a v1.0.0 => ../fork\n";
+        let other = "replace example.com/b => example.com/fork v1.0.0\n";
+        for (lines, applied) in [
+            ([hosted, other, fork], ReplaceShape::DirVersioned),
+            ([fork, other, hosted], ReplaceShape::ModuleVersioned),
+        ] {
+            let file = GoModFile::parse(&["module m\n", &lines.concat()].concat()).unwrap();
+            let of_a: Vec<_> = file.replaces_of("example.com/a").collect();
+            assert_eq!(of_a.len(), 2, "{lines:?}");
+            let last = file.replace_of("example.com/a").unwrap();
+            assert_eq!(last.shape, applied, "{lines:?}");
+            assert!(std::ptr::eq(last, of_a[1]), "{lines:?}");
+            assert_eq!(file.replaces_of("example.com/b").count(), 1);
+            let b = file.replace_of("example.com/b").unwrap();
+            assert_eq!((b.shape, b.target.as_str()), (Module, "example.com/fork"));
+            assert_eq!(file.replace_of("example.com/c"), None);
+            assert_eq!(file.replaces_of("example.com/c").count(), 0);
+        }
         // What gazelle fails on is no evidence of anything.
         for bad in [
             "go 1.21\n",
@@ -2065,7 +2299,7 @@ mod tests {
             replace_outcome(replace.shape, gazelle),
             ReplaceOutcome::GoSemantics
         );
-        assert!(detail.config.is_none());
+        assert!(detail.configs.is_empty());
         // Provision: the root module imports pgx's repository.
         let repo = detail.repo_name_of(PGX).unwrap();
         assert_eq!(repo, "com_github_jackc_pgx_v5");
@@ -2123,18 +2357,57 @@ mod tests {
             {"//:extensions.bzl%go_deps": {"general": {"recordedFileInputs": {}}}}}"#;
         let (record, _) = lock_record(Some(&ModuleLock::parse(own.as_bytes())), false);
         assert_eq!(record, LockRecord::NotRecorded);
+        // The entry is gazelle's under each spelling Bazel gives its
+        // repository. Under any other repository it may be another
+        // module's `//:extensions.bzl%go_deps`, which `MODULE.bazel`
+        // recognition does not take for gazelle's either. With gazelle
+        // 0.36.0 on Bazel 7.1 and later gazelle records no entry (probe
+        // B2), so such an entry is the only one: it is not gazelle's
+        // record, and not proof that gazelle records none.
+        const ID: &str = "@@gazelle+//:extensions.bzl%go_deps";
+        let hosted = String::from_utf8(x3("hidden/gz0.54.0-b8.8.2.hosted.reduced.json")).unwrap();
+        let keyed = |repo: &str| {
+            let id = format!("{repo}//:extensions.bzl%go_deps");
+            let lock = ModuleLock::parse(hosted.replace(ID, &id).as_bytes());
+            lock_record(Some(&lock), false).0
+        };
+        for own in [
+            "@@gazelle+",
+            "@@gazelle~",
+            "@gazelle~0.35.0",
+            "@@gazelle+0.54.0",
+        ] {
+            assert_eq!(keyed(own).specs_of(PGX).len(), 1, "{own}");
+        }
+        for foreign in ["@@wrapper~", "@@wrapper+", "@@gazelle_fork+", "@@gazelle2~"] {
+            assert_eq!(keyed(foreign), LockRecord::Unknown, "{foreign}");
+        }
+        // gazelle's entry beside another repository's, or beside a second
+        // gazelle's (`multiple_version_override`): the two cannot be told
+        // apart for a usage.
+        for second in ["@@wrapper+", "@@gazelle+0.54.0"] {
+            let mut both: serde_json::Value = serde_json::from_str(&hosted).unwrap();
+            let entry = both["moduleExtensions"][ID].clone();
+            both["moduleExtensions"][format!("{second}//:extensions.bzl%go_deps")] = entry;
+            let both = ModuleLock::parse(&serde_json::to_vec(&both).unwrap());
+            assert_eq!(lock_record(Some(&both), false), unknown, "{second}");
+        }
         // The facts list of a hermetic workspace is empty (probe B2), and
-        // facts in a shape of the future are not read as none.
-        let facts = |facts: &str| {
+        // facts in a shape of the future are not read as none. Facts of
+        // another repository are not gazelle's.
+        let facts = |repo: &str, facts: &str| {
             let lock = format!(
                 r#"{{"lockFileVersion": 28, "registryFileHashes": {{}},
-                "facts": {{"@@gazelle+//:extensions.bzl%go_deps": {facts}}}}}"#
+                "facts": {{"{repo}//:extensions.bzl%go_deps": {facts}}}}}"#
             );
-            lock_record(Some(&ModuleLock::parse(lock.as_bytes())), false).1
+            lock_record(Some(&ModuleLock::parse(lock.as_bytes())), false)
         };
-        let empty = facts(r#"{"required_mod_files_v1": []}"#);
-        assert_eq!(empty, Facts::Listed(Vec::new()));
-        assert_eq!(facts(r#"{"required_mod_files_v2": []}"#), Facts::Unknown);
+        let empty = facts("@@gazelle+", r#"{"required_mod_files_v1": []}"#);
+        assert_eq!(empty, (LockRecord::NotRecorded, Facts::Listed(Vec::new())));
+        let future = facts("@@gazelle+", r#"{"required_mod_files_v2": []}"#);
+        assert_eq!(future.1, Facts::Unknown);
+        let foreign = facts("@@wrapper+", r#"{"required_mod_files_v1": []}"#);
+        assert_eq!(foreign, unknown);
     }
 
     const GAZELLE: &str = r#"bazel_dep(name = "gazelle", version = "0.35.0")
@@ -2181,7 +2454,9 @@ use_repo(dev, "com_example_e")
             "//tools:go.mod Some(\"tools/go.mod\") PackageLock",
         ];
         assert_eq!(locks, want);
-        let config = detail.config.as_ref().unwrap();
+        let [config] = detail.configs.as_slice() else {
+            panic!("{:?}", detail.configs);
+        };
         assert_eq!(
             config.check_direct_dependencies,
             Attr::Is("error".to_string())
@@ -2253,6 +2528,66 @@ use_repo(dev, "com_example_e")
         assert!(TOKENS.contains(&bypass.token) && TOKENS.contains(&GO_WORK));
     }
 
+    /// gazelle 0.35.0 loops over every `config` tag of the root module and
+    /// the last `check_direct_dependencies` wins; "Multiple go_deps.config
+    /// tags" is an error only from 0.36.0. The root here declares 0.35.0,
+    /// the bottom of the range a selection proof takes `error` from, so the
+    /// first tag must not read as the setting in force.
+    #[test]
+    fn every_config_tag_is_kept_and_a_dev_tag_proves_no_release() {
+        let read = |tags: &str| {
+            let module = [GAZELLE, "go_deps.from_file(go_mod = \"//:go.mod\")\n", tags].concat();
+            recognized(&view(&[(MODULE_FILE, &module)]), None)
+        };
+        let lo = |hub: &Hub| {
+            let lo = hub.ruleset_version.lo.as_ref().unwrap();
+            (lo.version.clone(), lo.source)
+        };
+        let declared = ("0.35.0".to_string(), Source::Declared);
+        let found = read(
+            "go_deps.config(check_direct_dependencies = \"error\")\n\
+             go_deps.config(check_direct_dependencies = \"warning\")\n",
+        );
+        assert!(found.gaps.is_empty() && found.signals.is_empty());
+        let (hub, detail) = go_deps_of(&found);
+        let settings: Vec<_> = detail
+            .configs
+            .iter()
+            .map(|config| config.check_direct_dependencies.get().map(String::as_str))
+            .collect();
+        assert_eq!(settings, [Some("error"), Some("warning")]);
+        assert_eq!(lo(hub), declared);
+        // One tag is the one setting; none is every default.
+        let found = read("go_deps.config(check_direct_dependencies = \"error\")\n");
+        let [config] = go_deps_of(&found).1.configs.as_slice() else {
+            panic!("not one config tag");
+        };
+        assert_eq!(
+            config.check_direct_dependencies,
+            Attr::Is("error".to_string())
+        );
+        assert!(!config.dev && go_deps_of(&read("")).1.configs.is_empty());
+        // `checks` exists from 1.0.0-beta.1: on a tag every build
+        // evaluates it proves the go-list generation. On a dev proxy it
+        // proves no release, because `--ignore_dev_dependency` drops the
+        // tag and an older gazelle then builds.
+        let found = read("go_deps.config(checks = \"error\")\n");
+        let (hub, detail) = go_deps_of(&found);
+        assert_eq!(detail.api_floor, Some("1.0.0-beta.1"));
+        assert_eq!(lo(hub), ("1.0.0-beta.1".to_string(), Source::ApiShape));
+        assert_eq!(generation(&hub.ruleset_version), Generation::GoList);
+        let found = read(
+            "dev = use_extension(\"@gazelle//:extensions.bzl\", \"go_deps\", \
+             dev_dependency = True)\n\
+             dev.config(checks = \"error\")\n",
+        );
+        let (hub, detail) = go_deps_of(&found);
+        assert!(detail.exact && detail.configs[0].dev);
+        assert_eq!(detail.api_floor, None);
+        assert_eq!(lo(hub), declared);
+        assert_eq!(generation(&hub.ruleset_version), Generation::Unknown);
+    }
+
     #[test]
     fn what_is_not_a_literal_is_a_gap_and_never_a_guess() {
         let read = |tags: &str, files: &[(&str, &str)]| {
@@ -2267,6 +2602,11 @@ use_repo(dev, "com_example_e")
             "go_deps.from_file(go_work = \"//:missing.work\")\n",
             "go_deps.module_override(path = PATH + \"/v2\", patches = [])\n",
             "go_deps.config(**SETTINGS)\n",
+            // An environment that was not read may hold `GOPROXY=off`.
+            "go_deps.config(check_direct_dependencies = \"error\", go_env = ENV)\n",
+            "go_deps.config(go_env = {\"GOPROXY\": PROXY})\n",
+            "go_deps.config(go_env_inherit = INHERIT)\n",
+            "go_deps.config(checks = CHECKS)\n",
             "go_deps.future_tag(path = \"example.com/a\")\n",
             "[go_deps.module(path = p, version = \"v1.0.0\") for p in PATHS]\n",
         ] {
@@ -2288,6 +2628,26 @@ use_repo(dev, "com_example_e")
             &[],
         );
         assert_eq!(go_deps_of(&found).1.repo_name_of("example.com/a"), None);
+        // One whose name was not read renames its own module to a name
+        // nobody knows, and no other.
+        let found = read(
+            "go_deps.module_override(path = \"example.com/a\", repo_name = NAME)\n",
+            &[],
+        );
+        let (_, detail) = go_deps_of(&found);
+        assert_eq!(detail.repo_name_of("example.com/a"), None);
+        let b = detail.repo_name_of("example.com/b");
+        assert_eq!(b.as_deref(), Some("com_example_b"));
+        assert_eq!(found.gaps.len(), 1);
+        // A `go_work` that was not read is a workspace of several `go.mod`
+        // files all the same: the shape every lane refuses.
+        let found = read("go_deps.from_file(go_work = WORK)\n", &[]);
+        let (hub, detail) = go_deps_of(&found);
+        assert_eq!(detail.unsupported(), Some("go_work"));
+        assert_eq!(detail.from_files[0].go_work, Attr::Computed);
+        assert!(!detail.exact && hub.locks.is_empty());
+        let plain = read("go_deps.from_file(go_mod = \"//:go.mod\")\n", &[]);
+        assert_eq!(go_deps_of(&plain).1.unsupported(), None);
         // A `go.mod` that is missing, or that gazelle cannot parse, is kept
         // as that and not as an empty file.
         let named = "go_deps.from_file(go_mod = \"//svc:go.mod\")\n";
@@ -2353,18 +2713,14 @@ deps.from_file(go_mod = "//:go.mod")
     #[test]
     fn the_gazelle_version_is_a_range_with_its_evidence() {
         use ReplaceShape::{DirVersioned, ModuleVersioned};
-        let version = |extra: &str, rc: &str| {
-            let module = [
-                GAZELLE,
-                "go_deps.from_file(go_mod = \"//:go.mod\")\n",
-                extra,
-            ]
-            .concat();
-            let files = [(MODULE_FILE, module.as_str()), (".bazelrc", rc)];
+        const FROM_FILE: &str = "go_deps.from_file(go_mod = \"//:go.mod\")\n";
+        let version_of = |module: &str, rc: &str| {
+            let files = [(MODULE_FILE, module), (".bazelrc", rc)];
             let root = view(if rc.is_empty() { &files[..1] } else { &files });
             let found = recognized(&root, Some(&bazel(7, 7, 2)));
             go_deps_of(&found).0.ruleset_version.clone()
         };
+        let version = |extra: &str, rc: &str| version_of(&[GAZELLE, FROM_FILE, extra].concat(), rc);
         // A root `bazel_dep` is a lower bound: the hosted replace is not
         // proven honoured, because Bazel may select the go-list generation.
         let declared = version("", "");
@@ -2423,6 +2779,73 @@ deps.from_file(go_mod = "//:go.mod")
             replace_outcome(DirVersioned, &pinned),
             ReplaceOutcome::AnyVersion
         );
+        // From 7.4.0 `--ignore_dev_dependency` drops every root override,
+        // and a named config is enough to make it possible: the pin then
+        // holds on one reading only, and the declaration is what is left.
+        const DEV_FLAG: &str = "common:ci --ignore_dev_dependency\n";
+        let dropped = version(pin, DEV_FLAG);
+        let lo = dropped.lo.as_ref().unwrap();
+        assert_eq!(
+            (lo.version.as_str(), lo.source, &dropped.hi),
+            ("0.35.0", Source::Declared, &None)
+        );
+        assert_eq!(generation(&dropped), Generation::Unknown);
+        assert_eq!(
+            replace_outcome(DirVersioned, &dropped),
+            ReplaceOutcome::Unknown
+        );
+        // A dev `bazel_dep` is gone under the flag: nothing then declares
+        // gazelle, and the version has no lower end.
+        let dev_dep = GAZELLE.replace("\"0.35.0\")", "\"0.35.0\", dev_dependency = True)");
+        assert!(dev_dep.contains("dev_dependency = True"));
+        let dev_dep = [&dev_dep, FROM_FILE].concat();
+        let kept = version_of(&dev_dep, "");
+        assert_eq!(kept.lo.map(|lo| lo.version), Some("0.35.0".to_string()));
+        let gone = version_of(&dev_dep, DEV_FLAG);
+        assert_eq!((gone.lo, gone.hi), (None, None));
+    }
+
+    /// Bazel 7.1.x reuses the graph of a family-A lock, which names the
+    /// selected version, only under the `--registry` list the lock was
+    /// written with. A tracked rc line that sets one is not folded into
+    /// the comparison, so the lock is then no evidence at all, even when
+    /// the line names the default registry.
+    #[test]
+    fn a_tracked_registry_flag_ends_the_proof_of_a_family_a_lock() {
+        let module = [GAZELLE, "go_deps.from_file(go_mod = \"//:go.mod\")\n"].concat();
+        // The 7.1.2 lock of probe L1 with this root file's hash and a
+        // graph that selects gazelle 0.44.0.
+        let vector = "probe_vectors/lockfile/recorded-inputs/bazel-7.1.2/fresh";
+        let lock = std::fs::read(fixtures().join(vector).join("root.MODULE.bazel.lock")).unwrap();
+        let mut lock: serde_json::Value = serde_json::from_slice(&lock).unwrap();
+        let hash = super::super::super::module_lock::sha256_hex(module.as_bytes());
+        lock["moduleFileHash"] = hash.into();
+        lock["moduleDepGraph"]["gazelle@0.44.0"] = serde_json::json!({});
+        let lock = serde_json::to_string(&lock).unwrap();
+        let version = |rc: &str| {
+            let files = [
+                (MODULE_FILE, module.as_str()),
+                ("MODULE.bazel.lock", lock.as_str()),
+                (".bazelrc", rc),
+            ];
+            let root = view(if rc.is_empty() { &files[..2] } else { &files });
+            let found = recognized(&root, Some(&bazel(7, 1, 2)));
+            let verdict = go_deps_of(&found).0.ruleset_version.clone();
+            let end = |bound: Option<Bound>| bound.map(|bound| (bound.version, bound.source));
+            (end(verdict.lo), end(verdict.hi))
+        };
+        let fresh = Some(("0.44.0".to_string(), Source::FreshLock));
+        assert_eq!(version(""), (fresh.clone(), fresh.clone()));
+        // An rc line that sets no registry changes nothing.
+        assert_eq!(version("build --jobs=4\n"), (fresh.clone(), fresh));
+        let declared = Some(("0.35.0".to_string(), Source::Declared));
+        for rc in [
+            "common --registry=https://bcr.bazel.build/\n",
+            "common --registry=https://mirror.example/bcr/\n",
+            "common:ci --registry=https://mirror.example/bcr/\n",
+        ] {
+            assert_eq!(version(rc), (declared.clone(), None), "{rc}");
+        }
     }
 
     /// Probe L7 gv3 on Bazel 7.7.2: the root declares gazelle 0.36.0,
@@ -2436,7 +2859,7 @@ deps.from_file(go_mod = "//:go.mod")
             std::fs::read(path).expect(name)
         };
         let line = bazel(7, 7, 2);
-        let version = |root_file: &str| {
+        let version_under = |root_file: &str, rc: &str| {
             let mut module = gv3(root_file);
             module.extend_from_slice(GAZELLE.lines().nth(1).unwrap().as_bytes());
             module.extend_from_slice(b"\ngo_deps.from_file(go_mod = \"//:go.mod\")\n");
@@ -2445,9 +2868,14 @@ deps.from_file(go_mod = "//:go.mod")
                 .insert(MODULE_FILE.to_string(), FileText::Bytes(module));
             let lock = FileText::Bytes(gv3("7.7.2.MODULE.bazel.lock"));
             root.0.insert("MODULE.bazel.lock".to_string(), lock);
+            if !rc.is_empty() {
+                let rc = FileText::Bytes(rc.as_bytes().to_vec());
+                root.0.insert(".bazelrc".to_string(), rc);
+            }
             let found = recognized(&root, Some(&line));
             go_deps_of(&found).0.ruleset_version.clone()
         };
+        let version = |root_file: &str| version_under(root_file, "");
         let ends = |verdict: &VersionVerdict| {
             let end = |bound: &Bound| format!("{} {:?}", bound.version, bound.source);
             (verdict.lo.as_ref().map(end), verdict.hi.as_ref().map(end))
@@ -2476,6 +2904,22 @@ deps.from_file(go_mod = "//:go.mod")
         let raised = version("raise.MODULE.bazel");
         assert_eq!(ends(&raised), (Some("0.54.0 Declared".to_string()), None));
         assert_eq!(generation(&raised), Generation::Unknown);
+        // Under `--lockfile_mode=off` Bazel neither reads nor writes the
+        // lock: the file in the tree is a leftover and bounds nothing,
+        // whether every command sets the mode or one named config does.
+        // A mode that reads the lock leaves the bound.
+        let declared = Some("0.36.0 Declared".to_string());
+        for off in [
+            "common --lockfile_mode=off\n",
+            "build:ci --lockfile_mode=off\n",
+            "common --lockfile_mode=bogus\n",
+        ] {
+            let leftover = version_under("fresh.MODULE.bazel", off);
+            assert_eq!(ends(&leftover), (declared.clone(), None), "{off}");
+            assert_eq!(generation(&leftover), Generation::Unknown, "{off}");
+        }
+        let read = version_under("fresh.MODULE.bazel", "common --lockfile_mode=error\n");
+        assert_eq!(ends(&read), lifted);
     }
 
     // Probe G3's `WORKSPACE` (gazelle 0.35.0 with rules_go 0.44.0, built on
@@ -2628,6 +3072,135 @@ def go_dependencies():
             detail.position(&other, upstream),
             Position::Unknown(_)
         ));
+        assert!(matches!(
+            detail.defines(&other, "com_example_upstream"),
+            Governing::Unknown(_)
+        ));
+    }
+
+    /// What a rule says of the user's own source for a module is consent
+    /// evidence (gap-ruleset-patch-hooks 2.1): `patches` and `patch_cmds`
+    /// change the module, and `urls`, `local_path`, `remote` and `replace`
+    /// put something else in its place, as `go_deps.archive_override` does
+    /// under Bzlmod. Probe G5: the next `update-repos` reverts a `urls`
+    /// rule to the upstream `version` and `sum`.
+    #[test]
+    fn a_rule_that_names_its_own_source_is_a_user_declaration() {
+        const SOCKET: &str = "patch.socket.dev/gopatch/9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f";
+        let rules = [
+            ("plain", "version = \"v1.0.0\", sum = \"h1:x\"".to_string()),
+            ("urls", "urls = [\"https://example.com/a.zip\"]".to_string()),
+            (
+                "fork",
+                "commit = \"0123\", remote = \"https://example.com/fork\"".to_string(),
+            ),
+            ("dir", "local_path = \"../dir\"".to_string()),
+            (
+                "replaced",
+                "replace = \"example.com/fork\", version = \"v1.0.1\"".to_string(),
+            ),
+            (
+                "computed",
+                "replace = FORK, version = \"v1.0.1\"".to_string(),
+            ),
+            (
+                "patched",
+                "patches = [\"//:a.patch\"], version = \"v1.0.0\"".to_string(),
+            ),
+            (
+                "commands",
+                "patch_cmds = [\"true\"], version = \"v1.0.0\"".to_string(),
+            ),
+            (
+                "both",
+                "patches = [\"//:a.patch\"], urls = [\"https://example.com/a.zip\"]".to_string(),
+            ),
+            // The module's own repository at a commit or a tag, an empty
+            // `replace`, and the `replace` of a hosted pin, which is
+            // Socket's own.
+            ("commit", "commit = \"0123\"".to_string()),
+            ("tag", "tag = \"v1.0.0\"".to_string()),
+            (
+                "unreplaced",
+                "replace = \"\", version = \"v1.0.0\"".to_string(),
+            ),
+            (
+                "hosted",
+                format!("replace = \"{SOCKET}\", version = \"v1.0.0-socketpatch.1\""),
+            ),
+        ];
+        let mut text = "load(\"@bazel_gazelle//:deps.bzl\", \"go_repository\")\n".to_string();
+        for (name, attrs) in &rules {
+            let rule = format!(
+                "go_repository(name = \"{name}\", importpath = \"example.com/{name}\", {attrs})\n"
+            );
+            text.push_str(&rule);
+        }
+        let (_, found) = workspace(&[&text], "");
+        assert!(found.gaps.is_empty() && found.signals.is_empty());
+        let (hub, detail) = repositories_of(&found);
+        assert!(detail.unread.is_empty() && detail.rules.len() == rules.len());
+        let decls = hub.user_decls.iter();
+        let decls: Vec<_> = decls
+            .map(|decl| (decl.package.as_str(), decl.replacement))
+            .collect();
+        let want = [
+            ("example.com/urls", true),
+            ("example.com/fork", true),
+            ("example.com/dir", true),
+            ("example.com/replaced", true),
+            ("example.com/computed", true),
+            ("example.com/patched", false),
+            ("example.com/commands", false),
+            ("example.com/both", true),
+        ];
+        assert_eq!(decls, want);
+        // Each declaration is at its rule.
+        for decl in &hub.user_decls {
+            let name = decl.package.strip_prefix("example.com/").unwrap();
+            assert_eq!(decl.site, rule(detail, name).site);
+        }
+        let other: Vec<_> = detail
+            .rules
+            .iter()
+            .filter(|rule| rule.other_source)
+            .map(|rule| rule.name.as_str())
+            .collect();
+        assert_eq!(other, ["urls", "fork", "dir", "both", "commit", "tag"]);
+        assert_eq!(rule(detail, "computed").replace, Attr::Computed);
+        assert_eq!(rule(detail, "hosted").replace, Attr::Is(SOCKET.to_string()));
+        assert!(rule(detail, "patched").patches && rule(detail, "both").patches);
+    }
+
+    /// A rule Bazel never runs is not built: the function a
+    /// `repository_macro` directive names, which the `WORKSPACE` does not
+    /// call. `gazelle update-repos` would edit it all the same.
+    #[test]
+    fn a_rule_of_a_macro_that_is_never_called_is_not_built() {
+        const DIRECTIVE: &str = "\n# gazelle:repository_macro deps.bzl%go_dependencies\n";
+        let (model, found) = workspace(&[ARCHIVES, LOADS, DIRECTIVE, THEIRS], DEPS);
+        assert!(found.gaps.is_empty() && found.signals.is_empty());
+        let (_, detail) = repositories_of(&found);
+        assert!(detail.unread.is_empty() && detail.rules.len() == 5);
+        assert_eq!(rule(detail, "com_example_upstream").at, RuleAt::Macro(0, 0));
+        for name in ["com_example_upstream", "com_example_before"] {
+            let read = rule(detail, name);
+            assert_eq!(detail.position(&model, read), Position::NotBuilt, "{name}");
+            assert_eq!(detail.defines(&model, name), Governing::Undefined, "{name}");
+        }
+        // `gazelle_dependencies()` may declare this one: the rule that was
+        // read is not the one Bazel builds, and nothing says which is.
+        let crypto = detail.position(&model, rule(detail, "org_golang_x_crypto"));
+        assert!(matches!(crypto, Position::Unknown(_)), "{crypto:?}");
+        // With the call, the same rule governs.
+        let (model, found) = workspace(&[ARCHIVES, LOADS, OWN_LOAD, OWN, THEIRS], DEPS);
+        let (_, detail) = repositories_of(&found);
+        let upstream = rule(detail, "com_example_upstream");
+        assert_eq!(detail.position(&model, upstream), Position::Governing);
+        assert!(matches!(
+            detail.defines(&model, "com_example_upstream"),
+            Governing::Exact(_)
+        ));
     }
 
     /// `gazelle_dependencies()` declares `org_golang_x_crypto` through
@@ -2686,7 +3259,7 @@ def go_dependencies():
                 "name = \"dep\", importpath = \"example.com/dep\",",
             )
         };
-        let mut inexact = Vec::new();
+        let (mut inexact, mut lost_rules) = (Vec::new(), 0);
         for (case, cell_root, cell) in vectors("ws-order.json") {
             let mut root = View::default();
             for (path, file) in &cell_root.0 {
@@ -2710,66 +3283,127 @@ def go_dependencies():
                     let built = format!("dep-{}.tar.gz", cell["built"].as_str().unwrap());
                     let call = &file[rule.site.span.0..rule.site.span.1];
                     assert!(call.contains(&built), "{case}: {call}");
+                    // Every other rule of the name is one Bazel does not
+                    // build: it lost to the governing one.
+                    let lost = |rule: &&GoRepositoryRule| !governs(rule);
+                    let losers: Vec<_> = detail.rules.iter().filter(lost).collect();
+                    for loser in &losers {
+                        let position = detail.position(&model, loser);
+                        assert_eq!(position, Position::NotBuilt, "{case}");
+                    }
+                    // c12: `maybe` in a macro, then a literal in the same
+                    // chunk. The literal governs and the macro's rule lost.
+                    if case == "c12" {
+                        assert!(matches!(rule.at, RuleAt::Top(_)) && !rule.maybe);
+                        let [loser] = losers.as_slice() else {
+                            panic!("c12: {losers:?}");
+                        };
+                        assert!(matches!(loser.at, RuleAt::Macro(..)) && loser.maybe);
+                    }
+                    lost_rules += losers.len();
                 }
                 more => panic!("{case}: Bazel builds one definition, not {more:?}"),
             }
         }
         assert_eq!(inexact, ["c10", "r04"]);
+        assert_eq!(lost_rules, 13, "rules that lost to another");
+    }
+
+    const RULE: &str = "load(\"@bazel_gazelle//:deps.bzl\", \"go_repository\")\n";
+    const SEEDS: &str = "load(\"@bazel_gazelle//:deps.bzl\", \"gazelle_dependencies\")\n";
+    const MAYBE: &str = "load(\"@bazel_tools//tools/build_defs/repo:utils.bzl\", \"maybe\")\n";
+    const REPOS: &str = "load(\"//third_party:repos.bzl\", \"repos\")\n";
+
+    /// The one signal of `found`, which has no hub.
+    fn signal_of(found: &Recognized) -> &RulesetSignal {
+        assert!(found.hubs.is_empty(), "{:?}", found.hubs);
+        let [signal] = found.signals.as_slice() else {
+            panic!("not one signal: {:?}", found.signals);
+        };
+        assert_eq!(signal.ruleset, Ruleset::Gazelle);
+        assert_eq!(signal.site.system, DeclSystem::Workspace);
+        signal
     }
 
     #[test]
     fn a_workspace_that_may_hide_rules_is_a_signal_and_one_without_gazelle_is_nothing() {
-        const RULE: &str = "load(\"@bazel_gazelle//:deps.bzl\", \"go_repository\")\n";
-        const DEPS: &str = "load(\"@bazel_gazelle//:deps.bzl\", \"gazelle_dependencies\")\n";
         let read = |parts: &[&str]| workspace(parts, "def helper():\n    pass\n").1;
-        // gazelle as a BUILD file generator, a rule of another origin, and
-        // no gazelle at all.
-        for none in [
-            [DEPS, "gazelle_dependencies()\n"],
-            [
+        // No gazelle at all: a rule of the repository's own, and a function
+        // of the repository that was read. And gazelle with nothing that
+        // can declare a Go module: its load with no call, and its archive
+        // beside calls that are read in full (a `vendor/` build).
+        const TOOLCHAINS: &str = "load(\"@io_bazel_rules_go//go:deps.bzl\", \
+            \"go_register_toolchains\")\ngo_register_toolchains(version = \"1.21.13\")\n";
+        let none: [&[&str]; 4] = [
+            &[
                 "load(\"//:rules.bzl\", \"go_repository\")\n",
                 "go_repository(name = \"a\", importpath = \"example.com/a\")\n",
             ],
-            ["load(\"//:deps.bzl\", \"helper\")\n", "helper()\n"],
-        ] {
-            assert_eq!(read(&none), Recognized::default(), "{none:?}");
+            &["load(\"//:deps.bzl\", \"helper\")\n", "helper()\n"],
+            &[SEEDS],
+            &[ARCHIVES, TOOLCHAINS],
+        ];
+        for none in none {
+            assert_eq!(read(none), Recognized::default(), "{none:?}");
         }
-        // The rule is loaded and no call of it was read; gazelle is there
-        // and a function of the repository was not read; the rule is one
-        // another repository exports.
+        // No rule was read and one may hide in what was not: the rule is
+        // loaded and never called, or called in a way that is not read;
+        // gazelle is there and a function of the repository was not read,
+        // called or handed to `maybe`; the rule is one another repository
+        // exports.
         const OLD: &str = "load(\"@io_bazel_rules_go//go:def.bzl\", \"go_repository\")\n";
         const LOOP: &str = "[go_repository(name = n, importpath = p) for n, p in REPOS]\n";
         const COMPUTED: &str = "go_repository(name = P + \"a\", importpath = \"example.com/a\")\n";
-        const NESTED: &str = "load(\"//third_party:repos.bzl\", \"repos\")\nrepos()\n";
         const LITERAL: &str = "go_repository(name = \"a\", importpath = \"example.com/a\")\n";
-        let hidden = [
-            (RULE, LOOP, 0),
-            (RULE, COMPUTED, 1),
-            (DEPS, NESTED, 0),
-            (OLD, LITERAL, 0),
+        let hidden: [(&[&str], usize); 9] = [
+            (&[RULE], 0),
+            (&[RULE, LOOP], 0),
+            (&[RULE, COMPUTED], 1),
+            (&[SEEDS, REPOS, "repos()\n"], 0),
+            (&[SEEDS, MAYBE, REPOS, "maybe(repos, name = \"x\")\n"], 0),
+            (&[SEEDS, MAYBE, "maybe(RULES[0], name = \"x\")\n"], 0),
+            (&[SEEDS, MAYBE, "maybe(name = \"x\")\n"], 0),
+            (&[OLD, LITERAL], 0),
+            (&[OLD, MAYBE, "maybe(go_repository, name = \"a\")\n"], 0),
         ];
-        for (load, rest, gaps) in hidden {
-            let found = read(&[load, rest]);
-            assert!(found.hubs.is_empty(), "{rest}");
-            let [signal] = found.signals.as_slice() else {
-                panic!("{rest}: {:?}", found.signals);
-            };
-            assert_eq!(signal.ruleset, Ruleset::Gazelle);
-            assert_eq!(signal.site.file, "WORKSPACE");
+        for (parts, gaps) in hidden {
+            let found = read(parts);
+            let signal = signal_of(&found);
+            assert_eq!(signal.site.file, "WORKSPACE", "{parts:?}");
+            // At the `load` that brings gazelle in.
+            assert_eq!(signal.site.span.0, 0, "{parts:?}");
             let tokens: Vec<_> = found.gaps.iter().map(|gap| gap.token).collect();
-            assert_eq!(tokens, vec!["label_not_literal"; gaps]);
+            assert_eq!(tokens, vec!["label_not_literal"; gaps], "{parts:?}");
         }
-        // With a rule read, what was not read is kept beside it.
+        // `maybe` of a rule another repository defines is not unread:
+        // `governing` weighs it for each name.
+        let archive = [
+            SEEDS,
+            "load(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")\n",
+            MAYBE,
+            "maybe(http_archive, name = \"x\", urls = [\"https://example.com/x.zip\"])\n",
+        ];
+        assert_eq!(read(&archive), Recognized::default());
+        // With a rule read, what was not read is kept beside it: the
+        // function a call runs, and the one `maybe` is handed.
         let partly = read(&[
             RULE,
-            "load(\"@bazel_tools//tools/build_defs/repo:utils.bzl\", \"maybe\")\n",
-            "load(\"//third_party:repos.bzl\", \"repos\")\n",
+            MAYBE,
+            REPOS,
             "maybe(go_repository, name = \"a\", importpath = \"example.com/a\", commit = \"0123\")\n",
             "repos()\n",
+            "maybe(repos, name = \"x\")\n",
+            "maybe(REPOS[0], name = \"x\")\n",
         ]);
         let (hub, detail) = repositories_of(&partly);
-        assert_eq!(detail.unread, ["WORKSPACE:5: `repos` is not read"]);
+        let unread = [
+            "WORKSPACE:5: `repos` is not read",
+            "WORKSPACE:6: `repos` is not read",
+            "WORKSPACE:7: `maybe` is not read",
+        ];
+        assert_eq!(detail.unread, unread);
         assert!(hub.decl.literal && detail.rules[0].maybe && detail.rules[0].other_source);
+        assert!(hub.user_decls.is_empty() && partly.signals.is_empty());
         // An unread `repository_macro` file is where gazelle writes rules.
         let directive = read(&[
             RULE,
@@ -2781,6 +3415,205 @@ def go_dependencies():
             unread,
             &["third_party/go.bzl: the `repository_macro` function `go_repos` is not read"]
         );
+        // A macro body that calls a `def` of its own file: the name is
+        // bound, by nothing that was read.
+        const NESTED: &str = "load(\"@bazel_gazelle//:deps.bzl\", \"go_repository\")\n\n\
+            def go_dependencies():\n    go_repository(\n        name = \"com_example_a\",\n        \
+            importpath = \"example.com/a\",\n    )\n    _more()\n\n\
+            def _more():\n    pass\n";
+        let (_, found) = workspace(&[OWN_LOAD, OWN], NESTED);
+        let (_, detail) = repositories_of(&found);
+        assert_eq!(detail.unread, ["deps.bzl:8: `_more` is not read"]);
+        assert_eq!(detail.rules.len(), 1);
+    }
+
+    /// `gazelle_dependencies()` declares Go modules of its own: 37
+    /// `go_repository` rules at v0.35.0 (`deps.bzl`), `org_golang_x_sys`
+    /// among them. A `WORKSPACE` that calls it and shows no rule is not a
+    /// workspace without Go repositories: it is a hub with no rule, so
+    /// that a lane asks for each module whether Bazel may define it.
+    #[test]
+    fn a_workspace_whose_macros_may_declare_go_modules_is_a_hub_with_no_rule() {
+        const OPAQUE: &str = "load(\"@org_deps//:go.bzl\", \"go_deps\")\ngo_deps()\n";
+        const RULES_GO: &str = "load(\"@io_bazel_rules_go//go:deps.bzl\", \
+            \"go_rules_dependencies\")\ngo_rules_dependencies()\n";
+        let unknown = |found: Governing, line: usize| match found {
+            Governing::Unknown(gap) => {
+                let at = (gap.file.as_str(), gap.line, gap.why);
+                assert_eq!(at, ("WORKSPACE", line, OrderWhy::Opaque));
+            }
+            other => panic!("{other:?}"),
+        };
+        // gazelle as a BUILD file generator.
+        let (model, found) = workspace(&[SEEDS, "gazelle_dependencies()\n"], "");
+        assert!(found.signals.is_empty() && found.gaps.is_empty());
+        let (hub, detail) = repositories_of(&found);
+        assert_eq!(hub.shape, HubShape::GoRepository);
+        assert!(detail.rules.is_empty() && detail.unread.is_empty() && !detail.forced);
+        assert!(hub.decl.literal && hub.locks.is_empty() && hub.user_decls.is_empty());
+        // The hub stands at the `load` that brings gazelle in.
+        let load = Site {
+            file: "WORKSPACE".to_string(),
+            span: (0, SEEDS.len() - 1),
+            system: DeclSystem::Workspace,
+        };
+        assert_eq!(hub.decl.site, load);
+        assert_eq!(detail.load_repos, ["bazel_gazelle"]);
+        // The macro may declare `org_golang_x_sys`, and cannot declare a
+        // module its seed list does not hold.
+        unknown(detail.defines(&model, "org_golang_x_sys"), 2);
+        assert_eq!(
+            detail.defines(&model, "com_example_m"),
+            Governing::Undefined
+        );
+        assert_eq!(detail.rules_for("golang.org/x/sys").count(), 0);
+        // A function of another repository that nobody vouches for may
+        // declare any module.
+        let (model, found) = workspace(&[SEEDS, "gazelle_dependencies()\n", OPAQUE], "");
+        assert!(found.signals.is_empty());
+        let (_, detail) = repositories_of(&found);
+        assert!(detail.rules.is_empty() && detail.unread.is_empty());
+        unknown(detail.defines(&model, "com_example_m"), 4);
+        // gazelle by its archive alone, and the hub stands there:
+        // `go_rules_dependencies()` has a seed list of its own, and an
+        // opaque call needs no seed list.
+        let at = ARCHIVES.find("http_archive(\n    name = \"bazel_gazelle\"");
+        for (rest, name, may_declare) in [
+            (RULES_GO, "org_golang_x_sys", true),
+            (RULES_GO, "org_golang_x_crypto", false),
+            (OPAQUE, "com_example_m", true),
+        ] {
+            let (model, found) = workspace(&[ARCHIVES, rest], "");
+            assert!(found.signals.is_empty(), "{rest}");
+            let (hub, detail) = repositories_of(&found);
+            assert!(detail.rules.is_empty() && detail.load_repos.is_empty());
+            assert_eq!(Some(hub.decl.site.span.0), at, "{rest}");
+            match detail.defines(&model, name) {
+                Governing::Unknown(_) => assert!(may_declare, "{name}"),
+                Governing::Undefined => assert!(!may_declare, "{name}"),
+                exact => panic!("{name}: {exact:?}"),
+            }
+        }
+        // The archive itself is a rule that was read: `bazel_gazelle` is
+        // defined exactly, by something that is no `go_repository`.
+        let (model, found) = workspace(&[ARCHIVES, RULES_GO], "");
+        let (_, detail) = repositories_of(&found);
+        assert!(matches!(
+            detail.defines(&model, "bazel_gazelle"),
+            Governing::Exact(_)
+        ));
+    }
+
+    /// The `load` of gazelle's rule can be in a file the model does not
+    /// read: a macro file two levels down, or one that is missing. The
+    /// `bazel_gazelle` archive still says the ruleset is there (design
+    /// 2.7), and what was not read may then hold its rules.
+    #[test]
+    fn gazelle_is_there_by_its_archive_when_no_load_of_it_was_read() {
+        const TOP: &str = "load(\"//third_party:deps.bzl\", \"deps\")\n\ndeps()\n";
+        const FIRST: &str = "load(\"//third_party/go:repos.bzl\", \"go_repos\")\n\n\
+            def deps():\n    go_repos()\n";
+        const SECOND: &str = "load(\"@bazel_gazelle//:deps.bzl\", \"go_repository\")\n\n\
+            def go_repos():\n    go_repository(\n        name = \"com_example_m\",\n        \
+            importpath = \"example.com/m\",\n        version = \"v1.0.0\",\n    )\n";
+        let read = |files: &[(&str, &str)]| {
+            let root = view(files);
+            let model = WorkspaceModel::read(&root, "WORKSPACE").expect("a WORKSPACE");
+            (model, recognized(&root, None))
+        };
+        let archive = ARCHIVES.find("http_archive(\n    name = \"bazel_gazelle\"");
+        let top = [ARCHIVES, TOP].concat();
+        // Two levels: the rule and its `load` are in the second file.
+        let levels = [
+            ("WORKSPACE", top.as_str()),
+            ("third_party/deps.bzl", FIRST),
+            ("third_party/go/repos.bzl", SECOND),
+        ];
+        let (model, found) = read(&levels);
+        let files: Vec<_> = model.files.iter().map(|file| file.path.as_str()).collect();
+        assert_eq!(files, ["WORKSPACE", "third_party/deps.bzl"]);
+        let signal = signal_of(&found);
+        assert_eq!(
+            (signal.site.file.as_str(), Some(signal.site.span.0)),
+            ("WORKSPACE", archive)
+        );
+        assert!(found.gaps.is_empty());
+        // The first-level macro file is missing.
+        let (model, found) = read(&levels[..1]);
+        assert_eq!((model.files.len(), model.gaps.len()), (1, 1));
+        assert_eq!(Some(signal_of(&found).site.span.0), archive);
+        // The same two layouts with no archive and no load: nothing says
+        // gazelle is there.
+        for files in [&levels[..], &levels[..1]] {
+            let mut files = files.to_vec();
+            files[0].1 = TOP;
+            assert_eq!(read(&files).1, Recognized::default());
+        }
+        // With a `load` of gazelle in the file as well, the signal stands
+        // at the load.
+        let loaded = [ARCHIVES, SEEDS, TOP].concat();
+        let (_, found) = read(&[("WORKSPACE", &loaded)]);
+        assert_eq!(signal_of(&found).site.span.0, ARCHIVES.len());
+
+        // What counts as gazelle's archive, each beside a function that
+        // was not read.
+        const HTTP: &str = "load(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \
+            \"http_archive\", \"http_file\")\n";
+        const GIT: &str = "load(\"@bazel_tools//tools/build_defs/repo:git.bzl\", \
+            \"git_repository\")\n";
+        const RELEASE: &str = "https://github.com/bazelbuild/bazel-gazelle/releases/download/\
+            v0.35.0/bazel-gazelle-v0.35.0.tar.gz";
+        let url = format!("URL = \"{RELEASE}\"\n");
+        let forms = [
+            "http_archive(name = \"bazel_gazelle\", sha256 = \"00\")\n".to_string(),
+            "maybe(http_archive, name = \"bazel_gazelle\", sha256 = \"00\")\n".to_string(),
+            "local_repository(name = \"bazel_gazelle\", path = \"third_party/gazelle\")\n"
+                .to_string(),
+            format!(
+                "http_archive(name = \"gz\", urls = [\"https://mirror.example/gz.tgz\", \
+                 \"{RELEASE}\"])\n"
+            ),
+            format!("maybe(http_archive, name = \"gz\", url = \"{RELEASE}\")\n"),
+            format!("{url}http_archive(name = \"gz\", urls = [URL])\n"),
+            "git_repository(name = \"gz\", commit = \"0123\", \
+             remote = \"https://github.com/bazel-contrib/bazel-gazelle.git\")\n"
+                .to_string(),
+        ];
+        for form in &forms {
+            let text = [HTTP, GIT, MAYBE, REPOS, form, "repos()\n"].concat();
+            let (_, found) = read(&[("WORKSPACE", &text)]);
+            let signal = signal_of(&found);
+            let call = &text[signal.site.span.0..signal.site.span.1];
+            assert!(form.ends_with(&format!("{call}\n")), "{form}: {call}");
+        }
+        // In the body of a macro that was read.
+        let fetch = [
+            HTTP,
+            "load(\"//:more.bzl\", \"more\")\n\ndef fetch():\n    \
+             http_archive(name = \"bazel_gazelle\", sha256 = \"00\")\n    more()\n",
+        ]
+        .concat();
+        let files = [
+            (
+                "WORKSPACE",
+                "load(\"//:fetch.bzl\", \"fetch\")\n\nfetch()\n",
+            ),
+            ("fetch.bzl", fetch.as_str()),
+        ];
+        let (_, found) = read(&files);
+        assert_eq!(signal_of(&found).site.file, "fetch.bzl");
+        // Not gazelle's archive: another ruleset's, a file that only has
+        // the project's name in its URL, and a name that is computed.
+        let rules_go = "https://github.com/bazelbuild/rules_go/releases/download/v0.44.0/x.zip";
+        for other in [
+            format!("http_archive(name = \"io_bazel_rules_go\", urls = [\"{rules_go}\"])\n"),
+            format!("http_file(name = \"gazelle_binary\", urls = [\"{RELEASE}\"])\n"),
+            "http_archive(name = NAME, urls = URLS)\n".to_string(),
+        ] {
+            let text = [HTTP, GIT, MAYBE, REPOS, &other, "repos()\n"].concat();
+            let (_, found) = read(&[("WORKSPACE", &text)]);
+            assert_eq!(found, Recognized::default(), "{other}");
+        }
     }
 
     /// `go.mod`, `MODULE.bazel`, `WORKSPACE` and its macro files belong to
@@ -2835,6 +3668,7 @@ use_repo(go_deps, "a")
                 for rule in &detail.rules {
                     let _ = detail.position(&model, rule);
                 }
+                let _ = detail.defines(&model, "org_golang_x_sys");
             }
         }
         assert!(hubs > 800, "the mutations left {hubs} hubs to exercise");
