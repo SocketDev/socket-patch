@@ -253,15 +253,18 @@ pub struct BazelWorkspace {
 /// The vendor directories committed at a root: evidence that some command
 /// line passes `--vendor_dir` even where no tracked rc file does (design
 /// 2.6). Bazel then builds from the directory, and a pin in a lock is a
-/// silent no-op. Only a reader of the disk can fill this in
-/// (`crawlers::bazel_workspace`); the pure reader leaves it empty.
+/// silent no-op. `detect` fills this in through the [`FileView`], from the
+/// listing of the root and the marker files below it, so a model read from
+/// memory answers too. The disk reader (`crawlers::bazel_workspace`) adds
+/// what only a disk shows: a link to a vendor directory, and a marker test
+/// that went unanswered.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CommittedVendorDirs {
     /// First-level directories of the root that `bazel vendor` wrote,
     /// relative to the root, sorted.
     pub dirs: Vec<String>,
-    /// The root could not be listed to its end: an empty `dirs` does not
-    /// say that there is none.
+    /// The root could not be listed to its end, or a marker could not be
+    /// looked for: an empty `dirs` does not say that there is none.
     pub cannot_tell: bool,
 }
 
@@ -495,11 +498,26 @@ pub struct LockRef {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Liveness {
     Live,
-    Shadowed { by: Site },
-    Dead { why: String },
+    Shadowed {
+        by: Site,
+    },
+    /// Bazel never evaluates it, under any dependency system the
+    /// workspace may run.
+    Dead {
+        why: String,
+    },
     NotImported,
     NotRootModule,
     DevDependencyDropped,
+    /// No single answer: Bazel evaluates it under one dependency system
+    /// the workspace may run and not under another, or what decides it
+    /// was not read. It is never taken for live, and it is not dead
+    /// either: Bazel may build from it. `govern::governance` says which
+    /// refusal applies (`Ambiguous` or `Undetermined`), so this is never
+    /// the reason of a `Governance::Inactive`.
+    Undecided {
+        why: String,
+    },
 }
 
 /// A flag or declaration that makes Bazel take the hub, a spoke or the

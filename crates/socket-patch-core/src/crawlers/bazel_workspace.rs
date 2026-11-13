@@ -186,19 +186,32 @@ impl FileView for DiskView {
 }
 
 /// Reads the Bazel root behind `view` into its model: the pure reader over
-/// the view, and the vendor directories committed at the root, which only
-/// the disk shows (a `VENDOR.bazel` below a first-level directory, a link
-/// to one included; `bazel_output` owns that test).
+/// the view, and what only the disk shows of the vendor directories
+/// committed at the root (`bazel_output` owns that test).
+///
+/// The pure reader lists the vendor directories the view shows by their
+/// marker files. The disk test adds a link to a vendor directory, which a
+/// view will not follow out of the read boundary, and it is the one that
+/// says whether every marker was looked for: a `bazel-bin` link out of
+/// the boundary is a question the view cannot answer and the disk can. So
+/// the directories of both count, and "cannot tell" is the disk's.
 ///
 /// `Err` when the root holds no boundary file that can be read. The view
 /// outlives the call on purpose: the gates of the same root read lock
-/// files through it later and find what is already in memory.
+/// files through it later and find what is already in memory. That is
+/// also what makes a model per project cheap (`govern::governance` answers
+/// for the project a model was read for): each further read of the same
+/// root through the same view opens no file twice.
 pub fn read_workspace(root: &RootRef, view: &DiskView) -> Result<BazelWorkspace, Gap> {
     let mut workspace = crate::bazel::detect(root, view)?;
     let found = vendor_dirs_at(view.root());
     let name = |dir: &PathBuf| Some(dir.file_name()?.to_string_lossy().into_owned());
+    let mut dirs = std::mem::take(&mut workspace.vendor_dirs.dirs);
+    dirs.extend(found.dirs.iter().filter_map(name));
+    dirs.sort();
+    dirs.dedup();
     workspace.vendor_dirs = CommittedVendorDirs {
-        dirs: found.dirs.iter().filter_map(name).collect(),
+        dirs,
         cannot_tell: found.cannot_tell,
     };
     Ok(workspace)
@@ -208,7 +221,8 @@ pub fn read_workspace(root: &RootRef, view: &DiskView) -> Result<BazelWorkspace,
 mod tests {
     use super::*;
     use crate::bazel::govern;
-    use crate::bazel::model::FlagState;
+    use crate::bazel::model::{BoundaryFiles, Completeness, FlagState, Governance, HubId};
+    use crate::crawlers::types::Ecosystem;
 
     /// A root at `<tmp>/repo/ws` whose read boundary is `<tmp>/repo`.
     fn staged(files: &[(&str, &str)]) -> (tempfile::TempDir, RootRef) {
@@ -357,5 +371,124 @@ mod tests {
         let (_tmp, root) = staged(&[("repo/ws/README.md", "")]);
         let gap = read_workspace(&root, &DiskView::new(&root)).expect_err("no root");
         assert_eq!(gap.token, govern::WORKSPACE_UNREADABLE);
+    }
+
+    /// What the disk adds to the directories the view shows, and what it
+    /// answers that the view cannot: the convenience links of a built
+    /// workspace lead out of the read boundary, where a view reads
+    /// nothing, and they must not make every built workspace one whose
+    /// vendor directories nobody could look for.
+    #[cfg(unix)]
+    #[test]
+    fn links_at_the_root_are_judged_by_the_disk() {
+        let module = ("repo/ws/MODULE.bazel", "module(name = \"m\")\n");
+        let pin = ("repo/ws/.bazelversion", "9.3.2\n");
+        let (tmp, root) = staged(&[module, pin, ("outside/out/bin/x", "")]);
+        let ws_dir = tmp.path().join("repo/ws");
+        let link = |target: &str, name: &str| {
+            std::os::unix::fs::symlink(tmp.path().join(target), ws_dir.join(name)).unwrap();
+        };
+        link("outside/out/bin", "bazel-bin");
+        link("outside/out", "bazel-out");
+        let view = DiskView::new(&root);
+        // The view cannot say what is behind the link.
+        assert_eq!(view.read("bazel-bin/VENDOR.bazel"), FileText::Unreadable);
+        let ws = read_workspace(&root, &view).expect("a workspace");
+        assert_eq!(ws.vendor_dirs, CommittedVendorDirs::default());
+        assert_eq!(govern::vendor_dir(&ws), FlagState::NotSeen);
+
+        // A link to a vendor directory is one, inside the boundary or out
+        // of it, and a plain directory with the marker is found by both.
+        let (tmp, root) = staged(&[
+            module,
+            pin,
+            ("repo/vendored/VENDOR.bazel", ""),
+            ("outside/vendored/VENDOR.bazel", ""),
+            ("repo/ws/third_party/.vendorignore", ""),
+        ]);
+        let ws_dir = tmp.path().join("repo/ws");
+        let link = |target: &str, name: &str| {
+            std::os::unix::fs::symlink(tmp.path().join(target), ws_dir.join(name)).unwrap();
+        };
+        link("repo/vendored", "deps");
+        link("outside/vendored", "ext");
+        let ws = read_workspace(&root, &DiskView::new(&root)).expect("a workspace");
+        assert_eq!(ws.vendor_dirs.dirs, ["deps", "ext", "third_party"]);
+        assert!(!ws.vendor_dirs.cannot_tell);
+        assert!(matches!(govern::vendor_dir(&ws), FlagState::Possible(_)));
+    }
+
+    const JS_MODULE: &str = "bazel_dep(name = \"aspect_rules_js\", version = \"3.6.0\")\n\
+        npm = use_extension(\"@aspect_rules_js//npm:extensions.bzl\", \"npm\")\n\
+        npm.npm_translate_lock(name = \"npm\", pnpm_lock = \"//:pnpm-lock.yaml\")\n\
+        use_repo(npm, \"npm\")\n";
+
+    /// A directory named like a file of the `WORKSPACE` family is no
+    /// boundary file, however the disk folds its name: real Bazel 9.3.2
+    /// builds beside `WORKSPACE/` and `workspace/`, and nothing there may
+    /// refuse every ecosystem of the workspace.
+    #[test]
+    fn a_directory_named_like_a_workspace_file_holds_nothing_up() {
+        let lock = ("repo/ws/pnpm-lock.yaml", "lockfileVersion: '9.0'\n");
+        let module = ("repo/ws/MODULE.bazel", JS_MODULE);
+        let governed = Governance::Governed(vec![HubId(0)]);
+        let only_module = BoundaryFiles {
+            module_bazel: true,
+            ..BoundaryFiles::default()
+        };
+        for dir in [
+            "docs",
+            "WORKSPACE",
+            "workspace",
+            "workspace.bzlmod",
+            "Workspace.Bazel",
+        ] {
+            let inside = format!("repo/ws/{dir}/README.md");
+            let pin = ("repo/ws/.bazelversion", "9.3.2\n");
+            let (_tmp, root) = staged(&[module, pin, lock, (inside.as_str(), "")]);
+            let ws = read_workspace(&root, &DiskView::new(&root)).expect("a workspace");
+            assert_eq!(ws.boundary, only_module, "`{dir}/`");
+            assert_eq!(ws.workspace_files, [], "`{dir}/`");
+            assert_eq!(ws.completeness, Completeness::Exact, "`{dir}/`");
+            assert_eq!(
+                govern::governance(&ws, Ecosystem::Npm, ""),
+                governed,
+                "`{dir}/`"
+            );
+            assert_eq!(
+                govern::governance(&ws, Ecosystem::Pypi, ""),
+                Governance::NotGoverned,
+                "`{dir}/`"
+            );
+        }
+        // Where Bazel reads the `WORKSPACE` family and nothing outranks
+        // the path, it opens the directory and stops (7.7.2): that one
+        // case stays undetermined. `workspace/` is that path only on a
+        // disk that folds case.
+        for dir in ["WORKSPACE", "workspace"] {
+            let inside = format!("repo/ws/{dir}/README.md");
+            let pin = ("repo/ws/.bazelversion", "7.7.2\n");
+            let (_tmp, root) = staged(&[module, pin, lock, (inside.as_str(), "")]);
+            let opened = root.root.join("WORKSPACE").is_dir();
+            let ws = read_workspace(&root, &DiskView::new(&root)).expect("a workspace");
+            assert_eq!(ws.boundary, only_module, "`{dir}/`");
+            let found = govern::governance(&ws, Ecosystem::Npm, "");
+            match opened {
+                true => {
+                    let Governance::Undetermined(gaps) = &found else {
+                        panic!("`{dir}/`: {found:?}");
+                    };
+                    assert_eq!(gaps[0].token, govern::WORKSPACE_UNREADABLE);
+                    assert!(gaps[0].detail.contains("is a directory"), "{:?}", gaps[0]);
+                }
+                false => assert_eq!(found, governed, "`{dir}/`"),
+            }
+            assert_eq!(opened, dir == "WORKSPACE" || folds_case(&root.root));
+        }
+    }
+
+    /// Whether the disk under `dir` takes two spellings of a name for one.
+    fn folds_case(dir: &Path) -> bool {
+        dir.join("module.bazel").is_file() && dir.join("MODULE.bazel").is_file()
     }
 }

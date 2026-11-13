@@ -21,12 +21,13 @@
 //! `Undetermined` or `Ambiguous`, which refuse a write, and never as
 //! `NotGoverned`, which would let a native writer edit a lock Bazel reads.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use super::label::Repo;
 use super::model::{
-    BazelWorkspace, DeclSystem, FileView, FlagState, Gap, Governance, Hub, HubId, Liveness,
-    LockRef, LockRole, ModuleLock, Probe, Ruleset, RulesetDetail, RulesetSignal, Site,
+    BazelWorkspace, BoundaryFiles, DeclSystem, EffectiveFlags, FileView, FlagState, Gap,
+    Governance, Hub, HubId, Liveness, LockRef, LockRole, ModuleLock, Probe, Ruleset, RulesetDetail,
+    RulesetSignal, Site,
 };
 use super::module_file::{
     GapScope, GapWhy, ModuleGap, ModuleModel, NameSource, Tag, Visibility, MODULE_FILE,
@@ -39,7 +40,7 @@ use super::rulesets::rules_python::{module_version, HubImport};
 use super::rulesets::{rules_csharp, rules_jvm_external, RecognizeInput};
 use super::starlark::{Lookup, ValueKind};
 use super::version::{dep_system, BazelLine, BazelVersion, DepSystem};
-use super::workspace_file::{Callee, Governing, WorkspaceModel};
+use super::workspace_file::{Callee, Governing, WorkspaceModel, WsStmtKind};
 use crate::crawlers::types::Ecosystem;
 use crate::formats::registry;
 
@@ -53,7 +54,9 @@ pub const TOKENS: &[&str] = &[
 ];
 
 /// No Bazel version is pinned and the hub is declared only in `WORKSPACE`
-/// files. The remedy is to commit `.bazelversion`.
+/// files. The remedy is to commit `.bazelversion`. Also the answer to a
+/// caller that asks a model about a project it was not read for: the line
+/// of that project is one nobody read ([`governance`]).
 pub const BAZEL_LINE_UNKNOWN: &str = TOKENS[0];
 /// A Bazel file that can declare a hub cannot be read or parsed, or Bazel
 /// itself stops on the tracked rc flags.
@@ -79,8 +82,14 @@ const NUGET_LOCK: &str = "packages.lock.json";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DeclRef<'a> {
     pub system: DeclSystem,
-    /// The file it stands in, relative to the Bazel root.
+    /// The file it stands in, relative to the Bazel root. For a hub that
+    /// is every rule of one `WORKSPACE` file and its macros
+    /// (`go_repository`), that `WORKSPACE` file.
     pub file: &'a str,
+    /// The bytes of `file` the statement takes. A macro file is read for
+    /// every `WORKSPACE`-family file that loads it, and only the span says
+    /// which of them calls the function the statement stands in.
+    pub span: (usize, usize),
     /// The repository name main-repository labels use for it. `None` for
     /// a declaration with no repository of its own (`go_deps`, the
     /// `go_repository` rules of a file), which no name shadows as a whole.
@@ -119,19 +128,28 @@ fn unknown(token: &'static str, file: &str, detail: String) -> Gap {
 
 /// The dependency systems Bazel may run the workspace under.
 fn worlds(ws: &BazelWorkspace) -> Result<Vec<DepSystem>, Gap> {
-    let system = match ws.line.is_unknown() {
+    worlds_of(&ws.line, &ws.flags, &ws.system)
+}
+
+/// [`worlds`] from the parts `detect` holds before there is a model.
+pub(super) fn worlds_of(
+    line: &BazelLine,
+    flags: &EffectiveFlags,
+    system: &DepSystem,
+) -> Result<Vec<DepSystem>, Gap> {
+    let system = match line.is_unknown() {
         true => {
             let assumed = BazelLine {
                 lo: Some(UNPINNED_FLOOR),
                 hi: None,
                 evidence: Vec::new(),
             };
-            dep_system(&assumed, &ws.flags)
+            dep_system(&assumed, flags)
         }
-        false => ws.system.clone(),
+        false => system.clone(),
     };
     let undecided = |why: String| {
-        let unread = ws.flags.gaps().into_iter().find(|gap| gap.hard);
+        let unread = flags.gaps().into_iter().find(|gap| gap.hard);
         let (token, file) = match unread {
             Some(gap) => (RC_IMPORT_UNREADABLE, gap.file.as_str()),
             None => (WORKSPACE_UNREADABLE, ""),
@@ -166,6 +184,55 @@ fn name_site(module: &ModuleModel, source: NameSource) -> Site {
         },
         |at| module.site(at),
     )
+}
+
+/// The `WORKSPACE`-family file `model` was read from. A file that could
+/// not be read has no statements, and still has its name.
+fn root_file(model: &WorkspaceModel) -> Option<&str> {
+    let unread = model.unreadable.as_ref().map(|gap| gap.file.as_str());
+    let read = model.files.first().map(|file| file.path.as_str());
+    read.or(unread)
+}
+
+/// The `WORKSPACE`-family files that make the declaration `decl`: the file
+/// a top-level statement stands in, and for a statement of a macro body
+/// each file with a top-level call of that macro. Which model read the
+/// file says nothing: a macro file is in the model of every file that
+/// loads it, whichever of its functions that file calls, so `WORKSPACE`
+/// may run one function of `deps.bzl` and `WORKSPACE.bzlmod` another,
+/// while Bazel evaluates one of the two files.
+///
+/// A statement of a macro file in no function that a file calls (the
+/// `load` of the ruleset there) runs with every file that loads the macro
+/// file. Empty for a file no model holds (`Cargo.toml`): nothing here says
+/// which system reads it.
+fn homes<'a>(ws: &'a BazelWorkspace, decl: &DeclRef<'_>) -> Vec<&'a str> {
+    let inside = |outer: (usize, usize)| outer.0 <= decl.span.0 && decl.span.1 <= outer.1;
+    let makes = |model: &&WorkspaceModel| {
+        if root_file(model) == Some(decl.file) {
+            return true;
+        }
+        let called: BTreeSet<usize> = model
+            .stmts
+            .iter()
+            .filter_map(|stmt| match &stmt.kind {
+                WsStmtKind::Call(call) => call.macro_def,
+                _ => None,
+            })
+            .collect();
+        model.macros.iter().enumerate().any(|(index, made)| {
+            let file = model.files.get(made.file);
+            let here = file.is_some_and(|file| file.path == decl.file);
+            here && inside(made.span) && called.contains(&index)
+        })
+    };
+    let holds = |model: &&WorkspaceModel| model.files.iter().any(|f| f.path == decl.file);
+    let models = ws.workspace_files.iter();
+    let made: Vec<&str> = models.clone().filter(makes).filter_map(root_file).collect();
+    match made.is_empty() {
+        false => made,
+        true => models.filter(holds).filter_map(root_file).collect(),
+    }
 }
 
 /// `decl` under one dependency system.
@@ -203,17 +270,20 @@ fn standing_in(ws: &BazelWorkspace, decl: &DeclRef<'_>, world: &DepSystem) -> St
             dead("this Bazel configuration evaluates no WORKSPACE file".to_string())
         }
         DeclSystem::Workspace => {
-            // The files of the family whose statements, or whose macros,
-            // hold the declaration. Bazel evaluates one file of the family.
-            let holds = |model: &&WorkspaceModel| model.files.iter().any(|f| f.path == decl.file);
-            let homes = ws.workspace_files.iter().filter(holds);
-            let homes: Vec<&str> = homes
-                .filter_map(|model| Some(model.files.first()?.path.as_str()))
-                .collect();
+            // Bazel evaluates one file of the family: a declaration that
+            // file does not make is not made.
+            let homes = homes(ws, decl);
             match world.workspace_file(&ws.boundary) {
                 None => return dead("the root has no WORKSPACE file Bazel evaluates".to_string()),
                 Some(read) if !homes.is_empty() && !homes.contains(&read) => {
-                    return dead(format!("Bazel evaluates {read} and never {}", homes[0]));
+                    let through = match homes[0] == decl.file {
+                        true => String::new(),
+                        false => format!(", the file that runs this macro of {}", decl.file),
+                    };
+                    return dead(format!(
+                        "Bazel evaluates {read} and never {}{through}",
+                        homes[0]
+                    ));
                 }
                 Some(_) => {}
             }
@@ -378,15 +448,29 @@ fn facts(hub: &Hub, module: Option<&ModuleModel>) -> Facts {
 
 fn decl_of<'a>(hub: &'a Hub, facts: &Facts) -> DeclRef<'a> {
     let name = Some(hub.decl.apparent_name.as_str()).filter(|name| !name.is_empty());
+    // The `go_repository` hub is every rule of one `WORKSPACE` file and
+    // of its macros, and its site is only the first of them, or the
+    // `load` of gazelle where there is none: its recognizer names the file.
+    let (file, span) = match &hub.detail {
+        RulesetDetail::Gazelle(GazelleDetail::GoRepositories(rules)) => (&rules.file, (0, 0)),
+        _ => (&hub.decl.site.file, hub.decl.site.span),
+    };
     DeclRef {
         system: hub.decl.site.system,
-        file: &hub.decl.site.file,
+        file,
+        span,
         name: name.filter(|_| !matches!(hub.detail, RulesetDetail::Gazelle(_))),
         imported: facts.imported,
         dev: facts.dev,
         non_root: facts.non_root,
         build_rule: facts.build_rule,
     }
+}
+
+/// What Bazel does with the declaration of `hub`: [`liveness`] of it.
+pub fn standing(ws: &BazelWorkspace, hub: &Hub) -> Standing {
+    let facts = facts(hub, ws.module.as_ref());
+    liveness(ws, &decl_of(hub, &facts))
 }
 
 /// The version of the ruleset archive `repo` that a `WORKSPACE` file
@@ -483,8 +567,19 @@ fn version_of(
     let [repo] = &facts.ruleset_repos[..] else {
         return None;
     };
-    let holds = |model: &&WorkspaceModel| model.files.iter().any(|f| f.path == hub.decl.site.file);
-    let literal = literal_version(ws.workspace_files.iter().find(holds)?, repo);
+    let holds = |model: &WorkspaceModel| model.files.iter().any(|f| f.path == hub.decl.site.file);
+    if !ws.workspace_files.iter().any(holds) {
+        return None;
+    }
+    // The ruleset's archive is the one of the file Bazel evaluates under
+    // each system. A macro file is read for every file that loads it, so
+    // the first model that holds the hub's file may be one Bazel never
+    // evaluates, with another release of the ruleset.
+    let literal = |world: &DepSystem| {
+        let read = world.workspace_file(&ws.boundary)?;
+        let evaluated = |model: &&WorkspaceModel| root_file(model) == Some(read);
+        literal_version(ws.workspace_files.iter().find(evaluated)?, repo)
+    };
     let module = ws.module.as_ref();
     // In a workspace that reads both file families, a name the root
     // module can see is the Bzlmod module also for the WORKSPACE file's
@@ -507,15 +602,16 @@ fn version_of(
             DepSystem::Hybrid => HubSystem::Hybrid,
             _ => HubSystem::Bzlmod,
         };
-        ruleset_version::workspace_hub(literal.as_deref(), system, visible, &bzlmod)
+        ruleset_version::workspace_hub(literal(world).as_deref(), system, visible, &bzlmod)
     };
     worlds.iter().map(under).reduce(|a, b| a.union(&b))
 }
 
 /// Decides what the recognizers leave open on every hub: its liveness and,
 /// where the recognizer did not resolve it, its ruleset version. A hub
-/// that is not live under every dependency system the workspace may run
-/// stays dead: [`governance`] says which of the three refusals applies.
+/// with no one answer under the dependency systems the workspace may run
+/// is [`Liveness::Undecided`], never dead: Bazel may build from it, and
+/// [`governance`] says which refusal applies.
 pub fn settle(ws: &mut BazelWorkspace, files: &dyn FileView) {
     let decided: Vec<(Liveness, Option<VersionVerdict>)> = {
         let ws = &*ws;
@@ -533,8 +629,8 @@ pub fn settle(ws: &mut BazelWorkspace, files: &dyn FileView) {
             let facts = facts(hub, ws.module.as_ref());
             let liveness = match liveness(ws, &decl_of(hub, &facts)) {
                 Standing::Is(liveness) => liveness,
-                Standing::Contested(why) => Liveness::Dead { why },
-                Standing::Unknown(gap) => Liveness::Dead { why: gap.detail },
+                Standing::Contested(why) => Liveness::Undecided { why },
+                Standing::Unknown(gap) => Liveness::Undecided { why: gap.detail },
             };
             (liveness, version_of(ws, &input, hub, &facts, &worlds))
         };
@@ -546,35 +642,138 @@ pub fn settle(ws: &mut BazelWorkspace, files: &dyn FileView) {
     }
 }
 
-/// What leaves every ecosystem undetermined: a part of `MODULE.bazel`, a
-/// `WORKSPACE` file or a main-repository macro file it loads that could
-/// declare any hub and was not read. A call of another repository's
-/// function is no such gap: the recognizers answer for those, each for
-/// its own ruleset.
+/// The parts of `MODULE.bazel` that could declare any hub and were not
+/// read. A model at a root where `MODULE.bazel` is no boundary file is
+/// the one `detect` keeps of a directory of that name, where Bazel reads
+/// the module file and stops.
+fn module_gaps(module: Option<&ModuleModel>, boundary: &BoundaryFiles) -> Vec<Gap> {
+    let mut gaps = Vec::new();
+    let Some(module) = module else {
+        return gaps;
+    };
+    if !boundary.module_bazel {
+        let detail = format!(
+            "{MODULE_FILE} is a directory, and Bazel reads that path as the module file and \
+             stops; rename the directory"
+        );
+        return vec![unknown(WORKSPACE_UNREADABLE, MODULE_FILE, detail)];
+    }
+    let whole = |gap: &&ModuleGap| gap.scope == GapScope::Everything;
+    for gap in module.gaps.iter().filter(whole) {
+        let computed = matches!(
+            gap.why,
+            GapWhy::Unmodelled { .. } | GapWhy::Argument { .. } | GapWhy::IncludeShape
+        );
+        let token = match computed {
+            true => LABEL_NOT_LITERAL,
+            false => WORKSPACE_UNREADABLE,
+        };
+        let file = module.site(gap.at).file;
+        gaps.push(unknown(token, &file, module.describe(gap)));
+    }
+    gaps
+}
+
+/// The one model `detect` keeps of a `WORKSPACE`-family name that is no
+/// boundary file: a directory called `WORKSPACE`, where Bazel opens that
+/// path and stops.
+fn is_directory(model: &WorkspaceModel, boundary: &BoundaryFiles) -> bool {
+    !boundary.workspace && model.files.is_empty() && root_file(model) == Some("WORKSPACE")
+}
+
+/// What of one `WORKSPACE`-family file was not read: the file itself, or
+/// a main-repository macro file it loads.
+fn workspace_gaps<'a>(
+    model: &'a WorkspaceModel,
+    boundary: &BoundaryFiles,
+) -> impl Iterator<Item = Gap> + 'a {
+    let directory = is_directory(model, boundary);
+    let unread = model.unreadable.iter().chain(&model.gaps);
+    unread.map(move |unread| {
+        let file = &unread.file;
+        let detail = match directory {
+            true => format!(
+                "{file} is a directory, and Bazel opens that path as its WORKSPACE file and \
+                 stops; rename the directory, or add an empty WORKSPACE.bazel beside it"
+            ),
+            false => format!("{file}:{}: {}", unread.line, unread.why.describe()),
+        };
+        unknown(WORKSPACE_UNREADABLE, file, detail)
+    })
+}
+
+/// Everything of the model that could declare any hub and was not read: a
+/// part of `MODULE.bazel`, a `WORKSPACE` file or a main-repository macro
+/// file it loads. A call of another repository's function is no such gap:
+/// the recognizers answer for those, each for its own ruleset.
+///
+/// This is the run's warning, whichever file Bazel evaluates.
+/// [`governance`] holds an ecosystem up only for the gaps of a file Bazel
+/// may evaluate.
 pub(super) fn model_gaps(
     module: Option<&ModuleModel>,
     workspace_files: &[WorkspaceModel],
+    boundary: &BoundaryFiles,
 ) -> Vec<Gap> {
-    let mut gaps = Vec::new();
-    if let Some(module) = module {
-        let whole = |gap: &&ModuleGap| gap.scope == GapScope::Everything;
-        for gap in module.gaps.iter().filter(whole) {
-            let computed = matches!(
-                gap.why,
-                GapWhy::Unmodelled { .. } | GapWhy::Argument { .. } | GapWhy::IncludeShape
-            );
-            let token = match computed {
-                true => LABEL_NOT_LITERAL,
-                false => WORKSPACE_UNREADABLE,
-            };
-            let file = module.site(gap.at).file;
-            gaps.push(unknown(token, &file, module.describe(gap)));
+    let mut gaps = module_gaps(module, boundary);
+    let files = workspace_files.iter();
+    gaps.extend(files.flat_map(|model| workspace_gaps(model, boundary)));
+    gaps
+}
+
+/// Whether some dependency system of `worlds` evaluates the
+/// `WORKSPACE`-family file `path`, at a root that holds the files of
+/// `boundary`. With no system known, any file may be the one.
+///
+/// `detect` asks this with `boundary.workspace` set for a root where
+/// `WORKSPACE` is a directory: Bazel takes `WORKSPACE.bazel` and
+/// `WORKSPACE.bzlmod` only when they are files, falls back to the path
+/// `WORKSPACE` whatever is there, and stops on a directory
+/// (`ExternalPackageHelper.findWorkspaceFile` and `WorkspaceFileFunction`
+/// at 7.7.2; run on 7.7.2).
+pub(super) fn evaluates(
+    worlds: &Result<Vec<DepSystem>, Gap>,
+    boundary: &BoundaryFiles,
+    path: &str,
+) -> bool {
+    match worlds {
+        Ok(worlds) => {
+            let mut read = worlds.iter().map(|world| world.workspace_file(boundary));
+            read.any(|read| read == Some(path))
         }
+        Err(_) => true,
     }
-    for model in workspace_files {
-        for unread in model.unreadable.iter().chain(&model.gaps) {
-            let detail = format!("{}:{}: {}", unread.file, unread.line, unread.why.describe());
-            gaps.push(unknown(WORKSPACE_UNREADABLE, &unread.file, detail));
+}
+
+/// Whether some dependency system of `worlds` reads `MODULE.bazel` on
+/// every Bazel line: Bzlmod is on. With no system known, Bazel may. (From
+/// Bazel 7 the file is read under `WORKSPACE` alone too, which is the
+/// line's to say and `detect`'s to ask.)
+pub(super) fn reads_module(worlds: &Result<Vec<DepSystem>, Gap>) -> bool {
+    let bzlmod = |world: &DepSystem| matches!(world, DepSystem::Bzlmod | DepSystem::Hybrid);
+    match worlds {
+        Ok(worlds) => worlds.iter().any(bzlmod),
+        Err(_) => true,
+    }
+}
+
+/// What leaves every ecosystem undetermined: a gap of `MODULE.bazel`, and
+/// a gap of each `WORKSPACE`-family file that Bazel may evaluate. A
+/// `WORKSPACE` left behind beside `MODULE.bazel` on Bazel 8 or 9, or one
+/// that `WORKSPACE.bazel` replaces, declares nothing Bazel reads: Bazel
+/// builds past a missing macro file or a tab there, and so a refusal that
+/// names the file would name one nobody has to fix.
+fn governing_gaps(ws: &BazelWorkspace) -> Vec<Gap> {
+    let mut gaps = module_gaps(ws.module.as_ref(), &ws.boundary);
+    let worlds = worlds(ws);
+    let directory = |model: &WorkspaceModel| is_directory(model, &ws.boundary);
+    let opened = BoundaryFiles {
+        workspace: ws.boundary.workspace || ws.workspace_files.iter().any(directory),
+        ..ws.boundary
+    };
+    for model in &ws.workspace_files {
+        if root_file(model).is_none_or(|path| evaluates(&worlds, &opened, path)) {
+            gaps.extend(workspace_gaps(model, &ws.boundary));
         }
     }
     gaps
@@ -595,11 +794,22 @@ fn signal_gap(signal: &RulesetSignal) -> Gap {
 /// name no native project root is made by (`maven_install.json`, a
 /// requirements file under any name) and is found by its label alone,
 /// and one that names no package lock in this repository at all (an
-/// unpinned hub, `go_repository` rules, a hub of another module).
+/// unpinned hub, a hub of another module).
+///
+/// The `go_repository` rules of a `WORKSPACE` name no lock either, and
+/// they claim every project under the root: repository names are global
+/// there, so Bazel builds the Go modules of each project from the rules
+/// and reads no `go.mod` (`rulesets::gazelle`). A project left ungoverned
+/// would get the directory `replace` that design HZ-06 and owner decision
+/// O8 refuse under any live `go_repository` consumer, which the next
+/// `gazelle update-repos -prune` turns into a deleted rule.
 fn claims(hub: &Hub, project_rel: &str) -> bool {
     /// The directory and the name of a root-relative file.
     fn parts(path: &str) -> (&str, &str) {
         path.rsplit_once('/').unwrap_or(("", path))
+    }
+    if let RulesetDetail::Gazelle(GazelleDetail::GoRepositories(_)) = &hub.detail {
+        return true;
     }
     let files = || {
         let named = hub.locks.iter();
@@ -626,6 +836,18 @@ fn claims(hub: &Hub, project_rel: &str) -> bool {
 /// workspace may run under more than one dependency system and each has a
 /// candidate of its own, or a candidate is evaluated under one of them
 /// only (owner decision D6).
+///
+/// The model answers for the project it was read for
+/// (`ws.root.project_rel`) and for the directories above it, the root
+/// included. Its Bazel line is the span over the launcher files of those
+/// directories and of no other (design 2.4), and bazelisk takes the
+/// `.bazelversion` nearest the directory it is started in: a
+/// `sub/.bazelversion` that a model read for the root never saw can
+/// switch `WORKSPACE` off for `sub`. So a hub that claims any other
+/// project is `Undetermined`, never `Governed` on a line nobody read.
+/// Where no hub claims the project the answer is `NotGoverned`, which no
+/// line changes. A caller reads one model per root and project; over one
+/// view of the root each file is still read once.
 pub fn governance(ws: &BazelWorkspace, ecosystem: Ecosystem, project_rel: &str) -> Governance {
     // A report-only gap is of no one ecosystem: it leaves each open.
     let own = |ruleset: Ruleset| ruleset.ecosystem().is_none_or(|e| e == ecosystem);
@@ -635,7 +857,7 @@ pub fn governance(ws: &BazelWorkspace, ecosystem: Ecosystem, project_rel: &str) 
     {
         return Governance::NotGoverned;
     }
-    let mut gaps = model_gaps(ws.module.as_ref(), &ws.workspace_files);
+    let mut gaps = governing_gaps(ws);
     let read_short = ws.ruleset_gaps.iter().filter(|(ruleset, _)| own(*ruleset));
     gaps.extend(read_short.map(|(_, gap)| gap.clone()));
     let signals = ws.signals.iter().filter(|signal| own(signal.ruleset));
@@ -667,6 +889,16 @@ pub fn governance(ws: &BazelWorkspace, ecosystem: Ecosystem, project_rel: &str) 
     if candidates.is_empty() {
         return Governance::NotGoverned;
     }
+    if !ws.root.dirs_to_boundary().iter().any(|d| d == project_rel) {
+        let detail = format!(
+            "the Bazel version of this workspace was read for the project `{}`, and a \
+             `.bazelversion` in or above `{project_rel}` may name another; read the workspace \
+             for that project",
+            ws.root.project_rel
+        );
+        let gap = unknown(BAZEL_LINE_UNKNOWN, "", detail);
+        return Governance::Undetermined(vec![gap]);
+    }
     let several = match worlds(ws) {
         Ok(worlds) => worlds.len() > 1,
         Err(gap) => return Governance::Undetermined(vec![gap]),
@@ -676,11 +908,33 @@ pub fn governance(ws: &BazelWorkspace, ecosystem: Ecosystem, project_rel: &str) 
     if several && declared_in(DeclSystem::Bzlmod) && declared_in(DeclSystem::Workspace) {
         return Governance::Ambiguous(sites().collect());
     }
-    let standing = |id: &usize| {
-        let hub = &ws.hubs[*id];
-        liveness(ws, &decl_of(hub, &facts(hub, ws.module.as_ref())))
-    };
-    let standings: Vec<Standing> = candidates.iter().map(standing).collect();
+    // No release bounds the line from above (design 2.9): a `MODULE.bazel`
+    // hub is taken for live only when no `WORKSPACE`-family declaration
+    // of the ecosystem exists, whatever project that one claims. Run with
+    // Bzlmod off, which nothing here rules out, the build is the
+    // `WORKSPACE` one's and a pin in this hub's lock is not read.
+    if ws.line.hi.is_none() && declared_in(DeclSystem::Bzlmod) {
+        let legacy = |hub: &&Hub| {
+            let facts = facts(hub, ws.module.as_ref());
+            let decl = decl_of(hub, &facts);
+            decl.system == DeclSystem::Workspace && !decl.build_rule
+        };
+        let legacy = ws.hubs.iter().filter(of_ecosystem).filter(legacy);
+        let legacy: Vec<&Site> = legacy.map(|hub| &hub.decl.site).collect();
+        if !legacy.is_empty() {
+            let mut found: Vec<Site> = sites().collect();
+            for site in legacy {
+                if !found.contains(site) {
+                    found.push(site.clone());
+                }
+            }
+            return Governance::Ambiguous(found);
+        }
+    }
+    let standings: Vec<Standing> = candidates
+        .iter()
+        .map(|id| standing(ws, &ws.hubs[*id]))
+        .collect();
     let not_known = standings.iter().filter_map(|standing| match standing {
         Standing::Unknown(gap) => Some(gap.clone()),
         _ => None,
@@ -798,9 +1052,17 @@ pub fn governance_over(
 /// some command or config sets, together with each vendor directory
 /// committed at the root. A committed directory counts with no rc line at
 /// all: a CI-only `--vendor_dir` then builds from it, and a pin in the
-/// lock is a silent no-op. An empty value is the flag switched off; `?`
-/// stands for a value nobody could read (an rc file Bazel is sure to
-/// load, a root that cannot be listed), which is never "off".
+/// lock is a silent no-op.
+///
+/// The gate refuses on the variant and never on a value: every `Set` and
+/// every `Possible` refuses, because the flag has no value that switches
+/// it off. An empty value is the workspace root itself as the vendor
+/// directory. The option is a plain path that Bazel resolves against the
+/// workspace (`RepositoryOptions.java:374-385` and
+/// `BazelRepositoryModule.java:563-565` at 9.3.2, `:512-514` at 7.7.2),
+/// and run with `--vendor_dir=` both releases write `bazel-external` into
+/// the root and fail the build. `?` stands for a value nobody could read:
+/// an rc file Bazel is sure to load, a root that cannot be listed.
 pub fn vendor_dir(ws: &BazelWorkspace) -> FlagState<String> {
     let build = ws.flags.state(Flag::VendorDir, Chain::Build);
     let unread = ws.flags.gaps().into_iter().find(|gap| gap.hard);
@@ -895,6 +1157,7 @@ pub(super) mod tests {
         let decl = |system, file, name| DeclRef {
             system,
             file,
+            span: (0, 0),
             name: Some(name),
             imported: Some(true),
             dev: false,
@@ -1024,18 +1287,48 @@ pub(super) mod tests {
             "{:?}",
             spanned.system
         );
+        // Live from the root and dead from `sub`: not decided, and not
+        // dead, since Bazel builds from it wherever 7.7.2 runs.
         let hub = &spanned.hubs[0];
         assert!(
-            matches!(&hub.liveness, Liveness::Dead { why } if why.contains("pin")),
+            matches!(&hub.liveness, Liveness::Undecided { why } if why.contains("pin")),
             "{hub:?}"
         );
         let site = hub.decl.site.clone();
-        assert_eq!(
-            governance(&spanned, Ecosystem::Npm, "sub"),
-            Governance::Ambiguous(vec![site])
-        );
+        let ambiguous = Governance::Ambiguous(vec![site]);
+        assert_eq!(governance(&spanned, Ecosystem::Npm, "sub"), ambiguous);
         // From the root itself only the root's file is picked.
-        assert_eq!(read(&files).hubs[0].liveness, Liveness::Live);
+        let rooted = read(&files);
+        assert_eq!(rooted.line.exact(), Some(BazelVersion::new(7, 7, 2)));
+        assert_eq!(rooted.hubs[0].liveness, Liveness::Live);
+
+        // So a model answers for the project it was read for and for the
+        // directories above it. Read for the root, or for a sibling, it
+        // never saw `sub/.bazelversion`: it must not call `sub` governed.
+        for elsewhere in ["", "other", "sub2", "su"] {
+            let ws = read_at(&files, elsewhere);
+            let found = governance(&ws, Ecosystem::Npm, "sub");
+            assert_eq!(
+                tokens(&found),
+                [BAZEL_LINE_UNKNOWN],
+                "read for `{elsewhere}`"
+            );
+            let Governance::Undetermined(gaps) = &found else {
+                unreachable!()
+            };
+            assert!(gaps[0].detail.contains("`sub`"), "{:?}", gaps[0]);
+            // Where no hub claims the project, no line changes the answer.
+            let unclaimed = governance(&ws, Ecosystem::Npm, "third");
+            assert_eq!(unclaimed, Governance::NotGoverned, "read for `{elsewhere}`");
+        }
+        // Read for a project below `sub`, it saw every file that decides
+        // for `sub`.
+        let below = read_at(&files, "sub/pkg/web");
+        assert_eq!(governance(&below, Ecosystem::Npm, "sub"), ambiguous);
+        assert_eq!(
+            governance(&below, Ecosystem::Npm, "sub/pkg"),
+            Governance::NotGoverned
+        );
     }
 
     /// Acceptance: the rows for a flag the line does not know. Every Bazel
@@ -1069,8 +1362,10 @@ pub(super) mod tests {
                 "{what}: {:?}",
                 gaps[0]
             );
+            // Nobody knows what Bazel would do with the hub: that is not
+            // "dead".
             assert!(
-                matches!(ws.hubs[0].liveness, Liveness::Dead { .. }),
+                matches!(ws.hubs[0].liveness, Liveness::Undecided { .. }),
                 "{what}"
             );
             let Completeness::Incomplete(gaps) = &ws.completeness else {
@@ -1136,6 +1431,50 @@ pub(super) mod tests {
         };
         let files: Vec<&str> = sites.iter().map(|site| site.file.as_str()).collect();
         assert_eq!(files, ["MODULE.bazel", "WORKSPACE"]);
+
+        // The two families over two locks (design 2.9): the `MODULE.bazel`
+        // hub is live only where no `WORKSPACE`-family declaration of the
+        // ecosystem exists, whatever project that one claims. Run with
+        // Bzlmod off, the build is the `WORKSPACE` one's.
+        let module = JS_MODULE.replace("//:pnpm-lock.yaml", "//app:pnpm-lock.yaml");
+        let workspace = JS_WORKSPACE
+            .replace("//:pnpm-lock.yaml", "//legacy:pnpm-lock.yaml")
+            .replace("name = \"npm\"", "name = \"npm_ws\"");
+        let apart = [
+            ("MODULE.bazel", module.as_str()),
+            ("WORKSPACE", workspace.as_str()),
+            ("app/pnpm-lock.yaml", PNPM_LOCK.1),
+            ("legacy/pnpm-lock.yaml", PNPM_LOCK.1),
+        ];
+        let at = |project: &str| governance(&read_at(&apart, project), Ecosystem::Npm, project);
+        let Governance::Ambiguous(sites) = at("app") else {
+            panic!(
+                "a WORKSPACE hub of the ecosystem and no line: {:?}",
+                at("app")
+            );
+        };
+        let files: Vec<&str> = sites.iter().map(|site| site.file.as_str()).collect();
+        assert_eq!(files, ["MODULE.bazel", "WORKSPACE"]);
+        assert_eq!(tokens(&at("legacy")), [BAZEL_LINE_UNKNOWN]);
+        assert_eq!(at(""), Governance::NotGoverned);
+        // The hub of another ecosystem is no such declaration.
+        let other = apart.map(|(path, text)| match path {
+            "WORKSPACE" => (path, PIP_WORKSPACE),
+            _ => (path, text),
+        });
+        assert_eq!(
+            governance(&read_at(&other, "app"), Ecosystem::Npm, "app"),
+            Governance::Governed(vec![HubId(0)])
+        );
+        // With the line pinned each hub governs its own project.
+        let pinned = [&apart[..], &[(".bazelversion", "7.7.2\n")]].concat();
+        for (project, hub) in [("app", 0), ("legacy", 1)] {
+            assert_eq!(
+                governance(&read_at(&pinned, project), Ecosystem::Npm, project),
+                Governance::Governed(vec![HubId(hub)]),
+                "{project}"
+            );
+        }
 
         // A lower bound alone (`include()` is from 7.2.0) is no pin.
         let included = read(&[
@@ -1224,7 +1563,37 @@ pub(super) mod tests {
                 "{rc}"
             );
             assert!(
-                matches!(hybrid.hubs[0].liveness, Liveness::Dead { .. }),
+                matches!(hybrid.hubs[0].liveness, Liveness::Undecided { .. }),
+                "{rc}"
+            );
+        }
+        // The same flip seen from the WORKSPACE side: a dev `use_repo`
+        // name hides the WORKSPACE hub of that name, and under the flag
+        // the name is the WORKSPACE repository again.
+        let dev_name = "bazel_dep(name = \"aspect_rules_js\", version = \"3.6.0\")\n\
+            ext = use_extension(\"//:ext.bzl\", \"ext\", dev_dependency = True)\n\
+            use_repo(ext, \"npm\")\n";
+        let over = [
+            pin,
+            ("MODULE.bazel", dev_name),
+            ("WORKSPACE", JS_WORKSPACE),
+            PNPM_LOCK,
+        ];
+        let (hub, why) = inactive(&read(&over));
+        assert!(
+            hub == HubId(0) && matches!(why, Liveness::Shadowed { .. }),
+            "{why:?}"
+        );
+        for rc in [
+            "common --ignore_dev_dependency\n",
+            "common:ci --ignore_dev_dependency\n",
+        ] {
+            let flipped = read(&[&over[..], &[(".bazelrc", rc)]].concat());
+            let site = flipped.hubs[0].decl.site.clone();
+            assert_eq!(site.system, DeclSystem::Workspace, "{rc}");
+            assert_eq!(
+                governance(&flipped, Ecosystem::Npm, ""),
+                Governance::Ambiguous(vec![site]),
                 "{rc}"
             );
         }
@@ -1360,6 +1729,198 @@ pub(super) mod tests {
         }
     }
 
+    /// Workspace files as `(path, text)`.
+    type FileSet<'a> = &'a [(&'a str, &'a str)];
+
+    fn archive(version: &str) -> String {
+        PIP_WORKSPACE
+            .split_inclusive('\n')
+            .take(6)
+            .collect::<String>()
+            .replace("0.31.0", version)
+    }
+
+    /// A macro file is read for every `WORKSPACE`-family file that loads
+    /// it, whichever of its functions that file calls. The hub of a
+    /// function lives with the file that calls it: real Bazel 7.7.2 on
+    /// this shape finds no repository of the function only `WORKSPACE`
+    /// calls, and with `--noenable_bzlmod` none of the other.
+    #[test]
+    fn a_macro_hub_lives_with_the_workspace_file_that_calls_its_function() {
+        let deps = "load(\"@rules_python//python:pip.bzl\", \"pip_parse\")\n\
+            def legacy_deps():\n    pip_parse(name = \"pypi\", requirements_lock = \"//:requirements.txt\")\n\n\
+            def other_deps():\n    pip_parse(name = \"tools\", requirements_lock = \"//tools:requirements.txt\")\n";
+        let calls = |function: &str| {
+            let archive = archive("0.31.0");
+            format!("{archive}load(\"//:deps.bzl\", \"{function}\")\n{function}()\n")
+        };
+        let (legacy, other) = (calls("legacy_deps"), calls("other_deps"));
+        let shared = [
+            ("deps.bzl", deps),
+            ("requirements.txt", "six==1.16.0\n"),
+            ("tools/requirements.txt", "six==1.16.0\n"),
+        ];
+        let module = ("MODULE.bazel", "module(name = \"m\")\n");
+        // What Bazel evaluates, and the file only the unevaluated one is.
+        let cases: [(&str, &str, FileSet<'_>); 4] = [
+            // Hybrid: `WORKSPACE.bzlmod` replaces `WORKSPACE`.
+            (
+                "7.7.2",
+                "",
+                &[module, ("WORKSPACE", &legacy), ("WORKSPACE.bzlmod", &other)],
+            ),
+            (
+                "8.8.2",
+                "common --enable_workspace\n",
+                &[module, ("WORKSPACE", &legacy), ("WORKSPACE.bzlmod", &other)],
+            ),
+            // `WORKSPACE.bazel` outranks `WORKSPACE`.
+            (
+                "6.6.0",
+                "",
+                &[("WORKSPACE", &legacy), ("WORKSPACE.bazel", &other)],
+            ),
+            // Bzlmod off: `WORKSPACE.bzlmod` is the one never read.
+            (
+                "7.7.2",
+                "common --noenable_bzlmod\n",
+                &[module, ("WORKSPACE", &other), ("WORKSPACE.bzlmod", &legacy)],
+            ),
+        ];
+        for (version, rc, family) in cases {
+            let what = format!("Bazel {version} with {rc:?}");
+            let files = [
+                &[(".bazelversion", version), (".bazelrc", rc)][..],
+                family,
+                &shared[..],
+            ]
+            .concat();
+            let ws = read(&files);
+            assert_eq!(ws.completeness, Completeness::Exact, "{what}");
+            let hub = |name: &str| {
+                let found = ws.hubs.iter().position(|h| h.decl.apparent_name == name);
+                found.unwrap_or_else(|| panic!("{what}: no hub `{name}` in {:?}", ws.hubs))
+            };
+            let (pypi, tools) = (hub("pypi"), hub("tools"));
+            assert_eq!(ws.hubs.len(), 2, "{what}");
+            assert_eq!(ws.hubs[pypi].decl.site.file, "deps.bzl", "{what}");
+            // The function only the unevaluated file calls declares
+            // nothing Bazel builds.
+            let Liveness::Dead { why } = &ws.hubs[pypi].liveness else {
+                panic!("{what}: {:?}", ws.hubs[pypi].liveness);
+            };
+            assert!(why.contains("deps.bzl"), "{what}: {why}");
+            assert_eq!(
+                governance(&ws, Ecosystem::Pypi, ""),
+                Governance::Inactive(HubId(pypi), ws.hubs[pypi].liveness.clone()),
+                "{what}"
+            );
+            assert_eq!(ws.hubs[tools].liveness, Liveness::Live, "{what}");
+            let ws = read_at(&files, "tools");
+            assert_eq!(
+                governance(&ws, Ecosystem::Pypi, "tools"),
+                Governance::Governed(vec![HubId(tools)]),
+                "{what}"
+            );
+        }
+    }
+
+    /// One macro that both files of the family call is one hub, live
+    /// under either, and its ruleset is the archive of the file Bazel
+    /// evaluates: a version-gated lane would otherwise write the form of
+    /// a release the build never fetches.
+    #[test]
+    fn a_macro_hub_takes_the_ruleset_of_the_file_bazel_evaluates() {
+        let deps = "load(\"@rules_python//python:pip.bzl\", \"pip_parse\")\n\
+            def deps():\n    pip_parse(name = \"pypi\", requirements_lock = \"//:requirements.txt\")\n";
+        let calls = |version: &str| {
+            let archive = archive(version);
+            format!("{archive}load(\"//:deps.bzl\", \"deps\")\ndeps()\n")
+        };
+        let (old, new) = (calls("0.31.0"), calls("1.4.1"));
+        let shared = [("deps.bzl", deps), ("requirements.txt", "six==1.16.0\n")];
+        let module = ("MODULE.bazel", "module(name = \"m\")\n");
+        let exactly = |version: &'static str| {
+            let literal = Some((version, Source::WorkspaceLiteral));
+            (literal, literal)
+        };
+        let cases: [(&str, &str, FileSet<'_>, &str); 5] = [
+            // Hybrid evaluates `WORKSPACE.bzlmod`.
+            (
+                "7.7.2",
+                "",
+                &[module, ("WORKSPACE", &old), ("WORKSPACE.bzlmod", &new)],
+                "1.4.1",
+            ),
+            (
+                "7.7.2",
+                "",
+                &[module, ("WORKSPACE", &new), ("WORKSPACE.bzlmod", &old)],
+                "0.31.0",
+            ),
+            // With Bzlmod off it is `WORKSPACE`.
+            (
+                "7.7.2",
+                "common --noenable_bzlmod\n",
+                &[module, ("WORKSPACE", &old), ("WORKSPACE.bzlmod", &new)],
+                "0.31.0",
+            ),
+            // `WORKSPACE.bazel` outranks `WORKSPACE`, whichever is read first.
+            (
+                "6.6.0",
+                "",
+                &[("WORKSPACE.bazel", &new), ("WORKSPACE", &old)],
+                "1.4.1",
+            ),
+            (
+                "6.6.0",
+                "",
+                &[("WORKSPACE.bazel", &old), ("WORKSPACE", &new)],
+                "0.31.0",
+            ),
+        ];
+        for (version, rc, family, built) in cases {
+            let what = format!("Bazel {version} with {rc:?}, building {built}");
+            let files = [
+                &[(".bazelversion", version), (".bazelrc", rc)][..],
+                family,
+                &shared[..],
+            ]
+            .concat();
+            let ws = read(&files);
+            // The statement both files run is one declaration.
+            let [hub] = &ws.hubs[..] else {
+                panic!("{what}: one hub, not {:?}", ws.hubs);
+            };
+            assert_eq!(hub.liveness, Liveness::Live, "{what}");
+            assert_eq!(bounds(&hub.ruleset_version), exactly(built), "{what}");
+            assert_eq!(
+                governance(&ws, Ecosystem::Pypi, ""),
+                Governance::Governed(vec![HubId(0)]),
+                "{what}"
+            );
+        }
+        // Under a config either file may be the one: the range holds both
+        // archives, and no gate passes on one of them.
+        let either = [
+            &[
+                (".bazelversion", "7.7.2"),
+                (".bazelrc", "common:ws --noenable_bzlmod\n"),
+                module,
+                ("WORKSPACE", old.as_str()),
+                ("WORKSPACE.bzlmod", new.as_str()),
+            ][..],
+            &shared[..],
+        ]
+        .concat();
+        let ws = read(&either);
+        let version = &ws.hubs[0].ruleset_version;
+        assert!(
+            version.at_least("0.31.0") && !version.at_least("1.4.1") && !version.below("1.4.1"),
+            "{version:?}"
+        );
+    }
+
     /// Acceptance (design 2.8): from Bazel 7.4.0 `--ignore_dev_dependency`
     /// drops every root override, so `single_version_override(version =
     /// "1.5.0")` over `bazel_dep` 1.4.0 with `common:ci
@@ -1422,58 +1983,125 @@ pub(super) mod tests {
             maven.install(artifacts = [\"junit:junit:4.13.2\"], lock_file = \"//third_party:maven_install.json\")\n\
             maven.install(name = \"other\", artifacts = [], lock_file = \"//third_party:other_install.json\")\n\
             use_repo(maven, \"maven\", \"other\")\n";
-        let ws = read(&[
+        let files = [
             (".bazelversion", "9.3.2\n"),
             ("MODULE.bazel", module),
             ("app/pnpm-lock.yaml", PNPM_LOCK.1),
             ("third_party/maven_install.json", "{}\n"),
             ("third_party/other_install.json", "{}\n"),
-        ]);
+        ];
+        let ws = read(&files);
         assert_eq!(ws.completeness, Completeness::Exact, "{:?}", ws.signals);
+        // Each project is asked of the model read for it.
+        let at = |files: &[(&str, &str)], ecosystem, project: &str| {
+            governance(&read_at(files, project), ecosystem, project)
+        };
         let npm = Governance::Governed(vec![HubId(0)]);
-        assert_eq!(governance(&ws, Ecosystem::Npm, "app"), npm);
+        assert_eq!(at(&files, Ecosystem::Npm, "app"), npm);
         // The disk may spell the directory another way than the label.
-        assert_eq!(governance(&ws, Ecosystem::Npm, "App"), npm);
-        assert_eq!(governance(&ws, Ecosystem::Npm, ""), Governance::NotGoverned);
+        assert_eq!(at(&files, Ecosystem::Npm, "App"), npm);
+        assert_eq!(at(&files, Ecosystem::Npm, ""), Governance::NotGoverned);
         assert_eq!(
-            governance(&ws, Ecosystem::Npm, "app/web"),
+            at(&files, Ecosystem::Npm, "app/web"),
             Governance::NotGoverned
         );
         // Two live hubs over two locks are governed together.
         let maven = Governance::Governed(vec![HubId(1), HubId(2)]);
-        assert_eq!(governance(&ws, Ecosystem::Maven, ""), maven);
-        assert_eq!(governance(&ws, Ecosystem::Maven, "third_party"), maven);
+        assert_eq!(at(&files, Ecosystem::Maven, ""), maven);
+        assert_eq!(at(&files, Ecosystem::Maven, "third_party"), maven);
         assert_eq!(
-            governance(&ws, Ecosystem::Maven, "service-a"),
+            at(&files, Ecosystem::Maven, "service-a"),
             Governance::NotGoverned
         );
         // An ecosystem with no hub, and one no ruleset builds.
-        assert_eq!(
-            governance(&ws, Ecosystem::Cargo, ""),
-            Governance::NotGoverned
-        );
-        assert_eq!(
-            governance(&ws, Ecosystem::Composer, ""),
-            Governance::NotGoverned
-        );
+        assert_eq!(at(&files, Ecosystem::Cargo, ""), Governance::NotGoverned);
+        assert_eq!(at(&files, Ecosystem::Composer, ""), Governance::NotGoverned);
 
         // A hub that names no lock belongs to the workspace root alone:
         // a Maven project below it keeps today's behaviour.
         let unpinned = module.replace(", lock_file = \"//third_party:maven_install.json\"", "");
         let other = ("third_party/other_install.json", "{}\n");
-        let ws = read(&[
+        let files = [
             (".bazelversion", "9.3.2\n"),
-            ("MODULE.bazel", &unpinned),
+            ("MODULE.bazel", unpinned.as_str()),
             other,
-        ]);
-        assert_eq!(ws.hubs[1].locks, []);
-        assert_eq!(governance(&ws, Ecosystem::Maven, ""), maven);
+        ];
+        assert_eq!(read(&files).hubs[1].locks, []);
+        assert_eq!(at(&files, Ecosystem::Maven, ""), maven);
         assert_eq!(
-            governance(&ws, Ecosystem::Maven, "service-a"),
+            at(&files, Ecosystem::Maven, "service-a"),
             Governance::NotGoverned
         );
         let pinned = Governance::Governed(vec![HubId(2)]);
-        assert_eq!(governance(&ws, Ecosystem::Maven, "third_party"), pinned);
+        assert_eq!(at(&files, Ecosystem::Maven, "third_party"), pinned);
+    }
+
+    /// Design HZ-06, owner decision O8: the `go_repository` rules of a
+    /// `WORKSPACE` name no lock and are what Bazel builds every Go module
+    /// of the repository from. A Go project in any directory is governed
+    /// by them: left to the native writer it would get the directory
+    /// `replace` that `gazelle update-repos -prune` turns into a deleted
+    /// rule.
+    #[test]
+    fn go_repository_rules_govern_every_go_project_under_the_root() {
+        let workspace = "load(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")\n\
+            http_archive(\n    name = \"bazel_gazelle\",\n    \
+            urls = [\"https://github.com/bazelbuild/bazel-gazelle/releases/download/v0.35.0/bazel-gazelle-v0.35.0.tar.gz\"],\n)\n\
+            load(\"@bazel_gazelle//:deps.bzl\", \"gazelle_dependencies\", \"go_repository\")\n\
+            go_repository(\n    name = \"com_github_pkg_errors\",\n    importpath = \"github.com/pkg/errors\",\n    \
+            sum = \"h1:FEBLx1zS214owpjy7qsBeixbURkuhQAwrK5UwLGTwt4=\",\n    version = \"v0.9.1\",\n)\n\
+            gazelle_dependencies()\n";
+        let go_mod = "module example.com/svc\n\ngo 1.21\n\nrequire github.com/pkg/errors v0.9.1\n";
+        let files = [
+            (".bazelversion", "7.7.2\n"),
+            ("WORKSPACE", workspace),
+            ("svc/go.mod", go_mod),
+        ];
+        let governed = Governance::Governed(vec![HubId(0)]);
+        for project in ["", "svc", "tools/gen", "Svc"] {
+            let ws = read_at(&files, project);
+            assert_eq!(ws.hubs.len(), 1, "{:?}", ws.hubs);
+            assert_eq!(
+                ws.hubs[0].shape,
+                crate::bazel::model::HubShape::GoRepository
+            );
+            assert_eq!(ws.hubs[0].locks, []);
+            assert_eq!(
+                governance(&ws, Ecosystem::Golang, project),
+                governed,
+                "`{project}`"
+            );
+            // The rules are no hub of another ecosystem.
+            assert_eq!(
+                governance(&ws, Ecosystem::Npm, project),
+                Governance::NotGoverned
+            );
+        }
+        // Where Bazel reads no `WORKSPACE` the rules are dead, in every
+        // project alike: a refusal, never today's behaviour.
+        let dead = [&files[1..], &[(".bazelversion", "9.3.2\n")]].concat();
+        for project in ["", "svc"] {
+            let found = governance(&read_at(&dead, project), Ecosystem::Golang, project);
+            assert!(
+                matches!(found, Governance::Inactive(HubId(0), Liveness::Dead { .. })),
+                "`{project}`: {found:?}"
+            );
+        }
+        // The Bzlmod hub names its `go.mod` and governs that project only.
+        let module = "bazel_dep(name = \"gazelle\", version = \"0.47.0\")\n\
+            go_deps = use_extension(\"@gazelle//:extensions.bzl\", \"go_deps\")\n\
+            go_deps.from_file(go_mod = \"//svc:go.mod\")\n\
+            use_repo(go_deps, \"com_github_pkg_errors\")\n";
+        let files = [
+            (".bazelversion", "9.3.2\n"),
+            ("MODULE.bazel", module),
+            ("svc/go.mod", go_mod),
+            ("svc/go.sum", ""),
+        ];
+        let at = |project: &str| governance(&read_at(&files, project), Ecosystem::Golang, project);
+        assert_eq!(at("svc"), governed);
+        assert_eq!(at(""), Governance::NotGoverned);
+        assert_eq!(at("other"), Governance::NotGoverned);
     }
 
     /// Design 2.9: what was not read is not absent.
@@ -1512,11 +2140,13 @@ pub(super) mod tests {
         );
 
         // A file that is not Starlark Bazel accepts could declare any hub.
+        // On 7.7.2 Bazel evaluates both files.
         for (file, text) in [
             ("MODULE.bazel", "bazel_dep(name = \"x\"\n"),
             ("WORKSPACE", "\tworkspace(\n"),
         ] {
-            let ws = read(&[pin, ("MODULE.bazel", ""), (file, text)]);
+            let hybrid = (".bazelversion", "7.7.2\n");
+            let ws = read(&[hybrid, ("MODULE.bazel", ""), (file, text)]);
             for ecosystem in [Ecosystem::Npm, Ecosystem::Golang, Ecosystem::Nuget] {
                 let found = governance(&ws, ecosystem, "");
                 assert_eq!(tokens(&found), [WORKSPACE_UNREADABLE], "{file}");
@@ -1553,6 +2183,209 @@ pub(super) mod tests {
         assert_eq!(
             tokens(&governance(&ws, Ecosystem::Gem, "")),
             [LABEL_NOT_LITERAL]
+        );
+    }
+
+    /// A gap holds an ecosystem up only in a file Bazel may evaluate. Real
+    /// Bazel 9.3.2 builds beside a leftover `WORKSPACE` that loads a
+    /// missing file or is indented with a tab (8.8.2 was run with the
+    /// missing file), and 7.7.2 stops on both: a refusal on 9.3.2 would
+    /// name a file nobody has to fix.
+    #[test]
+    fn a_gap_in_a_workspace_file_bazel_never_evaluates_holds_nothing_up() {
+        let stale = [
+            ("load(\"//:gone.bzl\", \"x\")\nx()\n", "gone.bzl"),
+            ("\tworkspace(name = \"old\")\n", "WORKSPACE"),
+        ];
+        let with = |version: &'static str, rc: &'static str, files: &[(&str, &str)]| {
+            let fixed = [
+                (".bazelversion", version),
+                (".bazelrc", rc),
+                ("MODULE.bazel", JS_MODULE),
+                PNPM_LOCK,
+            ];
+            read(&[&fixed[..], files].concat())
+        };
+        let governed = Governance::Governed(vec![HubId(0)]);
+        for (text, at) in stale {
+            let leftover = [("WORKSPACE", text)];
+            // Bzlmod alone: Bazel never opens the file.
+            for version in ["9.3.2", "8.8.2"] {
+                let ws = with(version, "", &leftover);
+                let what = format!("Bazel {version}, {at}");
+                assert_eq!(governance(&ws, Ecosystem::Npm, ""), governed, "{what}");
+                assert_eq!(
+                    governance(&ws, Ecosystem::Gem, ""),
+                    Governance::NotGoverned,
+                    "{what}"
+                );
+                // The run still warns that a file was not read.
+                assert!(
+                    matches!(ws.completeness, Completeness::Incomplete(_)),
+                    "{what}"
+                );
+            }
+            // Bazel may evaluate it: outright, or under a config.
+            for (version, rc) in [
+                ("7.7.2", ""),
+                ("8.8.2", "common --enable_workspace\n"),
+                ("8.8.2", "common:ci --enable_workspace\n"),
+            ] {
+                let ws = with(version, rc, &leftover);
+                for ecosystem in [Ecosystem::Npm, Ecosystem::Gem] {
+                    let found = governance(&ws, ecosystem, "");
+                    let what = format!("Bazel {version} with {rc:?}, {at}");
+                    assert_eq!(tokens(&found), [WORKSPACE_UNREADABLE], "{what}");
+                    let Governance::Undetermined(gaps) = &found else {
+                        unreachable!()
+                    };
+                    assert_eq!(gaps[0].file, at, "{what}");
+                }
+            }
+            // The gap is judged for its own file: one that
+            // `WORKSPACE.bazel` replaces, or `WORKSPACE.bzlmod` wherever
+            // Bzlmod is on, is never opened.
+            for replaced_by in ["WORKSPACE.bazel", "WORKSPACE.bzlmod"] {
+                let ws = with("7.7.2", "", &[leftover[0], (replaced_by, "")]);
+                assert_eq!(
+                    governance(&ws, Ecosystem::Npm, ""),
+                    governed,
+                    "{replaced_by}, {at}"
+                );
+            }
+            // `WORKSPACE.bzlmod` replaces it only where Bzlmod is on.
+            let rc = "common:legacy --noenable_bzlmod\n";
+            let ws = with("7.7.2", rc, &[leftover[0], ("WORKSPACE.bzlmod", "")]);
+            let found = governance(&ws, Ecosystem::Gem, "");
+            assert_eq!(tokens(&found), [WORKSPACE_UNREADABLE], "{at}");
+            // And the file that replaces it is the one whose gap counts.
+            let ws = with(
+                "7.7.2",
+                "",
+                &[("WORKSPACE", ""), ("WORKSPACE.bzlmod", text)],
+            );
+            let found = governance(&ws, Ecosystem::Npm, "");
+            assert_eq!(tokens(&found), [WORKSPACE_UNREADABLE], "{at}");
+        }
+        // A gap of `MODULE.bazel` is no file's but Bazel's own.
+        let broken = read(&[
+            (".bazelversion", "9.3.2\n"),
+            ("MODULE.bazel", "bazel_dep(\n"),
+        ]);
+        assert_eq!(
+            tokens(&governance(&broken, Ecosystem::Npm, "")),
+            [WORKSPACE_UNREADABLE]
+        );
+    }
+
+    /// A statement of `MODULE.bazel` that was not read may give the root
+    /// module a repository of the WORKSPACE hub's name, which would hide
+    /// the hub: not known, and never live.
+    #[test]
+    fn a_name_the_module_file_may_shadow_is_undetermined() {
+        let star = "bazel_dep(name = \"aspect_rules_js\", version = \"3.6.0\")\n\
+            NAMES = [\"a\", \"b\"]\n\
+            ext = use_extension(\"//:ext.bzl\", \"ext\")\n\
+            use_repo(ext, *NAMES)\n";
+        let renamed = JS_WORKSPACE.replace("name = \"npm\"", "name = \"npm_ws\"");
+        let files = [
+            (".bazelversion", "7.7.2\n"),
+            ("MODULE.bazel", star),
+            ("WORKSPACE", renamed.as_str()),
+            PNPM_LOCK,
+        ];
+        let ws = read(&files);
+        assert_eq!(ws.system, DepSystem::Hybrid);
+        let found = governance(&ws, Ecosystem::Npm, "");
+        assert_eq!(tokens(&found), [LABEL_NOT_LITERAL]);
+        let Governance::Undetermined(gaps) = &found else {
+            unreachable!()
+        };
+        assert_eq!(gaps[0].file, "MODULE.bazel");
+        assert!(gaps[0].detail.contains("`npm_ws`"), "{:?}", gaps[0]);
+        assert!(
+            matches!(ws.hubs[0].liveness, Liveness::Undecided { .. }),
+            "{:?}",
+            ws.hubs[0].liveness
+        );
+        // With every name written out nothing can hide the hub.
+        let plain = star.replace("*NAMES", "\"a\", \"b\"");
+        let named = [("MODULE.bazel", plain.as_str())];
+        let ws = read(&[&files[..1], &named[..], &files[2..]].concat());
+        assert_eq!(
+            governance(&ws, Ecosystem::Npm, ""),
+            Governance::Governed(vec![HubId(0)])
+        );
+        // Where Bzlmod is off `MODULE.bazel` hides nothing.
+        let off = (".bazelrc", "common --noenable_bzlmod\n");
+        let ws = read(&[&files[..], &[off]].concat());
+        assert_eq!(
+            governance(&ws, Ecosystem::Npm, ""),
+            Governance::Governed(vec![HubId(0)])
+        );
+    }
+
+    /// An rc file Bazel is sure to load and nobody read may switch the
+    /// dependency system: the hub is not taken for a Bzlmod one.
+    #[test]
+    fn an_unread_rc_import_leaves_governance_undetermined() {
+        let files = [
+            (".bazelversion", "7.7.2\n"),
+            ("MODULE.bazel", JS_MODULE),
+            PNPM_LOCK,
+            (".bazelrc", "import %workspace%/ci.bazelrc\n"),
+        ];
+        let ws = read(&files);
+        assert!(
+            matches!(ws.system, DepSystem::Unknown { .. }),
+            "{:?}",
+            ws.system
+        );
+        let found = governance(&ws, Ecosystem::Npm, "");
+        assert_eq!(tokens(&found), [RC_IMPORT_UNREADABLE]);
+        let Governance::Undetermined(gaps) = &found else {
+            unreachable!()
+        };
+        assert_eq!(gaps[0].file, "ci.bazelrc");
+        assert!(
+            matches!(ws.hubs[0].liveness, Liveness::Undecided { .. }),
+            "{:?}",
+            ws.hubs[0].liveness
+        );
+        // With the file there the hub is live.
+        let ws = read(&[&files[..], &[("ci.bazelrc", "")]].concat());
+        assert_eq!(
+            governance(&ws, Ecosystem::Npm, ""),
+            Governance::Governed(vec![HubId(0)])
+        );
+    }
+
+    /// Root tags that only add artifacts to a hub another module's
+    /// `install` makes declare no hub of the root module (design 2.9,
+    /// `NotRootModule`): a lock written for them is one Bazel never reads.
+    #[test]
+    fn tags_on_another_modules_hub_are_not_a_hub_of_the_root_module() {
+        let tags = "bazel_dep(name = \"rules_jvm_external\", version = \"6.7\")\n\
+            maven = use_extension(\"@rules_jvm_external//:extensions.bzl\", \"maven\")\n\
+            maven.artifact(name = \"maven\", group = \"junit\", artifact = \"junit\", version = \"4.13.2\")\n\
+            use_repo(maven, \"maven\")\n";
+        let pin = (".bazelversion", "9.3.2\n");
+        let ws = read(&[pin, ("MODULE.bazel", tags)]);
+        assert_eq!(ws.completeness, Completeness::Exact);
+        assert_eq!(ws.hubs[0].liveness, Liveness::NotRootModule);
+        assert_eq!(
+            governance(&ws, Ecosystem::Maven, ""),
+            Governance::Inactive(HubId(0), Liveness::NotRootModule)
+        );
+        // With an `install` of its own the root module declares the hub.
+        let install = tags.replace(
+            "maven.artifact(",
+            "maven.install(artifacts = [])\nmaven.artifact(",
+        );
+        let ws = read(&[pin, ("MODULE.bazel", &install)]);
+        assert_eq!(
+            governance(&ws, Ecosystem::Maven, ""),
+            Governance::Governed(vec![HubId(0)])
         );
     }
 
@@ -1596,6 +2429,14 @@ pub(super) mod tests {
         };
         assert_eq!(sites.len(), 1);
         assert_eq!(sites[0].file, "../../MODULE.bazel");
+        // Both name it: two declarations govern one lock, and neither
+        // root's answer is the answer. Nearest the project first.
+        let both = [hub("app", "app"), hub("svc/app", "svc/app")];
+        let Governance::Ambiguous(sites) = over(&both, Ecosystem::Npm) else {
+            panic!("two roots govern the lock");
+        };
+        let files: Vec<&str> = sites.iter().map(|site| site.file.as_str()).collect();
+        assert_eq!(files, ["MODULE.bazel", "../MODULE.bazel"]);
         // Neither names it: today's behaviour.
         assert_eq!(
             over(&[bare(""), hub("svc/app", "elsewhere")], Ecosystem::Npm),
@@ -1676,8 +2517,49 @@ pub(super) mod tests {
         let mut unlisted = read(&[("MODULE.bazel", "")]);
         unlisted.vendor_dirs.cannot_tell = true;
         assert!(matches!(vendor_dir(&unlisted), FlagState::Possible(_)));
+
+        // The flag has no value that switches it off. An empty one makes
+        // the workspace root the vendor directory (`--vendor_dir=` on
+        // 7.7.2 and 9.3.2 writes `bazel-external` into the root): the flag
+        // is set, and the gate refuses on the variant whatever the value.
+        let empty = FlagState::Set(String::new());
+        assert_eq!(with("common --vendor_dir=\n"), empty);
+        assert_eq!(
+            with("build --vendor_dir=\ntest --vendor_dir=vendor_src\n"),
+            empty
+        );
+        let FlagState::Possible(readings) = with("vendor --vendor_dir=\n") else {
+            panic!("`vendor --vendor_dir=` sets the flag for one command");
+        };
+        assert_eq!(readings.values().collect::<Vec<_>>(), [""]);
+        // Beside a committed vendor directory too.
+        let committed = |rc: &str| {
+            let ws = read(&[
+                (".bazelversion", "9.3.2\n"),
+                ("MODULE.bazel", ""),
+                (".bazelrc", rc),
+                ("third_party/VENDOR.bazel", ""),
+            ]);
+            assert_eq!(ws.vendor_dirs.dirs, ["third_party"]);
+            vendor_dir(&ws)
+        };
+        assert_eq!(committed("common --vendor_dir=\n"), empty);
+        for rc in ["", "vendor --vendor_dir=\n", "common:ci --vendor_dir=\n"] {
+            let FlagState::Possible(readings) = committed(rc) else {
+                panic!("{rc:?}: a committed vendor directory is `Possible`");
+            };
+            let dirs: Vec<&String> = readings.values().collect();
+            assert!(dirs.iter().any(|dir| *dir == "third_party"), "{rc:?}");
+            // The root itself, where a command or a config names it.
+            assert_eq!(
+                dirs.iter().any(|dir| dir.is_empty()),
+                !rc.is_empty(),
+                "{rc:?}"
+            );
+        }
+
         // An rc file Bazel is sure to load and nobody read may set the
-        // flag: "switched off" in what was read is not off.
+        // flag after the ones that were read: what they say is not all.
         let import = "import %workspace%/ci.bazelrc\n";
         assert!(matches!(with(import), FlagState::UnknowableHard(_)));
         let FlagState::Possible(readings) = with(&format!("common --vendor_dir=\n{import}")) else {
