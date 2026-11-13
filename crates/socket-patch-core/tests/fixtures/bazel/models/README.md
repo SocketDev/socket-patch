@@ -18,8 +18,8 @@ with its line, so a changed or added input needs its line there.
 The first three come from the Bazel-support campaign's probes: 2026-11-11, one macOS arm64
 machine (Darwin 27.0.0), bazelisk 1.30.0; nothing ran on Linux or Windows. The drivers, the
 per-cell logs and the reports are in the campaign's probe directory, outside this
-repository. `python3 reduce.py <campaign probes directory> .` rewrites the three files byte
-for byte.
+repository. `python3 reduce.py <campaign probes directory> .` rewrites the three files, and
+`ws-units.json` below, byte for byte.
 
 | File | Probe | What a cell holds |
 |---|---|---|
@@ -61,6 +61,33 @@ of a `WORKSPACE` file never sees the module: Bzlmod on, a root `MODULE.bazel` of
 of `s3a`. Bazel 6.6.0 `--enable_bzlmod`, 7.7.2 and 8.8.2 `--enable_workspace` each loaded the
 main repository's file (`v1`): the name `workspace()` gives outranks a `bazel_dep` of the
 same name.
+
+### `ws-units.json`: a unit that declares a repository again
+
+Four cells from two probes of the campaign's revision 4, run on 2026-11-12 on the same
+machine and launcher; nothing ran on Linux or Windows. A unit of socket-patch is a `load` of
+a file under `.socket/` and a call of its macro, which declares again a repository the
+user's `WORKSPACE` already declares. Bazel builds the unit's definition only when the unit
+runs in the first chunk that defines the name, or in an earlier one. A cell holds `files`,
+`repo` (the repository asked for), `bazel` (the release that built it) and `built`.
+
+| Cell | Probe | Shape | `built` |
+|---|---|---|---|
+| `pypi-row7-ws-redeclare-b7.7.2` | `rev4-vendored-pypi`, row `row7-ws-redeclare-b7.7.2` (rules_python 1.4.2, Bazel 7.7.2): the `-fresh` copy of the workspace, which is the tree the row's builds read | the unit appended to the `WORKSPACE`, in a chunk after the one of the hub's `install_deps()` | `the hub's`: exit 0 on the wheel of the index (`SUMMARY.txt`, `a03-patched-run`), the silent no-op |
+| `pypi-row7-ws-inline-b7.7.2`, `pypi-row7-ws-inline-b8.8.2` | the same probe, rows `row7-ws-inline-b7.7.2` and `-b8.8.2` | the unit's `load` among the loads of the chunk of `install_deps()` and its call after it | `the unit's`: the patched wheel |
+| `go-aw35` | `rev4-go-unconditional-attack`, cell `aw35` (gazelle 0.35.0, rules_go 0.44.0, Bazel 7.7.2): the workspace as the attack's section 7 found it | a gazelle `WORKSPACE` whose `go_repository` rules are in the macro file `deps.bzl`; no unit | `the macro's` |
+
+The `WORKSPACE` of a pypi cell names the loopback index of its run
+(`http://127.0.0.1:<port>/pip-mode/simple`); the port is the run's and means nothing here.
+
+The Go probe kept no copy of the workspace with a unit in it. Its report (`rev4/go-unconditional-attack.md`
+of the campaign's design directory, section 7, logs `aw35/030`, `033`, `034` and `035`)
+says what Bazel 7.7.2 built for two placements: appended, the user's rule, while `bazel
+query --output=build //external:com_example_upstream` printed the unit's; in the chunk
+before the user's macro, the unit's. The test
+`a_unit_in_an_earlier_chunk_governs_and_an_appended_one_does_not` of `workspace_file` writes
+the unit and its file from that report and the query log into the `go-aw35` workspace, so
+its two inputs are a reconstruction and not a capture.
 
 ## Real files
 

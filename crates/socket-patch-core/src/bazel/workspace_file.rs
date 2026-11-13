@@ -92,7 +92,10 @@
 //! number over the body of each macro it calls, however often the macro
 //! is called, for each name asked. Reading costs what the files cost: the
 //! functions of a macro file are found by name, not by a walk of the file
-//! for each `load`, call or directive that names one.
+//! for each `load`, call or directive that names one, and what a name is
+//! bound to is found once for the file, not by a walk of its bindings for
+//! each statement or function that uses it. The size-cap tests hold both
+//! to a count of steps, not to a clock.
 //!
 //! The model also keeps what the hybrid rule needs: the repository each
 //! `load` names. When Bzlmod is on as well and the root module can see
@@ -103,7 +106,7 @@ use std::collections::BTreeMap;
 
 use super::label::{Label, Repo};
 use super::model::{DeclSystem, FileText, FileView, Gap, Site};
-use super::module_file::{constants, Constants, GapWhy};
+use super::module_file::{constants, steps, Constants, GapWhy};
 use super::starlark::{
     self, ArgKind, Binding, BindingKind, Call, Dialect, File, Load, Lookup, OpaqueKind, Span, Stmt,
     StmtKind, Value, ValueKind, MAX_FILES,
@@ -456,18 +459,37 @@ pub struct WorkspaceModel {
     linked: Vec<Option<usize>>,
 }
 
+/// Where one name of a file is bound. [`Scope::new`] finds it once for
+/// every name, so that what a name means costs a lookup however often it
+/// is asked, at the top level and in each function. A walk of the
+/// bindings of the name for each question costs the square of a file that
+/// binds one name on every line and asks about it on every line.
+#[derive(Debug, Default)]
+struct Bound {
+    /// How many bindings the name has in the file, function and block
+    /// bodies included.
+    count: usize,
+    /// Where one of them is written: the only one when `count` is 1.
+    first: Span,
+    /// What its bindings on unindented lines make it
+    /// ([`Binding::top_level`]), and the offset from which it is bound.
+    /// `None` when it has no such binding.
+    top: Option<(Callee, usize)>,
+    /// Where its other bindings are written, those inside a function or
+    /// block body, in source order.
+    inner: Vec<Span>,
+}
+
 /// A Starlark file while it is converted.
 struct Scope<'f> {
     file: &'f File<'f>,
     line_starts: Vec<usize>,
     /// Where each loaded name is written: `(load index, symbol)`.
     loaded: BTreeMap<usize, (usize, String)>,
+    /// Every name the file binds.
+    bound: BTreeMap<&'f [u8], Bound>,
     source: WsFile,
 }
-
-/// What each name of one scope (the top level, or one `def`) is bound to,
-/// and the offset of its binding.
-type Callees = BTreeMap<String, (Callee, usize)>;
 
 /// [`WsCall::runs`] while it is collected.
 type Runs = BTreeMap<String, Callee>;
@@ -481,14 +503,16 @@ impl<'f> Scope<'f> {
                 .chain(newlines.map(|(i, _)| i + 1))
                 .collect(),
             loaded: BTreeMap::new(),
+            bound: BTreeMap::new(),
             source: WsFile {
                 path: path.to_string(),
                 loads: Vec::new(),
                 constants: constants(file),
                 macros: BTreeMap::new(),
-                rules: Self::rules(file),
+                rules: BTreeMap::new(),
             },
         };
+        steps(file.stmts.len());
         for stmt in &file.stmts {
             let StmtKind::Load(load) = &stmt.kind else {
                 continue;
@@ -504,15 +528,45 @@ impl<'f> Scope<'f> {
                 span: stmt.span,
             });
         }
+        scope.bound = scope.bindings();
+        scope.source.rules = scope.rules();
         scope
+    }
+
+    /// Every name the file binds, with where: one pass over its bindings,
+    /// after the `load` statements are known.
+    fn bindings(&self) -> BTreeMap<&'f [u8], Bound> {
+        let mut bound: BTreeMap<&[u8], Bound> = BTreeMap::new();
+        let mut top: BTreeMap<&[u8], Vec<Binding>> = BTreeMap::new();
+        steps(self.file.bindings.len());
+        for binding in &self.file.bindings {
+            let name = self.file.bytes(binding.span);
+            let of = bound.entry(name).or_insert_with(|| Bound {
+                first: binding.span,
+                ..Bound::default()
+            });
+            of.count += 1;
+            match binding.top_level {
+                true => top.entry(name).or_default().push(*binding),
+                false => of.inner.push(binding.span),
+            }
+        }
+        for (name, of) in &mut bound {
+            // Nothing keeps the bindings of a file in source order.
+            of.inner.sort_unstable();
+            let means = |top: &Vec<Binding>| self.loaded_once(top).unwrap_or((Callee::Unknown, 0));
+            of.top = top.get(name).map(means);
+        }
+        bound
     }
 
     /// The names a macro file binds to `repository_rule(...)`: one
     /// top-level `name = repository_rule(...)` statement is the only
     /// binding of the name anywhere in the file, and nothing in the file
     /// binds `repository_rule`, so it is the function Bazel predeclares.
-    fn rules(file: &File<'_>) -> BTreeMap<String, Span> {
-        if file.dialect != Dialect::Bzl || !file.uses(REPOSITORY_RULE).bindings.is_empty() {
+    fn rules(&self) -> BTreeMap<String, Span> {
+        let file = self.file;
+        if file.dialect != Dialect::Bzl || self.bound.contains_key(REPOSITORY_RULE.as_bytes()) {
             return BTreeMap::new();
         }
         let rule = |stmt: &Stmt| match &stmt.kind {
@@ -521,12 +575,13 @@ impl<'f> Scope<'f> {
                 name_span,
                 call,
             } if call.callee == REPOSITORY_RULE => {
-                let once =
-                    matches!(file.uses(name).bindings[..], [only] if only.span == *name_span);
+                let bound = self.bound.get(name.as_bytes());
+                let once = bound.is_some_and(|of| of.count == 1 && of.first == *name_span);
                 once.then(|| (name.clone(), stmt.span))
             }
             _ => None,
         };
+        steps(file.stmts.len());
         file.stmts.iter().filter_map(rule).collect()
     }
 
@@ -559,26 +614,29 @@ impl<'f> Scope<'f> {
     }
 
     /// What `name` is bound to for a use at `at`, in the body of `def` or
-    /// at the top level.
-    fn callee(&self, def: Option<&Stmt>, name: &str, at: usize, seen: &mut Callees) -> Callee {
-        if !seen.contains_key(name) {
-            let uses = match def {
-                Some(def) => self.file.uses_in(def, name),
-                None => self.file.uses(name),
-            };
-            let bound = match uses.bindings[..] {
-                [] => (Callee::Builtin, 0),
-                _ => self
-                    .loaded_once(&uses.bindings)
-                    .unwrap_or((Callee::Unknown, 0)),
-            };
-            seen.insert(name.to_string(), bound);
-        }
-        let (callee, bound_at) = &seen[name];
-        if *bound_at < at || *callee == Callee::Builtin {
-            callee.clone()
-        } else {
-            Callee::Unknown
+    /// at the top level. The bindings that count are the ones
+    /// [`File::uses`] and [`File::uses_in`] give: at the top level every
+    /// binding of the file, and in a function the unindented ones and its
+    /// own.
+    fn callee(&self, def: Option<&Stmt>, name: &str, at: usize) -> Callee {
+        steps(1);
+        let Some(bound) = self.bound.get(name.as_bytes()) else {
+            return Callee::Builtin;
+        };
+        let local = match def {
+            None => !bound.inner.is_empty(),
+            Some(def) => {
+                let next = bound.inner.partition_point(|span| span.0 < def.span.0);
+                let inside = |span: &Span| span.1 <= def.span.1;
+                bound.inner.get(next).is_some_and(inside)
+            }
+        };
+        match &bound.top {
+            // A binding in a body is no `load`.
+            _ if local => Callee::Unknown,
+            None => Callee::Builtin,
+            Some((callee, from)) if *from < at => callee.clone(),
+            Some(_) => Callee::Unknown,
         }
     }
 
@@ -586,9 +644,11 @@ impl<'f> Scope<'f> {
     /// that declares a repository, each with what it is bound to: every
     /// name in it that is not a literal constant of the file or a
     /// function that only computes a value.
-    fn runs(&self, def: Option<&Stmt>, span: Span, seen: &mut Callees, out: &mut Runs) {
-        for name in self.file.names_in(span) {
-            let callee = self.callee(def, name, span.0, seen);
+    fn runs(&self, def: Option<&Stmt>, span: Span, out: &mut Runs) {
+        let names = self.file.names_in(span);
+        steps(names.len());
+        for name in names {
+            let callee = self.callee(def, name, span.0);
             let computes = callee == Callee::Builtin && PURE.contains(&name);
             if !computes && !self.source.constants.contains_key(name) && !out.contains_key(name) {
                 out.insert(name.to_string(), callee);
@@ -598,40 +658,40 @@ impl<'f> Scope<'f> {
 
     /// Whether evaluating `span` can run nothing that declares a
     /// repository: [`Scope::runs`] finds no name.
-    fn inert(&self, def: Option<&Stmt>, span: Span, seen: &mut Callees) -> bool {
+    fn inert(&self, def: Option<&Stmt>, span: Span) -> bool {
         let mut runs = Runs::new();
-        self.runs(def, span, seen, &mut runs);
+        self.runs(def, span, &mut runs);
         runs.is_empty()
     }
 
     /// [`Scope::runs`] for a value that was read. A literal, a bare name
     /// and a list or dict of them run nothing, whatever the name is bound
     /// to: only the computed parts can call a function.
-    fn value_runs(&self, def: Option<&Stmt>, value: &Value, seen: &mut Callees, out: &mut Runs) {
+    fn value_runs(&self, def: Option<&Stmt>, value: &Value, out: &mut Runs) {
         match &value.kind {
-            ValueKind::Dynamic => self.runs(def, value.span, seen, out),
+            ValueKind::Dynamic => self.runs(def, value.span, out),
             ValueKind::List(items) => {
                 for item in items {
-                    self.value_runs(def, item, seen, out);
+                    self.value_runs(def, item, out);
                 }
             }
             ValueKind::Dict(entries) => {
                 for (key, value) in entries {
-                    self.value_runs(def, key, seen, out);
-                    self.value_runs(def, value, seen, out);
+                    self.value_runs(def, key, out);
+                    self.value_runs(def, value, out);
                 }
             }
             _ => {}
         }
     }
 
-    fn inert_value(&self, def: Option<&Stmt>, value: &Value, seen: &mut Callees) -> bool {
+    fn inert_value(&self, def: Option<&Stmt>, value: &Value) -> bool {
         let mut runs = Runs::new();
-        self.value_runs(def, value, seen, &mut runs);
+        self.value_runs(def, value, &mut runs);
         runs.is_empty()
     }
 
-    fn call(&self, def: Option<&Stmt>, call: &Call, seen: &mut Callees) -> WsCall {
+    fn call(&self, def: Option<&Stmt>, call: &Call) -> WsCall {
         let at = call.span.0;
         let first = call
             .args
@@ -643,12 +703,12 @@ impl<'f> Scope<'f> {
         });
         let mut runs = Runs::new();
         for arg in &call.args {
-            self.value_runs(def, &arg.value, seen, &mut runs);
+            self.value_runs(def, &arg.value, &mut runs);
         }
         WsCall {
             call: call.clone(),
-            callee: self.callee(def, &call.callee, at, seen),
-            passes: passed.map(|name| self.callee(def, name, at, seen)),
+            callee: self.callee(def, &call.callee, at),
+            passes: passed.map(|name| self.callee(def, name, at)),
             impure: !runs.is_empty(),
             runs,
             macro_def: None,
@@ -659,9 +719,9 @@ impl<'f> Scope<'f> {
     /// The statements `stmts` of the top level, or of the body of `def`.
     fn stmts(&self, def: Option<&Stmt>, stmts: &[Stmt]) -> Vec<WsStmt> {
         let lossy = |span: Span| String::from_utf8_lossy(self.file.bytes(span)).into_owned();
-        let mut seen = Callees::new();
         let (mut chunk, mut after_other, mut loads) = (0, false, 0);
         let mut out = Vec::new();
+        steps(stmts.len());
         for stmt in stmts {
             let is_load = matches!(stmt.kind, StmtKind::Load(_));
             // A `load` after a statement that is not one starts a chunk.
@@ -681,30 +741,29 @@ impl<'f> Scope<'f> {
                     // it is handed (`sorted(xs, key = fn)`), so its call
                     // is judged as the expression it is: by every name.
                     let computes = PURE.contains(&call.callee.as_str())
-                        && self.callee(def, &call.callee, call.span.0, &mut seen)
-                            == Callee::Builtin;
-                    if computes && self.inert(def, call.span, &mut seen) {
+                        && self.callee(def, &call.callee, call.span.0) == Callee::Builtin;
+                    if computes && self.inert(def, call.span) {
                         WsStmtKind::Inert
                     } else {
-                        WsStmtKind::Call(self.call(def, call, &mut seen))
+                        WsStmtKind::Call(self.call(def, call))
                     }
                 }
                 // `native.<rule>(...)` is the predeclared rule in a `.bzl`.
                 StmtKind::TagCall { proxy, call, .. }
                     if proxy == "native"
-                        && self.callee(def, proxy, stmt.span.0, &mut seen) == Callee::Builtin =>
+                        && self.callee(def, proxy, stmt.span.0) == Callee::Builtin =>
                 {
                     let callee = Callee::Builtin;
                     WsStmtKind::Call(WsCall {
                         callee,
-                        ..self.call(def, call, &mut seen)
+                        ..self.call(def, call)
                     })
                 }
                 StmtKind::Docstring => WsStmtKind::Inert,
-                StmtKind::ConstBind { value, .. } => inert(self.inert_value(def, value, &mut seen)),
+                StmtKind::ConstBind { value, .. } => inert(self.inert_value(def, value)),
                 // Neither changes what runs next; `return` and a block do.
                 StmtKind::Opaque(OpaqueKind::Assignment | OpaqueKind::Expression) => {
-                    inert(self.inert(def, stmt.span, &mut seen))
+                    inert(self.inert(def, stmt.span))
                 }
                 StmtKind::Opaque(OpaqueKind::Keyword) => {
                     inert(self.file.bytes(stmt.span) == b"pass")
@@ -813,6 +872,7 @@ impl Step {
     /// finds the chunk in the same state.
     fn of(events: &[Event], mut defined: bool, mut doubted: bool, mut raised: bool) -> Self {
         let mut step = Self::default();
+        steps(events.len());
         for event in events {
             let untouched = !defined && !doubted;
             match *event {
@@ -932,6 +992,7 @@ impl WorkspaceModel {
             let next = file.stmts.partition_point(|stmt| stmt.span.1 <= at);
             file.stmts.get(next).is_some_and(|stmt| stmt.span.0 < at)
         };
+        steps(file.comments.len());
         let directives = file.comments.iter().filter(|comment| comment.own_line);
         for comment in directives.filter(|comment| !inside(comment.span.0)) {
             let text = String::from_utf8_lossy(file.bytes(comment.span));
@@ -986,6 +1047,7 @@ impl WorkspaceModel {
         let own = self.own_name_from();
         let loads = self.files.first().map_or(&[][..], |file| &file.loads);
         let mut chunks = vec![0; loads.len()];
+        steps(self.stmts.len() + loads.len());
         for stmt in &self.stmts {
             if let (WsStmtKind::Load(load), chunk) = (&stmt.kind, stmt.chunk) {
                 chunks
@@ -1060,6 +1122,7 @@ impl WorkspaceModel {
             // The first `def` of each name: one pass over the file,
             // however many of its functions are asked for.
             let mut defs: BTreeMap<&str, &Stmt> = BTreeMap::new();
+            steps(file.stmts.len() + names.len());
             for stmt in &file.stmts {
                 if let StmtKind::Def { name, .. } = &stmt.kind {
                     defs.entry(name.as_str()).or_insert(stmt);
@@ -1076,7 +1139,9 @@ impl WorkspaceModel {
                 let StmtKind::Def { body, .. } = &def.kind else {
                     continue;
                 };
-                if macros.contains_key(&name) || file.uses(&name).bindings.len() != 1 {
+                let once = |of: &Bound| of.count == 1;
+                if macros.contains_key(&name) || !scope.bound.get(name.as_bytes()).is_some_and(once)
+                {
                     continue;
                 }
                 macros.insert(name.clone(), self.macros.len());
@@ -1130,6 +1195,7 @@ impl WorkspaceModel {
     /// whether it declares its repository with a repository rule of the
     /// main repository ([`WsCall::own_rule`]).
     fn link(&self, file: usize, stmt: &WsStmt) -> (Option<usize>, bool) {
+        steps(1);
         let WsStmtKind::Call(call) = &stmt.kind else {
             return (None, false);
         };
@@ -1190,6 +1256,8 @@ impl WorkspaceModel {
             .map(|(path, def)| {
                 let leveled = path.starts_with('+');
                 let path = path.strip_prefix('+').unwrap_or(path);
+                // The files number at most the file cap.
+                steps(1 + self.files.len());
                 let file = self.files.iter().position(|file| file.path == path);
                 RepositoryMacro {
                     path,
@@ -1256,6 +1324,7 @@ impl WorkspaceModel {
             if stmt.chunk != chunk && (state.current.is_some() || state.uncertain.is_some()) {
                 break;
             }
+            steps(1);
             chunk = stmt.chunk;
             let called = match &stmt.kind {
                 WsStmtKind::Call(call) => call.macro_def.map(|m| (call, m)),
@@ -1380,6 +1449,7 @@ impl WorkspaceModel {
         (index, inner): (usize, Option<(usize, usize)>),
         out: &mut Vec<Event>,
     ) {
+        steps(1);
         let doubt = |why: OrderWhy| Doubt {
             why,
             stmt: index,
@@ -1458,7 +1528,7 @@ mod tests {
     use std::collections::BTreeSet;
     use std::fmt::Write as _;
 
-    use super::super::module_file::tests::{fixtures, golden, vectors, view, View};
+    use super::super::module_file::tests::{counted, fixtures, golden, vectors, view, View};
     use super::*;
     use crate::test_rng::Rng;
 
@@ -2729,12 +2799,34 @@ mod tests {
         golden("corpus-workspaces.golden", &out);
     }
 
+    /// The most steps ([`steps`]) reading may take for each statement it
+    /// reads, and an answer for each statement it passes. Reading took 9
+    /// and an answer 2 at most on the files of the tests below, and
+    /// listing the directives takes 3 for each. A walk that is repeated
+    /// for each statement of a file at the size cap takes thousands.
+    const READ_STEPS: u64 = 16;
+    const ANSWER_STEPS: u64 = 4;
+
+    /// Reads `files`, in [`READ_STEPS`] at most for each of `statements`.
+    #[track_caller]
+    fn read_in_steps(statements: usize, files: &[(&str, &str)]) -> WorkspaceModel {
+        counted(READ_STEPS, statements, || read(files))
+    }
+
+    /// The verdict for `name`, in [`ANSWER_STEPS`] at most for each of
+    /// `statements`.
+    #[track_caller]
+    fn verdict_in_steps(model: &WorkspaceModel, name: &str, statements: usize) -> String {
+        counted(ANSWER_STEPS, statements, || verdict(model, name, &|_| None))
+    }
+
     /// Reading costs what the file costs, and an answer one pass over its
     /// statements: a `WORKSPACE` and a macro file at the size cap, each
-    /// full of rules whose arguments are computed, read in seconds, where
-    /// a look at every use of a name for each call would take minutes.
+    /// full of rules whose arguments are computed. A look at every use of
+    /// a name for each call that names it takes over a hundred million
+    /// steps here, and the bound is under half a million.
     #[test]
-    fn files_at_the_size_cap_read_in_time() {
+    fn files_at_the_size_cap_read_in_linear_steps() {
         let rule = |n: usize| {
             format!("http_archive(name = \"r{n}\", urls = [BASE + \"/r{n}-{{}}.tgz\".format(VERSION)])\n")
         };
@@ -2759,8 +2851,7 @@ mod tests {
             inner += 1;
         }
         assert!(top > 10_000 && inner > 10_000);
-        let started = std::time::Instant::now();
-        let model = read(&[("WORKSPACE", &ws), ("deps.bzl", &bzl)]);
+        let model = read_in_steps(top + inner, &[("WORKSPACE", &ws), ("deps.bzl", &bzl)]);
         assert!(model.unreadable.is_none() && model.gaps.is_empty());
         assert_eq!(
             (model.stmts.len(), model.macros[0].body.len()),
@@ -2769,30 +2860,28 @@ mod tests {
         for n in (0..top + inner).step_by((top + inner) / 50) {
             let name = format!("r{n}");
             let file = if n < top { "WORKSPACE" } else { "deps.bzl" };
-            let found = verdict(&model, &name, &|_| None);
+            let found = verdict_in_steps(&model, &name, top + inner);
             assert!(
                 found.starts_with(&format!("exact {file}:")),
                 "{name}: {found}"
             );
         }
-        let took = started.elapsed();
-        assert!(took.as_secs() < 60, "reading and 50 answers took {took:?}");
     }
 
     /// The cost does not depend on what the bytes are spent on. One name
     /// bound again on every line of a file at the cap, and one macro
     /// called from every line of a `WORKSPACE` at the cap, its body a
     /// file of rules or of statements that are not read, are read and
-    /// answered in seconds: a look at every binding of a name for each
-    /// binding, or a walk of the body for each call, would take minutes.
+    /// answered in steps that number what the files hold: a look at every
+    /// binding of a name for each binding, or a walk of the body for each
+    /// call, takes thousands of millions.
     #[test]
-    fn rebound_names_and_repeated_calls_at_the_size_cap_read_in_time() {
+    fn rebound_names_and_repeated_calls_at_the_size_cap_read_in_linear_steps() {
         let cap = starlark::MAX_FILE_BYTES;
         let fill = |head: String, line: &str| {
             let lines = (cap - head.len()) / line.len();
             (head + &line.repeat(lines), lines)
         };
-        let started = std::time::Instant::now();
 
         // One name, bound on every line of the file and of a macro file.
         let rule = "def deps():\n    http_archive(name = \"inner\", urls = [\"m\"])\n";
@@ -2800,11 +2889,14 @@ mod tests {
         let (ws, bound) = fill(head + &archive("a"), "X = 1\n");
         let (bzl, _) = fill(format!("{HTTP}{rule}"), "X = 1\n");
         assert!(bound > 100_000);
-        let model = read(&[("WORKSPACE", &ws), ("deps.bzl", &bzl)]);
+        let model = read_in_steps(2 * bound, &[("WORKSPACE", &ws), ("deps.bzl", &bzl)]);
         assert!(model.unreadable.is_none() && model.gaps.is_empty());
         assert_eq!(model.stmts.len(), bound + 4);
         assert!(model.files.iter().all(|file| file.constants.is_empty()));
-        assert_eq!(verdict(&model, "dep", &|_| None), "exact WORKSPACE:4 a");
+        assert_eq!(
+            verdict_in_steps(&model, "dep", bound),
+            "exact WORKSPACE:4 a"
+        );
         assert_eq!(
             verdict(&model, "inner", &|_| None),
             "exact deps.bzl:3 macro m"
@@ -2826,7 +2918,7 @@ mod tests {
             rules += 1;
         }
         assert!(calls > 100_000 && rules > 10_000);
-        let model = read(&[("WORKSPACE", &ws), ("deps.bzl", &bzl)]);
+        let model = read_in_steps(calls + rules, &[("WORKSPACE", &ws), ("deps.bzl", &bzl)]);
         assert!(model.unreadable.is_none() && model.gaps.is_empty());
         assert_eq!(
             (model.stmts.len(), model.macros[0].body.len()),
@@ -2834,11 +2926,14 @@ mod tests {
         );
         for n in [0, rules / 2, rules - 1] {
             assert_eq!(
-                verdict(&model, &format!("r{n}"), &|_| None),
+                verdict_in_steps(&model, &format!("r{n}"), calls + rules),
                 format!("unknown ReplacedByMacro at line {}", calls + 2)
             );
         }
-        assert_eq!(verdict(&model, "other", &|_| None), "undefined");
+        assert_eq!(
+            verdict_in_steps(&model, "other", calls + rules),
+            "undefined"
+        );
         let once = ws.replacen("deps()\n", "pass\n", calls - 1);
         let model = read(&[("WORKSPACE", &once), ("deps.bzl", &bzl)]);
         assert_eq!(
@@ -2850,18 +2945,70 @@ mod tests {
         // them, for each call, may define the name.
         let (bzl, unread) = fill("def deps():\n".to_string(), "    f()\n");
         assert!(unread > 100_000);
-        let model = read(&[("WORKSPACE", &ws), ("deps.bzl", &bzl)]);
+        let model = read_in_steps(calls + unread, &[("WORKSPACE", &ws), ("deps.bzl", &bzl)]);
         assert_eq!(model.macros[0].body.len(), unread);
         assert_eq!(
-            verdict(&model, "dep", &|_| None),
+            verdict_in_steps(&model, "dep", calls + unread),
             format!(
                 "unknown Opaque at deps.bzl:{} called at line {}",
                 unread + 1,
                 calls + 2
             )
         );
-        let took = started.elapsed();
-        assert!(took.as_secs() < 60, "reading and 8 answers took {took:?}");
+    }
+
+    /// Nor on which name the bindings are of. A macro file at the cap
+    /// that binds one name to `repository_rule(...)` on every line, one
+    /// that binds on every line the name a `WORKSPACE` at the cap loads on
+    /// every line, and one whose every function binds and uses a name of
+    /// its own, are read in steps that number what the files hold. What a
+    /// name is bound to is found once for a file ([`Bound`]): asked of the
+    /// statement reader for each statement, the first took 16 s in a
+    /// debug build at 40,000 lines, four times the time of 20,000, and
+    /// the second 10 s at 20,000 loads.
+    #[test]
+    fn names_bound_and_asked_on_every_line_at_the_size_cap_read_in_linear_steps() {
+        let cap = starlark::MAX_FILE_BYTES;
+        let fill = |head: &str, line: &str| {
+            let lines = (cap - head.len()) / line.len();
+            (format!("{head}{}", line.repeat(lines)), lines)
+        };
+
+        // No name bound twice is a rule.
+        let (bzl, bound) = fill("", "x = repository_rule()\n");
+        assert!(bound > 40_000);
+        let ws = "load(\"//:deps.bzl\", \"x\")\nx(name = \"dep\")\n";
+        let model = read_in_steps(bound, &[("WORKSPACE", ws), ("deps.bzl", &bzl)]);
+        assert!(model.unreadable.is_none() && model.gaps.is_empty());
+        assert!(model.files[1].rules.is_empty());
+        assert_eq!(
+            verdict(&model, "dep", &|_| None),
+            "unknown Opaque at line 2"
+        );
+
+        // No function whose name is bound twice is read, however often
+        // it is asked for.
+        let (ws, loads) = fill("", "load(\"//:deps.bzl\", \"deps\")\n");
+        let (bzl, bound) = fill("def deps():\n    pass\n", "deps = 1\n");
+        assert!(loads > 30_000 && bound > 100_000);
+        let model = read_in_steps(loads + bound, &[("WORKSPACE", &ws), ("deps.bzl", &bzl)]);
+        assert!(model.unreadable.is_none() && model.gaps.is_empty());
+        assert!(model.macros.is_empty());
+
+        // A name of its own in every function.
+        let (mut bzl, mut names, mut defs) = (String::new(), String::new(), 0);
+        while bzl.len() + 64 < cap {
+            let _ = write!(bzl, "def f{defs}():\n    x = 1\n    g(x + 1)\n");
+            let _ = write!(names, ", \"f{defs}\"");
+            defs += 1;
+        }
+        assert!(defs > 20_000);
+        let ws = format!("load(\"//:deps.bzl\"{names})\n");
+        let model = read_in_steps(3 * defs, &[("WORKSPACE", &ws), ("deps.bzl", &bzl)]);
+        assert!(model.unreadable.is_none() && model.gaps.is_empty());
+        assert_eq!(model.macros.len(), defs);
+        let unread = |m: &Macro| matches!(&m.body[1].kind, WsStmtKind::Call(call) if call.impure);
+        assert!(model.macros.iter().all(unread));
     }
 
     /// The marker the repository of `definition` holds in the probes: the
@@ -3510,12 +3657,13 @@ mod tests {
     /// file of as many `def`s as the cap takes, each loaded by name and
     /// called once from a `WORKSPACE` at the cap, and each named by a
     /// `repository_macro` directive of another, is read, linked and
-    /// answered in seconds: a walk of the file for each loaded name, and
-    /// of the functions read so far for each call and each directive,
-    /// took this test 72 s in a debug build before the functions were
-    /// found by name.
+    /// answered in steps that number what the files hold. A walk of the
+    /// file for each loaded name, and of the functions read so far for
+    /// each call and each directive, takes thousands of millions: it took
+    /// this test 72 s in a debug build before the functions were found by
+    /// name.
     #[test]
-    fn a_macro_file_of_many_functions_is_linked_in_time() {
+    fn a_macro_file_of_many_functions_is_linked_in_linear_steps() {
         let cap = starlark::MAX_FILE_BYTES;
         let (mut bzl, mut defs) = (String::new(), 0);
         while bzl.len() + 32 < cap {
@@ -3529,10 +3677,10 @@ mod tests {
             loaded += 1;
         }
         assert!(loaded > 10_000, "{loaded} of {defs}");
-        let started = std::time::Instant::now();
 
         let ws = format!("load(\"//:deps.bzl\"{names})\n{calls}");
-        let model = read(&[("WORKSPACE", &ws), ("deps.bzl", &bzl)]);
+        let files = [("WORKSPACE", &*ws), ("deps.bzl", &*bzl)];
+        let model = read_in_steps(loaded + 2 * defs, &files);
         assert!(model.unreadable.is_none() && model.gaps.is_empty());
         assert_eq!(
             (model.stmts.len(), model.macros.len()),
@@ -3543,7 +3691,7 @@ mod tests {
             _ => false,
         };
         assert!(model.stmts[1..].iter().all(linked));
-        assert_eq!(verdict(&model, "dep", &|_| None), "undefined");
+        assert_eq!(verdict_in_steps(&model, "dep", 2 * loaded), "undefined");
 
         // The same functions, named by directives and never loaded.
         let mut ws = String::new();
@@ -3553,15 +3701,341 @@ mod tests {
             named += 1;
         }
         assert!(named > 10_000, "{named} of {defs}");
-        let model = read(&[("WORKSPACE", &ws), ("deps.bzl", &bzl)]);
+        let files = [("WORKSPACE", &*ws), ("deps.bzl", &*bzl)];
+        let model = read_in_steps(named + 2 * defs, &files);
         assert!(model.unreadable.is_none() && model.gaps.is_empty());
         assert_eq!(model.macros.len(), named);
-        let macros = model.repository_macros();
+        let macros = counted(ANSWER_STEPS, named, || model.repository_macros());
         assert_eq!(macros.len(), named);
         let read = |(n, named): (usize, &RepositoryMacro<'_>)| named.macro_def == Some(n);
         assert!(macros.iter().enumerate().all(read));
-        let took = started.elapsed();
-        assert!(took.as_secs() < 60, "reading and linking took {took:?}");
+    }
+
+    /// What the recognizers of the rulesets in `ws-units.json` would vouch
+    /// for: the repository rules, the setup macros, which declare none of
+    /// the names asked here, and the hub's macro, which declares a spoke
+    /// for each requirement.
+    fn hubs(origin: &Origin<'_>) -> Option<Effect> {
+        let label = origin.label?;
+        let Repo::Apparent(repo) = &label.repo else {
+            return None;
+        };
+        let setup = Effect::Macro {
+            names: &[],
+            weak: true,
+        };
+        match (repo.as_str(), label.file().as_str(), origin.symbol) {
+            ("bazel_gazelle", "deps.bzl", "go_repository") => Some(Effect::Rule),
+            ("bazel_gazelle", "deps.bzl", "gazelle_dependencies") => Some(setup),
+            ("io_bazel_rules_go", "go/deps.bzl", _) => Some(setup),
+            ("rules_python", "python/repositories.bzl", _) => Some(setup),
+            ("rules_python", "python/pip.bzl", "pip_parse") => Some(Effect::Rule),
+            ("pypi", "requirements.bzl", "install_deps") => Some(Effect::Macro {
+                names: &["pypi_spvictim"],
+                weak: false,
+            }),
+            _ => None,
+        }
+    }
+
+    /// The top-level call of `callee`: its index, its statement and the
+    /// call.
+    fn call_of<'m>(model: &'m WorkspaceModel, callee: &str) -> (usize, &'m WsStmt, &'m WsCall) {
+        let called = |(index, stmt): (usize, &'m WsStmt)| match &stmt.kind {
+            WsStmtKind::Call(call) if call.call.callee == callee => Some((index, stmt, call)),
+            _ => None,
+        };
+        let mut calls = model.stmts.iter().enumerate().filter_map(called);
+        let found = calls
+            .next()
+            .unwrap_or_else(|| panic!("no call of {callee}"));
+        assert!(calls.next().is_none(), "{callee} is called twice");
+        found
+    }
+
+    /// A unit of socket-patch that declares a repository again is a
+    /// `load` of a file under `.socket/` and a call of its macro. Where
+    /// the unit stands decides whether Bazel builds its definition: in a
+    /// chunk after the first one that defines the name it is a silent
+    /// no-op, with exit 0 on the bytes of the first definition.
+    ///
+    /// Probe `rev4-vendored-pypi` built rules_python 1.4.2 with the unit
+    /// appended to the `WORKSPACE` (Bazel 7.7.2: the hub's wheel) and with
+    /// its `load` among the loads of the chunk of `install_deps()` and its
+    /// call after it (7.7.2 and 8.8.2: the unit's wheel). The model puts
+    /// the two calls in the chunks Bazel ran them in, follows the label of
+    /// a file under `.socket/` to the unit's macro, and never calls the
+    /// appended definition the one Bazel builds: its answer is settled by
+    /// the hub's macro, in the chunk before the unit.
+    #[test]
+    fn a_unit_that_declares_a_name_again_governs_only_from_the_chunk_of_the_first() {
+        const UNIT: &str = ".socket/bazel/socket_patch_pypi.bzl";
+        let cells = vectors("ws-units.json");
+        let mut seen = Vec::new();
+        for (case, root, cell) in cells.iter().filter(|(case, ..)| case.starts_with("pypi-")) {
+            let model = WorkspaceModel::read(root, "WORKSPACE").unwrap();
+            assert!(
+                model.unreadable.is_none() && model.gaps.is_empty(),
+                "{case}"
+            );
+            let read: Vec<&str> = model.files.iter().map(|file| file.path.as_str()).collect();
+            assert_eq!(read, ["WORKSPACE", UNIT], "{case}");
+            let (_, hub, _) = call_of(&model, "install_deps");
+            let (_, unit, call) = call_of(&model, "socket_patch_pypi");
+            let made_by = &model.macros[call.macro_def.expect("the unit's macro was read")];
+            assert_eq!(
+                (made_by.file, made_by.name.as_str()),
+                (1, "socket_patch_pypi")
+            );
+            // Bazel built the unit's definition where the unit ran in the
+            // chunk of the hub's.
+            let built = cell["built"].as_str().unwrap();
+            assert_eq!(unit.chunk == hub.chunk, built == "the unit's", "{case}");
+            assert_eq!(unit.chunk > hub.chunk, built == "the hub's", "{case}");
+            let found = verdict(&model, cell["repo"].as_str().unwrap(), &hubs);
+            seen.push((case.as_str(), built, hub.line, unit.line, found));
+        }
+        // The appended unit is not reached: the hub's macro, which is not
+        // read, leaves the answer unknown in its own chunk. In the chunk
+        // of the hub's macro the unit is reached, and its body is a loop
+        // this reader does not follow (the two rows ran two drafts of the
+        // unit's file, with the loop on different lines).
+        let at_hub = "unknown Opaque at line 39".to_string();
+        let in_unit = |line: usize| format!("unknown Opaque at {UNIT}:{line} called at line 41");
+        assert_eq!(
+            seen,
+            [
+                (
+                    "pypi-row7-ws-inline-b7.7.2",
+                    "the unit's",
+                    40,
+                    41,
+                    in_unit(57)
+                ),
+                (
+                    "pypi-row7-ws-inline-b8.8.2",
+                    "the unit's",
+                    40,
+                    41,
+                    in_unit(49)
+                ),
+                ("pypi-row7-ws-redeclare-b7.7.2", "the hub's", 39, 42, at_hub),
+            ]
+        );
+    }
+
+    /// The same for a unit whose macro this reader follows. The attack
+    /// report on the Go lanes (`go-unconditional-attack.md`, section 7)
+    /// put a unit that declares `com_example_upstream` again into the
+    /// gazelle `WORKSPACE` of `go-aw35`, whose own rule for the name is in
+    /// a macro file. Appended, Bazel 7.7.2 built the user's rule, while
+    /// `bazel query //external:com_example_upstream` printed the unit's;
+    /// in the chunk before the user's macro, it built the unit's. The
+    /// probe kept the workspace as it was before the two steps: the unit
+    /// and its file are written here from the report and the query log.
+    #[test]
+    fn a_unit_in_an_earlier_chunk_governs_and_an_appended_one_does_not() {
+        const UNIT: &str = "# Socket security patches (managed by socket-patch)\n\
+                            load(\"//:.socket/bazel/socket_repos.bzl\", \"socket_patch_repositories\")\n\n\
+                            socket_patch_repositories()\n";
+        const UNIT_FILE: &str = "load(\"@bazel_gazelle//:deps.bzl\", \"go_repository\")\n\n\
+                                 def socket_patch_repositories():\n    go_repository(\n        \
+                                 name = \"com_example_upstream\",\n        \
+                                 importpath = \"example.com/upstream\",\n        \
+                                 urls = [\"https://socket-fixture.invalid/v1.0.0-socketpatch.1.zip\"],\n    )\n";
+        let cells = vectors("ws-units.json");
+        let (_, root, cell) = cells.iter().find(|(case, ..)| case == "go-aw35").unwrap();
+        let name = cell["repo"].as_str().unwrap();
+        let text = |path: &str| match &root.0[path] {
+            FileText::Bytes(bytes) => String::from_utf8(bytes.clone()).unwrap(),
+            _ => panic!("{path}"),
+        };
+        let (workspace, deps) = (text("WORKSPACE"), text("deps.bzl"));
+        // The first `load` after the two archives opens the second chunk.
+        let (archives, rest) = workspace
+            .split_once("load(\"@io_bazel_rules_go//go:deps.bzl\"")
+            .unwrap();
+        let early = format!("{archives}{UNIT}\nload(\"@io_bazel_rules_go//go:deps.bzl\"{rest}");
+        let appended = format!("{workspace}\n{UNIT}");
+        let made_in = |workspace: &str, knowledge: Knowledge<'_>| {
+            let model = read(&[
+                ("WORKSPACE", workspace),
+                ("deps.bzl", &deps),
+                (".socket/bazel/socket_repos.bzl", UNIT_FILE),
+            ]);
+            assert!(model.unreadable.is_none() && model.gaps.is_empty());
+            match model.governing_with(name, knowledge) {
+                Governing::Exact(definition) => {
+                    let site = model.site(&definition).unwrap();
+                    let (_, stmt, _) = model.declaration(&definition).unwrap();
+                    format!("{}:{}", site.file, stmt.line)
+                }
+                other => format!("{other:?}"),
+            }
+        };
+        // What Bazel built: the user's rule, the user's rule, the unit's.
+        assert_eq!(cell["built"], "the macro's");
+        assert_eq!(made_in(&workspace, &hubs), "deps.bzl:4");
+        assert_eq!(made_in(&appended, &hubs), "deps.bzl:4");
+        assert_eq!(made_in(&early, &hubs), ".socket/bazel/socket_repos.bzl:4");
+        // A reader that does not know gazelle's rule proves neither.
+        for workspace in [&workspace, &appended, &early] {
+            assert!(made_in(workspace, &|_| None).starts_with("Unknown("));
+        }
+    }
+
+    /// What [`Scope::callee`] answered before the names of a file were
+    /// indexed ([`Bound`]): from a walk of the bindings of the name by
+    /// the statement reader, for each question.
+    fn walked(scope: &Scope<'_>, def: Option<&Stmt>, name: &str, at: usize) -> Callee {
+        let uses = match def {
+            Some(def) => scope.file.uses_in(def, name),
+            None => scope.file.uses(name),
+        };
+        let (callee, from) = match uses.bindings[..] {
+            [] => (Callee::Builtin, 0),
+            _ => scope
+                .loaded_once(&uses.bindings)
+                .unwrap_or((Callee::Unknown, 0)),
+        };
+        if from < at || callee == Callee::Builtin {
+            callee
+        } else {
+            Callee::Unknown
+        }
+    }
+
+    /// Every `def` of a file, the nested ones included.
+    fn defs_of<'s>(stmts: &'s [Stmt], out: &mut Vec<&'s Stmt>) {
+        for stmt in stmts {
+            if let StmtKind::Def { body, .. } = &stmt.kind {
+                out.push(stmt);
+                defs_of(body, out);
+            }
+        }
+    }
+
+    /// Holds the index of one file against the statement reader: for
+    /// every name written in the file, at the top level and in every
+    /// function, before, at and after each of its bindings. Gives the
+    /// number of questions asked.
+    fn index_agrees(bytes: &[u8], dialect: Dialect) -> usize {
+        let Ok(file) = starlark::read(bytes, dialect) else {
+            return 0;
+        };
+        let scope = Scope::new(&file, "file", None);
+        let mut defs = Vec::new();
+        defs_of(&file.stmts, &mut defs);
+        let mut names: BTreeSet<&str> = file.names_in((0, bytes.len())).into_iter().collect();
+        names.extend([REPOSITORY_RULE, "no statement writes this name"]);
+        let mut asked = 0;
+        for name in names {
+            let uses = file.uses(name);
+            let count = scope.bound.get(name.as_bytes()).map_or(0, |of| of.count);
+            assert_eq!(count, uses.bindings.len(), "{name}");
+            let mut places = vec![0, 1, bytes.len()];
+            for binding in &uses.bindings {
+                places.extend([binding.span.0, binding.span.0 + 1, binding.span.1]);
+            }
+            for def in std::iter::once(None).chain(defs.iter().copied().map(Some)) {
+                for &at in &places {
+                    let found = scope.callee(def, name, at);
+                    assert_eq!(found, walked(&scope, def, name, at), "{name} at {at}");
+                    asked += 1;
+                }
+            }
+        }
+        // The rules of the file, as a walk for each statement found them.
+        let rebound = !file.uses(REPOSITORY_RULE).bindings.is_empty();
+        let rule = |stmt: &Stmt| match &stmt.kind {
+            StmtKind::Bind {
+                name,
+                name_span,
+                call,
+            } if call.callee == REPOSITORY_RULE => {
+                let once =
+                    matches!(file.uses(name).bindings[..], [only] if only.span == *name_span);
+                once.then(|| (name.clone(), stmt.span))
+            }
+            _ => None,
+        };
+        let rules: BTreeMap<String, Span> = match dialect == Dialect::Bzl && !rebound {
+            true => file.stmts.iter().filter_map(rule).collect(),
+            false => BTreeMap::new(),
+        };
+        assert_eq!(scope.source.rules, rules);
+        asked
+    }
+
+    /// What a name is bound to is looked up in an index of the file, and
+    /// the index answers what the statement reader answers: for the files
+    /// of both probes and of the real `WORKSPACE` corpus, as they are and
+    /// with bytes replaced, inserted and removed, read as a `WORKSPACE`
+    /// and as a macro file.
+    #[test]
+    fn the_index_of_a_file_answers_what_a_walk_of_its_bindings_answers() {
+        const BYTES: &[u8] = b"\"'\\#()[]{},=:;.*+-\n\r\t \0defloadforinx_% ";
+        let mut texts: Vec<Vec<u8>> = Vec::new();
+        let cells = vectors("ws-order.json")
+            .into_iter()
+            .chain(vectors("ws-shapes.json"));
+        for (_, root, _) in cells {
+            for text in root.0.into_values() {
+                if let FileText::Bytes(bytes) = text {
+                    texts.push(bytes);
+                }
+            }
+        }
+        let corpus = fixtures().join("starlark").join("corpus");
+        let mut paths: Vec<_> = std::fs::read_dir(&corpus)
+            .expect("the corpus")
+            .map(|entry| entry.expect("an entry").path())
+            .filter(|path| path.extension().is_none_or(|ext| ext != "golden"))
+            .collect();
+        paths.sort();
+        texts.extend(
+            paths
+                .iter()
+                .map(|path| std::fs::read(path).expect("a file")),
+        );
+        // Shapes the files above do not hold: a name bound at the top
+        // level and in a function, by a parameter, a loop and a nested
+        // function, and loaded twice.
+        texts.push(
+            b"load(\"//:a.bzl\", \"f\", g = \"h\")\nload(\"//:a.bzl\", \"f\")\nx = repository_rule()\n\
+              y = repository_rule()\ny = 1\ndef m(f, p = x):\n    z = f(p)\n    for g in z:\n        \
+              x(name = g)\n    def n(q):\n        y = q\n    return y\ndef o():\n    f()\n    g()\n\
+              if x:\n    w = 1\nw()\n"
+                .to_vec(),
+        );
+        let mut rng = Rng::new(0x1d5);
+        let (mut asked, mut cases) = (0, 0);
+        for text in &texts {
+            for dialect in [Dialect::Workspace, Dialect::Bzl] {
+                asked += index_agrees(text, dialect);
+                // Large files get fewer cases each, so the sweep stays
+                // fast.
+                for _ in 0..(20_000 / (text.len() + 500)).clamp(2, 30) {
+                    let mut bytes = text.clone();
+                    for _ in 0..1 + rng.below(3) {
+                        let at = rng.below(bytes.len() + 1);
+                        let byte = BYTES[rng.below(BYTES.len())];
+                        match rng.below(3) {
+                            0 => bytes.insert(at, byte),
+                            1 if at < bytes.len() => bytes[at] = byte,
+                            _ if at < bytes.len() => drop(bytes.remove(at)),
+                            _ => {}
+                        }
+                    }
+                    asked += index_agrees(&bytes, dialect);
+                    cases += 1;
+                }
+            }
+        }
+        assert!(
+            cases > 1_000 && asked > 100_000,
+            "{cases} cases, {asked} questions"
+        );
     }
 
     /// No input makes the reader panic, and no answer names a statement

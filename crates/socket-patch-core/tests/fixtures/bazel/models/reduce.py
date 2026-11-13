@@ -3,9 +3,9 @@
 
     python3 reduce.py <campaign probes directory> <output directory>
 
-Run with this directory as the output it rewrites `s1c.json`, `s2.json` and `ws-order.json`
-byte for byte. The probe directory is not part of this repository; README.md says what it
-holds. The `*.golden` files are not made here: they are what the readers produce.
+Run with this directory as the output it rewrites `s1c.json`, `s2.json`, `ws-order.json` and
+`ws-units.json` byte for byte. The probe directory is not part of this repository; README.md
+says what it holds. The `*.golden` files are not made here: they are what the readers produce.
 """
 import json
 import os
@@ -111,3 +111,36 @@ for case in sorted(os.listdir(group)):
         "query_shows": shown.pop(),
     }
 write("ws-order.json", cells)
+
+# ---- A unit that declares a repository again: after, in and before the chunk of the first ---
+# The `-fresh` copy of a pypi row is the workspace as the row's build read it: the unit is in
+# the `WORKSPACE` and its macro file under `.socket/`. The Go workspace is the one the two
+# steps of the attack report started from; the probe kept no copy with the unit in it.
+cells = {}
+group = os.path.join(PROBES, "rev4-vendored-pypi")
+HOOK = ".socket/bazel/socket_patch_pypi.bzl"
+for row, description in [
+    ("row7-ws-redeclare-b7.7.2", "the unit appended after the chunk of install_deps()"),
+    ("row7-ws-inline-b7.7.2", "the unit's load among the loads of the chunk of install_deps(), its call after it"),
+    ("row7-ws-inline-b8.8.2", "the same on Bazel 8.8.2"),
+]:
+    root = os.path.join(group, "ws", row + "-fresh")
+    summary = open(os.path.join(group, "logs", row, "SUMMARY.txt")).read()
+    ran = re.search(r"^a03-patched-run \| exit=0 \| SPVICTIM=(\S+)", summary, re.M).group(1)
+    assert ran == "vulnerable" or ran == "patched-" + row, (row, ran)
+    cells["pypi-" + row] = {
+        "description": description,
+        "repo": "pypi_spvictim",
+        "files": {name: open(os.path.join(root, name)).read() for name in ("WORKSPACE", HOOK)},
+        "bazel": row.rsplit("-b", 1)[1],
+        "built": "the hub's" if ran == "vulnerable" else "the unit's",
+    }
+root = os.path.join(PROBES, "rev4-go-unconditional-attack", "ws", "aw35", "ws")
+cells["go-aw35"] = {
+    "description": "a gazelle WORKSPACE whose go_repository rules are in a macro file; no unit",
+    "repo": "com_example_upstream",
+    "files": {name: open(os.path.join(root, name)).read() for name in ("WORKSPACE", "deps.bzl")},
+    "bazel": "7.7.2",
+    "built": "the macro's",
+}
+write("ws-units.json", cells)

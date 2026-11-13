@@ -680,6 +680,35 @@ fn text(constants: &Constants, call: &Call, name: &str) -> Result<Option<String>
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// What [`steps`] has counted on this thread, and the count past
+    /// which it fails the test that runs there.
+    static STEPS: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, u64::MAX)) };
+}
+
+/// Counts what a reader of this file or of `workspace_file` handles: a
+/// statement, a binding, a name, a function, a gap, an event of the order
+/// rule. Each loop of a reader counts what it visits, and a query of a
+/// name counts the places the answer names.
+///
+/// The size-cap tests hold a reader to a count that grows with its input
+/// (`tests::counted`). They read no clock, so a busy machine cannot fail
+/// them, and a walk that is repeated for every statement cannot pass
+/// them: it is stopped at the bound, not after the minutes it would run.
+/// Only a test build counts.
+pub(super) fn steps(count: usize) {
+    #[cfg(test)]
+    STEPS.with(|counted| {
+        let (taken, most) = counted.get();
+        let taken = taken + count as u64;
+        counted.set((taken, most));
+        assert!(taken <= most, "the reader took more steps than its bound");
+    });
+    #[cfg(not(test))]
+    let _ = count;
+}
+
 /// The names one top-level statement of `file` binds to a literal. Found
 /// once for the file, so that resolving an argument costs a lookup and
 /// not a walk over every use of the name; and asked once for each name,
@@ -688,6 +717,7 @@ fn text(constants: &Constants, call: &Call, name: &str) -> Result<Option<String>
 pub(super) fn constants(file: &File<'_>) -> Constants {
     let mut constants = Constants::new();
     let mut asked = BTreeSet::new();
+    steps(file.stmts.len());
     for stmt in &file.stmts {
         let StmtKind::ConstBind { name, .. } = &stmt.kind else {
             continue;
@@ -696,7 +726,9 @@ pub(super) fn constants(file: &File<'_>) -> Constants {
         if !asked.insert(name.as_str()) {
             continue;
         }
-        if let Some(value) = file.constant(name, usize::MAX).exact().flatten() {
+        let answer = file.constant(name, usize::MAX);
+        steps(1 + answer.reasons().len());
+        if let Some(value) = answer.exact().flatten() {
             let (value, bound_by) = (value.clone(), stmt.span.1);
             constants.insert(name.clone(), Constant { value, bound_by });
         }
@@ -744,6 +776,7 @@ struct Reader<'v> {
 
 impl Reader<'_> {
     fn gap(&mut self, scope: GapScope, at: At, why: GapWhy) {
+        steps(1);
         self.model.gaps.push(ModuleGap { scope, at, why });
     }
 
@@ -799,6 +832,7 @@ impl Reader<'_> {
             proxies: BTreeMap::new(),
             rules: BTreeMap::new(),
         };
+        steps(file.stmts.len());
         for stmt in &file.stmts {
             let at = cx.at(stmt.span);
             match &stmt.kind {
@@ -829,6 +863,14 @@ impl Reader<'_> {
     /// The uses of a directive or a proxy that no statement above
     /// accounts for. Starlark has no other way to reach either than by
     /// its name, so with none left the lists are complete.
+    ///
+    /// A name that several statements bind to a proxy is several proxies,
+    /// and each use belongs to one of them: the proxy the name is bound to
+    /// where the use is written, which is the last one bound above it.
+    /// Every binding of such a name is a reason of its own, so each of the
+    /// proxies has a gap. The gaps number what the reasons do: a gap for
+    /// each reason on each proxy would cost the square of a file that
+    /// binds one name to a proxy on every line.
     fn unmodelled(&mut self, cx: &Cx<'_>) {
         let why = |name: &str, why| GapWhy::Unmodelled {
             name: name.to_string(),
@@ -836,17 +878,38 @@ impl Reader<'_> {
         };
         let rules = cx.rules.keys().map(String::as_str);
         for name in DIRECTIVES.into_iter().chain(rules) {
-            for reason in cx.file.calls(name).reasons() {
+            let answer = cx.file.calls(name);
+            steps(1 + answer.seen().len() + answer.reasons().len());
+            for reason in answer.reasons() {
                 let at = cx.at(reason.span);
                 self.gap(GapScope::Everything, at, why(name, reason.why));
             }
         }
         for (var, bound) in &cx.proxies {
-            for reason in cx.file.tags(var).reasons() {
-                for proxy in bound {
-                    let at = cx.at(reason.span);
-                    self.gap(GapScope::Proxy(*proxy), at, why(var, reason.why));
-                }
+            let answer = cx.file.tags(var);
+            steps(1 + answer.seen().len() + answer.reasons().len() + bound.len());
+            let mut reached = vec![false; bound.len()];
+            for reason in answer.reasons() {
+                // The proxies of one name are in the order of their
+                // statements. A use above all of them goes to the first.
+                let starts = |proxy: &usize| self.model.proxies[*proxy].at.span.0;
+                let above = bound.partition_point(|proxy| starts(proxy) <= reason.span.0);
+                let meant = above.saturating_sub(1);
+                let (Some(&proxy), Some(hit)) = (bound.get(meant), reached.get_mut(meant)) else {
+                    continue;
+                };
+                *hit = true;
+                let at = cx.at(reason.span);
+                self.gap(GapScope::Proxy(proxy), at, why(var, reason.why));
+            }
+            // No proxy of a name that has a reason is left without a gap.
+            let Some(reason) = answer.reasons().first() else {
+                continue;
+            };
+            let unreached = bound.iter().zip(&reached).filter(|(_, reached)| !**reached);
+            for (proxy, _) in unreached {
+                let at = cx.at(reason.span);
+                self.gap(GapScope::Proxy(*proxy), at, why(var, reason.why));
             }
         }
     }
@@ -1168,6 +1231,42 @@ pub(super) mod tests {
             "{} differs; bless an intended change with SOCKET_PATCH_BLESS_GOLDEN=1\n{got}",
             path.display()
         );
+    }
+
+    /// Puts the bound of the test back when a count ends, also when it
+    /// ends in a panic: tests may run one after another on one thread.
+    struct Restore(u64);
+
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            STEPS.with(|steps| steps.set((steps.get().0, self.0)));
+        }
+    }
+
+    /// Runs `work`, which may take `most` steps for each of `statements`
+    /// ([`steps`]), and fails the test at the step that passes the bound.
+    /// The count is this thread's, so tests that run beside this one do
+    /// not add to it.
+    #[track_caller]
+    pub(in crate::bazel) fn counted<T>(
+        most: u64,
+        statements: usize,
+        work: impl FnOnce() -> T,
+    ) -> T {
+        let (before, outer) = STEPS.with(std::cell::Cell::get);
+        let bound = before.saturating_add(most * statements as u64);
+        STEPS.with(|steps| steps.set((before, bound.min(outer))));
+        let restore = Restore(outer);
+        let out = work();
+        drop(restore);
+        // The count is of what ran: a reader that stopped counting would
+        // pass any bound.
+        let taken = STEPS.with(std::cell::Cell::get).0 - before;
+        assert!(
+            taken >= statements as u64 / 2,
+            "only {taken} steps for {statements} statements"
+        );
+        out
     }
 
     fn read(files: &[(&str, &str)]) -> ModuleModel {
@@ -2364,12 +2463,18 @@ o = use_extension("//tools:ext.bzl", "ext")
         golden("corpus-modules.golden", &out);
     }
 
+    /// The most steps reading may take for each statement it reads
+    /// ([`steps`]). The reader took 6 at most on the files of the tests
+    /// below; a walk that is repeated for each statement of a file at the
+    /// size cap takes thousands.
+    const READ_STEPS: u64 = 12;
+
     /// Reading costs what the files cost: a root and a segment at the
     /// size cap, one full of proxies with a tag and an import each and
-    /// the other of dependencies with a constant for a version, read in
-    /// seconds.
+    /// the other of dependencies with a constant for a version, are read
+    /// in steps that number what they hold.
     #[test]
-    fn files_at_the_size_cap_read_in_time() {
+    fn files_at_the_size_cap_read_in_linear_steps() {
         let cap = starlark::MAX_FILE_BYTES;
         let mut root_text = String::from("include(\"//:deps.MODULE.bazel\")\n");
         let mut proxies = 0;
@@ -2389,8 +2494,8 @@ o = use_extension("//tools:ext.bzl", "ext")
             deps += 1;
         }
         assert!(proxies > 10_000 && deps > 20_000);
-        let started = std::time::Instant::now();
-        let model = read(&[(MODULE_FILE, &root_text), ("deps.MODULE.bazel", &segment)]);
+        let files = [(MODULE_FILE, &*root_text), ("deps.MODULE.bazel", &*segment)];
+        let model = counted(READ_STEPS, 3 * proxies + deps, || read(&files));
         assert!(model.is_exact(), "{:?}", model.gaps.first());
         assert_eq!(
             (
@@ -2404,16 +2509,15 @@ o = use_extension("//tools:ext.bzl", "ext")
         assert_eq!(model.deps[deps - 1].version.as_deref(), Some("1.0"));
         assert_eq!(model.visible_names().len(), proxies + deps);
         assert_eq!(model.usages().len(), proxies);
-        let took = started.elapsed();
-        assert!(took.as_secs() < 60, "reading took {took:?}");
     }
 
     /// The cost does not depend on what the bytes are spent on: a root
     /// and a segment at the size cap that bind one name again on every
-    /// line read in seconds, where a look at every binding of the name
-    /// for each of its bindings would take minutes.
+    /// line are read in steps that number their lines, where a look at
+    /// every binding of the name for each of its bindings takes
+    /// thousands of millions.
     #[test]
-    fn a_name_bound_on_every_line_at_the_size_cap_reads_in_time() {
+    fn a_name_bound_on_every_line_at_the_size_cap_reads_in_linear_steps() {
         const LINE: &str = "X = \"1\"\n";
         let fill = |head: &str| {
             let lines = (starlark::MAX_FILE_BYTES - head.len()) / LINE.len();
@@ -2423,9 +2527,8 @@ o = use_extension("//tools:ext.bzl", "ext")
             fill("include(\"//:deps.MODULE.bazel\")\nbazel_dep(name = \"a\", version = X)\n");
         let (segment, _) = fill("bazel_dep(name = \"b\", version = X)\n");
         assert!(bound > 100_000);
-        let started = std::time::Instant::now();
-        let model = read(&[(MODULE_FILE, &root_text), ("deps.MODULE.bazel", &segment)]);
-        let took = started.elapsed();
+        let files = [(MODULE_FILE, &*root_text), ("deps.MODULE.bazel", &*segment)];
+        let model = counted(READ_STEPS, 2 * bound, || read(&files));
         assert!(model.is_exact(), "{:?}", model.gaps.first());
         // A name bound twice is no constant, so the version is not read.
         assert!(model.files.iter().all(|file| file.constants.is_empty()));
@@ -2435,10 +2538,92 @@ o = use_extension("//tools:ext.bzl", "ext")
             .map(|dep| (dep.name.as_str(), dep.version.as_deref()))
             .collect();
         assert_eq!(deps, [("b", None), ("a", None)]);
-        assert!(took.as_secs() < 60, "reading took {took:?}");
         // Bound once, it is one.
         let model = root("X = \"1\"\nbazel_dep(name = \"a\", version = X)\n");
         assert_eq!(model.deps[0].version.as_deref(), Some("1"));
+    }
+
+    /// A name that several statements bind to a proxy is several proxies.
+    /// Each has a gap for its own binding, and each use of the name is
+    /// one gap more, of the proxy the name is bound to where the use is
+    /// written.
+    #[test]
+    fn a_use_of_a_name_bound_to_several_proxies_is_a_gap_of_the_one_it_means() {
+        use GapScope::Proxy;
+        let gaps = |model: &ModuleModel| -> Vec<(GapScope, usize, Why)> {
+            let unmodelled = |gap: &ModuleGap| match &gap.why {
+                GapWhy::Unmodelled { name, why } if name == "m" => {
+                    Some((gap.scope, gap.at.line, *why))
+                }
+                _ => None,
+            };
+            model.gaps.iter().filter_map(unmodelled).collect()
+        };
+        let model = root(
+            "m = use_extension(\"//:a.bzl\", \"a\")\nm.t(name = \"x\")\nfirst = m\n\
+             m = use_extension(\"//:b.bzl\", \"b\")\nm.t(name = \"y\")\nL = [m]\n",
+        );
+        assert_eq!(
+            gaps(&model),
+            [
+                (Proxy(0), 1, Why::Rebound),
+                (Proxy(1), 4, Why::Rebound),
+                (Proxy(0), 3, Why::UnmodelledUse),
+                (Proxy(1), 6, Why::UnmodelledUse),
+            ]
+        );
+        // Each tag is its proxy's, and neither proxy is exact.
+        let tagged: Vec<usize> = model.tags.iter().map(|tag| tag.proxy).collect();
+        assert_eq!(tagged, [0, 1]);
+        assert!((0..2).all(|proxy| model.gaps_for(proxy).count() == 2));
+
+        // A use above every binding goes to the first proxy, and a
+        // binding that makes no proxy to the proxy above it.
+        let model = root(
+            "early = m\nm = use_extension(\"//:a.bzl\", \"a\")\nm = 1\n\
+             m = use_extension(\"//:b.bzl\", \"b\")\n",
+        );
+        assert_eq!(
+            gaps(&model),
+            [
+                (Proxy(0), 2, Why::Rebound),
+                (Proxy(0), 3, Why::Rebound),
+                (Proxy(1), 4, Why::Rebound),
+                (Proxy(0), 1, Why::UnmodelledUse),
+            ]
+        );
+
+        // One proxy has every reason of its name, as before.
+        let model = root("m = use_extension(\"//:a.bzl\", \"a\")\nfirst = m\nL = [m]\n");
+        assert_eq!(
+            gaps(&model),
+            [
+                (Proxy(0), 2, Why::UnmodelledUse),
+                (Proxy(0), 3, Why::UnmodelledUse),
+            ]
+        );
+    }
+
+    /// Nor does the cost depend on how often a name is bound to a proxy.
+    /// A file at the size cap that binds one name to a proxy on every
+    /// line has a proxy for each line and a gap for each proxy. A gap for
+    /// each binding on each proxy is 800 million gaps here, more than the
+    /// memory of most machines: the count stops a reader that makes them
+    /// at the bound.
+    #[test]
+    fn a_proxy_name_bound_on_every_line_at_the_size_cap_reads_in_linear_steps() {
+        const LINE: &str = "m = use_extension(\"//:e.bzl\", \"e\")\n";
+        let lines = starlark::MAX_FILE_BYTES / LINE.len();
+        assert!(lines > 25_000);
+        let text = LINE.repeat(lines);
+        let model = counted(READ_STEPS, lines, || root(&text));
+        assert_eq!(model.proxies.len(), lines);
+        let own = |(proxy, gap): (usize, &ModuleGap)| {
+            gap.scope == GapScope::Proxy(proxy) && gap.at.line == proxy + 1
+        };
+        assert_eq!(model.gaps.len(), lines);
+        assert!(model.gaps.iter().enumerate().all(own));
+        assert_eq!(model.usages().len(), 1);
     }
 
     /// No input makes the reader panic or index outside a file: every
@@ -2495,6 +2680,25 @@ o = use_extension("//tools:ext.bzl", "ext")
                 assert!(proxies.into_iter().eq(0..model.proxies.len()));
                 for gap in &model.gaps {
                     assert!(gap.at.file < model.files.len() && gap.at.line >= 1);
+                }
+                // A name with a use that is not read leaves no proxy it
+                // is bound to exact.
+                let mut doubted = BTreeSet::new();
+                for gap in &model.gaps {
+                    if let (GapWhy::Unmodelled { name, .. }, GapScope::Proxy(proxy)) =
+                        (&gap.why, gap.scope)
+                    {
+                        doubted.insert((gap.at.file, name.as_str(), proxy));
+                    }
+                }
+                let names: BTreeSet<_> = doubted
+                    .iter()
+                    .map(|(file, name, _)| (*file, *name))
+                    .collect();
+                for (proxy, bound) in model.proxies.iter().enumerate() {
+                    let named = names.contains(&(bound.at.file, bound.var.as_str()));
+                    let own = doubted.contains(&(bound.at.file, bound.var.as_str(), proxy));
+                    assert_eq!(named, own, "proxy {proxy}");
                 }
                 for tag in &model.tags {
                     assert!(tag.proxy < model.proxies.len());
