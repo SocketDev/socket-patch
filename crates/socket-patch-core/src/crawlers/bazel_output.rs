@@ -23,6 +23,7 @@ use crate::bazel::output_tree::{
     self, Candidate, Entry, Found, LinkRoute, Located, Memo, PathClass, Tree, TreeFs, Unsure,
     Verdict, OUTPUT_BASE_MARKER,
 };
+use crate::constants::SOCKET_DIR;
 use crate::utils::fs::open_regular_file_sync;
 
 /// The most that is read of a marker. A marker holds one path, far below
@@ -220,7 +221,19 @@ impl Classifier {
         dir: &Path,
         names: impl IntoIterator<Item = &'a OsStr>,
     ) -> Vec<Tree> {
+        self.marked_trees(dir, names).0
+    }
+
+    /// [`Classifier::trees_marked_by`], and whether a marker test of a
+    /// directory that a name pointed at went unanswered: that directory
+    /// is in no returned tree, and it is not proven to be none.
+    fn marked_trees<'a>(
+        &self,
+        dir: &Path,
+        names: impl IntoIterator<Item = &'a OsStr>,
+    ) -> (Vec<Tree>, bool) {
         let mut trees: Vec<Tree> = Vec::new();
+        let mut unanswered = false;
         for name in names {
             let Some(marked) = output_tree::marked_dir(dir, name) else {
                 continue;
@@ -230,23 +243,31 @@ impl Classifier {
             }
             // A link is judged by where it leads, and a walker follows
             // none: only a tree rooted at the directory itself counts.
-            let own = self.tree_at(&marked).tree;
-            trees.extend(own.filter(|tree| tree.root == marked));
+            let own = self.tree_at(&marked);
+            unanswered |= own.cannot_tell;
+            trees.extend(own.tree.filter(|tree| tree.root == marked));
         }
-        trees
+        (trees, unanswered)
     }
 }
 
-/// What [`vendor_dirs_at`] found.
+/// What [`vendor_dirs_at`] or [`vendor_dirs_below`] found.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct VendorDirs {
-    /// The first-level entries of the root that are Bazel vendor
-    /// directories, sorted.
+    /// The Bazel vendor directories, sorted: first-level entries of the
+    /// root from [`vendor_dirs_at`], directories at any depth below it
+    /// from [`vendor_dirs_below`].
     pub dirs: Vec<PathBuf>,
-    /// The root could not be listed to its end, or a marker test went
+    /// A directory could not be listed to its end, or a marker test went
     /// unanswered: the list may be short, and an empty one does not say
     /// that the root holds no vendor directory.
     pub cannot_tell: bool,
+    /// [`vendor_dirs_below`] reached its bound with directories left to
+    /// search. `dirs` is whole for the levels nearest the root, which are
+    /// searched first, and says nothing about the rest. What could not be
+    /// read is not counted here: that is `cannot_tell`. Never set by
+    /// [`vendor_dirs_at`].
+    pub stopped_short: bool,
 }
 
 /// The first-level directories of the Bazel root `root` that are vendor
@@ -259,8 +280,9 @@ pub struct VendorDirs {
 /// then builds from it and a pin in the lock is a silent no-op. The
 /// directory a tracked flag names needs no marker and is the caller's to
 /// add. Only the first level is listed: that is where the flag's
-/// customary values put it, and a deeper one is found by its marker when
-/// a path into it is classified.
+/// customary values put it. A deeper one is found by its marker when a
+/// path into it is classified, and by [`vendor_dirs_below`], which
+/// searches every level.
 pub fn vendor_dirs_at(root: &Path) -> VendorDirs {
     let classifier = Classifier::new();
     let mut listed_all = true;
@@ -283,6 +305,195 @@ pub fn vendor_dirs_at(root: &Path) -> VendorDirs {
     VendorDirs {
         dirs,
         cannot_tell: !listed_all,
+        stopped_short: false,
+    }
+}
+
+/// How many directories [`vendor_dirs_below`] lists, and links it judges,
+/// unless the caller says otherwise: the bound of the other search of a
+/// whole checkout (`gradle::locks`), so that a huge one cannot stall a
+/// run.
+pub const VENDOR_WALK_DIRS: usize = 20_000;
+
+/// The directories [`vendor_dirs_below`] does not search: git's own, the
+/// packages a JavaScript package manager installed, and socket-patch's
+/// own state. None is a place Bazel is told to vendor into, the first two
+/// hold more directories than the rest of a checkout, and a copy of a
+/// package under the third must not be read as the user's vendor
+/// directory. Each is still asked for its own markers, as any entry is.
+const VENDOR_WALK_PRUNED: [&str; 3] = [".git", "node_modules", SOCKET_DIR];
+
+/// The vendor directories at any depth below the Bazel root `root`, by
+/// the markers [`vendor_dirs_at`] goes by, which it finds at the first
+/// level only: everything that function returns is returned here (short
+/// of a bound that cuts the first level), and the same test is made at
+/// every level below. A workspace that keeps its vendor directory at
+/// `third_party/bazel/vendor` and passes the flag on a command line shows
+/// it nowhere else (revision 4, obligation 6: a reader of the first level
+/// found nothing two levels down and called the write safe).
+///
+/// The walk is bounded and follows no link:
+///
+/// - It lists at most `max_dirs` directories and links
+///   ([`VENDOR_WALK_DIRS`] unless the caller knows better), level by
+///   level and each level in the order of its names. The customary places
+///   are near the root and are searched before a wide tree further down
+///   can use the bound up, and the answer does not depend on the order
+///   the disk lists in. When the bound cuts the walk, `stopped_short`
+///   says so.
+/// - It enters no tree Bazel owns. A vendor directory is returned and not
+///   searched, so a `VENDOR.bazel` that a vendored repository carries in
+///   its own sources is not a second vendor directory; an output base or
+///   a cache entry inside the checkout is not searched either.
+/// - A link is judged by where it leads and never followed, so a loop of
+///   links ends, and a link to a vendor directory counts as one.
+/// - `.git`, `node_modules` and `.socket` are not searched.
+///
+/// A directory costs one listing and no `stat` unless a name in it can be
+/// a marker ([`Classifier::trees_marked_by`]). A directory that cannot be
+/// listed is asked for its markers by name, as `vendor_dirs_at` asks; one
+/// that then shows none makes the answer `cannot_tell`.
+///
+/// The marker is where the flag points, whatever the depth: Bazel creates
+/// the directory with its parents and writes `VENDOR.bazel` into it
+/// (`VendorFileFunction.createVendorFile`, read at 9.3.2; no build ran a
+/// nested `--vendor_dir` for this).
+///
+/// Like `vendor_dirs_at` this reads the disk and not git: a vendor
+/// directory nobody committed is found too, and one of another workspace
+/// that is checked in below the root (a copy of a project under
+/// `third_party/`) is found as well. Whether such a directory is evidence
+/// of `--vendor_dir` is the caller's to decide.
+pub fn vendor_dirs_below(root: &Path, max_dirs: usize) -> VendorDirs {
+    let mut walk = VendorWalk {
+        classifier: Classifier::new(),
+        found: VendorDirs::default(),
+        listed_all: true,
+        left: max_dirs,
+    };
+    let mut level = vec![root.to_path_buf()];
+    let mut is_root = true;
+    'walk: while !level.is_empty() {
+        let mut below = Vec::new();
+        for dir in &level {
+            if !walk.search(dir, is_root, &mut below) {
+                break 'walk;
+            }
+        }
+        is_root = false;
+        level = below;
+    }
+    walk.found.dirs.sort();
+    walk.found.cannot_tell = !walk.listed_all;
+    walk.found
+}
+
+/// The state of one [`vendor_dirs_below`].
+struct VendorWalk {
+    classifier: Classifier,
+    found: VendorDirs,
+    /// Cleared when a directory could not be listed to its end and showed
+    /// no marker by name, or a marker test went unanswered.
+    listed_all: bool,
+    /// How many more directories and links the bound allows.
+    left: usize,
+}
+
+impl VendorWalk {
+    /// Takes one directory or link from the bound. `false` when the bound
+    /// is used up, which ends the walk.
+    fn take(&mut self) -> bool {
+        let Some(left) = self.left.checked_sub(1) else {
+            self.found.stopped_short = true;
+            return false;
+        };
+        self.left = left;
+        true
+    }
+
+    /// Asks `path` for its own markers, as [`vendor_dirs_at`] asks a
+    /// first-level entry, and keeps a vendor directory. Whether `path` is
+    /// a tree of any kind, or a link into one.
+    fn judge(&mut self, path: &Path) -> bool {
+        let own = self.classifier.tree_at(path);
+        self.listed_all &= !own.cannot_tell;
+        let class = own.tree.map(|tree| tree.class);
+        if class == Some(PathClass::VendorDir) {
+            self.found.dirs.push(path.to_path_buf());
+        }
+        class.is_some()
+    }
+
+    /// Lists `dir`, a real directory in no tree: judges it by the names
+    /// it holds, judges its links, and puts the directories to search
+    /// next into `below`. The root is not judged, as `vendor_dirs_at`
+    /// does not judge it: a stray marker in it makes no vendor directory
+    /// of the workspace. `false` when the bound ended the walk.
+    fn search(&mut self, dir: &Path, is_root: bool, below: &mut Vec<PathBuf>) -> bool {
+        if !self.take() {
+            return false;
+        }
+        let mut listed = true;
+        let mut entries = list(dir, MAX_LISTED, &mut listed);
+        entries.sort_by_cached_key(std::fs::DirEntry::file_name);
+        // The names that can be a marker, and what is left to judge: a
+        // link, or an entry whose kind the disk would not give.
+        let (mut names, mut subdirs, mut others) = (Vec::new(), Vec::new(), Vec::new());
+        for entry in &entries {
+            match entry.file_type() {
+                Ok(kind) if kind.is_dir() => subdirs.push(entry),
+                Ok(kind) if kind.is_file() => names.push(entry.file_name()),
+                _ => {
+                    names.push(entry.file_name());
+                    others.push(entry.path());
+                }
+            }
+        }
+        // The root is asked only for the entries a name beside them marks.
+        let names = names.iter().map(OsString::as_os_str).filter(|name| {
+            !is_root || output_tree::marked_dir(dir, name).is_some_and(|marked| marked != dir)
+        });
+        let (trees, unanswered) = self.classifier.marked_trees(dir, names);
+        self.listed_all &= !unanswered;
+        if !is_root {
+            if let Some(own) = trees.iter().find(|tree| tree.root == dir) {
+                if own.class == PathClass::VendorDir {
+                    self.found.dirs.push(dir.to_path_buf());
+                }
+                return true;
+            }
+            // A listing that stopped early may have left a marker out.
+            if !listed && self.judge(dir) {
+                return true;
+            }
+        }
+        self.listed_all &= listed;
+        for other in others {
+            if !self.take() {
+                return false;
+            }
+            self.judge(&other);
+        }
+        for entry in subdirs {
+            let path = entry.path();
+            // A contents-cache entry, which the marker beside it named.
+            if trees.iter().any(|tree| tree.root == path) {
+                continue;
+            }
+            let name = entry.file_name();
+            if VENDOR_WALK_PRUNED.iter().any(|pruned| name == *pruned) {
+                if !self.take() {
+                    return false;
+                }
+                self.judge(&path);
+            } else if below.len() < self.left {
+                below.push(path);
+            } else {
+                // The bound ends the walk before this one's turn.
+                self.found.stopped_short = true;
+            }
+        }
+        true
     }
 }
 
@@ -1192,6 +1403,166 @@ mod tests {
         let unread = while_locked(&disk.at("ws"), || vendor_dirs_at(&disk.at("ws")));
         if let Some(unread) = unread {
             assert_eq!((unread.dirs, unread.cannot_tell), (vec![], true));
+        }
+    }
+
+    #[test]
+    fn a_bounded_walk_finds_the_vendor_directories_at_any_depth() {
+        let disk = Scratch::new();
+        let sha256 = "87d8263a29f202dab6acea9f28262585d34aa0d6fc45683d74d929ffa339a198";
+        // Vendor directories at the first level, two levels down (where a
+        // reader of the first level found none: revision 4, obligation 6)
+        // and ten levels down, by either marker. Not vendor directories:
+        // the root with its stray marker, a repository inside a vendor
+        // directory that carries the marker in its own sources, a
+        // directory called `VENDOR.bazel`, and whatever lies inside an
+        // output base, a cache entry, `.git`, `node_modules` or `.socket`.
+        let more = format!(
+            "{{ws}}/MODULE.bazel
+             {{ws}}/VENDOR.bazel
+             {{ws}}/vendor_src/VENDOR.bazel
+             {{ws}}/vendor_src/+http+dep/VENDOR.bazel
+             {{ws}}/vendor_src/+http+dep/third_party/.vendorignore
+             {{ws}}/third_party/bazel/vendor/VENDOR.bazel
+             {{ws}}/third_party/bazel/vendor/+x+y/go.mod
+             {{ws}}/tools/a/b/c/d/e/f/g/h/deps/.vendorignore
+             {{ws}}/docs/VENDOR.bazel/readme.md
+             {{ws}}/notes/file
+             {{ws}}/.git/modules/x/VENDOR.bazel
+             {{ws}}/node_modules/pkg/vendor/VENDOR.bazel
+             {{ws}}/app/node_modules/pkg/VENDOR.bazel
+             {{ws}}/.socket/vendor/go/m/VENDOR.bazel
+             {{ws}}/.cache/contents/cd12/1/VENDOR.bazel
+             {{ws}}/.cache/contents/cd12/1.recorded_inputs
+             {{ws}}/.cache/content_addressable/sha256/{sha256}/file
+             {{base}}/external/rules_y+/VENDOR.bazel"
+        );
+        disk.lay("ws", "ws/out", &[BASE, &more].join("\n"));
+        let ws = disk.at("ws");
+        let found = vendor_dirs_below(&ws, VENDOR_WALK_DIRS);
+        let want = VendorDirs {
+            dirs: vec![
+                disk.at("ws/third_party/bazel/vendor"),
+                disk.at("ws/tools/a/b/c/d/e/f/g/h/deps"),
+                disk.at("ws/vendor_src"),
+            ],
+            cannot_tell: false,
+            stopped_short: false,
+        };
+        assert_eq!(found, want);
+        // The first level is all that `vendor_dirs_at` lists.
+        assert_eq!(vendor_dirs_at(&ws).dirs, [disk.at("ws/vendor_src")]);
+
+        // From a directory further down, and from a root that is not
+        // there, which holds none: that is known.
+        let below = |root: &str| vendor_dirs_below(&disk.at(root), VENDOR_WALK_DIRS);
+        let deeper = below("ws/third_party");
+        assert_eq!(deeper.dirs, [disk.at("ws/third_party/bazel/vendor")]);
+        assert_eq!(below("ws/docs"), VendorDirs::default());
+        assert_eq!(below("gone"), VendorDirs::default());
+
+        // A directory the walk does not search is still asked for its own
+        // markers, at the first level as `vendor_dirs_at` asks it and at
+        // every other.
+        let pruned = "
+            {ws}/node_modules/VENDOR.bazel
+            {ws}/node_modules/pkg/VENDOR.bazel
+            {ws}/sub/.socket/.vendorignore
+            {ws}/sub/.git/x/VENDOR.bazel";
+        disk.lay("held", "", pruned);
+        let held = [disk.at("held/node_modules"), disk.at("held/sub/.socket")];
+        assert_eq!(below("held").dirs, held);
+        assert_eq!(vendor_dirs_at(&disk.at("held")).dirs, held[..1]);
+    }
+
+    #[test]
+    fn a_walk_cut_by_its_bound_says_so_and_holds_the_nearest_levels() {
+        let disk = Scratch::new();
+        // Seven directories to list: the root, three at the first level,
+        // two at the second and one at the third.
+        let layout = "
+            {ws}/a/x/VENDOR.bazel
+            {ws}/b/y/z/VENDOR.bazel
+            {ws}/c/notes";
+        disk.lay("ws", "", layout);
+        let (near, far) = (disk.at("ws/a/x"), disk.at("ws/b/y/z"));
+        let walked = |max_dirs: usize| {
+            let found = vendor_dirs_below(&disk.at("ws"), max_dirs);
+            assert!(!found.cannot_tell, "{max_dirs}");
+            (found.dirs, found.stopped_short)
+        };
+        for enough in [7, 8, VENDOR_WALK_DIRS] {
+            let both = vec![near.clone(), far.clone()];
+            assert_eq!(walked(enough), (both, false), "{enough}");
+        }
+        // Short by one or two the third level is not reached; a level is
+        // searched in the order of its names, so it is always `a/x` that
+        // the walk still listed.
+        for short in [6, 5] {
+            assert_eq!(walked(short), (vec![near.clone()], true), "{short}");
+        }
+        for short in [4, 1, 0] {
+            assert_eq!(walked(short), (vec![], true), "{short}");
+        }
+        // A bound that is used up exactly, with nothing left to search,
+        // cut nothing.
+        assert_eq!(vendor_dirs_below(&far, 1), VendorDirs::default());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_walk_judges_a_link_follows_none_and_says_what_it_could_not_read() {
+        use std::os::unix::fs::PermissionsExt;
+        let disk = Scratch::new();
+        // A link to a vendor directory three levels down counts, as one
+        // at the first level does. A link back to the root is not
+        // followed, a convenience link leads into another kind of tree,
+        // and a marker that is itself a link to a file is a marker.
+        let layout = "
+            shared/vendor/VENDOR.bazel
+            shared/vendor/+http+dep/go.mod
+            {ws}/deep/er/deps -> shared/vendor
+            {ws}/deep/loop -> {ws}
+            {ws}/deep/stale -> nowhere
+            {ws}/bazel-bin -> {base}/execroot/_main/bazel-out/k8/bin
+            {ws}/tools/VENDOR.bazel -> shared/vendor/VENDOR.bazel
+            {ws}/locked/inner/VENDOR.bazel";
+        disk.lay("ws", "root/_bazel_u/6d82", &[BASE, layout].join("\n"));
+        let ws = disk.at("ws");
+        let (deps, tools) = (disk.at("ws/deep/er/deps"), disk.at("ws/tools"));
+        let (locked, inner) = (disk.at("ws/locked"), disk.at("ws/locked/inner"));
+        let all = VendorDirs {
+            dirs: vec![deps.clone(), inner.clone(), tools.clone()],
+            cannot_tell: false,
+            stopped_short: false,
+        };
+        assert_eq!(vendor_dirs_below(&ws, VENDOR_WALK_DIRS), all);
+
+        // A directory that can be entered and not listed is asked for its
+        // markers by name, as `vendor_dirs_at` asks: nothing is missed.
+        let mode = |path: &Path, mode: u32| {
+            fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+        };
+        mode(&inner, 0o111);
+        let unlisted = vendor_dirs_below(&ws, VENDOR_WALK_DIRS);
+        let first_level = vendor_dirs_at(&locked);
+        mode(&inner, 0o755);
+        assert_eq!(unlisted, all);
+        assert_eq!(
+            (first_level.dirs, first_level.cannot_tell),
+            (vec![inner], false)
+        );
+
+        // One that cannot be read at all hides what it holds, and the
+        // answer says so.
+        let unread = while_locked(&locked, || vendor_dirs_below(&ws, VENDOR_WALK_DIRS));
+        if let Some(unread) = unread {
+            let rest = VendorDirs {
+                dirs: vec![deps, tools],
+                cannot_tell: true,
+                stopped_short: false,
+            };
+            assert_eq!(unread, rest);
         }
     }
 

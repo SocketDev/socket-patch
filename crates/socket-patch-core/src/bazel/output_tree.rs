@@ -1569,6 +1569,11 @@ mod tests {
     const LINK_ROUTE: &str = probe_vector!("core-output-base/proto/vectors/link_route.json");
     /// Repository-cache entries of fetches that passed a canonical id.
     const CAS_VECTORS: &str = probe_vector!("platform-server/vectors/repo_cache_vectors.json");
+    /// A sample of what five builds downloaded, each download looked up in
+    /// the repository cache of its run: entries with and without an `id-*`
+    /// file, one of them under `sha384`.
+    const CAS_SAMPLE: &str =
+        probe_vector!("test-infra-offline/vectors/repo_cache/observed.sample.json");
 
     /// Where the tokens of a recorded path stand on a fabricated disk.
     type Tokens = [(&'static str, &'static str)];
@@ -1870,10 +1875,154 @@ mod tests {
                 assert_eq!(answer(&fs, &entry), (Plain, None), "{entry}");
             }
         }
-        // No recorded entry sits under `sha1`, `sha384` or `blake3`: those
-        // kinds are fabricated above.
+        // These 35 entries sit under `sha256` and `sha512`. The one recorded
+        // `sha384` entry is in the sample of the next test. No recorded
+        // entry sits under `sha1` or `blake3`: those two kinds are only
+        // fabricated above.
         let mut kinds: Vec<String> = kinds.into_iter().collect();
         kinds.sort();
         assert_eq!(kinds, ["sha256", "sha512"]);
+    }
+
+    #[test]
+    fn the_sampled_downloads_are_cache_entries_with_or_without_an_id_file() {
+        let sample = vector(CAS_SAMPLE);
+        let rows = list(&sample, "rows");
+        assert_eq!(rows.len(), 39);
+        // Three downloads of the 6.6.0 run are in no cache directory and
+        // name no entry: there is nothing to classify.
+        let in_cache = |row: &&Value| !row["key_type"].is_null();
+        let cached: Vec<&Value> = rows.iter().filter(in_cache).collect();
+        assert_eq!(cached.len(), 36);
+        let mut uncached = rows.iter().filter(|row| !in_cache(row));
+        assert!(uncached.all(|row| row.get("cache_file").is_none()));
+        let mut runs: Vec<&str> = cached.iter().map(|row| text(row, "run")).collect();
+        runs.sort_unstable();
+        runs.dedup();
+        assert_eq!(runs.len(), 5);
+
+        /// The entry a row names, under the cache root.
+        fn entry_of(row: &Value) -> &str {
+            let payload = text(row, "cache_file");
+            payload.strip_suffix("/file").expect("a payload")
+        }
+        /// What a run left in the entry: the payload, and an `id-*` file
+        /// where the fetch passed a canonical id.
+        fn files_of(row: &Value) -> Vec<String> {
+            let ids = list(row, "id_markers_present").iter();
+            let ids = ids.map(|id| format!("{}/{}", entry_of(row), id.as_str().expect("an id")));
+            let payload = text(row, "cache_file").to_string();
+            std::iter::once(payload).chain(ids).collect()
+        }
+        let answer = |fs: &Fake, path: &str| {
+            let found = p(path);
+            let verdict = classify(fs, &found, Some(&found), &mut Memo::default());
+            assert!(!verdict.cannot_tell && verdict.resolves_into.is_none());
+            (verdict.class, verdict.tree)
+        };
+
+        // The digest kind of every entry with whether it has an `id-*`
+        // file, and the entries of each form.
+        let mut shapes = HashSet::new();
+        let (mut with_id, mut without_id) = (HashSet::new(), HashSet::new());
+        for cache in [
+            "/home/u/.cache/bazel/_bazel_u/cache/repos/v1",
+            r"c:\users\me\_bazel_me\cache\repos\v1",
+        ] {
+            for run in &runs {
+                let of_run = || cached.iter().filter(|row| text(row, "run") == *run);
+                // What the sample holds of the run's cache, on a disk and
+                // as a path list has it: no disk, no link.
+                let mut fs = Fake::default();
+                let mut listed = Vec::new();
+                for row in of_run() {
+                    for file in files_of(row) {
+                        fs.put(p(&format!("{cache}/{file}")), Put::File);
+                        listed.push(format!("cache/{file}"));
+                    }
+                }
+                let listing = Listing::new(listed.iter().map(String::as_str));
+
+                for row in of_run() {
+                    let entry = entry_of(row);
+                    let ids = list(row, "id_markers_present");
+                    assert!(ids.len() <= 1, "{row}");
+                    let root = p(&format!("{cache}/{entry}"));
+                    let tree = Some(Tree {
+                        class: RepositoryCache,
+                        root: root.clone(),
+                    });
+                    // The entry, each file the run left in it, and the
+                    // `id-*` file a fetch that passes the URL as canonical
+                    // id leaves, whether or not it is there.
+                    let mut inside = files_of(row);
+                    inside.push(entry.to_string());
+                    inside.push(text(row, "id_marker_if_canonical_id_is_url").to_string());
+                    for path in &inside {
+                        assert!(path.starts_with(entry), "{path}");
+                        let want = (RepositoryCache, tree.clone());
+                        let path = format!("{cache}/{path}");
+                        assert_eq!(answer(&fs, &path), want, "{run}: {path}");
+                    }
+                    // A walker that holds the names of the entry is
+                    // pointed at it by the payload and by nothing else.
+                    assert_eq!(tree_at(&fs, &root, &[]).tree, tree, "{run}: {entry}");
+                    let payload = marked_dir(&root, OsStr::new(CAS_FILE));
+                    assert_eq!(payload, Some(root.clone()), "{run}: {entry}");
+                    for id in ids.iter().filter_map(Value::as_str) {
+                        assert_eq!(marked_dir(&root, OsStr::new(id)), None, "{id}");
+                    }
+                    let listed_tree = Some(Tree {
+                        class: RepositoryCache,
+                        root: PathBuf::from(format!("cache/{entry}")),
+                    });
+                    let payload = PathBuf::from(format!("cache/{entry}/{CAS_FILE}"));
+                    let found = enclosing(&listing, &payload, &mut Memo::default());
+                    assert_eq!(
+                        (found.tree, found.cannot_tell),
+                        (listed_tree, false),
+                        "{run}: {entry}"
+                    );
+                    // The cache's own directories are not an entry.
+                    let kind = entry.rsplit_once('/').expect("a kind").0;
+                    let cas = format!("{cache}/{CAS_DIR}");
+                    for above in [format!("{cache}/{kind}").as_str(), cas.as_str(), cache] {
+                        assert_eq!(answer(&fs, above), (Plain, None), "{run}: {above}");
+                    }
+
+                    let has_id = !ids.is_empty();
+                    shapes.insert((text(row, "key_type"), has_id));
+                    let form = if has_id {
+                        &mut with_id
+                    } else {
+                        &mut without_id
+                    };
+                    form.insert((*run, entry));
+                }
+            }
+        }
+        // Half of the sampled entries have no `id-*` file: registry files,
+        // tools fetched with no canonical id, and everything Bazel 6 left.
+        // Under `sha256` both forms are recorded; the one `sha384` entry
+        // has no such file and the two `sha512` entries have one.
+        let mut shapes: Vec<(&str, bool)> = shapes.into_iter().collect();
+        shapes.sort_unstable();
+        let want = [
+            ("sha256", false),
+            ("sha256", true),
+            ("sha384", false),
+            ("sha512", true),
+        ];
+        assert_eq!(shapes, want);
+        assert_eq!((with_id.len(), without_id.len()), (17, 19));
+        // The three archives of the 6.6.0 run are the entries the 7.7.2
+        // run left with an `id-*` file: one entry directory, both forms.
+        let entries = |form: &HashSet<(&str, &str)>, run: &str| -> HashSet<String> {
+            let of_run = form.iter().filter(|(of, _)| *of == run);
+            of_run.map(|(_, entry)| entry.to_string()).collect()
+        };
+        let bazel_6 = entries(&without_id, "skylib-6.6.0");
+        assert_eq!(bazel_6.len(), 3);
+        assert_eq!(bazel_6, entries(&with_id, "skylib-7.7.2"));
     }
 }
