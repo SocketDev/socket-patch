@@ -23,8 +23,11 @@ when
     Over a whole run a record-only cell is only listed, never an error;
   * `--claims FILE`: a claim of `lanes::claims_json()` has no evidence.
 
-A claim is `{lane, mode, ruleset, tier, lo, hi, system, os}`: the lane runs
-on Bazel `lo` to `hi` under one dependency system. It is held to the pinned
+A claim is `{lane, mode, ruleset, tier, lo, hi, system, os, classes, anchor,
+stale, tool}` (version 2 of the document): the lane runs on Bazel `lo` to
+`hi` under one dependency system. The last four say what the lane may write
+and are printed for the reviewer of a claim; this audit requires them and
+reads the first eight. It is held to the pinned
 releases CI can run (scripts/bazel-pins.txt) and to the Bazel lines of
 DESIGN 8, which are the majors, except that under Bzlmod (and hybrid) 7.0
 and 7.1 are each a line of their own beside 7.2 - 7.x: their lock is of
@@ -60,7 +63,11 @@ HOSTS_SOURCES = (LOGGED, "none")
 # cells 7.0.2 and 7.1.2, and 7.2 - 7.7 is Supported. Section 8 splits no
 # WORKSPACE line below the major.
 LINE_STARTS = {"bzlmod": ((7, 1), (7, 2)), "hybrid": ((7, 1), (7, 2))}
-CLAIM_KEYS = ("lane", "mode", "ruleset", "tier", "lo", "hi", "system", "os")
+CLAIM_KEYS = ("lane", "mode", "ruleset", "tier", "lo", "hi", "system", "os",
+              "classes", "anchor", "stale", "tool")
+# The version `lanes::claims_json()` writes. Version 1 had no write classes,
+# anchor, staleness behaviour or tool; no lane was ever claimed in it.
+CLAIMS_VERSION = 2
 
 
 def load(name, path):
@@ -251,8 +258,9 @@ def lines_of(lo, hi, system):
 
 def claim_errors(doc, reports, pins):
     """What the claims document states without evidence."""
-    if not isinstance(doc, dict) or doc.get("version") != 1 or not isinstance(doc.get("claims"), list):
-        return ['the claims file is not `{"version": 1, "claims": [...]}`']
+    if (not isinstance(doc, dict) or doc.get("version") != CLAIMS_VERSION
+            or not isinstance(doc.get("claims"), list)):
+        return [f'the claims file is not `{{"version": {CLAIMS_VERSION}, "claims": [...]}}`']
     releases = sorted({version for version, _ in pins}, key=version_key)
     errors = []
     for claim in doc["claims"]:

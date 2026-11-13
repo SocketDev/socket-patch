@@ -691,7 +691,7 @@ mod tests {
     #[test]
     fn table_fixture_dirs_are_not_corpus_projects() {
         let corpus = corpus();
-        for skipped in ["vlt", "vlt-trees", "vendor", "sbt"] {
+        for skipped in ["vlt", "vlt-trees", "vendor", "sbt", "bazel"] {
             let nested = format!("{skipped}/");
             assert!(
                 corpus

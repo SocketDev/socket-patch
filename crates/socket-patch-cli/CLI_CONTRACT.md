@@ -3269,6 +3269,7 @@ it is `active`, and is as stable as a code.
 | `lane_not_enabled` | No lane for this ruleset shape and mode is enabled in this release. |
 | `bazel_line_unsupported` | The Bazel release line or the dependency system is outside what the lane supports. |
 | `bazel_line_unproven` | The lane has not been run on this Bazel release line and dependency system. |
+| `ruleset_version_unproven` | The committed files do not prove that the ruleset is at or above the release the lane needs. The detail names the release and the evidence that was found. |
 | `bazel_line_unknown` | No Bazel version is declared and the hub is declared only in WORKSPACE files; commit `.bazelversion`. Also: the workspace was read for another project than the one asked about, where another `.bazelversion` may apply. |
 | `platform_unverified` | A lane that writes a directory tree has not been run on this operating system. |
 | `lock_path` | The lock a hub names has a file name the rewriter does not handle (for example `Cargo.Bazel.lock`). Also, for rules_jvm_external and rules_csharp: the lock label is a plain string that names no file of the main repository. |
@@ -3280,7 +3281,9 @@ it is `active`, and is as stable as a code.
 | `hub_not_imported` | The hub is declared and no `use_repo` imports it. |
 | `hub_not_root_module` | The hub belongs to a module that is not the root module. |
 | `dev_dependency_dropped` | The hub is a dev dependency and `--ignore_dev_dependency` is or may be set. |
+| `dual_mode` | Bzlmod and WORKSPACE may both be in effect, and the declarations that name a lock for the ecosystem are not the same under each; or whether Bazel evaluates the declaration is not decided. |
 | `nested_bazel_roots` | Several Bazel roots lie between the project and the repository root. |
+| `ignore_line_blocked` | A `.socket` tree needs a line in `.bazelignore`, and the file cannot take one: it cannot be read, or it ends a line with a lone carriage return. |
 | `vendor_dir` | `--vendor_dir` is or may be in effect: a tracked rc flag, or a committed vendor directory. |
 | `nofetch` | `--nofetch` is or may be set, so Bazel keeps building a copy it already fetched. |
 | `repo_override` | A repository or module override flag, `override_repo` or `inject_repo` names the hub, one of its repositories or the ruleset, or a name that cannot be parsed. |
