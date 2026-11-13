@@ -454,8 +454,12 @@ the range reaches must have a pinned release inside the range, and the newest
 such release of each line needs a `ran` report that names the lane, under
 that system, with its hosts from the fixture server's log, on each OS the
 claim lists (on any OS while it lists none). So a Bzlmod claim from 7.0.0
-needs reports on 7.0.2 and 7.1.2 as well as on 7.7.2. Over a whole run a
-record-only cell that did not run is listed and is not an error.
+needs reports on 7.0.2 and 7.1.2 as well as on 7.7.2. A lane whose claim
+lists the write class `hook` or `tag_edit` leaves wiring in a file of the
+user's, so its claim also names the test of its bump cell (`bump`, a name
+that holds `_bump`) and needs a `ran` report of that test, which names the
+lane under the claim's system on a release inside the claim. Over a whole
+run a record-only cell that did not run is listed and is not an error.
 
 To check a local run against the plan of its cell (the cell ids are in the
 plan; a macOS cell is `nightly`, so `--tiers full`):

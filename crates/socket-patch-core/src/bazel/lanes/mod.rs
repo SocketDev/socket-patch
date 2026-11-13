@@ -43,6 +43,7 @@ use super::model::{
     Reason, Refusal, RestoreOutcome, Ruleset, RunPolicy, TextRead, TokenSurface, LANE_NOT_ENABLED,
 };
 use super::version::{BazelVersion, NEWEST_AUDITED};
+use crate::crawlers::types::Ecosystem;
 
 /// Every `details.token` the design table refuses a cell with.
 pub const TOKENS: &[&str] = &[
@@ -95,11 +96,31 @@ pub const PRODUCTION: LaneTable = LaneTable(&[
 /// `Lift::None` anywhere else fails the lane-table test.
 pub const FINAL: &[(&str, &str)] = &[];
 
-/// The lanes whose real-Bazel bump cell has run: the user bumps the
-/// package, does not run socket-patch, and the leftover wiring does what
-/// the lane's `StaleBehaviour` declares (revision 4, 2.7). A lane that
-/// writes a hook or a tag edit is served only with a row here.
-pub const BUMP_CELLS: &[LaneId] = &[];
+/// The lanes whose real-Bazel bump cell has run, each with the name of
+/// the test that is the cell: the user bumps the package, does not run
+/// socket-patch, and the leftover wiring does what the lane's
+/// `StaleBehaviour` declares (revision 4, 2.7). A lane that writes a
+/// hook or a tag edit is served only with a row here.
+///
+/// A row is a statement, and nothing in this crate can check it. So the
+/// claims document prints the test of each row (`bump`), and the claims
+/// audit (`scripts/bazel-matrix-audit.py`) holds a lane whose classes
+/// list `hook` or `tag_edit` to a `ran` report of exactly that test, as
+/// it holds a claimed Bazel line to the report of a cell. A name with no
+/// `_bump` in it is no bump cell ([`spec_faults`]).
+pub const BUMP_CELLS: &[BumpCell] = &[];
+
+/// One row of [`BUMP_CELLS`]: a lane, and the test that ran its bump
+/// cell.
+pub type BumpCell = (LaneId, &'static str);
+
+/// The test that ran the bump cell of `lane`, among `bumped`.
+pub fn bump_cell(bumped: &[BumpCell], lane: LaneId) -> Option<&'static str> {
+    let of_lane = bumped.iter().find(|(id, _)| *id == lane);
+    of_lane
+        .map(|(_, test)| *test)
+        .filter(|test| test.contains("_bump"))
+}
 
 /// The lane IDs of design 4.3 with the shape each serves. The mode is in
 /// the ID's first letter.
@@ -181,9 +202,14 @@ pub fn decision(shape: HubShape, mode: Mode) -> Decision {
         return Decision::Lane(LaneId(id));
     }
     // An agent command patches an installed tree. Bazel builds from the
-    // lock, so the one thing that reaches its build is another mode.
-    if mode == Mode::Agent && shape != HubShape::GoRepository {
-        let command = "socket-patch scan --mode hosted".to_string();
+    // lock, so what reaches its build is another mode: the one the
+    // design has a lane for. A shape no mode has a lane for keeps its
+    // own token and lift below, so the remedy never leads the user to a
+    // second refusal.
+    let agent = mode == Mode::Agent && shape != HubShape::GoRepository;
+    let served = |other: &Mode| agent && matches!(decision(shape, *other), Decision::Lane(_));
+    if let Some(other) = [Mode::Hosted, Mode::Vendored].into_iter().find(served) {
+        let command = format!("socket-patch scan --mode {}", mode_name(other));
         let why = "Bazel builds this ecosystem from the lock its ruleset reads, not from an \
                    installed tree, so an agent patch does not reach the Bazel build";
         let lift = Lift::Run { command };
@@ -304,17 +330,23 @@ pub fn serving(
     specs.iter().filter(serves).collect()
 }
 
-/// The release a line is judged as at its top: an open or unaudited top
-/// is the newest audited release at or below it (owner decision D10).
+/// The release a line is judged as at its top: an unaudited top is the
+/// newest audited release at or below it (owner decision D10). A release
+/// of a major above every audited one is judged as the last audited
+/// release, the candidate of Bazel 10: Bazel 11 needs the claim Bazel 10
+/// needs, never less. A line with no top at all (no pin, so bazelisk
+/// runs the newest release) is judged as the newest audited final
+/// release, as design 8 decides it.
 fn judged_top(line: &BazelLine) -> BazelVersion {
     let newest = NEWEST_AUDITED.iter().rev().find(|v| v.is_final());
     let newest = newest.copied().unwrap_or(BazelVersion::new(0, 0, 0));
     let Some(hi) = line.hi else { return newest };
+    let last = NEWEST_AUDITED[NEWEST_AUDITED.len() - 1];
     let audited = NEWEST_AUDITED.iter().find(|v| v.major == hi.major);
     match audited {
         Some(audited) if hi > *audited => *audited,
         Some(_) => hi,
-        None if hi > newest => newest,
+        None if hi > last => last,
         None => hi,
     }
 }
@@ -420,26 +452,68 @@ pub const fn surface_rule(surface: TokenSurface) -> SurfaceRule {
     }
 }
 
+/// What [`discover`] found: the pins, and the hubs whose pins are not
+/// known. Both halves are always there, so one hub that cannot tell
+/// hides no pin another hub's lane found.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Discovered {
+    /// The pins of every hub whose family could tell, whatever file
+    /// carries each.
+    pub pins: Vec<BazelRef>,
+    /// The hubs Bazel may build from whose pins are not known, each with
+    /// the ecosystem it builds: no family of the table serves its
+    /// ruleset, or the family could not tell. "Cannot tell" is never "no
+    /// pin": for the ecosystem of such a hub a caller keeps what it has
+    /// and withholds what it would attest, because an empty list would
+    /// let `--prune` delete an artifact the hub still reads. It decides
+    /// per ecosystem, as `inventory::Inventory::cannot_enumerate` does.
+    pub cannot_tell: Vec<(HubId, Ecosystem)>,
+}
+
+impl Discovered {
+    /// The first hub of `ecosystem` whose pins are not known. `None`:
+    /// [`Self::pins`] holds every pin of the ecosystem.
+    pub fn unknown_for(&self, ecosystem: Ecosystem) -> Option<HubId> {
+        let of = self.cannot_tell.iter().find(|(_, of)| *of == ecosystem);
+        of.map(|(hub, _)| *hub)
+    }
+
+    /// Whether every hub could tell: [`Self::pins`] is every pin there is.
+    pub fn is_complete(&self) -> bool {
+        self.cannot_tell.is_empty()
+    }
+}
+
 /// The pins of every hub Bazel may build from, through the lane of each
-/// hub's family, whatever file carries a pin. `None` when any of them
-/// cannot tell: a caller keeps what it has, because an empty list would
-/// let `--prune` delete an artifact a hub still reads.
+/// hub's family, whatever file carries a pin, together with the hubs
+/// that could not tell ([`Discovered`]).
+///
+/// A report-only hub has no pin: no lane ever writes for that shape, so
+/// "no pin" is known there, and one hand-written pin in a workspace does
+/// not make every other hub's answer "cannot tell".
 pub fn discover(
     lanes: &LaneTable,
     ws: &BazelWorkspace,
     files: &dyn FileView,
     index: &Index,
     read: TextRead<'_>,
-) -> Option<Vec<BazelRef>> {
-    let mut found: Vec<BazelRef> = Vec::new();
+) -> Discovered {
+    let mut found = Discovered::default();
     for (id, hub) in ws.hubs.iter().enumerate().filter(|(_, hub)| may_build(hub)) {
-        let ops = family(lanes, hub.ruleset)?;
+        if hub.ruleset == Ruleset::ReportOnly {
+            continue;
+        }
+        let Some(ops) = family(lanes, hub.ruleset) else {
+            found.cannot_tell.push((HubId(id), hub.ecosystem));
+            continue;
+        };
         // A family with no lane is still asked once: its answer is
         // "cannot tell", never "no pin".
         let mut modes: Vec<Mode> = vec![Mode::Hosted];
         modes.extend(ops.lanes.iter().map(|spec| spec.mode));
         modes.sort();
         modes.dedup();
+        let mut told = true;
         for mode in modes {
             let cx = LaneCx {
                 mode,
@@ -449,14 +523,21 @@ pub fn discover(
                 index,
                 run: RunPolicy::Never,
             };
-            for pin in (ops.discover)(&cx, read)? {
-                if !found.contains(&pin) {
-                    found.push(pin);
+            let Some(pins) = (ops.discover)(&cx, read) else {
+                told = false;
+                continue;
+            };
+            for pin in pins {
+                if !found.pins.contains(&pin) {
+                    found.pins.push(pin);
                 }
             }
         }
+        if !told {
+            found.cannot_tell.push((HubId(id), hub.ecosystem));
+        }
     }
-    Some(found)
+    found
 }
 
 /// The restore of `exec::revert` over a lane table: a `pins` row is put
@@ -517,24 +598,27 @@ impl PinRestore for Restore<'_> {
 
 /// The claims of [`PRODUCTION`], for `target/bazel-claims.json`.
 pub fn claims_json() -> String {
-    claims_of(&PRODUCTION)
+    claims_of(&PRODUCTION, BUMP_CELLS)
 }
 
 /// Every claim of `lanes` as pretty JSON with a final newline:
 /// `{"version": 2, "claims": [{lane, mode, ruleset, tier, lo, hi, system,
-/// os, classes, anchor, stale, tool}]}`, one row per claimed line range.
-/// `tier` is `supported` for a claim the lane carries, else the `claims`
-/// file that makes it. `classes` are the write classes the lane may use,
-/// `anchor` and `stale` what it declares, and `tool` is `null` or the
-/// tool's `id` with the sentence that says why its output cannot be
-/// computed (`not_computable`): a reviewer reads what a lane may do to a
-/// repository beside what it claims. A disabled lane contributes no row,
-/// whatever its claim lists say.
-pub fn claims_of(lanes: &LaneTable) -> String {
+/// os, classes, anchor, stale, tool, bump}]}`, one row per claimed line
+/// range. `tier` is `supported` for a claim the lane carries, else the
+/// `claims` file that makes it. `classes` are the write classes the lane
+/// may use, `anchor` and `stale` what it declares, and `tool` is `null`
+/// or the tool's `id` with the sentence that says why its output cannot
+/// be computed (`not_computable`): a reviewer reads what a lane may do to
+/// a repository beside what it claims. `bump` is `null` or the test that
+/// ran the lane's bump cell (`bumped`: [`BUMP_CELLS`]), which the audit
+/// holds to a `ran` report for a lane that writes a hook or a tag edit.
+/// A disabled lane contributes no row, whatever its claim lists say.
+pub fn claims_of(lanes: &LaneTable, bumped: &[BumpCell]) -> String {
     let mut rows: Vec<Value> = Vec::new();
     for (ruleset, spec) in lanes.specs().filter(|(_, spec)| spec.enabled) {
         let os: Vec<&str> = claims::os_claims(spec.id).map(|os| os.as_str()).collect();
         let classes: Vec<&str> = spec.classes.iter().map(|class| class.as_str()).collect();
+        let bump = bump_cell(bumped, spec.id);
         let tool = spec.tool.map_or(
             Value::Null,
             |tool| json!({ "id": tool.id, "not_computable": tool.not_computable }),
@@ -554,6 +638,7 @@ pub fn claims_of(lanes: &LaneTable) -> String {
                 "anchor": spec.anchor.as_str(),
                 "stale": spec.stale.as_str(),
                 "tool": tool,
+                "bump": bump,
             }));
         }
     }
@@ -573,10 +658,10 @@ const fn mode_name(mode: Mode) -> &'static str {
 
 /// What the record of one lane states that the table does not allow
 /// (revision 4, section 5 item 7): empty for a lane that may stand in a
-/// table. `bumped` are the lanes whose bump cell has run
-/// ([`BUMP_CELLS`]). A disabled lane is held to what its ID says only: it
-/// declares its classes with the change that enables it.
-pub fn spec_faults(spec: &LaneSpec, bumped: &[LaneId]) -> Vec<String> {
+/// table. `bumped` are the lanes whose bump cell has run, each with the
+/// test that ran it ([`BUMP_CELLS`]). A disabled lane is held to what its
+/// ID says only: it declares its classes with the change that enables it.
+pub fn spec_faults(spec: &LaneSpec, bumped: &[BumpCell]) -> Vec<String> {
     use super::model::WriteClass::{Hook, TagEdit};
     let mut faults = Vec::new();
     if mode_of(spec.id.0) != Some(spec.mode) {
@@ -601,7 +686,7 @@ pub fn spec_faults(spec: &LaneSpec, bumped: &[LaneId]) -> Vec<String> {
         .classes
         .iter()
         .any(|class| [Hook, TagEdit].contains(class));
-    if marked && !bumped.contains(&spec.id) {
+    if marked && bump_cell(bumped, spec.id).is_none() {
         faults.push("it writes a hook or a tag edit and no bump cell of it has run".to_string());
     }
     faults
@@ -710,7 +795,7 @@ mod tests {
                 .iter()
                 .any(|shape| shape.ruleset() == *ruleset));
         }
-        let mut lanes = 0;
+        let (mut lanes, mut agent_runs) = (0, 0);
         for shape in HubShape::ALL {
             for mode in Mode::ALL {
                 let refusal = match decision(*shape, *mode) {
@@ -745,14 +830,43 @@ mod tests {
                     "{cell}: {:?}",
                     refusal.lift
                 );
-                // An agent cell is lifted by another mode, the others by a lane.
-                let lifted_by = if *mode == Mode::Agent && *shape != HubShape::GoRepository {
-                    "run"
-                } else {
-                    "enable_lane"
-                };
-                assert_eq!(refusal.lift.kind(), lifted_by, "{cell}");
+                // An agent cell is lifted by another mode where that mode
+                // has a lane for the shape, and by a lane everywhere else:
+                // the remedy never names a cell that is itself refused.
+                let lane_in =
+                    |other: &&Mode| matches!(decision(*shape, **other), Decision::Lane(_));
+                let other = [Mode::Hosted, Mode::Vendored];
+                let other = other
+                    .iter()
+                    .find(lane_in)
+                    .filter(|_| *mode == Mode::Agent && *shape != HubShape::GoRepository);
+                match (&refusal.lift, other) {
+                    (Lift::Run { command }, Some(other)) => {
+                        let named = format!("socket-patch scan --mode {}", mode_name(*other));
+                        assert_eq!((command, token), (&named, LANE_NOT_ENABLED), "{cell}");
+                        agent_runs += 1;
+                    }
+                    (lift, None) => assert_eq!(lift.kind(), "enable_lane", "{cell}"),
+                    (lift, Some(_)) => panic!("{cell}: lifted by {lift:?}"),
+                }
             }
+        }
+        assert!(agent_runs > 0, "no agent cell names another mode");
+        // A shape no mode has a lane for is refused alike in each: its
+        // own token and lift, never the name of another refused cell.
+        for shape in [
+            HubShape::ImportMode,
+            HubShape::ReportOnly,
+            HubShape::PipInstall,
+            HubShape::LegacyBundle,
+        ] {
+            let (Decision::Refused(agent), Decision::Refused(hosted)) =
+                (decision(shape, Mode::Agent), decision(shape, Mode::Hosted))
+            else {
+                panic!("{shape:?} has no lane in either mode");
+            };
+            assert_eq!((agent.token, &agent.lift), (hosted.token, &hosted.lift));
+            assert_ne!(agent.token, LANE_NOT_ENABLED, "{shape:?}");
         }
         assert_eq!(lanes, DESIGNED.len());
         // Every token the table can name is one it uses or reserves.
@@ -843,7 +957,7 @@ mod tests {
             not_computable: " ",
             needs_network: true,
         };
-        let faults = |spec: LaneSpec, bumped: &[LaneId]| spec_faults(&spec, bumped).join("; ");
+        let faults = |spec: LaneSpec, bumped: &[BumpCell]| spec_faults(&spec, bumped).join("; ");
         assert_eq!(faults(PROVEN, &[]), "");
         assert_eq!(faults(UNPROVEN, &[]), "");
         let no_class = LaneSpec {
@@ -871,8 +985,21 @@ mod tests {
             };
             let marked = LaneSpec { classes, ..PROVEN };
             assert!(faults(marked, &[]).contains("no bump cell"), "{class:?}");
-            assert_eq!(faults(marked, &[PROVEN.id]), "", "{class:?}");
+            let bumped = [(PROVEN.id, "bazel_hosted_toy_bump")];
+            assert_eq!(faults(marked, &bumped), "", "{class:?}");
+            // Another lane's cell, and a test that is no bump cell by its name.
+            for row in [
+                (UNPROVEN.id, "bazel_hosted_toy_bump"),
+                (PROVEN.id, "bazel_hosted_toy"),
+            ] {
+                assert!(faults(marked, &[row]).contains("no bump cell"), "{row:?}");
+            }
         }
+        assert_eq!(
+            bump_cell(&[(PROVEN.id, "bazel_hosted_toy_bump")], PROVEN.id),
+            Some("bazel_hosted_toy_bump")
+        );
+        assert_eq!(bump_cell(&[(PROVEN.id, "")], PROVEN.id), None);
         let tool = LaneSpec {
             tool: Some(TOOL),
             ..UNPROVEN
@@ -917,6 +1044,7 @@ mod tests {
             uuid: request.uuid.to_string(),
             lane: pin.lane,
             writes: Vec::new(),
+            repositories: Vec::new(),
             advisories: Vec::new(),
             attest: AttestBasis::Withheld,
             anchor: Anchor::Digest,
@@ -965,12 +1093,77 @@ mod tests {
         }
         // The dispatch over the table says "cannot tell" for the hub too,
         // and for a workspace with no hub it knows there is no pin.
-        assert_eq!(discover(&PRODUCTION, &ws, &view, &index, &read), None);
+        let found = discover(&PRODUCTION, &ws, &view, &index, &read);
+        assert_eq!(found.cannot_tell, [(HubId(0), Ecosystem::Npm)]);
+        assert!(found.pins.is_empty() && !found.is_complete());
+        assert_eq!(found.unknown_for(Ecosystem::Npm), Some(HubId(0)));
+        assert_eq!(found.unknown_for(Ecosystem::Maven), None);
         let bare = read_workspace(&[("MODULE.bazel", "module(name = \"m\")\n")]);
-        assert_eq!(
-            discover(&PRODUCTION, &bare, &view, &index, &read),
-            Some(Vec::new())
-        );
+        let found = discover(&PRODUCTION, &bare, &view, &index, &read);
+        assert_eq!(found, Discovered::default());
+        assert!(found.is_complete());
+    }
+
+    /// Discovery answers per hub. A report-only hub has no pin, because
+    /// nothing ever writes one for it; a hub whose family cannot tell is
+    /// named with its ecosystem and hides no pin of another hub.
+    #[test]
+    fn discovery_keeps_what_one_hub_found_when_another_cannot_tell() {
+        fn one_pin(cx: &LaneCx<'_>, _: TextRead<'_>) -> Option<Vec<BazelRef>> {
+            // Each mode of the family is asked, and the pin is listed once.
+            assert!(cx.mode == Mode::Hosted || cx.mode == Mode::Vendored);
+            Some(vec![BazelRef {
+                lane: LaneId("H-TOY1"),
+                purl: "pkg:npm/left-pad@1.3.0".to_string(),
+                uuid: request().uuid.to_string(),
+                file: "pnpm-lock.yaml".to_string(),
+                basis: AttestBasis::LockUrl,
+            }])
+        }
+        const TELLS: LaneOps = LaneOps {
+            discover: one_pin,
+            ..LaneOps::disabled(&[PROVEN, UNPROVEN])
+        };
+        const JS_ONLY: LaneTable = LaneTable(&[(Ruleset::RulesJs, &TELLS)]);
+        let jvm = "bazel_dep(name = \"rules_jvm_external\", version = \"6.7\")\n\
+            maven = use_extension(\"@rules_jvm_external//:extensions.bzl\", \"maven\")\n\
+            maven.install(name = \"maven\", artifacts = [\"a:b:1\"], \
+            lock_file = \"//:maven_install.json\")\n\
+            use_repo(maven, \"maven\")\n";
+        let jar = "http_jar = use_repo_rule(\
+            \"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_jar\")\n\
+            http_jar(name = \"guava\", url = \"https://repo1.maven.org/guava-33.0.jar\")\n";
+        let read = |_: &str| -> Option<String> { Some("lockfileVersion: '9.0'\n".to_string()) };
+        let (view, index) = (View::of(&[]), Index::default());
+        let workspace = |module: &str| {
+            read_workspace(&[
+                (".bazelversion", "9.3.2\n"),
+                ("MODULE.bazel", module),
+                PNPM_LOCK,
+                ("maven_install.json", "{}\n"),
+            ])
+        };
+
+        // One hand-written JVM pin beside the hub a lane can tell about.
+        let ws = workspace(&format!("{JS_MODULE}{jar}"));
+        let shapes: Vec<Ruleset> = ws.hubs.iter().map(|hub| hub.ruleset).collect();
+        assert_eq!(shapes, [Ruleset::RulesJs, Ruleset::ReportOnly]);
+        let found = discover(&JS_ONLY, &ws, &view, &index, &read);
+        assert_eq!(found.pins.len(), 1, "{found:?}");
+        assert!(found.is_complete(), "{found:?}");
+        // The production families cannot tell about their own hub, and
+        // still say nothing about the report-only one.
+        let found = discover(&PRODUCTION, &ws, &view, &index, &read);
+        assert_eq!(found.cannot_tell, [(HubId(0), Ecosystem::Npm)]);
+
+        // A hub of a family the table does not serve: its ecosystem is
+        // not known, and the pin of the other hub is still there.
+        let ws = workspace(&format!("{JS_MODULE}{jvm}"));
+        let found = discover(&JS_ONLY, &ws, &view, &index, &read);
+        assert_eq!(found.pins.len(), 1, "{found:?}");
+        assert_eq!(found.cannot_tell, [(HubId(1), Ecosystem::Maven)]);
+        assert_eq!(found.unknown_for(Ecosystem::Maven), Some(HubId(1)));
+        assert_eq!(found.unknown_for(Ecosystem::Npm), None);
     }
 
     /// A `pins` row goes back through the family that holds its lane. A
@@ -1062,7 +1255,15 @@ mod tests {
             (line(Some("9.4.0"), Some("9.4.0")), &bzlmod, true),
             (line(Some("7.2.0"), None), &bzlmod, true),
             // 10 is audited at a candidate, which no claim reaches.
+            (line(Some("10.0.0rc3"), Some("10.0.0rc3")), &bzlmod, false),
             (line(Some("10.0.0"), Some("10.0.0")), &bzlmod, false),
+            (line(Some("10.1.0"), Some("10.1.0")), &bzlmod, false),
+            // A major above every audited one needs the claim Bazel 10
+            // needs: it is further from any probe, never nearer.
+            (line(Some("11.0.0"), Some("11.0.0")), &bzlmod, false),
+            (line(Some("12.2.0"), Some("12.2.0")), &bzlmod, false),
+            (line(Some("9.3.2"), Some("11.0.0")), &bzlmod, false),
+            (floating(11), &bzlmod, false),
             // The dependency system is part of the claim.
             (line(Some("7.7.2"), Some("7.7.2")), &workspace, true),
             (line(Some("8.8.2"), Some("8.8.2")), &workspace, false),
@@ -1139,8 +1340,38 @@ mod tests {
             (of_hub.ruleset, of_hub.shape),
             (Ruleset::RulesJs, HubShape::PnpmLock)
         );
-        assert!(admits(&TABLE, &of_hub) && !admits(&PRODUCTION, &of_hub));
+        assert!(admits(&TABLE, &of_hub));
+        // The production table admits the cell exactly when its designed
+        // lane is enabled and claims the line: computed, so the change
+        // that enables H-JS1 does not turn this red.
+        let designed = PRODUCTION
+            .specs()
+            .find(|(_, spec)| spec.id == LaneId("H-JS1"));
+        let (_, designed) = designed.expect("H-JS1 is in the table");
+        let claimed = designed.enabled && claims_admit(designed, &ws.line, &ws.system);
+        assert_eq!(admits(&PRODUCTION, &of_hub), claimed);
         assert!(Cell::of(&ws, HubId(7), Mode::Hosted).is_none());
+
+        // A claim that reaches the candidate of Bazel 10 covers what is
+        // judged as it: Bazel 10 itself and every major above.
+        let to_ten = CellClaim {
+            lo: "7.2.0",
+            hi: "10.0.0rc3",
+            system: ClaimSystem::Bzlmod,
+        };
+        for (version, want) in [("10.0.0rc3", true), ("10.4.1", true), ("11.0.0", true)] {
+            let pinned = line(Some(version), Some(version));
+            assert_eq!(
+                covers(&to_ten, &pinned, ClaimSystem::Bzlmod),
+                want,
+                "{version}"
+            );
+            assert!(
+                !covers(&CLAIMS[0], &pinned, ClaimSystem::Bzlmod),
+                "{version}"
+            );
+        }
+        assert_eq!(judged_top(&line(Some("4.2.2"), Some("4.2.2"))).major, 4);
     }
 
     /// The policy of HZ-22: a lock and the owned pin data may hold the
@@ -1179,22 +1410,35 @@ mod tests {
         const TOOLED: LaneOps = LaneOps::disabled(&[WITH_TOOL]);
         const BOTH: LaneTable =
             LaneTable(&[(Ruleset::RulesJs, &OPS), (Ruleset::RulesRuby, &TOOLED)]);
-        let doc: Value = serde_json::from_str(&claims_of(&BOTH)).unwrap();
+        let doc: Value = serde_json::from_str(&claims_of(&BOTH, &[])).unwrap();
         let classes = json!(["native_lock", "owned"]);
         assert_eq!(
             doc,
             json!({ "version": 2, "claims": [
                 { "lane": "H-TOY1", "mode": "hosted", "ruleset": "rules_js", "tier": "supported",
                   "lo": "7.2.0", "hi": "9.3.2", "system": "bzlmod", "os": [], "classes": classes,
-                  "anchor": "digest", "stale": "inert", "tool": null },
+                  "anchor": "digest", "stale": "inert", "tool": null, "bump": null },
                 { "lane": "H-TOY1", "mode": "hosted", "ruleset": "rules_js", "tier": "supported",
                   "lo": "7.7.2", "hi": "7.7.2", "system": "workspace", "os": [], "classes": classes,
-                  "anchor": "digest", "stale": "inert", "tool": null },
+                  "anchor": "digest", "stale": "inert", "tool": null, "bump": null },
                 { "lane": "H-TOY1", "mode": "hosted", "ruleset": "rules_ruby", "tier": "supported",
                   "lo": "7.7.2", "hi": "7.7.2", "system": "workspace", "os": [], "classes": classes,
                   "anchor": "declaration", "stale": "fails_attributed",
-                  "tool": { "id": "bazel-mod-deps", "not_computable": TOOL.not_computable } },
+                  "tool": { "id": "bazel-mod-deps", "not_computable": TOOL.not_computable },
+                  "bump": null },
             ]})
         );
+        // The bump cell of a lane is printed on each of its rows, so the
+        // audit can hold it to the report of that test.
+        let bumped = [(LaneId("H-TOY1"), "bazel_hosted_toy_bump")];
+        let doc: Value = serde_json::from_str(&claims_of(&BOTH, &bumped)).unwrap();
+        let rows = doc["claims"].as_array().unwrap();
+        assert_eq!(rows.len(), 3);
+        assert!(rows
+            .iter()
+            .all(|row| row["bump"] == "bazel_hosted_toy_bump"));
+        let no_cell = [(LaneId("H-TOY1"), "bazel_hosted_toy")];
+        let doc: Value = serde_json::from_str(&claims_of(&BOTH, &no_cell)).unwrap();
+        assert!(doc["claims"][0]["bump"].is_null());
     }
 }

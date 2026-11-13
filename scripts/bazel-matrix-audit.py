@@ -24,10 +24,16 @@ when
   * `--claims FILE`: a claim of `lanes::claims_json()` has no evidence.
 
 A claim is `{lane, mode, ruleset, tier, lo, hi, system, os, classes, anchor,
-stale, tool}` (version 2 of the document): the lane runs on Bazel `lo` to
-`hi` under one dependency system. The last four say what the lane may write
-and are printed for the reviewer of a claim; this audit requires them and
-reads the first eight. It is held to the pinned
+stale, tool, bump}` (version 2 of the document): the lane runs on Bazel `lo`
+to `hi` under one dependency system. `classes`, `anchor`, `stale` and `tool`
+say what the lane may write and are printed for the reviewer of a claim;
+this audit requires them. `bump` is the test that ran the lane's bump cell
+(the user bumps the package and does not run socket-patch), or null. A lane
+whose `classes` hold `hook` or `tag_edit` leaves wiring in the user's files,
+so its claim needs that test, by a name that holds `_bump`, and a `ran`
+report of it that names the lane under the claim's system, on a release
+inside the claim, with its hosts taken from the fixture server's log. The
+claim itself is held to the pinned
 releases CI can run (scripts/bazel-pins.txt) and to the Bazel lines of
 DESIGN 8, which are the majors, except that under Bzlmod (and hybrid) 7.0
 and 7.1 are each a line of their own beside 7.2 - 7.x: their lock is of
@@ -64,10 +70,14 @@ HOSTS_SOURCES = (LOGGED, "none")
 # WORKSPACE line below the major.
 LINE_STARTS = {"bzlmod": ((7, 1), (7, 2)), "hybrid": ((7, 1), (7, 2))}
 CLAIM_KEYS = ("lane", "mode", "ruleset", "tier", "lo", "hi", "system", "os",
-              "classes", "anchor", "stale", "tool")
+              "classes", "anchor", "stale", "tool", "bump")
 # The version `lanes::claims_json()` writes. Version 1 had no write classes,
 # anchor, staleness behaviour or tool; no lane was ever claimed in it.
 CLAIMS_VERSION = 2
+# The write classes that leave wiring in a file of the user's: what it does
+# after a bump of the package is proven by the lane's bump cell (rev4/ARCH.md
+# 2.7 and 2.8), and a claim of such a lane stands only with its report.
+BUMP_CLASSES = ("hook", "tag_edit")
 
 
 def load(name, path):
@@ -256,6 +266,36 @@ def lines_of(lo, hi, system):
     return found
 
 
+def bump_errors(claim, what, lo, hi, reports):
+    """What a claim of a lane that writes a hook or a tag edit lacks: the
+    `ran` report of its bump cell. `lo` and `hi` are the claim's version
+    keys."""
+    classes = claim["classes"]
+    if not isinstance(classes, list) or not all(isinstance(name, str) for name in classes):
+        return [f"{what}: `classes` {classes!r} is not a list of write classes"]
+    marked = [name for name in classes if name in BUMP_CLASSES]
+    if not marked:
+        return []
+    wrote = " and ".join(f"`{name}`" for name in marked)
+    test = claim["bump"]
+    if not isinstance(test, str) or "_bump" not in test:
+        return [f"{what}: lists the write class {wrote} and names no bump cell (`bump` is "
+                f"{test!r}): what its wiring does after a bump of the package is not proven"]
+    inside = [r for r in reports if r["test"] == test and r["status"] == "ran"
+              and names_lane(r, claim["lane"]) and r.get("system") == claim["system"]
+              and version_key(r.get("bazel")) is not None
+              and lo <= version_key(r.get("bazel")) <= hi]
+    if not inside:
+        return [f"{what}: no `ran` report of its bump cell `{test}` names the lane under "
+                f"{claim['system']} on a release inside the claim"]
+    if not any(r.get("hosts_source") == LOGGED for r in inside):
+        files = ", ".join(sorted(r["_file"] for r in inside))
+        return [f"{what}: no `ran` report of its bump cell `{test}` took its hosts from the "
+                f"fixture server's log: {files} did not read the log (`hosts_source`), so it "
+                "proves nothing"]
+    return []
+
+
 def claim_errors(doc, reports, pins):
     """What the claims document states without evidence."""
     if (not isinstance(doc, dict) or doc.get("version") != CLAIMS_VERSION
@@ -279,6 +319,7 @@ def claim_errors(doc, reports, pins):
             errors.append(f"{what}: {claim['hi']} is not a pinned release, so no cell ran at "
                           "the top of the claim")
             continue
+        errors += bump_errors(claim, what, lo, hi, reports)
         inside = [v for v in releases if lo <= version_key(v) <= hi]
         for name, first, after in lines_of(lo, hi, claim["system"]):
             line = [v for v in inside if first <= version_key(v) < after]

@@ -1194,6 +1194,18 @@ pub struct Plan {
     /// dependents, so that every prefix is a state in which the build
     /// passes.
     pub writes: Vec<PlannedWrite>,
+    /// The repositories beside the hub's own that serve the package, by
+    /// the name the hub's extension or `WORKSPACE` gives each (a spoke
+    /// such as `npm__left-pad__1.3.0`). Only the lane knows how its
+    /// ruleset names them. The gate refuses the plan when a tracked rc
+    /// flag takes one of them from elsewhere (obligation 6: Bazel would
+    /// build the package from that directory while the lock holds the
+    /// pin), and the lane's `attest` hands the same names to
+    /// `gate::no_bypass`. Empty for a lane whose hub is the one
+    /// repository the package is built from.
+    ///
+    /// Revision 4, 2.1 draws `Plan` without it; this field amends it.
+    pub repositories: Vec<String>,
     pub advisories: Vec<Advisory>,
     pub attest: AttestBasis,
     pub anchor: Anchor,
@@ -1202,6 +1214,12 @@ pub struct Plan {
 /// The three outcomes of design principle P6, plus "not a Bazel matter".
 #[derive(Debug, Clone, PartialEq)]
 pub enum GateOutcome {
+    /// From `gate::gate`: no declaration names a lock of the ecosystem
+    /// for the project, and behaviour is what it is without Bazel. From
+    /// a lane's own gate ([`GateFn`]): the lock of this hub does not
+    /// resolve the release, so the hub is no part of the lock set and
+    /// the other hubs decide. The gate never passes a lane's `NotBazel`
+    /// on: where no hub resolves the release it refuses.
     NotBazel,
     Proceed(Plan),
     ProceedAfter(Plan, RunRequired),
@@ -1382,7 +1400,8 @@ pub type Files = BTreeMap<String, String>;
 /// valid UTF-8.
 pub type TextRead<'a> = &'a dyn Fn(&str) -> Option<String>;
 
-/// The pre-write proof.
+/// The pre-write proof of one hub. `NotBazel` is the answer for a hub
+/// whose lock does not resolve the release ([`GateOutcome::NotBazel`]).
 pub type GateFn = fn(&LaneCx<'_>, &PatchRequest<'_>) -> GateOutcome;
 /// Rewrites a Bazel-only lock.
 pub type RewriteOwnedFn = fn(&LaneCx<'_>, &mut Files, &[DepOverride], &mut RewriteResult);
