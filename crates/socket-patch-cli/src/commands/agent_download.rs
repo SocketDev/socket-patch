@@ -415,15 +415,15 @@ impl DownloadParams {
 /// Run-level context the download engines need beside `DownloadParams`:
 /// the run's API client — built once, proxy fallback included, so the
 /// engines never rebuild it from flags and repeat the org auto-resolve
-/// round-trip — and the flags the nested apply must inherit.
+/// round-trip — and the caller's flags, which the nested apply inherits.
 pub struct DownloadRun<'a> {
     /// The run's one API client; the nested apply runs on it too.
     pub api_client: &'a ApiClient,
-    /// `--lock-timeout`: the wait budget for the apply lock, taken once
-    /// around the manifest write and the nested apply.
-    pub lock_timeout: Option<u64>,
-    /// `--verbose`, forwarded to the nested apply.
-    pub verbose: bool,
+    /// The caller's global flags. The engine reads `--lock-timeout` from
+    /// them (the wait budget for the apply lock, taken once around the
+    /// manifest write and the nested apply); the nested apply starts from
+    /// all of them (see [`nested_apply_args_from_params`]).
+    pub common: &'a GlobalArgs,
 }
 
 /// Narrow a selection of patches down to the release variant(s) present
@@ -1357,10 +1357,13 @@ pub(crate) fn nested_apply_args(
     }
 }
 
-/// The caller flags a `DownloadParams` + [`DownloadRun`] pair reconstructs
-/// for the nested apply (the engine never sees a `GlobalArgs`). No API
-/// fields: the nested apply runs on the run's client (`run.api_client`),
-/// which was built from the caller's flags.
+/// The nested apply's flags for an engine run: the caller's own
+/// (`run.common`), so a flag only apply reads (`--no-gem-native-rebuild`,
+/// the Maven patch-service flags, …) reaches it without being named here
+/// (#2069), with the scope and consent fields `DownloadParams` owns laid
+/// over them, then [`nested_apply_args`]'s overrides. The nested apply
+/// runs on the run's client (`run.api_client`), never one rebuilt from
+/// these flags.
 pub(crate) fn nested_apply_args_from_params(
     params: &DownloadParams,
     run: &DownloadRun<'_>,
@@ -1376,9 +1379,7 @@ pub(crate) fn nested_apply_args_from_params(
         // apply the WHOLE manifest, mutating other ecosystems' packages the
         // user filtered out.
         ecosystems: params.ecosystems.clone(),
-        lock_timeout: run.lock_timeout,
-        verbose: run.verbose,
-        ..GlobalArgs::default()
+        ..run.common.clone()
     };
     nested_apply_args(&common, manifest_path, params.quiet())
 }
@@ -1644,7 +1645,7 @@ pub async fn download_and_apply_patches_into(
     let quiet = params.quiet();
     let manifest_path = params.manifest_path.clone();
     let socket_dir = params.socket_dir();
-    let lock_timeout = Duration::from_secs(run.lock_timeout.unwrap_or(0));
+    let lock_timeout = Duration::from_secs(run.common.lock_timeout.unwrap_or(0));
 
     // The manifest read-modify-write — and the blob writes it records —
     // runs under the apply lock: `remove`/`rollback` RMW the same file under
