@@ -260,12 +260,13 @@ class Planned(Audit):
 
 def claim(lane="H-TOY1", lo="7.2.0", hi="9.3.2", system="bzlmod", os_names=(), **more):
     base = {"lane": lane, "mode": "hosted", "ruleset": "rules_js", "tier": "supported",
-            "lo": lo, "hi": hi, "system": system, "os": list(os_names)}
+            "lo": lo, "hi": hi, "system": system, "os": list(os_names),
+            "classes": ["native_lock", "owned"], "anchor": "digest", "stale": "inert", "tool": None}
     return {**base, **more}
 
 
 def claims(*rows):
-    return {"version": 1, "claims": list(rows)}
+    return {"version": 2, "claims": list(rows)}
 
 
 def proof(bazel, os_name="macos", system="bzlmod", lanes=("H-TOY1",), **more):
@@ -276,7 +277,7 @@ class Claims(Audit):
     def test_no_claim_needs_no_report(self):
         """The skeleton state: every lane is a disabled stub."""
         self.assertEqual(self.run_audit([], claims=claims())[0], [])
-        self.assertEqual(self.run_audit([], claims=json.loads('{\n  "version": 1,\n  "claims": []\n}\n'))[0], [])
+        self.assertEqual(self.run_audit([], claims=json.loads('{\n  "version": 2,\n  "claims": []\n}\n'))[0], [])
 
     def test_a_range_is_held_to_the_newest_pinned_release_of_each_line(self):
         reports = [proof("7.7.2"), proof("8.8.2"), proof("9.3.2")]
@@ -433,11 +434,15 @@ class Claims(Audit):
             self.assertIsNone(key(text), text)
 
     def test_negative_a_claims_file_of_another_shape(self):
-        for doc in ([], {"version": 2, "claims": []}, {"version": 1}, {"version": 1, "claims": {}}):
+        # Version 1 is the document from before the write classes: a dump
+        # in it comes from a build that does not print what a lane may write.
+        for doc in ([], {"version": 1, "claims": []}, {"version": 3, "claims": []}, {"version": 2},
+                    {"version": 2, "claims": {}}):
             self.assert_one(self.run_audit([], claims=doc)[0], "the claims file is not")
-        row = claim()
-        del row["system"]
-        self.assert_one(self.run_audit([], claims=claims(row))[0], "needs lane, mode, ruleset")
+        for key in ("system", "classes", "anchor", "stale", "tool"):
+            row = claim()
+            del row[key]
+            self.assert_one(self.run_audit([], claims=claims(row))[0], "needs lane, mode, ruleset")
 
 
 class CommandLine(unittest.TestCase):
