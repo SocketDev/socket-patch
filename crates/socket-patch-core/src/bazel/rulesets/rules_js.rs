@@ -1791,6 +1791,9 @@ fn translate_lock(
 
     let mut user_decls = decl.package_keys("patches", false);
     user_decls.extend(decl.package_keys("replace_packages", true));
+    // A command rules_js runs in the package's directory once it is
+    // extracted: the user's own change to that package, like a patch.
+    user_decls.extend(decl.package_keys("custom_postinstalls", false));
     let lock_ref = pnpm_lock.as_ref().or(generated_lock.as_ref());
     let lock_path = lock_ref.and_then(|lock| lock.path.as_deref());
     let lock_text = lock_path.map(|path| files.read(path));
@@ -3284,6 +3287,25 @@ pub(super) mod tests {
         let (start, end) = hub.user_decls[3].site.span;
         assert_eq!(&crlf[start..end], "  left-pad@1.3.0:");
         assert_eq!(detail(&hub).lock_version.as_deref(), Some("9.0"));
+    }
+
+    /// `custom_postinstalls` names a command per package key: evidence
+    /// for the consent gate like a `patches` key, since the command
+    /// changes whatever the lock pins for that package (ROUTED R-088).
+    #[test]
+    fn a_custom_postinstall_is_a_user_declaration() {
+        let attrs =
+            ", custom_postinstalls = {\"fsevents@2.3.3\": \"node build.js\", \"sharp\": \"true\"}";
+        let hub = hub_of(&[
+            ("MODULE.bazel", &module(attrs, "")),
+            ("pnpm-lock.yaml", LOCK),
+        ]);
+        let declared = hub.user_decls.iter();
+        let declared: Vec<(&str, bool)> = declared
+            .map(|decl| (decl.package.as_str(), decl.replacement))
+            .collect();
+        assert_eq!(declared, [("fsevents@2.3.3", false), ("sharp", false)]);
+        assert!(hub.user_decls.iter().all(|d| d.site == hub.decl.site));
     }
 
     /// pnpm 11 and later can write two YAML documents, and rules_js
