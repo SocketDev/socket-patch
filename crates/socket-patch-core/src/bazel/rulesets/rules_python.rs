@@ -2710,13 +2710,20 @@ pub(super) mod tests {
         // The rule under another name.
         assert_eq!(one(&format!("parse = pip_parse\nparse({b})\n")), hidden);
 
-        // A rule that two `load` statements bind is not known to the
-        // reader of the file: neither call is read as a hub, and the hub
-        // of a macro beside them does not stand in for them.
-        let twice = format!(
-            "{seen}load(\"@a//:requirements.bzl\", \"install_deps\")\ninstall_deps()\n{PIP_LOAD}{}",
-            pip_parse("b")
+        // A rule that two `load` statements take from one file is one
+        // rule (`workspace_file`: loads of one symbol of one file are one
+        // binding): both calls are hubs.
+        let installed = "load(\"@a//:requirements.bzl\", \"install_deps\")\ninstall_deps()\n";
+        let twice = format!("{seen}{installed}{PIP_LOAD}{}", pip_parse("b"));
+        assert_eq!(
+            hubs_and_signals(&[("WORKSPACE", &twice)]),
+            want(&["a", "b"], &[])
         );
+        // Taken from two files, the name is not known to the reader of
+        // the file: neither call is read as a hub, and the hub of a macro
+        // beside them does not stand in for them.
+        let forked = "load(\"@pip_fork//python:pip.bzl\", \"pip_parse\")\n";
+        let twice = format!("{seen}{installed}{forked}{}", pip_parse("b"));
         assert_eq!(
             hubs_and_signals(&[("WORKSPACE", &twice)]),
             want(&[], &["WORKSPACE"])

@@ -2009,11 +2009,14 @@ mod tests {
         let alias = format!("{DEFS}cr = crates_repository\ncr({other})\n{hub}");
         check(&[("WORKSPACE", &alias)], "WORKSPACE:2", unmodelled);
 
-        // A name loaded again in a later chunk means nothing certain at
-        // any call: no hub is read, and every call says so.
+        // A name loaded again in a later chunk, from another file, means
+        // nothing certain at any call: no hub is read, and every call
+        // says so. (Two loads of one symbol of one file are one binding
+        // for `workspace_file`.)
+        let fork = DEFS.replace("@rules_rust//", "@rules_rust_fork//");
         let again = format!(
             "{DEFS}{hub}load(\"@crates//:defs.bzl\", \"crate_repositories\")\n\
-             crate_repositories()\n{DEFS}crates_repository({other})\n"
+             crate_repositories()\n{fork}crates_repository({other})\n"
         );
         let found = run(recognize, &[("WORKSPACE", &again)]);
         assert!(found.hubs.is_empty());
