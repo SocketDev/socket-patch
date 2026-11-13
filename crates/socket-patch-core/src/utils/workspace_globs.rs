@@ -23,7 +23,7 @@
 //! Bazel does not build it is asked of nothing.
 
 use std::collections::HashMap;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
 use regex::Regex;
@@ -1328,14 +1328,15 @@ pub(crate) fn bazel_owned(view: &ProjectView<'_>, rel: &str, repo: Option<&Path>
     if !marked && !view.is_symlink(rel) {
         return false;
     }
-    // Where the entry is: the directory that holds it, resolved, and its
-    // own name. The directory's real ancestors are the ones Bazel looks
-    // for its workspace in, and the ones `repo` is compared with.
+    // Where the entry is: the directory that holds it, resolved. That
+    // directory's real ancestors are the ones Bazel looks for its
+    // workspace in, and the ones `repo` is compared with. A path that ends
+    // in `..` names no entry of its own, and so nothing to leave out.
     let Ok(spelled) = std::path::absolute(root.join(rel)) else {
         return false;
     };
     let holder = spelled.parent().and_then(|dir| dir.canonicalize().ok());
-    let (Some(dir), Some(name)) = (holder, spelled.file_name()) else {
+    let Some(dir) = holder.filter(|_| spelled.file_name().is_some()) else {
         return false;
     };
     if !below_bazel_root(view, &dir, repo) {
@@ -1349,14 +1350,12 @@ pub(crate) fn bazel_owned(view: &ProjectView<'_>, rel: &str, repo: Option<&Path>
     // Bazel writes them when a server first starts in an output base and
     // removes them only with the base, which takes the link's target along.
     //
-    // The classifier judges a path spelled with `..` by its resolved form
-    // alone, which for a link is its target and never the link. So a `..`
-    // (a project root given as `--cwd ..`, a pattern re-rooted at a
-    // parent) is resolved here, and the link's own name kept. Any other
-    // path stays as it was spelled.
-    let dotted = spelled.components().any(|c| c == Component::ParentDir);
-    let entry = if dotted { dir.join(name) } else { spelled };
-    crate::crawlers::bazel_output::classify(&entry).class == PathClass::Link
+    // The path is judged as it is spelled. One that holds a `..` (a
+    // project root given as `--cwd ..`, a pattern re-rooted at a parent)
+    // the classifier places by the disk itself: it resolves the directory
+    // that holds the entry and keeps the entry's own name, so a link is
+    // judged as the link and not as the place it leads to.
+    crate::crawlers::bazel_output::classify(&spelled).class == PathClass::Link
 }
 
 /// Whether a Bazel boundary file is a regular file in `dir` or above it,
@@ -2912,8 +2911,10 @@ mod tests {
 
         // The root spelled with `..`, as `--cwd ..` from a member spells
         // it, and a pattern that climbs to the root from a member. The
-        // classifier reads a path that holds `..` by its resolved form,
-        // which for a link is the place it leads to.
+        // classifier places a path that holds `..` by the disk: the
+        // directory that holds the entry resolved, the entry's own name
+        // kept. So each link is judged as the link, as it is without the
+        // `..`, and not as the place it leads to.
         let dotted = ws.join("packages/..");
         let member = ws.join("packages/a");
         for (link, owned) in LINKS {
