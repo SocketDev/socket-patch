@@ -17,9 +17,12 @@
 //! classes (`[[:alpha:]]`) and `..` segments (#1490).
 //!
 //! Matching is pure. The one disk question here is [`bazel_owned`]: a walk
-//! that expands a pattern over a tree asks it for each entry, because a
-//! Bazel output tree is never a workspace member, whatever the pattern.
+//! that expands a pattern over a tree asks it for each entry that lies
+//! below a Bazel boundary file ([`BazelRoots`]), because a Bazel output
+//! tree is never a workspace member, whatever the pattern. In a project
+//! Bazel does not build it is asked of nothing.
 
+use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 use std::sync::LazyLock;
 
@@ -1255,6 +1258,12 @@ fn posix_class(name: &str) -> Option<&'static [(char, char)]> {
 /// included, meets the last only when its own directory lies inside
 /// Bazel's tree. That whole walk is then for the caller's scope check to
 /// refuse, not for a member walk to hide.
+///
+/// The answer costs four marker `stat`s for an ordinary directory, each
+/// fingerprinted by a recording snapshot, before a boundary file is looked
+/// for. A walk therefore asks only about an entry [`BazelRoots`] places
+/// below a boundary file, so that in a project Bazel does not build no
+/// directory it comes down to costs a call.
 pub(crate) fn bazel_owned(view: &ProjectView<'_>, rel: &str, repo: Option<&Path>) -> bool {
     // Read through a link as well: a link to a tree's root shows the
     // markers of that root. No rc file is read here, so a `--vendor_dir`
@@ -1264,7 +1273,7 @@ pub(crate) fn bazel_owned(view: &ProjectView<'_>, rel: &str, repo: Option<&Path>
         .tree
         .is_some();
     let Some(root) = view.disk_root_reading([rel]) else {
-        return marked && listed_below_bazel_root(view, rel);
+        return marked && parent_rel(rel).is_some_and(|dir| listed_bazel_root(view, dir));
     };
     if !marked && !view.is_symlink(rel) {
         return false;
@@ -1301,35 +1310,174 @@ pub(crate) fn bazel_owned(view: &ProjectView<'_>, rel: &str, repo: Option<&Path>
 }
 
 /// Whether a Bazel boundary file is a regular file in `dir` or above it,
-/// no higher than `repo`. Each name is asked of the view at its absolute
-/// path, so a recording snapshot fingerprints it. Only a file that was
-/// seen counts: this answer lifts evidence, and a name that cannot be
-/// judged must not.
+/// no higher than `repo`. Only a file that was seen counts: this answer
+/// lifts evidence, and a name that cannot be judged must not.
 fn below_bazel_root(view: &ProjectView<'_>, dir: &Path, repo: Option<&Path>) -> bool {
     dir.ancestors()
         .take_while(|dir| repo.is_none_or(|repo| dir.starts_with(repo)))
-        .any(|dir| {
-            BOUNDARY_FILES
-                .iter()
-                .any(|name| view.is_file(&dir.join(name).to_string_lossy()))
-        })
+        .any(|dir| holds_boundary_file(view, dir))
+}
+
+/// Whether a Bazel boundary file is a regular file in the directory at the
+/// absolute path `dir`. Each name is asked of the view at its absolute
+/// path, so a recording snapshot fingerprints it, a name that is absent
+/// included.
+fn holds_boundary_file(view: &ProjectView<'_>, dir: &Path) -> bool {
+    BOUNDARY_FILES
+        .iter()
+        .any(|name| view.is_file(&dir.join(name).to_string_lossy()))
 }
 
 /// [`below_bazel_root`] for a view with no disk behind it: whether the
-/// listing holds a boundary file in a directory above the entry at `rel`.
-fn listed_below_bazel_root(view: &ProjectView<'_>, rel: &str) -> bool {
-    let mut above = rel;
-    while !above.is_empty() {
-        above = above.rsplit_once('/').map_or("", |(dir, _)| dir);
-        let at = |name: &&str| match above {
+/// listing holds a boundary file in the directory `dir` (`""` for the
+/// root) or above it.
+fn listed_bazel_root(view: &ProjectView<'_>, dir: &str) -> bool {
+    let mut next = Some(dir);
+    while let Some(dir) = next {
+        let at = |name: &&str| match dir {
             "" => view.is_file(name),
             dir => view.is_file(&format!("{dir}/{name}")),
         };
         if BOUNDARY_FILES.iter().any(at) {
             return true;
         }
+        next = parent_rel(dir);
     }
     false
+}
+
+/// The directory that holds the entry at `rel`, as a view spells it (`""`
+/// for the root, which nothing holds).
+fn parent_rel(rel: &str) -> Option<&str> {
+    (!rel.is_empty()).then(|| rel.rsplit_once('/').map_or("", |(dir, _)| dir))
+}
+
+/// What one walk knows of the Bazel workspaces around it, so that it asks
+/// [`bazel_owned`] only about an entry that can be Bazel's.
+///
+/// `bazel_owned` says `true` only below a boundary file. A walk that asked
+/// it about every directory would pay the marker `stat`s in every project,
+/// and nearly all of them are projects Bazel does not build. So the walk
+/// first learns where a boundary file can lie above an entry:
+///
+/// - in a directory it has listed, from the names of the listing
+///   ([`may_name_boundary_file`]), at no call;
+/// - in a directory it has not listed (each one a pattern names its way
+///   down through, the walk's own first, and the ones above that up to
+///   `repo`), from [`BazelRoots::at`] and [`BazelRoots::above`], which ask
+///   the view for the four names once per directory and walk. That is the
+///   whole cost outside a Bazel workspace: a few names per walk, and none
+///   per directory walked.
+///
+/// The two only ever widen what `bazel_owned` is asked: they say `true`
+/// for every directory `bazel_owned` would find a boundary file in or
+/// above, so nothing it would prove Bazel's goes unasked, and `bazel_owned`
+/// still decides. What they rest on is in a recording snapshot's read set
+/// either way: a name the view was asked for by itself, a listed directory
+/// by its listing. A boundary file that appears later invalidates both.
+///
+/// Make one per walk: a directory is judged once and the answer kept.
+#[derive(Debug, Default)]
+pub(crate) struct BazelRoots {
+    /// The directories asked about, as the disk resolves them, and whether
+    /// a boundary file lies in each or above it, no higher than the
+    /// walk's `repo`.
+    below: HashMap<PathBuf, bool>,
+    /// The resolved form of each path [`Self::at`] and [`Self::above`]
+    /// were given (`None` for one that does not resolve).
+    resolved: HashMap<String, Option<PathBuf>>,
+}
+
+impl BazelRoots {
+    /// Whether an entry of the directory at `rel` (a path as `view` reads
+    /// it) can be Bazel's: a boundary file is a regular file in that
+    /// directory or above it, no higher than `repo`, exactly as
+    /// [`bazel_owned`] looks for one from an entry there.
+    pub(crate) fn at(&mut self, view: &ProjectView<'_>, rel: &str, repo: Option<&Path>) -> bool {
+        let Some(root) = view.disk_root_reading(std::iter::empty::<&Path>()) else {
+            // A listing answers at no cost, so nothing is kept for it.
+            return listed_bazel_root(view, rel);
+        };
+        match self.resolve(root, rel) {
+            Some(dir) => self.at_or_above(view, &dir, repo),
+            None => false,
+        }
+    }
+
+    /// [`Self::at`] without the directory at `rel` itself: whether a
+    /// boundary file lies above it. For a caller that lists that
+    /// directory and reads its own boundary files off the listing.
+    pub(crate) fn above(&mut self, view: &ProjectView<'_>, rel: &str, repo: Option<&Path>) -> bool {
+        let Some(root) = view.disk_root_reading(std::iter::empty::<&Path>()) else {
+            return parent_rel(rel).is_some_and(|dir| listed_bazel_root(view, dir));
+        };
+        match self.resolve(root, rel).as_deref().and_then(Path::parent) {
+            Some(dir) => self.at_or_above(view, dir, repo),
+            None => false,
+        }
+    }
+
+    /// The directory at `rel` as the disk resolves it, which is the
+    /// directory `bazel_owned` takes the ancestors of for an entry there
+    /// and the form `repo` is compared in. Costs one call per path and
+    /// walk; `None` for a path that names no directory to resolve.
+    fn resolve(&mut self, root: &Path, rel: &str) -> Option<PathBuf> {
+        if let Some(known) = self.resolved.get(rel) {
+            return known.clone();
+        }
+        let spelled = std::path::absolute(root.join(rel)).ok();
+        let dir = spelled.and_then(|dir| dir.canonicalize().ok());
+        self.resolved.insert(rel.to_string(), dir.clone());
+        dir
+    }
+
+    /// [`below_bazel_root`], asking about each directory once.
+    fn at_or_above(&mut self, view: &ProjectView<'_>, dir: &Path, repo: Option<&Path>) -> bool {
+        let mut asked: Vec<&Path> = Vec::new();
+        let mut found = false;
+        let readable = dir
+            .ancestors()
+            .take_while(|dir| repo.is_none_or(|repo| dir.starts_with(repo)));
+        for dir in readable {
+            // What is known of a directory covers everything above it.
+            if let Some(known) = self.below.get(dir) {
+                found = *known;
+                break;
+            }
+            asked.push(dir);
+            if holds_boundary_file(view, dir) {
+                found = true;
+                break;
+            }
+        }
+        // None of the directories asked on the way up holds a file, bar
+        // the last when one was found: the answer is the same for each.
+        for dir in asked {
+            self.below.insert(dir.to_path_buf(), found);
+        }
+        found
+    }
+}
+
+/// Whether a listed entry called `name`, which is no directory, can be
+/// what a lookup of one of [`BOUNDARY_FILES`] finds in its directory, by
+/// the name alone. The answer proves nothing: it says where
+/// [`bazel_owned`] has to be asked.
+///
+/// It must not be narrower than the disk. A disk that ignores case finds
+/// `WORKSPACE` in a file called `workspace`, as the Bazel client does
+/// there, and folds more than ASCII (the long s, U+017F, to `S`). Which
+/// characters a disk folds to a letter is its own table, so a character
+/// outside ASCII stands for any letter here; no boundary file's name holds
+/// a pair of letters that one character folds to, so the length is kept.
+pub(crate) fn may_name_boundary_file(name: &str) -> bool {
+    BOUNDARY_FILES.iter().any(|file| {
+        name.chars().count() == file.len()
+            && name
+                .chars()
+                .zip(file.chars())
+                .all(|(got, want)| !got.is_ascii() || got.eq_ignore_ascii_case(&want))
+    })
 }
 
 /// What is behind a [`ProjectView`], as the marker rules ask for it. Only
@@ -2755,5 +2903,129 @@ mod tests {
         );
         let disk = ProjectView::Disk(tmp.path());
         assert!(bazel_owned(&disk, "third_party", Some(&top)));
+    }
+
+    /// R-078: where a boundary file lies is learned once per directory and
+    /// walk, from the directory an entry is in up to the repository and no
+    /// higher, in every view, and it is what `bazel_owned` finds for an
+    /// entry there.
+    #[test]
+    fn bazel_roots_place_a_directory_as_bazel_owned_does() {
+        use crate::vendor::lock_inventory::{DiskSnapshot, MemoryEntry, MemoryProject};
+
+        const FILES: [&str; 5] = [
+            "a/b/c/package.json",
+            "a/d/package.json",
+            // A Bazel workspace of its own, below the project.
+            "tools/WORKSPACE.bazel",
+            "tools/vendor/VENDOR.bazel",
+            "tools/sub/dir/package.json",
+        ];
+        // (directory, a boundary file in it or above, one above it)
+        const PLACES: [(&str, bool, bool); 7] = [
+            ("", false, false),
+            ("a", false, false),
+            ("a/b/c", false, false),
+            ("tools", true, false),
+            ("tools/sub", true, true),
+            ("tools/sub/dir", true, true),
+            ("absent", false, false),
+        ];
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("repo");
+        let mut memory = MemoryProject::new();
+        for rel in FILES {
+            put(&root, rel);
+            memory.insert(rel, MemoryEntry::Present);
+        }
+        // Above the repository: out of reach of a walk it bounds.
+        put(tmp.path(), "WORKSPACE");
+        let repo = root.canonicalize().unwrap();
+        let snapshot = DiskSnapshot::new(&root);
+        let views = [
+            ProjectView::Disk(&root),
+            ProjectView::Snapshot(&snapshot),
+            ProjectView::Memory(&memory),
+        ];
+        for view in &views {
+            let mut roots = BazelRoots::default();
+            for (dir, at, above) in PLACES {
+                assert_eq!(roots.at(view, dir, Some(&repo)), at, "{dir} in {view:?}");
+                assert_eq!(roots.above(view, dir, Some(&repo)), above, "{dir}");
+                // An absolute path is read as it is, as a walk spells an
+                // ancestor; a listing has none.
+                if view.disk_root().is_some() && dir != "absent" {
+                    let spelled = root.join(dir);
+                    let spelled = spelled.to_string_lossy();
+                    assert_eq!(roots.at(view, &spelled, Some(&repo)), at, "{spelled}");
+                }
+            }
+            // The marked directory is Bazel's exactly where its holder is
+            // placed below a boundary file.
+            assert!(bazel_owned(view, "tools/vendor", Some(&repo)), "{view:?}");
+        }
+        // With no repository to bound it, the walk reads every ancestor.
+        let disk = ProjectView::Disk(&root);
+        let mut unbounded = BazelRoots::default();
+        assert!(unbounded.at(&disk, "a", None));
+        assert!(unbounded.above(&disk, "", None));
+
+        // Each directory is asked once: four names where it holds no
+        // boundary file, and the names up to the first one where it does.
+        let snapshot = DiskSnapshot::tracked(&root);
+        snapshot.begin_recording();
+        let view = ProjectView::Snapshot(&snapshot);
+        // The paths the view was asked for since the last count.
+        let asked = || {
+            let reads = snapshot.end_recording().expect("every probe is recorded");
+            snapshot.begin_recording();
+            reads.len()
+        };
+        let mut roots = BazelRoots::default();
+        for (dir, names) in [
+            // `c`, `b`, `a` and the repository.
+            ("a/b/c", 16),
+            ("a/b", 0),
+            ("a", 0),
+            ("", 0),
+            ("a/d", 4),
+            // `dir`, `sub`, and three names in `tools`.
+            ("tools/sub/dir", 11),
+            ("tools/sub", 0),
+            ("tools", 0),
+        ] {
+            roots.at(&view, dir, Some(&repo));
+            roots.above(&view, dir, Some(&repo));
+            assert_eq!(asked(), names, "{dir}");
+        }
+    }
+
+    /// A listed name is taken for a boundary file wherever a lookup of one
+    /// could find it, on a disk that ignores case too, and no other name
+    /// is: a lock, a backup, a manifest of the same length.
+    #[test]
+    fn a_listed_name_may_be_a_boundary_file_in_any_case() {
+        for name in BOUNDARY_FILES {
+            assert!(may_name_boundary_file(name), "{name}");
+            assert!(may_name_boundary_file(&name.to_lowercase()), "{name}");
+            assert!(may_name_boundary_file(&name.to_uppercase()), "{name}");
+        }
+        // The long s is `S` to a disk that ignores case, and the Kelvin
+        // sign is `K`.
+        for name in ["WORK\u{17f}PACE", "wor\u{212a}space.bazel"] {
+            assert!(may_name_boundary_file(name), "{name}");
+        }
+        for name in [
+            "MODULE.bazel.lock",
+            "WORKSPACE.bak",
+            "WORKSPACE.bzlmod",
+            "BUILD.bazel",
+            "package.json",
+            "REPO.bazelx",
+            "WORK\u{17f}PACE.bak",
+            "",
+        ] {
+            assert!(!may_name_boundary_file(name), "{name}");
+        }
     }
 }
