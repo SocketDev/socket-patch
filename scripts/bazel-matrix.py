@@ -16,18 +16,19 @@ parses each one strictly, so this script reads them as they are:
           "pins", "fetch"?, "cells": [{"bazel", "proof", "tier"}],
           "lanes"?: [{"test", "cells"}]}]}
   heavy   {"group", "ruleset", "fixtures": [{"fixture" (relative to
-          fixtures/bazel), "test", "system", "pins", "fetch", "cells"}]}
+          fixtures/bazel), "test", "system", "pins", "fetch", "cells":
+          [{"bazel", "proof", "tier", "cache"?}], "lanes"?: [{"test",
+          "cells"}]}]}
 
 A file of another shape is refused: a matrix this script cannot read would
 otherwise plan nothing and look covered.
 
-Two keys are read here that the suite's schemas do not take yet: `lanes`
-under a heavy fixture (the heavy `Fixture` of baseline_heavy.rs has no such
-field, so a heavy lane test cannot be listed until it does) and `cache` in
-a cell (neither `CellSpec` has it). Both schemas refuse unknown keys, so no
-committed matrix can carry them today. scripts/tests/test_bazel_matrix.py
-holds every key this script reads to the fields of those structs and names
-these two as the open ones.
+One key is read here that a schema of the suite does not take yet: `cache`
+in a light cell (the `CellSpec` of baseline_light.rs has no such field; the
+heavy one of baseline_heavy.rs has, for the cell of a lane test). Both
+schemas refuse unknown keys, so no committed light matrix can carry it
+today. scripts/tests/test_bazel_matrix.py holds every key this script reads
+to the fields of those structs and names this one as the open one.
 
 An entry is one test on one Bazel release on one runner. Its tier is `pr`
 (the path-filtered pull-request run and every wider run) or `nightly`
@@ -523,9 +524,8 @@ def fixture_errors(fixtures=FIXTURES):
                     if ruleset in GO_RUST and cell.get("cache") != "restored":
                         errors.append(f"{at}: a Go or Rust cell is in the pull-request tier "
                                       'only with a restored repository cache (`"cache": '
-                                      '"restored"`). The suite\'s `CellSpec` takes no `cache` '
-                                      "key yet (baseline_heavy.rs), so until it does the cell "
-                                      "is `nightly`")
+                                      '"restored"`, which the cell of a lane test may say; a '
+                                      "canary fetches cold and stays `nightly`)")
     return errors
 
 

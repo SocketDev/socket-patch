@@ -98,6 +98,22 @@ Optional members:
   recorded inputs) or `{"not_recorded": "<extension>"}`. The extension is named
   by label and name without its repository, whose spelling differs per Bazel
   line (`gazelle~`, `gazelle+`), and must be one the `MODULE.bazel` uses.
+- `lanes`: the tests of a lane package that run on the fixture, each as
+  `{"test": "bazel_hosted_...", "cells": [...]}`. The test starts with
+  `bazel_guard_`, `bazel_agent_`, `bazel_hosted_`, `bazel_vendor_` or
+  `bazel_canary_` (and is no `bazel_canary_baseline_`), is declared once with a
+  plain `fn`, in a module of the suite other than `baseline_heavy.rs`, and is
+  listed once in the heavy matrices. A lane cell has the members of a baseline
+  cell, on a Bazel release the fixture's own cells list: `evidence` then names
+  the probe cell that showed the lane's outcome on that pairing, or
+  `unverified`. No baseline runs a lane test; the lane's module does.
+
+A cell may also say `"cache": "restored"`, and nothing else under `cache`: the
+cell counts on the repository cache CI restores for it. CI restores one for the
+cell of a lane test and never for a canary, the baselines included, so only a
+lane cell says it. It is what lets a fixture whose fetch needs the Go SDK or a
+Rust toolchain into the `pr` tier: a lane cell of such a fixture is `pr` only
+with `"cache": "restored"`, and its baseline is always `nightly`.
 
 Every report of a Bzlmod cell lists the extensions the lock records
 (`recorded_extensions`, `lock_facts`); a report's `hosts` names `127.0.0.1` for

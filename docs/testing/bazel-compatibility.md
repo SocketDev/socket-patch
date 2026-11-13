@@ -384,9 +384,8 @@ fixtures; nobody edits the workflow. A new `#[ignore]` test that no matrix
 lists fails `--check`: a `bazel_core_` test goes into `core/MATRIX.json`, any
 other test on the toy fixture into `core/guard/MATRIX.json` (or a file of the
 same shape with its own `filter`), and a ruleset's test under its fixture in
-the ruleset's file (`lanes`). The last works for a light ruleset only today:
-the heavy schema (`baseline_heavy.rs`) has no `lanes` field yet, so a heavy
-lane test cannot be listed until its owner adds one.
+the ruleset's file (`lanes`). A heavy lane cell also names its `evidence`, as
+a heavy baseline cell does (`heavy/README.md` in that directory).
 
 ```sh
 python3 scripts/bazel-matrix.py --check                  # the rules below
@@ -408,8 +407,9 @@ listed test is not an `#[ignore]` test of the suite or such a test is in no
 matrix, when a (Bazel, runner) has no pin, when a (fixture, Bazel) pair is not
 in the era table the script carries, when a rules_jvm_external entry of tier
 `pr` climbs above proof tier 0, when a Go or Rust entry is `pr` without a
-restored repository cache (`"cache": "restored"`, a key the suite's schema
-does not take yet, so such a cell is `nightly` for now), when a fixture whose
+restored repository cache (`"cache": "restored"`, which the cell of a heavy
+lane test may say; a canary fetches cold, so a Go or Rust baseline stays
+`nightly`), when a fixture whose
 packages a tool fetches (pip mode, crate_universe, an unpinned Coursier hub)
 does not say `"fetch": "tool"`, or when the `os` list of a toy test is not a
 list of runners its cells run on, with at least one for each of its Bazel
