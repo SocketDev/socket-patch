@@ -223,11 +223,11 @@ impl YarnEnv {
             // Yarn takes the last `yarn_node_linker` spelling in the
             // environment (each one overwrites the setting) but the first
             // `yarn_rc_filename` (`getRcFilename` returns on a match).
-            node_linker: yarn_env_key(std::env::vars_os(), "YARN_NODE_LINKER", true),
-            pnpm_store_folder: yarn_env_key(std::env::vars_os(), "YARN_PNPM_STORE_FOLDER", true),
-            rc_filename: yarn_env_key(std::env::vars_os(), "YARN_RC_FILENAME", false)
+            node_linker: yarn_env_key(yarn_process_vars(), "YARN_NODE_LINKER", true),
+            pnpm_store_folder: yarn_env_key(yarn_process_vars(), "YARN_PNPM_STORE_FOLDER", true),
+            rc_filename: yarn_env_key(yarn_process_vars(), "YARN_RC_FILENAME", false)
                 .unwrap_or_else(|| ".yarnrc.yml".to_string()),
-            home: crate::utils::fs::home_dir(),
+            home: yarn_home(),
             vars: None,
             env_files: Default::default(),
             scope,
@@ -240,7 +240,7 @@ impl YarnEnv {
         scope: crate::utils::repo_root::ReadScope,
         project_root: &Path,
     ) -> Self {
-        let env_list = yarn_env_key(std::env::vars_os(), "YARN_INJECT_ENVIRONMENT_FILES", true);
+        let env_list = yarn_env_key(yarn_process_vars(), "YARN_INJECT_ENVIRONMENT_FILES", true);
         Self::current(scope).with_env_files(project_root, env_list.as_deref())
     }
 
@@ -358,6 +358,41 @@ impl YarnEnv {
         .ok()?;
         rc_node_linker(&rc, self)
     }
+}
+
+/// The home folder whose rc file [`YarnEnv::current`] reads last.
+#[cfg(not(test))]
+fn yarn_home() -> Option<PathBuf> {
+    crate::utils::fs::home_dir()
+}
+
+/// In unit tests, only a `HOME`/`USERPROFILE` a live `EnvGuard` sets: a
+/// developer's `~/.yarnrc.yml` can't change what the tests see (#1919).
+#[cfg(test)]
+fn yarn_home() -> Option<PathBuf> {
+    crate::utils::fs::home_from_env(|key| crate::test_env::guarded_var(key).map(Into::into))
+}
+
+/// The process environment the `YARN_*` lookups of [`YarnEnv::current`]
+/// and [`YarnEnv::for_project`] read.
+#[cfg(not(test))]
+fn yarn_process_vars() -> std::env::VarsOs {
+    std::env::vars_os()
+}
+
+/// In unit tests, only the variables a live `EnvGuard` holds: a
+/// developer's `YARN_NODE_LINKER` (or `YARN_PNPM_STORE_FOLDER`,
+/// `YARN_RC_FILENAME`, `YARN_INJECT_ENVIRONMENT_FILES`) can't change what
+/// the crawler tests see (#1919), as `utils::go_env` does for Go.
+#[cfg(test)]
+fn yarn_process_vars() -> std::vec::IntoIter<(std::ffi::OsString, std::ffi::OsString)> {
+    std::env::vars_os()
+        .filter(|(key, _)| {
+            key.to_str()
+                .is_some_and(|key| crate::test_env::guarded_var(key).is_some())
+        })
+        .collect::<Vec<_>>()
+        .into_iter()
 }
 
 /// The yarn environment setting `key` (upper case) in `vars`: yarn
@@ -703,6 +738,39 @@ impl YarnPnpLoader {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The unit tests read a `YARN_*` variable or the home folder only
+    /// while a guard sets it, so a developer's `YARN_NODE_LINKER` or
+    /// `~/.yarnrc.yml` can't flip a test (#1919), while a test that sets
+    /// one still sees it.
+    #[test]
+    #[serial_test::serial]
+    fn yarn_env_sees_only_guarded_variables() {
+        use crate::utils::repo_root::ReadScope;
+        let home = tempfile::tempdir().unwrap();
+        {
+            let _linker = crate::test_env::EnvGuard::many([
+                (
+                    "YARN_NODE_LINKER",
+                    Some(std::ffi::OsStr::new("node-modules")),
+                ),
+                (
+                    "YARN_PNPM_STORE_FOLDER",
+                    Some(std::ffi::OsStr::new("store")),
+                ),
+                ("HOME", Some(home.path().as_os_str())),
+            ]);
+            let env = YarnEnv::current(ReadScope::Workspace);
+            assert_eq!(env.node_linker.as_deref(), Some("node-modules"));
+            assert_eq!(env.pnpm_store_folder.as_deref(), Some("store"));
+            assert_eq!(env.home.as_deref(), Some(home.path()));
+        }
+        let env = YarnEnv::current(ReadScope::Workspace);
+        assert_eq!(env.node_linker, None);
+        assert_eq!(env.home, None);
+        assert_eq!(env.pnpm_store_folder, None);
+        assert_eq!(env.rc_filename, ".yarnrc.yml");
+    }
 
     /// The public entry points only add the host's yarn env, which is
     /// asked for a loader file alone: without one they agree with the
