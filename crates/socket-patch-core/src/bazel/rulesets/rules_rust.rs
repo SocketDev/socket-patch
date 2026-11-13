@@ -24,7 +24,9 @@
 //! that is computed, a hub whose `WORKSPACE` definition may not be the
 //! one Bazel builds, a use of `crates_repository` in a `WORKSPACE` or
 //! macro file that is no call the reader follows (a comprehension, a
-//! block, an alias, the rule handed to a function), and a `crates_vendor`
+//! block, an alias, the rule handed to a function), a use of it in any
+//! other `.bzl` file of the main repository (the implementation of a
+//! module extension, a macro that a macro calls), and a `crates_vendor`
 //! target the scan could not rule out are each a gap.
 //!
 //! With no hub at all, a signal is raised where one could still exist:
@@ -37,20 +39,26 @@
 //! A root module that was read in full, uses no `crate` tag and calls no
 //! `crates_repository` shows no hub, and its `bazel_dep` alone is no
 //! signal: rules_rust is also the toolchain of workspaces that fetch no
-//! crate through it. That is narrower than the sentence of design 2.7,
-//! and it is no proof: an extension of the main repository can call
-//! `crates_repository` in its implementation, which is not read.
+//! crate through it. That is narrower than the sentence of design 2.7.
+//! An extension of the main repository can still call `crates_repository`
+//! in its implementation, which no model reads: the scan below finds the
+//! `.bzl` file that binds the rule, and its use there is a gap
+//! ([`unread_rule_uses`]). Not found is a file that takes the rule from a
+//! file of another repository outside crate_universe, and any `.bzl` file
+//! of a root that names the ruleset under another module name and uses no
+//! `crate` tag, where the scan does not run.
 //!
 //! # The bounds of the scan
 //!
 //! The scan of the main repository lists at most [`SCAN_DIRS`] (65,536)
 //! directories and reads at most [`SCAN_FILES`] (16,384) BUILD and `.bzl`
-//! files. A file that does not name `crates_vendor` costs that one read;
-//! of those that do, at most [`starlark::MAX_FILES`] (512) are parsed,
-//! which is the bound of design 2.1 on what a model parses. The first two
-//! numbers are sized for a monorepo and are the wave steward's to change.
-//! Past any of the three the scan is incomplete, which is reported with
-//! the bound it met and never taken for "nothing there".
+//! files. A file that names neither `crates_vendor` nor, in a `.bzl` file
+//! with a label into crate_universe, `crates_repository` costs that one
+//! read; of those that do, at most [`starlark::MAX_FILES`] (512) are
+//! parsed, which is the bound of design 2.1 on what a model parses. The
+//! first two numbers are sized for a monorepo and are the wave steward's
+//! to change. Past any of the three the scan is incomplete, which is
+//! reported with the bound it met and never taken for "nothing there".
 //!
 //! The helpers that read a call's labels, walk the main repository and
 //! read the shared parts of a `crate` extension are also used by the
@@ -1288,22 +1296,13 @@ fn vendor_target(
 /// The `crates_vendor` targets of one BUILD or `.bzl` file that names the
 /// rule. A use that cannot be accounted for is a gap: a target that was
 /// not read may name any lock.
-fn vendor_file(input: &RecognizeInput<'_>, out: &mut Recognized, path: &str, bytes: &[u8]) {
+fn vendor_file(input: &RecognizeInput<'_>, out: &mut Recognized, path: &str, file: &File<'_>) {
     let gap = |detail: String| Gap {
         token: CRATES_VENDOR,
         file: path.to_string(),
         detail: format!("{path}{detail}"),
     };
     let build = !path.ends_with(".bzl");
-    let dialect = if build { Dialect::Build } else { Dialect::Bzl };
-    let file = match starlark::read(bytes, dialect) {
-        Ok(file) => file,
-        Err(e) => {
-            let why = e.kind.describe();
-            let detail = format!(" names `{VENDOR_RULE}` and cannot be read: {why}");
-            return out.gaps.push(gap(detail));
-        }
-    };
     let package = path.rsplit_once('/').map_or("", |(dir, _)| dir);
     for stmt in &file.stmts {
         let StmtKind::Load(load) = &stmt.kind else {
@@ -1348,32 +1347,135 @@ fn vendor_file(input: &RecognizeInput<'_>, out: &mut Recognized, path: &str, byt
                 out.gaps.push(gap(detail));
             }
             for stmt in calls.seen() {
-                vendor_target(input, out, &file, (path, package), &defs, stmt);
+                vendor_target(input, out, file, (path, package), &defs, stmt);
             }
         }
     }
 }
 
-/// The `crates_vendor` targets of the main repository. Every BUILD and
-/// `.bzl` file is read; only one that names the rule is parsed, and the
-/// bound on those is [`starlark::MAX_FILES`].
-fn vendor_targets(input: &RecognizeInput<'_>, out: &mut Recognized) -> Option<Unscanned> {
-    let rule = VENDOR_RULE.as_bytes();
+/// The uses of `crates_repository` in one `.bzl` file of the main
+/// repository that is no macro file read for a `WORKSPACE` file. The rule
+/// declares a hub wherever it runs, and such a file can run where no
+/// model reads: in the implementation of a module extension of this
+/// repository (`use_extension("//:extensions.bzl", ...)`), or in a macro
+/// that a macro calls. Each is a gap, so that cargo is undetermined and
+/// never "not governed" beside a lock that crate_universe pins.
+///
+/// The file binds the rule by a `load` from crate_universe in another
+/// repository. A copy of rules_rust kept in the tree loads its own files
+/// by labels of its own repository, and is not the user's declaration. A
+/// `load` whose name nothing uses declares nothing: a `.bzl` file does
+/// not hand on what it loads. Whether anything loads the file is not
+/// asked, as it is not for a `.bzl` file that loads `crates_vendor`: a
+/// file left behind by a migration is reported, and the gap says so.
+fn unread_rule_uses(input: &RecognizeInput<'_>, out: &mut Recognized, path: &str, file: &File<'_>) {
+    let package = path.rsplit_once('/').map_or("", |(dir, _)| dir);
+    for stmt in &file.stmts {
+        let StmtKind::Load(load) = &stmt.kind else {
+            continue;
+        };
+        let foreign = main_file(input, &load.module, Some(package), Home::Build).is_none();
+        let defs = Label::parse(&load.module, Some(package));
+        if !foreign || !defs.is_ok_and(|label| is_defs(&label)) {
+            continue;
+        }
+        for symbol in load.symbols.iter().filter(|s| s.name == REPOSITORY_RULE) {
+            let uses = file.uses(&symbol.local);
+            let stmts = uses.calls.iter().chain(&uses.tags).chain(&uses.passed);
+            let used = stmts.map(|stmt| stmt.span.0);
+            let Some(at) = used.chain(uses.other.iter().map(|span| span.0)).min() else {
+                continue;
+            };
+            let line = file.line_of(at);
+            out.gaps.push(Gap {
+                token: LABEL_NOT_LITERAL,
+                file: path.to_string(),
+                detail: format!(
+                    "{path}:{line}: a use of `{REPOSITORY_RULE}` is not read: the file is no \
+                     macro file of a `WORKSPACE` file that was read, and a module extension or \
+                     another macro of this repository may run it; declare the hub with a \
+                     `crate.from_cargo` tag in `MODULE.bazel`, or as one `{REPOSITORY_RULE}(...)` \
+                     call at the top level of the `WORKSPACE` file or directly in the body of a \
+                     macro it calls, or remove the use where nothing runs it"
+                ),
+            });
+        }
+    }
+}
+
+/// One BUILD or `.bzl` file of the scan, parsed once: its `crates_vendor`
+/// targets when `vendor`, and its uses of `crates_repository` when
+/// `rule`. A file that names a rule and cannot be read may declare with
+/// it, which is a gap under that rule's token.
+fn scanned_file(
+    input: &RecognizeInput<'_>,
+    out: &mut Recognized,
+    (path, bytes): (&str, &[u8]),
+    (vendor, rule): (bool, bool),
+) {
+    let build = !path.ends_with(".bzl");
+    let dialect = if build { Dialect::Build } else { Dialect::Bzl };
+    let file = match starlark::read(bytes, dialect) {
+        Ok(file) => file,
+        Err(e) => {
+            let why = e.kind.describe();
+            let unread = |token: &'static str, named: &str| Gap {
+                token,
+                file: path.to_string(),
+                detail: format!("{path} names `{named}` and cannot be read: {why}"),
+            };
+            out.gaps
+                .extend(vendor.then(|| unread(CRATES_VENDOR, VENDOR_RULE)));
+            out.gaps
+                .extend(rule.then(|| unread(LABEL_NOT_LITERAL, REPOSITORY_RULE)));
+            return;
+        }
+    };
+    if vendor {
+        vendor_file(input, out, path, &file);
+    }
+    if rule {
+        unread_rule_uses(input, out, path, &file);
+    }
+}
+
+/// The `crates_vendor` targets of the main repository, and the uses of
+/// `crates_repository` that no `WORKSPACE` file was read to reach
+/// ([`unread_rule_uses`]). Every BUILD and `.bzl` file is read; only one
+/// that names a rule is parsed, and the bound on those is
+/// [`starlark::MAX_FILES`].
+fn scan_repository(input: &RecognizeInput<'_>, out: &mut Recognized) -> Option<Unscanned> {
+    let names = |bytes: &[u8], word: &str| {
+        let word = word.as_bytes();
+        bytes.windows(word.len()).any(|window| window == word)
+    };
+    // A macro file read for a `WORKSPACE` file has every use of the rule
+    // accounted for there, as a hub or as a gap ([`unread_uses`]).
+    let macro_files = input.workspace_files.iter();
+    let macro_files = macro_files.flat_map(|ws| ws.files.iter().skip(1));
+    let read: BTreeSet<&str> = macro_files.map(|file| file.path.as_str()).collect();
     let mut parsed = 0;
     let scan = Scan::of(&build_or_bzl);
     scan_starlark(input.files, &scan, &mut |path, bytes| {
-        if !bytes.windows(rule.len()).any(|window| window == rule) {
+        let vendor = names(bytes, VENDOR_RULE);
+        // A `load` names its file by a string literal: one that binds the
+        // rule of another repository spells the package.
+        let rule = path.ends_with(".bzl")
+            && !read.contains(path)
+            && names(bytes, REPOSITORY_RULE)
+            && names(bytes, "//crate_universe");
+        if !vendor && !rule {
             return None;
         }
         parsed += 1;
         if parsed > starlark::MAX_FILES {
             let max = starlark::MAX_FILES;
             return Some(format!(
-                "more than {max} BUILD and .bzl files name `{VENDOR_RULE}`, which is all the \
-                 scan parses"
+                "more than {max} BUILD and .bzl files name `{VENDOR_RULE}` or \
+                 `{REPOSITORY_RULE}`, which is all the scan parses"
             ));
         }
-        vendor_file(input, out, path, bytes);
+        scanned_file(input, out, (path, bytes), (vendor, rule));
         None
     })
 }
@@ -1395,10 +1497,11 @@ pub fn recognize(input: &RecognizeInput<'_>) -> Recognized {
     }
     let loaded = input.workspace_files.iter().find_map(ruleset_load);
 
-    // A BUILD file can load the rule only where the ruleset's repository
-    // may exist: skip the walk where both systems prove it does not. A
-    // usage or a hub found by the path of its label is the ruleset under
-    // whatever name the root gives it (a fork, a private registry).
+    // A BUILD or `.bzl` file can load a rule only where the ruleset's
+    // repository may exist: skip the walk where both systems prove it
+    // does not. A usage or a hub found by the path of its label is the
+    // ruleset under whatever name the root gives it (a fork, a private
+    // registry).
     let dep = |m: &ModuleModel| m.deps.iter().any(|dep| dep.name == RULES_RUST);
     let visible = |m: &ModuleModel| dep(m) || m.visible(RULES_RUST) != Visibility::NotVisible;
     let defined = |ws: &WorkspaceModel| ws.governing(RULES_RUST) != Governing::Undefined;
@@ -1410,10 +1513,11 @@ pub fn recognize(input: &RecognizeInput<'_>) -> Recognized {
     let in_module = module.is_some_and(|m| dep(m) || seen(m));
     let in_root = in_module || input.workspace_files.iter().any(archived);
     if by_path || module.is_some_and(visible) || input.workspace_files.iter().any(defined) {
-        let stopped = vendor_targets(input, &mut out);
+        let stopped = scan_repository(input, &mut out);
         // An incomplete scan is a gap only where the root names the
         // ruleset outright, so a large repository without it keeps its
-        // cargo projects.
+        // cargo projects. The one gap also stands for a use of
+        // `crates_repository` the scan did not reach.
         let named = in_root || by_path || !out.hubs.is_empty() || loaded.is_some();
         if let Some(stopped) = stopped.filter(|_| named) {
             out.gaps.push(Gap {
@@ -2241,8 +2345,9 @@ mod tests {
         assert_eq!(tokens(&found), [CRATES_VENDOR]);
         assert_eq!(
             found.gaps[0].detail,
-            "p0512/BUILD: more than 512 BUILD and .bzl files name `crates_vendor`, which is all \
-             the scan parses, so a `crates_vendor` target cannot be ruled out"
+            "p0512/BUILD: more than 512 BUILD and .bzl files name `crates_vendor` or \
+             `crates_repository`, which is all the scan parses, so a `crates_vendor` target \
+             cannot be ruled out"
         );
 
         // A root that does not name the ruleset is not held to the scan:
@@ -2799,5 +2904,240 @@ mod tests {
             let found = run(recognize, &[("WORKSPACE", &text)]);
             assert!(found.hubs.is_empty(), "{from}");
         }
+    }
+
+    /// The lock of a hub is a file of the root, so a hub nobody read is a
+    /// cargo project that reads as not governed. A module extension of
+    /// the main repository can declare one in its implementation, which
+    /// no model follows: the use of the rule in its `.bzl` file is the
+    /// gap (ROUTED R-085).
+    #[test]
+    fn a_crates_repository_in_a_main_repository_extension_is_a_gap() {
+        use crate::bazel::govern::{governance, tests::read};
+        use crate::bazel::model::Governance;
+
+        const MODULE: &str = "module(name = \"app\")\n\
+             bazel_dep(name = \"rules_rust\", version = \"0.75.0\")\n\
+             rust_deps = use_extension(\"//:extensions.bzl\", \"rust_deps\")\n\
+             use_repo(rust_deps, \"crates\")\n";
+        const EXTENSION: &str =
+            "load(\"@rules_rust//crate_universe:defs.bzl\", \"crates_repository\")\n\n\
+             def _rust_deps_impl(module_ctx):\n    crates_repository(\n        name = \"crates\",\n        \
+             cargo_lockfile = \"//:Cargo.lock\",\n        manifests = [\"//:Cargo.toml\"],\n    )\n\n\
+             rust_deps = module_extension(implementation = _rust_deps_impl)\n";
+        let unread = |at: &str| {
+            format!(
+                "{at}: a use of `crates_repository` is not read: the file is no macro file of a \
+                 `WORKSPACE` file that was read, and a module extension or another macro of this \
+                 repository may run it; declare the hub with a `crate.from_cargo` tag in \
+                 `MODULE.bazel`, or as one `crates_repository(...)` call at the top level of the \
+                 `WORKSPACE` file or directly in the body of a macro it calls, or remove the use \
+                 where nothing runs it"
+            )
+        };
+        let files = [
+            ("MODULE.bazel", MODULE),
+            ("extensions.bzl", EXTENSION),
+            ("Cargo.lock", "version = 3\n"),
+        ];
+        let found = run(recognize, &files);
+        assert!(
+            found.hubs.is_empty() && found.signals.is_empty(),
+            "{found:?}"
+        );
+        let [gap] = &found.gaps[..] else {
+            panic!("one gap: {:?}", found.gaps)
+        };
+        assert_eq!(
+            (gap.token, gap.file.as_str()),
+            (LABEL_NOT_LITERAL, "extensions.bzl")
+        );
+        assert_eq!(gap.detail, unread("extensions.bzl:4"));
+
+        // The whole model: cargo is undetermined at the root and in every
+        // project, on each line the extension can run on, and no other
+        // ecosystem is held up.
+        for line in ["7.7.2", "8.8.2", "9.3.2"] {
+            let ws = read(&[files[0], files[1], files[2], (".bazelversion", line)]);
+            for project in ["", "services/api"] {
+                let Governance::Undetermined(gaps) = governance(&ws, Ecosystem::Cargo, project)
+                else {
+                    panic!("{line} `{project}`: cargo is not undetermined")
+                };
+                assert_eq!(gaps, [gap.clone()], "{line} `{project}`");
+            }
+            assert_eq!(
+                governance(&ws, Ecosystem::Npm, ""),
+                Governance::NotGoverned,
+                "{line}"
+            );
+        }
+
+        // An alias, the rule handed on under another name, and a helper
+        // file in a package: each use is one, at its first line.
+        let helper =
+            "load(\"@rules_rust//crate_universe:defs.bzl\", _rule = \"crates_repository\")\n\n\
+             crates_repository = _rule\n\ndef hub(name):\n    _rule(name = name)\n";
+        let found = run(
+            recognize,
+            &[("MODULE.bazel", MODULE), ("tools/rust/hub.bzl", helper)],
+        );
+        assert_eq!(tokens(&found), [LABEL_NOT_LITERAL]);
+        assert_eq!(found.gaps[0].detail, unread("tools/rust/hub.bzl:3"));
+
+        // The ruleset under the repository name the root gives it, and
+        // its files below `defs.bzl`.
+        let renamed = MODULE.replace("version = \"0.75.0\"", "repo_name = \"rr\"");
+        let private = EXTENSION.replace(
+            "@rules_rust//crate_universe:defs.bzl",
+            "@rr//crate_universe/private:crates_repository.bzl",
+        );
+        let found = run(
+            recognize,
+            &[("MODULE.bazel", &renamed), ("extensions.bzl", &private)],
+        );
+        assert_eq!(tokens(&found), [LABEL_NOT_LITERAL]);
+
+        // A file that names the rule and cannot be read may use it.
+        let broken = format!("{EXTENSION}rust_deps = module_extension(\n");
+        let found = run(
+            recognize,
+            &[("MODULE.bazel", MODULE), ("extensions.bzl", &broken)],
+        );
+        assert_eq!(tokens(&found), [LABEL_NOT_LITERAL]);
+        assert_eq!(
+            found.gaps[0].detail,
+            "extensions.bzl names `crates_repository` and cannot be read: an unmatched bracket"
+        );
+
+        // And one the scan never reached is the scan's own gap.
+        let found = run(recognize, &[("MODULE.bazel", MODULE), ("tools/", "")]);
+        assert_eq!(tokens(&found), [CRATES_VENDOR]);
+    }
+
+    /// What declares nothing raises nothing: a `load` nobody uses, a
+    /// mention, a function of the same name that is the user's own, the
+    /// files `crates_vendor` generates, and a copy of rules_rust in the
+    /// tree, whose files load each other by labels of their own
+    /// repository.
+    #[test]
+    fn a_bzl_file_that_declares_no_hub_is_no_gap() {
+        const MODULE: &str = "module(name = \"app\")\n\
+             bazel_dep(name = \"rules_rust\", version = \"0.75.0\")\n\
+             vendored = use_extension(\"//:vendor_extensions.bzl\", \"vendored\")\n\
+             use_repo(vendored, \"crates_vendor_pkgs\")\n";
+        // Reduced from rules_rust@0.70.0 `examples/crate_universe`:
+        // `vendor_extensions.bzl`, and the `defs.bzl` and `crates.bzl`
+        // that a remote `crates_vendor` target generates
+        // (`vendor_remote_pkgs/crates/`). The generated `defs.bzl` names
+        // `crates_repository` in its docstring.
+        let extension = "load(\"//vendor_remote_pkgs/crates:crates.bzl\", \"crate_repositories\")\n\n\
+             def _vendored_impl(module_ctx):\n    direct_deps = []\n    \
+             direct_deps.extend(crate_repositories())\n    return module_ctx.extension_metadata(\n        \
+             root_module_direct_deps = [repo.repo for repo in direct_deps],\n        \
+             root_module_direct_dev_deps = [],\n    )\n\n\
+             vendored = module_extension(implementation = _vendored_impl)\n";
+        let generated_defs = "# @generated\n\
+             # DO NOT MODIFY: This file is auto-generated by a crate_universe tool. To\n\
+             # regenerate this file, run the following:\n#\n\
+             #     See https://github.com/bazelbuild/rules_rust/blob/main/examples/crate_universe/vendor_local_pkgs/BUILD.bazel\n\
+             \"\"\"\n# `crates_repository` API\n\n- [crate_repositories](#crate_repositories)\n\"\"\"\n\n\
+             load(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")\n\
+             load(\"@bazel_tools//tools/build_defs/repo:utils.bzl\", \"maybe\")\n\n\
+             def crate_repositories():\n    maybe(\n        http_archive,\n        \
+             name = \"crates_vendor_pkgs__itoa-1.0.14\",\n        type = \"tar.gz\",\n        \
+             urls = [\"https://static.crates.io/crates/itoa/1.0.14/download\"],\n        \
+             build_file = Label(\"//vendor_remote_pkgs/crates:BUILD.itoa-1.0.14.bazel\"),\n    )\n    \
+             return [struct(repo = \"crates_vendor_pkgs__itoa-1.0.14\", is_dev_dep = False)]\n";
+        let generated_crates = "# @generated\n# This file is auto-generated by the cargo-bazel tool.\n\
+             \"\"\"Rules for defining repositories for remote `crates_vendor` repositories\"\"\"\n\n\
+             load(\"@bazel_tools//tools/build_defs/repo:utils.bzl\", \"maybe\")\n\n\
+             # buildifier: disable=bzl-visibility\n\
+             load(\"@rules_rust//crate_universe/private:crates_vendor.bzl\", \"crates_vendor_remote_repository\")\n\n\
+             # buildifier: disable=bzl-visibility\n\
+             load(\"//vendor_remote_pkgs/crates:defs.bzl\", _crate_repositories = \"crate_repositories\")\n\n\
+             def crate_repositories():\n    maybe(\n        crates_vendor_remote_repository,\n        \
+             name = \"crates_vendor_pkgs\",\n        \
+             build_file = Label(\"//vendor_remote_pkgs/crates:BUILD.bazel\"),\n        \
+             defs_module = Label(\"//vendor_remote_pkgs/crates:defs.bzl\"),\n    )\n\n    \
+             direct_deps = [struct(repo = \"crates_vendor_pkgs\", is_dev_dep = False)]\n    \
+             direct_deps.extend(_crate_repositories())\n    return direct_deps\n";
+        // Loaded and never used; named in a string and a comment beside a
+        // label into crate_universe; the user's own function.
+        let unused =
+            "load(\"@rules_rust//crate_universe:defs.bzl\", \"crates_repository\", \"crate\")\n\n\
+             def annotations():\n    return {\"serde\": [crate.annotation(rustc_flags = [])]}\n";
+        let mention = "load(\"@rules_rust//crate_universe:defs.bzl\", \"crate\")\n\n\
+             # The hubs are declared with crates_repository in //:WORKSPACE.\n\
+             DOC = \"see crates_repository\"\n";
+        let own = "load(\"//crate_universe:hub.bzl\", \"crates_repository\")\n\n\
+             def deps():\n    crates_repository(name = \"x\")\n";
+        // rules_rust@0.75.0 `crate_universe/defs.bzl`, as a copy of the
+        // ruleset in the tree holds it.
+        let copy = "load(\n    \"//crate_universe/private:crates_repository.bzl\",\n    \
+             _crates_repository = \"crates_repository\",\n)\n\ncrates_repository = _crates_repository\n";
+        let found = run(
+            recognize,
+            &[
+                ("MODULE.bazel", MODULE),
+                ("vendor_extensions.bzl", extension),
+                ("vendor_remote_pkgs/crates/defs.bzl", generated_defs),
+                ("vendor_remote_pkgs/crates/crates.bzl", generated_crates),
+                ("tools/unused.bzl", unused),
+                ("tools/mention.bzl", mention),
+                ("tools/own.bzl", own),
+                ("third_party/rules_rust/crate_universe/defs.bzl", copy),
+            ],
+        );
+        assert_eq!(found, Recognized::default());
+
+        // The root module's own name is the main repository too.
+        let own = own.replace("//crate_universe", "@app//crate_universe");
+        let found = run(
+            recognize,
+            &[("MODULE.bazel", MODULE), ("tools/own.bzl", &own)],
+        );
+        assert_eq!(found, Recognized::default());
+    }
+
+    /// A macro file that was read for a `WORKSPACE` file is not reported
+    /// a second time: each use in it is already a hub or a gap of that
+    /// reading. A file one level further down was read by nobody.
+    #[test]
+    fn a_workspace_macro_file_is_accounted_for_once() {
+        let rule = "load(\"@rules_rust//crate_universe:defs.bzl\", \"crates_repository\")\n";
+        let workspace =
+            "load(\"@rules_rust//rust:repositories.bzl\", \"rules_rust_dependencies\")\n\
+             rules_rust_dependencies()\nload(\"//:deps.bzl\", \"rust_deps\")\nrust_deps()\n";
+        let deps = format!(
+            "{rule}def rust_deps():\n    crates_repository(name = \"crates\", cargo_lockfile = \"//:Cargo.lock\")\n"
+        );
+        let files = [("WORKSPACE", workspace), ("deps.bzl", deps.as_str())];
+        let found = run(recognize, &files);
+        assert_eq!(found.hubs.len(), 1);
+        assert!(
+            found.gaps.is_empty() && found.signals.is_empty(),
+            "{found:?}"
+        );
+
+        // `rust_deps` hands the work to a macro of another file: the
+        // model follows one level, and the second file is the scan's.
+        let outer = "load(\"//rust:hubs.bzl\", \"hubs\")\n\ndef rust_deps():\n    hubs()\n";
+        let inner = format!(
+            "{rule}def hubs():\n    crates_repository(name = \"crates\", cargo_lockfile = \"//:Cargo.lock\")\n"
+        );
+        let files = [
+            ("WORKSPACE", workspace),
+            ("deps.bzl", outer),
+            ("rust/hubs.bzl", inner.as_str()),
+        ];
+        let found = run(recognize, &files);
+        assert!(found.hubs.is_empty());
+        assert_eq!(tokens(&found), [LABEL_NOT_LITERAL]);
+        assert!(found.gaps[0].detail.starts_with(
+            "rust/hubs.bzl:3: a use of `crates_repository` is not read: the file is no macro file"
+        ));
+        // The ruleset is loaded and no hub was read: the signal stands.
+        assert_eq!(found.signals.len(), 1);
     }
 }
