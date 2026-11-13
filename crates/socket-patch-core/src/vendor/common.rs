@@ -82,6 +82,7 @@ pub(crate) fn synthesized_result(
         applied_via: HashMap::new(),
         error,
         sidecar: None,
+        refusal: None,
     }
 }
 

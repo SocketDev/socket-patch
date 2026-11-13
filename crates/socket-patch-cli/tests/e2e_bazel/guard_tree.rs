@@ -649,6 +649,53 @@ async fn a_workspace_scan_takes_no_project_from_a_bazel_tree() {
     );
 }
 
+/// ROUTED R-033: after a build a workspace root holds convenience links
+/// into an output base outside the checkout. A PATH glob that matches
+/// them left the whole scan with the usage error of a directory outside
+/// the repository; a matched link is a tree like any other, left out
+/// with a note, and the projects beside it are scanned. A link the user
+/// named keeps the usage error.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_path_glob_leaves_out_the_convenience_links_it_matches() {
+    use std::os::unix::fs::symlink;
+    let (_tmp, scratch) = scratch();
+    let (root, base) = (scratch.join("ws"), scratch.join("base"));
+    std::fs::create_dir_all(root.join(".git")).unwrap();
+    put(&root, "MODULE.bazel", "module(name = \"ws\")\n");
+    npm_project(&root.join("api"), "left-pad", "1.3.0");
+    npm_project(&root.join("web"), "is-odd", "3.0.1");
+    lay_base(&base, &root, Base::Built);
+    let out = base.join("execroot/_main/bazel-out");
+    std::fs::create_dir_all(out.join("k8-fastbuild/bin")).unwrap();
+    symlink(&out, root.join("bazel-out")).unwrap();
+    symlink(out.join("k8-fastbuild/bin"), root.join("bazel-bin")).unwrap();
+    let before = snapshot(&root);
+
+    let api = fake_api().await;
+    let (code, stdout, stderr) = scan(&root, &api, &["--mode", "hosted", "*"]);
+    assert_eq!(code, 0, "stdout:\n{stdout}\nstderr:\n{stderr}");
+    for project in ["== api ==", "== web =="] {
+        assert_eq!(stdout.lines().filter(|l| *l == project).count(), 1);
+    }
+    assert!(!stdout.contains("== bazel-"), "{stdout}");
+    let note = "Note: 2 directories a PATH pattern matched were not scanned (bazel-bin, \
+                bazel-out): Bazel owns them";
+    assert_eq!(stderr.matches(note).count(), 1, "{stderr}");
+    assert_eq!(queried(&api).await, ["pkg:npm/is-odd@3.0.1", PURL]);
+
+    // A link the user named is theirs to hear about: the usage error.
+    let (code, _, stderr) = scan(&root, &api, &["--mode", "hosted", "api", "bazel-bin"]);
+    assert_eq!(code, 2, "{stderr}");
+    assert!(stderr.contains("is outside"), "{stderr}");
+    // Globs that match links alone leave nothing to scan: each is
+    // refused as the tree it is.
+    let (code, _, stderr) = scan(&root, &api, &["--mode", "hosted", "bazel-*"]);
+    assert_eq!(code, 1, "{stderr}");
+    assert_eq!(stderr.matches("Error: Refusing to scan in ").count(), 2);
+    assert_same_tree(&before, &snapshot(&root));
+}
+
 /// A checkout with two projects beside an output base and a vendor
 /// directory, each tree holding a project of its own.
 fn lay_checkout(root: &Path) {

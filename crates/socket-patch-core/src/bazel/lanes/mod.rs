@@ -38,9 +38,10 @@ use serde_json::{json, Value};
 use super::exec::{PinRestore, Txn};
 use super::inventory::may_build;
 use super::model::{
-    BazelLine, BazelRef, BazelWorkspace, CellClaim, ClaimSystem, Code, DepSystem, FileView, Files,
-    HubId, HubShape, Index, IndexRow, LaneCx, LaneId, LaneOps, LaneSpec, LaneTable, Lift, Mode,
-    Reason, Refusal, RestoreOutcome, Ruleset, RunPolicy, TextRead, TokenSurface, LANE_NOT_ENABLED,
+    BazelLine, BazelRef, BazelWorkspace, CellClaim, ClaimOs, ClaimSystem, Code, DepSystem,
+    FileView, Files, HubId, HubShape, Index, IndexRow, LaneCx, LaneId, LaneOps, LaneSpec,
+    LaneTable, Lift, Mode, Reason, Refusal, RestoreOutcome, Ruleset, RunPolicy, TextRead,
+    TokenSurface, LANE_NOT_ENABLED,
 };
 use super::version::{BazelVersion, NEWEST_AUDITED};
 use crate::crawlers::types::Ecosystem;
@@ -113,6 +114,34 @@ pub const BUMP_CELLS: &[BumpCell] = &[];
 /// One row of [`BUMP_CELLS`]: a lane, and the test that ran its bump
 /// cell.
 pub type BumpCell = (LaneId, &'static str);
+
+/// What only an executed real-Bazel cell proves about a lane, as the gate
+/// reads it (revision 4, architecture 8.2): the operating systems a cell
+/// of the lane ran on, and the lanes whose bump cell ran. The gate takes
+/// the lists from its question (`GateCx::proofs`), never from the statics,
+/// so that a test can hand in a fabricated claim beside its toy table: a
+/// vendored or an agent lane wires a path, and without an OS claim no plan
+/// of one leaves the gate. Production never sets the field.
+#[derive(Debug, Clone, Copy)]
+pub struct Proofs {
+    pub os: &'static [(LaneId, ClaimOs)],
+    pub bump: &'static [BumpCell],
+}
+
+impl Proofs {
+    /// The proofs of the shipped lanes: `claims::os::CLAIMS` and
+    /// [`BUMP_CELLS`], both empty until a lane's cells have run.
+    pub const PRODUCTION: Proofs = Proofs {
+        os: claims::os::CLAIMS,
+        bump: BUMP_CELLS,
+    };
+
+    /// The operating systems a cell of `lane` has run on.
+    pub fn os_of(&self, lane: LaneId) -> impl Iterator<Item = ClaimOs> + '_ {
+        let of_lane = self.os.iter().filter(move |(id, _)| *id == lane);
+        of_lane.map(|(_, os)| *os)
+    }
+}
 
 /// The test that ran the bump cell of `lane`, among `bumped`.
 pub fn bump_cell(bumped: &[BumpCell], lane: LaneId) -> Option<&'static str> {
@@ -1065,6 +1094,7 @@ mod tests {
             lane: pin.lane,
             writes: Vec::new(),
             repositories: Vec::new(),
+            artifacts: Vec::new(),
             advisories: Vec::new(),
             attest: AttestBasis::Withheld,
             anchor: Anchor::Digest,

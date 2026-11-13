@@ -1010,6 +1010,7 @@ fn js_gate(cx: &LaneCx<'_>, req: &PatchRequest<'_>) -> GateOutcome {
         lane: JS_LANE,
         writes: vec![PlannedWrite::NativeLock { path }],
         repositories: Vec::new(),
+        artifacts: Vec::new(),
         advisories: Vec::new(),
         attest: AttestBasis::LockUrl,
         anchor: Anchor::Digest,

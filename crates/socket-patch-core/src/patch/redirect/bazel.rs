@@ -458,6 +458,16 @@ impl<'a> Group<'a> {
                 lane.0
             )));
         };
+        // A hosted run produces no artifact: a plan that needs one in
+        // place before its pin is a vendored plan, and its pin would name
+        // bytes nobody committed.
+        if !plan.artifacts.is_empty() {
+            return Err(off(format!(
+                "the plan of lane {} needs a vendored artifact, which a hosted run does not \
+                 produce",
+                lane.0
+            )));
+        }
         // The candidate texts: the files the plan lets its lane author,
         // and no other file of the root.
         let authored = exec::authored(std::slice::from_ref(plan));

@@ -23,11 +23,13 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
+use crate::bazel::model::Advisory;
 use crate::manifest::schema::{PatchFileInfo, PatchManifest};
 use crate::patch::apply::{
     apply_package_patch, is_safe_relative_subpath, normalize_file_path, ApplyResult,
-    MismatchPolicy, PatchSources,
+    MismatchPolicy, PatchSources, Refused,
 };
 use crate::patch::file_hash::compute_file_git_sha256;
 use crate::utils::purl::{build_golang_purl, parse_golang_purl};
@@ -212,14 +214,234 @@ pub fn are_safe_redirect_coords(module: &str, version: &str) -> bool {
     path_safety::is_safe_multi_segment(module) && path_safety::is_safe_single_segment(version)
 }
 
+/// One agent Go redirect that is about to be written: what the Bazel
+/// gate is asked about.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GoWrite {
+    pub project_root: PathBuf,
+    /// The decoded module path and version of the PURL.
+    pub module: String,
+    pub version: String,
+    /// The patch the redirect is for.
+    pub uuid: String,
+}
+
+/// What the Bazel gate says about a [`GoWrite`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum GoGateAnswer {
+    /// Write. No ruleset builds the project's Go modules, or a lane admits
+    /// the directory `replace`. The notes ride the result, each as
+    /// `<code>: <detail>`.
+    Write(Vec<Advisory>),
+    /// Write nothing.
+    Refuse(GoRefusal),
+}
+
+/// A refusal of the agent Go writer under a Bazel root: what the failed
+/// event carries typed, and the sentence for a person, which ends with
+/// the remedy and "nothing was written".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GoRefusal {
+    pub refused: Refused,
+    pub detail: String,
+}
+
+/// Who decides whether the agent Go writer may write under a Bazel root
+/// (design 3, hazards HZ-05 and HZ-06). A directory `replace` in `go.mod`
+/// is a build input of a gazelle workspace, not a host tree: `go_deps`
+/// fails on it, ignores it or applies it to another version, depending on
+/// the gazelle release, and under `go_repository` it has no effect at all.
+/// So the copy and the `replace` are written only where no ruleset builds
+/// the project's Go modules, or where a lane admits the write.
+///
+/// The CLI implements it over its workspace loader, which reads a root
+/// once per run; this crate only says when the question is due: after the
+/// writer's own refusals, and only when something would be written. A
+/// redirect that is in sync is never asked about.
+pub trait AgentGoGate: Send + Sync {
+    /// Whether a Bazel workspace governs the directory at all. Stats
+    /// only: with none above the project it is the whole cost of the
+    /// gate, and the writer then behaves exactly as it does without one.
+    fn bazel(&self, project_root: &Path) -> bool;
+    /// The answer for one write. Reads the workspace, so it blocks.
+    fn ask(&self, write: &GoWrite) -> GoGateAnswer;
+    /// The writer changed files under `project_root`, or failed part-way:
+    /// what was read of the workspace is from before.
+    fn written(&self, project_root: &Path);
+}
+
+/// The gate of one agent write and the patch it is asked about.
+#[derive(Clone, Copy)]
+pub struct Gated<'a> {
+    pub gate: &'a Arc<dyn AgentGoGate>,
+    pub uuid: &'a str,
+}
+
+/// What the gate was asked while one redirect was written.
+#[derive(Default)]
+struct Asked {
+    notes: Vec<Advisory>,
+    /// The writer reached a step that writes.
+    touched: bool,
+}
+
+/// Asks the gate about a write that is due. `Ok` carries the notes of an
+/// answer that lets it through, and is empty where nobody is asked: no
+/// gate (the vendor backend asks for its own base), or no Bazel workspace
+/// around the project.
+async fn ask_gate(
+    gated: Option<&Gated<'_>>,
+    project_root: &Path,
+    module: &str,
+    version: &str,
+) -> Result<Vec<Advisory>, GoRefusal> {
+    let Some(gated) = gated.filter(|gated| gated.gate.bazel(project_root)) else {
+        return Ok(Vec::new());
+    };
+    let (gate, write) = (
+        Arc::clone(gated.gate),
+        GoWrite {
+            project_root: project_root.to_path_buf(),
+            module: module.to_string(),
+            version: version.to_string(),
+            uuid: gated.uuid.to_string(),
+        },
+    );
+    match crate::utils::fs::run_blocking(move || gate.ask(&write)).await {
+        GoGateAnswer::Write(notes) => Ok(notes),
+        GoGateAnswer::Refuse(refusal) => Err(refusal),
+    }
+}
+
+/// [`ask_gate`] for a redirect that is in sync: the one write left is the
+/// root `go.mod` mirror of a `go.work` replace, so the gate is asked only
+/// when that mirror is missing, and `asked.touched` says that it was. A
+/// user under Bazel may have taken the `replace` out of `go.mod` because
+/// `go_deps` fails on it, and a run that put it back unasked would break
+/// that build again on every apply.
+async fn ask_gate_for_mirror(
+    gated: Option<&Gated<'_>>,
+    project_root: &Path,
+    module: &str,
+    version: &str,
+    base_rel: &str,
+    asked: &mut Asked,
+) -> Result<(), GoRefusal> {
+    if !gated.is_some_and(|gated| gated.gate.bazel(project_root)) {
+        return Ok(());
+    }
+    let expected = replace_target_path(base_rel, module, version);
+    if root_go_mod_mirror_ok(project_root, module, version, &expected).await {
+        return Ok(());
+    }
+    asked.notes = ask_gate(gated, project_root, module, version).await?;
+    asked.touched = true;
+    Ok(())
+}
+
+/// The failed result of a refusal: its sentence, led by the code as every
+/// refusal of the Bazel checks is, and the code, token and lift typed.
+fn refused_result(purl: &str, copy_dir: &Path, refusal: GoRefusal) -> ApplyResult {
+    let text = format!("{}: {}", refusal.refused.code, refusal.detail);
+    let mut result = synthesized_result(purl, copy_dir, Vec::new(), false, Some(text));
+    result.refusal = Some(Box::new(refusal.refused));
+    result
+}
+
+/// A result that went through, with the notes of the gate that let it.
+fn with_notes(mut result: ApplyResult, notes: &[Advisory]) -> ApplyResult {
+    if !result.success || notes.is_empty() {
+        return result;
+    }
+    let said: Vec<String> = notes
+        .iter()
+        .map(|note| format!("{}: {}", note.code, note.detail))
+        .collect();
+    let said = said.join("; ");
+    result.error = Some(match result.error.take() {
+        Some(first) => format!("{first}; {said}"),
+        None => said,
+    });
+    result
+}
+
+/// What a writer under a gate does once its steps are over, in a wet run
+/// under a Bazel workspace (hazard HZ-27): no `.socket-stage-*` and no
+/// `.socket-orig-*` file stays in the copy. Inside a tree Bazel can read
+/// such a leftover becomes an action input wherever the directory is
+/// globbed, so it goes when the writer returns, whatever its age and
+/// whatever the run decided: the copy is this project's own, written
+/// under the project's apply lock, so no other run's write is in flight
+/// in it. The age gate of the sweep in `patch::apply` exists for shared
+/// caches, and leaves a window of ten minutes in which a build picks the
+/// file up. Then the gate is told when files changed.
+async fn close_gated_write(
+    gated: Option<&Gated<'_>>,
+    project_root: &Path,
+    copy_dir: &Path,
+    asked: &Asked,
+    dry_run: bool,
+) {
+    let Some(gated) = gated.filter(|gated| !dry_run && gated.gate.bazel(project_root)) else {
+        return;
+    };
+    let tree = copy_dir.to_path_buf();
+    crate::utils::fs::run_blocking(move || {
+        // Bounded by the copy. A linked directory is not entered: nothing
+        // outside the copy is this writer's to sweep.
+        let mut pending = vec![tree];
+        while let Some(dir) = pending.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                    pending.push(entry.path());
+                } else if crate::patch::apply::is_stale_stage(&entry, std::time::Duration::ZERO) {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
+        }
+    })
+    .await;
+    if asked.touched {
+        gated.gate.written(project_root);
+    }
+}
+
 /// Reuse an installed project-local redirect after Go's module cache was
 /// cleared. Never treat this copy as a pristine rebuild source: drift needs
 /// the original module, and copying the tree onto itself would delete it.
+///
+/// This entry asks no Bazel gate: `apply` goes through
+/// [`reuse_agent_go_redirect`].
 pub async fn reuse_go_redirect(
     purl: &str,
     project_root: &Path,
     files: &HashMap<String, PatchFileInfo>,
     dry_run: bool,
+) -> Option<ApplyResult> {
+    reuse_redirect(purl, project_root, files, dry_run, None).await
+}
+
+/// [`reuse_go_redirect`] for `apply`, under the Bazel gate: the one write
+/// a reuse can make, the root `go.mod` mirror, is asked about first.
+pub async fn reuse_agent_go_redirect(
+    purl: &str,
+    project_root: &Path,
+    files: &HashMap<String, PatchFileInfo>,
+    dry_run: bool,
+    gated: Gated<'_>,
+) -> Option<ApplyResult> {
+    reuse_redirect(purl, project_root, files, dry_run, Some(gated)).await
+}
+
+async fn reuse_redirect(
+    purl: &str,
+    project_root: &Path,
+    files: &HashMap<String, PatchFileInfo>,
+    dry_run: bool,
+    gated: Option<Gated<'_>>,
 ) -> Option<ApplyResult> {
     let (module, version) = parse_golang_purl(purl)?;
     if !are_safe_redirect_coords(&module, &version) || files.is_empty() {
@@ -267,12 +489,18 @@ pub async fn reuse_go_redirect(
         )
         .await
     {
+        let (gated, mut asked) = (gated.as_ref(), Asked::default());
+        let base = GO_PATCHES_DIR;
+        let mirror = ask_gate_for_mirror(gated, project_root, &module, &version, base, &mut asked);
+        if let Err(refusal) = mirror.await {
+            return Some(refused_result(purl, &copy, refusal));
+        }
         let mut result = already_patched_result(purl, &copy, files);
         if !dry_run {
-            repair_root_go_mod_mirror(&mut result, project_root, &module, &version, GO_PATCHES_DIR)
-                .await;
+            repair_root_go_mod_mirror(&mut result, project_root, &module, &version, base).await;
         }
-        return Some(result);
+        close_gated_write(gated, project_root, &copy, &asked, dry_run).await;
+        return Some(with_notes(result, &asked.notes));
     }
     Some(synthesized_result(purl, &copy, Vec::new(), false, Some(format!(
         "the local Go patch copy or replace for {module} {version} is out of sync and the upstream module is not installed; restore the committed patch files or download the upstream module before reapplying"
@@ -287,6 +515,10 @@ pub async fn reuse_go_redirect(
 ///   PURL); they key both the copy dir and the `replace` directive.
 /// * `base_rel` — the project-relative copy base ([`GO_PATCHES_DIR`] for
 ///   apply's redirect, `<GO_VENDOR_DIR>/<uuid>` for the vendor backend).
+///
+/// This entry asks no Bazel gate. The vendor backend, which calls it,
+/// asks for its own base, and `apply` writes the agent copy through
+/// [`apply_agent_go_redirect`].
 #[allow(clippy::too_many_arguments)]
 pub async fn apply_go_redirect<'a>(
     purl: &str,
@@ -300,7 +532,83 @@ pub async fn apply_go_redirect<'a>(
     dry_run: bool,
     policy: MismatchPolicy,
 ) -> ApplyResult {
-    let pristine_src = pristine_src.into();
+    let (pristine_src, mut asked) = (pristine_src.into(), Asked::default());
+    redirect_steps(
+        purl,
+        module,
+        version,
+        pristine_src,
+        project_root,
+        base_rel,
+        files,
+        sources,
+        dry_run,
+        policy,
+        None,
+        &mut asked,
+    )
+    .await
+}
+
+/// [`apply_go_redirect`] for `apply`: the agent copy under
+/// [`GO_PATCHES_DIR`], written only where the Bazel gate lets it be
+/// ([`AgentGoGate`]). The gate is asked after the writer's own refusals
+/// and before the first write, in a dry run as in a wet one, and never
+/// for a redirect that is in sync. A refusal comes back as a failed
+/// result with [`ApplyResult::refusal`] set, and nothing is written.
+#[allow(clippy::too_many_arguments)]
+pub async fn apply_agent_go_redirect<'a>(
+    purl: &str,
+    module: &str,
+    version: &str,
+    pristine_src: impl Into<PackageSource<'a>>,
+    project_root: &Path,
+    files: &HashMap<String, PatchFileInfo>,
+    sources: &PatchSources<'_>,
+    dry_run: bool,
+    policy: MismatchPolicy,
+    gated: Gated<'_>,
+) -> ApplyResult {
+    let (pristine_src, mut asked) = (pristine_src.into(), Asked::default());
+    let result = redirect_steps(
+        purl,
+        module,
+        version,
+        pristine_src,
+        project_root,
+        GO_PATCHES_DIR,
+        files,
+        sources,
+        dry_run,
+        policy,
+        Some(&gated),
+        &mut asked,
+    )
+    .await;
+    if are_safe_redirect_coords(module, version) {
+        let copy_dir = copy_dir_for(project_root, GO_PATCHES_DIR, module, version);
+        close_gated_write(Some(&gated), project_root, &copy_dir, &asked, dry_run).await;
+    }
+    with_notes(result, &asked.notes)
+}
+
+/// The steps of [`apply_go_redirect`]. `gated` is the Bazel gate of the
+/// agent caller, and `asked` what it answered.
+#[allow(clippy::too_many_arguments)]
+async fn redirect_steps(
+    purl: &str,
+    module: &str,
+    version: &str,
+    pristine_src: PackageSource<'_>,
+    project_root: &Path,
+    base_rel: &str,
+    files: &HashMap<String, PatchFileInfo>,
+    sources: &PatchSources<'_>,
+    dry_run: bool,
+    policy: MismatchPolicy,
+    gated: Option<&Gated<'_>>,
+    asked: &mut Asked,
+) -> ApplyResult {
     // SECURITY: refuse coordinates that would escape the copy base.
     // A `..`/separator-laden `module`/`version` (a tampered manifest PURL) would
     // otherwise make `fresh_copy` + the apply pipeline write the patched tree to
@@ -403,6 +711,20 @@ pub async fn apply_go_redirect<'a>(
     // by neither. `settle` reports the line with the result, and takes it
     // back when the copy was not made.
     let in_sync = redirect_in_sync(&copy_dir, files, project_root, module, version, base_rel).await;
+    // The Bazel gate comes before the line: a directory `replace` is a
+    // build input of a gazelle workspace, so where a ruleset builds the
+    // project's Go modules nothing is written unless a lane admits it
+    // (hazards HZ-05, HZ-06). A redirect that is in sync has one write
+    // left, the root `go.mod` mirror, and is asked about that alone.
+    let answered = match in_sync {
+        true => ask_gate_for_mirror(gated, project_root, module, version, base_rel, asked).await,
+        false => ask_gate(gated, project_root, module, version)
+            .await
+            .map(|notes| asked.notes = notes),
+    };
+    if let Err(refusal) = answered {
+        return refused_result(purl, &copy_dir, refusal);
+    }
     let ignore = match crate::utils::bazel_root_writes::before_agent_go_tree(
         project_root,
         base_rel,
@@ -414,9 +736,17 @@ pub async fn apply_go_redirect<'a>(
     {
         Ok(ignore) => ignore,
         Err(refusal) => {
-            return synthesized_result(purl, &copy_dir, Vec::new(), false, Some(refusal))
+            let detail = refusal.detail;
+            let refused = Refused {
+                code: refusal.code,
+                token: refusal.token,
+                lift: Some(refusal.lift),
+            };
+            return refused_result(purl, &copy_dir, GoRefusal { refused, detail });
         }
     };
+    // From here on a wet run writes: the line may be in already.
+    asked.touched |= !in_sync;
     let settle = |result| {
         crate::utils::bazel_root_writes::after_agent_go_tree(project_root, &ignore, result)
     };
@@ -3256,5 +3586,292 @@ mod tests {
             "module custom/path\n",
             "an existing go.mod must be left untouched"
         );
+    }
+
+    // ── The agent entry under a Bazel gate ───────────────────────────
+
+    /// A gate that answers as told and counts what it was asked.
+    struct FakeGate {
+        bazel: bool,
+        answer: GoGateAnswer,
+        asked: std::sync::Mutex<Vec<GoWrite>>,
+        written: std::sync::atomic::AtomicUsize,
+    }
+
+    impl FakeGate {
+        fn new(bazel: bool, answer: GoGateAnswer) -> (Arc<Self>, Arc<dyn AgentGoGate>) {
+            let gate = Arc::new(Self {
+                bazel,
+                answer,
+                asked: std::sync::Mutex::default(),
+                written: std::sync::atomic::AtomicUsize::new(0),
+            });
+            (Arc::clone(&gate), gate)
+        }
+
+        fn asked(&self) -> usize {
+            self.asked.lock().unwrap().len()
+        }
+
+        fn written(&self) -> usize {
+            self.written.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl AgentGoGate for FakeGate {
+        fn bazel(&self, _: &Path) -> bool {
+            self.bazel
+        }
+        fn ask(&self, write: &GoWrite) -> GoGateAnswer {
+            self.asked.lock().unwrap().push(write.clone());
+            self.answer.clone()
+        }
+        fn written(&self, _: &Path) {
+            self.written
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    const PATCH_UUID: &str = "0b5e1c1e-5f0a-4c8e-9a51-6d1f3c2b7a90";
+
+    fn refusing() -> GoGateAnswer {
+        use crate::bazel::codes::Code;
+        use crate::bazel::model::{LaneId, Lift, LANE_NOT_ENABLED};
+        GoGateAnswer::Refuse(GoRefusal {
+            refused: Refused {
+                code: Code::AgentGoUnsupported,
+                token: Some(LANE_NOT_ENABLED),
+                lift: Some(Lift::EnableLane(LaneId("A-GO1"))),
+            },
+            detail: "no lane; nothing was written".to_string(),
+        })
+    }
+
+    async fn gated_apply(
+        root: &Path,
+        blobs: &Path,
+        pristine: &Path,
+        files: &HashMap<String, PatchFileInfo>,
+        dry_run: bool,
+        gate: &Arc<dyn AgentGoGate>,
+    ) -> ApplyResult {
+        let sources = PatchSources::blobs_only(blobs);
+        let gated = Gated {
+            gate,
+            uuid: PATCH_UUID,
+        };
+        let policy = MismatchPolicy::Warn;
+        apply_agent_go_redirect(
+            PURL, MODULE, VERSION, pristine, root, files, &sources, dry_run, policy, gated,
+        )
+        .await
+    }
+
+    /// Every file under `root` but the blob store, with its bytes.
+    fn tree(root: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+        let mut out = Vec::new();
+        let mut pending = vec![root.to_path_buf()];
+        while let Some(dir) = pending.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    pending.push(path);
+                } else {
+                    let rel = path.strip_prefix(root).unwrap().to_path_buf();
+                    out.push((rel, std::fs::read(&path).unwrap()));
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// A refusal of the gate is the result's, typed, and nothing is
+    /// written, in a dry run as in a wet one. The gate is asked about the
+    /// write it is: the project, the module, the version and the patch.
+    #[tokio::test]
+    async fn a_gate_that_refuses_leaves_nothing_written() {
+        use crate::bazel::codes::Code;
+        let (dir, blobs, pristine, files, _after) = fixture().await;
+        let root = dir.path();
+        let before = tree(root);
+        let (fake, gate) = FakeGate::new(true, refusing());
+        for dry_run in [true, false] {
+            let result = gated_apply(root, &blobs, &pristine, &files, dry_run, &gate).await;
+            assert!(!result.success);
+            let refused = result.refusal.as_deref().expect("a typed refusal");
+            assert_eq!(refused.code, Code::AgentGoUnsupported);
+            assert_eq!(refused.token, Some("lane_not_enabled"));
+            let error = result.error.unwrap_or_default();
+            let said = format!("{}: no lane; nothing was written", refused.code);
+            assert_eq!(error, said);
+            assert_eq!(tree(root), before, "dry_run={dry_run}");
+        }
+        let asked = fake.asked.lock().unwrap().clone();
+        let write = GoWrite {
+            project_root: root.to_path_buf(),
+            module: MODULE.to_string(),
+            version: VERSION.to_string(),
+            uuid: PATCH_UUID.to_string(),
+        };
+        assert_eq!(asked, [write.clone(), write]);
+        assert_eq!(
+            fake.written(),
+            0,
+            "nothing was written, so nothing is stale"
+        );
+    }
+
+    /// With no Bazel workspace around the project the gate is never asked
+    /// and the writer does what the ungated entry does, byte for byte:
+    /// a leftover in the copy is not this path's to sweep either.
+    #[tokio::test]
+    async fn without_a_workspace_the_gated_entry_is_the_ungated_one() {
+        let (dir, blobs, pristine, files, _after) = fixture().await;
+        let (other, other_blobs, other_pristine, other_files, _) = fixture().await;
+        let (fake, gate) = FakeGate::new(false, refusing());
+        let gated = gated_apply(dir.path(), &blobs, &pristine, &files, false, &gate).await;
+        let plain = apply_fixture(other.path(), &other_blobs, &other_pristine, &other_files).await;
+        assert!(gated.success && plain.success, "{:?}", gated.error);
+        assert_eq!(gated.files_patched, plain.files_patched);
+        assert_eq!(gated.error, plain.error);
+        assert!(gated.refusal.is_none());
+        assert_eq!(tree(dir.path()), tree(other.path()));
+        assert_eq!((fake.asked(), fake.written()), (0, 0));
+
+        // An in-sync re-run with a leftover beside the patched file.
+        let copy = copy_dir_for(dir.path(), GO_PATCHES_DIR, MODULE, VERSION);
+        let leftover = copy.join(format!(".socket-orig-bar.go-{PATCH_UUID}"));
+        std::fs::write(&leftover, b"old").unwrap();
+        let again = gated_apply(dir.path(), &blobs, &pristine, &files, false, &gate).await;
+        assert!(again.success);
+        assert!(leftover.exists(), "no Bazel workspace: as before");
+        assert_eq!((fake.asked(), fake.written()), (0, 0));
+    }
+
+    /// A gate that lets the write through is asked once, told that files
+    /// changed, and its notes ride the result where the CLI finds their
+    /// codes. A redirect that is in sync is not asked about again.
+    #[tokio::test]
+    async fn a_gate_that_admits_is_asked_once_and_its_notes_ride_the_result() {
+        use crate::bazel::codes::Code;
+        let (dir, blobs, pristine, files, after) = fixture().await;
+        let root = dir.path();
+        let note = Advisory {
+            code: Code::WorkspaceOutOfScope,
+            detail: "a hand-written pin was left as it is".to_string(),
+        };
+        let (fake, gate) = FakeGate::new(true, GoGateAnswer::Write(vec![note]));
+        let result = gated_apply(root, &blobs, &pristine, &files, false, &gate).await;
+        assert!(result.success, "{:?}", result.error);
+        let said = result.error.expect("the note of a successful result");
+        let code = Code::WorkspaceOutOfScope.as_str();
+        assert_eq!(
+            said,
+            format!("{code}: a hand-written pin was left as it is")
+        );
+        assert_eq!(crate::patch::apply::advisory_warning_codes(&said), [code]);
+        let copy = copy_dir_for(root, GO_PATCHES_DIR, MODULE, VERSION);
+        assert_eq!(git_sha(&std::fs::read(copy.join("bar.go")).unwrap()), after);
+        assert_eq!((fake.asked(), fake.written()), (1, 1));
+
+        let again = gated_apply(root, &blobs, &pristine, &files, false, &gate).await;
+        assert!(again.success && again.error.is_none(), "{:?}", again.error);
+        assert_eq!(
+            (fake.asked(), fake.written()),
+            (1, 1),
+            "in sync: no question"
+        );
+    }
+
+    /// Hazard HZ-27: under a Bazel workspace no stage and no set-aside
+    /// original outlives the writer, whatever the run decided and however
+    /// young the file is. What the engine did not name stays, and a dry
+    /// run removes nothing.
+    #[tokio::test]
+    async fn under_bazel_the_writer_leaves_no_stage_or_original_behind() {
+        let (dir, blobs, pristine, files, _after) = fixture().await;
+        let root = dir.path();
+        let copy = copy_dir_for(root, GO_PATCHES_DIR, MODULE, VERSION);
+        std::fs::create_dir_all(copy.join("internal")).unwrap();
+        // What an interrupted run leaves, and what it does not.
+        let stage = copy.join(format!(".socket-stage-bar.go-{PATCH_UUID}"));
+        let saved = copy.join(format!(".socket-orig-bar.go-{PATCH_UUID}"));
+        let nested = copy
+            .join("internal")
+            .join(format!(".socket-stage-x.go-{PATCH_UUID}"));
+        let kept = copy.join(format!(".socket-kept-bar.go-{PATCH_UUID}"));
+        let unnamed = copy.join(".socket-stage-notes");
+        for path in [&stage, &saved, &nested, &kept, &unnamed] {
+            std::fs::write(path, b"left").unwrap();
+        }
+        // The run is refused, so nothing rebuilds the copy.
+        let (_, gate) = FakeGate::new(true, refusing());
+        let dry = gated_apply(root, &blobs, &pristine, &files, true, &gate).await;
+        assert!(!dry.success);
+        assert!(
+            stage.exists() && saved.exists() && nested.exists(),
+            "a dry run writes nothing"
+        );
+        let wet = gated_apply(root, &blobs, &pristine, &files, false, &gate).await;
+        assert!(!wet.success);
+        for gone in [&stage, &saved, &nested] {
+            assert!(!gone.exists(), "{} was left behind", gone.display());
+        }
+        assert!(
+            kept.exists() && unnamed.exists(),
+            "not the engine's leftovers"
+        );
+    }
+
+    /// An in-sync redirect has one write left, the root `go.mod` mirror
+    /// of a `go.work` replace. Under a gate that refuses it is not put
+    /// back, by `apply` or by the cache-less reuse; a mirror that is
+    /// there is not asked about.
+    #[tokio::test]
+    async fn a_missing_go_mod_mirror_is_written_back_only_past_the_gate() {
+        let (dir, blobs, pristine, files, _after) = fixture().await;
+        let root = dir.path();
+        let gomod = std::fs::read_to_string(root.join("go.mod")).unwrap();
+        std::fs::write(root.join("go.work"), "go 1.22\n\nuse (\n\t.\n\t./b\n)\n").unwrap();
+        std::fs::create_dir_all(root.join("b")).unwrap();
+        let member = format!("module example.com/b\n\ngo 1.21\n\nrequire {MODULE} {VERSION}\n");
+        std::fs::write(root.join("b").join("go.mod"), member).unwrap();
+        let (admits, open) = FakeGate::new(true, GoGateAnswer::Write(Vec::new()));
+        let first = gated_apply(root, &blobs, &pristine, &files, false, &open).await;
+        assert!(first.success, "{:?}", first.error);
+        let wired = std::fs::read_to_string(root.join("go.mod")).unwrap();
+        assert_ne!(wired, gomod, "the mirror was written");
+        assert_eq!((admits.asked(), admits.written()), (1, 1));
+        // In sync, mirror in place: nothing to ask.
+        let again = gated_apply(root, &blobs, &pristine, &files, false, &open).await;
+        assert!(again.success);
+        assert_eq!(admits.asked(), 1);
+
+        // The user took the mirror out. A gate that refuses keeps it out.
+        std::fs::write(root.join("go.mod"), &gomod).unwrap();
+        let (refuses, shut) = FakeGate::new(true, refusing());
+        let gated = Gated {
+            gate: &shut,
+            uuid: PATCH_UUID,
+        };
+        let refused = gated_apply(root, &blobs, &pristine, &files, false, &shut).await;
+        let reused = reuse_agent_go_redirect(PURL, root, &files, false, gated).await;
+        for result in [refused, reused.expect("the copy is there")] {
+            assert!(!result.success);
+            assert!(result.refusal.is_some());
+            assert_eq!(std::fs::read_to_string(root.join("go.mod")).unwrap(), gomod);
+        }
+        assert_eq!((refuses.asked(), refuses.written()), (2, 0));
+
+        // Past the gate the reuse writes it back, and says files changed.
+        let gated = Gated {
+            gate: &open,
+            uuid: PATCH_UUID,
+        };
+        let reused = reuse_agent_go_redirect(PURL, root, &files, false, gated).await;
+        assert!(reused.expect("the copy is there").success);
+        assert_eq!(std::fs::read_to_string(root.join("go.mod")).unwrap(), wired);
+        assert_eq!((admits.asked(), admits.written()), (2, 2));
     }
 }

@@ -213,6 +213,7 @@ fn toy_gate(cx: &LaneCx<'_>, req: &PatchRequest<'_>) -> GateOutcome {
             PlannedWrite::Owned(OwnedWrite::Index),
         ],
         repositories: Vec::new(),
+        artifacts: Vec::new(),
         advisories: Vec::new(),
         attest: AttestBasis::BazelLock,
         anchor: Anchor::Digest,
@@ -230,17 +231,18 @@ pub(super) fn edit(path: &str, key: &str, original: &str, new: &str) -> FileEdit
     }
 }
 
-/// The pin: the package's URL and digest become the patch's. The toy has
-/// no vendored form, so a vendored source pins nothing.
+/// The pin: the package's URL and digest become the patch's.
 fn toy_rewrite(cx: &LaneCx<'_>, files: &mut Files, pins: &[PinSource], result: &mut RewriteResult) {
     let Some(lock) = lock_of(cx) else { return };
     let Some(mut text) = files.get(&lock).cloned() else {
         return;
     };
-    for pin in pins {
-        let PinSource::Hosted(dep) = pin else {
-            continue;
-        };
+    // A hosted lane: a vendored pin is not this writer's.
+    let hosted = pins.iter().filter_map(|pin| match pin {
+        PinSource::Hosted(dep) => Some(dep),
+        PinSource::Vendored(_) => None,
+    });
+    for dep in hosted {
         let (Some(doc), Some(sha256)) = (parse(&text), dep.integrity.sha256.as_deref()) else {
             continue;
         };
@@ -924,6 +926,7 @@ fn the_gate_refuses_the_toy_lane_where_the_write_cannot_be_proven() {
             lane: LANE,
             writes: vec![PlannedWrite::NativeLock { path }],
             repositories: Vec::new(),
+            artifacts: Vec::new(),
             advisories: Vec::new(),
             attest: AttestBasis::BazelLock,
             anchor: Anchor::Digest,
