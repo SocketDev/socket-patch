@@ -988,6 +988,13 @@ pub(super) fn may_evaluate(ws: &BazelWorkspace, site: &Site) -> bool {
     Evaluated::of(ws).site(site)
 }
 
+/// Whether Bazel may evaluate the statement a recognizer's `gap` names
+/// ([`Evaluated::gap`]): the test [`governance`] applies to each entry of
+/// `ws.ruleset_gaps`, for a reader that must count the same gaps.
+pub(super) fn may_evaluate_gap(ws: &BazelWorkspace, gap: &Gap) -> bool {
+    Evaluated::of(ws).gap(gap)
+}
+
 /// What leaves every ecosystem undetermined: a gap of `MODULE.bazel`
 /// where Bazel may run with Bzlmod on, and a gap of each `WORKSPACE`-family
 /// file that Bazel may evaluate ([`Evaluated`]). A directory called
@@ -1097,6 +1104,59 @@ fn claims(ws: &BazelWorkspace, hub: &Hub, project_rel: &str) -> bool {
     files().any(here) || (project_rel.is_empty() && (!locked || files().any(by_label)))
 }
 
+/// What was not read and may declare a hub of `ecosystem`, or name its
+/// lock: the gaps that make [`governance`] answer `Undetermined` before it
+/// looks at one hub. Empty when every declaration Bazel may evaluate for
+/// the ecosystem was followed to a hub with a literal name and literal
+/// lock labels.
+///
+/// What was not read counts where Bazel may evaluate it, and nowhere
+/// else: the statement of a file Bazel never opens declares no hub.
+fn unread(ws: &BazelWorkspace, ecosystem: Ecosystem) -> Vec<Gap> {
+    // A report-only gap is of no one ecosystem: it leaves each open.
+    let own = |ruleset: Ruleset| ruleset.ecosystem().is_none_or(|e| e == ecosystem);
+    let evaluated = Evaluated::of(ws);
+    let mut gaps = governing_gaps(ws, &evaluated);
+    let read_short = ws.ruleset_gaps.iter();
+    let read_short = read_short.filter(|(ruleset, gap)| own(*ruleset) && evaluated.gap(gap));
+    gaps.extend(read_short.map(|(_, gap)| gap.clone()));
+    let signals = ws.signals.iter();
+    let signals = signals.filter(|signal| own(signal.ruleset) && evaluated.site(&signal.site));
+    gaps.extend(signals.map(|signal| signal_gap(ws, signal)));
+    if gaps.is_empty() {
+        // A hub whose name or lock label was not read may name any lock,
+        // unless Bazel never evaluates its declaration.
+        let unread = |hub: &&Hub| {
+            let lock = |l: &LockRef| l.role == LockRole::PackageLock && l.path.is_none();
+            let open = !hub.decl.literal || hub.locks.iter().any(lock);
+            open && !matches!(standing(ws, hub), Standing::Is(Liveness::Dead { .. }))
+        };
+        let hubs = ws.hubs.iter().filter(|hub| hub.ecosystem == ecosystem);
+        gaps.extend(hubs.filter(unread).map(|hub| {
+            let file = &hub.decl.site.file;
+            let detail = format!(
+                "{file}: the name or a lock label of the {} hub `{}` is not a literal",
+                hub.ruleset.name(),
+                hub.decl.apparent_name
+            );
+            unknown(LABEL_NOT_LITERAL, file, detail)
+        }));
+    }
+    gaps
+}
+
+/// [`unread`] for a reader that permits something by what no hub lock
+/// resolves (the hub inventory): where this is not empty a hub may exist
+/// whose lock nobody listed, so "no lock resolves it" is not known. Empty
+/// for an ecosystem no ruleset builds.
+pub(super) fn unread_gaps(ws: &BazelWorkspace, ecosystem: Ecosystem) -> Vec<Gap> {
+    let built = |ruleset: &Ruleset| ruleset.ecosystem() == Some(ecosystem);
+    match Ruleset::ALL.iter().any(built) {
+        true => unread(ws, ecosystem),
+        false => Vec::new(),
+    }
+}
+
 /// Governance of `ecosystem` for the project at `project_rel` (relative to
 /// the Bazel root, `""` at the root).
 ///
@@ -1119,47 +1179,17 @@ fn claims(ws: &BazelWorkspace, hub: &Hub, project_rel: &str) -> bool {
 /// line changes. A caller reads one model per root and project; over one
 /// view of the root each file is still read once.
 pub fn governance(ws: &BazelWorkspace, ecosystem: Ecosystem, project_rel: &str) -> Governance {
-    // A report-only gap is of no one ecosystem: it leaves each open.
-    let own = |ruleset: Ruleset| ruleset.ecosystem().is_none_or(|e| e == ecosystem);
     if !Ruleset::ALL
         .iter()
         .any(|r| r.ecosystem() == Some(ecosystem))
     {
         return Governance::NotGoverned;
     }
-    // What was not read counts where Bazel may evaluate it, and nowhere
-    // else: the statement of a file Bazel never opens declares no hub.
-    let evaluated = Evaluated::of(ws);
-    let mut gaps = governing_gaps(ws, &evaluated);
-    let read_short = ws.ruleset_gaps.iter();
-    let read_short = read_short.filter(|(ruleset, gap)| own(*ruleset) && evaluated.gap(gap));
-    gaps.extend(read_short.map(|(_, gap)| gap.clone()));
-    let signals = ws.signals.iter();
-    let signals = signals.filter(|signal| own(signal.ruleset) && evaluated.site(&signal.site));
-    gaps.extend(signals.map(|signal| signal_gap(ws, signal)));
-    let of_ecosystem = |hub: &&Hub| hub.ecosystem == ecosystem;
-    if gaps.is_empty() {
-        // A hub whose name or lock label was not read may name any lock,
-        // unless Bazel never evaluates its declaration.
-        let unread = |hub: &&Hub| {
-            let lock = |l: &LockRef| l.role == LockRole::PackageLock && l.path.is_none();
-            let open = !hub.decl.literal || hub.locks.iter().any(lock);
-            open && !matches!(standing(ws, hub), Standing::Is(Liveness::Dead { .. }))
-        };
-        let hubs = ws.hubs.iter().filter(of_ecosystem).filter(unread);
-        gaps.extend(hubs.map(|hub| {
-            let file = &hub.decl.site.file;
-            let detail = format!(
-                "{file}: the name or a lock label of the {} hub `{}` is not a literal",
-                hub.ruleset.name(),
-                hub.decl.apparent_name
-            );
-            unknown(LABEL_NOT_LITERAL, file, detail)
-        }));
-    }
+    let gaps = unread(ws, ecosystem);
     if !gaps.is_empty() {
         return Governance::Undetermined(gaps);
     }
+    let of_ecosystem = |hub: &&Hub| hub.ecosystem == ecosystem;
     let candidates: Vec<usize> = (0..ws.hubs.len())
         .filter(|id| of_ecosystem(&&ws.hubs[*id]) && claims(ws, &ws.hubs[*id], project_rel))
         .collect();
@@ -2561,6 +2591,69 @@ pub(super) mod tests {
         http_archive(\n    name = \"aspect_rules_js\",\n    strip_prefix = \"rules_js-2.9.3\",\n    \
         url = \"https://github.com/aspect-build/rules_js/releases/download/v2.9.3/rules_js-v2.9.3.tar.gz\",\n)\n\
         load(\"@aspect_rules_js//npm:repositories.bzl\", \"npm_translate_lock\")\n";
+
+    /// The two helpers other readers count the same gaps by.
+    /// `unread_gaps` is what `governance` answers `Undetermined` with
+    /// before it looks at a hub, for one ecosystem, and
+    /// `may_evaluate_gap` is its test of a recognizer's gap.
+    #[test]
+    fn unread_gaps_are_what_governance_is_undetermined_by() {
+        let signal = read(&[(
+            "MODULE.bazel",
+            "bazel_dep(name = \"rules_jvm_external\", version = \"6.5\")\n",
+        )]);
+        let gaps = unread_gaps(&signal, Ecosystem::Maven);
+        assert_eq!(gaps.len(), 1);
+        assert_eq!(
+            governance(&signal, Ecosystem::Maven, ""),
+            Governance::Undetermined(gaps)
+        );
+        // Another ecosystem is not held up, and one no ruleset builds
+        // has no hub to miss.
+        assert!(unread_gaps(&signal, Ecosystem::Npm).is_empty());
+        assert_eq!(
+            governance(&signal, Ecosystem::Npm, ""),
+            Governance::NotGoverned
+        );
+        assert!(unread_gaps(&signal, Ecosystem::Composer).is_empty());
+
+        // A recognizer's gap in a `WORKSPACE`: Bazel 6 evaluates the
+        // file, and Bazel 9 never opens it.
+        let workspace = JS_WORKSPACE.replace(
+            "pnpm_lock = \"//:pnpm-lock.yaml\")",
+            "pnpm_lock = \"//:pnpm-lock.yaml\", patches = PATCHES)",
+        );
+        let six = read(&[
+            (".bazelversion", "6.6.0\n"),
+            ("WORKSPACE", &workspace),
+            PNPM_LOCK,
+        ]);
+        let [(ruleset, gap)] = &six.ruleset_gaps[..] else {
+            panic!("one gap: {:?}", six.ruleset_gaps);
+        };
+        assert_eq!(
+            (*ruleset, gap.file.as_str()),
+            (Ruleset::RulesJs, "WORKSPACE")
+        );
+        assert!(may_evaluate_gap(&six, gap));
+        let unread = unread_gaps(&six, Ecosystem::Npm);
+        assert!(unread.contains(gap), "{unread:?}");
+        assert_eq!(
+            governance(&six, Ecosystem::Npm, ""),
+            Governance::Undetermined(unread)
+        );
+        let nine = read(&[
+            (".bazelversion", "9.3.2\n"),
+            ("MODULE.bazel", ""),
+            ("WORKSPACE", &workspace),
+            PNPM_LOCK,
+        ]);
+        let [(_, gap)] = &nine.ruleset_gaps[..] else {
+            panic!("one gap: {:?}", nine.ruleset_gaps);
+        };
+        assert!(!may_evaluate_gap(&nine, gap));
+        assert!(unread_gaps(&nine, Ecosystem::Npm).is_empty());
+    }
 
     /// A signal and a recognizer's gap hold an ecosystem up only where
     /// Bazel may evaluate their statement, as a gap of the model does. On
