@@ -460,6 +460,14 @@ pub struct Discovered {
     /// The pins of every hub whose family could tell, whatever file
     /// carries each.
     pub pins: Vec<BazelRef>,
+    /// Each pin of [`Self::pins`] with a hub whose lane found it; a pin
+    /// the lanes of two hubs found (two hubs read one lock) is here once
+    /// for each. The file that carries a pin need not be a lock its hub
+    /// names: the `go_repository` rules of a `WORKSPACE` name none, and
+    /// their lane finds its pins in a `go.mod`. So a caller that asks
+    /// which hub a pin is wiring of reads it here ([`Self::pins_of`]) and
+    /// never matches `BazelRef::file` against `Hub::locks`.
+    pub by_hub: Vec<(HubId, BazelRef)>,
     /// The hubs Bazel may build from whose pins are not known, each with
     /// the ecosystem it builds: no family of the table serves its
     /// ruleset, or the family could not tell. "Cannot tell" is never "no
@@ -481,6 +489,12 @@ impl Discovered {
     /// Whether every hub could tell: [`Self::pins`] is every pin there is.
     pub fn is_complete(&self) -> bool {
         self.cannot_tell.is_empty()
+    }
+
+    /// The pins the lane of `hub` found for it.
+    pub fn pins_of(&self, hub: HubId) -> impl Iterator<Item = &BazelRef> + '_ {
+        let own = move |(of, _): &&(HubId, BazelRef)| *of == hub;
+        self.by_hub.iter().filter(own).map(|(_, pin)| pin)
     }
 }
 
@@ -529,7 +543,13 @@ pub fn discover(
             };
             for pin in pins {
                 if !found.pins.contains(&pin) {
-                    found.pins.push(pin);
+                    found.pins.push(pin.clone());
+                }
+                // Each mode of a family is asked, so a lane that answers
+                // for every mode names a pin more than once.
+                let of_hub = (HubId(id), pin);
+                if !found.by_hub.contains(&of_hub) {
+                    found.by_hub.push(of_hub);
                 }
             }
         }
@@ -1151,6 +1171,24 @@ mod tests {
         let found = discover(&JS_ONLY, &ws, &view, &index, &read);
         assert_eq!(found.pins.len(), 1, "{found:?}");
         assert!(found.is_complete(), "{found:?}");
+        // The pin is kept with the hub whose lane found it, once, and
+        // the report-only hub has none.
+        assert_eq!(found.by_hub, [(HubId(0), found.pins[0].clone())]);
+        assert_eq!(found.pins_of(HubId(0)).count(), 1);
+        assert_eq!(found.pins_of(HubId(1)).count(), 0);
+        // Two hubs that read one lock: the pin is listed once, and kept
+        // with each hub.
+        let two = JS_MODULE.replace(
+            "use_repo(npm, \"npm\")",
+            "npm.npm_translate_lock(name = \"npm2\", pnpm_lock = \"//:pnpm-lock.yaml\")\n\
+             use_repo(npm, \"npm\", \"npm2\")",
+        );
+        let two = workspace(&two);
+        assert_eq!(two.hubs.len(), 2, "{:?}", two.hubs);
+        let found = discover(&JS_ONLY, &two, &view, &index, &read);
+        assert_eq!(found.pins.len(), 1, "{found:?}");
+        let hubs: Vec<HubId> = found.by_hub.iter().map(|(hub, _)| *hub).collect();
+        assert_eq!(hubs, [HubId(0), HubId(1)]);
         // The production families cannot tell about their own hub, and
         // still say nothing about the report-only one.
         let found = discover(&PRODUCTION, &ws, &view, &index, &read);
