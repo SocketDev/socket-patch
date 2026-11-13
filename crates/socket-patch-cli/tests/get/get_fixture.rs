@@ -296,6 +296,7 @@ pub fn engine_params(root: &Path) -> DownloadParams {
         allow_patch_conflicts: false,
         user_patch_skips_reported: false,
         ecosystems: None,
+        no_gem_native_rebuild: false,
         persist_blobs: true,
         patch_server_url: None,
         all_releases: true,

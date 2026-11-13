@@ -1171,18 +1171,40 @@ async fn the_opt_out_reaches_the_apply_that_scan_and_get_run() {
     let uri = mock.uri();
     let api = ["--api-url", &uri, "--api-token", "fake-token", "--org", ORG];
     let scan = ["scan", "--mode", "agent", "--yes", "--json"];
+    let scan_human = ["scan", "--mode", "agent", "--yes"];
     let get = ["get", UUID, "--mode", "agent", "--yes", "--json"];
     let flag = ["--no-gem-native-rebuild"];
     let env = [("SOCKET_NO_GEM_NATIVE_REBUILD", "1")];
-    // (name, command, extra flags, env, opted out)
-    let cases: [(&str, &[&str], &[&str], &[(&str, &str)], bool); 5] = [
-        ("scan, no opt-out", &scan, &[], &[], false),
-        ("scan, flag", &scan, &flag, &[], true),
-        ("scan, env", &scan, &[], &env, true),
-        ("get, flag", &get, &flag, &[], true),
-        ("get, env", &get, &[], &env, true),
+    struct Case<'a> {
+        name: &'a str,
+        command: &'a [&'a str],
+        opt_out_flag: bool,
+        opt_out_env: bool,
+    }
+    let case = |name, command, opt_out_flag, opt_out_env| Case {
+        name,
+        command,
+        opt_out_flag,
+        opt_out_env,
+    };
+    let cases = [
+        case("scan, no opt-out", &scan[..], false, false),
+        case("scan, flag", &scan, true, false),
+        case("scan, env", &scan, false, true),
+        case("scan, flag, human output", &scan_human, true, false),
+        case("get, flag", &get, true, false),
+        case("get, env", &get, false, true),
     ];
-    for (case, command, extra, env, opted_out) in cases {
+    for Case {
+        name: case,
+        command,
+        opt_out_flag,
+        opt_out_env,
+    } in cases
+    {
+        let extra: &[&str] = if opt_out_flag { &flag } else { &[] };
+        let env: &[(&str, &str)] = if opt_out_env { &env } else { &[] };
+        let opted_out = opt_out_flag || opt_out_env;
         let (_tmp, proj, gem_dir) = fake_native_gem(true);
         let ruby = FakeRuby::new();
         let args = [command, extra, &api[..]].concat();
@@ -1212,10 +1234,13 @@ async fn the_opt_out_reaches_the_apply_that_scan_and_get_run() {
         assert_eq!(built, b"\x7fELF original", "{case}: the build was replaced");
         assert!(!marker.exists(), "{case}: a build marker was written");
         assert!(!backup.exists(), "{case}: a build backup was written");
-        assert!(
-            stdout.contains("native_extension_not_rebuilt"),
-            "{case}: no native_extension_not_rebuilt warning\n{stdout}\n{stderr}"
-        );
+        // JSON names the code; the human line names the flag.
+        let warned = if command.contains(&"--json") {
+            stdout.contains("native_extension_not_rebuilt")
+        } else {
+            stderr.contains("without rebuilding the extension (--no-gem-native-rebuild)")
+        };
+        assert!(warned, "{case}: no warning\n{stdout}\n{stderr}");
         // The build Ruby loads is still the old one: no attestation.
         assert_ne!(check, 0, "{case}: {check_out}");
     }

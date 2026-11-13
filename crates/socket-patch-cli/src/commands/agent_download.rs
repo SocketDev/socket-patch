@@ -374,6 +374,10 @@ pub struct DownloadParams {
     /// `--ecosystems` forwarded to the nested apply, so it never touches
     /// other ecosystems' packages the user filtered out.
     pub ecosystems: Option<Vec<String>>,
+    /// `--no-gem-native-rebuild` forwarded to the nested apply, so a gem
+    /// patch to native-extension sources is written without a rebuild
+    /// there too.
+    pub no_gem_native_rebuild: bool,
     /// Persist downloaded blob content into `.socket/blobs` (the apply
     /// flows need it for later hook/rollback runs). Vendor flows pass
     /// `false`: their patch content is staged in memory and the committed
@@ -1376,6 +1380,7 @@ pub(crate) fn nested_apply_args_from_params(
         // apply the WHOLE manifest, mutating other ecosystems' packages the
         // user filtered out.
         ecosystems: params.ecosystems.clone(),
+        no_gem_native_rebuild: params.no_gem_native_rebuild,
         lock_timeout: run.lock_timeout,
         verbose: run.verbose,
         ..GlobalArgs::default()

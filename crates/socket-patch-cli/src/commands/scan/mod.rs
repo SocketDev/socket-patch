@@ -977,6 +977,7 @@ fn download_params(args: &ScanArgs, save_only: bool, json: bool, silent: bool) -
         allow_patch_conflicts: args.common.allow_patch_conflicts,
         user_patch_skips_reported: true,
         ecosystems: args.common.ecosystems.clone(),
+        no_gem_native_rebuild: args.common.no_gem_native_rebuild,
         persist_blobs: args.mode != Some(ScanMode::Vendored),
         patch_server_url: args.common.patch_server_url.clone(),
     }

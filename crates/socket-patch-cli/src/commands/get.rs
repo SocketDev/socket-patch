@@ -2227,6 +2227,7 @@ fn get_download_params(args: &GetArgs, save_only: bool, persist_blobs: bool) -> 
         allow_patch_conflicts: args.common.allow_patch_conflicts,
         user_patch_skips_reported: false,
         ecosystems: args.common.ecosystems.clone(),
+        no_gem_native_rebuild: args.common.no_gem_native_rebuild,
         persist_blobs,
         patch_server_url: args.common.patch_server_url.clone(),
     }
@@ -4015,6 +4016,7 @@ mod tests {
             allow_patch_conflicts: false,
             user_patch_skips_reported: false,
             ecosystems: None,
+            no_gem_native_rebuild: false,
             persist_blobs: false,
             patch_server_url: None,
         }
@@ -4714,6 +4716,7 @@ mod tests {
             allow_patch_conflicts: false,
             user_patch_skips_reported: false,
             ecosystems: None,
+            no_gem_native_rebuild: false,
             // The vendor-detached posture this fn exists for.
             persist_blobs: false,
             patch_server_url: None,
@@ -5882,6 +5885,37 @@ mod tests {
         );
         assert!(nested.silent, "json || silent params run a quiet apply");
         assert!(!nested.json && !nested.dry_run);
+        assert!(!nested.no_gem_native_rebuild, "rebuilding is the default");
+    }
+
+    /// The caller flags the nested apply acts on survive the rebuild from
+    /// `DownloadParams`: `scan --no-gem-native-rebuild` (or its env form,
+    /// which clap reads into the same field) must not have its apply
+    /// compile a gem's extension (#2069).
+    #[test]
+    fn nested_apply_args_from_params_carry_the_apply_flags() {
+        let client = ApiClient::new(socket_patch_core::api::client::ApiClientOptions {
+            api_url: "http://127.0.0.1:1".into(),
+            api_token: None,
+            route: socket_patch_core::api::client::ApiRoute::Proxy,
+        });
+        let run = DownloadRun {
+            api_client: &client,
+            lock_timeout: None,
+            verbose: false,
+        };
+        let params = DownloadParams {
+            strict: true,
+            allow_patch_conflicts: true,
+            ecosystems: Some(vec!["gem".to_string()]),
+            no_gem_native_rebuild: true,
+            ..dl_params()
+        };
+        let nested =
+            nested_apply_args_from_params(&params, &run, Path::new(".socket/manifest.json"));
+        assert!(nested.no_gem_native_rebuild);
+        assert!(nested.strict && nested.allow_patch_conflicts);
+        assert_eq!(nested.ecosystems, Some(vec!["gem".to_string()]));
     }
 
     /// The uuid path hands the engine the view it already fetched: the
