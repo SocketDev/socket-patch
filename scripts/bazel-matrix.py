@@ -16,19 +16,20 @@ parses each one strictly, so this script reads them as they are:
           "pins", "fetch"?, "cells": [{"bazel", "proof", "tier"}],
           "lanes"?: [{"test", "cells"}]}]}
   heavy   {"group", "ruleset", "fixtures": [{"fixture" (relative to
-          fixtures/bazel), "test", "system", "pins", "fetch", "cells"}]}
+          fixtures/bazel), "test", "system", "pins", "fetch", "cells":
+          [{"bazel", "proof", "tier", "cache"?}], "lanes"?: [{"test",
+          "cells"}]}]}
 
 A file of another shape is refused: a matrix this script cannot read would
 otherwise plan nothing and look covered.
 
-Two keys are read here that the suite's schemas do not take yet: `lanes`
-under a heavy fixture (the heavy `Fixture` of baseline_heavy.rs has no such
-field, so a heavy lane test cannot be listed until it does) and `cache` in
-a cell of a heavy matrix (the heavy `CellSpec` has no such field; the light
-one takes the key). The heavy schema refuses unknown keys, so no committed
-heavy matrix can carry them today. scripts/tests/test_bazel_matrix.py holds
-every key this script reads to the fields of those structs and names these
-two as the open ones.
+Every key read here is one the suite's schemas take: `lanes` under a
+fixture and `cache` in a cell are fields of the `Fixture` and the `CellSpec`
+of baseline_light.rs and of baseline_heavy.rs (`cache` for the cell of a
+lane test; a canary's cell never says it). Both schemas refuse unknown
+keys, so a key read here that a struct lacked could be in no committed
+matrix. scripts/tests/test_bazel_matrix.py holds every key this script
+reads to the fields of those structs, and names none as open.
 
 An entry is one test on one Bazel release on one runner. Its tier is `pr`
 (the path-filtered pull-request run and every wider run) or `nightly`
@@ -524,7 +525,8 @@ def fixture_errors(fixtures=FIXTURES):
                     if ruleset in GO_RUST and cell.get("cache") != "restored":
                         errors.append(f"{at}: a Go or Rust cell is in the pull-request tier "
                                       'only with a restored repository cache (`"cache": '
-                                      '"restored"`); without that key the cell is `nightly`')
+                                      '"restored"`, which the cell of a lane test may say; a '
+                                      "canary fetches cold and stays `nightly`)")
     return errors
 
 

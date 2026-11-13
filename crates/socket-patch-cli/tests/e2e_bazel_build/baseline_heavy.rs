@@ -19,6 +19,16 @@
 //! (`GOPROXY`, pip's `--index-url`). A baseline therefore has no offline
 //! phase and no real-registry variant: in either cell it prints
 //! `SKIP (n/a)`.
+//!
+//! Other modules of the suite. A lane package declares its tests in its
+//! own module and lists their cells under the `lanes` key of the fixture
+//! they run on. No baseline runs them: the tests here that need no Bazel
+//! hold each entry to a shape (the prefix of a lane test, cells on Bazel
+//! releases the fixture's baseline has, one declaration in another
+//! module, one listing). CI runs a lane cell on a restored repository
+//! cache and a canary on a cold one, so `"cache": "restored"` is a lane
+//! cell's statement, and the only way a fixture whose fetch needs the Go
+//! SDK or a Rust toolchain gets into the `pr` tier.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -47,6 +57,33 @@ const ORIGIN_PLACEHOLDER: &str = "http://socket-fixture.invalid";
 /// production index as its default.
 const PIP_INDEX_VAR: &str = "PIP_INDEX_URL";
 const PIP_INDEX_ENVSUBST: &str = "${PIP_INDEX_URL:-https://pypi.org/simple}";
+
+/// The name every baseline canary starts with.
+const BASELINE_PREFIX: &str = "bazel_canary_baseline_";
+
+/// The prefixes a test under a fixture's `lanes` key may have: the
+/// real-Bazel tests of the lane packages.
+const LANE_PREFIXES: &[&str] = &[
+    "bazel_guard_",
+    "bazel_agent_",
+    "bazel_hosted_",
+    "bazel_vendor_",
+    "bazel_canary_",
+];
+
+/// The prefix of a record-only test, a baseline included. CI runs its
+/// cell on a cold repository cache: on a warm one it could not tell when
+/// a pinned URL stops answering.
+const CANARY_PREFIX: &str = "bazel_canary_";
+
+/// The one value a cell's `cache` may have.
+const RESTORED: &str = "restored";
+
+/// The CI tiers a cell may name.
+const TIERS: &[&str] = &["nightly", "pr"];
+
+/// This file, among the modules of the suite.
+const THIS_MODULE: &str = "baseline_heavy.rs";
 
 /// Whether `text` (a `MODULE.bazel` or a `WORKSPACE`) hands pip its index
 /// through `envsubst`: the attribute names the variable and an
@@ -117,6 +154,24 @@ struct Fixture {
     lock: Option<LockSpec>,
     /// What the fixture is for.
     shape: String,
+    cells: Vec<CellSpec>,
+    /// The cells of the lane tests that run on this fixture. Checked for
+    /// shape by the tests of this file that need no Bazel; run by the
+    /// lane's own module, never by the baseline.
+    #[serde(default)]
+    lanes: Vec<Lane>,
+}
+
+/// One test of a lane package on a fixture, and the cells it is claimed in.
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Lane {
+    /// A `bazel_guard_`, `bazel_agent_`, `bazel_hosted_`, `bazel_vendor_`
+    /// or `bazel_canary_` test, declared once, in another module of the
+    /// suite.
+    test: String,
+    /// On Bazel releases the fixture's own cells list: a lane runs where
+    /// the baseline did.
     cells: Vec<CellSpec>,
 }
 
@@ -221,14 +276,21 @@ struct Probe {
 #[serde(deny_unknown_fields)]
 struct CellSpec {
     bazel: String,
-    /// The highest tier of the proof ladder the baseline climbs here: 0
+    /// The highest tier of the proof ladder the test climbs here: 0
     /// fetch, 1 build the probe, 2 run the consumer.
     proof: u8,
     /// `nightly`, or `pr` for a cell cheap enough for the path-filtered run.
     tier: String,
-    /// The probe cell that ran this pairing, or `unverified`: then this
-    /// canary is the first evidence.
+    /// The probe cell that ran this pairing (for a lane test: that showed
+    /// the lane's outcome on it), or `unverified`: then this test is the
+    /// first evidence.
     evidence: String,
+    /// `"restored"`, on a cell of a lane test: the cell counts on the
+    /// repository cache CI restores for it, which is what lets a fixture
+    /// whose fetch needs the Go SDK or a Rust toolchain into the `pr`
+    /// tier. Never on a canary's cell ([`CANARY_PREFIX`]).
+    #[serde(default)]
+    cache: Option<String>,
 }
 
 fn heavy_root() -> PathBuf {
@@ -337,6 +399,177 @@ fn pairing_refused(
             bazel.text
         )
     })
+}
+
+/// Whether the fetch of `fixture` needs the Go SDK or a Rust toolchain
+/// (65 MB and 121 MB) before anything is built.
+fn heavy_fetch(fixture: &Fixture) -> bool {
+    let heavy = |t: &String| t.contains("go_sdk") || t.contains("rust") || t.contains("cargo");
+    fixture.toolchains.iter().any(heavy)
+}
+
+/// What is wrong with the cells `test` is claimed in on `fixture`: the
+/// cells of the fixture's baseline, or those of one of its lane tests.
+/// `pinned` is [`pinned_bazel_versions`].
+fn cell_problems(
+    fixture: &Fixture,
+    test: &str,
+    cells: &[CellSpec],
+    pinned: &BTreeSet<String>,
+) -> Vec<String> {
+    let cold = test.starts_with(CANARY_PREFIX);
+    let heavy_fetch = heavy_fetch(fixture);
+    let mut problems = Vec::new();
+    if cells.is_empty() {
+        problems.push("no cell claims it".to_string());
+    }
+    let mut lines = BTreeSet::new();
+    for spec in cells {
+        let bazel = &spec.bazel;
+        let mut problem = |why: &str| problems.push(format!("Bazel {bazel}: {why}"));
+        if !lines.insert(bazel) {
+            problem("listed twice");
+        }
+        if !pinned.contains(bazel) {
+            problem("not in bazel-pins.txt");
+        }
+        if bazel == "7.7.0" {
+            problem("never pinned: it alone writes absolute file:/// registry keys into a lock");
+        }
+        if spec.proof > 2 {
+            problem("the proof ladder ends at tier 2");
+        }
+        if spec.evidence.is_empty() {
+            problem("no evidence: name the probe cell that ran it, or say `unverified`");
+        }
+        if !TIERS.contains(&spec.tier.as_str()) {
+            problem(&format!("tier {:?} is not one of {TIERS:?}", spec.tier));
+        }
+        let restored = spec.cache.as_deref() == Some(RESTORED);
+        if let Some(other) = spec.cache.as_deref().filter(|_| !restored) {
+            problem(&format!("cache {other:?} is not {RESTORED:?}"));
+        }
+        if restored && cold {
+            problem("a canary runs on a cold repository cache: it never says `cache`");
+        }
+        // Go and Rust need their toolchain just to fetch: a `pr` cell
+        // only where CI restores the repository cache, which it never
+        // does for a canary.
+        if spec.tier == "pr" && heavy_fetch {
+            if cold {
+                problem(
+                    "the fetch needs the Go SDK or a Rust toolchain and a canary fetches it \
+                     cold: its tier is `nightly`",
+                );
+            } else if !restored {
+                problem(
+                    "the fetch needs the Go SDK or a Rust toolchain: tier `pr` only with \
+                     `\"cache\": \"restored\"`",
+                );
+            }
+        }
+        let Some(version) = env::Version::parse(bazel) else {
+            problem("not a Bazel release");
+            continue;
+        };
+        if version.system_flags(fixture.system()).is_none() {
+            problem(&format!("it has no {}", fixture.system().name()));
+        }
+        // Exactly the pairings that ran, never a blanket list of lines.
+        if let Some(why) = pairing_refused(&fixture.pins, &version, &spec.evidence) {
+            problem(&why);
+        }
+    }
+    problems
+}
+
+/// What is wrong with the `lanes` of a fixture's entry, read without the
+/// suite's sources: the name of each lane test and its cells.
+fn lane_problems(fixture: &Fixture, pinned: &BTreeSet<String>) -> Vec<String> {
+    let mut problems = Vec::new();
+    for lane in &fixture.lanes {
+        let test = &lane.test;
+        let mut found = cell_problems(fixture, test, &lane.cells, pinned);
+        let prefixed = LANE_PREFIXES.iter().any(|prefix| test.starts_with(prefix));
+        if !prefixed || test.starts_with(BASELINE_PREFIX) {
+            found.push(format!(
+                "a lane test has one of the prefixes {LANE_PREFIXES:?} and is no baseline"
+            ));
+        }
+        let own = |bazel: &str| fixture.cells.iter().any(|spec| spec.bazel == bazel);
+        for spec in lane.cells.iter().filter(|spec| !own(&spec.bazel)) {
+            found.push(format!(
+                "Bazel {} is no cell of the fixture's baseline",
+                spec.bazel
+            ));
+        }
+        problems.extend(found.into_iter().map(|why| format!("{test}: {why}")));
+    }
+    problems
+}
+
+/// The names of the functions a Rust source declares with a plain `fn`.
+/// A name a macro builds is not seen.
+fn declared_functions(source: &str) -> Vec<String> {
+    let declaration =
+        regex::Regex::new(r"(?m)^\s*(?:pub(?:\([a-z]+\))?\s+)?fn\s+([A-Za-z0-9_]+)\s*\(").unwrap();
+    let names = declaration.captures_iter(source);
+    names.map(|hit| hit[1].to_string()).collect()
+}
+
+/// Function name to the modules of this suite that declare it, this one
+/// excepted: where a lane package declares the tests a matrix lists under
+/// `lanes`. A module is named by its path under the suite's directory.
+fn suite_functions() -> BTreeMap<String, Vec<String>> {
+    let suite = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("e2e_bazel_build");
+    let mut sources = Vec::new();
+    files(&suite, "", &mut sources);
+    sources.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut functions: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for (module, bytes) in &sources {
+        if !module.ends_with(".rs") || module == THIS_MODULE {
+            continue;
+        }
+        for name in declared_functions(&String::from_utf8_lossy(bytes)) {
+            functions.entry(name).or_default().push(module.clone());
+        }
+    }
+    functions
+}
+
+/// What is wrong with how the matrices name their lane tests and the
+/// suite declares them. `baselines` holds the test of every fixture,
+/// `lanes` every lane test as often as it is listed, and `declared` is
+/// [`suite_functions`]. A test is named once in the heavy matrices, and
+/// a lane test is declared once, in a module that is not this one.
+fn lane_declaration_problems(
+    baselines: &BTreeSet<String>,
+    lanes: &[String],
+    declared: &BTreeMap<String, Vec<String>>,
+) -> Vec<String> {
+    let mut problems = Vec::new();
+    let mut named: BTreeSet<&String> = baselines.iter().collect();
+    for test in lanes {
+        if !named.insert(test) {
+            problems.push(format!("{test} is named twice in the matrices"));
+        }
+    }
+    let unique: BTreeSet<&String> = lanes.iter().collect();
+    for test in unique {
+        match declared.get(test).map_or(&[][..], Vec::as_slice) {
+            [_] => {}
+            [] => problems.push(format!(
+                "the lane test {test} is declared in no module of the suite beside \
+                 {THIS_MODULE}"
+            )),
+            modules => problems.push(format!(
+                "the lane test {test} is declared more than once: {modules:?}"
+            )),
+        }
+    }
+    problems
 }
 
 /// `Err` unless `rel` (relative to its fixture) is
@@ -948,6 +1181,8 @@ fn heavy_matrix_lists_every_fixture_and_every_test() {
     workspaces(&heavy_root(), &mut on_disk);
     let mut listed = BTreeSet::new();
     let mut tests = BTreeSet::new();
+    let mut lanes = Vec::new();
+    let mut problems = Vec::new();
     for (path, matrix) in matrices() {
         let at = path.display();
         assert_eq!(matrix.group, "heavy", "{at}");
@@ -975,7 +1210,7 @@ fn heavy_matrix_lists_every_fixture_and_every_test() {
                 fixture.test
             );
             assert!(
-                fixture.test.starts_with("bazel_canary_baseline_"),
+                fixture.test.starts_with(BASELINE_PREFIX),
                 "{at}: {}",
                 fixture.test
             );
@@ -1025,47 +1260,15 @@ fn heavy_matrix_lists_every_fixture_and_every_test() {
                 );
             }
             assert!(
-                !fixture.cells.is_empty() && !fixture.pins.is_empty() && !fixture.shape.is_empty(),
+                !fixture.pins.is_empty() && !fixture.shape.is_empty(),
                 "{at}: {name}"
             );
-            let mut lines = BTreeSet::new();
-            for spec in &fixture.cells {
-                assert!(
-                    lines.insert(&spec.bazel),
-                    "{at}: {name} lists Bazel {} twice",
-                    spec.bazel
-                );
-                assert!(
-                    pinned.contains(&spec.bazel),
-                    "{at}: {name}: Bazel {} is not in bazel-pins.txt",
-                    spec.bazel
-                );
-                // 7.7.0 alone writes absolute file:/// registry keys into a lock.
-                assert_ne!(spec.bazel, "7.7.0", "{at}: {name}");
-                assert!(spec.proof <= 2 && !spec.evidence.is_empty(), "{at}: {name}");
-                let version = crate::bazel_build_common::env::Version::parse(&spec.bazel).unwrap();
-                assert!(
-                    version.system_flags(system).is_some(),
-                    "{at}: {name}: Bazel {} has no {}",
-                    spec.bazel,
-                    system.name()
-                );
-                // Go and Rust need their toolchain (65 MB and 121 MB) just
-                // to fetch: never a PR cell without a restored cache.
-                let heavy_fetch = fixture
-                    .toolchains
-                    .iter()
-                    .any(|t| t.contains("go_sdk") || t.contains("rust") || t.contains("cargo"));
-                assert!(
-                    spec.tier == "nightly" || (spec.tier == "pr" && !heavy_fetch),
-                    "{at}: {name}: tier {}",
-                    spec.tier
-                );
-                // Exactly the pairings that ran, never a blanket list of lines.
-                if let Some(why) = pairing_refused(&fixture.pins, &version, &spec.evidence) {
-                    panic!("{at}: {name}: Bazel {}: {why}", spec.bazel);
-                }
-            }
+            // The baseline's own cells and those of the lane tests listed
+            // under it: one set of rules, read by the test's name.
+            let mut found = cell_problems(fixture, &fixture.test, &fixture.cells, &pinned);
+            found.extend(lane_problems(fixture, &pinned));
+            problems.extend(found.into_iter().map(|why| format!("{at}: {name}: {why}")));
+            lanes.extend(fixture.lanes.iter().map(|lane| lane.test.clone()));
             let lists = |host: &str| fixture.hosts.iter().any(|listed| listed == host);
             let crates_io = lists("index.crates.io") && lists("static.crates.io");
             // Under crate_universe cargo-bazel's cargo reads the index and
@@ -1102,6 +1305,12 @@ fn heavy_matrix_lists_every_fixture_and_every_test() {
         tests, declared,
         "MATRIX.json tests and the baselines! list differ"
     );
+    problems.extend(lane_declaration_problems(
+        &tests,
+        &lanes,
+        &suite_functions(),
+    ));
+    assert!(problems.is_empty(), "{}", problems.join("\n"));
 }
 
 /// The Rust target triples of the platforms heavy cells run on: macOS
@@ -1769,5 +1978,306 @@ fn a_baseline_has_no_offline_and_no_real_registry_cell() {
     for (offline, real_registries) in [(true, false), (false, true), (true, true)] {
         let why = no_baseline_cell(offline, real_registries);
         assert!(why.is_some_and(|why| why.contains("fixture server")));
+    }
+}
+
+/// A `MATRIX.json` of one gazelle fixture (its fetch needs the Go SDK)
+/// and one rules_python fixture (it needs no toolchain), with these
+/// cells and lanes for the first and these lanes for the second.
+fn lane_matrix(go_cells: &str, go_lanes: &str, python_lanes: &str) -> Matrix {
+    let text = format!(
+        r#"{{"group": "heavy", "ruleset": "x", "fixtures": [
+            {{"fixture": "heavy/x/bzlmod/e9",
+              "test": "bazel_canary_baseline_x_bzlmod_e9", "system": "bzlmod",
+              "pins": {{"gazelle": "0.54.0", "rules_go": "0.65.0"}},
+              "registries": ["goproxy"], "fetch": "tool", "hosts": [],
+              "probe": {{"label": "@x//:f", "sha256": "00"}}, "consumer": "PRISTINE",
+              "toolchains": ["go_sdk"], "shape": "a Go fixture",
+              "cells": {go_cells}, "lanes": {go_lanes}}},
+            {{"fixture": "heavy/x/bzlmod/e9-plain",
+              "test": "bazel_canary_baseline_x_bzlmod_e9_plain", "system": "bzlmod",
+              "pins": {{"rules_python": "2.5.0-rc4"}},
+              "registries": ["pypi"], "fetch": "downloader", "hosts": [],
+              "probe": {{"label": "@y//:f", "sha256": "00"}}, "consumer": "vulnerable",
+              "toolchains": [], "shape": "a fixture with no toolchain",
+              "cells": [{{"bazel": "9.3.2", "proof": 2, "tier": "pr", "evidence": "p"}}],
+              "lanes": {python_lanes}}}]}}"#
+    );
+    serde_json::from_str(&text).unwrap_or_else(|e| panic!("{e}:\n{text}"))
+}
+
+/// Every problem the shape checks find in `matrix`, as the hermetic
+/// matrix test collects them. `declared` stands for [`suite_functions`].
+fn lane_matrix_problems(matrix: &Matrix, declared: &[(&str, &[&str])]) -> Vec<String> {
+    let pinned: BTreeSet<String> = ["9.3.2", "8.8.2", "7.7.2", "7.7.0"]
+        .iter()
+        .map(|bazel| bazel.to_string())
+        .collect();
+    let mut problems = Vec::new();
+    let (mut baselines, mut lanes) = (BTreeSet::new(), Vec::new());
+    for fixture in &matrix.fixtures {
+        problems.extend(cell_problems(
+            fixture,
+            &fixture.test,
+            &fixture.cells,
+            &pinned,
+        ));
+        problems.extend(lane_problems(fixture, &pinned));
+        baselines.insert(fixture.test.clone());
+        lanes.extend(fixture.lanes.iter().map(|lane| lane.test.clone()));
+    }
+    let modules = |files: &&[&str]| files.iter().map(|file| file.to_string()).collect();
+    let declared: BTreeMap<String, Vec<String>> = declared
+        .iter()
+        .map(|(test, files)| (test.to_string(), modules(files)))
+        .collect();
+    problems.extend(lane_declaration_problems(&baselines, &lanes, &declared));
+    problems
+}
+
+#[test]
+fn a_lane_lists_its_cells_under_its_fixture_and_a_go_cell_is_pr_on_a_restored_cache() {
+    const NIGHTLY: &str = r#"[{"bazel": "9.3.2", "proof": 2, "tier": "nightly", "evidence": "p"},
+                              {"bazel": "8.8.2", "proof": 2, "tier": "nightly", "evidence": "p"}]"#;
+    const HOSTED: &str = "bazel_hosted_x_bzlmod_e9";
+    let lane = |test: &str, cells: &str| format!(r#"[{{"test": "{test}", "cells": {cells}}}]"#);
+    let cell = |bazel: &str, rest: &str| {
+        format!(r#"[{{"bazel": "{bazel}", "proof": 2, "evidence": "gazelle-go G3", {rest}}}]"#)
+    };
+    let here: &[(&str, &[&str])] = &[(HOSTED, &["gazelle_hosted.rs"])];
+    let one = |problems: Vec<String>, text: &str| {
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains(text), "{}", problems[0]);
+    };
+
+    // The shape a lane package writes: its test under the fixture, in the
+    // `pr` tier on a restored repository cache where the fetch needs the
+    // Go SDK, and with no `cache` where it needs no toolchain.
+    let restored = cell("9.3.2", r#""tier": "pr", "cache": "restored""#);
+    let plain = cell("9.3.2", r#""tier": "pr""#);
+    let matrix = lane_matrix(
+        NIGHTLY,
+        &lane(HOSTED, &restored),
+        &lane("bazel_guard_x_plain", &plain),
+    );
+    let go_lane = &matrix.fixtures[0].lanes[0];
+    assert_eq!(go_lane.test, HOSTED);
+    assert_eq!(go_lane.cells[0].cache.as_deref(), Some(RESTORED));
+    assert_eq!(go_lane.cells[0].tier, "pr");
+    let both: &[(&str, &[&str])] = &[here[0], ("bazel_guard_x_plain", &["rules_python.rs"])];
+    assert_eq!(lane_matrix_problems(&matrix, both), Vec::<String>::new());
+    // A nightly lane cell needs no `cache`, and may state it.
+    for rest in [
+        r#""tier": "nightly""#,
+        r#""tier": "nightly", "cache": "restored""#,
+    ] {
+        let matrix = lane_matrix(NIGHTLY, &lane(HOSTED, &cell("8.8.2", rest)), "[]");
+        assert_eq!(lane_matrix_problems(&matrix, here), Vec::<String>::new());
+    }
+
+    // Go and Rust in the `pr` tier: only on a restored cache.
+    let cold = lane(HOSTED, &cell("9.3.2", r#""tier": "pr""#));
+    one(
+        lane_matrix_problems(&lane_matrix(NIGHTLY, &cold, "[]"), here),
+        "bazel_hosted_x_bzlmod_e9: Bazel 9.3.2: the fetch needs the Go SDK or a Rust toolchain: \
+         tier `pr` only with",
+    );
+    // `cache` has one value, and a tier is one of two.
+    let warm = lane(
+        HOSTED,
+        &cell("9.3.2", r#""tier": "nightly", "cache": "warm""#),
+    );
+    one(
+        lane_matrix_problems(&lane_matrix(NIGHTLY, &warm, "[]"), here),
+        r#"cache "warm" is not "restored""#,
+    );
+    let weekly = lane(HOSTED, &cell("9.3.2", r#""tier": "weekly""#));
+    one(
+        lane_matrix_problems(&lane_matrix(NIGHTLY, &weekly, "[]"), here),
+        r#"tier "weekly" is not one of"#,
+    );
+
+    // A canary runs cold, the baseline included: it never says `cache`,
+    // and a Go or Rust one is never `pr`.
+    let baseline = r#"[{"bazel": "9.3.2", "proof": 2, "tier": "nightly", "evidence": "p",
+                        "cache": "restored"}]"#;
+    one(
+        lane_matrix_problems(&lane_matrix(baseline, "[]", "[]"), &[]),
+        "a canary runs on a cold repository cache",
+    );
+    let baseline = r#"[{"bazel": "9.3.2", "proof": 2, "tier": "pr", "evidence": "p"}]"#;
+    one(
+        lane_matrix_problems(&lane_matrix(baseline, "[]", "[]"), &[]),
+        "a canary fetches it cold: its tier is `nightly`",
+    );
+    let canary = "bazel_canary_x_rot";
+    let listed = lane(canary, &restored);
+    let found = lane_matrix_problems(
+        &lane_matrix(NIGHTLY, &listed, "[]"),
+        &[(canary, &["canary.rs"])],
+    );
+    assert_eq!(found.len(), 2, "{found:?}");
+    assert!(found[0].contains("a canary runs on a cold repository cache"));
+    assert!(found[1].contains("its tier is `nightly`"));
+
+    // A lane test is one of the lane packages' tests, and no baseline.
+    for test in ["bazel_core_x", "bazel_canary_baseline_x_bzlmod_e9_other"] {
+        let matrix = lane_matrix(
+            NIGHTLY,
+            &lane(test, &cell("9.3.2", r#""tier": "nightly""#)),
+            "[]",
+        );
+        one(
+            lane_matrix_problems(&matrix, &[(test, &["core.rs"])]),
+            "a lane test has one of the prefixes",
+        );
+    }
+    // It runs where the baseline did, once per release, and somewhere.
+    let elsewhere = lane(HOSTED, &cell("7.7.2", r#""tier": "nightly""#));
+    one(
+        lane_matrix_problems(&lane_matrix(NIGHTLY, &elsewhere, "[]"), here),
+        "Bazel 7.7.2 is no cell of the fixture's baseline",
+    );
+    let twice = r#"[{"bazel": "9.3.2", "proof": 2, "tier": "nightly", "evidence": "p"},
+                    {"bazel": "9.3.2", "proof": 1, "tier": "nightly", "evidence": "p"}]"#;
+    one(
+        lane_matrix_problems(&lane_matrix(NIGHTLY, &lane(HOSTED, twice), "[]"), here),
+        "Bazel 9.3.2: listed twice",
+    );
+    one(
+        lane_matrix_problems(&lane_matrix(NIGHTLY, &lane(HOSTED, "[]"), "[]"), here),
+        "bazel_hosted_x_bzlmod_e9: no cell claims it",
+    );
+    // The rules of a baseline cell hold for a lane cell too: the proof
+    // ladder, the evidence, the pins file.
+    for (cells, why) in [
+        (
+            r#"[{"bazel": "9.3.2", "proof": 3, "tier": "nightly", "evidence": "p"}]"#,
+            "the proof ladder ends at tier 2",
+        ),
+        (
+            r#"[{"bazel": "9.3.2", "proof": 2, "tier": "nightly", "evidence": ""}]"#,
+            "no evidence",
+        ),
+    ] {
+        one(
+            lane_matrix_problems(&lane_matrix(NIGHTLY, &lane(HOSTED, cells), "[]"), here),
+            why,
+        );
+    }
+    let unpinned = r#"[{"bazel": "9.9.9", "proof": 2, "tier": "nightly", "evidence": "p"}]"#;
+    let found = lane_matrix_problems(&lane_matrix(unpinned, "[]", "[]"), &[]);
+    one(found, "Bazel 9.9.9: not in bazel-pins.txt");
+    let never = r#"[{"bazel": "7.7.0", "proof": 2, "tier": "nightly", "evidence": "p"}]"#;
+    let found = lane_matrix_problems(&lane_matrix(never, "[]", "[]"), &[]);
+    one(found, "Bazel 7.7.0: never pinned");
+
+    // One listing and one declaration, in another module than this one.
+    let matrix = lane_matrix(NIGHTLY, &lane(HOSTED, &restored), &lane(HOSTED, &plain));
+    one(
+        lane_matrix_problems(&matrix, here),
+        "bazel_hosted_x_bzlmod_e9 is named twice in the matrices",
+    );
+    // Nor is it the test of a fixture.
+    let guard = "bazel_guard_x".to_string();
+    let named = lane_declaration_problems(
+        &BTreeSet::from([guard.clone()]),
+        std::slice::from_ref(&guard),
+        &BTreeMap::from([(guard.clone(), vec!["guard.rs".to_string()])]),
+    );
+    one(named, "bazel_guard_x is named twice in the matrices");
+    let matrix = lane_matrix(NIGHTLY, &lane(HOSTED, &restored), "[]");
+    one(
+        lane_matrix_problems(&matrix, &[]),
+        "the lane test bazel_hosted_x_bzlmod_e9 is declared in no module of the suite",
+    );
+    one(
+        lane_matrix_problems(
+            &matrix,
+            &[(HOSTED, &["gazelle_hosted.rs", "go_evidence.rs"])],
+        ),
+        r#"declared more than once: ["gazelle_hosted.rs", "go_evidence.rs"]"#,
+    );
+
+    // The schema is strict: a key it does not act on cannot sit in a
+    // matrix and look honoured.
+    let parse = |lanes: &str| {
+        let text = format!(
+            r#"{{"fixture": "heavy/x/bzlmod/e9", "test": "t", "system": "bzlmod", "pins": {{}},
+                "registries": [], "fetch": "tool", "hosts": [],
+                "probe": {{"label": "l", "sha256": "0"}}, "consumer": "c", "toolchains": [],
+                "shape": "s", "cells": [], "lanes": {lanes}}}"#
+        );
+        serde_json::from_str::<Fixture>(&text).map(|fixture| fixture.lanes.len())
+    };
+    assert_eq!(parse(&lane(HOSTED, &restored)).unwrap(), 1);
+    for refused in [
+        r#"[{"test": "t", "cells": [], "outcome": "WORKS"}]"#,
+        r#"[{"test": "t"}]"#,
+        r#"[{"test": "t", "cells": [{"bazel": "9.3.2", "proof": 2, "tier": "pr"}]}]"#,
+        r#"[{"test": "t", "cells": [{"bazel": "9.3.2", "proof": 2, "tier": "pr", "evidence": "p",
+                                     "cache": true}]}]"#,
+        r#"[{"test": "t", "cells": [{"bazel": "9.3.2", "proof": 2, "tier": "pr", "evidence": "p",
+                                     "network": "cache"}]}]"#,
+    ] {
+        assert!(parse(refused).is_err(), "{refused}");
+    }
+}
+
+#[test]
+fn a_lane_cell_on_a_pairing_no_probe_ran_says_unverified() {
+    let lanes = |evidence: &str| {
+        format!(
+            r#"[{{"test": "bazel_vendor_x", "cells": [{{"bazel": "8.8.2", "proof": 2,
+                "tier": "nightly", "evidence": "{evidence}"}}]}}]"#
+        )
+    };
+    // rules_rs 0.2.2 ran on 8.7.0 and 9.3.2: on 8.8.2 the baseline is
+    // listed as `unverified`, and a lane there can say nothing stronger.
+    let on_rules_rs = |evidence: &str| {
+        let matrix = lane_matrix("[]", "[]", &lanes(evidence));
+        let mut fixture = matrix.fixtures[1].clone();
+        fixture.pins = BTreeMap::from([("rules_rs".to_string(), "0.2.2".to_string())]);
+        fixture.cells[0].bazel = "8.8.2".to_string();
+        fixture.cells[0].evidence = "unverified (ran on 8.7.0)".to_string();
+        let pinned = BTreeSet::from(["8.8.2".to_string()]);
+        let mut found = cell_problems(&fixture, &fixture.test, &fixture.cells, &pinned);
+        found.extend(lane_problems(&fixture, &pinned));
+        found
+    };
+    assert_eq!(on_rules_rs("unverified"), Vec::<String>::new());
+    let found = on_rules_rs("rust-vendor-rules-rs V3");
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert!(
+        found[0].starts_with("bazel_vendor_x: Bazel 8.8.2: no probe ran this pairing"),
+        "{}",
+        found[0]
+    );
+}
+
+#[test]
+fn the_suite_scan_reads_plain_declarations_of_the_other_modules() {
+    let source = "fn first() {}\n    pub(crate) fn second(cell: &Cell) {\n// fn commented() {}\n\
+                  pub fn third<T>(x: T) {}\n        fn $name() {}\nlet f = fn_like();\n\
+                  #[test]\n#[ignore = \"real Bazel\"]\nfn bazel_hosted_x() {\n";
+    assert_eq!(
+        declared_functions(source),
+        ["first", "second", "bazel_hosted_x"]
+    );
+
+    let declared = suite_functions();
+    let modules: BTreeSet<&str> = declared.values().flatten().map(String::as_str).collect();
+    // The suite's own modules are read, this one excepted: a lane test
+    // declared here would be one the baselines' owner runs.
+    assert!(
+        modules.contains("main.rs") && modules.contains("baseline_light.rs"),
+        "{modules:?}"
+    );
+    assert!(!modules.contains(THIS_MODULE));
+    assert!(!declared.contains_key("heavy_matrix_lists_every_fixture_and_every_test"));
+    // A baseline is declared by `baselines!`, here: no other module
+    // declares a function of that name.
+    for test in TESTS {
+        assert!(!declared.contains_key(*test), "{test} is declared twice");
     }
 }

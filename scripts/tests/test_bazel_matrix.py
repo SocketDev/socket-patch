@@ -512,8 +512,22 @@ class Rules(Synthetic):
                 fetch = {"fetch": "tool"} if ruleset != "rules_rs" else {}
                 errors = self.check("heavy", ruleset, [fixture(pins=pins, cells=[cell], **fetch)])
                 self.assert_one(errors, "only with a restored repository cache")
+                # The heavy schema takes the key on the cell of a lane test
+                # (`Schemas` below), and the message says who may write it.
+                self.assertIn("which the cell of a lane test may say", errors[0])
+                # The planner reads the key on any cell. That a canary's
+                # cell never says it is the suite's rule (baseline_heavy.rs).
                 restored = dict(cell, cache="restored")
                 self.assertEqual(self.check("heavy", ruleset, [fixture(pins=pins, cells=[restored], **fetch)]), [])
+                # The shape a heavy lane package commits: its test under the
+                # fixture, in the tier on a restored cache, beside a nightly
+                # baseline.
+                nightly = dict(cell, tier="nightly")
+                for lane_cell, found in ((restored, 0), (cell, 1)):
+                    lane = {"test": f"bazel_hosted_{ruleset}_bzlmod_e9", "cells": [lane_cell]}
+                    errors = self.check("heavy", ruleset, [fixture(pins=pins, cells=[nightly], lanes=[lane], **fetch)])
+                    self.assertEqual(len(errors), found, errors)
+                    self.assertTrue(all(f"bazel_hosted_{ruleset}_bzlmod_e9 on 9.3.2" in e for e in errors), errors)
         # A ruleset that needs no toolchain to fetch may be in the tier as it is.
         cell = {"bazel": "9.3.2", "proof": 1, "tier": "pr"}
         self.assertEqual(self.check("light", "rules_js", [
@@ -756,18 +770,16 @@ class Schemas(unittest.TestCase):
     HOLDS = {"doc": ("Matrix",), "fixture": ("Fixture",), "lane": ("Lane",), "claim": ("Fixture", "Lane"),
              "cell": ("CellSpec",)}
     # (shape, struct, key) the scripts read and the struct lacks, with why
-    # that is no drift. The first three are one thing spelled per shape.
-    # The last two are open: the planner is ahead of the heavy schema, and
-    # the fields are for the owner of baseline_heavy.rs to add (`lanes:
-    # Vec<Lane>` on the heavy `Fixture`, `cache: Option<String>` on the heavy
-    # `CellSpec`; the light one has it). An entry whose field has landed
+    # that is no drift. The three are one thing spelled per shape.
+    # None is open: the planner was ahead of both schemas, and their owners
+    # have added the fields (`cache: Option<String>` on both `CellSpec`s,
+    # `lanes: Vec<Lane>` on the heavy `Fixture`). A key the planner reads
+    # ahead of a schema is entered as `OPEN`; an entry whose field has landed
     # is dead and may go; it fails nothing while it stays.
     ACCEPTED = {
         ("light", "Fixture", "fixture"): "the heavy spelling of `path`; the planner tries both",
         ("heavy", "Fixture", "path"): "the light spelling of `fixture`",
         ("heavy", "Fixture", "loopback_repository"): "only a light fixture has an unpinned Coursier hub",
-        ("heavy", "Fixture", "lanes"): "OPEN: a heavy lane test cannot be listed under its fixture",
-        ("heavy", "CellSpec", "cache"): "OPEN: no Go or Rust cell can be `pr` with a restored cache",
     }
 
     def reads(self):
@@ -817,8 +829,8 @@ class Schemas(unittest.TestCase):
                 self.assertIsNotNone(structs[name], f"{source.name} has no struct {name}")
             for variable, key in reads:
                 for name in self.HOLDS[variable]:
-                    # No struct (heavy has no `Lane`): the key that would
-                    # hold it (`lanes`) is the one reported.
+                    # No struct (a shape with no `Lane`): the key that
+                    # would hold it (`lanes`) is the one reported.
                     if structs[name] and structs[name][1] and key not in structs[name][0]:
                         lacking.add((shape, name, key))
         self.assertLessEqual(lacking, set(self.ACCEPTED),
@@ -826,13 +838,28 @@ class Schemas(unittest.TestCase):
                              "MATRIX.json can carry it")
 
     def test_the_open_keys_are_the_ones_the_planner_says_are_open(self):
-        """The module docstring names them, so an author can tell which key
-        the hermetic suite still refuses, and in which matrix."""
+        """The module docstring names them, so an author is not told to
+        write a key the hermetic suite refuses and can tell which matrix
+        refuses it. Both schemas have caught up: none is open, and the
+        docstring says that too."""
         still_open = {entry for entry, why in self.ACCEPTED.items() if why.startswith("OPEN")}
-        self.assertEqual({key for _, _, key in still_open}, {"lanes", "cache"})
-        self.assertIn("Two keys are read here that the suite's schemas do not take yet", tool.__doc__)
-        for phrase in ("`lanes`\nunder a heavy fixture", "`cache` in\na cell"):
-            self.assertIn(phrase, tool.__doc__)
+        self.assertEqual(still_open, set())
+        self.assertIn("Every key read here is one the suite's schemas take", tool.__doc__)
+        self.assertIn("names none as open", tool.__doc__)
+        self.assertNotIn("not take yet", tool.__doc__)
+
+    def test_the_heavy_schema_takes_lanes_and_a_cell_cache(self):
+        """What a heavy lane package needs to list its tests: `lanes` under
+        a fixture and `cache` in a cell, in a schema that refuses every
+        other key."""
+        text = self.SOURCES["heavy"].read_text(encoding="utf-8")
+        structs = {name: rust_struct(text, name) for name in ("Fixture", "Lane", "CellSpec")}
+        for name, (fields, strict) in structs.items():
+            self.assertTrue(strict, name)
+        self.assertIn("lanes", structs["Fixture"][0])
+        self.assertEqual(structs["Lane"][0], {"test", "cells"})
+        self.assertLessEqual({"bazel", "proof", "tier", "cache"}, structs["CellSpec"][0])
+        self.assertFalse({entry for entry in self.ACCEPTED if entry[0] == "heavy" and entry[2] in ("lanes", "cache")})
 
 
 class PathFilter(unittest.TestCase):
