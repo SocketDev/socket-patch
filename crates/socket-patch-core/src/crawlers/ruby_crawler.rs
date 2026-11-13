@@ -45,10 +45,10 @@ impl RubyCrawler {
     ) -> Result<Vec<PathBuf>, std::io::Error> {
         Ok(Self::gem_paths_and_discovery(
             options,
-            std::env::var_os("BUNDLE_GEMFILE").as_deref(),
-            std::env::var_os("BUNDLE_PATH").as_deref(),
+            bundle_env("BUNDLE_GEMFILE").as_deref(),
+            bundle_env("BUNDLE_PATH").as_deref(),
             &BundlerEnvPathFlags::ambient(),
-            std::env::var_os("BUNDLE_APP_CONFIG").as_deref(),
+            bundle_env("BUNDLE_APP_CONFIG").as_deref(),
             ambient_home().as_deref(),
             ambient_global_config_unless_ignored(&options.cwd).as_deref(),
             bundler_ignores_config(),
@@ -164,10 +164,10 @@ impl RubyCrawler {
     ) -> (Vec<CrawledPackage>, Option<BundleStoreDiscovery>) {
         self.crawl_all_with_env(
             options,
-            std::env::var_os("BUNDLE_GEMFILE").as_deref(),
-            std::env::var_os("BUNDLE_PATH").as_deref(),
+            bundle_env("BUNDLE_GEMFILE").as_deref(),
+            bundle_env("BUNDLE_PATH").as_deref(),
             &BundlerEnvPathFlags::ambient(),
-            std::env::var_os("BUNDLE_APP_CONFIG").as_deref(),
+            bundle_env("BUNDLE_APP_CONFIG").as_deref(),
             ambient_home().as_deref(),
             ambient_global_config_unless_ignored(&options.cwd).as_deref(),
             bundler_ignores_config(),
@@ -625,10 +625,10 @@ impl RubyCrawler {
     pub async fn discover_bundle_stores(cwd: &Path) -> BundleStoreDiscovery {
         Self::discover_bundle_stores_impl(
             cwd,
-            std::env::var_os("BUNDLE_GEMFILE").as_deref(),
-            std::env::var_os("BUNDLE_PATH").as_deref(),
+            bundle_env("BUNDLE_GEMFILE").as_deref(),
+            bundle_env("BUNDLE_PATH").as_deref(),
             &BundlerEnvPathFlags::ambient(),
-            std::env::var_os("BUNDLE_APP_CONFIG").as_deref(),
+            bundle_env("BUNDLE_APP_CONFIG").as_deref(),
             ambient_home().as_deref(),
             ambient_global_config_unless_ignored(cwd).as_deref(),
             bundler_ignores_config(),
@@ -718,10 +718,10 @@ impl RubyCrawler {
     pub async fn verification_only_gem_paths(&self, options: &CrawlerOptions) -> Vec<PathBuf> {
         Self::verification_only_gem_paths_impl(
             options,
-            std::env::var_os("BUNDLE_GEMFILE").as_deref(),
-            std::env::var_os("BUNDLE_PATH").as_deref(),
+            bundle_env("BUNDLE_GEMFILE").as_deref(),
+            bundle_env("BUNDLE_PATH").as_deref(),
             &BundlerEnvPathFlags::ambient(),
-            std::env::var_os("BUNDLE_APP_CONFIG").as_deref(),
+            bundle_env("BUNDLE_APP_CONFIG").as_deref(),
             ambient_home().as_deref(),
             ambient_global_config_unless_ignored(&options.cwd).as_deref(),
             bundler_ignores_config(),
@@ -869,7 +869,7 @@ impl RubyCrawler {
         !bundler_sets_explicit_path(BundlerPathTiers {
             local: read_app_config(
                 discovery.bundler_root.as_deref().unwrap_or(cwd),
-                std::env::var_os("BUNDLE_APP_CONFIG").as_deref(),
+                bundle_env("BUNDLE_APP_CONFIG").as_deref(),
                 ignore_config,
             )
             .await,
@@ -1342,10 +1342,10 @@ impl BundlerPathSettings {
     /// `BUNDLE_DISABLE_SHARED_GEMS`, `BUNDLE_DEPLOYMENT`).
     fn from_ambient_env() -> Self {
         Self::from_env(
-            std::env::var_os("BUNDLE_PATH").as_deref(),
-            std::env::var_os("BUNDLE_PATH__SYSTEM").as_deref(),
-            std::env::var_os("BUNDLE_DISABLE_SHARED_GEMS").as_deref(),
-            std::env::var_os("BUNDLE_DEPLOYMENT").as_deref(),
+            bundle_env("BUNDLE_PATH").as_deref(),
+            bundle_env("BUNDLE_PATH__SYSTEM").as_deref(),
+            bundle_env("BUNDLE_DISABLE_SHARED_GEMS").as_deref(),
+            bundle_env("BUNDLE_DEPLOYMENT").as_deref(),
         )
     }
 
@@ -1382,8 +1382,8 @@ pub(crate) struct BundlerEnvPathFlags {
 impl BundlerEnvPathFlags {
     fn ambient() -> Self {
         Self {
-            path_system: std::env::var_os("BUNDLE_PATH__SYSTEM"),
-            disable_shared_gems: std::env::var_os("BUNDLE_DISABLE_SHARED_GEMS"),
+            path_system: bundle_env("BUNDLE_PATH__SYSTEM"),
+            disable_shared_gems: bundle_env("BUNDLE_DISABLE_SHARED_GEMS"),
         }
     }
 
@@ -1633,11 +1633,8 @@ const SOCKET_BUNDLER_PLUGIN: &str = "socket-patch";
 /// directory is still there is a v4 setup that is still wired, which
 /// Bundler loads fine.
 pub async fn stale_plugin_registration_warning(root: &Path) -> Option<(&'static str, String)> {
-    stale_plugin_registration_warning_with_env(
-        root,
-        std::env::var_os("BUNDLE_APP_CONFIG").as_deref(),
-    )
-    .await
+    stale_plugin_registration_warning_with_env(root, bundle_env("BUNDLE_APP_CONFIG").as_deref())
+        .await
 }
 
 pub(crate) async fn stale_plugin_registration_warning_with_env(
@@ -1714,8 +1711,37 @@ fn registered_plugin_path(index: &str, name: &str) -> Option<String> {
 /// The ambient home directory ([`home_dir`]) as an env value — the
 /// `~`-expansion base for ambient runs; tests inject theirs through the
 /// `_with_env` seams.
+#[cfg(not(test))]
 fn ambient_home() -> Option<std::ffi::OsString> {
     home_dir().map(PathBuf::into_os_string)
+}
+
+/// In the unit tests, only a `HOME` (or `USERPROFILE`) a test holds with
+/// an [`EnvGuard`](crate::test_env::EnvGuard): a developer's
+/// `~/.bundle/config` (`path.system`, `gemfile`, `app_config`) would
+/// otherwise change what every Bundler fixture resolves.
+#[cfg(test)]
+fn ambient_home() -> Option<std::ffi::OsString> {
+    crate::utils::fs::home_from_env(|k| {
+        crate::test_env::guarded_var(k).map(std::ffi::OsString::from)
+    })
+    .map(PathBuf::into_os_string)
+}
+
+/// A `BUNDLE_*` variable from the process environment.
+#[cfg(not(test))]
+fn bundle_env(key: &str) -> Option<std::ffi::OsString> {
+    std::env::var_os(key)
+}
+
+/// In the unit tests, only the `BUNDLE_*` vars a test holds with an
+/// [`EnvGuard`](crate::test_env::EnvGuard). A developer's exported
+/// `BUNDLE_GEMFILE` or `BUNDLE_APP_CONFIG` would otherwise move the
+/// manifest and config every Bundler fixture resolves (156 `vendor::gem`
+/// / `vex::discover::gem` tests failed under `BUNDLE_GEMFILE`, #1919).
+#[cfg(test)]
+fn bundle_env(key: &str) -> Option<std::ffi::OsString> {
+    crate::test_env::guarded_var(key).map(std::ffi::OsString::from)
 }
 
 /// Pure parser for `gem env <key>` stdout. Returns the trimmed path
@@ -1811,8 +1837,8 @@ fn expand_tilde(value: &Path, home: Option<&Path>) -> PathBuf {
 /// global config when there is one, and the `gems.rb` its pair choice
 /// probes. The manifest's own `lockfile` call is read through the view.
 fn bundler_config_files(root: &Path) -> Vec<PathBuf> {
-    let app = bundler_app_config_dir(root, std::env::var_os("BUNDLE_APP_CONFIG").as_deref())
-        .join("config");
+    let app =
+        bundler_app_config_dir(root, bundle_env("BUNDLE_APP_CONFIG").as_deref()).join("config");
     [app, PathBuf::from("gems.rb")]
         .into_iter()
         .chain(ambient_bundler_global_config_file(root))
@@ -1835,9 +1861,9 @@ async fn bundler_settings(root: &Path) -> BundlerSettings {
     bundler_settings_with_env(
         root,
         BundlerEnv {
-            gemfile: std::env::var_os("BUNDLE_GEMFILE").as_deref(),
-            lockfile: std::env::var_os("BUNDLE_LOCKFILE").as_deref(),
-            app_config: std::env::var_os("BUNDLE_APP_CONFIG").as_deref(),
+            gemfile: bundle_env("BUNDLE_GEMFILE").as_deref(),
+            lockfile: bundle_env("BUNDLE_LOCKFILE").as_deref(),
+            app_config: bundle_env("BUNDLE_APP_CONFIG").as_deref(),
             ignore_config: bundler_ignores_config(),
             global_config: ambient_bundler_global_config_file(root).as_deref(),
         },
@@ -2152,7 +2178,7 @@ pub async fn bundler_source_mirror(
         root,
         sources,
         &mirrors,
-        std::env::var_os("BUNDLE_APP_CONFIG").as_deref(),
+        bundle_env("BUNDLE_APP_CONFIG").as_deref(),
         bundler_ignores_config(),
     )
     .await
@@ -2175,7 +2201,7 @@ pub async fn bundler_source_mirror_with_env(
 /// is `ENV["BUNDLE_IGNORE_CONFIG"]`, so any value set (even an empty one)
 /// switches them off and every setting comes from the environment alone.
 pub(crate) fn bundler_ignores_config() -> bool {
-    std::env::var_os("BUNDLE_IGNORE_CONFIG").is_some()
+    bundle_env("BUNDLE_IGNORE_CONFIG").is_some()
 }
 
 /// The app config file's text (`$BUNDLE_APP_CONFIG/config`, else
@@ -2261,9 +2287,9 @@ pub(crate) fn bundler_truthy(value: &str) -> bool {
 pub(crate) fn ambient_bundler_global_config_file(root: &Path) -> Option<PathBuf> {
     bundler_global_config_file(
         root,
-        std::env::var_os("BUNDLE_CONFIG").as_deref(),
-        std::env::var_os("BUNDLE_USER_CONFIG").as_deref(),
-        std::env::var_os("BUNDLE_USER_HOME").as_deref(),
+        bundle_env("BUNDLE_CONFIG").as_deref(),
+        bundle_env("BUNDLE_USER_CONFIG").as_deref(),
+        bundle_env("BUNDLE_USER_HOME").as_deref(),
         ambient_home().as_deref(),
     )
 }
@@ -2294,8 +2320,8 @@ pub(crate) fn bundler_app_config_dir(root: &Path, env_value: Option<&OsStr>) -> 
 pub async fn bundler_app_cache_dir(root: &Path) -> PathBuf {
     bundler_app_cache_dir_with_env(
         root,
-        std::env::var_os("BUNDLE_CACHE_PATH").as_deref(),
-        std::env::var_os("BUNDLE_APP_CONFIG").as_deref(),
+        bundle_env("BUNDLE_CACHE_PATH").as_deref(),
+        bundle_env("BUNDLE_APP_CONFIG").as_deref(),
         bundler_ignores_config(),
         ambient_bundler_global_config_file(root).as_deref(),
     )
@@ -2578,6 +2604,43 @@ async fn bundle_config_dir_reading(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #1919: the unit tests see a `BUNDLE_*` var or `HOME` only while a
+    /// test holds it with an `EnvGuard`, never the developer's own.
+    #[test]
+    #[serial_test::serial]
+    fn bundler_env_sees_only_guarded_variables() {
+        let home = tempfile::tempdir().unwrap();
+        // Set outside any guard, the way a developer's shell export
+        // reaches the test process.
+        let saved = std::env::var_os("BUNDLE_GEMFILE");
+        std::env::set_var("BUNDLE_GEMFILE", "/elsewhere/Gemfile");
+        let unguarded = bundle_env("BUNDLE_GEMFILE");
+        match saved {
+            Some(v) => std::env::set_var("BUNDLE_GEMFILE", v),
+            None => std::env::remove_var("BUNDLE_GEMFILE"),
+        }
+        assert_eq!(unguarded, None);
+        assert_eq!(ambient_home(), None);
+        {
+            let _g = crate::test_env::EnvGuard::many([
+                (
+                    "BUNDLE_GEMFILE",
+                    Some(std::ffi::OsStr::new("/held/Gemfile")),
+                ),
+                ("HOME", Some(home.path().as_os_str())),
+            ]);
+            assert_eq!(
+                bundle_env("BUNDLE_GEMFILE").as_deref(),
+                Some(std::ffi::OsStr::new("/held/Gemfile"))
+            );
+            assert_eq!(
+                ambient_home().map(PathBuf::from).as_deref(),
+                Some(home.path())
+            );
+        }
+        assert_eq!(bundle_env("BUNDLE_GEMFILE"), None);
+    }
 
     /// #952: only an existing gemfile in another directory moves
     /// `Bundler.root`; one in the project root, a missing file, or an app
