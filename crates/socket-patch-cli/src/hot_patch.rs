@@ -352,19 +352,22 @@ fn summary_line(
         .map(|event| text(event, "purl"))
         .collect();
     // The passes can reach the same package (a Python image's system
-    // site-packages is the project's and the global one): what the first
-    // patched, the second finds in place, and that is not news.
-    let in_place = events(reports, "skipped")
-        .filter(|event| text(event, "errorCode").as_deref() == Some("already_patched"))
-        .filter(|event| !applied.contains(&text(event, "purl")))
-        .count();
-    // The same goes for a package neither pass could patch, or both would.
+    // site-packages is the project's and the global one), so each count
+    // below is of packages, not of events: a package both passes find
+    // patched, fail on or would patch is one.
     let distinct = |events: &mut dyn Iterator<Item = &Value>| {
         let mut purls: Vec<Option<String>> = events.map(|event| text(event, "purl")).collect();
         purls.sort();
         purls.dedup();
         purls.len()
     };
+    // What the first pass patched, the second finds in place, and that is
+    // not news either.
+    let in_place = distinct(
+        &mut events(reports, "skipped")
+            .filter(|event| text(event, "errorCode").as_deref() == Some("already_patched"))
+            .filter(|event| !applied.contains(&text(event, "purl"))),
+    );
     let failed = distinct(&mut events(reports, "failed"));
     // `--dry-run` writes nothing: each patch it would apply is `verified`.
     let previewed = distinct(
@@ -737,6 +740,23 @@ mod tests {
             summary_line(&[(PROJECT, project)], true, LIMIT, "5.0s"),
             "applied 1 patch; the global packages were not checked within 5.0s \
              [106 project packages checked, 5.0s]"
+        );
+    }
+
+    /// A restart: both passes find the same patch in place. One patch.
+    #[test]
+    fn a_patch_both_passes_find_in_place_is_said_once() {
+        let in_place = json!({ "status": "success", "scannedPackages": 37, "events": [
+            { "action": "skipped", "purl": "pkg:pypi/flask@2.0.0", "errorCode": "already_patched" },
+        ]});
+        assert_eq!(
+            summary_line(
+                &[(PROJECT, in_place.clone()), (GLOBAL, in_place)],
+                false,
+                LIMIT,
+                "1.0s"
+            ),
+            "1 patch already in place [37 project + 37 global packages checked, 1.0s]"
         );
     }
 
