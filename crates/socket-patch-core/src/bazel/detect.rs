@@ -27,8 +27,8 @@ use super::govern::{self, Standing, RC_IMPORT_UNREADABLE, WORKSPACE_UNREADABLE};
 use super::ignore::{IgnoreModel, BAZELIGNORE};
 use super::model::{
     BazelWorkspace, BoundaryFiles, CommittedVendorDirs, Completeness, DeclSystem, FileText,
-    FileView, Gap, Hub, Liveness, ModuleLock, ModuleModel, OutOfScope, RootRef, Tier,
-    WorkspaceModel,
+    FileView, Gap, Hub, Liveness, ModuleLock, ModuleModel, OutOfScope, RootRef, RulesetSignal,
+    Tier, WorkspaceModel,
 };
 use super::rc;
 use super::rulesets::{self, RecognizeInput};
@@ -122,7 +122,10 @@ fn api_shapes(module: Option<&ModuleModel>) -> Vec<ApiShape> {
 
 /// The weakest tier of the file families that declare something Bazel may
 /// evaluate; of every family that declares anything when none is live;
-/// of the files that exist when nothing is declared.
+/// of the files that exist when nothing is declared. A signal declares
+/// something only where Bazel may evaluate its statement: a hub rule
+/// nobody followed in a `WORKSPACE` left beside `MODULE.bazel` on Bazel 9
+/// must not make the workspace one whose `WORKSPACE` was removed.
 ///
 /// Bazel may evaluate a hub that is live under one of the dependency
 /// systems the workspace may run and dead under another, and one that a
@@ -141,7 +144,9 @@ fn tier(ws: &BazelWorkspace) -> Tier {
     let mut families: Vec<DeclSystem> = live.map(|hub| hub.decl.site.system).collect();
     if families.is_empty() {
         families.extend(ws.hubs.iter().map(|hub| hub.decl.site.system));
-        families.extend(ws.signals.iter().map(|signal| signal.site.system));
+        let evaluated = |signal: &&RulesetSignal| govern::may_evaluate(ws, &signal.site);
+        let signals = ws.signals.iter().filter(evaluated);
+        families.extend(signals.map(|signal| signal.site.system));
     }
     if families.is_empty() {
         families.push(match ws.boundary.module_bazel {
@@ -309,6 +314,8 @@ pub fn detect(root: &RootRef, files: &dyn FileView) -> Result<BazelWorkspace, Ga
         },
         ruleset_gaps,
         vendor_dirs: vendor_dirs(files),
+        // Links are the disk's to resolve (`crawlers::bazel_workspace`).
+        lock_real_dirs: std::collections::BTreeMap::new(),
     };
     govern::settle(&mut ws, files);
     ws.tier = tier(&ws);
@@ -932,5 +939,26 @@ mod tests {
             Liveness::Undecided { .. }
         ));
         assert_eq!(unpinned.tier, Tier::Supported);
+
+        // A signal counts for its family only where Bazel may evaluate
+        // its statement. A hub rule nobody followed in a `WORKSPACE` left
+        // beside a `MODULE.bazel` that declares no hub: Bazel 9 never
+        // opens the file, and the workspace is a Bzlmod one.
+        let loaded = "load(\"@aspect_rules_js//npm:repositories.bzl\", \"npm_translate_lock\")\n";
+        let leftover = [
+            ("MODULE.bazel", "module(name = \"app\")\n"),
+            ("WORKSPACE", loaded),
+        ];
+        let read_at = |version: &str| {
+            let ws = read(&[&leftover[..], &[(".bazelversion", version)]].concat());
+            assert!(ws.hubs.is_empty(), "{:?}", ws.hubs);
+            let files: Vec<&str> = ws.signals.iter().map(|s| s.site.file.as_str()).collect();
+            assert_eq!(files, ["WORKSPACE"], "Bazel {version}");
+            ws.tier
+        };
+        assert_eq!(read_at("9.3.2"), Tier::Supported);
+        assert_eq!(read_at("8.8.2"), Tier::Supported);
+        // Bazel 7 evaluates it beside the module file.
+        assert_eq!(read_at("7.7.2"), Tier::Beta);
     }
 }

@@ -36,21 +36,16 @@
 //! `WORKSPACE` that has gazelle, by a `load` or by its archive, and shows
 //! no rule where a statement of the repository was not read is a signal.
 
+use super::super::govern::module_version;
 use super::super::label::{main_repo_path, Label, Repo};
 use super::super::model::{
     Bypass, DeclSystem, Declaration, FileText, Gap, Hub, HubShape, Liveness, LockRef, LockRole,
     Ruleset, RulesetDetail, RulesetSignal, Site, UserDecl,
 };
-use super::super::module_file::{
-    BazelDep, GapScope, Host, ModuleGap, ModuleModel, ModuleOverride,
-    OverrideKind as RootOverrideKind, MODULE_FILE,
-};
+use super::super::module_file::{GapScope, Host, ModuleGap, ModuleModel};
 use super::super::module_lock::{ExtensionId, GoModFact, ModuleLock, RepoSpec};
-use super::super::rc::{root_relative, Chain, Flag, FlagState, LockfileMode};
-use super::super::ruleset_version::{
-    self, Evidence, LineSpan, LockfileFlag, OverrideKind as Pin, Registries, RootDep, RootOverride,
-    Unproven, VersionVerdict,
-};
+use super::super::rc::root_relative;
+use super::super::ruleset_version::{Unproven, VersionVerdict};
 use super::super::starlark::{self, Dialect, Lookup, Value, ValueKind};
 use super::super::version::{module_version_cmp, BazelLine, BazelVersion, Tri};
 use super::super::workspace_file::{
@@ -1371,7 +1366,9 @@ fn usage_hub(
         ruleset: Ruleset::Gazelle,
         shape: HubShape::GoDeps,
         ecosystem: Ecosystem::Golang,
-        ruleset_version: gazelle_version(input, module, detail.api_floor),
+        // The fold of the root files into the evidence ladder is the one
+        // every recognizer shares.
+        ruleset_version: module_version(input, Some(MODULE), detail.api_floor),
         detail: RulesetDetail::Gazelle(GazelleDetail::GoDeps(Box::new(detail))),
         decl: Declaration {
             site: hub_site,
@@ -1484,116 +1481,6 @@ fn lock_record(lock: Option<&ModuleLock>, isolated: bool) -> (LockRecord, Facts)
         _ => Facts::Unknown,
     };
     (record, facts)
-}
-
-/// The version of the `gazelle` module that Bazel resolves (design 2.8):
-/// the root module file, the tracked rc flags, the Bazel line and the lock
-/// folded into the evidence ladder. Whatever cannot be read off them
-/// weakens the verdict and never strengthens it.
-fn gazelle_version(
-    input: &RecognizeInput<'_>,
-    module: &ModuleModel,
-    floor: Option<&str>,
-) -> VersionVerdict {
-    let unreadable = || VersionVerdict::unknown(Unproven::UnreadableOverride);
-    // A statement that was not read can override the module.
-    if module
-        .gaps
-        .iter()
-        .any(|gap| gap.scope == GapScope::Everything)
-    {
-        return unreadable();
-    }
-    let dep = |dep: &BazelDep| RootDep {
-        name: dep.name.clone(),
-        version: dep.version.clone(),
-        dev_dependency: dep.dev,
-    };
-    let deps: Vec<RootDep> = module.deps.iter().map(dep).collect();
-    let pin = |over: &ModuleOverride| match over.kind {
-        RootOverrideKind::SingleVersion => match over.call.arg("version") {
-            Lookup::Absent => Pin::PatchOnly,
-            Lookup::Found(value) => match module.resolve(over.at, value).as_str() {
-                Some("") => Pin::PatchOnly,
-                Some(version) => Pin::Pinned(version.to_string()),
-                None => Pin::Unreadable,
-            },
-            Lookup::Unknown => Pin::Unreadable,
-        },
-        RootOverrideKind::MultipleVersion => Pin::Unreadable,
-        RootOverrideKind::Archive | RootOverrideKind::Git | RootOverrideKind::LocalPath => {
-            Pin::NonRegistry
-        }
-    };
-    let declared = module.overrides.iter().map(|over| RootOverride {
-        module: over.module.clone(),
-        kind: pin(over),
-    });
-    let mut overrides: Vec<RootOverride> = declared.collect();
-    let (mut lockfile, mut registries) = (LockfileFlag::Unset, Registries::Default);
-    let (mut ignore_dev, mut check_direct) = (false, false);
-    if let Some(flags) = input.flags {
-        // A file Bazel is sure to load and that was not read may set
-        // `--override_module`.
-        if flags.gaps().iter().any(|gap| gap.hard) {
-            return unreadable();
-        }
-        ignore_dev = ruleset_version::ignore_dev_dependency(flags);
-        let error = FlagState::Set("error".to_string());
-        check_direct = flags.state(Flag::CheckDirectDependencies, Chain::Build) == error;
-        let mut modes = Vec::new();
-        for chain in Chain::COMMANDS {
-            let found = flags.occurrences(Flag::OverrideModule, *chain);
-            let Ok(found) =
-                found.and_then(|found| Ok((found, flags.occurrences(Flag::Registry, *chain)?)))
-            else {
-                return unreadable();
-            };
-            overrides.extend(found.0.iter().map(|flag| {
-                RootOverride {
-                    module: flag
-                        .name_and_path()
-                        .map_or(flag.value.as_str(), |(name, _)| name)
-                        .to_string(),
-                    kind: Pin::NonRegistry,
-                }
-            }));
-            // A tracked `--registry` list is not folded: the lock's own
-            // list is then never proven to be the one in force.
-            if !found.1.is_empty() {
-                registries = Registries::Unknown;
-            }
-            modes.push(flags.state(Flag::LockfileMode, *chain));
-        }
-        let off = |state: &FlagState<String>| {
-            let read = |value: &&String| {
-                LockfileMode::parse(value).is_none_or(|mode| mode == LockfileMode::Off)
-            };
-            matches!(state, FlagState::UnknowableHard(_)) || state.values().iter().any(read)
-        };
-        lockfile = if modes.iter().any(off) {
-            LockfileFlag::MaybeOff
-        } else if modes.iter().any(FlagState::may_be_unset) {
-            LockfileFlag::Unset
-        } else {
-            LockfileFlag::On
-        };
-    }
-    static NO_LOCK: ModuleLock = ModuleLock::Absent;
-    let module_file = input.files.read(MODULE_FILE);
-    ruleset_version::resolve(&Evidence {
-        module: MODULE,
-        deps: &deps,
-        overrides: &overrides,
-        ignore_dev_dependency: ignore_dev,
-        check_direct_dependencies_error: check_direct,
-        line: input.line.and_then(LineSpan::of),
-        lockfile,
-        registries,
-        lock: input.module_lock.unwrap_or(&NO_LOCK),
-        module_file: module_file.as_bytes(),
-        api_floor: floor,
-    })
 }
 
 /// gazelle's test for a `# keep` comment (`rule.ShouldKeep`).
@@ -1915,6 +1802,7 @@ fn go_repositories(input: &RecognizeInput<'_>, model: &WorkspaceModel, out: &mut
 #[cfg(test)]
 mod tests {
     use super::super::super::module_file::tests::{fixtures, vectors, view, View};
+    use super::super::super::module_file::MODULE_FILE;
     use super::super::super::rc;
     use super::super::super::ruleset_version::{Bound, Source};
     use super::*;

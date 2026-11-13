@@ -21,8 +21,10 @@
 //! the lock checks over each lock ([`pip_compile`](super::pip_compile)),
 //! and for a `WORKSPACE` hub the repository its rule is loaded from.
 //!
-//! The ruleset version is resolved here for a Bzlmod hub
-//! ([`module_version`]). For a `WORKSPACE` hub it is left unknown: which
+//! The ruleset version is resolved here for a Bzlmod hub, by the one fold
+//! of the root files every recognizer shares
+//! ([`module_version`](crate::bazel::govern::module_version)). For a
+//! `WORKSPACE` hub it is left unknown: which
 //! system evaluates the file is not this reader's knowledge, and under a
 //! hybrid root the hub's rule comes from the Bzlmod module whenever the
 //! root module can see [`RulesPythonDetail::load_repo`] (design 2.8).
@@ -45,21 +47,14 @@ use std::collections::BTreeSet;
 use super::pip_compile::{self, PipCompileDetail};
 use super::{RecognizeInput, Recognized};
 use crate::bazel::derived::LockCheckKind;
+use crate::bazel::govern::module_version;
 use crate::bazel::label::{Label, Repo};
 use crate::bazel::model::{
     Bypass, DeclSystem, Declaration, DerivedState, FileText, FileView, Gap, Hub, HubShape,
     Liveness, LockRef, LockRole, Ruleset, RulesetDetail, RulesetSignal, Site, UserDecl,
 };
-use crate::bazel::module_file::{
-    At, BazelDep, GapScope, Host, ModuleGap, ModuleModel, ModuleOverride, OverrideKind as Declared,
-    Tag, MODULE_FILE,
-};
-use crate::bazel::module_lock::ModuleLock;
-use crate::bazel::rc::{Chain, EffectiveFlags, Flag, FlagState, LockfileMode};
-use crate::bazel::ruleset_version::{
-    self, Evidence, LineSpan, LockfileFlag, OverrideKind, Registries, RootDep, RootOverride,
-    Unproven, VersionVerdict,
-};
+use crate::bazel::module_file::{At, GapScope, Host, ModuleGap, ModuleModel, Tag};
+use crate::bazel::ruleset_version::{Unproven, VersionVerdict};
 use crate::bazel::starlark::{Arg, ArgKind, Call, Lookup, Span, Value, ValueKind};
 use crate::bazel::version::Tri;
 use crate::bazel::workspace_file::{
@@ -635,140 +630,6 @@ pub(super) fn unread_module(
         let site = model.site(dep.at);
         out.signals.push(RulesetSignal { ruleset, site });
     }
-}
-
-/// The resolved version of the module `module` (design 2.8), from the
-/// root files as the recognizer was handed them. `api_floor` is the first
-/// version that has an API the root file uses.
-///
-/// Every doubt degrades the evidence and none adds to it. A statement of
-/// `MODULE.bazel` that was not read may override the module, so nothing
-/// is proven then. A tracked `--override_module` is a non-registry
-/// override; an rc file Bazel is sure to load that could not be read may
-/// hold one, and may turn the lock off. `--registry`, when any line sets
-/// it, is taken for unknown: a family-A lock is then not proven to be
-/// reused, and the declared version stands as a lower bound.
-pub(in crate::bazel) fn module_version(
-    input: &RecognizeInput<'_>,
-    module: Option<&str>,
-    api_floor: Option<&str>,
-) -> VersionVerdict {
-    let (Some(model), Some(module)) = (input.module, module) else {
-        return VersionVerdict::unknown(Unproven::NotDeclared);
-    };
-    if model
-        .gaps
-        .iter()
-        .any(|gap| gap.scope == GapScope::Everything)
-    {
-        return VersionVerdict::unknown(Unproven::UnreadableOverride);
-    }
-    let root_dep = |dep: &BazelDep| RootDep {
-        name: dep.name.clone(),
-        version: dep.version.clone(),
-        dev_dependency: dep.dev,
-    };
-    let deps: Vec<RootDep> = model.deps.iter().map(root_dep).collect();
-    let declared = |over: &ModuleOverride| {
-        let version = named(&over.call, "version");
-        let version = version.map(|found| found.map(|value| model.resolve(over.at, value)));
-        let kind = match (over.kind, version) {
-            (Declared::Archive | Declared::Git | Declared::LocalPath, _) => {
-                OverrideKind::NonRegistry
-            }
-            (Declared::MultipleVersion, _) | (_, Err(Computed)) => OverrideKind::Unreadable,
-            (Declared::SingleVersion, _) if starred(&over.call) => OverrideKind::Unreadable,
-            // With no version it carries patches or a registry only.
-            (Declared::SingleVersion, Ok(None)) => OverrideKind::PatchOnly,
-            (Declared::SingleVersion, Ok(Some(version))) => match version.as_str() {
-                Some("") => OverrideKind::PatchOnly,
-                Some(version) => OverrideKind::Pinned(version.to_string()),
-                None => OverrideKind::Unreadable,
-            },
-        };
-        RootOverride {
-            module: over.module.clone(),
-            kind,
-        }
-    };
-    let mut overrides: Vec<RootOverride> = model.overrides.iter().map(declared).collect();
-    let flags = input.flags;
-    let unread_rc = flags.is_some_and(|flags| flags.gaps().iter().any(|gap| gap.hard));
-    let mut by_flag = |name: &str| {
-        overrides.push(RootOverride {
-            module: name.to_string(),
-            kind: OverrideKind::NonRegistry,
-        });
-    };
-    if unread_rc {
-        by_flag(module);
-    }
-    for chain in flags.map_or(&[][..], |_| Chain::COMMANDS) {
-        let found = flags.map(|flags| flags.occurrences(Flag::OverrideModule, *chain));
-        match found {
-            // A value with no `=` names no module this reader can rule
-            // out.
-            Some(Ok(found)) => found.iter().for_each(|flag| {
-                by_flag(flag.name_and_path().map_or(module, |(name, _)| name));
-            }),
-            Some(Err(_)) => by_flag(module),
-            None => {}
-        }
-    }
-    let build = |flag: Flag| flags.map(|flags| flags.state(flag, Chain::Build));
-    let checked = matches!(
-        build(Flag::CheckDirectDependencies),
-        Some(FlagState::Set(mode)) if mode == "error"
-    );
-    let absent = ModuleLock::Absent;
-    let root_file = input.files.read(MODULE_FILE);
-    ruleset_version::resolve(&Evidence {
-        module,
-        deps: &deps,
-        overrides: &overrides,
-        ignore_dev_dependency: flags.is_some_and(ruleset_version::ignore_dev_dependency),
-        check_direct_dependencies_error: checked && !unread_rc,
-        line: input.line.and_then(LineSpan::of),
-        lockfile: lockfile_flag(flags, unread_rc),
-        registries: match flags {
-            Some(flags) if unread_rc || registry_set(flags) => Registries::Unknown,
-            _ => Registries::Default,
-        },
-        lock: input.module_lock.unwrap_or(&absent),
-        module_file: root_file.as_bytes(),
-        api_floor,
-    })
-}
-
-/// `--lockfile_mode` over every command chain and named config.
-fn lockfile_flag(flags: Option<&EffectiveFlags>, unread_rc: bool) -> LockfileFlag {
-    let Some(flags) = flags else {
-        return LockfileFlag::Unset;
-    };
-    let mut unset = false;
-    for chain in Chain::COMMANDS {
-        let state = flags.state(Flag::LockfileMode, *chain);
-        // A value Bazel rejects is no proof that the lock is read.
-        let off =
-            |mode: &&String| matches!(LockfileMode::parse(mode), Some(LockfileMode::Off) | None);
-        if unread_rc || state.values().iter().any(off) {
-            return LockfileFlag::MaybeOff;
-        }
-        unset |= state.may_be_unset();
-    }
-    match unset {
-        true => LockfileFlag::Unset,
-        false => LockfileFlag::On,
-    }
-}
-
-/// Whether any tracked rc line sets `--registry`, on any chain.
-fn registry_set(flags: &EffectiveFlags) -> bool {
-    let set = |chain: &Chain| {
-        let found = flags.occurrences(Flag::Registry, *chain);
-        !found.is_ok_and(|found| found.is_empty())
-    };
-    Chain::COMMANDS.iter().any(set)
 }
 
 /// Whether the version is proven at or above `threshold`, proven below
@@ -1609,8 +1470,9 @@ fn workspace(input: &RecognizeInput<'_>, ws: &WorkspaceModel, out: &mut Recogniz
 pub(super) mod tests {
     use super::*;
     use crate::bazel::module_file::tests::fixtures;
-    use crate::bazel::rc::{self, testing::Files};
-    use crate::bazel::ruleset_version::Source;
+    use crate::bazel::module_lock::ModuleLock;
+    use crate::bazel::rc::{self, testing::Files, EffectiveFlags};
+    use crate::bazel::ruleset_version::{self, Source};
     use crate::bazel::rulesets::RecognizeFn;
     use crate::bazel::version::{BazelLine, BazelVersion};
     use crate::bazel::workspace_file::WORKSPACE_FILES;

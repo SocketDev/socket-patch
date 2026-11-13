@@ -170,6 +170,16 @@ pub trait FileView {
     fn read(&self, rel: &str) -> FileText;
     /// Children of a directory (`""` = the root): bare names, directories
     /// ending in `/`. `None` when it cannot be listed, which is not empty.
+    ///
+    /// A link that leads into a tree Bazel owns (an output base, a cache,
+    /// a vendor directory: [`PathClass::Link`]) is listed as a bare name,
+    /// never as a directory: Bazel's convenience links under any
+    /// `--symlink_prefix`, `bazel-external`. No package of the workspace
+    /// lies behind one (Bazel's own package walk skips them), so a scan
+    /// that follows the listing stays out of the output tree without
+    /// knowing a link's name. Every other link to a directory is listed
+    /// as a directory. A view with no disk behind it must hold to the
+    /// same rule: it lists no entry below such a link.
     fn list(&self, dir: &str) -> Option<Vec<String>>;
 }
 
@@ -239,15 +249,27 @@ pub struct BazelWorkspace {
     pub ignore: IgnoreModel,
     pub hubs: Vec<Hub>,
     /// A ruleset is present and no hub could be resolved for it: its
-    /// ecosystem is undetermined workspace-wide.
+    /// ecosystem is undetermined workspace-wide, where Bazel may evaluate
+    /// the statement. Every signal that was found is here, also one of a
+    /// file Bazel never opens (a `WORKSPACE` left beside `MODULE.bazel`
+    /// on Bazel 9), which holds nothing up: `govern::governance` decides.
     pub signals: Vec<RulesetSignal>,
     pub out_of_scope: OutOfScope,
     pub completeness: Completeness,
     /// What a recognizer could not read exactly, with its ruleset: the
-    /// ecosystem of that ruleset is undetermined (design 2.9). The same
-    /// gaps are in `completeness`, which does not say whose they are.
+    /// ecosystem of that ruleset is undetermined (design 2.9), under the
+    /// same condition as for a signal. The same gaps are in
+    /// `completeness`, which does not say whose they are.
     pub ruleset_gaps: Vec<(Ruleset, Gap)>,
     pub vendor_dirs: CommittedVendorDirs,
+    /// The lock files that are reached through a link: the path as a
+    /// hub's label spells it ([`LockRef::path`]), and the directory that
+    /// holds the file once every link is resolved, relative to the root.
+    /// A crawler finds the project at its real directory, so governance
+    /// takes both directories for the lock's (`govern::governance`). Only
+    /// the disk reader fills this in (`crawlers::bazel_workspace`): a view
+    /// with no disk behind it shows no link.
+    pub lock_real_dirs: BTreeMap<String, String>,
 }
 
 /// The vendor directories committed at a root: evidence that some command

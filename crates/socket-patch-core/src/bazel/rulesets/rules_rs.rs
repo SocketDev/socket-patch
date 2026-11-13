@@ -468,9 +468,6 @@ mod tests {
                 // Neither is Starlark the build loads.
                 ("MODULE.bazel.lock", &serde),
                 ("notes/README.md", &serde),
-                // The execution root is not the source tree.
-                ("bazel-app/bazel-out/x", ""),
-                ("bazel-app/BUILD.bazel", &serde),
             ],
         );
         let [hub] = &found.hubs[..] else {

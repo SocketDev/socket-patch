@@ -21,7 +21,7 @@ use std::path::Path;
 
 use serde_json::json;
 use socket_patch_core::bazel::govern::{liveness, DeclRef, Standing};
-use socket_patch_core::bazel::model::{BazelWorkspace, DeclSystem, Liveness, RootRef};
+use socket_patch_core::bazel::model::{BazelWorkspace, DeclSystem, FileView, Liveness, RootRef};
 use socket_patch_core::crawlers::bazel_workspace::{read_workspace, DiskView};
 
 use crate::bazel_build_common::env::{System, Version};
@@ -76,14 +76,34 @@ fn fixture_system(version: &Version) -> System {
     }
 }
 
-/// The model of the cell's workspace copy as it is on disk.
-fn model(workspace: &Path) -> BazelWorkspace {
-    let root = RootRef {
+fn root_of(workspace: &Path) -> RootRef {
+    RootRef {
         root: std::fs::canonicalize(workspace).expect("resolve the workspace copy"),
         project_rel: String::new(),
         boundary_levels: 0,
-    };
+    }
+}
+
+/// The model of the cell's workspace copy as it is on disk.
+fn model(workspace: &Path) -> BazelWorkspace {
+    let root = root_of(workspace);
     read_workspace(&root, &DiskView::new(&root)).expect("the workspace copy is a Bazel root")
+}
+
+/// The `bazel-*` root entries of a built workspace that are links, as the
+/// view lists them. Bazel made each one as a convenience link into its
+/// output tree, so the view must list every one as a bare name and none
+/// as a directory (`FileView::list`): a scan that follows the listing
+/// then stays out of the output tree.
+fn convenience_links(workspace: &Path) -> Vec<String> {
+    let view = DiskView::new(&root_of(workspace));
+    let listed = view.list("").expect("the workspace root can be listed");
+    let is_link = |name: &&String| {
+        let entry = workspace.join(name.trim_end_matches('/'));
+        let link = |meta: std::fs::Metadata| meta.file_type().is_symlink();
+        name.starts_with("bazel-") && std::fs::symlink_metadata(entry).is_ok_and(link)
+    };
+    listed.iter().filter(is_link).cloned().collect()
 }
 
 /// The three declarations of the fixture: `toy` in `MODULE.bazel`, and
@@ -265,6 +285,21 @@ fn bazel_core_liveness_matches_bazel() {
         rows.len() >= 2,
         "{TEST}: a line has its default and one more flag set"
     );
+    // The default flag set built, so the convenience links stand in the
+    // root of the workspace the model was read from.
+    let links = convenience_links(&toy.cell.scratch.workspace);
+    assert!(
+        links.iter().any(|name| name == "bazel-bin"),
+        "{TEST}: Bazel {} left no `bazel-bin` link: {links:?}",
+        version.text
+    );
+    let as_directory: Vec<&String> = links.iter().filter(|name| name.ends_with('/')).collect();
+    assert!(
+        as_directory.is_empty(),
+        "{TEST}: Bazel {}: links listed as directories: {as_directory:?}",
+        version.text
+    );
     toy.cell.report.detail("flag_sets", rows);
+    toy.cell.report.detail("convenience_links", links);
     toy.finish();
 }
