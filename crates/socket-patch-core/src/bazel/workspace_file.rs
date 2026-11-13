@@ -47,11 +47,52 @@
 //! expression can reach a function only through a name written in it. One
 //! whose names are all literal constants of the file or functions that
 //! only compute (`str`, `Label`; a method of a string names nothing)
-//! declares no repository. Any other is opaque.
+//! declares no repository. Any other is opaque, with one exception: a
+//! computed argument whose other names are all loaded ones the caller
+//! vouches declare nothing ([`WsCall::runs`]). rules_rust documents
+//! `crates_repository(annotations = {...: [crate.annotation(...)]})`, and
+//! only a reader that knows `crate` can say the argument runs nothing.
+//!
+//! # What is followed, and where the reader gives up
+//!
+//! Probe `ws-shapes` built each of these on five runs (Bazel 5.4.1, 6.6.0,
+//! 7.7.2 with and without Bzlmod, 8.8.2; `ws-shapes.json`), on macOS
+//! only.
+//!
+//! - A name that several `load` statements bind to one symbol of one file
+//!   means that symbol: a `WORKSPACE` file may load a name again
+//!   (`bazel@7.7.2:WorkspaceFileFunction.java:154-167`). Loads of
+//!   different files, or of different symbols, leave the name unknown.
+//! - A name a macro file binds to `repository_rule(...)` is a rule: a call
+//!   declares the repository its `name` names and no other, at the top
+//!   level of the `WORKSPACE` file, in a macro of the rule's own file, and
+//!   through `maybe` ([`WsFile::rules`]).
+//! - `load("@<name>//...")` names a file of the main repository when
+//!   `workspace(name = "<name>")` ran in an earlier chunk and nothing up to
+//!   the end of that chunk can define a repository of the name. Bazel maps
+//!   the name to the main repository at the end of the chunk of the call
+//!   (`bazel@7.7.2:WorkspaceGlobals.java:57-73`,
+//!   `WorkspaceFileFunction.java:274-292`), so a `load` of the same chunk
+//!   fails; and on 5.4.1 a repository rule of that name in that chunk
+//!   takes the name, where 6.6.0 and later still load the main
+//!   repository's file (case s3c). Such a `load` is left as the label of
+//!   another repository, which is not read. With Bzlmod on, the name of
+//!   the workspace outranks a `bazel_dep` of the same name
+//!   (`RepositoryMapping.java:164-173` puts the `WORKSPACE` file's
+//!   mapping over the root module's; built on 6.6.0, 7.7.2 and 8.8.2).
+//! - One level of macros, as the design has it. A function of the main
+//!   repository that a macro body calls (a `def` of its own file, or one
+//!   it loads) is not read: its call is opaque, and the gap names that
+//!   statement of the macro file and the `WORKSPACE` call that runs it
+//!   ([`OrderGap::called_at`]). A function that a macro file loads from
+//!   another file of the main repository is not linked either, so a
+//!   repository rule is known in a body only when its own file binds it.
 //!
 //! An answer costs one pass over the statements of the file and a fixed
 //! number over the body of each macro it calls, however often the macro
-//! is called, for each name asked.
+//! is called, for each name asked. Reading costs what the files cost: the
+//! functions of a macro file are found by name, not by a walk of the file
+//! for each `load`, call or directive that names one.
 //!
 //! The model also keeps what the hybrid rule needs: the repository each
 //! `load` names. When Bzlmod is on as well and the root module can see
@@ -64,7 +105,7 @@ use super::label::{Label, Repo};
 use super::model::{DeclSystem, FileText, FileView, Gap, Site};
 use super::module_file::{constants, Constants, GapWhy};
 use super::starlark::{
-    self, ArgKind, BindingKind, Call, Dialect, File, Load, Lookup, OpaqueKind, Span, Stmt,
+    self, ArgKind, Binding, BindingKind, Call, Dialect, File, Load, Lookup, OpaqueKind, Span, Stmt,
     StmtKind, Value, ValueKind, MAX_FILES,
 };
 
@@ -108,6 +149,9 @@ const PURE: [&str; 21] = [
     "zip",
 ];
 
+/// The function of a `.bzl` file that makes a repository rule.
+const REPOSITORY_RULE: &str = "repository_rule";
+
 /// A `load` statement, with its label parsed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WsLoad {
@@ -127,6 +171,17 @@ pub struct WsFile {
     pub loads: Vec<WsLoad>,
     /// The names one top-level statement binds to a literal.
     pub constants: Constants,
+    /// The functions of the file whose bodies were read, each with its
+    /// index into [`WorkspaceModel::macros`].
+    pub macros: BTreeMap<String, usize>,
+    /// The repository rules of a macro file: each name that one top-level
+    /// `name = repository_rule(...)` statement binds, and nothing else in
+    /// the file does, with the span of that statement. A call of one
+    /// declares the repository its `name` names and no other: the rule's
+    /// implementation runs when the repository is fetched, not when the
+    /// `WORKSPACE` file is evaluated. Empty for the `WORKSPACE` file
+    /// itself, which is not read for them.
+    pub rules: BTreeMap<String, Span>,
 }
 
 impl WsFile {
@@ -151,9 +206,10 @@ pub enum Callee {
     Builtin,
     /// Bound by one `load` above the call: index into the
     /// [`WsFile::loads`] of the call's file, and the function's name in
-    /// the loaded file.
+    /// the loaded file. Several `load` statements that bind the name to
+    /// one symbol of one file are one binding, and `load` is the first.
     Loaded { load: usize, symbol: String },
-    /// Bound any other way, more than once, or below the call.
+    /// Bound any other way, by loads that differ, or below the call.
     Unknown,
 }
 
@@ -166,11 +222,25 @@ pub struct WsCall {
     /// to: the rule of `maybe(rule, name = ...)`.
     pub passes: Option<Callee>,
     /// An argument mentions a name through which it could run a function
-    /// that declares a repository.
+    /// that declares a repository: [`WsCall::runs`] is not empty.
     pub impure: bool,
+    /// Every such name, with what it is bound to: each name written in a
+    /// computed argument that is not a literal constant of the file or a
+    /// function that only computes. [`WorkspaceModel::governing_with`]
+    /// takes the argument for harmless when each is a loaded name its
+    /// caller answers [`Effect::Nothing`] for.
+    pub runs: BTreeMap<String, Callee>,
     /// For a top-level call of a main-repository function whose body was
     /// read: index into [`WorkspaceModel::macros`].
     pub macro_def: Option<usize>,
+    /// The call declares its repository with a repository rule of the
+    /// main repository ([`WsFile::rules`]): the callee is one, or it is
+    /// `maybe` of `@bazel_tools` and the rule it is handed is one. For a
+    /// top-level call the rule is loaded from a file that was read; for a
+    /// statement of a macro body it is a rule of the macro's own file.
+    /// Such a call was followed in full: it declares the repository its
+    /// `name` names and no other.
+    pub own_rule: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -246,7 +316,10 @@ pub struct WsGap {
 /// What a caller knows a loaded function declares.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Effect {
-    /// No repository.
+    /// No repository, however the function is reached: called as a
+    /// statement, or named in a computed argument of another call, where
+    /// it can be called, handed on, or be a struct whose members are
+    /// called (`crate.spec(...)` of rules_rust).
     Nothing,
     /// A repository rule: exactly the repository its `name` names.
     Rule,
@@ -377,6 +450,10 @@ pub struct WorkspaceModel {
     pub unreadable: Option<WsGap>,
     /// Macro files that could not be read: their functions are opaque.
     pub gaps: Vec<WsGap>,
+    /// For each `load` of the `WORKSPACE` file, the file of the model it
+    /// names: index into [`WorkspaceModel::files`]. `None` for a file of
+    /// another repository and for one that was not read.
+    linked: Vec<Option<usize>>,
 }
 
 /// A Starlark file while it is converted.
@@ -392,6 +469,9 @@ struct Scope<'f> {
 /// and the offset of its binding.
 type Callees = BTreeMap<String, (Callee, usize)>;
 
+/// [`WsCall::runs`] while it is collected.
+type Runs = BTreeMap<String, Callee>;
+
 impl<'f> Scope<'f> {
     fn new(file: &'f File<'f>, path: &str, package: Option<&str>) -> Self {
         let newlines = file.src.iter().enumerate().filter(|(_, b)| **b == b'\n');
@@ -405,6 +485,8 @@ impl<'f> Scope<'f> {
                 path: path.to_string(),
                 loads: Vec::new(),
                 constants: constants(file),
+                macros: BTreeMap::new(),
+                rules: Self::rules(file),
             },
         };
         for stmt in &file.stmts {
@@ -425,8 +507,55 @@ impl<'f> Scope<'f> {
         scope
     }
 
+    /// The names a macro file binds to `repository_rule(...)`: one
+    /// top-level `name = repository_rule(...)` statement is the only
+    /// binding of the name anywhere in the file, and nothing in the file
+    /// binds `repository_rule`, so it is the function Bazel predeclares.
+    fn rules(file: &File<'_>) -> BTreeMap<String, Span> {
+        if file.dialect != Dialect::Bzl || !file.uses(REPOSITORY_RULE).bindings.is_empty() {
+            return BTreeMap::new();
+        }
+        let rule = |stmt: &Stmt| match &stmt.kind {
+            StmtKind::Bind {
+                name,
+                name_span,
+                call,
+            } if call.callee == REPOSITORY_RULE => {
+                let once =
+                    matches!(file.uses(name).bindings[..], [only] if only.span == *name_span);
+                once.then(|| (name.clone(), stmt.span))
+            }
+            _ => None,
+        };
+        file.stmts.iter().filter_map(rule).collect()
+    }
+
     fn line(&self, offset: usize) -> usize {
         self.line_starts.partition_point(|start| *start <= offset)
+    }
+
+    /// The `load` that binds a name, and where: the one `load` statement
+    /// that does, or the first of several that bind it to one symbol of
+    /// one file. `None` when anything else binds the name as well.
+    fn loaded_once(&self, bindings: &[Binding]) -> Option<(Callee, usize)> {
+        let module = |load: usize| self.source.loads.get(load).map(|load| &load.load.module);
+        let mut first: Option<(usize, usize, &str)> = None;
+        for binding in bindings {
+            if binding.kind != BindingKind::Load || !binding.top_level {
+                return None;
+            }
+            let (load, symbol) = self.loaded.get(&binding.span.0)?;
+            match first {
+                Some((_, other, name)) if name != symbol || module(other) != module(*load) => {
+                    return None;
+                }
+                Some((at, ..)) if at <= binding.span.0 => {}
+                _ => first = Some((binding.span.0, *load, symbol.as_str())),
+            }
+        }
+        let (at, load, symbol) = first?;
+        let symbol = symbol.to_string();
+        Some((Callee::Loaded { load, symbol }, at))
     }
 
     /// What `name` is bound to for a use at `at`, in the body of `def` or
@@ -439,16 +568,9 @@ impl<'f> Scope<'f> {
             };
             let bound = match uses.bindings[..] {
                 [] => (Callee::Builtin, 0),
-                [only] if only.kind == BindingKind::Load && only.top_level => {
-                    match self.loaded.get(&only.span.0) {
-                        Some((load, symbol)) => {
-                            let (load, symbol) = (*load, symbol.clone());
-                            (Callee::Loaded { load, symbol }, only.span.0)
-                        }
-                        None => (Callee::Unknown, 0),
-                    }
-                }
-                _ => (Callee::Unknown, 0),
+                _ => self
+                    .loaded_once(&uses.bindings)
+                    .unwrap_or((Callee::Unknown, 0)),
             };
             seen.insert(name.to_string(), bound);
         }
@@ -460,28 +582,53 @@ impl<'f> Scope<'f> {
         }
     }
 
-    /// Whether evaluating `span` can run nothing that declares a
-    /// repository: every name in it is a literal constant of the file or
-    /// a function that only computes a value.
-    fn inert(&self, def: Option<&Stmt>, span: Span, seen: &mut Callees) -> bool {
-        self.file.names_in(span).into_iter().all(|name| {
-            let unbound = self.callee(def, name, span.0, seen) == Callee::Builtin;
-            self.source.constants.contains_key(name) || (unbound && PURE.contains(&name))
-        })
+    /// The names through which evaluating `span` could run a function
+    /// that declares a repository, each with what it is bound to: every
+    /// name in it that is not a literal constant of the file or a
+    /// function that only computes a value.
+    fn runs(&self, def: Option<&Stmt>, span: Span, seen: &mut Callees, out: &mut Runs) {
+        for name in self.file.names_in(span) {
+            let callee = self.callee(def, name, span.0, seen);
+            let computes = callee == Callee::Builtin && PURE.contains(&name);
+            if !computes && !self.source.constants.contains_key(name) && !out.contains_key(name) {
+                out.insert(name.to_string(), callee);
+            }
+        }
     }
 
-    /// [`Scope::inert`] for a value that was read. A literal, a bare name
+    /// Whether evaluating `span` can run nothing that declares a
+    /// repository: [`Scope::runs`] finds no name.
+    fn inert(&self, def: Option<&Stmt>, span: Span, seen: &mut Callees) -> bool {
+        let mut runs = Runs::new();
+        self.runs(def, span, seen, &mut runs);
+        runs.is_empty()
+    }
+
+    /// [`Scope::runs`] for a value that was read. A literal, a bare name
     /// and a list or dict of them run nothing, whatever the name is bound
     /// to: only the computed parts can call a function.
-    fn inert_value(&self, def: Option<&Stmt>, value: &Value, seen: &mut Callees) -> bool {
+    fn value_runs(&self, def: Option<&Stmt>, value: &Value, seen: &mut Callees, out: &mut Runs) {
         match &value.kind {
-            ValueKind::Dynamic => self.inert(def, value.span, seen),
-            ValueKind::List(items) => items.iter().all(|item| self.inert_value(def, item, seen)),
-            ValueKind::Dict(entries) => entries.iter().all(|(key, value)| {
-                self.inert_value(def, key, seen) && self.inert_value(def, value, seen)
-            }),
-            _ => true,
+            ValueKind::Dynamic => self.runs(def, value.span, seen, out),
+            ValueKind::List(items) => {
+                for item in items {
+                    self.value_runs(def, item, seen, out);
+                }
+            }
+            ValueKind::Dict(entries) => {
+                for (key, value) in entries {
+                    self.value_runs(def, key, seen, out);
+                    self.value_runs(def, value, seen, out);
+                }
+            }
+            _ => {}
         }
+    }
+
+    fn inert_value(&self, def: Option<&Stmt>, value: &Value, seen: &mut Callees) -> bool {
+        let mut runs = Runs::new();
+        self.value_runs(def, value, seen, &mut runs);
+        runs.is_empty()
     }
 
     fn call(&self, def: Option<&Stmt>, call: &Call, seen: &mut Callees) -> WsCall {
@@ -494,13 +641,18 @@ impl<'f> Scope<'f> {
             ValueKind::Ident(name) => Some(name.as_str()),
             _ => None,
         });
-        let mut args = call.args.iter();
+        let mut runs = Runs::new();
+        for arg in &call.args {
+            self.value_runs(def, &arg.value, seen, &mut runs);
+        }
         WsCall {
             call: call.clone(),
             callee: self.callee(def, &call.callee, at, seen),
             passes: passed.map(|name| self.callee(def, name, at, seen)),
-            impure: !args.all(|arg| self.inert_value(def, &arg.value, seen)),
+            impure: !runs.is_empty(),
+            runs,
             macro_def: None,
+            own_rule: false,
         }
     }
 
@@ -804,14 +956,63 @@ impl WorkspaceModel {
         Some(model)
     }
 
+    /// The chunk from whose end `@<name>//` is the main repository, for
+    /// the name of `workspace(name = ...)`: the chunk of that call, when
+    /// no statement up to its end can define a repository of the name.
+    /// Bazel maps the name at the end of the chunk; on 5.4.1 a repository
+    /// rule of the name in that chunk takes it all the same (`ws-shapes`
+    /// case s3c), and a statement that was not read may be one.
+    fn own_name_from(&self) -> Option<usize> {
+        let name = self.name.as_deref()?;
+        let named = |stmt: &&WsStmt| match &stmt.kind {
+            WsStmtKind::Call(c) => c.callee == Callee::Builtin && c.call.callee == "workspace",
+            _ => false,
+        };
+        let chunk = self.stmts.iter().find(named)?.chunk;
+        let mut events = Vec::new();
+        let upto = self.stmts.iter().take_while(|stmt| stmt.chunk <= chunk);
+        for (index, stmt) in upto.enumerate() {
+            self.event(name, &|_| None, 0, stmt, (index, None), &mut events);
+        }
+        events.is_empty().then_some(chunk)
+    }
+
     /// Reads each main-repository file a `load` or a `repository_macro`
     /// directive names, once, and the `def` of each function asked of it.
     fn read_macros(&mut self, view: &dyn FileView) {
+        // The main-repository file each `load` of the `WORKSPACE` file
+        // names: `//...`, and `@<name>//...` in a chunk after the one
+        // that gives the main repository that name.
+        let own = self.own_name_from();
+        let loads = self.files.first().map_or(&[][..], |file| &file.loads);
+        let mut chunks = vec![0; loads.len()];
+        for stmt in &self.stmts {
+            if let (WsStmtKind::Load(load), chunk) = (&stmt.kind, stmt.chunk) {
+                chunks
+                    .iter_mut()
+                    .skip(*load)
+                    .take(1)
+                    .for_each(|of| *of = chunk);
+            }
+        }
+        let main = |(load, chunk): (&WsLoad, &usize)| {
+            let label = load.label.as_ref()?;
+            match &label.repo {
+                Repo::Main => Some(label.file()),
+                Repo::Apparent(repo) => {
+                    let own =
+                        own.is_some_and(|from| from < *chunk) && self.name.as_ref() == Some(repo);
+                    own.then(|| label.file())
+                }
+                Repo::Canonical(_) => None,
+            }
+        };
+        let paths: Vec<Option<String>> = loads.iter().zip(&chunks).map(main).collect();
         let mut wanted: BTreeMap<String, Vec<String>> = BTreeMap::new();
-        for load in self.files.first().map_or(&[][..], |file| &file.loads) {
-            if let Some(path) = load.label.as_ref().and_then(Label::path) {
+        for (load, path) in loads.iter().zip(&paths) {
+            if let Some(path) = path {
                 let names = load.load.symbols.iter().map(|symbol| symbol.name.clone());
-                wanted.entry(path).or_default().extend(names);
+                wanted.entry(path.clone()).or_default().extend(names);
             }
         }
         for named in self.repository_macros() {
@@ -826,7 +1027,8 @@ impl WorkspaceModel {
         }
         // The cap is on the files asked for, the `WORKSPACE` file among
         // them: a file that is missing was still looked for.
-        for (asked, (path, defs)) in wanted.into_iter().enumerate() {
+        let mut read: BTreeMap<String, usize> = BTreeMap::new();
+        for (asked, (path, names)) in wanted.into_iter().enumerate() {
             let mut gap = |line: usize, why: GapWhy| {
                 let file = path.clone();
                 self.gaps.push(WsGap { file, line, why });
@@ -855,62 +1057,123 @@ impl WorkspaceModel {
                 }
             };
             let scope = Scope::new(&file, &path, None);
-            for name in defs {
-                // The function is the one `def` of its name: a name bound
-                // twice, or by anything else, is not read.
-                let def = file
-                    .stmts
-                    .iter()
-                    .find(|stmt| matches!(&stmt.kind, StmtKind::Def { name: n, .. } if *n == name));
-                let once = file.uses(&name).bindings.len() == 1;
-                let known = self.macro_index(self.files.len(), &name).is_some();
-                if let (Some(def), true, false) = (def, once, known) {
-                    let StmtKind::Def { body, .. } = &def.kind else {
-                        continue;
-                    };
-                    self.macros.push(Macro {
-                        file: self.files.len(),
-                        name,
-                        span: def.span,
-                        line: scope.line(def.span.0),
-                        body: scope.stmts(Some(def), body),
-                    });
+            // The first `def` of each name: one pass over the file,
+            // however many of its functions are asked for.
+            let mut defs: BTreeMap<&str, &Stmt> = BTreeMap::new();
+            for stmt in &file.stmts {
+                if let StmtKind::Def { name, .. } = &stmt.kind {
+                    defs.entry(name.as_str()).or_insert(stmt);
                 }
             }
-            self.files.push(scope.source);
+            let index = self.files.len();
+            let mut macros = BTreeMap::new();
+            for name in names {
+                // The function is the one `def` of its name: a name bound
+                // twice, or by anything else, is not read.
+                let Some(&def) = defs.get(name.as_str()) else {
+                    continue;
+                };
+                let StmtKind::Def { body, .. } = &def.kind else {
+                    continue;
+                };
+                if macros.contains_key(&name) || file.uses(&name).bindings.len() != 1 {
+                    continue;
+                }
+                macros.insert(name.clone(), self.macros.len());
+                self.macros.push(Macro {
+                    file: index,
+                    name,
+                    span: def.span,
+                    line: scope.line(def.span.0),
+                    body: scope.stmts(Some(def), body),
+                });
+            }
+            // A `load` of the `WORKSPACE` file under its own path names
+            // no macro file: the first file of the model stays the one.
+            if self.files.first().is_some_and(|root| root.path != path) {
+                read.insert(path, index);
+            }
+            self.files.push(WsFile {
+                macros,
+                ..scope.source
+            });
         }
-        // Link each top-level call of a loaded function to its body.
-        let links: Vec<Option<usize>> = self.stmts.iter().map(|stmt| self.body_of(stmt)).collect();
-        for (stmt, link) in self.stmts.iter_mut().zip(links) {
+        let linked = |path: &Option<String>| read.get(path.as_deref()?).copied();
+        self.linked = paths.iter().map(linked).collect();
+        // Link each top-level call of a loaded function to its body, and
+        // mark each call of a repository rule of the main repository.
+        let links: Vec<(Option<usize>, bool)> =
+            self.stmts.iter().map(|stmt| self.link(0, stmt)).collect();
+        for (stmt, (macro_def, own_rule)) in self.stmts.iter_mut().zip(links) {
             if let WsStmtKind::Call(call) = &mut stmt.kind {
-                call.macro_def = link;
+                (call.macro_def, call.own_rule) = (macro_def, own_rule);
+            }
+        }
+        for m in 0..self.macros.len() {
+            let made_by = &self.macros[m];
+            let own = |stmt: &WsStmt| self.link(made_by.file, stmt).1;
+            let rules: Vec<bool> = made_by.body.iter().map(own).collect();
+            for (stmt, own_rule) in self.macros[m].body.iter_mut().zip(rules) {
+                if let WsStmtKind::Call(call) = &mut stmt.kind {
+                    call.own_rule = own_rule;
+                }
             }
         }
     }
 
     fn macro_index(&self, file: usize, name: &str) -> Option<usize> {
-        let found = |m: &Macro| m.file == file && m.name == name;
-        self.macros.iter().position(found)
+        self.files.get(file)?.macros.get(name).copied()
     }
 
-    /// The macro a top-level statement calls, when its body was read.
-    fn body_of(&self, stmt: &WsStmt) -> Option<usize> {
+    /// For statement `stmt` of file `file`: the macro it calls, when it
+    /// is a top-level call of a function whose body was read, and
+    /// whether it declares its repository with a repository rule of the
+    /// main repository ([`WsCall::own_rule`]).
+    fn link(&self, file: usize, stmt: &WsStmt) -> (Option<usize>, bool) {
         let WsStmtKind::Call(call) = &stmt.kind else {
-            return None;
+            return (None, false);
         };
-        let Callee::Loaded { load, symbol } = &call.callee else {
-            return None;
+        let body = match &call.callee {
+            Callee::Loaded { load, symbol } if file == 0 => {
+                let read = self.linked.get(*load).copied().flatten();
+                read.and_then(|read| self.macro_index(read, symbol))
+            }
+            _ => None,
         };
-        let path = self
-            .files
-            .first()?
-            .loads
-            .get(*load)?
-            .label
-            .as_ref()?
-            .path()?;
-        let file = self.files.iter().position(|file| file.path == path)?;
-        self.macro_index(file, symbol).filter(|_| file > 0)
+        let name = &call.call.callee;
+        let passed = call
+            .call
+            .args
+            .first()
+            .and_then(|arg| match &arg.value.kind {
+                ValueKind::Ident(passed) => Some(passed.as_str()).zip(call.passes.as_ref()),
+                _ => None,
+            });
+        let wraps = || self.effect(file, name, &call.callee, &|_| None) == Some(Effect::Maybe);
+        let own = self.own_rule(file, name, &call.callee)
+            || passed.is_some_and(|(passed, to)| self.own_rule(file, passed, to) && wraps());
+        (body, own)
+    }
+
+    /// Whether `name`, bound to `callee` in file `file`, is a repository
+    /// rule of the main repository: in the `WORKSPACE` file a name loaded
+    /// from a file that was read and binds it to `repository_rule(...)`,
+    /// and in a macro file such a name of the file itself. A name of
+    /// [`WsFile::rules`] has no other binding anywhere in its file, so
+    /// every use of it in a function body is the rule.
+    fn own_rule(&self, file: usize, name: &str, callee: &Callee) -> bool {
+        let rules = |file: usize| self.files.get(file).map(|file| &file.rules);
+        match callee {
+            Callee::Loaded { load, symbol } if file == 0 => {
+                let read = self.linked.get(*load).copied().flatten();
+                read.and_then(rules)
+                    .is_some_and(|rules| rules.contains_key(symbol))
+            }
+            Callee::Unknown if file > 0 => {
+                rules(file).is_some_and(|rules| rules.contains_key(name))
+            }
+            _ => false,
+        }
     }
 
     /// The `# gazelle:repository_macro` directives, parsed as gazelle
@@ -1015,7 +1278,8 @@ impl WorkspaceModel {
                 continue;
             };
             // An argument that can run a function does so before the macro.
-            if call.impure {
+            let impure = self.runs_unread(0, call, knowledge);
+            if impure {
                 state.run(&[unread], index);
             }
             let body = bodies.entry(m).or_insert_with(|| {
@@ -1029,8 +1293,8 @@ impl WorkspaceModel {
             });
             let (defined, doubted) = (state.current.is_some(), state.uncertain.is_some());
             let held = usize::from(defined) | usize::from(doubted) << 1;
-            let step = body.steps[held | usize::from(call.impure) << 2]
-                .get_or_insert_with(|| Step::of(&body.events, defined, doubted, call.impure));
+            let step = body.steps[held | usize::from(impure) << 2]
+                .get_or_insert_with(|| Step::of(&body.events, defined, doubted, impure));
             state.take(*step, index);
         }
         match (state.uncertain, state.current) {
@@ -1065,7 +1329,8 @@ impl WorkspaceModel {
         }
     }
 
-    /// What a function declares: Bazel's own first, then the caller's.
+    /// What a function declares: a repository rule of the main
+    /// repository and Bazel's own first, then the caller's.
     fn effect(
         &self,
         file: usize,
@@ -1073,6 +1338,9 @@ impl WorkspaceModel {
         callee: &Callee,
         knowledge: Knowledge<'_>,
     ) -> Option<Effect> {
+        if self.own_rule(file, name, callee) {
+            return Some(Effect::Rule);
+        }
         match callee {
             Callee::Builtin => builtin_effect(name),
             Callee::Loaded { load, symbol } => {
@@ -1086,6 +1354,18 @@ impl WorkspaceModel {
             }
             Callee::Unknown => None,
         }
+    }
+
+    /// Whether an argument of `call`, a statement of file `file`, can run
+    /// a function that may declare a repository: it names something
+    /// other than loaded names `knowledge` answers [`Effect::Nothing`]
+    /// for.
+    fn runs_unread(&self, file: usize, call: &WsCall, knowledge: Knowledge<'_>) -> bool {
+        let harmless = |(name, callee): (&String, &Callee)| {
+            let loaded = matches!(callee, Callee::Loaded { .. });
+            loaded && self.effect(file, name, callee, knowledge) == Some(Effect::Nothing)
+        };
+        call.impure && (call.runs.is_empty() || !call.runs.iter().all(harmless))
     }
 
     /// The events of one statement for `name`: the statement `stmt` of
@@ -1111,7 +1391,7 @@ impl WorkspaceModel {
             WsStmtKind::Opaque => return out.push(unread),
             WsStmtKind::Call(call) => call,
         };
-        out.extend(call.impure.then_some(unread));
+        out.extend(self.runs_unread(file, call, knowledge).then_some(unread));
         let definition = |maybe: bool| Definition {
             stmt: index,
             inner,
@@ -1175,6 +1455,7 @@ impl WorkspaceModel {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
     use std::fmt::Write as _;
 
     use super::super::module_file::tests::{fixtures, golden, vectors, view, View};
@@ -2583,6 +2864,706 @@ mod tests {
         assert!(took.as_secs() < 60, "reading and 8 answers took {took:?}");
     }
 
+    /// The marker the repository of `definition` holds in the probes: the
+    /// tag of the archive an `http_archive` names
+    /// (`file:///WS/archives/dep-<tag>.tar.gz`), or the `tag` of the
+    /// probe's own repository rule.
+    fn marker(model: &WorkspaceModel, definition: &Definition) -> String {
+        let (_, _, call) = model.declaration(definition).expect("a call");
+        let text = match (call.call.arg("urls"), call.call.arg("tag")) {
+            (
+                Lookup::Found(Value {
+                    kind: ValueKind::List(urls),
+                    ..
+                }),
+                _,
+            ) => urls[0].as_str(),
+            (_, Lookup::Found(tag)) => tag.as_str(),
+            _ => None,
+        };
+        let text = text.expect("a literal");
+        let tag = text.rsplit_once("dep-").map_or(text, |(_, tag)| tag);
+        tag.trim_end_matches(".tar.gz").to_string()
+    }
+
+    /// Probe `ws-shapes` built 18 shapes beyond those of S6 on five Bazel
+    /// runs (5.4.1, 6.6.0, 7.7.2 with Bzlmod off and on, 8.8.2): a name
+    /// loaded twice, a repository rule of the main repository, a `load`
+    /// through the workspace's own name, and a macro that calls a macro.
+    /// Where `governing` names a definition, it is the one every run
+    /// built. The five it does not answer are the `load` Bazel rejects
+    /// (s3b), the one that reaches another repository on 5.4.1 and the
+    /// main one from 6.6.0 on (s3c), the one that reaches another
+    /// repository on every run (s3d), and the two macros behind a macro
+    /// (s3e, s3f).
+    #[test]
+    fn governing_gives_the_definition_bazel_built_for_the_ws_shapes_cases() {
+        let cells = vectors("ws-shapes.json");
+        assert_eq!(cells.len(), 18);
+        let (mut out, mut inexact) = (String::new(), Vec::new());
+        for (case, root, cell) in &cells {
+            let runs = cell["built"].as_object().expect("the runs");
+            assert_eq!(runs.len(), 5, "{case}");
+            let built: Vec<&str> = runs
+                .values()
+                .map(|run| run.as_str().unwrap_or("failed"))
+                .collect();
+            let model = WorkspaceModel::read(root, "WORKSPACE").expect("a WORKSPACE");
+            assert!(
+                model.unreadable.is_none() && model.gaps.is_empty(),
+                "{case}"
+            );
+            let verdict = verdict(&model, "dep", &|_| None);
+            match model.governing("dep") {
+                Governing::Exact(definition) => {
+                    let marker = marker(&model, &definition);
+                    assert_eq!(built, [marker.as_str(); 5], "{case}: {verdict}");
+                }
+                _ => inexact.push(case.as_str()),
+            }
+            let _ = writeln!(out, "{case}\tbuilt={}\t{verdict}", built.join(","));
+        }
+        assert_eq!(inexact, ["s3b", "s3c", "s3d", "s3e", "s3f"]);
+        let line = |case: &str| {
+            out.lines()
+                .find(|line| line.starts_with(case))
+                .unwrap()
+                .to_string()
+        };
+        // A rule of the main repository, also in a macro of its own file.
+        assert!(line("s2a").ends_with("built=rule,rule,rule,rule,rule\texact WORKSPACE:5 -"));
+        assert!(line("s2g").ends_with("exact WORKSPACE:6 maybe -"));
+        assert!(line("s2h").ends_with("exact inner_rule.bzl:11 macro -"));
+        // The workspace's own name, where it is the main repository's.
+        assert!(
+            line("s3a").ends_with("exact deps_plain.bzl:4 macro file:///WS/archives/dep-v1.tar.gz")
+        );
+        assert!(line("s3b")
+            .ends_with("built=failed,failed,failed,failed,failed\tunknown Opaque at line 5"));
+        assert!(line("s3c").ends_with("built=v2,v1,v1,v1,v1\tunknown Opaque at line 10"));
+        assert!(line("s3d").ends_with("built=v2,v2,v2,v2,v2\tunknown Opaque at line 8"));
+        // The second level of macros: the statement of the first.
+        assert!(line("s3e").ends_with("unknown Opaque at outer.bzl:4 called at line 5"));
+        golden("ws-shapes.golden", &out);
+
+        // Which files the model holds says which `load` was followed:
+        // never the file of the repository `elsewhere`, and the root's
+        // own `deps_plain.bzl` only where `@ws_shapes//` is the root.
+        let read = |case: &str| {
+            let (_, root, _) = cells.iter().find(|(name, ..)| name == case).expect(case);
+            let model = WorkspaceModel::read(root, "WORKSPACE").expect("a WORKSPACE");
+            let paths = model.files.iter().map(|file| file.path.clone());
+            paths.collect::<Vec<String>>().join(" ")
+        };
+        assert_eq!(read("s3a"), "WORKSPACE deps_plain.bzl");
+        for case in ["s3b", "s3c", "s3d"] {
+            assert_eq!(read(case), "WORKSPACE", "{case}");
+        }
+    }
+
+    /// Several `load` statements that bind a name to one symbol of one
+    /// file are one binding (cases s1a to s1d of `ws-shapes`): each call
+    /// is the rule, and the order rule holds across them. Loads that
+    /// differ in the file or in the symbol, and any other binding beside
+    /// them, leave the name unknown at every call.
+    #[test]
+    fn loads_of_one_symbol_of_one_file_are_one_binding() {
+        const FILE: &str = "load(\"@bazel_tools//tools/build_defs/repo:http.bzl\", http_archive = \"http_file\")\n";
+        let lit = archive("a");
+        let other = "http_archive(name = \"other\", urls = [\"o\"])\n";
+        for (text, want) in [
+            (format!("{HTTP}{lit}{HTTP}{other}"), "exact WORKSPACE:2 a"),
+            (format!("{HTTP}{other}{HTTP}{lit}"), "exact WORKSPACE:4 a"),
+            (format!("{HTTP}{HTTP}{HTTP}{lit}"), "exact WORKSPACE:4 a"),
+            // In a later chunk the second call cannot override the first.
+            (
+                format!("{HTTP}{lit}{HTTP}{}", archive("b")),
+                "exact WORKSPACE:2 a",
+            ),
+            (
+                format!("{HTTP}{HTTP}{lit}{}", archive("b")),
+                "exact WORKSPACE:4 b",
+            ),
+            // Another file, another symbol, another kind of binding.
+            (
+                format!("{HTTP}{lit}load(\"@other//:http.bzl\", \"http_archive\")\n{other}"),
+                "unknown Opaque at line 2",
+            ),
+            (
+                format!("{HTTP}{lit}{FILE}{other}"),
+                "unknown Opaque at line 2",
+            ),
+            (
+                format!("{HTTP}{HTTP}{lit}http_archive = None\n"),
+                "unknown Opaque at line 3",
+            ),
+            // Above its first `load` the name is not bound.
+            (
+                format!("{lit}{HTTP}{HTTP}{other}"),
+                "unknown Opaque at line 1",
+            ),
+        ] {
+            assert_eq!(dep(&text), want, "{text}");
+        }
+        // The binding is the first `load`, for a call below any of them.
+        let model = workspace(&format!("{MAYBE}{HTTP}{lit}{HTTP}{other}"));
+        let callees: Vec<&Callee> = model
+            .stmts
+            .iter()
+            .filter_map(|stmt| match &stmt.kind {
+                WsStmtKind::Call(call) => Some(&call.callee),
+                _ => None,
+            })
+            .collect();
+        let first = Callee::Loaded {
+            load: 1,
+            symbol: "http_archive".to_string(),
+        };
+        assert_eq!(callees, [&first, &first]);
+        // A macro file with two loads of one name is a file Bazel rejects
+        // (`'http_archive' redeclared at top level`, Resolver.java at
+        // 7.7.2): nothing is built from what the reader takes it for.
+        let ws = "load(\"//:deps.bzl\", \"deps\")\ndeps()\n";
+        let bzl = format!("{HTTP}{HTTP}def deps():\n    {lit}");
+        let model = read(&[("WORKSPACE", ws), ("deps.bzl", &bzl)]);
+        assert_eq!(
+            verdict(&model, "dep", &|_| None),
+            "exact deps.bzl:4 macro a"
+        );
+    }
+
+    /// A name a macro file binds to `repository_rule(...)` is a rule: its
+    /// call declares the repository its `name` names and no other, at
+    /// the top level, through `maybe`, and in a macro of the rule's own
+    /// file (cases s2a to s2h of `ws-shapes`).
+    #[test]
+    fn a_repository_rule_of_the_main_repository_declares_its_own_name() {
+        const REPO: &str = "def _impl(ctx):\n    pass\n\nown = repository_rule(\n    implementation = _impl,\n    \
+                            attrs = {\"urls\": attr.string_list()},\n)\n";
+        const LOAD: &str = "load(\"//:repo.bzl\", \"own\")\n";
+        let lit = archive("a");
+        let own = |name: &str| format!("own(name = \"{name}\", urls = [\"r\"])\n");
+        let files = |ws: &str, repo: &str| {
+            let noop = ("noop.bzl", "def noop():\n    pass\n");
+            let model = read(&[("WORKSPACE", ws), ("repo.bzl", repo), noop]);
+            assert!(model.gaps.is_empty(), "{ws}");
+            model
+        };
+        for (body, want) in [
+            (own("dep"), "exact WORKSPACE:4 r"),
+            (format!("{lit}{}", own("dep")), "exact WORKSPACE:5 r"),
+            (format!("{}{lit}", own("dep")), "exact WORKSPACE:5 a"),
+            (format!("{lit}{}", own("other")), "exact WORKSPACE:4 a"),
+            (format!("{}{NOOP}{lit}", own("dep")), "exact WORKSPACE:4 r"),
+            (
+                format!("{lit}maybe(own, name = \"dep\", urls = [\"r\"])\n"),
+                "exact WORKSPACE:4 a",
+            ),
+            (
+                "maybe(own, name = \"dep\", urls = [\"r\"])\n".to_string(),
+                "exact WORKSPACE:4 maybe r",
+            ),
+            // A computed name, and an argument that runs a rule.
+            (
+                format!("{lit}own(name = NAME)\n"),
+                "unknown Opaque at line 5",
+            ),
+            (
+                format!("{lit}own(name = \"x\", urls = own(name = \"dep\"))\n"),
+                "unknown Opaque at line 5",
+            ),
+        ] {
+            let model = files(&format!("{HTTP}{MAYBE}{LOAD}{body}"), REPO);
+            assert_eq!(verdict(&model, "dep", &|_| None), want, "{body}");
+        }
+        // The model says which calls it followed this way: the rule, and
+        // `maybe` of the rule, but no other function it is handed to.
+        let wrap = "load(\"@rules//:wrap.bzl\", \"wrap\")\n";
+        let body = format!(
+            "{}maybe(own, name = \"b\")\nmaybe(http_archive, name = \"c\")\nwrap(own, name = \"d\")\n{lit}",
+            own("a")
+        );
+        let model = files(&format!("{HTTP}{MAYBE}{LOAD}{wrap}{body}"), REPO);
+        let followed = |stmts: &[WsStmt]| -> Vec<bool> {
+            let own = |stmt: &WsStmt| match &stmt.kind {
+                WsStmtKind::Call(call) => Some(call.own_rule),
+                _ => None,
+            };
+            stmts.iter().filter_map(own).collect()
+        };
+        assert_eq!(followed(&model.stmts), [true, true, false, false, false]);
+        let rules: Vec<&String> = model.files[1].rules.keys().collect();
+        assert_eq!(rules, ["own"]);
+        assert!(model.files[0].rules.is_empty() && model.macros.is_empty());
+
+        // What does not make the name a rule: `repository_rule` bound in
+        // the file, a second binding of the name anywhere in it, another
+        // function, and a binding inside a function.
+        for repo in [
+            "repository_rule = rule\nown = repository_rule(implementation = None)\n",
+            "load(\"//:other.bzl\", \"repository_rule\")\nown = repository_rule(implementation = None)\n",
+            "own = repository_rule(implementation = None)\nown = repository_rule(implementation = None)\n",
+            "own = repository_rule(implementation = None)\n\ndef f(own):\n    pass\n",
+            "own = rule(implementation = None)\n",
+            "def f():\n    own = repository_rule(implementation = None)\n",
+        ] {
+            let model = files(&format!("{LOAD}{}", own("dep")), repo);
+            assert!(model.files[1].rules.is_empty(), "{repo}");
+            assert_eq!(
+                verdict(&model, "dep", &|_| None),
+                "unknown Opaque at line 2",
+                "{repo}"
+            );
+            assert_eq!(followed(&model.stmts), [false], "{repo}");
+        }
+
+        // In a macro, a rule of the macro's own file is the rule.
+        let called = "load(\"//:repo.bzl\", \"deps\")\ndeps()\n";
+        let bzl = format!(
+            "{MAYBE}{REPO}def deps():\n    own(name = \"dep\", urls = [\"m\"])\n    \
+             maybe(own, name = \"weak\", urls = [\"w\"])\n"
+        );
+        let model = files(called, &bzl);
+        assert_eq!(
+            verdict(&model, "dep", &|_| None),
+            "exact repo.bzl:10 macro m"
+        );
+        assert_eq!(
+            verdict(&model, "weak", &|_| None),
+            "exact repo.bzl:11 maybe macro w"
+        );
+        assert_eq!(followed(&model.macros[0].body), [true, true]);
+        // A parameter of the name is a second binding: no rule is known.
+        let shadowed = format!("{REPO}def deps(own = None):\n    own(name = \"dep\")\n");
+        assert_eq!(
+            verdict(&files(called, &shadowed), "dep", &|_| None),
+            "unknown Opaque at repo.bzl:9 called at line 2"
+        );
+        // A rule the macro file loads from another file of the main
+        // repository is not linked: only the `WORKSPACE` file's loads are.
+        let outer = "load(\"//:repo.bzl\", \"own\")\ndef deps():\n    own(name = \"dep\")\n";
+        let ws = "load(\"//:outer.bzl\", \"deps\")\ndeps()\n";
+        let model = read(&[("WORKSPACE", ws), ("outer.bzl", outer), ("repo.bzl", REPO)]);
+        assert_eq!(
+            verdict(&model, "dep", &|_| None),
+            "unknown Opaque at outer.bzl:3 called at line 2"
+        );
+        assert_eq!(followed(&model.macros[0].body), [false]);
+    }
+
+    /// `load("@<name>//...")` names a file of the main repository once
+    /// `workspace(name = "<name>")` ran in an earlier chunk and nothing
+    /// up to the end of that chunk can define a repository of the name
+    /// (cases s3a to s3d of `ws-shapes`: a `load` in the chunk of the
+    /// call fails, and on 5.4.1 a rule of the name in that chunk takes
+    /// it). Any other `@<name>//` is another repository's file, which is
+    /// not read, whatever the root holds under the same path.
+    #[test]
+    fn a_load_through_the_workspaces_own_name_is_followed_after_its_chunk() {
+        const OWN: &str = "load(\"@w//:deps.bzl\", \"deps\")\ndeps()\n";
+        const NAMED: &str = "workspace(name = \"w\")\n";
+        let bzl = format!("{HTTP}def deps():\n    {}", archive("m"));
+        let found = |ws: &str| {
+            let model = read(&[("WORKSPACE", ws), ("deps.bzl", &bzl)]);
+            assert!(model.gaps.is_empty(), "{ws}");
+            (model.files.len(), verdict(&model, "dep", &|_| None))
+        };
+        let followed = (2, "exact deps.bzl:3 macro m".to_string());
+        let not = |line: usize| (1, format!("unknown Opaque at line {line}"));
+        assert_eq!(found(&format!("{NAMED}{OWN}")), followed);
+        // What stands in the chunk of the call and defines another name.
+        let beside = "local_repository(name = \"x\", path = \"x\")\nX = 1\nbind(name = \"y\", actual = \"//y\")\n";
+        assert_eq!(found(&format!("{NAMED}{beside}{OWN}")), followed);
+        // No `workspace(name)`, another name, one that is computed, and
+        // a canonical label.
+        assert_eq!(found(OWN), not(2));
+        assert_eq!(found(&format!("workspace(name = \"v\")\n{OWN}")), not(3));
+        assert_eq!(
+            found(&format!("workspace(name = \"w\".lower())\n{OWN}")),
+            not(3)
+        );
+        let canonical = OWN.replace("@w//", "@@w//");
+        assert_eq!(found(&format!("{NAMED}{canonical}")), not(3));
+        // The `load` in the chunk of the call: the name is not mapped yet.
+        assert_eq!(
+            found(&format!(
+                "load(\"@w//:deps.bzl\", \"deps\")\n{NAMED}deps()\n"
+            )),
+            not(3)
+        );
+        // Something in that chunk may define a repository of the name: a
+        // rule, a `bind`, and a statement that was not read.
+        for (taken, line) in [
+            ("local_repository(name = \"w\", path = \"x\")\n", 4),
+            ("bind(name = \"w\", actual = \"//x\")\n", 4),
+            ("setup()\n", 2),
+            ("if True:\n    pass\n", 2),
+        ] {
+            assert_eq!(found(&format!("{NAMED}{taken}{OWN}")), not(line), "{taken}");
+        }
+    }
+
+    /// One level of macros: a function of the main repository that a
+    /// macro body calls is not read, whether the macro's file defines it
+    /// or loads it (cases s3e and s3f of `ws-shapes`). The gap names the
+    /// statement where the reader stops and the call that runs it.
+    #[test]
+    fn a_macro_that_a_macro_calls_is_where_the_reader_stops() {
+        const WS: &str = "load(\"//:outer.bzl\", \"outer\")\nouter()\n";
+        let inner = format!("{HTTP}def inner():\n    {}", archive("m"));
+        let loaded = "load(\"//:inner.bzl\", \"inner\")\ndef outer():\n    inner()\n";
+        let model = read(&[
+            ("WORKSPACE", WS),
+            ("outer.bzl", loaded),
+            ("inner.bzl", &inner),
+        ]);
+        assert!(model.gaps.is_empty());
+        // The file of the second level is not asked for.
+        let paths: Vec<&str> = model.files.iter().map(|file| file.path.as_str()).collect();
+        assert_eq!(paths, ["WORKSPACE", "outer.bzl"]);
+        let Governing::Unknown(gap) = model.governing("dep") else {
+            panic!("unknown")
+        };
+        assert_eq!(
+            gap.to_gap("dep").detail,
+            "which definition of `dep` Bazel builds is not proven: the statement at outer.bzl:3, in \
+             the macro called at WORKSPACE:2, is not read and may define or replace `dep`"
+        );
+        let same = format!(
+            "{HTTP}def _inner():\n    {}\ndef outer():\n    _inner()\n",
+            archive("m")
+        );
+        let model = read(&[("WORKSPACE", WS), ("outer.bzl", &same)]);
+        assert_eq!(
+            verdict(&model, "dep", &|_| None),
+            "unknown Opaque at outer.bzl:6 called at line 2"
+        );
+        // Called from the `WORKSPACE` file itself, the same function is
+        // read.
+        let direct = "load(\"//:inner.bzl\", \"inner\")\ninner()\n";
+        let model = read(&[("WORKSPACE", direct), ("inner.bzl", &inner)]);
+        assert_eq!(
+            verdict(&model, "dep", &|_| None),
+            "exact inner.bzl:3 macro m"
+        );
+    }
+
+    /// What a caller knows of loaded names counts inside a computed
+    /// argument: the argument runs nothing that declares a repository
+    /// when every name in it is one the caller answers `Nothing` for,
+    /// beside the constants and the functions that only compute.
+    #[test]
+    fn a_computed_argument_is_harmless_when_the_caller_vouches_for_its_names() {
+        const EXT: &str =
+            "load(\"@rules//:defs.bzl\", \"helper\", \"STRUCT\", \"deps\", \"rule\")\n";
+        let knows = |origin: &Origin<'_>| match origin.symbol {
+            "helper" | "STRUCT" => Some(Effect::Nothing),
+            "rule" => Some(Effect::Rule),
+            _ => None,
+        };
+        let lit = archive("a");
+        let (exact, unknown) = ("exact WORKSPACE:3 a", "unknown Opaque at line 4");
+        for (argument, known) in [
+            ("helper()", exact),
+            ("[STRUCT.url(1), helper(STRUCT, key = len)]", exact),
+            ("{\"k\": helper(VERSION)}", exact),
+            // A name nobody vouches for, a rule, Bazel's own rule, and a
+            // name that no `load` binds.
+            ("helper(deps())", unknown),
+            ("helper(rule(name = \"dep\"))", unknown),
+            ("helper(http_archive(name = \"dep\"))", unknown),
+            ("helper(glob([\"*\"]))", unknown),
+            ("helper(lambda: deps())", unknown),
+        ] {
+            let text = format!(
+                "{HTTP}{EXT}{lit}http_archive(name = \"x\", urls = {argument})\nVERSION = \"1\"\n"
+            );
+            let model = workspace(&text);
+            assert_eq!(verdict(&model, "dep", &knows), known, "{argument}");
+            // Without the caller's knowledge the argument is not read.
+            assert_eq!(verdict(&model, "dep", &|_| None), unknown, "{argument}");
+        }
+        // The model keeps the names, each with what it is bound to.
+        let model = workspace(&format!(
+            "{HTTP}{EXT}VERSION = \"1\"\nhttp_archive(name = \"x\", urls = [STRUCT.url(VERSION), str(helper(glob))])\n"
+        ));
+        let Some(WsStmtKind::Call(call)) = model.stmts.last().map(|stmt| &stmt.kind) else {
+            panic!("a call")
+        };
+        let loaded = |symbol: &str| {
+            let (load, symbol) = (1, symbol.to_string());
+            Callee::Loaded { load, symbol }
+        };
+        let runs: Vec<(&str, &Callee)> = call
+            .runs
+            .iter()
+            .map(|(name, callee)| (name.as_str(), callee))
+            .collect();
+        assert_eq!(
+            runs,
+            [
+                ("STRUCT", &loaded("STRUCT")),
+                ("glob", &Callee::Builtin),
+                ("helper", &loaded("helper"))
+            ]
+        );
+        assert!(call.impure);
+
+        // The argument of a macro's own call, and of a rule in its body.
+        let ws = format!("{HTTP}{EXT}load(\"//:deps.bzl\", \"own\")\nown(x = helper())\n");
+        let bzl = format!(
+            "{HTTP}{EXT}def own(x = None):\n    http_archive(name = \"dep\", urls = [\"m\"], sha256 = STRUCT.sha(\"m\"))\n"
+        );
+        let model = read(&[("WORKSPACE", &ws), ("deps.bzl", &bzl)]);
+        assert_eq!(verdict(&model, "dep", &knows), "exact deps.bzl:4 macro m");
+        // Vouched for in the call and not in the body, the gap is the
+        // statement of the body; in neither, it is the same statement,
+        // the last that was not read.
+        let call_only = |origin: &Origin<'_>| knows(origin).filter(|_| origin.symbol == "helper");
+        for knowledge in [&call_only as Knowledge<'_>, &|_| None] {
+            assert_eq!(
+                verdict(&model, "dep", knowledge),
+                "unknown Opaque at deps.bzl:4 called at line 4"
+            );
+        }
+        let body_only = |origin: &Origin<'_>| knows(origin).filter(|_| origin.symbol == "STRUCT");
+        assert_eq!(
+            verdict(&model, "dep", &body_only),
+            "unknown Opaque at line 4"
+        );
+        let ws = ws.replace("x = helper()", "");
+        let model = read(&[("WORKSPACE", &ws), ("deps.bzl", &bzl)]);
+        assert_eq!(
+            verdict(&model, "dep", &|_| None),
+            "unknown Opaque at deps.bzl:4 called at line 4"
+        );
+    }
+
+    /// What a recognizer that knows rules_rust can say of its functions,
+    /// for a question about the repository `name`: the rule, the setup
+    /// macros, with `helpers` the functions the rule's arguments are
+    /// written with (`crate.spec(...)`, `render_config(...)`), and with
+    /// `generated` the `crate_repositories` macro of a hub's generated
+    /// `defs.bzl`, taken to declare `<hub>__<crate>-<version>` and
+    /// nothing else. Whether each holds is that recognizer's to prove.
+    fn rules_rust<'a>(
+        name: &'a str,
+        helpers: bool,
+        generated: bool,
+    ) -> impl Fn(&Origin<'_>) -> Option<Effect> + 'a {
+        move |origin| {
+            let label = origin.label?;
+            let Repo::Apparent(repo) = &label.repo else {
+                return None;
+            };
+            let nothing = |known: bool| known.then_some(Effect::Nothing);
+            match (repo.as_str(), label.file().as_str(), origin.symbol) {
+                ("rules_rust", "crate_universe/defs.bzl", "crates_repository") => {
+                    Some(Effect::Rule)
+                }
+                (
+                    "rules_rust",
+                    "crate_universe/defs.bzl",
+                    "crate" | "render_config" | "splicing_config",
+                ) => nothing(helpers),
+                (
+                    "rules_rust",
+                    "rust/repositories.bzl",
+                    "rules_rust_dependencies" | "rust_register_toolchains",
+                )
+                | (
+                    "rules_rust",
+                    "crate_universe/repositories.bzl",
+                    "crate_universe_dependencies",
+                ) => nothing(true),
+                (hub, "defs.bzl", "crate_repositories") => {
+                    nothing(generated && !name.starts_with(&format!("{hub}__")))
+                }
+                _ => None,
+            }
+        }
+    }
+
+    /// rules_rust's own crate_universe example (0.49.3) declares 19 hubs,
+    /// each `crates_repository(...)` with `crate.annotation(...)`,
+    /// `crate.spec(...)`, `render_config(...)` or `splicing_config(...)`
+    /// in its arguments, and after each the `crate_repositories()` of the
+    /// hub's generated `defs.bzl`. Knowing the rule and the setup macros
+    /// alone, only the first hub is exact: every later one follows a
+    /// `crates_repository` call whose arguments run functions. Knowing
+    /// those functions and the generated macro as well, each of the 14
+    /// hubs above the example's own macro is exact. The five below it
+    /// cannot be: `third_party_deps(prefix = ...)` declares a repository
+    /// under a name it computes from its parameter (`"{}__curl"
+    /// .format(prefix)`), which may be any name, and the hubs stand in
+    /// later chunks.
+    #[test]
+    fn the_rules_rust_example_is_exact_up_to_the_macro_with_a_computed_name() {
+        let models = fixtures().join("models");
+        let file = |name: &str| FileText::Bytes(std::fs::read(models.join(name)).expect(name));
+        let mut files = View::default();
+        files.0.insert(
+            "WORKSPACE.bazel".to_string(),
+            file("rules_rust-0.49.3-crate_universe.WORKSPACE"),
+        );
+        files.0.insert(
+            "multi_package/3rdparty/third_party_deps.bzl".to_string(),
+            file("rules_rust-0.49.3-crate_universe-third_party_deps.bzl"),
+        );
+        let model = WorkspaceModel::read(&files, "WORKSPACE.bazel").unwrap();
+        assert_eq!(model.name.as_deref(), Some("examples"));
+        // The three files `crates_vendor` generated are loaded below the
+        // last hub this test calls exact, and are not copied here.
+        let missing = model.gaps.iter().filter(|gap| gap.why == GapWhy::Missing);
+        let missing: Vec<&str> = missing.map(|gap| gap.file.as_str()).collect();
+        assert_eq!(
+            (model.unreadable.as_ref(), missing.len(), missing),
+            (
+                None,
+                model.gaps.len(),
+                vec![
+                    "vendor_external/crates/crates.bzl",
+                    "vendor_remote_manifests/crates/crates.bzl",
+                    "vendor_remote_pkgs/crates/crates.bzl"
+                ]
+            )
+        );
+        let hub = |stmt: &WsStmt| match &stmt.kind {
+            WsStmtKind::Call(call) if call.call.callee == "crates_repository" => {
+                let Lookup::Found(name) = call.call.arg("name") else {
+                    panic!("a name")
+                };
+                let name = model.files[0].resolve(name).as_str().expect("a literal");
+                Some((name.to_string(), stmt.line))
+            }
+            _ => None,
+        };
+        let hubs: Vec<(String, usize)> = model.stmts.iter().filter_map(hub).collect();
+        assert_eq!(hubs.len(), 19);
+        assert_eq!(
+            (hubs[0].1, hubs[1].1, hubs[13].0.as_str(), hubs[13].1),
+            (26, 55, "m_pkgs", 386)
+        );
+        let own_macro =
+            "unknown Opaque at multi_package/3rdparty/third_party_deps.bzl:9 called at line 423";
+        for (at, (name, line)) in hubs.iter().enumerate() {
+            let exact = format!("exact WORKSPACE.bazel:{line} -");
+            // Bazel's own functions alone: the setup macros, of which
+            // the gap names the last of their chunk.
+            assert_eq!(
+                verdict(&model, name, &|_| None),
+                "unknown Opaque at line 12",
+                "{name}"
+            );
+            // The rule and the setup macros: the first hub's arguments.
+            let found = verdict(&model, name, &rules_rust(name, false, false));
+            match at {
+                0 => assert_eq!(found, exact, "{name}"),
+                _ => assert_eq!(found, "unknown Opaque at line 26", "{name}"),
+            }
+            // And the functions of the arguments: the first generated
+            // macro, which the second hub follows in its own chunk.
+            let found = verdict(&model, name, &rules_rust(name, true, false));
+            match at {
+                0 | 1 => assert_eq!(found, exact, "{name}"),
+                _ => assert_eq!(found, "unknown Opaque at line 53", "{name}"),
+            }
+            let found = verdict(&model, name, &rules_rust(name, true, true));
+            match *line < 421 {
+                true => assert_eq!(found, exact, "{name}"),
+                false => assert_eq!(found, own_macro, "{name}"),
+            }
+        }
+        assert_eq!(hubs.iter().filter(|(_, line)| *line < 421).count(), 14);
+    }
+
+    /// The vectors of `models/` are the bytes that were committed:
+    /// `SHA256SUMS` lists every file there but itself and the goldens,
+    /// which are what the readers produce.
+    #[test]
+    fn the_model_vectors_are_the_bytes_that_were_committed() {
+        let dir = fixtures().join("models");
+        let sums = std::fs::read_to_string(dir.join("SHA256SUMS")).expect("SHA256SUMS");
+        let mut listed = BTreeSet::new();
+        for line in sums.lines() {
+            let (digest, name) = line.split_once("  ").expect("`<sha256>  <file>`");
+            let bytes = std::fs::read(dir.join(name)).unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_eq!(
+                crate::utils::digest::sha256_hex_of(&bytes),
+                digest,
+                "{name}"
+            );
+            listed.insert(name.to_string());
+        }
+        let mut on_disk = BTreeSet::new();
+        for entry in std::fs::read_dir(&dir).expect("the fixture directory") {
+            let name = entry.expect("an entry").file_name();
+            let name = name.to_string_lossy().into_owned();
+            if name != "SHA256SUMS" && !name.ends_with(".golden") {
+                on_disk.insert(name);
+            }
+        }
+        assert_eq!(listed, on_disk);
+    }
+
+    /// Nor does it depend on how many functions a macro file holds. One
+    /// file of as many `def`s as the cap takes, each loaded by name and
+    /// called once from a `WORKSPACE` at the cap, and each named by a
+    /// `repository_macro` directive of another, is read, linked and
+    /// answered in seconds: a walk of the file for each loaded name, and
+    /// of the functions read so far for each call and each directive,
+    /// took this test 72 s in a debug build before the functions were
+    /// found by name.
+    #[test]
+    fn a_macro_file_of_many_functions_is_linked_in_time() {
+        let cap = starlark::MAX_FILE_BYTES;
+        let (mut bzl, mut defs) = (String::new(), 0);
+        while bzl.len() + 32 < cap {
+            let _ = write!(bzl, "def f{defs}():\n    pass\n");
+            defs += 1;
+        }
+        let (mut names, mut calls, mut loaded) = (String::new(), String::new(), 0);
+        while names.len() + calls.len() + 64 < cap && loaded < defs {
+            let _ = write!(names, ", \"f{loaded}\"");
+            let _ = writeln!(calls, "f{loaded}()");
+            loaded += 1;
+        }
+        assert!(loaded > 10_000, "{loaded} of {defs}");
+        let started = std::time::Instant::now();
+
+        let ws = format!("load(\"//:deps.bzl\"{names})\n{calls}");
+        let model = read(&[("WORKSPACE", &ws), ("deps.bzl", &bzl)]);
+        assert!(model.unreadable.is_none() && model.gaps.is_empty());
+        assert_eq!(
+            (model.stmts.len(), model.macros.len()),
+            (loaded + 1, loaded)
+        );
+        let linked = |stmt: &WsStmt| match &stmt.kind {
+            WsStmtKind::Call(call) => call.macro_def.is_some(),
+            _ => false,
+        };
+        assert!(model.stmts[1..].iter().all(linked));
+        assert_eq!(verdict(&model, "dep", &|_| None), "undefined");
+
+        // The same functions, named by directives and never loaded.
+        let mut ws = String::new();
+        let mut named = 0;
+        while ws.len() + 64 < cap && named < defs {
+            let _ = writeln!(ws, "# gazelle:repository_macro deps.bzl%f{named}");
+            named += 1;
+        }
+        assert!(named > 10_000, "{named} of {defs}");
+        let model = read(&[("WORKSPACE", &ws), ("deps.bzl", &bzl)]);
+        assert!(model.unreadable.is_none() && model.gaps.is_empty());
+        assert_eq!(model.macros.len(), named);
+        let macros = model.repository_macros();
+        assert_eq!(macros.len(), named);
+        let read = |(n, named): (usize, &RepositoryMacro<'_>)| named.macro_def == Some(n);
+        assert!(macros.iter().enumerate().all(read));
+        let took = started.elapsed();
+        assert!(took.as_secs() < 60, "reading and linking took {took:?}");
+    }
+
     /// No input makes the reader panic, and no answer names a statement
     /// the model does not hold: the S6 files, truncated and with bytes
     /// replaced, inserted and removed.
@@ -2591,7 +3572,10 @@ mod tests {
         const BYTES: &[u8] = b"\"'\\#()[]{},=:;.*+-\n\r\t \0\x80\xef\xbb\xbfdefloadmaybe_%";
         let mut rng = Rng::new(0x56);
         let mut cases = 0;
-        for (_, root, _) in &vectors("ws-order.json") {
+        let cells = vectors("ws-order.json")
+            .into_iter()
+            .chain(vectors("ws-shapes.json"));
+        for (_, root, _) in cells {
             for _ in 0..120 {
                 let mut mutated = View::default();
                 for (path, text) in &root.0 {
@@ -2627,6 +3611,6 @@ mod tests {
                 cases += 1;
             }
         }
-        assert!(cases > 2_000, "only {cases} cases ran");
+        assert!(cases > 4_000, "only {cases} cases ran");
     }
 }

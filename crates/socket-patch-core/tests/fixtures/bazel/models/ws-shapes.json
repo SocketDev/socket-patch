@@ -1,0 +1,380 @@
+{
+ "s1a": {
+  "built": {
+   "5.4.1": "v1",
+   "6.6.0": "v1",
+   "7.7.2 --enable_workspace": "v1",
+   "7.7.2 --enable_workspace --noenable_bzlmod": "v1",
+   "8.8.2 --enable_workspace --noenable_bzlmod": "v1"
+  },
+  "description": "http_archive loaded twice: literal(v1) after the first load, another repository after the second",
+  "files": {
+   "WORKSPACE": "workspace(name = \"ws_shapes\")\n\nload(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")\n\nhttp_archive(\n    name = \"dep\",\n    urls = [\"file:///WS/archives/dep-v1.tar.gz\"],\n    sha256 = \"b73874449991e5ec4475818559550eb63e0be30a992a5ac72e3194ee85b22910\",\n    strip_prefix = \"dep-v1\",\n)\n\nload(\"//:noop.bzl\", \"noop\")\n\nnoop()\n\nload(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")\n\nhttp_archive(\n    name = \"other\",\n    urls = [\"file:///WS/archives/dep-v2.tar.gz\"],\n    sha256 = \"9dc01da0d21ba44475441de3c06a5ed7415bd1b2f8570d3e9419e272912bf7ae\",\n    strip_prefix = \"dep-v2\",\n)\n",
+   "deps_plain.bzl": "load(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")\n\ndef dep_deps():\n    http_archive(\n        name = \"dep\",\n        urls = [\"file:///WS/archives/dep-v1.tar.gz\"],\n        sha256 = \"b73874449991e5ec4475818559550eb63e0be30a992a5ac72e3194ee85b22910\",\n        strip_prefix = \"dep-v1\",\n    )\n",
+   "elsewhere/BUILD.bazel": "",
+   "elsewhere/WORKSPACE": "",
+   "elsewhere/deps_plain.bzl": "load(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")\n\ndef dep_deps():\n    http_archive(\n        name = \"dep\",\n        urls = [\"file:///WS/archives/dep-v2.tar.gz\"],\n        sha256 = \"9dc01da0d21ba44475441de3c06a5ed7415bd1b2f8570d3e9419e272912bf7ae\",\n        strip_prefix = \"dep-v2\",\n    )\n",
+   "inner_rule.bzl": "def _impl(ctx):\n    ctx.file(\"marker.txt\", ctx.attr.tag + \"\\n\")\n    ctx.file(\"BUILD.bazel\", 'exports_files([\"marker.txt\"])\\n')\n\n_marker_repo = repository_rule(\n    implementation = _impl,\n    attrs = {\"tag\": attr.string()},\n)\n\ndef own_deps():\n    _marker_repo(name = \"dep\", tag = \"inner\")\n",
+   "noop.bzl": "def noop():\n    pass\n",
+   "outer.bzl": "load(\"//:deps_plain.bzl\", \"dep_deps\")\n\ndef outer():\n    dep_deps()\n",
+   "repo.bzl": "def _impl(ctx):\n    ctx.file(\"marker.txt\", ctx.attr.tag + \"\\n\")\n    ctx.file(\"BUILD.bazel\", 'exports_files([\"marker.txt\"])\\n')\n\nmarker_repo = repository_rule(\n    implementation = _impl,\n    attrs = {\"tag\": attr.string()},\n)\n"
+  }
+ },
+ "s1b": {
+  "built": {
+   "5.4.1": "v2",
+   "6.6.0": "v2",
+   "7.7.2 --enable_workspace": "v2",
+   "7.7.2 --enable_workspace --noenable_bzlmod": "v2",
+   "8.8.2 --enable_workspace --noenable_bzlmod": "v2"
+  },
+  "description": "http_archive loaded twice: the only literal(v2) after the second load",
+  "files": {
+   "WORKSPACE": "workspace(name = \"ws_shapes\")\n\nload(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")\nload(\"//:noop.bzl\", \"noop\")\n\nnoop()\n\nload(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")\n\nhttp_archive(\n    name = \"dep\",\n    urls = [\"file:///WS/archives/dep-v2.tar.gz\"],\n    sha256 = \"9dc01da0d21ba44475441de3c06a5ed7415bd1b2f8570d3e9419e272912bf7ae\",\n    strip_prefix = \"dep-v2\",\n)\n",
+   "deps_plain.bzl": "load(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")\n\ndef dep_deps():\n    http_archive(\n        name = \"dep\",\n        urls = [\"file:///WS/archives/dep-v1.tar.gz\"],\n        sha256 = \"b73874449991e5ec4475818559550eb63e0be30a992a5ac72e3194ee85b22910\",\n        strip_prefix = \"dep-v1\",\n    )\n",
+   "elsewhere/BUILD.bazel": "",
+   "elsewhere/WORKSPACE": "",
+   "elsewhere/deps_plain.bzl": "load(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")\n\ndef dep_deps():\n    http_archive(\n        name = \"dep\",\n        urls = [\"file:///WS/archives/dep-v2.tar.gz\"],\n        sha256 = \"9dc01da0d21ba44475441de3c06a5ed7415bd1b2f8570d3e9419e272912bf7ae\",\n        strip_prefix = \"dep-v2\",\n    )\n",
+   "inner_rule.bzl": "def _impl(ctx):\n    ctx.file(\"marker.txt\", ctx.attr.tag + \"\\n\")\n    ctx.file(\"BUILD.bazel\", 'exports_files([\"marker.txt\"])\\n')\n\n_marker_repo = repository_rule(\n    implementation = _impl,\n    attrs = {\"tag\": attr.string()},\n)\n\ndef own_deps():\n    _marker_repo(name = \"dep\", tag = \"inner\")\n",
+   "noop.bzl": "def noop():\n    pass\n",
+   "outer.bzl": "load(\"//:deps_plain.bzl\", \"dep_deps\")\n\ndef outer():\n    dep_deps()\n",
+   "repo.bzl": "def _impl(ctx):\n    ctx.file(\"marker.txt\", ctx.attr.tag + \"\\n\")\n    ctx.file(\"BUILD.bazel\", 'exports_files([\"marker.txt\"])\\n')\n\nmarker_repo = repository_rule(\n    implementation = _impl,\n    attrs = {\"tag\": attr.string()},\n)\n"
+  }
+ },
+ "s1c": {
+  "built": {
+   "5.4.1": "v1",
+   "6.6.0": "v1",
+   "7.7.2 --enable_workspace": "v1",
+   "7.7.2 --enable_workspace --noenable_bzlmod": "v1",
+   "8.8.2 --enable_workspace --noenable_bzlmod": "v1"
+  },
+  "description": "http_archive loaded twice: literal(v1); the second load; literal(v2)",
+  "files": {
+   "WORKSPACE": "workspace(name = \"ws_shapes\")\n\nload(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")\n\nhttp_archive(\n    name = \"dep\",\n    urls = [\"file:///WS/archives/dep-v1.tar.gz\"],\n    sha256 = \"b73874449991e5ec4475818559550eb63e0be30a992a5ac72e3194ee85b22910\",\n    strip_prefix = \"dep-v1\",\n)\n\nload(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")\n\nhttp_archive(\n    name = \"dep\",\n    urls = [\"file:///WS/archives/dep-v2.tar.gz\"],\n    sha256 = \"9dc01da0d21ba44475441de3c06a5ed7415bd1b2f8570d3e9419e272912bf7ae\",\n    strip_prefix = \"dep-v2\",\n)\n",
+   "deps_plain.bzl": "load(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")\n\ndef dep_deps():\n    http_archive(\n        name = \"dep\",\n        urls = [\"file:///WS/archives/dep-v1.tar.gz\"],\n        sha256 = \"b73874449991e5ec4475818559550eb63e0be30a992a5ac72e3194ee85b22910\",\n        strip_prefix = \"dep-v1\",\n    )\n",
+   "elsewhere/BUILD.bazel": "",
+   "elsewhere/WORKSPACE": "",
+   "elsewhere/deps_plain.bzl": "load(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")\n\ndef dep_deps():\n    http_archive(\n        name = \"dep\",\n        urls = [\"file:///WS/archives/dep-v2.tar.gz\"],\n        sha256 = \"9dc01da0d21ba44475441de3c06a5ed7415bd1b2f8570d3e9419e272912bf7ae\",\n        strip_prefix = \"dep-v2\",\n    )\n",
+   "inner_rule.bzl": "def _impl(ctx):\n    ctx.file(\"marker.txt\", ctx.attr.tag + \"\\n\")\n    ctx.file(\"BUILD.bazel\", 'exports_files([\"marker.txt\"])\\n')\n\n_marker_repo = repository_rule(\n    implementation = _impl,\n    attrs = {\"tag\": attr.string()},\n)\n\ndef own_deps():\n    _marker_repo(name = \"dep\", tag = \"inner\")\n",
+   "noop.bzl": "def noop():\n    pass\n",
+   "outer.bzl": "load(\"//:deps_plain.bzl\", \"dep_deps\")\n\ndef outer():\n    dep_deps()\n",
+   "repo.bzl": "def _impl(ctx):\n    ctx.file(\"marker.txt\", ctx.attr.tag + \"\\n\")\n    ctx.file(\"BUILD.bazel\", 'exports_files([\"marker.txt\"])\\n')\n\nmarker_repo = repository_rule(\n    implementation = _impl,\n    attrs = {\"tag\": attr.string()},\n)\n"
+  }
+ },
+ "s1d": {
+  "built": {
+   "5.4.1": "v2",
+   "6.6.0": "v2",
+   "7.7.2 --enable_workspace": "v2",
+   "7.7.2 --enable_workspace --noenable_bzlmod": "v2",
+   "8.8.2 --enable_workspace --noenable_bzlmod": "v2"
+  },
+  "description": "http_archive loaded twice by two loads of one chunk: literal(v1); literal(v2)",
+  "files": {
+   "WORKSPACE": "workspace(name = \"ws_shapes\")\n\nload(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")\nload(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")\n\nhttp_archive(\n    name = \"dep\",\n    urls = [\"file:///WS/archives/dep-v1.tar.gz\"],\n    sha256 = \"b73874449991e5ec4475818559550eb63e0be30a992a5ac72e3194ee85b22910\",\n    strip_prefix = \"dep-v1\",\n)\n\nhttp_archive(\n    name = \"dep\",\n    urls = [\"file:///WS/archives/dep-v2.tar.gz\"],\n    sha256 = \"9dc01da0d21ba44475441de3c06a5ed7415bd1b2f8570d3e9419e272912bf7ae\",\n    strip_prefix = \"dep-v2\",\n)\n",
+   "deps_plain.bzl": "load(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")\n\ndef dep_deps():\n    http_archive(\n        name = \"dep\",\n        urls = [\"file:///WS/archives/dep-v1.tar.gz\"],\n        sha256 = \"b73874449991e5ec4475818559550eb63e0be30a992a5ac72e3194ee85b22910\",\n        strip_prefix = \"dep-v1\",\n    )\n",
+   "elsewhere/BUILD.bazel": "",
+   "elsewhere/WORKSPACE": "",
+   "elsewhere/deps_plain.bzl": "load(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")\n\ndef dep_deps():\n    http_archive(\n        name = \"dep\",\n        urls = [\"file:///WS/archives/dep-v2.tar.gz\"],\n        sha256 = \"9dc01da0d21ba44475441de3c06a5ed7415bd1b2f8570d3e9419e272912bf7ae\",\n        strip_prefix = \"dep-v2\",\n    )\n",
+   "inner_rule.bzl": "def _impl(ctx):\n    ctx.file(\"marker.txt\", ctx.attr.tag + \"\\n\")\n    ctx.file(\"BUILD.bazel\", 'exports_files([\"marker.txt\"])\\n')\n\n_marker_repo = repository_rule(\n    implementation = _impl,\n    attrs = {\"tag\": attr.string()},\n)\n\ndef own_deps():\n    _marker_repo(name = \"dep\", tag = \"inner\")\n",
+   "noop.bzl": "def noop():\n    pass\n",
+   "outer.bzl": "load(\"//:deps_plain.bzl\", \"dep_deps\")\n\ndef outer():\n    dep_deps()\n",
+   "repo.bzl": "def _impl(ctx):\n    ctx.file(\"marker.txt\", ctx.attr.tag + \"\\n\")\n    ctx.file(\"BUILD.bazel\", 'exports_files([\"marker.txt\"])\\n')\n\nmarker_repo = repository_rule(\n    implementation = _impl,\n    attrs = {\"tag\": attr.string()},\n)\n"
+  }
+ },
+ "s2a": {
+  "built": {
+   "5.4.1": "rule",
+   "6.6.0": "rule",
+   "7.7.2 --enable_workspace": "rule",
+   "7.7.2 --enable_workspace --noenable_bzlmod": "rule",
+   "8.8.2 --enable_workspace --noenable_bzlmod": "rule"
+  },
+  "description": "own rule(dep) only",
+  "files": {
+   "WORKSPACE": "workspace(name = \"ws_shapes\")\n\nload(\"//:repo.bzl\", \"marker_repo\")\n\nmarker_repo(name = \"dep\", tag = \"rule\")\n",
+   "deps_plain.bzl": "load(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")\n\ndef dep_deps():\n    http_archive(\n        name = \"dep\",\n        urls = [\"file:///WS/archives/dep-v1.tar.gz\"],\n        sha256 = \"b73874449991e5ec4475818559550eb63e0be30a992a5ac72e3194ee85b22910\",\n        strip_prefix = \"dep-v1\",\n    )\n",
+   "elsewhere/BUILD.bazel": "",
+   "elsewhere/WORKSPACE": "",
+   "elsewhere/deps_plain.bzl": "load(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")\n\ndef dep_deps():\n    http_archive(\n        name = \"dep\",\n        urls = [\"file:///WS/archives/dep-v2.tar.gz\"],\n        sha256 = \"9dc01da0d21ba44475441de3c06a5ed7415bd1b2f8570d3e9419e272912bf7ae\",\n        strip_prefix = \"dep-v2\",\n    )\n",
+   "inner_rule.bzl": "def _impl(ctx):\n    ctx.file(\"marker.txt\", ctx.attr.tag + \"\\n\")\n    ctx.file(\"BUILD.bazel\", 'exports_files([\"marker.txt\"])\\n')\n\n_marker_repo = repository_rule(\n    implementation = _impl,\n    attrs = {\"tag\": attr.string()},\n)\n\ndef own_deps():\n    _marker_repo(name = \"dep\", tag = \"inner\")\n",
+   "noop.bzl": "def noop():\n    pass\n",
+   "outer.bzl": "load(\"//:deps_plain.bzl\", \"dep_deps\")\n\ndef outer():\n    dep_deps()\n",
+   "repo.bzl": "def _impl(ctx):\n    ctx.file(\"marker.txt\", ctx.attr.tag + \"\\n\")\n    ctx.file(\"BUILD.bazel\", 'exports_files([\"marker.txt\"])\\n')\n\nmarker_repo = repository_rule(\n    implementation = _impl,\n    attrs = {\"tag\": attr.string()},\n)\n"
+  }
+ },
+ "s2b": {
+  "built": {
+   "5.4.1": "rule",
+   "6.6.0": "rule",
+   "7.7.2 --enable_workspace": "rule",
+   "7.7.2 --enable_workspace --noenable_bzlmod": "rule",
+   "8.8.2 --enable_workspace --noenable_bzlmod": "rule"
+  },
+  "description": "literal(v1); own rule(dep) in one chunk",
+  "files": {
+   "WORKSPACE": "workspace(name = \"ws_shapes\")\n\nload(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")\nload(\"//:repo.bzl\", \"marker_repo\")\n\nhttp_archive(\n    name = \"dep\",\n    urls = [\"file:///WS/archives/dep-v1.tar.gz\"],\n    sha256 = \"b73874449991e5ec4475818559550eb63e0be30a992a5ac72e3194ee85b22910\",\n    strip_prefix = \"dep-v1\",\n)\n\nmarker_repo(name = \"dep\", tag = \"rule\")\n",
+   "deps_plain.bzl": "load(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")\n\ndef dep_deps():\n    http_archive(\n        name = \"dep\",\n        urls = [\"file:///WS/archives/dep-v1.tar.gz\"],\n        sha256 = \"b73874449991e5ec4475818559550eb63e0be30a992a5ac72e3194ee85b22910\",\n        strip_prefix = \"dep-v1\",\n    )\n",
+   "elsewhere/BUILD.bazel": "",
+   "elsewhere/WORKSPACE": "",
+   "elsewhere/deps_plain.bzl": "load(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")\n\ndef dep_deps():\n    http_archive(\n        name = \"dep\",\n        urls = [\"file:///WS/archives/dep-v2.tar.gz\"],\n        sha256 = \"9dc01da0d21ba44475441de3c06a5ed7415bd1b2f8570d3e9419e272912bf7ae\",\n        strip_prefix = \"dep-v2\",\n    )\n",
+   "inner_rule.bzl": "def _impl(ctx):\n    ctx.file(\"marker.txt\", ctx.attr.tag + \"\\n\")\n    ctx.file(\"BUILD.bazel\", 'exports_files([\"marker.txt\"])\\n')\n\n_marker_repo = repository_rule(\n    implementation = _impl,\n    attrs = {\"tag\": attr.string()},\n)\n\ndef own_deps():\n    _marker_repo(name = \"dep\", tag = \"inner\")\n",
+   "noop.bzl": "def noop():\n    pass\n",
+   "outer.bzl": "load(\"//:deps_plain.bzl\", \"dep_deps\")\n\ndef outer():\n    dep_deps()\n",
+   "repo.bzl": "def _impl(ctx):\n    ctx.file(\"marker.txt\", ctx.attr.tag + \"\\n\")\n    ctx.file(\"BUILD.bazel\", 'exports_files([\"marker.txt\"])\\n')\n\nmarker_repo = repository_rule(\n    implementation = _impl,\n    attrs = {\"tag\": attr.string()},\n)\n"
+  }
+ },
+ "s2c": {
+  "built": {
+   "5.4.1": "v2",
+   "6.6.0": "v2",
+   "7.7.2 --enable_workspace": "v2",
+   "7.7.2 --enable_workspace --noenable_bzlmod": "v2",
+   "8.8.2 --enable_workspace --noenable_bzlmod": "v2"
+  },
+  "description": "own rule(dep); literal(v2) in one chunk",
+  "files": {
+   "WORKSPACE": "workspace(name = \"ws_shapes\")\n\nload(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")\nload(\"//:repo.bzl\", \"marker_repo\")\n\nmarker_repo(name = \"dep\", tag = \"rule\")\n\nhttp_archive(\n    name = \"dep\",\n    urls = [\"file:///WS/archives/dep-v2.tar.gz\"],\n    sha256 = \"9dc01da0d21ba44475441de3c06a5ed7415bd1b2f8570d3e9419e272912bf7ae\",\n    strip_prefix = \"dep-v2\",\n)\n",
+   "deps_plain.bzl": "load(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")\n\ndef dep_deps():\n    http_archive(\n        name = \"dep\",\n        urls = [\"file:///WS/archives/dep-v1.tar.gz\"],\n        sha256 = \"b73874449991e5ec4475818559550eb63e0be30a992a5ac72e3194ee85b22910\",\n        strip_prefix = \"dep-v1\",\n    )\n",
+   "elsewhere/BUILD.bazel": "",
+   "elsewhere/WORKSPACE": "",
+   "elsewhere/deps_plain.bzl": "load(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")\n\ndef dep_deps():\n    http_archive(\n        name = \"dep\",\n        urls = [\"file:///WS/archives/dep-v2.tar.gz\"],\n        sha256 = \"9dc01da0d21ba44475441de3c06a5ed7415bd1b2f8570d3e9419e272912bf7ae\",\n        strip_prefix = \"dep-v2\",\n    )\n",
+   "inner_rule.bzl": "def _impl(ctx):\n    ctx.file(\"marker.txt\", ctx.attr.tag + \"\\n\")\n    ctx.file(\"BUILD.bazel\", 'exports_files([\"marker.txt\"])\\n')\n\n_marker_repo = repository_rule(\n    implementation = _impl,\n    attrs = {\"tag\": attr.string()},\n)\n\ndef own_deps():\n    _marker_repo(name = \"dep\", tag = \"inner\")\n",
+   "noop.bzl": "def noop():\n    pass\n",
+   "outer.bzl": "load(\"//:deps_plain.bzl\", \"dep_deps\")\n\ndef outer():\n    dep_deps()\n",
+   "repo.bzl": "def _impl(ctx):\n    ctx.file(\"marker.txt\", ctx.attr.tag + \"\\n\")\n    ctx.file(\"BUILD.bazel\", 'exports_files([\"marker.txt\"])\\n')\n\nmarker_repo = repository_rule(\n    implementation = _impl,\n    attrs = {\"tag\": attr.string()},\n)\n"
+  }
+ },
+ "s2d": {
+  "built": {
+   "5.4.1": "v1",
+   "6.6.0": "v1",
+   "7.7.2 --enable_workspace": "v1",
+   "7.7.2 --enable_workspace --noenable_bzlmod": "v1",
+   "8.8.2 --enable_workspace --noenable_bzlmod": "v1"
+  },
+  "description": "literal(v1); own rule(other) in one chunk",
+  "files": {
+   "WORKSPACE": "workspace(name = \"ws_shapes\")\n\nload(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")\nload(\"//:repo.bzl\", \"marker_repo\")\n\nhttp_archive(\n    name = \"dep\",\n    urls = [\"file:///WS/archives/dep-v1.tar.gz\"],\n    sha256 = \"b73874449991e5ec4475818559550eb63e0be30a992a5ac72e3194ee85b22910\",\n    strip_prefix = \"dep-v1\",\n)\n\nmarker_repo(name = \"other\", tag = \"rule\")\n",
+   "deps_plain.bzl": "load(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")\n\ndef dep_deps():\n    http_archive(\n        name = \"dep\",\n        urls = [\"file:///WS/archives/dep-v1.tar.gz\"],\n        sha256 = \"b73874449991e5ec4475818559550eb63e0be30a992a5ac72e3194ee85b22910\",\n        strip_prefix = \"dep-v1\",\n    )\n",
+   "elsewhere/BUILD.bazel": "",
+   "elsewhere/WORKSPACE": "",
+   "elsewhere/deps_plain.bzl": "load(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")\n\ndef dep_deps():\n    http_archive(\n        name = \"dep\",\n        urls = [\"file:///WS/archives/dep-v2.tar.gz\"],\n        sha256 = \"9dc01da0d21ba44475441de3c06a5ed7415bd1b2f8570d3e9419e272912bf7ae\",\n        strip_prefix = \"dep-v2\",\n    )\n",
+   "inner_rule.bzl": "def _impl(ctx):\n    ctx.file(\"marker.txt\", ctx.attr.tag + \"\\n\")\n    ctx.file(\"BUILD.bazel\", 'exports_files([\"marker.txt\"])\\n')\n\n_marker_repo = repository_rule(\n    implementation = _impl,\n    attrs = {\"tag\": attr.string()},\n)\n\ndef own_deps():\n    _marker_repo(name = \"dep\", tag = \"inner\")\n",
+   "noop.bzl": "def noop():\n    pass\n",
+   "outer.bzl": "load(\"//:deps_plain.bzl\", \"dep_deps\")\n\ndef outer():\n    dep_deps()\n",
+   "repo.bzl": "def _impl(ctx):\n    ctx.file(\"marker.txt\", ctx.attr.tag + \"\\n\")\n    ctx.file(\"BUILD.bazel\", 'exports_files([\"marker.txt\"])\\n')\n\nmarker_repo = repository_rule(\n    implementation = _impl,\n    attrs = {\"tag\": attr.string()},\n)\n"
+  }
+ },
+ "s2e": {
+  "built": {
+   "5.4.1": "rule",
+   "6.6.0": "rule",
+   "7.7.2 --enable_workspace": "rule",
+   "7.7.2 --enable_workspace --noenable_bzlmod": "rule",
+   "8.8.2 --enable_workspace --noenable_bzlmod": "rule"
+  },
+  "description": "own rule(dep); load; literal(v2) (two chunks)",
+  "files": {
+   "WORKSPACE": "workspace(name = \"ws_shapes\")\n\nload(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")\nload(\"//:repo.bzl\", \"marker_repo\")\n\nmarker_repo(name = \"dep\", tag = \"rule\")\n\nload(\"//:noop.bzl\", \"noop\")\n\nhttp_archive(\n    name = \"dep\",\n    urls = [\"file:///WS/archives/dep-v2.tar.gz\"],\n    sha256 = \"9dc01da0d21ba44475441de3c06a5ed7415bd1b2f8570d3e9419e272912bf7ae\",\n    strip_prefix = \"dep-v2\",\n)\n",
+   "deps_plain.bzl": "load(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")\n\ndef dep_deps():\n    http_archive(\n        name = \"dep\",\n        urls = [\"file:///WS/archives/dep-v1.tar.gz\"],\n        sha256 = \"b73874449991e5ec4475818559550eb63e0be30a992a5ac72e3194ee85b22910\",\n        strip_prefix = \"dep-v1\",\n    )\n",
+   "elsewhere/BUILD.bazel": "",
+   "elsewhere/WORKSPACE": "",
+   "elsewhere/deps_plain.bzl": "load(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")\n\ndef dep_deps():\n    http_archive(\n        name = \"dep\",\n        urls = [\"file:///WS/archives/dep-v2.tar.gz\"],\n        sha256 = \"9dc01da0d21ba44475441de3c06a5ed7415bd1b2f8570d3e9419e272912bf7ae\",\n        strip_prefix = \"dep-v2\",\n    )\n",
+   "inner_rule.bzl": "def _impl(ctx):\n    ctx.file(\"marker.txt\", ctx.attr.tag + \"\\n\")\n    ctx.file(\"BUILD.bazel\", 'exports_files([\"marker.txt\"])\\n')\n\n_marker_repo = repository_rule(\n    implementation = _impl,\n    attrs = {\"tag\": attr.string()},\n)\n\ndef own_deps():\n    _marker_repo(name = \"dep\", tag = \"inner\")\n",
+   "noop.bzl": "def noop():\n    pass\n",
+   "outer.bzl": "load(\"//:deps_plain.bzl\", \"dep_deps\")\n\ndef outer():\n    dep_deps()\n",
+   "repo.bzl": "def _impl(ctx):\n    ctx.file(\"marker.txt\", ctx.attr.tag + \"\\n\")\n    ctx.file(\"BUILD.bazel\", 'exports_files([\"marker.txt\"])\\n')\n\nmarker_repo = repository_rule(\n    implementation = _impl,\n    attrs = {\"tag\": attr.string()},\n)\n"
+  }
+ },
+ "s2f": {
+  "built": {
+   "5.4.1": "v1",
+   "6.6.0": "v1",
+   "7.7.2 --enable_workspace": "v1",
+   "7.7.2 --enable_workspace --noenable_bzlmod": "v1",
+   "8.8.2 --enable_workspace --noenable_bzlmod": "v1"
+  },
+  "description": "literal(v1); maybe(own rule, dep) in one chunk",
+  "files": {
+   "WORKSPACE": "workspace(name = \"ws_shapes\")\n\nload(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")\nload(\"@bazel_tools//tools/build_defs/repo:utils.bzl\", \"maybe\")\nload(\"//:repo.bzl\", \"marker_repo\")\n\nhttp_archive(\n    name = \"dep\",\n    urls = [\"file:///WS/archives/dep-v1.tar.gz\"],\n    sha256 = \"b73874449991e5ec4475818559550eb63e0be30a992a5ac72e3194ee85b22910\",\n    strip_prefix = \"dep-v1\",\n)\n\nmaybe(marker_repo, name = \"dep\", tag = \"rule\")\n",
+   "deps_plain.bzl": "load(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")\n\ndef dep_deps():\n    http_archive(\n        name = \"dep\",\n        urls = [\"file:///WS/archives/dep-v1.tar.gz\"],\n        sha256 = \"b73874449991e5ec4475818559550eb63e0be30a992a5ac72e3194ee85b22910\",\n        strip_prefix = \"dep-v1\",\n    )\n",
+   "elsewhere/BUILD.bazel": "",
+   "elsewhere/WORKSPACE": "",
+   "elsewhere/deps_plain.bzl": "load(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")\n\ndef dep_deps():\n    http_archive(\n        name = \"dep\",\n        urls = [\"file:///WS/archives/dep-v2.tar.gz\"],\n        sha256 = \"9dc01da0d21ba44475441de3c06a5ed7415bd1b2f8570d3e9419e272912bf7ae\",\n        strip_prefix = \"dep-v2\",\n    )\n",
+   "inner_rule.bzl": "def _impl(ctx):\n    ctx.file(\"marker.txt\", ctx.attr.tag + \"\\n\")\n    ctx.file(\"BUILD.bazel\", 'exports_files([\"marker.txt\"])\\n')\n\n_marker_repo = repository_rule(\n    implementation = _impl,\n    attrs = {\"tag\": attr.string()},\n)\n\ndef own_deps():\n    _marker_repo(name = \"dep\", tag = \"inner\")\n",
+   "noop.bzl": "def noop():\n    pass\n",
+   "outer.bzl": "load(\"//:deps_plain.bzl\", \"dep_deps\")\n\ndef outer():\n    dep_deps()\n",
+   "repo.bzl": "def _impl(ctx):\n    ctx.file(\"marker.txt\", ctx.attr.tag + \"\\n\")\n    ctx.file(\"BUILD.bazel\", 'exports_files([\"marker.txt\"])\\n')\n\nmarker_repo = repository_rule(\n    implementation = _impl,\n    attrs = {\"tag\": attr.string()},\n)\n"
+  }
+ },
+ "s2g": {
+  "built": {
+   "5.4.1": "rule",
+   "6.6.0": "rule",
+   "7.7.2 --enable_workspace": "rule",
+   "7.7.2 --enable_workspace --noenable_bzlmod": "rule",
+   "8.8.2 --enable_workspace --noenable_bzlmod": "rule"
+  },
+  "description": "maybe(own rule, dep) only",
+  "files": {
+   "WORKSPACE": "workspace(name = \"ws_shapes\")\n\nload(\"@bazel_tools//tools/build_defs/repo:utils.bzl\", \"maybe\")\nload(\"//:repo.bzl\", \"marker_repo\")\n\nmaybe(marker_repo, name = \"dep\", tag = \"rule\")\n",
+   "deps_plain.bzl": "load(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")\n\ndef dep_deps():\n    http_archive(\n        name = \"dep\",\n        urls = [\"file:///WS/archives/dep-v1.tar.gz\"],\n        sha256 = \"b73874449991e5ec4475818559550eb63e0be30a992a5ac72e3194ee85b22910\",\n        strip_prefix = \"dep-v1\",\n    )\n",
+   "elsewhere/BUILD.bazel": "",
+   "elsewhere/WORKSPACE": "",
+   "elsewhere/deps_plain.bzl": "load(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")\n\ndef dep_deps():\n    http_archive(\n        name = \"dep\",\n        urls = [\"file:///WS/archives/dep-v2.tar.gz\"],\n        sha256 = \"9dc01da0d21ba44475441de3c06a5ed7415bd1b2f8570d3e9419e272912bf7ae\",\n        strip_prefix = \"dep-v2\",\n    )\n",
+   "inner_rule.bzl": "def _impl(ctx):\n    ctx.file(\"marker.txt\", ctx.attr.tag + \"\\n\")\n    ctx.file(\"BUILD.bazel\", 'exports_files([\"marker.txt\"])\\n')\n\n_marker_repo = repository_rule(\n    implementation = _impl,\n    attrs = {\"tag\": attr.string()},\n)\n\ndef own_deps():\n    _marker_repo(name = \"dep\", tag = \"inner\")\n",
+   "noop.bzl": "def noop():\n    pass\n",
+   "outer.bzl": "load(\"//:deps_plain.bzl\", \"dep_deps\")\n\ndef outer():\n    dep_deps()\n",
+   "repo.bzl": "def _impl(ctx):\n    ctx.file(\"marker.txt\", ctx.attr.tag + \"\\n\")\n    ctx.file(\"BUILD.bazel\", 'exports_files([\"marker.txt\"])\\n')\n\nmarker_repo = repository_rule(\n    implementation = _impl,\n    attrs = {\"tag\": attr.string()},\n)\n"
+  }
+ },
+ "s2h": {
+  "built": {
+   "5.4.1": "inner",
+   "6.6.0": "inner",
+   "7.7.2 --enable_workspace": "inner",
+   "7.7.2 --enable_workspace --noenable_bzlmod": "inner",
+   "8.8.2 --enable_workspace --noenable_bzlmod": "inner"
+  },
+  "description": "a macro that calls a repository rule of its own file",
+  "files": {
+   "WORKSPACE": "workspace(name = \"ws_shapes\")\n\nload(\"//:inner_rule.bzl\", \"own_deps\")\n\nown_deps()\n",
+   "deps_plain.bzl": "load(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")\n\ndef dep_deps():\n    http_archive(\n        name = \"dep\",\n        urls = [\"file:///WS/archives/dep-v1.tar.gz\"],\n        sha256 = \"b73874449991e5ec4475818559550eb63e0be30a992a5ac72e3194ee85b22910\",\n        strip_prefix = \"dep-v1\",\n    )\n",
+   "elsewhere/BUILD.bazel": "",
+   "elsewhere/WORKSPACE": "",
+   "elsewhere/deps_plain.bzl": "load(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")\n\ndef dep_deps():\n    http_archive(\n        name = \"dep\",\n        urls = [\"file:///WS/archives/dep-v2.tar.gz\"],\n        sha256 = \"9dc01da0d21ba44475441de3c06a5ed7415bd1b2f8570d3e9419e272912bf7ae\",\n        strip_prefix = \"dep-v2\",\n    )\n",
+   "inner_rule.bzl": "def _impl(ctx):\n    ctx.file(\"marker.txt\", ctx.attr.tag + \"\\n\")\n    ctx.file(\"BUILD.bazel\", 'exports_files([\"marker.txt\"])\\n')\n\n_marker_repo = repository_rule(\n    implementation = _impl,\n    attrs = {\"tag\": attr.string()},\n)\n\ndef own_deps():\n    _marker_repo(name = \"dep\", tag = \"inner\")\n",
+   "noop.bzl": "def noop():\n    pass\n",
+   "outer.bzl": "load(\"//:deps_plain.bzl\", \"dep_deps\")\n\ndef outer():\n    dep_deps()\n",
+   "repo.bzl": "def _impl(ctx):\n    ctx.file(\"marker.txt\", ctx.attr.tag + \"\\n\")\n    ctx.file(\"BUILD.bazel\", 'exports_files([\"marker.txt\"])\\n')\n\nmarker_repo = repository_rule(\n    implementation = _impl,\n    attrs = {\"tag\": attr.string()},\n)\n"
+  }
+ },
+ "s3a": {
+  "built": {
+   "5.4.1": "v1",
+   "6.6.0": "v1",
+   "7.7.2 --enable_workspace": "v1",
+   "7.7.2 --enable_workspace --noenable_bzlmod": "v1",
+   "8.8.2 --enable_workspace --noenable_bzlmod": "v1"
+  },
+  "description": "workspace(name); load @<name>//:deps_plain.bzl; macro(v1)",
+  "files": {
+   "WORKSPACE": "workspace(name = \"ws_shapes\")\n\nload(\"@ws_shapes//:deps_plain.bzl\", own_deps = \"dep_deps\")\n\nown_deps()\n",
+   "deps_plain.bzl": "load(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")\n\ndef dep_deps():\n    http_archive(\n        name = \"dep\",\n        urls = [\"file:///WS/archives/dep-v1.tar.gz\"],\n        sha256 = \"b73874449991e5ec4475818559550eb63e0be30a992a5ac72e3194ee85b22910\",\n        strip_prefix = \"dep-v1\",\n    )\n",
+   "elsewhere/BUILD.bazel": "",
+   "elsewhere/WORKSPACE": "",
+   "elsewhere/deps_plain.bzl": "load(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")\n\ndef dep_deps():\n    http_archive(\n        name = \"dep\",\n        urls = [\"file:///WS/archives/dep-v2.tar.gz\"],\n        sha256 = \"9dc01da0d21ba44475441de3c06a5ed7415bd1b2f8570d3e9419e272912bf7ae\",\n        strip_prefix = \"dep-v2\",\n    )\n",
+   "inner_rule.bzl": "def _impl(ctx):\n    ctx.file(\"marker.txt\", ctx.attr.tag + \"\\n\")\n    ctx.file(\"BUILD.bazel\", 'exports_files([\"marker.txt\"])\\n')\n\n_marker_repo = repository_rule(\n    implementation = _impl,\n    attrs = {\"tag\": attr.string()},\n)\n\ndef own_deps():\n    _marker_repo(name = \"dep\", tag = \"inner\")\n",
+   "noop.bzl": "def noop():\n    pass\n",
+   "outer.bzl": "load(\"//:deps_plain.bzl\", \"dep_deps\")\n\ndef outer():\n    dep_deps()\n",
+   "repo.bzl": "def _impl(ctx):\n    ctx.file(\"marker.txt\", ctx.attr.tag + \"\\n\")\n    ctx.file(\"BUILD.bazel\", 'exports_files([\"marker.txt\"])\\n')\n\nmarker_repo = repository_rule(\n    implementation = _impl,\n    attrs = {\"tag\": attr.string()},\n)\n"
+  }
+ },
+ "s3b": {
+  "built": {
+   "5.4.1": null,
+   "6.6.0": null,
+   "7.7.2 --enable_workspace": null,
+   "7.7.2 --enable_workspace --noenable_bzlmod": null,
+   "8.8.2 --enable_workspace --noenable_bzlmod": null
+  },
+  "description": "load @<name>//:deps_plain.bzl in the chunk of workspace(name)",
+  "files": {
+   "WORKSPACE": "load(\"@ws_shapes//:deps_plain.bzl\", own_deps = \"dep_deps\")\n\nworkspace(name = \"ws_shapes\")\n\nown_deps()\n",
+   "deps_plain.bzl": "load(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")\n\ndef dep_deps():\n    http_archive(\n        name = \"dep\",\n        urls = [\"file:///WS/archives/dep-v1.tar.gz\"],\n        sha256 = \"b73874449991e5ec4475818559550eb63e0be30a992a5ac72e3194ee85b22910\",\n        strip_prefix = \"dep-v1\",\n    )\n",
+   "elsewhere/BUILD.bazel": "",
+   "elsewhere/WORKSPACE": "",
+   "elsewhere/deps_plain.bzl": "load(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")\n\ndef dep_deps():\n    http_archive(\n        name = \"dep\",\n        urls = [\"file:///WS/archives/dep-v2.tar.gz\"],\n        sha256 = \"9dc01da0d21ba44475441de3c06a5ed7415bd1b2f8570d3e9419e272912bf7ae\",\n        strip_prefix = \"dep-v2\",\n    )\n",
+   "inner_rule.bzl": "def _impl(ctx):\n    ctx.file(\"marker.txt\", ctx.attr.tag + \"\\n\")\n    ctx.file(\"BUILD.bazel\", 'exports_files([\"marker.txt\"])\\n')\n\n_marker_repo = repository_rule(\n    implementation = _impl,\n    attrs = {\"tag\": attr.string()},\n)\n\ndef own_deps():\n    _marker_repo(name = \"dep\", tag = \"inner\")\n",
+   "noop.bzl": "def noop():\n    pass\n",
+   "outer.bzl": "load(\"//:deps_plain.bzl\", \"dep_deps\")\n\ndef outer():\n    dep_deps()\n",
+   "repo.bzl": "def _impl(ctx):\n    ctx.file(\"marker.txt\", ctx.attr.tag + \"\\n\")\n    ctx.file(\"BUILD.bazel\", 'exports_files([\"marker.txt\"])\\n')\n\nmarker_repo = repository_rule(\n    implementation = _impl,\n    attrs = {\"tag\": attr.string()},\n)\n"
+  }
+ },
+ "s3c": {
+  "built": {
+   "5.4.1": "v2",
+   "6.6.0": "v1",
+   "7.7.2 --enable_workspace": "v1",
+   "7.7.2 --enable_workspace --noenable_bzlmod": "v1",
+   "8.8.2 --enable_workspace --noenable_bzlmod": "v1"
+  },
+  "description": "workspace(name); local_repository(name) in its chunk; load @<name>//:deps_plain.bzl; macro",
+  "files": {
+   "WORKSPACE": "workspace(name = \"ws_shapes\")\n\nlocal_repository(\n    name = \"ws_shapes\",\n    path = \"elsewhere\",\n)\n\nload(\"@ws_shapes//:deps_plain.bzl\", own_deps = \"dep_deps\")\n\nown_deps()\n",
+   "deps_plain.bzl": "load(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")\n\ndef dep_deps():\n    http_archive(\n        name = \"dep\",\n        urls = [\"file:///WS/archives/dep-v1.tar.gz\"],\n        sha256 = \"b73874449991e5ec4475818559550eb63e0be30a992a5ac72e3194ee85b22910\",\n        strip_prefix = \"dep-v1\",\n    )\n",
+   "elsewhere/BUILD.bazel": "",
+   "elsewhere/WORKSPACE": "",
+   "elsewhere/deps_plain.bzl": "load(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")\n\ndef dep_deps():\n    http_archive(\n        name = \"dep\",\n        urls = [\"file:///WS/archives/dep-v2.tar.gz\"],\n        sha256 = \"9dc01da0d21ba44475441de3c06a5ed7415bd1b2f8570d3e9419e272912bf7ae\",\n        strip_prefix = \"dep-v2\",\n    )\n",
+   "inner_rule.bzl": "def _impl(ctx):\n    ctx.file(\"marker.txt\", ctx.attr.tag + \"\\n\")\n    ctx.file(\"BUILD.bazel\", 'exports_files([\"marker.txt\"])\\n')\n\n_marker_repo = repository_rule(\n    implementation = _impl,\n    attrs = {\"tag\": attr.string()},\n)\n\ndef own_deps():\n    _marker_repo(name = \"dep\", tag = \"inner\")\n",
+   "noop.bzl": "def noop():\n    pass\n",
+   "outer.bzl": "load(\"//:deps_plain.bzl\", \"dep_deps\")\n\ndef outer():\n    dep_deps()\n",
+   "repo.bzl": "def _impl(ctx):\n    ctx.file(\"marker.txt\", ctx.attr.tag + \"\\n\")\n    ctx.file(\"BUILD.bazel\", 'exports_files([\"marker.txt\"])\\n')\n\nmarker_repo = repository_rule(\n    implementation = _impl,\n    attrs = {\"tag\": attr.string()},\n)\n"
+  }
+ },
+ "s3d": {
+  "built": {
+   "5.4.1": "v2",
+   "6.6.0": "v2",
+   "7.7.2 --enable_workspace": "v2",
+   "7.7.2 --enable_workspace --noenable_bzlmod": "v2",
+   "8.8.2 --enable_workspace --noenable_bzlmod": "v2"
+  },
+  "description": "local_repository(name) and no workspace(name); load @<name>//:deps_plain.bzl; macro(v2)",
+  "files": {
+   "WORKSPACE": "local_repository(\n    name = \"ws_shapes\",\n    path = \"elsewhere\",\n)\n\nload(\"@ws_shapes//:deps_plain.bzl\", own_deps = \"dep_deps\")\n\nown_deps()\n",
+   "deps_plain.bzl": "load(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")\n\ndef dep_deps():\n    http_archive(\n        name = \"dep\",\n        urls = [\"file:///WS/archives/dep-v1.tar.gz\"],\n        sha256 = \"b73874449991e5ec4475818559550eb63e0be30a992a5ac72e3194ee85b22910\",\n        strip_prefix = \"dep-v1\",\n    )\n",
+   "elsewhere/BUILD.bazel": "",
+   "elsewhere/WORKSPACE": "",
+   "elsewhere/deps_plain.bzl": "load(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")\n\ndef dep_deps():\n    http_archive(\n        name = \"dep\",\n        urls = [\"file:///WS/archives/dep-v2.tar.gz\"],\n        sha256 = \"9dc01da0d21ba44475441de3c06a5ed7415bd1b2f8570d3e9419e272912bf7ae\",\n        strip_prefix = \"dep-v2\",\n    )\n",
+   "inner_rule.bzl": "def _impl(ctx):\n    ctx.file(\"marker.txt\", ctx.attr.tag + \"\\n\")\n    ctx.file(\"BUILD.bazel\", 'exports_files([\"marker.txt\"])\\n')\n\n_marker_repo = repository_rule(\n    implementation = _impl,\n    attrs = {\"tag\": attr.string()},\n)\n\ndef own_deps():\n    _marker_repo(name = \"dep\", tag = \"inner\")\n",
+   "noop.bzl": "def noop():\n    pass\n",
+   "outer.bzl": "load(\"//:deps_plain.bzl\", \"dep_deps\")\n\ndef outer():\n    dep_deps()\n",
+   "repo.bzl": "def _impl(ctx):\n    ctx.file(\"marker.txt\", ctx.attr.tag + \"\\n\")\n    ctx.file(\"BUILD.bazel\", 'exports_files([\"marker.txt\"])\\n')\n\nmarker_repo = repository_rule(\n    implementation = _impl,\n    attrs = {\"tag\": attr.string()},\n)\n"
+  }
+ },
+ "s3e": {
+  "built": {
+   "5.4.1": "v1",
+   "6.6.0": "v1",
+   "7.7.2 --enable_workspace": "v1",
+   "7.7.2 --enable_workspace --noenable_bzlmod": "v1",
+   "8.8.2 --enable_workspace --noenable_bzlmod": "v1"
+  },
+  "description": "a macro that calls a macro(v1)",
+  "files": {
+   "WORKSPACE": "workspace(name = \"ws_shapes\")\n\nload(\"//:outer.bzl\", \"outer\")\n\nouter()\n",
+   "deps_plain.bzl": "load(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")\n\ndef dep_deps():\n    http_archive(\n        name = \"dep\",\n        urls = [\"file:///WS/archives/dep-v1.tar.gz\"],\n        sha256 = \"b73874449991e5ec4475818559550eb63e0be30a992a5ac72e3194ee85b22910\",\n        strip_prefix = \"dep-v1\",\n    )\n",
+   "elsewhere/BUILD.bazel": "",
+   "elsewhere/WORKSPACE": "",
+   "elsewhere/deps_plain.bzl": "load(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")\n\ndef dep_deps():\n    http_archive(\n        name = \"dep\",\n        urls = [\"file:///WS/archives/dep-v2.tar.gz\"],\n        sha256 = \"9dc01da0d21ba44475441de3c06a5ed7415bd1b2f8570d3e9419e272912bf7ae\",\n        strip_prefix = \"dep-v2\",\n    )\n",
+   "inner_rule.bzl": "def _impl(ctx):\n    ctx.file(\"marker.txt\", ctx.attr.tag + \"\\n\")\n    ctx.file(\"BUILD.bazel\", 'exports_files([\"marker.txt\"])\\n')\n\n_marker_repo = repository_rule(\n    implementation = _impl,\n    attrs = {\"tag\": attr.string()},\n)\n\ndef own_deps():\n    _marker_repo(name = \"dep\", tag = \"inner\")\n",
+   "noop.bzl": "def noop():\n    pass\n",
+   "outer.bzl": "load(\"//:deps_plain.bzl\", \"dep_deps\")\n\ndef outer():\n    dep_deps()\n",
+   "repo.bzl": "def _impl(ctx):\n    ctx.file(\"marker.txt\", ctx.attr.tag + \"\\n\")\n    ctx.file(\"BUILD.bazel\", 'exports_files([\"marker.txt\"])\\n')\n\nmarker_repo = repository_rule(\n    implementation = _impl,\n    attrs = {\"tag\": attr.string()},\n)\n"
+  }
+ },
+ "s3f": {
+  "built": {
+   "5.4.1": "v1",
+   "6.6.0": "v1",
+   "7.7.2 --enable_workspace": "v1",
+   "7.7.2 --enable_workspace --noenable_bzlmod": "v1",
+   "8.8.2 --enable_workspace --noenable_bzlmod": "v1"
+  },
+  "description": "literal(v2); a macro that calls a macro(v1) in one chunk",
+  "files": {
+   "WORKSPACE": "workspace(name = \"ws_shapes\")\n\nload(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")\nload(\"//:outer.bzl\", \"outer\")\n\nhttp_archive(\n    name = \"dep\",\n    urls = [\"file:///WS/archives/dep-v2.tar.gz\"],\n    sha256 = \"9dc01da0d21ba44475441de3c06a5ed7415bd1b2f8570d3e9419e272912bf7ae\",\n    strip_prefix = \"dep-v2\",\n)\n\nouter()\n",
+   "deps_plain.bzl": "load(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")\n\ndef dep_deps():\n    http_archive(\n        name = \"dep\",\n        urls = [\"file:///WS/archives/dep-v1.tar.gz\"],\n        sha256 = \"b73874449991e5ec4475818559550eb63e0be30a992a5ac72e3194ee85b22910\",\n        strip_prefix = \"dep-v1\",\n    )\n",
+   "elsewhere/BUILD.bazel": "",
+   "elsewhere/WORKSPACE": "",
+   "elsewhere/deps_plain.bzl": "load(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")\n\ndef dep_deps():\n    http_archive(\n        name = \"dep\",\n        urls = [\"file:///WS/archives/dep-v2.tar.gz\"],\n        sha256 = \"9dc01da0d21ba44475441de3c06a5ed7415bd1b2f8570d3e9419e272912bf7ae\",\n        strip_prefix = \"dep-v2\",\n    )\n",
+   "inner_rule.bzl": "def _impl(ctx):\n    ctx.file(\"marker.txt\", ctx.attr.tag + \"\\n\")\n    ctx.file(\"BUILD.bazel\", 'exports_files([\"marker.txt\"])\\n')\n\n_marker_repo = repository_rule(\n    implementation = _impl,\n    attrs = {\"tag\": attr.string()},\n)\n\ndef own_deps():\n    _marker_repo(name = \"dep\", tag = \"inner\")\n",
+   "noop.bzl": "def noop():\n    pass\n",
+   "outer.bzl": "load(\"//:deps_plain.bzl\", \"dep_deps\")\n\ndef outer():\n    dep_deps()\n",
+   "repo.bzl": "def _impl(ctx):\n    ctx.file(\"marker.txt\", ctx.attr.tag + \"\\n\")\n    ctx.file(\"BUILD.bazel\", 'exports_files([\"marker.txt\"])\\n')\n\nmarker_repo = repository_rule(\n    implementation = _impl,\n    attrs = {\"tag\": attr.string()},\n)\n"
+  }
+ }
+}
