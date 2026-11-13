@@ -744,7 +744,7 @@ fn restore_walk(cwd: &Path, skip: &[PathBuf]) -> RestoreWalk {
     // Absolute, so `skip` and the restores' (absolute) package folders
     // compare against the walked paths.
     let root = std::path::absolute(cwd).unwrap_or_else(|_| cwd.to_path_buf());
-    let bazel = super::bazel_output::Classifier::new();
+    let bazel = super::bazel_workspace::tree_classifier(&root);
     let mut pending = vec![root.clone()];
     let mut listed = 0usize;
     while let Some(dir) = pending.pop() {

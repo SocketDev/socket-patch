@@ -1520,6 +1520,60 @@ pub fn vendor_dir(ws: &BazelWorkspace) -> FlagState<String> {
     }
 }
 
+/// Every value the tracked rc files give `--vendor_dir`, on any command
+/// chain and under any config, as written, sorted and without repeats.
+///
+/// This is the input of the output-tree classifier (design 2.11), which
+/// asks another question than the gate: not "may a build read from a
+/// vendor directory", which [`vendor_dir`] answers with the committed
+/// directories and the unread files counted in, but "which directories
+/// does a `bazel vendor` of this workspace fill". A directory named only
+/// under `common:ci` is one of them: CI fills it, and nothing in it is a
+/// project. It takes the flags alone and no model, so that a walk can
+/// ask before anything else of the workspace is read.
+///
+/// A value is a path Bazel resolves against the workspace root. Whether
+/// one lies below the root, and what an empty one means for a caller that
+/// prunes by it, is [`vendor_dir_below`]'s answer.
+pub fn tracked_vendor_dirs(flags: &EffectiveFlags) -> Vec<String> {
+    let mut dirs: BTreeSet<String> = BTreeSet::new();
+    for chain in Chain::COMMANDS {
+        let state = flags.state(Flag::VendorDir, *chain);
+        dirs.extend(state.values().into_iter().cloned());
+    }
+    dirs.into_iter().collect()
+}
+
+/// A `--vendor_dir` value as a directory strictly below the workspace
+/// root: forward slashes, `..` folded, no trailing slash. `None` for a
+/// value that is not such a directory: an absolute path, one that leaves
+/// the root, and one that names the root itself.
+///
+/// The root itself is what an empty value names (`--vendor_dir=` is not
+/// the flag switched off, [`vendor_dir`]). The gate refuses on it like on
+/// any other value. A caller that prunes by the directory must not: the
+/// whole workspace would be a tree nothing is patched in, every project
+/// of it refused for one rc line under some config, and where Bazel is
+/// run with that value it writes `VENDOR.bazel` into the root, which then
+/// is a vendor directory by its marker with no help from here.
+pub fn vendor_dir_below(value: &str) -> Option<String> {
+    let value = value.replace('\\', "/");
+    let drive = value.split('/').next().is_some_and(|s| s.contains(':'));
+    if value.starts_with('/') || drive {
+        return None;
+    }
+    let mut out: Vec<&str> = Vec::new();
+    for segment in value.split('/') {
+        match segment {
+            "" | "." => {}
+            // Above the root: no directory below it.
+            ".." => drop(out.pop()?),
+            segment => out.push(segment),
+        }
+    }
+    (!out.is_empty()).then(|| out.join("/"))
+}
+
 #[cfg(test)]
 pub(super) mod tests {
     use std::path::PathBuf;
@@ -3568,5 +3622,64 @@ pub(super) mod tests {
             panic!("an unread import after `--vendor_dir=`");
         };
         assert!(readings.values().any(|value| value == "?"), "{readings:?}");
+    }
+
+    /// Design 2.11: what the classifier is told. Every directory some
+    /// command or config vendors into, from the rc files alone: no model,
+    /// no committed directory, no `?` for a file nobody read.
+    #[test]
+    fn tracked_vendor_dirs_are_every_value_of_every_chain_and_config() {
+        let tracked = |rc: &str| {
+            let files = Files::of(&[("MODULE.bazel", ""), (".bazelrc", rc)]);
+            let flags = crate::bazel::rc::read(&files).effective(&BazelLine::unknown());
+            tracked_vendor_dirs(&flags)
+        };
+        assert!(tracked("").is_empty());
+        assert!(tracked("build --lockfile_mode=error\n").is_empty());
+        assert_eq!(tracked("common --vendor_dir=vendor_src\n"), ["vendor_src"]);
+        // A value a later line overrides is no longer where Bazel vendors.
+        assert_eq!(
+            tracked("common --vendor_dir=a\ncommon --vendor_dir=b\n"),
+            ["b"]
+        );
+        assert_eq!(
+            tracked(
+                "common:ci --vendor_dir=third_party/bazel\nvendor --vendor_dir=out/v\n\
+                 build --vendor_dir=\n"
+            ),
+            ["", "out/v", "third_party/bazel"]
+        );
+        // A committed directory and an unread import are the gate's to
+        // weigh ([`vendor_dir`]); neither is a value an rc file gives.
+        let files = Files::of(&[
+            ("MODULE.bazel", ""),
+            (".bazelrc", "import %workspace%/ci.bazelrc\n"),
+            ("third_party/VENDOR.bazel", ""),
+        ]);
+        let flags = crate::bazel::rc::read(&files).effective(&BazelLine::unknown());
+        assert!(tracked_vendor_dirs(&flags).is_empty());
+    }
+
+    #[test]
+    fn a_vendor_dir_value_is_placed_below_the_root_or_not_at_all() {
+        for (value, below) in [
+            ("vendor_src", Some("vendor_src")),
+            ("third_party/bazel/", Some("third_party/bazel")),
+            ("./a//b/../c", Some("a/c")),
+            ("third_party\\bazel", Some("third_party/bazel")),
+            // The root itself, however it is spelled.
+            ("", None),
+            (".", None),
+            ("a/..", None),
+            // Outside the root.
+            ("..", None),
+            ("../shared", None),
+            ("a/../../b", None),
+            ("/abs/vendor", None),
+            ("C:/vendor", None),
+            ("C:\\vendor", None),
+        ] {
+            assert_eq!(vendor_dir_below(value).as_deref(), below, "{value:?}");
+        }
     }
 }

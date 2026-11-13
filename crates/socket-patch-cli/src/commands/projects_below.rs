@@ -65,6 +65,9 @@ impl RepoPolicy {
 /// ([`MANIFEST_MARKERS`] and the JVM build files) are its markers instead;
 /// the in-memory engine has no such fallback (manifests alone never make
 /// a root there), so for a lockless directory the two engines disagree.
+///
+/// A directory with neither is still a project when it is a Bazel root
+/// ([`bazel_root_marker`]): its boundary file is then its one marker.
 pub(crate) fn dir_markers(dir: &Path) -> Vec<String> {
     let mut markers = lock_markers(dir);
     if markers.is_empty() {
@@ -80,8 +83,31 @@ pub(crate) fn dir_markers(dir: &Path) -> Vec<String> {
             .map(|name| name.to_string())
             .collect();
     }
+    if markers.is_empty() {
+        markers.extend(bazel_root_marker(dir));
+    }
     markers.sort();
     markers
+}
+
+/// The boundary file that makes `dir` a Bazel root (`MODULE.bazel`,
+/// `REPO.bazel`, `WORKSPACE.bazel` or `WORKSPACE`, a directory of the name
+/// not counting), as a marker of last resort (design 2.2).
+///
+/// The test names no ecosystem, on purpose. A Bazel workspace often keeps
+/// no lockfile and no manifest a native tool would know beside its
+/// boundary file: `maven_install.json`, a requirements file under a name
+/// of its own, a lock a label points at in `third_party/`. Without this a
+/// bare scan from such a root runs in the native projects below it and
+/// never in the root, so what the root's hubs build is never looked at
+/// and the run says nothing of the workspace.
+///
+/// It is asked only of a directory that has no other marker, so a project
+/// that had markers keeps exactly those and the socket.yml path policy
+/// judges it as before; and it costs a directory that is no Bazel root
+/// four `stat`s.
+fn bazel_root_marker(dir: &Path) -> Option<String> {
+    socket_patch_core::crawlers::bazel_root::boundary_file_in(dir).map(str::to_string)
 }
 
 /// The lockfile markers in `dir` (unsorted): what makes a directory a
@@ -671,6 +697,47 @@ impl Below {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Design 2.2: a Bazel root is a project whatever it builds, and a
+    /// directory that was a project by a lockfile or a manifest keeps the
+    /// markers it had.
+    #[test]
+    fn a_bazel_root_is_a_project_by_its_boundary_file_as_a_last_resort() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = |name: &str, files: &[&str]| {
+            let dir = tmp.path().join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            for file in files {
+                std::fs::write(dir.join(file), "").unwrap();
+            }
+            dir
+        };
+        let pure = dir(
+            "pure",
+            &[
+                "MODULE.bazel",
+                "maven_install.json",
+                "requirements_lock.txt",
+            ],
+        );
+        assert_eq!(dir_markers(&pure), ["MODULE.bazel"]);
+        // The first name in Bazel's order, one marker.
+        let both = dir("both", &["WORKSPACE", "WORKSPACE.bazel", "BUILD.bazel"]);
+        assert_eq!(dir_markers(&both), ["WORKSPACE.bazel"]);
+        // A lockfile or a manifest decides alone, as before.
+        let locked = dir(
+            "locked",
+            &["MODULE.bazel", "package-lock.json", "package.json"],
+        );
+        assert_eq!(dir_markers(&locked), ["package-lock.json"]);
+        let manifest = dir("manifest", &["WORKSPACE", "pyproject.toml"]);
+        assert_eq!(dir_markers(&manifest), ["pyproject.toml"]);
+        // A directory of the name, a BUILD file and an rc file make no root.
+        let none = dir("none", &["BUILD.bazel", ".bazelrc", ".bazelversion"]);
+        std::fs::create_dir(none.join("WORKSPACE")).unwrap();
+        assert!(dir_markers(&none).is_empty());
+        assert!(dir_markers(&dir("empty", &[])).is_empty());
+    }
 
     const REQUESTS: (&str, &str) = (
         "pkg:pypi/requests@2.31.0",

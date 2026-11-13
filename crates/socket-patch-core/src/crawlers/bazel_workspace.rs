@@ -42,11 +42,13 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use super::bazel_output::{vendor_dirs_at, Classifier};
+use super::bazel_root::RootProbe;
 use crate::bazel::model::{
-    BazelWorkspace, CommittedVendorDirs, FileText, FileView, Gap, PathClass, RootRef,
+    BazelLine, BazelWorkspace, CommittedVendorDirs, FileText, FileView, Gap, PathClass, RootRef,
 };
+use crate::bazel::{govern, rc};
 use crate::utils::fs::read_regular_to_bytes_sync;
-use crate::utils::repo_root::ReadBoundary;
+use crate::utils::repo_root::{ReadBoundary, ReadScope};
 
 /// The largest file a view reads. The Starlark readers stop at 1 MiB by
 /// themselves; this is for the locks, of which a `MODULE.bazel.lock` or a
@@ -334,10 +336,67 @@ pub fn read_workspace(root: &RootRef, view: &DiskView) -> Result<BazelWorkspace,
     Ok(workspace)
 }
 
+/// The vendor directories that tracked rc files name for the Bazel roots
+/// at and above `dir` (design 2.6, 2.11): each `--vendor_dir` value of any
+/// command chain or config that lies below its root
+/// (`govern::vendor_dir_below`), as an absolute path under the resolved
+/// root.
+///
+/// Such a directory is Bazel's before `bazel vendor` has written a marker
+/// into it, and where git does not track the marker. Without this the
+/// classifier knows a vendor directory by its marker alone.
+///
+/// The cost where no Bazel root lies above `dir`, which is every project
+/// that does not build with Bazel: the stat-only root probe, once, and
+/// nothing else. No file is opened, no directory listed and no checkout
+/// looked for. Under a root, the checkout that bounds the read is found,
+/// and each root's `.bazelrc` and what it imports inside that boundary
+/// are read; an rc file outside it is never opened.
+///
+/// A relative `dir` is read from the working directory. The calls block.
+pub fn tracked_vendor_dirs(dir: &Path) -> Vec<PathBuf> {
+    let probe = RootProbe::new();
+    // Asked without a boundary first: only names are stat'ed, and "no
+    // boundary file up to the top of the disk" needs no checkout to be
+    // found. The roots that count are the ones inside the read boundary.
+    if probe.survey(dir, &ReadBoundary::Unbounded).roots.is_empty() {
+        return Vec::new();
+    }
+    let from = match dir.as_os_str().is_empty() {
+        true => Path::new("."),
+        false => dir,
+    };
+    let boundary = ReadBoundary::upward(ReadScope::Workspace, from);
+    let mut dirs = Vec::new();
+    for root in &probe.survey(dir, &boundary).roots {
+        let view = DiskView::new(root);
+        let flags = rc::read(&view).effective(&BazelLine::unknown());
+        for value in govern::tracked_vendor_dirs(&flags) {
+            let Some(below) = govern::vendor_dir_below(&value) else {
+                continue;
+            };
+            // Component by component: one `join("a/b")` would leave a
+            // `/` inside a component on Windows.
+            let mut path = view.root().to_path_buf();
+            path.extend(below.split('/'));
+            dirs.push(path);
+        }
+    }
+    dirs
+}
+
+/// The output-tree classifier for work at or below `dir`: the markers
+/// Bazel writes, and the vendor directories the tracked rc files name
+/// ([`tracked_vendor_dirs`]). Every guard that keeps a walk or a write out
+/// of Bazel's trees makes its classifier here, so that all of them know
+/// the same trees.
+pub fn tree_classifier(dir: &Path) -> Classifier {
+    Classifier::with_vendor_dirs(tracked_vendor_dirs(dir))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bazel::govern;
     use crate::bazel::model::{BoundaryFiles, Completeness, FlagState, Governance, HubId};
     use crate::crawlers::types::Ecosystem;
 
@@ -920,5 +979,74 @@ mod tests {
     /// Whether the disk under `dir` takes two spellings of a name for one.
     fn folds_case(dir: &Path) -> bool {
         dir.join("module.bazel").is_file() && dir.join("MODULE.bazel").is_file()
+    }
+    /// Design 2.11 and HZ-03: the classifier of a run knows the vendor
+    /// directories the tracked rc files name, and a project that does not
+    /// build with Bazel is asked for nothing but names.
+    #[test]
+    fn the_tracked_vendor_dirs_of_the_roots_above_reach_the_classifier() {
+        let (tmp, root) = staged(&[
+            ("repo/ws/MODULE.bazel", ""),
+            (
+                "repo/ws/.bazelrc",
+                "common:ci --vendor_dir=third_party/bazel\nimport %workspace%/extra.bazelrc\n",
+            ),
+            (
+                "repo/ws/extra.bazelrc",
+                "vendor --vendor_dir=./deps/\nbuild:x --vendor_dir=\n",
+            ),
+            ("repo/ws/app/package.json", "{}"),
+            ("repo/ws/third_party/bazel/+npm+dep/package.json", "{}"),
+            ("repo/plain/package.json", "{}"),
+        ]);
+        // Level by level from the resolved root, as the reader builds them.
+        let ws = &std::fs::canonicalize(&root.root).expect("the staged root");
+        let below = |rel: &str| rel.split('/').fold(ws.clone(), |dir, name| dir.join(name));
+        let expected = [below("deps"), below("third_party/bazel")];
+        // From the root, from a project below it and from inside the
+        // vendor directory, also one nobody created yet.
+        for from in ["", "app", "third_party/bazel/+npm+dep", "deps/not/yet"] {
+            let from = match from {
+                "" => ws.clone(),
+                rel => below(rel),
+            };
+            assert_eq!(tracked_vendor_dirs(&from), expected, "{}", from.display());
+        }
+        let trees = tree_classifier(&below("app"));
+        let class = |path: PathBuf| trees.classify(&path).class;
+        assert_eq!(
+            class(below("third_party/bazel/+npm+dep")),
+            PathClass::VendorDir
+        );
+        assert_eq!(class(below("deps")), PathClass::VendorDir);
+        assert_eq!(class(below("app")), PathClass::Plain);
+        // The empty value names the root itself, and the root is not made
+        // a tree by a flag.
+        assert_eq!(class(ws.clone()), PathClass::Plain);
+        // What a walker of the root is told to stay out of.
+        let at_root: Vec<PathBuf> = trees
+            .tracked_at(ws)
+            .into_iter()
+            .map(|tree| tree.root)
+            .collect();
+        assert_eq!(at_root, [ws.join("deps")]);
+        let third_party: Vec<PathBuf> = trees
+            .tracked_at(&ws.join("third_party"))
+            .into_iter()
+            .map(|tree| tree.root)
+            .collect();
+        assert_eq!(third_party, [below("third_party/bazel")]);
+        assert!(trees.tracked_at(&below("app")).is_empty());
+
+        // No Bazel root above: nothing is read and nothing is tracked.
+        let plain = std::fs::canonicalize(tmp.path())
+            .unwrap()
+            .join("repo")
+            .join("plain");
+        assert!(tracked_vendor_dirs(&plain).is_empty());
+        assert_eq!(
+            tree_classifier(&plain).classify(&plain).class,
+            PathClass::Plain
+        );
     }
 }

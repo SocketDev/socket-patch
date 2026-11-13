@@ -6,6 +6,14 @@
 //! Plug'n'Play markers and the vendored ledger), plus one
 //! presence-only Maven / NuGet marker per ecosystem so a repo holding only
 //! those still gets its `ecosystem_unsupported_in_memory` warning.
+//!
+//! Bazel changes the set in two ways (design 3, HZ-03 and HZ-20). Nothing
+//! inside a tree Bazel owns (an output base, a cache or a vendor directory
+//! kept in the repository) is a root or is streamed. And the boundary
+//! files, the `.bazelrc` and the socket-owned `.socket/bazel/` directory
+//! of every Bazel root at or above a project root are streamed, so the
+//! session can tell which ecosystems Bazel builds there and leave them
+//! alone (`super::bazel`).
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -21,8 +29,8 @@ use crate::policy::{
 };
 
 use super::roots::{
-    detect_roots, join_root, pnpm_member_candidates, root_markers, split_path, strict_ancestors,
-    strip_root, EXCLUDED_ROOT_SEGMENTS, UNSUPPORTED_MARKERS, YARNRC_NAME,
+    bazel_trees_listed, detect_roots, join_root, pnpm_member_candidates, root_markers, split_path,
+    strict_ancestors, strip_root, EXCLUDED_ROOT_SEGMENTS, UNSUPPORTED_MARKERS, YARNRC_NAME,
 };
 use super::types::{
     IgnoredPath, PathSelection, PolicyErrorInfo, PolicyFileInput, SelectOptions, TreeEntryInput,
@@ -375,11 +383,24 @@ pub fn select_paths(entries: &[TreeEntryInput], options: &SelectOptions) -> Path
         PolicySource::None | PolicySource::Bypassed => None,
     };
 
+    // The trees Bazel owns (design 3, HZ-02 and HZ-03), known by the
+    // markers this listing holds. The session detects roots over what is
+    // streamed, so a lockfile streamed from inside a tree would be a
+    // project root to it: nothing in a tree is a root here, and nothing
+    // in one is streamed. (A vendor directory that only a `.bazelrc`
+    // names is the session's to prune: selection reads no content.)
+    let bazel_trees = bazel_trees_listed(blobs.keys().map(String::as_str), &[]);
+    let bazel_tree_skipped = crate::bazel::codes::Code::WorkspaceOutputTreeSkipped.as_str();
+
     let candidate_roots: Vec<String> = match &options.project_roots {
         Some(requested) => {
             let mut out: BTreeSet<String> = BTreeSet::new();
             for root in requested {
                 match safe_root_path(root) {
+                    Some(r) if bazel_trees.hold(&r) => ignored.push(IgnoredPath {
+                        path: r,
+                        reason: bazel_tree_skipped.to_string(),
+                    }),
                     Some(r) => {
                         out.insert(r);
                     }
@@ -451,6 +472,9 @@ pub fn select_paths(entries: &[TreeEntryInput], options: &SelectOptions) -> Path
 
     let mut per_root: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
     for path in blobs.keys() {
+        if bazel_trees.hold(split_path(path).0) {
+            continue;
+        }
         let mut dir = path.as_str();
         loop {
             dir = match dir.rsplit_once('/') {
@@ -534,6 +558,7 @@ pub fn select_paths(entries: &[TreeEntryInput], options: &SelectOptions) -> Path
                 && !dir
                     .split('/')
                     .any(|seg| EXCLUDED_ROOT_SEGMENTS.contains(&seg))
+                && !bazel_trees.hold(dir)
                 && policy
                     .admits_root(&Root {
                         rel_dir: dir,
@@ -545,6 +570,12 @@ pub fn select_paths(entries: &[TreeEntryInput], options: &SelectOptions) -> Path
         if let Some(path) = first {
             needs.entry(path.clone()).or_insert(Need::Present);
         }
+    }
+
+    // What says which ecosystems Bazel builds in a root (HZ-20): the
+    // session reads these as text, and leaves alone what they claim.
+    for path in super::bazel::selected(&roots, &blobs) {
+        needs.insert(path.to_string(), Need::Text);
     }
 
     // The session reads the same policy text again.
@@ -585,7 +616,13 @@ pub fn candidate_files() -> Vec<String> {
         .chain(PNP_MARKERS.iter())
         .map(|s| s.to_string())
         .collect();
+    for pattern in super::bazel::ROOT_FILES {
+        out.insert(format!(
+            "{pattern} (Bazel roots at or above a project root)"
+        ));
+    }
     for pattern in [
+        ".socket/bazel/** (Bazel roots at or above a project root)",
         "rush.json",
         RUSH_COMMON_LOCK_REL,
         RUSH_REPO_STATE_REL,
@@ -820,6 +857,136 @@ mod tests {
             },
         );
         assert!(s.present_only.is_empty());
+    }
+
+    /// HZ-03 in memory: the session detects roots over the streamed files
+    /// alone and sees no marker, so nothing in a tree Bazel owns may be
+    /// streamed. A vendor directory and an output base kept in the
+    /// checkout hold what the user-patch walk, the pnpm member rule, the
+    /// Cargo member rule and the Maven / NuGet probe would each select.
+    #[test]
+    fn nothing_in_a_bazel_tree_is_streamed_or_named_a_root() {
+        let entries: Vec<TreeEntryInput> = [
+            "package.json",
+            "yarn.lock",
+            "pnpm-workspace.yaml",
+            "Cargo.toml",
+            "Cargo.lock",
+            "apps/web/package.json",
+            "apps/web/pnpm-lock.yaml",
+            "vendor_src/VENDOR.bazel",
+            "vendor_src/+http_archive+dep/package.json",
+            "vendor_src/+http_archive+dep/yarn.lock",
+            "vendor_src/+http_archive+dep/pnpm-lock.yaml",
+            "vendor_src/+http_archive+dep/fix+1.0.0.patch",
+            "vendor_src/+http_archive+dep/crate/Cargo.toml",
+            "vendor_src/+http_archive+dep/java/pom.xml",
+            "vendor_src/+http_archive+dep/MODULE.bazel",
+            "out/DO_NOT_BUILD_HERE",
+            "out/external/rules_nodejs~/package.json",
+            "out/external/rules_nodejs~/yarn.lock",
+            "out/external/rules_nodejs~/pnpm-lock.yaml",
+            "out/execroot/_main/package.json",
+            "out/execroot/_main/yarn.lock",
+            "svc/pom.xml",
+        ]
+        .map(blob)
+        .to_vec();
+        let in_tree = |path: &str| path.starts_with("vendor_src/") || path.starts_with("out/");
+        let streamed = |s: &PathSelection| -> Vec<String> {
+            let lists = [&s.fetch_text, &s.fetch_binary, &s.present_only, &s.symlinks];
+            lists.into_iter().flatten().cloned().collect()
+        };
+
+        let s = select_paths(&entries, &SelectOptions::default());
+        assert_eq!(s.roots, vec!["", "apps/web"]);
+        let files = streamed(&s);
+        assert!(!files.iter().any(|path| in_tree(path)), "{files:?}");
+        assert!(files.contains(&"svc/pom.xml".to_string()), "{files:?}");
+        assert!(files.contains(&"apps/web/package.json".to_string()));
+        // What the session does with `projectRoots` unset.
+        let (session_roots, _) = detect_roots(files.iter().map(String::as_str), None);
+        assert_eq!(session_roots, s.roots);
+        let skipped = crate::bazel::codes::Code::WorkspaceOutputTreeSkipped.as_str();
+        let reported = |s: &PathSelection, path: &str| {
+            let mut sample = s.ignored_sample.iter();
+            sample.any(|i| i.path == path && i.reason == skipped)
+        };
+        assert!(reported(&s, "vendor_src/+http_archive+dep/yarn.lock"));
+        assert!(reported(&s, "out/execroot/_main/yarn.lock"));
+
+        // A root the caller names inside a tree is left out and reported.
+        let named = SelectOptions {
+            project_roots: Some(vec![
+                "apps/web".into(),
+                "vendor_src/+http_archive+dep".into(),
+                "out".into(),
+            ]),
+            ..SelectOptions::default()
+        };
+        let s = select_paths(&entries, &named);
+        assert_eq!(s.roots, vec!["apps/web"]);
+        assert!(!streamed(&s).iter().any(|path| in_tree(path)));
+        assert!(reported(&s, "vendor_src/+http_archive+dep") && reported(&s, "out"));
+
+        // Without the markers the same directories are projects.
+        let unmarked: Vec<TreeEntryInput> = entries
+            .iter()
+            .filter(|e| !e.path.ends_with("VENDOR.bazel") && !e.path.ends_with("DO_NOT_BUILD_HERE"))
+            .cloned()
+            .collect();
+        let s = select_paths(&unmarked, &SelectOptions::default());
+        assert!(s
+            .roots
+            .contains(&"vendor_src/+http_archive+dep".to_string()));
+        assert!(streamed(&s).iter().any(|path| in_tree(path)));
+    }
+
+    /// HZ-20: what says which ecosystems Bazel builds is streamed as
+    /// text, for every Bazel root at or above a project root, and a
+    /// repository with no boundary file streams what it always did.
+    #[test]
+    fn the_files_of_a_bazel_root_above_a_project_are_streamed() {
+        let native = ["web/package.json", "web/package-lock.json", "web/src/a.js"];
+        let bazel = [
+            "MODULE.bazel",
+            "WORKSPACE.bzlmod",
+            ".bazelrc",
+            ".bazelversion",
+            "MODULE.bazel.lock",
+            "BUILD.bazel",
+            ".socket/bazel/index.json",
+            "web/BUILD.bazel",
+            // A Bazel root with no project at or below it.
+            "docs/WORKSPACE",
+        ];
+        let plain = select_paths(&native.map(blob), &SelectOptions::default());
+        assert_eq!(
+            plain.fetch_text,
+            ["web/package-lock.json", "web/package.json"]
+        );
+        let entries: Vec<TreeEntryInput> = native.iter().chain(&bazel).map(|p| blob(p)).collect();
+        let s = select_paths(&entries, &SelectOptions::default());
+        assert_eq!(s.roots, plain.roots);
+        assert_eq!(
+            s.fetch_text,
+            [
+                ".bazelrc",
+                ".socket/bazel/index.json",
+                "MODULE.bazel",
+                "WORKSPACE.bzlmod",
+                "web/package-lock.json",
+                "web/package.json",
+            ]
+        );
+        assert_eq!(s.present_only, plain.present_only);
+        // A boundary file that is a symbolic link is reported, not fetched:
+        // the session then knows the root and cannot read it.
+        let mut linked = entries.clone();
+        linked[native.len()].mode = "120000".into();
+        let s = select_paths(&linked, &SelectOptions::default());
+        assert_eq!(s.symlinks, ["MODULE.bazel"]);
+        assert!(!s.fetch_text.contains(&"MODULE.bazel".to_string()));
     }
 
     #[test]

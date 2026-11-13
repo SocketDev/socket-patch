@@ -12,6 +12,14 @@
 //!
 //! The list must also stay tight: an allowlisted edge the code no longer
 //! has fails the test, so the entry is deleted in the PR that removes it.
+//!
+//! The second half is a source scan over `src/bazel_gate/*.rs`, the
+//! command seams of the Bazel layer ([`seam_problems`]). A seam is written
+//! once and a lane lands later behind it, so a seam must not build in
+//! what a lane changes: it takes its contexts from the loader, hands
+//! plans to the executor and names no file socket-patch owns. No type
+//! enforces that, so this scan does, and it covers a seam file from the
+//! day the file exists.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -346,4 +354,461 @@ fn command_module_graph_has_no_cycles() {
             );
         }
     }
+}
+
+// ── The Bazel seam files ─────────────────────────────────────────────
+
+/// The types a seam never matches on (revision 4, seam contract item 1):
+/// the executor, `Code::withheld` and `Level::of_required_run` take them
+/// whole. A match needs `Type::Variant`, so that spelling is what the
+/// scan looks for.
+const SEAM_OPAQUE_TYPES: [&str; 9] = [
+    "WriteClass",
+    "OwnedWrite",
+    "HookKind",
+    "TagOp",
+    "RunKind",
+    "Anchor",
+    "AttestBasis",
+    "StaleBehaviour",
+    "WithholdKind",
+];
+
+/// What marks a string literal as a path socket-patch owns under a Bazel
+/// root: the owned directory, and the names of the owned files that no
+/// other file has. A seam takes such a path from `exec::touched` or from
+/// the constants of `bazel::owned_index`, so that a change of the layout
+/// edits no seam.
+fn owned_path_marks() -> Vec<&'static str> {
+    use socket_patch_core::bazel::owned_index::{
+        OWNED_BZL_PATH, OWNED_DIR, OWNED_RC_PATH, OWNED_SEGMENT_PATH,
+    };
+    let name = |path: &'static str| path.rsplit('/').next().expect("a file name");
+    let files = [OWNED_RC_PATH, OWNED_SEGMENT_PATH, OWNED_BZL_PATH].map(name);
+    std::iter::once(OWNED_DIR).chain(files).collect()
+}
+
+/// Rust source with what a scan must not read taken out: `masked` is the
+/// source, byte for byte, with every comment and the content of every
+/// string literal blanked, and `literals` are the content ranges of the
+/// string literals in the source.
+struct Lexed {
+    masked: String,
+    literals: Vec<std::ops::Range<usize>>,
+}
+
+/// A lexer for exactly that: line and (nested) block comments, plain,
+/// byte and raw strings, and char literals, which may hold a `"` or a
+/// brace. Delimiters are ASCII, so it runs over bytes and blanks whole
+/// characters.
+fn lex(src: &str) -> Lexed {
+    let bytes = src.as_bytes();
+    let mut masked = bytes.to_vec();
+    let mut literals = Vec::new();
+    let blank = |masked: &mut Vec<u8>, range: std::ops::Range<usize>| {
+        for at in range {
+            if masked[at] != b'\n' {
+                masked[at] = b' ';
+            }
+        }
+    };
+    let ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let mut at = 0;
+    while at < bytes.len() {
+        let rest = &bytes[at..];
+        let after_ident = at > 0 && ident(bytes[at - 1]);
+        if rest.starts_with(b"//") {
+            let end = rest.iter().position(|b| *b == b'\n').unwrap_or(rest.len());
+            blank(&mut masked, at..at + end);
+            at += end;
+        } else if rest.starts_with(b"/*") {
+            let (mut depth, mut end) = (0usize, 0usize);
+            while end < rest.len() {
+                if rest[end..].starts_with(b"/*") {
+                    depth += 1;
+                    end += 2;
+                } else if rest[end..].starts_with(b"*/") {
+                    depth -= 1;
+                    end += 2;
+                    if depth == 0 {
+                        break;
+                    }
+                } else {
+                    end += 1;
+                }
+            }
+            blank(&mut masked, at..at + end);
+            at += end;
+        } else if rest[0] == b'"' {
+            let mut end = 1;
+            while end < rest.len() && rest[end] != b'"' {
+                end += if rest[end] == b'\\' { 2 } else { 1 };
+            }
+            let end = end.min(rest.len());
+            literals.push(at + 1..at + end);
+            blank(&mut masked, at + 1..at + end);
+            at += end + 1;
+        } else if rest[0] == b'r' && !after_ident && {
+            let hashes = rest[1..].iter().take_while(|b| **b == b'#').count();
+            rest.get(1 + hashes) == Some(&b'"')
+        } {
+            let hashes = rest[1..].iter().take_while(|b| **b == b'#').count();
+            let open = 2 + hashes;
+            let mut close = vec![b'"'];
+            close.extend(std::iter::repeat_n(b'#', hashes));
+            let body = &rest[open..];
+            let len = body
+                .windows(close.len())
+                .position(|window| window == close.as_slice())
+                .unwrap_or(body.len());
+            literals.push(at + open..at + open + len);
+            blank(&mut masked, at + open..at + open + len);
+            at += open + len + close.len();
+        } else if rest[0] == b'\'' {
+            // A char literal, or a lifetime, which has no closing quote.
+            // An escape closes at the first quote after the escaped
+            // character; any other char literal is one character wide.
+            let len = match rest.get(1).copied() {
+                Some(b'\\') => {
+                    let close = rest.iter().skip(3).position(|b| *b == b'\'');
+                    close.map_or(1, |close| close + 4)
+                }
+                Some(first) => {
+                    let wide = match first {
+                        0..=0x7f => 1,
+                        0xc0..=0xdf => 2,
+                        0xe0..=0xef => 3,
+                        _ => 4,
+                    };
+                    match rest.get(1 + wide) {
+                        Some(b'\'') => wide + 2,
+                        _ => 1,
+                    }
+                }
+                None => 1,
+            };
+            if len > 1 {
+                blank(&mut masked, at + 1..at + len - 1);
+            }
+            at += len;
+        } else {
+            at += 1;
+        }
+    }
+    Lexed {
+        masked: String::from_utf8(masked).expect("blanking keeps whole characters"),
+        literals,
+    }
+}
+
+/// The offset just past the brace that closes the one at `code[open]`,
+/// in masked code, where no string or comment holds a brace.
+fn closing_brace(code: &str, open: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    for (at, byte) in code.bytes().enumerate().skip(open) {
+        match byte {
+            b'{' => depth += 1,
+            b'}' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(at + 1);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// The byte ranges of the inline test modules of masked code
+/// (`#[cfg(test)]` on a `mod name { .. }`). Anything else under a
+/// `cfg(test)` is scanned as production code: stricter, never laxer.
+fn test_modules(code: &str) -> Vec<std::ops::Range<usize>> {
+    let start =
+        Regex::new(r"#\[cfg\(test\)\]\s*(?:pub(?:\([a-z]+\))?\s+)?mod\s+\w+\s*\{").expect("regex");
+    let mut ranges: Vec<std::ops::Range<usize>> = Vec::new();
+    for found in start.find_iter(code) {
+        if ranges.last().is_some_and(|last| found.start() < last.end) {
+            continue;
+        }
+        if let Some(end) = closing_brace(code, found.end() - 1) {
+            ranges.push(found.start()..end);
+        }
+    }
+    ranges
+}
+
+/// `body` without what nested brackets hold: the members of a struct
+/// literal, less the expressions inside them.
+fn top_level(body: &str) -> String {
+    let (mut out, mut depth) = (String::new(), 0usize);
+    for c in body.chars() {
+        match c {
+            '{' | '(' | '[' => depth += 1,
+            '}' | ')' | ']' => depth = depth.saturating_sub(1),
+            c if depth == 0 => out.push(c),
+            _ => {}
+        }
+    }
+    out
+}
+
+/// The bodies of the `<name> { .. }` expressions and patterns of masked
+/// code: every `<name> {` that is not the head of an item (`struct`,
+/// `impl`, `impl .. for`, `enum`, `trait`, `mod`).
+fn struct_bodies<'a>(code: &'a str, name: &str) -> Vec<&'a str> {
+    let head = Regex::new(&format!(r"\b{name}\s*\{{")).expect("regex");
+    let item = Regex::new(r"\b(?:struct|impl|for|enum|trait|mod)\s*$").expect("regex");
+    let mut bodies = Vec::new();
+    for found in head.find_iter(code) {
+        if item.is_match(&code[..found.start()]) {
+            continue;
+        }
+        let end = closing_brace(code, found.end() - 1).unwrap_or(code.len());
+        bodies.push(&code[found.end()..end.saturating_sub(1).max(found.end())]);
+    }
+    bodies
+}
+
+/// What the production code of the Bazel seam file `file` (a name under
+/// `src/bazel_gate/`) does that a seam must not (the module docs of
+/// `bazel_gate` have the rules):
+///
+/// - a `LaneCx { .. }` outside `mod.rs`: the loader builds the one lane
+///   context (`LoadedRoot::lane_cx`), from one read of the root;
+/// - a `GateCx { .. }` that is not a struct update over `GateCx::new`,
+///   which would stop compiling, or silently default, when the context
+///   gains a member; or one that sets no `roots`: `GateCx::new` defaults
+///   it to "one root", and a seam that leaves the root probe's answer
+///   out judges nested roots as one;
+/// - a `RunCx { .. }` with no `..`: the run context gains members too;
+/// - a `Type::Variant` of a type the executor takes whole
+///   ([`SEAM_OPAQUE_TYPES`]);
+/// - a string literal that spells an owned path ([`owned_path_marks`]).
+fn seam_problems(file: &str, src: &str) -> Vec<String> {
+    let lexed = lex(src);
+    let tests = test_modules(&lexed.masked);
+    let in_tests = |at: usize| tests.iter().any(|range| range.contains(&at));
+    let mut code = lexed.masked.clone().into_bytes();
+    for range in &tests {
+        for at in range.clone() {
+            if code[at] != b'\n' {
+                code[at] = b' ';
+            }
+        }
+    }
+    let code = String::from_utf8(code).expect("blanking keeps whole characters");
+    let mut problems = Vec::new();
+    let mut say = |what: String| problems.push(format!("{file}: {what}"));
+
+    if file != "mod.rs" && !struct_bodies(&code, "LaneCx").is_empty() {
+        say("builds or takes apart a `LaneCx { .. }`; take it from `LoadedRoot::lane_cx`".into());
+    }
+    let update = Regex::new(r"\.\.\s*GateCx::new\s*$").expect("regex");
+    let roots = Regex::new(r"(?:^|[\s,])roots\s*(?:[:,]|$)").expect("regex");
+    for body in struct_bodies(&code, "GateCx") {
+        // The call's arguments are nested, so the update ends the body.
+        let members = top_level(body);
+        if !update.is_match(members.trim_end()) {
+            say("a `GateCx { .. }` that is not `GateCx { .., ..GateCx::new(..) }`".into());
+        } else if !roots.is_match(&members) {
+            say(
+                "a `GateCx { .. }` that sets no `roots`: pass the root probe's answer, \
+                 `GateCx::new` defaults it to one root"
+                    .into(),
+            );
+        }
+    }
+    for body in struct_bodies(&code, "RunCx") {
+        if !top_level(body).contains("..") {
+            say("a `RunCx { .. }` literal with no `..`; build it by struct update".into());
+        }
+    }
+    for name in SEAM_OPAQUE_TYPES {
+        let variant = Regex::new(&format!(r"\b{name}\s*::")).expect("regex");
+        if variant.is_match(&code) {
+            say(format!(
+                "names a variant of `{name}`; a seam hands it on whole and never matches on it"
+            ));
+        }
+    }
+    let marks = owned_path_marks();
+    for literal in &lexed.literals {
+        let text = &src[literal.clone()];
+        let owned = marks.iter().find(|mark| text.contains(**mark));
+        if let (Some(mark), false) = (owned, in_tests(literal.start)) {
+            say(format!(
+                "the string literal {text:?} spells the owned path `{mark}`; take it from \
+                 `exec::touched` or `bazel::owned_index`"
+            ));
+        }
+    }
+    problems
+}
+
+/// The scan is only worth its rules if it finds what breaks each of them,
+/// and leaves alone what merely looks like it.
+#[test]
+fn the_seam_scan_fails_on_a_planted_example_of_each_rule() {
+    let caught = |file: &str, src: &str, needle: &str| {
+        let problems = seam_problems(file, src);
+        assert!(
+            problems.iter().any(|problem| problem.contains(needle)),
+            "{src}\nwas not caught for `{needle}`: {problems:?}"
+        );
+    };
+    let clean = |file: &str, src: &str| {
+        let problems = seam_problems(file, src);
+        assert!(problems.is_empty(), "{src}\nis clean, yet: {problems:?}");
+    };
+
+    // 1. A lane context of a seam's own making.
+    let lane = "fn f() { let cx = LaneCx { mode, files, ws, hub, index, run }; }";
+    caught("hosted.rs", lane, "LaneCx");
+    caught(
+        "vex.rs",
+        "fn f(cx: LaneCx<'_>) { let LaneCx { ws, .. } = cx; }",
+        "LaneCx",
+    );
+    clean("mod.rs", lane);
+    clean(
+        "hosted.rs",
+        "fn f(cx: &LaneCx<'_>) -> Option<LaneCx<'_>> { cx.ws; None }",
+    );
+
+    // 2. A gate context that names every member, or forgets the roots.
+    let all = "let cx = GateCx { mode, ws, files, index, run, roots, host, \
+               allow_patch_conflicts, patch_url };";
+    caught("mod.rs", all, "GateCx::new");
+    let no_roots = "let cx = GateCx { host, patch_url: Some(url), ..GateCx::new(mode, ws, f, i) };";
+    caught("vendored.rs", no_roots, "sets no `roots`");
+    // `roots` inside another member's expression is not the member.
+    let hidden = "GateCx { host: pick(Thing { roots }), ..GateCx::new(mode, ws, f, i) }";
+    caught("vendored.rs", hidden, "sets no `roots`");
+    for good in [
+        "GateCx { roots, host, ..GateCx::new(mode, ws, files, index) }",
+        "GateCx {\n    roots: Roots::Probed { probe: &probe, read: models },\n    \
+         ..GateCx::new(mode, ws, files, index)\n}",
+        "GateCx { host, roots, ..GateCx::new(Mode::Hosted, ws, root.files(), index) }",
+    ] {
+        clean(
+            "commands.rs",
+            &format!("fn f() {{ gate(&{good}, lanes, req); }}"),
+        );
+    }
+
+    // 3. A run context that names every member.
+    caught(
+        "agent.rs",
+        "let run = RunCx { read_only: true, dry_run, offline };",
+        "RunCx",
+    );
+    clean(
+        "agent.rs",
+        "let run = RunCx { read_only: true, ..RunCx::default() };",
+    );
+    clean("agent.rs", "let run = RunCx { dry_run, ..run };");
+    clean(
+        "mod.rs",
+        "pub struct RunCx { pub read_only: bool }\nimpl RunCx { fn f() {} }",
+    );
+    clean(
+        "mod.rs",
+        "impl Default for RunCx { fn default() -> Self { todo() } }",
+    );
+
+    // 4. A match on a type the executor takes whole, each of the nine.
+    for name in SEAM_OPAQUE_TYPES {
+        let matched = format!("fn f(x: &Plan) -> u8 {{ match x.y {{ {name}::A => 1, _ => 0 }} }}");
+        caught("hosted.rs", &matched, name);
+        caught("mod.rs", &format!("use model::{name}::*;"), name);
+        // Handing one on whole names no variant.
+        clean(
+            "vex.rs",
+            &format!("fn f(kind: {name}) -> Code {{ Code::of(kind) }}"),
+        );
+    }
+    clean(
+        "vex.rs",
+        "fn f() { let x = LaneAnchor::new(); let y = MyRunKindness::A; }",
+    );
+
+    // 5. An owned path as a literal, in every kind of string.
+    for literal in [
+        "\".socket/bazel/index.json\"",
+        "r\".socket/bazel\"",
+        "r#\"x/.socket/bazel/pins.json\"#",
+        "b\"socket.bazelrc\"",
+        "\"socket-patch.MODULE.bazel\"",
+        "\"read socket_patch.bzl first\"",
+    ] {
+        caught(
+            "commands.rs",
+            &format!("fn f() {{ write({literal}, 1); }}"),
+            "owned path",
+        );
+    }
+    clean(
+        "commands.rs",
+        "fn f() { write(INDEX_PATH, \".socket/vendor\", \".bazelrc\"); }",
+    );
+
+    // What only looks like one of them: comments, strings, test modules.
+    let quiet = "//! A seam never writes `GateCx { mode }` or \".socket/bazel\".\n\
+        /* RunCx { a } /* nested WriteClass::Owned */ LaneCx { b } */\n\
+        fn f() -> &'static str { let _c = '{'; let _q = '\"'; \"RunCx { x } HookKind::Rc\" }\n\
+        #[cfg(test)]\nmod tests {\n    fn g() { let run = RunCx { read_only: true };\n        \
+        put(\".socket/bazel/index.json\", LaneCx { a }); let _ = TagOp::Set; }\n}\n";
+    clean("hosted.rs", quiet);
+    // Production code after a test module is production code.
+    let after = format!("{quiet}fn h() {{ let run = RunCx {{ read_only: true }}; }}\n");
+    caught("hosted.rs", &after, "RunCx");
+    // And `cfg(test)` on anything but an inline module hides nothing.
+    let item = "#[cfg(test)]\nfn g() { let _ = Anchor::Digest; }\n";
+    caught("hosted.rs", item, "Anchor");
+}
+
+#[test]
+fn the_bazel_seam_files_keep_the_seam_rules() {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/bazel_gate");
+    let mut scanned = Vec::new();
+    let mut problems = Vec::new();
+    for entry in std::fs::read_dir(&dir).expect("read src/bazel_gate") {
+        let path = entry.expect("dir entry").path();
+        let name = path
+            .file_name()
+            .expect("a name")
+            .to_string_lossy()
+            .into_owned();
+        // Flat on purpose: a seam in a subdirectory would not be scanned.
+        assert!(
+            !path.is_dir(),
+            "src/bazel_gate/{name} is a directory; scan it too"
+        );
+        if !name.ends_with(".rs") {
+            continue;
+        }
+        let src = std::fs::read_to_string(&path).expect("read a seam file");
+        if name == "mod.rs" {
+            // The scan reads this code: the loader's own lane context is
+            // what it reports for any other file.
+            let elsewhere = seam_problems("other.rs", &src);
+            assert!(
+                elsewhere.iter().any(|problem| problem.contains("LaneCx")),
+                "the scan no longer sees the loader's `LaneCx {{ .. }}`: {elsewhere:?}"
+            );
+        }
+        problems.extend(seam_problems(&name, &src));
+        scanned.push(name);
+    }
+    assert!(
+        scanned.len() >= 8 && scanned.iter().any(|name| name == "mod.rs"),
+        "src/bazel_gate moved? scanned only {scanned:?}"
+    );
+    assert!(
+        problems.is_empty(),
+        "the Bazel seam files break the seam rules (see the module docs of \
+         src/bazel_gate/mod.rs):\n{}",
+        problems.join("\n")
+    );
 }

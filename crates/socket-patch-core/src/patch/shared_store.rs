@@ -67,6 +67,7 @@ use std::path::{Path, PathBuf};
 
 use crate::bazel::output_tree::PathClass;
 use crate::crawlers::bazel_output::Classifier;
+use crate::crawlers::bazel_workspace::tree_classifier;
 
 /// The substring every shared-store refusal carries, so callers and tests
 /// can recognize it without matching the full sentence.
@@ -250,7 +251,7 @@ impl SharedStore {
 pub async fn bazel_tree_of(scope_root: &Path) -> Option<SharedStore> {
     let scope_root = scope_root.to_path_buf();
     tokio::task::spawn_blocking(move || {
-        let class = Classifier::new().classify(&scope_root).class;
+        let class = tree_classifier(&scope_root).classify(&scope_root).class;
         (class != PathClass::Plain).then(|| SharedStore {
             kind: SharedStoreKind::BazelTree(class),
             real_path: std::fs::canonicalize(&scope_root).unwrap_or(scope_root),
@@ -271,7 +272,13 @@ pub async fn bazel_tree_of(scope_root: &Path) -> Option<SharedStore> {
 pub async fn in_bazel_tree(scope_roots: Vec<PathBuf>) -> Vec<bool> {
     let count = scope_roots.len();
     tokio::task::spawn_blocking(move || {
-        let bazel = Classifier::new();
+        // The directories are the matches of one glob, so they share the
+        // Bazel roots above them: the first one's tracked vendor
+        // directories are everyone's.
+        let bazel = match scope_roots.first() {
+            Some(first) => tree_classifier(first),
+            None => Classifier::new(),
+        };
         let in_tree = |root: &PathBuf| bazel.classify(root).class != PathClass::Plain;
         scope_roots.iter().map(in_tree).collect()
     })
@@ -288,7 +295,7 @@ pub async fn shared_store_of(
 ) -> Option<SharedStore> {
     let pkg_path = pkg_path.to_path_buf();
     tokio::task::spawn_blocking(move || {
-        shared_store_of_blocking(scope, &Classifier::new(), &pkg_path)
+        shared_store_of_blocking(scope, &tree_classifier(&pkg_path), &pkg_path)
     })
     .await
     .ok()
@@ -318,7 +325,7 @@ pub async fn shared_store_of_patch_dirs<'a>(
     tokio::task::spawn_blocking(move || {
         // One classifier for the package: its directories share ancestors,
         // which are then judged once.
-        let bazel = Classifier::new();
+        let bazel = tree_classifier(&pkg_path);
         let mut seen = std::collections::HashSet::new();
         let dirs = std::iter::once(pkg_path.clone()).chain(keys.iter().filter_map(|key| {
             let mut dir = pkg_path.join(key).parent()?.to_path_buf();

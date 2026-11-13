@@ -132,7 +132,7 @@ fn skipped_members_of(root: &Path) -> Vec<PathBuf> {
     let walkable = |entry: &ListedEntry| {
         entry.file_type.is_some_and(|ft| ft.is_dir()) && entry.name_str != "node_modules"
     };
-    let bazel = BazelTrees::new();
+    let bazel = super::bazel_workspace::tree_classifier(root);
     let mut roots = Vec::new();
     // A leading `!` is a negation in some readings and part of an extglob
     // or a literal name in others; the dirs it can reach are walked either
@@ -3584,7 +3584,7 @@ impl NpmCrawler {
         // Dirs are numbered in visit order, level by level, so each dir's
         // children occupy a contiguous range of the next level.
         let mut nodes: Vec<WalkedDir> = Vec::new();
-        let bazel = BazelTrees::new();
+        let bazel = super::bazel_workspace::tree_classifier(dir);
         // The scan root itself is exempt, as for a tagged cache directory.
         let bazel_trees = bazel_trees_listed(&bazel, dir, &listing);
         let mut level = Self::workspace_children(dir, listing);

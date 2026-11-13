@@ -1079,6 +1079,39 @@ defect, guarded by the `#[ignore]`d gap pin
 `crates/socket-patch-core/tests/crawler_monorepo_gaps.rs` (gem is the representative; python/go/composer
 share the limitation).
 
+**Bazel workspaces.** A directory that holds a Bazel workspace file (`MODULE.bazel`, `REPO.bazel`,
+`WORKSPACE.bazel` or `WORKSPACE`; a directory of that name does not count) is a project when a run
+is started in it, also when it holds no lockfile and no manifest that a native tool knows: the
+workspace file is then its one marker for the socket.yml path filters. A bare hosted or vendored
+`scan` from such a root therefore scans the root as well as the native project directories below it,
+where earlier releases scanned only those. A directory that has a lockfile or a manifest keeps
+exactly the markers it had. A Bazel root below `--cwd` that has neither is not searched for: start
+the run in it.
+
+Nothing inside a tree that Bazel owns is a project: an output base, an entry of the repository
+cache or of the repo contents cache, and a vendor directory. A tree is known by the marker Bazel
+writes into it. A vendor directory is also known by a `--vendor_dir` line, on any command and under
+any `--config`, in the `.bazelrc` of a Bazel root at or above the directory the search starts in, or
+in an rc file that `.bazelrc` imports inside the repository; so one that `bazel vendor` has not
+filled yet, or whose marker git does not track, is left out too. Only a value that names a directory
+below the workspace root counts: the root itself (which the empty value names), a directory outside
+it and an absolute path are not taken for a vendor directory by the flag alone. Each directory left
+out is reported with `bazel_workspace_output_tree_skipped`.
+
+*In-memory engine.* Path selection (`selectHostedScanPaths`) names no root inside such a tree and
+streams no file from one. For every Bazel root at or above a project root it also streams the
+workspace files, `WORKSPACE.bzlmod`, `.bazelrc` and everything under `.socket/bazel/`. The session
+reads them and leaves alone every ecosystem whose packages a Bazel ruleset builds, or may build, in
+a project: those packages are not looked up, none of their lockfiles is rewritten, and one
+`bazel_workspace_unsupported_in_memory` warning for the project names the ecosystems and the number
+of packages. "May build" covers everything the streamed files do not decide: an `include()` in
+`MODULE.bazel`, a `.bzl` macro that a `WORKSPACE` file calls, a lock file the ruleset reads that was
+not streamed, a workspace file that is a symbolic link. A workspace whose files declare no ruleset
+for an ecosystem leaves that ecosystem to the engine, as before. A session also leaves out a root
+inside a vendor directory that only a streamed `.bazelrc` names; a root the caller named there is
+reported with `bazel_workspace_output_tree_skipped`. A repository with no Bazel workspace file is
+selected and scanned exactly as before.
+
 **Deeply nested transitive dependencies are fully supported.** The npm crawler recurses `node_modules`
 at unbounded depth, and `apply` is path-agnostic — it patches a package by PURL against the manifest
 regardless of how deep in the dependency tree it was installed, so a deeply-nested transitive dependency
@@ -1102,6 +1135,8 @@ socket-patch creates `.socket/` and everything under it itself and never writes 
 - **Ledgers**: the vendored ledger (`.socket/vendor/state.json`) and the pre-v5 hosted redirect ledger are refused when `.socket` itself, a directory below it or the ledger file is a link (`vendor_dir_symlink_unsupported` for the vendored flows), so a hosted run that still has to update a pre-v5 redirect ledger fails under a linked `.socket`.
 - **Agent-mode apply and rollback outside the install tree**: `apply` and `rollback` (dry run included) refuse a package whose written directories resolve outside the install tree they were found in: a Composer path repository (`vendor/<ns>/<name>` linked to first-party source), a `flit install --symlink` / editable-by-link package, or a package directory a package manager links into `site-packages` from its own prefix (Homebrew's Cellar, a Nix store path). The per-package error carries `outside the install tree`. For `apply` the remedy is to patch that source directly or install the package as a copy; for `rollback` it is to restore that source from version control, since socket-patch does not write into a tree it does not own.
 
+- **Under a Bazel root**: what socket-patch writes for a Bazel build is anchored at the Bazel root (the directory of the workspace file), not at the project, because Bazel reads these files there and nowhere else. The directory `<Bazel root>/.socket/bazel/` is socket-patch's own. Its layout is fixed: `index.json`, the record of every other file and edit listed here, from which each is undone byte for byte; `apply.lock`, which exists only while a command holds it; and, reserved for the releases that enable the first lane that needs them, `socket.bazelrc`, `socket-patch.MODULE.bazel`, `socket_patch.bzl`, `pins.json`, `patches/<uuid>/<name>.patch` and `BUILD.bazel`. This release writes `index.json` and the lock and none of the others. Outside `.socket/`, socket-patch edits four files of the user's at a Bazel root and no other: `.bazelignore`, where it adds and removes whole lines that keep a `.socket` tree out of `//...` (`bazel_workspace_ignore_line_added`); and, reserved in the same way, one marked unit each in `.bazelrc`, in `MODULE.bazel` and in one `WORKSPACE` file, which makes Bazel read the owned file beside it (`bazel_workspace_hook_added`). No release writes a hook yet. Every one of these writes is staged and renamed into place under the root's own lock, and is refused when `.bazelignore`, `.socket`, `.socket/bazel` or the index is reached through a link, like any other linked level. `.socket/bazel` is never added to `.bazelignore`.
+
 Not covered: the agent-mode blob cache and manifest are checked from `.socket` down, so a `.socket` that is itself a link still redirects those writes (deciding that at lock time is deferred).
 
 ### Reads bounded to the repository root
@@ -1115,6 +1150,7 @@ VEX discovery, the lock inventory, hosted mode and vendored mode never read a PR
 - **NuGet parent configs** (an upward lookup: without a checkout, as before): a `nuget.config` in a directory above the root is never read. Vendoring refuses (`… also merges <path>, which is outside the repository root …`) and hosted mode skips each NuGet dep with `redirect_nuget_inherited_config_outside_root`, writing nothing for it.
 - **Relative and absolute references read through the project view** (yarn `file:` / `portal:` / `link:` copies, include chains, any `../` path a lockfile names) and the hosted upstream restore's staged reads: outside the root they read as missing, and the restore refuses.
 - **Upward lookups** (a workspace root or settings file the package manager searches the project's ancestors for): inside a git checkout none reads above the repository root. When one of the files the lookup would read exists above it (a stat, never a read, and never in the home directory or above), the tool may honor it, so writers refuse and readers withhold: a lockless npm-family member or a member's own npm/Bun/vlt lock under a `package.json`, `pnpm-workspace.yaml` or `vlt.json` above (`redirect_workspace_lockfile_elsewhere` in hosted mode, `vendor_lockfile_missing` in vendored mode, unattested in discovery); the nearest `pnpm-workspace.yaml` above (but never one in the home directory or above it) counts as governing (`redirect_pnpm_settings_elsewhere`, `vendor_pnpm_settings_elsewhere`, and a `gitBranchLockfile` that may be on); a uv workspace `pyproject.toml` above (`redirect_workspace_lockfile_elsewhere`, `pypi_uv_workspace_unsupported`) or uv settings above (`pypi_uv_ancestor_settings`; hosted `redirect_uv_project_unsupported` / `redirect_uv_script_unsupported` / `redirect_uv_lock_unsupported`); a `Cargo.toml` above (`cargo_manifest_not_workspace_root`) or a `.cargo/config(.toml)` above (`user_authored_patch_entry` in vendored mode; hosted mode refuses the run with `redirect_cargo_config_outside_root`; agent-mode `apply` and `apply --check` refuse a run with Cargo patches with `cargo_config_outside_root`, naming the file, since it may replace crates.io while apply would patch the registry cache, and the cargo build-cache invalidation warns `cargo_build_cache_stale` that a `build.target-dir` / `build.build-dir` set there was not read); a `.yarnrc.yml` above (its `nodeLinker` reads as unknown, so PnP; no `pnpmStoreFolder` store is admitted; the Berry upstream restore refuses the registry lookup); a yarn classic `.yarnrc` / `.npmrc` above, or a workspace member linked from outside the repository (`redirect_yarn_classic_offline_mirror`, naming the file or member); a `pom.xml`, Gradle settings or `build.sbt` above (`not_build_root`). Gradle settings above are not analysed by the crawler, an `injectEnvironmentFiles` dotenv file outside the repository (other than beside the home rc) injects nothing, a cargo `[patch]` path outside it reads as unknown (`user_authored_patch_entry`), and agent mode's build-cache invalidation stays inside it. Without a git checkout every upward lookup walks on as before.
+- **Bazel workspace files** (an upward lookup: without a checkout, as before): every directory from the project up to the repository root that holds a workspace file is a Bazel root of the project, and its files are read. A workspace file above the repository root is only noticed (a stat, never a read). Where a second sign of Bazel sits beside it (`.bazelversion`, `.bazelrc`, `MODULE.bazel.lock` or a `bazel-*` link), somebody builds there, and which lock files that workspace reads is not known, so nothing may be assumed about them ([Bazel builds](#bazel-builds) has the code, `bazel_workspace_above_repo`, and its status). Nothing above the repository root is written either: not a `.bazelignore` line, not a hook unit in `.bazelrc`, `MODULE.bazel` or a `WORKSPACE` file, and not `.socket/bazel/`. A project whose `.socket` tree would need a line in the `.bazelignore` of a root outside its repository is refused instead (`bazel_root_outside_repository`), and a line that somebody added there by hand does not lift the refusal, because the file is not read.
 - **Vendored ownership**: writers, reverters and the GC claim a lockfile reference only when it is root-anchored into THIS project's `.socket/vendor/` (`./.socket/vendor/…`, or `../` from a file below the root back to exactly the root). A sibling checkout's `../.socket/vendor/<eco>/<uuid>/…`, even for the same patch uuid, is never rewritten, reverted or deleted; the revert leaves it with `vendor_lock_entry_drifted` and keeps the artifact. The one exception is pnpm <= 8, which records override specifiers as machine-absolute paths itself: an absolute `…/.socket/vendor/npm/<uuid>/<leaf>` naming the entry's own uuid and leaf is still the entry's.
 
 ## Vendor command contract
@@ -3161,21 +3197,21 @@ was written", and never contains a grant token.
 
 | Code | Status | Level | When | Remedy |
 |---|---|---|---|---|
-| `bazel_workspace_detected` | planned | `info` | A Bazel workspace with at least one recognized ruleset. Names the root, the Bazel release line and its support tier, the dependency system (Bzlmod or WORKSPACE) and each governed ecosystem with its ruleset and lock. | - |
+| `bazel_workspace_detected` | planned | `info` | A Bazel workspace with at least one recognized ruleset. Names the root, the Bazel release line and its support tier, the dependency system (Bzlmod, WORKSPACE, both, or each one the workspace may run under where that is not decided) and each recognized declaration: the ruleset, the ecosystem and the lock Bazel builds from; a declaration Bazel does not build from, with the reason; a shape that is recognized and not patched. | - |
 | `bazel_workspace_out_of_scope` | planned | `info` | The workspace has Bazel modules, source archives or hand-written pins. Socket patches cover registry packages; these dependencies are counted and not examined. Also rides the plan of a patch when a hand-written pin of the same ecosystem names no lock: the pin is left as it is while the hubs that resolve the package are patched, and `vex` makes no statement for the package. | - |
 | `bazel_workspace_unreadable` | planned | `warn` | A Bazel file exists and cannot be read or parsed. | Names the file and the construct to fix. |
 | `bazel_workspace_version_unsupported` | planned | `warn` | Bazel 4 or older, or Bazel 5 with Bzlmod. | Upgrade Bazel, or patch outside Bazel. |
 | `bazel_workspace_version_untested` | planned | `info` | The Bazel or ruleset version is floating, unknown or newer than the releases socket-patch was tested with. | Pin `.bazelversion` to a tested release. |
 | `bazel_workspace_above_repo` | planned | `warn` | A Bazel workspace file exists above the repository root, where socket-patch does not read. | Where nobody builds from that directory, remove the file and any other Bazel workspace file beside it; or patch from a project that is not a repository nested in the workspace. Where somebody builds there, a project in the nested repository has no remedy in this release: nothing above the repository that holds the project is read, wherever the command is started. |
-| `bazel_workspace_output_tree_skipped` | active | `info` | The search for project directories left out a directory that is a Bazel output base, cache or vendor directory. A bare hosted or vendored scan reports the directories below `--cwd` that it did not search, in one entry; a scan with a PATH pattern prints one `Note:` for the matches it did not scan. Each names the first ten directories and counts the rest. In the in-memory engine the code is the `reason` of a marker file that is ignored inside such a directory. The npm and NuGet crawler walks leave such a directory out too, with no message. | - |
+| `bazel_workspace_output_tree_skipped` | active | `info` | The search for project directories left out a directory that is a Bazel output base, cache or vendor directory. A bare hosted or vendored scan reports the directories below `--cwd` that it did not search, in one entry; a scan with a PATH pattern prints one `Note:` for the matches it did not scan. Each names the first ten directories and counts the rest. A vendor directory is known by Bazel's marker, or by a `--vendor_dir` line in a tracked rc file of a Bazel root at or above the directory the search starts in. In the in-memory engine the code is the `reason` of a marker file, or of a named root, that path selection ignores inside such a directory, and a session `warnings[]` entry for a root the caller named inside one. The npm and NuGet crawler walks leave such a directory out too, with no message. | - |
 | `bazel_workspace_inside_output_tree` | active | `warn` | `apply` ran with its working directory inside a Bazel output tree (not given by `--cwd`). Nothing was patched; the exit code stays 0. `apply --check` is not covered: it is refused with `bazel_agent_output_tree` wherever it runs. The run attests nothing, so an OpenVEX document that an earlier run left at `--vex` is removed (`vex_stale_doc_removed`); `--dry-run` leaves it. | Run from the workspace root, or use hosted mode. |
-| `bazel_workspace_rc_unread` | planned | `info` | An rc file import could not be followed, or a `tools/bazel` wrapper exists, so flags may apply that socket-patch cannot see. Names the path. | - |
+| `bazel_workspace_rc_unread` | planned | `info` | An rc file import could not be followed, or a `tools/bazel` wrapper exists, so flags may apply that socket-patch cannot see. Names the path. It is a note for an optional file (`try-import`) and for one Bazel is sure to load (`import`) alike: the note refuses nothing, and a write or a VEX statement that depends on a flag the file may set is refused or withheld with a detail of its own (`rc_import_unreadable`). | - |
 | `bazel_workspace_ignore_line_added` | active | `info` | A line was added to `.bazelignore` so that a `.socket` tree stays out of `//...`. | Commit `.bazelignore`. |
 | `bazel_workspace_ignore_line_needed` | active | `warn` | A `.socket` tree is visible to `//...`, or a new one would be, and the `.bazelignore` line that hides it cannot be written. A tree that is already there is reported and the run goes on. A new tree is not created: this is then the code of the refusal, unless a token names the case (`bazel_agent_go_unsupported` and `vendor_bazel_ruleset_unsupported` below). Also reported, with the run going on: for a line of an existing `.bazelignore` that starts with `/`, which socket-patch names and never edits; for a recorded line that `rollback` or `vendor --revert` could not take out again; and for a stray Bazel workspace file above a project that is in no repository, where the tree is created. | Add the printed lines to the printed file. |
 | `bazel_workspace_hook_added` | planned | `info` | One marked unit was added to a file of the user's (`.bazelrc`, `MODULE.bazel` or a `WORKSPACE` file) so that Bazel reads an owned file under `.socket/bazel/`. Names the file. | Commit the file and `.socket/bazel/`. |
 | `bazel_workspace_hook_needed` | planned | `warn` | Owned wiring under `.socket/bazel/` exists, and the unit that makes Bazel read it is missing from the user's file or cannot be written there. The wiring is off: the build does not get the patch through it. | `socket-patch repair`, or add the printed lines to the printed file. |
 | `bazel_workspace_prune_skipped` | planned | `warn` | `scan --prune` could not tell what a lock that Bazel reads resolves, so the records of that ecosystem were kept. | - |
-| `bazel_workspace_unsupported_in_memory` | planned | - | A warning of the in-memory hosted engine, which prints no line for a human and so has no level: it met an ecosystem that a Bazel ruleset governs and left it alone. | Run `socket-patch scan --mode hosted` from a checkout. |
+| `bazel_workspace_unsupported_in_memory` | active | - | A warning of the in-memory hosted engine, which prints no line for a human and so has no level: in one project it met packages of an ecosystem that a Bazel ruleset builds, or may build, and left them alone. Their patches are not looked up and none of their lockfiles is rewritten. One entry per project, with `projectRoot`; it names the workspace file, the ecosystems and the number of packages. "May build" includes every case the files streamed to the engine do not decide ([discovery model](#monorepo--multi-project-discovery-model)). | Run `socket-patch scan --mode hosted` from a checkout. |
 
 ### Agent mode
 
@@ -3229,6 +3265,16 @@ does lists it here as in use.
 | `owner` | `decision` | A decision the socket-patch maintainers have not taken; `decision` is its number. |
 | `none` | `proof` | Nothing: no committed state builds the patched package. No refusal is of this kind in this release. |
 
+### `details.bazel`
+
+An event about a package that a Bazel ruleset governs will carry what Bazel makes of the
+patch in `details.bazel`. It is always an object, never a bare string, so that members can
+be added (MINOR): `apply --check` on a governed package that the build does not consume
+prints `{ "state": "not_consumed" }`, and `state` is `consumed` where a committed pin
+proves that it does. The other members are reserved with the lanes that fill them
+(`ruleset`, `lane`, `lock`, `anchor`). The field is additive and reserved: no release emits
+it yet, and the release that first does lists it here as in use.
+
 ### Advisories
 
 | Code | Status | Level | When |
@@ -3243,6 +3289,8 @@ does lists it here as in use.
 | `redirect_bazel_token_surface` | planned | `info` | Once per run: the pinned URL, grant token included, is repeated outside the lock that was edited: in the `maven_url=` tags of the BUILD file rules_jvm_external generates, or in the refreshed `MODULE.bazel.lock` for a NuGet pin. |
 | `redirect_bazel_pin_erased` | planned | `warn` | A recorded pin is gone from its lock (a ruleset's pin or update command, or a package-manager install, rewrote it). Run `scan` again. |
 | `redirect_bazel_side_file_skipped` | planned | `info` | A lock of the same ecosystem that no hub reads (a `package-lock.json` or `yarn.lock` beside the governed `pnpm-lock.yaml`) was left as found, and no `.npmrc` was created. Names the file. |
+| `redirect_bazel_revert_incomplete` | planned | `warn` | `rollback` or `remove` could not undo a pin and undid nothing of it: a file of the user's still carries the pin in a form the record does not match (an edit beside it, a formatter run, a second pin), an owned file is not what the index records, or the row is of a kind this release cannot restore. Nothing that the file still names was deleted, so the build keeps passing with the patch in it, and the run goes on with the other pins. Names the file. Restore the file from version control (`git checkout -- <file>`), then run the command again. |
+| `vendor_bazel_revert_incomplete` | planned | `warn` | The same, in vendored mode: the vendored artifact that the pin names is kept too. |
 
 ### Withheld VEX statements
 
@@ -3273,7 +3321,7 @@ it is `active`, and is as stable as a code.
 | `bazel_line_unknown` | No Bazel version is declared and the hub is declared only in WORKSPACE files; commit `.bazelversion`. Also: the workspace was read for another project than the one asked about, where another `.bazelversion` may apply. |
 | `platform_unverified` | A lane that writes a directory tree has not been run on this operating system. |
 | `lock_path` | The lock a hub names has a file name the rewriter does not handle (for example `Cargo.Bazel.lock`). Also, for rules_jvm_external and rules_csharp: the lock label is a plain string that names no file of the main repository. |
-| `label_not_literal` | A hub name, a lock label or a value to edit is computed, not a plain string literal. Also: a hub rule is used where no declaration is read (rules_js, rules_nodejs, rules_ruby); a scan for a lock check could not read a file or an argument; a crate_universe label names no file of the main repository, or the tags of its extension cannot all be read; or a ruleset is present and no hub of it could be read. |
+| `label_not_literal` | A hub name, a lock label or a value to edit is computed, not a plain string literal. Also: a hub rule is used where no declaration is read (rules_js, rules_nodejs, rules_ruby); a scan for a lock check could not read a file or an argument; a crate_universe label names no file of the main repository, or the tags of its extension cannot all be read; `crates_repository` is used in a `.bzl` file that no model reads, or a `.bzl` file names it and cannot be parsed; or a ruleset is used in a way that was not followed to a hub (the detail names the statement; hubs of the same ruleset may have been read beside it). |
 | `rc_import_unreadable` | An rc file import could not be followed, so a flag that changes the answer may be set. |
 | `workspace_unreadable` | A Bazel file that can declare a hub exists and cannot be read or parsed, or Bazel itself stops on the tracked rc flags, so which lock Bazel reads is not known. |
 | `workspace_dead` | The declaration is in a WORKSPACE file that this Bazel configuration does not evaluate. |
@@ -3328,7 +3376,7 @@ it is `active`, and is as stable as a code.
 | `crates_repository_unpinned` | WORKSPACE `crates_repository` without a `lockfile`. |
 | `from_specs` | A `crate.from_specs` hub. |
 | `cargo_raze` | cargo-raze. |
-| `crates_vendor` | rules_rust `crates_vendor`, or a hub whose lock a `crates_vendor` target names. Also: a `crates_vendor` target could not be read, or the scan of BUILD files for one did not finish. |
+| `crates_vendor` | rules_rust `crates_vendor`, or a hub whose lock a `crates_vendor` target names. Also: a `crates_vendor` target could not be read, or the scan of BUILD files for one did not finish: more than 512 BUILD and .bzl files name `crates_vendor` or `crates_repository`. |
 | `crate_name_collision` | Vendored rules_rs: another source-less entry or `[patch]` path already exists for the crate name. |
 | `facts_cold` | Hosted rules_rs: the committed `MODULE.bazel.lock` does not hold the fact for the crate. |
 | `token_in_repo_name` | The pin would put the grant token in a Bazel repository name. |
