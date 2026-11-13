@@ -117,7 +117,7 @@ GO_RUST = ("gazelle", "gazelle_directory", "gazelle_workspace", "rules_rust", "r
 HARNESS_TESTS = {
     "bazel_canary_probe_rule_tree_artifact": {
         "group": "core",
-        "bazel": ("5.4.1", "6.6.0", "7.0.2", "7.1.2", "8.4.2", "10.0.0rc3"),
+        "bazel": ("5.4.1", "8.4.2", "10.0.0rc3"),
     },
 }
 

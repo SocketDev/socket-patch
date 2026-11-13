@@ -24,6 +24,13 @@
 //! them. Any other cell on a Bazel version the manifest does not list
 //! cannot run, which is a failure where the cell is required.
 //!
+//! Before that, `Cell::open` holds a test of the toy group to its row in
+//! the group's `MATRIX.json` ([`unclaimed`]): on a Bazel release the group
+//! has a cell for, a test runs only where its row lists the release, and
+//! reports `SKIP (n/a)` elsewhere. A prefix run (`--ignored bazel_core_`)
+//! therefore leaves a `ran` report for claimed (test, Bazel) pairs only;
+//! to run a test on another release, add the release to its row first.
+//!
 //! No toy fixture has a `MODULE.bazel.lock` at its root: every cell makes
 //! its lock in the test. For 6.6.0, 7.0.2 and 7.1.2 that is the only way.
 //! Their locks name the registry they were made against
@@ -187,6 +194,79 @@ pub fn file_url(dir: &Path) -> Option<String> {
 /// The fixture workspace of a Bazel line: `core/<system>/e<major>`.
 pub fn fixture_of(version: &Version, system: System) -> String {
     format!("core/{}/e{}", system.name(), version.major)
+}
+
+/// Every `MATRIX.json` of the toy group, by its path under
+/// `fixtures/bazel` (with `/`), sorted: `core/MATRIX.json`, and each file
+/// of its shape that lists other tests on the toy fixture
+/// (`core/guard/MATRIX.json`).
+pub fn matrices() -> Vec<(String, serde_json::Value)> {
+    fn walk(dir: &Path, rel: &str, found: &mut Vec<(String, serde_json::Value)>) {
+        let entries =
+            std::fs::read_dir(dir).unwrap_or_else(|e| panic!("read {}: {e}", dir.display()));
+        for entry in entries {
+            let entry = entry.expect("a fixture entry");
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let rel = format!("{rel}/{name}");
+            if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                walk(&entry.path(), &rel, found);
+            } else if name == "MATRIX.json" {
+                let bytes =
+                    std::fs::read(entry.path()).unwrap_or_else(|e| panic!("read {rel}: {e}"));
+                let matrix =
+                    serde_json::from_slice(&bytes).unwrap_or_else(|e| panic!("{rel}: {e}"));
+                found.push((rel, matrix));
+            }
+        }
+    }
+    let mut found = Vec::new();
+    walk(&fixtures_root().join("core"), "core", &mut found);
+    found.sort_by(|a, b| a.0.cmp(&b.0));
+    found
+}
+
+/// Why `test` does not run on the Bazel release `version`, going by its
+/// row in the toy group's `matrices` ([`matrices`]): `Some` when a matrix
+/// lists the test, no row of it names the release, and the group has a
+/// cell on the release. Such a test is not applicable there (`SKIP (n/a)`,
+/// also where the cell is required): the planner runs a test only where
+/// its row claims it, and a prefix run must leave no `ran` report for a
+/// pair nobody claims.
+///
+/// `None` = the claims do not decline the test: its row lists the release,
+/// or no toy matrix lists the test (a canary, a test of another group), or
+/// no toy matrix has a cell on the release. On such a release there is no
+/// claim to hold a test to, and [`gate`] still fails a required cell that
+/// cannot run instead of letting it pass having run nothing.
+pub fn unclaimed(
+    matrices: &[(String, serde_json::Value)],
+    test: &str,
+    version: &str,
+) -> Option<String> {
+    let rows: Vec<(&str, Vec<&str>)> = matrices
+        .iter()
+        .filter_map(|(name, matrix)| {
+            let row = matrix["tests"].get(test)?;
+            let releases = row["bazel"].as_array().into_iter().flatten();
+            Some((name.as_str(), releases.filter_map(|r| r.as_str()).collect()))
+        })
+        .collect();
+    let (name, claimed) = rows.first()?;
+    if rows.iter().any(|(_, claimed)| claimed.contains(&version)) {
+        return None;
+    }
+    let has_cell = |matrix: &serde_json::Value| {
+        let mut cells = matrix["cells"].as_array().into_iter().flatten();
+        cells.any(|cell| cell["bazel"].as_str() == Some(version))
+    };
+    if !matrices.iter().any(|(_, matrix)| has_cell(matrix)) {
+        return None;
+    }
+    Some(format!(
+        "{name} claims {test} on Bazel {} and not on {version}: a test of the toy group runs on \
+         a release of its matrices only where its row lists the release",
+        claimed.join(", ")
+    ))
 }
 
 /// What a toy cell takes from the committed registry subset
