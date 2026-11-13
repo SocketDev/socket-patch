@@ -407,7 +407,10 @@ fn undetermined(gaps: &[Gap]) -> Refusal {
 /// The variant of the probe decides, never a comparison of root paths:
 /// two spellings of one directory are one root, and a mismatch must not
 /// send a governed project down the path that asks about another.
-fn governing(cx: &GateCx<'_>, req: &PatchRequest<'_>) -> Result<Governance, Refusal> {
+///
+/// Public for `attest`, which asks the same question at discovery: a
+/// second reading of the roots there could attest what this one refuses.
+pub fn governing(cx: &GateCx<'_>, req: &PatchRequest<'_>) -> Result<Governance, Refusal> {
     let (probe, read) = match cx.roots {
         // One root: its model answers, and `governance` holds it to the
         // project it was read for (ROUTED R-090).
@@ -574,7 +577,8 @@ fn dual_mode_lift() -> Lift {
 }
 
 /// Obligation 3: the hubs that are live for the project, or why none is.
-fn live_hubs(ws: &BazelWorkspace, governed: Governance) -> Result<Vec<HubId>, Refusal> {
+/// Public for `attest`, which withholds for the reason a write is refused.
+pub fn live_hubs(ws: &BazelWorkspace, governed: Governance) -> Result<Vec<HubId>, Refusal> {
     match governed {
         Governance::Governed(hubs) if !hubs.is_empty() => Ok(hubs),
         Governance::NotGoverned | Governance::Governed(_) => Err(undetermined(&[])),
