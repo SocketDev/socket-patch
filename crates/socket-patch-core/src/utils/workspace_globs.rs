@@ -973,6 +973,8 @@ impl ExtglobMatcher {
 
     /// One more call, `cost` steps, if the bounds allow it.
     fn enter(&mut self, cost: usize) -> bool {
+        #[cfg(test)]
+        group_calls::count();
         if self.gave_up || self.depth >= MAX_GROUP_DEPTH || self.steps < cost {
             self.gave_up = true;
             return false;
@@ -1090,6 +1092,54 @@ impl ExtglobMatcher {
         self.depth -= 1;
         self.memo.insert(key, matched);
         matched
+    }
+}
+
+/// The calls the group matcher asked for on this thread
+/// ([`ExtglobMatcher::enter`], allowed or refused), and the most a test
+/// lets it ask for.
+///
+/// A test of a pattern that is costly to match bounds the matcher by this
+/// count and not by a clock: the count is the same on a busy machine as on
+/// an idle one, and a time limit is not. Past the limit the matcher
+/// panics, so one that has lost its step bound fails its test at once,
+/// where it would otherwise run for hours.
+#[cfg(test)]
+mod group_calls {
+    use std::cell::Cell;
+
+    thread_local! {
+        static MADE: Cell<usize> = const { Cell::new(0) };
+        static LIMIT: Cell<usize> = const { Cell::new(usize::MAX) };
+    }
+
+    /// One more call.
+    pub(super) fn count() {
+        let made = MADE.with(|made| {
+            made.set(made.get().saturating_add(1));
+            made.get()
+        });
+        let limit = LIMIT.with(Cell::get);
+        assert!(
+            made <= limit,
+            "the group matcher made more than the {limit} calls it was allowed"
+        );
+    }
+
+    /// `decide`'s answer, for which the matcher may make `limit` calls at
+    /// most. No limit holds on this thread afterwards, whether `decide`
+    /// returned or the matcher went past it.
+    pub(super) fn within<T>(limit: usize, decide: impl FnOnce() -> T) -> T {
+        struct NoLimit;
+        impl Drop for NoLimit {
+            fn drop(&mut self) {
+                LIMIT.with(|limit| limit.set(usize::MAX));
+            }
+        }
+        MADE.with(|made| made.set(0));
+        LIMIT.with(|allowed| allowed.set(limit));
+        let _after = NoLimit;
+        decide()
     }
 }
 
@@ -2133,32 +2183,73 @@ mod tests {
     /// it reads as unreadable, which lists every directory and, as a `!`
     /// pattern, excludes none. Sixty `*(a|aa)` groups against one
     /// 255-character directory name take the matcher seconds, and twelve
-    /// two-way brace sets in front make that 4,096 times over.
+    /// two-way brace sets in front make that a thousand times over: every
+    /// alternative leads the groups with a run of `a`, so every one is as
+    /// costly as the first.
+    ///
+    /// The cost is held to a count of the matcher's calls and to no clock
+    /// ([`group_calls`]). The matching the bound allows takes seconds in a
+    /// test build and more than a minute on a busy machine, so a time
+    /// limit failed runs in which the matcher had done nothing wrong.
     #[test]
     fn a_group_pattern_past_the_step_bound_fails_closed() {
-        let costly = format!("build/{}{}x", "{a,b}".repeat(12), "*(a|aa)".repeat(60));
-        let rel = vec!["build".to_string(), "a".repeat(255)];
-        let extglob_dialects = WorkspacesDialect::ALL
-            .into_iter()
-            .filter(|dialect| dialect.extglob);
-        let answers = decided(move || {
-            let mut answers = Vec::new();
-            for dialect in extglob_dialects {
-                let listed = workspaces_include_as(std::slice::from_ref(&costly), &rel, dialect);
-                let excluding = ["build/*".to_string(), format!("!{costly}")];
-                let kept = workspaces_include_as(&excluding, &rel, dialect);
-                answers.push((dialect, listed, kept));
-            }
-            answers
-        });
-        assert_eq!(answers.len(), 5);
-        for (dialect, listed, kept) in answers {
-            assert!(listed, "{dialect:?}: an unreadable pattern lists");
-            assert!(kept, "{dialect:?}: an unreadable `!` pattern excludes none");
+        let groups = "*(a|aa)".repeat(60);
+        let costly = format!("build/{}{groups}x", "{a,aa}".repeat(12));
+        let name = "a".repeat(255);
+        let rel = vec!["build".to_string(), name.clone()];
+        // The expansion stops at a mebibyte of text. What it gives is
+        // still a thousand alternatives, and each is a costly one.
+        let alternatives = expand_braces(&costly);
+        assert!(alternatives.len() > 1000, "{}", alternatives.len());
+        let tail = format!("{groups}x");
+        for alternative in &alternatives {
+            let lead = alternative.strip_prefix("build/");
+            let lead = lead.and_then(|rest| rest.strip_suffix(&tail));
+            let run_of_a = |lead: &str| lead.len() >= 12 && lead.chars().all(|c| c == 'a');
+            assert!(lead.is_some_and(run_of_a), "{alternative}");
         }
+
+        // What one reading of the pattern may cost, in calls of the group
+        // matcher: the calls the step bound allows, each of which takes a
+        // step at least, and the ones it refuses while the loops that were
+        // running come to their end. A matcher with no bound, or with a
+        // bound for each brace alternative, asks for thousands of times as
+        // many and is stopped here.
+        let ceiling = 2 * MAX_GROUP_STEPS;
+
+        // It is the step bound that refuses the pattern, not its size and
+        // not the depth of the matching: one alternative's component by
+        // itself leaves the matcher fewer steps than a call may cost.
+        let component: Vec<char> = format!("{}{tail}", "a".repeat(12)).chars().collect();
+        let long_name: Vec<char> = name.chars().collect();
+        let steps = std::cell::Cell::new(MAX_GROUP_STEPS);
+        let alone = group_calls::within(ceiling, || {
+            component_matches(&component, &long_name, true, false, &steps)
+        });
+        assert_eq!(alone, None);
+        let left = steps.get();
+        assert!(left <= component.len() / 8, "{left} steps were left");
+
+        // Each call below reads the costly pattern once at most.
+        let mut dialects = 0;
+        for dialect in WorkspacesDialect::ALL {
+            if !dialect.extglob {
+                continue;
+            }
+            let listed = group_calls::within(ceiling, || {
+                workspaces_include_as(std::slice::from_ref(&costly), &rel, dialect)
+            });
+            assert!(listed, "{dialect:?}: an unreadable pattern lists");
+            let excluding = ["build/*".to_string(), format!("!{costly}")];
+            let kept =
+                group_calls::within(ceiling, || workspaces_include_as(&excluding, &rel, dialect));
+            assert!(kept, "{dialect:?}: an unreadable `!` pattern excludes none");
+            dialects += 1;
+        }
+        assert_eq!(dialects, 5);
+
         // The dialects without groups read the same text as literals.
-        let rel = vec!["build".to_string(), "a".repeat(255)];
-        let costly = format!("build/{}x", "*(a|aa)".repeat(60));
+        let costly = format!("build/{tail}");
         assert!(!workspaces_include_as(
             std::slice::from_ref(&costly),
             &rel,
