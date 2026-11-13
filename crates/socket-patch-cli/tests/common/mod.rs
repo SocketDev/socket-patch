@@ -107,6 +107,10 @@ pub fn run_bin_with_env(
     // would otherwise read the developer's `~/.gradle` / `~/.m2` (and any
     // `GRADLE_USER_HOME` / `GRADLE_RO_DEP_CACHE`) into every test.
     jvm_env::isolate_cli(&mut cmd);
+    // No ambient Go module cache, flags or `go env -w` file either: an
+    // exported `GOFLAGS=-modfile=...` or `GOMODCACHE` would move the go
+    // crawl and Go apply off the fixture.
+    hermetic::scrub_extra(&mut cmd, &[hermetic::Extra::Go]);
     // Caller-supplied env lands last so explicit injections (runtime
     // gates, discovery roots) survive the scrub.
     for (k, v) in env {

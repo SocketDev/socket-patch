@@ -52,7 +52,8 @@
 //! - Every run is hermetic: ambient `SOCKET_*` is scrubbed, telemetry and
 //!   the socket-cli config are off, ambient API tokens are vetoed (only
 //!   [`VexRun::api_token`] authenticates) and the crawler's ambient inputs
-//!   (`VIRTUAL_ENV`, `BUNDLE_*`, `COMPOSER_*`; `hermetic::CRAWLER_EXTRAS`)
+//!   (`VIRTUAL_ENV`, `BUNDLE_*`, `COMPOSER_*`, Go's `GO*` module/flag vars;
+//!   `hermetic::CRAWLER_EXTRAS`)
 //!   are removed. Package-manager homes/caches the installed-tree lookups need go in
 //!   [`VexRun::envs`].
 //! - `--json` is the default ([`VexRun::human`] opts out), so

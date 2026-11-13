@@ -64,7 +64,7 @@ const PATCHED_LIB: &str = "package upstream\n\nfunc Greeting() string { return \
 /// through it).
 fn run_socket(cwd: &Path, args: &[&str], modcache: &Path) -> (i32, String, String) {
     let mut cmd = hermetic_command(&binary());
-    hermetic::scrub_extra(&mut cmd, &[hermetic::Extra::Venv]);
+    hermetic::scrub_extra(&mut cmd, &[hermetic::Extra::Venv, hermetic::Extra::Go]);
     cmd.current_dir(cwd);
     cmd.env("GOMODCACHE", modcache);
     let _fixture = prebuilt_common::prepare_command(
@@ -103,6 +103,9 @@ fn go_env<'a>(modcache: &'a str, proxy: &'a str) -> Vec<(&'a str, &'a str)> {
 fn go(dir: &Path, args: &[&str], env: &[(&str, &str)]) -> Output {
     let mut cmd = Command::new("go");
     cmd.args(args).current_dir(dir);
+    // No ambient `GOWORK`/`GOFLAGS`/`go env -w` file: an exported
+    // `GOWORK=<file>` fails every `go mod download` in `stage`.
+    hermetic::scrub_extra(&mut cmd, &[hermetic::Extra::Go]);
     cache_env::isolate(&mut cmd);
     for (k, v) in env {
         cmd.env(k, v);
