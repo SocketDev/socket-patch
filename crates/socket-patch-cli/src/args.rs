@@ -32,6 +32,21 @@ fn parse_supported_ecosystem(s: &str) -> Result<String, String> {
         Err(format!(
             "empty ecosystem name in the list (supported: {supported})"
         ))
+    } else if s.trim().eq_ignore_ascii_case("bazel") {
+        // Bazel is a build tool whose rulesets fetch packages of the
+        // registry ecosystems: there is nothing of its own to select, and
+        // the message names what to select instead (owner decision D13).
+        let mut built: Vec<&str> = Vec::new();
+        for ruleset in socket_patch_core::bazel::model::Ruleset::ALL {
+            let name = ruleset.ecosystem().map(|ecosystem| ecosystem.cli_name());
+            built.extend(name.filter(|name| !built.contains(name)));
+        }
+        Err(format!(
+            "unsupported ecosystem `{s}`: Bazel is a build tool, not an ecosystem. Name the \
+             ecosystems of the packages its rulesets fetch ({}), or leave --ecosystems out \
+             (supported: {supported})",
+            built.join(", ")
+        ))
     } else {
         Err(format!(
             "unsupported ecosystem `{s}` (supported: {supported})"
@@ -842,6 +857,29 @@ mod tests {
                 ))
             );
         }
+        // Bazel is no ecosystem and stays unknown (owner decision D13):
+        // the message names the registry ecosystems to pass instead, each
+        // of which is itself a name the flag takes.
+        let built = "npm, pypi, maven, golang, cargo, gem, nuget";
+        for bazel in ["bazel", "Bazel", " BAZEL "] {
+            assert_eq!(
+                parse_supported_ecosystem(bazel),
+                Err(format!(
+                    "unsupported ecosystem `{bazel}`: Bazel is a build tool, not an ecosystem. \
+                     Name the ecosystems of the packages its rulesets fetch ({built}), or leave \
+                     --ecosystems out (supported: {supported})"
+                ))
+            );
+        }
+        for name in built.split(", ") {
+            assert_eq!(parse_supported_ecosystem(name), Ok(name.to_string()));
+        }
+        // A name that only contains the word is an ordinary unknown one.
+        let other = parse_supported_ecosystem("bazelisk").unwrap_err();
+        assert_eq!(
+            other,
+            format!("unsupported ecosystem `bazelisk` (supported: {supported})")
+        );
     }
 
     /// Minimal harness so we can exercise clap's parse + env-var resolution of
