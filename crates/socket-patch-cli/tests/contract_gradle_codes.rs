@@ -669,7 +669,8 @@ fn the_scans_catch_what_they_were_written_for() {
 ///   seen (`token_scan`);
 /// * the token table keeps the rows of the tokens reserved for lanes that
 ///   have not landed: at least the 72 of design 6, the four of revision 3
-///   among them;
+///   among them, and the thirteen revision 4 reserves for its write
+///   classes;
 /// * a `Bazel*` variant of `SidecarAdvisoryCode`, which serde spells, is a
 ///   sidecar code of the enum.
 #[test]
@@ -765,7 +766,25 @@ fn test_bazel_contract_codes() {
         "cargo_config_undeclared",
         "user_patch_hook",
     ];
-    for token in revision_3 {
+    // Revision 4 reserves the tokens of its write classes the same way:
+    // the hook, the tag edit, the owned files, the rc flags and the tool
+    // run are documented before a lane or the gate reports one.
+    let revision_4 = [
+        "hook_blocked",
+        "tag_not_editable",
+        "rc_flag_unsupported",
+        "rc_flag_conflict",
+        "owned_path_foreign",
+        "owned_file_modified",
+        "owned_file_missing",
+        "hook_missing",
+        "stale_override",
+        "rc_selected",
+        "tool_run_failed",
+        "tool_run_disallowed",
+        "tool_version_mismatch",
+    ];
+    for token in revision_3.into_iter().chain(revision_4) {
         if !documented.contains(&token) {
             problems.insert(format!("token `{token}` has no token-table row"));
         }

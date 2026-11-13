@@ -5,22 +5,35 @@
 //!
 //! Stub: `wp-gate` (wave 4) lands the obligations and the dispatch through
 //! the lane table. Until then every question is refused, so nothing is
-//! written or attested on this module's authority. [`LaneCx`] and
-//! [`PatchRequest`] are placeholders the same package completes (the
-//! workspace, the hub, the grant's digests). The facade re-exports `gate`
-//! and `governed` and `model` re-exports the two types, so the four names
-//! stay.
+//! written or attested on this module's authority. [`LaneCx`] has the
+//! fields of revision 4 (`wp-gate-types`); [`PatchRequest`] is a
+//! placeholder `wp-gate` completes (the grant's digests). The facade
+//! re-exports `gate` and `governed` and `model` re-exports the two types,
+//! so the four names stay.
 
 use super::govern::governance;
 use super::model::{
-    BazelWorkspace, FileView, GateOutcome, Governance, LaneTable, Mode, Refusal, Ruleset,
+    BazelWorkspace, FileView, GateOutcome, Governance, HubId, LaneId, LaneTable, Mode, Refusal,
+    Ruleset, RunPolicy,
 };
+use super::owned_index::Index;
 use crate::crawlers::types::Ecosystem;
 
-/// What a lane function is handed about the run.
+/// What a lane function is handed about the run: the mode, the files of
+/// the root, the model read from them, the hub the patch is for, the
+/// owned index as the loader parsed it, and whether a tool may be run.
 pub struct LaneCx<'a> {
     pub mode: Mode,
     pub files: &'a dyn FileView,
+    pub ws: &'a BazelWorkspace,
+    /// The hub in `ws.hubs` the request is decided for.
+    pub hub: HubId,
+    /// Read-only: a lane contributes rows through its plan, and
+    /// `bazel::exec` records them.
+    pub index: &'a Index,
+    /// `RunPolicy::Never` from every caller until the owner allows tool
+    /// runs (owner decision O17).
+    pub run: RunPolicy,
 }
 
 /// One patch a caller wants wired, and the project that resolves it.
@@ -42,7 +55,7 @@ pub fn gate(
     _req: &PatchRequest<'_>,
     _files: &dyn FileView,
 ) -> GateOutcome {
-    GateOutcome::Refuse(Refusal::lane_not_enabled())
+    GateOutcome::Refuse(Refusal::lane_not_enabled(LaneId::UNNAMED))
 }
 
 /// The governance of every ecosystem a Bazel ruleset can build, for the

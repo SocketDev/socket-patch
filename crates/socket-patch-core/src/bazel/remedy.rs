@@ -28,7 +28,7 @@
 //! restores `MODULE.bazel.lock`: a restored lock is exactly what creates
 //! the hidden stale-facts state on Bazel 8.6 to 9.2.
 
-use super::model::{DeclSystem, RunKind, RunRequired};
+use super::model::{Actor, DeclSystem, Interim, RunKind, RunRequired};
 use super::module_lock::GENERAL;
 use super::rc::{Chain, EffectiveFlags, Flag};
 use super::version::{BazelLine, BazelVersion, Tri};
@@ -110,10 +110,22 @@ impl Remedy {
 
     /// The advisory this remedy rides on. `None` where it names no command
     /// that refreshes tracked state.
+    ///
+    /// The run is the user's: a remedy is text for a person, so it has no
+    /// exact arguments, no environment and no output list, and nothing
+    /// can be started from it. It is described as leaving the build
+    /// passing; `derived::Decision::run_required`, which knows the
+    /// interim state, says otherwise where the build fails until the
+    /// command has run.
     pub fn run_required(&self, gates_vex: bool) -> Option<RunRequired> {
         Some(RunRequired {
             kind: self.kind.filter(|_| !self.command.is_empty())?,
             command: self.command.clone(),
+            argv: Vec::new(),
+            env: Vec::new(),
+            outputs: Vec::new(),
+            interim: Interim::Passing,
+            actor: Actor::User,
             platforms: self.platforms.clone(),
             gates_vex,
         })

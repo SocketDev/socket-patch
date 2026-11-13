@@ -113,10 +113,18 @@ impl Level {
     /// refreshes: until the user runs `update-repos` Bazel keeps building
     /// from the old `go_repository` rule, so the build does not get the
     /// patch, and until a repin the crate lock digest fails the build.
+    /// The two kinds of revision 4 are warnings for the same reason: no
+    /// build runs a ruleset's pin target or `bazel vendor`, so until the
+    /// command has run Bazel builds from the lock or the vendor directory
+    /// as it was.
     pub const fn of_required_run(kind: RunKind, builds_fail: bool) -> Level {
         match kind {
             RunKind::Lockfile if !builds_fail => Self::Info,
-            RunKind::Lockfile | RunKind::UpdateRepos | RunKind::Repin => Self::Warn,
+            RunKind::Lockfile
+            | RunKind::UpdateRepos
+            | RunKind::Repin
+            | RunKind::Pin
+            | RunKind::Vendor => Self::Warn,
         }
     }
 }
@@ -208,6 +216,13 @@ codes! {
     /// A `.socket` tree is visible to `//...` and the line cannot be
     /// written.
     WorkspaceIgnoreLineNeeded = "bazel_workspace_ignore_line_needed", RunLevel, Warn;
+    /// A marked hook unit was written into a user file (`.bazelrc`,
+    /// `MODULE.bazel` or a WORKSPACE file) so that Bazel reads the owned
+    /// file under `.socket/bazel/` (revision 4, write class `Hook`).
+    WorkspaceHookAdded = "bazel_workspace_hook_added", RunLevel, Info;
+    /// Owned wiring exists and the hook that makes Bazel read it is
+    /// missing or cannot be written, so the wiring is off.
+    WorkspaceHookNeeded = "bazel_workspace_hook_needed", RunLevel, Warn;
     /// `--prune` could not enumerate a hub lock, so the records that lock
     /// may resolve were kept.
     WorkspacePruneSkipped = "bazel_workspace_prune_skipped", RunLevel, Warn;
@@ -304,6 +319,12 @@ codes! {
     RedirectRunRequired = "redirect_bazel_run_required", Advisory, Info;
     /// Vendored twin of [`Code::RedirectRunRequired`].
     VendorRunRequired = "vendor_bazel_run_required", Advisory, Info;
+    /// socket-patch ran the one tool a lane names, inside the transaction,
+    /// because the build would not pass between the write and the run
+    /// (revision 4, 2.5). Names the command and the files it rewrote.
+    RedirectToolRan = "redirect_bazel_tool_ran", Advisory, Info;
+    /// Vendored twin of [`Code::RedirectToolRan`].
+    VendorToolRan = "vendor_bazel_tool_ran", Advisory, Info;
     /// The withdrawn-pin sweep kept a pin, because restoring it would fail
     /// every build: under `--lockfile_mode=error`, or under any mode
     /// where the restore stales a crate lock digest that only a repin
@@ -466,7 +487,7 @@ mod tests {
 
     /// A typo in one string of the table would ship as a contract
     /// identifier. Each string is rebuilt from its variant's name instead,
-    /// and the totals are the ones of design 6.
+    /// and the totals are the 56 of design 6 plus the four of revision 4.
     #[test]
     fn every_string_is_its_variant_name_in_one_of_the_five_families() {
         for code in Code::ALL {
@@ -475,7 +496,7 @@ mod tests {
         }
         let strings: BTreeSet<&str> = Code::ALL.iter().map(|code| code.as_str()).collect();
         assert_eq!(strings.len(), Code::ALL.len(), "two codes share a string");
-        assert_eq!(Code::ALL.len(), 56);
+        assert_eq!(Code::ALL.len(), 60);
         let sizes = [
             "bazel_workspace_",
             "bazel_agent_",
@@ -484,7 +505,7 @@ mod tests {
             "vex_bazel_",
         ]
         .map(|prefix| family(prefix).len());
-        assert_eq!(sizes, [13, 4, 20, 12, 7]);
+        assert_eq!(sizes, [15, 4, 21, 13, 7]);
     }
 
     /// Hosted and vendored refusals differ in the prefix alone, so a
@@ -550,6 +571,8 @@ mod tests {
         let floor = Code::RedirectRunRequired.level();
         assert_eq!(floor, Level::Info);
         assert_eq!(Code::VendorRunRequired.level(), floor);
+        // Only a stale `MODULE.bazel.lock` heals: no build runs
+        // `update-repos`, a repin, a ruleset's pin target or `bazel vendor`.
         for kind in RunKind::ALL {
             let heals = *kind == RunKind::Lockfile;
             let passing = Level::of_required_run(*kind, false);
@@ -560,9 +583,10 @@ mod tests {
     }
 
     /// A code's kind is where a script finds it, so the split is pinned to
-    /// the one of design 6: every workspace code is run-level bar the
-    /// engine's one, and there are nine advisories, 26 refusals, seven
-    /// withheld statements and one sidecar advisory.
+    /// the one of design 6 as revision 4 extends it (two hook codes at
+    /// run level, two tool-run advisories): every workspace code is
+    /// run-level bar the engine's one, and there are eleven advisories, 26
+    /// refusals, seven withheld statements and one sidecar advisory.
     #[test]
     fn kinds_split_the_codes_as_the_design_does() {
         let mut run_level = of_kind(Kind::RunLevel);
@@ -573,6 +597,6 @@ mod tests {
         assert_eq!(only(Kind::EngineWarning), [in_memory]);
         assert_eq!(only(Kind::SidecarAdvisory), [Code::AgentCoursierPinHazard]);
         let sizes = [Kind::Advisory, Kind::Refusal, Kind::Withheld].map(|kind| of_kind(kind).len());
-        assert_eq!(sizes, [9, 26, 7]);
+        assert_eq!(sizes, [11, 26, 7]);
     }
 }

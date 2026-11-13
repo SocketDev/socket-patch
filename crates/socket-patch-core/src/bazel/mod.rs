@@ -16,6 +16,11 @@
 //! [`gate()`] decides one patch in one mode and [`governed`] says which
 //! ecosystems Bazel builds in a project.
 //!
+//! What a passing gate allows is a typed plan, and one module carries
+//! plans out: [`exec`] applies, reverts and reconciles them over a
+//! transaction, so no seam matches on a write class or names an owned
+//! path.
+//!
 //! Nothing here touches the filesystem, the environment or the network,
 //! and nothing spawns Bazel: files arrive through [`model::FileView`]. The
 //! IO lives in `crawlers::bazel_*`, `utils::bazel_root_writes` and
@@ -35,6 +40,7 @@ pub mod detect;
 pub mod diff;
 pub mod downloader_cfg;
 pub mod evidence;
+pub mod exec;
 pub mod gate;
 pub mod govern;
 pub mod ignore;
