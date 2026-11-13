@@ -1097,3 +1097,126 @@ fn opted_out_native_patch_writes_sources_without_a_build() {
         assert_ne!(code, 0, "{stdout}");
     }
 }
+
+// ── the opt-out through `scan` / `get --mode agent` (#2069) ───────────
+
+const ORG: &str = "test-org";
+
+/// A patch API that serves the `sp_native` patch (1 → 2) to `scan`'s
+/// discovery and to the record download of `scan` and `get`.
+#[cfg(unix)]
+async fn mount_native_patch_api(mock: &wiremock::MockServer) {
+    use base64::Engine;
+    use serde_json::json;
+    use wiremock::matchers::{method, path, path_regex};
+    use wiremock::{Mock, ResponseTemplate};
+
+    Mock::given(method("POST"))
+        .and(path(format!("/v0/orgs/{ORG}/patches/batch")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "packages": [{
+                "purl": PURL,
+                "patches": [{
+                    "uuid": UUID, "purl": PURL, "tier": "free",
+                    "cveIds": [], "ghsaIds": [],
+                    "severity": "high", "title": "sp_native",
+                }]
+            }],
+            "canAccessPaidPatches": false,
+        })))
+        .mount(mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path_regex(format!(
+            "^/v0/orgs/{ORG}/patches/by-package/.*sp_native(%40|@)1\\.0\\.0$"
+        )))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "patches": [{
+                "uuid": UUID, "purl": PURL, "publishedAt": "2026-01-01T00:00:00Z",
+                "description": "sp_native", "license": "MIT", "tier": "free",
+                "vulnerabilities": {},
+            }],
+            "canAccessPaidPatches": false,
+        })))
+        .mount(mock)
+        .await;
+    let after = c_source(2);
+    Mock::given(method("GET"))
+        .and(path(format!("/v0/orgs/{ORG}/patches/view/{UUID}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "uuid": UUID, "purl": PURL, "publishedAt": "2026-01-01T00:00:00Z",
+            "files": { C_KEY: {
+                "beforeHash": git_sha256(c_source(1).as_bytes()),
+                "afterHash": git_sha256(after.as_bytes()),
+                "blobContent": base64::engine::general_purpose::STANDARD.encode(&after),
+            }},
+            "vulnerabilities": {},
+            "description": "sp_native", "license": "MIT", "tier": "free",
+        })))
+        .mount(mock)
+        .await;
+}
+
+/// The opt-out reaches the apply that `scan --mode agent` and
+/// `get --mode agent` run after they record the patch, as a flag and as
+/// `SOCKET_NO_GEM_NATIVE_REBUILD`: the sources are written, no Ruby
+/// starts, the run warns `native_extension_not_rebuilt`, and `apply
+/// --check` does not attest the patch. The first case is the control: the
+/// same `scan` without the opt-out does build.
+#[cfg(unix)]
+#[tokio::test]
+async fn the_opt_out_reaches_the_apply_that_scan_and_get_run() {
+    let mock = wiremock::MockServer::start().await;
+    mount_native_patch_api(&mock).await;
+    let uri = mock.uri();
+    let api = ["--api-url", &uri, "--api-token", "fake-token", "--org", ORG];
+    let scan = ["scan", "--mode", "agent", "--yes", "--json"];
+    let get = ["get", UUID, "--mode", "agent", "--yes", "--json"];
+    let flag = ["--no-gem-native-rebuild"];
+    let env = [("SOCKET_NO_GEM_NATIVE_REBUILD", "1")];
+    // (name, command, extra flags, env, opted out)
+    let cases: [(&str, &[&str], &[&str], &[(&str, &str)], bool); 5] = [
+        ("scan, no opt-out", &scan, &[], &[], false),
+        ("scan, flag", &scan, &flag, &[], true),
+        ("scan, env", &scan, &[], &env, true),
+        ("get, flag", &get, &flag, &[], true),
+        ("get, env", &get, &[], &env, true),
+    ];
+    for (case, command, extra, env, opted_out) in cases {
+        let (_tmp, proj, gem_dir) = fake_native_gem(true);
+        let ruby = FakeRuby::new();
+        let args = [command, extra, &api[..]].concat();
+        let (code, stdout, stderr) = ruby.run(&proj, &args, env);
+        assert_eq!(code, 0, "{case}:\n{stdout}\n{stderr}");
+        assert_eq!(
+            std::fs::read_to_string(gem_dir.join(C_KEY)).unwrap(),
+            c_source(2),
+            "{case}: the patched source was not written\n{stdout}\n{stderr}"
+        );
+        let built = std::fs::read(gem_dir.join("lib/sp_native/sp_native.so")).unwrap();
+        let marker = gem_dir.join(".socket-patch-native-build.json");
+        let backup = gem_dir.join(".socket-patch-native-orig");
+        let (check, check_out, _) = ruby.run(&proj, &["apply", "--check", "--json"], &[]);
+        if !opted_out {
+            assert_eq!(ruby.calls(), ["extensions_dir", "build"], "{case}");
+            assert_eq!(built, b"rebuilt", "{case}");
+            assert!(marker.is_file(), "{case}");
+            assert_eq!(check, 0, "{case}: {check_out}");
+            continue;
+        }
+        assert_eq!(
+            ruby.calls(),
+            Vec::<String>::new(),
+            "{case}: Ruby ran despite the opt-out\n{stdout}\n{stderr}"
+        );
+        assert_eq!(built, b"\x7fELF original", "{case}: the build was replaced");
+        assert!(!marker.exists(), "{case}: a build marker was written");
+        assert!(!backup.exists(), "{case}: a build backup was written");
+        assert!(
+            stdout.contains("native_extension_not_rebuilt"),
+            "{case}: no native_extension_not_rebuilt warning\n{stdout}\n{stderr}"
+        );
+        // The build Ruby loads is still the old one: no attestation.
+        assert_ne!(check, 0, "{case}: {check_out}");
+    }
+}
