@@ -18,12 +18,15 @@
 //! is `labelStrategy` (`null` while no hook uses a label), so one state
 //! has one spelling. [`parse`] accepts exactly what [`Index::render`]
 //! writes, compared line-ending blind (a checkout may have converted the
-//! file to CRLF, which a rewrite then keeps). Anything else that holds the
-//! index's first two row lists, `pins` and `ignoreLines`, is
-//! [`Parsed::Modified`] and nothing is written over it: its rows may
-//! still be the only record of what a rollback must undo. So is text that
-//! is not JSON and names any row list (a merge conflict, a truncated
-//! write). A file of another shape is [`Parsed::Foreign`].
+//! file to CRLF, which a rewrite then keeps). Anything else that is still
+//! the index is [`Parsed::Modified`] and nothing is written over it: its
+//! rows may be the only record of what a rollback must undo. A JSON
+//! object is still the index when it holds the first two row lists,
+//! `pins` and `ignoreLines`, or a row in any of the nine: a file that
+//! lost `pins` to an edit and keeps a hook row is not taken for a file of
+//! the user's. Text that is not JSON is still the index when it names any
+//! row list (a merge conflict, a truncated write). A file of another
+//! shape is [`Parsed::Foreign`].
 //!
 //! The lists of revision 4 were added in place, at `"version": 1`: no
 //! release has written an index, so no reader of the two-list form
@@ -83,8 +86,10 @@ const ROW_LISTS: [&str; 9] = [
 ];
 
 /// The two lists the index has held in every form. A JSON object with
-/// both is the index, read strictly; one without is a file of the
-/// user's: every index socket-patch writes has both, empty or not.
+/// both is the index, read strictly, with rows in them or without: every
+/// index socket-patch writes has both. One without them is the index all
+/// the same when a row is left in any list ([`holds_a_row`]), and a file
+/// of the user's when none is.
 const FIRST_LISTS: [&str; 2] = ["ignoreLines", "pins"];
 
 /// The names in `.socket/bazel/` that are the executor's own, and the
@@ -196,7 +201,8 @@ impl HookAt {
 /// and what removing it must undo. At most one per file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HookRow {
-    /// `.bazelrc`, `MODULE.bazel`, or the WORKSPACE file that is live.
+    /// `.bazelrc`, `MODULE.bazel`, or the WORKSPACE file that is live:
+    /// one of [`HookKind::files`].
     pub file: String,
     pub kind: HookKind,
     /// The version of the unit's text ([`HOOK_UNIT`]).
@@ -379,10 +385,10 @@ pub struct Index {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Parsed {
     Ours(Index),
-    /// The index's row lists are there and the bytes are not what
-    /// socket-patch writes: it was edited, a merge mangled it, a write
-    /// was cut short, or another version wrote it. The text says what
-    /// differs. Nothing is written.
+    /// The index's first two row lists are there, or a row in any list,
+    /// and the bytes are not what socket-patch writes: it was edited, a
+    /// merge mangled it, a write was cut short, or another version wrote
+    /// it. The text says what differs. Nothing is written.
     Modified(String),
     /// Not the index: a file of the user's under this name.
     Foreign,
@@ -581,12 +587,10 @@ impl Row for HookRow {
 
     fn fault(&self) -> Fault {
         // The hook goes into the root file Bazel reads, never into a file
-        // that one imports, so each kind has its names.
-        let files: &[&str] = match self.kind {
-            HookKind::Bazelrc => &[".bazelrc"],
-            HookKind::ModuleFile => &["MODULE.bazel"],
-            HookKind::WorkspaceFile => &["WORKSPACE", "WORKSPACE.bazel"],
-        };
+        // that one imports, so each kind has its names: the list the
+        // executor captures from, so that every file a hook can be
+        // written into can be recorded.
+        let files = self.kind.files();
         first_fault([
             (
                 "file",
@@ -1065,13 +1069,6 @@ fn missing<R: Row>(of: &[R], held: &[R]) -> Option<String> {
     Some(format!("{}[{at}]", R::LIST))
 }
 
-/// Appends to `own` the rows of `file` it does not hold, by identity.
-fn adopt_rows<R: Row + Clone>(own: &mut Vec<R>, file: &[R]) {
-    let held: Vec<Vec<String>> = own.iter().map(Row::key).collect();
-    let new = file.iter().filter(|row| !held.contains(&row.key()));
-    own.extend(new.cloned());
-}
-
 fn rows_json<R: Row>(rows: &[R]) -> Result<Value, InvalidRow> {
     Ok(sorted_rows(rows)?.into_iter().map(Row::json).collect())
 }
@@ -1125,7 +1122,33 @@ impl Index {
     /// Records a pin. A row replaces the one already recorded for its
     /// pin, file and lane: the lane wrote the value again, and the edits
     /// it reports now are the ones a restore must undo.
-    pub fn record_pin(&mut self, row: IndexRow) {
+    ///
+    /// What a restore lands on is the value from before the first pin,
+    /// and only the recorded row knows it. A lane that runs again finds
+    /// the value socket-patch pinned and reports that as the `original`
+    /// of its edit (the pin again, or a newer one over it). Such an edit
+    /// keeps the recorded `original`: taken as reported, the row would
+    /// name the pin as what to put back, and a later undo would "restore"
+    /// the pinned value and drop the only record of the upstream one. The
+    /// derived value a restore must land on (`check`) is kept the same
+    /// way.
+    pub fn record_pin(&mut self, mut row: IndexRow) {
+        if let Some(old) = self.pins.iter().find(|old| pin_key(old) == pin_key(&row)) {
+            for edit in &mut row.edits {
+                let pinned =
+                    |first: &&IndexEdit| first.key == edit.key && first.new == edit.original;
+                if let Some(first) = old.edits.iter().find(pinned) {
+                    edit.original = first.original.clone();
+                }
+            }
+            if let (Some(first), Some(check)) = (&old.check, &mut row.check) {
+                if first.flavor == check.flavor
+                    && first.resolved_hash_after == check.resolved_hash_before
+                {
+                    check.resolved_hash_before = first.resolved_hash_before.clone();
+                }
+            }
+        }
         self.pins.retain(|old| pin_key(old) != pin_key(&row));
         self.pins.push(row);
     }
@@ -1133,7 +1156,10 @@ impl Index {
     /// The first thing this index records that `held` does not, as
     /// `list[at]`: the test of whether `held` descends from this one. A
     /// writer that holds an index in memory and renders it over a file
-    /// with such a row would drop the only record of an edit.
+    /// with such a row would drop the only record of an edit. Asked the
+    /// other way round, with the holder's rows as `self`, it names a row
+    /// the file no longer has, which a writer must not put back
+    /// (`bazel::exec` asks both).
     ///
     /// Rows are compared by identity, not by content: a pin recorded
     /// again for its file and lane, or a line whose flags a later insert
@@ -1156,39 +1182,6 @@ impl Index {
             .or_else(|| missing(&self.files, &held.files))
             .or_else(|| missing(&self.tag_edits, &held.tag_edits))
             .or_else(|| missing(&self.runs, &held.runs))
-    }
-
-    /// Takes over what `file` records and this index does not, so that
-    /// [`Index::row_missing_from`] finds nothing: the way a holder of an
-    /// index in memory catches up with a file another writer added to. A
-    /// row both hold stays as this index has it. `Err` names the one
-    /// thing the two cannot both hold: a label strategy each records
-    /// differently.
-    pub fn adopt(&mut self, file: &Index) -> Result<(), &'static str> {
-        match (self.label_strategy, file.label_strategy) {
-            (Some(own), Some(theirs)) if own != theirs => return Err("labelStrategy"),
-            (None, theirs) => self.label_strategy = theirs,
-            _ => {}
-        }
-        let pin = |own: &[IndexRow], row: &IndexRow| own.iter().any(|o| pin_key(o) == pin_key(row));
-        for row in &file.pins {
-            if !pin(&self.pins, row) {
-                self.pins.push(row.clone());
-            }
-        }
-        for row in &file.ignore_lines {
-            if !self.ignore_lines.iter().any(|own| own.line == row.line) {
-                self.ignore_lines.push(row.clone());
-            }
-        }
-        adopt_rows(&mut self.hooks, &file.hooks);
-        adopt_rows(&mut self.rc_flags, &file.rc_flags);
-        adopt_rows(&mut self.segment, &file.segment);
-        adopt_rows(&mut self.bzl, &file.bzl);
-        adopt_rows(&mut self.files, &file.files);
-        adopt_rows(&mut self.tag_edits, &file.tag_edits);
-        adopt_rows(&mut self.runs, &file.runs);
-        Ok(())
     }
 
     /// What the rows say together that no row says alone.
@@ -1271,6 +1264,16 @@ fn names_a_row_list(text: &str) -> bool {
     ROW_LISTS.iter().any(named)
 }
 
+/// Whether one of the row lists of `doc` holds a row: a list with an
+/// object in it. Every row socket-patch writes is an object, so a list of
+/// strings under one of these names (`"files": ["a.txt"]`) is a file of
+/// the user's.
+fn holds_a_row(doc: &Map<String, Value>) -> bool {
+    let rows = |key: &&str| doc.get(*key).and_then(Value::as_array);
+    let lists = ROW_LISTS.iter().filter_map(rows);
+    lists.flatten().any(Value::is_object)
+}
+
 /// Reads the bytes found at [`INDEX_PATH`].
 pub fn parse(bytes: &[u8]) -> Parsed {
     let Ok(text) = std::str::from_utf8(bytes) else {
@@ -1293,8 +1296,12 @@ pub fn parse(bytes: &[u8]) -> Parsed {
     // The row lists are what make a file the index. One that holds the
     // first two may hold rows a rollback needs, whatever else was edited
     // out of it, `version` and the later lists included: it is never
-    // taken for a file of the user's.
-    if !FIRST_LISTS.iter().all(|key| doc.contains_key(*key)) {
+    // taken for a file of the user's. Neither is one that lost a first
+    // list and still holds a row in any other: the hook, the tag edit or
+    // the owned row it records is as much a rollback's only record as a
+    // pin is, and `read` then says which list is gone.
+    let first_lists = FIRST_LISTS.iter().all(|key| doc.contains_key(*key));
+    if !first_lists && !holds_a_row(&doc) {
         return Parsed::Foreign;
     }
     match read(text, &doc) {
@@ -1807,7 +1814,7 @@ pub(super) mod tests {
 
     #[test]
     fn a_file_of_another_shape_is_foreign() {
-        let foreign: [&[u8]; 9] = [
+        let foreign: [&[u8]; 13] = [
             b"",
             b"\xff\xfe{}",
             b"not json",
@@ -1815,6 +1822,13 @@ pub(super) mod tests {
             b"{}",
             b"{\"version\": 1}",
             b"{\"version\": 1, \"pins\": []}",
+            // One first list, or a later list, with no row in it, and a
+            // list of the same name that holds no row object: nothing in
+            // them is a record a rollback needs.
+            b"{\"ignoreLines\": [], \"version\": 1}",
+            b"{\"hooks\": [], \"tagEdits\": [], \"version\": 1}",
+            b"{\"files\": [\"a.txt\", \"b.txt\"], \"version\": 1}",
+            b"{\"runs\": {\"ci\": {}}, \"segment\": 1}",
             // socket-cli's Bazel manifest directory is a neighbour, and a
             // user may keep any JSON under this name.
             b"{\"manifests\": [], \"version\": 1}",
@@ -1878,6 +1892,74 @@ pub(super) mod tests {
         let tail = &SAMPLE[SAMPLE.find("\"pins\"").expect("the list after the lines")..];
         assert!(!tail.contains("\"ignoreLines\""));
         assert_eq!(modified(tail), "it is not valid JSON");
+    }
+
+    /// A row in any list makes a JSON object the index, whichever lists
+    /// were edited out of it: an index that lost `pins` and still records
+    /// a hook is `Modified`, with the missing list named, and never a
+    /// file of the user's to be moved away. The same file cut short reads
+    /// the same way, so the two branches of the reader agree.
+    #[test]
+    fn an_index_that_lost_a_first_list_and_keeps_a_row_is_modified() {
+        let full = revision_4();
+        type Keep<'a> = &'a dyn Fn(&mut Index);
+        let lists: [(&str, Keep<'_>); 9] = [
+            ("pins", &|i| i.pins = sample().pins),
+            ("ignoreLines", &|i| i.ignore_lines = sample().ignore_lines),
+            ("hooks", &|i| {
+                (i.hooks, i.label_strategy) = (full.hooks.clone(), full.label_strategy);
+            }),
+            ("rcFlags", &|i| i.rc_flags = full.rc_flags.clone()),
+            ("segment", &|i| i.segment = full.segment.clone()),
+            ("bzl", &|i| i.bzl = full.bzl.clone()),
+            ("files", &|i| i.files = full.files.clone()),
+            ("tagEdits", &|i| i.tag_edits = full.tag_edits.clone()),
+            ("runs", &|i| i.runs = full.runs.clone()),
+        ];
+        // Every list, in the order of the file.
+        let mut named: Vec<&str> = lists.iter().map(|(list, _)| *list).collect();
+        named.sort_unstable();
+        assert_eq!(named, ROW_LISTS);
+        for (list, keep) in lists {
+            let mut index = Index::default();
+            keep(&mut index);
+            let ours = index.render().expect("one list with rows");
+            assert!(matches!(parse(ours.as_bytes()), Parsed::Ours(_)), "{list}");
+            let without = |text: &str, gone: &str| {
+                let member = format!("  \"{gone}\": [],\n");
+                assert!(text.contains(&member), "{list}: `{gone}` holds rows");
+                text.replacen(&member, "", 1)
+            };
+            // Each first list in turn, and both: the first that is asked
+            // for and not there is named.
+            for gone in FIRST_LISTS.into_iter().filter(|first| *first != list) {
+                let edited = without(&ours, gone);
+                assert_eq!(
+                    modified(&edited),
+                    format!("`{gone}` is not a list"),
+                    "{list} without {gone}"
+                );
+            }
+            if !FIRST_LISTS.contains(&list) {
+                let neither = without(&without(&ours, "pins"), "ignoreLines");
+                assert_eq!(modified(&neither), "`pins` is not a list", "{list}");
+                // Nothing but the list and its rows.
+                let doc: Value = serde_json::from_str(&ours).unwrap();
+                let alone = serde_json::to_string(&serde_json::json!({ list: doc[list] })).unwrap();
+                assert_eq!(modified(&alone), NOT_VERSION, "{list} alone");
+                // Not JSON any more: the name of the list is enough, as
+                // it is for a first list.
+                let cut = &ours[..ours.find(&format!("\"{list}\"")).unwrap() + list.len() + 2];
+                assert_eq!(modified(cut), "it is not valid JSON", "{list} cut short");
+            }
+        }
+        // The rendering of every list at once, with `pins` taken out and
+        // with `ignoreLines` taken out.
+        for gone in FIRST_LISTS {
+            let edited = REVISION_4.replacen(&format!("  \"{gone}\": [],\n"), "", 1);
+            assert_ne!(edited, REVISION_4);
+            assert_eq!(modified(&edited), format!("`{gone}` is not a list"));
+        }
     }
 
     #[test]
@@ -1964,7 +2046,10 @@ pub(super) mod tests {
                 "{file:?}"
             );
         }
-        for lane in ["", "H", "H-", "X-MVN1", "h-mvn1", "H-MVN 1"] {
+        // The placeholder of a refusal that cannot name its lane is no
+        // lane ID either: no row records it.
+        let unnamed = crate::bazel::model::LaneId::UNNAMED.0;
+        for lane in ["", "H", "H-", "X-MVN1", "h-mvn1", "H-MVN 1", unnamed] {
             assert_eq!(
                 refused(&|row| row.lane = lane.to_string()),
                 "`pins[0].lane` is not a lane ID",
@@ -2435,6 +2520,71 @@ pub(super) mod tests {
         assert!(matches!(parse(text.as_bytes()), Parsed::Ours(read) if read.render() == Ok(text)));
     }
 
+    /// A hook is recorded for every file its kind can go into, and for no
+    /// other: the list is `HookKind::files`, which is also what the
+    /// executor captures for a planned hook. `WORKSPACE.bzlmod` is among
+    /// them, since on a hybrid workspace it is the WORKSPACE file Bazel
+    /// evaluates.
+    #[test]
+    fn a_hook_row_names_one_of_the_files_of_its_kind() {
+        let files = |kind: &HookKind| kind.files().iter().copied();
+        let every: Vec<&str> = HookKind::ALL.iter().flat_map(files).collect();
+        assert_eq!(
+            every,
+            [
+                ".bazelrc",
+                "MODULE.bazel",
+                "WORKSPACE",
+                "WORKSPACE.bazel",
+                "WORKSPACE.bzlmod"
+            ]
+        );
+        let not_its_file = "`hooks[0].file` is not the root file a hook of this kind goes into";
+        let recorded = |file: &str, kind: HookKind| Index {
+            label_strategy: Some(LabelStrategy::Ancestor),
+            hooks: vec![hook(file, kind)],
+            ..Index::default()
+        };
+        for kind in HookKind::ALL {
+            for file in &every {
+                let index = recorded(file, *kind);
+                if kind.files().contains(file) {
+                    let text = index.render().expect("a file of the kind");
+                    assert!(text.contains(&format!("\"file\": \"{file}\"")));
+                    assert_eq!(parse(text.as_bytes()), Parsed::Ours(index), "{file}");
+                } else {
+                    let why = index.render().expect_err("a file of another kind");
+                    assert_eq!(why.to_string(), not_its_file, "{kind:?} in {file}");
+                }
+            }
+        }
+        // Only the root file, in the case Bazel reads it in.
+        for file in [
+            "workspace.bzlmod",
+            "tools/WORKSPACE.bzlmod",
+            "WORKSPACE.bzlmod/",
+            "WORKSPACE.bzlmod.bak",
+            "sub/.bazelrc",
+            "",
+        ] {
+            for kind in HookKind::ALL {
+                let why = recorded(file, *kind).render().expect_err("not a root file");
+                assert_eq!(why.to_string(), not_its_file, "{file:?}");
+            }
+        }
+        // The same through the reader.
+        let bzlmod = REVISION_4.replacen(
+            "\"file\": \"WORKSPACE\"",
+            "\"file\": \"WORKSPACE.bzlmod\"",
+            1,
+        );
+        let Parsed::Ours(read) = parse(bzlmod.as_bytes()) else {
+            panic!("not ours: {:?}", parse(bzlmod.as_bytes()));
+        };
+        assert_eq!(read.hooks[2].file, "WORKSPACE.bzlmod");
+        assert_eq!(read.hooks[2].kind, HookKind::WorkspaceFile);
+    }
+
     /// Each list in turn, with one row made into something no lane may
     /// record: the rendering refuses it, so it never reaches a committed
     /// file.
@@ -2886,17 +3036,64 @@ pub(super) mod tests {
             let edited = REVISION_4.replacen(from, &to, 1);
             assert_eq!(modified(&edited), why, "{from} -> {to}");
         }
-        // A member no row has, and a row out of canonical order.
+        // A member no row has.
         let extra = REVISION_4.replacen(
             "\"flag\": \"distdir\",",
             "\"flag\": \"distdir\",\n      \"note\": 1,",
             1,
         );
         assert!(modified(&extra).ends_with(NOT_OURS), "{}", modified(&extra));
-        let rc_hook = "\"file\": \".bazelrc\",\n      \"kind\": \"rc\"";
+
+        // Rows out of canonical order: `one` and `other` change places.
+        let swapped = |one: &str, other: &str| {
+            assert!(REVISION_4.contains(one) && REVISION_4.contains(other));
+            let parked = REVISION_4.replacen(one, "@first@", 1);
+            let parked = parked.replacen(other, one, 1);
+            parked.replacen("@first@", other, 1)
+        };
+        let rc_hook =
+            "    {\n      \"addedFinalNewline\": true,\n      \"createdFile\": false,\n      \
+                       \"file\": \".bazelrc\",\n      \"kind\": \"rc\",\n      \"unit\": 1\n    }";
         let module_hook =
-            "\"file\": \"MODULE.bazel\",\n      \"inline\": false,\n      \"kind\": \"module\"";
-        assert!(REVISION_4.contains(rc_hook) && REVISION_4.contains(module_hook));
+            "    {\n      \"addedFinalNewline\": false,\n      \"createdFile\": false,\n      \
+                           \"file\": \"MODULE.bazel\",\n      \"inline\": false,\n      \
+                           \"kind\": \"module\",\n      \"unit\": 1\n    }";
+        let hooks = swapped(rc_hook, module_hook);
+        assert!(hooks.find("MODULE.bazel\",\n      \"inline") < hooks.find(".bazelrc\""));
+        // Still JSON, with the same rows: only their order differs.
+        let parsed = |text: &str| serde_json::from_str::<Value>(text).expect("still JSON");
+        assert_eq!(parsed(&hooks)["hooks"].as_array().map(Vec::len), Some(3));
+        assert_eq!(modified(&hooks), format!("line 19 {NOT_OURS}"));
+
+        // The two outputs of the one `runs` row.
+        let output = |file: &str, digit: &str| {
+            let digest = digit.repeat(64);
+            format!(
+                "        {{\n          \"file\": \"{file}\",\n          \"sha256After\": \
+                 \"{digest}\"\n        }}"
+            )
+        };
+        let (module_lock, cargo_lock) = (
+            output("MODULE.bazel.lock", "f"),
+            output("cargo-bazel-lock.json", "9"),
+        );
+        let outputs = swapped(&module_lock, &cargo_lock);
+        assert_eq!(
+            parsed(&outputs)["runs"][0]["outputs"][0]["file"],
+            "cargo-bazel-lock.json"
+        );
+        let reason = modified(&outputs);
+        assert!(reason.ends_with(NOT_OURS), "{reason}");
+        assert_eq!(reason, format!("line 59 {NOT_OURS}"));
+
+        // One row written twice: the same thing recorded twice.
+        let rc_flag = &REVISION_4[REVISION_4
+            .find("    {\n      \"flag\": \"distdir\"")
+            .unwrap()..];
+        let rc_flag = &rc_flag[..rc_flag.find("\n    }").unwrap() + "\n    }".len()];
+        let twice = REVISION_4.replacen(rc_flag, &format!("{rc_flag},\n{rc_flag}"), 1);
+        assert_eq!(parsed(&twice)["rcFlags"].as_array().map(Vec::len), Some(2));
+        assert_eq!(modified(&twice), "`rcFlags[1]` is recorded twice");
     }
 
     /// A writer that holds an index in memory may render it over the
@@ -2937,34 +3134,6 @@ pub(super) mod tests {
         again.pins[0].edits.truncate(1);
         again.ignore_lines[0].created_file = true;
         assert_eq!(file.row_missing_from(&again), None);
-
-        // Catching up: whatever was lost is taken over from the file, a
-        // row both hold stays as the holder has it, and the result
-        // renders as the file plus what only the holder had.
-        for (lose, row) in cases {
-            let mut held = file.clone();
-            lose(&mut held);
-            assert_eq!(held.adopt(&file), Ok(()), "{row}");
-            assert_eq!(file.row_missing_from(&held), None, "{row}");
-            assert_eq!(held.render(), file.render(), "{row}");
-        }
-        assert_eq!(again.adopt(&file), Ok(()));
-        assert_eq!(again.pins[0].edits.len(), 1);
-        assert!(again.ignore_lines[0].created_file);
-        let mut ahead = file.clone();
-        ahead.record_pin(maven_pin(UUID_A, "tools/maven_install.json", None));
-        let (before, pins) = (ahead.clone(), ahead.pins.len());
-        assert_eq!(ahead.adopt(&file), Ok(()));
-        assert_eq!((ahead.pins.len(), &ahead), (pins, &before));
-        let mut empty = Index::default();
-        assert_eq!(empty.adopt(&file), Ok(()));
-        assert_eq!(empty.render(), file.render());
-        // One root has one label strategy: two that differ are not merged.
-        let mut other = file.clone();
-        other.label_strategy = Some(LabelStrategy::Package);
-        let before = other.clone();
-        assert_eq!(other.adopt(&file), Err("labelStrategy"));
-        assert_eq!(other, before);
     }
 
     /// `record_pin` keeps one row per pin, file and lane, as the index
@@ -2987,5 +3156,66 @@ pub(super) mod tests {
         index.record_pin(other_lane);
         assert_eq!(index.pins.len(), 4);
         assert!(index.render().is_ok());
+    }
+
+    /// A lane that runs again finds the value socket-patch pinned. What
+    /// it reports as the original is then the pin, and the row keeps the
+    /// value from before the first pin: the only record of it.
+    #[test]
+    fn a_pin_recorded_again_keeps_the_original_from_before_the_first_pin() {
+        const KEY: &str = "artifacts/com.example:lib/version";
+        let (a, b, c) = ("1.2.3", "1.2.3-socket.0a1b2c3d", "1.2.3-socket.9f6b2c4e");
+        let sha = |c: &str| ResolvedHash::Sha256(c.repeat(64));
+        let row = |original: &str, new: &str, before: &str, after: &str| IndexRow {
+            edits: vec![edit(KEY, original, new)],
+            check: check(sha(before), sha(after), "v3-sorted"),
+            ..maven_pin(UUID_A, "maven_install.json", None)
+        };
+        let recorded = |index: &Index| {
+            let [row] = &index.pins[..] else {
+                panic!("{:?}", index.pins);
+            };
+            let check = row.check.clone().expect("a check");
+            let hashes = (check.resolved_hash_before, check.resolved_hash_after);
+            (
+                row.edits[0].original.clone(),
+                row.edits[0].new.clone(),
+                hashes,
+            )
+        };
+
+        let mut index = Index::default();
+        index.record_pin(row(a, b, "a", "b"));
+        assert_eq!(recorded(&index), (a.into(), b.into(), (sha("a"), sha("b"))));
+        // The second run finds the pin in place and reports B -> B.
+        index.record_pin(row(b, b, "b", "b"));
+        assert_eq!(recorded(&index), (a.into(), b.into(), (sha("a"), sha("b"))));
+        // A newer patch over the pin: B -> C is recorded as A -> C.
+        index.record_pin(row(b, c, "b", "c"));
+        assert_eq!(recorded(&index), (a.into(), c.into(), (sha("a"), sha("c"))));
+        assert!(index.render().is_ok());
+
+        // What is not the recorded pin is taken as reported: the user put
+        // another value there since, and that is what a restore finds.
+        index.record_pin(row("9.9.9", c, "d", "c"));
+        assert_eq!(recorded(&index).0, "9.9.9");
+        assert_eq!(recorded(&index).2, (sha("d"), sha("c")));
+        // An edit of another key, and a row of another file or lane,
+        // have no recorded original to keep.
+        let mut other_key = row(c, c, "c", "c");
+        other_key.edits[0].key = "artifacts/com.example:lib/shasums/jar".to_string();
+        index.record_pin(other_key);
+        assert_eq!(recorded(&index).0, c);
+        let mut elsewhere = row(c, c, "c", "c");
+        elsewhere.file = "tools/maven_install.json".to_string();
+        index.record_pin(elsewhere.clone());
+        assert_eq!(index.pins[1], elsewhere);
+        // A derived value in another flavor is another computation.
+        let mut index = Index::default();
+        index.record_pin(row(a, b, "a", "b"));
+        let mut flavored = row(b, b, "b", "b");
+        flavored.check.as_mut().unwrap().flavor = "v2".to_string();
+        index.record_pin(flavored);
+        assert_eq!(recorded(&index).2, (sha("b"), sha("b")));
     }
 }

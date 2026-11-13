@@ -445,9 +445,45 @@ fn row_problems(code: Code, row: &[&str]) -> Vec<String> {
 struct TokenScan {
     /// The items of its `TOKENS` lists.
     listed: Vec<String>,
-    /// The constants it uses as `token: NAME`.
+    /// The constants it uses as `token: NAME`, as `token: Some(NAME)` or
+    /// as the token argument of `Refusal::new(`.
     named: Vec<String>,
+    /// How many `Refusal::new(` calls it holds.
+    refusals: usize,
     problems: Vec<String>,
+}
+
+/// The arguments of the call whose `(` is at `src[open]`, split at the
+/// commas of the call itself: one inside a nested bracket, a string, a
+/// char literal or a comment does not split. `None` when the call is not
+/// closed. A lexer, like [`block_end`], because a token literal can hold
+/// a comma and the argument before it a call.
+fn call_arguments(src: &str, open: usize) -> Option<Vec<&str>> {
+    let (mut args, mut depth, mut start, mut at) = (Vec::new(), 0usize, open + 1, open);
+    while at < src.len() {
+        at += match (lexeme(src, at), src.as_bytes()[at]) {
+            (Some((len, _)), _) => len,
+            (None, b'(' | b'[' | b'{') => {
+                depth += 1;
+                1
+            }
+            (None, b')' | b']' | b'}') if depth == 1 => {
+                args.push(src[start..at].trim());
+                return Some(args);
+            }
+            (None, b')' | b']' | b'}') => {
+                depth = depth.saturating_sub(1);
+                1
+            }
+            (None, b',') if depth == 1 => {
+                args.push(src[start..at].trim());
+                start = at + 1;
+                1
+            }
+            _ => 1,
+        };
+    }
+    None
 }
 
 /// The names declared as `const NAME: &str = TOKENS[<n>];` in `code`: a
@@ -466,16 +502,27 @@ fn token_constants(code: &str) -> Vec<&str> {
 /// file: a module imports another module's constant, so a name is
 /// resolved across files.
 ///
+/// A token is read in the three spellings the Bazel layer gives one: the
+/// field of a struct literal (`token: "…"`, `token: NAME`), the same
+/// field where it is optional (`token: Some("…")`, `token: Some(NAME)`,
+/// as a withheld attestation carries it) and the token argument of
+/// `Refusal::new(`, the second, which is how every `model::Refusal` gets
+/// its token.
+///
 /// A scan follows a token only as far as it is spelled. A token that
 /// reaches a `Refusal`, a `Gap` or a `Bypass` through a variable, a
-/// parameter or the field shorthand is not seen here; only a type for the
-/// field would close that.
+/// parameter or the field shorthand is not seen here, and neither is one
+/// passed to `Refusal::new(` as anything but a literal or a constant;
+/// only a type for the field would close that.
 fn token_scan(file: &str, code: &str, documented: &[&str], constants: &[&str]) -> TokenScan {
     let token_list = regex::Regex::new(r"(?s)\bconst TOKENS: &\[&str\] = &\[(.*?)\];").unwrap();
     let token_item = r"\b(?:const|static)\s+(?:mut\s+)?(\w*TOKENS\w*)";
     let token_item = regex::Regex::new(token_item).unwrap();
-    let token_field = regex::Regex::new(r#"\btoken: "([^"]*)""#).unwrap();
-    let token_named = regex::Regex::new(r"\btoken:\s*(?:\w+::)*([A-Z][A-Z0-9_]+)\b").unwrap();
+    let token_field = regex::Regex::new(r#"\btoken:\s*(?:Some\(\s*)?"([^"]*)""#).unwrap();
+    let token_named = r"\btoken:\s*(?:Some\(\s*)?(?:\w+::)*([A-Z][A-Z0-9_]+)\b";
+    let token_named = regex::Regex::new(token_named).unwrap();
+    let refusal_new = regex::Regex::new(r"\bRefusal::new\(").unwrap();
+    let constant = regex::Regex::new(r"^(?:\w+::)*([A-Z][A-Z0-9_]+)$").unwrap();
     let mut scan = TokenScan::default();
     for list in token_list.captures_iter(code) {
         let items = list.get(1).unwrap().as_str();
@@ -521,6 +568,37 @@ fn token_scan(file: &str, code: &str, documented: &[&str], constants: &[&str]) -
                 "{file}: `token: {name}` is no item of a list; declare it as \
                  `const {name}: &str = TOKENS[<n>];`"
             ));
+        }
+    }
+    // The constructor takes the token as its second argument. A literal
+    // there is held to the file's list and a constant to a list's item,
+    // as the field is.
+    for call in refusal_new.find_iter(code) {
+        scan.refusals += 1;
+        let arguments = call_arguments(code, call.end() - 1);
+        let Some(token) = arguments.as_ref().and_then(|arguments| arguments.get(1)) else {
+            scan.problems.push(format!(
+                "{file}: a `Refusal::new(` call has no token argument this scan can read"
+            ));
+            continue;
+        };
+        let literal = string_literals(token);
+        let whole_literal = literal.len() == 1 && outside_literals(token).trim().is_empty();
+        if whole_literal {
+            let token = literal[0];
+            if !scan.listed.iter().any(|listed| listed == token) {
+                let problem = format!("{file}: \"{token}\" is not in the file's `TOKENS`");
+                scan.problems.push(problem);
+            }
+        } else if let Some(name) = constant.captures(token) {
+            let name = name.get(1).unwrap().as_str();
+            scan.named.push(name.to_string());
+            if !constants.contains(&name) {
+                scan.problems.push(format!(
+                    "{file}: the token `{name}` of a `Refusal::new(` call is no item of a list; \
+                     declare it as `const {name}: &str = TOKENS[<n>];`"
+                ));
+            }
         }
     }
     scan
@@ -607,12 +685,35 @@ fn the_scans_catch_what_they_were_written_for() {
     let expected = TokenScan {
         listed: vec!["documented".to_string()],
         named: vec!["FIRST".to_string()],
+        refusals: 0,
         problems: Vec::new(),
     };
     assert_eq!(
         token_scan("f.rs", &clean, &["documented"], &constants),
         expected
     );
+    // The optional field and the constructor are read the same way: a
+    // token of the list, by its literal or by its constant, is clean,
+    // whatever stands around it.
+    let withheld = "fn w() -> VexWithhold {\n    VexWithhold { kind, token: Some(FIRST), detail }\n}\n\
+                    fn v() -> VexWithhold {\n    VexWithhold { token: Some(\"documented\"), ..w() }\n}\n\
+                    fn n() -> VexWithhold {\n    VexWithhold { token: None, ..w() }\n}\n";
+    let constructed = "fn r() -> Refusal {\n    Refusal::new(Reason::PinBypassed, FIRST, \"a, b\", lift)\n}\n\
+                       fn s() -> Refusal {\n    Refusal::new(\n        reason_of(a, [b, c]),\n        \
+                       \"documented\",\n        format!(\"{x}, {y}\"),\n        Lift::Owner(\"O6\"),\n    )\n}\n\
+                       fn t(token: &'static str) -> Refusal {\n    \
+                       Refusal::new(reason, model::FIRST, detail, lift).with_snippet(token)\n}\n\
+                       fn u(gap: &Gap) -> Refusal {\n    Refusal::new(reason, gap.token, detail, lift)\n}\n";
+    let both = format!("{clean}{withheld}{constructed}");
+    let scanned = token_scan("f.rs", &both, &["documented"], &token_constants(&both));
+    assert_eq!(scanned.problems, [""; 0]);
+    assert_eq!(scanned.refusals, 4);
+    assert_eq!(scanned.named, ["FIRST", "FIRST", "FIRST", "FIRST"]);
+    assert_eq!(
+        call_arguments("f(a, (b, c), \"d, e\", ',', [f, g]) + h(i)", 1),
+        Some(vec!["a", "(b, c)", "\"d, e\"", "','", "[f, g]"])
+    );
+    assert_eq!(call_arguments("f(a, (b, c)", 1), None);
     assert_eq!(
         scan("pub const TOKENS: &[&str] = &[\"documented\", \"other\"];\n"),
         "f.rs: token `other` has no token-table row"
@@ -635,6 +736,53 @@ fn the_scans_catch_what_they_were_written_for() {
         scan(&named.replace("token: OTHER", "token: Self::OTHER")),
         problem
     );
+    // The same two mistakes in the optional field.
+    assert_eq!(
+        scan(&named.replace("token: OTHER", "token: Some(OTHER)")),
+        problem
+    );
+    assert_eq!(
+        scan(&named.replace("token: OTHER", "token: Some(model::OTHER)")),
+        problem
+    );
+    for misspelt in [
+        "token: Some(\"hook_mising\"),",
+        "token: Some( \"hook_mising\" ),",
+    ] {
+        assert_eq!(
+            scan(&format!(
+                "{list}fn f() -> W {{\n    W {{ {misspelt} }}\n}}\n"
+            )),
+            "f.rs: \"hook_mising\" is not in the file's `TOKENS`"
+        );
+    }
+    // And as the token argument of the constructor, on one line or over
+    // several, behind a first argument that holds commas of its own.
+    for call in [
+        "Refusal::new(Reason::PinBypassed, \"vendor_dirr\", detail, lift)",
+        "Refusal::new(\n        pick(a, b),\n        \"vendor_dirr\",\n        detail,\n    )",
+    ] {
+        assert_eq!(
+            scan(&format!("{list}fn f() -> Refusal {{\n    {call}\n}}\n")),
+            "f.rs: \"vendor_dirr\" is not in the file's `TOKENS`"
+        );
+    }
+    let unlisted = "f.rs: the token `OTHER` of a `Refusal::new(` call is no item of a list; \
+                    declare it as `const OTHER: &str = TOKENS[<n>];`";
+    for call in [
+        "Refusal::new(reason, OTHER, detail, lift)",
+        "Refusal::new(reason, codes::OTHER, detail, lift)",
+    ] {
+        let code =
+            format!("{list}const OTHER: &str = \"other\";\nfn f() -> Refusal {{\n    {call}\n}}\n");
+        assert_eq!(scan(&code), unlisted);
+    }
+    for unread in ["Refusal::new(reason)", "Refusal::new(reason, TOKEN"] {
+        assert_eq!(
+            scan(&format!("{list}fn f() -> Refusal {{\n    {unread}\n")),
+            "f.rs: a `Refusal::new(` call has no token argument this scan can read"
+        );
+    }
     for other_list in [
         "pub const LANE_TOKENS: &[&str] = &[\"other\"];\n",
         "pub static TOKENS: &[&str] = &[\"other\"];\n",
@@ -665,8 +813,9 @@ fn the_scans_catch_what_they_were_written_for() {
 ///   the section's token table; the list has the one spelling this scan
 ///   reads and only string literals in it; a `token: "…"` literal is in
 ///   the `TOKENS` of its file, and a `token: NAME` constant is declared as
-///   an item of a list. What reaches a `token` field any other way is not
-///   seen (`token_scan`);
+///   an item of a list; the same holds behind `Some(` and for the token
+///   argument of `Refusal::new(`. What reaches a token any other way is
+///   not seen (`token_scan`);
 /// * the token table keeps the rows of the tokens reserved for lanes that
 ///   have not landed: at least the 72 of design 6, the four of revision 3
 ///   among them, and the thirteen revision 4 reserves for its write
@@ -807,10 +956,19 @@ fn test_bazel_contract_codes() {
     let constants = bazel.iter().flat_map(|(_, code)| token_constants(code));
     let constants: Vec<&str> = constants.collect();
     let (mut first_list_seen, mut first_name_seen) = (false, false);
+    let (mut first_refusal_seen, mut optional_seen) = (false, false);
+    let optional =
+        regex::Regex::new(r"\btoken:\s*Some\(\s*(?:\w+::)*[A-Z][A-Z0-9_]+\s*\)").unwrap();
     for (file, code) in &bazel {
         let scan = token_scan(file, code, &documented, &constants);
         let lists = |token: &str| scan.listed.iter().any(|listed| listed == token);
         first_list_seen |= file.ends_with("/bazel/model.rs") && lists("lane_not_enabled");
+        // `Refusal::lane_not_enabled` builds its refusal through the
+        // constructor, with the constant.
+        let names = |name: &str| scan.named.iter().any(|named| named == name);
+        first_refusal_seen |=
+            file.ends_with("/bazel/model.rs") && scan.refusals > 0 && names("LANE_NOT_ENABLED");
+        optional_seen |= optional.is_match(code) && scan.problems.is_empty();
         first_name_seen |= scan
             .named
             .iter()
@@ -823,6 +981,14 @@ fn test_bazel_contract_codes() {
     assert!(
         first_name_seen,
         "the scan lost every `token: NAME` of a `TOKENS[<n>]` constant"
+    );
+    assert!(
+        first_refusal_seen,
+        "the scan lost the `Refusal::new(` call of `Refusal::lane_not_enabled`"
+    );
+    assert!(
+        optional_seen,
+        "the scan lost every `token: Some(NAME)` of a `TOKENS[<n>]` constant"
     );
 
     let sidecars = sources
