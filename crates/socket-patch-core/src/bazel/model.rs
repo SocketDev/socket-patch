@@ -1511,6 +1511,9 @@ pub type TextRead<'a> = &'a dyn Fn(&str) -> Option<String>;
 /// whose lock does not resolve the release ([`GateOutcome::NotBazel`]).
 pub type GateFn = fn(&LaneCx<'_>, &PatchRequest<'_>) -> GateOutcome;
 /// Rewrites a Bazel-only lock for the pins of one run, hosted or vendored.
+/// It reports each value it replaced as an edit with a key and with both
+/// values as strings: the hosted rewriter group records those as the
+/// `pins` rows of the owned index.
 pub type RewriteOwnedFn = fn(&LaneCx<'_>, &mut Files, &[PinSource], &mut RewriteResult);
 /// Recomputes derived values after the native rewriter ran.
 pub type FixupsFn = fn(&LaneCx<'_>, &mut Files, &Plan, &mut RewriteResult);

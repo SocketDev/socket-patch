@@ -615,9 +615,25 @@ pub fn resolve_member_yarn_mirror(
 /// depth ([`MEMBER_SEARCH_DEPTH`] for `**`, which also bounds a link
 /// cycle), and gives up after [`MEMBER_SEARCH_DIR_BUDGET`] directories,
 /// keeping the members found so far.
+///
+/// In a Bazel workspace an entry that is one of Bazel's own trees is no
+/// member, whatever the pattern: an output base, a cache or a vendor
+/// directory inside the checkout, and a link into one. The convenience
+/// links of a built workspace (`bazel-bin`, `bazel-<name>`) lead to
+/// mirrors of this very tree, each with the `package.json` of the
+/// directory it mirrors; taken for members "linked from outside the
+/// repository", they refused the whole hosted rewrite while they existed
+/// (hazard HZ-17). Only an entry below a Bazel boundary file is asked
+/// about, so a project Bazel does not build pays one stat-only probe of
+/// the directories above it and nothing per directory.
 pub fn yarn_classic_workspace_members(root: &Path) -> Vec<PathBuf> {
+    use crate::crawlers::bazel_root::RootProbe;
+    use crate::crawlers::bazel_workspace::tree_classifier;
     use crate::utils::fs::read_regular_to_string_sync;
-    use crate::utils::workspace_globs::{workspaces_include_as, WorkspacesDialect};
+    use crate::utils::repo_root::ReadBoundary;
+    use crate::utils::workspace_globs::{
+        may_name_boundary_file, workspaces_include_as, WorkspacesDialect,
+    };
 
     let classic = read_regular_to_string_sync(&root.join("yarn.lock"))
         .is_ok_and(|lock| !super::is_berry_lock(&lock));
@@ -651,8 +667,16 @@ pub fn yarn_classic_workspace_members(root: &Path) -> Vec<PathBuf> {
     // its rc files are outside the repository.
     let bound =
         crate::utils::repo_root::upward_bound(crate::utils::repo_root::ReadScope::Workspace, root);
-    let mut stack = vec![(root.to_path_buf(), Vec::<String>::new())];
-    while let Some((dir, rel)) = stack.pop() {
+    // Whether a Bazel boundary file lies in `root` or above it: names are
+    // stat'ed, nothing is read. A boundary file further down shows in the
+    // listing of its directory.
+    let probe = RootProbe::new().survey(root, &ReadBoundary::Unbounded);
+    let below_bazel_root = !probe.roots.is_empty();
+    // Made when the first entry is asked about: it reads the rc files of
+    // the roots above for a tracked `--vendor_dir`.
+    let mut trees = None;
+    let mut stack = vec![(root.to_path_buf(), Vec::<String>::new(), below_bazel_root)];
+    while let Some((dir, rel, in_workspace)) = stack.pop() {
         if !rel.is_empty()
             && dir.join("package.json").is_file()
             && workspaces_include_as(&patterns, &rel, WorkspacesDialect::YARN_CLASSIC)
@@ -669,11 +693,25 @@ pub fn yarn_classic_workspace_members(root: &Path) -> Vec<PathBuf> {
         let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;
         };
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().into_owned();
+        let entries: Vec<std::fs::DirEntry> = entries.flatten().collect();
+        let named = |entry: &std::fs::DirEntry| entry.file_name().to_string_lossy().into_owned();
+        let in_workspace = in_workspace
+            || entries
+                .iter()
+                .any(|entry| may_name_boundary_file(&named(entry)));
+        for entry in entries {
+            let name = named(&entry);
             let path = entry.path();
             if name == "node_modules" || name == ".git" || !path.is_dir() {
                 continue;
+            }
+            // Before a link is taken for a member, and before a real
+            // directory is entered.
+            if in_workspace {
+                let trees = trees.get_or_insert_with(|| tree_classifier(root));
+                if trees.tree_at(&path).tree.is_some() {
+                    continue;
+                }
             }
             if bound.as_ref().is_some_and(|b| !b.contains(&path)) {
                 // Not descended into: only a member AT the link counts
@@ -690,7 +728,7 @@ pub fn yarn_classic_workspace_members(root: &Path) -> Vec<PathBuf> {
             }
             let mut child = rel.clone();
             child.push(name);
-            stack.push((path, child));
+            stack.push((path, child, in_workspace));
         }
     }
     members.sort();

@@ -18,7 +18,7 @@ use std::sync::Arc;
 use futures_util::StreamExt;
 use toml_edit::{DocumentMut, Item, Table};
 
-use crate::utils::workspace_globs::segment_glob_matches;
+use crate::utils::workspace_globs::{bazel_owned, segment_glob_matches, BazelRoots};
 use crate::vendor::lock_inventory::view::{MemoryProject, ProjectView};
 use crate::vendor::parse_memo::ParseMemo;
 
@@ -84,6 +84,7 @@ pub(crate) async fn member_manifest_texts_in(view: &ProjectView<'_>) -> Vec<(Str
     );
     let mut found: BTreeMap<String, String> = BTreeMap::new();
     let mut tried: BTreeSet<String> = BTreeSet::new();
+    let mut bazel = BazelRoots::default();
     while !frontier.is_empty() {
         let mut level: Vec<String> = Vec::new();
         for dir in std::mem::take(&mut frontier) {
@@ -94,7 +95,9 @@ pub(crate) async fn member_manifest_texts_in(view: &ProjectView<'_>) -> Vec<(Str
                 continue;
             }
             tried.insert(dir.clone());
-            if every_segment(&dir, |at| view_is_real_dir(view, at)) {
+            if every_segment(&dir, |at| view_is_real_dir(view, at))
+                && !in_bazel_tree(view, &mut bazel, &dir)
+            {
                 level.push(dir);
             }
         }
@@ -226,6 +229,39 @@ pub(crate) trait DirTree {
 trait Tree: DirTree {
     /// A regular (non-symlink) manifest file's walk facts.
     fn read_manifest(&self, rel: &str) -> Option<Arc<ManifestFacts>>;
+    /// The tree as a view, which is what the Bazel check reads through
+    /// ([`in_bazel_tree`]).
+    fn view(&self) -> ProjectView<'_>;
+}
+
+/// Whether the root-relative directory `dir` is one of Bazel's own trees
+/// or lies inside one: an output base, a cache or a vendor directory in
+/// the checkout, or a link into one (`workspace_globs::bazel_owned`).
+///
+/// Such a tree mirrors the workspace or holds what Bazel fetched: an
+/// output base has the manifests of every external crate under
+/// `external/`, and a vendor directory has them under its own name. A
+/// `members` glob or a path dependency that reaches one names a manifest
+/// that is Bazel's to write, and a hosted pin there would edit a file the
+/// next build regenerates (ROUTED R-029). The same holds for a pnpm
+/// workspace member (`pnpm_workspace`, ROUTED R-027).
+///
+/// Each directory on the way down to `dir` is asked, because the markers
+/// are at a tree's root and say nothing from inside it. And only below a
+/// Bazel boundary file, which `bazel` finds at a few `stat`s per
+/// directory that holds members: in a project Bazel does not build no
+/// candidate costs a marker test, and a directory that merely holds a
+/// marker's name is a member like any other.
+pub(crate) fn in_bazel_tree(view: &ProjectView<'_>, bazel: &mut BazelRoots, dir: &str) -> bool {
+    let mut holder = String::new();
+    for name in dir.split('/').filter(|name| !name.is_empty()) {
+        let below_boundary = bazel.at(view, &holder, None);
+        holder = join_rel(&holder, name);
+        if below_boundary && bazel_owned(view, &holder, None) {
+            return true;
+        }
+    }
+    false
 }
 
 pub(crate) struct DiskTree<'a>(pub(crate) &'a Path);
@@ -233,6 +269,10 @@ pub(crate) struct DiskTree<'a>(pub(crate) &'a Path);
 impl Tree for DiskTree<'_> {
     fn read_manifest(&self, rel: &str) -> Option<Arc<ManifestFacts>> {
         read_manifest(&self.0.join(rel))
+    }
+
+    fn view(&self) -> ProjectView<'_> {
+        ProjectView::Disk(self.0)
     }
 }
 
@@ -259,6 +299,10 @@ impl Tree for MemoryTree<'_> {
     fn read_manifest(&self, rel: &str) -> Option<Arc<ManifestFacts>> {
         let doc: DocumentMut = self.0.text(rel)?.parse().ok()?;
         Some(Arc::new(ManifestFacts::of(&doc)))
+    }
+
+    fn view(&self) -> ProjectView<'_> {
+        ProjectView::Memory(self.0)
     }
 }
 
@@ -293,6 +337,8 @@ fn member_manifests_with(tree: &dyn Tree) -> Vec<String> {
     };
     let mut dirs: BTreeSet<String> = BTreeSet::new();
     let mut queue: Vec<(String, Arc<ManifestFacts>)> = Vec::new();
+    let (view, mut bazel) = (tree.view(), BazelRoots::default());
+    let mut bazels = |dir: &str| in_bazel_tree(&view, &mut bazel, dir);
 
     if let Some((members, exclude)) = &facts.workspace {
         let excluded: BTreeSet<String> = exclude
@@ -302,20 +348,20 @@ fn member_manifests_with(tree: &dyn Tree) -> Vec<String> {
         for pattern in members {
             for dir in expand_glob(tree, pattern, CARGO_SKIP) {
                 if !excluded.contains(&dir) {
-                    enqueue(tree, dir, &mut dirs, &mut queue);
+                    enqueue(tree, dir, &mut dirs, &mut queue, &mut bazels);
                 }
             }
         }
     }
     for dep_dir in &facts.path_deps {
         if let Some(dir) = normalize_rel("", dep_dir) {
-            enqueue(tree, dir, &mut dirs, &mut queue);
+            enqueue(tree, dir, &mut dirs, &mut queue, &mut bazels);
         }
     }
     while let Some((dir, facts)) = queue.pop() {
         for dep_dir in &facts.path_deps {
             if let Some(dep) = normalize_rel(&dir, dep_dir) {
-                enqueue(tree, dep, &mut dirs, &mut queue);
+                enqueue(tree, dep, &mut dirs, &mut queue, &mut bazels);
             }
         }
     }
@@ -401,6 +447,10 @@ fn member_manifests_unmemoized(root: &Path) -> Vec<String> {
             let doc: DocumentMut = std::fs::read_to_string(path).ok()?.parse().ok()?;
             Some(Arc::new(ManifestFacts::of(&doc)))
         }
+
+        fn view(&self) -> ProjectView<'_> {
+            ProjectView::Disk(self.0)
+        }
     }
 
     impl DirTree for UnmemoizedDiskTree<'_> {
@@ -450,11 +500,15 @@ fn enqueue(
     dir: String,
     dirs: &mut BTreeSet<String>,
     queue: &mut Vec<(String, Arc<ManifestFacts>)>,
+    bazels: &mut dyn FnMut(&str) -> bool,
 ) {
+    // Bazel's trees last: the test is asked only of a directory that
+    // would otherwise be read.
     if !walkable(&dir)
         || dirs.len() >= MAX_MANIFESTS
         || dirs.contains(&dir)
         || !is_real_dir_path(tree, &dir)
+        || bazels(&dir)
     {
         return;
     }
@@ -1039,6 +1093,54 @@ mod tests {
         )
         .unwrap();
         assert_eq!(member_manifests(&root), vec!["crates/two/Cargo.toml"]);
+    }
+
+    /// ROUTED R-029. An output base inside the checkout holds the
+    /// manifest of every crate Bazel fetched, and a vendor directory holds
+    /// them under its own name. A `members` glob, a literal member or a
+    /// path dependency that reaches one names a manifest that is Bazel's:
+    /// below a Bazel boundary file none of them is returned, by the disk
+    /// walk and by the view walk alike. The same tree with no boundary
+    /// file is not Bazel's, and is listed as it always was.
+    #[test]
+    fn manifests_inside_a_bazel_tree_are_not_returned() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write(
+            root,
+            "Cargo.toml",
+            &format!(
+                "[workspace]\nmembers = [\"*\", \"out/external/*\", \"third_party/crates/dep\"]\n\n\
+                 {}[dependencies]\nfetched = {{ path = \"out/external/fetched\" }}\n",
+                pkg("root")
+            ),
+        );
+        write(root, "app/Cargo.toml", &pkg("app"));
+        // An output base: its marker, and a directory Bazel makes in it.
+        write(root, "out/DO_NOT_BUILD_HERE", "");
+        write(root, "out/Cargo.toml", &pkg("mirror"));
+        write(root, "out/external/fetched/Cargo.toml", &pkg("fetched"));
+        // A vendor directory, by the marker `bazel vendor` writes.
+        write(root, "third_party/VENDOR.bazel", "");
+        write(root, "third_party/crates/dep/Cargo.toml", &pkg("dep"));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let through_view = || runtime.block_on(member_manifests_in(&ProjectView::Disk(root)));
+
+        let all = vec![
+            "app/Cargo.toml",
+            "out/Cargo.toml",
+            "out/external/fetched/Cargo.toml",
+            "third_party/crates/dep/Cargo.toml",
+        ];
+        assert_eq!(member_manifests(root), all, "no Bazel workspace");
+        assert_eq!(through_view(), all);
+
+        write(root, "MODULE.bazel", "module(name = \"ws\")\n");
+        assert_eq!(member_manifests(root), vec!["app/Cargo.toml"]);
+        assert_eq!(through_view(), vec!["app/Cargo.toml"]);
+        assert_eq!(member_manifests_unmemoized(root), vec!["app/Cargo.toml"]);
     }
 
     #[test]

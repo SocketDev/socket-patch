@@ -1216,7 +1216,13 @@ impl<'a> Attest<'a> {
     /// lock file the hub reads, and not the first one alone: a second
     /// entry on the upstream digest, or on none, is a build of the
     /// upstream package.
-    fn pinned_digest(
+    ///
+    /// Public for the hosted rewriter group, which holds a pin it has
+    /// just written to the grant before it calls the patch confirmed: the
+    /// rest of the proof of a pin can say "run pending" first, and a lock
+    /// line with the Socket URL and the upstream digest must not pass as
+    /// a write that only waits for its command.
+    pub fn pinned_digest(
         &self,
         id: HubId,
         pin: &BazelRef,

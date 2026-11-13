@@ -1236,6 +1236,47 @@ pub fn touched(index: &Index, plans: &[Plan]) -> Vec<String> {
     paths.into_iter().map(str::to_string).collect()
 }
 
+/// The root-relative paths whose bytes the lanes of `plans` author
+/// themselves (the module docs, "Who authors which bytes"): the native
+/// locks and the files of the generated values. Sorted, each once.
+///
+/// A seam stages what a lane's rewrite left at these paths and at no
+/// other. Every other path a plan touches is the executor's to write, so
+/// a lane that changed one (the index, an owned file, a file its plan
+/// does not name) wrote off its plan, and the seam discards what it did.
+/// The seam asks here because which classes a lane authors is this
+/// module's knowledge: a class that lands later is added in this
+/// function and no seam changes.
+pub fn authored(plans: &[Plan]) -> Vec<String> {
+    let mut paths: BTreeSet<&str> = BTreeSet::new();
+    for write in plans.iter().flat_map(|plan| &plan.writes) {
+        if let PlannedWrite::NativeLock { path } | PlannedWrite::GeneratedValue { path, .. } = write
+        {
+            paths.insert(path);
+        }
+    }
+    paths.into_iter().map(str::to_string).collect()
+}
+
+/// The paths of [`authored`] that the native rewriter of the package
+/// manager writes: the native locks of `plans`, with their paired
+/// manifests and side files. Sorted, each once.
+///
+/// A seam runs the native rewriter on these files and on nothing else,
+/// and takes nothing from it but these files. A file only Bazel's
+/// rulesets read is not among them: no native rewriter knows it, and one
+/// that happened to know its name (a generated file called like a
+/// requirements file) must not be handed it.
+pub fn native_locks(plans: &[Plan]) -> Vec<String> {
+    let mut paths: BTreeSet<&str> = BTreeSet::new();
+    for write in plans.iter().flat_map(|plan| &plan.writes) {
+        if let PlannedWrite::NativeLock { path } = write {
+            paths.insert(path);
+        }
+    }
+    paths.into_iter().map(str::to_string).collect()
+}
+
 /// Whether the statement at `site` is socket-patch's own wiring, which a
 /// reader subtracts before it looks for the user's bypasses and patch
 /// hooks (revision 4, 2.2 row 6(a)). `false` for every site in this
@@ -1914,6 +1955,39 @@ mod tests {
                 Err(ExecError::ClassNotImplemented { lane, class })
             );
         }
+    }
+
+    /// The paths a seam stages a lane's bytes at are the native locks and
+    /// the files of the generated values, and no other path a plan
+    /// touches: the index, an owned file, a hook file and a tool's output
+    /// are never a lane's to author.
+    #[test]
+    fn authored_lists_the_paths_a_lane_writes_and_no_path_of_the_executor() {
+        assert_eq!(authored(&[]), [""; 0]);
+        let plans = [
+            plan(TOY, vec![lock_write(LOCK), line_write(".socket/vendor")]),
+            plan(
+                MVN,
+                vec![
+                    value_write(TOOLS, "k"),
+                    value_write(TOOLS, "j"),
+                    lock_write(LOCK),
+                    INDEX_WRITE,
+                ],
+            ),
+        ];
+        assert_eq!(authored(&plans), [LOCK, TOOLS]);
+        // The native rewriter is handed the native locks alone.
+        assert_eq!(native_locks(&plans), [LOCK]);
+        assert_eq!(native_locks(&[]), [""; 0]);
+        for write in unhandled_writes(UUID, TOY) {
+            let plans = [plan(TOY, vec![write.clone()])];
+            assert_eq!(authored(&plans), [""; 0], "{write:?}");
+            assert_eq!(native_locks(&plans), [""; 0], "{write:?}");
+        }
+        // Every authored path is one the commit captures.
+        let touched = touched(&Index::default(), &plans);
+        assert!(authored(&plans).iter().all(|path| touched.contains(path)));
     }
 
     #[test]
