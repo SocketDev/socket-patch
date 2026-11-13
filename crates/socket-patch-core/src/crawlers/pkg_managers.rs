@@ -99,6 +99,18 @@ pub fn detect_npm_pkg_manager(
     scope: crate::utils::repo_root::ReadScope,
     project_root: &Path,
 ) -> NpmPkgManager {
+    detect_npm_pkg_manager_with(project_root, || yarn_node_linker(scope, project_root))
+}
+
+/// [`detect_npm_pkg_manager`] with the yarn `nodeLinker` lookup injected:
+/// `yarn_linker` is only asked when a PnP loader file exists. Tests pass
+/// [`yarn_node_linker_in`] over [`YarnEnv::repository_only`] so a
+/// developer's `YARN_NODE_LINKER` or `~/.yarnrc.yml` can't change the
+/// answer (#1919).
+pub(crate) fn detect_npm_pkg_manager_with(
+    project_root: &Path,
+    yarn_linker: impl FnOnce() -> Option<String>,
+) -> NpmPkgManager {
     // 1. yarn-berry PnP — highest priority because it determines
     //    whether the npm crawler can find anything at all. Yarn 3+
     //    emits `.pnp.cjs`; Yarn 2.x emitted `.pnp.js` (renamed to
@@ -107,7 +119,11 @@ pub fn detect_npm_pkg_manager(
     //    mean "packages aren't on disk" — refuse rather than silently
     //    fall through to Unknown (a Yarn 2 PnP tree has no
     //    `node_modules/`, so it would otherwise escape the refusal).
-    if live_pnp_marker(scope, project_root, |m| project_root.join(m).is_file()).is_some() {
+    if live_pnp_marker_in(project_root, yarn_linker, |m| {
+        project_root.join(m).is_file()
+    })
+    .is_some()
+    {
         // Carve-out: pnpm has its OWN PnP mode (`node-linker=pnp` in
         // `.npmrc`) which also writes a `.pnp.cjs` loader at the root
         // — but unlike yarn-berry the packages are real directories in
@@ -513,13 +529,25 @@ pub fn live_pnp_marker(
     project_root: &Path,
     exists: impl Fn(&str) -> bool,
 ) -> Option<&'static str> {
+    live_pnp_marker_in(
+        project_root,
+        || yarn_node_linker(scope, project_root),
+        exists,
+    )
+}
+
+/// [`live_pnp_marker`] with the configured `nodeLinker` lookup injected
+/// (`linker`), still reading the project's `yarn.lock` from disk.
+fn live_pnp_marker_in(
+    project_root: &Path,
+    linker: impl FnOnce() -> Option<String>,
+    exists: impl Fn(&str) -> bool,
+) -> Option<&'static str> {
     live_pnp_marker_with(
         || {
             let lock =
                 crate::utils::fs::read_regular_to_string_sync(&project_root.join("yarn.lock"));
-            effective_yarn_linker(lock.ok().as_deref(), || {
-                yarn_node_linker(scope, project_root)
-            })
+            effective_yarn_linker(lock.ok().as_deref(), linker)
         },
         exists,
     )
@@ -594,9 +622,15 @@ impl YarnPnpLoader {
     /// `node-linker=pnp` tree is not). A loader file that cannot be read
     /// contributes nothing, so it never vouches for a patch.
     pub fn detect(project_root: &Path) -> Option<Self> {
-        if detect_npm_pkg_manager(crate::utils::repo_root::ReadScope::Workspace, project_root)
-            != NpmPkgManager::YarnBerryPnP
-        {
+        Self::detect_with(
+            project_root,
+            detect_npm_pkg_manager(crate::utils::repo_root::ReadScope::Workspace, project_root),
+        )
+    }
+
+    /// [`Self::detect`] given the project's detected package manager.
+    fn detect_with(project_root: &Path, manager: NpmPkgManager) -> Option<Self> {
+        if manager != NpmPkgManager::YarnBerryPnP {
             return None;
         }
         let texts = crate::constants::npm_family::PNP_MARKERS
@@ -640,9 +674,82 @@ impl YarnPnpLoader {
     }
 }
 
+/// [`detect_npm_pkg_manager`] for a unit test: the `nodeLinker` comes from
+/// the project's own `.yarnrc.yml` alone, never `YARN_NODE_LINKER`,
+/// `YARN_RC_FILENAME`, the home rc file or an rc file in a folder above
+/// the project, so a developer's yarn setup can't flip the answer (#1919).
+/// The upward walk is skipped on purpose: a temp dir outside a git
+/// checkout has no read boundary, so it would reach every ancestor of
+/// `TMPDIR` up to `/`.
+#[cfg(test)]
+pub(crate) fn detect_npm_pkg_manager_hermetic(project_root: &Path) -> NpmPkgManager {
+    detect_npm_pkg_manager_with(project_root, || {
+        let env = YarnEnv::repository_only();
+        let rc =
+            crate::utils::fs::read_regular_to_string_sync(&project_root.join(&env.rc_filename))
+                .ok()?;
+        rc_node_linker(&rc, &env)
+    })
+}
+
+#[cfg(test)]
+impl YarnPnpLoader {
+    /// [`Self::detect`] over [`detect_npm_pkg_manager_hermetic`].
+    pub(crate) fn detect_hermetic(project_root: &Path) -> Option<Self> {
+        Self::detect_with(project_root, detect_npm_pkg_manager_hermetic(project_root))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The public entry points only add the host's yarn env, which is
+    /// asked for a loader file alone: without one they agree with the
+    /// hermetic variants the other tests use.
+    #[test]
+    fn public_detectors_match_the_hermetic_ones_without_a_loader() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("yarn.lock"), "").unwrap();
+        std::fs::create_dir_all(d.path().join("node_modules")).unwrap();
+        assert_eq!(
+            detect_npm_pkg_manager(crate::utils::repo_root::ReadScope::Workspace, d.path()),
+            NpmPkgManager::YarnClassic
+        );
+        assert_eq!(
+            detect_npm_pkg_manager_hermetic(d.path()),
+            NpmPkgManager::YarnClassic
+        );
+        assert!(YarnPnpLoader::detect(d.path()).is_none());
+        // Without a loader the injected lookup is never asked, so the host
+        // env the public wrapper reads can't matter here.
+        assert_eq!(
+            detect_npm_pkg_manager_with(d.path(), || panic!("linker asked without a loader")),
+            NpmPkgManager::YarnClassic
+        );
+    }
+
+    /// The hermetic detector ignores an rc file above the project: outside
+    /// a git checkout the production walk is unbounded, and a developer's
+    /// `$HOME/tmp/../.yarnrc.yml` would otherwise mark the loader stale.
+    #[test]
+    fn hermetic_detector_ignores_an_rc_file_above_the_project() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join(".yarnrc.yml"), "nodeLinker: node-modules\n").unwrap();
+        let project = d.path().join("app");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join(".pnp.cjs"), "").unwrap();
+        assert_eq!(
+            detect_npm_pkg_manager_hermetic(&project),
+            NpmPkgManager::YarnBerryPnP
+        );
+        std::fs::write(project.join(".yarnrc.yml"), "nodeLinker: node-modules\n").unwrap();
+        assert_eq!(
+            detect_npm_pkg_manager_hermetic(&project),
+            NpmPkgManager::Unknown,
+            "the project's own rc file is still read"
+        );
+    }
 
     /// A yarn PnP loader vouches for a patch only when it names it: berry
     /// by the hosted url's uuid, classic by the resolved url's hash. A
@@ -656,7 +763,10 @@ mod tests {
         let classic_url = format!("{url}#{HASH}");
 
         let d = tempfile::tempdir().unwrap();
-        assert!(YarnPnpLoader::detect(d.path()).is_none(), "not PnP");
+        assert!(
+            YarnPnpLoader::detect_hermetic(d.path()).is_none(),
+            "not PnP"
+        );
 
         // berry, fresh install: the registry names the hosted locator.
         std::fs::write(
@@ -664,7 +774,7 @@ mod tests {
             format!("[\"left-pad\", [[\"{url}\", {{packageLocation: \"./.yarn/cache/x.zip\"}}]]]"),
         )
         .unwrap();
-        let loader = YarnPnpLoader::detect(d.path()).expect("berry PnP");
+        let loader = YarnPnpLoader::detect_hermetic(d.path()).expect("berry PnP");
         assert!(loader.resolves_patch(UUID, [url.as_str()]));
         assert!(!loader.resolves_patch("5e6f7081-92a3-4b4c-8d5e-6f7081920354", []));
         assert!(!loader.resolves_patch("", []));
@@ -675,7 +785,7 @@ mod tests {
             "[\"left-pad\", [[\"npm:1.3.0\", {packageLocation: \"./.yarn/cache/x.zip\"}]]]",
         )
         .unwrap();
-        let loader = YarnPnpLoader::detect(d.path()).unwrap();
+        let loader = YarnPnpLoader::detect_hermetic(d.path()).unwrap();
         assert!(!loader.resolves_patch(UUID, [url.as_str()]));
 
         // berry with pnpEnableInlining: false — the data file names it.
@@ -684,7 +794,7 @@ mod tests {
             format!("{{\"r\":\"{url}\"}}"),
         )
         .unwrap();
-        assert!(YarnPnpLoader::detect(d.path())
+        assert!(YarnPnpLoader::detect_hermetic(d.path())
             .unwrap()
             .resolves_patch(UUID, []));
 
@@ -695,7 +805,7 @@ mod tests {
             format!("packageLocation: \"/c/v6/npm-left-pad-1.3.0-{HASH}-integrity/\""),
         )
         .unwrap();
-        let loader = YarnPnpLoader::detect(c.path()).expect("classic PnP");
+        let loader = YarnPnpLoader::detect_hermetic(c.path()).expect("classic PnP");
         assert!(loader.resolves_patch(UUID, [classic_url.as_str()]));
         assert!(
             !loader.resolves_patch(UUID, [url.as_str()]),
@@ -1114,7 +1224,7 @@ mod tests {
     fn unknown_for_empty_dir() {
         let d = tempfile::tempdir().unwrap();
         assert_eq!(
-            detect_npm_pkg_manager(crate::utils::repo_root::ReadScope::Workspace, d.path()),
+            detect_npm_pkg_manager_hermetic(d.path()),
             NpmPkgManager::Unknown
         );
     }
@@ -1124,7 +1234,7 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(d.path().join("node_modules")).unwrap();
         assert_eq!(
-            detect_npm_pkg_manager(crate::utils::repo_root::ReadScope::Workspace, d.path()),
+            detect_npm_pkg_manager_hermetic(d.path()),
             NpmPkgManager::Npm
         );
     }
@@ -1135,7 +1245,7 @@ mod tests {
         std::fs::create_dir_all(d.path().join("node_modules")).unwrap();
         std::fs::write(d.path().join("node_modules/.modules.yaml"), "").unwrap();
         assert_eq!(
-            detect_npm_pkg_manager(crate::utils::repo_root::ReadScope::Workspace, d.path()),
+            detect_npm_pkg_manager_hermetic(d.path()),
             NpmPkgManager::Pnpm
         );
     }
@@ -1145,7 +1255,7 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(d.path().join("node_modules/.pnpm")).unwrap();
         assert_eq!(
-            detect_npm_pkg_manager(crate::utils::repo_root::ReadScope::Workspace, d.path()),
+            detect_npm_pkg_manager_hermetic(d.path()),
             NpmPkgManager::Pnpm
         );
     }
@@ -1156,7 +1266,7 @@ mod tests {
         std::fs::create_dir_all(d.path().join("node_modules")).unwrap();
         std::fs::write(d.path().join("yarn.lock"), "").unwrap();
         assert_eq!(
-            detect_npm_pkg_manager(crate::utils::repo_root::ReadScope::Workspace, d.path()),
+            detect_npm_pkg_manager_hermetic(d.path()),
             NpmPkgManager::YarnClassic
         );
     }
@@ -1168,7 +1278,7 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         std::fs::write(d.path().join("yarn.lock"), "").unwrap();
         assert_eq!(
-            detect_npm_pkg_manager(crate::utils::repo_root::ReadScope::Workspace, d.path()),
+            detect_npm_pkg_manager_hermetic(d.path()),
             NpmPkgManager::Unknown
         );
     }
@@ -1178,7 +1288,7 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         std::fs::write(d.path().join(".pnp.cjs"), "").unwrap();
         assert_eq!(
-            detect_npm_pkg_manager(crate::utils::repo_root::ReadScope::Workspace, d.path()),
+            detect_npm_pkg_manager_hermetic(d.path()),
             NpmPkgManager::YarnBerryPnP
         );
     }
@@ -1191,7 +1301,7 @@ mod tests {
         std::fs::write(d.path().join(".pnp.cjs"), "").unwrap();
         std::fs::create_dir_all(d.path().join("node_modules/.pnpm")).unwrap();
         assert_eq!(
-            detect_npm_pkg_manager(crate::utils::repo_root::ReadScope::Workspace, d.path()),
+            detect_npm_pkg_manager_hermetic(d.path()),
             NpmPkgManager::YarnBerryPnP
         );
     }
@@ -1202,7 +1312,7 @@ mod tests {
         std::fs::create_dir_all(d.path().join("node_modules")).unwrap();
         std::fs::write(d.path().join("bun.lock"), "").unwrap();
         assert_eq!(
-            detect_npm_pkg_manager(crate::utils::repo_root::ReadScope::Workspace, d.path()),
+            detect_npm_pkg_manager_hermetic(d.path()),
             NpmPkgManager::Bun
         );
     }
@@ -1213,7 +1323,7 @@ mod tests {
         std::fs::create_dir_all(d.path().join("node_modules")).unwrap();
         std::fs::write(d.path().join("bun.lockb"), b"").unwrap();
         assert_eq!(
-            detect_npm_pkg_manager(crate::utils::repo_root::ReadScope::Workspace, d.path()),
+            detect_npm_pkg_manager_hermetic(d.path()),
             NpmPkgManager::Bun
         );
     }
@@ -1225,7 +1335,7 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         std::fs::write(d.path().join("bun.lock"), "").unwrap();
         assert_eq!(
-            detect_npm_pkg_manager(crate::utils::repo_root::ReadScope::Workspace, d.path()),
+            detect_npm_pkg_manager_hermetic(d.path()),
             NpmPkgManager::Unknown
         );
     }
@@ -1240,7 +1350,7 @@ mod tests {
         std::fs::create_dir_all(d.path().join("node_modules/.pnpm")).unwrap();
         std::fs::write(d.path().join("bun.lock"), "").unwrap();
         assert_eq!(
-            detect_npm_pkg_manager(crate::utils::repo_root::ReadScope::Workspace, d.path()),
+            detect_npm_pkg_manager_hermetic(d.path()),
             NpmPkgManager::Bun
         );
     }
@@ -1254,7 +1364,7 @@ mod tests {
         std::fs::write(d.path().join("bun.lock"), "").unwrap();
         std::fs::create_dir_all(d.path().join("node_modules")).unwrap();
         assert_eq!(
-            detect_npm_pkg_manager(crate::utils::repo_root::ReadScope::Workspace, d.path()),
+            detect_npm_pkg_manager_hermetic(d.path()),
             NpmPkgManager::YarnBerryPnP
         );
     }
@@ -1269,7 +1379,7 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         std::fs::write(d.path().join(".pnp.loader.mjs"), "").unwrap();
         assert_eq!(
-            detect_npm_pkg_manager(crate::utils::repo_root::ReadScope::Workspace, d.path()),
+            detect_npm_pkg_manager_hermetic(d.path()),
             NpmPkgManager::YarnBerryPnP
         );
     }
@@ -1284,7 +1394,7 @@ mod tests {
         std::fs::write(d.path().join(".pnp.cjs"), "").unwrap();
         std::fs::create_dir_all(d.path().join("node_modules")).unwrap();
         assert_eq!(
-            detect_npm_pkg_manager(crate::utils::repo_root::ReadScope::Workspace, d.path()),
+            detect_npm_pkg_manager_hermetic(d.path()),
             NpmPkgManager::YarnBerryPnP
         );
     }
@@ -1299,7 +1409,7 @@ mod tests {
         std::fs::create_dir_all(d.path().join("node_modules/.pnpm")).unwrap();
         std::fs::write(d.path().join("yarn.lock"), "").unwrap();
         assert_eq!(
-            detect_npm_pkg_manager(crate::utils::repo_root::ReadScope::Workspace, d.path()),
+            detect_npm_pkg_manager_hermetic(d.path()),
             NpmPkgManager::Pnpm
         );
     }
@@ -1313,7 +1423,7 @@ mod tests {
         std::fs::write(d.path().join("bun.lock"), "").unwrap();
         std::fs::write(d.path().join("yarn.lock"), "").unwrap();
         assert_eq!(
-            detect_npm_pkg_manager(crate::utils::repo_root::ReadScope::Workspace, d.path()),
+            detect_npm_pkg_manager_hermetic(d.path()),
             NpmPkgManager::Bun
         );
     }
@@ -1329,7 +1439,7 @@ mod tests {
         std::fs::write(d.path().join("node_modules"), "not a dir").unwrap();
         std::fs::write(d.path().join("bun.lock"), "").unwrap();
         assert_eq!(
-            detect_npm_pkg_manager(crate::utils::repo_root::ReadScope::Workspace, d.path()),
+            detect_npm_pkg_manager_hermetic(d.path()),
             NpmPkgManager::Unknown
         );
     }
@@ -1345,7 +1455,7 @@ mod tests {
         std::fs::create_dir_all(d.path().join("node_modules/.pnpm")).unwrap();
         std::fs::write(d.path().join("bun.lockb"), b"").unwrap();
         assert_eq!(
-            detect_npm_pkg_manager(crate::utils::repo_root::ReadScope::Workspace, d.path()),
+            detect_npm_pkg_manager_hermetic(d.path()),
             NpmPkgManager::Bun
         );
     }
@@ -1362,7 +1472,7 @@ mod tests {
         std::fs::write(d.path().join("bun.lock"), "").unwrap();
         std::fs::create_dir_all(d.path().join("node_modules")).unwrap();
         assert_eq!(
-            detect_npm_pkg_manager(crate::utils::repo_root::ReadScope::Workspace, d.path()),
+            detect_npm_pkg_manager_hermetic(d.path()),
             NpmPkgManager::YarnBerryPnP
         );
     }
@@ -1378,7 +1488,7 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         std::fs::write(d.path().join(".pnp.js"), "").unwrap();
         assert_eq!(
-            detect_npm_pkg_manager(crate::utils::repo_root::ReadScope::Workspace, d.path()),
+            detect_npm_pkg_manager_hermetic(d.path()),
             NpmPkgManager::YarnBerryPnP
         );
     }
@@ -1394,7 +1504,7 @@ mod tests {
         std::fs::write(d.path().join("bun.lock"), "").unwrap();
         std::fs::create_dir_all(d.path().join("node_modules")).unwrap();
         assert_eq!(
-            detect_npm_pkg_manager(crate::utils::repo_root::ReadScope::Workspace, d.path()),
+            detect_npm_pkg_manager_hermetic(d.path()),
             NpmPkgManager::YarnBerryPnP
         );
     }
@@ -1426,7 +1536,7 @@ mod tests {
         .unwrap();
         std::fs::write(d.path().join("node_modules/.modules.yaml"), "").unwrap();
         assert_eq!(
-            detect_npm_pkg_manager(crate::utils::repo_root::ReadScope::Workspace, d.path()),
+            detect_npm_pkg_manager_hermetic(d.path()),
             NpmPkgManager::Pnpm
         );
     }
@@ -1443,7 +1553,7 @@ mod tests {
         std::fs::write(d.path().join("yarn.lock"), "").unwrap();
         std::fs::create_dir_all(d.path().join("node_modules/.pnpm")).unwrap();
         assert_eq!(
-            detect_npm_pkg_manager(crate::utils::repo_root::ReadScope::Workspace, d.path()),
+            detect_npm_pkg_manager_hermetic(d.path()),
             NpmPkgManager::YarnBerryPnP
         );
     }
@@ -1458,7 +1568,7 @@ mod tests {
         std::fs::write(d.path().join(".pnp.cjs"), "").unwrap();
         std::fs::write(d.path().join("pnpm-lock.yaml"), "").unwrap();
         assert_eq!(
-            detect_npm_pkg_manager(crate::utils::repo_root::ReadScope::Workspace, d.path()),
+            detect_npm_pkg_manager_hermetic(d.path()),
             NpmPkgManager::YarnBerryPnP
         );
     }
@@ -1471,7 +1581,7 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(d.path().join(".pnp.js")).unwrap();
         assert_eq!(
-            detect_npm_pkg_manager(crate::utils::repo_root::ReadScope::Workspace, d.path()),
+            detect_npm_pkg_manager_hermetic(d.path()),
             NpmPkgManager::Unknown
         );
     }
@@ -1486,7 +1596,7 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         std::fs::write(d.path().join("package-lock.json"), "{}").unwrap();
         assert_eq!(
-            detect_npm_pkg_manager(crate::utils::repo_root::ReadScope::Workspace, d.path()),
+            detect_npm_pkg_manager_hermetic(d.path()),
             NpmPkgManager::Unknown
         );
     }
@@ -1500,7 +1610,7 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(d.path().join("node_modules/.modules.yaml")).unwrap();
         assert_eq!(
-            detect_npm_pkg_manager(crate::utils::repo_root::ReadScope::Workspace, d.path()),
+            detect_npm_pkg_manager_hermetic(d.path()),
             NpmPkgManager::Npm
         );
     }
@@ -1519,7 +1629,7 @@ mod tests {
         std::os::unix::fs::symlink(&real, d.path().join("node_modules")).unwrap();
         std::fs::write(d.path().join("yarn.lock"), "").unwrap();
         assert_eq!(
-            detect_npm_pkg_manager(crate::utils::repo_root::ReadScope::Workspace, d.path()),
+            detect_npm_pkg_manager_hermetic(d.path()),
             NpmPkgManager::YarnClassic
         );
     }
@@ -1529,7 +1639,7 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(d.path().join("node_modules/.vlt")).unwrap();
         assert_eq!(
-            detect_npm_pkg_manager(crate::utils::repo_root::ReadScope::Workspace, d.path()),
+            detect_npm_pkg_manager_hermetic(d.path()),
             NpmPkgManager::Vlt
         );
     }
@@ -1540,7 +1650,7 @@ mod tests {
         std::fs::create_dir_all(d.path().join("node_modules")).unwrap();
         std::fs::write(d.path().join("node_modules/.vlt-lock.json"), "{}").unwrap();
         assert_eq!(
-            detect_npm_pkg_manager(crate::utils::repo_root::ReadScope::Workspace, d.path()),
+            detect_npm_pkg_manager_hermetic(d.path()),
             NpmPkgManager::Vlt
         );
     }
@@ -1552,19 +1662,19 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         std::fs::write(d.path().join("vlt-lock.json"), "{}").unwrap();
         assert_eq!(
-            detect_npm_pkg_manager(crate::utils::repo_root::ReadScope::Workspace, d.path()),
+            detect_npm_pkg_manager_hermetic(d.path()),
             NpmPkgManager::Unknown
         );
 
         std::fs::create_dir_all(d.path().join("node_modules")).unwrap();
         assert_eq!(
-            detect_npm_pkg_manager(crate::utils::repo_root::ReadScope::Workspace, d.path()),
+            detect_npm_pkg_manager_hermetic(d.path()),
             NpmPkgManager::Npm
         );
 
         std::fs::create_dir_all(d.path().join("node_modules/.pnpm")).unwrap();
         assert_eq!(
-            detect_npm_pkg_manager(crate::utils::repo_root::ReadScope::Workspace, d.path()),
+            detect_npm_pkg_manager_hermetic(d.path()),
             NpmPkgManager::Pnpm
         );
     }
@@ -1576,7 +1686,7 @@ mod tests {
         std::fs::create_dir_all(d.path().join("node_modules/.vlt")).unwrap();
         std::fs::write(d.path().join("node_modules/.vlt-lock.json"), "{}").unwrap();
         assert_eq!(
-            detect_npm_pkg_manager(crate::utils::repo_root::ReadScope::Workspace, d.path()),
+            detect_npm_pkg_manager_hermetic(d.path()),
             NpmPkgManager::YarnBerryPnP
         );
     }
@@ -1598,7 +1708,7 @@ mod tests {
                 std::fs::create_dir_all(d.path().join(marker)).unwrap();
             }
             assert_eq!(
-                detect_npm_pkg_manager(crate::utils::repo_root::ReadScope::Workspace, d.path()),
+                detect_npm_pkg_manager_hermetic(d.path()),
                 NpmPkgManager::Vlt,
                 "{marker}"
             );
@@ -1612,7 +1722,7 @@ mod tests {
         std::fs::write(d.path().join("vlt-lock.json"), "{}").unwrap();
         std::fs::write(d.path().join("vlt.json"), "{}").unwrap();
         assert_eq!(
-            detect_npm_pkg_manager(crate::utils::repo_root::ReadScope::Workspace, d.path()),
+            detect_npm_pkg_manager_hermetic(d.path()),
             NpmPkgManager::Unknown
         );
     }
@@ -1625,7 +1735,7 @@ mod tests {
         std::fs::create_dir_all(d.path().join("node_modules/.vlt-lock.json")).unwrap();
         std::fs::write(d.path().join("node_modules/.vlt"), "not a dir").unwrap();
         assert_eq!(
-            detect_npm_pkg_manager(crate::utils::repo_root::ReadScope::Workspace, d.path()),
+            detect_npm_pkg_manager_hermetic(d.path()),
             NpmPkgManager::Npm
         );
     }

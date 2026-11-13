@@ -84,6 +84,7 @@ pub fn offers_from_results(results: &[PatchSearchResult], can_access_paid: bool)
     Offers {
         unfiltered,
         selected,
+        withheld: BTreeSet::new(),
     }
 }
 
@@ -211,8 +212,13 @@ pub fn classify(offers: &Offers, recorded: &RecordedIndex, project: &str) -> Vec
                 (Recorded::Same, selected.clone())
             } else {
                 let old = uuids[0].clone();
+                // A recorded patch the selection filter withholds fixes
+                // nothing that needs a fix: the selection replaces it even
+                // when it does not outrank it.
+                let withheld = !offers.withheld.is_empty()
+                    && offers.withheld.contains(&(purl.clone(), old.clone()));
                 match offered.iter().find(|p| p.uuid == old) {
-                    Some(prior) if !search_result_supersedes(selected, prior) => {
+                    Some(prior) if !withheld && !search_result_supersedes(selected, prior) => {
                         (Recorded::Kept { uuid: old }, prior.clone())
                     }
                     _ => (Recorded::Superseded { old_uuid: old }, selected.clone()),
@@ -657,6 +663,58 @@ mod tests {
                 old_uuid: "w1".into()
             }
         );
+    }
+
+    /// A recorded patch the selection filter withholds ([`Offers::withheld`])
+    /// gives way to the selection even when the selection does not outrank
+    /// it; nothing else about the classification changes.
+    #[test]
+    fn a_recorded_patch_the_filter_withholds_gives_way_to_the_selection() {
+        let purl = "pkg:npm/a@1";
+        let recorded_offer = offer(purl, "old", "", &["critical"]);
+        let selected = offer(purl, "new", "", &["high", "low"]);
+        let mut offers = Offers {
+            unfiltered: BTreeMap::from([(
+                purl.to_string(),
+                vec![recorded_offer.clone(), selected.clone()],
+            )]),
+            selected: BTreeMap::from([(purl.to_string(), selected.clone())]),
+            withheld: BTreeSet::new(),
+        };
+        let recorded = manifest(&[(purl, "old")]);
+        let index = RecordedIndex::new(Some(&recorded), &[]);
+
+        // Unfiltered, a high never supersedes a recorded critical.
+        let rows = classify(&offers, &index, "");
+        assert_eq!(
+            rows[0].candidate.recorded,
+            Recorded::Kept { uuid: "old".into() }
+        );
+        assert_eq!(rows[0].writer.uuid, "old");
+
+        // Another package's withheld offer changes nothing here.
+        offers
+            .withheld
+            .insert(("pkg:npm/b@1".to_string(), "old".to_string()));
+        assert_eq!(
+            classify(&offers, &index, "")[0].candidate.recorded,
+            Recorded::Kept { uuid: "old".into() }
+        );
+
+        offers
+            .withheld
+            .insert((purl.to_string(), "old".to_string()));
+        let rows = classify(&offers, &index, "");
+        assert_eq!(
+            rows[0].candidate.recorded,
+            Recorded::Superseded {
+                old_uuid: "old".into()
+            }
+        );
+        assert_eq!(rows[0].writer.uuid, "new");
+        // The row is ranked by everything the selected patch fixes.
+        assert_eq!(rows[0].candidate.severity_order, 1);
+        assert_eq!(rows[0].candidate.advisory_count, 2);
     }
 
     #[test]

@@ -2037,6 +2037,13 @@ async fn scan_project(
             Err(PolicyLoadError::Usage(message)) => {
                 return scan_usage_error(&args, "invalid_env", &message);
             }
+            Err(PolicyLoadError::Filter(message)) => {
+                return scan_usage_error(
+                    &args,
+                    socket_patch_core::policy::filter::FILTER_INVALID,
+                    &message,
+                );
+            }
             Err(PolicyLoadError::Policy(err)) => return report_policy_error(&err, &args),
         },
     };
@@ -2073,7 +2080,11 @@ async fn scan_project(
             })
             .collect();
         if !args.common.json && !args.common.silent {
-            for line in render::discovery_notes(found.ignored, found.truncated) {
+            let filter_paths = invocation
+                .policy
+                .filter()
+                .is_some_and(|filter| filter.has_skip_paths());
+            for line in render::discovery_notes(found.ignored, found.truncated, filter_paths) {
                 eprintln!("{line}");
             }
         }

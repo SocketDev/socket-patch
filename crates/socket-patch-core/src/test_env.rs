@@ -4,6 +4,22 @@
 //! must also be `#[serial_test::serial]`.
 
 use std::ffi::{OsStr, OsString};
+use std::sync::{Mutex, MutexGuard, PoisonError};
+
+/// The keys live guards hold, once per guard entry.
+static GUARDED: Mutex<Vec<OsString>> = Mutex::new(Vec::new());
+
+fn guarded() -> MutexGuard<'static, Vec<OsString>> {
+    GUARDED.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// `key`'s value while an [`EnvGuard`] holds it, else `None` whatever the
+/// host set. For lookups that must not see the developer's environment
+/// (`utils::go_env` in the unit tests).
+pub(crate) fn guarded_var(key: &str) -> Option<String> {
+    let held = guarded().iter().any(|k| k == key);
+    held.then(|| std::env::var(key).ok()).flatten()
+}
 
 /// Sets or removes env vars and puts the previous values back on drop, a
 /// panicking assertion included. Previous values are kept as `OsString`,
@@ -33,6 +49,7 @@ impl EnvGuard {
         let mut guard = Self { saved: Vec::new() };
         for (key, value) in pairs {
             let key = key.as_ref();
+            guarded().push(key.to_os_string());
             guard
                 .saved
                 .push((key.to_os_string(), std::env::var_os(key)));
@@ -52,6 +69,10 @@ impl Drop for EnvGuard {
             match prev {
                 Some(v) => std::env::set_var(&key, v),
                 None => std::env::remove_var(&key),
+            }
+            let mut held = guarded();
+            if let Some(i) = held.iter().rposition(|k| *k == key) {
+                held.swap_remove(i);
             }
         }
     }

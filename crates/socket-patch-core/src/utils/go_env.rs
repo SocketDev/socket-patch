@@ -24,7 +24,22 @@ use std::path::{Path, PathBuf};
 /// caller applies go's default). An empty environment variable falls
 /// through to the file, as go's own `cfg.Getenv` does.
 pub(crate) fn go_env(key: &str) -> Option<String> {
-    go_env_with(key, |k| std::env::var(k).ok())
+    go_env_with(key, process_env)
+}
+
+/// The process environment [`go_env`] reads.
+#[cfg(not(test))]
+fn process_env(key: &str) -> Option<String> {
+    std::env::var(key).ok()
+}
+
+/// In the unit tests, only the vars a test holds with an
+/// [`EnvGuard`](crate::test_env::EnvGuard). A developer's `GOWORK=off`,
+/// `GOFLAGS=-modfile=...` or `go env -w` file (found through `HOME`) would
+/// otherwise change what every Go fixture resolves.
+#[cfg(test)]
+fn process_env(key: &str) -> Option<String> {
+    crate::test_env::guarded_var(key)
 }
 
 /// [`go_env`] over an injected environment lookup.

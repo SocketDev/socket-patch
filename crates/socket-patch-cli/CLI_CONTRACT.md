@@ -564,6 +564,37 @@ patches:
 - `filtered[]` and `retained[]` are sorted by project, then purl; purls use the canonical spelling (qualifiers stripped, percent-decoded).
 - Exit code is unchanged by filtering.
 
+### Selection filter (`scan --selection-filter`, internal)
+
+`scan --selection-filter <FILE>` / `SOCKET_SELECTION_FILTER` narrows one run with a JSON sidecar: paths, packages and advisories to skip, plus reachability findings. The run then leaves a package unpatched only when every advisory its patches fix is skipped or unreachable. A relative `FILE` is relative to the process's working directory (not `--cwd`), like `--vex`. It is an **internal** interface for Socket's own remediation tooling (`socket fix` pull requests): the flag is hidden from `--help`, and the file is versioned (`"version": 1`) rather than covered by the semver policy.
+
+The format reference is [docs/selection-filter.md](../../docs/selection-filter.md), with its JSON Schema in [docs/selection-filter.schema.json](../../docs/selection-filter.schema.json) (a test keeps the schema and the parser in step); the parser and the rules are `socket_patch_core::policy::filter`. This is the summary.
+
+```json
+{
+  "version": 1,
+  "skip": {
+    "paths": ["services/legacy/"],
+    "packages": ["pkg:npm/left-pad"],
+    "advisories": ["GHSA-jf85-cpcp-j695", "CVE-2021-23337"]
+  },
+  "reachability": [
+    { "advisory": "GHSA-35jh-r3h4-6jhm", "package": "pkg:npm/lodash@4.17.20", "state": "reachable" },
+    { "advisory": "GHSA-p6mc-m468-83gw", "state": "unreachable" },
+    { "package": "pkg:npm/minimist@1.2.5", "state": "unreachable" }
+  ],
+  "unlistedAdvisories": "patch"
+}
+```
+
+- Only `version` is required. `skip.paths` uses the grammar and marker rule of `patches.ignorePaths`, relative to the same repository root (see "Lookup": `--cwd` when there is no trusted `.git`), matched as its own list (a negation re-includes only what this list excluded) and applied to named roots too; `skip.packages` and a finding's `package` use the `--package` grammar; advisory ids are GHSA or CVE ids (`GHSA-xxxx-xxxx-xxxx`, `CVE-2024-1234`), matched case-insensitively against an advisory's id and its CVE aliases. A finding names an `advisory`, a `package`, or both; `state` is `reachable`, `unreachable` or `unknown`.
+- **Per advisory.** A skipped advisory needs no fix. Otherwise the most specific finding decides (advisory and package, then advisory, then package); among equally specific ones the most cautious wins (`reachable` > `unknown` > `unreachable`). `unreachable` needs no fix, `reachable` and `unknown` need one. An advisory no finding covers follows `unlistedAdvisories`: `patch` (default, it needs a fix) or `skip` (it needs none, which makes the findings an allowlist).
+- **Per patch.** A patch is withheld only when no advisory it fixes needs a fix. A patch that fixes one that does is applied whole: a merged patch brings its fixes for unreachable or skipped advisories along. The filter never changes how patches rank: among the patches not withheld, [the ranking](#which-patch-gets-selected) picks one as always, over everything each patch fixes, and the severity floor judges the whole patch too. One preference comes first: when exactly one advisory of the package needs a fix and a floor-admitted patch fixes that advisory and nothing else, that single-advisory patch is taken instead of a merged one (a package already on a merged patch that fixes it follows the usual ranking alone: it is not traded for the smaller patch, and still upgrades to a better merged one).
+- **Composition.** The filter narrows beside the socket.yml policy; `--no-socket-yml` drops only the file. "Narrowing never removes" holds: a recorded package the filter skips is retained, and one whose patches are all withheld keeps its recorded patch. Unlike the severity floor, a recorded patch that is itself withheld gives way to a patch that is not, even when it ranks higher (an UPGRADE row, reported in `updates[]`): the patch that fixes something reachable lands whether or not the package was patched before.
+- **Output.** `policy.filtered[]` / `policy.retained[]` carry the reasons `filter_path_skipped` (detail `/services/legacy/ (skip.paths)`; for a root the run was pointed at, or a nested root of an agent scan: a bare scan's search for project directories does not visit a skipped root, and counts it in its "under ignored paths" note like a socket.yml-ignored one; a `--global` scan has no project roots), `filter_package_skipped` (`pkg:npm/left-pad (skip.packages)`) and `filter_not_needed` (no patch could be selected and the filter withholds the top-ranked one, named with each advisory it fixes and why: `GHSA-… unreachable, GHSA-… skipped`, `… unlisted`; at most five named; never listed when an admitted patch wins, so a re-scan reports what the first scan did). A run given a filter adds `policy.selectionFilter: {"sha256", "skip": {"paths", "packages", "advisories"}, "reachability", "unlistedAdvisories"}` (the file's digest and its entry counts as written); the key is absent otherwise. The human policy line reads `Policy (socket.yml + selection filter): …`. `packages[].selectedUuids` / `fixedIds` / `unfixedIds` describe the selection as always.
+- **Errors (fail closed).** A file that cannot be read or honored (missing, not a regular file, over 16 MiB, invalid JSON, an unknown or duplicate key, a wrong type, an unknown `state`, another `version`, an invalid pattern, spec or id (including one that could never match: a bare package name with a version, a pattern gitignore reads as a comment), a `skip.paths` / `skip.packages` list over 1000 entries, more than 100000 skipped advisories or findings) is a usage error before any request or write: exit **2**, `error.code` `filter_invalid`, the message naming the file and the entry (`selection filter filter.json: reachability[3].package: …`).
+- Only `scan` reads it (every mode, wet and `--dry-run`). The in-memory engine does not take one yet.
+
 ### Per-run limit on new patches (`scan --max-new-patches`, v5.0)
 
 `scan --max-new-patches <N|none>` (env `SOCKET_MAX_NEW_PATCHES`; socket.yml `patches.maxNewPatches`) paces a rollout: each run adds at most N patches to packages that had none, the most critical first, and defers the rest to the next run. It applies to `scan` in hosted, vendored and agent mode, wet and `--dry-run`, and to the in-memory engine (napi `maxNewPatches`, `hosted-bundle`); `get` is explicit intent and ignores it. Usage guide: [gradual rollout](../../docs/configuration.md#gradual-rollout).
@@ -1708,6 +1739,7 @@ Empty string means unset at every layer: exported-but-empty flag-bound vars are 
 | `SOCKET_SCAN_PACKAGES` | `scan --package` | (none) | Local to `scan` (v5.0); comma-separated names or purls. |
 | `SOCKET_NO_SOCKET_YML` | `scan --no-socket-yml` | `false` | Local to `scan` (v5.0); bool vocabulary, empty = unset. `list`, `rollback`, `vex`, `apply`, `repair` and `remove` read it when they look for the patched project directories below `--cwd`, so they find the directories the scan covered. |
 | `SOCKET_MIN_SEVERITY` | `scan --min-severity` | (none) | Local to `scan` (v5.0); read by scan (not clap) so the `policy` block can say `source: "env"`; empty = unset, malformed = exit 2. |
+| `SOCKET_SELECTION_FILTER` | `scan --selection-filter` | (none) | Local to `scan`; **internal** (hidden flag, see "Selection filter"). Path of the selection filter file; empty = unset. |
 | `SOCKET_SAVE_ONLY` | `get --save-only` | `false` | Local to `get`. |
 | `SOCKET_ALL_RELEASES` | `get --all-releases` / `scan --all-releases` | `false` | Local to `get`/`scan`. Download patches for every release/distribution variant, not just the installed one. |
 | `SOCKET_SKIP_ROLLBACK` | `remove --skip-rollback` | `false` | Local to `remove`. Conflicts with `--preserve-state`/`SOCKET_PRESERVE_STATE` (exit 2 — see below). |
@@ -2182,6 +2214,7 @@ outcome for a selected record, rather than inferring a write from exit 0.
 | `path_outside_repo`   | scan                             | Usage error (exit 2): a PATH is outside the repository root socket.yml is read from. |
 | `path_glob_invalid`   | scan, rollback                   | Usage error (exit 2): a path glob cannot be parsed. |
 | `invalid_env`         | scan                             | Usage error (exit 2): a malformed `SOCKET_MIN_SEVERITY` or `SOCKET_MAX_NEW_PATCHES`. |
+| `filter_invalid`      | scan                             | Usage error (exit 2): the `--selection-filter` file cannot be read or honored (internal interface, see "Selection filter"). |
 | `json_requires_output` | vex                             | Usage error (exit 2): `--json` without `--output`. |
 | `no_patches`          | vex                              | The manifest file exists but is empty AND no vendor-ledger record or lockfile reference names a patch (exit 1). |
 | `vendor_ledger_corrupt` | vex (every form) | `.socket/vendor/state.json` exists but is malformed or unreadable. The vendor ledger is an attestation input (records and liveness), so attesting from a partial view is refused (exit 2 standalone; the host command fails). A missing ledger is simply empty. |

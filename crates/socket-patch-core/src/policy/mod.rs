@@ -6,12 +6,17 @@
 //! CLI_CONTRACT.md): nothing here names an endpoint, a credential, a mode
 //! or a safety switch. Because it only narrows, an unreadable or invalid
 //! file fails closed ([`PolicyError`]) instead of meaning "no policy".
+//!
+//! One invocation can narrow further with a selection filter
+//! ([`filter`], `scan --selection-filter`): its skip lists and
+//! reachability findings are judged here, beside the file's lists.
 
+pub mod filter;
 pub mod paths;
 mod report;
 pub mod socket_yml;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
@@ -21,6 +26,7 @@ use crate::crawlers::python_crawler::canonicalize_pypi_name;
 use crate::crawlers::Ecosystem;
 use crate::utils::purl_key::PurlKey;
 
+use self::filter::SelectionFilter;
 use self::paths::{PathHit, PathMatcher};
 use self::socket_yml::{parse_file, ParsedFile, PatchesBlock};
 
@@ -110,6 +116,20 @@ pub enum FilterReason {
         found: Option<String>,
         floor: String,
     },
+    /// The selection filter's `skip.paths`.
+    FilterPath {
+        pattern: String,
+    },
+    /// The selection filter's `skip.packages`.
+    FilterPackage {
+        spec: String,
+    },
+    /// The selection filter withholds the patch: no advisory it fixes
+    /// needs a fix (each skipped, unreachable or unlisted, as `detail`
+    /// says).
+    FilterNotNeeded {
+        detail: String,
+    },
 }
 
 impl FilterReason {
@@ -122,6 +142,9 @@ impl FilterReason {
             FilterReason::PackageNotListed => "policy_package_not_listed",
             FilterReason::PackageIgnored { .. } => "policy_package_ignored",
             FilterReason::Severity { .. } => "policy_severity",
+            FilterReason::FilterPath { .. } => "filter_path_skipped",
+            FilterReason::FilterPackage { .. } => "filter_package_skipped",
+            FilterReason::FilterNotNeeded { .. } => "filter_not_needed",
         }
     }
 
@@ -140,6 +163,9 @@ impl FilterReason {
             FilterReason::Severity { found, floor } => {
                 format!("{} < {floor}", found.as_deref().unwrap_or("unknown"))
             }
+            FilterReason::FilterPath { pattern } => format!("{} (skip.paths)", sanitize(pattern)),
+            FilterReason::FilterPackage { spec } => format!("{} (skip.packages)", sanitize(spec)),
+            FilterReason::FilterNotNeeded { detail } => detail.clone(),
         }
     }
 }
@@ -402,6 +428,9 @@ pub struct SelectionPolicy {
     min_severity: Option<u8>,
     min_severity_source: SeveritySource,
     max_new_patches: Option<u32>,
+    /// The invocation's selection filter (shared: a policy is cloned per
+    /// project root).
+    filter: Option<std::sync::Arc<SelectionFilter>>,
 }
 
 /// Canonical severity name of an order (`moderate` reads as `medium`).
@@ -509,7 +538,43 @@ impl SelectionPolicy {
                 SeveritySource::Default
             },
             max_new_patches: block.max_new_patches,
+            filter: None,
         })
+    }
+
+    /// Narrow this policy further with the invocation's selection filter.
+    /// It applies whatever the policy's source, a bypassed file included.
+    pub fn with_filter(mut self, filter: SelectionFilter) -> Self {
+        self.filter = Some(std::sync::Arc::new(filter));
+        self
+    }
+
+    /// The invocation's selection filter, if it gave one.
+    pub fn filter(&self) -> Option<&SelectionFilter> {
+        self.filter.as_deref()
+    }
+
+    /// How the selection filter judges one package's patches (`offers`, all
+    /// for one package, in any order). A patch is withheld only when no
+    /// advisory it fixes needs a fix; one that is not withheld is wanted
+    /// whole, so the ranking and the severity floor judge it as they always
+    /// do. Without a filter nothing is withheld and nothing preferred.
+    pub fn judge_offers(&self, offers: &[PatchSearchResult]) -> OfferJudgement {
+        let Some(filter) = &self.filter else {
+            return OfferJudgement {
+                withheld: vec![None; offers.len()],
+                sole_fix: Vec::new(),
+            };
+        };
+        let judged = filter.judge(offers);
+        OfferJudgement {
+            withheld: judged
+                .withheld
+                .into_iter()
+                .map(|detail| detail.map(|detail| FilterReason::FilterNotNeeded { detail }))
+                .collect(),
+            sole_fix: judged.sole_fix,
+        }
     }
 
     fn apply_overrides(&mut self, overrides: &PolicyOverrides) {
@@ -637,26 +702,11 @@ impl SelectionPolicy {
         } else {
             &self.ignore_discovered
         };
-        let mut first_hit: Option<PathHit> = None;
-        let mut all_ignored = true;
-        for (path, is_dir) in &subjects {
-            match ignore.check(path, *is_dir) {
-                Some(hit) => {
-                    first_hit.get_or_insert(hit);
-                }
-                None => {
-                    all_ignored = false;
-                    break;
-                }
-            }
-        }
-        if all_ignored {
-            if let Some(hit) = first_hit {
-                return Err(FilterReason::PathExcluded {
-                    pattern: sanitize(&hit.pattern),
-                    list: hit.list,
-                });
-            }
+        if let Some(hit) = ignored_by(ignore, &subjects) {
+            return Err(FilterReason::PathExcluded {
+                pattern: sanitize(&hit.pattern),
+                list: hit.list,
+            });
         }
         if let Some(include) = &self.include {
             if !subjects
@@ -665,6 +715,13 @@ impl SelectionPolicy {
             {
                 return Err(FilterReason::PathNotIncluded);
             }
+        }
+        // The selection filter's list is matched on its own: its negations
+        // cannot re-include a root the lists above excluded.
+        if let Some(hit) = self.filter.as_ref().and_then(|f| f.skips_root(&subjects)) {
+            return Err(FilterReason::FilterPath {
+                pattern: sanitize(&hit.pattern),
+            });
         }
         Ok(())
     }
@@ -683,6 +740,11 @@ impl SelectionPolicy {
             .find(|s| package_spec_matches(s, purl))
         {
             return Err(FilterReason::PackageIgnored {
+                spec: sanitize(spec),
+            });
+        }
+        if let Some(spec) = self.filter.as_ref().and_then(|f| f.skips_package(purl)) {
+            return Err(FilterReason::FilterPackage {
                 spec: sanitize(spec),
             });
         }
@@ -729,12 +791,43 @@ impl SelectionPolicy {
     }
 }
 
+/// [`SelectionPolicy::judge_offers`]: the selection filter's say on one
+/// package's patches.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OfferJudgement {
+    /// Per offer, in order: why the filter withholds it (`None`: it does
+    /// not).
+    pub withheld: Vec<Option<FilterReason>>,
+    /// The filter's one preference: the indices of the patches that fix the
+    /// package's one needed advisory and nothing else
+    /// ([`filter::Judgement::sole_fix`]).
+    pub sole_fix: Vec<usize>,
+}
+
+/// The pattern that ignores a project root, given its subjects (each
+/// marker's repo-relative path, or the directory itself, with whether it
+/// is a directory): a root is ignored iff every subject is. The first
+/// subject's pattern is the one reported.
+fn ignored_by(matcher: &PathMatcher, subjects: &[(String, bool)]) -> Option<PathHit> {
+    let mut first_hit: Option<PathHit> = None;
+    for (path, is_dir) in subjects {
+        let hit = matcher.check(path, *is_dir)?;
+        first_hit.get_or_insert(hit);
+    }
+    first_hit
+}
+
 /// The step 5 → 7 seam: every offer per purl (after the tier filter) and
-/// the winner among the floor-admitted ones.
+/// the winner among the admitted ones.
 #[derive(Debug, Clone, Default)]
 pub struct Offers {
     pub unfiltered: BTreeMap<String, Vec<PatchSearchResult>>,
     pub selected: BTreeMap<String, PatchSearchResult>,
+    /// The offers a selection filter withholds, as `(purl, uuid)`: nothing
+    /// they fix needs a fix. Empty without a filter. A recorded patch among
+    /// them gives way to the selection, whatever it ranks
+    /// ([`crate::rollout::stage::classify`]).
+    pub withheld: BTreeSet<(String, String)>,
 }
 
 /// Whether a `--package` spec names the package at `purl`: a purl spec

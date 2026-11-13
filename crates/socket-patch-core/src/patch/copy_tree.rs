@@ -655,6 +655,9 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn relax_loop_must_not_traverse_symlinked_root() {
+        if unsafe { libc::geteuid() } == 0 {
+            return; // root bypasses permission bits; nothing to test
+        }
         let base = tempfile::tempdir().unwrap();
         // External target tree with restrictive perms.
         let target = base.path().join("target");

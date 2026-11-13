@@ -1328,6 +1328,66 @@ distribution = false
         }
     }
 
+    /// PDM 0.x keeps an extras unit's file hashes under a key of its own,
+    /// `<name>[<extras>] <version>`. Vendoring rewrites both keys and the
+    /// revert takes both back (5.1.0 refused it as a change to another
+    /// package's entry).
+    #[tokio::test]
+    async fn revert_round_trip_restores_a_legacy_lock_with_extras() {
+        const WHEEL: &str = "urllib3-1.26.18-py2.py3-none-any.whl";
+        let rel_wheel = format!(".socket/vendor/pypi/{UUID}/{WHEEL}");
+        let before = crate::utils::pdm_lock::tests::fixture("0.12.3-extras");
+        let tmp = write_project(
+            &before,
+            "[tool.pdm]\nname = \"legacy-extras\"\nversion = \"0.0.0\"\npython_requires = \">=3.8\"\n\n[tool.pdm.dependencies]\nurllib3 = {version = \"==1.26.18\", extras = [\"socks\"]}\n",
+        )
+        .await;
+        let p = load_pdm_project(tmp.path()).await.unwrap();
+        let (wiring, meta) = wire_pdm(
+            &p,
+            tmp.path(),
+            "urllib3",
+            "1.26.18",
+            &rel_wheel,
+            WHEEL,
+            WHEEL_SHA,
+            UUID,
+            &[WHEEL_SHA],
+        )
+        .await
+        .unwrap();
+        let vendored = read_lock(tmp.path()).await;
+        assert_eq!(vendored.matches(&rel_wheel).count(), 2, "{vendored}");
+        assert_eq!(
+            vendored.matches(&format!("sha256:{WHEEL_SHA}")).count(),
+            2,
+            "{vendored}"
+        );
+        let entry = VendorEntry {
+            flavor: Some("pdm".into()),
+            pdm: Some(meta),
+            ..VendorEntry::new(
+                "pypi".into(),
+                "pkg:pypi/urllib3@1.26.18".into(),
+                UUID.into(),
+                VendorArtifact {
+                    yarn_berry10c0: None,
+                    path: rel_wheel.clone(),
+                    sha256: WHEEL_SHA.into(),
+                    size: Some(11053),
+                    platform_locked: None,
+                    file_inventory: None,
+                },
+                wiring,
+            )
+        };
+
+        let outcome = revert_pdm(&entry, tmp.path(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+        assert_eq!(read_lock(tmp.path()).await, before, "byte-identical revert");
+    }
+
     /// The lock file is user-owned: wiring the splice must not reset its
     /// permission bits (see `atomic_write_bytes_preserving_mode`; the revert
     /// leg is covered in common.rs).

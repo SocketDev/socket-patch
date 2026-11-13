@@ -512,6 +512,72 @@ fn composer_package_filters_match_release_identity_and_preserve_branch_case() {
     ));
 }
 
+/// A selection filter narrows beside the file's lists: its own reason
+/// codes, its paths matched on their own list, and it survives a bypass.
+#[test]
+fn a_selection_filter_narrows_roots_and_packages_beside_the_file() {
+    use super::filter::SelectionFilter;
+    let filter = |json: &str| SelectionFilter::parse(json.as_bytes()).unwrap();
+    let json = r#"{"version": 1, "skip": {
+        "paths": ["/apps/admin/", "!/legacy/"],
+        "packages": ["pkg:npm/left-pad"]
+    }}"#;
+    let yml = "version: 2\npatches:\n  ignorePaths: [\"/legacy/\"]\n  ignorePackages: [lodash]\n";
+    let policy = load(&[("socket.yml", yml)]).with_filter(filter(json));
+    let lock = strings(&["package-lock.json"]);
+
+    let err = policy
+        .admits_root(&root("apps/admin", &lock, true))
+        .unwrap_err();
+    assert_eq!(err.code(), "filter_path_skipped");
+    assert_eq!(err.detail(), "/apps/admin/ (skip.paths)");
+    assert!(policy.admits_root(&root("apps/web", &lock, true)).is_ok());
+    // The filter's negation cannot re-include what socket.yml ignores.
+    let err = policy
+        .admits_root(&root("legacy", &lock, true))
+        .unwrap_err();
+    assert_eq!(err.code(), "policy_path_excluded");
+
+    let err = policy.admits_purl("pkg:npm/left-pad@1.3.0").unwrap_err();
+    assert_eq!(err.code(), "filter_package_skipped");
+    assert_eq!(err.detail(), "pkg:npm/left-pad (skip.packages)");
+    assert_eq!(
+        policy
+            .admits_purl("pkg:npm/lodash@4.17.20")
+            .unwrap_err()
+            .code(),
+        "policy_package_ignored"
+    );
+    assert!(policy.admits_purl("pkg:npm/minimist@1.2.5").is_ok());
+
+    // `--no-socket-yml` drops the file, not the invocation's filter.
+    let overrides = PolicyOverrides {
+        bypass: true,
+        min_severity: None,
+    };
+    let bypassed = SelectionPolicy::load(&mem(&[("socket.yml", yml)]), &overrides)
+        .unwrap()
+        .0
+        .with_filter(filter(json));
+    assert!(bypassed.admits_root(&root("legacy", &lock, true)).is_ok());
+    assert!(bypassed.admits_purl("pkg:npm/lodash@4.17.20").is_ok());
+    assert!(bypassed.admits_purl("pkg:npm/left-pad@1.3.0").is_err());
+
+    // The block names the filter only on a run that was given one.
+    let block = policy_block(&policy, &[], &[]);
+    assert_eq!(
+        block["selectionFilter"],
+        serde_json::json!({
+            "sha256": hex::encode(Sha256::digest(json.as_bytes())),
+            "skip": {"paths": 2, "packages": 1, "advisories": 0},
+            "reachability": 0,
+            "unlistedAdvisories": "patch",
+        })
+    );
+    let plain = policy_block(&load(&[("socket.yml", yml)]), &[], &[]);
+    assert!(plain.get("selectionFilter").is_none());
+}
+
 #[test]
 fn enabled_false_is_reported_by_callers() {
     let policy = load(&[("socket.yml", "version: 2\npatches:\n  enabled: false\n")]);

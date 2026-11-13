@@ -307,12 +307,26 @@ pub(crate) fn user_patch_withheld_lines(declared: usize, unreadable: usize) -> V
 
 /// What a bare scan's search for project directories left out, one line
 /// each: roots under an ignored path, and a walk that gave up.
-pub(super) fn discovery_notes(ignored: usize, truncated: bool) -> Vec<String> {
+/// `filter_paths`: the run's selection filter skips roots by path too (and
+/// goes on skipping one that is named).
+pub(super) fn discovery_notes(ignored: usize, truncated: bool, filter_paths: bool) -> Vec<String> {
     let mut lines = Vec::new();
     if ignored > 0 {
+        let (lists, unless) = if filter_paths {
+            (
+                "socket.yml path filters, the selection filter's skip.paths and the built-in \
+                 test and fixture directories",
+                " (the selection filter still skips the ones it names)",
+            )
+        } else {
+            (
+                "socket.yml path filters and the built-in test and fixture directories",
+                "",
+            )
+        };
         lines.push(format!(
-            "Note: {} under ignored paths (socket.yml path filters and the built-in \
-             test and fixture directories) {} not scanned; name a directory to scan it.",
+            "Note: {} under ignored paths ({lists}) {} not scanned; name a directory to scan \
+             it{unless}.",
             plural(ignored, "project directory", "project directories"),
             if ignored == 1 { "was" } else { "were" },
         ));

@@ -1209,7 +1209,8 @@ fn toml_json(item: &Item) -> serde_json::Value {
 /// of the key `parent`: array elements that name the package (a
 /// requirement string, a `{ name = … }` entry, a lock unit), its key in a
 /// `sources` table or in a lock's `files` / `hashes` table (Poetry's and
-/// PDM's older formats, the latter keyed `<name> <version>`), the Hatch
+/// PDM's older formats, the latter keyed `<name> <version>`, or
+/// `<name>[<extras>] <version>` for a unit with extras), the Hatch
 /// direct-reference permission, and then every table and array left
 /// empty.
 fn drop_package(value: &mut serde_json::Value, parent: &str, canon: &str) {
@@ -1217,11 +1218,12 @@ fn drop_package(value: &mut serde_json::Value, parent: &str, canon: &str) {
     let names = |name: &str| canonicalize_pypi_name(name) == canon;
     match value {
         Json::Object(map) => {
-            let keyed = matches!(parent, "sources" | "files" | "hashes");
-            map.retain(|key, _| {
-                key != "allow-direct-references"
-                    && !(keyed && names(key.split_whitespace().next().unwrap_or_default()))
-            });
+            let own = |key: &str| match parent {
+                "sources" => names(key.split_whitespace().next().unwrap_or_default()),
+                "files" | "hashes" => names(crate::utils::pdm_lock::files_key_package(key)),
+                _ => false,
+            };
+            map.retain(|key, _| key != "allow-direct-references" && !own(key));
             for (key, child) in map.iter_mut() {
                 drop_package(child, key, canon);
             }
@@ -3674,6 +3676,47 @@ mod tests {
                 "{table}"
             );
         }
+    }
+
+    /// A revert of what the PDM writer wrote is the package's own in every
+    /// native lock format. PDM 0.x keys an extras unit's files
+    /// `<name>[<extras>] <version>`: read as another package's key, it made
+    /// `rollback` refuse to undo its own vendoring of a dependency declared
+    /// with extras.
+    #[test]
+    fn confinement_allows_a_pdm_revert_in_every_native_format() {
+        use crate::utils::pdm_lock::tests::{fixture as native_lock, REWRITABLE};
+        const WHEEL: &str = "urllib3-1.26.18-py2.py3-none-any.whl";
+        for fixture in REWRITABLE {
+            let original = native_lock(fixture);
+            let vendored = crate::utils::pdm_lock::rewrite_pdm_lock(
+                &original,
+                "urllib3",
+                "1.26.18",
+                ("path", &format!("./.socket/vendor/pypi/u/{WHEEL}")),
+                WHEEL,
+                &"a".repeat(64),
+            )
+            .unwrap();
+            assert_ne!(vendored, original, "{fixture}");
+            assert_eq!(
+                confinement_refusal(&vendored, &original, "urllib3"),
+                None,
+                "{fixture}"
+            );
+        }
+
+        // Another package's extras key is still not the package's own, and
+        // a `sources` key is a name: nothing is read off the end of one.
+        let wired = "[metadata]\ncontent_hash = \"h\"\n\n[metadata.files]\n\"six[socks] 1.16.0\" = [{ file = \"six.whl\", hash = \"sha256:cc\" }]\n\"idna[socks] 3.7\" = [{ file = \"idna.whl\", hash = \"sha256:dd\" }]\n";
+        let restored = wired.replace("sha256:cc", "sha256:bb");
+        assert_eq!(confinement_refusal(wired, &restored, "six"), None);
+        assert!(
+            confinement_refusal(wired, &restored.replace("sha256:dd", "sha256:ee"), "six")
+                .is_some()
+        );
+        let sourced = "[tool.uv.sources]\n\"six[socks]\" = { path = \"a\" }\n";
+        assert!(confinement_refusal(sourced, &sourced.replace("\"a\"", "\"b\""), "six").is_some());
     }
 
     /// ...and what it may not: another package, a setting, or anything in a
