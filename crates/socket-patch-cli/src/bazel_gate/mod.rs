@@ -249,8 +249,12 @@ impl<'a> LoadedRoot<'a> {
     /// The files of the root, as every project of the run has read them
     /// since the last commit the loader was told of.
     ///
-    /// It is a read cache and no snapshot: a file is read when it is
-    /// first asked for and never again. So it is not the base of a
+    /// It is a read cache: a file is read when it is first asked for and
+    /// never again. Once the loader is told of a commit under the root
+    /// the view is frozen (`DiskView::freeze`): it goes on answering what
+    /// it had read, and a path nobody had asked for is `Unreadable`, never
+    /// the bytes of after the commit and never `Absent`. So a load held
+    /// across a commit is the root as it was, and it is not the base of a
     /// transaction. A seam reads what it is about to write over from a
     /// view made after the last commit of the run, and tells the loader
     /// once its own has landed ([`Loader::committed`]).
@@ -517,7 +521,11 @@ impl Loader {
     /// the files below it, and a view reads as far up as its read
     /// boundary, so both directions count. A load that a caller still
     /// holds keeps what it read: it is the root of before the commit, and
-    /// nothing may be written from it.
+    /// nothing may be written from it. Its view is frozen, so what it had
+    /// not read by now it cannot read any more: a lane or a gate that asks
+    /// it for a file after the commit is told `Unreadable` and refuses,
+    /// where it would have judged a model of before the commit by bytes
+    /// of after it.
     ///
     /// Which directories are Bazel roots is not asked again: socket-patch
     /// creates no boundary file.
@@ -537,7 +545,13 @@ impl Loader {
         };
         let mut memo = self.memo();
         memo.commits += 1;
-        memo.roots.retain(|(root, _), _| !touched(root));
+        memo.roots.retain(|(root, _), state| {
+            let dropped = touched(root);
+            if dropped {
+                state.view.freeze();
+            }
+            !dropped
+        });
         let built_on = |key: &ProjectKey| key.0.iter().any(|(root, _, _)| touched(root));
         memo.projects.retain(|key, _| !built_on(key));
         let built_on = |loaded: &Arc<Loaded>| loaded.survey.roots.iter().any(|r| touched(&r.root));
@@ -1742,6 +1756,53 @@ mod tests {
         loader.committed(&repo.top);
         assert!(Arc::ptr_eq(&at_other, &loader.load(&other.top)));
         assert!(at_app1.upgrade().is_none(), "a load of before the commit");
+    }
+
+    /// A load held across a commit is the root as it was, for every file
+    /// (ROUTED R-136). What it had read it still answers; what it is
+    /// asked for the first time after the commit it does not read, so no
+    /// byte of after the commit is judged beside its model. Only the root
+    /// the commit touched is closed.
+    #[test]
+    fn a_load_of_before_a_commit_reads_nothing_of_after_it() {
+        let repo = Repo::new(&[JS_MODULE, PNPM_LOCK, BAZEL_9, ("late.bzl", "X = 0\n")]);
+        let other = Repo::new(&[JS_MODULE, PNPM_LOCK, BAZEL_9, ("late.bzl", "X = 0\n")]);
+        let loader = Loader::new(RunCx::default());
+        let before = loader.load(&repo.top);
+        let elsewhere = loader.load(&other.top);
+        let old = outer(&before);
+        let lock = old.files().read(PNPM_LOCK.0);
+        assert_eq!(lock.as_bytes(), Some(PNPM_LOCK.1.as_bytes()));
+        assert!(!old.files().is_frozen());
+
+        // The commit of a seam: the lock, and two files nobody has read.
+        repo.put(PNPM_LOCK.0, "lockfileVersion: 'after'\n");
+        repo.put("late.bzl", "X = 1\n");
+        repo.put("new.bzl", "Y = 1\n");
+        loader.committed(&repo.top);
+
+        assert!(old.files().is_frozen());
+        assert_eq!(old.files().read(PNPM_LOCK.0), lock);
+        for unread in ["late.bzl", "new.bzl", "never.bzl"] {
+            assert_eq!(old.files().read(unread), FileText::Unreadable, "{unread}");
+        }
+        assert_eq!(old.files().list("never"), None);
+        // The next load reads the disk.
+        let after = loader.load(&repo.top);
+        let new = outer(&after);
+        assert!(!new.files().is_frozen());
+        assert_eq!(
+            new.files().read("late.bzl").as_bytes(),
+            Some(&b"X = 1\n"[..])
+        );
+        assert_eq!(new.files().read("never.bzl"), FileText::Absent);
+        // A root the commit did not touch is read as before.
+        let untouched = outer(&elsewhere);
+        assert!(!untouched.files().is_frozen());
+        assert_eq!(
+            untouched.files().read("late.bzl").as_bytes(),
+            Some(&b"X = 0\n"[..])
+        );
     }
 
     /// A load that was read while a commit landed is of neither side of

@@ -26,15 +26,15 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use super::label::Repo;
+use super::label::{Label, Repo};
 use super::model::{
     BazelWorkspace, BoundaryFiles, DeclSystem, EffectiveFlags, FileView, FlagState, Gap,
     Governance, Hub, HubId, Liveness, LockRef, LockRole, ModuleLock, Probe, Ruleset, RulesetDetail,
     RulesetSignal, Site,
 };
 use super::module_file::{
-    GapScope, GapWhy, ModuleGap, ModuleModel, ModuleOverride, NameSource, OverrideKind as Declared,
-    Tag, Visibility, MODULE_FILE,
+    GapScope, GapWhy, Host, ModuleGap, ModuleModel, ModuleOverride, NameSource,
+    OverrideKind as Declared, Tag, Visibility, MODULE_FILE,
 };
 use super::rc::{Chain, Flag, LockfileMode};
 use super::ruleset_version::{
@@ -903,6 +903,91 @@ pub(super) fn reads_module(worlds: &Result<Vec<DepSystem>, Gap>) -> bool {
     }
 }
 
+/// The boundary files as Bazel opens them: with the path `WORKSPACE`
+/// counted where it is a directory Bazel opens and stops on
+/// ([`is_directory`]).
+fn opened(boundary: &BoundaryFiles, workspace_files: &[WorkspaceModel]) -> BoundaryFiles {
+    let directory = |model: &WorkspaceModel| is_directory(model, boundary);
+    BoundaryFiles {
+        workspace: boundary.workspace || workspace_files.iter().any(directory),
+        ..*boundary
+    }
+}
+
+/// For each model of `workspace_files`, in order, whether some dependency
+/// system of `worlds` evaluates the `WORKSPACE`-family file it was read
+/// from ([`evaluates`]). A model that names no file may be anyone's.
+///
+/// `detect` asks this before there is a workspace: a recognizer's gap in
+/// a macro file that only models with `false` here hold is read a second
+/// time without them ([`Evaluated::gap`]).
+pub(super) fn evaluated_models(
+    worlds: &Result<Vec<DepSystem>, Gap>,
+    boundary: &BoundaryFiles,
+    workspace_files: &[WorkspaceModel],
+) -> Vec<bool> {
+    let opened = opened(boundary, workspace_files);
+    let may = |model: &WorkspaceModel| {
+        root_file(model).is_none_or(|path| evaluates(worlds, &opened, path))
+    };
+    workspace_files.iter().map(may).collect()
+}
+
+/// Whether Bazel may run a function of a macro file by a way that no
+/// second reading of a recognizer shows (`detect`): `live` is
+/// [`evaluated_models`] of `workspace_files`.
+///
+/// Two ways exist. A `WORKSPACE`-family file Bazel evaluates that loads
+/// macro files of its own: the model follows one level of macros, so a
+/// function of one of them may call into any other `.bzl` file of the
+/// repository. And, where Bzlmod may be on, a module extension or a
+/// repository rule that the root module takes from a file of the main
+/// repository (`use_extension("//:extensions.bzl", ...)`,
+/// `use_repo_rule`): its implementation is not read, and it may call the
+/// macro a `WORKSPACE` used to call, which is how a migration wraps one.
+///
+/// A file of a module the root names by a `bazel_dep` is not one of the
+/// main repository, and neither is one of Bazel's built-in modules. Every
+/// other label counts: one Bazel would reject, and one into a repository
+/// no `bazel_dep` gives, which an extension or a repository rule of the
+/// root generated (a `local_repository` over a directory of the checkout)
+/// and which sees the root's files under the root's own names.
+///
+/// What is left when this is `false` is a BUILD file that loads the
+/// macro file, which declares no repository and which the recognizers
+/// scan for by themselves.
+pub(super) fn runs_macro_files_unseen(
+    worlds: &Result<Vec<DepSystem>, Gap>,
+    module: Option<&ModuleModel>,
+    workspace_files: &[WorkspaceModel],
+    live: &[bool],
+) -> bool {
+    /// Every module depends on these with no `bazel_dep`
+    /// (`ModuleFileFunction.getBuiltinModules`: both at 7.7.2 `:820-833`,
+    /// `bazel_tools` alone at 9.3.2 `:1011-1013`).
+    const BUILT_IN: [&str; 2] = ["bazel_tools", "local_config_platform"];
+    let models = workspace_files.iter().zip(live);
+    let nested = |(model, live): (&WorkspaceModel, &bool)| *live && model.files.len() > 1;
+    let own = |module: &ModuleModel, label: &Option<Label>| {
+        let Some(label) = label else {
+            return true;
+        };
+        match (module.host(label), &label.repo) {
+            (Host::Dep(_), _) => false,
+            (Host::Root, _) | (Host::Unknown, Repo::Main) => true,
+            (Host::Unknown, Repo::Apparent(name) | Repo::Canonical(name)) => {
+                !BUILT_IN.contains(&name.as_str())
+            }
+        }
+    };
+    let extends = |module: &ModuleModel| {
+        let extensions = module.proxies.iter().map(|proxy| &proxy.label);
+        let rules = module.repo_rules.iter().map(|rule| &rule.label);
+        extensions.chain(rules).any(|label| own(module, label))
+    };
+    models.into_iter().any(nested) || (reads_module(worlds) && module.is_some_and(extends))
+}
+
 /// Which files of a root Bazel may evaluate, under the dependency systems
 /// the workspace may run. What was not read holds an ecosystem up only
 /// where Bazel may evaluate it: a `WORKSPACE` left behind beside
@@ -914,25 +999,43 @@ pub(super) fn reads_module(worlds: &Result<Vec<DepSystem>, Gap>) -> bool {
 ///
 /// Every test here errs towards "may": with no dependency system known,
 /// and for a file whose reader is not known, the answer is yes.
+///
+/// A macro file is the one case a file does not answer (ROUTED R-135): a
+/// `.bzl` file that a `WORKSPACE` loads can be loaded by a BUILD file or
+/// run by a module extension too, and a recognizer's gap names the file,
+/// not the reader that met the statement. There the answer is the
+/// recognizer's own: `detect` runs it a second time without the
+/// `WORKSPACE`-family files Bazel never evaluates, and a gap that the
+/// second reading does not report is one of the dead file alone
+/// (`BazelWorkspace::unevaluated_gaps`). So a root answers as it would
+/// with the dead file deleted, which is what Bazel builds: a hub rule
+/// nobody followed in the macro file of a leftover `WORKSPACE` holds
+/// nothing up, and what a recognizer says of a `.bzl` file no
+/// `WORKSPACE` reads it still says (`rulesets::rules_rust` reports each
+/// use of `crates_repository` there).
+///
+/// The limit that stays, on purpose: the second reading is trusted only
+/// where nothing it cannot see may run the macro file
+/// ([`runs_macro_files_unseen`]). In a root whose module takes an
+/// extension or a repository rule from one of its own files, and beside a
+/// `WORKSPACE`-family file Bazel evaluates that has macro files of its
+/// own, a gap in the macro file of a dead `WORKSPACE` counts as before:
+/// most recognizers do not read the implementation of an extension, and a
+/// gap that is dropped there could be the one use Bazel runs. That
+/// over-refuses and never the reverse; the gap names the file to fix.
 struct Evaluated<'a> {
     ws: &'a BazelWorkspace,
     worlds: Result<Vec<DepSystem>, Gap>,
-    /// The boundary files, with the path `WORKSPACE` counted where it is
-    /// a directory Bazel opens and stops on ([`is_directory`]).
+    /// The boundary files as Bazel opens them ([`opened`]).
     opened: BoundaryFiles,
 }
 
 impl<'a> Evaluated<'a> {
     fn of(ws: &'a BazelWorkspace) -> Self {
-        let directory = |model: &WorkspaceModel| is_directory(model, &ws.boundary);
-        let opened = BoundaryFiles {
-            workspace: ws.boundary.workspace || ws.workspace_files.iter().any(directory),
-            ..ws.boundary
-        };
         Self {
             ws,
             worlds: worlds(ws),
-            opened,
+            opened: opened(&ws.boundary, &ws.workspace_files),
         }
     }
 
@@ -955,13 +1058,20 @@ impl<'a> Evaluated<'a> {
     }
 
     /// The statement a recognizer's gap names. A gap says which file it
-    /// is in and not which system reads the statement, so it is dropped
-    /// only where the file answers that: a `WORKSPACE`-family file itself
-    /// (nothing else loads one), a file of the `MODULE.bazel` closure, and
-    /// for the order rule, which is of a `WORKSPACE` model by
-    /// construction, a macro file of that family. Any other gap in a
-    /// `.bzl` file counts: a BUILD file or a module extension may load
-    /// the file too (a `crates_vendor` target, a label scan).
+    /// is in and not which system reads the statement, so the file
+    /// answers where it can: a `WORKSPACE`-family file itself (nothing
+    /// else loads one), a file of the `MODULE.bazel` closure, and for the
+    /// order rule, which is of a `WORKSPACE` model by construction, a
+    /// macro file of that family.
+    ///
+    /// Any other gap in a macro file counts with each `WORKSPACE`-family
+    /// file that loads it. Where Bazel evaluates none of them a BUILD
+    /// file or a module extension may still load the file (a
+    /// `crates_vendor` target, a label scan), so the gap counts unless
+    /// `detect` found that the recognizer reports it for the dead
+    /// `WORKSPACE` file alone (`BazelWorkspace::unevaluated_gaps`). That
+    /// list is believed only here, for a file whose every loader is dead:
+    /// it never drops a gap of a file Bazel evaluates.
     fn gap(&self, gap: &Gap) -> bool {
         let models = &self.ws.workspace_files;
         if models
@@ -973,12 +1083,17 @@ impl<'a> Evaluated<'a> {
         }
         let holds = |model: &&WorkspaceModel| model.files.iter().any(|f| f.path == gap.file);
         let mut holders = models.iter().filter(holds).filter_map(root_file).peekable();
-        if gap.token == WORKSPACE_DEFINITION_ORDER && holders.peek().is_some() {
-            return holders.any(|home| self.workspace_file(home));
+        if holders.peek().is_some() {
+            if holders.any(|home| self.workspace_file(home)) {
+                return true;
+            }
+            let of_a_dead_file =
+                gap.token == WORKSPACE_DEFINITION_ORDER || self.ws.unevaluated_gaps.contains(gap);
+            return !of_a_dead_file;
         }
         let module = self.ws.module.as_ref();
         let in_closure = module.is_some_and(|m| m.files.iter().any(|f| f.path == gap.file));
-        !in_closure || holders.peek().is_some() || reads_module(&self.worlds)
+        !in_closure || reads_module(&self.worlds)
     }
 }
 
@@ -2780,18 +2895,257 @@ pub(super) mod tests {
         let found = governance(&with("7.7.2", "", &leftover), Ecosystem::Pypi, "");
         assert_eq!(tokens(&found), [LABEL_NOT_LITERAL]);
 
-        // What is not dropped: a recognizer's gap in a `.bzl` file. A gap
-        // names its file and not the system that reads the statement, and
-        // a BUILD file or a module extension may load a macro file too.
-        // Only the order rule's gap is a `WORKSPACE` statement by
-        // construction.
+        // A recognizer's gap in a macro file (ROUTED R-135). A gap names
+        // its file and not the reader that met the statement, and a BUILD
+        // file or a module extension may load a macro file too, so the
+        // file does not answer. The recognizer does: read again without
+        // the `WORKSPACE` Bazel never evaluates, it no longer reports the
+        // gap, which was of the dead file alone.
         let handed = "load(\"@aspect_rules_js//npm:repositories.bzl\", \"npm_translate_lock\")\n\
             def deps():\n    other(npm_translate_lock)\n";
-        let ws = with("9.3.2", "", &[load, ("deps.bzl", handed)]);
-        assert_eq!(ws.ruleset_gaps[0].1.file, "deps.bzl");
-        let found = governance(&ws, Ecosystem::Npm, "");
-        assert_eq!(tokens(&found), [LABEL_NOT_LITERAL]);
-        assert!(details(&found)[0].starts_with("deps.bzl:3: "), "{found:?}");
+        let macros = [load, ("deps.bzl", handed)];
+        for version in ["9.3.2", "8.8.2"] {
+            let ws = with(version, "", &macros);
+            // The model still says what was found, and the run warns.
+            let [(Ruleset::RulesJs, gap)] = &ws.ruleset_gaps[..] else {
+                panic!("Bazel {version}: one gap: {:?}", ws.ruleset_gaps);
+            };
+            assert!(gap.detail.starts_with("deps.bzl:3: "), "{gap:?}");
+            assert_eq!(ws.unevaluated_gaps, [gap.clone()], "Bazel {version}");
+            let warned = |gaps: &Vec<Gap>| gaps.contains(gap);
+            assert!(
+                matches!(&ws.completeness, Completeness::Incomplete(gaps) if warned(gaps)),
+                "Bazel {version}"
+            );
+            assert!(!may_evaluate_gap(&ws, gap), "Bazel {version}");
+            assert!(unread_gaps(&ws, Ecosystem::Npm).is_empty());
+            assert_eq!(
+                governance(&ws, Ecosystem::Npm, ""),
+                governed,
+                "Bazel {version}"
+            );
+        }
+        // Bazel may evaluate the `WORKSPACE`: outright, or under a config.
+        // Nothing is of a dead file then, and the gap counts.
+        let counted = |ws: &BazelWorkspace, what: &str| {
+            assert!(ws.unevaluated_gaps.is_empty(), "{what}");
+            let found = governance(ws, Ecosystem::Npm, "");
+            assert!(
+                tokens(&found)
+                    .iter()
+                    .all(|token| *token == LABEL_NOT_LITERAL),
+                "{what}: {found:?}"
+            );
+            let details = details(&found);
+            let named = |detail: &String| detail.starts_with("deps.bzl:3: ");
+            assert!(details.iter().any(named), "{what}: {details:?}");
+        };
+        for (version, rc) in [
+            ("7.7.2", ""),
+            ("8.8.2", "common --enable_workspace\n"),
+            ("8.8.2", "common:ci --enable_workspace\n"),
+        ] {
+            let what = format!("Bazel {version} with {rc:?}");
+            counted(&with(version, rc, &macros), &what);
+        }
+        // The gap is judged by the files that load its macro file: one
+        // that another file replaces is dead on 7.7.2 too.
+        for replaced_by in ["WORKSPACE.bazel", "WORKSPACE.bzlmod"] {
+            let ws = with("7.7.2", "", &[macros[0], macros[1], (replaced_by, "")]);
+            assert_eq!(ws.unevaluated_gaps.len(), 1, "{replaced_by}");
+            assert_eq!(
+                governance(&ws, Ecosystem::Npm, ""),
+                governed,
+                "{replaced_by}"
+            );
+        }
+        // And one that a file Bazel evaluates loads as well stays.
+        let both = [macros[0], macros[1], ("WORKSPACE.bzlmod", load.1)];
+        counted(
+            &with("7.7.2", "", &both),
+            "loaded by `WORKSPACE.bzlmod` too",
+        );
+        // So does one beside a file Bazel evaluates that has macro files
+        // of its own: a function of those may call into `deps.bzl`, and
+        // the model follows one level.
+        let other = "load(\"//:other.bzl\", \"more\")\nmore()\n";
+        let nested = [
+            macros[0],
+            macros[1],
+            ("WORKSPACE.bzlmod", other),
+            ("other.bzl", "def more():\n    pass\n"),
+        ];
+        counted(&with("7.7.2", "", &nested), "beside a live macro file");
+        // With no dependency system known, any file may be the one.
+        let rc = "common --enable_workspace\n";
+        counted(&with("6.6.0", rc, &macros), "Bazel stops on its rc flags");
+
+        // The limit that stays: a root whose module takes an extension
+        // or a repository rule from a file of its own. Its implementation
+        // is not read and may call the macro the `WORKSPACE` called, so
+        // nothing is dropped there, on any line.
+        for own in [
+            "ext = use_extension(\"//:extensions.bzl\", \"ext\")\n",
+            "module(name = \"app\")\next = use_extension(\"@app//tools:ext.bzl\", \"ext\")\n",
+            "pinned = use_repo_rule(\"//:rules.bzl\", \"pinned\")\n",
+            // A repository no `bazel_dep` gives is one the root made, and
+            // it sees the root's files.
+            "ext = use_extension(\"@tools_repo//:ext.bzl\", \"ext\")\n",
+            "ext = use_extension(\"@@tools_repo+//:ext.bzl\", \"ext\")\n",
+        ] {
+            let module = format!("{own}{JS_MODULE}");
+            let ws = read(&[
+                (".bazelversion", "9.3.2\n"),
+                ("MODULE.bazel", module.as_str()),
+                PNPM_LOCK,
+                macros[0],
+                macros[1],
+            ]);
+            counted(&ws, own);
+        }
+        // A file of a module the root depends on, or of a module built
+        // into Bazel, is no such file.
+        let theirs = "ext = use_extension(\"@aspect_rules_js//npm:extensions.bzl\", \"pnpm\")\n\
+            http_file = use_repo_rule(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_file\")\n\
+            local = use_repo_rule(\"@@bazel_tools//tools/build_defs/repo:local.bzl\", \"local_repository\")\n";
+        let module = format!("{JS_MODULE}{theirs}");
+        let ws = read(&[
+            (".bazelversion", "9.3.2\n"),
+            ("MODULE.bazel", module.as_str()),
+            PNPM_LOCK,
+            macros[0],
+            macros[1],
+        ]);
+        assert_eq!(ws.unevaluated_gaps.len(), 1, "{:?}", ws.ruleset_gaps);
+        assert_eq!(governance(&ws, Ecosystem::Npm, ""), governed);
+
+        // The list of dead gaps is believed only for a macro file whose
+        // every loader is dead: named for a file Bazel evaluates, a gap
+        // still counts.
+        let mut ws = with("7.7.2", "", &macros);
+        let gap = ws.ruleset_gaps[0].1.clone();
+        ws.unevaluated_gaps.push(gap.clone());
+        assert!(may_evaluate_gap(&ws, &gap));
+    }
+
+    /// ROUTED R-135, the case that keeps counting under every dependency
+    /// system: a use of `crates_repository` in a `.bzl` file of the main
+    /// repository that a module extension of the root runs. A `WORKSPACE`
+    /// that loads the same file accounts for the use in its own reading,
+    /// and where Bazel never evaluates that `WORKSPACE` its reading is of
+    /// a dead file. Cargo stays undetermined, with the dead file and
+    /// without it.
+    #[test]
+    fn a_use_a_module_extension_may_run_counts_beside_a_dead_workspace_file() {
+        const MODULE: &str = "module(name = \"app\")\n\
+             bazel_dep(name = \"rules_rust\", version = \"0.75.0\")\n\
+             rust_deps = use_extension(\"//:extensions.bzl\", \"rust_deps\")\n\
+             use_repo(rust_deps, \"crates\")\n";
+        // `pins` is what a `WORKSPACE` calls; the hub is declared by the
+        // implementation of the extension, which no model follows.
+        const EXTENSION: &str =
+            "load(\"@rules_rust//crate_universe:defs.bzl\", \"crates_repository\")\n\n\
+             def pins():\n    pass\n\n\
+             def _rust_deps_impl(module_ctx):\n    crates_repository(\n        name = \"crates\",\n        \
+             cargo_lockfile = \"//:Cargo.lock\",\n        manifests = [\"//:Cargo.toml\"],\n    )\n\n\
+             rust_deps = module_extension(implementation = _rust_deps_impl)\n";
+        let leftover = (
+            "WORKSPACE",
+            "load(\"//:extensions.bzl\", \"pins\")\npins()\n",
+        );
+        let lock = ("Cargo.lock", "version = 3\n");
+        let no_macro_file = "extensions.bzl:7: a use of `crates_repository` is not read: the file \
+                             is no macro file of a `WORKSPACE` file that was read";
+        let undetermined = |ws: &BazelWorkspace, what: &str| {
+            // At the root and in every project, and for cargo alone.
+            let at = |project: &str| governance(ws, Ecosystem::Cargo, project);
+            let found = at("");
+            let Governance::Undetermined(gaps) = &found else {
+                panic!("{what}: cargo is not undetermined: {found:?}");
+            };
+            let named = |gap: &Gap| gap.token == LABEL_NOT_LITERAL && gap.file == "extensions.bzl";
+            assert!(gaps.iter().all(named), "{what}: {gaps:?}");
+            assert_eq!(at("services/api"), found, "{what}");
+            assert_eq!(
+                governance(ws, Ecosystem::Npm, ""),
+                Governance::NotGoverned,
+                "{what}"
+            );
+            gaps.clone()
+        };
+
+        // The root takes the extension from its own file: what its
+        // implementation runs is not read, so the reading of the dead
+        // `WORKSPACE` is not second-guessed and its gap counts.
+        for line in ["9.3.2", "8.8.2", "7.7.2"] {
+            let pin = (".bazelversion", line);
+            let module = ("MODULE.bazel", MODULE);
+            let extension = ("extensions.bzl", EXTENSION);
+            // The root as Bazel 8 and 9 build it: no `WORKSPACE` at all.
+            let clean = read(&[pin, module, extension, lock]);
+            let gaps = undetermined(&clean, line);
+            assert!(gaps[0].detail.starts_with(no_macro_file), "{gaps:?}");
+
+            let ws = read(&[pin, module, extension, lock, leftover]);
+            assert!(ws.unevaluated_gaps.is_empty(), "{line}");
+            let [(Ruleset::RulesRust, gap)] = &ws.ruleset_gaps[..] else {
+                panic!("{line}: one gap: {:?}", ws.ruleset_gaps);
+            };
+            assert!(may_evaluate_gap(&ws, gap), "{line}");
+            // On 7.7.2 Bazel evaluates the `WORKSPACE` as well, and its
+            // signal counts beside the gap.
+            let counted = undetermined(&ws, line);
+            assert_eq!(counted[0], *gap, "{line}");
+            assert_eq!(counted.len(), 1 + usize::from(line == "7.7.2"), "{line}");
+        }
+
+        // A root with no extension of its own, and a use that the dead
+        // `WORKSPACE` never calls. The second reading drops the gap of the
+        // dead reading and reports the use by the recognizer's rule for a
+        // `.bzl` file no `WORKSPACE` reads: the dead file hides nothing,
+        // and the root answers as it does with the file deleted.
+        let module = (
+            "MODULE.bazel",
+            "bazel_dep(name = \"rules_rust\", version = \"0.75.0\")\n",
+        );
+        let extension = ("extensions.bzl", EXTENSION);
+        for line in ["9.3.2", "8.8.2"] {
+            let pin = (".bazelversion", line);
+            let clean = read(&[pin, module, extension, lock]);
+            let expected = undetermined(&clean, line);
+            assert!(
+                expected[0].detail.starts_with(no_macro_file),
+                "{expected:?}"
+            );
+
+            let ws = read(&[pin, module, extension, lock, leftover]);
+            let [dead] = &ws.unevaluated_gaps[..] else {
+                panic!("{line}: one dead gap: {:?}", ws.unevaluated_gaps);
+            };
+            assert!(!dead.detail.starts_with(no_macro_file), "{dead:?}");
+            assert!(!may_evaluate_gap(&ws, dead), "{line}");
+            let found: Vec<&Gap> = ws.ruleset_gaps.iter().map(|(_, gap)| gap).collect();
+            assert_eq!(found, [dead, &expected[0]], "{line}");
+            assert!(may_evaluate_gap(&ws, &expected[0]), "{line}");
+            let warned = |gaps: &Vec<Gap>| gaps.contains(dead) && gaps.contains(&expected[0]);
+            assert!(
+                matches!(&ws.completeness, Completeness::Incomplete(gaps) if warned(gaps)),
+                "{line}"
+            );
+            assert_eq!(undetermined(&ws, line), expected, "{line}");
+        }
+        // Where Bazel evaluates the `WORKSPACE`, its reading is the one
+        // that counts, and nothing is read twice.
+        let ws = read(&[
+            (".bazelversion", "7.7.2"),
+            module,
+            extension,
+            lock,
+            leftover,
+        ]);
+        assert!(ws.unevaluated_gaps.is_empty());
+        assert_eq!(ws.ruleset_gaps.len(), 1, "{:?}", ws.ruleset_gaps);
+        undetermined(&ws, "7.7.2");
     }
 
     /// The order rule's gap is of one `WORKSPACE` model: where Bazel
