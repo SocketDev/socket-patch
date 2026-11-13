@@ -409,6 +409,12 @@ fn nested_roots_refuse_the_tree_and_print_each_line_and_file() {
             text.starts_with(Code::AgentGoUnsupported.as_str()),
             "{text}"
         );
+        // The code and the token are fields of the event, not only words
+        // of its text, and the lift says that the user's edit lifts it.
+        let event = event_for(&envelope, PURL);
+        assert_eq!(event["errorCode"], Code::AgentGoUnsupported.as_str());
+        assert_eq!(event["details"]["token"], "nested_bazel_roots");
+        assert_eq!(event["details"]["lift"]["kind"], "user_edit");
         let outer = ws.root.join(".bazelignore");
         let inner = ws.root.join("svc").join(".bazelignore");
         for part in [

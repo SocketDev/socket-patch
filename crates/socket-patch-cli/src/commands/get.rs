@@ -1068,6 +1068,13 @@ pub async fn run(args: GetArgs) -> i32 {
             "Only one of --id, --cve, --ghsa, or --package can be specified",
         );
     }
+    // Nothing in a tree Bazel owns is patched (owner decision O16): refused
+    // before the project's state is read or the API is asked.
+    let refused =
+        crate::bazel_gate::scope::refuse_in_bazel_tree(&args.common, JsonCommand::Get, "get");
+    if let Some(code) = refused.await {
+        return code;
+    }
     // v5: with no `--mode`, like scan, the project keeps the mode its
     // state already records (#1088) and a project with no state is hosted.
     // `--save-only` (records a manifest entry) and global installs (no
@@ -3205,6 +3212,7 @@ mod tests {
             purl: purl.to_string(),
             code: code.to_string(),
             error: error.to_string(),
+            details: None,
         }
     }
 

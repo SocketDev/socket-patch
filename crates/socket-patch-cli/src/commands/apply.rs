@@ -13,7 +13,7 @@ use socket_patch_core::patch::apply::{
 use socket_patch_core::patch::apply_lock::LockGuard;
 use socket_patch_core::patch::gem_ext;
 use socket_patch_core::patch::redirect::golang_local::{
-    apply_go_redirect, reconcile_go_redirects, verify_go_redirect_state,
+    apply_agent_go_redirect, reconcile_go_redirects, verify_go_redirect_state, AgentGoGate, Gated,
 };
 use socket_patch_core::patch::sidecars::{maven as maven_sidecars, SidecarAdvisoryCode};
 use socket_patch_core::telemetry::{track_patch_applied, track_patch_apply_failed, TelemetryAuth};
@@ -217,7 +217,9 @@ fn eco_in_local_scope(common: &GlobalArgs, eco: Ecosystem) -> bool {
 
 /// Materialise a local-go redirect for `purl`, or `None` if `purl` isn't a
 /// local-go target (the caller then falls back to in-place apply, i.e. the
-/// `--global` module-cache path).
+/// `--global` module-cache path). `go_gate` is the run's Bazel gate
+/// (`bazel_gate::agent_go`): under a Bazel workspace the writer asks it
+/// before it writes.
 async fn try_local_go_apply(
     purl: &str,
     pkg_path: &Path,
@@ -225,6 +227,7 @@ async fn try_local_go_apply(
     sources: &PatchSources<'_>,
     common: &GlobalArgs,
     policy: MismatchPolicy,
+    go_gate: &std::sync::Arc<dyn AgentGoGate>,
 ) -> Option<ApplyResult> {
     if !is_local_go(purl, common) {
         return None;
@@ -237,18 +240,22 @@ async fn try_local_go_apply(
     // `version` are the decoded PURL components keying the copy + `replace`.
     let (module, version) = parse_golang_purl(purl)?;
     let (module, version) = (&*module, &*version);
+    let gated = Gated {
+        gate: go_gate,
+        uuid: &patch.uuid,
+    };
     Some(
-        apply_go_redirect(
+        apply_agent_go_redirect(
             purl,
             module,
             version,
             pkg_path,
             &common.cwd,
-            socket_patch_core::vendor::go_mod_edit::GO_PATCHES_DIR,
             &patch.files,
             sources,
             common.dry_run,
             policy,
+            gated,
         )
         .await,
     )
@@ -319,6 +326,7 @@ async fn reconcile_local_go(
                 applied_via: HashMap::new(),
                 error: Some(error),
                 sidecar: None,
+                refusal: None,
             }
         })
         .collect()
@@ -379,6 +387,7 @@ fn invalid_key_failures(args: &ApplyArgs, manifest_purls: &[String]) -> Vec<Appl
                 applied_via: HashMap::new(),
                 error: Some(error),
                 sidecar: None,
+                refusal: None,
             }
         })
         .collect()
@@ -459,9 +468,27 @@ async fn run_check(args: &ApplyArgs, manifest_path: &Path) -> i32 {
         }
         None => Vec::new(),
     };
+    // What the Bazel build makes of these patches (design 7): "in sync"
+    // is a statement about the installed tree, and where a ruleset builds
+    // a package from its lock the check says so, once, and marks the
+    // package. The verdicts and the exit code stay as they are.
+    let bazel_records = manifest.patches.iter();
+    let bazel_records = bazel_records.filter(|(purl, _)| owned_by_apply(purl));
+    let bazel = Box::pin(crate::bazel_gate::agent::report(
+        &args.common,
+        crate::bazel_gate::agent::Command::Check,
+        bazel_records
+            .map(|(purl, record)| (purl.clone(), record.uuid.clone()))
+            .collect(),
+        &[],
+        &[],
+    ))
+    .await;
+    check_warnings.extend(bazel.run_warnings());
     if !args.common.json && !args.common.silent {
         for warning in &check_warnings {
-            eprintln!("Warning: {}", warning.detail);
+            let prefix = crate::bazel_gate::agent::prefix(&warning.code);
+            eprintln!("{prefix}: {}", warning.detail);
         }
     }
 
@@ -610,6 +637,7 @@ async fn run_check(args: &ApplyArgs, manifest_path: &Path) -> i32 {
                 env.record(event);
             }
             env.warnings.extend(check_warnings);
+            bazel.mark(&mut env);
             println!("{}", env.to_pretty_json());
         } else if !args.common.silent {
             println!(
@@ -633,6 +661,7 @@ async fn run_check(args: &ApplyArgs, manifest_path: &Path) -> i32 {
             }
             env.warnings.extend(check_warnings);
             env.mark_partial_failure();
+            bazel.mark(&mut env);
             println!("{}", env.to_pretty_json());
         } else {
             // Drift IS the error the exit code signals — it prints even
@@ -997,11 +1026,17 @@ pub(crate) fn representative_file(
 /// `files` enumerates only the files that participated in the action —
 /// for `Applied`, the patched ones with their `applied_via` strategy;
 /// for `Verified`, every file the engine confirmed could be patched.
-/// The `errorCode` of a package whose apply failed with `error`: the
-/// refusal to write into a tree Bazel owns has its own (design 3, HZ-02),
-/// so a script can tell it from a patch that did not fit.
-fn failure_code(error: &str) -> &'static str {
+/// The `errorCode` of a package whose apply failed, so a script can tell
+/// a refusal from a patch that did not fit. A refusal that carries its
+/// code typed reports that one (the Go writer under a Bazel workspace);
+/// the refusal to write into a tree Bazel owns has its own as well
+/// (design 3, HZ-02).
+fn failure_code(result: &ApplyResult) -> &'static str {
     use socket_patch_core::patch::shared_store::BAZEL_TREE_REFUSAL_MARKER;
+    if let Some(refused) = &result.refusal {
+        return refused.code.as_str();
+    }
+    let error = result.error.as_deref().unwrap_or_default();
     if error.contains(BAZEL_TREE_REFUSAL_MARKER) {
         socket_patch_core::bazel::codes::Code::AgentOutputTree.as_str()
     } else {
@@ -1013,7 +1048,18 @@ pub(crate) fn result_to_event(result: &ApplyResult, dry_run: bool) -> PatchEvent
     let purl = result.package_key.clone();
     if !result.success {
         let error = result.error.as_deref().unwrap_or("unknown error");
-        return PatchEvent::new(PatchAction::Failed, purl).with_error(failure_code(error), error);
+        let event =
+            PatchEvent::new(PatchAction::Failed, purl).with_error(failure_code(result), error);
+        // The token and the lift of a typed refusal, as every Bazel
+        // refusal reports them.
+        let details = result
+            .refusal
+            .as_ref()
+            .and_then(|refused| refused.details());
+        return match details {
+            Some(details) => event.with_details(details),
+            None => event,
+        };
     }
 
     // A package managed by `socket-patch vendor` is skipped with its own
@@ -1465,12 +1511,14 @@ pub async fn run(args: ApplyArgs) -> i32 {
 
 /// One patch the nested apply failed: the manifest purl, a stable code
 /// (`apply_failed`, `package_not_installed`) and the error text — the same
-/// `errorCode` / `error` pair the standalone `apply --json` reports.
+/// `errorCode` / `error` pair the standalone `apply --json` reports, and
+/// the `details` of a refusal that has some (its token and lift).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ApplyFailure {
     pub purl: String,
     pub code: String,
     pub error: String,
+    pub details: Option<serde_json::Value>,
 }
 
 /// What a run of [`run_locked`] reports back. `apply` itself only needs
@@ -1530,8 +1578,9 @@ fn collect_apply_failures(
         let error = r.error.as_deref().unwrap_or("unknown error");
         failures.push(ApplyFailure {
             purl: r.package_key.clone(),
-            code: failure_code(error).to_string(),
+            code: failure_code(r).to_string(),
             error: error.to_string(),
+            details: r.refusal.as_ref().and_then(|refused| refused.details()),
         });
     }
     if !failures.is_empty() {
@@ -1542,6 +1591,7 @@ fn collect_apply_failures(
             code: "package_not_installed".to_string(),
             error: not_installed_detail(&purl).to_string(),
             purl,
+            details: None,
         });
     }
     failures
@@ -1762,6 +1812,13 @@ pub(crate) async fn run_locked(
         NpmPkgManager::Npm | NpmPkgManager::YarnClassic | NpmPkgManager::Unknown => {}
     }
 
+    // The records the Bazel layer is asked about once the loop has run:
+    // the manifest moves into it.
+    let bazel_records: Vec<(String, String)> = manifest
+        .patches
+        .iter()
+        .map(|(purl, record)| (purl.clone(), record.uuid.clone()))
+        .collect();
     match apply_patches_inner(&args, manifest, &user_patched, client).await {
         Ok(ApplyOutcome {
             success,
@@ -1850,6 +1907,27 @@ pub(crate) async fn run_locked(
                 cache_warnings.extend(warnings);
             }
 
+            // Under a Bazel workspace: what its build makes of these
+            // patches (design 3, HZ-01). The installed copies are patched
+            // all the same and the exit code is unchanged; the run says
+            // once which packages Bazel builds from a lock instead. Asked
+            // after the loop, over the disk as it left it, and never for
+            // a package `vendor` owns.
+            let vendor_owned: Vec<&str> = results
+                .iter()
+                .filter(|r| r.package_path == VENDOR_OWNED_MARKER)
+                .map(|r| r.package_key.as_str())
+                .collect();
+            let bazel = Box::pin(crate::bazel_gate::agent::report(
+                &args.common,
+                crate::bazel_gate::agent::Command::Apply,
+                bazel_records,
+                &results,
+                &vendor_owned,
+            ))
+            .await;
+            run_warnings.extend(bazel.run_warnings());
+
             // Run-level advisories + best-effort fallback-home skips on the
             // human path: one gated stderr line each. `--silent` is
             // errors-only, and under `--json` the envelope copies below are
@@ -1860,7 +1938,9 @@ pub(crate) async fn run_locked(
                     // own `Error:` diagnostic (already printed, even under
                     // --silent); they exist for the JSON envelope.
                     if !is_stage_failure_code(&w.code) {
-                        eprintln!("Warning: {}", w.detail);
+                        // A Bazel code of level `info` is a note.
+                        let prefix = crate::bazel_gate::agent::prefix(&w.code);
+                        eprintln!("{prefix}: {}", w.detail);
                     }
                 }
                 for skip in &fallback_skips {
@@ -1902,6 +1982,11 @@ pub(crate) async fn run_locked(
                         if advised.insert(advisory.message.clone()) {
                             eprintln!("{label}: {}", advisory.message);
                         }
+                    }
+                }
+                for hazard in bazel.hazards() {
+                    if advised.insert(hazard.to_string()) {
+                        eprintln!("Warning: {hazard}");
                     }
                 }
             }
@@ -2071,6 +2156,9 @@ pub(crate) async fn run_locked(
                     }
                     None => {}
                 }
+                // `details.bazel` on the events of the packages Bazel
+                // has a verdict for, and the repin hazards.
+                bazel.mark(&mut env);
                 println!("{}", env.to_pretty_json());
             }
 
@@ -2261,6 +2349,7 @@ fn synthesize_vendor_owned_results(
             applied_via: HashMap::new(),
             error: None,
             sidecar: None,
+            refusal: None,
         });
         matched.insert(purl);
     }
@@ -2764,16 +2853,24 @@ async fn apply_patches_inner(
     // the root store is the same copy the root walk found (#633).
     distinct_npm_copies(&mut all_packages).await;
 
+    // The Bazel gate of this run's Go redirects: one for the run, so a
+    // workspace is read once however many modules are patched.
+    let go_gate = crate::bazel_gate::agent_go::Gate::of(&args.common);
     let mut reused_go = false;
     for (purl, record) in &manifest.patches {
         if is_local_go(purl, &args.common) && !is_vendored(purl) && !all_packages.contains_key(purl)
         {
+            let gated = Gated {
+                gate: &go_gate,
+                uuid: &record.uuid,
+            };
             if let Some(result) =
-                socket_patch_core::patch::redirect::golang_local::reuse_go_redirect(
+                socket_patch_core::patch::redirect::golang_local::reuse_agent_go_redirect(
                     purl,
                     &args.common.cwd,
                     &record.files,
                     args.common.dry_run,
+                    gated,
                 )
                 .await
             {
@@ -3238,33 +3335,34 @@ async fn apply_patches_inner(
                 // can't build). Everything else in this branch (npm, cargo,
                 // composer, nuget, …) patches in place via
                 // `apply_package_patch`.
-                let result =
-                    match try_local_go_apply(purl, pkg_path, patch, &sources, &args.common, policy)
+                let common = &args.common;
+                let result = match try_local_go_apply(
+                    purl, pkg_path, patch, &sources, common, policy, &go_gate,
+                )
+                .await
+                {
+                    Some(r) => {
+                        // The unpatched go.mod, so the consumer-sync
+                        // audit below can tell requirements the patch
+                        // added from ones upstream always had (#618).
+                        if let Some((module, _)) = parse_golang_purl(purl) {
+                            go_pristine_mods.insert(module.into_owned(), pkg_path.join("go.mod"));
+                        }
+                        r
+                    }
+                    None => {
+                        apply_package_patch(
+                            args.common.read_scope(),
+                            purl,
+                            pkg_path,
+                            &patch.files,
+                            &sources,
+                            args.common.dry_run,
+                            policy,
+                        )
                         .await
-                    {
-                        Some(r) => {
-                            // The unpatched go.mod, so the consumer-sync
-                            // audit below can tell requirements the patch
-                            // added from ones upstream always had (#618).
-                            if let Some((module, _)) = parse_golang_purl(purl) {
-                                go_pristine_mods
-                                    .insert(module.into_owned(), pkg_path.join("go.mod"));
-                            }
-                            r
-                        }
-                        None => {
-                            apply_package_patch(
-                                args.common.read_scope(),
-                                purl,
-                                pkg_path,
-                                &patch.files,
-                                &sources,
-                                args.common.dry_run,
-                                policy,
-                            )
-                            .await
-                        }
-                    };
+                    }
+                };
 
                 warn_mismatch_overwrites(&result, &args.common);
                 if !result.success {
@@ -3493,6 +3591,7 @@ impl MavenApplied {
             applied_via: HashMap::new(),
             error: Some(format!("{code}: {detail}")),
             sidecar: None,
+            refusal: None,
         });
         self.warn(code, detail);
         self.failed = true;
@@ -4190,6 +4289,7 @@ mod tests {
             applied_via,
             error: None,
             sidecar: None,
+            refusal: None,
         }
     }
 
@@ -4305,6 +4405,7 @@ mod tests {
             applied_via,
             error: None,
             sidecar: None,
+            refusal: None,
         };
 
         let event = result_to_event(&result, false);
@@ -4346,6 +4447,7 @@ mod tests {
             applied_via: HashMap::new(),
             error: None,
             sidecar: None,
+            refusal: None,
         }
     }
 
@@ -4490,6 +4592,7 @@ mod tests {
             applied_via,
             error: None,
             sidecar: None,
+            refusal: None,
         };
         let event = result_to_event(&result, false);
         let v: serde_json::Value =
@@ -4893,6 +4996,7 @@ mod tests {
             applied_via: HashMap::new(),
             error: error.map(str::to_string),
             sidecar: None,
+            refusal: None,
         }
     }
 
@@ -4912,11 +5016,13 @@ mod tests {
                     purl: "pkg:npm/a@1.0.0".to_string(),
                     code: "apply_failed".to_string(),
                     error: "Permission denied (os error 13)".to_string(),
+                    details: None,
                 },
                 ApplyFailure {
                     purl: "pkg:npm/b@1.0.0".to_string(),
                     code: "apply_failed".to_string(),
                     error: "unknown error".to_string(),
+                    details: None,
                 },
             ]
         );
@@ -4947,6 +5053,53 @@ mod tests {
         assert_eq!(event.error_code.as_deref(), Some(failures[0].code.as_str()));
     }
 
+    /// A refusal that carries its code typed (the Go writer under a Bazel
+    /// workspace) reports that code, its token and its lift as fields, to
+    /// the standalone event and to a nested caller alike. Nothing is read
+    /// back out of the text.
+    #[test]
+    fn a_typed_refusal_reports_its_code_token_and_lift() {
+        use socket_patch_core::bazel::codes::Code;
+        use socket_patch_core::bazel::model::Lift;
+        use socket_patch_core::patch::apply::Refused;
+        let mut refused = failed_result("pkg:golang/m@v1.0.0", Some("reworded freely"));
+        refused.refusal = Some(Box::new(Refused {
+            code: Code::AgentGoUnsupported,
+            token: Some("nested_bazel_roots"),
+            lift: Some(Lift::Owner("O15")),
+        }));
+        let details = serde_json::json!({
+            "token": "nested_bazel_roots",
+            "lift": { "kind": "owner", "decision": "O15" },
+        });
+        let event = result_to_event(&refused, false);
+        assert_eq!(
+            event.error_code.as_deref(),
+            Some(Code::AgentGoUnsupported.as_str())
+        );
+        assert_eq!(event.error.as_deref(), Some("reworded freely"));
+        assert_eq!(event.details, Some(details.clone()));
+        let failures = collect_apply_failures(&[refused.clone()], &[], &HashSet::new());
+        assert_eq!(failures[0].code, Code::AgentGoUnsupported.as_str());
+        assert_eq!(failures[0].details, Some(details));
+        // A refusal with neither has no `details` at all.
+        refused.refusal = Some(Box::new(Refused {
+            code: Code::WorkspaceIgnoreLineNeeded,
+            token: None,
+            lift: None,
+        }));
+        let event = result_to_event(&refused, false);
+        assert_eq!(
+            event.error_code.as_deref(),
+            Some(Code::WorkspaceIgnoreLineNeeded.as_str())
+        );
+        assert_eq!(event.details, None);
+        // And a failure that is no refusal is what it was.
+        let plain = result_to_event(&failed_result("pkg:npm/a@1.0.0", Some("boom")), false);
+        assert_eq!(plain.error_code.as_deref(), Some("apply_failed"));
+        assert_eq!(plain.details, None);
+    }
+
     #[test]
     fn collect_apply_failures_names_unresolved_purls_only_when_nothing_else_failed() {
         let unmatched = vec![
@@ -4961,6 +5114,7 @@ mod tests {
                 purl: "pkg:npm/gone@1.0.0".to_string(),
                 code: "package_not_installed".to_string(),
                 error: "No installed package matches this PURL".to_string(),
+                details: None,
             }],
             "a lockfile-resolved purl never fails the run (#403)"
         );

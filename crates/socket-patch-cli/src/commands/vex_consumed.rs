@@ -70,11 +70,21 @@ use crate::ecosystem_dispatch::{
 /// (embedded hosted `scan --vex` only) is scan's npm crawl of the same
 /// tree: the identity fallback takes its packages instead of crawling the
 /// tree again.
+///
+/// `bazel` is the consumer verdict of a Bazel workspace
+/// ([`crate::bazel_gate::vex`]). A purl the Bazel build consumes through a
+/// hosted pin has no consumed copy on the host, whatever ecosystem it is
+/// of: Bazel fetches the pinned bytes into its own repository cache and
+/// reads no `node_modules`, global packages folder or `~/.m2`. It gets an
+/// empty entry ("not installed", which its pinned reference excuses) and
+/// no host store is looked at for it, so an upstream copy there neither
+/// attests nor withholds.
 pub(crate) async fn hosted_consumed_copies(
     common: &GlobalArgs,
     hosted: &BTreeMap<String, HostedWiring>,
     installed: &HashMap<String, Vec<PathBuf>>,
     prior: Option<&NpmCrawlSnapshot>,
+    bazel: &crate::bazel_gate::vex::Verdicts,
 ) -> HashMap<String, HostedCopies> {
     let mut out = HashMap::new();
     if hosted.is_empty() {
@@ -82,7 +92,17 @@ pub(crate) async fn hosted_consumed_copies(
     }
     let options = common.crawler_options();
     let purls: Vec<String> = hosted.keys().cloned().collect();
-    let partitioned = partition_purls(&purls, common.ecosystems.as_deref());
+    let mut partitioned = partition_purls(&purls, common.ecosystems.as_deref());
+    for purls in partitioned.values_mut() {
+        let by_bazel = |purl: &String| bazel.replaces_installed_tree(purl);
+        out.extend(
+            purls
+                .iter()
+                .filter(|purl| by_bazel(purl))
+                .map(|purl| (purl.clone(), HostedCopies::default())),
+        );
+        purls.retain(|purl| !by_bazel(purl));
+    }
 
     // Shared-location ecosystems: every physical copy is consumed by someone.
     let shared: HashMap<Ecosystem, Vec<String>> = partitioned
@@ -464,7 +484,9 @@ mod tests {
         )]);
         VARIANT_INPUTS
             .scope(std::cell::RefCell::new(Vec::new()), async {
-                let mut found = hosted_consumed_copies(common, &hosted, installed, None).await;
+                let none = Default::default();
+                let mut found =
+                    hosted_consumed_copies(common, &hosted, installed, None, &none).await;
                 let paths = found.remove(&purl).unwrap().paths;
                 let calls = VARIANT_INPUTS.with(|inputs| inputs.borrow().clone());
                 (paths, calls)

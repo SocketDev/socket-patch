@@ -72,7 +72,7 @@ use crate::bazel::codes::Code;
 use crate::bazel::ignore::{
     self, CannotEdit, IgnoreLine, IgnoreLineRow, IgnoreModel, Removal, SocketTree,
 };
-use crate::bazel::model::{Advisory, FileText, RootRef};
+use crate::bazel::model::{Advisory, FileText, Lift, RootRef};
 use crate::bazel::owned_index::{self, Index, Parsed, INDEX_PATH};
 use crate::constants::npm_family::VLT_LOCK;
 use crate::crawlers::bazel_root::{boundary_file_in, RootProbe, BOUNDARY_FILES};
@@ -122,6 +122,9 @@ pub struct Refusal {
     pub code: Code,
     pub token: Option<&'static str>,
     pub detail: String,
+    /// What would lift it: the edit the detail names, where one lets the
+    /// next run through, else the decision that would.
+    pub lift: Lift,
 }
 
 impl std::fmt::Display for Refusal {
@@ -219,6 +222,17 @@ impl Blocked {
             (None, Some(_), SocketTree::Vendor) => Code::VendorRulesetUnsupported,
         };
         let noted: String = noted.iter().map(|note| format!("{note}. ")).collect();
+        // The remedy is an edit of the user's wherever it lets the next
+        // run through. Where no edit does (a root above the repository,
+        // which is neither read nor written), the refusal stands until
+        // the owner decides otherwise (design 11.3, decision O15).
+        let lift = match self.rerun {
+            true => Lift::UserEdit {
+                file: ignore::BAZELIGNORE.to_string(),
+                what: self.remedy.clone(),
+            },
+            false => Lift::Owner("O15"),
+        };
         let detail = format!(
             "{} was not created: the upstream BUILD files in it would join Bazel's `//...` \
              and break the build, and the `.bazelignore` line that hides it could not be \
@@ -232,6 +246,7 @@ impl Blocked {
             code,
             token: self.token,
             detail,
+            lift,
         }
     }
 }
@@ -1059,8 +1074,10 @@ fn with_note(said: Option<String>, note: Option<String>) -> Option<String> {
 }
 
 /// [`before_tree`] for the agent Go writer and its copy `copy_dir`, in a
-/// wet run and in a dry one. `Err` is the refusal, as the text of a
-/// failed result. Only the agent copy base is guarded here (the vendored
+/// wet run and in a dry one. `Err` is the refusal as it was decided: its
+/// `Display` is the text of the failed result, and its code, token and
+/// lift go on the result typed, so that the event needs no text match
+/// (ROUTED R-024). Only the agent copy base is guarded here (the vendored
 /// one goes through [`before_vendor_tree`]), and a copy that is in sync
 /// is not written, so nothing is asked for it. Hand the value to
 /// [`after_agent_go_tree`] with the result of the write.
@@ -1070,7 +1087,7 @@ pub async fn before_agent_go_tree(
     copy_dir: &Path,
     in_sync: bool,
     dry_run: bool,
-) -> Result<Guarded, String> {
+) -> Result<Guarded, Refusal> {
     if base_rel != GO_PATCHES_DIR || in_sync {
         return Ok(Guarded::default());
     }
@@ -1078,7 +1095,7 @@ pub async fn before_agent_go_tree(
     let advisories = before_tree(project_root, tree, copy_dir, dry_run).await;
     Ok(Guarded {
         tree: Some(tree),
-        advisories: advisories.map_err(|refusal| refusal.to_string())?,
+        advisories: advisories?,
         dry_run,
     })
 }
@@ -1473,6 +1490,12 @@ mod tests {
         let refusal = create(&project, Vendor, false).expect_err("two roots");
         assert_eq!(refusal.code, Code::VendorRulesetUnsupported);
         assert_eq!(refusal.token, Some(NESTED_BAZEL_ROOTS));
+        // The lines the user adds lift it, and the lift carries them.
+        let Lift::UserEdit { file, what } = &refusal.lift else {
+            panic!("an edit of the user's lifts it: {refusal:?}");
+        };
+        assert_eq!(file, ignore::BAZELIGNORE);
+        assert!(what.contains(&outer) && what.contains(&inner), "{what}");
         // The boundary files, as the platform spells their paths.
         let markers = [repo.shown("MODULE.bazel"), repo.shown("svc/WORKSPACE")];
         for part in [&outer, &inner, &markers[0], &markers[1]] {
@@ -1519,6 +1542,8 @@ mod tests {
         let refusal = create(&project, GoPatches, false).expect_err("a root out of reach");
         assert_eq!(refusal.code, Code::AgentGoUnsupported);
         assert_eq!(refusal.token, Some(BAZEL_ROOT_OUTSIDE_REPOSITORY));
+        // No edit of the user's lets a later run through.
+        assert_eq!(refusal.lift, Lift::Owner("O15"));
         let line = format!(
             "the line `repo/.socket/go-patches` to {}",
             outer.shown(".bazelignore")
@@ -1603,6 +1628,7 @@ mod tests {
         assert_eq!(refusal.token, Some(BAZEL_ROOT_OUTSIDE_REPOSITORY));
         assert!(refusal.detail.contains(&format!("Add {line}")), "{refusal}");
         assert!(refusal.detail.contains("then run again"), "{refusal}");
+        assert!(matches!(refusal.lift, Lift::UserEdit { .. }), "{refusal:?}");
         assert_eq!(outer.tree(), before);
         outer.put(".bazelignore", b"repo/.socket/vendor\n");
         assert_eq!(create(&project, Vendor, false), Ok(Vec::new()));

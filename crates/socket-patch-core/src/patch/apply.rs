@@ -133,6 +133,42 @@ pub struct ApplyResult {
     /// Surfaced in the CLI JSON envelope under
     /// `Envelope.sidecars[]` (top-level, not per-event).
     pub sidecar: Option<crate::patch::sidecars::SidecarRecord>,
+    /// Set on a failed result that is a refusal with a contract code of
+    /// its own: the failed event takes its `errorCode` and `details` from
+    /// here, never from the text in `error`.
+    pub refusal: Option<Box<Refused>>,
+}
+
+/// A refusal that has a contract code of its own (the Bazel checks), as
+/// the failed event of the package reports it beside the text in
+/// [`ApplyResult::error`]. It is typed so that no caller reads a code or
+/// a token back out of a message: the text is for a person and may be
+/// reworded, and a script matches on these.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Refused {
+    /// The event's `errorCode`.
+    pub code: crate::bazel::codes::Code,
+    /// `details.token`: the case, where the contract names one.
+    pub token: Option<&'static str>,
+    /// `details.lift`: what would lift the refusal, where that is known.
+    pub lift: Option<crate::bazel::model::Lift>,
+}
+
+impl Refused {
+    /// The `details` of the failed event: `token` and `lift`, each only
+    /// when the refusal has it. `None` for a refusal with neither, so an
+    /// event never carries an empty object. One function builds it, so
+    /// every command prints the same members.
+    pub fn details(&self) -> Option<serde_json::Value> {
+        let mut details = serde_json::Map::new();
+        if let Some(token) = self.token {
+            details.insert("token".to_string(), token.into());
+        }
+        if let Some(lift) = &self.lift {
+            details.insert("lift".to_string(), lift.details());
+        }
+        (!details.is_empty()).then(|| serde_json::Value::Object(details))
+    }
 }
 
 /// A patch's files in file-name order: the verify and write loops walk
@@ -681,7 +717,7 @@ pub(crate) async fn sweep_stale_stages(
 /// `older_than` old. The age is the entry's inode-change time on Unix (a
 /// set-aside original is a hard link, whose modification time is the
 /// file's own), its modification time elsewhere.
-fn is_stale_stage(entry: &std::fs::DirEntry, older_than: std::time::Duration) -> bool {
+pub(crate) fn is_stale_stage(entry: &std::fs::DirEntry, older_than: std::time::Duration) -> bool {
     let name = entry.file_name();
     let Some(name) = name.to_str() else {
         return false;
@@ -1443,10 +1479,10 @@ pub fn advisory_warning_codes(note: &str) -> Vec<&'static str> {
     // A `.bazelignore` line the agent Go writer added, or could not add
     // for a tree that is already there (`utils::bazel_root_writes`): the
     // note names the code itself.
-    use crate::bazel::codes::Code;
+    use crate::bazel::codes::{Code, Kind};
     let ignore_line_added = Code::WorkspaceIgnoreLineAdded.as_str();
     let ignore_line_needed = Code::WorkspaceIgnoreLineNeeded.as_str();
-    [
+    let mut codes: Vec<&'static str> = [
         (OWNERSHIP_NOT_RESTORED_MARKER, "ownership_not_restored"),
         (
             STALE_BYTECODE_NOT_REMOVED_MARKER,
@@ -1459,7 +1495,28 @@ pub fn advisory_warning_codes(note: &str) -> Vec<&'static str> {
     .into_iter()
     .filter(|(marker, _)| note.contains(marker))
     .map(|(_, code)| code)
-    .collect()
+    .collect();
+    // Every other advisory of the Bazel checks rides the same way (the
+    // plan a gate let through carries its own): as a part of the note
+    // that its code leads, `<code>: <detail>`. Stricter than the markers
+    // above on purpose, so that a file name in a note never reads as a
+    // code.
+    let rides = |code: &&Code| matches!(code.kind(), Kind::RunLevel | Kind::Advisory);
+    let leads = |code: &str| {
+        let led = |part: &str| {
+            part.strip_prefix(code)
+                .is_some_and(|rest| rest.starts_with(": "))
+        };
+        note.split("; ").any(led)
+    };
+    let led: Vec<&'static str> = Code::ALL
+        .iter()
+        .filter(rides)
+        .map(|code| code.as_str())
+        .filter(|code| !codes.contains(code) && leads(code))
+        .collect();
+    codes.extend(led);
+    codes
 }
 
 /// The message of a new-file collision (see [`mark_new_file_collision`]).
@@ -1555,6 +1612,7 @@ async fn apply_package_patch_at(
         applied_via: HashMap::new(),
         error: None,
         sidecar: None,
+        refusal: None,
     };
 
     // A package dir that resolves into a store other projects link to
@@ -4513,6 +4571,7 @@ mod tests {
             applied_via: HashMap::new(),
             error: None,
             sidecar: None,
+            refusal: None,
         };
 
         let mut primary = clean();
@@ -5049,6 +5108,19 @@ mod tests {
             ["patch_files_skipped"]
         );
         assert!(advisory_warning_codes("some other note").is_empty());
+        // An advisory of the Bazel checks rides a note as the part its
+        // code leads; a mention anywhere else is no code.
+        use crate::bazel::codes::Code;
+        let out_of_scope = Code::WorkspaceOutOfScope.as_str();
+        assert_eq!(
+            advisory_warning_codes(&format!("{ownership}; {out_of_scope}: two pins were left")),
+            vec!["ownership_not_restored", out_of_scope]
+        );
+        let named = format!("1 patch file {FILES_SKIPPED_MARKER}: {out_of_scope}.js");
+        assert_eq!(advisory_warning_codes(&named), vec!["patch_files_skipped"]);
+        // A refusal's code never rides a successful result.
+        let refusal = Code::AgentGoUnsupported.as_str();
+        assert!(advisory_warning_codes(&format!("{refusal}: no")).is_empty());
     }
 
     /// The tarball bytes of a bin published from Windows (CRLF shebang),
