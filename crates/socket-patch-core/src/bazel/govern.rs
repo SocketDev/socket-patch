@@ -10,6 +10,9 @@
 //!   only one that is the same everywhere is a [`Liveness`].
 //! - [`settle`]: fills in what the recognizers leave open on every hub,
 //!   its liveness and its ruleset version (design 2.8).
+//! - [`module_version`]: the one fold of the root files into the version
+//!   evidence, which every recognizer calls for a Bzlmod hub and `settle`
+//!   for a `WORKSPACE` hub.
 //! - [`governance`]: the answer per project and ecosystem, and
 //!   [`governance_over`] for what the root probe found (nested roots, a
 //!   root above the repository).
@@ -30,17 +33,23 @@ use super::model::{
     RulesetSignal, Site,
 };
 use super::module_file::{
-    GapScope, GapWhy, ModuleGap, ModuleModel, NameSource, Tag, Visibility, MODULE_FILE,
+    GapScope, GapWhy, ModuleGap, ModuleModel, ModuleOverride, NameSource, OverrideKind as Declared,
+    Tag, Visibility, MODULE_FILE,
 };
-use super::rc::{Chain, Flag};
-use super::ruleset_version::{self, HubSystem, Unproven, VersionVerdict};
+use super::rc::{Chain, Flag, LockfileMode};
+use super::ruleset_version::{
+    self, Evidence, HubSystem, LineSpan, LockfileFlag, OverrideKind, Registries, RootDep,
+    RootOverride, Unproven, VersionVerdict,
+};
 use super::rulesets::gazelle::GazelleDetail;
 use super::rulesets::report_only::ReportOnlyKind;
-use super::rulesets::rules_python::{module_version, HubImport};
+use super::rulesets::rules_python::HubImport;
 use super::rulesets::{rules_csharp, rules_jvm_external, RecognizeInput};
 use super::starlark::{Lookup, ValueKind};
 use super::version::{dep_system, BazelLine, BazelVersion, DepSystem};
-use super::workspace_file::{Callee, Governing, WorkspaceModel, WsStmtKind};
+use super::workspace_file::{
+    Callee, Governing, WorkspaceModel, WsStmtKind, WORKSPACE_DEFINITION_ORDER,
+};
 use crate::crawlers::types::Ecosystem;
 use crate::formats::registry;
 
@@ -194,22 +203,22 @@ fn root_file(model: &WorkspaceModel) -> Option<&str> {
     read.or(unread)
 }
 
-/// The `WORKSPACE`-family files that make the declaration `decl`: the file
-/// a top-level statement stands in, and for a statement of a macro body
-/// each file with a top-level call of that macro. Which model read the
-/// file says nothing: a macro file is in the model of every file that
-/// loads it, whichever of its functions that file calls, so `WORKSPACE`
-/// may run one function of `deps.bzl` and `WORKSPACE.bzlmod` another,
-/// while Bazel evaluates one of the two files.
+/// The `WORKSPACE`-family files that make the statement at `span` of
+/// `file`: the file a top-level statement stands in, and for a statement
+/// of a macro body each file with a top-level call of that macro. Which
+/// model read the file says nothing: a macro file is in the model of every
+/// file that loads it, whichever of its functions that file calls, so
+/// `WORKSPACE` may run one function of `deps.bzl` and `WORKSPACE.bzlmod`
+/// another, while Bazel evaluates one of the two files.
 ///
 /// A statement of a macro file in no function that a file calls (the
 /// `load` of the ruleset there) runs with every file that loads the macro
 /// file. Empty for a file no model holds (`Cargo.toml`): nothing here says
 /// which system reads it.
-fn homes<'a>(ws: &'a BazelWorkspace, decl: &DeclRef<'_>) -> Vec<&'a str> {
-    let inside = |outer: (usize, usize)| outer.0 <= decl.span.0 && decl.span.1 <= outer.1;
+fn homes<'a>(ws: &'a BazelWorkspace, file: &str, span: (usize, usize)) -> Vec<&'a str> {
+    let inside = |outer: (usize, usize)| outer.0 <= span.0 && span.1 <= outer.1;
     let makes = |model: &&WorkspaceModel| {
-        if root_file(model) == Some(decl.file) {
+        if root_file(model) == Some(file) {
             return true;
         }
         let called: BTreeSet<usize> = model
@@ -221,12 +230,12 @@ fn homes<'a>(ws: &'a BazelWorkspace, decl: &DeclRef<'_>) -> Vec<&'a str> {
             })
             .collect();
         model.macros.iter().enumerate().any(|(index, made)| {
-            let file = model.files.get(made.file);
-            let here = file.is_some_and(|file| file.path == decl.file);
+            let source = model.files.get(made.file);
+            let here = source.is_some_and(|source| source.path == file);
             here && inside(made.span) && called.contains(&index)
         })
     };
-    let holds = |model: &&WorkspaceModel| model.files.iter().any(|f| f.path == decl.file);
+    let holds = |model: &&WorkspaceModel| model.files.iter().any(|f| f.path == file);
     let models = ws.workspace_files.iter();
     let made: Vec<&str> = models.clone().filter(makes).filter_map(root_file).collect();
     match made.is_empty() {
@@ -272,7 +281,7 @@ fn standing_in(ws: &BazelWorkspace, decl: &DeclRef<'_>, world: &DepSystem) -> St
         DeclSystem::Workspace => {
             // Bazel evaluates one file of the family: a declaration that
             // file does not make is not made.
-            let homes = homes(ws, decl);
+            let homes = homes(ws, decl.file, decl.span);
             match world.workspace_file(&ws.boundary) {
                 None => return dead("the root has no WORKSPACE file Bazel evaluates".to_string()),
                 Some(read) if !homes.is_empty() && !homes.contains(&read) => {
@@ -542,6 +551,143 @@ fn literal_version(model: &WorkspaceModel, repo: &str) -> Option<String> {
     prefix.is_none_or(agrees).then_some(version)
 }
 
+/// The resolved version of the module `module` (design 2.8), from the
+/// root files as a recognizer was handed them. `api_floor` is the first
+/// version that has an API the root file uses.
+///
+/// This is the one fold of the root module file, the tracked rc flags,
+/// the Bazel line and the lock into [`Evidence`]. Every recognizer calls
+/// it for a Bzlmod hub and [`settle`] for a `WORKSPACE` hub, so a rule
+/// added here holds for every ruleset.
+///
+/// Every doubt degrades the evidence and none adds to it. A statement of
+/// `MODULE.bazel` that was not read may override the module, so nothing
+/// is proven then. A tracked `--override_module` is a non-registry
+/// override; an rc file Bazel is sure to load that could not be read may
+/// hold one, and may turn the lock off. `--registry`, when any line sets
+/// it, is taken for unknown: a family-A lock is then not proven to be
+/// reused, and the declared version stands as a lower bound.
+pub(in crate::bazel) fn module_version(
+    input: &RecognizeInput<'_>,
+    module: Option<&str>,
+    api_floor: Option<&str>,
+) -> VersionVerdict {
+    let (Some(model), Some(module)) = (input.module, module) else {
+        return VersionVerdict::unknown(Unproven::NotDeclared);
+    };
+    if model
+        .gaps
+        .iter()
+        .any(|gap| gap.scope == GapScope::Everything)
+    {
+        return VersionVerdict::unknown(Unproven::UnreadableOverride);
+    }
+    let deps = model.deps.iter().map(|dep| RootDep {
+        name: dep.name.clone(),
+        version: dep.version.clone(),
+        dev_dependency: dep.dev,
+    });
+    let deps: Vec<RootDep> = deps.collect();
+    // A `*` or `**` argument may supply a `version`, and Bazel rejects
+    // one given twice: neither is read (`Lookup::Unknown`).
+    let pin = |over: &ModuleOverride| match over.kind {
+        Declared::Archive | Declared::Git | Declared::LocalPath => OverrideKind::NonRegistry,
+        Declared::MultipleVersion => OverrideKind::Unreadable,
+        Declared::SingleVersion => match over.call.arg("version") {
+            // With no version it carries patches or a registry only.
+            Lookup::Absent => OverrideKind::PatchOnly,
+            Lookup::Found(value) => match model.resolve(over.at, value).as_str() {
+                Some("") => OverrideKind::PatchOnly,
+                Some(version) => OverrideKind::Pinned(version.to_string()),
+                None => OverrideKind::Unreadable,
+            },
+            Lookup::Unknown => OverrideKind::Unreadable,
+        },
+    };
+    let declared = model.overrides.iter().map(|over| RootOverride {
+        module: over.module.clone(),
+        kind: pin(over),
+    });
+    let mut overrides: Vec<RootOverride> = declared.collect();
+    let flags = input.flags;
+    let unread_rc = flags.is_some_and(|flags| flags.gaps().iter().any(|gap| gap.hard));
+    let mut by_flag = |name: &str| {
+        overrides.push(RootOverride {
+            module: name.to_string(),
+            kind: OverrideKind::NonRegistry,
+        });
+    };
+    if unread_rc {
+        by_flag(module);
+    }
+    for chain in flags.map_or(&[][..], |_| Chain::COMMANDS) {
+        let found = flags.map(|flags| flags.occurrences(Flag::OverrideModule, *chain));
+        match found {
+            // A value with no `=` names no module this reader can rule
+            // out.
+            Some(Ok(found)) => found.iter().for_each(|flag| {
+                by_flag(flag.name_and_path().map_or(module, |(name, _)| name));
+            }),
+            Some(Err(_)) => by_flag(module),
+            None => {}
+        }
+    }
+    let build = |flag: Flag| flags.map(|flags| flags.state(flag, Chain::Build));
+    let checked = matches!(
+        build(Flag::CheckDirectDependencies),
+        Some(FlagState::Set(mode)) if mode == "error"
+    );
+    let absent = ModuleLock::Absent;
+    let root_file = input.files.read(MODULE_FILE);
+    ruleset_version::resolve(&Evidence {
+        module,
+        deps: &deps,
+        overrides: &overrides,
+        ignore_dev_dependency: flags.is_some_and(ruleset_version::ignore_dev_dependency),
+        check_direct_dependencies_error: checked && !unread_rc,
+        line: input.line.and_then(LineSpan::of),
+        lockfile: lockfile_flag(flags, unread_rc),
+        registries: match flags {
+            Some(flags) if unread_rc || registry_set(flags) => Registries::Unknown,
+            _ => Registries::Default,
+        },
+        lock: input.module_lock.unwrap_or(&absent),
+        module_file: root_file.as_bytes(),
+        api_floor,
+    })
+}
+
+/// `--lockfile_mode` over every command chain and named config.
+fn lockfile_flag(flags: Option<&EffectiveFlags>, unread_rc: bool) -> LockfileFlag {
+    let Some(flags) = flags else {
+        return LockfileFlag::Unset;
+    };
+    let mut unset = false;
+    for chain in Chain::COMMANDS {
+        let state = flags.state(Flag::LockfileMode, *chain);
+        // A value Bazel rejects is no proof that the lock is read.
+        let off =
+            |mode: &&String| matches!(LockfileMode::parse(mode), Some(LockfileMode::Off) | None);
+        if unread_rc || state.values().iter().any(off) {
+            return LockfileFlag::MaybeOff;
+        }
+        unset |= state.may_be_unset();
+    }
+    match unset {
+        true => LockfileFlag::Unset,
+        false => LockfileFlag::On,
+    }
+}
+
+/// Whether any tracked rc line sets `--registry`, on any chain.
+fn registry_set(flags: &EffectiveFlags) -> bool {
+    let set = |chain: &Chain| {
+        let found = flags.occurrences(Flag::Registry, *chain);
+        !found.is_ok_and(|found| found.is_empty())
+    };
+    Chain::COMMANDS.iter().any(set)
+}
+
 /// The ruleset version of a hub the recognizer left open (design 2.8).
 /// `None` keeps the recognizer's answer: a version it resolved, or its
 /// reason why a Bzlmod module has none.
@@ -757,33 +903,148 @@ pub(super) fn reads_module(worlds: &Result<Vec<DepSystem>, Gap>) -> bool {
     }
 }
 
-/// What leaves every ecosystem undetermined: a gap of `MODULE.bazel`, and
-/// a gap of each `WORKSPACE`-family file that Bazel may evaluate. A
-/// `WORKSPACE` left behind beside `MODULE.bazel` on Bazel 8 or 9, or one
-/// that `WORKSPACE.bazel` replaces, declares nothing Bazel reads: Bazel
-/// builds past a missing macro file or a tab there, and so a refusal that
-/// names the file would name one nobody has to fix.
-fn governing_gaps(ws: &BazelWorkspace) -> Vec<Gap> {
-    let mut gaps = module_gaps(ws.module.as_ref(), &ws.boundary);
-    let worlds = worlds(ws);
-    let directory = |model: &WorkspaceModel| is_directory(model, &ws.boundary);
-    let opened = BoundaryFiles {
-        workspace: ws.boundary.workspace || ws.workspace_files.iter().any(directory),
-        ..ws.boundary
+/// Which files of a root Bazel may evaluate, under the dependency systems
+/// the workspace may run. What was not read holds an ecosystem up only
+/// where Bazel may evaluate it: a `WORKSPACE` left behind beside
+/// `MODULE.bazel` on Bazel 8 or 9, or one that `WORKSPACE.bazel` replaces,
+/// declares nothing Bazel reads. Bazel builds past a missing macro file, a
+/// tab or a hub rule nobody followed there, and a refusal that names the
+/// file would name one nobody has to fix. The same holds for
+/// `MODULE.bazel` where Bzlmod is off.
+///
+/// Every test here errs towards "may": with no dependency system known,
+/// and for a file whose reader is not known, the answer is yes.
+struct Evaluated<'a> {
+    ws: &'a BazelWorkspace,
+    worlds: Result<Vec<DepSystem>, Gap>,
+    /// The boundary files, with the path `WORKSPACE` counted where it is
+    /// a directory Bazel opens and stops on ([`is_directory`]).
+    opened: BoundaryFiles,
+}
+
+impl<'a> Evaluated<'a> {
+    fn of(ws: &'a BazelWorkspace) -> Self {
+        let directory = |model: &WorkspaceModel| is_directory(model, &ws.boundary);
+        let opened = BoundaryFiles {
+            workspace: ws.boundary.workspace || ws.workspace_files.iter().any(directory),
+            ..ws.boundary
+        };
+        Self {
+            ws,
+            worlds: worlds(ws),
+            opened,
+        }
+    }
+
+    /// The `WORKSPACE`-family file `path` of the root.
+    fn workspace_file(&self, path: &str) -> bool {
+        evaluates(&self.worlds, &self.opened, path)
+    }
+
+    /// The statement at `site`. One of a macro file counts with each
+    /// `WORKSPACE`-family file that runs it ([`homes`]); one in a file no
+    /// model holds counts always.
+    fn site(&self, site: &Site) -> bool {
+        match site.system {
+            DeclSystem::Bzlmod => reads_module(&self.worlds),
+            DeclSystem::Workspace => {
+                let homes = homes(self.ws, &site.file, site.span);
+                homes.is_empty() || homes.iter().any(|home| self.workspace_file(home))
+            }
+        }
+    }
+
+    /// The statement a recognizer's gap names. A gap says which file it
+    /// is in and not which system reads the statement, so it is dropped
+    /// only where the file answers that: a `WORKSPACE`-family file itself
+    /// (nothing else loads one), a file of the `MODULE.bazel` closure, and
+    /// for the order rule, which is of a `WORKSPACE` model by
+    /// construction, a macro file of that family. Any other gap in a
+    /// `.bzl` file counts: a BUILD file or a module extension may load
+    /// the file too (a `crates_vendor` target, a label scan).
+    fn gap(&self, gap: &Gap) -> bool {
+        let models = &self.ws.workspace_files;
+        if models
+            .iter()
+            .filter_map(root_file)
+            .any(|root| root == gap.file)
+        {
+            return self.workspace_file(&gap.file);
+        }
+        let holds = |model: &&WorkspaceModel| model.files.iter().any(|f| f.path == gap.file);
+        let mut holders = models.iter().filter(holds).filter_map(root_file).peekable();
+        if gap.token == WORKSPACE_DEFINITION_ORDER && holders.peek().is_some() {
+            return holders.any(|home| self.workspace_file(home));
+        }
+        let module = self.ws.module.as_ref();
+        let in_closure = module.is_some_and(|m| m.files.iter().any(|f| f.path == gap.file));
+        !in_closure || holders.peek().is_some() || reads_module(&self.worlds)
+    }
+}
+
+/// Whether Bazel may evaluate the statement at `site` under some
+/// dependency system the workspace may run ([`Evaluated`]).
+pub(super) fn may_evaluate(ws: &BazelWorkspace, site: &Site) -> bool {
+    Evaluated::of(ws).site(site)
+}
+
+/// What leaves every ecosystem undetermined: a gap of `MODULE.bazel`
+/// where Bazel may run with Bzlmod on, and a gap of each `WORKSPACE`-family
+/// file that Bazel may evaluate ([`Evaluated`]). A directory called
+/// `MODULE.bazel` counts under every system: `detect` keeps its model only
+/// where Bazel reads the path and stops.
+fn governing_gaps(ws: &BazelWorkspace, evaluated: &Evaluated<'_>) -> Vec<Gap> {
+    let stops = ws.module.is_some() && !ws.boundary.module_bazel;
+    let mut gaps = match stops || reads_module(&evaluated.worlds) {
+        true => module_gaps(ws.module.as_ref(), &ws.boundary),
+        false => Vec::new(),
     };
     for model in &ws.workspace_files {
-        if root_file(model).is_none_or(|path| evaluates(&worlds, &opened, path)) {
+        if root_file(model).is_none_or(|path| evaluated.workspace_file(path)) {
             gaps.extend(workspace_gaps(model, &ws.boundary));
         }
     }
     gaps
 }
 
-fn signal_gap(signal: &RulesetSignal) -> Gap {
+/// The 1-based line of the statement at `site`, where a model holds a
+/// statement of that span.
+fn line_of(ws: &BazelWorkspace, site: &Site) -> Option<usize> {
+    match site.system {
+        DeclSystem::Bzlmod => {
+            let module = ws.module.as_ref()?;
+            let ats = (module.deps.iter().map(|dep| dep.at))
+                .chain(module.proxies.iter().map(|proxy| proxy.at))
+                .chain(module.tags.iter().map(|tag| tag.at))
+                .chain(module.imports.iter().map(|import| import.at))
+                .chain(module.repo_rule_calls.iter().map(|call| call.at));
+            let mut ats = ats.filter(|at| module.site(*at) == *site);
+            ats.next().map(|at| at.line)
+        }
+        DeclSystem::Workspace => ws.workspace_files.iter().find_map(|model| {
+            let index = model.files.iter().position(|f| f.path == site.file)?;
+            let top = model.stmts.iter().filter(|_| index == 0);
+            let bodies = model.macros.iter().filter(|made| made.file == index);
+            let mut stmts = top.chain(bodies.flat_map(|made| &made.body));
+            let stmt = stmts.find(|stmt| stmt.span == site.span)?;
+            Some(stmt.line)
+        }),
+    }
+}
+
+/// The gap of a signal: it names the use of the ruleset that was not
+/// followed to a hub. Hubs of the same ruleset may have been read beside
+/// it, so it does not say that none was.
+fn signal_gap(ws: &BazelWorkspace, signal: &RulesetSignal) -> Gap {
     let (file, ruleset) = (&signal.site.file, signal.ruleset.name());
+    let at = match line_of(ws, &signal.site) {
+        Some(line) => format!("{file}:{line}"),
+        None => file.clone(),
+    };
     let detail = format!(
-        "{file}: {ruleset} is present and no hub of it could be read, so the lock Bazel builds \
-         from is not known; declare the hub with literal names and labels"
+        "{at}: {ruleset} is used here in a way that was not followed to a hub, so a lock Bazel \
+         builds from may be one that was not read; declare each hub with literal names and \
+         labels, or remove the use"
     );
     unknown(LABEL_NOT_LITERAL, file, detail)
 }
@@ -803,7 +1064,15 @@ fn signal_gap(signal: &RulesetSignal) -> Gap {
 /// would get the directory `replace` that design HZ-06 and owner decision
 /// O8 refuse under any live `go_repository` consumer, which the next
 /// `gazelle update-repos -prune` turns into a deleted rule.
-fn claims(hub: &Hub, project_rel: &str) -> bool {
+///
+/// A label is spelled by hand and the project by the disk, so a file is
+/// in the project's directory under either spelling: on a file system
+/// that folds case `//App:lock` is the lock of `app`, and a label that
+/// reaches its file through a linked directory (`//pkg:lock` with `pkg`
+/// a link to `real/pkg`) names the lock of the project a crawler finds at
+/// `real/pkg` (`ws.lock_real_dirs`). Taking two directories for one only
+/// governs more.
+fn claims(ws: &BazelWorkspace, hub: &Hub, project_rel: &str) -> bool {
     /// The directory and the name of a root-relative file.
     fn parts(path: &str) -> (&str, &str) {
         path.rsplit_once('/').unwrap_or(("", path))
@@ -820,11 +1089,12 @@ fn claims(hub: &Hub, project_rel: &str) -> bool {
         role == LockRole::PackageLock && registry::root_marker(base).is_none() && base != NUGET_LOCK
     };
     let locked = files().any(|(_, role)| role == LockRole::PackageLock);
-    // A label is spelled by hand and the project by the disk: on a file
-    // system that folds case, `//App:lock` is the lock of `app`. Taking
-    // two directories for one only governs more.
-    files().any(|(path, _)| parts(path).0.eq_ignore_ascii_case(project_rel))
-        || (project_rel.is_empty() && (!locked || files().any(by_label)))
+    let here = |(path, _): (&str, LockRole)| {
+        let real = ws.lock_real_dirs.get(path).map(String::as_str);
+        let mut dirs = [Some(parts(path).0), real].into_iter().flatten();
+        dirs.any(|dir| dir.eq_ignore_ascii_case(project_rel))
+    };
+    files().any(here) || (project_rel.is_empty() && (!locked || files().any(by_label)))
 }
 
 /// Governance of `ecosystem` for the project at `project_rel` (relative to
@@ -857,17 +1127,24 @@ pub fn governance(ws: &BazelWorkspace, ecosystem: Ecosystem, project_rel: &str) 
     {
         return Governance::NotGoverned;
     }
-    let mut gaps = governing_gaps(ws);
-    let read_short = ws.ruleset_gaps.iter().filter(|(ruleset, _)| own(*ruleset));
+    // What was not read counts where Bazel may evaluate it, and nowhere
+    // else: the statement of a file Bazel never opens declares no hub.
+    let evaluated = Evaluated::of(ws);
+    let mut gaps = governing_gaps(ws, &evaluated);
+    let read_short = ws.ruleset_gaps.iter();
+    let read_short = read_short.filter(|(ruleset, gap)| own(*ruleset) && evaluated.gap(gap));
     gaps.extend(read_short.map(|(_, gap)| gap.clone()));
-    let signals = ws.signals.iter().filter(|signal| own(signal.ruleset));
-    gaps.extend(signals.map(signal_gap));
+    let signals = ws.signals.iter();
+    let signals = signals.filter(|signal| own(signal.ruleset) && evaluated.site(&signal.site));
+    gaps.extend(signals.map(|signal| signal_gap(ws, signal)));
     let of_ecosystem = |hub: &&Hub| hub.ecosystem == ecosystem;
     if gaps.is_empty() {
-        // A hub whose name or lock label was not read may name any lock.
+        // A hub whose name or lock label was not read may name any lock,
+        // unless Bazel never evaluates its declaration.
         let unread = |hub: &&Hub| {
             let lock = |l: &LockRef| l.role == LockRole::PackageLock && l.path.is_none();
-            !hub.decl.literal || hub.locks.iter().any(lock)
+            let open = !hub.decl.literal || hub.locks.iter().any(lock);
+            open && !matches!(standing(ws, hub), Standing::Is(Liveness::Dead { .. }))
         };
         let hubs = ws.hubs.iter().filter(of_ecosystem).filter(unread);
         gaps.extend(hubs.map(|hub| {
@@ -884,7 +1161,7 @@ pub fn governance(ws: &BazelWorkspace, ecosystem: Ecosystem, project_rel: &str) 
         return Governance::Undetermined(gaps);
     }
     let candidates: Vec<usize> = (0..ws.hubs.len())
-        .filter(|id| of_ecosystem(&&ws.hubs[*id]) && claims(&ws.hubs[*id], project_rel))
+        .filter(|id| of_ecosystem(&&ws.hubs[*id]) && claims(ws, &ws.hubs[*id], project_rel))
         .collect();
     if candidates.is_empty() {
         return Governance::NotGoverned;
@@ -2275,6 +2552,284 @@ pub(super) mod tests {
         assert_eq!(
             tokens(&governance(&broken, Ecosystem::Npm, "")),
             [WORKSPACE_UNREADABLE]
+        );
+    }
+
+    /// The `WORKSPACE` of a root that fetches rules_js and loads its hub
+    /// rule; the caller adds what uses it.
+    const JS_LOADED: &str = "load(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")\n\
+        http_archive(\n    name = \"aspect_rules_js\",\n    strip_prefix = \"rules_js-2.9.3\",\n    \
+        url = \"https://github.com/aspect-build/rules_js/releases/download/v2.9.3/rules_js-v2.9.3.tar.gz\",\n)\n\
+        load(\"@aspect_rules_js//npm:repositories.bzl\", \"npm_translate_lock\")\n";
+
+    /// A signal and a recognizer's gap hold an ecosystem up only where
+    /// Bazel may evaluate their statement, as a gap of the model does. On
+    /// Bazel 8 and 9, and wherever another file replaces it, a `WORKSPACE`
+    /// left beside `MODULE.bazel` declares nothing Bazel reads: a hub rule
+    /// nobody followed there must not refuse the hub Bazel builds from.
+    #[test]
+    fn a_signal_or_a_recognizer_gap_counts_only_where_bazel_may_evaluate_it() {
+        let with = |version: &'static str, rc: &'static str, files: &[(&str, &str)]| {
+            let fixed = [
+                (".bazelversion", version),
+                (".bazelrc", rc),
+                ("MODULE.bazel", JS_MODULE),
+                PNPM_LOCK,
+            ];
+            read(&[&fixed[..], files].concat())
+        };
+        let governed = Governance::Governed(vec![HubId(0)]);
+        let details = |found: &Governance| match found {
+            Governance::Undetermined(gaps) => {
+                let details = gaps.iter().map(|gap| gap.detail.clone());
+                details.collect::<Vec<String>>()
+            }
+            other => panic!("not undetermined: {other:?}"),
+        };
+
+        // A signal: the hub rule is loaded and no hub was read from it.
+        let leftover = [("WORKSPACE", JS_LOADED)];
+        for version in ["9.3.2", "8.8.2"] {
+            let ws = with(version, "", &leftover);
+            // The model still says what was found.
+            let [signal] = &ws.signals[..] else {
+                panic!("Bazel {version}: one signal: {:?}", ws.signals);
+            };
+            assert_eq!(
+                (signal.ruleset, signal.site.file.as_str()),
+                (Ruleset::RulesJs, "WORKSPACE")
+            );
+            assert_eq!(
+                governance(&ws, Ecosystem::Npm, ""),
+                governed,
+                "Bazel {version}"
+            );
+        }
+        // Bazel may evaluate the file: outright, or under a config.
+        for (version, rc) in [
+            ("7.7.2", ""),
+            ("8.8.2", "common --enable_workspace\n"),
+            ("8.8.2", "common:ci --enable_workspace\n"),
+        ] {
+            let found = governance(&with(version, rc, &leftover), Ecosystem::Npm, "");
+            let what = format!("Bazel {version} with {rc:?}");
+            assert_eq!(tokens(&found), [LABEL_NOT_LITERAL], "{what}");
+            // The text names the use that was not followed, and does not
+            // say that no hub was read: one was, in `MODULE.bazel`.
+            let detail = &details(&found)[0];
+            assert!(
+                detail.starts_with("WORKSPACE:7: rules_js is used here"),
+                "{what}: {detail}"
+            );
+            assert!(!detail.contains("no hub"), "{what}: {detail}");
+        }
+        // The signal is judged for its own file.
+        for replaced_by in ["WORKSPACE.bazel", "WORKSPACE.bzlmod"] {
+            let ws = with("7.7.2", "", &[leftover[0], (replaced_by, "")]);
+            assert_eq!(
+                governance(&ws, Ecosystem::Npm, ""),
+                governed,
+                "{replaced_by}"
+            );
+        }
+        let ws = with(
+            "7.7.2",
+            "",
+            &[("WORKSPACE", ""), ("WORKSPACE.bzlmod", JS_LOADED)],
+        );
+        let found = governance(&ws, Ecosystem::Npm, "");
+        assert!(
+            details(&found)[0].starts_with("WORKSPACE.bzlmod:7: "),
+            "{found:?}"
+        );
+
+        // A signal of a macro file lives with the file that loads it.
+        let load = ("WORKSPACE", "load(\"//:deps.bzl\", \"deps\")\ndeps()\n");
+        let unused = "load(\"@aspect_rules_js//npm:repositories.bzl\", \"npm_translate_lock\")\n\
+            def deps():\n    pass\n";
+        let macros = [load, ("deps.bzl", unused)];
+        assert_eq!(with("9.3.2", "", &macros).signals.len(), 1);
+        assert_eq!(
+            governance(&with("9.3.2", "", &macros), Ecosystem::Npm, ""),
+            governed
+        );
+        let found = governance(&with("7.7.2", "", &macros), Ecosystem::Npm, "");
+        let detail = &details(&found)[0];
+        assert!(detail.starts_with("deps.bzl: rules_js is used"), "{detail}");
+
+        // A recognizer's gap in the `WORKSPACE` file itself: the rule is
+        // handed to a function nobody read.
+        let passed =
+            format!("{JS_LOADED}load(\"@other//:deps.bzl\", \"more\")\nmore(npm_translate_lock)\n");
+        let leftover = [("WORKSPACE", passed.as_str())];
+        let ws = with("9.3.2", "", &leftover);
+        assert_eq!(ws.ruleset_gaps.len(), 1, "{:?}", ws.ruleset_gaps);
+        assert_eq!(ws.ruleset_gaps[0].1.file, "WORKSPACE");
+        assert_eq!(governance(&ws, Ecosystem::Npm, ""), governed);
+        // The run still warns about it.
+        assert!(matches!(ws.completeness, Completeness::Incomplete(_)));
+        let found = governance(&with("7.7.2", "", &leftover), Ecosystem::Npm, "");
+        assert_eq!(tokens(&found), [LABEL_NOT_LITERAL; 2]);
+        assert!(details(&found)[0].starts_with("WORKSPACE:9: "), "{found:?}");
+
+        // A hub whose lock label is computed, in a file Bazel never
+        // evaluates, is dead like any other hub there.
+        let computed = PIP_WORKSPACE.replace("\"//:requirements.txt\"", "REQS");
+        let leftover = [("WORKSPACE", computed.as_str())];
+        let ws = with("9.3.2", "", &leftover);
+        assert!(!ws.hubs[1].decl.literal, "{:?}", ws.hubs[1]);
+        let found = governance(&ws, Ecosystem::Pypi, "");
+        assert!(
+            matches!(found, Governance::Inactive(HubId(1), Liveness::Dead { .. })),
+            "{found:?}"
+        );
+        assert_eq!(governance(&ws, Ecosystem::Npm, ""), governed);
+        let found = governance(&with("7.7.2", "", &leftover), Ecosystem::Pypi, "");
+        assert_eq!(tokens(&found), [LABEL_NOT_LITERAL]);
+
+        // What is not dropped: a recognizer's gap in a `.bzl` file. A gap
+        // names its file and not the system that reads the statement, and
+        // a BUILD file or a module extension may load a macro file too.
+        // Only the order rule's gap is a `WORKSPACE` statement by
+        // construction.
+        let handed = "load(\"@aspect_rules_js//npm:repositories.bzl\", \"npm_translate_lock\")\n\
+            def deps():\n    other(npm_translate_lock)\n";
+        let ws = with("9.3.2", "", &[load, ("deps.bzl", handed)]);
+        assert_eq!(ws.ruleset_gaps[0].1.file, "deps.bzl");
+        let found = governance(&ws, Ecosystem::Npm, "");
+        assert_eq!(tokens(&found), [LABEL_NOT_LITERAL]);
+        assert!(details(&found)[0].starts_with("deps.bzl:3: "), "{found:?}");
+    }
+
+    /// The order rule's gap is of one `WORKSPACE` model: where Bazel
+    /// evaluates none of the files that hold its statement, it holds
+    /// nothing up, in the `WORKSPACE` file or in a macro file.
+    #[test]
+    fn an_order_gap_counts_only_under_a_workspace_file_bazel_evaluates() {
+        let order = |file: &str| Gap {
+            token: WORKSPACE_DEFINITION_ORDER,
+            file: file.to_string(),
+            detail: format!("{file}:1: which definition of `npm` Bazel builds is not proven"),
+        };
+        let scan = |file: &str| Gap {
+            token: LABEL_NOT_LITERAL,
+            file: file.to_string(),
+            detail: format!("{file}:1: a use of a rule is not read"),
+        };
+        let macros = "def deps():\n    pass\n";
+        let read_with = |version: &'static str, gap: Gap| {
+            let mut ws = read(&[
+                (".bazelversion", version),
+                ("MODULE.bazel", JS_MODULE),
+                ("WORKSPACE", "load(\"//:deps.bzl\", \"deps\")\ndeps()\n"),
+                ("deps.bzl", macros),
+                PNPM_LOCK,
+            ]);
+            assert!(ws.ruleset_gaps.is_empty(), "{:?}", ws.ruleset_gaps);
+            ws.ruleset_gaps.push((Ruleset::RulesJs, gap));
+            governance(&ws, Ecosystem::Npm, "")
+        };
+        let governed = Governance::Governed(vec![HubId(0)]);
+        for file in ["WORKSPACE", "deps.bzl"] {
+            assert_eq!(read_with("9.3.2", order(file)), governed, "{file}");
+            let found = read_with("7.7.2", order(file));
+            assert_eq!(tokens(&found), [WORKSPACE_DEFINITION_ORDER], "{file}");
+        }
+        // Any other gap is dropped only in the `WORKSPACE` file itself
+        // and in the `MODULE.bazel` closure, which nothing else loads.
+        assert_eq!(read_with("9.3.2", scan("WORKSPACE")), governed);
+        assert_eq!(
+            tokens(&read_with("9.3.2", scan("deps.bzl"))),
+            [LABEL_NOT_LITERAL]
+        );
+        assert_eq!(
+            tokens(&read_with("9.3.2", scan("pkg/BUILD.bazel"))),
+            [LABEL_NOT_LITERAL]
+        );
+        assert_eq!(
+            tokens(&read_with("9.3.2", scan("MODULE.bazel"))),
+            [LABEL_NOT_LITERAL]
+        );
+        assert_eq!(tokens(&read_with("9.3.2", scan(""))), [LABEL_NOT_LITERAL]);
+        // A gap of another ecosystem's ruleset is not this one's.
+        let mut ws = read(&[
+            (".bazelversion", "7.7.2\n"),
+            ("MODULE.bazel", JS_MODULE),
+            PNPM_LOCK,
+        ]);
+        ws.ruleset_gaps
+            .push((Ruleset::RulesPython, scan("MODULE.bazel")));
+        assert_eq!(governance(&ws, Ecosystem::Npm, ""), governed);
+    }
+
+    /// `MODULE.bazel` declares nothing where Bzlmod is off: Bazel 6 never
+    /// opens the file, and a hub of it is dead on Bazel 7 under
+    /// `--noenable_bzlmod`. What was not read there holds nothing up.
+    #[test]
+    fn a_module_file_bazel_does_not_use_holds_nothing_up() {
+        let dep = "bazel_dep(name = \"aspect_rules_js\", version = \"3.6.0\")\n";
+        let broken = "bazel_dep(\n";
+        for (version, rc, bzlmod) in [
+            ("6.6.0", "", false),
+            ("6.6.0", "common --enable_bzlmod\n", true),
+            ("6.6.0", "common:next --enable_bzlmod\n", true),
+            ("7.7.2", "common --noenable_bzlmod\n", false),
+            ("7.7.2", "", true),
+            ("9.3.2", "", true),
+        ] {
+            let what = format!("Bazel {version} with {rc:?}");
+            let read_with = |module: &str| {
+                read(&[
+                    (".bazelversion", version),
+                    (".bazelrc", rc),
+                    ("MODULE.bazel", module),
+                    ("WORKSPACE", ""),
+                ])
+            };
+            // A signal of the module file.
+            let ws = read_with(dep);
+            assert_eq!(ws.signals.len(), 1, "{what}");
+            let found = governance(&ws, Ecosystem::Npm, "");
+            match bzlmod {
+                true => assert_eq!(tokens(&found), [LABEL_NOT_LITERAL], "{what}"),
+                false => assert_eq!(found, Governance::NotGoverned, "{what}"),
+            }
+            // A gap of the module file itself.
+            let ws = read_with(broken);
+            assert!(
+                matches!(ws.completeness, Completeness::Incomplete(_)),
+                "{what}"
+            );
+            let found = governance(&ws, Ecosystem::Npm, "");
+            match bzlmod {
+                true => assert_eq!(tokens(&found), [WORKSPACE_UNREADABLE], "{what}"),
+                false => assert_eq!(found, Governance::NotGoverned, "{what}"),
+            }
+        }
+        // A recognizer's gap in the closure of `MODULE.bazel`.
+        let computed = JS_MODULE.replace("\"//:pnpm-lock.yaml\"", "LOCKS[0]");
+        let files = [
+            ("MODULE.bazel", computed.as_str()),
+            ("WORKSPACE", ""),
+            PNPM_LOCK,
+        ];
+        let on = read(&[&files[..], &[(".bazelversion", "7.7.2\n")]].concat());
+        let in_module = |(_, gap): &(Ruleset, Gap)| gap.file == "MODULE.bazel";
+        assert!(
+            on.ruleset_gaps.iter().any(in_module),
+            "{:?}",
+            on.ruleset_gaps
+        );
+        assert_eq!(
+            tokens(&governance(&on, Ecosystem::Npm, ""))[0],
+            LABEL_NOT_LITERAL
+        );
+        let off = read(&[&files[..], &[(".bazelversion", "6.6.0\n")]].concat());
+        assert!(!off.ruleset_gaps.is_empty());
+        let found = governance(&off, Ecosystem::Npm, "");
+        assert!(
+            matches!(found, Governance::Inactive(HubId(0), Liveness::Dead { .. })),
+            "{found:?}"
         );
     }
 

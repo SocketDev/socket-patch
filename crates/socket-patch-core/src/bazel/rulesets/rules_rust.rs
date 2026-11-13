@@ -139,9 +139,6 @@ const VENDOR_RULE: &str = "crates_vendor";
 pub const SCAN_DIRS: usize = 65_536;
 /// How many files one scan of the main repository reads.
 pub const SCAN_FILES: usize = 16_384;
-/// The root entries Bazel makes as convenience links into its output
-/// tree under the default `--symlink_prefix`.
-const CONVENIENCE_LINKS: [&str; 4] = ["bazel-bin", "bazel-out", "bazel-testlogs", "bazel-genfiles"];
 
 /// What a declaration passes for an attribute that names one file.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -840,14 +837,6 @@ pub(super) fn build_or_bzl(name: &str) -> bool {
     name == "BUILD" || name == "BUILD.bazel" || name.ends_with(".bzl")
 }
 
-/// Whether the root entry `dir`, with the children `names`, is the
-/// execution root behind the `bazel-<workspace>` convenience link: it
-/// holds `bazel-out`, which no source tree does.
-fn execution_root(dir: &str, names: &[String]) -> bool {
-    let out = |name: &String| name == "bazel-out/" || name == "bazel-out";
-    !dir.contains('/') && dir.starts_with("bazel-") && names.iter().any(out)
-}
-
 /// Hands every file of the main repository that `scan` wants to `visit`,
 /// breadth first, so the packages near the root are read before a deep
 /// tree uses up the bounds. Directories the root's `.bazelignore` hides
@@ -858,11 +847,10 @@ fn execution_root(dir: &str, names: &[String]) -> bool {
 /// under the output base (`isConvenienceSymlink`, read at 7.7.2
 /// `ProcessPackageDirectory.java:196`, and the same test at 5.4.1 and
 /// 6.6.0). A real directory named `bazel-<x>` is an ordinary package
-/// tree. No listing tells a link from a directory, so the links are told
-/// by what they are: the four fixed names of the default prefix
-/// ([`CONVENIENCE_LINKS`]), and a root `bazel-*` entry that holds
-/// `bazel-out`, which is the execution root. Every other root `bazel-*`
-/// directory is walked like any directory.
+/// tree. The view tells the two apart: it lists a link into a tree Bazel
+/// owns as a bare name and never as a directory ([`FileView::list`]),
+/// under the default prefix and under any `--symlink_prefix`. So the scan
+/// knows no link by its name, and walks every directory it is shown.
 ///
 /// `visit` returns `Some` when it can take no more files, with the
 /// reason; the scan stops there. The result is `Some` when a file or
@@ -892,9 +880,6 @@ pub(super) fn scan_starlark(
             stopped = stopped.or_else(|| unscanned(&dir, unlisted()));
             continue;
         };
-        if execution_root(&dir, &names) {
-            continue;
-        }
         names.sort();
         for name in names {
             let (entry, is_dir) = match name.strip_suffix('/') {
@@ -906,8 +891,7 @@ pub(super) fn scan_starlark(
                 dir => format!("{dir}/{entry}"),
             };
             if is_dir {
-                let link = dir.is_empty() && CONVENIENCE_LINKS.contains(&entry);
-                if entry != ".git" && !link && !hidden.covers(&child) {
+                if entry != ".git" && !hidden.covers(&child) {
                     pending.push_back(child);
                 }
             } else if (scan.wanted)(entry) {
@@ -2047,12 +2031,6 @@ mod tests {
                 ),
                 (".bazelignore", "hidden\n"),
                 ("hidden/BUILD.bazel", &build),
-                // None is a package of the build: the convenience links
-                // lead into the output tree, `bazel-app` to the execution
-                // root, which holds `bazel-out`.
-                ("bazel-bin/third_party/BUILD.bazel", &build),
-                ("bazel-app/third_party/BUILD.bazel", &build),
-                ("bazel-app/bazel-out/darwin_arm64-fastbuild/bin/x", ""),
                 (".git/BUILD", &build),
             ],
         );
@@ -2091,10 +2069,44 @@ mod tests {
         assert!(detail(specs).vendored_by.is_empty() && read.vendored_by.is_empty());
     }
 
+    /// A view that lists some of its directories as a disk view lists a
+    /// link into a tree Bazel owns: a bare name, no directory
+    /// ([`FileView::list`]).
+    struct Linked<'a> {
+        tree: testing::Tree,
+        links: &'a [&'a str],
+    }
+
+    impl FileView for Linked<'_> {
+        fn read(&self, rel: &str) -> FileText {
+            self.tree.read(rel)
+        }
+
+        fn list(&self, dir: &str) -> Option<Vec<String>> {
+            let child = |name: &str| match dir {
+                "" => name.to_string(),
+                dir => format!("{dir}/{name}"),
+            };
+            let link = |name: &String| {
+                let entry = name.strip_suffix('/').unwrap_or(name);
+                self.links.contains(&child(entry).as_str())
+            };
+            let names = self.tree.list(dir)?.into_iter();
+            let bare = |name: String| match link(&name) {
+                true => name.trim_end_matches('/').to_string(),
+                false => name,
+            };
+            Some(names.map(bare).collect())
+        }
+    }
+
     /// Bazel skips a root entry only when it is one of its own
     /// convenience links (bazel@7.7.2 `ProcessPackageDirectory.java:196`):
     /// a real directory named `bazel-<x>` is a package tree like any
-    /// other, and a target in it names a lock like any other.
+    /// other, and a target in it names a lock like any other. The scan
+    /// knows no link by its name. The view lists a link into the output
+    /// tree as no directory, whatever `--symlink_prefix` names it, and the
+    /// scan walks every directory it is shown.
     #[test]
     fn a_real_bazel_directory_is_scanned_and_an_output_link_is_not() {
         let module = format!(
@@ -2102,20 +2114,31 @@ mod tests {
         );
         let build =
             format!("{DEFS}crates_vendor(name = \"vendor\", cargo_lockfile = \"//:Cargo.lock\")\n");
-        let found = run(
-            recognize,
-            &[
-                ("MODULE.bazel", &module),
-                ("bazel-tools/BUILD.bazel", &build),
-                // Below the root the names mean nothing.
-                ("tools/bazel-out/BUILD.bazel", &build),
-                ("bazel-out/BUILD.bazel", &build),
-                ("bazel-testlogs/BUILD.bazel", &build),
-                ("bazel-genfiles/BUILD.bazel", &build),
-                ("bazel-app/BUILD.bazel", &build),
-                ("bazel-app/bazel-out/x", ""),
-            ],
-        );
+        let files = [
+            ("MODULE.bazel", module.as_str()),
+            ("bazel-tools/BUILD.bazel", &build),
+            ("tools/bazel-out/BUILD.bazel", &build),
+            // What stands behind the links of a built workspace: the
+            // default prefix, the execution root, and `dist/` as
+            // `--symlink_prefix=dist/` makes them.
+            ("bazel-bin/third_party/BUILD.bazel", &build),
+            ("bazel-out/BUILD.bazel", &build),
+            ("bazel-app/third_party/BUILD.bazel", &build),
+            ("dist/bin/third_party/BUILD.bazel", &build),
+            ("dist/app/BUILD.bazel", &build),
+        ];
+        let links = [
+            "bazel-bin",
+            "bazel-out",
+            "bazel-app",
+            "dist/bin",
+            "dist/app",
+        ];
+        let view = Linked {
+            tree: testing::Tree::new(&files),
+            links: &links,
+        };
+        let found = run_in(recognize, &files, &view);
         let [crates, real, nested] = &found.hubs[..] else {
             panic!("three hubs: {:?}", found.hubs)
         };
@@ -2124,6 +2147,27 @@ mod tests {
         let both = ["//bazel-tools:vendor", "//tools/bazel-out:vendor"];
         assert_eq!(detail(crates).vendored_by, both);
         assert!(found.gaps.is_empty());
+
+        // A directory is a package tree under any name: one called like a
+        // convenience link is read like every other.
+        let found = run(recognize, &files);
+        let mut names: Vec<&str> = found.hubs[1..]
+            .iter()
+            .map(|hub| detail(hub).hub_name.as_str())
+            .collect();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            [
+                "//bazel-app/third_party:vendor",
+                "//bazel-bin/third_party:vendor",
+                "//bazel-out:vendor",
+                "//bazel-tools:vendor",
+                "//dist/app:vendor",
+                "//dist/bin/third_party:vendor",
+                "//tools/bazel-out:vendor",
+            ]
+        );
 
         // A `bazel-*` directory that cannot be listed is not known to be
         // a link: the scan says it stopped there.

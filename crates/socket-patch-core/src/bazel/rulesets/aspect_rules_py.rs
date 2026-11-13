@@ -23,10 +23,11 @@
 
 use super::pip_compile::PipCompileDetail;
 use super::rules_python::{
-    lock_checks, module_version, unread_module, ExtensionUse, HubImport, PairedManifest, Pick,
-    Reading, Usage, USER_OVERRIDE,
+    lock_checks, unread_module, ExtensionUse, HubImport, PairedManifest, Pick, Reading, Usage,
+    USER_OVERRIDE,
 };
 use super::{RecognizeInput, Recognized};
+use crate::bazel::govern::module_version;
 use crate::bazel::model::{Bypass, HubShape, LockRole, Ruleset, RulesetDetail, Site, UserDecl};
 use crate::bazel::module_file::Tag;
 use crate::bazel::version::Tri;

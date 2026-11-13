@@ -38,11 +38,11 @@
 
 use super::pip_compile::PipCompileDetail;
 use super::rules_python::{
-    called_rule, lock_checks, module_version, ruleset_load, unread_module, wheel_package,
-    ExtensionUse, HubImport, PairedManifest, Pick, Ran, Reading, Usage, WsSignature, MANIFEST,
-    USER_OVERRIDE,
+    called_rule, lock_checks, ruleset_load, unread_module, wheel_package, ExtensionUse, HubImport,
+    PairedManifest, Pick, Ran, Reading, Usage, WsSignature, MANIFEST, USER_OVERRIDE,
 };
 use super::{RecognizeInput, Recognized};
+use crate::bazel::govern::module_version;
 use crate::bazel::model::{Bypass, HubShape, LockRole, Ruleset, RulesetDetail, Site, UserDecl};
 use crate::bazel::module_file::ModuleModel;
 use crate::bazel::ruleset_version::{Unproven, VersionVerdict};
