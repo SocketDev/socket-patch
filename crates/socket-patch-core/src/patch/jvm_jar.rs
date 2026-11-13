@@ -327,6 +327,7 @@ fn result_for(swap: &JarSwap<'_>, dir: &Path) -> ApplyResult {
         applied_via: HashMap::new(),
         error: None,
         sidecar: None,
+        refusal: None,
     }
 }
 

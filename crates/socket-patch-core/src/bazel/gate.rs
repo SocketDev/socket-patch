@@ -370,7 +370,12 @@ fn occurrences(ws: &BazelWorkspace, flag: Flag) -> Result<Vec<Occurrence>, Refus
 
 // ── Obligations 1 to 3 ───────────────────────────────────────────────
 
-fn undetermined(gaps: &[Gap]) -> Refusal {
+/// The refusal for an ecosystem whose governance is not known
+/// (`Governance::Undetermined`): the first gap names the case and what
+/// would lift it. Public for a seam that has no model to ask [`gate`]
+/// with (a root above the repository, a root no boundary file of which
+/// could be read) and still must refuse as the gate would.
+pub fn undetermined(gaps: &[Gap]) -> Refusal {
     let Some(first) = gaps.first() else {
         let why = "which lock Bazel reads for this ecosystem could not be determined";
         let lift = Lift::EnableLane(LaneId::UNNAMED);
