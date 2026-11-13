@@ -2529,7 +2529,7 @@ pub(super) mod tests {
             empty
         );
         let FlagState::Possible(readings) = with("vendor --vendor_dir=\n") else {
-            panic!("`vendor --vendor_dir=` sets the flag for one command");
+            panic!("an empty --vendor_dir on the vendor command sets the flag for one command");
         };
         assert_eq!(readings.values().collect::<Vec<_>>(), [""]);
         // Beside a committed vendor directory too.
