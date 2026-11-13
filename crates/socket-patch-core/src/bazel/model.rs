@@ -274,6 +274,15 @@ pub struct BazelWorkspace {
     /// same condition as for a signal. The same gaps are in
     /// `completeness`, which does not say whose they are.
     pub ruleset_gaps: Vec<(Ruleset, Gap)>,
+    /// The gaps of `ruleset_gaps` that a recognizer reports only because
+    /// it read a `WORKSPACE`-family file Bazel never evaluates: each is in
+    /// a macro file that only such files load, and the recognizer, run
+    /// again without them, does not report it. They hold nothing up
+    /// (`govern::governance`). A gap names its file and not the reader
+    /// that met the statement, so `detect` asks the recognizer twice
+    /// where the file alone does not answer, and only in a root where no
+    /// module extension of its own could run the macro file unseen.
+    pub unevaluated_gaps: Vec<Gap>,
     pub vendor_dirs: CommittedVendorDirs,
     /// The lock files that are reached through a link: the path as a
     /// hub's label spells it ([`LockRef::path`]), and the directory that

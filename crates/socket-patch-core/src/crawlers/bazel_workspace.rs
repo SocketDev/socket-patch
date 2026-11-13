@@ -10,6 +10,14 @@
 //! the old one when it is told of the commit), and no transaction is
 //! based on a view from before one. Nothing is read before somebody asks.
 //!
+//! That makes a view a read cache, and a cache alone is no snapshot: a
+//! path nobody asked for before a commit would be read after it, and a
+//! model of before the commit would be judged with bytes of after it. So
+//! the view that a commit leaves behind is frozen ([`DiskView::freeze`]):
+//! it goes on answering what it had read, and what it had not read it
+//! cannot read any more, which is `Unreadable` and never `Absent`. Whoever
+//! still holds it decides from the root as it was, or refuses.
+//!
 //! What a view will not do:
 //!
 //! - leave the read boundary. A path with more leading `..` than the
@@ -54,9 +62,17 @@ struct Memo {
     reads: HashMap<String, FileText>,
     lists: HashMap<String, Option<Vec<String>>>,
     bytes_read: u64,
+    /// Set by [`DiskView::freeze`]: nothing more is read from the disk.
+    frozen: bool,
 }
 
 /// One Bazel root on disk, as the pure layer reads files.
+///
+/// A view is a read cache until it is frozen, and a snapshot of what it
+/// had read from then on ([`DiskView::freeze`]). The decision of ROUTED
+/// R-136: a view held across a commit of the run must not hand out bytes
+/// of after the commit beside a model of before it, and "do not read a
+/// held view" is a rule nothing else enforces.
 pub struct DiskView {
     root: PathBuf,
     boundary: ReadBoundary,
@@ -99,6 +115,31 @@ impl DiskView {
     /// The root, resolved.
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// Closes the view to the disk, for good: what was read or listed
+    /// before the call is answered as before, and every other path is
+    /// `Unreadable` and cannot be listed. Neither is `Absent` or empty:
+    /// the view did not look, so it cannot know.
+    ///
+    /// The owner of a view calls this when the run changed a file under
+    /// the root (the CLI's loader does, for every view it drops on
+    /// `Loader::committed`). A caller that still holds the view then sees
+    /// the root as it was before the change and nothing of after it. A
+    /// read that is under way when the call is made may still return what
+    /// it found; every read that starts after it is of the memo alone.
+    ///
+    /// [`DiskView::real_dir`] is no part of this. It reads no file: it
+    /// resolves links for the one caller that reads a model
+    /// ([`read_workspace`]), and a model is read before a commit, not
+    /// across one.
+    pub fn freeze(&self) {
+        self.memo().frozen = true;
+    }
+
+    /// Whether [`DiskView::freeze`] was called.
+    pub fn is_frozen(&self) -> bool {
+        self.memo().frozen
     }
 
     fn memo(&self) -> MutexGuard<'_, Memo> {
@@ -223,6 +264,9 @@ impl FileView for DiskView {
         if let Some(known) = memo.reads.get(rel) {
             return known.clone();
         }
+        if memo.frozen {
+            return FileText::Unreadable;
+        }
         let text = match self.locate(rel) {
             Some(path) => self.read_file(&path, &mut memo.bytes_read),
             None => FileText::Unreadable,
@@ -235,6 +279,9 @@ impl FileView for DiskView {
         let mut memo = self.memo();
         if let Some(known) = memo.lists.get(dir) {
             return known.clone();
+        }
+        if memo.frozen {
+            return None;
         }
         let listed = self
             .locate(dir)
@@ -346,6 +393,122 @@ mod tests {
             DiskView::new(&root).read("MODULE.bazel"),
             bytes("changed\n")
         );
+    }
+
+    /// ROUTED R-136: a view held across a commit is a snapshot of what it
+    /// had read. What it reads for the first time after the commit would
+    /// be bytes of after it, beside a model of before it, so a frozen view
+    /// reads nothing more: such a path is unreadable, never absent.
+    #[test]
+    fn a_frozen_view_answers_only_what_it_read_before() {
+        let (tmp, root) = staged(&[
+            ("repo/ws/MODULE.bazel", "module()\n"),
+            ("repo/ws/pnpm-lock.yaml", "lockfileVersion: '9.0'\n"),
+            ("repo/ws/pkg/BUILD", ""),
+            ("repo/ws/pkg/sub/BUILD", ""),
+            ("repo/.bazelversion", "9.3.2\n"),
+        ]);
+        let view = DiskView::new(&root);
+        assert!(!view.is_frozen());
+        // Read before the commit: a file, a file that is not there, and
+        // two listings.
+        assert_eq!(view.read("MODULE.bazel"), bytes("module()\n"));
+        assert_eq!(view.read("WORKSPACE"), FileText::Absent);
+        let top = view.list("").expect("a listing");
+        assert_eq!(top, ["MODULE.bazel", "pkg/", "pnpm-lock.yaml"]);
+        assert_eq!(view.list("gone"), Some(Vec::new()));
+
+        // The commit: every file changes, and new ones appear.
+        let ws = tmp.path().join("repo").join("ws");
+        let put = |rel: &[&str], text: &str| {
+            let path = rel.iter().fold(ws.clone(), |at, part| at.join(part));
+            std::fs::create_dir_all(path.parent().expect("a parent")).expect("mkdir");
+            std::fs::write(path, text).expect("write");
+        };
+        put(&["MODULE.bazel"], "module(name = \"after\")\n");
+        put(&["WORKSPACE"], "workspace(name = \"after\")\n");
+        put(&["pnpm-lock.yaml"], "lockfileVersion: 'after'\n");
+        put(&[".bazelignore"], "pkg/.socket\n");
+        put(&["gone", "BUILD"], "");
+        view.freeze();
+        assert!(view.is_frozen());
+
+        // What was read is answered as it was read.
+        assert_eq!(view.read("MODULE.bazel"), bytes("module()\n"));
+        assert_eq!(view.read("WORKSPACE"), FileText::Absent);
+        assert_eq!(view.list(""), Some(top));
+        assert_eq!(view.list("gone"), Some(Vec::new()));
+        // What was not read is not read now: no byte of after the commit
+        // leaves the view, and nothing is taken for missing. That holds
+        // for a file that changed, one that is new, one that was never
+        // there, one above the root, and for every listing.
+        for unread in [
+            "pnpm-lock.yaml",
+            ".bazelignore",
+            "gone/BUILD",
+            "never/there.bzl",
+            "pkg/BUILD",
+            "../.bazelversion",
+        ] {
+            assert_eq!(view.read(unread), FileText::Unreadable, "{unread}");
+        }
+        for unlisted in ["pkg", "pkg/sub", "never", ".."] {
+            assert_eq!(view.list(unlisted), None, "{unlisted}");
+        }
+        // Asking twice changes nothing, and nothing thaws a view.
+        assert_eq!(view.read("pnpm-lock.yaml"), FileText::Unreadable);
+        assert_eq!(view.list("pkg"), None);
+
+        // A model over the frozen view is not a model of the new files:
+        // the lock a hub would name was never read, so nothing is decided
+        // from it. A view made after the commit reads the root as it is.
+        let fresh = DiskView::new(&root);
+        assert_eq!(
+            fresh.read("pnpm-lock.yaml"),
+            bytes("lockfileVersion: 'after'\n")
+        );
+        assert_eq!(fresh.read(".bazelignore"), bytes("pkg/.socket\n"));
+        assert_eq!(fresh.list("pkg"), Some(vec!["BUILD".into(), "sub/".into()]));
+    }
+
+    /// A model read through a view is the root of before the freeze: the
+    /// readers find every file they asked for in the memo, and a second
+    /// read of the same root and project through the frozen view gives
+    /// the same model, whatever the disk holds by then.
+    #[test]
+    fn a_model_read_again_through_a_frozen_view_is_the_model_of_before() {
+        let (tmp, root) = staged(&[
+            ("repo/ws/MODULE.bazel", JS_MODULE),
+            ("repo/ws/.bazelversion", "9.3.2\n"),
+            ("repo/ws/pnpm-lock.yaml", "lockfileVersion: '9.0'\n"),
+        ]);
+        let view = DiskView::new(&root);
+        let before = read_workspace(&root, &view).expect("a workspace");
+        let governed = Governance::Governed(vec![HubId(0)]);
+        assert_eq!(govern::governance(&before, Ecosystem::Npm, ""), governed);
+
+        // The run takes the hub out of `MODULE.bazel`.
+        let module = tmp.path().join("repo").join("ws").join("MODULE.bazel");
+        std::fs::write(module, "module(name = \"after\")\n").expect("write");
+        view.freeze();
+        let again = read_workspace(&root, &view).expect("a workspace");
+        assert_eq!(again, before);
+        let after = read_workspace(&root, &DiskView::new(&root)).expect("a workspace");
+        assert!(after.hubs.is_empty(), "{:?}", after.hubs);
+
+        // A project the view was not read for has launcher files nobody
+        // asked for. A view that reads the disk finds none in `sub` and
+        // takes the root's pin; the frozen one cannot say that there is
+        // none, so the pin is not this project's and its line is open.
+        let sub = RootRef {
+            project_rel: "sub".to_string(),
+            ..root.clone()
+        };
+        let bounds = |ws: &BazelWorkspace| (ws.line.lo, ws.line.hi);
+        let read = read_workspace(&sub, &DiskView::new(&root)).expect("a workspace");
+        assert_eq!(bounds(&read), bounds(&before));
+        let held = read_workspace(&sub, &view).expect("a workspace");
+        assert_eq!(bounds(&held), (None, None), "an unread file is no pin");
     }
 
     #[test]

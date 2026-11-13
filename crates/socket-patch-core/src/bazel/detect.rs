@@ -20,6 +20,14 @@
 //! lock headers and scans BUILD files only where its ruleset is declared,
 //! so a workspace pays for the rulesets it uses.
 //!
+//! The recognizers read every `WORKSPACE`-family file there is, also one
+//! Bazel never evaluates (a `WORKSPACE` left beside `MODULE.bazel` on
+//! Bazel 9): the model says what was found, and governance drops what
+//! Bazel cannot run. A gap in a macro file of such a `WORKSPACE` is the one
+//! finding a file does not place, because a module extension may run the
+//! same `.bzl` file. For those a recognizer is asked a second time,
+//! without the files Bazel never evaluates ([`reread`]).
+//!
 //! Nested roots are read one at a time: every path of a model is relative
 //! to its own root. `govern::governance_over` combines their answers.
 
@@ -27,13 +35,13 @@ use super::govern::{self, Standing, RC_IMPORT_UNREADABLE, WORKSPACE_UNREADABLE};
 use super::ignore::{IgnoreModel, BAZELIGNORE};
 use super::model::{
     BazelWorkspace, BoundaryFiles, CommittedVendorDirs, Completeness, DeclSystem, FileText,
-    FileView, Gap, Hub, Liveness, ModuleLock, ModuleModel, OutOfScope, RootRef, RulesetSignal,
-    Tier, WorkspaceModel,
+    FileView, Gap, Hub, Liveness, ModuleLock, ModuleModel, OutOfScope, RootRef, Ruleset,
+    RulesetSignal, Tier, WorkspaceModel,
 };
 use super::rc;
 use super::rulesets::{self, RecognizeInput};
 use super::version::{self, ApiShape, BazelVersion, Declared, DepSystem, LineEvidence};
-use super::workspace_file::WORKSPACE_FILES;
+use super::workspace_file::{WORKSPACE_DEFINITION_ORDER, WORKSPACE_FILES};
 
 /// What a root holds under the name of a boundary file.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -166,6 +174,88 @@ fn tier(ws: &BazelWorkspace) -> Tier {
     tiers.min_by_key(rank).unwrap_or(Tier::Beta)
 }
 
+/// The second reading (ROUTED R-135). `live` says of each
+/// `WORKSPACE`-family model of `input` whether Bazel may evaluate its file
+/// (`govern::evaluated_models`), and `found` holds what the recognizers
+/// reported over all of them.
+///
+/// A gap of `found` in a macro file that only never-evaluated files load
+/// may be of that dead reading alone, or of a statement Bazel reaches by
+/// another way. The file does not say which, and the recognizer does:
+/// each ruleset with such a gap is run again over the models Bazel may
+/// evaluate, which is the root as Bazel builds it. Returned are the gaps
+/// the second reading no longer reports, the ones governance drops. What
+/// it reports and the first did not is added to `found` and counts:
+/// without the `WORKSPACE` that accounted for a macro file, a recognizer
+/// reads the file by the rule it has for a `.bzl` file no `WORKSPACE`
+/// loads, and a dead file must not hide what that rule reports.
+///
+/// The caller asks only where a recognizer sees every way that is left
+/// to run the file (`govern::runs_macro_files_unseen`).
+///
+/// The order rule's gap is left out: it is of a `WORKSPACE` model by
+/// construction, and governance places it by its file. With every model
+/// live, and with no such gap, nothing is run twice. The hubs and signals
+/// of the second reading are not used: a hub of a dead file is reported
+/// as dead, and the model says what was found.
+fn reread(input: &RecognizeInput<'_>, live: &[bool], found: &mut Vec<(Ruleset, Gap)>) -> Vec<Gap> {
+    let models = || input.workspace_files.iter().zip(live);
+    let macro_files = |wanted: bool| {
+        let models = models().filter(move |(_, live)| **live == wanted);
+        let files = models.flat_map(|(model, _)| model.files.iter().skip(1));
+        files.map(|file| file.path.as_str())
+    };
+    let evaluated: Vec<&str> = macro_files(true).collect();
+    let dead: Vec<&str> = macro_files(false)
+        .filter(|file| !evaluated.contains(file))
+        .collect();
+    let doubted =
+        |gap: &Gap| gap.token != WORKSPACE_DEFINITION_ORDER && dead.contains(&gap.file.as_str());
+    let mut again: Vec<Ruleset> = Vec::new();
+    for (ruleset, gap) in found.iter() {
+        if doubted(gap) && !again.contains(ruleset) {
+            again.push(*ruleset);
+        }
+    }
+    if again.is_empty() {
+        return Vec::new();
+    }
+    let kept: Vec<WorkspaceModel> = models()
+        .filter(|(_, live)| **live)
+        .map(|(model, _)| model.clone())
+        .collect();
+    let input = RecognizeInput {
+        module: input.module,
+        workspace_files: &kept,
+        module_lock: input.module_lock,
+        flags: input.flags,
+        line: input.line,
+        files: input.files,
+    };
+    let mut reported: Vec<(Ruleset, Gap)> = Vec::new();
+    for (ruleset, recognize) in rulesets::ALL {
+        if again.contains(ruleset) {
+            let gaps = recognize(&input).gaps.into_iter();
+            reported.extend(gaps.map(|gap| (*ruleset, gap)));
+        }
+    }
+    // A gap is dropped only when no second reading reports it, whichever
+    // ruleset it was found for.
+    let stands = |gap: &Gap| reported.iter().any(|(_, again)| again == gap);
+    let mut unevaluated: Vec<Gap> = Vec::new();
+    for (_, gap) in found.iter() {
+        if doubted(gap) && !stands(gap) && !unevaluated.contains(gap) {
+            unevaluated.push(gap.clone());
+        }
+    }
+    for entry in reported {
+        if !found.contains(&entry) {
+            found.push(entry);
+        }
+    }
+    unevaluated
+}
+
 /// Reads the workspace at `root` through `files`. `Err` when the view
 /// shows no boundary file there: the root the probe found cannot be read,
 /// and "no model" must never be taken for "no Bazel".
@@ -228,8 +318,8 @@ pub fn detect(root: &RootRef, files: &dyn FileView) -> Result<BazelWorkspace, Ga
     // directory without (6.6.0). The model of such a path says that it
     // was not read, and holds every ecosystem up. Wherever Bazel does not
     // read the path it builds, and the directory means nothing.
+    let worlds = govern::worlds_of(&line, &flags, &system);
     if module_entry == Entry::Directory || workspace_entry == Entry::Directory {
-        let worlds = govern::worlds_of(&line, &flags, &system);
         let since_7 = line.hi.is_none_or(|hi| hi >= BazelVersion::new(7, 0, 0));
         if module_entry == Entry::Directory && (since_7 || govern::reads_module(&worlds)) {
             module = ModuleModel::read(files);
@@ -247,7 +337,7 @@ pub fn detect(root: &RootRef, files: &dyn FileView) -> Result<BazelWorkspace, Ga
 
     let (mut hubs, mut signals, mut ruleset_gaps) = (Vec::new(), Vec::new(), Vec::new());
     let mut out_of_scope = OutOfScope::default();
-    {
+    let unevaluated_gaps = {
         let input = RecognizeInput {
             module: module.as_ref(),
             workspace_files: &workspace_files,
@@ -265,7 +355,14 @@ pub fn detect(root: &RootRef, files: &dyn FileView) -> Result<BazelWorkspace, Ga
             out_of_scope.source_archives += found.out_of_scope.source_archives;
             out_of_scope.report_only_pins += found.out_of_scope.report_only_pins;
         }
-    }
+        let live = govern::evaluated_models(&worlds, &boundary, &workspace_files);
+        let unseen =
+            || govern::runs_macro_files_unseen(&worlds, input.module, &workspace_files, &live);
+        match live.contains(&false) && !unseen() {
+            true => reread(&input, &live, &mut ruleset_gaps),
+            false => Vec::new(),
+        }
+    };
     // A macro file is read for every `WORKSPACE`-family file that loads
     // it, and a recognizer walks each of their models: a statement that
     // two of the files run is found twice, as two equal hubs. One
@@ -313,6 +410,7 @@ pub fn detect(root: &RootRef, files: &dyn FileView) -> Result<BazelWorkspace, Ga
             false => Completeness::Incomplete(gaps),
         },
         ruleset_gaps,
+        unevaluated_gaps,
         vendor_dirs: vendor_dirs(files),
         // Links are the disk's to resolve (`crawlers::bazel_workspace`).
         lock_real_dirs: std::collections::BTreeMap::new(),
