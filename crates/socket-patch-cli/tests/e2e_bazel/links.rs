@@ -255,10 +255,9 @@ async fn bazel_links_and_output_bases_are_not_workspace_members() {
         // and so sets the trap for the next run itself.
         (Some("."), "bazel-", false, ""),
         (None, "bazel-", false, ""),
-        // The same root as `--cwd ..` from the member spells it. A path
-        // that holds `..` is classified by where it resolves to, and a
-        // link resolves to its target: the link has to be judged where
-        // it lies.
+        // The same root as `--cwd ..` from the member spells it. A link
+        // reached through a `..` is still the link: it is judged where it
+        // lies, in the workspace root, and not as the place it leads to.
         (Some("."), "bazel-", false, "app/.."),
         // Probe B4: `--symlink_prefix=dist/` moves the links into a
         // directory, where no name tells them from the user's own.
