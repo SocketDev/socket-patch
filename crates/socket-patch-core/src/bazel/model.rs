@@ -1238,8 +1238,7 @@ impl Digest {
     /// The lowercase hex SHA-256 of `bytes`: what a [`Digest::Sha256`]
     /// holds, and what the vendor ledger records for a file artifact.
     pub fn sha256_hex(bytes: &[u8]) -> String {
-        use sha2::{Digest as _, Sha256};
-        hex::encode(Sha256::digest(bytes))
+        crate::utils::digest::sha256_hex_of(bytes)
     }
 
     /// Whether `bytes` hash to this digest. The comparison is exact: a
