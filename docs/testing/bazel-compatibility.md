@@ -408,8 +408,8 @@ listed test is not an `#[ignore]` test of the suite or such a test is in no
 matrix, when a (Bazel, runner) has no pin, when a (fixture, Bazel) pair is not
 in the era table the script carries, when a rules_jvm_external entry of tier
 `pr` climbs above proof tier 0, when a Go or Rust entry is `pr` without a
-restored repository cache (`"cache": "restored"`, a key the suite's schema
-does not take yet, so such a cell is `nightly` for now), when a fixture whose
+restored repository cache (`"cache": "restored"` on its cell; without the
+key such a cell is `nightly`), when a fixture whose
 packages a tool fetches (pip mode, crate_universe, an unpinned Coursier hub)
 does not say `"fetch": "tool"`, or when the `os` list of a toy test is not a
 list of runners its cells run on, with at least one for each of its Bazel

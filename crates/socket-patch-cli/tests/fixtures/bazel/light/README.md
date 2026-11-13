@@ -205,6 +205,9 @@ fixtures[]
     test            a bazel_guard_, bazel_agent_, bazel_hosted_, bazel_vendor_ or
                     bazel_canary_ test, declared as a plain `fn` in a module of e2e_bazel_build
     cells[]         as above, proof up to 2; each on a Bazel version of the fixture's own cells
+      cache         optional: "restored", the one value. The cell runs on the restored
+                    repository cache. Not for a bazel_canary_ test, a baseline included:
+                    a canary's cell stays cold
 ```
 
 A fixture is listed on a Bazel version only when its canary built it there.
@@ -218,6 +221,14 @@ fixture with a committed lock it is that build under `--lockfile_mode=error`,
 which passes only when the committed file already holds everything the build
 evaluates. `lanes` is read for its shape only: the lane's own module runs
 those tests, and the CI plan reads their cells.
+
+`cache` is the key the CI plan asks of a Go or Rust cell of tier `pr`
+(`scripts/bazel-matrix.py`), which fetches a language toolchain even at proof
+tier 0. No light ruleset needs one, and the plan restores the repository cache
+for every guard, agent, hosted and vendor cell whether the cell says so or
+not, so here the key only states that. A canary's cell never gets that cache
+(on a warm one it could not tell when a pinned URL stops answering), so the
+suite refuses the key there.
 
 `proof`, `tier` and `fetch` mean what they mean in `heavy/*/MATRIX.json`. The
 three groups still spell the rest differently (heavy names a fixture by its

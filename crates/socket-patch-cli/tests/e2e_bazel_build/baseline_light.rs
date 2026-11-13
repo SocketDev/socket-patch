@@ -69,6 +69,14 @@ const TIERS: &[&str] = &["nightly", "pr"];
 /// The classes a cell's `outcome` may name.
 const OUTCOMES: &[&str] = &["WORKS", "WORKS-AFTER"];
 
+/// What a cell's `cache` may name: the restored repository cache.
+const CACHES: &[&str] = &["restored"];
+
+/// The tests whose CI cell never gets a restored repository cache (the
+/// baselines and every other canary): on a warm cache a canary could not tell
+/// when a pinned URL stops answering.
+const COLD_PREFIX: &str = "bazel_canary_";
+
 /// Who fetches a fixture's packages: Bazel's downloader, or a tool it runs.
 const FETCHERS: &[&str] = &["downloader", "tool"];
 
@@ -257,6 +265,12 @@ pub(crate) struct CellSpec {
     /// probe fixed it (`WORKS`, `WORKS-AFTER`).
     #[serde(default)]
     pub(crate) outcome: Option<String>,
+    /// `restored`, the one value: the cell runs on the restored repository
+    /// cache. The CI plan demands the key of a Go or Rust cell of the `pr`
+    /// tier and gives every guard, agent, hosted and vendor cell that cache
+    /// anyway. Never on a canary's cell, which stays cold ([`COLD_PREFIX`]).
+    #[serde(default)]
+    pub(crate) cache: Option<String>,
 }
 
 /// What the stderr of a fixture's first build must hold: the evidence that a
@@ -976,6 +990,11 @@ fn cell_problems(
                 "Bazel {bazel}: outcome {outcome:?} is not one of {OUTCOMES:?}"
             ));
         }
+        if let Some(cache) = spec.cache.as_deref().filter(|c| !CACHES.contains(c)) {
+            problems.push(format!(
+                "Bazel {bazel}: cache {cache:?} is not one of {CACHES:?}"
+            ));
+        }
         // Any build through a rules_jvm_external hub pulls a JDK, up to 418 MB.
         if ruleset == "rules_jvm_external" && spec.tier == "pr" && spec.proof > 0 {
             problems.push(format!(
@@ -1035,6 +1054,13 @@ fn fixture_problems(matrix: &Matrix, fixture: &Fixture, pinned: &BTreeSet<String
         BASELINE_PROOF,
         ruleset,
     ));
+    // The CI plan restores no repository cache for a canary's cell, so a
+    // `cache` there would state what no run does.
+    let warm = |cells: &[CellSpec]| cells.iter().any(|spec| spec.cache.is_some());
+    let cold = "a canary's cell runs on a cold repository cache and takes no `cache`";
+    if warm(&fixture.cells) {
+        problems.push(cold.to_string());
+    }
     let cell = |bazel: &str| fixture.cells.iter().find(|spec| spec.bazel == bazel);
     for bazel in fixture.module_lock.keys() {
         match cell(bazel) {
@@ -1090,6 +1116,9 @@ fn fixture_problems(matrix: &Matrix, fixture: &Fixture, pinned: &BTreeSet<String
         }
         for why in cell_problems(&lane.cells, system, pinned, TOP_PROOF, ruleset) {
             problems.push(format!("{test}: {why}"));
+        }
+        if test.starts_with(COLD_PREFIX) && warm(&lane.cells) {
+            problems.push(format!("{test}: {cold}"));
         }
         for spec in &lane.cells {
             if cell(&spec.bazel).is_none() {
@@ -1997,6 +2026,10 @@ fn matrix_checks_refuse_what_a_canary_would_not_notice() {
             r#"[{"bazel": "9.3.2", "proof": 1, "tier": "pr"}, {"bazel": "9.3.2", "proof": 0, "tier": "pr"}]"#,
             "Bazel 9.3.2 is listed twice",
         ),
+        (
+            r#"[{"bazel": "9.3.2", "proof": 1, "tier": "nightly", "cache": "restored"}]"#,
+            "rules_x/bzlmod/e9: a canary's cell runs on a cold repository cache",
+        ),
     ] {
         let found = of_cells(cells);
         assert!(found.contains(why), "{cells}: {found}");
@@ -2073,6 +2106,35 @@ fn matrix_checks_refuse_what_a_canary_would_not_notice() {
         r#""lanes": [{"test": "bazel_hosted_rules_x_bzlmod", "cells": [{"bazel": "9.3.2", "proof": 3, "tier": "pr"}]}],"#,
     );
     assert!(above.contains("proof 3 is above 2"), "{above}");
+    // A lane cell may say that it runs on the restored repository cache, in
+    // that one word, unless its test is a canary: a canary's cell stays cold.
+    let lane_on = |test: &str, cache: &str| {
+        of_extra(&format!(
+            r#""lanes": [{{"test": "{test}", "cells": [{{"bazel": "9.3.2", "proof": 2, "tier": "pr", "cache": {cache}}}]}}],"#
+        ))
+    };
+    assert_eq!(lane_on("bazel_hosted_rules_x_bzlmod", r#""restored""#), "");
+    for cache in [r#""restore""#, r#""warm""#, r#""""#] {
+        let found = lane_on("bazel_hosted_rules_x_bzlmod", cache);
+        let why = format!("bazel_hosted_rules_x_bzlmod: Bazel 9.3.2: cache {cache} is not one of");
+        assert!(found.contains(&why), "{cache}: {found}");
+    }
+    let canary = lane_on("bazel_canary_rules_x_drift", r#""restored""#);
+    assert_eq!(
+        canary,
+        "rules_x/bzlmod/e9: bazel_canary_rules_x_drift: a canary's cell runs on a cold \
+         repository cache and takes no `cache`"
+    );
+    // The key is a word, not a switch.
+    let switch = entry(SOUND_CELLS, "").replace(
+        r#""tier": "nightly""#,
+        r#""tier": "nightly", "cache": true"#,
+    );
+    let text = format!(
+        r#"{{"group": "light", "ruleset": "rules_x", "registries": ["gem"],
+            "probe": {SOUND_PROBE}, "fixtures": [{switch}]}}"#
+    );
+    assert!(Matrix::parse(&text).is_err_and(|why| why.contains("expected a string")));
 
     // The path and the test name follow from each other and from the system.
     let misnamed = entry(SOUND_CELLS, "").replace("rules_x_bzlmod_e9", "rules_x_e9");
@@ -2102,6 +2164,7 @@ fn matrix_checks_refuse_what_a_canary_would_not_notice() {
         proof: 1,
         tier: "pr".to_string(),
         outcome: None,
+        cache: None,
     }];
     let found = cell_problems(
         &pr,
@@ -2121,6 +2184,7 @@ fn matrix_checks_refuse_what_a_canary_would_not_notice() {
         proof: 1,
         tier: "nightly".to_string(),
         outcome: None,
+        cache: None,
     }];
     let found = cell_problems(
         &on_770,
