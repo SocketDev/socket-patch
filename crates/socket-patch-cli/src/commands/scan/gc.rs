@@ -13,6 +13,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use crate::args::GlobalArgs;
+use crate::bazel_gate::agent_go;
 use crate::commands::lock_cli::{acquire_with_status, lock_failure};
 use crate::commands::vendor::{run_vendor_gc, VendorGcSummary};
 use crate::json_envelope::{Envelope, GcReport, PatchAction, PatchEvent};
@@ -286,7 +287,9 @@ async fn apply_gc_locked(
     };
     let mut prunable = detect_prunable(&manifest, scanned_purls, vendored);
     keep_project_entries(common, &mut prunable).await;
-    let kept = keep_patched_cargo_copies(common, &manifest, socket_dir, &mut prunable).await;
+    let mut kept = keep_patched_cargo_copies(common, &manifest, socket_dir, &mut prunable).await;
+    // A record a lock that Bazel reads resolves, or may resolve, stays.
+    kept.extend(agent_go::keep_hub_records(common, &manifest, &mut prunable).await);
     for purl in &prunable {
         manifest.patches.remove(purl);
     }
@@ -470,12 +473,15 @@ async fn preview_apply_gc(
     let mut prunable = detect_prunable(&manifest, scanned_purls, vendored);
     keep_project_entries(common, &mut prunable).await;
     let _ = keep_patched_cargo_copies(common, &manifest, socket_dir, &mut prunable).await;
+    // As the wet pass keeps them, and says why where it cannot tell.
+    let kept_for_bazel = agent_go::keep_hub_records(common, &manifest, &mut prunable).await;
     // The sweep derives the referenced set from this in-memory manifest.
     for purl in &prunable {
         manifest.patches.remove(purl);
     }
     let mut gc = run_gc(&manifest, prunable, socket_dir, /*dry_run=*/ true).await;
     gc.absorb_vendor_gc(vendor_gc);
+    gc.warnings.extend(kept_for_bazel);
     gc
 }
 

@@ -3205,6 +3205,7 @@ mod tests {
             purl: purl.to_string(),
             code: code.to_string(),
             error: error.to_string(),
+            details: None,
         }
     }
 

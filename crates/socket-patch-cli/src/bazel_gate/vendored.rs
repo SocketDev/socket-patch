@@ -654,6 +654,7 @@ fn outcome(
         applied_via: HashMap::new(),
         error: None,
         sidecar: None,
+        refusal: None,
     };
     VendorOutcome::Done {
         result,

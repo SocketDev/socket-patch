@@ -1276,6 +1276,7 @@ mod tests {
             applied_via: Default::default(),
             error: None,
             sidecar: None,
+            refusal: None,
         }
     }
 

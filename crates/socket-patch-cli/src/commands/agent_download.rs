@@ -27,7 +27,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::args::GlobalArgs;
-use crate::commands::apply::ApplyRunReport;
+use crate::commands::apply::{ApplyFailure, ApplyRunReport};
 use crate::commands::lock_cli::lock_failure;
 use crate::ecosystem_dispatch::{find_all_packages_for_rollback, partition_purls};
 use crate::json_envelope::{
@@ -1503,11 +1503,10 @@ pub(crate) fn record_apply_outcome(
             .iter()
             .find(|f| apply_key_covers(&f.purl, purl))
         {
-            env.record(
-                PatchEvent::new(EventAction::Failed, purl.as_str())
-                    .with_uuid(uuid.as_str())
-                    .with_error(failure.code.as_str(), failure.error.as_str()),
-            );
+            let event = PatchEvent::new(EventAction::Failed, purl.as_str())
+                .with_uuid(uuid.as_str())
+                .with_error(failure.code.as_str(), failure.error.as_str());
+            env.record(with_failure_details(event, failure));
             failed_any = true;
         } else if let Some(skip) = report.skipped.iter().find(|skip| {
             skip.purl
@@ -1575,7 +1574,7 @@ pub(crate) fn record_apply_outcome(
         if let Some(uuid) = uuid_of(&failure.purl) {
             event = event.with_uuid(uuid);
         }
-        env.record(event);
+        env.record(with_failure_details(event, failure));
         failed_any = true;
     }
     if let Some((code, error)) = &report.run_error {
@@ -1589,6 +1588,16 @@ pub(crate) fn record_apply_outcome(
             PatchEvent::artifact(EventAction::Failed)
                 .with_error("apply_failed", "the nested apply failed"),
         );
+    }
+}
+
+/// The failed event of a nested apply's failure, with the `details` of a
+/// refusal that has some (its token and lift), as the standalone
+/// `apply --json` reports them.
+fn with_failure_details(event: PatchEvent, failure: &ApplyFailure) -> PatchEvent {
+    match &failure.details {
+        Some(details) => event.with_details(details.clone()),
+        None => event,
     }
 }
 

@@ -1567,6 +1567,7 @@ fn refusal(package_key: &str, pkg_path: &Path, code: &str, detail: String) -> Ge
             applied_via: HashMap::new(),
             error: Some(format!("{code}: {detail}")),
             sidecar: None,
+            refusal: None,
         },
         warning: Some((code.to_string(), detail)),
     }
