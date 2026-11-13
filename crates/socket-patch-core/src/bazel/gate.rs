@@ -83,6 +83,7 @@ use super::rulesets::rules_python::USER_OVERRIDE;
 use super::rulesets::rules_rust::REPO_OVERRIDE;
 use super::version::{BazelVersion, DepSystem, TierRefusal, Tri};
 use crate::crawlers::types::Ecosystem;
+use crate::formats::text::strip_bom_bytes;
 use crate::patch::path_safety::is_safe_multi_segment;
 
 /// Every `details.token` this file emits.
@@ -628,7 +629,7 @@ fn rc_hook_blocked(files: &dyn FileView) -> Option<&'static str> {
     let lone_cr = |(at, byte): (usize, &u8)| *byte == b'\r' && bytes.get(at + 1) != Some(&b'\n');
     let body = bytes.strip_suffix(b"\n").unwrap_or(&bytes[..]);
     let body = body.strip_suffix(b"\r").unwrap_or(body);
-    if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
+    if strip_bom_bytes(&bytes).len() != bytes.len() {
         Some("it starts with a byte-order mark, and Bazel drops the first line of such a file")
     } else if bytes.iter().enumerate().any(lone_cr) {
         Some("it ends a line with a lone carriage return")
