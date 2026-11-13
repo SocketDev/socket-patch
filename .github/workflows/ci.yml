@@ -692,6 +692,16 @@ jobs:
       contents: read
     env:
       VEXCTL_VERSION: v0.3.0
+      # No DWARF in the instrumented build. llvm-cov maps coverage from
+      # the __llvm_cov* sections, not debug info, and a panic's location
+      # comes from #[track_caller], so neither the LCOV nor the failure
+      # annotations change. The self-update e2e suites serve this very
+      # binary as a release asset, and the updater refuses one over its
+      # 256 MiB cap (MAX_BINARY_BYTES in update/download.rs). With
+      # line-tables-only the instrumented socket-patch was ~274 MB
+      # locally (~107 MB of it .debug_*), and feat/bazel-support crossed
+      # the cap in CI; without DWARF it is ~163 MB.
+      CARGO_PROFILE_DEV_DEBUG: '0'
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
