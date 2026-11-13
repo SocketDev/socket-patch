@@ -3,7 +3,7 @@
 Evidence captured from real Bazel for the three probes the Bazel-support design adds (its
 section "Probes this design adds"), the `MODULE.bazel.lock` vectors of the campaign's
 lockfile probe group that the same section names, and the on-disk layouts of Bazel-owned
-trees that three other probe groups recorded (the design's section "Output-tree
+trees that four other probe groups recorded (the design's section "Output-tree
 classifier"). Nothing here was written by socket-patch. The files are test inputs for the
 pure Bazel readers of `socket_patch_core::bazel`, and the record of why the design
 hypotheses stand or fall.
@@ -21,18 +21,20 @@ hypotheses stand or fall.
   a user sees. X2 and X4 ran both ways: nothing else differs, and the X4 locks are
   byte-identical (`x2/vectors.json` `environment`). A test that reruns a cell either keeps
   `TEST_TMPDIR` out of Bazel's environment or sets both variables. The lockfile group and
-  the three groups of the output-tree layouts ran earlier on 2026-11-11, before the
+  the four groups of the output-tree layouts ran earlier on 2026-11-11, before the
   launcher exported the variable.
 - The driver scripts, the cell workspaces, every command's log and the full reports are in
   the campaign's probe directories, outside this repository: `design-x/RESULTS.md` for
   X2 - X4, `lockfile/RESULTS.md` (rows L1.g and L6.a, sections L6 and 5) for `lockfile/`,
   and the `RESULTS.md` of `core-external-edits`, `core-output-base` and `platform-server`
-  (each one's section 5, "Test vectors written") for the output-tree layouts.
+  (each one's section 5, "Test vectors written") and of `test-infra-offline` (sections
+  2.6 and 5) for the output-tree layouts.
   `*/vectors.json` repeats each cell's exit codes and first error line.
 - Machine paths are replaced with `<PROBE>`, `<OUTPUT_BASE>` and `<CAMPAIGN>` in every
   text that had one. The byte-real files had none. The layout vectors also carried the
   machine's host and user names in two file names, replaced with `host` and `user`
-  ("Output-tree layouts" below).
+  ("Output-tree layouts" below). The URLs of the repository-cache sample are public
+  registry and release URLs, as Bazel requested them.
 - No file here has the literal name of a Bazel boundary file. A `MODULE.bazel`,
   `MODULE.bazel.lock`, `BUILD.bazel` or `WORKSPACE` of a probe workspace is committed with a
   prefix (`root.MODULE.bazel`, `9.3.2.MODULE.bazel.lock`, `sub-pkg.BUILD.bazel`), and the
@@ -49,7 +51,8 @@ Check the tree in this directory with
 checks what the checksums cannot: that every file is listed, that every file a
 `vectors.json` names is there, that every workspace file a committed lock records (main
 repository and `othermod`) has its bytes committed, that the locks still show each
-verdict below, and that every recorded layout still gives its recorded classification.
+verdict below, that every recorded layout still gives its recorded classification, and
+that the repository-cache sample still holds each shape it was taken for.
 `.gitattributes` marks the
 directory `-text`: the CRLF, BOM and no-final-newline inputs are the point, and a
 line-ending conversion on checkout would break both the digests in the locks and the
@@ -63,7 +66,7 @@ checksum file.
 | X2 | Under Bzlmod a crate_universe hub exposes `BUILD.<name>-<version>.bazel`, so a spoke can be replaced with `override_repo` and nothing else | The hub file does not exist (rules_rust 0.75.0 on 7.7.2, 8.8.2, 9.3.2). `override_repo` itself leaves `cargo-bazel-lock.json` byte-identical and needs no repin. `MODULE.bazel.lock` is byte-identical too, but only because the `crate` extension has no entry in it: with `lockfile` and `cargo_lockfile` both set, as here, rules_rust reports the extension reproducible. For an extension that has an entry `override_repo` changes its `usagesDigest`, and `--lockfile_mode=error` fails until the lock is refreshed (campaign probe S10 and the starlark-include lock-touch table, toy extensions; not run here on a recorded hub). A substitute built from a copy of the spoke's BUILD file works for a crate with no crate dependency, fails for one that has any (unless the root module imports each dependency spoke), and breaks `bazel query 'deps(...)'`. A stale override after a version bump is a hard error |
 | X3 | The output base holds the result of a reproducible extension, and gazelle's lock facts name the selected Go module version | Bazel 8.8.2 and 9.3.2 keep `<output_base>/MODULE.bazel.lock` in the workspace lock's format; its `go_deps` entry names version, sum and replacement of the selected module. 7.7.2 has no such file and nothing else that names the version. gazelle's facts are not a selection proof: they list the Socket module at its pin while Bazel builds an unpatched higher version, and after the replace is removed. The recorded root `go.mod` / `go.sum` digests are not a sufficient freshness test for that entry: `hosted` and `skew` record the same two digests and select different versions (below) |
 | L1.g, L6.a (lockfile group) | A static reader that compares each recorded main-repository input with the SHA-256 of the file predicts Bazel's `error`-mode verdict | 34 of 34 vectors on 17 releases from 6.5.0 to 10.0.0rc3, fresh and stale. A CRLF copy of an input stales the entry (6.6.0, 7.0.2, 7.1.2, 7.7.2, 8.8.2, 9.3.2, 10.0.0rc3). A CRLF-encoded `MODULE.bazel.lock` is accepted in `error` mode and left CRLF by `update` on 7.7.2 and 9.3.2; the cells of the other five stopped early and recorded the acceptance only |
-| Output-tree layouts (`core-external-edits`, `core-output-base`, `platform-server` groups) | A tree Bazel owns is known by a marker Bazel writes and never by a name; a convenience link names its output base when its target is cut at the segment `execroot`; the path of a repository-cache entry and the name of its `id-` file follow from the checksum and the canonical id | The groups' prototypes agree with the real trees: 42 of 42 query paths over 10 layouts (5.4.1 to 10.0.0rc3), 24 of 24 links, 35 of 35 cache entries (6.6.0, 7.7.2, 9.3.2). These are recordings for the classifier's tests, not a run of socket-patch |
+| Output-tree layouts (`core-external-edits`, `core-output-base`, `platform-server`, `test-infra-offline` groups) | A tree Bazel owns is known by a marker Bazel writes and never by a name; a convenience link names its output base when its target is cut at the segment `execroot`; the path of a repository-cache entry and the name of its `id-` file follow from the checksum and the canonical id; an entry need not have an `id-` file | The groups' prototypes agree with the real trees: 42 of 42 query paths over 10 layouts (5.4.1 to 10.0.0rc3), 24 of 24 links, 35 of 35 cache entries (6.6.0, 7.7.2, 9.3.2). Of the 842 cached downloads of five more runs (6.6.0, 7.7.2, 8.8.2, 9.3.2) 797 have no `id-` file and one is under `sha384`; where a file is there it is the hash of the URL, 45 of 45. These are recordings for the classifier's tests, not a run of socket-patch |
 
 ## X4: `x4/`
 
@@ -159,20 +162,21 @@ This directory alone has a byte-real lock for each of the nine lock versions the
 run here write (3, 6, 11, 13, 16, 18, 24, 26, 28). Versions 6, 11, 16, 18 and 24 are
 nowhere else in this tree; 6 and 18 are what Bazel 7.1.2 and 8.4.2 write.
 
-## Output-tree layouts: `core-external-edits/`, `core-output-base/`, `platform-server/`
+## Output-tree layouts: `core-external-edits/`, `core-output-base/`, `platform-server/`, `test-infra-offline/`
 
 What real Bazel left on disk in the kinds of tree the output-tree classifier
 (`socket_patch_core::bazel::output_tree`) has to recognise: an output base, an entry of the
 repo contents cache, a vendor directory, the convenience links, and the repository cache.
-Three other probe groups of the campaign recorded them on 2026-11-11 on the same machine,
+Four other probe groups of the campaign recorded them on 2026-11-11 on the same machine,
 each with its own harness, which its report describes (not the `env -i` cells above). The
 classifier's tests fabricate their trees; these files are the shapes Bazel itself made,
 for the tests that need no Bazel.
 
 Each file keeps its path under the campaign's probes directory, so a citation of the
-design names the file here. `import_layouts.py <probes directory>` wrote them. It pins
-the SHA-256 of each probe file and changes three things, all of which named the capture
-machine:
+design names the file here; the one sample (`observed.sample.json`, below) stands beside
+the path of the probe file it was taken from. `import_layouts.py <probes directory>`
+wrote them. It pins the SHA-256 of each probe file. In the twelve files it copies it
+changes three things, all of which named the capture machine:
 
 - the campaign directory is `<CAMPAIGN>` (the two `detect` fields below, and every path
   of `link_route.json`);
@@ -181,7 +185,9 @@ machine:
 - the directory `_bazel_<user>` of an output user root is `_bazel_user` (twelve paths of
   `link_route.json`).
 
-`repo_cache_vectors.json` had none of them and is the probe's file byte for byte.
+`repo_cache_vectors.json` had none of them and is the probe's file byte for byte. The
+rows of `observed.sample.json` had none either and are the probe's rows unchanged; the
+import refuses a row that one of the three rewrites would touch.
 
 | Path | What |
 |---|---|
@@ -190,6 +196,9 @@ machine:
 | its `expect` | four or five query paths (42 in all), each with `kinds`, the `canonical` path with every link followed, and the `output_base`, `cache_entry` and `vendor_dir` the markers name, or null |
 | `core-output-base/proto/vectors/link_route.json` | 24 convenience links in six sets of four (`out`, `bin`, `testlogs`, the workspace's name): the default prefix on 9.3.2 and on 7.7.2; `dist/` as the prefix (7.7.2); after an upgrade from 8.8.2 to 9.3.2, where the links name the 9.3.2 base under `$HOME/Library/Caches/bazel` while the 8.8.2 base of the same name was still on disk under another root; a `startup --output_base` shared by two workspaces (7.7.2); and `--output_base=<workspace>/out` (7.7.2), a base inside the checkout. Each row has the `workspace`, the `link` name under it with its `prefix`, the `readlink` `target`, the `expected_output_base`, and `marker`, the content of `DO_NOT_BUILD_HERE` in that base |
 | `platform-server/vectors/repo_cache_vectors.json` | 35 entries found in the repository caches Bazel 6.6.0, 7.7.2 and 9.3.2 wrote for downloads from a local fake server (the URLs carry made-up tokens). `entry_dir` is the entry under the cache root, `content_addressable/sha256/<64 hex>` (27) or `content_addressable/sha512/<128 hex>` (8, where `checksum` is an SRI `sha512-` string); the payload is the file named `file` in it, and `observed_id_marker` is the empty `id-<hex>` file beside it: the entry's own hash function over `canonical_id`, which in every row is the URL list joined by one space |
+| `test-infra-offline/vectors/repo_cache/observed.sample.json` | a **sample** of the probe's `observed.json` (880 rows, 0.5 MB, not committed; `source` has its path and SHA-256): every URL that five runs fetched through the group's recording server and that was answered, each looked up afterwards in the repository cache of its run. A `run` is `<fixture>-<bazel>`: `skylib` (a `bazel_dep` on bazel_skylib 1.8.2) on 6.6.0, 7.7.2 and 9.3.2, `js` (aspect_rules_js 3.6.0, two npm packages) and `jvm` (rules_jvm_external 7.2 with a `maven_install.json`) on 8.8.2. Unlike the 35 entries above these were not collected from `id-` files |
+| its `rows` | 39 rows of the probe, unchanged and in its order: the first three of each of the 14 shapes (run, host of the URL, `key_type`, whether an `id-` file is there). `cache_file` is the payload under the cache root, `content_addressable/<key_type>/<hex>/file`: the probe hashed the bytes the server sent with each function and looked for the entry, so `key_type` is the kind it was found under and `integrity` the SRI form of that digest; `bytes` is the size; `id_markers_present` lists the `id-` files beside the payload, none or one; `id_marker_if_canonical_id_is_url` is the file a caller that passes the URL as canonical id would leave, and `canonical_id_is_url` says whether that file is the one there. The three rows with `key_type` null have none of these members: the 6.6.0 run left the registry's files in no cache directory |
+| its `source_shapes`, `source_totals` | the row count of each shape in the whole probe file, and the sums: 842 downloads in a cache directory (839 under `sha256`, 2 under `sha512`, 1 under `sha384`), 45 with an `id-` file, 797 without, 38 in no cache directory. The import refuses the probe file unless each of the 842 is where its checksum puts it and each `id-` file is the hash of the URL |
 
 Tokens in a `detect` vector: `<OB>` the output base, `<WS>` the workspace, `<CACHE>` the
 root of the repo contents cache, `<INSTALL>` the directory of install bases. A test picks
@@ -221,12 +230,25 @@ Limits of what was recorded:
 - Every marker names its own workspace, the shared base of `link_route.json` included, and
   every path is ASCII. A marker that names another workspace, and one whose bytes are not
   the canonical path, are not recorded.
-- Every repository-cache entry here has an `id-` file, because the vectors were collected
-  from those files, and sits under `sha256` or `sha512`. The campaign also saw entries
-  with no `id-` file (5.4.1 and 6.6.0 caches unless a rule passes `canonical_id`:
-  `platform-server/RESULTS.md`, "Cache layout that explains it") and one entry under
-  `sha384` (`test-infra-offline/RESULTS.md` 2.6). Neither is recorded here, so a test of
-  the repository-cache rule fabricates those two shapes.
+- Every entry of `repo_cache_vectors.json` has an `id-` file, because those vectors were
+  collected from the files, and sits under `sha256` or `sha512`. The entries with no
+  `id-` file are in `observed.sample.json` (19 of its 36 cached rows): registry files of
+  the four runs on 7.7.2, 8.8.2 and 9.3.2; the three archives of the 6.6.0 run, each of
+  which the 7.7.2 run left in the same entry directory with an `id-` file; and four
+  tools the `js` run on 8.8.2 fetched from GitHub releases (three binaries and an
+  archive). One of those four is the only entry under `sha384`, a `yq` binary. Which
+  rule fetched the four, and with what arguments, is not recorded. No entry is under
+  `sha1` or `blake3`, and none was written by Bazel 5: a test of those shapes fabricates
+  them.
+- The sample records which `id-` files were beside a payload, not the whole entry
+  directory, and nothing of a cache that two releases shared: each run had its own
+  (`--repository_cache` under its state directory).
+- When the sample was taken (2026-11-12) the caches of the three `skylib` runs were
+  still in the probe directory, and its 15 cached rows of those runs were compared with
+  them again: each payload is there with the recorded size, with the recorded `id-`
+  file or, in the 6.6.0 cache, alone in its directory. The caches of the `js` and `jvm`
+  runs had been deleted, so their 21 rows, the `sha384` one among them, rest on the
+  probe's file and its report.
 - macOS arm64 only (`darwin_arm64-fastbuild`). No Windows junction and no Linux layout.
 
 ## Reruns from the committed files
@@ -250,4 +272,8 @@ cannot be reproduced that way: gazelle's facts keep rows from the states that ca
   (`<OB>`, `<WS>`, `<CACHE>`, `<INSTALL>`, `<CAMPAIGN>`) before a path is used, and build
   the tree in memory or in a temporary directory, never here. Its `expect` rows are what
   a prototype answered; the classifier's own classes and precedence are the design's.
+- A repository-cache row names an entry under a cache root the test picks; its URL is a
+  name and is never fetched. Skip the rows of `observed.sample.json` whose `key_type` is
+  null, and do not edit that file by hand: `import_layouts.py` writes it from the probe
+  file, and `check.py` pins the counts.
 - A file added here needs its line in `SHA256SUMS`, and `check.py` must still pass.

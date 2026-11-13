@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Import the output-tree layout vectors of three other probe groups.
+"""Import the output-tree layout vectors of four other probe groups.
 
     python3 import_layouts.py <campaign probes directory>
 
@@ -14,9 +14,18 @@ the strings that name the capture machine replaced (README.md, "Output-tree layo
 Nothing else changes, so each copy is the probe's bytes apart from those strings. A source
 whose SHA-256 is not the one pinned here is refused. Before a file is rewritten, each
 output base it names by 32 hex digits is checked to be the MD5 of its workspace path,
-which the copy can no longer show. The probes directory is not part of this repository.
-After a run, rewrite SHA256SUMS and run check.py.
+which the copy can no longer show.
+
+The thirteenth file is a sample, not a copy: SAMPLED names a probe file that is too large
+to commit (880 downloads, 0.5 MB) and the file its sample is written to. The sample holds
+the first PER_SHAPE rows of each shape, unchanged and in the probe's order, and the row
+count of every shape in the whole file. The probe file is refused unless each of its rows
+follows the repository-cache rule, and the sample is refused if it names the machine.
+
+The probes directory is not part of this repository. After a run, rewrite SHA256SUMS and
+run check.py.
 """
+import base64
 import hashlib
 import json
 import os
@@ -41,6 +50,14 @@ SOURCES = {  # path under the probes directory: SHA-256 of the probe's file
     "platform-server/vectors/repo_cache_vectors.json":
         "a2e4d629a8d94ada660b40b0ae102a984dd09cab67dda6c2ed9042d1251e0f63",
 }
+REPO_CACHE = "test-infra-offline/vectors/repo_cache/"
+SAMPLED = {  # path under the probes directory: (SHA-256 of the probe's file, the sample's path)
+    REPO_CACHE + "observed.json": (
+        "b020bf4a90eabac4b70838088ebeb5d0e85febe20873371504eea3c1e81b9731",
+        REPO_CACHE + "observed.sample.json",
+    ),
+}
+PER_SHAPE = 3
 
 
 def scrub(data, campaign):
@@ -65,11 +82,88 @@ def scrub(data, campaign):
     return data
 
 
+def shape(row):
+    """What tells one kind of download from another: the run, the host, the digest kind of
+    the entry (None when the download is in no cache directory) and whether the entry has
+    an `id-` file."""
+    host = re.fullmatch(r"https://([^/]+)/.*", row["url"]).group(1)
+    return (row["run"], host, row["key_type"], bool(row.get("id_markers_present")))
+
+
+def follows_the_rule(row):
+    """Whether the entry and the `id-` file of a download are where its checksum and its
+    URL put them: `content_addressable/<kind>/<hex>/file`, and beside it either nothing or
+    the one file `id-<the entry's own hash function over the URL>`."""
+    kind, _, b64 = row["integrity"].partition("-")
+    digest = base64.b64decode(b64).hex()
+    entry = f"content_addressable/{kind}/{digest}/"
+    marker = "id-" + hashlib.new(kind, row["url"].encode("utf-8")).hexdigest()
+    return (kind == row["key_type"]
+            and len(digest) == 2 * hashlib.new(kind).digest_size
+            and row["cache_file"] == entry + "file"
+            and row["id_marker_if_canonical_id_is_url"] == entry + marker
+            and row["id_markers_present"] in ([], [marker])
+            and row["canonical_id_is_url"] == bool(row["id_markers_present"]))
+
+
+def sample(data, rel, pinned):
+    """The committed sample of the probe file `data`: its bytes."""
+    rows = json.loads(data)
+    counts, picked = {}, []
+    for row in rows:
+        if row["key_type"] is None:
+            if sorted(row) != ["bytes", "key_type", "run", "url"]:
+                raise SystemExit(f"{rel}: a download in no cache directory names an entry: {row['url']}")
+        elif not follows_the_rule(row):
+            raise SystemExit(f"{rel}: {row['url']} ({row['run']}) does not follow the cache rule")
+        key = shape(row)
+        counts[key] = counts.get(key, 0) + 1
+        if counts[key] <= PER_SHAPE:
+            picked.append(row)
+    cached = [row for row in rows if row["key_type"] is not None]
+    with_id = sum(1 for row in cached if row["id_markers_present"])
+    doc = {
+        "source": {"path": rel, "sha256": pinned, "rows": len(rows)},
+        "selection": f"the first {PER_SHAPE} rows of each shape (run, host of the URL, key_type, "
+                     "whether id_markers_present is empty), unchanged and in the order of the source",
+        "source_totals": {
+            "in_a_cache_directory": len(cached),
+            "with_an_id_file": with_id,
+            "without_an_id_file": len(cached) - with_id,
+            "in_no_cache_directory": len(rows) - len(cached),
+            "by_key_type": {kind: sum(1 for row in cached if row["key_type"] == kind)
+                            for kind in sorted({row["key_type"] for row in cached})},
+        },
+        "source_shapes": [
+            {"run": run, "host": host, "key_type": kind, "id_file": has_id, "rows": n,
+             "sampled": min(n, PER_SHAPE)}
+            for (run, host, kind, has_id), n in counts.items()
+        ],
+        "rows": picked,
+    }
+    return (json.dumps(doc, indent=1) + "\n").encode("utf-8")
+
+
 def main():
     if len(sys.argv) != 2:
         raise SystemExit(__doc__)
     probes = os.path.abspath(sys.argv[1])
     campaign = os.path.dirname(probes)
+    for rel, (pinned, out_rel) in SAMPLED.items():
+        with open(os.path.join(probes, rel), "rb") as f:
+            data = f.read()
+        if hashlib.sha256(data).hexdigest() != pinned:
+            raise SystemExit(f"{rel}: not the file this import was written for")
+        clean = sample(data, rel, pinned)
+        # The rows are public URLs and digests. Nothing is rewritten: a row that the
+        # rewrite would touch is refused, because its `id-` name is a hash of the URL.
+        if scrub(clean, campaign) != clean:
+            raise SystemExit(f"{rel}: a sampled row matches a machine-name pattern")
+        out = os.path.join(HERE, out_rel)
+        os.makedirs(os.path.dirname(out), exist_ok=True)
+        with open(out, "wb") as f:
+            f.write(clean)
+        print(f"wrote {out_rel} (sample of {rel})")
     for rel, pinned in SOURCES.items():
         with open(os.path.join(probes, rel), "rb") as f:
             data = f.read()

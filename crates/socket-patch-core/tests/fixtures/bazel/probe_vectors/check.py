@@ -15,7 +15,9 @@ script checks what a test that reads the vectors relies on:
 - each output-tree layout still gives what was recorded for it: the tree of a detect vector
   alone yields every classification in its `expect`, each convenience link cut at
   `execroot` names its output base, and each repository-cache entry and `id-` file follows
-  from the checksum and the canonical id;
+  from the checksum and the canonical id, in the entries collected from their `id-` files
+  and in the sample of every download of five runs, which has entries with no `id-` file
+  and one under `sha384`;
 - each verdict that a design rule rests on is still what the files show: a byte-real lock
   for each lock version run, a lock written under a non-default digest function, the
   crate extension absent from the X2 lock, and the `hosted` / `skew` pair of X3 with equal
@@ -532,13 +534,10 @@ def check_layouts():
     problems, lengths, bazels = [], {}, {}
     rows = load("platform-server/vectors/repo_cache_vectors.json")
     for row in rows:
-        kind, _, b64 = row["checksum"].rpartition("-")
-        digest = base64.b64decode(b64).hex() if kind else row["checksum"].lower()
-        kind = kind or "sha256"
-        marker = "id-" + hashlib.new(kind, row["canonical_id"].encode("utf-8")).hexdigest()
-        if row["entry_dir"] != f"content_addressable/{kind}/{digest}" or row["observed_id_marker"] != marker:
+        kind, entry, marker, whole = cache_entry(row["checksum"], row["canonical_id"])
+        if row["entry_dir"] != entry or row["observed_id_marker"] != marker:
             problems.append(f"{row['name']}: entry directory or id marker")
-        if len(digest) != 2 * hashlib.new(kind).digest_size or row["canonical_id"] != " ".join(row["urls"]):
+        if not whole or row["canonical_id"] != " ".join(row["urls"]):
             problems.append(f"{row['name']}: digest length or canonical id")
         lengths[kind] = lengths.get(kind, 0) + 1
         bazels[row["bazel"]] = bazels.get(row["bazel"], 0) + 1
@@ -546,6 +545,108 @@ def check_layouts():
         problems.append(f"entries by algorithm {lengths}, by release {bazels}")
     check("layouts: each of the 35 repository-cache entries and id markers follows from its checksum and canonical id",
           problems)
+    check_repo_cache_sample()
+
+
+def cache_entry(checksum, canonical_id):
+    """Where the repository cache keeps a download with this checksum, by the rule of the
+    two probes: the digest kind, the entry directory under the cache root, the name of the
+    `id-` file a caller that passes `canonical_id` leaves in it, and whether the digest is
+    as long as its kind says. The checksum is an SRI string or 64 hex digits (SHA-256)."""
+    kind, _, b64 = checksum.rpartition("-")
+    digest = base64.b64decode(b64).hex() if kind else checksum.lower()
+    kind = kind or "sha256"
+    marker = "id-" + hashlib.new(kind, canonical_id.encode("utf-8")).hexdigest()
+    return (kind, f"content_addressable/{kind}/{digest}", marker,
+            len(digest) == 2 * hashlib.new(kind).digest_size)
+
+
+def check_repo_cache_sample():
+    """The sample of `test-infra-offline`: every download of five runs, by shape.
+
+    Unlike the 35 entries above, these were not collected from `id-` files, so most have
+    none. A run is `<fixture>-<bazel>`; a row with no `key_type` is a download that is in
+    no cache directory.
+    """
+    per_shape = 3
+    doc = load("test-infra-offline/vectors/repo_cache/observed.sample.json")
+    rows, shapes, totals = doc["rows"], doc["source_shapes"], doc["source_totals"]
+
+    problems, seen, cached = [], {}, []
+    for row in rows:
+        where = f"{row['run']} {row['url']}"
+        host = re.fullmatch(r"https://([^/]+)/.*", row["url"]).group(1)
+        key = (row["run"], host, row["key_type"], bool(row.get("id_markers_present")))
+        seen[key] = seen.get(key, 0) + 1
+        if row["key_type"] is None:
+            if sorted(row) != ["bytes", "key_type", "run", "url"]:
+                problems.append(f"{where}: a download in no cache directory names an entry")
+            continue
+        cached.append(row)
+        kind, entry, marker, whole = cache_entry(row["integrity"], row["url"])
+        if not whole or kind != row["key_type"] or row["cache_file"] != entry + "/file":
+            problems.append(f"{where}: the entry is not where the checksum puts it")
+        if row["id_marker_if_canonical_id_is_url"] != f"{entry}/{marker}":
+            problems.append(f"{where}: the id file a canonical id of the URL would leave")
+        if row["id_markers_present"] not in ([], [marker]):
+            problems.append(f"{where}: an id file that is not the hash of the URL")
+        if row["canonical_id_is_url"] != bool(row["id_markers_present"]):
+            problems.append(f"{where}: canonical_id_is_url")
+    check(f"layouts: each of the {len(cached)} sampled repository-cache entries follows from its checksum, "
+          "and its id file, where it has one, from the URL", problems)
+
+    problems = []
+    listed = {(s["run"], s["host"], s["key_type"], s["id_file"]): s for s in shapes}
+    if len(listed) != len(shapes) or list(seen) != list(listed):
+        problems.append("the shapes of the rows, in order of first row, are not source_shapes")
+    for key, s in listed.items():
+        if s["sampled"] != min(s["rows"], per_shape) or seen.get(key) != s["sampled"]:
+            problems.append(f"{key}: {seen.get(key)} rows for a shape of {s['rows']}")
+    in_cache = [s for s in shapes if s["key_type"] is not None]
+    by_kind = {}
+    for s in in_cache:
+        by_kind[s["key_type"]] = by_kind.get(s["key_type"], 0) + s["rows"]
+    counted = {
+        "in_a_cache_directory": sum(s["rows"] for s in in_cache),
+        "with_an_id_file": sum(s["rows"] for s in in_cache if s["id_file"]),
+        "without_an_id_file": sum(s["rows"] for s in in_cache if not s["id_file"]),
+        "in_no_cache_directory": sum(s["rows"] for s in shapes if s["key_type"] is None),
+        "by_key_type": by_kind,
+    }
+    want = {"in_a_cache_directory": 842, "with_an_id_file": 45, "without_an_id_file": 797,
+            "in_no_cache_directory": 38, "by_key_type": {"sha256": 839, "sha384": 1, "sha512": 2}}
+    if not (totals == counted == want) or (len(shapes), len(rows)) != (14, 39):
+        problems.append(f"source_totals {totals}; the {len(shapes)} shapes add up to {counted}; {len(rows)} rows")
+    if doc["source"]["rows"] != sum(s["rows"] for s in shapes) or doc["source"]["rows"] != 880:
+        problems.append("the shapes do not add up to the rows of the source")
+    check("layouts: the sample has up to three downloads of each of the 14 shapes, which add up to the 880 recorded",
+          problems)
+
+    problems = []
+    no_id = [r for r in cached if not r["id_markers_present"]]
+    sha384 = [r for r in cached if r["cache_file"].startswith("content_addressable/sha384/")]
+    if not no_id or len(sha384) != 1 or sha384[0]["id_markers_present"]:
+        problems.append(f"{len(no_id)} entries with no id file, {len(sha384)} under sha384")
+    kinds = sorted({(r["key_type"], bool(r["id_markers_present"])) for r in cached})
+    if kinds != [("sha256", False), ("sha256", True), ("sha384", False), ("sha512", True)]:
+        problems.append(f"digest kinds with and without an id file: {kinds}")
+    # No id file is not a shape of old releases alone: registry files and release
+    # downloads of the runs on 7.7.2 and later have none either.
+    later = [r for r in no_id if not r["run"].endswith("-6.6.0")]
+    if {"bcr.bazel.build", "github.com"} - {r["url"].split("/")[2] for r in later}:
+        problems.append("no entry without an id file from a registry and from a release host on Bazel 7+")
+    # Bazel 6.6.0 leaves none at all, and the same download has one on 7.7.2.
+    with_id = {r["cache_file"] for r in cached if r["id_markers_present"] and r["run"] == "skylib-7.7.2"}
+    old = [r for r in cached if r["run"].endswith("-6.6.0")]
+    if len(old) != 3 or any(r["id_markers_present"] for r in old):
+        problems.append(f"{len(old)} cached downloads of the 6.6.0 run, or one has an id file")
+    for r in old:
+        if r["cache_file"] not in with_id:
+            problems.append(f"{r['url']}: the 7.7.2 run does not have this entry with an id file")
+    if (len(no_id), len(cached)) != (19, 36):
+        problems.append(f"{len(no_id)} of {len(cached)} cached rows have no id file")
+    check("layouts: the sample has entries with no id file, one of them under sha384, and three that "
+          "Bazel 6.6.0 left without the id file Bazel 7.7.2 wrote", problems)
 
 
 def main():
