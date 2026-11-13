@@ -17,7 +17,9 @@ use crate::utils::fs::read_regular_to_string;
 use crate::utils::npm_range::npm_range_admits;
 use crate::utils::purl::{normalize_purl, strip_purl_qualifiers};
 use crate::utils::relpath::normalize_lexically_keeping_escapes;
-use crate::utils::workspace_globs::{bazel_owned, workspaces_include_as, WorkspacesDialect};
+use crate::utils::workspace_globs::{
+    bazel_owned, may_name_boundary_file, workspaces_include_as, BazelRoots, WorkspacesDialect,
+};
 use crate::vendor::lock_inventory::ProjectView;
 
 #[derive(Default, Debug)]
@@ -242,6 +244,8 @@ impl UserPatchIndex {
         if reads == ReadScope::Global {
             bound = Bound::None;
         }
+        // Where Bazel workspaces lie, learned once for the whole walk.
+        let mut bazel = BazelRoots::default();
         let mut seen = BTreeSet::new();
         while let Some((dir, ecosystem)) = pending.pop_front() {
             if !seen.insert(dir.rel.clone()) {
@@ -317,7 +321,8 @@ impl UserPatchIndex {
                 .iter()
                 .filter(|g| !g.starts_with('!') || g.starts_with("!("))
             {
-                for rel in index.workspace_members(view, &dir, pattern, &bound).await {
+                let members = index.workspace_members(view, &dir, pattern, &bound, &mut bazel);
+                for rel in members.await {
                     pending.push_back((at(&rel), "npm"));
                 }
             }
@@ -562,13 +567,18 @@ impl UserPatchIndex {
     // Positive patterns are a conservative union: a patch in an excluded member
     // may still protect the same release elsewhere, never silently lose it.
     // Bazel's own trees, and the links into them, are no members whatever
-    // the pattern (`bazel_owned`). Returns the members' root-relative paths.
+    // the pattern (`bazel_owned`). Only an entry below a Bazel boundary file
+    // is asked about, and `bazel` knows where those are: in a project Bazel
+    // does not build, no directory the walk comes down to costs a call more
+    // than it did before the walk knew of Bazel. Returns the members'
+    // root-relative paths.
     async fn workspace_members(
         &mut self,
         view: &ProjectView<'_>,
         dir: &Dir,
         pattern: &str,
         bound: &Bound,
+        bazel: &mut BazelRoots,
     ) -> Vec<std::path::PathBuf> {
         if Path::new(pattern).is_absolute() {
             self.unknown("npm", &dir.shown, "workspace outside the inspection root");
@@ -627,13 +637,24 @@ impl UserPatchIndex {
         // into one of its trees (`bazel-bin/packages/*`, `out/external/*`)
         // lists no member either (hazard HZ-17): each segment it names is
         // judged on the way down, as the walk judges what it comes down to.
+        // No listing shows the directories it names, so each is asked for
+        // its boundary files, once per walk.
+        let repo = bound.repo();
         let mut named = root.clone();
+        let mut in_workspace = None;
         for name in prefix.components() {
+            let holder = bazel.at(view, &named.view_rel(), repo);
             named = named.file(&name.as_os_str().to_string_lossy());
-            if bazel_owned(view, &named.view_rel(), bound.repo()) {
+            if holder && bazel_owned(view, &named.view_rel(), repo) {
                 return Vec::new();
             }
+            in_workspace = Some(holder);
         }
+        // Whether a boundary file lies above the directory the walk
+        // starts in. The boundary files of that directory itself show in
+        // its listing.
+        let in_workspace =
+            in_workspace.unwrap_or_else(|| bazel.above(view, &root.view_rel(), repo));
         let max_depth = if pattern.contains("**") {
             32
         } else {
@@ -646,21 +667,23 @@ impl UserPatchIndex {
         let mut out = Vec::new();
         let patterns = vec![pattern.to_string()];
         // Depth-first, as `walkdir` walked it: (directory, depth, its
-        // components below `root`).
+        // components below `root`, whether a Bazel boundary file lies in
+        // a directory above it).
         let base_name = prefix.file_name().map(|n| n.to_string_lossy().into_owned());
         if base_name.as_deref().is_some_and(skipped) {
             return Vec::new();
         }
-        let mut stack: Vec<(Dir, usize, Vec<String>)> = vec![(
+        let mut stack: Vec<(Dir, usize, Vec<String>, bool)> = vec![(
             base.clone(),
             0,
             prefix
                 .components()
                 .map(|c| c.as_os_str().to_string_lossy().into_owned())
                 .collect(),
+            in_workspace,
         )];
         let mut count = 0usize;
-        while let Some((entry, depth, components)) = stack.pop() {
+        while let Some((entry, depth, components, in_workspace)) = stack.pop() {
             count += 1;
             if count > 16384 {
                 self.unknown("npm", &root.shown, "workspace inspection limit exceeded");
@@ -677,9 +700,10 @@ impl UserPatchIndex {
             // what the pattern named was judged above, and the walk's own
             // directory never is. A project the user points at is
             // inspected even where it holds a marker, and one inside
-            // Bazel's tree is the scope check's to refuse.
-            let below = depth > 0;
-            if below && !is_link && bazel_owned(view, &rel, bound.repo()) {
+            // Bazel's tree is the scope check's to refuse. And only below
+            // a boundary file: nowhere else can the answer be yes.
+            let may_be_bazels = depth > 0 && in_workspace;
+            if may_be_bazels && !is_link && bazel_owned(view, &rel, repo) {
                 continue;
             }
             if depth == 32 && !is_link {
@@ -703,7 +727,7 @@ impl UserPatchIndex {
                     // Bazel's convenience links lead to mirrors of this
                     // very tree, under any `--symlink_prefix`: nothing
                     // behind one is a member the walk failed to inspect.
-                    if below && bazel_owned(view, &rel, bound.repo()) {
+                    if may_be_bazels && bazel_owned(view, &rel, repo) {
                         continue;
                     }
                     self.unknown(
@@ -724,6 +748,12 @@ impl UserPatchIndex {
             }
             match view.list_dir_strict(&rel).await {
                 Ok(children) => {
+                    // The listing shows this directory's own boundary
+                    // files, so what is below it costs no call to place.
+                    let in_workspace = in_workspace
+                        || children
+                            .iter()
+                            .any(|child| !child.is_dir && may_name_boundary_file(&child.name));
                     for child in children.into_iter().rev() {
                         let child_dir = entry.file(&child.name);
                         if skipped(&child.name)
@@ -733,7 +763,7 @@ impl UserPatchIndex {
                         }
                         let mut below = components.clone();
                         below.push(child.name.clone());
-                        stack.push((child_dir, depth + 1, below));
+                        stack.push((child_dir, depth + 1, below, in_workspace));
                     }
                 }
                 Err(error) => {
@@ -2057,6 +2087,191 @@ mod tests {
                 let what = format!("{marker} {pattern}");
                 assert_eq!(withheld(&root).await, [(false, true); 2], "{what}");
             }
+        }
+    }
+
+    /// The Bazel root may lie above the project: a package of a Bazel
+    /// workspace, scanned from its own directory. No listing of the walk
+    /// shows that root's boundary file, and a tree below the project is
+    /// Bazel's all the same, under a pattern that names nothing and under
+    /// one that names its way to the tree.
+    #[tokio::test]
+    async fn a_bazel_root_above_the_project_marks_the_trees_below_it() {
+        for pattern in ["**", "*", "libs/*"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let ws = tmp.path().join("ws");
+            let project = ws.join("services").join("web");
+            write(&ws, "MODULE.bazel", "");
+            write(&ws, ".git/HEAD", "ref: refs/heads/main\n");
+            let globs = format!("packages: ['{pattern}', 'app']\n");
+            write(&project, "pnpm-workspace.yaml", &globs);
+            write(&project, "package.json", "{}");
+            write(&project, "app/package.json", "{}");
+            // A vendor directory that holds a copy of a patched package.
+            for vendor in ["third_party", "libs/third_party"] {
+                write(&project, &format!("{vendor}/VENDOR.bazel"), "");
+                write(&project, &format!("{vendor}/package.json"), "{}");
+                let patch = format!("{vendor}/patches/child+2.0.0.patch");
+                write(&project, &patch, "user diff");
+            }
+            assert_eq!(withheld(&project).await, [(false, false); 2], "{pattern}");
+
+            std::fs::remove_file(ws.join("MODULE.bazel")).unwrap();
+            let member = [(false, true); 2];
+            assert_eq!(
+                withheld(&project).await,
+                member,
+                "{pattern}: no boundary file"
+            );
+        }
+    }
+
+    /// R-078: a project with no Bazel boundary file pays nothing for
+    /// HZ-17. A `**` walk reads exactly the paths it read before it knew of
+    /// Bazel, whatever it finds on the way: asking about a marker costs
+    /// four `stat`s per directory, each one in a recording snapshot's read
+    /// set, and was once asked of every directory of every project. Inside
+    /// a Bazel workspace the markers are asked about, as they have to be.
+    #[tokio::test]
+    async fn a_walk_outside_a_bazel_workspace_reads_nothing_for_bazel() {
+        use crate::vendor::lock_inventory::DiskSnapshot;
+
+        const GROUPS: usize = 4;
+        const MEMBERS_EACH: usize = 5;
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().join("ws");
+        write(&ws, "package.json", r#"{"workspaces":["**"]}"#);
+        // A checkout, so that nothing above it is read, whatever lies
+        // above the temporary directory.
+        write(&ws, ".git/HEAD", "ref: refs/heads/main\n");
+        for group in 0..GROUPS {
+            for member in 0..MEMBERS_EACH {
+                let dir = format!("packages/g{group}/m{member}");
+                write(&ws, &format!("{dir}/package.json"), "{}");
+                // A directory that is no member.
+                std::fs::create_dir_all(ws.join(dir).join("src")).unwrap();
+            }
+        }
+        let walk = || async {
+            let snapshot = DiskSnapshot::tracked(&ws);
+            snapshot.begin_recording();
+            let view = ProjectView::Snapshot(&snapshot);
+            let index = UserPatchIndex::npm_family_in(&view, &[]).await;
+            assert!(index.is_empty(), "{index:?}");
+            snapshot
+                .end_recording()
+                .expect("the walk keeps its recording")
+        };
+
+        // What the walk read before the campaign, counted with
+        // `bazel_owned` taken out: each directory it comes down to and the
+        // `package.json` in it; in each directory it inspects (the root
+        // and every member) the patch directory, the yarn lock and the
+        // two pnpm files; and the root's `.git`.
+        let members = GROUPS * MEMBERS_EACH;
+        let visited = 1 + 1 + GROUPS + 2 * members;
+        let inspected = 1 + members;
+        let before_bazel = 2 * visited + 4 * inspected + 1;
+        let plain = walk().await;
+        assert_eq!(plain.len(), before_bazel);
+        assert!(plain.unchanged());
+
+        // A pattern that names its way down starts below the root, which
+        // is then neither walked nor listed, so no listing shows whether
+        // the root holds a boundary file: its four names are asked for,
+        // once for the walk however many patterns start there.
+        let named = r#"{"workspaces":["packages/**","packages/*/*"]}"#;
+        write(&ws, "package.json", named);
+        assert_eq!(walk().await.len(), before_bazel - 1 + 4);
+        write(&ws, "package.json", r#"{"workspaces":["**"]}"#);
+
+        // A marker with no boundary file above it lifts nothing and costs
+        // nothing: the file is one more entry of a listing, which the walk
+        // tests for a link as it tests every entry.
+        write(&ws, "packages/g0/m0/src/VENDOR.bazel", "");
+        write(&ws, "packages/g0/m1/src/DO_NOT_BUILD_HERE", "");
+        let marked = walk().await;
+        assert_eq!(marked.len(), before_bazel + 2);
+
+        // The boundary file makes it a Bazel workspace, and every
+        // directory below it is asked about: the count above is one that
+        // moves when a marker is asked for.
+        write(&ws, "MODULE.bazel", "");
+        let asked = visited - 1;
+        let in_workspace = walk().await;
+        assert!(
+            in_workspace.len() > marked.len() + 3 * asked,
+            "{} paths read in a Bazel workspace",
+            in_workspace.len()
+        );
+    }
+
+    /// The read set of a walk outside a Bazel workspace holds what its
+    /// answer rested on, wherever a boundary file could have made it
+    /// another: in a directory the walk listed, in one a pattern named,
+    /// and above the project inside the checkout. A cached discovery is
+    /// not reused once the project has become a Bazel workspace.
+    #[tokio::test]
+    async fn a_boundary_file_that_appears_invalidates_a_recorded_walk() {
+        use crate::vendor::lock_inventory::DiskSnapshot;
+
+        // (pattern, the project below the checkout, where the file appears)
+        for (pattern, project, boundary) in [
+            ("**", "", "MODULE.bazel"),
+            ("**", "", "packages/WORKSPACE"),
+            ("packages/*", "", "REPO.bazel"),
+            ("packages/group/*", "", "packages/WORKSPACE.bazel"),
+            ("**", "apps/web", "MODULE.bazel"),
+            ("**", "apps/web", "apps/WORKSPACE"),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let repo = tmp.path().join("repo");
+            let root = repo.join(project);
+            write(&repo, ".git/HEAD", "ref: refs/heads/main\n");
+            let manifest = serde_json::json!({"workspaces": [pattern]}).to_string();
+            write(&root, "package.json", &manifest);
+            // Every manifest here is a member's under each pattern that
+            // reaches it, so the walk reads it: a file only tested for is
+            // too new for its stats to vouch for.
+            write(&root, "packages/a/package.json", "{}");
+            write(&root, "packages/group/b/package.json", "{}");
+            let what = format!("{pattern} in {project:?}, {boundary} appears");
+
+            let snapshot = DiskSnapshot::tracked(&root);
+            snapshot.begin_recording();
+            let view = ProjectView::Snapshot(&snapshot);
+            let index = UserPatchIndex::npm_family_in(&view, &[]).await;
+            assert!(index.is_empty(), "{what}: {index:?}");
+            let reads = snapshot
+                .end_recording()
+                .expect("the walk keeps its recording");
+            assert!(reads.unchanged(), "{what}");
+            write(&repo, boundary, "");
+            assert!(!reads.unchanged(), "{what}");
+        }
+    }
+
+    /// The walk learns of a boundary file from the names of a listing, and
+    /// must not read them more narrowly than the disk: where case is
+    /// ignored, `WORKSPACE` is found in a file called `workspace`, by
+    /// `bazel_owned` and by the Bazel client. Whatever this disk does, the
+    /// walk hides exactly what `bazel_owned` proves.
+    #[tokio::test]
+    async fn a_boundary_file_in_a_listing_counts_as_the_disk_finds_it() {
+        for boundary in ["workspace", "Module.Bazel", "tools/repo.BAZEL"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let ws = tmp.path().join("ws");
+            write(&ws, "pnpm-workspace.yaml", "packages: ['**']\n");
+            write(&ws, "package.json", "{}");
+            write(&ws, ".git/HEAD", "ref: refs/heads/main\n");
+            write(&ws, boundary, "");
+            write(&ws, "tools/app/package.json", "{}");
+            write(&ws, "tools/app/patches/child+2.0.0.patch", "user diff");
+            write(&ws, "tools/app/VENDOR.bazel", "");
+            let repo = ws.canonicalize().unwrap();
+            let proven = bazel_owned(&ProjectView::Disk(&ws), "tools/app", Some(&repo));
+            let hidden = [(false, !proven); 2];
+            assert_eq!(withheld(&ws).await, hidden, "{boundary}: {proven}");
         }
     }
 
