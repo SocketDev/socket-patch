@@ -29,22 +29,41 @@
 //!
 //! The trust is the engine's usual one: a file selection asks for and the
 //! host does not send is a file the repository does not have.
+//!
+//! Two things the model alone does not say, and the session adds:
+//!
+//! - Where a hub's lock lies. A label is a spelling, and the file behind
+//!   it may be a link, or lie behind a linked directory, in another
+//!   project. The disk reader resolves that
+//!   (`BazelWorkspace::lock_real_dirs`); a session cannot, so a hub whose
+//!   lock it does not hold as content claims its ecosystem in every
+//!   project under the root ([`Workspaces::claims`]).
+//! - Which locks a project's run rewrites. The engine works per project
+//!   root, and a root's run also pins locks in other directories: a pnpm
+//!   member's own lock, a Rush lock under `common/config/`. So a run is
+//!   judged by every lock it reads ([`Workspaces::claims_of_run`]), and
+//!   what it would write is checked once more before it is accepted
+//!   ([`Workspaces::refused_write`]): no file changes in a directory where
+//!   Bazel builds, or may build, packages of that file's ecosystem.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Bound;
 use std::path::PathBuf;
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use crate::bazel::codes::Code;
 use crate::bazel::model::{
-    BazelLine, BazelWorkspace, FileText, FileView, Gap, Governance, Probe, RootRef, Ruleset,
+    BazelLine, BazelWorkspace, FileText, FileView, Gap, Governance, LockRole, Probe, RootRef,
+    Ruleset,
 };
 use crate::bazel::owned_index::OWNED_DIR;
 use crate::bazel::{detect, govern, rc};
 use crate::crawlers::bazel_root::BOUNDARY_FILES;
 use crate::crawlers::Ecosystem;
+use crate::formats::registry;
 use crate::vendor::lock_inventory::MemoryEntry;
 
-use super::roots::{at_or_above, join_root, split_path};
+use super::roots::{at_or_above, join_root, marker_ecosystem, split_path};
 use super::types::EngineWarning;
 use super::SharedFile;
 
@@ -62,6 +81,19 @@ pub(super) const ROOT_FILES: [&str; 6] = [
     ".bazelrc",
 ];
 
+/// Whether Bazel reads the file at `path` as bytes, so that the session
+/// keeps it whatever its encoding: a [`ROOT_FILES`] name in any directory,
+/// and anything under an owned directory. Bytes that are not UTF-8 are
+/// legal in a comment and in a string literal of a workspace file (design
+/// 2.2), and a file dropped for one would leave every ecosystem of the
+/// workspace undecided.
+pub(super) fn read_as_bytes(path: &str) -> bool {
+    let owned = format!("{OWNED_DIR}/");
+    ROOT_FILES.contains(&split_path(path).1)
+        || path.starts_with(&owned)
+        || path.contains(&format!("/{owned}"))
+}
+
 /// Whether `dir` holds a Bazel boundary file among `listed` paths.
 fn is_root(dir: &str, listed: impl Fn(&str) -> bool) -> bool {
     BOUNDARY_FILES
@@ -70,16 +102,18 @@ fn is_root(dir: &str, listed: impl Fn(&str) -> bool) -> bool {
 }
 
 /// The paths selection streams for Bazel: for each Bazel root at or above
-/// one of `roots`, its [`ROOT_FILES`] and everything under its
-/// `.socket/bazel/`, as far as `blobs` lists them. The owned directory is
-/// what a later in-memory gate reads its index and wiring from (revision
-/// 4, seam contract item 8); streaming it now means that change edits no
+/// one of `dirs`, its [`ROOT_FILES`] and everything under its
+/// `.socket/bazel/`, as far as `blobs` lists them. `dirs` are the project
+/// roots and the directories of the locks a root's run reads elsewhere
+/// ([`Workspaces::claims_of_run`]). The owned directory is what a later
+/// in-memory gate reads its index and wiring from (revision 4, seam
+/// contract item 8); streaming it now means that change edits no
 /// selection.
 ///
-/// A Bazel root with no project root below it is not looked for: nothing
+/// A Bazel root with none of them below it is not looked for: nothing
 /// there is scanned, so there is nothing to leave alone.
-pub(super) fn selected<'a>(roots: &[String], blobs: &'a BTreeMap<String, bool>) -> Vec<&'a str> {
-    let dirs: BTreeSet<&str> = roots.iter().flat_map(|root| at_or_above(root)).collect();
+pub(super) fn selected<'a>(dirs: &[String], blobs: &'a BTreeMap<String, bool>) -> Vec<&'a str> {
+    let dirs: BTreeSet<&str> = dirs.iter().flat_map(|dir| at_or_above(dir)).collect();
     let mut out: Vec<&'a str> = Vec::new();
     for dir in dirs {
         if !is_root(dir, |path| blobs.contains_key(path)) {
@@ -168,6 +202,9 @@ pub(super) struct Workspaces<'a> {
     files: &'a BTreeMap<String, SharedFile>,
     /// Every directory that holds a boundary file.
     roots: BTreeSet<&'a str>,
+    /// What [`Workspaces::claims`] answered for each directory it was
+    /// asked about: a run asks again for the files it would write.
+    asked: Mutex<BTreeMap<String, Option<Claims>>>,
 }
 
 impl<'a> Workspaces<'a> {
@@ -179,7 +216,14 @@ impl<'a> Workspaces<'a> {
         Self {
             files,
             roots: paths.map(|path| split_path(path).0).collect(),
+            asked: Mutex::new(BTreeMap::new()),
         }
+    }
+
+    /// No Bazel root among the session's files: nothing is claimed
+    /// anywhere, and every question below is answered without a read.
+    pub(super) fn is_empty(&self) -> bool {
+        self.roots.is_empty()
     }
 
     fn view(&self, base: &'a str) -> RootView<'a> {
@@ -208,7 +252,65 @@ impl<'a> Workspaces<'a> {
     /// What Bazel claims of the project at `root`: `None` under no Bazel
     /// root, which is every project of a repository that does not build
     /// with Bazel.
+    ///
+    /// A hub is placed by the directory of its lock, as its label spells
+    /// it (`govern::claims`). That is the lock's place only where the
+    /// session holds the file there as content: a regular file of the
+    /// listing, which no link leads to. A lock that is a symbolic link,
+    /// one that was not handed over, and one the session does not hold at
+    /// all (it lies behind a linked directory, or its directory is no
+    /// project root, or it does not exist) may be the lock of any project,
+    /// so such a hub claims its ecosystem in every project under its
+    /// root. Unreadable is not absent.
     pub(super) fn claims(&self, root: &str) -> Option<Claims> {
+        if self.roots.is_empty() {
+            return None;
+        }
+        let known = self.asked().get(root).cloned();
+        if let Some(known) = known {
+            return known;
+        }
+        // Read outside the lock: a second caller would only read again.
+        let claims = self.read_claims(root);
+        self.asked().insert(root.to_string(), claims.clone());
+        claims
+    }
+
+    fn asked(&self) -> MutexGuard<'_, BTreeMap<String, Option<Claims>>> {
+        self.asked.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Whether the session holds the content of `path`: a regular file of
+    /// the listing that the host handed over.
+    fn holds(&self, path: &str) -> bool {
+        let entry = self.files.get(path).map(|file| &file.entry);
+        matches!(entry, Some(MemoryEntry::Text(_) | MemoryEntry::Binary(_)))
+    }
+
+    /// The ecosystems of the hubs of `ws` (the model of the root at `base`)
+    /// whose lock the session cannot place: a package lock under a name
+    /// that makes a native project root, which the session does not hold
+    /// as content where the label spells it. A lock under any other name
+    /// places its hub at the workspace root wherever it lies
+    /// (`govern::claims`), so no link changes whose it is.
+    fn unplaced(&self, base: &str, ws: &BazelWorkspace) -> Vec<Ecosystem> {
+        let mut ecosystems = Vec::new();
+        for hub in &ws.hubs {
+            let placing = |path: &&str| registry::root_marker(split_path(path).1).is_some();
+            let locks = hub.locks.iter();
+            let locks = locks.filter(|lock| lock.role == LockRole::PackageLock);
+            let mut paths = locks
+                .filter_map(|lock| lock.path.as_deref())
+                .filter(placing);
+            let lost = paths.any(|path| !self.holds(&join_root(base, path)));
+            if lost && !ecosystems.contains(&hub.ecosystem) {
+                ecosystems.push(hub.ecosystem);
+            }
+        }
+        ecosystems
+    }
+
+    fn read_claims(&self, root: &str) -> Option<Claims> {
         // Nearest the project first, as the root probe reports them.
         let above: Vec<&str> = at_or_above(root)
             .filter(|dir| self.roots.contains(dir))
@@ -231,10 +333,15 @@ impl<'a> Workspaces<'a> {
             [only] => Probe::Workspace(only.clone()),
             _ => Probe::Nested(refs),
         };
+        let read = above.iter().zip(&models);
+        let read = read.filter_map(|(base, model)| Some((base, model.as_ref().ok()?)));
+        let unplaced: Vec<Ecosystem> = read
+            .flat_map(|(base, ws)| self.unplaced(base, ws))
+            .collect();
         let mut ecosystems: Vec<Ecosystem> = Vec::new();
         for ecosystem in Ruleset::ALL.iter().filter_map(|r| r.ecosystem()) {
-            let claimed =
-                govern::governance_over(&probe, &models, ecosystem) != Governance::NotGoverned;
+            let claimed = unplaced.contains(&ecosystem)
+                || govern::governance_over(&probe, &models, ecosystem) != Governance::NotGoverned;
             if claimed && !ecosystems.contains(&ecosystem) {
                 ecosystems.push(ecosystem);
             }
@@ -247,7 +354,90 @@ impl<'a> Workspaces<'a> {
             ecosystems,
         })
     }
+
+    /// What Bazel claims of the run of the project at `root`: its own
+    /// [`claims`](Self::claims), and Bazel's claim on npm in each of
+    /// `npm_lock_dirs`, the directories of the pnpm locks the run reads
+    /// and rewrites besides the root's own (a workspace member's lock, a
+    /// Rush lock). A hub that names one of those locks governs the run
+    /// that pins it, whichever directory the engine starts that run in.
+    ///
+    /// Only those directories: the files of a nested project root are in
+    /// the outer root's view too, and a hub on the nested project's lock
+    /// says nothing of the outer one.
+    pub(super) fn claims_of_run(&self, root: &str, npm_lock_dirs: &[String]) -> Option<Claims> {
+        let mut claims = self.claims(root);
+        for dir in npm_lock_dirs {
+            let Some(found) = self.claims(dir).filter(|found| found.holds(NPM)) else {
+                continue;
+            };
+            match &mut claims {
+                Some(claims) if claims.holds(NPM) => {}
+                Some(claims) => claims.ecosystems.push(Ecosystem::Npm),
+                None => {
+                    claims = Some(Claims {
+                        marker: found.marker,
+                        ecosystems: vec![Ecosystem::Npm],
+                    })
+                }
+            }
+        }
+        claims
+    }
+
+    /// Why a rewrite that changes `paths` (repository-relative) is not
+    /// accepted: one of them lies in a directory where Bazel builds, or
+    /// may build, packages of the file's ecosystem. `None` for a rewrite
+    /// that touches no such directory, which is every rewrite in a
+    /// repository with no Bazel root.
+    ///
+    /// The last check before a project's changes are taken
+    /// ([`claims_of_run`](Self::claims_of_run) withholds the packages
+    /// before they are looked up, by the locks a run is known to read). A
+    /// run that reaches a claimed directory some other way (a workspace
+    /// member's manifest, a layout added later) is stopped here, whole:
+    /// Bazel would build from a file the engine changed over rules it
+    /// never read.
+    ///
+    /// A file is of the ecosystem its name makes a project root of
+    /// (`pnpm-lock.yaml`, `Cargo.lock`). Any other file (a manifest, a
+    /// settings file beside a lock) says nothing by its name and counts
+    /// for each of `pinned`, the ecosystems (CLI names) the run pins.
+    pub(super) fn refused_write<'p>(
+        &self,
+        paths: impl IntoIterator<Item = &'p str>,
+        pinned: &BTreeSet<&'static str>,
+    ) -> Option<String> {
+        if self.roots.is_empty() {
+            return None;
+        }
+        for path in paths {
+            let (dir, base) = split_path(path);
+            let Some(claims) = self.claims(dir) else {
+                continue;
+            };
+            let named = marker_ecosystem(base);
+            let mut of_file = named
+                .iter()
+                .chain(pinned.iter().filter(|_| named.is_none()));
+            let Some(ecosystem) = of_file.find(|ecosystem| claims.holds(ecosystem)) else {
+                continue;
+            };
+            return Some(format!(
+                "{path} would be rewritten, and {} makes its directory part of a Bazel workspace \
+                 whose rulesets build, or may build, {ecosystem} packages from lock files Bazel \
+                 reads. The in-memory hosted scan patches nothing Bazel builds, so none of this \
+                 project's changes were written; run `socket-patch scan --mode hosted` from a \
+                 checkout",
+                claims.marker
+            ));
+        }
+        None
+    }
 }
+
+/// The CLI name of the ecosystem every pnpm lock is of.
+const NPM: &str = "npm";
 
 /// The ecosystems of one project that Bazel builds or may build.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -258,6 +448,12 @@ pub(super) struct Claims {
 }
 
 impl Claims {
+    /// Whether the ecosystem of this CLI name is claimed.
+    fn holds(&self, ecosystem: &str) -> bool {
+        let mut claimed = self.ecosystems.iter();
+        claimed.any(|claimed| claimed.cli_name() == ecosystem)
+    }
+
     /// `purls` less the packages of the claimed ecosystems, which the
     /// engine then never asks the API about and never pins. When that
     /// left any out, one warning for the project says which ecosystems
@@ -335,10 +531,194 @@ mod tests {
         assert_eq!(claimed(&[("MODULE.bazel", CC)], ""), Some(vec![]));
         assert_eq!(claimed(&[("MODULE.bazel", JS)], ""), Some(vec!["npm"]));
         // A project below the root is claimed by the root's hub only where
-        // the hub's lock is its own; a hub that names the root's lock
-        // leaves a sibling project alone.
-        let nested = [("MODULE.bazel", JS), ("web/package-lock.json", "{}")];
+        // the hub's lock is its own; a hub that names the root's lock,
+        // which the session holds, leaves a sibling project alone.
+        let nested = [
+            ("MODULE.bazel", JS),
+            ("pnpm-lock.yaml", ""),
+            ("web/package-lock.json", "{}"),
+        ];
+        assert_eq!(claimed(&nested, ""), Some(vec!["npm"]));
         assert_eq!(claimed(&nested, "web"), Some(vec![]));
+    }
+
+    /// A label spells where a hub's lock is, and the lock is there only
+    /// when the session holds a regular file under that path. A link, a
+    /// file that was not handed over and a file the session does not hold
+    /// may each be the lock of another project (the disk reader resolves
+    /// it, `BazelWorkspace::lock_real_dirs`), so the hub claims its
+    /// ecosystem in every project under its root.
+    #[test]
+    fn a_hub_whose_lock_the_session_cannot_place_claims_every_project() {
+        let hub = |label: &str| JS.replace("//:pnpm-lock.yaml", label);
+        let real = ("real/pnpm-lock.yaml", "");
+        let other = ("other/package-lock.json", "{}");
+        let claims_all = |files: &BTreeMap<String, SharedFile>| {
+            let ws = Workspaces::of(files);
+            let npm = |root: &str| ws.claims(root).expect("a Bazel root").holds(NPM);
+            ["", "real", "other", "deep/er"].map(npm)
+        };
+
+        // The lock is a link at the root, and the real file is elsewhere.
+        let root_hub = hub("//:pnpm-lock.yaml");
+        let root_hub = root_hub.as_str();
+        let mut files = session(&[("MODULE.bazel", root_hub), real, other]);
+        files.insert("pnpm-lock.yaml".to_string(), share(InputFile::Symlink));
+        assert_eq!(claims_all(&files), [true; 4]);
+        // A directory on the label's path is a link: the session holds
+        // nothing under the spelled path at all.
+        let linked_dir = hub("//pkg:pnpm-lock.yaml");
+        let files = session(&[
+            ("MODULE.bazel", linked_dir.as_str()),
+            ("real/pkg/pnpm-lock.yaml", ""),
+            other,
+        ]);
+        assert_eq!(claims_all(&files), [true; 4]);
+        // Present without content: oversize, an LFS pointer.
+        let mut files = session(&[("MODULE.bazel", root_hub), other]);
+        let oversize = InputFile::Present(PresentKind::Oversize);
+        files.insert("pnpm-lock.yaml".to_string(), share(oversize));
+        assert_eq!(claims_all(&files), [true; 4]);
+
+        // The controls. The same hub over a lock the session holds claims
+        // the lock's project and no other.
+        let files = session(&[("MODULE.bazel", root_hub), ("pnpm-lock.yaml", ""), other]);
+        assert_eq!(claims_all(&files), [true, false, false, false]);
+        let named = hub("//real:pnpm-lock.yaml");
+        let named = named.as_str();
+        let files = session(&[("MODULE.bazel", named), real, other]);
+        assert_eq!(claims_all(&files), [false, true, false, false]);
+        // Bytes are content too.
+        let mut files = session(&[("MODULE.bazel", named), other]);
+        let bytes = InputFile::Binary(b"lockfileVersion: '9.0'\n".to_vec());
+        files.insert(real.0.to_string(), share(bytes));
+        assert_eq!(claims_all(&files), [false, true, false, false]);
+        // And a hub of another root says nothing here.
+        let apart = session(&[("ws/MODULE.bazel", root_hub), other]);
+        assert!(Workspaces::of(&apart).claims("other").is_none());
+        assert!(Workspaces::of(&apart)
+            .claims("ws/app")
+            .expect("under ws")
+            .holds(NPM));
+    }
+
+    /// A project's run is judged by every lock it pins. The engine starts
+    /// a run in a project root, and a pnpm member's own lock or a Rush
+    /// lock lies in another directory, which is the one a hub names.
+    #[test]
+    fn a_run_is_claimed_by_the_locks_it_reads_in_other_directories() {
+        let hub = |label: &str| JS.replace("//:pnpm-lock.yaml", label);
+        let member = hub("//packages/a:pnpm-lock.yaml");
+        let files = session(&[
+            ("MODULE.bazel", member.as_str()),
+            ("packages/a/pnpm-lock.yaml", ""),
+            ("packages/b/pnpm-lock.yaml", ""),
+            ("Cargo.lock", ""),
+        ]);
+        let ws = Workspaces::of(&files);
+        let dirs = |dirs: &[&str]| -> Vec<String> { dirs.iter().map(|d| d.to_string()).collect() };
+        let npm = |root: &str, lock_dirs: &[&str]| {
+            let claims = ws.claims_of_run(root, &dirs(lock_dirs));
+            claims.expect("a Bazel root").holds(NPM)
+        };
+        // The root alone is not the hub's; the run that reads the member's
+        // lock is, and one that reads another member's is not.
+        assert!(!npm("", &[]));
+        assert!(npm("", &["packages/a"]));
+        assert!(npm("", &["packages/b", "packages/a"]));
+        assert!(!npm("", &["packages/b"]));
+        // Only npm is taken from a lock's directory: the locks read there
+        // are pnpm's.
+        let found = ws.claims_of_run("", &dirs(&["packages/a"])).unwrap();
+        assert_eq!(found.ecosystems, [Ecosystem::Npm]);
+        assert_eq!(found.marker, "MODULE.bazel");
+
+        // A Bazel root between the project and the lock claims the run of
+        // a project that is under no Bazel root itself.
+        let rush = hub("//:pnpm-lock.yaml");
+        let files = session(&[
+            ("common/config/rush/MODULE.bazel", rush.as_str()),
+            ("common/config/rush/pnpm-lock.yaml", ""),
+            ("rush.json", "{}"),
+        ]);
+        let ws = Workspaces::of(&files);
+        assert!(ws.claims("").is_none());
+        let found = ws.claims_of_run("", &dirs(&["common/config/rush"]));
+        let found = found.expect("claimed through the lock");
+        assert_eq!(found.ecosystems, [Ecosystem::Npm]);
+        assert_eq!(found.marker, "common/config/rush/MODULE.bazel");
+        assert!(ws.claims_of_run("", &dirs(&["common/temp"])).is_none());
+        // No Bazel root at all: nothing is asked and nothing claimed.
+        let plain = session(&[("packages/a/pnpm-lock.yaml", "")]);
+        let ws = Workspaces::of(&plain);
+        assert!(ws.is_empty());
+        assert!(ws.claims_of_run("", &dirs(&["packages/a"])).is_none());
+        let no_pins = BTreeSet::new();
+        assert!(ws
+            .refused_write(["packages/a/pnpm-lock.yaml"], &no_pins)
+            .is_none());
+    }
+
+    /// An rc file decides which workspace files Bazel evaluates, and a
+    /// `try-import` of a file inside the root may name a tracked file that
+    /// was not streamed: the session cannot list a directory, so it does
+    /// not take the target for the usual missing per-user file.
+    #[test]
+    fn a_try_import_the_session_cannot_see_is_not_taken_for_absent() {
+        let macros = "load(\"//:deps.bzl\", \"deps\")\ndeps()\n";
+        let claimed_with = |rc: &str| {
+            let files = [
+                ("MODULE.bazel", CC),
+                ("WORKSPACE", macros),
+                (".bazelrc", rc),
+            ];
+            let found = claimed(&files, "web").expect("a Bazel root");
+            found.contains(&"npm")
+        };
+        // The flag alone switches `WORKSPACE` off, and its macros with it.
+        assert!(!claimed_with("common --noenable_workspace\n"));
+        // A file that may switch it back on, imported either way.
+        let ci = "%workspace%/tools/ci.bazelrc";
+        for keyword in ["import", "try-import"] {
+            let rc = format!("common --noenable_workspace\n{keyword} {ci}\n");
+            assert!(claimed_with(&rc), "{keyword}");
+        }
+        // Above the root nothing is listed by design: the per-user file.
+        let rc = "common --noenable_workspace\ntry-import %workspace%/../user.bazelrc\n";
+        assert!(!claimed_with(rc));
+        // A workspace with nothing unread loses nothing by the gap.
+        let files = [
+            ("MODULE.bazel", CC),
+            (".bazelrc", "try-import %workspace%/user.bazelrc\n"),
+        ];
+        assert_eq!(claimed(&files, "web"), Some(vec![]));
+    }
+
+    #[test]
+    fn the_files_bazel_reads_as_bytes_are_known_by_their_names() {
+        for path in [
+            "MODULE.bazel",
+            "a/b/WORKSPACE",
+            "a/WORKSPACE.bazel",
+            "REPO.bazel",
+            "WORKSPACE.bzlmod",
+            "svc/.bazelrc",
+            ".socket/bazel/index.json",
+            "svc/.socket/bazel/patches/u/x.patch",
+        ] {
+            assert!(read_as_bytes(path), "{path}");
+        }
+        for path in [
+            "BUILD.bazel",
+            "deps.bzl",
+            "MODULE.bazel.lock",
+            ".socket/manifest.json",
+            ".socket/bazelish/x",
+            "x.socket/bazel/y",
+            ".bazelversion",
+        ] {
+            assert!(!read_as_bytes(path), "{path}");
+        }
     }
 
     /// Unreadable is not absent: every way the streamed files can fail to
@@ -429,11 +809,23 @@ mod tests {
     #[test]
     fn every_root_above_the_project_is_asked() {
         let lock = ("svc/web/pnpm-lock.yaml", "");
-        let inner_js = [("MODULE.bazel", CC), ("svc/MODULE.bazel", JS), lock];
+        let hub_lock = ("svc/pnpm-lock.yaml", "");
+        let inner_js = [
+            ("MODULE.bazel", CC),
+            ("svc/MODULE.bazel", JS),
+            lock,
+            hub_lock,
+        ];
         // The inner root's hub names `svc/pnpm-lock.yaml`, not this one.
         assert_eq!(claimed(&inner_js, "svc/web"), Some(vec![]));
         assert_eq!(claimed(&inner_js, "svc"), Some(vec!["npm"]));
-        let outer_js = [("MODULE.bazel", JS), ("svc/MODULE.bazel", CC), lock];
+        let hub_lock = ("pnpm-lock.yaml", "");
+        let outer_js = [
+            ("MODULE.bazel", JS),
+            ("svc/MODULE.bazel", CC),
+            lock,
+            hub_lock,
+        ];
         assert_eq!(claimed(&outer_js, ""), Some(vec!["npm"]));
         assert_eq!(claimed(&outer_js, "svc"), Some(vec![]));
         assert_eq!(claimed(&outer_js, "other"), Some(vec![]));

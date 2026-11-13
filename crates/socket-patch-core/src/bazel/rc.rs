@@ -975,16 +975,24 @@ impl RcFiles {
             // Bazel skips a `try-import` target it cannot read, a
             // directory included. A file that is there and that this
             // reader cannot read (its size cap, another user's file) may
-            // be one Bazel reads: unreadable is not absent. Past the read
-            // boundary nothing can be listed, and the file is the usual
-            // optional one.
+            // be one Bazel reads: unreadable is not absent. Nor is a
+            // directory that cannot be listed an empty one
+            // (`FileView::list`): inside the root the file may be there,
+            // tracked and read by every build, as it is for a view that
+            // was handed a few files of the repository and no listing.
+            // Only above the root, where a view past the read boundary
+            // lists nothing by design, is the file the usual optional one.
             FileText::Unreadable => {
                 let (dir, name) = rel.rsplit_once('/').unwrap_or(("", &rel));
-                let listed = view.list(dir).unwrap_or_default();
-                if listed.iter().any(|entry| entry == name) {
-                    self.gap(true, &rel, "exists and cannot be read", cond);
-                } else {
-                    self.gap(false, &rel, "cannot be read", cond);
+                let above_root = rel == ".." || rel.starts_with("../");
+                match view.list(dir) {
+                    Some(listed) if listed.iter().any(|entry| entry == name) => {
+                        self.gap(true, &rel, "exists and cannot be read", cond);
+                    }
+                    None if !above_root => {
+                        self.gap(true, &rel, "may exist and was not read", cond);
+                    }
+                    Some(_) | None => self.gap(false, &rel, "cannot be read", cond),
                 }
             }
         }
@@ -2432,6 +2440,46 @@ mod tests {
         assert!(!flags.gaps()[0].hard);
         let state = flags.state(Flag::LockfileMode, Chain::Build);
         assert!(matches!(state, FlagState::UnknowableSoft(_)), "{state:?}");
+
+        // A view that cannot list the directory does not know that the
+        // target is missing (`FileView::list`: not listed is not empty).
+        // Inside the root it may be a tracked file every build reads: the
+        // in-memory engine is handed a few files and no listing.
+        struct Unlisted(Files);
+        impl FileView for Unlisted {
+            fn read(&self, rel: &str) -> FileText {
+                self.0.read(rel)
+            }
+            fn list(&self, _dir: &str) -> Option<Vec<String>> {
+                None
+            }
+        }
+        for target in ["ci.rc", "tools/ci.rc"] {
+            let rc = format!("try-import %workspace%/{target}\ncommon --vendor_dir=v\n");
+            let files = Files::of(&[(".bazelrc", rc.as_str())]).with(target, FileText::Unreadable);
+            let flags = read(&Unlisted(files)).effective(&line);
+            let gaps = flags.gaps();
+            assert_eq!(
+                (gaps.len(), gaps[0].hard, gaps[0].file.as_str()),
+                (1, true, target)
+            );
+            assert!(
+                gaps[0].detail.starts_with("may exist"),
+                "{}",
+                gaps[0].detail
+            );
+            let state = flags.state(Flag::LockfileMode, Chain::Build);
+            assert!(matches!(state, FlagState::UnknowableHard(_)), "{state:?}");
+        }
+        // Above the root the same view is past what it reads, and the
+        // target is the usual optional per-user file.
+        for target in ["../home.rc", "../../etc/ci.rc"] {
+            let rc = format!("try-import %workspace%/{target}\n");
+            let files = Files::of(&[(".bazelrc", rc.as_str())]).with(target, FileText::Unreadable);
+            let flags = read(&Unlisted(files)).effective(&line);
+            let gaps: Vec<bool> = flags.gaps().iter().map(|gap| gap.hard).collect();
+            assert_eq!(gaps, [false], "{target}");
+        }
 
         // A path that is not UTF-8 names a file Bazel can open and this
         // reader cannot ask for, whatever the kind of import.

@@ -39,7 +39,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::io::ErrorKind;
 use std::path::{Component, Path, PathBuf};
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use super::bazel_output::{vendor_dirs_at, Classifier};
 use super::bazel_root::RootProbe;
@@ -354,35 +354,10 @@ pub fn read_workspace(root: &RootRef, view: &DiskView) -> Result<BazelWorkspace,
 /// are read; an rc file outside it is never opened.
 ///
 /// A relative `dir` is read from the working directory. The calls block.
+/// A caller that asks about several directories keeps a
+/// [`TreeClassifiers`], which reads each root once.
 pub fn tracked_vendor_dirs(dir: &Path) -> Vec<PathBuf> {
-    let probe = RootProbe::new();
-    // Asked without a boundary first: only names are stat'ed, and "no
-    // boundary file up to the top of the disk" needs no checkout to be
-    // found. The roots that count are the ones inside the read boundary.
-    if probe.survey(dir, &ReadBoundary::Unbounded).roots.is_empty() {
-        return Vec::new();
-    }
-    let from = match dir.as_os_str().is_empty() {
-        true => Path::new("."),
-        false => dir,
-    };
-    let boundary = ReadBoundary::upward(ReadScope::Workspace, from);
-    let mut dirs = Vec::new();
-    for root in &probe.survey(dir, &boundary).roots {
-        let view = DiskView::new(root);
-        let flags = rc::read(&view).effective(&BazelLine::unknown());
-        for value in govern::tracked_vendor_dirs(&flags) {
-            let Some(below) = govern::vendor_dir_below(&value) else {
-                continue;
-            };
-            // Component by component: one `join("a/b")` would leave a
-            // `/` inside a component on Windows.
-            let mut path = view.root().to_path_buf();
-            path.extend(below.split('/'));
-            dirs.push(path);
-        }
-    }
-    dirs
+    TreeClassifiers::new().vendor_dirs(dir)
 }
 
 /// The output-tree classifier for work at or below `dir`: the markers
@@ -390,8 +365,105 @@ pub fn tracked_vendor_dirs(dir: &Path) -> Vec<PathBuf> {
 /// ([`tracked_vendor_dirs`]). Every guard that keeps a walk or a write out
 /// of Bazel's trees makes its classifier here, so that all of them know
 /// the same trees.
+///
+/// It knows the Bazel roots at and above `dir` and no other: a directory
+/// under another root (a sibling workspace, a root nested below `dir`) is
+/// judged by a classifier made for it ([`TreeClassifiers::for_dir`]).
 pub fn tree_classifier(dir: &Path) -> Classifier {
     Classifier::with_vendor_dirs(tracked_vendor_dirs(dir))
+}
+
+/// The classifiers of a run that judges several directories: the matches
+/// of a glob, the projects a search found, the Bazel roots a walk meets.
+///
+/// Which trees Bazel owns around a directory depends on the Bazel roots
+/// above that directory, because each root's rc files may name a vendor
+/// directory of its own. Two directories of one run need not share them:
+/// `a/` and `b/` may each be a workspace, and a workspace may lie below
+/// the directory a run was started in. So each directory is asked about
+/// through the classifier of its own roots ([`tree_classifier`] is that
+/// for one directory), and a guard that judged every directory by the
+/// roots of the first would let a run into the vendor directory of
+/// another, which that run's own check then refuses.
+///
+/// What is shared is the work: a boundary-file name is stat'ed once per
+/// directory, a root's rc files are read once, and directories under the
+/// same roots share one classifier and the ancestors it has judged. Under
+/// no Bazel root that is one classifier for everything and no read.
+#[derive(Debug, Default)]
+pub struct TreeClassifiers {
+    probe: RootProbe,
+    /// What each root's rc files name, by root and by how far above it
+    /// the read boundary lies (an import may reach up to there).
+    by_root: Mutex<HashMap<(PathBuf, usize), Vec<PathBuf>>>,
+    /// One classifier per set of tracked vendor directories.
+    made: Mutex<HashMap<Vec<PathBuf>, Arc<Classifier>>>,
+}
+
+impl TreeClassifiers {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// [`tracked_vendor_dirs`] of `dir`.
+    pub fn vendor_dirs(&self, dir: &Path) -> Vec<PathBuf> {
+        // Asked without a boundary first: only names are stat'ed, and "no
+        // boundary file up to the top of the disk" needs no checkout to be
+        // found. The roots that count are the ones inside the read
+        // boundary.
+        let unbounded = self.probe.survey(dir, &ReadBoundary::Unbounded);
+        if unbounded.roots.is_empty() {
+            return Vec::new();
+        }
+        let from = match dir.as_os_str().is_empty() {
+            true => Path::new("."),
+            false => dir,
+        };
+        let boundary = ReadBoundary::upward(ReadScope::Workspace, from);
+        let mut dirs = Vec::new();
+        for root in &self.probe.survey(dir, &boundary).roots {
+            let key = (root.root.clone(), root.boundary_levels);
+            let known = self.by_root().get(&key).cloned();
+            dirs.extend(known.unwrap_or_else(|| {
+                // Read outside the lock: a second caller only reads again.
+                let read = vendor_dirs_of(root);
+                self.by_root().insert(key, read.clone());
+                read
+            }));
+        }
+        dirs
+    }
+
+    fn by_root(&self) -> MutexGuard<'_, HashMap<(PathBuf, usize), Vec<PathBuf>>> {
+        self.by_root.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// [`tree_classifier`] of `dir`, shared with every other directory
+    /// under the same Bazel roots.
+    pub fn for_dir(&self, dir: &Path) -> Arc<Classifier> {
+        let tracked = self.vendor_dirs(dir);
+        let mut made = self.made.lock().unwrap_or_else(PoisonError::into_inner);
+        let fresh = || Arc::new(Classifier::with_vendor_dirs(tracked.clone()));
+        Arc::clone(made.entry(tracked.clone()).or_insert_with(fresh))
+    }
+}
+
+/// The vendor directories the rc files of one Bazel root name, absolute.
+fn vendor_dirs_of(root: &RootRef) -> Vec<PathBuf> {
+    let view = DiskView::new(root);
+    let flags = rc::read(&view).effective(&BazelLine::unknown());
+    let mut dirs = Vec::new();
+    for value in govern::tracked_vendor_dirs(&flags) {
+        let Some(below) = govern::vendor_dir_below(&value) else {
+            continue;
+        };
+        // Component by component: one `join("a/b")` would leave a `/`
+        // inside a component on Windows.
+        let mut path = view.root().to_path_buf();
+        path.extend(below.split('/'));
+        dirs.push(path);
+    }
+    dirs
 }
 
 #[cfg(test)]
@@ -1047,6 +1119,94 @@ mod tests {
         assert_eq!(
             tree_classifier(&plain).classify(&plain).class,
             PathClass::Plain
+        );
+    }
+
+    /// The read boundary holds for the rc files as for every other read:
+    /// a Bazel root above the checkout is not this repository's, and its
+    /// rc file is never opened to learn a vendor directory from. With no
+    /// checkout between, the same root is read.
+    #[test]
+    fn an_rc_file_above_the_checkout_names_no_vendor_dir() {
+        let (tmp, _) = staged(&[
+            ("outer/MODULE.bazel", ""),
+            ("outer/.bazelrc", "common --vendor_dir=repo/third_party\n"),
+            ("outer/repo/app/package.json", "{}"),
+            ("outer/repo/third_party/dep/package.json", "{}"),
+        ]);
+        let top = std::fs::canonicalize(tmp.path()).expect("resolve the tempdir");
+        let repo = top.join("outer").join("repo");
+        let inside = repo.join("third_party").join("dep");
+        let class = |dir: &Path| tree_classifier(dir).classify(dir).class;
+        std::fs::create_dir(repo.join(".git")).expect("a checkout");
+        for from in [&repo, &repo.join("app"), &inside] {
+            assert!(tracked_vendor_dirs(from).is_empty(), "{}", from.display());
+            assert_eq!(class(from), PathClass::Plain, "{}", from.display());
+        }
+        std::fs::remove_dir(repo.join(".git")).expect("no checkout");
+        assert_eq!(tracked_vendor_dirs(&inside), [repo.join("third_party")]);
+        assert_eq!(class(&inside), PathClass::VendorDir);
+        assert_eq!(class(&repo.join("app")), PathClass::Plain);
+    }
+
+    /// A run that judges several directories asks each through the
+    /// classifier of the Bazel roots above it. One classifier for all of
+    /// them, made for the first, does not know the vendor directory of a
+    /// second workspace.
+    #[test]
+    fn each_directory_is_judged_by_the_roots_above_it() {
+        let (tmp, _) = staged(&[
+            ("a/MODULE.bazel", ""),
+            ("a/.bazelrc", "common --vendor_dir=third_party\n"),
+            ("a/app/package.json", "{}"),
+            ("a/lib/package.json", "{}"),
+            ("a/third_party/dep/package.json", "{}"),
+            ("b/WORKSPACE", ""),
+            ("b/.bazelrc", "build:ci --vendor_dir=deps\n"),
+            ("b/app/package.json", "{}"),
+            ("b/deps/dep/package.json", "{}"),
+            ("b/third_party/package.json", "{}"),
+            ("plain/one/package.json", "{}"),
+            ("plain/two/package.json", "{}"),
+        ]);
+        let top = std::fs::canonicalize(tmp.path()).expect("resolve the tempdir");
+        let at = |rel: &str| rel.split('/').fold(top.clone(), |dir, name| dir.join(name));
+        let classifiers = TreeClassifiers::new();
+        let class = |rel: &str| classifiers.for_dir(&at(rel)).classify(&at(rel)).class;
+        for (dir, want) in [
+            ("a/app", PathClass::Plain),
+            ("a/third_party", PathClass::VendorDir),
+            ("a/third_party/dep", PathClass::VendorDir),
+            ("b/app", PathClass::Plain),
+            ("b/deps/dep", PathClass::VendorDir),
+            // `third_party` is the word of `a`'s rc file, not of `b`'s.
+            ("b/third_party", PathClass::Plain),
+            ("plain/one", PathClass::Plain),
+        ] {
+            assert_eq!(class(dir), want, "{dir}");
+            // What a run started in the directory finds for itself.
+            let own = tree_classifier(&at(dir)).classify(&at(dir)).class;
+            assert_eq!(own, want, "{dir}");
+        }
+        // The classifier of `a` knows nothing of `b`.
+        let of_a = tree_classifier(&at("a/app"));
+        assert_eq!(of_a.classify(&at("b/deps/dep")).class, PathClass::Plain);
+        // Directories under the same roots share one classifier, and so
+        // do all the directories under no root.
+        let same = |one: &str, other: &str| {
+            Arc::ptr_eq(
+                &classifiers.for_dir(&at(one)),
+                &classifiers.for_dir(&at(other)),
+            )
+        };
+        assert!(same("a/app", "a/lib"));
+        assert!(same("a/app", "a/third_party/dep"));
+        assert!(same("plain/one", "plain/two"));
+        assert!(!same("a/app", "b/app"));
+        assert!(!same("a/app", "plain/one"));
+        assert_eq!(
+            classifiers.vendor_dirs(&at("b/app")),
+            tracked_vendor_dirs(&at("b/app"))
         );
     }
 }

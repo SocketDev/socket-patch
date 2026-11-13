@@ -161,7 +161,11 @@ pub(crate) fn resolve_options(options: &HostedScanOptions) -> Result<ResolvedOpt
 /// enforcing `maxFiles`, `maxFileBytes` and `maxTotalBytes` on every chunk.
 /// `bun.lockb` is kept as bytes; every other file must be UTF-8 (a file
 /// that is not is kept as present-but-unreadable with an `invalid_utf8`
-/// warning, exactly like an unreadable file on disk).
+/// warning, exactly like an unreadable file on disk). The one exception
+/// is a file Bazel reads as bytes (a workspace file, `.bazelrc`, anything
+/// under `.socket/bazel/`): Bazel takes any byte in a comment or a string
+/// literal, and so does the reader of those files, so one that is not
+/// UTF-8 is kept as its bytes and stays readable.
 #[derive(Debug)]
 pub struct SessionBuilder {
     options: HostedScanOptions,
@@ -265,6 +269,9 @@ impl SessionBuilder {
         } else {
             match String::from_utf8(bytes) {
                 Ok(text) => InputFile::Text(text),
+                Err(bytes) if super::bazel::read_as_bytes(&path) => {
+                    InputFile::Binary(bytes.into_bytes())
+                }
                 Err(_) => {
                     self.warnings.push(EngineWarning::new(
                         "invalid_utf8",
@@ -456,5 +463,50 @@ mod tests {
         assert_eq!(input.files.get(".npmrc"), Some(&InputFile::Symlink));
         assert_eq!(input.warnings.len(), 1);
         assert_eq!(input.warnings[0].code, "invalid_utf8");
+    }
+
+    /// Bazel reads its workspace files, its rc file and what socket-patch
+    /// keeps under `.socket/bazel/` as bytes, and a Latin-1 byte in a
+    /// comment is legal there (design 2.2). Such a file is kept, not
+    /// dropped as unreadable text; in UTF-8 it is text like any other.
+    #[test]
+    fn a_file_bazel_reads_as_bytes_is_kept_whatever_its_encoding() {
+        let latin1: &[u8] = b"# auteur: Ren\xe9\nmodule(name = \"app\")\n";
+        let mut b = SessionBuilder::new(options(HostedScanLimits::default())).unwrap();
+        let kept = [
+            "MODULE.bazel",
+            "svc/WORKSPACE",
+            "svc/WORKSPACE.bzlmod",
+            "tools/REPO.bazel",
+            "WORKSPACE.bazel",
+            ".bazelrc",
+            ".socket/bazel/index.json",
+            "svc/.socket/bazel/patches/u/x.patch",
+        ];
+        // The same bytes under a name Bazel does not read.
+        let dropped = [
+            "BUILD.bazel",
+            "deps.bzl",
+            ".socket/manifest.json",
+            ".socket/bazelish/x",
+        ];
+        for path in kept.iter().chain(&dropped) {
+            b.push_chunk(path, latin1).unwrap();
+            b.end_file(path).unwrap();
+        }
+        b.add_text("web/MODULE.bazel", "module()\n").unwrap();
+        let input = b.finish().unwrap();
+        for path in kept {
+            let file = input.files.get(path);
+            assert_eq!(file, Some(&InputFile::Binary(latin1.to_vec())), "{path}");
+        }
+        for path in dropped {
+            let skipped = InputFile::Present(PresentKind::BinarySkipped);
+            assert_eq!(input.files.get(path), Some(&skipped), "{path}");
+        }
+        let text = InputFile::Text("module()\n".into());
+        assert_eq!(input.files.get("web/MODULE.bazel"), Some(&text));
+        let warned: Vec<&str> = input.warnings.iter().map(|w| w.code.as_str()).collect();
+        assert_eq!(warned, ["invalid_utf8"; 4]);
     }
 }

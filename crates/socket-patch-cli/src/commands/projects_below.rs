@@ -18,6 +18,7 @@
 use std::path::{Path, PathBuf};
 
 use socket_patch_core::constants::DEFAULT_PATCH_MANIFEST_PATH;
+use socket_patch_core::patch::shared_store::in_bazel_tree;
 use socket_patch_core::policy::{
     find_repo_root_with_warnings, repo_relative_checked, DiskPolicyFs, PolicyError,
     PolicyOverrides, PolicyWarning, Root, SelectionPolicy,
@@ -152,8 +153,11 @@ pub(crate) struct DiscoveredDirs {
     pub ignored: usize,
     /// The walk gave up before it had seen the whole tree.
     pub truncated: bool,
-    /// Directories below `--cwd` the walk did not enter because Bazel owns
-    /// them (`DiskRoots::bazel_trees`), relative to `--cwd`.
+    /// Directories below `--cwd` that are not searched or not run in
+    /// because Bazel owns them, relative to `--cwd` and sorted: the trees
+    /// the walk did not enter (`DiskRoots::bazel_trees`), and any project
+    /// directory the walk returned that its own run would refuse as lying
+    /// in one.
     pub bazel_trees: Vec<String>,
 }
 
@@ -162,6 +166,17 @@ pub(crate) struct DiscoveredDirs {
 /// socket.yml path `policy` (read from `repo_root`) leaves out of a
 /// discovered set. `--cwd` itself is the user's choice, so it is explicit
 /// and stays in whenever it is a project at all (a lockless one included).
+///
+/// No directory below `--cwd` is returned that lies in a tree Bazel owns
+/// (design 3, HZ-02 and HZ-03). The walk enters none, and each directory
+/// it found is then asked the question its own run asks before it does
+/// anything (`shared_store::bazel_tree_of`): a run in a tree is refused,
+/// and one refusal fails the whole command, so a directory nobody named
+/// must not reach it. The walk and that check read the same rc files, and
+/// the second look is for what a walk cannot see: a Bazel root below
+/// `--cwd` whose boundary file git ignores still names its vendor
+/// directory to a run started inside it. `--cwd` is the user's to hear
+/// about, and its own run tells them.
 pub(crate) async fn discovered(
     common: &GlobalArgs,
     policy: &SelectionPolicy,
@@ -194,18 +209,29 @@ pub(crate) async fn discovered(
     if found.governs_members || !dir_markers(cwd).is_empty() {
         dirs.push((cwd.clone(), true));
     }
+    let mut below: Vec<PathBuf> = Vec::new();
     for rel in found.roots.iter().filter(|rel| !rel.is_empty()) {
         if admitted(rel) {
-            dirs.push((cwd.join(rel), false));
+            below.push(cwd.join(rel));
         } else {
             ignored += 1;
         }
     }
+    let mut bazel_trees = found.bazel_trees;
+    let in_tree = in_bazel_tree(below.clone()).await;
+    for (dir, in_tree) in below.into_iter().zip(in_tree) {
+        match in_tree {
+            true => bazel_trees.push(shown_project_dir(cwd, &dir)),
+            false => dirs.push((dir, false)),
+        }
+    }
+    bazel_trees.sort();
+    bazel_trees.dedup();
     DiscoveredDirs {
         dirs,
         ignored,
         truncated: found.truncated,
-        bazel_trees: found.bazel_trees,
+        bazel_trees,
     }
 }
 
