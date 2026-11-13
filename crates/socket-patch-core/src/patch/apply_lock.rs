@@ -67,6 +67,18 @@
 //! project (the user cache dir or a configurable path), never under
 //! `.socket/`.
 //!
+//! # A bare lock
+//!
+//! [`acquire_bare`] takes the same file the same way in a directory that
+//! is not a project's `.socket/`: the Bazel root's `.socket/bazel`, where
+//! `utils::bazel_root_writes` edits that root's `.bazelignore` and index.
+//! It is the lock file and nothing else. The lifecycle above holds for it,
+//! the interrupt table included, so a run that is killed while it edits a
+//! Bazel root leaves no `apply.lock` there either. What [`acquire`] and its
+//! guard do to the project around the lock (finish an interrupted vendored
+//! commit, sweep stage entries, sync pending artifacts on release) is left
+//! out, because the directory above a bare lock is not a project.
+//!
 //! # Windows
 //!
 //! `DeleteFile` on an open file succeeds, but the name stays
@@ -225,6 +237,9 @@ pub struct LockGuard {
     handle: Option<Handle>,
     path: PathBuf,
     socket_dir: PathBuf,
+    /// Taken by [`acquire_bare`]: the drop leaves the project-level steps
+    /// out, and the directories it prunes are a bare lock's ([`prunable`]).
+    bare: bool,
     /// This guard's entry in the interrupt-cleanup table, if it got one
     /// (see [`cleanup_held_lock_on_interrupt`]).
     registration: Option<interrupt::Registration>,
@@ -252,11 +267,15 @@ impl Drop for LockGuard {
         // the lock is held — an artifact rebuilt in place that no later
         // commit point's barrier covered (see `utils::durability`). Best
         // effort: a drop cannot fail the command, so a failure is said.
-        if let Err(e) = crate::utils::durability::barrier_blocking() {
-            eprintln!(
-                "Warning: could not sync the vendored artifacts this run wrote ({e}); \
-                 run `socket-patch repair` after an unclean shutdown"
-            );
+        // Not for a bare lock, which has no project around it: the run's
+        // artifacts stay pending for the project lock's own drop.
+        if !self.bare {
+            if let Err(e) = crate::utils::durability::barrier_blocking() {
+                eprintln!(
+                    "Warning: could not sync the vendored artifacts this run wrote ({e}); \
+                     run `socket-patch repair` after an unclean shutdown"
+                );
+            }
         }
         // The guard stays in the interrupt table through R1, so an
         // interrupt anywhere before the unlink below has happened (during
@@ -264,8 +283,12 @@ impl Drop for LockGuard {
         // or during the identity probe) still removes the file: the CLI's
         // handler ends the process, so this drop never gets to finish.
         // Debug-only hook: the interrupt tests park the process here and
-        // signal it.
-        crate::utils::failpoint::hit("apply_lock.releasing");
+        // signal it. A bare lock has a name of its own, so that a run
+        // which takes both still counts each lock's releases apart.
+        crate::utils::failpoint::hit(match self.bare {
+            false => "apply_lock.releasing",
+            true => "apply_lock.releasing_bare",
+        });
         // R1: unlink while still holding the lock — but only the file we
         // hold. The unlink is gated on the path still naming the held
         // inode: after a non-cooperating `rm` + `touch`, the path names a
@@ -299,7 +322,7 @@ impl Drop for LockGuard {
         // R3: prune an otherwise-empty `.socket/`. Non-recursive, so it
         // fails harmlessly when anything else lives there — including a
         // concurrent acquirer's freshly created `apply.lock`.
-        prune_empty_socket_dir(&self.socket_dir);
+        prune_empty_dirs(&self.socket_dir, self.bare);
         // Only now leave the interrupt table: an interrupt between R1 and
         // here still prunes the `.socket/` this run left empty.
         if let Some(registration) = self.registration.take() {
@@ -308,16 +331,34 @@ impl Drop for LockGuard {
     }
 }
 
-/// Best-effort `remove_dir` of `socket_dir`, gated to a directory
-/// literally named `.socket`: `--manifest-path` can point the lock at an
-/// arbitrary user directory, and the lock must never delete one of those
-/// just because it happened to be empty.
-fn prune_empty_socket_dir(socket_dir: &Path) {
-    if socket_dir
-        .file_name()
-        .is_some_and(|name| name == SOCKET_DIR_NAME)
-    {
-        let _ = std::fs::remove_dir(socket_dir);
+/// The directories a release of the lock in `lock_dir` removes when they
+/// are empty, innermost first.
+///
+/// A project lock: `lock_dir` itself, gated to a directory literally named
+/// `.socket`: `--manifest-path` can point the lock at an arbitrary user
+/// directory, and the lock must never delete one of those just because it
+/// happened to be empty.
+///
+/// A bare lock ([`acquire_bare`]): `lock_dir` and the `.socket` right
+/// above it, so that a Bazel root which had no `.socket/` before an edit
+/// has none after it. A `lock_dir` that does not lie directly in a
+/// directory named `.socket` is the caller's, and nothing is removed.
+fn prunable(lock_dir: &Path, bare: bool) -> Vec<&Path> {
+    let named_socket = |dir: &&Path| dir.file_name().is_some_and(|name| name == SOCKET_DIR_NAME);
+    if !bare {
+        return Some(lock_dir).filter(named_socket).into_iter().collect();
+    }
+    match lock_dir.parent().filter(named_socket) {
+        Some(above) => vec![lock_dir, above],
+        None => Vec::new(),
+    }
+}
+
+/// Best-effort `remove_dir` of each directory [`prunable`] names.
+/// Non-recursive, so a directory that holds anything stays.
+fn prune_empty_dirs(lock_dir: &Path, bare: bool) {
+    for dir in prunable(lock_dir, bare) {
+        let _ = std::fs::remove_dir(dir);
     }
 }
 
@@ -330,11 +371,12 @@ fn prune_empty_socket_dir(socket_dir: &Path) {
 ///
 /// For each registered guard: if the lock path still names the inode the
 /// guard holds, unlink it, then remove the `.socket/` directory if it is
-/// now empty. The identity gate is the drop's: a replacement planted by a
-/// non-cooperating `rm` + `touch` belongs to someone else and is left
-/// alone. A guard whose drop already got past its own unlink is only
-/// pruned, never unlinked. Nothing is unregistered, so a second call is a
-/// harmless no-op.
+/// now empty (for a bare lock, its own directory and then the `.socket/`
+/// above it: what the guard's drop prunes). The identity gate is the
+/// drop's: a replacement planted by a non-cooperating `rm` + `touch`
+/// belongs to someone else and is left alone. A guard whose drop already
+/// got past its own unlink is only pruned, never unlinked. Nothing is
+/// unregistered, so a second call is a harmless no-op.
 ///
 /// Unix: async-signal-safe. It reads only memory built at acquire time
 /// and calls only `stat`, `unlink` and `rmdir`. Windows: the console ctrl
@@ -353,9 +395,11 @@ pub fn cleanup_held_lock_on_interrupt() {
 
 /// The interrupt-cleanup table behind [`cleanup_held_lock_on_interrupt`].
 ///
-/// Every command holds one guard at a time, but the in-process unit tests
-/// hold many at once, so the table has a few slots. A guard that finds
-/// them all taken is simply not registered: its drop still cleans up
+/// Every command holds one guard at a time, and a second one while it
+/// edits a Bazel root (the project lock, then a bare one). The in-process
+/// unit tests hold many more at once, one per test the harness runs in
+/// parallel, so the table has room for those. A guard that finds every
+/// slot taken is simply not registered: its drop still cleans up
 /// normally, only an interrupt would leave its file behind.
 #[cfg(unix)]
 mod interrupt {
@@ -365,17 +409,19 @@ mod interrupt {
     use std::ptr;
     use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering::SeqCst};
 
-    use super::{LockGuard, SOCKET_DIR_NAME};
+    use super::{prunable, LockGuard};
 
-    const SLOTS: usize = 8;
+    const SLOTS: usize = 64;
 
     /// Everything the handler needs, built before the slot is published so
     /// the handler never allocates.
     pub(super) struct Held {
         lock: CString,
-        /// `None` unless the directory is literally named `.socket` (the
-        /// same gate as `prune_empty_socket_dir`).
-        socket_dir: Option<CString>,
+        /// The directories to remove when empty, innermost first: what
+        /// the guard's drop prunes (`prunable`). Empty unless the lock's
+        /// directory is literally named `.socket`, or is a bare lock's
+        /// directly inside one.
+        prune: Vec<CString>,
         dev: u64,
         ino: u64,
         /// Set by the guard's drop once it has dealt with the file itself:
@@ -401,18 +447,13 @@ mod interrupt {
 
     pub(super) fn register(guard: &LockGuard) -> Option<Registration> {
         let handle = guard.handle.as_ref()?;
-        let socket_dir = if guard
-            .socket_dir
-            .file_name()
-            .is_some_and(|name| name == SOCKET_DIR_NAME)
-        {
-            Some(c_path(&guard.socket_dir)?)
-        } else {
-            None
-        };
+        let prune = prunable(&guard.socket_dir, guard.bare)
+            .into_iter()
+            .map(c_path)
+            .collect::<Option<Vec<_>>>()?;
         let held = Box::into_raw(Box::new(Held {
             lock: c_path(&guard.path)?,
-            socket_dir,
+            prune,
             dev: handle.dev(),
             ino: handle.ino(),
             released: AtomicBool::new(false),
@@ -477,7 +518,7 @@ mod interrupt {
                 {
                     libc::unlink(held.lock.as_ptr());
                 }
-                if let Some(dir) = &held.socket_dir {
+                for dir in &held.prune {
                     // Non-recursive: fails harmlessly when not empty.
                     libc::rmdir(dir.as_ptr());
                 }
@@ -502,12 +543,14 @@ mod interrupt {
         FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
     };
 
-    use super::{prune_empty_socket_dir, LockGuard};
+    use super::{prune_empty_dirs, LockGuard};
 
     struct Held {
         id: u64,
         lock: PathBuf,
         socket_dir: PathBuf,
+        /// The guard's `bare`: which directories the cleanup prunes.
+        bare: bool,
         /// A duplicate of the guard's handle, kept only for the identity
         /// comparison. The guard's drop clears it once it has dealt with
         /// the file itself, before closing its own handle, so it never
@@ -535,6 +578,7 @@ mod interrupt {
             id,
             lock: guard.path.clone(),
             socket_dir: guard.socket_dir.clone(),
+            bare: guard.bare,
             handle: Some(handle),
         });
         Some(Registration(id))
@@ -595,7 +639,7 @@ mod interrupt {
             if let Some(handle) = &held.handle {
                 unlink_if_held(&held.lock, handle);
             }
-            prune_empty_socket_dir(&held.socket_dir);
+            prune_empty_dirs(&held.socket_dir, held.bare);
         }
     }
 }
@@ -752,7 +796,7 @@ fn named(files: &[String]) -> String {
 /// what that did. A command that must write nothing takes the lock with
 /// [`acquire_dry_run`] instead.
 pub fn acquire(socket_dir: &Path, timeout: Duration) -> Result<LockGuard, LockError> {
-    acquire_as(socket_dir, timeout, false)
+    acquire_as(socket_dir, timeout, Mode::Run)
 }
 
 /// [`acquire`] for a dry run. The lock is taken the same way (and is as
@@ -760,10 +804,44 @@ pub fn acquire(socket_dir: &Path, timeout: Duration) -> Result<LockGuard, LockEr
 /// finished, because that rewrites project files: it fails the acquire
 /// with [`LockError::CommitPending`] and everything is left as it was.
 pub fn acquire_dry_run(socket_dir: &Path, timeout: Duration) -> Result<LockGuard, LockError> {
-    acquire_as(socket_dir, timeout, true)
+    acquire_as(socket_dir, timeout, Mode::DryRun)
 }
 
-fn acquire_as(socket_dir: &Path, timeout: Duration, dry_run: bool) -> Result<LockGuard, LockError> {
+/// Take the lock file `<lock_dir>/apply.lock` and do nothing else.
+///
+/// For a directory of socket-patch's that is not a project's `.socket/`:
+/// the Bazel root's `.socket/bazel` (see "A bare lock" in the module doc).
+/// The file is created, locked, verified and waited for exactly as
+/// [`acquire`] does it and exists only while the guard does. The guard is
+/// in the interrupt table, so [`cleanup_held_lock_on_interrupt`] removes
+/// the file from a run that is interrupted while it holds the lock.
+///
+/// None of what [`acquire`] and its guard do to the project around the
+/// lock happens: no group commit is looked for or finished
+/// ([`LockGuard::commit_recovery`] is `None`), no stage entry is swept,
+/// and the drop syncs no pending artifact.
+///
+/// Every release (the drop, an interrupt, an acquire that fails) removes
+/// `lock_dir` when that leaves it empty, and then an empty `.socket` right
+/// above it. A `lock_dir` that does not lie directly in a directory named
+/// `.socket` is the caller's and is never removed.
+pub fn acquire_bare(lock_dir: &Path, timeout: Duration) -> Result<LockGuard, LockError> {
+    acquire_as(lock_dir, timeout, Mode::Bare)
+}
+
+/// What an acquire does once the lock is held.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    /// [`acquire`]: finish an interrupted group commit, sweep stage entries.
+    Run,
+    /// [`acquire_dry_run`]: refuse a pending group commit, write nothing.
+    DryRun,
+    /// [`acquire_bare`]: nothing.
+    Bare,
+}
+
+fn acquire_as(socket_dir: &Path, timeout: Duration, mode: Mode) -> Result<LockGuard, LockError> {
+    let bare = mode == Mode::Bare;
     let path = socket_dir.join(LOCK_FILE_NAME);
 
     // Use `checked_add` so an astronomically large `timeout` (the flag
@@ -784,15 +862,22 @@ fn acquire_as(socket_dir: &Path, timeout: Duration, dry_run: bool) -> Result<Loc
         // function so the file handle is closed before any sleep below:
         // a waiter parked with the file open would prolong a Windows
         // delete-pending window for everyone.
-        match attempt(&path, socket_dir) {
+        match attempt(&path, socket_dir, bare) {
             Attempt::Acquired(mut guard) => {
                 guard.registration = interrupt::register(&guard);
+                if bare {
+                    // The lock and nothing else. Debug-only hook: the
+                    // interrupt tests park the process here, lock held,
+                    // and signal it.
+                    crate::utils::failpoint::hit("apply_lock.acquired_bare");
+                    return Ok(guard);
+                }
                 // On failure the guard drops here, releasing the lock.
-                guard.recovery = recover_group_commit(socket_dir, dry_run)?;
+                guard.recovery = recover_group_commit(socket_dir, mode == Mode::DryRun)?;
                 // The lock proves no live run owns a staging entry left
                 // here: clear what an interrupted one could not. A dry
                 // run deletes nothing.
-                if !dry_run {
+                if mode == Mode::Run {
                     crate::utils::socket_dir::sweep_stale_stage_entries(
                         socket_dir,
                         crate::utils::socket_dir::STALE_STAGE_AGE,
@@ -833,7 +918,7 @@ fn acquire_as(socket_dir: &Path, timeout: Duration, dry_run: bool) -> Result<Loc
                         ErrorKind::NotFound,
                         "lock file kept vanishing while acquiring it",
                     );
-                    return Err(fail(socket_dir, path, source));
+                    return Err(fail(socket_dir, bare, path, source));
                 }
                 // Let the releaser finish its unlink → close → rmdir
                 // before we mkdir again; spinning straight back in just
@@ -847,11 +932,11 @@ fn acquire_as(socket_dir: &Path, timeout: Duration, dry_run: bool) -> Result<Loc
                 // are both spent; a `None` deadline (an overflowing timeout)
                 // waits indefinitely, exactly as it does for contention.
                 if now >= grace_end && deadline.is_some_and(|d| now >= d) {
-                    return Err(fail(socket_dir, path, source));
+                    return Err(fail(socket_dir, bare, path, source));
                 }
                 std::thread::sleep(DELETE_PENDING_SLEEP);
             }
-            Attempt::Fault { path, source } => return Err(fail(socket_dir, path, source)),
+            Attempt::Fault { path, source } => return Err(fail(socket_dir, bare, path, source)),
         }
     }
 }
@@ -876,7 +961,7 @@ enum Attempt {
     },
 }
 
-fn attempt(path: &Path, socket_dir: &Path) -> Attempt {
+fn attempt(path: &Path, socket_dir: &Path, bare: bool) -> Attempt {
     // 1. The directory, idempotently. Inside every attempt on purpose:
     // a releaser may have pruned it since the last one.
     match std::fs::create_dir_all(socket_dir) {
@@ -898,6 +983,17 @@ fn attempt(path: &Path, socket_dir: &Path) -> Attempt {
             }
         }
         Err(e) if is_delete_pending(&e) => return Attempt::DeletePending(e),
+        // A bare lock's directory has a level above it that a release
+        // prunes: the `.socket` its own release removes when empty, and a
+        // project lock's does too. An acquire that loses that level
+        // between two of `create_dir_all`'s own steps (it makes the
+        // parent, then the directory) gets `NotFound`, or on macOS the
+        // `EINVAL` of the open below. `create_dir_all` makes every level
+        // that is missing, so neither lasts. Nothing prunes the level
+        // above a project lock's directory: there both stay faults.
+        Err(e) if bare && e.kind() == ErrorKind::NotFound => return Attempt::Vanished,
+        #[cfg(unix)]
+        Err(e) if bare && e.raw_os_error() == Some(EINVAL) => return Attempt::Vanished,
         Err(e) => {
             return Attempt::Fault {
                 path: socket_dir.to_path_buf(),
@@ -955,6 +1051,7 @@ fn attempt(path: &Path, socket_dir: &Path) -> Attempt {
             handle: Some(held),
             path: path.to_path_buf(),
             socket_dir: socket_dir.to_path_buf(),
+            bare,
             registration: None,
             recovery: None,
         }),
@@ -1002,8 +1099,8 @@ fn open_failure(e: std::io::Error, path: &Path, socket_dir: &Path) -> Attempt {
 /// residue behind. (`remove_dir` is non-recursive: a lock file we
 /// created but could not lock keeps the directory, on purpose — we must
 /// never unlink a file we do not hold the lock on.)
-fn fail(socket_dir: &Path, path: PathBuf, source: std::io::Error) -> LockError {
-    prune_empty_socket_dir(socket_dir);
+fn fail(socket_dir: &Path, bare: bool, path: PathBuf, source: std::io::Error) -> LockError {
+    prune_empty_dirs(socket_dir, bare);
     LockError::Io { path, source }
 }
 
@@ -1907,5 +2004,182 @@ mod tests {
             "{hostile:?}"
         );
         assert!(commit_pending_message(Path::new("j"), &[]).contains("could not be parsed"));
+    }
+
+    /// The directory of a bare lock as production lays it out: directly
+    /// inside a `.socket/`, here the Bazel root's `.socket/bazel`.
+    fn bare_dir(dir: &tempfile::TempDir) -> PathBuf {
+        socket_dir(dir).join("bazel")
+    }
+
+    /// A bare lock is the same file under the same protocol: one holder at
+    /// a time, there only while it is held, and with nothing left behind,
+    /// the two levels it had to create included.
+    #[test]
+    fn a_bare_lock_excludes_and_leaves_no_residue() {
+        let dir = tempfile::tempdir().unwrap();
+        let (socket, owned) = (socket_dir(&dir), bare_dir(&dir));
+        let lock_path = owned.join("apply.lock");
+
+        let guard = acquire_bare(&owned, Duration::ZERO).unwrap();
+        assert!(lock_path.is_file());
+        assert_eq!(guard.commit_recovery(), None);
+        let second = acquire_bare(&owned, Duration::ZERO);
+        assert!(matches!(second, Err(LockError::Held)), "{second:?}");
+        assert!(
+            lock_path.is_file(),
+            "a refused acquire leaves the holder's file"
+        );
+        drop(guard);
+        assert!(!lock_path.exists(), "drop must unlink the lock file");
+        assert!(!socket.exists(), "and prune both levels it left empty");
+
+        // Each level stays as soon as it holds anything else.
+        std::fs::create_dir_all(&owned).unwrap();
+        std::fs::write(owned.join("index.json"), b"{}").unwrap();
+        drop(acquire_bare(&owned, Duration::ZERO).unwrap());
+        assert!(!lock_path.exists());
+        assert!(owned.join("index.json").is_file());
+        std::fs::remove_file(owned.join("index.json")).unwrap();
+        std::fs::write(socket.join("manifest.json"), b"{}").unwrap();
+        drop(acquire_bare(&owned, Duration::ZERO).unwrap());
+        assert!(!owned.exists());
+        assert!(socket.join("manifest.json").is_file());
+    }
+
+    /// A bare lock prunes only inside a `.socket/`: a directory that does
+    /// not lie directly in one is the caller's, at any depth and whatever
+    /// its own name.
+    #[test]
+    fn a_bare_lock_outside_a_socket_dir_prunes_no_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        for levels in [&["custom"][..], &[".socket"], &[".socket", "bazel", "deep"]] {
+            let owned = levels
+                .iter()
+                .fold(dir.path().to_path_buf(), |at, l| at.join(l));
+            let guard = acquire_bare(&owned, Duration::ZERO).unwrap();
+            assert!(owned.join("apply.lock").is_file());
+            drop(guard);
+            assert!(!owned.join("apply.lock").exists(), "{levels:?}");
+            assert!(owned.is_dir(), "{levels:?} must survive");
+        }
+    }
+
+    /// None of the project-level steps run under a bare lock. The fixture
+    /// is one the project lock acts on: taken through [`acquire`], the
+    /// same directory replays the journal and sweeps the stage entry.
+    #[test]
+    fn a_bare_lock_does_nothing_to_the_directory_above_it() {
+        use std::time::SystemTime;
+        let dir = tempfile::tempdir().unwrap();
+        let (socket, owned) = (socket_dir(&dir), bare_dir(&dir));
+        std::fs::create_dir_all(&owned).unwrap();
+        // The project of a lock in `owned` would be the `.socket/` itself.
+        let journal = interrupted_commit(&socket, INTERRUPTED);
+        let journaled = std::fs::read(&journal).unwrap();
+        let staged = owned.join(".socket-stage-index.json-123");
+        std::fs::write(&staged, b"{").unwrap();
+        let past = SystemTime::now() - Duration::from_secs(7200);
+        std::fs::File::options()
+            .write(true)
+            .open(&staged)
+            .and_then(|f| f.set_modified(past))
+            .unwrap();
+
+        let guard = acquire_bare(&owned, Duration::ZERO).unwrap();
+        assert_eq!(guard.commit_recovery(), None);
+        drop(guard);
+        assert_eq!(std::fs::read(&journal).unwrap(), journaled);
+        assert_eq!(
+            std::fs::read(socket.join("package.json")).unwrap(),
+            b"old\n"
+        );
+        assert!(!socket.join("pnpm-workspace.yaml").exists());
+        assert!(staged.is_file(), "a two-hour-old stage entry is not swept");
+        assert!(!owned.join("apply.lock").exists());
+
+        let guard = acquire(&owned, Duration::ZERO).unwrap();
+        assert_eq!(
+            guard.commit_recovery().map(|r| r.code),
+            Some(COMMIT_RECOVERED)
+        );
+        assert_eq!(
+            std::fs::read(socket.join("package.json")).unwrap(),
+            b"new\n"
+        );
+        assert!(!staged.exists());
+    }
+
+    /// An interrupt removes a bare lock's file and the levels the acquire
+    /// created, as it does a project lock's, and leaves what the holder
+    /// wrote under the lock.
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn interrupt_cleanup_removes_a_bare_lock_and_its_empty_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        let (socket, owned) = (socket_dir(&dir), bare_dir(&dir));
+        let lock_path = owned.join("apply.lock");
+
+        let guard = acquire_bare(&owned, Duration::ZERO).unwrap();
+        assert!(guard.registration.is_some(), "a bare acquire registers");
+        assert!(lock_path.is_file());
+        interrupt_cleanup_of(&lock_path);
+        assert!(!lock_path.exists(), "the interrupt removes apply.lock");
+        assert!(!socket.exists(), "and both levels it left empty");
+        drop(guard);
+        assert!(!socket.exists());
+
+        std::fs::create_dir_all(&owned).unwrap();
+        std::fs::write(owned.join("index.json"), b"{}").unwrap();
+        let guard = acquire_bare(&owned, Duration::ZERO).unwrap();
+        interrupt_cleanup_of(&lock_path);
+        assert!(!lock_path.exists());
+        assert!(owned.join("index.json").is_file());
+        drop(guard);
+        assert!(owned.join("index.json").is_file());
+    }
+
+    /// The stress test of the project lock on a bare one, whose release
+    /// prunes two levels: an acquire that finds the `.socket/` above its
+    /// directory gone between two steps of its own mkdir tries again and
+    /// is no fault.
+    #[test]
+    fn concurrent_bare_acquire_release_never_double_holds_and_leaves_no_residue() {
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+
+        const ITERATIONS: usize = 200;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (socket, owned) = (socket_dir(&dir), bare_dir(&dir));
+        let (holders, doubled) = (AtomicUsize::new(0), AtomicUsize::new(0));
+        let hammer = || {
+            let mut faults = Vec::new();
+            for _ in 0..ITERATIONS {
+                match acquire_bare(&owned, Duration::ZERO) {
+                    Ok(guard) => {
+                        if holders.fetch_add(1, SeqCst) != 0 {
+                            doubled.fetch_add(1, SeqCst);
+                        }
+                        std::thread::yield_now();
+                        holders.fetch_sub(1, SeqCst);
+                        drop(guard);
+                    }
+                    Err(LockError::Held) => {}
+                    Err(e) => faults.push(e.to_string()),
+                }
+            }
+            faults
+        };
+        let faults: Vec<String> = std::thread::scope(|scope| {
+            let workers = [scope.spawn(hammer), scope.spawn(hammer)];
+            workers
+                .into_iter()
+                .flat_map(|worker| worker.join().unwrap())
+                .collect()
+        });
+
+        assert_eq!(doubled.load(SeqCst), 0, "two threads held the lock at once");
+        assert!(faults.is_empty(), "acquire hit I/O faults: {faults:?}");
+        assert!(!socket.exists(), "the last release must prune both levels");
     }
 }

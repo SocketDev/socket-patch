@@ -50,13 +50,15 @@
 //! Both files are replaced by stage and rename, never truncated, under one
 //! lock per root (`.socket/bazel/apply.lock`, which exists only while it
 //! is held), so two sub-projects of one root are applied in order, in one
-//! run or in two. The lock is this file's own: it does nothing but lock,
-//! because the root's `.socket` is not a project's (`patch::apply_lock`
-//! also finishes an interrupted vendored commit and sweeps stage entries
-//! there). No stage file is left beside either file: a failed write
-//! removes its own, and the next edit removes what an interrupted one
-//! left (hazard HZ-27). The writes bypass an open group commit on purpose:
-//! the line must be on disk before the tree is.
+//! run or in two. The lock is the bare one of `patch::apply_lock`
+//! (`acquire_bare`): it does nothing but lock, because the root's
+//! `.socket` is not a project's (the project lock also finishes an
+//! interrupted vendored commit and sweeps stage entries there), and a run
+//! that is interrupted inside an edit removes the file on its way out as
+//! it removes the project's. No stage file is left beside either file: a
+//! failed write removes its own, and the next edit removes what an
+//! interrupted one left (hazard HZ-27). The writes bypass an open group
+//! commit on purpose: the line must be on disk before the tree is.
 //!
 //! With no Bazel root above a project the cost is the root probe's stats;
 //! nothing is read and nothing is written.
@@ -64,10 +66,7 @@
 use std::io::{ErrorKind, Read as _};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, PoisonError};
-use std::time::{Duration, Instant};
-
-use fs2::FileExt as _;
-use same_file::Handle;
+use std::time::Duration;
 
 use crate::bazel::codes::Code;
 use crate::bazel::ignore::{
@@ -78,6 +77,7 @@ use crate::bazel::owned_index::{self, Index, Parsed, INDEX_PATH};
 use crate::constants::npm_family::VLT_LOCK;
 use crate::crawlers::bazel_root::{boundary_file_in, RootProbe, BOUNDARY_FILES};
 use crate::patch::apply::ApplyResult;
+use crate::patch::apply_lock::{self, LockError, LockGuard};
 use crate::utils::containment::linked_level;
 use crate::utils::fs::{atomic_write_sync, open_regular_file_sync, run_blocking};
 use crate::utils::repo_root::{ReadBoundary, ReadScope};
@@ -106,12 +106,8 @@ const MAX_BYTES: u64 = 1 << 20;
 /// hold a package.
 const SCAN_FILES: usize = 512;
 const SCAN_DIRS: usize = 4096;
-/// The lock file of a root's `.bazelignore` and index, beside the index.
-const LOCK_FILE: &str = "apply.lock";
-/// How long an edit waits for another run's edit of the same root, and
-/// how often it looks.
+/// How long an edit waits for another run's edit of the same root.
 const LOCK_WAIT: Duration = Duration::from_secs(10);
-const LOCK_POLL: Duration = Duration::from_millis(20);
 
 /// Serializes the edits of one process; the lock file serializes processes.
 static CHANNEL: Mutex<()> = Mutex::new(());
@@ -468,132 +464,31 @@ fn slashed_lines(file: &Path, model: &IgnoreModel) -> Option<String> {
     })
 }
 
-/// Removes the directories of the owned index when nothing is left in
-/// them: a root that had no `.socket` before an edit has none after its
-/// undo. `remove_dir` leaves a directory that holds anything.
-fn prune(root: &Path) {
-    for dir in root.join(INDEX_PATH).ancestors().skip(1).take(2) {
-        let _ = std::fs::remove_dir(dir);
-    }
-}
-
-/// One try at a [`RootLock`] that did not get it.
-enum NotTaken {
-    /// Another run holds the lock.
-    Held,
-    /// A holder's release ran between two of the steps: its directory or
-    /// its file went, the handle that was locked is no longer the file
-    /// the path names, or (Windows) the name is still pending deletion.
-    Raced(std::io::Error),
-    Fault(std::io::Error),
-}
-
-/// The lock of one root's `.bazelignore` and index among processes: an
-/// advisory lock on `apply.lock` beside the index. The file exists only
-/// while it is held: it is unlinked under the lock, and a waiter that had
-/// opened it finds, once it locks it, that the path names another file
-/// and tries again.
+/// The lock of one root's `.bazelignore` and index among processes: the
+/// bare lock of `patch::apply_lock` on `apply.lock` in `owned`, the index's
+/// directory (created when missing), waiting up to `wait` for a run that
+/// holds it. The file exists only while the guard does.
 ///
-/// Taking it does nothing else. `patch::apply_lock` would lock the same
-/// way, and would also treat the directory above the one it locks as a
-/// project: finish a vendored commit journal there, sweep stage entries,
-/// sync pending artifacts when it lets go. Here that directory is the
-/// Bazel root's `.socket`, which is not a project's, and no other file
-/// goes through this channel (design 5.4).
+/// Taking it does nothing else. The project lock would also treat the
+/// directory above the one it locks as a project: finish a vendored commit
+/// journal there, sweep stage entries, sync pending artifacts when it lets
+/// go. Here that directory is the Bazel root's `.socket`, which is not a
+/// project's, and no other file goes through this channel (design 5.4).
 ///
-/// It is not in the interrupt table of `patch::apply_lock`, so a run that
-/// is killed between the two renames of an edit leaves the file. A dead
-/// holder's lock is released by the kernel, and the next edit of the root
-/// takes the file over and removes it.
-struct RootLock {
-    held: Option<Handle>,
-    path: PathBuf,
-}
-
-impl RootLock {
-    /// The lock in `owned` (the index's directory, created when missing),
-    /// waiting up to `wait` for a run that holds it.
-    fn take(owned: &Path, wait: Duration) -> Result<Self, String> {
-        let path = owned.join(LOCK_FILE);
-        let deadline = Instant::now() + wait;
-        loop {
-            let late = Instant::now() >= deadline;
-            match Self::attempt(owned, &path) {
-                Ok(lock) => return Ok(lock),
-                Err(NotTaken::Held) if late => {
-                    return Err("another socket-patch run holds it".to_string())
-                }
-                Err(NotTaken::Raced(e) | NotTaken::Fault(e)) if late => return Err(e.to_string()),
-                Err(NotTaken::Fault(e)) => return Err(e.to_string()),
-                Err(NotTaken::Held | NotTaken::Raced(_)) => std::thread::sleep(LOCK_POLL),
-            }
-        }
-    }
-
-    fn attempt(owned: &Path, path: &Path) -> Result<Self, NotTaken> {
-        // What a release leaves behind for a moment: a missing level
-        // (macOS reports an `O_CREAT` open in a directory removed a moment
-        // ago as EINVAL), and on Windows a name whose last handle is not
-        // closed yet (access denied, sharing violation, delete pending).
-        let raced = |e: std::io::Error| {
-            let gone = e.kind() == ErrorKind::NotFound;
-            let unlinking = match e.raw_os_error() {
-                Some(22) => cfg!(unix),
-                Some(5 | 32 | 303) => cfg!(windows),
-                _ => false,
-            };
-            match gone || unlinking {
-                true => NotTaken::Raced(e),
-                false => NotTaken::Fault(e),
-            }
-        };
-        if let Err(e) = std::fs::create_dir_all(owned) {
-            // `create_dir_all` reports a directory that a release removed
-            // under it as existing.
-            let squatted = std::fs::metadata(owned).is_ok_and(|meta| !meta.is_dir());
-            return Err(match e.kind() == ErrorKind::AlreadyExists && !squatted {
-                true => NotTaken::Raced(e),
-                false => raced(e),
-            });
-        }
-        let mut options = std::fs::OpenOptions::new();
-        options.read(true).write(true).create(true).truncate(false);
-        let file = options.open(path).map_err(raced)?;
-        if let Err(e) = file.try_lock_exclusive() {
-            let held = e.raw_os_error() == fs2::lock_contended_error().raw_os_error();
-            return Err(match held {
-                true => NotTaken::Held,
-                false => NotTaken::Fault(e),
-            });
-        }
-        let held = Handle::from_file(file).map_err(NotTaken::Fault)?;
-        match Handle::from_path(path) {
-            Ok(named) if named == held => Ok(Self {
-                held: Some(held),
-                path: path.to_path_buf(),
-            }),
-            // A holder unlinked the file between the open and the lock.
-            Ok(_) => Err(NotTaken::Raced(ErrorKind::NotFound.into())),
-            Err(e) => Err(raced(e)),
-        }
-    }
-}
-
-impl Drop for RootLock {
-    fn drop(&mut self) {
-        // Unlinked while the lock is held, and only the file that is
-        // held: one that replaced it belongs to whoever locked it.
-        let ours = match Handle::from_path(&self.path) {
-            Ok(named) => self.held.as_ref() == Some(&named),
-            Err(e) => e.kind() != ErrorKind::NotFound,
-        };
-        if ours {
-            let _ = std::fs::remove_file(&self.path);
-        }
-        // Closed before the caller prunes the directory: Windows lets go
-        // of the name only with the last handle.
-        self.held = None;
-    }
+/// The guard is in the interrupt table like the project's, so a run that
+/// is interrupted between the two renames of an edit takes the file out
+/// as it dies. Only a kill nothing can catch leaves it: the kernel lets go
+/// of a dead holder's lock, and the next edit of the root takes the file
+/// over and removes it. Letting go also removes the index's directory and
+/// the root's `.socket` when nothing is left in them: a root that had no
+/// `.socket` before an edit has none after its undo.
+fn take_lock(owned: &Path, wait: Duration) -> Result<LockGuard, String> {
+    apply_lock::acquire_bare(owned, wait).map_err(|e| match e {
+        LockError::Held => "another socket-patch run holds it".to_string(),
+        LockError::Io { source, .. } => source.to_string(),
+        // Only the project lock looks for a commit journal.
+        pending @ LockError::CommitPending { .. } => pending.to_string(),
+    })
 }
 
 /// Runs `edit` as the one writer of a root's `.bazelignore` and index: in
@@ -605,7 +500,7 @@ fn locked<T>(root: &Path, edit: impl FnOnce() -> T) -> Result<T, String> {
     let _serial = CHANNEL.lock().unwrap_or_else(PoisonError::into_inner);
     let index_path = root.join(INDEX_PATH);
     let owned = index_path.parent().unwrap_or(root);
-    let lock = RootLock::take(owned, LOCK_WAIT);
+    let lock = take_lock(owned, LOCK_WAIT);
     let done = match &lock {
         Err(e) => Err(format!(
             "the lock of {} was not taken ({e})",
@@ -624,7 +519,6 @@ fn locked<T>(root: &Path, edit: impl FnOnce() -> T) -> Result<T, String> {
         }
     };
     drop(lock);
-    prune(root);
     done
 }
 
@@ -1290,6 +1184,9 @@ mod tests {
 
     const UUID: &str = "0b5e1c1e-5f0a-4c8e-9a51-6d1f3c2b7a90";
     const OTHER_UUID: &str = "7c1d2e3f-4a5b-4c6d-8e7f-9a0b1c2d3e4f";
+    /// The lock file of a root's `.bazelignore` and index, beside the
+    /// index: the name `patch::apply_lock` gives every lock file.
+    const LOCK_FILE: &str = "apply.lock";
 
     /// A checkout in a temporary directory: `.git` bounds every upward
     /// walk, so nothing above the test's own files is a Bazel root.
@@ -2041,7 +1938,7 @@ mod tests {
     #[test]
     fn the_lock_of_a_root_does_nothing_but_lock() {
         let repo = Repo::workspace();
-        // What `patch::apply_lock` would take for an interrupted vendored
+        // What the project lock would take for an interrupted vendored
         // commit of the project `<root>/.socket`, replay or set aside.
         let journal = ".socket/.socket/vendor/.commit-journal.json";
         repo.put(journal, b"not a journal");
@@ -2056,28 +1953,52 @@ mod tests {
         );
 
         // One holder at a time, and the file exists only while it is held.
-        let owned = repo.top.join(".socket/bazel");
+        let owned = repo.top.join(".socket").join("bazel");
         let lock = owned.join(LOCK_FILE);
-        let first = RootLock::take(&owned, Duration::ZERO).expect("free");
+        let first = take_lock(&owned, Duration::ZERO).expect("free");
         assert!(lock.exists());
-        let busy = RootLock::take(&owned, Duration::ZERO).err();
+        let busy = take_lock(&owned, Duration::ZERO).err();
         assert_eq!(busy.as_deref(), Some("another socket-patch run holds it"));
         std::thread::scope(|scope| {
-            let waiter = scope.spawn(|| RootLock::take(&owned, Duration::from_secs(30)));
-            std::thread::sleep(LOCK_POLL * 3);
+            let waiter = scope.spawn(|| take_lock(&owned, Duration::from_secs(30)));
+            std::thread::sleep(Duration::from_millis(60));
             drop(first);
             let second = waiter.join().unwrap().expect("taken once it is free");
             assert!(lock.exists());
             drop(second);
         });
-        assert!(!lock.exists());
-        prune(&repo.top);
+        // Letting go took the file and the index's directory with it.
+        assert!(!owned.exists());
         assert_eq!(repo.tree(), before);
         // A file where the directory belongs is said, and not waited for.
         let squatted = Repo::workspace();
         squatted.put(".socket/bazel", b"");
         let refusal = create(&squatted.top, GoPatches, false).expect_err("no lock, no line");
         assert!(refusal.detail.contains("was not taken"), "{refusal}");
+        assert_eq!(squatted.tree().len(), 3, "{:?}", squatted.tree());
+    }
+
+    /// A root that had no `.socket` gets none from an edit that writes
+    /// nothing, and none from a lock that was not taken: the directories
+    /// the lock made go with it.
+    #[test]
+    fn a_root_without_a_socket_directory_has_none_after_an_edit_that_wrote_nothing() {
+        let repo = Repo::workspace();
+        let before = repo.tree();
+        let done = locked(&repo.top, || {
+            assert!(repo.top.join(INDEX_PATH).with_file_name(LOCK_FILE).exists());
+        });
+        assert_eq!(done, Ok(()));
+        assert_eq!(repo.tree(), before);
+        // The edit of another run is waited for, then given up on, and
+        // the holder's file is left to the holder.
+        let owned = repo.top.join(".socket").join("bazel");
+        let held = take_lock(&owned, Duration::ZERO).expect("free");
+        let busy = take_lock(&owned, Duration::from_millis(50)).err();
+        assert_eq!(busy.as_deref(), Some("another socket-patch run holds it"));
+        assert!(owned.join(LOCK_FILE).exists());
+        drop(held);
+        assert_eq!(repo.tree(), before);
     }
 
     fn result(success: bool, error: Option<&str>) -> ApplyResult {
