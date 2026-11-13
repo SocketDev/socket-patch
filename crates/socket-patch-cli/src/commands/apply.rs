@@ -468,9 +468,27 @@ async fn run_check(args: &ApplyArgs, manifest_path: &Path) -> i32 {
         }
         None => Vec::new(),
     };
+    // What the Bazel build makes of these patches (design 7): "in sync"
+    // is a statement about the installed tree, and where a ruleset builds
+    // a package from its lock the check says so, once, and marks the
+    // package. The verdicts and the exit code stay as they are.
+    let bazel_records = manifest.patches.iter();
+    let bazel_records = bazel_records.filter(|(purl, _)| owned_by_apply(purl));
+    let bazel = Box::pin(crate::bazel_gate::agent::report(
+        &args.common,
+        crate::bazel_gate::agent::Command::Check,
+        bazel_records
+            .map(|(purl, record)| (purl.clone(), record.uuid.clone()))
+            .collect(),
+        &[],
+        &[],
+    ))
+    .await;
+    check_warnings.extend(bazel.run_warnings());
     if !args.common.json && !args.common.silent {
         for warning in &check_warnings {
-            eprintln!("Warning: {}", warning.detail);
+            let prefix = crate::bazel_gate::agent::prefix(&warning.code);
+            eprintln!("{prefix}: {}", warning.detail);
         }
     }
 
@@ -619,6 +637,7 @@ async fn run_check(args: &ApplyArgs, manifest_path: &Path) -> i32 {
                 env.record(event);
             }
             env.warnings.extend(check_warnings);
+            bazel.mark(&mut env);
             println!("{}", env.to_pretty_json());
         } else if !args.common.silent {
             println!(
@@ -642,6 +661,7 @@ async fn run_check(args: &ApplyArgs, manifest_path: &Path) -> i32 {
             }
             env.warnings.extend(check_warnings);
             env.mark_partial_failure();
+            bazel.mark(&mut env);
             println!("{}", env.to_pretty_json());
         } else {
             // Drift IS the error the exit code signals — it prints even
@@ -1792,6 +1812,13 @@ pub(crate) async fn run_locked(
         NpmPkgManager::Npm | NpmPkgManager::YarnClassic | NpmPkgManager::Unknown => {}
     }
 
+    // The records the Bazel layer is asked about once the loop has run:
+    // the manifest moves into it.
+    let bazel_records: Vec<(String, String)> = manifest
+        .patches
+        .iter()
+        .map(|(purl, record)| (purl.clone(), record.uuid.clone()))
+        .collect();
     match apply_patches_inner(&args, manifest, &user_patched, client).await {
         Ok(ApplyOutcome {
             success,
@@ -1880,6 +1907,27 @@ pub(crate) async fn run_locked(
                 cache_warnings.extend(warnings);
             }
 
+            // Under a Bazel workspace: what its build makes of these
+            // patches (design 3, HZ-01). The installed copies are patched
+            // all the same and the exit code is unchanged; the run says
+            // once which packages Bazel builds from a lock instead. Asked
+            // after the loop, over the disk as it left it, and never for
+            // a package `vendor` owns.
+            let vendor_owned: Vec<&str> = results
+                .iter()
+                .filter(|r| r.package_path == VENDOR_OWNED_MARKER)
+                .map(|r| r.package_key.as_str())
+                .collect();
+            let bazel = Box::pin(crate::bazel_gate::agent::report(
+                &args.common,
+                crate::bazel_gate::agent::Command::Apply,
+                bazel_records,
+                &results,
+                &vendor_owned,
+            ))
+            .await;
+            run_warnings.extend(bazel.run_warnings());
+
             // Run-level advisories + best-effort fallback-home skips on the
             // human path: one gated stderr line each. `--silent` is
             // errors-only, and under `--json` the envelope copies below are
@@ -1890,7 +1938,9 @@ pub(crate) async fn run_locked(
                     // own `Error:` diagnostic (already printed, even under
                     // --silent); they exist for the JSON envelope.
                     if !is_stage_failure_code(&w.code) {
-                        eprintln!("Warning: {}", w.detail);
+                        // A Bazel code of level `info` is a note.
+                        let prefix = crate::bazel_gate::agent::prefix(&w.code);
+                        eprintln!("{prefix}: {}", w.detail);
                     }
                 }
                 for skip in &fallback_skips {
@@ -1932,6 +1982,11 @@ pub(crate) async fn run_locked(
                         if advised.insert(advisory.message.clone()) {
                             eprintln!("{label}: {}", advisory.message);
                         }
+                    }
+                }
+                for hazard in bazel.hazards() {
+                    if advised.insert(hazard.to_string()) {
+                        eprintln!("Warning: {hazard}");
                     }
                 }
             }
@@ -2101,6 +2156,9 @@ pub(crate) async fn run_locked(
                     }
                     None => {}
                 }
+                // `details.bazel` on the events of the packages Bazel
+                // has a verdict for, and the repin hazards.
+                bazel.mark(&mut env);
                 println!("{}", env.to_pretty_json());
             }
 

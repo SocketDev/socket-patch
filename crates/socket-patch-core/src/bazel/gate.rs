@@ -253,6 +253,10 @@ pub struct GateCx<'a> {
     /// it. It is matched against the downloader config and never
     /// printed: its path can hold the grant token.
     pub patch_url: Option<&'a str>,
+    /// What executed cells prove about the lanes of the table that is
+    /// asked: `Proofs::PRODUCTION` from every caller but a test with a
+    /// lane table of its own.
+    pub proofs: &'a lanes::Proofs,
 }
 
 impl<'a> GateCx<'a> {
@@ -274,6 +278,7 @@ impl<'a> GateCx<'a> {
             host: None,
             allow_patch_conflicts: false,
             patch_url: None,
+            proofs: &lanes::Proofs::PRODUCTION,
         }
     }
 }
@@ -370,11 +375,10 @@ fn occurrences(ws: &BazelWorkspace, flag: Flag) -> Result<Vec<Occurrence>, Refus
 
 // ── Obligations 1 to 3 ───────────────────────────────────────────────
 
-/// The refusal for an ecosystem whose governance is not known
-/// (`Governance::Undetermined`): the first gap names the case and what
-/// would lift it. Public for a seam that has no model to ask [`gate`]
-/// with (a root above the repository, a root no boundary file of which
-/// could be read) and still must refuse as the gate would.
+/// The refusal for a project whose governance is not known: `gaps` are
+/// what was not read. Public for a seam that has no model to ask the gate
+/// with (no boundary file of the root could be read, or the root lies
+/// above the repository): it refuses with what the gate would have said.
 pub fn undetermined(gaps: &[Gap]) -> Refusal {
     let Some(first) = gaps.first() else {
         let why = "which lock Bazel reads for this ecosystem could not be determined";
@@ -2148,6 +2152,11 @@ fn merge(mut passed: Vec<Passed>) -> Result<GateOutcome, Refusal> {
                 plan.repositories.push(repository);
             }
         }
+        for artifact in next.artifacts {
+            if !plan.artifacts.contains(&artifact) {
+                plan.artifacts.push(artifact);
+            }
+        }
         for advisory in next.advisories {
             if !plan.advisories.contains(&advisory) {
                 plan.advisories.push(advisory);
@@ -2480,11 +2489,11 @@ fn hub_outcome(
         .collect();
     rc_carriage(ws, &rc_rows)?;
     owned_state(ws, cx.files, cx.index, &plan.writes)?;
-    classes_and_anchor(spec, &plan, lanes::BUMP_CELLS)?;
+    classes_and_anchor(spec, &plan, cx.proofs.bump)?;
     ignore_lines(ws, &plan)?;
     placement(&plan)?;
     token_surfaces(spec, &mut plan)?;
-    let claimed: Vec<ClaimOs> = lanes::claims::os_claims(spec.id).collect();
+    let claimed: Vec<ClaimOs> = cx.proofs.os_of(spec.id).collect();
     host_os(spec, &plan, cx.host, &claimed)?;
     if let Some(write) = plan.writes.iter().find(|write| !carried_out(write)) {
         let class = write.class().as_str();
@@ -2844,6 +2853,7 @@ mod tests {
             lane: LaneId(lane),
             writes,
             repositories,
+            artifacts: Vec::new(),
             advisories: Vec::new(),
             attest: AttestBasis::LockUrl,
             anchor: Anchor::Digest,
@@ -3950,6 +3960,7 @@ mod tests {
                 path: "pnpm-lock.yaml".to_string(),
             }],
             repositories: Vec::new(),
+            artifacts: Vec::new(),
             advisories: Vec::new(),
             attest: AttestBasis::LockUrl,
             anchor: Anchor::Digest,
@@ -4191,6 +4202,7 @@ mod tests {
             lane: LaneId("H-TOY2"),
             writes,
             repositories: Vec::new(),
+            artifacts: Vec::new(),
             advisories: Vec::new(),
             attest,
             anchor,
@@ -4338,6 +4350,7 @@ mod tests {
                 line: line.to_string(),
             }],
             repositories: Vec::new(),
+            artifacts: Vec::new(),
             advisories: Vec::new(),
             attest: AttestBasis::LockPath,
             anchor: Anchor::Digest,
@@ -4423,6 +4436,7 @@ mod tests {
                 lane: LaneId("H-TOY2"),
                 writes: vec![write.clone()],
                 repositories: Vec::new(),
+                artifacts: Vec::new(),
                 advisories: Vec::new(),
                 attest: AttestBasis::LockUrl,
                 anchor: Anchor::Digest,
@@ -4445,6 +4459,7 @@ mod tests {
             lane: LaneId(lane),
             writes,
             repositories: Vec::new(),
+            artifacts: Vec::new(),
             advisories: Vec::new(),
             attest: AttestBasis::LockUrl,
             anchor: Anchor::Digest,
@@ -5301,6 +5316,7 @@ mod tests {
                                 lane: spec.id,
                                 writes: vec![write.clone()],
                                 repositories: Vec::new(),
+                                artifacts: Vec::new(),
                                 advisories: Vec::new(),
                                 attest: AttestBasis::Declared,
                                 anchor: Anchor::Declaration,
@@ -5417,6 +5433,7 @@ mod tests {
                 path: "pnpm-lock.yaml".to_string(),
             }],
             repositories: Vec::new(),
+            artifacts: Vec::new(),
             advisories: Vec::new(),
             attest: AttestBasis::LockUrl,
             anchor: Anchor::Digest,

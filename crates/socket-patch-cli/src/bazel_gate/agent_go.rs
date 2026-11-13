@@ -477,6 +477,7 @@ mod tests {
             lane: TOY.id,
             writes: Vec::new(),
             repositories: Vec::new(),
+            artifacts: Vec::new(),
             advisories: vec![Advisory {
                 code: Code::WorkspaceOutOfScope,
                 detail: "a hand-written pin was left as it is".to_string(),
