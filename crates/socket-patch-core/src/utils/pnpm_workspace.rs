@@ -28,10 +28,12 @@ use std::path::{Path, PathBuf};
 
 use crate::formats::pnpm::workspace::read_package_globs;
 use crate::utils::cargo_workspace::{
-    expand_glob_bounded, DirTree, DiskTree, MemoryTree, MAX_MANIFESTS,
+    expand_glob_bounded, in_bazel_tree, DirTree, DiskTree, MemoryTree, MAX_MANIFESTS,
 };
 use crate::utils::fs::{read_regular_to_string, read_regular_to_string_sync};
-use crate::utils::workspace_globs::{brace_alternatives, glob_matches_no_dot, split_negation};
+use crate::utils::workspace_globs::{
+    brace_alternatives, glob_matches_no_dot, split_negation, BazelRoots,
+};
 use crate::vendor::lock_inventory::view::ProjectView;
 
 /// pnpm's workspace and settings file.
@@ -667,7 +669,7 @@ async fn workspace_members(view: &ProjectView<'_>, env: bool) -> Members {
         }
         ProjectView::Memory(project) => member_dirs(&MemoryTree(project), &globs),
     };
-    let dirs = match dirs {
+    let mut dirs = match dirs {
         Ok(dirs) => dirs,
         Err(why) => {
             return Members::Unresolved(format!(
@@ -677,6 +679,14 @@ async fn workspace_members(view: &ProjectView<'_>, env: bool) -> Members {
             ))
         }
     };
+    // A Bazel output base inside the checkout mirrors the workspace, its
+    // `package.json` and `pnpm-lock.yaml` included (the execution root
+    // links them), and a vendor directory holds what Bazel fetched. Under
+    // a `**` glob such a directory would be a member with a lock of its
+    // own, and the hosted rewrite would edit a file Bazel owns (ROUTED
+    // R-027). pnpm run by Bazel never installs from there.
+    let mut bazel = BazelRoots::default();
+    dirs.retain(|dir| !in_bazel_tree(view, &mut bazel, dir));
     // pnpm's project finder matches `<glob>/package.{json,yaml,json5}`: a
     // directory without a manifest is no project, and pnpm never installs
     // from a lock in it.
@@ -1915,6 +1925,60 @@ mod tests {
             PNPM_LOCK,
             "lockfileVersion: '9.0'\nimporters:\n  .: {}\n",
         );
+        assert!(matches!(
+            member_locks(&view).await,
+            MemberLocks::Unresolved(_)
+        ));
+    }
+
+    /// ROUTED R-027. An output base inside the checkout mirrors the
+    /// workspace: its execution root holds the root `package.json` and
+    /// `pnpm-lock.yaml`, and a vendor directory holds fetched packages
+    /// with theirs. Under a `**` glob each would be a member that installs
+    /// from its own lock, and the hosted rewrite would then edit a file
+    /// Bazel owns. Below a Bazel boundary file such a directory is no
+    /// member. The same tree with no boundary file is not Bazel's, and
+    /// lists as it always has: this is the layout that reproduces the
+    /// defect.
+    #[tokio::test]
+    async fn member_locks_leave_out_a_bazel_tree_inside_the_checkout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let view = ProjectView::Disk(root);
+        write(
+            root,
+            PNPM_WORKSPACE,
+            "packages:\n  - '**'\nsharedWorkspaceLockfile: false\n",
+        );
+        let lock = "lockfileVersion: '9.0'\n";
+        for member in [
+            "packages/a",
+            "out/execroot/_main",
+            "out/external/npm__left-pad",
+            "third_party/vendored",
+        ] {
+            write(root, &format!("{member}/package.json"), "{}");
+            write(root, &format!("{member}/pnpm-lock.yaml"), lock);
+        }
+        // The markers Bazel writes into an output base and a vendor
+        // directory.
+        write(root, "out/DO_NOT_BUILD_HERE", "");
+        write(root, "third_party/VENDOR.bazel", "");
+        let key = |member: &str| format!("{member}/pnpm-lock.yaml");
+        let all = vec![
+            key("out/execroot/_main"),
+            key("out/external/npm__left-pad"),
+            key("packages/a"),
+            key("third_party/vendored"),
+        ];
+        assert_eq!(member_locks(&view).await, MemberLocks::PerMember(all));
+
+        write(root, "MODULE.bazel", "module(name = \"ws\")\n");
+        let own = MemberLocks::PerMember(vec![key("packages/a")]);
+        assert_eq!(member_locks(&view).await, own);
+        // A workspace whose only member locks are Bazel's has none: the
+        // rewrite is refused, never pointed at the mirror.
+        std::fs::remove_file(root.join("packages/a/pnpm-lock.yaml")).unwrap();
         assert!(matches!(
             member_locks(&view).await,
             MemberLocks::Unresolved(_)

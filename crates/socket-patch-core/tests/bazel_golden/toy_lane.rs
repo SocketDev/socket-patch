@@ -35,24 +35,28 @@ use socket_patch_core::bazel::lanes::{self, refuse};
 use socket_patch_core::bazel::model::{
     Anchor, AttestBasis, BazelRef, BazelWorkspace, CellClaim, ClaimSystem, Code, FileText,
     FileView, Files, GateOutcome, Governance, HubId, Index, IndexRow, LaneCx, LaneId, LaneOps,
-    LaneSpec, LaneTable, Lift, Mode, OwnedWrite, PatchRequest, Plan, PlannedWrite, Reason,
-    RestoreOutcome, RootRef, Ruleset, RunPolicy, TextRead, TokenSurface, VexWithhold, WithholdKind,
-    WriteClass,
+    LaneSpec, LaneTable, Lift, Mode, OwnedWrite, PatchRequest, PinSource, Plan, PlannedWrite,
+    Reason, RestoreOutcome, RootRef, Ruleset, RunPolicy, TextRead, TokenSurface, VexWithhold,
+    WithholdKind, WriteClass,
 };
 use socket_patch_core::bazel::owned_index::{IndexEdit, INDEX_PATH};
 use socket_patch_core::crawlers::types::Ecosystem;
 use socket_patch_core::patch::redirect::{DepOverride, FileEdit, Integrity, RewriteResult};
 use socket_patch_core::vendor::lock_inventory::{LockIntegrity, LockfileEntry, SourceKind};
 
-const LANE: LaneId = LaneId("H-TOY1");
-const LOCK: &str = "toy.lock.json";
-const UUID: &str = "9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f";
-const PURL: &str = "pkg:maven/toy/dep@1.0.0";
-const UPSTREAM: &str = "5b850ef1c5b6c9c45330badb880dce1bcf31390ea60f25800a142825327121b8";
-const PATCHED: &str = "0f4e2bd7a1c38e6f95d7b21a4c60e8f3b9d5a7c1e2f4068a9bc3d5e7f1a2b4c6";
-const PATCH_URL: &str = "https://patch.socket.dev/toy/tok_fixture_4f1c/dep-1.0.0.sh";
+pub(super) const LANE: LaneId = LaneId("H-TOY1");
+pub(super) const LOCK: &str = "toy.lock.json";
+pub(super) const UUID: &str = "9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f";
+/// The purl of the toy's one package, as the rewriter group derives it
+/// from a grant (its ecosystem, name and version) and as the lane's
+/// inventory lists it: a pin is held to the entries of its own purl.
+pub(super) const PURL: &str = "pkg:maven/dep@1.0.0";
+pub(super) const UPSTREAM: &str =
+    "5b850ef1c5b6c9c45330badb880dce1bcf31390ea60f25800a142825327121b8";
+pub(super) const PATCHED: &str = "0f4e2bd7a1c38e6f95d7b21a4c60e8f3b9d5a7c1e2f4068a9bc3d5e7f1a2b4c6";
+pub(super) const PATCH_URL: &str = "https://patch.socket.dev/toy/tok_fixture_4f1c/dep-1.0.0.sh";
 
-const MODULE: &str = "module(name = \"toy_ws\")\n\
+pub(super) const MODULE: &str = "module(name = \"toy_ws\")\n\
     bazel_dep(name = \"rules_jvm_external\", version = \"6.7\")\n\
     maven = use_extension(\"@rules_jvm_external//:extensions.bzl\", \"maven\")\n\
     maven.install(name = \"maven\", artifacts = [\"toy:dep:1.0.0\"], \
@@ -60,7 +64,8 @@ const MODULE: &str = "module(name = \"toy_ws\")\n\
     use_repo(maven, \"maven\")\n";
 
 /// The lock of the `core/` fixture, byte for byte.
-const INPUT: &str = "{\n  \"lockVersion\": 1,\n  \"packages\": {\n    \"dep\": {\n      \
+pub(super) const INPUT: &str =
+    "{\n  \"lockVersion\": 1,\n  \"packages\": {\n    \"dep\": {\n      \
     \"version\": \"1.0.0\",\n      \
     \"url\": \"https://registry.toy.invalid/dep/-/dep-1.0.0.sh\",\n      \
     \"sha256\": \"5b850ef1c5b6c9c45330badb880dce1bcf31390ea60f25800a142825327121b8\"\n    \
@@ -78,7 +83,7 @@ const SPEC: LaneSpec = LaneSpec {
     classes: &[WriteClass::GeneratedValue, WriteClass::Owned],
     ..LaneSpec::stub("H-TOY1", Mode::Hosted, &["X2"])
 };
-const TOY: LaneOps = LaneOps {
+pub(super) const TOY: LaneOps = LaneOps {
     lanes: &[SPEC],
     gate: toy_gate,
     rewrite_owned: toy_rewrite,
@@ -88,13 +93,13 @@ const TOY: LaneOps = LaneOps {
     restore: toy_restore,
     inventory: toy_inventory,
 };
-const TABLE: LaneTable = LaneTable(&[(Ruleset::RulesJvmExternal, &TOY)]);
+pub(super) const TABLE: LaneTable = LaneTable(&[(Ruleset::RulesJvmExternal, &TOY)]);
 
 // ── The toy lock ─────────────────────────────────────────────────────
 
 /// The toy registry's URL of a release: what a restore puts back. The
 /// index never holds a URL, so the original is derived, not recorded.
-fn upstream_url(name: &str, version: &str) -> String {
+pub(super) fn upstream_url(name: &str, version: &str) -> String {
     format!("https://registry.toy.invalid/{name}/-/{name}-{version}.sh")
 }
 
@@ -103,7 +108,7 @@ fn member<'a>(doc: &'a Value, name: &str, key: &str) -> Option<&'a str> {
 }
 
 /// The value the toy extension computes for `pinsHash`.
-fn pins_hash(doc: &Value) -> Option<i64> {
+pub(super) fn pins_hash(doc: &Value) -> Option<i64> {
     let packages = doc.get("packages")?.as_object()?;
     let mut names: Vec<&String> = packages.keys().collect();
     names.sort();
@@ -117,7 +122,7 @@ fn pins_hash(doc: &Value) -> Option<i64> {
     Some(i64::from(hash_bytes(pins.as_bytes())))
 }
 
-fn parse(text: &str) -> Option<Value> {
+pub(super) fn parse(text: &str) -> Option<Value> {
     let doc: Value = serde_json::from_str(text).ok()?;
     (doc.get("lockVersion")?.as_i64()? == 1 && doc.get("pinsHash")?.is_i64()).then_some(doc)
 }
@@ -125,7 +130,7 @@ fn parse(text: &str) -> Option<Value> {
 /// Replaces one string member of a package in place: only the bytes of
 /// the value change, so the file's layout, line endings and final newline
 /// stay the user's.
-fn set_member(text: &mut String, name: &str, key: &str, old: &str, new: &str) -> bool {
+pub(super) fn set_member(text: &mut String, name: &str, key: &str, old: &str, new: &str) -> bool {
     let Some(package) = text.find(&format!("\"{name}\": {{")) else {
         return false;
     };
@@ -149,11 +154,11 @@ fn set_pins_hash(text: &mut String, new: i64) -> bool {
     true
 }
 
-fn lock_of(cx: &LaneCx<'_>) -> Option<String> {
+pub(super) fn lock_of(cx: &LaneCx<'_>) -> Option<String> {
     cx.ws.hubs.get(cx.hub.0)?.locks.first()?.path.clone()
 }
 
-fn sha_key(name: &str) -> String {
+pub(super) fn sha_key(name: &str) -> String {
     format!("packages/{name}/sha256")
 }
 
@@ -214,7 +219,7 @@ fn toy_gate(cx: &LaneCx<'_>, req: &PatchRequest<'_>) -> GateOutcome {
     })
 }
 
-fn edit(path: &str, key: &str, original: &str, new: &str) -> FileEdit {
+pub(super) fn edit(path: &str, key: &str, original: &str, new: &str) -> FileEdit {
     FileEdit {
         path: path.to_string(),
         kind: "toy-lock".to_string(),
@@ -225,18 +230,17 @@ fn edit(path: &str, key: &str, original: &str, new: &str) -> FileEdit {
     }
 }
 
-/// The pin: the package's URL and digest become the patch's.
-fn toy_rewrite(
-    cx: &LaneCx<'_>,
-    files: &mut Files,
-    overrides: &[DepOverride],
-    result: &mut RewriteResult,
-) {
+/// The pin: the package's URL and digest become the patch's. The toy has
+/// no vendored form, so a vendored source pins nothing.
+fn toy_rewrite(cx: &LaneCx<'_>, files: &mut Files, pins: &[PinSource], result: &mut RewriteResult) {
     let Some(lock) = lock_of(cx) else { return };
     let Some(mut text) = files.get(&lock).cloned() else {
         return;
     };
-    for dep in overrides {
+    for pin in pins {
+        let PinSource::Hosted(dep) = pin else {
+            continue;
+        };
         let (Some(doc), Some(sha256)) = (parse(&text), dep.integrity.sha256.as_deref()) else {
             continue;
         };
@@ -436,7 +440,7 @@ fn toy_inventory(cx: &LaneCx<'_>, read: TextRead<'_>) -> Option<Vec<LockfileEntr
             ecosystem: "maven",
             name: name.clone(),
             version: version.to_string(),
-            purl: format!("pkg:maven/toy/{name}@{version}"),
+            purl: format!("pkg:maven/{name}@{version}"),
             resolved: package.get("url")?.as_str().map(str::to_string),
             integrity: LockIntegrity::Sha256Hex(package.get("sha256")?.as_str()?.to_string()),
             source_kind: SourceKind::Unspecified,
@@ -530,7 +534,7 @@ fn request() -> PatchRequest<'static> {
     }
 }
 
-fn grant() -> DepOverride {
+pub(super) fn grant() -> DepOverride {
     DepOverride {
         ecosystem: "maven".to_string(),
         name: "dep".to_string(),
@@ -579,7 +583,7 @@ fn wire(tree: &mut Tree, index: &mut Index) -> Plan {
     let mut result = RewriteResult::default();
     {
         let cx = lane_cx(tree, &ws, index);
-        (TOY.rewrite_owned)(&cx, &mut files, &[grant()], &mut result);
+        (TOY.rewrite_owned)(&cx, &mut files, &[PinSource::Hosted(grant())], &mut result);
         (TOY.fixups)(&cx, &mut files, &plan, &mut result);
     }
     let text = |value: &Option<Value>| value.as_ref().and_then(Value::as_str).unwrap().to_string();
@@ -708,7 +712,7 @@ fn the_toy_lane_wires_attests_and_restores_byte_for_byte() {
             Files::from([(LOCK.to_string(), wired.clone())]),
             RewriteResult::default(),
         );
-        (TOY.rewrite_owned)(&cx, &mut files, &[grant()], &mut again);
+        (TOY.rewrite_owned)(&cx, &mut files, &[PinSource::Hosted(grant())], &mut again);
         (TOY.fixups)(&cx, &mut files, &plan, &mut again);
         assert!(again.edits.is_empty() && again.files.is_empty() && files[LOCK] == wired);
 

@@ -33,7 +33,7 @@ use crate::vendor::npm_origin::{
     npm_link_source_identity, npm_non_registry_entries, npm_shrinkwrapped_entries, NpmOverrides,
 };
 
-mod bazel;
+pub mod bazel;
 mod bun_binary;
 pub use bun_binary::{preflight_bun_binary, rewrite_bun_binary};
 #[cfg(test)]
@@ -429,7 +429,9 @@ pub struct RewriteResult {
     /// hosted confirmation keys off this set and its twin below, never off
     /// substring presence: a URL in a lock no hub reads pins nothing in the
     /// Bazel build. Like the Gradle and sbt sets, the two serialize (and
-    /// print) only when non-empty. No rewriter fills them yet.
+    /// print) only when non-empty. The Bazel rewriter group fills them
+    /// ([`rewrite_registry_redirect_with_host_under_bazel`]), and puts
+    /// each patch it decides into exactly one of the two.
     #[cfg_attr(
         test,
         serde(skip_serializing_if = "std::collections::BTreeSet::is_empty")
@@ -733,6 +735,98 @@ pub fn rewrite_registry_redirect_with_host(
     let mut result = rewrite_groups_parallel(result, &groups);
     result.vlt_drives = vlt::vlt_drives(files, bun_lockb_present);
     result
+}
+
+/// [`rewrite_registry_redirect`] for a project under a Bazel root
+/// ([`rewrite_registry_redirect_with_host_under_bazel`]), with nothing
+/// from the host but the root.
+pub fn rewrite_registry_redirect_under_bazel(
+    files: &BTreeMap<String, String>,
+    overrides: &[DepOverride],
+    bazel: &bazel::BazelHost<'_>,
+) -> (RewriteResult, bazel::BazelRewrite) {
+    rewrite_registry_redirect_with_host_under_bazel(
+        files,
+        overrides,
+        &BTreeMap::new(),
+        None,
+        false,
+        &std::collections::BTreeSet::new(),
+        &yarnrc::OuterYarnMirror::default(),
+        &CratesIoSource::Registry,
+        bazel,
+    )
+}
+
+/// [`rewrite_registry_redirect_with_host`] for a project under a Bazel
+/// root (design principle P7): the Bazel rewriter group decides every
+/// patch of an ecosystem that a ruleset governs there, or may govern, and
+/// the native rewriters get the others.
+///
+/// The Bazel group runs first, on the calling thread, and is no member of
+/// [`rewriter_groups`]: what it decides is what the native groups are
+/// handed, and the view of the root it reads is not `Sync`. Its pre-pass
+/// is the gate itself. A patch the gate does not answer "not Bazel" for
+/// is withheld from pdm, pipenv and every native group with the mechanism
+/// a refusing rewriter already uses ([`withhold`]). The native rewriters
+/// then hold no patch of a governed ecosystem, so they write none of its
+/// files: not the lock a hub names, not its paired manifest, not a
+/// sibling lock no hub reads, and not the `.npmrc` such a sibling's
+/// rewrite creates.
+///
+/// The result is the native result with the Bazel group's warnings and
+/// uuid sets in front. Its `files` and `edits` are the native ones alone,
+/// relative to the project: what the Bazel group wrote is in the returned
+/// [`bazel::BazelRewrite`], relative to the Bazel root, for the commit
+/// anchored there. For a project no hub claims the group decides nothing
+/// and the result is exactly [`rewrite_registry_redirect_with_host`]'s.
+#[allow(clippy::too_many_arguments)]
+pub fn rewrite_registry_redirect_with_host_under_bazel(
+    files: &BTreeMap<String, String>,
+    overrides: &[DepOverride],
+    artifact_metadata: &BTreeMap<String, String>,
+    pipenv_major: Option<u32>,
+    bun_lockb_present: bool,
+    gradle_unreadable: &std::collections::BTreeSet<String>,
+    yarn_outer: &yarnrc::OuterYarnMirror,
+    cargo_outer: &CratesIoSource,
+    bazel: &bazel::BazelHost<'_>,
+) -> (RewriteResult, bazel::BazelRewrite) {
+    // The native rewriter as the Bazel group calls it: over the files it
+    // is handed and nothing else of the project, so it knows of no binary
+    // lock and of no unreadable build file outside that set.
+    let nothing_else = std::collections::BTreeSet::new();
+    let native = |set: &BTreeMap<String, String>, deps: &[DepOverride]| {
+        rewrite_registry_redirect_with_host(
+            set,
+            deps,
+            artifact_metadata,
+            pipenv_major,
+            false,
+            &nothing_else,
+            yarn_outer,
+            cargo_outer,
+        )
+    };
+    let mut result = RewriteResult::default();
+    let group = bazel::rewrite(bazel, files, overrides, &native, &mut result);
+    let overrides = withhold(overrides, &group.governed());
+    let rest = rewrite_registry_redirect_with_host(
+        files,
+        &overrides,
+        artifact_metadata,
+        pipenv_major,
+        bun_lockb_present,
+        gradle_unreadable,
+        yarn_outer,
+        cargo_outer,
+    );
+    // The merge of a group's delta carries everything but this flag,
+    // which is the native run's to set.
+    let vlt_drives = rest.vlt_drives;
+    merge_group_delta(&mut result, rest);
+    result.vlt_drives = vlt_drives;
+    (result, group)
 }
 
 /// One rewriter group: rewriters that must run in this order on one result.

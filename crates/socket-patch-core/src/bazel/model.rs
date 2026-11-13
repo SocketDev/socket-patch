@@ -18,7 +18,7 @@ use std::path::PathBuf;
 
 use crate::crawlers::types::Ecosystem;
 use crate::patch::redirect::{DepOverride, RewriteResult};
-use crate::vendor::lock_inventory::LockfileEntry;
+use crate::vendor::lock_inventory::{LockIntegrity, LockfileEntry};
 
 use serde_json::{json, Value};
 
@@ -1409,11 +1409,61 @@ pub type Files = BTreeMap<String, String>;
 /// valid UTF-8.
 pub type TextRead<'a> = &'a dyn Fn(&str) -> Option<String>;
 
+/// What a lane's writer pins a package to (revision 4, 2.10). One writer
+/// serves both modes that edit a lock, so a lane that gains a vendored
+/// form lands without a ninth [`LaneOps`] function and without an edit of
+/// the seam that calls it: the hosted rewriter group wraps each grant in
+/// [`PinSource::Hosted`], and the vendored seam hands in
+/// [`PinSource::Vendored`].
+// The variants differ in size because a grant carries every digest the
+// service returned. A slice of sources is built once per patch and read
+// once, so a box per grant would buy nothing.
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug, Clone)]
+pub enum PinSource {
+    /// The hosted artifact of a grant: its URL, the grant token in it and
+    /// the digests the service returned.
+    Hosted(DepOverride),
+    /// An artifact committed under `.socket/vendor/`.
+    Vendored(VendoredPin),
+}
+
+impl PinSource {
+    /// The patch the pin is for.
+    pub fn uuid(&self) -> &str {
+        match self {
+            Self::Hosted(dep) => &dep.patch_uuid,
+            Self::Vendored(pin) => &pin.uuid,
+        }
+    }
+}
+
+/// A vendored artifact as a lane's writer pins it (revision 4, 2.10). No
+/// seam builds one yet: the vendored seam lands the artifact that it
+/// describes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VendoredPin {
+    pub uuid: String,
+    /// The root-relative directory that holds the artifact.
+    pub path: String,
+    /// What the pin names for the bytes, in the rendering of the lock.
+    pub digest: LockIntegrity,
+    /// The basename the pin's URL ends in: Bazel looks a `--distdir` file
+    /// up by it.
+    pub leaf: String,
+    /// The entry's own upstream URL, or the placeholder a lane writes in
+    /// its place. Never a Socket URL: a vendored build needs no patch
+    /// host.
+    pub url: String,
+}
+
 /// The pre-write proof of one hub. `NotBazel` is the answer for a hub
 /// whose lock does not resolve the release ([`GateOutcome::NotBazel`]).
 pub type GateFn = fn(&LaneCx<'_>, &PatchRequest<'_>) -> GateOutcome;
-/// Rewrites a Bazel-only lock.
-pub type RewriteOwnedFn = fn(&LaneCx<'_>, &mut Files, &[DepOverride], &mut RewriteResult);
+/// Rewrites a Bazel-only lock: pins each source in the candidate texts,
+/// and reports each value it replaced as an edit with a key (the rewriter
+/// group records those as the `pins` rows of the owned index).
+pub type RewriteOwnedFn = fn(&LaneCx<'_>, &mut Files, &[PinSource], &mut RewriteResult);
 /// Recomputes derived values after the native rewriter ran.
 pub type FixupsFn = fn(&LaneCx<'_>, &mut Files, &Plan, &mut RewriteResult);
 /// The lane's pins. `None` = cannot tell, which callers treat as "keep":
@@ -1471,7 +1521,7 @@ impl LaneOps {
 fn refuse_gate(_: &LaneCx<'_>, _: &PatchRequest<'_>) -> GateOutcome {
     GateOutcome::Refuse(Refusal::lane_not_enabled(LaneId::UNNAMED))
 }
-fn write_nothing(_: &LaneCx<'_>, _: &mut Files, _: &[DepOverride], _: &mut RewriteResult) {}
+fn write_nothing(_: &LaneCx<'_>, _: &mut Files, _: &[PinSource], _: &mut RewriteResult) {}
 fn fix_nothing(_: &LaneCx<'_>, _: &mut Files, _: &Plan, _: &mut RewriteResult) {}
 fn cannot_discover(_: &LaneCx<'_>, _: TextRead<'_>) -> Option<Vec<BazelRef>> {
     None
