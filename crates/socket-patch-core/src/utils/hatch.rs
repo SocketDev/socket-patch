@@ -601,6 +601,25 @@ fn walk(
     Ok(())
 }
 
+/// Whether a non-empty `HATCH_ENV_TYPE_VIRTUAL_UV_PATH` switches every
+/// Hatch virtual environment to the uv installer, whatever the files say.
+pub(crate) fn uv_path_override() -> bool {
+    uv_path_env().is_some_and(|path| !path.is_empty())
+}
+
+#[cfg(not(test))]
+fn uv_path_env() -> Option<String> {
+    std::env::var("HATCH_ENV_TYPE_VIRTUAL_UV_PATH").ok()
+}
+
+/// In the unit tests, only a value a test holds with an
+/// [`EnvGuard`](crate::test_env::EnvGuard): a developer who points Hatch at
+/// uv would otherwise see every pip-installer fixture refused.
+#[cfg(test)]
+fn uv_path_env() -> Option<String> {
+    crate::test_env::guarded_var("HATCH_ENV_TYPE_VIRTUAL_UV_PATH")
+}
+
 /// Whether hatch.toml carries `metadata`, which then holds the
 /// direct-reference permission instead of pyproject.
 fn external_metadata(documents: &BTreeMap<&'static str, DocumentMut>) -> bool {
@@ -620,10 +639,7 @@ fn run_round(documents: &mut BTreeMap<&'static str, DocumentMut>, round: &mut Ro
             }
         }
     }
-    round.uv_sources = uv_source_names(
-        documents,
-        std::env::var("HATCH_ENV_TYPE_VIRTUAL_UV_PATH").is_ok_and(|path| !path.is_empty()),
-    );
+    round.uv_sources = uv_source_names(documents, uv_path_override());
     round.apply = false;
     if let Err(error) = walk(documents, round) {
         round.fail_rest(&error);
@@ -1721,5 +1737,29 @@ mod tests {
             .as_ref()
             .unwrap_err()
             .contains("pip installer"));
+    }
+
+    /// In the unit tests a host `HATCH_ENV_TYPE_VIRTUAL_UV_PATH` is hidden,
+    /// so a developer's own uv path can't refuse the pip-installer fixtures.
+    /// The test never holds the key with an `EnvGuard`: the other hatch
+    /// tests run in parallel and would see uv switched on, even for the
+    /// instant a guard's drop restores the host value before releasing the
+    /// key (`uv_source_names(.., true)` covers that branch directly).
+    #[test]
+    #[serial_test::serial]
+    fn uv_path_env_hides_the_host_value() {
+        const KEY: &str = "HATCH_ENV_TYPE_VIRTUAL_UV_PATH";
+        let url = "https://patch.test/six-1.16.0-py2.py3-none-any.whl";
+        let inputs = files(
+            "[project]\ndependencies = [\"six==1.16.0\"]\n[tool.uv.sources]\nsix = { path = \"/abs/six.whl\" }\n",
+        );
+        let host = std::env::var_os(KEY);
+        std::env::set_var(KEY, "/host/uv");
+        assert!(!uv_path_override(), "host value hidden");
+        assert!(rewrite(&inputs, "six", "1.16.0", url).is_ok());
+        match host {
+            Some(value) => std::env::set_var(KEY, value),
+            None => std::env::remove_var(KEY),
+        }
     }
 }
