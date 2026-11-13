@@ -2161,13 +2161,16 @@ pub async fn bundler_source_mirror(
     root: &Path,
     sources: &[&str],
 ) -> Option<crate::formats::gem::mirror::MirrorCapture> {
+    // Keys come from the process env; values go through `bundle_env`, so
+    // the unit tests see only mirrors a test holds with an `EnvGuard`.
     let environment: Vec<_> = std::env::vars_os()
-        .filter_map(|(key, value)| {
+        .filter_map(|(key, _)| {
             let key = key.into_string().ok()?;
             if !key.starts_with("BUNDLE_MIRROR__") {
                 return None;
             }
-            Some((key, value.into_string().ok()?))
+            let value = bundle_env(&key)?.into_string().ok()?;
+            Some((key, value))
         })
         .collect();
     let mirrors: Vec<_> = environment
@@ -2613,13 +2616,12 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         // Set outside any guard, the way a developer's shell export
         // reaches the test process.
-        let saved = std::env::var_os("BUNDLE_GEMFILE");
-        std::env::set_var("BUNDLE_GEMFILE", "/elsewhere/Gemfile");
-        let unguarded = bundle_env("BUNDLE_GEMFILE");
-        match saved {
-            Some(v) => std::env::set_var("BUNDLE_GEMFILE", v),
-            None => std::env::remove_var("BUNDLE_GEMFILE"),
-        }
+        // A key no code reads, so a `gem` child spawned meanwhile by a
+        // non-serial test can't be affected.
+        const PROBE: &str = "BUNDLE_SOCKET_PATCH_SEAM_PROBE";
+        std::env::set_var(PROBE, "/elsewhere/Gemfile");
+        let unguarded = bundle_env(PROBE);
+        std::env::remove_var(PROBE);
         assert_eq!(unguarded, None);
         assert_eq!(ambient_home(), None);
         {
