@@ -1344,8 +1344,27 @@ fn bazel_trees_matched_detail(trees: &[String]) -> String {
     bazel_trees_left_out(trees, "a PATH pattern matched", "scanned")
 }
 
+/// The directories of a PATH list that a glob matched in a tree Bazel
+/// owns, or that link into one (a `bazel-bin` link at a workspace root
+/// leads to an output base outside the checkout). A directory the user
+/// named is never among them.
+async fn matched_bazel_trees(dirs: &[(PathBuf, bool)]) -> HashSet<PathBuf> {
+    let matched = dirs.iter().filter(|(_, named)| !named);
+    let matched: Vec<PathBuf> = matched.map(|(dir, _)| dir.clone()).collect();
+    if matched.is_empty() {
+        return HashSet::new();
+    }
+    let in_tree = socket_patch_core::patch::shared_store::in_bazel_tree(matched.clone()).await;
+    matched
+        .into_iter()
+        .zip(in_tree)
+        .filter_map(|(dir, in_tree)| in_tree.then_some(dir))
+        .collect()
+}
+
 /// The project directories of a PATH list, less the ones a glob matched in
-/// a tree Bazel owns, which are named once in a note.
+/// a tree Bazel owns (`trees`, [`matched_bazel_trees`]), which are named
+/// once in a note.
 ///
 /// A glob takes every directory it matches: `*` at a workspace root
 /// matches an output base kept in the checkout, a vendor directory and a
@@ -1358,21 +1377,11 @@ fn bazel_trees_matched_detail(trees: &[String]) -> String {
 /// A directory the user named is theirs to hear about, so it stays and its
 /// run refuses it. So do the matches when they are all the PATHs gave: a
 /// run that scanned nothing must not exit 0.
-async fn leave_out_matched_bazel_trees(
+fn leave_out_matched_bazel_trees(
     common: &GlobalArgs,
     dirs: Vec<(PathBuf, bool)>,
+    trees: &HashSet<PathBuf>,
 ) -> Vec<(PathBuf, bool)> {
-    let matched = dirs.iter().filter(|(_, named)| !named);
-    let matched: Vec<PathBuf> = matched.map(|(dir, _)| dir.clone()).collect();
-    if matched.is_empty() {
-        return dirs;
-    }
-    let in_tree = socket_patch_core::patch::shared_store::in_bazel_tree(matched.clone()).await;
-    let trees: HashSet<PathBuf> = matched
-        .into_iter()
-        .zip(in_tree)
-        .filter_map(|(dir, in_tree)| in_tree.then_some(dir))
-        .collect();
     if trees.is_empty() || trees.len() == dirs.len() {
         return dirs;
     }
@@ -1431,7 +1440,7 @@ fn is_info_note(code: &str) -> bool {
     matches!(
         code,
         GRADLE_MAVEN_LOCAL_UNDETERMINED | GRADLE_USER_HOME_DIFFERS | BAZEL_TREE_SKIPPED
-    )
+    ) || crate::bazel_gate::agent::is_note(code)
 }
 
 /// Print the run-level warnings to stderr: advisories as `Note:` (not
@@ -1836,8 +1845,19 @@ async fn run_project_dirs(
             message,
         )
     };
+    // Only a PATH glob can match a tree: the search of a bare scan enters
+    // none, so the directories it found need no second look. The matches
+    // are judged before the repository bound below: a convenience link
+    // leads to an output base outside the checkout, and a glob that
+    // matched one must leave it out with a note like any other tree, not
+    // end in the usage error a directory the user named gets.
+    let trees = if args.paths.is_empty() {
+        HashSet::new()
+    } else {
+        matched_bazel_trees(&dirs).await
+    };
     if !args.common.is_global() {
-        for (dir, _) in &dirs {
+        for (dir, _) in dirs.iter().filter(|(dir, _)| !trees.contains(dir)) {
             let resolved = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.clone());
             if !resolved.starts_with(&invocation.repo_root) {
                 return usage(
@@ -1877,13 +1897,7 @@ async fn run_project_dirs(
     // A run over several directories heads each one's output, also when
     // one is all that is left of them below.
     let headed = dirs.len() > 1 && !args.common.silent;
-    // Only a PATH glob can match a tree: the search of a bare scan enters
-    // none, so the directories it found need no second look.
-    let dirs = if args.paths.is_empty() {
-        dirs
-    } else {
-        leave_out_matched_bazel_trees(&args.common, dirs).await
-    };
+    let dirs = leave_out_matched_bazel_trees(&args.common, dirs, &trees);
     // One budget per invocation (§5.2): the directories spend it in sorted
     // order, and a package admitted in one is admitted free in the next.
     let configured = match args
@@ -2242,6 +2256,11 @@ async fn scan_project(
     // Unsupported layouts and malformed binary Bun locks, kept on empty
     // scans too: an unreadable graph is not evidence of no dependencies.
     let mut layout_refusals = unsupported_layout_warnings(&lockfile_only.unsupported);
+    // What a run says once about the Bazel workspace this project is in
+    // (design 3: HZ-19, HZ-23), in every mode. A stat-only probe and no
+    // entry where no Bazel root lies above the project. The advisory of
+    // agent mode is the nested apply's, over the patches it applied.
+    layout_refusals.extend(Box::pin(crate::bazel_gate::agent::workspace_notes(&args.common)).await);
     if let Some(others) = &unscanned_projects {
         let detail = render::unscanned_projects_detail(others, args.common.json);
         if !args.common.json && !args.common.silent {
