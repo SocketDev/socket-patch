@@ -393,10 +393,7 @@ pub fn advisory(not_consumed: &[&Patch]) -> Option<Warning> {
                 false => format!(" from {}", hub.locks.join(", ")),
             };
             let next = match hub.remedy {
-                Some(mode) => format!(
-                    "run `socket-patch scan --mode {}` to patch what Bazel builds",
-                    mode_name(mode)
-                ),
+                Some(mode) => format!("run {} to patch what Bazel builds", scan_command(mode)),
                 None => "no socket-patch release patches this Bazel shape yet".to_string(),
             };
             let builds = if hub.live { "builds" } else { "may build" };
@@ -422,11 +419,16 @@ pub fn advisory(not_consumed: &[&Patch]) -> Option<Warning> {
     })
 }
 
-const fn mode_name(mode: Mode) -> &'static str {
+/// The command a remedy names for `mode`, backticks included. One literal
+/// per mode and no format argument inside the span, so
+/// `tests/remedy_commands_parse.rs` parses each command line with the real
+/// CLI: it reads a `{}` in a backticked command as a package, which
+/// `--mode` rejects.
+const fn scan_command(mode: Mode) -> &'static str {
     match mode {
-        Mode::Agent => "agent",
-        Mode::Vendored => "vendored",
-        Mode::Hosted => "hosted",
+        Mode::Agent => "`socket-patch scan --mode agent`",
+        Mode::Vendored => "`socket-patch scan --mode vendored`",
+        Mode::Hosted => "`socket-patch scan --mode hosted`",
     }
 }
 
@@ -440,8 +442,8 @@ fn pin_hazard(purl: &str, dir: &Path, hub: &HubNote) -> SidecarRecord {
     };
     let next = match hub.remedy {
         Some(mode) => format!(
-            "run `socket-patch scan --mode {}` to pin the patch where Bazel reads it",
-            mode_name(mode)
+            "run {} to pin the patch where Bazel reads it",
+            scan_command(mode)
         ),
         None => "roll the patch back (`socket-patch rollback`) before a repin".to_string(),
     };
@@ -1126,7 +1128,14 @@ mod tests {
             );
             match expected {
                 Some(mode) => {
-                    let command = format!("`socket-patch scan --mode {}`", mode_name(mode));
+                    // Spelled here, not taken from `scan_command`, so the
+                    // expectation does not follow the text it checks.
+                    let name = match mode {
+                        Mode::Agent => "agent",
+                        Mode::Vendored => "vendored",
+                        Mode::Hosted => "hosted",
+                    };
+                    let command = format!("`socket-patch scan --mode {name}`");
                     assert!(detail.contains(&command), "{detail}");
                 }
                 None => {
