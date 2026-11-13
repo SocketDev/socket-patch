@@ -2424,7 +2424,7 @@ mod tests {
             .filter(|name| name.ends_with(".WORKSPACE"))
             .collect();
         names.sort();
-        assert_eq!(names.len(), 7);
+        assert_eq!(names.len(), 8);
         let mut out = String::new();
         for name in &names {
             let mut files = View::default();

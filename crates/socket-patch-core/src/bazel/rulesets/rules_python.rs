@@ -2536,64 +2536,14 @@ pub(super) mod tests {
         assert_eq!(found.hubs.len(), 1, "{:?}", found.hubs);
     }
 
-    /// `rules_python@0.31.0:examples/multi_python_versions/WORKSPACE`,
-    /// byte for byte.
-    const MULTI_PYTHON_VERSIONS: &str = r#"workspace(name = "rules_python_multi_python_versions")
-
-local_repository(
-    name = "rules_python",
-    path = "../..",
-)
-
-load("@rules_python//python:repositories.bzl", "py_repositories", "python_register_multi_toolchains")
-
-py_repositories()
-
-load("@rules_python//python/pip_install:repositories.bzl", "pip_install_dependencies")
-
-pip_install_dependencies()
-
-default_python_version = "3.9"
-
-python_register_multi_toolchains(
-    name = "python",
-    default_version = default_python_version,
-    python_versions = [
-        "3.8",
-        "3.9",
-        "3.10",
-        "3.11",
-    ],
-    register_coverage_tool = True,
-)
-
-load("@python//:pip.bzl", "multi_pip_parse")
-
-multi_pip_parse(
-    name = "pypi",
-    default_version = default_python_version,
-    python_interpreter_target = {
-        "3.10": "@python_3_10_host//:python",
-        "3.11": "@python_3_11_host//:python",
-        "3.8": "@python_3_8_host//:python",
-        "3.9": "@python_3_9_host//:python",
-    },
-    requirements_lock = {
-        "3.10": "//requirements:requirements_lock_3_10.txt",
-        "3.11": "//requirements:requirements_lock_3_11.txt",
-        "3.8": "//requirements:requirements_lock_3_8.txt",
-        "3.9": "//requirements:requirements_lock_3_9.txt",
-    },
-)
-
-load("@pypi//:requirements.bzl", "install_deps")
-
-install_deps()
-"#;
-
+    /// The rules_python 0.31.0 `examples/multi_python_versions` workspace
+    /// (the Starlark corpus; its README says where it is from).
     #[test]
     fn the_multi_python_versions_example_is_one_hub_over_a_lock_per_version() {
-        let found = Root::of(&[("WORKSPACE", MULTI_PYTHON_VERSIONS)]).recognize(recognize);
+        let name = "rules_python-0.31.0-multi_python_versions.WORKSPACE";
+        let path = fixtures().join("starlark").join("corpus").join(name);
+        let text = std::fs::read_to_string(path).expect("the corpus file");
+        let found = Root::of(&[("WORKSPACE", &text)]).recognize(recognize);
         assert_eq!((&found.gaps, &found.signals), (&vec![], &vec![]));
         let [hub] = &found.hubs[..] else {
             panic!("one hub, found {:?}", found.hubs);
