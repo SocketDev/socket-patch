@@ -131,8 +131,8 @@ pub(crate) use npm_common::is_safe_npm_name;
 pub use pypi_requirements::requirements_include_names;
 pub use state::{
     carry_forward_wiring, file_gitignored, ledger_gitignore_refusal, load_state, lookup_entry,
-    lookup_entry_kv, purl_keys_cover, save_state, save_state_shared, VendorEntry, VendorState,
-    LEDGER_GITIGNORED, VENDOR_STATE_REL,
+    lookup_entry_kv, purl_keys_cover, save_state, save_state_shared, BazelIndexRecord, VendorEntry,
+    VendorState, WiringRecord, LEDGER_GITIGNORED, VENDOR_STATE_REL,
 };
 pub use verify::{
     artifact_is_file_shaped, check_vendored_artifact, compute_dir_inventory,
@@ -916,6 +916,33 @@ impl RevertOutcome {
                  or re-vendor) and re-run `vendor --revert` to finish cleaning up"
             ),
         ));
+    }
+}
+
+/// The file the patch service serves for the patch `uuid`, verified
+/// against the service's own integrity: the bytes of a vendored artifact
+/// in its native file form, for a caller that wires it by other means
+/// than a native lock (a Bazel lane's plan). `Err` is the refusal's code
+/// and detail; nothing is written either way.
+pub async fn native_file_bytes(
+    cfg: &VendorServiceConfig,
+    uuid: &str,
+) -> Result<Vec<u8>, (&'static str, String)> {
+    use service_fetch::ServiceArtifact;
+    if !cfg.service_enabled() {
+        let why = "vendoring requires a prebuilt artifact from the patch service";
+        return Err((VENDOR_PREBUILT_REQUIRED, why.to_string()));
+    }
+    match service_fetch::fetch_verified_archive(cfg, uuid).await {
+        ServiceArtifact::Ready(archive) => Ok(archive.bytes),
+        ServiceArtifact::Pending => Err((
+            VENDOR_PREBUILT_PENDING,
+            "the patch service is still building the artifact".to_string(),
+        )),
+        ServiceArtifact::Unavailable(why) => Err((VENDOR_PREBUILT_UNAVAILABLE, why)),
+        ServiceArtifact::Failed(why) | ServiceArtifact::IntegrityMismatch(why) => {
+            Err((VENDOR_PREBUILT_REQUIRED, why))
+        }
     }
 }
 

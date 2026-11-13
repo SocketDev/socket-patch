@@ -1364,6 +1364,7 @@ mod tests {
             lane,
             writes,
             repositories: Vec::new(),
+            artifacts: Vec::new(),
             advisories: Vec::new(),
             attest: AttestBasis::Withheld,
             anchor: Anchor::Digest,
