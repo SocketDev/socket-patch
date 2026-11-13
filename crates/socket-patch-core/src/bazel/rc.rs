@@ -360,8 +360,15 @@ const PARENTS: &[(&str, &str)] = &[
     ("fetch", "test"),
 ];
 
-/// The configs a `startup:<name>` section may be written for.
-const OS_CONFIGS: [&str; 5] = ["linux", "macos", "windows", "freebsd", "openbsd"];
+/// Bazel's names for the host OS, the same five in the client
+/// (`option_processor.cc`, 9.0.2 to 10.0.0rc3) and in the server
+/// (`ConfigExpander.java`, 5.4.1 to 10.0.0rc3): the configs a
+/// `startup:<name>` section may be written for, and the
+/// `<command>:<name>` sections that `--enable_platform_specific_config`
+/// applies with no `--config`. The one copy of the list: a
+/// [`FlagState::Possible`] key of such a section is the bare name, or
+/// the name and ` [<condition>]`.
+pub(crate) const OS_CONFIGS: [&str; 5] = ["linux", "macos", "windows", "freebsd", "openbsd"];
 
 const ALWAYS_SINCE: BazelVersion = BazelVersion::new(6, 3, 0);
 /// `VendorCommand.java` names `TestCommand` from 7.3.0 (7.3.0rc1

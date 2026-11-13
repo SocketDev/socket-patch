@@ -34,7 +34,7 @@ use super::module_lock::{
     input_state, ExtensionEntry, ExtensionFacts, Extensions, FactDigest, InputState, ModuleLock,
     GENERAL,
 };
-use super::rc::{Chain, EffectiveFlags, Flag, FlagState, LockfileMode};
+use super::rc::{Chain, EffectiveFlags, Flag, FlagState, LockfileMode, OS_CONFIGS};
 use super::remedy::{self, Remedy};
 use super::version::{lockfile_mode_default, BazelLine, Tri};
 use crate::crawlers::python_crawler::canonicalize_pypi_name;
@@ -687,10 +687,6 @@ pub enum LockUse {
     Refreshed,
 }
 
-/// The sections `--enable_platform_specific_config` applies by itself,
-/// one per host OS (`build:linux`): the names `rc.rs` keeps for `startup`.
-const OS_SECTIONS: [&str; 5] = ["linux", "macos", "windows", "freebsd", "openbsd"];
-
 /// A [`FlagState::Possible`] key of the command with no `--config`: the
 /// plain reading, or one that only a release of the line or the working
 /// directory decides (a bracketed condition).
@@ -698,10 +694,11 @@ fn plain_reading(key: &str) -> bool {
     key.is_empty() || key.starts_with('[')
 }
 
-/// A [`FlagState::Possible`] key of an OS section, with or without a
-/// bracketed condition after it.
+/// A [`FlagState::Possible`] key of an OS section (`build:linux`), which
+/// `--enable_platform_specific_config` applies by itself on that host
+/// OS, with or without a bracketed condition after it.
 fn os_reading(key: &str) -> bool {
-    OS_SECTIONS.iter().any(|os| {
+    OS_CONFIGS.iter().any(|os| {
         let rest = key.strip_prefix(os);
         rest.is_some_and(|rest| rest.is_empty() || rest.starts_with(" ["))
     })
