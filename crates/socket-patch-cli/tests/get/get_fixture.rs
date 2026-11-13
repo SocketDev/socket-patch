@@ -37,10 +37,10 @@ pub async fn download_and_apply_patches(
         proxy_url: None,
     })
     .await;
+    let flags = socket_patch_cli::args::GlobalArgs::default();
     let run = DownloadRun {
         api_client: &api_client,
-        lock_timeout: None,
-        verbose: false,
+        common: &flags,
     };
     let (code, env) = download_and_apply_patches_with(selected, params, &run).await;
     (code, env.to_value())
@@ -296,7 +296,6 @@ pub fn engine_params(root: &Path) -> DownloadParams {
         allow_patch_conflicts: false,
         user_patch_skips_reported: false,
         ecosystems: None,
-        no_gem_native_rebuild: false,
         persist_blobs: true,
         patch_server_url: None,
         all_releases: true,

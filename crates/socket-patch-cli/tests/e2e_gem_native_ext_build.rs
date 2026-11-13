@@ -1100,6 +1100,7 @@ fn opted_out_native_patch_writes_sources_without_a_build() {
 
 // ── the opt-out through `scan` / `get --mode agent` (#2069) ───────────
 
+#[cfg(unix)]
 const ORG: &str = "test-org";
 
 /// A patch API that serves the `sp_native` patch (1 → 2) to `scan`'s
@@ -1172,39 +1173,23 @@ async fn the_opt_out_reaches_the_apply_that_scan_and_get_run() {
     let api = ["--api-url", &uri, "--api-token", "fake-token", "--org", ORG];
     let scan = ["scan", "--mode", "agent", "--yes", "--json"];
     let scan_human = ["scan", "--mode", "agent", "--yes"];
-    let get = ["get", UUID, "--mode", "agent", "--yes", "--json"];
+    // By purl: `get <uuid>` hands its own flags to the apply and never
+    // went through the engine that dropped this one.
+    let get = ["get", PURL, "--mode", "agent", "--yes", "--json"];
     let flag = ["--no-gem-native-rebuild"];
     let env = [("SOCKET_NO_GEM_NATIVE_REBUILD", "1")];
-    struct Case<'a> {
-        name: &'a str,
-        command: &'a [&'a str],
-        opt_out_flag: bool,
-        opt_out_env: bool,
-    }
-    let case = |name, command, opt_out_flag, opt_out_env| Case {
-        name,
-        command,
-        opt_out_flag,
-        opt_out_env,
-    };
+    let (no_flag, no_env) = (&[][..], &[][..]);
+    // (name, command, extra flags, env)
     let cases = [
-        case("scan, no opt-out", &scan[..], false, false),
-        case("scan, flag", &scan, true, false),
-        case("scan, env", &scan, false, true),
-        case("scan, flag, human output", &scan_human, true, false),
-        case("get, flag", &get, true, false),
-        case("get, env", &get, false, true),
+        ("scan, no opt-out", &scan[..], no_flag, no_env),
+        ("scan, flag", &scan, &flag[..], no_env),
+        ("scan, env", &scan, no_flag, &env[..]),
+        ("scan, flag, human output", &scan_human, &flag, no_env),
+        ("get, flag", &get, &flag, no_env),
+        ("get, env", &get, no_flag, &env),
     ];
-    for Case {
-        name: case,
-        command,
-        opt_out_flag,
-        opt_out_env,
-    } in cases
-    {
-        let extra: &[&str] = if opt_out_flag { &flag } else { &[] };
-        let env: &[(&str, &str)] = if opt_out_env { &env } else { &[] };
-        let opted_out = opt_out_flag || opt_out_env;
+    for (case, command, extra, env) in cases {
+        let opted_out = !extra.is_empty() || !env.is_empty();
         let (_tmp, proj, gem_dir) = fake_native_gem(true);
         let ruby = FakeRuby::new();
         let args = [command, extra, &api[..]].concat();
@@ -1243,5 +1228,9 @@ async fn the_opt_out_reaches_the_apply_that_scan_and_get_run() {
         assert!(warned, "{case}: no warning\n{stdout}\n{stderr}");
         // The build Ruby loads is still the old one: no attestation.
         assert_ne!(check, 0, "{case}: {check_out}");
+        assert!(
+            check_out.contains("native_extension_not_rebuilt"),
+            "{case}: {check_out}"
+        );
     }
 }

@@ -1798,8 +1798,7 @@ pub async fn run(args: GetArgs) -> i32 {
     let params = get_download_params(&args, args.save_only, /*persist_blobs=*/ true);
     let run = DownloadRun {
         api_client: &api_client,
-        lock_timeout: args.common.lock_timeout,
-        verbose: args.common.verbose,
+        common: &args.common,
     };
     let mut env = new_envelope(&args.common);
     // The narrowing skips came first (before any download).
@@ -2227,7 +2226,6 @@ fn get_download_params(args: &GetArgs, save_only: bool, persist_blobs: bool) -> 
         allow_patch_conflicts: args.common.allow_patch_conflicts,
         user_patch_skips_reported: false,
         ecosystems: args.common.ecosystems.clone(),
-        no_gem_native_rebuild: args.common.no_gem_native_rebuild,
         persist_blobs,
         patch_server_url: args.common.patch_server_url.clone(),
     }
@@ -4016,7 +4014,6 @@ mod tests {
             allow_patch_conflicts: false,
             user_patch_skips_reported: false,
             ecosystems: None,
-            no_gem_native_rebuild: false,
             persist_blobs: false,
             patch_server_url: None,
         }
@@ -4716,7 +4713,6 @@ mod tests {
             allow_patch_conflicts: false,
             user_patch_skips_reported: false,
             ecosystems: None,
-            no_gem_native_rebuild: false,
             // The vendor-detached posture this fn exists for.
             persist_blobs: false,
             patch_server_url: None,
@@ -5859,63 +5855,66 @@ mod tests {
         );
     }
 
-    /// The engine's variant rebuilds the same shape from `DownloadParams` +
-    /// `DownloadRun`: the run's verbosity flag, the caller's scope/mode
-    /// flags, and quiet = json || silent. No API fields: the nested apply
-    /// runs on the run's client, so `--org` need not be re-threaded.
+    /// The engine's variant starts from the caller's flags too
+    /// (`DownloadRun::common`), so a flag only apply reads reaches the
+    /// nested apply of `scan` and of `get <purl>` (#2069: the opt-out from
+    /// compiling a gem's extension, and the Maven patch-service flags),
+    /// with the scope and consent fields `DownloadParams` owns on top and
+    /// quiet = json || silent.
     #[test]
-    fn nested_apply_args_from_params_carry_run_flags() {
+    fn nested_apply_args_from_params_start_from_the_callers_flags() {
         let client = ApiClient::new(socket_patch_core::api::client::ApiClientOptions {
             api_url: "http://127.0.0.1:1".into(),
             api_token: None,
             route: socket_patch_core::api::client::ApiRoute::Proxy,
         });
-        let run = DownloadRun {
-            api_client: &client,
-            lock_timeout: Some(7),
+        let common = GlobalArgs {
             verbose: true,
+            lock_timeout: Some(7),
+            no_gem_native_rebuild: true,
+            vendor_url: Some("https://vendor.test".into()),
+            patch_server_url: Some("https://patch.test".into()),
+            vendor_source: "auto".into(),
+            maven_config: Some("none".into()),
+            // Overridden: the nested apply is a real, non-JSON run.
+            json: true,
+            dry_run: true,
+            ..GlobalArgs::default()
         };
-        let params = dl_params();
-        let nested =
-            nested_apply_args_from_params(&params, &run, Path::new(".socket/manifest.json"));
-        assert!(nested.verbose);
-        assert!(
-            nested.org.is_none() && nested.api_token.is_none(),
-            "API fields are never threaded through params: the nested apply runs on the run's client"
-        );
-        assert!(nested.silent, "json || silent params run a quiet apply");
-        assert!(!nested.json && !nested.dry_run);
-        assert!(!nested.no_gem_native_rebuild, "rebuilding is the default");
-    }
-
-    /// The caller flags the nested apply acts on survive the rebuild from
-    /// `DownloadParams`: `scan --no-gem-native-rebuild` (or its env form,
-    /// which clap reads into the same field) must not have its apply
-    /// compile a gem's extension (#2069).
-    #[test]
-    fn nested_apply_args_from_params_carry_the_apply_flags() {
-        let client = ApiClient::new(socket_patch_core::api::client::ApiClientOptions {
-            api_url: "http://127.0.0.1:1".into(),
-            api_token: None,
-            route: socket_patch_core::api::client::ApiRoute::Proxy,
-        });
         let run = DownloadRun {
             api_client: &client,
-            lock_timeout: None,
-            verbose: false,
+            common: &common,
         };
         let params = DownloadParams {
+            cwd: PathBuf::from("proj"),
             strict: true,
             allow_patch_conflicts: true,
             ecosystems: Some(vec!["gem".to_string()]),
-            no_gem_native_rebuild: true,
             ..dl_params()
         };
         let nested =
             nested_apply_args_from_params(&params, &run, Path::new(".socket/manifest.json"));
+        assert!(nested.verbose);
+        assert_eq!(nested.lock_timeout, Some(7));
         assert!(nested.no_gem_native_rebuild);
+        assert_eq!(nested.vendor_url.as_deref(), Some("https://vendor.test"));
+        assert_eq!(
+            nested.patch_server_url.as_deref(),
+            Some("https://patch.test")
+        );
+        assert_eq!(nested.vendor_source, "auto");
+        assert_eq!(nested.maven_config.as_deref(), Some("none"));
+        // The engine's own scope and consent win over the caller's.
+        assert_eq!(nested.cwd, PathBuf::from("proj"));
         assert!(nested.strict && nested.allow_patch_conflicts);
         assert_eq!(nested.ecosystems, Some(vec!["gem".to_string()]));
+        assert!(nested.silent, "json || silent params run a quiet apply");
+        assert!(!nested.json && !nested.dry_run);
+        assert!(
+            Path::new(&nested.manifest_path).is_absolute(),
+            "got {}",
+            nested.manifest_path
+        );
     }
 
     /// The uuid path hands the engine the view it already fetched: the
