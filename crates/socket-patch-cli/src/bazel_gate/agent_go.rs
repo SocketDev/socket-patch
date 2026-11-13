@@ -1,9 +1,9 @@
 //! The agent Go writer's gate and the prune guard (design 3, hazards
 //! HZ-05, HZ-06 and HZ-18).
 //!
-//! Two agent-mode seams ask here. Neither changes anything for a project
-//! with no Bazel workspace file around it: the cost is the root probe's
-//! stats, and the answer is what the command did before.
+//! Two seams of agent-mode commands ask here. Neither changes anything
+//! for a project with no Bazel workspace file around it: the cost is the
+//! root probe's stats, and the answer is what the command did before.
 //!
 //! - [`Gate`] is what `apply` hands the Go writer
 //!   (`patch::redirect::golang_local`). A directory `replace` in `go.mod`
@@ -360,8 +360,8 @@ fn kept_by_hubs(loaded: &Loaded, lanes: &LaneTable, records: &[Record]) -> Kept 
             more => format!(" and {more} more"),
         };
         kept.said.push(format!(
-            "kept {} that the Bazel build may still use ({}{more}): {reason}, so what Bazel \
-             builds from is not known",
+            "kept {} that the Bazel build may still use ({}{more}); what Bazel builds from is \
+             not known: {reason}",
             plural(purls.len(), "manifest entry", "manifest entries"),
             named.join(", ")
         ));
@@ -659,6 +659,27 @@ mod tests {
         std::fs::remove_file(outer.at(".bazelversion")).expect("remove");
         let gate = Gate::over(&GlobalArgs::default(), &lanes::PRODUCTION);
         assert!(!gate.bazel(&outer.at("nested")));
+    }
+
+    /// Nested roots each build the project, and they are not one build:
+    /// a hub in the outer one that names the project's `go.mod` refuses
+    /// the write, whatever the inner root declares (design 3, HZ-04).
+    #[test]
+    fn a_go_hub_of_an_outer_root_refuses_a_project_under_nested_roots() {
+        let nested = GO_DEPS.replace("//:go.mod", "//svc:go.mod");
+        let files = [
+            ("MODULE.bazel", nested.as_str()),
+            (".bazelversion", "9.3.2\n"),
+            ("svc/WORKSPACE", ""),
+            ("svc/go.mod", GO_MOD),
+        ];
+        let repo = Repo::new(&files);
+        for table in [&lanes::PRODUCTION, &TOY_TABLE] {
+            let refused = refusal(repo.asked("svc", table));
+            assert_eq!(refused.refused.code, Code::AgentGoUnsupported);
+            assert_eq!(refused.refused.token, Some(gate::NESTED_BAZEL_ROOTS));
+            assert_eq!(refused.refused.lift, Some(Lift::Owner("O15")));
+        }
     }
 
     #[test]
