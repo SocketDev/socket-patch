@@ -35,9 +35,9 @@ use socket_patch_core::bazel::lanes::{self, refuse};
 use socket_patch_core::bazel::model::{
     Anchor, AttestBasis, BazelRef, BazelWorkspace, CellClaim, ClaimSystem, Code, FileText,
     FileView, Files, GateOutcome, Governance, HubId, Index, IndexRow, LaneCx, LaneId, LaneOps,
-    LaneSpec, LaneTable, Lift, Mode, OwnedWrite, PatchRequest, Plan, PlannedWrite, Reason,
-    RestoreOutcome, RootRef, Ruleset, RunPolicy, TextRead, TokenSurface, VexWithhold, WithholdKind,
-    WriteClass,
+    LaneSpec, LaneTable, Lift, Mode, OwnedWrite, PatchRequest, PinSource, Plan, PlannedWrite,
+    Reason, RestoreOutcome, RootRef, Ruleset, RunPolicy, TextRead, TokenSurface, VexWithhold,
+    WithholdKind, WriteClass,
 };
 use socket_patch_core::bazel::owned_index::{IndexEdit, INDEX_PATH};
 use socket_patch_core::crawlers::types::Ecosystem;
@@ -208,6 +208,7 @@ fn toy_gate(cx: &LaneCx<'_>, req: &PatchRequest<'_>) -> GateOutcome {
             PlannedWrite::Owned(OwnedWrite::Index),
         ],
         repositories: Vec::new(),
+        artifacts: Vec::new(),
         advisories: Vec::new(),
         attest: AttestBasis::BazelLock,
         anchor: Anchor::Digest,
@@ -226,17 +227,17 @@ fn edit(path: &str, key: &str, original: &str, new: &str) -> FileEdit {
 }
 
 /// The pin: the package's URL and digest become the patch's.
-fn toy_rewrite(
-    cx: &LaneCx<'_>,
-    files: &mut Files,
-    overrides: &[DepOverride],
-    result: &mut RewriteResult,
-) {
+fn toy_rewrite(cx: &LaneCx<'_>, files: &mut Files, pins: &[PinSource], result: &mut RewriteResult) {
     let Some(lock) = lock_of(cx) else { return };
     let Some(mut text) = files.get(&lock).cloned() else {
         return;
     };
-    for dep in overrides {
+    // A hosted lane: a vendored pin is not this writer's.
+    let hosted = pins.iter().filter_map(|pin| match pin {
+        PinSource::Hosted(dep) => Some(dep),
+        PinSource::Vendored(_) => None,
+    });
+    for dep in hosted {
         let (Some(doc), Some(sha256)) = (parse(&text), dep.integrity.sha256.as_deref()) else {
             continue;
         };
@@ -579,7 +580,7 @@ fn wire(tree: &mut Tree, index: &mut Index) -> Plan {
     let mut result = RewriteResult::default();
     {
         let cx = lane_cx(tree, &ws, index);
-        (TOY.rewrite_owned)(&cx, &mut files, &[grant()], &mut result);
+        (TOY.rewrite_owned)(&cx, &mut files, &[PinSource::Hosted(grant())], &mut result);
         (TOY.fixups)(&cx, &mut files, &plan, &mut result);
     }
     let text = |value: &Option<Value>| value.as_ref().and_then(Value::as_str).unwrap().to_string();
@@ -708,7 +709,7 @@ fn the_toy_lane_wires_attests_and_restores_byte_for_byte() {
             Files::from([(LOCK.to_string(), wired.clone())]),
             RewriteResult::default(),
         );
-        (TOY.rewrite_owned)(&cx, &mut files, &[grant()], &mut again);
+        (TOY.rewrite_owned)(&cx, &mut files, &[PinSource::Hosted(grant())], &mut again);
         (TOY.fixups)(&cx, &mut files, &plan, &mut again);
         assert!(again.edits.is_empty() && again.files.is_empty() && files[LOCK] == wired);
 
@@ -920,6 +921,7 @@ fn the_gate_refuses_the_toy_lane_where_the_write_cannot_be_proven() {
             lane: LANE,
             writes: vec![PlannedWrite::NativeLock { path }],
             repositories: Vec::new(),
+            artifacts: Vec::new(),
             advisories: Vec::new(),
             attest: AttestBasis::BazelLock,
             anchor: Anchor::Digest,
