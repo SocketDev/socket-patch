@@ -4,13 +4,18 @@
 //!
 //! - rules_req_compile: its own lock dialect (`requirements.parse` tags
 //!   and `py_requirements_repository`).
-//! - rules_poetry: unmaintained; it skips every package whose source is
-//!   not `legacy`.
+//! - rules_poetry: unmaintained (no release tag; read at the last commit,
+//!   `soniaai/rules_poetry@d7a852a`, 2023-01-05). Its one repository rule
+//!   is `poetry` (`rules_poetry/poetry.bzl:252`), with the mandatory
+//!   labels `pyproject` and `lockfile` (`:254-261`); it skips every
+//!   package that has a `source` whose type is not `legacy` (`:134-137`).
 //! - bazel-deps: a generated `.bzl` of Maven pins, loaded by `WORKSPACE`.
 //! - hand-written JVM pins: `jvm_maven_import_external`,
 //!   `jvm_import_external` and `http_jar`.
-//! - cargo-raze: unmaintained; Bazel builds the generated `crates.bzl`
-//!   or vendored tree, never `Cargo.lock`.
+//! - cargo-raze: unmaintained (read at its last tag,
+//!   `google/cargo-raze@v0.16.1`); Bazel builds the generated `crates.bzl`
+//!   or vendored tree, never `Cargo.lock`. [`raze_table`] and the fetch
+//!   macro in [`workspace`] say what was read.
 //! - hubs of a module that is not the root: their locks are files of
 //!   that module's repository.
 //!
@@ -21,8 +26,8 @@
 //! modules and source archives have no Socket patches (F93).
 
 use super::rules_rust::{
-    loaded_calls, new_hub, not_literal, proxy_gaps, unread_uses, usages_of, Args, Home, LabelAttr,
-    LoadedCall,
+    loaded_calls, main_file, new_hub, not_literal, proxy_gaps, unread_uses, usages_of, Args, Home,
+    LabelAttr, LoadedCall,
 };
 use super::{RecognizeInput, Recognized};
 use crate::bazel::label::{Label, Repo};
@@ -230,8 +235,12 @@ fn req_compile(out: &mut Recognized, args: &Args<'_>, at: At<'_>) {
 }
 
 /// The byte span of the table header that makes the `Cargo.toml` at
-/// `manifest` a cargo-raze input: `[package.metadata.raze]`,
-/// `[workspace.metadata.raze]` or a table below one.
+/// `manifest` a cargo-raze input: `[workspace.metadata.raze]`,
+/// `[package.metadata.raze]`, the deprecated top-level `[raze]`, or a
+/// table below one. cargo-raze takes its settings from the first of the
+/// three that exists, in that order, and then from any package of the
+/// cargo workspace (read at cargo-raze@v0.16.1
+/// `impl/src/settings.rs:685-709`; the top-level key at `:675-682`).
 fn raze_table(view: &dyn FileView, manifest: &str) -> Option<(usize, usize)> {
     let read = view.read(manifest);
     let bytes = read.as_bytes()?;
@@ -240,7 +249,8 @@ fn raze_table(view: &dyn FileView, manifest: &str) -> Option<(usize, usize)> {
     for line in text.split_inclusive(|b| *b == b'\n') {
         let header = line.trim_ascii_start();
         let raze = |table: &[u8]| header.starts_with(table);
-        if raze(b"[package.metadata.raze") || raze(b"[workspace.metadata.raze") {
+        let metadata = raze(b"[package.metadata.raze") || raze(b"[workspace.metadata.raze");
+        if metadata || raze(b"[raze]") || raze(b"[raze.") {
             return Some((at, at + line.trim_ascii_end().len()));
         }
         at += line.len();
@@ -338,10 +348,16 @@ fn bzlmod(input: &RecognizeInput<'_>, module: &ModuleModel, out: &mut Recognized
     }
 }
 
-/// Whether a `load` binds the rule of rules_poetry
-/// (`@com_sonia_rules_poetry//rules_poetry:poetry.bzl`, README), under
-/// whatever name the `WORKSPACE` gives the repository. A function of the
-/// same name in the main repository is the user's own code.
+/// Whether a `load` binds the rule of rules_poetry: `poetry`, the one
+/// repository rule of the project (read at soniaai/rules_poetry@d7a852a
+/// `rules_poetry/poetry.bzl:252`, and under the same name with the same
+/// two labels in the file's first commit, `285b0a5`; its `defs.bzl`
+/// holds build rules and the `poetry_deps` setup macro, which names no
+/// lock). The project calls itself `com_sonia_rules_poetry`
+/// (`WORKSPACE:2`, and the stanza of `README.md:34-39`); the rule is told
+/// by its file under whatever name the `WORKSPACE` gives the repository.
+/// A function of the same name in the main repository is the user's own
+/// code.
 fn is_poetry(label: Option<&Label>, symbol: &str) -> bool {
     let file = |l: &Label| l.package == "rules_poetry" && l.name == "poetry.bzl";
     symbol == "poetry" && label.is_some_and(|l| l.repo != Repo::Main && file(l))
@@ -386,7 +402,11 @@ fn workspace(input: &RecognizeInput<'_>, ws: &WorkspaceModel, out: &mut Recogniz
             );
             continue;
         }
-        let main = label.repo == Repo::Main;
+        // The main repository, by `//` or by the workspace's own name: the
+        // examples of cargo-raze load their generated files as
+        // `@cargo_raze_examples//...` (v0.16.1 `examples/repositories.bzl:3`).
+        let home = Home::Workspace(ws);
+        let main = main_file(input, &load.load.module, Some(""), home).is_some();
         let at = (found.site(), found.stmt.line, symbol);
         let found = match (label.package.as_str(), label.name.as_str(), symbol) {
             _ if is_poetry(Some(label), symbol) => {
@@ -422,10 +442,23 @@ fn workspace(input: &RecognizeInput<'_>, ws: &WorkspaceModel, out: &mut Recogniz
                 let kind = ReportOnlyKind::BazelDeps;
                 hub(kind, Ecosystem::Maven, decl, vec![lock], pins.count())
             }
-            // `raze_fetch_remote_crates`, or the same under the project's
-            // `gen_workspace_prefix` (cargo-raze README).
+            // The function cargo-raze generates in remote mode, named
+            // after the project's `gen_workspace_prefix` (`raze` unless
+            // set), in `crates.bzl` under the project's `workspace_path`.
+            // Read at cargo-raze@v0.16.1:
+            // `impl/src/rendering/templates/remote_crates.bzl.template:9`,
+            // `impl/src/settings.rs:76-82` and `:305-307`,
+            // `impl/src/rendering/bazel.rs:434`. The manifest with the
+            // settings is in that directory or above it: the project's
+            // own examples keep it one level up
+            // (`examples/remote/cargo_workspace/Cargo.toml:8-10`).
             (dir, "crates.bzl", fetch) if main && fetch.ends_with("_fetch_remote_crates") => {
-                cargo_raze(input.files, found.site(), &[dir, ""])
+                let mut dirs = vec![dir];
+                while let Some((parent, _)) = dirs[dirs.len() - 1].rsplit_once('/') {
+                    dirs.push(parent);
+                }
+                dirs.extend((!dir.is_empty()).then_some(""));
+                cargo_raze(input.files, found.site(), &dirs)
             }
             _ => continue,
         };
@@ -805,6 +838,126 @@ mod tests {
             run(recognize, &[("Cargo.toml", vendored)]),
             Recognized::default()
         );
+    }
+
+    /// cargo-raze names the fetch macro after the project's
+    /// `gen_workspace_prefix` (cargo-raze@v0.16.1
+    /// `impl/src/rendering/templates/remote_crates.bzl.template:9`). The
+    /// layout is that of its own examples (`examples/WORKSPACE`,
+    /// `examples/repositories.bzl:5` and `:14`,
+    /// `examples/remote/cargo_workspace/Cargo.toml:8-11`): a macro file
+    /// loads the generated file by the workspace's own name, and the
+    /// manifest with the settings is one directory above `crates.bzl`.
+    #[test]
+    fn cargo_raze_under_another_prefix_is_told_by_its_fetch_macro() {
+        let root = "workspace(name = \"cargo_raze_examples\")\n\n\
+             load(\"//:repositories.bzl\", \"repositories\")\n\nrepositories()\n";
+        let macros = "load(\"@cargo_raze_examples//remote/cargo_workspace/cargo:crates.bzl\", \
+             \"remote_cargo_workspace_fetch_remote_crates\")\n\n\
+             def repositories():\n    remote_cargo_workspace_fetch_remote_crates()\n";
+        let manifest =
+            "[workspace]\nmembers = [\n    \"num_printer\",\n    \"printer\",\n    \"rng\",\n]\n\n\
+             [workspace.metadata.raze]\nworkspace_path = \"//remote/cargo_workspace/cargo\"\n\
+             gen_workspace_prefix = \"remote_cargo_workspace\"\ngenmode = \"Remote\"\n";
+        let generated = "def remote_cargo_workspace_fetch_remote_crates():\n    pass\n";
+        let files = [
+            ("WORKSPACE", root),
+            ("repositories.bzl", macros),
+            ("remote/cargo_workspace/Cargo.toml", manifest),
+            ("remote/cargo_workspace/cargo/crates.bzl", generated),
+        ];
+        let found = run(recognize, &files);
+        let [hub] = &found.hubs[..] else {
+            panic!("one hub: {:?}", found.hubs)
+        };
+        assert_eq!(
+            (detail(hub).kind, hub.ecosystem),
+            (ReportOnlyKind::CargoRaze, Ecosystem::Cargo)
+        );
+        assert_eq!(
+            (hub.decl.site.file.as_str(), hub.decl.site.system),
+            ("repositories.bzl", DeclSystem::Workspace)
+        );
+        assert_eq!(
+            paths(hub),
+            [
+                ("remote/cargo_workspace/Cargo.toml", LockRole::Config),
+                ("remote/cargo_workspace/Cargo.lock", LockRole::PackageLock)
+            ]
+        );
+        assert!(found.gaps.is_empty() && found.signals.is_empty());
+
+        // The name another repository's `crates.bzl` exports is that
+        // repository's macro, and a workspace of another name is one.
+        let other = files[0].1.replace("cargo_raze_examples", "app");
+        let found = run(
+            recognize,
+            &[("WORKSPACE", other.as_str()), files[1], files[2], files[3]],
+        );
+        assert!(found.hubs.is_empty(), "{:?}", found.hubs);
+
+        // cargo-raze's own setup (v0.16.1 `repositories.bzl:5` and `:62`,
+        // settings in `impl/Cargo.toml`): the manifest is somewhere this
+        // reader does not look, and the files beside the generated
+        // `crates.bzl` are named.
+        let found = workspace(
+            "load(\"//third_party/cargo:crates.bzl\", \"cargo_raze_fetch_remote_crates\")\n\
+             cargo_raze_fetch_remote_crates()\n",
+        );
+        let [hub] = &found.hubs[..] else {
+            panic!("one hub: {:?}", found.hubs)
+        };
+        assert_eq!(detail(hub).kind, ReportOnlyKind::CargoRaze);
+        assert_eq!(
+            paths(hub),
+            [
+                ("third_party/cargo/Cargo.toml", LockRole::Config),
+                ("third_party/cargo/Cargo.lock", LockRole::PackageLock)
+            ]
+        );
+
+        // A function that only ends like the generated one, loaded from a
+        // file of another name, is the user's own.
+        let found = workspace(
+            "load(\"//cargo:deps.bzl\", \"raze_fetch_remote_crates\")\nraze_fetch_remote_crates()\n",
+        );
+        assert!(found.hubs.is_empty());
+    }
+
+    /// The deprecated top-level `[raze]` table is still read
+    /// (cargo-raze@v0.16.1 `impl/src/settings.rs:675-682` and `:699-706`):
+    /// a vendored project that keeps its settings there has no fetch
+    /// macro, and the table is the declaration.
+    #[test]
+    fn the_legacy_raze_table_declares_a_vendored_project() {
+        let module = ("MODULE.bazel", "module(name = \"app\")\n");
+        let legacy =
+            "[package]\nname = \"deps\"\nversion = \"0.1.0\"\n\n[raze]\nworkspace_path = \"//cargo\"\n";
+        let found = run(recognize, &[module, ("Cargo.toml", legacy)]);
+        let [hub] = &found.hubs[..] else {
+            panic!("one hub: {:?}", found.hubs)
+        };
+        assert_eq!(detail(hub).kind, ReportOnlyKind::CargoRaze);
+        assert_eq!(
+            paths(hub),
+            [
+                ("Cargo.toml", LockRole::Config),
+                ("Cargo.lock", LockRole::PackageLock)
+            ]
+        );
+        let (start, end) = hub.decl.site.span;
+        assert_eq!(&legacy[start..end], "[raze]");
+        let below = legacy.replace("[raze]", "[raze.crates.ring.'*']");
+        assert_eq!(
+            run(recognize, &[module, ("Cargo.toml", &below)]).hubs.len(),
+            1
+        );
+        // A table of another name is none.
+        for other in ["[razer]", "[raze-settings]", "[dependencies.raze]"] {
+            let manifest = legacy.replace("[raze]", other);
+            let found = run(recognize, &[module, ("Cargo.toml", &manifest)]);
+            assert!(found.hubs.is_empty(), "{other}");
+        }
     }
 
     /// A repository the root imports from an extension it gives no tag

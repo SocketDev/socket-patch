@@ -372,7 +372,8 @@ listed_enum! {
         GoRepository,
         /// Row 19: crate_universe with a `lockfile`.
         CrateUniverseLocked,
-        /// Row 20: WORKSPACE `crates_repository` without one.
+        /// Row 20: a `crates_repository` call without one, in a `WORKSPACE`
+        /// file or through `use_repo_rule` in `MODULE.bazel`.
         CratesRepositoryUnlocked,
         /// Row 21: Bzlmod crate_universe without one.
         CrateUniverseUnlocked,
