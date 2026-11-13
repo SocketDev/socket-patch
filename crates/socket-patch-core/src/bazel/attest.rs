@@ -821,6 +821,7 @@ impl<'a> Attest<'a> {
             lane: pin.lane,
             writes: rc.iter().map(provider).collect(),
             repositories: Vec::new(),
+            artifacts: Vec::new(),
             advisories: Vec::new(),
             attest: pin.basis,
             anchor: Anchor::Digest,

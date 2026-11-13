@@ -1215,9 +1215,107 @@ pub struct Plan {
     ///
     /// Revision 4, 2.1 draws `Plan` without it; this field amends it.
     pub repositories: Vec<String>,
+    /// The vendored artifacts the plan's pins name (revision 4, 2.10). The
+    /// vendored seam puts each in place, with the digest checked, before
+    /// the plan is handed to `bazel::exec`: an artifact is a provider, and
+    /// nothing reads it until the pin lands. Empty for a hosted plan.
+    ///
+    /// Revision 4, 2.1 draws `Plan` without it; this field amends it.
+    pub artifacts: Vec<ArtifactSpec>,
     pub advisories: Vec<Advisory>,
     pub attest: AttestBasis,
     pub anchor: Anchor,
+}
+
+/// A digest a pin names for a vendored artifact, as lowercase hex.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Digest {
+    Sha256(String),
+    Sha512(String),
+}
+
+impl Digest {
+    /// The lowercase hex SHA-256 of `bytes`: what a [`Digest::Sha256`]
+    /// holds, and what the vendor ledger records for a file artifact.
+    pub fn sha256_hex(bytes: &[u8]) -> String {
+        crate::utils::digest::sha256_hex_of(bytes)
+    }
+
+    /// Whether `bytes` hash to this digest. The comparison is exact: a
+    /// digest that is not lowercase hex of the right length holds nothing.
+    pub fn holds(&self, bytes: &[u8]) -> bool {
+        use sha2::{Digest as _, Sha512};
+        match self {
+            Self::Sha256(hex) => Self::sha256_hex(bytes) == *hex,
+            Self::Sha512(hex) => hex::encode(Sha512::digest(bytes)) == *hex,
+        }
+    }
+}
+
+listed_enum! {
+    /// The form a vendored artifact is committed in (revision 4, 2.10).
+    /// Only [`ArtifactForm::NativeFile`] can be produced in this release;
+    /// a plan that asks for another form is refused until the vendor
+    /// engine can build it.
+    pub enum ArtifactForm {
+        /// The one file the patch service serves for the patch (a tarball,
+        /// a wheel, a jar), byte for byte.
+        NativeFile,
+        HostedArchive,
+        UpstreamOriginal,
+        ZipOfTree,
+        UnpackedTree,
+        SiblingFiles,
+    }
+}
+
+/// One vendored artifact a plan needs in place before its pin is written:
+/// where it goes, under which name, and the digest the pin will hold.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArtifactSpec {
+    /// The patch the artifact is of: the plan's.
+    pub uuid: String,
+    pub form: ArtifactForm,
+    /// Root-relative directory: `<project>/.socket/vendor/<eco>/<uuid>`.
+    pub dir: String,
+    /// The file name, which is the basename the pin's URL ends in (Bazel
+    /// looks a distdir file up by it).
+    pub leaf: String,
+    /// What the pin will name. The seam checks the bytes against it
+    /// before anything is written.
+    pub digest: Digest,
+}
+
+/// A vendored pin as a lane's writer takes it: the artifact that is in
+/// place, and what the lock entry will say about it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VendoredPin {
+    pub uuid: String,
+    /// The release the pin is for, as the gate was asked about it.
+    pub name: String,
+    pub version: String,
+    /// Root-relative path of the artifact file.
+    pub path: String,
+    pub digest: Digest,
+    pub leaf: String,
+    /// The URL the entry keeps or gains: its own upstream URL, or a
+    /// placeholder a lane derives. Never a Socket URL: a vendored pin
+    /// needs no patch host.
+    pub url: Option<String>,
+}
+
+/// What a lane's writer pins: the hosted override (token, URL, integrity)
+/// or a vendored artifact. One writer serves both modes, so a lane keeps
+/// one edit of its lock (revision 4, 2.10).
+//
+// `large_enum_variant`: the hosted override is the larger one. A pin
+// source is built once per pin and handed to the writer in a slice of a
+// few, so boxing it would add a deref to every lane and save nothing.
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug, Clone)]
+pub enum PinSource {
+    Hosted(DepOverride),
+    Vendored(VendoredPin),
 }
 
 /// The three outcomes of design principle P6, plus "not a Bazel matter".
@@ -1412,8 +1510,8 @@ pub type TextRead<'a> = &'a dyn Fn(&str) -> Option<String>;
 /// The pre-write proof of one hub. `NotBazel` is the answer for a hub
 /// whose lock does not resolve the release ([`GateOutcome::NotBazel`]).
 pub type GateFn = fn(&LaneCx<'_>, &PatchRequest<'_>) -> GateOutcome;
-/// Rewrites a Bazel-only lock.
-pub type RewriteOwnedFn = fn(&LaneCx<'_>, &mut Files, &[DepOverride], &mut RewriteResult);
+/// Rewrites a Bazel-only lock for the pins of one run, hosted or vendored.
+pub type RewriteOwnedFn = fn(&LaneCx<'_>, &mut Files, &[PinSource], &mut RewriteResult);
 /// Recomputes derived values after the native rewriter ran.
 pub type FixupsFn = fn(&LaneCx<'_>, &mut Files, &Plan, &mut RewriteResult);
 /// The lane's pins. `None` = cannot tell, which callers treat as "keep":
@@ -1471,7 +1569,7 @@ impl LaneOps {
 fn refuse_gate(_: &LaneCx<'_>, _: &PatchRequest<'_>) -> GateOutcome {
     GateOutcome::Refuse(Refusal::lane_not_enabled(LaneId::UNNAMED))
 }
-fn write_nothing(_: &LaneCx<'_>, _: &mut Files, _: &[DepOverride], _: &mut RewriteResult) {}
+fn write_nothing(_: &LaneCx<'_>, _: &mut Files, _: &[PinSource], _: &mut RewriteResult) {}
 fn fix_nothing(_: &LaneCx<'_>, _: &mut Files, _: &Plan, _: &mut RewriteResult) {}
 fn cannot_discover(_: &LaneCx<'_>, _: TextRead<'_>) -> Option<Vec<BazelRef>> {
     None

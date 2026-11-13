@@ -154,7 +154,66 @@ pub struct WiringRecord {
     pub new: Option<serde_json::Value>,
 }
 
+/// The `kind` of the record of an artifact that a Bazel root's owned
+/// index wires ([`WiringRecord::bazel_index`]).
+pub const BAZEL_INDEX_KIND: &str = "bazel_index";
+
+/// What a [`WiringRecord::bazel_index`] record says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BazelIndexRecord<'a> {
+    /// Where the project sits under the Bazel root, `""` at the root.
+    pub project_rel: &'a str,
+    /// The patch whose index rows wire the artifact.
+    pub uuid: &'a str,
+    /// `apply` wrote the entry by itself, routing a package of a Bazel
+    /// build to its vendored lane (revision 4, architecture 8.4). An entry
+    /// of `vendor` or `scan --mode vendored` never carries the mark.
+    pub routed: bool,
+}
+
 impl WiringRecord {
+    /// The record of an artifact that no project file wires natively: the
+    /// rows the owned index of a Bazel root holds for the patch `uuid` do
+    /// (revision 4, 2.10). `vendor --check`, the orphan sweep and a revert
+    /// follow it to the index, never to a lock path.
+    ///
+    /// `project_rel` is where the project sits under that root, which is
+    /// how a committed record names a root above the project without a
+    /// `..` level or an absolute path: a reader holds it to what the root
+    /// probe finds, and a record that no longer matches is followed
+    /// nowhere. `file` is the index, relative to the root. The member
+    /// `routed` is written only when it is true, so an entry of `vendor`
+    /// renders as it would without the mark.
+    pub fn bazel_index(project_rel: &str, uuid: &str, routed: bool) -> Self {
+        let mut said = serde_json::json!({ "projectRel": project_rel });
+        if routed {
+            said["routed"] = serde_json::json!(true);
+        }
+        Self {
+            file: crate::bazel::owned_index::INDEX_PATH.to_string(),
+            kind: BAZEL_INDEX_KIND.to_string(),
+            action: WiringAction::Added,
+            key: Some(uuid.to_string()),
+            original: None,
+            new: Some(said),
+        }
+    }
+
+    /// What a record of kind [`BAZEL_INDEX_KIND`] says. `None` for any
+    /// other kind, and for one of this kind that does not have the shape
+    /// this build writes (which is then followed nowhere).
+    pub fn as_bazel_index(&self) -> Option<BazelIndexRecord<'_>> {
+        if self.kind != BAZEL_INDEX_KIND || self.file != crate::bazel::owned_index::INDEX_PATH {
+            return None;
+        }
+        let said = self.new.as_ref()?;
+        Some(BazelIndexRecord {
+            project_rel: said.get("projectRel")?.as_str()?,
+            uuid: self.key.as_deref()?,
+            routed: said.get("routed").and_then(|routed| routed.as_bool()) == Some(true),
+        })
+    }
+
     /// The key as user-facing warning text: verbatim, or `<unknown>` for a
     /// record without one (an older or hand-written ledger). SECURITY: the
     /// key comes from the committed, tamper-able state.json, so control
@@ -428,6 +487,12 @@ impl VendorEntry {
         } else {
             key
         }
+    }
+
+    /// The record that says a Bazel root's owned index wires this entry's
+    /// artifact, when the entry has one: the entry of a governed package.
+    pub fn bazel_index(&self) -> Option<BazelIndexRecord<'_>> {
+        self.wiring.iter().find_map(WiringRecord::as_bazel_index)
     }
 
     /// Does this entry, stored under ledger `key`, own the manifest purl
@@ -1277,6 +1342,9 @@ async fn wiring_file_refusal(rec: &WiringRecord, project_root: &Path) -> Option<
         }
         "nuget_lock_entry" => super::nuget_feed::ledger_lock_file_refusal(project_root, file),
         "maven_pom_repository" => one_of(&[super::jvm::layout::POM_FILE]),
+        // A revert follows this record to the index and writes nothing at
+        // a path the record names.
+        BAZEL_INDEX_KIND => one_of(&[crate::bazel::owned_index::INDEX_PATH]),
         // The JVM kinds: `jvm::apply` checks each record's path against its
         // kind before it reads anything. Any other kind is a newer build's.
         _ => None,
@@ -1342,6 +1410,61 @@ mod tests {
                 })),
             }],
         )
+    }
+
+    /// The record of a Bazel-wired artifact is one more `kind` of the
+    /// record every ledger already holds: it adds no member, an entry
+    /// without one renders as before, and the mark of a routed entry is
+    /// written only when it is set. A record of the kind in another shape
+    /// (a hand edit, a newer build) names no index.
+    #[test]
+    fn a_bazel_index_record_is_an_additive_kind_and_the_routed_mark_is_opt_in() {
+        let before = serde_json::to_string(&sample_entry()).expect("render");
+        assert!(sample_entry().bazel_index().is_none());
+        assert!(!before.contains("bazel_index") && !before.contains("routed"));
+
+        for (routed, project_rel) in [(false, ""), (true, "svc/api")] {
+            let mut entry = sample_entry();
+            entry.wiring = vec![WiringRecord::bazel_index(project_rel, UUID, routed)];
+            let text = serde_json::to_string(&entry).expect("render");
+            assert_eq!(text.contains("\"routed\""), routed, "{text}");
+            let read: VendorEntry = serde_json::from_str(&text).expect("parse");
+            assert_eq!(read, entry);
+            let said = BazelIndexRecord {
+                project_rel,
+                uuid: UUID,
+                routed,
+            };
+            assert_eq!(read.bazel_index(), Some(said));
+            // The members are the ones every record has.
+            let record = serde_json::to_value(&entry.wiring[0]).expect("render");
+            let members: Vec<&String> = record.as_object().expect("an object").keys().collect();
+            assert_eq!(members, ["file", "kind", "action", "key", "new"]);
+            assert_eq!(wiring_path_refusal(&entry.wiring[0].file), None);
+        }
+
+        let mut odd = WiringRecord::bazel_index("", UUID, false);
+        odd.file = "MODULE.bazel".into();
+        assert_eq!(odd.as_bazel_index(), None, "another file is no index");
+        let mut odd = WiringRecord::bazel_index("", UUID, false);
+        odd.new = Some(serde_json::json!({ "routed": true }));
+        assert_eq!(odd.as_bazel_index(), None, "no place under a root");
+        let mut odd = WiringRecord::bazel_index("", UUID, true);
+        odd.new = Some(serde_json::json!({ "projectRel": "", "routed": "yes" }));
+        assert!(!odd.as_bazel_index().expect("a record").routed);
+    }
+
+    /// A ledger must not aim a revert at another file through the Bazel
+    /// record either: the kind names the index and nothing else.
+    #[tokio::test]
+    async fn a_bazel_index_record_that_names_another_file_is_refused() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut entry = sample_entry();
+        entry.wiring = vec![WiringRecord::bazel_index("", UUID, false)];
+        assert_eq!(wiring_refusal(&entry, tmp.path()).await, None);
+        entry.wiring[0].file = ".github/workflows/ci.yml".into();
+        let refusal = wiring_refusal(&entry, tmp.path()).await.expect("refused");
+        assert!(refusal.contains("never edits"), "{refusal}");
     }
 
     /// A cargo entry migrated from the pre-v5 `.cargo/config.toml` wiring to

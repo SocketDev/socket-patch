@@ -22,6 +22,9 @@ pub(crate) struct OrphanSweep {
     pub(crate) still_wired: Vec<vendor::path::SweptVendorDir>,
     /// Un-ledgered and unreferenced, but the delete failed (the error).
     pub(crate) failed: Vec<(vendor::path::SweptVendorDir, String)>,
+    /// Un-ledgered, and a Bazel workspace above the project uses them or
+    /// cannot say that it does not — kept.
+    pub(crate) kept_for_bazel: Vec<vendor::path::SweptVendorDir>,
 }
 
 /// Sweep the uuid dirs under `.socket/vendor/<eco>/` with no owning
@@ -86,6 +89,17 @@ pub(crate) async fn sweep_orphan_vendor_dirs_where(
             out.still_wired.push(unit);
             continue;
         }
+        // No lockfile names it, and a Bazel build reads its artifacts
+        // through other files: a row of the root's owned index, or a pin
+        // only a lane can find. "Cannot tell" keeps the directory.
+        let eco = vendor::jvm::layout::ledger_ecosystem(&unit.eco);
+        let ecosystems = socket_patch_core::crawlers::Ecosystem::all().iter();
+        let ecosystem = ecosystems.copied().find(|e| e.cli_name() == eco);
+        let in_use = crate::bazel_gate::vendored::in_use_blocking(cwd, ecosystem, None, &unit.uuid);
+        if in_use.await != Some(false) {
+            out.kept_for_bazel.push(unit);
+            continue;
+        }
         if !dry_run {
             if let Err(e) = remove_tree_and_prune(&unit.dir, &stop_dir).await {
                 out.failed.push((unit, e.to_string()));
@@ -126,6 +140,19 @@ pub(crate) fn orphan_still_wired(unit: &vendor::path::SweptVendorDir) -> VendorW
             "a project lockfile still points at .socket/vendor/{}/{}, which no ledger \
              entry owns; the artifacts were kept ({UNLEDGERED_WIRING_REMEDY}, then revert \
              again)",
+            unit.eco, unit.uuid
+        ),
+    )
+}
+
+/// The advisory for an orphan uuid dir the sweep kept because a Bazel
+/// workspace governs the project: a row of its owned index names the
+/// patch, or no enabled lane can say that the build reads none of it.
+pub(crate) fn orphan_kept_for_bazel(unit: &vendor::path::SweptVendorDir) -> VendorWarning {
+    VendorWarning::new(
+        "vendor_orphan_still_wired",
+        format!(
+            "no ledger entry owns .socket/vendor/{}/{}, and whether the Bazel build of this              workspace still reads it is not known to socket-patch (a row of the owned index              names the patch, or no enabled lane can tell); the artifacts were kept. Delete              the directory by hand once no file Bazel reads names it",
             unit.eco, unit.uuid
         ),
     )

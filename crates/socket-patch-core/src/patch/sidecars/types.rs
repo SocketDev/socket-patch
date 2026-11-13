@@ -123,6 +123,12 @@ pub struct SidecarAdvisory {
 ///   home every build of this account reads, not just this project.
 /// * `GradleJarLockedByDaemon` — Windows refused the write because a
 ///   process (normally a Gradle daemon) holds the jar open.
+/// * `BazelAgentCoursierPinHazard` — a jar patched in a Coursier or
+///   Maven cache has a coordinate that a rules_jvm_external hub resolves
+///   from its lock: the hub's next pin run from this cache would record
+///   the patched jar's digest as if it were the upstream one. The tag is
+///   the code `bazel::codes::Code::AgentCoursierPinHazard` of the
+///   contract's Bazel section.
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SidecarAdvisoryCode {
@@ -135,6 +141,7 @@ pub enum SidecarAdvisoryCode {
     GradleDaemonStale,
     GradleGlobalCacheShared,
     GradleJarLockedByDaemon,
+    BazelAgentCoursierPinHazard,
 }
 
 /// Severity bucket. UI consumers use this for badge color; jq
@@ -242,6 +249,11 @@ mod tests {
             (
                 SidecarAdvisoryCode::GradleJarLockedByDaemon,
                 "gradle_jar_locked_by_daemon",
+            ),
+            // One code, defined once: the tag is the Bazel contract's.
+            (
+                SidecarAdvisoryCode::BazelAgentCoursierPinHazard,
+                crate::bazel::codes::Code::AgentCoursierPinHazard.as_str(),
             ),
         ];
         for (variant, expected) in cases {
