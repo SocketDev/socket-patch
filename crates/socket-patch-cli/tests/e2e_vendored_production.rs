@@ -325,8 +325,8 @@ fn has_corepack_pm(pm: &str) -> bool {
 /// test process and fails if one reaches the child), and forces
 /// `SOCKET_NO_CONFIG=1` to block the socket-cli
 /// config.json. The crawler's own ambient inputs are scrubbed too
-/// (`hermetic::CRAWLER_EXTRAS`: an activated venv, `BUNDLE_*`, `COMPOSER_*`),
-/// so an ambient BUNDLE_PATH can't move the gem leg's crawl off
+/// (`hermetic::CRAWLER_EXTRAS`: an activated venv, `BUNDLE_*`, `COMPOSER_*`,
+/// `GOFLAGS`/`GOMODCACHE` and friends), so an ambient BUNDLE_PATH can't move the gem leg's crawl off
 /// `vendor/bundle`.
 fn run_socket(cwd: &Path, args: &[&str]) -> (i32, String, String) {
     let mut cmd = hermetic::binary_command();

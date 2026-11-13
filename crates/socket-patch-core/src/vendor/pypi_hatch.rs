@@ -177,7 +177,7 @@ async fn require_no_raw_workspace(
 }
 
 fn require_pip_installer() -> Result<(), Failure> {
-    if std::env::var("HATCH_ENV_TYPE_VIRTUAL_UV_PATH").is_ok_and(|path| !path.is_empty()) {
+    if crate::utils::hatch::uv_path_override() {
         return Err(("pypi_hatch_unsupported", "vendored Hatch wheels require the pip installer: uv does not enforce local wheel fragment hashes".into()));
     }
     Ok(())

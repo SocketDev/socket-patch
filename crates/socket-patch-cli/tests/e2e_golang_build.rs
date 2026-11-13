@@ -88,6 +88,9 @@ fn run_socket(cwd: &Path, args: &[&str], modcache: &Path) -> (i32, String, Strin
 fn go(dir: &Path, args: &[&str], env: &[(&str, &str)]) -> std::process::Output {
     let mut cmd = Command::new("go");
     cmd.args(args).current_dir(dir);
+    // No ambient `GOWORK`/`GOFLAGS`/`go env -w` file: an exported
+    // `GOWORK=<file>` fails every `go mod download` in `stage`.
+    common::hermetic::scrub_extra(&mut cmd, &[common::hermetic::Extra::Go]);
     cache_env::isolate(&mut cmd);
     for (k, v) in env {
         cmd.env(k, v);

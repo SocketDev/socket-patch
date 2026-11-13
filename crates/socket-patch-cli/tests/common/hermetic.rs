@@ -267,15 +267,24 @@ pub enum Extra {
     /// fixture's `vendor/`. The pin outranks `XDG_CONFIG_HOME` and holds
     /// no config. Run it before the suite sets its own `COMPOSER_*` values.
     Composer,
+    /// `GOFLAGS`, `GOWORK`, `GOPATH` and `GOMODCACHE` removed, then
+    /// `GOENV=off`. The go crawler finds installed modules through
+    /// `GOMODCACHE`/`GOPATH`, and Go apply, `vex` and `vendor` honor
+    /// `GOFLAGS=-modfile` and `GOWORK` (`utils::go_env`), so an ambient
+    /// value moves the crawl off the fixture or turns a replace into a
+    /// refusal. `GOENV=off` stops the same keys arriving from the user's
+    /// `go env -w` file. Tests that need a value set it after the scrub.
+    Go,
 }
 
 /// The [`Extra`] scrubs for a `socket-patch` child that crawls a real
 /// project tree: the binary's own crawlers read `VIRTUAL_ENV`, bundler's
-/// `BUNDLE_PATH`/`BUNDLE_APP_CONFIG`/`BUNDLE_GEMFILE` and Composer's vendor
-/// dir and home, so an ambient value moves discovery (and the installed
-/// evidence `vex` hashes) off the fixture. Any env the test sets after the
-/// scrub still wins. Apply it with [`scrub_crawler_inputs`].
-pub const CRAWLER_EXTRAS: [Extra; 3] = [Extra::Venv, Extra::Bundle, Extra::Composer];
+/// `BUNDLE_PATH`/`BUNDLE_APP_CONFIG`/`BUNDLE_GEMFILE`, Composer's vendor
+/// dir and home, and Go's module cache and flags, so an ambient value
+/// moves discovery (and the installed evidence `vex` hashes) off the
+/// fixture. Any env the test sets after the scrub still wins. Apply it
+/// with [`scrub_crawler_inputs`].
+pub const CRAWLER_EXTRAS: [Extra; 4] = [Extra::Venv, Extra::Bundle, Extra::Composer, Extra::Go];
 
 /// Where [`scrub_crawler_inputs`] points `BUNDLE_USER_CONFIG`.
 pub const NO_BUNDLE_USER_CONFIG: &str = "/nonexistent/bundle-user-config";
@@ -364,6 +373,12 @@ pub fn scrub_extra(cmd: &mut Command, extras: &[Extra]) {
                     }
                 }
                 cmd.env("COMPOSER_HOME", "/nonexistent/composer-home");
+            }
+            Extra::Go => {
+                for key in ["GOFLAGS", "GOWORK", "GOPATH", "GOMODCACHE"] {
+                    cmd.env_remove(key);
+                }
+                cmd.env("GOENV", "off");
             }
         }
     }

@@ -305,7 +305,7 @@ fn has_command(cmd: &str) -> bool {
 /// immediately instead of letting a developer's ambient shell decide what got
 /// tested. The crawler's own ambient inputs are scrubbed too
 /// (`hermetic::CRAWLER_EXTRAS`: an activated venv, `BUNDLE_*`,
-/// `COMPOSER_*`): the hosted scan discovers packages unscoped under the cwd.
+/// `COMPOSER_*`, `GOFLAGS`/`GOMODCACHE` and friends): the hosted scan discovers packages unscoped under the cwd.
 fn run(cwd: &Path, args: &[&str]) -> (i32, String, String) {
     let mut cmd = hermetic::binary_command();
     hermetic::scrub_crawler_inputs(&mut cmd);

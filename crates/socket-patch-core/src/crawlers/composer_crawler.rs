@@ -772,8 +772,26 @@ fn global_vendor_dir_sync(composer_home: &Path) -> Option<PathBuf> {
         manifest.as_deref(),
         true,
         || read("config.json"),
-        &|name| std::env::var_os(name),
+        &process_var,
     )
+}
+
+/// The process environment the vendor-dir lookups read
+/// (`COMPOSER_VENDOR_DIR`, and `COMPOSER_HOME` / `HOME` / `APPDATA` for the
+/// user-level `config.json`).
+#[cfg(not(test))]
+fn process_var(name: &str) -> Option<OsString> {
+    std::env::var_os(name)
+}
+
+/// In the unit tests, only the vars a test holds with an
+/// [`EnvGuard`](crate::test_env::EnvGuard). A developer's
+/// `COMPOSER_VENDOR_DIR`, or a `vendor-dir` in their own Composer
+/// `config.json` (found through `HOME`), would otherwise move every
+/// fixture's vendor tree.
+#[cfg(test)]
+fn process_var(name: &str) -> Option<OsString> {
+    crate::test_env::guarded_var_os(name)
 }
 
 /// Resolve the vendor directory of a local project the way Composer does
@@ -798,7 +816,7 @@ async fn resolve_local_vendor_dir(cwd: &Path) -> Option<PathBuf> {
 /// a synchronous path after the run, and must name the directory Composer
 /// actually installed into, not a hardcoded `vendor/`.
 pub fn resolve_local_vendor_dir_sync(cwd: &Path) -> Option<PathBuf> {
-    let var = |name: &str| std::env::var_os(name);
+    let var = process_var;
     let read = |path: &Path| crate::utils::fs::read_regular_to_string_sync(path).ok();
     let manifest = read(&cwd.join("composer.json"));
     let user_config =
@@ -819,7 +837,7 @@ pub fn resolve_local_vendor_dir_sync(cwd: &Path) -> Option<PathBuf> {
 /// file exists, or when the directory cannot be resolved at all (a
 /// placeholder naming nothing).
 pub fn local_install_unread(cwd: &Path) -> bool {
-    local_install_unread_with(cwd, &|name| std::env::var_os(name))
+    local_install_unread_with(cwd, &process_var)
 }
 
 fn local_install_unread_with(cwd: &Path, var: &impl Fn(&str) -> Option<OsString>) -> bool {
@@ -2513,5 +2531,50 @@ mod tests {
                 "vacuous fixtures: {crawled}/{found}"
             );
         }
+    }
+
+    /// The unit tests see only the Composer env a test holds: a host
+    /// `COMPOSER_VENDOR_DIR` must not move a fixture's vendor tree.
+    #[test]
+    #[serial_test::serial]
+    fn vendor_dir_lookups_ignore_the_hosts_composer_env() {
+        use crate::test_env::EnvGuard;
+        /// Sets a var raw, as a host would (an `EnvGuard` would make it
+        /// visible), and puts the previous value back on drop, a failed
+        /// assertion included. Only the lookups this test covers read
+        /// `COMPOSER_VENDOR_DIR`.
+        struct HostVar(&'static str, Option<std::ffi::OsString>);
+        impl HostVar {
+            fn set(key: &'static str, value: &str) -> Self {
+                let previous = std::env::var_os(key);
+                std::env::set_var(key, value);
+                Self(key, previous)
+            }
+        }
+        impl Drop for HostVar {
+            fn drop(&mut self) {
+                match self.1.take() {
+                    Some(value) => std::env::set_var(self.0, value),
+                    None => std::env::remove_var(self.0),
+                }
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path();
+        {
+            let _host = HostVar::set("COMPOSER_VENDOR_DIR", "from-host");
+            assert_eq!(
+                resolve_local_vendor_dir_sync(project),
+                Some(project.join("vendor")),
+                "host env hidden"
+            );
+        }
+
+        let _var = EnvGuard::set("COMPOSER_VENDOR_DIR", "held");
+        assert_eq!(
+            resolve_local_vendor_dir_sync(project),
+            Some(project.join("held")),
+            "a value the test holds is honoured"
+        );
     }
 }

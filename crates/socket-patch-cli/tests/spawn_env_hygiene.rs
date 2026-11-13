@@ -709,6 +709,36 @@ fn crawler_inputs_sweep_bundler_and_composer_overrides() {
 }
 
 #[test]
+#[serial]
+fn crawler_inputs_sweep_go_module_cache_and_flags() {
+    with_ambient(
+        &[
+            ("GOFLAGS", "-modfile=/ambient/alt.mod"),
+            ("GOWORK", "/ambient/go.work"),
+            ("GOPATH", "/ambient/gopath"),
+            ("GOMODCACHE", "/ambient/modcache"),
+            ("GOENV", "/ambient/go-env"),
+        ],
+        || {
+            let mut cmd = hermetic::binary_command();
+            hermetic::scrub_crawler_inputs(&mut cmd);
+            let env = effective_env(&cmd);
+            for key in ["GOFLAGS", "GOWORK", "GOPATH", "GOMODCACHE"] {
+                assert_eq!(get(&env, key), None, "{key}");
+            }
+            // The user's `go env -w` file is switched off, not left to
+            // supply the same keys.
+            assert_eq!(get(&env, "GOENV"), Some("off"));
+
+            // A test's own pin, set after the scrub, survives.
+            cmd.env("GOMODCACHE", "/fixture/modcache");
+            let env = effective_env(&cmd);
+            assert_eq!(get(&env, "GOMODCACHE"), Some("/fixture/modcache"));
+        },
+    );
+}
+
+#[test]
 fn no_private_bundler_sweeps() {
     let found: Vec<String> = test_sources()
         .into_iter()
