@@ -858,3 +858,145 @@ fn a_revert_over_a_modified_index_says_that_the_line_stays() {
         assert_eq!(after.get(kept), wired.get(kept), "{kept}");
     }
 }
+
+/// A run that is interrupted while it holds the lock of the Bazel root
+/// takes that lock file out as it dies, as it does the project's: the
+/// root's lock is the bare one of `patch::apply_lock`, which is in the
+/// interrupt table. The binary is parked by a debug-only failpoint with
+/// the root's lock held, then signalled.
+#[cfg(unix)]
+mod interrupted_under_the_root_lock {
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::{Child, Stdio};
+    use std::time::{Duration, Instant};
+
+    use super::*;
+
+    /// A parked `apply`. It sleeps for good, so a test that fails before
+    /// it signals the run must not leave it behind.
+    struct Parked(Option<Child>);
+
+    impl Drop for Parked {
+        fn drop(&mut self) {
+            if let Some(mut child) = self.0.take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+
+    impl Parked {
+        /// `apply` in `project`, parked at `failpoint`.
+        fn at(ws: &Workspace, project: &Path, failpoint: &str) -> Self {
+            // Beside the workspace: the marker is in no snapshot of it.
+            let ready = ws.cache.with_file_name("failpoint-ready");
+            let mut command = crate::common::hermetic_command(&crate::common::binary());
+            crate::common::jvm_env::isolate_cli(&mut command);
+            command
+                .args(["apply", "--offline", "--json", "--ecosystems", "golang"])
+                .current_dir(project)
+                .env("GOMODCACHE", &ws.cache)
+                .env("GOFLAGS", "")
+                .env("GOWORK", "off")
+                .env("SOCKET_PATCH_FAILPOINT", format!("{failpoint}~pause"))
+                .env("SOCKET_PATCH_FAILPOINT_READY", &ready)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            let mut parked = Self(Some(command.spawn().expect("spawn socket-patch apply")));
+            let deadline = Instant::now() + Duration::from_secs(60);
+            while !ready.exists() {
+                let child = parked.0.as_mut().expect("the child");
+                if let Some(status) = child.try_wait().unwrap() {
+                    parked.0 = None;
+                    panic!("apply exited ({status}) before it reached `{failpoint}`");
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "apply never reached `{failpoint}`"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            parked
+        }
+
+        /// Sends `signal`. The run must still die by it: the handler
+        /// cleans up and hands the signal back to its default.
+        fn interrupt(mut self, signal: libc::c_int) {
+            let mut child = self.0.take().expect("the child");
+            // SAFETY: plain kill(2) on the pid of a child nobody waited for.
+            let rc = unsafe { libc::kill(child.id() as libc::pid_t, signal) };
+            assert_eq!(rc, 0, "kill({signal}) failed");
+            let status = child.wait().unwrap();
+            assert_eq!(status.signal(), Some(signal), "got {status}");
+        }
+    }
+
+    /// Every `apply.lock` under the workspace.
+    fn lock_files(ws: &Workspace) -> Vec<String> {
+        let is_lock = |path: &String| path.rsplit('/').next() == Some("apply.lock");
+        snapshot(&ws.root).into_keys().filter(is_lock).collect()
+    }
+
+    /// Interrupted before the edit: nothing of the run is left, the
+    /// directories the root's lock made included, and the next run and
+    /// its rollback behave as if the first had never started.
+    #[test]
+    fn an_interrupt_before_the_edit_leaves_the_tree_as_it_was() {
+        for (rel, signal) in [("", libc::SIGINT), ("svc/api", libc::SIGTERM)] {
+            let ws = Workspace::new();
+            let project = ws.project(rel);
+            let before = snapshot(&ws.root);
+
+            let parked = Parked::at(&ws, &project, "apply_lock.acquired_bare");
+            let mut held = vec![
+                ".socket/bazel/apply.lock".to_string(),
+                join(rel, ".socket/apply.lock"),
+            ];
+            held.sort();
+            assert_eq!(lock_files(&ws), held, "the root's lock and the project's");
+            parked.interrupt(signal);
+
+            assert_eq!(lock_files(&ws), Vec::<String>::new(), "{rel:?}");
+            assert_same_tree(&before, &snapshot(&ws.root));
+
+            let envelope = ws.applied(&project);
+            warning(&envelope, Code::WorkspaceIgnoreLineAdded);
+            ws.roll_back(&project);
+            assert_same_tree(&before, &snapshot(&ws.root));
+        }
+    }
+
+    /// Interrupted after the edit, while the lock is being let go: the
+    /// lock file goes, and what stays is the line for a copy that was not
+    /// made, which hides nothing, with its row. The next run finds the
+    /// line and makes the copy, and its rollback takes the line out by
+    /// that row.
+    #[test]
+    fn an_interrupt_after_the_edit_leaves_the_line_and_its_row_and_no_lock() {
+        let ws = Workspace::new();
+        ws.put(".bazelignore", "node_modules\r\n");
+        let project = ws.project("svc/api");
+        let before = snapshot(&ws.root);
+        let wired = "node_modules\r\nsvc/api/.socket/go-patches\r\n";
+
+        let parked = Parked::at(&ws, &project, "apply_lock.releasing_bare");
+        assert_eq!(ws.bytes(".bazelignore"), wired.as_bytes());
+        assert!(lock_files(&ws).contains(&".socket/bazel/apply.lock".to_string()));
+        parked.interrupt(libc::SIGHUP);
+
+        assert_eq!(lock_files(&ws), Vec::<String>::new());
+        assert_eq!(ws.bytes(".bazelignore"), wired.as_bytes());
+        let index: Value = serde_json::from_slice(&ws.bytes(".socket/bazel/index.json")).unwrap();
+        assert_eq!(
+            index["ignoreLines"][0]["line"], "svc/api/.socket/go-patches",
+            "{index:#}"
+        );
+        assert!(!project.join(".socket/go-patches").exists());
+
+        let envelope = ws.applied(&project);
+        assert!(warning_codes(&envelope).is_empty(), "{envelope:#}");
+        ws.roll_back(&project);
+        assert_same_tree(&before, &snapshot(&ws.root));
+    }
+}
