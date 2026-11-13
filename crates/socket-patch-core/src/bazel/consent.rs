@@ -15,36 +15,44 @@
 //! Three rules decide what is in the list:
 //!
 //! - **Only hubs Bazel may build from** ([`may_build`]): a declaration on
-//!   a hub that is proven dead, shadowed or not imported patches nothing.
+//!   a hub that is proven dead or shadowed patches nothing. One on a hub
+//!   that is a dev dependency, another module's or imported by a spoke
+//!   alone still does: Bazel builds from those.
 //! - **Own wiring is subtracted first** (revision 4, 2.2 row 6). Every
-//!   exported function takes the filter as a parameter, and the gate and
-//!   `attest` pass the same one (`exec::own_site` over the index they
-//!   hold), so a `patches` item or a tag that socket-patch wrote itself
-//!   is no user patch hook and no bypass in either.
+//!   exported function takes the filter as a parameter ([`OwnSite`]), and
+//!   the gate and `attest` pass the same one (over the index they hold),
+//!   so a `patches` item or a tag that socket-patch wrote itself is no
+//!   user patch hook and no bypass in either. The filter is asked per
+//!   item: the user's other key of a dict socket-patch added one to stays
+//!   the user's.
 //! - **Unread is not absent.** A declaration that names no single
 //!   package, a hook attribute nobody read and a use of the ruleset that
 //!   was not followed to a hub each protect every package of the
-//!   ecosystem ([`Subject::Every`]). A recognizer gap is counted wherever
-//!   it lies: a gap names a file and not the statement, so whether Bazel
-//!   evaluates it is not asked, which only protects more.
+//!   ecosystem ([`Subject::Every`]). A recognizer gap and a signal count
+//!   where Bazel may evaluate the statement, by the test
+//!   `govern::governance` applies to the same gap: one in a file Bazel
+//!   never opens declares nothing, and a refusal over it would name a
+//!   file nobody has to fix.
 //!
 //! A replacement defeats a pin outright, so it is also a bypass that
 //! `--allow-patch-conflicts` does not lift ([`bypasses`]). A patch on a
-//! hub whose hook runs the host `patch` tool is a **user patch hook**
-//! ([`user_patch_hooks`], token [`USER_PATCH_HOOK`]): probe P4 saw such a
-//! hook stack silently, fail the fetch, or reverse the same fix over the
-//! patched tarball with exit 0, so a pin written beside one is never
-//! attested.
+//! hub whose hook runs, or is not known not to run, the host `patch` tool
+//! is a **user patch hook** ([`user_patch_hooks`], token
+//! [`USER_PATCH_HOOK`]): probe P4 saw such a hook stack silently, fail
+//! the fetch, or reverse the same fix over the patched tarball with exit
+//! 0, so a pin written beside one is never attested.
 
 use super::govern::{self, WORKSPACE_UNREADABLE};
 use super::inventory::may_build;
 use super::model::{BazelWorkspace, Bypass, DeclSystem, Hub, HubId, Ruleset, RulesetDetail, Site};
+use super::rulesets::gazelle::GazelleDetail;
 use super::rulesets::rules_python::USER_OVERRIDE;
 use super::starlark::Lookup;
 use super::workspace_file::WsStmtKind;
 use crate::crawlers::python_crawler::canonicalize_pypi_name;
 use crate::crawlers::types::Ecosystem;
 use crate::utils::npm_range::npm_range_admits;
+use crate::vendor::bun_lock_text::split_name_spec;
 
 /// Every `details.token` this file names.
 pub const TOKENS: &[&str] = &["user_patch_hook"];
@@ -53,9 +61,26 @@ pub const TOKENS: &[&str] = &["user_patch_hook"];
 /// runs the host `patch` tool. `attest` withholds with it.
 pub const USER_PATCH_HOOK: &str = TOKENS[0];
 
-/// Whether a statement is socket-patch's own wiring. The gate and `attest`
-/// pass `exec::own_site` over the same index.
-pub type OwnSite<'a> = &'a dyn Fn(&Site) -> bool;
+/// Whether a statement, or one item of it, is socket-patch's own wiring.
+///
+/// The second argument is the recognizer's key of one item of the
+/// statement at the site (`UserDecl.package`: a key of a `patches` or
+/// `replace_packages` dict, the package of a tag, a local wheel). Every
+/// key of one call carries the site of the whole call, so the site alone
+/// cannot tell an item socket-patch added (a `tagEdits` row) from the
+/// user's own item beside it. `None` asks about the statement as a whole:
+/// a hub whose declaration is not literal, install patches, annotations
+/// nobody read, a use of the ruleset that led to no hub.
+///
+/// A filter answers `true` for `None` only where the whole statement is
+/// socket-patch's (it stands in an owned file). A statement of the user's
+/// that is only the target of a tag edit is never subtracted whole: the
+/// filter claims the edited item by its key and nothing else of the call.
+///
+/// The gate and `attest` pass the same filter. Until the `TagEdit`
+/// handler lands an item matcher over the `tagEdits` rows, that is
+/// `|site, _| exec::own_site(&index, site)`.
+pub type OwnSite<'a> = &'a dyn Fn(&Site, Option<&str>) -> bool;
 
 /// What a declaration is about.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -118,18 +143,45 @@ impl Evidence {
     }
 }
 
-/// Whether the hub applies a user's patches with the host `patch` tool:
-/// rules_js and rules_nodejs on every release (bazel-lib's `patch` with a
-/// `patch_directory`, and the install rules' own shell-out), and gazelle
-/// until it is proven 0.29.0 or later, where `go_repository` moved to
-/// Bazel's patcher. An unproven gazelle counts: the answer only withholds
-/// an attestation.
+/// Whether the hub applies a user's patches with the host `patch` tool,
+/// or is not known not to. "Not known" counts: the answer only withholds
+/// an attestation for a pin beside the user's own patch of the package.
+///
+/// - rules_js and rules_nodejs on every release (bazel-lib's `patch` with
+///   a `patch_directory`, and the install rules' own shell-out).
+/// - A `WORKSPACE` `go_repository` on every release. Until gazelle 0.29.0
+///   the rule shells out itself. From 0.29.0 it calls Bazel's `patch()`,
+///   which is native only when `patch_tool` is empty and every
+///   `patch_args` entry is `-p<n>` (bazel@7.7.2
+///   tools/build_defs/repo/utils.bzl:162-195), and the rule still takes
+///   both attributes (bazel-gazelle@v0.29.0 internal/go_repository.bzl).
+///   The recognizer records one bit per hook and not those attributes.
+/// - A `go_deps` hub only while gazelle is not proven 0.29.0 or later:
+///   its override tags take `patches`, `patch_strip` and `patch_cmds`
+///   only (bazel-gazelle@v0.54.0 internal/bzlmod/go_deps.bzl:1008-1057).
+///   A tag proves the release it arrived in (`module_override`: 0.31.0),
+///   so a hub with such a patch is proven as a rule.
+/// - rules_rust: `crate.annotation` passes `patch_tool` and `patch_args`
+///   through (rules_rust@0.57.1 crate_universe/private/crate.bzl:111-113),
+///   and they are not recorded either. rules_rs has the same reader of
+///   annotations; its patch path was not read, so it counts as well.
+///
+/// rules_python, rules_pycross, aspect_rules_py and rules_jvm_external
+/// patch through Bazel's own patcher or have no patch hook.
 pub fn host_patch(hub: &Hub) -> bool {
-    match hub.ruleset {
-        Ruleset::RulesJs | Ruleset::RulesNodejs => true,
-        Ruleset::Gazelle => !hub.ruleset_version.at_least("0.29.0"),
-        _ => false,
+    match (hub.ruleset, &hub.detail) {
+        (Ruleset::Gazelle, RulesetDetail::Gazelle(GazelleDetail::GoDeps(_))) => {
+            !hub.ruleset_version.at_least("0.29.0")
+        }
+        (ruleset, _) => may_host_patch(ruleset),
     }
+}
+
+/// [`host_patch`] where no hub was read: whether any hub of the ruleset
+/// may run the host `patch` tool.
+fn may_host_patch(ruleset: Ruleset) -> bool {
+    use Ruleset::{Gazelle, RulesJs, RulesNodejs, RulesRs, RulesRust};
+    [RulesJs, RulesNodejs, Gazelle, RulesRust, RulesRs].contains(&ruleset)
 }
 
 /// The ecosystem of a ruleset that has a patch or replacement hook.
@@ -158,10 +210,20 @@ fn subject(hub: &Hub, package: &str) -> Subject {
         _ if package.is_empty() || package == "*" => {
             every("a declaration here names no single package".to_string())
         }
-        // `name` or `name@version`; a scope starts with `@`.
-        Ruleset::RulesJs => match package.rsplit_once('@') {
-            Some((name, version)) if !name.is_empty() => named(name, Some(version)),
-            _ => named(package, None),
+        // `name`, `name@version` or `name@version` with the peer suffix
+        // of one snapshot (`1.2.3(peer@2.0.0)`, pnpm 5 `1.2.3_peer@2.0.0`):
+        // rules_js matches a key against all three spellings
+        // (rules_js@v3.6.0 npm/private/npm_translate_lock_helpers.bzl:526-536).
+        // A scope starts with `@` and a peer suffix holds one, so the
+        // version starts at the first `@` past the scope's. A version
+        // holds neither `(` nor `_`: what follows one is the peer set,
+        // and the key covers the release whatever its peers.
+        Ruleset::RulesJs => match split_name_spec(package) {
+            Some((name, selector)) => {
+                let version = selector.split(['(', '_']).next().unwrap_or(selector);
+                named(name, Some(version).filter(|version| !version.is_empty()))
+            }
+            None => named(package, None),
         },
         Ruleset::RulesJvmExternal => match package.split(':').collect::<Vec<_>>()[..] {
             [group, artifact] if !group.is_empty() && !artifact.is_empty() => {
@@ -169,8 +231,23 @@ fn subject(hub: &Hub, package: &str) -> Subject {
             }
             _ => every(format!("`{package}` is not a `group:artifact` coordinate")),
         },
+        // A key that cannot be a distribution name is a label (a local
+        // wheel whose file name is not a wheel's): which package it
+        // stands in for is not known.
+        Ruleset::RulesPython | Ruleset::RulesPycross | Ruleset::AspectRulesPy
+            if !package.chars().all(distribution_char) =>
+        {
+            every(format!(
+                "`{package}` is no distribution name, so the package it is for is not known"
+            ))
+        }
         _ => named(package, None),
     }
+}
+
+/// A character of a Python distribution name (PEP 508).
+fn distribution_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_')
 }
 
 /// Whether the hub is a `crates_repository` or `crates_vendor` call whose
@@ -209,8 +286,10 @@ fn annotations_unread(ws: &BazelWorkspace, hub: &Hub) -> bool {
 pub fn evidence(ws: &BazelWorkspace, own: OwnSite<'_>) -> Vec<Evidence> {
     let mut out = Vec::new();
     for (id, hub) in ws.hubs.iter().enumerate().filter(|(_, hub)| may_build(hub)) {
-        let mut push = |subject: Subject, replacement: bool, site: &Site| {
-            if !own(site) {
+        // `key`: the recognizer's key of one item, `None` for evidence
+        // that is of the statement as a whole.
+        let mut push = |subject: Subject, replacement: bool, site: &Site, key: Option<&str>| {
+            if !own(site, key) {
                 out.push(Evidence {
                     hub: Some(HubId(id)),
                     ecosystem: hub.ecosystem,
@@ -227,14 +306,20 @@ pub fn evidence(ws: &BazelWorkspace, own: OwnSite<'_>) -> Vec<Evidence> {
             unreadable: false,
         };
         for decl in &hub.user_decls {
-            push(subject(hub, &decl.package), decl.replacement, &decl.site);
+            let key = Some(decl.package.as_str());
+            push(
+                subject(hub, &decl.package),
+                decl.replacement,
+                &decl.site,
+                key,
+            );
         }
         // What a recognizer keeps in its detail and not in `user_decls`.
         match &hub.detail {
             RulesetDetail::RulesNodejs(detail) if !detail.install_patches.is_empty() => {
                 let labels = detail.install_patches.join("`, `");
                 let why = format!("the install patches `{labels}` name no package");
-                push(every(why), false, &hub.decl.site);
+                push(every(why), false, &hub.decl.site, None);
             }
             RulesetDetail::RulesPython(detail) => {
                 for over in detail.overrides.iter().filter(|o| o.package.is_none()) {
@@ -242,12 +327,12 @@ pub fn evidence(ws: &BazelWorkspace, own: OwnSite<'_>) -> Vec<Evidence> {
                         "`pip.override` of `{}`, which is no wheel's name",
                         over.file
                     );
-                    push(every(why), false, &over.site);
+                    push(every(why), false, &over.site, None);
                 }
             }
             RulesetDetail::RulesRust(_) if annotations_unread(ws, hub) => {
                 let why = "the `annotations` of this crate_universe rule are not read";
-                push(every(why.to_string()), false, &hub.decl.site);
+                push(every(why.to_string()), false, &hub.decl.site, None);
             }
             _ => {}
         }
@@ -255,7 +340,7 @@ pub fn evidence(ws: &BazelWorkspace, own: OwnSite<'_>) -> Vec<Evidence> {
         // attribute may be among them.
         if !hub.decl.literal && hooked(hub.ruleset).is_some() {
             let why = "the declaration is not literal, so its patches are not known";
-            push(every(why.to_string()), false, &hub.decl.site);
+            push(every(why.to_string()), false, &hub.decl.site, None);
         }
     }
     let unread =
@@ -268,19 +353,18 @@ pub fn evidence(ws: &BazelWorkspace, own: OwnSite<'_>) -> Vec<Evidence> {
                     unreadable,
                 },
                 replacement: false,
-                host_patch: matches!(
-                    ruleset,
-                    Ruleset::RulesJs | Ruleset::RulesNodejs | Ruleset::Gazelle
-                ),
+                host_patch: may_host_patch(ruleset),
                 file: file.to_string(),
                 site: site.cloned(),
             })
         };
-    for (ruleset, gap) in &ws.ruleset_gaps {
+    // What a recognizer could not read, where Bazel may evaluate it.
+    let gaps = ws.ruleset_gaps.iter();
+    for (ruleset, gap) in gaps.filter(|(_, gap)| govern::may_evaluate_gap(ws, gap)) {
         let unreadable = gap.token == WORKSPACE_UNREADABLE;
         out.extend(unread(*ruleset, &gap.detail, unreadable, None, &gap.file));
     }
-    let followed = |site: &Site| !own(site) && govern::may_evaluate(ws, site);
+    let followed = |site: &Site| !own(site, None) && govern::may_evaluate(ws, site);
     for signal in ws.signals.iter().filter(|signal| followed(&signal.site)) {
         let why = format!("{} is used here and no hub was read", signal.ruleset.name());
         let (site, file) = (Some(&signal.site), &signal.site.file);
@@ -291,8 +375,9 @@ pub fn evidence(ws: &BazelWorkspace, own: OwnSite<'_>) -> Vec<Evidence> {
 
 /// The user's patch hooks for `name`@`version`: the patches of
 /// [`evidence`] that cover it on a hub whose hook runs the host `patch`
-/// tool (a `patches` key, a pnpm `patchedDependencies` entry, an install
-/// patch, a `go_repository` patch). Empty when there is none. With one,
+/// tool or is not known not to ([`host_patch`]: a `patches` key, a pnpm
+/// `patchedDependencies` entry, an install patch, a `go_repository`
+/// patch, a `crate.annotation` patch). Empty when there is none. With one,
 /// the gate allows a write only under `--allow-patch-conflicts`, and
 /// `attest` withholds the pin ([`USER_PATCH_HOOK`]) while the entry exists.
 pub fn user_patch_hooks(
@@ -325,7 +410,13 @@ pub fn bypasses(
     replaced
         .map(|e| Bypass {
             token: USER_OVERRIDE,
-            what: format!("{}: a declaration of the user's replaces `{name}`", e.file),
+            what: match &e.subject {
+                // Which package it replaces is not known: say what is.
+                Subject::Every { why, .. } => format!("{}: {why}", e.file),
+                Subject::Package { .. } => {
+                    format!("{}: a declaration of the user's replaces `{name}`", e.file)
+                }
+            },
             site: e.site,
         })
         .collect()
@@ -335,8 +426,12 @@ pub fn bypasses(
 mod tests {
     use super::*;
     use crate::bazel::exec;
-    use crate::bazel::govern::tests::read;
+    use crate::bazel::govern::tests::{read, JS_WORKSPACE};
     use crate::bazel::model::Index;
+    use crate::bazel::model::Liveness;
+    use crate::bazel::owned_index::tests::revision_4;
+    use crate::bazel::owned_index::OWNED_SEGMENT_PATH;
+    use crate::bazel::ruleset_version::{Unproven, VersionVerdict};
 
     const NPM: Ecosystem = Ecosystem::Npm;
     const JS: &str = "bazel_dep(name = \"aspect_rules_js\", version = \"3.6.0\")\n\
@@ -344,7 +439,7 @@ mod tests {
     const LOCK: &str = "lockfileVersion: '9.0'\n\npatchedDependencies:\n  is-odd@3.0.1:\n    \
         hash: abc\n    path: patches/is-odd@3.0.1.patch\n";
 
-    fn none(_: &Site) -> bool {
+    fn none(_: &Site, _: Option<&str>) -> bool {
         false
     }
 
@@ -363,7 +458,7 @@ mod tests {
         // The filter the gate and `attest` pass: an index with no
         // revision-4 row owns no site.
         let index = Index::default();
-        let own = |site: &Site| exec::own_site(&index, site);
+        let own = |site: &Site, _: Option<&str>| exec::own_site(&index, site);
         let hooks = |name: &str, version: &str| user_patch_hooks(&ws, &own, NPM, name, version);
 
         let found = hooks("left-pad", "1.3.0");
@@ -417,11 +512,178 @@ mod tests {
             1
         );
 
-        let module = |site: &Site| site.file == "MODULE.bazel";
+        let module = |site: &Site, _: Option<&str>| site.file == "MODULE.bazel";
         assert!(bypasses(&ws, &module, HubId(0), "chalk", "5.3.0").is_empty());
         assert!(user_patch_hooks(&ws, &module, NPM, "left-pad", "1.0.0").is_empty());
         let left: Vec<String> = evidence(&ws, &module).into_iter().map(|e| e.file).collect();
         assert_eq!(left, ["pnpm-lock.yaml"]);
+    }
+
+    /// Every key of one `patches` dict carries the site of the whole
+    /// call, so the filter is asked per key: the item it claims is
+    /// subtracted, and the user's other item of the same call is still a
+    /// hook. Evidence of the statement as a whole is asked with no key,
+    /// and a filter that claims one item does not subtract it.
+    #[test]
+    fn the_filter_claims_one_item_of_a_call_and_not_the_users_other_item() {
+        let ws = js("npm.npm_translate_lock(name = \"npm\", pnpm_lock = \"//:pnpm-lock.yaml\", \
+                     patches = {\"left-pad@1.3.0\": [\"//:user.patch\"], \
+                     \"is-even@1.0.0\": [\"//.socket/bazel/patches/u/own.patch\"]}, \
+                     replace_packages = {\"chalk@5.3.0\": \"//:chalk\", \"debug@4.3.4\": \"//:own\"})\n");
+        let sites: Vec<Site> = (evidence(&ws, &none).into_iter())
+            .filter(|e| e.file == "MODULE.bazel")
+            .filter_map(|e| e.site)
+            .collect();
+        assert_eq!(sites.len(), 4);
+        assert!(sites.iter().all(|site| *site == sites[0]), "{sites:?}");
+
+        let call = sites[0].clone();
+        let asked = std::cell::RefCell::new(Vec::new());
+        let item = |site: &Site, key: Option<&str>| {
+            asked.borrow_mut().push(key.map(str::to_string));
+            *site == call && matches!(key, Some("is-even@1.0.0" | "debug@4.3.4"))
+        };
+        let hooks = |name: &str, version: &str| user_patch_hooks(&ws, &item, NPM, name, version);
+        assert!(hooks("is-even", "1.0.0").is_empty(), "socket-patch's own");
+        assert_eq!(hooks("left-pad", "1.3.0").len(), 1, "the user's own");
+        assert!(bypasses(&ws, &item, HubId(0), "debug", "4.3.4").is_empty());
+        assert_eq!(bypasses(&ws, &item, HubId(0), "chalk", "5.3.0").len(), 1);
+        // The lock's `patchedDependencies` entry is asked by its key too.
+        let asked = asked.into_inner();
+        for key in ["left-pad@1.3.0", "is-even@1.0.0", "is-odd@3.0.1"] {
+            assert!(asked.contains(&Some(key.to_string())), "{key}: {asked:?}");
+        }
+
+        // A computed `patches` is evidence of the whole statement: no key.
+        let computed = js("npm.npm_translate_lock(name = \"npm\", pnpm_lock = \"//:pnpm-lock.yaml\", patches = PATCHES)\n");
+        let site = computed.hubs[0].decl.site.clone();
+        let at_call = |own: OwnSite<'_>| {
+            let found = evidence(&computed, own);
+            let here = found.iter().filter(|e| e.site.as_ref() == Some(&site));
+            here.map(|e| e.subject.clone()).collect::<Vec<_>>()
+        };
+        let keyed = |at: &Site, key: Option<&str>| *at == site && key.is_some();
+        let [Subject::Every { why, .. }] = &at_call(&keyed)[..] else {
+            panic!("{:?}", at_call(&keyed));
+        };
+        assert!(why.contains("not literal"), "{why}");
+        let whole = |at: &Site, key: Option<&str>| *at == site && key.is_none();
+        assert_eq!(at_call(&whole), []);
+    }
+
+    /// The filter the gate and `attest` pass today, over an index that
+    /// renders the owned segment: a replacement tag in that file is
+    /// socket-patch's own and is subtracted, and the user's tag of the
+    /// same extension in `MODULE.bazel` is still a bypass.
+    #[test]
+    fn a_tag_in_the_owned_segment_is_subtracted_by_the_real_filter() {
+        let module = format!(
+            "{JS}npm.npm_translate_lock(name = \"npm\", pnpm_lock = \"//:pnpm-lock.yaml\")\n\
+             npm.npm_replace_package(package = \"chalk@5.3.0\", replacement = \"//:chalk\")\n\
+             use_repo(npm, \"npm\")\n\
+             include(\"//.socket/bazel:socket-patch.MODULE.bazel\")\n"
+        );
+        let segment = "npm = use_extension(\"@aspect_rules_js//npm:extensions.bzl\", \"npm\")\n\
+             npm.npm_replace_package(package = \"left-pad@1.3.0\", replacement = \"@socket_patch_left_pad//:pkg\")\n";
+        let ws = read(&[
+            (".bazelversion", "8.8.2\n"),
+            ("MODULE.bazel", &module),
+            (OWNED_SEGMENT_PATH, segment),
+            ("pnpm-lock.yaml", "lockfileVersion: '9.0'\n"),
+        ]);
+        let replaced = |own: OwnSite<'_>, name: &str, version: &str| {
+            let found = bypasses(&ws, own, HubId(0), name, version);
+            let files = found.iter().filter_map(|b| b.site.as_ref());
+            files.map(|site| site.file.clone()).collect::<Vec<_>>()
+        };
+        // With no row the segment is not rendered: both tags are the user's.
+        let empty = Index::default();
+        let unowned = |site: &Site, _: Option<&str>| exec::own_site(&empty, site);
+        assert_eq!(
+            replaced(&unowned, "left-pad", "1.3.0"),
+            [OWNED_SEGMENT_PATH]
+        );
+        assert_eq!(replaced(&unowned, "chalk", "5.3.0"), ["MODULE.bazel"]);
+
+        let index = Index {
+            segment: revision_4().segment,
+            ..Index::default()
+        };
+        let own = |site: &Site, _: Option<&str>| exec::own_site(&index, site);
+        assert_eq!(replaced(&own, "left-pad", "1.3.0"), [""; 0]);
+        assert_eq!(replaced(&own, "chalk", "5.3.0"), ["MODULE.bazel"]);
+    }
+
+    /// A hub that is a dev dependency under a flag that is only possible,
+    /// and one the root imports by a spoke alone, are hubs Bazel builds
+    /// from: the user's `patches` key on either is still a patch hook.
+    /// The proven cases stay out: see the Bazel 9 `WORKSPACE` below.
+    #[test]
+    fn a_patches_key_on_a_dev_or_spoke_only_hub_is_still_a_hook() {
+        let hub = |proxy: &str, import: &str| {
+            format!(
+                "bazel_dep(name = \"aspect_rules_js\", version = \"3.6.0\")\n\
+                 npm = use_extension(\"@aspect_rules_js//npm:extensions.bzl\", \"npm\"{proxy})\n\
+                 npm.npm_translate_lock(name = \"npm\", pnpm_lock = \"//:pnpm-lock.yaml\", \
+                 patches = {{\"left-pad@1.3.0\": [\"//:left-pad.patch\"]}})\n\
+                 use_repo(npm, \"{import}\")\n"
+            )
+        };
+        let lock = ("pnpm-lock.yaml", "lockfileVersion: '9.0'\n");
+        let hooks =
+            |ws: &BazelWorkspace| user_patch_hooks(ws, &none, NPM, "left-pad", "1.3.0").len();
+        let dev = hub(", dev_dependency = True", "npm");
+        let ws = read(&[
+            (".bazelversion", "9.3.2\n"),
+            (".bazelrc", "common:ci --ignore_dev_dependency\n"),
+            ("MODULE.bazel", &dev),
+            lock,
+        ]);
+        assert_eq!(ws.hubs[0].liveness, Liveness::DevDependencyDropped);
+        assert_eq!(hooks(&ws), 1);
+
+        let spoke = hub("", "npm__left-pad__1.3.0");
+        let ws = read(&[(".bazelversion", "9.3.2\n"), ("MODULE.bazel", &spoke), lock]);
+        assert_eq!(ws.hubs[0].liveness, Liveness::NotImported);
+        assert_eq!(hooks(&ws), 1);
+    }
+
+    /// rules_js matches a key against the name, the name with its
+    /// version, and the name with the version and peer suffix of one
+    /// snapshot. Each is a declaration for the plain name and version.
+    #[test]
+    fn a_peer_suffixed_key_is_for_the_plain_name_and_version() {
+        let ws = js("npm.npm_translate_lock(name = \"npm\", pnpm_lock = \"//:pnpm-lock.yaml\", \
+                     patches = {\"@rollup/plugin-commonjs@21.1.0(rollup@2.70.2)\": [\"//:a.patch\"], \
+                     \"foo@1.2.3_bar@2.0.0\": [\"//:b.patch\"], \
+                     \"@s/foo@1.2.3(bar@2.0.0)\": [\"//:c.patch\"], \
+                     \"styled-components@5.3.6_react@18.2.0\": [\"//:d.patch\"]}, \
+                     replace_packages = {\"chalk@5.3.0(debug@4.3.4)\": \"//:chalk\"})\n");
+        let hooks = |name: &str, version: &str| user_patch_hooks(&ws, &none, NPM, name, version);
+        for (name, version) in [
+            ("@rollup/plugin-commonjs", "21.1.0"),
+            ("foo", "1.2.3"),
+            ("@s/foo", "1.2.3"),
+            ("styled-components", "5.3.6"),
+        ] {
+            let found = hooks(name, version);
+            let [hook] = &found[..] else {
+                panic!("{name}@{version}: {found:?}");
+            };
+            let subject = Subject::Package {
+                name: name.to_string(),
+                version: Some(version.to_string()),
+            };
+            assert_eq!(hook.subject, subject);
+            // The key is for one release, whatever its peers.
+            assert!(hooks(name, "9.9.9").is_empty(), "{name}");
+        }
+        // No package is named by a peer of another.
+        assert!(hooks("rollup", "2.70.2").is_empty());
+        assert!(hooks("bar", "2.0.0").is_empty());
+        assert_eq!(bypasses(&ws, &none, HubId(0), "chalk", "5.3.0").len(), 1);
+        assert!(bypasses(&ws, &none, HubId(0), "chalk", "5.2.0").is_empty());
+        assert!(bypasses(&ws, &none, HubId(0), "debug", "4.3.4").is_empty());
     }
 
     fn every(found: &[Evidence], ecosystem: Ecosystem) -> Vec<&str> {
@@ -491,14 +753,298 @@ mod tests {
         assert!(found
             .iter()
             .any(|e| e.covers(Ecosystem::Cargo, "openssl-sys", "0.9.0")));
+        // `crate.annotation` passes `patch_tool` through, and it is not
+        // read: the host tool is not ruled out.
         assert!(found
             .iter()
-            .all(|e| !e.host_patch && !e.covers(NPM, "openssl-sys", "0.9.0")));
+            .all(|e| e.host_patch && !e.covers(NPM, "openssl-sys", "0.9.0")));
         assert_eq!(
             every(&evidence(&rule(""), &none), Ecosystem::Cargo),
             [""; 0]
         );
-        assert!(!every(&evidence(&rule("    **EXTRA\n"), &none), Ecosystem::Cargo).is_empty());
+        // `**EXTRA` may hold `annotations`, and the call is not literal.
+        // Beside those two is what the recognizer could not read, in its
+        // own words, and nothing else.
+        let spread = rule("    **EXTRA\n");
+        let found = evidence(&spread, &none);
+        let (of_hub, unread): (Vec<Evidence>, Vec<Evidence>) =
+            found.into_iter().partition(|e| e.hub == Some(HubId(0)));
+        assert_eq!(
+            every(&of_hub, Ecosystem::Cargo),
+            [
+                "the `annotations` of this crate_universe rule are not read",
+                "the declaration is not literal, so its patches are not known",
+            ]
+        );
+        assert_eq!(of_hub.len(), 2);
+        let gaps = spread.ruleset_gaps.iter();
+        let gaps: Vec<&str> = gaps.map(|(_, gap)| gap.detail.as_str()).collect();
+        assert_eq!(every(&unread, Ecosystem::Cargo), gaps);
+        assert!(unread.len() == gaps.len() && unread.iter().all(|e| e.hub.is_none()));
+    }
+
+    const CARGO: &str = "bazel_dep(name = \"rules_rust\", version = \"0.57.0\")\n\
+        crate = use_extension(\"@rules_rust//crate_universe:extensions.bzl\", \"crate\")\n\
+        crate.from_cargo(name = \"crates\", cargo_lockfile = \"//:Cargo.lock\", manifests = [\"//:Cargo.toml\"])\n";
+
+    /// The Bzlmod half of the same rule. A hub a `crate.from_cargo` tag
+    /// declares has its annotations in `crate.annotation` tags, which are
+    /// read: without one nothing is protected, and with one only its
+    /// crate is. A `crates_repository` called through `use_repo_rule`
+    /// takes an `annotations` dict like the `WORKSPACE` rule.
+    #[test]
+    fn the_annotations_of_a_bzlmod_hub_are_read_from_its_tags() {
+        let module = |tags: &str| {
+            let text = format!("{CARGO}{tags}use_repo(crate, \"crates\")\n");
+            read(&[
+                (".bazelversion", "9.3.2\n"),
+                ("MODULE.bazel", &text),
+                ("Cargo.lock", "version = 3\n"),
+            ])
+        };
+        let plain = module("");
+        assert_eq!(plain.hubs.len(), 1);
+        assert_eq!(evidence(&plain, &none), []);
+
+        let annotated =
+            module("crate.annotation(crate = \"openssl-sys\", patches = [\"//:o.patch\"])\n");
+        let found = evidence(&annotated, &none);
+        let [patch] = &found[..] else {
+            panic!("{found:?}");
+        };
+        let subject = Subject::Package {
+            name: "openssl-sys".to_string(),
+            version: None,
+        };
+        assert_eq!((&patch.subject, patch.replacement), (&subject, false));
+        // crates.io folds case and `-` / `_`.
+        assert!(patch.covers(Ecosystem::Cargo, "openssl_sys", "0.9.0"));
+        assert!(!patch.covers(Ecosystem::Cargo, "openssl", "0.10.0"));
+        let hooks =
+            |name: &str| user_patch_hooks(&annotated, &none, Ecosystem::Cargo, name, "1.0.0");
+        assert_eq!((hooks("openssl-sys").len(), hooks("serde").len()), (1, 0));
+
+        let rule = read(&[
+            (".bazelversion", "9.3.2\n"),
+            (
+                "MODULE.bazel",
+                "bazel_dep(name = \"rules_rust\", version = \"0.57.0\")\n\
+                 crates_repository = use_repo_rule(\"@rules_rust//crate_universe:defs.bzl\", \"crates_repository\")\n\
+                 crates_repository(name = \"crates\", cargo_lockfile = \"//:Cargo.lock\", \
+                 lockfile = \"//:cargo-bazel-lock.json\", manifests = [\"//:Cargo.toml\"], annotations = ANNOTATIONS)\n",
+            ),
+            ("Cargo.lock", "version = 3\n"),
+        ]);
+        let found = evidence(&rule, &none);
+        let whys = every(&found, Ecosystem::Cargo);
+        assert!(
+            whys.contains(&"the `annotations` of this crate_universe rule are not read"),
+            "{found:?}"
+        );
+        assert!(!user_patch_hooks(&rule, &none, Ecosystem::Cargo, "serde", "1.0.0").is_empty());
+
+        // A `crates_vendor` BUILD target takes the dict as well, and its
+        // call is not found again: unknown, beside a tag hub that hides
+        // nothing.
+        let module = format!("{CARGO}use_repo(crate, \"crates\")\n");
+        let build = "load(\"@rules_rust//crate_universe:defs.bzl\", \"crates_vendor\")\n\
+             crates_vendor(\n    name = \"crates_vendor\",\n    cargo_lockfile = \"//:Cargo.lock\",\n    \
+             manifests = [\"//:Cargo.toml\"],\n    mode = \"local\",\n    vendor_path = \"crates\",\n)\n";
+        let vendored = read(&[
+            (".bazelversion", "9.3.2\n"),
+            ("MODULE.bazel", &module),
+            ("Cargo.lock", "version = 3\n"),
+            ("third_party/BUILD.bazel", build),
+        ]);
+        assert_eq!(vendored.hubs.len(), 2, "{:?}", vendored.hubs);
+        let found = evidence(&vendored, &none);
+        let unread: Vec<(&str, &Subject)> = (found.iter())
+            .map(|e| (e.file.as_str(), &e.subject))
+            .collect();
+        let every = Subject::Every {
+            why: "the `annotations` of this crate_universe rule are not read".to_string(),
+            unreadable: false,
+        };
+        assert_eq!(unread, [("third_party/BUILD.bazel", &every)]);
+    }
+
+    const GO_RULES: &str = "workspace(name = \"sp\")\n\n\
+        load(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")\n\n\
+        http_archive(\n    name = \"io_bazel_rules_go\",\n    \
+        urls = [\"https://github.com/bazelbuild/rules_go/releases/download/v0.44.0/rules_go-v0.44.0.zip\"],\n)\n\n";
+
+    /// A `WORKSPACE` hub of `go_repository` rules, gazelle fetched as
+    /// release `version` (`None`: from a URL that proves no version).
+    fn go_repositories(version: Option<&str>, attrs: &str) -> BazelWorkspace {
+        let url = match version {
+            Some(v) => format!(
+                "https://github.com/bazelbuild/bazel-gazelle/releases/download/v{v}/bazel-gazelle-v{v}.tar.gz"
+            ),
+            None => "https://mirror.example.com/gazelle.tar.gz".to_string(),
+        };
+        let text = format!(
+            "{GO_RULES}http_archive(\n    name = \"bazel_gazelle\",\n    urls = [\"{url}\"],\n)\n\n\
+             load(\"@bazel_gazelle//:deps.bzl\", \"gazelle_dependencies\", \"go_repository\")\n\n\
+             go_repository(\n    name = \"org_golang_x_crypto\",\n    importpath = \"golang.org/x/crypto\",\n    \
+             sum = \"h1:SLqDtcPyVkkOYblt1rSVexJHaLWU/teyZ8o5mHyiUbA=\",\n    version = \"v0.17.0\",\n    \
+             patches = [\"//:crypto.patch\"],\n{attrs})\n\ngazelle_dependencies()\n"
+        );
+        read(&[(".bazelversion", "6.6.0\n"), ("WORKSPACE", &text)])
+    }
+
+    /// The golang evidence. A `go_repository` patch is a user patch hook
+    /// on every gazelle release: until 0.29.0 the rule shells out, and
+    /// from 0.29.0 `patch_tool` or an argument that is not `-p<n>` still
+    /// does, and neither attribute is recorded. A `go_deps` override tag
+    /// has no such attribute: with gazelle proven 0.29.0 or later its
+    /// patch is consent evidence and no hook, and an `archive_override`
+    /// is a bypass.
+    #[test]
+    fn a_go_repository_patch_is_a_hook_and_a_go_deps_patch_is_not() {
+        const GOLANG: Ecosystem = Ecosystem::Golang;
+        let crypto = "golang.org/x/crypto";
+        let tool = "    patch_tool = \"patch\",\n    patch_args = [\"-p1\", \"--binary\"],\n";
+        for (version, attrs) in [
+            (Some("0.28.0"), ""),
+            (Some("0.35.0"), ""),
+            (Some("0.35.0"), tool),
+            (None, ""),
+        ] {
+            let ws = go_repositories(version, attrs);
+            let label = format!("{version:?} {attrs:?}");
+            let [hub] = &ws.hubs[..] else {
+                panic!("{label}: {:?}", ws.hubs);
+            };
+            assert_eq!(hub.ruleset, Ruleset::Gazelle, "{label}");
+            let proven = hub.ruleset_version.at_least("0.29.0");
+            assert_eq!(proven, version == Some("0.35.0"), "{label}");
+            assert!(host_patch(hub), "{label}");
+            let found = user_patch_hooks(&ws, &none, GOLANG, crypto, "v0.17.0");
+            let [hook] = &found[..] else {
+                panic!("{label}: {found:?}");
+            };
+            let subject = Subject::Package {
+                name: crypto.to_string(),
+                version: None,
+            };
+            assert_eq!(
+                (&hook.subject, hook.replacement),
+                (&subject, false),
+                "{label}"
+            );
+            // Another module path, and another ecosystem, are not covered.
+            assert!(user_patch_hooks(&ws, &none, GOLANG, "golang.org/x/net", "v0.17.0").is_empty());
+            assert!(user_patch_hooks(&ws, &none, NPM, crypto, "v0.17.0").is_empty());
+            assert!(bypasses(&ws, &none, HubId(0), crypto, "v0.17.0").is_empty());
+        }
+
+        let go_deps = |gazelle: &str| {
+            let module = format!(
+                "bazel_dep(name = \"gazelle\", version = \"{gazelle}\")\n\
+                 go_deps = use_extension(\"@gazelle//:extensions.bzl\", \"go_deps\")\n\
+                 go_deps.from_file(go_mod = \"//:go.mod\")\n\
+                 go_deps.module_override(path = \"example.com/a\", patches = [\"//:a.patch\"])\n\
+                 go_deps.archive_override(path = \"example.com/b\", urls = [\"https://example.com/b.zip\"])\n\
+                 use_repo(go_deps, \"com_example_a\", \"com_example_b\")\n"
+            );
+            let go_mod = "module example.com/app\n\ngo 1.21\n";
+            read(&[
+                (".bazelversion", "8.8.2\n"),
+                ("MODULE.bazel", &module),
+                ("go.mod", go_mod),
+            ])
+        };
+        let ws = go_deps("0.35.0");
+        let [hub] = &ws.hubs[..] else {
+            panic!("{:?}", ws.hubs);
+        };
+        assert!(hub.ruleset_version.at_least("0.29.0") && !host_patch(hub));
+        let found = evidence(&ws, &none);
+        let patched: Vec<&Evidence> = found
+            .iter()
+            .filter(|e| e.covers(GOLANG, "example.com/a", "v1.0.0"))
+            .collect();
+        let [patch] = &patched[..] else {
+            panic!("{found:?}");
+        };
+        assert!(!patch.host_patch && !patch.replacement);
+        assert!(user_patch_hooks(&ws, &none, GOLANG, "example.com/a", "v1.0.0").is_empty());
+        assert!(bypasses(&ws, &none, HubId(0), "example.com/a", "v1.0.0").is_empty());
+        let replaced = bypasses(&ws, &none, HubId(0), "example.com/b", "v1.0.0");
+        let [bypass] = &replaced[..] else {
+            panic!("{replaced:?}");
+        };
+        assert_eq!(bypass.token, "user_override");
+        // A replacement is no patch hook, whatever the hub's patcher.
+        assert!(user_patch_hooks(&ws, &none, GOLANG, "example.com/b", "v1.0.0").is_empty());
+
+        // The override tags prove the release themselves
+        // (`module_override` is of 0.31.0), whatever the `bazel_dep` says:
+        // a `go_deps` hub with a patch is past 0.29.0.
+        let old = go_deps("0.28.0");
+        assert!(old.hubs[0].ruleset_version.at_least("0.29.0") && !host_patch(&old.hubs[0]));
+        // Should a `go_deps` hub ever stand with no proven release, its
+        // patch counts as a hook: unknown is not "native".
+        let mut unproven = ws.hubs[0].clone();
+        unproven.ruleset_version = VersionVerdict::unknown(Unproven::NotDeclared);
+        assert!(host_patch(&unproven));
+    }
+
+    /// A pycross local wheel whose label is no wheel file name stands in
+    /// for a package nobody can name: it is a replacement of every
+    /// package of its hub. One named like a wheel covers its distribution.
+    #[test]
+    fn a_local_wheel_that_names_no_distribution_replaces_any_package() {
+        const PYPI: Ecosystem = Ecosystem::Pypi;
+        let pycross = |wheel: &str| {
+            let module = format!(
+                "module(name = \"socket_fixture\", version = \"0.0.0\")\n\n\
+                 bazel_dep(name = \"rules_pycross\", version = \"2.0.1\")\n\
+                 bazel_dep(name = \"rules_python\", version = \"2.0.0\")\n\n\
+                 uv = use_extension(\"@rules_pycross//pycross/extensions:uv.bzl\", \"uv\")\n\
+                 uv.workspace(\n    name = \"pypi\",\n    local_wheels = [\"{wheel}\"],\n    lock_file = \"//:uv.lock\",\n)\n\
+                 uv.repo(\n    dependency_groups = [\"default\"],\n    workspace = \"pypi\",\n)\n\
+                 use_repo(uv, \"pypi\")\n"
+            );
+            read(&[
+                (".bazelversion", "9.3.2\n"),
+                ("MODULE.bazel", &module),
+                ("uv.lock", "version = 1\n"),
+            ])
+        };
+        let replaced =
+            |ws: &BazelWorkspace, name: &str| bypasses(ws, &none, HubId(0), name, "1.16.0").len();
+        let label = pycross("@my_wheel//file");
+        assert_eq!(label.hubs[0].ruleset, Ruleset::RulesPycross);
+        assert_eq!(
+            (replaced(&label, "six"), replaced(&label, "requests")),
+            (1, 1)
+        );
+        // The bypass names the label, not a package it cannot know.
+        let bypass = &bypasses(&label, &none, HubId(0), "six", "1.16.0")[0];
+        assert_eq!(
+            (bypass.token, bypass.what.as_str()),
+            (
+                "user_override",
+                "MODULE.bazel: `@my_wheel//file` is no distribution name, so the package it is \
+                 for is not known"
+            )
+        );
+        let found = evidence(&label, &none);
+        assert_eq!(
+            every(&found, PYPI),
+            ["`@my_wheel//file` is no distribution name, so the package it is for is not known"]
+        );
+        // A replacement is no patch hook, and it is of its own ecosystem.
+        assert!(user_patch_hooks(&label, &none, PYPI, "six", "1.16.0").is_empty());
+        assert!(found.iter().all(|e| !e.covers(NPM, "six", "1.16.0")));
+
+        let wheel = pycross("//third_party:six-1.16.0-py2.py3-none-any.whl");
+        assert_eq!(
+            (replaced(&wheel, "six"), replaced(&wheel, "requests")),
+            (1, 0)
+        );
+        assert_eq!(every(&evidence(&wheel, &none), PYPI), [""; 0]);
     }
 
     /// A Maven override is keyed `group:artifact` and replaces the jar in
@@ -581,5 +1127,49 @@ mod tests {
             ["rules_jvm_external is used here and no hub was read"]
         );
         assert!(found.iter().all(|e| e.hub.is_none() && !e.replacement));
+    }
+
+    /// A recognizer gap counts where Bazel may evaluate its statement,
+    /// as `govern::governance` counts it: one in a `WORKSPACE` that Bazel
+    /// 9 never opens declares nothing, and the same file on Bazel 6
+    /// protects the ecosystem.
+    #[test]
+    fn a_gap_in_a_file_bazel_never_evaluates_is_no_evidence() {
+        let workspace = format!(
+            "{}npm_translate_lock(name = \"npm\", pnpm_lock = \"//:pnpm-lock.yaml\", patches = PATCHES)\n",
+            JS_WORKSPACE
+                .strip_suffix("npm_translate_lock(name = \"npm\", pnpm_lock = \"//:pnpm-lock.yaml\")\n")
+                .expect("the hub call ends the fixture")
+        );
+        let lock = ("pnpm-lock.yaml", "lockfileVersion: '9.0'\n");
+        let nine = read(&[
+            (".bazelversion", "9.3.2\n"),
+            ("MODULE.bazel", ""),
+            ("WORKSPACE", &workspace),
+            lock,
+        ]);
+        let gaps: Vec<(Ruleset, &str)> = (nine.ruleset_gaps.iter())
+            .map(|(ruleset, gap)| (*ruleset, gap.file.as_str()))
+            .collect();
+        assert_eq!(gaps, [(Ruleset::RulesJs, "WORKSPACE")]);
+        assert!(matches!(nine.hubs[0].liveness, Liveness::Dead { .. }));
+        assert_eq!(evidence(&nine, &none), []);
+        assert!(user_patch_hooks(&nine, &none, NPM, "anything", "1.0.0").is_empty());
+
+        let six = read(&[
+            (".bazelversion", "6.6.0\n"),
+            ("WORKSPACE", &workspace),
+            lock,
+        ]);
+        assert_eq!(six.ruleset_gaps.len(), 1);
+        let found = evidence(&six, &none);
+        let unread: Vec<&Evidence> = found.iter().filter(|e| e.hub.is_none()).collect();
+        let [gap] = &unread[..] else {
+            panic!("{found:?}");
+        };
+        assert_eq!((gap.ecosystem, gap.file.as_str()), (NPM, "WORKSPACE"));
+        assert!(gap.host_patch && matches!(gap.subject, Subject::Every { .. }));
+        assert!(!user_patch_hooks(&six, &none, NPM, "anything", "1.0.0").is_empty());
+        assert!(user_patch_hooks(&six, &none, Ecosystem::Cargo, "anything", "1.0.0").is_empty());
     }
 }
