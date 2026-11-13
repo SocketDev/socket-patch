@@ -196,6 +196,20 @@ fn hooked(ruleset: Ruleset) -> Option<Ecosystem> {
     ruleset.ecosystem().filter(|_| !none.contains(&ruleset))
 }
 
+/// Every ecosystem [`evidence`] can name: the ones a ruleset with a patch
+/// or replacement hook builds. A package of any other ecosystem is
+/// protected by no declaration of a Bazel workspace, so a caller that has
+/// only such packages need not read one.
+pub fn ecosystems() -> Vec<Ecosystem> {
+    let mut found = Vec::new();
+    for ecosystem in Ruleset::ALL.iter().filter_map(|ruleset| hooked(*ruleset)) {
+        if !found.contains(&ecosystem) {
+            found.push(ecosystem);
+        }
+    }
+    found
+}
+
 /// A recognizer's package key in the terms a purl is matched by.
 fn subject(hub: &Hub, package: &str) -> Subject {
     let named = |name: &str, version: Option<&str>| Subject::Package {
@@ -1178,5 +1192,31 @@ mod tests {
         assert!(gap.host_patch && matches!(gap.subject, Subject::Every { .. }));
         assert!(!user_patch_hooks(&six, &none, NPM, "anything", "1.0.0").is_empty());
         assert!(user_patch_hooks(&six, &none, Ecosystem::Cargo, "anything", "1.0.0").is_empty());
+    }
+
+    /// The consent gate skips its walk for a run whose packages no
+    /// declaration can protect, so the list has to hold every ecosystem
+    /// evidence can come with: each one a ruleset with a hook builds, and
+    /// neither of the two whose rulesets have none.
+    #[test]
+    fn the_ecosystems_are_the_ones_a_ruleset_with_a_hook_builds() {
+        use Ecosystem::{Cargo, Gem, Golang, Maven, Npm, Nuget, Pypi};
+        let found = ecosystems();
+        for ecosystem in [Npm, Pypi, Cargo, Golang, Maven] {
+            let count = found.iter().filter(|e| **e == ecosystem).count();
+            assert_eq!(count, 1, "{ecosystem:?}: {found:?}");
+        }
+        assert_eq!(found.len(), 5, "{found:?}");
+        assert!(!found.contains(&Gem) && !found.contains(&Nuget));
+        // Evidence that names no hub comes from a signal of the ruleset:
+        // its ecosystem is in the list, and one without a hook gives none.
+        let signal = |dep: &str| {
+            let module = format!("bazel_dep(name = \"{dep}\", version = \"1.0.0\")\n");
+            let ws = read(&[("MODULE.bazel", &module)]);
+            let found = evidence(&ws, &none);
+            found.iter().map(|e| e.ecosystem).collect::<Vec<_>>()
+        };
+        assert_eq!(signal("rules_jvm_external"), [Maven]);
+        assert_eq!(signal("rules_ruby"), []);
     }
 }

@@ -11,6 +11,10 @@ use std::sync::LazyLock;
 use regex::Regex;
 use serde_json::Value;
 
+use crate::bazel::consent::{self, OwnSite, Subject};
+use crate::bazel::govern::{self, WORKSPACE_UNREADABLE};
+use crate::bazel::model::{BazelWorkspace, Gap, Governance};
+use crate::crawlers::types::Ecosystem;
 use crate::formats::package_json::Workspaces;
 use crate::formats::text::strip_bom;
 use crate::utils::fs::read_regular_to_string;
@@ -37,7 +41,21 @@ struct Evidence {
     /// known: it protects its ecosystem, and the remedy is to fix the
     /// file (see [`UserPatchIndex::unreadable_only`]).
     unreadable: bool,
+    /// A declaration of a Bazel workspace ([`UserPatchIndex::add_bazel`]),
+    /// as `bazel::consent` exports it. It decides what the entry covers by
+    /// its own rule ([`consent::Evidence::covers`]), the one the lane gate
+    /// and `vex` apply to the same declaration, so `ecosystem`, `name` and
+    /// `version` only describe such an entry.
+    starlark: Option<consent::Evidence>,
 }
+
+/// What the source of a Bazel replacement says after its file. Consent
+/// lifts the check for the package like any other, and a patch that Bazel
+/// would have to build from stays refused all the same (design 2.12,
+/// obligation 6): the reader of an override warning is told so here.
+const REPLACED_IN_BAZEL: &str = "replaces the package in the Bazel build, where a hosted or \
+                                 vendored Socket patch of it is refused with or without \
+                                 --allow-patch-conflicts";
 
 impl UserPatchIndex {
     /// Inspect the project, declared workspace members and ancestor workspace
@@ -145,6 +163,125 @@ impl UserPatchIndex {
     /// Whether the index holds no evidence at all.
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+
+    /// Adds what the Bazel workspace `ws` declares about packages of its
+    /// own: the patches and replacements a user wrote into a ruleset's
+    /// hook (`patches` of `npm_translate_lock`, `pip.override`,
+    /// `crate.annotation`, `go_deps.module_override`, `maven.override`, ...),
+    /// which no file the walk reads shows (design HZ-17). The list is
+    /// `bazel::consent`'s, so the consent gate, the lane gate and `vex`
+    /// judge the same declarations by the same rule.
+    ///
+    /// `own` says which statements are socket-patch's own wiring, and they
+    /// are left out: the caller passes the filter the lane gate passes,
+    /// `|site, _| bazel::exec::own_site(&index, site)` over the root's
+    /// owned index. `shown_root` is the workspace root as sources are
+    /// reported under it.
+    ///
+    /// Each entry maps onto one of the three kinds the walk records. A
+    /// declaration for one package protects that package, a replacement
+    /// like a patch. One that names no single package, or stands where it
+    /// was not read (a computed `patches` argument, a use of the ruleset
+    /// that led to no hub), protects every package of its ecosystem. A
+    /// file that could not be read or parsed protects them as unreadable
+    /// evidence, whose remedy is to fix the file.
+    pub fn add_bazel(&mut self, shown_root: &Path, ws: &BazelWorkspace, own: OwnSite<'_>) {
+        for found in consent::evidence(ws, own) {
+            self.push_bazel(shown_root, found);
+        }
+        // `consent` reports what a recognizer of one ruleset left unread.
+        // A workspace file that could not be read or parsed at all (a
+        // boundary file, a file it includes or loads) belongs to no
+        // ruleset and may hold a hook of any: it is the governing file the
+        // walk protects an ecosystem for when it cannot read it. Which
+        // files Bazel evaluates, and so which gaps count, is governance's
+        // answer. A statement that is merely computed is not taken from
+        // here: where it can hide a hook, it uses a ruleset's name, and
+        // `consent` has reported it.
+        for ecosystem in consent::ecosystems() {
+            let governance = govern::governance(ws, ecosystem, &ws.root.project_rel);
+            let Governance::Undetermined(gaps) = governance else {
+                continue;
+            };
+            for gap in gaps.iter().filter(|gap| gap.token == WORKSPACE_UNREADABLE) {
+                self.push_bazel(shown_root, unreadable_in_bazel(ecosystem, gap));
+            }
+        }
+    }
+
+    /// Records that the Bazel workspace at `shown_root` has no model
+    /// (`gap`: none of its boundary files could be read). Which hooks it
+    /// uses is not known, so every package a ruleset with a hook can build
+    /// is protected until the file is fixed.
+    pub fn bazel_unreadable(&mut self, shown_root: &Path, gap: &Gap) {
+        for ecosystem in consent::ecosystems() {
+            self.push_bazel(shown_root, unreadable_in_bazel(ecosystem, gap));
+        }
+    }
+
+    /// One piece of Bazel evidence as an entry. A patch is named by its
+    /// file alone, like a patch the walk finds; whatever else it is
+    /// follows the file in brackets, as for the walk's own entries.
+    fn push_bazel(&mut self, shown_root: &Path, found: consent::Evidence) {
+        let path = shown_in(shown_root, &found.file).display().to_string();
+        let (name, version, source, unreadable) = match &found.subject {
+            Subject::Package { name, version } => {
+                let source = match found.replacement {
+                    true => format!("{path} ({REPLACED_IN_BAZEL})"),
+                    false => path,
+                };
+                (name.clone(), version.clone(), source, false)
+            }
+            Subject::Every { why, unreadable } => {
+                (String::new(), None, format!("{path} ({why})"), *unreadable)
+            }
+        };
+        self.entries.push(Evidence {
+            ecosystem: found.ecosystem.cli_name(),
+            name,
+            version,
+            source,
+            unreadable,
+            starlark: Some(found),
+        });
+    }
+
+    /// Takes over the evidence of `other`: an index built elsewhere for
+    /// the same run (the Bazel declarations, read on a blocking thread).
+    pub fn absorb(&mut self, other: Self) {
+        self.entries.extend(other.entries);
+    }
+
+    /// Whether a declaration of a Bazel workspace can protect `purl`: its
+    /// ecosystem is one [`Self::add_bazel`] can add evidence for. The
+    /// walk itself reads nothing for PyPI and Maven, so a run over such
+    /// packages alone needs the index only under a Bazel workspace.
+    pub fn bazel_detects(purl: &str) -> bool {
+        consent::ecosystems().into_iter().any(|ecosystem| {
+            let prefix = format!("pkg:{}/", ecosystem.cli_name());
+            purl.get(..prefix.len())
+                .is_some_and(|head| head.eq_ignore_ascii_case(&prefix))
+        })
+    }
+
+    /// The ecosystem of `purl` when nothing protects it but Bazel
+    /// declarations that name no single package ([`Self::add_bazel`],
+    /// [`Self::bazel_unreadable`]). One such declaration holds back every
+    /// package of its ecosystem for the same reason, so a caller can say
+    /// it once for all of them. `None` when a declaration for the package
+    /// itself, or any evidence of the walk, protects it too, and when
+    /// nothing does.
+    pub fn bazel_ecosystem_wide(&self, purl: &str) -> Option<Ecosystem> {
+        let evidence = self.evidence_for(purl);
+        let wide = |e: &&Evidence| {
+            let found = e.starlark.as_ref();
+            found.is_some_and(|found| matches!(found.subject, Subject::Every { .. }))
+        };
+        match !evidence.is_empty() && evidence.iter().all(wide) {
+            true => evidence[0].starlark.as_ref().map(|found| found.ecosystem),
+            false => None,
+        }
     }
 
     /// The walk [`Self::discover`] and [`Self::npm_family_in`] share. Every
@@ -812,9 +949,17 @@ impl UserPatchIndex {
         let Some((name, version)) = coordinate.rsplit_once('@') else {
             return Vec::new();
         };
+        let of_purl = Ecosystem::from_purl(base);
         self.entries
             .iter()
             .filter(|e| {
+                // A Bazel declaration covers what `bazel::consent` says
+                // it covers: names as each registry compares them, and a
+                // version selector that cannot be decided covers the
+                // version.
+                if let Some(found) = &e.starlark {
+                    return of_purl.is_some_and(|of| found.covers(of, name, version));
+                }
                 e.ecosystem == ecosystem
                     && (e.name.is_empty()
                         || if ecosystem == "composer" {
@@ -858,6 +1003,7 @@ impl UserPatchIndex {
             version: version.map(str::to_owned),
             source: path.display().to_string(),
             unreadable: false,
+            starlark: None,
         });
     }
 
@@ -871,6 +1017,7 @@ impl UserPatchIndex {
             version: None,
             source: format!("{} ({reason})", path.display()),
             unreadable: false,
+            starlark: None,
         });
     }
 
@@ -884,6 +1031,7 @@ impl UserPatchIndex {
             version: None,
             source: format!("{} ({reason})", path.display()),
             unreadable: true,
+            starlark: None,
         });
     }
 
@@ -1219,6 +1367,36 @@ impl UserPatchIndex {
             }
         }
     }
+}
+
+/// The workspace file `gap` names, which could not be read or parsed, as
+/// evidence for every package of `ecosystem`.
+fn unreadable_in_bazel(ecosystem: Ecosystem, gap: &Gap) -> consent::Evidence {
+    consent::Evidence {
+        hub: None,
+        ecosystem,
+        subject: Subject::Every {
+            why: gap.detail.clone(),
+            unreadable: true,
+        },
+        replacement: false,
+        // Nothing was read, so the hook is not known not to run the host
+        // `patch` tool. No reader of the index asks.
+        host_patch: true,
+        file: gap.file.clone(),
+        site: None,
+    }
+}
+
+/// The path a file of a Bazel workspace is reported under: `rel` (relative
+/// to the workspace root, `/`-separated, `""` for the root itself) below
+/// `shown_root`, joined level by level so that it reads as a path of this
+/// system, and spelled as the walk spells a file of the same directory, so
+/// that one file both report is one source.
+fn shown_in(shown_root: &Path, rel: &str) -> std::path::PathBuf {
+    let levels = rel.split('/').filter(|level| !level.is_empty());
+    let path = levels.fold(shown_root.to_path_buf(), |at, level| at.join(level));
+    normalize_lexically_keeping_escapes(&path)
 }
 
 /// Which project files a run may read, chosen once from the CLI mode
@@ -2919,5 +3097,383 @@ mod tests {
             .is_empty());
         let index = UserPatchIndex::npm_family_in(&ProjectView::Disk(tmp.path()), &[]).await;
         assert!(index.is_empty(), "{index:?}");
+    }
+
+    // ── Declarations of a Bazel workspace (design HZ-17) ──────────────
+
+    use crate::bazel::exec;
+    use crate::bazel::model::{Index, Site, StmtRef, TagEdit, TagOp};
+    use crate::bazel::owned_index::TagEditRow;
+
+    const RULES_JS: &str = "bazel_dep(name = \"aspect_rules_js\", version = \"3.6.0\")\n\
+        npm = use_extension(\"@aspect_rules_js//npm:extensions.bzl\", \"npm\")\n";
+    const NPM_HUB: &str =
+        "npm.npm_translate_lock(name = \"npm\", pnpm_lock = \"//:pnpm-lock.yaml\")\n";
+    const PNPM_LOCK: (&str, &str) = ("pnpm-lock.yaml", "lockfileVersion: '9.0'\n");
+
+    /// A checkout whose root is a Bazel workspace on Bazel 8, at its
+    /// resolved path: `.git` bounds every upward read at the root.
+    fn bazel_checkout(files: &[(&str, &str)]) -> (tempfile::TempDir, std::path::PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let fixed = [
+            (".git/HEAD", "ref: refs/heads/main\n"),
+            (".bazelversion", "8.4.2\n"),
+        ];
+        for (rel, text) in fixed.iter().chain(files) {
+            let path = rel
+                .split('/')
+                .fold(root.clone(), |at, level| at.join(level));
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        }
+        (tmp, root)
+    }
+
+    /// A rules_js workspace whose `MODULE.bazel` holds `tags` on the `npm`
+    /// extension.
+    fn js_checkout(tags: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let module = format!("{RULES_JS}{tags}use_repo(npm, \"npm\")\n");
+        bazel_checkout(&[("MODULE.bazel", &module), PNPM_LOCK])
+    }
+
+    /// The model of the workspace at `root`, read as a command reads it:
+    /// the root probe, then the bounded disk view.
+    fn bazel_model(root: &Path) -> BazelWorkspace {
+        use crate::crawlers::bazel_root::RootProbe;
+        use crate::crawlers::bazel_workspace::{read_workspace, DiskView};
+        use crate::utils::repo_root::ReadBoundary;
+        let boundary = ReadBoundary::upward(ReadScope::Workspace, root);
+        let survey = RootProbe::new().survey(root, &boundary);
+        let [found] = &survey.roots[..] else {
+            panic!("one Bazel root: {survey:?}");
+        };
+        read_workspace(found, &DiskView::new(found)).expect("a workspace")
+    }
+
+    /// The filter of a workspace socket-patch wired nothing into.
+    fn the_users(_: &Site, _: Option<&str>) -> bool {
+        false
+    }
+
+    /// The index of the walk at `root` with the workspace's declarations.
+    async fn with_bazel(root: &Path) -> UserPatchIndex {
+        let mut index = UserPatchIndex::discover(root).await;
+        index.add_bazel(root, &bazel_model(root), &the_users);
+        index
+    }
+
+    fn file_in(root: &Path, name: &str) -> String {
+        root.join(name).display().to_string()
+    }
+
+    /// The hazard and its fix: a patch or a replacement a user wrote into
+    /// a ruleset's hook is in no file the walk reads, and PyPI and Maven
+    /// have no evidence at all outside Bazel. With the workspace's
+    /// declarations each protects its package, by the name the registry
+    /// compares and for the versions it is for, and no other package.
+    #[tokio::test]
+    async fn starlark_declarations_protect_their_packages_in_five_ecosystems() {
+        let module = "bazel_dep(name = \"aspect_rules_js\", version = \"3.6.0\")\n\
+            npm = use_extension(\"@aspect_rules_js//npm:extensions.bzl\", \"npm\")\n\
+            npm.npm_translate_lock(name = \"npm\", pnpm_lock = \"//:pnpm-lock.yaml\", \
+            patches = {\"left-pad@1.3.0\": [\"//:left-pad.patch\"], \"@scope/pkg\": [\"//:p.patch\"]})\n\
+            use_repo(npm, \"npm\")\n\
+            bazel_dep(name = \"rules_python\", version = \"1.4.1\")\n\
+            pip = use_extension(\"@rules_python//python/extensions:pip.bzl\", \"pip\")\n\
+            pip.parse(hub_name = \"pypi\", python_version = \"3.11\", requirements_lock = \"//:requirements.txt\")\n\
+            pip.override(file = \"requests-2.31.0-py3-none-any.whl\", patches = [\"//:r.patch\"])\n\
+            use_repo(pip, \"pypi\")\n\
+            bazel_dep(name = \"rules_jvm_external\", version = \"6.5\")\n\
+            maven = use_extension(\"@rules_jvm_external//:extensions.bzl\", \"maven\")\n\
+            maven.install(artifacts = [\"com.google.guava:guava:32.1.3-jre\"], lock_file = \"//:maven_install.json\")\n\
+            maven.override(coordinates = \"com.google.guava:guava\", target = \"//third_party:guava\")\n\
+            use_repo(maven, \"maven\")\n\
+            bazel_dep(name = \"rules_rust\", version = \"0.57.1\")\n\
+            crate = use_extension(\"@rules_rust//crate_universe:extensions.bzl\", \"crate\")\n\
+            crate.from_cargo(name = \"crates\", cargo_lockfile = \"//:Cargo.lock\", manifests = [\"//:Cargo.toml\"])\n\
+            crate.annotation(crate = \"openssl-sys\", patches = [\"//:o.patch\"])\n\
+            use_repo(crate, \"crates\")\n\
+            bazel_dep(name = \"rules_go\", version = \"0.50.1\")\n\
+            bazel_dep(name = \"gazelle\", version = \"0.39.1\")\n\
+            go_deps = use_extension(\"@gazelle//:extensions.bzl\", \"go_deps\")\n\
+            go_deps.from_file(go_mod = \"//:go.mod\")\n\
+            go_deps.module_override(path = \"github.com/foo/bar\", patches = [\"//:g.patch\"])\n\
+            use_repo(go_deps, \"com_github_foo_bar\")\n";
+        let go_mod = "module example.com/m\n\ngo 1.22\n\nrequire github.com/foo/bar v1.2.3\n";
+        let (_tmp, root) = bazel_checkout(&[
+            ("MODULE.bazel", module),
+            PNPM_LOCK,
+            ("requirements.txt", "requests==2.31.0 --hash=sha256:aaaa\n"),
+            ("maven_install.json", "{}"),
+            ("Cargo.lock", "version = 3\n"),
+            (
+                "Cargo.toml",
+                "[package]\nname = \"x\"\nversion = \"0.1.0\"\n",
+            ),
+            ("go.mod", go_mod),
+            ("go.sum", ""),
+        ]);
+        let protected = [
+            "pkg:npm/left-pad@1.3.0",
+            // A key with no version is for every version; a scope keeps
+            // its `@`, which a purl spells percent-encoded.
+            "pkg:npm/%40scope/pkg@2.0.0",
+            // PyPI compares names folded, and a purl carries qualifiers.
+            "pkg:pypi/Requests@2.31.0?artifact_id=requests-2.31.0-py3-none-any.whl",
+            "pkg:maven/com.google.guava/guava@32.1.3-jre",
+            // crates.io compares names ignoring case and `-` / `_`.
+            "pkg:cargo/openssl_sys@0.9.102",
+            "pkg:golang/github.com/foo/bar@v1.2.3",
+        ];
+        let free = [
+            "pkg:npm/left-pad@1.2.0",
+            "pkg:npm/pkg@2.0.0",
+            "pkg:pypi/urllib3@2.0.7",
+            "pkg:maven/com.google.guava/failureaccess@1.0.2",
+            "pkg:cargo/openssl@0.10.64",
+            "pkg:golang/github.com/foo/baz@v1.0.0",
+            "pkg:gem/rack@2.2.8",
+        ];
+        // Before: the walk alone sees none of them.
+        let walk = UserPatchIndex::discover(&root).await;
+        for purl in protected.iter().chain(&free) {
+            assert_eq!(walk.conflicts(purl), [""; 0], "{purl}");
+        }
+
+        let index = with_bazel(&root).await;
+        let module_file = file_in(&root, "MODULE.bazel");
+        for purl in protected {
+            // A patch is named by its file alone. A replacement says
+            // what it is: a patch of the package is never built from.
+            let source = match purl.starts_with("pkg:maven/") {
+                true => format!("{module_file} ({REPLACED_IN_BAZEL})"),
+                false => module_file.clone(),
+            };
+            assert_eq!(index.conflicts(purl), [source], "{purl}");
+            assert!(!index.unreadable_only(purl), "{purl}");
+            assert_eq!(index.bazel_ecosystem_wide(purl), None, "{purl}");
+        }
+        for purl in free {
+            assert_eq!(index.conflicts(purl), [""; 0], "{purl}");
+        }
+    }
+
+    /// ROUTED R-118: own wiring is subtracted per item. Over one
+    /// `patches` dict with one item a `tagEdits` row would record and one
+    /// item of the user's: the recorded item raises no conflict under a
+    /// filter that claims it, the same item with no row does, and the
+    /// user's other item of the same call still does. A match on the
+    /// statement would subtract the user's item too.
+    ///
+    /// The filter a command passes today, `exec::own_site`, claims no
+    /// site of a file of the user's, with or without the row: it cannot
+    /// yet prove which item of the call it wrote. So both items raise the
+    /// conflict, which refuses where it should subtract and never the
+    /// reverse.
+    #[test]
+    fn a_patches_item_socket_patch_added_is_subtracted_only_by_a_filter_that_claims_it() {
+        let own_item = "\"is-even@1.0.0\": [\"//.socket/bazel/patches/u/own.patch\"]";
+        let (_tmp, root) = js_checkout(&format!(
+            "npm.npm_translate_lock(name = \"npm\", pnpm_lock = \"//:pnpm-lock.yaml\", \
+             patches = {{\"left-pad@1.3.0\": [\"//:user.patch\"], {own_item}}})\n"
+        ));
+        let (recorded, users) = ("pkg:npm/is-even@1.0.0", "pkg:npm/left-pad@1.3.0");
+        let ws = bazel_model(&root);
+        let conflicts = |own: OwnSite<'_>, purl: &str| {
+            let mut index = UserPatchIndex::default();
+            index.add_bazel(&root, &ws, own);
+            index.conflicts(purl)
+        };
+        let module_file = [file_in(&root, "MODULE.bazel")];
+
+        // Both keys carry the site of the one call they stand in.
+        let sites: Vec<Site> = (consent::evidence(&ws, &the_users).into_iter())
+            .filter_map(|found| found.site)
+            .collect();
+        assert!(sites.len() == 2 && sites[0] == sites[1], "{sites:?}");
+        let claims =
+            |site: &Site, key: Option<&str>| *site == sites[0] && key == Some("is-even@1.0.0");
+        assert_eq!(conflicts(&claims, recorded), [""; 0]);
+        assert_eq!(conflicts(&the_users, recorded), module_file);
+        assert_eq!(conflicts(&claims, users), module_file);
+
+        let edit = TagEdit {
+            file: "MODULE.bazel".to_string(),
+            stmt: StmtRef {
+                callee: "npm.npm_translate_lock".to_string(),
+                id: "npm".to_string(),
+                ordinal: 0,
+            },
+            attr: "patches".to_string(),
+            op: TagOp::AddDictEntry,
+            inserted: format!("{own_item}, "),
+            version_key: Some("is-even@1.0.0".to_string()),
+        };
+        let row = TagEditRow {
+            uuid: "9c1f4a52-7d3e-4b8a-a6f0-2e5d8c7b1a90".to_string(),
+            lane: "V-JS1".to_string(),
+            edit,
+            stmt_sha256_before: "e".repeat(64),
+            marker: true,
+        };
+        let with_row = Index {
+            tag_edits: vec![row],
+            ..Index::default()
+        };
+        for index in [Index::default(), with_row] {
+            let real = |site: &Site, _: Option<&str>| exec::own_site(&index, site);
+            assert_eq!(conflicts(&real, recorded), module_file);
+            assert_eq!(conflicts(&real, users), module_file);
+        }
+    }
+
+    /// A declaration that names no single package protects every package
+    /// of its ecosystem and of no other, and says what was not read. It
+    /// is the one kind of evidence a caller may report once for all of
+    /// them, and only where nothing else protects the package. A
+    /// workspace that declares nothing of its own adds nothing.
+    #[tokio::test]
+    async fn a_computed_patches_argument_protects_every_package_of_the_ecosystem() {
+        let (_tmp, root) = js_checkout(NPM_HUB);
+        let mut plain = UserPatchIndex::default();
+        plain.add_bazel(&root, &bazel_model(&root), &the_users);
+        assert!(plain.is_empty(), "{plain:?}");
+
+        let computed = NPM_HUB.replace(")\n", ", patches = PATCHES)\n");
+        let (_tmp, root) = js_checkout(&computed);
+        let index = with_bazel(&root).await;
+        // The hub is marked as not literal, and the recognizer names the
+        // attribute and its line: two reasons, each of the one file.
+        let whys = [
+            "MODULE.bazel:3: `patches` of `npm.npm_translate_lock` is not read: ",
+            "the declaration is not literal, so its patches are not known)",
+        ];
+        let sources = index.conflicts("pkg:npm/%40scope/pkg@2.0.0");
+        assert_eq!(sources.len(), 2, "{sources:?}");
+        for (source, why) in sources.iter().zip(whys) {
+            let opens = format!("{} ({why}", file_in(&root, "MODULE.bazel"));
+            assert!(source.starts_with(&opens), "{source}");
+        }
+        // Computed is not broken: the remedy is the user's choice.
+        assert!(!index.unreadable_only("pkg:npm/left-pad@1.3.0"));
+        let wide = |index: &UserPatchIndex, purl: &str| index.bazel_ecosystem_wide(purl);
+        assert_eq!(wide(&index, "pkg:npm/left-pad@1.3.0"), Some(Ecosystem::Npm));
+        assert_eq!(index.conflicts("pkg:pypi/requests@2.31.0"), [""; 0]);
+        assert_eq!(wide(&index, "pkg:pypi/requests@2.31.0"), None);
+
+        // A patch of the package's own beside it: the package has a
+        // source of its own, so it is reported by itself. The pnpm lock
+        // is read by the walk and by the hub that names it: one source.
+        let lock = "lockfileVersion: '9.0'\n\npatchedDependencies:\n  left-pad@1.3.0:\n    \
+                    hash: abc\n    path: patches/left-pad@1.3.0.patch\n";
+        write(&root, "pnpm-lock.yaml", lock);
+        let index = with_bazel(&root).await;
+        let sources = index.conflicts("pkg:npm/left-pad@1.3.0");
+        assert_eq!(sources.len(), 3, "{sources:?}");
+        assert!(sources.contains(&file_in(&root, "pnpm-lock.yaml")));
+        assert_eq!(wide(&index, "pkg:npm/left-pad@1.3.0"), None);
+        assert_eq!(wide(&index, "pkg:npm/is-odd@3.0.1"), Some(Ecosystem::Npm));
+    }
+
+    /// A workspace file that cannot be parsed, or is not there, may hold
+    /// a hook of any ruleset: every ecosystem a ruleset with a hook
+    /// builds is protected as by a file the walk could not read, whose
+    /// remedy is to fix the file. A statement that is only computed is
+    /// another matter: it hides a hook only where it uses a ruleset's
+    /// name, which `consent` reports for that ruleset's ecosystem, so a
+    /// comprehension over `use_repo` holds back no other.
+    #[tokio::test]
+    async fn an_unparseable_workspace_file_protects_as_unreadable_and_a_computed_statement_does_not(
+    ) {
+        let hooked = [
+            "pkg:npm/left-pad@1.3.0",
+            "pkg:pypi/requests@2.31.0",
+            "pkg:cargo/serde@1.0.200",
+            "pkg:golang/github.com/foo/bar@v1.2.3",
+            "pkg:maven/com.google.guava/guava@32.1.3-jre",
+        ];
+        let broken = format!("{RULES_JS}{NPM_HUB}use_repo(npm, \"npm\"\n");
+        let included = "include(\"//third_party:deps.MODULE.bazel\")\n";
+        for (module, file) in [
+            (broken.as_str(), "MODULE.bazel"),
+            (included, "third_party/deps.MODULE.bazel"),
+        ] {
+            let (_tmp, root) = bazel_checkout(&[("MODULE.bazel", module), PNPM_LOCK]);
+            let index = with_bazel(&root).await;
+            let named = file
+                .split('/')
+                .fold(root.clone(), |at, level| at.join(level));
+            let opens = format!("{} ({file}:", named.display());
+            for purl in hooked {
+                let sources = index.conflicts(purl);
+                assert!(
+                    sources.len() == 1 && sources[0].starts_with(&opens),
+                    "{sources:?}"
+                );
+                assert!(index.unreadable_only(purl), "{purl}");
+                assert_eq!(index.bazel_ecosystem_wide(purl), Ecosystem::from_purl(purl));
+            }
+            assert_eq!(index.conflicts("pkg:gem/rack@2.2.8"), [""; 0]);
+        }
+
+        let computed = format!("{RULES_JS}{NPM_HUB}[use_repo(npm, name) for name in [\"npm\"]]\n");
+        let (_tmp, root) = bazel_checkout(&[("MODULE.bazel", &computed), PNPM_LOCK]);
+        // The statement was not read, and governance says so.
+        let governance = govern::governance(&bazel_model(&root), Ecosystem::Pypi, "");
+        assert!(
+            matches!(governance, Governance::Undetermined(_)),
+            "{governance:?}"
+        );
+        // The statement uses the name of the npm extension, so `consent`
+        // has npm protected, as a conflict; no other ecosystem is held.
+        let index = with_bazel(&root).await;
+        for purl in hooked {
+            let held = !index.conflicts(purl).is_empty();
+            assert_eq!(held, purl.starts_with("pkg:npm/"), "{purl}");
+            assert!(!index.unreadable_only(purl), "{purl}");
+        }
+    }
+
+    /// A root with no model (no boundary file of it could be read) is the
+    /// same question with nothing read at all. Such a gap names no file,
+    /// so the source is the workspace directory. PyPI and Maven have
+    /// evidence only under a Bazel workspace, so a caller asks which
+    /// purls one can protect before it skips the index: the list is
+    /// `consent`'s, and an ecosystem with evidence and no entry in it
+    /// would never be checked.
+    #[test]
+    fn a_workspace_with_no_model_protects_every_ecosystem_a_declaration_can() {
+        let gap = Gap {
+            token: WORKSPACE_UNREADABLE,
+            file: String::new(),
+            detail: "the root holds no workspace file that can be read".to_string(),
+        };
+        let mut index = UserPatchIndex::default();
+        index.bazel_unreadable(Path::new("ws"), &gap);
+        let source = format!("ws ({})", gap.detail);
+        for ecosystem in consent::ecosystems() {
+            let purl = format!("pkg:{}/name@1.0.0", ecosystem.cli_name());
+            assert_eq!(index.conflicts(&purl), [source.as_str()], "{purl}");
+            assert!(index.unreadable_only(&purl), "{purl}");
+            assert_eq!(index.bazel_ecosystem_wide(&purl), Some(ecosystem));
+            assert!(UserPatchIndex::bazel_detects(&purl), "{purl}");
+            let shouted = purl.to_ascii_uppercase();
+            assert!(UserPatchIndex::bazel_detects(&shouted), "{shouted}");
+        }
+        for purl in [
+            "pkg:gem/rack@2.2.8",
+            "pkg:nuget/Newtonsoft.Json@13.0.3",
+            "pkg:composer/a/b@1.0.0",
+        ] {
+            assert_eq!(index.conflicts(purl), [""; 0], "{purl}");
+            assert!(!UserPatchIndex::bazel_detects(purl), "{purl}");
+        }
+        assert!(!UserPatchIndex::bazel_detects("pkg:pypi"));
+
+        // An index built elsewhere for the same run is taken over whole.
+        let mut walked = UserPatchIndex::default();
+        walked.absorb(index);
+        assert_eq!(walked.conflicts("pkg:npm/left-pad@1.3.0"), [source]);
     }
 }
