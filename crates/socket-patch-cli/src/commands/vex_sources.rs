@@ -417,6 +417,15 @@ fn unattested_note(kind: UnattestedKind) -> (&'static str, &'static str) {
              reading that lock; the wiring itself is intact, so re-running `scan` / `vendor` \
              does not change this (drop the setting so the lock is read again)",
         ),
+        // The marks of the Bazel extractor: the tag is the code of the
+        // withhold kind, and the mark's own detail names the remedy.
+        UnattestedKind::BazelNotConsumed
+        | UnattestedKind::BazelConsumerUndetermined
+        | UnattestedKind::BazelPinBypassed
+        | UnattestedKind::BazelDerivedStale
+        | UnattestedKind::BazelRunPending
+        | UnattestedKind::BazelSelectionUnproven
+        | UnattestedKind::BazelIntegrityUnanchored => crate::bazel_gate::vex::note(kind),
     }
 }
 

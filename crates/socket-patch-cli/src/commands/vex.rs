@@ -183,6 +183,7 @@ impl VexEmbedArgs {
             flag_prefix: "--vex-",
             npm_prior: None,
             hosted_uuids: Vec::new(),
+            bazel: Default::default(),
         }
     }
 }
@@ -253,6 +254,11 @@ pub(crate) struct VexBuildParams {
     /// command, else built at most once when the plan must fetch records.
     /// Telemetry reads its route when it exists.
     pub api_client: RunApiClient,
+    /// What the run knows of a Bazel build beyond the committed files
+    /// ([`crate::bazel_gate::vex::Knowledge`]): the grants of the pins a
+    /// Bazel lane wrote in this run. Empty everywhere but an in-run
+    /// statement; inert outside a Bazel workspace.
+    pub bazel: crate::bazel_gate::vex::Knowledge,
 }
 
 impl VexBuildParams {
@@ -365,6 +371,14 @@ pub async fn run(args: VexArgs) -> i32 {
         );
     }
 
+    // Nothing in a tree Bazel owns is attested (owner decision O16):
+    // refused before a manifest, a ledger or a lockfile is read.
+    let refused =
+        crate::bazel_gate::scope::refuse_in_bazel_tree(&args.common, Command::Vex, "attest");
+    if let Some(code) = refused.await {
+        return code;
+    }
+
     // `-o` is `--org`, `-O` is `--output`: a file-shaped org slug is almost
     // certainly a mistyped `-O` (the document then silently went to stdout).
     let mut run_warnings: Vec<RunWarning> = Vec::new();
@@ -393,6 +407,7 @@ pub async fn run(args: VexArgs) -> i32 {
         npm_prior: None,
         hosted_uuids: Vec::new(),
         api_client: RunApiClient::new(),
+        bazel: Default::default(),
     };
 
     // One project for the whole document (#745): the ledgers and the
@@ -722,9 +737,13 @@ async fn patched_blob(
 async fn generate_vex(
     common: &GlobalArgs,
     params: &VexBuildParams,
-    plan: Plan,
+    mut plan: Plan,
     warnings: &mut Vec<RunWarning>,
 ) -> Result<VexWriteSummary, VexGenError> {
+    // Under a Bazel workspace, the consumer gate: a patch the Bazel build
+    // does not provably consume leaves the plan here, before anything is
+    // hashed, so `--no-verify` and an in-run confirmation skip none of it.
+    let bazel = crate::bazel_gate::vex::gate(common, &params.bazel, &mut plan).await;
     let manifest = &plan.view;
     let mirror_captured = hosted_gem_mirror_captured(common, params, &plan).await;
     let mirror_refused = |purl: &str| {
@@ -874,6 +893,7 @@ async fn generate_vex(
             &plan.hosted,
             &copies,
             params.npm_prior.as_ref(),
+            &bazel,
         )
         .await;
         let vendor = VendorContext {
@@ -2040,7 +2060,10 @@ async fn generate_vex_from_manifest_path_inner(
     // too: discovery is what gates the ledgers (core discover rule 11);
     // without it the raw-text fallbacks would decide a uuid a lockfile
     // mentions, attesting a commented-out or rejected pin.
-    let discovery = crate::commands::discover_wiring(common, &common.project_root()).await;
+    // Through the Bazel gate's entry, which hands the extractor what this
+    // run knows of a Bazel build beyond the committed files.
+    let root = common.project_root();
+    let discovery = crate::bazel_gate::vex::discover(common, &root, &params.bazel).await;
     for diag in &discovery.diagnostics {
         note_warning(warnings, common, diag.code, diag.detail.clone());
     }
@@ -2897,6 +2920,7 @@ mod npm_prior_tests {
             npm_prior: prior,
             hosted_uuids: Vec::new(),
             api_client: RunApiClient::new(),
+            bazel: Default::default(),
         };
         let manifest_path = common.resolved_manifest_path();
         match generate_vex_from_manifest_path(common, &params, &manifest_path).await {
