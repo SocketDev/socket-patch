@@ -32,7 +32,7 @@ use super::model::{
 };
 use super::rc;
 use super::rulesets::{self, RecognizeInput};
-use super::version::{self, ApiShape, BazelVersion, DepSystem};
+use super::version::{self, ApiShape, BazelVersion, DepSystem, LineEvidence};
 use super::workspace_file::WORKSPACE_FILES;
 
 /// What a root holds under the name of a boundary file.
@@ -322,6 +322,60 @@ pub fn detect(root: &RootRef, files: &dyn FileView) -> Result<BazelWorkspace, Ga
     Ok(ws)
 }
 
+/// The model [`detect`] reads for the project of `root`, made from the
+/// model `known` that it read for another project of the same Bazel root
+/// through the same view. `None` when Bazel may be another release from
+/// this project's directory: the root is then read for it.
+///
+/// A read depends on the project through one thing, the launcher files
+/// between it and the read boundary (module docs): what bazelisk picks
+/// from each directory and the wrappers it may run give the Bazel line,
+/// and every other reader takes the files of the root. Where the picks
+/// and the wrappers of two projects are the same, so is everything read,
+/// and the two models differ only in the project they name: in `root`,
+/// and in the directory of each pick that the line, and the copy of it
+/// in the flags, keep as evidence. A caller with many projects under one
+/// root makes their models here instead of reading the root once more
+/// for each: a read parses the whole `MODULE.bazel.lock`, and a
+/// recognizer may open every BUILD file.
+pub fn rebase(
+    known: &BazelWorkspace,
+    root: &RootRef,
+    files: &dyn FileView,
+) -> Option<BazelWorkspace> {
+    if known.root.root != root.root || known.root.boundary_levels != root.boundary_levels {
+        return None;
+    }
+    let declared = version::read_declared(root, files);
+    let mut picks = declared.picks.iter();
+    let mut wrappers = declared.wrappers.iter();
+    // The evidence `version::line` builds, with this project's picks: its
+    // picks first, in order, each with the directory it was made from.
+    let mut evidence = Vec::with_capacity(known.line.evidence.len());
+    for found in &known.line.evidence {
+        evidence.push(match found {
+            LineEvidence::Declared(pick) => {
+                let own = picks.next()?;
+                let same = (&own.file, &own.label, &own.reading)
+                    == (&pick.file, &pick.label, &pick.reading);
+                LineEvidence::Declared(same.then(|| own.clone())?)
+            }
+            LineEvidence::Wrapper(path) => {
+                LineEvidence::Wrapper(wrappers.next().filter(|own| *own == path)?.clone())
+            }
+            other => other.clone(),
+        });
+    }
+    if picks.next().is_some() || wrappers.next().is_some() {
+        return None;
+    }
+    let mut ws = known.clone();
+    ws.root = root.clone();
+    ws.line.evidence = evidence;
+    ws.flags = rc::read(files).effective(&ws.line);
+    Some(ws)
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -330,7 +384,7 @@ mod tests {
     use crate::bazel::govern::tests::{read, read_at, JS_MODULE, JS_WORKSPACE, PNPM_LOCK};
     use crate::bazel::model::{FlagState, Governance, HubId, Ruleset};
     use crate::bazel::rc::testing::Files;
-    use crate::bazel::version::{BazelVersion, LineEvidence, TierRefusal};
+    use crate::bazel::version::{BazelVersion, TierRefusal};
     use crate::crawlers::types::Ecosystem;
 
     fn tokens(ws: &BazelWorkspace) -> Vec<&'static str> {
@@ -960,5 +1014,63 @@ mod tests {
         assert_eq!(read_at("8.8.2"), Tier::Supported);
         // Bazel 7 evaluates it beside the module file.
         assert_eq!(read_at("7.7.2"), Tier::Beta);
+    }
+
+    /// A model made for another project of a root is the model a read of
+    /// the root gives for that project, and none is made where bazelisk
+    /// may start another Bazel from the project's directory.
+    #[test]
+    fn a_rebased_model_is_the_model_a_read_gives() {
+        let at = |project: &str| RootRef {
+            root: PathBuf::from("/repo/ws"),
+            project_rel: project.to_string(),
+            boundary_levels: 1,
+        };
+        let files = Files::of(&[
+            ("MODULE.bazel", JS_MODULE),
+            ("WORKSPACE", JS_WORKSPACE),
+            PNPM_LOCK,
+            (".bazelversion", "7.7.2\n"),
+            (
+                ".bazelrc",
+                "common --enable_workspace\ntry-import %workspace%/user.bazelrc\n",
+            ),
+            ("tools/bazel", "#!/bin/sh\n"),
+            ("../.bazeliskrc", "BAZELISK_SHUTDOWN=1\n"),
+            ("svc/api/.bazelversion", "8.8.2\n"),
+            ("wrapped/.bazeliskrc", "BAZELISK_WRAPPER_DIRECTORY=ci\n"),
+            ("ci/bazel", "#!/bin/sh\n"),
+        ])
+        .boundary(1);
+        let read = |project: &str| detect(&at(project), &files).expect("a workspace");
+        let root = read("");
+        assert_eq!(root.hubs.len(), 2);
+        for project in ["app", "app/deep", "svc"] {
+            let made = rebase(&root, &at(project), &files);
+            assert_eq!(made, Some(read(project)), "`{project}`");
+        }
+        assert_eq!(
+            rebase(&read("app/deep"), &at(""), &files),
+            Some(root.clone())
+        );
+        // Another `.bazelversion`, or a wrapper only this directory's
+        // `.bazeliskrc` names, is another Bazel: no model is made.
+        for project in ["svc/api", "svc/api/v2", "wrapped"] {
+            assert_eq!(rebase(&root, &at(project), &files), None, "`{project}`");
+            assert_eq!(rebase(&read(project), &at(""), &files), None, "`{project}`");
+        }
+        let nested = rebase(&read("svc/api"), &at("svc/api/v2"), &files);
+        assert_eq!(nested, Some(read("svc/api/v2")));
+        // A model answers for its own root only.
+        let elsewhere = RootRef {
+            root: PathBuf::from("/repo/other"),
+            ..at("")
+        };
+        assert_eq!(rebase(&root, &elsewhere, &files), None);
+        let nearer = RootRef {
+            boundary_levels: 0,
+            ..at("")
+        };
+        assert_eq!(rebase(&root, &nearer, &files), None);
     }
 }

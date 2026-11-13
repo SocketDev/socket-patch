@@ -423,6 +423,25 @@ pub struct RewriteResult {
         serde(skip_serializing_if = "std::collections::BTreeSet::is_empty")
     )]
     pub refused_sbt_uuids: std::collections::BTreeSet<String>,
+    /// Patch uuids the Bazel rewriter group pinned in every lock a live hub
+    /// reads for the package, derived values included (written by this run
+    /// or already in place). Where a Bazel ruleset governs the ecosystem,
+    /// hosted confirmation keys off this set and its twin below, never off
+    /// substring presence: a URL in a lock no hub reads pins nothing in the
+    /// Bazel build. Like the Gradle and sbt sets, the two serialize (and
+    /// print) only when non-empty. No rewriter fills them yet.
+    #[cfg_attr(
+        test,
+        serde(skip_serializing_if = "std::collections::BTreeSet::is_empty")
+    )]
+    pub confirmed_bazel_uuids: std::collections::BTreeSet<String>,
+    /// Patch uuids a Bazel lane refused: nothing was written for them, and
+    /// a native file that carries the URL does not confirm them.
+    #[cfg_attr(
+        test,
+        serde(skip_serializing_if = "std::collections::BTreeSet::is_empty")
+    )]
+    pub refused_bazel_uuids: std::collections::BTreeSet<String>,
 }
 
 /// The derived `Debug` shape, with the Gradle sets shown only when
@@ -468,6 +487,8 @@ impl std::fmt::Debug for RewriteResult {
             ("refused_gradle_uuids", &self.refused_gradle_uuids),
             ("confirmed_sbt_uuids", &self.confirmed_sbt_uuids),
             ("refused_sbt_uuids", &self.refused_sbt_uuids),
+            ("confirmed_bazel_uuids", &self.confirmed_bazel_uuids),
+            ("refused_bazel_uuids", &self.refused_bazel_uuids),
         ] {
             if !set.is_empty() {
                 d.field(name, set);
@@ -847,6 +868,8 @@ fn merge_group_delta(result: &mut RewriteResult, delta: RewriteResult) {
         refused_gradle_uuids,
         confirmed_sbt_uuids,
         refused_sbt_uuids,
+        confirmed_bazel_uuids,
+        refused_bazel_uuids,
     } = delta;
     result.files.extend(files);
     result.binary_files.extend(binary_files);
@@ -899,6 +922,8 @@ fn merge_group_delta(result: &mut RewriteResult, delta: RewriteResult) {
     }
     result.confirmed_sbt_uuids.extend(confirmed_sbt_uuids);
     result.refused_sbt_uuids.extend(refused_sbt_uuids);
+    result.confirmed_bazel_uuids.extend(confirmed_bazel_uuids);
+    result.refused_bazel_uuids.extend(refused_bazel_uuids);
 }
 
 /// [`rewrite_groups_serial`], with the groups run concurrently under
@@ -10391,6 +10416,34 @@ fn rewrite_golang_target(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The Bazel sets are in neither rendering of a result while they are
+    /// empty, so the goldens blessed before them still hold, and what a
+    /// group puts in them comes through the merge of the groups.
+    #[test]
+    fn the_bazel_sets_render_only_when_filled_and_come_through_the_group_merge() {
+        let empty = RewriteResult::default();
+        let json = serde_json::to_string(&empty).expect("a result serializes");
+        let rendered = format!("{empty:?} {json}");
+        assert!(!rendered.contains("bazel"), "{rendered}");
+
+        let mut result = RewriteResult::default();
+        result.confirmed_bazel_uuids.insert("a".into());
+        let mut delta = RewriteResult::default();
+        delta.confirmed_bazel_uuids.insert("b".into());
+        delta.refused_bazel_uuids.insert("c".into());
+        merge_group_delta(&mut result, delta);
+        let debug = format!("{result:?}");
+        let confirmed = "confirmed_bazel_uuids: {\"a\", \"b\"}";
+        let refused = "refused_bazel_uuids: {\"c\"}";
+        assert!(
+            debug.contains(confirmed) && debug.contains(refused),
+            "{debug}"
+        );
+        let json = serde_json::to_value(&result).expect("a result serializes");
+        assert_eq!(json["confirmed_bazel_uuids"], serde_json::json!(["a", "b"]));
+        assert_eq!(json["refused_bazel_uuids"], serde_json::json!(["c"]));
+    }
 
     /// The sha1 an npm grant carries (or the hosted flow derives from the
     /// served tarball, #558): yarn classic pins it as `resolved`'s fragment.
