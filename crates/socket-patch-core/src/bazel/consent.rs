@@ -571,12 +571,18 @@ mod tests {
         assert_eq!(at_call(&whole), []);
     }
 
-    /// The filter the gate and `attest` pass today, over an index that
-    /// renders the owned segment: a replacement tag in that file is
-    /// socket-patch's own and is subtracted, and the user's tag of the
-    /// same extension in `MODULE.bazel` is still a bypass.
+    /// A replacement tag in the owned segment is subtracted once the
+    /// filter claims it, and the user's tag of the same extension in
+    /// `MODULE.bazel` is still a bypass.
+    ///
+    /// The filter the gate and `attest` pass today (`exec::own_site`)
+    /// claims no site, with or without a segment row: a statement is own
+    /// only where its file is proven to be what its rows render, and the
+    /// segment's handler brings that check. Until it lands both tags are
+    /// the user's, which refuses where it should subtract and never the
+    /// reverse.
     #[test]
-    fn a_tag_in_the_owned_segment_is_subtracted_by_the_real_filter() {
+    fn a_tag_in_the_owned_segment_is_subtracted_only_by_a_filter_that_claims_it() {
         let module = format!(
             "{JS}npm.npm_translate_lock(name = \"npm\", pnpm_lock = \"//:pnpm-lock.yaml\")\n\
              npm.npm_replace_package(package = \"chalk@5.3.0\", replacement = \"//:chalk\")\n\
@@ -596,20 +602,21 @@ mod tests {
             let files = found.iter().filter_map(|b| b.site.as_ref());
             files.map(|site| site.file.clone()).collect::<Vec<_>>()
         };
-        // With no row the segment is not rendered: both tags are the user's.
-        let empty = Index::default();
-        let unowned = |site: &Site, _: Option<&str>| exec::own_site(&empty, site);
-        assert_eq!(
-            replaced(&unowned, "left-pad", "1.3.0"),
-            [OWNED_SEGMENT_PATH]
-        );
-        assert_eq!(replaced(&unowned, "chalk", "5.3.0"), ["MODULE.bazel"]);
-
-        let index = Index {
+        // The real filter: with no row the segment is not rendered, and
+        // with rows it cannot yet be checked against them.
+        let rows = Index {
             segment: revision_4().segment,
             ..Index::default()
         };
-        let own = |site: &Site, _: Option<&str>| exec::own_site(&index, site);
+        assert!(!rows.segment.is_empty());
+        for index in [Index::default(), rows] {
+            let real = |site: &Site, _: Option<&str>| exec::own_site(&index, site);
+            assert_eq!(replaced(&real, "left-pad", "1.3.0"), [OWNED_SEGMENT_PATH]);
+            assert_eq!(replaced(&real, "chalk", "5.3.0"), ["MODULE.bazel"]);
+        }
+
+        // A filter that claims the statements of the owned segment.
+        let own = |site: &Site, _: Option<&str>| site.file == OWNED_SEGMENT_PATH;
         assert_eq!(replaced(&own, "left-pad", "1.3.0"), [""; 0]);
         assert_eq!(replaced(&own, "chalk", "5.3.0"), ["MODULE.bazel"]);
     }
