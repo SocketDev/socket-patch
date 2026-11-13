@@ -1739,13 +1739,15 @@ mod tests {
             .contains("pip installer"));
     }
 
-    /// `HATCH_ENV_TYPE_VIRTUAL_UV_PATH` turns on the uv refusals with no file
-    /// setting, and in the unit tests only a guarded value counts: a
-    /// developer's own uv path must not refuse the pip-installer fixtures.
+    /// In the unit tests a host `HATCH_ENV_TYPE_VIRTUAL_UV_PATH` is hidden,
+    /// so a developer's own uv path can't refuse the pip-installer fixtures.
+    /// The test never holds the key with an `EnvGuard`: the other hatch
+    /// tests run in parallel and would see uv switched on, even for the
+    /// instant a guard's drop restores the host value before releasing the
+    /// key (`uv_source_names(.., true)` covers that branch directly).
     #[test]
     #[serial_test::serial]
-    fn uv_path_env_counts_only_when_a_guard_holds_it() {
-        use crate::test_env::EnvGuard;
+    fn uv_path_env_hides_the_host_value() {
         const KEY: &str = "HATCH_ENV_TYPE_VIRTUAL_UV_PATH";
         let url = "https://patch.test/six-1.16.0-py2.py3-none-any.whl";
         let inputs = files(
@@ -1755,17 +1757,6 @@ mod tests {
         std::env::set_var(KEY, "/host/uv");
         assert!(!uv_path_override(), "host value hidden");
         assert!(rewrite(&inputs, "six", "1.16.0", url).is_ok());
-        {
-            let _uv = EnvGuard::set(KEY, "/usr/bin/uv");
-            assert!(uv_path_override());
-            assert!(rewrite(&inputs, "six", "1.16.0", url)
-                .unwrap_err()
-                .contains("[tool.uv.sources]"));
-        }
-        {
-            let _empty = EnvGuard::set(KEY, "");
-            assert!(!uv_path_override(), "an empty value is unset");
-        }
         match host {
             Some(value) => std::env::set_var(KEY, value),
             None => std::env::remove_var(KEY),
