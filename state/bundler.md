@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled Bundler (RubyGems) bug-hunt routine (label pm:bundler).
 
-Last run: 2026-11-13, main `7c5240e`, release 5.1.0, newest Bundler 4.0.18 tested (4.1.0.beta3 is the newest prerelease). Ruby 3.3.6 only so far.
+Last run: 2026-11-13, main `7c5240e`, release 5.1.0, newest Bundler 4.0.24 stable and 4.1.0.beta3 prerelease (tested: 2.5.23, 2.6.9, 4.0.18; 4.0.24 not yet). Ruby 3.3.6 only so far.
 
 The ledger was reset on 2026-11-13. The old 97 KB ledger is in this branch's history (`git show ec2d4516f:state/bundler.md`); search it with `git grep`, don't copy it back.
 
