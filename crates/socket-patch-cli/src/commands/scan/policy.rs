@@ -56,6 +56,12 @@ pub(crate) struct InvocationPolicy {
 /// Load the policy for `args` (4.5): `--global` scans have no repo and read
 /// no file; everything else reads the repo root's socket.yml. The
 /// invocation's selection filter narrows either.
+///
+/// A hot-patch run is the exception to the first: its global pass reads the
+/// working directory's socket.yml like its project pass. The two can reach
+/// the same installed copy (a system site-packages), and a package the
+/// repository excludes must stay unpatched in both. (The file's path
+/// filters still judge project paths only.)
 pub(crate) fn load_invocation_policy(args: &ScanArgs) -> Result<InvocationPolicy, PolicyLoadError> {
     let overrides = args
         .socket_yml
@@ -70,7 +76,7 @@ pub(crate) fn load_invocation_policy(args: &ScanArgs) -> Result<InvocationPolicy
         None => policy,
     };
     let cwd = std::fs::canonicalize(&args.common.cwd).unwrap_or_else(|_| args.common.cwd.clone());
-    if args.common.is_global() {
+    if args.common.is_global() && !crate::hot_patch::active() {
         let policy = SelectionPolicy::load(
             &socket_patch_core::policy::MemoryPolicyFs::default(),
             &overrides,

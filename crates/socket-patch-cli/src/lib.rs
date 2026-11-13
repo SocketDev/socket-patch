@@ -65,6 +65,7 @@ macro_rules! eprint {
 pub mod args;
 pub mod commands;
 pub(crate) mod ecosystem_dispatch;
+pub mod hot_patch;
 pub mod interrupt;
 /// The in-memory hosted engine, which lives in core
 /// ([`socket_patch_core::hosted::memory`]); re-exported under its old path
@@ -195,6 +196,18 @@ pub enum Commands {
     // documented as internal in CLI_CONTRACT.md (no stability guarantee).
     #[command(hide = true, name = "hosted-bundle")]
     HostedBundle(commands::hosted_bundle::HostedBundleArgs),
+
+    // Hot patch mode (EXPERIMENTAL): patch everything installed in place,
+    // save nothing, then become the command after `--` (see `hot_patch`).
+    // Hidden and documented as experimental in CLI_CONTRACT.md: no
+    // stability guarantee. Plain `//` comments keep this out of help text.
+    #[command(
+        hide = true,
+        name = "hot-patch",
+        about = "Patch every installed package in place, then run a command (experimental)",
+        override_usage = "socket-patch hot-patch [OPTIONS] -- <COMMAND> [ARGS]..."
+    )]
+    HotPatch(hot_patch::HotPatchArgs),
 }
 
 impl Commands {
@@ -214,6 +227,7 @@ impl Commands {
             Commands::Repair(a) => &a.common,
             Commands::SelfUpdate(a) => &a.common,
             Commands::HostedBundle(a) => &a.common,
+            Commands::HotPatch(a) => &a.scan.common,
         }
     }
 
@@ -227,7 +241,9 @@ impl Commands {
     pub fn validate_paths(&self) -> Result<(), String> {
         match self {
             Commands::SelfUpdate(_) | Commands::HostedBundle(_) => return Ok(()),
-            Commands::Get(_) | Commands::Scan(_) => self.global_args().validate_paths(true)?,
+            Commands::Get(_) | Commands::Scan(_) | Commands::HotPatch(_) => {
+                self.global_args().validate_paths(true)?
+            }
             other => other.global_args().validate_paths(false)?,
         }
         // Refuse a `--global-prefix` inside a Deno tool's `node_modules` that
@@ -430,6 +446,7 @@ const SELF_UPDATE_TIP: &str = "to update socket-patch itself, run `socket-patch 
 const HIDDEN_SUBCOMMAND_TIPS: &[(&str, Option<&str>)] = &[
     ("self-update", Some(SELF_UPDATE_TIP)),
     ("hosted-bundle", None),
+    ("hot-patch", None),
 ];
 
 /// Replace clap's tip for an unknown subcommand when it would mislead: a

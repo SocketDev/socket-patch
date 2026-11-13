@@ -113,6 +113,12 @@ pub fn init(common: &GlobalArgs) {
 /// behind every `--json` envelope, so each consumer parses stdout as
 /// exactly one document.
 pub(crate) fn print_json(v: &serde_json::Value) {
+    // Hot patch mode: stdout belongs to the command about to start, so the
+    // document goes into the run's one stderr line instead.
+    if crate::hot_patch::active() {
+        crate::hot_patch::report(v);
+        return;
+    }
     println!(
         "{}",
         serde_json::to_string_pretty(v).expect("serializing an in-memory JSON value cannot fail")
