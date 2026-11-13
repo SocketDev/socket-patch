@@ -153,7 +153,9 @@ pub(crate) async fn gate(common: &GlobalArgs, known: &Knowledge, plan: &mut Plan
         ..RunCx::default()
     };
     let (loader, root) = (Loader::new(run), common.project_root());
-    if loader.probe(&root) == Probe::NotBazel {
+    // Nothing to judge, or no Bazel root: the stat-only probe at most, and
+    // no file of a workspace is read.
+    if plan.view.patches.is_empty() || loader.probe(&root) == Probe::NotBazel {
         return verdicts;
     }
     // Vendored pins of records that name no artifact yet: the ledger is
