@@ -32,7 +32,7 @@ use super::model::{
 };
 use super::rc;
 use super::rulesets::{self, RecognizeInput};
-use super::version::{self, ApiShape, BazelVersion, DepSystem, LineEvidence};
+use super::version::{self, ApiShape, BazelVersion, Declared, DepSystem, LineEvidence};
 use super::workspace_file::WORKSPACE_FILES;
 
 /// What a root holds under the name of a boundary file.
@@ -343,10 +343,21 @@ pub fn rebase(
     root: &RootRef,
     files: &dyn FileView,
 ) -> Option<BazelWorkspace> {
+    rebase_onto(known, root, &version::read_declared(root, files), files)
+}
+
+/// [`rebase`] for a caller that tries several known models for one
+/// project: `declared` is `version::read_declared(root, files)`, read once
+/// for all of them.
+pub fn rebase_onto(
+    known: &BazelWorkspace,
+    root: &RootRef,
+    declared: &Declared,
+    files: &dyn FileView,
+) -> Option<BazelWorkspace> {
     if known.root.root != root.root || known.root.boundary_levels != root.boundary_levels {
         return None;
     }
-    let declared = version::read_declared(root, files);
     let mut picks = declared.picks.iter();
     let mut wrappers = declared.wrappers.iter();
     // The evidence `version::line` builds, with this project's picks: its
@@ -1061,6 +1072,12 @@ mod tests {
         }
         let nested = rebase(&read("svc/api"), &at("svc/api/v2"), &files);
         assert_eq!(nested, Some(read("svc/api/v2")));
+        // One read of a project's launcher files serves every model that
+        // is tried for it.
+        let declared = version::read_declared(&at("svc/api/v2"), &files);
+        let tried = [&root, &read("svc/api")]
+            .map(|known| rebase_onto(known, &at("svc/api/v2"), &declared, &files));
+        assert_eq!(tried, [None, Some(read("svc/api/v2"))]);
         // A model answers for its own root only.
         let elsewhere = RootRef {
             root: PathBuf::from("/repo/other"),

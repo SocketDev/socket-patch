@@ -100,6 +100,15 @@ pub trait Txn {
 
 /// A transaction held in memory over a view of the root: what the hermetic
 /// tests run the executor on, and what a seam can hand its commit.
+///
+/// The base is what the transaction writes over, so it has to show the
+/// root as it is now: a view made after the last commit of the run. A
+/// view that answered before a commit keeps its answers (the files the
+/// CLI's loader hands out are such a read cache until it is told of the
+/// commit), and a transaction over one stages the index and
+/// `.bazelignore` without what that commit landed. No
+/// [`IndexFault::Behind`] stops it, because the stale base shows the old
+/// file, which the caller's index agrees with.
 pub struct Overlay<'a> {
     base: &'a dyn FileView,
     staged: BTreeMap<String, Option<Vec<u8>>>,

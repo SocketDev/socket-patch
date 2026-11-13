@@ -8,14 +8,21 @@
 //! - [`Loader::probe`] stats and reads nothing. Under no Bazel root that is
 //!   the whole cost of this module, so a command that needs no governance
 //!   answer (an `apply` run from a lifecycle hook) asks only this.
-//! - [`Loader::load`] reads. Each Bazel root gets one `DiskView` for the
-//!   run, so each file of a root is opened once, whichever project asks.
-//!   There is a model per root **and project**: its Bazel line spans the
-//!   launcher files from the project up to the root, bazelisk takes the
+//! - [`Loader::load`] reads. Each Bazel root gets one `DiskView`, so each
+//!   file of a root is opened once, whichever project asks. There is a
+//!   model per root **and project**: its Bazel line spans the launcher
+//!   files from the project up to the root, bazelisk takes the
 //!   `.bazelversion` nearest the directory it is started in, and governance
 //!   answers only for the project a model was read for. Projects with the
 //!   same Bazel launcher files share what was read (`detect::rebase`). The
-//!   root's owned index is read once and handed out as [`IndexState`].
+//!   root's owned index is read with its first model and handed out as
+//!   [`IndexState`].
+//! - [`Loader::committed`] is what a seam calls after it changed files
+//!   under a Bazel root. What was read of the root is a cache from before
+//!   the change, and the loader has no other way to learn of it: without
+//!   the call the next project of the root is handed the files, the index
+//!   and the model of before the write, and a transaction over them writes
+//!   the first project's line and row away.
 //!
 //! What the run should say once about a workspace (it cannot be read, its
 //! Bazel is too old, a workspace file lies above the repository) is queued
@@ -28,7 +35,11 @@
 //! The calls block (stats and reads): a command runs them where it runs
 //! its other blocking walks. No command calls into this module yet: the
 //! seams of the integration packages will, and the `mod` lines below name
-//! their files.
+//! their files. `run.rs` (`ToolRunner`, `NoRunner` and `finish`, revision 4
+//! section 4) is not among them yet: its `finish` takes the captured
+//! originals of the group commit, a type the hosted engine's package
+//! defines, so the file and its `mod` line land in wave 5, before the
+//! first seam that calls `finish`.
 
 pub mod agent;
 pub mod agent_go;
@@ -46,11 +57,13 @@ use socket_patch_core::bazel::detect;
 use socket_patch_core::bazel::exec::IndexFault;
 use socket_patch_core::bazel::govern::{self, WORKSPACE_UNREADABLE};
 use socket_patch_core::bazel::model::{
-    BazelWorkspace, Completeness, DepSystem, FileText, FileView, Gap, Governance, HubId, Index,
-    LaneCx, LockRole, Mode, Probe, RootRef, Ruleset, RunPolicy, Tier,
+    BazelWorkspace, Completeness, DepSystem, FileText, FileView, Gap, Governance, Hub, HubId,
+    Index, LaneCx, Liveness, LockRole, Mode, Probe, RootRef, Ruleset, RulesetDetail, RunPolicy,
+    Tier,
 };
 use socket_patch_core::bazel::owned_index::{self, Parsed, INDEX_PATH};
-use socket_patch_core::bazel::version::{LineEvidence, TierRefusal};
+use socket_patch_core::bazel::rulesets::report_only::ReportOnlyKind;
+use socket_patch_core::bazel::version::{self, LineEvidence, TierRefusal};
 use socket_patch_core::crawlers::bazel_root::{MarkerAbove, RootProbe, Survey};
 use socket_patch_core::crawlers::bazel_workspace::{read_workspace, DiskView};
 use socket_patch_core::crawlers::types::Ecosystem;
@@ -98,9 +111,13 @@ impl Warning {
     }
 }
 
-/// What the file at the owned index's path is. Read once per root: a row
-/// another writer of the same run records later is caught up with through
-/// `bazel::exec::refresh`.
+/// What the file at the owned index's path is. Read once per root, with
+/// the root's first model, so it is as old as the files and the model it
+/// is handed out with. A row that a writer of the same run records later
+/// is not in it: the seam that wrote calls [`Loader::committed`], and the
+/// next load reads the file again. `bazel::exec::refresh` catches up with
+/// such a row only over a transaction that reads the disk, which one over
+/// [`LoadedRoot::files`] does not.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IndexState {
     /// The index socket-patch wrote. A root with no index file has the
@@ -112,13 +129,30 @@ pub enum IndexState {
     Faulty(IndexFault),
 }
 
-/// What is read once per Bazel root, whichever project asks.
+/// How many models a root keeps for the projects that come after
+/// ([`RootState::model`]). A model holds the parsed `MODULE.bazel.lock`,
+/// and a root whose sub-projects each pin their own Bazel (the nested
+/// example workspaces of a ruleset repository) is read once for each of
+/// them: without a bound every one of those reads would stay in memory
+/// for the whole run.
+const KEPT_MODELS: usize = 4;
+
+/// The models of one root ([`RootState::model`]).
+#[derive(Default)]
+struct Models {
+    /// How often the root was read.
+    reads: usize,
+    /// Copies of the last reads but the first, at most [`KEPT_MODELS`];
+    /// the one a model was made from last is at the back.
+    kept: VecDeque<BazelWorkspace>,
+}
+
+/// What is read once per Bazel root, whichever project asks, until the
+/// run changes a file under the root ([`Loader::committed`]).
 struct RootState {
     view: DiskView,
     index: OnceLock<IndexState>,
-    /// How often the root was read, and the models kept for the projects
-    /// that come after ([`RootState::model`]).
-    models: Mutex<(usize, Vec<BazelWorkspace>)>,
+    models: Mutex<Models>,
 }
 
 impl RootState {
@@ -137,20 +171,38 @@ impl RootState {
     /// a root is read twice for them, not once per project: a read parses
     /// the whole `MODULE.bazel.lock` and, with rules_rust, opens every
     /// BUILD file. The first project owns what it read, so a run over one
-    /// project holds one model; every later read leaves a copy from which
-    /// the models of the projects after it are made.
+    /// project holds one model; a later read leaves a copy from which the
+    /// models of the projects after it are made. The copies are bounded
+    /// ([`KEPT_MODELS`]), and the one that keeps being used is the one
+    /// that stays.
     fn model(&self, root: &RootRef) -> Result<BazelWorkspace, Gap> {
         // Held across the read: a second project waits, then copies.
-        let mut kept = self.models.lock().unwrap_or_else(PoisonError::into_inner);
-        let made = |known: &BazelWorkspace| detect::rebase(known, root, &self.view);
-        if let Some(model) = kept.1.iter().find_map(made) {
+        let mut models = self.models.lock().unwrap_or_else(PoisonError::into_inner);
+        // The index is read with the root's first model and never again,
+        // so a lane is handed a model, files and an index of one read of
+        // the root. It is read first: should another writer land a line
+        // and its row in between, a line with no row is taken for the
+        // user's and left alone, where a row with no line would record an
+        // edit that the model says is not there.
+        self.index();
+        // The launcher files are read once, whatever the number of copies.
+        let declared = version::read_declared(root, &self.view);
+        let made = |known: &BazelWorkspace| detect::rebase_onto(known, root, &declared, &self.view);
+        let mut kept = models.kept.iter().enumerate();
+        if let Some((at, model)) = kept.find_map(|(at, known)| Some((at, made(known)?))) {
+            if let Some(used) = models.kept.remove(at) {
+                models.kept.push_back(used);
+            }
             return Ok(model);
         }
         let model = read_workspace(root, &self.view);
-        if let (Ok(ws), true) = (&model, kept.0 > 0) {
-            kept.1.push(ws.clone());
+        if let (Ok(ws), true) = (&model, models.reads > 0) {
+            if models.kept.len() >= KEPT_MODELS {
+                models.kept.pop_front();
+            }
+            models.kept.push_back(ws.clone());
         }
-        kept.0 += 1;
+        models.reads += 1;
         model
     }
 
@@ -194,7 +246,14 @@ impl<'a> LoadedRoot<'a> {
         self.root
     }
 
-    /// The files of the root, as every project of the run reads them.
+    /// The files of the root, as every project of the run has read them
+    /// since the last commit the loader was told of.
+    ///
+    /// It is a read cache and no snapshot: a file is read when it is
+    /// first asked for and never again. So it is not the base of a
+    /// transaction. A seam reads what it is about to write over from a
+    /// view made after the last commit of the run, and tells the loader
+    /// once its own has landed ([`Loader::committed`]).
     pub fn files(&self) -> &'a DiskView {
         &self.state.view
     }
@@ -205,13 +264,17 @@ impl<'a> LoadedRoot<'a> {
         self.model.as_ref()
     }
 
-    /// The root's owned index, read on the first call.
+    /// The root's owned index, as it was when the root's first model was
+    /// read.
     pub fn index(&self) -> &'a IndexState {
         self.state.index()
     }
 
     /// What a lane function is handed for `hub` in `mode`: the model, the
-    /// files, the index as it was read, and the run policy.
+    /// files and the index of one read of the root, and the run policy.
+    /// They are what the root held before the run's last commit that the
+    /// loader was not told of ([`Loader::committed`]): a lane decides from
+    /// them, and no transaction is based on `files` ([`LoadedRoot::files`]).
     pub fn lane_cx(&self, mode: Mode, hub: HubId) -> Result<LaneCx<'a>, NoLaneCx<'a>> {
         let ws = self.model().map_err(NoLaneCx::Workspace)?;
         let index = match self.index() {
@@ -319,6 +382,8 @@ struct Memo {
     projects: HashMap<ProjectKey, Weak<Loaded>>,
     /// The last [`KEPT`] loads.
     recent: VecDeque<Arc<Loaded>>,
+    /// How many commits the loader was told of ([`Loader::committed`]).
+    commits: u64,
     said: BTreeSet<(Code, String)>,
     pending: Vec<Warning>,
 }
@@ -372,12 +437,10 @@ impl Loader {
         };
         let boundary = ReadBoundary::upward(ReadScope::Workspace, from);
         let survey = self.probe.survey(project_dir, &boundary);
-        // A marker the probe reports inside the boundary is its answer for
-        // a project it could not place under the root there.
         let above = survey.above.iter();
         self.say(
             above
-                .map(|a| above_warning(a, !boundary.contains(&a.marker)))
+                .map(|above| above_warning(above, is_outside(&boundary, &above.marker)))
                 .collect(),
         );
         let known = survey.clone();
@@ -392,27 +455,93 @@ impl Loader {
 
     /// The models and the files of every Bazel root that governs
     /// `project_dir`. One project has one load for as long as somebody
-    /// holds it, and the loader holds the last few itself.
+    /// holds it, and the loader holds the last few itself. A load is what
+    /// its roots held when it was read: after [`Loader::committed`] the
+    /// project is read again, and a load somebody still holds stays as it
+    /// was.
     pub fn load(&self, project_dir: &Path) -> Arc<Loaded> {
         let survey = self.survey(project_dir);
         let key = project_key(&survey);
-        let held = |memo: &Memo| memo.projects.get(&key).and_then(Weak::upgrade);
-        if let Some(known) = held(&self.memo()) {
-            return known;
+        loop {
+            let commits = match self.held(&key) {
+                Ok(known) => return known,
+                Err(commits) => commits,
+            };
+            let read = Arc::new(self.read(survey.clone()));
+            if let Some(loaded) = self.keep(&key, read, commits) {
+                return loaded;
+            }
         }
-        let loaded = Arc::new(self.read(survey));
+    }
+
+    /// The load of the project that somebody holds, else how many commits
+    /// the loader was told of so far.
+    fn held(&self, key: &ProjectKey) -> Result<Arc<Loaded>, u64> {
+        let memo = self.memo();
+        let held = memo.projects.get(key).and_then(Weak::upgrade);
+        held.ok_or(memo.commits)
+    }
+
+    /// Makes `read` the project's load and returns the load everybody
+    /// shares. `None` when the loader was told of a commit since it knew
+    /// of `commits` of them, which is when the read began: the files may
+    /// be from either side of the commit, so the caller reads again.
+    fn keep(&self, key: &ProjectKey, read: Arc<Loaded>, commits: u64) -> Option<Arc<Loaded>> {
         let mut memo = self.memo();
+        if memo.commits != commits {
+            return None;
+        }
         // Another task may have loaded the project meanwhile: its load is
         // the one everybody shares.
-        if let Some(known) = held(&memo) {
-            return known;
+        if let Some(known) = memo.projects.get(key).and_then(Weak::upgrade) {
+            return Some(known);
         }
-        memo.projects.insert(key, Arc::downgrade(&loaded));
-        memo.recent.push_back(Arc::clone(&loaded));
+        memo.projects.insert(key.clone(), Arc::downgrade(&read));
+        memo.recent.push_back(Arc::clone(&read));
         if memo.recent.len() > KEPT {
             memo.recent.pop_front();
         }
-        loaded
+        Some(read)
+    }
+
+    /// Tells the loader that this run changed files at or below `dir`: a
+    /// Bazel root for a write anchored there (a `.bazelignore` line, the
+    /// owned index and what it records), a project directory for a
+    /// project's own (a lock file a hub reads, a vendored tree). A seam
+    /// calls it after every commit that landed, and after one that failed
+    /// part-way.
+    ///
+    /// Everything read of a root at, above or below `dir` is dropped: its
+    /// files, its index and its models, and the loads built on them, so
+    /// the next [`Loader::load`] reads the disk. A root above `dir` reads
+    /// the files below it, and a view reads as far up as its read
+    /// boundary, so both directions count. A load that a caller still
+    /// holds keeps what it read: it is the root of before the commit, and
+    /// nothing may be written from it.
+    ///
+    /// Which directories are Bazel roots is not asked again: socket-patch
+    /// creates no boundary file.
+    pub fn committed(&self, dir: &Path) {
+        // The empty path is the working directory, as it is to the probe.
+        let from = match dir.as_os_str().is_empty() {
+            true => Path::new("."),
+            false => dir,
+        };
+        // The roots are resolved paths, and `dir` is as the caller spells
+        // it. One that cannot be resolved could be anywhere, so every
+        // root goes: reading one again costs time and nothing else.
+        let real = std::fs::canonicalize(from).ok();
+        let touched = |root: &Path| {
+            let near = |dir: &Path| root.starts_with(dir) || dir.starts_with(root);
+            real.as_deref().is_none_or(|real| near(real) || near(from))
+        };
+        let mut memo = self.memo();
+        memo.commits += 1;
+        memo.roots.retain(|(root, _), _| !touched(root));
+        let built_on = |key: &ProjectKey| key.0.iter().any(|(root, _, _)| touched(root));
+        memo.projects.retain(|key, _| !built_on(key));
+        let built_on = |loaded: &Arc<Loaded>| loaded.survey.roots.iter().any(|r| touched(&r.root));
+        memo.recent.retain(|loaded| !built_on(loaded));
     }
 
     fn root_state(&self, root: &RootRef) -> Arc<RootState> {
@@ -440,6 +569,22 @@ impl Loader {
             run: run_policy(&self.run),
         }
     }
+}
+
+/// Whether the marker a survey reports is a file above the read boundary.
+/// One the probe reports at or below it is its answer for a project it
+/// could not place under the root there, and so is a relative one, which
+/// it gives back when the working directory cannot be read.
+///
+/// Decided from the two paths as the probe built them, never by resolving
+/// the file: the marker is a name joined to an ancestor of the resolved
+/// project directory, and the boundary is such an ancestor. A boundary
+/// file above the repository that is a link to a file inside it is above
+/// the repository all the same, and `ReadBoundary::contains` would follow
+/// the link and place it inside. An unbounded run has nothing above.
+fn is_outside(boundary: &ReadBoundary, marker: &Path) -> bool {
+    let above = |root: &Path| marker.is_absolute() && !marker.starts_with(root);
+    boundary.root().is_some_and(above)
 }
 
 /// The warning for the marker a survey reports beside its roots. `outside`:
@@ -501,6 +646,69 @@ fn system_words(system: &DepSystem) -> String {
     }
 }
 
+/// The name the detection note gives the ruleset of `hub`. A report-only
+/// shape is named by its kind (`report_only` is nobody's ruleset) and
+/// marked: socket-patch knows the shape and patches nothing for it.
+fn hub_name(hub: &Hub) -> String {
+    let RulesetDetail::ReportOnly(detail) = &hub.detail else {
+        return hub.ruleset.name().to_string();
+    };
+    let kind = match detail.kind {
+        ReportOnlyKind::RulesReqCompile => "rules_req_compile",
+        ReportOnlyKind::RulesPoetry => "rules_poetry",
+        ReportOnlyKind::BazelDeps => "bazel-deps",
+        ReportOnlyKind::JvmImportExternal => "jvm_import_external",
+        ReportOnlyKind::HttpJar => "http_jar",
+        ReportOnlyKind::CargoRaze => "cargo-raze",
+        ReportOnlyKind::NonRootModuleHub => "a module extension",
+    };
+    format!("{kind} (recognized, not patched)")
+}
+
+/// One hub as the detection note describes it, by what `govern::settle`
+/// decided about its declaration. Bazel builds from a live one and may
+/// build from an undecided one. Of any other the note says where it is
+/// declared and why no build comes from it, and never that Bazel builds
+/// from its lock: a `WORKSPACE` hub left beside `MODULE.bazel` on Bazel 9
+/// names a lock that Bazel does not read.
+fn hub_words(hub: &Hub) -> String {
+    let locks = hub.locks.iter();
+    let locks = locks.filter(|lock| lock.role == LockRole::PackageLock);
+    let locks: Vec<&str> = locks
+        .map(|lock| lock.path.as_deref().unwrap_or(&lock.label))
+        .collect();
+    let from = match locks.is_empty() {
+        true => String::new(),
+        false => format!(" from {}", locks.join(", ")),
+    };
+    let (name, packages) = (hub_name(hub), hub.ecosystem.display_name());
+    let unused = |why: &str| {
+        format!(
+            "{name} is declared in {} for {packages} packages{from}, and Bazel does not build \
+             from that declaration: {why}",
+            hub.decl.site.file
+        )
+    };
+    match &hub.liveness {
+        Liveness::Live => format!("{name} builds {packages} packages{from}"),
+        Liveness::Undecided { .. } => format!("{name} may build {packages} packages{from}"),
+        // Bazel builds the packages, from locks of that module's own
+        // repository, which are no files of this workspace.
+        Liveness::NotRootModule => format!(
+            "{name} builds {packages} packages for a module that is not the root module, from \
+             that module's own lock files"
+        ),
+        Liveness::Dead { why } => unused(why),
+        Liveness::Shadowed { by } => {
+            unused(&format!("{} gives its name to another repository", by.file))
+        }
+        Liveness::NotImported => unused("no use_repo statement imports its repository"),
+        Liveness::DevDependencyDropped => {
+            unused("it is a dev dependency, and --ignore_dev_dependency drops it")
+        }
+    }
+}
+
 /// What the run says once about the root `root`, from the model read for
 /// one project. Every text names the root and facts of the root, so the
 /// projects of one root say it once between them.
@@ -525,27 +733,12 @@ fn model_warnings(root: &RootRef, model: &Result<BazelWorkspace, Gap>, out: &mut
         say(Code::WorkspaceUnreadable, detail);
     }
 
-    // A ruleset socket-patch patches for: a report-only shape is counted
-    // below and governs nothing.
-    let patched = |ruleset: Ruleset| ruleset.ecosystem().is_some();
-    let mut rulesets: Vec<String> = Vec::new();
-    for hub in ws.hubs.iter().filter(|hub| patched(hub.ruleset)) {
-        let locks = hub.locks.iter();
-        let locks = locks.filter(|lock| lock.role == LockRole::PackageLock);
-        let locks: Vec<&str> = locks
-            .map(|lock| lock.path.as_deref().unwrap_or(&lock.label))
-            .collect();
-        let (name, packages) = (hub.ruleset.name(), hub.ecosystem.display_name());
-        rulesets.push(match locks.is_empty() {
-            true => format!("{name} builds {packages} packages"),
-            false => format!(
-                "{name} builds {packages} packages from {}",
-                locks.join(", ")
-            ),
-        });
-    }
-    let signals = ws.signals.iter().filter(|signal| patched(signal.ruleset));
-    rulesets.extend(signals.map(|signal| {
+    // Every hub is described, a report-only one too: it is no ruleset
+    // socket-patch patches for, but governance answers for its ecosystem
+    // and the locks it reads are refused, so the run says that it is
+    // there. (Only its hand-written pins are counted below.)
+    let mut rulesets: Vec<String> = ws.hubs.iter().map(hub_words).collect();
+    rulesets.extend(ws.signals.iter().map(|signal| {
         let name = signal.ruleset.name();
         format!("{name} is declared, and the lock file it reads was not found")
     }));
@@ -601,7 +794,15 @@ fn model_warnings(root: &RootRef, model: &Result<BazelWorkspace, Gap>, out: &mut
             Tier::Supported => "supported",
             Tier::Beta => "beta",
             Tier::Legacy => "legacy",
-            Tier::Refused(_) => "not supported",
+            Tier::Refused(TierRefusal::TooOld | TierRefusal::ExperimentalBzlmod) => "not supported",
+            // The release is not what is refused here: what the root
+            // declares in a WORKSPACE file is.
+            Tier::Refused(TierRefusal::WorkspaceRemoved) => {
+                "WORKSPACE declarations refused, Bazel 9 and newer read none"
+            }
+            Tier::Refused(TierRefusal::LineUnknown) => {
+                "WORKSPACE declarations refused, no Bazel release is pinned"
+            }
         };
         // The launcher files the line was read from: a project that pins
         // its own Bazel has another line than the root, and says why.
@@ -648,7 +849,9 @@ fn model_warnings(root: &RootRef, model: &Result<BazelWorkspace, Gap>, out: &mut
 #[cfg(test)]
 mod tests {
     use super::*;
-    use socket_patch_core::bazel::ignore::{IgnoreLine, IgnoreLineRow, SocketTree};
+    use socket_patch_core::bazel::exec::{self, Overlay, Txn};
+    use socket_patch_core::bazel::ignore::BAZELIGNORE;
+    use socket_patch_core::bazel::ignore::{self, IgnoreLine, IgnoreLineRow, SocketTree};
     use socket_patch_core::bazel::version::BazelVersion;
     use socket_patch_core::crawlers::bazel_root::boundary_file_in;
 
@@ -658,6 +861,11 @@ mod tests {
          npm = use_extension(\"@aspect_rules_js//npm:extensions.bzl\", \"npm\")\n\
          npm.npm_translate_lock(name = \"npm\", pnpm_lock = \"//:pnpm-lock.yaml\")\n\
          use_repo(npm, \"npm\")\n",
+    );
+    const JS_WORKSPACE: (&str, &str) = (
+        "WORKSPACE",
+        "load(\"@aspect_rules_js//npm:repositories.bzl\", \"npm_translate_lock\")\n\
+         npm_translate_lock(name = \"npm\", pnpm_lock = \"//:pnpm-lock.yaml\")\n",
     );
     const PNPM_LOCK: (&str, &str) = ("pnpm-lock.yaml", "lockfileVersion: '9.0'\n");
     const BAZEL_9: (&str, &str) = (".bazelversion", "9.3.2\n");
@@ -689,6 +897,25 @@ mod tests {
             let path = self.at(rel);
             std::fs::create_dir_all(path.parent().expect("a parent")).expect("mkdir");
             std::fs::write(path, text).expect("write");
+        }
+
+        fn get(&self, rel: &str) -> String {
+            std::fs::read_to_string(self.at(rel)).expect("read")
+        }
+
+        /// Lands what a transaction staged, as the commit of a seam does.
+        fn land(&self, txn: &Overlay<'_>) {
+            for (rel, bytes) in txn.changes() {
+                match bytes {
+                    Some(bytes) => self.put(rel, std::str::from_utf8(bytes).expect("text")),
+                    None => std::fs::remove_file(self.at(rel)).expect("remove"),
+                }
+            }
+        }
+
+        /// The codes of [`Repo::said`], in order.
+        fn codes(said: &[(Code, String)]) -> Vec<&'static str> {
+            said.iter().map(|(code, _)| code.as_str()).collect()
         }
 
         /// What the run says about this checkout. A workspace file above
@@ -733,8 +960,9 @@ mod tests {
         repo.put("sub/.bazelversion", "8.8.2\n");
         let loader = Loader::new(RunCx::default());
         let at_root = loader.load(&repo.top);
-        // What a run has read of a root is what it keeps seeing: the next
-        // project of the root opens no file a second time.
+        // What a run has read of a root is what it keeps seeing until it
+        // is told of a commit: the next project of the root opens no file
+        // a second time.
         repo.put("MODULE.bazel", "module(name = \"changed\")\n");
         let at_sub = loader.load(&repo.at("sub"));
         let (root, sub) = (outer(&at_root), outer(&at_sub));
@@ -784,6 +1012,13 @@ mod tests {
         assert_eq!(loader.take_warnings(), []);
     }
 
+    /// What a case of the index test puts at the index's path.
+    enum Held<'a> {
+        Nothing,
+        Text(&'a str),
+        Directory,
+    }
+
     #[test]
     fn the_owned_index_is_read_once_per_root_and_a_faulty_one_yields_no_lane_context() {
         let line = IgnoreLine::new("", SocketTree::Vendor).expect("a line");
@@ -794,18 +1029,25 @@ mod tests {
             added_final_newline: false,
         }]);
         let rendered = recorded.render().expect("a valid index");
-        let cases: [(Option<&str>, Result<&Index, &str>); 4] = [
-            (None, Ok(&Index::default())),
-            (Some(&rendered), Ok(&recorded)),
+        let cases: [(Held<'_>, Result<&Index, &str>); 5] = [
+            (Held::Nothing, Ok(&Index::default())),
+            (Held::Text(&rendered), Ok(&recorded)),
             (
-                Some("{\"ignoreLines\": [], \"pins\": []}\n"),
+                Held::Text("{\"ignoreLines\": [], \"pins\": []}\n"),
                 Err("modified"),
             ),
-            (Some("{\"name\": \"mine\"}\n"), Err("foreign")),
+            (Held::Text("{\"name\": \"mine\"}\n"), Err("foreign")),
+            // Unreadable is not absent: a directory of the name is no
+            // empty index, and nothing is written beside it.
+            (Held::Directory, Err("unreadable")),
         ];
-        for (file, want) in cases {
+        for (at, (held, want)) in cases.into_iter().enumerate() {
             let repo = Repo::new(&[JS_MODULE, PNPM_LOCK, BAZEL_9, ("app/package.json", "{}")]);
-            file.into_iter().for_each(|text| repo.put(INDEX_PATH, text));
+            match held {
+                Held::Nothing => {}
+                Held::Text(text) => repo.put(INDEX_PATH, text),
+                Held::Directory => std::fs::create_dir_all(repo.at(INDEX_PATH)).expect("mkdir"),
+            }
             let loader = Loader::new(RunCx::default());
             let (at_root, at_app) = (loader.load(&repo.top), loader.load(&repo.at("app")));
             let root = outer(&at_root);
@@ -814,7 +1056,7 @@ mod tests {
                 (IndexState::Ours(index), Ok(want)) => {
                     assert_eq!(index, want);
                     let Ok(cx) = cx else {
-                        panic!("{file:?}: no lane context");
+                        panic!("case {at}: no lane context");
                     };
                     let model = root.model().expect("a model");
                     assert!(std::ptr::eq(cx.index, index) && std::ptr::eq(cx.ws, model));
@@ -825,6 +1067,7 @@ mod tests {
                 }
                 (IndexState::Faulty(fault), Err(want)) => {
                     let kind = match fault {
+                        IndexFault::Unreadable => "unreadable",
                         IndexFault::Modified(_) => "modified",
                         IndexFault::Foreign => "foreign",
                         _ => "other",
@@ -832,12 +1075,50 @@ mod tests {
                     assert_eq!(kind, want);
                     assert_eq!(cx.err(), Some(NoLaneCx::Index(fault)));
                 }
-                (found, want) => panic!("{file:?}: {found:?}, not {want:?}"),
+                (found, want) => panic!("case {at}: {found:?}, not {want:?}"),
             }
             // Read once: a later write is not seen, by any project of the root.
-            repo.put(INDEX_PATH, "{}");
+            if !matches!(held, Held::Directory) {
+                repo.put(INDEX_PATH, "{}");
+            }
             assert!(std::ptr::eq(root.index(), outer(&at_app).index()));
         }
+    }
+
+    /// The index is read with the root's first model and not when a lane
+    /// first asks: the root channel writes a line and its row straight to
+    /// the disk, and a lane must not be handed a recorded line that its
+    /// own model and files say is not there.
+    #[test]
+    fn a_lane_is_handed_an_index_as_old_as_its_model_and_files() {
+        let repo = Repo::new(&[JS_MODULE, PNPM_LOCK, BAZEL_9]);
+        let loader = Loader::new(RunCx::default());
+        let loaded = loader.load(&repo.top);
+        // Another writer of the run, after the load and before the lane.
+        let line = IgnoreLine::new("app", SocketTree::Vendor).expect("a line");
+        let added = ignore::insert(&FileText::Absent, std::slice::from_ref(&line));
+        let added = added.expect("an edit").expect("a line to add");
+        let mut index = Index::default();
+        index.record_lines(added.rows);
+        repo.put(
+            BAZELIGNORE,
+            std::str::from_utf8(&added.bytes).expect("text"),
+        );
+        repo.put(INDEX_PATH, &index.render().expect("a valid index"));
+
+        let cx = outer(&loaded).lane_cx(Mode::Hosted, HubId(0));
+        let cx = cx.expect("a lane context");
+        assert_eq!(cx.index, &Index::default());
+        assert!(!cx.ws.ignore.covers(line.as_str()));
+        assert_eq!(cx.files.read(BAZELIGNORE), FileText::Absent);
+        // Told of the write, the loader hands out all three as they are.
+        loader.committed(&repo.top);
+        let loaded = loader.load(&repo.top);
+        let cx = outer(&loaded).lane_cx(Mode::Hosted, HubId(0));
+        let cx = cx.expect("a lane context");
+        assert_eq!(cx.index, &index);
+        assert!(cx.ws.ignore.covers(line.as_str()));
+        assert_eq!(cx.files.read(BAZELIGNORE), FileText::Bytes(added.bytes));
     }
 
     /// Wave 4 is inert: whatever a command says about its run, no tool is
@@ -886,7 +1167,6 @@ mod tests {
         let loader = Loader::new(RunCx::default());
         loader.load(&repo.top);
         let said = repo.said(&loader);
-        let codes: Vec<&str> = said.iter().map(|(code, _)| code.as_str()).collect();
         let want = [
             "bazel_workspace_version_untested",
             "bazel_workspace_rc_unread",
@@ -894,25 +1174,48 @@ mod tests {
             "bazel_workspace_detected",
             "bazel_workspace_out_of_scope",
         ];
-        assert_eq!(codes, want, "{said:?}");
+        assert_eq!(Repo::codes(&said), want, "{said:?}");
         assert!(said[1].1.contains("user.bazelrc") && said[2].1.contains("tools/bazel"));
 
-        // Bazel 4 is said once as unsupported, not also as untested.
-        let workspace = (
-            "WORKSPACE",
-            "load(\"@aspect_rules_js//npm:repositories.bzl\", \"npm_translate_lock\")\n\
-             npm_translate_lock(name = \"npm\", pnpm_lock = \"//:pnpm-lock.yaml\")\n",
-        );
-        let repo = Repo::new(&[workspace, PNPM_LOCK, (".bazelversion", "4.2.4\n")]);
+        // An `import` of an rc file that is missing is an rc file that
+        // was not read. It is no workspace file that cannot be read.
+        let rc = (".bazelrc", "import %workspace%/missing.bazelrc\n");
+        let repo = Repo::new(&[JS_MODULE, PNPM_LOCK, BAZEL_9, rc]);
         let loader = Loader::new(RunCx::default());
         loader.load(&repo.top);
         let said = repo.said(&loader);
-        let codes: Vec<&str> = said.iter().map(|(code, _)| code.as_str()).collect();
+        let want = [
+            "bazel_workspace_rc_unread",
+            "bazel_workspace_detected",
+            "bazel_workspace_out_of_scope",
+        ];
+        assert_eq!(Repo::codes(&said), want, "{said:?}");
+        assert!(said[0].1.contains("missing.bazelrc"), "{said:?}");
+
+        // Bazel 4 is said once as unsupported, not also as untested.
+        let repo = Repo::new(&[JS_WORKSPACE, PNPM_LOCK, (".bazelversion", "4.2.4\n")]);
+        let loader = Loader::new(RunCx::default());
+        loader.load(&repo.top);
+        let said = repo.said(&loader);
         let want = [
             "bazel_workspace_version_unsupported",
             "bazel_workspace_detected",
         ];
-        assert_eq!(codes, want, "{said:?}");
+        assert_eq!(Repo::codes(&said), want, "{said:?}");
+        assert!(said[0].1.contains("Bazel 4 and older are"), "{said:?}");
+
+        // So is Bzlmod on Bazel 5, where it is an experiment.
+        let repo = Repo::new(&[JS_MODULE, PNPM_LOCK, (".bazelversion", "5.4.1\n")]);
+        let loader = Loader::new(RunCx::default());
+        loader.load(&repo.top);
+        let said = repo.said(&loader);
+        let want = [
+            "bazel_workspace_version_unsupported",
+            "bazel_workspace_detected",
+            "bazel_workspace_out_of_scope",
+        ];
+        assert_eq!(Repo::codes(&said), want, "{said:?}");
+        assert!(said[0].1.contains("Bzlmod on Bazel 5 is"), "{said:?}");
 
         // A root where Bazel builds no registry package says nothing of
         // its Bazel version, pinned or not.
@@ -920,6 +1223,106 @@ mod tests {
         let loader = Loader::new(RunCx::default());
         loader.load(&repo.top);
         assert_eq!(repo.said(&loader), []);
+    }
+
+    /// The text of the one `bazel_workspace_detected` line of a load.
+    fn detected(repo: &Repo, project: &str) -> String {
+        let loader = Loader::new(RunCx::default());
+        loader.load(&repo.at(project));
+        let said = repo.said(&loader);
+        let mut found = said
+            .iter()
+            .filter(|(code, _)| *code == Code::WorkspaceDetected);
+        let (Some((_, detail)), None) = (found.next(), found.next()) else {
+            panic!("one detected line, not {said:?}");
+        };
+        let at = format!("Bazel workspace {} ", repo.top.display());
+        let detail = detail.strip_prefix(&at);
+        detail.expect("the line names the root").to_string()
+    }
+
+    /// The note never says that Bazel builds from the lock of a hub it
+    /// does not evaluate, and calls a Bazel release unsupported only when
+    /// the release is what is refused.
+    #[test]
+    fn a_hub_bazel_does_not_evaluate_is_described_as_declared_and_unused() {
+        let dead = "rules_js is declared in WORKSPACE for npm packages from";
+        let no_workspace = "and Bazel does not build from that declaration: this Bazel \
+                            configuration evaluates no WORKSPACE file";
+        // A WORKSPACE hub left beside a MODULE.bazel that declares none,
+        // on a Bazel that reads no WORKSPACE file.
+        let plain = ("MODULE.bazel", "module(name = \"plain\")\n");
+        let repo = Repo::new(&[plain, JS_WORKSPACE, PNPM_LOCK, BAZEL_9]);
+        let want = format!(
+            "(Bazel 9.3.2 from .bazelversion, WORKSPACE declarations refused, Bazel 9 and newer \
+             read none; Bzlmod): {dead} pnpm-lock.yaml, {no_workspace}"
+        );
+        assert_eq!(detected(&repo, ""), want);
+
+        // The same hub beside a live one: each is described as it stands.
+        let legacy = JS_WORKSPACE.1.replace("//:pnpm", "//legacy:pnpm");
+        let repo = Repo::new(&[JS_MODULE, ("WORKSPACE", &legacy), PNPM_LOCK, BAZEL_9]);
+        repo.put("legacy/pnpm-lock.yaml", PNPM_LOCK.1);
+        repo.put("legacy/BUILD.bazel", "");
+        let want = format!(
+            "(Bazel 9.3.2 from .bazelversion, supported; Bzlmod): rules_js builds npm packages \
+             from pnpm-lock.yaml; {dead} legacy/pnpm-lock.yaml, {no_workspace}"
+        );
+        assert_eq!(detected(&repo, "legacy"), want);
+
+        // A MODULE.bazel hub on Bazel 5, which reads no MODULE.bazel.
+        let repo = Repo::new(&[JS_MODULE, PNPM_LOCK, (".bazelversion", "5.4.1\n")]);
+        let want = "(Bazel 5.4.1 from .bazelversion, not supported; WORKSPACE): rules_js is \
+                    declared in MODULE.bazel for npm packages from pnpm-lock.yaml, and Bazel does \
+                    not build from that declaration: Bzlmod is off, so Bazel never reads \
+                    MODULE.bazel";
+        assert_eq!(detected(&repo, ""), want);
+
+        // No pinned release: the WORKSPACE hub may be built from or not.
+        let repo = Repo::new(&[JS_WORKSPACE, PNPM_LOCK]);
+        let said = detected(&repo, "");
+        let tier = "(Bazel unknown, WORKSPACE declarations refused, no Bazel release is pinned; ";
+        assert!(said.starts_with(tier), "{said}");
+        let hub = "): rules_js may build npm packages from pnpm-lock.yaml";
+        assert!(said.ends_with(hub), "{said}");
+    }
+
+    /// A root whose only hub is a shape socket-patch reports and does not
+    /// patch is a workspace all the same: governance answers for its
+    /// ecosystem, so the run says what it found and what Bazel runs.
+    #[test]
+    fn a_report_only_hub_is_described_with_the_bazel_that_reads_it() {
+        let poetry = (
+            "WORKSPACE",
+            "load(\"@com_sonia_rules_poetry//rules_poetry:poetry.bzl\", \"poetry\")\n\
+             poetry(name = \"poetry\", lockfile = \"//:poetry.lock\", \
+             pyproject = \"//:pyproject.toml\")\n",
+        );
+        let repo = Repo::new(&[
+            poetry,
+            ("poetry.lock", "# empty\n"),
+            ("pyproject.toml", "[tool.poetry]\n"),
+            (".bazelversion", "4.2.4\n"),
+            ("tools/bazel", "#!/bin/sh\n"),
+        ]);
+        let loader = Loader::new(RunCx::default());
+        let loaded = loader.load(&repo.top);
+        let governed = Governance::Governed(vec![HubId(0)]);
+        assert_eq!(loaded.governance(Ecosystem::Pypi), governed);
+        let said = repo.said(&loader);
+        let want = [
+            "bazel_workspace_version_unsupported",
+            "bazel_workspace_rc_unread",
+            "bazel_workspace_detected",
+        ];
+        assert_eq!(Repo::codes(&said), want, "{said:?}");
+        assert!(said[1].1.contains("tools/bazel"), "{said:?}");
+        let want = format!(
+            "Bazel workspace {} (Bazel 4.2.4 from .bazelversion, not supported; WORKSPACE): \
+             rules_poetry (recognized, not patched) builds python packages from poetry.lock",
+            repo.top.display()
+        );
+        assert_eq!(said[2].1, want);
     }
 
     #[test]
@@ -966,6 +1369,167 @@ mod tests {
         let unplaced = above_warning(&above, false);
         assert_eq!(unplaced.code, Code::WorkspaceUnreadable);
         assert!(!unplaced.detail.contains("remove"), "{}", unplaced.detail);
+        // Which of the two a marker is, by the paths alone: above the
+        // boundary, or the probe's answer at a root inside it. A relative
+        // one is what the probe gives back when it could not resolve the
+        // project, and an unbounded run has nothing above.
+        let repo = Repo::new(&[]);
+        let boundary = ReadBoundary::Workspace {
+            root: repo.at("repo"),
+        };
+        assert!(is_outside(&boundary, &repo.at("WORKSPACE")));
+        assert!(!is_outside(&boundary, &repo.at("repo/MODULE.bazel")));
+        assert!(!is_outside(&boundary, &repo.at("repo/ws/MODULE.bazel")));
+        assert!(!is_outside(&boundary, Path::new("MODULE.bazel")));
+        assert!(!is_outside(&ReadBoundary::Unbounded, &repo.at("WORKSPACE")));
+    }
+
+    /// A workspace file above the repository that is a link to a file
+    /// inside it is above the repository all the same: where it lies is
+    /// decided by its path, not by where the link leads. (Unix only:
+    /// creating a link on Windows needs a privilege the test may not have.)
+    #[cfg(unix)]
+    #[test]
+    fn a_linked_workspace_file_above_the_repository_is_still_above_it() {
+        for confirmed in [true, false] {
+            let target = "repo/tools/WORKSPACE.outer";
+            let outer = Repo::new(&[(target, "\tx = 1\n"), ("repo/app/package.json", "{}")]);
+            outer.put("repo/.git/HEAD", "ref: refs/heads/main\n");
+            if confirmed {
+                outer.put(".bazelversion", "7.7.2\n");
+            }
+            let marker = outer.at("WORKSPACE");
+            std::os::unix::fs::symlink(outer.at(target), &marker).expect("a link");
+            let loader = Loader::new(RunCx::default());
+            let loaded = loader.load(&outer.at("repo/app"));
+            let probe = Probe::RootOutsideBoundary {
+                marker: marker.clone(),
+                confirmed,
+            };
+            assert_eq!(loaded.probe(), probe);
+            let npm = loaded.governance(Ecosystem::Npm);
+            match confirmed {
+                true => assert!(matches!(npm, Governance::Undetermined(_)), "{npm:?}"),
+                false => assert_eq!(npm, Governance::NotGoverned),
+            }
+            // The warning says what governance does: a remedy where it
+            // refuses, and "changes nothing" where it does not.
+            let said = outer.said(&loader);
+            let [(Code::WorkspaceAboveRepo, detail)] = said.as_slice() else {
+                panic!("the file is above the repository, not {said:?}");
+            };
+            assert!(
+                detail.starts_with(&marker.display().to_string()),
+                "{detail}"
+            );
+            assert_eq!(detail.contains("refused"), confirmed, "{detail}");
+        }
+    }
+
+    /// The other answer of the same probe value, end to end: a project the
+    /// probe cannot place under a root inside the boundary. (Linux only:
+    /// the disks of macOS and Windows refuse a name that is not Unicode.)
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_project_no_text_can_name_under_its_root_is_unreadable_and_not_above() {
+        use std::os::unix::ffi::OsStrExt as _;
+        let repo = Repo::new(&[JS_MODULE, PNPM_LOCK, BAZEL_9]);
+        let odd = repo.top.join(std::ffi::OsStr::from_bytes(b"caf\xe9"));
+        let project = odd.join("app");
+        std::fs::create_dir_all(&project).expect("a directory whose name is not UTF-8");
+        let loader = Loader::new(RunCx::default());
+        let loaded = loader.load(&project);
+        assert!(loaded.models().is_empty());
+        let npm = loaded.governance(Ecosystem::Npm);
+        assert!(matches!(npm, Governance::Undetermined(_)), "{npm:?}");
+        let said = repo.said(&loader);
+        let [(Code::WorkspaceUnreadable, detail)] = said.as_slice() else {
+            panic!("the project cannot be placed, not {said:?}");
+        };
+        let named = repo.at("MODULE.bazel").display().to_string();
+        assert!(detail.contains(&named), "{detail}");
+        assert!(!detail.contains("remove"), "{detail}");
+    }
+
+    /// Every project with no root inside its read boundary has the same
+    /// roots, none. What lies above the boundary tells them apart, so it
+    /// is part of what a load is kept by: a project under a workspace
+    /// somebody builds above its repository must not be handed the load
+    /// of an unrelated checkout that was asked about first.
+    #[test]
+    fn projects_with_no_root_inside_are_told_apart_by_what_lies_above() {
+        let checkout = |files: &[(&str, &str)]| {
+            let repo = Repo::new(files);
+            repo.put("repo/.git/HEAD", "ref: refs/heads/main\n");
+            repo.put("repo/app/package.json", "{}");
+            repo
+        };
+        let plain = checkout(&[]);
+        let built = checkout(&[("WORKSPACE", "\tx = 1\n"), (".bazelversion", "7.7.2\n")]);
+        for built_first in [true, false] {
+            let loader = Loader::new(RunCx::default());
+            let load = |repo: &Repo| loader.load(&repo.at("repo/app"));
+            let (at_plain, at_built) = match built_first {
+                true => {
+                    let at_built = load(&built);
+                    (load(&plain), at_built)
+                }
+                false => (load(&plain), load(&built)),
+            };
+            assert!(!Arc::ptr_eq(&at_plain, &at_built));
+            // A stray workspace file above the temporary directory of
+            // this machine may be reported for `plain`: it is never a
+            // workspace somebody builds above `repo`, which is what makes
+            // an ecosystem undetermined.
+            let npm = |loaded: &Loaded| loaded.governance(Ecosystem::Npm);
+            let (on_plain, on_built) = (npm(&at_plain), npm(&at_built));
+            let undetermined = |found: &Governance| matches!(found, Governance::Undetermined(_));
+            assert!(undetermined(&on_built), "{on_built:?}");
+            assert!(!undetermined(&on_plain), "{on_plain:?}");
+        }
+    }
+
+    /// A root with no model, over made-up values: `detect` gives none only
+    /// when the view shows no boundary file where the probe saw one, and
+    /// the two agree on every kind of file, so no disk produces the case
+    /// short of a race. It is unreadable, and never "Bazel builds nothing
+    /// here".
+    #[test]
+    fn a_root_with_no_model_is_unreadable_and_never_ungoverned() {
+        let root = RootRef {
+            root: PathBuf::from("nowhere"),
+            project_rel: String::new(),
+            boundary_levels: 0,
+        };
+        let gap = Gap {
+            token: WORKSPACE_UNREADABLE,
+            file: String::new(),
+            detail: "the root holds no workspace file that can be read".to_string(),
+        };
+        let model: Result<BazelWorkspace, Gap> = Err(gap.clone());
+        let mut said = Vec::new();
+        model_warnings(&root, &model, &mut said);
+        let want = Warning {
+            code: Code::WorkspaceUnreadable,
+            detail: gap.detail.clone(),
+        };
+        assert_eq!(said, [want]);
+
+        let loaded = Loaded {
+            survey: Survey {
+                roots: vec![root.clone()],
+                above: None,
+            },
+            states: vec![Arc::new(RootState::new(&root))],
+            models: vec![model],
+            run: RunPolicy::Never,
+        };
+        let no_cx = outer(&loaded).lane_cx(Mode::Hosted, HubId(0)).err();
+        assert_eq!(no_cx, Some(NoLaneCx::Workspace(&gap)));
+        for (ecosystem, governance) in loaded.governed() {
+            let undetermined = matches!(governance, Governance::Undetermined(_));
+            assert!(undetermined, "{ecosystem:?}: {governance:?}");
+        }
     }
 
     #[test]
@@ -1043,7 +1607,7 @@ mod tests {
             });
             let root = outer(&loads[0].1);
             let models = root.state.models.lock().expect("the models");
-            let kept = (models.0, models.1.len());
+            let kept = (models.reads, models.kept.len());
             assert_eq!(kept, (2, 1), "{}: three projects, two reads", dir.display());
             let fresh = DiskView::new(root.root());
             for (project, loaded) in [&loads[0], &loads[2]] {
@@ -1055,6 +1619,158 @@ mod tests {
                 assert_eq!(seen.model(), read.as_ref(), "{shown}");
             }
         }
+    }
+
+    /// A root whose sub-projects each pin their own Bazel is read once for
+    /// each, and each read is a model as large as the lock it parsed: a
+    /// root keeps a few of them, and the one that keeps being used.
+    #[test]
+    fn a_root_keeps_a_few_models_whatever_its_projects_pin() {
+        let repo = Repo::new(&[JS_MODULE, PNPM_LOCK, BAZEL_9]);
+        let pinned = KEPT_MODELS + 3;
+        for project in 0..pinned {
+            repo.put(&format!("pinned{project}/.bazelversion"), "9.3.2\n");
+        }
+        let loader = Loader::new(RunCx::default());
+        let at_root = loader.load(&repo.top);
+        let root = outer(&at_root);
+        let fresh = DiskView::new(root.root());
+        let load = |project: String| {
+            let loaded = loader.load(&repo.at(&project));
+            let seen = outer(&loaded);
+            assert_eq!(seen.root().project_rel, project);
+            let read = read_workspace(seen.root(), &fresh);
+            assert_eq!(seen.model(), read.as_ref(), "`{project}`");
+        };
+        // The second project with the root's own launcher files is read,
+        // and its read is the copy for the others.
+        load("plain".to_string());
+        for project in 0..pinned {
+            // Its own `.bazelversion`: another launcher set, another read.
+            load(format!("pinned{project}"));
+            // The copy that was just used is not the one that goes.
+            load(format!("plain{project}"));
+        }
+        let models = root.state.models.lock().expect("the models");
+        let kept = (models.reads, models.kept.len());
+        assert_eq!(kept, (pinned + 2, KEPT_MODELS));
+    }
+
+    /// The loader cannot see a commit of its own run, so the seam that
+    /// commits tells it. Two projects of one root add their lines to the
+    /// root's `.bazelignore` in turn, each through a transaction over the
+    /// files the loader hands out: without the call the second reads the
+    /// files of before the first commit and writes its line and row away.
+    #[test]
+    fn a_commit_is_followed_once_the_loader_is_told_of_it() {
+        let apps = [("app1/package.json", "{}"), ("app2/package.json", "{}")];
+        let repo = Repo::new(&[JS_MODULE, PNPM_LOCK, BAZEL_9, apps[0], apps[1]]);
+        let loader = Loader::new(RunCx::default());
+        // Held across both commits.
+        let before = loader.load(&repo.at("app1"));
+        let mut lines = Vec::new();
+        for project in ["app1", "app2"] {
+            let loaded = loader.load(&repo.at(project));
+            let root = outer(&loaded);
+            let IndexState::Ours(index) = root.index() else {
+                panic!("{project}: a faulty index");
+            };
+            let mut index = index.clone();
+            let mut txn = Overlay::new(root.files());
+            let line = IgnoreLine::new(project, SocketTree::Vendor).expect("a line");
+            let added = ignore::insert(&txn.read(BAZELIGNORE), std::slice::from_ref(&line));
+            let added = added.expect("an edit").expect("a line to add");
+            index.record_lines(added.rows);
+            txn.write(BAZELIGNORE, added.bytes);
+            txn.write(
+                INDEX_PATH,
+                index.render().expect("a valid index").into_bytes(),
+            );
+            repo.land(&txn);
+            loader.committed(&root.root().root);
+            lines.push(line);
+        }
+        let both = "app1/.socket/vendor\napp2/.socket/vendor\n";
+        assert_eq!(repo.get(BAZELIGNORE), both);
+
+        let after = loader.load(&repo.at("app1"));
+        let root = outer(&after);
+        let IndexState::Ours(index) = root.index() else {
+            panic!("a faulty index");
+        };
+        let recorded: Vec<&IgnoreLine> = index.ignore_lines.iter().map(|row| &row.line).collect();
+        assert_eq!(recorded, lines.iter().collect::<Vec<_>>());
+        let model = root.model().expect("a model");
+        assert!(lines.iter().all(|line| model.ignore.covers(line.as_str())));
+        assert_eq!(
+            root.files().read(BAZELIGNORE).as_bytes(),
+            Some(both.as_bytes())
+        );
+
+        // The load held from before the commits is the root as it was:
+        // no row, no line, and no base for a transaction.
+        assert!(!Arc::ptr_eq(&before, &after));
+        let old = outer(&before);
+        assert_eq!(old.index(), &IndexState::Ours(Index::default()));
+        assert_eq!(old.files().read(BAZELIGNORE), FileText::Absent);
+        assert!(!old
+            .model()
+            .expect("a model")
+            .ignore
+            .covers(lines[0].as_str()));
+        // `refresh` catches up with the rows of another writer only over
+        // a transaction that reads the disk.
+        let mut held = Index::default();
+        exec::refresh(&mut held, &Overlay::new(old.files())).expect("an index");
+        assert_eq!(held, Index::default());
+        exec::refresh(&mut held, &Overlay::new(root.files())).expect("an index");
+        assert_eq!(&held, index);
+
+        // A commit under a project is a commit under every root above it,
+        // however the directory is spelled.
+        loader.committed(&repo.tmp.path().join("app2"));
+        assert!(!Arc::ptr_eq(&after, &loader.load(&repo.at("app1"))));
+        // Elsewhere, nothing that was read is dropped. What was read
+        // here is let go, where no caller holds it.
+        let other = Repo::new(&[JS_MODULE, PNPM_LOCK, BAZEL_9]);
+        let at_other = loader.load(&other.top);
+        let at_app1 = Arc::downgrade(&loader.load(&repo.at("app1")));
+        assert!(
+            at_app1.upgrade().is_some(),
+            "the loader keeps the last loads"
+        );
+        loader.committed(&repo.top);
+        assert!(Arc::ptr_eq(&at_other, &loader.load(&other.top)));
+        assert!(at_app1.upgrade().is_none(), "a load of before the commit");
+    }
+
+    /// A load that was read while a commit landed is of neither side of
+    /// it: it is not kept, and the project is read again.
+    #[test]
+    fn a_load_read_across_a_commit_is_not_kept() {
+        let repo = Repo::new(&[JS_MODULE, PNPM_LOCK, BAZEL_9]);
+        let loader = Loader::new(RunCx::default());
+        let survey = loader.survey(&repo.top);
+        let key = project_key(&survey);
+        let Err(commits) = loader.held(&key) else {
+            panic!("nothing is loaded yet");
+        };
+        let read = Arc::new(loader.read(survey.clone()));
+        loader.committed(&repo.top);
+        assert!(loader.keep(&key, Arc::clone(&read), commits).is_none());
+        let loaded = loader.load(&repo.top);
+        assert!(!Arc::ptr_eq(&read, &loaded));
+        assert!(!std::ptr::eq(outer(&read).files(), outer(&loaded).files()));
+        // With no commit in between, a read is what the project keeps.
+        let survey = loader.survey(&repo.at("app"));
+        let key = project_key(&survey);
+        let Err(commits) = loader.held(&key) else {
+            panic!("nothing is loaded for the project yet");
+        };
+        let read = Arc::new(loader.read(survey));
+        let kept = loader.keep(&key, Arc::clone(&read), commits);
+        assert!(kept.is_some_and(|kept| Arc::ptr_eq(&kept, &read)));
+        assert!(Arc::ptr_eq(&read, &loader.load(&repo.at("app"))));
     }
 
     /// A model can be as large as the lock it parsed: the loader keeps the

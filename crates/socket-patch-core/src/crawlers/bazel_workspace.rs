@@ -2,10 +2,13 @@
 //! on disk behind the pure layer's [`FileView`], and the entry that reads
 //! a root into a [`BazelWorkspace`].
 //!
-//! A [`DiskView`] is made per root and kept for the run. Every answer is
-//! remembered, so the readers, the recognizers and later the gates of one
-//! root read each file once, and a file that changes during the run is
-//! seen as it first was. Nothing is read before somebody asks.
+//! A [`DiskView`] is made per root and kept while the run changes
+//! nothing under it. Every answer is remembered, so the readers, the
+//! recognizers and later the gates of one root read each file once, and
+//! a file that changes during the run is seen as it first was: after a
+//! commit of the run itself a new view is made (the CLI's loader drops
+//! the old one when it is told of the commit), and no transaction is
+//! based on a view from before one. Nothing is read before somebody asks.
 //!
 //! What a view will not do:
 //!
