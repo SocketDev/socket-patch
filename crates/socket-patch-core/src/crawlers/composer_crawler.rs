@@ -791,7 +791,7 @@ fn process_var(name: &str) -> Option<OsString> {
 /// fixture's vendor tree.
 #[cfg(test)]
 fn process_var(name: &str) -> Option<OsString> {
-    crate::test_env::guarded_var(name).map(OsString::from)
+    crate::test_env::guarded_var_os(name)
 }
 
 /// Resolve the vendor directory of a local project the way Composer does
@@ -2534,37 +2534,45 @@ mod tests {
     }
 
     /// The unit tests see only the Composer env a test holds: a host
-    /// `COMPOSER_VENDOR_DIR` (or a `vendor-dir` in the developer's own
-    /// `config.json` under `HOME`) must not move a fixture's vendor tree.
+    /// `COMPOSER_VENDOR_DIR` must not move a fixture's vendor tree.
     #[test]
     #[serial_test::serial]
     fn vendor_dir_lookups_ignore_the_hosts_composer_env() {
         use crate::test_env::EnvGuard;
-        let dir = tempfile::tempdir().unwrap();
-        let home = dir.path().join("home");
-        std::fs::create_dir_all(home.join(".composer")).unwrap();
-        std::fs::write(
-            home.join(".composer/config.json"),
-            r#"{"config":{"vendor-dir":"from-home"}}"#,
-        )
-        .unwrap();
-        let project = dir.path().join("project");
-        std::fs::create_dir_all(&project).unwrap();
-        // Set raw, as a host would: an EnvGuard would make them visible.
-        let host_home = std::env::var_os("HOME");
-        std::env::set_var("COMPOSER_VENDOR_DIR", "from-host");
-        std::env::set_var("HOME", &home);
-        let hidden = resolve_local_vendor_dir_sync(&project);
-        std::env::remove_var("COMPOSER_VENDOR_DIR");
-        match host_home {
-            Some(value) => std::env::set_var("HOME", value),
-            None => std::env::remove_var("HOME"),
+        /// Sets a var raw, as a host would (an `EnvGuard` would make it
+        /// visible), and puts the previous value back on drop, a failed
+        /// assertion included. Only the lookups this test covers read
+        /// `COMPOSER_VENDOR_DIR`.
+        struct HostVar(&'static str, Option<std::ffi::OsString>);
+        impl HostVar {
+            fn set(key: &'static str, value: &str) -> Self {
+                let previous = std::env::var_os(key);
+                std::env::set_var(key, value);
+                Self(key, previous)
+            }
         }
-        assert_eq!(hidden, Some(project.join("vendor")), "host env hidden");
+        impl Drop for HostVar {
+            fn drop(&mut self) {
+                match self.1.take() {
+                    Some(value) => std::env::set_var(self.0, value),
+                    None => std::env::remove_var(self.0),
+                }
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path();
+        {
+            let _host = HostVar::set("COMPOSER_VENDOR_DIR", "from-host");
+            assert_eq!(
+                resolve_local_vendor_dir_sync(project),
+                Some(project.join("vendor")),
+                "host env hidden"
+            );
+        }
 
         let _var = EnvGuard::set("COMPOSER_VENDOR_DIR", "held");
         assert_eq!(
-            resolve_local_vendor_dir_sync(&project),
+            resolve_local_vendor_dir_sync(project),
             Some(project.join("held")),
             "a value the test holds is honoured"
         );

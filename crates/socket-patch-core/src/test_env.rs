@@ -17,8 +17,14 @@ fn guarded() -> MutexGuard<'static, Vec<OsString>> {
 /// host set. For lookups that must not see the developer's environment
 /// (`utils::go_env` in the unit tests).
 pub(crate) fn guarded_var(key: &str) -> Option<String> {
+    guarded_var_os(key).and_then(|v| v.into_string().ok())
+}
+
+/// [`guarded_var`] without the UTF-8 requirement, for lookups that read
+/// `std::env::var_os` in production (`crawlers::composer_crawler`).
+pub(crate) fn guarded_var_os(key: &str) -> Option<OsString> {
     let held = guarded().iter().any(|k| k == key);
-    held.then(|| std::env::var(key).ok()).flatten()
+    held.then(|| std::env::var_os(key)).flatten()
 }
 
 /// Sets or removes env vars and puts the previous values back on drop, a
