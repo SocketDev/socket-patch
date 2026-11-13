@@ -512,9 +512,6 @@ class Rules(Synthetic):
                 fetch = {"fetch": "tool"} if ruleset != "rules_rs" else {}
                 errors = self.check("heavy", ruleset, [fixture(pins=pins, cells=[cell], **fetch)])
                 self.assert_one(errors, "only with a restored repository cache")
-                # No committed matrix can say so yet (`Schemas` below), and
-                # the message does not pretend otherwise.
-                self.assertIn("takes no `cache` key yet", errors[0])
                 restored = dict(cell, cache="restored")
                 self.assertEqual(self.check("heavy", ruleset, [fixture(pins=pins, cells=[restored], **fetch)]), [])
         # A ruleset that needs no toolchain to fetch may be in the tier as it is.
@@ -760,17 +757,16 @@ class Schemas(unittest.TestCase):
              "cell": ("CellSpec",)}
     # (shape, struct, key) the scripts read and the struct lacks, with why
     # that is no drift. The first three are one thing spelled per shape.
-    # The last three are open: the planner is ahead of the schemas, and the
-    # fields are for the owners of baseline_light.rs and baseline_heavy.rs
-    # to add (`lanes: Vec<Lane>` on the heavy `Fixture`, `cache:
-    # Option<String>` on both `CellSpec`s). An entry whose field has landed
+    # The last two are open: the planner is ahead of the heavy schema, and
+    # the fields are for the owner of baseline_heavy.rs to add (`lanes:
+    # Vec<Lane>` on the heavy `Fixture`, `cache: Option<String>` on the heavy
+    # `CellSpec`; the light one has it). An entry whose field has landed
     # is dead and may go; it fails nothing while it stays.
     ACCEPTED = {
         ("light", "Fixture", "fixture"): "the heavy spelling of `path`; the planner tries both",
         ("heavy", "Fixture", "path"): "the light spelling of `fixture`",
         ("heavy", "Fixture", "loopback_repository"): "only a light fixture has an unpinned Coursier hub",
         ("heavy", "Fixture", "lanes"): "OPEN: a heavy lane test cannot be listed under its fixture",
-        ("light", "CellSpec", "cache"): "OPEN: no light cell can say `\"cache\": \"restored\"`",
         ("heavy", "CellSpec", "cache"): "OPEN: no Go or Rust cell can be `pr` with a restored cache",
     }
 
@@ -830,8 +826,8 @@ class Schemas(unittest.TestCase):
                              "MATRIX.json can carry it")
 
     def test_the_open_keys_are_the_ones_the_planner_says_are_open(self):
-        """The module docstring and the Go / Rust message name them, so an
-        author is not told to write a key the hermetic suite refuses."""
+        """The module docstring names them, so an author can tell which key
+        the hermetic suite still refuses, and in which matrix."""
         still_open = {entry for entry, why in self.ACCEPTED.items() if why.startswith("OPEN")}
         self.assertEqual({key for _, _, key in still_open}, {"lanes", "cache"})
         self.assertIn("Two keys are read here that the suite's schemas do not take yet", tool.__doc__)

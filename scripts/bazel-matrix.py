@@ -24,10 +24,11 @@ otherwise plan nothing and look covered.
 Two keys are read here that the suite's schemas do not take yet: `lanes`
 under a heavy fixture (the heavy `Fixture` of baseline_heavy.rs has no such
 field, so a heavy lane test cannot be listed until it does) and `cache` in
-a cell (neither `CellSpec` has it). Both schemas refuse unknown keys, so no
-committed matrix can carry them today. scripts/tests/test_bazel_matrix.py
-holds every key this script reads to the fields of those structs and names
-these two as the open ones.
+a cell of a heavy matrix (the heavy `CellSpec` has no such field; the light
+one takes the key). The heavy schema refuses unknown keys, so no committed
+heavy matrix can carry them today. scripts/tests/test_bazel_matrix.py holds
+every key this script reads to the fields of those structs and names these
+two as the open ones.
 
 An entry is one test on one Bazel release on one runner. Its tier is `pr`
 (the path-filtered pull-request run and every wider run) or `nightly`
@@ -523,9 +524,7 @@ def fixture_errors(fixtures=FIXTURES):
                     if ruleset in GO_RUST and cell.get("cache") != "restored":
                         errors.append(f"{at}: a Go or Rust cell is in the pull-request tier "
                                       'only with a restored repository cache (`"cache": '
-                                      '"restored"`). The suite\'s `CellSpec` takes no `cache` '
-                                      "key yet (baseline_heavy.rs), so until it does the cell "
-                                      "is `nightly`")
+                                      '"restored"`); without that key the cell is `nightly`')
     return errors
 
 
