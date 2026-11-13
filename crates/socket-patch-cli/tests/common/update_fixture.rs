@@ -209,10 +209,26 @@ pub fn real_binary_hash() -> String {
 /// is the canary that fails loudly if a platform stops tolerating this.
 pub fn make_served_binary() -> (Vec<u8>, bool) {
     let mut bytes = std::fs::read(real_binary()).expect("read real binary");
+    // The updater rejects an extracted binary above 256 MiB
+    // (`MAX_BINARY_BYTES` in core/src/update/download.rs). A test build
+    // that outgrows it fails every test that serves it with "exceeds the
+    // ...-byte cap", far from the cause: name the cause here. It happened
+    // to the coverage build, which keeps every function of every
+    // dependency (ci.yml builds it with `CARGO_PROFILE_DEV_DEBUG=0`).
+    const UPDATER_BINARY_CAP: usize = 256 * 1024 * 1024;
+    const TRAILER: &[u8] = b"\nSOCKET-PATCH-E2E-TRAILER-0123456789abcdef0123456789abcdef\n";
+    assert!(
+        bytes.len() + TRAILER.len() <= UPDATER_BINARY_CAP,
+        "the built socket-patch binary is {} bytes, above the updater's \
+         {UPDATER_BINARY_CAP}-byte cap on a downloaded binary, so it cannot \
+         be served as a release payload: build this profile with less debug \
+         info (CARGO_PROFILE_DEV_DEBUG=0)",
+        bytes.len()
+    );
     if cfg!(target_os = "macos") {
         (bytes, false)
     } else {
-        bytes.extend_from_slice(b"\nSOCKET-PATCH-E2E-TRAILER-0123456789abcdef0123456789abcdef\n");
+        bytes.extend_from_slice(TRAILER);
         (bytes, true)
     }
 }

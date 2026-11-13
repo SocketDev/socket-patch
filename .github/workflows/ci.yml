@@ -694,6 +694,14 @@ jobs:
       contents: read
     env:
       VEXCTL_VERSION: v0.3.0
+      # No DWARF in the instrumented build, as in e2e-build. The self-update
+      # tests serve the built `socket-patch` binary as the release payload,
+      # and the updater rejects an extracted binary above 256 MiB
+      # (MAX_BINARY_BYTES in core/src/update/download.rs). An instrumented
+      # binary keeps every function of every dependency; with the dev
+      # profile's line tables on top it passed that cap. A panic still
+      # names its file and line, and backtraces keep function names.
+      CARGO_PROFILE_DEV_DEBUG: '0'
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
