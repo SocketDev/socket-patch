@@ -212,9 +212,14 @@ impl Classifier {
     /// ([`output_tree::marked_dir`]), so a directory that holds none, which
     /// is every directory outside a Bazel tree, costs no `stat`; the ones
     /// a name points at are judged by [`Classifier::tree_at`]. The walker
-    /// neither enters a returned root nor looks at anything in it. A
-    /// directory only a tracked `--vendor_dir` names has no marker to list
-    /// and is not found here.
+    /// neither enters a returned root nor looks at anything in it.
+    ///
+    /// A directory only a tracked `--vendor_dir` names has no marker to
+    /// list. It is returned all the same when it is `dir` or an entry of
+    /// `dir` ([`Classifier::tracked_at`]), so that a walker keeps out of
+    /// a vendor directory `bazel vendor` has yet to mark. A classifier
+    /// that was told of none, which is every classifier outside a Bazel
+    /// workspace, pays nothing for it.
     pub fn trees_marked_by<'a>(
         &self,
         dir: &Path,
@@ -233,7 +238,40 @@ impl Classifier {
             let own = self.tree_at(&marked).tree;
             trees.extend(own.filter(|tree| tree.root == marked));
         }
+        for tracked in self.tracked_at(dir) {
+            if !trees.iter().any(|tree| tree.root == tracked.root) {
+                trees.push(tracked);
+            }
+        }
         trees
+    }
+
+    /// The tracked vendor directories that are `dir` itself or entries of
+    /// it, each spelled the way the caller spells `dir`: the roots a
+    /// walker that lists `dir` must stay out of. The tracked directories
+    /// are kept absolute, as declared and as resolved, so `dir` is
+    /// compared both ways too, and only when there is one to compare with.
+    pub fn tracked_at(&self, dir: &Path) -> Vec<Tree> {
+        if self.vendor_dirs.is_empty() {
+            return Vec::new();
+        }
+        let spelled = std::path::absolute(dir).ok();
+        let real = spelled.as_deref().and_then(|at| resolve(at, MAX_LINK_HOPS));
+        let here = |at: &Path| [&spelled, &real].into_iter().flatten().any(|d| d == at);
+        let mut roots: Vec<PathBuf> = Vec::new();
+        for tracked in &self.vendor_dirs {
+            let root = match (here(tracked), tracked.parent(), tracked.file_name()) {
+                (true, _, _) => dir.to_path_buf(),
+                (false, Some(parent), Some(name)) if here(parent) => dir.join(name),
+                _ => continue,
+            };
+            if !roots.contains(&root) {
+                roots.push(root);
+            }
+        }
+        let class = PathClass::VendorDir;
+        let tree = |root| Tree { class, root };
+        roots.into_iter().map(tree).collect()
     }
 }
 

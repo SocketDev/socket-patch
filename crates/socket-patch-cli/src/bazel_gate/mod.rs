@@ -39,12 +39,88 @@
 //! section 4) is not among them yet: its `finish` takes the captured
 //! originals of the group commit, a type the hosted engine's package
 //! defines, so the file and its `mod` line land in wave 5, before the
-//! first seam that calls `finish`.
+//! first seam that calls `finish`. `scope.rs` is the one check of a
+//! command's scope root against Bazel's own trees.
+//!
+//! # Rules for a seam
+//!
+//! A seam is written once: a lane lands later by changing its lane file,
+//! the lane table and the executor, and no file here. So a seam file of
+//! this directory keeps to the following, and
+//! `tests/command_module_layering.rs` scans every file here for the ones a
+//! scan can see.
+//!
+//! - It asks the gate through a `GateCx` (`bazel::gate`) built as
+//!   `GateCx { roots, .., ..GateCx::new(..) }`: the struct update keeps
+//!   it compiling when the context gains a member, and `roots` is the root
+//!   probe's answer, which `GateCx::new` cannot know and defaults to "one
+//!   root". A context without it judges nested roots as one. Under
+//!   `Probe::Nested` the models it passes are the ones read for the
+//!   project of the request. The three other members `GateCx::new`
+//!   defaults are as easy to forget and fail closed: with no `patch_url`
+//!   every hosted request is refused (`fetch_blocked`), with no `host` a
+//!   lane that wires a path refuses, and a default
+//!   `allow_patch_conflicts` drops the user's flag. A seam sets what the
+//!   run knows of each.
+//! - It takes its [`LaneCx`] from [`LoadedRoot::lane_cx`] and its `RunCx`
+//!   by struct update, never as a literal.
+//! - It never matches on a write class, an owned write, a hook kind, a tag
+//!   operation, a run kind, an anchor, an attest basis, a staleness
+//!   behaviour or a withhold kind, and names no owned path as a literal:
+//!   it hands plans to `exec::apply`, takes the paths of a commit from
+//!   `exec::touched`, undoes through `exec::revert` and repairs through
+//!   `exec::reconcile`.
+//! - It maps a refusal the same way everywhere: the code is
+//!   `Code::refusal(mode, reason)`, which is `Some` for every refusal the
+//!   gate hands a hosted or vendored caller, a lane's own included;
+//!   `details.token` and `details.lift` ride along; it never branches on a
+//!   token. `not_resolved_by_hub` is a refusal like any other and never a
+//!   reason to fall back to the native writer. A plan may carry the
+//!   advisory `bazel_workspace_out_of_scope`: it is printed like any other.
+//! - `lanes::discover` answers `Discovered { pins, cannot_tell }`: a
+//!   reader keeps or withholds per ecosystem (`unknown_for`) and uses the
+//!   pins of the others. It never treats "cannot tell" as "none".
+//! - A write under a Bazel root goes `bazel_root_writes::before_*`,
+//!   `exec::refresh`, `exec::touched`, `exec::apply`, and `exec::refresh`
+//!   again after every root-channel call. `apply` inserts no `.bazelignore`
+//!   line: `ExecError::LineNotHidden` maps to
+//!   `bazel_workspace_ignore_line_needed`, and there is no conversion from
+//!   `ExecError` to a refusal, so each seam maps the error to a code. After
+//!   a failed commit the index is read again (`IndexFault::Stale` and
+//!   `Missing` are answers, not bugs).
+//! - After each commit, one that failed part-way included, it calls
+//!   [`Loader::committed`], and builds no transaction on
+//!   [`LoadedRoot::files`] or `LaneCx.files` from before it. It holds the
+//!   `Arc<Loaded>` of the project it works on: the loader keeps only the
+//!   last few.
+//! - No seam lands a transaction or an overlay by itself. A commit
+//!   under a Bazel root is the anchored group commit (the hosted engine's
+//!   package lands it): under the root lock, staged and renamed, refused
+//!   through a linked level. Until it exists a seam writes nothing under
+//!   a root's owned directory, and no `.bazelignore`, except through
+//!   `bazel_root_writes`.
+//! - `exec::revert` answers `Reverted { written, dropped, kept }`. A
+//!   `Kept::Pin` or `Kept::PinOfUnhandled` entry is a row that was not
+//!   undone, with nothing of that row written; another row of the same
+//!   patch may have been staged all the same. So a seam undoes one patch
+//!   at a time, on an overlay of its own and over a copy of the index,
+//!   and hands the overlay's changes to the commit only when `kept` is
+//!   empty. Otherwise it drops both, deletes no artifact and reports
+//!   `Code::revert_incomplete(mode)` with the file of each entry: a patch
+//!   is undone whole or not at all. A pin's restore goes through
+//!   `lanes::Restore`, on a copy of the row's files, written back only on
+//!   `Restored`.
+//! - `repair` reports what `exec::reconcile` reports and writes neither a
+//!   missing index nor an absent ignore line: the root channel re-adds the
+//!   line, and the index is never rebuilt from memory.
+//! - A command that needs no governance answer asks [`Loader::probe`] or
+//!   [`Loader::survey`] and never [`Loader::load`], which reads.
 
 pub mod agent;
 pub mod agent_go;
 pub mod commands;
 pub mod hosted;
+pub mod scope;
 pub mod vendored;
 pub mod vex;
 
@@ -632,6 +708,11 @@ fn counted(count: usize, thing: &str) -> Option<String> {
 }
 
 /// The dependency system as the detection note names it.
+///
+/// A workspace that may run under more than one is named by each of them,
+/// as a list no reader can group another way: the hybrid system is itself
+/// "Bzlmod and WORKSPACE", and joined to its neighbours with "or" it read
+/// as "WORKSPACE or Bzlmod and WORKSPACE or Bzlmod".
 fn system_words(system: &DepSystem) -> String {
     match system {
         DepSystem::Bzlmod => "Bzlmod".to_string(),
@@ -639,8 +720,18 @@ fn system_words(system: &DepSystem) -> String {
         DepSystem::Hybrid => "Bzlmod and WORKSPACE".to_string(),
         DepSystem::Neither => "no dependency system".to_string(),
         DepSystem::DualMode { systems, .. } => {
-            let each: Vec<String> = systems.iter().map(system_words).collect();
-            format!("{}, not decided", each.join(" or "))
+            let one = |system: &DepSystem| match system {
+                DepSystem::Hybrid => "Bzlmod and WORKSPACE together".to_string(),
+                other => system_words(other),
+            };
+            let each: Vec<String> = systems.iter().map(one).collect();
+            let listed = match each.as_slice() {
+                [] => "no system named".to_string(),
+                [only] => only.clone(),
+                [first, second] => format!("{first} or {second}"),
+                [most @ .., last] => format!("{}, or {last}", most.join(", ")),
+            };
+            format!("dependency system not decided: {listed}")
         }
         DepSystem::Unknown { .. } => "dependency system unknown".to_string(),
     }
@@ -1793,6 +1884,31 @@ mod tests {
         assert_eq!(
             outer(&again).model().map(|ws| &ws.hubs),
             outer(&held).model().map(|ws| &ws.hubs)
+        );
+    }
+
+    /// The detection note names a workspace that may run under several
+    /// dependency systems by each of them, in words that group one way.
+    #[test]
+    fn a_dual_mode_workspace_is_named_by_each_system_it_may_run() {
+        let dual = |systems: &[DepSystem]| {
+            system_words(&DepSystem::DualMode {
+                systems: systems.to_vec(),
+                why: String::new(),
+            })
+        };
+        assert_eq!(system_words(&DepSystem::Hybrid), "Bzlmod and WORKSPACE");
+        assert_eq!(
+            dual(&[DepSystem::Workspace, DepSystem::Hybrid, DepSystem::Bzlmod]),
+            "dependency system not decided: WORKSPACE, Bzlmod and WORKSPACE together, or Bzlmod"
+        );
+        assert_eq!(
+            dual(&[DepSystem::Bzlmod, DepSystem::Hybrid]),
+            "dependency system not decided: Bzlmod or Bzlmod and WORKSPACE together"
+        );
+        assert_eq!(
+            dual(&[DepSystem::Neither]),
+            "dependency system not decided: no dependency system"
         );
     }
 

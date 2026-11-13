@@ -346,6 +346,17 @@ codes! {
     /// A same-ecosystem lock that no hub reads was left as found, and no
     /// `.npmrc` was created beside the governed lock.
     RedirectSideFileSkipped = "redirect_bazel_side_file_skipped", Advisory, Info;
+    /// `rollback` or `remove` could not undo a pin and undid nothing of
+    /// it: a user file still carries the pin in a form the record does
+    /// not match, or a row is of a kind this release cannot restore
+    /// (revision 4, 2.8 item 4). Nothing the file still names was
+    /// deleted, so the build keeps passing, patched. An advisory, because
+    /// the run goes on with the other pins; a warning, because the patch
+    /// the user asked to remove is still built.
+    RedirectRevertIncomplete = "redirect_bazel_revert_incomplete", Advisory, Warn;
+    /// Vendored twin of [`Code::RedirectRevertIncomplete`]: the vendored
+    /// artifact the pin names is kept as well.
+    VendorRevertIncomplete = "vendor_bazel_revert_incomplete", Advisory, Warn;
 
     // ── VEX: `vex_bazel_` plus the withhold kind ─────────────────────
     /// The candidate rests on a host tree, or on a lock no live hub reads.
@@ -422,6 +433,18 @@ impl Code {
         })
     }
 
+    /// The code of an undo that left a pin in place in `mode`: what a
+    /// seam reports for each pin that `exec::revert` kept
+    /// (`Kept::Pin`, `Kept::PinOfUnhandled`), with the file the entry
+    /// names. `None` in agent mode, which records no pin to undo.
+    pub const fn revert_incomplete(mode: Mode) -> Option<Code> {
+        match mode {
+            Mode::Hosted => Some(Self::RedirectRevertIncomplete),
+            Mode::Vendored => Some(Self::VendorRevertIncomplete),
+            Mode::Agent => None,
+        }
+    }
+
     /// The code `vex` reports when it withholds a statement for `kind`.
     pub const fn withheld(kind: WithholdKind) -> Code {
         match kind {
@@ -487,7 +510,9 @@ mod tests {
 
     /// A typo in one string of the table would ship as a contract
     /// identifier. Each string is rebuilt from its variant's name instead,
-    /// and the totals are the 56 of design 6 plus the four of revision 4.
+    /// and the totals are the 56 of design 6 plus the six of revision 4
+    /// (two hook codes, two tool-run advisories and the two
+    /// `revert_incomplete` advisories).
     #[test]
     fn every_string_is_its_variant_name_in_one_of_the_five_families() {
         for code in Code::ALL {
@@ -496,7 +521,7 @@ mod tests {
         }
         let strings: BTreeSet<&str> = Code::ALL.iter().map(|code| code.as_str()).collect();
         assert_eq!(strings.len(), Code::ALL.len(), "two codes share a string");
-        assert_eq!(Code::ALL.len(), 60);
+        assert_eq!(Code::ALL.len(), 62);
         let sizes = [
             "bazel_workspace_",
             "bazel_agent_",
@@ -505,7 +530,7 @@ mod tests {
             "vex_bazel_",
         ]
         .map(|prefix| family(prefix).len());
-        assert_eq!(sizes, [15, 4, 21, 13, 7]);
+        assert_eq!(sizes, [15, 4, 22, 14, 7]);
     }
 
     /// Hosted and vendored refusals differ in the prefix alone, so a
@@ -584,9 +609,10 @@ mod tests {
 
     /// A code's kind is where a script finds it, so the split is pinned to
     /// the one of design 6 as revision 4 extends it (two hook codes at
-    /// run level, two tool-run advisories): every workspace code is
-    /// run-level bar the engine's one, and there are eleven advisories, 26
-    /// refusals, seven withheld statements and one sidecar advisory.
+    /// run level, two tool-run advisories, two `revert_incomplete`
+    /// advisories): every workspace code is run-level bar the engine's
+    /// one, and there are thirteen advisories, 26 refusals, seven withheld
+    /// statements and one sidecar advisory.
     #[test]
     fn kinds_split_the_codes_as_the_design_does() {
         let mut run_level = of_kind(Kind::RunLevel);
@@ -597,6 +623,20 @@ mod tests {
         assert_eq!(only(Kind::EngineWarning), [in_memory]);
         assert_eq!(only(Kind::SidecarAdvisory), [Code::AgentCoursierPinHazard]);
         let sizes = [Kind::Advisory, Kind::Refusal, Kind::Withheld].map(|kind| of_kind(kind).len());
-        assert_eq!(sizes, [11, 26, 7]);
+        assert_eq!(sizes, [13, 26, 7]);
+    }
+
+    /// An undo that kept a pin has a code in each mode that records pins,
+    /// the mode's prefix and one name, and none in agent mode.
+    #[test]
+    fn an_incomplete_revert_has_a_code_per_mode_that_pins() {
+        let hosted = Code::revert_incomplete(Mode::Hosted).expect("hosted");
+        let vendored = Code::revert_incomplete(Mode::Vendored).expect("vendored");
+        assert_eq!(hosted.as_str(), "redirect_bazel_revert_incomplete");
+        assert_eq!(vendored.as_str(), "vendor_bazel_revert_incomplete");
+        assert_eq!(Code::revert_incomplete(Mode::Agent), None);
+        for code in [hosted, vendored] {
+            assert_eq!((code.kind(), code.level()), (Kind::Advisory, Level::Warn));
+        }
     }
 }

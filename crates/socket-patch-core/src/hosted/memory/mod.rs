@@ -16,6 +16,11 @@
 //! lockfile inventory (disk discovers them only through installed-tree
 //! crawlers), so their files raise `ecosystem_unsupported_in_memory`. A dry
 //! run still requests reference grants, exactly like the disk dry run.
+//! And an ecosystem whose packages a Bazel ruleset builds, or may build,
+//! in a project is left alone there
+//! (`bazel_workspace_unsupported_in_memory`): what a pin does to a Bazel
+//! build is decided over files this engine is never handed (the `bazel`
+//! module has the rule).
 //!
 //! Cargo member manifests are chosen by content on disk (`members`,
 //! `exclude`, path dependencies and `[patch]` paths, anywhere but
@@ -59,6 +64,7 @@ use crate::vendor::lock_inventory::{
 };
 use tokio_util::sync::CancellationToken;
 
+mod bazel;
 pub(crate) mod discover;
 pub mod limits;
 pub mod roots;
@@ -688,9 +694,42 @@ async fn engine(
     }
     let mut policy_filtered: Vec<FilteredEntry> = Vec::new();
 
+    // The Bazel roots among the streamed files (design 3, HZ-20). In a
+    // repository with no Bazel boundary file this is one pass over the
+    // paths and everything below it is a no-op.
+    let bazel = bazel::Workspaces::of(&files);
+    // Nothing in a tree Bazel owns is a project (HZ-03). Selection left
+    // out the trees its listing marks; the session adds the vendor
+    // directories only a streamed rc file names, and holds a root the
+    // caller names to the same rule.
+    let bazel_vendor_dirs = bazel.vendor_dirs();
     let mut root_list: Vec<String> = match &options.project_roots {
-        Some(roots) => roots.clone(),
-        None => roots::detect_roots(files.keys().map(String::as_str), ecosystems).0,
+        Some(roots) => {
+            let paths = files.keys().map(String::as_str);
+            let trees = roots::bazel_trees_listed(paths, &bazel_vendor_dirs);
+            let (inside, outside): (Vec<String>, Vec<String>) =
+                roots.iter().cloned().partition(|root| trees.hold(root));
+            if !inside.is_empty() {
+                warnings.push(EngineWarning::new(
+                    crate::bazel::codes::Code::WorkspaceOutputTreeSkipped.as_str(),
+                    format!(
+                        "{} not scanned: Bazel owns the directory (an output base, a cache or \
+                         a vendor directory), and nothing in one is a project to patch",
+                        inside
+                            .iter()
+                            .map(|root| format!("`{root}`"))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                    None,
+                ));
+            }
+            outside
+        }
+        None => {
+            let paths = files.keys().map(String::as_str);
+            roots::detect_roots_outside(paths, ecosystems, &bazel_vendor_dirs).0
+        }
     };
     // The full policy (paths from the file too) judges every root before
     // the project limit; roots named in `projectRoots` are explicit.
@@ -815,6 +854,12 @@ async fn engine(
     if options.trust_lockfile_config {
         refuse_governed_pnpm_members(&files, &mut states);
     }
+    // What Bazel builds, or may build, in each project: read while the
+    // files are still here, applied when the packages are known.
+    let bazel_claims: BTreeMap<String, bazel::Claims> = root_list
+        .iter()
+        .filter_map(|root| Some((root.clone(), bazel.claims(root)?)))
+        .collect();
     drop(files);
     demote_cargo_members(&mut states, &mut warnings);
     phases.mark("roots");
@@ -837,6 +882,12 @@ async fn engine(
             .filter_map(|e| discover::supplement_purl(&e.purl))
             .filter(|p| ecosystem_allowed(ecosystems, p))
             .collect();
+        // An ecosystem Bazel builds here is left alone (HZ-20): never
+        // looked up, so never offered, pinned or rewritten.
+        let purls = match bazel_claims.get(&state.root) {
+            Some(claims) => claims.withhold(purls, &state.root, &mut warnings),
+            None => purls,
+        };
         let mut admitted: Vec<String> = Vec::with_capacity(purls.len());
         for purl in purls {
             match policy.admits_purl(&purl) {

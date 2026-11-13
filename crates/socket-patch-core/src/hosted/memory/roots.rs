@@ -22,6 +22,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use crate::bazel::codes::Code;
 use crate::bazel::output_tree;
 use crate::crawlers::bazel_output::Classifier;
+use crate::crawlers::bazel_workspace::tracked_vendor_dirs;
 use crate::formats::registry;
 use crate::utils::python_lock::is_python_lock_name;
 
@@ -137,7 +138,7 @@ fn allowed(ecosystems: Option<&[String]>, eco: &str) -> bool {
 
 /// `dir` and the directories above it inside the repository, nearest
 /// first, ending with the repository root (`""`).
-fn at_or_above(dir: &str) -> impl Iterator<Item = &str> {
+pub(super) fn at_or_above(dir: &str) -> impl Iterator<Item = &str> {
     std::iter::once(dir).chain(strict_ancestors(dir))
 }
 
@@ -180,10 +181,20 @@ fn marked_by(path: &str) -> Option<String> {
 /// Almost no list has one, and then nothing more is done; the directories
 /// the names point at are judged by the classifier, over the files listed
 /// in and beside them.
-pub(super) fn bazel_trees_listed<'a>(paths: impl Iterator<Item = &'a str> + Clone) -> ListedTrees {
+///
+/// `tracked` are the directories that tracked rc files name with
+/// `--vendor_dir`, in the list's own spelling (`/`-separated, relative to
+/// its root). Such a directory is a tree with no marker listed: one
+/// `bazel vendor` has yet to fill, or whose marker git does not track
+/// (design 3, HZ-03). A caller that has read no rc file passes none.
+pub(super) fn bazel_trees_listed<'a>(
+    paths: impl Iterator<Item = &'a str> + Clone,
+    tracked: &[String],
+) -> ListedTrees {
+    let declared = || tracked.iter().filter(|dir| !dir.is_empty()).cloned();
     let pointed = ListedTrees(paths.clone().filter_map(marked_by).collect());
     if pointed.0.is_empty() {
-        return pointed;
+        return ListedTrees(declared().collect());
     }
     // Every file a rule asks for lies inside the directory, but for the
     // marker of a contents-cache entry, which lies beside it and whose
@@ -198,7 +209,8 @@ pub(super) fn bazel_trees_listed<'a>(paths: impl Iterator<Item = &'a str> + Clon
             .tree
             .is_some()
     };
-    ListedTrees(pointed.0.into_iter().filter(is_tree).collect())
+    let marked = pointed.0.into_iter().filter(is_tree);
+    ListedTrees(marked.chain(declared()).collect())
 }
 
 /// The detected roots (sorted) and the marker paths that did not make one.
@@ -212,8 +224,23 @@ where
     I: IntoIterator<Item = &'a str>,
     I::IntoIter: Clone,
 {
+    detect_roots_outside(paths, ecosystems, &[])
+}
+
+/// [`detect_roots`] for a caller that has read the tracked rc files:
+/// nothing in one of the `vendor_dirs` they name is a root either
+/// ([`bazel_trees_listed`]).
+pub(crate) fn detect_roots_outside<'a, I>(
+    paths: I,
+    ecosystems: Option<&[String]>,
+    vendor_dirs: &[String],
+) -> (Vec<String>, Vec<IgnoredPath>)
+where
+    I: IntoIterator<Item = &'a str>,
+    I::IntoIter: Clone,
+{
     let paths = paths.into_iter();
-    let bazel_trees = bazel_trees_listed(paths.clone());
+    let bazel_trees = bazel_trees_listed(paths.clone(), vendor_dirs);
     let mut ignored: Vec<IgnoredPath> = Vec::new();
     let mut markers: BTreeMap<String, BTreeSet<&'static str>> = BTreeMap::new();
     let mut marker_paths: BTreeMap<String, Vec<String>> = BTreeMap::new();
@@ -414,9 +441,45 @@ const MAX_WALKED_ENTRIES: usize = 500_000;
 ///
 /// Nor does it enter a tree Bazel owns ([`BazelTreesMet`]): nothing below
 /// the root of one is read, and what the root itself holds is dropped.
+/// The classifier knows the vendor directories that the tracked rc files
+/// of the Bazel roots at and above `dir` name (`tracked_vendor_dirs`), so
+/// one that holds no marker yet is not entered either. An rc file of a Bazel
+/// root the walk meets below `dir` is not read for it: that root's own
+/// run reads it.
+///
+/// One limit, on purpose. A tree root is judged when the walk is about to
+/// enter one of its subdirectories, or by a marker among the entries the
+/// walk lists. A root with no subdirectory whose marker git ignores is
+/// met neither way, and a lockfile in it would count. No tree Bazel
+/// writes has that shape: an output base and a vendor directory hold one
+/// directory per repository, a repository-cache entry holds the one file
+/// `file`, and the marker of a contents-cache entry lies beside the
+/// entry, where an ignore rule that hides it hides the entry too. So the
+/// walk does not `stat` the marker names in every leaf directory that
+/// holds a lockfile, which every project of every other repository would
+/// pay for.
 fn marker_paths_below(dir: &Path) -> WalkedMarkers {
-    let classifier = Arc::new(Classifier::new());
-    let met: Arc<Mutex<BazelTreesMet>> = Arc::default();
+    let tracked = tracked_vendor_dirs(dir);
+    let mut met = BazelTreesMet::default();
+    // A tracked vendor directory is a root before the walk meets it: it
+    // may hold no marker and no subdirectory to be judged by. The tracked
+    // directories lie under resolved roots, and the walk spells what it
+    // meets from `dir` as given, so each is re-spelled below `dir`. The
+    // walked directory itself is the caller's to judge.
+    if let Some(real) = std::fs::canonicalize(dir)
+        .ok()
+        .filter(|_| !tracked.is_empty())
+    {
+        let below = tracked.iter().filter_map(|at| at.strip_prefix(&real).ok());
+        for at in below.filter(|rel| !rel.as_os_str().is_empty()) {
+            let spelled = dir.join(at);
+            if spelled.is_dir() {
+                met.note(spelled);
+            }
+        }
+    }
+    let classifier = Arc::new(Classifier::with_vendor_dirs(tracked));
+    let met = Arc::new(Mutex::new(met));
     let (judge, entered) = (Arc::clone(&classifier), Arc::clone(&met));
     let walk = ignore::WalkBuilder::new(dir)
         .hidden(false)
@@ -969,7 +1032,7 @@ mod tests {
     ];
 
     fn listed_trees(paths: &[&str]) -> Vec<String> {
-        bazel_trees_listed(paths.iter().copied()).into_sorted()
+        bazel_trees_listed(paths.iter().copied(), &[]).into_sorted()
     }
 
     /// HZ-02 and HZ-03 in a path list: a lockfile inside a tree Bazel owns
@@ -1003,7 +1066,10 @@ mod tests {
         let locks = BAZEL_LAYOUT
             .into_iter()
             .filter(|path| marker_ecosystem(split_path(path).1).is_some());
-        assert_eq!(bazel_trees_listed(locks.clone()), ListedTrees::default());
+        assert_eq!(
+            bazel_trees_listed(locks.clone(), &[]),
+            ListedTrees::default()
+        );
         assert_eq!(detect_roots(locks, None).1.len(), 0);
 
         // A vendor directory at the listing's root: the list is one tree.
@@ -1133,7 +1199,7 @@ mod tests {
             paths.push(format!("{contents}/1/go.mod"));
         }
         let listed = || paths.iter().map(String::as_str);
-        let trees = bazel_trees_listed(listed());
+        let trees = bazel_trees_listed(listed(), &[]);
         assert_eq!(trees.0.len(), 2 * ENTRIES + 1);
         assert!(trees.hold("vendor_src/+http_archive+dep"));
         assert!(trees.hold(".cache/contents/00000007/1/sub"));
@@ -1145,6 +1211,60 @@ mod tests {
         assert_eq!(ignored.len(), 2 * ENTRIES + 1);
         let code = Code::WorkspaceOutputTreeSkipped.as_str();
         assert!(ignored.iter().all(|i| i.reason == code));
+    }
+
+    /// HZ-03: a vendor directory that only a tracked `--vendor_dir` names
+    /// carries no marker, in a list (git does not track it, or `bazel
+    /// vendor` has not run) and on disk. It is a tree all the same, in a
+    /// list for the caller that read the rc file and on disk for the walk,
+    /// which reads the rc files of the Bazel roots at and above it.
+    #[tokio::test]
+    async fn a_tracked_vendor_dir_is_a_tree_without_a_marker() {
+        let listed = [
+            "MODULE.bazel",
+            ".bazelrc",
+            "go.sum",
+            "third_party/bazel/yarn.lock",
+            "third_party/bazel/+npm+dep/package-lock.json",
+            "third_party/other/yarn.lock",
+        ];
+        let tracked = ["third_party/bazel".to_string()];
+        let unaware = detect_roots(listed, None).0;
+        assert!(unaware.contains(&"third_party/bazel".to_string()));
+        let (found, ignored) = detect_roots_outside(listed, None, &tracked);
+        assert_eq!(found, ["", "third_party/other"]);
+        let code = Code::WorkspaceOutputTreeSkipped.as_str();
+        assert_eq!(ignored.len(), 2);
+        assert!(ignored.iter().all(|i| i.reason == code));
+        // The root of the list is never a tree by a flag's say-so.
+        let root = bazel_trees_listed(listed.into_iter(), &[String::new()]);
+        assert_eq!(root, ListedTrees::default());
+
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().canonicalize().unwrap();
+        for file in listed {
+            let path = file.split('/').fold(ws.clone(), |dir, name| dir.join(name));
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "").unwrap();
+        }
+        // Outside any checkout the workspace's own rc file is read.
+        let rc = "common:ci --vendor_dir=third_party/bazel\n";
+        let none = roots_below(&ws, None, |_| true).await;
+        assert!(none.roots.contains(&"third_party/bazel".to_string()));
+        assert!(none.bazel_trees.is_empty());
+        std::fs::write(ws.join(".bazelrc"), rc).unwrap();
+        let found = roots_below(&ws, None, |_| true).await;
+        assert_eq!(found.roots, ["", "third_party/other"]);
+        assert_eq!(found.bazel_trees, ["third_party/bazel"]);
+        // From a directory below the root too: the rc file of the root
+        // above the walked directory is the one that names the tree.
+        let found = roots_below(&ws.join("third_party"), None, |_| true).await;
+        assert_eq!(found.roots, ["other"]);
+        assert_eq!(found.bazel_trees, ["bazel"]);
+        // A directory the flag names and nobody created is not reported.
+        std::fs::remove_dir_all(ws.join("third_party").join("bazel")).unwrap();
+        let found = roots_below(&ws, None, |_| true).await;
+        assert!(found.bazel_trees.is_empty());
     }
 
     /// A build leaves links into its output base in the workspace. The

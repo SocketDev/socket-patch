@@ -818,6 +818,67 @@ async fn a_maven_only_repo_warns_through_selection() {
     );
 }
 
+/// Hazard HZ-20: where a Bazel ruleset builds an ecosystem's packages in
+/// a project, a pin in the native lock is at best a silent no-op and at
+/// worst a red build, and the gate that tells them apart reads files the
+/// engine is never handed. So the engine leaves the ecosystem alone
+/// there: no lookup, no pin, no rewritten file, one warning. A project of
+/// the same workspace that the ruleset does not build is pinned as ever.
+/// (A dedicated case on purpose: a Bazel fixture in the parity suite
+/// would pin the disk run to the same skip, which is not its rule.)
+#[tokio::test]
+async fn bazel_claimed_ecosystem_skipped() {
+    let server = npm_server().await;
+    // rules_js builds the npm packages of the workspace root from the
+    // lock its hub names; `web/` has a lock of its own that no hub reads.
+    let module = "bazel_dep(name = \"aspect_rules_js\", version = \"2.9.3\")\n\
+        npm = use_extension(\"@aspect_rules_js//npm:extensions.bzl\", \"npm\")\n\
+        npm.npm_translate_lock(name = \"npm\", pnpm_lock = \"//:pnpm-lock.yaml\")\n\
+        use_repo(npm, \"npm\")\n";
+    let mut repo = npm_files();
+    repo.extend(prefixed("web", &npm_files()));
+    repo.insert("MODULE.bazel".into(), module.as_bytes().to_vec());
+    let output = run_engine(&server, build_input(&repo, &[], options(false))).await;
+
+    let roots: Vec<&str> = output.projects.iter().map(|p| p.root.as_str()).collect();
+    assert_eq!(roots, ["", "web"]);
+    let (root, web) = (&output.projects[0], &output.projects[1]);
+    assert!(root.error.is_none(), "{:?}", root.error);
+    assert_eq!(root.summary.scanned_packages, 0);
+    assert!(root.redirected.is_empty() && root.skipped.is_empty());
+    assert_eq!(web.redirected.len(), 1, "{:?}", web.skipped);
+    let paths: Vec<&str> = output
+        .changed_files
+        .iter()
+        .map(|f| f.path.as_str())
+        .collect();
+    assert_eq!(paths, ["web/.npmrc", "web/package-lock.json"]);
+    let code = socket_patch_core::bazel::codes::Code::WorkspaceUnsupportedInMemory.as_str();
+    let said: Vec<_> = output.warnings.iter().filter(|w| w.code == code).collect();
+    assert_eq!(said.len(), 1, "{:?}", output.warnings);
+    assert_eq!(said[0].project_root.as_deref(), Some(""));
+    assert!(
+        said[0].detail.contains("(npm) was not scanned"),
+        "{}",
+        said[0].detail
+    );
+
+    // Bazel is what made the difference: without the workspace file the
+    // root is pinned like `web`, and nothing is said.
+    repo.remove("MODULE.bazel");
+    let output = run_engine(&server, build_input(&repo, &[], options(false))).await;
+    assert!(output.projects.iter().all(|p| p.redirected.len() == 1));
+    assert!(output.warnings.iter().all(|w| w.code != code));
+    // And a workspace that builds no npm package is that same run.
+    let plain = comparable(&output);
+    let cc = "bazel_dep(name = \"rules_cc\", version = \"0.1.1\")\n";
+    repo.insert("MODULE.bazel".into(), cc.as_bytes().to_vec());
+    let mut with_cc = run_engine(&server, build_input(&repo, &[], options(false))).await;
+    with_cc.stats.files_input = output.stats.files_input;
+    with_cc.stats.bytes_input = output.stats.bytes_input;
+    assert_eq!(comparable(&with_cc), plain);
+}
+
 #[tokio::test]
 async fn an_unreadable_higher_precedence_lock_refuses_the_project() {
     let server = npm_server().await;
