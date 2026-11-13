@@ -710,7 +710,9 @@ impl Refusal {
     /// `lane` is the lane to enable; the stub of a family none of whose
     /// lanes has landed passes [`LaneId::UNNAMED`].
     pub fn lane_not_enabled(lane: LaneId) -> Self {
-        Self::new(
+        // Spelled `Refusal::new`, not `Self::new`: the contract test reads
+        // the token argument of every call spelled that way.
+        Refusal::new(
             Reason::RulesetUnsupported,
             LANE_NOT_ENABLED,
             "socket-patch has no enabled lane for this Bazel ruleset shape in this mode, so the \
@@ -963,7 +965,20 @@ pub enum PlannedWrite {
         path: String,
         key: String,
     },
-    /// One exact-prefix line in the root's `.bazelignore`.
+    /// One exact-prefix line in the root's `.bazelignore` that the plan
+    /// relies on: the directory it names holds a tree with upstream BUILD
+    /// files, which must stay out of `//...`.
+    ///
+    /// The line has one writer, the root channel
+    /// (`utils::bazel_root_writes`), which puts it in before the tree
+    /// exists and only after its preconditions hold: the label scan of
+    /// hazard HZ-04 (a line deletes every package-form label under its
+    /// directory), no linked `.bazelignore` or index, and a report of
+    /// every line of the user's with a leading `/`. `bazel::exec::apply`
+    /// inserts nothing for this write. It requires that the file already
+    /// hides the directory and refuses the plan when it does not, so a
+    /// line the channel declined to write is never written behind its
+    /// back.
     IgnoreLine {
         line: String,
     },
@@ -1021,7 +1036,8 @@ listed_enum! {
         /// An `include()` of the owned segment in the root `MODULE.bazel`.
         ModuleFile,
         /// A `load` of `socket_patch.bzl` and its call in the WORKSPACE
-        /// file that is live for the hub.
+        /// file that is live for the hub: `WORKSPACE`, `WORKSPACE.bazel`
+        /// or `WORKSPACE.bzlmod` ([`HookKind::files`]).
         WorkspaceFile,
     }
 }
@@ -1033,6 +1049,30 @@ impl HookKind {
             Self::Bazelrc => "rc",
             Self::ModuleFile => "module",
             Self::WorkspaceFile => "workspace",
+        }
+    }
+
+    /// The root files a hook of this kind can go into. The one list: the
+    /// executor captures these for a planned hook and the owned index
+    /// admits these in a `hooks` row, so the two cannot drift.
+    ///
+    /// A WORKSPACE hook goes into the file that is live for its hub, and
+    /// `WORKSPACE.bzlmod` replaces `WORKSPACE` and `WORKSPACE.bazel`
+    /// wherever Bzlmod is on beside it (design 2.5), so on a hybrid
+    /// workspace it can be the only one Bazel evaluates: a hook that could
+    /// not be recorded there would leave such a hub with no WORKSPACE
+    /// route at all.
+    ///
+    /// Naming a file here permits nothing. Whether a hook may be written
+    /// into it is the gate's decision and the hook handler's proof, and no
+    /// probe has run the `load` of the owned `.bzl` file from
+    /// `WORKSPACE.bzlmod` (probe S1b ran `WORKSPACE`): the handler proves
+    /// it with a real-Bazel cell before it writes one there.
+    pub const fn files(self) -> &'static [&'static str] {
+        match self {
+            Self::Bazelrc => &[".bazelrc"],
+            Self::ModuleFile => &["MODULE.bazel"],
+            Self::WorkspaceFile => &["WORKSPACE", "WORKSPACE.bazel", "WORKSPACE.bzlmod"],
         }
     }
 }
@@ -1137,6 +1177,17 @@ impl StaleBehaviour {
 /// What a passing gate allows.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Plan {
+    /// The patch the plan wires. The gate decides one patch per request
+    /// ([`PatchRequest::uuid`]), and every row the executor records for
+    /// the plan is that patch's: the row of a lane's file, of a tag edit
+    /// and of a tool run each need a canonical patch UUID, and the write
+    /// that asks for one carries none. A write that brings its own row (an
+    /// rc flag, a segment statement, a `.bzl` entry) names the same patch
+    /// and lane, or the executor refuses the plan.
+    ///
+    /// Revision 4, 2.1 draws `Plan` with the lane alone; this field amends
+    /// it.
+    pub uuid: String,
     /// The lane that planned it and whose rows the executor records.
     pub lane: LaneId,
     /// In the order of the root transaction: providers, hooks, then
@@ -1346,6 +1397,12 @@ pub type AttestFn = fn(&LaneCx<'_>, &BazelRef) -> Result<(), VexWithhold>;
 /// Undoes one `pins` row of the index offline. Every other row (an ignore
 /// line, and with revision 4 a hook, an owned file, a tag edit) is undone
 /// mechanically by `bazel::exec` from the row itself.
+///
+/// The edits count only with [`RestoreOutcome::Restored`]: the executor
+/// runs each row's restore on a buffer of its own
+/// (`bazel::exec::PinRestore`) and throws away what an outcome of drift or
+/// refusal left in it. An adapter over this function hands it a copy of
+/// the files for one row and writes back only what a `Restored` changed.
 pub type RestoreFn = fn(&LaneCx<'_>, &mut Files, &IndexRow) -> RestoreOutcome;
 /// What the hub lock resolves. `None` = cannot enumerate: an empty list
 /// would read as "resolves nothing" and drop a live record.
@@ -1613,12 +1670,50 @@ mod tests {
         }
     }
 
-    /// The placeholder is no lane ID: it names no mode, so the owned
-    /// index cannot record it and no lane table can hold it.
+    /// The placeholder is no lane ID: it names no mode, and the owned
+    /// index, which is asked here, refuses to record it in any row a lane
+    /// owns.
     #[test]
     fn the_unnamed_lane_is_not_a_lane_id() {
         let id = LaneId::UNNAMED.0;
         assert!(!["H-", "V-", "A-"].iter().any(|mode| id.starts_with(mode)));
+
+        let uuid = "9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f";
+        let pin = |lane: &str| IndexRow {
+            uuid: uuid.to_string(),
+            purl: "pkg:npm/left-pad@1.3.0".to_string(),
+            lane: lane.to_string(),
+            file: "pnpm-lock.yaml".to_string(),
+            edits: vec![crate::bazel::owned_index::IndexEdit {
+                key: "k".to_string(),
+                original: "a".to_string(),
+                new: "b".to_string(),
+            }],
+            check: None,
+        };
+        let with = |pins: Vec<IndexRow>, bzl: Vec<BzlRow>| Index {
+            pins,
+            bzl,
+            ..Index::default()
+        };
+        let entry = |lane: &str| BzlRow {
+            kind: "pinned_archive".to_string(),
+            uuid: uuid.to_string(),
+            lane: lane.to_string(),
+        };
+        // The same rows under a real lane ID render.
+        assert!(with(vec![pin("H-JS1")], vec![entry("H-JS1")])
+            .render()
+            .is_ok());
+        let refused = |index: Index| index.render().expect_err("recorded").to_string();
+        assert_eq!(
+            refused(with(vec![pin(id)], Vec::new())),
+            "`pins[0].lane` is not a lane ID"
+        );
+        assert_eq!(
+            refused(with(Vec::new(), vec![entry(id)])),
+            "`bzl[0].lane` is not a lane ID"
+        );
     }
 
     #[test]

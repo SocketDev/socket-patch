@@ -196,6 +196,7 @@ mod tests {
             basis: AttestBasis::LockUrl,
         };
         let plan = Plan {
+            uuid: request.uuid.to_string(),
             lane: pin.lane,
             writes: Vec::new(),
             advisories: Vec::new(),
