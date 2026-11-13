@@ -164,14 +164,25 @@ fn bazel_core_classifier_output_base_after_build_and_clean() {
     let mut second_marker = Vec::new();
     for after_clean in [false, true] {
         if after_clean {
-            // Asked first, so that an idle server which went away is
-            // replaced before the two commands, not between them.
-            assert_eq!(output_base(cell), base);
-            let server = cell.server_pid();
-            cell.bazel_ok("clean", &[]);
-            cell.bazel_ok("build", &["//..."]);
-            // Only a server that lived through both shows the state.
-            assert_eq!(cell.server_pid(), server, "the server restarted");
+            // Only a server that lived through both commands shows the
+            // state. One that idled out between them (15 s; a launcher
+            // that queues each command can take longer) is replaced by a
+            // server that writes the marker again, so the pair is run
+            // again on that one.
+            let mut lived = false;
+            for _ in 0..3 {
+                // Asked first, so that an idle server which went away is
+                // replaced before the two commands, not between them.
+                assert_eq!(output_base(cell), base);
+                let server = cell.server_pid();
+                cell.bazel_ok("clean", &[]);
+                cell.bazel_ok("build", &["//..."]);
+                if cell.server_pid() == server {
+                    lived = true;
+                    break;
+                }
+            }
+            assert!(lived, "the server restarted between clean and build");
         }
         assert!(base.join("DO_NOT_BUILD_HERE").is_file(), "{after_clean}");
         second_marker.push(base.join("execroot/DO_NOT_BUILD_HERE").is_file());
