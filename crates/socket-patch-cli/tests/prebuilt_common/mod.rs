@@ -480,8 +480,11 @@ fn source_dir(root: &Path, paths: &[PathBuf], purl: &str) -> PathBuf {
                         .is_dir()
             }
             "cargo" | "gem" => leaf == format!("{name}-{version}"),
+            // The purl spells the module path with `/`, whatever the
+            // platform separates the cache's directories with.
             "golang" => dir
                 .to_string_lossy()
+                .replace('\\', "/")
                 .ends_with(&format!("{name}@{version}")),
             "maven" => {
                 let jar = format!("{}-{version}.jar", name.rsplit('/').next().unwrap());
@@ -795,6 +798,30 @@ mod prebuilt_common_selftests {
         assert_eq!(envs["USERPROFILE"].as_deref(), Some(home.as_str()));
         let args: Vec<_> = cmd.get_args().collect();
         assert_eq!(args, ["scan", "--json"]);
+    }
+
+    /// A purl spells a Go module path with `/`, and Windows lists the
+    /// module cache with `\` (behind `\\?\` when the cache path was
+    /// canonicalized). Under either separator the module's directory is
+    /// the archive source: without it the fixture serves the stand-in of
+    /// `package_layout`, which holds the patched files and none of the
+    /// module's own.
+    #[test]
+    fn a_go_module_directory_is_found_under_either_path_separator() {
+        let purl = "pkg:golang/example.com/m@v1.0.0";
+        let root = Path::new("project");
+        for found in [
+            "/tmp/modcache/example.com/m@v1.0.0",
+            r"C:\Temp\modcache\example.com\m@v1.0.0",
+            r"\\?\C:\Temp\modcache\example.com\m@v1.0.0",
+        ] {
+            let listed = ["/tmp/modcache/example.com/m@v1.0.1", found].map(PathBuf::from);
+            let source = source_dir(root, &listed, purl);
+            assert_eq!(source, PathBuf::from(found), "{found}");
+        }
+        // Another version of the module is not its source.
+        let other = [PathBuf::from(r"C:\Temp\modcache\example.com\m@v1.0.1")];
+        assert_eq!(source_dir(root, &other, purl), root.join("missing"));
     }
 
     #[test]

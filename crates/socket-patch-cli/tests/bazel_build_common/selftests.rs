@@ -636,12 +636,34 @@ fn the_offline_phase_points_every_proxy_at_a_closed_port() {
 }
 
 #[test]
+fn a_name_resolution_failure_of_a_tool_on_libcurl_is_an_unreachable_origin() {
+    // What cargo printed under the crate_universe splice when the resolver
+    // failed once (real-Bazel sweep of 2026-11-12, Bazel 8.8.2).
+    let cargo = "error: failed to query replaced source registry `crates-io`\n\
+                 Caused by:\n  [6] Couldn't resolve host name (Could not resolve host: index.crates.io)";
+    assert!(super::invoke::names_an_unreachable_origin(cargo));
+    let java = "java.net.UnknownHostException: bcr.bazel.build";
+    assert!(super::invoke::names_an_unreachable_origin(java));
+    // A host that answered with something wrong is a failure, not a skip.
+    for served in [
+        "Checksum was 0123 but wanted 4567",
+        "GET returned 404 Not Found",
+        "error: no matching package named `left-pad` found",
+    ] {
+        assert!(
+            !super::invoke::names_an_unreachable_origin(served),
+            "{served}"
+        );
+    }
+}
+
+#[test]
 fn outside_state_reports_created_changed_and_removed_entries() {
     let tmp = tempfile::tempdir().unwrap();
     let present = tmp.path().join("present");
     let absent = tmp.path().join("absent");
-    std::fs::create_dir_all(present.join("_bazel_user/old")).unwrap();
-    let keep = present.join("_bazel_user/keep");
+    std::fs::create_dir_all(present.join("_bazel_user").join("old")).unwrap();
+    let keep = present.join("_bazel_user").join("keep");
     std::fs::create_dir_all(&keep).unwrap();
     let state = OutsideState::capture_of(&[present.clone(), absent.clone()]);
     assert_eq!(state.changes(), Vec::<String>::new());
@@ -678,14 +700,14 @@ fn outside_state_reports_created_changed_and_removed_entries() {
     );
 
     // A stray run creates `<root>/_bazel_<user>/<md5>`, two levels down.
-    std::fs::create_dir_all(present.join("_bazel_user/0123abcd")).unwrap();
+    std::fs::create_dir_all(present.join("_bazel_user").join("0123abcd")).unwrap();
     std::fs::create_dir_all(absent.join("downloads")).unwrap();
-    std::fs::remove_dir(present.join("_bazel_user/old")).unwrap();
+    std::fs::remove_dir(present.join("_bazel_user").join("old")).unwrap();
     let changes = state.changes().join("\n");
     assert!(
         changes.contains(&format!(
             "created: {}",
-            present.join("_bazel_user/0123abcd").display()
+            present.join("_bazel_user").join("0123abcd").display()
         )),
         "{changes}"
     );
@@ -696,7 +718,7 @@ fn outside_state_reports_created_changed_and_removed_entries() {
     assert!(
         changes.contains(&format!(
             "removed: {}",
-            present.join("_bazel_user/old").display()
+            present.join("_bazel_user").join("old").display()
         )),
         "{changes}"
     );

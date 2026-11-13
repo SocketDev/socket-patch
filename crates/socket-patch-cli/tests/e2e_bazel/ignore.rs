@@ -247,6 +247,22 @@ fn refusal(envelope: &Value) -> &str {
     event["error"].as_str().expect("the refusal text")
 }
 
+/// What a `vendor` run in `project` printed and every path it left under
+/// the project's `.socket/vendor`: the message of an assertion on the
+/// vendored tree, so that a failure on a platform nobody can rerun the
+/// test on says what the run did.
+fn vendor_report(project: &Path, stdout: &str, stderr: &str) -> String {
+    let dir = project.join(".socket").join("vendor");
+    let left: Vec<String> = match dir.is_dir() {
+        true => snapshot(&dir).into_keys().collect(),
+        false => Vec::new(),
+    };
+    format!(
+        "{} holds {left:#?}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+        dir.display()
+    )
+}
+
 const ROOT_ONLY: Layout<'static> = Layout {
     hub_locks: &[],
     bazel_roots: &[""],
@@ -549,20 +565,25 @@ fn a_vendored_go_tree_gets_its_line_and_the_revert_takes_it_back() {
     // `vendor` reports a package's advisories as events of that package.
     let added = Code::WorkspaceIgnoreLineAdded.as_str();
     assert!(has_event(&envelope, "skipped", added, PURL), "{envelope:#}");
+    // The unit is the module as its upstream ships it: the fixture service
+    // packs the module cache's directory, BUILD file included.
+    let ran = vendor_report(&project, &stdout, &stderr);
     let unpacked = format!(".socket/vendor/golang/{UUID}/{MODULE}@{VERSION}/BUILD.bazel");
+    let upstream = std::fs::read_to_string(project.join(&unpacked));
     assert_eq!(
-        std::fs::read_to_string(project.join(unpacked)).unwrap(),
-        UPSTREAM_BUILD
+        upstream.unwrap_or_else(|e| panic!("read {unpacked}: {e}\n{ran}")),
+        UPSTREAM_BUILD,
+        "{ran}"
     );
-    assert_eq!(
-        ws.bytes(".bazelignore"),
-        b"node_modules\r\nsvc/.socket/vendor\r\n"
-    );
+    let ignore = String::from_utf8_lossy(&ws.bytes(".bazelignore")).into_owned();
+    assert_eq!(ignore, "node_modules\r\nsvc/.socket/vendor\r\n", "{ran}");
     let vendored = snapshot(&ws.root);
     assert_write_policy_with(&before, &vendored, &ROOT_ONLY);
 
     let (code, stdout, stderr) = ws.vendor(&project, &["vendor", "--revert", "--json"]);
     assert_eq!(code, 0, "revert failed:\n{stdout}\n{stderr}");
+    // Shown with a failure of the two checks below, which name paths only.
+    println!("revert stdout:\n{stdout}\nrevert stderr:\n{stderr}");
     let after = snapshot(&ws.root);
     assert_restore_policy_with(&vendored, &after, &ROOT_ONLY);
     assert_same_tree(&before, &after);
