@@ -15,7 +15,7 @@
 //! Each case fabricates the Bazel side of the rules_js fixture workspace
 //! (no Bazel runs) and runs the real binary against a fake Socket API: a
 //! hosted `scan`, the `scan` after it, and `vex`. Every npm package has to
-//! be wired and attested each time. Then the marker that makes the tree
+//! be wired, and seen by `vex`, each time. Then the marker that makes the tree
 //! Bazel's is deleted and the same commands must withhold every package
 //! again: the fixture is the hazard, and the marker, not a name, lifts it.
 //! The marker lifts it only in a Bazel workspace: with the fixture's
@@ -39,7 +39,8 @@ mod vex_e2e_common;
 use crate::bazel_common::{assert_same_tree, assert_write_policy, snapshot, WriteClass};
 use crate::common::{self, envelope};
 use hosted_memory_common::{mount_api, Patch, ORG};
-use vex_e2e_common::{assert_attested, assert_not_attested, run_vex, Marker, VexOutcome, VexRun};
+use socket_patch_core::bazel::codes::Code;
+use vex_e2e_common::{assert_not_attested, run_vex, VexOutcome, VexRun};
 
 /// The two registry packages of the fixture lock: purl, tarball path on
 /// the patch host, and the patch the fake API offers. One is scoped.
@@ -57,8 +58,6 @@ const PACKAGES: [(&str, &str, &str); 2] = [
 ];
 const TOKEN: &str = "22222222-2222-4222-8222-222222222222";
 const SRI: &str = "sha512-PATCHEDpatchedPATCHEDpatchedPATCHEDpatched9876543210ZYXWVUTSRQPONMLKJIHGFEDCBAzyxwvutsrqponmlkjihgfedcba0123456789AB==";
-/// What the fake API's patch view names for every patch.
-const VULNS: &[(&str, &[&str])] = &[("GHSA-test-aaaa-bbbb", &["CVE-2024-0001"])];
 
 /// A copy of the rules_js fixture workspace (`MODULE.bazel`, a pnpm lock
 /// 9.0 in the root package) as its own git checkout, with a workspace
@@ -188,9 +187,12 @@ fn pins(scan: &Value) -> Vec<(String, String)> {
 }
 
 /// A hosted `scan`, the `scan` after it and `vex` each see every npm
-/// package: both are wired, nothing is withheld, both are attested. The
-/// first run changes the lock and the pnpm side file and nothing else; the
-/// second, with the side file now in place, changes nothing.
+/// package: both are wired, and nothing is withheld as a package the
+/// project patches itself. The first run changes the lock and the pnpm
+/// side file and nothing else; the second, with the side file now in
+/// place, changes nothing. (`vex` makes no statement for a pin in a lock
+/// a Bazel hub reads while no lane proves the build consumes it: that is
+/// the consumer gate's omission, and it is asserted as such.)
 fn assert_every_package_seen(ws: &Workspace, api: &MockServer, what: &str) {
     let all: Vec<_> = PACKAGES
         .map(|(purl, _, uuid)| (purl.to_string(), uuid.to_string()))
@@ -215,10 +217,17 @@ fn assert_every_package_seen(ws: &Workspace, api: &MockServer, what: &str) {
         );
     }
     assert_same_tree(&wired, &snapshot(&ws.root));
+    // `vex` sees both pins as well: neither is omitted as a package the
+    // project patches itself, which is what a member walk through one of
+    // Bazel's trees ended in. No statement follows all the same. The
+    // fixture's rules_js hub reads this lock, and until a lane proves that
+    // the Bazel build consumes a pin in it, the consumer gate withholds
+    // the statement under a code of its own (design 7).
     let out = vex(ws, api);
-    assert_eq!(out.code, Some(0), "{what}: {out}");
-    for (purl, _, uuid) in PACKAGES {
-        assert_attested(out.doc(), purl, uuid, Marker::Redirected, VULNS);
+    assert_eq!(out.code, Some(1), "{what}: {out}");
+    let unproven = Code::VexConsumerUndetermined.as_str();
+    for (purl, ..) in PACKAGES {
+        assert_not_attested(&out.envelope, purl, unproven);
     }
 }
 

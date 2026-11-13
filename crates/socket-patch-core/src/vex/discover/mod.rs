@@ -58,6 +58,11 @@
 //! ```
 //!
 //! and is called once, in a fixed order, by [`discover_patched_refs_with`].
+//! [`bazel`] runs after them and is no extractor of a file format: for a
+//! project under a Bazel workspace it judges every reference the others
+//! found (does the Bazel build consume it?) and adds the pins of the locks
+//! only Bazel reads. Its own docs say what it reads and why rule 11 does
+//! not apply to it. Outside a Bazel workspace it costs a stat-only probe.
 //! The rules below let the extractors be written independently:
 //!
 //! 1. **Root-only, every file.** Read only the files named in the extractor's
@@ -214,6 +219,7 @@ pub use crate::origin::{
 };
 
 pub(crate) mod bazel;
+pub use bazel::{no_artifact_record, withheld_detail, BazelOptions, Judge, Read};
 pub(crate) mod bun;
 pub(crate) mod cargo;
 pub(crate) mod composer;
@@ -812,6 +818,31 @@ pub enum UnattestedKind {
     /// artifact is the vendored basis, and nothing installs it through a
     /// lock nothing reads.
     LockNotRead,
+    /// A Bazel ruleset builds the package, and the patch rests on an
+    /// installed tree or on a file no live hub reads: the Bazel build
+    /// fetches the package from the lock its ruleset reads, where no pin of
+    /// this patch is (design 7 of the Bazel support; `bazel::attest`). This
+    /// and the six kinds below are the withhold kinds of the Bazel layer,
+    /// one each ([`UnattestedKind::of_withheld`]); the mark's detail is the
+    /// layer's own sentence and names the remedy.
+    BazelNotConsumed,
+    /// Which lock Bazel builds the package from is not known: a workspace
+    /// file could not be read, a declaration is not literal, the workspace
+    /// lies above the repository, or no enabled lane proves the pin.
+    BazelConsumerUndetermined,
+    /// An override, a vendor directory or a patch of the user's own keeps
+    /// the Bazel build from the pinned bytes.
+    BazelPinBypassed,
+    /// A value Bazel derives from the pinned file, or the owned record of
+    /// the pin, disagrees with the pin.
+    BazelDerivedStale,
+    /// The one command that makes Bazel take the pin has not left its
+    /// committed evidence yet.
+    BazelRunPending,
+    /// A Go pin with no proof that Bazel selects the pinned version.
+    BazelSelectionUnproven,
+    /// No digest the Bazel build enforces anchors the pin.
+    BazelIntegrityUnanchored,
 }
 
 impl UnattestedKind {
@@ -1997,6 +2028,21 @@ pub async fn discover_patched_refs_with(root: &Path, opts: &DiscoverOptions) -> 
     discover_with_ctx(DiscoverCtx::with_origins(root, &opts.patch_server_origins)).await
 }
 
+/// [`discover_patched_refs_with`] for a caller that knows more of a Bazel
+/// build than the committed files say ([`BazelOptions`]): the grants an
+/// in-run statement holds, or the lane table of a test. Every other entry
+/// judges a Bazel workspace with the production lanes and no grant, which
+/// is what an offline `vex` knows.
+pub async fn discover_patched_refs_under(
+    root: &Path,
+    opts: &DiscoverOptions,
+    bazel: BazelOptions<'_>,
+) -> Discovery {
+    let mut ctx = DiscoverCtx::with_origins(root, &opts.patch_server_origins);
+    ctx.bazel = bazel;
+    discover_with_ctx(ctx).await
+}
+
 /// [`discover_patched_refs_with`] reading the lock and config files through
 /// `snapshot`, so a run that also inventories the lockfiles reads each file
 /// once.
@@ -2064,9 +2110,15 @@ async fn discover_with_ctx(mut ctx: DiscoverCtx<'_>) -> Discovery {
     nuget::extract(&ctx, &mut out).await;
     ctx.ecosystem = "deno";
     deno::extract(&ctx, &mut out).await;
+    // Last, over what the others found: the Bazel layer judges every
+    // reference, and adds the pins of the locks only Bazel reads. Its marks
+    // land once the contests and the other marks have, on the references
+    // that are left and that nothing else withholds.
+    let bazel = bazel::extract(&ctx, &mut out).await;
     out.contest_within_locks();
     out.contest_across_locks();
     out.unattest_unwired_copies();
+    bazel.mark(&mut out);
     out.recognized.extend(ctx.take_recognized());
     out.read.extend(ctx.take_read());
     out.patch_server_origins = ctx.origin.origins().to_vec();
@@ -2150,6 +2202,10 @@ pub(crate) struct DiscoverCtx<'a> {
     ecosystem: &'static str,
     /// Every guarded read so far ([`Discovery::read`]).
     read: Mutex<BTreeSet<ReadFile>>,
+    /// What the caller knows of a Bazel build beyond the committed files
+    /// ([`discover_patched_refs_under`]); the production lanes and no
+    /// grant from every other entry.
+    bazel: BazelOptions<'a>,
 }
 
 impl<'a> DiscoverCtx<'a> {
@@ -2171,6 +2227,7 @@ impl<'a> DiscoverCtx<'a> {
             recognized: Mutex::new(BTreeSet::new()),
             ecosystem: "",
             read: Mutex::new(BTreeSet::new()),
+            bazel: BazelOptions::default(),
         }
     }
 
