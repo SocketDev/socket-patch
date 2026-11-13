@@ -18,6 +18,7 @@ use super::env::{self, Group, System};
 use super::invoke::{Bazel, Options, Run};
 use super::isolation::Scratch;
 use super::probe_report::{self, Report};
+use super::toy;
 use super::workspace;
 
 /// How many servers may run at once: two fit a 4-vCPU runner (about
@@ -109,7 +110,9 @@ impl Cell {
     /// Open a cell for `test`, which belongs to `group` and needs
     /// `system` (`None`: it runs under any, with the line's default
     /// flags). `None` = the test does not run in this cell or cannot run
-    /// here; the reason is printed and a `skipped` report written.
+    /// here; the reason is printed and a `skipped` report written. A test
+    /// of the toy group does not run on a Bazel release its `MATRIX.json`
+    /// row does not claim (`toy::unclaimed`).
     pub fn open(test: &str, group: Group, system: Option<System>) -> Option<Cell> {
         Self::open_in(test, group, system, Scratch::new, Bazel::detect)
     }
@@ -175,6 +178,16 @@ impl Cell {
                 bazel.version.text,
                 system.name()
             );
+            probe_report::skip_na(&report, &why);
+            return None;
+        }
+        // A test of the toy group runs on a release of the group's
+        // matrices only where its row claims it, so a prefix run leaves no
+        // `ran` report for a pair nobody claims.
+        let unclaimed = (group == Group::Core)
+            .then(|| toy::unclaimed(&toy::matrices(), test, &bazel.version.text))
+            .flatten();
+        if let Some(why) = unclaimed {
             probe_report::skip_na(&report, &why);
             return None;
         }

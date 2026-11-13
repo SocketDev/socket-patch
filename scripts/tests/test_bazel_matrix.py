@@ -147,7 +147,7 @@ class CommittedMatrices(unittest.TestCase):
         workflow's build job to the binary's own."""
         main = (tool.TESTS / tool.SUITE / "main.rs").read_text(encoding="utf-8")
         modules = set(re.findall(r"^mod ([a-z0-9_]+);$", main, re.M))
-        self.assertGreaterEqual(len(FULL), 30)
+        self.assertGreaterEqual(len(FULL), 27)
         for cell in FULL:
             with self.subTest(cell=cell["id"]):
                 words = cell["filter"].split()

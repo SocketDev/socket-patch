@@ -332,9 +332,15 @@ fn assert_probe_outputs(cell: &Cell, target: &str, server: &str) {
 /// loopback fixture server. Tier 1 holds for the file and for the tree on
 /// a warm and on a restarted server, and the lock the baseline wrote is
 /// the lock a restarted server writes again (`lock_after_rebaseline`: what
-/// a lane compares after a rollback). The standing check of the rule in
-/// the `bazel_core_` row; `bazel_canary_probe_rule_tree_artifact` is the
-/// same probe on any line, through the real registry.
+/// a lane compares after a rollback), also on 6.6.0, 7.0.2 and 7.1.2,
+/// whose lock is of the older family that names the registry it was made
+/// against. The standing check of the rule in the `bazel_core_` row, on
+/// every release of the core cells that has the Bzlmod fixture
+/// (`core/MATRIX.json`; like any test of the toy group it reports `SKIP
+/// (n/a)` on a release its row does not list).
+/// `bazel_canary_probe_rule_tree_artifact` is the same probe on any line,
+/// through the real registry; it is planned on the pinned releases this
+/// test does not claim.
 #[test]
 #[ignore = "real Bazel; run with --ignored"]
 fn bazel_core_probe_rule_takes_a_tree_artifact() {

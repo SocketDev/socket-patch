@@ -534,6 +534,153 @@ fn a_toy_cell_runs_or_is_not_applicable_or_cannot_run() {
     }
 }
 
+/// A test of the toy group is held to its `MATRIX.json` row: on a Bazel
+/// release the group has a cell for it runs only where the row lists the
+/// release, so a prefix run leaves no `ran` report for a pair nobody
+/// claims. Where there is no cell there is no claim to hold it to, and
+/// `toy::gate` decides (a required cell that cannot run still fails).
+#[test]
+fn a_toy_test_runs_on_a_release_of_its_matrices_only_where_its_row_lists_it() {
+    let core = serde_json::json!({
+        "cells": [{ "bazel": "9.3.2" }, { "bazel": "8.8.2" }, { "bazel": "7.0.2" }],
+        "tests": {
+            "bazel_core_every_line": { "bazel": ["7.0.2", "8.8.2", "9.3.2"] },
+            "bazel_core_new_lines": { "bazel": ["8.8.2", "9.3.2"] },
+        },
+    });
+    let guard = serde_json::json!({
+        "cells": [{ "bazel": "9.3.2" }],
+        "tests": { "bazel_guard_x": { "bazel": ["9.3.2"] } },
+    });
+    let matrices = [
+        ("core/MATRIX.json".to_string(), core),
+        ("core/guard/MATRIX.json".to_string(), guard),
+    ];
+    let unclaimed = |test: &str, release: &str| toy::unclaimed(&matrices, test, release);
+
+    for release in ["7.0.2", "8.8.2", "9.3.2"] {
+        assert_eq!(unclaimed("bazel_core_every_line", release), None);
+    }
+    assert_eq!(unclaimed("bazel_core_new_lines", "9.3.2"), None);
+    assert_eq!(unclaimed("bazel_guard_x", "9.3.2"), None);
+
+    // A cell of the group, and the row does not list it.
+    let why = unclaimed("bazel_core_new_lines", "7.0.2").expect("declined on 7.0.2");
+    for part in [
+        "core/MATRIX.json",
+        "bazel_core_new_lines",
+        "8.8.2, 9.3.2",
+        "not on 7.0.2",
+    ] {
+        assert!(why.contains(part), "{why}");
+    }
+    // The cells are the group's, not the one file's: the planner puts a
+    // guard test into the core cell of its release.
+    let why = unclaimed("bazel_guard_x", "8.8.2").expect("declined on 8.8.2");
+    assert!(why.contains("core/guard/MATRIX.json"), "{why}");
+
+    // No cell on the release (a release is matched whole, not by its line).
+    for release in ["10.0.0rc3", "7.0.1", "9.3"] {
+        assert_eq!(
+            unclaimed("bazel_core_new_lines", release),
+            None,
+            "{release}"
+        );
+    }
+    // A test no toy matrix lists: a canary, a test of another group.
+    assert_eq!(
+        unclaimed("bazel_canary_probe_rule_tree_artifact", "7.0.2"),
+        None
+    );
+    assert_eq!(toy::unclaimed(&[], "bazel_core_new_lines", "7.0.2"), None);
+}
+
+/// The committed matrices of the toy group are found, and every test they
+/// list is declined on exactly the releases of the group's cells that its
+/// row leaves out.
+#[test]
+fn the_committed_toy_matrices_hold_every_listed_test_to_its_row() {
+    let matrices = toy::matrices();
+    let names: Vec<&str> = matrices.iter().map(|(name, _)| name.as_str()).collect();
+    for expected in ["core/MATRIX.json", "core/guard/MATRIX.json"] {
+        assert!(names.contains(&expected), "{expected} is not in {names:?}");
+    }
+    let strings = |list: &serde_json::Value| -> Vec<String> {
+        let items = list.as_array().into_iter().flatten();
+        items
+            .filter_map(|item| item.as_str().map(str::to_string))
+            .collect()
+    };
+    let mut releases: Vec<String> = matrices
+        .iter()
+        .flat_map(|(_, matrix)| matrix["cells"].as_array().into_iter().flatten())
+        .filter_map(|cell| cell["bazel"].as_str().map(str::to_string))
+        .collect();
+    releases.sort();
+    releases.dedup();
+    assert!(releases.len() >= 2, "{releases:?}");
+
+    let mut listed_tests = 0;
+    for (name, matrix) in &matrices {
+        let tests = matrix["tests"].as_object().into_iter().flatten();
+        for (test, row) in tests {
+            let claimed = strings(&row["bazel"]);
+            assert!(!claimed.is_empty(), "{name}: {test} claims no release");
+            for release in &releases {
+                let declined = toy::unclaimed(&matrices, test, release);
+                assert_eq!(
+                    declined.is_none(),
+                    claimed.contains(release),
+                    "{name}: {test} on {release}: {declined:?}"
+                );
+            }
+            listed_tests += 1;
+        }
+    }
+    assert!(listed_tests > 0, "the toy matrices list no test");
+}
+
+/// A stand-in for Bazel 9.3.2 that probes nothing, like [`no_bazel`].
+fn no_bazel_9_3_2(_: &Scratch) -> Result<Bazel, String> {
+    Ok(Bazel {
+        version: version("9.3.2"),
+        ..stand_in("socket-patch-selftest-no-such-bazel")?
+    })
+}
+
+/// `Cell::open` asks the claims: a core cell does not open for a test on a
+/// release its row does not list, and says why in a `skipped` report. The
+/// pair is one no row can ever claim (WORKSPACE is gone from Bazel 9), and
+/// the test's own cell there reports under its dependency system, so this
+/// selftest touches no report a real run leaves.
+#[test]
+fn a_core_cell_does_not_open_where_the_matrix_does_not_claim_the_test() {
+    const TEST: &str = "bazel_core_toy_pin_consumed_workspace";
+    if env::selected_group().is_some_and(|group| group != Group::Core) {
+        // The cell is declined for its group before the claims are asked.
+        return;
+    }
+    let declined = Cell::open_in(TEST, Group::Core, None, Scratch::cold, no_bazel_9_3_2);
+    assert!(declined.is_none(), "{TEST} opened a cell on Bazel 9.3.2");
+    let mut report = Report::new(TEST);
+    report.bazel = Some("9.3.2".into());
+    let path = report.path();
+    let text = std::fs::read_to_string(&path).expect("the declined cell wrote a report");
+    let json: serde_json::Value = serde_json::from_str(&text).expect("a JSON report");
+    assert_eq!(json["status"], "skipped", "{text}");
+    let reason = json["reason"].as_str().unwrap_or_default();
+    assert!(
+        reason.contains("core/MATRIX.json") && reason.contains("not on 9.3.2"),
+        "{text}"
+    );
+    std::fs::remove_file(&path).expect("remove the selftest's report");
+
+    // The same test on a release the group has no cell for: the claims
+    // decline nothing there.
+    let opened = Cell::open_in(TEST, Group::Core, None, Scratch::cold, no_bazel);
+    opened.expect("a cell on a release with no cell").close();
+}
+
 /// A line that does not commit its module archives takes them from a
 /// repository cache: a cell is given the listed entries, whole, and
 /// nothing else the shared cache holds.

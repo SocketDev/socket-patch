@@ -95,6 +95,18 @@ A name that `_GROUP` or `_SYSTEM` does not know is a failure, not "run
 everything": a typo in a CI cell must not turn into a run that skips what it
 was meant to cover.
 
+A test of the toy group runs only where its matrix claims it. `Cell::open`
+reads the group's matrices (`core/MATRIX.json`, `core/guard/MATRIX.json`):
+on a Bazel release one of them has a cell for, a test they list runs only
+when its own row names that release, and prints `SKIP (n/a)` otherwise. A
+prefix run such as `--ignored bazel_core_` therefore leaves a `ran` report
+for the claimed (test, Bazel) pairs and for no other. To run a test on one
+more release, add the release to its row first; the report of that run is
+then the evidence for the claim. On a release no toy matrix has a cell for
+(8.4.2, 10.0.0rc3) nothing is declined this way: a toy test there runs if the
+fixture and the registry files exist, and fails a required cell if they do
+not. The rule looks at the Bazel release only, not at the `os` list of a row.
+
 ## Isolation
 
 Each test owns one temp root (`<T>`), with one workspace copy and one output
@@ -292,18 +304,21 @@ a directory input on a 5.x line.
 Two tests build the rule over a file and a tree artifact (the shape rules_js
 hands it), on a warm and on a restarted server:
 
-- `bazel_core_probe_rule_takes_a_tree_artifact` runs on the toy cell, so
-  nothing leaves the machine where the line's module archives are committed
-  (7.7.2 and 9.3.2). It also checks that a restarted server writes the same
-  `MODULE.bazel.lock` for the baseline commands
-  (`Cell::lock_after_rebaseline`). The tree is made with `/bin/cp`: `SKIP
-  (n/a)` on Windows.
+- `bazel_core_probe_rule_takes_a_tree_artifact` runs on the toy cell of
+  every release that has the Bzlmod fixture (6.6.0, 7.0.2, 7.1.2, 7.7.2,
+  8.8.2 and 9.3.2), so nothing leaves the machine where the line's module
+  archives are committed (every one of them but 8.8.2). It also checks that
+  a restarted server writes the same `MODULE.bazel.lock` for the baseline
+  commands (`Cell::lock_after_rebaseline`), also on 6.6.0, 7.0.2 and 7.1.2,
+  whose lock is of the older family that names the registry it was made
+  against. The tree is made with `/bin/cp`: `SKIP (n/a)` on Windows.
 - `bazel_canary_probe_rule_tree_artifact` runs on any selected Bazel, with no
-  fixture. Before Bazel 6 it builds the file input alone and records
-  `"tree_artifact": "unsupported before Bazel 6"` in the report's details. It
-  is record-only and uses the network on a Bzlmod line (Bazel resolves its
-  builtin modules from the registry), so it prints `SKIP (n/a)` in the
-  offline phase.
+  fixture; the nightly plan runs it on the pinned releases the toy test does
+  not claim (5.4.1, 8.4.2 and 10.0.0rc3). Before Bazel 6 it builds the file
+  input alone and records `"tree_artifact": "unsupported before Bazel 6"` in
+  the report's details. It is record-only and uses the network on a Bzlmod
+  line (Bazel resolves its builtin modules from the registry), so it prints
+  `SKIP (n/a)` in the offline phase.
 
 ## Reports
 
