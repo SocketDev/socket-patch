@@ -1,0 +1,583 @@
+{
+ "source": {
+  "path": "test-infra-offline/vectors/repo_cache/observed.json",
+  "sha256": "b020bf4a90eabac4b70838088ebeb5d0e85febe20873371504eea3c1e81b9731",
+  "rows": 880
+ },
+ "selection": "the first 3 rows of each shape (run, host of the URL, key_type, whether id_markers_present is empty), unchanged and in the order of the source",
+ "source_totals": {
+  "in_a_cache_directory": 842,
+  "with_an_id_file": 45,
+  "without_an_id_file": 797,
+  "in_no_cache_directory": 38,
+  "by_key_type": {
+   "sha256": 839,
+   "sha384": 1,
+   "sha512": 2
+  }
+ },
+ "source_shapes": [
+  {
+   "run": "js-8.8.2",
+   "host": "bcr.bazel.build",
+   "key_type": "sha256",
+   "id_file": false,
+   "rows": 213,
+   "sampled": 3
+  },
+  {
+   "run": "js-8.8.2",
+   "host": "github.com",
+   "key_type": "sha256",
+   "id_file": true,
+   "rows": 20,
+   "sampled": 3
+  },
+  {
+   "run": "js-8.8.2",
+   "host": "github.com",
+   "key_type": "sha384",
+   "id_file": false,
+   "rows": 1,
+   "sampled": 1
+  },
+  {
+   "run": "js-8.8.2",
+   "host": "registry.npmjs.org",
+   "key_type": "sha512",
+   "id_file": true,
+   "rows": 2,
+   "sampled": 2
+  },
+  {
+   "run": "js-8.8.2",
+   "host": "github.com",
+   "key_type": "sha256",
+   "id_file": false,
+   "rows": 3,
+   "sampled": 3
+  },
+  {
+   "run": "jvm-8.8.2",
+   "host": "bcr.bazel.build",
+   "key_type": "sha256",
+   "id_file": false,
+   "rows": 286,
+   "sampled": 3
+  },
+  {
+   "run": "jvm-8.8.2",
+   "host": "github.com",
+   "key_type": "sha256",
+   "id_file": true,
+   "rows": 14,
+   "sampled": 3
+  },
+  {
+   "run": "jvm-8.8.2",
+   "host": "repo1.maven.org",
+   "key_type": "sha256",
+   "id_file": true,
+   "rows": 3,
+   "sampled": 3
+  },
+  {
+   "run": "skylib-7.7.2",
+   "host": "bcr.bazel.build",
+   "key_type": "sha256",
+   "id_file": false,
+   "rows": 80,
+   "sampled": 3
+  },
+  {
+   "run": "skylib-7.7.2",
+   "host": "github.com",
+   "key_type": "sha256",
+   "id_file": true,
+   "rows": 3,
+   "sampled": 3
+  },
+  {
+   "run": "skylib-9.3.2",
+   "host": "bcr.bazel.build",
+   "key_type": "sha256",
+   "id_file": false,
+   "rows": 211,
+   "sampled": 3
+  },
+  {
+   "run": "skylib-9.3.2",
+   "host": "github.com",
+   "key_type": "sha256",
+   "id_file": true,
+   "rows": 3,
+   "sampled": 3
+  },
+  {
+   "run": "skylib-6.6.0",
+   "host": "bcr.bazel.build",
+   "key_type": null,
+   "id_file": false,
+   "rows": 38,
+   "sampled": 3
+  },
+  {
+   "run": "skylib-6.6.0",
+   "host": "github.com",
+   "key_type": "sha256",
+   "id_file": false,
+   "rows": 3,
+   "sampled": 3
+  }
+ ],
+ "rows": [
+  {
+   "url": "https://bcr.bazel.build/modules/aspect_rules_js/3.6.0/MODULE.bazel",
+   "bytes": 11174,
+   "key_type": "sha256",
+   "integrity": "sha256-982Uz6IPam3PHRnQJbl6KgKYATKW5LPTIEwo7kbQ/Po=",
+   "cache_file": "content_addressable/sha256/f7cd94cfa20f6a6dcf1d19d025b97a2a0298013296e4b3d3204c28ee46d0fcfa/file",
+   "canonical_id_is_url": false,
+   "id_marker_if_canonical_id_is_url": "content_addressable/sha256/f7cd94cfa20f6a6dcf1d19d025b97a2a0298013296e4b3d3204c28ee46d0fcfa/id-4a4b89b58b250b7961d433241c6eb1a8be414701692659d9b1780db762184909",
+   "id_markers_present": [],
+   "run": "js-8.8.2"
+  },
+  {
+   "url": "https://bcr.bazel.build/modules/tar.bzl/0.10.4/MODULE.bazel",
+   "bytes": 761,
+   "key_type": "sha256",
+   "integrity": "sha256-6Pn/eRmejZ6q1/Gwp3rXSzC7gteUuH2MqUK+rV3oOuk=",
+   "cache_file": "content_addressable/sha256/e8f9ff79199e8d9eaad7f1b0a77ad74b30bb82d794b87d8ca942bead5de83ae9/file",
+   "canonical_id_is_url": false,
+   "id_marker_if_canonical_id_is_url": "content_addressable/sha256/e8f9ff79199e8d9eaad7f1b0a77ad74b30bb82d794b87d8ca942bead5de83ae9/id-77a8aa58de9cbd908cf112c968d9efbead314ec1012cfce29d6fdfdd4b320272",
+   "id_markers_present": [],
+   "run": "js-8.8.2"
+  },
+  {
+   "url": "https://bcr.bazel.build/modules/bazel_features/1.41.0/MODULE.bazel",
+   "bytes": 346,
+   "key_type": "sha256",
+   "integrity": "sha256-bg+H+v7YASc8Nx1B4ioVpvir+D/df4fV5ErTF7lEM9A=",
+   "cache_file": "content_addressable/sha256/6e0f87fafed801273c371d41e22a15a6f8abf83fdd7f87d5e44ad317b94433d0/file",
+   "canonical_id_is_url": false,
+   "id_marker_if_canonical_id_is_url": "content_addressable/sha256/6e0f87fafed801273c371d41e22a15a6f8abf83fdd7f87d5e44ad317b94433d0/id-737a5e343bd0c912154a897dd0a4a5ecc1cc3dadee2c14bff5750f28a05936f1",
+   "id_markers_present": [],
+   "run": "js-8.8.2"
+  },
+  {
+   "url": "https://github.com/bazelbuild/rules_python/releases/download/0.40.0/rules_python-0.40.0.tar.gz",
+   "bytes": 873165,
+   "key_type": "sha256",
+   "integrity": "sha256-aQ4BQXJKu1aCZ+ADx7bZpUkl30DCdahwpNk0Fh3J3VM=",
+   "cache_file": "content_addressable/sha256/690e0141724abb568267e003c7b6d9a54925df40c275a870a4d934161dc9dd53/file",
+   "canonical_id_is_url": true,
+   "id_marker_if_canonical_id_is_url": "content_addressable/sha256/690e0141724abb568267e003c7b6d9a54925df40c275a870a4d934161dc9dd53/id-2f55fc720cb32ffbe95b54eb78d7a966e634fd529a11eae1b44406bd624b5e59",
+   "id_markers_present": [
+    "id-2f55fc720cb32ffbe95b54eb78d7a966e634fd529a11eae1b44406bd624b5e59"
+   ],
+   "run": "js-8.8.2"
+  },
+  {
+   "url": "https://github.com/bazelbuild/rules_java/releases/download/8.14.0/rules_java-8.14.0.tar.gz",
+   "bytes": 112382,
+   "key_type": "sha256",
+   "integrity": "sha256-u+fZQ2DMntRgfsX9lJlf0exB6EJXAgtvCeZAVSgeyxI=",
+   "cache_file": "content_addressable/sha256/bbe7d94360cc9ed4607ec5fd94995fd1ec41e84257020b6f09e64055281ecb12/file",
+   "canonical_id_is_url": true,
+   "id_marker_if_canonical_id_is_url": "content_addressable/sha256/bbe7d94360cc9ed4607ec5fd94995fd1ec41e84257020b6f09e64055281ecb12/id-8a25c7cefdfdda1d4a700f418fb99d5b376862d92fc9793c352c1f6942692332",
+   "id_markers_present": [
+    "id-8a25c7cefdfdda1d4a700f418fb99d5b376862d92fc9793c352c1f6942692332"
+   ],
+   "run": "js-8.8.2"
+  },
+  {
+   "url": "https://github.com/bazelbuild/rules_shell/releases/download/v0.4.1/rules_shell-v0.4.1.tar.gz",
+   "bytes": 22017,
+   "key_type": "sha256",
+   "integrity": "sha256-vGHvlPrMeOIKZFcm9kdW5eKFoEUDfHph9lrylB9MJeE=",
+   "cache_file": "content_addressable/sha256/bc61ef94facc78e20a645726f64756e5e285a045037c7a61f65af2941f4c25e1/file",
+   "canonical_id_is_url": true,
+   "id_marker_if_canonical_id_is_url": "content_addressable/sha256/bc61ef94facc78e20a645726f64756e5e285a045037c7a61f65af2941f4c25e1/id-45aeeca9a83370667df9c79d4bac756b53b29f02af0da0ec093ea312e235eec1",
+   "id_markers_present": [
+    "id-45aeeca9a83370667df9c79d4bac756b53b29f02af0da0ec093ea312e235eec1"
+   ],
+   "run": "js-8.8.2"
+  },
+  {
+   "url": "https://github.com/mikefarah/yq/releases/download/v4.45.2/yq_darwin_arm64",
+   "bytes": 10893826,
+   "key_type": "sha384",
+   "integrity": "sha384-bnZ5TqsG5pcWB6gC87QKrBrjcKYmdOcSD7TpFVeCU6Nj7z5egeZzm4BH1FHbqo0e",
+   "cache_file": "content_addressable/sha384/6e76794eab06e6971607a802f3b40aac1ae370a62674e7120fb4e915578253a363ef3e5e81e6739b8047d451dbaa8d1e/file",
+   "canonical_id_is_url": false,
+   "id_marker_if_canonical_id_is_url": "content_addressable/sha384/6e76794eab06e6971607a802f3b40aac1ae370a62674e7120fb4e915578253a363ef3e5e81e6739b8047d451dbaa8d1e/id-3a55cd9d395926645d55f0f61c2e7b14d91437c5dc1e77c6faea2bac4c034e67ae05d06a09fcb40f1ee9166845d8e2a1",
+   "id_markers_present": [],
+   "run": "js-8.8.2"
+  },
+  {
+   "url": "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz",
+   "bytes": 3619,
+   "key_type": "sha512",
+   "integrity": "sha512-XI5MPzVNApjAyhQzphX8BkmKsKUxD4LdyK24iZeQGinBN9yTQT3bFlCBy/aVx2HrNcqQGsdot8ghrjyrvMCoEA==",
+   "cache_file": "content_addressable/sha512/5c8e4c3f354d0298c0ca1433a615fc06498ab0a5310f82ddc8adb88997901a29c137dc93413ddb165081cbf695c761eb35ca901ac768b7c821ae3cabbcc0a810/file",
+   "canonical_id_is_url": true,
+   "id_marker_if_canonical_id_is_url": "content_addressable/sha512/5c8e4c3f354d0298c0ca1433a615fc06498ab0a5310f82ddc8adb88997901a29c137dc93413ddb165081cbf695c761eb35ca901ac768b7c821ae3cabbcc0a810/id-09b9e9826fafac551ecf8ca6d7912d23a468eb8e9b69505a1ef7cfca0e3b504f84144097fdb5bc471b2511ea95a5f2bc4a583a7faa1a4d4bddea3b5f2c1a4b57",
+   "id_markers_present": [
+    "id-09b9e9826fafac551ecf8ca6d7912d23a468eb8e9b69505a1ef7cfca0e3b504f84144097fdb5bc471b2511ea95a5f2bc4a583a7faa1a4d4bddea3b5f2c1a4b57"
+   ],
+   "run": "js-8.8.2"
+  },
+  {
+   "url": "https://registry.npmjs.org/@tootallnate/once/-/once-2.0.0.tgz",
+   "bytes": 3944,
+   "key_type": "sha512",
+   "integrity": "sha512-XCuKFP5PS55gnMVu3dty8KPatLqUoy/ZYzDzAGCQ8JNFCkLXzmI7vNHCR+XpbZaMWQK/vQubr7PkYq8g470J/A==",
+   "cache_file": "content_addressable/sha512/5c2b8a14fe4f4b9e609cc56edddb72f0a3dab4ba94a32fd96330f3006090f093450a42d7ce623bbcd1c247e5e96d968c5902bfbd0b9bafb3e462af20e3bd09fc/file",
+   "canonical_id_is_url": true,
+   "id_marker_if_canonical_id_is_url": "content_addressable/sha512/5c2b8a14fe4f4b9e609cc56edddb72f0a3dab4ba94a32fd96330f3006090f093450a42d7ce623bbcd1c247e5e96d968c5902bfbd0b9bafb3e462af20e3bd09fc/id-ef6981e7971ce34fb1c7c019c899ce9eabdfc06efa2ba475e9d93793786896407521001deca7f5d0fef942e08bc4b591719dfc9204c4b6d0916a086665770350",
+   "id_markers_present": [
+    "id-ef6981e7971ce34fb1c7c019c899ce9eabdfc06efa2ba475e9d93793786896407521001deca7f5d0fef942e08bc4b591719dfc9204c4b6d0916a086665770350"
+   ],
+   "run": "js-8.8.2"
+  },
+  {
+   "url": "https://github.com/hermeticbuild/bsdtar-prebuilt/releases/download/v3.8.1-3/tar_darwin_arm64",
+   "bytes": 1448560,
+   "key_type": "sha256",
+   "integrity": "sha256-94rmPkj1i+joi7HkSrFlUDuL3HN0zr3rf6kydinIiQc=",
+   "cache_file": "content_addressable/sha256/f78ae63e48f58be8e88bb1e44ab165503b8bdc7374cebdeb7fa9327629c88907/file",
+   "canonical_id_is_url": false,
+   "id_marker_if_canonical_id_is_url": "content_addressable/sha256/f78ae63e48f58be8e88bb1e44ab165503b8bdc7374cebdeb7fa9327629c88907/id-e48906c5b5fdfe5da8c804cc204d84f80c437fc6281850c06d52a11144e940c7",
+   "id_markers_present": [],
+   "run": "js-8.8.2"
+  },
+  {
+   "url": "https://github.com/bazel-contrib/bazel-lib/releases/download/v3.7.0/copy_directory-darwin_arm64",
+   "bytes": 1724402,
+   "key_type": "sha256",
+   "integrity": "sha256-lrrolbctbQ6bAjrXrPZziZBwIsQm5elo3pkGUi7zIDg=",
+   "cache_file": "content_addressable/sha256/96bae895b72d6d0e9b023ad7acf67389907022c426e5e968de9906522ef32038/file",
+   "canonical_id_is_url": false,
+   "id_marker_if_canonical_id_is_url": "content_addressable/sha256/96bae895b72d6d0e9b023ad7acf67389907022c426e5e968de9906522ef32038/id-6721213db12307401610cec4f8c116b5494cca8365dd934db31c1bbe978af52a",
+   "id_markers_present": [],
+   "run": "js-8.8.2"
+  },
+  {
+   "url": "https://github.com/uutils/coreutils/releases/download/0.5.0/coreutils-0.5.0-aarch64-apple-darwin.tar.gz",
+   "bytes": 4485874,
+   "key_type": "sha256",
+   "integrity": "sha256-y1TO670Jk2su5RZ9X/kxjDqeKOLxVP3dPsf+u3/EBiQ=",
+   "cache_file": "content_addressable/sha256/cb54ceebbd09936b2ee5167d5ff9318c3a9e28e2f154fddd3ec7febb7fc40624/file",
+   "canonical_id_is_url": false,
+   "id_marker_if_canonical_id_is_url": "content_addressable/sha256/cb54ceebbd09936b2ee5167d5ff9318c3a9e28e2f154fddd3ec7febb7fc40624/id-d44ad09f38c1a201f41658b20972e7b32457b6624f0a82c50f873978037e9238",
+   "id_markers_present": [],
+   "run": "js-8.8.2"
+  },
+  {
+   "url": "https://bcr.bazel.build/modules/rules_java/9.3.0/MODULE.bazel",
+   "bytes": 4218,
+   "key_type": "sha256",
+   "integrity": "sha256-9lfHLWWsRJyq6avy5o5mwNNvlBaEjExJA9CzI0Ip5/I=",
+   "cache_file": "content_addressable/sha256/f657c72d65ac449caae9abf2e68e66c0d36f9416848c4c4903d0b3234229e7f2/file",
+   "canonical_id_is_url": false,
+   "id_marker_if_canonical_id_is_url": "content_addressable/sha256/f657c72d65ac449caae9abf2e68e66c0d36f9416848c4c4903d0b3234229e7f2/id-b407c92e0819b9e6a56f5ff58d735976115d1c6bcfaa2ade0a3c215b56ba0160",
+   "id_markers_present": [],
+   "run": "jvm-8.8.2"
+  },
+  {
+   "url": "https://bcr.bazel.build/modules/rules_jvm_external/7.2/MODULE.bazel",
+   "bytes": 46011,
+   "key_type": "sha256",
+   "integrity": "sha256-5PYKlyeAyiISjVN31hMbT5wACFTovIniEiAmduQeeM4=",
+   "cache_file": "content_addressable/sha256/e4f60a972780ca22128d5377d6131b4f9c000854e8bc89e212202676e41e78ce/file",
+   "canonical_id_is_url": false,
+   "id_marker_if_canonical_id_is_url": "content_addressable/sha256/e4f60a972780ca22128d5377d6131b4f9c000854e8bc89e212202676e41e78ce/id-298fd2a68abbb9e3cc11c10f0bc09d8da28710f0e69a0f7d41c41903d755c06f",
+   "id_markers_present": [],
+   "run": "jvm-8.8.2"
+  },
+  {
+   "url": "https://bcr.bazel.build/modules/bazel_skylib/1.8.1/MODULE.bazel",
+   "bytes": 389,
+   "key_type": "sha256",
+   "integrity": "sha256-iK3nKTvs2pY+Dj6jPn1U00JRJ+CjJuDRfaCFpfHwP/Y=",
+   "cache_file": "content_addressable/sha256/88ade7293becda963e0e3ea33e7d54d3425127e0a326e0d17da085a5f1f03ff6/file",
+   "canonical_id_is_url": false,
+   "id_marker_if_canonical_id_is_url": "content_addressable/sha256/88ade7293becda963e0e3ea33e7d54d3425127e0a326e0d17da085a5f1f03ff6/id-7aeddd16c21d1be9a8676bf5ab8ecf92f446bbaedb718d0b5c756dd0196ee3ac",
+   "id_markers_present": [],
+   "run": "jvm-8.8.2"
+  },
+  {
+   "url": "https://github.com/bazel-contrib/rules_jvm_external/releases/download/7.2/rules_jvm_external-7.2.tar.gz",
+   "bytes": 10517471,
+   "key_type": "sha256",
+   "integrity": "sha256-8UdLo2mfBKseq4k4HWTJ+QaVLFd1JOmpyLOUm4dbuqA=",
+   "cache_file": "content_addressable/sha256/f1474ba3699f04ab1eab89381d64c9f906952c577524e9a9c8b3949b875bbaa0/file",
+   "canonical_id_is_url": true,
+   "id_marker_if_canonical_id_is_url": "content_addressable/sha256/f1474ba3699f04ab1eab89381d64c9f906952c577524e9a9c8b3949b875bbaa0/id-93bba58524a8b966f511dd6a97beb4fcc9f2e0b3b9c636cc92fd18dd3cfc365d",
+   "id_markers_present": [
+    "id-93bba58524a8b966f511dd6a97beb4fcc9f2e0b3b9c636cc92fd18dd3cfc365d"
+   ],
+   "run": "jvm-8.8.2"
+  },
+  {
+   "url": "https://github.com/bazelbuild/bazel-skylib/releases/download/1.8.1/bazel-skylib-1.8.1.tar.gz",
+   "bytes": 44537,
+   "key_type": "sha256",
+   "integrity": "sha256-UbUQWnYLNTdz+QTSu8XmZNCYf7ryImUWTeZdQ+kQ2Kw=",
+   "cache_file": "content_addressable/sha256/51b5105a760b353773f904d2bbc5e664d0987fbaf22265164de65d43e910d8ac/file",
+   "canonical_id_is_url": true,
+   "id_marker_if_canonical_id_is_url": "content_addressable/sha256/51b5105a760b353773f904d2bbc5e664d0987fbaf22265164de65d43e910d8ac/id-73ef6f7593359ab909293d2c4684d1722db8a542d5923c7223a30506e2978854",
+   "id_markers_present": [
+    "id-73ef6f7593359ab909293d2c4684d1722db8a542d5923c7223a30506e2978854"
+   ],
+   "run": "jvm-8.8.2"
+  },
+  {
+   "url": "https://github.com/bazel-contrib/bazel_features/releases/download/v1.39.0/bazel_features-v1.39.0.tar.gz",
+   "bytes": 17770,
+   "key_type": "sha256",
+   "integrity": "sha256-WrGpDQn9dFVeDfIoCa1Ylifd/yY8/4JTWBWqgMo+NWI=",
+   "cache_file": "content_addressable/sha256/5ab1a90d09fd74555e0df22809ad589627ddff263cff82535815aa80ca3e3562/file",
+   "canonical_id_is_url": true,
+   "id_marker_if_canonical_id_is_url": "content_addressable/sha256/5ab1a90d09fd74555e0df22809ad589627ddff263cff82535815aa80ca3e3562/id-b7d2b922f92601d94a56e7aa5b56e61406b0120f25796936fe5721f0c73559a1",
+   "id_markers_present": [
+    "id-b7d2b922f92601d94a56e7aa5b56e61406b0120f25796936fe5721f0c73559a1"
+   ],
+   "run": "jvm-8.8.2"
+  },
+  {
+   "url": "https://repo1.maven.org/maven2/org/slf4j/slf4j-simple/1.7.36/slf4j-simple-1.7.36.jar",
+   "bytes": 15333,
+   "key_type": "sha256",
+   "integrity": "sha256-Lzm+2UPWJN+o9BAtBXEoOhCHC2qjbxl6ilBvFHAQwQ8=",
+   "cache_file": "content_addressable/sha256/2f39bed943d624dfa8f4102d0571283a10870b6aa36f197a8a506f147010c10f/file",
+   "canonical_id_is_url": true,
+   "id_marker_if_canonical_id_is_url": "content_addressable/sha256/2f39bed943d624dfa8f4102d0571283a10870b6aa36f197a8a506f147010c10f/id-88de2359ed49cc68af43beba028255a63678aa19a8728fbe2fd8ac89bf4bb5da",
+   "id_markers_present": [
+    "id-88de2359ed49cc68af43beba028255a63678aa19a8728fbe2fd8ac89bf4bb5da"
+   ],
+   "run": "jvm-8.8.2"
+  },
+  {
+   "url": "https://repo1.maven.org/maven2/org/slf4j/slf4j-api/1.7.36/slf4j-api-1.7.36.jar",
+   "bytes": 41125,
+   "key_type": "sha256",
+   "integrity": "sha256-0+9XXj5JeWeNwBvx3M5RAhSTtNEft/G+itmCh3wWocA=",
+   "cache_file": "content_addressable/sha256/d3ef575e3e4979678dc01bf1dcce51021493b4d11fb7f1be8ad982877c16a1c0/file",
+   "canonical_id_is_url": true,
+   "id_marker_if_canonical_id_is_url": "content_addressable/sha256/d3ef575e3e4979678dc01bf1dcce51021493b4d11fb7f1be8ad982877c16a1c0/id-b139fd54a449ed6a5f6e4427875a41aac5bb5bfc31e92698570930ff145d026f",
+   "id_markers_present": [
+    "id-b139fd54a449ed6a5f6e4427875a41aac5bb5bfc31e92698570930ff145d026f"
+   ],
+   "run": "jvm-8.8.2"
+  },
+  {
+   "url": "https://repo1.maven.org/maven2/com/google/code/gson/gson/2.10.1/gson-2.10.1.jar",
+   "bytes": 283367,
+   "key_type": "sha256",
+   "integrity": "sha256-QkHBSncnw0/uplB+yAExij1KkPBw5FJWgQefuU7kxZM=",
+   "cache_file": "content_addressable/sha256/4241c14a7727c34feea6507ec801318a3d4a90f070e4525681079fb94ee4c593/file",
+   "canonical_id_is_url": true,
+   "id_marker_if_canonical_id_is_url": "content_addressable/sha256/4241c14a7727c34feea6507ec801318a3d4a90f070e4525681079fb94ee4c593/id-ae48325e823e9c1ab22411f743cccc3c49acaf26240a1aaff4f4efdc10809ec6",
+   "id_markers_present": [
+    "id-ae48325e823e9c1ab22411f743cccc3c49acaf26240a1aaff4f4efdc10809ec6"
+   ],
+   "run": "jvm-8.8.2"
+  },
+  {
+   "url": "https://bcr.bazel.build/modules/bazel_skylib/1.8.2/MODULE.bazel",
+   "bytes": 389,
+   "key_type": "sha256",
+   "integrity": "sha256-aa1pJwmDFoSLNKkUK8yXXgGLon8IxP9AP1DBtuZGymc=",
+   "cache_file": "content_addressable/sha256/69ad6927098316848b34a9142bcc975e018ba27f08c4ff403f50c1b6e646ca67/file",
+   "canonical_id_is_url": false,
+   "id_marker_if_canonical_id_is_url": "content_addressable/sha256/69ad6927098316848b34a9142bcc975e018ba27f08c4ff403f50c1b6e646ca67/id-5017f0208dbce0d55880394f478651f071c393a471fc261054a1599df5ee70de",
+   "id_markers_present": [],
+   "run": "skylib-7.7.2"
+  },
+  {
+   "url": "https://bcr.bazel.build/modules/rules_cc/0.0.11/MODULE.bazel",
+   "bytes": 545,
+   "key_type": "sha256",
+   "integrity": "sha256-nyScViSkeIBnuWuLiWvhDH6LQ3XcRvbY4eURABE+CZI=",
+   "cache_file": "content_addressable/sha256/9f249c5624a4788067b96b8b896be10c7e8b4375dc46f6d8e1e51100113e0992/file",
+   "canonical_id_is_url": false,
+   "id_marker_if_canonical_id_is_url": "content_addressable/sha256/9f249c5624a4788067b96b8b896be10c7e8b4375dc46f6d8e1e51100113e0992/id-0a4f0d2450997b55acb2bf73c5801f9208e38bbf0ab66b7430c449bbb8628557",
+   "id_markers_present": [],
+   "run": "skylib-7.7.2"
+  },
+  {
+   "url": "https://bcr.bazel.build/modules/platforms/0.0.7/MODULE.bazel",
+   "bytes": 173,
+   "key_type": "sha256",
+   "integrity": "sha256-cv1KDt6e5cAh9qjdkrUD4In0bCJ7ooE/8YO3FhYDSBQ=",
+   "cache_file": "content_addressable/sha256/72fd4a0ede9ee5c021f6a8dd92b503e089f46c227ba2813ff183b71616034814/file",
+   "canonical_id_is_url": false,
+   "id_marker_if_canonical_id_is_url": "content_addressable/sha256/72fd4a0ede9ee5c021f6a8dd92b503e089f46c227ba2813ff183b71616034814/id-2b50f115108e85be70f9d327e5c509ddbd147fea97d5b48391f8911816c7eb16",
+   "id_markers_present": [],
+   "run": "skylib-7.7.2"
+  },
+  {
+   "url": "https://github.com/bazelbuild/platforms/releases/download/0.0.10/platforms-0.0.10.tar.gz",
+   "bytes": 7680,
+   "key_type": "sha256",
+   "integrity": "sha256-IY7+juc20mo1cmY7N0olPAErcW2K8MB+hC6C8jigp+4=",
+   "cache_file": "content_addressable/sha256/218efe8ee736d26a3572663b374a253c012b716d8af0c07e842e82f238a0a7ee/file",
+   "canonical_id_is_url": true,
+   "id_marker_if_canonical_id_is_url": "content_addressable/sha256/218efe8ee736d26a3572663b374a253c012b716d8af0c07e842e82f238a0a7ee/id-af499490460f8b55033ef52f017530ad777c8424a7f2407b25d93da4233ade4d",
+   "id_markers_present": [
+    "id-af499490460f8b55033ef52f017530ad777c8424a7f2407b25d93da4233ade4d"
+   ],
+   "run": "skylib-7.7.2"
+  },
+  {
+   "url": "https://github.com/bazelbuild/bazel-skylib/releases/download/1.8.2/bazel-skylib-1.8.2.tar.gz",
+   "bytes": 44667,
+   "key_type": "sha256",
+   "integrity": "sha256-bnjw5X3iaAH29WT6fEpI3Is2hz5BYlepK7sJN+6shEY=",
+   "cache_file": "content_addressable/sha256/6e78f0e57de26801f6f564fa7c4a48dc8b36873e416257a92bbb0937eeac8446/file",
+   "canonical_id_is_url": true,
+   "id_marker_if_canonical_id_is_url": "content_addressable/sha256/6e78f0e57de26801f6f564fa7c4a48dc8b36873e416257a92bbb0937eeac8446/id-662940d75b9a273377781b50f8c64bf499fe05a5f7bbbecb3d8b033e8151fb83",
+   "id_markers_present": [
+    "id-662940d75b9a273377781b50f8c64bf499fe05a5f7bbbecb3d8b033e8151fb83"
+   ],
+   "run": "skylib-7.7.2"
+  },
+  {
+   "url": "https://github.com/bazelbuild/rules_license/releases/download/1.0.0/rules_license-1.0.0.tar.gz",
+   "bytes": 35903,
+   "key_type": "sha256",
+   "integrity": "sha256-JtQCH2iY4juC75UweDid1JrCtWGKxWSt5O+HzO0Uezg=",
+   "cache_file": "content_addressable/sha256/26d4021f6898e23b82ef953078389dd49ac2b5618ac564ade4ef87cced147b38/file",
+   "canonical_id_is_url": true,
+   "id_marker_if_canonical_id_is_url": "content_addressable/sha256/26d4021f6898e23b82ef953078389dd49ac2b5618ac564ade4ef87cced147b38/id-6c4d1bc143996634cd77343420dfa2435acc7ec5d5d62f97d8da70d68c5d4aa1",
+   "id_markers_present": [
+    "id-6c4d1bc143996634cd77343420dfa2435acc7ec5d5d62f97d8da70d68c5d4aa1"
+   ],
+   "run": "skylib-7.7.2"
+  },
+  {
+   "url": "https://bcr.bazel.build/modules/bazel_skylib/1.8.2/MODULE.bazel",
+   "bytes": 389,
+   "key_type": "sha256",
+   "integrity": "sha256-aa1pJwmDFoSLNKkUK8yXXgGLon8IxP9AP1DBtuZGymc=",
+   "cache_file": "content_addressable/sha256/69ad6927098316848b34a9142bcc975e018ba27f08c4ff403f50c1b6e646ca67/file",
+   "canonical_id_is_url": false,
+   "id_marker_if_canonical_id_is_url": "content_addressable/sha256/69ad6927098316848b34a9142bcc975e018ba27f08c4ff403f50c1b6e646ca67/id-5017f0208dbce0d55880394f478651f071c393a471fc261054a1599df5ee70de",
+   "id_markers_present": [],
+   "run": "skylib-9.3.2"
+  },
+  {
+   "url": "https://bcr.bazel.build/modules/buildozer/8.5.1/MODULE.bazel",
+   "bytes": 1122,
+   "key_type": "sha256",
+   "integrity": "sha256-o12VYbP8Wxh5fDMHk+meO4NKRz1fvT19djSq/Jvbb48=",
+   "cache_file": "content_addressable/sha256/a35d9561b3fc5b18797c330793e99e3b834a473d5fbd3d7d7634aafc9bdb6f8f/file",
+   "canonical_id_is_url": false,
+   "id_marker_if_canonical_id_is_url": "content_addressable/sha256/a35d9561b3fc5b18797c330793e99e3b834a473d5fbd3d7d7634aafc9bdb6f8f/id-974ba8130ab5d86e163595065c1dfc67e0833c8cfdb8241e87e7f4c8cf222dba",
+   "id_markers_present": [],
+   "run": "skylib-9.3.2"
+  },
+  {
+   "url": "https://bcr.bazel.build/modules/apple_support/2.5.2/MODULE.bazel",
+   "bytes": 1222,
+   "key_type": "sha256",
+   "integrity": "sha256-uxtwgeOQqNOIX2QssAc9/Pjno2Ul4Hn6j1g1r3B5wP4=",
+   "cache_file": "content_addressable/sha256/bb1b7081e390a8d3885f642cb0073dfcf8e7a36525e079fa8f5835af7079c0fe/file",
+   "canonical_id_is_url": false,
+   "id_marker_if_canonical_id_is_url": "content_addressable/sha256/bb1b7081e390a8d3885f642cb0073dfcf8e7a36525e079fa8f5835af7079c0fe/id-0db8717959509b612480c174389477d5824f8d5df7a0c135a8f0f8e57606c3dc",
+   "id_markers_present": [],
+   "run": "skylib-9.3.2"
+  },
+  {
+   "url": "https://github.com/bazelbuild/platforms/releases/download/1.0.0/platforms-1.0.0.tar.gz",
+   "bytes": 7879,
+   "key_type": "sha256",
+   "integrity": "sha256-M4TrHDB2JwT7445EAgThFBVAhsj8iowuPihEECjAGag=",
+   "cache_file": "content_addressable/sha256/3384eb1c30762704fbe38e440204e114154086c8fc8a8c2e3e28441028c019a8/file",
+   "canonical_id_is_url": true,
+   "id_marker_if_canonical_id_is_url": "content_addressable/sha256/3384eb1c30762704fbe38e440204e114154086c8fc8a8c2e3e28441028c019a8/id-bde864feb635557686f26acbca5850e35afb0ddbfec43fafc42ff736d9fc96fc",
+   "id_markers_present": [
+    "id-bde864feb635557686f26acbca5850e35afb0ddbfec43fafc42ff736d9fc96fc"
+   ],
+   "run": "skylib-9.3.2"
+  },
+  {
+   "url": "https://github.com/bazelbuild/bazel-skylib/releases/download/1.8.2/bazel-skylib-1.8.2.tar.gz",
+   "bytes": 44667,
+   "key_type": "sha256",
+   "integrity": "sha256-bnjw5X3iaAH29WT6fEpI3Is2hz5BYlepK7sJN+6shEY=",
+   "cache_file": "content_addressable/sha256/6e78f0e57de26801f6f564fa7c4a48dc8b36873e416257a92bbb0937eeac8446/file",
+   "canonical_id_is_url": true,
+   "id_marker_if_canonical_id_is_url": "content_addressable/sha256/6e78f0e57de26801f6f564fa7c4a48dc8b36873e416257a92bbb0937eeac8446/id-662940d75b9a273377781b50f8c64bf499fe05a5f7bbbecb3d8b033e8151fb83",
+   "id_markers_present": [
+    "id-662940d75b9a273377781b50f8c64bf499fe05a5f7bbbecb3d8b033e8151fb83"
+   ],
+   "run": "skylib-9.3.2"
+  },
+  {
+   "url": "https://github.com/bazelbuild/rules_license/releases/download/1.0.0/rules_license-1.0.0.tar.gz",
+   "bytes": 35903,
+   "key_type": "sha256",
+   "integrity": "sha256-JtQCH2iY4juC75UweDid1JrCtWGKxWSt5O+HzO0Uezg=",
+   "cache_file": "content_addressable/sha256/26d4021f6898e23b82ef953078389dd49ac2b5618ac564ade4ef87cced147b38/file",
+   "canonical_id_is_url": true,
+   "id_marker_if_canonical_id_is_url": "content_addressable/sha256/26d4021f6898e23b82ef953078389dd49ac2b5618ac564ade4ef87cced147b38/id-6c4d1bc143996634cd77343420dfa2435acc7ec5d5d62f97d8da70d68c5d4aa1",
+   "id_markers_present": [
+    "id-6c4d1bc143996634cd77343420dfa2435acc7ec5d5d62f97d8da70d68c5d4aa1"
+   ],
+   "run": "skylib-9.3.2"
+  },
+  {
+   "url": "https://bcr.bazel.build/modules/bazel_skylib/1.8.2/MODULE.bazel",
+   "bytes": 389,
+   "key_type": null,
+   "run": "skylib-6.6.0"
+  },
+  {
+   "url": "https://bcr.bazel.build/modules/bazel_skylib/metadata.json",
+   "bytes": 1048,
+   "key_type": null,
+   "run": "skylib-6.6.0"
+  },
+  {
+   "url": "https://bcr.bazel.build/modules/rules_license/1.0.0/MODULE.bazel",
+   "bytes": 753,
+   "key_type": null,
+   "run": "skylib-6.6.0"
+  },
+  {
+   "url": "https://github.com/bazelbuild/platforms/releases/download/0.0.10/platforms-0.0.10.tar.gz",
+   "bytes": 7680,
+   "key_type": "sha256",
+   "integrity": "sha256-IY7+juc20mo1cmY7N0olPAErcW2K8MB+hC6C8jigp+4=",
+   "cache_file": "content_addressable/sha256/218efe8ee736d26a3572663b374a253c012b716d8af0c07e842e82f238a0a7ee/file",
+   "canonical_id_is_url": false,
+   "id_marker_if_canonical_id_is_url": "content_addressable/sha256/218efe8ee736d26a3572663b374a253c012b716d8af0c07e842e82f238a0a7ee/id-af499490460f8b55033ef52f017530ad777c8424a7f2407b25d93da4233ade4d",
+   "id_markers_present": [],
+   "run": "skylib-6.6.0"
+  },
+  {
+   "url": "https://github.com/bazelbuild/bazel-skylib/releases/download/1.8.2/bazel-skylib-1.8.2.tar.gz",
+   "bytes": 44667,
+   "key_type": "sha256",
+   "integrity": "sha256-bnjw5X3iaAH29WT6fEpI3Is2hz5BYlepK7sJN+6shEY=",
+   "cache_file": "content_addressable/sha256/6e78f0e57de26801f6f564fa7c4a48dc8b36873e416257a92bbb0937eeac8446/file",
+   "canonical_id_is_url": false,
+   "id_marker_if_canonical_id_is_url": "content_addressable/sha256/6e78f0e57de26801f6f564fa7c4a48dc8b36873e416257a92bbb0937eeac8446/id-662940d75b9a273377781b50f8c64bf499fe05a5f7bbbecb3d8b033e8151fb83",
+   "id_markers_present": [],
+   "run": "skylib-6.6.0"
+  },
+  {
+   "url": "https://github.com/bazelbuild/rules_license/releases/download/1.0.0/rules_license-1.0.0.tar.gz",
+   "bytes": 35903,
+   "key_type": "sha256",
+   "integrity": "sha256-JtQCH2iY4juC75UweDid1JrCtWGKxWSt5O+HzO0Uezg=",
+   "cache_file": "content_addressable/sha256/26d4021f6898e23b82ef953078389dd49ac2b5618ac564ade4ef87cced147b38/file",
+   "canonical_id_is_url": false,
+   "id_marker_if_canonical_id_is_url": "content_addressable/sha256/26d4021f6898e23b82ef953078389dd49ac2b5618ac564ade4ef87cced147b38/id-6c4d1bc143996634cd77343420dfa2435acc7ec5d5d62f97d8da70d68c5d4aa1",
+   "id_markers_present": [],
+   "run": "skylib-6.6.0"
+  }
+ ]
+}

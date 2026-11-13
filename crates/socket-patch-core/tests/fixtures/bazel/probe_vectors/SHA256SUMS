@@ -1,6 +1,6 @@
 8a517a2b003d4cc15c630a7b3be9e16848f2a64a9e142022a8a899c2da15d04e  .gitattributes
-3e9db14859b0cdd9e2ed2e5368be0a593d9f3c55ac472344c627cd57d81f6b99  README.md
-99c2d5c62018739c7864fef75fca743f49591a2447b9508fd859da91aa1c27be  check.py
+25b5220bfbdfa94cd2bf9b642a2fb4d7aee3fdec67db815bdd09789b2575c23b  README.md
+4308c13c430ca4930fef7988f6b92fd4b89cdc8ed79f8428aaf0c7444f4e25a1  check.py
 d222c475d686c028ef0072db385e434b1f8ebd56338bf481740e7bff60d0e11f  core-external-edits/vectors/detect/10.0.0rc3-cc.json
 bd6af7192007d58ed6cd795694844a39a6ffa27330cfc2a4ee7a2f8f8024e29c  core-external-edits/vectors/detect/5.4.1-default.json
 e0ab0668bbc3ee5fda385182ba1b2492f55f6f866f6834880d14731318ed2d90  core-external-edits/vectors/detect/6.6.0-default.json
@@ -12,7 +12,7 @@ f416ebc21a28ddd105de2071303394e7fe4f9511dec86a9595185187d9afb8b3  core-external-
 747c61caa921a83a3a793c33e8dd5b868abcc9c5cd89599481ec167f922d7480  core-external-edits/vectors/detect/9.3.2-cc.json
 fd279ae821636450098eaae257b1decb610b73a50163ab5a5926f15fc5337080  core-external-edits/vectors/detect/9.3.2-vendor.json
 07f4da30de05f532cfa7730bb0630861bd22e646d7d9d3851cb217e3be9d878e  core-output-base/proto/vectors/link_route.json
-d460e22bc90e07d67f8a77cc2d76e3213ab5c983fbd5d985fc9ed87a5fe0223f  import_layouts.py
+c3c6f9f429aa6f3063e36069155a5822844ece03eed7a4b66741f369541c48ba  import_layouts.py
 a06841bae347dc1a62e0993147fb81c16a09ed30c01d53fa1988b9eeccf20e9d  lockfile/l6-crlf-pair/bazel-7.0.2/crlf/dep.lock
 bef94a3ce27f7bbe3e6d4b0396b65b1ba3ca9a6017c835ed92fd4645639e7ab2  lockfile/l6-crlf-pair/bazel-7.0.2/crlf/root.MODULE.bazel.lock
 e8416e29516964fe181293c389328c5eb829d92391d5fed444df3a5ba74cf535  lockfile/l6-crlf-pair/bazel-7.0.2/lf/dep.lock
@@ -196,6 +196,7 @@ e64f1d515b36e38c1d73d1965e8f9d54665aa733e7757ba5f558953af8456000  lockfile/works
 ecfc0ae67c1b4a17dbbfd9d25320e1be24b8e448951916699524e59e5ccb6e02  lockfile/workspace/root.BUILD.bazel
 de68664a47cd76b5aaca5eb38dac15b086235d64ca8bb38f7fab9cc7cd286891  lockfile/workspace/third_party-py.BUILD.bazel
 a2e4d629a8d94ada660b40b0ae102a984dd09cab67dda6c2ed9042d1251e0f63  platform-server/vectors/repo_cache_vectors.json
+cbb345e848ef17cb4acc2010a7f5f9fd9e61b40ed7dcd280cc0206cec2a603dd  test-infra-offline/vectors/repo_cache/observed.sample.json
 36d9b0810ad6bbb35db31b524d4eb7eb66ad98a8cc6f520cf87d5d03703b0a43  x2/cargo-bazel-lock.json
 716d7d03490f3c377242cc98ebb8276396833d4817726f3a3c6c7371cc4dbc6b  x2/hub.BUILD.bazel
 e9559f9612b94de0c7620864f39a3894f31dacb5f36e31376accbf0bd0773be7  x2/hub.defs.bzl
