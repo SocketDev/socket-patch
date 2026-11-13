@@ -28,7 +28,7 @@
 //! compared.
 
 use super::model::{
-    DeclSystem, FileText, FileView, Reason, RunRequired, VexWithhold, WithholdKind,
+    DeclSystem, FileText, FileView, Interim, Reason, RunRequired, VexWithhold, WithholdKind,
 };
 use super::module_lock::{
     input_state, ExtensionEntry, ExtensionFacts, Extensions, FactDigest, InputState, ModuleLock,
@@ -842,8 +842,15 @@ impl Decision {
     pub fn run_required(&self) -> Option<RunRequired> {
         match (&self.interim, &self.advisory) {
             (InterimState::SelfHealing { command }, _) => command.run_required(true),
+            // The build fails until the command has run, and the
+            // advisory says so: a caller that reads `interim` must not
+            // take a failing state for a passing one.
             (InterimState::Red { remedy, .. }, _) => {
-                remedy.run_required(self.stale.iter().any(DerivedState::gates_vex))
+                let run = remedy.run_required(self.stale.iter().any(DerivedState::gates_vex));
+                run.map(|run| RunRequired {
+                    interim: Interim::Failing,
+                    ..run
+                })
             }
             (InterimState::Green, Some(advisory)) => advisory.run_required(false),
             (InterimState::Green, None) => None,
@@ -1030,7 +1037,12 @@ impl Evidence {
                 (WithholdKind::DerivedStale, remedy.text())
             }
         };
-        Some(VexWithhold { kind, detail })
+        let token = None;
+        Some(VexWithhold {
+            kind,
+            token,
+            detail,
+        })
     }
 }
 
@@ -2232,6 +2244,11 @@ mod tests {
         let advisory = decision.run_required().unwrap();
         assert_eq!(advisory.platforms, [LINUX, OSX]);
         assert!(advisory.gates_vex);
+        // Works-after: the build passes until the user runs the command,
+        // and nothing socket-patch could start is described.
+        assert_eq!(advisory.interim, Interim::Passing);
+        assert_eq!(advisory.actor, crate::bazel::model::Actor::User);
+        assert!(advisory.argv.is_empty() && advisory.outputs.is_empty());
         let InterimState::SelfHealing { command } = &decision.interim else {
             panic!("{decision:?}");
         };
@@ -2559,6 +2576,8 @@ mod tests {
         assert_eq!(repin.kind.as_str(), "repin");
         assert_eq!(repin.command, "CARGO_BAZEL_REPIN=1 bazel mod deps");
         assert!(repin.gates_vex);
+        // A red state fails the build until the command has run.
+        assert_eq!(repin.interim, Interim::Failing);
         // No repair makes an unrepairable row go away.
         let named = edit(&["Cargo.toml"], &rows, &["cargo-bazel-lock.json"]);
         assert_eq!(outcome(&named), "refused");

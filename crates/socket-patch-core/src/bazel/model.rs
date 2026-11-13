@@ -1,4 +1,6 @@
-//! The cross-cutting types of the Bazel layer (design 2.3 and 2.12).
+//! The cross-cutting types of the Bazel layer (design 2.3 and 2.12, and
+//! the policy types of revision 4: write classes, lifts, anchors, the run
+//! policy).
 //!
 //! Only what more than one reader, recognizer or lane shares lives here.
 //! Each reader keeps its own types in the file its package owns and this
@@ -18,6 +20,8 @@ use crate::crawlers::types::Ecosystem;
 use crate::patch::redirect::{DepOverride, RewriteResult};
 use crate::vendor::lock_inventory::LockfileEntry;
 
+use serde_json::{json, Value};
+
 pub use super::codes::Code;
 pub use super::derived::{DerivedState, InterimState};
 pub use super::gate::{LaneCx, PatchRequest};
@@ -25,7 +29,7 @@ pub use super::ignore::IgnoreModel;
 pub use super::module_file::ModuleModel;
 pub use super::module_lock::ModuleLock;
 pub use super::output_tree::PathClass;
-pub use super::owned_index::IndexRow;
+pub use super::owned_index::{BzlRow, Index, IndexRow, RcFlagRow, SegmentRow};
 pub use super::rc::{EffectiveFlags, FlagState};
 pub use super::remedy::Remedy;
 pub use super::ruleset_version::VersionVerdict;
@@ -169,7 +173,16 @@ impl FileText {
 pub trait FileView {
     fn read(&self, rel: &str) -> FileText;
     /// Children of a directory (`""` = the root): bare names, directories
-    /// ending in `/`. `None` when it cannot be listed, which is not empty.
+    /// ending in `/`.
+    ///
+    /// The recognizers rely on exactly two answers. `Some` of an empty
+    /// list is a directory that holds nothing or is not there: a scan
+    /// that finds no file in it has seen all of it. `None` is a listing
+    /// that cannot be trusted (a path past the read boundary, a directory
+    /// that could not be read to its end): it is never empty, and a scan
+    /// that meets it reports a gap. A view that answers `None` for a
+    /// directory that is merely absent turns every such scan into "could
+    /// not read".
     fn list(&self, dir: &str) -> Option<Vec<String>>;
 }
 
@@ -372,7 +385,8 @@ listed_enum! {
         GoRepository,
         /// Row 19: crate_universe with a `lockfile`.
         CrateUniverseLocked,
-        /// Row 20: WORKSPACE `crates_repository` without one.
+        /// Row 20: `crates_repository` without one, called in a WORKSPACE
+        /// file or, through `use_repo_rule`, in `MODULE.bazel`.
         CratesRepositoryUnlocked,
         /// Row 21: Bzlmod crate_universe without one.
         CrateUniverseUnlocked,
@@ -574,6 +588,68 @@ listed_enum! {
     }
 }
 
+/// What would lift a refusal (revision 4, decision R4-8). A refusal is a
+/// state of one cell in one release, not a verdict on the shape: it names
+/// the lane to enable, the floor to reach, the one edit only the user may
+/// make, the command to run, or the owner decision it waits for. Only
+/// [`Lift::None`] is final, and the gate itself never emits it: finality
+/// is data in the lane table (`lanes::FINAL`), each entry with its proof.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Lift {
+    /// A lane exists for the cell and is disabled: its real-Bazel cells
+    /// have not run. [`LaneId::UNNAMED`] where the refusing code cannot
+    /// name it.
+    EnableLane(LaneId),
+    /// A Bazel or ruleset floor the workspace is below.
+    Line { needs: &'static str },
+    /// One edit only the user may make. `what` is the text to add or the
+    /// change to make, printed with the refusal.
+    UserEdit { file: String, what: String },
+    /// A tool run the run policy forbade, or one that failed. The command
+    /// is display text: no token, no URL.
+    Run { command: String },
+    /// An open owner decision, by its number (`O6`, `O15`, `O20`).
+    Owner(&'static str),
+    /// Final: why no committed state builds the patched bytes.
+    None { proof: &'static str },
+}
+
+impl Lift {
+    /// The `kind` of `details.lift`.
+    pub const fn kind(&self) -> &'static str {
+        match self {
+            Self::EnableLane(_) => "enable_lane",
+            Self::Line { .. } => "line",
+            Self::UserEdit { .. } => "user_edit",
+            Self::Run { .. } => "run",
+            Self::Owner(_) => "owner",
+            Self::None { .. } => "none",
+        }
+    }
+
+    /// Whether nothing lifts the refusal.
+    pub const fn is_final(&self) -> bool {
+        matches!(self, Self::None { .. })
+    }
+
+    /// `details.lift` of the refusal's event: `kind` plus the fields of
+    /// the variant. One function builds it, so every seam prints the same
+    /// object and none matches on the variant. A lane that is not named
+    /// has no `lane` member: a script never reads a placeholder as an ID.
+    pub fn details(&self) -> Value {
+        let kind = self.kind();
+        match self {
+            Self::EnableLane(lane) if *lane == LaneId::UNNAMED => json!({ "kind": kind }),
+            Self::EnableLane(lane) => json!({ "kind": kind, "lane": lane.0 }),
+            Self::Line { needs } => json!({ "kind": kind, "needs": needs }),
+            Self::UserEdit { file, what } => json!({ "kind": kind, "file": file, "what": what }),
+            Self::Run { command } => json!({ "kind": kind, "command": command }),
+            Self::Owner(decision) => json!({ "kind": kind, "decision": decision }),
+            Self::None { proof } => json!({ "kind": kind, "proof": proof }),
+        }
+    }
+}
+
 /// A refusal: nothing was written. `detail` ends with the remedy and
 /// never echoes a grant token.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -583,19 +659,42 @@ pub struct Refusal {
     pub detail: String,
     /// The manual procedure, where one exists.
     pub snippet: Option<String>,
+    /// What would lift it. Every constructor takes one or names one: a
+    /// refusal that did not say would read as final, and only
+    /// [`Lift::None`] with its proof may say that.
+    pub lift: Lift,
 }
 
 impl Refusal {
-    /// The refusal of every lane that has not landed its real-Bazel proof.
-    pub fn lane_not_enabled() -> Self {
+    /// A refusal for `reason`, with the token that names the case and
+    /// what would lift it.
+    pub fn new(reason: Reason, token: &'static str, detail: impl Into<String>, lift: Lift) -> Self {
         Self {
-            reason: Reason::RulesetUnsupported,
-            token: LANE_NOT_ENABLED,
-            detail: "socket-patch has no enabled lane for this Bazel ruleset shape in this mode, \
-                     so the build would not consume the patch; nothing was written"
-                .to_string(),
+            reason,
+            token,
+            detail: detail.into(),
             snippet: None,
+            lift,
         }
+    }
+
+    /// The same refusal with the manual procedure attached.
+    pub fn with_snippet(mut self, snippet: impl Into<String>) -> Self {
+        self.snippet = Some(snippet.into());
+        self
+    }
+
+    /// The refusal of a lane that has not landed its real-Bazel proof.
+    /// `lane` is the lane to enable; the stub of a family none of whose
+    /// lanes has landed passes [`LaneId::UNNAMED`].
+    pub fn lane_not_enabled(lane: LaneId) -> Self {
+        Self::new(
+            Reason::RulesetUnsupported,
+            LANE_NOT_ENABLED,
+            "socket-patch has no enabled lane for this Bazel ruleset shape in this mode, so the \
+             build would not consume the patch; nothing was written",
+            Lift::EnableLane(lane),
+        )
     }
 }
 
@@ -606,20 +705,49 @@ pub struct Advisory {
     pub detail: String,
 }
 
-/// The kind of reference `vex` may attest a plan's pin through (design
-/// 4.3). `Withheld` is the answer whenever no digest the build enforces
-/// anchors the pin.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AttestBasis {
-    Withheld,
-    /// A Socket-host URL plus an enforced digest in the hub's native lock.
-    LockUrl,
-    /// A `.socket/vendor/...` path in the hub's native lock.
-    LockPath,
-    /// A pin in a Bazel-only lock.
-    BazelLock,
-    /// The `go.mod` reference plus matching `go_repository` attributes.
-    GoRule,
+listed_enum! {
+    /// The kind of reference `vex` may attest a plan's pin through (design
+    /// 4.3). `Withheld` is the answer whenever no digest the build
+    /// enforces anchors the pin. An rc flag is not a basis: an rc provider
+    /// adds nothing to a lock proof, and a pin only an rc flag selects is
+    /// not attested (revision 4, section 3).
+    ///
+    /// Only `attest.rs` matches on it. Every other caller prints
+    /// [`AttestBasis::as_str`], so a basis is added without a seam edit.
+    pub enum AttestBasis {
+        Withheld,
+        /// A Socket-host URL plus an enforced digest in the hub's native
+        /// lock.
+        LockUrl,
+        /// A `.socket/vendor/...` path in the hub's native lock.
+        LockPath,
+        /// A pin in a Bazel-only lock.
+        BazelLock,
+        /// The `go.mod` reference plus matching `go_repository`
+        /// attributes.
+        GoRule,
+        /// A pin in `.socket/bazel/pins.json` that an owned rule reads and
+        /// passes to a checked download.
+        OwnedPin,
+        /// A segment row, a WORKSPACE definition or a tag edit selects the
+        /// bytes, and Bazel evaluates that statement on every build.
+        Declared,
+    }
+}
+
+impl AttestBasis {
+    /// The basis as output names it.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Withheld => "withheld",
+            Self::LockUrl => "lock_url",
+            Self::LockPath => "lock_path",
+            Self::BazelLock => "bazel_lock",
+            Self::GoRule => "go_rule",
+            Self::OwnedPin => "owned_pin",
+            Self::Declared => "declared",
+        }
+    }
 }
 
 listed_enum! {
@@ -635,6 +763,13 @@ listed_enum! {
         /// `lockfile`: after a restore the build fails with `Digests do
         /// not match` until the repin (design 7).
         Repin,
+        /// A lock a ruleset's own pin target regenerates
+        /// (`maven_install.json` through `@<hub>//:pin`).
+        Pin,
+        /// A committed vendor directory, through `bazel vendor`: under
+        /// `--vendor_dir` Bazel builds from that tree and not from a pin
+        /// in a lock.
+        Vendor,
     }
 }
 
@@ -645,8 +780,69 @@ impl RunKind {
             Self::Lockfile => "lockfile",
             Self::UpdateRepos => "update_repos",
             Self::Repin => "repin",
+            Self::Pin => "pin",
+            Self::Vendor => "vendor",
         }
     }
+}
+
+listed_enum! {
+    /// Whether the build passes between a write and the run that follows
+    /// it (revision 4, 2.5). `Failing` is what makes a run part of the
+    /// transaction: with no run nothing may be written.
+    pub enum Interim { Passing, Failing }
+}
+
+impl Interim {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Passing => "passing",
+            Self::Failing => "failing",
+        }
+    }
+}
+
+listed_enum! {
+    /// Who runs the command of a [`RunRequired`]. The gate decides it from
+    /// the [`RunPolicy`]; no seam looks at it.
+    pub enum Actor { User, SocketPatch }
+}
+
+impl Actor {
+    /// The `actor` of a `runs` row of the owned index.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::SocketPatch => "socket-patch",
+        }
+    }
+}
+
+listed_enum! {
+    /// Whether socket-patch may run a lane's tool (revision 4, 2.5; owner
+    /// decision O17). Every caller passes `Never` until the owner agrees:
+    /// a lane whose interim state fails is then refused with
+    /// [`Lift::Run`], and nothing spawns.
+    pub enum RunPolicy {
+        Never,
+        /// Only where the interim state would fail.
+        RequiredOnly,
+        Always,
+    }
+}
+
+/// The tool a lane may name for a run (revision 4, 2.5). Static, in the
+/// lane's [`LaneSpec`]. Core describes the run and never starts it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ToolSpec {
+    /// For example `bazel-mod-deps`, `crate-universe-repin`, `rje-pin`,
+    /// `gazelle-update-repos`, `bazel-vendor`.
+    pub id: &'static str,
+    /// Which part of the tool's output socket-patch cannot derive from
+    /// committed files, with the source or probe that shows it. A lane
+    /// names a tool only with this sentence; the claims dump prints it.
+    pub not_computable: &'static str,
+    pub needs_network: bool,
 }
 
 /// The one command the user runs after a works-after write, or after a
@@ -656,7 +852,22 @@ impl RunKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunRequired {
     pub kind: RunKind,
+    /// Display text: no token, no URL.
     pub command: String,
+    /// The exact arguments, the tool first. No shell reads them. Empty
+    /// for a run that is known only as display text (a remedy the user
+    /// follows): nothing can be started from it.
+    pub argv: Vec<String>,
+    /// Variables added to the scrubbed environment: allow-listed names
+    /// only (`CARGO_BAZEL_REPIN`, `REPIN`).
+    pub env: Vec<(String, String)>,
+    /// The root-relative [`PlannedWrite::ToolOutput`] paths the run
+    /// rewrites, which are snapshotted before it starts.
+    pub outputs: Vec<String>,
+    /// Whether the build passes between the write and the run.
+    pub interim: Interim,
+    /// Decided by the gate from the run policy.
+    pub actor: Actor,
     /// The platforms the lock records an entry for; the command is run on
     /// each.
     pub platforms: Vec<String>,
@@ -667,9 +878,51 @@ pub struct RunRequired {
     pub gates_vex: bool,
 }
 
-/// One write of a plan, by root-relative path. These four constructors
-/// are the only way the Bazel rewriter group can express a write, which
-/// keeps its output inside the allowed classes (owner decision D4).
+listed_enum! {
+    /// The classes of write a lane may make (revision 4, decision R4-1),
+    /// in order of preference. A lane lists the ones it uses in
+    /// [`LaneSpec::classes`]; the executor (`bazel::exec`) handles each
+    /// class in one place and refuses one it does not implement.
+    pub enum WriteClass {
+        /// The hub's native lock, its paired manifest, `pnpm-workspace.yaml`.
+        NativeLock,
+        /// A value in a file a tool generates (`maven_install.json`,
+        /// `paket.<group>.bzl`, a hash file).
+        GeneratedValue,
+        /// An exact-prefix line in the root's `.bazelignore`.
+        IgnoreLine,
+        /// A file under `<root>/.socket/bazel/`.
+        Owned,
+        /// One marked unit in one user file that reaches an owned file.
+        Hook,
+        /// A marked edit inside one user tag or rule call.
+        TagEdit,
+        /// A file a named tool rewrites during a run of the plan. Never
+        /// written by socket-patch.
+        ToolOutput,
+    }
+}
+
+impl WriteClass {
+    /// The class as the claims dump and a message name it.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NativeLock => "native_lock",
+            Self::GeneratedValue => "generated_value",
+            Self::IgnoreLine => "ignore_line",
+            Self::Owned => "owned",
+            Self::Hook => "hook",
+            Self::TagEdit => "tag_edit",
+            Self::ToolOutput => "tool_output",
+        }
+    }
+}
+
+/// One write of a plan, by root-relative path. These seven constructors
+/// are the only way a lane can express a write, which keeps its output
+/// inside the allowed classes (owner decision D4 as revision 4 reads it).
+/// A seam never builds one and never matches on one: it hands the plan to
+/// `bazel::exec`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PlannedWrite {
     /// A native lock a live hub names, its paired manifest or a side file:
@@ -678,21 +931,199 @@ pub enum PlannedWrite {
     /// lock, which is created as native hosted mode creates it (owner
     /// decision O14). `.npmrc` is never one: a created `.npmrc` fails
     /// rules_js 3.x.
-    NativeLock { path: String },
-    /// One value in a file a tool generates.
-    GeneratedValue { path: String, key: String },
+    NativeLock {
+        path: String,
+    },
+    /// One value in a file a tool generates. `key` addresses it in the
+    /// lane's own terms, and is the key of the edit in the `pins` row
+    /// that records the original.
+    GeneratedValue {
+        path: String,
+        key: String,
+    },
     /// One exact-prefix line in the root's `.bazelignore`.
-    IgnoreLine { line: String },
-    /// The owned index, `.socket/bazel/index.json`.
-    OwnedFile { path: String },
+    IgnoreLine {
+        line: String,
+    },
+    Owned(OwnedWrite),
+    Hook(HookKind),
+    TagEdit(TagEdit),
+    /// A file the plan's tool run rewrites. Declared so the executor can
+    /// snapshot it and the write-policy test can classify the change.
+    ToolOutput {
+        path: String,
+    },
+}
+
+impl PlannedWrite {
+    pub const fn class(&self) -> WriteClass {
+        match self {
+            Self::NativeLock { .. } => WriteClass::NativeLock,
+            Self::GeneratedValue { .. } => WriteClass::GeneratedValue,
+            Self::IgnoreLine { .. } => WriteClass::IgnoreLine,
+            Self::Owned(_) => WriteClass::Owned,
+            Self::Hook(_) => WriteClass::Hook,
+            Self::TagEdit(_) => WriteClass::TagEdit,
+            Self::ToolOutput { .. } => WriteClass::ToolOutput,
+        }
+    }
+}
+
+/// A write under `<root>/.socket/bazel/`. The text files there are
+/// rendered from the index, so a lane contributes a typed row and never
+/// file bytes (decision R4-2). `File` is the exception: a patch file or
+/// pin data, whose bytes come from the lane and whose row holds their
+/// SHA-256.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OwnedWrite {
+    /// `.socket/bazel/index.json`.
+    Index,
+    /// One line of `socket.bazelrc`.
+    RcFlag(RcFlagRow),
+    /// One statement group of `socket-patch.MODULE.bazel`.
+    Segment(SegmentRow),
+    /// One entry of `socket_patch.bzl`.
+    Bzl(BzlRow),
+    File {
+        path: String,
+        sha256: String,
+    },
+}
+
+listed_enum! {
+    /// The user file a hook unit goes into.
+    pub enum HookKind {
+        /// `try-import %workspace%/.socket/bazel/socket.bazelrc` in the
+        /// root `.bazelrc`.
+        Bazelrc,
+        /// An `include()` of the owned segment in the root `MODULE.bazel`.
+        ModuleFile,
+        /// A `load` of `socket_patch.bzl` and its call in the WORKSPACE
+        /// file that is live for the hub.
+        WorkspaceFile,
+    }
+}
+
+impl HookKind {
+    /// The `kind` of a `hooks` row of the owned index.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Bazelrc => "rc",
+            Self::ModuleFile => "module",
+            Self::WorkspaceFile => "workspace",
+        }
+    }
+}
+
+/// The statement a tag edit is made in: the callee as written
+/// (`bundle.fetch`, `maven.install`), the literal that identifies the call
+/// among its siblings (the hub name) and its ordinal among the calls that
+/// share both.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StmtRef {
+    pub callee: String,
+    pub id: String,
+    pub ordinal: u32,
+}
+
+listed_enum! {
+    /// What a tag edit does to one attribute.
+    pub enum TagOp { ReplaceString, AddAttr, AddListItem, AddDictEntry }
+}
+
+impl TagOp {
+    /// The `op` of a `tagEdits` row of the owned index.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ReplaceString => "replace_string",
+            Self::AddAttr => "add_attr",
+            Self::AddListItem => "add_list_item",
+            Self::AddDictEntry => "add_dict_entry",
+        }
+    }
+}
+
+/// A minimal edit inside one call of the user's (revision 4, 1.6): a
+/// byte-span splice, recorded so that the removal cuts exactly the bytes
+/// that went in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TagEdit {
+    /// Root-relative: `MODULE.bazel`, an include, a WORKSPACE file, a
+    /// `.bzl` macro file.
+    pub file: String,
+    pub stmt: StmtRef,
+    pub attr: String,
+    pub op: TagOp,
+    /// The exact bytes spliced in, separators included.
+    pub inserted: String,
+    /// The package version the edit is keyed by in the ruleset's own
+    /// terms, so that it is inert once the lock pins another version.
+    pub version_key: Option<String>,
+}
+
+listed_enum! {
+    /// What ties a lane's wiring to the patched bytes (decision R4-6). A
+    /// lane uses the strongest one its shape admits.
+    pub enum Anchor {
+        /// A digest in a file the hub reads pins the bytes. Rc flags and
+        /// segment rows only provide them: without them the build fetches
+        /// the pinned bytes or fails, never upstream.
+        Digest,
+        /// A statement Bazel evaluates on every build selects the bytes.
+        Declaration,
+        /// Only an rc flag selects them. An ignored rc file then builds
+        /// upstream with no message, so the pin is not attested.
+        RcSelector,
+    }
+}
+
+impl Anchor {
+    /// `details.bazel.anchor`.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Digest => "digest",
+            Self::Declaration => "declaration",
+            Self::RcSelector => "rc_selector",
+        }
+    }
+}
+
+listed_enum! {
+    /// What a lane's leftover wiring does after the user bumps the package
+    /// and does not run socket-patch (decision R4-7). A real-Bazel bump
+    /// cell proves the declared one. Building the old patched version
+    /// with no message is not admissible, so it has no variant.
+    pub enum StaleBehaviour {
+        /// The leftover selects nothing: the build uses the version the
+        /// user asked for.
+        Inert,
+        /// The build fails, and the error names an owned path or
+        /// socket-patch and the one command to run.
+        FailsAttributed,
+    }
+}
+
+impl StaleBehaviour {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Inert => "inert",
+            Self::FailsAttributed => "fails_attributed",
+        }
+    }
 }
 
 /// What a passing gate allows.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Plan {
+    /// The lane that planned it and whose rows the executor records.
+    pub lane: LaneId,
+    /// In the order of the root transaction: providers, hooks, then
+    /// dependents, so that every prefix is a state in which the build
+    /// passes.
     pub writes: Vec<PlannedWrite>,
     pub advisories: Vec<Advisory>,
     pub attest: AttestBasis,
+    pub anchor: Anchor,
 }
 
 /// The three outcomes of design principle P6, plus "not a Bazel matter".
@@ -710,6 +1141,15 @@ pub enum GateOutcome {
 /// `H` hosted, `V` vendored, `A` agent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct LaneId(pub &'static str);
+
+impl LaneId {
+    /// Stands in where a refusal must name the lane to enable and the
+    /// refusing code is handed no lane table: the stub of a family none of
+    /// whose lanes has landed. It is no lane ID (the index refuses it as
+    /// one), and [`Lift::details`] prints no `lane` for it. The gate's
+    /// dispatch knows the family's lanes and names the real one.
+    pub const UNNAMED: LaneId = LaneId("unnamed");
+}
 
 /// A dependency system a real-Bazel cell runs as.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -770,6 +1210,10 @@ pub enum TokenSurface {
     RepositoryName,
     /// Refused without the owner's sign-off.
     PurlQualifier,
+    /// `.socket/bazel/pins.json`, lock-like data an owned rule reads: the
+    /// only owned file that may hold a Socket URL, with the standing of a
+    /// lock file (owner decision O22).
+    OwnedPinData,
 }
 
 /// One lane and what it claims.
@@ -786,11 +1230,21 @@ pub struct LaneSpec {
     pub token_surfaces: &'static [TokenSurface],
     /// The probes that gate the lane.
     pub probes: &'static [&'static str],
+    /// The write classes the lane may use. A plan that uses another is
+    /// rejected; an enabled lane lists at least one.
+    pub classes: &'static [WriteClass],
+    pub anchor: Anchor,
+    pub stale: StaleBehaviour,
+    /// The tool the lane may name for a run, with why its output cannot
+    /// be computed.
+    pub tool: Option<ToolSpec>,
 }
 
 impl LaneSpec {
     /// A lane that is designed and not yet proven: disabled, no claim, no
-    /// token surface.
+    /// token surface, no write class, no tool. The anchor and the
+    /// staleness behaviour are the strictest, so a lane that forgets to
+    /// declare its own claims nothing weaker.
     pub const fn stub(id: &'static str, mode: Mode, probes: &'static [&'static str]) -> Self {
         Self {
             id: LaneId(id),
@@ -799,6 +1253,10 @@ impl LaneSpec {
             supported: &[],
             token_surfaces: &[],
             probes,
+            classes: &[],
+            anchor: Anchor::Digest,
+            stale: StaleBehaviour::Inert,
+            tool: None,
         }
     }
 }
@@ -827,6 +1285,9 @@ listed_enum! {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VexWithhold {
     pub kind: WithholdKind,
+    /// The token that names the case, where the kind alone does not
+    /// (`hook_missing`, `stale_override`, `rc_selected`).
+    pub token: Option<&'static str>,
     pub detail: String,
 }
 
@@ -860,7 +1321,9 @@ pub type DiscoverFn = fn(&LaneCx<'_>, TextRead<'_>) -> Option<Vec<BazelRef>>;
 /// Re-runs the gate at discovery, so a pin whose proof no longer holds is
 /// not attested.
 pub type AttestFn = fn(&LaneCx<'_>, &BazelRef) -> Result<(), VexWithhold>;
-/// Undoes one index row offline.
+/// Undoes one `pins` row of the index offline. Every other row (an ignore
+/// line, and with revision 4 a hook, an owned file, a tag edit) is undone
+/// mechanically by `bazel::exec` from the row itself.
 pub type RestoreFn = fn(&LaneCx<'_>, &mut Files, &IndexRow) -> RestoreOutcome;
 /// What the hub lock resolves. `None` = cannot enumerate: an empty list
 /// would read as "resolves nothing" and drop a live record.
@@ -899,7 +1362,7 @@ impl LaneOps {
 }
 
 fn refuse_gate(_: &LaneCx<'_>, _: &PatchRequest<'_>) -> GateOutcome {
-    GateOutcome::Refuse(Refusal::lane_not_enabled())
+    GateOutcome::Refuse(Refusal::lane_not_enabled(LaneId::UNNAMED))
 }
 fn write_nothing(_: &LaneCx<'_>, _: &mut Files, _: &[DepOverride], _: &mut RewriteResult) {}
 fn fix_nothing(_: &LaneCx<'_>, _: &mut Files, _: &Plan, _: &mut RewriteResult) {}
@@ -909,11 +1372,12 @@ fn cannot_discover(_: &LaneCx<'_>, _: TextRead<'_>) -> Option<Vec<BazelRef>> {
 fn withhold(_: &LaneCx<'_>, _: &BazelRef) -> Result<(), VexWithhold> {
     Err(VexWithhold {
         kind: WithholdKind::ConsumerUndetermined,
+        token: None,
         detail: "no enabled lane proves the Bazel build consumes this pin".to_string(),
     })
 }
 fn refuse_restore(_: &LaneCx<'_>, _: &mut Files, _: &IndexRow) -> RestoreOutcome {
-    RestoreOutcome::Refused(Refusal::lane_not_enabled())
+    RestoreOutcome::Refused(Refusal::lane_not_enabled(LaneId::UNNAMED))
 }
 fn cannot_enumerate(_: &LaneCx<'_>, _: TextRead<'_>) -> Option<Vec<LockfileEntry>> {
     None
@@ -1029,21 +1493,110 @@ mod tests {
     }
 
     /// Design 6 lists the advisory's `kind` values. `repin` is the
-    /// crate_universe case of design 7.
+    /// crate_universe case of design 7; revision 4 adds the ruleset's own
+    /// pin target and `bazel vendor`.
     #[test]
-    fn a_required_run_has_the_three_kinds_of_the_contract() {
+    fn a_required_run_has_the_five_kinds_of_the_contract() {
         let kinds: Vec<&str> = RunKind::ALL.iter().map(|kind| kind.as_str()).collect();
-        assert_eq!(kinds, ["lockfile", "update_repos", "repin"]);
+        assert_eq!(
+            kinds,
+            ["lockfile", "update_repos", "repin", "pin", "vendor"]
+        );
     }
 
+    /// One of each lift, with the `details.lift` object the contract
+    /// documents for it.
+    fn lifts() -> Vec<(Lift, Value)> {
+        let (file, what) = ("BUILD.bazel".to_string(), "create it, empty".to_string());
+        let command = "bazel mod deps --lockfile_mode=update".to_string();
+        vec![
+            (
+                Lift::EnableLane(LaneId("H-JS1")),
+                json!({ "kind": "enable_lane", "lane": "H-JS1" }),
+            ),
+            (
+                Lift::EnableLane(LaneId::UNNAMED),
+                json!({ "kind": "enable_lane" }),
+            ),
+            (
+                Lift::Line {
+                    needs: "Bazel 7.2.0",
+                },
+                json!({ "kind": "line", "needs": "Bazel 7.2.0" }),
+            ),
+            (
+                Lift::UserEdit { file, what },
+                json!({ "kind": "user_edit", "file": "BUILD.bazel", "what": "create it, empty" }),
+            ),
+            (
+                Lift::Run { command },
+                json!({ "kind": "run", "command": "bazel mod deps --lockfile_mode=update" }),
+            ),
+            (
+                Lift::Owner("O20"),
+                json!({ "kind": "owner", "decision": "O20" }),
+            ),
+            (
+                Lift::None { proof: "probe X9" },
+                json!({ "kind": "none", "proof": "probe X9" }),
+            ),
+        ]
+    }
+
+    /// `details.lift` is `kind` plus the fields of the variant, and only
+    /// `none` is final. A seam prints the object and never matches on the
+    /// variant, so its shape is pinned here.
     #[test]
-    fn the_stub_refusal_is_a_complete_contract_refusal() {
-        let refusal = Refusal::lane_not_enabled();
-        assert_eq!(refusal.reason, Reason::RulesetUnsupported);
-        assert_eq!(refusal.token, "lane_not_enabled");
-        assert!(TOKENS.contains(&refusal.token));
-        assert!(refusal.detail.ends_with("nothing was written"));
-        assert_eq!(refusal.snippet, None);
+    fn a_lift_prints_its_kind_and_its_fields() {
+        let mut kinds = BTreeSet::new();
+        for (lift, details) in lifts() {
+            assert_eq!(lift.details(), details, "{lift:?}");
+            assert_eq!(details["kind"], lift.kind());
+            assert_eq!(lift.is_final(), lift.kind() == "none", "{lift:?}");
+            kinds.insert(lift.kind());
+        }
+        assert_eq!(kinds.len(), 6, "a lift kind is not covered: {kinds:?}");
+    }
+
+    /// Every constructor of a refusal takes the lift or names one, and
+    /// none of them invents a final refusal: `Lift::None` reaches a
+    /// refusal only from a caller that passes it with its proof.
+    #[test]
+    fn every_refusal_constructor_carries_a_lift_and_none_makes_one_final() {
+        for (lift, _) in lifts() {
+            let made = Refusal::new(Reason::PinBypassed, "vendor_dir", "why", lift.clone());
+            assert_eq!(
+                (made.reason, made.token),
+                (Reason::PinBypassed, "vendor_dir")
+            );
+            assert_eq!((made.detail.as_str(), &made.snippet), ("why", &None));
+            assert_eq!(made.lift, lift, "the constructor changed the lift");
+            let with = made.clone().with_snippet("bazel mod deps");
+            assert_eq!(with.snippet.as_deref(), Some("bazel mod deps"));
+            assert_eq!(with.lift, lift, "attaching a snippet changed the lift");
+        }
+
+        // The constructors that choose the lift themselves.
+        let named = Refusal::lane_not_enabled(LaneId("V-GO1"));
+        assert_eq!(named.lift, Lift::EnableLane(LaneId("V-GO1")));
+        let chosen = [named, Refusal::lane_not_enabled(LaneId::UNNAMED)];
+        for refusal in chosen {
+            assert_eq!(refusal.reason, Reason::RulesetUnsupported);
+            assert_eq!(refusal.token, "lane_not_enabled");
+            assert!(TOKENS.contains(&refusal.token));
+            assert!(refusal.detail.ends_with("nothing was written"));
+            assert_eq!(refusal.snippet, None);
+            assert_eq!(refusal.lift.kind(), "enable_lane");
+            assert!(!refusal.lift.is_final());
+        }
+    }
+
+    /// The placeholder is no lane ID: it names no mode, so the owned
+    /// index cannot record it and no lane table can hold it.
+    #[test]
+    fn the_unnamed_lane_is_not_a_lane_id() {
+        let id = LaneId::UNNAMED.0;
+        assert!(!["H-", "V-", "A-"].iter().any(|mode| id.starts_with(mode)));
     }
 
     #[test]
@@ -1055,5 +1608,127 @@ mod tests {
             (spec.id, spec.mode, spec.probes),
             (LaneId("H-XX1"), Mode::Hosted, &["P1"][..])
         );
+        // No write class, no tool, and the strictest anchor and staleness
+        // behaviour: nothing weaker is claimed by default.
+        assert!(spec.classes.is_empty() && spec.tool.is_none());
+        assert_eq!(
+            (spec.anchor, spec.stale),
+            (Anchor::Digest, StaleBehaviour::Inert)
+        );
+    }
+
+    /// Each planned write is of exactly one class, and the seven classes
+    /// are the seven constructors: a class with no constructor could be
+    /// listed by a lane and never written, and a constructor with no
+    /// class could be written and never allowed.
+    #[test]
+    fn every_planned_write_has_its_class() {
+        let text = |s: &str| s.to_string();
+        let edit = TagEdit {
+            file: text("MODULE.bazel"),
+            stmt: StmtRef {
+                callee: text("bundle.fetch"),
+                id: text("bundle"),
+                ordinal: 0,
+            },
+            attr: text("gem_checksums"),
+            op: TagOp::AddDictEntry,
+            inserted: text("\"rack-2.2.8\": \"00\", "),
+            version_key: Some(text("rack-2.2.8")),
+        };
+        let writes = [
+            PlannedWrite::NativeLock {
+                path: text("pnpm-lock.yaml"),
+            },
+            PlannedWrite::GeneratedValue {
+                path: text("maven_install.json"),
+                key: text("artifacts/g:a/version"),
+            },
+            PlannedWrite::IgnoreLine {
+                line: text(".socket/vendor"),
+            },
+            PlannedWrite::Owned(OwnedWrite::Index),
+            PlannedWrite::Hook(HookKind::Bazelrc),
+            PlannedWrite::TagEdit(edit),
+            PlannedWrite::ToolOutput {
+                path: text("MODULE.bazel.lock"),
+            },
+        ];
+        let classes: Vec<WriteClass> = writes.iter().map(PlannedWrite::class).collect();
+        assert_eq!(classes, WriteClass::ALL);
+    }
+
+    /// The words output and the index spell these values with. Each is a
+    /// contract or file-format identifier, so each is distinct within its
+    /// type and none is empty.
+    #[test]
+    fn the_names_of_the_policy_values_are_distinct() {
+        fn distinct<T: std::fmt::Debug>(all: &[T], name: impl Fn(&T) -> &'static str) {
+            let names: BTreeSet<&str> = all.iter().map(&name).collect();
+            assert_eq!(names.len(), all.len(), "{all:?}");
+            assert!(names.iter().all(|n| !n.is_empty() && !n.contains(' ')));
+        }
+        distinct(WriteClass::ALL, |v| v.as_str());
+        distinct(HookKind::ALL, |v| v.as_str());
+        distinct(TagOp::ALL, |v| v.as_str());
+        distinct(Anchor::ALL, |v| v.as_str());
+        distinct(StaleBehaviour::ALL, |v| v.as_str());
+        distinct(Interim::ALL, |v| v.as_str());
+        distinct(Actor::ALL, |v| v.as_str());
+        distinct(AttestBasis::ALL, |v| v.as_str());
+        // An rc flag is no basis (revision 4, section 3).
+        assert!(AttestBasis::ALL.iter().all(|b| !b.as_str().contains("rc")));
+        assert_eq!(RunPolicy::ALL[0], RunPolicy::Never);
+    }
+
+    /// The record of a family none of whose lanes has landed refuses with
+    /// a lift, restores nothing and attests nothing, in every mode.
+    #[test]
+    fn a_disabled_family_refuses_with_a_lift_that_is_not_final() {
+        use crate::bazel::govern::tests::{read, JS_MODULE, PNPM_LOCK};
+        use crate::bazel::rc::testing::Files as View;
+
+        const LANES: &[LaneSpec] = &[LaneSpec::stub("H-XX1", Mode::Hosted, &["P1"])];
+        const OPS: LaneOps = LaneOps::disabled(LANES);
+        let ws = read(&[("MODULE.bazel", JS_MODULE), PNPM_LOCK]);
+        let (view, index) = (View::of(&[]), Index::default());
+        let request = PatchRequest {
+            ecosystem: Ecosystem::Npm,
+            name: "left-pad",
+            version: "1.3.0",
+            uuid: "9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f",
+            project_rel: "",
+        };
+        let row = IndexRow {
+            uuid: request.uuid.to_string(),
+            purl: "pkg:npm/left-pad@1.3.0".to_string(),
+            lane: "H-XX1".to_string(),
+            file: "pnpm-lock.yaml".to_string(),
+            edits: Vec::new(),
+            check: None,
+        };
+        for mode in Mode::ALL {
+            let cx = LaneCx {
+                mode: *mode,
+                files: &view,
+                ws: &ws,
+                hub: HubId(0),
+                index: &index,
+                run: RunPolicy::Never,
+            };
+            let GateOutcome::Refuse(gate) = (OPS.gate)(&cx, &request) else {
+                panic!("{mode:?}: a disabled family did not refuse");
+            };
+            let mut files = Files::new();
+            let RestoreOutcome::Refused(restore) = (OPS.restore)(&cx, &mut files, &row) else {
+                panic!("{mode:?}: a disabled family restored a row");
+            };
+            assert!(files.is_empty());
+            for refusal in [gate, restore] {
+                assert_eq!(refusal.token, LANE_NOT_ENABLED);
+                assert_eq!(refusal.lift, Lift::EnableLane(LaneId::UNNAMED));
+                assert!(!refusal.lift.is_final());
+            }
+        }
     }
 }

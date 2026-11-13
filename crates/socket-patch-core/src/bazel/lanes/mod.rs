@@ -93,10 +93,11 @@ mod tests {
     use std::collections::BTreeSet;
 
     use super::*;
+    use crate::bazel::govern::tests::{read as read_workspace, JS_MODULE, PNPM_LOCK};
     use crate::bazel::model::{
-        AttestBasis, BazelRef, CellClaim, ClaimSystem, FileText, FileView, Files, GateOutcome,
-        LaneCx, LaneId, LaneOps, LaneSpec, PatchRequest, Plan, Reason, WithholdKind,
-        LANE_NOT_ENABLED,
+        Anchor, AttestBasis, BazelRef, CellClaim, ClaimSystem, FileText, FileView, Files,
+        GateOutcome, HubId, Index, LaneCx, LaneId, LaneOps, LaneSpec, PatchRequest, Plan, Reason,
+        RunPolicy, WithholdKind, LANE_NOT_ENABLED,
     };
     use crate::crawlers::types::Ecosystem;
     use crate::patch::redirect::RewriteResult;
@@ -195,22 +196,34 @@ mod tests {
             basis: AttestBasis::LockUrl,
         };
         let plan = Plan {
+            lane: pin.lane,
             writes: Vec::new(),
             advisories: Vec::new(),
             attest: AttestBasis::Withheld,
+            anchor: Anchor::Digest,
         };
         let read = |_: &str| -> Option<String> { Some("lockfileVersion: '9.0'\n".to_string()) };
+        let ws = read_workspace(&[("MODULE.bazel", JS_MODULE), PNPM_LOCK]);
+        let index = Index::default();
         for (ruleset, ops) in PRODUCTION.0 {
             for mode in Mode::ALL {
                 let cx = LaneCx {
                     mode: *mode,
                     files: &NoFiles,
+                    ws: &ws,
+                    hub: HubId(0),
+                    index: &index,
+                    run: RunPolicy::Never,
                 };
                 let GateOutcome::Refuse(refusal) = (ops.gate)(&cx, &request) else {
                     panic!("{ruleset:?} {mode:?}: a stub lane did not refuse");
                 };
                 assert_eq!(refusal.reason, Reason::RulesetUnsupported);
                 assert_eq!(refusal.token, LANE_NOT_ENABLED);
+                assert!(
+                    !refusal.lift.is_final(),
+                    "{ruleset:?}: a stub refused for good"
+                );
 
                 let before: Files = [("pnpm-lock.yaml".to_string(), "x\n".to_string())].into();
                 let (mut files, mut result) = (before.clone(), RewriteResult::default());

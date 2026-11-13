@@ -511,7 +511,7 @@ patches:
 **Paths.** Path lists are gitignore patterns with the npm `ignore` package's semantics (the backend's `projectIgnorePaths` matcher): case-insensitive, anchored at the repo root, a leading or middle `/` anchors, a bare name matches at any depth, a trailing `/` matches directories only, `!` negates, the last match wins, and a negation cannot re-include anything under an ignored directory (evaluation walks top-down). Backslash is gitignore's escape character, not a separator. Patterns with a `..` segment, a drive letter, a NUL byte, or over 1024 bytes are rejected.
 
 - They are matched against a project root's **marker files**, repo-relative: the lockfiles in the root's directory (`package-lock.json`, `pnpm-lock.yaml`, `yarn.lock`, `bun.lock(b)`, `vlt-lock.json`, `rush.json`, `uv.lock`, `poetry.lock`, `pdm.lock`, `Pipfile.lock`, `requirements.txt`, `*.py.lock`/`pylock*.toml`, `Cargo.lock`, `go.mod`, `go.sum`, `composer.lock`, `Gemfile.lock`, `gems.locked`, plus the Maven/NuGet markers). A root is ignored iff **every** marker is ignored; with `includePaths`, it is included iff **any** marker matches; a disk root with no lockfile uses its manifests (`package.json`, `pyproject.toml`, `setup.py`, `Cargo.toml`, `composer.json`, `Gemfile`, and the JVM build files: `pom.xml`, `build.gradle(.kts)`, `settings.gradle(.kts)`, `build.sbt`, `build.mill`, `build.mill.yaml`, `build.sc`, `project.scala`) instead, and one with neither is matched as its directory. So `/package-lock.json`, `**/yarn.lock` and `examples/**` mean what they mean to the scanner; `includePaths: ["/*", "!/*/"]` targets only the repo-root project.
-- Evaluation order (one combined list): the **built-in defaults** `test/ tests/ fixtures/ __fixtures__/ testdata/`, then `projectIgnorePaths`, then `patches.ignorePaths`. Re-include a default with a negation (`ignorePaths: ["!/e2e/tests/"]`). The defaults apply only to **discovered** roots: hosted/vendored PATH-glob matches and roots the in-memory engine detects. A root you name — `--cwd`, a literal PATH, an in-memory `projectRoots` entry — skips them (the other lists still apply). `node_modules .git .socket .yarn vendor` stay structural excludes of in-memory root detection; no policy negates them.
+- Evaluation order (one combined list): the **built-in defaults** `test/ tests/ fixtures/ __fixtures__/ testdata/`, then `projectIgnorePaths`, then `patches.ignorePaths`. Re-include a default with a negation (`ignorePaths: ["!/e2e/tests/"]`). The defaults apply only to **discovered** roots: hosted/vendored PATH-glob matches and roots the in-memory engine detects. A root you name — `--cwd`, a literal PATH, an in-memory `projectRoots` entry — skips them (the other lists still apply). `node_modules .git .socket .yarn vendor .socket-auto-manifest` stay structural excludes of root detection, on disk (a bare scan's search for project directories) and in memory; no policy negates them. `.socket-auto-manifest` holds the manifests socket-cli generates for a build it cannot read: they describe the project above them, so a pin written there would patch nothing.
 - A workspace member that shares its root's lockfile is part of that root's project: exclude it with `ignorePackages`, not paths.
 - **Nested projects in agent mode.** An agent (or report-only) disk scan crawls every nested project's `node_modules` below `--cwd`, so each installed copy is judged by the project root that owns it: the nearest directory above the copy's first `node_modules` that holds a lockfile (none: the scanned root). Nested roots are discovered roots (the built-in defaults apply), and one filtered as a whole is its own `purl: null` entry in `filtered[]`. A package stays in the run when any of its copies' roots admits it: a patch is recorded per package version, so its copies under skipped roots are patched too, and each such selected package gets a `policy_shared_copy` warning naming those roots (and a `note:` line under the human policy line). Hosted and vendored scans rewire only the named root's lockfiles, so they judge just that root.
 - A hosted/vendored PATH that resolves outside the repository root is a usage error (exit 2): one policy per invocation.
@@ -3166,12 +3166,14 @@ was written", and never contains a grant token.
 | `bazel_workspace_unreadable` | planned | `warn` | A Bazel file exists and cannot be read or parsed. | Names the file and the construct to fix. |
 | `bazel_workspace_version_unsupported` | planned | `warn` | Bazel 4 or older, or Bazel 5 with Bzlmod. | Upgrade Bazel, or patch outside Bazel. |
 | `bazel_workspace_version_untested` | planned | `info` | The Bazel or ruleset version is floating, unknown or newer than the releases socket-patch was tested with. | Pin `.bazelversion` to a tested release. |
-| `bazel_workspace_above_repo` | planned | `warn` | A Bazel workspace file exists above the repository root, where socket-patch does not read. | Run from the repository that holds the Bazel root. |
-| `bazel_workspace_output_tree_skipped` | active | `info` | A directory that is a Bazel output base, cache or vendor directory was left out of a walk. | - |
-| `bazel_workspace_inside_output_tree` | active | `warn` | `apply` ran with its working directory inside a Bazel output tree (not given by `--cwd`). Nothing was patched; the exit code stays 0. | Run from the workspace root, or use hosted mode. |
+| `bazel_workspace_above_repo` | planned | `warn` | A Bazel workspace file exists above the repository root, where socket-patch does not read. | Where nobody builds from that directory, remove the file and any other Bazel workspace file beside it; or patch from a project that is not a repository nested in the workspace. Where somebody builds there, a project in the nested repository has no remedy in this release: nothing above the repository that holds the project is read, wherever the command is started. |
+| `bazel_workspace_output_tree_skipped` | active | `info` | The search for project directories left out a directory that is a Bazel output base, cache or vendor directory. A bare hosted or vendored scan reports the directories below `--cwd` that it did not search, in one entry; a scan with a PATH pattern prints one `Note:` for the matches it did not scan. Each names the first ten directories and counts the rest. In the in-memory engine the code is the `reason` of a marker file that is ignored inside such a directory. The npm and NuGet crawler walks leave such a directory out too, with no message. | - |
+| `bazel_workspace_inside_output_tree` | active | `warn` | `apply` ran with its working directory inside a Bazel output tree (not given by `--cwd`). Nothing was patched; the exit code stays 0. `apply --check` is not covered: it is refused with `bazel_agent_output_tree` wherever it runs. The run attests nothing, so an OpenVEX document that an earlier run left at `--vex` is removed (`vex_stale_doc_removed`); `--dry-run` leaves it. | Run from the workspace root, or use hosted mode. |
 | `bazel_workspace_rc_unread` | planned | `info` | An rc file import could not be followed, or a `tools/bazel` wrapper exists, so flags may apply that socket-patch cannot see. Names the path. | - |
 | `bazel_workspace_ignore_line_added` | active | `info` | A line was added to `.bazelignore` so that a `.socket` tree stays out of `//...`. | Commit `.bazelignore`. |
-| `bazel_workspace_ignore_line_needed` | active | `warn` | A `.socket` tree is visible to `//...`, or a new one would be, and the `.bazelignore` line that hides it cannot be written. A tree that is already there is reported and the run goes on. A new tree is not created: this is then the code of the refusal, unless a token names the case (`bazel_agent_go_unsupported` and `vendor_bazel_ruleset_unsupported` below). | Add the printed lines to the printed file. |
+| `bazel_workspace_ignore_line_needed` | active | `warn` | A `.socket` tree is visible to `//...`, or a new one would be, and the `.bazelignore` line that hides it cannot be written. A tree that is already there is reported and the run goes on. A new tree is not created: this is then the code of the refusal, unless a token names the case (`bazel_agent_go_unsupported` and `vendor_bazel_ruleset_unsupported` below). Also reported, with the run going on: for a line of an existing `.bazelignore` that starts with `/`, which socket-patch names and never edits; for a recorded line that `rollback` or `vendor --revert` could not take out again; and for a stray Bazel workspace file above a project that is in no repository, where the tree is created. | Add the printed lines to the printed file. |
+| `bazel_workspace_hook_added` | planned | `info` | One marked unit was added to a file of the user's (`.bazelrc`, `MODULE.bazel` or a `WORKSPACE` file) so that Bazel reads an owned file under `.socket/bazel/`. Names the file. | Commit the file and `.socket/bazel/`. |
+| `bazel_workspace_hook_needed` | planned | `warn` | Owned wiring under `.socket/bazel/` exists, and the unit that makes Bazel read it is missing from the user's file or cannot be written there. The wiring is off: the build does not get the patch through it. | `socket-patch repair`, or add the printed lines to the printed file. |
 | `bazel_workspace_prune_skipped` | planned | `warn` | `scan --prune` could not tell what a lock that Bazel reads resolves, so the records of that ecosystem were kept. | - |
 | `bazel_workspace_unsupported_in_memory` | planned | - | A warning of the in-memory hosted engine, which prints no line for a human and so has no level: it met an ecosystem that a Bazel ruleset governs and left it alone. | Run `socket-patch scan --mode hosted` from a checkout. |
 
@@ -3180,17 +3182,17 @@ was written", and never contains a grant token.
 | Code | Status | Kind | Level | When | Remedy |
 |---|---|---|---|---|---|
 | `bazel_agent_not_consumed` | planned | advisory | `warn` | An agent command, or `apply --check`, touched an ecosystem that a ruleset governs or may govern. The ruleset builds those packages from its lock, not from the installed tree, so the Bazel build does not get the patch. The installed tree is still patched and the exit code is unchanged. | `socket-patch scan --mode hosted` |
-| `bazel_agent_output_tree` | active | refusal | - | `scan`, or any command with an explicit `--cwd` or `--global-prefix`, where the scope root or a package path is a Bazel output tree or a link into one. | Run from the workspace root, or use hosted mode. |
-| `bazel_agent_go_unsupported` | active | refusal | - | A Go directory `replace` that this workspace cannot consume safely. `details.token` is the token the vendored refusal carries. In this release it is reported for one case only: the directory tree of the replace would be created where no `.bazelignore` line can keep it out of `//...`, because several Bazel roots lie above the project (`nested_bazel_roots`) or the Bazel root is outside the repository (`bazel_root_outside_repository`). Every other token of this code is reserved. | The remedy of the check that failed. |
+| `bazel_agent_output_tree` | active | refusal | - | The scope root or a package directory is a Bazel output tree or a link into one. `scan` is refused. `apply` is refused when its scope was given explicitly (`--cwd`, `SOCKET_CWD` or `--global-prefix`), and `apply --check` wherever it runs; a plain `apply` in its working directory gets `bazel_workspace_inside_output_tree` instead. `rollback`, `remove`, `repair`, `get`, `vex` and `vendor` (`vendor --revert` included) are refused whether the scope was given explicitly or is the working directory. `list` only reads and is never refused. In this release only `scan` and `apply` judge their scope root yet: in the other commands only a write into a package directory inside such a tree is refused, package by package. | Run from the workspace root, or use hosted mode. |
+| `bazel_agent_go_unsupported` | active | refusal | - | A Go directory `replace` that this workspace cannot consume safely. The token is the one the vendored refusal carries. In this release the code and the token are in the text of the failed event, whose `errorCode` is `apply_failed`; the token is in backticks. It is reported for one case only: the directory tree of the replace would be created where no `.bazelignore` line can keep it out of `//...`, because several Bazel roots lie above the project (`nested_bazel_roots`) or the Bazel root is outside the repository (`bazel_root_outside_repository`). Every other token of this code is reserved. | The remedy of the check that failed. |
 | `bazel_agent_coursier_pin_hazard` | planned | sidecar advisory | - | An agent-patched Coursier or `~/.m2` jar has a coordinate that a rules_jvm_external hub resolves: a later `@<hub>//:pin` would record the patched jar's digest in the lock. | Do not run `@<hub>//:pin` from this cache; use hosted mode. |
 
 ### Hosted and vendored refusals
 
 Hosted and vendored mode refuse for the same reasons. The code is the mode's prefix
 plus the reason, and `details.token` (one of the [tokens](#tokens) below) names the
-case. A `-` means the mode has no such refusal. The two `ruleset_unsupported` codes are
-the exception: they have a row each for as long as their statuses differ, and the `-`
-in each of those rows stands for the other mode's code.
+case. A `-` means the mode has no such refusal. The `ruleset_unsupported` and
+`owned_file_modified` codes are the exception: they have a row each for as long as their
+statuses differ, and the `-` in each of those rows stands for the other mode's code.
 
 | Hosted code | Vendored code | Status | When | Remedy |
 |---|---|---|---|---|
@@ -3198,7 +3200,7 @@ in each of those rows stands for the other mode's code.
 | `redirect_bazel_mode_ambiguous` | `vendor_bazel_mode_ambiguous` | planned | Bzlmod and WORKSPACE may both be in effect, or the candidate declarations name different locks. | Names both declarations and the rc line. |
 | `redirect_bazel_declaration_inactive` | `vendor_bazel_declaration_inactive` | planned | The only declaration that names the lock is dead, shadowed, not imported or in another module, so Bazel does not read the lock through it. | `--enable_workspace` (Bazel 8) or a migration; the shadowing declaration; the missing `use_repo`. |
 | `redirect_bazel_ruleset_unsupported` | - | planned | socket-patch has no lane for this ruleset shape in this mode, or the lane is not enabled. | The mode that works, else the manual snippet. |
-| - | `vendor_bazel_ruleset_unsupported` | active | The vendored form of the row above. In this release it is reported for one case only: a vendored directory tree would be created where no `.bazelignore` line can keep it out of `//...`, because several Bazel roots lie above the project (`nested_bazel_roots`) or the Bazel root is outside the repository (`bazel_root_outside_repository`). Every other token of this code is reserved. | The `.bazelignore` lines printed with the refusal, where adding them helps; else the mode that works. |
+| - | `vendor_bazel_ruleset_unsupported` | active | The vendored form of the row above. In this release it is reported for one case only: a vendored directory tree would be created where no `.bazelignore` line can keep it out of `//...`, because several Bazel roots lie above the project (`nested_bazel_roots`) or the Bazel root is outside the repository (`bazel_root_outside_repository`). The code is the `errorCode` of the failed event, and the token is in backticks in its detail. Every other token of this code is reserved. | The `.bazelignore` lines printed with the refusal, where adding them helps; else the mode that works. |
 | `redirect_bazel_ruleset_version_unsupported` | `vendor_bazel_ruleset_version_unsupported` | planned | A ruleset version requirement is not proven, or the Bazel release line is outside what the lane supports. | Commit `MODULE.bazel.lock`, raise the `bazel_dep`, or pin with `single_version_override`. Names the threshold and the evidence found. |
 | `redirect_bazel_lockfile_frozen` | `vendor_bazel_lockfile_frozen` | planned | The edit would make `MODULE.bazel.lock` stale while `--lockfile_mode=error` is set, which fails every build. | Names the rc line and `bazel mod deps --lockfile_mode=update`; followed by the manual snippet. |
 | `redirect_bazel_pin_bypassed` | `vendor_bazel_pin_bypassed` | planned | A repository override, a vendor directory, `--nofetch` or a replacement declaration makes Bazel take the package from where the pin does not reach. | Remove the override, or patch its target. |
@@ -3207,14 +3209,34 @@ in each of those rows stands for the other mode's code.
 | `redirect_bazel_lock_check_present` | - | planned | A lock check target (for example `compile_pip_requirements`) covers the file: its test would fail after the rewrite, and its update command would erase the pin. | The ordered steps printed with the refusal. |
 | `redirect_bazel_selection_unproven` | `vendor_bazel_selection_unproven` | planned | Go: nothing committed proves that Bazel selects the pinned module version. | The routes printed with the refusal. |
 | `redirect_bazel_lock_set_partial` | `vendor_bazel_lock_set_partial` | planned | One of several lock files of a hub, or one of several hubs that pin the package, cannot be rewritten. | Names the file. |
-| `redirect_bazel_owned_file_modified` | `vendor_bazel_owned_file_modified` | planned | `.socket/bazel/index.json` does not pass the strict parse. | Restore it from version control. |
+| `redirect_bazel_owned_file_modified` | - | planned | `.socket/bazel/index.json` does not pass the strict parse, or another file under `.socket/bazel/` is not what the index records for it. | Restore it from version control. |
+| - | `vendor_bazel_owned_file_modified` | active | The vendored form of the row above. In this release it is reported for the index alone: as the refusal of a vendored directory tree whose `.bazelignore` line cannot be recorded, and as a warning of `vendor --revert` when a recorded line could not be taken out again. | Restore the index from version control; the detail names the line to add or remove by hand. |
+
+### What lifts a refusal
+
+A refusal is the state of one hub shape in one release, not a verdict on the shape.
+The event of a hosted or vendored refusal will say what would lift it, in
+`details.lift`: an object with a `kind` and the fields of that kind. The field is
+additive (MINOR) and reserved: no release emits it yet, and the release that first
+does lists it here as in use.
+
+| `kind` | Fields | What lifts the refusal |
+|---|---|---|
+| `enable_lane` | `lane` | A release that enables the lane for this shape: the lane exists, and its proof on real Bazel has not landed. `lane` is absent where the release does not name the lane. |
+| `line` | `needs` | A Bazel or ruleset release at or above the one `needs` names. |
+| `user_edit` | `file`, `what` | One edit that only the user may make: `what` is the text to add to `file`, or the change to make there. |
+| `run` | `command` | One command to run. socket-patch runs no Bazel or ruleset tool in this release. |
+| `owner` | `decision` | A decision the socket-patch maintainers have not taken; `decision` is its number. |
+| `none` | `proof` | Nothing: no committed state builds the patched package. No refusal is of this kind in this release. |
 
 ### Advisories
 
 | Code | Status | Level | When |
 |---|---|---|---|
-| `redirect_bazel_run_required` | planned | `info` | The pin is wired, and one named command must be run and its result committed; until then `vex` withholds the statement. The detail names the command and the platforms to run it on. Reported at `warn` when, until the command has run, builds fail or the Bazel build does not yet consume the patch: a WORKSPACE `go_repository` hub keeps building the upstream module until its `gazelle update-repos` command has run, and after a restoring edit a crate_universe hub with a `lockfile` fails every build (`Digests do not match`) until its repin has run. It stays `info` where an ordinary build refreshes the stale `MODULE.bazel.lock` by itself, and where it only notes lockfile facts that may be stale, in which case `vex` is not held back. Also reported, by the same rule, after `rollback`, `remove`, `repair` or a takeover whose restoring edit leaves Bazel state stale. The entry is `{code, detail}`: a structured form (`kind`: `lockfile`, `update_repos` or `repin`; `command`; `platforms`; `gatesVex`) is left to an event's `details`, and is specified in the release that makes this code `active`. |
+| `redirect_bazel_run_required` | planned | `info` | The pin is wired, and one named command must be run and its result committed; until then `vex` withholds the statement. The detail names the command and the platforms to run it on. Reported at `warn` when, until the command has run, builds fail or the Bazel build does not yet consume the patch: a WORKSPACE `go_repository` hub keeps building the upstream module until its `gazelle update-repos` command has run, and after a restoring edit a crate_universe hub with a `lockfile` fails every build (`Digests do not match`) until its repin has run. It stays `info` where an ordinary build refreshes the stale `MODULE.bazel.lock` by itself, and where it only notes lockfile facts that may be stale, in which case `vex` is not held back. Also reported, by the same rule, after `rollback`, `remove`, `repair` or a takeover whose restoring edit leaves Bazel state stale. The entry is `{code, detail}`: a structured form (`kind`: `lockfile`, `update_repos`, `repin`, `pin` or `vendor`; `command`; `platforms`; `gatesVex`) is left to an event's `details`, and is specified in the release that makes this code `active`. The kinds `pin` (a ruleset's own pin target) and `vendor` (`bazel vendor`) are reported at `warn`: no build runs either, so until the command has run Bazel builds from the lock or the vendor directory as it was. |
 | `vendor_bazel_run_required` | planned | `info` | The same, in vendored mode. |
+| `redirect_bazel_tool_ran` | planned | `info` | socket-patch itself ran the one tool the lane names (for example `bazel mod deps --lockfile_mode=update`), because the build would not pass between its write and that run. Names the command and the files the tool rewrote. Never under `--dry-run`. No release runs a tool yet. |
+| `vendor_bazel_tool_ran` | planned | `info` | The same, in vendored mode. |
 | `redirect_bazel_withdrawn_pin_kept` | planned | `warn` | The pin of a withdrawn patch was kept, because restoring it would fail every build: under `--lockfile_mode=error`, or in any lockfile mode on a crate_universe hub with a `lockfile`, where only a repin makes the build pass again. Names both steps to take. |
 | `redirect_bazel_fetch_dependency` | planned | `info` | Once per run: a pin makes cold repository fetches depend on the patch host beyond the package itself (the NuGet service index for a rules_dotnet pin, the registry `config.json` for a rules_rs pin). |
 | `redirect_bazel_manual_snippet` | planned | `info` | Follows a refusal that has a manual procedure. |
@@ -3247,10 +3269,10 @@ it is `active`, and is as stable as a code.
 | `lane_not_enabled` | No lane for this ruleset shape and mode is enabled in this release. |
 | `bazel_line_unsupported` | The Bazel release line or the dependency system is outside what the lane supports. |
 | `bazel_line_unproven` | The lane has not been run on this Bazel release line and dependency system. |
-| `bazel_line_unknown` | No Bazel version is declared and the hub is declared only in WORKSPACE files; commit `.bazelversion`. |
+| `bazel_line_unknown` | No Bazel version is declared and the hub is declared only in WORKSPACE files; commit `.bazelversion`. Also: the workspace was read for another project than the one asked about, where another `.bazelversion` may apply. |
 | `platform_unverified` | A lane that writes a directory tree has not been run on this operating system. |
-| `lock_path` | The lock a hub names has a file name the rewriter does not handle (for example `Cargo.Bazel.lock`). |
-| `label_not_literal` | A hub name, a lock label or a value to edit is computed, not a plain string literal. |
+| `lock_path` | The lock a hub names has a file name the rewriter does not handle (for example `Cargo.Bazel.lock`). Also, for rules_jvm_external and rules_csharp: the lock label is a plain string that names no file of the main repository. |
+| `label_not_literal` | A hub name, a lock label or a value to edit is computed, not a plain string literal. Also: a hub rule is used where no declaration is read (rules_js, rules_nodejs, rules_ruby); a scan for a lock check could not read a file or an argument; a crate_universe label names no file of the main repository, or the tags of its extension cannot all be read; or a ruleset is present and no hub of it could be read. |
 | `rc_import_unreadable` | An rc file import could not be followed, so a flag that changes the answer may be set. |
 | `workspace_unreadable` | A Bazel file that can declare a hub exists and cannot be read or parsed, or Bazel itself stops on the tracked rc flags, so which lock Bazel reads is not known. |
 | `workspace_dead` | The declaration is in a WORKSPACE file that this Bazel configuration does not evaluate. |
@@ -3273,7 +3295,7 @@ it is `active`, and is as stable as a code.
 | `spoke_imported` | The workspace refers directly to the package's own repository, which the pin renames or bypasses. |
 | `hash_file_mismatch` | The `update_pnpm_lock` hash file did not match its lock before the edit. |
 | `legacy_lock_absolute_path` | Vendored mode on a pnpm lock older than `lockfileVersion` 9.0. |
-| `derived_outside_project` | A derived value that must change with the pin lives outside the project root. |
+| `derived_outside_project` | Retired, and never reported: a derived value that lives outside the project root is written through the Bazel root with the pin, and is no longer a refusal. The name stays reserved. |
 | `paired_manifest_mismatch` | The manifest the hub names (`Gemfile`, `pyproject.toml`) is not the one beside the lock that the rewriter edits. |
 | `no_local_wheel_form` | Vendored PyPI: a requirements file has no relative form for a local wheel. |
 | `uv_lock_requires_url` | Vendored PyPI: a hub that reads `uv.lock` needs a URL for each wheel. |
@@ -3289,7 +3311,7 @@ it is `active`, and is as stable as a code.
 | `m2local` | The Maven artifact is resolved from the local Maven repository. |
 | `same_gav` | The patch is served under the original Maven coordinates, which cannot be pinned fail-closed. |
 | `non_ascii` | `maven_install.json` v1, or a lock whose strings use `\u` escapes: its hash over non-ASCII text is not proven. |
-| `versioned_label_used` | A BUILD or `.bzl` file names the package's versioned alias, which the pin renames. |
+| `versioned_label_used` | A BUILD, `.bzl`, module or WORKSPACE file, or a `build_file` template, names the package's versioned alias, which the pin renames. |
 | `export_consumer` | The workspace calls `java_export`, `maven_export` or `pom_file`: a published POM would carry the patched version string. |
 | `unpinned_hub` | rules_jvm_external without a lock file. |
 | `no_committable_wiring` | Vendored Maven under rules_jvm_external: no wiring exists that could be committed. |
@@ -3303,7 +3325,7 @@ it is `active`, and is as stable as a code.
 | `crates_repository_unpinned` | WORKSPACE `crates_repository` without a `lockfile`. |
 | `from_specs` | A `crate.from_specs` hub. |
 | `cargo_raze` | cargo-raze. |
-| `crates_vendor` | rules_rust `crates_vendor`, or a hub whose lock a `crates_vendor` target names. |
+| `crates_vendor` | rules_rust `crates_vendor`, or a hub whose lock a `crates_vendor` target names. Also: a `crates_vendor` target could not be read, or the scan of BUILD files for one did not finish. |
 | `crate_name_collision` | Vendored rules_rs: another source-less entry or `[patch]` path already exists for the crate name. |
 | `facts_cold` | Hosted rules_rs: the committed `MODULE.bazel.lock` does not hold the fact for the crate. |
 | `token_in_repo_name` | The pin would put the grant token in a Bazel repository name. |
@@ -3317,3 +3339,16 @@ it is `active`, and is as stable as a code.
 | `managed_pnpm_unproven` | `update_pnpm_lock` with a Bazel-managed pnpm that is version 8 or older, or unknown. |
 | `cargo_config_undeclared` | A crate_universe hub that does not name, as a literal `cargo_config` label, the config file the rewriter edits. |
 | `user_patch_hook` | The user's own patch for the package exists on a hub whose patch hook runs the host `patch` tool, which can reverse the fix. |
+| `hook_blocked` | The marked unit cannot be put into the user's file safely: the line before it ends in a backslash, the file starts with a byte-order mark, has lone-CR line endings or is a link, or an rc file it imports cannot be read. |
+| `tag_not_editable` | The call a value would be added to is not a plain call with literal keyword arguments (a computed value, `**kwargs`, mixed line endings or a byte-order mark). The refusal prints the text to add by hand. |
+| `rc_flag_unsupported` | A flag the owned rc file would carry is not one socket-patch writes, or is not accepted by every Bazel release the workspace may run. |
+| `rc_flag_conflict` | A tracked rc file already sets the same flag for the same repository. |
+| `owned_path_foreign` | A file socket-patch did not write is at a path under `.socket/bazel/` that it owns. |
+| `owned_file_modified` | A file under `.socket/bazel/` is not what `index.json` records for it: it was edited by hand. |
+| `owned_file_missing` | A file under `.socket/bazel/` that `index.json` records is gone. |
+| `hook_missing` | The marked unit that makes Bazel read an owned file is no longer in the user's file. |
+| `stale_override` | The recorded wiring is for another version of the package than the lock pins now. |
+| `rc_selected` | Only an rc flag selects the patched package, and a build that ignores the rc file takes the upstream one with no message, so `vex` makes no statement. |
+| `tool_run_failed` | The lane's tool could not be started, exited with an error, ran out of time or left its output without the pin. Every file was put back. |
+| `tool_run_disallowed` | The build would fail until the lane's tool has run, and this run may not run it. |
+| `tool_version_mismatch` | The `bazel` or `bazelisk` on `PATH` is not a release the lane is proven on, so the tool was not started. |
