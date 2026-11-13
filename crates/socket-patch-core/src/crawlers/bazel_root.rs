@@ -42,11 +42,22 @@
 //!   nowhere above it: the same sandbox would make a root of every
 //!   ancestor.
 //!
-//! The walk goes to the top of the disk on either side of the boundary,
-//! as Bazel's does (`workspace_layout.cc:45-56`, the same in 7.7.2). It
-//! does not end below the home directory, where `marker_above` ends, so a
-//! workspace at the home directory or above it is found from a checkout
-//! below it. What keeps a stray `~/WORKSPACE` from refusing anything is
+//! The walk goes to the top of the disk on either side of the boundary.
+//! It does not end below the home directory, where `marker_above` ends,
+//! and neither does Bazel's (`workspace_layout.cc:45-56`, the same in
+//! 7.7.2), so a workspace at the home directory or above it is found from
+//! a checkout below it. The two differ at the last directory. Bazel tests
+//! the filesystem root, on Windows the root of a drive, only when it is
+//! the working directory: started anywhere below, its loop ends before
+//! that directory (`workspace_layout.cc:53-54`). This walk tests it for
+//! every project. A boundary file there is a root here, where Bazel run
+//! in the project finds no workspace. It is an outer root as the first
+//! paragraph has it: Bazel run at the top of the disk tests its working
+//! directory first and takes it (line 50 of that file; read from the
+//! source, no probe ran Bazel there), and every directory below is then
+//! inside its workspace.
+//!
+//! What keeps a stray `~/WORKSPACE` from refusing anything is
 //! the second signal, and at the home directory `.bazelrc` is not one:
 //! there it is the user's own rc file, which Bazel reads wherever it
 //! runs. The cost is a home directory in which Bazel once ran
@@ -842,6 +853,28 @@ mod tests {
         let (repo, home) = (Path::new(REPO), Path::new("/home/u/src/.home"));
         let got = survey_with(&fs, &mut Memo::default(), repo, Some(repo), Some(home));
         assert_eq!(got.probe(), outside("/home/u/src/MODULE.bazel", true));
+    }
+
+    #[test]
+    fn a_root_at_the_top_of_the_disk_is_found_from_every_project_below_it() {
+        // Where this walk and Bazel's differ (module docs). Started below
+        // the filesystem root, Bazel never tests that directory and finds
+        // no workspace. Started there, it takes the root and every
+        // directory below, so the probe reports it like any outer root.
+        let top = "/MODULE.bazel";
+        let stray = Fake::lay(top);
+        assert_eq!(stray.probe(REPO), outside(top, false));
+        // The top of the disk has no name, so no link is named after it:
+        // the marker, the signal files and the default links are asked.
+        let at_top = |call: &&(bool, PathBuf)| call.1.parent() == Some(Path::new("/"));
+        let asked = stray.calls.borrow().iter().filter(at_top).count();
+        assert_eq!(asked, 1 + SIGNAL_FILES.len() + SIGNAL_LINKS.len());
+        let fs = Fake::lay(&format!("{top}\n/.bazelversion"));
+        assert_eq!(fs.probe(REPO), outside(top, true));
+        // Outside any checkout it is the project's workspace, and the
+        // boundary is that directory.
+        let found = Probe::Workspace(root("/", "srv/app", 0));
+        assert_eq!(fs.unbounded("/srv/app").probe(), found);
     }
 
     #[test]
