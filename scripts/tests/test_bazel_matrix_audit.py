@@ -261,7 +261,8 @@ class Planned(Audit):
 def claim(lane="H-TOY1", lo="7.2.0", hi="9.3.2", system="bzlmod", os_names=(), **more):
     base = {"lane": lane, "mode": "hosted", "ruleset": "rules_js", "tier": "supported",
             "lo": lo, "hi": hi, "system": system, "os": list(os_names),
-            "classes": ["native_lock", "owned"], "anchor": "digest", "stale": "inert", "tool": None}
+            "classes": ["native_lock", "owned"], "anchor": "digest", "stale": "inert", "tool": None,
+            "bump": None}
     return {**base, **more}
 
 
@@ -439,10 +440,56 @@ class Claims(Audit):
         for doc in ([], {"version": 1, "claims": []}, {"version": 3, "claims": []}, {"version": 2},
                     {"version": 2, "claims": {}}):
             self.assert_one(self.run_audit([], claims=doc)[0], "the claims file is not")
-        for key in ("system", "classes", "anchor", "stale", "tool"):
+        for key in ("system", "classes", "anchor", "stale", "tool", "bump"):
             row = claim()
             del row[key]
             self.assert_one(self.run_audit([], claims=claims(row))[0], "needs lane, mode, ruleset")
+
+    def test_negative_a_lane_that_writes_a_hook_or_a_tag_edit_needs_the_report_of_its_bump_cell(self):
+        """rev4/ARCH.md 2.7 and 2.8: a lane that leaves wiring in a file of
+        the user's declares what it does after a bump of the package, and a
+        real-Bazel bump cell proves it. `lanes::BUMP_CELLS` is a hand-kept
+        list, so the claim prints the test of the cell and the audit holds
+        it to a report, as it holds a claimed line to one."""
+        line = dict(lo="9.0.0", hi="9.3.2")
+        forward = [proof("9.3.2")]
+        bump = "bazel_hosted_toy_bump"
+        bumped = report(bump, "9.3.2", "macos", lanes=["H-TOY1"])
+        for classes in (["native_lock", "hook"], ["tag_edit"], ["owned", "hook", "tag_edit"]):
+            with self.subTest(classes=classes):
+                marked = dict(line, classes=classes)
+                # No row in BUMP_CELLS, and a row that names no bump cell.
+                for named in (None, "", "bazel_hosted_toy_bzlmod", 7):
+                    errors = self.run_audit(forward + [bumped], claims=claims(claim(bump=named, **marked)))[0]
+                    self.assert_one(errors, "names no bump cell")
+                # The cell is named and did not run.
+                rows = claims(claim(bump=bump, **marked))
+                self.assert_one(self.run_audit(forward, claims=rows)[0],
+                                f"no `ran` report of its bump cell `{bump}` names the lane")
+                self.assertEqual(self.run_audit(forward + [bumped], claims=rows)[0], [])
+        rows = claims(claim(bump=bump, classes=["native_lock", "hook"], **line))
+        cases = {
+            "skipped": skipped(bump, bazel="9.3.2", lanes=["H-TOY1"]),
+            "another lane": dict(bumped, lanes=["H-TOY2"]),
+            "another system": dict(bumped, system="workspace"),
+            "a release outside the claim": dict(bumped, bazel="8.8.2"),
+            "no release": dict(bumped, bazel=None),
+            "the forward cell under another name": proof("9.3.2"),
+        }
+        for name, last in cases.items():
+            with self.subTest(case=name):
+                errors = [e for e in self.run_audit(forward + [last], claims=rows)[0] if "bump cell" in e]
+                self.assert_one(errors, f"no `ran` report of its bump cell `{bump}` names the lane")
+        unlogged = dict(bumped, hosts=[], hosts_source="none")
+        errors = [e for e in self.run_audit(forward + [unlogged], claims=rows)[0] if "bump cell" in e]
+        self.assert_one(errors, "took its hosts from the fixture server's log")
+        # A lane that writes neither needs no bump cell, whatever it names.
+        for named in (None, bump):
+            plain = claims(claim(bump=named, **line))
+            self.assertEqual(self.run_audit(forward, claims=plain)[0], [])
+        # `classes` is read, so it must be a list of names.
+        self.assert_one(self.run_audit(forward, claims=claims(claim(classes="hook", **line)))[0],
+                        "is not a list of write classes")
 
 
 class CommandLine(unittest.TestCase):

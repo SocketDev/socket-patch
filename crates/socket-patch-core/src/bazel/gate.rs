@@ -13,7 +13,7 @@
 //! | 3 | governance: a live hub names the lock | [`gate`], [`inactive`] |
 //! | 4 | literal declaration and labels; the hook file can take its unit | [`literal`] |
 //! | 5 | the lane's ruleset version gate | [`version_gate`], called by the lane |
-//! | 6 | no bypass, after socket-patch's own wiring is subtracted | [`no_bypass`] |
+//! | 6 | no bypass, after socket-patch's own wiring is subtracted; asked again over the repositories the plan names | [`no_bypass`] |
 //! | 8 | consent | [`patch_consent`] |
 //! | - | the lane's own gate, which returns the plan | `LaneOps::gate` |
 //! | 7 | the patch URL can be fetched | [`reachable`] |
@@ -37,7 +37,14 @@
 //!
 //! No refusal here is final. Each carries the [`Lift`] that would lift
 //! it; `Lift::None` is data of the lane table (`lanes::FINAL`), never a
-//! decision of this file.
+//! decision of this file, and a lane's refusal is held to that table and
+//! to the codes of its mode like one made here.
+//!
+//! Several live hubs are decided as one lock set, which is the hubs
+//! whose locks resolve the release, not every hub of the ecosystem: a
+//! hub's lane answers `NotBazel` for a lock that does not hold it, a hub
+//! with no lane is asked through `inventory::list`, and a hand-written
+//! pin that names no lock is left out with an advisory ([`gate`]).
 //!
 //! The functions of obligations 3 to 6, 14 and 15 are public: `attest`
 //! re-runs them at discovery, over the same own-wiring subtraction
@@ -50,30 +57,31 @@
 //! and is then refused (`lane_not_enabled`), and so is any plan over an
 //! index that records one. No enabled lane produces either.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use super::consent::{self, USER_PATCH_HOOK};
-use super::derived::{self, DerivedState, InterimState};
-use super::downloader_cfg::{self, Verdict};
+use super::derived::{self, DerivedState, ExtRef, InterimState};
+use super::downloader_cfg::{self, SetUrls, Verdict};
 use super::exec;
 use super::govern::{
     self, governance, governance_over, BAZEL_LINE_UNKNOWN, BAZEL_ROOT_OUTSIDE_REPOSITORY,
     LABEL_NOT_LITERAL, RC_IMPORT_UNREADABLE,
 };
 use super::ignore::{CannotEdit, IgnoreLine, BAZELIGNORE};
-use super::inventory::lock_path_refused;
+use super::inventory::{self, lock_path_refused};
 use super::lanes::{self, refuse, Decision, SurfaceRule, TOKEN_IN_REPO_NAME};
 use super::model::{
     Actor, Advisory, Anchor, AttestBasis, BazelWorkspace, ClaimOs, Code, FileText, FileView,
-    FlagState, Gap, GateOutcome, Governance, Hub, HubId, Interim, LaneId, LaneSpec, LaneTable,
-    Lift, Liveness, LockRole, Mode, OwnedWrite, Plan, PlannedWrite, Probe, Reason, Refusal,
-    Ruleset, RulesetDetail, RunKind, RunPolicy, RunRequired, Site, Tier, ToolSpec, WriteClass,
-    LANE_NOT_ENABLED,
+    FlagState, Gap, GateOutcome, Governance, HookKind, Hub, HubId, Interim, LaneId, LaneSpec,
+    LaneTable, Lift, Liveness, LockRef, LockRole, Mode, OwnedWrite, Plan, PlannedWrite, Probe,
+    Reason, Refusal, Ruleset, RulesetDetail, RunKind, RunPolicy, RunRequired, Site, Tier, ToolSpec,
+    WriteClass, LANE_NOT_ENABLED,
 };
+use super::module_file::{ExtensionProxy, RepoOverride, MODULE_FILE};
 use super::module_lock::MODULE_LOCK;
 use super::owned_index::{
-    self, Index, LabelStrategy, Parsed, RcFlag, RcFlagRow, INDEX_PATH, OWNED_BUILD_PATH,
-    OWNED_BZL_PATH, OWNED_DIR, OWNED_RC_PATH, OWNED_SEGMENT_PATH,
+    self, Index, LabelStrategy, Parsed, RcFlag, RcFlagRow, SegmentKind, INDEX_PATH,
+    OWNED_BUILD_PATH, OWNED_BZL_PATH, OWNED_DIR, OWNED_RC_PATH, OWNED_SEGMENT_PATH,
 };
 use super::rc::{Chain, Flag, Occurrence, RcSite, RepoEnv};
 use super::remedy;
@@ -85,6 +93,8 @@ use super::version::{BazelVersion, DepSystem, TierRefusal, Tri};
 use crate::crawlers::types::Ecosystem;
 use crate::formats::text::strip_bom_bytes;
 use crate::patch::path_safety::is_safe_multi_segment;
+use crate::utils::purl_key::PurlKey;
+use crate::vendor::lock_inventory::LockfileEntry;
 
 /// Every `details.token` this file emits.
 pub const TOKENS: &[&str] = &[
@@ -112,6 +122,7 @@ pub const TOKENS: &[&str] = &[
     "owned_file_missing",
     "hook_missing",
     "tool_run_disallowed",
+    "not_resolved_by_hub",
 ];
 
 pub const BAZEL_LINE_UNSUPPORTED: &str = TOKENS[0];
@@ -142,6 +153,8 @@ pub const OWNED_FILE_MODIFIED: &str = TOKENS[20];
 pub const OWNED_FILE_MISSING: &str = TOKENS[21];
 pub const HOOK_MISSING: &str = TOKENS[22];
 pub const TOOL_RUN_DISALLOWED: &str = TOKENS[23];
+/// No hub that governs the project resolves the release in its lock.
+pub const NOT_RESOLVED_BY_HUB: &str = TOKENS[24];
 
 /// The tool that refreshes `MODULE.bazel.lock`, and the one that repins a
 /// crate_universe hub: the two whose run repairs a state this file finds
@@ -390,21 +403,46 @@ fn undetermined(gaps: &[Gap]) -> Refusal {
 /// Obligation 1, and the governance obligation 3 judges: the project has
 /// one Bazel root inside the read boundary, and the model answers for
 /// the project that was asked about.
+///
+/// The variant of the probe decides, never a comparison of root paths:
+/// two spellings of one directory are one root, and a mismatch must not
+/// send a governed project down the path that asks about another.
 fn governing(cx: &GateCx<'_>, req: &PatchRequest<'_>) -> Result<Governance, Refusal> {
-    let over = match cx.roots {
-        Roots::One => None,
-        Roots::Probed {
-            probe: Probe::Workspace(root),
+    let (probe, read) = match cx.roots {
+        // One root: its model answers, and `governance` holds it to the
+        // project it was read for (ROUTED R-090).
+        Roots::One
+        | Roots::Probed {
+            probe: Probe::Workspace(_),
             ..
-        } if *root == cx.ws.root => None,
-        Roots::Probed { probe, read } => Some(governance_over(probe, read, req.ecosystem)),
+        } => return Ok(governance(cx.ws, req.ecosystem, req.project_rel)),
+        Roots::Probed { probe, read } => (probe, read),
     };
-    match over {
-        None => Ok(governance(cx.ws, req.ecosystem, req.project_rel)),
-        Some(Governance::NotGoverned) => Ok(Governance::NotGoverned),
-        Some(Governance::Undetermined(gaps)) => Err(undetermined(&gaps)),
+    // `governance_over` asks each model about the project it was read
+    // for. Asked about another one, no model of nested roots knows the
+    // Bazel line there, and "no hub claims it" was never looked at.
+    let built = |ruleset: &Ruleset| ruleset.ecosystem() == Some(req.ecosystem);
+    let read_for = cx.ws.root.dirs_to_boundary();
+    let asked_about = read_for.iter().any(|dir| dir == req.project_rel);
+    if matches!(probe, Probe::Nested(_)) && Ruleset::ALL.iter().any(built) && !asked_about {
+        let detail = format!(
+            "the Bazel roots above this project were read for the project `{}`, and a \
+             `.bazelversion` in or above `{}` may name another Bazel version; read the \
+             workspaces for that project",
+            cx.ws.root.project_rel, req.project_rel
+        );
+        let gap = Gap {
+            token: BAZEL_LINE_UNKNOWN,
+            file: String::new(),
+            detail,
+        };
+        return Err(undetermined(&[gap]));
+    }
+    match governance_over(probe, read, req.ecosystem) {
+        Governance::NotGoverned => Ok(Governance::NotGoverned),
+        Governance::Undetermined(gaps) => Err(undetermined(&gaps)),
         // Each root governs the project, and they are not one build.
-        Some(_) => {
+        _ => {
             let why = "several Bazel roots lie between the project and the repository root, and \
                        each of them builds it";
             let lift = Lift::Owner("O15");
@@ -643,8 +681,7 @@ fn rc_hook_blocked(files: &dyn FileView) -> Option<&'static str> {
 /// Obligation 4 as revision 4 extends it: every hook file of the plan
 /// can take its unit.
 fn hook_files(cx: &GateCx<'_>, plan: &Plan) -> Result<(), Refusal> {
-    use super::model::HookKind::Bazelrc;
-    if !plan.writes.contains(&PlannedWrite::Hook(Bazelrc)) {
+    if !plan.writes.contains(&PlannedWrite::Hook(HookKind::Bazelrc)) {
         return Ok(());
     }
     rc_gaps(cx.ws)?;
@@ -789,73 +826,56 @@ impl OwnWiring for Index {
     }
 }
 
-/// Obligation 6: nothing makes Bazel take the hub, one of its
-/// repositories, the ruleset or the package from where the pin does not
-/// reach. Socket-patch's own wiring is subtracted first
-/// (`exec::own_site`, `exec::own_rc_site`) and checked against the index:
-/// an override it recorded is no bypass, and one in an owned file that no
-/// row records means the file was edited. `lane` is the lane a
-/// precondition waits for.
-pub fn no_bypass(
-    ws: &BazelWorkspace,
-    index: &Index,
-    hub: HubId,
-    req: &PatchRequest<'_>,
-    lane: LaneId,
-) -> Result<(), Refusal> {
-    bypasses(ws, index, index, hub, req, lane)
+/// What a bypass is lifted by where the user wrote it.
+const TAKE_OUT: &str = "remove it, or patch what it points at";
+
+/// The `override_repo` and `inject_repo` pairs of the statement at
+/// `site`, each with the proxy it is written on. One call can hold
+/// several pairs, and every pair carries the site of the whole call, so
+/// a recognizer's bypass names the statement and this names what it
+/// replaces: obligation 6 matches on these fields, never on the sentence
+/// a recognizer wrote for a human (`Bypass::what`).
+fn overrides_at<'a>(
+    ws: &'a BazelWorkspace,
+    site: &Site,
+) -> Vec<(&'a RepoOverride, &'a ExtensionProxy)> {
+    let Some(module) = &ws.module else {
+        return Vec::new();
+    };
+    let here = |over: &&RepoOverride| module.site(over.at) == *site;
+    let pairs = module.repo_overrides.iter().filter(here);
+    pairs
+        .filter_map(|over| Some((over, module.proxies.get(over.proxy)?)))
+        .collect()
 }
 
-/// [`no_bypass`] over the own-wiring answer `owned`.
-fn bypasses(
+/// Whether a `segment` row records the pair: the same statement on the
+/// same extension, spelled as the row spells it, replacing the same
+/// repository with the same one.
+fn recorded(index: &Index, over: &RepoOverride, proxy: &ExtensionProxy) -> bool {
+    let kind = match over.inject {
+        true => SegmentKind::InjectRepo,
+        false => SegmentKind::OverrideRepo,
+    };
+    index.segment.iter().any(|row| {
+        row.kind == kind
+            && (row.extension.as_str(), row.name.as_str())
+                == (proxy.bzl_file.as_str(), proxy.extension.as_str())
+            && (row.repo.as_str(), row.target.as_str()) == (over.repo.as_str(), over.with.as_str())
+    })
+}
+
+/// The tracked repository and module override flags, on every command
+/// chain and config: one that names `found`, one of `spokes` or the
+/// ruleset takes it from where the pin does not reach. A line of the
+/// owned rc file is socket-patch's own, and must be one a row records.
+fn rc_overrides(
     ws: &BazelWorkspace,
     index: &Index,
     owned: &dyn OwnWiring,
-    hub: HubId,
-    req: &PatchRequest<'_>,
-    lane: LaneId,
+    found: &Hub,
+    spokes: &[&str],
 ) -> Result<(), Refusal> {
-    rc_gaps(ws)?;
-    let Some(found) = ws.hubs.get(hub.0) else {
-        return Err(undetermined(&[]));
-    };
-    let own = |site: &Site, item: Option<&str>| owned.site(site, item);
-    let take_out = "remove it, or patch what it points at";
-    for bypass in found.bypasses.iter().filter(|by| by.token != USER_OVERRIDE) {
-        match &bypass.site {
-            Some(site) if own(site, Some(&bypass.what)) => {
-                if !index.segment.iter().any(|row| row.repo == bypass.what) {
-                    return Err(owned_modified(
-                        &site.file,
-                        "overrides a repository no row records",
-                    ));
-                }
-            }
-            site => {
-                let file = site.as_ref().map_or(".bazelrc", |site| site.file.as_str());
-                let why = format!(
-                    "an override in `{file}` takes `{}` from where the pin does not reach",
-                    bypass.what
-                );
-                return Err(refuse(
-                    Reason::PinBypassed,
-                    bypass.token,
-                    why,
-                    edit(file, take_out),
-                ));
-            }
-        }
-    }
-    // The user's replacement of the package. Consent does not lift it.
-    let replaced = consent::bypasses(ws, &own, hub, req.name, req.version);
-    if let Some(bypass) = replaced.into_iter().next() {
-        let file = bypass
-            .site
-            .as_ref()
-            .map_or("MODULE.bazel", |site| site.file.as_str());
-        let lift = edit(file, "remove the replacement of the package");
-        return Err(refuse(Reason::PinBypassed, bypass.token, bypass.what, lift));
-    }
     for flag in [
         Flag::OverrideRepository,
         Flag::InjectRepository,
@@ -870,7 +890,7 @@ fn bypasses(
                 if !index.rc_flags.iter().any(recorded) {
                     return Err(owned_modified(file, "sets a flag no row records"));
                 }
-            } else if override_names(&occurrence.value, found, &[]) {
+            } else if override_names(&occurrence.value, found, spokes) {
                 let why = format!(
                     "{} sets `--{}={}`, which takes the hub, one of its repositories or the \
                      ruleset from where the pin does not reach",
@@ -880,11 +900,113 @@ fn bypasses(
                     Reason::PinBypassed,
                     REPO_OVERRIDE,
                     why,
-                    edit(file, take_out),
+                    edit(file, TAKE_OUT),
                 ));
             }
         }
     }
+    Ok(())
+}
+
+/// Obligation 6: nothing makes Bazel take the hub, one of its
+/// repositories, the ruleset or the package from where the pin does not
+/// reach. Socket-patch's own wiring is subtracted first
+/// (`exec::own_site`, `exec::own_rc_site`) and checked against the index:
+/// an override it recorded is no bypass, and one in an owned file that no
+/// row records means the file was edited. `lane` is the lane a
+/// precondition waits for.
+///
+/// `spokes` are the repositories beside the hub's own that serve the
+/// package, by the name the ruleset gives each (`Plan::repositories`):
+/// an override flag that names one is a bypass like one that names the
+/// hub. Only a lane knows them, so the gate asks twice: here with none
+/// before the lane's gate, and over the plan's list after it. A lane's
+/// `attest` asks once, with its list.
+pub fn no_bypass(
+    ws: &BazelWorkspace,
+    index: &Index,
+    hub: HubId,
+    req: &PatchRequest<'_>,
+    lane: LaneId,
+    spokes: &[&str],
+) -> Result<(), Refusal> {
+    bypasses(ws, index, index, hub, req, lane, spokes)
+}
+
+/// [`no_bypass`] over the own-wiring answer `owned`.
+fn bypasses(
+    ws: &BazelWorkspace,
+    index: &Index,
+    owned: &dyn OwnWiring,
+    hub: HubId,
+    req: &PatchRequest<'_>,
+    lane: LaneId,
+    spokes: &[&str],
+) -> Result<(), Refusal> {
+    rc_gaps(ws)?;
+    let Some(found) = ws.hubs.get(hub.0) else {
+        return Err(undetermined(&[]));
+    };
+    let own = |site: &Site, item: Option<&str>| owned.site(site, item);
+    for bypass in found.bypasses.iter().filter(|by| by.token != USER_OVERRIDE) {
+        let pairs = bypass.site.as_ref().map(|site| overrides_at(ws, site));
+        let pairs = pairs.unwrap_or_default();
+        // The item key of an override is the repository it replaces. A
+        // statement nobody read as pairs is own only as a whole.
+        let ours = |site: &Site| match &pairs[..] {
+            [] => own(site, None),
+            pairs => pairs.iter().all(|(over, _)| own(site, Some(&over.repo))),
+        };
+        match &bypass.site {
+            Some(site) if ours(site) => {
+                let every =
+                    |(over, proxy): &(&RepoOverride, &ExtensionProxy)| recorded(index, over, proxy);
+                if pairs.is_empty() || !pairs.iter().all(every) {
+                    return Err(owned_modified(
+                        &site.file,
+                        "overrides a repository no row records",
+                    ));
+                }
+            }
+            site => {
+                let file = site.as_ref().map_or(".bazelrc", |site| site.file.as_str());
+                let replaced = |(over, _): &(&RepoOverride, &ExtensionProxy)| {
+                    format!("`{}` by `{}`", over.repo, over.with)
+                };
+                let replaced: Vec<String> = pairs.iter().map(replaced).collect();
+                let why = match replaced.is_empty() {
+                    // Only the recognizer's own words say what it found.
+                    true => format!(
+                        "an override in `{file}` takes the hub or one of its repositories from \
+                         where the pin does not reach ({})",
+                        bypass.what
+                    ),
+                    false => format!(
+                        "`{file}` replaces the repository {} of the hub's extension, so Bazel \
+                         takes it from where the pin does not reach",
+                        replaced.join(", ")
+                    ),
+                };
+                return Err(refuse(
+                    Reason::PinBypassed,
+                    bypass.token,
+                    why,
+                    edit(file, TAKE_OUT),
+                ));
+            }
+        }
+    }
+    // The user's replacement of the package. Consent does not lift it.
+    let replaced = consent::bypasses(ws, &own, hub, req.name, req.version);
+    if let Some(bypass) = replaced.into_iter().next() {
+        let file = bypass
+            .site
+            .as_ref()
+            .map_or("MODULE.bazel", |site| site.file.as_str());
+        let lift = edit(file, "remove the replacement of the package");
+        return Err(refuse(Reason::PinBypassed, bypass.token, bypass.what, lift));
+    }
+    rc_overrides(ws, index, owned, found, spokes)?;
     vendor_dir(ws, lane)?;
     for chain in Chain::COMMANDS {
         let state = ws.flags.state(Flag::Fetch, *chain);
@@ -964,19 +1086,64 @@ fn host_of(url: &str) -> &str {
     host.split(':').next().unwrap_or(host)
 }
 
-/// `text` without the URL, its path or anything after its host: a
-/// message of the downloader-config reader can quote the URL it judged,
-/// and a rewritten copy of it.
+/// `text` with nothing of the patch URL in it but its host (hazard
+/// HZ-22). A message of the downloader-config reader can quote the URL
+/// it judged, and a URL that a `rewrite` built from captured parts of
+/// its path, where the grant token can stand as the host or as half a
+/// path level. So three things go, in this order: the URL and its path
+/// as written; every other `scheme://` run, whole, because no message
+/// needs one and a rewritten URL can hold any part of the path; and
+/// every level of the path and the query wherever it still stands. A
+/// level of one or two characters names nothing and is left, since
+/// replacing it would only garble the sentence.
+///
+/// What is put in their place is written last, and the host is set
+/// aside meanwhile: a level can spell a word of either (`patch`).
 fn redact(text: &str, url: &str) -> String {
+    // Marks no message holds, for what is spelled out at the end.
+    const MARKS: [(&str, &str); 3] = [
+        ("\u{1}", "the patch URL"),
+        ("\u{2}", "/..."),
+        ("\u{3}", "a URL"),
+    ];
+    const HOST: &str = "\u{4}";
     let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
-    let path = rest.find('/').map_or("", |at| &rest[at..]);
-    let text = text
-        .replace(url, "the patch URL")
-        .replace(rest, "the patch URL");
-    match path.len() > 1 {
-        true => text.replace(path, "/..."),
-        false => text,
+    let tail = rest.find(['/', '?', '#']).map_or("", |at| &rest[at..]);
+    let host = host_of(url);
+    let plain: String = text
+        .chars()
+        .filter(|c| !('\u{1}'..='\u{4}').contains(c))
+        .collect();
+    let mut text = plain.replace(url, MARKS[0].0).replace(rest, MARKS[0].0);
+    if tail.len() > 1 {
+        text = text.replace(tail, MARKS[1].0);
     }
+    let mut out = String::with_capacity(text.len());
+    let mut from = 0;
+    while let Some(at) = text[from..].find("://").map(|at| from + at) {
+        let scheme = |c: char| c.is_ascii_alphanumeric() || "+-.".contains(c);
+        let ends = |c: char| c.is_whitespace() || "`\"'<>".contains(c);
+        let start = text[from..at]
+            .rfind(|c: char| !scheme(c))
+            .map_or(from, |before| from + before + 1);
+        let end = text[at..].find(ends).map_or(text.len(), |end| at + end);
+        out.push_str(&text[from..start]);
+        out.push_str(MARKS[2].0);
+        from = end;
+    }
+    out.push_str(&text[from..]);
+    if !host.is_empty() {
+        out = out.replace(host, HOST);
+    }
+    for level in tail.split(['/', '?', '&', '=', '#']) {
+        if level.len() > 2 {
+            out = out.replace(level, "...");
+        }
+    }
+    for (mark, said) in MARKS.into_iter().chain([(HOST, host)]) {
+        out = out.replace(mark, said);
+    }
+    out
 }
 
 /// Whether a `GOPROXY` list still lets `go mod download` reach an
@@ -1062,6 +1229,10 @@ fn go_proxy(ws: &BazelWorkspace, hub: &Hub, host: &str, reason: Reason) -> Resul
 /// first, then `allow` over `block`), so `block *` with an `allow` of the
 /// patch host passes. A rewrite that moves the URL to another host is
 /// refused: nothing shows that the mirror serves the patched artifact.
+/// It is refused under any set of configs a build may run with, so a
+/// second config that leaves the URL alone does not hide it; a rewrite
+/// that keeps the URL among its targets (a mirror with a fallback)
+/// passes, because the pin's digest decides between them.
 pub fn reachable(
     ws: &BazelWorkspace,
     files: &dyn FileView,
@@ -1095,23 +1266,35 @@ pub fn reachable(
         return go_proxy(ws, hub, host, reason);
     }
     let allow = |config: &str| edit(config, format!("add `allow {host}`"));
-    match downloader_cfg::verdict(&ws.flags, &ws.line, files, url) {
-        Verdict::NoConfig => {}
-        Verdict::Fetchable { urls } if urls.iter().any(|fetched| fetched.as_str() == url) => {}
-        Verdict::Fetchable { .. } => {
-            let why = format!(
-                "the tracked downloader config rewrites the patch host `{host}` to another host, \
-                 which is not known to serve the patched package"
-            );
-            return Err(refuse(reason, DOWNLOADER_CONFIG, why, allow(".bazelrc")));
+    match downloader_cfg::by_config_set(&ws.flags, &ws.line, files, url) {
+        // Every set of configs a build may run with must still fetch the
+        // URL itself. One that only names other URLs (a mirror under
+        // `--config=ci`) makes that build fetch from them alone, whatever
+        // the plain build does.
+        Ok(sets) => {
+            let moves = |set: &&SetUrls| !set.urls.iter().any(|fetched| fetched.as_str() == url);
+            if let Some(moved) = sets.iter().find(moves) {
+                let why = format!(
+                    "the downloader config `{}` rewrites the patch host `{host}` to another \
+                     host, which is not known to serve the patched package",
+                    moved.config
+                );
+                let lift = edit(
+                    &moved.config,
+                    format!("remove the `rewrite` of `{host}`, or keep `{host}` among its targets"),
+                );
+                return Err(refuse(reason, DOWNLOADER_CONFIG, why, lift));
+            }
         }
-        Verdict::Blocked { config, why } => {
+        Err(Verdict::Blocked { config, why }) => {
             let why = format!(
                 "the downloader config `{config}` keeps Bazel from the patch host `{host}`: {}",
                 redact(&why, url)
             );
             return Err(refuse(reason, DOWNLOADER_CONFIG, why, allow(&config)));
         }
+        // No tracked rc file names a config.
+        Err(_) => {}
     }
     let disabled = |chain: &Chain| {
         let state = ws.flags.state(Flag::RepositoryDisableDownload, *chain);
@@ -1136,6 +1319,85 @@ fn tool_repairs(tool: Option<ToolSpec>, what: &DerivedState) -> bool {
     tool.is_some_and(|tool| match what {
         DerivedState::CrateLockDigest { .. } => tool.id == TOOL_REPIN,
         what => what.in_lock() && tool.id == TOOL_MOD_DEPS,
+    })
+}
+
+/// An extension as `derived::ExtRef` takes it: the label of its `.bzl`
+/// file and its name.
+type Extension = (String, String);
+
+/// The extension a proxy of the module model uses. The label is the one
+/// the reader parsed, written out in full: a relative spelling names the
+/// same file of the root package, and matches no lock entry as written.
+fn extension_of(proxy: &ExtensionProxy) -> Extension {
+    let label = match &proxy.label {
+        Some(label) => format!("//{}:{}", label.package, label.name),
+        None => proxy.bzl_file.clone(),
+    };
+    (label, proxy.extension.clone())
+}
+
+/// The extensions one of whose tags `write` changes, for the usages
+/// digest of a family-B lock (revision 4, 1.4 and 1.6 rule 6), with the
+/// file the write changes. `None` for a write that changes no file
+/// `MODULE.bazel.lock` can record.
+///
+/// A segment row names its extension. A tag edit names its statement,
+/// and the proxy the statement is called on names the extension. A
+/// generated value in a module file names neither (and so would a native
+/// write of one): every extension the root module uses is then taken to
+/// be the one, as an edited `.bzl` file with no known loader is taken to
+/// be loaded by all of them. That can ask for a refresh that was not
+/// needed and never misses one.
+fn changed_by(ws: &BazelWorkspace, write: &PlannedWrite) -> Option<(String, Vec<Extension>)> {
+    let module = ws.module.as_ref();
+    let in_module =
+        |path: &str| module.is_some_and(|model| model.files.iter().any(|file| file.path == path));
+    let every = || -> Vec<Extension> {
+        let proxies = module.map(|model| model.proxies.iter());
+        proxies.map_or_else(Vec::new, |proxies| proxies.map(extension_of).collect())
+    };
+    // An extension the lock cannot be searched for stands for every one.
+    let named = |named: Vec<Extension>| {
+        let searchable = |(label, name): &Extension| ExtRef::new(label, name).is_ok();
+        match !named.is_empty() && named.iter().all(searchable) {
+            true => named,
+            false => every(),
+        }
+    };
+    Some(match write {
+        // A write that names a file of the module closure and no
+        // statement of it.
+        PlannedWrite::NativeLock { path } | PlannedWrite::GeneratedValue { path, .. }
+            if in_module(path) =>
+        {
+            (path.clone(), every())
+        }
+        PlannedWrite::NativeLock { path } | PlannedWrite::GeneratedValue { path, .. } => {
+            (path.clone(), Vec::new())
+        }
+        PlannedWrite::TagEdit(edit) if in_module(&edit.file) => {
+            let var = edit.stmt.callee.split_once('.').map(|(var, _)| var);
+            let called_on = |proxy: &&ExtensionProxy| {
+                let file = module.and_then(|model| model.files.get(proxy.at.file));
+                Some(proxy.var.as_str()) == var && file.is_some_and(|file| file.path == edit.file)
+            };
+            let proxies = module.map(|model| model.proxies.iter().filter(called_on));
+            let of_call = proxies.map_or_else(Vec::new, |found| found.map(extension_of).collect());
+            (edit.file.clone(), named(of_call))
+        }
+        PlannedWrite::TagEdit(edit) => (edit.file.clone(), Vec::new()),
+        PlannedWrite::Owned(OwnedWrite::Segment(row)) => {
+            let of_row = vec![(row.extension.clone(), row.name.clone())];
+            (OWNED_SEGMENT_PATH.to_string(), named(of_row))
+        }
+        // A `.bzl` file with no known loader: every extension of the
+        // root module is taken to load it (`derived::Write::loaded_by`).
+        PlannedWrite::Owned(OwnedWrite::Bzl(_)) => (OWNED_BZL_PATH.to_string(), Vec::new()),
+        // A family-A lock records the hash of the root module file, and
+        // the hook unit is a change of it.
+        PlannedWrite::Hook(HookKind::ModuleFile) => (MODULE_FILE.to_string(), Vec::new()),
+        _ => return None,
     })
 }
 
@@ -1212,27 +1474,40 @@ fn derived_state(
 ) -> Result<(Plan, Option<RunRequired>), Refusal> {
     let ws = cx.ws;
     rc_gaps(ws)?;
-    let mut paths: BTreeSet<&str> = BTreeSet::new();
+    // Each file the plan changes, once, with the extensions whose tags
+    // it changes there.
+    let mut changed: BTreeMap<String, Vec<Extension>> = BTreeMap::new();
     let mut repairs: BTreeSet<&str> = BTreeSet::new();
     for write in &plan.writes {
         match write {
-            PlannedWrite::NativeLock { path } => {
-                paths.insert(path);
-            }
-            PlannedWrite::GeneratedValue { path, .. } => {
-                paths.insert(path);
-                repairs.insert(path);
-            }
-            PlannedWrite::TagEdit(edit) => {
-                paths.insert(&edit.file);
-                repairs.insert(&edit.file);
-            }
+            PlannedWrite::GeneratedValue { path, .. } => drop(repairs.insert(path)),
+            PlannedWrite::TagEdit(edit) => drop(repairs.insert(&edit.file)),
             _ => {}
         }
+        let Some((path, tags)) = changed_by(ws, write) else {
+            continue;
+        };
+        let of_path = changed.entry(path).or_default();
+        for extension in tags {
+            if !of_path.contains(&extension) {
+                of_path.push(extension);
+            }
+        }
     }
-    let writes: Vec<derived::Write<'_>> = paths
-        .iter()
-        .map(|path| derived::Write::changed(path))
+    fn tagged(tags: &[Extension]) -> Vec<ExtRef<'_>> {
+        let found = tags.iter();
+        found
+            .filter_map(|(label, name)| ExtRef::new(label, name).ok())
+            .collect()
+    }
+    let tags: Vec<Vec<ExtRef<'_>>> = changed.values().map(|tags| tagged(tags)).collect();
+    let writes: Vec<derived::Write<'_>> = changed
+        .keys()
+        .zip(&tags)
+        .map(|(path, tags_of)| derived::Write {
+            tags_of,
+            ..derived::Write::changed(path)
+        })
         .collect();
     let repairs: Vec<&str> = repairs.into_iter().collect();
     // A checksum row is one package's: only this package's goes stale.
@@ -1306,12 +1581,20 @@ fn derived_state(
                 Some(snippet) => refusal.with_snippet(snippet),
                 None => refusal,
             };
-            // A lane's own run that rewrites the lock repairs lock state,
-            // and the build fails until it has run. Any other run of the
-            // lane's leaves the state stale: two commands, and a build
-            // that fails between them.
+            // A lane's own run repairs the state when it is the run
+            // that does: one that rewrites the lock, for lock state, and
+            // the repin of the lane's tool, for a crate lock digest
+            // (revision 4, 2.3). The build fails until it has run. Any
+            // other run of the lane's leaves the state stale: two
+            // commands, and a build that fails between them.
             let lane_runs = own_run.is_some();
-            if let Some(run) = own_run.filter(|run| what.in_lock() && refreshes_lock(run)) {
+            let repairs = |run: &RunRequired| match what {
+                DerivedState::CrateLockDigest { .. } => {
+                    run.kind == RunKind::Repin && tool_repairs(spec.tool, what)
+                }
+                what => what.in_lock() && refreshes_lock(run),
+            };
+            if let Some(run) = own_run.filter(repairs) {
                 let run = RunRequired {
                     interim: Interim::Failing,
                     ..run
@@ -1457,7 +1740,6 @@ pub fn owned_state(
     index: &Index,
     planned: &[PlannedWrite],
 ) -> Result<(), Refusal> {
-    use super::model::HookKind;
     let restore = |file: &str| {
         edit(
             file,
@@ -1598,7 +1880,11 @@ pub fn owned_state(
 /// declares, a pin only an rc flag selects asks for no attestation, and
 /// a hook or a tag edit is planned only by a lane whose bump cell has
 /// run (`bumped`: `lanes::BUMP_CELLS`).
-pub fn classes_and_anchor(spec: &LaneSpec, plan: &Plan, bumped: &[LaneId]) -> Result<(), Refusal> {
+pub fn classes_and_anchor(
+    spec: &LaneSpec,
+    plan: &Plan,
+    bumped: &[lanes::BumpCell],
+) -> Result<(), Refusal> {
     let lane = spec.id.0;
     if let Some(write) = plan
         .writes
@@ -1629,7 +1915,7 @@ pub fn classes_and_anchor(spec: &LaneSpec, plan: &Plan, bumped: &[LaneId]) -> Re
     }
     let marked =
         |write: &PlannedWrite| [WriteClass::Hook, WriteClass::TagEdit].contains(&write.class());
-    if plan.writes.iter().any(marked) && !bumped.contains(&spec.id) {
+    if plan.writes.iter().any(marked) && lanes::bump_cell(bumped, spec.id).is_none() {
         return Err(off_record(
             spec.id,
             format!("lane {lane} plans a hook or a tag edit, and no bump cell of it has run"),
@@ -1848,6 +2134,11 @@ fn merge(mut passed: Vec<Passed>) -> Result<GateOutcome, Refusal> {
                 plan.writes.push(write);
             }
         }
+        for repository in next.repositories {
+            if !plan.repositories.contains(&repository) {
+                plan.repositories.push(repository);
+            }
+        }
         for advisory in next.advisories {
             if !plan.advisories.contains(&advisory) {
                 plan.advisories.push(advisory);
@@ -1859,21 +2150,27 @@ fn merge(mut passed: Vec<Passed>) -> Result<GateOutcome, Refusal> {
         plan.anchor = plan.anchor.max(next.anchor);
         run = match (run, next_run) {
             (None, other) | (other, None) => other,
+            // One command: the same words in the same environment.
             (Some(a), Some(b))
-                if (a.kind, &a.command, &a.argv) == (b.kind, &b.command, &b.argv) =>
+                if (a.kind, &a.command, &a.argv, &a.env)
+                    == (b.kind, &b.command, &b.argv, &b.env) =>
             {
-                let mut platforms = a.platforms.clone();
-                platforms.extend(
-                    b.platforms
-                        .iter()
-                        .filter(|p| !a.platforms.contains(p))
-                        .cloned(),
-                );
+                let union = |ours: &[String], theirs: &[String]| {
+                    let mut all = ours.to_vec();
+                    let more = theirs.iter().filter(|item| !ours.contains(item));
+                    all.extend(more.cloned());
+                    all
+                };
                 Some(RunRequired {
-                    platforms,
+                    platforms: union(&a.platforms, &b.platforms),
+                    // Every file either hub's run rewrites is snapshotted.
+                    outputs: union(&a.outputs, &b.outputs),
                     // `Failing` orders after `Passing`: one failing
-                    // interim state makes the whole run a required one.
+                    // interim state makes the whole run a required one,
+                    // and a run one hub handed to socket-patch is
+                    // socket-patch's for both.
                     interim: a.interim.max(b.interim),
+                    actor: a.actor.max(b.actor),
                     gates_vex: a.gates_vex || b.gates_vex,
                     ..a
                 })
@@ -1888,21 +2185,183 @@ fn merge(mut passed: Vec<Passed>) -> Result<GateOutcome, Refusal> {
     }
     plan.writes.sort_by_key(phase);
     Ok(match run {
+        // The one state nothing may be written in: the build fails until
+        // the command has run, and nobody is to run it (revision 4, 2.5).
+        Some(run) if run.interim == Interim::Failing && run.actor == Actor::User => {
+            let why = format!(
+                "the build would fail from this write until `{}` has run, and this run of \
+                 socket-patch may not run it",
+                run.command
+            );
+            let reason = match run.kind {
+                RunKind::Lockfile => Reason::LockfileFrozen,
+                _ => Reason::DerivedUnrepairable,
+            };
+            let command = run.command;
+            let lift = Lift::Run { command };
+            return Err(refuse(reason, TOOL_RUN_DISALLOWED, why, lift));
+        }
         Some(run) => GateOutcome::ProceedAfter(plan, run),
         None => GateOutcome::Proceed(plan),
     })
 }
 
-/// Everything the gate asks of one live hub.
+/// Why one live hub takes no plan.
+struct Held {
+    refusal: Refusal,
+    /// The hub was refused before its lane was asked, so nothing has
+    /// said yet whether its lock resolves the release at all.
+    unasked: bool,
+    /// Nothing is ever written for the hub and it names no lock: beside
+    /// a hub that takes the patch it is left out of the write set, and
+    /// this is what the plan says about it.
+    left_out: Option<Advisory>,
+}
+
+/// A refusal after the lane was asked: the lane read the hub's lock, and
+/// it did not say the release is not there. Boxed, as the error of
+/// [`hub_outcome`]: a refusal with what the gate notes beside it is
+/// larger than a `Result` should carry by value.
+impl From<Refusal> for Box<Held> {
+    fn from(refusal: Refusal) -> Self {
+        Box::new(Held {
+            refusal,
+            unasked: false,
+            left_out: None,
+        })
+    }
+}
+
+/// A refusal before the lane was asked.
+fn unasked(refusal: Refusal) -> Box<Held> {
+    Box::new(Held {
+        refusal,
+        unasked: true,
+        left_out: None,
+    })
+}
+
+/// The refusal of a hub whose cell has no lane. A report-only shape is
+/// refused under the token of its kind (`cargo_raze`, where the shape
+/// alone says `report_only`). One that names no lock is the hand-written
+/// pins of one file: there is nothing socket-patch could rewrite for
+/// them, so beside a hub that takes the patch they do not hold its plan
+/// up. They are left out of the write set and the plan says so. `vex`
+/// still withholds for the ecosystem, because what the pins fetch cannot
+/// be listed (`inventory::Inventory::cannot_enumerate`).
+fn unserved(hub: &Hub, req: &PatchRequest<'_>, refusal: Refusal) -> Box<Held> {
+    let RulesetDetail::ReportOnly(detail) = &hub.detail else {
+        return unasked(refusal);
+    };
+    let token = detail.kind.token();
+    let locked = |lock: &LockRef| lock.role == LockRole::PackageLock;
+    let left_out = (!hub.locks.iter().any(locked)).then(|| {
+        let more = match detail.pins {
+            0 | 1 => String::new(),
+            pins => format!(" and {} more", pins - 1),
+        };
+        let detail = format!(
+            "the hand-written pins in `{}` (`{}`{more}; `{token}`) name no lock, so they were \
+             left as they are. If one of them fetches `{}`, Bazel builds that copy unpatched, \
+             and `vex` makes no statement for the package",
+            hub.decl.site.file, hub.decl.apparent_name, req.name
+        );
+        let code = Code::WorkspaceOutOfScope;
+        Advisory { code, detail }
+    });
+    Box::new(Held {
+        refusal: Refusal { token, ..refusal },
+        unasked: true,
+        left_out,
+    })
+}
+
+/// Whether a lock entry is the release asked about. It errs towards
+/// "yes": a hub whose lock is found not to resolve the release is left
+/// out of the lock set, so a spelling this does not fold must count as
+/// the release. Names are compared ignoring case, the separators a
+/// registry folds (`-`, `_`, `.`) and the two ways a Maven coordinate is
+/// joined; versions ignoring a leading `v`; and the entry's own purl is
+/// asked as well.
+fn is_release(entry: &LockfileEntry, req: &PatchRequest<'_>) -> bool {
+    let name = |name: &str| -> String {
+        let folded = name.to_ascii_lowercase().replace(':', "/");
+        let mut out = String::with_capacity(folded.len());
+        for c in folded.chars() {
+            let c = if matches!(c, '_' | '.') { '-' } else { c };
+            if c != '-' || !out.ends_with('-') {
+                out.push(c);
+            }
+        }
+        out
+    };
+    let version = |version: &str| version.trim_start_matches('v').to_ascii_lowercase();
+    if name(&entry.name) == name(req.name) && version(&entry.version) == version(req.version) {
+        return true;
+    }
+    let kind = entry
+        .purl
+        .strip_prefix("pkg:")
+        .and_then(|rest| rest.split_once('/'));
+    kind.is_some_and(|(kind, _)| {
+        let asked = format!("pkg:{kind}/{}@{}", req.name.replace(':', "/"), req.version);
+        PurlKey::same(&asked, &entry.purl)
+    })
+}
+
+/// Whether the lock of the hub `id` may resolve the release: `false`
+/// only when the lock was listed in full and no entry of it is the
+/// release. A lock nobody can list may hold anything.
+fn may_resolve(cx: &GateCx<'_>, lanes: &LaneTable, req: &PatchRequest<'_>, id: HubId) -> bool {
+    // A listing does not depend on the mode; it is asked as the one mode
+    // that writes into no lock, as `inventory::inventory` asks it.
+    let lane_cx = LaneCx {
+        mode: Mode::Agent,
+        files: cx.files,
+        ws: cx.ws,
+        hub: id,
+        index: cx.index,
+        run: RunPolicy::Never,
+    };
+    match inventory::list(&lane_cx, lanes) {
+        Ok(entries) => entries.iter().any(|entry| is_release(entry, req)),
+        Err(_) => true,
+    }
+}
+
+/// No hub that governs the project takes the patch, and none refused:
+/// each said that its lock does not resolve the release. Bazel then does
+/// not build the package from any lock socket-patch could pin it in.
+/// Never `NotBazel`: the hubs read the locks of this project, and a
+/// native write into one of them is not what "no Bazel" means.
+fn not_resolved(ws: &BazelWorkspace, hubs: &[HubId], req: &PatchRequest<'_>) -> Refusal {
+    let first = hubs.first().and_then(|id| ws.hubs.get(id.0));
+    let file = first.map_or("MODULE.bazel", |hub| hub.decl.site.file.as_str());
+    let why = format!(
+        "no hub that governs the project resolves `{}` {} in its lock, so the Bazel build does \
+         not take the package from a lock socket-patch can pin it in",
+        req.name, req.version
+    );
+    let lift = edit(
+        file,
+        "resolve the package through a hub with a lock (and pin the hub again), or patch the \
+         release its lock resolves",
+    );
+    refuse(Reason::ConsumerUndetermined, NOT_RESOLVED_BY_HUB, why, lift)
+}
+
+/// Everything the gate asks of one live hub. `Ok(None)`: the hub's lane
+/// says that its lock does not resolve the release, so the hub is no
+/// part of the lock set.
 fn hub_outcome(
     cx: &GateCx<'_>,
     lanes: &LaneTable,
     req: &PatchRequest<'_>,
     id: HubId,
-) -> Result<Passed, Refusal> {
+) -> Result<Option<Passed>, Box<Held>> {
     let ws = cx.ws;
     let Some(hub) = ws.hubs.get(id.0) else {
-        return Err(undetermined(&[]));
+        return Err(undetermined(&[]).into());
     };
     let decision = lanes::decision(hub.shape, cx.mode);
     let named = match &decision {
@@ -1914,17 +2373,17 @@ fn hub_outcome(
     // 2: a lane runs only inside its claims.
     let admitted = |spec: &&LaneSpec| lanes::claims_admit(spec, &ws.line, &ws.system);
     if let (Some(first), false) = (enabled.first(), enabled.iter().any(admitted)) {
-        return Err(line_unproven(ws, first));
+        return Err(unasked(line_unproven(ws, first)));
     }
-    literal(hub)?;
-    no_bypass(ws, cx.index, id, req, named)?;
-    patch_consent(ws, cx.index, id, req, cx.allow_patch_conflicts)?;
+    literal(hub).map_err(unasked)?;
+    no_bypass(ws, cx.index, id, req, named, &[]).map_err(unasked)?;
+    patch_consent(ws, cx.index, id, req, cx.allow_patch_conflicts).map_err(unasked)?;
     // The lane's own gate.
     if let Decision::Refused(refusal) = decision {
-        return Err(refusal);
+        return Err(unserved(hub, req, refusal));
     }
     let Some(ops) = lanes::family(lanes, hub.ruleset).filter(|_| !enabled.is_empty()) else {
-        return Err(not_enabled(named));
+        return Err(unasked(not_enabled(named)));
     };
     let lane_cx = LaneCx {
         mode: cx.mode,
@@ -1941,7 +2400,7 @@ fn hub_outcome(
         // dispatch knows it for a stub.
         GateOutcome::Refuse(refusal) if refusal.lift == Lift::EnableLane(LaneId::UNNAMED) => {
             if refusal.token == LANE_NOT_ENABLED {
-                return Err(not_enabled(named));
+                return Err(not_enabled(named).into());
             }
             let lift = Lift::EnableLane(named);
             let (unnamed, by_name) = (lanes::remedy(&refusal.lift), lanes::remedy(&lift));
@@ -1950,13 +2409,28 @@ fn hub_outcome(
                 lift,
                 detail,
                 ..refusal
-            });
+            }
+            .into());
         }
-        GateOutcome::Refuse(refusal) => return Err(refusal),
-        GateOutcome::NotBazel => {
-            let why = "the lane gave no answer for a hub that governs the project".to_string();
-            return Err(off_record(named, why));
+        // Finality is data of the lane table (decision R4-8): a lane
+        // says "nothing lifts this" only for a token the table lists as
+        // final, with its proof.
+        GateOutcome::Refuse(refusal) if refusal.lift.is_final() => {
+            let listed =
+                |(token, proof): &(&str, &str)| *token == refusal.token && !proof.trim().is_empty();
+            if lanes::FINAL.iter().any(listed) {
+                return Err(refusal.into());
+            }
+            let why = format!(
+                "the lane refused for good under the token `{}`, which the lane table does not \
+                 list as final",
+                refusal.token
+            );
+            return Err(off_record(named, why).into());
         }
+        GateOutcome::Refuse(refusal) => return Err(refusal.into()),
+        // The lock of this hub does not resolve the release.
+        GateOutcome::NotBazel => return Ok(None),
     };
     // A plan is one patch's: the executor records its rows under it.
     if plan.uuid != req.uuid {
@@ -1964,17 +2438,22 @@ fn hub_outcome(
             "the plan of lane {} names another patch than the one asked about",
             plan.lane.0
         );
-        return Err(off_record(named, why));
+        return Err(off_record(named, why).into());
     }
     let Some(spec) = enabled.iter().find(|spec| spec.id == plan.lane).copied() else {
         let why = format!(
             "the plan names lane {}, which does not serve this hub",
             plan.lane.0
         );
-        return Err(off_record(named, why));
+        return Err(off_record(named, why).into());
     };
     if !admitted(&spec) {
-        return Err(line_unproven(ws, spec));
+        return Err(line_unproven(ws, spec).into());
+    }
+    // 6 again, over the repositories only the lane could name.
+    let spokes: Vec<&str> = plan.repositories.iter().map(String::as_str).collect();
+    if !spokes.is_empty() {
+        rc_overrides(ws, cx.index, cx.index, hub, &spokes)?;
     }
     hook_files(cx, &plan)?;
     reachable(ws, cx.files, cx.mode, hub, &plan, cx.patch_url)?;
@@ -2004,9 +2483,9 @@ fn hub_outcome(
             "lane {} plans a write of class `{class}`, which this release does not carry out",
             spec.id.0
         );
-        return Err(off_record(spec.id, why));
+        return Err(off_record(spec.id, why).into());
     }
-    Ok((plan, run))
+    Ok(Some((plan, run)))
 }
 
 /// Decides one patch in one mode. The first failed obligation refuses,
@@ -2014,8 +2493,19 @@ fn hub_outcome(
 ///
 /// [`GateOutcome::NotBazel`] is the answer for a project where no
 /// declaration names a lock of the ecosystem: behaviour is then exactly
-/// what it is without a Bazel workspace. Several live hubs are decided
-/// together: every one of them must pass, or nothing is planned.
+/// what it is without a Bazel workspace.
+///
+/// Several live hubs are decided together, over the hubs that pin the
+/// package: every lock that resolves the release is rewritten or none is
+/// (design 6, `lock_set_partial`). A hub is no part of that set when its
+/// lane says its lock does not resolve the release, or when it was
+/// refused before its lane was asked and the listing of its lock holds
+/// no such release. A hand-written pin that names no lock is left out
+/// with an advisory. Where no hub is left the patch is refused, never
+/// passed on as "not Bazel".
+///
+/// A refusal leaves with a reason the mode has a code for, whoever made
+/// it: a lane's refusal is mapped like one of this file.
 pub fn gate(cx: &GateCx<'_>, lanes: &LaneTable, req: &PatchRequest<'_>) -> GateOutcome {
     let decided = || -> Result<GateOutcome, Refusal> {
         let governed = match governing(cx, req)? {
@@ -2025,28 +2515,54 @@ pub fn gate(cx: &GateCx<'_>, lanes: &LaneTable, req: &PatchRequest<'_>) -> GateO
         tier(cx.ws)?;
         let hubs = live_hubs(cx.ws, governed)?;
         let mut passed: Vec<Passed> = Vec::new();
-        let mut refused: Option<Refusal> = None;
-        for hub in hubs {
-            match hub_outcome(cx, lanes, req, hub) {
-                Ok(done) => passed.push(done),
-                Err(refusal) => refused = refused.or(Some(refusal)),
+        let mut held: Vec<(HubId, Box<Held>)> = Vec::new();
+        for hub in &hubs {
+            match hub_outcome(cx, lanes, req, *hub) {
+                Ok(Some(done)) => passed.push(done),
+                Ok(None) => {}
+                Err(why) => held.push((*hub, why)),
             }
         }
-        match refused {
-            None => merge(passed),
-            Some(refusal) if passed.is_empty() => Err(refusal),
-            // Another hub would have taken the patch: the set is partial.
-            Some(refusal) => Err(Refusal {
+        // Nothing is planned: the first refusal says why, and with no
+        // refusal no hub resolves the release.
+        if passed.is_empty() {
+            let first = held.into_iter().next();
+            return Err(
+                first.map_or_else(|| not_resolved(cx.ws, &hubs, req), |(_, why)| why.refusal)
+            );
+        }
+        // Another hub takes the patch. A hub that was refused holds the
+        // set up when its lock resolves the release or may.
+        for (hub, why) in held {
+            let Held {
+                refusal,
+                unasked,
+                left_out,
+            } = *why;
+            if let (Some(advisory), Some((plan, _))) = (left_out, passed.first_mut()) {
+                plan.advisories.push(advisory);
+                continue;
+            }
+            if unasked && !may_resolve(cx, lanes, req, hub) {
+                continue;
+            }
+            return Err(Refusal {
                 reason: Reason::LockSetPartial,
                 detail: format!(
                     "one of the hubs that govern the project cannot take the patch: {}",
                     refusal.detail
                 ),
                 ..refusal
-            }),
+            });
         }
+        merge(passed)
     };
-    decided().unwrap_or_else(GateOutcome::Refuse)
+    // The one exit: a seam is never handed a refusal its mode has no
+    // code for.
+    decided().unwrap_or_else(|refusal| {
+        let reason = in_mode(cx.mode, refusal.reason);
+        GateOutcome::Refuse(Refusal { reason, ..refusal })
+    })
 }
 
 /// The governance of every ecosystem a Bazel ruleset can build, for the
@@ -2069,14 +2585,21 @@ pub fn governed(ws: &BazelWorkspace, project_rel: &str) -> Vec<(Ecosystem, Gover
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::*;
+    use crate::bazel::derived::LockCheckKind;
     use crate::bazel::exec::{ExecError, Overlay};
-    use crate::bazel::govern::tests::{read, read_at, JS_MODULE, PNPM_LOCK};
+    use crate::bazel::govern::tests::{read, read_at, JS_MODULE, JS_WORKSPACE, PNPM_LOCK};
     use crate::bazel::model::{
-        CellClaim, ClaimSystem, HookKind, LaneOps, RootRef, StmtRef, TagEdit, TagOp, TokenSurface,
+        BzlRow, CellClaim, ClaimSystem, DeclSystem, LaneOps, RootRef, SegmentRow, StmtRef, TagEdit,
+        TagOp, TextRead, TokenSurface,
     };
-    use crate::bazel::owned_index::{HookAt, HookRow};
+    use crate::bazel::module_lock::ModuleLock;
+    use crate::bazel::owned_index::{FileRow, HookAt, HookRow};
     use crate::bazel::rc::testing::Files as View;
+    use crate::bazel::rulesets::report_only::{CARGO_RAZE, REPORT_ONLY};
+    use crate::vendor::lock_inventory::{LockIntegrity, SourceKind};
 
     /// The grant token of the fixture URL. No refusal may repeat it.
     const SECRET: &str = "tok_fixture_4f1c";
@@ -2091,6 +2614,7 @@ mod tests {
         hi: "9.3.2",
         system: ClaimSystem::Bzlmod,
     }];
+    const BUMP_TEST: &str = "bazel_hosted_toy_bump";
     const MOD_DEPS: ToolSpec = ToolSpec {
         id: TOOL_MOD_DEPS,
         not_computable: "usagesDigest is the result of evaluating the extension (probe L1.d)",
@@ -2131,9 +2655,45 @@ mod tests {
     ];
     const TOY: LaneOps = LaneOps {
         gate: toy_gate,
+        inventory: toy_inventory,
         ..LaneOps::disabled(SPECS)
     };
     const TABLE: LaneTable = LaneTable(&[(Ruleset::RulesJs, &TOY)]);
+
+    /// Two rules_js hubs over the root project, which read one lock.
+    const TWO_HUBS: &str = "bazel_dep(name = \"aspect_rules_js\", version = \"3.6.0\")\n\
+        npm = use_extension(\"@aspect_rules_js//npm:extensions.bzl\", \"npm\")\n\
+        npm.npm_translate_lock(name = \"npm\", pnpm_lock = \"//:pnpm-lock.yaml\")\n\
+        npm.npm_translate_lock(name = \"npm2\", pnpm_lock = \"//:pnpm-lock.yaml\")\n\
+        use_repo(npm, \"npm\", \"npm2\")\n";
+
+    fn entry(name: &str, version: &str, purl: &str) -> LockfileEntry {
+        LockfileEntry {
+            ecosystem: "npm",
+            name: name.to_string(),
+            version: version.to_string(),
+            purl: purl.to_string(),
+            resolved: None,
+            integrity: LockIntegrity::None,
+            source_kind: SourceKind::Unspecified,
+            pnpm_env: false,
+        }
+    }
+
+    /// What the toy lock resolves for a hub: one release per line
+    /// `# <hub> resolves <name>@<version>`. A lock with no line for the
+    /// hub cannot be listed, which is never "resolves nothing".
+    fn toy_inventory(cx: &LaneCx<'_>, read: TextRead<'_>) -> Option<Vec<LockfileEntry>> {
+        let hub = cx.ws.hubs.get(cx.hub.0)?;
+        let text = read(hub.locks.first()?.path.as_deref()?)?;
+        let mine = format!("# {} resolves ", hub.decl.apparent_name);
+        let lines = text.lines().filter_map(|line| line.strip_prefix(&mine));
+        let listed: Vec<LockfileEntry> = lines
+            .filter_map(|line| line.rsplit_once('@'))
+            .map(|(name, version)| entry(name, version, &format!("pkg:npm/{name}@{version}")))
+            .collect();
+        (!listed.is_empty()).then_some(listed)
+    }
 
     fn rc_row(flag: RcFlag, value: &str) -> RcFlagRow {
         RcFlagRow {
@@ -2230,7 +2790,34 @@ mod tests {
                 let gated = version_gate(hub, "9.9.9", "rules_js 9.9.9");
                 return GateOutcome::Refuse(gated.expect_err("3.6.0 is below the floor"));
             }
+            // The lock of this hub does not resolve the release.
             "silent" => return GateOutcome::NotBazel,
+            // Only the first hub's lock resolves it.
+            "first-hub" if cx.hub.0 > 0 => return GateOutcome::NotBazel,
+            "first-hub" | "spoked" => (own, vec![lock("pnpm-lock.yaml"), index]),
+            "two-runs" => ("H-TOY2", vec![lock("pnpm-lock.yaml"), index]),
+            "module-value" => (
+                "H-TOY1",
+                vec![PlannedWrite::GeneratedValue {
+                    path: "MODULE.bazel".to_string(),
+                    key: "toy.from_file/lock".to_string(),
+                }],
+            ),
+            // A lane's own refusals, as a lane may word them.
+            "lane-fetch" | "lane-check" | "lane-final" => {
+                let (reason, lift) = match req.name {
+                    "lane-fetch" => (Reason::FetchBlocked, Lift::EnableLane(LaneId(own))),
+                    "lane-check" => (Reason::LockCheckPresent, Lift::Owner("O20")),
+                    _ => (
+                        Reason::RulesetUnsupported,
+                        Lift::None {
+                            proof: "a lane said so",
+                        },
+                    ),
+                };
+                let why = "a refusal of the lane's own";
+                return GateOutcome::Refuse(refuse(reason, lanes::TOKENS[0], why, lift));
+            }
             _ => return GateOutcome::Refuse(Refusal::lane_not_enabled(LaneId::UNNAMED)),
         };
         // A plan is its request's patch; one case names another.
@@ -2238,16 +2825,38 @@ mod tests {
             "other-patch" => "00000000-0000-4000-8000-000000000000",
             _ => req.uuid,
         };
+        // The repositories that serve the package beside the hub's own.
+        let repositories = match req.name {
+            "spoked" => vec![format!("npm__{}__{}", "left-pad", req.version)],
+            _ => Vec::new(),
+        };
         let plan = Plan {
             uuid: uuid.to_string(),
             lane: LaneId(lane),
             writes,
+            repositories,
             advisories: Vec::new(),
             attest: AttestBasis::LockUrl,
             anchor: Anchor::Digest,
         };
         match req.name {
             "lane-run" => GateOutcome::ProceedAfter(plan, failing_run()),
+            // One command for both hubs: the build passes after the
+            // first hub's write and fails after the second's, and each
+            // run rewrites a file of its own.
+            "two-runs" => {
+                let interim = match cx.hub.0 {
+                    0 => Interim::Passing,
+                    _ => Interim::Failing,
+                };
+                let run = RunRequired {
+                    outputs: vec![format!("crates-{}.lock.json", cx.hub.0)],
+                    interim,
+                    actor: Actor::User,
+                    ..failing_run()
+                };
+                GateOutcome::ProceedAfter(plan, run)
+            }
             _ => GateOutcome::Proceed(plan),
         }
     }
@@ -2389,25 +2998,34 @@ mod tests {
             GateOutcome::NotBazel
         );
 
-        // With every production lane disabled the cell is refused, and
-        // the dispatch names the lane the stub could not.
+        // Where no production lane admits the cell it is refused, and
+        // the dispatch names the lane the stub could not. The expectation
+        // is computed (`lanes::admits`): the change that enables H-JS1 or
+        // V-JS1 does not turn this red.
         for mode in [Mode::Hosted, Mode::Vendored] {
             let cell = lanes::Cell::of(&root.ws, HubId(0), mode).unwrap();
-            assert!(lanes::admits(&TABLE, &cell) && !lanes::admits(&lanes::PRODUCTION, &cell));
-            let refusal = refused(
-                mode,
-                gate(&root.cx(mode), &lanes::PRODUCTION, &request("left-pad")),
-            );
+            assert!(lanes::admits(&TABLE, &cell));
+            let outcome = gate(&root.cx(mode), &lanes::PRODUCTION, &request("left-pad"));
             let lane = if mode == Mode::Hosted {
                 "H-JS1"
             } else {
                 "V-JS1"
             };
-            assert_eq!(
-                (refusal.reason, refusal.token),
-                (Reason::RulesetUnsupported, LANE_NOT_ENABLED)
+            let not_enabled = (
+                Reason::RulesetUnsupported,
+                LANE_NOT_ENABLED,
+                Lift::EnableLane(LaneId(lane)),
             );
-            assert_eq!(refusal.lift, Lift::EnableLane(LaneId(lane)));
+            let said = |refusal: &Refusal| (refusal.reason, refusal.token, refusal.lift.clone());
+            if lanes::admits(&lanes::PRODUCTION, &cell) {
+                let passed = !matches!(&outcome, GateOutcome::Refuse(r) if said(r) == not_enabled);
+                assert!(
+                    passed,
+                    "an admitted cell is refused as not enabled: {outcome:?}"
+                );
+            } else {
+                assert_eq!(said(&refused(mode, outcome)), not_enabled);
+            }
         }
         // An agent command does not reach the Bazel build: another mode does.
         let agent = refused(
@@ -2420,7 +3038,6 @@ mod tests {
         for (name, part) in [
             ("stranger", "names lane H-XX9"),
             ("other-patch", "names another patch"),
-            ("silent", "gave no answer"),
             ("off-class", "class `hook`, which it does not list"),
             ("escape", "no path below the Bazel root"),
         ] {
@@ -2559,8 +3176,74 @@ mod tests {
             (refusal.reason, refusal.token),
             (Reason::ConsumerUndetermined, BAZEL_LINE_UNKNOWN)
         );
-        let cx = GateCx { ws: &for_app, ..cx };
-        assert_eq!(proceeds(gate(&cx, &TABLE, &app)).lane, LaneId("H-TOY1"));
+        let for_the_app = GateCx { ws: &for_app, ..cx };
+        assert_eq!(
+            proceeds(gate(&for_the_app, &TABLE, &app)).lane,
+            LaneId("H-TOY1")
+        );
+        // The probe names the one root in another spelling: still one
+        // root, so the model is still held to the project it was read
+        // for. Comparing the paths sent this to "not Bazel".
+        let spelled = |ws: &BazelWorkspace| {
+            Probe::Workspace(RootRef {
+                root: PathBuf::from("./repo"),
+                ..ws.root.clone()
+            })
+        };
+        assert_ne!(spelled(&for_root), Probe::Workspace(for_root.root.clone()));
+        let (probe, models) = (spelled(&for_root), [Ok(for_root.clone())]);
+        let roots = Roots::Probed {
+            probe: &probe,
+            read: &models,
+        };
+        let refusal = refused(Mode::Hosted, gate(&GateCx { roots, ..cx }, &TABLE, &app));
+        assert_eq!(
+            (refusal.reason, refusal.token),
+            (Reason::ConsumerUndetermined, BAZEL_LINE_UNKNOWN)
+        );
+        // And a project the one root governs is not refused as nested.
+        let (probe, models) = (spelled(&root.ws), [Ok(root.ws.clone())]);
+        let roots = Roots::Probed {
+            probe: &probe,
+            read: &models,
+        };
+        let one = GateCx {
+            roots,
+            ..root.cx(Mode::Hosted)
+        };
+        assert_eq!(
+            proceeds(gate(&one, &TABLE, &request("left-pad"))).lane,
+            LaneId("H-TOY1")
+        );
+        // Nested roots, asked about a project their models were not read
+        // for: no model knows the Bazel line there, and none was asked
+        // whether a hub claims it. Never "not Bazel".
+        let outer = RootRef {
+            project_rel: "nested".to_string(),
+            ..for_root.root.clone()
+        };
+        let probe = Probe::Nested(vec![for_root.root.clone(), outer]);
+        let models = [Ok(for_root.clone()), Ok(for_root.clone())];
+        let roots = Roots::Probed {
+            probe: &probe,
+            read: &models,
+        };
+        let nested = GateCx { roots, ..cx };
+        for project_rel in ["app", "elsewhere"] {
+            let asked = PatchRequest { project_rel, ..app };
+            let refusal = refused(Mode::Hosted, gate(&nested, &TABLE, &asked));
+            assert_eq!(
+                (refusal.reason, refusal.token),
+                (Reason::ConsumerUndetermined, BAZEL_LINE_UNKNOWN),
+                "{project_rel}"
+            );
+        }
+        // An ecosystem no ruleset builds is no Bazel matter under any probe.
+        let composer = PatchRequest {
+            ecosystem: Ecosystem::Composer,
+            ..app
+        };
+        assert_eq!(gate(&nested, &TABLE, &composer), GateOutcome::NotBazel);
 
         let hub = &root.ws.hubs[0];
         let site = hub.decl.site.clone();
@@ -2757,6 +3440,7 @@ mod tests {
                 HubId(0),
                 &request("left-pad"),
                 LaneId("H-JS1"),
+                &[],
             );
             assert_eq!(
                 refusal_of(bypassed),
@@ -2836,7 +3520,7 @@ mod tests {
         let mut own = js(&files);
         let (lane, req) = (LaneId("H-JS1"), request("left-pad"));
         let with = |root: &Root, owned: &dyn OwnWiring| {
-            bypasses(&root.ws, &root.index, owned, HubId(0), &req, lane)
+            bypasses(&root.ws, &root.index, owned, HubId(0), &req, lane, &[])
         };
         let bypassed = (Reason::PinBypassed, REPO_OVERRIDE);
         // With no row the line is in no file socket-patch owns: a bypass.
@@ -2855,7 +3539,7 @@ mod tests {
         ));
         assert_eq!(refusal_of(with(&own, &own.index)), bypassed);
         assert_eq!(
-            refusal_of(no_bypass(&own.ws, &own.index, HubId(0), &req, lane)),
+            refusal_of(no_bypass(&own.ws, &own.index, HubId(0), &req, lane, &[])),
             bypassed
         );
         // A line of the owned file that no row records: the file was edited.
@@ -2893,7 +3577,7 @@ mod tests {
             ..request("chalk")
         };
         let with = |owned: &dyn OwnWiring, req: &PatchRequest<'_>| {
-            bypasses(&root.ws, &root.index, owned, HubId(0), req, lane)
+            bypasses(&root.ws, &root.index, owned, HubId(0), req, lane, &[])
         };
         let replaced = (Reason::PinBypassed, USER_OVERRIDE);
         assert_eq!(with(&Rendered, &left_pad), Ok(()));
@@ -2901,7 +3585,7 @@ mod tests {
         // This build: fail closed, for both.
         assert_eq!(refusal_of(with(&root.index, &left_pad)), replaced);
         assert_eq!(refusal_of(with(&root.index, &chalk)), replaced);
-        let through_gate = no_bypass(&root.ws, &root.index, HubId(0), &left_pad, lane);
+        let through_gate = no_bypass(&root.ws, &root.index, HubId(0), &left_pad, lane, &[]);
         assert_eq!(refusal_of(through_gate), replaced);
     }
 
@@ -2979,6 +3663,42 @@ mod tests {
             refusal_of(reach(&mirrored, Mode::Hosted, &plan, Some(URL))),
             (Reason::FetchBlocked, DOWNLOADER_CONFIG)
         );
+        // A second config that leaves the URL alone does not hide the one
+        // that moves it: a build with `--config=ci` fetches from the
+        // mirror alone. The same config is refused wherever it stands.
+        let mirror = "rewrite patch\\.socket\\.dev/(.*) mirror.corp.example/$1\n";
+        for rc in [
+            "common --downloader_config=a.cfg\ncommon:ci --downloader_config=ci.cfg\n",
+            "common:ci --downloader_config=ci.cfg\n",
+            "build:ci --downloader_config=ci.cfg\n",
+            "common --downloader_config=ci.cfg\n",
+        ] {
+            let moved = js(&[
+                (".bazelrc", rc),
+                ("a.cfg", "allow patch.socket.dev\n"),
+                ("ci.cfg", mirror),
+            ]);
+            let refusal = reach(&moved, Mode::Hosted, &plan, Some(URL)).expect_err(rc);
+            let refusal = checked(Mode::Hosted, refusal);
+            assert_eq!(
+                (refusal.reason, refusal.token),
+                (Reason::FetchBlocked, DOWNLOADER_CONFIG),
+                "{rc}"
+            );
+            let Lift::UserEdit { file, what } = &refusal.lift else {
+                panic!("{rc}: {:?}", refusal.lift);
+            };
+            assert_eq!(file, "ci.cfg", "{rc}");
+            assert!(what.contains("`rewrite` of `patch.socket.dev`"), "{what}");
+        }
+        // A mirror with a fallback keeps the URL among its targets, and
+        // the pin's digest decides between the two.
+        let fallback = format!("{mirror}rewrite (patch\\.socket\\.dev/.*) $1\n");
+        let kept = js(&[
+            (".bazelrc", "common --downloader_config=dl.cfg\n"),
+            ("dl.cfg", &fallback),
+        ]);
+        assert_eq!(reach(&kept, Mode::Hosted, &plan, Some(URL)), Ok(()));
         // A distdir provider needs the URL allowed, not downloads enabled
         // (probe S11), and vendored mode has a code for its refusal.
         let offline = js(&[(".bazelrc", "common --repository_disable_download\n")]);
@@ -3220,6 +3940,7 @@ mod tests {
             writes: vec![PlannedWrite::NativeLock {
                 path: "pnpm-lock.yaml".to_string(),
             }],
+            repositories: Vec::new(),
             advisories: Vec::new(),
             attest: AttestBasis::LockUrl,
             anchor: Anchor::Digest,
@@ -3231,7 +3952,8 @@ mod tests {
                 &root.index,
                 HubId(0),
                 &req,
-                LaneId("H-JS1")
+                LaneId("H-JS1"),
+                &[]
             )),
             unread
         );
@@ -3449,13 +4171,6 @@ mod tests {
             );
             assert!(refusal.detail.contains(part), "{name}: {}", refusal.detail);
         }
-        assert_eq!(
-            redact(
-                "no URL for https://h.example/a/tok/b is left (h.example/a/tok/b, /a/tok/b)",
-                "https://h.example/a/tok/b"
-            ),
-            "no URL for the patch URL is left (the patch URL, /...)"
-        );
     }
 
     /// Obligation 16, and the two after it that read the lane's record:
@@ -3466,6 +4181,7 @@ mod tests {
             uuid: UUID.to_string(),
             lane: LaneId("H-TOY2"),
             writes,
+            repositories: Vec::new(),
             advisories: Vec::new(),
             attest,
             anchor,
@@ -3496,7 +4212,7 @@ mod tests {
             AttestBasis::LockUrl,
         );
         assert_eq!(
-            refusal_of(classes_and_anchor(plain, &hooked, &[id])),
+            refusal_of(classes_and_anchor(plain, &hooked, &[(id, BUMP_TEST)])),
             off_record,
             "a class the lane does not list"
         );
@@ -3507,7 +4223,15 @@ mod tests {
                 off_record,
                 "no bump cell"
             );
-            assert_eq!(classes_and_anchor(all, &marked, &[id]), Ok(()));
+            assert_eq!(classes_and_anchor(all, &marked, &[(id, BUMP_TEST)]), Ok(()));
+            // A row for another lane, and a test that is no bump cell.
+            for row in [(plain.id, BUMP_TEST), (id, "bazel_hosted_toy")] {
+                assert_eq!(
+                    refusal_of(classes_and_anchor(all, &marked, &[row])),
+                    off_record,
+                    "{row:?}"
+                );
+            }
         }
         // The lane declares `Digest`: a weaker plan is not its own.
         let weaker = plan(
@@ -3604,6 +4328,7 @@ mod tests {
             writes: vec![PlannedWrite::IgnoreLine {
                 line: line.to_string(),
             }],
+            repositories: Vec::new(),
             advisories: Vec::new(),
             attest: AttestBasis::LockPath,
             anchor: Anchor::Digest,
@@ -3688,6 +4413,7 @@ mod tests {
                 uuid: UUID.to_string(),
                 lane: LaneId("H-TOY2"),
                 writes: vec![write.clone()],
+                repositories: Vec::new(),
                 advisories: Vec::new(),
                 attest: AttestBasis::LockUrl,
                 anchor: Anchor::Digest,
@@ -3709,6 +4435,7 @@ mod tests {
             uuid: UUID.to_string(),
             lane: LaneId(lane),
             writes,
+            repositories: Vec::new(),
             advisories: Vec::new(),
             attest: AttestBasis::LockUrl,
             anchor: Anchor::Digest,
@@ -3738,31 +4465,103 @@ mod tests {
             command: remedy::LOCK_REFRESH.to_string(),
             argv: Vec::new(),
             env: Vec::new(),
-            outputs: Vec::new(),
+            outputs: vec![format!("{platform}.lock")],
             interim,
             actor: Actor::User,
             platforms: vec![platform.to_string()],
             gates_vex: true,
         };
-        let both = vec![
-            (
-                first.clone(),
-                Some(refresh("os:linux,arch:amd64", Interim::Passing)),
-            ),
-            (
-                first.clone(),
-                Some(refresh("os:osx,arch:aarch64", Interim::Failing)),
-            ),
-            (first.clone(), None),
+        let (linux, mac) = ("os:linux,arch:amd64", "os:osx,arch:aarch64");
+        // The second hub's write fails the build until the command has
+        // run, and the gate handed that run to socket-patch.
+        let required = RunRequired {
+            actor: Actor::SocketPatch,
+            ..refresh(mac, Interim::Failing)
+        };
+        let both = |second: RunRequired| {
+            vec![
+                (first.clone(), Some(refresh(linux, Interim::Passing))),
+                (first.clone(), Some(second)),
+                (first.clone(), None),
+            ]
+        };
+        let GateOutcome::ProceedAfter(_, run) = merge(both(required.clone())).unwrap() else {
+            panic!("one command for both hubs");
+        };
+        assert_eq!(run.platforms, [linux, mac]);
+        // One failing interim state makes the run a required one, the
+        // run is socket-patch's for both hubs, and every file either
+        // hub's run rewrites is there to be snapshotted.
+        assert_eq!(
+            (run.interim, run.actor),
+            (Interim::Failing, Actor::SocketPatch)
+        );
+        assert_eq!(
+            run.outputs,
+            [format!("{linux}.lock"), format!("{mac}.lock")]
+        );
+        // Whichever hub comes first.
+        let swapped = vec![
+            (first.clone(), Some(required.clone())),
+            (first.clone(), Some(refresh(linux, Interim::Passing))),
         ];
-        let GateOutcome::ProceedAfter(_, run) = merge(both).unwrap() else {
+        let GateOutcome::ProceedAfter(_, run) = merge(swapped).unwrap() else {
             panic!("one command for both hubs");
         };
         assert_eq!(
-            run.platforms,
-            ["os:linux,arch:amd64", "os:osx,arch:aarch64"]
+            (run.interim, run.actor, run.outputs.len()),
+            (Interim::Failing, Actor::SocketPatch, 2)
         );
-        assert_eq!(run.interim, Interim::Failing);
+        // A failing interim state with nobody to run the command is the
+        // one state nothing is written in.
+        let nobody = merge(both(refresh(mac, Interim::Failing)));
+        let refusal = checked(
+            Mode::Hosted,
+            nobody.expect_err("a failing run for the user"),
+        );
+        assert_eq!(
+            (refusal.reason, refusal.token, refusal.lift.kind()),
+            (Reason::LockfileFrozen, TOOL_RUN_DISALLOWED, "run")
+        );
+        // The same words in another environment are another command.
+        let other_env = RunRequired {
+            env: vec![("REPIN".to_string(), "1".to_string())],
+            ..refresh(mac, Interim::Passing)
+        };
+        assert!(merge(both(other_env)).is_err());
+
+        // Through the gate, one row per run policy: two hubs, one command,
+        // and the build passes after the first hub's write only.
+        let two = js(&[("MODULE.bazel", TWO_HUBS)]);
+        for policy in RunPolicy::ALL {
+            let cx = GateCx {
+                run: *policy,
+                ..two.cx(Mode::Hosted)
+            };
+            match gate(&cx, &TABLE, &request("two-runs")) {
+                GateOutcome::ProceedAfter(_, run) => {
+                    assert_ne!(*policy, RunPolicy::Never);
+                    assert_eq!(
+                        (run.interim, run.actor),
+                        (Interim::Failing, Actor::SocketPatch),
+                        "{policy:?}"
+                    );
+                    assert_eq!(
+                        run.outputs,
+                        ["crates-0.lock.json", "crates-1.lock.json"],
+                        "{policy:?}"
+                    );
+                }
+                outcome => {
+                    assert_eq!(*policy, RunPolicy::Never, "{outcome:?}");
+                    let refusal = refused(Mode::Hosted, outcome);
+                    assert_eq!(
+                        (refusal.reason, refusal.token, refusal.lift.kind()),
+                        (Reason::LockSetPartial, TOOL_RUN_DISALLOWED, "run")
+                    );
+                }
+            }
+        }
 
         let partial = (Reason::LockSetPartial, LANE_NOT_ENABLED);
         let two_lanes = merge(vec![
@@ -3794,5 +4593,1149 @@ mod tests {
         } else {
             panic!("two rules_js hubs govern the root: {shapes:?}");
         }
+    }
+
+    /// The lock set is the hubs whose locks resolve the release (design
+    /// 6, `lock_set_partial`): a hub that does not resolve it holds no
+    /// other hub's plan up, and where none resolves it the patch is
+    /// refused, never passed on as "not Bazel".
+    #[test]
+    fn a_hub_that_does_not_resolve_the_release_is_no_part_of_the_lock_set() {
+        let unresolved = (Reason::ConsumerUndetermined, NOT_RESOLVED_BY_HUB);
+        // One hub, and its lane says the lock does not hold the release.
+        let one = js(&[]);
+        let refusal = refused(Mode::Hosted, one.ask("silent"));
+        assert_eq!((refusal.reason, refusal.token), unresolved);
+        assert_eq!(refusal.lift.kind(), "user_edit");
+        assert!(
+            refusal.detail.contains("`silent` 1.3.0"),
+            "{}",
+            refusal.detail
+        );
+        let vendored = gate(&one.cx(Mode::Vendored), &TABLE, &request("silent"));
+        let refusal = refused(Mode::Vendored, vendored);
+        assert_eq!((refusal.reason, refusal.token), unresolved);
+
+        // Two hubs govern the project. The lane of the second says its
+        // lock does not resolve the release: the first hub's plan stands.
+        let two = js(&[("MODULE.bazel", TWO_HUBS)]);
+        let Governance::Governed(hubs) = governance(&two.ws, Ecosystem::Npm, "") else {
+            panic!("two rules_js hubs govern the root");
+        };
+        assert_eq!(hubs.len(), 2);
+        let plan = proceeds(two.ask("first-hub"));
+        assert_eq!(
+            (plan.lane, plan.writes.len()),
+            (LaneId("H-TOY1"), 2),
+            "{plan:?}"
+        );
+        // Neither resolves it, and both do.
+        let refusal = refused(Mode::Hosted, two.ask("silent"));
+        assert_eq!((refusal.reason, refusal.token), unresolved);
+        assert_eq!(proceeds(two.ask("left-pad")).lane, LaneId("H-TOY1"));
+
+        // The second hub is refused before its lane is asked (a bypass of
+        // that hub alone). Whether it holds the first one up is decided
+        // by what its lock resolves, as the inventory lists it.
+        let rc = (".bazelrc", "common --override_repository=npm2=/elsewhere\n");
+        let lock = |listing: &str| format!("lockfileVersion: '9.0'\n{listing}");
+        let with = |listing: &str| {
+            let lock = lock(listing);
+            let files = [
+                ("MODULE.bazel", TWO_HUBS),
+                rc,
+                ("pnpm-lock.yaml", &lock[..]),
+            ];
+            js(&files).ask("left-pad")
+        };
+        let other = "# npm resolves left-pad@1.3.0\n# npm2 resolves is-odd@3.0.1\n";
+        assert_eq!(proceeds(with(other)).lane, LaneId("H-TOY1"));
+        let older = "# npm2 resolves left-pad@1.2.0\n";
+        assert_eq!(proceeds(with(older)).lane, LaneId("H-TOY1"));
+        for (listing, why) in [
+            (
+                "# npm2 resolves left-pad@1.3.0\n",
+                "it resolves the release",
+            ),
+            ("# npm2 resolves Left_Pad@v1.3.0\n", "in another spelling"),
+            (
+                "# npm resolves left-pad@1.3.0\n",
+                "its lock cannot be listed",
+            ),
+            ("", "no lock can be listed"),
+        ] {
+            let refusal = refused(Mode::Hosted, with(listing));
+            assert_eq!(
+                (refusal.reason, refusal.token),
+                (Reason::LockSetPartial, REPO_OVERRIDE),
+                "{why}"
+            );
+        }
+
+        // "Is the release" errs towards yes: only a listing that holds
+        // no spelling of it drops a hub.
+        let asked = |name: &'static str, version: &'static str| PatchRequest {
+            version,
+            ..request(name)
+        };
+        for (name, version, purl, req, want) in [
+            (
+                "left-pad",
+                "1.3.0",
+                "pkg:npm/left-pad@1.3.0",
+                asked("left-pad", "1.3.0"),
+                true,
+            ),
+            (
+                "left-pad",
+                "1.2.0",
+                "pkg:npm/left-pad@1.2.0",
+                asked("left-pad", "1.3.0"),
+                false,
+            ),
+            (
+                "is-odd",
+                "1.3.0",
+                "pkg:npm/is-odd@1.3.0",
+                asked("left-pad", "1.3.0"),
+                false,
+            ),
+            // A Maven coordinate, joined either way.
+            (
+                "com.google.guava:guava",
+                "33.0.0-jre",
+                "pkg:maven/com.google.guava/guava@33.0.0-jre",
+                asked("com.google.guava/guava", "33.0.0-jre"),
+                true,
+            ),
+            // The spellings a registry folds, and a Go version.
+            (
+                "Typing_Extensions",
+                "4.9.0",
+                "pkg:pypi/typing-extensions@4.9.0",
+                asked("typing.extensions", "4.9.0"),
+                true,
+            ),
+            (
+                "github.com/foo/bar",
+                "1.0.0",
+                "pkg:golang/github.com/foo/bar@v1.0.0",
+                asked("github.com/foo/bar", "v1.0.0"),
+                true,
+            ),
+            // The name as the lock spells it differs: the purl decides.
+            (
+                "jar",
+                "1.0.0",
+                "pkg:maven/toy/dep@1.0.0",
+                asked("toy/dep", "1.0.0"),
+                true,
+            ),
+        ] {
+            assert_eq!(
+                is_release(&entry(name, version, purl), &req),
+                want,
+                "{purl}"
+            );
+        }
+    }
+
+    /// Obligation 6 over the repositories only a lane can name (design
+    /// 2.6; probe S10): an rc flag that overrides the spoke that serves
+    /// the package is a bypass like one that overrides the hub, under
+    /// its plain `WORKSPACE` name, a canonical name and the apparent name
+    /// Bzlmod takes from 9.3.2.
+    #[test]
+    fn an_override_of_a_repository_the_plan_names_is_a_bypass() {
+        let spoke = "npm__left-pad__1.3.0";
+        let bypassed = (Reason::PinBypassed, REPO_OVERRIDE);
+        for (flag, name) in [
+            ("common --override_repository", spoke.to_string()),
+            ("common --override_repository", format!("_main~npm~{spoke}")),
+            ("build:ci --override_repository", format!("+npm+{spoke}")),
+            ("fetch --inject_repository", spoke.to_string()),
+        ] {
+            let rc = format!("{flag}={name}=/elsewhere\n");
+            let root = js(&[(".bazelrc", &rc)]);
+            let refusal = refused(Mode::Hosted, root.ask("spoked"));
+            assert_eq!((refusal.reason, refusal.token), bypassed, "{rc}");
+            // A plan that names no repository cannot be held to one.
+            assert_eq!(
+                proceeds(root.ask("left-pad")).lane,
+                LaneId("H-TOY1"),
+                "{rc}"
+            );
+        }
+        // Another package's spoke is no bypass of this pin.
+        let other = js(&[(
+            ".bazelrc",
+            "common --override_repository=npm__is-odd__3.0.1=/elsewhere\n",
+        )]);
+        assert_eq!(
+            proceeds(other.ask("spoked")).repositories,
+            [spoke.to_string()]
+        );
+
+        // `attest` hands the same names to `no_bypass`. Under WORKSPACE a
+        // spoke has its plain name.
+        let rc = format!(
+            "common --noenable_bzlmod --enable_workspace\n\
+             common --override_repository={spoke}=/elsewhere\n"
+        );
+        let ws = read(&[
+            (".bazelversion", "7.7.2\n"),
+            (".bazelrc", &rc),
+            ("WORKSPACE", JS_WORKSPACE),
+            PNPM_LOCK,
+        ]);
+        assert_eq!(ws.hubs.len(), 1, "the WORKSPACE hub");
+        let (index, req, lane) = (Index::default(), request("left-pad"), LaneId("H-JS1"));
+        assert_eq!(no_bypass(&ws, &index, HubId(0), &req, lane, &[]), Ok(()));
+        assert_eq!(
+            refusal_of(no_bypass(&ws, &index, HubId(0), &req, lane, &[spoke])),
+            bypassed
+        );
+        let unrelated = ["npm__is-odd__3.0.1", ""];
+        assert_eq!(
+            no_bypass(&ws, &index, HubId(0), &req, lane, &unrelated),
+            Ok(())
+        );
+    }
+
+    /// Obligation 6 over a Starlark `override_repo`, on the three
+    /// rulesets whose recognizers describe the override in a sentence.
+    /// The statement is matched on what it replaces: the user's own is a
+    /// bypass with a detail that reads, and the same statement in the
+    /// owned segment is socket-patch's exactly when a row records it.
+    #[test]
+    fn an_override_repo_is_matched_on_what_it_replaces() {
+        let include = "include(\"//.socket/bazel:socket-patch.MODULE.bazel\")\n";
+        let go = "bazel_dep(name = \"gazelle\", version = \"0.45.0\")\n\
+            go_deps = use_extension(\"@gazelle//:extensions.bzl\", \"go_deps\")\n\
+            go_deps.from_file(go_mod = \"//:go.mod\")\n\
+            use_repo(go_deps, \"com_github_foo_bar\")\n";
+        let rust = "bazel_dep(name = \"rules_rust\", version = \"0.57.1\")\n\
+            crate = use_extension(\"@rules_rust//crate_universe:extension.bzl\", \"crate\")\n\
+            crate.from_cargo(name = \"crates\", cargo_lockfile = \"//:Cargo.lock\", \
+            manifests = [\"//:Cargo.toml\"])\n\
+            use_repo(crate, \"crates\")\n";
+        let locks = [
+            (
+                "go.mod",
+                "module example.com/m\n\ngo 1.22\n\nrequire github.com/foo/bar v1.0.0\n",
+            ),
+            ("go.sum", ""),
+            (
+                "Cargo.toml",
+                "[package]\nname = \"m\"\nversion = \"0.1.0\"\n",
+            ),
+            ("Cargo.lock", "version = 3\n"),
+        ];
+        let cases = [
+            (
+                Ruleset::RulesJs,
+                JS_MODULE,
+                "npm",
+                "@aspect_rules_js//npm:extensions.bzl",
+                "npm",
+            ),
+            (
+                Ruleset::Gazelle,
+                go,
+                "go_deps",
+                "@gazelle//:extensions.bzl",
+                "com_github_foo_bar",
+            ),
+            (
+                Ruleset::RulesRust,
+                rust,
+                "crate",
+                "@rules_rust//crate_universe:extension.bzl",
+                "crates",
+            ),
+        ];
+        let (lane, req) = (LaneId::UNNAMED, request("left-pad"));
+        for (ruleset, module, var, label, repo) in cases {
+            let statement = format!("override_repo({var}, {repo} = \"socket_patch_x\")\n");
+            let root = |module: &str, segment: Option<&str>| {
+                let mut files = vec![("MODULE.bazel", module)];
+                files.extend(locks);
+                files.extend(segment.map(|text| (OWNED_SEGMENT_PATH, text)));
+                js(&files)
+            };
+            let hub_of = |root: &Root| {
+                let found = root.ws.hubs.iter().position(|hub| hub.ruleset == ruleset);
+                HubId(found.unwrap_or_else(|| panic!("no {ruleset:?} hub: {:?}", root.ws.hubs)))
+            };
+            let ask = |root: &Root, owned: &dyn OwnWiring| {
+                bypasses(&root.ws, &root.index, owned, hub_of(root), &req, lane, &[])
+            };
+
+            // The user's own statement, in `MODULE.bazel`.
+            let users = root(&format!("{module}{statement}"), None);
+            let refusal = ask(&users, &Rendered).expect_err("the user's override");
+            let refusal = checked(Mode::Hosted, refusal);
+            assert_eq!(
+                (refusal.reason, refusal.token),
+                (Reason::PinBypassed, REPO_OVERRIDE),
+                "{ruleset:?}"
+            );
+            let said = format!("replaces the repository `{repo}` by `socket_patch_x`");
+            assert!(refusal.detail.contains(&said), "{}", refusal.detail);
+            assert!(!refusal.detail.contains("``"), "{}", refusal.detail);
+            assert_eq!(refusal.lift, edit("MODULE.bazel", TAKE_OUT));
+
+            // The same statement in the owned segment.
+            let segment = format!("{var} = use_extension(\"{label}\", \"{var}\")\n{statement}");
+            let mut own = root(&format!("{module}{include}"), Some(&segment));
+            let edited = (Reason::OwnedFileModified, OWNED_FILE_MODIFIED);
+            assert_eq!(
+                refusal_of(ask(&own, &Rendered)),
+                edited,
+                "{ruleset:?}: no row"
+            );
+            let row = SegmentRow {
+                kind: SegmentKind::OverrideRepo,
+                extension: label.to_string(),
+                name: var.to_string(),
+                repo: repo.to_string(),
+                target: "socket_patch_x".to_string(),
+                uuid: UUID.to_string(),
+                lane: "H-TOY2".to_string(),
+            };
+            own.index.segment = vec![row.clone()];
+            assert_eq!(
+                ask(&own, &Rendered),
+                Ok(()),
+                "{ruleset:?}: a recorded override"
+            );
+            // A row that records another target, another repository,
+            // another statement or another extension is not its record.
+            for other in [
+                SegmentRow {
+                    target: "socket_patch_y".to_string(),
+                    ..row.clone()
+                },
+                SegmentRow {
+                    repo: format!("{repo}_2"),
+                    ..row.clone()
+                },
+                SegmentRow {
+                    kind: SegmentKind::InjectRepo,
+                    ..row.clone()
+                },
+                SegmentRow {
+                    extension: "@other//:extensions.bzl".to_string(),
+                    ..row.clone()
+                },
+            ] {
+                own.index.segment = vec![other];
+                assert_eq!(refusal_of(ask(&own, &Rendered)), edited, "{ruleset:?}");
+            }
+            // This build's executor calls no site its own: a bypass.
+            own.index.segment = vec![row];
+            assert_eq!(
+                refusal_of(ask(&own, &own.index)),
+                (Reason::PinBypassed, REPO_OVERRIDE),
+                "{ruleset:?}"
+            );
+        }
+    }
+
+    /// Hazard HZ-22: nothing of the patch URL but its host reaches a
+    /// refusal, also where a `rewrite` rebuilds a URL from captured parts
+    /// of its path and the reader quotes the result.
+    #[test]
+    fn a_fetch_refusal_never_repeats_a_part_of_the_patch_url() {
+        let root = js(&[]);
+        let plan = proceeds(root.ask("left-pad"));
+        let leaks = |text: &str| {
+            let parts = [SECRET, "fixture_4f1c", "left-pad-1.3.0", "/npm/"];
+            parts.iter().any(|part| text.contains(part))
+        };
+        for cfg in [
+            // The token becomes the host, whole and in half.
+            "rewrite patch\\.socket\\.dev/npm/([^/]+)/(.*) $1/$2\n",
+            "rewrite patch\\.socket\\.dev/npm/tok_([^/]+)/(.*) $1/$2\n",
+            "rewrite patch\\.socket\\.dev/npm/(.*) /$1\n",
+            "block *\n",
+            "rewrite patch\\.socket\\.dev/npm/(?<=x)(.*) m/$1\n",
+        ] {
+            let blocked = js(&[
+                (".bazelrc", "common --downloader_config=dl.cfg\n"),
+                ("dl.cfg", cfg),
+            ]);
+            let hub = &blocked.ws.hubs[0];
+            let reached = reachable(
+                &blocked.ws,
+                &blocked.view,
+                Mode::Hosted,
+                hub,
+                &plan,
+                Some(URL),
+            );
+            let refusal = checked(Mode::Hosted, reached.expect_err(cfg));
+            assert_eq!(
+                (refusal.reason, refusal.token),
+                (Reason::FetchBlocked, DOWNLOADER_CONFIG),
+                "{cfg}"
+            );
+            assert!(!leaks(&format!("{refusal:?}")), "{cfg}: {refusal:?}");
+            assert!(refusal.detail.contains("`patch.socket.dev`"), "{cfg}");
+        }
+        // The redaction itself, on what a reader may say.
+        for text in [
+            "no URL for https://patch.socket.dev/npm/tok_fixture_4f1c/left-pad-1.3.0.tgz is left",
+            "the rewritten URL https://tok_fixture_4f1c/left-pad-1.3.0.tgz has no host name",
+            "the rewritten URL `http://fixture_4f1c/left-pad-1.3.0.tgz`, which has none",
+            "patch.socket.dev/npm/tok_fixture_4f1c/left-pad-1.3.0.tgz is blocked",
+            "the path /npm/tok_fixture_4f1c/left-pad-1.3.0.tgz matches twice",
+            "the level tok_fixture_4f1c alone, `tok_fixture_4f1c` quoted, xtok_fixture_4f1cx inside",
+            "ends in a URL: https://mirror.example/tok_fixture_4f1c",
+        ] {
+            let said = redact(text, URL);
+            assert!(!leaks(&said), "{said}");
+        }
+        assert_eq!(
+            redact(
+                "no URL for https://h.example/a/tok/b is left (h.example/a/tok/b, /a/tok/b)",
+                "https://h.example/a/tok/b"
+            ),
+            "no URL for the patch URL is left (the patch URL, /...)"
+        );
+        // What is no part of the URL stays, the host included.
+        let kept = "dl.cfg:3 one host name is expected: allow a b (patch.socket.dev)";
+        assert_eq!(redact(kept, URL), kept);
+        // A level of the path that spells a word of the host or of the
+        // replacement text garbles neither.
+        let served = "https://patch.socket.dev/patch/npm/left-pad/1.3.0/tok_fixture_4f1c/\
+                      9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f/left-pad-1.3.0.tgz";
+        let blocked = format!("every URL for {served} is blocked by patch.socket.dev");
+        assert_eq!(
+            redact(&blocked, served),
+            "every URL for the patch URL is blocked by patch.socket.dev"
+        );
+        let rewritten = "the rewritten URL https://patch/tok_fixture_4f1c and the level patch";
+        assert_eq!(
+            redact(rewritten, served),
+            "the rewritten URL a URL and the level ..."
+        );
+        assert_eq!(
+            redact("see https://mirror.example/x, then stop", URL),
+            "see a URL then stop"
+        );
+    }
+
+    /// A lane's refusal leaves the gate like one of the gate's own
+    /// (ROUTED R-018): under a reason its mode has a code for, and final
+    /// only for a token the lane table lists as final.
+    #[test]
+    fn a_lanes_refusal_is_held_to_the_codes_of_its_mode_and_to_the_final_list() {
+        let root = js(&[]);
+        for (name, hosted, vendored) in [
+            (
+                "lane-fetch",
+                Reason::FetchBlocked,
+                Reason::RulesetUnsupported,
+            ),
+            (
+                "lane-check",
+                Reason::LockCheckPresent,
+                Reason::DerivedUnrepairable,
+            ),
+        ] {
+            for (mode, want) in [(Mode::Hosted, hosted), (Mode::Vendored, vendored)] {
+                // `refused` holds the reason to a code of the mode.
+                let refusal = refused(mode, gate(&root.cx(mode), &TABLE, &request(name)));
+                assert_eq!(
+                    (refusal.reason, refusal.token),
+                    (want, lanes::TOKENS[0]),
+                    "{name} {mode:?}"
+                );
+            }
+        }
+        // A lane cannot refuse for good by itself.
+        assert!(!lanes::FINAL
+            .iter()
+            .any(|(token, _)| *token == lanes::TOKENS[0]));
+        for (mode, lane) in [(Mode::Hosted, "H-JS1"), (Mode::Vendored, "V-JS1")] {
+            // `refused` holds the lift to "not final".
+            let refusal = refused(mode, gate(&root.cx(mode), &TABLE, &request("lane-final")));
+            assert_eq!(
+                (refusal.token, &refusal.lift),
+                (LANE_NOT_ENABLED, &Lift::EnableLane(LaneId(lane))),
+                "{mode:?}"
+            );
+            assert!(
+                refusal.detail.contains("does not list as final"),
+                "{}",
+                refusal.detail
+            );
+        }
+        // Every reason has a code in hosted mode, and the two vendored
+        // mode lacks are exactly the two the exit maps.
+        for reason in Reason::ALL {
+            assert!(Code::refusal(Mode::Hosted, *reason).is_some(), "{reason:?}");
+            let mapped = in_mode(Mode::Vendored, *reason);
+            assert!(
+                Code::refusal(Mode::Vendored, mapped).is_some(),
+                "{reason:?}"
+            );
+        }
+    }
+
+    /// A report-only hub is refused under the token of its kind (design
+    /// 4.2 rows 24 and 31), in every mode alike.
+    #[test]
+    fn a_report_only_hub_is_refused_under_the_token_of_its_kind() {
+        let fetch = "load(\"//cargo:crates.bzl\", \"raze_fetch_remote_crates\")\n\
+                     raze_fetch_remote_crates()\n";
+        let manifest = "[package]\nname = \"deps\"\n\n[package.metadata.raze]\n\
+                        workspace_path = \"//cargo\"\n";
+        let raze = [
+            (".bazelversion", "7.7.2\n"),
+            (".bazelrc", "common --noenable_bzlmod --enable_workspace\n"),
+            ("WORKSPACE", fetch),
+            ("cargo/Cargo.toml", manifest),
+            ("cargo/Cargo.lock", "version = 3\n"),
+            (
+                "cargo/crates.bzl",
+                "def raze_fetch_remote_crates():\n    pass\n",
+            ),
+            ("Cargo.toml", "[workspace]\nmembers = [\"cargo\"]\n"),
+        ];
+        let jar = format!(
+            "{JS_MODULE}http_jar = use_repo_rule(\
+             \"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_jar\")\n\
+             http_jar(name = \"guava\", url = \"https://repo1.maven.org/guava-33.0.jar\")\n"
+        );
+        let pinned = [VERSION, ("MODULE.bazel", &jar[..]), PNPM_LOCK];
+        let serde = PatchRequest {
+            ecosystem: Ecosystem::Cargo,
+            name: "serde",
+            version: "1.0.0",
+            uuid: UUID,
+            project_rel: "cargo",
+        };
+        let guava = PatchRequest {
+            ecosystem: Ecosystem::Maven,
+            ..request("com.google.guava/guava")
+        };
+        for (files, project, req, token) in [
+            (&raze[..], "cargo", serde, CARGO_RAZE),
+            (&pinned[..], "", guava, REPORT_ONLY),
+        ] {
+            let (ws, view, index) = (read_at(files, project), View::of(files), Index::default());
+            let details: Vec<&RulesetDetail> = ws.hubs.iter().map(|hub| &hub.detail).collect();
+            for mode in Mode::ALL {
+                let cx = GateCx {
+                    patch_url: Some(URL),
+                    ..GateCx::new(*mode, &ws, &view, &index)
+                };
+                let refusal = refused(*mode, gate(&cx, &lanes::PRODUCTION, &req));
+                assert_eq!(
+                    (refusal.reason, refusal.token),
+                    (Reason::RulesetUnsupported, token),
+                    "{mode:?}: {details:?}"
+                );
+                assert_eq!(refusal.lift, Lift::EnableLane(LaneId::UNNAMED), "{mode:?}");
+            }
+        }
+    }
+
+    fn vector(release: &str, file: &str) -> String {
+        let fixtures =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/bazel");
+        let vectors = fixtures.join("probe_vectors/lockfile/recorded-inputs");
+        let path = vectors
+            .join(format!("bazel-{release}"))
+            .join("fresh")
+            .join(file);
+        std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+            .replace("\r\n", "\n")
+    }
+
+    /// The D5 rows of a write in the module file or its include closure
+    /// (revision 4, 1.4, 1.6 rule 6 and 2.3): a tag edit and a segment
+    /// row stale the usages digest of the extension they change in a
+    /// family-B lock, any byte of `MODULE.bazel` stales the hash a
+    /// family-A lock records, and an owned `.bzl` file stales the
+    /// transitive digest. The locks are the vectors of probe L1.
+    #[test]
+    fn a_write_in_the_module_closure_goes_through_the_lock_refresh_rule() {
+        let text = |s: &str| s.to_string();
+        let edit = |callee: &str| {
+            PlannedWrite::TagEdit(TagEdit {
+                file: text("MODULE.bazel"),
+                stmt: StmtRef {
+                    callee: text(callee),
+                    id: text("x"),
+                    ordinal: 0,
+                },
+                attr: text("lock"),
+                op: TagOp::ReplaceString,
+                inserted: text("//:other.lock"),
+                version_key: None,
+            })
+        };
+        let row = |extension: &str, name: &str| {
+            PlannedWrite::Owned(OwnedWrite::Segment(SegmentRow {
+                kind: SegmentKind::OverrideRepo,
+                extension: text(extension),
+                name: text(name),
+                repo: text("dep_a"),
+                target: text("socket_patch_dep_a"),
+                uuid: text(UUID),
+                lane: text("H-TOY2"),
+            }))
+        };
+        let value = PlannedWrite::GeneratedValue {
+            path: text("MODULE.bazel"),
+            key: text("toy.from_file/lock"),
+        };
+        let bzl = PlannedWrite::Owned(OwnedWrite::Bzl(BzlRow {
+            kind: text("pinned_archive"),
+            uuid: text(UUID),
+            lane: text("H-TOY2"),
+        }));
+        let module_file = PlannedWrite::NativeLock {
+            path: text("MODULE.bazel"),
+        };
+        let js_label = "@aspect_rules_js//npm:extensions.bzl";
+        // (the write, stale in the family-B lock, stale in the family-A lock)
+        let writes = [
+            (
+                "a tag of the recorded extension",
+                edit("toy.from_file"),
+                true,
+                true,
+            ),
+            (
+                "a tag of an extension with no entry",
+                edit("npm.npm_translate_lock"),
+                false,
+                true,
+            ),
+            ("a call nobody can place", edit("from_file"), true, true),
+            (
+                "a segment row on the recorded extension",
+                row("//:ext.bzl", "toy"),
+                true,
+                false,
+            ),
+            (
+                "a segment row on another extension",
+                row(js_label, "npm"),
+                false,
+                false,
+            ),
+            (
+                "a segment row with a relative label",
+                row(":ext.bzl", "toy"),
+                true,
+                false,
+            ),
+            ("a generated value in the module file", value, true, true),
+            ("a native write of the module file", module_file, true, true),
+            (
+                "the module hook",
+                PlannedWrite::Hook(HookKind::ModuleFile),
+                false,
+                true,
+            ),
+            ("an owned .bzl entry", bzl, true, true),
+        ];
+        let frozen = "common --lockfile_mode=error\n";
+        let modes = [
+            (frozen, true),
+            ("common --lockfile_mode=update\n", false),
+            // `error` only under a named config: the plain build refreshes.
+            ("build:ci --lockfile_mode=error\n", false),
+        ];
+        let req = request("left-pad");
+        let mut cells = 0;
+        for (release, family_a) in [("9.3.2", false), ("7.1.2", true)] {
+            let module = format!("{}{JS_MODULE}", vector(release, "root.MODULE.bazel"));
+            let lock = vector(release, "root.MODULE.bazel.lock");
+            let version = format!("{release}\n");
+            for (rc, is_frozen) in modes {
+                let root = js(&[
+                    (".bazelversion", &version),
+                    (".bazelrc", rc),
+                    ("MODULE.bazel", &module),
+                    ("MODULE.bazel.lock", &lock),
+                    ("dep.lock", "x\n"),
+                ]);
+                let hub = root
+                    .ws
+                    .hubs
+                    .iter()
+                    .find(|hub| hub.ruleset == Ruleset::RulesJs);
+                let hub = hub.expect("the rules_js hub");
+                assert_eq!(
+                    matches!(root.ws.module_lock, ModuleLock::FamilyA(_)),
+                    family_a,
+                    "{release}"
+                );
+                for (what, write, in_b, in_a) in &writes {
+                    let stale = if family_a { *in_a } else { *in_b };
+                    for (spec, tool) in [(&SPECS[0], false), (&SPECS[1], true)] {
+                        for policy in RunPolicy::ALL {
+                            let cell = format!("{release} {rc:?} {what} tool={tool} {policy:?}");
+                            let cx = GateCx {
+                                run: *policy,
+                                ..root.cx(Mode::Hosted)
+                            };
+                            let plan = Plan {
+                                uuid: UUID.to_string(),
+                                lane: spec.id,
+                                writes: vec![write.clone()],
+                                repositories: Vec::new(),
+                                advisories: Vec::new(),
+                                attest: AttestBasis::Declared,
+                                anchor: Anchor::Declaration,
+                            };
+                            let decided = derived_state(&cx, hub, spec, plan, None, &req);
+                            cells += 1;
+                            let runs = tool
+                                && match is_frozen {
+                                    true => *policy != RunPolicy::Never,
+                                    false => *policy == RunPolicy::Always,
+                                };
+                            match (stale, decided) {
+                                (false, Ok((_, run))) => assert_eq!(run, None, "{cell}"),
+                                (true, Ok((_, Some(run)))) => {
+                                    let interim = match is_frozen {
+                                        true => Interim::Failing,
+                                        false => Interim::Passing,
+                                    };
+                                    let actor = match runs {
+                                        true => Actor::SocketPatch,
+                                        false => Actor::User,
+                                    };
+                                    assert_eq!(
+                                        (run.kind, run.interim, run.actor),
+                                        (RunKind::Lockfile, interim, actor),
+                                        "{cell}"
+                                    );
+                                    assert!(!is_frozen || runs, "{cell}");
+                                }
+                                (true, Err(refusal)) => {
+                                    assert!(is_frozen && !runs, "{cell}: {refusal:?}");
+                                    let refusal = checked(Mode::Hosted, refusal);
+                                    assert_eq!(
+                                        (refusal.reason, refusal.token, refusal.lift.kind()),
+                                        (Reason::LockfileFrozen, TOOL_RUN_DISALLOWED, "run"),
+                                        "{cell}"
+                                    );
+                                }
+                                (_, other) => panic!("{cell}: {other:?}"),
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            cells,
+            2 * modes.len() * writes.len() * 2 * RunPolicy::ALL.len()
+        );
+
+        // Through the gate: a value in a tag of the root module file,
+        // under a frozen lock that has an entry for the extension, is
+        // refused before anything is written (it was passed).
+        let module = format!("{}{JS_MODULE}", vector("9.3.2", "root.MODULE.bazel"));
+        let lock = vector("9.3.2", "root.MODULE.bazel.lock");
+        let root = js(&[
+            (".bazelrc", frozen),
+            ("MODULE.bazel", &module),
+            ("MODULE.bazel.lock", &lock),
+            ("dep.lock", "x\n"),
+        ]);
+        let refusal = refused(Mode::Hosted, root.ask("module-value"));
+        assert_eq!(
+            (refusal.reason, refusal.token),
+            (Reason::LockfileFrozen, TOOL_RUN_DISALLOWED)
+        );
+        assert!(
+            refusal.detail.contains("UsagesDigest"),
+            "{}",
+            refusal.detail
+        );
+        // A lock that is refreshed takes the write, with the command.
+        let root = js(&[
+            ("MODULE.bazel", &module),
+            ("MODULE.bazel.lock", &lock),
+            ("dep.lock", "x\n"),
+        ]);
+        let GateOutcome::ProceedAfter(_, run) = root.ask("module-value") else {
+            panic!("a refreshed lock takes the write");
+        };
+        assert_eq!(
+            (run.kind, run.interim, run.actor),
+            (RunKind::Lockfile, Interim::Passing, Actor::User)
+        );
+    }
+
+    /// A stale crate lock digest fails the build under every lockfile
+    /// mode until a repin (revision 4, 2.3). The lane's own repin is the
+    /// run that repairs it, when the lane names the repin tool and the
+    /// policy lets socket-patch run it.
+    #[test]
+    fn a_stale_crate_lock_digest_is_repaired_by_the_lanes_own_repin() {
+        const REPIN: ToolSpec = ToolSpec {
+            id: TOOL_REPIN,
+            not_computable: "the lock digest is the result of a cargo-bazel run (probe X2)",
+            needs_network: true,
+        };
+        const RUST: LaneSpec = LaneSpec {
+            tool: Some(REPIN),
+            ..spec("H-TOY2", Mode::Hosted, WriteClass::ALL)
+        };
+        let root = js(&[]);
+        let mut hub = root.ws.hubs[0].clone();
+        hub.derived = vec![DerivedState::CrateLockDigest {
+            lockfile: "cargo-bazel-lock.json".to_string(),
+            input: "pnpm-lock.yaml".to_string(),
+            hub: "crates".to_string(),
+            system: DeclSystem::Bzlmod,
+        }];
+        let plan = Plan {
+            uuid: UUID.to_string(),
+            lane: LaneId("H-TOY2"),
+            writes: vec![PlannedWrite::NativeLock {
+                path: "pnpm-lock.yaml".to_string(),
+            }],
+            repositories: Vec::new(),
+            advisories: Vec::new(),
+            attest: AttestBasis::LockUrl,
+            anchor: Anchor::Digest,
+        };
+        let req = request("left-pad");
+        // The lane's repin, which it says leaves the build passing. The
+        // digest row says the build fails until it has run.
+        let repin = RunRequired {
+            interim: Interim::Passing,
+            actor: Actor::User,
+            ..failing_run()
+        };
+        let disallowed = (Reason::DerivedUnrepairable, TOOL_RUN_DISALLOWED, "run");
+        let said = |refusal: Refusal| {
+            let refusal = checked(Mode::Hosted, refusal);
+            (refusal.reason, refusal.token, refusal.lift.kind())
+        };
+        for policy in RunPolicy::ALL {
+            let cx = GateCx {
+                run: *policy,
+                ..root.cx(Mode::Hosted)
+            };
+            let own = derived_state(&cx, &hub, &RUST, plan.clone(), Some(repin.clone()), &req);
+            match (policy, own) {
+                (RunPolicy::Never, Err(refusal)) => assert_eq!(said(refusal), disallowed),
+                (RunPolicy::RequiredOnly | RunPolicy::Always, Ok((_, Some(run)))) => {
+                    assert_eq!(
+                        (run.kind, run.interim, run.actor),
+                        (RunKind::Repin, Interim::Failing, Actor::SocketPatch),
+                        "{policy:?}"
+                    );
+                    assert_eq!(run.argv, failing_run().argv);
+                }
+                (_, other) => panic!("{policy:?}: {other:?}"),
+            }
+            // With no run of the lane's the remedy's command is display
+            // text: nothing can be started from it, whatever the policy.
+            let none = derived_state(&cx, &hub, &RUST, plan.clone(), None, &req);
+            assert_eq!(
+                said(none.expect_err("no run to start")),
+                disallowed,
+                "{policy:?}"
+            );
+            // A lane without the repin tool, and a run of the lane's that
+            // is no repin, do not repair the digest.
+            let other_tool = derived_state(
+                &cx,
+                &hub,
+                &SPECS[1],
+                plan.clone(),
+                Some(repin.clone()),
+                &req,
+            );
+            assert!(other_tool.is_err(), "{policy:?}");
+            let refresh = RunRequired {
+                kind: RunKind::Lockfile,
+                ..repin.clone()
+            };
+            let other_run = derived_state(&cx, &hub, &RUST, plan.clone(), Some(refresh), &req);
+            assert!(other_run.is_err(), "{policy:?}");
+        }
+        // A write the row does not name leaves the digest alone.
+        let elsewhere = Plan {
+            writes: vec![PlannedWrite::NativeLock {
+                path: "other.lock".to_string(),
+            }],
+            ..plan
+        };
+        let cx = root.cx(Mode::Hosted);
+        let decided = derived_state(&cx, &hub, &RUST, elsewhere, None, &req);
+        assert_eq!(decided.map(|(_, run)| run), Ok(None));
+    }
+
+    /// Obligation 9 over the rows a recognizer declares: a lock check
+    /// over the written lock waits for the owner (revision 4, 2.2 row 9;
+    /// O20), and a checksum row counts for the package it is keyed by
+    /// and for no other.
+    #[test]
+    fn a_lock_check_and_a_checksum_row_of_the_package_refuse() {
+        let mut root = js(&[]);
+        let check = |kind| DerivedState::LockCheck {
+            target: "//:requirements.test".to_string(),
+            input: "pnpm-lock.yaml".to_string(),
+            kind,
+        };
+        for kind in [
+            LockCheckKind::Erasing,
+            LockCheckKind::GazelleManifest,
+            LockCheckKind::RequirementsBzl,
+        ] {
+            root.ws.hubs[0].derived = vec![check(kind)];
+            let hosted = refused(Mode::Hosted, root.ask("left-pad"));
+            assert_eq!(
+                (hosted.reason, hosted.token, &hosted.lift),
+                (
+                    Reason::LockCheckPresent,
+                    LANE_NOT_ENABLED,
+                    &Lift::Owner("O20")
+                ),
+                "{kind:?}"
+            );
+            assert!(hosted.detail.contains("LockCheck"), "{}", hosted.detail);
+            // Vendored mode has no code for the reason: the nearest one.
+            let vendored = gate(&root.cx(Mode::Vendored), &TABLE, &request("left-pad"));
+            let vendored = refused(Mode::Vendored, vendored);
+            assert_eq!(
+                (vendored.reason, &vendored.lift),
+                (Reason::DerivedUnrepairable, &Lift::Owner("O20")),
+                "{kind:?}"
+            );
+        }
+        // A check over another file is no matter of this write.
+        root.ws.hubs[0].derived = vec![DerivedState::LockCheck {
+            target: "//:requirements.test".to_string(),
+            input: "requirements.txt".to_string(),
+            kind: LockCheckKind::Erasing,
+        }];
+        assert_eq!(proceeds(root.ask("left-pad")).lane, LaneId("H-TOY1"));
+
+        // `gem_checksums` keys: `<name>-<version>`, with or without a
+        // platform. The plan writes the lock and not the tag.
+        let checksum = |key: &str| DerivedState::ChecksumValue {
+            file: "MODULE.bazel".to_string(),
+            key: key.to_string(),
+            input: "pnpm-lock.yaml".to_string(),
+        };
+        for (key, stale) in [
+            ("left-pad-1.3.0", true),
+            ("left-pad-1.3.0-x86_64-linux", true),
+            ("left-pad-1.3.00", false),
+            ("left-pad-1.2.0", false),
+            ("rack-2.2.8", false),
+            ("left-pad-extra-1.3.0", false),
+        ] {
+            root.ws.hubs[0].derived = vec![checksum("rack-2.2.8"), checksum(key)];
+            let outcome = root.ask("left-pad");
+            if !stale {
+                assert_eq!(proceeds(outcome).lane, LaneId("H-TOY1"), "{key}");
+                continue;
+            }
+            let refusal = refused(Mode::Hosted, outcome);
+            assert_eq!(
+                (refusal.reason, refusal.token, &refusal.lift),
+                (
+                    Reason::DerivedUnrepairable,
+                    LANE_NOT_ENABLED,
+                    &Lift::EnableLane(LaneId("H-TOY1"))
+                ),
+                "{key}"
+            );
+            assert!(refusal.detail.contains(key), "{}", refusal.detail);
+        }
+    }
+
+    /// Obligation 15 beyond the rendered files: a `files` row whose file
+    /// is gone, and the package label strategy under a `.bazelignore`
+    /// line that hides the owned directory (revision 4, 1.4; probe S1).
+    #[test]
+    fn a_missing_owned_file_and_a_hidden_owned_package_refuse() {
+        let modified = Reason::OwnedFileModified;
+        let state = |root: &Root| owned_state(&root.ws, &root.view, &root.index, &[]);
+        let patch = format!(".socket/bazel/patches/{UUID}/left-pad.patch");
+        let recorded = Index {
+            files: vec![FileRow {
+                path: patch.clone(),
+                sha256: "c".repeat(64),
+                uuid: UUID.to_string(),
+                lane: "H-TOY2".to_string(),
+            }],
+            ..Index::default()
+        };
+        let rendered = recorded.render().expect("an index with a files row");
+        let mut gone = js(&[(INDEX_PATH, &rendered)]);
+        gone.index = recorded.clone();
+        let refusal = checked(Mode::Hosted, state(&gone).expect_err("the file is gone"));
+        assert_eq!(
+            (refusal.reason, refusal.token),
+            (modified, OWNED_FILE_MISSING)
+        );
+        assert!(refusal.detail.contains(&patch), "{}", refusal.detail);
+        assert_eq!(refusal.lift.kind(), "user_edit");
+        // With the file there the row is one this release cannot check.
+        let mut there = js(&[(INDEX_PATH, &rendered), (&patch, "--- a\n+++ b\n")]);
+        there.index = recorded;
+        assert_eq!(
+            refusal_of(state(&there)),
+            (Reason::RulesetUnsupported, LANE_NOT_ENABLED)
+        );
+
+        // The package label strategy: the owned directory is a package,
+        // and a line that hides it deletes the labels into it.
+        let package = Index {
+            label_strategy: Some(LabelStrategy::Package),
+            ..Index::default()
+        };
+        let rendered = package.render().expect("an index with a label strategy");
+        let build = (OWNED_BUILD_PATH, "# gazelle:ignore\n");
+        for (ignore, hidden) in [
+            (".socket\n", true),
+            (".socket/bazel\n", true),
+            ("node_modules\n.socket/\n", true),
+            (".socket/vendor\n", false),
+            ("", false),
+        ] {
+            let mut root = js(&[(INDEX_PATH, &rendered), build, (BAZELIGNORE, ignore)]);
+            root.index = package.clone();
+            if !hidden {
+                assert_eq!(state(&root), Ok(()), "{ignore:?}");
+                continue;
+            }
+            let refusal = checked(Mode::Hosted, state(&root).expect_err(ignore));
+            assert_eq!(
+                (refusal.reason, refusal.token),
+                (modified, OWNED_FILE_MISSING),
+                "{ignore:?}"
+            );
+            let Lift::UserEdit { file, .. } = &refusal.lift else {
+                panic!("{:?}", refusal.lift);
+            };
+            assert_eq!(file, BAZELIGNORE);
+            // Through the gate, before anything is planned to be written.
+            let refusal = refused(Mode::Hosted, root.ask("left-pad"));
+            assert_eq!(refusal.token, OWNED_FILE_MISSING, "{ignore:?}");
+        }
+        // The strategy is recorded and its BUILD file is gone.
+        let mut bare = js(&[(INDEX_PATH, &rendered)]);
+        bare.index = package;
+        assert_eq!(refusal_of(state(&bare)), (modified, OWNED_FILE_MISSING));
+    }
+
+    /// Obligation 7 for a `go_deps` hub: the proxy `go mod download`
+    /// uses is the tracked `GOPROXY`, in an rc file or in the `go_env` of
+    /// `go_deps.config`, unless `GONOPROXY` or `GOPRIVATE` names the
+    /// patch host (probe G4).
+    #[test]
+    fn the_go_env_of_go_deps_decides_whether_the_patch_host_is_reached() {
+        let plan = proceeds(js(&[]).ask("left-pad"));
+        let go = |config: &str, rc: &str| {
+            let module = format!(
+                "bazel_dep(name = \"gazelle\", version = \"0.45.0\")\n\
+                 go_deps = use_extension(\"@gazelle//:extensions.bzl\", \"go_deps\")\n\
+                 go_deps.from_file(go_mod = \"//:go.mod\")\n{config}\
+                 use_repo(go_deps, \"com_github_foo_bar\")\n"
+            );
+            let go_mod = "module example.com/m\n\ngo 1.22\n\nrequire github.com/foo/bar v1.0.0\n";
+            let files = [
+                VERSION,
+                (".bazelrc", rc),
+                ("MODULE.bazel", &module[..]),
+                ("go.mod", go_mod),
+                ("go.sum", ""),
+            ];
+            let (ws, view) = (read(&files), View::of(&files));
+            let hub = ws.hubs.iter().find(|hub| hub.ruleset == Ruleset::Gazelle);
+            let hub = hub.unwrap_or_else(|| panic!("no go_deps hub: {:?}", ws.hubs));
+            reachable(&ws, &view, Mode::Hosted, hub, &plan, Some(URL))
+        };
+        let blocked = (Reason::FetchBlocked, GOPROXY);
+        assert_eq!(go("", ""), Ok(()));
+        let off = "go_deps.config(go_env = {\"GOPROXY\": \"off\"})\n";
+        let refusal = checked(Mode::Hosted, go(off, "").expect_err("GOPROXY=off"));
+        assert_eq!((refusal.reason, refusal.token), blocked);
+        assert_eq!(
+            refusal.lift,
+            edit(
+                "MODULE.bazel",
+                "add `direct` to `GOPROXY`, or `patch.socket.dev` to `GONOPROXY`"
+            )
+        );
+        let direct = "go_deps.config(go_env = {\"GOPROXY\": \"https://goproxy.corp,direct\"})\n";
+        assert_eq!(go(direct, ""), Ok(()));
+        // The settings that take the host past the proxy, in the tag and
+        // in an rc file.
+        for name in ["GOPRIVATE", "GONOPROXY"] {
+            let private = format!(
+                "go_deps.config(go_env = {{\"GOPROXY\": \"off\", \
+                 \"{name}\": \"corp.example,patch.socket.dev\"}})\n"
+            );
+            assert_eq!(go(&private, ""), Ok(()), "{name}");
+            let rc = format!("common --repo_env={name}=patch.socket.dev\n");
+            assert_eq!(go(off, &rc), Ok(()), "{name}");
+            let other = format!("common --repo_env={name}=corp.example\n");
+            assert_eq!(refusal_of(go(off, &other)), blocked, "{name}");
+        }
+        // A `go_env` nobody can read may hold any proxy.
+        let computed = "go_deps.config(go_env = dict(GOPROXY = \"off\"))\n";
+        let refusal = checked(Mode::Hosted, go(computed, "").expect_err("computed"));
+        assert_eq!((refusal.reason, refusal.token), blocked);
+        assert_eq!(
+            refusal.lift,
+            edit("MODULE.bazel", "write `go_env` as a literal dict")
+        );
+    }
+
+    /// The rc configs expand past what the reader follows: the flags of
+    /// a command are then not all known, and "not seen" is never "not
+    /// set" (ROUTED R-017).
+    #[test]
+    fn a_config_chain_past_the_readers_depth_refuses() {
+        let mut rc = String::from("build --config=c0\n");
+        for depth in 0..60 {
+            rc.push_str(&format!("build:c{depth} --config=c{}\n", depth + 1));
+        }
+        rc.push_str("build:c60 --override_repository=npm=/elsewhere\n");
+        let root = js(&[(".bazelrc", &rc)]);
+        let unread = (Reason::ConsumerUndetermined, RC_IMPORT_UNREADABLE);
+        let found = occurrences(&root.ws, Flag::OverrideRepository);
+        let refusal = checked(Mode::Hosted, found.expect_err("an unfollowed chain"));
+        assert_eq!((refusal.reason, refusal.token), unread);
+        assert!(refusal.detail.contains("`bazel "), "{}", refusal.detail);
+        assert_eq!(
+            refusal.lift,
+            edit(".bazelrc", "shorten the chain of `--config` expansions")
+        );
+        let (req, lane) = (request("left-pad"), LaneId("H-JS1"));
+        assert_eq!(
+            refusal_of(no_bypass(&root.ws, &root.index, HubId(0), &req, lane, &[])),
+            unread
+        );
+        let row = rc_row(RcFlag::Distdir, ".socket/vendor/npm/x");
+        assert_eq!(refusal_of(rc_carriage(&root.ws, &[row])), unread);
+        let refusal = refused(Mode::Hosted, root.ask("left-pad"));
+        assert_eq!(refusal.reason, Reason::ConsumerUndetermined);
+        // A chain the reader follows to its end is read.
+        let short = "build --config=a\nbuild:a --config=b\nbuild:b --jobs=4\n";
+        let root = js(&[(".bazelrc", short)]);
+        let found = occurrences(&root.ws, Flag::OverrideRepository);
+        assert_eq!(found.map(|found| found.len()), Ok(0));
+        assert_eq!(proceeds(root.ask("left-pad")).lane, LaneId("H-TOY1"));
     }
 }

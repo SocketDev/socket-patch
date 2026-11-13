@@ -29,13 +29,15 @@ use std::path::PathBuf;
 use serde_json::{json, Value};
 use socket_patch_core::bazel::exec::{self, Kept, Overlay, Scope, Selector, Txn};
 use socket_patch_core::bazel::gate::{self, gate, GateCx};
+use socket_patch_core::bazel::inventory;
 use socket_patch_core::bazel::java_hash::hash_bytes;
 use socket_patch_core::bazel::lanes::{self, refuse};
 use socket_patch_core::bazel::model::{
-    Anchor, AttestBasis, BazelRef, BazelWorkspace, CellClaim, ClaimSystem, FileText, FileView,
-    Files, GateOutcome, HubId, Index, IndexRow, LaneCx, LaneId, LaneOps, LaneSpec, LaneTable, Lift,
-    Mode, OwnedWrite, PatchRequest, Plan, PlannedWrite, Reason, RestoreOutcome, RootRef, Ruleset,
-    RunPolicy, TextRead, TokenSurface, VexWithhold, WithholdKind, WriteClass,
+    Anchor, AttestBasis, BazelRef, BazelWorkspace, CellClaim, ClaimSystem, Code, FileText,
+    FileView, Files, GateOutcome, Governance, HubId, Index, IndexRow, LaneCx, LaneId, LaneOps,
+    LaneSpec, LaneTable, Lift, Mode, OwnedWrite, PatchRequest, Plan, PlannedWrite, Reason,
+    RestoreOutcome, RootRef, Ruleset, RunPolicy, TextRead, TokenSurface, VexWithhold, WithholdKind,
+    WriteClass,
 };
 use socket_patch_core::bazel::owned_index::{IndexEdit, INDEX_PATH};
 use socket_patch_core::crawlers::types::Ecosystem;
@@ -177,8 +179,10 @@ fn toy_gate(cx: &LaneCx<'_>, req: &PatchRequest<'_>) -> GateOutcome {
     let Some(doc) = found.as_str().and_then(parse) else {
         return cannot("lock_format", "the lock is not a toy lock");
     };
+    // The lock of this hub does not resolve the release: the hub is no
+    // part of the lock set, and the other hubs decide.
     if member(&doc, req.name, "version") != Some(req.version) {
-        return cannot("lock_format", "the lock does not pin this release");
+        return GateOutcome::NotBazel;
     }
     // A derived value that is wrong before the edit is not ours to fix.
     if pins_hash(&doc) != doc["pinsHash"].as_i64() {
@@ -203,6 +207,7 @@ fn toy_gate(cx: &LaneCx<'_>, req: &PatchRequest<'_>) -> GateOutcome {
             value("pinsHash".to_string()),
             PlannedWrite::Owned(OwnedWrite::Index),
         ],
+        repositories: Vec::new(),
         advisories: Vec::new(),
         attest: AttestBasis::BazelLock,
         anchor: Anchor::Digest,
@@ -363,7 +368,9 @@ fn toy_attest(cx: &LaneCx<'_>, pin: &BazelRef) -> Result<(), VexWithhold> {
         uuid: &pin.uuid,
         project_rel: "",
     };
-    gate::no_bypass(cx.ws, cx.index, cx.hub, &request, LANE)
+    // The toy hub is the one repository the package is built from: the
+    // plan names no other, and neither does the proof.
+    gate::no_bypass(cx.ws, cx.index, cx.hub, &request, LANE, &[])
         .map_err(|refusal| withhold(WithholdKind::PinBypassed, &refusal.detail))
 }
 
@@ -672,9 +679,10 @@ fn the_toy_lane_wires_attests_and_restores_byte_for_byte() {
         // Discovery, the consumer proof and the inventory, from committed state.
         let ws = workspace(&tree);
         let read = |path: &str| tree.read(path).as_str().map(str::to_string);
-        let pins = lanes::discover(&TABLE, &ws, &tree, &index, &read).expect("the lane can tell");
-        let [pin] = &pins[..] else {
-            panic!("one pin: {pins:?}")
+        let found = lanes::discover(&TABLE, &ws, &tree, &index, &read);
+        assert!(found.is_complete(), "the lane can tell: {found:?}");
+        let [pin] = &found.pins[..] else {
+            panic!("one pin: {found:?}")
         };
         assert_eq!(
             (
@@ -732,7 +740,7 @@ fn the_toy_lane_wires_attests_and_restores_byte_for_byte() {
         let read = |path: &str| tree.read(path).as_str().map(str::to_string);
         assert_eq!(
             lanes::discover(&TABLE, &ws, &tree, &index, &read),
-            Some(Vec::new())
+            lanes::Discovered::default()
         );
     }
 }
@@ -768,7 +776,7 @@ fn a_tampered_or_drifted_toy_lock_is_not_attested_and_not_restored() {
     let read = |path: &str| erased.read(path).as_str().map(str::to_string);
     assert_eq!(
         lanes::discover(&TABLE, &ws, &erased, &index, &read),
-        Some(Vec::new())
+        lanes::Discovered::default()
     );
     // The digest is the patch's and the derived value is not: the lock would not load.
     let hash = pins_hash(&parse(&wired.text(LOCK)).unwrap())
@@ -794,9 +802,10 @@ fn a_tampered_or_drifted_toy_lock_is_not_attested_and_not_restored() {
     let unreadable = with_lock("{".to_string());
     let ws = workspace(&unreadable);
     let read = |path: &str| unreadable.read(path).as_str().map(str::to_string);
+    let found = lanes::discover(&TABLE, &ws, &unreadable, &index, &read);
     assert_eq!(
-        lanes::discover(&TABLE, &ws, &unreadable, &index, &read),
-        None,
+        (found.pins.len(), found.unknown_for(Ecosystem::Maven)),
+        (0, Some(HubId(0))),
         "cannot tell, never no pin"
     );
 
@@ -849,8 +858,13 @@ fn the_gate_refuses_the_toy_lane_where_the_write_cannot_be_proven() {
         refused(&mismatch),
         (Reason::DerivedUnrepairable, "hash_file_mismatch")
     );
+    // The one hub does not resolve the release: refused, and never
+    // passed on as "not a Bazel matter".
     let other = toy_tree(&INPUT.replace("\"1.0.0\"", "\"2.0.0\""), &[]);
-    assert_eq!(refused(&other), (Reason::RulesetUnsupported, "lock_format"));
+    assert_eq!(
+        refused(&other),
+        (Reason::ConsumerUndetermined, gate::NOT_RESOLVED_BY_HUB)
+    );
     assert_eq!(
         refused(&toy_tree("{}\n", &[])),
         (Reason::RulesetUnsupported, "lock_format")
@@ -879,15 +893,24 @@ fn the_gate_refuses_the_toy_lane_where_the_write_cannot_be_proven() {
         patch_url: Some(PATCH_URL),
         ..GateCx::new(Mode::Hosted, &ws, &tree, &index)
     };
-    let GateOutcome::Refuse(refusal) = gate(&cx, &lanes::PRODUCTION, &request()) else {
-        panic!("a production lane is enabled");
-    };
-    assert_eq!(
-        (refusal.token, refusal.lift),
-        ("lane_not_enabled", Lift::EnableLane(LaneId("H-MVN1")))
-    );
+    // The expectation is computed (`lanes::admits`), so the change that
+    // enables H-MVN1 does not turn this red.
     let cell = lanes::Cell::of(&ws, HubId(0), Mode::Hosted).unwrap();
-    assert!(lanes::admits(&TABLE, &cell) && !lanes::admits(&lanes::PRODUCTION, &cell));
+    assert!(lanes::admits(&TABLE, &cell));
+    let not_enabled = ("lane_not_enabled", Lift::EnableLane(LaneId("H-MVN1")));
+    match gate(&cx, &lanes::PRODUCTION, &request()) {
+        GateOutcome::Refuse(refusal) if !lanes::admits(&lanes::PRODUCTION, &cell) => {
+            assert_eq!((refusal.token, refusal.lift), not_enabled);
+        }
+        GateOutcome::Refuse(refusal) => {
+            assert_ne!(
+                (refusal.token, refusal.lift),
+                not_enabled,
+                "an admitted cell"
+            );
+        }
+        _ => assert!(lanes::admits(&lanes::PRODUCTION, &cell)),
+    }
     // A lane that edits the lock and does not recompute its derived value
     // is refused by the gate: the resolved hash would be stale.
     fn careless(cx: &LaneCx<'_>, req: &PatchRequest<'_>) -> GateOutcome {
@@ -896,6 +919,7 @@ fn the_gate_refuses_the_toy_lane_where_the_write_cannot_be_proven() {
             uuid: req.uuid.to_string(),
             lane: LANE,
             writes: vec![PlannedWrite::NativeLock { path }],
+            repositories: Vec::new(),
             advisories: Vec::new(),
             attest: AttestBasis::BazelLock,
             anchor: Anchor::Digest,
@@ -923,4 +947,191 @@ fn the_gate_refuses_the_toy_lane_where_the_write_cannot_be_proven() {
         "{}",
         refusal.detail
     );
+}
+
+// ── Several hubs ─────────────────────────────────────────────────────
+
+/// Two hubs of the toy ruleset over the root project, a lock each.
+const TWO_HUBS: &str = "module(name = \"toy_ws\")\n\
+    bazel_dep(name = \"rules_jvm_external\", version = \"6.7\")\n\
+    maven = use_extension(\"@rules_jvm_external//:extensions.bzl\", \"maven\")\n\
+    maven.install(name = \"maven\", artifacts = [\"toy:dep:1.0.0\"], \
+    lock_file = \"//:toy.lock.json\")\n\
+    maven.install(name = \"maven_tools\", artifacts = [\"toy:other:2.0.0\"], \
+    lock_file = \"//:tools.lock.json\")\n\
+    use_repo(maven, \"maven\", \"maven_tools\")\n";
+const TOOLS_LOCK: &str = "tools.lock.json";
+
+/// A hand-written jar pin: a hub of the ecosystem that names no lock.
+const HTTP_JAR: &str = "http_jar = use_repo_rule(\
+    \"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_jar\")\n\
+    http_jar(name = \"some_jar\", url = \"https://repo.toy.invalid/a.jar\")\n";
+
+/// The toy lock with its one package renamed, and the derived value
+/// those pins give.
+fn toy_lock(name: &str, version: &str) -> String {
+    let mut text = INPUT
+        .replace("\"dep\"", &format!("\"{name}\""))
+        .replace("\"1.0.0\"", &format!("\"{version}\""));
+    let hash = pins_hash(&parse(&text).expect("a toy lock")).expect("its pins");
+    assert!(set_pins_hash(&mut text, hash));
+    text
+}
+
+/// The locks a plan writes values in, each once, in plan order.
+fn locks_of(plan: &Plan) -> Vec<&str> {
+    let mut paths: Vec<&str> = Vec::new();
+    for write in &plan.writes {
+        if let PlannedWrite::GeneratedValue { path, .. } = write {
+            if !paths.contains(&path.as_str()) {
+                paths.push(path);
+            }
+        }
+    }
+    paths
+}
+
+/// The lock set is the hubs that pin the package (design 6,
+/// `lock_set_partial`): "every lock that pins a package is rewritten or
+/// none is". A hub whose lock does not resolve the release holds nothing
+/// up, whether its lane says so or the gate refused it before the lane
+/// was asked; a hub that pins it and cannot be rewritten refuses all.
+#[test]
+fn the_lock_set_is_the_hubs_whose_locks_resolve_the_release() {
+    let tree = |tools: &str, rc: &str| {
+        Tree::of(&[
+            (".bazelversion", "9.3.2\n"),
+            (".bazelrc", rc),
+            ("MODULE.bazel", TWO_HUBS),
+            (LOCK, INPUT),
+            (TOOLS_LOCK, tools),
+        ])
+    };
+    let outcome = |tree: &Tree| {
+        let ws = workspace(tree);
+        let governed = gate::governed(&ws, "");
+        let maven = governed.iter().find(|(e, _)| *e == Ecosystem::Maven);
+        assert_eq!(
+            maven.map(|(_, governance)| governance),
+            Some(&Governance::Governed(vec![HubId(0), HubId(1)])),
+            "both hubs govern the root"
+        );
+        ask(tree, &ws, &Index::default())
+    };
+    let refusal_of = |outcome: GateOutcome| match outcome {
+        GateOutcome::Refuse(refusal) => {
+            assert!(
+                !format!("{refusal:?}").contains("tok_fixture"),
+                "{refusal:?}"
+            );
+            (refusal.reason, refusal.token)
+        }
+        other => panic!("not refused: {other:?}"),
+    };
+    let other = toy_lock("other", "2.0.0");
+
+    // The package is pinned in one of the two locks: that lock alone is
+    // planned. The lane of the second hub answers "not here".
+    let GateOutcome::Proceed(plan) = outcome(&tree(&other, "")) else {
+        panic!("a hub that does not pin the package held the other up");
+    };
+    assert_eq!(locks_of(&plan), [LOCK]);
+    assert!(plan.advisories.is_empty());
+    // Pinned in both: one plan over both locks.
+    let GateOutcome::Proceed(plan) = outcome(&tree(INPUT, "")) else {
+        panic!("two hubs that pin the package are one plan");
+    };
+    assert_eq!(locks_of(&plan), [LOCK, TOOLS_LOCK]);
+    // Pinned in both, and one of the two cannot be rewritten: none is.
+    let broken = INPUT.replace("-1084610730", "12");
+    assert_eq!(
+        refusal_of(outcome(&tree(&broken, ""))),
+        (Reason::LockSetPartial, "hash_file_mismatch")
+    );
+    // Pinned in neither: no hub resolves the release.
+    let neither = Tree::of(&[
+        (".bazelversion", "9.3.2\n"),
+        ("MODULE.bazel", TWO_HUBS),
+        (LOCK, &other),
+        (TOOLS_LOCK, &other),
+    ]);
+    assert_eq!(
+        refusal_of(outcome(&neither)),
+        (Reason::ConsumerUndetermined, gate::NOT_RESOLVED_BY_HUB)
+    );
+
+    // The second hub is bypassed, so the gate refuses it before its lane
+    // is asked. What its lock resolves, as the lane lists it, decides
+    // whether that holds the first hub up.
+    let bypassed = "common --override_repository=maven_tools=/elsewhere\n";
+    let GateOutcome::Proceed(plan) = outcome(&tree(&other, bypassed)) else {
+        panic!("a bypassed hub that does not pin the package held the other up");
+    };
+    assert_eq!(locks_of(&plan), [LOCK]);
+    assert_eq!(
+        refusal_of(outcome(&tree(INPUT, bypassed))),
+        (Reason::LockSetPartial, "repo_override")
+    );
+    // A lock nobody can list may resolve anything.
+    assert_eq!(
+        refusal_of(outcome(&tree("{", bypassed))),
+        (Reason::LockSetPartial, "repo_override")
+    );
+}
+
+/// A hand-written jar pin is a hub of the ecosystem at the root. It
+/// names no lock, so nothing could be rewritten for it: it is left out
+/// of the write set with an advisory, and does not refuse every Maven
+/// patch of a workspace that has one. `vex` still withholds, because
+/// what the pin fetches cannot be listed.
+#[test]
+fn a_hand_written_pin_is_left_out_of_the_write_set_with_an_advisory() {
+    let module = format!("{MODULE}{HTTP_JAR}");
+    let tree = Tree::of(&[
+        (".bazelversion", "9.3.2\n"),
+        ("MODULE.bazel", &module),
+        (LOCK, INPUT),
+    ]);
+    let (ws, index) = (workspace(&tree), Index::default());
+    let shapes: Vec<Ruleset> = ws.hubs.iter().map(|hub| hub.ruleset).collect();
+    assert_eq!(shapes, [Ruleset::RulesJvmExternal, Ruleset::ReportOnly]);
+    let GateOutcome::Proceed(plan) = ask(&tree, &ws, &index) else {
+        panic!("one hand-written pin refused the patch of the hub's lock");
+    };
+    assert_eq!(locks_of(&plan), [LOCK]);
+    let [advisory] = &plan.advisories[..] else {
+        panic!("one advisory: {:?}", plan.advisories);
+    };
+    assert_eq!(advisory.code, Code::WorkspaceOutOfScope);
+    assert!(
+        advisory.detail.contains("`some_jar`") && advisory.detail.contains("`dep`"),
+        "{}",
+        advisory.detail
+    );
+    let listed = inventory::inventory(&ws, &TABLE, &tree, &index);
+    let unlisted = listed.cannot_enumerate(Ecosystem::Maven);
+    assert_eq!(unlisted.and_then(|hub| hub.hub), Some(HubId(1)));
+    // Discovery has nothing to say about it: no lane writes a pin there.
+    let read = |path: &str| tree.read(path).as_str().map(str::to_string);
+    assert!(lanes::discover(&TABLE, &ws, &tree, &index, &read).is_complete());
+
+    // Alone, it refuses under its own token, and so it does when the
+    // hub beside it does not resolve the release.
+    for lock in ["{}\n".to_string(), toy_lock("other", "2.0.0")] {
+        let alone = Tree::of(&[
+            (".bazelversion", "9.3.2\n"),
+            ("MODULE.bazel", &module),
+            (LOCK, &lock),
+        ]);
+        let ws = workspace(&alone);
+        let GateOutcome::Refuse(refusal) = ask(&alone, &ws, &index) else {
+            panic!("nothing takes the patch");
+        };
+        let lock_format = lock.starts_with("{}");
+        let want = match lock_format {
+            true => (Reason::RulesetUnsupported, "lock_format"),
+            false => (Reason::RulesetUnsupported, "report_only"),
+        };
+        assert_eq!((refusal.reason, refusal.token), want);
+    }
 }

@@ -3162,7 +3162,7 @@ was written", and never contains a grant token.
 | Code | Status | Level | When | Remedy |
 |---|---|---|---|---|
 | `bazel_workspace_detected` | planned | `info` | A Bazel workspace with at least one recognized ruleset. Names the root, the Bazel release line and its support tier, the dependency system (Bzlmod or WORKSPACE) and each governed ecosystem with its ruleset and lock. | - |
-| `bazel_workspace_out_of_scope` | planned | `info` | The workspace has Bazel modules, source archives or hand-written pins. Socket patches cover registry packages; these dependencies are counted and not examined. | - |
+| `bazel_workspace_out_of_scope` | planned | `info` | The workspace has Bazel modules, source archives or hand-written pins. Socket patches cover registry packages; these dependencies are counted and not examined. Also rides the plan of a patch when a hand-written pin of the same ecosystem names no lock: the pin is left as it is while the hubs that resolve the package are patched, and `vex` makes no statement for the package. | - |
 | `bazel_workspace_unreadable` | planned | `warn` | A Bazel file exists and cannot be read or parsed. | Names the file and the construct to fix. |
 | `bazel_workspace_version_unsupported` | planned | `warn` | Bazel 4 or older, or Bazel 5 with Bzlmod. | Upgrade Bazel, or patch outside Bazel. |
 | `bazel_workspace_version_untested` | planned | `info` | The Bazel or ruleset version is floating, unknown or newer than the releases socket-patch was tested with. | Pin `.bazelversion` to a tested release. |
@@ -3208,7 +3208,7 @@ statuses differ, and the `-` in each of those rows stands for the other mode's c
 | `redirect_bazel_derived_unrepairable` | `vendor_bazel_derived_unrepairable` | planned | A value derived from the lock cannot be recomputed, or was already inconsistent before the edit. | Regenerate the file with the ruleset's own command, then run again. |
 | `redirect_bazel_lock_check_present` | - | planned | A lock check target (for example `compile_pip_requirements`) covers the file: its test would fail after the rewrite, and its update command would erase the pin. | The ordered steps printed with the refusal. |
 | `redirect_bazel_selection_unproven` | `vendor_bazel_selection_unproven` | planned | Go: nothing committed proves that Bazel selects the pinned module version. | The routes printed with the refusal. |
-| `redirect_bazel_lock_set_partial` | `vendor_bazel_lock_set_partial` | planned | One of several lock files of a hub, or one of several hubs that pin the package, cannot be rewritten. | Names the file. |
+| `redirect_bazel_lock_set_partial` | `vendor_bazel_lock_set_partial` | planned | One of several lock files of a hub, or one of several hubs that pin the package, cannot be rewritten. A hub whose lock does not resolve the release is no part of the set. | Names the file. |
 | `redirect_bazel_owned_file_modified` | - | planned | `.socket/bazel/index.json` does not pass the strict parse, or another file under `.socket/bazel/` is not what the index records for it. | Restore it from version control. |
 | - | `vendor_bazel_owned_file_modified` | active | The vendored form of the row above. In this release it is reported for the index alone: as the refusal of a vendored directory tree whose `.bazelignore` line cannot be recorded, and as a warning of `vendor --revert` when a recorded line could not be taken out again. | Restore the index from version control; the detail names the line to add or remove by hand. |
 
@@ -3355,3 +3355,4 @@ it is `active`, and is as stable as a code.
 | `tool_run_failed` | The lane's tool could not be started, exited with an error, ran out of time or left its output without the pin. Every file was put back. |
 | `tool_run_disallowed` | The build would fail until the lane's tool has run, and this run may not run it. |
 | `tool_version_mismatch` | The `bazel` or `bazelisk` on `PATH` is not a release the lane is proven on, so the tool was not started. |
+| `not_resolved_by_hub` | No hub that governs the project resolves this release of the package in its lock, so the Bazel build does not take the package from a lock socket-patch can pin it in. Reported with `*_bazel_consumer_undetermined`. |

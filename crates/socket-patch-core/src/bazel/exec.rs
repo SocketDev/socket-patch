@@ -1363,6 +1363,7 @@ mod tests {
             uuid: uuid.to_string(),
             lane,
             writes,
+            repositories: Vec::new(),
             advisories: Vec::new(),
             attest: AttestBasis::Withheld,
             anchor: Anchor::Digest,

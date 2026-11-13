@@ -650,7 +650,9 @@ impl DownloaderConfig {
         let mut urls = Vec::new();
         for candidate in candidates {
             let Some(host) = host_of(&candidate) else {
-                let why = format!("the rewritten URL {candidate} has no host name to check");
+                // The candidate is built from captured parts of the URL,
+                // which can be the grant token: it is never quoted.
+                let why = "a `rewrite` gives a URL with no host name to check".to_string();
                 return Amended::Unevaluable(why);
             };
             // Bazel 10 compares hosts without regard to case and older
@@ -771,20 +773,57 @@ pub enum Verdict {
 /// [`EffectiveFlags::gaps`], or rc configs that expand past what the
 /// reader follows, a config nobody read may block the URL, so the
 /// verdict is `Blocked` and never `NoConfig` or `Fetchable`.
+///
+/// `Fetchable` lists the URLs of every set together. A caller that must
+/// know what one build fetches from asks [`by_config_set`]: a URL some
+/// set keeps says nothing about a set that moves it.
 pub fn verdict(
     flags: &EffectiveFlags,
     line: &BazelLine,
     files: &dyn FileView,
     url: &str,
 ) -> Verdict {
+    match by_config_set(flags, line, files, url) {
+        Err(verdict) => verdict,
+        Ok(sets) => {
+            let mut fetched: Vec<String> = sets.into_iter().flat_map(|set| set.urls).collect();
+            fetched.sort();
+            fetched.dedup();
+            Verdict::Fetchable { urls: fetched }
+        }
+    }
+}
+
+/// What one set of downloader configs that a build may run with does to
+/// a URL.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SetUrls {
+    /// The config files of the set as the rc files name them, joined
+    /// with `, `.
+    pub config: String,
+    /// The URLs Bazel tries under the set, in its order; never empty.
+    pub urls: Vec<String>,
+}
+
+/// [`verdict`] before the sets are folded into one list: the URLs each
+/// set of configs fetches `url` from, one entry per set a reading of the
+/// rc files may select. `Err` is the verdict where it is not
+/// `Fetchable`: `NoConfig`, or the `Blocked` of the first set that
+/// blocks the URL or cannot be evaluated.
+pub fn by_config_set(
+    flags: &EffectiveFlags,
+    line: &BazelLine,
+    files: &dyn FileView,
+    url: &str,
+) -> Result<Vec<SetUrls>, Verdict> {
     if let Some(gap) = flags.gaps().into_iter().find(|gap| gap.hard) {
-        return Verdict::Blocked {
+        return Err(Verdict::Blocked {
             config: gap.file.clone(),
             why: format!(
                 "{} {}; it may name a downloader config",
                 gap.file, gap.detail
             ),
-        };
+        });
     }
     // The tracked rc files start at the root `.bazelrc`.
     let unread = |why: String| Verdict::Blocked {
@@ -809,7 +848,7 @@ pub fn verdict(
     for chain in [Chain::Build, Chain::Test, Chain::Fetch] {
         let state = flags.state(Flag::DownloaderConfig, chain);
         if let FlagState::UnknowableHard(why) = &state {
-            return unread(why.clone());
+            return Err(unread(why.clone()));
         }
         if last_wins {
             state
@@ -820,7 +859,7 @@ pub fn verdict(
         if union {
             let seen = match flags.occurrences(Flag::DownloaderConfig, chain) {
                 Ok(seen) => seen,
-                Err(why) => return unread(why),
+                Err(why) => return Err(unread(why)),
             };
             let mut configs: Vec<&str> = seen.iter().map(|o| o.config.as_str()).collect();
             configs.dedup();
@@ -839,19 +878,23 @@ pub fn verdict(
         }
     }
     if sets.is_empty() {
-        return Verdict::NoConfig;
+        return Err(Verdict::NoConfig);
     }
 
-    let mut fetched: Vec<String> = Vec::new();
+    let mut fetched: Vec<SetUrls> = Vec::new();
     for set in sets {
         let name = set.join(", ");
         let blocked = |why: String| Verdict::Blocked {
             config: name.clone(),
             why,
         };
+        let from = |urls: Vec<String>| SetUrls {
+            config: name.clone(),
+            urls,
+        };
         // An empty value switches the downloader config off.
         if set.iter().any(|path| path.is_empty()) {
-            fetched.push(url.to_string());
+            fetched.push(from(vec![url.to_string()]));
             continue;
         }
         let mut config = DownloaderConfig::default();
@@ -859,24 +902,24 @@ pub fn verdict(
             // Bazel decodes the file as UTF-8 and replaces what is not.
             let Some(FileText::Bytes(bytes)) = root_relative(path).map(|rel| files.read(&rel))
             else {
-                return blocked(format!("{path} cannot be read, and Bazel stops without it"));
+                return Err(blocked(format!(
+                    "{path} cannot be read, and Bazel stops without it"
+                )));
             };
             let text = String::from_utf8_lossy(&bytes);
             if let Err(error) = config.add(&text) {
-                return blocked(format!("{path}:{} {}", error.line, error.detail));
+                return Err(blocked(format!("{path}:{} {}", error.line, error.detail)));
             }
         }
         match config.amend(url) {
-            Amended::Unevaluable(why) => return blocked(why),
+            Amended::Unevaluable(why) => return Err(blocked(why)),
             Amended::Urls(urls) if urls.is_empty() => {
-                return blocked(format!("every URL for {url} is blocked"));
+                return Err(blocked(format!("every URL for {url} is blocked")));
             }
-            Amended::Urls(urls) => fetched.extend(urls),
+            Amended::Urls(urls) => fetched.push(from(urls)),
         }
     }
-    fetched.sort();
-    fetched.dedup();
-    Verdict::Fetchable { urls: fetched }
+    Ok(fetched)
 }
 
 #[cfg(test)]
@@ -1429,6 +1472,74 @@ mod tests {
             ("shut.cfg", "block *\n"),
         ];
         assert_eq!(blocked_by(tracked(&test_only, &nine)).0, "shut.cfg");
+    }
+
+    /// One list over every set hides a set that moves the URL: a config
+    /// under `--config=ci` that rewrites to a mirror, beside a plain one
+    /// that leaves the URL alone. The answer per set keeps them apart.
+    #[test]
+    fn the_urls_of_each_config_set_are_kept_apart() {
+        let nine = BazelLine::of(BazelVersion::new(9, 3, 2));
+        let per_set = |files: &[(&str, &str)]| {
+            let files = Files::of(files);
+            by_config_set(&read(&files).effective(&nine), &nine, &files, PATCH)
+        };
+        let moved = PATCH.replace("patch.socket.dev", "mirror.corp.example");
+        let mirror = "rewrite patch\\.socket\\.dev/(.*) mirror.corp.example/$1\n";
+        let two = [
+            (
+                ".bazelrc",
+                "common --downloader_config=a.cfg\ncommon:ci --downloader_config=ci.cfg\n",
+            ),
+            ("a.cfg", "allow patch.socket.dev\n"),
+            ("ci.cfg", mirror),
+        ];
+        let set = |config: &str, url: &str| SetUrls {
+            config: config.to_string(),
+            urls: vec![url.to_string()],
+        };
+        assert_eq!(
+            per_set(&two),
+            Ok(vec![set("a.cfg", PATCH), set("ci.cfg", &moved)])
+        );
+        // Folded into one list, the URL looks kept.
+        assert_eq!(
+            tracked(&two, &nine),
+            Verdict::Fetchable {
+                urls: vec![moved.clone(), PATCH.to_string()]
+            }
+        );
+        // A mirror with a fallback keeps the URL inside its one set.
+        let fallback = format!("{mirror}rewrite (patch\\.socket\\.dev/.*) $1\n");
+        let one = [
+            (".bazelrc", "common --downloader_config=dl.cfg\n"),
+            ("dl.cfg", &fallback[..]),
+        ];
+        let sets = per_set(&one).expect("one set");
+        assert_eq!(sets.len(), 1);
+        assert_eq!(sets[0].urls, [moved, PATCH.to_string()]);
+        // What is not fetchable is the verdict itself.
+        assert_eq!(per_set(&[]), Err(Verdict::NoConfig));
+        let shut = [
+            (".bazelrc", "build:ci --downloader_config=shut.cfg\n"),
+            ("shut.cfg", "block *\n"),
+        ];
+        assert!(matches!(per_set(&shut), Err(Verdict::Blocked { .. })));
+        // A URL a rewrite built is never quoted: it can hold the path.
+        let hostless = [
+            (".bazelrc", "common --downloader_config=dl.cfg\n"),
+            (
+                "dl.cfg",
+                "rewrite patch\\.socket\\.dev/patch/npm/([^/]+)/(.*) /$1/$2\n",
+            ),
+        ];
+        let Err(Verdict::Blocked { why, .. }) = per_set(&hostless) else {
+            panic!("a URL with no host is not fetched");
+        };
+        assert!(
+            why.contains("no host name") && !why.contains("left-pad"),
+            "{why}"
+        );
     }
 
     #[test]

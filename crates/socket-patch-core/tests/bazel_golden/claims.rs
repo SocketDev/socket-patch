@@ -12,12 +12,14 @@ use std::path::Path;
 use serde_json::Value;
 use socket_patch_core::bazel::lanes;
 
-/// The keys of a claim row. The audit reads the first eight; the rest
-/// say what the lane may do to a repository (revision 4, section 5 item
-/// 8), for the reviewer of the claim.
-const KEYS: [&str; 12] = [
+/// The keys of a claim row. The audit reads the first eight, and holds
+/// `bump` (the test that ran the lane's bump cell) to a `ran` report
+/// where `classes` list a hook or a tag edit; the rest say what the lane
+/// may do to a repository (revision 4, section 5 item 8), for the
+/// reviewer of the claim.
+const KEYS: [&str; 13] = [
     "lane", "mode", "ruleset", "tier", "lo", "hi", "system", "os", "classes", "anchor", "stale",
-    "tool",
+    "tool", "bump",
 ];
 
 #[test]
