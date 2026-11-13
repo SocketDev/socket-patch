@@ -112,6 +112,13 @@ impl Classifier {
     /// Classify `path`, as found and as resolved. A relative path is read
     /// from the working directory. A path that does not exist yet (a file
     /// a patch would add) is judged by where it would be created.
+    ///
+    /// A path spelled with `..` is first placed by the disk: the directory
+    /// that holds the entry is resolved and the entry keeps its own name.
+    /// So `<workspace>/app/../bazel-bin` is the link
+    /// `<workspace>/bazel-bin` and answers `Link`, as it does without the
+    /// `..`, and no caller has to spell the path another way first. A path
+    /// that ends in `..` names no entry and is judged where it resolves.
     pub fn classify(&self, path: &Path) -> Verdict {
         let Ok(found) = std::path::absolute(path) else {
             return Verdict {
@@ -125,12 +132,15 @@ impl Classifier {
         // and `<link>/` is not a link to `read_link`. `..` is kept.
         let found: PathBuf = found.components().collect();
         let canonical = resolve(&found, MAX_LINK_HOPS);
-        // Where `a/b/../c` is, only the disk knows, so a path spelled with
-        // `..` is judged by its resolved form alone.
-        let dotted = found.components().any(|c| c == Component::ParentDir);
-        let found = match &canonical {
-            Some(real) if dotted => real.clone(),
-            _ => found,
+        // Where `a/b/../c` is, only the disk knows, and the rules walk no
+        // path that holds `..`. The entry is placed by its directory, so
+        // that a link stays a link; failing that, by the resolved form
+        // alone, which for a link is the place it leads to.
+        let found = if has_parent_dir(&found) {
+            let placed = in_resolved_dir(&found).or_else(|| canonical.clone());
+            placed.unwrap_or(found)
+        } else {
+            found
         };
         let mut verdict = {
             // Held across the marker tests: they are a few `stat`s, and
@@ -320,6 +330,27 @@ fn resolve(path: &Path, hops: usize) -> Option<PathBuf> {
     None
 }
 
+/// Whether `path` is spelled with a `..` segment.
+fn has_parent_dir(path: &Path) -> bool {
+    path.components().any(|c| c == Component::ParentDir)
+}
+
+/// `path`, which is spelled with `..`, as the same entry spelled without:
+/// the directory that holds it with every link followed, and its own name.
+/// The name is kept because the entry may be a link, and a link is judged
+/// as one ([`PathClass::Link`]) only while the path still names it; with
+/// every link followed the path names the place the link leads to.
+///
+/// `None` when the path ends in `..` and so names no entry of its own, and
+/// when the disk does not place the directory: it would not resolve it, or
+/// a segment before a `..` is missing, which [`resolve`] appends as it is
+/// spelled.
+fn in_resolved_dir(path: &Path) -> Option<PathBuf> {
+    let name = path.file_name()?;
+    let dir = resolve(path.parent()?, MAX_LINK_HOPS)?;
+    (!has_parent_dir(&dir)).then(|| dir.join(name))
+}
+
 /// Where a workspace's output base may be, beyond what its links in the
 /// workspace root say. Relative paths are ignored: they would be read from
 /// socket-patch's working directory, not from Bazel's.
@@ -363,6 +394,23 @@ impl Candidates {
 /// of them, and the order is no preference. An empty variable counts as
 /// unset. `passwd_home` is the account's home from the user database,
 /// which the client falls back to when `$HOME` is empty.
+///
+/// One empty variable is not unset to Bazel, and no root is listed for
+/// it. The client asks only whether `TEST_TMPDIR` exists
+/// (`IsRunningWithinTest`, `blaze_util.cc`), and an empty one names no
+/// directory. Through 8.0.0 the server is then handed the relative root
+/// `_bazel_<user>` and refuses to start (run on 5.4.1;
+/// `startup_options.cc` reads the same through 8.0.0). From 8.1.0 the
+/// client resolves that name in the directory the command was typed in,
+/// the workspace root or a directory below it, and leaves a user root
+/// there (probe C6 cell E11, run on 9.3.2 from a workspace root;
+/// `startup_options.cc` reads the same from 8.1.0 to 10.0.0rc3, not run).
+/// That directory is Bazel's working directory, not this process's, so it
+/// cannot be named here. [`locate_output_base`] looks for such a user root
+/// in the workspace root whatever the environment says; one that a
+/// command typed further down left is found by a link or not at all.
+/// Classifying a path needs none of this: the base is known by its marker
+/// wherever it lies.
 pub fn default_output_roots(
     os: TargetOs,
     env: &dyn Fn(&str) -> Option<OsString>,
@@ -394,7 +442,8 @@ pub fn default_output_roots(
         // is not looked up.
         TargetOs::Windows => roots.extend(var("HOME").or_else(|| var("USERPROFILE"))),
     }
-    // A client that sees `TEST_TMPDIR` uses it whatever else is set.
+    // A client that sees `TEST_TMPDIR` uses it whatever else is set. An
+    // empty one names no directory this function knows: see above.
     roots.extend(var("TEST_TMPDIR"));
     let mut seen = std::collections::HashSet::new();
     roots.retain(|root| seen.insert(root.clone()));
@@ -475,6 +524,12 @@ fn absolute_only(dirs: &[PathBuf]) -> Vec<PathBuf> {
 /// name with `/` in it nests the bases one level deeper on Bazel 9 and
 /// earlier; those are not listed and are found by a link or not at all.
 ///
+/// The workspace root is itself a candidate root, with no caller naming
+/// it: a `_bazel_<user>` directory lies there when Bazel 8.1.0 or later
+/// ran from the root under an empty `TEST_TMPDIR` (probe C6 cell E11; see
+/// [`default_output_roots`]), and no environment this process reads
+/// later says so.
+///
 /// What the disk would not show is never read as absent: a directory that
 /// could not be listed, a link target or a candidate base that could not
 /// be read, and a marker that could not be opened each leave the answer
@@ -518,7 +573,10 @@ pub fn locate_output_base(workspace: &Path, candidates: &Candidates) -> Located 
     }
 
     let mut user_roots = absolute_only(&candidates.output_user_roots);
-    for root in absolute_only(&candidates.output_roots) {
+    // The workspace root first: see above. It is listed a second time
+    // only here, where no link named a base.
+    let output_roots = absolute_only(&candidates.output_roots);
+    for root in std::iter::once(workspace.clone()).chain(output_roots) {
         let entries = list(&root, MAX_LISTED, &mut listed_all).into_iter();
         let users = entries.filter(|e| e.file_name().as_encoded_bytes().starts_with(b"_bazel_"));
         user_roots.extend(users.map(|entry| entry.path()));
@@ -888,6 +946,90 @@ mod tests {
         // No path at all is no proof of anything.
         let nothing = classify(Path::new(""));
         assert_eq!((nothing.class, nothing.cannot_tell), (Plain, true));
+    }
+
+    /// A `..` in the path does not change what the entry is: a link
+    /// reached through one is the link, not the place it leads to, and
+    /// the `..` is taken by the disk, not by the spelling.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_reached_through_dot_dot_is_still_a_link() {
+        let disk = Scratch::new();
+        let more = "
+            {ws}/app/package.json
+            {ws}/dist/bin -> {base}/execroot/_main/bazel-out/k8/bin
+            {ws}/old-bin -> {base}/execroot/_main/bazel-out/k8-opt/bin
+            {ws}/ob -> {base}
+            {ws}/notes -> {ws}/app
+            {ws}/gone -> nowhere/execroot/_main";
+        disk.lay("ws", "root/_bazel_u/6d82", &[BASE, LINKS, more].join("\n"));
+        let classifier = Classifier::new();
+        let base = tree(OutputBase, disk.at("root/_bazel_u/6d82"));
+        for (dotted, plain, want) in [
+            // A project root given as `--cwd ..`, a pattern re-rooted at a
+            // parent.
+            ("ws/app/../bazel-bin", "ws/bazel-bin", Link),
+            ("ws/app/../dist/../bazel-proj", "ws/bazel-proj", Link),
+            ("ws/app/../dist/bin", "ws/dist/bin", Link),
+            ("ws/dist/../app/../dist/bin", "ws/dist/bin", Link),
+            // Stale: its base is live.
+            ("ws/app/../old-bin", "ws/old-bin", Link),
+            // A link to the root of a tree is that root, as spelled.
+            ("ws/app/../ob", "ws/ob", OutputBase),
+            // Below a link the path is where it is stored.
+            (
+                "ws/app/../bazel-bin/node_modules/left-pad",
+                "ws/bazel-bin/node_modules/left-pad",
+                OutputBase,
+            ),
+            (
+                "ws/app/../old-bin/new/file.js",
+                "ws/old-bin/new/file.js",
+                OutputBase,
+            ),
+            // Ordinary links and ordinary files stay what they are.
+            ("ws/app/../notes", "ws/notes", Plain),
+            ("ws/app/../gone", "ws/gone", Plain),
+            ("ws/dist/../app/package.json", "ws/app/package.json", Plain),
+        ] {
+            let spelled = disk.at(dotted);
+            assert!(has_parent_dir(&spelled), "{dotted}");
+            let verdict = classifier.classify(&spelled);
+            assert_eq!(
+                (verdict.class, verdict.cannot_tell),
+                (want, false),
+                "{dotted}"
+            );
+            if want == Link {
+                assert_eq!(verdict.tree, base, "{dotted}");
+            }
+            // In full, the answer of the same entry spelled without `..`.
+            assert_eq!(verdict, classifier.classify(&disk.at(plain)), "{dotted}");
+        }
+        // A walker's test of the entry agrees.
+        let own = classifier.tree_at(&disk.at("ws/app/../bazel-bin"));
+        assert_eq!((own.tree, own.cannot_tell), (base.clone(), false));
+
+        // The disk takes a `..` after a link from where the link leads:
+        // `bazel-proj/..` is `<base>/execroot`, not the workspace.
+        for (path, want) in [
+            ("ws/bazel-proj/../_main/bazel-out", OutputBase),
+            ("ws/bazel-bin/..", OutputBase),
+            ("ws/notes/..", Plain),
+            ("ws/app/..", Plain),
+        ] {
+            let verdict = classifier.classify(&disk.at(path));
+            assert_eq!(
+                (verdict.class, verdict.cannot_tell),
+                (want, false),
+                "{path}"
+            );
+            assert_eq!(
+                verdict.tree,
+                base.clone().filter(|_| want != Plain),
+                "{path}"
+            );
+        }
     }
 
     #[test]
@@ -1278,6 +1420,14 @@ mod tests {
         ];
         let want = paths(&["/home/u/.cache/bazel", "/tmp/t"]);
         assert_eq!(roots(linux, &vars, None), want);
+        // An empty `TEST_TMPDIR` is not unset to Bazel and names no
+        // directory (probe C6 cell E11): no root is listed for it, on any
+        // OS, and the roots of the other variables stay.
+        let vars = [("HOME", "/home/u"), ("TEST_TMPDIR", "")];
+        assert_eq!(roots(linux, &vars, None), paths(&["/home/u/.cache/bazel"]));
+        let want = paths(&["/var/tmp", "/home/u/Library/Caches/bazel"]);
+        assert_eq!(roots(mac, &vars, None), want);
+        assert_eq!(roots(windows, &vars, None), paths(&["/home/u"]));
 
         // A value that is not UTF-8 is a path all the same: the client
         // reads the bytes (`GetPathEnv`, `blaze_util_posix.cc`). It is not
@@ -1384,6 +1534,220 @@ mod tests {
         // A workspace that is not there has no base to name.
         let gone = locate_output_base(&disk.at("gone"), &by_flag);
         assert_eq!(gone, Located::CannotTell(Unsure::Unlisted));
+    }
+
+    /// Probe C6 cell E11: under an empty `TEST_TMPDIR`, Bazel 9.3.2 run
+    /// from a workspace root left `_bazel_<user>/<md5>` there. No
+    /// candidate root names that directory, and no environment read
+    /// later tells of it.
+    #[test]
+    fn a_user_root_in_the_workspace_root_is_found_with_no_candidate() {
+        // What that run left in the base, and a directory of the user's
+        // that only shares the prefix.
+        let left = "
+            {ws}/MODULE.bazel
+            {ws}/_bazel_notes/readme/
+            {base}/DO_NOT_BUILD_HERE
+            {base}/execroot/
+            {base}/server/
+            {base}/lock
+            {base}/README";
+        let disk = Scratch::new();
+        disk.lay("ws", "ws/_bazel_u/6d82", left);
+        let (ws, base) = (disk.at("ws"), disk.at("ws/_bazel_u/6d82"));
+        let unnamed = Candidates::default();
+        let own = found(base.clone(), Route::Enumeration);
+        assert_eq!(locate_output_base(&ws, &unnamed), own);
+        // A caller that names the workspace root as well names no second
+        // base.
+        let named = Candidates {
+            output_roots: vec![ws.clone()],
+            ..Candidates::default()
+        };
+        assert_eq!(locate_output_base(&ws, &named), own);
+        // Locating is for wording: the classifier never needed it.
+        let inside = classify(&base.join("execroot"));
+        assert_eq!(inside.tree, tree(OutputBase, base));
+
+        // A base there whose marker names another workspace is not this
+        // one's, as under any other root.
+        let shared = Scratch::new();
+        shared.lay("other", "ws/_bazel_u/aaaa", left);
+        shared.lay("ws", "", "{ws}/MODULE.bazel");
+        assert_eq!(
+            locate_output_base(&shared.at("ws"), &unnamed),
+            Located::NotFound
+        );
+
+        // The limit: a command typed in a directory below the root leaves
+        // its user root there, where only a caller's candidate finds it.
+        let below = Scratch::new();
+        below.lay("ws", "ws/sub/_bazel_u/6d82", left);
+        let ws = below.at("ws");
+        assert_eq!(locate_output_base(&ws, &unnamed), Located::NotFound);
+        let named = Candidates {
+            output_roots: vec![below.at("ws/sub")],
+            ..Candidates::default()
+        };
+        let own = found(below.at("ws/sub/_bazel_u/6d82"), Route::Enumeration);
+        assert_eq!(locate_output_base(&ws, &named), own);
+    }
+
+    /// The install base has no marker and no rule (see the module doc of
+    /// `bazel::output_tree`): everything in it is plain, and that is
+    /// known. What makes a rule unnecessary is held here: no name real
+    /// Bazel puts there is one that makes a directory a root of a run.
+    #[test]
+    fn an_install_base_in_the_checkout_is_no_tree_and_holds_no_root_marker() {
+        use crate::hosted::memory::roots::{marker_ecosystem, UNSUPPORTED_MARKERS};
+
+        // `--output_user_root=<ws>/our` after one command of real Bazel
+        // (the layout of 7.7.2, with the lock file 8.8.2 and later put
+        // beside the base): the output base, the install base, an empty
+        // repository cache.
+        let user_root = "
+            {ws}/MODULE.bazel
+            {base}/DO_NOT_BUILD_HERE
+            {base}/execroot/DO_NOT_BUILD_HERE
+            {base}/server/cmdline
+            {base}/README
+            {base}/lock
+            {ws}/our/cache/repos/v1/
+            {ws}/our/install/7b1f.lock
+            {ws}/our/install/7b1f/A-server.jar
+            {ws}/our/install/7b1f/build-label.txt
+            {ws}/our/install/7b1f/install_base_key
+            {ws}/our/install/7b1f/process-wrapper
+            {ws}/our/install/7b1f/embedded_tools/MODULE.bazel
+            {ws}/our/install/7b1f/embedded_tools/WORKSPACE
+            {ws}/our/install/7b1f/embedded_tools/tools/BUILD
+            {ws}/our/install/7b1f/embedded_tools/jdk/lib/jrt-fs.jar
+            {ws}/our/install/7b1f/embedded_tools/third_party/py/abseil/setup.py
+            {ws}/our/install/7b1f/embedded_tools/third_party/py/abseil/PKG-INFO
+            {ws}/our/install/7b1f/embedded_tools/third_party/py/abseil/absl_py.egg-info/requires.txt
+            {ws}/our/install/7b1f/platforms/WORKSPACE
+            {ws}/our/install/7b1f/rules_java/MODULE.bazel";
+        let disk = Scratch::new();
+        disk.lay("ws", "ws/our/2e6a", user_root);
+        let classifier = Classifier::new();
+        let base = tree(OutputBase, disk.at("ws/our/2e6a"));
+        assert_eq!(classifier.tree_at(&disk.at("ws/our/2e6a")).tree, base);
+        for dir in [
+            "ws/our",
+            "ws/our/cache/repos/v1",
+            "ws/our/install",
+            "ws/our/install/7b1f",
+            "ws/our/install/7b1f/embedded_tools",
+            "ws/our/install/7b1f/embedded_tools/third_party/py/abseil",
+            "ws/our/install/7b1f/platforms",
+        ] {
+            let at = disk.at(dir);
+            assert_eq!(classifier.tree_at(&at), Found::default(), "{dir}");
+            let names = file_names(&at);
+            let names = names.iter().map(OsString::as_os_str);
+            assert_eq!(classifier.trees_marked_by(&at, names), vec![], "{dir}");
+        }
+        for path in [
+            "ws/our/install/7b1f/A-server.jar",
+            "ws/our/install/7b1f/embedded_tools/MODULE.bazel",
+            "ws/our/install/7b1f/embedded_tools/third_party/py/abseil/setup.py",
+            "ws/our/install/7b1f/new/file.js",
+        ] {
+            let verdict = classifier.classify(&disk.at(path));
+            assert_eq!(
+                (verdict.class, verdict.cannot_tell),
+                (Plain, false),
+                "{path}"
+            );
+        }
+        // The output base's two links into it: a path spelled through the
+        // base is in the base.
+        if cfg!(unix) {
+            let links = "
+                {base}/install -> {ws}/our/install/7b1f
+                {base}/external/bazel_tools -> {ws}/our/install/7b1f/embedded_tools";
+            disk.lay("ws", "ws/our/2e6a", links);
+            for path in [
+                "ws/our/2e6a/install/A-server.jar",
+                "ws/our/2e6a/external/bazel_tools/tools/BUILD",
+            ] {
+                let verdict = classifier.classify(&disk.at(path));
+                assert_eq!(
+                    (verdict.class, verdict.tree, verdict.resolves_into),
+                    (OutputBase, base.clone(), None),
+                    "{path}"
+                );
+            }
+        }
+
+        // The names below the install bases of Bazel 5.4.1, 6.6.0, 7.7.2,
+        // 8.8.2, 9.3.2 and 10.0.0rc3 (macOS arm64) that read like a
+        // project's files: the top level, the boundary, build and Python
+        // packaging files, and every name that ends in `.txt`, `.json`,
+        // `.xml`, `.properties`, `.cfg`, `.jar`, `.zip` or `.egg-info`.
+        // None ends in `.toml`, `.yaml`, `.lock`, `.mod` or `.sum`. The
+        // other 643 are sources, scripts, templates, binaries and the
+        // embedded JDK.
+        const READ_LIKE_PROJECT_FILES: [&str; 50] = [
+            "A-server.jar",
+            "build-label.txt",
+            "build-runfiles",
+            "daemonize",
+            "embedded_tools",
+            "install_base_key",
+            "libcpu_profiler.dylib",
+            "linux-sandbox",
+            "platforms",
+            "process-wrapper",
+            "rules_java",
+            "xcode-locator",
+            "BUILD",
+            "BUILD.bazel",
+            "MODULE.bazel",
+            "WORKSPACE",
+            "Makefile",
+            "LICENSE",
+            "README",
+            "PKG-INFO",
+            "setup.py",
+            "setup.cfg",
+            "absl_py.egg-info",
+            "six.egg-info",
+            "requires.txt",
+            "dependency_links.txt",
+            "top_level.txt",
+            "SOURCES.txt",
+            "LICENSE.txt",
+            "README.txt",
+            "readme.txt",
+            "Copyright.txt",
+            "Xusage.txt",
+            "correct_file_format.txt",
+            "duplicated_key.txt",
+            "no_separator.txt",
+            "java_stub_template.txt",
+            "python_bootstrap_template.txt",
+            "pywrapper_template.txt",
+            "chm_only_desugar_jdk_libs.json",
+            "java.xml",
+            "win_manifest.xml",
+            "jaxp.properties",
+            "logging.properties",
+            "net.properties",
+            "no_se_linux.properties",
+            "jvm.cfg",
+            "minify_java8_legacy_libs.cfg",
+            "jrt-fs.jar",
+            "snapshots.img.zip",
+        ];
+        for name in READ_LIKE_PROJECT_FILES {
+            assert_eq!(marker_ecosystem(name), None, "{name}");
+            let unsupported = UNSUPPORTED_MARKERS.iter().find(|row| row.1.contains(&name));
+            assert_eq!(unsupported, None, "{name}");
+            // Nor is any of them a marker of a tree.
+            let marked = output_tree::marked_dir(Path::new("install"), OsStr::new(name));
+            assert_eq!(marked, None, "{name}");
+        }
     }
 
     #[test]

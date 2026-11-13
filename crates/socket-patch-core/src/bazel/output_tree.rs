@@ -22,6 +22,52 @@
 //! answers them for a list of paths (the in-memory engine). The verdict is
 //! used to refuse and to prune, never to choose a place to write or a tree
 //! to crawl.
+//!
+//! # The install base has no rule
+//!
+//! One more directory is Bazel's: the install base,
+//! `<output_user_root>/install/<md5>`, where the client unpacks Bazel
+//! itself. It carries no marker, none of the files the rules below ask
+//! for, so where a workspace keeps its output user root inside the
+//! checkout a walk enters it, and a scope inside it is not refused. It
+//! gets no rule, because it holds nothing socket-patch takes for a project
+//! or for an installed package.
+//!
+//! That is read from real install bases, not from memory: Bazel 5.4.1,
+//! 6.6.0, 7.7.2, 8.8.2, 9.3.2 and 10.0.0rc3, each started once with
+//! `--output_user_root=<workspace>/our` (macOS arm64, 2026-11-12; the
+//! bases of Linux and Windows were not listed). Each base is 369 to 616
+//! files in 93 to 154 directories, with no link: the server jar, the
+//! client's helper binaries, `install_base_key`, and the directories
+//! `embedded_tools`, `platforms` and (7.7.2) `rules_java`. Among the 693
+//! distinct names below the six:
+//!
+//! - none is a file that makes a directory a root of a run: no lock file
+//!   of any ecosystem, no `requirements.txt`, no `go.mod`;
+//! - none is a manifest a member walk reads (`package.json`,
+//!   `Cargo.toml`, `pyproject.toml`, `pom.xml`, a Gradle script);
+//! - no directory is called `node_modules`, `vendor` or `site-packages`,
+//!   where the crawlers look for installed packages. The nearest thing is
+//!   an unpacked source tree, `embedded_tools/third_party/py/abseil` with
+//!   a `setup.py` and an `.egg-info` (through 9.3.2), under no site
+//!   directory;
+//! - the Bazel boundary files (`MODULE.bazel` and `WORKSPACE` in
+//!   `embedded_tools`, `platforms` and `rules_java`) are looked for from
+//!   a project upward and never downward.
+//!
+//! So a walk that enters an install base reads a few hundred entries and
+//! finds nothing, while a rule would cost every directory of every walk
+//! one more `stat`. A test in `crawlers::bazel_output` holds the names
+//! that read most like project files against the root markers: a marker
+//! added later under one of those names has to bring a rule with it.
+//!
+//! The output base reaches into the install base through two links,
+//! `<base>/install` and `<base>/external/bazel_tools`. A path spelled
+//! through either is in the output base, and is refused as such. In the
+//! same run 9.3.2 and 10.0.0rc3 ended every command, `shutdown` included,
+//! with exit 2 ("The repo contents cache ... is inside the main repo"):
+//! there an output user root inside the workspace builds nothing while
+//! the contents cache stays in it. 5.4.1 to 8.8.2 ran.
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
@@ -293,7 +339,10 @@ pub fn marked_dir(dir: &Path, name: &OsStr) -> Option<PathBuf> {
 ///
 /// A path with a `..` segment is not walked: `a/b/../c` is not below
 /// `a/b`, and only the disk knows what `b/..` is when `b` is a link. The
-/// answer is then `cannot_tell`, and the caller judges the resolved form.
+/// answer is then `cannot_tell`, and the caller has the disk place the
+/// path first: `crawlers::bazel_output` resolves the directory that holds
+/// the entry and keeps the entry's own name, so that a link reached
+/// through `..` is still judged as a link.
 pub fn enclosing(fs: &dyn TreeFs, path: &Path, memo: &mut Memo) -> Found {
     if path.components().any(|c| c == Component::ParentDir) {
         return Found {
