@@ -202,7 +202,7 @@ mod tests {
     #[test]
     fn the_corpus_of_real_files_reads_to_its_goldens() {
         let files = corpus();
-        assert_eq!(files.len(), 25, "a corpus file was added or lost");
+        assert_eq!(files.len(), 26, "a corpus file was added or lost");
         let mut seen = BTreeMap::new();
         for (name, bytes) in &files {
             let file = read(bytes, dialect_of(name)).unwrap_or_else(|e| {
@@ -219,7 +219,7 @@ mod tests {
         let count = |key: &str| seen.get(key).copied().unwrap_or(0);
         assert_eq!(
             (count("Module"), count("Workspace"), count("Bzl")),
-            (16, 7, 2)
+            (16, 8, 2)
         );
         assert_eq!((count("Crlf"), count("Mixed")), (1, 0));
     }
@@ -415,7 +415,7 @@ mod tests {
             listed.insert(dir.join(rel));
         }
         assert_eq!(listed, on_disk);
-        assert_eq!(listed.len(), 238);
+        assert_eq!(listed.len(), 239);
         // No fixture has the name of a file Bazel takes for a boundary.
         let boundary = [
             "MODULE.bazel",
@@ -534,7 +534,7 @@ mod tests {
             paths.sort();
             inputs.extend(paths.iter().map(|p| std::fs::read(p).expect("vector")));
         }
-        assert_eq!(inputs.len(), 25 + 181 + 27);
+        assert_eq!(inputs.len(), 26 + 181 + 27);
         let mut rng = Rng::new(0x5714);
         let mut cases = 0;
         for bytes in &inputs {

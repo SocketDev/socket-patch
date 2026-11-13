@@ -1,5 +1,5 @@
 f577a2c6662fa7f7221a4452afcbbbc0e9e7554aa83d147295fd9a39137aa8e0  .gitattributes
-9eb1bdfe15d7b900931bcb422bfae6312e1136a8aa3eae6169421a329899ddf1  README.md
+14e602bc025e8dcff376de625bc63af333faec24dedbab7b7089caeba6c8f5c3  README.md
 bf7ba9edd293a7870c9bed8453aa10fb0accacc5772ce66e2bf40156b1aa57ea  corpus/aspect_rules_py-2.0.0-alpha.11-uv-overrides-setup.MODULE.bazel
 82bf6aec93db399f7e3ae13b6a4e2ee6a7156eab039f17e089024be164a1fcc1  corpus/bazelbuild-bazel-6.5.0.WORKSPACE
 7c1951d2bc8d259958201db29620de648ca367476b97651c677101fb3a63246d  corpus/bazelbuild-bazel-9.3.2.MODULE.bazel
@@ -20,6 +20,7 @@ a74055a23ae0f11de4642abe1365bf6b6ded407b5bb59dabd87ecd35a2c51d2e  corpus/rules_n
 bce6edcc23742075f55b4a070aa15008135435a03269425419e45a04dd0dc1b2  corpus/rules_pycross-2.0.1-build_setuptools.MODULE.bazel
 15cb6a854ea6286f17b51efbf5088e8b66cdb3eb9b884291daff2292d540da46  corpus/rules_pycross-2.0.1-openssl-repositories.MODULE.bazel
 643f5ef3f3a63864bff7ccf29e67bb6981d89e7487fc2ec0c12c03fdaeae0eb4  corpus/rules_python-0.31.0-gazelle-deps.bzl
+3b43beec115564ba69302657a65dc8292969d66ce1acdc227758ea2799fe38d4  corpus/rules_python-0.31.0-multi_python_versions.WORKSPACE
 8fd0c695e6aa343ab5ba21e8f1e66c62f48439e5f564e183f9c9e2d55a095cd7  corpus/rules_python-0.31.0-pip_parse.WORKSPACE
 a5b3823fa10f3896e3429b8ef7a57bce354a117f3fdfebc686442d76712571de  corpus/rules_python-1.7.0-bzlmod.MODULE.bazel
 8cb1c0d09340159fe82a715773faaabd6adf29f9c087617f995ef6c00ddd19db  corpus/rules_ruby-0.29.0-gem.MODULE.bazel

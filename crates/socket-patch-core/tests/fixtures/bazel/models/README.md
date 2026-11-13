@@ -38,4 +38,4 @@ after an intended change (review the diff).
 | `s2.golden` | `module_file`: `s2_cells_read_to_their_goldens_and_agree_with_bazel` | the model of each S2 cell. The test also holds the tags of each cell against `seen` |
 | `corpus-modules.golden` | `module_file`: `real_module_files_read` | counts for the 16 real `MODULE.bazel` files of `../starlark/corpus/` |
 | `ws-order.golden` | `workspace_file`: `governing_gives_the_definition_bazel_built_for_the_20_s6_cases` | per S6 case what Bazel built, what `bazel query` showed, and the verdict of `governing("dep")` |
-| `corpus-workspaces.golden` | `workspace_file`: `real_workspace_files_read` | counts for the 7 real `WORKSPACE` files of `../starlark/corpus/` |
+| `corpus-workspaces.golden` | `workspace_file`: `real_workspace_files_read` | counts for the 8 real `WORKSPACE` files of `../starlark/corpus/` |

@@ -40,6 +40,7 @@ and review the diff. The file name decides the dialect: `*MODULE.bazel` is a mod
 | `rules_js-3.6.0-npm_translate_lock.MODULE.bazel` | aspect-build/rules_js `v3.6.0`: `e2e/npm_translate_lock/MODULE.bazel` | `npm.npm_translate_lock` with lock, npmrc and data labels |
 | `rules_python-1.7.0-bzlmod.MODULE.bazel` | bazel-contrib/rules_python `1.7.0`: `examples/bzlmod/MODULE.bazel` | `pip.parse` per Python version, `pip.override`, dict attributes |
 | `rules_python-0.31.0-pip_parse.WORKSPACE` | bazel-contrib/rules_python `0.31.0`: `examples/pip_parse/WORKSPACE` | WORKSPACE `pip_parse` |
+| `rules_python-0.31.0-multi_python_versions.WORKSPACE` | bazel-contrib/rules_python `0.31.0`: `examples/multi_python_versions/WORKSPACE` | WORKSPACE `multi_pip_parse`, loaded from the toolchains repository: dict attributes keyed by Python version, and a top-level constant passed by name to two calls |
 | `rules_python-0.31.0-gazelle-deps.bzl` | bazel-contrib/rules_python `0.31.0`: `gazelle/deps.bzl` | a repository macro: `go_repository` calls in a `def` body, behind a wrapper `def` |
 | `rules_jvm_external-6.7-bzlmod_lock_files.MODULE.bazel` | bazel-contrib/rules_jvm_external `6.7`: `tests/integration/bzlmod_lock_files/MODULE.bazel` | `maven.install` with `lock_file` |
 | `rules_jvm_external-5.3-simple.WORKSPACE` | bazel-contrib/rules_jvm_external `5.3`: `examples/simple/WORKSPACE` | WORKSPACE `maven_install` |
@@ -62,6 +63,24 @@ and review the diff. The file name decides the dialect: `*MODULE.bazel` is a mod
 | `bcr-libsl3-1.2.53004.MODULE.bazel` | bazelbuild/bazel-central-registry `bdcd04501`: `modules/libsl3/1.2.53004/MODULE.bazel` | a triple-quoted docstring |
 
 Each file keeps the licence of its repository (Apache-2.0 for all of the above).
+
+A real file that a test of the Bazel readers needs goes here, also when only one ruleset
+recognizer reads it; the tests of `bazel/rulesets/*.rs` read theirs from this directory by
+name. A copy inside a Rust string has no checksum and no row above, and a checkout may
+convert its line endings. To add a file:
+
+1. Copy its bytes to `corpus/<repository>-<tag>-<what>` with the ending that gives its
+   dialect, and add its row above.
+2. Write its golden with the command above.
+3. Add its line to `SHA256SUMS` and renew the line of this README, which the new row
+   changed (`reduce.py` rewrites the whole list).
+4. Raise the counts the tests hold: the corpus size, the dialect counts and the number of
+   listed inputs in `starlark/mod.rs`. The models of `bazel/module_file.rs` and
+   `bazel/workspace_file.rs` read every `*.MODULE.bazel` and every `*.WORKSPACE` here as
+   well: `real_module_files_read` and `real_workspace_files_read` hold a count each, and
+   a row per file in `../models/corpus-modules.golden` and
+   `../models/corpus-workspaces.golden` (`../models/README.md` says how to regenerate
+   them).
 
 ## `s5/`: what Bazel accepts
 
