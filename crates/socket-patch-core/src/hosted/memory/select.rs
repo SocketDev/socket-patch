@@ -11,9 +11,11 @@
 //! inside a tree Bazel owns (an output base, a cache or a vendor directory
 //! kept in the repository) is a root or is streamed. And the boundary
 //! files, the `.bazelrc` and the socket-owned `.socket/bazel/` directory
-//! of every Bazel root at or above a project root are streamed, so the
-//! session can tell which ecosystems Bazel builds there and leave them
-//! alone (`super::bazel`).
+//! of every Bazel root at or above a project root are streamed, and of
+//! every Bazel root at or above a lock that is streamed from another
+//! directory (a root's run pins a pnpm member's own lock and a Rush lock
+//! too), so the session can tell which ecosystems Bazel builds there and
+//! leave them alone (`super::bazel`).
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -572,9 +574,20 @@ pub fn select_paths(entries: &[TreeEntryInput], options: &SelectOptions) -> Path
         }
     }
 
-    // What says which ecosystems Bazel builds in a root (HZ-20): the
-    // session reads these as text, and leaves alone what they claim.
-    for path in super::bazel::selected(&roots, &blobs) {
+    // What says which ecosystems Bazel builds (HZ-20): the session reads
+    // these, and leaves alone what they claim. A run is judged by every
+    // lock it pins, and a root's run pins locks in other directories (a
+    // pnpm member's own, a Rush lock), so the Bazel roots above each
+    // streamed lock are asked for like the ones above a project root.
+    let mut above: BTreeSet<String> = roots.iter().cloned().collect();
+    for (path, need) in &needs {
+        let (dir, base) = split_path(path);
+        if *need == Need::Text && super::roots::marker_ecosystem(base).is_some() {
+            above.insert(dir.to_string());
+        }
+    }
+    let above: Vec<String> = above.into_iter().collect();
+    for path in super::bazel::selected(&above, &blobs) {
         needs.insert(path.to_string(), Need::Text);
     }
 
@@ -618,11 +631,11 @@ pub fn candidate_files() -> Vec<String> {
         .collect();
     for pattern in super::bazel::ROOT_FILES {
         out.insert(format!(
-            "{pattern} (Bazel roots at or above a project root)"
+            "{pattern} (Bazel roots at or above a project root or a streamed lock)"
         ));
     }
     for pattern in [
-        ".socket/bazel/** (Bazel roots at or above a project root)",
+        ".socket/bazel/** (Bazel roots at or above a project root or a streamed lock)",
         "rush.json",
         RUSH_COMMON_LOCK_REL,
         RUSH_REPO_STATE_REL,
@@ -987,6 +1000,49 @@ mod tests {
         let s = select_paths(&linked, &SelectOptions::default());
         assert_eq!(s.symlinks, ["MODULE.bazel"]);
         assert!(!s.fetch_text.contains(&"MODULE.bazel".to_string()));
+    }
+
+    /// A root's run pins locks in other directories (a Rush lock, a pnpm
+    /// member's own), and a hub that names one governs that run: the
+    /// Bazel roots above each streamed lock are streamed like the ones
+    /// above a project root. A Bazel root above no root and no lock is
+    /// still not looked for.
+    #[test]
+    fn the_bazel_roots_above_a_lock_another_root_reads_are_streamed() {
+        let listed = [
+            "rush.json",
+            "common/config/rush/pnpm-lock.yaml",
+            "common/config/rush/MODULE.bazel",
+            "common/config/rush/.bazelrc",
+            "common/config/WORKSPACE",
+            "common/config/subspaces/web/pnpm-lock.yaml",
+            "common/config/subspaces/web/REPO.bazel",
+            "common/temp/MODULE.bazel",
+            "tools/MODULE.bazel",
+        ];
+        let entries: Vec<TreeEntryInput> = listed.iter().map(|path| blob(path)).collect();
+        let named = SelectOptions {
+            project_roots: Some(vec!["".into()]),
+            ..SelectOptions::default()
+        };
+        for options in [SelectOptions::default(), named] {
+            let s = select_paths(&entries, &options);
+            assert_eq!(s.roots, [""]);
+            let bazel = |path: &&String| {
+                let base = split_path(path).1;
+                base.contains("bazel") || base.starts_with("WORKSPACE")
+            };
+            let streamed: Vec<&String> = s.fetch_text.iter().filter(bazel).collect();
+            assert_eq!(
+                streamed,
+                [
+                    "common/config/WORKSPACE",
+                    "common/config/rush/.bazelrc",
+                    "common/config/rush/MODULE.bazel",
+                    "common/config/subspaces/web/REPO.bazel",
+                ]
+            );
+        }
     }
 
     #[test]

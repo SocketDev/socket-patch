@@ -67,7 +67,7 @@ use std::path::{Path, PathBuf};
 
 use crate::bazel::output_tree::PathClass;
 use crate::crawlers::bazel_output::Classifier;
-use crate::crawlers::bazel_workspace::tree_classifier;
+use crate::crawlers::bazel_workspace::{tree_classifier, TreeClassifiers};
 
 /// The substring every shared-store refusal carries, so callers and tests
 /// can recognize it without matching the full sentence.
@@ -263,23 +263,26 @@ pub async fn bazel_tree_of(scope_root: &Path) -> Option<SharedStore> {
 }
 
 /// Whether each of `scope_roots` is in or links into a Bazel tree
-/// ([`bazel_tree_of`]), for a run that holds several candidate directories
-/// (the matches of a PATH glob). One classifier judges them all, so the
-/// directories above them, which siblings share, are walked once.
+/// ([`bazel_tree_of`]), for a run that holds several candidate directories:
+/// the matches of PATH globs, the projects a search found.
+///
+/// Each directory gets the answer its own run gets from [`bazel_tree_of`],
+/// which is the point: a directory left in here is handed to such a run,
+/// and that run refuses a tree. So each is judged through the classifier
+/// of the Bazel roots above it ([`TreeClassifiers`]), whose rc files may
+/// name a vendor directory no other root knows. The directories need not
+/// share those roots: the matches of `*/*` lie in as many workspaces as
+/// the checkout holds. Directories that do share them share a classifier,
+/// so the ancestors they have in common are walked once.
 ///
 /// A classifier that could not run answers `false` for every directory:
 /// the run that then starts in one still asks [`bazel_tree_of`] about it.
 pub async fn in_bazel_tree(scope_roots: Vec<PathBuf>) -> Vec<bool> {
     let count = scope_roots.len();
     tokio::task::spawn_blocking(move || {
-        // The directories are the matches of one glob, so they share the
-        // Bazel roots above them: the first one's tracked vendor
-        // directories are everyone's.
-        let bazel = match scope_roots.first() {
-            Some(first) => tree_classifier(first),
-            None => Classifier::new(),
-        };
-        let in_tree = |root: &PathBuf| bazel.classify(root).class != PathClass::Plain;
+        let classifiers = TreeClassifiers::new();
+        let in_tree =
+            |root: &PathBuf| classifiers.for_dir(root).classify(root).class != PathClass::Plain;
         scope_roots.iter().map(in_tree).collect()
     })
     .await
@@ -1673,6 +1676,102 @@ mod tests {
             [true, false, true, false, true]
         );
         assert_eq!(in_bazel_tree(Vec::new()).await, [false; 0]);
+    }
+
+    /// HZ-03 with no marker (ROUTED R-032): a vendor directory that only
+    /// a tracked `--vendor_dir` names. Every check that keeps a write or a
+    /// run out of Bazel's trees reads the rc files of the Bazel roots
+    /// above the path it judges: the package check, the check of each
+    /// directory a patch writes into, the scope check, and the check of
+    /// several directories at once, where each directory has roots of its
+    /// own. The same tree without the rc line is an ordinary install.
+    #[tokio::test]
+    async fn a_vendor_directory_only_an_rc_file_names_is_a_tree_to_every_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        for ws in ["a", "b"] {
+            lay(
+                &root.join(ws),
+                &[
+                    "MODULE.bazel",
+                    "app/node_modules/left-pad/index.js",
+                    "third_party/dep/node_modules/left-pad/index.js",
+                    "third_party/pip/site-packages/urllib3/response.py",
+                ],
+            );
+        }
+        lay(root, &["plain/node_modules/left-pad/index.js"]);
+        let rc = |ws: &str, text: &str| {
+            std::fs::write(root.join(ws).join(".bazelrc"), text).unwrap();
+        };
+        let vendored = |ws: &str| {
+            let dep = root.join(ws).join("third_party").join("dep");
+            dep.join("node_modules").join("left-pad")
+        };
+        let site = |ws: &str| {
+            let pip = root.join(ws).join("third_party").join("pip");
+            pip.join("site-packages")
+        };
+        let own = |ws: &str| {
+            root.join(ws)
+                .join("app")
+                .join("node_modules")
+                .join("left-pad")
+        };
+        let package = |pkg: PathBuf| async move {
+            let mut kinds = Vec::new();
+            for scope in [ReadScope::Workspace, ReadScope::Global] {
+                let store = shared_store_of(scope, &pkg).await;
+                kinds.push(store.map(|store| store.kind));
+            }
+            assert_eq!(kinds[0], kinds[1], "{}", pkg.display());
+            kinds.remove(0)
+        };
+        let several = || {
+            let dirs = [
+                root.join("a").join("app"),
+                root.join("a").join("third_party"),
+                root.join("b").join("app"),
+                root.join("b").join("third_party").join("dep"),
+                root.join("plain"),
+            ];
+            in_bazel_tree(dirs.to_vec())
+        };
+
+        // Each workspace names the directory in its own way.
+        rc("a", "common --vendor_dir=third_party\n");
+        rc("b", "build:ci --vendor_dir=./third_party/\n");
+        let tree = Some(SharedStoreKind::BazelTree(PathClass::VendorDir));
+        for ws in ["a", "b"] {
+            assert_eq!(package(vendored(ws)).await, tree, "{ws}");
+            assert_eq!(kind_of(&vendored(ws), &["index.js"]).await, tree, "{ws}");
+            // A file the patch adds, in a directory it would create.
+            let added = kind_of(&vendored(ws), &["lib/new/added.js"]).await;
+            assert_eq!(added, tree, "{ws}");
+            // A PyPI patch is rooted at `site-packages`.
+            let pypi = kind_of(&site(ws), &["urllib3/response.py"]).await;
+            assert_eq!(pypi, tree, "{ws}");
+            let scope = bazel_tree_of(&root.join(ws).join("third_party")).await;
+            assert_eq!(scope.map(|store| store.kind), tree, "{ws}");
+            // The workspace's own install is what it was.
+            assert_eq!(package(own(ws)).await, None, "{ws}");
+            assert_eq!(kind_of(&own(ws), &["index.js"]).await, None, "{ws}");
+            assert!(bazel_tree_of(&root.join(ws)).await.is_none(), "{ws}");
+        }
+        assert_eq!(several().await, [false, true, false, true, false]);
+
+        // No such line: every one of them is an install like any other.
+        rc("a", "build --jobs=4\n");
+        std::fs::remove_file(root.join("b").join(".bazelrc")).unwrap();
+        for ws in ["a", "b"] {
+            assert_eq!(package(vendored(ws)).await, None, "{ws}");
+            assert_eq!(kind_of(&vendored(ws), &["index.js"]).await, None, "{ws}");
+            let pypi = kind_of(&site(ws), &["urllib3/response.py"]).await;
+            assert_eq!(pypi, None, "{ws}");
+            let scope = bazel_tree_of(&root.join(ws).join("third_party")).await;
+            assert!(scope.is_none(), "{ws}");
+        }
+        assert_eq!(several().await, [false; 5]);
     }
 
     #[test]

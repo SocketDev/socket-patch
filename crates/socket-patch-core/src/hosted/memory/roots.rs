@@ -22,7 +22,8 @@ use std::sync::{Arc, Mutex, PoisonError};
 use crate::bazel::codes::Code;
 use crate::bazel::output_tree;
 use crate::crawlers::bazel_output::Classifier;
-use crate::crawlers::bazel_workspace::tracked_vendor_dirs;
+use crate::crawlers::bazel_root::BOUNDARY_FILES;
+use crate::crawlers::bazel_workspace::TreeClassifiers;
 use crate::formats::registry;
 use crate::utils::python_lock::is_python_lock_name;
 
@@ -441,11 +442,19 @@ const MAX_WALKED_ENTRIES: usize = 500_000;
 ///
 /// Nor does it enter a tree Bazel owns ([`BazelTreesMet`]): nothing below
 /// the root of one is read, and what the root itself holds is dropped.
-/// The classifier knows the vendor directories that the tracked rc files
-/// of the Bazel roots at and above `dir` name (`tracked_vendor_dirs`), so
-/// one that holds no marker yet is not entered either. An rc file of a Bazel
-/// root the walk meets below `dir` is not read for it: that root's own
-/// run reads it.
+/// That includes the vendor directories that tracked rc files name, which
+/// may hold no marker yet: those of the Bazel roots at and above `dir`,
+/// known before the walk starts, and those of every Bazel root the walk
+/// meets below `dir`, read when it lists that root's boundary file
+/// (`TreeClassifiers::vendor_dirs`). The second half is what makes the
+/// walk agree with the check each directory's own run makes
+/// (`shared_store::bazel_tree_of`, which reads the rc files of the roots
+/// above that directory): a root this walk returned is handed to such a
+/// run, and one inside a nested workspace's vendor directory would be
+/// refused there, failing a scan of the whole checkout. A directory lists
+/// its entries in no particular order, so the walk may be inside such a
+/// vendor directory before it has seen the boundary file beside it; what
+/// it found there is dropped when the walk is done.
 ///
 /// One limit, on purpose. A tree root is judged when the walk is about to
 /// enter one of its subdirectories, or by a marker among the entries the
@@ -459,24 +468,32 @@ const MAX_WALKED_ENTRIES: usize = 500_000;
 /// holds a lockfile, which every project of every other repository would
 /// pay for.
 fn marker_paths_below(dir: &Path) -> WalkedMarkers {
-    let tracked = tracked_vendor_dirs(dir);
-    let mut met = BazelTreesMet::default();
+    let classifiers = TreeClassifiers::new();
+    let tracked = classifiers.vendor_dirs(dir);
     // A tracked vendor directory is a root before the walk meets it: it
     // may hold no marker and no subdirectory to be judged by. The tracked
     // directories lie under resolved roots, and the walk spells what it
     // meets from `dir` as given, so each is re-spelled below `dir`. The
     // walked directory itself is the caller's to judge.
-    if let Some(real) = std::fs::canonicalize(dir)
-        .ok()
-        .filter(|_| !tracked.is_empty())
-    {
-        let below = tracked.iter().filter_map(|at| at.strip_prefix(&real).ok());
-        for at in below.filter(|rel| !rel.as_os_str().is_empty()) {
-            let spelled = dir.join(at);
-            if spelled.is_dir() {
-                met.note(spelled);
-            }
+    let mut real: Option<PathBuf> = None;
+    let mut spelled_below = |tracked: &[PathBuf]| -> Vec<PathBuf> {
+        if tracked.is_empty() {
+            return Vec::new();
         }
+        if real.is_none() {
+            real = std::fs::canonicalize(dir).ok();
+        }
+        let Some(real) = real.as_deref() else {
+            return Vec::new();
+        };
+        let below = tracked.iter().filter_map(|at| at.strip_prefix(real).ok());
+        let below = below.filter(|rel| !rel.as_os_str().is_empty());
+        let spelled = below.map(|rel| dir.join(rel));
+        spelled.filter(|spelled| spelled.is_dir()).collect()
+    };
+    let mut met = BazelTreesMet::default();
+    for root in spelled_below(&tracked) {
+        met.note(root);
     }
     let classifier = Arc::new(Classifier::with_vendor_dirs(tracked));
     let met = Arc::new(Mutex::new(met));
@@ -504,6 +521,7 @@ fn marker_paths_below(dir: &Path) -> WalkedMarkers {
         })
         .build();
     let mut found = WalkedMarkers::default();
+    let mut nested_roots: HashSet<PathBuf> = HashSet::new();
     for (seen, entry) in walk.flatten().enumerate() {
         if seen >= MAX_WALKED_ENTRIES {
             found.truncated = true;
@@ -522,10 +540,25 @@ fn marker_paths_below(dir: &Path) -> WalkedMarkers {
                 .unwrap_or_else(PoisonError::into_inner)
                 .note(marked);
         }
-        let is_marker = entry
-            .file_name()
-            .to_str()
-            .is_some_and(|base| marker_ecosystem(base).is_some());
+        let name = entry.file_name().to_str();
+        // A Bazel root below the walked directory: its rc files name
+        // vendor directories that no root above it knows. (Depth 1 is the
+        // walked directory itself, whose roots were read before the walk.)
+        // The probe decides whether the name is a boundary file at all.
+        let nested = name.is_some_and(|name| BOUNDARY_FILES.contains(&name));
+        let nested = entry
+            .path()
+            .parent()
+            .filter(|_| nested && entry.depth() > 1);
+        // Once per directory, however many boundary files it holds.
+        if let Some(root) = nested.filter(|root| nested_roots.insert(root.to_path_buf())) {
+            let tracked = classifiers.vendor_dirs(root);
+            let mut met = met.lock().unwrap_or_else(PoisonError::into_inner);
+            for vendor_dir in spelled_below(&tracked) {
+                met.note(vendor_dir);
+            }
+        }
+        let is_marker = name.is_some_and(|base| marker_ecosystem(base).is_some());
         if is_marker {
             found.markers.extend(relative_slashed(dir, entry.path()));
         }
@@ -1265,6 +1298,92 @@ mod tests {
         std::fs::remove_dir_all(ws.join("third_party").join("bazel")).unwrap();
         let found = roots_below(&ws, None, |_| true).await;
         assert!(found.bazel_trees.is_empty());
+    }
+
+    /// The walk hands each root it returns to a run of its own, and that
+    /// run reads the rc files of the Bazel roots above its directory. So
+    /// the walk reads the rc file of every Bazel root it meets below the
+    /// walked directory as well: a workspace nested in the checkout, two
+    /// workspaces side by side, a workspace in a workspace. A root it
+    /// returned inside one of their vendor directories would be refused by
+    /// its run, and the scan of the whole checkout with it.
+    #[tokio::test]
+    async fn the_walk_reads_the_rc_file_of_a_bazel_root_it_meets() {
+        let tmp = tempfile::tempdir().unwrap();
+        let top = tmp.path().canonicalize().unwrap();
+        let at = |rel: &str| rel.split('/').fold(top.clone(), |dir, name| dir.join(name));
+        let write = |rel: &str, text: &str| {
+            let path = at(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        };
+        for lock in [
+            "web/yarn.lock",
+            "a/app/yarn.lock",
+            "a/third_party/bazel/+npm+dep/yarn.lock",
+            "a/third_party/other/yarn.lock",
+            "b/WORKSPACE",
+            "b/deps/yarn.lock",
+            "b/inner/MODULE.bazel",
+            "b/inner/REPO.bazel",
+            "b/inner/vendored/x/yarn.lock",
+            "b/inner/app/yarn.lock",
+            // Named by no root above it: `vendored` is `b/inner`'s word.
+            "b/vendored/yarn.lock",
+        ] {
+            write(lock, "");
+        }
+        write("a/MODULE.bazel", "");
+        let everything = [
+            "a/app",
+            "a/third_party/bazel/+npm+dep",
+            "a/third_party/other",
+            "b/deps",
+            "b/inner/app",
+            "b/inner/vendored/x",
+            "b/vendored",
+            "web",
+        ];
+        let found = roots_below(&top, None, |_| true).await;
+        assert_eq!(found.roots, everything);
+        assert!(found.bazel_trees.is_empty());
+
+        write("a/.bazelrc", "common --vendor_dir=third_party/bazel\n");
+        write("b/.bazelrc", "build:ci --vendor_dir=./deps\n");
+        write("b/inner/.bazelrc", "vendor --vendor_dir=vendored\n");
+        let found = roots_below(&top, None, |_| true).await;
+        let kept = [
+            "a/app",
+            "a/third_party/other",
+            "b/inner/app",
+            "b/vendored",
+            "web",
+        ];
+        assert_eq!(found.roots, kept);
+        let trees = ["a/third_party/bazel", "b/deps", "b/inner/vendored"];
+        assert_eq!(found.bazel_trees, trees);
+        // From one of the workspaces, and from between two of them.
+        let found = roots_below(&at("b"), None, |_| true).await;
+        assert_eq!(found.roots, ["inner/app", "vendored"]);
+        assert_eq!(found.bazel_trees, ["deps", "inner/vendored"]);
+        // Each root the walk returned is outside every tree by the test
+        // its own run makes, and each it left out is inside one.
+        let class = |rel: &str| {
+            let dir = at(rel);
+            crate::crawlers::bazel_workspace::tree_classifier(&dir)
+                .classify(&dir)
+                .class
+        };
+        for root in kept {
+            assert_eq!(class(root), output_tree::PathClass::Plain, "{root}");
+        }
+        for root in [
+            "a/third_party/bazel/+npm+dep",
+            "b/deps",
+            "b/inner/vendored/x",
+        ] {
+            assert_eq!(class(root), output_tree::PathClass::VendorDir, "{root}");
+        }
     }
 
     /// A build leaves links into its output base in the workspace. The

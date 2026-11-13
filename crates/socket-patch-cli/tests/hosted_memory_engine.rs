@@ -838,6 +838,12 @@ async fn bazel_claimed_ecosystem_skipped() {
     let mut repo = npm_files();
     repo.extend(prefixed("web", &npm_files()));
     repo.insert("MODULE.bazel".into(), module.as_bytes().to_vec());
+    // The lock the hub names is in the session: a hub whose lock the
+    // session does not hold may read any project's, and would claim `web`
+    // too (e2e_bazel `memory::` has those cases).
+    let hub_lock = fixtures_root().join("redirect/npm/pnpm/basic/input/pnpm-lock.yaml");
+    let hub_lock = std::fs::read(hub_lock).expect("the pnpm fixture lock");
+    repo.insert("pnpm-lock.yaml".into(), hub_lock);
     let output = run_engine(&server, build_input(&repo, &[], options(false))).await;
 
     let roots: Vec<&str> = output.projects.iter().map(|p| p.root.as_str()).collect();
@@ -863,9 +869,10 @@ async fn bazel_claimed_ecosystem_skipped() {
         said[0].detail
     );
 
-    // Bazel is what made the difference: without the workspace file the
-    // root is pinned like `web`, and nothing is said.
+    // Bazel is what made the difference: without the workspace file and
+    // its lock the root is pinned like `web`, and nothing is said.
     repo.remove("MODULE.bazel");
+    repo.remove("pnpm-lock.yaml");
     let output = run_engine(&server, build_input(&repo, &[], options(false))).await;
     assert!(output.projects.iter().all(|p| p.redirected.len() == 1));
     assert!(output.warnings.iter().all(|w| w.code != code));

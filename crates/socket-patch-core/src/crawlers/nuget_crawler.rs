@@ -2884,4 +2884,52 @@ mod tests {
         std::fs::remove_file(root.join("third_party/.vendorignore")).unwrap();
         assert_eq!(restore_walk(root, &[]).libraries, None);
     }
+
+    /// The same for a vendor directory that only a tracked `--vendor_dir`
+    /// names and that holds no marker (HZ-03; ROUTED R-032): the walk
+    /// reads the rc file of the Bazel root above it. Entered, the restore
+    /// in it would add its package folder to the crawl, and its
+    /// unrestored project file would drop the scope.
+    #[test]
+    fn restore_walk_does_not_enter_a_vendor_dir_an_rc_file_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let at = |rel: &str| {
+            rel.split('/')
+                .fold(root.to_path_buf(), |dir, name| dir.join(name))
+        };
+        let write = |rel: &str, text: &str| {
+            let path = at(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        };
+        let restore = |project: &str, folder: &str, library: &str| {
+            write(&format!("{project}/App.csproj"), "<Project/>");
+            let assets = serde_json::json!({
+                "libraries": { library: { "type": "package" } },
+                "packageFolders": { root.join(folder).to_string_lossy(): {} }
+            });
+            let assets_file = format!("{project}/obj/project.assets.json");
+            write(&assets_file, &assets.to_string());
+        };
+        write("MODULE.bazel", "");
+        write(".bazelrc", "common:ci --vendor_dir=third_party/bazel\n");
+        restore("src/app", "own", "Newtonsoft.Json/13.0.3");
+        restore("third_party/bazel/+nuget+dep", "vendored", "Serilog/3.0.0");
+        write("third_party/bazel/rules_x~/Old.csproj", "<Project/>");
+
+        let walk = restore_walk(root, &[]);
+        assert_eq!(walk.package_folders, [root.join("own")]);
+        let own = ("Newtonsoft.Json".to_string(), "13.0.3".to_string());
+        assert_eq!(walk.libraries, Some(vec![own]));
+
+        // No such line: the directory is walked like any other, and the
+        // project in it that was never restored leaves no scope.
+        write(".bazelrc", "build --jobs=4\n");
+        let walk = restore_walk(root, &[]);
+        let mut folders = walk.package_folders.clone();
+        folders.sort();
+        assert_eq!(folders, [root.join("own"), root.join("vendored")]);
+        assert_eq!(walk.libraries, None);
+    }
 }

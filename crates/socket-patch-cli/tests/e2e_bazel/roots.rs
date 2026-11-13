@@ -321,6 +321,130 @@ async fn a_vendor_dir_named_only_by_a_tracked_rc_file_holds_no_project() {
     }
 }
 
+/// A scan in `root` that must exit 0 and write nothing: the directories
+/// it ran in, the purls it asked about, and what it said.
+async fn clean_scan(root: &Path, args: &[&str]) -> (Vec<String>, Vec<String>, String) {
+    let before = snapshot(root);
+    let api = fake_api().await;
+    let (code, stdout, stderr) = scan(root, &api, args);
+    assert_eq!(code, 0, "{args:?}\nstdout:\n{stdout}\nstderr:\n{stderr}");
+    assert_same_tree(&before, &snapshot(root));
+    let ran: Vec<String> = headings(&stdout).into_iter().map(str::to_string).collect();
+    (ran, queried(&api).await, stderr)
+}
+
+/// A checkout with a Bazel workspace in `ws/`, below the directory a scan
+/// starts in, whose rc file sends `bazel vendor` to `ws/third_party/bazel`.
+fn lay_nested_workspace(root: &Path, rc: &str) {
+    npm_project(root, "web", "web-only");
+    npm_project(root, "ws/app", "app-only");
+    npm_project(root, "ws/third_party/bazel/+npm+dep", "vendored-only");
+    put(root, "ws/MODULE.bazel", "");
+    put(root, "ws/.bazelrc", rc);
+}
+
+/// HZ-03: the search for projects knows what each directory's own run
+/// knows. A run in a directory reads the rc files of the Bazel roots
+/// above it and refuses a scope inside a vendor directory they name; a
+/// bare scan from above the workspace hands each project it found to such
+/// a run. So the search reads the rc file of a Bazel root it meets below
+/// the scanned directory too, and leaves that vendor directory out with a
+/// note: found and then refused, it failed the scan of the whole checkout
+/// (exit 1) where the same checkout without the rc line exits 0.
+#[tokio::test]
+async fn a_vendor_dir_of_a_bazel_root_below_the_scanned_directory_holds_no_project() {
+    let note = "1 directory below this one was not searched for projects";
+    let kept = [purl("app-only"), purl("web-only")];
+    for mode in ["hosted", "vendored"] {
+        let (_tmp, root) = checkout();
+        lay_nested_workspace(&root, "common --vendor_dir=third_party/bazel\n");
+        let (ran, asked, stderr) = clean_scan(&root, &["--mode", mode]).await;
+        assert_eq!(ran, ["web", "ws/app"], "{mode}");
+        assert_eq!(asked, kept, "{mode}");
+        let named = format!("Note: {note} (ws/third_party/bazel)");
+        assert_eq!(stderr.matches(&named).count(), 1, "{mode}: {stderr}");
+
+        // The same search from inside the workspace, as before.
+        let (ran, asked, stderr) = clean_scan(&at(&root, "ws"), &["--mode", mode]).await;
+        assert_eq!(ran, [".", "app"], "{mode}");
+        assert_eq!(asked, kept[..1], "{mode}");
+        let named = format!("Note: {note} (third_party/bazel)");
+        assert_eq!(stderr.matches(&named).count(), 1, "{mode}: {stderr}");
+
+        // No such line: the directory is a project like its neighbours,
+        // as it is to every earlier release.
+        put(&root, "ws/.bazelrc", "build --jobs=4\n");
+        let (ran, asked, stderr) = clean_scan(&root, &["--mode", mode]).await;
+        let inside = "ws/third_party/bazel/+npm+dep";
+        assert_eq!(ran, ["web", "ws/app", inside], "{mode}");
+        assert_eq!(asked.len(), 3, "{mode}: {asked:?}");
+        assert!(!stderr.contains("not searched for projects"), "{stderr}");
+    }
+}
+
+/// The second look (`projects_below::discovered`): a Bazel root whose
+/// boundary file git ignores is one the walk never lists, and a run
+/// started in its vendor directory still finds it. The project the walk
+/// returned there is asked the question its own run asks, and is left out
+/// with the same note instead of failing the scan.
+#[tokio::test]
+async fn a_project_its_own_run_would_refuse_is_left_out_of_a_bare_scan() {
+    let (_tmp, root) = checkout();
+    lay_nested_workspace(&root, "common --vendor_dir=third_party/bazel\n");
+    put(&root, ".gitignore", "MODULE.bazel\n");
+    let inside = "ws/third_party/bazel/+npm+dep";
+    let (ran, asked, stderr) = clean_scan(&root, &["--mode", "hosted"]).await;
+    assert_eq!(ran, ["web", "ws/app"]);
+    assert_eq!(asked, [purl("app-only"), purl("web-only")]);
+    let note = format!("Note: 1 directory below this one was not searched for projects ({inside})");
+    assert_eq!(stderr.matches(&note).count(), 1, "{stderr}");
+    // Its own run refuses it, which is what the scan above was spared.
+    let api = fake_api().await;
+    let (code, stdout, _) = scan(
+        &root,
+        &api,
+        &["--mode", "hosted", "--json", "--cwd", inside],
+    );
+    assert_eq!(code, 1, "{stdout}");
+    let refusal = Code::AgentOutputTree.as_str();
+    let envelope = parse_json_envelope(&stdout);
+    assert_eq!(envelope_error_code(&envelope), Some(refusal));
+}
+
+/// A PATH glob takes the directories of as many workspaces as it matches,
+/// and each workspace's rc file names a vendor directory of its own. Each
+/// match is judged by the Bazel roots above it: judged by the roots of
+/// the first match, the vendor directory of the second workspace was
+/// scanned, and its own run refused it (exit 1).
+#[tokio::test]
+async fn a_glob_over_two_workspaces_leaves_out_the_vendor_dir_of_each() {
+    let lay = |root: &Path, rc: &str| {
+        for ws in ["a", "b"] {
+            put(root, &format!("{ws}/MODULE.bazel"), "");
+            put(root, &format!("{ws}/.bazelrc"), rc);
+            npm_project(root, &format!("{ws}/app"), &format!("{ws}-app"));
+            let vendored = format!("{ws}-vendored");
+            npm_project(root, &format!("{ws}/third_party"), &vendored);
+        }
+    };
+    let (_tmp, root) = checkout();
+    lay(&root, "common --vendor_dir=third_party\n");
+    let (ran, asked, stderr) = clean_scan(&root, &["--mode", "hosted", "*/*"]).await;
+    assert_eq!(ran, ["a/app", "b/app"]);
+    assert_eq!(asked, [purl("a-app"), purl("b-app")]);
+    let note = "Note: 2 directories a PATH pattern matched were not scanned \
+                (a/third_party, b/third_party)";
+    assert_eq!(stderr.matches(note).count(), 1, "{stderr}");
+
+    // Without the lines the four directories are four projects.
+    let (_tmp, root) = checkout();
+    lay(&root, "build --jobs=4\n");
+    let (ran, asked, stderr) = clean_scan(&root, &["--mode", "hosted", "*/*"]).await;
+    assert_eq!(ran, ["a/app", "a/third_party", "b/app", "b/third_party"]);
+    assert_eq!(asked.len(), 4, "{asked:?}");
+    assert!(!stderr.contains("were not scanned"), "{stderr}");
+}
+
 /// The agent crawl keeps out of such a directory too: a package that a
 /// vendored repository has installed is no installed copy of the
 /// project's.
