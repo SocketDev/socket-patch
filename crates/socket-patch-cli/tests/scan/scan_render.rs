@@ -17,6 +17,19 @@ use wiremock::MockServer;
 
 use crate::scan_fixture::*;
 
+const OPT_IN_NOTE: &str = "Set `safeMode` to `true`; defaults remain vulnerable.";
+
+fn assert_opt_in_event(envelope: &serde_json::Value) {
+    let event = envelope["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|event| event["uuid"] == UUID)
+        .unwrap_or_else(|| panic!("no event for {UUID}: {envelope}"));
+    assert_eq!(event["details"]["requiresOptIn"], true, "{event}");
+    assert_eq!(event["details"]["optInNote"], OPT_IN_NOTE, "{event}");
+}
+
 // ---------------------------------------------------------------------------
 // Terminals reachable without a network
 // ---------------------------------------------------------------------------
@@ -356,6 +369,68 @@ async fn scan_human_preview_renders_vulnerability_details() {
             stdout.lines().any(|l| l.trim() == line),
             "each vuln's summary is labeled with its CVE or advisory id ({line:?}); got {stdout:?}"
         );
+    }
+}
+
+#[tokio::test]
+async fn scan_hosted_dry_run_prints_opt_in_note() {
+    let mock = MockServer::start().await;
+    mount_opt_in_patch_api(&mock, b"x\n", OPT_IN_NOTE).await;
+    mount_forbidden_reference(&mock, MINIMIST).await;
+    let tmp = minimist_project(b"x\n");
+    seed_hosted_pin(tmp.path(), MINIMIST, OLD_UUID);
+
+    let (code, stdout, stderr) = run_scan_api(tmp.path(), &mock.uri(), &["--dry-run"]);
+    assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
+    assert!(
+        stdout.contains(&format!("Opt-in required:\n  {MINIMIST}: {OPT_IN_NOTE}")),
+        "hosted result must include the activation instruction: {stdout}"
+    );
+    assert_eq!(stdout.matches(OPT_IN_NOTE).count(), 1, "{stdout}");
+}
+
+#[tokio::test]
+async fn repeated_agent_scan_prints_opt_in_note_once() {
+    let mock = MockServer::start().await;
+    mount_opt_in_patch_api(&mock, b"before\n", OPT_IN_NOTE).await;
+    let tmp = minimist_project(b"before\n");
+
+    let (code, first, stderr) = run_scan_agent(tmp.path(), &mock.uri(), &[]);
+    assert_eq!(code, 0, "first run: stdout={first}; stderr={stderr}");
+    assert_eq!(first.matches(OPT_IN_NOTE).count(), 1, "first run: {first}");
+    let (code, second, stderr) = run_scan_agent(tmp.path(), &mock.uri(), &[]);
+    assert_eq!(code, 0, "second run: stdout={second}; stderr={stderr}");
+    assert!(second.contains("already patched"), "second run: {second}");
+    assert_eq!(
+        second.matches(OPT_IN_NOTE).count(),
+        1,
+        "second run: {second}"
+    );
+}
+
+#[tokio::test]
+async fn scan_json_events_carry_opt_in_fields_in_hosted_and_repeated_agent_runs() {
+    let hosted_mock = MockServer::start().await;
+    mount_opt_in_patch_api(&hosted_mock, b"x\n", OPT_IN_NOTE).await;
+    mount_forbidden_reference(&hosted_mock, MINIMIST).await;
+    let hosted_tmp = minimist_project(b"x\n");
+    seed_hosted_pin(hosted_tmp.path(), MINIMIST, OLD_UUID);
+    let (code, stdout, stderr) = run_scan_api(
+        hosted_tmp.path(),
+        &hosted_mock.uri(),
+        &["--dry-run", "--json"],
+    );
+    assert_eq!(code, 0, "hosted: stdout={stdout}; stderr={stderr}");
+    assert_opt_in_event(&serde_json::from_str(&stdout).unwrap());
+
+    let agent_mock = MockServer::start().await;
+    mount_opt_in_patch_api(&agent_mock, b"before\n", OPT_IN_NOTE).await;
+    let agent_tmp = minimist_project(b"before\n");
+    for run in 1..=2 {
+        let (code, stdout, stderr) =
+            run_scan_agent(agent_tmp.path(), &agent_mock.uri(), &["--json"]);
+        assert_eq!(code, 0, "agent run {run}: stdout={stdout}; stderr={stderr}");
+        assert_opt_in_event(&serde_json::from_str(&stdout).unwrap());
     }
 }
 

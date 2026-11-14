@@ -439,6 +439,70 @@ async fn opt_in_note_renders_and_persists_in_human_and_json_get() {
     assert_eq!(event["details"]["optInNote"], NOTE);
 }
 
+#[tokio::test]
+async fn unchanged_uuid_refreshes_and_clears_opt_in_metadata_on_both_save_paths() {
+    async fn mount_api(server: &MockServer, cve: &str, note: Option<&str>) {
+        let mut patch = serde_json::json!({
+            "uuid": UUID,
+            "purl": PURL,
+            "publishedAt": "2024-01-01T00:00:00Z",
+            "description": "Opt-in metadata refresh",
+            "license": "MIT",
+            "tier": "free",
+            "vulnerabilities": {},
+        });
+        let mut view = view_json(UUID, PURL, good_files());
+        if let Some(note) = note {
+            patch["requiresOptIn"] = serde_json::json!(true);
+            patch["optInNote"] = serde_json::json!(note);
+            view["requiresOptIn"] = serde_json::json!(true);
+            view["optInNote"] = serde_json::json!(note);
+        }
+        Mock::given(method("GET"))
+            .and(path(format!("/v0/orgs/{ORG}/patches/by-cve/{cve}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "patches": [patch],
+                "canAccessPaidPatches": false,
+            })))
+            .mount(server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/v0/orgs/{ORG}/patches/view/{UUID}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(view))
+            .mount(server)
+            .await;
+    }
+
+    let cve = "CVE-2024-4244";
+    for identifier in [UUID, cve] {
+        let server = MockServer::start().await;
+        let tmp = tempfile::tempdir().unwrap();
+        seed_manifest_with(tmp.path(), PURL, UUID);
+        mount_api(&server, cve, Some("Set `safeMode` to `true`.")).await;
+        let (code, stdout, stderr) =
+            run_get_bin(tmp.path(), &server.uri(), &[identifier, "--save-only"]);
+        assert_eq!(code, 0, "{identifier}: stdout={stdout}\nstderr={stderr}");
+        let manifest = manifest_json(tmp.path());
+        let record = &manifest["patches"][PURL];
+        assert_eq!(record["requiresOptIn"], true, "{identifier}: {record}");
+        assert_eq!(record["optInNote"], "Set `safeMode` to `true`.");
+        assert_eq!(record["files"], serde_json::json!({}));
+
+        server.reset().await;
+        mount_api(&server, cve, None).await;
+        let (code, stdout, stderr) =
+            run_get_bin(tmp.path(), &server.uri(), &[identifier, "--save-only"]);
+        assert_eq!(code, 0, "{identifier}: stdout={stdout}\nstderr={stderr}");
+        let record = &manifest_json(tmp.path())["patches"][PURL];
+        assert!(
+            record.get("requiresOptIn").is_none(),
+            "{identifier}: {record}"
+        );
+        assert!(record.get("optInNote").is_none(), "{identifier}: {record}");
+        assert_eq!(record["files"], serde_json::json!({}));
+    }
+}
+
 /// Human paid-only search: the subscription message, exit 0, no download.
 #[tokio::test]
 async fn human_paid_only_search_prints_subscription_message() {

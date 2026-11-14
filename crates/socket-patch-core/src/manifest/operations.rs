@@ -132,6 +132,8 @@ const RECORD_KEYS: &[&str] = &[
     "description",
     "license",
     "tier",
+    "requiresOptIn",
+    "optInNote",
 ];
 
 /// The manifest now at `path` as a JSON object; `None` when there is none
@@ -825,6 +827,9 @@ mod tests {
             exclude: vec!["packages/a".to_string()],
             manual: Vec::new(),
         });
+        let record = manifest.patches.values_mut().next().unwrap();
+        record.requires_opt_in = Some(true);
+        record.opt_in_note = Some("Set `safeMode` to `true`.".to_string());
         let document = serde_json::to_value(&manifest).unwrap();
         let keys = |value: &serde_json::Value| -> Vec<String> {
             value.as_object().unwrap().keys().cloned().collect()

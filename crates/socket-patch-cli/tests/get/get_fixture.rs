@@ -300,6 +300,7 @@ pub fn engine_params(root: &Path) -> DownloadParams {
         ecosystems: None,
         persist_blobs: true,
         patch_server_url: None,
+        opt_in_notes_shown: Vec::new(),
         all_releases: true,
     }
 }

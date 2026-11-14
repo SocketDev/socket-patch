@@ -176,7 +176,7 @@ pub struct ApplyArgs {
 }
 
 /// What a nested apply knows about the command that runs it.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct NestedApply {
     /// The caller runs under `--json`. The nested run itself is never JSON
     /// (one envelope per command), but the caller's stdout is, so the
@@ -186,6 +186,7 @@ pub struct NestedApply {
     /// (`get`) checked only its own selection. `scan` already reported
     /// every protected installed package, so it passes `false`.
     pub report_user_patch_skips: bool,
+    pub shown_opt_in_uuids: Vec<String>,
 }
 
 impl ApplyArgs {
@@ -193,7 +194,7 @@ impl ApplyArgs {
     /// `--json` (the envelope is the channel), always otherwise — errors
     /// are exempt from `--silent`.
     fn prints_errors(&self) -> bool {
-        !self.common.json && !self.nested.is_some_and(|n| n.caller_json)
+        !self.common.json && !self.nested.as_ref().is_some_and(|n| n.caller_json)
     }
 }
 
@@ -1848,14 +1849,14 @@ pub(crate) async fn run_locked(
                 for line in block {
                     println!("{line}");
                 }
-                if args.nested.is_none() {
-                    let notes = format_opt_in_notes(&opt_ins, &results, &unmatched);
-                    if !notes.is_empty() {
-                        println!("\nOpt-in required:");
-                        for note in notes {
-                            println!("{note}");
-                        }
-                    }
+                let shown_opt_in_uuids = args
+                    .nested
+                    .as_ref()
+                    .map_or(&[][..], |nested| nested.shown_opt_in_uuids.as_slice());
+                if let Some(notes) =
+                    format_opt_in_notes(&opt_ins, &results, &unmatched, shown_opt_in_uuids)
+                {
+                    println!("\n{notes}");
                 }
                 if args.common.verbose && !results.is_empty() {
                     print_verbose_verification(&results);
@@ -2401,30 +2402,26 @@ fn format_opt_in_notes(
     opt_ins: &OptInPatches,
     results: &[ApplyResult],
     unmatched: &[String],
-) -> Vec<String> {
+    shown_opt_in_uuids: &[String],
+) -> Option<String> {
     let shown: HashSet<&str> = results
         .iter()
         .map(|result| result.package_key.as_str())
         .chain(unmatched.iter().map(String::as_str))
         .collect();
-    let mut notes: Vec<(&str, &str)> = opt_ins
-        .iter()
-        .filter_map(|(purl, _, requires_opt_in, opt_in_note)| {
-            if requires_opt_in != &Some(true) || !shown.contains(purl.as_str()) {
+    crate::ui::opt_in_note_block(opt_ins.iter().filter_map(
+        |(purl, uuid, requires_opt_in, opt_in_note)| {
+            if !shown.contains(purl.as_str()) || shown_opt_in_uuids.contains(uuid) {
                 return None;
             }
-            let note = opt_in_note.as_deref()?;
-            (!note.trim().is_empty()).then_some((purl.as_str(), note))
-        })
-        .collect();
-    notes.sort_unstable();
-    notes
-        .into_iter()
-        .map(|(purl, note)| {
-            let note = crate::ui::terminal_text(note).replace('\n', "\n    ");
-            format!("  {}: {note}", normalize_purl(purl))
-        })
-        .collect()
+            Some(crate::ui::OptInEntry {
+                purl,
+                uuid,
+                requires_opt_in: *requires_opt_in,
+                opt_in_note: opt_in_note.as_deref(),
+            })
+        },
+    ))
 }
 
 /// One `Patched packages:` line. `copy` names the physical copy when a

@@ -2147,6 +2147,20 @@ async fn run_redirect_selected_untracked(
                 "{}",
                 format_hosted_summary(confirmed.len(), already, human_files.len(), common.dry_run)
             );
+            if let Some(notes) = rollout.as_ref().and_then(|gate| {
+                crate::ui::opt_in_note_block(
+                    gate.rows
+                        .iter()
+                        .filter(|row| {
+                            selected.iter().any(|(purl, uuid)| {
+                                purl == &row.writer.purl && uuid == &row.writer.uuid
+                            })
+                        })
+                        .map(|row| crate::ui::OptInEntry::from_search(&row.writer)),
+                )
+            }) {
+                println!("\n{notes}");
+            }
             // Under it, per package on a hosted patch: the advisories that
             // patch fixes and the ones it leaves unpatched.
             if let Some(gate) = &rollout {

@@ -49,6 +49,15 @@ pub fn build_patch_record(
     }
 }
 
+pub fn refresh_opt_in_metadata(record: &mut PatchRecord, patch: &PatchResponse) -> bool {
+    if record.requires_opt_in == patch.requires_opt_in && record.opt_in_note == patch.opt_in_note {
+        return false;
+    }
+    record.requires_opt_in = patch.requires_opt_in;
+    record.opt_in_note = patch.opt_in_note.clone();
+    true
+}
+
 /// Build the manifest-shaped `files` map from a fetched patch view,
 /// keeping EVERY file the patch touches — including net-new files the
 /// patch ADDS, which carry an `afterHash` but no `beforeHash`. A new

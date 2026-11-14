@@ -684,14 +684,6 @@ pub(super) fn patch_block(b: &PatchBlock) -> Vec<String> {
     if !desc.is_empty() {
         lines.push(format!("    {desc}"));
     }
-    if p.requires_opt_in == Some(true) {
-        if let Some(note) = &p.opt_in_note {
-            let note = ui::terminal_text(note).replace('\n', "\n    ");
-            if !note.trim().is_empty() {
-                lines.push(format!("    Opt-in required: {note}"));
-            }
-        }
-    }
     lines.push(String::new());
     lines
 }
@@ -1286,21 +1278,6 @@ mod tests {
                 "",
             ]
         );
-    }
-
-    #[test]
-    fn patch_block_renders_sanitized_opt_in_note() {
-        let mut p = patch(&[], "");
-        p.requires_opt_in = Some(true);
-        p.opt_in_note = Some(
-            "Set `safeMode` to `true`.\x1b[2J\x1b]0;bad\x07\r\nDefaults remain vulnerable."
-                .to_string(),
-        );
-        let out = patch_block(&block(&p, false)).join("\n");
-        assert!(out.contains(
-            "    Opt-in required: Set `safeMode` to `true`.[2J]0;bad\n    Defaults remain vulnerable."
-        ));
-        assert!(!out.contains('\x1b') && !out.contains('\x07') && !out.contains('\r'));
     }
 
     #[test]

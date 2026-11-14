@@ -11,7 +11,9 @@ use socket_patch_core::api::ranking::severity_order;
 use socket_patch_core::api::types::{PatchResponse, PatchSearchResult, VulnerabilityResponse};
 use socket_patch_core::crawlers::{CrawlerOptions, Ecosystem};
 use socket_patch_core::manifest::operations::{read_manifest, write_manifest};
-use socket_patch_core::manifest::records::{build_patch_record, files_for_manifest};
+use socket_patch_core::manifest::records::{
+    build_patch_record, files_for_manifest, refresh_opt_in_metadata,
+};
 use socket_patch_core::manifest::schema::{PatchFileInfo, PatchManifest, PatchRecord};
 use socket_patch_core::patch::apply::{is_valid_blob_hash, select_installed_variants_any};
 use socket_patch_core::patch::apply_lock::{LockError, LockGuard};
@@ -388,6 +390,7 @@ pub struct DownloadParams {
     /// `--patch-server-url`: the extra origin whose URLs count as hosted
     /// when lockfile discovery reads the project's hosted pins.
     pub patch_server_url: Option<String>,
+    pub opt_in_notes_shown: Vec<String>,
 }
 
 impl DownloadParams {
@@ -701,6 +704,7 @@ pub(crate) struct FetchBatch {
     failed: usize,
     /// Fetched, recordable patches in selection order.
     fetched: Vec<FetchedPatch>,
+    metadata_refreshes: Vec<PatchResponse>,
     /// Ledger store only: `(purl, record)` reused from a detached entry
     /// already at the selected uuid (no fetch).
     reused: Vec<(String, PatchRecord)>,
@@ -912,6 +916,7 @@ pub(crate) async fn fetch_selected_patches(
         already_recorded: 0,
         failed: 0,
         fetched: Vec::new(),
+        metadata_refreshes: Vec::new(),
         reused: Vec::new(),
         events: Vec::new(),
         warnings,
@@ -1039,13 +1044,15 @@ pub(crate) async fn fetch_selected_patches(
             },
         };
         if action == PatchAction::Skipped {
+            batch.metadata_refreshes.push(patch.clone());
             if !quiet {
                 eprintln!("{}", format_record_skip(&patch.purl, "already in manifest"));
             }
             batch.events.push(
                 PatchEvent::new(EventAction::Skipped, patch.purl.as_str())
                     .with_uuid(patch.uuid.as_str())
-                    .with_reason(ALREADY_IN_MANIFEST, "already in manifest"),
+                    .with_reason(ALREADY_IN_MANIFEST, "already in manifest")
+                    .with_details(patch_event_metadata(&patch)),
             );
             batch.skipped += 1;
             batch.already_recorded += 1;
@@ -1405,6 +1412,7 @@ pub(crate) async fn run_nested_apply(
     common: GlobalArgs,
     json: bool,
     report_user_patch_skips: bool,
+    shown_opt_in_uuids: Vec<String>,
     recorded: &[(String, String)],
     client: &ApiClient,
     lock: LockGuard,
@@ -1419,6 +1427,7 @@ pub(crate) async fn run_nested_apply(
         nested: Some(super::apply::NestedApply {
             caller_json: json,
             report_user_patch_skips,
+            shown_opt_in_uuids,
         }),
     };
     // The nested apply runs on the host's client: seeded, never rebuilt.
@@ -1713,6 +1722,12 @@ pub async fn download_and_apply_patches_into(
     // matching the per-patch event (`downloaded` / `updated`) and the
     // single-uuid flow's summary in `save_and_apply_patch`; their sum gates
     // the apply step.
+    let mut metadata_changed = false;
+    for patch in &batch.metadata_refreshes {
+        if let Some(record) = manifest.patches.get_mut(&patch.purl) {
+            metadata_changed |= refresh_opt_in_metadata(record, patch);
+        }
+    }
     let downloaded = batch.fetched.len();
     let mut updated = 0usize;
     let mut new_blobs: Vec<String> = Vec::new();
@@ -1748,7 +1763,7 @@ pub async fn download_and_apply_patches_into(
     let added = downloaded - updated;
     // Write only when a record changed: an all-skipped or all-failed run
     // leaves the manifest bytes (and a fresh project's tree) untouched.
-    if downloaded > 0 {
+    if downloaded > 0 || metadata_changed {
         if let Err(e) = write_manifest(&manifest_path, &manifest).await {
             // The blobs this run just wrote have no record pointing at them:
             // unwind exactly those (a pre-existing record's blobs stay).
@@ -1819,6 +1834,7 @@ pub async fn download_and_apply_patches_into(
                 nested_apply_args_from_params(params, run, &manifest_path),
                 params.json,
                 !params.user_patch_skips_reported,
+                params.opt_in_notes_shown.clone(),
                 &recorded,
                 run.api_client,
                 lock,

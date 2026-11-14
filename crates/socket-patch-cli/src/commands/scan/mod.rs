@@ -556,7 +556,7 @@ async fn discover_selected(
     show_progress: bool,
     warn: bool,
     detail_error_line: bool,
-    json_warnings: Option<&mut Envelope>,
+    mut json_warnings: Option<&mut Envelope>,
 ) -> Result<Discovered, (i32, String)> {
     let (all_search_results, failures) =
         fetch_patch_details(api_client, packages, show_progress, warn).await;
@@ -577,6 +577,17 @@ async fn discover_selected(
     // Some queries failed, some succeeded: a `--json` run has no stderr
     // warning (`warn` is human-only), so each failed package becomes a
     // run-level `warnings[]` entry — never a silent drop from the envelope.
+    if let Some(env) = json_warnings.as_deref_mut() {
+        for patch in &all_search_results {
+            env.register_opt_in(
+                &patch.purl,
+                &patch.uuid,
+                patch.requires_opt_in,
+                patch.opt_in_note.as_deref(),
+            );
+        }
+        env.add_registered_opt_in_to_events();
+    }
     let offers = select_accessible(all_search_results, can_access_paid_patches, policy);
     if let Some(env) = json_warnings {
         for (purl, e) in &failures {
@@ -979,6 +990,7 @@ fn download_params(args: &ScanArgs, save_only: bool, json: bool, silent: bool) -
         ecosystems: args.common.ecosystems.clone(),
         persist_blobs: args.mode != Some(ScanMode::Vendored),
         patch_server_url: args.common.patch_server_url.clone(),
+        opt_in_notes_shown: Vec::new(),
     }
 }
 
@@ -2950,6 +2962,16 @@ async fn scan_project(
 
     if args.common.json {
         let mut env = scan_envelope(&args.common);
+        for package in &all_packages_with_patches {
+            for patch in &package.patches {
+                env.register_opt_in(
+                    &patch.purl,
+                    &patch.uuid,
+                    patch.requires_opt_in,
+                    patch.opt_in_note.as_deref(),
+                );
+            }
+        }
         env.set_extra("scannedPackages", serde_json::json!(package_count));
         env.set_extra(
             "lockfileOnlyPackages",
@@ -3593,6 +3615,14 @@ async fn scan_project(
 
     if selected.is_empty() && (!reapply || already_recorded.is_empty()) {
         if !silent {
+            if let Some(notes) = ui::opt_in_note_block(
+                selected
+                    .iter()
+                    .chain(&already_recorded)
+                    .map(ui::OptInEntry::from_search),
+            ) {
+                println!("\n{notes}");
+            }
             open_paragraph(&mut skip_paragraph);
             if !stage.deferred_keys().is_empty() {
                 if args.common.dry_run {
@@ -3656,6 +3686,17 @@ async fn scan_project(
                     }
                 }
             }
+        }
+    }
+
+    if !silent && (vendor || report_only || args.common.dry_run) {
+        if let Some(notes) = ui::opt_in_note_block(
+            selected
+                .iter()
+                .chain(&already_recorded)
+                .map(ui::OptInEntry::from_search),
+        ) {
+            println!("\n{notes}");
         }
     }
 

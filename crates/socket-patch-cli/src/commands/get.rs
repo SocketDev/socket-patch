@@ -11,7 +11,9 @@ use socket_patch_core::api::types::{
 use socket_patch_core::crawlers::fuzzy_match::fuzzy_match_packages;
 use socket_patch_core::formats::pnpm::PnpmLock;
 use socket_patch_core::manifest::operations::{read_manifest, write_manifest};
-use socket_patch_core::manifest::records::{build_patch_record, files_for_manifest};
+use socket_patch_core::manifest::records::{
+    build_patch_record, files_for_manifest, refresh_opt_in_metadata,
+};
 use socket_patch_core::manifest::schema::PatchManifest;
 use socket_patch_core::telemetry::{track_patch_fetch_failed, track_patch_fetched, TelemetryAuth};
 use socket_patch_core::utils::concurrent::{api_concurrency_for, ordered_concurrent};
@@ -1810,7 +1812,8 @@ pub async fn run(args: GetArgs) -> i32 {
     }
 
     // Download and apply (agent mode), with the run's client and flags.
-    let params = get_download_params(&args, args.save_only, /*persist_blobs=*/ true);
+    let mut params = get_download_params(&args, args.save_only, /*persist_blobs=*/ true);
+    params.opt_in_notes_shown = selected.iter().map(|patch| patch.uuid.clone()).collect();
     let run = DownloadRun {
         api_client: &api_client,
         lock_timeout: args.common.lock_timeout,
@@ -1994,6 +1997,19 @@ async fn save_patch_record(
     // not `added` — consumers diff manifest replacements on that action.
     let action = decide_patch_action(&manifest, &patch.purl, &patch.uuid);
     if action == PatchAction::Skipped {
+        let refreshed = manifest
+            .patches
+            .get_mut(&patch.purl)
+            .is_some_and(|record| refresh_opt_in_metadata(record, patch));
+        if refreshed {
+            if let Err(e) = write_manifest(manifest_path, &manifest).await {
+                return Err(report_error(
+                    &args.common,
+                    "manifest_write_failed",
+                    format!("Failed to write manifest: {e}"),
+                ));
+            }
+        }
         return Ok(action);
     }
 
@@ -2146,6 +2162,7 @@ async fn save_and_apply_patch(
                 nested_apply_args(&args.common, &manifest_path, quiet),
                 args.common.json,
                 true,
+                vec![patch.uuid.clone()],
                 &recorded,
                 client,
                 lock,
@@ -2265,6 +2282,7 @@ fn get_download_params(args: &GetArgs, save_only: bool, persist_blobs: bool) -> 
         ecosystems: args.common.ecosystems.clone(),
         persist_blobs,
         patch_server_url: args.common.patch_server_url.clone(),
+        opt_in_notes_shown: Vec::new(),
     }
 }
 
@@ -4069,6 +4087,7 @@ mod tests {
             ecosystems: None,
             persist_blobs: false,
             patch_server_url: None,
+            opt_in_notes_shown: Vec::new(),
         }
     }
 
@@ -4769,6 +4788,7 @@ mod tests {
             // The vendor-detached posture this fn exists for.
             persist_blobs: false,
             patch_server_url: None,
+            opt_in_notes_shown: Vec::new(),
         }
     }
 

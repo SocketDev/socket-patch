@@ -248,25 +248,40 @@ pub async fn mount_by_package_500(mock: &MockServer, purl: &str) {
 /// The patch view for `uuid` with an inline blob turning `before` into
 /// `after\n` in `package/index.js`, so the apply step needs no blob endpoint.
 pub async fn mount_view(mock: &MockServer, purl: &str, uuid: &str, before: &[u8]) {
+    mount_view_with_opt_in(mock, purl, uuid, before, None).await;
+}
+
+pub async fn mount_view_with_opt_in(
+    mock: &MockServer,
+    purl: &str,
+    uuid: &str,
+    before: &[u8],
+    opt_in_note: Option<&str>,
+) {
+    let mut response = serde_json::json!({
+        "uuid": uuid,
+        "purl": purl,
+        "publishedAt": "2024-01-01T00:00:00Z",
+        "files": {
+            "package/index.js": {
+                "beforeHash": git_sha256(before),
+                "afterHash": git_sha256(b"after\n"),
+                // base64 of "after\n"
+                "blobContent": "YWZ0ZXIK",
+            }
+        },
+        "vulnerabilities": {},
+        "description": "Covgap test patch",
+        "license": "MIT",
+        "tier": "free",
+    });
+    if let Some(note) = opt_in_note {
+        response["requiresOptIn"] = serde_json::json!(true);
+        response["optInNote"] = serde_json::json!(note);
+    }
     Mock::given(method("GET"))
         .and(path(format!("/v0/orgs/{ORG_SLUG}/patches/view/{uuid}")))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "uuid": uuid,
-            "purl": purl,
-            "publishedAt": "2024-01-01T00:00:00Z",
-            "files": {
-                "package/index.js": {
-                    "beforeHash": git_sha256(before),
-                    "afterHash": git_sha256(b"after\n"),
-                    // base64 of "after\n"
-                    "blobContent": "YWZ0ZXIK",
-                }
-            },
-            "vulnerabilities": {},
-            "description": "Covgap test patch",
-            "license": "MIT",
-            "tier": "free",
-        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(response))
         .mount(mock)
         .await;
 }
@@ -285,6 +300,30 @@ pub async fn mount_patch_api(mock: &MockServer, pkgs: &[(&str, &str)], before: &
 /// [`mount_patch_api`] for one patch, `UUID`, on `purl`.
 pub async fn mount_one_patch_api(mock: &MockServer, purl: &str, before: &[u8]) {
     mount_patch_api(mock, &[(purl, UUID)], before).await;
+}
+
+pub async fn mount_opt_in_patch_api(mock: &MockServer, before: &[u8], note: &str) {
+    mount_batch_free(mock, &[(MINIMIST, UUID)]).await;
+    mount_by_package_body(
+        mock,
+        MINIMIST,
+        serde_json::json!({
+            "patches": [{
+                "uuid": UUID,
+                "purl": MINIMIST,
+                "publishedAt": "2024-01-01T00:00:00Z",
+                "description": "Covgap test patch",
+                "license": "MIT",
+                "tier": "free",
+                "vulnerabilities": {},
+                "requiresOptIn": true,
+                "optInNote": note,
+            }],
+            "canAccessPaidPatches": false,
+        }),
+    )
+    .await;
+    mount_view_with_opt_in(mock, MINIMIST, UUID, before, Some(note)).await;
 }
 
 /// Seed `.socket/manifest.json` with one entry per `(purl, uuid)` pair

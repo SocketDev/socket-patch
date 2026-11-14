@@ -255,6 +255,51 @@ pub(crate) fn terminal_text(s: &str) -> String {
         .collect()
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct OptInEntry<'a> {
+    pub purl: &'a str,
+    pub uuid: &'a str,
+    pub requires_opt_in: Option<bool>,
+    pub opt_in_note: Option<&'a str>,
+}
+
+impl<'a> OptInEntry<'a> {
+    pub fn from_search(patch: &'a socket_patch_core::api::types::PatchSearchResult) -> Self {
+        Self {
+            purl: &patch.purl,
+            uuid: &patch.uuid,
+            requires_opt_in: patch.requires_opt_in,
+            opt_in_note: patch.opt_in_note.as_deref(),
+        }
+    }
+}
+
+pub(crate) fn opt_in_note_block<'a>(
+    entries: impl IntoIterator<Item = OptInEntry<'a>>,
+) -> Option<String> {
+    let mut entries: Vec<OptInEntry<'_>> = entries.into_iter().collect();
+    entries.sort_by(|a, b| (a.uuid, a.purl).cmp(&(b.uuid, b.purl)));
+    let mut seen = std::collections::HashSet::new();
+    let mut block = None::<String>;
+    for entry in entries {
+        if entry.requires_opt_in != Some(true) {
+            continue;
+        }
+        let Some(note) = entry.opt_in_note else {
+            continue;
+        };
+        let note = terminal_text(note);
+        if note.trim().is_empty() || !seen.insert(entry.uuid) {
+            continue;
+        }
+        let note = note.replace('\n', "\n    ");
+        let purl = socket_patch_core::utils::purl::normalize_purl(entry.purl);
+        let block = block.get_or_insert_with(|| "Opt-in required:".to_string());
+        block.push_str(&format!("\n  {purl}: {note}"));
+    }
+    block
+}
+
 /// `word` as one argument a user can paste into their shell: bare when it
 /// holds only characters no shell treats specially, otherwise quoted (POSIX
 /// single quotes; double quotes on Windows, which cmd and PowerShell both
