@@ -1752,6 +1752,7 @@ mod tests {
                 pnpm_rerun_only: false,
                 workspace_symlinked: false,
                 final_discovery: None,
+                bazel: None,
             },
         }
     }

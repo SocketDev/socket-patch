@@ -18,6 +18,13 @@
 //! Nothing here writes, spawns, reads the environment or touches the
 //! network: every host effect (locking, record fetches, the commit of the
 //! rewritten files) stays with the caller.
+//!
+//! Under a Bazel root the caller attaches what it read of the root to the
+//! candidate files ([`CandidateFiles::attach`]), and stage 5 puts the
+//! Bazel rewriter group in front of the native rewriters
+//! ([`super::bazel_reads`]): a patch of an ecosystem a ruleset governs is
+//! decided there, confirmed by its report alone, and left alone by every
+//! native step. With nothing attached the stages are what they were.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
@@ -27,6 +34,7 @@ use crate::api::types::PackageVendorResult;
 use crate::constants::npm_family::VLT_HIDDEN_LOCK_REL;
 use crate::formats::cargo::source_replacement::CratesIoSource;
 use crate::formats::governing_locks::PYPI_REQUIREMENTS;
+use crate::patch::redirect::bazel::BazelRewrite;
 use crate::patch::redirect::npmrc::{
     effective_omit_lockfile_registry_resolved, effective_replace_registry_host,
     plan_npmrc_allow_remote_with, replace_registry_host_rewrites, NpmrcPlan, OuterAllowRemote,
@@ -35,8 +43,9 @@ use crate::patch::redirect::npmrc::{
 use crate::patch::redirect::presence::groups_present;
 use crate::patch::redirect::yarnrc::OuterYarnMirror;
 use crate::patch::redirect::{
-    artifact_url_spellings, rewrite_registry_redirect_with_host, DepOverride, FileEdit,
-    RewriteResult, RewriteWarning,
+    artifact_url_spellings, rewrite_registry_redirect_with_host,
+    rewrite_registry_redirect_with_host_under_bazel, DepOverride, FileEdit, RewriteResult,
+    RewriteWarning,
 };
 use crate::utils::pnpm_workspace::governing_workspace_file;
 use crate::utils::purl::purl_parts;
@@ -44,6 +53,7 @@ use crate::utils::redact::url_host;
 use crate::vendor::lock_inventory::pnpm::{is_rush, rush_lock_rels};
 use crate::vendor::lock_inventory::{bun_text_lock_drives, MemoryEntry, ProjectView};
 
+use super::bazel_reads::{self, BazelDone, BazelReads, BAZEL_WORKSPACE_KEY};
 use super::guidance::{
     npm_allow_remote_already_detail, npm_allow_remote_configured_detail,
     npm_allow_remote_env_set_detail, npm_allow_remote_manual_detail,
@@ -637,9 +647,26 @@ pub struct CandidateFiles {
     /// `files`, and the rewrite reports this instead of a redirect or a
     /// "no lockfile" hint.
     pub pnpm_refusal: Option<RewriteWarning>,
+    /// The Bazel root above the project, when the caller found one
+    /// ([`CandidateFiles::attach`]): the rewrite then asks the Bazel gate
+    /// about every patch before a native rewriter sees it. `None` under no
+    /// Bazel root, and always in memory, where the in-memory engine has
+    /// already left the governed ecosystems alone.
+    pub bazel: Option<BazelReads>,
 }
 
 impl CandidateFiles {
+    /// Hands the rewrite what was read of the Bazel root above the
+    /// project. The root rides the candidate files under a synthetic key
+    /// as the sbt evidence does ([`BAZEL_WORKSPACE_KEY`]), so whoever
+    /// reads the candidate texts of a rewrite sees that the Bazel group
+    /// ran in front of the native rewriters.
+    pub fn attach(&mut self, reads: BazelReads) {
+        self.files
+            .insert(BAZEL_WORKSPACE_KEY.to_string(), reads.marker());
+        self.bazel = Some(reads);
+    }
+
     /// Read `rel` into `files`: `true` when it was read.
     async fn read(
         &mut self,
@@ -2060,7 +2087,14 @@ pub struct Rewritten {
     /// writes exactly [`RewriteResult::files`] and
     /// [`RewriteResult::binary_files`] and nothing else may use it in place
     /// of discovering the written project again (see [`FinalDiscovery`]).
+    /// Always `None` when the Bazel group staged a change: the caller then
+    /// writes files the discovery did not see.
     pub final_discovery: Option<FinalDiscovery>,
+    /// What the Bazel rewriter group decided for the patches of governed
+    /// ecosystems, and the change set it staged for the Bazel root, which
+    /// the caller lands in a commit anchored there. `None` when no Bazel
+    /// root was attached to the candidate files.
+    pub bazel: Option<BazelDone>,
 }
 
 /// Where [`Rewritten::final_discovery`] lives.
@@ -2241,6 +2275,11 @@ pub async fn rewrite(
             options.clone(),
         )
         .await;
+        // A patch the Bazel group decided is judged by the group's own
+        // confirmation, which reads the locks Bazel builds from: native
+        // lockfile discovery of the project has no say in it.
+        let governed = done.bazel.iter().flat_map(|bazel| bazel.governed());
+        let exempt: BTreeSet<String> = exempt.iter().chain(governed).cloned().collect();
         let Gated {
             vetoed,
             lockless,
@@ -2263,7 +2302,9 @@ pub async fn rewrite(
             done.rewrite.warnings.extend(lockless);
             done.rewrite.warnings.extend(copy_left);
             done.rewrite.bundled_skipped_uuids.extend(copy_shadowed);
-            done.final_discovery = discovery;
+            // The discovery saw the native writes alone.
+            let staged = done.bazel.as_ref().is_some_and(|b| !b.changes.is_empty());
+            done.final_discovery = discovery.filter(|_| !staged);
             return done;
         }
         kept.retain(|c| !vetoed.iter().any(|skip| skip.uuid == c.dep.patch_uuid));
@@ -2658,6 +2699,7 @@ async fn rewrite_once(
         gradle_unreadable,
         gem_refusal,
         pnpm_refusal,
+        bazel,
     } = read;
     // The rewriters' override slice — materialized ONCE, after the last
     // candidate filter, so it can never disagree with `candidates`.
@@ -2703,40 +2745,67 @@ async fn rewrite_once(
     } else {
         CratesIoSource::Registry
     };
-    let (files, mut rewrite) = if options.blocking {
-        // Pure CPU over every lock text (the independent rewriter groups
-        // run concurrently inside), so it runs on the blocking pool rather
-        // than on a runtime worker; `files` comes back for the probe below.
-        tokio::task::spawn_blocking(move || {
-            let rewrite = rewrite_registry_redirect_with_host(
+    // The rewriters of this pass: the native ones alone, or behind the
+    // Bazel rewriter group where a Bazel root was attached, which decides
+    // the patches of governed ecosystems first and hands on the rest.
+    let rewriters = move |files: BTreeMap<String, String>| {
+        let native = |overrides: &[DepOverride]| {
+            rewrite_registry_redirect_with_host(
                 &files,
-                &rewrite_overrides,
+                overrides,
                 &python_metadata,
                 pipenv_major,
                 bun_lockb,
                 &gradle_unreadable,
                 &yarn_outer,
                 &cargo_outer,
-            );
-            (files, rewrite)
-        })
-        .await
-        .unwrap_or_else(|e| match e.try_into_panic() {
-            Ok(payload) => std::panic::resume_unwind(payload),
-            Err(e) => panic!("hosted rewrite task failed: {e}"),
-        })
+            )
+        };
+        let (rewrite, bazel) = match &bazel {
+            None => (native(&rewrite_overrides), None),
+            Some(reads) => {
+                let under = |overrides: &[DepOverride],
+                             host: Option<&crate::patch::redirect::bazel::BazelHost<'_>>| {
+                    let Some(host) = host else {
+                        return (native(overrides), BazelRewrite::default());
+                    };
+                    rewrite_registry_redirect_with_host_under_bazel(
+                        &files,
+                        overrides,
+                        &python_metadata,
+                        pipenv_major,
+                        bun_lockb,
+                        &gradle_unreadable,
+                        &yarn_outer,
+                        &cargo_outer,
+                        host,
+                    )
+                };
+                let (rewrite, done) = bazel_reads::rewrite(reads, &rewrite_overrides, &under);
+                (rewrite, Some(done))
+            }
+        };
+        (files, rewrite, bazel)
+    };
+    let (files, mut rewrite, bazel) = if options.blocking {
+        // Pure CPU over every lock text (the independent rewriter groups
+        // run concurrently inside), so it runs on the blocking pool rather
+        // than on a runtime worker; `files` comes back for the probe below.
+        tokio::task::spawn_blocking(move || rewriters(files))
+            .await
+            .unwrap_or_else(|e| match e.try_into_panic() {
+                Ok(payload) => std::panic::resume_unwind(payload),
+                Err(e) => panic!("hosted rewrite task failed: {e}"),
+            })
     } else {
-        let rewrite = rewrite_registry_redirect_with_host(
-            &files,
-            &rewrite_overrides,
-            &python_metadata,
-            pipenv_major,
-            bun_lockb,
-            &gradle_unreadable,
-            &yarn_outer,
-            &cargo_outer,
-        );
-        (files, rewrite)
+        rewriters(files)
+    };
+    // What the engine's own steps below may act on: a patch the Bazel
+    // group decided is the group's alone, confirmed or refused (design
+    // principle P7). With no Bazel root these are the overrides.
+    let own_overrides: std::borrow::Cow<'_, [DepOverride]> = match &bazel {
+        Some(done) => done.native(&overrides).into(),
+        None => overrides.as_slice().into(),
     };
     // The gem files were withheld on purpose: say why, not "no Gemfile".
     if let Some(warning) = gem_refusal {
@@ -2765,7 +2834,7 @@ async fn rewrite_once(
                     files.get("package.json").map(String::as_str),
                     None,
                 );
-                let binary_overrides: Vec<DepOverride> = overrides
+                let binary_overrides: Vec<DepOverride> = own_overrides
                     .iter()
                     .filter(|o| {
                         o.ecosystem != "npm"
@@ -2838,18 +2907,48 @@ async fn rewrite_once(
         ));
     }
 
-    let (pnpm_warnings, trust_config_write, pnpm_rerun_only, workspace_symlinked) = pnpm_trust(
-        view,
-        &files,
-        &pnpm_member_lock_keys,
-        &rewrite,
-        &rush_lock_keys,
-        &overrides,
-        &options,
-    );
-    let (mut npm_warnings, npmrc_config_write) =
-        npm_allow_remote(view, &files, &rewrite, &overrides, &options);
-    npm_warnings.extend(npm_allow_scripts(&files, &rewrite, &overrides));
+    // Under a hub the pnpm trust step also sees the locks the Bazel group
+    // pinned, for the patches it confirmed (owner decision O14), and is
+    // kept from a `pnpm-workspace.yaml` a hub names. The npm steps see
+    // native patches alone, and write no `.npmrc` beside a governed lock.
+    let (trust_overrides, spliced) = match &bazel {
+        Some(done) => {
+            let mut spliced = done.project_texts();
+            spliced.extend(rewrite.files.clone());
+            (done.trust_overrides(&overrides).into(), Some(spliced))
+        }
+        None => (own_overrides.clone(), None),
+    };
+    let (mut pnpm_warnings, mut trust_config_write, pnpm_rerun_only, workspace_symlinked) =
+        pnpm_trust(
+            view,
+            &files,
+            &pnpm_member_lock_keys,
+            spliced.as_ref().unwrap_or(&rewrite.files),
+            &rush_lock_keys,
+            &trust_overrides,
+            &options,
+        );
+    let (mut npm_warnings, mut npmrc_config_write) =
+        npm_allow_remote(view, &files, &rewrite, &own_overrides, &options);
+    npm_warnings.extend(npm_allow_scripts(&files, &rewrite, &own_overrides));
+    if let Some(done) = &bazel {
+        let npm = done.governs_npm();
+        if let Some(said) = trust_config_write
+            .as_ref()
+            .and_then(|_| done.withholds(PNPM_WORKSPACE_REL, npm))
+        {
+            trust_config_write = None;
+            pnpm_warnings.push(said);
+        }
+        if let Some(said) = npmrc_config_write
+            .as_ref()
+            .and_then(|_| done.withholds(NPMRC_REL, npm))
+        {
+            npmrc_config_write = None;
+            npm_warnings.push(said);
+        }
+    }
     if let Some((text, edit)) = trust_config_write {
         rewrite.files.insert(PNPM_WORKSPACE_REL.to_string(), text);
         // Appended last, after the lock edits it serves. v5 keeps no hosted
@@ -2861,15 +2960,21 @@ async fn rewrite_once(
         // Appended after the lock edits, like the pnpm trust key above.
         rewrite.edits.push(edit);
     }
-    let rewritten: Vec<String> = rewrite
+    let mut rewritten: Vec<String> = rewrite
         .files
         .keys()
         .chain(rewrite.binary_files.keys())
         .filter(|k| !crate::patch::redirect::sbt::is_synthetic_key(k))
         .cloned()
         .collect();
+    if let Some(done) = &bazel {
+        // What the commit anchored at the Bazel root writes counts too.
+        rewritten.extend(done.rewritten());
+        rewritten.sort();
+        rewritten.dedup();
+    }
     let confirmed = confirm(&files, &rewrite, candidates, binary_bun);
-    npm_warnings.extend(npm_deno_lock(view, &overrides, &confirmed));
+    npm_warnings.extend(npm_deno_lock(view, &own_overrides, &confirmed));
     Rewritten {
         files,
         symlinked_reads,
@@ -2887,6 +2992,7 @@ async fn rewrite_once(
         pnpm_rerun_only,
         workspace_symlinked,
         final_discovery: None,
+        bazel,
     }
 }
 
@@ -2929,7 +3035,9 @@ fn pnpm_trust(
     view: &ProjectView<'_>,
     files: &BTreeMap<String, String>,
     member_lock_keys: &[String],
-    rewrite: &RewriteResult,
+    // The files written in this run, by their name in the project: the
+    // rewriters' own, and under a Bazel hub the locks its lane pinned.
+    written: &BTreeMap<String, String>,
     rush_lock_keys: &[String],
     overrides: &[DepOverride],
     options: &RewriteOptions<'_>,
@@ -2940,8 +3048,7 @@ fn pnpm_trust(
     let mut workspace_symlinked = false;
     // pnpm locks spliced THIS run (any depth — the rewriter is
     // basename-generalized).
-    let (spliced_keys, mut pnpm_lock_texts): (Vec<&String>, Vec<&String>) = rewrite
-        .files
+    let (spliced_keys, mut pnpm_lock_texts): (Vec<&String>, Vec<&String>) = written
         .iter()
         .filter(|(key, _)| {
             std::path::Path::new(key)
@@ -2975,9 +3082,7 @@ fn pnpm_trust(
     // no-op.
     let heal_locks: Vec<&String> = governing
         .iter()
-        .filter_map(|key| {
-            pnpm_heal_root(rewrite.files.contains_key(*key), files.get(*key), overrides)
-        })
+        .filter_map(|key| pnpm_heal_root(written.contains_key(*key), files.get(*key), overrides))
         .collect();
     let spliced_pnpm_locks = pnpm_lock_texts.len();
     pnpm_lock_texts.extend(heal_locks.iter().copied());
@@ -2987,9 +3092,7 @@ fn pnpm_trust(
     // re-issued on every run. Same gate as the governing heal; never
     // configured.
     for key in rush_lock_keys {
-        if let Some(text) =
-            pnpm_heal_root(rewrite.files.contains_key(key), files.get(key), overrides)
-        {
+        if let Some(text) = pnpm_heal_root(written.contains_key(key), files.get(key), overrides) {
             pnpm_lock_texts.push(text);
             spliced_rush += 1;
         }
@@ -3034,7 +3137,7 @@ fn pnpm_trust(
     let governing_lock_v9 = heal_locks.iter().copied().any(is_v9)
         || governing
             .iter()
-            .filter_map(|key| rewrite.files.get(*key))
+            .filter_map(|key| written.get(*key))
             .any(is_v9);
     // Every touched pnpm lock is a KNOWN legacy (5.x/6.0) format, where
     // `--trust-lockfile` is rejected as an unknown option. An unparseable
@@ -3643,6 +3746,17 @@ fn confirm(
         .map(|c| {
             let purl = c.purl.as_str();
             let uuid = c.dep.patch_uuid.as_str();
+            // A patch of an ecosystem a Bazel ruleset governs is decided by
+            // the Bazel rewriter group's report and by nothing else: it is
+            // in exactly one of the two sets, and a Socket URL in a lock
+            // no hub reads proves nothing about the Bazel build. Refusal
+            // is asked first, so a uuid a lane refused is never confirmed.
+            if rewrite.refused_bazel_uuids.contains(uuid) {
+                return ProbeStep::Decided(false);
+            }
+            if rewrite.confirmed_bazel_uuids.contains(uuid) {
+                return ProbeStep::Decided(true);
+            }
             // vlt decides before the binary-bun rule, so `bun.lockb` beside
             // a vlt-driven `vlt-lock.json` never confirms an npm purl.
             if rewrite.refused_vlt_uuids.contains(uuid)
@@ -3882,6 +3996,24 @@ pub fn guard(
     };
     if let Some(linked) = written().find(|k| view.is_symlink(k)) {
         return Some(symlink_refusal(linked));
+    }
+    // The commit anchored at the Bazel root refuses a path it reaches
+    // through a link, the file or a directory above it, and a path whose
+    // bytes it cannot compare. Said here, so a dry run predicts it.
+    if let Some(bazel) = &done.bazel {
+        let rewritten = bazel.rewritten();
+        let spelled = |at: usize| rewritten.get(at).map_or("", String::as_str);
+        for (at, change) in bazel.changes.iter().enumerate() {
+            let levels = change.rel.split('/').filter(|level| !level.is_empty());
+            let path = levels.fold(bazel.root.clone(), |at, level| at.join(level));
+            let linked = crate::utils::containment::try_linked_level(&bazel.root, &path);
+            if !matches!(linked, Ok(None)) {
+                return Some(symlink_refusal(spelled(at)));
+            }
+            if bazel.unreadable.contains(&change.rel) {
+                return Some(unreadable_refusal(spelled(at)));
+            }
+        }
     }
     if let Some(refusal) = undecodable_guard(&done.undecodable_reads, candidates) {
         return Some(refusal);
