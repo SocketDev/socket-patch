@@ -157,3 +157,6 @@ Documented limitations and verified false positives. One bullet each. Search thi
 - 2026-11-13: hosted scan warns "Not refreshed (the patched gem's gemspec differs from the installed one)" only when the mock patched gem was rebuilt with `gem build`; a repack that keeps the upstream `metadata.gz` refreshes fine. Harness artifact.
 - 2026-11-13: `vex` / `list` say "No patches in this project" on a hosted project whose lock points at a loopback mock; discovery reads only a Socket host or `--patch-server-url`. Harness artifact.
 - 2026-11-13: `vex` exits 2 "must name the project it describes" in a project with no git origin and no gemspec; the message names the flag to pass. Working as documented.
+- `vex` from a monorepo root attests only the root project although a bare scan, `list` and `rollback` cover the project directories below. Documented: `vex`, `apply`, `repair`, `remove` and `rollback <target>` act on the one project at `--cwd` (2026-11-14).
+- `remove <gem>` from a monorepo root where only sub-projects pin the gem says "No patch found matching identifier" and exits 1. Same documented one-project rule; run it in the sub-project (2026-11-14).
+- `vex --json` without `--output` fails with `json_requires_output`. Documented (2026-11-14).
