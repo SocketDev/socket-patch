@@ -15,12 +15,13 @@
 //! `tests/e2e_bazel/vendored.rs` as its submodule.
 
 use serde_json::json;
+use socket_patch_core::bazel::codes::Code;
 use socket_patch_core::bazel::lanes::Proofs;
 use socket_patch_core::bazel::model::{
-    Anchor, ArtifactForm, ArtifactSpec, AttestBasis, BazelRef, CellClaim, ClaimOs, ClaimSystem,
-    Digest, Files, GateOutcome, IndexRow, LaneCx, LaneId, LaneOps, LaneSpec, LaneTable, Mode,
-    OwnedWrite, PatchRequest, PinSource, Plan, PlannedWrite, RestoreOutcome, Ruleset, TextRead,
-    VexWithhold, WithholdKind, WriteClass,
+    Actor, Advisory, Anchor, ArtifactForm, ArtifactSpec, AttestBasis, BazelRef, CellClaim, ClaimOs,
+    ClaimSystem, Digest, Files, GateOutcome, IndexRow, Interim, LaneCx, LaneId, LaneOps, LaneSpec,
+    LaneTable, Mode, OwnedWrite, PatchRequest, PinSource, Plan, PlannedWrite, RestoreOutcome,
+    Ruleset, RunKind, RunRequired, TextRead, VexWithhold, WithholdKind, WriteClass,
 };
 use socket_patch_core::patch::redirect::{FileEdit, RewriteResult};
 use socket_patch_core::vendor::lock_inventory::{LockIntegrity, LockfileEntry, SourceKind};
@@ -37,6 +38,39 @@ pub const ARTIFACT: &[u8] = b"left-pad 1.3.0, patched\n";
 /// members of an archive against the patch record, and this is no archive.
 pub const LEAF: &str = "left-pad-1.3.0.bin";
 pub const UPSTREAM: &str = "{integrity: sha512-upstream-left-pad}";
+/// A patch no test vendors: the one a faulty plan or a stray row names.
+pub const OTHER_UUID: &str = "0a1b2c3d-0000-4000-8000-0000000000a1";
+
+/// Packages the lane plans wrongly, by name, each at version `1.0.0`:
+/// what a seam has to refuse before it asks the patch service. The lock
+/// of [`FAULTS_LOCK_TEXT`] resolves each.
+pub const FAULTS: [&str; 7] = [
+    "spec-uuid",
+    "spec-dir",
+    "spec-up",
+    "spec-sep",
+    "spec-scope",
+    "spec-two",
+    "runs-after",
+];
+
+/// The purl of the faulty package `name`.
+pub fn fault_purl(name: &str) -> String {
+    format!("pkg:npm/{name}@1.0.0")
+}
+
+/// A lock that resolves `left-pad` and every package of [`FAULTS`].
+pub fn faults_lock_text() -> String {
+    let (mut packages, mut snapshots) = (String::new(), String::new());
+    for name in FAULTS {
+        packages.push_str(&format!(
+            "  {name}@1.0.0:\n    resolution: {{integrity: sha512-upstream-{name}}}\n\n"
+        ));
+        snapshots.push_str(&format!("  {name}@1.0.0: {{}}\n\n"));
+    }
+    let lock = LOCK_TEXT.replace("packages:\n\n", &format!("packages:\n\n{packages}"));
+    lock.replace("snapshots:\n\n", &format!("snapshots:\n\n{snapshots}"))
+}
 
 pub const BAZELVERSION: &str = "9.3.2\n";
 pub const MODULE: &str = "bazel_dep(name = \"aspect_rules_js\", version = \"3.6.0\")\n\
@@ -130,7 +164,27 @@ fn toy_gate(cx: &LaneCx<'_>, req: &PatchRequest<'_>) -> GateOutcome {
         "is-odd" => ArtifactForm::ZipOfTree,
         _ => ArtifactForm::NativeFile,
     };
-    GateOutcome::Proceed(Plan {
+    let mut spec = ArtifactSpec {
+        uuid: req.uuid.to_string(),
+        form,
+        dir,
+        leaf: format!("{}-{}.bin", req.name, req.version),
+        digest: digest(),
+    };
+    // What a lane must never get past a seam (see [`FAULTS`]).
+    match req.name {
+        "spec-uuid" => spec.uuid = OTHER_UUID.to_string(),
+        "spec-dir" => spec.dir = spec.dir.replace(&format!("/{}", req.uuid), ""),
+        "spec-up" => spec.leaf = "../x".to_string(),
+        "spec-sep" => spec.leaf = "a/b".to_string(),
+        "spec-scope" => spec.leaf = "@scope/name-1.0.0.tgz".to_string(),
+        _ => {}
+    }
+    let artifacts = match req.name {
+        "spec-two" => vec![spec.clone(), spec],
+        _ => vec![spec],
+    };
+    let plan = Plan {
         uuid: req.uuid.to_string(),
         lane: LANE,
         writes: vec![
@@ -141,21 +195,151 @@ fn toy_gate(cx: &LaneCx<'_>, req: &PatchRequest<'_>) -> GateOutcome {
             PlannedWrite::Owned(OwnedWrite::Index),
         ],
         repositories: Vec::new(),
-        artifacts: vec![ArtifactSpec {
-            uuid: req.uuid.to_string(),
-            form,
-            dir,
-            leaf: format!("{}-{}.bin", req.name, req.version),
-            digest: digest(),
-        }],
+        artifacts,
         advisories: Vec::new(),
         attest: AttestBasis::LockPath,
         anchor: Anchor::Digest,
+    };
+    if req.name != "runs-after" {
+        return GateOutcome::Proceed(plan);
+    }
+    // A works-after plan: one command the user runs afterwards.
+    let run = RunRequired {
+        kind: RunKind::Lockfile,
+        command: "bazel mod deps --lockfile_mode=update".to_string(),
+        argv: Vec::new(),
+        env: Vec::new(),
+        outputs: Vec::new(),
+        interim: Interim::Passing,
+        actor: Actor::User,
+        platforms: Vec::new(),
+        gates_vex: false,
+    };
+    GateOutcome::ProceedAfter(plan, run)
+}
+
+/// [`toy_gate`] with one change to the plan it makes.
+fn changed(cx: &LaneCx<'_>, req: &PatchRequest<'_>, change: impl FnOnce(&mut Plan)) -> GateOutcome {
+    match toy_gate(cx, req) {
+        GateOutcome::Proceed(mut plan) => {
+            change(&mut plan);
+            GateOutcome::Proceed(plan)
+        }
+        other => other,
+    }
+}
+
+/// The plan with an advisory riding on it, as the gate adds one for a
+/// hand-written pin it left out of the write set.
+pub fn gate_advised(cx: &LaneCx<'_>, req: &PatchRequest<'_>) -> GateOutcome {
+    changed(cx, req, |plan| {
+        plan.advisories.push(Advisory {
+            code: Code::WorkspaceOutOfScope,
+            detail: "a hand-written pin of npm was left as it is".to_string(),
+        });
     })
 }
 
+/// The plan relying on the `.bazelignore` line of the project's vendor
+/// tree, as most vendored lanes of the design do.
+pub fn gate_hidden(cx: &LaneCx<'_>, req: &PatchRequest<'_>) -> GateOutcome {
+    let project = cx.ws.root.project_rel.clone();
+    let line = match project.is_empty() {
+        true => ".socket/vendor".to_string(),
+        false => format!("{project}/.socket/vendor"),
+    };
+    changed(cx, req, |plan| {
+        plan.writes.push(PlannedWrite::IgnoreLine { line });
+    })
+}
+
+/// The plan as a lane makes it that edits the hub's native lock: no
+/// generated value, so the executor asks for no `pins` row.
+pub fn gate_native(cx: &LaneCx<'_>, req: &PatchRequest<'_>) -> GateOutcome {
+    let lock = lock_of(cx).unwrap_or_default();
+    changed(cx, req, |plan| {
+        plan.writes = vec![
+            PlannedWrite::NativeLock { path: lock },
+            PlannedWrite::Owned(OwnedWrite::Index),
+        ];
+    })
+}
+
+/// The plan with a real archive for its artifact ([`tarball`]): what the
+/// vendor ledger's own artifact check verifies against a patch record.
+pub fn gate_archive(cx: &LaneCx<'_>, req: &PatchRequest<'_>) -> GateOutcome {
+    let (name, version) = (req.name.to_string(), req.version.to_string());
+    changed(cx, req, |plan| {
+        for spec in &mut plan.artifacts {
+            spec.leaf = format!("{name}-{version}.tgz");
+            spec.digest = Digest::Sha256(Digest::sha256_hex(tarball()));
+        }
+    })
+}
+
+/// The file of [`tarball`] that the patch of [`archive_record`] patches,
+/// before and after.
+pub const ARCHIVE_FILE: &str = "package/index.js";
+pub const ARCHIVE_BEFORE: &[u8] = b"module.exports = 'upstream';\n";
+pub const ARCHIVE_AFTER: &[u8] = b"module.exports = 'patched';\n";
+
+/// A patched `left-pad` as the patch service serves an npm artifact: a
+/// gzipped tarball. Built once, so its digest is one value per process.
+pub fn tarball() -> &'static [u8] {
+    static BYTES: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+    BYTES.get_or_init(|| {
+        let gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        let mut tar = tar::Builder::new(gz);
+        let manifest = br#"{"name":"left-pad","version":"1.3.0"}"#;
+        for (name, bytes) in [
+            ("package/package.json", &manifest[..]),
+            (ARCHIVE_FILE, ARCHIVE_AFTER),
+        ] {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(bytes.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            tar.append_data(&mut header, name, bytes).expect("a member");
+        }
+        let gz = tar.into_inner().expect("the archive");
+        gz.finish().expect("the gzip stream")
+    })
+}
+
+/// A writer that leaves every file as it is and says nothing.
+pub fn write_nothing(_: &LaneCx<'_>, _: &mut Files, _: &[PinSource], _: &mut RewriteResult) {}
+
+/// A writer that will not pin, and says so.
+pub fn write_refuses(
+    _: &LaneCx<'_>,
+    _: &mut Files,
+    pins: &[PinSource],
+    result: &mut RewriteResult,
+) {
+    for pin in pins {
+        if let PinSource::Vendored(pin) = pin {
+            result.refused_bazel_uuids.insert(pin.uuid.clone());
+        }
+    }
+}
+
+/// The lane's own functions, for a table that swaps one of them.
+pub const fn ops() -> LaneOps {
+    OPS
+}
+
+/// A table like [`TABLE`] over `ops`, whose lane may use `classes`. The
+/// table of a test lives as long as the process, as a real one does.
+pub fn table_with(ops: LaneOps, classes: &'static [WriteClass]) -> LaneTable {
+    let spec = LaneSpec { classes, ..SPEC };
+    let lanes: &'static [LaneSpec] = Box::leak(Box::new([spec]));
+    let ops: &'static LaneOps = Box::leak(Box::new(LaneOps { lanes, ..ops }));
+    LaneTable(Box::leak(Box::new([(Ruleset::RulesJs, ops)])))
+}
+
 /// The pin: the package's `resolution:` value becomes the artifact's path
-/// and digest. A value that is the pin already is left as it is.
+/// and digest. A value that is the pin already is left as it is. The
+/// patch is confirmed for the hub in both cases, and in no other.
 fn toy_rewrite(cx: &LaneCx<'_>, files: &mut Files, pins: &[PinSource], result: &mut RewriteResult) {
     let Some(lock) = lock_of(cx) else { return };
     let Some(mut text) = files.get(&lock).cloned() else {
@@ -170,6 +354,9 @@ fn toy_rewrite(cx: &LaneCx<'_>, files: &mut Files, pins: &[PinSource], result: &
             continue;
         };
         let (old, new) = (text[at.clone()].to_string(), pinned(&pin.path, &pin.digest));
+        // Pinned by this call or found pinned: either way the writer
+        // vouches for this hub's lock.
+        result.confirmed_bazel_uuids.insert(pin.uuid.clone());
         if old == new {
             continue;
         }

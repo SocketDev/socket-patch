@@ -21,7 +21,7 @@ use socket_patch_core::vendor::{
 };
 
 use crate::args::GlobalArgs;
-use crate::commands::vendor::{dispatch_revert_one_opts, vendor_records_reusing, EjectCapture};
+use crate::commands::vendor::{dispatch_revert_one_with, vendor_records_reusing, EjectCapture};
 use crate::ecosystem_dispatch::NpmCrawlSnapshot;
 use crate::json_envelope::Envelope;
 
@@ -52,6 +52,8 @@ pub(crate) struct VendoredBackend<'a> {
     pub(crate) service: Option<&'a VendorServiceConfig>,
     /// See [`VendoredBackend::with_closing_lines`].
     pub(crate) closing_lines: Option<&'a ClosingLines<'a>>,
+    /// See [`VendoredBackend::with_workspace_notes`].
+    pub(crate) workspace_notes: bool,
 }
 
 /// Lines for the human close of a vendor run to print under its summary
@@ -90,7 +92,18 @@ impl<'a> VendoredBackend<'a> {
             common: common.at_project_root(),
             service,
             closing_lines: None,
+            workspace_notes: false,
         }
+    }
+
+    /// Have [`VendoredBackend::apply`] report what the Bazel gate finds
+    /// to say about the workspace above the project (it was detected, it
+    /// cannot be read, its Bazel is too old), as run-level warnings. The
+    /// `vendor` command asks for it; `scan` and `get` do not, because a
+    /// scan says the same notes itself before its vendor step.
+    pub(crate) fn with_workspace_notes(mut self) -> Self {
+        self.workspace_notes = true;
+        self
     }
 
     /// Have [`VendoredBackend::apply`]'s human close print what `lines`
@@ -140,6 +153,7 @@ impl<'a> VendoredBackend<'a> {
             req.prior,
             req.eject,
             self.closing_lines,
+            self.workspace_notes,
         ))
         .await
     }
@@ -158,6 +172,9 @@ impl<'a> VendoredBackend<'a> {
         stop_on_failure: bool,
     ) -> Vec<RevertedEntry> {
         let mut out = Vec::with_capacity(keys.len());
+        // One loader of the Bazel workspace above the project for the
+        // whole loop: only an entry that a Bazel index wires asks it.
+        let bazel = crate::bazel_gate::vendored::reader();
         for key in keys {
             let Some(entry) = state.entries.get(key).cloned() else {
                 out.push(RevertedEntry {
@@ -171,7 +188,7 @@ impl<'a> VendoredBackend<'a> {
             let flavor = entry.flavor.clone();
             let wiring_files: Vec<String> = entry.wiring.iter().map(|w| w.file.clone()).collect();
             let root = &self.common.cwd;
-            let outcome = dispatch_revert_one_opts(&entry, root, opts).await;
+            let outcome = dispatch_revert_one_with(&entry, root, opts, &bazel).await;
             let step = if !outcome.success {
                 VendorRevertStep::Failed(outcome.error.unwrap_or_else(|| "unknown error".into()))
             } else if outcome.kept_artifact {

@@ -43,6 +43,23 @@ pub type LedgerLoad<'a> = Result<&'a HashMap<String, VendorEntry>, &'a std::io::
 pub struct VendorRefusal {
     pub code: &'static str,
     pub detail: String,
+    /// The `details` of the refusal's event, for a refusal that has any:
+    /// one the Bazel gate made for a package a ruleset governs carries its
+    /// `token`, `lift` and `bazel` here, so the download phase and the
+    /// dry-run preview print what the vendor loop prints. `None` for every
+    /// refusal [`vendor_refusals`] decides.
+    pub details: Option<serde_json::Value>,
+}
+
+impl VendorRefusal {
+    /// A refusal with a code and a detail and nothing else to say.
+    pub fn new(code: &'static str, detail: impl Into<String>) -> Self {
+        Self {
+            code,
+            detail: detail.into(),
+            details: None,
+        }
+    }
 }
 
 /// The refusals of one run, keyed by the candidate purl as given.
@@ -149,10 +166,7 @@ pub async fn vendor_refusals(
 
 fn refuse(out: &mut VendorRefusals, purl: &str, code: &'static str, detail: &str) {
     out.entry(purl.to_string())
-        .or_insert_with(|| VendorRefusal {
-            code,
-            detail: detail.to_string(),
-        });
+        .or_insert_with(|| VendorRefusal::new(code, detail));
 }
 
 /// The npm flavor gate the router picks for this project. vlt wins the

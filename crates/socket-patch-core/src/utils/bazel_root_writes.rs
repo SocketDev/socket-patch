@@ -1185,6 +1185,142 @@ pub async fn after_vendor_tree(
     outcome
 }
 
+/// What [`before_plans`] decided, for the [`after_plans`] call that
+/// follows the plans' writes.
+#[derive(Debug, Default)]
+pub struct PlanGuard {
+    /// One per tree the plans rely on a line for.
+    guarded: Vec<Guarded>,
+    /// A dry run only: the root's `.bazelignore` as the real run would
+    /// have left it by now.
+    preview: Option<Vec<u8>>,
+}
+
+impl PlanGuard {
+    /// What the run reports with the package the plans are for, once they
+    /// are carried through: a line that was added (or would be).
+    pub fn advisories(&self) -> impl Iterator<Item = &Advisory> {
+        self.guarded.iter().flat_map(|guarded| &guarded.advisories)
+    }
+
+    /// A dry run that would add a line: the file the real run would have
+    /// written before the plans are applied, by its root-relative path. A
+    /// caller that previews the plans on a transaction stages it there, so
+    /// the preview and the real run decide the same. `None` in a real run,
+    /// where the line is on disk, and where no line would be added.
+    pub fn preview(&self) -> Option<(&'static str, &[u8])> {
+        let bytes = self.preview.as_deref()?;
+        Some((ignore::BAZELIGNORE, bytes))
+    }
+}
+
+/// The root's `.bazelignore` with the line of `tree` in it, for the dry
+/// run of a guard that would add it. `held` is the file as an earlier
+/// tree of the same call would leave it.
+fn previewed(project: &Path, tree: SocketTree, held: Option<Vec<u8>>) -> Option<Vec<u8>> {
+    let reads = ReadBoundary::upward(ReadScope::Workspace, project);
+    let survey = RootProbe::new().survey(project, &reads);
+    // A line is written only where one root governs the project.
+    let [root] = survey.roots.as_slice() else {
+        return held;
+    };
+    let Ok(line) = IgnoreLine::new(&root.project_rel, tree) else {
+        return held;
+    };
+    let file = match held {
+        Some(bytes) => FileText::Bytes(bytes),
+        None => read(&root.root.join(ignore::BAZELIGNORE)),
+    };
+    match ignore::insert(&file, std::slice::from_ref(&line)) {
+        Ok(Some(insertion)) => Some(insertion.bytes),
+        _ => file.as_bytes().map(<[u8]>::to_vec),
+    }
+}
+
+/// [`before_tree`] for the plans a lane made for the project at
+/// `project_root`, which a seam carries out in a backend's place: call it
+/// before the unit directory `unit` is created or written into, and before
+/// the plans are handed to `bazel::exec::apply`, which requires that the
+/// root's `.bazelignore` already hides every tree a plan relies on a line
+/// for and never writes the line itself. Which trees those are is read
+/// from the plans here, so that no seam looks into a plan's writes: a plan
+/// that relies on no line asks for nothing, whatever its artifact is.
+///
+/// `Err` is the refusal for the package the plans are for; nothing stays
+/// written. Hand the value to [`after_plans`] once it is known whether the
+/// plans were carried through.
+pub async fn before_plans(
+    project_root: &Path,
+    plans: &[crate::bazel::model::Plan],
+    unit: &Path,
+    dry_run: bool,
+) -> Result<PlanGuard, Refusal> {
+    use crate::bazel::model::PlannedWrite;
+    let lines = plans.iter().flat_map(|plan| &plan.writes);
+    let mut trees: Vec<SocketTree> = lines
+        .filter_map(|write| match write {
+            // A line socket-patch does not write is the executor's to
+            // refuse.
+            PlannedWrite::IgnoreLine { line } => IgnoreLine::parse(line).map(|line| line.tree()),
+            _ => None,
+        })
+        .collect();
+    trees.sort();
+    trees.dedup();
+    if trees.is_empty() {
+        return Ok(PlanGuard::default());
+    }
+    let (project, unit) = (project_root.to_path_buf(), unit.to_path_buf());
+    run_blocking(move || {
+        let creates = !holds_entries(&unit);
+        let mut decided = PlanGuard::default();
+        for tree in trees {
+            let advisories = match guard(&project, tree, &unit, creates, dry_run) {
+                Ok(advisories) => advisories,
+                Err(refusal) => {
+                    // The lines this call put in for the trees before go
+                    // back out with the refusal.
+                    let done = decided.guarded.iter().filter(|_| !dry_run);
+                    for tree in done.filter_map(|done| done.tree) {
+                        release(&project, tree);
+                    }
+                    return Err(refusal);
+                }
+            };
+            let adds = |advisory: &Advisory| advisory.code == Code::WorkspaceIgnoreLineAdded;
+            if dry_run && advisories.iter().any(adds) {
+                decided.preview = previewed(&project, tree, decided.preview.take());
+            }
+            decided.guarded.push(Guarded {
+                tree: Some(tree),
+                advisories,
+                dry_run,
+            });
+        }
+        Ok(decided)
+    })
+    .await
+}
+
+/// What the run reports of `guard` once the plans it guarded are settled.
+/// `carried`: they were carried through (staged for a commit, or in place
+/// already), so the lines they rely on stay, whatever shape the artifact
+/// has: the lane said that it needs the line, and an archive unit is no
+/// tree [`after_removal`] would keep it for. Otherwise the lines this run
+/// put in go back out, unless a tree they cover is there, and what could
+/// not be taken back is reported. Call it again with `false` when the
+/// commit of carried plans did not land.
+pub async fn after_plans(project_root: &Path, guard: &PlanGuard, carried: bool) -> Vec<Advisory> {
+    let mut report = Vec::new();
+    for guarded in &guard.guarded {
+        match carried {
+            true => report.extend(guarded.advisories.iter().cloned()),
+            false => report.extend(settle(project_root, guarded, false).await),
+        }
+    }
+    report
+}
+
 /// [`after_removal`] for a vendored revert: the warnings of its outcome.
 pub async fn after_vendor_removal(project_root: &Path, dry_run: bool) -> Vec<VendorWarning> {
     let left = after_removal(project_root, SocketTree::Vendor, dry_run).await;
@@ -2234,5 +2370,105 @@ mod tests {
         let applied = after_agent_go_tree(&project, &asked, result(true, None)).await;
         assert!(applied.error.unwrap().contains("would add the line"));
         assert_eq!(repo.tree(), wired);
+    }
+
+    /// A plan of a lane, with the writes it relies on.
+    fn plan(writes: Vec<crate::bazel::model::PlannedWrite>) -> crate::bazel::model::Plan {
+        use crate::bazel::model::{Anchor, AttestBasis, LaneId, Plan};
+        Plan {
+            uuid: UUID.to_string(),
+            lane: LaneId::UNNAMED,
+            writes,
+            repositories: Vec::new(),
+            artifacts: Vec::new(),
+            advisories: Vec::new(),
+            attest: AttestBasis::LockPath,
+            anchor: Anchor::Digest,
+        }
+    }
+
+    /// The entry of a seam that carries out a lane's plan in a backend's
+    /// place. The line a plan relies on goes in before the unit, whatever
+    /// shape the artifact has, and stays once the plan is carried through
+    /// (an archive is no tree a removal would keep it for); a plan that is
+    /// not carried through takes it back, and so does a commit that did
+    /// not land. A plan that relies on no line asks for nothing, and a dry
+    /// run writes nothing and hands back the file the real run would have
+    /// written.
+    #[tokio::test]
+    async fn a_plans_line_goes_in_before_its_unit_and_stays_while_the_plan_does() {
+        use crate::bazel::model::PlannedWrite;
+        let repo = Repo::workspace();
+        let before = repo.tree();
+        // An archive unit of an ecosystem no backend asks a line for.
+        let unit = repo
+            .top
+            .join(vendor_uuid_dir_rel("npm", UUID).expect("a unit"));
+        let line = || PlannedWrite::IgnoreLine {
+            line: ".socket/vendor".to_string(),
+        };
+
+        let lock = PlannedWrite::NativeLock {
+            path: "pnpm-lock.yaml".to_string(),
+        };
+        let asked = before_plans(&repo.top, &[plan(vec![lock])], &unit, false).await;
+        let asked = asked.expect("nothing to refuse");
+        assert_eq!((asked.advisories().count(), asked.preview()), (0, None));
+        assert_eq!(after_plans(&repo.top, &asked, true).await, Vec::new());
+        assert_eq!(repo.tree(), before, "no line was planned, none is written");
+
+        // A dry run decides the same and writes nothing.
+        let plans = [plan(vec![line()])];
+        let dry = before_plans(&repo.top, &plans, &unit, true).await;
+        let dry = dry.expect("the line can be written");
+        let said: Vec<&Advisory> = dry.advisories().collect();
+        assert!(said[0].detail.starts_with("would add the line"), "{said:?}");
+        let preview = (ignore::BAZELIGNORE, &b".socket/vendor\n"[..]);
+        assert_eq!(dry.preview(), Some(preview));
+        assert_eq!(repo.tree(), before);
+
+        // The real run: the line and its row, before any unit exists.
+        let asked = before_plans(&repo.top, &plans, &unit, false).await;
+        let asked = asked.expect("the line can be written");
+        assert_eq!(asked.preview(), None, "the line is on disk");
+        assert_eq!(repo.rows(), [".socket/vendor"]);
+        let hidden = std::fs::read(repo.top.join(ignore::BAZELIGNORE)).expect("the file");
+        assert_eq!(hidden, b".socket/vendor\n");
+        // Not carried through: the root is as it was found.
+        assert_eq!(after_plans(&repo.top, &asked, false).await, Vec::new());
+        assert_eq!(repo.tree(), before);
+
+        // Carried through with an archive artifact: the line stays, and
+        // the run says that the root's files changed.
+        let asked = before_plans(&repo.top, &plans, &unit, false).await;
+        let asked = asked.expect("the line can be written");
+        repo.put(
+            &format!(".socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz"),
+            b"an archive",
+        );
+        let told = after_plans(&repo.top, &asked, true).await;
+        assert_eq!(told.len(), 1, "{told:?}");
+        assert_eq!(told[0].code, Code::WorkspaceIgnoreLineAdded);
+        assert_eq!(repo.rows(), [".socket/vendor"]);
+        // A second run finds the tree hidden and has nothing to add.
+        let again = before_plans(&repo.top, &plans, &unit, false).await;
+        let again = again.expect("already hidden");
+        assert_eq!(again.advisories().count(), 0);
+        // The commit of the carried plan did not land: the line goes.
+        std::fs::remove_dir_all(repo.top.join(".socket").join("vendor")).expect("unwind");
+        assert_eq!(after_plans(&repo.top, &asked, false).await, Vec::new());
+        assert_eq!(repo.tree(), before);
+
+        // Where the line cannot be written the plan's unit is refused,
+        // with the channel's own code and remedy.
+        let nested = Repo::workspace();
+        nested.put("svc/MODULE.bazel", b"module(name = \"svc\")\n");
+        let project = nested.dir("svc");
+        let unit = project.join(vendor_uuid_dir_rel("npm", UUID).expect("a unit"));
+        let wired = nested.tree();
+        let refused = before_plans(&project, &[plan(vec![line()])], &unit, false).await;
+        let refused = refused.expect_err("two roots, no line");
+        assert_eq!(refused.token, Some(NESTED_BAZEL_ROOTS));
+        assert_eq!(nested.tree(), wired);
     }
 }

@@ -469,6 +469,21 @@ pub(crate) async fn dispatch_revert_one_opts(
     project_root: &Path,
     opts: RevertOpts,
 ) -> RevertOutcome {
+    let bazel = crate::bazel_gate::vendored::reader();
+    dispatch_revert_one_with(entry, project_root, opts, &bazel).await
+}
+
+/// [`dispatch_revert_one_opts`] for a run that reverts several entries:
+/// `bazel` is the run's one loader of the Bazel workspace above the
+/// project (`bazel_gate::vendored::reader`), so the workspace is read
+/// once however many entries a Bazel index wires. Under no Bazel root,
+/// and for an entry with native wiring, it is never asked.
+pub(crate) async fn dispatch_revert_one_with(
+    entry: &VendorEntry,
+    project_root: &Path,
+    opts: RevertOpts,
+    bazel: &std::sync::Arc<crate::bazel_gate::Loader>,
+) -> RevertOutcome {
     // Before any lock edit or delete: the unit removal would reach through
     // a linked vendor dir into another project's artifacts (#664).
     if let Some(link) =
@@ -493,6 +508,7 @@ pub(crate) async fn dispatch_revert_one_opts(
                 opts,
                 socket_patch_core::bazel::lanes::PRODUCTION,
                 &crate::bazel_gate::vendored::NoAnchoredCommit,
+                bazel,
             )
             .await
         }
@@ -541,6 +557,7 @@ async fn unwired_check_failure(
     root: &Path,
     key: &str,
     entry: &VendorEntry,
+    bazel: &std::sync::Arc<crate::bazel_gate::Loader>,
 ) -> String {
     let dir = format!(".socket/vendor/{}/{}", entry.ecosystem, entry.uuid);
     if let Some(c) = discovery.vendored_contest(&entry.base_purl, &entry.uuid) {
@@ -577,7 +594,7 @@ async fn unwired_check_failure(
     if matches!(entry.ecosystem.as_str(), "npm" | "pypi")
         && !discovery.resolves_package(&entry.base_purl)
         && discovery.vendor_entry_in_use(root, entry).await == Some(false)
-        && bazel_in_use(root, entry).await == Some(false)
+        && bazel_in_use(bazel, root, entry).await == Some(false)
     {
         return format!(
             "dependency removed: no lockfile resolves {} any more (it was upgraded or \
@@ -608,10 +625,17 @@ async fn unwired_check_failure(
 
 /// Whether the Bazel build above `root` still uses the vendored `entry`
 /// (`bazel_gate::vendored::in_use`). `Some(false)` under no Bazel root.
-async fn bazel_in_use(root: &Path, entry: &VendorEntry) -> Option<bool> {
+/// `bazel` is the run's one loader of that workspace.
+async fn bazel_in_use(
+    bazel: &std::sync::Arc<crate::bazel_gate::Loader>,
+    root: &Path,
+    entry: &VendorEntry,
+) -> Option<bool> {
     let ecosystem = Ecosystem::from_purl(&entry.base_purl);
     let purl = Some(entry.base_purl.as_str());
-    crate::bazel_gate::vendored::in_use_blocking(root, ecosystem, purl, &entry.uuid).await
+    let lanes = socket_patch_core::bazel::lanes::PRODUCTION;
+    let uuid = entry.uuid.as_str();
+    crate::bazel_gate::vendored::in_use_blocking(bazel, lanes, root, ecosystem, purl, uuid).await
 }
 
 /// Does `eco` fall inside this run's `--ecosystems` scope? A vendor-ledger
@@ -1367,13 +1391,41 @@ pub async fn run(args: VendorArgs) -> i32 {
 
 /// Read-only audit: no API client, lock recovery, staging, or telemetry is started.
 async fn run_check(args: &VendorArgs) -> i32 {
-    let root = &args.common.project_root();
-    let local_repo = args.local_repo.as_ref().map(|p| args.common.cwd.join(p));
+    let lanes = socket_patch_core::bazel::lanes::PRODUCTION;
+    let local_repo = args.local_repo.as_deref();
+    let env = match check_ledger(&args.common, local_repo, lanes).await {
+        Ok(env) => env,
+        Err(exit) => return exit,
+    };
+    if args.common.json {
+        println!("{}", env.to_pretty_json());
+    }
+    i32::from(env.summary.failed != 0)
+}
+
+/// The audit of [`run_check`] over `lanes`: the envelope with one event
+/// per ledger entry, or the exit code of a refusal that was already
+/// printed. An entry that a Bazel root's index wires is judged by what the
+/// Bazel build reads (`bazel_gate::vendored::check_entry`), never by the
+/// native lockfile checks of its ecosystem: its ledger entry records no
+/// lockfile flavor, and a native lock beside the hub's lock is not what
+/// the build installs from.
+pub(crate) async fn check_ledger(
+    common: &GlobalArgs,
+    local_repo: Option<&Path>,
+    lanes: socket_patch_core::bazel::model::LaneTable,
+) -> Result<Envelope, i32> {
+    let root = &common.project_root();
+    let local_repo = local_repo.map(|p| common.cwd.join(p));
     let mut env = Envelope::new(Command::Vendor);
+    // One loader of the Bazel workspace above the project for the whole
+    // audit. Under no Bazel root it stats and reads nothing.
+    let bazel = crate::bazel_gate::vendored::reader();
     let state = match load_state(root).await {
         Ok(state) => state,
         Err(e) => {
-            return emit_eject_refusal(&args.common, "vendor_state_unreadable", &e.to_string())
+            let refused = emit_eject_refusal(common, "vendor_state_unreadable", &e.to_string());
+            return Err(refused);
         }
     };
     // JVM trees are not `.socket/vendor/<eco>/<uuid>` dirs the reference
@@ -1391,9 +1443,10 @@ async fn run_check(args: &VendorArgs) -> i32 {
     const JVM_ORPHAN_DETAIL: &str = "JVM artifacts exist without a vendor ledger entry; restore \
                                      .socket/vendor/state.json from version control";
     if state.entries.is_empty() && jvm_orphan.is_some() {
-        return emit_eject_refusal(&args.common, "vendor_ledger_missing", JVM_ORPHAN_DETAIL);
+        let refused = emit_eject_refusal(common, "vendor_ledger_missing", JVM_ORPHAN_DETAIL);
+        return Err(refused);
     }
-    let manifest_path = args.common.resolved_manifest_path();
+    let manifest_path = common.resolved_manifest_path();
     let manifest = match read_manifest(&manifest_path).await {
         Ok(Some(m)) => m,
         // A workspace member verifies nothing of its own: the root's
@@ -1402,14 +1455,14 @@ async fn run_check(args: &VendorArgs) -> i32 {
         Ok(None) => {
             if state.entries.is_empty() && jvm_orphan.is_none() {
                 if let Some(message) = member_refusal(root, "vendor --check").await {
-                    return emit_eject_refusal(&args.common, MEMBER_REFUSAL_CODE, &message);
+                    return Err(emit_eject_refusal(common, MEMBER_REFUSAL_CODE, &message));
                 }
             }
             Default::default()
         }
         Err(e) => {
             let err = crate::json_envelope::manifest_load_error(&manifest_path, &e);
-            return emit_eject_refusal(&args.common, &err.code, &err.message);
+            return Err(emit_eject_refusal(common, &err.code, &err.message));
         }
     };
     let mut entries: Vec<_> = state.entries.iter().collect();
@@ -1421,7 +1474,7 @@ async fn run_check(args: &VendorArgs) -> i32 {
         .values()
         .any(|e| !vendor::jvm::apply::is_jvm_entry(e))
     {
-        Some(crate::commands::discover_wiring(&args.common, root).await)
+        Some(crate::commands::discover_wiring(common, root).await)
     } else {
         None
     };
@@ -1458,21 +1511,24 @@ async fn run_check(args: &VendorArgs) -> i32 {
                 Err(e) => failure = Some(e),
             }
         }
+        // An entry that a Bazel root's index wires is no lockfile
+        // reference: `attest` says whether the build consumes its pin, and
+        // none of the native wiring checks below is asked. Its entry
+        // records no lockfile flavor, which the npm check would read as
+        // `package-lock.json`, and a native lock beside the hub's lock is
+        // not what the Bazel build installs from.
+        let bazel_wired = entry.bazel_index().is_some();
         // The npm check names the exact unwired lock entry, so it runs
         // before the generic liveness rule below.
-        if failure.is_none() && entry.ecosystem == "npm" {
+        if failure.is_none() && entry.ecosystem == "npm" && !bazel_wired {
             failure = vendor::npm_flavor::check_npm_wiring(entry, root)
                 .await
                 .err();
         }
-        // An entry that a Bazel root's index wires is no lockfile
-        // reference: `attest` says whether the build consumes its pin.
-        let bazel_wired = entry.bazel_index().is_some();
         if failure.is_none() && bazel_wired {
-            let (at, checked) = (root.clone(), entry.clone());
+            let (at, checked, asked) = (root.clone(), entry.clone(), bazel.clone());
             let proof = tokio::task::spawn_blocking(move || {
-                let lanes = socket_patch_core::bazel::lanes::PRODUCTION;
-                crate::bazel_gate::vendored::check_entry(&at, &checked, &lanes)
+                crate::bazel_gate::vendored::check_entry(&asked, &at, &checked, &lanes)
             });
             failure = match proof.await {
                 Ok(proof) => proof.err(),
@@ -1489,13 +1545,13 @@ async fn run_check(args: &VendorArgs) -> i32 {
             // intact; a fresh install is then unpatched. Same rule as
             // `vex`'s `vendor_unwired`.
             if !discovery.vendor_entry_live(root, entry).await {
-                failure = Some(unwired_check_failure(discovery, root, key, entry).await);
+                failure = Some(unwired_check_failure(discovery, root, key, entry, &bazel).await);
             }
         }
         // The committed copy and its `replace` can be intact while the
         // project no longer builds: vendor/modules.txt or the go.mod
         // requirements out of step with the `replace` (#343, #618).
-        if failure.is_none() && entry.ecosystem == "golang" {
+        if failure.is_none() && entry.ecosystem == "golang" && !bazel_wired {
             if let Some(record) = record {
                 // Its modules.txt drift is the audit's just below.
                 failure = socket_patch_core::vendor::go_consumer_sync::verify_native_vendor_tree(
@@ -1528,7 +1584,7 @@ async fn run_check(args: &VendorArgs) -> i32 {
             None => PatchEvent::new(PatchAction::Verified, key)
                 .with_reason("vendor_check_ok", "committed artifact and wiring verified"),
         };
-        if !args.common.json && (!args.common.silent || event.action == PatchAction::Failed) {
+        if !common.json && (!common.silent || event.action == PatchAction::Failed) {
             println!("{}: {}", key, event.reason.as_deref().unwrap_or("verified"));
         }
         env.record(event);
@@ -1540,7 +1596,7 @@ async fn run_check(args: &VendorArgs) -> i32 {
         .filter(|(k, _)| !state.entries.contains_key(*k))
     {
         unledgered_uuids.insert(record.uuid.as_str());
-        if !args.common.json {
+        if !common.json {
             eprintln!("{key}: patch has no vendored ledger entry");
         }
         env.record(PatchEvent::new(PatchAction::Failed, key).with_reason(
@@ -1549,7 +1605,7 @@ async fn run_check(args: &VendorArgs) -> i32 {
         ));
     }
     if let Some(rel) = jvm_orphan {
-        if !args.common.json {
+        if !common.json {
             eprintln!("vendor_ledger_missing: {JVM_ORPHAN_DETAIL}");
         }
         env.record(
@@ -1576,7 +1632,7 @@ async fn run_check(args: &VendorArgs) -> i32 {
              the vendor ledger (.socket/vendor/state.json) has no entry for it; restore \
              state.json from version control"
         );
-        if !args.common.json {
+        if !common.json {
             eprintln!("vendor_ledger_missing: {detail}");
         }
         env.record(
@@ -1611,7 +1667,7 @@ async fn run_check(args: &VendorArgs) -> i32 {
         .map(|issue| (issue.module().to_string(), issue.to_string()))
         .collect();
     for (module, detail) in stale_records {
-        if !args.common.json {
+        if !common.json {
             eprintln!(
                 "{}: {detail}",
                 socket_patch_core::vendor::go_consumer_sync::VENDOR_MODULES_TXT_CODE
@@ -1626,10 +1682,7 @@ async fn run_check(args: &VendorArgs) -> i32 {
                 .with_details(serde_json::json!({ "ecosystem": "golang", "module": module })),
         );
     }
-    if args.common.json {
-        println!("{}", env.to_pretty_json());
-    }
-    i32::from(env.summary.failed != 0)
+    Ok(env)
 }
 
 /// Whether every ecosystem in a vendored run has a backend that refuses a
@@ -2304,7 +2357,10 @@ async fn run_eject(
     // of a row during the eject rewrites them, so the rollback must hold
     // them. The executor lists them; none under no Bazel root.
     let at = common.cwd.clone();
-    let recorded = tokio::task::spawn_blocking(move || crate::bazel_gate::vendored::captured(&at));
+    let recorded = tokio::task::spawn_blocking(move || {
+        let loader = crate::bazel_gate::vendored::reader();
+        crate::bazel_gate::vendored::captured(&loader, &at)
+    });
     let touched: Vec<String> = touched
         .into_iter()
         .chain(recorded.await.unwrap_or_default())
@@ -2404,6 +2460,7 @@ async fn run_eject(
         // eject does not use the agent manifest) over this run's client
         // and the shared service-config assembler.
         let applied = VendoredBackend::new(common, Some(&service))
+            .with_workspace_notes()
             .apply(
                 ApplyRequest {
                     manifest: &manifest,
@@ -2700,7 +2757,10 @@ async fn run_vendor(
         println!("The manifest has no patches; nothing to vendor.");
     }
     // Download the server artifacts through the shared vendored backend.
+    // `vendor` is the command of this run, so what the Bazel gate finds
+    // to say about the workspace above the project is its to report.
     let applied = VendoredBackend::new(common, Some(service))
+        .with_workspace_notes()
         .apply(
             ApplyRequest {
                 manifest: &manifest,
@@ -3065,6 +3125,10 @@ struct CandidateGates<'a> {
     /// What the Bazel gate said about the run's records. A purl it
     /// refused never reaches a download, a takeover or a backend.
     bazel: &'a crate::bazel_gate::vendored::Judged,
+    /// `apply` routed the run's record to its vendored lane (the inner
+    /// entry of the Bazel seam): a record no lane plans is refused before
+    /// any takeover, download or backend call.
+    routed: bool,
 }
 
 impl<'a> CandidateGates<'a> {
@@ -3081,6 +3145,60 @@ impl<'a> CandidateGates<'a> {
         };
         if self.refused.contains(candidate) {
             return CandidateVerdict::Skip;
+        }
+        // A lock a Bazel ruleset reads is the gate's to decide, before
+        // any native check of that lock and before the variant probe: a
+        // governed package is refused with the gate's code, token and
+        // lift whatever its variants and whatever is installed.
+        if let Some(refused) = self.bazel.refusal(candidate) {
+            return CandidateVerdict::Refuse {
+                code: refused.code,
+                detail: refused.detail.clone(),
+                details: Some(refused.details.clone()),
+            };
+        }
+        // A package a lane takes is pinned by the lane's plan: which
+        // release the hub builds is the hub lock's to say, so no installed
+        // copy is probed, and what the native backend would refuse about
+        // the lock does not apply. The gate is asked about a release, not
+        // about a variant, so of several variants in one run none is
+        // vendored on a guess.
+        if let Some(planned) = self.bazel.planned(candidate) {
+            let planned_too = |other: &&String| self.bazel.planned(other).is_some();
+            let refused = match group.candidates.iter().filter(planned_too).count() {
+                0 | 1 => None,
+                _ => Some(crate::bazel_gate::vendored::variants_refusal(planned)),
+            };
+            if let Some(refused) = refused {
+                return CandidateVerdict::Refuse {
+                    code: refused.code,
+                    detail: refused.detail,
+                    details: Some(refused.details),
+                };
+            }
+            if let Some(detail) = linked_vendor_dir_refusal(self.cwd, candidate, &record.uuid) {
+                return CandidateVerdict::Refuse {
+                    code: "vendor_dir_symlink_unsupported",
+                    detail,
+                    details: None,
+                };
+            }
+            return CandidateVerdict::Vendor {
+                purl,
+                record,
+                superseded: false,
+            };
+        }
+        // A routed call writes a lane's plan or nothing: it never reaches
+        // a native backend, whose ledger entry would own the installed
+        // tree and set the project's mode.
+        if self.routed {
+            let refused = crate::bazel_gate::vendored::unplanned_route();
+            return CandidateVerdict::Refuse {
+                code: refused.code,
+                detail: refused.detail,
+                details: Some(refused.details),
+            };
         }
         // Variant probe: only the installed distribution's variant is
         // vendored (mirrors apply / select_installed_variants). It hashes a
@@ -3131,19 +3249,7 @@ impl<'a> CandidateGates<'a> {
                 return CandidateVerdict::Ambiguous;
             }
         }
-        // A lock a Bazel ruleset reads is the gate's to decide, before
-        // any native check of that lock.
-        if let Some(refused) = self.bazel.refusal(candidate) {
-            return CandidateVerdict::Refuse {
-                code: refused.code,
-                detail: refused.detail.clone(),
-                details: Some(refused.details.clone()),
-            };
-        }
-        // A package a lane takes is pinned by the lane's plan, so what
-        // the native backend would refuse about the lock does not apply.
-        let native = self.refusals.get(candidate);
-        if let Some(refusal) = native.filter(|_| self.bazel.planned(candidate).is_none()) {
+        if let Some(refusal) = self.refusals.get(candidate) {
             return CandidateVerdict::Refuse {
                 code: refusal.code,
                 detail: refusal.detail.clone(),
@@ -3296,7 +3402,7 @@ pub(crate) async fn vendor_records(
     ledger: std::io::Result<VendorState>,
 ) -> bool {
     vendor_records_reusing(
-        common, records, sources, detached, force, env, service, ledger, None, None, None,
+        common, records, sources, detached, force, env, service, ledger, None, None, None, false,
     )
     .await
 }
@@ -3322,10 +3428,16 @@ pub(crate) async fn vendor_records_reusing(
     // Lines for the human close to print under its summary line (see
     // `VendoredBackend::with_closing_lines`).
     closing_lines: Option<&super::vendored_backend::ClosingLines<'_>>,
+    // Report what the Bazel gate found to say about the workspace above
+    // the project (see `VendoredBackend::with_workspace_notes`).
+    workspace_notes: bool,
 ) -> bool {
     let source = crate::bazel_gate::vendored::ServiceSource(service);
-    let engine = crate::bazel_gate::vendored::Engine::production(&source);
-    vendor_engine(
+    let engine = crate::bazel_gate::vendored::Engine {
+        notes: workspace_notes,
+        ..crate::bazel_gate::vendored::Engine::production(&source)
+    };
+    let run = vendor_engine(
         common,
         records,
         sources,
@@ -3338,8 +3450,43 @@ pub(crate) async fn vendor_records_reusing(
         eject,
         closing_lines,
         &engine,
-    )
-    .await
+    );
+    run.await.has_errors
+}
+
+/// What the engine itself settled for a package, from the state of its
+/// loop and after its commit. A package with none was refused, failed or
+/// skipped, and the event the engine recorded for it says why.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Settled {
+    /// Vendored by this run: the artifact, the wiring and the ledger
+    /// record are committed.
+    Vendored,
+    /// Already vendored at this patch; the run wrote nothing for it.
+    InSync,
+    /// A dry run that would vendor it.
+    WouldVendor,
+}
+
+/// What one run of [`vendor_engine`] did.
+#[derive(Debug, Default)]
+pub(crate) struct EngineRun {
+    /// A package failed, or the run itself did.
+    pub(crate) has_errors: bool,
+    /// By the purl of the record. The inner entry of the Bazel seam reads
+    /// its verdict from here, never from the run's events: an advisory of
+    /// a vendored package is a `skipped` event too.
+    pub(crate) settled: HashMap<String, Settled>,
+}
+
+impl EngineRun {
+    /// A run that stopped before its loop, or after it with errors.
+    fn failed() -> Self {
+        Self {
+            has_errors: true,
+            settled: HashMap::new(),
+        }
+    }
 }
 
 /// The vendoring engine itself ([`vendor_records_reusing`] runs it with
@@ -3366,8 +3513,10 @@ pub(crate) async fn vendor_engine(
     mut eject: Option<&mut EjectCapture>,
     closing_lines: Option<&super::vendored_backend::ClosingLines<'_>>,
     engine: &crate::bazel_gate::vendored::Engine<'_>,
-) -> bool {
+) -> EngineRun {
     let mut has_errors = false;
+    // What the loop settled per package (see [`Settled`]).
+    let mut settled: HashMap<String, Settled> = HashMap::new();
     // This run's events start here (`scan --mode vendored` hands over an
     // envelope that already holds its own): the ones a refused commit
     // retracts.
@@ -3402,7 +3551,10 @@ pub(crate) async fn vendor_engine(
         if !records.is_empty() && !common.json && !common.silent {
             println!("No vendorable patches in scope.");
         }
-        return has_errors;
+        return EngineRun {
+            has_errors,
+            settled,
+        };
     }
 
     let vendorable_partition: HashMap<Ecosystem, Vec<String>> = partitioned
@@ -3427,7 +3579,7 @@ pub(crate) async fn vendor_engine(
         Err(e) => {
             env.mark_error(EnvelopeError::new("vendor_state_unreadable", e.to_string()));
             report_state_unreadable(common, &e);
-            return true;
+            return EngineRun::failed();
         }
     };
     // The ledger must survive the commit the run asks for, or no other
@@ -3446,7 +3598,7 @@ pub(crate) async fn vendor_engine(
             eprintln!("Error: {detail}");
         }
         env.mark_error(EnvelopeError::new(code, detail));
-        return true;
+        return EngineRun::failed();
     }
     // Pre-stage trees a previous run left behind (it crashed or was
     // interrupted between staging an archive and settling): nothing of
@@ -3599,9 +3751,25 @@ pub(crate) async fn vendor_engine(
     let bazel =
         crate::bazel_gate::vendored::judge(common, (engine.lanes, engine.proofs), &refusal_pairs)
             .await;
+    // What the run says once about the Bazel workspace above the project
+    // (it was detected, it cannot be read, its Bazel is too old, a
+    // workspace file lies above the repository): the run-level codes of
+    // the contract, for a caller that has not said them itself.
+    let notes = match engine.notes {
+        true => bazel.take_warnings(),
+        false => Vec::new(),
+    };
+    for warning in notes {
+        let entry = warning.entry();
+        if !common.json && !common.silent {
+            let prefix = crate::bazel_gate::agent::prefix(&entry.code);
+            eprintln!("{prefix}: {}", entry.detail);
+        }
+        env.warnings.push(entry);
+    }
     // What the lane plans of this run staged under Bazel roots, for the
-    // run's commit.
-    let mut bazel_staged: Vec<crate::bazel_gate::vendored::RootTxn> = Vec::new();
+    // run's commit, and what they put on disk ahead of it.
+    let mut bazel_staged = crate::bazel_gate::vendored::Staged::default();
 
     // Yarn berry takeover preflight (see
     // `socket_patch_core::vendor::yarn_berry_vendor_preflight`): the
@@ -3654,6 +3822,7 @@ pub(crate) async fn vendor_engine(
         refusals: &refusals,
         hosted_pinned: &hosted_pinned,
         bazel: &bazel,
+        routed: engine.routed,
     };
     // Candidates the loop refuses as `vendor_variant_ambiguous`, joined to
     // `fetch_failed` once the loop is done.
@@ -4110,6 +4279,18 @@ pub(crate) async fn vendor_engine(
                         }
                     }))
                 }
+                // `apply` routed the package to its vendored lane and no
+                // lane plans it: a routed call writes a lane's plan or
+                // nothing, and never the native wiring, whose ledger entry
+                // would own the installed tree.
+                None if engine.routed => {
+                    let refused = crate::bazel_gate::vendored::unplanned_route();
+                    bazel_details = Some(refused.details);
+                    Some(VendorOutcome::Refused {
+                        code: refused.code,
+                        detail: refused.detail,
+                    })
+                }
                 None => {
                     dispatch_vendor_one(
                         candidate,
@@ -4241,6 +4422,15 @@ pub(crate) async fn vendor_engine(
                         dry_in_sync += 1;
                     }
                     let in_sync = event.error_code.as_deref() == Some("already_vendored");
+                    // What the loop itself knows of the package, for a
+                    // caller that asks the engine and not the events.
+                    let known = match event.action {
+                        _ if in_sync || dry_previewed_in_sync => Some(Settled::InSync),
+                        PatchAction::Verified if common.dry_run => Some(Settled::WouldVendor),
+                        PatchAction::Applied => Some(Settled::Vendored),
+                        _ => None,
+                    };
+                    settled.extend(known.map(|known| (candidate.clone(), known)));
                     // An in-sync package's wet run writes nothing, so it
                     // cannot hit the commit's symlink refusal.
                     let symlinked =
@@ -4293,6 +4483,9 @@ pub(crate) async fn vendor_engine(
                         )
                         .await;
                         has_errors |= save_failed;
+                        if save_failed {
+                            settled.remove(candidate.as_str());
+                        }
                         socket_patch_core::utils::failpoint::hit("vendor_package_recorded");
                         if let Some(stale) = stale {
                             if group.is_some() {
@@ -4365,6 +4558,8 @@ pub(crate) async fn vendor_engine(
                 drop(group);
                 has_errors = true;
                 let _ = remove_new_vendor_dirs(common, vendor_dirs_before.as_ref()).await;
+                // Nothing of the run is committed, a lane's plan included.
+                unwind_bazel_plans(common, env, &mut bazel_staged, &mut settled).await;
                 None
             }
         }
@@ -4373,10 +4568,19 @@ pub(crate) async fn vendor_engine(
     let mut commit_failed = false;
     if group.is_some() || !bazel_staged.is_empty() {
         socket_patch_core::utils::failpoint::hit("vendor_group_commit");
+        let planned_under_bazel = !bazel_staged.is_empty();
         // One commit: the project's group and what the lane plans staged
-        // under Bazel roots land together or not at all.
-        let committed = engine.commit.commit(group, &bazel_staged).await;
-        if !bazel_staged.is_empty() {
+        // under Bazel roots land together or not at all. The plans are
+        // sealed first, over the roots as they are now: a run that cannot
+        // be sealed is not committed, and its group is dropped unwritten.
+        let committed = match bazel_staged.seal(common).await {
+            Ok(()) => engine.commit.commit(group, bazel_staged.roots()).await,
+            Err(why) => {
+                drop(group);
+                Err(std::io::Error::other(why))
+            }
+        };
+        if planned_under_bazel {
             bazel.committed(&common.cwd);
         }
         match committed {
@@ -4401,6 +4605,7 @@ pub(crate) async fn vendor_engine(
                 let refusal = socket_patch_core::hosted::engine::symlink_refusal(linked);
                 let mut message = refusal.message;
                 let leftovers = remove_new_vendor_dirs(common, vendor_dirs_before.as_ref()).await;
+                unwind_bazel_plans(common, env, &mut bazel_staged, &mut settled).await;
                 if !leftovers.is_empty() {
                     message = format!(
                         "{} (except the downloaded artifacts that could not be removed: {}; \
@@ -4421,7 +4626,9 @@ pub(crate) async fn vendor_engine(
                 let detail = if socket_patch_core::utils::group_commit::is_pending(&e) {
                     // Some files were replaced and could not be put back:
                     // the journal left behind makes the next locked command
-                    // finish the commit.
+                    // finish the commit. Until it has, no package of this
+                    // run is vendored.
+                    settled.retain(|_, known| *known != Settled::Vendored);
                     format!(
                         "could not commit the vendored lockfile, manifest and ledger edits: \
                          {e}; the commit is journaled and the next socket-patch command in \
@@ -4438,6 +4645,7 @@ pub(crate) async fn vendor_engine(
                     );
                     let leftovers =
                         remove_new_vendor_dirs(common, vendor_dirs_before.as_ref()).await;
+                    unwind_bazel_plans(common, env, &mut bazel_staged, &mut settled).await;
                     if !leftovers.is_empty() {
                         detail = format!(
                             "{detail} (except the downloaded artifacts that could not be \
@@ -4592,7 +4800,33 @@ pub(crate) async fn vendor_engine(
         ),
     }
 
-    has_errors
+    EngineRun {
+        has_errors,
+        settled,
+    }
+}
+
+/// The run's commit did not land (or, for an eject, was dropped): no
+/// package of it is vendored, and what the lane plans put on disk ahead of
+/// the commit is taken back (`Staged::unwind`), so the run leaves a
+/// project under a Bazel root as it found it. What could not be taken
+/// back is a warning of the run.
+async fn unwind_bazel_plans(
+    common: &GlobalArgs,
+    env: &mut Envelope,
+    staged: &mut crate::bazel_gate::vendored::Staged,
+    settled: &mut HashMap<String, Settled>,
+) {
+    settled.retain(|_, known| *known != Settled::Vendored);
+    for left in staged.unwind(common).await {
+        if !common.json && !common.silent {
+            eprintln!("Warning: {}", left.detail);
+        }
+        env.warnings.push(RunWarning {
+            code: left.code.to_string(),
+            detail: left.detail,
+        });
+    }
 }
 
 /// The human close of a vendor run: the summary line, the caller's
@@ -5365,6 +5599,12 @@ pub(crate) async fn run_vendor_gc(
         _ => return out,
     };
 
+    // One loader of the Bazel workspace above the project for the whole
+    // collection: every in-use question and every revert of an entry a
+    // Bazel index wires reads it once. Under no Bazel root it stats.
+    let bazel = crate::bazel_gate::vendored::reader();
+    let reverted = RevertOpts::new(false);
+
     // (a) manifest-dropped entries. Everything (a) touches is excluded from
     // (b), which would otherwise list/fail the same purl a second time on a
     // dry run or after a wet revert failure.
@@ -5382,7 +5622,7 @@ pub(crate) async fn run_vendor_gc(
                 continue;
             }
             let entry = state.entries.get(&purl).cloned().expect("listed above");
-            let mut outcome = dispatch_revert_one(&entry, &common.cwd, false).await;
+            let mut outcome = dispatch_revert_one_with(&entry, &common.cwd, reverted, &bazel).await;
             // The patch left the manifest while the package stays locked:
             // the restored lock pins the version the vendored build is
             // installed as, which pip, PDM, uv and Pipenv keep (#477), and a
@@ -5449,7 +5689,7 @@ pub(crate) async fn run_vendor_gc(
             // that resolves the package, keeps the entry whatever the
             // native lockfiles say.
             if discovery.vendor_entry_in_use(&common.cwd, entry).await == Some(false)
-                && bazel_in_use(&common.cwd, entry).await == Some(false)
+                && bazel_in_use(&bazel, &common.cwd, entry).await == Some(false)
             {
                 unused.push(purl);
             }
@@ -5461,7 +5701,7 @@ pub(crate) async fn run_vendor_gc(
             out.unused_reverted.push(purl);
             continue;
         }
-        let outcome = dispatch_revert_one(&entry, &common.cwd, false).await;
+        let outcome = dispatch_revert_one_with(&entry, &common.cwd, reverted, &bazel).await;
         out.take_advisories(&outcome);
         if !outcome.success {
             out.failed.push(purl);
@@ -5661,6 +5901,7 @@ mod plan_gate_tests {
             hosted_pinned: &|_| false,
             // No Bazel verdict: the project of these tests has no root.
             bazel: Box::leak(Box::default()),
+            routed: false,
         }
     }
 

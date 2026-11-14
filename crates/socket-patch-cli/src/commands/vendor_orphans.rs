@@ -53,6 +53,23 @@ pub(crate) async fn sweep_orphan_vendor_dirs_where(
     dry_run: bool,
     select: impl Fn(&vendor::path::SweptVendorDir) -> bool,
 ) -> OrphanSweep {
+    let lanes = socket_patch_core::bazel::lanes::PRODUCTION;
+    sweep_orphan_vendor_dirs_over(cwd, state, dry_run, select, lanes).await
+}
+
+/// [`sweep_orphan_vendor_dirs_where`] over the lane table `lanes`, which
+/// is what says whether the Bazel build above the project still reads an
+/// orphan: a row of a root's owned index that names its patch keeps it,
+/// a lane that finds no pin of it lets it go, and a hub no lane can speak
+/// for keeps it ("cannot tell" is never "unused"). Production passes the
+/// shipped lanes.
+pub(crate) async fn sweep_orphan_vendor_dirs_over(
+    cwd: &Path,
+    state: &VendorState,
+    dry_run: bool,
+    select: impl Fn(&vendor::path::SweptVendorDir) -> bool,
+    lanes: socket_patch_core::bazel::model::LaneTable,
+) -> OrphanSweep {
     let recorded_units: HashSet<(&str, &str)> = state
         .entries
         .values()
@@ -84,6 +101,9 @@ pub(crate) async fn sweep_orphan_vendor_dirs_where(
     // is the last thing that can leave a fully reverted project with empty
     // `.socket/vendor/<eco>/` husks.
     let stop_dir = cwd.join(SOCKET_DIR);
+    // One loader of the Bazel workspace above the project for the sweep:
+    // it is read once, however many orphans are asked about.
+    let bazel = crate::bazel_gate::vendored::reader();
     for unit in candidates {
         if wired.contains(&(unit.eco.as_str(), unit.uuid.as_str())) {
             out.still_wired.push(unit);
@@ -95,7 +115,9 @@ pub(crate) async fn sweep_orphan_vendor_dirs_where(
         let eco = vendor::jvm::layout::ledger_ecosystem(&unit.eco);
         let ecosystems = socket_patch_core::crawlers::Ecosystem::all().iter();
         let ecosystem = ecosystems.copied().find(|e| e.cli_name() == eco);
-        let in_use = crate::bazel_gate::vendored::in_use_blocking(cwd, ecosystem, None, &unit.uuid);
+        let in_use = crate::bazel_gate::vendored::in_use_blocking(
+            &bazel, lanes, cwd, ecosystem, None, &unit.uuid,
+        );
         if in_use.await != Some(false) {
             out.kept_for_bazel.push(unit);
             continue;
@@ -152,7 +174,10 @@ pub(crate) fn orphan_kept_for_bazel(unit: &vendor::path::SweptVendorDir) -> Vend
     VendorWarning::new(
         "vendor_orphan_still_wired",
         format!(
-            "no ledger entry owns .socket/vendor/{}/{}, and whether the Bazel build of this              workspace still reads it is not known to socket-patch (a row of the owned index              names the patch, or no enabled lane can tell); the artifacts were kept. Delete              the directory by hand once no file Bazel reads names it",
+            "no ledger entry owns .socket/vendor/{}/{}, and whether the Bazel build of this \
+             workspace still reads it is not known to socket-patch (a row of the owned index \
+             names the patch, or no enabled lane can tell); the artifacts were kept. Delete \
+             the directory by hand once no file Bazel reads names it",
             unit.eco, unit.uuid
         ),
     )
@@ -239,6 +264,29 @@ mod tests {
         let unparsed = unit(&[]);
         assert!(orphan_in_target(&Target::parse(uuid), &unparsed));
         assert!(!orphan_in_target(&Target::parse("left-pad"), &unparsed));
+    }
+
+    /// The advisory of an orphan kept for a Bazel build is one sentence
+    /// with single spaces: a string literal that loses its line
+    /// continuations prints its indentation.
+    #[test]
+    fn orphan_kept_for_bazel_reads_as_one_line() {
+        let unit = vendor::path::SweptVendorDir {
+            eco: "npm".into(),
+            uuid: "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa".into(),
+            dir: PathBuf::from("/x"),
+            purls: vec![],
+        };
+        let warning = orphan_kept_for_bazel(&unit);
+        assert_eq!(warning.code, "vendor_orphan_still_wired");
+        assert_eq!(
+            warning.detail,
+            "no ledger entry owns .socket/vendor/npm/aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa, and \
+             whether the Bazel build of this workspace still reads it is not known to \
+             socket-patch (a row of the owned index names the patch, or no enabled lane can \
+             tell); the artifacts were kept. Delete the directory by hand once no file Bazel \
+             reads names it"
+        );
     }
 
     /// A kept, still-wired orphan points the user at a remedy that works
