@@ -2658,8 +2658,11 @@ async fn run_vendor(
     let (mut has_errors, ledger) = reconcile_dropped(&manifest, common, env).await;
     // After the reconcile: reverting entries dropped from the manifest
     // touches no project patch, so a protected record must not block it.
-    let (warnings, conflicts) =
-        super::user_patches::partition(common, manifest.patches.keys()).await;
+    let super::user_patches::Sorted {
+        warnings,
+        conflicts,
+        refusals,
+    } = super::user_patches::partition(common, manifest.patches.keys()).await;
     super::user_patches::warn(common, &warnings);
     env.warnings.extend(
         warnings
@@ -2667,17 +2670,17 @@ async fn run_vendor(
             .map(|(code, detail)| crate::json_envelope::RunWarning { code, detail }),
     );
     if !conflicts.is_empty() {
-        for (_, message) in &conflicts {
+        // What holds a whole ecosystem back is said once, not once per
+        // package of the manifest; a package's own line stays its own.
+        for line in &refusals {
             if !common.json {
-                eprintln!("Error: {message}");
+                eprintln!("Error: {line}");
             }
         }
         if env.events.is_empty() {
-            let mut messages: Vec<String> = conflicts.into_iter().map(|(_, m)| m).collect();
-            messages.dedup();
             env.mark_error(crate::json_envelope::EnvelopeError::new(
                 super::user_patches::CONFLICT,
-                messages.join("\n"),
+                refusals.join("\n"),
             ));
         } else {
             // The reconcile already wrote: a top-level error would claim

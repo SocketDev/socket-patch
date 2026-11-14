@@ -2636,17 +2636,20 @@ async fn scan_project(
     // be read: a broken file, not a patch the project declares.
     let mut user_patch_unreadable = 0usize;
     let mut user_patch_skips = Vec::new();
+    // What holds a whole ecosystem back is one run-level line, not one
+    // per crawled package; each package keeps the reason of its own event.
+    let mut user_patch_lines = super::user_patches::Lines::default();
     filtered_crawled.retain(|package| {
         let sources = user_patches.conflicts(&package.purl);
         if sources.is_empty() {
             return true;
         }
         let unreadable = user_patches.unreadable_only(&package.purl);
-        let detail = super::user_patches::detail(
+        let (detail, line) = user_patch_lines.of(
+            &user_patches,
             &package.purl,
             &sources,
             args.common.allow_patch_conflicts,
-            unreadable,
         );
         if !args.common.allow_patch_conflicts {
             user_patch_withheld += 1;
@@ -2661,15 +2664,12 @@ async fn scan_project(
                 );
             }
         }
-        layout_refusals.push((
-            if args.common.allow_patch_conflicts {
-                super::user_patches::ALLOWED
-            } else {
-                super::user_patches::CONFLICT
-            }
-            .into(),
-            detail,
-        ));
+        let code = if args.common.allow_patch_conflicts {
+            super::user_patches::ALLOWED
+        } else {
+            super::user_patches::CONFLICT
+        };
+        layout_refusals.extend(line.map(|line| (code.into(), line)));
         args.common.allow_patch_conflicts
     });
 

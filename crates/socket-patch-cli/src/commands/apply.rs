@@ -2982,14 +2982,19 @@ async fn apply_patches_inner(
         // `--json`
         // mutes stderr and the envelope's `package_not_installed` events
         // are the channel. Lockfile-resolved purls never flip it (#403).
-        if !unresolved.is_empty() && args.prints_errors() {
+        // Neither does a run that held records back for the project's own
+        // patches (`none_installed`): it says which records it left.
+        let none_installed = none_installed(&unresolved, user_patched);
+        if none_installed && args.prints_errors() {
             for line in format_none_installed_error(&unresolved) {
                 eprintln!("{line}");
             }
+        } else if !none_installed {
+            warn_not_installed(&args.common, &unresolved);
         }
         print_lockfile_only_note(args, &unmatched, &lockfile_only);
         return Ok(ApplyOutcome {
-            success: unresolved.is_empty() && results.iter().all(|r| r.success),
+            success: !none_installed && results.iter().all(|r| r.success),
             results,
             unmatched,
             lockfile_only,
@@ -3475,7 +3480,7 @@ async fn apply_patches_inner(
     let none_matched = !target_manifest_purls.is_empty()
         && matched_manifest_purls.is_empty()
         && !all_packages.is_empty()
-        && !unresolved.is_empty();
+        && none_installed(&unresolved, user_patched);
     if none_matched {
         has_errors = true;
         if args.prints_errors() {
@@ -3483,17 +3488,8 @@ async fn apply_patches_inner(
                 eprintln!("{line}");
             }
         }
-    } else if !unresolved.is_empty() && !args.common.silent && !args.common.json {
-        eprintln!(
-            "Warning: {} had no matching installed package:",
-            plural(unresolved.len(), "manifest patch", "manifest patches")
-        );
-        for purl in &unresolved {
-            eprintln!("  - {}", normalize_purl(purl));
-        }
-        if let Some(line) = cargo_fetch_hint(&unresolved) {
-            eprintln!("{line}");
-        }
+    } else {
+        warn_not_installed(&args.common, &unresolved);
     }
     print_lockfile_only_note(args, &unmatched, &lockfile_only);
 
@@ -4224,6 +4220,43 @@ fn print_lockfile_only_note(
 /// `Error: Failed to patch <purl>: <why>` (stderr, even under --silent).
 fn format_patch_failure(purl: &str, why: &str) -> String {
     format!("Error: Failed to patch {purl}: {why}")
+}
+
+/// Whether a run in which no targeted record matched an installed package
+/// fails for it: some record has neither an installed copy nor a lock
+/// entry (`unresolved`), and the run held no record back for the project's
+/// own patches (`user_patched`, see `user_patches::skip_protected`).
+///
+/// "Nothing of the manifest is installed here" is an error because it
+/// usually means a wrong `--cwd`. It is not known of a run that left
+/// records out before the crawl: the crawl covers only the ecosystems of
+/// the records that stayed, so a package the project patches itself may
+/// be installed all the same, and one declaration can hold back every
+/// package of an ecosystem (a computed Bazel `patches` argument, a
+/// workspace file that cannot be read). Failing then would fail every
+/// install whose postinstall hook runs `apply`, over a record that is
+/// only a warning in a run with nothing held back. The records are named
+/// either way ([`warn_not_installed`], `package_not_installed`).
+fn none_installed(unresolved: &[String], user_patched: &HashSet<String>) -> bool {
+    !unresolved.is_empty() && user_patched.is_empty()
+}
+
+/// The warning for manifest records with no installed package in a run
+/// that does not fail for them.
+fn warn_not_installed(common: &GlobalArgs, unresolved: &[String]) {
+    if unresolved.is_empty() || common.silent || common.json {
+        return;
+    }
+    eprintln!(
+        "Warning: {} had no matching installed package:",
+        plural(unresolved.len(), "manifest patch", "manifest patches")
+    );
+    for purl in unresolved {
+        eprintln!("  - {}", normalize_purl(purl));
+    }
+    if let Some(line) = cargo_fetch_hint(unresolved) {
+        eprintln!("{line}");
+    }
 }
 
 /// The failing "no targeted patch matched an installed package" report:
@@ -5025,6 +5058,21 @@ mod tests {
             format_none_installed_error(&[])[0],
             "Error: None of the targeted manifest patches matched an installed package."
         );
+    }
+
+    /// "None of the targeted patches is installed" fails a run only when
+    /// no record was held back for the project's own patches: the crawl
+    /// covers what stayed, so a run that left records out does not know
+    /// that nothing is installed, and its absent records are warnings.
+    #[test]
+    fn records_held_back_for_project_patches_are_not_nothing_installed() {
+        let absent = ["pkg:gem/rack@2.2.8".to_string()];
+        let held: HashSet<String> = ["pkg:npm/left-pad@1.3.0".to_string()].into();
+        assert!(none_installed(&absent, &HashSet::new()));
+        assert!(!none_installed(&absent, &held));
+        // Nothing unresolved is never the error, whatever was held back.
+        assert!(!none_installed(&[], &HashSet::new()));
+        assert!(!none_installed(&[], &held));
     }
 
     #[test]

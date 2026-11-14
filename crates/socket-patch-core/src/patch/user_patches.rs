@@ -190,15 +190,17 @@ impl UserPatchIndex {
         for found in consent::evidence(ws, own) {
             self.push_bazel(shown_root, found);
         }
-        // `consent` reports what a recognizer of one ruleset left unread.
+        // `consent::evidence` reports what a recognizer of one ruleset
+        // left unread. Two kinds of gap belong to no ruleset, and a hook
+        // of any may stand in either.
+        //
         // A workspace file that could not be read or parsed at all (a
-        // boundary file, a file it includes or loads) belongs to no
-        // ruleset and may hold a hook of any: it is the governing file the
-        // walk protects an ecosystem for when it cannot read it. Which
-        // files Bazel evaluates, and so which gaps count, is governance's
-        // answer. A statement that is merely computed is not taken from
-        // here: where it can hide a hook, it uses a ruleset's name, and
-        // `consent` has reported it.
+        // boundary file, a file it includes or loads) is the governing
+        // file the walk protects an ecosystem for when it cannot read it.
+        // Which files Bazel evaluates, and so which gaps count, is
+        // governance's answer. Its other gaps are not taken from here:
+        // each is either a recognizer's, which `consent::evidence` has
+        // reported in its own words, or one of the statements below.
         for ecosystem in consent::ecosystems() {
             let governance = govern::governance(ws, ecosystem, &ws.root.project_rel);
             let Governance::Undetermined(gaps) = governance else {
@@ -207,6 +209,15 @@ impl UserPatchIndex {
             for gap in gaps.iter().filter(|gap| gap.token == WORKSPACE_UNREADABLE) {
                 self.push_bazel(shown_root, unreadable_in_bazel(ecosystem, gap));
             }
+        }
+        // A statement of the module file that was read as text and not as
+        // what it declares (a `use_extension` whose label is computed, or
+        // one bound inside an expression) uses no ruleset's name, so no
+        // recognizer sees it, and beside a hub it may be a second use of
+        // the same extension with a tag nobody read. `consent` says which
+        // ecosystems that leaves open.
+        for found in consent::unread_statements(ws) {
+            self.push_bazel(shown_root, found);
         }
     }
 
@@ -282,6 +293,22 @@ impl UserPatchIndex {
             true => evidence[0].starlark.as_ref().map(|found| found.ecosystem),
             false => None,
         }
+    }
+
+    /// Whether nothing protects `purl` but replacements of it in a Bazel
+    /// workspace (a replacement tag, a `maven.override`, an
+    /// `archive_override`): Bazel builds what the user put in the
+    /// package's place, so no patch of the package reaches that build
+    /// while the declaration stands, with or without consent. Consent
+    /// still lifts the check for an installed copy, which is all it can
+    /// permit, and a caller says so instead of offering the flag as the
+    /// remedy. False when a patch of the user's, a file that could not be
+    /// read or any evidence of the walk protects the package too, and
+    /// when nothing does.
+    pub fn bazel_replaced_only(&self, purl: &str) -> bool {
+        let evidence = self.evidence_for(purl);
+        let replaced = |e: &&Evidence| e.starlark.as_ref().is_some_and(|found| found.replacement);
+        !evidence.is_empty() && evidence.iter().all(replaced)
     }
 
     /// The walk [`Self::discover`] and [`Self::npm_family_in`] share. Every
@@ -3253,10 +3280,49 @@ mod tests {
             assert_eq!(index.conflicts(purl), [source], "{purl}");
             assert!(!index.unreadable_only(purl), "{purl}");
             assert_eq!(index.bazel_ecosystem_wide(purl), None, "{purl}");
+            // Only the Maven override puts something else in the
+            // package's place.
+            let replaced = purl.starts_with("pkg:maven/");
+            assert_eq!(index.bazel_replaced_only(purl), replaced, "{purl}");
         }
         for purl in free {
             assert_eq!(index.conflicts(purl), [""; 0], "{purl}");
+            assert!(!index.bazel_replaced_only(purl), "{purl}");
         }
+    }
+
+    /// A package is "replaced only" while replacements in a Bazel
+    /// workspace are all that protects it. A patch of the user's beside
+    /// the replacement, in Starlark or in a file the walk reads, is a
+    /// conflict consent is the remedy for, so the package is no longer
+    /// one.
+    #[tokio::test]
+    async fn a_package_is_replaced_only_while_nothing_else_protects_it() {
+        let left_pad = "pkg:npm/left-pad@1.3.0";
+        let replace = "npm.npm_replace_package(package = \"left-pad@1.3.0\", replacement = \"//:left_pad\")\n";
+        let (_tmp, root) = js_checkout(&format!("{NPM_HUB}{replace}"));
+        let index = with_bazel(&root).await;
+        let source = format!("{} ({REPLACED_IN_BAZEL})", file_in(&root, "MODULE.bazel"));
+        assert_eq!(index.conflicts(left_pad), [source]);
+        assert!(index.bazel_replaced_only(left_pad));
+        assert!(!index.bazel_replaced_only("pkg:npm/left-pad@1.2.0"));
+        assert!(!index.unreadable_only(left_pad));
+        assert_eq!(index.bazel_ecosystem_wide(left_pad), None);
+
+        let patched = NPM_HUB.replace(
+            ")\n",
+            ", patches = {\"left-pad@1.3.0\": [\"//:left-pad.patch\"]})\n",
+        );
+        let (_tmp, root) = js_checkout(&format!("{patched}{replace}"));
+        let index = with_bazel(&root).await;
+        assert_eq!(index.conflicts(left_pad).len(), 2);
+        assert!(!index.bazel_replaced_only(left_pad));
+
+        let (_tmp, root) = js_checkout(&format!("{NPM_HUB}{replace}"));
+        let own = r#"{"pnpm":{"patchedDependencies":{"left-pad@1.3.0":"p.patch"}}}"#;
+        write(&root, "package.json", own);
+        let index = with_bazel(&root).await;
+        assert!(!index.bazel_replaced_only(left_pad));
     }
 
     /// ROUTED R-118: own wiring is subtracted per item. Over one
@@ -3380,9 +3446,13 @@ mod tests {
     /// a hook of any ruleset: every ecosystem a ruleset with a hook
     /// builds is protected as by a file the walk could not read, whose
     /// remedy is to fix the file. A statement that is only computed is
-    /// another matter: it hides a hook only where it uses a ruleset's
-    /// name, which `consent` reports for that ruleset's ecosystem, so a
-    /// comprehension over `use_repo` holds back no other.
+    /// another matter. One that uses a ruleset's name is that ruleset's,
+    /// and `consent` reports it for its ecosystem alone, so a
+    /// comprehension over `use_repo` holds back no other. One that uses
+    /// no ruleset's name (a `use_extension` bound inside an expression,
+    /// or with a computed label) may be a second use of an extension the
+    /// workspace has a hub of: it protects the ecosystems of those hubs,
+    /// as a declaration the user can make literal, and no other.
     #[tokio::test]
     async fn an_unparseable_workspace_file_protects_as_unreadable_and_a_computed_statement_does_not(
     ) {
@@ -3432,6 +3502,40 @@ mod tests {
             let held = !index.conflicts(purl).is_empty();
             assert_eq!(held, purl.starts_with("pkg:npm/"), "{purl}");
             assert!(!index.unreadable_only(purl), "{purl}");
+        }
+
+        // Review finding consent-design-2: each of these carried a
+        // replacement of `left-pad` past the gate beside the literal hub,
+        // because the statement names no ruleset a recognizer looks for.
+        let extension = "use_extension(\"@aspect_rules_js//npm:extensions.bzl\", \"npm\")";
+        let replace =
+            ".npm_replace_package(package = \"left-pad@1.3.0\", replacement = \"//:left_pad\")\n";
+        for hidden in [
+            format!("exts = [{extension}]\nexts[0]{replace}"),
+            format!("other = {extension} if True else None\nother{replace}"),
+            format!("other = use_extension(\"@{{}}//npm:extensions.bzl\".format(\"aspect_rules_js\"), \"npm\")\nother{replace}"),
+            format!("other = use_extension(\"@%s//npm:extensions.bzl\" % \"aspect_rules_js\", \"npm\")\nother{replace}"),
+        ] {
+            let module = format!("{RULES_JS}{NPM_HUB}use_repo(npm, \"npm\")\n{hidden}");
+            let (_tmp, root) = bazel_checkout(&[("MODULE.bazel", &module), PNPM_LOCK]);
+            let index = with_bazel(&root).await;
+            let opens = format!("{} (MODULE.bazel:", file_in(&root, "MODULE.bazel"));
+            for purl in hooked {
+                let sources = index.conflicts(purl);
+                match purl.starts_with("pkg:npm/") {
+                    true => assert!(
+                        sources.len() == 1
+                            && sources[0].starts_with(&opens)
+                            && sources[0].contains("`use_extension`"),
+                        "{hidden}: {sources:?}"
+                    ),
+                    false => assert_eq!(sources, [""; 0], "{hidden}: {purl}"),
+                }
+                // Computed is not broken: the remedy is the user's choice.
+                assert!(!index.unreadable_only(purl), "{purl}");
+            }
+            let wide = index.bazel_ecosystem_wide("pkg:npm/left-pad@1.3.0");
+            assert_eq!(wide, Some(Ecosystem::Npm), "{hidden}");
         }
     }
 
