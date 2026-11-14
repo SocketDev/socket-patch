@@ -654,6 +654,50 @@ fn gem_vendor_fresh_checkout_bundle_install_and_revert() {
         "vendored attestation must carry the (vendored) marker: {impact}"
     );
 
+    // REGRESSION (#2076): the registry copy the first `bundle install` put
+    // in the gem home is a leftover now. Bundler loads the vendored path
+    // and installs nothing for rack, so the install the run prescribes
+    // keeps the leftover, unpatched. `vex` must not report it as an
+    // out-of-sync live tree, before that install or after it.
+    assert!(
+        !stderr.contains("vendored artifact"),
+        "a gem-home leftover is no out-of-sync tree:\n{stderr}"
+    );
+    let reinstall = bundle(&proj, &["install"], false);
+    assert!(
+        reinstall.status.success(),
+        "`bundle install` over the vendored pair must succeed.\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&reinstall.stdout),
+        String::from_utf8_lossy(&reinstall.stderr),
+    );
+    assert_eq!(
+        std::fs::read(&installed_rb).expect("the leftover lib/rack.rb"),
+        orig,
+        "bundler keeps the gem-home copy it no longer loads (test premise)"
+    );
+    let (code, stdout, stderr) = run_socket(
+        &proj,
+        &[
+            "vex",
+            "--json",
+            "--cwd",
+            proj.to_str().unwrap(),
+            "--output",
+            vex_path.to_str().unwrap(),
+            "--product",
+            "pkg:gem/app@1.0.0",
+        ],
+    );
+    assert_eq!(code, 0, "vex failed.\nstdout:\n{stdout}\nstderr:\n{stderr}");
+    let env = parse_json_envelope(&stdout);
+    assert_eq!(env["status"], "success", "envelope: {env}");
+    assert!(
+        env["warnings"]
+            .as_array()
+            .is_none_or(|w| w.iter().all(|w| w["code"] != "vendored_tree_out_of_sync")),
+        "a gem-home leftover is no out-of-sync tree: {env}"
+    );
+
     // 5. FRESH-CHECKOUT PROOF: ONLY the committable files, frozen lock. The
     //    vendored path source is the only provider of rack (the fresh dir
     //    has no vendor/bundle), and the patched constant must be visible at
