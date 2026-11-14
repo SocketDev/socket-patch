@@ -755,23 +755,11 @@ async fn run_shape(shape: Shape) -> Option<()> {
         }
         let after = snapshot(&proj);
         for (rel, bytes) in &before {
-            // v5 keeps no ledger fragment, and the rewriter separates its
-            // appended registry block with the same bytes whether or not the
-            // original file ended in a newline — so an UNTERMINATED file can
-            // only come back with its final newline (every other byte exact).
-            let bytes = &shape
+            let want = shape
                 .restored
                 .iter()
                 .find(|(path, _)| path == rel)
                 .map_or_else(|| bytes.clone(), |(_, text)| text.as_bytes().to_vec());
-            let want = match after.get(rel) {
-                Some(got)
-                    if !bytes.ends_with(b"\n") && *got == [bytes.as_slice(), b"\n"].concat() =>
-                {
-                    got.clone()
-                }
-                _ => bytes.clone(),
-            };
             assert_eq!(
                 after
                     .get(rel)
@@ -1195,10 +1183,11 @@ async fn cargo_hosted_dotted_and_literal_spellings_are_pinned() {
 }
 
 /// Bug H: a config ending in a blank line comes back byte-for-byte (the
-/// appended block's removal once normalized the trailing newline run). A
-/// config without a final newline comes back with every byte but that
-/// missing newline: v5 keeps no ledger fragment to tell it apart from a
-/// terminated file, since the rewriter's separator is the same for both.
+/// appended block's removal once normalized the trailing newline run). So
+/// does a config without a final newline: v5 keeps no ledger fragment to
+/// tell it apart from a terminated file, so the rewriter puts one newline
+/// before its block whatever the config ends with, and `remove` takes back
+/// exactly that one.
 #[tokio::test(flavor = "multi_thread")]
 async fn cargo_hosted_config_trailing_bytes_are_restored() {
     for (tag, rel, config) in [
