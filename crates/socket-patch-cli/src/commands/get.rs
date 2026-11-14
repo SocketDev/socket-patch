@@ -3227,6 +3227,7 @@ mod tests {
             applied: applied.iter().map(|p| p.to_string()).collect(),
             skipped: Vec::new(),
             warnings: Vec::new(),
+            sidecars: Vec::new(),
         }
     }
 
@@ -3527,6 +3528,7 @@ mod tests {
             applied: Vec::new(),
             skipped: Vec::new(),
             warnings: vec![RunWarning::new("content_mismatch_overwritten", "w")],
+            sidecars: Vec::new(),
         };
         let recs = recorded(&[("pkg:npm/a@1.0.0", "ua")]);
         record_apply_outcome(&mut env, &recs, Some(&report), |_| None);
