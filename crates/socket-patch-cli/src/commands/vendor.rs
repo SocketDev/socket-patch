@@ -115,8 +115,11 @@ pub struct VendorArgs {
 
 /// Refusal codes that are expected skips, not command failures: the user's
 /// request is still fully satisfied when these are the only non-successes.
-fn refusal_is_benign(code: &str) -> bool {
+pub(crate) fn refusal_is_benign(code: &str) -> bool {
     matches!(code, "vendor_unsupported_ecosystem" | "already_vendored")
+        // A gem version another project (or Ruby) put in the shared gem
+        // home: this project doesn't lock it, so there is nothing to wire.
+        || code == vendor::gem::GEM_VERSION_NOT_LOCKED
         // An older vendored patch kept in force (see [`keep_older_vendored_patch`]).
         || vendor::is_unserved(code)
         || socket_patch_core::vendor::jvm::sbt_gate::SKIP_CODES.contains(&code)
@@ -3555,6 +3558,18 @@ pub(crate) async fn vendor_records_reusing(
                 // revert a live hosted redirect.
                 CandidateVerdict::Refuse { code, detail } => {
                     matched.insert(candidate.clone());
+                    if refusal_is_benign(code) {
+                        // An expected skip, as for the backend's own
+                        // benign refusals below.
+                        if !common.silent && !common.json {
+                            eprintln!("Skipping {}: {detail}", normalize_purl(candidate));
+                        }
+                        env.record(
+                            PatchEvent::new(PatchAction::Skipped, candidate.clone())
+                                .with_reason(code, detail),
+                        );
+                        continue;
+                    }
                     has_errors = true;
                     env.record(
                         PatchEvent::new(PatchAction::Failed, candidate.clone())

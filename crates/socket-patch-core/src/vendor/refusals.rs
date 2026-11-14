@@ -17,7 +17,10 @@
 //! 2. the npm package-lock project refusal (a lock that is not v2/v3);
 //! 3. the lock-text refusals a hosted pnpm pin's takeover meets (#853);
 //! 4. the lock-text refusals of every other npm and cargo candidate, the
-//!    ones the backend raises on the lock and manifest text alone.
+//!    ones the backend raises on the lock and manifest text alone;
+//! 5. an installed gem version the project's `Gemfile.lock` doesn't
+//!    resolve (`vendor_gem_version_not_locked`, which the callers report
+//!    as a skip).
 //!
 //! Each check lives in its backend's module; this one only dispatches and
 //! scopes them.
@@ -31,7 +34,7 @@ use crate::crawlers::Ecosystem;
 use crate::patch::redirect::upstream::HostedPin;
 use crate::utils::purl_key::PurlKey;
 use crate::vendor::state::{lookup_entry, VendorEntry};
-use crate::vendor::{bun_lock, lock_inventory, npm_flavor, npm_lock, vlt_lock};
+use crate::vendor::{bun_lock, gem, lock_inventory, npm_flavor, npm_lock, vlt_lock};
 
 /// The vendor ledger as the refusals consume it: the caller's own load
 /// outcome, so an UNREADABLE ledger is a refusal the run can report
@@ -144,7 +147,37 @@ pub async fn vendor_refusals(
     for (purl, (code, detail)) in takeover_refusals.into_iter().chain(lock_text) {
         refuse(&mut out, &purl, code, &detail);
     }
+    for (purl, (code, detail)) in gem_refusals(project_root, candidates, scope.installed).await {
+        refuse(&mut out, &purl, code, &detail);
+    }
     out
+}
+
+/// The gem candidates whose version `Gemfile.lock` doesn't resolve
+/// ([`gem::gem_version_not_locked_refusals`]), less the ones that are not
+/// installed: like [`reaching_backend`], a package with no copy on disk
+/// never reaches its backend, and the vendor loop reports it
+/// `package_not_installed`.
+async fn gem_refusals(
+    project_root: &Path,
+    candidates: &[(&str, &str)],
+    installed: &InstalledLookup<'_>,
+) -> Vec<(String, (&'static str, String))> {
+    let gems: Vec<&str> = candidates
+        .iter()
+        .map(|(purl, _)| *purl)
+        .filter(|purl| Ecosystem::from_purl(purl) == Some(Ecosystem::Gem))
+        .collect();
+    if gems.is_empty() {
+        return Vec::new();
+    }
+    let mut refused = gem::gem_version_not_locked_refusals(project_root, &gems).await;
+    if refused.is_empty() {
+        return refused;
+    }
+    let installed = installed(refused.iter().map(|(purl, _)| purl.clone()).collect()).await;
+    refused.retain(|(purl, _)| installed.contains(purl));
+    refused
 }
 
 fn refuse(out: &mut VendorRefusals, purl: &str, code: &'static str, detail: &str) {
@@ -349,6 +382,62 @@ mod tests {
 
     fn entry(json: serde_json::Value) -> VendorEntry {
         serde_json::from_value(json).unwrap()
+    }
+
+    mod gem {
+        use super::*;
+
+        const LOCKED: &str = "pkg:gem/rack@2.2.8";
+        const UNLOCKED: &str = "pkg:gem/rake@13.0.6";
+
+        fn project() -> tempfile::TempDir {
+            let tmp = tempfile::tempdir().unwrap();
+            std::fs::write(
+                tmp.path().join("Gemfile"),
+                "source \"https://rubygems.org\"\n\ngem \"rack\", \"2.2.8\"\n",
+            )
+            .unwrap();
+            std::fs::write(
+                tmp.path().join("Gemfile.lock"),
+                "GEM\n  remote: https://rubygems.org/\n  specs:\n    rack (2.2.8)\n\nPLATFORMS\n  ruby\n\nDEPENDENCIES\n  rack (= 2.2.8)\n\nBUNDLED WITH\n   2.6.9\n",
+            )
+            .unwrap();
+            tmp
+        }
+
+        fn everything_installed(purls: Vec<String>) -> BoxFuture<'static, HashSet<String>> {
+            Box::pin(async move { purls.into_iter().collect() })
+        }
+
+        /// #2075: a gem version in the gem home that the lock doesn't
+        /// resolve is refused before any download; the gem the project
+        /// locks is left to the engine.
+        #[tokio::test]
+        async fn installed_version_the_lock_does_not_resolve_is_refused() {
+            let tmp = project();
+            let pairs = [(LOCKED, UUID), (UNLOCKED, OTHER_UUID)];
+            let state = HashMap::new();
+            let got = run_scoped(tmp.path(), &pairs, Ok(&state), &[], &everything_installed).await;
+            assert_eq!(got.keys().collect::<Vec<_>>(), [UNLOCKED]);
+            assert_eq!(got[UNLOCKED].code, "vendor_gem_version_not_locked");
+            assert!(
+                got[UNLOCKED]
+                    .detail
+                    .contains("does not resolve rake 13.0.6"),
+                "{}",
+                got[UNLOCKED].detail
+            );
+        }
+
+        /// A gem that is neither locked nor installed never reaches the
+        /// backend: the vendor loop still reports it `package_not_installed`.
+        #[tokio::test]
+        async fn uninstalled_version_is_left_to_the_vendor_loop() {
+            let tmp = project();
+            let state = HashMap::new();
+            let got = run(tmp.path(), &[(UNLOCKED, UUID)], Ok(&state)).await;
+            assert!(got.is_empty(), "{got:?}");
+        }
     }
 
     mod bun {

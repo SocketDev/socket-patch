@@ -3911,6 +3911,55 @@ async fn scan_vendor_gem_skips_a_version_the_lock_does_not_resolve() {
     }
 }
 
+/// #2075 in human mode: one `[skip]` line that says why, no `Error:` line
+/// and exit 0, wet run and dry run alike.
+#[tokio::test]
+async fn scan_vendor_gem_unlocked_version_skip_reads_as_a_skip() {
+    let (_, gemfile, lock) = gem_unlocked_projects().remove(0);
+    for (extra, marker) in [(&[][..], "[skip]"), (&["--dry-run"][..], "[would-refuse]")] {
+        let mock = wiremock::MockServer::start().await;
+        mount_gem_patch_api(&mock, GEM_PURL).await;
+        let fx = gem_unlocked_fixture(&gemfile, &lock);
+        let uri = mock.uri();
+        let mut argv = vec![
+            "scan",
+            "--mode",
+            "vendored",
+            "--yes",
+            "--api-url",
+            uri.as_str(),
+            "--api-token",
+            "fake-token",
+            "--org",
+            "test-org",
+            "--cwd",
+            fx.root().to_str().unwrap(),
+        ];
+        argv.extend_from_slice(extra);
+        let (code, stdout, stderr) = run_cli(fx.root(), &argv, &[]);
+        let out = format!("{stdout}\n{stderr}");
+        assert_eq!(code, 0, "{extra:?}:\n{out}");
+        let line = out
+            .lines()
+            .find(|l| {
+                l.contains(&format!(
+                    "{marker} {GEM_PURL} (vendor_gem_version_not_locked): "
+                ))
+            })
+            .unwrap_or_else(|| panic!("{extra:?}: no {marker} line for the gem:\n{out}"));
+        assert!(
+            line.contains("Gemfile.lock does not resolve demo-gem 1.0.0")
+                && line.contains("this project doesn't lock it"),
+            "{extra:?}: {line}"
+        );
+        assert!(
+            !out.contains("Error") && !out.contains("failed") && !out.contains("has no entry"),
+            "{extra:?}: a skip is not an error:\n{out}"
+        );
+        assert!(!fx.root().join(".socket").exists(), "{extra:?}");
+    }
+}
+
 /// #2075: the dry run reports what the wet run does. It used to say it
 /// would vendor the gem the wet run then failed on.
 #[tokio::test]

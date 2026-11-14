@@ -1950,6 +1950,12 @@ the shared gem home. Another project that pins the upstream build of the same ge
 loads the patched code too, and its `bundle pristine` fails on the checksum until it is patched
 as well.
 
+A shared gem home also holds gem versions this project doesn't use: the gems Ruby ships (`rake`,
+`rexml`, ...) and the versions other projects installed. Hosted and vendored mode patch what
+`Gemfile.lock` resolves, so a version the lock doesn't list is skipped, never a failure: hosted
+mode warns `redirect_gem_version_not_locked`, vendored mode reports a `skipped` event with
+`vendor_gem_version_not_locked` and doesn't download its patch. The run exits 0.
+
 ## Ruby gems: native extensions
 
 Some gem fixes change only a C extension's sources (`ext/**/*.c`, `*.h`, `extconf.rb`). Ruby

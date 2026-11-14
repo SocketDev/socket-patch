@@ -951,6 +951,22 @@ pub(crate) async fn fetch_selected_patches(
         // fetched (nor, downstream, its pristine source). Code-tagged so a
         // `--silent` operator can grep the stable code.
         if let Some(VendorRefusal { code, detail }) = refusals.get(purl) {
+            // An expected skip (a gem version this project doesn't lock)
+            // is the package's whole account: no view, no record, and no
+            // failure, as in the vendor loop.
+            if crate::commands::vendor::refusal_is_benign(code) {
+                if !quiet {
+                    eprintln!("  [skip] {} ({code}): {detail}", normalize_purl(purl));
+                }
+                batch.events.push(tag_mode(
+                    PatchEvent::new(EventAction::Skipped, purl)
+                        .with_uuid(uuid)
+                        .with_reason(*code, detail.as_str()),
+                    batch.mode,
+                ));
+                batch.skipped += 1;
+                continue;
+            }
             batch.fail(
                 params.json,
                 Some(format!("[error] {purl} ({code}): {detail}")),
