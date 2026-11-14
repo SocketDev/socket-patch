@@ -55,9 +55,7 @@ use socket_patch_core::patch::redirect::upstream::{
     restore_upstream, restore_upstream_under_bazel, HostedPin, PinResult, PinStatus,
     RestoreOptions, RestoreOutcome,
 };
-use socket_patch_core::utils::bazel_root_writes::{
-    lock_root, repair_lines, RootLock, ROOT_LOCK_WAIT,
-};
+use socket_patch_core::utils::bazel_root_writes::{lock_root, repair_lines, ROOT_LOCK_WAIT};
 use socket_patch_core::utils::group_commit::{
     pending_anchored, restore_anchored, AnchoredChange, CommittedFile,
 };
@@ -66,7 +64,7 @@ use socket_patch_core::utils::purl_key::PurlKey;
 use socket_patch_core::vendor::VendorState;
 use socket_patch_core::vex::discover::{BazelOptions, Judge, Read, WiringMode};
 
-use super::run::{finish, land, Captured, Finish, NoRunner, Staged, Unlanded};
+use super::run::{finish, land, runner, Captured, Finish, Staged, Unlanded};
 use super::{run_loader, run_policy, IndexState, Loaded, LoadedRoot, Loader, RunCx};
 use crate::args::GlobalArgs;
 use crate::json_envelope::{Envelope, RunWarning};
@@ -189,65 +187,88 @@ fn anchored(changes: &Changes, read: impl Fn(&str) -> Option<Vec<u8>>) -> Vec<An
     ordered.map(change).collect()
 }
 
-/// Settles the command a restoring edit leaves, once its files are on
-/// disk. `captured` are the originals, and `lock` the root's lock where
-/// the caller still holds it. `Err`: the command failed, the originals
-/// were put back (or could not be), and nothing of the edit stands.
+/// The error line of an edit whose command failed: `left` holds one line
+/// per file that could not be put back, and is empty when the tree is as
+/// it was.
+fn unwound(why: &str, left: &[String]) -> String {
+    match left.is_empty() {
+        true => format!("{why}; what was written was put back, so nothing was changed"),
+        false => format!(
+            "{why}; putting back what was written failed as well: {}",
+            left.join(", ")
+        ),
+    }
+}
+
+/// Settles the command a restoring edit leaves, for an edit whose files a
+/// native flush has already written (an edit that lands through [`commit`]
+/// is settled inside `run::land`). `captured` are the originals. `Err`:
+/// the command failed, the originals were put back (or could not be), and
+/// nothing of the edit stands.
 async fn settle(
     loader: &Loader,
     root: &Path,
     restoring: &Restoring,
     captured: Captured,
-    lock: Option<RootLock>,
 ) -> Result<(), String> {
-    let (captured, why) = match finish(&restoring.outcome, captured, &NoRunner) {
+    let settled = finish(&restoring.outcome, captured, runner().as_ref());
+    let (captured, why) = match settled {
         Finish::Keep(_) => return Ok(()),
         Finish::Unwind { captured, why } => (captured, why),
     };
-    let lock = match lock {
-        Some(lock) => Ok(lock),
-        None => lock_root(root, ROOT_LOCK_WAIT).await,
-    };
-    let back = match &lock {
-        Ok(lock) => restore_anchored(lock, captured.files()).await,
+    let back = match lock_root(root, ROOT_LOCK_WAIT).await {
+        Ok(lock) => restore_anchored(&lock, captured.files()).await,
         Err(e) => Err(vec![e.to_string()]),
     };
     loader.committed(root);
-    Err(match back {
-        Ok(()) => format!("{why}; what was written was put back, so nothing was changed"),
-        Err(left) => format!(
-            "{why}; putting back what was written failed as well: {}",
-            left.join(", ")
-        ),
-    })
+    Err(unwound(&why, &back.err().unwrap_or_default()))
 }
 
-/// Lands `changes` in the commit anchored at `root` and settles the
-/// command the edit leaves. `Err`: why nothing stayed written.
+/// Lands `changes` in the commit anchored at `root`, for the project at
+/// `project_rel` under it, and settles the command the edit leaves
+/// (`run::land` does both, in its order: a command that fails takes the
+/// commit back). `Err`: why nothing of the edit stayed written.
 async fn commit(
     loader: &Loader,
     root: &Path,
+    project_rel: &str,
     touched: &[String],
     changes: &[AnchoredChange],
     restoring: &Restoring,
 ) -> Result<(), String> {
+    let outcomes = [&restoring.outcome];
     let staged = Staged {
         root,
+        project_rel,
         touched,
         changes,
+        outcomes: &outcomes,
+        ahead: &[],
     };
-    let landed = land(staged, async { Ok::<(), String>(()) }).await;
+    let runner = runner();
+    let landed = land(staged, runner.as_ref(), async { Ok::<(), String>(()) }).await;
     // Whatever came of it, what the loader read of the root is old.
     loader.committed(root);
     match landed {
-        Ok(landed) => settle(loader, root, restoring, landed.captured, Some(landed.lock)).await,
+        Ok(_) => Ok(()),
         Err(Unlanded::Root {
-            why,
-            pending: false,
-        }) => Err(format!("{why}; nothing was changed")),
-        Err(Unlanded::Root { why, pending: true }) => Err(format!(
+            why, pending: true, ..
+        }) => Err(format!(
             "{why}; the interrupted write is journaled, and the next socket-patch command \
              finishes it"
+        )),
+        Err(Unlanded::Root { why, left, .. }) if left.is_empty() => {
+            Err(format!("{why}; nothing was changed"))
+        }
+        Err(Unlanded::Root { why, left, .. }) | Err(Unlanded::Run { why, left }) => {
+            Err(unwound(&why, &left))
+        }
+        // The replay rewrote files under the root, so "nothing was
+        // changed" would be false: nothing of this edit was.
+        Err(Unlanded::Recovered(replayed)) => Err(format!(
+            "{}; this command decided from the files as they were before that, so nothing of \
+             its own was written: run it again",
+            replayed.detail
         )),
         Err(Unlanded::Project { error, left }) => Err(format!("{error} {}", left.join(", "))),
     }
@@ -378,7 +399,9 @@ pub async fn restore(
         };
         let mut touched = exec::touched(index, &[]);
         touched.extend(outcome.staged_text.keys().map(rebased));
-        commit(&loader, at, &touched, &anchored(&changes, read), &restoring).await
+        let staged = anchored(&changes, read);
+        let project_rel = &root.root().project_rel;
+        commit(&loader, at, project_rel, &touched, &staged, &restoring).await
     } else {
         // The native flush has written. Its originals are what an unwind
         // puts back.
@@ -388,7 +411,7 @@ pub async fn restore(
         };
         let originals = outcome.staged_from.iter().map(original).collect();
         loader.committed(at);
-        settle(&loader, at, &restoring, Captured::new(at, originals), None).await
+        settle(&loader, at, &restoring, Captured::new(at, originals)).await
     };
     match settled {
         Ok(()) => advise(common, &restoring, &mut outcome.warnings),
@@ -508,6 +531,8 @@ impl Undone {
 /// anchored at their root, with what the gate says of it as an edit.
 struct RowsPlan {
     root: PathBuf,
+    /// The project of the run relative to `root`, `""` at the root.
+    project_rel: String,
     touched: Vec<String>,
     changes: Vec<AnchoredChange>,
     restoring: Restoring,
@@ -515,11 +540,19 @@ struct RowsPlan {
 
 impl RowsPlan {
     /// `changes` over the root `files` shows, as the transaction that
-    /// made them read it, capturing what the rows of `index` name.
-    fn of(files: &DiskView, index: &Index, changes: &Changes, restoring: Restoring) -> Self {
+    /// made them read it, capturing what the rows of `index` name, for a
+    /// run of the project at `project_rel` under that root.
+    fn of(
+        files: &DiskView,
+        project_rel: &str,
+        index: &Index,
+        changes: &Changes,
+        restoring: Restoring,
+    ) -> Self {
         let read = |rel: &str| files.read(rel).as_bytes().map(<[u8]>::to_vec);
         Self {
             root: files.root().to_path_buf(),
+            project_rel: project_rel.to_string(),
             touched: exec::touched(index, &[]),
             changes: anchored(changes, read),
             restoring,
@@ -620,7 +653,8 @@ fn plan_rows(
     }
     let purls = out.reverted.iter().map(String::as_str);
     let restoring = reverse(common, &loaded, (ws, &fresh, &index), purls, &undo.changes);
-    let plan = RowsPlan::of(&fresh, &index, &undo.changes, restoring);
+    let below = &place.project_rel;
+    let plan = RowsPlan::of(&fresh, below, &index, &undo.changes, restoring);
     (out, Some(plan))
 }
 
@@ -657,11 +691,13 @@ pub async fn undo_rows(
     if !common.dry_run {
         let RowsPlan {
             root,
+            project_rel,
             touched,
             changes,
             restoring,
         } = &plan;
-        if let Err(why) = commit(&loader, root, touched, changes, restoring).await {
+        let landed = commit(&loader, root, project_rel, touched, changes, restoring).await;
+        if let Err(why) = landed {
             // Nothing landed: every row stands, and so does every record.
             let code = Code::RedirectRevertIncomplete.as_str();
             for purl in std::mem::take(&mut out.reverted) {
@@ -765,7 +801,8 @@ fn audit(
     }
     let none = std::iter::empty();
     let restoring = reverse(common, &loaded, (ws, &fresh, &index), none, changes);
-    let plan = RowsPlan::of(&fresh, &index, changes, restoring);
+    let below = &place.project_rel;
+    let plan = RowsPlan::of(&fresh, below, &index, changes, restoring);
     (said, Some(plan))
 }
 
@@ -813,6 +850,7 @@ pub async fn repair(common: &GlobalArgs, lanes: &LaneTable) -> Vec<RunWarning> {
                 commit(
                     &loader,
                     &plan.root,
+                    &plan.project_rel,
                     &plan.touched,
                     &plan.changes,
                     &plan.restoring,
@@ -1574,6 +1612,8 @@ mod tests {
             let root = std::fs::canonicalize(tmp.path()).expect("its real path");
             let lock = root.join("svc").join(LOCK);
             std::fs::create_dir_all(root.join("svc")).expect("mkdir");
+            // A checkout: the root lies inside what a run of `svc` writes.
+            std::fs::create_dir_all(root.join(".git")).expect("mkdir");
             std::fs::write(&lock, b"patched\n").expect("write");
 
             let mut outcome = RestoreOutcome::default();
@@ -1595,14 +1635,19 @@ mod tests {
             let staged = anchored(&changes, read);
             let staged = Staged {
                 root: &root,
+                project_rel: "svc",
                 touched: &touched,
                 changes: &staged,
+                outcomes: &[],
+                ahead: &[],
             };
-            let landed = land(staged, async { Ok::<(), String>(()) }).await;
-            let Err(Unlanded::Root { why, pending }) = landed else {
+            let runner = runner();
+            let landed = land(staged, runner.as_ref(), async { Ok::<(), String>(()) }).await;
+            let Err(Unlanded::Root { why, pending, left }) = landed else {
                 panic!("{outside}: the commit at the root refuses");
             };
             assert!(!pending && why.contains(".npmrc"), "{outside}: {why}");
+            assert_eq!(left, Vec::<String>::new(), "{outside}");
             let held = std::fs::read(&lock).expect("read");
             assert_eq!(held, b"patched\n", "{outside}");
         }
