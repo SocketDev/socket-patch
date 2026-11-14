@@ -117,11 +117,32 @@
 //! ([`crate::utils::bazel_root_writes::RootLock`]), and taking that lock is
 //! what replays a journal an interrupted anchored commit left
 //! ([`recover_anchored`]): by the next run that locks the root, and by the
-//! project lock of any project at or below it. The replay writes only what
+//! project lock of any project at or below it, as far up as the directory
+//! socket-patch writes in for that project and only at a directory that is
+//! a Bazel root (`bazel_root_writes::recover_above`). A seam commits at no
+//! root outside that directory, so no journal of socket-patch's lies where
+//! the project lock does not look. The replay writes only what
 //! an anchored commit could have journaled ([`anchored_admits`]), through no
 //! link. Every read and write of an anchored commit goes to the disk, past
 //! any group commit that is open for the project: the two are landed one
 //! after the other, each from what the disk holds.
+//!
+//! **One answer for a path both commits touch.** A run that decides while
+//! a group commit is open reads the root through it, so the bytes it read
+//! at a path the group holds (a takeover's staged revert of a lock a hub
+//! reads) are the staged ones, not the disk's. [`settle_with_open_group`]
+//! makes the two agree before either lands: it holds the read to what the
+//! group staged, hands the anchored commit the path with the bytes the
+//! disk holds, and hands the group the bytes the anchored commit lands, so
+//! the group's own commit finds the path as it wants it and writes nothing
+//! there.
+//!
+//! **Nothing staged is left behind.** A replay removes the stage files an
+//! interrupted commit left beside each file its journal names and beside
+//! the journal, with no age gate: under the root's lock nobody else is
+//! writing them. A replace that fails takes the directories it made for
+//! the file with it, so a root that had no `.socket` before a failed
+//! commit has none after.
 
 use std::any::Any;
 use std::collections::BTreeMap;
@@ -1332,7 +1353,10 @@ struct Journaled {
     /// How a journaled file is read: a project's through the readers every
     /// backend uses, an anchored commit's from the disk alone.
     read: fn(&Path) -> std::io::Result<Vec<u8>>,
-    /// Whether a removal takes the owned directories it leaves empty.
+    /// Whether the commit is anchored at a Bazel root: a removal takes
+    /// the owned directories it leaves empty, a write that fails takes the
+    /// directories it made, and a replay removes the stage files that an
+    /// interrupted commit left beside the files it names.
     prunes: bool,
 }
 
@@ -1514,14 +1538,21 @@ fn replay(project_root: &Path, kind: &Journaled) -> std::io::Result<Recovery> {
         .filter(|i| !i.at_new() && !i.at_old())
         .collect();
     // An anchored commit takes the owned directories its removals leave
-    // empty; a project's commit removes no directory here.
+    // empty, and the directories a failed write made; a project's commit
+    // removes no directory here.
     let write = |item: &Replay, bytes: Option<&[u8]>| -> std::io::Result<()> {
-        write_sync(&item.path, bytes, item.preserve_mode)?;
-        if kind.prunes && bytes.is_none() {
-            prune_owned(project_root, &item.path);
+        match kind.prunes {
+            true => write_owned(project_root, &item.path, bytes, item.preserve_mode),
+            false => write_sync(&item.path, bytes, item.preserve_mode),
         }
-        Ok(())
     };
+    if kind.prunes {
+        // Every path was admitted and is reached through no link: what an
+        // interrupted commit staged beside them and never renamed goes
+        // before anything is written (hazard HZ-27).
+        let paths = items.iter().map(|item| item.path.as_path());
+        sweep_stages(paths.chain(std::iter::once(journal_path.as_path())));
+    }
     if conflicts.is_empty() {
         let mut rewritten = Vec::new();
         for item in items.iter().filter(|i| !i.at_new()) {
@@ -1716,14 +1747,69 @@ thread_local! {
     static FAIL_ANCHORED_AT: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
 }
 
+/// One write under a Bazel root: of an anchored commit, of its undo or of
+/// its replay. A removal takes the owned directories it leaves empty
+/// ([`prune_owned`]). A write that fails takes every directory it made for
+/// the file, so a commit that is refused by the disk leaves no empty
+/// directory behind, under the owned directory or in the user's tree.
+fn write_owned(
+    root: &Path,
+    path: &Path,
+    bytes: Option<&[u8]>,
+    preserve_mode: bool,
+) -> std::io::Result<()> {
+    // The outermost directory the file's parent chain lacks.
+    let missing = |dir: &&Path| *dir != root && std::fs::symlink_metadata(dir).is_err();
+    let made = bytes
+        .and(path.parent())
+        .and_then(|parent| parent.ancestors().take_while(missing).last());
+    match write_sync(path, bytes, preserve_mode) {
+        Ok(()) => {
+            if bytes.is_none() {
+                prune_owned(root, path);
+            }
+            Ok(())
+        }
+        Err(e) => {
+            let mut dir = path.parent();
+            while let (Some(level), Some(top)) = (dir, made) {
+                if !level.starts_with(top) || std::fs::remove_dir(level).is_err() {
+                    break;
+                }
+                dir = level.parent();
+            }
+            Err(e)
+        }
+    }
+}
+
+/// Removes the stage files left beside each of `paths`: the
+/// `STAGE_PREFIX<leaf>-*` siblings a kill inside stage-and-rename leaves.
+/// No age gate: the caller holds the root's lock, and the paths are ones
+/// only a holder of it writes. Regular files only, and nothing is followed.
+fn sweep_stages<'a>(paths: impl Iterator<Item = &'a Path>) {
+    for path in paths {
+        let (Some(dir), Some(leaf)) = (path.parent(), path.file_name()) else {
+            continue;
+        };
+        let staged = format!(
+            "{}{}-",
+            crate::utils::socket_dir::STAGE_PREFIX,
+            leaf.to_string_lossy()
+        );
+        for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            let is_file = entry.file_type().is_ok_and(|kind| kind.is_file());
+            if is_file && entry.file_name().to_string_lossy().starts_with(&staged) {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+}
+
 /// One replace of an anchored commit, or of its undo.
 fn write_anchored(root: &Path, change: &Change) -> std::io::Result<()> {
     let path = root.join(&change.rel);
-    write_sync(&path, change.after.as_deref(), change.preserve_mode)?;
-    if change.after.is_none() {
-        prune_owned(root, &path);
-    }
-    Ok(())
+    write_owned(root, &path, change.after.as_deref(), change.preserve_mode)
 }
 
 /// Puts `applied` back to the bytes they held, newest first and every one
@@ -1835,6 +1921,10 @@ fn commit_anchored_at(
                 Ok(()) => {
                     let _ = std::fs::remove_file(&journal);
                     sync_dir(journal.parent());
+                    // Nothing staged stays beside a file of the commit.
+                    let paths: Vec<PathBuf> = planned.iter().map(|c| root.join(&c.rel)).collect();
+                    let paths = paths.iter().map(PathBuf::as_path);
+                    sweep_stages(paths.chain(std::iter::once(journal.as_path())));
                     Err(e)
                 }
                 Err(_) => Err(std::io::Error::new(e.kind(), CommitPending(e))),
@@ -1879,9 +1969,8 @@ fn restore_anchored_at(root: &Path, committed: &[CommittedFile]) -> Result<(), V
     let mut left = Vec::new();
     for file in committed.iter().rev() {
         let path = below(root, &file.rel);
-        let put_back = write_sync(&path, file.before.as_deref(), true);
+        let put_back = write_owned(root, &path, file.before.as_deref(), true);
         match put_back {
-            Ok(()) if file.before.is_none() => prune_owned(root, &path),
             Ok(()) => {}
             Err(e) => {
                 let state = match &file.before {
@@ -1910,6 +1999,131 @@ pub async fn restore_anchored(
 ) -> Result<(), Vec<String>> {
     let (root, committed) = (lock.root().to_path_buf(), committed.to_vec());
     super::fs::run_blocking(move || restore_anchored_at(&root, &committed)).await
+}
+
+/// Makes a change set that [`commit_anchored`] is about to land agree with
+/// the group commit that is open for the project (the module docs, "One
+/// answer for a path both commits touch").
+///
+/// For each change whose path an open group holds: the bytes the
+/// transaction read must be the bytes the group staged there, or the whole
+/// change set is refused ([`AnchoredRefusal::Changed`]) with nothing
+/// touched. Then `read` becomes what the disk holds, which is what the
+/// anchored commit compares and what its undo puts back, and the group is
+/// handed the bytes the anchored commit lands, so that its own commit finds
+/// the path as it wants it. A path no open group holds is left alone.
+///
+/// The caller lands the change set and then the group, or drops both: a
+/// group that was handed bytes here and is committed without the anchored
+/// commit would land them itself.
+pub fn settle_with_open_group(root: &Path, changes: &mut [AnchoredChange]) -> std::io::Result<()> {
+    let mut held: Vec<(usize, Arc<Overlay>, PathBuf, bool)> = Vec::new();
+    for (at, change) in changes.iter().enumerate() {
+        let path = below(root, &change.rel);
+        let Some((overlay, key)) = resolve(&path) else {
+            continue;
+        };
+        let files = overlay
+            .files
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(captured) = files.get(&key) else {
+            continue;
+        };
+        let staged = match &captured.bytes {
+            Some(content) => Some(content.bytes()?),
+            None => None,
+        };
+        if staged != change.read {
+            let why = AnchoredRefusal::Changed(change.rel.clone());
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, why));
+        }
+        let preserve_mode = captured.preserve_mode;
+        drop(files);
+        held.push((at, overlay, key, preserve_mode));
+    }
+    for (at, overlay, key, preserve_mode) in held {
+        let change = &mut changes[at];
+        change.read = disk_bytes(&below(root, &change.rel))?;
+        let bytes = change.write.clone().map(Content::Bytes);
+        overlay
+            .files
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(
+                key,
+                Captured {
+                    bytes,
+                    preserve_mode,
+                },
+            );
+    }
+    Ok(())
+}
+
+/// [`land_ahead`], blocking.
+fn land_ahead_at(dir: &Path, files: &[(String, Vec<u8>)]) -> std::io::Result<Vec<CommittedFile>> {
+    use crate::utils::containment::try_linked_level;
+    let mut landed: Vec<CommittedFile> = Vec::new();
+    for (rel, bytes) in files {
+        let path = below(dir, rel);
+        let written = (|| {
+            if try_linked_level(dir, &path)?.is_some() {
+                let linked = SymlinkedTarget(rel.clone());
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    linked,
+                ));
+            }
+            let before = disk_bytes(&path)?;
+            if before.as_deref() == Some(bytes.as_slice()) {
+                return Ok(None);
+            }
+            write_owned(dir, &path, Some(bytes), true)?;
+            Ok(Some(before))
+        })();
+        match written {
+            Ok(None) => {}
+            Ok(Some(before)) => landed.push(CommittedFile {
+                rel: rel.clone(),
+                before,
+            }),
+            Err(e) => {
+                return Err(match restore_anchored_at(dir, &landed) {
+                    Ok(()) => e,
+                    Err(files) => std::io::Error::new(e.kind(), LeftReplaced { cause: e, files }),
+                });
+            }
+        }
+    }
+    Ok(landed)
+}
+
+/// Lands `files` (path relative to `dir`, forward-slashed, with the bytes
+/// to hold) straight on disk, past any group commit that is open, each by
+/// stage and rename and through no link. For the files of a run that are
+/// inert until a later commit of the same run makes them matter (an
+/// install-policy file beside a lock that is about to be pinned): landed
+/// first, an interruption between the two leaves the inert file and never
+/// the pin without it (revision 4, 1.9: inert first).
+///
+/// Returns each file that was written with the bytes it held before, for
+/// [`take_back`]. On an error the files already written were put back, or
+/// the error names the ones that could not be ([`left_replaced`]).
+pub async fn land_ahead(
+    dir: &Path,
+    files: Vec<(String, Vec<u8>)>,
+) -> std::io::Result<Vec<CommittedFile>> {
+    let dir = dir.to_path_buf();
+    super::fs::run_blocking(move || land_ahead_at(&dir, &files)).await
+}
+
+/// Undoes a [`land_ahead`]: each file goes back to the bytes it held, and
+/// a file it created is removed. `Err` holds one line per file that could
+/// not be put back, naming the state it is left in.
+pub async fn take_back(dir: &Path, landed: &[CommittedFile]) -> Result<(), Vec<String>> {
+    let (dir, landed) = (dir.to_path_buf(), landed.to_vec());
+    super::fs::run_blocking(move || restore_anchored_at(&dir, &landed)).await
 }
 
 #[cfg(test)]
@@ -3028,18 +3242,31 @@ mod tests {
 
     /// A checkout whose top is a Bazel root, with a project below it.
     fn bazel_root() -> (tempfile::TempDir, PathBuf) {
+        bazel_root_in(true)
+    }
+
+    /// [`bazel_root`], in a checkout (`git`) or in a directory no
+    /// repository encloses: the read boundary of a project there is the
+    /// project itself.
+    fn bazel_root_in(git: bool) -> (tempfile::TempDir, PathBuf) {
         let tmp = tempfile::tempdir().unwrap();
         let root = std::fs::canonicalize(tmp.path()).unwrap();
-        std::fs::create_dir_all(root.join(".git")).unwrap();
+        if git {
+            std::fs::create_dir_all(root.join(".git")).unwrap();
+        }
         std::fs::write(root.join("MODULE.bazel"), b"module(name = \"ws\")\n").unwrap();
         std::fs::create_dir_all(below(&root, "svc/api")).unwrap();
         std::fs::write(below(&root, LOCK), b"lock-old\n").unwrap();
         (tmp, root)
     }
 
-    /// Every file below `root` but the git directory, by its path from
+    /// Everything below `root` but the git directory, by its path from
     /// there, built from the components so that it is spelled with `/` on
-    /// every system.
+    /// every system: each file with its bytes, and each directory under a
+    /// name that ends with `/`, so that a directory a commit left behind
+    /// is a difference. The root's lock file is left out: it exists only
+    /// while the lock is held, and on Windows a second handle cannot read
+    /// a file whose whole range another handle has locked.
     fn tree(root: &Path) -> BTreeMap<String, Vec<u8>> {
         fn walk(dir: &Path, at: &mut Vec<String>, out: &mut BTreeMap<String, Vec<u8>>) {
             for entry in std::fs::read_dir(dir).unwrap() {
@@ -3049,8 +3276,15 @@ mod tests {
                     continue;
                 }
                 at.push(name);
+                if *at == [".socket", "bazel", "apply.lock"] {
+                    at.pop();
+                    continue;
+                }
                 match entry.file_type().unwrap().is_dir() {
-                    true => walk(&entry.path(), at, out),
+                    true => {
+                        out.insert(format!("{}/", at.join("/")), Vec::new());
+                        walk(&entry.path(), at, out);
+                    }
                     false => drop(out.insert(at.join("/"), std::fs::read(entry.path()).unwrap())),
                 }
                 at.pop();
@@ -3059,6 +3293,19 @@ mod tests {
         let mut out = BTreeMap::new();
         walk(root, &mut Vec::new(), &mut out);
         out
+    }
+
+    /// The files of a [`tree`], without its directories.
+    fn files_of(tree: &BTreeMap<String, Vec<u8>>) -> Vec<&String> {
+        tree.keys().filter(|path| !path.ends_with('/')).collect()
+    }
+
+    /// A directory link, as each system makes one.
+    fn link_dir(target: &Path, link: &Path) {
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(target, link).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_dir(target, link).unwrap();
     }
 
     /// The change set of a run that pins a lock and records it: the
@@ -3160,6 +3407,7 @@ mod tests {
         restore_anchored(&lock, &committed).await.unwrap();
         drop(lock);
         assert_eq!(tree(&root), before, "also the directories it made");
+        assert!(!root.join(".socket").exists());
     }
 
     /// A change set with nothing in it is no commit: no journal, no
@@ -3193,12 +3441,98 @@ mod tests {
             assert!(!is_pending(&err), "{err}");
             assert!(anchored_refusal(&err).is_none(), "{err}");
             assert!(!below(&root, ROOT_JOURNAL_REL).exists(), "at {failing}");
-            let mut after = tree(&root);
-            after.remove(".socket/bazel/apply.lock");
-            assert_eq!(after, before, "at {failing}");
+            assert_eq!(tree(&root), before, "at {failing}");
+            let owned = below(&root, INDEX).parent().unwrap().to_path_buf();
+            assert!(!owned.join("patches").exists(), "at {failing}");
         }
         drop(lock);
         assert_eq!(tree(&root), before);
+    }
+
+    /// A replace that fails inside the write, after the directories of
+    /// the file were made, takes them back with everything else: a root
+    /// that had no `.socket` has none after. The leaf is so long that its
+    /// stage file has no name a file system accepts.
+    #[test]
+    fn a_replace_that_fails_behind_its_directories_leaves_none() {
+        let (_tmp, root) = bazel_root();
+        let before = tree(&root);
+        let lock = lock_root_blocking(&root, Duration::ZERO).unwrap();
+        let long = format!(
+            ".socket/bazel/patches/9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f/{}.patch",
+            "p".repeat(246)
+        );
+        let change = |rel: &str, write: &[u8]| AnchoredChange {
+            rel: rel.to_string(),
+            read: disk_bytes(&below(&root, rel)).unwrap(),
+            write: Some(write.to_vec()),
+        };
+        let changes = vec![
+            change(INDEX, b"{\"version\": 1}\n"),
+            change(&long, b"--- a\n+++ b\n"),
+            change(LOCK, b"lock-new\n"),
+        ];
+        let touched: Vec<String> = changes.iter().map(|change| change.rel.clone()).collect();
+        let err = commit_anchored_at(lock.root(), &touched, &changes).unwrap_err();
+        assert!(!is_pending(&err), "{err}");
+        assert!(anchored_refusal(&err).is_none(), "{err}");
+        drop(lock);
+        assert_eq!(tree(&root), before, "{err}");
+        assert!(!root.join(".socket").exists(), "{err}");
+    }
+
+    /// What a kill inside stage-and-rename leaves beside the files of a
+    /// commit goes with the replay of its journal: beside the journal,
+    /// beside a file under the owned directory and beside the user's lock.
+    /// A file of the user's that only looks alike stays.
+    #[test]
+    fn a_replay_removes_the_stage_files_an_interrupted_commit_left() {
+        let (_tmp, root) = bazel_root();
+        let planned = vec![
+            Change {
+                rel: INDEX.into(),
+                before: None,
+                after: Some(b"{\"version\": 1}\n".to_vec()),
+                preserve_mode: true,
+            },
+            Change {
+                rel: PATCH.into(),
+                before: None,
+                after: Some(b"--- a\n+++ b\n".to_vec()),
+                preserve_mode: true,
+            },
+            change(LOCK, b"lock-old\n", b"lock-new\n"),
+        ];
+        let journal = below(&root, ROOT_JOURNAL_REL);
+        std::fs::create_dir_all(below(&root, PATCH).parent().unwrap()).unwrap();
+        std::fs::write(&journal, journal_bytes(&planned).unwrap()).unwrap();
+        let stage = crate::utils::socket_dir::STAGE_PREFIX;
+        let staged = [
+            journal.with_file_name(format!("{stage}.commit-journal.json-1a2b")),
+            below(&root, INDEX).with_file_name(format!("{stage}index.json-3c4d")),
+            below(&root, PATCH).with_file_name(format!("{stage}lib.patch-5e6f")),
+            below(&root, LOCK).with_file_name(format!("{stage}pnpm-lock.yaml-7a8b")),
+        ];
+        for path in &staged {
+            std::fs::write(path, b"half").unwrap();
+        }
+        // Not a stage file of a journaled path: the user's own.
+        let kept = below(&root, LOCK).with_file_name(format!("{stage}notes.txt-1"));
+        std::fs::write(&kept, b"mine").unwrap();
+
+        let lock = lock_root_blocking(&root, Duration::ZERO).unwrap();
+        let rolled = [INDEX, PATCH, LOCK].map(str::to_string).to_vec();
+        assert_eq!(lock.recovery(), &Recovery::RolledForward(rolled));
+        for path in &staged {
+            assert!(!path.exists(), "{} is left", path.display());
+        }
+        assert_eq!(std::fs::read(&kept).unwrap(), b"mine");
+        drop(lock);
+        let left: Vec<String> = tree(&root)
+            .into_keys()
+            .filter(|path| path.contains(stage))
+            .collect();
+        assert_eq!(left, [format!("svc/api/{stage}notes.txt-1")]);
     }
 
     /// When the files cannot be put back either, the journal is what makes
@@ -3252,8 +3586,8 @@ mod tests {
             let _ = commit_anchored_at(lock.root(), &touched, &changes);
             panic!("the failpoint did not end the process");
         }
-        for project in ["", "svc/api"] {
-            let (_tmp, root) = bazel_root();
+        for (project, git) in [("", true), ("svc/api", true), ("", false)] {
+            let (_tmp, root) = bazel_root_in(git);
             let before = tree(&root);
             let exe = std::env::current_exe().unwrap();
             let child = std::process::Command::new(exe)
@@ -3272,7 +3606,7 @@ mod tests {
             let crashed = tree(&root);
             let untouched: Vec<&String> = crashed
                 .keys()
-                .filter(|path| !path.starts_with(".socket/bazel/"))
+                .filter(|path| !path.starts_with(".socket/"))
                 .collect();
             assert_eq!(untouched, before.keys().collect::<Vec<_>>(), "{project}");
             assert_eq!(crashed[LOCK], b"lock-old\n");
@@ -3301,8 +3635,8 @@ mod tests {
             assert_eq!(after[PATCH], b"--- a\n+++ b\n", "{project}");
             assert_eq!(after[LOCK], b"lock-new\n", "{project}");
             assert_eq!(
-                after.len(),
-                before.len() + 2,
+                files_of(&after).len(),
+                files_of(&before).len() + 2,
                 "{project}: {:?}",
                 after.keys()
             );
@@ -3311,6 +3645,36 @@ mod tests {
             let clean = apply_lock::acquire(&socket_dir, Duration::ZERO).unwrap();
             assert_eq!(clean.commit_recovery(), None, "{project}");
         }
+
+        // A project below the root, with no repository around either: the
+        // directory socket-patch writes in is the project, the root lies
+        // outside it, and no seam commits there
+        // (`bazel_root_outside_repository`). So the project's lock neither
+        // finishes nor reports a journal at that root, and leaves it and
+        // every file it names as found. The root's own lock still does.
+        let (_tmp, root) = bazel_root_in(false);
+        let exe = std::env::current_exe().unwrap();
+        let child = std::process::Command::new(exe)
+            .args([NAME, "--exact", "--test-threads=1", "--nocapture"])
+            .env(CHILD, &root)
+            .env("SOCKET_PATCH_FAILPOINT", "group_commit_journal")
+            .output()
+            .unwrap();
+        assert_eq!(child.status.code(), Some(86));
+        let crashed = tree(&root);
+        let socket_dir = below(&root, "svc/api").join(".socket");
+        let dry = apply_lock::acquire_dry_run(&socket_dir, Duration::ZERO).unwrap();
+        assert_eq!(dry.commit_recovery(), None);
+        assert!(dry.unfinished_above().is_empty());
+        drop(dry);
+        let wet = apply_lock::acquire(&socket_dir, Duration::ZERO).unwrap();
+        assert_eq!(wet.commit_recovery(), None);
+        assert!(wet.unfinished_above().is_empty());
+        drop(wet);
+        assert_eq!(tree(&root), crashed, "left as found");
+        let lock = lock_root_blocking(&root, Duration::ZERO).unwrap();
+        let rolled = [INDEX, PATCH, LOCK].map(str::to_string).to_vec();
+        assert_eq!(lock.recovery(), &Recovery::RolledForward(rolled));
     }
 
     /// A file that changed after the transaction read it refuses the
@@ -3380,13 +3744,13 @@ mod tests {
     /// A Bazel root whose `.socket` is a symbolic link gets no write: the
     /// lock is refused, nothing is created behind the link, and a commit
     /// asked for all the same refuses too. A linked directory on the way
-    /// to a file of the user's refuses the commit like a linked file.
-    #[cfg(unix)]
+    /// to a file of the user's refuses the commit like a linked file. On
+    /// every system: the link is a directory link as each one makes it.
     #[tokio::test]
     async fn an_anchored_commit_writes_through_no_link() {
         let (_tmp, root) = bazel_root();
         let other = tempfile::tempdir().unwrap();
-        std::os::unix::fs::symlink(other.path(), root.join(".socket")).unwrap();
+        link_dir(other.path(), &root.join(".socket"));
         let linked = lock_root_blocking(&root, Duration::ZERO).unwrap_err();
         assert!(
             matches!(&linked, RootLockError::Linked(link) if *link == root.join(".socket")),
@@ -3409,7 +3773,7 @@ mod tests {
         std::fs::write(shared.path().join("pnpm-lock.yaml"), b"lock-old\n").unwrap();
         std::fs::remove_dir_all(root.join("svc")).unwrap();
         std::fs::create_dir_all(root.join("svc")).unwrap();
-        std::os::unix::fs::symlink(shared.path(), below(&root, "svc/api")).unwrap();
+        link_dir(shared.path(), &below(&root, "svc/api"));
         let lock = lock_root_blocking(&root, Duration::ZERO).unwrap();
         let (touched, changes) = pinning(&root);
         let err = commit_anchored(&lock, &touched, changes).await.unwrap_err();
@@ -3490,5 +3854,115 @@ mod tests {
         assert!(below(&root, "svc/api").is_dir());
         drop(lock);
         assert_eq!(tree(&root), before);
+    }
+
+    /// A path that the project's open group commit holds and a Bazel
+    /// change set rewrites has one answer: the anchored commit lands it
+    /// over what the disk holds, the group finds it as it wants it, and
+    /// the undo of the anchored commit puts the disk's bytes back. A read
+    /// that is not what the group staged refuses the whole set and leaves
+    /// the group as it was.
+    #[tokio::test]
+    async fn a_path_an_open_group_holds_is_landed_once_and_by_the_anchored_commit() {
+        let (_tmp, root) = bazel_root();
+        let project = below(&root, "svc/api");
+        let lock_path = below(&root, LOCK);
+        let group = GroupCommit::begin(&project);
+        // A takeover staged its revert of the lock a hub reads.
+        crate::utils::fs::atomic_write_bytes_preserving_mode(&lock_path, b"lock-reverted\n")
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(&lock_path).unwrap(), b"lock-old\n");
+        let decided = |read: &[u8]| {
+            vec![
+                AnchoredChange {
+                    rel: INDEX.to_string(),
+                    read: None,
+                    write: Some(b"{\"version\": 1}\n".to_vec()),
+                },
+                AnchoredChange {
+                    rel: LOCK.to_string(),
+                    read: Some(read.to_vec()),
+                    write: Some(b"lock-pinned\n".to_vec()),
+                },
+            ]
+        };
+        let touched = vec![INDEX.to_string(), LOCK.to_string()];
+
+        // Decided from other bytes than the group staged: refused whole.
+        let mut stale = decided(b"lock-old\n");
+        let err = settle_with_open_group(&root, &mut stale).unwrap_err();
+        let changed = AnchoredRefusal::Changed(LOCK.to_string());
+        assert_eq!(anchored_refusal(&err), Some(&changed), "{err}");
+        let staged = crate::utils::fs::read_regular_to_bytes(&lock_path).await;
+        assert_eq!(
+            staged.unwrap(),
+            b"lock-reverted\n",
+            "the group is as it was"
+        );
+
+        // Decided from what the group staged, as a run reads it.
+        let mut changes = decided(b"lock-reverted\n");
+        settle_with_open_group(&root, &mut changes).unwrap();
+        assert_eq!(changes[0].read, None, "a path no group holds is left alone");
+        assert_eq!(changes[1].read.as_deref(), Some(&b"lock-old\n"[..]));
+        let lock = lock_root_blocking(&root, Duration::ZERO).unwrap();
+        let committed = commit_anchored(&lock, &touched, changes).await.unwrap();
+        assert_eq!(std::fs::read(&lock_path).unwrap(), b"lock-pinned\n");
+        // The group's own commit has nothing to do at the path, and does
+        // not write its staged revert over the pin.
+        assert_eq!(group.commit().await.unwrap(), Vec::<String>::new());
+        assert_eq!(std::fs::read(&lock_path).unwrap(), b"lock-pinned\n");
+        // The undo is the disk's bytes of before, not the staged ones.
+        restore_anchored(&lock, &committed).await.unwrap();
+        assert_eq!(std::fs::read(&lock_path).unwrap(), b"lock-old\n");
+    }
+
+    /// The files landed ahead of a commit are on disk at once, past an
+    /// open group, and go back byte for byte; a file that already holds
+    /// its bytes is not written; a linked one refuses and leaves the files
+    /// before it as they were.
+    #[tokio::test]
+    async fn files_landed_ahead_are_written_past_an_open_group_and_taken_back() {
+        let (_tmp, root) = bazel_root();
+        let project = below(&root, "svc/api");
+        std::fs::write(project.join(".npmrc"), b"registry=x\n").unwrap();
+        let before = tree(&root);
+        let group = GroupCommit::begin(&project);
+        let files = vec![
+            (
+                "pnpm-workspace.yaml".to_string(),
+                b"trustLockfile: true\n".to_vec(),
+            ),
+            (
+                ".npmrc".to_string(),
+                b"registry=x\nallow-remote=all\n".to_vec(),
+            ),
+            ("pnpm-lock.yaml".to_string(), b"lock-old\n".to_vec()),
+        ];
+        let landed = land_ahead(&project, files.clone()).await.unwrap();
+        let rels: Vec<&str> = landed.iter().map(|file| file.rel.as_str()).collect();
+        assert_eq!(
+            rels,
+            ["pnpm-workspace.yaml", ".npmrc"],
+            "the lock holds its bytes"
+        );
+        assert_eq!(
+            std::fs::read(project.join("pnpm-workspace.yaml")).unwrap(),
+            b"trustLockfile: true\n",
+            "on disk while the group is open"
+        );
+        take_back(&project, &landed).await.unwrap();
+        assert_eq!(tree(&root), before);
+
+        // A link in the way: nothing stays written.
+        let other = tempfile::tempdir().unwrap();
+        std::fs::remove_file(project.join(".npmrc")).unwrap();
+        link_dir(other.path(), &project.join(".npmrc"));
+        let err = land_ahead(&project, files).await.unwrap_err();
+        assert_eq!(symlinked_target(&err), Some(".npmrc"), "{err}");
+        assert!(!project.join("pnpm-workspace.yaml").exists());
+        assert_eq!(std::fs::read_dir(other.path()).unwrap().count(), 0);
+        drop(group);
     }
 }

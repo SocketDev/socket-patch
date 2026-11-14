@@ -298,6 +298,14 @@ pub struct BazelRewrite {
     /// The edits the native rewriter and the lanes reported for the
     /// confirmed patches, with paths relative to the Bazel root.
     pub edits: Vec<FileEdit>,
+    /// The paths of `changes` that the executor staged or restored, in
+    /// the order it gave for a commit, each once: what an undo of the
+    /// sweep wrote (`exec::Reverted::written`, the edits before the
+    /// record), then what the plans' records wrote
+    /// (`exec::Applied::written`). A path of `changes` that is not named
+    /// here is one a lane authored, and lands after these. A seam takes
+    /// the order from here and decides none itself.
+    pub order: Vec<String>,
 }
 
 impl BazelRewrite {
@@ -464,6 +472,20 @@ struct State<'a> {
     work: Staged<'a>,
     index: Index,
     ws: Cow<'a, BazelWorkspace>,
+    /// The paths the executor staged so far, in the order it gave
+    /// ([`BazelRewrite::order`]).
+    order: Vec<String>,
+}
+
+impl State<'_> {
+    /// Notes the paths the executor staged, each once, in its order.
+    fn staged_by_executor(&mut self, written: Vec<String>) {
+        for path in written {
+            if !self.order.contains(&path) {
+                self.order.push(path);
+            }
+        }
+    }
 }
 
 struct Group<'a> {
@@ -717,17 +739,18 @@ impl<'a> Group<'a> {
         }
         let mut work = state.work.clone();
         let plans = std::slice::from_ref(plan);
-        if let Err(error) = exec::apply(&state.ws, &mut index, plans, &mut work) {
+        let applied = exec::apply(&state.ws, &mut index, plans, &mut work);
+        if let Err(error) = &applied {
             // A planned value that nothing records, in a write that
             // changed nothing, is no fault of the lane's plan: the pin is
             // in the file with its record gone, or no rewriter could make
             // it.
-            let unrecorded = match &error {
+            let unrecorded = match error {
                 ExecError::Unrecorded { path, .. } if idle => Some(path.clone()),
                 _ => None,
             };
             let Some(path) = unrecorded else {
-                return Err(exec_refused(lane, error));
+                return Err(exec_refused(lane, error.clone()));
             };
             let names = |text: &String| deps.iter().any(|dep| text.contains(&dep.artifact_url));
             return Err(match files.get(&path).is_some_and(names) {
@@ -759,11 +782,14 @@ impl<'a> Group<'a> {
             )));
         }
         let ws = state.ws.clone();
-        Ok(Written {
-            state: State { work, index, ws },
-            edits,
-            idle,
-        })
+        let mut state = State {
+            work,
+            index,
+            ws,
+            order: state.order.clone(),
+        };
+        state.staged_by_executor(applied.map(|applied| applied.written).unwrap_or_default());
+        Ok(Written { state, edits, idle })
     }
 
     /// Step 4 of the module docs, over everything that was staged: the
@@ -806,6 +832,7 @@ impl<'a> Group<'a> {
             work: state.work.clone(),
             index: state.index.clone(),
             ws: Cow::Borrowed(&*ws),
+            order: Vec::new(),
         };
         let (lanes, roots) = (self.host.lanes, self.host.cx.roots);
         let attest = Attest::read(&ws, lanes, &state.work, &state.index, roots);
@@ -1082,8 +1109,9 @@ impl<'a> Group<'a> {
                 let done =
                     super::upstream::bazel::revert_one(lanes, ws, &next.work, &next.index, uuid);
                 match done {
-                    Ok(Some((work, index, _))) => {
+                    Ok(Some((work, index, written))) => {
                         (next.work, next.index) = (work, index);
+                        next.staged_by_executor(written);
                         undone = true;
                     }
                     Ok(None) => {}
@@ -1327,6 +1355,7 @@ pub(super) fn rewrite(
         work: Staged::new(host.cx.files),
         index: host.cx.index.clone(),
         ws: Cow::Borrowed(host.cx.ws),
+        order: Vec::new(),
     };
     // The index file is the record: the held index is brought up to date
     // with it, and an index nobody can rely on stops every write.
@@ -1448,6 +1477,10 @@ pub(super) fn rewrite(
     }
     out.changes = written.state.work.into_changes();
     out.index = written.state.index;
+    // Only what is still part of the change set: a path staged back to
+    // what the root holds is no change.
+    out.order = written.state.order;
+    out.order.retain(|path| out.changes.contains_key(path));
     out
 }
 

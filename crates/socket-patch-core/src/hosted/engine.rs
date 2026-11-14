@@ -217,6 +217,26 @@ fn unreadable_refusal(rel: &str) -> Refusal {
     }
 }
 
+/// The refusal for a file under a Bazel root that the run would write
+/// over and whose bytes could not be read: nothing can be compared at the
+/// commit, so nothing is written. On disk that is a file over the size
+/// socket-patch reads or one its permissions keep from being read; in
+/// memory, one whose content was not provided.
+fn bazel_unreadable_refusal(view: &ProjectView<'_>, rel: &str) -> Refusal {
+    match view {
+        ProjectView::Memory(_) => unreadable_refusal(rel),
+        _ => Refusal {
+            code: UNREADABLE_REFUSAL.to_string(),
+            message: format!(
+                "{rel} exists and could not be read (it is larger than the files socket-patch \
+                 reads, or its permissions keep it from being read), so what this run would \
+                 write over it cannot be compared with what is there; make the file readable \
+                 and run again; nothing was written"
+            ),
+        },
+    }
+}
+
 /// The refusal for an unreadable `socket-patch.sbt`, the file the sbt
 /// planner owns and would otherwise create over the user's bytes.
 pub const SBT_OWNED_FILE_UNREADABLE: &str = "redirect_sbt_owned_file_unreadable";
@@ -2119,6 +2139,25 @@ pub enum FinalDiscovery {
     },
 }
 
+/// The install-policy files `done` writes in the project, each with its
+/// bytes: `pnpm-workspace.yaml` (`trustLockfile`) and `.npmrc`
+/// (`allow-remote`). Each is inert until a lock names a hosted URL, and a
+/// lock that names one is rejected by the package manager without it. So a
+/// run that lands a pin in a commit of its own (the commit anchored at a
+/// Bazel root) lands these first: an interruption between the two leaves
+/// the policy file without the pin, never the pin without it (revision 4,
+/// 1.9: inert first).
+pub fn policy_files(done: &Rewritten) -> Vec<(String, Vec<u8>)> {
+    let written = |rel: &&str| {
+        let text = done.rewrite.files.get(*rel)?;
+        Some((rel.to_string(), text.clone().into_bytes()))
+    };
+    [PNPM_WORKSPACE_REL, NPMRC_REL]
+        .iter()
+        .filter_map(written)
+        .collect()
+}
+
 /// Whether CREATING `rel` (a write over no existing regular file) leaves a
 /// discovery over the overlaid project equal to one over the written disk:
 /// the root config files the install-policy auto-configs create
@@ -2722,12 +2761,22 @@ async fn rewrite_once(
     } else {
         None
     };
-    // A malformed primary lock must not cause edits to stale npm siblings.
+    // A malformed primary lock must not cause edits to stale npm siblings:
+    // its patches are kept from the native rewriters. They are not kept
+    // from the Bazel rewriter group, which decides every patch of an
+    // ecosystem a ruleset governs from the lock a hub reads, whatever a
+    // lock beside it holds.
+    let kept_from_native: BTreeSet<String> = overrides
+        .iter()
+        .filter(|o| binary_content.as_ref().is_some_and(Result::is_err) && o.ecosystem == "npm")
+        .map(|o| o.patch_uuid.clone())
+        .collect();
     let rewrite_overrides: Vec<DepOverride> = overrides
         .iter()
-        .filter(|o| !(binary_content.as_ref().is_some_and(Result::is_err) && o.ecosystem == "npm"))
+        .filter(|o| !kept_from_native.contains(&o.patch_uuid))
         .cloned()
         .collect();
+    let all_overrides = overrides.clone();
     let pipenv_major = options.pipenv_major;
     // The yarn config outside the project decides the classic rewriter's
     // offline-mirror refusal too: resolved only beside a classic lock.
@@ -2767,7 +2816,14 @@ async fn rewrite_once(
                 let under = |overrides: &[DepOverride],
                              host: Option<&crate::patch::redirect::bazel::BazelHost<'_>>| {
                     let Some(host) = host else {
-                        return (native(overrides), BazelRewrite::default());
+                        // What the root left to the native rewriters,
+                        // less what this engine keeps from them.
+                        let own: Vec<DepOverride> = overrides
+                            .iter()
+                            .filter(|o| !kept_from_native.contains(&o.patch_uuid))
+                            .cloned()
+                            .collect();
+                        return (native(&own), BazelRewrite::default());
                     };
                     rewrite_registry_redirect_with_host_under_bazel(
                         &files,
@@ -2779,9 +2835,13 @@ async fn rewrite_once(
                         &yarn_outer,
                         &cargo_outer,
                         host,
+                        &kept_from_native,
                     )
                 };
-                let (rewrite, done) = bazel_reads::rewrite(reads, &rewrite_overrides, &under);
+                // Every override, unfiltered: a filter in front of the
+                // gate would hand a governed patch to nobody, and the
+                // engine's own steps would then heal its side files.
+                let (rewrite, done) = bazel_reads::rewrite(reads, &all_overrides, &under);
                 (rewrite, Some(done))
             }
         };
@@ -4011,7 +4071,7 @@ pub fn guard(
                 return Some(symlink_refusal(spelled(at)));
             }
             if bazel.unreadable.contains(&change.rel) {
-                return Some(unreadable_refusal(spelled(at)));
+                return Some(bazel_unreadable_refusal(view, spelled(at)));
             }
         }
     }

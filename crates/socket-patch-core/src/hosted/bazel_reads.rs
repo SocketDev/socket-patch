@@ -21,6 +21,12 @@
 //!   withheld from every step of the engine that writes for a patch: the
 //!   binary Bun lock, the npm install-policy configs, the stale-install
 //!   hints. Its confirmation is the group's report and nothing else.
+//! - **So is every patch of an ecosystem a ruleset governs, or may
+//!   govern** ([`BazelDone::ruled`]). The engine's own steps ask the
+//!   governance of the ecosystem, not which patches the group happened to
+//!   be handed: the group is handed every override, and should a filter
+//!   ever stand in front of it again, a governed patch that reached nobody
+//!   still gets no native write and no healed side file.
 //! - **No `.npmrc`.** A new `.npmrc` beside a lock a hub reads fails
 //!   rules_js 3.x (`Undeclared .npmrc file`), so none is created or edited
 //!   for a governed patch, whether the patch was written or refused.
@@ -62,8 +68,11 @@ use std::sync::Arc;
 
 use crate::bazel::codes::Code;
 use crate::bazel::exec;
+use crate::bazel::gate;
 use crate::bazel::inventory::may_build;
-use crate::bazel::model::{FileText, GateOutcome, HookKind, Mode, Refusal};
+use crate::bazel::model::{
+    FileText, GateOutcome, Governance, HookKind, Mode, PatchRequest, Refusal, Ruleset,
+};
 use crate::bazel::owned_index::OWNED_DIR;
 use crate::crawlers::types::Ecosystem;
 use crate::patch::redirect::bazel::{BazelHost, BazelRewrite, Decided, Refused, Verdict};
@@ -176,6 +185,9 @@ pub struct BazelDone {
     /// root: locks, derived values, configs.
     named: BTreeSet<String>,
     governed: BTreeSet<String>,
+    /// The ecosystems a ruleset governs for the project, or may govern:
+    /// every one whose governance is anything but "not governed".
+    ruled: Vec<Ecosystem>,
 }
 
 /// The ecosystem of a grant, as the rewriter group reads it.
@@ -207,10 +219,15 @@ impl BazelDone {
                 write: write.clone(),
             });
         }
-        // The record lands before what it records where both are new: a
-        // row without its edit is dropped by the next removal, and an
-        // edit without its row would stay for good.
-        changes.sort_by_key(|change| !change.rel.starts_with(OWNED_DIR));
+        // The landing order is the executor's (`BazelRewrite::order`): what
+        // it staged or restored comes first, as it listed it, and what the
+        // lanes authored follows in path order. Nothing here says which
+        // path is a record and which an edit.
+        let rank = |change: &AnchoredChange| {
+            let at = group.order.iter().position(|path| *path == change.rel);
+            at.unwrap_or(group.order.len())
+        };
+        changes.sort_by_key(rank);
         // The rows a sweep undid are in the index as it was read, the
         // rows of this run in the one the change set leaves.
         let mut touched = exec::touched(host.cx.index, &group.plans);
@@ -219,11 +236,34 @@ impl BazelDone {
         touched.dedup();
         let hubs = ws.hubs.iter().filter(|hub| may_build(hub));
         let named = hubs.flat_map(|hub| hub.locks.iter().filter_map(|lock| lock.path.clone()));
+        // The governance the gate itself judges each patch by, asked once
+        // per ecosystem: a refusal to answer is no "not governed".
+        let mut ruled: Vec<Ecosystem> = Vec::new();
+        for ecosystem in Ruleset::ALL
+            .iter()
+            .filter_map(|ruleset| ruleset.ecosystem())
+        {
+            let asked = PatchRequest {
+                ecosystem,
+                name: "",
+                version: "",
+                uuid: "",
+                project_rel: &ws.root.project_rel,
+            };
+            let free = matches!(
+                gate::governing(&host.cx, &asked),
+                Ok(Governance::NotGoverned)
+            );
+            if !free && !ruled.contains(&ecosystem) {
+                ruled.push(ecosystem);
+            }
+        }
         Self {
             root: ws.root.root.clone(),
             project_rel: ws.root.project_rel.clone(),
             governed: group.governed(),
             named: named.collect(),
+            ruled,
             group,
             changes,
             touched,
@@ -249,10 +289,26 @@ impl BazelDone {
             .is_some_and(|patch| patch.verdict == Verdict::Confirmed)
     }
 
+    /// The ecosystems a ruleset governs for the project, or may govern.
+    /// A patch of one is never the native rewriters' and never a reason
+    /// for the engine to write a side file, whether the Bazel group
+    /// decided it or was never handed it.
+    pub fn ruled(&self) -> &[Ecosystem] {
+        &self.ruled
+    }
+
+    /// Whether `dep` is a patch only the Bazel group may act on: one it
+    /// decided, or one of an ecosystem a ruleset governs or may govern.
+    fn bazels(&self, dep: &DepOverride) -> bool {
+        let ruled = ecosystem_of(dep).is_some_and(|ecosystem| self.ruled.contains(&ecosystem));
+        ruled || self.governed.contains(&dep.patch_uuid)
+    }
+
     /// The overrides the engine's own steps may act on: every one the
-    /// Bazel group left to the native rewriters.
+    /// Bazel group left to the native rewriters, of an ecosystem no
+    /// ruleset governs.
     pub(crate) fn native(&self, overrides: &[DepOverride]) -> Vec<DepOverride> {
-        let own = |dep: &&DepOverride| !self.governed.contains(&dep.patch_uuid);
+        let own = |dep: &&DepOverride| !self.bazels(dep);
         overrides.iter().filter(own).cloned().collect()
     }
 
@@ -261,7 +317,7 @@ impl BazelDone {
     /// lock pnpm installs from with the same policy outside Bazel.
     pub(crate) fn trust_overrides(&self, overrides: &[DepOverride]) -> Vec<DepOverride> {
         let takes = |dep: &&DepOverride| {
-            !self.governed.contains(&dep.patch_uuid)
+            !self.bazels(dep)
                 || (creates_pnpm_workspace()
                     && dep.ecosystem == "npm"
                     && self.confirmed(&dep.patch_uuid))
@@ -342,11 +398,12 @@ impl BazelDone {
         })
     }
 
-    /// Whether a patch of the npm ecosystem was decided by the Bazel
-    /// group: no `.npmrc` is then created or edited in the project.
+    /// Whether a ruleset governs the npm ecosystem of the project, or
+    /// may, or the Bazel group decided an npm patch: no `.npmrc` is then
+    /// created or edited in the project.
     pub(crate) fn governs_npm(&self) -> bool {
         let npm = |patch: &Decided| patch.ecosystem == Ecosystem::Npm;
-        self.group.decided.iter().any(npm)
+        self.ruled.contains(&Ecosystem::Npm) || self.group.decided.iter().any(npm)
     }
 
     /// Takes out of `result` every file a native rewriter wrote where
@@ -472,11 +529,18 @@ pub(crate) fn rewrite(
     let governed = group.governed();
     result.refused_bazel_uuids.extend(governed.iter().cloned());
     let (root, project_rel) = reads.0.place().unwrap_or_default();
+    let mut ruled: Vec<Ecosystem> = Vec::new();
+    for (ecosystem, _) in &refusals {
+        if !ruled.contains(ecosystem) {
+            ruled.push(*ecosystem);
+        }
+    }
     let done = BazelDone {
         root,
         project_rel,
         group,
         governed,
+        ruled,
         ..BazelDone::default()
     };
     (result, done)
@@ -488,10 +552,12 @@ mod tests {
 
     use super::*;
     use crate::bazel::gate::{self, GateCx, Roots};
-    use crate::bazel::lanes::{self, Proofs};
+    use crate::bazel::lanes::Proofs;
     use crate::bazel::model::{
-        BazelWorkspace, Gap, Index, LaneTable, Lift, Probe, Reason, RootRef, RulesetDetail,
+        BazelWorkspace, FileView, Gap, Index, LaneOps, LaneSpec, LaneTable, Lift, Probe, Reason,
+        RootRef, RulesetDetail,
     };
+    use crate::bazel::owned_index::INDEX_PATH;
     use crate::bazel::rulesets::rules_js::ActionCache;
     use crate::crawlers::bazel_workspace::{read_workspace, DiskView};
     use crate::hosted::engine::{
@@ -556,6 +622,13 @@ mod tests {
         }
     }
 
+    /// A lane table of this fixture's own: the rules_js family with the
+    /// hosted lane the shipped table names for the cell, disabled. The
+    /// refusals below are judged over it, so they say the same once a
+    /// release enables the shipped lane.
+    const DISABLED: LaneTable = LaneTable(&[(Ruleset::RulesJs, &NO_LANE)]);
+    const NO_LANE: LaneOps = LaneOps::disabled(&[LaneSpec::stub("H-JS1", Mode::Hosted, &[])]);
+
     /// One root read from disk, as the CLI's loader hands one over: the
     /// model, the view it was read through and the owned index.
     struct DiskRoot {
@@ -576,7 +649,7 @@ mod tests {
                 models: vec![model],
                 view,
                 index: Index::default(),
-                lanes: lanes::PRODUCTION,
+                lanes: DISABLED,
                 proofs: Proofs::PRODUCTION,
             }
         }
@@ -729,6 +802,12 @@ mod tests {
 
     /// A lock a label reaches through a linked directory lies in two
     /// directories, and only a model read from disk knows the real one.
+    ///
+    /// Unix only: how the disk reader resolves a directory link on Windows
+    /// (the form `canonicalize` gives a link's target there) has no cell
+    /// in any suite yet, and that reader is `crawlers::bazel_workspace`'s
+    /// to prove, not this file's. What this file adds to it is the `Root`
+    /// that hands the model over, which no system changes.
     #[cfg(unix)]
     #[test]
     fn a_root_read_from_disk_knows_where_a_linked_lock_really_lies() {
@@ -983,14 +1062,9 @@ mod tests {
         }
     }
 
-    /// The engine under a Bazel root, every lane disabled, in a project
-    /// that release 5.1 already rewrote: both npm locks carry the hosted
-    /// URL. The patch is refused, and nothing is written for it: not the
-    /// locks, and none of the install-policy files native hosted mode
-    /// would heal for a lock that carries a hosted URL. A native lock
-    /// line that names the URL confirms nothing.
-    #[tokio::test]
-    async fn the_engine_writes_nothing_for_a_patch_the_bazel_gate_refuses() {
+    /// A project that release 5.1 already rewrote, under a hub: both npm
+    /// locks carry the hosted URL. `extra` are more files of the project.
+    fn rewritten_by_5_1(extra: &[(&str, &[u8])]) -> Checkout {
         let pinned = format!("{{integrity: sha512-patched, tarball: {URL}}}");
         let pnpm = PNPM_LOCK.replace("{integrity: sha512-upstream}", &pinned);
         let npm = NPM_LOCK
@@ -1008,11 +1082,80 @@ mod tests {
                 "{\"name\": \"p\", \"version\": \"0.0.0\"}\n",
             ),
         ]);
-        let view = ProjectView::Disk(&checkout.top);
-        let candidates = [Candidate {
+        for (rel, bytes) in extra {
+            std::fs::write(checkout.at(rel), bytes).expect("write");
+        }
+        checkout
+    }
+
+    fn left_pad_candidates() -> [Candidate; 1] {
+        [Candidate {
             purl: "pkg:npm/left-pad@1.3.0".to_string(),
             dep: left_pad(),
-        }];
+        }]
+    }
+
+    /// The engine over `checkout` with its Bazel root attached.
+    async fn under_the_root(checkout: &Checkout) -> crate::hosted::engine::Rewritten {
+        let view = ProjectView::Disk(&checkout.top);
+        let candidates = left_pad_candidates();
+        let (npm_outer, yarn_outer) = (OuterAllowRemote::default, OuterYarnMirror::default);
+        let mut read = read_candidate_files(&view, &BTreeSet::new(), &candidates).await;
+        read.attach(BazelReads::new(DiskRoot::read(&checkout.root(""))));
+        assert!(read.files.contains_key(BAZEL_WORKSPACE_KEY));
+        engine_rewrite(
+            &view,
+            read,
+            &candidates,
+            BTreeMap::new(),
+            options(&npm_outer, &yarn_outer),
+        )
+        .await
+    }
+
+    /// The patch is refused by the Bazel gate, and nothing at all is
+    /// written for it.
+    fn assert_refused_and_unwritten(checkout: &Checkout, done: &crate::hosted::engine::Rewritten) {
+        assert_eq!(
+            done.confirmed,
+            Vec::new(),
+            "refused, whatever the locks say"
+        );
+        assert_eq!(done.rewritten, Vec::<String>::new());
+        assert!(done.rewrite.files.is_empty() && done.rewrite.edits.is_empty());
+        assert!(done.rewrite.binary_files.is_empty());
+        let bazel = done.bazel.as_ref().expect("the Bazel group ran");
+        assert_eq!(bazel.governed().len(), 1, "the gate decided the patch");
+        assert_eq!(bazel.ruled(), [Ecosystem::Npm]);
+        assert!(bazel.changes.is_empty());
+        let codes: Vec<&str> = done
+            .rewrite
+            .warnings
+            .iter()
+            .map(|w| w.code.as_str())
+            .collect();
+        assert!(
+            codes.contains(&Code::RedirectRulesetUnsupported.as_str()),
+            "{codes:?}"
+        );
+        // No guidance for a pin the run did not make or confirm.
+        assert!(done.pnpm_warnings.is_empty() && done.npm_warnings.is_empty());
+        let view = ProjectView::Disk(&checkout.top);
+        let candidates = left_pad_candidates();
+        assert!(crate::hosted::engine::guard(&view, done, &candidates).is_none());
+    }
+
+    /// The engine under a Bazel root, every lane disabled, in a project
+    /// that release 5.1 already rewrote: both npm locks carry the hosted
+    /// URL. The patch is refused, and nothing is written for it: not the
+    /// locks, and none of the install-policy files native hosted mode
+    /// would heal for a lock that carries a hosted URL. A native lock
+    /// line that names the URL confirms nothing.
+    #[tokio::test]
+    async fn the_engine_writes_nothing_for_a_patch_the_bazel_gate_refuses() {
+        let checkout = rewritten_by_5_1(&[]);
+        let view = ProjectView::Disk(&checkout.top);
+        let candidates = left_pad_candidates();
         let (npm_outer, yarn_outer) = (OuterAllowRemote::default, OuterYarnMirror::default);
 
         // Under no Bazel root this run heals both install-policy files.
@@ -1033,39 +1176,168 @@ mod tests {
             assert!(wrote, "{healed}: {:?}", native.rewritten);
         }
 
-        let mut read = read_candidate_files(&view, &BTreeSet::new(), &candidates).await;
-        read.attach(BazelReads::new(DiskRoot::read(&checkout.root(""))));
-        assert!(read.files.contains_key(BAZEL_WORKSPACE_KEY));
-        let done = engine_rewrite(
-            &view,
-            read,
-            &candidates,
-            BTreeMap::new(),
-            options(&npm_outer, &yarn_outer),
-        )
-        .await;
-        assert_eq!(
-            done.confirmed,
-            Vec::new(),
-            "refused, whatever the locks say"
-        );
-        assert_eq!(done.rewritten, Vec::<String>::new());
-        assert!(done.rewrite.files.is_empty() && done.rewrite.edits.is_empty());
-        let bazel = done.bazel.as_ref().expect("the Bazel group ran");
-        assert_eq!(bazel.governed().len(), 1);
-        assert!(bazel.changes.is_empty());
-        let codes: Vec<&str> = done
-            .rewrite
-            .warnings
-            .iter()
-            .map(|w| w.code.as_str())
-            .collect();
+        let done = under_the_root(&checkout).await;
+        assert_refused_and_unwritten(&checkout, &done);
+    }
+
+    /// A `bun.lockb` that cannot be parsed keeps the npm patches from the
+    /// native rewriters, and must never keep them from the Bazel gate: a
+    /// patch that reached nobody was a patch whose side files the engine
+    /// healed beside the lock the hub reads. The gate decides it like any
+    /// other, the refusal is said, and nothing is written.
+    #[tokio::test]
+    async fn an_unparseable_bun_lock_takes_no_governed_patch_from_the_gate() {
+        let checkout = rewritten_by_5_1(&[("bun.lockb", b"not a bun lock")]);
+        let done = under_the_root(&checkout).await;
         assert!(
-            codes.contains(&Code::RedirectRulesetUnsupported.as_str()),
-            "{codes:?}"
+            done.binary_bun,
+            "the binary lock is the project's primary one"
         );
-        // No guidance for a pin the run did not make or confirm.
-        assert!(done.pnpm_warnings.is_empty() && done.npm_warnings.is_empty());
-        assert!(crate::hosted::engine::guard(&view, &done, &candidates).is_none());
+        assert_refused_and_unwritten(&checkout, &done);
+        // What the engine says of the binary lock it could not read stays.
+        let said = |code: &str| done.rewrite.warnings.iter().any(|w| w.code == code);
+        assert!(
+            said("redirect_bun_lockb_invalid"),
+            "{:?}",
+            done.rewrite.warnings
+        );
+    }
+
+    /// The engine's own steps ask the governance of the ecosystem, not
+    /// which patches the group was handed: a governed patch that never
+    /// reached the group is still no native patch, takes no part in the
+    /// pnpm trust step, and keeps `.npmrc` from being written.
+    #[test]
+    fn a_governed_ecosystem_is_never_native_whatever_the_group_decided() {
+        let checkout =
+            Checkout::new(&[("MODULE.bazel", &module("")), ("pnpm-lock.yaml", PNPM_LOCK)]);
+        let root = DiskRoot::read(&checkout.root(""));
+        let Asked::Gate(host) = root.ask() else {
+            panic!("a readable root is asked");
+        };
+        // A group that decided nothing: it was handed no override.
+        let done = BazelDone::of(&host, BazelRewrite::default());
+        assert!(done.governed().is_empty());
+        assert_eq!(done.ruled(), [Ecosystem::Npm]);
+        assert!(done.governs_npm());
+        let overrides = [left_pad(), requests()];
+        let native: Vec<String> = done
+            .native(&overrides)
+            .into_iter()
+            .map(|d| d.name)
+            .collect();
+        assert_eq!(native, ["requests"], "pypi is not governed here");
+        let trusted = done.trust_overrides(&overrides);
+        let trusted: Vec<String> = trusted.into_iter().map(|d| d.name).collect();
+        assert_eq!(trusted, ["requests"]);
+        assert!(done.withholds(".npmrc", done.governs_npm()).is_some());
+
+        // Where no gate can be asked, every ecosystem the root refuses.
+        let files = texts(&[("package-lock.json", NPM_LOCK)]);
+        let reads = BazelReads::new(Unread);
+        let (_, done) = rewrite(&reads, &[requests()], &rewriters(&files));
+        assert_eq!(done.ruled(), [Ecosystem::Npm]);
+        assert!(done.native(&[left_pad()]).is_empty());
+    }
+
+    /// A view over another that cannot give the bytes of one path.
+    struct Blind<'a>(&'a dyn FileView, &'static str);
+
+    impl FileView for Blind<'_> {
+        fn read(&self, rel: &str) -> FileText {
+            match rel == self.1 {
+                true => FileText::Unreadable,
+                false => self.0.read(rel),
+            }
+        }
+
+        fn list(&self, dir: &str) -> Option<Vec<String>> {
+            self.0.list(dir)
+        }
+    }
+
+    /// A change at a path whose bytes the root's view cannot give has
+    /// nothing the commit could compare: the path is named, no bytes are
+    /// recorded as read, and the guard refuses the run before any write,
+    /// with the sentence of a file on disk.
+    #[tokio::test]
+    async fn a_change_over_bytes_nobody_could_read_refuses_the_run() {
+        let checkout = rewritten_by_5_1(&[]);
+        let root = DiskRoot::read(&checkout.root(""));
+        let Asked::Gate(host) = root.ask() else {
+            panic!("a readable root is asked");
+        };
+        let blind = Blind(host.cx.files, "pnpm-lock.yaml");
+        let cx = GateCx {
+            files: &blind,
+            ..host.cx
+        };
+        let host = BazelHost {
+            cx,
+            lanes: host.lanes,
+        };
+        let change = |rel: &str| (rel.to_string(), Some(b"pinned\n".to_vec()));
+        let group = BazelRewrite {
+            changes: [change("pnpm-lock.yaml"), change("package-lock.json")].into(),
+            ..BazelRewrite::default()
+        };
+        let staged = BazelDone::of(&host, group);
+        assert_eq!(staged.unreadable, ["pnpm-lock.yaml"]);
+        let read = |rel: &str| {
+            let change = staged.changes.iter().find(|change| change.rel == rel);
+            change.expect("staged").read.clone()
+        };
+        assert_eq!(read("pnpm-lock.yaml"), None);
+        assert!(read("package-lock.json").is_some());
+
+        let mut done = under_the_root(&checkout).await;
+        done.bazel = Some(staged);
+        let view = ProjectView::Disk(&checkout.top);
+        let refusal = crate::hosted::engine::guard(&view, &done, &left_pad_candidates());
+        let refusal = refusal.expect("refused before any write");
+        assert_eq!(refusal.code, crate::hosted::engine::UNREADABLE_REFUSAL);
+        assert!(refusal
+            .message
+            .starts_with("pnpm-lock.yaml exists and could not be read"));
+        assert!(refusal.message.contains("permissions"), "{refusal:?}");
+        assert!(
+            refusal.message.ends_with("nothing was written"),
+            "{refusal:?}"
+        );
+    }
+
+    /// The landing order of a change set is the executor's: the paths it
+    /// staged or restored come first, as it listed them, and what the
+    /// lanes authored follows in path order. An undo lands its edits
+    /// before the record, a write the record first, and this file knows
+    /// neither.
+    #[test]
+    fn a_change_set_lands_in_the_order_the_executor_gave() {
+        let checkout =
+            Checkout::new(&[("MODULE.bazel", &module("")), ("pnpm-lock.yaml", PNPM_LOCK)]);
+        let root = DiskRoot::read(&checkout.root(""));
+        let Asked::Gate(host) = root.ask() else {
+            panic!("a readable root is asked");
+        };
+        let landing = |order: &[&str]| {
+            let change = |rel: &str| (rel.to_string(), Some(b"x\n".to_vec()));
+            let group = BazelRewrite {
+                changes: [change(INDEX_PATH), change("a.lock"), change("z.lock")].into(),
+                order: order.iter().map(|path| path.to_string()).collect(),
+                ..BazelRewrite::default()
+            };
+            let done = BazelDone::of(&host, group);
+            let rels: Vec<String> = done.changes.into_iter().map(|change| change.rel).collect();
+            rels
+        };
+        // A write: the record, then what it records.
+        assert_eq!(landing(&[INDEX_PATH]), [INDEX_PATH, "a.lock", "z.lock"]);
+        // An undo: the edit the executor restored, then the record.
+        assert_eq!(
+            landing(&["z.lock", INDEX_PATH]),
+            ["z.lock", INDEX_PATH, "a.lock"]
+        );
+        // Nothing of the executor's: path order.
+        assert_eq!(landing(&[]), [INDEX_PATH, "a.lock", "z.lock"]);
     }
 }

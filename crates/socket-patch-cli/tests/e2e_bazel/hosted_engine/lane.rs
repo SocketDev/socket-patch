@@ -97,6 +97,20 @@ const OPS: LaneOps = LaneOps {
 pub const TABLE: LaneTable = LaneTable(&[(Ruleset::RulesJs, &OPS)]);
 pub const PROOFS: Proofs = Proofs::PRODUCTION;
 
+/// A table whose rules_js family has landed no lane: the hosted lane the
+/// shipped table names for the cell, disabled. What a test of a refusal
+/// runs over, so that it says the same once a release enables that lane.
+pub const DISABLED: LaneTable = LaneTable(&[(Ruleset::RulesJs, &NO_LANE)]);
+const NO_LANE: LaneOps = LaneOps::disabled(&[LaneSpec::stub("H-JS1", Mode::Hosted, &[])]);
+
+/// Two rules_js hubs, one over the lock of each of two projects of one
+/// root.
+pub const TWO_HUBS: &str = "bazel_dep(name = \"aspect_rules_js\", version = \"3.6.0\")\n\
+    npm = use_extension(\"@aspect_rules_js//npm:extensions.bzl\", \"npm\")\n\
+    npm.npm_translate_lock(name = \"npm_a\", pnpm_lock = \"//svc/a:pnpm-lock.yaml\")\n\
+    npm.npm_translate_lock(name = \"npm_b\", pnpm_lock = \"//svc/b:pnpm-lock.yaml\")\n\
+    use_repo(npm, \"npm_a\", \"npm_b\")\n";
+
 /// The grant of the patch of `left-pad`, as the patch service names it.
 pub fn grant() -> DepOverride {
     DepOverride {

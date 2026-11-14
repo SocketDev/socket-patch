@@ -70,9 +70,14 @@
 //! nothing is created there: what lies behind the link is another
 //! project's. And a commit that an interrupted run left anchored at the
 //! root is finished first, from its journal, so no holder ever works over
-//! a half-replaced root ([`RootLock::recovery`] says what that did). The
-//! project lock looks for such a journal too ([`recover_above`]), since the
-//! files it covers can be a project's own.
+//! a half-replaced root ([`RootLock::recovery`] says what that did, and
+//! [`RootLock::recovered`] is the sentence for the run: a replay is never
+//! silent, whichever holder made it). The project lock looks for such a
+//! journal too ([`recover_above`]), since the files it covers can be a
+//! project's own. It looks only at a directory that is a Bazel root, and
+//! only inside the directory socket-patch writes in for the project: a
+//! journal anywhere else is no commit of socket-patch's, and is neither
+//! replayed nor reported.
 //!
 //! A holder calls no `before_*` or `after_*` function of this file: each
 //! takes the lock itself, and would wait for the holder until it gives up.
@@ -95,7 +100,7 @@ use crate::constants::npm_family::VLT_LOCK;
 use crate::crawlers::bazel_root::{boundary_file_in, RootProbe, BOUNDARY_FILES};
 use crate::patch::apply::ApplyResult;
 use crate::patch::apply_lock::{
-    self, CommitRecovery, LockError, LockGuard, COMMIT_RECOVERED, COMMIT_SET_ASIDE,
+    self, AnchoredPending, CommitRecovery, LockError, LockGuard, COMMIT_RECOVERED, COMMIT_SET_ASIDE,
 };
 use crate::utils::containment::{linked_level, try_linked_level};
 use crate::utils::fs::{atomic_write_sync, open_regular_file_sync, run_blocking};
@@ -627,6 +632,15 @@ impl RootLock {
     pub fn recovery(&self) -> &Recovery {
         &self.recovery
     }
+
+    /// [`Self::recovery`] as the run reports it: the code and the
+    /// sentence, which names every file the replay rewrote and a journal
+    /// it set aside. `None` when no journal was found. A holder that made
+    /// a replay says this once, on stderr or in its result: a journal is a
+    /// file of the working tree, and what it wrote is never silent.
+    pub fn recovered(&self) -> Option<CommitRecovery> {
+        recovered(&self.root, self.recovery.clone())
+    }
 }
 
 /// Why a root's lock was not taken. Nothing was written, and whatever
@@ -727,6 +741,10 @@ fn locked<T>(root: &Path, edit: impl FnOnce() -> T) -> Result<T, String> {
         let owned = owned.parent().unwrap_or(root);
         format!("the lock of {} was not taken ({e})", owned.display())
     })?;
+    // A replay under this lock is said like one under the project's.
+    if let Some(replayed) = lock.recovered() {
+        eprintln!("Warning: {}", replayed.detail);
+    }
     let done = edit();
     drop(lock);
     Ok(done)
@@ -786,7 +804,7 @@ fn recovered(root: &Path, recovery: Recovery) -> Option<CommitRecovery> {
                 format!(
                     "an interrupted run's commit under the Bazel root {at} could not be \
                      finished as written: {done}; the journal was set aside at {} — run \
-                     `socket-patch scan` again to pin what it left out",
+                     the command that was interrupted again to write what it left out",
                     journal.display()
                 ),
             )
@@ -795,28 +813,85 @@ fn recovered(root: &Path, recovery: Recovery) -> Option<CommitRecovery> {
     Some(CommitRecovery { code, detail })
 }
 
+/// What the project lock found of commits anchored at Bazel roots above
+/// its project ([`recover_above`]).
+#[derive(Debug, Default)]
+pub struct Above {
+    /// What each replay did, for the run to report.
+    pub recovered: Vec<CommitRecovery>,
+    /// The journals that stay: each could not be finished, and names no
+    /// file of the project.
+    pub unfinished: Vec<AnchoredPending>,
+}
+
+/// Whether the journal at `root` may cover a file of the project at
+/// `project` (resolved, at or below `root`): it names a path at or below
+/// the project, the project is the root itself, or what it names is not
+/// known. A locked command of such a project reads files the commit may
+/// have half replaced.
+fn covers(root: &Path, project: &Path, files: Option<&[String]>) -> bool {
+    let Ok(below) = project.strip_prefix(root) else {
+        return true;
+    };
+    let levels: Vec<String> = below
+        .components()
+        .map(|level| level.as_os_str().to_string_lossy().into_owned())
+        .collect();
+    let Some(files) = files.filter(|files| !files.is_empty() && !levels.is_empty()) else {
+        return true;
+    };
+    files.iter().any(|file| {
+        let mut named = file.split('/');
+        levels
+            .iter()
+            .all(|level| named.next() == Some(level.as_str()))
+    })
+}
+
 /// For the project lock (`patch::apply_lock`): finishes every commit that
 /// an interrupted run left anchored at a Bazel root at or above
 /// `project_root`, inside the directory socket-patch writes in. The files
 /// such a commit covers can be the project's own (a lock a hub reads), so
 /// a locked command must not read them half replaced.
 ///
+/// Only a directory that is a Bazel root is looked at: a commit is
+/// anchored at one and nowhere else, so a journal in any other directory
+/// (a file that came with the checkout, an ancestor of the repository) is
+/// not socket-patch's, and is neither replayed nor reported. And only
+/// inside the write boundary of the project: with no repository around a
+/// project its boundary is the project, a root above it is one no seam
+/// commits at (`bazel_root_outside_repository`), and a journal there is
+/// left to a run that is started at that root.
+///
 /// Where no journal lies above the project the cost is one stat per
 /// directory level up to the repository root, and nothing is read or
 /// locked: that is every project outside a Bazel workspace. A journal
 /// that is found is replayed under its root's lock ([`lock_root_blocking`]
-/// does it), and what that did is returned for the run to report. A dry
-/// run replays nothing and refuses with [`LockError::CommitPending`], as
-/// it does for a project's own journal.
-pub fn recover_above(project_root: &Path, dry_run: bool) -> Result<Vec<CommitRecovery>, LockError> {
+/// does it, waiting up to `wait` for another holder), and what that did is
+/// returned for the run to report. A dry run replays nothing.
+///
+/// A journal that cannot be finished (a dry run, a file it covers that
+/// cannot be written, another run that holds the root past the wait) fails
+/// the acquire only where it may cover a file of the project ([`covers`]):
+/// [`LockError::CommitPending`] for a dry run, as for a project's own
+/// journal, and [`LockError::Io`] or [`LockError::Held`] otherwise. For
+/// any other project under the root it is data
+/// ([`Above::unfinished`]): the command goes on, since it reads no file
+/// the commit touched, and whoever writes under that root is refused by
+/// the root's own lock until a holder finishes the commit.
+pub fn recover_above(
+    project_root: &Path,
+    dry_run: bool,
+    wait: Duration,
+) -> Result<Above, LockError> {
     let start = std::fs::canonicalize(project_root).unwrap_or_else(|_| project_root.to_path_buf());
     let writes = ReadBoundary::of(ReadScope::Workspace, project_root);
     let top = writes.root().filter(|top| start.starts_with(top));
-    let mut found = Vec::new();
+    let mut found = Above::default();
     for dir in start.ancestors() {
         let journal = dir.join(ROOT_JOURNAL_REL);
-        if exists(&journal) {
-            found.extend(recover_at(dir, &journal, dry_run)?);
+        if exists(&journal) && boundary_file_in(dir).is_some() {
+            recover_at(dir, &start, &journal, dry_run, wait, &mut found)?;
         }
         // Outside the write boundary no commit of socket-patch's was made.
         if top.is_none_or(|top| dir == top) {
@@ -829,10 +904,13 @@ pub fn recover_above(project_root: &Path, dry_run: bool) -> Result<Vec<CommitRec
 /// [`recover_above`] for the one root `root`, whose journal is `journal`.
 fn recover_at(
     root: &Path,
+    project: &Path,
     journal: &Path,
     dry_run: bool,
-) -> Result<Option<CommitRecovery>, LockError> {
-    let unfinished = |source: std::io::Error| {
+    wait: Duration,
+    found: &mut Above,
+) -> Result<(), LockError> {
+    let failed = |source: std::io::Error| {
         let why = format!(
             "could not finish an interrupted run's commit under the Bazel root {}: {source}; the \
              journal is kept for the next command",
@@ -843,27 +921,62 @@ fn recover_at(
             source: std::io::Error::new(source.kind(), why),
         }
     };
+    // What the journal names, for the question of whose files it covers.
+    // Asked only once a replay is known not to happen.
+    let pending = || group_commit::pending_anchored(root);
+    let mut unfinished = |files: Vec<String>, reason: String| {
+        found.unfinished.push(AnchoredPending {
+            root: root.to_path_buf(),
+            journal: journal.to_path_buf(),
+            files,
+            reason,
+        });
+    };
     if dry_run {
-        return match group_commit::pending_anchored(root) {
-            Ok(None) => Ok(None),
-            Ok(Some(found)) => Err(LockError::CommitPending {
-                journal: found.journal,
-                files: found.files,
-            }),
-            Err(source) => Err(unfinished(source)),
+        return match pending() {
+            Ok(None) => Ok(()),
+            Ok(Some(named)) if covers(root, project, Some(&named.files)) => {
+                Err(LockError::CommitPending {
+                    journal: named.journal,
+                    files: named.files,
+                })
+            }
+            Ok(Some(named)) => {
+                let reason = "a dry run writes nothing, so it was not finished".to_string();
+                unfinished(named.files, reason);
+                Ok(())
+            }
+            Err(source) => Err(failed(source)),
         };
     }
-    match lock_root_blocking(root, LOCK_WAIT) {
-        Ok(lock) => Ok(recovered(root, lock.recovery().clone())),
+    let why = match lock_root_blocking(root, wait) {
+        Ok(lock) => {
+            found.recovered.extend(lock.recovered());
+            return Ok(());
+        }
         // Behind a link the journal is another project's: its own lock
         // finds it.
-        Err(RootLockError::Linked(_)) => Ok(None),
-        // A live run holds the root: the journal is its commit under way.
-        // Nothing may be read over that, so this lock waits its own turn.
-        Err(RootLockError::Held) => Err(LockError::Held),
-        Err(RootLockError::Replay { source, .. }) => Err(unfinished(source)),
-        Err(RootLockError::Io(why)) => Err(unfinished(std::io::Error::other(why))),
+        Err(RootLockError::Linked(_)) => return Ok(()),
+        Err(why) => why,
+    };
+    let named = pending().ok().flatten().map(|named| named.files);
+    if covers(root, project, named.as_deref()) {
+        return Err(match why {
+            // A live run holds the root: the journal is its commit under
+            // way. Nothing may be read over that, so this lock waits its
+            // own turn.
+            RootLockError::Held => LockError::Held,
+            RootLockError::Replay { source, .. } => failed(source),
+            other => failed(std::io::Error::other(other.to_string())),
+        });
     }
+    let reason = match why {
+        RootLockError::Held => format!("{HELD} and is finishing it"),
+        RootLockError::Replay { source, .. } => source.to_string(),
+        other => other.to_string(),
+    };
+    unfinished(named.unwrap_or_default(), reason);
+    Ok(())
 }
 
 /// Adds `line` and its index row. `Ok(false)`: a line hides the tree by
@@ -2653,15 +2766,22 @@ mod tests {
         assert!(!repo.top.join(".socket").exists(), "no `.socket` is left");
     }
 
+    /// A directory link, as each system makes one.
+    fn link_dir(target: &Path, link: &Path) {
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(target, link).expect("a link");
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_dir(target, link).expect("a link");
+    }
+
     /// A root whose `.socket` is a link is another project's: the lock is
-    /// refused and nothing is made behind the link. A lock that fails for
-    /// any other reason leaves no directory either.
-    #[cfg(unix)]
+    /// refused and nothing is made behind the link. On every system: the
+    /// link is a directory link as each one makes it.
     #[test]
     fn a_root_lock_is_refused_through_a_link_and_leaves_nothing() {
         let repo = Repo::workspace();
         let other = Repo::new();
-        std::os::unix::fs::symlink(&other.top, repo.top.join(".socket")).expect("a link");
+        link_dir(&other.top, &repo.top.join(".socket"));
         let linked = lock_root_blocking(&repo.top, Duration::ZERO).unwrap_err();
         assert!(
             matches!(&linked, RootLockError::Linked(link) if *link == repo.top.join(".socket")),
@@ -2673,13 +2793,37 @@ mod tests {
             "nothing behind the link: {:?}",
             other.tree()
         );
+    }
 
+    /// A lock that fails for any other reason leaves no directory either:
+    /// a file where the owned directory belongs.
+    #[test]
+    fn a_root_lock_that_cannot_be_made_leaves_nothing() {
         let squatted = Repo::workspace();
-        squatted.put(".socket/bazel", b"");
+        squatted.dir(".socket");
+        std::fs::write(squatted.top.join(".socket").join("bazel"), b"").expect("a file");
         let before = squatted.tree();
         let failed = lock_root_blocking(&squatted.top, Duration::ZERO).unwrap_err();
         assert!(matches!(failed, RootLockError::Io(_)), "{failed}");
         assert_eq!(squatted.tree(), before);
+    }
+
+    /// `rel` below `base`, level by level.
+    fn at(base: &Path, rel: &str) -> PathBuf {
+        rel.split('/')
+            .fold(base.to_path_buf(), |at, level| at.join(level))
+    }
+
+    /// The journal of an anchored commit that writes `after` at each of
+    /// `files` (none of which exists yet), in the form the commit writes.
+    fn journal_of(files: &[&str]) -> Vec<u8> {
+        let file = |path: &&str| {
+            serde_json::json!({
+                "path": path, "before": null, "after": "bG9jay1uZXcK", "preserveMode": false,
+            })
+        };
+        let files: Vec<serde_json::Value> = files.iter().map(file).collect();
+        serde_json::to_vec(&serde_json::json!({ "version": 1, "files": files })).expect("json")
     }
 
     /// The project lock finds nothing to finish above a project that has
@@ -2694,10 +2838,169 @@ mod tests {
             };
             let project = repo.dir("svc/api");
             let before = repo.tree();
-            assert_eq!(recover_above(&project, false).expect("nothing to do"), []);
-            assert_eq!(recover_above(&project, true).expect("nothing to do"), []);
+            for dry_run in [false, true] {
+                let above = recover_above(&project, dry_run, Duration::ZERO).expect("nothing");
+                assert!(above.recovered.is_empty() && above.unfinished.is_empty());
+            }
             assert_eq!(repo.tree(), before, "bazel={bazel}");
         }
+    }
+
+    /// A journal is a commit of socket-patch's only at a Bazel root. One
+    /// that lies in any other directory above a project (a file that came
+    /// with the checkout) is neither replayed nor reported, by a run or by
+    /// its dry run, and no file it names is written. At a Bazel root the
+    /// same journal is finished, and the replay is said with its files.
+    #[test]
+    fn a_journal_is_replayed_only_at_a_bazel_root() {
+        let named = ["README.md", "svc/app/package.json"];
+        let plant = |repo: &Repo| {
+            let journal = at(&repo.top, ROOT_JOURNAL_REL);
+            std::fs::create_dir_all(journal.parent().expect("a parent")).expect("mkdir");
+            std::fs::write(journal, journal_of(&named)).expect("the journal");
+        };
+
+        // No boundary file anywhere: an npm project in a plain checkout.
+        let plain = Repo::new();
+        let project = plain.dir("svc").join("app");
+        std::fs::create_dir_all(&project).expect("mkdir");
+        plant(&plain);
+        let before = plain.tree();
+        for dry_run in [true, false] {
+            let above = recover_above(&project, dry_run, Duration::ZERO).expect("not ours");
+            assert!(above.recovered.is_empty() && above.unfinished.is_empty());
+            let socket_dir = project.join(".socket");
+            let guard = match dry_run {
+                true => apply_lock::acquire_dry_run(&socket_dir, Duration::ZERO),
+                false => apply_lock::acquire(&socket_dir, Duration::ZERO),
+            };
+            let guard = guard.expect("the project's lock");
+            assert_eq!(guard.commit_recovery(), None, "dry_run={dry_run}");
+            assert!(guard.unfinished_above().is_empty());
+            drop(guard);
+            assert_eq!(plain.tree(), before, "dry_run={dry_run}");
+        }
+
+        // The same checkout as a Bazel root.
+        let bazel = Repo::workspace();
+        let project = bazel.dir("svc").join("app");
+        std::fs::create_dir_all(&project).expect("mkdir");
+        plant(&bazel);
+        let before = bazel.tree();
+        let dry = recover_above(&project, true, Duration::ZERO).unwrap_err();
+        let LockError::CommitPending { files, .. } = &dry else {
+            panic!("expected the pending commit, got {dry:?}");
+        };
+        assert_eq!(files, &named);
+        // Its own wording: a commit under a Bazel root, not a vendored one.
+        let said = dry.to_string();
+        assert!(said.contains("under the Bazel root"), "{said}");
+        assert!(said.contains("relative to that root"), "{said}");
+        assert!(!said.contains("vendored"), "{said}");
+        assert_eq!(bazel.tree(), before, "a dry run writes nothing");
+        let above = recover_above(&project, false, Duration::ZERO).expect("replayed");
+        assert!(above.unfinished.is_empty());
+        let [replayed] = &above.recovered[..] else {
+            panic!("one replay: {:?}", above.recovered);
+        };
+        assert_eq!(replayed.code, COMMIT_RECOVERED);
+        for file in named {
+            assert!(replayed.detail.contains(file), "{}", replayed.detail);
+            assert_eq!(
+                std::fs::read(at(&bazel.top, file)).expect("written"),
+                b"lock-new\n"
+            );
+        }
+        assert!(!at(&bazel.top, ROOT_JOURNAL_REL).exists());
+    }
+
+    /// A journal the lock cannot finish (a level of a path it names is a
+    /// file) fails the acquire of a project it may cover, and of no other:
+    /// a sibling project is handed the fact, goes on, and the journal and
+    /// every file stay as found. The root's own lock refuses every writer.
+    #[test]
+    fn a_journal_that_cannot_be_finished_stops_only_a_project_it_covers() {
+        let repo = Repo::workspace();
+        repo.put("blocked", b"a file where a directory is named");
+        // The path that cannot be written comes first: where a system
+        // only finds that out at the write, nothing was written before it.
+        let named = ["blocked/pnpm-lock.yaml", "svc/api/pnpm-lock.yaml"];
+        let journal = at(&repo.top, ROOT_JOURNAL_REL);
+        std::fs::create_dir_all(journal.parent().expect("a parent")).expect("mkdir");
+        std::fs::write(&journal, journal_of(&named)).expect("the journal");
+        let (covered, sibling) = (repo.dir("svc").join("api"), repo.dir("svc").join("other"));
+        for dir in [&covered, &sibling] {
+            std::fs::create_dir_all(dir).expect("mkdir");
+        }
+        let before = repo.tree();
+
+        let refused = lock_root_blocking(&repo.top, Duration::ZERO).unwrap_err();
+        assert!(matches!(refused, RootLockError::Replay { .. }), "{refused}");
+
+        // A project the journal names a file of, and the root itself.
+        for project in [&covered, &repo.top] {
+            let failed = recover_above(project, false, Duration::ZERO).unwrap_err();
+            assert!(matches!(failed, LockError::Io { .. }), "{failed}");
+            let pending = recover_above(project, true, Duration::ZERO).unwrap_err();
+            assert!(
+                matches!(pending, LockError::CommitPending { .. }),
+                "{pending}"
+            );
+        }
+        // A project it names no file of.
+        for dry_run in [false, true] {
+            let above = recover_above(&sibling, dry_run, Duration::ZERO).expect("data");
+            assert!(above.recovered.is_empty(), "{:?}", above.recovered);
+            let [left] = &above.unfinished[..] else {
+                panic!("one journal: {:?}", above.unfinished);
+            };
+            assert_eq!((&left.root, &left.journal), (&repo.top, &journal));
+            assert_eq!(left.files, named);
+            let said = left.warning();
+            assert!(
+                said.contains("is not finished") && said.contains("went on"),
+                "{said}"
+            );
+            let socket_dir = sibling.join(".socket");
+            let guard = match dry_run {
+                true => apply_lock::acquire_dry_run(&socket_dir, Duration::ZERO),
+                false => apply_lock::acquire(&socket_dir, Duration::ZERO),
+            };
+            let guard = guard.expect("the sibling's lock is taken");
+            assert_eq!(guard.unfinished_above(), &above.unfinished[..]);
+            assert_eq!(guard.commit_recovery(), None);
+            drop(guard);
+        }
+        assert_eq!(repo.tree(), before, "the journal and every file as found");
+    }
+
+    /// Which projects a journal may cover: the root, a project a named
+    /// path lies at or below, and every project when nothing is known of
+    /// what it names.
+    #[test]
+    fn a_journal_covers_the_projects_its_paths_lie_in() {
+        let root = Path::new("repo");
+        let files = [
+            "svc/api/pnpm-lock.yaml".to_string(),
+            "MODULE.bazel".to_string(),
+        ];
+        let covered =
+            |project: &str, files: Option<&[String]>| covers(root, &at(root, project), files);
+        assert!(covered("svc/api", Some(&files)));
+        assert!(covered("svc", Some(&files)));
+        assert!(!covered("svc/api/web", Some(&files)));
+        assert!(!covered("svc/other", Some(&files)));
+        assert!(!covered("svc/ap", Some(&files)), "a level, not a prefix");
+        assert!(covers(root, root, Some(&files)), "the root holds them all");
+        assert!(
+            covered("svc/other", None),
+            "an unread journal covers anything"
+        );
+        assert!(
+            covered("svc/other", Some(&[])),
+            "and so does an unparsed one"
+        );
+        assert!(covers(root, Path::new("elsewhere"), Some(&files)));
     }
 
     fn result(success: bool, error: Option<&str>) -> ApplyResult {

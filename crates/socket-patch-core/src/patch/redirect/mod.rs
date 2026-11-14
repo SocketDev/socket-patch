@@ -765,6 +765,7 @@ pub fn rewrite_registry_redirect_under_bazel(
         &yarnrc::OuterYarnMirror::default(),
         &CratesIoSource::Registry,
         bazel,
+        &std::collections::BTreeSet::new(),
     )
 }
 
@@ -790,6 +791,13 @@ pub fn rewrite_registry_redirect_under_bazel(
 /// [`bazel::BazelRewrite`], relative to the Bazel root, for the commit
 /// anchored there. For a project no hub claims the group decides nothing
 /// and the result is exactly [`rewrite_registry_redirect_with_host`]'s.
+///
+/// `kept_from_native` are the patches the host keeps from the native
+/// rewriters for a reason of its own (a primary lock of the project that
+/// it could not read). They are withheld here, behind the Bazel group and
+/// never in front of it: the group is handed every override, so a patch of
+/// a governed ecosystem is always decided by the gate, and a filter of the
+/// host's can never leave one to nobody.
 #[allow(clippy::too_many_arguments)]
 pub fn rewrite_registry_redirect_with_host_under_bazel(
     files: &BTreeMap<String, String>,
@@ -801,6 +809,7 @@ pub fn rewrite_registry_redirect_with_host_under_bazel(
     yarn_outer: &yarnrc::OuterYarnMirror,
     cargo_outer: &CratesIoSource,
     bazel: &bazel::BazelHost<'_>,
+    kept_from_native: &std::collections::BTreeSet<String>,
 ) -> (RewriteResult, bazel::BazelRewrite) {
     // The native rewriter as the Bazel group calls it: over the files it
     // is handed and nothing else of the project, so it knows of no binary
@@ -820,7 +829,9 @@ pub fn rewrite_registry_redirect_with_host_under_bazel(
     };
     let mut result = RewriteResult::default();
     let group = bazel::rewrite(bazel, files, overrides, &native, &mut result);
-    let overrides = withhold(overrides, &group.governed());
+    let mut withheld = group.governed();
+    withheld.extend(kept_from_native.iter().cloned());
+    let overrides = withhold(overrides, &withheld);
     let rest = rewrite_registry_redirect_with_host(
         files,
         &overrides,
