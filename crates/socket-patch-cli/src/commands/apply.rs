@@ -186,7 +186,7 @@ pub struct NestedApply {
     /// (`get`) checked only its own selection. `scan` already reported
     /// every protected installed package, so it passes `false`.
     pub report_user_patch_skips: bool,
-    pub shown_opt_in_uuids: Vec<String>,
+    pub shown_opt_ins: Vec<crate::ui::ShownOptIn>,
 }
 
 impl ApplyArgs {
@@ -1849,12 +1849,12 @@ pub(crate) async fn run_locked(
                 for line in block {
                     println!("{line}");
                 }
-                let shown_opt_in_uuids = args
+                let shown_opt_ins = args
                     .nested
                     .as_ref()
-                    .map_or(&[][..], |nested| nested.shown_opt_in_uuids.as_slice());
+                    .map_or(&[][..], |nested| nested.shown_opt_ins.as_slice());
                 if let Some(notes) =
-                    format_opt_in_notes(&opt_ins, &results, &unmatched, shown_opt_in_uuids)
+                    format_opt_in_notes(&opt_ins, &results, &unmatched, shown_opt_ins)
                 {
                     println!("\n{notes}");
                 }
@@ -2402,7 +2402,7 @@ fn format_opt_in_notes(
     opt_ins: &OptInPatches,
     results: &[ApplyResult],
     unmatched: &[String],
-    shown_opt_in_uuids: &[String],
+    shown_opt_ins: &[crate::ui::ShownOptIn],
 ) -> Option<String> {
     let shown: HashSet<&str> = results
         .iter()
@@ -2411,7 +2411,11 @@ fn format_opt_in_notes(
         .collect();
     crate::ui::opt_in_note_block(opt_ins.iter().filter_map(
         |(purl, uuid, requires_opt_in, opt_in_note)| {
-            if !shown.contains(purl.as_str()) || shown_opt_in_uuids.contains(uuid) {
+            if !shown.contains(purl.as_str())
+                || shown_opt_ins
+                    .iter()
+                    .any(|shown| shown.matches(uuid, *requires_opt_in, opt_in_note.as_deref()))
+            {
                 return None;
             }
             Some(crate::ui::OptInEntry {

@@ -390,7 +390,7 @@ pub struct DownloadParams {
     /// `--patch-server-url`: the extra origin whose URLs count as hosted
     /// when lockfile discovery reads the project's hosted pins.
     pub patch_server_url: Option<String>,
-    pub opt_in_notes_shown: Vec<String>,
+    pub opt_in_notes_shown: Vec<crate::ui::ShownOptIn>,
 }
 
 impl DownloadParams {
@@ -1412,7 +1412,7 @@ pub(crate) async fn run_nested_apply(
     common: GlobalArgs,
     json: bool,
     report_user_patch_skips: bool,
-    shown_opt_in_uuids: Vec<String>,
+    shown_opt_ins: Vec<crate::ui::ShownOptIn>,
     recorded: &[(String, String)],
     client: &ApiClient,
     lock: LockGuard,
@@ -1427,7 +1427,7 @@ pub(crate) async fn run_nested_apply(
         nested: Some(super::apply::NestedApply {
             caller_json: json,
             report_user_patch_skips,
-            shown_opt_in_uuids,
+            shown_opt_ins,
         }),
     };
     // The nested apply runs on the host's client: seeded, never rebuilt.

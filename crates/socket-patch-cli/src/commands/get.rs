@@ -1297,7 +1297,7 @@ pub async fn run(args: GetArgs) -> i32 {
                             let note = crate::ui::terminal_text(note).replace('\n', "\n  ");
                             println!(
                                 "Opt-in required for {}: {note}",
-                                normalize_purl(&patch.purl)
+                                crate::ui::terminal_purl(&patch.purl)
                             );
                         }
                     }
@@ -1813,7 +1813,10 @@ pub async fn run(args: GetArgs) -> i32 {
 
     // Download and apply (agent mode), with the run's client and flags.
     let mut params = get_download_params(&args, args.save_only, /*persist_blobs=*/ true);
-    params.opt_in_notes_shown = selected.iter().map(|patch| patch.uuid.clone()).collect();
+    params.opt_in_notes_shown = selected
+        .iter()
+        .map(crate::ui::ShownOptIn::from_search)
+        .collect();
     let run = DownloadRun {
         api_client: &api_client,
         lock_timeout: args.common.lock_timeout,
@@ -2162,7 +2165,7 @@ async fn save_and_apply_patch(
                 nested_apply_args(&args.common, &manifest_path, quiet),
                 args.common.json,
                 true,
-                vec![patch.uuid.clone()],
+                vec![crate::ui::ShownOptIn::from_response(patch)],
                 &recorded,
                 client,
                 lock,

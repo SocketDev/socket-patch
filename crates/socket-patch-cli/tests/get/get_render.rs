@@ -440,6 +440,58 @@ async fn opt_in_note_renders_and_persists_in_human_and_json_get() {
 }
 
 #[tokio::test]
+async fn changed_view_opt_in_note_is_not_suppressed_in_nested_apply() {
+    const PREVIEW_NOTE: &str = "Preview configuration instruction.";
+    const LATEST_NOTE: &str = "Latest configuration instruction.";
+    let server = MockServer::start().await;
+    let cve = "CVE-2024-4245";
+    Mock::given(method("GET"))
+        .and(path(format!("/v0/orgs/{ORG}/patches/by-cve/{cve}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "patches": [{
+                "uuid": UUID, "purl": PURL,
+                "publishedAt": "2024-01-01T00:00:00Z",
+                "description": "Opt-in metadata changes", "license": "MIT", "tier": "free",
+                "vulnerabilities": {},
+                "requiresOptIn": true, "optInNote": PREVIEW_NOTE,
+            }],
+            "canAccessPaidPatches": false,
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/v0/orgs/{ORG}/patches/view/{UUID}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "uuid": UUID,
+            "purl": PURL,
+            "publishedAt": "2024-01-01T00:00:00Z",
+            "files": one_file_view(),
+            "vulnerabilities": {},
+            "description": "Opt-in metadata changes",
+            "license": "MIT",
+            "tier": "free",
+            "requiresOptIn": true,
+            "optInNote": LATEST_NOTE,
+        })))
+        .mount(&server)
+        .await;
+    let tmp = tempfile::tempdir().unwrap();
+    write_project(tmp.path());
+
+    let (code, stdout, stderr) = run_get_bin(tmp.path(), &server.uri(), &[cve]);
+    assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
+    assert!(stdout.contains(PREVIEW_NOTE), "{stdout}");
+    assert!(
+        stdout.contains(&format!("Opt-in required:\n  {PURL}: {LATEST_NOTE}")),
+        "nested apply must show the refreshed view's note: {stdout}"
+    );
+    assert_eq!(
+        manifest_json(tmp.path())["patches"][PURL]["optInNote"],
+        LATEST_NOTE
+    );
+}
+
+#[tokio::test]
 async fn unchanged_uuid_refreshes_and_clears_opt_in_metadata_on_both_save_paths() {
     async fn mount_api(server: &MockServer, cve: &str, note: Option<&str>) {
         let mut patch = serde_json::json!({

@@ -255,6 +255,13 @@ pub(crate) fn terminal_text(s: &str) -> String {
         .collect()
 }
 
+pub(crate) fn terminal_purl(purl: &str) -> String {
+    socket_patch_core::utils::purl::normalize_purl(purl)
+        .chars()
+        .filter(|c| !c.is_control())
+        .collect()
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct OptInEntry<'a> {
     pub purl: &'a str,
@@ -271,6 +278,50 @@ impl<'a> OptInEntry<'a> {
             requires_opt_in: patch.requires_opt_in,
             opt_in_note: patch.opt_in_note.as_deref(),
         }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ShownOptIn {
+    uuid: String,
+    requires_opt_in: Option<bool>,
+    opt_in_note: Option<String>,
+}
+
+impl ShownOptIn {
+    fn new(uuid: &str, requires_opt_in: Option<bool>, opt_in_note: Option<&str>) -> Self {
+        Self {
+            uuid: uuid.to_string(),
+            requires_opt_in,
+            opt_in_note: opt_in_note.map(str::to_string),
+        }
+    }
+
+    pub fn from_search(patch: &socket_patch_core::api::types::PatchSearchResult) -> Self {
+        Self::new(
+            &patch.uuid,
+            patch.requires_opt_in,
+            patch.opt_in_note.as_deref(),
+        )
+    }
+
+    pub fn from_response(patch: &socket_patch_core::api::types::PatchResponse) -> Self {
+        Self::new(
+            &patch.uuid,
+            patch.requires_opt_in,
+            patch.opt_in_note.as_deref(),
+        )
+    }
+
+    pub(crate) fn matches(
+        &self,
+        uuid: &str,
+        requires_opt_in: Option<bool>,
+        opt_in_note: Option<&str>,
+    ) -> bool {
+        self.uuid == uuid
+            && self.requires_opt_in == requires_opt_in
+            && self.opt_in_note.as_deref() == opt_in_note
     }
 }
 
@@ -293,7 +344,7 @@ pub(crate) fn opt_in_note_block<'a>(
             continue;
         }
         let note = note.replace('\n', "\n    ");
-        let purl = socket_patch_core::utils::purl::normalize_purl(entry.purl);
+        let purl = terminal_purl(entry.purl);
         let block = block.get_or_insert_with(|| "Opt-in required:".to_string());
         block.push_str(&format!("\n  {purl}: {note}"));
     }
@@ -333,6 +384,30 @@ mod tests {
         assert_eq!(plural(2, "package", "packages"), "2 packages");
         assert_eq!(plural(1, "patch", "patches"), "1 patch");
         assert_eq!(plural(7, "patch", "patches"), "7 patches");
+    }
+
+    #[test]
+    fn opt_in_block_sanitizes_purls_and_dedups_uuids() {
+        let block = opt_in_note_block([
+            OptInEntry {
+                purl: "pkg:npm/bad%1Bname%09more\r\nnext@1.0.0",
+                uuid: "uuid-a",
+                requires_opt_in: Some(true),
+                opt_in_note: Some("Enable safe mode."),
+            },
+            OptInEntry {
+                purl: "pkg:npm/other@1.0.0",
+                uuid: "uuid-a",
+                requires_opt_in: Some(true),
+                opt_in_note: Some("Enable safe mode."),
+            },
+        ])
+        .unwrap();
+        assert_eq!(
+            block,
+            "Opt-in required:\n  pkg:npm/badnamemorenext@1.0.0: Enable safe mode."
+        );
+        assert!(!block.contains('\x1b') && !block.contains('\r') && !block.contains('\t'));
     }
 
     #[test]
