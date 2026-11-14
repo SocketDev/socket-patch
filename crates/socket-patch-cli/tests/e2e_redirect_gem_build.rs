@@ -5515,3 +5515,197 @@ async fn gem_hosted_redirect_keeps_a_crlf_gemfile_crlf() {
         "rollback hands the lock back byte for byte"
     );
 }
+
+/// Publish `DEP` 1.1.0 on the mock upstream, the way rubygems.org does: one
+/// more line in the gem's `/info` and one appended to `/versions`. The
+/// routes outrank the fixture's own (wiremock priority 1 over the default 5).
+async fn release_upstream_1_1_0(fx: &RedirectFixture) {
+    let api = fx._server.uri();
+    let gem = build_gem(
+        &fx.tmp.path().join("gem-stage-next"),
+        DEP,
+        "1.1.0",
+        "vuln_gem.rb",
+        &orig_lib(),
+        &[TRANSITIVE],
+    );
+    let fetch = |route: String| async move {
+        reqwest::get(route)
+            .await
+            .expect("mock upstream reachable")
+            .text()
+            .await
+            .expect("compact index body")
+    };
+    let info = format!(
+        "{}1.1.0 {TRANSITIVE}:>= 0|checksum:{}\n",
+        fetch(format!("{api}/upstream/info/{DEP}")).await,
+        sha256_hex(&gem)
+    );
+    let versions = format!(
+        "{}{DEP} 1.1.0 {}\n",
+        fetch(format!("{api}/upstream/versions")).await,
+        md5_hex(info.as_bytes())
+    );
+    for (route, response) in [
+        (format!("/upstream/info/{DEP}"), compact_index_body(info)),
+        (
+            "/upstream/versions".to_owned(),
+            compact_index_body(versions),
+        ),
+        (
+            format!("/upstream/gems/{DEP}-1.1.0.gem"),
+            ResponseTemplate::new(200).set_body_raw(gem, "application/octet-stream"),
+        ),
+    ] {
+        Mock::given(method("GET"))
+            .and(path(route))
+            .respond_with(response)
+            .with_priority(1)
+            .mount(&fx._server)
+            .await;
+    }
+}
+
+/// A hosted gem's only source is its patch's registry, which serves one
+/// version, so the gem leaves `bundle outdated` and `bundle update` cannot
+/// move it (#2070). The scan has to say so, and what it says has to be true
+/// of the real Bundler: with a newer upstream release out, `bundle outdated`
+/// lists the gem before the scan and not after, `bundle update` leaves the
+/// scanned lock at the patched version, and the way past the hold the scan
+/// names (`rollback`, then `bundle update <gem>`) does move the gem.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "host capstone: shells out to a real ruby/gem/bundler (>= 1.17); \
+            the unpinned `test` job skips it, an e2e job with a pinned toolchain runs it via --ignored"]
+async fn gem_hosted_scan_says_the_gem_is_held_at_its_version() {
+    let Some(fx) = redirect_scanned_project(
+        "update-hold",
+        Spelling::Gemfile,
+        false,
+        true,
+        None,
+        Driver::ScanVex,
+    )
+    .await
+    else {
+        return;
+    };
+    let api = fx._server.uri();
+    let upstream = format!("{api}/upstream");
+    let cwd = fx.proj.to_str().expect("utf8 tmp path");
+    let lock_path = fx.proj.join(fx.lock_name);
+    let rollback = || {
+        let (code, stdout, stderr) = run_socket_env(
+            &fx.proj,
+            &[
+                "rollback",
+                PURL,
+                "--json",
+                "--cwd",
+                cwd,
+                "--api-url",
+                &api,
+                "--org",
+                ORG,
+                "--api-token",
+                "fake",
+                "--patch-server-url",
+                &api,
+            ],
+            &[("SOCKET_RUBYGEMS_URL", &upstream)],
+        );
+        assert_eq!(code, 0, "rollback:\nstdout:\n{stdout}\nstderr:\n{stderr}");
+        assert_eq!(
+            String::from_utf8_lossy(&std::fs::read(&lock_path).unwrap()),
+            String::from_utf8_lossy(&fx.pristine_lock),
+            "rollback hands the lock back byte for byte"
+        );
+    };
+    // Bundler with a cold compact-index cache, so each call reads the
+    // upstream index as it stands now.
+    let bundle_cold = |args: &[&str]| {
+        let _ = std::fs::remove_dir_all(fx.proj.join(".bundle-user-home"));
+        let out = bundle(&fx.proj, args);
+        (
+            out.status.success(),
+            format!(
+                "stdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            ),
+        )
+    };
+    let locked = |version: &str| {
+        std::fs::read_to_string(&lock_path)
+            .unwrap()
+            .contains(&format!("    {DEP} ({version})\n"))
+    };
+
+    // Back to the pre-scan pair, and upstream releases 1.1.0.
+    rollback();
+    release_upstream_1_1_0(&fx).await;
+    let (up_to_date, before) = bundle_cold(&["outdated"]);
+    assert!(
+        !up_to_date && before.contains(DEP) && before.contains("1.1.0"),
+        "control: before the scan `bundle outdated` reports {DEP} 1.0.0 -> 1.1.0:\n{before}"
+    );
+
+    // The scan, in human output: it names the gem it now holds and the way
+    // past the hold.
+    let (code, stdout, stderr) = run_socket(
+        &fx.proj,
+        &[
+            "scan",
+            "--mode",
+            "hosted",
+            "--yes",
+            "--cwd",
+            cwd,
+            "--api-url",
+            &api,
+            "--org",
+            ORG,
+            "--api-token",
+            "fake",
+        ],
+    );
+    assert_eq!(code, 0, "scan:\nstdout:\n{stdout}\nstderr:\n{stderr}");
+    let note = format!(
+        "Bundler now takes {DEP} from its Socket patch source only, which serves the patched \
+         version and no other: `bundle outdated` no longer lists it and `bundle update` cannot \
+         move it. To move it to a newer release, run `socket-patch rollback {PURL}`, \
+         then `bundle update {DEP}`, then `socket-patch scan` again."
+    );
+    assert!(
+        stdout.lines().any(|line| line == note),
+        "the scan says {DEP} is held at its version:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    let scanned_lock = std::fs::read_to_string(&lock_path).unwrap();
+    assert!(locked(DEP_VERSION), "scanned lock:\n{scanned_lock}");
+
+    // What the line says is so: the gem is gone from `bundle outdated`, and
+    // `bundle update` leaves it at the patched version.
+    let (up_to_date, after) = bundle_cold(&["outdated"]);
+    assert!(
+        up_to_date && !after.contains(DEP) && !after.contains("1.1.0"),
+        "after the scan `bundle outdated` no longer reports {DEP}:\n{after}"
+    );
+    let (updated, update) = bundle_cold(&["update"]);
+    assert!(updated, "`bundle update` on the scanned pair:\n{update}");
+    assert!(
+        locked(DEP_VERSION) && !locked("1.1.0"),
+        "`bundle update` cannot move the held gem:\n{}",
+        std::fs::read_to_string(&lock_path).unwrap()
+    );
+
+    // And the way past it works: roll back, then `bundle update <gem>`.
+    std::fs::write(&lock_path, &scanned_lock).unwrap();
+    rollback();
+    let (updated, update) = bundle_cold(&["update", DEP]);
+    assert!(updated, "`bundle update {DEP}` after rollback:\n{update}");
+    assert!(
+        locked("1.1.0"),
+        "after rollback `bundle update {DEP}` moves it to 1.1.0:\n{}",
+        std::fs::read_to_string(&lock_path).unwrap()
+    );
+}
