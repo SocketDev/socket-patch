@@ -41,6 +41,13 @@ pub struct RepairArgs {
 
 pub async fn run(args: RepairArgs) -> i32 {
     apply_env_toggles(&args.common);
+    // Nothing in a tree Bazel owns is repaired (owner decision O16):
+    // refused before a manifest, a ledger or a lockfile is read.
+    let refused =
+        crate::bazel_gate::scope::refuse_in_bazel_tree(&args.common, Command::Repair, "repair");
+    if let Some(code) = refused.await {
+        return code;
+    }
 
     if args.common.offline && args.download_only {
         return crate::json_envelope::usage_error(
@@ -208,6 +215,16 @@ pub async fn run(args: RepairArgs) -> i32 {
     // client's public-proxy advisory ahead of its own output.
     let mut client: Option<ApiClient> = None;
     let result = repair_inner(&args, &manifest_path, &mut client, vendor_references).await;
+    // Under a Bazel root: the `.bazelignore` lines back in step with the
+    // trees (one an older release left with no line, one whose tree a
+    // later run removed), what the root's owned index no longer matches,
+    // and a recorded pin that is gone. Under the project's lock, after the
+    // repairs above, which can recreate a tree.
+    let lanes = &crate::bazel_gate::commands::PRODUCTION;
+    let bazel = match &result {
+        Ok(_) => crate::bazel_gate::commands::repair(&args.common, lanes).await,
+        Err(_) => Vec::new(),
+    };
     let auth_fallback = client
         .as_ref()
         .and_then(crate::commands::vex_sources::api_auth_fallback_warning);
@@ -224,6 +241,7 @@ pub async fn run(args: RepairArgs) -> i32 {
         Ok((mut env, counts)) => {
             env.warnings.extend(commit_recovery);
             env.warnings.extend(auth_fallback);
+            env.warnings.extend(bazel);
             let had_failure = matches!(env.status, Status::PartialFailure | Status::Error);
             if had_failure {
                 track_patch_repair_failed("One or more artifacts failed to download", &telemetry)

@@ -600,6 +600,26 @@ async fn run_check(args: &ApplyArgs, manifest_path: &Path) -> i32 {
         not_installed.sort();
         checked += in_sync.len();
     }
+    // Wiring that the owned index of a Bazel root records for a record of
+    // the manifest and that no longer stands, and a commit an interrupted
+    // run left pending at the root, are drift (revision 4, 8.7). A record
+    // that was never wired is none.
+    let wired = manifest
+        .patches
+        .iter()
+        .filter(|(purl, _)| owned_by_apply(purl));
+    let wired: Vec<(String, String)> = wired
+        .map(|(purl, record)| (purl.clone(), record.uuid.clone()))
+        .collect();
+    let lanes = &crate::bazel_gate::commands::PRODUCTION;
+    drifts.extend(
+        Box::pin(crate::bazel_gate::commands::check(
+            &args.common,
+            wired,
+            lanes,
+        ))
+        .await,
+    );
     drifts.sort();
 
     // A drifting package the project patched itself is one a plain `apply`

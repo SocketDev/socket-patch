@@ -126,6 +126,29 @@ impl Takeover {
             if !takeover::in_reach(purl, entry) {
                 continue;
             }
+            // The target mode's gate first (Bazel builds, design 7): where a
+            // Bazel ruleset builds the package and the hosted gate refuses
+            // the pin, the revert is never staged and the entry stays
+            // vendored, byte for byte.
+            let lanes = &crate::bazel_gate::commands::PRODUCTION;
+            let patch = (purl.as_str(), candidate.dep.patch_uuid.as_str());
+            let url = &candidate.dep.artifact_url;
+            let gate = match entry {
+                Some(_) => {
+                    crate::bazel_gate::commands::takeover_refusal(common, patch, url, lanes).await
+                }
+                None => None,
+            };
+            if let Some((code, detail)) = gate {
+                refused.push(purl.clone());
+                out.warnings
+                    .push(serde_json::json!({ "code": code, "detail": detail }));
+                skipped.push(SkippedPatch {
+                    detail: Some(detail),
+                    ..SkippedPatch::new(purl, &candidate.dep.patch_uuid, &code)
+                });
+                continue;
+            }
             match entry {
                 Some(entry) => out.attempts.push((
                     purl.clone(),

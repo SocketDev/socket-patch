@@ -1659,6 +1659,144 @@ fn with_argv(run: RunRequired) -> RunRequired {
     }
 }
 
+// ── The restoring edit ───────────────────────────────────────────────
+
+/// What a restoring edit leaves stale ([`restoring`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Restoring {
+    /// The lock-refresh policy's decision for the edit. An explicit
+    /// `rollback` or `remove` restores whatever it says; a restore nobody
+    /// asked for by name goes ahead only when
+    /// `Decision::automatic_restore_allowed`.
+    pub decision: derived::Decision,
+    /// The same as a gate outcome, for the caller's `finish`: with the one
+    /// command where one refreshes what the edit stales. Its plan writes
+    /// nothing: the undo is the executor's.
+    pub outcome: GateOutcome,
+    /// What the run says once: the command, or why none helps, at the
+    /// level `Level::of_required_run` gives it.
+    pub advisory: Option<(super::codes::Level, Advisory)>,
+}
+
+/// Obligation 9 for an edit that puts files back (design 7, hazard
+/// HZ-26): `rollback`, `remove`, a takeover, `repair` and the
+/// withdrawn-pin sweep ask with the bytes their undo leaves, and get the
+/// verdict a forward edit of the same files would.
+///
+/// `changes` is the undo's change set by root-relative path (`None`: the
+/// file goes), and `releases` are the `(name, version)` it restores: a
+/// checksum row is one package's, and only theirs can go stale. A value a
+/// hub derives counts as repaired when the file that holds it is among
+/// the changes, since a lane's restore recomputes it there. The index is
+/// no input of any build and is left out.
+///
+/// The facts an extension stores are a lane's knowledge and are not asked
+/// here: a restore that returns a package to an index changes a lock that
+/// the extension records as an input, and that record is what is seen.
+pub fn restoring(
+    cx: &GateCx<'_>,
+    releases: &[(String, String)],
+    changes: &BTreeMap<String, Option<Vec<u8>>>,
+) -> Restoring {
+    let ws = cx.ws;
+    let module = ws.module.as_ref();
+    let in_module =
+        |path: &str| module.is_some_and(|model| model.files.iter().any(|file| file.path == path));
+    // A file of the module closure names no statement: every extension
+    // the root module uses is taken to have a tag in it (`changed_by`).
+    let every: Vec<Extension> = module.map_or_else(Vec::new, |model| {
+        model.proxies.iter().map(extension_of).collect()
+    });
+    let tags: Vec<ExtRef<'_>> = every
+        .iter()
+        .filter_map(|(label, name)| ExtRef::new(label, name).ok())
+        .collect();
+    let written = changes.iter().filter(|(path, _)| *path != INDEX_PATH);
+    let writes: Vec<derived::Write<'_>> = written
+        .map(|(path, after)| {
+            let write = match after {
+                Some(bytes) => derived::Write::bytes(path, bytes),
+                None => derived::Write::removed(path, None),
+            };
+            let tags_of: &[ExtRef<'_>] = if in_module(path) { &tags } else { &[] };
+            derived::Write { tags_of, ..write }
+        })
+        .collect();
+    let repairs: Vec<&str> = changes.keys().map(String::as_str).collect();
+    let keyed = |key: &str| {
+        releases.iter().any(|(name, version)| {
+            let rest = key.strip_prefix(name.as_str());
+            let rest = rest.and_then(|rest| rest.strip_prefix('-'));
+            let rest = rest.and_then(|rest| rest.strip_prefix(version.as_str()));
+            rest.is_some_and(|rest| rest.is_empty() || rest.starts_with('-'))
+        })
+    };
+    let concerns = |row: &&DerivedState| match row {
+        DerivedState::ChecksumValue { key, .. } => keyed(key),
+        _ => true,
+    };
+    let hubs = ws.hubs.iter().filter(|hub| inventory::may_build(hub));
+    let rows = hubs.flat_map(|hub| &hub.derived).filter(concerns);
+    let rows: Vec<DerivedState> = rows.cloned().collect();
+    let edit = derived::Edit {
+        writes: &writes,
+        facts: None,
+        hub: &rows,
+        repairs: &repairs,
+        digest_function: derived::digest_function_tracked(&ws.flags),
+    };
+    let remedy_cx = remedy::Cx {
+        line: &ws.line,
+        strict_repo_env: remedy::strict_repo_env(&ws.flags),
+        facts_in_lock: false,
+        query_hub: None,
+    };
+    let lock_use = derived::lock_use_of(&ws.flags, &ws.line);
+    let decision = derived::decide(&ws.module_lock, &edit, lock_use, &remedy_cx);
+    let run = decision.run_required().map(with_argv);
+    let fails = decision.builds_fail();
+    let remedy = match (&decision.interim, &decision.advisory) {
+        (InterimState::Red { remedy, .. }, _) => Some(remedy),
+        (InterimState::SelfHealing { command }, _) => Some(command),
+        (InterimState::Green, advisory) => advisory.as_ref(),
+    };
+    let advisory = remedy.map(|remedy| {
+        let level = match &run {
+            Some(run) => super::codes::Level::of_required_run(run.kind, fails),
+            None => super::codes::Level::Warn,
+        };
+        let until = match fails {
+            true => " Builds fail until that is done.",
+            false => "",
+        };
+        let detail = format!(
+            "the restore leaves Bazel state behind that it cannot refresh. {}{until}",
+            remedy.text()
+        );
+        let code = run_required(cx.mode);
+        (level, Advisory { code, detail })
+    });
+    let plan = Plan {
+        uuid: String::new(),
+        lane: LaneId::UNNAMED,
+        writes: Vec::new(),
+        repositories: Vec::new(),
+        artifacts: Vec::new(),
+        advisories: Vec::new(),
+        attest: AttestBasis::Withheld,
+        anchor: Anchor::Digest,
+    };
+    let outcome = match run {
+        Some(run) => GateOutcome::ProceedAfter(plan, run),
+        None => GateOutcome::Proceed(plan),
+    };
+    Restoring {
+        decision,
+        outcome,
+        advisory,
+    }
+}
+
 // ── Obligations 14 to 16 ─────────────────────────────────────────────
 
 /// Obligation 14, rc carriage (revision 4, 1.3): each row is a flag the
@@ -5763,5 +5901,82 @@ mod tests {
         let found = occurrences(&root.ws, Flag::OverrideRepository);
         assert_eq!(found.map(|found| found.len()), Ok(0));
         assert_eq!(proceeds(root.ask("left-pad")).lane, LaneId("H-TOY1"));
+    }
+
+    /// A restoring edit gets the verdict of a forward one (design 7): the
+    /// file the lock records goes stale, and the mode of the lock decides
+    /// whether the command is advice or the one thing that makes builds
+    /// pass again. A crate lock digest fails the build in every mode, and
+    /// an edit that returns the recorded bytes, or touches no input, is
+    /// silent.
+    #[test]
+    fn a_restoring_edit_is_decided_like_a_forward_one() {
+        let lock = recorded_lock();
+        let put = |path: &str, bytes: &[u8]| {
+            let change = (path.to_string(), Some(bytes.to_vec()));
+            BTreeMap::from([change, (INDEX_PATH.to_string(), None)])
+        };
+        let ask = |root: &Root, changes: &BTreeMap<String, Option<Vec<u8>>>| {
+            restoring(&root.cx(Mode::Hosted), &[], changes)
+        };
+        for (rc, fails) in [("", false), ("common --lockfile_mode=error\n", true)] {
+            let files = [(".bazelrc", rc), ("MODULE.bazel.lock", lock.as_str())];
+            let root = js(&files);
+            let found = ask(&root, &put("dep.lock", b"restored\n"));
+            assert_eq!(found.decision.builds_fail(), fails, "{rc:?}");
+            assert_eq!(found.decision.automatic_restore_allowed(), !fails);
+            let GateOutcome::ProceedAfter(plan, run) = &found.outcome else {
+                panic!("{rc:?}: {:?}", found.outcome);
+            };
+            assert!(plan.writes.is_empty() && run.actor == Actor::User);
+            assert_eq!(run.command, remedy::LOCK_REFRESH);
+            assert_eq!(run.interim == Interim::Failing, fails);
+            let (level, advisory) = found.advisory.expect("the command is named");
+            assert_eq!(advisory.code, Code::RedirectRunRequired);
+            assert_eq!(level == super::super::codes::Level::Warn, fails, "{rc:?}");
+            assert!(advisory.detail.contains(remedy::LOCK_REFRESH));
+            assert_eq!(advisory.detail.contains("Builds fail"), fails);
+            // A file no lock records, and the index, are no input.
+            let quiet = ask(&root, &put("other.lock", b"x\n"));
+            assert!(quiet.advisory.is_none(), "{:?}", quiet.advisory);
+            assert!(matches!(quiet.outcome, GateOutcome::Proceed(_)));
+        }
+
+        let mut root = js(&[]);
+        let digest = |input: &str| DerivedState::CrateLockDigest {
+            lockfile: "cargo-bazel-lock.json".to_string(),
+            input: input.to_string(),
+            hub: "crates".to_string(),
+            system: DeclSystem::Bzlmod,
+        };
+        let checksum = DerivedState::ChecksumValue {
+            file: "MODULE.bazel".to_string(),
+            key: "rack-2.2.8".to_string(),
+            input: "pnpm-lock.yaml".to_string(),
+        };
+        root.ws.hubs[0].derived = vec![digest("Cargo.toml"), checksum];
+        // Another gem's checksum is not this restore's, and the manifest
+        // is not written: nothing is stale.
+        let other = [("rack".to_string(), "3.0.0".to_string())];
+        let lock_only = put("pnpm-lock.yaml", b"upstream\n");
+        let found = restoring(&root.cx(Mode::Vendored), &other, &lock_only);
+        assert!(found.advisory.is_none(), "{:?}", found.advisory);
+        // The restored gem's own checksum is, and no command recomputes it.
+        let own = [("rack".to_string(), "2.2.8".to_string())];
+        let found = restoring(&root.cx(Mode::Vendored), &own, &lock_only);
+        assert!(found.decision.builds_fail());
+        assert!(matches!(found.outcome, GateOutcome::Proceed(_)));
+        assert_eq!(
+            found.advisory.map(|(_, said)| said.code),
+            Some(Code::VendorRunRequired)
+        );
+        // The crate lock digest: red under every mode, and the repin is named.
+        let found = ask(&root, &put("Cargo.toml", b"[package]\n"));
+        assert!(found.decision.builds_fail() && !found.decision.automatic_restore_allowed());
+        let GateOutcome::ProceedAfter(_, run) = &found.outcome else {
+            panic!("{:?}", found.outcome);
+        };
+        assert_eq!(run.kind, RunKind::Repin);
+        assert!(run.command.contains("CARGO_BAZEL_REPIN=1"), "{run:?}");
     }
 }

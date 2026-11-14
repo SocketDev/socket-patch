@@ -246,6 +246,14 @@ pub(super) async fn sweep(
     };
 
     let to_restore: Vec<HostedPin> = gone.iter().map(|(pin, _)| pin.clone()).collect();
+    // Nobody asked for this restore by name: under a Bazel root a pin
+    // whose restoring edit would fail every build is kept, and said so.
+    let lanes = &crate::bazel_gate::commands::PRODUCTION;
+    let (to_restore, kept) =
+        crate::bazel_gate::commands::automatic(common, to_restore, lanes).await;
+    for (code, detail) in kept {
+        out.warn(common, code, detail);
+    }
     let leg = crate::commands::hosted_unwind::run_hosted_leg(common, &to_restore).await;
     out.half_restored = leg.half_applied().map(str::to_string);
 
