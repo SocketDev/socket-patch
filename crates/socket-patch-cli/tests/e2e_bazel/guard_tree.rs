@@ -655,6 +655,13 @@ async fn a_workspace_scan_takes_no_project_from_a_bazel_tree() {
 /// the repository; a matched link is a tree like any other, left out
 /// with a note, and the projects beside it are scanned. A link the user
 /// named keeps the usage error.
+///
+/// Unix only: the convenience links are symbolic links here and
+/// junctions on Windows, and a test cannot make a junction without
+/// spawning `cmd` (`links.rs` has the same limit). The decision that
+/// changed is the same on every system and has its own case that needs
+/// no link: `a_glob_matched_bazel_tree_is_not_held_to_the_repository_bound`
+/// in `src/commands/scan/mod.rs`.
 #[cfg(unix)]
 #[tokio::test]
 async fn a_path_glob_leaves_out_the_convenience_links_it_matches() {

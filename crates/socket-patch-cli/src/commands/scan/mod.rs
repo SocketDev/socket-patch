@@ -945,6 +945,36 @@ fn partition_agent_selection(
     }
 }
 
+/// The `(purl, uuid)` of the patches an agent or report-only scan hands
+/// to no apply: the offers `skips` records for packages with no installed
+/// copy, and the `previewed` selection of a run that applies nothing. A
+/// vendor-owned package is the vendored mode's and is not among them.
+fn unapplied_records(
+    skips: &[PatchEvent],
+    previewed: &[PatchSearchResult],
+) -> Vec<(String, String)> {
+    let not_installed =
+        |event: &&PatchEvent| event.error_code.as_deref() == Some("package_not_installed");
+    let skipped = skips.iter().filter(not_installed);
+    let skipped = skipped.filter_map(|event| Some((event.purl.clone()?, event.uuid.clone()?)));
+    let previewed = previewed.iter().map(|p| (p.purl.clone(), p.uuid.clone()));
+    skipped.chain(previewed).collect()
+}
+
+/// Says what the Bazel build makes of the patches this scan gave to
+/// [`bazel_gate::agent::hold`](crate::bazel_gate::agent::hold) and no
+/// apply spoke for: one advisory, in the envelope of a `--json` run and
+/// on stderr otherwise (never under `--silent`, like the apply's own).
+/// Nothing where an apply took them, and nothing under no Bazel root.
+async fn warn_bazel_held(common: &GlobalArgs, env: Option<&mut Envelope>) {
+    let said = Box::pin(crate::bazel_gate::agent::held_advisory(common)).await;
+    match env {
+        Some(env) => env.warnings.extend(layout_warnings(&said)),
+        None if !common.silent => print_layout_refusals(&said, false),
+        None => {}
+    }
+}
+
 /// The ecosystems a scan crawls (`None`: every one). `--ecosystems`
 /// narrows everything the run counts, queries and shows to the named
 /// ecosystems, so without a GC the other crawlers' output would only be
@@ -1400,6 +1430,31 @@ fn leave_out_matched_bazel_trees(
     kept
 }
 
+/// The first directory of a PATH list that lies outside the repository
+/// root `repo_root`, which ends the scan with a usage error.
+///
+/// A directory that a glob matched in a tree Bazel owns (`trees`,
+/// [`matched_bazel_trees`]) is not held to the bound: a convenience link
+/// at a workspace root leads to an output base outside the checkout, and
+/// such a match is left out with a note like any other tree
+/// ([`leave_out_matched_bazel_trees`]). A directory the user named is
+/// never in `trees`, so a link they name keeps the error, and so does a
+/// match that is no tree. Paths are compared as paths: `trees` holds the
+/// directories as `dirs` spells them, and the bound is asked of the
+/// resolved directory.
+fn first_outside_repo<'a>(
+    dirs: &'a [(PathBuf, bool)],
+    trees: &HashSet<PathBuf>,
+    repo_root: &Path,
+) -> Option<&'a Path> {
+    let held = dirs.iter().filter(|(dir, _)| !trees.contains(dir));
+    let outside = |dir: &&'a Path| {
+        let resolved = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+        !resolved.starts_with(repo_root)
+    };
+    held.map(|(dir, _)| dir.as_path()).find(outside)
+}
+
 /// Refuse a scan whose scope root (`--cwd`, or `--global-prefix`) is in a
 /// tree Bazel owns, before anything there is read or crawled (design 3,
 /// HZ-02): what a scan found in an output base it would report as
@@ -1757,7 +1812,12 @@ fn scanned_ecosystems(purls: &[String]) -> Vec<String> {
 }
 
 pub async fn run(args: ScanArgs) -> i32 {
-    Box::pin(run_scan(args, None, true)).await
+    // One run of the Bazel layer for the whole command: the projects of
+    // the scan and the apply it ends with share one loader, and two scans
+    // in one process share nothing.
+    let bazel = crate::bazel_gate::RunCx::from(&args.common);
+    let scan = Box::pin(run_scan(args, None, true));
+    Box::pin(crate::bazel_gate::agent::in_run(bazel, scan)).await
 }
 
 /// The project directories a hosted or vendored scan's PATHs name: each
@@ -1857,20 +1917,17 @@ async fn run_project_dirs(
         matched_bazel_trees(&dirs).await
     };
     if !args.common.is_global() {
-        for (dir, _) in dirs.iter().filter(|(dir, _)| !trees.contains(dir)) {
-            let resolved = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.clone());
-            if !resolved.starts_with(&invocation.repo_root) {
-                return usage(
-                    "path_outside_repo",
-                    &format!(
-                        "`{}` is outside {} (the repository root socket.yml is read \
-                         from; without a trusted .git it is --cwd): run one scan per \
-                         repository, or pass --cwd at a common parent",
-                        dir.display(),
-                        invocation.repo_root.display()
-                    ),
-                );
-            }
+        if let Some(dir) = first_outside_repo(&dirs, &trees, &invocation.repo_root) {
+            return usage(
+                "path_outside_repo",
+                &format!(
+                    "`{}` is outside {} (the repository root socket.yml is read \
+                     from; without a trusted .git it is --cwd): run one scan per \
+                     repository, or pass --cwd at a common parent",
+                    dir.display(),
+                    invocation.repo_root.display()
+                ),
+            );
         }
     }
     if args.common.json && dirs.len() > 1 {
@@ -3236,7 +3293,7 @@ async fn scan_project(
             .await
             {
                 Ok(discovered) => {
-                    classified_rows(
+                    let rows = classified_rows(
                         &mut stage,
                         &discovered,
                         &recorded,
@@ -3244,6 +3301,15 @@ async fn scan_project(
                         &all_packages_with_patches,
                         Some(&mut env),
                     );
+                    // This run applies none of what it found.
+                    let split = partition_agent_selection(
+                        writers_of(&rows),
+                        &vendor_owned_purls,
+                        &lockfile_only,
+                    );
+                    let unapplied = unapplied_records(&split.skip_records, &split.kept);
+                    crate::bazel_gate::agent::hold(&args.common, unapplied);
+                    warn_bazel_held(&args.common, Some(&mut env)).await;
                 }
                 Err((code, message)) => {
                     emit_discovery_error_json(&mut env, &message);
@@ -3291,6 +3357,14 @@ async fn scan_project(
                 ..
             } = partition_agent_selection(writers_of(&rows), &vendor_owned_purls, &lockfile_only);
             let selected = plan_kept_rows(&mut stage, rows, kept);
+            // What Bazel makes of the patches this run hands to no apply
+            // (HZ-01): the ones with no installed copy, and the whole
+            // selection of a preview. `bazel_gate::agent` decides what is
+            // said: the apply below speaks for them with its own records,
+            // and what no apply took is said after it.
+            let previewed: &[PatchSearchResult] = if dry { &selected } else { &[] };
+            let unapplied = unapplied_records(&vendored_records, previewed);
+            crate::bazel_gate::agent::hold(&args.common, unapplied);
             for event in vendored_records {
                 env.record(event);
             }
@@ -3340,6 +3414,7 @@ async fn scan_project(
                     return apply_code;
                 }
             }
+            warn_bazel_held(&args.common, Some(&mut env)).await;
 
             // Cross-mode visibility: run-level warnings, never a status or
             // exit-code change.
@@ -3687,6 +3762,8 @@ async fn scan_project(
 
     // Agent flow (mirrors the JSON arm): vendor-owned and lockfile-only
     // purls leave the selection as skips. Vendored mode partitions nothing.
+    // The patches this run hands to no apply (see the JSON arm).
+    let mut unapplied: Vec<(String, String)> = Vec::new();
     let selected = if vendor {
         selected
     } else {
@@ -3701,6 +3778,7 @@ async fn scan_project(
                 println!("{}", render::not_installed_skip_line(&normalize_purl(purl)));
             }
         }
+        unapplied = unapplied_records(&split.skip_records, &[]);
         split.kept
     };
 
@@ -3750,6 +3828,21 @@ async fn scan_project(
                 "{}",
                 render::already_recorded_line(&normalize_purl(&p.purl), &p.uuid, reapply)
             );
+        }
+    }
+    // What Bazel makes of the patches no apply of this run speaks for
+    // (HZ-01). An apply runs below only for a wet agent run with something
+    // to apply; a preview, a report and a run that selected nothing hand
+    // it their whole selection, and say so here.
+    if !vendor {
+        let applies = reapply && !(selected.is_empty() && already_recorded.is_empty());
+        if !applies {
+            let listed = selected.iter().chain(&already_recorded);
+            unapplied.extend(listed.map(|p| (p.purl.clone(), p.uuid.clone())));
+        }
+        crate::bazel_gate::agent::hold(&args.common, unapplied);
+        if !applies {
+            warn_bazel_held(&args.common, None).await;
         }
     }
 
@@ -3966,6 +4059,8 @@ async fn scan_project(
         if !silent {
             print_coverage(&coverage, &patched_uuids(&outcome), false, verbose);
         }
+        // What the apply did not speak for: it ran over no record.
+        warn_bazel_held(&args.common, None).await;
         // A project run that recorded a patch has something to commit, and
         // a re-apply to wire up after every install.
         if code == 0 && !args.common.is_global() {
@@ -4024,6 +4119,59 @@ async fn scan_project(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ROUTED R-033, the decision itself, on every system (the CLI case
+    /// in `tests/e2e_bazel/guard_tree.rs` needs a symbolic link and runs
+    /// on Unix alone): a directory that a glob matched in a tree Bazel
+    /// owns is not held to the repository bound, so the scan goes on and
+    /// leaves it out with a note. A directory the user named, and a match
+    /// that is no tree, keep the usage error.
+    #[test]
+    fn a_glob_matched_bazel_tree_is_not_held_to_the_repository_bound() {
+        let tmp = tempfile::tempdir().expect("a temporary directory");
+        let real = std::fs::canonicalize(tmp.path()).expect("its real path");
+        // The checkout, and an output base beside it: what a convenience
+        // link at the workspace root leads to.
+        let (repo, base) = (real.join("ws"), real.join("base"));
+        let (api, web) = (repo.join("api"), repo.join("web"));
+        for dir in [&api, &web, &base] {
+            std::fs::create_dir_all(dir).expect("mkdir");
+        }
+        let named = |dir: &PathBuf| (dir.clone(), true);
+        let matched = |dir: &PathBuf| (dir.clone(), false);
+        let trees: HashSet<PathBuf> = HashSet::from([base.clone()]);
+        let none = HashSet::new();
+
+        // Projects inside the bound, however they were given.
+        let inside = [named(&api), matched(&web)];
+        assert_eq!(first_outside_repo(&inside, &none, &repo), None);
+        // A glob matched the tree outside the bound: it is exempt.
+        let with_tree = [named(&api), matched(&base), matched(&web)];
+        assert_eq!(first_outside_repo(&with_tree, &trees, &repo), None);
+        // The same match when nothing classified it as a tree.
+        let outside = Some(base.as_path());
+        assert_eq!(first_outside_repo(&with_tree, &none, &repo), outside);
+        // The user named it: `matched_bazel_trees` never returns a named
+        // directory, so it is held to the bound.
+        let by_name = [named(&api), named(&base)];
+        assert_eq!(first_outside_repo(&by_name, &none, &repo), outside);
+        // The exemption is of the directory that was classified, as the
+        // list spells it, and of no other.
+        let other = real.join("elsewhere");
+        std::fs::create_dir_all(&other).expect("mkdir");
+        let both = [matched(&base), matched(&other)];
+        assert_eq!(
+            first_outside_repo(&both, &trees, &repo),
+            Some(other.as_path())
+        );
+        // A directory that is gone resolves to itself.
+        let gone = [matched(&real.join("gone"))];
+        assert!(first_outside_repo(&gone, &none, &repo).is_some());
+        assert_eq!(
+            first_outside_repo(&[matched(&repo.join("gone"))], &none, &repo),
+            None
+        );
+    }
 
     /// A repository cache kept in the checkout is one tree per download:
     /// the note names the first few and counts the rest, on stderr and in

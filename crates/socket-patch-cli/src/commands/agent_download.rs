@@ -1473,9 +1473,10 @@ pub(crate) fn apply_key_covers(key: &str, record: &str) -> bool {
 /// the yarn PnP refusal, unavailable sources) — so a failed apply always
 /// leaves a `failed` event and the envelope's `partialFailure` agrees with
 /// exit 1. The apply's non-fatal warnings (`content_mismatch_overwritten`,
-/// #1004) join `env.warnings`: a JSON caller's nested apply is silent, so
-/// the envelope is their only channel. `None` (no apply ran) records
-/// nothing.
+/// #1004) join `env.warnings`, and the sidecar records it reports back
+/// (the Bazel repin hazards) join `env.sidecars`: a JSON caller's nested
+/// apply is silent, so the envelope is their only channel. `None` (no
+/// apply ran) records nothing.
 pub(crate) fn record_apply_outcome(
     env: &mut Envelope,
     recorded: &[(String, String)],
@@ -1496,6 +1497,9 @@ pub(crate) fn record_apply_outcome(
             env.warnings.push(warning.clone());
         }
     }
+    // The Bazel repin hazards of the jars the apply patched: a JSON
+    // caller's nested apply prints nothing, so this is their one channel.
+    env.sidecars.extend(report.sidecars.iter().cloned());
     let mut failed_any = false;
     for (purl, uuid) in recorded {
         if let Some(failure) = report
@@ -2034,5 +2038,45 @@ mod tests {
             elsewhere[1],
             "  1. Commit ops/patches/ to keep the patches."
         );
+    }
+
+    /// The sidecar records a nested apply reports back (the Bazel repin
+    /// hazard of a jar it patched) reach the caller's envelope, whatever
+    /// the apply's exit code: under `--json` nothing else carries them.
+    #[test]
+    fn the_sidecar_records_of_a_nested_apply_join_the_callers_envelope() {
+        use socket_patch_core::patch::sidecars::{
+            SidecarAdvisory, SidecarAdvisoryCode, SidecarRecord, SidecarSeverity,
+        };
+        let purl = "pkg:maven/com.google.code.gson/gson@2.10.1";
+        let hazard = SidecarRecord {
+            purl: purl.to_string(),
+            ecosystem: "maven".to_string(),
+            files: Vec::new(),
+            advisory: Some(SidecarAdvisory {
+                code: SidecarAdvisoryCode::BazelAgentCoursierPinHazard,
+                severity: SidecarSeverity::Warning,
+                message: "do not repin from this cache".to_string(),
+            }),
+        };
+        let recorded = [(purl.to_string(), "uuid".to_string())];
+        for code in [0, 1] {
+            let report = ApplyRunReport {
+                code,
+                applied: vec![purl.to_string()],
+                sidecars: vec![hazard.clone()],
+                ..ApplyRunReport::default()
+            };
+            let mut env = Envelope::new(EnvelopeCommand::Scan);
+            record_apply_outcome(&mut env, &recorded, Some(&report), |_| None);
+            assert_eq!(env.sidecars, [hazard.clone()], "exit {code}");
+            let printed = env.to_value();
+            let code = &printed["sidecars"][0]["advisory"]["code"];
+            assert_eq!(code, "bazel_agent_coursier_pin_hazard");
+        }
+        // No apply ran: nothing to carry.
+        let mut env = Envelope::new(EnvelopeCommand::Get);
+        record_apply_outcome(&mut env, &recorded, None, |_| None);
+        assert!(env.sidecars.is_empty());
     }
 }
