@@ -101,7 +101,7 @@ use super::model::{
     Anchor, AttestBasis, BazelRef, BazelWorkspace, FileText, FileView, Governance, HookKind, Hub,
     HubId, Index, IndexRow, LaneCx, LaneId, LaneOps, LaneSpec, LaneTable, Mode, OwnedWrite,
     PatchRequest, Plan, PlannedWrite, Probe, Reason, Refusal, Ruleset, RunPolicy, Site,
-    VexWithhold, WithholdKind,
+    StaleBehaviour, VexWithhold, WithholdKind,
 };
 use super::owned_index::{
     self, BzlRow, FileRow, HookRow, LabelStrategy, Parsed, RcFlag, RcFlagRow, SegmentRow,
@@ -301,6 +301,74 @@ impl Consumed {
                 ..
             }
         )
+    }
+}
+
+/// What a verdict says of a patch that a pin or a row of the owned index
+/// holds (revision 4, architecture 8.7): the `state` an audit prints, and
+/// what `apply --check` fails on. Decided here, from the kind and the
+/// token of a withhold, so that no caller matches on either.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Held {
+    /// The build takes the patch through a pin that passes its proof.
+    Consumed,
+    /// The pin is written and its one command has left no evidence yet.
+    RunPending,
+    /// The wiring is for another version than the lock pins now: the
+    /// user bumped the package and has not run socket-patch since.
+    Stale,
+    /// What was written no longer stands: a pin erased or changed, an
+    /// owned file missing or edited, a hook gone, a bypass, a digest
+    /// nothing anchors.
+    Drift,
+    /// Nothing proves that the build takes the patch, and nothing says it
+    /// was ever wired: no lane can tell, or no hub builds the package.
+    NotConsumed,
+}
+
+impl Held {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Consumed => "consumed",
+            Self::RunPending => "run_pending",
+            Self::Stale => "stale",
+            Self::Drift => "drift",
+            Self::NotConsumed => "not_consumed",
+        }
+    }
+
+    /// The state a verdict of [`Attest::consumer`] is. "Cannot tell" is
+    /// never drift: a withhold for an undetermined consumer says nothing
+    /// about what was written. Of the stale states only the version bump
+    /// is [`Self::Stale`]: a derived value or an owned file that disagrees
+    /// with its record is wiring that was changed, whatever version the
+    /// lock pins.
+    pub fn of(verdict: &Result<Consumed, VexWithhold>) -> Self {
+        let why = match verdict {
+            Ok(Consumed::AsToday) => return Self::NotConsumed,
+            Ok(Consumed::ByBazel { .. }) => return Self::Consumed,
+            Err(why) => why,
+        };
+        match (why.kind, why.token) {
+            (WithholdKind::ConsumerUndetermined, _) => Self::NotConsumed,
+            (WithholdKind::RunPending, _) => Self::RunPending,
+            (WithholdKind::DerivedStale, Some(STALE_OVERRIDE)) => Self::Stale,
+            _ => Self::Drift,
+        }
+    }
+
+    /// Whether `apply --check` exits non-zero for the state, for wiring a
+    /// lane with the staleness behaviour `stale` wrote (owner decision
+    /// O53, defaulted). Drift always does. A stale row does only where
+    /// the leftover fails the build: under an inert lane the build is
+    /// green on the version the user asked for, and a routine bump must
+    /// not turn the check red.
+    pub const fn fails_check(self, stale: StaleBehaviour) -> bool {
+        match self {
+            Self::Drift => true,
+            Self::Stale => matches!(stale, StaleBehaviour::FailsAttributed),
+            Self::Consumed | Self::RunPending | Self::NotConsumed => false,
+        }
     }
 }
 
@@ -3771,5 +3839,45 @@ mod tests {
         let nested_roots = Err((ConsumerUndetermined, Some("nested_bazel_roots")));
         assert_eq!(verdict(GSON, nested), nested_roots);
         assert_eq!(verdict(LEFT_PAD, nested), Ok(Consumed::AsToday));
+    }
+
+    /// The state of a held patch, for every kind of withhold: cannot-tell
+    /// is never drift, only the version bump is stale, and the check
+    /// fails on drift always and on a stale row only where the lane's
+    /// leftover fails the build (owner decision O53).
+    #[test]
+    fn a_verdict_is_one_state_and_only_drift_always_fails_the_check() {
+        let by_bazel = Consumed::ByBazel {
+            lane: LaneId("H-TOY1"),
+            mode: Mode::Hosted,
+            basis: AttestBasis::LockUrl,
+        };
+        assert_eq!(Held::of(&Ok(by_bazel)), Held::Consumed);
+        assert_eq!(Held::of(&Ok(Consumed::AsToday)), Held::NotConsumed);
+        for kind in WithholdKind::ALL {
+            for token in [None, Some(STALE_OVERRIDE), Some(HOOK_MISSING)] {
+                let state = Held::of(&Err(withheld(*kind, token, "why")));
+                let expected = match (kind, token) {
+                    (WithholdKind::ConsumerUndetermined, _) => Held::NotConsumed,
+                    (WithholdKind::RunPending, _) => Held::RunPending,
+                    (WithholdKind::DerivedStale, Some(STALE_OVERRIDE)) => Held::Stale,
+                    _ => Held::Drift,
+                };
+                assert_eq!(state, expected, "{kind:?} {token:?}");
+            }
+        }
+        let states = [
+            (Held::Consumed, "consumed", false, false),
+            (Held::RunPending, "run_pending", false, false),
+            (Held::Stale, "stale", false, true),
+            (Held::Drift, "drift", true, true),
+            (Held::NotConsumed, "not_consumed", false, false),
+        ];
+        for (state, word, inert, attributed) in states {
+            assert_eq!(state.as_str(), word);
+            assert_eq!(state.fails_check(StaleBehaviour::Inert), inert, "{word}");
+            let fails = state.fails_check(StaleBehaviour::FailsAttributed);
+            assert_eq!(fails, attributed, "{word}");
+        }
     }
 }

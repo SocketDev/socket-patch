@@ -449,6 +449,9 @@ fn a_rollback_into_an_output_base_is_refused_and_restores_nothing() {
             (&Value::from("failed"), &Value::from(PURL)),
             "{stdout}"
         );
+        // Under the code of the refusal, not the generic failure.
+        let refusal = Code::AgentOutputTree.as_str();
+        assert_eq!(failed["errorCode"], refusal, "{stdout}");
         let message = failed["error"].as_str().unwrap_or_default();
         assert!(message.starts_with("Refusing to roll back "), "{stdout}");
         assert!(message.contains(BAZEL_TREE_REFUSAL_MARKER), "{stdout}");

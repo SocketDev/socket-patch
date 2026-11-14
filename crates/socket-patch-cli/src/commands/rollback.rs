@@ -729,6 +729,13 @@ fn verify_rollback_status_camel(status: &VerifyRollbackStatus) -> &'static str {
 /// verify status, else the generic `rollback_failed` (a write error, a
 /// local-go redirect that could not be dropped).
 fn rollback_failure_code(result: &RollbackResult) -> &'static str {
+    use socket_patch_core::patch::shared_store::BAZEL_TREE_REFUSAL_MARKER;
+    // A copy inside a tree Bazel owns is refused whole, under the code of
+    // that refusal.
+    let in_bazel_tree = |why: &String| why.contains(BAZEL_TREE_REFUSAL_MARKER);
+    if !result.success && result.error.as_ref().is_some_and(in_bazel_tree) {
+        return socket_patch_core::bazel::codes::Code::AgentOutputTree.as_str();
+    }
     result
         .files_verified
         .iter()
@@ -1482,6 +1489,16 @@ const PROJECTS_NOT_ROLLED_BACK: &str = "projects_not_rolled_back";
 pub async fn run(args: RollbackArgs) -> i32 {
     use crate::commands::projects_below::{self, Depth, Work};
     apply_env_toggles(&args.common);
+    // Nothing in a tree Bazel owns is rolled back (owner decision O16):
+    // refused before a manifest, a ledger or a lockfile is read.
+    let refused = crate::bazel_gate::scope::refuse_in_bazel_tree(
+        &args.common,
+        EnvelopeCommand::Rollback,
+        "roll back",
+    );
+    if let Some(code) = refused.await {
+        return code;
+    }
     let loud = !args.common.json && !args.common.silent;
     if !args.targets.is_empty() {
         // A target names a patch of one project, so the run stays the
@@ -2375,7 +2392,40 @@ async fn run_project(args: RollbackArgs, below: BelowNotes) -> i32 {
                 .filter(|pin| hosted_scope.contains(&pin.purl))
                 .cloned()
                 .collect();
-            let hosted_leg = run_hosted_leg(&args.common, &in_scope).await;
+            let mut hosted_leg = run_hosted_leg(&args.common, &in_scope).await;
+            // What the owned index of a Bazel root records for the manifest
+            // records in scope, whatever lane wrote it, is undone with
+            // them (`--preserve-state` included: the wiring is derived
+            // state). A hosted pin's rows went with its pin and a vendored
+            // entry's go with its entry; a record whose in-place restore
+            // failed, or was never started, keeps its rows. A record whose
+            // rows stand fails the run and stays in the manifest.
+            let own_rows = |(purl, uuid): &(String, String)| {
+                !aborted
+                    && !in_scope.iter().any(|pin| pin.uuid == *uuid)
+                    && !vendored_excluded.contains(purl)
+                    && !results.iter().any(|r| !r.success && r.package_key == *purl)
+            };
+            let row_records: Vec<(String, String)> = manifest_scope
+                .iter()
+                .filter_map(|purl| Some((purl.clone(), manifest.patches.get(purl)?.uuid.clone())))
+                .filter(own_rows)
+                .collect();
+            let lanes = &crate::bazel_gate::commands::PRODUCTION;
+            let bazel_rows =
+                crate::bazel_gate::commands::undo_rows(&args.common, &row_records, true, lanes)
+                    .await;
+            hosted_leg.failed.extend(bazel_rows.kept.iter().cloned());
+            if args.common.json {
+                hosted_leg
+                    .warnings
+                    .extend(bazel_rows.warnings.iter().cloned());
+            } else {
+                // Errors print even under --silent: this drives exit 1.
+                for (_, why) in &bazel_rows.kept {
+                    eprintln!("Error: {}", crate::ui::sentence_case(why));
+                }
+            }
             // An unscoped rollback promises to unwind EVERY hosted patch:
             // contested wiring it cannot restore fails the leg (a scoped run
             // names its own targets and leaves unrelated wiring alone).
@@ -2437,7 +2487,7 @@ async fn run_project(args: RollbackArgs, below: BelowNotes) -> i32 {
             let mut removable: Vec<String> = manifest_scope
                 .iter()
                 .filter(|purl| {
-                    if failed_purls.contains(*purl) {
+                    if failed_purls.contains(*purl) || bazel_rows.holds(purl) {
                         return false;
                     }
                     if !project_state && purl_keys_cover(&project_vendored_keys, purl) {
@@ -2694,7 +2744,7 @@ async fn run_project(args: RollbackArgs, below: BelowNotes) -> i32 {
                     run_warnings.push(("gc_skipped".into(), format!("artifact GC skipped: {why}")));
                 }
                 run_warnings.extend(commit_recovery.map(|w| (w.code, w.detail)));
-                let env = build_rollback_envelope(&RollbackReport {
+                let mut env = build_rollback_envelope(&RollbackReport {
                     dry_run: args.common.dry_run,
                     success,
                     manifest: &manifest,
@@ -2717,6 +2767,7 @@ async fn run_project(args: RollbackArgs, below: BelowNotes) -> i32 {
                     warnings: &run_warnings,
                     paths: path_scope.raw(),
                 });
+                bazel_rows.mark(&mut env);
                 println!("{}", env.to_pretty_json());
             } else if !args.common.silent && results.is_empty() {
                 print_project_owned(&args.common, &vendored_excluded);

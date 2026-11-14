@@ -611,6 +611,11 @@ async fn list_project(args: &ListArgs) -> Listed {
     if args.common.json {
         let mut env = build_list_envelope(&entries);
         env.warnings = warnings;
+        // What the Bazel build makes of each pin (`details.bazel`), for a
+        // package a ruleset builds. Read-only, and a listing is never
+        // refused for where it runs.
+        let lanes = &crate::bazel_gate::commands::PRODUCTION;
+        crate::bazel_gate::commands::list(&args.common, &mut env, vendor_state, lanes).await;
         listed.envelope = Some(env);
     } else if args.common.silent {
         // `--silent` is "errors only" (CLI_CONTRACT.md).

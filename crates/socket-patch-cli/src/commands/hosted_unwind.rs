@@ -130,9 +130,7 @@ async fn refresh_restored_gems(
 /// ledger, so each pin's lock entry is re-resolved from the registry, and a
 /// pin that cannot be is refused with the `git checkout` remedy.
 pub(crate) async fn run_hosted_leg(common: &GlobalArgs, pins: &[HostedPin]) -> HostedLegOutcome {
-    use socket_patch_core::patch::redirect::upstream::{
-        restore_upstream, PinStatus, RestoreOptions,
-    };
+    use socket_patch_core::patch::redirect::upstream::{PinStatus, RestoreOptions};
     // The pins are the manifest's project's: restore them there.
     let rooted = common.at_project_root();
     let common: &GlobalArgs = &rooted;
@@ -172,7 +170,12 @@ pub(crate) async fn run_hosted_leg(common: &GlobalArgs, pins: &[HostedPin]) -> H
     } else {
         socket_patch_core::vendor::bun_lock::live_user_patch_keys(&common.cwd).await
     };
-    let outcome = restore_upstream(&common.cwd, pins, &opts).await;
+    // Under a Bazel root the pins are restored together with what the
+    // root's owned index records for them (a lock only Bazel reads, a
+    // value derived from a lock), and the run names the command that
+    // refreshes what Bazel derived. Elsewhere this is `restore_upstream`.
+    let lanes = &crate::bazel_gate::commands::PRODUCTION;
+    let outcome = crate::bazel_gate::commands::restore(common, pins, &opts, lanes).await;
     for pin in &outcome.pins {
         match &pin.status {
             PinStatus::Restored => {

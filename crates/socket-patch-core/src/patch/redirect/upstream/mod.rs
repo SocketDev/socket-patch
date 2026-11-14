@@ -577,6 +577,12 @@ pub struct RestoreOutcome {
     /// the flush writes, and under a Bazel root what the commit there
     /// lands ([`Self::commit_pending`]).
     pub staged_bytes: BTreeMap<String, Vec<u8>>,
+    /// What the restore read at each path of [`Self::staged_text`] while
+    /// it resolved the pins (`None`: no file there); no entry for a path
+    /// it wrote without reading. A caller that lands the staged text
+    /// itself ([`Self::commit_pending`]) holds the disk to these bytes
+    /// before its first replace, so an edit made meanwhile is kept.
+    pub staged_from: BTreeMap<String, Option<String>>,
     /// Why the restored files were not written, after every pin resolved:
     /// a file the flush must not or cannot write (a symbolic link, an
     /// unwritable directory, an edit since it was read), which a dry run
@@ -1202,6 +1208,8 @@ async fn restore(
     result.warnings.extend(incomplete);
 
     let changed = view.changed();
+    let read = |rel: &String| Some((rel.clone(), view.originals.get(rel)?.clone()));
+    let staged_from = changed.keys().filter_map(read).collect();
     let changed_bytes = view.changed_bytes();
     let mut reverted_files: BTreeSet<String> = changed
         .keys()
@@ -1279,6 +1287,7 @@ async fn restore(
             true => outside,
             false => Vec::new(),
         },
+        staged_from,
         flush_error,
         half_applied,
         bazel: undo,

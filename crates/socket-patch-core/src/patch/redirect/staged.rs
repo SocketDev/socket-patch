@@ -452,6 +452,21 @@ mod tests {
     #[tokio::test]
     async fn the_three_file_restore_lands_whole() {
         let tmp = maven_project();
+        // A plan names, for each file it changes, the text it was worked
+        // out from: what a caller that lands the plan itself compares the
+        // disk with.
+        let before = tree(tmp.path());
+        let planned = restore(tmp.path(), true).await;
+        let read: BTreeMap<String, String> = planned
+            .staged_from
+            .iter()
+            .filter_map(|(rel, text)| Some((rel.clone(), text.clone()?)))
+            .collect();
+        assert_eq!(read, before);
+        assert_eq!(
+            planned.staged_from.keys().collect::<Vec<_>>(),
+            planned.staged_text.keys().collect::<Vec<_>>()
+        );
         let outcome = restore(tmp.path(), false).await;
         assert_eq!(outcome.flush_error, None);
         assert_eq!(outcome.restored().count(), 1);

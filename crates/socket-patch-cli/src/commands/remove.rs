@@ -316,6 +316,13 @@ pub struct RemoveArgs {
 
 pub async fn run(args: RemoveArgs) -> i32 {
     apply_env_toggles(&args.common);
+    // Nothing in a tree Bazel owns is removed (owner decision O16): refused
+    // before a manifest, a ledger or a lockfile is read.
+    let refused =
+        crate::bazel_gate::scope::refuse_in_bazel_tree(&args.common, Command::Remove, "remove");
+    if let Some(code) = refused.await {
+        return code;
+    }
     // The shared target grammar: a UUID, a purl (versioned or not) or an
     // exact package name. Every store below matches through it.
     let target = Target::parse(&args.identifier);
@@ -966,6 +973,35 @@ pub async fn run(args: RemoveArgs) -> i32 {
         }
     }
 
+    // ── Bazel rows ──────────────────────────────────────────────────────
+    // What the owned index of a Bazel root records for the matching
+    // records, whatever lane wrote it, is undone with them. A hosted pin's
+    // rows went with its pin and a vendored entry's with its entry. A
+    // record leaves the manifest only when every row of its patch was
+    // undone, so one whose rows stand (or would be left by
+    // `--skip-rollback`) fails the remove before the manifest is touched.
+    let own_rows = |(purl, uuid): &(String, String)| {
+        !hosted_pins.iter().any(|pin| pin.uuid == *uuid)
+            && !vendored_matches.iter().any(|(k, e)| e.covers_purl(k, purl))
+    };
+    let row_records: Vec<(String, String)> = matching
+        .iter()
+        .map(|(purl, record)| ((*purl).clone(), record.uuid.clone()))
+        .filter(own_rows)
+        .collect();
+    let lanes = &crate::bazel_gate::commands::PRODUCTION;
+    let revert = !args.skip_rollback;
+    let bazel_rows =
+        crate::bazel_gate::commands::undo_rows(&args.common, &row_records, revert, lanes).await;
+    if let Some((_, why)) = bazel_rows.kept.first() {
+        let code = socket_patch_core::bazel::codes::Code::RedirectRevertIncomplete.as_str();
+        let msg = format!("{why}. The manifest was not modified.");
+        emit_error_envelope(args.common.json, args.common.dry_run, code, msg);
+        return 1;
+    }
+    print_run_warnings(&args.common, &bazel_rows.warnings);
+    hosted_leg_warnings.extend(bazel_rows.warnings.iter().cloned());
+
     // ── manifest mutation ───────────────────────────────────────────────
     // Drift-kept vendored purls are EXCLUDED from the removal (dropping a
     // record whose vendored state survives would hand `vendor`'s reconcile
@@ -1292,6 +1328,7 @@ pub async fn run(args: RemoveArgs) -> i32 {
         if !vendor_leg.kept.is_empty() {
             env.status = Status::PartialFailure;
         }
+        bazel_rows.mark(&mut env);
         crate::ui::print_json(&env.to_value());
     }
 
