@@ -571,6 +571,12 @@ pub struct RestoreOutcome {
     /// would, on a dry run); `None` for a file it removed. Lets a caller
     /// evaluate the restored project before anything is written.
     pub staged_text: BTreeMap<String, Option<String>>,
+    /// The new bytes of each root-relative binary file the restore rewrote
+    /// (or would, on a dry run): a `bun.lockb` rebuilt under
+    /// [`RestoreOptions::bun_lockb`]. Like [`Self::staged_text`] it is what
+    /// the flush writes, and under a Bazel root what the commit there
+    /// lands ([`Self::commit_pending`]).
+    pub staged_bytes: BTreeMap<String, Vec<u8>>,
     /// Why the restored files were not written, after every pin resolved:
     /// a file the flush must not or cannot write (a symbolic link, an
     /// unwritable directory, an edit since it was read), which a dry run
@@ -586,18 +592,36 @@ pub struct RestoreOutcome {
     /// The Bazel side of the restore ([`restore_upstream_under_bazel`]):
     /// what the owned index of the Bazel root records for the pins, and
     /// the change set that undoes it, by path relative to that root.
+    /// When that change set is not empty it is the whole restore: the
+    /// files of [`Self::staged_text`] and [`Self::staged_bytes`] are in
+    /// it, re-based to the Bazel root, as the lanes' restores left them
+    /// ([`Self::outside_bazel_root`] names the ones that are not).
     /// `None` from [`restore_upstream`].
     pub bazel: Option<bazel::Undo>,
+    /// The files of [`Self::staged_text`] and [`Self::staged_bytes`], by
+    /// their key there, that a pending commit at the Bazel root cannot
+    /// name: an absolute path (the settings of a pnpm workspace root
+    /// above the project) or one above the Bazel root. They are in no
+    /// change set and were not written here. The caller that lands the
+    /// commit decides them: it writes them beside the commit, or refuses
+    /// the restore. Empty unless [`Self::commit_pending`].
+    pub outside_bazel_root: Vec<String>,
 }
 
 impl RestoreOutcome {
     /// Whether the restore is planned and not written, on a wet run too:
-    /// the Bazel side has changes to land, and they go in one commit
-    /// anchored at the Bazel root together with [`Self::staged_text`]
-    /// ([`restore_upstream_under_bazel`]).
+    /// the Bazel side has changes to land, and the caller lands the change
+    /// set of [`Self::bazel`], which holds both sides, in one commit
+    /// anchored at the Bazel root ([`restore_upstream_under_bazel`]).
+    ///
+    /// Never with a [`Self::flush_error`]: a restore whose native files
+    /// must not or cannot be written has nothing to land. Its pins are
+    /// [`PinStatus::Unwritten`] and the change set of [`Self::bazel`] is
+    /// empty, so that no caller commits the Bazel side beside native
+    /// files that stay as they were.
     pub fn commit_pending(&self) -> bool {
         let undo = self.bazel.as_ref();
-        undo.is_some_and(|undo| !undo.changes.is_empty())
+        self.flush_error.is_none() && undo.is_some_and(|undo| !undo.changes.is_empty())
     }
 
     pub fn restored(&self) -> impl Iterator<Item = &PinResult> {
@@ -1000,23 +1024,34 @@ pub async fn restore_upstream(
 /// the paired manifest) are restored by the native restorers, as they are
 /// without Bazel. What the owned index records for it (a value in a file
 /// only Bazel's rulesets read) is undone offline by the row's lane
-/// ([`bazel::revert`]), and such a file is kept from every restorer that
-/// knows it by its name. A pin is restored on both sides or on neither: a
-/// patch whose rows cannot all be undone is refused before a registry is
-/// asked, naming the files in its way
-/// (`redirect_bazel_revert_incomplete`), and the Bazel side of a pin the
-/// native restorers refuse is planned again without it.
+/// ([`bazel::revert_over`]), and such a file is kept from every restorer
+/// that knows it by its name.
+///
+/// The native side is planned first and the Bazel side over it: a lane's
+/// restore reads the native files as the restorers staged them, so a
+/// value it derives from a native lock (a hash line over a
+/// `pnpm-lock.yaml`) lands on the value of the restored lock and never on
+/// the one that was recorded. A pin is restored on both sides or on
+/// neither. A pin the native restorers refuse is refused, and both sides
+/// are planned again without it. A patch whose rows cannot all be undone
+/// is refused too, naming the files in its way
+/// (`redirect_bazel_revert_incomplete`), and both sides are planned again
+/// without it.
 ///
 /// The Bazel side is anchored at the Bazel root, and nothing under a
 /// root's owned directory is written but through the commit anchored
 /// there, under the root's lock. So when the Bazel side has anything to
 /// land ([`RestoreOutcome::commit_pending`]) **nothing is written here,
-/// on a wet run as on a dry one**: the caller lands
-/// [`RestoreOutcome::staged_text`] and the change set of
-/// [`RestoreOutcome::bazel`] in that one commit, so that no build ever
-/// sees a lock at upstream beside a derived value that still names the
-/// patch. Without such changes the native files are flushed as
-/// [`restore_upstream`] flushes them.
+/// on a wet run as on a dry one**. The caller lands one change set in
+/// that one commit: [`bazel::Undo::changes`] of
+/// [`RestoreOutcome::bazel`], by path relative to the Bazel root. It
+/// holds both sides, the text files of [`RestoreOutcome::staged_text`]
+/// and the binary files of [`RestoreOutcome::staged_bytes`] included, so
+/// that no build ever sees a lock at upstream beside a derived value that
+/// still names the patch. A native file the Bazel root cannot name (one
+/// outside it) is in no change set: [`RestoreOutcome::outside_bazel_root`]
+/// lists those. Without changes of the Bazel side the native files are
+/// flushed as [`restore_upstream`] flushes them.
 pub async fn restore_upstream_under_bazel(
     root: &Path,
     pins: &[HostedPin],
@@ -1035,6 +1070,19 @@ fn below_root(root: &bazel::Root<'_>) -> String {
     }
 }
 
+/// A file the native restorers staged, by its path from the Bazel root:
+/// `rel` is relative to the project at `project_rel`, and may climb out
+/// of it. `None` for a file the commit at the Bazel root cannot name: an
+/// absolute path (the restorers name the settings of a pnpm workspace
+/// root above the project that way) or one that climbs above the root.
+fn at_bazel_root(project_rel: &str, rel: &str) -> Option<String> {
+    use crate::utils::relpath::{is_anchored, resolve_rel};
+    if is_anchored(rel) {
+        return None;
+    }
+    resolve_rel(project_rel, rel, 0).filter(|path| !path.is_empty())
+}
+
 async fn restore(
     root: &Path,
     pins: &[HostedPin],
@@ -1048,25 +1096,55 @@ async fn restore(
         origins: &opts.patch_server_origins,
         bun_lockb: opts.bun_lockb,
     };
+    // The files the owned index records, by patch: the Bazel side's,
+    // whatever a file is called. Read from the rows, so that the claim
+    // holds before any undo is planned.
+    let recorded = bazel.map(bazel::recorded);
 
     // Pins refused so far (uuid → reason). Each pass restores the pins not
     // yet refused over a FRESH view; a pass that refuses a new pin is rerun
     // without it, so the final view restores exactly the surviving set.
     let mut refused: BTreeMap<String, String> = BTreeMap::new();
     let mut incomplete: Vec<(&'static str, String)> = Vec::new();
-    let (mut view, mut result, undo) = loop {
+    let (mut view, mut result, undo, outside) = loop {
         let active: Vec<&HostedPin> = pins
             .iter()
             .filter(|p| !refused.contains_key(&p.uuid))
             .collect();
-        // The Bazel side first: it is planned in memory, over the pins
-        // that are still to be restored, so the change set never holds
-        // the undo of a pin a later pass refused.
+        let mut grew = false;
+        // The native side first: the Bazel side is planned over what it
+        // stages.
+        let mut view = View::new(root);
+        let claimed = recorded.as_ref().zip(below.as_deref());
+        let mut result = restore_pass(&mut view, &active, &ctx, claimed).await;
+        for (uuid, why) in &result.refused {
+            if !refused.contains_key(uuid) {
+                refused.insert(uuid.clone(), why.clone());
+                grew = true;
+            }
+        }
+        if grew {
+            continue;
+        }
+        // The Bazel side, in memory, over the pins that are still to be
+        // restored and over the native files as this pass staged them: the
+        // change set never holds the undo of a pin a pass refused.
+        let mut outside: Vec<String> = Vec::new();
         let undo = bazel.map(|root| {
             let uuids: Vec<&str> = active.iter().map(|pin| pin.uuid.as_str()).collect();
-            bazel::revert(root, &uuids)
+            let text = view.changed().into_iter();
+            let text = text.map(|(rel, text)| (rel, text.map(String::into_bytes)));
+            let binary = view.changed_bytes().into_iter();
+            let binary = binary.map(|(rel, bytes)| (rel, Some(bytes)));
+            let mut staged: BTreeMap<String, Option<Vec<u8>>> = BTreeMap::new();
+            for (rel, bytes) in text.chain(binary) {
+                match at_bazel_root(&root.ws.root.project_rel, &rel) {
+                    Some(path) => drop(staged.insert(path, bytes)),
+                    None => outside.push(rel),
+                }
+            }
+            bazel::revert_over(root, &uuids, &staged)
         });
-        let mut grew = false;
         for pin in &active {
             let stuck = undo.as_ref().and_then(|undo| undo.incomplete(&pin.uuid));
             let Some((files, why)) = stuck else { continue };
@@ -1091,14 +1169,12 @@ async fn restore(
         if grew {
             continue;
         }
-        let mut view = View::new(root);
-        let claimed = undo.as_ref().zip(below.as_deref());
-        let result = restore_pass(&mut view, &active, &ctx, claimed).await;
-        for (uuid, why) in &result.refused {
-            if !refused.contains_key(uuid) {
-                refused.insert(uuid.clone(), why.clone());
-                grew = true;
-            }
+        // A pin the index records is wired there, whichever of its files
+        // discovery named: its rows were undone, so it is not "wiring
+        // nothing here can unwind".
+        if let Some(undo) = &undo {
+            let restored = active.iter().filter(|pin| undo.restored(&pin.uuid));
+            result.handled.extend(restored.map(|pin| pin.uuid.clone()));
         }
         // A pin no restorer claimed has wiring nothing here can unwind.
         for pin in &active {
@@ -1120,7 +1196,7 @@ async fn restore(
             }
         }
         if !grew {
-            break (view, result, undo);
+            break (view, result, undo, outside);
         }
     };
     result.warnings.extend(incomplete);
@@ -1151,6 +1227,16 @@ async fn restore(
                 Err(failed) => (Some(failed.message), failed.left),
             },
         };
+    // A restore whose native files may not be written lands nothing of
+    // the Bazel side either: the change set is withdrawn, so that no
+    // commit puts a derived value at upstream beside a lock that still
+    // names the patch.
+    let undo = match (undo, bazel) {
+        (Some(undo), Some(root)) if flush_error.is_some() && !undo.changes.is_empty() => {
+            Some(bazel::revert(root, &[]))
+        }
+        (undo, _) => undo,
+    };
 
     let mut pins_out = Vec::with_capacity(pins.len());
     for pin in pins {
@@ -1159,9 +1245,8 @@ async fn restore(
                 // A refused pin is refused on both sides, so its remedy
                 // names the files the owned index records for it too.
                 let mut files = remedy_files(&mut view, pin).await;
-                let rows = bazel.iter().flat_map(|root| &root.index.pins);
-                let recorded = rows.filter(|row| row.uuid == pin.uuid);
-                for file in recorded.filter_map(|row| row.file.strip_prefix(below)) {
+                let rows = recorded.iter().filter_map(|by| by.get(&pin.uuid)).flatten();
+                for file in rows.filter_map(|file| file.strip_prefix(below)) {
                     if !files.iter().any(|known| known == file) {
                         files.push(file.to_string());
                     }
@@ -1188,27 +1273,34 @@ async fn restore(
         reverted_files: reverted_files.into_iter().collect(),
         warnings: result.warnings,
         staged_text: changed,
+        staged_bytes: changed_bytes,
+        // Said only of a commit that is to be landed.
+        outside_bazel_root: match flush_error.is_none() && commit_pending {
+            true => outside,
+            false => Vec::new(),
+        },
         flush_error,
         half_applied,
         bazel: undo,
     }
 }
 
-/// One restore pass over `view` for the `active` pins. `claimed` is the
-/// Bazel side of the pass, with the project's prefix below the Bazel
-/// root: a file the owned index records for a pin is that side's
-/// ([`Format::BazelIndex`]), whatever its name, and a pin whose rows were
-/// all undone is restored there.
+/// One restore pass over `view` for the `active` pins. `claimed` is what
+/// the owned index of the Bazel root records, by patch, with the
+/// project's prefix below the Bazel root: a file the index records for a
+/// pin is the Bazel side's ([`Format::BazelIndex`]), whatever its name,
+/// and is left to the undo the driver plans after the pass.
 async fn restore_pass(
     view: &mut View<'_>,
     active: &[&HostedPin],
     ctx: &Ctx<'_>,
-    claimed: Option<(&bazel::Undo, &str)>,
+    claimed: Option<(&BTreeMap<String, Vec<String>>, &str)>,
 ) -> FormatResult {
     let format_in = |pin: &HostedPin, file: &str| {
-        let recorded = claimed.is_some_and(|(undo, below)| {
+        let recorded = claimed.is_some_and(|(recorded, below)| {
             let at_root = format!("{below}{file}");
-            undo.recorded(&pin.uuid).contains(&at_root)
+            let files = recorded.get(&pin.uuid);
+            files.is_some_and(|files| files.contains(&at_root))
         });
         match recorded {
             true => Format::BazelIndex,
@@ -1250,9 +1342,9 @@ async fn restore_pass(
             Format::Gradle => gradle::restore(view, &pins, &files, ctx).await,
             Format::Sbt => sbt::restore(view, &pins, &files, ctx).await,
             Format::NuGet => nuget::restore(view, &pins, &files, ctx).await,
-            // Planned before the pass, by the rows' lanes: a pin whose
-            // rows could not all be undone never reaches a pass, so what
-            // is here is restored (below, for every such pin at once).
+            // Planned after the pass, by the rows' lanes, over what the
+            // pass staged: the driver says which of these pins are
+            // restored.
             Format::BazelIndex => FormatResult::default(),
             Format::Unsupported | Format::BunLockb => {
                 let mut r = FormatResult::default();
@@ -1285,19 +1377,40 @@ async fn restore_pass(
     // The npm-family side settings a hosted run may have written, once no
     // npm-family lock entry needs them any more.
     npm::cleanup_side_config(view, ctx, &mut out).await;
-    // A pin the index records is wired there, whichever of its files
-    // discovery named: its rows were undone, so it is not "wiring nothing
-    // here can unwind".
-    if let Some((undo, _)) = claimed {
-        let restored = active.iter().filter(|pin| undo.restored(&pin.uuid));
-        out.handled.extend(restored.map(|pin| pin.uuid.clone()));
-    }
     out
 }
 
 #[cfg(test)]
 mod tests {
-    use super::checkout_remedy;
+    use super::{at_bazel_root, checkout_remedy};
+
+    /// A native file is named from the Bazel root where it lies below
+    /// it, with the climbs out of the project folded away. An absolute
+    /// path and a path above the root have no name there, and are never
+    /// spelled as one (`svc//abs/.npmrc` would be a file of the root).
+    #[test]
+    fn native_files_are_named_from_the_bazel_root_or_not_at_all() {
+        let named = |project: &str, rel: &str| at_bazel_root(project, rel);
+        assert_eq!(
+            named("", "pnpm-lock.yaml").as_deref(),
+            Some("pnpm-lock.yaml")
+        );
+        assert_eq!(
+            named("svc", "a/pnpm-lock.yaml").as_deref(),
+            Some("svc/a/pnpm-lock.yaml")
+        );
+        assert_eq!(
+            named("apps/svc", "../.npmrc").as_deref(),
+            Some("apps/.npmrc")
+        );
+        assert_eq!(named("svc", "../.npmrc").as_deref(), Some(".npmrc"));
+        assert_eq!(named("svc", "../../.npmrc"), None);
+        assert_eq!(named("", "../.npmrc"), None);
+        assert_eq!(named("svc", "/abs/ws/.npmrc"), None);
+        assert_eq!(named("svc", ".."), None, "the root itself is no file");
+        #[cfg(windows)]
+        assert_eq!(named("svc", "C:\\ws\\.npmrc"), None);
+    }
 
     #[test]
     fn bun_lock_remedies_name_the_forced_reinstall() {

@@ -459,47 +459,128 @@ fn a_member_linked_from_outside_the_repository_fails_closed() {
     assert_eq!(linked_member_outside(&root, &members), None);
 }
 
-/// ROUTED R-028. A built Bazel workspace has convenience links in its
-/// root (`bazel-bin`, `bazel-<name>`) that lead into an output base
-/// outside the checkout, each to a mirror of this very tree with the
-/// `package.json` of the directory it mirrors. Under `workspaces: ["*"]`
-/// they were members "linked from outside the repository", and the member
-/// mirror then refused the whole classic rewrite while the links existed.
-/// Below a Bazel boundary file an entry that is one of Bazel's trees, or
-/// a link into one, is no member. With no boundary file nothing is asked,
-/// and the links are listed as before.
+/// A classic yarn project at `<base>/repo` with one real member, `app`.
+/// Every path is built component by component, so it is spelled as a walk
+/// of the directory spells it on every system.
+fn classic_project(base: &Path, workspaces: &str) -> PathBuf {
+    let root = base.join("repo");
+    put(&root.join("yarn.lock"), "# yarn lockfile v1\n\n");
+    let manifest = format!(r#"{{"private":true,"workspaces":["{workspaces}"]}}"#);
+    put(&root.join("package.json"), &manifest);
+    put(&root.join("app").join("package.json"), "{}");
+    root
+}
+
+fn put(path: &Path, text: &str) {
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, text).unwrap();
+}
+
+/// ROUTED R-028, the part that needs no link and so runs on every system.
+/// An output base inside the checkout mirrors the workspace, `package.json`
+/// included, and is no workspace member: below a Bazel boundary file an
+/// entry that is one of Bazel's trees is skipped. The boundary file counts
+/// in the project root and in a directory above it. With none, nothing is
+/// asked and the directory is listed as it always was.
+#[test]
+fn an_output_base_in_the_checkout_is_no_workspace_member() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = std::fs::canonicalize(tmp.path()).unwrap();
+    let root = classic_project(&base, "*");
+    put(&root.join("out").join("DO_NOT_BUILD_HERE"), "");
+    std::fs::create_dir_all(root.join("out").join("execroot")).unwrap();
+    put(&root.join("out").join("package.json"), "{}");
+
+    // No Bazel boundary file: every entry is judged as it always was.
+    let listed = yarn_classic_workspace_members(&root);
+    assert_eq!(listed, [root.join("app"), root.join("out")]);
+
+    put(&root.join("MODULE.bazel"), "module(name = \"repo\")\n");
+    assert_eq!(yarn_classic_workspace_members(&root), [root.join("app")]);
+    // A boundary file in a directory above the project counts too.
+    std::fs::remove_file(root.join("MODULE.bazel")).unwrap();
+    assert_eq!(yarn_classic_workspace_members(&root).len(), 2);
+    put(&base.join("WORKSPACE"), "");
+    assert_eq!(yarn_classic_workspace_members(&root), [root.join("app")]);
+}
+
+/// The boundary file can also lie below the project root: a nested Bazel
+/// workspace whose output base is inside it. Nothing in the root or above
+/// it says "Bazel", so the walk learns it from the listing of the
+/// directory it is in, and from there on asks about every entry: the
+/// nested workspace is a member, its output base and what that mirrors
+/// are not. A sibling directory with the same shape and no boundary file
+/// is not asked about.
+#[test]
+fn a_boundary_file_below_the_project_root_marks_the_trees_under_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = std::fs::canonicalize(tmp.path()).unwrap();
+    let root = classic_project(&base, "**");
+    for dir in ["sub", "plain"] {
+        let dir = root.join(dir);
+        put(&dir.join("package.json"), "{}");
+        put(&dir.join("out").join("DO_NOT_BUILD_HERE"), "");
+        put(&dir.join("out").join("package.json"), "{}");
+        let mirrored = dir.join("out").join("execroot").join("_main");
+        put(&mirrored.join("package.json"), "{}");
+    }
+    let plain = root.join("plain");
+    let every = |sub: &[PathBuf]| {
+        let mut all = vec![
+            root.join("app"),
+            plain.clone(),
+            plain.join("out"),
+            plain.join("out").join("execroot").join("_main"),
+        ];
+        all.extend(sub.iter().cloned());
+        all.sort();
+        all
+    };
+    let sub = root.join("sub");
+    let mirrored = [
+        sub.clone(),
+        sub.join("out"),
+        sub.join("out").join("execroot").join("_main"),
+    ];
+    assert_eq!(yarn_classic_workspace_members(&root), every(&mirrored));
+
+    put(&sub.join("MODULE.bazel"), "module(name = \"sub\")\n");
+    assert_eq!(
+        yarn_classic_workspace_members(&root),
+        every(std::slice::from_ref(&sub)),
+        "the output base under `sub` is Bazel's; the one under `plain` is not asked about"
+    );
+}
+
+/// ROUTED R-028, the part with links, which is why it runs only where a
+/// test can make a directory link without a privilege. A built Bazel
+/// workspace has convenience links in its root (`bazel-bin`,
+/// `bazel-<name>`) that lead into an output base outside the checkout,
+/// each to a mirror of this very tree with the `package.json` of the
+/// directory it mirrors. Under `workspaces: ["*"]` they were members
+/// "linked from outside the repository", and the member mirror then
+/// refused the whole classic rewrite while the links existed. Below a
+/// Bazel boundary file a link into one of Bazel's trees is no member.
+/// With no boundary file nothing is asked, and the links are listed as
+/// before.
 #[cfg(unix)]
 #[test]
 fn bazel_convenience_links_are_no_workspace_members() {
     use std::os::unix::fs::symlink;
     let tmp = tempfile::tempdir().unwrap();
     let base = std::fs::canonicalize(tmp.path()).unwrap();
-    let root = base.join("repo");
-    let write = |p: &Path, text: &str| {
-        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
-        std::fs::write(p, text).unwrap();
-    };
-    write(&root.join("yarn.lock"), "# yarn lockfile v1\n\n");
-    write(
-        &root.join("package.json"),
-        r#"{"private":true,"workspaces":["*"]}"#,
-    );
-    write(&root.join("app").join("package.json"), "{}");
+    let root = classic_project(&base, "*");
     std::fs::create_dir_all(root.join(".git")).unwrap();
     // The output base, outside the checkout: Bazel's marker, and the
     // execution root that mirrors the workspace.
     let output_base = base.join("cache").join("0a1b2c");
     let execroot = output_base.join("execroot").join("_main");
-    write(&output_base.join("DO_NOT_BUILD_HERE"), "");
-    write(&execroot.join("package.json"), "{}");
+    put(&output_base.join("DO_NOT_BUILD_HERE"), "");
+    put(&execroot.join("package.json"), "{}");
     let bin = execroot.join("bazel-out").join("k8-fastbuild").join("bin");
-    write(&bin.join("package.json"), "{}");
+    put(&bin.join("package.json"), "{}");
     symlink(&bin, root.join("bazel-bin")).unwrap();
     symlink(&execroot, root.join("bazel-repo")).unwrap();
-    // An output base inside the checkout is no member either.
-    write(&root.join("out").join("DO_NOT_BUILD_HERE"), "");
-    std::fs::create_dir_all(root.join("out").join("execroot")).unwrap();
-    write(&root.join("out").join("package.json"), "{}");
 
     // No Bazel boundary file: every entry is judged as it always was.
     let listed = yarn_classic_workspace_members(&root);
@@ -507,12 +588,11 @@ fn bazel_convenience_links_are_no_workspace_members() {
         root.join("app"),
         root.join("bazel-bin"),
         root.join("bazel-repo"),
-        root.join("out"),
     ];
     assert_eq!(listed, all);
     assert!(linked_member_outside(&root, &listed).is_some());
 
-    write(&root.join("MODULE.bazel"), "module(name = \"repo\")\n");
+    put(&root.join("MODULE.bazel"), "module(name = \"repo\")\n");
     let members = yarn_classic_workspace_members(&root);
     assert_eq!(members, [root.join("app")]);
     // Nothing is linked from outside any more, which is what made
@@ -520,7 +600,7 @@ fn bazel_convenience_links_are_no_workspace_members() {
     assert_eq!(linked_member_outside(&root, &members), None);
     // A boundary file in a directory above the project counts too.
     std::fs::remove_file(root.join("MODULE.bazel")).unwrap();
-    write(&base.join("WORKSPACE"), "");
+    put(&base.join("WORKSPACE"), "");
     assert_eq!(yarn_classic_workspace_members(&root), [root.join("app")]);
 }
 

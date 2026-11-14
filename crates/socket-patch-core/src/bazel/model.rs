@@ -1513,9 +1513,18 @@ pub type GateFn = fn(&LaneCx<'_>, &PatchRequest<'_>) -> GateOutcome;
 /// Rewrites a Bazel-only lock for the pins of one run, hosted or vendored.
 /// It reports each value it replaced as an edit with a key and with both
 /// values as strings: the hosted rewriter group records those as the
-/// `pins` rows of the owned index.
+/// `pins` rows of the owned index. A value it finds pinned already is no
+/// edit; the row the index holds for the file keeps it.
+///
+/// Where a restore of the file must land on a derived value (the
+/// resolved-artifacts hash of a `maven_install.json`), the lane reports
+/// that value in `RewriteResult::bazel_checks`, under the path of the
+/// file: it becomes the `check` of the file's row and is never an edit.
+/// A lane never reports an edit with a key for a native lock, which keeps
+/// no record: the group refuses such a write.
 pub type RewriteOwnedFn = fn(&LaneCx<'_>, &mut Files, &[PinSource], &mut RewriteResult);
-/// Recomputes derived values after the native rewriter ran.
+/// Recomputes derived values after the native rewriter ran. It reports
+/// its edits, and a row's check, as [`RewriteOwnedFn`] does.
 pub type FixupsFn = fn(&LaneCx<'_>, &mut Files, &Plan, &mut RewriteResult);
 /// The lane's pins. `None` = cannot tell, which callers treat as "keep":
 /// an empty list would let `--prune` delete an artifact a hub still reads.

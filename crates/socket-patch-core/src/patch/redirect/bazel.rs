@@ -6,9 +6,13 @@
 //! the project reaches the build. So every patch of such an ecosystem is
 //! taken away from the native rewriters and decided here:
 //!
-//! 1. **The sweep** (revision 4, 2.8 item 5). A `pins` row of the owned
-//!    index whose pin its lane no longer finds is undone before anything
-//!    is planned, so a stale record never stands beside a new pin.
+//! 1. **The sweep** (revision 4, 2.8 item 5). A patch whose every `pins`
+//!    row is a row of this project that its lane no longer finds the pin
+//!    of is undone before anything is planned, so a stale record never
+//!    stands beside a new pin. A patch with a row anywhere else in the
+//!    root (another project's lock, a second lock that still holds its
+//!    pin) is not undone here: the undo of a patch takes every row of it,
+//!    and a scan of one project never takes a live pin out of another.
 //! 2. **The gate** (`bazel::gate`), once per patch. `NotBazel` leaves the
 //!    patch to the native rewriters, which behave as they do without
 //!    Bazel. A refusal ends the patch with nothing written. A plan goes
@@ -17,19 +21,25 @@
 //!    that holds the files of the plan and nothing else: the native pure
 //!    rewriter, called as a library on the plan's native locks
 //!    (`exec::native_locks`); the lane's `rewrite_owned`; the lane's
-//!    `fixups`. What changed must be a file the plan lets the lane
-//!    author (`exec::authored`), or the patch is refused. The values the
-//!    lane reports become the `pins` rows, and the plan goes to
-//!    `exec::apply`, which writes the record. This file writes no index
-//!    and names no owned path.
+//!    `fixups`. A file of the plan that exists and is no UTF-8 text is
+//!    never handed over as absent: the patch is refused. What changed
+//!    must be a file the plan lets the lane author (`exec::authored`), or
+//!    the patch is refused. The values the lane reports become the `pins`
+//!    rows, merged with the row the index already holds for the file, and
+//!    the plan goes to `exec::apply`, which writes the record. What was
+//!    staged must be a path the plan captures (`exec::touched`). This
+//!    file writes no index and names no owned path.
 //! 4. **The confirmation.** A patch is confirmed only when its lane finds
-//!    the pin in what was staged, the lane's own proof passes there, no
-//!    lock of a governing hub still resolves the release without it, and
-//!    the digest the lock now holds is the grant's (ROUTED R-143: a lock
-//!    line with the Socket URL and the upstream digest builds the
-//!    upstream package from the repository cache). A patch that fails is
-//!    refused and the remaining patches are written again from the start,
-//!    so nothing of a refused patch is left in the change set.
+//!    the pin of its release in a lock of a hub that governs this
+//!    project, the lane's own proof passes there, no lock of such a hub
+//!    still resolves the release without it, and every digest the lock
+//!    now holds for the release is the digest of an artifact of the grant
+//!    (ROUTED R-143: a lock line with the Socket URL and the upstream
+//!    digest builds the upstream package from the repository cache). A
+//!    pin in another project of the root, or of another release, proves
+//!    nothing here. A patch that fails is refused and the remaining
+//!    patches are written again from the start, so nothing of a refused
+//!    patch is left in the change set.
 //!
 //! Each patch therefore ends as exactly one of confirmed and refused
 //! ([`RewriteResult::confirmed_bazel_uuids`],
@@ -66,12 +76,15 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::Value;
 
-use super::{full_name, DepOverride, FileEdit, RewriteResult, RewriteWarning};
+use super::{full_name, DepOverride, FileEdit, Integrity, RewriteResult, RewriteWarning};
 use crate::bazel::attest::Attest;
 use crate::bazel::codes::Code;
 use crate::bazel::detect;
 use crate::bazel::exec::{self, ExecError, Txn};
-use crate::bazel::gate::{self, gate, GateCx, IGNORE_LINE_BLOCKED, OWNED_FILE_MODIFIED};
+use crate::bazel::gate::{
+    self, gate, GateCx, IGNORE_LINE_BLOCKED, NOT_RESOLVED_BY_HUB, OWNED_FILE_MISSING,
+    OWNED_FILE_MODIFIED,
+};
 use crate::bazel::govern::WORKSPACE_UNREADABLE;
 use crate::bazel::ignore::BAZELIGNORE;
 use crate::bazel::lanes::{self, refuse};
@@ -81,7 +94,7 @@ use crate::bazel::model::{
     Mode, PatchRequest, PinSource, Plan, Reason, Refusal, RunRequired, VexWithhold, WithholdKind,
     LANE_NOT_ENABLED,
 };
-use crate::bazel::owned_index::{IndexEdit, INDEX_PATH};
+use crate::bazel::owned_index::{IndexCheck, IndexEdit, INDEX_PATH};
 use crate::crawlers::types::Ecosystem;
 use crate::utils::purl_key::{canonical_base_purl, PurlKey};
 
@@ -134,7 +147,10 @@ impl Refused {
     }
 
     /// A lane whose write contradicts its own plan or proof: it is not
-    /// enabled for what it did, and what it staged is discarded.
+    /// enabled for what it did, and what it staged is discarded. Only a
+    /// lane's own fault is said this way. What the user's files or the
+    /// grant keep a lane from ([`Self::unreadable`], [`Self::not_pinned`],
+    /// [`Self::unrecorded`]) names the edit that lifts it.
     fn off_record(lane: LaneId, why: impl AsRef<str>) -> Self {
         let lift = Lift::EnableLane(lane);
         Self::of(refuse(
@@ -143,6 +159,88 @@ impl Refused {
             why,
             lift,
         ))
+    }
+
+    /// A file the plan lets its lane edit exists and is no text a rewriter
+    /// can be handed: it cannot be read, or it is not UTF-8. It is never
+    /// handed over as absent, where a writer that creates what it does not
+    /// find would replace the user's file.
+    fn unreadable(path: &str) -> Self {
+        let lift = Lift::UserEdit {
+            file: path.to_string(),
+            what: "make the file readable UTF-8 text".to_string(),
+        };
+        let why = format!(
+            "`{path}` exists and cannot be read as UTF-8 text, so it is neither edited nor \
+             replaced"
+        );
+        let detail = format!("{why}; {}; nothing was written", lanes::remedy(&lift));
+        Self {
+            code: Code::WorkspaceUnreadable,
+            token: WORKSPACE_UNREADABLE,
+            detail,
+            snippet: None,
+            lift,
+        }
+    }
+
+    /// The release is not pinned in every lock of the plan, and this run
+    /// changed none of them: the native rewriter and the lane left every
+    /// file as found. The reason is the native rewriter's where it gave
+    /// one (`native`: its warnings for this patch, which the run says
+    /// first).
+    fn not_pinned(one: &Planned<'_, '_>, native: &[RewriteWarning], why: &str) -> Self {
+        let (patch, lane) = (one.patch, one.plan.lane);
+        let locks = exec::authored(std::slice::from_ref(one.plan));
+        let reason = match native.first() {
+            Some(said) => format!(
+                "the package manager's rewriter left it as found ({}: {})",
+                said.code, said.detail
+            ),
+            None => format!(
+                "neither the package manager's rewriter nor lane {} found an entry of the \
+                 release that it can pin ({why})",
+                lane.0
+            ),
+        };
+        let why = format!(
+            "`{}` {} is not pinned in every lock the Bazel build reads (`{}`), and this run \
+             changed none of them: {reason}",
+            patch.name,
+            patch.version,
+            locks.join("`, `")
+        );
+        let lift = Lift::UserEdit {
+            file: locks.first().cloned().unwrap_or_default(),
+            what: "lock the release from its registry, with a digest, then run `socket-patch \
+                   scan` again"
+                .to_string(),
+        };
+        let reason = Reason::ConsumerUndetermined;
+        Self::of(refuse(reason, NOT_RESOLVED_BY_HUB, why, lift))
+    }
+
+    /// The pin is in `path` already and the owned index holds no record
+    /// of what it replaced: the index was deleted, or lost the row. The
+    /// lane is not at fault, and nothing it could write would bring the
+    /// original back.
+    fn unrecorded(patch: &Patch<'_>, path: &str, index_there: bool) -> Self {
+        let token = match index_there {
+            true => OWNED_FILE_MODIFIED,
+            false => OWNED_FILE_MISSING,
+        };
+        let why = format!(
+            "`{path}` already holds the pin of `{}` {}, and `{INDEX_PATH}` does not record what \
+             the pin replaced, so the pin could never be undone",
+            patch.name, patch.version
+        );
+        let lift = Lift::UserEdit {
+            file: INDEX_PATH.to_string(),
+            what: format!(
+                "restore it from version control, or restore `{path}` to its state before the pin"
+            ),
+        };
+        Self::of(refuse(Reason::OwnedFileModified, token, why, lift))
     }
 
     /// The refusal as the run says it, and the manual procedure after it
@@ -381,8 +479,29 @@ pub(super) type Native<'a> =
 /// What one patch's write staged.
 struct Written<'a> {
     state: State<'a>,
-    warnings: Vec<RewriteWarning>,
     edits: Vec<FileEdit>,
+    /// The write changed no file and recorded no value: every pin was in
+    /// place already, or no rewriter could make one.
+    idle: bool,
+}
+
+/// What the last write of one patch said and did, kept by uuid: a patch
+/// that is refused in a later round is written in no round after it, and
+/// what the native rewriter said about it is still the reason.
+#[derive(Default)]
+struct Note {
+    /// The native rewriter's warnings for the patch's own files.
+    warnings: Vec<RewriteWarning>,
+    idle: bool,
+}
+
+/// Why a patch is not confirmed.
+enum Unproven {
+    /// No pin of the release is in a lock of a hub that governs the
+    /// project, or one such lock resolves the release without it.
+    Missing(String),
+    /// A pin is there and is not proven.
+    Unsound(String),
 }
 
 /// A planned patch on its way through the write.
@@ -447,8 +566,15 @@ impl<'a> Group<'a> {
     }
 
     /// Step 3 of the module docs for one patch, on a copy of `state`.
-    /// `Err`: the copy is dropped and `state` is as it was.
-    fn write(&self, planned: &Planned<'_, '_>, state: &State<'a>) -> Result<Written<'a>, Refused> {
+    /// `Err`: the copy is dropped and `state` is as it was. `said` takes
+    /// what the native rewriter said about the files of the plan, whether
+    /// the patch is then written or refused.
+    fn write(
+        &self,
+        planned: &Planned<'_, '_>,
+        state: &State<'a>,
+        said: &mut Vec<RewriteWarning>,
+    ) -> Result<Written<'a>, Refused> {
         let (patch, plan) = (planned.patch, planned.plan);
         let lane = plan.lane;
         let off = |why: String| Refused::off_record(lane, why);
@@ -469,10 +595,23 @@ impl<'a> Group<'a> {
             )));
         }
         // The candidate texts: the files the plan lets its lane author,
-        // and no other file of the root.
+        // and no other file of the root. Only a file that is not there is
+        // absent: one that cannot be read, or is not UTF-8, is the user's
+        // file all the same, and a writer that creates what it does not
+        // find must never be told it is missing.
         let authored = exec::authored(std::slice::from_ref(plan));
-        let text = |path: &String| Some((path.clone(), state.work.text(path)?));
-        let before: Files = authored.iter().filter_map(text).collect();
+        let mut before = Files::new();
+        for path in &authored {
+            let text = match state.work.get(path) {
+                FileText::Absent => continue,
+                FileText::Unreadable => return Err(Refused::unreadable(path)),
+                FileText::Bytes(bytes) => String::from_utf8(bytes),
+            };
+            match text {
+                Ok(text) => drop(before.insert(path.clone(), text)),
+                Err(_) => return Err(Refused::unreadable(path)),
+            }
+        }
         let mut files = before.clone();
 
         // The native rewriter knows a file by its name in the project, and
@@ -493,6 +632,7 @@ impl<'a> Group<'a> {
             true => RewriteResult::default(),
             false => (self.native)(&set, &deps),
         };
+        said.clone_from(&native.warnings);
         if let Some(binary) = native.binary_files.keys().next() {
             return Err(off(format!(
                 "the native rewriter would rewrite the binary lock `{binary}`, which no plan of \
@@ -543,34 +683,86 @@ impl<'a> Group<'a> {
                 lane.0
             )));
         }
-        let rows = pin_rows(patch, lane, &reported.edits);
+        let rows = pin_rows(patch, lane, &reported.edits, &reported.bazel_checks);
         if let Some(row) = rows.iter().find(|row| !authored.contains(&row.file)) {
             return Err(off(format!(
                 "lane {} reported a value of `{}`, which its plan does not name",
                 lane.0, row.file
             )));
         }
+        // A native lock keeps no record: its restorer re-derives the
+        // upstream entry. A row for one would hand the lock to the row's
+        // lane at restore, away from the native restorer, and would stage
+        // an index that the plan of a native lock does not capture.
+        if let Some(row) = rows.iter().find(|row| native_locks.contains(&row.file)) {
+            return Err(off(format!(
+                "lane {} reported a recorded value of `{}`, a lock of the package manager, which \
+                 keeps no record",
+                lane.0, row.file
+            )));
+        }
         edits.extend(reported.edits);
+        let idle = files == before && rows.is_empty();
 
         // The record, through the executor. Nothing was staged yet, so a
-        // plan it refuses leaves the copy as clean as the original.
+        // plan it refuses leaves the copy as clean as the original. A row
+        // is recorded over the one the index holds for the same file: a
+        // lane that pins one value again reports that value alone, and
+        // the others of the row are still what a restore must undo.
         let mut index = state.index.clone();
         for row in rows {
+            let held = state.index.pins.iter().find(|held| same_pin(held, &row));
+            let row = merged(held, row);
             index.record_pin(row);
         }
         let mut work = state.work.clone();
-        exec::apply(&state.ws, &mut index, std::slice::from_ref(plan), &mut work)
-            .map_err(|error| exec_refused(lane, error))?;
+        let plans = std::slice::from_ref(plan);
+        if let Err(error) = exec::apply(&state.ws, &mut index, plans, &mut work) {
+            // A planned value that nothing records, in a write that
+            // changed nothing, is no fault of the lane's plan: the pin is
+            // in the file with its record gone, or no rewriter could make
+            // it.
+            let unrecorded = match &error {
+                ExecError::Unrecorded { path, .. } if idle => Some(path.clone()),
+                _ => None,
+            };
+            let Some(path) = unrecorded else {
+                return Err(exec_refused(lane, error));
+            };
+            let names = |text: &String| deps.iter().any(|dep| text.contains(&dep.artifact_url));
+            return Err(match files.get(&path).is_some_and(names) {
+                true => Refused::unrecorded(patch, &path, !state.index.is_empty()),
+                false => {
+                    let found = error.to_string();
+                    let found = found.strip_suffix("; nothing was written");
+                    Refused::not_pinned(planned, said, found.unwrap_or_default())
+                }
+            });
+        }
         for (path, text) in files {
             if before.get(&path) != Some(&text) {
                 work.put(&path, Some(text.into_bytes()));
             }
         }
+        // Held to the capture list: the commit captures the paths of
+        // `exec::touched` before it writes, so a path this write staged
+        // and the list does not name would be written with no way back.
+        let captured = exec::touched(&state.index, plans);
+        let was = state.work.changes();
+        let staged = work.changes().iter();
+        let mut fresh = staged.filter(|(path, bytes)| was.get(*path) != Some(*bytes));
+        if let Some((path, _)) = fresh.find(|(path, _)| !captured.contains(*path)) {
+            return Err(off(format!(
+                "the write of lane {} would stage `{path}`, which no capture list of its plan \
+                 names",
+                lane.0
+            )));
+        }
         let ws = state.ws.clone();
         Ok(Written {
             state: State { work, index, ws },
-            warnings: native.warnings,
             edits,
+            idle,
         })
     }
 
@@ -583,6 +775,7 @@ impl<'a> Group<'a> {
         planned: &[&Planned<'_, '_>],
         state: &State<'_>,
         written: bool,
+        notes: &BTreeMap<String, Note>,
     ) -> BTreeMap<String, Refused> {
         let mut failed: BTreeMap<String, Refused> = BTreeMap::new();
         if planned.is_empty() {
@@ -617,16 +810,37 @@ impl<'a> Group<'a> {
         let (lanes, roots) = (self.host.lanes, self.host.cx.roots);
         let attest = Attest::read(&ws, lanes, &state.work, &state.index, roots);
         for one in planned {
-            if let Err(why) = self.proven(one, &after, &attest) {
-                let lane = one.plan.lane;
-                let why = format!(
-                    "what lane {} wrote for `{}` {} is not a pin the Bazel build provably \
-                     consumes, and was discarded ({why})",
-                    lane.0, one.patch.name, one.patch.version
-                );
-                let refused = Refused::off_record(lane, why);
-                failed.insert(one.patch.uuid.to_string(), refused);
-            }
+            let Err(unproven) = self.proven(one, &after, &attest) else {
+                continue;
+            };
+            let (lane, patch) = (one.plan.lane, one.patch);
+            let note = notes.get(patch.uuid);
+            let idle = note.is_some_and(|note| note.idle);
+            let refused = match (unproven, idle) {
+                // Nothing was written and no pin is there: no rewriter
+                // could make one, and the native one may have said why.
+                (Unproven::Missing(why), true) => {
+                    let native = note.map_or(&[][..], |note| &note.warnings);
+                    Refused::not_pinned(one, native, &why)
+                }
+                (Unproven::Unsound(why), true) => {
+                    let why = format!(
+                        "the pin of `{}` {} that is in place is not one the Bazel build provably \
+                         consumes, and lane {} had nothing to write for it ({why})",
+                        patch.name, patch.version, lane.0
+                    );
+                    Refused::off_record(lane, why)
+                }
+                (Unproven::Missing(why) | Unproven::Unsound(why), false) => {
+                    let why = format!(
+                        "what lane {} wrote for `{}` {} is not a pin the Bazel build provably \
+                         consumes, and was discarded ({why})",
+                        lane.0, patch.name, patch.version
+                    );
+                    Refused::off_record(lane, why)
+                }
+            };
+            failed.insert(patch.uuid.to_string(), refused);
         }
         failed
     }
@@ -638,45 +852,55 @@ impl<'a> Group<'a> {
         one: &Planned<'_, '_>,
         after: &State<'_>,
         attest: &Attest<'_>,
-    ) -> Result<(), String> {
+    ) -> Result<(), Unproven> {
         let (patch, lane) = (one.patch, one.plan.lane);
-        let own = |pin: &BazelRef| pin.uuid == patch.uuid && pin.lane == lane;
-        let found = attest.discovered.by_hub.iter();
-        let pins: Vec<(HubId, &BazelRef)> = found
-            .filter(|(_, pin)| own(pin))
-            .map(|(hub, pin)| (*hub, pin))
-            .collect();
-        if pins.is_empty() {
-            return Err("the lane finds no pin of the patch in a lock a hub reads".to_string());
-        }
         let Some((ops, hubs)) = self.serving(patch, lane, after) else {
-            return Err("no hub of the lane governs the project any more".to_string());
+            let why = "no hub of the lane governs the project any more";
+            return Err(Unproven::Unsound(why.to_string()));
         };
+        // The pins of this patch: of its release, written by its lane, in
+        // a lock of a hub that governs this project. A pin of the same
+        // patch in another project of the root says nothing about this
+        // one, and neither does a pin its lane put on another release: the
+        // digest below is compared with the entries of the pin's purl.
+        let own = |(hub, pin): &&(HubId, BazelRef)| {
+            let ours = pin.uuid == patch.uuid && pin.lane == lane;
+            ours && hubs.contains(hub) && PurlKey::same(&pin.purl, &patch.purl)
+        };
+        let found = attest.discovered.by_hub.iter();
+        let pins: Vec<(HubId, &BazelRef)> =
+            found.filter(own).map(|(hub, pin)| (*hub, pin)).collect();
+        if pins.is_empty() {
+            let why = "the lane finds no pin of the release in a lock a hub of the project reads";
+            return Err(Unproven::Missing(why.to_string()));
+        }
         // Every lock of a governing hub that resolves the release holds
         // the pin, or none may: one lock left on the upstream entry is a
         // build of the upstream package on some platform. A hub that
         // cannot tell its pins may be such a lock.
-        for hub in hubs {
+        for hub in &hubs {
             let name = after.ws.hubs.get(hub.0);
             let name = name.map_or("", |hub| hub.decl.apparent_name.as_str());
             if attest
                 .discovered
                 .cannot_tell
                 .iter()
-                .any(|(id, _)| *id == hub)
+                .any(|(id, _)| id == hub)
             {
-                return Err(format!("the pins of the hub `{name}` are not known"));
+                let why = format!("the pins of the hub `{name}` are not known");
+                return Err(Unproven::Unsound(why));
             }
-            let listed = attest.inventory.listed.iter().filter(|of| of.hub == hub);
+            let listed = attest.inventory.listed.iter().filter(|of| of.hub == *hub);
             let mut entries = listed.flat_map(|of| &of.entries);
             let resolves = entries.any(|entry| PurlKey::same(&entry.purl, &patch.purl));
-            if resolves && !pins.iter().any(|(of, _)| *of == hub) {
-                return Err(format!(
+            if resolves && !pins.iter().any(|(of, _)| of == hub) {
+                return Err(Unproven::Missing(format!(
                     "the lock of the hub `{name}` resolves the release and holds no pin of the \
                      patch"
-                ));
+                )));
             }
         }
+        let unsound = |withheld: VexWithhold| Unproven::Unsound(withheld.detail);
         for (hub, pin) in &pins {
             let cx = LaneCx {
                 mode: Mode::Hosted,
@@ -686,66 +910,65 @@ impl<'a> Group<'a> {
                 index: &after.index,
                 run: self.host.cx.run,
             };
-            attest.common(*hub, pin).map_err(|w| w.detail)?;
+            attest.common(*hub, pin).map_err(unsound)?;
             match (ops.attest)(&cx, pin) {
                 Ok(()) => {}
                 // Written as planned: the one command has not run yet.
                 Err(withheld) if run_pending(one.pending, &withheld) => {}
-                Err(withheld) => return Err(withheld.detail),
+                Err(withheld) => return Err(unsound(withheld)),
             }
         }
         // The digest, whatever the proof above said: "run pending" is
         // answered before a digest is compared, and a lock line with the
         // Socket URL and the upstream digest must not pass as a pin that
-        // only waits for its command. One artifact of the grant has to be
-        // what every pin of the patch holds.
-        let holds = |dep: &DepOverride| {
-            let grant = Some(&dep.integrity);
-            let held = |(hub, pin): &(HubId, &BazelRef)| {
-                attest.pinned_digest(*hub, pin, Mode::Hosted, grant)
-            };
-            pins.iter().try_for_each(held)
-        };
-        let mut reasons = patch.deps.iter().map(|dep| holds(dep));
-        let mut last = String::new();
-        let granted = reasons.any(|held| match held {
-            Ok(()) => true,
-            Err(withheld) => {
-                last = withheld.detail;
-                false
-            }
-        });
-        match granted {
-            true => Ok(()),
-            false => Err(last),
+        // only waits for its command. Every digest a lock lists for the
+        // release has to be the digest of an artifact of the grant: a
+        // patch can be granted as several (a wheel and an sdist), and a
+        // lock entry then lists one digest for each.
+        let grants: Vec<&Integrity> = patch.deps.iter().map(|dep| &dep.integrity).collect();
+        for (hub, pin) in &pins {
+            let held = attest.pinned_digest_of(*hub, pin, Mode::Hosted, &grants);
+            held.map_err(unsound)?;
         }
+        Ok(())
     }
 
     /// Steps 3 and 4 until every patch that is left is confirmed. A patch
     /// that fails its confirmation is dropped and the others are written
     /// again over the state the sweep left, so that the change set holds
     /// nothing of a refused patch. Each round drops at least one patch.
+    ///
+    /// The notes are what the last write of each patch said and did. They
+    /// outlive the round: a patch that was dropped is written in no later
+    /// round, and what the native rewriter said about it is said with its
+    /// refusal.
     fn carry_out(
         &self,
         planned: &[Planned<'_, '_>],
         swept: &State<'a>,
-    ) -> (Written<'a>, BTreeMap<String, Refused>) {
+    ) -> (
+        Written<'a>,
+        BTreeMap<String, Refused>,
+        BTreeMap<String, Note>,
+    ) {
         let mut refused: BTreeMap<String, Refused> = BTreeMap::new();
+        let mut notes: BTreeMap<String, Note> = BTreeMap::new();
         loop {
             let mut all = Written {
                 state: swept.clone(),
-                warnings: Vec::new(),
                 edits: Vec::new(),
+                idle: true,
             };
             let mut staged: Vec<&Planned<'_, '_>> = Vec::new();
             for one in planned {
                 if refused.contains_key(one.patch.uuid) {
                     continue;
                 }
-                match self.write(one, &all.state) {
+                let note = notes.entry(one.patch.uuid.to_string()).or_default();
+                match self.write(one, &all.state, &mut note.warnings) {
                     Ok(written) => {
+                        note.idle = written.idle;
                         all.state = written.state;
-                        all.warnings.extend(written.warnings);
                         all.edits.extend(written.edits);
                         staged.push(one);
                     }
@@ -753,9 +976,9 @@ impl<'a> Group<'a> {
                 }
             }
             let written = all.state.work.changes() != swept.work.changes();
-            let failed = self.unconfirmed(&staged, &all.state, written);
+            let failed = self.unconfirmed(&staged, &all.state, written, &notes);
             if failed.is_empty() {
-                return (all, refused);
+                return (all, refused, notes);
             }
             refused.extend(failed);
         }
@@ -766,11 +989,19 @@ impl<'a> Group<'a> {
     /// the row's file. A hub that cannot tell its pins leaves its rows
     /// alone, because "cannot tell" is never "gone".
     ///
-    /// A stale row is undone through the executor, whole patch or not at
-    /// all (`upstream::bazel::revert_one`). Where the lane cannot put the
-    /// value back (it is no longer the one socket-patch wrote), the row
-    /// stays the record and is returned, for the advisory of a pin that
-    /// this run does not write again.
+    /// The undo of a patch goes through the executor, whole patch or not
+    /// at all (`upstream::bazel::revert_one`), and it takes every row of
+    /// the patch under the root. So a patch is undone only when every row
+    /// of it is a stale row of this project. One row elsewhere (the lock
+    /// of another project, a second lock of this one that still holds its
+    /// pin) keeps all of them: nothing is written for the patch, and the
+    /// stale file is returned for the advisory of a pin that this run
+    /// does not write again. Granted again, the run pins that file again
+    /// and its row is the new pin's.
+    ///
+    /// Where the lane cannot put a value back (it is no longer the one
+    /// socket-patch wrote), the rows stay the record and are returned the
+    /// same way.
     fn sweep(&self, state: &State<'a>) -> (State<'a>, Vec<Erased>) {
         let mut erased: Vec<Erased> = Vec::new();
         if state.index.pins.is_empty() {
@@ -799,35 +1030,72 @@ impl<'a> Group<'a> {
                 family.is_some_and(holds) && hub.locks.iter().any(|lock| names(&lock.path))
             })
         };
-        let mut stale: Vec<&IndexRow> = Vec::new();
-        for row in &state.index.pins {
-            let Some(hub) = hub_of(row) else { continue };
+        // A row of this project whose pin its lane no longer finds.
+        let gone = |row: &IndexRow| {
+            let Some(hub) = hub_of(row) else {
+                return false;
+            };
             if found.cannot_tell.iter().any(|(id, _)| *id == hub) {
-                continue;
+                return false;
             }
             let same = |pin: &BazelRef| {
                 pin.uuid == row.uuid && pin.file == row.file && pin.lane.0 == row.lane
             };
-            if !found.pins_of(hub).any(same) && !stale.iter().any(|of| of.uuid == row.uuid) {
-                stale.push(row);
+            !found.pins_of(hub).any(same)
+        };
+        let report = |uuid: &str, files: Vec<String>| {
+            let row = state.index.pins.iter().find(|row| row.uuid == uuid);
+            Erased {
+                uuid: uuid.to_string(),
+                purl: row.map(|row| row.purl.clone()).unwrap_or_default(),
+                files,
+            }
+        };
+        let mut waiting: Vec<&str> = Vec::new();
+        for row in state.index.pins.iter().filter(|row| gone(row)) {
+            if waiting.contains(&row.uuid.as_str()) {
+                continue;
+            }
+            let rows = state.index.pins.iter().filter(|of| of.uuid == row.uuid);
+            let (stale, live): (Vec<&IndexRow>, Vec<&IndexRow>) = rows.partition(|of| gone(of));
+            if live.is_empty() {
+                waiting.push(&row.uuid);
+                continue;
+            }
+            if !erased.iter().any(|known| known.uuid == row.uuid) {
+                let mut files: Vec<String> = Vec::new();
+                for of in stale {
+                    if !files.contains(&of.file) {
+                        files.push(of.file.clone());
+                    }
+                }
+                erased.push(report(&row.uuid, files));
             }
         }
+        // Pass after pass, as the restore does: the undo of one patch can
+        // stand on another's.
         let mut next = state.clone();
-        for row in stale {
-            let undone =
-                super::upstream::bazel::revert_one(lanes, ws, &next.work, &next.index, &row.uuid);
-            match undone {
-                Ok(Some((work, index, _))) => (next.work, next.index) = (work, index),
-                Ok(None) => {}
-                Err(kept) => {
-                    let (files, _) = super::upstream::bazel::kept_rows(&kept);
-                    erased.push(Erased {
-                        uuid: row.uuid.clone(),
-                        purl: row.purl.clone(),
-                        files,
-                    });
+        loop {
+            let mut left: Vec<(&str, Vec<String>)> = Vec::new();
+            let mut undone = false;
+            for uuid in waiting {
+                let done =
+                    super::upstream::bazel::revert_one(lanes, ws, &next.work, &next.index, uuid);
+                match done {
+                    Ok(Some((work, index, _))) => {
+                        (next.work, next.index) = (work, index);
+                        undone = true;
+                    }
+                    Ok(None) => {}
+                    Err(kept) => left.push((uuid, super::upstream::bazel::kept_rows(&kept).0)),
                 }
             }
+            if !undone || left.is_empty() {
+                let kept = left.into_iter();
+                erased.extend(kept.map(|(uuid, files)| report(uuid, files)));
+                break;
+            }
+            waiting = left.into_iter().map(|(uuid, _)| uuid).collect();
         }
         if next.work.changes() == state.work.changes() {
             return (next, erased);
@@ -844,8 +1112,9 @@ impl<'a> Group<'a> {
     }
 }
 
-/// A recorded pin that is gone from its lock, and whose row the sweep
-/// could not undo.
+/// A recorded pin that is gone from its lock, and whose rows the sweep
+/// left as the record: the lane could not put a value back, or the patch
+/// has a row the sweep of this project does not judge.
 struct Erased {
     uuid: String,
     purl: String,
@@ -885,7 +1154,17 @@ fn reread(before: &BazelWorkspace, view: &dyn FileView) -> Result<BazelWorkspace
 /// which the native restorer re-derives from the registry. A value left
 /// as it was is no edit, and a row is never written with `original`
 /// equal to `new`.
-fn pin_rows(patch: &Patch<'_>, lane: LaneId, edits: &[FileEdit]) -> Vec<IndexRow> {
+///
+/// `checks` is [`RewriteResult::bazel_checks`]: the derived value a
+/// restore of a file must land on, where the lane has one. It goes into
+/// the row of its file and is never an edit. A check for a file the lane
+/// reported no value of is not recorded: there is no row for it to ride.
+fn pin_rows(
+    patch: &Patch<'_>,
+    lane: LaneId,
+    edits: &[FileEdit],
+    checks: &BTreeMap<String, IndexCheck>,
+) -> Vec<IndexRow> {
     let mut by_file: Vec<(&str, Vec<IndexEdit>)> = Vec::new();
     for edit in edits {
         let (Some(key), Some(Value::String(original)), Some(Value::String(new))) =
@@ -912,14 +1191,53 @@ fn pin_rows(patch: &Patch<'_>, lane: LaneId, edits: &[FileEdit]) -> Vec<IndexRow
         lane: lane.0.to_string(),
         file: file.to_string(),
         edits,
-        check: None,
+        check: checks.get(file).cloned(),
     };
     by_file.into_iter().map(row).collect()
+}
+
+/// Whether two rows record the same pin: one patch, in one file, by one
+/// lane. The index holds one row for each.
+fn same_pin(held: &IndexRow, row: &IndexRow) -> bool {
+    (&held.file, &held.uuid, &held.lane) == (&row.file, &row.uuid, &row.lane)
+}
+
+/// The row to record for a pin the index already holds a row of.
+///
+/// A lane reports the values it replaced in this run, and a run that
+/// completes a pin replaces only what was missing: one of three recorded
+/// values was reset by hand, and the lane writes that one again. The
+/// index keeps one row per pin and file, and a row built from this run's
+/// edits alone would drop the record of the values that were left in
+/// place. A later undo would then put one value back, call the pin
+/// restored and leave the lock on the patch with no record of it.
+///
+/// So the held edits whose value the lane did not replace again stay, in
+/// their recorded order, and the reported ones follow in the order they
+/// were made: they were made over the others, and a restore undoes them
+/// first. `Index::record_pin` then chains each reported original to the
+/// one of the first pin. The held check stays where the lane reported
+/// none.
+fn merged(held: Option<&IndexRow>, row: IndexRow) -> IndexRow {
+    let Some(held) = held else { return row };
+    let again = |edit: &&IndexEdit| !row.edits.iter().any(|new| new.key == edit.key);
+    let mut edits: Vec<IndexEdit> = held.edits.iter().filter(again).cloned().collect();
+    edits.extend(row.edits.iter().cloned());
+    IndexRow {
+        edits,
+        check: row.check.clone().or_else(|| held.check.clone()),
+        ..row
+    }
 }
 
 /// A refusal of the executor as the patch's refusal. The executor has no
 /// reason of the gate's to give, so each error is mapped to the code of
 /// what it found; its text already ends with "nothing was written".
+///
+/// The last arm takes every error this file does not name: a plan the
+/// executor will not carry out is a plan its lane must not have made. An
+/// error that a later class handler adds lands there, and this seam
+/// compiles unchanged.
 fn exec_refused(lane: LaneId, error: ExecError) -> Refused {
     let detail = error.to_string();
     let edit = |file: &str, what: &str| Lift::UserEdit {
@@ -940,11 +1258,7 @@ fn exec_refused(lane: LaneId, error: ExecError) -> Refused {
             edit(BAZELIGNORE, "make the file readable"),
         ),
         ExecError::Index(_) | ExecError::Row(_) => index_fault(),
-        ExecError::PlanRefused { .. }
-        | ExecError::ClassNotImplemented { .. }
-        | ExecError::PathRefused { .. }
-        | ExecError::LineRefused { .. }
-        | ExecError::Unrecorded { .. } => (
+        _ => (
             Code::RedirectRulesetUnsupported,
             LANE_NOT_ENABLED,
             Lift::EnableLane(lane),
@@ -1060,12 +1374,14 @@ pub(super) fn rewrite(
             }),
         }
     }
-    let (written, failed) = group.carry_out(&planned, &state);
+    let (written, failed, notes) = group.carry_out(&planned, &state);
     refused.extend(failed);
 
-    // What the run says, each text once: the native rewriter's own
-    // warnings about the files of a plan, then each patch in order.
-    let mut said: Vec<RewriteWarning> = written.warnings;
+    // What the run says, each text once, patch by patch in the order of
+    // the overrides: what the native rewriter said about the files of the
+    // patch's plan, then how the patch ended. A refused patch keeps the
+    // native rewriter's reason, which is often the whole of why.
+    let mut said: Vec<RewriteWarning> = Vec::new();
     let mut out = BazelRewrite {
         edits: written.edits,
         ..BazelRewrite::default()
@@ -1073,6 +1389,8 @@ pub(super) fn rewrite(
     let mut confirmed: Vec<&Planned<'_, '_>> = Vec::new();
     for (patch, outcome) in &asked {
         let uuid = patch.uuid.to_string();
+        let native = notes.get(&uuid).map_or(&[][..], |note| &note.warnings);
+        said.extend(native.iter().cloned());
         let verdict = match refused.remove(&uuid) {
             Some(why) => {
                 said.extend(why.warnings());
@@ -1234,7 +1552,7 @@ mod tests {
     use super::*;
     use crate::bazel::lanes::PRODUCTION;
     use crate::bazel::model::{HookKind, RootRef};
-    use crate::bazel::owned_index::OWNED_DIR;
+    use crate::bazel::owned_index::{ResolvedHash, OWNED_DIR};
     use crate::patch::redirect::{
         rewrite_registry_redirect, rewrite_registry_redirect_under_bazel, Integrity,
     };
@@ -1375,6 +1693,60 @@ mod tests {
         packages_lock_json = \"//:packages.lock.json\")\n\
         use_repo(nuget, \"nuget\")\n";
 
+    /// The files a hook unit, a tag edit or an owned row lives in, each
+    /// with content of the kind socket-patch and the user put there: the
+    /// module file with a hub of every ruleset, a `WORKSPACE` with a hub
+    /// call, an rc file with a flag and the two-line hook unit, a `.bzl`
+    /// file with a rule call that carries a `patches` item, the owned rc
+    /// file, and an index rendered from one row for the first grant.
+    fn bazel_candidates(deps: &[DepOverride]) -> BTreeMap<String, String> {
+        const WORKSPACE: &str = "workspace(name = \"every_ruleset\")\n\
+            load(\"@rules_jvm_external//:defs.bzl\", \"maven_install\")\n\
+            maven_install(\n    name = \"maven\",\n    artifacts = [\"toy:dep:1.0.0\"],\n    \
+            maven_install_json = \"//:maven_install.json\",\n)\n";
+        const BAZELRC: &str = "common --enable_bzlmod\n\
+            build --lockfile_mode=update\n\
+            # Socket security patches (managed by socket-patch)\n\
+            try-import %workspace%/.socket/bazel/socket.bazelrc\n";
+        const DEPS_BZL: &str = "load(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \
+            \"http_archive\")\n\ndef deps():\n    http_archive(\n        \
+            name = \"left_pad\",\n        \
+            urls = [\"https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz\"],\n        \
+            patches = [\"//:.socket/bazel/patches/left-pad.patch\"],\n    )\n";
+        let mut index = Index::default();
+        if let Some(patch) = patches(deps).first() {
+            index.record_pin(IndexRow {
+                uuid: patch.uuid.to_string(),
+                purl: patch.purl.clone(),
+                lane: "H-TOY1".to_string(),
+                file: "third_party/pins.json".to_string(),
+                edits: vec![IndexEdit {
+                    key: format!("packages/{}/sha256", patch.name),
+                    original: "upstream".to_string(),
+                    new: "patched".to_string(),
+                }],
+                check: None,
+            });
+        }
+        let mut files: BTreeMap<String, String> = BTreeMap::new();
+        let mut put =
+            |path: &str, text: &str| drop(files.insert(path.to_string(), text.to_string()));
+        put("MODULE.bazel", EVERY_RULESET);
+        for workspace in HookKind::WorkspaceFile.files() {
+            put(workspace, WORKSPACE);
+        }
+        put(".bazelrc", BAZELRC);
+        put("third_party/deps.bzl", DEPS_BZL);
+        let owned_rc = format!("{OWNED_DIR}/socket.bazelrc");
+        put(&owned_rc, "common --distdir=.socket/vendor\n");
+        // An index that no row can be rendered for is still a file there.
+        put(
+            INDEX_PATH,
+            &index.render().unwrap_or_else(|_| "{}\n".to_string()),
+        );
+        files
+    }
+
     fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
         for entry in std::fs::read_dir(dir).expect("a fixture directory") {
             let path = entry.expect("a directory entry").path();
@@ -1485,17 +1857,19 @@ mod tests {
             // hub: a file a hook unit or a tag edit goes into (a Bazel
             // boundary file, an rc file, a `.bzl` file), and a path
             // socket-patch owns under the Bazel root. Each is in the
-            // project's files here, as a candidate text a rewriter could
-            // pick up.
+            // project's files here with the content such a file has (a
+            // hub call, the hook unit, a `patches` item a `tagEdits` row
+            // names, a rendered index), as a candidate text a rewriter
+            // could pick up and edit a statement of.
             let hook_files = HookKind::ALL.iter().flat_map(|kind| kind.files());
             let mut all = texts.clone();
-            all.extend(
-                hook_files
-                    .clone()
-                    .map(|file| (file.to_string(), String::new())),
-            );
-            all.insert(INDEX_PATH.to_string(), String::new());
-            all.insert("third_party/deps.bzl".to_string(), String::new());
+            all.extend(bazel_candidates(&deps));
+            for file in hook_files.clone() {
+                assert!(
+                    all.get(*file).is_some_and(|text| !text.is_empty()),
+                    "{file}"
+                );
+            }
             let wrote = rewrite_registry_redirect(&all, &deps);
             let mut written = wrote.files.keys().chain(wrote.binary_files.keys());
             let owned = format!("{OWNED_DIR}/");
@@ -1504,6 +1878,15 @@ mod tests {
                 hook || path.starts_with(&owned) || path.ends_with(".bzl")
             };
             assert_eq!(written.find(|path| theirs(path)), None, "{name}");
+            // And what it does write is what it writes without them: a
+            // statement in one of those files changes no native rewrite.
+            let (mut plain, mut beside) = (native.clone(), wrote.clone());
+            plain.warnings.clear();
+            beside.warnings.clear();
+            assert!(
+                plain == beside,
+                "{name}: the Bazel files changed the rewrite"
+            );
             assert!(result.edits.is_empty(), "{name}: {:?}", result.edits);
             assert!(bazel.changes.is_empty(), "{name}: {:?}", bazel.changes);
             let uuids: BTreeSet<String> = deps.iter().map(|d| d.patch_uuid.clone()).collect();
@@ -1757,7 +2140,8 @@ mod tests {
             edit("a.lock", Some("k4"), Value::from(1), Value::from(2)),
             edit("a.lock", Some("k5"), text("same"), text("same")),
         ];
-        let rows = pin_rows(&patches[0], LaneId("H-TOY1"), &edits);
+        let lane = LaneId("H-TOY1");
+        let rows = pin_rows(&patches[0], lane, &edits, &BTreeMap::new());
         let keys = |row: &IndexRow| -> Vec<String> {
             row.edits.iter().map(|edit| edit.key.clone()).collect()
         };
@@ -1774,6 +2158,92 @@ mod tests {
             && row.purl == "pkg:pypi/flask-login@0.6.3"
             && row.lane == "H-TOY1"
             && row.check.is_none()));
+
+        // The derived value a restore must land on rides the row of its
+        // file. It is no edit, and a check for a file the lane reported
+        // no value of has no row to ride.
+        let check = |before: i64, after: i64| IndexCheck {
+            resolved_hash_before: ResolvedHash::Int(before),
+            resolved_hash_after: ResolvedHash::Int(after),
+            flavor: "v2".to_string(),
+        };
+        let checks = BTreeMap::from([
+            ("b.lock".to_string(), check(1, 2)),
+            ("c.lock".to_string(), check(3, 4)),
+        ]);
+        let rows = pin_rows(&patches[0], lane, &edits, &checks);
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert_eq!((rows[0].file.as_str(), &rows[0].check), ("a.lock", &None));
+        assert_eq!(rows[1].check, Some(check(1, 2)));
+        assert_eq!(keys(&rows[1]), ["k2"], "the check is no edit");
+    }
+
+    /// A pin that is completed records the values this run replaced over
+    /// the row the index holds, and loses none of the others: the held
+    /// edits the lane did not report again stay in their order, the
+    /// reported ones follow, and `record_pin` chains a reported original
+    /// to the one of the first pin.
+    #[test]
+    fn a_row_recorded_again_keeps_the_values_the_lane_left_in_place() {
+        let edit = |key: &str, original: &str, new: &str| IndexEdit {
+            key: key.to_string(),
+            original: original.to_string(),
+            new: new.to_string(),
+        };
+        let row = |file: &str, edits: Vec<IndexEdit>, check: Option<IndexCheck>| IndexRow {
+            uuid: UUID.to_string(),
+            purl: "pkg:maven/toy/dep@1.0.0".to_string(),
+            lane: "H-TOY1".to_string(),
+            file: file.to_string(),
+            edits,
+            check,
+        };
+        let check = |before: i64, after: i64| IndexCheck {
+            resolved_hash_before: ResolvedHash::Int(before),
+            resolved_hash_after: ResolvedHash::Int(after),
+            flavor: "v2".to_string(),
+        };
+        let first = vec![
+            edit("sha", "up", "patched"),
+            edit("alt", "alt-up", "alt-patched"),
+            edit("hash", "7", "9"),
+        ];
+        let held = row("a.lock", first.clone(), Some(check(7, 9)));
+
+        // No held row: the row is the one reported.
+        let again = row("a.lock", vec![edit("alt", "alt-up", "alt-patched")], None);
+        assert_eq!(merged(None, again.clone()), again);
+        assert!(same_pin(&held, &again) && !same_pin(&held, &row("b.lock", Vec::new(), None)));
+
+        // One value was reset by hand and is pinned again.
+        let both = merged(Some(&held), again);
+        let keys: Vec<&str> = both.edits.iter().map(|edit| &*edit.key).collect();
+        assert_eq!(keys, ["sha", "hash", "alt"]);
+        assert_eq!(both.check, Some(check(7, 9)), "the held check stays");
+        let mut index = Index::default();
+        index.record_pin(held.clone());
+        index.record_pin(both);
+        let [recorded] = &index.pins[..] else {
+            panic!("one row per pin and file: {:?}", index.pins);
+        };
+        assert_eq!(recorded.edits.len(), 3);
+        for was in &first {
+            assert!(recorded.edits.contains(was), "{was:?} is lost");
+        }
+
+        // A newer pin over the old one: the value is reported from the
+        // pinned one, and the row still restores to upstream.
+        let over = vec![edit("sha", "patched", "patched-2"), edit("hash", "9", "11")];
+        let newer = merged(Some(&held), row("a.lock", over, Some(check(9, 11))));
+        let mut index = Index::default();
+        index.record_pin(held);
+        index.record_pin(newer);
+        let recorded = &index.pins[0];
+        let found = |key: &str| recorded.edits.iter().find(|edit| edit.key == key).cloned();
+        assert_eq!(found("sha"), Some(edit("sha", "up", "patched-2")));
+        assert_eq!(found("hash"), Some(edit("hash", "7", "11")));
+        assert_eq!(found("alt"), Some(edit("alt", "alt-up", "alt-patched")));
+        assert_eq!(recorded.check, Some(check(7, 11)));
     }
 
     /// A refusal of the gate keeps its parts: the code of its reason in
@@ -1817,6 +2287,34 @@ mod tests {
             "{}",
             off.detail
         );
+        // What is not the lane's fault names the edit that lifts it, and
+        // never the lane as one to enable.
+        let deps = [dep("maven", "dep", "1.0.0", UUID)];
+        let patches = patches(&deps);
+        let edited = |refused: &Refused| match &refused.lift {
+            Lift::UserEdit { file, .. } => file.clone(),
+            other => panic!("{other:?} is no edit of the user's"),
+        };
+        let unreadable = Refused::unreadable("svc/toy.lock.json");
+        assert_eq!(
+            (unreadable.code, unreadable.token),
+            (Code::WorkspaceUnreadable, WORKSPACE_UNREADABLE)
+        );
+        assert_eq!(edited(&unreadable), "svc/toy.lock.json");
+        for (index_there, token) in [(true, OWNED_FILE_MODIFIED), (false, OWNED_FILE_MISSING)] {
+            let gone = Refused::unrecorded(&patches[0], "toy.lock.json", index_there);
+            assert_eq!(
+                (gone.code, gone.token),
+                (Code::RedirectOwnedFileModified, token)
+            );
+            assert_eq!(edited(&gone), INDEX_PATH);
+            assert!(gone.detail.contains("`toy.lock.json`"), "{}", gone.detail);
+        }
+        for refused in [unreadable, Refused::unrecorded(&patches[0], "a", true)] {
+            let detail = &refused.detail;
+            assert!(detail.ends_with("; nothing was written"), "{detail}");
+            assert!(!detail.contains("not enabled") && !detail.contains(TOKEN));
+        }
     }
 
     /// Each refusal of the executor has the code of what it found, and
