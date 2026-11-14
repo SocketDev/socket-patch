@@ -734,6 +734,23 @@ impl FetchBatch {
     }
 }
 
+/// The `details` of a refusal joined to what `event` already carries (its
+/// `mode`): the members of the refusal's own object, never over a member
+/// that is there.
+pub(crate) fn with_refusal_details(event: &mut PatchEvent, details: &serde_json::Value) {
+    let Some(members) = details.as_object() else {
+        return;
+    };
+    let held = event.details.take().filter(serde_json::Value::is_object);
+    let mut held = held.unwrap_or_else(|| serde_json::json!({}));
+    for (name, value) in members {
+        if held.get(name).is_none() {
+            held[name] = value.clone();
+        }
+    }
+    event.details = Some(held);
+}
+
 /// `errorCode` of a patch whose view could not be fetched (network error,
 /// 404).
 pub(crate) const DOWNLOAD_FAILED: &str = "download_failed";
@@ -755,9 +772,12 @@ pub(crate) fn selection_pairs(selected: &[PatchSearchResult]) -> Vec<(&str, &str
 }
 
 /// Every refusal the vendored download phase raises before it fetches a
-/// view: [`vendor_refusals`] over the selection, plus a hosted gem the
-/// takeover would refuse (#775, [`gem_takeover_refusals_for`]), refused
-/// here with the takeover's code instead of after its fetch. The download
+/// view: [`vendor_refusals`] over the selection, the Bazel gate's refusal
+/// of every package whose lock a Bazel ruleset reads
+/// (`bazel_gate::vendored::download_refusals`: it comes first, as it does
+/// in the vendor loop, and carries the event's `details`), plus a hosted
+/// gem the takeover would refuse (#775, [`gem_takeover_refusals_for`]),
+/// refused here with the takeover's code instead of after its fetch. The download
 /// phase only runs online (`--offline` refuses `get` and `scan` before it),
 /// so the gem's dry-run restore may resolve the registry entry. `prior` is
 /// scan's npm crawl, when the caller has it (the installed-copy lookup
@@ -786,6 +806,24 @@ pub(crate) async fn vendored_download_refusals(
         },
     )
     .await;
+    // A lock a Bazel ruleset reads is the gate's to decide, before any
+    // native check of that lock: the same refusal the vendor loop makes,
+    // made here, so that no view is fetched for the package.
+    let pairs = selection_pairs(selected);
+    let governed = crate::bazel_gate::vendored::download_refusals(
+        cwd,
+        false,
+        params.allow_patch_conflicts,
+        &pairs,
+    );
+    for (purl, refused) in governed.await {
+        let refusal = VendorRefusal {
+            code: refused.code,
+            detail: refused.detail,
+            details: Some(refused.details),
+        };
+        refusals.insert(purl, refusal);
+    }
     let claimed = claimed_purls(&pins);
     let empty = HashMap::new();
     let entries = ledger.unwrap_or(&empty);
@@ -810,7 +848,7 @@ pub(crate) async fn vendored_download_refusals(
     for (purl, (code, detail)) in gem {
         refusals
             .entry(purl)
-            .or_insert(VendorRefusal { code, detail });
+            .or_insert(VendorRefusal::new(code, detail));
     }
     refusals
 }
@@ -950,7 +988,12 @@ pub(crate) async fn fetch_selected_patches(
         // the package before it reads the patch, so its view is never
         // fetched (nor, downstream, its pristine source). Code-tagged so a
         // `--silent` operator can grep the stable code.
-        if let Some(VendorRefusal { code, detail }) = refusals.get(purl) {
+        if let Some(VendorRefusal {
+            code,
+            detail,
+            details,
+        }) = refusals.get(purl)
+        {
             batch.fail(
                 params.json,
                 Some(format!("[error] {purl} ({code}): {detail}")),
@@ -958,6 +1001,11 @@ pub(crate) async fn fetch_selected_patches(
                 code,
                 detail,
             );
+            // What the refusal itself has to say beside its text (the
+            // token, the lift and the Bazel state of a Bazel refusal).
+            if let (Some(details), Some(event)) = (details, batch.events.last_mut()) {
+                with_refusal_details(event, details);
+            }
             continue;
         }
 

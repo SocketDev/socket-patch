@@ -76,7 +76,13 @@ type VendorStepResult = Result<(bool, Envelope), VendorStepError>;
 #[derive(Debug, Clone)]
 pub(crate) enum PreviewVerdict {
     /// The wet run's preflight would refuse it before any download.
-    WouldRefuse { code: String, detail: String },
+    /// `details` are the refusal's own (`token`, `lift` and `bazel` of a
+    /// package a Bazel ruleset governs); `None` for every other refusal.
+    WouldRefuse {
+        code: String,
+        detail: String,
+        details: Option<serde_json::Value>,
+    },
     /// The vendor ledger already holds it at this uuid.
     AlreadyVendored,
     /// The ledger holds the purl at another uuid: a re-vendor.
@@ -144,9 +150,17 @@ impl VendorPreview {
     pub(crate) fn record_into(&self, env: &mut Envelope) {
         for row in &self.rows {
             let event = match &row.verdict {
-                PreviewVerdict::WouldRefuse { code, detail } => {
-                    PatchEvent::new(PatchAction::Skipped, row.purl.as_str())
-                        .with_reason(code.as_str(), detail.as_str())
+                PreviewVerdict::WouldRefuse {
+                    code,
+                    detail,
+                    details,
+                } => {
+                    let event = PatchEvent::new(PatchAction::Skipped, row.purl.as_str())
+                        .with_reason(code.as_str(), detail.as_str());
+                    match details {
+                        Some(details) => event.with_details(details.clone()),
+                        None => event,
+                    }
                 }
                 PreviewVerdict::AlreadyVendored => {
                     PatchEvent::new(PatchAction::Skipped, row.purl.as_str()).with_reason(
@@ -222,7 +236,7 @@ impl VendorPreview {
             }
         }
         for row in &self.rows {
-            if let PreviewVerdict::WouldRefuse { code, detail } = &row.verdict {
+            if let PreviewVerdict::WouldRefuse { code, detail, .. } = &row.verdict {
                 println!("  [would-refuse] {} ({code}): {detail}", row.purl);
             }
         }
@@ -269,7 +283,30 @@ pub(crate) async fn preview_vendor(
         selected.iter().map(|p| p.purl.as_str()),
     )
     .await;
-    preview_vendor_with(&common.cwd, selected, &origins, &takeover).await
+    let mut preview = preview_vendor_with(&common.cwd, selected, &origins, &takeover).await;
+    // A lock a Bazel ruleset reads is the gate's to decide, before any
+    // native check of that lock and whatever the ledger records: the wet
+    // run refuses such a package before it fetches its view, so the
+    // preview shows the same refusal, with the same code and details.
+    let pairs = crate::commands::agent_download::selection_pairs(selected);
+    let governed = crate::bazel_gate::vendored::download_refusals(
+        &common.cwd,
+        common.dry_run,
+        common.allow_patch_conflicts,
+        &pairs,
+    )
+    .await;
+    for row in &mut preview.rows {
+        if let Some(refused) = governed.get(&row.purl) {
+            row.verdict = PreviewVerdict::WouldRefuse {
+                code: refused.code.to_string(),
+                detail: refused.detail.clone(),
+                details: Some(refused.details.clone()),
+            };
+            row.warnings.clear();
+        }
+    }
+    preview
 }
 
 /// [`preview_vendor`] over caller-resolved `origins` (the run's
@@ -318,6 +355,7 @@ async fn preview_vendor_with(
     let refuse = |code: &str, detail: &str| PreviewVerdict::WouldRefuse {
         code: code.to_string(),
         detail: detail.to_string(),
+        details: None,
     };
     let mut rows: Vec<PreviewRow> = selected
         .iter()
@@ -326,7 +364,7 @@ async fn preview_vendor_with(
                 // Refusal takes priority: a preserved ledger can name this
                 // UUID even after rollback has removed its live wiring.
                 _ if refusals.contains_key(&p.purl) => {
-                    let VendorRefusal { code, detail } = &refusals[&p.purl];
+                    let VendorRefusal { code, detail, .. } = &refusals[&p.purl];
                     refuse(code, detail)
                 }
                 _ if takeover_refusals.contains_key(&p.purl) => {
@@ -1440,7 +1478,7 @@ mod preview_tests {
             .iter()
             .map(|r| {
                 let mut row = match &r.verdict {
-                    PreviewVerdict::WouldRefuse { code, detail } => serde_json::json!({
+                    PreviewVerdict::WouldRefuse { code, detail, .. } => serde_json::json!({
                         "purl": r.purl, "uuid": r.uuid, "action": "would_refuse",
                         "errorCode": code, "error": detail,
                     }),
@@ -2324,7 +2362,9 @@ mod npm_lock_entry_refusal_tests {
                     .verdict
             };
             match verdict(LEFT_PAD) {
-                PreviewVerdict::WouldRefuse { code: got, detail } => {
+                PreviewVerdict::WouldRefuse {
+                    code: got, detail, ..
+                } => {
                     assert_eq!(got, code, "{shape}: {detail}");
                 }
                 other => panic!("{shape}: left-pad must preview would_refuse, got {other:?}"),

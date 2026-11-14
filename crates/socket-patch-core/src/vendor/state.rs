@@ -491,6 +491,12 @@ impl VendorEntry {
 
     /// The record that says a Bazel root's owned index wires this entry's
     /// artifact, when the entry has one: the entry of a governed package.
+    ///
+    /// The record's `uuid` is what the committed ledger says, and nothing
+    /// here holds it to [`VendorEntry::uuid`]: a reader that follows the
+    /// record to index rows compares the two first, so that a hand edit
+    /// or a merge that kept one side's wiring cannot aim an undo at
+    /// another patch's pin.
     pub fn bazel_index(&self) -> Option<BazelIndexRecord<'_>> {
         self.wiring.iter().find_map(WiringRecord::as_bazel_index)
     }
@@ -1442,6 +1448,19 @@ mod tests {
             assert_eq!(members, ["file", "kind", "action", "key", "new"]);
             assert_eq!(wiring_path_refusal(&entry.wiring[0].file), None);
         }
+
+        // A record whose key names another patch than its entry's is still
+        // a Bazel record: the entry is never handed to a native backend,
+        // which would delete its artifact and undo nothing. The record
+        // says which patch it names, and the reader that follows it holds
+        // that to the entry's own (`bazel_gate::vendored` follows such a
+        // record nowhere: the undo is kept and `vendor --check` fails).
+        let mut merged = sample_entry();
+        let other = "0a1b2c3d-0000-4000-8000-0000000000a1";
+        merged.wiring = vec![WiringRecord::bazel_index("", other, false)];
+        let named = merged.bazel_index().expect("still a Bazel record");
+        assert_eq!(named.uuid, other);
+        assert_ne!(named.uuid, merged.uuid, "the entry is of another patch");
 
         let mut odd = WiringRecord::bazel_index("", UUID, false);
         odd.file = "MODULE.bazel".into();

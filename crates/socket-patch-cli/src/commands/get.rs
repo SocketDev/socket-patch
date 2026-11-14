@@ -2359,7 +2359,12 @@ async fn run_get_vendored(
             None,
         ))
         .await;
-        if let Some(VendorRefusal { code, detail }) = refusals.get(&patch.purl) {
+        if let Some(VendorRefusal {
+            code,
+            detail,
+            details,
+        }) = refusals.get(&patch.purl)
+        {
             // Same failure telemetry as the vendor-step Err arm below: this
             // run exits 1 without vendoring anything.
             socket_patch_core::telemetry::track_patch_vendor_failed(
@@ -2369,12 +2374,16 @@ async fn run_get_vendored(
             )
             .await;
             if args.common.json {
-                env.record(tag_mode(
+                let mut event = tag_mode(
                     PatchEvent::new(EventAction::Failed, patch.purl.as_str())
                         .with_uuid(patch.uuid.as_str())
                         .with_error(*code, detail.as_str()),
                     Some("vendored"),
-                ));
+                );
+                if let Some(details) = details {
+                    super::agent_download::with_refusal_details(&mut event, details);
+                }
+                env.record(event);
                 env.mark_error(EnvelopeError::new(*code, detail.as_str()));
                 emit(&env);
             } else {

@@ -145,7 +145,7 @@ pub use npm_lock::npm_lock_vendor_preflight;
 pub use yarn_berry_lock::{yarn_berry_vendor_preflight, yarn_berry_vendor_target_preflight};
 
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::manifest::schema::PatchRecord;
 use crate::patch::apply::{is_safe_relative_subpath, normalize_file_path, ApplyResult};
@@ -944,6 +944,67 @@ pub async fn native_file_bytes(
             Err((VENDOR_PREBUILT_REQUIRED, why))
         }
     }
+}
+
+/// The project-relative, forward-slashed `rel` below `project_root`, level
+/// by level, and the refusal for a path socket-patch may not use as an
+/// artifact file: a level of it, the file itself included, is a link, or
+/// something other than a regular file is at its name. socket-patch
+/// creates every level under `.socket/vendor` itself and never a link, so
+/// a link there leads to a file that is not its own to read as an
+/// artifact or to replace, and a directory under an artifact's name is
+/// never removed to make room.
+fn native_file_path(project_root: &Path, rel: &str) -> std::io::Result<PathBuf> {
+    let levels = rel.split('/').filter(|level| !level.is_empty());
+    let path = levels.fold(project_root.to_path_buf(), |at, level| at.join(level));
+    if let Some(link) = crate::utils::containment::try_linked_level(project_root, &path)? {
+        return Err(std::io::Error::other(format!(
+            "{} {}, and its target is not socket-patch's to read or replace",
+            link.display(),
+            crate::utils::containment::LINKED_LEVEL_MARKER
+        )));
+    }
+    match std::fs::symlink_metadata(&path) {
+        Ok(meta) if !meta.is_file() => Err(std::io::Error::other(format!(
+            "{} is not a regular file",
+            path.display()
+        ))),
+        Ok(_) => Ok(path),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(path),
+        Err(e) => Err(e),
+    }
+}
+
+/// The bytes of the artifact file at the project-relative `rel`, for a
+/// caller that places an artifact in its native file form itself
+/// ([`place_native_file`]). `Ok(None)`: nothing is there. `Err`: the path
+/// cannot hold an artifact of socket-patch's (a linked level, a leaf that
+/// is no regular file) or could not be read. A link is never followed.
+pub async fn native_file_at(project_root: &Path, rel: &str) -> std::io::Result<Option<Vec<u8>>> {
+    let path = native_file_path(project_root, rel)?;
+    match crate::utils::fs::read_regular_to_bytes(&path).await {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// Puts the content-verified `bytes` at the project-relative `rel`, as
+/// every native backend places an artifact: stage and rename, recorded for
+/// the durability barrier, so a reader sees the whole old file or the
+/// whole new one and a link under the name is replaced, never written
+/// through. Refuses, with nothing written, where [`native_file_at`]
+/// refuses. The levels above the file are created.
+pub async fn place_native_file(
+    project_root: &Path,
+    rel: &str,
+    bytes: &[u8],
+) -> std::io::Result<()> {
+    let path = native_file_path(project_root, rel)?;
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    crate::utils::fs::atomic_write_artifact(&path, bytes).await
 }
 
 /// True iff this build can vendor this PURL's ecosystem.
@@ -2099,6 +2160,100 @@ mod vendor_warning_redaction_tests {
         assert!(w.detail.contains("HTTP 404"), "{}", w.detail);
         let plain = VendorWarning::new("c", "no url here");
         assert_eq!(plain.detail, "no url here");
+    }
+}
+
+#[cfg(test)]
+mod native_file_tests {
+    use super::*;
+
+    const REL: &str = ".socket/vendor/npm/9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f/left-pad-1.3.0.tgz";
+
+    fn at(root: &Path, rel: &str) -> PathBuf {
+        rel.split('/')
+            .fold(root.to_path_buf(), |at, level| at.join(level))
+    }
+
+    /// An artifact is placed by stage and rename, its levels created, and
+    /// read back as the bytes that are there; nothing there is `None`.
+    #[tokio::test]
+    async fn an_artifact_is_placed_whole_and_read_back() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = std::fs::canonicalize(tmp.path()).expect("its real path");
+        assert_eq!(native_file_at(&root, REL).await.expect("readable"), None);
+        place_native_file(&root, REL, b"first")
+            .await
+            .expect("placed");
+        let held = native_file_at(&root, REL).await.expect("readable");
+        assert_eq!(held.as_deref(), Some(&b"first"[..]));
+        place_native_file(&root, REL, b"second")
+            .await
+            .expect("replaced");
+        assert_eq!(std::fs::read(at(&root, REL)).expect("read"), b"second");
+        // No stage file is left beside it.
+        let unit = at(&root, REL).parent().expect("a unit").to_path_buf();
+        let names: Vec<_> = std::fs::read_dir(unit)
+            .expect("the unit")
+            .flatten()
+            .collect();
+        assert_eq!(names.len(), 1, "{names:?}");
+    }
+
+    /// Something other than a regular file under the artifact's name is
+    /// never read as an artifact and never replaced: a directory here (the
+    /// same on every system), a link below.
+    #[tokio::test]
+    async fn a_directory_under_the_artifacts_name_is_refused() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = std::fs::canonicalize(tmp.path()).expect("its real path");
+        let leaf = at(&root, REL);
+        std::fs::create_dir_all(leaf.join("kept")).expect("mkdir");
+        let read = native_file_at(&root, REL).await.expect_err("refused");
+        assert!(read.to_string().contains("not a regular file"), "{read}");
+        let placed = place_native_file(&root, REL, b"bytes").await;
+        let placed = placed.expect_err("refused");
+        assert!(
+            placed.to_string().contains("not a regular file"),
+            "{placed}"
+        );
+        assert!(leaf.join("kept").is_dir(), "the directory stays");
+    }
+
+    /// A linked leaf, and a linked level above it, leads to a file that is
+    /// not socket-patch's: it is not read through and its target is never
+    /// written, whether the link holds the artifact's bytes or not.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_linked_leaf_or_level_is_never_read_or_written_through() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = std::fs::canonicalize(tmp.path()).expect("its real path");
+        let victim = root.join("victim.txt");
+        std::fs::write(&victim, b"the user's file").expect("write");
+        let leaf = at(&root, REL);
+        std::fs::create_dir_all(leaf.parent().expect("a unit")).expect("mkdir");
+        std::os::unix::fs::symlink(&victim, &leaf).expect("symlink");
+        for refused in [
+            native_file_at(&root, REL).await.map(drop),
+            place_native_file(&root, REL, b"the artifact").await,
+        ] {
+            let refused = refused.expect_err("refused");
+            let marker = crate::utils::containment::LINKED_LEVEL_MARKER;
+            assert!(refused.to_string().contains(marker), "{refused}");
+        }
+        assert_eq!(std::fs::read(&victim).expect("read"), b"the user's file");
+        assert!(std::fs::symlink_metadata(&leaf)
+            .expect("the leaf")
+            .is_symlink());
+
+        // A linked unit directory: the artifact would land in its target.
+        let elsewhere = root.join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).expect("mkdir");
+        let other = ".socket/vendor/npm/0a1b2c3d-0000-4000-8000-0000000000a1";
+        std::os::unix::fs::symlink(&elsewhere, at(&root, other)).expect("symlink");
+        let rel = format!("{other}/is-odd-3.0.1.tgz");
+        let placed = place_native_file(&root, &rel, b"the artifact").await;
+        assert!(placed.is_err(), "{placed:?}");
+        assert_eq!(std::fs::read_dir(&elsewhere).expect("list").count(), 0);
     }
 }
 

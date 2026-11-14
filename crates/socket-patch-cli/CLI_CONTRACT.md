@@ -3227,7 +3227,8 @@ table that describe the workspace itself (`bazel_workspace_detected`,
 `bazel_workspace_version_unsupported`, `bazel_workspace_version_untested`,
 `bazel_workspace_above_repo`, `bazel_workspace_rc_unread`), each text once per run however
 many projects of the run lie in the workspace. `get` reports them with the apply it ends
-with. `apply` reads the workspace only when its manifest holds a patch in the run's scope:
+with. `vendor` reports them when it asks which lock files Bazel reads for the packages it
+vendors. `apply` reads the workspace only when its manifest holds a patch in the run's scope:
 with none it reports `bazel_workspace_above_repo` alone, which needs no read. A run on the
 global installs (`--global`, `--global-prefix`) reports none. In this release
 `bazel_workspace_out_of_scope` is the count alone: no patch has a plan for it to ride.
