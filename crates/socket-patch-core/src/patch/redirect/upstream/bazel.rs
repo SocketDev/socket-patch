@@ -24,15 +24,30 @@
 //! was, with both files named: its generated value at upstream beside a
 //! lock that still pins the patch is a state no write ever produced.
 //!
+//! The patches of one call are not undone in an order the caller chose:
+//! the restore driver orders its pins by purl. So a patch that could not
+//! be undone is tried again after every pass that undid another one, and
+//! is reported as incomplete only when a whole pass undid nothing. (A lane
+//! whose rows are independent of each other, as revision 4, 2.8 item 2
+//! asks, never needs the second pass.)
+//!
+//! A lane's restore reads the root through the transaction it writes
+//! into. Where a recorded value is derived from the bytes of a native lock
+//! (a hash line over a `pnpm-lock.yaml`), it must land on the value of the
+//! lock as the native restorer leaves it, never on the recorded original.
+//! [`revert_over`] therefore takes the files the native restorers staged
+//! and undoes the rows over them.
+//!
 //! Nothing here touches a disk. [`revert`] returns the change set and the
 //! index it leaves; the command that asked lands both in the commit
-//! anchored at the Bazel root, under the root's lock, together with what
-//! the native restorer staged for the same pins.
+//! anchored at the Bazel root, under the root's lock. With
+//! [`revert_over`] the files the native restorers staged for the same pins
+//! are part of that one change set.
 
 use std::collections::BTreeMap;
 
 use super::super::bazel::Staged;
-use crate::bazel::exec::{self, Kept, Scope, Selector};
+use crate::bazel::exec::{self, Kept, Scope, Selector, Txn};
 use crate::bazel::ignore::BAZELIGNORE;
 use crate::bazel::lanes;
 use crate::bazel::model::{BazelWorkspace, FileView, Index, LaneTable, RestoreOutcome};
@@ -84,7 +99,9 @@ pub struct UndonePatch {
 pub struct Undo {
     pub patches: Vec<UndonePatch>,
     /// By root-relative path: `Some` bytes to write, `None` to remove.
-    /// Empty when no patch had a row to undo.
+    /// Empty when no patch had a row to undo. Otherwise it is the whole
+    /// commit: the files staged before the undo ([`revert_over`]) are in
+    /// it, as the lanes' restores left them.
     pub changes: BTreeMap<String, Option<Vec<u8>>>,
     /// The index as `changes` leave it. The index file itself is among
     /// the changes whenever a row went.
@@ -127,7 +144,30 @@ impl Undo {
 /// (unreadable, edited, a file of the user's) leaves every patch
 /// incomplete: nothing is undone from a record nobody can trust.
 pub fn revert(root: &Root<'_>, uuids: &[&str]) -> Undo {
+    revert_over(root, uuids, &BTreeMap::new())
+}
+
+/// [`revert`] over the root with `staged` in it: the files the native
+/// restorers staged for the same pins, by root-relative path (`None`: a
+/// removal). A lane's restore reads them as they will be committed, so a
+/// value it derives from a native lock lands on the restored lock.
+///
+/// When a row was undone, [`Undo::changes`] is the whole commit, `staged`
+/// included. When none was, it is empty and `staged` is the caller's to
+/// land as it lands a restore without a Bazel side.
+pub fn revert_over(
+    root: &Root<'_>,
+    uuids: &[&str],
+    staged: &BTreeMap<String, Option<Vec<u8>>>,
+) -> Undo {
     let mut work = Staged::new(root.files);
+    for (path, bytes) in staged {
+        match bytes {
+            Some(bytes) => Txn::write(&mut work, path, bytes.clone()),
+            None => Txn::remove(&mut work, path),
+        }
+    }
+    let before = work.changes().clone();
     let mut index = root.index.clone();
     let fault = exec::refresh(&mut index, &work).err();
     let mut patches: Vec<UndonePatch> = Vec::new();
@@ -142,17 +182,7 @@ pub fn revert(root: &Root<'_>, uuids: &[&str]) -> Undo {
                 files: vec![INDEX_PATH.to_string()],
                 why: fault.to_string(),
             },
-            None => match revert_one(root.lanes, root.ws, &work, &index, uuid) {
-                Ok(None) => Undone::NotRecorded,
-                Ok(Some((next, left, files))) => {
-                    (work, index) = (next, left);
-                    Undone::Restored { files }
-                }
-                Err(kept) => {
-                    let (files, why) = kept_rows(&kept);
-                    Undone::Incomplete { files, why }
-                }
-            },
+            None => Undone::NotRecorded,
         };
         patches.push(UndonePatch {
             uuid: uuid.to_string(),
@@ -160,11 +190,65 @@ pub fn revert(root: &Root<'_>, uuids: &[&str]) -> Undo {
             state,
         });
     }
+    // Pass after pass, until one undoes nothing: a patch whose undo
+    // stands on another's (a derived value both changed) goes in the pass
+    // after it, whatever order the caller named them in.
+    let mut waiting: Vec<usize> = match fault {
+        Some(_) => Vec::new(),
+        None => (0..patches.len()).collect(),
+    };
+    loop {
+        let (mut left, mut undone) = (Vec::new(), false);
+        for at in waiting {
+            let patch = &mut patches[at];
+            match revert_one(root.lanes, root.ws, &work, &index, &patch.uuid) {
+                Ok(None) => patch.state = Undone::NotRecorded,
+                Ok(Some((next, rest, files))) => {
+                    (work, index) = (next, rest);
+                    patch.state = Undone::Restored { files };
+                    undone = true;
+                }
+                Err(kept) => {
+                    let (files, why) = kept_rows(&kept);
+                    patch.state = Undone::Incomplete { files, why };
+                    left.push(at);
+                }
+            }
+        }
+        if !undone || left.is_empty() {
+            break;
+        }
+        waiting = left;
+    }
+    let changes = work.into_changes();
     Undo {
         patches,
-        changes: work.into_changes(),
+        // Nothing of the Bazel side: nothing for the root's commit.
+        changes: match changes == before {
+            true => BTreeMap::new(),
+            false => changes,
+        },
         index,
     }
+}
+
+/// The root-relative files the `pins` rows of the root record, by patch:
+/// the files no native restorer may open for that patch. Read from the
+/// rows, so the answer does not wait for an undo to be planned. The index
+/// file is the record; where it cannot be relied on, the held index is
+/// what is known.
+pub fn recorded(root: &Root<'_>) -> BTreeMap<String, Vec<String>> {
+    let mut index = root.index.clone();
+    // On an error the index is left as it was held.
+    let _ = exec::refresh(&mut index, &Staged::new(root.files));
+    let mut files: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for row in &index.pins {
+        let of = files.entry(row.uuid.clone()).or_default();
+        if !of.contains(&row.file) {
+            of.push(row.file.clone());
+        }
+    }
+    files
 }
 
 /// The transaction and the index after one patch's undo, with the paths
@@ -213,6 +297,10 @@ pub(crate) fn revert_one<'a>(
 
 /// The files the kept rows of one patch name, each once, and one sentence
 /// per row that says what stands in its way.
+///
+/// The last arm takes every entry this file does not name: a kept entry
+/// that a later class handler adds is reported under the index, in the
+/// executor's own words, and this seam compiles unchanged.
 pub(crate) fn kept_rows(kept: &[Kept]) -> (Vec<String>, String) {
     let mut files: Vec<String> = Vec::new();
     let mut reasons: Vec<String> = Vec::new();
@@ -242,12 +330,9 @@ pub(crate) fn kept_rows(kept: &[Kept]) -> (Vec<String>, String) {
                 BAZELIGNORE,
                 format!("the line `{line}` could not be taken out ({why:?})"),
             ),
-            Kept::Class { class, rows } => (
+            other => (
                 INDEX_PATH,
-                format!(
-                    "{rows} row(s) of class `{}`, which this socket-patch cannot undo",
-                    class.as_str()
-                ),
+                format!("rows this socket-patch cannot undo ({other:?})"),
             ),
         };
         if !files.iter().any(|known| known == file) {
@@ -258,4 +343,222 @@ pub(crate) fn kept_rows(kept: &[Kept]) -> (Vec<String>, String) {
         }
     }
     (files, reasons.join("; "))
+}
+
+/// A Bazel root with one index-backed pin, for the tests of the restore
+/// driver that live beside a native restorer: the lock a hub names holds
+/// one value, a `pins` row records what it replaced, and the lane's
+/// restore puts each recorded value back.
+#[cfg(test)]
+pub(crate) mod testing {
+    use std::collections::BTreeMap;
+    use std::path::PathBuf;
+
+    use super::Root;
+    use crate::bazel::detect;
+    use crate::bazel::model::{
+        BazelWorkspace, FileText, FileView, Files, Index, IndexRow, LaneCx, LaneOps, LaneSpec,
+        LaneTable, Mode, RestoreOutcome, RootRef, Ruleset,
+    };
+    use crate::bazel::owned_index::{IndexEdit, INDEX_PATH};
+    use crate::patch::redirect::upstream::HostedPin;
+
+    pub(crate) const UUID: &str = "0a1b2c3d-0000-4000-8000-0000000000a1";
+    pub(crate) const PURL: &str = "pkg:maven/toy/dep@1.0.0";
+    pub(crate) const LOCK: &str = "pins.lock.json";
+    pub(crate) const PINNED: &str = "{\"dep\": \"patched\"}\n";
+    pub(crate) const UPSTREAM: &str = "{\"dep\": \"upstream\"}\n";
+    const LANE: &str = "H-TOYSWAP";
+    const MODULE: &str = "module(name = \"toy_ws\")\n\
+        bazel_dep(name = \"rules_jvm_external\", version = \"6.7\")\n\
+        maven = use_extension(\"@rules_jvm_external//:extensions.bzl\", \"maven\")\n\
+        maven.install(name = \"maven\", artifacts = [\"toy:dep:1.0.0\"], \
+        lock_file = \"//:pins.lock.json\")\n\
+        use_repo(maven, \"maven\")\n";
+
+    fn swap_back(_: &LaneCx<'_>, files: &mut Files, row: &IndexRow) -> RestoreOutcome {
+        let Some(text) = files.get_mut(&row.file) else {
+            return RestoreOutcome::Drifted("the lock is gone".to_string());
+        };
+        for edit in row.edits.iter().rev() {
+            if !text.contains(&edit.new) {
+                let why = format!("`{}` is no longer the value socket-patch wrote", edit.key);
+                return RestoreOutcome::Drifted(why);
+            }
+            *text = text.replace(&edit.new, &edit.original);
+        }
+        RestoreOutcome::Restored
+    }
+
+    const SPEC: LaneSpec = LaneSpec::stub(LANE, Mode::Hosted, &[]);
+    const OPS: LaneOps = LaneOps {
+        lanes: &[SPEC],
+        restore: swap_back,
+        ..LaneOps::disabled(&[])
+    };
+    pub(crate) const LANES: LaneTable = LaneTable(&[(Ruleset::RulesJvmExternal, &OPS)]);
+
+    /// The files of the root, in memory.
+    #[derive(Default)]
+    pub(crate) struct Tree(pub(crate) BTreeMap<String, Vec<u8>>);
+
+    impl FileView for Tree {
+        fn read(&self, rel: &str) -> FileText {
+            let found = self.0.get(rel);
+            found.map_or(FileText::Absent, |bytes| FileText::Bytes(bytes.clone()))
+        }
+
+        fn list(&self, dir: &str) -> Option<Vec<String>> {
+            let below = match dir {
+                "" => String::new(),
+                dir => format!("{dir}/"),
+            };
+            let mut names: Vec<String> = Vec::new();
+            for rest in self.0.keys().filter_map(|path| path.strip_prefix(&below)) {
+                let name = match rest.split_once('/') {
+                    Some((child, _)) => format!("{child}/"),
+                    None => rest.to_string(),
+                };
+                if !names.contains(&name) {
+                    names.push(name);
+                }
+            }
+            Some(names)
+        }
+    }
+
+    /// The root with its pin in place.
+    pub(crate) struct Pinned {
+        pub(crate) tree: Tree,
+        pub(crate) ws: BazelWorkspace,
+        pub(crate) index: Index,
+    }
+
+    impl Pinned {
+        pub(crate) fn new() -> Self {
+            let mut index = Index::default();
+            index.record_pin(IndexRow {
+                uuid: UUID.to_string(),
+                purl: PURL.to_string(),
+                lane: LANE.to_string(),
+                file: LOCK.to_string(),
+                edits: vec![IndexEdit {
+                    key: "dep".to_string(),
+                    original: "upstream".to_string(),
+                    new: "patched".to_string(),
+                }],
+                check: None,
+            });
+            let record = index.render().expect("a record");
+            let mut tree = Tree::default();
+            for (path, text) in [
+                (".bazelversion", "9.3.2\n"),
+                ("MODULE.bazel", MODULE),
+                (LOCK, PINNED),
+                (INDEX_PATH, record.as_str()),
+            ] {
+                tree.0.insert(path.to_string(), text.as_bytes().to_vec());
+            }
+            let root = RootRef {
+                root: PathBuf::from("repo"),
+                project_rel: String::new(),
+                boundary_levels: 0,
+            };
+            let ws = detect(&root, &tree).expect("a Bazel workspace");
+            Self { tree, ws, index }
+        }
+
+        pub(crate) fn root(&self) -> Root<'_> {
+            Root {
+                ws: &self.ws,
+                files: &self.tree,
+                index: &self.index,
+                lanes: &LANES,
+            }
+        }
+
+        /// The pin as discovery names it.
+        pub(crate) fn pin(&self) -> HostedPin {
+            HostedPin {
+                purl: PURL.to_string(),
+                uuid: UUID.to_string(),
+                files: vec![LOCK.to_string()],
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use super::testing::{Pinned, LOCK, PINNED, UPSTREAM, UUID};
+    use super::*;
+
+    /// The files the index records are read from its rows, before any
+    /// undo is planned, and from the index file where the held index is
+    /// behind it.
+    #[test]
+    fn the_recorded_files_are_read_from_the_rows() {
+        let fixture = Pinned::new();
+        let by_patch = recorded(&fixture.root());
+        assert_eq!(by_patch.get(UUID), Some(&vec![LOCK.to_string()]));
+        assert_eq!(by_patch.len(), 1);
+        // A run that read no index yet learns the row from the file.
+        let behind = Root {
+            index: &Index::default(),
+            ..fixture.root()
+        };
+        assert_eq!(recorded(&behind), by_patch);
+    }
+
+    /// What was staged before the undo is part of the one change set when
+    /// a row is undone, and is nobody's commit when none is: the change
+    /// set is then empty, and the caller flushes its files as it does
+    /// without a Bazel side.
+    #[test]
+    fn staged_files_ride_the_change_set_of_an_undo_and_no_other() {
+        let fixture = Pinned::new();
+        let native = "bun.lockb".to_string();
+        let staged = BTreeMap::from([
+            (native.clone(), Some(vec![0u8, 159, 146, 150])),
+            ("gone.lock".to_string(), None),
+        ]);
+        let undo = revert_over(&fixture.root(), &[UUID], &staged);
+        assert!(undo.restored(UUID), "{:?}", undo.patches);
+        let changed: Vec<&String> = undo.changes.keys().collect();
+        assert_eq!(changed, [INDEX_PATH, native.as_str(), LOCK]);
+        assert_eq!(undo.changes[&native], staged[&native]);
+        assert_eq!(undo.changes[LOCK].as_deref(), Some(UPSTREAM.as_bytes()));
+        assert_eq!(undo.changes[INDEX_PATH], None, "the last row is gone");
+        assert!(undo.index.is_empty());
+
+        let other = "5e7d1a2b-3c4d-4e5f-8a6b-7c8d9e0f1a2b";
+        let none = revert_over(&fixture.root(), &[other], &staged);
+        assert_eq!(none.patches[0].state, Undone::NotRecorded);
+        assert!(none.changes.is_empty(), "{:?}", none.changes.keys());
+        assert_eq!(fixture.tree.0[LOCK], PINNED.as_bytes());
+    }
+
+    /// A kept entry this file does not name is reported under the index,
+    /// in the executor's words, and the entries it names keep their file.
+    #[test]
+    fn kept_entries_are_reported_by_the_file_in_their_way() {
+        use crate::bazel::model::WriteClass;
+        let class = Kept::Class {
+            class: WriteClass::Hook,
+            rows: 2,
+        };
+        let pin = Kept::Pin {
+            uuid: UUID.to_string(),
+            file: LOCK.to_string(),
+            outcome: RestoreOutcome::Drifted("the value moved".to_string()),
+        };
+        let (files, why) = kept_rows(&[pin, class]);
+        assert_eq!(files, [LOCK, INDEX_PATH]);
+        assert!(
+            why.contains("the value moved") && why.contains("Hook") && why.contains("rows: 2"),
+            "{why}"
+        );
+    }
 }

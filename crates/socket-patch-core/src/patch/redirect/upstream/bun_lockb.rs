@@ -396,6 +396,56 @@ mod tests {
         assert!(after == lock);
     }
 
+    /// Under a Bazel root, beside a pin the owned index records, the
+    /// restore is one commit anchored at the root, and nothing is written
+    /// here. The rebuilt lock is binary, so no text carries it: it is in
+    /// the outcome's staged bytes and in the one change set the caller
+    /// lands, with the lock's own bytes on disk until then.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_rebuilt_binary_lock_rides_the_commit_at_the_bazel_root() {
+        use super::super::bazel::testing::{Pinned, LOCK, UPSTREAM};
+        use super::super::restore_upstream_under_bazel;
+        use crate::bazel::owned_index::INDEX_PATH;
+        let original = fixture("1.1.38");
+        let upstream = minimist(&original);
+        let server = registry(upstream.integrity.as_deref().unwrap()).await;
+        std::env::set_var("SOCKET_NPM_REGISTRY", server.uri());
+        let lock = hosted(&original);
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("bun.lockb"), &lock).unwrap();
+        let discovery = crate::vex::discover_patched_refs(tmp.path()).await;
+        let mut pins = HostedPin::all(&discovery);
+        assert_eq!(pins.len(), 1, "{pins:?}");
+        let bazel = Pinned::new();
+        pins.push(bazel.pin());
+        let outcome =
+            restore_upstream_under_bazel(tmp.path(), &pins, &vendor_opts(), &bazel.root()).await;
+        std::env::remove_var("SOCKET_NPM_REGISTRY");
+        for pin in &outcome.pins {
+            assert_eq!(pin.status, PinStatus::Restored, "{outcome:?}");
+        }
+        assert!(outcome.commit_pending() && outcome.flush_error.is_none());
+        assert_eq!(outcome.reverted_files, [INDEX_PATH, "bun.lockb", LOCK]);
+        let on_disk = std::fs::read(tmp.path().join("bun.lockb")).unwrap();
+        assert!(
+            on_disk == lock,
+            "nothing is written while a commit is pending"
+        );
+        assert!(outcome.staged_text.is_empty(), "{:?}", outcome.staged_text);
+        let staged = outcome
+            .staged_bytes
+            .get("bun.lockb")
+            .expect("the rebuilt lock");
+        assert!(*staged == original, "the staged lock is the pre-hosted one");
+        let undo = outcome.bazel.expect("the Bazel side");
+        let changed: Vec<&String> = undo.changes.keys().collect();
+        assert_eq!(changed, [INDEX_PATH, "bun.lockb", LOCK]);
+        let landed = undo.changes["bun.lockb"].as_ref().expect("bytes to write");
+        assert!(*landed == original, "the commit lands the rebuilt lock");
+        assert_eq!(undo.changes[LOCK].as_deref(), Some(UPSTREAM.as_bytes()));
+    }
+
     /// Without the vendor opt-in (the `rollback` posture), or offline,
     /// nothing is written and the refusal names the checkout remedy; a dry
     /// run resolves the restore and writes nothing.

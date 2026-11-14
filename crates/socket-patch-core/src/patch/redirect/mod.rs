@@ -444,6 +444,16 @@ pub struct RewriteResult {
         serde(skip_serializing_if = "std::collections::BTreeSet::is_empty")
     )]
     pub refused_bazel_uuids: std::collections::BTreeSet<String>,
+    /// What a Bazel lane's writer reports beside its edits, by the path of
+    /// the file it edited (relative to the Bazel root): the derived value
+    /// a restore of that file must land on, where the lane has one (the
+    /// resolved-artifacts hash of a `maven_install.json` before and after
+    /// the pin). The Bazel rewriter group puts it into the `pins` row of
+    /// the file (`IndexRow::check`); it is never recorded as an edit. No
+    /// native rewriter fills it, and it is neither serialized nor printed,
+    /// so the rewrite goldens are unchanged by it.
+    #[cfg_attr(test, serde(skip))]
+    pub bazel_checks: BTreeMap<String, crate::bazel::owned_index::IndexCheck>,
 }
 
 /// The derived `Debug` shape, with the Gradle sets shown only when
@@ -964,6 +974,7 @@ fn merge_group_delta(result: &mut RewriteResult, delta: RewriteResult) {
         refused_sbt_uuids,
         confirmed_bazel_uuids,
         refused_bazel_uuids,
+        bazel_checks,
     } = delta;
     result.files.extend(files);
     result.binary_files.extend(binary_files);
@@ -1018,6 +1029,7 @@ fn merge_group_delta(result: &mut RewriteResult, delta: RewriteResult) {
     result.refused_sbt_uuids.extend(refused_sbt_uuids);
     result.confirmed_bazel_uuids.extend(confirmed_bazel_uuids);
     result.refused_bazel_uuids.extend(refused_bazel_uuids);
+    result.bazel_checks.extend(bazel_checks);
 }
 
 /// [`rewrite_groups_serial`], with the groups run concurrently under

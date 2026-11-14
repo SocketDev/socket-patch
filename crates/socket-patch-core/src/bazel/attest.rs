@@ -446,31 +446,47 @@ fn digest_key(digest: &LockIntegrity) -> (&'static str, Vec<String>) {
 /// repository cache (probe Y6). A lock entry with no digest anchors
 /// nothing.
 pub fn digest_equals_grant(pinned: &LockIntegrity, grant: &Integrity) -> Result<(), VexWithhold> {
-    let hex = |found: &str, of: &Option<String>| {
-        let of = of.as_deref().filter(|of| !of.is_empty());
-        of.is_some_and(|of| of.eq_ignore_ascii_case(found))
+    digest_of_grants(pinned, &[grant])
+}
+
+/// [`digest_equals_grant`] for a patch that is granted as several
+/// artifacts (a wheel and an sdist of one release): `Ok` only when every
+/// digest the lock holds for the release is the digest of one of them. A
+/// lock entry can list one digest per artifact (`Sha256AnyOf`, an SRI
+/// string with several hashes), and the build accepts any of the listed
+/// ones, so each has to be an artifact of the patch. No artifact at all is
+/// no grant: nothing equals it.
+pub fn digest_of_grants(pinned: &LockIntegrity, grants: &[&Integrity]) -> Result<(), VexWithhold> {
+    let hex = |found: &str, of: fn(&Integrity) -> &Option<String>| {
+        let held = |grant: &&Integrity| {
+            let of = of(grant).as_deref().filter(|of| !of.is_empty());
+            of.is_some_and(|of| of.eq_ignore_ascii_case(found))
+        };
+        grants.iter().any(held)
     };
-    let exact =
-        |found: &str, of: &Option<String>| of.as_deref() == Some(found) && !found.is_empty();
+    let exact = |found: &str, of: fn(&Integrity) -> &Option<String>| {
+        let held = |grant: &&Integrity| of(grant).as_deref() == Some(found);
+        !found.is_empty() && grants.iter().any(held)
+    };
     let equal = match pinned {
         LockIntegrity::None => {
             let detail = "the lock records no digest for the pinned package, so nothing the \
                           build enforces says which bytes it fetches";
             return Err(withheld(WithholdKind::IntegrityUnanchored, None, detail));
         }
-        LockIntegrity::Sha256Hex(sum) => hex(sum, &grant.sha256),
+        LockIntegrity::Sha256Hex(sum) => hex(sum, |grant| &grant.sha256),
         // The build accepts any digest of the set, so each must be the
         // patch's.
         LockIntegrity::Sha256AnyOf(sums) => {
-            !sums.is_empty() && sums.iter().all(|sum| hex(sum, &grant.sha256))
+            !sums.is_empty() && sums.iter().all(|sum| hex(sum, |grant| &grant.sha256))
         }
-        LockIntegrity::Sha1Hex(sum) => hex(sum, &grant.sha1),
+        LockIntegrity::Sha1Hex(sum) => hex(sum, |grant| &grant.sha1),
         LockIntegrity::Sri(sri) => {
             let mut hashes = sri.split_whitespace().peekable();
-            hashes.peek().is_some() && hashes.all(|hash| exact(hash, &grant.sha512))
+            hashes.peek().is_some() && hashes.all(|hash| exact(hash, |grant| &grant.sha512))
         }
-        LockIntegrity::GoH1(sum) => exact(sum, &grant.dirhash_h1),
-        LockIntegrity::BerryChecksum(sum) => exact(sum, &grant.yarn_berry10c0),
+        LockIntegrity::GoH1(sum) => exact(sum, |grant| &grant.dirhash_h1),
+        LockIntegrity::BerryChecksum(sum) => exact(sum, |grant| &grant.yarn_berry10c0),
     };
     if equal {
         return Ok(());
@@ -1229,6 +1245,22 @@ impl<'a> Attest<'a> {
         mode: Mode,
         grant: Option<&Integrity>,
     ) -> Result<(), VexWithhold> {
+        self.pinned_digest_of(id, pin, mode, grant.as_slice())
+    }
+
+    /// [`Self::pinned_digest`] for a patch that is granted as several
+    /// artifacts: every digest the hub's locks list for the release is
+    /// the digest of one of `grants` ([`digest_of_grants`]). An entry that
+    /// lists a wheel's digest and an sdist's is held to both artifacts of
+    /// the patch, where one grant alone would refuse it. No grant is the
+    /// `None` of [`Self::pinned_digest`].
+    pub fn pinned_digest_of(
+        &self,
+        id: HubId,
+        pin: &BazelRef,
+        mode: Mode,
+        grants: &[&Integrity],
+    ) -> Result<(), VexWithhold> {
         let listed = self.inventory.listed.iter().filter(|of| of.hub == id);
         let entries = listed.flat_map(|of| &of.entries);
         let entries: Vec<&LockfileEntry> = entries
@@ -1247,7 +1279,8 @@ impl<'a> Attest<'a> {
             }
         }
         let hosted = mode == Mode::Hosted;
-        match grant {
+        let granted = (!grants.is_empty()).then_some(grants);
+        match granted {
             Some(_) if hosted && entries.is_empty() => {
                 let detail = format!(
                     "the listing of the hub's lock holds no entry of `{}`, so no digest the \
@@ -1259,11 +1292,11 @@ impl<'a> Attest<'a> {
             // A vendored or an agent pin rests on the artifact or the
             // tree, which the caller hashes: a digest its lock holds is
             // compared, and none is asked for.
-            Some(grant) => entries
+            Some(grants) => entries
                 .iter()
                 .map(|entry| &entry.integrity)
                 .filter(|digest| hosted || **digest != LockIntegrity::None)
-                .try_for_each(|digest| digest_equals_grant(digest, grant)),
+                .try_for_each(|digest| digest_of_grants(digest, grants)),
             None if hosted && !self.recorded(pin) => Err(undetermined(format!(
                 "no committed file records the digest the pin in `{}` was written with, and \
                  this run holds no grant of the patch to compare the locked digest with, so \
@@ -2864,6 +2897,53 @@ mod tests {
     /// the verdict the forged lock is withheld by the lane's own call,
     /// which names the extension and the pin; the call the verdict makes
     /// for every lane names neither and cannot see it.
+    /// A patch granted as several artifacts: every digest a lock entry
+    /// lists has to be the digest of one of them, in the entry's own
+    /// kind. One grant is the case of [`digest_equals_grant`], and no
+    /// grant equals nothing.
+    #[test]
+    fn a_listed_digest_is_held_to_the_artifacts_of_one_patch() {
+        let sha256 = |sum: &str| Integrity {
+            sha256: Some(sum.to_string()),
+            ..Integrity::default()
+        };
+        let sha512 = |sri: &str| Integrity {
+            sha512: Some(sri.to_string()),
+            ..Integrity::default()
+        };
+        let (wheel, sdist) = (sha256(&"a".repeat(64)), sha256(&"B".repeat(64)));
+        let any = |sums: &[&str]| {
+            LockIntegrity::Sha256AnyOf(sums.iter().map(|sum| sum.to_string()).collect())
+        };
+        let both = any(&[&"A".repeat(64), &"b".repeat(64)]);
+        let kind = |held: Result<(), VexWithhold>| held.map_err(|withheld| withheld.kind);
+        assert_eq!(kind(digest_of_grants(&both, &[&wheel, &sdist])), Ok(()));
+        // One artifact alone leaves a listed digest that is not its own.
+        let stale = Err(WithholdKind::DerivedStale);
+        assert_eq!(kind(digest_of_grants(&both, &[&wheel])), stale);
+        assert_eq!(kind(digest_equals_grant(&both, &sdist)), stale);
+        // A listed digest that is no artifact of the patch.
+        let foreign = any(&[&"a".repeat(64), &"c".repeat(64)]);
+        assert_eq!(kind(digest_of_grants(&foreign, &[&wheel, &sdist])), stale);
+        assert_eq!(kind(digest_of_grants(&any(&[]), &[&wheel])), stale);
+        assert_eq!(kind(digest_of_grants(&both, &[])), stale);
+        // An SRI string with a hash per artifact, compared exactly.
+        let (tgz, zip) = (sha512("sha512-AAA="), sha512("sha512-BBB="));
+        let sri = LockIntegrity::Sri("sha512-BBB= sha512-AAA=".to_string());
+        assert_eq!(kind(digest_of_grants(&sri, &[&tgz, &zip])), Ok(()));
+        assert_eq!(kind(digest_of_grants(&sri, &[&tgz])), stale);
+        assert_eq!(kind(digest_of_grants(&sri, &[&tgz, &wheel])), stale);
+        // A kind no artifact has a digest of, and an entry with none.
+        let single = LockIntegrity::Sha256Hex("a".repeat(64));
+        assert_eq!(kind(digest_of_grants(&single, &[&tgz, &zip])), stale);
+        assert_eq!(kind(digest_of_grants(&single, &[&zip, &wheel])), Ok(()));
+        let unanchored = Err(WithholdKind::IntegrityUnanchored);
+        assert_eq!(
+            kind(digest_of_grants(&LockIntegrity::None, &[&wheel])),
+            unanchored
+        );
+    }
+
     #[test]
     fn a_forged_lock_entry_is_derived_stale() {
         let locks = [
