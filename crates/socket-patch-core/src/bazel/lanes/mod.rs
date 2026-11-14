@@ -589,6 +589,27 @@ pub fn discover(
     found
 }
 
+/// The mode an undo of the rows that the lanes `row_lanes` wrote reports
+/// in: its incomplete undo is `Code::revert_incomplete` of this mode, and
+/// so is the advisory of what the undo leaves stale. The mode is the one
+/// `lanes` gives each lane by its ID: hosted where a hosted lane wrote a
+/// row, vendored where vendored lanes did and no hosted one. An agent
+/// lane has no code of its own, and a lane the table does not hold says
+/// nothing, so rows of those alone report as hosted. A seam asks here
+/// and never reads a lane ID itself.
+pub fn undo_mode(lanes: &LaneTable, row_lanes: &[&str]) -> Mode {
+    let mode = |lane: &&str| {
+        let held = lanes.specs().find(|(_, spec)| spec.id.0 == *lane);
+        held.map(|(_, spec)| spec.mode)
+    };
+    let modes: Vec<Mode> = row_lanes.iter().filter_map(mode).collect();
+    let vendored = modes.contains(&Mode::Vendored) && !modes.contains(&Mode::Hosted);
+    match vendored {
+        true => Mode::Vendored,
+        false => Mode::Hosted,
+    }
+}
+
 /// The restore of `exec::revert` over a lane table: a `pins` row is put
 /// back by the restore of the family that holds its lane, on the file the
 /// row names. A row whose lane or hub the table and the model no longer
@@ -959,6 +980,28 @@ mod tests {
                 (Reason::PinBypassed, "vendor_dir", lift)
             );
         }
+    }
+
+    /// The mode an undo reports in comes from the table, lane by lane: a
+    /// production lane says its own, a vendored row beside an agent one
+    /// is vendored, and rows of lanes the table does not hold are hosted.
+    #[test]
+    fn an_undo_reports_in_the_mode_of_the_lanes_that_wrote_its_rows() {
+        let of = |mode: Mode| {
+            let lane = PRODUCTION.specs().find(|(_, spec)| spec.mode == mode);
+            lane.expect("a production lane of each mode").1.id.0
+        };
+        let (hosted, vendored, agent) = (of(Mode::Hosted), of(Mode::Vendored), of(Mode::Agent));
+        assert_eq!(undo_mode(&PRODUCTION, &[hosted]), Mode::Hosted);
+        assert_eq!(undo_mode(&PRODUCTION, &[vendored]), Mode::Vendored);
+        assert_eq!(undo_mode(&PRODUCTION, &[agent, vendored]), Mode::Vendored);
+        assert_eq!(undo_mode(&PRODUCTION, &[vendored, hosted]), Mode::Hosted);
+        assert_eq!(undo_mode(&PRODUCTION, &[agent]), Mode::Hosted);
+        assert_eq!(undo_mode(&PRODUCTION, &["V-NOT-HELD"]), Mode::Hosted);
+        assert_eq!(undo_mode(&PRODUCTION, &[]), Mode::Hosted);
+        let code = |lanes: &[&str]| Code::revert_incomplete(undo_mode(&PRODUCTION, lanes));
+        assert_eq!(code(&[vendored]), Some(Code::VendorRevertIncomplete));
+        assert_eq!(code(&[agent]), Some(Code::RedirectRevertIncomplete));
     }
 
     #[test]

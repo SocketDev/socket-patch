@@ -5,24 +5,27 @@
 //! Each command keeps doing what it does, and asks here about the part of
 //! a patch that the Bazel build reads:
 //!
-//! - **Undo** ([`restore`], [`undo_rows`]). A hosted pin is restored on
+//! - **Undo** ([`restore`], [`RowsLeg`]). A hosted pin is restored on
 //!   both sides or on neither: its native files by the native restorers,
 //!   what the owned index records for it by the row's lane, through
 //!   `bazel::exec::revert`, in one commit anchored at the Bazel root. The
 //!   rows of a manifest record are selected by patch, whatever lane wrote
-//!   them, and a record whose rows could not all be undone stays in the
-//!   manifest: a pin with no record is one `apply` never looks at again.
+//!   them, and are planned before the command restores anything: a record
+//!   whose rows cannot all be undone is left alone as a whole, and stays
+//!   in the manifest, since a pin with no record is one `apply` never
+//!   looks at again.
 //! - **The restoring edit** is judged like a forward one
-//!   (`gate::restoring`). A command a person ran restores and names the
-//!   command that refreshes what Bazel derived; a restore nobody asked
-//!   for by name ([`automatic`]) keeps the pin where builds would fail.
-//!   The command goes through `run::finish`, which this release never
-//!   lets unwind.
+//!   (`gate::restoring`), by every Bazel root above the project. A command
+//!   a person ran restores and names the command that refreshes what
+//!   Bazel derived; a restore nobody asked for by name ([`automatic`])
+//!   keeps the pin where builds would fail, and where nothing can say
+//!   whether they would. The command goes through `run::finish`, which
+//!   this release never lets unwind.
 //! - **Repair** ([`repair`]) reports what `bazel::exec::reconcile` finds,
 //!   has the root channel bring the `.bazelignore` lines back in step
 //!   with the trees, and names a recorded pin that is gone. It rebuilds
 //!   no row and no pin.
-//! - **A takeover** ([`takeover_refusal`]) asks the target mode's gate
+//! - **A takeover** ([`TakeoverGate`]) asks the target mode's gate
 //!   before the source mode's wiring is touched.
 //! - **Audits** ([`list`], [`check`]) say what the build makes of a pin,
 //!   from committed files alone.
@@ -37,15 +40,15 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use serde_json::{json, Value};
-use socket_patch_core::bazel::attest::{Attest, Basis, Candidate, Consumed, Held};
+use socket_patch_core::bazel::attest::{Attest, Consumed, Held};
 use socket_patch_core::bazel::codes::{Code, Level};
 use socket_patch_core::bazel::exec::{self, Finding, Overlay, OwnedState};
 use socket_patch_core::bazel::gate::{self, GateCx, PatchRequest, Restoring, Roots};
 use socket_patch_core::bazel::inventory;
 use socket_patch_core::bazel::lanes;
 use socket_patch_core::bazel::model::{
-    BazelRef, BazelWorkspace, ClaimOs, FileText, FileView, GateOutcome, Governance, Hub, Index,
-    LaneTable, LockRole, Mode, Probe,
+    Advisory, BazelWorkspace, ClaimOs, FileText, FileView, GateOutcome, Governance, Index,
+    LaneTable, Lift, Mode, Probe, Reason,
 };
 use socket_patch_core::bazel::owned_index::{self, Parsed, INDEX_PATH};
 use socket_patch_core::crawlers::bazel_workspace::DiskView;
@@ -55,7 +58,9 @@ use socket_patch_core::patch::redirect::upstream::{
     restore_upstream, restore_upstream_under_bazel, HostedPin, PinResult, PinStatus,
     RestoreOptions, RestoreOutcome,
 };
-use socket_patch_core::utils::bazel_root_writes::{lock_root, repair_lines, ROOT_LOCK_WAIT};
+use socket_patch_core::utils::bazel_root_writes::{
+    lock_root, repair_lines, Repair, ROOT_LOCK_WAIT,
+};
 use socket_patch_core::utils::group_commit::{
     pending_anchored, restore_anchored, AnchoredChange, CommittedFile,
 };
@@ -64,6 +69,7 @@ use socket_patch_core::utils::purl_key::PurlKey;
 use socket_patch_core::vendor::VendorState;
 use socket_patch_core::vex::discover::{BazelOptions, Judge, Read, WiringMode};
 
+use super::hosted::{hub_details, refused_details};
 use super::run::{finish, land, runner, Captured, Finish, Staged, Unlanded};
 use super::{run_loader, run_policy, IndexState, Loaded, LoadedRoot, Loader, RunCx};
 use crate::args::GlobalArgs;
@@ -85,8 +91,19 @@ fn host() -> Option<ClaimOs> {
 /// A change set by root-relative path: `None` removes the file.
 type Changes = BTreeMap<String, Option<Vec<u8>>>;
 
+/// A manifest record of a `rollback` or `remove`: its purl and the uuid
+/// of its patch.
+pub type Record = (String, String);
+
 /// The roots above `project`, read now. `None` under no Bazel root, where
 /// the stat-only probe is all that ran.
+///
+/// Asked once per step of a command (a restore, the sweep, the gate of a
+/// takeover), never once per package of it: a step before this one may
+/// have written under the root with a loader of its own (the hosted
+/// rewrite of a scan, the in-place leg of a rollback), so what the run's
+/// loader read is read again, and reading a large workspace once per
+/// package would cost seconds each.
 async fn load(common: &GlobalArgs, project: &Path) -> Option<(Arc<Loader>, Arc<Loaded>)> {
     let loader = run_loader(RunCx::from(common));
     let (asked, at) = (Arc::clone(&loader), project.to_path_buf());
@@ -94,7 +111,6 @@ async fn load(common: &GlobalArgs, project: &Path) -> Option<(Arc<Loader>, Arc<L
         if asked.probe(&at) == Probe::NotBazel {
             return None;
         }
-        // An earlier step of the run may have written under the root.
         asked.committed(&at);
         Some(asked.load(&at))
     });
@@ -136,41 +152,229 @@ fn below(project_rel: &str) -> String {
     }
 }
 
-/// What the gate says of `changes` as a restoring edit of `purls`.
+/// Prints `detail` for a person at `level` (`--silent` hides a note), or
+/// adds it to `warnings` under `--json`.
+fn say(
+    common: &GlobalArgs,
+    level: Level,
+    (code, detail): (Code, &str),
+    warnings: &mut Vec<(&'static str, String)>,
+) {
+    if common.json {
+        warnings.push((code.as_str(), detail.to_string()));
+    } else if level == Level::Warn {
+        eprintln!("Warning: {detail}");
+    } else if !common.silent {
+        eprintln!("Note: {detail}");
+    }
+}
+
+// ── The restoring edit ───────────────────────────────────────────────
+
+/// What the Bazel roots above a project say of one restoring edit.
+struct Reverse {
+    /// The answer of each root that could be asked, nearest first.
+    asked: Vec<Restoring>,
+    /// One sentence for each root above the nearest that could not be
+    /// asked: its build may read the restored files too.
+    unasked: Vec<String>,
+}
+
+impl Reverse {
+    /// The gate outcome of each root, for `run::finish`.
+    fn outcomes(&self) -> Vec<&GateOutcome> {
+        self.asked.iter().map(|root| &root.outcome).collect()
+    }
+
+    /// Whether a restore nobody asked for by name may go ahead: no root's
+    /// build fails from it, and every root could say so.
+    fn automatic(&self) -> bool {
+        let passes = |root: &Restoring| root.decision.automatic_restore_allowed();
+        self.unasked.is_empty() && self.asked.iter().all(passes)
+    }
+
+    /// What each root leaves for the user to run, each text once.
+    fn advisories(&self) -> Vec<&(Level, Advisory)> {
+        let mut said: Vec<&(Level, Advisory)> = Vec::new();
+        for advisory in self.asked.iter().filter_map(|root| root.advisory.as_ref()) {
+            if !said.iter().any(|known| known.1.detail == advisory.1.detail) {
+                said.push(advisory);
+            }
+        }
+        said
+    }
+
+    /// The advisories and the roots that could not be asked, as the end
+    /// of a sentence about a restore that was not made.
+    fn then(&self) -> String {
+        let advised = self.advisories().into_iter();
+        let advised = advised.map(|(_, advisory)| advisory.detail.clone());
+        let all: Vec<String> = advised.chain(self.unasked.iter().cloned()).collect();
+        all.join(" ")
+    }
+
+    /// Says what the edit leaves for the user to run, and which root
+    /// could not be asked about it.
+    fn advise(&self, common: &GlobalArgs, warnings: &mut Vec<(&'static str, String)>) {
+        for (level, advisory) in self.advisories() {
+            say(common, *level, (advisory.code, &advisory.detail), warnings);
+        }
+        for unasked in &self.unasked {
+            let detail = format!(
+                "{unasked}, so what the restore leaves stale there is not known. If its builds \
+                 fail, run `bazel mod deps --lockfile_mode=update` there and commit the result"
+            );
+            say(
+                common,
+                Level::Warn,
+                (Code::RedirectRunRequired, &detail),
+                warnings,
+            );
+        }
+    }
+}
+
+/// The place of the directory `inner` under the directory `outer`, as a
+/// path prefix: `""` when they are one, `None` when `inner` is not at or
+/// below `outer` or has a level that is not text.
+fn place_under(inner: &Path, outer: &Path) -> Option<String> {
+    let rel = inner.strip_prefix(outer).ok()?;
+    let levels = rel.components().map(|level| level.as_os_str().to_str());
+    let levels: Vec<&str> = levels.collect::<Option<_>>()?;
+    Some(below(&levels.join("/")))
+}
+
+/// What the gate of each Bazel root above the project says of `changes`
+/// as a restoring edit of `purls`, in `mode`. `near` is the root nearest
+/// the project, whose paths `changes` are in; each root further up is
+/// asked about the same files by its own paths, since its build reads
+/// what lies below it (a lock it records, a hub that names the file). A
+/// root that cannot be asked is said so, never passed over: unreadable is
+/// not absent.
 fn reverse<'a>(
     common: &GlobalArgs,
     loaded: &Loaded,
-    (ws, files, index): (&BazelWorkspace, &dyn FileView, &Index),
+    lanes: &LaneTable,
+    mode: Mode,
+    near: (&BazelWorkspace, &dyn FileView, &Index),
     purls: impl Iterator<Item = &'a str>,
     changes: &Changes,
-) -> Restoring {
+) -> Reverse {
     let probe = loaded.probe();
-    let cx = GateCx {
-        roots: Roots::Probed {
-            probe: &probe,
-            read: loaded.models(),
-        },
-        run: run_policy(&RunCx::from(common)),
-        ..GateCx::new(Mode::Hosted, ws, files, index)
-    };
     let release = |purl: &str| purl_parts(purl).map(|(_, name, version)| (name, version));
     let releases: Vec<(String, String)> = purls.filter_map(release).collect();
-    gate::restoring(&cx, &releases, changes)
+    let ask = |(ws, files, index): (&BazelWorkspace, &dyn FileView, &Index), edit: &Changes| {
+        let cx = GateCx {
+            roots: Roots::Probed {
+                probe: &probe,
+                read: loaded.models(),
+            },
+            run: run_policy(&RunCx::from(common)),
+            ..GateCx::new(mode, ws, files, index)
+        };
+        gate::restoring(&cx, lanes, &releases, edit)
+    };
+    let mut out = Reverse {
+        asked: vec![ask(near, changes)],
+        unasked: Vec::new(),
+    };
+    let mut roots = loaded.roots();
+    let Some(first) = roots.next() else {
+        return out;
+    };
+    // The record of the nearest root is no input of any build.
+    let edits = changes.iter().filter(|(path, _)| *path != INDEX_PATH);
+    for root in roots {
+        let place = root.root();
+        let up = place_under(&first.root().root, &place.root);
+        let asked = match (root.model(), root.index(), up) {
+            (Err(gap), _, _) => Err(gap.detail.clone()),
+            (_, IndexState::Faulty(fault), _) => Err(fault.to_string()),
+            (_, _, None) => Err("it does not lie above the project's own root".to_string()),
+            (Ok(ws), IndexState::Ours(index), Some(up)) => {
+                let named = |(path, bytes): (&String, &Option<Vec<u8>>)| {
+                    (format!("{up}{path}"), bytes.clone())
+                };
+                let edit: Changes = edits.clone().map(named).collect();
+                Ok(ask((ws, root.files(), index), &edit))
+            }
+        };
+        match asked {
+            Ok(said) => out.asked.push(said),
+            Err(why) => out.unasked.push(format!(
+                "the Bazel workspace at {} could not be asked ({why})",
+                place.root.display()
+            )),
+        }
+    }
+    out
 }
 
-/// Says what a restoring edit leaves for the user to run: a line for a
-/// person at the advisory's level (`--silent` hides a note), an entry of
-/// `warnings[]` under `--json`.
-fn advise(common: &GlobalArgs, restoring: &Restoring, warnings: &mut Vec<(&'static str, String)>) {
-    let Some((level, advisory)) = &restoring.advisory else {
-        return;
+/// Why nothing can say what the Bazel build makes of a restore of
+/// `purl`, as the end of a sentence. `None` where Bazel does not govern
+/// the package's ecosystem, and where a root was asked (`asked`) and
+/// governance is decided: the gate's answer is then the whole answer.
+///
+/// Mirrors what the forward gate refuses on: an ecosystem whose
+/// governance is undetermined, and one a ruleset governs, or may, under a
+/// workspace no model of which could be read (a root above the
+/// repository, files that cannot be read).
+fn unjudged(loaded: &Loaded, purl: &str, asked: bool) -> Option<String> {
+    let governance = loaded.governance(Ecosystem::from_purl(purl)?);
+    let gaps = match governance {
+        Governance::NotGoverned => return None,
+        Governance::Undetermined(gaps) => gaps,
+        _ if asked => return None,
+        _ => Vec::new(),
     };
-    if common.json {
-        warnings.push((advisory.code.as_str(), advisory.detail.clone()));
-    } else if *level == Level::Warn {
-        eprintln!("Warning: {}", advisory.detail);
-    } else if !common.silent {
-        eprintln!("Note: {}", advisory.detail);
+    let said: Vec<&str> = gaps.iter().map(|gap| gap.detail.as_str()).collect();
+    if !said.is_empty() {
+        return Some(said.join("; "));
+    }
+    let unread = loaded.roots().next().and_then(|root| root.model().err());
+    let why = match (unread, loaded.above()) {
+        (Some(gap), _) => gap.detail.clone(),
+        (None, Some(above)) => format!(
+            "the Bazel workspace file {} lies above the repository, where socket-patch reads \
+             nothing",
+            above.marker.display()
+        ),
+        (None, None) => "which lock Bazel reads for it could not be determined".to_string(),
+    };
+    Some(why)
+}
+
+/// Says, once per reason, that a restore was made of packages whose
+/// Bazel side nobody could judge.
+fn advise_unjudged(
+    common: &GlobalArgs,
+    unjudged: &[(String, String)],
+    warnings: &mut Vec<(&'static str, String)>,
+) {
+    let mut reasons: Vec<&str> = Vec::new();
+    for (_, why) in unjudged {
+        if !reasons.contains(&why.as_str()) {
+            reasons.push(why);
+        }
+    }
+    for why in reasons {
+        let of = unjudged.iter().filter(|(_, reason)| reason == why);
+        let purls: Vec<&str> = of.map(|(purl, _)| purl.as_str()).collect();
+        let detail = format!(
+            "{} restored, and what a Bazel build makes of the restored files could not be \
+             judged: {why}. If a Bazel build reads them, state it derived from them may be \
+             stale: run `bazel mod deps --lockfile_mode=update` and commit the result",
+            match purls.as_slice() {
+                [one] => format!("{one} was"),
+                many => format!("{} were", many.join(", ")),
+            }
+        );
+        say(
+            common,
+            Level::Warn,
+            (Code::RedirectRunRequired, &detail),
+            warnings,
+        );
     }
 }
 
@@ -200,21 +404,33 @@ fn unwound(why: &str, left: &[String]) -> String {
     }
 }
 
-/// Settles the command a restoring edit leaves, for an edit whose files a
+/// Settles the commands a restoring edit leaves, for an edit whose files a
 /// native flush has already written (an edit that lands through [`commit`]
 /// is settled inside `run::land`). `captured` are the originals. `Err`:
-/// the command failed, the originals were put back (or could not be), and
+/// a command failed, the originals were put back (or could not be), and
 /// nothing of the edit stands.
 async fn settle(
     loader: &Loader,
     root: &Path,
-    restoring: &Restoring,
-    captured: Captured,
+    reversed: &Reverse,
+    mut captured: Captured,
 ) -> Result<(), String> {
-    let settled = finish(&restoring.outcome, captured, runner().as_ref());
-    let (captured, why) = match settled {
-        Finish::Keep(_) => return Ok(()),
-        Finish::Unwind { captured, why } => (captured, why),
+    let runner = runner();
+    let mut failed: Option<String> = None;
+    for outcome in reversed.outcomes() {
+        match finish(outcome, captured, runner.as_ref()) {
+            Finish::Keep(kept) => captured = kept,
+            Finish::Unwind {
+                captured: kept,
+                why,
+            } => {
+                (captured, failed) = (kept, Some(why));
+                break;
+            }
+        }
+    }
+    let Some(why) = failed else {
+        return Ok(());
     };
     let back = match lock_root(root, ROOT_LOCK_WAIT).await {
         Ok(lock) => restore_anchored(&lock, captured.files()).await,
@@ -225,7 +441,7 @@ async fn settle(
 }
 
 /// Lands `changes` in the commit anchored at `root`, for the project at
-/// `project_rel` under it, and settles the command the edit leaves
+/// `project_rel` under it, and settles the commands the edit leaves
 /// (`run::land` does both, in its order: a command that fails takes the
 /// commit back). `Err`: why nothing of the edit stayed written.
 async fn commit(
@@ -234,9 +450,9 @@ async fn commit(
     project_rel: &str,
     touched: &[String],
     changes: &[AnchoredChange],
-    restoring: &Restoring,
+    reversed: &Reverse,
 ) -> Result<(), String> {
-    let outcomes = [&restoring.outcome];
+    let outcomes = reversed.outcomes();
     let staged = Staged {
         root,
         project_rel,
@@ -308,6 +524,16 @@ fn changes_of(outcome: &RestoreOutcome, below: &str) -> Changes {
     changes
 }
 
+/// A pin that is refused as a whole: nothing of it was changed.
+fn refused(pin: &HostedPin, why: String) -> PinResult {
+    PinResult {
+        purl: pin.purl.clone(),
+        uuid: pin.uuid.clone(),
+        status: PinStatus::Refused(why),
+        files: pin.files.clone(),
+    }
+}
+
 /// The restore of the project at `--cwd` beside an owned index nobody can
 /// rely on: a pin of an ecosystem a ruleset governs, or may govern, is
 /// refused, because what the index records for it is not known, and the
@@ -331,12 +557,54 @@ async fn beside_a_faulty_index(
              reads for it is not known; nothing of the pin was changed",
             pin.purl
         );
-        outcome.pins.push(PinResult {
-            purl: pin.purl.clone(),
-            uuid: pin.uuid.clone(),
-            status: PinStatus::Refused(why),
-            files: pin.files.clone(),
-        });
+        outcome.pins.push(refused(pin, why));
+    }
+    outcome
+}
+
+/// The restore of the project at `--cwd` beside a Bazel workspace no
+/// model of which could be read (a root above the repository, a root
+/// whose files cannot be read). A person asked for the restore, so the
+/// native files are restored. Two things differ from a project without
+/// Bazel: a pin the root's owned index records a row for is refused,
+/// since its row cannot be undone without the model and a pin is
+/// restored on both sides or on neither; and the run says, for each
+/// package a ruleset governs or may govern, that nobody could judge what
+/// the restore leaves stale.
+async fn beside_no_model(
+    common: &GlobalArgs,
+    loaded: &Loaded,
+    project: &Path,
+    pins: &[HostedPin],
+    opts: &RestoreOptions,
+) -> RestoreOutcome {
+    let index = loaded.roots().next().map(|root| root.index());
+    let wired = match index {
+        Some(IndexState::Faulty(fault)) => {
+            return beside_a_faulty_index(loaded, project, pins, opts, fault).await;
+        }
+        Some(IndexState::Ours(index)) => inventory::wired(index),
+        None => Default::default(),
+    };
+    let free: Vec<HostedPin> = pins
+        .iter()
+        .filter(|pin| !wired.contains(&pin.uuid))
+        .cloned()
+        .collect();
+    let mut outcome = restore_upstream(project, &free, opts).await;
+    for pin in pins.iter().filter(|pin| wired.contains(&pin.uuid)) {
+        let why = format!(
+            "cannot restore {} to its upstream registry entry: the owned index of the Bazel \
+             root records what the build reads for it, and the workspace cannot be read, so \
+             that part cannot be undone; nothing of the pin was changed",
+            pin.purl
+        );
+        outcome.pins.push(refused(pin, why));
+    }
+    let reason = |pin: &PinResult| Some((pin.purl.clone(), unjudged(loaded, &pin.purl, false)?));
+    let open: Vec<(String, String)> = outcome.restored().filter_map(reason).collect();
+    if outcome.flush_error.is_none() {
+        advise_unjudged(common, &open, &mut outcome.warnings);
     }
     outcome
 }
@@ -345,8 +613,8 @@ async fn beside_a_faulty_index(
 /// ran (`rollback`, `remove`): under a Bazel root the pins are restored
 /// with what the owned index records for them, in the commit anchored at
 /// the root, and the run names the command that refreshes what Bazel
-/// derived from the restored files. Under no Bazel root it is
-/// `restore_upstream`, byte for byte.
+/// derived from the restored files, for each Bazel root above the
+/// project. Under no Bazel root it is `restore_upstream`, byte for byte.
 pub async fn restore(
     common: &GlobalArgs,
     pins: &[HostedPin],
@@ -358,7 +626,7 @@ pub async fn restore(
         return restore_upstream(&project, pins, opts).await;
     };
     let Some((root, ws)) = nearest(&loaded) else {
-        return restore_upstream(&project, pins, opts).await;
+        return beside_no_model(common, &loaded, &project, pins, opts).await;
     };
     let index = match root.index() {
         IndexState::Ours(index) => index,
@@ -381,9 +649,13 @@ pub async fn restore(
     }
     let restored: Vec<String> = outcome.restored().map(|pin| pin.purl.clone()).collect();
     let purls = restored.iter().map(String::as_str);
-    let restoring = reverse(common, &loaded, (ws, &fresh, index), purls, &changes);
+    let near = (ws, &fresh as &dyn FileView, index);
+    let reversed = reverse(common, &loaded, lanes, Mode::Hosted, near, purls, &changes);
+    let reason = |purl: &String| Some((purl.clone(), unjudged(&loaded, purl, true)?));
+    let open: Vec<(String, String)> = restored.iter().filter_map(reason).collect();
     if opts.dry_run {
-        advise(common, &restoring, &mut outcome.warnings);
+        reversed.advise(common, &mut outcome.warnings);
+        advise_unjudged(common, &open, &mut outcome.warnings);
         return outcome;
     }
     let rebased = |path: &String| format!("{below}{path}");
@@ -401,7 +673,7 @@ pub async fn restore(
         touched.extend(outcome.staged_text.keys().map(rebased));
         let staged = anchored(&changes, read);
         let project_rel = &root.root().project_rel;
-        commit(&loader, at, project_rel, &touched, &staged, &restoring).await
+        commit(&loader, at, project_rel, &touched, &staged, &reversed).await
     } else {
         // The native flush has written. Its originals are what an unwind
         // puts back.
@@ -411,10 +683,13 @@ pub async fn restore(
         };
         let originals = outcome.staged_from.iter().map(original).collect();
         loader.committed(at);
-        settle(&loader, at, &restoring, Captured::new(at, originals)).await
+        settle(&loader, at, &reversed, Captured::new(at, originals)).await
     };
     match settled {
-        Ok(()) => advise(common, &restoring, &mut outcome.warnings),
+        Ok(()) => {
+            reversed.advise(common, &mut outcome.warnings);
+            advise_unjudged(common, &open, &mut outcome.warnings);
+        }
         Err(why) => unwritten(&mut outcome, why),
     }
     outcome
@@ -422,9 +697,13 @@ pub async fn restore(
 
 /// The pins of `pins` that a restore nobody asked for by name may put
 /// back (the withdrawn-pin sweep), and a `(code, detail)` for each one
-/// that is kept: its restoring edit would leave state stale that fails
-/// every build, under `--lockfile_mode=error` or, for a crate lock
-/// digest, under any mode (design 7). Each pin is planned alone and
+/// that is kept. A pin is kept where its restoring edit would leave state
+/// stale that fails every build of a Bazel root above the project (under
+/// `--lockfile_mode=error` or, for a crate lock digest, under any mode;
+/// design 7), and where nothing can say whether it would: no model of
+/// the workspace could be read, a root further up could not be asked, or
+/// which lock Bazel reads for the package is undetermined. Unreadable is
+/// not absent, here as for a forward edit. Each pin is planned alone and
 /// nothing is written here.
 pub async fn automatic(
     common: &GlobalArgs,
@@ -436,24 +715,46 @@ pub async fn automatic(
     let Some((_, loaded)) = load(&rooted, &project).await else {
         return (pins, Vec::new());
     };
-    // Beside a root that cannot be read, or an index nobody can rely on,
-    // the restore itself decides.
-    let read = nearest(&loaded).and_then(|(root, ws)| match root.index() {
+    let index = loaded.roots().next().map(|root| root.index());
+    // Beside an index nobody can rely on the restore itself decides: it
+    // refuses every pin a ruleset may build, and says why.
+    if matches!(index, Some(IndexState::Faulty(_))) {
+        return (pins, Vec::new());
+    }
+    let asked = nearest(&loaded).and_then(|(root, ws)| match root.index() {
         IndexState::Ours(index) => Some((root, ws, index)),
         IndexState::Faulty(_) => None,
     });
-    let Some((root, ws, index)) = read else {
-        return (pins, Vec::new());
-    };
     let opts = RestoreOptions {
         dry_run: true,
         offline: rooted.offline,
         patch_server_origins: crate::commands::hosted_unwind::patch_server_origins(&rooted),
         bun_lockb: false,
     };
-    let below = below(&root.root().project_rel);
     let (mut free, mut kept) = (Vec::new(), Vec::new());
     for pin in pins {
+        let keep = |why: String| {
+            let detail = format!(
+                "{} is pinned to patch {}, which is no longer published, and the pin was kept: \
+                 {why}",
+                pin.purl, pin.uuid
+            );
+            (Code::RedirectWithdrawnPinKept.as_str(), detail)
+        };
+        let unknown = |why: String| {
+            keep(format!(
+                "what the Bazel build makes of the upstream entry could not be judged ({why}). \
+                 Run `socket-patch rollback {}` to put it back all the same",
+                pin.purl
+            ))
+        };
+        let Some((root, ws, index)) = asked else {
+            match unjudged(&loaded, &pin.purl, false) {
+                Some(why) => kept.push(unknown(why)),
+                None => free.push(pin),
+            }
+            continue;
+        };
         let fresh = DiskView::new(root.root());
         let side = rows::Root {
             ws,
@@ -463,34 +764,55 @@ pub async fn automatic(
         };
         let one = std::slice::from_ref(&pin);
         let planned = restore_upstream_under_bazel(&project, one, &opts, &side).await;
-        let changes = changes_of(&planned, &below);
+        let changes = changes_of(&planned, &below(&root.root().project_rel));
         let purls = std::iter::once(pin.purl.as_str());
-        let restoring = reverse(&rooted, &loaded, (ws, &fresh, index), purls, &changes);
-        if restoring.decision.automatic_restore_allowed() {
-            free.push(pin);
-            continue;
-        }
-        let then = restoring.advisory.as_ref();
-        let then = then.map_or("", |(_, advisory)| advisory.detail.as_str());
-        let detail = format!(
-            "{} is pinned to patch {}, which is no longer published, and the pin was kept: \
-             putting the upstream entry back would fail every Bazel build until Bazel's own \
-             state is refreshed. Run `socket-patch rollback {}` when you can run the refresh \
-             with it: {then}",
-            pin.purl, pin.uuid, pin.purl
-        );
-        kept.push((Code::RedirectWithdrawnPinKept.as_str(), detail));
+        let near = (ws, &fresh as &dyn FileView, index);
+        let reversed = reverse(&rooted, &loaded, lanes, Mode::Hosted, near, purls, &changes);
+        // A build that would fail is said first: it names the refresh.
+        let fails = reversed
+            .asked
+            .iter()
+            .any(|root| root.decision.builds_fail());
+        let why = match (fails, unjudged(&loaded, &pin.purl, true)) {
+            (true, _) => keep(format!(
+                "putting the upstream entry back would fail every Bazel build until Bazel's \
+                 own state is refreshed. Run `socket-patch rollback {}` when you can run the \
+                 refresh with it: {}",
+                pin.purl,
+                reversed.then()
+            )),
+            (false, Some(why)) => unknown(why),
+            (false, None) if reversed.automatic() => {
+                free.push(pin);
+                continue;
+            }
+            (false, None) => unknown(reversed.unasked.join("; ")),
+        };
+        kept.push(why);
     }
     (free, kept)
 }
 
+// ── The rows of the owned index ──────────────────────────────────────
+
+/// A manifest record whose rows of the owned index stand: it stays in the
+/// manifest, nothing of it is restored, and the run fails for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Kept {
+    pub purl: String,
+    /// `redirect_bazel_revert_incomplete` or its vendored twin, by the
+    /// mode of the lanes that wrote the rows.
+    pub code: &'static str,
+    /// What stands in the way, and what lifts it.
+    pub why: String,
+}
+
 /// What became of the rows the owned index of the Bazel root holds for
-/// the records of one `rollback` or `remove` ([`undo_rows`]).
+/// the records of one `rollback` or `remove` ([`RowsLeg`]).
 #[derive(Debug, Default)]
 pub struct Undone {
-    /// `(purl, why)` of each record whose rows stand: it stays in the
-    /// manifest, and the run failed for it.
-    pub kept: Vec<(String, String)>,
+    /// The records whose rows stand.
+    pub kept: Vec<Kept>,
     /// The records whose rows were all undone (on a dry run: would be).
     pub reverted: Vec<String>,
     /// Run-level `(code, detail)`.
@@ -503,7 +825,25 @@ pub struct Undone {
 impl Undone {
     /// Whether rows of `purl` stand, so that its record stays.
     pub fn holds(&self, purl: &str) -> bool {
-        self.kept.iter().any(|(kept, _)| kept == purl)
+        self.kept.iter().any(|kept| kept.purl == purl)
+    }
+
+    /// Keeps the record `purl`, whose rows lanes of `mode` wrote.
+    fn keep(&mut self, purl: &str, mode: Mode, why: String) {
+        let code = Code::revert_incomplete(mode).unwrap_or(Code::RedirectRevertIncomplete);
+        let code = code.as_str();
+        self.warnings.push((code.to_string(), why.clone()));
+        let purl = purl.to_string();
+        self.kept.push(Kept { purl, code, why });
+    }
+
+    /// What `later` found, after what this holds.
+    fn then(mut self, later: Undone) -> Undone {
+        self.kept.extend(later.kept);
+        self.reverted.extend(later.reverted);
+        self.warnings.extend(later.warnings);
+        self.root = self.root.or(later.root);
+        self
     }
 
     /// Adds `details.bazel = { root, state }` to each event of a record
@@ -528,14 +868,16 @@ impl Undone {
 }
 
 /// A change set of rows of the owned index, staged for the commit
-/// anchored at their root, with what the gate says of it as an edit.
+/// anchored at their root, with what the gates say of it as an edit.
 struct RowsPlan {
     root: PathBuf,
     /// The project of the run relative to `root`, `""` at the root.
     project_rel: String,
     touched: Vec<String>,
     changes: Vec<AnchoredChange>,
-    restoring: Restoring,
+    /// The mode the undo reports in (`lanes::undo_mode`).
+    mode: Mode,
+    reversed: Reverse,
 }
 
 impl RowsPlan {
@@ -547,7 +889,7 @@ impl RowsPlan {
         project_rel: &str,
         index: &Index,
         changes: &Changes,
-        restoring: Restoring,
+        (mode, reversed): (Mode, Reverse),
     ) -> Self {
         let read = |rel: &str| files.read(rel).as_bytes().map(<[u8]>::to_vec);
         Self {
@@ -555,28 +897,57 @@ impl RowsPlan {
             project_rel: project_rel.to_string(),
             touched: exec::touched(index, &[]),
             changes: anchored(changes, read),
-            restoring,
+            mode,
+            reversed,
         }
+    }
+
+    async fn commit(&self, loader: &Loader) -> Result<(), String> {
+        let (root, at) = (&self.root, &self.project_rel);
+        commit(
+            loader,
+            root,
+            at,
+            &self.touched,
+            &self.changes,
+            &self.reversed,
+        )
+        .await
     }
 }
 
-/// The files a kept patch names, with why, as one sentence.
-fn kept_words(purl: &str, files: &[String], why: &str) -> String {
+/// The files a kept patch names, with why and what lifts it, as one
+/// sentence. The remedy is the one of the cause: a checkout is named for
+/// a file that drifted, never for a row no lane of this release undoes or
+/// for a flag the user gave.
+fn kept_words(purl: &str, files: &[String], why: &str, remedy: &str) -> String {
     format!(
         "what the Bazel build reads for {purl} was not undone, and nothing of it was changed: \
-         `{}` ({why}). Its record stays in the manifest; restore the file from version control \
-         (`git checkout -- <file>`), then run the command again",
+         `{}` ({why}). Its record stays in the manifest; {remedy}",
         files.join("`, `")
     )
 }
 
-/// The blocking half of [`undo_rows`]: reads the index file, and the
-/// workspace only when the index holds a row of one of `records`.
+/// What one planning of the rows is asked.
+struct Ask<'a> {
+    /// The records whose rows are undone here.
+    records: &'a [Record],
+    /// The records that only hold: each stays where the index records a
+    /// row of its patch, which another leg was to undo and did not.
+    hold: &'a [Record],
+    /// The records another leg undoes, rows included, and which stay only
+    /// beside an index nobody can rely on: that leg refuses there.
+    beside: &'a [Record],
+    /// `false` under `remove --skip-rollback`: nothing is undone.
+    revert: bool,
+}
+
+/// The blocking half of [`RowsLeg`]: reads the index file, and the
+/// workspace only when the index holds a row of one of the records.
 fn plan_rows(
     common: &GlobalArgs,
     loader: &Loader,
-    records: &[(String, String)],
-    revert: bool,
+    ask: &Ask<'_>,
     lanes: &LaneTable,
 ) -> (Undone, Option<RowsPlan>) {
     let mut out = Undone::default();
@@ -586,11 +957,6 @@ fn plan_rows(
         return (out, None);
     };
     let fresh = DiskView::new(place);
-    let incomplete = Code::RedirectRevertIncomplete.as_str().to_string();
-    let keep = |out: &mut Undone, purl: &str, why: String| {
-        out.warnings.push((incomplete.clone(), why.clone()));
-        out.kept.push((purl.to_string(), why));
-    };
     let at = [INDEX_PATH.to_string()];
     let index = match index_file(&fresh) {
         Ok(None) => return (out, None),
@@ -604,32 +970,56 @@ fn plan_rows(
                 let ecosystem = Ecosystem::from_purl(purl);
                 ecosystem.is_some_and(|eco| loaded.governance(eco) != Governance::NotGoverned)
             };
-            for (purl, _) in records.iter().filter(|(purl, _)| governed(purl)) {
+            let all = ask.records.iter().chain(ask.hold).chain(ask.beside);
+            for (purl, _) in all.filter(|(purl, _)| governed(purl)) {
+                if out.holds(purl) {
+                    continue;
+                }
                 out.root = Some(place.root.clone());
-                keep(&mut out, purl, kept_words(purl, &at, &fault.to_string()));
+                let remedy = rows::checkout(INDEX_PATH);
+                let why = kept_words(purl, &at, &fault.to_string(), &remedy);
+                out.keep(purl, Mode::Hosted, why);
             }
             return (out, None);
         }
     };
     let wired = inventory::wired(&index);
-    let held: Vec<&(String, String)> = records.iter().filter(|r| wired.contains(&r.1)).collect();
+    let mode = |uuid: &str| lanes::undo_mode(lanes, &inventory::lanes_of(&index, uuid).0);
+    for (purl, uuid) in ask.hold.iter().filter(|held| wired.contains(&held.1)) {
+        out.root = Some(place.root.clone());
+        let why = "the hosted pin of the patch was not restored, so what the owned index \
+                   records for it stands";
+        let remedy = "run the command again once the pin can be restored";
+        out.keep(purl, mode(uuid), kept_words(purl, &at, why, remedy));
+    }
+    let held: Vec<&Record> = ask
+        .records
+        .iter()
+        .filter(|r| wired.contains(&r.1))
+        .collect();
     if held.is_empty() {
         return (out, None);
     }
     out.root = Some(place.root.clone());
-    if !revert {
+    if !ask.revert {
         let why = "--skip-rollback leaves the wiring in place, and a pin with no record is one \
                    no command looks at again";
-        for (purl, _) in held {
-            keep(&mut out, purl, kept_words(purl, &at, why));
+        for (purl, uuid) in held {
+            let remedy = format!(
+                "run the command without `--skip-rollback`, or run `socket-patch rollback \
+                 {purl}` first"
+            );
+            out.keep(purl, mode(uuid), kept_words(purl, &at, why, &remedy));
         }
         return (out, None);
     }
     let loaded = loader.load(&project);
     let Some((_, ws)) = nearest(&loaded) else {
-        for (purl, _) in held {
+        for (purl, uuid) in held {
             let why = "the Bazel workspace cannot be read";
-            keep(&mut out, purl, kept_words(purl, &at, why));
+            let remedy = "make the Bazel files of the workspace readable, then run the command \
+                          again";
+            out.keep(purl, mode(uuid), kept_words(purl, &at, why, remedy));
         }
         return (out, None);
     };
@@ -641,10 +1031,18 @@ fn plan_rows(
     };
     let uuids: Vec<&str> = held.iter().map(|(_, uuid)| uuid.as_str()).collect();
     let undo: Undo = rows::revert(&side, &uuids);
+    let mut wrote: Vec<&str> = Vec::new();
     for (purl, uuid) in &held {
         match undo.incomplete(uuid) {
-            Some((files, why)) => keep(&mut out, purl, kept_words(purl, files, why)),
-            None if undo.restored(uuid) => out.reverted.push(purl.clone()),
+            Some((files, why)) => {
+                let remedy = undo.remedy(uuid).unwrap_or_default();
+                let words = kept_words(purl, files, why, remedy);
+                out.keep(purl, undo.mode(uuid, lanes), words);
+            }
+            None if undo.restored(uuid) => {
+                out.reverted.push(purl.clone());
+                wrote.extend(inventory::lanes_of(&index, uuid).0);
+            }
             None => {}
         }
     }
@@ -652,68 +1050,235 @@ fn plan_rows(
         return (out, None);
     }
     let purls = out.reverted.iter().map(String::as_str);
-    let restoring = reverse(common, &loaded, (ws, &fresh, &index), purls, &undo.changes);
+    let near = (ws, &fresh as &dyn FileView, &index);
+    let mode = lanes::undo_mode(lanes, &wrote);
+    let reversed = reverse(common, &loaded, lanes, mode, near, purls, &undo.changes);
     let below = &place.project_rel;
-    let plan = RowsPlan::of(&fresh, below, &index, &undo.changes, restoring);
+    let plan = RowsPlan::of(&fresh, below, &index, &undo.changes, (mode, reversed));
     (out, Some(plan))
 }
 
-/// Undoes what the owned index of the Bazel root records for `records`
-/// (`(purl, uuid)` of the manifest records a `rollback` or `remove`
-/// covers), a patch whole or not at all, in the commit anchored at the
-/// root. The rows are selected by patch, whatever the mode of the lane
-/// that wrote them. With `revert` false (`remove --skip-rollback`)
-/// nothing is undone, and a record that has rows is kept.
+/// The rows leg of one `rollback` or `remove`: what the owned index of
+/// the Bazel root records for the manifest records the run covers,
+/// selected by patch, whatever the mode of the lane that wrote a row.
 ///
-/// Under no Bazel root this is the stat-only probe; under a root whose
-/// index holds no row of the records it reads the index file and nothing
-/// else.
+/// It runs in two steps, around the command's other legs:
+///
+/// 1. [`RowsLeg::plan`], before anything is restored. It reads, and says
+///    which records the run must leave alone as a whole
+///    ([`RowsLeg::kept`]): a record whose rows cannot all be undone, one
+///    beside an index nobody can rely on, one `--skip-rollback` would
+///    leave wired with no record. A refused undo therefore restores
+///    nothing: the command takes such a record out of its in-place
+///    restore, or stops.
+/// 2. [`RowsLeg::undo`], after the legs. It undoes the rows of the
+///    records whose own leg succeeded, a patch whole or not at all, in
+///    the commit anchored at the root, and holds the record of a patch
+///    whose hosted pin was not restored while the index still records a
+///    row of it.
+///
+/// A record whose patch a hosted pin of the run wires as well is the
+/// hosted leg's to undo, rows included: that leg plans both sides before
+/// it writes. Step 1 keeps such a record only where no undo can be
+/// planned at all.
+///
+/// Under no Bazel root each step is the stat-only probe; under a root
+/// whose index holds no row of the records it reads the index file and
+/// nothing else.
+pub struct RowsLeg {
+    lanes: LaneTable,
+    revert: bool,
+    /// The records with no hosted pin: their rows are undone here.
+    own: Vec<Record>,
+    /// The records a hosted pin wires too, each with the purls of those
+    /// pins.
+    pinned: Vec<(Record, Vec<String>)>,
+    planned: Undone,
+}
+
+impl RowsLeg {
+    /// Step 1. `records` are the manifest records the run covers and
+    /// `pins` its hosted pins. With `revert` false (`remove
+    /// --skip-rollback`) nothing will be undone, and every record that
+    /// has rows is kept.
+    pub async fn plan(
+        common: &GlobalArgs,
+        records: &[Record],
+        pins: &[HostedPin],
+        revert: bool,
+        lanes: &LaneTable,
+    ) -> Self {
+        let of = |uuid: &str| -> Vec<String> {
+            let same = pins.iter().filter(|pin| pin.uuid == uuid);
+            same.map(|pin| pin.purl.clone()).collect()
+        };
+        let (mut own, mut pinned) = (Vec::new(), Vec::new());
+        for record in records {
+            match of(&record.1) {
+                purls if purls.is_empty() => own.push(record.clone()),
+                purls => pinned.push((record.clone(), purls)),
+            }
+        }
+        let mut leg = Self {
+            lanes: *lanes,
+            revert,
+            own,
+            pinned,
+            planned: Undone::default(),
+        };
+        if records.is_empty() || common.is_global() {
+            return leg;
+        }
+        let with_pins: Vec<Record> = leg
+            .pinned
+            .iter()
+            .map(|(record, _)| record.clone())
+            .collect();
+        // What is kept here is kept before anything was restored: the
+        // plan is dropped, and step 2 plans again over the tree the legs
+        // leave.
+        let hold = match revert {
+            true => Vec::new(),
+            false => with_pins.clone(),
+        };
+        (leg.planned, _) = planned(common, &leg.own, &hold, &with_pins, revert, lanes).await;
+        // Nothing was undone yet: step 2 says what was.
+        leg.planned.reverted.clear();
+        leg
+    }
+
+    /// The records the run leaves alone as a whole, known before it
+    /// restores anything.
+    pub fn kept(&self) -> &[Kept] {
+        &self.planned.kept
+    }
+
+    /// Whether the run leaves the record `purl` alone.
+    pub fn holds(&self, purl: &str) -> bool {
+        self.planned.holds(purl)
+    }
+
+    /// Step 2. `left` are the purls of the records whose own leg did not
+    /// undo them (the in-place restore failed or was never started, a
+    /// vendored entry's revert is another leg's): their rows stay.
+    /// `restored` are the purls of the hosted pins the run restored: the
+    /// record of a patch one of whose pins is not among them is held
+    /// while the index records a row of it.
+    pub async fn undo(self, common: &GlobalArgs, left: &[String], restored: &[String]) -> Undone {
+        let Self {
+            lanes,
+            revert,
+            own,
+            pinned,
+            planned: before,
+        } = self;
+        if common.is_global() {
+            return before;
+        }
+        let open = |record: &Record| !before.holds(&record.0) && !left.contains(&record.0);
+        let records: Vec<Record> = own.into_iter().filter(open).collect();
+        let unrestored = |(record, pins): &(Record, Vec<String>)| {
+            !before.holds(&record.0) && !pins.iter().all(|pin| restored.contains(pin))
+        };
+        let hold = pinned.into_iter().filter(unrestored);
+        let hold: Vec<Record> = hold.map(|(record, _)| record).collect();
+        if records.is_empty() && hold.is_empty() {
+            return before;
+        }
+        let (mut out, plan) = planned(common, &records, &hold, &[], revert, &lanes).await;
+        let Some(plan) = plan else {
+            return before.then(out);
+        };
+        let loader = run_loader(RunCx::from(common));
+        if !common.dry_run {
+            if let Err(why) = plan.commit(&loader).await {
+                // Nothing landed: every row stands, and so does every
+                // record. No file is at fault, so no checkout is named.
+                let at = [INDEX_PATH.to_string()];
+                for purl in std::mem::take(&mut out.reverted) {
+                    let why = kept_words(&purl, &at, &why, "run the command again");
+                    out.keep(&purl, plan.mode, why);
+                }
+                return before.then(out);
+            }
+        }
+        let mut said = Vec::new();
+        plan.reversed.advise(common, &mut said);
+        let said = said.into_iter();
+        out.warnings
+            .extend(said.map(|(code, detail)| (code.to_string(), detail)));
+        before.then(out)
+    }
+}
+
+/// One planning of the rows, off the async threads. The legs of the
+/// command may have written under the root since the run's loader read
+/// it, so the loader is told first.
+async fn planned(
+    common: &GlobalArgs,
+    records: &[Record],
+    hold: &[Record],
+    beside: &[Record],
+    revert: bool,
+    lanes: &LaneTable,
+) -> (Undone, Option<RowsPlan>) {
+    let loader = run_loader(RunCx::from(common));
+    let (owned, table) = (common.clone(), *lanes);
+    let (records, hold, beside) = (records.to_vec(), hold.to_vec(), beside.to_vec());
+    let task = tokio::task::spawn_blocking(move || {
+        loader.committed(&owned.project_root());
+        let ask = Ask {
+            records: &records,
+            hold: &hold,
+            beside: &beside,
+            revert,
+        };
+        plan_rows(&owned, &loader, &ask, &table)
+    });
+    match task.await {
+        Ok(planned) => planned,
+        Err(panic) => std::panic::resume_unwind(panic.into_panic()),
+    }
+}
+
+/// Both steps of [`RowsLeg`] at once, for records no other leg touches:
+/// undoes what the owned index of the Bazel root records for `records`,
+/// a patch whole or not at all, in the commit anchored at the root. With
+/// `revert` false nothing is undone, and a record that has rows is kept.
 pub async fn undo_rows(
     common: &GlobalArgs,
-    records: &[(String, String)],
+    records: &[Record],
     revert: bool,
     lanes: &LaneTable,
 ) -> Undone {
-    if records.is_empty() || common.is_global() {
-        return Undone::default();
+    let leg = RowsLeg::plan(common, records, &[], revert, lanes).await;
+    leg.undo(common, &[], &[]).await
+}
+
+/// What the run's loader found to say once about the Bazel workspace the
+/// command read (a workspace that cannot be read, a workspace file above
+/// the repository, the detection note): a command that wraps its body in
+/// `bazel_gate::in_run` takes them once, at its end. A person gets each
+/// line on stderr at the level of its code, and nothing is returned;
+/// under `--json` the `(code, detail)` entries are returned for
+/// `warnings[]`.
+pub fn said(common: &GlobalArgs) -> Vec<(String, String)> {
+    let found = run_loader(RunCx::from(common)).take_warnings();
+    if common.json {
+        let entry = |warning: super::Warning| (warning.code.as_str().to_string(), warning.detail);
+        return found.into_iter().map(entry).collect();
     }
-    let loader = run_loader(RunCx::from(common));
-    let (asked, owned, table) = (Arc::clone(&loader), common.clone(), *lanes);
-    let records = records.to_vec();
-    let task =
-        tokio::task::spawn_blocking(move || plan_rows(&owned, &asked, &records, revert, &table));
-    let (mut out, plan) = match task.await {
-        Ok(planned) => planned,
-        Err(panic) => std::panic::resume_unwind(panic.into_panic()),
-    };
-    let Some(plan) = plan else { return out };
-    let mut said = Vec::new();
-    if !common.dry_run {
-        let RowsPlan {
-            root,
-            project_rel,
-            touched,
-            changes,
-            restoring,
-        } = &plan;
-        let landed = commit(&loader, root, project_rel, touched, changes, restoring).await;
-        if let Err(why) = landed {
-            // Nothing landed: every row stands, and so does every record.
-            let code = Code::RedirectRevertIncomplete.as_str();
-            for purl in std::mem::take(&mut out.reverted) {
-                let why = kept_words(&purl, &[INDEX_PATH.to_string()], &why);
-                out.warnings.push((code.to_string(), why.clone()));
-                out.kept.push((purl, why));
-            }
-            return out;
+    for warning in &found {
+        match warning.code.level() {
+            Level::Warn => eprintln!("Warning: {}", warning.detail),
+            Level::Info if !common.silent => eprintln!("Note: {}", warning.detail),
+            Level::Info => {}
         }
     }
-    advise(common, &plan.restoring, &mut said);
-    let said = said.into_iter();
-    out.warnings
-        .extend(said.map(|(code, detail)| (code.to_string(), detail)));
-    out
+    Vec::new()
 }
+
+// ── Repair ───────────────────────────────────────────────────────────
 
 /// What `repair` reports of one finding of the executor.
 fn finding_words(finding: &Finding) -> (Code, String) {
@@ -772,37 +1337,35 @@ fn audit(
     let mut overlay = Overlay::new(&fresh);
     let found = exec::reconcile(ws, &index, &mut overlay);
     said.extend(found.findings.iter().map(finding_words));
-    // A recorded pin that no file the build reads holds any more. Only a
-    // lane that can tell its pins says so: "cannot tell" is not "erased".
+    // A recorded pin that no file the build reads holds any more, of a
+    // release a lock still resolves. Only a lane that can tell its pins
+    // says so: "cannot tell" is not "erased", and neither is a row that a
+    // bump or a removed hub left behind (`Attest::erased`).
     let probe = loaded.probe();
     let roots = Roots::Probed {
         probe: &probe,
         read: loaded.models(),
     };
     let attest = Attest::read(ws, lanes, &fresh, &index, roots);
-    for row in &index.pins {
-        let told = Ecosystem::from_purl(&row.purl)
-            .is_some_and(|eco| attest.discovered.unknown_for(eco).is_none());
-        let holds = |pin: &BazelRef| pin.uuid == row.uuid && pin.file == row.file;
-        if told && !attest.discovered.pins.iter().any(holds) {
-            let detail = format!(
-                "the pin of {} that socket-patch recorded in `{}` is gone: a ruleset's own pin \
-                 or update command, or an install, rewrote the file, and the Bazel build no \
-                 longer gets the patch. Run `socket-patch scan` to pin it again; its record \
-                 stays until `socket-patch rollback {}`",
-                row.purl, row.file, row.purl
-            );
-            said.push((Code::RedirectPinErased, detail));
-        }
+    for row in index.pins.iter().filter(|row| attest.erased(row)) {
+        let detail = format!(
+            "the pin of {} that socket-patch recorded in `{}` is gone: a ruleset's own pin or \
+             update command, or an install, rewrote the file, and the Bazel build no longer \
+             gets the patch. Run `socket-patch scan` to pin it again; its record stays until \
+             `socket-patch rollback {}`",
+            row.purl, row.file, row.purl
+        );
+        said.push((Code::RedirectPinErased, detail));
     }
     let changes = overlay.changes();
     if changes.is_empty() {
         return (said, None);
     }
     let none = std::iter::empty();
-    let restoring = reverse(common, &loaded, (ws, &fresh, &index), none, changes);
+    let near = (ws, &fresh as &dyn FileView, &index);
+    let reversed = reverse(common, &loaded, lanes, Mode::Hosted, near, none, changes);
     let below = &place.project_rel;
-    let plan = RowsPlan::of(&fresh, below, &index, changes, restoring);
+    let plan = RowsPlan::of(&fresh, below, &index, changes, (Mode::Hosted, reversed));
     (said, Some(plan))
 }
 
@@ -813,9 +1376,15 @@ fn audit(
 /// again what it can; and a recorded pin that is gone is named
 /// (`redirect_bazel_pin_erased`). No row and no pin is rebuilt, and what
 /// the executor wrote again is landed only where the edit leaves the
-/// build passing. A person gets each line on stderr at the level of its
-/// code; the entries are returned for `warnings[]`.
-pub async fn repair(common: &GlobalArgs, lanes: &LaneTable) -> Vec<RunWarning> {
+/// build passing. `download_only` (`repair --download-only`, which skips
+/// every cleanup) removes nothing: a recorded line whose tree is gone
+/// stays, as it does on a dry run. A person gets each line on stderr at
+/// the level of its code; the entries are returned for `warnings[]`.
+pub async fn repair(
+    common: &GlobalArgs,
+    download_only: bool,
+    lanes: &LaneTable,
+) -> Vec<RunWarning> {
     if common.is_global() {
         return Vec::new();
     }
@@ -826,7 +1395,12 @@ pub async fn repair(common: &GlobalArgs, lanes: &LaneTable) -> Vec<RunWarning> {
     if !probed.await.unwrap_or(false) {
         return Vec::new();
     }
-    let lines = repair_lines(&project, common.dry_run).await;
+    let how = match (common.dry_run, download_only) {
+        (true, _) => Repair::DryRun,
+        (false, true) => Repair::AddOnly,
+        (false, false) => Repair::All,
+    };
+    let lines = repair_lines(&project, how).await;
     let mut said: Vec<(Code, String)> = lines.into_iter().map(|a| (a.code, a.detail)).collect();
     loader.committed(&project);
     let (asked, owned, table) = (Arc::clone(&loader), common.clone(), *lanes);
@@ -843,33 +1417,32 @@ pub async fn repair(common: &GlobalArgs, lanes: &LaneTable) -> Vec<RunWarning> {
     said.extend(found.into_iter().filter(fresh));
     if let Some(plan) = plan.filter(|_| !common.dry_run) {
         // A repair is a restore nobody asked for by name: it lands only
-        // where builds keep passing.
-        let allowed = plan.restoring.decision.automatic_restore_allowed();
-        let landed = match allowed {
-            true => {
-                commit(
-                    &loader,
-                    &plan.root,
-                    &plan.project_rel,
-                    &plan.touched,
-                    &plan.changes,
-                    &plan.restoring,
-                )
-                .await
-            }
-            false => Err(
+        // where builds keep passing, and where every root could say so.
+        let mut asked = plan.reversed.asked.iter();
+        let fails = asked.any(|root| root.decision.builds_fail());
+        let landed = match (plan.reversed.automatic(), fails) {
+            (true, _) => plan.commit(&loader).await,
+            (false, true) => Err(
                 "writing it again would fail every build until Bazel's own state is \
-                          refreshed"
+                 refreshed"
+                    .to_string(),
+            ),
+            (false, false) => Err(
+                "a Bazel root above the project could not be asked what that would stale"
                     .to_string(),
             ),
         };
-        let advisory = plan.restoring.advisory.as_ref();
-        let then = advisory.map_or("", |(_, advisory)| advisory.detail.as_str());
         match landed {
-            Ok(()) => said.extend(advisory.map(|(_, a)| (a.code, a.detail.clone()))),
+            Ok(()) => {
+                let advised = plan.reversed.advisories().into_iter();
+                said.extend(advised.map(|(_, a)| (a.code, a.detail.clone())));
+            }
             Err(why) => said.push((
                 Code::RedirectDerivedUnrepairable,
-                format!("what the owned index records was not written again: {why}. {then}"),
+                format!(
+                    "what the owned index records was not written again: {why}. {}",
+                    plan.reversed.then()
+                ),
             )),
         }
     }
@@ -886,88 +1459,136 @@ pub async fn repair(common: &GlobalArgs, lanes: &LaneTable) -> Vec<RunWarning> {
     said.into_iter().map(entry).collect()
 }
 
-/// The target mode's gate, asked before a vendored package is taken over
-/// by hosted mode (design 7): `Some((code, detail))` when a Bazel ruleset
-/// builds the package and the hosted gate refuses the pin, so that the
-/// vendored wiring is never touched and stays byte for byte. `None`: no
-/// Bazel root, no ruleset governs the ecosystem, or a lane takes the pin.
-/// `patch_url` is the URL the pin would name.
-pub async fn takeover_refusal(
-    common: &GlobalArgs,
-    (purl, uuid): (&str, &str),
-    patch_url: &str,
-    lanes: &LaneTable,
-) -> Option<(String, String)> {
-    let ecosystem = Ecosystem::from_purl(purl)?;
-    let (_, name, version) = purl_parts(purl)?;
-    let (_, loaded) = load(common, &common.cwd).await?;
-    let governed = loaded.governance(ecosystem);
-    if governed == Governance::NotGoverned {
-        return None;
+// ── A takeover ───────────────────────────────────────────────────────
+
+/// A takeover the target mode's gate refused: the parts of the event of
+/// the package that stays in its source mode.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Refused {
+    /// `redirect_bazel_` plus the reason of the refusal.
+    pub code: &'static str,
+    /// Ends with the remedy and with "nothing was written".
+    pub detail: String,
+    /// `{ token, lift, bazel: { state: "refused", ruleset, lock, lane } }`,
+    /// the members every refusal of a gate adds to its event's `details`.
+    pub details: Value,
+}
+
+/// The target mode's gate of a vendored-to-hosted takeover (design 7):
+/// asked for each vendored package before its vendored wiring is touched,
+/// so that a package the hosted gate refuses stays vendored, byte for
+/// byte. The workspace is read once, with the first package asked about:
+/// nothing is written between two of them.
+pub struct TakeoverGate<'a> {
+    common: &'a GlobalArgs,
+    lanes: &'a LaneTable,
+    /// `None` until the first package is asked about; then the read, or
+    /// `None` under no Bazel root.
+    read: Option<Option<Arc<Loaded>>>,
+}
+
+impl<'a> TakeoverGate<'a> {
+    pub fn new(common: &'a GlobalArgs, lanes: &'a LaneTable) -> Self {
+        let read = None;
+        Self {
+            common,
+            lanes,
+            read,
+        }
     }
-    let refusal = match nearest(&loaded).map(|(root, ws)| (root, ws, root.index())) {
-        None => match governed {
-            Governance::Undetermined(gaps) => gate::undetermined(&gaps),
-            _ => gate::undetermined(&[]),
-        },
-        Some((_, _, IndexState::Faulty(fault))) => {
-            let code = Code::RedirectOwnedFileModified.as_str().to_string();
-            return Some((code, format!("{fault}; nothing was written")));
+
+    /// `Some` when a Bazel ruleset builds the package `purl` and the
+    /// hosted gate refuses the pin of the patch `uuid`. `None`: no Bazel
+    /// root, no ruleset governs the ecosystem, or a lane takes the pin.
+    /// `patch_url` is the URL the pin would name.
+    pub async fn refusal(
+        &mut self,
+        (purl, uuid): (&str, &str),
+        patch_url: &str,
+    ) -> Option<Refused> {
+        let common = self.common;
+        let ecosystem = Ecosystem::from_purl(purl)?;
+        let (_, name, version) = purl_parts(purl)?;
+        if self.read.is_none() {
+            let loaded = load(common, &common.cwd).await;
+            self.read = Some(loaded.map(|(_, loaded)| loaded));
         }
-        Some((root, ws, IndexState::Ours(index))) => {
-            let probe = loaded.probe();
-            let cx = GateCx {
-                roots: Roots::Probed {
-                    probe: &probe,
-                    read: loaded.models(),
-                },
-                run: run_policy(&RunCx::from(common)),
-                host: host(),
-                allow_patch_conflicts: common.allow_patch_conflicts,
-                patch_url: Some(patch_url),
-                ..GateCx::new(Mode::Hosted, ws, root.files(), index)
-            };
-            let req = PatchRequest {
-                ecosystem,
-                name: &name,
-                version: &version,
-                uuid,
-                project_rel: &root.root().project_rel,
-            };
-            match gate::gate(&cx, lanes, &req) {
-                GateOutcome::Refuse(refusal) => refusal,
-                _ => return None,
+        let loaded = self.read.as_ref()?.as_ref()?;
+        let governed = loaded.governance(ecosystem);
+        if governed == Governance::NotGoverned {
+            return None;
+        }
+        let ws = nearest(loaded).map(|(_, ws)| ws);
+        let refusal = match nearest(loaded).map(|(root, ws)| (root, ws, root.index())) {
+            None => match governed {
+                Governance::Undetermined(gaps) => gate::undetermined(&gaps),
+                _ => gate::undetermined(&[]),
+            },
+            // No lane writes beside an index that cannot be relied on.
+            Some((_, _, IndexState::Faulty(fault))) => {
+                let lift = Lift::UserEdit {
+                    file: INDEX_PATH.to_string(),
+                    what: "restore it from version control".to_string(),
+                };
+                let why = format!("the owned index cannot be relied on ({fault})");
+                let reason = Reason::OwnedFileModified;
+                lanes::refuse(reason, gate::OWNED_FILE_MODIFIED, why, lift)
             }
+            Some((root, ws, IndexState::Ours(index))) => {
+                let probe = loaded.probe();
+                let cx = GateCx {
+                    roots: Roots::Probed {
+                        probe: &probe,
+                        read: loaded.models(),
+                    },
+                    run: run_policy(&RunCx::from(common)),
+                    host: host(),
+                    allow_patch_conflicts: common.allow_patch_conflicts,
+                    patch_url: Some(patch_url),
+                    ..GateCx::new(Mode::Hosted, ws, root.files(), index)
+                };
+                let req = PatchRequest {
+                    ecosystem,
+                    name: &name,
+                    version: &version,
+                    uuid,
+                    project_rel: &root.root().project_rel,
+                };
+                match gate::gate(&cx, self.lanes, &req) {
+                    GateOutcome::Refuse(refusal) => refusal,
+                    _ => return None,
+                }
+            }
+        };
+        let code = Code::refusal(Mode::Hosted, refusal.reason);
+        let code = code.unwrap_or(Code::RedirectRulesetUnsupported);
+        Some(Refused {
+            code: code.as_str(),
+            details: refused_details(ws, ecosystem, refusal.token, &refusal.lift),
+            detail: refusal.detail,
+        })
+    }
+}
+
+/// Adds the `details` of each refused takeover of `refused` (the uuid of
+/// its patch with [`Refused::details`]) to the events of that patch:
+/// `token`, `lift` and `bazel`, beside what the event already says.
+pub fn annotate_refused(env: &mut Envelope, refused: &[(String, Value)]) {
+    for event in &mut env.events {
+        let of = |(uuid, _): &&(String, Value)| event.uuid.as_deref() == Some(uuid.as_str());
+        let Some((_, added)) = refused.iter().find(of) else {
+            continue;
+        };
+        let kept = event.details.take().filter(Value::is_object);
+        let mut details = kept.unwrap_or_else(|| json!({}));
+        if let (Some(into), Value::Object(added)) = (details.as_object_mut(), added.clone()) {
+            into.extend(added);
         }
-    };
-    let code = Code::refusal(Mode::Hosted, refusal.reason);
-    let code = code.unwrap_or(Code::RedirectRulesetUnsupported);
-    Some((code.as_str().to_string(), refusal.detail))
+        event.details = Some(details);
+    }
 }
 
-/// The lanes of the rows the index holds for the patch `uuid`, each once,
-/// and whether one of them is of a class beyond a lock pin.
-fn row_lanes<'a>(index: &'a Index, uuid: &str) -> (Vec<&'a str>, bool) {
-    let pins = index.pins.iter().map(|row| (&row.uuid, &row.lane));
-    let wired = (index.rc_flags.iter().map(|row| (&row.uuid, &row.lane)))
-        .chain(index.segment.iter().map(|row| (&row.uuid, &row.lane)))
-        .chain(index.bzl.iter().map(|row| (&row.uuid, &row.lane)))
-        .chain(index.files.iter().map(|row| (&row.uuid, &row.lane)))
-        .chain(index.tag_edits.iter().map(|row| (&row.uuid, &row.lane)));
-    let own = |(of, _): &(&String, &String)| of.as_str() == uuid;
-    let wired: Vec<&str> = wired.filter(own).map(|(_, lane)| lane.as_str()).collect();
-    let mut all: Vec<&str> = pins.filter(own).map(|(_, lane)| lane.as_str()).collect();
-    all.extend(&wired);
-    all.sort_unstable();
-    all.dedup();
-    (all, !wired.is_empty())
-}
-
-/// The first hub that builds `ecosystem`, as an event names it.
-fn hub_of(ws: &BazelWorkspace, ecosystem: Ecosystem) -> Option<&Hub> {
-    let builds = |hub: &&Hub| hub.ecosystem == ecosystem && inventory::may_build(hub);
-    ws.hubs.iter().find(builds)
-}
+// ── Audits ───────────────────────────────────────────────────────────
 
 /// One event of a listing: its place in the envelope, the patch, and the
 /// project-relative files that wire a hosted pin.
@@ -1019,17 +1640,13 @@ fn list_details(
             Held::RunPending => "pending",
             Held::Stale | Held::Drift | Held::NotConsumed => "withheld",
         };
-        let mut bazel = json!({ "state": state });
-        let hub = Ecosystem::from_purl(purl).and_then(|eco| hub_of(ws?, eco));
-        if let Some(hub) = hub {
-            bazel["ruleset"] = json!(hub.ruleset.name());
-            let lock = hub.locks.iter().find(|l| l.role == LockRole::PackageLock);
-            if let Some(lock) = lock {
-                bazel["lock"] = json!(lock.path.as_deref().unwrap_or(&lock.label));
-            }
-        }
+        let mut bazel = match Ecosystem::from_purl(purl) {
+            Some(ecosystem) => hub_details(ws, ecosystem),
+            None => json!({}),
+        };
+        bazel["state"] = json!(state);
         if let Some(Ok(index)) = index {
-            let (row_lanes, beyond_a_pin) = row_lanes(index, uuid);
+            let (row_lanes, beyond_a_pin) = inventory::lanes_of(index, uuid);
             if let Some(lane) = row_lanes.first() {
                 bazel["lane"] = json!(lane);
                 let spec = lanes.specs().find(|(_, spec)| spec.id.0 == *lane);
@@ -1106,7 +1723,7 @@ pub struct Verdict {
     pub state: Held,
     /// The check fails for it ([`check_fails`]).
     pub fails: bool,
-    /// The code of the drift, and what to do about it.
+    /// The code of the state, and what to do about it.
     pub code: Code,
     pub detail: String,
 }
@@ -1116,83 +1733,112 @@ pub struct Verdict {
 /// defaulted): for drift always, and for a row a version bump made stale
 /// only where the lane's leftover fails the build. The one place the
 /// decision is made; the rule itself is `Held::fails_check`.
+///
+/// It is asked for a record the index holds wiring for, which has a lane
+/// in some row list (`inventory::lanes_of`). No lane at all is a row list
+/// this build does not read a lane from: like a lane no table holds, it
+/// cannot be called inert.
 pub fn check_fails(lanes: &LaneTable, row_lanes: &[&str], state: Held) -> bool {
+    let unknown = matches!(state, Held::Drift | Held::Stale);
     let fails = |lane: &&str| {
         let spec = lanes.specs().find(|(_, spec)| spec.id.0 == *lane);
         match spec {
             Some((_, spec)) => state.fails_check(spec.stale),
             // A lane this build does not know cannot be called inert.
-            None => matches!(state, Held::Drift | Held::Stale),
+            None => unknown,
         }
     };
-    row_lanes.iter().any(fails)
+    match row_lanes.is_empty() {
+        true => unknown,
+        false => row_lanes.iter().any(fails),
+    }
 }
 
 /// The verdict of each record of `records` that the index of `attest`
-/// holds a row for, from committed files alone. A record with no row was
-/// never wired: it has no verdict here and never fails the check. A
-/// record whose pins no lane can tell is `not_consumed`: cannot tell is
-/// not drift.
-pub fn verdicts(
-    attest: &Attest<'_>,
-    project_rel: &str,
-    records: &[(String, String)],
-) -> Vec<Verdict> {
+/// holds a row for, from committed files alone (`Attest::held` has the
+/// rule). A record with no row was never wired: it has no verdict here
+/// and never fails the check. A record whose pins no lane can tell is
+/// `not_consumed`: cannot tell is not drift. A row for a release no lock
+/// resolves any more is `stale`, which fails only under a lane whose
+/// leftover fails the build.
+pub fn verdicts(attest: &Attest<'_>, project_rel: &str, records: &[Record]) -> Vec<Verdict> {
     let wired = inventory::wired(attest.index);
     let mut out = Vec::new();
     for (purl, uuid) in records.iter().filter(|(_, uuid)| wired.contains(uuid)) {
-        let Some(ecosystem) = Ecosystem::from_purl(purl) else {
-            continue;
-        };
-        let own = |pin: &&BazelRef| pin.uuid == *uuid && PurlKey::same(&pin.purl, purl);
-        let pin = attest.discovered.pins.iter().find(own);
-        let installed = Candidate {
-            purl,
-            uuid,
-            project_rel,
-            basis: Basis::Installed,
-            grant: None,
-        };
-        let verdict = match pin {
-            None if attest.discovered.unknown_for(ecosystem).is_some() => None,
-            None => Some(attest.consumer(&installed)),
-            Some(pin) => Some(attest.consumer(&Candidate::of_pin(pin, project_rel, None))),
-        };
-        let state = verdict.as_ref().map_or(Held::NotConsumed, Held::of);
-        let (row_lanes, _) = row_lanes(attest.index, uuid);
-        let (code, detail) = match (pin, verdict) {
-            (Some(_), Some(Err(why))) => (Code::withheld(why.kind), why.detail),
-            (None, Some(_)) => {
-                let detail = "no file the Bazel build reads holds the pin that socket-patch \
-                              recorded for this patch any more (a ruleset's own pin or update \
-                              command, or an install, rewrote it); run `socket-patch scan` to pin \
-                              it again";
-                (Code::RedirectPinErased, detail.to_string())
-            }
-            _ => (Code::AgentNotConsumed, String::new()),
-        };
+        let held = attest.held(purl, uuid, project_rel);
+        let (row_lanes, _) = inventory::lanes_of(attest.index, uuid);
         out.push(Verdict {
             purl: purl.clone(),
-            state,
-            fails: check_fails(attest.lanes, &row_lanes, state),
-            code,
-            detail,
+            state: held.state,
+            fails: check_fails(attest.lanes, &row_lanes, held.state),
+            code: held.code,
+            detail: held.detail,
         });
     }
     out
 }
 
+/// What `apply --check` adds for the project at `--cwd` under a Bazel
+/// root ([`check`]).
+#[derive(Debug, Default)]
+pub struct Checked {
+    /// What fails the check, as `(id, code, detail)`: a record whose
+    /// recorded wiring no longer stands, an owned index that is not the
+    /// one socket-patch wrote, a commit an interrupted run left pending
+    /// at the root.
+    pub drifts: Vec<(String, String, String)>,
+    /// The verdict of each record the index holds wiring for.
+    pub verdicts: Vec<Verdict>,
+}
+
+impl Checked {
+    /// What the run says of a record whose wiring does not fail the
+    /// check and is not in place either: a row for a release the lock no
+    /// longer resolves, under a lane whose leftover is inert (the check
+    /// exits 0 with this advisory), and a pin that waits for its command.
+    pub fn warnings(&self) -> Vec<RunWarning> {
+        let open = |verdict: &&Verdict| !verdict.fails && !verdict.detail.is_empty();
+        let entry = |verdict: &Verdict| {
+            let detail = format!(
+                "{}: the Bazel wiring of this patch is `{}`: {}",
+                verdict.purl,
+                verdict.state.as_str(),
+                verdict.detail
+            );
+            RunWarning::new(verdict.code.as_str(), detail)
+        };
+        self.verdicts.iter().filter(open).map(entry).collect()
+    }
+
+    /// Sets `details.bazel.state` on each event of a record that has a
+    /// verdict, beside what the event already says of Bazel.
+    pub fn mark(&self, env: &mut Envelope) {
+        for event in &mut env.events {
+            let Some(purl) = event.purl.as_deref() else {
+                continue;
+            };
+            let of =
+                |verdict: &&Verdict| verdict.purl == purl || PurlKey::same(&verdict.purl, purl);
+            let Some(verdict) = self.verdicts.iter().find(of) else {
+                continue;
+            };
+            let kept = event.details.take().filter(Value::is_object);
+            let mut details = kept.unwrap_or_else(|| json!({}));
+            if !details["bazel"].is_object() {
+                details["bazel"] = json!({});
+            }
+            details["bazel"]["state"] = json!(verdict.state.as_str());
+            event.details = Some(details);
+        }
+    }
+}
+
 /// The blocking half of [`check`].
-fn check_at(
-    loader: &Loader,
-    project: &Path,
-    records: &[(String, String)],
-    lanes: &LaneTable,
-) -> Vec<(String, String, String)> {
-    let mut drifts = Vec::new();
+fn check_at(loader: &Loader, project: &Path, records: &[Record], lanes: &LaneTable) -> Checked {
+    let mut out = Checked::default();
     let survey = loader.survey(project);
     let Some(place) = survey.roots.first() else {
-        return drifts;
+        return out;
     };
     // A commit an interrupted run left at the root: its files may be half
     // replaced, and a read-only run can neither finish it nor trust them.
@@ -1206,25 +1852,27 @@ fn check_at(
             "{journal}: an interrupted socket-patch run left a commit pending at the Bazel root \
              (`commit_pending`); run `socket-patch apply` (or any command that writes) to finish it"
         );
-        drifts.push((journal, "vendor_commit_pending".to_string(), detail));
+        let code = "vendor_commit_pending".to_string();
+        out.drifts.push((journal, code, detail));
     }
     let fresh = DiskView::new(place);
     let index = match index_file(&fresh) {
-        Ok(None) => return drifts,
+        Ok(None) => return out,
         Ok(Some(index)) => index,
         Err(fault) => {
             let code = Code::RedirectOwnedFileModified.as_str().to_string();
-            drifts.push((INDEX_PATH.to_string(), code, fault.to_string()));
-            return drifts;
+            out.drifts
+                .push((INDEX_PATH.to_string(), code, fault.to_string()));
+            return out;
         }
     };
     let wired = inventory::wired(&index);
     if !records.iter().any(|(_, uuid)| wired.contains(uuid)) {
-        return drifts;
+        return out;
     }
     let loaded = loader.load(project);
     let Some((root, ws)) = nearest(&loaded) else {
-        return drifts;
+        return out;
     };
     let probe = loaded.probe();
     let roots = Roots::Probed {
@@ -1232,33 +1880,32 @@ fn check_at(
         read: loaded.models(),
     };
     let attest = Attest::read(ws, lanes, &fresh, &index, roots);
-    let found = verdicts(&attest, &root.root().project_rel, records);
-    for verdict in found.into_iter().filter(|verdict| verdict.fails) {
+    out.verdicts = verdicts(&attest, &root.root().project_rel, records);
+    for verdict in out.verdicts.iter().filter(|verdict| verdict.fails) {
         let detail = format!(
             "{}: the Bazel wiring of this patch no longer stands (`{}`): {}",
             verdict.purl,
             verdict.state.as_str(),
             verdict.detail
         );
-        drifts.push((verdict.purl, verdict.code.as_str().to_string(), detail));
+        let code = verdict.code.as_str().to_string();
+        out.drifts.push((verdict.purl.clone(), code, detail));
     }
-    drifts
+    out
 }
 
-/// The drifts `apply --check` adds for the project at `--cwd` under a
-/// Bazel root, as `(id, code, detail)`: a record whose recorded wiring no
-/// longer stands ([`verdicts`], [`check_fails`]), an owned index that is
-/// not the one socket-patch wrote, and a commit an interrupted run left
-/// pending at the root. A record that was never wired adds none, and
-/// neither does one whose pins no lane can tell. Read-only; under no
-/// Bazel root the stat-only probe.
-pub async fn check(
-    common: &GlobalArgs,
-    records: Vec<(String, String)>,
-    lanes: &LaneTable,
-) -> Vec<(String, String, String)> {
+/// What `apply --check` adds for the project at `--cwd` under a Bazel
+/// root: the drifts (a record whose recorded wiring no longer stands,
+/// [`verdicts`] and [`check_fails`]; an owned index that is not the one
+/// socket-patch wrote; a commit an interrupted run left pending at the
+/// root) and the verdict of every record the index holds wiring for, for
+/// the advisory and the `details.bazel.state` of one that does not fail
+/// the check. A record that was never wired has no verdict and adds no
+/// drift, and neither does one whose pins no lane can tell. Read-only;
+/// under no Bazel root the stat-only probe.
+pub async fn check(common: &GlobalArgs, records: Vec<Record>, lanes: &LaneTable) -> Checked {
     if records.is_empty() || common.is_global() {
-        return Vec::new();
+        return Checked::default();
     }
     let run = RunCx {
         read_only: true,
@@ -1267,7 +1914,7 @@ pub async fn check(
     let (loader, project, table) = (run_loader(run), common.cwd.clone(), *lanes);
     let task = tokio::task::spawn_blocking(move || check_at(&loader, &project, &records, &table));
     match task.await {
-        Ok(drifts) => drifts,
+        Ok(checked) => checked,
         Err(panic) => std::panic::resume_unwind(panic.into_panic()),
     }
 }
@@ -1276,8 +1923,9 @@ pub async fn check(
 mod tests {
     use socket_patch_core::bazel::attest::{HookUnit, OwnedFile, OwnedState};
     use socket_patch_core::bazel::model::{
-        AttestBasis, CellClaim, ClaimSystem, HookKind, LaneCx, LaneOps, LaneSpec, RootRef, Ruleset,
-        StaleBehaviour, StmtRef, TagEdit, TagOp, TextRead, TokenSurface, WriteClass,
+        AttestBasis, BazelRef, CellClaim, ClaimSystem, HookKind, LaneCx, LaneOps, LaneSpec,
+        RootRef, Ruleset, StaleBehaviour, StmtRef, TagEdit, TagOp, TextRead, TokenSurface,
+        WriteClass,
     };
     use socket_patch_core::bazel::owned_index::{
         HookAt, HookRow, IndexEdit, IndexRow, LabelStrategy, SegmentKind, SegmentRow, TagEditRow,
@@ -1347,17 +1995,22 @@ mod tests {
         Some(pins)
     }
 
-    fn toy_inventory(_: &LaneCx<'_>, _: TextRead<'_>) -> Option<Vec<LockfileEntry>> {
-        Some(vec![LockfileEntry {
+    /// What the lock resolves: each `left-pad@<version>` it names.
+    fn toy_inventory(_: &LaneCx<'_>, read: TextRead<'_>) -> Option<Vec<LockfileEntry>> {
+        let text = read(LOCK)?;
+        let versions = text.split("left-pad@").skip(1);
+        let versions = versions.filter_map(|rest| rest.split(':').next());
+        let entry = |version: &str| LockfileEntry {
             ecosystem: "npm",
             name: "left-pad".to_string(),
-            version: "1.3.0".to_string(),
-            purl: PURL.to_string(),
+            version: version.to_string(),
+            purl: format!("pkg:npm/left-pad@{version}"),
             resolved: None,
             integrity: LockIntegrity::None,
             source_kind: SourceKind::Unspecified,
             pnpm_env: false,
-        }])
+        };
+        Some(versions.map(entry).collect())
     }
 
     /// The owned state a test wants the verdict proven over.
@@ -1389,9 +2042,19 @@ mod tests {
     }
 
     /// The verdicts of the record of `left-pad`, and of one that was never
-    /// wired, over a checkout whose lock holds `digest` and whose owned
-    /// index is `index`, read through `lanes`.
+    /// wired, over a checkout whose lock resolves `left-pad@1.3.0` with
+    /// `digest` and whose owned index is `index`, read through `lanes`.
     fn checked(index: &Index, digest: &str, hook: HookUnit, lanes: &LaneTable) -> Vec<Verdict> {
+        checked_at(index, ("1.3.0", digest), hook, lanes)
+    }
+
+    /// [`checked`] over a lock that resolves `left-pad@<version>`.
+    fn checked_at(
+        index: &Index,
+        (version, digest): (&str, &str),
+        hook: HookUnit,
+        lanes: &LaneTable,
+    ) -> Vec<Verdict> {
         let tmp = tempfile::tempdir().expect("a temporary directory");
         let top = std::fs::canonicalize(tmp.path()).expect("its real path");
         let put = |rel: &str, text: &str| {
@@ -1403,7 +2066,7 @@ mod tests {
         put(".bazelversion", "9.3.2\n");
         put("MODULE.bazel", MODULE);
         let lock = format!(
-            "lockfileVersion: '9.0'\n\npackages:\n\n  left-pad@1.3.0:\n    resolution: \
+            "lockfileVersion: '9.0'\n\npackages:\n\n  left-pad@{version}:\n    resolution: \
              {{integrity: {digest}}}\n"
         );
         put(LOCK, &lock);
@@ -1450,6 +2113,10 @@ mod tests {
         assert_eq!(erased.code, Code::RedirectPinErased);
         assert!(erased.detail.contains("socket-patch scan"), "{erased:?}");
 
+        // A missing hook and an erased pin are named by the code whose
+        // contract row has the remedy, never by one of the `vex` table.
+        assert!(!erased.code.as_str().starts_with("vex_"), "{erased:?}");
+
         // A segment row whose hook is gone from the user's file.
         let mut hooked = pinned.clone();
         hooked.label_strategy = Some(LabelStrategy::Ancestor);
@@ -1476,6 +2143,7 @@ mod tests {
         let unhooked = one(&hooked, "sha512-patched", HookUnit::Absent);
         assert_eq!((unhooked.state, unhooked.fails), (Held::Drift, true));
         assert!(unhooked.detail.contains("MODULE.bazel"), "{unhooked:?}");
+        assert_eq!(unhooked.code, Code::WorkspaceHookNeeded);
 
         // A tag edit keyed for a version the lock no longer pins.
         for (lane, fails) in [("H-TOYI", false), ("H-TOYF", true)] {
@@ -1505,6 +2173,45 @@ mod tests {
             assert_eq!((stale.state, stale.fails), (Held::Stale, fails), "{lane}");
         }
 
+        // The user bumped the package: the lock resolves 1.4.0 alone, so
+        // the pin of 1.3.0 is not one somebody erased. The row is stale,
+        // and the check fails only where the lane's leftover fails the
+        // build (owner decision O53): a routine bump is not drift.
+        for (lane, fails) in [("H-TOYI", false), ("H-TOYF", true)] {
+            let bumped = Index {
+                pins: vec![pin_row(lane)],
+                ..Index::default()
+            };
+            let next = ("1.4.0", "sha512-next");
+            let found = checked_at(&bumped, next, HookUnit::Present, &TABLE);
+            let [stale] = found.as_slice() else {
+                panic!("{lane}: one verdict: {found:?}");
+            };
+            assert_eq!((stale.state, stale.fails), (Held::Stale, fails), "{lane}");
+            assert_eq!(stale.code, Code::AgentNotConsumed, "{lane}");
+            assert!(stale.detail.contains("socket-patch scan"), "{stale:?}");
+            // It is said, and marked on the record's event, either way.
+            let said = Checked {
+                drifts: Vec::new(),
+                verdicts: found.clone(),
+            };
+            let warnings = said.warnings();
+            assert_eq!(warnings.len(), usize::from(!fails), "{lane}: {warnings:?}");
+            if let Some(warning) = warnings.first() {
+                assert_eq!(warning.code, Code::AgentNotConsumed.as_str());
+                assert!(warning.detail.contains("`stale`"), "{warning:?}");
+            }
+            use crate::json_envelope::{Command, PatchAction, PatchEvent};
+            let mut env = Envelope::new(Command::Apply);
+            let event = PatchEvent::new(PatchAction::Skipped, PURL);
+            env.record(event.with_details(json!({ "bazel": { "hub": "npm" } })));
+            env.record(PatchEvent::new(PatchAction::Skipped, "pkg:npm/other@1.0.0"));
+            said.mark(&mut env);
+            let details = env.events[0].details.as_ref().expect("details");
+            assert_eq!(details["bazel"], json!({ "hub": "npm", "state": "stale" }));
+            assert!(env.events[1].details.is_none());
+        }
+
         // The shipped lanes cannot tell their pins: a hand-written row is
         // `not_consumed`, whatever the lock holds, and never fails.
         for digest in ["sha512-patched", "sha512-upstream"] {
@@ -1516,7 +2223,48 @@ mod tests {
         assert!(!check_fails(&TABLE, &["H-GONE"], Held::NotConsumed));
         assert!(check_fails(&TABLE, &["H-GONE"], Held::Stale));
         assert!(check_fails(&TABLE, &["H-TOYI", "H-TOYF"], Held::Stale));
-        assert!(!check_fails(&TABLE, &[], Held::Drift), "no row, no wiring");
+        // A wired record with no lane to read (a row list this build
+        // takes no lane from) fails closed, like a lane no table holds.
+        assert!(check_fails(&TABLE, &[], Held::Drift));
+        assert!(check_fails(&TABLE, &[], Held::Stale));
+        assert!(!check_fails(&TABLE, &[], Held::NotConsumed));
+    }
+
+    /// A root further up names the files of a change set by its own
+    /// paths: the place of the nearest root under it, level by level.
+    #[test]
+    fn a_root_further_up_names_the_files_by_its_own_paths() {
+        let outer = Path::new("ws");
+        let inner = outer.join("services").join("api");
+        assert_eq!(
+            place_under(&inner, outer),
+            Some("services/api/".to_string())
+        );
+        assert_eq!(place_under(outer, outer), Some(String::new()));
+        assert_eq!(place_under(outer, &inner), None, "not above it");
+    }
+
+    /// The details of a refused takeover ride every event of its patch,
+    /// beside what the event already says, and no other event.
+    #[test]
+    fn a_refused_takeover_adds_its_details_to_the_events_of_its_patch() {
+        use crate::json_envelope::{Command, PatchAction, PatchEvent};
+        let mut env = Envelope::new(Command::Scan);
+        let skipped = PatchEvent::new(PatchAction::Skipped, PURL).with_uuid(UUID);
+        env.record(skipped.with_details(json!({ "mode": "hosted" })));
+        env.record(PatchEvent::new(PatchAction::Skipped, PURL).with_uuid(NEVER));
+        let lift = Lift::UserEdit {
+            file: INDEX_PATH.to_string(),
+            what: "restore it from version control".to_string(),
+        };
+        let details = refused_details(None, Ecosystem::Npm, "owned_file_modified", &lift);
+        annotate_refused(&mut env, &[(UUID.to_string(), details)]);
+        let said = env.events[0].details.as_ref().expect("details");
+        assert_eq!(said["mode"], "hosted");
+        assert_eq!(said["token"], "owned_file_modified");
+        assert_eq!(said["lift"]["file"], INDEX_PATH);
+        assert_eq!(said["bazel"], json!({ "state": "refused" }));
+        assert!(env.events[1].details.is_none());
     }
 
     /// An undo lands its edits before the record, and an event of a record
@@ -1536,12 +2284,21 @@ mod tests {
         assert_eq!(landed[2].write, None);
 
         use crate::json_envelope::{Command, PatchAction, PatchEvent};
-        let undone = Undone {
-            kept: vec![("pkg:npm/kept@1.0.0".to_string(), "why".to_string())],
+        let mut undone = Undone {
             reverted: vec![PURL.to_string()],
-            warnings: Vec::new(),
             root: Some(PathBuf::from("ws")),
+            ..Undone::default()
         };
+        // A kept record reports under the code of the mode of its rows.
+        undone.keep("pkg:npm/kept@1.0.0", Mode::Vendored, "why".to_string());
+        assert_eq!(undone.kept[0].code, Code::VendorRevertIncomplete.as_str());
+        assert_eq!(undone.warnings[0].0, Code::VendorRevertIncomplete.as_str());
+        let mut hosted = Undone::default();
+        for mode in [Mode::Hosted, Mode::Agent] {
+            hosted.keep(PURL, mode, "why".to_string());
+        }
+        let codes: Vec<&str> = hosted.kept.iter().map(|kept| kept.code).collect();
+        assert_eq!(codes, [Code::RedirectRevertIncomplete.as_str(); 2]);
         assert!(undone.holds("pkg:npm/kept@1.0.0") && !undone.holds(PURL));
         let mut env = Envelope::new(Command::Rollback);
         for purl in [PURL, "pkg:npm/kept@1.0.0", "pkg:npm/other@1.0.0"] {

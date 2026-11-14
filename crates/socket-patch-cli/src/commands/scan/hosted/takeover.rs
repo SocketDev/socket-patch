@@ -77,6 +77,10 @@ pub(super) struct Takeover {
     staged: Vec<Staged>,
     /// Refusals, in order.
     warnings: Vec<serde_json::Value>,
+    /// The purls the target mode's gate refused under a Bazel hub, by
+    /// patch uuid, each with the `details` of its refusal (`token`,
+    /// `lift`, `bazel`): what its skipped event carries beside the code.
+    refused: Vec<(String, serde_json::Value)>,
     /// Rewriter warnings that explained a retracted purl (the final rewrite
     /// no longer reports them once the purl left the rewrite set).
     explained: Vec<RewriteWarning>,
@@ -87,6 +91,10 @@ pub(super) struct Finished {
     /// Refusals and the per-purl takeover announcements, reported after the
     /// rewriters' own warnings.
     pub warnings: Vec<serde_json::Value>,
+    /// The refusals of the target mode's gate, by patch uuid, each with
+    /// the `details` its skipped event carries
+    /// (`bazel_gate::commands::annotate_refused`).
+    pub refused: Vec<(String, serde_json::Value)>,
     /// The purls migrated (or to be migrated) from vendored to hosted.
     pub migrated: Vec<String>,
     /// The files their revert touches. Human output counts `rewritten ∪
@@ -112,12 +120,17 @@ impl Takeover {
             attempts: Vec::new(),
             staged: Vec::new(),
             warnings: Vec::new(),
+            refused: Vec::new(),
             explained: Vec::new(),
         };
         if !takeover::any_takeover_ecosystem(candidates.iter().map(|c| c.purl.as_str())) {
             return Ok(out);
         }
         let mut refused: Vec<String> = Vec::new();
+        // The target mode's gate, which reads the workspace once for
+        // every candidate it is asked about.
+        let lanes = &crate::bazel_gate::commands::PRODUCTION;
+        let mut target = crate::bazel_gate::commands::TakeoverGate::new(common, lanes);
         for candidate in candidates.iter() {
             let purl = &candidate.purl;
             let entry = vendor_state.as_ref().ok().and_then(|s| {
@@ -130,22 +143,21 @@ impl Takeover {
             // Bazel ruleset builds the package and the hosted gate refuses
             // the pin, the revert is never staged and the entry stays
             // vendored, byte for byte.
-            let lanes = &crate::bazel_gate::commands::PRODUCTION;
             let patch = (purl.as_str(), candidate.dep.patch_uuid.as_str());
             let url = &candidate.dep.artifact_url;
             let gate = match entry {
-                Some(_) => {
-                    crate::bazel_gate::commands::takeover_refusal(common, patch, url, lanes).await
-                }
+                Some(_) => target.refusal(patch, url).await,
                 None => None,
             };
-            if let Some((code, detail)) = gate {
+            if let Some(gate) = gate {
                 refused.push(purl.clone());
                 out.warnings
-                    .push(serde_json::json!({ "code": code, "detail": detail }));
+                    .push(serde_json::json!({ "code": gate.code, "detail": gate.detail }));
+                out.refused
+                    .push((candidate.dep.patch_uuid.clone(), gate.details));
                 skipped.push(SkippedPatch {
-                    detail: Some(detail),
-                    ..SkippedPatch::new(purl, &candidate.dep.patch_uuid, &code)
+                    detail: Some(gate.detail),
+                    ..SkippedPatch::new(purl, &candidate.dep.patch_uuid, gate.code)
                 });
                 continue;
             }
@@ -473,6 +485,7 @@ impl Takeover {
         }
         Finished {
             warnings,
+            refused: self.refused,
             migrated,
             files,
         }

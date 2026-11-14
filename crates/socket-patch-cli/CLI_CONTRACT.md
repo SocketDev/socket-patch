@@ -306,7 +306,7 @@ Beyond the globals above, each subcommand defines a small set of local arguments
 | `remove` | positional `identifier` (target grammar: UUID, PURL with or without version, or exact package name); `--skip-rollback`; `--preserve-state` (v5.0) | `SOCKET_SKIP_ROLLBACK`, `SOCKET_PRESERVE_STATE` | Manifest entry removal. The identifier matches like a `rollback` target (a PyPI name compares by its PEP 503 canonical form). `--preserve-state` is the single-patch twin of `rollback --preserve-state`: restore the tree and unwind the identifier's vendored/hosted wiring, but keep the manifest entry, the vendored artifact + ledger entry, and skip all GC. Combining it with `--skip-rollback` is a self-enforced usage error (exit 2): one flag keeps the tree and drops the state, the other restores the tree and keeps the state — together they select the do-nothing quadrant ("the combination would be a no-op: nothing would change"). The conflict fires whether either flag is spelled on the command line or sourced from its env var |
 | `rollback` | optional variadic positional `targets` (PURL \| UUID \| package name \| path glob); `--preserve-state` (v5.0) | `SOCKET_PRESERVE_STATE` | Rollback scope. Multiple targets union. A token becomes a path glob ONLY when it is path-SHAPED — contains a separator (`/` or `\`) or a glob metacharacter (`*?[`), or starts with `./`, or is absolute (an npm `@scope/name` is a name, not a path; a relative slash name without glob metacharacters or `.`/`..` segments — composer `vendor/pkg`, a go module path — is a name when it selects a recorded or hosted patch); a `pkg:` prefix is a PURL and every other token keeps the target grammar (UUID, PURL or exact package name), so a mistyped identifier or truncated UUID stays a safe exit-1 "No patch found matching identifier: X" (with a hint suggesting `./X` or `X/**` for directory targeting) instead of silently becoming a path scope. An unparseable glob is a usage error (exit 2) |
 | `vex` | `--output` / `-O`, `--product`, `--no-verify`, `--doc-id`, `--compact` | `SOCKET_VEX_OUTPUT`, `SOCKET_VEX_PRODUCT`, `SOCKET_VEX_NO_VERIFY`, `SOCKET_VEX_DOC_ID`, `SOCKET_VEX_COMPACT` | OpenVEX 0.2.0 document generation; see "vex output channels" below |
-| `repair` | `--download-only` | `SOCKET_DOWNLOAD_ONLY` | Repair-specific cleanup mode (mutually exclusive with `--offline`; combining them is a usage error, exit 2) |
+| `repair` | `--download-only` | `SOCKET_DOWNLOAD_ONLY` | Repair-specific cleanup mode (mutually exclusive with `--offline`; combining them is a usage error, exit 2). Under a Bazel root it removes nothing either: a recorded `.bazelignore` line whose tree is gone stays, with its record, as on a dry run; a tree that has no line still gets one |
 
 **pnpm hosted-mode contract**: `scan --mode hosted` handles block and flow resolutions in legacy `shrinkwrap.yaml` and lockfileVersion 5.x, 6.0, and 9.0. The [pinned compatibility matrix](../../docs/testing/pnpm-compatibility.md) samples pnpm majors 1–12. Early shrinkwrapVersion 3 without a positive minor version is refused with `redirect_pnpm_legacy_lockfile_unsupported`: pnpm 1.0.0 discards hosted URLs even on frozen installs. Upgrade to a tested release (1.43.1 or newer) and regenerate the lock, or use agent mode.
 
@@ -3228,7 +3228,10 @@ table that describe the workspace itself (`bazel_workspace_detected`,
 `bazel_workspace_above_repo`, `bazel_workspace_rc_unread`), each text once per run however
 many projects of the run lie in the workspace. `get` reports them with the apply it ends
 with. `vendor` reports them when it asks which lock files Bazel reads for the packages it
-vendors. `apply` reads the workspace only when its manifest holds a patch in the run's scope:
+vendors. `rollback`, `remove` and `repair` report them once, at the end of the run, when
+they read the workspace: for a hosted pin to restore, for a record the owned index holds a
+row for, or for an owned index to audit; a run of theirs that needs none of that reads no
+workspace and reports none. `apply` reads the workspace only when its manifest holds a patch in the run's scope:
 with none it reports `bazel_workspace_above_repo` alone, which needs no read. A run on the
 global installs (`--global`, `--global-prefix`) reports none. In this release
 `bazel_workspace_out_of_scope` is the count alone: no patch has a plan for it to ride.
@@ -3268,6 +3271,16 @@ case. A `-` means the mode has no such refusal. The `ruleset_unsupported` and
 `owned_file_modified` codes are the exception: they have a row each for as long as their
 statuses differ, and the `-` in each of those rows stands for the other mode's code.
 
+A mode takeover is refused by the target mode's gate, and a refused takeover leaves the
+source mode as it was, byte for byte. Vendored to hosted (`scan --mode hosted` over a
+vendored package): the hosted gate is asked before the vendored entry is touched. Hosted to
+vendored (the eject of `vendor`): in this release the vendored gate is asked by the vendored
+apply, which runs after the eject has planned and made its restore of the hosted pins. Where
+that restore is part of the run's group commit nothing has reached the disk when the gate
+refuses; where it is not, the restore was written and the eject puts back exactly the files
+it wrote (`eject_rolled_back`). The eject's restore is the native one: it does not undo rows
+of the owned index, which no release writes for a hosted pin yet.
+
 | Hosted code | Vendored code | Status | When | Remedy |
 |---|---|---|---|---|
 | `redirect_bazel_consumer_undetermined` | `vendor_bazel_consumer_undetermined` | planned | The ruleset is present and its hub or lock label is not a literal, or a file it needs cannot be read. | Names the statement and the argument to make literal. |
@@ -3283,7 +3296,7 @@ statuses differ, and the `-` in each of those rows stands for the other mode's c
 | `redirect_bazel_lock_check_present` | - | planned | A lock check target (for example `compile_pip_requirements`) covers the file: its test would fail after the rewrite, and its update command would erase the pin. | The ordered steps printed with the refusal. |
 | `redirect_bazel_selection_unproven` | `vendor_bazel_selection_unproven` | planned | Go: nothing committed proves that Bazel selects the pinned module version. | The routes printed with the refusal. |
 | `redirect_bazel_lock_set_partial` | `vendor_bazel_lock_set_partial` | planned | One of several lock files of a hub, or one of several hubs that pin the package, cannot be rewritten. A hub whose lock does not resolve the release is no part of the set. | Names the file. |
-| `redirect_bazel_owned_file_modified` | - | active | `.socket/bazel/index.json` does not pass the strict parse, or another file under `.socket/bazel/` is not what the index records for it. In this release it is reported for the index alone: as the refusal of a hosted pin and of a takeover for a package a ruleset builds beside such an index, as a warning of `repair`, and as drift of `apply --check` (exit 1), since nothing can be said of the wiring the index records. `rollback` and `remove` keep the hosted pins and the manifest records of such packages there, and name the index. | Restore it from version control. |
+| `redirect_bazel_owned_file_modified` | - | active | `.socket/bazel/index.json` does not pass the strict parse, or another file under `.socket/bazel/` is not what the index records for it. In this release it is reported for the index alone: as the refusal of a hosted pin and of a takeover for a package a ruleset builds beside such an index, as a warning of `repair`, and as drift of `apply --check` (exit 1), since nothing can be said of the wiring the index records. `rollback` and `remove` keep the hosted pins and the manifest records of such packages there, restore nothing of them (an installed copy stays patched, like the build), and name the index; a record whose patch a hosted pin wires too is kept with its pin. | Restore it from version control. |
 | - | `vendor_bazel_owned_file_modified` | active | The vendored form of the row above. In this release it is reported for the index alone: as the refusal of a vendored directory tree whose `.bazelignore` line cannot be recorded, and as a warning of `vendor --revert` when a recorded line could not be taken out again. | Restore the index from version control; the detail names the line to add or remove by hand. |
 
 ### What lifts a refusal
@@ -3297,7 +3310,10 @@ failed event of `bazel_agent_go_unsupported`, and of the Go patch that
 vendored refusal that the Bazel gate makes (a hub that no enabled lane serves, an index
 that cannot be relied on), in `vendor --json` and in the envelope of a `scan` or `get` in
 vendored mode. The vendored refusal of a directory tree carries `details.token` alone, and
-the hosted refusals do not emit `details.lift` yet.
+the hosted refusals do not emit `details.lift` yet, with one exception: the `skipped` event
+of a vendored package whose takeover by `scan --mode hosted` the hosted gate refuses carries
+`details.token`, `details.lift` and `details.bazel` (`state: "refused"`, with `ruleset`,
+`lock` and, where the lift names one, `lane`), the mapping every gate refusal has.
 
 | `kind` | Fields | What lifts the refusal |
 |---|---|---|
@@ -3323,7 +3339,18 @@ command hashes the artifact. The other members are reserved with the lanes that 
 `bazel_agent_not_consumed` covers or that a committed pin proves consumed, and there it is
 exactly `{ "state": ... }` in this release. A local Go patch that `apply --check` finds in
 sync has no event of its own; where Bazel has a verdict for it the check prints one
-`skipped` / `already_patched` event to carry the member. An event of a package that Bazel
+`skipped` / `already_patched` event to carry the member. For a record that the owned index
+of the Bazel root holds wiring for, `apply --check` sets `state` to what that wiring is:
+`consumed`, `run_pending`, `drift`, `stale` or `not_consumed`. `drift` (a pin of a release
+the lock still resolves that is gone or changed, an owned file that is missing or edited, a
+missing hook) fails the check, under the code whose row has the remedy
+(`redirect_bazel_pin_erased`, `redirect_bazel_owned_file_modified`,
+`bazel_workspace_hook_needed`, `redirect_bazel_pin_bypassed`), never under a `vex_bazel_*`
+code. `stale` (the lock no longer resolves the release the wiring is for: a routine bump)
+fails it only where the lane's leftover fails the build; otherwise the check exits 0 and
+says so once, under `bazel_agent_not_consumed`. A record whose pins no lane can tell is
+`not_consumed`, and a record the index holds nothing for is none of these. In this release
+no lane can tell its pins, so every such record is `not_consumed`. An event of a package that Bazel
 does not build carries no such member. `list --json` carries it on the event of each
 package that a ruleset builds: `state` is `consumed`, `pending` (the pin is written and its
 one command has left no evidence yet) or `withheld` (nothing committed proves that the
@@ -3333,25 +3360,28 @@ and `lock` of the hub, `lane` and `anchor` where a row of the owned index names 
 `route: "vendored"` for a pin `apply` routed to a vendored lane. `rollback --json` and
 `remove --json` carry `{ "root", "state" }` on the events of a record whose rows of the
 owned index the run undid (`reverted`) or had to keep (`kept`): the rows belong to the
-Bazel root, so undoing a patch there unwires it for every project under that root. The
+Bazel root, so undoing a patch there unwires it for every project under that root. A kept
+record is a `failed` event of `rollback` under its own code
+(`redirect_bazel_revert_incomplete` or the vendored twin, by the lanes that wrote its
+rows), with no `mode`: it is no failure of the hosted or the vendored leg. The
 other commands do not emit it yet.
 
 ### Advisories
 
 | Code | Status | Level | When |
 |---|---|---|---|
-| `redirect_bazel_run_required` | active | `info` | The pin is wired, and one named command must be run and its result committed; until then `vex` withholds the statement. The detail names the command and the platforms to run it on. Reported at `warn` when, until the command has run, builds fail or the Bazel build does not yet consume the patch: a WORKSPACE `go_repository` hub keeps building the upstream module until its `gazelle update-repos` command has run, and after a restoring edit a crate_universe hub with a `lockfile` fails every build (`Digests do not match`) until its repin has run. It stays `info` where an ordinary build refreshes the stale `MODULE.bazel.lock` by itself, and where it only notes lockfile facts that may be stale, in which case `vex` is not held back. Also reported, by the same rule, after `rollback`, `remove`, `repair` or a takeover whose restoring edit leaves Bazel state stale, and after the withdrawn-pin sweep of `scan --mode hosted` restored a pin: in this release that is the one case it is reported in, for a pin an earlier release wrote into a lock a ruleset reads. The entry is `{code, detail}`: a structured form (`kind`: `lockfile`, `update_repos`, `repin`, `pin` or `vendor`; `command`; `platforms`; `gatesVex`) is left to an event's `details`, and is specified in the release that makes this code `active`. The kinds `pin` (a ruleset's own pin target) and `vendor` (`bazel vendor`) are reported at `warn`: no build runs either, so until the command has run Bazel builds from the lock or the vendor directory as it was. |
+| `redirect_bazel_run_required` | active | `info` | The pin is wired, and one named command must be run and its result committed; until then `vex` withholds the statement. The detail names the command and the platforms to run it on. Reported at `warn` when, until the command has run, builds fail or the Bazel build does not yet consume the patch: a WORKSPACE `go_repository` hub keeps building the upstream module until its `gazelle update-repos` command has run, and after a restoring edit a crate_universe hub with a `lockfile` fails every build (`Digests do not match`) until its repin has run. It stays `info` where an ordinary build refreshes the stale `MODULE.bazel.lock` by itself, and where it only notes lockfile facts that may be stale, in which case `vex` is not held back. Also reported, by the same rule, after `rollback`, `remove`, `repair` or a takeover whose restoring edit leaves Bazel state stale, and after the withdrawn-pin sweep of `scan --mode hosted` restored a pin: in this release that is the one case it is reported in, for a pin an earlier release wrote into a lock a ruleset reads. The entry is `{code, detail}`, and in this release the detail is the whole of it: it names the command (after a restore on a crate_universe hub with a `lockfile`, the repin). A structured form (`kind`: `lockfile`, `update_repos`, `repin`, `pin` or `vendor`; `command`; `platforms`; `gatesVex`) is left to an event's `details`; no release emits it yet, and it is specified in the release that enables the first lane whose pin leaves a command to run. The same code reports, at `warn`, a restore whose effect on a Bazel build nobody could judge: a workspace no model of which could be read (its files are unreadable, or it lies above the repository), a Bazel root further up that could not be asked, or an ecosystem whose governing lock is undetermined. The kinds `pin` (a ruleset's own pin target) and `vendor` (`bazel vendor`) are reported at `warn`: no build runs either, so until the command has run Bazel builds from the lock or the vendor directory as it was. |
 | `vendor_bazel_run_required` | planned | `info` | The same, in vendored mode. |
 | `redirect_bazel_tool_ran` | planned | `info` | socket-patch itself ran the one tool the lane names (for example `bazel mod deps --lockfile_mode=update`), because the build would not pass between its write and that run. Names the command and the files the tool rewrote. Never under `--dry-run`. No release runs a tool yet. |
 | `vendor_bazel_tool_ran` | planned | `info` | The same, in vendored mode. |
-| `redirect_bazel_withdrawn_pin_kept` | active | `warn` | The pin of a withdrawn patch was kept, because restoring it would fail every build: under `--lockfile_mode=error`, or in any lockfile mode on a crate_universe hub with a `lockfile`, where only a repin makes the build pass again. Names both steps to take. |
+| `redirect_bazel_withdrawn_pin_kept` | active | `warn` | The pin of a withdrawn patch was kept, because restoring it would fail every build of a Bazel root above the project: under `--lockfile_mode=error` (a lock entry that records the file, or facts of the hub's extension that the restore may stale), or in any lockfile mode on a crate_universe hub with a `lockfile`, where only a repin makes the build pass again (also where its `manifests` cannot all be followed to a file: the project's own Cargo manifests and cargo config then count as inputs). Names both steps to take. Also where nothing can say whether the restore would fail a build: no model of the workspace could be read (unreadable files, a workspace above the repository), a root further up could not be asked, or which lock Bazel reads for the package is undetermined. The detail then says what could not be judged, and names `socket-patch rollback <purl>`, which restores all the same. The run prints no "restoring" note for a pin it keeps. |
 | `redirect_bazel_fetch_dependency` | planned | `info` | Once per run: a pin makes cold repository fetches depend on the patch host beyond the package itself (the NuGet service index for a rules_dotnet pin, the registry `config.json` for a rules_rs pin). |
 | `redirect_bazel_manual_snippet` | planned | `info` | Follows a refusal that has a manual procedure. |
 | `redirect_bazel_token_surface` | planned | `info` | Once per run: the pinned URL, grant token included, is repeated outside the lock that was edited: in the `maven_url=` tags of the BUILD file rules_jvm_external generates, or in the refreshed `MODULE.bazel.lock` for a NuGet pin. |
-| `redirect_bazel_pin_erased` | planned | `warn` | A recorded pin is gone from its lock (a ruleset's pin or update command, or a package-manager install, rewrote it). Run `scan` again. |
+| `redirect_bazel_pin_erased` | active | `warn` | A recorded pin is gone from its lock (a ruleset's pin or update command, or a package-manager install, rewrote it), while a lock the build reads still resolves the release. Run `scan` again. Reported by `repair`, which rebuilds no pin, and as drift of `apply --check` (exit 1). Never for a row whose pin no lane can tell, nor for a row of a release that no lock resolves any more (a bump, or a hub that was removed): that row is `stale`, not erased. In this release no lane can tell its pins, so the code is not reported. |
 | `redirect_bazel_side_file_skipped` | planned | `info` | A lock of the same ecosystem that no hub reads (a `package-lock.json` or `yarn.lock` beside the governed `pnpm-lock.yaml`) was left as found, and no `.npmrc` was created. Names the file. |
-| `redirect_bazel_revert_incomplete` | active | `warn` | `rollback` or `remove` could not undo a pin and undid nothing of it: a file of the user's still carries the pin in a form the record does not match (an edit beside it, a formatter run, a second pin), an owned file is not what the index records, or the row is of a kind this release cannot restore. Nothing that the file still names was deleted, so the build keeps passing with the patch in it, and the run goes on with the other pins. Names the file. Restore the file from version control (`git checkout -- <file>`), then run the command again. The manifest record of such a patch stays, so that a later run still finds the pin: `rollback` exits 1 and reports the package as `failed`, and `remove` stops with this code as its `error.code` before it touches the manifest (also under `--skip-rollback`, which would leave the wiring with no record). In this release no lane restores a row, so every row of the owned index is kept. |
-| `vendor_bazel_revert_incomplete` | planned | `warn` | The same, in vendored mode: the vendored artifact that the pin names is kept too. |
+| `redirect_bazel_revert_incomplete` | active | `warn` | `rollback` or `remove` could not undo what the owned index records for a patch and undid nothing of it. The rows of a manifest record are judged before the command restores anything, so such a record is left alone as a whole: its installed copy stays patched, like the build, nothing that the file still names is deleted, and the run goes on with the other patches. Names the file and the remedy of the cause: a file of the user's that still carries the pin in a form the record does not match (an edit beside it, a formatter run, a second pin), or an index that is not the one socket-patch wrote, is restored from version control (`git checkout -- <file>`), then the command is run again; a row that no lane of this release undoes waits for the release that wrote it, or a later one; `--skip-rollback` is refused for a patch the index records, and the remedy is the command without it; a workspace that cannot be read is made readable; a commit that did not land is run again. The manifest record of such a patch stays, so that a later run still finds the pin: `rollback` exits 1 and reports the record as a `failed` event under this code, and `remove` stops with it as its `error.code` before it restores anything or touches the manifest (also under `--skip-rollback`, which would leave the wiring with no record). The record of a patch that a hosted pin wires as well is undone with that pin, and stays when the pin could not be restored. Reported under the vendored code where vendored lanes wrote the rows. In this release no lane restores a row, so every row of the owned index is kept. |
+| `vendor_bazel_revert_incomplete` | planned | `warn` | The same, in vendored mode: the vendored artifact that the pin names is kept too. `rollback` and `remove` report a kept record under this code where the rows of its patch are a vendored lane's and none is a hosted lane's; no release writes such a row yet. |
 
 ### Withheld VEX statements
 

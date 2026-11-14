@@ -129,7 +129,14 @@ async fn refresh_restored_gems(
 /// entries (core `patch::redirect::upstream`): v5 hosted mode keeps no
 /// ledger, so each pin's lock entry is re-resolved from the registry, and a
 /// pin that cannot be is refused with the `git checkout` remedy.
-pub(crate) async fn run_hosted_leg(common: &GlobalArgs, pins: &[HostedPin]) -> HostedLegOutcome {
+///
+/// `lanes` is the lane table the rows of a Bazel root's owned index are
+/// undone through: `bazel_gate::commands::PRODUCTION` from a command.
+pub(crate) async fn run_hosted_leg(
+    common: &GlobalArgs,
+    pins: &[HostedPin],
+    lanes: &socket_patch_core::bazel::model::LaneTable,
+) -> HostedLegOutcome {
     use socket_patch_core::patch::redirect::upstream::{PinStatus, RestoreOptions};
     // The pins are the manifest's project's: restore them there.
     let rooted = common.at_project_root();
@@ -174,7 +181,6 @@ pub(crate) async fn run_hosted_leg(common: &GlobalArgs, pins: &[HostedPin]) -> H
     // root's owned index records for them (a lock only Bazel reads, a
     // value derived from a lock), and the run names the command that
     // refreshes what Bazel derived. Elsewhere this is `restore_upstream`.
-    let lanes = &crate::bazel_gate::commands::PRODUCTION;
     let outcome = crate::bazel_gate::commands::restore(common, pins, &opts, lanes).await;
     for pin in &outcome.pins {
         match &pin.status {

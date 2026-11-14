@@ -67,7 +67,7 @@
 use std::collections::{BTreeSet, VecDeque};
 
 use super::{RecognizeInput, Recognized};
-use crate::bazel::derived::DerivedState;
+use crate::bazel::derived::{DerivedState, ANY_CARGO_INPUT};
 use crate::bazel::ignore::{IgnoreModel, BAZELIGNORE};
 use crate::bazel::label::{Label, Repo};
 use crate::bazel::model::{
@@ -966,25 +966,36 @@ fn crate_hub(
 /// hub is rendered from that file, and a digest over the manifests and
 /// the cargo config guards it. An edit of one of them fails the build
 /// with `Digests do not match` until a repin, under every lockfile mode
-/// (probes R3 and R5), so each is declared as an input. A member whose
-/// file cannot be followed is not listed: the hub is then not literal,
-/// and nothing is written for it.
+/// (probes R3 and R5), so each is declared as an input.
+///
+/// Where an input cannot be followed to a file (a `manifests` list or a
+/// member that is computed, a member of another repository, a computed
+/// `cargo_config`) the hub is not literal and no forward write is made
+/// for it. A restoring edit is still judged against its rows (a hosted
+/// pin of release 5.1 can stand in such a project), so the inputs that
+/// are not known are declared as one row that any Cargo manifest and any
+/// cargo config matches (`ANY_CARGO_INPUT`): which files the digest
+/// covers is then not known, and "no row" would read as "nothing stale".
 fn lock_digest_rows(detail: &RulesRustDetail, decl: &Declaration) -> Vec<DerivedState> {
     let lockfile = match &detail.lockfile {
         LabelAttr::Absent => return Vec::new(),
         LabelAttr::Label(lock) => lock.path.clone().unwrap_or_else(|| lock.label.clone()),
         LabelAttr::Computed => "lockfile".to_string(),
     };
-    let manifests = detail.manifests.iter().flatten();
-    let manifests = manifests.filter_map(|manifest| manifest.path.as_deref());
+    let members = detail.manifests.iter().flatten();
+    let followed = detail.manifests.is_some()
+        && members.clone().all(|manifest| manifest.path.is_some())
+        && !detail.cargo_config.unresolved();
+    let manifests = members.filter_map(|manifest| manifest.path.as_deref());
     let inputs = manifests.chain(detail.cargo_config.path());
+    let unknown = (!followed).then_some(ANY_CARGO_INPUT);
     let row = |input: &str| DerivedState::CrateLockDigest {
         lockfile: lockfile.clone(),
         input: input.to_string(),
         hub: decl.apparent_name.clone(),
         system: decl.site.system,
     };
-    inputs.map(row).collect()
+    inputs.chain(unknown).map(row).collect()
 }
 
 /// `name`, when the declaration's name was not read.
@@ -1778,6 +1789,38 @@ mod tests {
         };
         let inputs = ["Cargo.toml", "tools/Cargo.toml", ".cargo/config.toml"];
         assert_eq!(hub.derived, inputs.map(digest));
+
+        // An input that cannot be followed to a file is declared all the
+        // same, as the one row every Cargo manifest and cargo config
+        // matches: a concatenated list, a member of another repository, a
+        // computed cargo config. "No row" would let a restore of the
+        // manifest pass for an edit that stales nothing.
+        let rows = |manifests: &str, config: &str| {
+            let found = bzlmod(&format!(
+                "EXTRA = [\"//tools:Cargo.toml\"]\n\
+                 crate.from_cargo(\n    name = \"crates\",\n    cargo_config = {config},\n    \
+                 cargo_lockfile = \"//:Cargo.lock\",\n    lockfile = \"//:cargo-bazel-lock.json\",\n    \
+                 manifests = {manifests},\n)\nuse_repo(crate, deps = \"crates\")\n"
+            ));
+            let [hub] = &found.hubs[..] else {
+                panic!("one hub: {:?}", found.hubs)
+            };
+            assert!(!hub.decl.literal, "{manifests} {config}");
+            hub.derived.clone()
+        };
+        let literal = "\"//:.cargo/config.toml\"";
+        assert_eq!(
+            rows("[\"//:Cargo.toml\"] + EXTRA", literal),
+            [".cargo/config.toml", ANY_CARGO_INPUT].map(digest)
+        );
+        assert_eq!(
+            rows("[\"@other//:Cargo.toml\", \"//:Cargo.toml\"]", literal),
+            ["Cargo.toml", ".cargo/config.toml", ANY_CARGO_INPUT].map(digest)
+        );
+        assert_eq!(
+            rows("[\"//:Cargo.toml\"]", "CONFIG"),
+            ["Cargo.toml", ANY_CARGO_INPUT].map(digest)
+        );
         // Neither is the recognizer's to decide, and neither passes a gate.
         assert!(matches!(hub.liveness, Liveness::Dead { .. }));
         assert!(!hub.ruleset_version.at_least("0.0.1") && !hub.ruleset_version.below("999.0.0"));

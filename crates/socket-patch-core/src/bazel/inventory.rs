@@ -361,19 +361,51 @@ pub fn list(cx: &LaneCx<'_>, lanes: &LaneTable) -> Result<Vec<LockfileEntry>, Un
     }
 }
 
+/// Every row of the owned index that wires a patch, from each row list:
+/// the patch, the lane that wrote the row, and whether the row is of a
+/// class beyond a lock pin. The one list of row lists: [`wired`] and
+/// [`lanes_of`] read it, so a list added here is seen by both.
+fn wiring(index: &Index) -> impl Iterator<Item = (&String, &String, bool)> {
+    let pins = index.pins.iter().map(|row| (&row.uuid, &row.lane, false));
+    pins.chain(
+        index
+            .rc_flags
+            .iter()
+            .map(|row| (&row.uuid, &row.lane, true)),
+    )
+    .chain(index.segment.iter().map(|row| (&row.uuid, &row.lane, true)))
+    .chain(index.bzl.iter().map(|row| (&row.uuid, &row.lane, true)))
+    .chain(index.files.iter().map(|row| (&row.uuid, &row.lane, true)))
+    .chain(
+        index
+            .tag_edits
+            .iter()
+            .map(|row| (&row.uuid, &row.lane, true)),
+    )
+    .chain(index.runs.iter().map(|row| (&row.uuid, &row.lane, true)))
+}
+
 /// The patch UUIDs the owned index records wiring for, in any row list.
 /// Each is in use whatever a lock resolves: the row is the record that
 /// socket-patch wired the patch into the build, and only its removal
 /// through the executor ends that.
 pub fn wired(index: &Index) -> BTreeSet<String> {
-    let uuids = (index.pins.iter().map(|row| &row.uuid))
-        .chain(index.rc_flags.iter().map(|row| &row.uuid))
-        .chain(index.segment.iter().map(|row| &row.uuid))
-        .chain(index.bzl.iter().map(|row| &row.uuid))
-        .chain(index.files.iter().map(|row| &row.uuid))
-        .chain(index.tag_edits.iter().map(|row| &row.uuid))
-        .chain(index.runs.iter().map(|row| &row.uuid));
-    uuids.cloned().collect()
+    wiring(index).map(|(uuid, _, _)| uuid.clone()).collect()
+}
+
+/// The lanes of the rows the index holds for the patch `uuid`, each once
+/// and sorted, and whether one of the rows is of a class beyond a lock
+/// pin. A patch [`wired`] holds has at least one lane here.
+pub fn lanes_of<'a>(index: &'a Index, uuid: &str) -> (Vec<&'a str>, bool) {
+    let own = wiring(index).filter(|(of, _, _)| of.as_str() == uuid);
+    let (mut lanes, mut beyond_a_pin) = (Vec::new(), false);
+    for (_, lane, beyond) in own {
+        lanes.push(lane.as_str());
+        beyond_a_pin |= beyond;
+    }
+    lanes.sort_unstable();
+    lanes.dedup();
+    (lanes, beyond_a_pin)
 }
 
 /// The inventory of the root `ws` was read from: every hub Bazel may
@@ -1188,6 +1220,12 @@ mod tests {
                 row.clone_from(&uuid);
             }
             assert_eq!(wired(index), BTreeSet::from([uuid.clone()]), "{list}");
+            // Each list names the lane that wrote its row, `runs` too:
+            // a patch that is wired has a lane, whichever list holds it.
+            let (lanes, beyond_a_pin) = lanes_of(index, &uuid);
+            assert_eq!(lanes.len(), 1, "{list}: {lanes:?}");
+            assert_eq!(beyond_a_pin, *list != "pins", "{list}");
+            assert_eq!(lanes_of(index, "another"), (Vec::new(), false), "{list}");
             let kept = inventory(&ws, &NONE, &Files::of(&files), index);
             assert_eq!(kept.in_use(unresolved, &uuid), Some(true), "{list}");
             assert_eq!(kept.in_use(unresolved, "another"), Some(false), "{list}");

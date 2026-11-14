@@ -89,6 +89,7 @@
 //! The `runs` rows of the index are receipts and are never read here: a
 //! row cannot prove that a tool's output is still current.
 
+use super::codes::Code;
 use super::consent::{self, USER_PATCH_HOOK};
 use super::derived::{self, ExtRef, LockUse, Proof};
 use super::exec;
@@ -370,6 +371,49 @@ impl Held {
             Self::Consumed | Self::RunPending | Self::NotConsumed => false,
         }
     }
+}
+
+impl Held {
+    /// The code an audit (`apply --check`) names a held state by: the
+    /// one whose contract row carries the remedy for what stands in the
+    /// way, never a code of the `vex` withhold table, which speaks of a
+    /// statement nobody asked for. `why` is the withhold the state came
+    /// from, where there is one.
+    ///
+    /// A missing hook and an owned file that is gone or edited are named
+    /// as themselves; a pin that is gone or no longer the one that was
+    /// written is `redirect_bazel_pin_erased`; a bypass, an unproven
+    /// selection and a stale derived value have their refusal's code.
+    /// What only waits for its command is the run-required advisory, and
+    /// a row for a version the lock no longer resolves is the advisory
+    /// that the build does not get the patch.
+    pub fn code(self, why: Option<&VexWithhold>) -> Code {
+        let token = why.and_then(|why| why.token);
+        match (self, why.map(|why| why.kind)) {
+            (Self::Consumed | Self::NotConsumed | Self::Stale, _) => Code::AgentNotConsumed,
+            (Self::RunPending, _) => Code::RedirectRunRequired,
+            (Self::Drift, _) if token == Some(HOOK_MISSING) => Code::WorkspaceHookNeeded,
+            (Self::Drift, _) if matches!(token, Some(OWNED_FILE_MISSING | OWNED_FILE_MODIFIED)) => {
+                Code::RedirectOwnedFileModified
+            }
+            (Self::Drift, Some(WithholdKind::PinBypassed)) => Code::RedirectPinBypassed,
+            (Self::Drift, Some(WithholdKind::SelectionUnproven)) => Code::RedirectSelectionUnproven,
+            (Self::Drift, Some(WithholdKind::DerivedStale)) => Code::RedirectDerivedUnrepairable,
+            (Self::Drift, _) => Code::RedirectPinErased,
+        }
+    }
+}
+
+/// What an audit makes of one record that the owned index holds wiring
+/// for ([`Attest::held`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeldRecord {
+    pub state: Held,
+    /// The code of the state ([`Held::code`]).
+    pub code: Code,
+    /// Why the wiring does not stand, with what to do about it. Empty
+    /// for a record that is consumed, and for one nothing can be said of.
+    pub detail: String,
 }
 
 /// An entry a hub builds with no pin that passes: it contests a native
@@ -792,6 +836,106 @@ impl<'a> Attest<'a> {
                 self.governed(&package, &hubs)
             }
         }
+    }
+
+    /// The state of the record `(purl, uuid)`, which the owned index
+    /// holds wiring for, from committed files alone (revision 4, 8.7;
+    /// owner decision O53). The one rule for every audit of held wiring:
+    /// `apply --check` asks it, and so does the agent write seam.
+    ///
+    /// - A pin discovery holds for the record is judged as that pin
+    ///   ([`Candidate::of_pin`]), and its verdict is the state
+    ///   ([`Held::of`]).
+    /// - No pin, and a family of the ecosystem cannot list its pins:
+    ///   `not_consumed`. Cannot tell is not drift.
+    /// - No pin, and no hub lock resolves the release any more: the user
+    ///   bumped or dropped the package, and the wiring is for a version
+    ///   the build no longer asks for. That is `stale`, never drift: a
+    ///   routine bump must not read as an erased pin.
+    /// - No pin, and a lock of the ecosystem cannot be listed:
+    ///   `not_consumed`, for the same reason as the second case.
+    /// - No pin, and a hub lock still resolves the release: the pin that
+    ///   was written is gone (`drift`, `redirect_bazel_pin_erased`),
+    ///   unless the consumer cannot be determined.
+    pub fn held(&self, purl: &str, uuid: &str, project_rel: &str) -> HeldRecord {
+        let silent = |state: Held| HeldRecord {
+            state,
+            code: state.code(None),
+            detail: String::new(),
+        };
+        let Some(ecosystem) = Ecosystem::from_purl(purl) else {
+            return silent(Held::NotConsumed);
+        };
+        let own = |pin: &&BazelRef| pin.uuid == uuid && PurlKey::same(&pin.purl, purl);
+        if let Some(pin) = self.discovered.pins.iter().find(own) {
+            let verdict = self.consumer(&Candidate::of_pin(pin, project_rel, None));
+            let state = Held::of(&verdict);
+            let why = verdict.as_ref().err();
+            return HeldRecord {
+                state,
+                code: state.code(why),
+                detail: why.map(|why| why.detail.clone()).unwrap_or_default(),
+            };
+        }
+        if self.discovered.unknown_for(ecosystem).is_some() {
+            return silent(Held::NotConsumed);
+        }
+        match self.inventory.resolves(purl) {
+            Resolved::CannotEnumerate(_) => silent(Held::NotConsumed),
+            Resolved::No => HeldRecord {
+                state: Held::Stale,
+                code: Held::Stale.code(None),
+                detail: "no lock the Bazel build reads resolves this release any more (the \
+                         package was bumped or dropped), so the wiring socket-patch recorded is \
+                         for a version the build no longer asks for; run `socket-patch scan` to \
+                         patch the version the lock resolves now"
+                    .to_string(),
+            },
+            Resolved::By { .. } => {
+                let installed = Candidate {
+                    purl,
+                    uuid,
+                    project_rel,
+                    basis: Basis::Installed,
+                    grant: None,
+                };
+                let state = Held::of(&self.consumer(&installed));
+                if state != Held::Drift {
+                    return silent(state);
+                }
+                HeldRecord {
+                    state,
+                    code: Code::RedirectPinErased,
+                    detail: "no file the Bazel build reads holds the pin that socket-patch \
+                             recorded for this patch any more (a ruleset's own pin or update \
+                             command, or an install, rewrote it); run `socket-patch scan` to pin \
+                             it again"
+                        .to_string(),
+                }
+            }
+        }
+    }
+
+    /// Whether the pin that the `pins` row `row` records is gone from the
+    /// file it names while a lock the build reads still resolves the
+    /// release: a ruleset's own pin or update command, or an install,
+    /// rewrote the file (`redirect_bazel_pin_erased`). `false` where no
+    /// family of the ecosystem can list its pins or a lock cannot be
+    /// listed (cannot tell is not erased), and where no lock resolves
+    /// the release any more: such a row is what a bump or a removed hub
+    /// left behind, not a pin somebody erased.
+    pub fn erased(&self, row: &IndexRow) -> bool {
+        let Some(ecosystem) = Ecosystem::from_purl(&row.purl) else {
+            return false;
+        };
+        if self.discovered.unknown_for(ecosystem).is_some() {
+            return false;
+        }
+        if !matches!(self.inventory.resolves(&row.purl), Resolved::By { .. }) {
+            return false;
+        }
+        let holds = |pin: &BazelRef| pin.uuid == row.uuid && pin.file == row.file;
+        !self.discovered.pins.iter().any(holds)
     }
 
     /// Whether an in-run statement (`scan --mode hosted --vex`) may take
@@ -1686,7 +1830,6 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
-    use crate::bazel::codes::Code;
     use crate::bazel::derived::{stale, DerivedState, Edit, FactsEdit, FactsOf, Write};
     use crate::bazel::govern::tests::{read, read_at, JS_MODULE};
     use crate::bazel::model::{
@@ -3879,5 +4022,65 @@ mod tests {
             let fails = state.fails_check(StaleBehaviour::FailsAttributed);
             assert_eq!(fails, attributed, "{word}");
         }
+
+        // An audit names drift by the code whose row has the remedy, and
+        // never by a code of the `vex` table.
+        let code = |kind, token| {
+            let why = withheld(kind, token, "why");
+            Held::of(&Err(why.clone())).code(Some(&why))
+        };
+        let drift = [
+            (
+                WithholdKind::NotConsumed,
+                Some(HOOK_MISSING),
+                Code::WorkspaceHookNeeded,
+            ),
+            (
+                WithholdKind::DerivedStale,
+                Some(OWNED_FILE_MISSING),
+                Code::RedirectOwnedFileModified,
+            ),
+            (
+                WithholdKind::DerivedStale,
+                Some(OWNED_FILE_MODIFIED),
+                Code::RedirectOwnedFileModified,
+            ),
+            (WithholdKind::NotConsumed, None, Code::RedirectPinErased),
+            (
+                WithholdKind::IntegrityUnanchored,
+                None,
+                Code::RedirectPinErased,
+            ),
+            (WithholdKind::PinBypassed, None, Code::RedirectPinBypassed),
+            (
+                WithholdKind::SelectionUnproven,
+                None,
+                Code::RedirectSelectionUnproven,
+            ),
+            (
+                WithholdKind::DerivedStale,
+                None,
+                Code::RedirectDerivedUnrepairable,
+            ),
+            (
+                WithholdKind::DerivedStale,
+                Some(STALE_OVERRIDE),
+                Code::AgentNotConsumed,
+            ),
+            (WithholdKind::RunPending, None, Code::RedirectRunRequired),
+            (
+                WithholdKind::ConsumerUndetermined,
+                None,
+                Code::AgentNotConsumed,
+            ),
+        ];
+        for (kind, token, expected) in drift {
+            assert_eq!(code(kind, token), expected, "{kind:?} {token:?}");
+        }
+        for kind in WithholdKind::ALL {
+            let named = code(*kind, None).as_str();
+            assert!(!named.starts_with("vex_"), "{kind:?}: {named}");
+        }
+        assert_eq!(Held::Drift.code(None), Code::RedirectPinErased);
     }
 }
