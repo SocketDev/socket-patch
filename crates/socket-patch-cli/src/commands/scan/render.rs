@@ -445,12 +445,14 @@ pub(super) enum Plan {
     /// Vendored mode: of `total` selected patches, `refused` would be
     /// refused by the vendored preflight (listed as `[would-refuse]`
     /// lines) and `in_sync` are held by the ledger at this uuid (listed as
-    /// `[skip] … (already vendored)` lines); the rest are downloaded and
-    /// vendored.
+    /// `[skip] … (already vendored)` lines); `skipped` are expected skips
+    /// (a gem version the project doesn't lock, listed as `[skip]` lines
+    /// with their code); the rest are downloaded and vendored.
     Vendor {
         total: usize,
         refused: usize,
         in_sync: usize,
+        skipped: usize,
     },
 }
 
@@ -464,17 +466,21 @@ pub(super) fn dry_run_line(plan: Plan) -> String {
             total,
             refused,
             in_sync,
-        } if refused > 0 || in_sync > 0 => {
+            skipped,
+        } if refused > 0 || in_sync > 0 || skipped > 0 => {
             let mut why = Vec::new();
             if in_sync > 0 {
                 why.push(format!("{in_sync} already vendored"));
+            }
+            if skipped > 0 {
+                why.push(format!("{skipped} would be skipped"));
             }
             if refused > 0 {
                 why.push(format!("{refused} would be refused"));
             }
             format!(
                 "download and vendor {} of {} ({})",
-                total.saturating_sub(refused + in_sync),
+                total.saturating_sub(refused + in_sync + skipped),
                 plural(total, "patch", "patches"),
                 why.join(", ")
             )
@@ -995,7 +1001,28 @@ mod tests {
             total,
             refused,
             in_sync,
+            skipped: 0,
         }
+    }
+
+    /// #2075: an expected skip is not a refusal, and not work either.
+    #[test]
+    fn dry_run_line_counts_expected_skips() {
+        let plan = |total, refused, skipped| Plan::Vendor {
+            total,
+            refused,
+            in_sync: 0,
+            skipped,
+        };
+        assert_eq!(
+            dry_run_line(plan(1, 0, 1)),
+            "[dry-run] Would download and vendor 0 of 1 patch (1 would be skipped). No changes made."
+        );
+        assert_eq!(
+            dry_run_line(plan(4, 1, 2)),
+            "[dry-run] Would download and vendor 1 of 4 patches (2 would be skipped, \
+             1 would be refused). No changes made."
+        );
     }
 
     #[test]

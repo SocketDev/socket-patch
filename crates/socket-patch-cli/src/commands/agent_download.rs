@@ -342,6 +342,12 @@ pub(crate) fn format_record_skip(purl: &str, why: &str) -> String {
     format!("  [skip] {} ({why})", normalize_purl(purl))
 }
 
+/// `[skip]` line for a patch a vendored run doesn't download because its
+/// refusal is an expected skip (`code`, see `socket_patch_core::vendor::refusals::refusal_is_benign`).
+pub(crate) fn format_refusal_skip(purl: &str, code: &str, detail: &str) -> String {
+    format!("  [skip] {} ({code}): {detail}", normalize_purl(purl))
+}
+
 /// Download parameters shared between get and scan commands.
 pub struct DownloadParams {
     pub cwd: PathBuf,
@@ -951,6 +957,22 @@ pub(crate) async fn fetch_selected_patches(
         // fetched (nor, downstream, its pristine source). Code-tagged so a
         // `--silent` operator can grep the stable code.
         if let Some(VendorRefusal { code, detail }) = refusals.get(purl) {
+            // An expected skip (a gem version this project doesn't lock)
+            // is the package's whole account: no view, no record, and no
+            // failure, as in the vendor loop.
+            if socket_patch_core::vendor::refusals::refusal_is_benign(code) {
+                if !quiet {
+                    eprintln!("{}", format_refusal_skip(purl, code, detail));
+                }
+                batch.events.push(tag_mode(
+                    PatchEvent::new(EventAction::Skipped, purl)
+                        .with_uuid(uuid)
+                        .with_reason(*code, detail.as_str()),
+                    batch.mode,
+                ));
+                batch.skipped += 1;
+                continue;
+            }
             batch.fail(
                 params.json,
                 Some(format!("[error] {purl} ({code}): {detail}")),
