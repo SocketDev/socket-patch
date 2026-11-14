@@ -62,6 +62,15 @@ mod imp {
         unsafe {
             libc::signal(sig, libc::SIG_DFL);
             libc::raise(sig);
+            // As a container's PID 1 this process is shielded from every
+            // signal it does not handle, so the re-raise above is dropped
+            // and the run would carry on, deaf to the stop it was just
+            // sent (and `hot-patch` would go on to start a command that
+            // never hears it). End it here, with the status a death by
+            // this signal reports.
+            if libc::getpid() == 1 {
+                libc::_exit(128 + sig);
+            }
         }
     }
 

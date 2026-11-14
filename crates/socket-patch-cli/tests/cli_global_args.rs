@@ -48,6 +48,8 @@ const SUBCOMMANDS_NO_POSITIONAL: &[&str] = &[
     "self-update",
     // Hidden internal harness for the in-memory hosted engine.
     "hosted-bundle",
+    // Hidden experimental hot patch mode: it takes scan's options.
+    "hot-patch",
 ];
 
 /// Subcommands that require a positional identifier.
@@ -158,6 +160,7 @@ fn common_of(cli: &Cli) -> &GlobalArgs {
         Vex(a) => &a.common,
         SelfUpdate(a) => &a.common,
         HostedBundle(a) => &a.common,
+        HotPatch(a) => &a.scan.common,
     }
 }
 

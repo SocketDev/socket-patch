@@ -1805,6 +1805,9 @@ pub async fn download_and_apply_patches_into(
             eprintln!();
             eprintln!("Applying patches...");
         }
+        // Past the network, about to write to installed packages: a
+        // hot-patch pass is no longer dropped at its time limit.
+        crate::hot_patch::mark_apply_started();
         apply_report = Some(
             run_nested_apply(
                 nested_apply_args_from_params(params, run, &manifest_path),
