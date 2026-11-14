@@ -64,13 +64,9 @@ pub(crate) async fn member_manifest_texts_in(view: &ProjectView<'_>) -> Vec<(Str
     };
     let mut frontier: Vec<String> = Vec::new();
     if let Some((members, exclude)) = &facts.workspace {
-        let mut excluded: BTreeSet<String> = BTreeSet::new();
-        for pattern in exclude {
-            excluded.extend(expand_glob_in(view, pattern, CARGO_SKIP).await);
-        }
         for pattern in members {
             for dir in expand_glob_in(view, pattern, CARGO_SKIP).await {
-                if !excluded.contains(&dir) {
+                if !is_excluded(members, exclude, &dir) {
                     frontier.push(dir);
                 }
             }
@@ -295,13 +291,9 @@ fn member_manifests_with(tree: &dyn Tree) -> Vec<String> {
     let mut queue: Vec<(String, Arc<ManifestFacts>)> = Vec::new();
 
     if let Some((members, exclude)) = &facts.workspace {
-        let excluded: BTreeSet<String> = exclude
-            .iter()
-            .flat_map(|p| expand_glob(tree, p, CARGO_SKIP))
-            .collect();
         for pattern in members {
             for dir in expand_glob(tree, pattern, CARGO_SKIP) {
-                if !excluded.contains(&dir) {
+                if !is_excluded(members, exclude, &dir) {
                     enqueue(tree, dir, &mut dirs, &mut queue);
                 }
             }
@@ -322,6 +314,38 @@ fn member_manifests_with(tree: &dyn Tree) -> Vec<String> {
     dirs.into_iter()
         .map(|dir| format!("{dir}/Cargo.toml"))
         .collect()
+}
+
+/// Whether repo-relative `dir` is at or under the path a `members` or
+/// `exclude` entry names, the entry taken literally as cargo's
+/// `Path::starts_with` reads it: `.` segments dropped, nothing else folded
+/// (a `..` or a glob character is a segment like any other).
+///
+/// Two deliberate differences from cargo. `\` separates segments on every
+/// platform, as it does where the member globs themselves are read, so a
+/// manifest written on Windows means the same wherever it is scanned. And
+/// an absolute entry matches nothing: the in-memory view has no root path
+/// to hold it against.
+fn at_or_under(dir: &str, entry: &str) -> bool {
+    if crate::utils::relpath::is_anchored(entry) {
+        return false;
+    }
+    let mut dir = dir.split('/').filter(|seg| !seg.is_empty());
+    entry
+        .split(['/', '\\'])
+        .filter(|seg| !seg.is_empty() && *seg != ".")
+        .all(|seg| dir.next() == Some(seg))
+}
+
+/// Whether cargo leaves the member-glob match `dir` out of the workspace
+/// (its `WorkspaceRootConfig::is_excluded`): an `exclude` entry is a path
+/// prefix, never a glob, and a `members` entry taken literally keeps what
+/// is at or under it, whatever `exclude` says.
+/// [`crate::vendor::cargo::workspace_root_refusal`] asks the same of a
+/// member directory looking up at an ancestor's `[workspace]`.
+pub(crate) fn is_excluded(members: &[String], exclude: &[String], dir: &str) -> bool {
+    exclude.iter().any(|entry| at_or_under(dir, entry))
+        && !members.iter().any(|entry| at_or_under(dir, entry))
 }
 
 /// What [`member_manifests`] reads out of one manifest: its `[workspace]`
@@ -524,8 +548,8 @@ pub(crate) fn normalize_rel(base: &str, rel: &str) -> Option<String> {
 /// directory.
 const CARGO_SKIP: &[&str] = &["target"];
 
-/// Expand a cargo `members` / `exclude` glob (`*`, `?`, `[..]` classes,
-/// `**`) to the repo-relative directories it names. A wildcard segment
+/// Expand a cargo `members` glob (`*`, `?`, `[..]` classes, `**`) to the
+/// repo-relative directories it names. A wildcard segment
 /// never matches a dot-directory (unless the segment itself starts with
 /// `.`, as `.*` does) or a name in `skip`; a literal segment names any
 /// real directory. A segment matches as `workspace_globs` reads one, so a
@@ -816,6 +840,99 @@ mod tests {
                 "{rel}"
             );
         }
+    }
+
+    /// Cargo's `is_excluded` (checked against `cargo metadata` 1.93.1): an
+    /// `exclude` entry is a path prefix, a `members` entry taken literally
+    /// keeps what is at or under it, and neither is a glob there.
+    #[tokio::test]
+    async fn exclude_is_a_path_prefix_that_a_literal_member_overrides() {
+        /// The members of a workspace with `manifest` at its root and one
+        /// crate in each of `crates`, the same through every walk.
+        async fn members_of(manifest: &str, crates: &[&str]) -> Vec<String> {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path();
+            write(root, "Cargo.toml", manifest);
+            let mut memory = MemoryProject::new();
+            memory.insert_text("Cargo.toml", manifest);
+            for dir in crates {
+                let name = dir.rsplit('/').next().unwrap();
+                write(root, &format!("{dir}/Cargo.toml"), &pkg(name));
+                memory.insert_text(format!("{dir}/Cargo.toml"), pkg(name));
+            }
+            let disk = member_manifests(root);
+            assert_eq!(member_manifests_in_memory(&memory), disk, "{manifest}");
+            assert_eq!(
+                member_manifests_in(&ProjectView::Disk(root)).await,
+                disk,
+                "{manifest}"
+            );
+            disk
+        }
+        // A member listed literally stays a member though `exclude` names it.
+        assert_eq!(
+            members_of(
+                "[workspace]\nmembers = [\"app\"]\nexclude = [\"app\"]\n",
+                &["app"]
+            )
+            .await,
+            vec!["app/Cargo.toml"]
+        );
+        // A glob match that `exclude` names is left out.
+        assert!(members_of(
+            "[workspace]\nmembers = [\"crates/*\"]\nexclude = [\"./crates/app/\"]\n",
+            &["crates/app"]
+        )
+        .await
+        .is_empty());
+        // `exclude` covers everything under its path, not a sibling that
+        // only shares the name's prefix.
+        assert_eq!(
+            members_of(
+                "[workspace]\nmembers = [\"crates/**\"]\nexclude = [\"crates/legacy\"]\n",
+                &[
+                    "crates/kept",
+                    "crates/legacy",
+                    "crates/legacy/nested",
+                    "crates/legacy-next"
+                ]
+            )
+            .await,
+            vec!["crates/kept/Cargo.toml", "crates/legacy-next/Cargo.toml"]
+        );
+        // A literal member keeps its whole subtree out of `exclude`.
+        assert_eq!(
+            members_of(
+                "[workspace]\nmembers = [\"crates/a\", \"crates/**\"]\nexclude = [\"crates\"]\n",
+                &["crates/a", "crates/a/sub", "crates/b"]
+            )
+            .await,
+            vec!["crates/a/Cargo.toml", "crates/a/sub/Cargo.toml"]
+        );
+        // `exclude` is no glob: `crates/*` names a directory called `*`.
+        assert_eq!(
+            members_of(
+                "[workspace]\nmembers = [\"crates/*\"]\nexclude = [\"crates/*\"]\n",
+                &["crates/a"]
+            )
+            .await,
+            vec!["crates/a/Cargo.toml"]
+        );
+        // Excluding the root excludes every glob match.
+        assert!(members_of(
+            "[workspace]\nmembers = [\"crates/*\"]\nexclude = [\".\"]\n",
+            &["crates/a"]
+        )
+        .await
+        .is_empty());
+        // A literal `.` member is the whole workspace: nothing under it is
+        // excluded.
+        assert!(members_of(
+            "[workspace]\nmembers = [\".\", \"crates/*\"]\nexclude = [\"crates/legacy\"]\n",
+            &["crates/legacy"]
+        )
+        .await
+        .contains(&"crates/legacy/Cargo.toml".to_string()));
     }
 
     #[test]
