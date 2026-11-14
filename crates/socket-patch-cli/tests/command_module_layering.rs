@@ -374,6 +374,10 @@ const SEAM_OPAQUE_TYPES: [&str; 9] = [
     "WithholdKind",
 ];
 
+/// The types a seam takes from the loader or builds by struct update
+/// only, each with a rule of its own in [`seam_problems`].
+const SEAM_CONTEXT_TYPES: [&str; 3] = ["LaneCx", "GateCx", "RunCx"];
+
 /// What marks a string literal as a path socket-patch owns under a Bazel
 /// root: the owned directory, and the names of the owned files that no
 /// other file has. A seam takes such a path from `exec::touched` or from
@@ -386,6 +390,27 @@ fn owned_path_marks() -> Vec<&'static str> {
     let name = |path: &'static str| path.rsplit('/').next().expect("a file name");
     let files = [OWNED_RC_PATH, OWNED_SEGMENT_PATH, OWNED_BZL_PATH].map(name);
     std::iter::once(OWNED_DIR).chain(files).collect()
+}
+
+/// The owned directory component by component (`.socket`, `bazel`): the
+/// spelling of a path that is built with one `join` per level, which is
+/// how most paths in this code base are built.
+fn owned_dir_levels() -> Vec<&'static str> {
+    socket_patch_core::bazel::owned_index::OWNED_DIR
+        .split('/')
+        .collect()
+}
+
+/// The owned files whose names other files have too: the index, and the
+/// pins file reserved beside it. As one whole literal, such a name is an
+/// owned path only where a path is being built: after the levels of the
+/// owned directory, or as the argument of a `join` or a `push`.
+/// (`apply.lock`, `patches` and `BUILD.bazel` are left out on purpose:
+/// too many files that are nobody's carry those names.)
+fn owned_file_names() -> [&'static str; 2] {
+    let index = socket_patch_core::bazel::owned_index::INDEX_PATH;
+    let index = index.rsplit('/').next().expect("a file name");
+    [index, "pins.json"]
 }
 
 /// Rust source with what a scan must not read taken out: `masked` is the
@@ -581,10 +606,21 @@ fn struct_bodies<'a>(code: &'a str, name: &str) -> Vec<&'a str> {
 ///   gains a member; or one that sets no `roots`: `GateCx::new` defaults
 ///   it to "one root", and a seam that leaves the root probe's answer
 ///   out judges nested roots as one;
+/// - a `GateCx::new` anywhere else than as the base of such an update:
+///   the value it returns, bound, passed on or assigned to afterwards,
+///   is that same context with the default `roots`;
+/// - a literal `Roots::One`: the default again, written out. A seam
+///   passes what the probe found (`Roots::Probed`), which the gate reads
+///   as one root where the probe found one;
 /// - a `RunCx { .. }` with no `..`: the run context gains members too;
 /// - a `Type::Variant` of a type the executor takes whole
 ///   ([`SEAM_OPAQUE_TYPES`]);
-/// - a string literal that spells an owned path ([`owned_path_marks`]).
+/// - another name for one of those types or for a context type (`use ..
+///   as`, a `type` alias): every rule here looks for the type's own
+///   name;
+/// - a string literal that spells an owned path ([`owned_path_marks`]),
+///   or string literals that spell one level by level
+///   ([`owned_dir_levels`], [`owned_file_names`]).
 fn seam_problems(file: &str, src: &str) -> Vec<String> {
     let lexed = lex(src);
     let tests = test_modules(&lexed.masked);
@@ -619,6 +655,28 @@ fn seam_problems(file: &str, src: &str) -> Vec<String> {
             );
         }
     }
+    // Every `GateCx::new` is the base of an update: the two counts are
+    // one. A call that is bound, passed on or assigned to afterwards
+    // carries the default `roots` past the rule above.
+    let constructor = Regex::new(r"\bGateCx\s*::\s*new\b").expect("regex");
+    let as_base = Regex::new(r"\.\.\s*GateCx\s*::\s*new\b").expect("regex");
+    if constructor.find_iter(&code).count() != as_base.find_iter(&code).count() {
+        say(
+            "a `GateCx::new` that is not the base of `GateCx { roots, .., ..GateCx::new(..) }`: \
+             the context it returns judges nested roots as one"
+                .into(),
+        );
+    }
+    if Regex::new(r"\bRoots\s*::\s*One\b")
+        .expect("regex")
+        .is_match(&code)
+    {
+        say(
+            "names `Roots::One`, the default of `GateCx::new`; pass what the root probe found \
+             as `Roots::Probed`, which is one root where the probe found one"
+                .into(),
+        );
+    }
     for body in struct_bodies(&code, "RunCx") {
         if !top_level(body).contains("..") {
             say("a `RunCx { .. }` literal with no `..`; build it by struct update".into());
@@ -632,14 +690,52 @@ fn seam_problems(file: &str, src: &str) -> Vec<String> {
             ));
         }
     }
+    // Another name for a type hides it from every rule above.
+    let imports = Regex::new(r"\buse\b[^;]*;").expect("regex");
+    for name in SEAM_OPAQUE_TYPES.iter().chain(&SEAM_CONTEXT_TYPES) {
+        let renamed = Regex::new(&format!(r"\b{name}\s+as\s+(\w+)")).expect("regex");
+        let in_use = imports.find_iter(&code).any(|import| {
+            let mut found = renamed.captures_iter(import.as_str());
+            found.any(|import| &import[1] != "_")
+        });
+        let alias = Regex::new(&format!(r"\btype\s+\w+[^=;]*=[^;]*\b{name}\b")).expect("regex");
+        if in_use || alias.is_match(&code) {
+            say(format!(
+                "gives `{name}` another name (`use .. as`, a `type` alias); name it as it is, \
+                 so that this scan sees what is done with it"
+            ));
+        }
+    }
     let marks = owned_path_marks();
+    let (levels, names) = (owned_dir_levels(), owned_file_names());
+    let joined = Regex::new(r"\b(?:join|push)\s*\(\s*&?\s*(?:b|br|r)?#*$").expect("regex");
+    // The literals of production code, in order, each with the code up
+    // to its opening quote.
+    let mut before: Vec<&str> = Vec::new();
     for literal in &lexed.literals {
+        if in_tests(literal.start) {
+            continue;
+        }
         let text = &src[literal.clone()];
-        let owned = marks.iter().find(|mark| text.contains(**mark));
-        if let (Some(mark), false) = (owned, in_tests(literal.start)) {
+        let after_levels = before.ends_with(&levels);
+        before.push(text);
+        if let Some(mark) = marks.iter().find(|mark| text.contains(**mark)) {
             say(format!(
                 "the string literal {text:?} spells the owned path `{mark}`; take it from \
                  `exec::touched` or `bazel::owned_index`"
+            ));
+        } else if before.ends_with(&levels) {
+            say(format!(
+                "the string literals {levels:?} spell the owned path `{}` level by level; \
+                 take it from `exec::touched` or `bazel::owned_index`",
+                levels.join("/")
+            ));
+        } else if names.contains(&text)
+            && (after_levels || joined.is_match(&code[..literal.start - 1]))
+        {
+            say(format!(
+                "the string literal {text:?} names a file of the owned path as a path level; \
+                 take it from `exec::touched` or `bazel::owned_index`"
             ));
         }
     }
@@ -696,6 +792,38 @@ fn the_seam_scan_fails_on_a_planted_example_of_each_rule() {
             &format!("fn f() {{ gate(&{good}, lanes, req); }}"),
         );
     }
+    // The constructor outside an update is the context with the default
+    // roots: bound, handed straight to the gate, assigned to afterwards,
+    // taken as a function, and beside an update that is in order.
+    let bare = "a `GateCx::new` that is not the base";
+    for call in [
+        "let cx = GateCx::new(Mode::Hosted, ws, root.files(), index); gate(&cx, lanes, req);",
+        "gate(&GateCx::new(mode, ws, files, index), lanes, req);",
+        "let mut cx = GateCx::new(mode, ws, files, index); cx.host = host; \
+         cx.patch_url = Some(url); gate(&cx, lanes, req);",
+        "let make = GateCx::new; gate(&make(mode, ws, files, index), lanes, req);",
+        "let cx = GateCx :: new(mode, ws, files, index);",
+        "let a = GateCx { roots, ..GateCx::new(mode, ws, f, i) }; \
+         let b = GateCx::new(mode, ws, f, i);",
+    ] {
+        caught("hosted.rs", &format!("fn f() {{ {call} }}"), bare);
+    }
+    // And the default written out is the default.
+    let one = "GateCx { roots: Roots::One, host, ..GateCx::new(mode, ws, files, index) }";
+    caught(
+        "vex.rs",
+        &format!("fn f() {{ gate(&{one}, l, r); }}"),
+        "Roots::One",
+    );
+    caught(
+        "vex.rs",
+        "fn f() -> Roots<'static> { Roots :: One }",
+        "Roots::One",
+    );
+    clean(
+        "vex.rs",
+        "fn f(roots: Roots<'_>) { let _ = MyRoots::Oneness; }",
+    );
 
     // 3. A run context that names every member.
     caught(
@@ -732,6 +860,34 @@ fn the_seam_scan_fails_on_a_planted_example_of_each_rule() {
         "vex.rs",
         "fn f() { let x = LaneAnchor::new(); let y = MyRunKindness::A; }",
     );
+    // Under another name each of them, and each context type, would pass
+    // every rule here: the new name is what gets reported.
+    for name in SEAM_OPAQUE_TYPES.iter().chain(&SEAM_CONTEXT_TYPES) {
+        let renamed = format!("gives `{name}` another name");
+        for alias in [
+            format!("use socket_patch_core::bazel::model::{name} as W;"),
+            format!("use socket_patch_core::bazel::model::{{Plan, {name} as W, Lift}};"),
+            format!("use model::{{\n    {name}\n        as W,\n}};"),
+            format!("type W = {name};"),
+            format!("pub(crate) type Cx<'a> = model::{name}<'a>;"),
+        ] {
+            let src =
+                format!("{alias}\nfn f(x: &Plan) -> u8 {{ match x.y {{ W::A => 1, _ => 0 }} }}");
+            caught("hosted.rs", &src, &renamed);
+        }
+        // An import under its own name, an anonymous one, a cast and a
+        // qualified path are no other name.
+        for own in [
+            format!("use socket_patch_core::bazel::model::{{{name}, Plan as P}};"),
+            format!("use socket_patch_core::bazel::model::{name} as _;"),
+            format!("fn f(x: {name}) -> u8 {{ let _ = <{name} as Default>::default; x as u8 }}"),
+            format!("type Kept = Vec<u8>; fn f(x: {name}) {{ let y: Kept = Vec::new(); }}"),
+        ] {
+            let problems = seam_problems("hosted.rs", &own);
+            let renamed = problems.iter().any(|problem| problem.contains(&renamed));
+            assert!(!renamed, "{own}: {problems:?}");
+        }
+    }
 
     // 5. An owned path as a literal, in every kind of string.
     for literal in [
@@ -752,6 +908,53 @@ fn the_seam_scan_fails_on_a_planted_example_of_each_rule() {
         "commands.rs",
         "fn f() { write(INDEX_PATH, \".socket/vendor\", \".bazelrc\"); }",
     );
+    // The same path level by level, which is how a path is built here:
+    // one `join` or `push` per level, an array of levels, a raw string.
+    for built in [
+        "root.join(\".socket\").join(\"bazel\").join(\"index.json\")",
+        "root.join(\".socket\").join(\"bazel\")",
+        "{ let mut p = root.to_path_buf(); p.push(\".socket\"); p.push(\"bazel\"); p }",
+        "[\".socket\", \"bazel\", \"patches\"].iter().collect::<PathBuf>()",
+        "root.join(r\".socket\").join(r#\"bazel\"#)",
+        "root\n    .join(\".socket\") // the owned directory\n    .join(\"bazel\")",
+    ] {
+        caught(
+            "commands.rs",
+            &format!("fn f(root: &Path) -> PathBuf {{ {built} }}"),
+            "level by level",
+        );
+    }
+    // A file of the owned directory under a name other files have too,
+    // where a path is built.
+    for built in [
+        "dir.join(\"pins.json\")",
+        "dir.join(\"index.json\")",
+        "{ let mut p = dir.to_path_buf(); p.push(\"index.json\"); p }",
+        "dir.join(&\"pins.json\")",
+        "dir.join( r\"index.json\" )",
+        "[\".socket\", \"bazel\", \"pins.json\"].iter().collect::<PathBuf>()",
+    ] {
+        caught(
+            "vendored.rs",
+            &format!("fn f(dir: &Path) -> PathBuf {{ {built} }}"),
+            "owned path",
+        );
+    }
+    // The levels apart, the other directories under `.socket`, and the
+    // shared names where no path is built.
+    for apart in [
+        "root.join(\".socket\").join(\"vendor\").join(\"bazel\")",
+        "root.join(\"bazel\").join(\".socket\")",
+        "root.join(\".socket\").join(\"manifest.json\")",
+        "{ say(\"index.json was read\"); root.join(\"apply.lock\").join(\"patches\") }",
+        "{ let name = \"index.json\"; let pins = [\"pins.json\"]; root.join(name) }",
+        "root.join(\"BUILD.bazel\")",
+    ] {
+        clean(
+            "commands.rs",
+            &format!("fn f(root: &Path) -> PathBuf {{ {apart} }}"),
+        );
+    }
 
     // What only looks like one of them: comments, strings, test modules.
     let quiet = "//! A seam never writes `GateCx { mode }` or \".socket/bazel\".\n\

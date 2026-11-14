@@ -2,8 +2,10 @@
 //! (`socket_patch_core::bazel`). It is not under `commands/`, so the command
 //! layering allowlist does not grow.
 //!
-//! This file is the loader. A command makes one [`Loader`] per run and asks
-//! it about each project directory it works on:
+//! This file is the loader. A command makes one [`Loader`] per run
+//! ([`in_run`] scopes it to the command, and [`run_loader`] hands it to
+//! each seam the command reaches) and asks it about each project directory
+//! it works on:
 //!
 //! - [`Loader::probe`] stats and reads nothing. Under no Bazel root that is
 //!   the whole cost of this module, so a command that needs no governance
@@ -54,22 +56,29 @@
 //!   `GateCx { roots, .., ..GateCx::new(..) }`: the struct update keeps
 //!   it compiling when the context gains a member, and `roots` is the root
 //!   probe's answer, which `GateCx::new` cannot know and defaults to "one
-//!   root". A context without it judges nested roots as one. Under
-//!   `Probe::Nested` the models it passes are the ones read for the
-//!   project of the request. The three other members `GateCx::new`
-//!   defaults are as easy to forget and fail closed: with no `patch_url`
-//!   every hosted request is refused (`fetch_blocked`), with no `host` a
-//!   lane that wires a path refuses, and a default
+//!   root". A context without it judges nested roots as one. So
+//!   `GateCx::new` is written nowhere but as the base of that update (a
+//!   call that is bound or passed on is the context with the default),
+//!   and `Roots::One` is never written out: a seam passes what the probe
+//!   found as `Roots::Probed`, which the gate reads as one root where the
+//!   probe found one. Under `Probe::Nested` the models it passes are the
+//!   ones read for the project of the request. The three other members
+//!   `GateCx::new` defaults are as easy to forget and fail closed: with
+//!   no `patch_url` every hosted request is refused (`fetch_blocked`),
+//!   with no `host` a lane that wires a path refuses, and a default
 //!   `allow_patch_conflicts` drops the user's flag. A seam sets what the
 //!   run knows of each.
 //! - It takes its [`LaneCx`] from [`LoadedRoot::lane_cx`] and its `RunCx`
 //!   by struct update, never as a literal.
 //! - It never matches on a write class, an owned write, a hook kind, a tag
 //!   operation, a run kind, an anchor, an attest basis, a staleness
-//!   behaviour or a withhold kind, and names no owned path as a literal:
-//!   it hands plans to `exec::apply`, takes the paths of a commit from
+//!   behaviour or a withhold kind, and names no owned path as a literal,
+//!   whole or level by level (`join(".socket").join("bazel")`): it hands
+//!   plans to `exec::apply`, takes the paths of a commit from
 //!   `exec::touched`, undoes through `exec::revert` and repairs through
-//!   `exec::reconcile`.
+//!   `exec::reconcile`. It names those types and the three contexts by
+//!   their own names, with no `use .. as` and no `type` alias: the scan
+//!   looks for the names.
 //! - It maps a refusal the same way everywhere: the code is
 //!   `Code::refusal(mode, reason)`, which is `Some` for every refusal the
 //!   gate hands a hosted or vendored caller, a lane's own included;
@@ -115,6 +124,23 @@
 //!   line, and the index is never rebuilt from memory.
 //! - A command that needs no governance answer asks [`Loader::probe`] or
 //!   [`Loader::survey`] and never [`Loader::load`], which reads.
+//! - Where a hub's lock lies is the disk's to say. A label is a spelling,
+//!   and the lock behind it may be a link or lie behind a linked
+//!   directory, in the directory of another project.
+//!   `BazelWorkspace.lock_real_dirs` holds the real directories, and only
+//!   `crawlers::bazel_workspace::read_workspace` fills it, which is what
+//!   [`Loader::load`] calls. A seam that judges governance over a model
+//!   `detect` built on any other view (an in-memory project, an overlay)
+//!   has none: it treats a hub lock that it does not hold as content as
+//!   undetermined, never as the lock of the directory the label spells.
+//!   The same goes for which lock a run rewrites: a run started in one
+//!   directory may pin a lock in another (a pnpm member's own, a Rush
+//!   lock), and it is the lock's directory the gate is asked about.
+//! - `crawlers::bazel_output::locate_output_base` also looks for a
+//!   `_bazel_*` user root in the workspace root itself, beside the
+//!   candidates it is handed. It has no product caller yet; a seam that
+//!   becomes one hands it the run's candidates and does not look for a
+//!   base on its own.
 
 pub mod agent;
 pub mod agent_go;
@@ -659,6 +685,37 @@ impl Loader {
             run: run_policy(&self.run),
         }
     }
+}
+
+tokio::task_local! {
+    /// The loader of the command this task runs ([`in_run`]).
+    static RUN: Arc<Loader>;
+}
+
+/// Runs `command` as one run of the Bazel layer: every seam call it makes
+/// through [`run_loader`] is handed the same [`Loader`], so a root is read
+/// once however many of its projects the command works on, a note about
+/// it is said once, and all of that ends with the command. Two commands
+/// in one process (the in-process suites, an embedder) share nothing.
+///
+/// A command that reaches more than one seam call wraps its body in this:
+/// a scan asks about each of its projects and ends with an apply. A
+/// command that another runs joins its caller's run and keeps the caller's
+/// `run`.
+pub async fn in_run<F: std::future::Future>(run: RunCx, command: F) -> F::Output {
+    if RUN.try_with(|_| ()).is_ok() {
+        return command.await;
+    }
+    RUN.scope(Arc::new(Loader::new(run)), command).await
+}
+
+/// The loader of the run this task is in ([`in_run`]). Outside one, a
+/// loader of the caller's own over `run`: a command that makes one seam
+/// call is its own run. Asked before a blocking task is spawned, never
+/// inside one, which the run does not reach.
+pub fn run_loader(run: RunCx) -> Arc<Loader> {
+    let shared = RUN.try_with(Arc::clone);
+    shared.unwrap_or_else(|_| Arc::new(Loader::new(run)))
 }
 
 /// Whether the marker a survey reports is a file above the read boundary.

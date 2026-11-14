@@ -20,7 +20,10 @@
 //! in a project is left alone there
 //! (`bazel_workspace_unsupported_in_memory`): what a pin does to a Bazel
 //! build is decided over files this engine is never handed (the `bazel`
-//! module has the rule).
+//! module has the rule). A project is judged by every lock its run pins,
+//! a pnpm member's own lock and a Rush lock included, and a rewrite that
+//! would still change a file in a directory Bazel claims for the file's
+//! ecosystem is refused whole, as a project error of the same code.
 //!
 //! Cargo member manifests are chosen by content on disk (`members`,
 //! `exclude`, path dependencies and `[patch]` paths, anywhere but
@@ -470,6 +473,46 @@ fn demote_pnpm_members(
     }
 }
 
+/// The run-level warning for the roots `inside` a tree Bazel owns, which
+/// the session leaves out; none when there is no such root.
+fn bazel_tree_warning(inside: &[String]) -> Option<EngineWarning> {
+    if inside.is_empty() {
+        return None;
+    }
+    let named: Vec<String> = inside.iter().map(|root| format!("`{root}`")).collect();
+    Some(EngineWarning::new(
+        crate::bazel::codes::Code::WorkspaceOutputTreeSkipped.as_str(),
+        format!(
+            "{} not scanned: Bazel owns the directory (an output base, a cache or a vendor \
+             directory), and nothing in one is a project to patch",
+            named.join(", ")
+        ),
+        None,
+    ))
+}
+
+/// The directories (repository-relative) of the pnpm locks that the run of
+/// the project at `root` reads and rewrites besides the root's own: a Rush
+/// monorepo's common and subspace locks, and the workspace members' own
+/// locks under `sharedWorkspaceLockfile: false`. They are the two lists
+/// the lock inventory and the rewrite take those locks from
+/// (`rush_lock_rels`, `member_locks`), so what is asked about here is what
+/// would be scanned and pinned.
+async fn npm_lock_dirs_below(root: &str, project: &MemoryProject) -> Vec<String> {
+    use crate::utils::pnpm_workspace::{member_locks, MemberLocks};
+    use crate::vendor::lock_inventory::pnpm::{is_rush, rush_lock_rels};
+    let view = ProjectView::Memory(project);
+    let locks = match is_rush(view).await {
+        true => rush_lock_rels(view).await,
+        false => match member_locks(&view).await {
+            MemberLocks::PerMember(keys) => keys,
+            MemberLocks::Shared | MemberLocks::Unresolved(_) => Vec::new(),
+        },
+    };
+    let dir_of = |lock: &String| roots::join_root(root, roots::split_path(lock).0);
+    locks.iter().map(dir_of).collect()
+}
+
 fn ecosystem_allowed(ecosystems: Option<&[String]>, purl: &str) -> bool {
     match ecosystems {
         None => true,
@@ -709,26 +752,30 @@ async fn engine(
             let trees = roots::bazel_trees_listed(paths, &bazel_vendor_dirs);
             let (inside, outside): (Vec<String>, Vec<String>) =
                 roots.iter().cloned().partition(|root| trees.hold(root));
-            if !inside.is_empty() {
-                warnings.push(EngineWarning::new(
-                    crate::bazel::codes::Code::WorkspaceOutputTreeSkipped.as_str(),
-                    format!(
-                        "{} not scanned: Bazel owns the directory (an output base, a cache or \
-                         a vendor directory), and nothing in one is a project to patch",
-                        inside
-                            .iter()
-                            .map(|root| format!("`{root}`"))
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    ),
-                    None,
-                ));
-            }
+            warnings.extend(bazel_tree_warning(&inside));
             outside
         }
         None => {
             let paths = files.keys().map(String::as_str);
-            roots::detect_roots_outside(paths, ecosystems, &bazel_vendor_dirs).0
+            let (found, left_out) =
+                roots::detect_roots_outside(paths, ecosystems, &bazel_vendor_dirs);
+            // A root the session left out for a tree is said here as well:
+            // without `projectRoots` nobody named it, and a caller that
+            // counted on its project would see only that it is missing.
+            // (Selection streams nothing from a tree its listing marks, so
+            // these are the roots in a vendor directory that only a
+            // streamed rc file names.)
+            let skipped = crate::bazel::codes::Code::WorkspaceOutputTreeSkipped.as_str();
+            let root_of = |ignored: &IgnoredPath| {
+                let (dir, base) = roots::split_path(&ignored.path);
+                let scanned = roots::marker_ecosystem(base)
+                    .is_some_and(|eco| ecosystems.is_none_or(|list| list.iter().any(|e| e == eco)));
+                (ignored.reason == skipped && scanned).then(|| dir.to_string())
+            };
+            let inside: BTreeSet<String> = left_out.iter().filter_map(root_of).collect();
+            let inside: Vec<String> = inside.into_iter().collect();
+            warnings.extend(bazel_tree_warning(&inside));
+            found
         }
     };
     // The full policy (paths from the file too) judges every root before
@@ -854,13 +901,30 @@ async fn engine(
     if options.trust_lockfile_config {
         refuse_governed_pnpm_members(&files, &mut states);
     }
-    // What Bazel builds, or may build, in each project: read while the
-    // files are still here, applied when the packages are known.
-    let bazel_claims: BTreeMap<String, bazel::Claims> = root_list
-        .iter()
-        .filter_map(|root| Some((root.clone(), bazel.claims(root)?)))
-        .collect();
-    drop(files);
+    // What Bazel builds, or may build, in each project's run (HZ-20):
+    // applied when the packages are known. A run is judged by every lock
+    // it pins, not by the directory it starts in.
+    let mut bazel_claims: BTreeMap<String, bazel::Claims> = BTreeMap::new();
+    for state in states.iter().filter(|_| !bazel.is_empty()) {
+        let Some(project) = state.project.as_ref() else {
+            continue;
+        };
+        let lock_dirs = npm_lock_dirs_below(&state.root, project).await;
+        if let Some(claims) = bazel.claims_of_run(&state.root, &lock_dirs) {
+            bazel_claims.insert(state.root.clone(), claims);
+        }
+    }
+    // A session with a Bazel root is asked once more, about the files each
+    // rewrite would change (`Workspaces::refused_write`), so it keeps its
+    // files until then. Every other session drops them here, as before.
+    let files = match bazel.is_empty() {
+        true => {
+            drop(files);
+            BTreeMap::new()
+        }
+        false => files,
+    };
+    let bazel = bazel::Workspaces::of(&files);
     demote_cargo_members(&mut states, &mut warnings);
     phases.mark("roots");
 
@@ -1306,6 +1370,7 @@ async fn engine(
             state,
             done,
             options.dry_run,
+            &bazel,
             &mut changed,
             &mut changed_binary,
             &mut warnings,
@@ -1487,11 +1552,15 @@ fn select_with_policy(
     offers
 }
 
-/// The rewrite → the project's result and changed files.
+/// The rewrite → the project's result and changed files. A rewrite that
+/// would change a file in a directory where Bazel builds, or may build,
+/// packages of the file's ecosystem is not taken, whole
+/// ([`bazel::Workspaces::refused_write`]).
 fn finish_root(
     state: &mut RootState,
     done: Rewritten,
     dry_run: bool,
+    bazel: &bazel::Workspaces<'_>,
     changed: &mut BTreeMap<String, (String, String)>,
     changed_binary: &mut BTreeMap<String, (String, Vec<u8>)>,
     warnings: &mut Vec<EngineWarning>,
@@ -1535,6 +1604,32 @@ fn finish_root(
         })
         .map(|(rel, bytes)| (roots::join_root(&root, rel), bytes.clone()))
         .collect();
+    let refused = |code: &str, message: String, warnings: &mut Vec<EngineWarning>| {
+        warnings.push(EngineWarning::new(code, message.clone(), Some(&root)));
+        ProjectResult {
+            root: root.clone(),
+            redirect: serde_json::json!({ "mode": "hosted" }),
+            summary: state.summary.clone(),
+            redirected: Vec::new(),
+            skipped: skipped.clone(),
+            deferred: state.deferred.clone(),
+            error: Some(ProjectError {
+                code: code.into(),
+                message,
+            }),
+        }
+    };
+    let pinned: BTreeSet<&'static str> = state
+        .selected
+        .iter()
+        .filter_map(|(purl, _)| Some(Ecosystem::from_purl(purl)?.cli_name()))
+        .collect();
+    let written = text_writes.iter().map(|(path, _)| path.as_str());
+    let written = written.chain(binary_writes.iter().map(|(path, _)| path.as_str()));
+    if let Some(message) = bazel.refused_write(written, &pinned) {
+        let code = crate::bazel::codes::Code::WorkspaceUnsupportedInMemory.as_str();
+        return refused(code, message, warnings);
+    }
     let conflict = text_writes
         .iter()
         .find_map(|(path, content)| match changed.get(path) {
@@ -1554,23 +1649,7 @@ fn finish_root(
             "{path} is rewritten differently by project `{owner}`; none of this project's \
              changes were written"
         );
-        warnings.push(EngineWarning::new(
-            "conflicting_write",
-            message.clone(),
-            Some(&root),
-        ));
-        return ProjectResult {
-            root,
-            redirect: serde_json::json!({ "mode": "hosted" }),
-            summary: state.summary.clone(),
-            redirected: Vec::new(),
-            skipped,
-            deferred: state.deferred.clone(),
-            error: Some(ProjectError {
-                code: "conflicting_write".into(),
-                message,
-            }),
-        };
+        return refused("conflicting_write", message, warnings);
     }
     for (path, content) in text_writes {
         changed
@@ -1679,6 +1758,8 @@ mod tests {
 
     #[test]
     fn a_conflicting_project_writes_nothing() {
+        let no_files = BTreeMap::new();
+        let no_bazel = bazel::Workspaces::of(&no_files);
         let mut changed = BTreeMap::new();
         let mut changed_binary = BTreeMap::new();
         let mut warnings = Vec::new();
@@ -1686,6 +1767,7 @@ mod tests {
             &mut state("", MemoryProject::new()),
             rewritten(&[("crates/b/Cargo.toml", "A")]),
             false,
+            &no_bazel,
             &mut changed,
             &mut changed_binary,
             &mut warnings,
@@ -1696,6 +1778,7 @@ mod tests {
             &mut state("crates/b", MemoryProject::new()),
             rewritten(&[("Cargo.toml", "B"), ("Cargo.lock", "L")]),
             false,
+            &no_bazel,
             &mut changed,
             &mut changed_binary,
             &mut warnings,
@@ -1713,6 +1796,7 @@ mod tests {
             &mut state("crates/b", MemoryProject::new()),
             rewritten(&[("Cargo.toml", "A")]),
             true,
+            &no_bazel,
             &mut changed,
             &mut changed_binary,
             &mut warnings,
@@ -1720,8 +1804,98 @@ mod tests {
         assert!(same.error.is_none());
     }
 
+    /// The last check before a rewrite is taken (HZ-20): a file in a
+    /// directory where Bazel builds the file's ecosystem is not changed,
+    /// whichever project's run reached it, and nothing else of that run
+    /// is written either.
+    #[test]
+    fn a_rewrite_into_a_directory_bazel_claims_is_refused_whole() {
+        // gazelle builds the Go modules of `lib` from `lib/go.mod`.
+        let gazelle = "bazel_dep(name = \"gazelle\", version = \"0.45.0\")\n\
+            go_deps = use_extension(\"@gazelle//:extensions.bzl\", \"go_deps\")\n\
+            go_deps.from_file(go_mod = \"//lib:go.mod\")\n\
+            use_repo(go_deps, \"com_github_pkg_errors\")\n";
+        let text = |text: &str| share(InputFile::Text(text.to_string()));
+        let files: BTreeMap<String, SharedFile> = [
+            ("MODULE.bazel", gazelle),
+            ("go.mod", "module example.com/app\n"),
+            ("lib/go.mod", "module example.com/lib\n"),
+            ("lib/go.sum", ""),
+            ("web/package-lock.json", "{}"),
+        ]
+        .into_iter()
+        .map(|(path, content)| (path.to_string(), text(content)))
+        .collect();
+        let bazel = bazel::Workspaces::of(&files);
+        let code = crate::bazel::codes::Code::WorkspaceUnsupportedInMemory.as_str();
+        let finish = |root: &str, selected: &str, writes: &[(&str, &str)]| {
+            let mut changed = BTreeMap::new();
+            let mut changed_binary = BTreeMap::new();
+            let mut warnings = Vec::new();
+            let mut state = state(root, MemoryProject::new());
+            state.selected = vec![(selected.to_string(), "u".to_string())];
+            let result = finish_root(
+                &mut state,
+                rewritten(writes),
+                false,
+                &bazel,
+                &mut changed,
+                &mut changed_binary,
+                &mut warnings,
+            );
+            let paths: Vec<String> = changed.keys().cloned().collect();
+            (result, paths, warnings)
+        };
+
+        // The root's own go.mod is no hub's. The one in `lib` is the file
+        // Bazel builds from: the run that would change it writes nothing,
+        // its own go.mod included.
+        let golang = "pkg:golang/github.com/pkg/errors@v0.9.1";
+        let writes = [("go.mod", "M"), ("lib/go.mod", "M")];
+        let (result, paths, warnings) = finish("", golang, &writes);
+        let error = result.error.expect("refused");
+        assert_eq!(error.code, code);
+        let message = &error.message;
+        assert!(message.starts_with("lib/go.mod would be rewritten, and MODULE.bazel makes"));
+        assert!(message.contains("golang packages"), "{message}");
+        assert!(
+            result.redirected.is_empty() && paths.is_empty(),
+            "{paths:?}"
+        );
+        let [warning] = warnings.as_slice() else {
+            panic!("one warning: {warnings:?}");
+        };
+        assert_eq!(warning.code, code);
+        assert_eq!(warning.project_root.as_deref(), Some(""));
+
+        // The same run without that file is taken.
+        let (result, paths, warnings) = finish("", golang, &[("go.mod", "M")]);
+        assert!(result.error.is_none() && warnings.is_empty());
+        assert_eq!(paths, ["go.mod"]);
+        // A file that is no lock says nothing by its name and counts for
+        // what the run pins: beside the Go module, an npm run's settings
+        // file is not Go's, and a Go run's is.
+        let npm = "pkg:npm/left-pad@1.3.0";
+        let (result, paths, _) = finish("", npm, &[("lib/.npmrc", "R")]);
+        assert!(result.error.is_none());
+        assert_eq!(paths, ["lib/.npmrc"]);
+        let (result, paths, _) = finish("", golang, &[("lib/settings.toml", "R")]);
+        assert_eq!(result.error.expect("refused").code, code);
+        assert!(paths.is_empty());
+        // A lock is its ecosystem's whatever the run pins.
+        let (result, paths, _) = finish("", npm, &[("lib/go.sum", "S")]);
+        assert_eq!(result.error.expect("refused").code, code);
+        assert!(paths.is_empty());
+        // A project the hub does not reach is written as ever.
+        let (result, paths, _) = finish("web", npm, &[("package-lock.json", "L")]);
+        assert!(result.error.is_none());
+        assert_eq!(paths, ["web/package-lock.json"]);
+    }
+
     #[test]
     fn a_conflicting_binary_write_refuses_the_project() {
+        let no_files = BTreeMap::new();
+        let no_bazel = bazel::Workspaces::of(&no_files);
         let mut changed = BTreeMap::new();
         let mut changed_binary = BTreeMap::new();
         changed_binary.insert("web/bun.lockb".to_string(), ("".to_string(), vec![1u8]));
@@ -1735,6 +1909,7 @@ mod tests {
             &mut state("web", MemoryProject::new()),
             done,
             true,
+            &no_bazel,
             &mut changed,
             &mut changed_binary,
             &mut warnings,
