@@ -36,11 +36,10 @@
 //! its other blocking walks. No command calls into this module yet: the
 //! seams of the integration packages will, and the `mod` lines below name
 //! their files. `run.rs` (`ToolRunner`, `NoRunner` and `finish`, revision 4
-//! section 4) is not among them yet: its `finish` takes the captured
-//! originals of the group commit, a type the hosted engine's package
-//! defines, so the file and its `mod` line land in wave 5, before the
-//! first seam that calls `finish`. `scope.rs` is the one check of a
-//! command's scope root against Bazel's own trees.
+//! section 4) is among them: its `finish` takes the captured originals of
+//! a commit anchored at a Bazel root and says whether the commit stands,
+//! and the hosted seam is the first to call it. `scope.rs` is the one
+//! check of a command's scope root against Bazel's own trees.
 //!
 //! # Rules for a seam
 //!
@@ -120,6 +119,7 @@ pub mod agent;
 pub mod agent_go;
 pub mod commands;
 pub mod hosted;
+pub mod run;
 pub mod scope;
 pub mod vendored;
 pub mod vex;

@@ -50,23 +50,40 @@
 //! Both files are replaced by stage and rename, never truncated, under one
 //! lock per root (`.socket/bazel/apply.lock`, which exists only while it
 //! is held), so two sub-projects of one root are applied in order, in one
-//! run or in two. The lock is the bare one of `patch::apply_lock`
-//! (`acquire_bare`): it does nothing but lock, because the root's
-//! `.socket` is not a project's (the project lock also finishes an
-//! interrupted vendored commit and sweeps stage entries there), and a run
-//! that is interrupted inside an edit removes the file on its way out as
-//! it removes the project's. No stage file is left beside either file: a
-//! failed write removes its own, and the next edit removes what an
-//! interrupted one left (hazard HZ-27). The writes bypass an open group
-//! commit on purpose: the line must be on disk before the tree is.
+//! run or in two. The lock file is the bare one of `patch::apply_lock`
+//! (`acquire_bare`), because the root's `.socket` is not a project's (the
+//! project lock also finishes an interrupted vendored commit and sweeps
+//! stage entries there), and a run that is interrupted inside an edit
+//! removes the file on its way out as it removes the project's. No stage
+//! file is left beside either file: a failed write removes its own, and
+//! the next edit removes what an interrupted one left (hazard HZ-27). The
+//! writes bypass an open group commit on purpose: the line must be on
+//! disk before the tree is.
+//!
+//! # The root's lock, for every writer under the root
+//!
+//! [`RootLock`] is that lock as a guard ([`lock_root`]). The commit of a
+//! Bazel change set (`utils::group_commit::commit_anchored`) is made under
+//! it, by whichever seam lands one, and the edits of this file take it for
+//! each of their own. Taking it does two things besides locking. A root
+//! whose `.socket` or owned directory is a symbolic link is refused and
+//! nothing is created there: what lies behind the link is another
+//! project's. And a commit that an interrupted run left anchored at the
+//! root is finished first, from its journal, so no holder ever works over
+//! a half-replaced root ([`RootLock::recovery`] says what that did). The
+//! project lock looks for such a journal too ([`recover_above`]), since the
+//! files it covers can be a project's own.
+//!
+//! A holder calls no `before_*` or `after_*` function of this file: each
+//! takes the lock itself, and would wait for the holder until it gives up.
 //!
 //! With no Bazel root above a project the cost is the root probe's stats;
 //! nothing is read and nothing is written.
 
 use std::io::{ErrorKind, Read as _};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, PoisonError};
-use std::time::Duration;
+use std::sync::{Condvar, Mutex, PoisonError};
+use std::time::{Duration, Instant};
 
 use crate::bazel::codes::Code;
 use crate::bazel::ignore::{
@@ -77,9 +94,12 @@ use crate::bazel::owned_index::{self, Index, Parsed, INDEX_PATH};
 use crate::constants::npm_family::VLT_LOCK;
 use crate::crawlers::bazel_root::{boundary_file_in, RootProbe, BOUNDARY_FILES};
 use crate::patch::apply::ApplyResult;
-use crate::patch::apply_lock::{self, LockError, LockGuard};
-use crate::utils::containment::linked_level;
+use crate::patch::apply_lock::{
+    self, CommitRecovery, LockError, LockGuard, COMMIT_RECOVERED, COMMIT_SET_ASIDE,
+};
+use crate::utils::containment::{linked_level, try_linked_level};
 use crate::utils::fs::{atomic_write_sync, open_regular_file_sync, run_blocking};
+use crate::utils::group_commit::{self, Recovery, SetAsideOutcome, ROOT_JOURNAL_REL};
 use crate::utils::repo_root::{ReadBoundary, ReadScope};
 use crate::utils::socket_dir::STAGE_PREFIX;
 use crate::vendor::go_mod_edit::GO_PATCHES_DIR;
@@ -108,9 +128,61 @@ const SCAN_FILES: usize = 512;
 const SCAN_DIRS: usize = 4096;
 /// How long an edit waits for another run's edit of the same root.
 const LOCK_WAIT: Duration = Duration::from_secs(10);
+/// [`LOCK_WAIT`], for a seam that takes the root's lock itself
+/// ([`lock_root`]): what the edits of this file wait.
+pub const ROOT_LOCK_WAIT: Duration = LOCK_WAIT;
 
-/// Serializes the edits of one process; the lock file serializes processes.
-static CHANNEL: Mutex<()> = Mutex::new(());
+/// Serializes the holders of one root in one process; the lock file
+/// serializes processes, and two spellings of one root. A turn is owned,
+/// not borrowed, so a guard that holds one can be kept across an `await`
+/// and handed to another thread. Roots do not wait for one another.
+struct Channel {
+    /// The roots a holder of this process has its turn at.
+    busy: Mutex<Vec<PathBuf>>,
+    freed: Condvar,
+}
+
+static CHANNEL: Channel = Channel {
+    busy: Mutex::new(Vec::new()),
+    freed: Condvar::new(),
+};
+
+/// One holder's turn at a root; the waiters are woken when it goes.
+struct Turn(PathBuf);
+
+impl Channel {
+    /// The next turn at `root`, waited for up to `wait`. `None`: another
+    /// holder of this process kept its turn for that long.
+    fn take(&self, root: &Path, wait: Duration) -> Option<Turn> {
+        let deadline = Instant::now().checked_add(wait);
+        let mut busy = self.busy.lock().unwrap_or_else(PoisonError::into_inner);
+        while busy.iter().any(|held| held == root) {
+            let left = match deadline {
+                Some(deadline) => deadline.checked_duration_since(Instant::now())?,
+                // A wait too long to add up is a wait without an end.
+                None => Duration::from_secs(3600),
+            };
+            if left.is_zero() {
+                return None;
+            }
+            let waited = self.freed.wait_timeout(busy, left);
+            busy = waited.unwrap_or_else(PoisonError::into_inner).0;
+        }
+        busy.push(root.to_path_buf());
+        Some(Turn(root.to_path_buf()))
+    }
+}
+
+impl Drop for Turn {
+    fn drop(&mut self) {
+        let mut busy = CHANNEL.busy.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(at) = busy.iter().position(|held| *held == self.0) {
+            busy.swap_remove(at);
+        }
+        drop(busy);
+        CHANNEL.freed.notify_all();
+    }
+}
 
 /// A copy or a unit that was not created. `detail` ends with the remedy
 /// and "nothing was written".
@@ -497,44 +569,301 @@ fn slashed_lines(file: &Path, model: &IgnoreModel) -> Option<String> {
 /// over and removes it. Letting go also removes the index's directory and
 /// the root's `.socket` when nothing is left in them: a root that had no
 /// `.socket` before an edit has none after its undo.
+#[cfg(test)]
 fn take_lock(owned: &Path, wait: Duration) -> Result<LockGuard, String> {
-    apply_lock::acquire_bare(owned, wait).map_err(|e| match e {
-        LockError::Held => "another socket-patch run holds it".to_string(),
+    apply_lock::acquire_bare(owned, wait).map_err(|e| lock_failure(&e))
+}
+
+/// Why the lock file was not taken, as a refusal says it.
+fn lock_failure(error: &LockError) -> String {
+    match error {
+        LockError::Held => HELD.to_string(),
         LockError::Io { source, .. } => source.to_string(),
-        // Only the project lock looks for a commit journal.
+        // A bare lock looks for no commit journal.
         pending @ LockError::CommitPending { .. } => pending.to_string(),
+    }
+}
+
+/// What a waiter says of a lock a live run kept past the wait.
+const HELD: &str = "another socket-patch run holds it";
+
+/// The lock of one Bazel root, held: its `.bazelignore`, its owned index
+/// and every file a commit anchored at the root replaces have one writer
+/// while this lives (the module docs, "The root's lock"). The lock file
+/// exists only as long as the guard, and letting go removes the owned
+/// directory and the root's `.socket` when nothing is left in them, so a
+/// root that had no `.socket` before has none after.
+///
+/// A project's own lock is taken first where a run holds both: every
+/// holder takes them in that order.
+#[must_use = "the root is unlocked when this guard is dropped"]
+pub struct RootLock {
+    root: PathBuf,
+    recovery: Recovery,
+    // Dropped in this order: the lock file goes, then the next holder of
+    // this process is let in.
+    _file: LockGuard,
+    _turn: Turn,
+}
+
+impl std::fmt::Debug for RootLock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut shown = f.debug_struct("RootLock");
+        shown.field("root", &self.root);
+        shown.field("recovery", &self.recovery).finish()
+    }
+}
+
+impl RootLock {
+    /// The root that is locked, as the caller named it.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// What taking the lock did about a commit that an interrupted run
+    /// left anchored at the root: [`Recovery::Clean`] when it found none.
+    /// Anything else rewrote files under the root, so what the holder
+    /// read of the root before it took the lock is stale.
+    pub fn recovery(&self) -> &Recovery {
+        &self.recovery
+    }
+}
+
+/// Why a root's lock was not taken. Nothing was written, and whatever
+/// directory the attempt made is gone again.
+#[derive(Debug)]
+pub enum RootLockError {
+    /// The root's `.socket` or its owned directory is a symbolic link (the
+    /// path of the link): what lies behind it is another project's, and
+    /// nothing is created or written there.
+    Linked(PathBuf),
+    /// Another run holds the lock and kept it past the wait.
+    Held,
+    /// The lock file could not be made or locked.
+    Io(String),
+    /// The lock was taken, and the commit an interrupted run left at the
+    /// root could not be finished from its journal: a file it covers
+    /// cannot be read or written. The journal is kept, and nobody works
+    /// over the files it covers until a holder finishes it.
+    Replay {
+        journal: PathBuf,
+        source: std::io::Error,
+    },
+}
+
+impl std::fmt::Display for RootLockError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Linked(link) => write!(f, "{} is a symbolic link", link.display()),
+            Self::Held => f.write_str(HELD),
+            Self::Io(why) => f.write_str(why),
+            Self::Replay { journal, source } => write!(
+                f,
+                "the commit an interrupted run left at {} could not be finished ({source}); the \
+                 journal is kept",
+                journal.display()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for RootLockError {}
+
+/// [`lock_root`], blocking: the calls wait for another holder for up to
+/// `wait`, in this process and in another.
+pub fn lock_root_blocking(root: &Path, wait: Duration) -> Result<RootLock, RootLockError> {
+    let index_path = root.join(INDEX_PATH);
+    let owned = index_path.parent().unwrap_or(root);
+    // A level that cannot be probed is the lock attempt's to report.
+    if let Ok(Some(link)) = try_linked_level(root, owned) {
+        return Err(RootLockError::Linked(link));
+    }
+    let turn = CHANNEL.take(root, wait).ok_or(RootLockError::Held)?;
+    let file = apply_lock::acquire_bare(owned, wait).map_err(|e| match e {
+        LockError::Held => RootLockError::Held,
+        other => RootLockError::Io(lock_failure(&other)),
+    })?;
+    // What an interrupted edit staged beside either file goes first, with
+    // no age gate: only a holder of this lock writes there, and a leftover
+    // in a tree Bazel globs becomes an action input (hazard HZ-27).
+    for (dir, name) in [(root, ignore::BAZELIGNORE), (owned, "index.json")] {
+        let staged = format!("{STAGE_PREFIX}{name}-");
+        for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            if entry.file_name().to_string_lossy().starts_with(&staged) {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+    // Then the commit an interrupted run left, before the holder reads a
+    // file it covers. On a failure the guards drop here and the journal
+    // stays for the next holder.
+    let recovery = group_commit::recover_anchored(root).map_err(|source| {
+        let journal = root.join(ROOT_JOURNAL_REL);
+        RootLockError::Replay { journal, source }
+    })?;
+    Ok(RootLock {
+        root: root.to_path_buf(),
+        recovery,
+        _file: file,
+        _turn: turn,
     })
 }
 
-/// Runs `edit` as the one writer of a root's `.bazelignore` and index: in
-/// this process, and among processes through the lock file. What an
-/// interrupted edit staged beside either file goes first, with no age
-/// gate, because only a holder of this lock writes there and a leftover in
-/// a tree Bazel globs becomes an action input (hazard HZ-27).
+/// Takes the lock of the Bazel root `root` (the module docs, "The root's
+/// lock"), waiting up to `wait` for another holder: [`ROOT_LOCK_WAIT`] is
+/// what the edits of this file wait. The seam that lands a Bazel change
+/// set holds the guard from before it reads the root again until its
+/// commit is over, and passes it to `group_commit::commit_anchored`.
+pub async fn lock_root(root: &Path, wait: Duration) -> Result<RootLock, RootLockError> {
+    let root = root.to_path_buf();
+    run_blocking(move || lock_root_blocking(&root, wait)).await
+}
+
+/// Runs `edit` as the one writer of a root's `.bazelignore` and index,
+/// under the root's lock ([`lock_root_blocking`]).
 fn locked<T>(root: &Path, edit: impl FnOnce() -> T) -> Result<T, String> {
-    let _serial = CHANNEL.lock().unwrap_or_else(PoisonError::into_inner);
-    let index_path = root.join(INDEX_PATH);
-    let owned = index_path.parent().unwrap_or(root);
-    let lock = take_lock(owned, LOCK_WAIT);
-    let done = match &lock {
-        Err(e) => Err(format!(
-            "the lock of {} was not taken ({e})",
-            owned.display()
-        )),
-        Ok(_) => {
-            for (dir, name) in [(root, ignore::BAZELIGNORE), (owned, "index.json")] {
-                let staged = format!("{STAGE_PREFIX}{name}-");
-                for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
-                    if entry.file_name().to_string_lossy().starts_with(&staged) {
-                        let _ = std::fs::remove_file(entry.path());
-                    }
+    let lock = lock_root_blocking(root, LOCK_WAIT).map_err(|e| {
+        let owned = root.join(INDEX_PATH);
+        let owned = owned.parent().unwrap_or(root);
+        format!("the lock of {} was not taken ({e})", owned.display())
+    })?;
+    let done = edit();
+    drop(lock);
+    Ok(done)
+}
+
+/// What a replay did, as the run reports it: the code and the sentence
+/// the project lock reports for a commit of its own.
+fn recovered(root: &Path, recovery: Recovery) -> Option<CommitRecovery> {
+    let shown = |files: &[String]| {
+        let safe: Vec<String> = files
+            .iter()
+            .map(|f| crate::policy::strip_unsafe(f))
+            .collect();
+        safe.join(", ")
+    };
+    let named = |files: &[String]| match files.is_empty() {
+        true => String::new(),
+        false => format!(" ({})", shown(files)),
+    };
+    let at = root.display();
+    let (code, detail) = match recovery {
+        Recovery::Clean => return None,
+        Recovery::RolledForward(files) if files.is_empty() => (
+            COMMIT_RECOVERED,
+            format!(
+                "an interrupted run's commit under the Bazel root {at} had already replaced \
+                 every file it covers; its leftover journal was removed"
+            ),
+        ),
+        Recovery::RolledForward(files) => (
+            COMMIT_RECOVERED,
+            format!(
+                "an interrupted run's commit under the Bazel root {at} was finished from its \
+                 journal: rolled forward {}; if no run was interrupted in this checkout, the \
+                 journal came with the checkout, so review those files",
+                shown(&files)
+            ),
+        ),
+        Recovery::SetAside { journal, outcome } => {
+            let done = match outcome {
+                SetAsideOutcome::Refused => "nothing of it was applied (it is unreadable, or \
+                                             names a path it must not write)"
+                    .to_string(),
+                SetAsideOutcome::LeftAsIs => {
+                    "nothing of it was applied (a file it covers changed since)".to_string()
                 }
-            }
-            Ok(edit())
+                SetAsideOutcome::FinishedAround(files) => format!(
+                    "it was finished around the files edited since{}",
+                    named(&files)
+                ),
+                SetAsideOutcome::RolledBack(files) => {
+                    format!("the files it had replaced were put back{}", named(&files))
+                }
+            };
+            (
+                COMMIT_SET_ASIDE,
+                format!(
+                    "an interrupted run's commit under the Bazel root {at} could not be \
+                     finished as written: {done}; the journal was set aside at {} — run \
+                     `socket-patch scan` again to pin what it left out",
+                    journal.display()
+                ),
+            )
         }
     };
-    drop(lock);
-    done
+    Some(CommitRecovery { code, detail })
+}
+
+/// For the project lock (`patch::apply_lock`): finishes every commit that
+/// an interrupted run left anchored at a Bazel root at or above
+/// `project_root`, inside the directory socket-patch writes in. The files
+/// such a commit covers can be the project's own (a lock a hub reads), so
+/// a locked command must not read them half replaced.
+///
+/// Where no journal lies above the project the cost is one stat per
+/// directory level up to the repository root, and nothing is read or
+/// locked: that is every project outside a Bazel workspace. A journal
+/// that is found is replayed under its root's lock ([`lock_root_blocking`]
+/// does it), and what that did is returned for the run to report. A dry
+/// run replays nothing and refuses with [`LockError::CommitPending`], as
+/// it does for a project's own journal.
+pub fn recover_above(project_root: &Path, dry_run: bool) -> Result<Vec<CommitRecovery>, LockError> {
+    let start = std::fs::canonicalize(project_root).unwrap_or_else(|_| project_root.to_path_buf());
+    let writes = ReadBoundary::of(ReadScope::Workspace, project_root);
+    let top = writes.root().filter(|top| start.starts_with(top));
+    let mut found = Vec::new();
+    for dir in start.ancestors() {
+        let journal = dir.join(ROOT_JOURNAL_REL);
+        if exists(&journal) {
+            found.extend(recover_at(dir, &journal, dry_run)?);
+        }
+        // Outside the write boundary no commit of socket-patch's was made.
+        if top.is_none_or(|top| dir == top) {
+            break;
+        }
+    }
+    Ok(found)
+}
+
+/// [`recover_above`] for the one root `root`, whose journal is `journal`.
+fn recover_at(
+    root: &Path,
+    journal: &Path,
+    dry_run: bool,
+) -> Result<Option<CommitRecovery>, LockError> {
+    let unfinished = |source: std::io::Error| {
+        let why = format!(
+            "could not finish an interrupted run's commit under the Bazel root {}: {source}; the \
+             journal is kept for the next command",
+            root.display()
+        );
+        LockError::Io {
+            path: journal.to_path_buf(),
+            source: std::io::Error::new(source.kind(), why),
+        }
+    };
+    if dry_run {
+        return match group_commit::pending_anchored(root) {
+            Ok(None) => Ok(None),
+            Ok(Some(found)) => Err(LockError::CommitPending {
+                journal: found.journal,
+                files: found.files,
+            }),
+            Err(source) => Err(unfinished(source)),
+        };
+    }
+    match lock_root_blocking(root, LOCK_WAIT) {
+        Ok(lock) => Ok(recovered(root, lock.recovery().clone())),
+        // Behind a link the journal is another project's: its own lock
+        // finds it.
+        Err(RootLockError::Linked(_)) => Ok(None),
+        // A live run holds the root: the journal is its commit under way.
+        // Nothing may be read over that, so this lock waits its own turn.
+        Err(RootLockError::Held) => Err(LockError::Held),
+        Err(RootLockError::Replay { source, .. }) => Err(unfinished(source)),
+        Err(RootLockError::Io(why)) => Err(unfinished(std::io::Error::other(why))),
+    }
 }
 
 /// Adds `line` and its index row. `Ok(false)`: a line hides the tree by
@@ -2025,6 +2354,144 @@ mod tests {
         assert!(owned.join(LOCK_FILE).exists());
         drop(held);
         assert_eq!(repo.tree(), before);
+    }
+
+    // ── The root's lock, as a guard ──────────────────────────────────
+
+    /// Two holders in one process take their turns: the second waits for
+    /// the first, a holder that will not wait is told the lock is held,
+    /// and the lock file exists only while one of them holds it.
+    #[test]
+    fn two_holders_of_a_root_lock_in_one_process_are_serialized() {
+        let repo = Repo::workspace();
+        let before = repo.tree();
+        let lock = repo.top.join(INDEX_PATH).with_file_name(LOCK_FILE);
+        let first = lock_root_blocking(&repo.top, Duration::ZERO).expect("free");
+        assert_eq!(first.root(), repo.top);
+        assert_eq!(first.recovery(), &Recovery::Clean);
+        assert!(lock.exists());
+        let busy = lock_root_blocking(&repo.top, Duration::ZERO).unwrap_err();
+        assert!(matches!(busy, RootLockError::Held), "{busy}");
+        let busy = lock_root_blocking(&repo.top, Duration::from_millis(40)).unwrap_err();
+        assert!(matches!(busy, RootLockError::Held), "{busy}");
+        // An edit of this file waits its turn like any other holder.
+        let released = std::sync::atomic::AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            let waiter = scope.spawn(|| {
+                let second = lock_root_blocking(&repo.top, Duration::from_secs(30));
+                let second = second.expect("taken once it is free");
+                // The first holder was gone before this one got in.
+                assert!(released.load(std::sync::atomic::Ordering::SeqCst));
+                assert!(lock.exists());
+                drop(second);
+            });
+            std::thread::sleep(Duration::from_millis(80));
+            released.store(true, std::sync::atomic::Ordering::SeqCst);
+            drop(first);
+            waiter.join().expect("the waiter");
+        });
+        // A root that had no `.socket` before has none after.
+        assert_eq!(repo.tree(), before);
+        assert!(!repo.top.join(".socket").exists());
+    }
+
+    /// Two processes are serialized by the lock file: while a child holds
+    /// the root, this process is told so and then waits it out.
+    #[test]
+    fn two_holders_of_a_root_lock_in_two_processes_are_serialized() {
+        const CHILD: &str = "SOCKET_PATCH_CORE_TEST_ROOT_LOCK_CHILD";
+        const NAME: &str = "utils::bazel_root_writes::tests::\
+             two_holders_of_a_root_lock_in_two_processes_are_serialized";
+        if let Some(root) = std::env::var_os(CHILD) {
+            // The child: take the lock, say so, hold it until told to go.
+            let root = PathBuf::from(root);
+            let held = lock_root_blocking(&root, Duration::ZERO).expect("free");
+            std::fs::write(root.join("held"), b"").expect("the marker");
+            let told = Instant::now();
+            while !root.join("go").exists() {
+                assert!(told.elapsed() < Duration::from_secs(60), "never told to go");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            drop(held);
+            return;
+        }
+        let repo = Repo::workspace();
+        let exe = std::env::current_exe().expect("the test binary");
+        let mut child = std::process::Command::new(exe)
+            .args([NAME, "--exact", "--test-threads=1", "--nocapture"])
+            .env(CHILD, &repo.top)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("the child");
+        let started = Instant::now();
+        while !repo.top.join("held").exists() {
+            assert!(
+                started.elapsed() < Duration::from_secs(60),
+                "the child never locked"
+            );
+            assert!(
+                child.try_wait().expect("the child").is_none(),
+                "the child ended early"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let busy = lock_root_blocking(&repo.top, Duration::ZERO).unwrap_err();
+        assert!(matches!(busy, RootLockError::Held), "{busy}");
+        let busy = lock_root_blocking(&repo.top, Duration::from_millis(60)).unwrap_err();
+        assert!(matches!(busy, RootLockError::Held), "{busy}");
+        std::fs::write(repo.top.join("go"), b"").expect("the signal");
+        let mine = lock_root_blocking(&repo.top, Duration::from_secs(60)).expect("its turn");
+        assert!(child.wait().expect("the child").success());
+        drop(mine);
+        assert!(!repo.top.join(".socket").exists(), "no `.socket` is left");
+    }
+
+    /// A root whose `.socket` is a link is another project's: the lock is
+    /// refused and nothing is made behind the link. A lock that fails for
+    /// any other reason leaves no directory either.
+    #[cfg(unix)]
+    #[test]
+    fn a_root_lock_is_refused_through_a_link_and_leaves_nothing() {
+        let repo = Repo::workspace();
+        let other = Repo::new();
+        std::os::unix::fs::symlink(&other.top, repo.top.join(".socket")).expect("a link");
+        let linked = lock_root_blocking(&repo.top, Duration::ZERO).unwrap_err();
+        assert!(
+            matches!(&linked, RootLockError::Linked(link) if *link == repo.top.join(".socket")),
+            "{linked}"
+        );
+        assert_eq!(
+            other.tree().len(),
+            0,
+            "nothing behind the link: {:?}",
+            other.tree()
+        );
+
+        let squatted = Repo::workspace();
+        squatted.put(".socket/bazel", b"");
+        let before = squatted.tree();
+        let failed = lock_root_blocking(&squatted.top, Duration::ZERO).unwrap_err();
+        assert!(matches!(failed, RootLockError::Io(_)), "{failed}");
+        assert_eq!(squatted.tree(), before);
+    }
+
+    /// The project lock finds nothing to finish above a project that has
+    /// no journal at any level, and it reads, locks and creates nothing
+    /// for that answer.
+    #[test]
+    fn a_project_with_no_anchored_journal_above_it_costs_the_lock_nothing() {
+        for bazel in [false, true] {
+            let repo = match bazel {
+                true => Repo::workspace(),
+                false => Repo::new(),
+            };
+            let project = repo.dir("svc/api");
+            let before = repo.tree();
+            assert_eq!(recover_above(&project, false).expect("nothing to do"), []);
+            assert_eq!(recover_above(&project, true).expect("nothing to do"), []);
+            assert_eq!(repo.tree(), before, "bazel={bazel}");
+        }
     }
 
     fn result(success: bool, error: Option<&str>) -> ApplyResult {

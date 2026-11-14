@@ -679,6 +679,38 @@ fn recover_group_commit(
     socket_dir: &Path,
     dry_run: bool,
 ) -> Result<Option<CommitRecovery>, LockError> {
+    let own = recover_project_commit(socket_dir, dry_run)?;
+    let Some(project_root) = socket_dir.parent() else {
+        return Ok(own);
+    };
+    // A commit anchored at a Bazel root at or above the project covers
+    // files a command of this project reads (a lock a hub names, the
+    // root's index), and its journal lies at that root: it is finished
+    // here too, under the root's own lock, and said like the project's.
+    let anchored = crate::utils::bazel_root_writes::recover_above(project_root, dry_run)?;
+    for recovery in &anchored {
+        eprintln!("Warning: {}", recovery.detail);
+    }
+    let mut all = own.into_iter().chain(anchored);
+    let Some(mut merged) = all.next() else {
+        return Ok(None);
+    };
+    for more in all {
+        // One entry is reported: a journal that was set aside outranks
+        // one that was replayed, and every sentence is kept.
+        if more.code == COMMIT_SET_ASIDE {
+            merged.code = COMMIT_SET_ASIDE;
+        }
+        merged.detail = format!("{}; {}", merged.detail, more.detail);
+    }
+    Ok(Some(merged))
+}
+
+/// [`recover_group_commit`] for the project's own journal.
+fn recover_project_commit(
+    socket_dir: &Path,
+    dry_run: bool,
+) -> Result<Option<CommitRecovery>, LockError> {
     use crate::utils::group_commit::{
         pending, recover, Recovery, SetAsideOutcome, COMMIT_JOURNAL_REL,
     };
