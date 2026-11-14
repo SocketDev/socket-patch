@@ -54,7 +54,11 @@
 //!   which record no wiring, included), never because a `package.json`
 //!   override or any other file its ledger names still spells the vendored
 //!   dir. A reverted lockfile plus a leftover ledger or artifact must not
-//!   keep attesting.
+//!   keep attesting. The one entry no reference can wire is an entry whose
+//!   ledger record says the owned index of a Bazel root wires its artifact:
+//!   the Bazel gate decides it ([`crate::bazel_gate::vex`]) and omits it
+//!   with the same tag wherever the build is not proven to consume a
+//!   vendored pin of its patch, outside a Bazel workspace included.
 //!   A dead vendor claim falls through to a live hosted claim for the same
 //!   key (hosted takeover of a vendored package). A manifest-owned purl whose REDIRECT
 //!   claim is dead simply falls back to agent-mode verification (hosted mode
@@ -191,7 +195,7 @@ const NOTE_WIRING_CONFLICT: &str = "vex_wiring_conflict";
 /// A recorded patch is superseded by the lockfile-wired one.
 const NOTE_RECORD_SUPERSEDED: &str = "vex_record_superseded";
 /// A ledger claim died although the lockfiles still mention the patch.
-const NOTE_CLAIM_UNWIRED: &str = "vex_claim_unwired";
+pub(crate) const NOTE_CLAIM_UNWIRED: &str = "vex_claim_unwired";
 /// `--offline` forbids fetching the records the plan needs.
 const NOTE_RECORD_OFFLINE: &str = "vex_record_offline";
 /// The patch API has no such patch.
@@ -724,7 +728,11 @@ pub(crate) async fn plan(
                 lockfile_basis: cand.discovered.iter().all(PatchedRef::lockfile_basis_ok),
             }
         } else if let Some(entry) = &cand.vendor_entry {
-            if liveness.vendor_entry(entry).await {
+            // An entry whose record says the owned index of a Bazel root
+            // wires its artifact has no lockfile reference to be live by.
+            // The Bazel gate decides it, on the pin of its patch, and omits
+            // it as unwired where it finds no proof (`bazel_gate::vex`).
+            if liveness.vendor_entry(entry).await || entry.bazel_index().is_some() {
                 Basis::Vendored(Box::new(entry.clone()))
             } else if let Some(hosted) = redirect_records.get(&cand.key).cloned() {
                 // Hosted-over-vendored takeover: `scan --mode hosted` over a
