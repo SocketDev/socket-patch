@@ -53,6 +53,9 @@ pub struct VerifyOutcome {
     /// manager re-installs. An ABSENT installed tree is the expected
     /// post-vendor state and is never flagged.
     pub vendored_out_of_sync: Vec<String>,
+    /// The first installed copy that put each purl in
+    /// `vendored_out_of_sync`, so a caller can name the directory.
+    pub vendored_out_of_sync_copies: HashMap<String, PathBuf>,
     /// Maven / Gradle: `(purl, copy)` for every installed copy of a failed
     /// purl that does not verify — the copy a build may still load
     /// unpatched. Callers name them (`vex_gradle_unpatched_copy`).
@@ -257,6 +260,8 @@ pub async fn applied_patches_with_copies(
                         };
                         if !in_sync {
                             out.vendored_out_of_sync.push(purl.clone());
+                            out.vendored_out_of_sync_copies
+                                .insert(purl.clone(), pkg_path.clone());
                             break;
                         }
                     }
@@ -1966,6 +1971,11 @@ mod tests {
         assert_eq!(out.applied, vec![purl.to_string()]);
         assert_eq!(out.vendored, vec![purl.to_string()]);
         assert_eq!(out.vendored_out_of_sync, vec![purl.to_string()]);
+        // The copy that drifted is the one named, not the first crawled.
+        assert_eq!(
+            out.vendored_out_of_sync_copies,
+            HashMap::from([(purl.to_string(), root.path().join("drifted"))])
+        );
     }
 
     /// Go vendored: the crawler's module-cache `M@v` is pristine by

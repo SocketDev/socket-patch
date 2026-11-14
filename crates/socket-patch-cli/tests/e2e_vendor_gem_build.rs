@@ -659,9 +659,10 @@ fn gem_vendor_fresh_checkout_bundle_install_and_revert() {
     // and installs nothing for rack, so no install replaces that copy. The
     // warning about it must name a remedy that removes it (`bundle clean`,
     // run below), not a reinstall.
+    let leftover = format!("Warning: {purl}: {} does not match", gem_dir.display());
     assert!(
-        stderr.contains(&format!("Warning: {purl}: ")) && stderr.contains("`bundle clean`"),
-        "the leftover gem-home copy is disclosed with a remedy that clears it:\n{stderr}"
+        stderr.contains(&leftover) && stderr.contains("Remove it with `bundle clean`."),
+        "the leftover gem-home copy is named, with the remedy that clears it:\n{stderr}"
     );
     assert!(
         !stderr.contains("re-run your package manager"),
