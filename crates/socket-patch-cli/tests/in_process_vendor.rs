@@ -3812,6 +3812,176 @@ async fn scan_vendor_gem_unserved_first_vendor_still_fails() {
     assert_eq!(std::fs::read_to_string(fx.lock_path()).unwrap(), GEM_LOCK);
 }
 
+/// The locks of #2075: the gem home holds demo-gem 1.0.0 (Ruby ships it,
+/// or another project installed it), and this project's lock doesn't
+/// resolve that version. Each is `(label, Gemfile, Gemfile.lock)`.
+fn gem_unlocked_projects() -> Vec<(&'static str, String, String)> {
+    let other = "GEM\n  remote: https://rubygems.org/\n  specs:\n    other-gem (2.0.0)\n\nPLATFORMS\n  ruby\n\nDEPENDENCIES\n  other-gem\n\nBUNDLED WITH\n   2.6.2\n";
+    let newer = GEM_LOCK.replace("demo-gem (1.0.0)", "demo-gem (1.2.0)");
+    vec![
+        (
+            "the project doesn't use the gem",
+            "source \"https://rubygems.org\"\n\ngem \"other-gem\"\n".to_string(),
+            other.to_string(),
+        ),
+        (
+            "the lock resolves a newer version",
+            GEM_GEMFILE.to_string(),
+            newer.clone(),
+        ),
+        (
+            "a CRLF lock that resolves a newer version",
+            GEM_GEMFILE.to_string(),
+            newer.replace('\n', "\r\n"),
+        ),
+    ]
+}
+
+/// A [`gem_fixture`] whose Gemfile pair is one of [`gem_unlocked_projects`].
+fn gem_unlocked_fixture(gemfile: &str, lock: &str) -> GemFixture {
+    let fx = gem_fixture();
+    std::fs::write(fx.gemfile_path(), gemfile).unwrap();
+    std::fs::write(fx.lock_path(), lock).unwrap();
+    fx
+}
+
+/// The paths of the requests `mock` received.
+async fn requested_paths(mock: &wiremock::MockServer) -> Vec<String> {
+    mock.received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .map(|r| r.url.path().to_string())
+        .collect()
+}
+
+/// #2075: `scan --mode vendored` on a project whose gem home holds a
+/// patchable gem version the lock doesn't resolve. The gem is skipped as
+/// `vendor_gem_version_not_locked` (exit 0, nothing failed), its patch is
+/// never downloaded, and the project is left byte-identical. It used to
+/// fail the run: "Gemfile.lock GEM specs has no entry", exit 1.
+#[tokio::test]
+async fn scan_vendor_gem_skips_a_version_the_lock_does_not_resolve() {
+    for (label, gemfile, lock) in gem_unlocked_projects() {
+        let mock = wiremock::MockServer::start().await;
+        mount_gem_patch_api(&mock, GEM_PURL).await;
+        let fx = gem_unlocked_fixture(&gemfile, &lock);
+
+        let (code, env) = run_scan_vendor(fx.root(), &mock.uri(), &[]);
+        assert_eq!(code, 0, "{label}: {env:#}");
+        assert_eq!(env["status"], "success", "{label}: {env:#}");
+        assert_eq!(env["summary"]["failed"], 0, "{label}: {env:#}");
+        let skipped = find_event(&env, "skipped", Some("vendor_gem_version_not_locked"));
+        assert_eq!(skipped["purl"], GEM_PURL, "{label}: {skipped}");
+        assert_eq!(skipped["details"]["mode"], "vendored", "{label}: {skipped}");
+        let detail = skipped["reason"].as_str().unwrap_or_default();
+        assert!(
+            detail.contains("Gemfile.lock does not resolve demo-gem 1.0.0")
+                && detail.contains("this project doesn't lock it"),
+            "{label}: the skip says why: {skipped}"
+        );
+        assert!(
+            events(&env).iter().all(|e| e["action"] != "failed"),
+            "{label}: {env:#}"
+        );
+
+        assert_eq!(
+            std::fs::read_to_string(fx.gemfile_path()).unwrap(),
+            gemfile,
+            "{label}: Gemfile untouched"
+        );
+        assert_eq!(
+            std::fs::read_to_string(fx.lock_path()).unwrap(),
+            lock,
+            "{label}: Gemfile.lock untouched"
+        );
+        assert!(
+            !fx.root().join(".socket").exists(),
+            "{label}: nothing is written for a gem the project doesn't lock"
+        );
+        let downloads: Vec<String> = requested_paths(&mock)
+            .await
+            .into_iter()
+            .filter(|p| p.contains("/patches/view/") || p.ends_with("/package"))
+            .collect();
+        assert!(
+            downloads.is_empty(),
+            "{label}: the skipped patch is never downloaded: {downloads:?}"
+        );
+    }
+}
+
+/// #2075: the dry run reports what the wet run does. It used to say it
+/// would vendor the gem the wet run then failed on.
+#[tokio::test]
+async fn scan_vendor_gem_dry_run_previews_the_unlocked_version_skip() {
+    for (label, gemfile, lock) in gem_unlocked_projects() {
+        let mock = wiremock::MockServer::start().await;
+        mount_gem_patch_api(&mock, GEM_PURL).await;
+        let fx = gem_unlocked_fixture(&gemfile, &lock);
+
+        let (code, env) = run_scan_vendor(fx.root(), &mock.uri(), &["--dry-run"]);
+        assert_eq!(code, 0, "{label}: {env:#}");
+        let skipped = find_event(&env, "skipped", Some("vendor_gem_version_not_locked"));
+        assert_eq!(skipped["purl"], GEM_PURL, "{label}: {skipped}");
+        assert!(
+            events(&env)
+                .iter()
+                .all(|e| e["action"] != "verified" && e["action"] != "failed"),
+            "{label}: the dry run must not say it would vendor the gem: {env:#}"
+        );
+        assert!(!fx.root().join(".socket").exists(), "{label}");
+    }
+}
+
+/// #2075 through `vendor`: a manifest record (an agent-mode patch of the
+/// shared gem home, say) for a version the lock doesn't resolve is the
+/// same skip, exit 0, and the Gemfile pair stays byte-identical.
+#[tokio::test]
+async fn vendor_gem_skips_a_version_the_lock_does_not_resolve() {
+    for (label, gemfile, lock) in gem_unlocked_projects() {
+        let fx = gem_unlocked_fixture(&gemfile, &lock);
+        let after = compute_git_sha256_from_bytes(GEM_PATCHED);
+        std::fs::create_dir_all(fx.root().join(".socket/blobs")).unwrap();
+        std::fs::write(fx.root().join(".socket/blobs").join(&after), GEM_PATCHED).unwrap();
+        std::fs::write(
+            fx.root().join(".socket/manifest.json"),
+            serde_json::to_vec_pretty(&json!({ "patches": { GEM_PURL: {
+                "uuid": GEM_UUID, "exportedAt": "2026-01-01T00:00:00Z",
+                "files": { "lib/demo_gem.rb": {
+                    "beforeHash": compute_git_sha256_from_bytes(GEM_ORIG), "afterHash": after,
+                } },
+                "vulnerabilities": {}, "description": "gem vendor patch", "license": "MIT",
+                "tier": "free",
+            } } }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        for extra in [&["--dry-run"][..], &[]] {
+            let (code, env) = vendor_cli(fx.root(), extra);
+            assert_eq!(code, 0, "{label} {extra:?}: {env:#}");
+            let skipped = find_event(&env, "skipped", Some("vendor_gem_version_not_locked"));
+            assert_eq!(skipped["purl"], GEM_PURL, "{label} {extra:?}: {skipped}");
+            assert_eq!(env["summary"]["failed"], 0, "{label} {extra:?}: {env:#}");
+            assert_eq!(
+                std::fs::read_to_string(fx.gemfile_path()).unwrap(),
+                gemfile,
+                "{label} {extra:?}: Gemfile untouched"
+            );
+            assert_eq!(
+                std::fs::read_to_string(fx.lock_path()).unwrap(),
+                lock,
+                "{label} {extra:?}: Gemfile.lock untouched"
+            );
+            assert!(
+                !fx.root().join(".socket/vendor").exists(),
+                "{label} {extra:?}: nothing vendored"
+            );
+        }
+    }
+}
+
 /// `scan --mode vendored` end to end on a gem project: discover → download →
 /// vendor lands the gem pair edit (Gemfile pin + `path:`, lock PATH section
 /// + `(= …)!` DEPENDENCIES pin) and the patched artifact dir, keyed in the
