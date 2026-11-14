@@ -3285,6 +3285,52 @@ mod tests {
         assert!(env.events.is_empty());
     }
 
+    /// A refusal that has `details` (the token and the lift of a Bazel
+    /// refusal) keeps them on the failed event of the nested apply, as the
+    /// standalone `apply --json` reports them: for a patch this run
+    /// recorded, and for a failing manifest patch it did not select. A
+    /// failure with none gets no `details` member.
+    #[test]
+    fn record_apply_outcome_carries_the_details_of_a_refusal() {
+        let details = serde_json::json!({
+            "token": "lane_not_enabled",
+            "lift": { "kind": "enable_lane", "lane": "A-GO1" },
+        });
+        let refused = |purl: &str| crate::commands::apply::ApplyFailure {
+            details: Some(details.clone()),
+            ..failure(purl, "bazel_agent_go_unsupported", "refused")
+        };
+        let (selected, other, plain) = (
+            "pkg:golang/example.com/a@v1.0.0",
+            "pkg:golang/example.com/b@v1.0.0",
+            "pkg:npm/c@1.0.0",
+        );
+        let failures = vec![
+            refused(selected),
+            refused(other),
+            failure(plain, "apply_failed", "mismatch"),
+        ];
+        let report = report_with(failures, &[]);
+        let mut env = Envelope::new(JsonCommand::Scan);
+        // `selected` is a recorded patch; `other` and `plain` are manifest
+        // patches the run did not select.
+        let recs = recorded(&[(selected, "ua")]);
+        record_apply_outcome(&mut env, &recs, Some(&report), |_| None);
+        let code = "bazel_agent_go_unsupported";
+        assert_eq!(
+            outcomes(&env),
+            vec![
+                o("failed", selected, "ua", code),
+                o("failed", other, "", code),
+                o("failed", plain, "", "apply_failed"),
+            ]
+        );
+        let json = env.to_value();
+        assert_eq!(json["events"][0]["details"], details);
+        assert_eq!(json["events"][1]["details"], details);
+        assert!(json["events"][2].get("details").is_none(), "{json:#}");
+    }
+
     #[test]
     fn record_apply_outcome_preserves_skip_reasons_on_success_and_failure() {
         for code in [0, 1] {

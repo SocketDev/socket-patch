@@ -527,6 +527,15 @@ fn a_cr_only_bazelignore_is_refused_with_the_advisory_and_left_byte_for_byte() {
         text.starts_with(Code::WorkspaceIgnoreLineNeeded.as_str()),
         "{text}"
     );
+    // A refusal that no token names is the event's code all the same
+    // (never `apply_failed`), it has no `details.token`, and its lift
+    // says that the user's edit of the file lifts it (ROUTED R-024).
+    let event = event_for(&envelope, PURL);
+    let needed = Code::WorkspaceIgnoreLineNeeded.as_str();
+    assert_eq!(event["errorCode"], needed, "{envelope:#}");
+    assert!(event["details"].get("token").is_none(), "{envelope:#}");
+    assert_eq!(event["details"]["lift"]["kind"], "user_edit");
+    assert_eq!(event["details"]["lift"]["file"], ".bazelignore");
     let file = ws.root.join(".bazelignore");
     let remedy = format!(
         "Add the line `svc/.socket/go-patches` to {}",
