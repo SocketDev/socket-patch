@@ -38,11 +38,10 @@
 //! its other blocking walks. No command calls into this module yet: the
 //! seams of the integration packages will, and the `mod` lines below name
 //! their files. `run.rs` (`ToolRunner`, `NoRunner` and `finish`, revision 4
-//! section 4) is not among them yet: its `finish` takes the captured
-//! originals of the group commit, a type the hosted engine's package
-//! defines, so the file and its `mod` line land in wave 5, before the
-//! first seam that calls `finish`. `scope.rs` is the one check of a
-//! command's scope root against Bazel's own trees.
+//! section 4) is among them: its `finish` takes the captured originals of
+//! a commit anchored at a Bazel root and says whether the commit stands,
+//! and the hosted seam is the first to call it. `scope.rs` is the one
+//! check of a command's scope root against Bazel's own trees.
 //!
 //! # Rules for a seam
 //!
@@ -146,6 +145,7 @@ pub mod agent;
 pub mod agent_go;
 pub mod commands;
 pub mod hosted;
+pub mod run;
 pub mod scope;
 pub mod vendored;
 pub mod vex;
@@ -559,6 +559,31 @@ impl Loader {
         self.survey(project_dir).probe()
     }
 
+    /// The marker of the Bazel workspace that `project_dir` lies in and
+    /// could not be placed under ([`unplaced`]): the survey has no root
+    /// for it, and it is a workspace all the same, which this loader
+    /// reports as one it cannot read (`Code::WorkspaceUnreadable`). `None`
+    /// for every other project, one under a workspace file above the
+    /// repository included.
+    ///
+    /// For a reader that goes by [`Survey::roots`] alone (the consent
+    /// check): no root to read is "no workspace" for every project but
+    /// this one. Stats only.
+    pub fn unplaced(&self, project_dir: &Path) -> Option<PathBuf> {
+        let survey = self.survey(project_dir);
+        // Most projects are answered by the survey; only one with a
+        // marker and no root pays for the boundary again.
+        if !survey.roots.is_empty() || survey.above.is_none() {
+            return None;
+        }
+        let from = match project_dir.as_os_str().is_empty() {
+            true => Path::new("."),
+            false => project_dir,
+        };
+        let boundary = ReadBoundary::upward(ReadScope::Workspace, from);
+        unplaced(&survey, &boundary).map(Path::to_path_buf)
+    }
+
     /// The models and the files of every Bazel root that governs
     /// `project_dir`. One project has one load for as long as somebody
     /// holds it, and the loader holds the last few itself. A load is what
@@ -732,6 +757,15 @@ pub fn run_loader(run: RunCx) -> Arc<Loader> {
 fn is_outside(boundary: &ReadBoundary, marker: &Path) -> bool {
     let above = |root: &Path| marker.is_absolute() && !marker.starts_with(root);
     boundary.root().is_some_and(above)
+}
+
+/// The marker of a survey that could not place its project under a root
+/// inside `boundary`: no root, and a marker that is not above the boundary
+/// ([`is_outside`]). A marker above it is another workspace, which nothing
+/// reads, and a survey with roots placed the project.
+fn unplaced<'a>(survey: &'a Survey, boundary: &ReadBoundary) -> Option<&'a Path> {
+    let above = survey.above.as_ref().filter(|_| survey.roots.is_empty())?;
+    (!is_outside(boundary, &above.marker)).then_some(above.marker.as_path())
 }
 
 /// The warning for the marker a survey reports beside its roots. `outside`:
@@ -1611,6 +1645,66 @@ mod tests {
         let named = repo.at("MODULE.bazel").display().to_string();
         assert!(detail.contains(&named), "{detail}");
         assert!(!detail.contains("remove"), "{detail}");
+        // A reader that goes by the roots is told which workspace it is.
+        assert_eq!(loader.unplaced(&project), Some(repo.at("MODULE.bazel")));
+    }
+
+    /// Which survey is the one of a project that could not be placed
+    /// under its workspace, by the values alone: no root, and a marker at
+    /// or below the read boundary (a relative one is the probe's answer
+    /// when the working directory cannot be read). A marker above the
+    /// boundary is a workspace nobody reads, confirmed or not, and a
+    /// survey with a root placed the project.
+    #[test]
+    fn an_unplaced_project_is_told_from_one_below_a_workspace_above_the_repository() {
+        let repo = Repo::new(&[]);
+        let boundary = ReadBoundary::Workspace {
+            root: repo.at("repo"),
+        };
+        let survey = |roots: Vec<RootRef>, marker: PathBuf, confirmed: bool| Survey {
+            roots,
+            above: Some(MarkerAbove { marker, confirmed }),
+        };
+        let inside = repo.at("repo/MODULE.bazel");
+        let found = survey(Vec::new(), inside.clone(), true);
+        assert_eq!(unplaced(&found, &boundary), Some(inside.as_path()));
+        let relative = survey(Vec::new(), PathBuf::from("app"), true);
+        assert_eq!(unplaced(&relative, &boundary), Some(Path::new("app")));
+        assert_eq!(
+            unplaced(&relative, &ReadBoundary::Unbounded),
+            Some(Path::new("app"))
+        );
+        for confirmed in [true, false] {
+            let above = survey(Vec::new(), repo.at("WORKSPACE"), confirmed);
+            assert_eq!(unplaced(&above, &boundary), None, "{confirmed}");
+        }
+        let root = RootRef {
+            root: repo.at("repo"),
+            project_rel: String::new(),
+            boundary_levels: 0,
+        };
+        let placed = survey(vec![root], inside, true);
+        assert_eq!(unplaced(&placed, &boundary), None);
+        let none = Survey {
+            roots: Vec::new(),
+            above: None,
+        };
+        assert_eq!(unplaced(&none, &boundary), None);
+
+        // Through the loader, over a disk: a project under a workspace
+        // file above its repository is not one, whatever beside the file
+        // confirms it, and neither is one with a root or with nothing.
+        let outer = Repo::new(&[
+            ("WORKSPACE", "\tx = 1\n"),
+            (".bazelversion", "7.7.2\n"),
+            ("repo/app/package.json", "{}"),
+        ]);
+        outer.put("repo/.git/HEAD", "ref: refs/heads/main\n");
+        let loader = Loader::new(RunCx::default());
+        assert!(loader.survey(&outer.at("repo/app")).above.is_some());
+        assert_eq!(loader.unplaced(&outer.at("repo/app")), None);
+        let inner = Repo::new(&[JS_MODULE, PNPM_LOCK, ("app/package.json", "{}")]);
+        assert_eq!(loader.unplaced(&inner.at("app")), None);
     }
 
     /// Every project with no root inside its read boundary has the same

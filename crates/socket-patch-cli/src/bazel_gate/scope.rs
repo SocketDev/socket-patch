@@ -7,7 +7,10 @@
 //! removal, a repair or an attestation of a tree the next build replaces,
 //! so a command whose scope root (`--global-prefix`, else `--cwd`) is in
 //! one, or links into one, is refused before it reads, fetches or writes
-//! anything: the coded error `bazel_agent_output_tree`, exit 1.
+//! anything: the coded error `bazel_agent_output_tree`, exit 1. The
+//! project a `--manifest-path` names is a scope root too: these commands
+//! read and write the state of the manifest's project, and attest it,
+//! wherever `--cwd` points.
 //!
 //! This is the one check for the commands of O16: `rollback`, `remove`,
 //! `repair`, `get`, `vex` and `vendor` (`vendor --revert` with it). Each
@@ -27,6 +30,7 @@
 //! The file is under `bazel_gate/`, not `commands/`, so that every command
 //! module can call it with no new edge in `command_module_layering`.
 
+use std::borrow::Cow;
 use std::path::Path;
 
 use socket_patch_core::bazel::codes::Code;
@@ -81,11 +85,20 @@ fn cwd_named_by(common: &GlobalArgs) -> &'static str {
 /// name a refusal gives it. `--global-prefix` comes first: where it is
 /// given it is the tree the run works in, and `--cwd` only locates the
 /// manifest.
-fn scope_roots(common: &GlobalArgs) -> Vec<(&Path, &'static str)> {
+///
+/// The last is the project of the manifest, where `--manifest-path` (or
+/// its variable) names one that is not the working directory: every
+/// command of the rule moves its run there (`GlobalArgs::project_root`,
+/// `at_project_root`), reads that project's manifest, ledgers and
+/// lockfiles and attests or changes it. The two are compared as paths, as
+/// `at_project_root` compares them.
+fn scope_roots(common: &GlobalArgs) -> Vec<(Cow<'_, Path>, &'static str)> {
     let prefix = common.global_prefix.as_deref();
-    let prefix = prefix.map(|prefix| (prefix, "--global-prefix"));
-    let cwd = (common.cwd.as_path(), cwd_named_by(common));
-    prefix.into_iter().chain([cwd]).collect()
+    let prefix = prefix.map(|prefix| (Cow::Borrowed(prefix), "--global-prefix"));
+    let cwd = (Cow::Borrowed(common.cwd.as_path()), cwd_named_by(common));
+    let project = Some(common.project_root()).filter(|project| *project != common.cwd);
+    let project = project.map(|project| (Cow::Owned(project), "--manifest-path"));
+    prefix.into_iter().chain([cwd]).chain(project).collect()
 }
 
 /// A scope root in a Bazel tree, and the refusal it earns.
@@ -119,7 +132,7 @@ impl InBazelTree {
 /// that does not build with Bazel.
 pub async fn in_bazel_tree(common: &GlobalArgs, action: &str) -> Option<InBazelTree> {
     for (root, named_by) in scope_roots(common) {
-        if let Some(tree) = bazel_tree_of(root).await {
+        if let Some(tree) = bazel_tree_of(&root).await {
             return Some(InBazelTree::of(&tree, action, named_by));
         }
     }
@@ -290,7 +303,7 @@ mod tests {
         assert_eq!(cwd_named_by(&implicit), "the working directory");
         assert_eq!(
             scope_roots(&implicit),
-            [(Path::new("."), "the working directory")]
+            [(Cow::Borrowed(Path::new(".")), "the working directory")]
         );
         assert_eq!(cwd_named_by(&run_at(tree)), "--cwd");
         let store = bazel_tree_of(tree).await.expect("a tree");
@@ -315,6 +328,59 @@ mod tests {
             .expect("refused")
             .detail;
         assert!(detail.contains("(--cwd)"), "{detail}");
+    }
+
+    /// A manifest in another project's `.socket` moves the run there:
+    /// that project is judged too, and named by the flag that chose it.
+    /// The default manifest, a manifest path that stays in the working
+    /// directory's project, and a bare manifest file (whose project is
+    /// the working directory) add no root.
+    #[tokio::test]
+    async fn the_project_a_manifest_path_names_is_a_scope_root() {
+        let (_tmp, root, inside) = trees();
+        let (tree, _) = &inside[0];
+        let ws = at(&root, "ws");
+        let named = |common: &GlobalArgs| -> Vec<&'static str> {
+            scope_roots(common).iter().map(|(_, by)| *by).collect()
+        };
+        let with_manifest = |manifest: &Path| GlobalArgs {
+            manifest_path: manifest.to_string_lossy().into_owned(),
+            ..run_at(&ws)
+        };
+
+        // From the workspace, a manifest in the tree's `.socket`.
+        let foreign = with_manifest(&tree.join(".socket").join("manifest.json"));
+        assert_eq!(named(&foreign), ["--cwd", "--manifest-path"]);
+        let roots = scope_roots(&foreign);
+        assert_eq!(roots[1].0.as_ref(), tree.as_path());
+        for (command, action) in [
+            (Command::Vex, "attest"),
+            (Command::Get, "get"),
+            (Command::Vendor, "vendor"),
+        ] {
+            let refused = in_bazel_tree(&foreign, action).await;
+            let detail = refused.unwrap_or_else(|| panic!("{command:?}")).detail;
+            assert!(detail.contains("(--manifest-path)"), "{detail}");
+            assert!(detail.contains("in a Bazel output base"), "{detail}");
+            let code = refuse_in_bazel_tree(&foreign, command, action).await;
+            assert_eq!(code, Some(1), "{command:?}");
+        }
+        // The prefix and the working directory are still judged first.
+        let mut all = with_manifest(&tree.join(".socket").join("manifest.json"));
+        all.global_prefix = Some(ws.clone());
+        assert_eq!(named(&all), ["--global-prefix", "--cwd", "--manifest-path"]);
+
+        // A manifest that leaves the run where it is adds nothing.
+        assert_eq!(named(&run_at(&ws)), ["--cwd"]);
+        let own = with_manifest(&ws.join(".socket").join("manifest.json"));
+        assert_eq!(named(&own), ["--cwd"]);
+        let bare = with_manifest(&tree.join("manifest.json"));
+        assert_eq!(named(&bare), ["--cwd"]);
+        assert_eq!(in_bazel_tree(&bare, "attest").await, None);
+        // And a manifest in a project outside every tree is not refused.
+        let plain = with_manifest(&at(&root, "ws/app/.socket/manifest.json"));
+        assert_eq!(named(&plain), ["--cwd", "--manifest-path"]);
+        assert_eq!(in_bazel_tree(&plain, "attest").await, None);
     }
 
     #[tokio::test]

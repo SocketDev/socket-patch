@@ -10,6 +10,12 @@
 //! as they always did. The fixture workspace is the rules_jvm_external one,
 //! whose `maven_install.json` resolves `slf4j-api` 1.7.36 unpatched.
 //!
+//! Three more cases are about where the rule stops and where it does not:
+//! a run on the global installs is not judged against the workspace at
+//! `--cwd`; a vendor ledger entry that says the owned index of a Bazel root
+//! wires its artifact is not attested from the artifact alone; and nothing
+//! in a tree Bazel owns is attested, however the run got there.
+//!
 //! The verdicts that need a lane (a pin the build consumes, an in-run
 //! grant, an agent or a vendored lane's pin of a manifest record) are unit
 //! tests over a toy lane table, in `socket_patch_core::vex::discover::bazel`
@@ -27,7 +33,8 @@ mod vex_e2e_common;
 use crate::bazel_common::{assert_same_tree, snapshot};
 use crate::common::{self, envelope_error_code, git_sha256, parse_json_envelope};
 use vex_e2e_common::{
-    assert_attested, assert_omitted, patch_view, run_vex, Marker, PatchApi, VexOutcome, VexRun,
+    assert_attested, assert_omitted, patch_view, run_vex, write_hosted_npm_lock, Marker, PatchApi,
+    VexOutcome, VexRun,
 };
 
 const SLF4J: &str = "pkg:maven/org.slf4j/slf4j-api@1.7.36";
@@ -181,13 +188,184 @@ fn a_patched_local_repository_does_not_attest_beside_a_root_maven_install_json()
     assert_attested(out.doc(), SLF4J, UUID, Marker::Applied, VULNS);
 }
 
+/// A run on the global installs (`--global-prefix`) attests another tree
+/// than the project's, which the workspace at `--cwd` does not build. It is
+/// not judged against that workspace: the statement is made as it is with
+/// no workspace file, and no code of the Bazel checks appears. The same
+/// record in a project run of the same workspace is withheld, which is
+/// what shows the hub governs it.
+#[test]
+fn a_run_on_the_global_installs_is_not_judged_against_the_workspace() {
+    const PURL: &str = "pkg:pypi/examplepkg@1.2.3";
+    let tmp = tempfile::tempdir().unwrap();
+    let top = tmp.path().canonicalize().unwrap();
+    let (root, site) = (top.join("ws"), top.join("site-packages"));
+    put(&root, ".git/HEAD", "ref: refs/heads/main\n");
+    let hub = "bazel_dep(name = \"rules_python\", version = \"1.0.0\")\n\
+               pip = use_extension(\"@rules_python//python/extensions:pip.bzl\", \"pip\")\n\
+               pip.parse(hub_name = \"pip\", python_version = \"3.11\", \
+               requirements_lock = \"//:requirements_lock.txt\")\n\
+               use_repo(pip, \"pip\")\n";
+    put(&root, "MODULE.bazel", hub);
+    let lock = format!(
+        "examplepkg==1.2.3 \\\n    --hash=sha256:{}\n",
+        "1".repeat(64)
+    );
+    put(&root, "requirements_lock.txt", lock);
+    let metadata = "Metadata-Version: 2.1\nName: examplepkg\nVersion: 1.2.3\n\n";
+    put(&site, "examplepkg-1.2.3.dist-info/METADATA", metadata);
+    put(&site, "mod.py", PATCHED);
+    record(&root, PURL, "package/mod.py");
+
+    let run = |global: bool| {
+        let run = VexRun {
+            output: Some(top.join("out.vex.json")),
+            ..VexRun::offline()
+        };
+        let run = run.arg("--ecosystems").arg("pypi");
+        let run = match global {
+            true => run.arg("--global-prefix").arg(site.to_string_lossy()),
+            false => run,
+        };
+        run_vex(&common::binary(), &root, &run)
+    };
+    // Every code of the Bazel checks the envelope carries: a warning's,
+    // and the reason of a skipped event.
+    fn bazel_codes(out: &VexOutcome) -> Vec<String> {
+        let mut found = Vec::new();
+        for (list, member) in [("warnings", "code"), ("events", "errorCode")] {
+            let entries = out.envelope[list].as_array();
+            let codes = entries.into_iter().flatten();
+            let codes = codes.filter_map(|entry| entry[member].as_str());
+            found.extend(
+                codes
+                    .filter(|code| code.contains("bazel"))
+                    .map(String::from),
+            );
+        }
+        found
+    }
+
+    let out = run(true);
+    assert_eq!(out.code, Some(0), "{out}");
+    assert_attested(out.doc(), PURL, UUID, Marker::Applied, VULNS);
+    assert_eq!(bazel_codes(&out), Vec::<String>::new(), "{out}");
+
+    // The project run of the same workspace: the pip hub builds the
+    // package from its lock, and a patched tree says nothing of that.
+    let out = run(false);
+    let code = Code::VexNotConsumed.as_str();
+    assert_omitted(&out, PURL, code, "a project run under the pip hub");
+    let said = bazel_codes(&out);
+    assert!(said.len() >= 2 && said.iter().all(|c| c == code), "{out}");
+
+    // And with no workspace the global run says what it said under one.
+    std::fs::remove_file(root.join("MODULE.bazel")).unwrap();
+    let out = run(true);
+    assert_eq!(out.code, Some(0), "{out}");
+    assert_attested(out.doc(), PURL, UUID, Marker::Applied, VULNS);
+}
+
+/// A vendor ledger entry that says the owned index of a Bazel root wires
+/// its artifact, as `scan --mode vendored` or a route of `apply` records
+/// one. Nothing in this build can prove that the Bazel build consumes the
+/// pin, so the artifact is not attested from its own bytes: with or
+/// without a manifest record, routed or not, under `--no-verify`, and
+/// with the workspace file gone. (The statement such an entry does make,
+/// on a vendored lane's pin, is a unit test over a toy lane table in the
+/// CLI's `bazel_gate::vex`.)
+#[test]
+fn an_index_wired_vendor_entry_is_not_attested_from_its_artifact_alone() {
+    const PURL: &str = "pkg:golang/github.com/foo/bar@v1.0.0";
+    let hub = "bazel_dep(name = \"gazelle\", version = \"0.45.0\")\n\
+               go_deps = use_extension(\"@gazelle//:extensions.bzl\", \"go_deps\")\n\
+               go_deps.from_file(go_mod = \"//:go.mod\")\n\
+               use_repo(go_deps, \"com_github_foo_bar\")\n";
+    let go_mod = "module example.com/m\n\ngo 1.22\n\nrequire github.com/foo/bar v1.0.0\n";
+    let artifact = format!(".socket/vendor/golang/{UUID}/bar");
+    let files = json!({"package/bar.go": {
+        "beforeHash": git_sha256(PRISTINE), "afterHash": git_sha256(PATCHED),
+    }});
+    let vuln =
+        json!({"cves": ["CVE-2024-0001"], "summary": "s", "severity": "high", "description": "d"});
+    let patch = json!({
+        "uuid": UUID, "exportedAt": "2026-01-01T00:00:00Z", "files": files,
+        "vulnerabilities": {"GHSA-test-aaaa-bbbb": vuln},
+        "description": "d", "license": "MIT", "tier": "free",
+    });
+    let fixture = |routed: bool, manifest: bool| {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap().join("ws");
+        put(&root, ".git/HEAD", "ref: refs/heads/main\n");
+        put(&root, ".bazelversion", "9.3.2\n");
+        put(&root, "MODULE.bazel", hub);
+        put(&root, "go.mod", go_mod);
+        put(&root, "go.sum", "");
+        put(&root, &format!("{artifact}/bar.go"), PATCHED);
+        let mut said = json!({"projectRel": ""});
+        if routed {
+            said["routed"] = json!(true);
+        }
+        let wiring = json!({
+            "file": ".socket/bazel/index.json", "kind": "bazel_index", "action": "added",
+            "key": UUID, "new": said,
+        });
+        let entry = json!({
+            "ecosystem": "golang", "basePurl": PURL, "uuid": UUID,
+            "artifact": {"path": artifact, "sha256": "c".repeat(64)},
+            "wiring": [wiring], "record": patch,
+        });
+        let state = json!({"version": 1, "entries": {PURL: entry}});
+        put(&root, ".socket/vendor/state.json", state.to_string());
+        if manifest {
+            let manifest = json!({"patches": {PURL: patch}});
+            put(&root, ".socket/manifest.json", manifest.to_string());
+        }
+        (tmp, root)
+    };
+    let vex = |tmp: &tempfile::TempDir, root: &Path, no_verify: bool| {
+        let run = VexRun {
+            output: Some(tmp.path().join("out.vex.json")),
+            no_verify,
+            ..VexRun::offline()
+        };
+        let home = tmp.path().join("home");
+        let run = run
+            .env("HOME", &home)
+            .env("USERPROFILE", &home)
+            .env("GOMODCACHE", home.join("gomodcache"));
+        run_vex(&common::binary(), root, &run)
+    };
+    for (routed, manifest) in [(false, false), (false, true), (true, false), (true, true)] {
+        let what = format!("routed {routed}, manifest record {manifest}");
+        let (tmp, root) = fixture(routed, manifest);
+        for no_verify in [false, true] {
+            let out = vex(&tmp, &root, no_verify);
+            assert_omitted(&out, PURL, "vendor_unwired", &what);
+            let said = warning(&out, "vex_claim_unwired");
+            assert!(said.contains("the owned index of a Bazel root"), "{said}");
+            assert!(said.contains("no enabled lane can tell"), "{said}");
+        }
+        std::fs::remove_file(root.join("MODULE.bazel")).unwrap();
+        let out = vex(&tmp, &root, false);
+        assert_omitted(&out, PURL, "vendor_unwired", &what);
+        let said = warning(&out, "vex_claim_unwired");
+        assert!(said.contains("no Bazel workspace"), "{said}");
+    }
+}
+
 /// Owner decision O16: nothing in a tree Bazel owns is attested or
 /// patched. `vex` and `get` are refused there, whether a flag named the
-/// tree or the command was started inside it, before a manifest is read or
-/// the API is asked: no document, no request, no file touched.
+/// tree, the command was started inside it, or `--manifest-path` moved
+/// the run to it from outside, before a manifest is read or the API is
+/// asked: no document, no request, no file touched.
 #[test]
 fn vex_and_get_are_refused_in_a_tree_bazel_owns() {
     const PURL: &str = "pkg:npm/left-pad@1.3.0";
+    /// The patch a lockfile of the second tree pins `left-pad` to.
+    const HOSTED: &str = "5d2c8e1a-3b4f-4c6d-9e7a-1f0b2c3d4e5f";
+    const TOKEN: &str = "sktsec_test_token_for_vex_e2e";
+    const ORG: [&str; 4] = ["--api-token", TOKEN, "--org", "test-org"];
     let tmp = tempfile::tempdir().unwrap();
     let top = tmp.path().canonicalize().unwrap();
     let (ws, base) = (top.join("ws"), top.join("base"));
@@ -205,23 +383,63 @@ fn vex_and_get_are_refused_in_a_tree_bazel_owns() {
     put(&tree, "node_modules/left-pad/package.json", package);
     put(&tree, "node_modules/left-pad/index.js", PATCHED);
     record(&tree, PURL, "package/index.js");
+    // A second one whose lockfile resolves the package from a hosted
+    // patch, with no record of it anywhere on this machine: outside an
+    // output base `vex` asks the API for the record, so a refusal that
+    // came after planning would show as a request.
+    let hosted = base.join("external").join("hosted");
+    put(
+        &hosted,
+        "package.json",
+        r#"{"name": "app", "version": "1.0.0"}"#,
+    );
+    assert_eq!(
+        write_hosted_npm_lock(&hosted, "left-pad", "1.3.0", HOSTED),
+        PURL
+    );
 
-    let api = PatchApi::empty();
+    let files = [("package/index.js", &git_sha256(PATCHED)[..])];
+    let view = patch_view(HOSTED, PURL, &files, VULNS);
+    let api = PatchApi::start(vec![(HOSTED.to_string(), view)]);
     let (doc, uri) = (ws.join("vex.json"), api.uri());
     let (doc_arg, tree_arg) = (doc.to_string_lossy(), tree.to_string_lossy());
+    let hosted_arg = hosted.to_string_lossy();
+    let manifest = tree.join(".socket").join("manifest.json");
+    let hosted_manifest = hosted.join(".socket").join("manifest.json");
+    let (manifest_arg, hosted_manifest_arg) = (
+        manifest.to_string_lossy(),
+        hosted_manifest.to_string_lossy(),
+    );
     let vex = ["vex", "--json", "--offline", "--output", &doc_arg];
+    let online = ["vex", "--json", "--output", &doc_arg, "--api-url", &uri];
+    let online = [&online[..], &ORG].concat();
     let get = ["get", PURL, "--json", "--yes", "--api-url", &uri];
-    let get = [
-        &get[..],
-        &["--api-token", "fake-token", "--org", "test-org"],
-    ]
-    .concat();
+    let get = [&get[..], &ORG].concat();
+    // How the tree becomes the scope of the run, each from a directory
+    // that makes it so: named by `--cwd`, the working directory itself,
+    // and the project of a manifest that `--manifest-path` names.
+    let forms = |tree: &Path, tree_arg: &str, manifest_arg: &str| {
+        let named = vec!["--cwd".to_string(), tree_arg.to_string()];
+        let moved = vec!["--manifest-path".to_string(), manifest_arg.to_string()];
+        [
+            (ws.clone(), named),
+            (tree.to_path_buf(), Vec::new()),
+            (ws.clone(), moved),
+        ]
+    };
+    let runs = [
+        (&vex[..], forms(&tree, &tree_arg, &manifest_arg)),
+        (&get[..], forms(&tree, &tree_arg, &manifest_arg)),
+        (
+            &online[..],
+            forms(&hosted, &hosted_arg, &hosted_manifest_arg),
+        ),
+    ];
     let before = snapshot(&top);
-    for command in [&vex[..], &get[..]] {
-        for named in [true, false] {
-            let scope: &[&str] = if named { &["--cwd", &tree_arg] } else { &[] };
-            let cwd = if named { &ws } else { &tree };
-            let args = [command, scope].concat();
+    for (command, forms) in &runs {
+        for (cwd, scope) in forms {
+            let scope = scope.iter().map(|arg| &arg[..]);
+            let args: Vec<&str> = command.iter().copied().chain(scope).collect();
             let (code, stdout, stderr) = common::run_with_env(cwd, &args, &[]);
             let what = format!("{args:?}\nstdout:\n{stdout}\nstderr:\n{stderr}");
             assert_eq!(code, 1, "{what}");
@@ -229,6 +447,7 @@ fn vex_and_get_are_refused_in_a_tree_bazel_owns() {
             let refused = Code::AgentOutputTree.as_str();
             assert_eq!(envelope_error_code(&envelope), Some(refused), "{what}");
             assert_eq!(envelope["command"], command[0], "{what}");
+            assert!(!doc.exists(), "a document was written: {what}");
         }
     }
     api.assert_no_requests();
@@ -237,13 +456,28 @@ fn vex_and_get_are_refused_in_a_tree_bazel_owns() {
     // The marker, not the path, makes it Bazel's: with it gone the same
     // tree is a project, and its patched copy is attested.
     std::fs::remove_file(base.join("DO_NOT_BUILD_HERE")).unwrap();
-    let args = [
-        &vex[..],
-        &["--cwd", &tree_arg, "--product", "pkg:npm/app@1.0.0"],
-    ]
-    .concat();
+    let product = ["--product", "pkg:npm/app@1.0.0"];
+    let args = [&vex[..], &["--cwd", &tree_arg], &product].concat();
     let (code, stdout, stderr) = common::run_with_env(&ws, &args, &[]);
     assert_eq!(code, 0, "stdout:\n{stdout}\nstderr:\n{stderr}");
     let written: Value = serde_json::from_slice(&std::fs::read(&doc).unwrap()).unwrap();
     assert_attested(&written, PURL, UUID, Marker::Applied, VULNS);
+    // So is it through its manifest, from the workspace.
+    std::fs::remove_file(&doc).unwrap();
+    let args = [&vex[..], &["--manifest-path", &manifest_arg], &product].concat();
+    let (code, stdout, stderr) = common::run_with_env(&ws, &args, &[]);
+    assert_eq!(code, 0, "stdout:\n{stdout}\nstderr:\n{stderr}");
+    let written: Value = serde_json::from_slice(&std::fs::read(&doc).unwrap()).unwrap();
+    assert_attested(&written, PURL, UUID, Marker::Applied, VULNS);
+    api.assert_no_requests();
+
+    // And the second tree is where the zero above bites: the same online
+    // run asks the API for the record of the pin, and attests from it.
+    std::fs::remove_file(&doc).unwrap();
+    let args = [&online[..], &["--cwd", &hosted_arg], &product].concat();
+    let (code, stdout, stderr) = common::run_with_env(&ws, &args, &[]);
+    assert_eq!(code, 0, "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(api.view_requests(HOSTED) >= 1, "{:?}", api.requests());
+    let written: Value = serde_json::from_slice(&std::fs::read(&doc).unwrap()).unwrap();
+    assert_attested(&written, PURL, HOSTED, Marker::Redirected, VULNS);
 }

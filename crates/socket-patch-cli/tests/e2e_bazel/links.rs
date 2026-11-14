@@ -15,11 +15,19 @@
 //! Each case fabricates the Bazel side of the rules_js fixture workspace
 //! (no Bazel runs) and runs the real binary against a fake Socket API: a
 //! hosted `scan`, the `scan` after it, and `vex`. Every npm package has to
-//! be wired, and seen by `vex`, each time. Then the marker that makes the tree
+//! be seen by each of them, each time. Then the marker that makes the tree
 //! Bazel's is deleted and the same commands must withhold every package
 //! again: the fixture is the hazard, and the marker, not a name, lifts it.
 //! The marker lifts it only in a Bazel workspace: with the fixture's
 //! `MODULE.bazel` deleted instead, the packages are withheld as well.
+//!
+//! What "seen" comes to depends on the hosted seam, which hands a package
+//! whose lock a Bazel hub reads to the Bazel gate. Where a shipped lane
+//! serves the fixture's hub the scan wires both packages. Where none does
+//! (`lanes::admits`), the gate refuses each of them under its own code,
+//! and that refusal is the evidence that the package got as far as the
+//! gate: a member walk through one of Bazel's trees withholds it as
+//! `user_patch_conflict` before any gate is asked.
 //!
 //! The link cases are Unix only (a test cannot make a junction without
 //! spawning `cmd`); the vendor-directory case runs everywhere.
@@ -40,6 +48,9 @@ use crate::bazel_common::{assert_same_tree, assert_write_policy, snapshot, Write
 use crate::common::{self, envelope};
 use hosted_memory_common::{mount_api, Patch, ORG};
 use socket_patch_core::bazel::codes::Code;
+use socket_patch_core::bazel::lanes::{self, Cell};
+use socket_patch_core::bazel::model::{HubId, Mode, Reason, RootRef};
+use socket_patch_core::crawlers::bazel_workspace::{read_workspace, DiskView};
 use vex_e2e_common::{assert_not_attested, run_vex, VexOutcome, VexRun};
 
 /// The two registry packages of the fixture lock: purl, tarball path on
@@ -186,14 +197,98 @@ fn pins(scan: &Value) -> Vec<(String, String)> {
     pins
 }
 
+/// Whether a shipped lane serves the fixture's rules_js hub in hosted
+/// mode: what decides whether a hosted `scan` there wires a package or
+/// refuses it.
+fn admitted(ws: &Workspace) -> bool {
+    let root = RootRef {
+        root: std::fs::canonicalize(&ws.root).unwrap(),
+        project_rel: String::new(),
+        boundary_levels: 0,
+    };
+    let model = read_workspace(&root, &DiskView::new(&root)).expect("a workspace");
+    let cell = Cell::of(&model, HubId(0), Mode::Hosted).expect("the hub");
+    lanes::admits(&lanes::PRODUCTION, &cell)
+}
+
+/// [`assert_every_package_seen`] where no shipped lane serves the hub:
+/// the hosted seam hands each package to the Bazel gate, which refuses
+/// it, and the run writes nothing. Each refusal says the package was
+/// seen: withheld as a package the project patches itself, it would not
+/// have reached the gate.
+///
+/// Then the same in the workspace as release 5.1 left it, which wrote
+/// under a hub: the lock with both pins, and beside it the
+/// `pnpm-workspace.yaml` whose `.` is the trap of probe rules-js B1. The
+/// scan there refuses both packages again and changes nothing, and `vex`
+/// sees both pins.
+fn assert_every_package_refused(ws: &Workspace, api: &MockServer, what: &str) {
+    let all: Vec<_> = PACKAGES
+        .map(|(purl, _, uuid)| (purl.to_string(), uuid.to_string()))
+        .into();
+    let refused = Code::refusal(Mode::Hosted, Reason::RulesetUnsupported).expect("a code");
+    let assert_seen = |run: &Value| {
+        assert_eq!(pins(run), [], "{what}: {run:#}");
+        for (purl, ..) in PACKAGES {
+            let decided = envelope::has_event(run, "skipped", refused.as_str(), purl);
+            assert!(decided, "{what}: {purl}\n{run:#}");
+        }
+        let codes = envelope::all_codes(run);
+        let withheld = codes.iter().any(|c| c == "user_patch_conflict");
+        assert!(!withheld, "{what}: {run:#}");
+    };
+    let before = snapshot(&ws.root);
+    assert_seen(&scan(ws, api));
+    assert_same_tree(&before, &snapshot(&ws.root));
+
+    // The two files a hosted run writes, taken from the same project with
+    // no Bazel workspace around it and none of Bazel's trees in it.
+    let side_file = ws.root.join("pnpm-workspace.yaml");
+    let plain = workspace(None);
+    std::fs::remove_file(plain.root.join("MODULE.bazel")).unwrap();
+    if side_file.exists() {
+        std::fs::copy(&side_file, plain.root.join("pnpm-workspace.yaml")).unwrap();
+    }
+    let wired = scan(&plain, api);
+    assert_eq!(pins(&wired), all, "{what}: outside Bazel\n{wired:#}");
+    for file in ["pnpm-lock.yaml", "pnpm-workspace.yaml"] {
+        std::fs::copy(plain.root.join(file), ws.root.join(file)).unwrap();
+    }
+
+    let wired = snapshot(&ws.root);
+    assert_seen(&scan(ws, api));
+    assert_same_tree(&wired, &snapshot(&ws.root));
+    assert_withheld_by_the_consumer_gate(ws, api, what);
+}
+
+/// `vex` sees both pins: neither is omitted as a package the project
+/// patches itself, which is what a member walk through one of Bazel's
+/// trees ended in. No statement follows all the same. The fixture's
+/// rules_js hub reads this lock, and until a lane proves that the Bazel
+/// build consumes a pin in it, the consumer gate withholds the statement
+/// under a code of its own (design 7).
+fn assert_withheld_by_the_consumer_gate(ws: &Workspace, api: &MockServer, what: &str) {
+    let out = vex(ws, api);
+    assert_eq!(out.code, Some(1), "{what}: {out}");
+    let unproven = Code::VexConsumerUndetermined.as_str();
+    for (purl, ..) in PACKAGES {
+        assert_not_attested(&out.envelope, purl, unproven);
+    }
+}
+
 /// A hosted `scan`, the `scan` after it and `vex` each see every npm
-/// package: both are wired, and nothing is withheld as a package the
-/// project patches itself. The first run changes the lock and the pnpm
-/// side file and nothing else; the second, with the side file now in
-/// place, changes nothing. (`vex` makes no statement for a pin in a lock
-/// a Bazel hub reads while no lane proves the build consumes it: that is
-/// the consumer gate's omission, and it is asserted as such.)
+/// package: nothing is withheld as a package the project patches itself.
+///
+/// Where a shipped lane serves the hub both are wired. The first run
+/// changes the lock and the pnpm side file and nothing else; the second,
+/// with the side file now in place, changes nothing. Where none does, it
+/// is [`assert_every_package_refused`]. (`vex` makes no statement for a
+/// pin in a lock a Bazel hub reads while no lane proves the build consumes
+/// it: that is the consumer gate's omission, and it is asserted as such.)
 fn assert_every_package_seen(ws: &Workspace, api: &MockServer, what: &str) {
+    if !admitted(ws) {
+        return assert_every_package_refused(ws, api, what);
+    }
     let all: Vec<_> = PACKAGES
         .map(|(purl, _, uuid)| (purl.to_string(), uuid.to_string()))
         .into();
@@ -217,18 +312,7 @@ fn assert_every_package_seen(ws: &Workspace, api: &MockServer, what: &str) {
         );
     }
     assert_same_tree(&wired, &snapshot(&ws.root));
-    // `vex` sees both pins as well: neither is omitted as a package the
-    // project patches itself, which is what a member walk through one of
-    // Bazel's trees ended in. No statement follows all the same. The
-    // fixture's rules_js hub reads this lock, and until a lane proves that
-    // the Bazel build consumes a pin in it, the consumer gate withholds
-    // the statement under a code of its own (design 7).
-    let out = vex(ws, api);
-    assert_eq!(out.code, Some(1), "{what}: {out}");
-    let unproven = Code::VexConsumerUndetermined.as_str();
-    for (purl, ..) in PACKAGES {
-        assert_not_attested(&out.envelope, purl, unproven);
-    }
+    assert_withheld_by_the_consumer_gate(ws, api, what);
 }
 
 /// The control: with the marker gone the same tree withholds every npm

@@ -33,6 +33,13 @@
 //!   `govern::governance` applies to the same gap: one in a file Bazel
 //!   never opens declares nothing, and a refusal over it would name a
 //!   file nobody has to fix.
+//! - **Unread is not everywhere either.** A hook is an argument of a tag
+//!   or of a repository rule call, so it needs a statement that can hold
+//!   one. A ruleset's `bazel_dep` in a module file that was read whole and
+//!   uses no extension and no repository rule of that module holds none
+//!   ([`declares_no_hook`]), and is no evidence: every npm package of a
+//!   workspace that only depends on `aspect_rules_js` would be held back
+//!   over a hook that cannot exist, with nothing in the file to fix.
 //!
 //! A replacement defeats a pin outright, so it is also a bypass that
 //! `--allow-patch-conflicts` does not lift ([`bypasses`]). A patch on a
@@ -44,7 +51,13 @@
 
 use super::govern::{self, WORKSPACE_UNREADABLE};
 use super::inventory::may_build;
-use super::model::{BazelWorkspace, Bypass, DeclSystem, Hub, HubId, Ruleset, RulesetDetail, Site};
+use super::label::{Label, Repo};
+use super::model::{
+    BazelWorkspace, Bypass, DeclSystem, Hub, HubId, Ruleset, RulesetDetail, RulesetSignal, Site,
+};
+use super::module_file::{
+    ExtensionProxy, GapScope, GapWhy, Host, ModuleGap, ModuleModel, RepoRule,
+};
 use super::rulesets::gazelle::GazelleDetail;
 use super::rulesets::rules_python::USER_OVERRIDE;
 use super::starlark::Lookup;
@@ -379,10 +392,145 @@ pub fn evidence(ws: &BazelWorkspace, own: OwnSite<'_>) -> Vec<Evidence> {
         out.extend(unread(*ruleset, &gap.detail, unreadable, None, &gap.file));
     }
     let followed = |site: &Site| !own(site, None) && govern::may_evaluate(ws, site);
-    for signal in ws.signals.iter().filter(|signal| followed(&signal.site)) {
+    let may_hold_one = |signal: &&RulesetSignal| !declares_no_hook(ws, signal);
+    let signals = ws.signals.iter().filter(may_hold_one);
+    for signal in signals.filter(|signal| followed(&signal.site)) {
         let why = format!("{} is used here and no hub was read", signal.ruleset.name());
         let (site, file) = (Some(&signal.site), &signal.site.file);
         out.extend(unread(signal.ruleset, &why, false, site, file));
+    }
+    out
+}
+
+/// Whether a gap of the module file leaves room for a declaration that
+/// can hold a hook: a tag, a repository rule call, the extension proxy or
+/// the rule either hangs on, a file that may hold any of them, or the
+/// `bazel_dep` that says whose file a label names.
+///
+/// Every [`GapScope::Everything`] gap does but one. `use_repo` gives the
+/// root module repository names and nothing else, so a use of it that was
+/// not read (a comprehension over the names, an argument that is no
+/// proxy) hides imports and no tag. A use of the proxy inside such a
+/// statement is a gap of that proxy, which its ruleset's recognizer
+/// reports.
+fn may_hide_a_hook(gap: &ModuleGap) -> bool {
+    let imports = |name: &str| name == "use_repo";
+    let harmless = match &gap.why {
+        GapWhy::Unmodelled { name, .. } => imports(name),
+        GapWhy::Argument { directive, .. } => imports(directive),
+        _ => false,
+    };
+    gap.scope == GapScope::Everything && !harmless
+}
+
+/// Whether `label` may name a file of the module the `bazel_dep` at
+/// `dep` brings in. One Bazel rejects and a canonical name are not known
+/// not to. An apparent name no `bazel_dep` gives is another repository:
+/// a module is visible to the root under the name its `bazel_dep` gives
+/// it and under no other.
+fn may_be_of(module: &ModuleModel, label: Option<&Label>, dep: &str) -> bool {
+    let Some(label) = label else {
+        return true;
+    };
+    match module.host(label) {
+        Host::Dep(host) => host.name == dep,
+        Host::Root => false,
+        Host::Unknown => matches!(label.repo, Repo::Canonical(_)),
+    }
+}
+
+/// Whether `signal` is a ruleset's `bazel_dep` in a module file that
+/// proves no hook of the ruleset stands in it.
+///
+/// A hook is an argument of a tag (`patches` of `npm.npm_translate_lock`,
+/// `maven.override`) or of a repository rule call, and each needs a
+/// `use_extension` or a `use_repo_rule` over a file of the ruleset's
+/// module. Where every statement that could hold one was read
+/// ([`may_hide_a_hook`]) and none names such a file, no tag exists, so no
+/// hook does: the root only depends on the ruleset (for its build rules,
+/// or to pin its version), and holding the ecosystem back would name a
+/// declaration nobody can edit.
+///
+/// `false` for every other signal: one of a `WORKSPACE` file (the call
+/// may be in a macro nobody read), one at an extension proxy, and a
+/// `bazel_dep` beside a statement that was not read or beside a use of
+/// the module. An extension of another module that wraps the ruleset is
+/// outside what the model shows here as it is beside a hub that was read.
+fn declares_no_hook(ws: &BazelWorkspace, signal: &RulesetSignal) -> bool {
+    let bzlmod = signal.site.system == DeclSystem::Bzlmod;
+    let Some(module) = ws.module.as_ref().filter(|_| bzlmod) else {
+        return false;
+    };
+    let mut deps = module.deps.iter();
+    let Some(dep) = deps.find(|dep| module.site(dep.at) == signal.site) else {
+        return false;
+    };
+    let of_the_ruleset = |label: Option<&Label>| may_be_of(module, label, &dep.name);
+    let extension = |proxy: &ExtensionProxy| of_the_ruleset(proxy.label.as_ref());
+    let rule = |rule: &RepoRule| of_the_ruleset(rule.label.as_ref());
+    !module.gaps.iter().any(may_hide_a_hook)
+        && !module.proxies.iter().any(extension)
+        && !module.repo_rules.iter().any(rule)
+}
+
+/// Where a hook may stand in a statement of the module file that was read
+/// as text and not as what it declares: a `use_extension` whose label is
+/// computed or that is used inside an expression, an `include` that is no
+/// plain statement, a repository rule called in a comprehension. Such a
+/// gap belongs to no ruleset, so no recognizer reports it, and beside a
+/// hub it may be a second use of the same extension with tags nobody read
+/// (`exts = [use_extension(...)]`, then `exts[0].npm_replace_package(...)`).
+///
+/// It counts for each ecosystem the workspace has a hub of that Bazel may
+/// build from: there the ruleset's hooks are in use and one more may be
+/// in what was not read. A ruleset with no hub is answered by its signal
+/// in [`evidence`], which stands beside such a gap; an ecosystem the
+/// workspace shows no use of is not held back by a statement that may be
+/// anyone's. A gap counts where Bazel reads the module file, and one that
+/// can hide no hook does not ([`may_hide_a_hook`]).
+///
+/// These are not part of [`evidence`]: the lane gate and `attest` hold
+/// every ecosystem up for the same gaps through `govern::governance`,
+/// with the refusal that names them, and a "patch of your own" there
+/// would say more than is known. A gap that is an unreadable or missing
+/// file is governance's too, for every ecosystem
+/// ([`WORKSPACE_UNREADABLE`]).
+pub fn unread_statements(ws: &BazelWorkspace) -> Vec<Evidence> {
+    let Some(module) = ws.module.as_ref() else {
+        return Vec::new();
+    };
+    let built = |ecosystem: &Ecosystem| {
+        let of = |hub: &Hub| may_build(hub) && hooked(hub.ruleset) == Some(*ecosystem);
+        ws.hubs.iter().any(of)
+    };
+    let used: Vec<Ecosystem> = ecosystems().into_iter().filter(built).collect();
+    let computed = |gap: &&ModuleGap| {
+        let text = matches!(
+            gap.why,
+            GapWhy::Unmodelled { .. } | GapWhy::Argument { .. } | GapWhy::IncludeShape
+        );
+        text && may_hide_a_hook(gap)
+    };
+    let mut out = Vec::new();
+    for gap in module.gaps.iter().filter(computed) {
+        let site = module.site(gap.at);
+        if !govern::may_evaluate(ws, &site) {
+            continue;
+        }
+        let why = module.describe(gap);
+        out.extend(used.iter().map(|ecosystem| Evidence {
+            hub: None,
+            ecosystem: *ecosystem,
+            subject: Subject::Every {
+                why: why.clone(),
+                unreadable: false,
+            },
+            replacement: false,
+            // What stands there is not known, so neither is its patcher.
+            host_patch: true,
+            file: site.file.clone(),
+            site: None,
+        }));
     }
     out
 }
@@ -1137,10 +1285,13 @@ mod tests {
         assert!(!user_patch_hooks(&computed, &none, NPM, "left-pad", "1.3.0").is_empty());
         assert!(every(&found, Ecosystem::Pypi).is_empty());
 
-        // The ruleset with no hub that was read.
+        // The ruleset used and no hub of the root read: its extension is
+        // there, and all it imports is a hub of another module.
         let signal = read(&[(
             "MODULE.bazel",
-            "bazel_dep(name = \"rules_jvm_external\", version = \"6.5\")\n",
+            "bazel_dep(name = \"rules_jvm_external\", version = \"6.5\")\n\
+             maven = use_extension(\"@rules_jvm_external//:extensions.bzl\", \"maven\")\n\
+             use_repo(maven, \"kotlin_rules_maven\")\n",
         )]);
         let found = evidence(&signal, &none);
         assert_eq!(
@@ -1148,6 +1299,195 @@ mod tests {
             ["rules_jvm_external is used here and no hub was read"]
         );
         assert!(found.iter().all(|e| e.hub.is_none() && !e.replacement));
+    }
+
+    /// The whys of [`evidence`] for npm over a root module that depends
+    /// on rules_js and declares `rest`.
+    fn npm_whys(rest: &str) -> Vec<String> {
+        let module = format!(
+            "module(name = \"app\")\n\
+             bazel_dep(name = \"aspect_rules_js\", version = \"2.8.3\", repo_name = \"js\")\n\
+             bazel_dep(name = \"gazelle\", version = \"0.47.0\")\n{rest}"
+        );
+        let ws = read(&[(".bazelversion", "8.4.2\n"), ("MODULE.bazel", &module)]);
+        assert!(ws.hubs.iter().all(|hub| hub.ecosystem != NPM), "{rest}");
+        let found = evidence(&ws, &none);
+        every(&found, NPM).into_iter().map(str::to_string).collect()
+    }
+
+    /// A `bazel_dep` on a ruleset is no hook. A hook is an argument of a
+    /// tag or of a repository rule call, and in a module file that was
+    /// read whole and uses no extension and no rule of the ruleset's
+    /// module there is none: the root depends on the ruleset for its
+    /// build rules (the `MODULE.bazel` of bazelisk and of buildtools do,
+    /// on `aspect_rules_js`). Holding every npm package back there would
+    /// name a declaration nobody can edit.
+    #[test]
+    fn a_bazel_dep_alone_in_a_module_file_read_whole_is_no_evidence() {
+        let used = ["rules_js is used here and no hub was read"];
+        assert_eq!(npm_whys(""), [""; 0]);
+        // Extensions and rules of other modules, of the root and of
+        // Bazel's own repositories are no use of rules_js.
+        let others = "go_deps = use_extension(\"@gazelle//:extensions.bzl\", \"go_deps\")\n\
+             go_deps.from_file(go_mod = \"//:go.mod\")\n\
+             use_repo(go_deps, \"org_golang_x_term\")\n\
+             own = use_extension(\"//:extensions.bzl\", \"own\")\n\
+             use_repo(own, \"tools\")\n\
+             http_archive = use_repo_rule(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")\n\
+             http_archive(name = \"x\", urls = [\"https://example.com/x.zip\"])\n";
+        assert_eq!(npm_whys(others), [""; 0]);
+        // What was not read can hold no hook: imports, in a comprehension.
+        let imports = format!("{others}[use_repo(own, name) for name in [\"a\", \"b\"]]\n");
+        assert_eq!(npm_whys(&imports), [""; 0]);
+
+        // A use of the ruleset's module, under the name the root gives it:
+        // an extension that led to no hub, and a repository rule.
+        let extension = "pnpm = use_extension(\"@js//npm:extensions.bzl\", \"pnpm\")\n\
+             use_repo(pnpm, \"pnpm\")\n";
+        assert_eq!(npm_whys(extension), used);
+        let rule = "npm_import = use_repo_rule(\"@js//npm:repositories.bzl\", \"npm_import\")\n";
+        assert_eq!(npm_whys(rule), used);
+        // A canonical name, and a label Bazel rejects: whose file it is
+        // is not known.
+        for label in ["@@aspect_rules_js+//npm:extensions.bzl", "@js//npm::x"] {
+            let unknown = format!("other = use_extension(\"{label}\", \"npm\")\n");
+            assert_eq!(npm_whys(&unknown), used, "{label}");
+        }
+        // A statement that was not read may be the use: a label that is
+        // computed, an extension bound inside an expression, a file that
+        // is not there.
+        for unread in [
+            "other = use_extension(\"@{}//npm:extensions.bzl\".format(\"js\"), \"npm\")\n",
+            "exts = [use_extension(\"@js//npm:extensions.bzl\", \"npm\")]\n",
+            "include(\"//third_party:deps.MODULE.bazel\")\n",
+        ] {
+            assert_eq!(npm_whys(unread), used, "{unread}");
+        }
+    }
+
+    /// A signal of a `WORKSPACE` file stays evidence whatever the file
+    /// shows: the hub call may be in a macro nobody read.
+    #[test]
+    fn a_ruleset_a_workspace_file_fetches_with_no_hub_read_is_still_evidence() {
+        let workspace = JS_WORKSPACE
+            .strip_suffix("npm_translate_lock(name = \"npm\", pnpm_lock = \"//:pnpm-lock.yaml\")\n")
+            .expect("the hub call ends the fixture");
+        let ws = read(&[(".bazelversion", "6.6.0\n"), ("WORKSPACE", workspace)]);
+        assert!(ws.hubs.is_empty(), "{:?}", ws.hubs);
+        let found = evidence(&ws, &none);
+        assert_eq!(
+            every(&found, NPM),
+            ["rules_js is used here and no hub was read"]
+        );
+    }
+
+    /// The whys and ecosystems of [`unread_statements`] over a module
+    /// that declares the `npm` hub and `rest`.
+    fn unread(bazel: &str, rest: &str) -> Vec<(Ecosystem, String)> {
+        let module = format!(
+            "module(name = \"app\")\n{JS}\
+             npm.npm_translate_lock(name = \"npm\", pnpm_lock = \"//:pnpm-lock.yaml\")\n\
+             use_repo(npm, \"npm\")\n{rest}"
+        );
+        let ws = read(&[
+            (".bazelversion", bazel),
+            ("MODULE.bazel", &module),
+            ("pnpm-lock.yaml", "lockfileVersion: '9.0'\n"),
+            ("requirements.txt", "requests==2.31.0 --hash=sha256:aaaa\n"),
+        ]);
+        let found = unread_statements(&ws);
+        for e in &found {
+            assert!(e.hub.is_none() && e.site.is_none() && !e.replacement && e.host_patch);
+            assert_eq!(e.file, "MODULE.bazel");
+            assert!(e.covers(e.ecosystem, "anything", "1.0.0"));
+        }
+        let why = |e: &Evidence| match &e.subject {
+            Subject::Every {
+                why,
+                unreadable: false,
+            } => why.clone(),
+            other => panic!("{other:?}"),
+        };
+        found.iter().map(|e| (e.ecosystem, why(e))).collect()
+    }
+
+    /// A statement of the module file that was not read as what it
+    /// declares belongs to no ruleset, so no recognizer reports it.
+    /// Beside a hub it may be a second use of the same extension, with a
+    /// tag nobody read: each of these shapes carried an
+    /// `npm_replace_package` of `left-pad` past the consent gate. It
+    /// protects the ecosystems the workspace has a hub of, as a
+    /// declaration that is not literal (not as a broken file), and no
+    /// ecosystem the workspace shows no use of.
+    #[test]
+    fn an_unread_statement_beside_a_hub_protects_the_ecosystem_of_the_hub() {
+        let replace =
+            ".npm_replace_package(package = \"left-pad@1.3.0\", replacement = \"//:left_pad\")\n";
+        let extension = "use_extension(\"@aspect_rules_js//npm:extensions.bzl\", \"npm\")";
+        let computed = "the label and name of `use_extension` is computed; write it as a literal";
+        let inside =
+            "`use_extension`: the name is used in a statement or expression that is not read";
+        for (statement, why) in [
+            (format!("exts = [{extension}]\nexts[0]{replace}"), inside),
+            (format!("other = {extension} if True else None\nother{replace}"), inside),
+            (
+                format!("other = use_extension(\"@{{}}//npm:extensions.bzl\".format(\"aspect_rules_js\"), \"npm\")\nother{replace}"),
+                computed,
+            ),
+            (
+                format!("other = use_extension(\"@%s//npm:extensions.bzl\" % \"aspect_rules_js\", \"npm\")\nother{replace}"),
+                computed,
+            ),
+            (
+                "other = use_extension(\"@{}//npm:extensions.bzl\".format(\"aspect_rules_js\"), \"npm\")\n\
+                 other.npm_translate_lock(name = \"npm2\", pnpm_lock = \"//:pnpm-lock.yaml\", \
+                 patches = {\"left-pad@1.3.0\": [\"//:left-pad.patch\"]})\n\
+                 use_repo(other, \"npm2\")\n"
+                    .to_string(),
+                computed,
+            ),
+        ] {
+            let found = unread("8.4.2\n", &statement);
+            let [(ecosystem, said)] = &found[..] else {
+                panic!("{statement}: {found:?}");
+            };
+            assert_eq!(*ecosystem, NPM, "{statement}");
+            assert_eq!(said, &format!("MODULE.bazel:6: {why}"), "{statement}");
+        }
+
+        // What was read adds nothing here: a literal tag is evidence of
+        // its package, and a use of the proxy that was not read is the
+        // recognizer's gap. Both are in `evidence`.
+        assert_eq!(unread("8.4.2\n", &format!("npm{replace}")), []);
+        assert_eq!(unread("8.4.2\n", &format!("n = npm\nn{replace}")), []);
+        // Imports hide no tag, whatever was not read of them.
+        let imports = "[use_repo(npm, name) for name in [\"a\", \"b\"]]\n";
+        assert_eq!(unread("8.4.2\n", imports), []);
+
+        // Each ecosystem with a hub, and no other.
+        let pip = format!(
+            "bazel_dep(name = \"rules_python\", version = \"1.4.1\")\n\
+             bazel_dep(name = \"rules_jvm_external\", version = \"6.5\")\n\
+             pip = use_extension(\"@rules_python//python/extensions:pip.bzl\", \"pip\")\n\
+             pip.parse(hub_name = \"pypi\", python_version = \"3.11\", requirements_lock = \"//:requirements.txt\")\n\
+             use_repo(pip, \"pypi\")\n\
+             exts = [{extension}]\n"
+        );
+        let held: Vec<Ecosystem> = (unread("8.4.2\n", &pip).into_iter())
+            .map(|(ecosystem, _)| ecosystem)
+            .collect();
+        assert_eq!(held, [NPM, Ecosystem::Pypi]);
+
+        // Bazel 6 with a `WORKSPACE` file never reads the module file.
+        let module = format!("{JS}exts = [{extension}]\n");
+        let off = read(&[
+            (".bazelversion", "6.6.0\n"),
+            ("WORKSPACE", JS_WORKSPACE),
+            ("MODULE.bazel", &module),
+            ("pnpm-lock.yaml", "lockfileVersion: '9.0'\n"),
+        ]);
+        assert!(off.hubs.iter().any(|hub| hub.ecosystem == NPM));
+        assert_eq!(unread_statements(&off), []);
     }
 
     /// A recognizer gap counts where Bazel may evaluate its statement,
@@ -1210,8 +1550,13 @@ mod tests {
         assert!(!found.contains(&Gem) && !found.contains(&Nuget));
         // Evidence that names no hub comes from a signal of the ruleset:
         // its ecosystem is in the list, and one without a hook gives none.
+        // (The ruleset beside a statement that was not read: a
+        // `bazel_dep` alone is no evidence.)
         let signal = |dep: &str| {
-            let module = format!("bazel_dep(name = \"{dep}\", version = \"1.0.0\")\n");
+            let module = format!(
+                "bazel_dep(name = \"{dep}\", version = \"1.0.0\")\n\
+                 include(\"//third_party:deps.MODULE.bazel\")\n"
+            );
             let ws = read(&[("MODULE.bazel", &module)]);
             let found = evidence(&ws, &none);
             found.iter().map(|e| e.ecosystem).collect::<Vec<_>>()

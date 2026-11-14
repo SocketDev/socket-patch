@@ -54,12 +54,18 @@
 //! the release), so the statement is withheld and the wiring stays
 //! manageable.
 //!
+//! `Attest::contests` is the list that report would be made from. It has
+//! no caller here and is kept for the hosted lanes: the first of them
+//! brings the command that clears a Bazel contest (a pin in the hub's own
+//! lock), and only then may a contest be reported.
+//!
 //! The pin of a vendored or an agent lane becomes no reference: a
 //! reference names a hosted URL or a vendored artifact, and a pin carries
 //! neither. The record of such a patch is judged through the pin
-//! ([`Judge::record`]). A pin in a file outside the project is no reference
-//! of the project either: its management commands must not unwind a file
-//! of another project.
+//! ([`Judge::record`]), and so is a vendor ledger entry that says the owned
+//! index of a Bazel root wires its artifact ([`Judge::pinned`]). A pin in a
+//! file outside the project is no reference of the project either: its
+//! management commands must not unwind a file of another project.
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
@@ -303,29 +309,53 @@ impl<'a> Judge<'a> {
         first.map_or_else(|| self.record(purl, uuid), Err)
     }
 
-    /// The verdict of a record that no file of the project wires (agent
-    /// mode's manifest record, a ledger record). Where discovery holds a
-    /// pin of the patch, the candidate is that pin, so a pin an agent lane
-    /// or a route wrote is judged as the pin it is and one patch gets one
-    /// statement or one withhold. Only with no pin is it a patched
-    /// installed tree, which says nothing about a build that fetches from
-    /// a lock.
-    pub fn record(&self, purl: &str, uuid: &str) -> Result<Consumed, VexWithhold> {
+    /// The verdict of the pins discovery holds for the patch `uuid` of
+    /// `purl`, whatever lane wrote them: the first one the build consumes,
+    /// else the first withhold. `None` where it holds none: no file the
+    /// Bazel build reads carries a pin of the patch, or no enabled lane
+    /// can tell.
+    ///
+    /// This is the whole verdict of a vendor ledger entry whose record
+    /// says the owned index of a Bazel root wires its artifact
+    /// (`WiringRecord::bazel_index`): no file of the project wires it, and
+    /// no installed tree stands in for a committed artifact.
+    pub fn pinned(&self, purl: &str, uuid: &str) -> Option<Result<Consumed, VexWithhold>> {
+        let Some(attest) = &self.attest else {
+            // Nobody listed a pin. Where a ruleset may build the
+            // ecosystem that is "not known", as for every other candidate.
+            return self.unread(purl).err().map(Err);
+        };
         let key = canonical_base_purl(purl);
-        let found = self.attest.iter().flat_map(|a| &a.discovered.pins);
+        let found = attest.discovered.pins.iter();
         let own = found.filter(|pin| pin.uuid == uuid && PurlKey::same(&pin.purl, &key));
         let mut first = None;
         for pin in own {
             match self.consumer(purl, uuid, Basis::Pin(pin)) {
-                Ok(consumed) => return Ok(consumed),
+                Ok(consumed) => return Some(Ok(consumed)),
                 Err(why) => drop(first.get_or_insert(why)),
             }
         }
+        first.map(Err)
+    }
+
+    /// The verdict of a record that no file of the project wires (agent
+    /// mode's manifest record, a ledger record). Where discovery holds a
+    /// pin of the patch, the candidate is that pin ([`Self::pinned`]), so
+    /// a pin an agent lane or a route wrote is judged as the pin it is and
+    /// one patch gets one statement or one withhold. Only with no pin is
+    /// it a patched installed tree, which says nothing about a build that
+    /// fetches from a lock.
+    pub fn record(&self, purl: &str, uuid: &str) -> Result<Consumed, VexWithhold> {
+        let withheld = match self.pinned(purl, uuid) {
+            Some(Ok(consumed)) => return Ok(consumed),
+            Some(Err(why)) => Some(why),
+            None => None,
+        };
         // In a project no hub governs, a pin elsewhere under the root is no
         // wiring of the project, and the tree is judged as it is today
         // (against every hub lock that resolves the release). Where a hub
         // governs, the withhold is the pin's.
-        match (first, self.consumer(purl, uuid, Basis::Installed)) {
+        match (withheld, self.consumer(purl, uuid, Basis::Installed)) {
             (Some(why), Err(_)) => Err(why),
             (_, verdict) => verdict,
         }
@@ -872,6 +902,9 @@ mod tests {
         assert_eq!(governed.diagnostics, plain.diagnostics);
         assert_eq!(governed.recognized, plain.recognized);
         assert_eq!(governed.elsewhere, plain.elsewhere);
+        // The Bazel reads are not logged as files discovery read (module
+        // docs). Whether one happened is another test's:
+        // `a_root_with_nothing_to_judge_is_not_read`.
         assert_eq!(governed.read, plain.read);
         assert!(governed.contested.is_empty() && governed.rewirable.is_empty());
     }
@@ -1011,6 +1044,52 @@ mod tests {
         assert!(snapshot.end_recording().is_some());
     }
 
+    /// Under a Bazel root with nothing to judge (no reference, and no
+    /// enabled lane that could have written a pin) the extractor opens
+    /// nothing: the discovery is what it is without the workspace file,
+    /// and a recording of the view still vouches for it, which is what
+    /// lets a command reuse one discovery and spares it the model load.
+    /// One reference brings the read, and with it the recording is void.
+    #[tokio::test]
+    async fn a_root_with_nothing_to_judge_is_not_read() {
+        let recorded = |project: &Project| {
+            let root = project.root().to_path_buf();
+            async move {
+                let snapshot = DiskSnapshot::tracked(&root);
+                snapshot.begin_recording();
+                // The production options: every lane disabled.
+                let ctx = DiscoverCtx::over(ProjectView::Snapshot(&snapshot), &[]);
+                let out = discover_with_ctx(ctx).await;
+                (out, snapshot.end_recording().is_some())
+            }
+        };
+        let lock = "lockfileVersion: '9.0'\n\nimporters:\n\n  .: {}\n";
+        let project = project(&[("package.json", "{}"), ("pnpm-lock.yaml", lock)]);
+        let (plain, vouched) = recorded(&project).await;
+        assert!(vouched, "no Bazel root: the recording stands");
+        assert!(plain.refs.is_empty(), "{:#?}", plain.refs);
+
+        project.write("MODULE.bazel", JS);
+        let (governed, vouched) = recorded(&project).await;
+        assert!(vouched, "a root with nothing to judge was read");
+        assert_eq!(governed.refs, plain.refs);
+        assert_eq!(governed.unattested, plain.unattested);
+        assert_eq!(governed.diagnostics, plain.diagnostics);
+        assert_eq!(governed.recognized, plain.recognized);
+        assert_eq!(governed.elsewhere, plain.elsewhere);
+        assert_eq!(governed.read, plain.read);
+
+        // The same root with one hosted reference: there is something to
+        // judge, the model is read beside the view, and the recording
+        // cannot vouch for what it did not see.
+        project.copy_fixture(PNPM_PINNED);
+        let (pinned, vouched) = recorded(&project).await;
+        assert_eq!(ref_triples(&pinned), wired(LEFT_PAD, PNPM_PIN));
+        let expected = [(LEFT_PAD, PNPM_PIN, BazelConsumerUndetermined)];
+        assert_eq!(marks(&pinned), expected);
+        assert!(!vouched, "a recording vouched for a read beside the view");
+    }
+
     // ── The judge ────────────────────────────────────────────────────
 
     /// With no lane enabled, every basis is withheld in a project a hub
@@ -1027,6 +1106,11 @@ mod tests {
         let undetermined = Err(WithholdKind::ConsumerUndetermined);
         let installed = Err(WithholdKind::NotConsumed);
         assert_eq!(kinds, [undetermined, undetermined, installed]);
+        // No lane can tell a pin, so discovery holds none for the patch.
+        let pinned = judged(&project, BazelOptions::default(), |judge| {
+            judge.pinned(LEFT_PAD, UUID)
+        });
+        assert_eq!(pinned, None);
         // An ecosystem no ruleset of the workspace builds is as it is
         // today.
         let cargo = judged(&project, BazelOptions::default(), |judge| {
@@ -1057,6 +1141,12 @@ mod tests {
             let project = project(&files);
             judged(&project, toy(grants), |judge| {
                 let record = judge.record(BAR, UUID).map_err(|why| why.kind);
+                // Where discovery holds a pin, the record's verdict is the
+                // pin's; with none, only the record has one (the tree's).
+                let pinned = judge.pinned(BAR, UUID);
+                let pinned = pinned.map(|verdict| verdict.map_err(|why| why.kind));
+                assert_eq!(pinned.is_some(), !pin.is_empty(), "{pin}");
+                assert!(pinned.is_none_or(|pinned| pinned == record), "{pin}");
                 let stray = [(Hosted, "tools/other.lock"), (Hosted, "go.mod")];
                 (
                     record,
@@ -1110,7 +1200,11 @@ mod tests {
             };
             let judge = Judge::new(&read, BazelOptions::default());
             let wiring = [(Hosted, "package-lock.json")];
-            (judge.record(purl, UUID), judge.wired(purl, UUID, &wiring))
+            // Nobody listed a pin: "not known" where a ruleset may build
+            // the ecosystem, and no pin at all where none can.
+            let record = judge.record(purl, UUID);
+            assert_eq!(judge.pinned(purl, UUID), record.clone().err().map(Err));
+            (record, judge.wired(purl, UUID, &wiring))
         };
         let (record, wired) = verdict(true, LEFT_PAD);
         let why = record.expect_err("undetermined");

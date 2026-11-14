@@ -1017,6 +1017,9 @@ async fn run_redirect_selected_untracked(
     use socket_patch_core::vendor::lock_inventory::ProjectView;
 
     let view = ProjectView::Disk(&common.cwd);
+    // The Bazel root above the project, if any: its gate decides the
+    // patches of every ecosystem a ruleset governs there.
+    let bazel = crate::bazel_gate::hosted::Hosted::production(common);
     let mut skipped: Vec<SkippedPatch> = Vec::new();
     let mut candidates: Vec<Candidate> = Vec::new();
     // One warning per grant refused for its shape or its plain-http URL.
@@ -1311,7 +1314,7 @@ async fn run_redirect_selected_untracked(
     // when no candidate survived (the rewriters do nothing without a dep);
     // everything after the rewrite still runs.
     let read = if !candidates.is_empty() {
-        engine::read_candidate_files(&view, &std::collections::BTreeSet::new(), &candidates).await
+        bazel.read(&view, &candidates).await
     } else {
         CandidateFiles::default()
     };
@@ -1608,8 +1611,7 @@ async fn run_redirect_selected_untracked(
         let read = if candidates.is_empty() {
             CandidateFiles::default()
         } else {
-            engine::read_candidate_files(&view, &std::collections::BTreeSet::new(), &candidates)
-                .await
+            bazel.read(&view, &candidates).await
         };
         done = engine::rewrite(
             &view,
@@ -1623,6 +1625,8 @@ async fn run_redirect_selected_untracked(
     // Candidates the rewrite left out because discovery would not attribute
     // their pin (`engine::rewrite`).
     skipped.extend(done.unattributed.iter().cloned());
+    // And the ones the Bazel gate refused, each with the code of its reason.
+    skipped.extend(bazel.skipped(&done, &candidates));
     let takeover::Finished {
         warnings: takeover_pre_warnings,
         migrated: takeover_migrated,
@@ -1699,8 +1703,12 @@ async fn run_redirect_selected_untracked(
     if common.dry_run {
         // A preview: the staged reverts never reach the disk.
         drop(group);
-    } else if let Err(message) =
-        commit_hosted_writes(common, group, rewrite, &vendor_state, &takeover_migrated).await
+    } else if let Err(message) = bazel
+        .commit(
+            &done,
+            commit_hosted_writes(common, group, rewrite, &vendor_state, &takeover_migrated),
+        )
+        .await
     {
         eprintln!("{}", format_error_line(&message));
         if common.json {
@@ -1845,6 +1853,7 @@ async fn run_redirect_selected_untracked(
         // a dry run drops them).
         let created: Vec<&str> = created_paths.iter().map(String::as_str).collect();
         let written = if takeover_migrated.is_empty()
+            && !crate::bazel_gate::hosted::staged(&done)
             && !rewrite
                 .files
                 .keys()
@@ -1944,11 +1953,16 @@ async fn run_redirect_selected_untracked(
         // A confirmed uuid whose bundled instance (#469) or `npm:` alias
         // entry (#1081) the rewriter had to skip leaves that copy
         // unpatched, so it too is verified, never assumed.
+        // A package Bazel governs is assumed only on a pin the Bazel gate
+        // confirmed in this run, and the statement holds that pin to the
+        // digest this run was granted.
+        params.bazel.grants = crate::bazel_gate::hosted::grants(&done);
         params.assume_applied = confirmed
             .iter()
             .filter(|(_, uuid)| {
                 !rewrite.bundled_skipped_uuids.contains(uuid)
                     && !rewrite.alias_skipped_entries.contains_key(uuid)
+                    && crate::bazel_gate::hosted::assumed(&done, uuid)
             })
             .map(|(purl, _)| purl.clone())
             .filter(|purl| {
@@ -2062,6 +2076,7 @@ async fn run_redirect_selected_untracked(
         // engine's warnings hoisted to the top-level `warnings`.
         let mut env = scan_result.take().unwrap_or_else(|| scan_envelope(common));
         record_hosted_events(&mut env, &confirmed, &unconfirmed, &skipped, common.dry_run);
+        bazel.annotate(&mut env, &done);
         env.set_extra("redirect", redirect_block(done.rewritten.clone()));
         env.warnings.extend(warnings);
         // Taking the lock may have finished an interrupted run's commit
@@ -2522,13 +2537,24 @@ fn format_warning(code: &str, detail: &str, width: Option<usize>) -> String {
     } else {
         (detail, Vec::new())
     };
-    render_warning(&headline, &bullets, width)
+    // A Bazel code of level `info` is a note; every other code a warning.
+    let prefix = format!("{}: ", crate::bazel_gate::agent::prefix(code));
+    render_prefixed(&prefix, &headline, &bullets, width)
 }
 
 /// `Warning: <headline>` over one `  - ` line per bullet, word-wrapped to
 /// `width` when stderr is a terminal.
 fn render_warning(headline: &str, bullets: &[String], width: Option<usize>) -> String {
-    let prefix = "Warning: ";
+    render_prefixed("Warning: ", headline, bullets, width)
+}
+
+/// [`render_warning`] under another prefix.
+fn render_prefixed(
+    prefix: &str,
+    headline: &str,
+    bullets: &[String],
+    width: Option<usize>,
+) -> String {
     let mut lines: Vec<String> = Vec::new();
     match width {
         Some(w) => {
@@ -2729,7 +2755,8 @@ fn describe_skip_reason(reason: &str) -> String {
              detail)"
                 .into()
         }
-        other => format!("server status `{other}`"),
+        other => crate::bazel_gate::hosted::skip_reason(other)
+            .unwrap_or_else(|| format!("server status `{other}`")),
     }
 }
 

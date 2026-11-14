@@ -372,7 +372,9 @@ pub async fn run(args: VexArgs) -> i32 {
     }
 
     // Nothing in a tree Bazel owns is attested (owner decision O16):
-    // refused before a manifest, a ledger or a lockfile is read.
+    // refused before a manifest, a ledger or a lockfile is read. The check
+    // judges the project a `--manifest-path` moves the run to as well,
+    // which is where `at_project_root` below roots it.
     let refused =
         crate::bazel_gate::scope::refuse_in_bazel_tree(&args.common, Command::Vex, "attest");
     if let Some(code) = refused.await {
@@ -1054,7 +1056,13 @@ async fn generate_vex(
             .iter()
             .map(|purl| strip_purl_qualifiers(purl))
             .collect();
-        let is_stale = |purl: &str| stale.contains(strip_purl_qualifiers(purl));
+        // A purl the Bazel build consumes through a hosted pin has no copy
+        // on the host that is evidence either way: Bazel fetches the pinned
+        // bytes itself, so what a probe found in a host store (the NuGet
+        // global packages folder, a site-packages) says nothing about it.
+        let is_stale = |purl: &str| {
+            stale.contains(strip_purl_qualifiers(purl)) && !bazel.replaces_installed_tree(purl)
+        };
         outcome.applied.retain(|purl| !is_stale(purl));
         outcome.failed.retain(|failure| !is_stale(&failure.purl));
         outcome.failed.extend(
@@ -1078,7 +1086,10 @@ async fn generate_vex(
             .iter()
             .map(|purl| strip_purl_qualifiers(purl))
             .collect();
-        let is_unjudged = |purl: &str| unjudged.contains(strip_purl_qualifiers(purl));
+        // Nor is a host copy nobody could judge held against such a pin.
+        let is_unjudged = |purl: &str| {
+            unjudged.contains(strip_purl_qualifiers(purl)) && !bazel.replaces_installed_tree(purl)
+        };
         outcome.applied.retain(|purl| !is_unjudged(purl));
         let failed: std::collections::HashSet<String> = outcome
             .failed
