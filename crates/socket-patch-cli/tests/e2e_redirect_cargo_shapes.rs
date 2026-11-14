@@ -7,8 +7,9 @@
 //!   own version's registry, and removing both purls restores every byte.
 //! * `legacy_config` — an existing legacy `.cargo/config`: the registry
 //!   block lands there, and `remove` restores the file byte-for-byte —
-//!   also when it ends in a blank line (one lacking a final newline gets
-//!   that newline back: v5 keeps no ledger fragment to tell them apart).
+//!   also when it ends in a blank line or lacks a final newline (v5 keeps
+//!   no ledger fragment to tell the two apart, so the rewriter puts one
+//!   newline before its block either way and `remove` takes that one back).
 //! * `crlf` — CRLF `Cargo.toml` + `Cargo.lock`: rewritten with CRLF kept,
 //!   and restored byte-for-byte.
 //! * `workspace_direct_member` — a virtual workspace whose root pins
