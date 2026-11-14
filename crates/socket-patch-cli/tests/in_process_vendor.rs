@@ -3877,7 +3877,7 @@ async fn scan_vendor_gem_skips_a_version_the_lock_does_not_resolve() {
         let detail = skipped["reason"].as_str().unwrap_or_default();
         assert!(
             detail.contains("Gemfile.lock does not resolve demo-gem 1.0.0")
-                && detail.contains("this project doesn't lock it"),
+                && detail.contains("this project doesn't lock that version"),
             "{label}: the skip says why: {skipped}"
         );
         assert!(
@@ -3916,7 +3916,13 @@ async fn scan_vendor_gem_skips_a_version_the_lock_does_not_resolve() {
 #[tokio::test]
 async fn scan_vendor_gem_unlocked_version_skip_reads_as_a_skip() {
     let (_, gemfile, lock) = gem_unlocked_projects().remove(0);
-    for (extra, marker) in [(&[][..], "[skip]"), (&["--dry-run"][..], "[would-refuse]")] {
+    for (extra, headline) in [
+        (&[][..], "Downloading 1 patch"),
+        (
+            &["--dry-run"][..],
+            "Would download and vendor 0 of 1 patch (1 would be skipped)",
+        ),
+    ] {
         let mock = wiremock::MockServer::start().await;
         mount_gem_patch_api(&mock, GEM_PURL).await;
         let fx = gem_unlocked_fixture(&gemfile, &lock);
@@ -3939,24 +3945,83 @@ async fn scan_vendor_gem_unlocked_version_skip_reads_as_a_skip() {
         let (code, stdout, stderr) = run_cli(fx.root(), &argv, &[]);
         let out = format!("{stdout}\n{stderr}");
         assert_eq!(code, 0, "{extra:?}:\n{out}");
-        let line = out
+        assert!(out.contains(headline), "{extra:?}:\n{out}");
+        let line = stderr
             .lines()
             .find(|l| {
                 l.contains(&format!(
-                    "{marker} {GEM_PURL} (vendor_gem_version_not_locked): "
+                    "[skip] {GEM_PURL} (vendor_gem_version_not_locked): "
                 ))
             })
-            .unwrap_or_else(|| panic!("{extra:?}: no {marker} line for the gem:\n{out}"));
+            .unwrap_or_else(|| panic!("{extra:?}: no [skip] line for the gem:\n{out}"));
         assert!(
             line.contains("Gemfile.lock does not resolve demo-gem 1.0.0")
-                && line.contains("this project doesn't lock it"),
+                && line.contains("this project doesn't lock that version"),
             "{extra:?}: {line}"
         );
         assert!(
-            !out.contains("Error") && !out.contains("failed") && !out.contains("has no entry"),
+            !["Error", "failed", "refuse", "has no entry"]
+                .iter()
+                .any(|bad| out.contains(bad)),
             "{extra:?}: a skip is not an error:\n{out}"
         );
         assert!(!fx.root().join(".socket").exists(), "{extra:?}");
+    }
+}
+
+/// #2075 through `get <uuid> --mode vendored`, which judges the one patch
+/// it names before its download phase: the same skip, exit 0 and nothing
+/// written, in JSON and in human mode.
+#[tokio::test]
+async fn get_uuid_vendored_gem_skips_a_version_the_lock_does_not_resolve() {
+    for (label, gemfile, lock) in gem_unlocked_projects() {
+        for json_mode in [true, false] {
+            let mock = wiremock::MockServer::start().await;
+            mount_gem_patch_api(&mock, GEM_PURL).await;
+            let fx = gem_unlocked_fixture(&gemfile, &lock);
+            let uri = mock.uri();
+            let mut argv = vec![
+                "get",
+                GEM_UUID,
+                "--mode",
+                "vendored",
+                "--yes",
+                "--api-url",
+                uri.as_str(),
+                "--api-token",
+                "fake-token",
+                "--org",
+                "test-org",
+                "--cwd",
+                fx.root().to_str().unwrap(),
+            ];
+            if json_mode {
+                argv.push("--json");
+            }
+            let (code, stdout, stderr) = run_cli(fx.root(), &argv, &[]);
+            assert_eq!(code, 0, "{label}:\n{stdout}\n{stderr}");
+            if json_mode {
+                let env: Value = serde_json::from_str(stdout.trim()).unwrap();
+                assert_eq!(env["status"], "success", "{label}: {env:#}");
+                let skipped = find_event(&env, "skipped", Some("vendor_gem_version_not_locked"));
+                assert_eq!(skipped["purl"], GEM_PURL, "{label}: {skipped}");
+                assert_eq!(skipped["details"]["mode"], "vendored", "{label}");
+                assert_eq!(env["summary"]["failed"], 0, "{label}: {env:#}");
+            } else {
+                assert!(
+                    stderr.contains(&format!(
+                        "[skip] {GEM_PURL} (vendor_gem_version_not_locked): "
+                    )) && !stderr.contains("Error"),
+                    "{label}:\n{stdout}\n{stderr}"
+                );
+            }
+            assert_eq!(
+                std::fs::read_to_string(fx.lock_path()).unwrap(),
+                lock,
+                "{label}: Gemfile.lock untouched"
+            );
+            assert!(!fx.root().join(".socket").exists(), "{label}");
+        }
     }
 }
 

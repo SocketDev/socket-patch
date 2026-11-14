@@ -342,6 +342,12 @@ pub(crate) fn format_record_skip(purl: &str, why: &str) -> String {
     format!("  [skip] {} ({why})", normalize_purl(purl))
 }
 
+/// `[skip]` line for a patch a vendored run doesn't download because its
+/// refusal is an expected skip (`code`, see `vendor::refusal_is_benign`).
+pub(crate) fn format_refusal_skip(purl: &str, code: &str, detail: &str) -> String {
+    format!("  [skip] {} ({code}): {detail}", normalize_purl(purl))
+}
+
 /// Download parameters shared between get and scan commands.
 pub struct DownloadParams {
     pub cwd: PathBuf,
@@ -956,7 +962,7 @@ pub(crate) async fn fetch_selected_patches(
             // failure, as in the vendor loop.
             if crate::commands::vendor::refusal_is_benign(code) {
                 if !quiet {
-                    eprintln!("  [skip] {} ({code}): {detail}", normalize_purl(purl));
+                    eprintln!("{}", format_refusal_skip(purl, code, detail));
                 }
                 batch.events.push(tag_mode(
                     PatchEvent::new(EventAction::Skipped, purl)

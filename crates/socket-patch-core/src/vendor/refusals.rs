@@ -18,7 +18,7 @@
 //! 3. the lock-text refusals a hosted pnpm pin's takeover meets (#853);
 //! 4. the lock-text refusals of every other npm and cargo candidate, the
 //!    ones the backend raises on the lock and manifest text alone;
-//! 5. an installed gem version the project's `Gemfile.lock` doesn't
+//! 5. a gem version the project's `Gemfile.lock` doesn't
 //!    resolve (`vendor_gem_version_not_locked`, which the callers report
 //!    as a skip).
 //!
@@ -147,21 +147,18 @@ pub async fn vendor_refusals(
     for (purl, (code, detail)) in takeover_refusals.into_iter().chain(lock_text) {
         refuse(&mut out, &purl, code, &detail);
     }
-    for (purl, (code, detail)) in gem_refusals(project_root, candidates, scope.installed).await {
+    for (purl, (code, detail)) in gem_refusals(project_root, candidates).await {
         refuse(&mut out, &purl, code, &detail);
     }
     out
 }
 
 /// The gem candidates whose version `Gemfile.lock` doesn't resolve
-/// ([`gem::gem_version_not_locked_refusals`]), less the ones that are not
-/// installed: like [`reaching_backend`], a package with no copy on disk
-/// never reaches its backend, and the vendor loop reports it
-/// `package_not_installed`.
+/// ([`gem::gem_version_not_locked_refusals`]), installed or not: the
+/// backend refuses either before it asks the patch service for anything.
 async fn gem_refusals(
     project_root: &Path,
     candidates: &[(&str, &str)],
-    installed: &InstalledLookup<'_>,
 ) -> Vec<(String, (&'static str, String))> {
     let gems: Vec<&str> = candidates
         .iter()
@@ -171,13 +168,7 @@ async fn gem_refusals(
     if gems.is_empty() {
         return Vec::new();
     }
-    let mut refused = gem::gem_version_not_locked_refusals(project_root, &gems).await;
-    if refused.is_empty() {
-        return refused;
-    }
-    let installed = installed(refused.iter().map(|(purl, _)| purl.clone()).collect()).await;
-    refused.retain(|(purl, _)| installed.contains(purl));
-    refused
+    gem::gem_version_not_locked_refusals(project_root, &gems).await
 }
 
 fn refuse(out: &mut VendorRefusals, purl: &str, code: &'static str, detail: &str) {
@@ -405,19 +396,16 @@ mod tests {
             tmp
         }
 
-        fn everything_installed(purls: Vec<String>) -> BoxFuture<'static, HashSet<String>> {
-            Box::pin(async move { purls.into_iter().collect() })
-        }
-
-        /// #2075: a gem version in the gem home that the lock doesn't
-        /// resolve is refused before any download; the gem the project
-        /// locks is left to the engine.
+        /// #2075: a gem version the lock doesn't resolve (one the gem
+        /// home holds for Ruby or another project, or one that is not
+        /// installed at all) is refused before any download; the gem the
+        /// project locks is left to the engine.
         #[tokio::test]
-        async fn installed_version_the_lock_does_not_resolve_is_refused() {
+        async fn version_the_lock_does_not_resolve_is_refused() {
             let tmp = project();
             let pairs = [(LOCKED, UUID), (UNLOCKED, OTHER_UUID)];
             let state = HashMap::new();
-            let got = run_scoped(tmp.path(), &pairs, Ok(&state), &[], &everything_installed).await;
+            let got = run(tmp.path(), &pairs, Ok(&state)).await;
             assert_eq!(got.keys().collect::<Vec<_>>(), [UNLOCKED]);
             assert_eq!(got[UNLOCKED].code, "vendor_gem_version_not_locked");
             assert!(
@@ -427,16 +415,6 @@ mod tests {
                 "{}",
                 got[UNLOCKED].detail
             );
-        }
-
-        /// A gem that is neither locked nor installed never reaches the
-        /// backend: the vendor loop still reports it `package_not_installed`.
-        #[tokio::test]
-        async fn uninstalled_version_is_left_to_the_vendor_loop() {
-            let tmp = project();
-            let state = HashMap::new();
-            let got = run(tmp.path(), &[(UNLOCKED, UUID)], Ok(&state)).await;
-            assert!(got.is_empty(), "{got:?}");
         }
     }
 

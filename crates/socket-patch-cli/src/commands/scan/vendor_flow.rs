@@ -85,6 +85,19 @@ pub(crate) enum PreviewVerdict {
     WouldVendor,
 }
 
+impl PreviewVerdict {
+    /// For a row the wet run's preflight stops: whether it is an expected
+    /// skip (`[skip]`, exit 0) rather than a failure. `None` for the rest.
+    fn would_skip(&self) -> Option<bool> {
+        match self {
+            Self::WouldRefuse { code, .. } => {
+                Some(crate::commands::vendor::refusal_is_benign(code))
+            }
+            _ => None,
+        }
+    }
+}
+
 /// One row of [`VendorPreview`].
 #[derive(Debug, Clone)]
 pub(crate) struct PreviewRow {
@@ -103,11 +116,20 @@ pub(crate) struct VendorPreview {
 }
 
 impl VendorPreview {
-    /// How many rows the wet run would refuse.
+    /// How many rows the wet run would refuse as failures.
     pub(crate) fn refused_count(&self) -> usize {
         self.rows
             .iter()
-            .filter(|r| matches!(r.verdict, PreviewVerdict::WouldRefuse { .. }))
+            .filter(|r| r.verdict.would_skip() == Some(false))
+            .count()
+    }
+
+    /// How many rows the wet run would skip without failing: a refusal
+    /// under a benign code.
+    pub(crate) fn skipped_count(&self) -> usize {
+        self.rows
+            .iter()
+            .filter(|r| r.verdict.would_skip() == Some(true))
             .count()
     }
 
@@ -199,13 +221,16 @@ impl VendorPreview {
             total: self.rows.len(),
             refused: self.refused_count(),
             in_sync: self.in_sync_count(),
+            skipped: self.skipped_count(),
         })
     }
 
     /// Human rendering of the preview: the headline, then a `[skip] …
     /// (already vendored)` line for each in-sync row (stderr, the wet
     /// run's line and stream), a `[would-refuse]` line naming what the wet
-    /// run would refuse and why, and the symlink advisories. Shared by
+    /// run would refuse and why (a `[skip]` line on stderr, as the wet run
+    /// prints it, when the refusal is an expected skip), and the symlink
+    /// advisories. Shared by
     /// `scan --mode vendored --dry-run` and `get … --mode vendored
     /// --dry-run` so the two cannot drift. Callers gate it on `--silent`.
     pub(crate) fn print_human(&self) {
@@ -223,7 +248,17 @@ impl VendorPreview {
         }
         for row in &self.rows {
             if let PreviewVerdict::WouldRefuse { code, detail } = &row.verdict {
-                println!("  [would-refuse] {} ({code}): {detail}", row.purl);
+                if row.verdict.would_skip() == Some(true) {
+                    // The wet run's line and stream.
+                    eprintln!(
+                        "{}",
+                        crate::commands::agent_download::format_refusal_skip(
+                            &row.purl, code, detail
+                        )
+                    );
+                } else {
+                    println!("  [would-refuse] {} ({code}): {detail}", row.purl);
+                }
             }
         }
         for row in &self.rows {

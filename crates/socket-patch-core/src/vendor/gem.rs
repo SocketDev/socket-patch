@@ -82,7 +82,7 @@ use super::state::{
     write_marker_or_warn, VendorArtifact, VendorEntry, VendorMarker, WiringAction, WiringRecord,
 };
 use super::{RevertOpts, RevertOutcome, VendorOutcome, VendorServiceConfig, VendorWarning};
-use crate::formats::gem::{is_plain_gem_token, split_checksum_entry, split_entry};
+use crate::formats::gem::{is_plain_gem_token, listed_specs, split_checksum_entry, split_entry};
 
 const GEMFILE: &str = "Gemfile";
 const GEMFILE_LOCK: &str = "Gemfile.lock";
@@ -193,25 +193,10 @@ pub async fn gem_manifest_refusal(project_root: &Path) -> Option<(&'static str, 
 /// project (or to Ruby itself), and there is nothing in this one to wire.
 pub const GEM_VERSION_NOT_LOCKED: &str = "vendor_gem_version_not_locked";
 
-/// Whether any section of `lock_text` (`GEM`, `PATH`, `GIT`, `PLUGIN
-/// SOURCE`) has a spec entry for `name` at `version`, as the portable gem
-/// or as one of its platform builds (`name (version-platform)`). CRLF
-/// tolerant.
-fn lock_lists_gem_version(lock_text: &str, name: &str, version: &str) -> bool {
-    lock_text.lines().any(|line| {
-        spec_entry(line.trim_end_matches('\r')).is_some_and(|(n, token)| {
-            n == name
-                && token
-                    .strip_prefix(version)
-                    .is_some_and(|rest| rest.is_empty() || rest.starts_with('-'))
-        })
-    })
-}
-
 fn version_not_locked_detail(name: &str, version: &str) -> String {
     format!(
-        "{GEMFILE_LOCK} does not resolve {name} {version} (it is installed on this machine \
-         but this project doesn't lock it); nothing to vendor"
+        "{GEMFILE_LOCK} does not resolve {name} {version}: this project doesn't lock that \
+         version, so there is nothing to vendor"
     )
 }
 
@@ -222,6 +207,8 @@ fn version_not_locked_detail(name: &str, version: &str) -> String {
 /// and the ones other projects installed; vendoring is a `Gemfile.lock`
 /// edit, and for those versions there is no entry to edit (#2075, the
 /// vendored twin of hosted mode's `redirect_gem_version_not_locked`).
+/// A spec entry in any source section counts as resolved
+/// ([`listed_specs`]).
 ///
 /// Read-only. Nothing is returned when bundler loads another manifest or
 /// the lock can't be read: the backend reports those itself.
@@ -242,8 +229,9 @@ pub async fn gem_version_not_locked_refusals(
     let Ok(lock_text) = read_regular_to_string(&project_root.join(GEMFILE_LOCK)).await else {
         return Vec::new();
     };
+    let listed = listed_specs(&lock_text);
     gems.into_iter()
-        .filter(|(_, name, version)| !lock_lists_gem_version(&lock_text, name, version))
+        .filter(|(_, name, version)| !listed.contains(&(name.as_str(), version.as_str())))
         .map(|(purl, name, version)| {
             (
                 purl.to_string(),
@@ -463,7 +451,7 @@ async fn gem_prelude(
     // A version the lock doesn't resolve has no entry to move into a PATH
     // section: an expected skip (see [`gem_version_not_locked_refusals`]),
     // decided before the patch service is asked for anything.
-    if !lock_lists_gem_version(&lock_text, name, version) {
+    if !listed_specs(&lock_text).contains(&(name, version)) {
         return Err(refused(
             GEM_VERSION_NOT_LOCKED,
             version_not_locked_detail(name, version),
@@ -9587,32 +9575,30 @@ mod tests {
     /// it; a dependency subline, a DEPENDENCIES or CHECKSUMS entry, another
     /// version or a gem whose name only starts the same does not.
     #[test]
-    fn lock_lists_gem_version_reads_spec_entries_of_every_section() {
-        assert!(lock_lists_gem_version(LOCK_DIRECT, "rack", "3.2.6"));
-        assert!(lock_lists_gem_version(LOCK_TWO_SOURCES, "rack", "3.2.6"));
+    fn listed_specs_reads_spec_entries_of_every_section() {
+        let lists =
+            |lock: &str, name: &str, version: &str| listed_specs(lock).contains(&(name, version));
+        assert!(lists(LOCK_DIRECT, "rack", "3.2.6"));
+        assert!(lists(LOCK_TWO_SOURCES, "rack", "3.2.6"));
         let crlf = LOCK_DIRECT.replace('\n', "\r\n");
-        assert!(lock_lists_gem_version(&crlf, "rack", "3.2.6"));
+        assert!(lists(&crlf, "rack", "3.2.6"));
         // Our own PATH section, a user's PATH or GIT section.
-        assert!(lock_lists_gem_version(
-            &expected_lock_two_sources(),
-            "rack",
-            "3.2.6"
-        ));
+        assert!(lists(&expected_lock_two_sources(), "rack", "3.2.6"));
         let git = "GIT\n  remote: https://example.com/rack.git\n  revision: abc\n  specs:\n    rack (3.2.6)\n\nGEM\n  specs:\n\nDEPENDENCIES\n  rack!\n";
-        assert!(lock_lists_gem_version(git, "rack", "3.2.6"));
+        assert!(lists(git, "rack", "3.2.6"));
         // A platform build of the version is still that version.
         let platform = "GEM\n  remote: https://rubygems.org/\n  specs:\n    ffi (1.17.2-x86_64-linux-gnu)\n\nCHECKSUMS\n  rake (13.0.6) sha256=00\n";
-        assert!(lock_lists_gem_version(platform, "ffi", "1.17.2"));
+        assert!(lists(platform, "ffi", "1.17.2"));
 
-        assert!(!lock_lists_gem_version(LOCK_DIRECT, "rack", "3.2.5"));
-        assert!(!lock_lists_gem_version(LOCK_DIRECT, "rack", "3.2"));
-        assert!(!lock_lists_gem_version(LOCK_DIRECT, "rack", "3.2.60"));
-        assert!(!lock_lists_gem_version(LOCK_DIRECT, "rac", "3.2.6"));
+        assert!(!lists(LOCK_DIRECT, "rack", "3.2.5"));
+        assert!(!lists(LOCK_DIRECT, "rack", "3.2"));
+        assert!(!lists(LOCK_DIRECT, "rack", "3.2.60"));
+        assert!(!lists(LOCK_DIRECT, "rac", "3.2.6"));
         // `nio4r (~> 2.0)` and `base64 (>= 0.1.0)` are dependency sublines.
-        assert!(!lock_lists_gem_version(LOCK_DIRECT, "base64", ">= 0.1.0"));
-        assert!(!lock_lists_gem_version(platform, "ffi", "1.17"));
-        assert!(!lock_lists_gem_version(platform, "rake", "13.0.6"));
-        assert!(!lock_lists_gem_version("", "rack", "3.2.6"));
+        assert!(!lists(LOCK_DIRECT, "base64", ">= 0.1.0"));
+        assert!(!lists(platform, "ffi", "1.17"));
+        assert!(!lists(platform, "rake", "13.0.6"));
+        assert!(!lists("", "rack", "3.2.6"));
     }
 
     /// #2075: the refusals name exactly the gem purls the lock doesn't
@@ -9637,7 +9623,10 @@ mod tests {
         );
         for (_, (code, detail)) in &refused {
             assert_eq!(*code, GEM_VERSION_NOT_LOCKED);
-            assert!(detail.contains("this project doesn't lock it"), "{detail}");
+            assert!(
+                detail.contains("this project doesn't lock that version"),
+                "{detail}"
+            );
         }
         assert!(refused[0].1 .1.contains("does not resolve rack 2.2.8"));
     }
