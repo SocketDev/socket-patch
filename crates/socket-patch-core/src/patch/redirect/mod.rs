@@ -4490,27 +4490,24 @@ fn plan_cargo_config(
             },
         });
     }
-    // Absent (or surviving only in comments): append a fresh block.
+    // Absent (or surviving only in comments): append a fresh block after
+    // exactly one newline, whatever the config ends with. After a final
+    // newline that is a blank separator line; after none it is the line
+    // ending the config lacked, and the block follows its last line
+    // directly. `remove` keeps no record of the append and takes back the
+    // block plus that one newline (`upstream::cargo::remove_registry_block`),
+    // so a second newline here would stay behind in a config that had none.
     let block = format!("{header}\n{index_line}\n");
-    let sep = if !config.is_empty() && !config.ends_with('\n') {
-        "\n"
-    } else {
-        ""
-    };
     let prefix = if config.is_empty() { "" } else { "\n" };
-    // The newline a config without a final one needed rides in the recorded
-    // fragment, so the revert (which also drops the one blank separator
-    // before the fragment) restores the config's exact bytes.
-    let recorded = format!("{sep}{block}");
     Some(CargoConfigPlan {
-        content: format!("{config}{sep}{prefix}{block}"),
+        content: format!("{config}{prefix}{block}"),
         edit: FileEdit {
             path: config_key.into(),
             kind: "redirect_cargo_registry".into(),
             action: "added".into(),
             key: Some(reg.to_string()),
             original: None,
-            new: Some(Value::String(recorded)),
+            new: Some(Value::String(block)),
         },
     })
 }
@@ -27921,7 +27918,8 @@ packages:
         );
         assert!(r.confirmed_cargo_uuids.contains(CARGO_UUID));
 
-        // Newline-less user config: exactly one blank line before the block.
+        // Newline-less user config: the block follows the last line after
+        // the one newline that line lacked, and no second one.
         let mut files = cargo_files(manifest);
         files.insert(
             ".cargo/config.toml".to_string(),
@@ -27932,13 +27930,78 @@ packages:
         assert_eq!(
             cfg,
             &format!(
-                "[net]\nretry = 3\n\n[registries.{}]\nindex = \"{}\"\n",
+                "[net]\nretry = 3\n[registries.{}]\nindex = \"{}\"\n",
                 cargo_reg(),
                 cargo_index_url()
             ),
-            "a newline must be added before the separator blank line"
+            "one newline ends the user's last line; a second could not be taken back"
         );
         assert!(r.confirmed_cargo_uuids.contains(CARGO_UUID));
+    }
+
+    /// `remove` keeps no record of what the rewriter appended, so the append
+    /// has to be one `upstream::cargo::remove_registry_block` inverts from
+    /// the file alone: the config comes back byte for byte, whatever it
+    /// ended with, in LF and CRLF.
+    #[test]
+    fn cargo_config_append_is_undone_byte_for_byte() {
+        let manifest = "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n\
+                        [dependencies]\nserde = \"1.0.190\"\n";
+        for original in [
+            "[net]\nretry = 3\n",
+            "[net]\nretry = 3",
+            "[net]\nretry = 3\n\n\n",
+            "# only a comment",
+            "[net]\r\nretry = 3\r\n",
+            "[net]\r\nretry = 3",
+        ] {
+            let mut files = cargo_files(manifest);
+            files.insert(".cargo/config.toml".to_string(), original.to_string());
+            let r = rewrite_registry_redirect(&files, &[cargo_sparse_override()]);
+            let hosted = r.files.get(".cargo/config.toml").expect("block appended");
+            let parsed = hosted
+                .parse::<toml_edit::DocumentMut>()
+                .unwrap_or_else(|e| panic!("{original:?} hosted is not TOML: {e}"));
+            assert_eq!(
+                parsed["registries"][&cargo_reg()]["index"].as_str(),
+                Some(cargo_index_url().as_str()),
+                "{original:?}"
+            );
+            assert_eq!(
+                upstream::cargo::remove_registry_block(hosted, &cargo_reg()).as_deref(),
+                Some(original),
+                "{original:?}"
+            );
+        }
+
+        // Two patches appended to a newline-less config, removed in either
+        // order.
+        let original = "[net]\nretry = 3";
+        let other_reg = format!("socket-patch-{CARGO_UUID_2}");
+        let one = plan_cargo_config(
+            original,
+            ".cargo/config.toml",
+            &cargo_reg(),
+            &cargo_index_url(),
+        )
+        .expect("first block appended")
+        .content;
+        let both = plan_cargo_config(
+            &one,
+            ".cargo/config.toml",
+            &other_reg,
+            &format!("sparse+https://patch.test/cargo/{CARGO_UUID_2}/index/"),
+        )
+        .expect("second block appended")
+        .content;
+        for order in [[&cargo_reg(), &other_reg], [&other_reg, &cargo_reg()]] {
+            let mut config = both.clone();
+            for reg in order {
+                config = upstream::cargo::remove_registry_block(&config, reg)
+                    .unwrap_or_else(|| panic!("{reg} block not found in {config:?}"));
+            }
+            assert_eq!(config, original, "{order:?}");
+        }
     }
 
     /// A custom-registry pnpm lock carries extra `resolution:` fields
