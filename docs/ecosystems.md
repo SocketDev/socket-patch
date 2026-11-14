@@ -1871,24 +1871,29 @@ other, and it is now the gem's only source. So Bundler sees nothing newer for th
 `bundle outdated` no longer lists it and `bundle update`, with or without the gem's name, leaves
 it where it is, even when the Gemfile requirement is a range (`"~> 3.1"`) and upstream has
 released a later version. A gem that was a transitive dependency no longer floats with the gems
-that depend on it either: its added line pins the exact version. The other gems update as before.
-The scan says which gems it now holds, once, when it wires them:
+that depend on it either: its added line pins the exact version, so a later release of a parent
+gem that needs a newer version of it is held back too, or fails to resolve. Gems that do not
+depend on a patched gem update as before.
+
+The run says which gems it now holds when it wires them, on stdout under the line above:
 
 ```text
-Bundler now takes puma, rack, and nokogiri from their Socket patch source only, which serves the patched version and no other: `bundle outdated` no longer lists them and `bundle update` cannot move them. To move one to a newer release, run `socket-patch rollback`, then `bundle update <gem>`, then `socket-patch scan` again.
+Bundler now takes rack from its Socket patch source only, which serves the patched version and no other: `bundle outdated` no longer lists it and `bundle update` cannot move it. To move it to a newer release, run `socket-patch rollback pkg:gem/rack@3.1.8`, then `bundle update rack`, then `socket-patch scan` again.
 ```
 
-To take a newer upstream release of a patched gem (a later security release included), undo the
-pin, update, and scan again, which patches the new version if it still needs a patch:
+To take a newer upstream release of a patched gem (a later security release included), undo that
+gem's pin, update it, and scan again, which patches the new version if it still needs a patch:
 
 ```sh
-socket-patch rollback pkg:gem/rack@3.1.8   # or `socket-patch rollback` for every patch
+socket-patch rollback pkg:gem/rack@3.1.8
 bundle update rack
 socket-patch scan
 ```
 
-A re-scan that changes nothing does not repeat the line, and `--json` output does not carry it;
-`socket-patch list` shows the gems on a hosted patch at any time.
+Name the gem: `socket-patch rollback` with no argument undoes every patch in the project. The
+line is printed by the run that wires the gem (`--dry-run` prints what the run would hold,
+without the steps); a re-scan that changes nothing does not repeat it, and `--json` output does
+not carry it. `socket-patch list` shows the gems on a hosted patch at any time.
 
 **When a gem is left alone.** The scan never writes a pair Bundler would refuse. A gem it cannot
 wire is skipped, neither file changes for it, and the warning says why and what to do:

@@ -5673,8 +5673,8 @@ async fn gem_hosted_scan_says_the_gem_is_held_at_its_version() {
     let note = format!(
         "Bundler now takes {DEP} from its Socket patch source only, which serves the patched \
          version and no other: `bundle outdated` no longer lists it and `bundle update` cannot \
-         move it. To move it to a newer release, run `socket-patch rollback`, then \
-         `bundle update {DEP}`, then `socket-patch scan` again."
+         move it. To move it to a newer release, run `socket-patch rollback {PURL}`, \
+         then `bundle update {DEP}`, then `socket-patch scan` again."
     );
     assert!(
         stdout.lines().any(|line| line == note),
@@ -5685,9 +5685,9 @@ async fn gem_hosted_scan_says_the_gem_is_held_at_its_version() {
 
     // What the line says is so: the gem is gone from `bundle outdated`, and
     // `bundle update` leaves it at the patched version.
-    let (_, after) = bundle_cold(&["outdated"]);
+    let (up_to_date, after) = bundle_cold(&["outdated"]);
     assert!(
-        !after.contains(&format!("{DEP} ")) && !after.contains("1.1.0"),
+        up_to_date && !after.contains(DEP) && !after.contains("1.1.0"),
         "after the scan `bundle outdated` no longer reports {DEP}:\n{after}"
     );
     let (updated, update) = bundle_cold(&["update"]);

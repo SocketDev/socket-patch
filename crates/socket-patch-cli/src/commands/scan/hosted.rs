@@ -2166,7 +2166,12 @@ async fn run_redirect_selected_untracked(
                 println!("{line}");
             }
             // And what that costs: Bundler can no longer update those gems.
-            if let Some(note) = format_gem_hold_note(&rewrite.edits, common.dry_run) {
+            if let Some(note) = format_gem_hold_note(
+                &rewrite.edits,
+                &confirmed,
+                telemetry.command,
+                common.dry_run,
+            ) {
                 println!("{note}");
             }
             let human_warnings: Vec<(&str, &str)> = warnings
@@ -2668,8 +2673,17 @@ fn format_gem_manifest_edits(
 /// under a range requirement, until the pin is rolled back. Names the gems
 /// this run newly wired (a refreshed source URL holds nothing that was not
 /// held before), each once, in first-edit order. `None` when there are none.
+///
+/// A wet run also gives the way past the hold. Its `rollback` names the
+/// gem's own purl (looked up in `confirmed`, the run's `(purl, uuid)`
+/// pins): a bare `rollback` would unwind every patch in the project. Its
+/// last step is `scan` only after a scan; `get` selected one patch, and a
+/// scan would wire every other one too. A dry run wired nothing, so it has
+/// nothing to roll back and says only what the wet run would cost.
 fn format_gem_hold_note(
     edits: &[socket_patch_core::patch::redirect::FileEdit],
+    confirmed: &[(String, String)],
+    command: &str,
     dry_run: bool,
 ) -> Option<String> {
     let mut gems: Vec<String> = Vec::new();
@@ -2692,22 +2706,53 @@ fn format_gem_hold_note(
         [one] => Some(one.as_str()),
         _ => None,
     };
-    let (its, them, move_one, update_arg) = match one {
-        Some(name) => ("its", "it", "it", name),
-        None => ("their", "them", "one", "<gem>"),
+    let (its, them) = if one.is_some() {
+        ("its", "it")
+    } else {
+        ("their", "them")
     };
     let (takes, lists, moves) = if dry_run {
         ("would then take", "would no longer list", "could not move")
     } else {
         ("now takes", "no longer lists", "cannot move")
     };
-    Some(format!(
+    let mut note = format!(
         "Bundler {takes} {names} from {its} Socket patch source only, which serves the patched \
          version and no other: `bundle outdated` {lists} {them} and `bundle update` {moves} \
-         {them}. To move {move_one} to a newer release, run `socket-patch rollback`, then \
-         `bundle update {update_arg}`, then `socket-patch scan` again.",
+         {them}.",
         names = join_names(&gems, 6),
-    ))
+    );
+    if dry_run {
+        return Some(note);
+    }
+    // The one gem's own purl, when exactly one confirmed pin carries its
+    // name; else the shape of one, for the user to fill in.
+    let purl = one.and_then(|name| {
+        let prefix = format!("pkg:gem/{name}@");
+        let mut pins = confirmed
+            .iter()
+            .map(|(purl, _)| purl.as_str())
+            .filter(|purl| purl.starts_with(&prefix));
+        match (pins.next(), pins.next()) {
+            (Some(purl), None) => Some(purl),
+            _ => None,
+        }
+    });
+    let (move_one, target, update_arg) = match (one, purl) {
+        (Some(name), Some(purl)) => ("it", purl, name),
+        (Some(name), None) => ("it", "pkg:gem/<gem>@<version>", name),
+        (None, _) => ("one", "pkg:gem/<gem>@<version>", "<gem>"),
+    };
+    let again = if command == "scan" {
+        "then `socket-patch scan` again"
+    } else {
+        "then patch the new version the same way"
+    };
+    note.push_str(&format!(
+        " To move {move_one} to a newer release, run `socket-patch rollback {target}`, then \
+         `bundle update {update_arg}`, {again}."
+    ));
+    Some(note)
 }
 
 /// [`format_redirect_summary`] for a run that confirmed `confirmed`
@@ -5153,46 +5198,78 @@ mod tests {
             edit("api/Gemfile", "redirect_gemfile_source_option", "rack"),
             edit("package-lock.json", "redirect_npm_lock", "lodash"),
         ];
+        let pin = |purl: &str| (purl.to_string(), "uuid".to_string());
+        let confirmed = [
+            pin("pkg:gem/rack@3.1.8"),
+            pin("pkg:gem/nokogiri@1.16.0"),
+            pin("pkg:npm/rack@1.0.0"),
+        ];
+        let hold = "from their Socket patch source only, which serves the patched version and \
+                    no other: `bundle outdated` no longer lists them and `bundle update` cannot \
+                    move them.";
         assert_eq!(
-            super::format_gem_hold_note(&edits, false).as_deref(),
-            Some(
-                "Bundler now takes rack and nokogiri from their Socket patch source only, \
-                 which serves the patched version and no other: `bundle outdated` no longer \
-                 lists them and `bundle update` cannot move them. To move one to a newer \
-                 release, run `socket-patch rollback`, then `bundle update <gem>`, then \
-                 `socket-patch scan` again."
-            )
+            super::format_gem_hold_note(&edits, &confirmed, "scan", false),
+            Some(format!(
+                "Bundler now takes rack and nokogiri {hold} To move one to a newer release, \
+                 run `socket-patch rollback pkg:gem/<gem>@<version>`, then \
+                 `bundle update <gem>`, then `socket-patch scan` again."
+            ))
         );
+        // One gem: the rollback names that gem's own pin, never the whole
+        // project (and never the npm package of the same name).
         assert_eq!(
-            super::format_gem_hold_note(&edits[..1], false).as_deref(),
+            super::format_gem_hold_note(&edits[..1], &confirmed, "scan", false).as_deref(),
             Some(
                 "Bundler now takes rack from its Socket patch source only, which serves the \
                  patched version and no other: `bundle outdated` no longer lists it and \
                  `bundle update` cannot move it. To move it to a newer release, run \
-                 `socket-patch rollback`, then `bundle update rack`, then `socket-patch scan` \
-                 again."
+                 `socket-patch rollback pkg:gem/rack@3.1.8`, then `bundle update rack`, then \
+                 `socket-patch scan` again."
             )
         );
-        let dry = super::format_gem_hold_note(&edits[..1], true).unwrap();
+        // No bare `socket-patch rollback` anywhere: it unwinds every patch.
+        for edits in [&edits[..], &edits[..1]] {
+            for confirmed in [&confirmed[..], &[]] {
+                let note = super::format_gem_hold_note(edits, confirmed, "scan", false).unwrap();
+                assert!(note.contains("`socket-patch rollback pkg:gem/"), "{note}");
+            }
+        }
+        // `get` wired the one patch it was asked for; it does not send the
+        // user to a scan, which would wire every other patch too.
+        let got = super::format_gem_hold_note(&edits[..1], &confirmed, "get", false).unwrap();
         assert!(
-            dry.starts_with("Bundler would then take rack from its Socket patch source only"),
-            "{dry}"
+            got.ends_with(
+                "run `socket-patch rollback pkg:gem/rack@3.1.8`, then `bundle update rack`, \
+                 then patch the new version the same way."
+            ),
+            "{got}"
         );
-        assert!(
-            dry.contains("`bundle outdated` would no longer list it"),
-            "{dry}"
+        assert!(!got.contains("socket-patch scan"), "{got}");
+        // A dry run wired nothing: it says what the wet run would cost and
+        // gives no rollback to run.
+        assert_eq!(
+            super::format_gem_hold_note(&edits[..1], &confirmed, "scan", true).as_deref(),
+            Some(
+                "Bundler would then take rack from its Socket patch source only, which serves \
+                 the patched version and no other: `bundle outdated` would no longer list it \
+                 and `bundle update` could not move it."
+            )
         );
-        assert!(dry.contains("`bundle update` could not move it"), "{dry}");
         // A refreshed source URL holds nothing new, and other ecosystems'
         // edits are not Bundler's.
         assert_eq!(
             super::format_gem_hold_note(
                 &[edit("Gemfile", "redirect_gemfile_source_url", "rack")],
+                &confirmed,
+                "scan",
                 false
             ),
             None
         );
-        assert_eq!(super::format_gem_hold_note(&edits[4..], false), None);
+        assert_eq!(
+            super::format_gem_hold_note(&edits[4..], &confirmed, "scan", false),
+            None
+        );
     }
 
     #[test]
