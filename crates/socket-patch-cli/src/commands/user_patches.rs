@@ -11,7 +11,8 @@
 use std::path::Path;
 
 use socket_patch_core::bazel::exec;
-use socket_patch_core::bazel::model::{Index, Site};
+use socket_patch_core::bazel::govern::WORKSPACE_UNREADABLE;
+use socket_patch_core::bazel::model::{BazelWorkspace, Gap, Index, Site};
 use socket_patch_core::crawlers::types::Ecosystem;
 use socket_patch_core::patch::user_patches::{ReadScope, UserPatchIndex};
 
@@ -59,15 +60,16 @@ fn run_cx(common: &GlobalArgs) -> RunCx {
 }
 
 /// Whether a Bazel workspace file lies at or above the scope root, inside
-/// the repository. Stats only. A global run inspects no project, so it
-/// has none.
+/// the repository: a root the check reads, or a workspace the project
+/// could not be placed under ([`Loader::unplaced`]), which protects like
+/// a root with no model. Stats only. A global run inspects no project, so
+/// it has none.
 fn under_bazel(common: &GlobalArgs) -> bool {
-    let workspace = common.read_scope() == ReadScope::Workspace;
-    workspace
-        && !Loader::new(run_cx(common))
-            .survey(&common.cwd)
-            .roots
-            .is_empty()
+    if common.read_scope() != ReadScope::Workspace {
+        return false;
+    }
+    let loader = Loader::new(run_cx(common));
+    !loader.survey(&common.cwd).roots.is_empty() || loader.unplaced(&common.cwd).is_some()
 }
 
 pub(crate) async fn inspect(common: &GlobalArgs) -> UserPatchIndex {
@@ -94,15 +96,46 @@ pub(crate) async fn inspect(common: &GlobalArgs) -> UserPatchIndex {
 /// tells it of its commits, can hand [`starlark`] that one instead.
 async fn bazel_declarations(common: &GlobalArgs) -> UserPatchIndex {
     let (cwd, run) = (common.cwd.clone(), run_cx(common));
-    let read = move || starlark(&Loader::new(run), &cwd);
+    read_apart(&common.cwd, move || starlark(&Loader::new(run), &cwd)).await
+}
+
+/// What `read` finds, run on a blocking thread.
+///
+/// A read that does not come back (the reader panicked, or the runtime is
+/// shutting down) is answered here and never run a second time: the
+/// reader is deterministic over the same files, so on this thread it
+/// would stop the command the same way, and a command that dies in its
+/// consent check fails every install whose hook runs it. "No declaration"
+/// is not an answer a consent check may make up either. So the workspace
+/// at `cwd` counts as one that could not be read: every package a ruleset
+/// with a hook can build is held back, the run says why, and it ends like
+/// any other run that skipped packages.
+async fn read_apart(
+    cwd: &Path,
+    read: impl FnOnce() -> UserPatchIndex + Send + 'static,
+) -> UserPatchIndex {
     match tokio::task::spawn_blocking(read).await {
         Ok(index) => index,
-        // The task did not run to its end (the runtime is shutting down,
-        // or the reader panicked). "No declaration" is not an answer a
-        // consent check may make up: read on this thread, where a panic
-        // is this command's own.
-        Err(_) => starlark(&Loader::new(run), &common.cwd),
+        Err(_) => {
+            let gap = Gap {
+                token: WORKSPACE_UNREADABLE,
+                file: String::new(),
+                detail: "socket-patch stopped while it read the Bazel workspace files at or \
+                         above this directory, which is a defect of this version: please report \
+                         it"
+                .to_string(),
+            };
+            let mut found = UserPatchIndex::default();
+            found.bazel_unreadable(&shown(cwd), &gap);
+            found
+        }
     }
+}
+
+/// The scope root as the walk reports a file of it: under the directory as
+/// the command spells it.
+fn shown(cwd: &Path) -> std::path::PathBuf {
+    std::path::absolute(cwd).unwrap_or_else(|_| cwd.to_path_buf())
 }
 
 /// What the Bazel workspaces at and above `cwd` declare about packages of
@@ -111,47 +144,86 @@ async fn bazel_declarations(common: &GlobalArgs) -> UserPatchIndex {
 /// Under no Bazel root this stats and reads nothing more. Otherwise every
 /// root between the scope root and the repository root counts, the
 /// nearest and the ones above it: a nested workspace file does not cut
-/// its directory out of the outer workspace (design 2.2). A workspace
-/// file above the repository is not read and adds nothing here: no hosted
-/// or vendored patch is written under one (design 2.12, obligation 1;
-/// owner decision O15), and the run says that it is there.
+/// its directory out of the outer workspace (design 2.2).
 ///
-/// The own-wiring filter is the lane gate's, `exec::own_site` over the
-/// root's owned index. An index that cannot be relied on proves no
-/// statement socket-patch's own, so every declaration is the user's.
+/// A workspace inside the repository that the project cannot be placed
+/// under ([`Loader::unplaced`]) has no root to read and is no less a
+/// workspace: it protects like a root with no model, as the loader
+/// reports it unreadable.
+///
+/// A workspace file above the repository is not read and adds nothing
+/// here, confirmed or not: no hosted or vendored patch is written under
+/// one (design 2.12, obligation 1; owner decision O15), and the run says
+/// that it is there. Holding five ecosystems back in every checkout that
+/// lies below some Bazel workspace would cost each of them its installed
+/// patches over a file this run may not read.
 ///
 /// What `loader` queues to say about the workspace is left to the command
 /// whose run it is.
 fn starlark(loader: &Loader, cwd: &Path) -> UserPatchIndex {
     let mut found = UserPatchIndex::default();
     if loader.survey(cwd).roots.is_empty() {
+        if let Some(marker) = loader.unplaced(cwd) {
+            found.bazel_unreadable(&marker, &unplaced());
+        }
         return found;
     }
     let loaded = loader.load(cwd);
-    let unproven = Index::default();
     for root in loaded.roots() {
         let at = root.root();
         // A file of the scope root is reported as the walk reports it,
         // under the directory as the command spells it, so that a pnpm
         // lock both of them read is one source. A root above is reported
         // at its resolved path, as the walk reports an ancestor.
-        let shown = match at.project_rel.is_empty() {
-            true => std::path::absolute(cwd).unwrap_or_else(|_| cwd.to_path_buf()),
+        let at = match at.project_rel.is_empty() {
+            true => shown(cwd),
             false => at.root.clone(),
         };
-        match root.model() {
-            Ok(ws) => {
-                let rows = match root.index() {
-                    IndexState::Ours(index) => index,
-                    IndexState::Faulty(_) => &unproven,
-                };
-                let own = |site: &Site, _: Option<&str>| exec::own_site(rows, site);
-                found.add_bazel(&shown, ws, &own);
-            }
-            Err(gap) => found.bazel_unreadable(&shown, gap),
-        }
+        declared(&mut found, &at, root.model(), root.index(), &exec::own_site);
     }
     found
+}
+
+/// What one Bazel root adds to `found`, reported under `shown`.
+///
+/// A root with no model (`Err`: none of its boundary files could be read)
+/// protects every package a ruleset with a hook can build until the file
+/// is fixed. One with a model adds what it declares, less socket-patch's
+/// own wiring: `claims` is the lane gate's filter, `exec::own_site`, asked
+/// over the root's owned index. An index that cannot be relied on proves
+/// no statement socket-patch's own, so the filter is not asked at all and
+/// every declaration is the user's.
+fn declared(
+    found: &mut UserPatchIndex,
+    shown: &Path,
+    model: Result<&BazelWorkspace, &Gap>,
+    index: &IndexState,
+    claims: &dyn Fn(&Index, &Site) -> bool,
+) {
+    match model {
+        Ok(ws) => {
+            let own = |site: &Site, _: Option<&str>| match index {
+                IndexState::Ours(rows) => claims(rows, site),
+                IndexState::Faulty(_) => false,
+            };
+            found.add_bazel(shown, ws, &own);
+        }
+        Err(gap) => found.bazel_unreadable(shown, gap),
+    }
+}
+
+/// Why a workspace the project cannot be placed under has nothing read:
+/// the loader's own words for it (`Code::WorkspaceUnreadable`). The source
+/// it follows is the workspace file.
+fn unplaced() -> Gap {
+    Gap {
+        token: WORKSPACE_UNREADABLE,
+        file: String::new(),
+        detail: "this project's directory cannot be named under the Bazel workspace of this \
+                 file: a directory name between them is not UTF-8, or the working directory \
+                 could not be read"
+            .to_string(),
+    }
 }
 
 /// The project-patch sources protecting `purl`, if its ecosystem is selected
@@ -164,34 +236,69 @@ fn protecting(common: &GlobalArgs, index: &UserPatchIndex, purl: &str) -> Option
     (!sources.is_empty()).then_some(sources)
 }
 
+/// What holds a package back, which decides what its line tells the user
+/// to do about it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Held {
+    /// The project declares a patch or a replacement of it: the user
+    /// merges the fixes, or accepts the conflict risk.
+    Declared,
+    /// Nothing the project declares protects it, only files that could
+    /// not be read or parsed ([`UserPatchIndex::unreadable_only`]). That
+    /// is a broken file, not a conflict, so the text says to fix it
+    /// rather than to switch the check off.
+    Unreadable,
+    /// Nothing protects it but replacements in a Bazel workspace
+    /// ([`UserPatchIndex::bazel_replaced_only`]): Bazel builds something
+    /// else in its place, with or without consent, so the remedy for that
+    /// build is to remove the replacement, and the flag is offered for
+    /// what it permits, the installed copy.
+    ReplacedInBazel,
+}
+
+impl Held {
+    fn of(index: &UserPatchIndex, purl: &str) -> Self {
+        if index.unreadable_only(purl) {
+            Self::Unreadable
+        } else if index.bazel_replaced_only(purl) {
+            Self::ReplacedInBazel
+        } else {
+            Self::Declared
+        }
+    }
+}
+
 /// The `user_patch_conflict` / `user_patch_override` text for `purl`.
-/// `unreadable` ([`UserPatchIndex::unreadable_only`]): nothing the project
-/// declares protects it, only files that could not be read or parsed. That
-/// is a broken file, not a conflict, so the text says to fix it rather than
-/// to switch the check off.
-pub(crate) fn detail(purl: &str, sources: &[String], allowed: bool, unreadable: bool) -> String {
+fn detail(purl: &str, sources: &[String], allowed: bool, held: Held) -> String {
     let fix = plural(sources);
     let sources = sources.join(", ");
-    if unreadable && !allowed {
-        return format!(
+    if allowed {
+        return format!("{purl}: --allow-patch-conflicts permits attempting a Socket patch alongside project patches in {sources}; review and test the combined result. Backend safety checks still apply");
+    }
+    match held {
+        Held::Unreadable => format!(
             "{purl}: not patched, because this project's own patches for it could not be \
              checked: {sources}. Fix {fix} and run again."
-        );
-    }
-    if allowed {
-        format!("{purl}: --allow-patch-conflicts permits attempting a Socket patch alongside project patches in {sources}; review and test the combined result. Backend safety checks still apply")
-    } else {
-        format!("{purl}: protected by project patch/replacement metadata in {sources}; leaving this package untouched. Merge the fixes manually, or explicitly accept the conflict risk with --allow-patch-conflicts (ordinary --yes/--force do not approve this)")
+        ),
+        Held::ReplacedInBazel => format!("{purl}: protected by a replacement in {sources}; leaving this package untouched. Remove the replacement to have the package patched where Bazel builds it; --allow-patch-conflicts permits patching the installed copy only (ordinary --yes/--force do not approve this)"),
+        Held::Declared => format!("{purl}: protected by project patch/replacement metadata in {sources}; leaving this package untouched. Merge the fixes manually, or explicitly accept the conflict risk with --allow-patch-conflicts (ordinary --yes/--force do not approve this)"),
     }
 }
 
 /// [`detail`] for every package of `ecosystem` at once, where what
 /// protects them is a Bazel declaration that names no single package
 /// ([`UserPatchIndex::bazel_ecosystem_wide`]): a computed `patches`
-/// argument, a use of a ruleset that led to no hub, a workspace file that
-/// could not be read. One such declaration holds back each package of the
-/// ecosystem for the same reason, so a run says it once, with the file
-/// and what was not read there (the sources), and not once per package.
+/// argument, a use of a ruleset that led to no hub, a statement that was
+/// not read, a workspace file that could not be read. One such
+/// declaration holds back each package of the ecosystem for the same
+/// reason, so a run says it once, with the file and what was not read
+/// there (the sources), and not once per package.
+///
+/// The remedy names no one edit: the sources say what was not read, and
+/// not each of them is a declaration the user can make name its packages
+/// (a call in a macro file, the `annotations` of a rule). Where it can be
+/// written as a literal the gate reads it; where it cannot, the flag is
+/// how the user says the workspace patches none of them.
 fn wide_detail(
     ecosystem: Ecosystem,
     sources: &[String],
@@ -209,7 +316,7 @@ fn wide_detail(
     if allowed {
         format!("every {packages} package: --allow-patch-conflicts permits attempting a Socket patch alongside whatever this Bazel workspace patches or replaces itself, which is not known: {sources}; review and test the combined result. Backend safety checks still apply")
     } else {
-        format!("every {packages} package: protected, because this Bazel workspace may patch or replace any of them itself, and which ones is not known: {sources}; leaving these packages untouched. Make the declaration name its packages, or explicitly accept the conflict risk with --allow-patch-conflicts (ordinary --yes/--force do not approve this)")
+        format!("every {packages} package: protected, because this Bazel workspace may patch or replace any of them itself, and which ones is not known: {sources}; leaving these packages untouched. Where what is named there can be written as a literal declaration, do that; otherwise explicitly accept the conflict risk with --allow-patch-conflicts (ordinary --yes/--force do not approve this)")
     }
 }
 
@@ -241,12 +348,12 @@ impl Lines {
         sources: &[String],
         allowed: bool,
     ) -> (String, Option<String>) {
-        let unreadable = index.unreadable_only(purl);
-        let own = detail(purl, sources, allowed, unreadable);
+        let held = Held::of(index, purl);
+        let own = detail(purl, sources, allowed, held);
         let Some(ecosystem) = index.bazel_ecosystem_wide(purl) else {
             return (own.clone(), Some(own));
         };
-        let shared = wide_detail(ecosystem, sources, allowed, unreadable);
+        let shared = wide_detail(ecosystem, sources, allowed, held == Held::Unreadable);
         let first = !self.wide.contains(&shared);
         if first {
             self.wide.push(shared.clone());
@@ -263,37 +370,38 @@ pub(crate) async fn check(
     common: &GlobalArgs,
     purls: impl IntoIterator<Item = impl AsRef<str>>,
 ) -> Result<Vec<(String, String)>, EnvelopeError> {
-    let sorted = sort(common, purls).await;
+    let sorted = partition(common, purls).await;
     if sorted.conflicts.is_empty() {
         Ok(sorted.warnings)
     } else {
-        let mut messages = sorted.refusals;
-        messages.sort();
-        messages.dedup();
-        Err(EnvelopeError::new(CONFLICT, messages.join("\n")))
+        Err(EnvelopeError::new(CONFLICT, sorted.refusals.join("\n")))
     }
 }
 
-/// [`check`]'s two outcomes kept apart: approved-override warnings, and the
-/// `(purl, message)` of each refused conflict.
+/// [`check`]'s outcomes kept apart, for a caller that reports a refusal
+/// its own way (`vendor`, which may have written before it checks). The
+/// refusal lines are sorted, each once.
 pub(crate) async fn partition(
     common: &GlobalArgs,
     purls: impl IntoIterator<Item = impl AsRef<str>>,
-) -> (Vec<(String, String)>, Vec<(String, String)>) {
-    let sorted = sort(common, purls).await;
-    (sorted.warnings, sorted.conflicts)
+) -> Sorted {
+    let mut sorted = sort(common, purls).await;
+    sorted.refusals.sort();
+    sorted.refusals.dedup();
+    sorted
 }
 
 /// What one consent check found for a selection.
 #[derive(Default)]
-struct Sorted {
+pub(crate) struct Sorted {
     /// The approved overrides, as run-level warnings.
-    warnings: Vec<(String, String)>,
-    /// `(purl, message)` of each refused conflict.
-    conflicts: Vec<(String, String)>,
-    /// What a refusal over `conflicts` says: the message of each, with
-    /// the line an ecosystem shares given once ([`Lines`]).
-    refusals: Vec<String>,
+    pub(crate) warnings: Vec<(String, String)>,
+    /// `(purl, message)` of each refused conflict: what the package's own
+    /// event says.
+    pub(crate) conflicts: Vec<(String, String)>,
+    /// What a refusal over `conflicts` says to the run: the message of
+    /// each, with the line an ecosystem shares given once ([`Lines`]).
+    pub(crate) refusals: Vec<String>,
 }
 
 async fn sort(common: &GlobalArgs, purls: impl IntoIterator<Item = impl AsRef<str>>) -> Sorted {
@@ -421,7 +529,7 @@ mod tests {
     #[test]
     fn detail_tells_an_unreadable_file_from_a_declared_patch() {
         let declared = ["/p/package.json".to_string()];
-        let blocked = detail("pkg:npm/a@1.0.0", &declared, false, false);
+        let blocked = detail("pkg:npm/a@1.0.0", &declared, false, Held::Declared);
         assert!(
             blocked.starts_with("pkg:npm/a@1.0.0: protected by project patch/replacement metadata in /p/package.json;"),
             "{blocked}"
@@ -432,7 +540,7 @@ mod tests {
         // the safety check off is not the remedy for a syntax error.
         let unreadable = ["/p/package.json (not valid JSON: EOF at line 2 column 0)".to_string()];
         assert_eq!(
-            detail("pkg:npm/a@1.0.0", &unreadable, false, true),
+            detail("pkg:npm/a@1.0.0", &unreadable, false, Held::Unreadable),
             "pkg:npm/a@1.0.0: not patched, because this project's own patches for it could not \
              be checked: /p/package.json (not valid JSON: EOF at line 2 column 0). Fix that file \
              and run again."
@@ -442,14 +550,42 @@ mod tests {
             "pnpm-lock.yaml (cannot be read: denied)".to_string(),
         ];
         assert!(
-            detail("pkg:npm/a@1.0.0", &two, false, true)
+            detail("pkg:npm/a@1.0.0", &two, false, Held::Unreadable)
                 .ends_with(". Fix those files and run again."),
             "{}",
-            detail("pkg:npm/a@1.0.0", &two, false, true)
+            detail("pkg:npm/a@1.0.0", &two, false, Held::Unreadable)
         );
-        // Consent given: the override wording is the same for both.
-        assert!(detail("pkg:npm/a@1.0.0", &unreadable, true, true)
-            .contains("--allow-patch-conflicts permits"),);
+        // Consent given: the override wording is the same for each.
+        for held in [Held::Declared, Held::Unreadable, Held::ReplacedInBazel] {
+            assert!(detail("pkg:npm/a@1.0.0", &unreadable, true, held)
+                .contains("--allow-patch-conflicts permits"),);
+        }
+    }
+
+    /// Review finding consent-design-4. A package that only a Bazel
+    /// replacement protects is not patched in that build whatever the
+    /// consent, so its line names the remedy that works there, removing
+    /// the replacement, and offers the flag for what it permits: the
+    /// installed copy. It never tells the user to merge fixes into a
+    /// patch there is none of.
+    #[test]
+    fn a_package_only_a_bazel_replacement_protects_is_told_the_remedy_that_works() {
+        let replaced = [
+            "/ws/MODULE.bazel (replaces the package in the Bazel build, where a \
+                         hosted or vendored Socket patch of it is refused with or without \
+                         --allow-patch-conflicts)"
+                .to_string(),
+        ];
+        let line = detail("pkg:npm/a@1.0.0", &replaced, false, Held::ReplacedInBazel);
+        let opens = "pkg:npm/a@1.0.0: protected by a replacement in /ws/MODULE.bazel (";
+        assert!(line.starts_with(opens), "{line}");
+        assert!(line.contains("Remove the replacement"), "{line}");
+        let flag = "--allow-patch-conflicts permits patching the installed copy only";
+        assert!(line.contains(flag), "{line}");
+        assert!(
+            !line.contains("Merge the fixes") && !line.contains("accept the conflict risk"),
+            "{line}"
+        );
     }
 
     /// The line an ecosystem shares names the ecosystem and never a
@@ -625,6 +761,206 @@ mod tests {
             ..bazel.run_in("")
         };
         assert!(!detectable(&npm_only, REQUESTS) && !detectable(&global, REQUESTS));
+    }
+
+    /// The five ecosystems a Bazel declaration can protect, one package of
+    /// each, and one of an ecosystem none can.
+    const HOOKED: [&str; 5] = [
+        LEFT_PAD,
+        REQUESTS,
+        GUAVA,
+        "pkg:cargo/serde@1.0.200",
+        "pkg:golang/github.com/foo/bar@v1.2.3",
+    ];
+    const RACK: &str = "pkg:gem/rack@2.2.8";
+
+    /// Asserts that `index` holds every package of [`HOOKED`] back for
+    /// one source that opens with `source`, as a file to fix and not as a
+    /// conflict to accept, with one line per ecosystem.
+    fn assert_all_unreadable(index: &UserPatchIndex, source: &str) {
+        let mut lines = Lines::default();
+        for purl in HOOKED {
+            let sources = index.conflicts(purl);
+            assert!(
+                sources.len() == 1 && sources[0].starts_with(source),
+                "{purl}: {sources:?}"
+            );
+            assert!(index.unreadable_only(purl), "{purl}");
+            let (own, shared) = lines.of(index, purl, &sources, false);
+            let shared = shared.expect("the first package of its ecosystem");
+            for line in [&own, &shared] {
+                assert!(line.ends_with(". Fix that file and run again."), "{line}");
+                assert!(!line.contains("--allow-patch-conflicts"), "{line}");
+            }
+        }
+        assert_eq!(index.conflicts(RACK), [""; 0]);
+    }
+
+    /// Review finding H5: the two arms of a root that fail closed. A root
+    /// with no model protects every ecosystem a hook can build for, as a
+    /// file to fix. A root whose owned index cannot be relied on has no
+    /// statement proven socket-patch's own: a filter that would claim the
+    /// declaration over a sound index is not asked, and the declaration
+    /// stays the user's.
+    #[test]
+    fn a_root_with_no_model_or_with_a_faulty_index_fails_closed() {
+        use socket_patch_core::bazel::exec::IndexFault;
+
+        let gap = Gap {
+            token: WORKSPACE_UNREADABLE,
+            file: String::new(),
+            detail: "the root holds no workspace file that can be read".to_string(),
+        };
+        let claims_all = |_: &Index, _: &Site| true;
+        let sound = IndexState::Ours(Index::default());
+        let mut found = UserPatchIndex::default();
+        declared(&mut found, Path::new("ws"), Err(&gap), &sound, &claims_all);
+        assert_all_unreadable(&found, "ws (the root holds no workspace file");
+
+        let patched = js_module(", patches = {\"left-pad@1.3.0\": [\"//:left-pad.patch\"]}");
+        let repo = Checkout::new(&[
+            (".bazelversion", "8.4.2\n"),
+            ("MODULE.bazel", &patched),
+            ("pnpm-lock.yaml", PNPM_LOCK),
+        ]);
+        let loaded = Loader::new(RunCx::default()).load(&repo.at(""));
+        let root = loaded.roots().next().expect("the root");
+        let ws = root.model().expect("a model");
+        let over = |index: &IndexState, claims: &dyn Fn(&Index, &Site) -> bool| {
+            let mut found = UserPatchIndex::default();
+            declared(&mut found, &repo.at(""), Ok(ws), index, claims);
+            found.conflicts(LEFT_PAD)
+        };
+        let users = [repo.named("MODULE.bazel")];
+        // The filter is the one asked over a sound index: what it claims
+        // is subtracted, and the real one claims nothing in this build.
+        assert_eq!(over(&sound, &claims_all), [""; 0]);
+        assert_eq!(over(&sound, &exec::own_site), users);
+        for fault in [
+            IndexFault::Foreign,
+            IndexFault::Unreadable,
+            IndexFault::Modified("a row was edited".to_string()),
+        ] {
+            let faulty = IndexState::Faulty(fault);
+            assert_eq!(over(&faulty, &claims_all), users, "{faulty:?}");
+        }
+    }
+
+    /// Review finding H6: a read that does not come back is not run a
+    /// second time on the command's own thread, where the same panic
+    /// would end the command, and is not "no declaration" either. The
+    /// workspace counts as one that could not be read, at the scope root.
+    #[tokio::test]
+    async fn a_read_that_does_not_come_back_protects_and_is_not_run_again() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let repo = Checkout::new(&[]);
+        let runs = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&runs);
+        let read = move || -> UserPatchIndex {
+            counted.fetch_add(1, Ordering::SeqCst);
+            panic!("a reader that fails (expected by this test)");
+        };
+        let found = read_apart(&repo.at(""), read).await;
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+        let source = format!("{} (socket-patch stopped while it read", repo.named(""));
+        assert_all_unreadable(&found, &source);
+
+        // A read that comes back is the answer, whatever it found.
+        let found = read_apart(&repo.at(""), UserPatchIndex::default).await;
+        assert!(found.is_empty());
+    }
+
+    /// Review finding consent-design-3, shape (2), and disclosed
+    /// deviation 7: a workspace file above the repository is never read,
+    /// so what it declares protects nothing here, confirmed or not, and a
+    /// PyPI-only run under one is not checked. (Hosted and vendored
+    /// patches are refused under a confirmed one by the lane gate, and the
+    /// run says that the file is there.)
+    #[tokio::test]
+    async fn a_workspace_above_the_repository_adds_nothing_to_the_check() {
+        let outer = js_module(", patches = {\"left-pad@1.3.0\": [\"//:left-pad.patch\"]}");
+        for confirmed in [true, false] {
+            let mut files = vec![
+                ("MODULE.bazel", outer.as_str()),
+                ("pnpm-lock.yaml", PNPM_LOCK),
+                ("repo/.git/HEAD", "ref: refs/heads/main\n"),
+                ("repo/package.json", "{}\n"),
+            ];
+            if confirmed {
+                files.push((".bazelversion", "8.4.2\n"));
+            }
+            let above = Checkout::new(&files);
+            let common = above.run_in("repo");
+            let loader = Loader::new(run_cx(&common));
+            let survey = loader.survey(&common.cwd);
+            assert!(survey.roots.is_empty() && survey.above.is_some());
+            assert_eq!(loader.unplaced(&common.cwd), None);
+            assert!(!under_bazel(&common), "{confirmed}");
+            let index = inspect(&common).await;
+            assert_eq!(index.conflicts(LEFT_PAD), [""; 0], "{confirmed}");
+            // The same file inside the repository holds the package back.
+            let index = inspect(&above.run_in("")).await;
+            assert_eq!(index.conflicts(LEFT_PAD), [above.named("MODULE.bazel")]);
+        }
+    }
+
+    /// Review finding consent-design-3, shape (1): what a workspace the
+    /// project cannot be placed under adds. The loader reports it as a
+    /// workspace it cannot read, and so does the check: every ecosystem a
+    /// hook can build for is held back as by a root with no model, with
+    /// the workspace file as the source.
+    #[test]
+    fn a_workspace_the_project_cannot_be_placed_under_protects_like_one_with_no_model() {
+        let marker = Path::new("ws").join("MODULE.bazel");
+        let mut found = UserPatchIndex::default();
+        found.bazel_unreadable(&marker, &unplaced());
+        let source = format!(
+            "{} (this project's directory cannot be named",
+            marker.display()
+        );
+        assert_all_unreadable(&found, &source);
+    }
+
+    /// The same, end to end over a disk. (Linux only: the disks of macOS
+    /// and Windows refuse a directory name that is not Unicode.)
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn an_unplaced_project_is_checked_and_protected() {
+        use std::os::unix::ffi::OsStrExt as _;
+        let repo = Checkout::new(&[
+            (".bazelversion", "8.4.2\n"),
+            ("MODULE.bazel", &js_module("")),
+            ("pnpm-lock.yaml", PNPM_LOCK),
+        ]);
+        let odd = repo.top.join(std::ffi::OsStr::from_bytes(b"caf\xe9"));
+        let project = odd.join("app");
+        std::fs::create_dir_all(&project).expect("a directory whose name is not UTF-8");
+        let common = GlobalArgs {
+            cwd: project,
+            ..GlobalArgs::default()
+        };
+        // No root to read, and a workspace all the same: a PyPI-only run
+        // is checked.
+        assert!(under_bazel(&common));
+        assert!(any_detectable(&common, [REQUESTS].into_iter()));
+        let index = inspect(&common).await;
+        let source = format!("{} (this project's directory", repo.named("MODULE.bazel"));
+        // Whatever the walk makes of the directory's name for a file of
+        // its own, the workspace is a source for each ecosystem.
+        for purl in HOOKED {
+            let sources = index.conflicts(purl);
+            let named = sources.iter().any(|found| found.starts_with(&source));
+            assert!(named, "{purl}: {sources:?}");
+        }
+        // The walk reads nothing for PyPI and Maven: the workspace is all
+        // that holds them back, as a file to fix.
+        for purl in [REQUESTS, GUAVA] {
+            assert_eq!(index.conflicts(purl).len(), 1, "{purl}");
+            assert!(index.unreadable_only(purl), "{purl}");
+        }
+        assert_eq!(index.conflicts(RACK), [""; 0]);
     }
 
     /// ROUTED R-144: what holds back a whole ecosystem is said once, by
