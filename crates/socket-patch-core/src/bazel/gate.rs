@@ -71,11 +71,11 @@ use super::ignore::{CannotEdit, IgnoreLine, BAZELIGNORE};
 use super::inventory::{self, lock_path_refused};
 use super::lanes::{self, refuse, Decision, SurfaceRule, TOKEN_IN_REPO_NAME};
 use super::model::{
-    Actor, Advisory, Anchor, AttestBasis, BazelWorkspace, ClaimOs, Code, FileText, FileView,
-    FlagState, Gap, GateOutcome, Governance, HookKind, Hub, HubId, Interim, LaneId, LaneSpec,
-    LaneTable, Lift, Liveness, LockRef, LockRole, Mode, OwnedWrite, Plan, PlannedWrite, Probe,
-    Reason, Refusal, Ruleset, RulesetDetail, RunKind, RunPolicy, RunRequired, Site, Tier, ToolSpec,
-    WriteClass, LANE_NOT_ENABLED,
+    Actor, Advisory, Anchor, AttestBasis, BazelWorkspace, ClaimOs, Code, DeclSystem, FileText,
+    FileView, FlagState, Gap, GateOutcome, Governance, HookKind, Hub, HubId, Interim, LaneId,
+    LaneSpec, LaneTable, Lift, Liveness, LockRef, LockRole, Mode, OwnedWrite, Plan, PlannedWrite,
+    Probe, Reason, Refusal, Ruleset, RulesetDetail, RunKind, RunPolicy, RunRequired, Site, Tier,
+    ToolSpec, WriteClass, LANE_NOT_ENABLED,
 };
 use super::module_file::{ExtensionProxy, RepoOverride, MODULE_FILE};
 use super::module_lock::MODULE_LOCK;
@@ -1690,11 +1690,16 @@ pub struct Restoring {
 /// the changes, since a lane's restore recomputes it there. The index is
 /// no input of any build and is left out.
 ///
-/// The facts an extension stores are a lane's knowledge and are not asked
-/// here: a restore that returns a package to an index changes a lock that
-/// the extension records as an input, and that record is what is seen.
+/// The facts an extension stores are a lane's knowledge. No lane of this
+/// build says what its restore does to them, so each extension that holds
+/// facts in the lock, and one of whose hubs has a file among the changes,
+/// counts as possibly stale ([`restoring_facts`]): a frozen lock then
+/// fails the build until the refresh, and any other gets the command as
+/// advice. `lanes` is the table whose lanes will answer that exactly;
+/// it is taken here so that no caller changes when one does.
 pub fn restoring(
     cx: &GateCx<'_>,
+    _lanes: &LaneTable,
     releases: &[(String, String)],
     changes: &BTreeMap<String, Option<Vec<u8>>>,
 ) -> Restoring {
@@ -1737,9 +1742,11 @@ pub fn restoring(
     };
     let hubs = ws.hubs.iter().filter(|hub| inventory::may_build(hub));
     let rows = hubs.flat_map(|hub| &hub.derived).filter(concerns);
-    let rows: Vec<DerivedState> = rows.cloned().collect();
+    let mut rows: Vec<DerivedState> = rows.cloned().collect();
+    rows.extend(restoring_facts(ws, changes));
     let edit = derived::Edit {
         writes: &writes,
+        // Asked per hub above, and handed over among the rows.
         facts: None,
         hub: &rows,
         repairs: &repairs,
@@ -1795,6 +1802,97 @@ pub fn restoring(
         outcome,
         advisory,
     }
+}
+
+/// The extensions that make the repositories of `hub`: of the proxy its
+/// declaration is a tag of, an import of, or the first use of. A hub of a
+/// `WORKSPACE` file is made by none, and neither is one a `use_repo_rule`
+/// call makes. `None` for a hub of the module files whose statement the
+/// model does not hold under an extension: which one makes it is then
+/// not known.
+fn made_by(ws: &BazelWorkspace, hub: &Hub) -> Option<Vec<Extension>> {
+    if hub.decl.site.system != DeclSystem::Bzlmod {
+        return Some(Vec::new());
+    }
+    let module = ws.module.as_ref()?;
+    let here = |at| module.site(at) == hub.decl.site;
+    let tags = module.tags.iter().filter(|tag| here(tag.at));
+    let imports = module.imports.iter().filter(|import| here(import.at));
+    let proxies = module.proxies.iter().enumerate();
+    let proxies = proxies.filter(|(_, proxy)| here(proxy.at));
+    let mut found: Vec<usize> = (tags.map(|tag| tag.proxy))
+        .chain(imports.map(|import| import.proxy))
+        .chain(proxies.map(|(at, _)| at))
+        .collect();
+    found.sort_unstable();
+    found.dedup();
+    if found.is_empty() {
+        let by_rule = module.repo_rule_calls.iter().any(|call| here(call.at));
+        return by_rule.then(Vec::new);
+    }
+    let proxies = found.iter().filter_map(|at| module.proxies.get(*at));
+    Some(proxies.map(extension_of).collect())
+}
+
+/// The facts rows of a restoring edit ([`restoring`]): one for each
+/// extension that holds facts in `MODULE.bazel.lock` and one of whose
+/// hubs names a file the edit changes (a lock, a manifest, a config).
+///
+/// What a restore does to a fact is the lane's knowledge, and no lane of
+/// this build says: so the facts count as possibly stale, never as
+/// fresh. A `go_deps` hub is asked the way a forward Go edit is (its one
+/// list changes with any Go edit, and Bazel's refresh after a rollback
+/// does not return the first list); every other extension is taken at
+/// the fact that it holds some. An extension with no fact in the lock
+/// adds no row: most store none at all. A hub whose extension is not
+/// known is held to every extension the root module uses.
+fn restoring_facts(
+    ws: &BazelWorkspace,
+    changes: &BTreeMap<String, Option<Vec<u8>>>,
+) -> Vec<DerivedState> {
+    // A lock that cannot be read is stale as a whole (`derived::stale`).
+    let Some(recorded) = ws.module_lock.extensions() else {
+        return Vec::new();
+    };
+    let every = || -> Vec<Extension> {
+        let proxies = ws.module.as_ref().map(|model| model.proxies.iter());
+        proxies.map_or_else(Vec::new, |proxies| proxies.map(extension_of).collect())
+    };
+    let changed = |lock: &LockRef| {
+        let path = lock.path.as_ref();
+        path.is_some_and(|path| changes.contains_key(path))
+    };
+    let mut rows: Vec<DerivedState> = Vec::new();
+    let hubs = ws.hubs.iter().filter(|hub| inventory::may_build(hub));
+    for hub in hubs.filter(|hub| hub.locks.iter().any(changed)) {
+        for (label, name) in made_by(ws, hub).unwrap_or_else(every) {
+            let Ok(extension) = ExtRef::new(&label, &name) else {
+                continue;
+            };
+            let held = recorded.facts_of(extension.label(), extension.name());
+            let Some(first) = held.first() else {
+                continue;
+            };
+            let row = match hub.ruleset {
+                Ruleset::Gazelle => {
+                    let edit = derived::FactsEdit {
+                        extension,
+                        of: derived::FactsOf::GoDeps,
+                        removed: &[],
+                        added: &[],
+                    };
+                    edit.state(recorded)
+                }
+                _ => Some(DerivedState::Facts {
+                    extension: first.id.raw.clone(),
+                }),
+            };
+            if let Some(row) = row.filter(|row| !rows.contains(row)) {
+                rows.push(row);
+            }
+        }
+    }
+    rows
 }
 
 // ── Obligations 14 to 16 ─────────────────────────────────────────────
@@ -5917,7 +6015,7 @@ mod tests {
             BTreeMap::from([change, (INDEX_PATH.to_string(), None)])
         };
         let ask = |root: &Root, changes: &BTreeMap<String, Option<Vec<u8>>>| {
-            restoring(&root.cx(Mode::Hosted), &[], changes)
+            restoring(&root.cx(Mode::Hosted), &TABLE, &[], changes)
         };
         for (rc, fails) in [("", false), ("common --lockfile_mode=error\n", true)] {
             let files = [(".bazelrc", rc), ("MODULE.bazel.lock", lock.as_str())];
@@ -5959,11 +6057,11 @@ mod tests {
         // is not written: nothing is stale.
         let other = [("rack".to_string(), "3.0.0".to_string())];
         let lock_only = put("pnpm-lock.yaml", b"upstream\n");
-        let found = restoring(&root.cx(Mode::Vendored), &other, &lock_only);
+        let found = restoring(&root.cx(Mode::Vendored), &TABLE, &other, &lock_only);
         assert!(found.advisory.is_none(), "{:?}", found.advisory);
         // The restored gem's own checksum is, and no command recomputes it.
         let own = [("rack".to_string(), "2.2.8".to_string())];
-        let found = restoring(&root.cx(Mode::Vendored), &own, &lock_only);
+        let found = restoring(&root.cx(Mode::Vendored), &TABLE, &own, &lock_only);
         assert!(found.decision.builds_fail());
         assert!(matches!(found.outcome, GateOutcome::Proceed(_)));
         assert_eq!(
@@ -5978,5 +6076,81 @@ mod tests {
         };
         assert_eq!(run.kind, RunKind::Repin);
         assert!(run.command.contains("CARGO_BAZEL_REPIN=1"), "{run:?}");
+
+        // A hub whose manifests could not all be followed: any Cargo
+        // manifest or cargo config counts as an input of the digest.
+        root.ws.hubs[0].derived = vec![digest(derived::ANY_CARGO_INPUT)];
+        for input in ["Cargo.toml", "tools/Cargo.toml", ".cargo/config.toml"] {
+            let found = ask(&root, &put(input, b"restored\n"));
+            assert!(found.decision.builds_fail(), "{input}");
+            let said = found.advisory.expect("the repin is named").1.detail;
+            assert!(said.contains("CARGO_BAZEL_REPIN=1"), "{input}: {said}");
+        }
+        for other in ["Cargo.lock", "config.toml", "docs/Cargo.toml.md"] {
+            let found = ask(&root, &put(other, b"restored\n"));
+            assert!(found.advisory.is_none(), "{other}: {:?}", found.advisory);
+        }
+    }
+
+    /// The facts of an extension are judged for a restoring edit too
+    /// (design 2.10 and 7): the lock of probe L3 holds facts for
+    /// `go_deps` and no entry that records `go.mod`, so only the facts
+    /// say that the restore stales it. Under a frozen lock the build
+    /// fails until the refresh; otherwise the command is advice. An edit
+    /// of a file no hub of the extension names stales no fact.
+    #[test]
+    fn a_restoring_edit_counts_the_facts_of_the_hubs_it_touches() {
+        let fixtures =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/bazel");
+        let vector = |name: &str| {
+            let file = fixtures.join("module_lock").join("facts").join("go-deps");
+            let text = std::fs::read_to_string(file.join(name));
+            text.expect("a vector of probe L3").replace("\r\n", "\n")
+        };
+        let (module, lock) = (
+            vector("root.MODULE.bazel"),
+            vector("bazel-repaired.MODULE.bazel.lock"),
+        );
+        let go_mod = "module example.com/m\n\ngo 1.22\n\nrequire github.com/pkg/errors v0.9.1\n";
+        let restored = BTreeMap::from([
+            ("go.mod".to_string(), Some(go_mod.as_bytes().to_vec())),
+            ("go.sum".to_string(), Some(Vec::new())),
+        ]);
+        for (rc, fails) in [("", false), ("common --lockfile_mode=error\n", true)] {
+            let files = [
+                VERSION,
+                ("MODULE.bazel", module.as_str()),
+                ("MODULE.bazel.lock", lock.as_str()),
+                ("go.mod", go_mod),
+                ("go.sum", ""),
+                (".bazelrc", rc),
+            ];
+            let root = Root {
+                ws: read(&files),
+                view: View::of(&files),
+                index: Index::default(),
+            };
+            let hub = root
+                .ws
+                .hubs
+                .iter()
+                .find(|hub| hub.ruleset == Ruleset::Gazelle);
+            assert!(hub.is_some_and(inventory::may_build), "{:?}", root.ws.hubs);
+            let found = restoring(&root.cx(Mode::Hosted), &TABLE, &[], &restored);
+            let facts = |row: &DerivedState| matches!(row, DerivedState::Facts { extension } if extension.ends_with("%go_deps"));
+            assert!(found.decision.stale.iter().any(facts), "{rc:?}: {found:?}");
+            assert_eq!(found.decision.builds_fail(), fails, "{rc:?}");
+            assert_eq!(found.decision.automatic_restore_allowed(), !fails);
+            let (_, advisory) = found.advisory.expect("the refresh is named");
+            assert!(
+                advisory.detail.contains(remedy::LOCK_REFRESH),
+                "{advisory:?}"
+            );
+            assert_eq!(advisory.detail.contains("Builds fail"), fails, "{rc:?}");
+            // A file no hub names is no input of the extension.
+            let other = BTreeMap::from([("notes.txt".to_string(), Some(b"x\n".to_vec()))]);
+            let quiet = restoring(&root.cx(Mode::Hosted), &TABLE, &[], &other);
+            assert!(quiet.advisory.is_none(), "{rc:?}: {:?}", quiet.advisory);
+        }
     }
 }

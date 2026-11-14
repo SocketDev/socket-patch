@@ -12,7 +12,12 @@ use serde_json::{json, Value};
 use socket_patch_cli::bazel_gate::commands;
 use socket_patch_cli::json_envelope::{Command, Envelope, PatchAction, PatchEvent};
 use socket_patch_core::bazel::codes::Code;
-use socket_patch_core::bazel::owned_index::{Index, IndexEdit, IndexRow, INDEX_PATH};
+use socket_patch_core::bazel::model::HookKind;
+use socket_patch_core::bazel::owned_index::{
+    HookAt, HookRow, Index, IndexEdit, IndexRow, LabelStrategy, SegmentKind, SegmentRow, HOOK_UNIT,
+    INDEX_PATH,
+};
+use socket_patch_core::utils::group_commit::ROOT_JOURNAL_REL;
 use socket_patch_core::vendor::state::VendorArtifact;
 use socket_patch_core::vendor::{VendorEntry, VendorState, WiringRecord};
 use wiremock::MockServer;
@@ -135,6 +140,35 @@ async fn a_proven_pin_is_consumed_and_a_routed_one_says_its_route() {
         lane::LANE.0,
         "the row names its lane: {bazel:#}"
     );
+    assert_eq!(bazel["hooks"], Value::Null, "a lock pin needs no hook");
+
+    // Wiring beyond a lock pin reaches the build through a hook: the
+    // event names the user's file that carries it.
+    index.label_strategy = Some(LabelStrategy::Ancestor);
+    index.hooks = vec![HookRow {
+        file: "MODULE.bazel".to_string(),
+        kind: HookKind::ModuleFile,
+        unit: HOOK_UNIT,
+        created_file: false,
+        added_final_newline: false,
+        inline: false,
+        at: HookAt::End,
+    }];
+    index.segment = vec![SegmentRow {
+        kind: SegmentKind::OverrideRepo,
+        extension: "@aspect_rules_js//npm:extensions.bzl".to_string(),
+        name: "npm".to_string(),
+        repo: "npm__left-pad__1.3.0".to_string(),
+        target: "socket_patch_left_pad".to_string(),
+        uuid: lane::UUID.to_string(),
+        lane: lane::LANE.0.to_string(),
+    }];
+    ws.put(INDEX_PATH, index.render().expect("an index that renders"));
+    let mut env = listing();
+    commands::list(&args, &mut env, None, &lane::TABLE).await;
+    let bazel = &env.events[0].details.as_ref().expect("details")["bazel"];
+    assert_eq!(bazel["hooks"], json!(["MODULE.bazel"]), "{bazel:#}");
+    assert_eq!(bazel["lane"], lane::LANE.0, "{bazel:#}");
 }
 
 /// `list` is the one command of owner decision O16 that is not refused in
@@ -181,6 +215,9 @@ async fn apply_check_fails_on_a_mangled_index_and_not_on_what_no_lane_can_tell()
     let args = ["apply", "--check", "--json", "--offline"];
     let ws = Checkout::new(true);
     ws.record();
+    // The patched copy an in-place restore would put back: a rollback
+    // that keeps the record leaves it as it is.
+    ws.install();
     let mut index = Index::default();
     for uuid in ["0a1b2c3d-0000-4000-8000-0000000000a1", lane::UUID] {
         // First a row of another patch, then one of the record's own.
@@ -223,5 +260,41 @@ async fn apply_check_fails_on_a_mangled_index_and_not_on_what_no_lane_can_tell()
     assert_eq!(code, 1, "{envelope:#}");
     let kept = event_for(&envelope, lane::PURL);
     assert_eq!(kept["details"]["bazel"]["state"], "kept", "{envelope:#}");
+    assert_eq!(kept["action"], "failed", "{envelope:#}");
+    let incomplete = Code::RedirectRevertIncomplete.as_str();
+    assert_eq!(kept["errorCode"], incomplete, "{envelope:#}");
+    // The index is the file to put back, and a checkout is its remedy.
+    let said = kept.to_string();
+    let checkout = format!("git checkout -- {INDEX_PATH}");
+    assert!(said.contains(&checkout), "{kept:#}");
+    assert_same_tree(&before, &snapshot(&ws.root));
+}
+
+/// A commit that an interrupted run left pending at the Bazel root is
+/// drift to `apply --check`: the files its journal covers may be half
+/// replaced, and a run that only reads can neither finish it nor trust
+/// them. The check exits non-zero and writes nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn apply_check_fails_on_a_commit_pending_at_the_root() {
+    let server = MockServer::start().await;
+    let ws = Checkout::new(true);
+    ws.record();
+    let args = ["apply", "--check", "--json", "--offline"];
+    let (code, envelope) = run(&ws.root, &args, &server).await;
+    assert_eq!(code, 0, "nothing is pending yet: {envelope:#}");
+
+    let journal = json!({
+        "version": 1,
+        "files": [{ "path": lane::LOCK, "before": null, "after": null }],
+    });
+    ws.put(ROOT_JOURNAL_REL, format!("{journal:#}\n"));
+    let before = snapshot(&ws.root);
+    let (code, envelope) = run(&ws.root, &args, &server).await;
+    assert_eq!(code, 1, "{envelope:#}");
+    let events = envelope["events"].as_array().cloned().unwrap_or_default();
+    let pending = |event: &&Value| event["errorCode"] == "vendor_commit_pending";
+    let drift = events.iter().find(pending);
+    let drift = drift.unwrap_or_else(|| panic!("the pending commit is drift: {envelope:#}"));
+    assert_eq!(drift["action"], "failed", "{envelope:#}");
     assert_same_tree(&before, &snapshot(&ws.root));
 }

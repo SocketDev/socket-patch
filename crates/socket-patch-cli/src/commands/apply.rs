@@ -612,14 +612,13 @@ async fn run_check(args: &ApplyArgs, manifest_path: &Path) -> i32 {
         .map(|(purl, record)| (purl.clone(), record.uuid.clone()))
         .collect();
     let lanes = &crate::bazel_gate::commands::PRODUCTION;
-    drifts.extend(
-        Box::pin(crate::bazel_gate::commands::check(
-            &args.common,
-            wired,
-            lanes,
-        ))
-        .await,
-    );
+    let bazel_rows = Box::pin(crate::bazel_gate::commands::check(
+        &args.common,
+        wired,
+        lanes,
+    ))
+    .await;
+    drifts.extend(bazel_rows.drifts.iter().cloned());
     drifts.sort();
 
     // A drifting package the project patched itself is one a plain `apply`
@@ -662,6 +661,18 @@ async fn run_check(args: &ApplyArgs, manifest_path: &Path) -> i32 {
         }
     }
     check_warnings.extend(bazel.run_warnings());
+    // Wiring the owned index records that is neither in place nor a
+    // failure of the check (a row for a version the lock no longer
+    // resolves, under a lane whose leftover is inert): said, exit code
+    // unchanged.
+    let row_warnings = bazel_rows.warnings();
+    if !args.common.json && !args.common.silent {
+        for warning in &row_warnings {
+            let prefix = crate::bazel_gate::agent::prefix(&warning.code);
+            eprintln!("{prefix}: {}", warning.detail);
+        }
+    }
+    check_warnings.extend(row_warnings);
     // A local Go patch in sync has no event of its own. Where Bazel has a
     // verdict for it, the verdict needs one to ride on: `already_patched`,
     // the tag of every other patch the check found in place. Under no
@@ -691,6 +702,7 @@ async fn run_check(args: &ApplyArgs, manifest_path: &Path) -> i32 {
             }
             env.warnings.extend(check_warnings);
             bazel.mark(&mut env);
+            bazel_rows.mark(&mut env);
             println!("{}", env.to_pretty_json());
         } else if !args.common.silent {
             println!(
@@ -716,6 +728,7 @@ async fn run_check(args: &ApplyArgs, manifest_path: &Path) -> i32 {
             env.warnings.extend(check_warnings);
             env.mark_partial_failure();
             bazel.mark(&mut env);
+            bazel_rows.mark(&mut env);
             println!("{}", env.to_pretty_json());
         } else {
             // Drift IS the error the exit code signals — it prints even

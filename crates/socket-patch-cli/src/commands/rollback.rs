@@ -1,5 +1,6 @@
 use clap::Args;
 use socket_patch_core::api::blob_fetcher::{fetch_blobs_by_hash, format_fetch_result};
+use socket_patch_core::bazel::model::LaneTable;
 use socket_patch_core::crawlers::{CrawlerOptions, Ecosystem};
 use socket_patch_core::manifest::cleanup_blobs::ArtifactReferences;
 use socket_patch_core::manifest::operations::{
@@ -1148,6 +1149,10 @@ struct RollbackReport<'a> {
     vendor_entries: &'a [(String, socket_patch_core::vendor::VendorEntry)],
     hosted: &'a HostedLegOutcome,
     hosted_pins: &'a [HostedPin],
+    /// Manifest records whose rows of a Bazel root's owned index stand:
+    /// nothing of them was restored (`failed`, with the code of the
+    /// record; kept).
+    bazel_kept: &'a [crate::bazel_gate::commands::Kept],
     /// An unscoped run's contested hosted wiring (`hosted_wiring_contested`).
     contested: Option<&'a str>,
     /// Manifest entries the run dropped (would drop, on a dry run).
@@ -1310,6 +1315,17 @@ fn build_rollback_envelope(report: &RollbackReport<'_>) -> Envelope {
                 .with_error("hosted_wiring_contested", refusal)
                 .with_details(hosted()),
         );
+    }
+
+    // ── Bazel rows ──
+    // A record that stays because what the owned index records for its
+    // patch could not be undone: of no mode's leg, under its own code.
+    for kept in report.bazel_kept {
+        env.record(with_uuid(
+            PatchEvent::new(PatchAction::Failed, kept.purl.clone())
+                .with_error(kept.code, kept.why.clone()),
+            manifest_uuid(&kept.purl),
+        ));
     }
 
     // ── manifest cleanup ──
@@ -1487,6 +1503,19 @@ impl BelowNotes {
 const PROJECTS_NOT_ROLLED_BACK: &str = "projects_not_rolled_back";
 
 pub async fn run(args: RollbackArgs) -> i32 {
+    run_over(args, &crate::bazel_gate::commands::PRODUCTION).await
+}
+
+/// [`run`] over a lane table of the caller's: the production one in the
+/// binary, a table of its own in a test. The whole command is one run of
+/// the Bazel layer, so each Bazel root is read once for all its legs and
+/// a note about it is said once.
+pub async fn run_over(args: RollbackArgs, lanes: &LaneTable) -> i32 {
+    let run = crate::bazel_gate::RunCx::from(&args.common);
+    crate::bazel_gate::in_run(run, Box::pin(run_in(args, lanes))).await
+}
+
+async fn run_in(args: RollbackArgs, lanes: &LaneTable) -> i32 {
     use crate::commands::projects_below::{self, Depth, Work};
     apply_env_toggles(&args.common);
     // Nothing in a tree Bazel owns is rolled back (owner decision O16):
@@ -1521,7 +1550,7 @@ pub async fn run(args: RollbackArgs) -> i32 {
             },
             left: Vec::new(),
         };
-        return run_project(args, notes).await;
+        return run_project(args, notes, lanes).await;
     }
     // What a bare `scan` patched from this directory, a bare `rollback`
     // undoes from it: the project at `--cwd` and the patched project
@@ -1532,7 +1561,7 @@ pub async fn run(args: RollbackArgs) -> i32 {
         below.print_notes();
     }
     if below.projects.is_empty() {
-        return run_project(args, BelowNotes::default()).await;
+        return run_project(args, BelowNotes::default(), lanes).await;
     }
     // `--cwd` is one of the run's directories when it holds something to
     // undo itself.
@@ -1543,7 +1572,7 @@ pub async fn run(args: RollbackArgs) -> i32 {
     // alone, and so does its rollback.
     let scan_looks_below = !here || crate::commands::bare_scan_looks_below(&args.common).await;
     if !args.common.json && scan_looks_below {
-        return roll_back_projects(args, below, here).await;
+        return roll_back_projects(args, below, here, lanes).await;
     }
     // One directory, the one at `--cwd`: `--json` reports on one project
     // directory, and an agent-mode project's run is the one it has always
@@ -1558,7 +1587,7 @@ pub async fn run(args: RollbackArgs) -> i32 {
             unmatched: Unmatched::Ready(below.advice(&args.common, &command, Work::Any, &[])),
             left: Vec::new(),
         };
-        return run_project(args, notes).await;
+        return run_project(args, notes, lanes).await;
     }
     let one = below.projects.len() == 1;
     let why = if args.common.json {
@@ -1579,7 +1608,7 @@ pub async fn run(args: RollbackArgs) -> i32 {
         left: vec![(PROJECTS_NOT_ROLLED_BACK.to_string(), detail)],
         ..BelowNotes::default()
     };
-    run_project(args, notes).await
+    run_project(args, notes, lanes).await
 }
 
 /// Roll back each patched project directory as if it were `--cwd`, under
@@ -1591,6 +1620,7 @@ async fn roll_back_projects(
     args: RollbackArgs,
     below: crate::commands::projects_below::Below,
     here: bool,
+    lanes: &LaneTable,
 ) -> i32 {
     use crate::commands::projects_below::{heading, CWD_NAME};
     // One question for the whole run, naming every directory it reaches;
@@ -1634,7 +1664,7 @@ async fn roll_back_projects(
             common,
             preserve_state: args.preserve_state,
         };
-        let project_code = Box::pin(run_project(child, BelowNotes::default())).await;
+        let project_code = Box::pin(run_project(child, BelowNotes::default(), lanes)).await;
         if project_code != 0 {
             failed.push(shown);
         }
@@ -1662,7 +1692,7 @@ async fn roll_back_projects(
 
 /// Roll back the project at `--cwd`. `below` is what the run says about
 /// the patched project directories below it (see [`run`]).
-async fn run_project(args: RollbackArgs, below: BelowNotes) -> i32 {
+async fn run_project(args: RollbackArgs, below: BelowNotes, lanes: &LaneTable) -> i32 {
     apply_env_toggles(&args.common);
 
     // Classify targets up front: the glob validation is a pre-network
@@ -2290,6 +2320,37 @@ async fn run_project(args: RollbackArgs, below: BelowNotes) -> i32 {
         }
     }
 
+    // ── Bazel rows: the plan ────────────────────────────────────────────
+    // What the owned index of a Bazel root records for the manifest
+    // records in scope, whatever lane wrote it, is undone with them
+    // (`--preserve-state` included: the wiring is derived state). It is
+    // planned before anything is restored: a record whose rows cannot all
+    // be undone is left alone as a whole, so its installed copy stays
+    // patched like the build, and it fails the run and stays in the
+    // manifest.
+    let in_scope: Vec<HostedPin> = hosted_pins
+        .iter()
+        .filter(|pin| hosted_scope.contains(&pin.purl))
+        .cloned()
+        .collect();
+    let row_records: Vec<(String, String)> = manifest_scope
+        .iter()
+        .filter_map(|purl| Some((purl.clone(), manifest.patches.get(purl)?.uuid.clone())))
+        .collect();
+    let bazel_rows = crate::bazel_gate::commands::RowsLeg::plan(
+        &args.common,
+        &row_records,
+        &in_scope,
+        true,
+        lanes,
+    )
+    .await;
+    let in_place: HashSet<String> = manifest_scope
+        .iter()
+        .filter(|purl| !bazel_rows.holds(purl))
+        .cloned()
+        .collect();
+
     // ── agent leg (in-place restore) ────────────────────────────────────
     // The "No patches in this project" line is for an unscoped run with
     // nothing to do anywhere: a hosted-/vendored-only project has work in
@@ -2297,7 +2358,7 @@ async fn run_project(args: RollbackArgs, below: BelowNotes) -> i32 {
     // one whose scope `--ecosystems` filtered out entirely (announced
     // above), is not told its manifest is empty either.
     let selection = InnerSelection::Scope {
-        purls: &manifest_scope,
+        purls: &in_place,
         announce_empty: !scoped
             && !manifest_missing
             && !has_work
@@ -2387,43 +2448,37 @@ async fn run_project(args: RollbackArgs, below: BelowNotes) -> i32 {
             }
 
             // ── hosted leg ───────────────────────────────────────────────
-            let in_scope: Vec<HostedPin> = hosted_pins
-                .iter()
-                .filter(|pin| hosted_scope.contains(&pin.purl))
-                .cloned()
-                .collect();
-            let mut hosted_leg = run_hosted_leg(&args.common, &in_scope).await;
-            // What the owned index of a Bazel root records for the manifest
-            // records in scope, whatever lane wrote it, is undone with
-            // them (`--preserve-state` included: the wiring is derived
-            // state). A hosted pin's rows went with its pin and a vendored
-            // entry's go with its entry; a record whose in-place restore
-            // failed, or was never started, keeps its rows. A record whose
-            // rows stand fails the run and stays in the manifest.
-            let own_rows = |(purl, uuid): &(String, String)| {
-                !aborted
-                    && !in_scope.iter().any(|pin| pin.uuid == *uuid)
-                    && !vendored_excluded.contains(purl)
-                    && !results.iter().any(|r| !r.success && r.package_key == *purl)
+            let mut hosted_leg = run_hosted_leg(&args.common, &in_scope, lanes).await;
+            // ── Bazel rows: the undo ─────────────────────────────────────
+            // The rows of the records whose own leg undid them go now. A
+            // hosted pin's rows went with its pin and a vendored entry's
+            // go with its entry; a record whose in-place restore failed,
+            // or was never started, keeps its rows. A record whose rows
+            // stand (also one whose hosted pin was not restored while the
+            // index records a row of its patch) fails the run and stays
+            // in the manifest.
+            let left = |purl: &&String| {
+                aborted
+                    || vendored_excluded.contains(*purl)
+                    || results
+                        .iter()
+                        .any(|r| !r.success && r.package_key == **purl)
             };
-            let row_records: Vec<(String, String)> = manifest_scope
-                .iter()
-                .filter_map(|purl| Some((purl.clone(), manifest.patches.get(purl)?.uuid.clone())))
-                .filter(own_rows)
-                .collect();
-            let lanes = &crate::bazel_gate::commands::PRODUCTION;
-            let bazel_rows =
-                crate::bazel_gate::commands::undo_rows(&args.common, &row_records, true, lanes)
-                    .await;
-            hosted_leg.failed.extend(bazel_rows.kept.iter().cloned());
+            let left: Vec<String> = manifest_scope.iter().filter(left).cloned().collect();
+            let bazel_rows = bazel_rows
+                .undo(&args.common, &left, &hosted_leg.reverted)
+                .await;
+            let said = crate::bazel_gate::commands::said(&args.common);
             if args.common.json {
                 hosted_leg
                     .warnings
                     .extend(bazel_rows.warnings.iter().cloned());
+                hosted_leg.warnings.extend(said);
             } else {
                 // Errors print even under --silent: this drives exit 1.
-                for (_, why) in &bazel_rows.kept {
-                    eprintln!("Error: {}", crate::ui::sentence_case(why));
+                // (What the undo leaves to run was said as it was found.)
+                for kept in &bazel_rows.kept {
+                    eprintln!("Error: {}", crate::ui::sentence_case(&kept.why));
                 }
             }
             // An unscoped rollback promises to unwind EVERY hosted patch:
@@ -2439,7 +2494,7 @@ async fn run_project(args: RollbackArgs, below: BelowNotes) -> i32 {
                     eprintln!("Error: {}", crate::ui::sentence_case(refusal));
                 }
             }
-            if hosted_leg.failed.is_empty() && contested.is_none() {
+            if hosted_leg.failed.is_empty() && bazel_rows.kept.is_empty() && contested.is_none() {
                 if let Some(warning) = retire_legacy_redirect_ledger(&args.common).await {
                     run_warnings.push(warning);
                 }
@@ -2706,6 +2761,7 @@ async fn run_project(args: RollbackArgs, below: BelowNotes) -> i32 {
                 && vendored_leg.kept.is_empty()
                 && vendored_leg.failed.is_empty()
                 && hosted_leg.failed.is_empty()
+                && bazel_rows.kept.is_empty()
                 && contested.is_none()
                 && !vendor_corrupt
                 && manifest_write_failed.is_none()
@@ -2761,6 +2817,7 @@ async fn run_project(args: RollbackArgs, below: BelowNotes) -> i32 {
                     vendor_entries: &vendor_entries,
                     hosted: &hosted_leg,
                     hosted_pins: &hosted_pins,
+                    bazel_kept: &bazel_rows.kept,
                     contested: contested.as_deref(),
                     removed: &removed,
                     gc,
@@ -6651,6 +6708,7 @@ mod tests {
             vendor_entries: &[],
             hosted,
             hosted_pins: &[],
+            bazel_kept: &[],
             contested: None,
             removed: &[],
             gc: None,

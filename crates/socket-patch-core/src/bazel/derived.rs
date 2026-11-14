@@ -116,6 +116,27 @@ impl<'a> ExtRef<'a> {
     }
 }
 
+/// The `input` of a [`DerivedState::CrateLockDigest`] whose hub names a
+/// manifest or a cargo config that cannot be followed to a file (a
+/// computed `manifests` list, a member of another repository, a computed
+/// `cargo_config`). Which files the digest covers is then not known, so
+/// every Cargo manifest and every cargo config under the root counts as
+/// one: an edit of any of them may fail the build until a repin. No file
+/// has this path, so the row matches by leaf name alone
+/// ([`cargo_input`]).
+pub const ANY_CARGO_INPUT: &str = "*";
+
+/// Whether the root-relative `path` is a Cargo manifest or a cargo
+/// config by its name: `Cargo.toml`, or `config` or `config.toml` in a
+/// directory `.cargo`.
+fn cargo_input(path: &str) -> bool {
+    let mut levels = path.rsplit('/');
+    matches!(
+        (levels.next(), levels.next()),
+        (Some("Cargo.toml"), _) | (Some("config" | "config.toml"), Some(".cargo"))
+    )
+}
+
 /// Which lock check a [`DerivedState::LockCheck`] is. What its own
 /// regeneration does to the pin decides the remedy (remedy matrix 1.2,
 /// rows 5 to 8 and 14).
@@ -204,7 +225,8 @@ pub enum DerivedState {
     /// Declared by a recognizer: `input` is a manifest or the
     /// `cargo_config` of a crate_universe hub with a `lockfile`. The build
     /// then fails with `Digests do not match` until a repin, under every
-    /// lockfile mode.
+    /// lockfile mode. An `input` of [`ANY_CARGO_INPUT`] stands for the
+    /// inputs a recognizer could not follow to a file.
     CrateLockDigest {
         lockfile: String,
         input: String,
@@ -303,6 +325,15 @@ impl DerivedState {
             }
             Self::ResolvedHash { file } => Some((file, file)),
             _ => None,
+        }
+    }
+
+    /// Whether an edit of the root-relative file `path` stales a declared
+    /// row whose input is `input` ([`Self::declared`]).
+    fn staled_by(&self, input: &str, path: &str) -> bool {
+        match self {
+            Self::CrateLockDigest { .. } if input == ANY_CARGO_INPUT => cargo_input(path),
+            _ => path == input,
         }
     }
 
@@ -516,7 +547,11 @@ impl FactsEdit<'_> {
         })
     }
 
-    fn state(&self, recorded: &Extensions) -> Option<DerivedState> {
+    /// The facts row the edit leaves stale in a lock that records
+    /// `recorded`, if any: what [`stale`] adds for [`Edit::facts`], and
+    /// what a caller that asks about several extensions puts among
+    /// [`Edit::hub`].
+    pub fn state(&self, recorded: &Extensions) -> Option<DerivedState> {
         let ExtRef { label, name } = self.extension;
         let found = recorded.facts_of(label, name);
         let Some(first) = found.first() else {
@@ -554,7 +589,10 @@ pub struct Edit<'a> {
     /// `uv_lock` hub: the pip facts in such a lock belong to rules_python's
     /// own hubs, and the lock is byte-identical after the rewrite.
     pub facts: Option<FactsEdit<'a>>,
-    /// The rows of `Hub::derived` that concern the package.
+    /// The rows of `Hub::derived` that concern the package. A facts row
+    /// here ([`DerivedState::Facts`], [`DerivedState::UnknownFactsShape`])
+    /// is one the caller judged possibly stale itself ([`FactsEdit::state`]):
+    /// it counts wherever the lock can be read.
     pub hub: &'a [DerivedState],
     /// The files whose derived values the same transaction recomputes. A
     /// repairable row whose value lives in none of them stays stale.
@@ -657,6 +695,13 @@ pub fn stale(lock: &ModuleLock, edit: &Edit<'_>) -> Vec<DerivedState> {
             if let Some(state) = edit.facts.and_then(|facts| facts.state(recorded)) {
                 push(state);
             }
+            // A facts row among the hub's rows is a verdict its caller
+            // already reached about an extension's facts (a restoring
+            // edit asks per hub, `gate::restoring`). It names no file to
+            // match, and counts as it stands.
+            for judged in edit.hub.iter().filter(|row| row.is_facts()) {
+                push(judged.clone());
+            }
         }
     }
     for declared in edit.hub {
@@ -664,7 +709,8 @@ pub fn stale(lock: &ModuleLock, edit: &Edit<'_>) -> Vec<DerivedState> {
             continue;
         };
         let repaired = declared.repairable() && edit.repairs.contains(&holder);
-        if !repaired && edit.writes.iter().any(|write| write.path == input) {
+        let staled = |write: &Write<'_>| declared.staled_by(input, write.path);
+        if !repaired && edit.writes.iter().any(staled) {
             push(declared.clone());
         }
     }

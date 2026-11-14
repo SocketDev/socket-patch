@@ -1665,6 +1665,7 @@ async fn run_redirect_selected_untracked(
     skipped.extend(bazel.skipped(&done, &candidates));
     let takeover::Finished {
         warnings: takeover_pre_warnings,
+        refused: takeover_refused,
         migrated: takeover_migrated,
         files: takeover_files,
     } = takeover.finish(common.dry_run, &mut vendor_state, &done.rewrite.warnings);
@@ -2112,6 +2113,7 @@ async fn run_redirect_selected_untracked(
         let mut env = scan_result.take().unwrap_or_else(|| scan_envelope(common));
         record_hosted_events(&mut env, &confirmed, &unconfirmed, &skipped, common.dry_run);
         bazel.annotate(&mut env, &done);
+        crate::bazel_gate::commands::annotate_refused(&mut env, &takeover_refused);
         env.set_extra("redirect", redirect_block(done.rewritten.clone()));
         env.warnings.extend(warnings);
         // Taking the lock may have finished an interrupted run's commit

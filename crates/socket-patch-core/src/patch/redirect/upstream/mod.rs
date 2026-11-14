@@ -1156,13 +1156,16 @@ async fn restore(
             let Some((files, why)) = stuck else { continue };
             let code = crate::bazel::codes::Code::RedirectRevertIncomplete.as_str();
             let files = files.join("`, `");
+            // The remedy of what stands in the way: a checkout for a file
+            // that drifted, another release for a row this one cannot undo.
+            let remedy = undo.as_ref().and_then(|undo| undo.remedy(&pin.uuid));
             incomplete.push((
                 code,
                 format!(
-                    "the pin of {} was not undone, and nothing of it was changed: `{files}` no \
-                     longer holds what socket-patch recorded for it ({why}); restore the file \
-                     from version control (`git checkout -- <file>`), then run the command again",
-                    pin.purl
+                    "the pin of {} was not undone, and nothing of it was changed: what \
+                     socket-patch recorded for it in `{files}` could not be put back ({why}); {}",
+                    pin.purl,
+                    remedy.unwrap_or_default()
                 ),
             ));
             let why = format!(

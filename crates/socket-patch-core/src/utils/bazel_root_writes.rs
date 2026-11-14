@@ -1466,17 +1466,31 @@ pub async fn after_removal(project_root: &Path, tree: SocketTree, dry_run: bool)
     run_blocking(move || release(&project, tree).1).await
 }
 
+/// How far [`repair_lines`] goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Repair {
+    /// Adds the line of a tree that has none and takes out a recorded
+    /// line whose tree is gone.
+    All,
+    /// Adds a missing line and removes nothing: `repair --download-only`
+    /// skips every cleanup, and a line that is left is inert.
+    AddOnly,
+    /// Decides the same about a missing line and writes nothing.
+    DryRun,
+}
+
 /// `repair`: brings the lines of the project at `project_root` back in
 /// step with its trees. A tree that is there and that no line hides gets
 /// its line, after the label scan, as a copy that is rebuilt does
 /// ([`before_tree`]): an older release left such trees with no line. A
-/// recorded line whose tree a later run removed goes ([`after_removal`]).
+/// recorded line whose tree a later run removed goes ([`after_removal`]),
+/// unless `how` keeps the run from removing anything ([`Repair`]).
 /// Returns what the run reports: a line that was added, one that is
 /// needed and could not be written, a recorded line that could not be
-/// taken out. A dry run decides the same about a missing line and writes
-/// nothing.
-pub async fn repair_lines(project_root: &Path, dry_run: bool) -> Vec<Advisory> {
+/// taken out.
+pub async fn repair_lines(project_root: &Path, how: Repair) -> Vec<Advisory> {
     let project = project_root.to_path_buf();
+    let dry_run = how == Repair::DryRun;
     run_blocking(move || {
         let mut report = Vec::new();
         for tree in [SocketTree::GoPatches, SocketTree::Vendor] {
@@ -1486,7 +1500,7 @@ pub async fn repair_lines(project_root: &Path, dry_run: bool) -> Vec<Advisory> {
                 true => {
                     report.extend(guard(&project, tree, &dir, false, dry_run).unwrap_or_default())
                 }
-                false if dry_run => {}
+                false if how != Repair::All => {}
                 false => report.extend(release(&project, tree).1),
             }
         }
@@ -1945,22 +1959,30 @@ mod tests {
             b"module m\n",
         );
         let with_tree = repo.tree();
-        let said = repair_lines(&repo.top, true).await;
+        let said = repair_lines(&repo.top, Repair::DryRun).await;
         assert_eq!(said.len(), 1, "{said:?}");
         assert_eq!(said[0].code, Code::WorkspaceIgnoreLineAdded);
         assert_eq!(repo.tree(), with_tree, "a dry run writes nothing");
 
-        let said = repair_lines(&repo.top, false).await;
+        // A run that removes nothing still adds the line a tree needs.
+        let said = repair_lines(&repo.top, Repair::AddOnly).await;
         assert_eq!(said.len(), 1, "{said:?}");
         assert_eq!(said[0].code, Code::WorkspaceIgnoreLineAdded);
         assert_eq!(repo.rows(), [".socket/go-patches"]);
         let wired = repo.tree();
         // In step: a second repair has nothing to do.
-        assert_eq!(repair_lines(&repo.top, false).await, Vec::new());
+        assert_eq!(repair_lines(&repo.top, Repair::All).await, Vec::new());
         assert_eq!(repo.tree(), wired);
 
         std::fs::remove_dir_all(repo.top.join(".socket/go-patches")).expect("remove the tree");
-        assert_eq!(repair_lines(&repo.top, false).await, Vec::new());
+        let gone = repo.tree();
+        // The line of a tree that is gone stays where nothing is removed
+        // and where nothing is written, and goes with a full repair.
+        for kept in [Repair::AddOnly, Repair::DryRun] {
+            assert_eq!(repair_lines(&repo.top, kept).await, Vec::new());
+            assert_eq!(repo.tree(), gone, "{kept:?}");
+        }
+        assert_eq!(repair_lines(&repo.top, Repair::All).await, Vec::new());
         assert_eq!(repo.tree(), before, "the line and its row are gone");
 
         let plain = Repo::new();
@@ -1969,7 +1991,7 @@ mod tests {
             b"module m\n",
         );
         let found = plain.tree();
-        assert_eq!(repair_lines(&plain.top, false).await, Vec::new());
+        assert_eq!(repair_lines(&plain.top, Repair::All).await, Vec::new());
         assert_eq!(plain.tree(), found);
     }
 

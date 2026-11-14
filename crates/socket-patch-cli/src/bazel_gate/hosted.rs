@@ -53,8 +53,8 @@ use socket_patch_core::bazel::govern::{BAZEL_ROOT_OUTSIDE_REPOSITORY, WORKSPACE_
 use socket_patch_core::bazel::inventory;
 use socket_patch_core::bazel::lanes::{self, Proofs};
 use socket_patch_core::bazel::model::{
-    ClaimOs, Gap, GateOutcome, Governance, Hub, LaneTable, Lift, LockRole, Mode, Probe, Reason,
-    Refusal, RunPolicy,
+    BazelWorkspace, ClaimOs, Gap, GateOutcome, Governance, Hub, LaneTable, Lift, LockRole, Mode,
+    Probe, Reason, Refusal, RunPolicy,
 };
 use socket_patch_core::bazel::owned_index::INDEX_PATH;
 use socket_patch_core::crawlers::types::Ecosystem;
@@ -226,6 +226,42 @@ impl Root for Read {
     }
 }
 
+/// The hub that builds `ecosystem` under `ws`, as an event names it:
+/// `{ ruleset, lock }`, each where it is known.
+pub(super) fn hub_details(ws: Option<&BazelWorkspace>, ecosystem: Ecosystem) -> Value {
+    let mut bazel = json!({});
+    let builds = |hub: &&Hub| hub.ecosystem == ecosystem && inventory::may_build(hub);
+    let building = ws.and_then(|ws| ws.hubs.iter().find(builds));
+    if let Some(hub) = building {
+        bazel["ruleset"] = json!(hub.ruleset.name());
+        let lock = hub.locks.iter().find(|l| l.role == LockRole::PackageLock);
+        if let Some(lock) = lock {
+            bazel["lock"] = json!(lock.path.as_deref().unwrap_or(&lock.label));
+        }
+    }
+    bazel
+}
+
+/// `details` of the event of a patch a gate refused: `token` and `lift`
+/// beside `bazel = { ruleset, lock, state: "refused", lane }`. The one
+/// mapping of a refusal, for every seam that reports one (the hosted
+/// rewrite, a takeover the target mode's gate refuses); no token is
+/// branched on.
+pub(super) fn refused_details(
+    ws: Option<&BazelWorkspace>,
+    ecosystem: Ecosystem,
+    token: &str,
+    lift: &Lift,
+) -> Value {
+    let mut bazel = hub_details(ws, ecosystem);
+    bazel["state"] = json!("refused");
+    let lift = lift.details();
+    if let Some(lane) = lift.get("lane") {
+        bazel["lane"] = lane.clone();
+    }
+    json!({ "token": token, "lift": lift, "bazel": bazel })
+}
+
 /// The hosted seam of one run over the project at `--cwd`.
 pub struct Hosted {
     loader: Arc<Loader>,
@@ -385,22 +421,13 @@ impl Hosted {
     /// for a refusal `token` and `lift` beside it. The mapping is the one
     /// every seam uses, and no token is branched on.
     fn details(&self, patch: &Decided) -> Value {
-        let mut bazel = json!({});
         let loaded = self.last();
         let nearest = loaded.as_ref().and_then(|loaded| loaded.roots().next());
         let ws = nearest.and_then(|root| root.model().ok());
-        let builds = |hub: &&Hub| hub.ecosystem == patch.ecosystem && inventory::may_build(hub);
-        let building = ws.and_then(|ws| ws.hubs.iter().find(builds));
-        if let Some(hub) = building {
-            bazel["ruleset"] = json!(hub.ruleset.name());
-            let lock = hub.locks.iter().find(|l| l.role == LockRole::PackageLock);
-            if let Some(lock) = lock {
-                bazel["lock"] = json!(lock.path.as_deref().unwrap_or(&lock.label));
-            }
-        }
         let refused = match &patch.verdict {
             Verdict::Refused(refused) => refused,
             Verdict::Confirmed => {
+                let mut bazel = hub_details(ws, patch.ecosystem);
                 let (plan, pending) = match &patch.outcome {
                     GateOutcome::Proceed(plan) => (Some(plan), false),
                     GateOutcome::ProceedAfter(plan, run) => (Some(plan), run.gates_vex),
@@ -414,12 +441,7 @@ impl Hosted {
                 return json!({ "bazel": bazel });
             }
         };
-        bazel["state"] = json!("refused");
-        let lift = refused.lift.details();
-        if let Some(lane) = lift.get("lane") {
-            bazel["lane"] = lane.clone();
-        }
-        json!({ "token": refused.token, "lift": lift, "bazel": bazel })
+        refused_details(ws, patch.ecosystem, refused.token, &refused.lift)
     }
 
     /// Adds `details.bazel` (and `details.token` and `details.lift` of a

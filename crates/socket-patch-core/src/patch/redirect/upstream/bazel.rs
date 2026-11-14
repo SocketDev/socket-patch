@@ -49,8 +49,9 @@ use std::collections::BTreeMap;
 use super::super::bazel::Staged;
 use crate::bazel::exec::{self, Kept, Scope, Selector, Txn};
 use crate::bazel::ignore::BAZELIGNORE;
+use crate::bazel::inventory;
 use crate::bazel::lanes;
-use crate::bazel::model::{BazelWorkspace, FileView, Index, LaneTable, RestoreOutcome};
+use crate::bazel::model::{BazelWorkspace, FileView, Index, LaneTable, Mode, RestoreOutcome};
 use crate::bazel::owned_index::INDEX_PATH;
 
 /// The Bazel root an undo works on: its model, its files as they are now,
@@ -78,9 +79,16 @@ pub enum Undone {
     /// paths the undo changes, in the order a commit lands them.
     Restored { files: Vec<String> },
     /// A row could not be undone, so none was: the patch is as it was.
-    /// `files` are the files the kept rows name, and `why` says what
-    /// stands in the way of each.
-    Incomplete { files: Vec<String>, why: String },
+    /// `files` are the files the kept rows name, `why` says what stands
+    /// in the way of each, and `remedy` what lifts it: a checkout for a
+    /// file that drifted or a record nobody can rely on, another release
+    /// for a row this one has no undo for. Never one sentence for every
+    /// cause: a checkout does nothing for a row no lane here restores.
+    Incomplete {
+        files: Vec<String>,
+        why: String,
+        remedy: String,
+    },
 }
 
 /// One patch of an [`Undo`].
@@ -90,6 +98,10 @@ pub struct UndonePatch {
     /// The root-relative files the patch's `pins` rows named before the
     /// undo: the files no native restorer may open for this patch.
     pub recorded: Vec<String>,
+    /// The lanes that wrote the rows the index held for the patch before
+    /// the undo, of every row list (`inventory::lanes_of`): what the mode
+    /// of its report is read from (`lanes::undo_mode`).
+    pub lanes: Vec<String>,
     pub state: Undone,
 }
 
@@ -123,9 +135,29 @@ impl Undo {
     /// reason, when its undo is incomplete.
     pub fn incomplete(&self, uuid: &str) -> Option<(&[String], &str)> {
         match &self.of(uuid)?.state {
-            Undone::Incomplete { files, why } => Some((files, why)),
+            Undone::Incomplete { files, why, .. } => Some((files, why)),
             Undone::NotRecorded | Undone::Restored { .. } => None,
         }
+    }
+
+    /// What lifts an incomplete undo of the patch ([`Undone::Incomplete`]).
+    pub fn remedy(&self, uuid: &str) -> Option<&str> {
+        match &self.of(uuid)?.state {
+            Undone::Incomplete { remedy, .. } => Some(remedy),
+            Undone::NotRecorded | Undone::Restored { .. } => None,
+        }
+    }
+
+    /// The mode the undo of the patch reports in: the mode of the lanes
+    /// that wrote its rows, as `lanes` knows them (`lanes::undo_mode`).
+    pub fn mode(&self, uuid: &str, lanes: &LaneTable) -> Mode {
+        let wrote = self.of(uuid).map(|patch| patch.lanes.as_slice());
+        let wrote: Vec<&str> = wrote
+            .unwrap_or_default()
+            .iter()
+            .map(String::as_str)
+            .collect();
+        lanes::undo_mode(lanes, &wrote)
     }
 
     /// The root-relative files the index recorded for the patch.
@@ -181,12 +213,15 @@ pub fn revert_over(
             Some(fault) => Undone::Incomplete {
                 files: vec![INDEX_PATH.to_string()],
                 why: fault.to_string(),
+                remedy: checkout(INDEX_PATH),
             },
             None => Undone::NotRecorded,
         };
+        let (wrote, _) = inventory::lanes_of(&index, uuid);
         patches.push(UndonePatch {
             uuid: uuid.to_string(),
             recorded,
+            lanes: wrote.into_iter().map(str::to_string).collect(),
             state,
         });
     }
@@ -209,8 +244,8 @@ pub fn revert_over(
                     undone = true;
                 }
                 Err(kept) => {
-                    let (files, why) = kept_rows(&kept);
-                    patch.state = Undone::Incomplete { files, why };
+                    let (files, why, remedy) = kept_rows(&kept);
+                    patch.state = Undone::Incomplete { files, why, remedy };
                     left.push(at);
                 }
             }
@@ -295,29 +330,48 @@ pub(crate) fn revert_one<'a>(
     Ok(Some((txn, left, reverted.written)))
 }
 
-/// The files the kept rows of one patch name, each once, and one sentence
-/// per row that says what stands in its way.
+/// What lifts an undo that a file in another state than its record
+/// stands in the way of: the file as version control holds it.
+pub fn checkout(file: &str) -> String {
+    format!(
+        "restore `{file}` from version control (`git checkout -- {file}`), then run the command \
+         again"
+    )
+}
+
+/// What lifts an undo of a row this build has no undo for.
+const OTHER_RELEASE: &str = "run the command with the socket-patch release that wrote the row, \
+                             or a later one whose lane undoes it";
+
+/// The files the kept rows of one patch name, each once, one sentence per
+/// row that says what stands in its way, and what lifts them: a checkout
+/// of each file that drifted or cannot be relied on, and another release
+/// for a row this one cannot undo. A row that would have gone back, and
+/// stays only because another of its patch does, asks for nothing.
 ///
 /// The last arm takes every entry this file does not name: a kept entry
 /// that a later class handler adds is reported under the index, in the
 /// executor's own words, and this seam compiles unchanged.
-pub(crate) fn kept_rows(kept: &[Kept]) -> (Vec<String>, String) {
+pub(crate) fn kept_rows(kept: &[Kept]) -> (Vec<String>, String, String) {
     let mut files: Vec<String> = Vec::new();
     let mut reasons: Vec<String> = Vec::new();
+    let mut remedies: Vec<String> = Vec::new();
     for entry in kept {
-        let (file, why) = match entry {
-            Kept::Index(fault) => (INDEX_PATH, fault.to_string()),
+        let release = || Some(OTHER_RELEASE.to_string());
+        let (file, why, remedy) = match entry {
+            Kept::Index(fault) => (INDEX_PATH, fault.to_string(), Some(checkout(INDEX_PATH))),
             Kept::Row(invalid) => (
                 INDEX_PATH,
                 format!("{INDEX_PATH} cannot record this: {invalid}"),
+                Some(checkout(INDEX_PATH)),
             ),
             Kept::Pin { file, outcome, .. } => {
-                let why = match outcome {
-                    RestoreOutcome::Drifted(why) => why.clone(),
-                    RestoreOutcome::Refused(refusal) => refusal.detail.clone(),
-                    RestoreOutcome::Restored => String::new(),
+                let (why, remedy) = match outcome {
+                    RestoreOutcome::Drifted(why) => (why.clone(), Some(checkout(file))),
+                    RestoreOutcome::Refused(refusal) => (refusal.detail.clone(), release()),
+                    RestoreOutcome::Restored => (String::new(), None),
                 };
-                (file.as_str(), why)
+                (file.as_str(), why, remedy)
             }
             Kept::PinOfUnhandled { file, class, .. } => (
                 file.as_str(),
@@ -325,14 +379,20 @@ pub(crate) fn kept_rows(kept: &[Kept]) -> (Vec<String>, String) {
                     "the patch also has a row of class `{}`, which this socket-patch cannot undo",
                     class.as_str()
                 ),
+                release(),
             ),
             Kept::Line { line, why } => (
                 BAZELIGNORE,
                 format!("the line `{line}` could not be taken out ({why:?})"),
+                Some(format!(
+                    "make `{BAZELIGNORE}` a regular file socket-patch can write, then run the \
+                     command again"
+                )),
             ),
             other => (
                 INDEX_PATH,
                 format!("rows this socket-patch cannot undo ({other:?})"),
+                release(),
             ),
         };
         if !files.iter().any(|known| known == file) {
@@ -341,8 +401,11 @@ pub(crate) fn kept_rows(kept: &[Kept]) -> (Vec<String>, String) {
         if !why.is_empty() {
             reasons.push(format!("`{file}`: {why}"));
         }
+        if let Some(remedy) = remedy.filter(|remedy| !remedies.contains(remedy)) {
+            remedies.push(remedy);
+        }
     }
-    (files, reasons.join("; "))
+    (files, reasons.join("; "), remedies.join("; "))
 }
 
 /// A Bazel root with one index-backed pin, for the tests of the restore
@@ -554,11 +617,27 @@ mod tests {
             file: LOCK.to_string(),
             outcome: RestoreOutcome::Drifted("the value moved".to_string()),
         };
-        let (files, why) = kept_rows(&[pin, class]);
+        let (files, why, remedy) = kept_rows(&[pin.clone(), class.clone()]);
         assert_eq!(files, [LOCK, INDEX_PATH]);
         assert!(
             why.contains("the value moved") && why.contains("Hook") && why.contains("rows: 2"),
             "{why}"
         );
+        // Each cause has its own remedy: the file that drifted is checked
+        // out, and a row this build cannot undo waits for a release that
+        // can. A checkout is never named for the second.
+        assert_eq!(kept_rows(&[pin]).2, checkout(LOCK));
+        let other_release = kept_rows(&[class]).2;
+        assert!(other_release.contains("release"), "{other_release}");
+        assert!(!other_release.contains("git checkout"), "{other_release}");
+        assert_eq!(remedy, format!("{}; {other_release}", checkout(LOCK)));
+        let refused = Kept::Pin {
+            uuid: UUID.to_string(),
+            file: LOCK.to_string(),
+            outcome: RestoreOutcome::Refused(crate::bazel::model::Refusal::lane_not_enabled(
+                crate::bazel::model::LaneId::UNNAMED,
+            )),
+        };
+        assert_eq!(kept_rows(&[refused]).2, other_release);
     }
 }

@@ -1,5 +1,6 @@
 use clap::Args;
 use socket_patch_core::api::blob_fetcher::{DIFF_ARCHIVE, PACKAGE_ARCHIVE};
+use socket_patch_core::bazel::model::LaneTable;
 use socket_patch_core::ledgers::hosted_pins_matching;
 use socket_patch_core::manifest::cleanup_blobs::{
     format_bytes, format_cleanup_result_for, ArtifactReferences,
@@ -315,6 +316,19 @@ pub struct RemoveArgs {
 }
 
 pub async fn run(args: RemoveArgs) -> i32 {
+    run_over(args, &crate::bazel_gate::commands::PRODUCTION).await
+}
+
+/// [`run`] over a lane table of the caller's: the production one in the
+/// binary, a table of its own in a test. The whole command is one run of
+/// the Bazel layer, so each Bazel root is read once for all its legs and
+/// a note about it is said once.
+pub async fn run_over(args: RemoveArgs, lanes: &LaneTable) -> i32 {
+    let run = crate::bazel_gate::RunCx::from(&args.common);
+    crate::bazel_gate::in_run(run, Box::pin(run_in(args, lanes))).await
+}
+
+async fn run_in(args: RemoveArgs, lanes: &LaneTable) -> i32 {
     apply_env_toggles(&args.common);
     // Nothing in a tree Bazel owns is removed (owner decision O16): refused
     // before a manifest, a ledger or a lockfile is read.
@@ -584,7 +598,8 @@ pub async fn run(args: RemoveArgs) -> i32 {
         // per-purl exit path (restoring the upstream entry IS the removal).
         let hosted_matches = hosted_pins_matching(&hosted_pins, &target, &[]);
         if !hosted_matches.is_empty() {
-            return remove_hosted_only(&args, hosted_matches, &telemetry, commit_recovery).await;
+            return remove_hosted_only(&args, hosted_matches, &telemetry, commit_recovery, lanes)
+                .await;
         }
 
         let msg = format!("No patch found matching identifier: {}", args.identifier);
@@ -688,6 +703,46 @@ pub async fn run(args: RemoveArgs) -> i32 {
             }
             return 0;
         }
+    }
+
+    // ── Bazel rows: the plan ────────────────────────────────────────────
+    // What the owned index of a Bazel root records for the matching
+    // records, whatever lane wrote it, is undone with them. It is planned
+    // before anything is restored: a record leaves the manifest only when
+    // every row of its patch was undone, so one whose rows cannot be
+    // (or would be left with no record by `--skip-rollback`) fails the
+    // remove here, with the tree and the manifest as they were.
+    let row_records: Vec<(String, String)> = matching
+        .iter()
+        .map(|(purl, record)| ((*purl).clone(), record.uuid.clone()))
+        .collect();
+    let revert = !args.skip_rollback;
+    let bazel_rows = crate::bazel_gate::commands::RowsLeg::plan(
+        &args.common,
+        &row_records,
+        &hosted_pins,
+        revert,
+        lanes,
+    )
+    .await;
+    if let Some(kept) = bazel_rows.kept().first() {
+        let msg = format!(
+            "{}. Nothing was restored, and the manifest was not modified.",
+            kept.why
+        );
+        track_patch_remove_failed(&msg, &telemetry).await;
+        let warnings = crate::bazel_gate::commands::said(&args.common);
+        emit_error_envelope_with(
+            args.common.json,
+            args.common.dry_run,
+            kept.code,
+            msg,
+            warnings
+                .into_iter()
+                .map(|(code, detail)| crate::json_envelope::RunWarning::new(code, detail))
+                .collect(),
+        );
+        return 1;
     }
 
     // ── nested in-place rollback ────────────────────────────────────────
@@ -947,10 +1002,12 @@ pub async fn run(args: RemoveArgs) -> i32 {
     // The hosted leg's run-level advisories: printed as they arrive,
     // carried into the success envelope's `warnings[]`.
     let mut hosted_leg_warnings: Vec<(String, String)> = Vec::new();
+    // The purls of the hosted pins this run restored.
+    let mut hosted_restored: Vec<String> = Vec::new();
     if !args.skip_rollback {
         let hosted_matches = hosted_pins_matching(&hosted_pins, &target, &matched_keys);
         if !hosted_matches.is_empty() {
-            let leg = match unwind_hosted(&args.common, &hosted_matches).await {
+            let leg = match unwind_hosted(&args.common, &hosted_matches, lanes).await {
                 Ok(leg) => {
                     hosted_leg_warnings.extend(leg.warnings.iter().cloned());
                     leg
@@ -965,6 +1022,7 @@ pub async fn run(args: RemoveArgs) -> i32 {
             }
             // `run_hosted_leg` printed one line per restored purl.
             printed_progress |= loud && !leg.reverted.is_empty();
+            hosted_restored.extend(leg.reverted.iter().cloned());
             hosted_reverted_events.extend(
                 leg.reverted
                     .iter()
@@ -973,30 +1031,23 @@ pub async fn run(args: RemoveArgs) -> i32 {
         }
     }
 
-    // ── Bazel rows ──────────────────────────────────────────────────────
-    // What the owned index of a Bazel root records for the matching
-    // records, whatever lane wrote it, is undone with them. A hosted pin's
-    // rows went with its pin and a vendored entry's with its entry. A
-    // record leaves the manifest only when every row of its patch was
-    // undone, so one whose rows stand (or would be left by
-    // `--skip-rollback`) fails the remove before the manifest is touched.
-    let own_rows = |(purl, uuid): &(String, String)| {
-        !hosted_pins.iter().any(|pin| pin.uuid == *uuid)
-            && !vendored_matches.iter().any(|(k, e)| e.covers_purl(k, purl))
-    };
-    let row_records: Vec<(String, String)> = matching
+    // ── Bazel rows: the undo ────────────────────────────────────────────
+    // A hosted pin's rows went with its pin and a vendored entry's go
+    // with its entry: the rows of every other record go now. A record
+    // whose rows stand after all (the tree changed since the plan, the
+    // commit did not land, a hosted pin of its patch was not restored)
+    // fails the remove before the manifest is touched.
+    let left: Vec<String> = matching
         .iter()
-        .map(|(purl, record)| ((*purl).clone(), record.uuid.clone()))
-        .filter(own_rows)
+        .map(|(purl, _)| (*purl).clone())
+        .filter(|purl| vendored_matches.iter().any(|(k, e)| e.covers_purl(k, purl)))
         .collect();
-    let lanes = &crate::bazel_gate::commands::PRODUCTION;
-    let revert = !args.skip_rollback;
-    let bazel_rows =
-        crate::bazel_gate::commands::undo_rows(&args.common, &row_records, revert, lanes).await;
-    if let Some((_, why)) = bazel_rows.kept.first() {
-        let code = socket_patch_core::bazel::codes::Code::RedirectRevertIncomplete.as_str();
-        let msg = format!("{why}. The manifest was not modified.");
-        emit_error_envelope(args.common.json, args.common.dry_run, code, msg);
+    let bazel_rows = bazel_rows.undo(&args.common, &left, &hosted_restored).await;
+    hosted_leg_warnings.extend(crate::bazel_gate::commands::said(&args.common));
+    if let Some(kept) = bazel_rows.kept.first() {
+        let msg = format!("{}. The manifest was not modified.", kept.why);
+        track_patch_remove_failed(&msg, &telemetry).await;
+        emit_error_envelope(args.common.json, args.common.dry_run, kept.code, msg);
         return 1;
     }
     print_run_warnings(&args.common, &bazel_rows.warnings);
@@ -1627,8 +1678,9 @@ async fn sweep_target_orphans(
 async fn unwind_hosted(
     common: &GlobalArgs,
     hosted_matches: &[HostedPin],
+    lanes: &LaneTable,
 ) -> Result<HostedLegOutcome, String> {
-    let leg = run_hosted_leg(common, hosted_matches).await;
+    let leg = run_hosted_leg(common, hosted_matches, lanes).await;
     // Printed as soon as the leg returns, so a human run that then fails
     // still says what it did to the files.
     print_run_warnings(common, &leg.warnings);
@@ -1698,6 +1750,7 @@ async fn remove_hosted_only(
     hosted_matches: Vec<HostedPin>,
     telemetry: &TelemetryAuth,
     commit_recovery: Option<crate::json_envelope::RunWarning>,
+    lanes: &LaneTable,
 ) -> i32 {
     let loud = !args.common.json && !args.common.silent;
     if args.skip_rollback {
@@ -1750,7 +1803,7 @@ async fn remove_hosted_only(
         return 0;
     }
 
-    let leg = match unwind_hosted(&args.common, &hosted_matches).await {
+    let leg = match unwind_hosted(&args.common, &hosted_matches, lanes).await {
         Ok(leg) => leg,
         Err(err) => {
             track_patch_remove_failed("hosted redirect revert failed", telemetry).await;

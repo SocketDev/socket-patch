@@ -204,16 +204,6 @@ pub(super) async fn sweep(
         return out;
     }
 
-    if !common.json && !common.silent {
-        for (pin, status) in &gone {
-            eprintln!(
-                "Note: patch {} for {} is no longer published ({status}); restoring its \
-                 upstream registry entry",
-                pin.uuid, pin.purl
-            );
-        }
-    }
-
     let _lock = if common.dry_run {
         None
     } else {
@@ -251,10 +241,26 @@ pub(super) async fn sweep(
     let lanes = &crate::bazel_gate::commands::PRODUCTION;
     let (to_restore, kept) =
         crate::bazel_gate::commands::automatic(common, to_restore, lanes).await;
+    // The note names what is restored: a pin that is kept gets its
+    // warning alone, never "restoring" first.
+    if !common.json && !common.silent {
+        let restoring = |(pin, _): &&(HostedPin, String)| {
+            to_restore
+                .iter()
+                .any(|free| free.uuid == pin.uuid && free.purl == pin.purl)
+        };
+        for (pin, status) in gone.iter().filter(restoring) {
+            eprintln!(
+                "Note: patch {} for {} is no longer published ({status}); restoring its \
+                 upstream registry entry",
+                pin.uuid, pin.purl
+            );
+        }
+    }
     for (code, detail) in kept {
         out.warn(common, code, detail);
     }
-    let leg = crate::commands::hosted_unwind::run_hosted_leg(common, &to_restore).await;
+    let leg = crate::commands::hosted_unwind::run_hosted_leg(common, &to_restore, lanes).await;
     out.half_restored = leg.half_applied().map(str::to_string);
 
     let action = if common.dry_run {

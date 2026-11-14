@@ -18,6 +18,7 @@ use std::collections::BTreeMap;
 use serde_json::json;
 use socket_patch_core::bazel::codes::Code;
 use socket_patch_core::bazel::model::{Mode, Reason};
+use socket_patch_core::bazel::owned_index::INDEX_PATH;
 use wiremock::MockServer;
 
 use crate::bazel_common::{assert_same_tree, snapshot};
@@ -93,6 +94,19 @@ async fn a_refused_hosted_takeover_leaves_the_entry_vendored() {
         assert_eq!(event["errorCode"], refusal.as_str(), "{envelope:#}");
         let reason = event["reason"].as_str().unwrap_or_default();
         assert!(reason.ends_with("nothing was written"), "{event:#}");
+        // The refusal is mapped as every gate refusal is: the token and
+        // what would lift it ride the event, beside what Bazel builds
+        // the package from.
+        let details = &event["details"];
+        let token = details["token"].as_str().unwrap_or_default();
+        assert!(!token.is_empty(), "{event:#}");
+        assert!(details["lift"]["kind"].is_string(), "{event:#}");
+        let bazel = &details["bazel"];
+        assert_eq!(bazel["state"], "refused", "{event:#}");
+        assert_eq!(bazel["ruleset"], "rules_js", "{event:#}");
+        assert_eq!(bazel["lock"], lane::LOCK, "{event:#}");
+        assert_eq!(bazel["lane"], details["lift"]["lane"], "{event:#}");
+        assert_eq!(details["mode"], "hosted", "{event:#}");
         // The run says the refusal as a warning too, and no code of an
         // undo: nothing was staged to take back.
         let codes = bazel_codes(envelope);
@@ -109,6 +123,36 @@ async fn a_refused_hosted_takeover_leaves_the_entry_vendored() {
     assert_eq!(bazel_codes(&plain.envelope), Vec::<String>::new());
     let event = event_for(&plain.envelope, lane::PURL);
     assert_eq!(event["errorCode"], "vendored_revert_failed", "{event:#}");
+}
+
+/// Vendored to hosted beside an owned index that is not the one
+/// socket-patch wrote: no lane writes beside it, so the takeover is
+/// refused before the vendored entry is touched, under the code of an
+/// owned file somebody edited, with the index as the file to restore.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_takeover_beside_a_faulty_index_is_refused_and_changes_nothing() {
+    let api = MockServer::start().await;
+    mount_api(&api, &[patch()]).await;
+    let mut files = vendored(true);
+    let mangled = b"{\"version\": 1, \"pins\": [], \"ignoreLines\": \"oops\"}\n";
+    files.insert(INDEX_PATH.to_string(), mangled.to_vec());
+    let refusal = Code::RedirectOwnedFileModified.as_str();
+    for dry_run in [true, false] {
+        let run = run_disk_in(&api, &files, "", dry_run);
+        let envelope = &run.envelope;
+        assert_eq!(
+            run.changed,
+            BTreeMap::new(),
+            "dry_run={dry_run}: {envelope:#}"
+        );
+        let event = event_for(envelope, lane::PURL);
+        assert_eq!(event["action"], "skipped", "{envelope:#}");
+        assert_eq!(event["errorCode"], refusal, "{envelope:#}");
+        let details = &event["details"];
+        assert!(details["token"].is_string(), "{event:#}");
+        assert_eq!(details["lift"]["file"], INDEX_PATH, "{event:#}");
+        assert_eq!(details["bazel"]["state"], "refused", "{event:#}");
+    }
 }
 
 /// Hosted to vendored: the vendored gate refuses the artifact under the

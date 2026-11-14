@@ -5347,7 +5347,9 @@ async fn run_revert(args: &VendorArgs, env: &mut Envelope) -> i32 {
                 .filter(|pin| reverted.contains(&PurlKey::new(&pin.purl)))
                 .collect();
         if !rehosted.is_empty() {
-            let leg = crate::commands::hosted_unwind::run_hosted_leg(common, &rehosted).await;
+            let lanes = &crate::bazel_gate::commands::PRODUCTION;
+            let leg =
+                crate::commands::hosted_unwind::run_hosted_leg(common, &rehosted, lanes).await;
             for purl in &leg.reverted {
                 record_warning(
                     env,

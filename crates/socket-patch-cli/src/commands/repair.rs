@@ -40,6 +40,13 @@ pub struct RepairArgs {
 }
 
 pub async fn run(args: RepairArgs) -> i32 {
+    // One run of the Bazel layer: a Bazel root is read once for the scope
+    // check and the repair, and a note about it is said once.
+    let run = crate::bazel_gate::RunCx::from(&args.common);
+    crate::bazel_gate::in_run(run, Box::pin(run_in(args))).await
+}
+
+async fn run_in(args: RepairArgs) -> i32 {
     apply_env_toggles(&args.common);
     // Nothing in a tree Bazel owns is repaired (owner decision O16):
     // refused before a manifest, a ledger or a lockfile is read.
@@ -219,12 +226,15 @@ pub async fn run(args: RepairArgs) -> i32 {
     // trees (one an older release left with no line, one whose tree a
     // later run removed), what the root's owned index no longer matches,
     // and a recorded pin that is gone. Under the project's lock, after the
-    // repairs above, which can recreate a tree.
+    // repairs above, which can recreate a tree. `--download-only` skips
+    // every cleanup, so it takes no recorded line out.
     let lanes = &crate::bazel_gate::commands::PRODUCTION;
-    let bazel = match &result {
-        Ok(_) => crate::bazel_gate::commands::repair(&args.common, lanes).await,
+    let mut bazel = match &result {
+        Ok(_) => crate::bazel_gate::commands::repair(&args.common, args.download_only, lanes).await,
         Err(_) => Vec::new(),
     };
+    let said = crate::bazel_gate::commands::said(&args.common).into_iter();
+    bazel.extend(said.map(|(code, detail)| crate::json_envelope::RunWarning::new(code, detail)));
     let auth_fallback = client
         .as_ref()
         .and_then(crate::commands::vex_sources::api_auth_fallback_warning);
