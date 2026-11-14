@@ -2356,7 +2356,7 @@ async fn run_get_vendored(
             // An expected skip (a gem version this project doesn't lock)
             // is not an error: the same `skipped` event and `[skip]` line
             // as the search path and `scan`, exit 0, nothing written.
-            if crate::commands::vendor::refusal_is_benign(code) {
+            if socket_patch_core::vendor::refusals::refusal_is_benign(code) {
                 if args.common.json {
                     env.record(tag_mode(
                         PatchEvent::new(EventAction::Skipped, patch.purl.as_str())

@@ -343,7 +343,7 @@ pub(crate) fn format_record_skip(purl: &str, why: &str) -> String {
 }
 
 /// `[skip]` line for a patch a vendored run doesn't download because its
-/// refusal is an expected skip (`code`, see `vendor::refusal_is_benign`).
+/// refusal is an expected skip (`code`, see `socket_patch_core::vendor::refusals::refusal_is_benign`).
 pub(crate) fn format_refusal_skip(purl: &str, code: &str, detail: &str) -> String {
     format!("  [skip] {} ({code}): {detail}", normalize_purl(purl))
 }
@@ -960,7 +960,7 @@ pub(crate) async fn fetch_selected_patches(
             // An expected skip (a gem version this project doesn't lock)
             // is the package's whole account: no view, no record, and no
             // failure, as in the vendor loop.
-            if crate::commands::vendor::refusal_is_benign(code) {
+            if socket_patch_core::vendor::refusals::refusal_is_benign(code) {
                 if !quiet {
                     eprintln!("{}", format_refusal_skip(purl, code, detail));
                 }

@@ -41,6 +41,21 @@ use crate::vendor::{bun_lock, gem, lock_inventory, npm_flavor, npm_lock, vlt_loc
 /// instead of a silently empty ledger.
 pub type LedgerLoad<'a> = Result<&'a HashMap<String, VendorEntry>, &'a std::io::Error>;
 
+/// Refusal codes that are expected skips, not command failures: the user's
+/// request is still fully satisfied when these are the only non-successes.
+/// Every vendored entry point (`vendor`, `scan`, `get`, their dry runs)
+/// reads this one answer.
+pub fn refusal_is_benign(code: &str) -> bool {
+    matches!(code, "vendor_unsupported_ecosystem" | "already_vendored")
+        // A gem version another project (or Ruby) put in the shared gem
+        // home: this project doesn't lock it, so there is nothing to wire.
+        || code == gem::GEM_VERSION_NOT_LOCKED
+        // An older vendored patch kept in force while the newer one is
+        // unserved.
+        || super::is_unserved(code)
+        || super::jvm::sbt_gate::SKIP_CODES.contains(&code)
+}
+
 /// A purl the engine would refuse: its stable code and detail.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VendorRefusal {

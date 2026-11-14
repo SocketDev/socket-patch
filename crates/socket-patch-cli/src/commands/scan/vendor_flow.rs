@@ -91,7 +91,7 @@ impl PreviewVerdict {
     fn would_skip(&self) -> Option<bool> {
         match self {
             Self::WouldRefuse { code, .. } => {
-                Some(crate::commands::vendor::refusal_is_benign(code))
+                Some(socket_patch_core::vendor::refusals::refusal_is_benign(code))
             }
             _ => None,
         }

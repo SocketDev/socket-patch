@@ -113,17 +113,7 @@ pub struct VendorArgs {
     pub vex: VexEmbedArgs,
 }
 
-/// Refusal codes that are expected skips, not command failures: the user's
-/// request is still fully satisfied when these are the only non-successes.
-pub(crate) fn refusal_is_benign(code: &str) -> bool {
-    matches!(code, "vendor_unsupported_ecosystem" | "already_vendored")
-        // A gem version another project (or Ruby) put in the shared gem
-        // home: this project doesn't lock it, so there is nothing to wire.
-        || code == vendor::gem::GEM_VERSION_NOT_LOCKED
-        // An older vendored patch kept in force (see [`keep_older_vendored_patch`]).
-        || vendor::is_unserved(code)
-        || socket_patch_core::vendor::jvm::sbt_gate::SKIP_CODES.contains(&code)
-}
+use socket_patch_core::vendor::refusals::refusal_is_benign;
 
 /// #954, #1235: the patch service has no artifact for `uuid` yet (still
 /// building) or at all (`build_failed`, `not_found`, …) — the backend's
