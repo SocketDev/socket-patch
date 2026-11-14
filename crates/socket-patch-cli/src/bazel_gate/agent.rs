@@ -584,6 +584,8 @@ fn run_loader(run: RunCx) -> &'static Loader {
 }
 
 /// [`report`] over `loader` and `lanes`, without the process state.
+/// `refused` are the packages whose write the run refused under a code of
+/// its own.
 fn build(
     loader: &Loader,
     lanes: &LaneTable,
@@ -591,6 +593,7 @@ fn build(
     command: Command,
     records: &[(String, String)],
     jars: &[(String, PathBuf)],
+    refused: &[String],
 ) -> Report {
     let mut report = Report::default();
     if records.is_empty() && jars.is_empty() {
@@ -609,9 +612,18 @@ fn build(
         (report.patches, report.sidecars) = judge(&loaded, lanes, asked);
     }
     report.warnings = loader.take_warnings();
-    report
-        .warnings
-        .extend(advisory(&not_consumed(&report.patches)));
+    // The advisory says that the installed copy is patched all the same
+    // and the exit code unchanged. The event of a refused package says
+    // that nothing was written, and the run fails: the advisory does not
+    // name that package beside it. Its verdict stays, and so does what
+    // the run says about the workspace.
+    let refused = |patch: &&Patch| {
+        let same = |purl: &String| *purl == patch.purl || PurlKey::same(purl, &patch.purl);
+        refused.iter().any(same)
+    };
+    let mut advised = not_consumed(&report.patches);
+    advised.retain(|patch| !refused(patch));
+    report.warnings.extend(advisory(&advised));
     report
 }
 
@@ -620,8 +632,10 @@ fn build(
 /// `records` are the `(purl, uuid)` records of the manifest; the ones
 /// outside `--ecosystems` and the `vendor_owned` ones are not asked about
 /// (what the build makes of a vendored package is the vendored seam's to
-/// say). `results` are what the apply loop did, for the repin hazard of a
-/// patched jar.
+/// say). `results` are what the apply loop did: for the repin hazard of a
+/// patched jar, and for the packages it refused to write under a code of
+/// their own (the Go patch under a gazelle hub), which the advisory then
+/// leaves out, because their events say that nothing was written.
 ///
 /// A run on the global installs patches another tree and asks nothing.
 /// Under no Bazel root this is one stat-only probe, and the report is
@@ -641,6 +655,8 @@ pub async fn report(
     };
     let records: Vec<(String, String)> = records.into_iter().filter(asked).collect();
     let jars = patched_jars(results);
+    let refused = results.iter().filter(|result| result.refusal.is_some());
+    let refused: Vec<String> = refused.map(|result| result.package_key.clone()).collect();
     // By struct update, as every seam builds it: the context gains
     // members with the write seam.
     let run = RunCx {
@@ -661,7 +677,7 @@ pub async fn report(
         // the `go.mod` of a Go redirect, a `.bazelignore` line.
         loader.committed(&project);
         let lanes = &lanes::PRODUCTION;
-        build(loader, lanes, &project, command, &records, &jars)
+        build(loader, lanes, &project, command, &records, &jars, &refused)
     });
     // The advisory is advice: a panic in it must not fail a command that
     // has already patched.
@@ -1008,13 +1024,52 @@ mod tests {
         assert_eq!(checked(&loaded, &TOY, &asked), []);
         let records = [(LEFT_PAD.to_string(), UUID.to_string())];
         for command in [Command::Apply, Command::Check] {
-            let report = build(&loader, &TOY, &repo.top, command, &records, &[]);
+            let report = build(&loader, &TOY, &repo.top, command, &records, &[], &[]);
             assert!(report.patches().is_empty() && report.sidecars.is_empty());
             let here = repo.top.display().to_string();
             let said = report.run_warnings();
             let said: Vec<_> = said.iter().filter(|w| w.detail.contains(&here)).collect();
             assert!(said.is_empty(), "{said:?}");
         }
+    }
+
+    /// A package whose write the run refused is told so by its own
+    /// event, and the run fails. The advisory, which says that the
+    /// installed copy is patched all the same and the exit code
+    /// unchanged, does not name it. Its verdict stays for the event, the
+    /// other packages stay in the advisory, and what the run says about
+    /// the workspace is said all the same.
+    #[test]
+    fn a_refused_package_is_left_out_of_the_advisory_and_nothing_else_is() {
+        let files = [GO, GO_MOD, ("go.sum", ""), BAZEL_9];
+        let repo = Repo::new(&files);
+        let other = "pkg:golang/github.com/foo/baz@v1.0.0";
+        let records = [
+            (BAR.to_string(), UUID.to_string()),
+            (other.to_string(), OTHER.to_string()),
+        ];
+        let advisories = |refused: &[String]| {
+            let loader = Loader::new(RunCx::default());
+            let lanes = &lanes::PRODUCTION;
+            let command = Command::Apply;
+            let report = build(&loader, lanes, &repo.top, command, &records, &[], refused);
+            assert_eq!(report.state_of(BAR), Some(State::NotConsumed));
+            let said = report.run_warnings();
+            let detected = Code::WorkspaceDetected.as_str();
+            assert!(said.iter().any(|w| w.code == detected), "{said:?}");
+            let advisory = Code::AgentNotConsumed.as_str();
+            let advised = said.into_iter().filter(|w| w.code == advisory);
+            advised.map(|w| w.detail).collect::<Vec<String>>()
+        };
+        let [both] = advisories(&[]).try_into().expect("one advisory");
+        assert!(both.contains(BAR) && both.contains(other), "{both}");
+        let [one] = advisories(&[BAR.to_string()])
+            .try_into()
+            .expect("one advisory");
+        assert!(!one.contains(BAR) && one.contains(other), "{one}");
+        // Every governed package of the run was refused: no advisory.
+        let all = [BAR.to_string(), other.to_string()];
+        assert_eq!(advisories(&all), Vec::<String>::new());
     }
 
     // ── A pin that passes ────────────────────────────────────────────
@@ -1047,7 +1102,7 @@ mod tests {
         assert_eq!(advisory(&not_consumed(&set)), None);
         let records = [(BAR.to_string(), UUID.to_string())];
         let loader = Loader::new(RunCx::default());
-        let report = build(&loader, &TOY, &repo.top, Command::Apply, &records, &[]);
+        let report = build(&loader, &TOY, &repo.top, Command::Apply, &records, &[], &[]);
         assert_eq!(report.state_of(BAR), Some(State::Consumed));
         let codes: Vec<String> = report.run_warnings().into_iter().map(|w| w.code).collect();
         assert!(
@@ -1226,6 +1281,7 @@ mod tests {
             Command::Apply,
             &records,
             &[],
+            &[],
         );
         assert_eq!(apply.state_of(GSON), None);
         let check = build(
@@ -1234,6 +1290,7 @@ mod tests {
             &project,
             Command::Check,
             &records,
+            &[],
             &[],
         );
         assert_eq!(check.state_of(GSON), Some(State::NotConsumed));
@@ -1319,7 +1376,7 @@ mod tests {
         // a `sidecars[]` record, and a line for a person.
         let loader = Loader::new(RunCx::default());
         let lanes = &lanes::PRODUCTION;
-        let report = build(&loader, lanes, &repo.top, Command::Apply, &[], &jars);
+        let report = build(&loader, lanes, &repo.top, Command::Apply, &[], &jars, &[]);
         assert_eq!(report.sidecars, hazards);
         let lines: Vec<&str> = report.hazards().collect();
         assert_eq!(lines, [advisory.message.as_str()]);
