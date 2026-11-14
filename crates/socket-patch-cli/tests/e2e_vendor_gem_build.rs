@@ -657,12 +657,14 @@ fn gem_vendor_fresh_checkout_bundle_install_and_revert() {
     // REGRESSION (#2076): the registry copy the first `bundle install` put
     // in the gem home is a leftover now. Bundler loads the vendored path
     // and installs nothing for rack, so no install replaces that copy. The
-    // warning about it must name a remedy that removes it (`bundle clean`,
-    // run below), not a reinstall.
-    let leftover = format!("Warning: {purl}: {} does not match", gem_dir.display());
+    // warning about it must name the copy and a remedy that removes it
+    // (`bundle clean`, run below), not a reinstall.
     assert!(
-        stderr.contains(&leftover) && stderr.contains("Remove it with `bundle clean`."),
-        "the leftover gem-home copy is named, with the remedy that clears it:\n{stderr}"
+        stderr.contains(&format!("Warning: {purl}: "))
+            && stderr.contains(&format!("({})", gem_dir.display()))
+            && stderr.contains(&format!("`gem uninstall {DEP} -v {version} -i "))
+            && stderr.contains("`bundle clean`"),
+        "the leftover gem-home copy is named, with remedies that clear it:\n{stderr}"
     );
     assert!(
         !stderr.contains("re-run your package manager"),
