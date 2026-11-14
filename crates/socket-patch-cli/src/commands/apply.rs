@@ -15,7 +15,9 @@ use socket_patch_core::patch::gem_ext;
 use socket_patch_core::patch::redirect::golang_local::{
     apply_agent_go_redirect, reconcile_go_redirects, verify_go_redirect_state, AgentGoGate, Gated,
 };
-use socket_patch_core::patch::sidecars::{maven as maven_sidecars, SidecarAdvisoryCode};
+use socket_patch_core::patch::sidecars::{
+    maven as maven_sidecars, SidecarAdvisoryCode, SidecarRecord,
+};
 use socket_patch_core::telemetry::{track_patch_applied, track_patch_apply_failed, TelemetryAuth};
 use socket_patch_core::utils::purl::parse_golang_purl;
 use socket_patch_core::utils::purl::{normalize_purl, strip_purl_qualifiers};
@@ -468,30 +470,14 @@ async fn run_check(args: &ApplyArgs, manifest_path: &Path) -> i32 {
         }
         None => Vec::new(),
     };
-    // What the Bazel build makes of these patches (design 7): "in sync"
-    // is a statement about the installed tree, and where a ruleset builds
-    // a package from its lock the check says so, once, and marks the
-    // package. The verdicts and the exit code stay as they are.
-    let bazel_records = manifest.patches.iter();
-    let bazel_records = bazel_records.filter(|(purl, _)| owned_by_apply(purl));
-    let bazel = Box::pin(crate::bazel_gate::agent::report(
-        &args.common,
-        crate::bazel_gate::agent::Command::Check,
-        bazel_records
-            .map(|(purl, record)| (purl.clone(), record.uuid.clone()))
-            .collect(),
-        &[],
-        &[],
-    ))
-    .await;
-    check_warnings.extend(bazel.run_warnings());
     if !args.common.json && !args.common.silent {
         for warning in &check_warnings {
-            let prefix = crate::bazel_gate::agent::prefix(&warning.code);
-            eprintln!("{prefix}: {}", warning.detail);
+            eprintln!("Warning: {}", warning.detail);
         }
     }
 
+    // The local Go patches the redirect audit below covers.
+    let mut go_checked: Vec<String> = Vec::new();
     {
         use socket_patch_core::patch::redirect::golang_local::Drift as GoDrift;
         if eco_in_local_scope(&args.common, Ecosystem::Golang) {
@@ -503,6 +489,7 @@ async fn run_check(args: &ApplyArgs, manifest_path: &Path) -> i32 {
                 .cloned()
                 .collect();
             checked += desired.len();
+            go_checked.extend(desired.iter().cloned());
             if let Err(ds) = verify_go_redirect_state(&args.common.cwd, &manifest, &desired).await {
                 for d in &ds {
                     let id = match d {
@@ -629,10 +616,56 @@ async fn run_check(args: &ApplyArgs, manifest_path: &Path) -> i32 {
         }
     }
 
+    // What the Bazel build makes of these patches (design 7): "in sync"
+    // is a statement about the installed tree, and where a ruleset builds
+    // a package from its lock the check says so, once, and marks the
+    // package. Asked after the tree was checked: a pin whose evidence is
+    // the installed tree counts only for a package found in sync. The
+    // verdicts and the exit code stay as they are.
+    go_checked.sort();
+    let go_in_sync = go_in_sync(&go_checked, &drifts);
+    let verified: Vec<String> = in_sync.iter().chain(&go_in_sync).cloned().collect();
+    let bazel_records = manifest.patches.iter();
+    let bazel_records = bazel_records.filter(|(purl, _)| owned_by_apply(purl));
+    let bazel = Box::pin(crate::bazel_gate::agent::report(
+        &args.common,
+        crate::bazel_gate::agent::Command::Check { in_sync: &verified },
+        bazel_records
+            .map(|(purl, record)| (purl.clone(), record.uuid.clone()))
+            .collect(),
+    ))
+    .await;
+    if !args.common.json && !args.common.silent {
+        for warning in bazel.run_warnings() {
+            let prefix = crate::bazel_gate::agent::prefix(&warning.code);
+            eprintln!("{prefix}: {}", warning.detail);
+        }
+    }
+    check_warnings.extend(bazel.run_warnings());
+    // A local Go patch in sync has no event of its own. Where Bazel has a
+    // verdict for it, the verdict needs one to ride on: `already_patched`,
+    // the tag of every other patch the check found in place. Under no
+    // Bazel root there is no verdict, and the envelope is what it was.
+    let judged_go = go_in_sync.iter();
+    let judged_go: Vec<&String> = judged_go
+        .filter(|purl| bazel.state_of(purl).is_some())
+        .collect();
+    let record_judged_go = |env: &mut Envelope| {
+        for purl in &judged_go {
+            env.record(
+                PatchEvent::new(PatchAction::Skipped, purl.as_str()).with_reason(
+                    "already_patched",
+                    "the committed copy and its go.mod replace are in place",
+                ),
+            );
+        }
+    };
+
     if drifts.is_empty() {
         if args.common.json {
             let mut env = Envelope::new(Command::Apply);
             record_check_skips(&mut env, &in_sync, &not_installed);
+            record_judged_go(&mut env);
             for event in unchecked_events {
                 env.record(event);
             }
@@ -656,6 +689,7 @@ async fn run_check(args: &ApplyArgs, manifest_path: &Path) -> i32 {
                 );
             }
             record_check_skips(&mut env, &in_sync, &not_installed);
+            record_judged_go(&mut env);
             for event in unchecked_events {
                 env.record(event);
             }
@@ -855,6 +889,25 @@ fn describe_check_failure(reason: &str) -> &'static str {
         }
         _ => "an installed copy does not verify",
     }
+}
+
+/// The local Go patches of `checked` that no drift names, by purl or by
+/// module: their committed copy and `replace` are in place. A module whose
+/// consumer files drifted (its drift carries the module path, not a purl)
+/// is not in sync either.
+fn go_in_sync(checked: &[String], drifts: &[(String, String, String)]) -> Vec<String> {
+    let drifted = |purl: &&String| {
+        let module = parse_golang_purl(purl).map(|(module, _)| module);
+        let named = |(id, _, _): &(String, String, String)| {
+            id == *purl || module.as_deref().is_some_and(|module| id == module)
+        };
+        drifts.iter().any(named)
+    };
+    checked
+        .iter()
+        .filter(|purl| !drifted(purl))
+        .cloned()
+        .collect()
 }
 
 /// The `skipped` events of an `apply --check --json` envelope: in-sync
@@ -1548,6 +1601,12 @@ pub(crate) struct ApplyRunReport {
     /// for a JSON caller, so this is their only channel. Filled whenever
     /// the apply loop ran, whatever the exit code.
     pub warnings: Vec<RunWarning>,
+    /// The sidecar records only the caller's envelope can carry: the
+    /// Bazel repin hazards of the jars this apply patched (HZ-25). A
+    /// human caller's nested apply prints them itself. The per-package
+    /// sidecar records of the loop are not here: a nested caller never
+    /// carried those.
+    pub sidecars: Vec<SidecarRecord>,
 }
 
 impl ApplyRunReport {
@@ -1829,6 +1888,7 @@ pub(crate) async fn run_locked(
             fallback_skips,
             targeted,
             show_summary,
+            vendor_owned,
         }) => {
             let patched_count = results
                 .iter()
@@ -1912,18 +1972,15 @@ pub(crate) async fn run_locked(
             // all the same and the exit code is unchanged; the run says
             // once which packages Bazel builds from a lock instead. Asked
             // after the loop, over the disk as it left it, and never for
-            // a package `vendor` owns.
-            let vendor_owned: Vec<&str> = results
-                .iter()
-                .filter(|r| r.package_path == VENDOR_OWNED_MARKER)
-                .map(|r| r.package_key.as_str())
-                .collect();
+            // a package `vendor` owns: by the ledger, as `--check` tells
+            // them apart, so that an exit before the loop (sources that
+            // could not be staged) leaves them out as well.
+            let mut bazel_records = bazel_records;
+            bazel_records.retain(|(purl, _)| !purl_keys_cover(&vendor_owned, purl));
             let bazel = Box::pin(crate::bazel_gate::agent::report(
                 &args.common,
-                crate::bazel_gate::agent::Command::Apply,
+                crate::bazel_gate::agent::Command::Apply { results: &results },
                 bazel_records,
-                &results,
-                &vendor_owned,
             ))
             .await;
             run_warnings.extend(bazel.run_warnings());
@@ -2230,11 +2287,13 @@ pub(crate) async fn run_locked(
             );
             // A requested-but-failed VEX flips an otherwise-successful
             // apply to a non-zero exit (fail-the-command contract).
+            let sidecars = bazel.sidecars().to_vec();
             if success && !vex_failed {
                 return ApplyRunReport {
                     applied,
                     skipped,
                     warnings,
+                    sidecars,
                     ..ApplyRunReport::default()
                 };
             }
@@ -2270,6 +2329,7 @@ pub(crate) async fn run_locked(
                 applied,
                 skipped,
                 warnings,
+                sidecars,
             }
         }
         Err(e) => {
@@ -2406,6 +2466,11 @@ struct ApplyOutcome {
     /// the empty-scope no-op or the sources-unavailable bail, which print
     /// their own one-line outcome).
     show_summary: bool,
+    /// The vendor-ledger keys that own this run's copies
+    /// ([`vendor_ownership`]), read from the ledger on every exit that has
+    /// records in scope: what `vendor` owns does not depend on how far the
+    /// loop got.
+    vendor_owned: HashSet<PurlKey>,
 }
 
 /// Run-warning code for the `--offline` sources-unavailable bail.
@@ -2724,7 +2789,10 @@ async fn apply_patches_inner(
                 fallback_skips: Vec::new(),
                 targeted: target_manifest_purls.len(),
                 show_summary: false,
-            })
+                // The loop below never ran, and its results name no
+                // vendor-owned package: the ledger still does.
+                vendor_owned: vendor_ownership(&args.common).await.0,
+            });
         }
     };
 
@@ -2765,6 +2833,7 @@ async fn apply_patches_inner(
             fallback_skips: Vec::new(),
             targeted: 0,
             show_summary: false,
+            vendor_owned: HashSet::new(),
         });
     }
 
@@ -2928,6 +2997,7 @@ async fn apply_patches_inner(
             fallback_skips,
             targeted: target_manifest_purls.len(),
             show_summary: true,
+            vendor_owned: vendored_purls,
         });
     }
 
@@ -3452,6 +3522,7 @@ async fn apply_patches_inner(
         fallback_skips,
         targeted: target_manifest_purls.len(),
         show_summary: true,
+        vendor_owned: vendored_purls,
     })
 }
 
@@ -4203,6 +4274,34 @@ mod tests {
     //! contract value here (action tags, `errorCode` reasons, `files[].path`
     //! shape) is documented in `CLI_CONTRACT.md`.
     use super::*;
+
+    /// `apply --check`: a local Go patch is in sync when no drift names
+    /// it, by its purl (the redirect audit) or by its module (the
+    /// consumer-sync audit, which reports module paths). Only such a
+    /// patch counts as verified in the tree for the Bazel verdict, and
+    /// only it gets the event that carries `details.bazel`.
+    #[test]
+    fn a_local_go_patch_is_in_sync_when_no_drift_names_it_or_its_module() {
+        let purl = |module: &str| format!("pkg:golang/{module}@v1.0.0");
+        let checked = [
+            purl("example.com/a"),
+            purl("example.com/b"),
+            purl("example.com/c"),
+        ];
+        let drift = |id: &str, code: &str| (id.to_string(), code.to_string(), String::new());
+        assert_eq!(go_in_sync(&checked, &[]), checked);
+        let drifts = [
+            drift(&purl("example.com/a"), "go_redirect_drift"),
+            // The consumer-sync audit names the module, not the purl.
+            drift("example.com/b", "vendor_modules_txt_drift"),
+            // Another package's drift, and a module that only shares a
+            // prefix, name neither.
+            drift("pkg:npm/left-pad@1.3.0", "not_applied"),
+            drift("example.com/c/v2", "go_redirect_drift"),
+        ];
+        assert_eq!(go_in_sync(&checked, &drifts), [purl("example.com/c")]);
+        assert_eq!(go_in_sync(&[], &drifts), [] as [String; 0]);
+    }
     use socket_patch_core::patch::apply::{
         AppliedVia as CoreAppliedVia, ApplyResult, VerifyResult, VerifyStatus,
     };

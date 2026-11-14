@@ -2,8 +2,10 @@
 //! (`socket_patch_core::bazel`). It is not under `commands/`, so the command
 //! layering allowlist does not grow.
 //!
-//! This file is the loader. A command makes one [`Loader`] per run and asks
-//! it about each project directory it works on:
+//! This file is the loader. A command makes one [`Loader`] per run
+//! ([`in_run`] scopes it to the command, and [`run_loader`] hands it to
+//! each seam the command reaches) and asks it about each project directory
+//! it works on:
 //!
 //! - [`Loader::probe`] stats and reads nothing. Under no Bazel root that is
 //!   the whole cost of this module, so a command that needs no governance
@@ -683,6 +685,37 @@ impl Loader {
             run: run_policy(&self.run),
         }
     }
+}
+
+tokio::task_local! {
+    /// The loader of the command this task runs ([`in_run`]).
+    static RUN: Arc<Loader>;
+}
+
+/// Runs `command` as one run of the Bazel layer: every seam call it makes
+/// through [`run_loader`] is handed the same [`Loader`], so a root is read
+/// once however many of its projects the command works on, a note about
+/// it is said once, and all of that ends with the command. Two commands
+/// in one process (the in-process suites, an embedder) share nothing.
+///
+/// A command that reaches more than one seam call wraps its body in this:
+/// a scan asks about each of its projects and ends with an apply. A
+/// command that another runs joins its caller's run and keeps the caller's
+/// `run`.
+pub async fn in_run<F: std::future::Future>(run: RunCx, command: F) -> F::Output {
+    if RUN.try_with(|_| ()).is_ok() {
+        return command.await;
+    }
+    RUN.scope(Arc::new(Loader::new(run)), command).await
+}
+
+/// The loader of the run this task is in ([`in_run`]). Outside one, a
+/// loader of the caller's own over `run`: a command that makes one seam
+/// call is its own run. Asked before a blocking task is spawned, never
+/// inside one, which the run does not reach.
+pub fn run_loader(run: RunCx) -> Arc<Loader> {
+    let shared = RUN.try_with(Arc::clone);
+    shared.unwrap_or_else(|_| Arc::new(Loader::new(run)))
 }
 
 /// Whether the marker a survey reports is a file above the read boundary.
