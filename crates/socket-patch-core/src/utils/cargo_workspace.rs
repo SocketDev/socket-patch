@@ -320,6 +320,12 @@ fn member_manifests_with(tree: &dyn Tree) -> Vec<String> {
 /// `exclude` entry names, the entry taken literally as cargo's
 /// `Path::starts_with` reads it: `.` segments dropped, nothing else folded
 /// (a `..` or a glob character is a segment like any other).
+///
+/// Two deliberate differences from cargo. `\` separates segments on every
+/// platform, as it does where the member globs themselves are read, so a
+/// manifest written on Windows means the same wherever it is scanned. And
+/// an absolute entry matches nothing: the in-memory view has no root path
+/// to hold it against.
 fn at_or_under(dir: &str, entry: &str) -> bool {
     if crate::utils::relpath::is_anchored(entry) {
         return false;
@@ -334,9 +340,10 @@ fn at_or_under(dir: &str, entry: &str) -> bool {
 /// Whether cargo leaves the member-glob match `dir` out of the workspace
 /// (its `WorkspaceRootConfig::is_excluded`): an `exclude` entry is a path
 /// prefix, never a glob, and a `members` entry taken literally keeps what
-/// is at or under it, whatever `exclude` says. The check
-/// [`crate::vendor::cargo::workspace_root_refusal`] applies from a member.
-fn is_excluded(members: &[String], exclude: &[String], dir: &str) -> bool {
+/// is at or under it, whatever `exclude` says.
+/// [`crate::vendor::cargo::workspace_root_refusal`] asks the same of a
+/// member directory looking up at an ancestor's `[workspace]`.
+pub(crate) fn is_excluded(members: &[String], exclude: &[String], dir: &str) -> bool {
     exclude.iter().any(|entry| at_or_under(dir, entry))
         && !members.iter().any(|entry| at_or_under(dir, entry))
 }
@@ -541,8 +548,8 @@ pub(crate) fn normalize_rel(base: &str, rel: &str) -> Option<String> {
 /// directory.
 const CARGO_SKIP: &[&str] = &["target"];
 
-/// Expand a cargo `members` / `exclude` glob (`*`, `?`, `[..]` classes,
-/// `**`) to the repo-relative directories it names. A wildcard segment
+/// Expand a cargo `members` glob (`*`, `?`, `[..]` classes, `**`) to the
+/// repo-relative directories it names. A wildcard segment
 /// never matches a dot-directory (unless the segment itself starts with
 /// `.`, as `.*` does) or a name in `skip`; a literal segment names any
 /// real directory. A segment matches as `workspace_globs` reads one, so a
@@ -918,6 +925,14 @@ mod tests {
         )
         .await
         .is_empty());
+        // A literal `.` member is the whole workspace: nothing under it is
+        // excluded.
+        assert!(members_of(
+            "[workspace]\nmembers = [\".\", \"crates/*\"]\nexclude = [\"crates/legacy\"]\n",
+            &["crates/legacy"]
+        )
+        .await
+        .contains(&"crates/legacy/Cargo.toml".to_string()));
     }
 
     #[test]
