@@ -83,9 +83,7 @@ use socket_patch_core::manifest::schema::PatchRecord;
 use socket_patch_core::patch::apply::{ApplyResult, PatchSources, VerifyResult, VerifyStatus};
 use socket_patch_core::patch::redirect::{FileEdit, RewriteResult};
 use socket_patch_core::utils::bazel_root_writes::{self, PlanGuard};
-use socket_patch_core::utils::group_commit::{
-    restore_anchored, AnchoredChange, CommittedFile, GroupCommit,
-};
+use socket_patch_core::utils::group_commit::{AnchoredChange, CommittedFile, GroupCommit};
 use socket_patch_core::utils::purl::{purl_parts, strip_purl_qualifiers};
 use socket_patch_core::utils::socket_dir::remove_tree_and_prune;
 use socket_patch_core::vendor::path::vendor_uuid_dir_rel;
@@ -95,7 +93,7 @@ use socket_patch_core::vendor::{
     VendorWarning, WiringRecord, VENDOR_STATE_REL,
 };
 
-use super::run::{self, finish, land, Finish, NoRunner, Unlanded};
+use super::run::{self, land, Unlanded};
 use super::{run_policy, IndexState, Loaded, LoadedRoot, Loader, RunCx, Warning};
 use crate::args::GlobalArgs;
 use crate::json_envelope::{Envelope, PatchAction};
@@ -234,6 +232,10 @@ impl ArtifactSource for ServiceSource<'_> {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct RootTxn {
     pub root: PathBuf,
+    /// The project of the run relative to `root`, `""` at the root: the
+    /// commit lands only at a root inside the directory socket-patch
+    /// writes in for that project (`run::land`).
+    pub project_rel: String,
     /// The files as they are to be after the commit (`None`: removed), by
     /// root-relative path. Between the packages of a run it holds what
     /// the lanes authored and nothing the executor renders: the index
@@ -329,8 +331,9 @@ pub fn root_pending(error: &std::io::Error) -> bool {
 /// The production commit: what the run staged under its Bazel root lands
 /// in the commit anchored there, under the root's lock, and then the
 /// project's group commit, both or neither (`bazel_gate::run::land`). Each
-/// plan that landed is then settled by `run::finish`. With nothing staged
-/// under a root it is the project's group commit, byte for byte.
+/// plan that landed is settled by `run::finish` between the two. With
+/// nothing staged under a root it is the project's group commit, byte for
+/// byte.
 pub struct AnchoredCommit;
 
 impl RootCommit for AnchoredCommit {
@@ -358,17 +361,44 @@ impl RootCommit for AnchoredCommit {
                 return Err(std::io::Error::other(why));
             }
             let changes = txn.anchored();
+            // Each plan that lands is settled by `run::finish` inside
+            // `land`, between the two commits: a command that fails takes
+            // the root back before the project's commit is started.
+            let outcomes: Vec<&GateOutcome> = txn.outcomes.iter().collect();
             let at = run::Staged {
                 root: &txn.root,
+                project_rel: &txn.project_rel,
                 touched: &txn.touched,
                 changes: &changes,
+                outcomes: &outcomes,
+                ahead: &[],
             };
-            let landed = match land(at, project).await {
+            let runner = run::runner();
+            let landed = match land(at, runner.as_ref(), project).await {
                 Ok(landed) => landed,
-                Err(Unlanded::Root { why, pending: true }) => {
+                Err(Unlanded::Root {
+                    why, pending: true, ..
+                }) => {
                     return Err(std::io::Error::other(RootPending(why)));
                 }
                 Err(Unlanded::Root { why, .. }) => return Err(std::io::Error::other(why)),
+                // The replay rewrote files this run had read: it is said,
+                // and nothing of this run is committed.
+                Err(Unlanded::Recovered(replayed)) => {
+                    let why = format!(
+                        "{}; this run decided from the files as they were before that, so \
+                         its commit was not made: run it again",
+                        replayed.detail
+                    );
+                    return Err(std::io::Error::other(why));
+                }
+                Err(Unlanded::Run { why, left }) => {
+                    let left = match left.is_empty() {
+                        true => "what was written under the Bazel root was taken back".into(),
+                        false => format!("taking it back failed: {}", left.join(", ")),
+                    };
+                    return Err(std::io::Error::other(format!("{why}; {left}")));
+                }
                 Err(Unlanded::Project { error, left }) if left.is_empty() => return Err(error),
                 Err(Unlanded::Project { error, left }) => {
                     let why = format!(
@@ -380,26 +410,6 @@ impl RootCommit for AnchoredCommit {
                     return Err(std::io::Error::new(error.kind(), why));
                 }
             };
-            // Each plan that was carried out is settled; the originals
-            // are kept until the last one has spoken.
-            let mut captured = landed.captured;
-            for outcome in &txn.outcomes {
-                captured = match finish(outcome, captured, &NoRunner) {
-                    Finish::Keep(captured) => captured,
-                    // Not reached while no tool is run (`NoRunner` leaves
-                    // every command to the user). The root goes back to
-                    // what it held; the project's own commit has landed,
-                    // and the package that lands the runner owes its undo.
-                    Finish::Unwind { captured, why } => {
-                        let left = restore_anchored(&landed.lock, captured.files()).await;
-                        let left = match left {
-                            Ok(()) => "what was written under the Bazel root was taken back".into(),
-                            Err(left) => format!("taking it back failed: {}", left.join(", ")),
-                        };
-                        return Err(std::io::Error::other(format!("{why}; {left}")));
-                    }
-                };
-            }
             drop(landed.lock);
             Ok(landed.project)
         })
@@ -1278,6 +1288,7 @@ pub async fn carry_out(
         Some(at) => staged.roots[at].clone(),
         None => RootTxn {
             root: root.root.clone(),
+            project_rel: root.project_rel.clone(),
             ..RootTxn::default()
         },
     };
@@ -1626,6 +1637,7 @@ fn undo(
     let mut overlay = Overlay::new(&fresh);
     let mut txn = RootTxn {
         root: root.root().root.clone(),
+        project_rel: root.root().project_rel.clone(),
         ..RootTxn::default()
     };
     let index_kept = |refused: Refused| {

@@ -950,6 +950,41 @@ pub(crate) async fn run_redirect_selected(
     rollout: Option<super::rollout::Gate<'_>>,
     command: &'static str,
 ) -> i32 {
+    // The Bazel root above the project, if any: its gate decides the
+    // patches of every ecosystem a ruleset governs there.
+    let bazel = crate::bazel_gate::hosted::Hosted::production(common);
+    run_redirect_selected_over(
+        common,
+        vex,
+        prune_requested,
+        api_client,
+        selected,
+        scan_result,
+        npm_prior,
+        rollout,
+        command,
+        &bazel,
+    )
+    .await
+}
+
+/// [`run_redirect_selected`] over a hosted seam of the caller's making:
+/// the production one from every command, and one over a lane table (and
+/// a tool runner) of its own from a test, which is how the lines of this
+/// command that only a planning lane reaches are run.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_redirect_selected_over(
+    common: &crate::args::GlobalArgs,
+    vex: &crate::commands::vex::VexEmbedArgs,
+    prune_requested: bool,
+    api_client: &socket_patch_core::api::client::ApiClient,
+    selected: &[(String, String)],
+    scan_result: Option<Envelope>,
+    npm_prior: Option<&crate::ecosystem_dispatch::NpmCrawlSnapshot>,
+    rollout: Option<super::rollout::Gate<'_>>,
+    command: &'static str,
+    bazel: &crate::bazel_gate::hosted::Hosted,
+) -> i32 {
     let mut telemetry = HostedTelemetry {
         command,
         auth: socket_patch_core::telemetry::TelemetryAuth::for_client(api_client),
@@ -966,6 +1001,7 @@ pub(crate) async fn run_redirect_selected(
         npm_prior,
         rollout,
         &mut telemetry,
+        bazel,
     )
     .await;
     if code != 0 && !telemetry.sent && !selected.is_empty() {
@@ -1009,6 +1045,9 @@ async fn run_redirect_selected_untracked(
     // every write-free eligibility check below (§5.2). `get` passes `None`.
     mut rollout: Option<super::rollout::Gate<'_>>,
     telemetry: &mut HostedTelemetry,
+    // The hosted seam over the Bazel root above the project, if any: its
+    // gate decides the patches of every ecosystem a ruleset governs there.
+    bazel: &crate::bazel_gate::hosted::Hosted,
 ) -> i32 {
     use socket_patch_core::hosted::engine::{
         self, Candidate, CandidateFiles, RewriteOptions, SkippedPatch,
@@ -1017,9 +1056,6 @@ async fn run_redirect_selected_untracked(
     use socket_patch_core::vendor::lock_inventory::ProjectView;
 
     let view = ProjectView::Disk(&common.cwd);
-    // The Bazel root above the project, if any: its gate decides the
-    // patches of every ecosystem a ruleset governs there.
-    let bazel = crate::bazel_gate::hosted::Hosted::production(common);
     let mut skipped: Vec<SkippedPatch> = Vec::new();
     let mut candidates: Vec<Candidate> = Vec::new();
     // One warning per grant refused for its shape or its plain-http URL.
@@ -1953,16 +1989,11 @@ async fn run_redirect_selected_untracked(
         // A confirmed uuid whose bundled instance (#469) or `npm:` alias
         // entry (#1081) the rewriter had to skip leaves that copy
         // unpatched, so it too is verified, never assumed.
-        // A package Bazel governs is assumed only on a pin the Bazel gate
-        // confirmed in this run, and the statement holds that pin to the
-        // digest this run was granted.
-        params.bazel.grants = crate::bazel_gate::hosted::grants(&done);
         params.assume_applied = confirmed
             .iter()
             .filter(|(_, uuid)| {
                 !rewrite.bundled_skipped_uuids.contains(uuid)
                     && !rewrite.alias_skipped_entries.contains_key(uuid)
-                    && crate::bazel_gate::hosted::assumed(&done, uuid)
             })
             .map(|(purl, _)| purl.clone())
             .filter(|purl| {
@@ -1974,6 +2005,10 @@ async fn run_redirect_selected_untracked(
                     && !python_stale.unjudged_purls.contains(purl)
             })
             .collect();
+        // A package Bazel governs is assumed only on a pin the Bazel gate
+        // confirmed in this run, and the statement holds that pin to the
+        // digest this run was granted.
+        bazel.statement(&done, &mut params);
         // A healthy copy in another interpreter must not override a stale
         // Python tree found by the probe, including with --vex-no-verify;
         // likewise a vlt copy the heal could not prove patched.

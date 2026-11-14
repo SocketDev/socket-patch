@@ -192,11 +192,68 @@ fn commit_pending_message(journal: &Path, files: &[String]) -> String {
     } else {
         format!("it covers {}", listed(files))
     };
-    format!(
-        "a previous run was interrupted before its vendored commit finished (journal: {}; \
-         {covers}), and --dry-run writes nothing; run without --dry-run to finish it",
-        journal.display()
-    )
+    // The journal of a commit anchored at a Bazel root lies beside that
+    // root's index, and the paths it names are relative to the root, which
+    // can lie above the project the command was started in.
+    let root_journal = Path::new(crate::utils::group_commit::ROOT_JOURNAL_REL);
+    let anchored = root_journal.components().count();
+    let root = journal.ancestors().nth(anchored).filter(|_| {
+        let tail: Vec<_> = journal.components().rev().take(anchored).collect();
+        tail.into_iter().rev().eq(root_journal.components())
+    });
+    match root {
+        Some(root) => format!(
+            "a previous run was interrupted before its commit under the Bazel root {} finished \
+             (journal: {}; {covers}, relative to that root), and --dry-run writes nothing; run \
+             without --dry-run to finish it",
+            root.display(),
+            journal.display()
+        ),
+        None => format!(
+            "a previous run was interrupted before its vendored commit finished (journal: {}; \
+             {covers}), and --dry-run writes nothing; run without --dry-run to finish it",
+            journal.display()
+        ),
+    }
+}
+
+/// A commit that an interrupted run left anchored at a Bazel root above
+/// the project, which this acquire could not finish and which names no
+/// file of the project (`utils::bazel_root_writes::recover_above`). The
+/// lock was taken all the same: the command reads none of the files the
+/// commit touched. The files under `root` that the journal names may be
+/// half replaced, so a command that decides from them or writes there
+/// treats the root as one it cannot ask about, and the root's own lock
+/// refuses every writer until a holder finishes the commit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnchoredPending {
+    /// The Bazel root the commit is anchored at.
+    pub root: PathBuf,
+    pub journal: PathBuf,
+    /// The paths the journal names, relative to `root`, exactly as
+    /// written in it: for a message only. Empty when it cannot be parsed.
+    pub files: Vec<String>,
+    /// Why it was not finished. For the user: no token, no URL.
+    pub reason: String,
+}
+
+impl AnchoredPending {
+    /// The one warning of the acquire that left the journal in place.
+    pub fn warning(&self) -> String {
+        let covers = match self.files.is_empty() {
+            true => String::new(),
+            false => format!("; it covers {}, relative to that root", listed(&self.files)),
+        };
+        format!(
+            "an interrupted run's commit under the Bazel root {} is not finished ({}; journal: \
+             {}{covers}); this command reads none of those files and went on, and nothing is \
+             written under that root until a socket-patch command that can write there \
+             finishes it",
+            self.root.display(),
+            self.reason,
+            self.journal.display()
+        )
+    }
 }
 
 /// What acquiring the lock did about the group commit an interrupted
@@ -245,6 +302,8 @@ pub struct LockGuard {
     registration: Option<interrupt::Registration>,
     /// See [`LockGuard::commit_recovery`].
     recovery: Option<CommitRecovery>,
+    /// See [`LockGuard::unfinished_above`].
+    unfinished: Vec<AnchoredPending>,
 }
 
 impl LockGuard {
@@ -252,6 +311,15 @@ impl LockGuard {
     /// commit; `None` when it found no journal.
     pub fn commit_recovery(&self) -> Option<&CommitRecovery> {
         self.recovery.as_ref()
+    }
+
+    /// The commits anchored at a Bazel root above the project that this
+    /// acquire found and could not finish, none of which names a file of
+    /// the project. The acquire already printed one `Warning:` line for
+    /// each on stderr. Empty for a bare lock, and wherever no such journal
+    /// lies above the project.
+    pub fn unfinished_above(&self) -> &[AnchoredPending] {
+        &self.unfinished
     }
 
     /// Release the lock now — unlink, close, prune — instead of at the
@@ -678,22 +746,28 @@ mod interrupt {
 fn recover_group_commit(
     socket_dir: &Path,
     dry_run: bool,
-) -> Result<Option<CommitRecovery>, LockError> {
+    wait: Duration,
+) -> Result<(Option<CommitRecovery>, Vec<AnchoredPending>), LockError> {
     let own = recover_project_commit(socket_dir, dry_run)?;
     let Some(project_root) = socket_dir.parent() else {
-        return Ok(own);
+        return Ok((own, Vec::new()));
     };
     // A commit anchored at a Bazel root at or above the project covers
     // files a command of this project reads (a lock a hub names, the
     // root's index), and its journal lies at that root: it is finished
     // here too, under the root's own lock, and said like the project's.
-    let anchored = crate::utils::bazel_root_writes::recover_above(project_root, dry_run)?;
-    for recovery in &anchored {
+    // One that cannot be finished and names no file of the project is
+    // said once and does not fail the acquire.
+    let above = crate::utils::bazel_root_writes::recover_above(project_root, dry_run, wait)?;
+    for recovery in &above.recovered {
         eprintln!("Warning: {}", recovery.detail);
     }
-    let mut all = own.into_iter().chain(anchored);
+    for pending in &above.unfinished {
+        eprintln!("Warning: {}", pending.warning());
+    }
+    let mut all = own.into_iter().chain(above.recovered);
     let Some(mut merged) = all.next() else {
-        return Ok(None);
+        return Ok((None, above.unfinished));
     };
     for more in all {
         // One entry is reported: a journal that was set aside outranks
@@ -703,7 +777,7 @@ fn recover_group_commit(
         }
         merged.detail = format!("{}; {}", merged.detail, more.detail);
     }
-    Ok(Some(merged))
+    Ok((Some(merged), above.unfinished))
 }
 
 /// [`recover_group_commit`] for the project's own journal.
@@ -904,8 +978,15 @@ fn acquire_as(socket_dir: &Path, timeout: Duration, mode: Mode) -> Result<LockGu
                     crate::utils::failpoint::hit("apply_lock.acquired_bare");
                     return Ok(guard);
                 }
-                // On failure the guard drops here, releasing the lock.
-                guard.recovery = recover_group_commit(socket_dir, mode == Mode::DryRun)?;
+                // On failure the guard drops here, releasing the lock. A
+                // root above the project is waited for no longer than the
+                // caller would have waited for its own lock.
+                let left = match deadline {
+                    Some(deadline) => deadline.saturating_duration_since(Instant::now()),
+                    None => timeout,
+                };
+                (guard.recovery, guard.unfinished) =
+                    recover_group_commit(socket_dir, mode == Mode::DryRun, left)?;
                 // The lock proves no live run owns a staging entry left
                 // here: clear what an interrupted one could not. A dry
                 // run deletes nothing.
@@ -1086,6 +1167,7 @@ fn attempt(path: &Path, socket_dir: &Path, bare: bool) -> Attempt {
             bare,
             registration: None,
             recovery: None,
+            unfinished: Vec::new(),
         }),
         // The path names a replacement: a releaser unlinked the inode we
         // locked between our open and our lock, and a newcomer created

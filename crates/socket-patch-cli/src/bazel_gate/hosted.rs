@@ -13,11 +13,21 @@
 //!   the stat-only probe and nothing else, and the engine then runs
 //!   exactly as it always has.
 //! - **The commit** ([`Hosted::commit`]). What the Bazel group staged is
-//!   relative to the Bazel root and lands in the commit anchored there
-//!   (`utils::group_commit::commit_anchored`), under the root's lock,
-//!   before the project's own files. A failure of either side leaves
-//!   neither written. Each plan that was carried out is then settled by
-//!   `run::finish`, which this release never lets unwind.
+//!   relative to the Bazel root and lands through `run::land`: under the
+//!   root's lock, the project's install-policy files first (they are inert
+//!   without the pin, and the pin is rejected by the package manager
+//!   without them), then the commit anchored at the root
+//!   (`utils::group_commit::commit_anchored`), then each plan settled by
+//!   `run::finish` over the seam's runner, and only then the project's
+//!   own files. A failure of any step leaves nothing written. A path that
+//!   the project's open group commit holds and the Bazel group rewrote (a
+//!   takeover's staged revert of a lock a hub reads) is landed once, by
+//!   the anchored commit (`group_commit::settle_with_open_group`).
+//! - **What cannot be asked.** A root outside the directory socket-patch
+//!   writes in for the project (no repository around it, and the root
+//!   above it), and a root whose interrupted commit is still journaled:
+//!   each governed patch is refused before any plan, in a run and in its
+//!   dry run, with the root or the journal named.
 //! - **The report** ([`Hosted::skipped`], [`Hosted::annotate`]). A patch
 //!   the gate refused is a `skipped` event whose `errorCode` is the code
 //!   of the mode and reason, with `details.token`, `details.lift` and
@@ -39,11 +49,12 @@ use std::sync::{Arc, Mutex, PoisonError};
 use serde_json::{json, Value};
 use socket_patch_core::bazel::codes::Code;
 use socket_patch_core::bazel::gate::{self, GateCx, Roots};
+use socket_patch_core::bazel::govern::{BAZEL_ROOT_OUTSIDE_REPOSITORY, WORKSPACE_UNREADABLE};
 use socket_patch_core::bazel::inventory;
 use socket_patch_core::bazel::lanes::{self, Proofs};
 use socket_patch_core::bazel::model::{
-    ClaimOs, GateOutcome, Governance, Hub, LaneTable, Lift, LockRole, Mode, Probe, Reason, Refusal,
-    RunPolicy,
+    ClaimOs, Gap, GateOutcome, Governance, Hub, LaneTable, Lift, LockRole, Mode, Probe, Reason,
+    Refusal, RunPolicy,
 };
 use socket_patch_core::bazel::owned_index::INDEX_PATH;
 use socket_patch_core::crawlers::types::Ecosystem;
@@ -51,12 +62,15 @@ use socket_patch_core::hosted::bazel_reads::{Asked, BazelDone, BazelReads, Root}
 use socket_patch_core::hosted::engine::{self, Candidate, CandidateFiles, Rewritten, SkippedPatch};
 use socket_patch_core::patch::redirect::bazel::{BazelHost, Decided, Verdict};
 use socket_patch_core::patch::redirect::Integrity;
-use socket_patch_core::utils::group_commit::restore_anchored;
+use socket_patch_core::utils::group_commit::{
+    pending_anchored, settle_with_open_group, ROOT_JOURNAL_REL,
+};
 use socket_patch_core::vendor::lock_inventory::ProjectView;
 
-use super::run::{finish, land, Finish, NoRunner, Staged, Unlanded};
+use super::run::{land, outside, runner, Staged, ToolRunner, Unlanded};
 use super::{run_policy, IndexState, Loaded, Loader, RunCx};
 use crate::args::GlobalArgs;
+use crate::commands::vex::VexBuildParams;
 use crate::json_envelope::Envelope;
 
 /// The operating system socket-patch runs on, as a lane claims one.
@@ -72,6 +86,14 @@ fn host() -> Option<ClaimOs> {
     }
 }
 
+/// The journal of a commit that an interrupted run left anchored at the
+/// root, still there when the root was read.
+struct Pending {
+    journal: PathBuf,
+    /// The paths it names, relative to the root; empty when unknown.
+    files: Vec<String>,
+}
+
 /// One load of the project's Bazel roots, as the engine asks about it.
 struct Read {
     loaded: Arc<Loaded>,
@@ -80,19 +102,35 @@ struct Read {
     proofs: Proofs,
     run: RunPolicy,
     allow_patch_conflicts: bool,
+    /// Why no run of this project lands at the nearest root
+    /// (`run::outside`).
+    outside: Option<String>,
+    /// The nearest root's unfinished commit.
+    pending: Option<Pending>,
+}
+
+/// Why no gate can be asked about a root.
+enum Unaskable<'a> {
+    /// No model of the root was read.
+    Unread,
+    /// The owned index cannot be relied on.
+    Index(&'a dyn std::fmt::Display),
+    /// The root lies outside the directory socket-patch writes in.
+    Outside(&'a str),
+    /// An interrupted commit is journaled at the root.
+    Pending(&'a Pending),
 }
 
 impl Read {
     /// The refusal of every ecosystem a ruleset governs, or may govern,
-    /// where no gate can be asked: with `fault`, because the owned index
-    /// cannot be relied on, else because no model of the root was read.
-    fn unasked(&self, fault: Option<&dyn std::fmt::Display>) -> Vec<(Ecosystem, Refusal)> {
+    /// where no gate can be asked.
+    fn unasked(&self, why: &Unaskable<'_>) -> Vec<(Ecosystem, Refusal)> {
         let mut refusals = Vec::new();
         for (ecosystem, governance) in self.loaded.governed() {
-            let refusal = match (governance, fault) {
+            let refusal = match (governance, why) {
                 (Governance::NotGoverned, _) => continue,
                 // No lane writes beside an index that cannot be relied on.
-                (_, Some(fault)) => {
+                (_, Unaskable::Index(fault)) => {
                     let lift = Lift::UserEdit {
                         file: INDEX_PATH.to_string(),
                         what: "restore it from version control".to_string(),
@@ -101,8 +139,43 @@ impl Read {
                     let reason = Reason::OwnedFileModified;
                     lanes::refuse(reason, gate::OWNED_FILE_MODIFIED, why, lift)
                 }
-                (Governance::Undetermined(gaps), None) => gate::undetermined(&gaps),
-                (_, None) => gate::undetermined(&[]),
+                // What the root channel says of the same placement: the
+                // project lock finishes an interrupted commit no further
+                // up than the directory socket-patch writes in.
+                (_, Unaskable::Outside(why)) => gate::undetermined(&[Gap {
+                    token: BAZEL_ROOT_OUTSIDE_REPOSITORY,
+                    file: String::new(),
+                    detail: (*why).to_string(),
+                }]),
+                // The files the journal names may be half replaced:
+                // nothing is decided from them, in a run or in its dry run.
+                (_, Unaskable::Pending(pending)) => {
+                    let covers = match pending.files.is_empty() {
+                        true => String::new(),
+                        false => format!("; it covers {}", pending.files.join(", ")),
+                    };
+                    let why = format!(
+                        "a commit under the Bazel root is unfinished: an interrupted run left \
+                         it, or another run is making it now (journal: {}{covers}), so the \
+                         files it covers may be half replaced and nothing is decided from them",
+                        pending.journal.display()
+                    );
+                    let lift = Lift::UserEdit {
+                        file: ROOT_JOURNAL_REL.to_string(),
+                        what: "run `socket-patch scan` without `--dry-run`, from a checkout it \
+                               can write to, which finishes the interrupted commit; then run \
+                               this command again"
+                            .to_string(),
+                    };
+                    lanes::refuse(
+                        Reason::ConsumerUndetermined,
+                        WORKSPACE_UNREADABLE,
+                        why,
+                        lift,
+                    )
+                }
+                (Governance::Undetermined(gaps), Unaskable::Unread) => gate::undetermined(&gaps),
+                (_, Unaskable::Unread) => gate::undetermined(&[]),
             };
             refusals.push((ecosystem, refusal));
         }
@@ -112,16 +185,24 @@ impl Read {
 
 impl Root for Read {
     fn ask(&self) -> Asked<'_> {
+        if let Some(why) = &self.outside {
+            return Asked::Unasked(self.unasked(&Unaskable::Outside(why)));
+        }
+        if let Some(pending) = &self.pending {
+            return Asked::Unasked(self.unasked(&Unaskable::Pending(pending)));
+        }
         let nearest = self.loaded.roots().next();
         let read = nearest.and_then(|root| Some((root, root.model().ok()?)));
         let Some((root, ws)) = read else {
             // No root inside the repository, or one that could not be
             // read: governance decides alone.
-            return Asked::Unasked(self.unasked(None));
+            return Asked::Unasked(self.unasked(&Unaskable::Unread));
         };
         let index = match root.index() {
             IndexState::Ours(index) => index,
-            IndexState::Faulty(fault) => return Asked::Unasked(self.unasked(Some(fault))),
+            IndexState::Faulty(fault) => {
+                return Asked::Unasked(self.unasked(&Unaskable::Index(fault)));
+            }
         };
         let roots = Roots::Probed {
             probe: &self.probe,
@@ -153,6 +234,12 @@ pub struct Hosted {
     proofs: Proofs,
     run: RunCx,
     allow_patch_conflicts: bool,
+    /// Who runs the one command of a plan that needs one: the release's
+    /// runner (`run::runner`), whatever the lane table.
+    runner: Box<dyn ToolRunner>,
+    /// The table the run's own statement is judged over
+    /// ([`Hosted::statement`]): the production one in the binary.
+    attests: &'static LaneTable,
     /// The load the last rewrite was decided from, for the report.
     loaded: Mutex<Option<Arc<Loaded>>>,
 }
@@ -173,8 +260,26 @@ impl Hosted {
             proofs,
             run,
             allow_patch_conflicts: common.allow_patch_conflicts,
+            runner: runner(),
+            attests: &lanes::PRODUCTION,
             loaded: Mutex::new(None),
         }
+    }
+
+    /// The seam whose in-run statement is judged over `lanes`: a test's
+    /// table, where the pins of the run were made by a lane of it. The
+    /// binary's statement is judged over the production table, which is
+    /// also the one its pins were made over.
+    pub fn attesting(mut self, lanes: &'static LaneTable) -> Self {
+        self.attests = lanes;
+        self
+    }
+
+    /// The seam with another runner than the release's: a test's, which
+    /// answers as it is told.
+    pub fn with_runner(mut self, runner: impl ToolRunner + 'static) -> Self {
+        self.runner = Box::new(runner);
+        self
     }
 
     /// The seam of `scan --mode hosted` and `get --mode hosted`.
@@ -202,10 +307,35 @@ impl Hosted {
             if again {
                 loader.committed(&project);
             }
-            Some(loader.load(&project))
+            let loaded = loader.load(&project);
+            // What keeps the nearest root from being asked, whatever its
+            // files say: one stat each. The journal is looked for after
+            // the project's lock had its chance to finish the commit (a
+            // run that writes holds it by now), so one that is still
+            // there is one nobody could finish, or a dry run's to report.
+            let nearest = loaded.roots().next().map(|root| root.root().root.clone());
+            let outside = nearest.as_deref().and_then(|root| outside(root, &project));
+            let pending = nearest.as_deref().and_then(|root| {
+                // A journal that cannot be read is no less in the way.
+                let unread = |_| {
+                    let levels = ROOT_JOURNAL_REL.split('/');
+                    Pending {
+                        journal: levels.fold(root.to_path_buf(), |at, level| at.join(level)),
+                        files: Vec::new(),
+                    }
+                };
+                let found = pending_anchored(root).map(|found| {
+                    found.map(|found| Pending {
+                        journal: found.journal,
+                        files: found.files,
+                    })
+                });
+                found.unwrap_or_else(|e| Some(unread(e)))
+            });
+            Some((loaded, outside, pending))
         });
-        let loaded = match task.await {
-            Ok(loaded) => loaded?,
+        let (loaded, outside, pending) = match task.await {
+            Ok(read) => read?,
             Err(panic) => std::panic::resume_unwind(panic.into_panic()),
         };
         let mut last = self.loaded.lock().unwrap_or_else(PoisonError::into_inner);
@@ -217,6 +347,8 @@ impl Hosted {
             proofs: self.proofs,
             run: run_policy(&self.run),
             allow_patch_conflicts: self.allow_patch_conflicts,
+            outside,
+            pending,
         }))
     }
 
@@ -309,10 +441,10 @@ impl Hosted {
         }
     }
 
-    /// Lands the run: what the Bazel group staged, in the commit anchored
-    /// at the Bazel root, and then the project's own files through
-    /// `native`. Both land or neither does. With nothing staged for a
-    /// Bazel root this is `native` and nothing else.
+    /// Lands the run (the module docs, "The commit"): what the Bazel group
+    /// staged, through `run::land`, and the project's own files through
+    /// `native`. All of it lands or none of it does. With nothing staged
+    /// for a Bazel root this is `native` and nothing else.
     ///
     /// `Err` is the error line. It says `nothing was changed` only when
     /// that is so.
@@ -328,58 +460,67 @@ impl Hosted {
         let unwritten = |why: &dyn std::fmt::Display| {
             format!("failed to write the hosted pins under the Bazel root {at}: {why}")
         };
+        // A path that the project's open group commit holds is landed
+        // once, by the anchored commit; the group is told its bytes.
+        let mut changes = bazel.changes.clone();
+        if let Err(why) = settle_with_open_group(&bazel.root, &mut changes) {
+            return Err(format!("{} (nothing was changed)", unwritten(&why)));
+        }
+        let confirmed = |patch: &&Decided| bazel.confirmed(&patch.uuid);
+        let carried = bazel.group.decided.iter().filter(confirmed);
+        let outcomes: Vec<&GateOutcome> = carried.map(|patch| &patch.outcome).collect();
+        let ahead = engine::policy_files(done);
         let staged = Staged {
             root: &bazel.root,
+            project_rel: &bazel.project_rel,
             touched: &bazel.touched,
-            changes: &bazel.changes,
+            changes: &changes,
+            outcomes: &outcomes,
+            ahead: &ahead,
         };
-        let landed = land(staged, native).await;
+        let landed = land(staged, self.runner.as_ref(), native).await;
         // Whatever came of it, what the loader read of the root is old.
         self.loader.committed(&bazel.root);
-        let landed = match landed {
-            Ok(landed) => landed,
-            Err(Unlanded::Root { why, pending }) => {
+        let back = |left: Vec<String>| match left.is_empty() {
+            true => "nothing was changed".to_string(),
+            false => format!(
+                "putting back what was written failed as well: {}",
+                left.join(", ")
+            ),
+        };
+        match landed {
+            Ok(landed) => {
+                drop(landed.lock);
+                Ok(())
+            }
+            Err(Unlanded::Root { why, pending, left }) => {
                 let state = match pending {
-                    true => {
-                        "the interrupted write is journaled; the next socket-patch command \
+                    true => "the interrupted write is journaled; the next socket-patch command \
                              finishes it"
-                    }
-                    false => "nothing was changed",
+                        .to_string(),
+                    false => back(left),
                 };
-                return Err(format!("{} ({state})", unwritten(&why)));
+                Err(format!("{} ({state})", unwritten(&why)))
+            }
+            // The replay rewrote files, so "nothing was changed" would be
+            // false: nothing of this run was.
+            Err(Unlanded::Recovered(replayed)) => Err(format!(
+                "{}; this run decided from the files as they were before that, so nothing of \
+                 this run was written: run it again",
+                unwritten(&replayed.detail)
+            )),
+            Err(Unlanded::Run { why, left }) => {
+                Err(format!("{} ({})", unwritten(&why), back(left)))
             }
             // The project's files did not land, and the Bazel root went
             // back to what it held: the run left nothing half-written.
-            Err(Unlanded::Project { error, left }) if left.is_empty() => return Err(error),
-            Err(Unlanded::Project { error, left }) => {
-                return Err(format!(
-                    "{error}; putting back what was written under the Bazel root {at} failed as \
-                     well: {}",
-                    left.join(", ")
-                ));
-            }
-        };
-        // Each plan that was carried out is settled. The originals are
-        // kept until the last one has spoken.
-        let mut captured = landed.captured;
-        for patch in &bazel.group.decided {
-            if !bazel.confirmed(&patch.uuid) {
-                continue;
-            }
-            captured = match finish(&patch.outcome, captured, &NoRunner) {
-                Finish::Keep(captured) => captured,
-                Finish::Unwind { captured, why } => {
-                    let left = restore_anchored(&landed.lock, captured.files()).await;
-                    let left = match left {
-                        Ok(()) => "the pins under the Bazel root were taken back".to_string(),
-                        Err(left) => format!("taking them back failed: {}", left.join(", ")),
-                    };
-                    return Err(format!("{}; {left}", unwritten(&why)));
-                }
-            };
+            Err(Unlanded::Project { error, left }) if left.is_empty() => Err(error),
+            Err(Unlanded::Project { error, left }) => Err(format!(
+                "{error}; putting back what was written under the Bazel root {at} failed as \
+                 well: {}",
+                left.join(", ")
+            )),
         }
-        drop(landed.lock);
-        Ok(())
     }
 }
 
@@ -412,6 +553,48 @@ pub fn grants(done: &Rewritten) -> Vec<(String, Integrity)> {
         .filter(|dep| confirmed.contains(&dep.patch_uuid));
     own.map(|dep| (dep.patch_uuid.clone(), dep.integrity.clone()))
         .collect()
+}
+
+impl Hosted {
+    /// The Bazel part of the statement a hosted run makes for itself
+    /// (design 7), over the parameters the command built for `done`: the
+    /// statement is judged over the seam's table, holds each pin the Bazel
+    /// group confirmed in this run to the digest this run was granted
+    /// ([`grants`]), and takes no patch of a package Bazel governs for
+    /// applied unless the group confirmed it ([`assumed`]). The one place
+    /// these are set: the command calls it, and so does every test of the
+    /// statement.
+    pub(crate) fn statement(&self, done: &Rewritten, params: &mut VexBuildParams) {
+        params.bazel.lanes = self.attests;
+        params.bazel.grants = grants(done);
+        let unproven = |purl: &String| {
+            let mut pins = done.confirmed.iter().filter(|(of, _)| of == purl);
+            pins.any(|(_, uuid)| !assumed(done, uuid))
+        };
+        params.assume_applied.retain(|purl| !unproven(purl));
+    }
+}
+
+/// The hosted command (`get --mode hosted` for the selected `(purl,
+/// uuid)` pairs) over a seam of the caller's making, boxed: the future
+/// embeds the whole hosted engine. For a test that runs the command with a
+/// lane table, and a tool runner, of its own: the lines of the command
+/// that only a planning lane reaches are run by nothing else, since every
+/// lane of the binary is disabled. The binary's commands build the
+/// production seam themselves.
+pub fn run_command<'a>(
+    seam: &'a Hosted,
+    common: &'a GlobalArgs,
+    vex: &'a crate::commands::vex::VexEmbedArgs,
+    api_client: &'a socket_patch_core::api::client::ApiClient,
+    selected: &'a [(String, String)],
+) -> std::pin::Pin<Box<dyn Future<Output = i32> + 'a>> {
+    let envelope = common
+        .json
+        .then(|| Envelope::new(crate::json_envelope::Command::Get));
+    Box::pin(crate::commands::scan::hosted::run_redirect_selected_over(
+        common, vex, false, api_client, selected, envelope, None, None, "get", seam,
+    ))
 }
 
 /// What a person is told about a patch that was skipped with a Bazel
@@ -581,18 +764,15 @@ mod tests {
     /// A patch of a governed ecosystem with no enabled lane: the event
     /// carries the uniform details, the in-run statement does not take it
     /// for applied, and the commit is the project's own and nothing else.
+    /// Over a table of this fixture's whose lane for the cell is disabled,
+    /// so the case says the same once a release enables the shipped one.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_refused_patch_is_reported_and_nothing_is_committed_for_it() {
         let (_tmp, common) = checkout(true);
         let before = tree(&common.cwd);
-        let seam = Hosted::production(&common);
+        let seam = Hosted::new(&common, lane::DISABLED, lane::PROOFS);
         let candidates = [candidate()];
         let done = rewrite(&seam, &common, &candidates).await;
-        let admitted = done.bazel.as_ref().is_some_and(|b| b.confirmed(UUID));
-        if admitted {
-            // A release that enables the lane pins the package instead.
-            return;
-        }
         assert_eq!(done.confirmed, Vec::new());
         assert!(!staged(&done) && !assumed(&done, UUID));
         assert!(assumed(&done, "0a1b2c3d-0000-4000-8000-0000000000a1"));
@@ -690,7 +870,7 @@ mod tests {
             std::fs::write(path, text).expect("write");
         };
         put(lane::LOCK, lane::LOCK_TEXT);
-        let seam = Hosted::new(&common, lane::NATIVE, lane::PROOFS);
+        let seam = Hosted::new(&common, lane::NATIVE, lane::PROOFS).attesting(&lane::NATIVE);
         let candidates = [Candidate {
             purl: lane::PURL.to_string(),
             dep: lane::grant(),
@@ -726,8 +906,10 @@ mod tests {
         let manifest = json!({ "patches": { lane::PURL: record } });
         put(".socket/manifest.json", &manifest.to_string());
 
-        // The parameters as the hosted run sets them for `done`.
-        let statement = |done: &Rewritten, name: &str| {
+        // The parameters as the hosted run builds them for `done`: every
+        // pin it confirmed, and then the seam's own part
+        // ([`Hosted::statement`], the function the command calls).
+        let parameters = |done: &Rewritten, name: &str| {
             let out = tmp.path().join(name);
             let mut params = VexEmbedArgs {
                 vex: Some(out),
@@ -735,35 +917,164 @@ mod tests {
                 ..VexEmbedArgs::default()
             }
             .to_build_params(None);
-            params.bazel.lanes = &lane::NATIVE;
-            params.bazel.grants = grants(done);
-            let own = done
-                .confirmed
-                .iter()
-                .filter(|(_, uuid)| assumed(done, uuid));
-            params.assume_applied = own.map(|(purl, _)| purl.clone()).collect();
-            params.hosted_uuids = done
-                .confirmed
-                .iter()
-                .map(|(_, uuid)| uuid.clone())
-                .collect();
+            let pins = done.confirmed.iter();
+            params.assume_applied = pins.clone().map(|(purl, _)| purl.clone()).collect();
+            params.hosted_uuids = pins.map(|(_, uuid)| uuid.clone()).collect();
+            seam.statement(done, &mut params);
+            params
+        };
+        let generate = |params: VexBuildParams| {
             let manifest_path = common.resolved_manifest_path();
             let common = &common;
             async move { generate_vex_from_manifest_path(common, &params, &manifest_path).await }
         };
-        let attested = statement(&done, "in-run.json").await;
+        let params = parameters(&done, "in-run.json");
+        assert_eq!(params.assume_applied, [lane::PURL.to_string()]);
+        assert_eq!(
+            params.bazel.grants.len(),
+            1,
+            "the grant of the confirmed pin"
+        );
+        let attested = generate(params).await;
         let attested = attested.unwrap_or_else(|e| panic!("{}: {:?}", e.message, e.failed));
         assert_eq!(attested.statements, 1, "{:?}", attested.failed);
 
-        // The same tree with no confirmed uuid: the run holds no grant.
+        // A pin of a governed package that the Bazel group did not confirm
+        // in this run is not taken for applied, and holds no grant.
         let mut later = done;
         later.rewrite.confirmed_bazel_uuids.clear();
+        let params = parameters(&later, "unconfirmed.json");
+        assert_eq!(params.assume_applied, Vec::<String>::new());
+        assert!(params.bazel.grants.is_empty());
+        // The same tree with no confirmed uuid: the run holds no grant.
         later.confirmed.clear();
         assert!(grants(&later).is_empty());
-        let Err(withheld) = statement(&later, "later.json").await else {
+        let Err(withheld) = generate(parameters(&later, "later.json")).await else {
             panic!("attested with no grant to hold the locked digest to");
         };
         let reasons: Vec<&str> = withheld.failed.iter().map(|f| &f.reason[..]).collect();
         assert_eq!(reasons, [Code::VexConsumerUndetermined.as_str()]);
+    }
+
+    /// A checkout-less tree: a Bazel root with `.bazelversion`, and an
+    /// npm project at `project` under it whose lock the hub reads. No
+    /// repository bounds what socket-patch writes there.
+    fn unbounded(project: &str) -> (tempfile::TempDir, GlobalArgs) {
+        let tmp = tempfile::tempdir().expect("a temporary directory");
+        let root = std::fs::canonicalize(tmp.path()).expect("its real path");
+        let at = |rel: &str| {
+            let levels = rel.split('/').filter(|level| !level.is_empty());
+            levels.fold(root.clone(), |at, level| at.join(level))
+        };
+        let put = |rel: &str, text: &str| {
+            let path = at(rel);
+            std::fs::create_dir_all(path.parent().expect("a parent")).expect("mkdir");
+            std::fs::write(path, text).expect("write");
+        };
+        let (below, label) = match project {
+            "" => (String::new(), "//:pnpm-lock.yaml".to_string()),
+            project => (format!("{project}/"), format!("//{project}:pnpm-lock.yaml")),
+        };
+        put(".bazelversion", lane::BAZELVERSION);
+        put("MODULE.bazel", &lane::MODULE.replace("LOCK_LABEL", &label));
+        put(&format!("{below}BUILD.bazel"), "");
+        put(&format!("{below}{}", lane::LOCK), lane::LOCK_TEXT);
+        let common = GlobalArgs {
+            cwd: at(project),
+            ..GlobalArgs::default()
+        };
+        (tmp, common)
+    }
+
+    fn lane_candidates() -> [Candidate; 1] {
+        [Candidate {
+            purl: lane::PURL.to_string(),
+            dep: lane::grant(),
+        }]
+    }
+
+    /// With no repository around a project, a Bazel root above it lies
+    /// outside the directory socket-patch writes in, and the project's
+    /// lock finishes no interrupted commit there. So no plan is made for
+    /// such a root, whatever lane serves the cell: each governed patch is
+    /// refused with the root named, and nothing is staged or written. The
+    /// project at the root itself is inside its own bound and is pinned.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_root_outside_the_directory_socket_patch_writes_in_is_never_planned_for() {
+        let (tmp, common) = unbounded("svc/app");
+        let root = std::fs::canonicalize(tmp.path()).expect("its real path");
+        let before = tree(&root);
+        let seam = Hosted::new(&common, lane::TABLE, lane::PROOFS);
+        let candidates = lane_candidates();
+        let done = rewrite(&seam, &common, &candidates).await;
+        assert!(done.bazel.is_some(), "the root above the project was read");
+        assert_eq!(done.confirmed, Vec::new(), "{:?}", done.rewrite.warnings);
+        assert!(!staged(&done) && !assumed(&done, lane::UUID));
+        assert_eq!(done.rewritten, Vec::<String>::new());
+        let skipped = seam.skipped(&done, &candidates);
+        let code = Code::refusal(Mode::Hosted, Reason::ConsumerUndetermined).expect("a code");
+        let reasons: Vec<&str> = skipped.iter().map(|patch| patch.reason.as_str()).collect();
+        assert_eq!(reasons, [code.as_str()], "{skipped:?}");
+        let detail = skipped[0].detail.as_deref().unwrap_or_default();
+        assert!(detail.contains("outside the project"), "{detail}");
+        assert!(detail.ends_with("nothing was written"), "{detail}");
+        let mut env = Envelope::new(Command::Scan);
+        env.record(PatchEvent::new(PatchAction::Skipped, lane::PURL).with_uuid(lane::UUID));
+        seam.annotate(&mut env, &done);
+        let details = env.events[0].details.clone().expect("details");
+        assert_eq!(
+            details["token"], BAZEL_ROOT_OUTSIDE_REPOSITORY,
+            "{details:#}"
+        );
+        assert_eq!(seam.commit(&done, async { Ok(()) }).await, Ok(()));
+        assert_eq!(tree(&root), before);
+
+        // The root's own project: the same lane pins it.
+        let (_tmp, common) = unbounded("");
+        let seam = Hosted::new(&common, lane::TABLE, lane::PROOFS);
+        let done = rewrite(&seam, &common, &candidates).await;
+        let pinned = [(lane::PURL.to_string(), lane::UUID.to_string())];
+        assert_eq!(done.confirmed, pinned, "{:?}", done.rewrite.warnings);
+        assert!(staged(&done));
+    }
+
+    /// A commit that an interrupted run left journaled at the root, still
+    /// there when the root is read: the files it names may be half
+    /// replaced, so nothing is decided from them. Each governed patch is
+    /// refused with the journal and its files named, whatever lane serves
+    /// the cell, and nothing is staged.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_root_with_an_unfinished_commit_is_not_decided_from() {
+        let (_tmp, common) = checkout(true);
+        let put = |rel: &str, text: &str| {
+            let levels = rel.split('/').filter(|level| !level.is_empty());
+            let path = levels.fold(common.cwd.clone(), |at, level| at.join(level));
+            std::fs::create_dir_all(path.parent().expect("a parent")).expect("mkdir");
+            std::fs::write(path, text).expect("write");
+        };
+        put(lane::LOCK, lane::LOCK_TEXT);
+        let journal = serde_json::json!({
+            "version": 1,
+            "files": [{ "path": lane::LOCK, "before": null, "after": "bG9jawo=" }],
+        });
+        put(ROOT_JOURNAL_REL, &journal.to_string());
+        let before = tree(&common.cwd);
+        let seam = Hosted::new(&common, lane::TABLE, lane::PROOFS);
+        let candidates = lane_candidates();
+        let done = rewrite(&seam, &common, &candidates).await;
+        assert_eq!(done.confirmed, Vec::new(), "{:?}", done.rewrite.warnings);
+        assert!(!staged(&done));
+        let skipped = seam.skipped(&done, &candidates);
+        assert_eq!(skipped.len(), 1, "{skipped:?}");
+        let detail = skipped[0].detail.as_deref().unwrap_or_default();
+        assert!(detail.contains("unfinished"), "{detail}");
+        assert!(detail.contains(".commit-journal.json"), "{detail}");
+        assert!(detail.contains(lane::LOCK), "{detail}");
+        assert!(detail.ends_with("nothing was written"), "{detail}");
+        assert_eq!(
+            tree(&common.cwd),
+            before,
+            "the journal and the lock as found"
+        );
     }
 }
