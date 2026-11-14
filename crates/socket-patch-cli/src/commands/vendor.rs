@@ -507,7 +507,7 @@ pub(crate) async fn dispatch_revert_one_with(
                 project_root,
                 opts,
                 socket_patch_core::bazel::lanes::PRODUCTION,
-                &crate::bazel_gate::vendored::NoAnchoredCommit,
+                &crate::bazel_gate::vendored::AnchoredCommit,
                 bazel,
             )
             .await
@@ -4626,7 +4626,12 @@ pub(crate) async fn vendor_engine(
             Err(e) => {
                 has_errors = true;
                 commit_failed = true;
-                let detail = if socket_patch_core::utils::group_commit::is_pending(&e) {
+                // A commit left journaled, the project's or the one under
+                // the Bazel root: the next command that takes the lock
+                // finishes it, so nothing of this run is taken back.
+                let pending = socket_patch_core::utils::group_commit::is_pending(&e)
+                    || crate::bazel_gate::vendored::root_pending(&e);
+                let detail = if pending {
                     // Some files were replaced and could not be put back:
                     // the journal left behind makes the next locked command
                     // finish the commit. Until it has, no package of this

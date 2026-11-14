@@ -44,25 +44,30 @@ pub const OTHER_UUID: &str = "0a1b2c3d-0000-4000-8000-0000000000a1";
 /// Packages the lane plans wrongly, by name, each at version `1.0.0`:
 /// what a seam has to refuse before it asks the patch service. The lock
 /// of [`FAULTS_LOCK_TEXT`] resolves each.
-pub const FAULTS: [&str; 7] = [
+pub const FAULTS: [&str; 6] = [
     "spec-uuid",
     "spec-dir",
     "spec-up",
     "spec-sep",
     "spec-scope",
     "spec-two",
-    "runs-after",
 ];
+/// A package the lane plans with a command the user runs afterwards (a
+/// works-after plan). The lock of [`faults_lock_text`] resolves it.
+pub const RUNS_AFTER_PURL: &str = "pkg:npm/runs-after@1.0.0";
+/// The command of that plan.
+pub const RUNS_AFTER_COMMAND: &str = "bazel mod deps --lockfile_mode=update";
 
 /// The purl of the faulty package `name`.
 pub fn fault_purl(name: &str) -> String {
     format!("pkg:npm/{name}@1.0.0")
 }
 
-/// A lock that resolves `left-pad` and every package of [`FAULTS`].
+/// A lock that resolves `left-pad`, every package of [`FAULTS`] and the
+/// one of [`RUNS_AFTER_PURL`].
 pub fn faults_lock_text() -> String {
     let (mut packages, mut snapshots) = (String::new(), String::new());
-    for name in FAULTS {
+    for name in FAULTS.into_iter().chain(["runs-after"]) {
         packages.push_str(&format!(
             "  {name}@1.0.0:\n    resolution: {{integrity: sha512-upstream-{name}}}\n\n"
         ));
@@ -206,7 +211,7 @@ fn toy_gate(cx: &LaneCx<'_>, req: &PatchRequest<'_>) -> GateOutcome {
     // A works-after plan: one command the user runs afterwards.
     let run = RunRequired {
         kind: RunKind::Lockfile,
-        command: "bazel mod deps --lockfile_mode=update".to_string(),
+        command: RUNS_AFTER_COMMAND.to_string(),
         argv: Vec::new(),
         env: Vec::new(),
         outputs: Vec::new(),

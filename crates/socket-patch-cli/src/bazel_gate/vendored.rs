@@ -21,6 +21,10 @@
 //!   lane's writer pin the artifact, hands the plan to `bazel::exec` and
 //!   puts the artifact in place.
 //!
+//! A plan whose command the user runs afterwards (works-after) is a plan
+//! like any other: it is carried out, the run names the command
+//! (`vendor_bazel_run_required`), and `run::finish` settles it.
+//!
 //! Every production lane is disabled, so the shipped binary only ever
 //! takes the first two. The third is run by the tests of this file and of
 //! `tests/e2e_bazel/vendored.rs` over a lane table of their own.
@@ -39,14 +43,16 @@
 //! [`Staged::seal`]s what it staged right before its commit (the root's
 //! index is rendered over the file as it is on disk then, never over what
 //! an earlier package of the run read) and hands it to a [`RootCommit`]
-//! with its own group commit, to be committed as one. The commit under a
-//! Bazel root (anchored, journaled, under the root's lock) belongs to the
-//! hosted engine's package; until it is wired in, [`NoAnchoredCommit`] is
-//! the production commit, and it refuses a run that staged anything. An
-//! artifact is a provider, which nothing reads before the pin lands: it is
-//! placed once its plan is staged, as a regular file and never through a
-//! link, and [`Staged::unwind`] takes it away again (or puts back the file
-//! it replaced) when the run's commit does not land.
+//! with its own group commit, to be committed as one. The production
+//! commit is [`AnchoredCommit`]: `bazel_gate::run::land`, the one way a
+//! seam commits under a Bazel root (the commit anchored at the root,
+//! journaled, under the root's lock, refused through a linked level and
+//! for a file that changed since the run read it), with each plan settled
+//! by `run::finish` over `NoRunner`. An artifact is a provider, which
+//! nothing reads before the pin lands: it is placed once its plan is
+//! staged, as a regular file and never through a link, and
+//! [`Staged::unwind`] takes it away again (or puts back the file it
+//! replaced) when the run's commit does not land.
 //!
 //! [`vendor_one`] is the inner entry of the agent write seam: the vendor
 //! engine for one package, under an apply lock the caller holds, with the
@@ -68,7 +74,7 @@ use socket_patch_core::bazel::lanes::{self, Proofs};
 use socket_patch_core::bazel::model::{
     Advisory, ArtifactForm, ArtifactSpec, ClaimOs, Digest, FileText, FileView, Files, GateOutcome,
     Governance, Hub, HubId, Index, LaneId, LaneOps, LaneTable, Lift, LockRole, Mode, PinSource,
-    Plan, Probe, Refusal, RestoreOutcome, VendoredPin, LANE_NOT_ENABLED,
+    Plan, Probe, Refusal, RestoreOutcome, RunRequired, VendoredPin, LANE_NOT_ENABLED,
 };
 use socket_patch_core::bazel::owned_index::{IndexEdit, IndexRow, INDEX_PATH};
 use socket_patch_core::crawlers::bazel_workspace::DiskView;
@@ -77,7 +83,9 @@ use socket_patch_core::manifest::schema::PatchRecord;
 use socket_patch_core::patch::apply::{ApplyResult, PatchSources, VerifyResult, VerifyStatus};
 use socket_patch_core::patch::redirect::{FileEdit, RewriteResult};
 use socket_patch_core::utils::bazel_root_writes::{self, PlanGuard};
-use socket_patch_core::utils::group_commit::{CommittedFile, GroupCommit};
+use socket_patch_core::utils::group_commit::{
+    restore_anchored, AnchoredChange, CommittedFile, GroupCommit,
+};
 use socket_patch_core::utils::purl::{purl_parts, strip_purl_qualifiers};
 use socket_patch_core::utils::socket_dir::remove_tree_and_prune;
 use socket_patch_core::vendor::path::vendor_uuid_dir_rel;
@@ -87,6 +95,7 @@ use socket_patch_core::vendor::{
     VendorWarning, WiringRecord, VENDOR_STATE_REL,
 };
 
+use super::run::{self, finish, land, Finish, NoRunner, Unlanded};
 use super::{run_policy, IndexState, Loaded, LoadedRoot, Loader, RunCx, Warning};
 use crate::args::GlobalArgs;
 use crate::json_envelope::{Envelope, PatchAction};
@@ -107,6 +116,9 @@ pub struct Planned {
     /// The live hubs the plan's lane pins the package in.
     hubs: Vec<HubId>,
     ops: &'static LaneOps,
+    /// The command the user runs after the write, for a plan that works
+    /// after it (the gate's `ProceedAfter`).
+    pending: Option<RunRequired>,
     /// The table the plan's lane is from: the lane is asked through it
     /// what it finds once its writer has run.
     lanes: LaneTable,
@@ -228,17 +240,55 @@ pub struct RootTxn {
     /// joins it when the run seals the transaction ([`Staged::seal`]),
     /// rendered over the file as it is on disk then.
     pub changes: BTreeMap<String, Option<Vec<u8>>>,
-    /// The plans whose writes `changes` holds, in the order they were
-    /// staged: `exec::touched` over them and the root's index lists every
-    /// path a commit of this transaction may land. Empty for an undo.
-    pub plans: Vec<Plan>,
+    /// The gate's outcome for each plan whose writes `changes` holds, in
+    /// the order they were staged: what `run::finish` settles after the
+    /// commit. Empty for an undo.
+    pub outcomes: Vec<GateOutcome>,
     /// What each path of `changes` held on disk when this run read it
     /// (`None`: no file). The commit compares before it replaces, and
     /// refuses the whole transaction when a file changed since.
     pub read: BTreeMap<String, Option<Vec<u8>>>,
+    /// Every path a commit of this transaction may land: `exec::touched`
+    /// over the plans and the root's index, as of the seal (an undo: over
+    /// the rows it works from). A change anywhere else refuses the commit.
+    pub touched: Vec<String>,
     /// The `pins` rows the plans of this run recorded. They are the one
     /// part of the index a run holds: every other row is the file's.
     pins: Vec<IndexRow>,
+    /// The order the commit lands `changes` in, as the executor gave it:
+    /// the record before what it records for a write, the edits before
+    /// the record for an undo. A path it does not name follows.
+    order: Vec<String>,
+}
+
+impl RootTxn {
+    /// The plans whose writes the transaction holds, in the order staged.
+    pub fn plans(&self) -> Vec<Plan> {
+        let plan = |outcome: &GateOutcome| match outcome {
+            GateOutcome::Proceed(plan) | GateOutcome::ProceedAfter(plan, _) => Some(plan.clone()),
+            GateOutcome::NotBazel | GateOutcome::Refuse(_) => None,
+        };
+        self.outcomes.iter().filter_map(plan).collect()
+    }
+
+    /// The change set as the anchored commit takes it: each path with the
+    /// bytes this run read there and the bytes to land, in landing order.
+    pub fn anchored(&self) -> Vec<AnchoredChange> {
+        let first = self
+            .order
+            .iter()
+            .filter(|path| self.changes.contains_key(*path));
+        let rest = self
+            .changes
+            .keys()
+            .filter(|path| !self.order.contains(path));
+        let change = |rel: &String| AnchoredChange {
+            rel: rel.clone(),
+            read: self.read.get(rel).cloned().flatten(),
+            write: self.changes.get(rel).cloned().flatten(),
+        };
+        first.chain(rest).map(change).collect()
+    }
 }
 
 /// The commit of a vendored run: the project's group commit and what the
@@ -253,29 +303,105 @@ pub trait RootCommit: Sync {
     ) -> BoxFuture<'a, std::io::Result<Vec<CommittedFile>>>;
 }
 
-/// The commit of a build that has no commit under a Bazel root yet. With
-/// nothing staged there it is the project's group commit, byte for byte.
-/// A run that staged a change under a root is refused whole and nothing
-/// is written: no production lane makes such a run.
-pub struct NoAnchoredCommit;
+/// A commit under a Bazel root that failed part-way and could not be put
+/// back: its journal stays at the root, and the next run that takes the
+/// root's lock finishes it. Nothing of the run may be taken back.
+#[derive(Debug)]
+struct RootPending(String);
 
-impl RootCommit for NoAnchoredCommit {
+impl std::fmt::Display for RootPending {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for RootPending {}
+
+/// Whether a failed [`RootCommit`] left a journaled commit at the Bazel
+/// root for the next run to finish (the twin of
+/// `utils::group_commit::is_pending` for the project's own commit): the
+/// files of the root are then at their old bytes or their new ones, and
+/// what the run put on disk ahead of the commit stays for them.
+pub fn root_pending(error: &std::io::Error) -> bool {
+    error.get_ref().is_some_and(|e| e.is::<RootPending>())
+}
+
+/// The production commit: what the run staged under its Bazel root lands
+/// in the commit anchored there, under the root's lock, and then the
+/// project's group commit, both or neither (`bazel_gate::run::land`). Each
+/// plan that landed is then settled by `run::finish`. With nothing staged
+/// under a root it is the project's group commit, byte for byte.
+pub struct AnchoredCommit;
+
+impl RootCommit for AnchoredCommit {
     fn commit<'a>(
         &'a self,
         group: Option<GroupCommit>,
         staged: &'a [RootTxn],
     ) -> BoxFuture<'a, std::io::Result<Vec<CommittedFile>>> {
         Box::pin(async move {
-            if staged.iter().any(|txn| !txn.changes.is_empty()) {
-                drop(group);
-                return Err(std::io::Error::other(
-                    "this build cannot commit a change under a Bazel root",
-                ));
+            let project = async move {
+                match group {
+                    Some(group) => group.commit_changes().await,
+                    None => Ok(Vec::new()),
+                }
+            };
+            let mut changed = staged.iter().filter(|txn| !txn.changes.is_empty());
+            let (Some(txn), more) = (changed.next(), changed.next()) else {
+                return project.await;
+            };
+            if more.is_some() {
+                // One project lies under one nearest root, so a run stages
+                // under one: two would need a commit over both.
+                drop(project);
+                let why = "a run staged changes under two Bazel roots";
+                return Err(std::io::Error::other(why));
             }
-            match group {
-                Some(group) => group.commit_changes().await,
-                None => Ok(Vec::new()),
+            let changes = txn.anchored();
+            let at = run::Staged {
+                root: &txn.root,
+                touched: &txn.touched,
+                changes: &changes,
+            };
+            let landed = match land(at, project).await {
+                Ok(landed) => landed,
+                Err(Unlanded::Root { why, pending: true }) => {
+                    return Err(std::io::Error::other(RootPending(why)));
+                }
+                Err(Unlanded::Root { why, .. }) => return Err(std::io::Error::other(why)),
+                Err(Unlanded::Project { error, left }) if left.is_empty() => return Err(error),
+                Err(Unlanded::Project { error, left }) => {
+                    let why = format!(
+                        "{error}; putting back what was written under the Bazel root {} failed \
+                         as well: {}",
+                        txn.root.display(),
+                        left.join(", ")
+                    );
+                    return Err(std::io::Error::new(error.kind(), why));
+                }
+            };
+            // Each plan that was carried out is settled; the originals
+            // are kept until the last one has spoken.
+            let mut captured = landed.captured;
+            for outcome in &txn.outcomes {
+                captured = match finish(outcome, captured, &NoRunner) {
+                    Finish::Keep(captured) => captured,
+                    // Not reached while no tool is run (`NoRunner` leaves
+                    // every command to the user). The root goes back to
+                    // what it held; the project's own commit has landed,
+                    // and the package that lands the runner owes its undo.
+                    Finish::Unwind { captured, why } => {
+                        let left = restore_anchored(&landed.lock, captured.files()).await;
+                        let left = match left {
+                            Ok(()) => "what was written under the Bazel root was taken back".into(),
+                            Err(left) => format!("taking it back failed: {}", left.join(", ")),
+                        };
+                        return Err(std::io::Error::other(format!("{why}; {left}")));
+                    }
+                };
             }
+            drop(landed.lock);
+            Ok(landed.project)
         })
     }
 }
@@ -310,7 +436,7 @@ impl<'a> Engine<'a> {
             lanes: lanes::PRODUCTION,
             proofs: Proofs::PRODUCTION,
             source,
-            commit: &NoAnchoredCommit,
+            commit: &AnchoredCommit,
             routed: false,
             close: true,
             notes: false,
@@ -474,17 +600,15 @@ fn ask(
     };
     let building = |hub: &&Hub| hub.ecosystem == ecosystem && inventory::may_build(hub);
     let hub = ws.hubs.iter().find(building);
-    let plan = match gate(&cx, lanes, &req) {
+    let (plan, pending) = match gate(&cx, lanes, &req) {
         GateOutcome::NotBazel => return None,
         GateOutcome::Refuse(refusal) => return Some(Verdict::Refused(refused(hub, &refusal))),
-        // The follow-up of a plan (the command to run, its evidence) is
-        // settled by `run::finish`, which this build does not have: such a
-        // plan is not written.
-        GateOutcome::ProceedAfter(plan, run) => {
-            let why = format!("`{}` has to run after the write", run.command);
-            return Some(Verdict::Refused(not_carried(&plan, &why)));
-        }
-        GateOutcome::Proceed(plan) => plan,
+        // A plan with a command to run afterwards is carried out like any
+        // other. Who runs the command, and whether the build passes until
+        // then, the gate has decided; `run::finish` settles it after the
+        // commit, and this seam looks at neither.
+        GateOutcome::ProceedAfter(plan, run) => (plan, Some(run)),
+        GateOutcome::Proceed(plan) => (plan, None),
     };
     let family = lanes.0.iter().find(|(_, ops)| {
         let holds = |spec: &socket_patch_core::bazel::model::LaneSpec| spec.id == plan.lane;
@@ -506,6 +630,7 @@ fn ask(
         plan,
         hubs,
         ops,
+        pending,
         lanes: *lanes,
         name,
         version,
@@ -860,7 +985,10 @@ fn stage(
             txn.pins.push(row);
         }
     }
-    txn.plans.push(plan.clone());
+    txn.outcomes.push(match &planned.pending {
+        Some(run) => GateOutcome::ProceedAfter(plan.clone(), run.clone()),
+        None => GateOutcome::Proceed(plan.clone()),
+    });
     Ok(wrote)
 }
 
@@ -889,15 +1017,19 @@ fn seal_root(txn: &mut RootTxn, loaded: &Loaded) -> Result<(), String> {
     }
     let mut overlay = reopen(&fresh, txn);
     let mut index = open_index(txn, &overlay).map_err(|refused| refused.detail)?;
-    let applied = exec::apply(ws, &mut index, &txn.plans, &mut overlay);
+    let plans = txn.plans();
+    let applied = exec::apply(ws, &mut index, &plans, &mut overlay);
     let applied = applied.map_err(|error| error.to_string())?;
-    for path in applied.written {
-        let Ok(found) = held(&fresh, &path) else {
+    for path in &applied.written {
+        let Ok(found) = held(&fresh, path) else {
             return Err(format!("`{path}` could not be read"));
         };
-        txn.read.insert(path, found);
+        txn.read.insert(path.clone(), found);
     }
     txn.changes = overlay.changes().clone();
+    // What the commit may land, and in which order: the record first.
+    txn.touched = exec::touched(&index, &plans);
+    txn.order = applied.written;
     Ok(())
 }
 
@@ -1157,6 +1289,23 @@ pub async fn carry_out(
         |advisory: &Advisory| VendorWarning::new(advisory.code.as_str(), advisory.detail.clone());
     let mut warnings: Vec<VendorWarning> = plan.advisories.iter().map(warning).collect();
     warnings.extend(guard.advisories().map(warning));
+    // A works-after plan: the pin is written, and the run names the one
+    // command the user runs and commits the result of.
+    if let Some(run) = &planned.pending {
+        let on = match run.platforms.as_slice() {
+            [] => String::new(),
+            platforms => format!(" on each of {}", platforms.join(", ")),
+        };
+        let until = match run.gates_vex {
+            true => "; until then `vex` makes no statement for the package",
+            false => "",
+        };
+        let detail = format!(
+            "the pin of `{}` {} is written: run `{}`{on} and commit the result{until}",
+            planned.name, planned.version, run.command
+        );
+        warnings.push(VendorWarning::new(Code::VendorRunRequired.as_str(), detail));
+    }
     if common.dry_run {
         let status = VerifyStatus::Ready;
         return Ok(outcome(purl, &rel, record, status, None, warnings));
@@ -1526,6 +1675,10 @@ fn undo(
         };
         txn.read.insert(path.clone(), found);
     }
+    // What the rows the undo works from record, and the order it gave:
+    // the edits before the record.
+    txn.touched = exec::touched(&before, &[]);
+    txn.order = reverted.written;
     Ok(txn)
 }
 
@@ -2185,9 +2338,9 @@ mod tests {
     /// service is asked and before anything is written, with the code of
     /// a lane that is ahead of this build and its token: an artifact of
     /// another patch, one outside the patch's own unit, a name that is no
-    /// plain file name (a `..` level, a separator, a scoped npm name), two
-    /// artifacts, and a plan whose command has to run after the write.
-    /// An index that cannot be relied on refuses every plan under it.
+    /// plain file name (a `..` level, a separator, a scoped npm name) and
+    /// two artifacts. An index that cannot be relied on refuses every
+    /// plan under it.
     #[tokio::test]
     async fn a_plan_the_seam_cannot_carry_out_is_refused_before_anything_is_asked() {
         let (repo, source) = (Repo::new(true), Serves::the_artifact());
@@ -2201,7 +2354,6 @@ mod tests {
             "an artifact whose name is no plain file name",
             "an artifact whose name is no plain file name",
             "not exactly one artifact",
-            "has to run after the write",
         ];
         for (name, why) in lane::FAULTS.into_iter().zip(reasons) {
             let purl = lane::fault_purl(name);
@@ -2505,27 +2657,120 @@ mod tests {
         }
     }
 
-    /// The commit of this build refuses a run that staged a change under
-    /// a Bazel root, and the run then leaves nothing: no artifact, no pin,
-    /// no row, no ledger entry.
-    #[tokio::test]
-    async fn the_production_commit_lands_nothing_under_a_bazel_root() {
+    /// The production commit lands a plan under its Bazel root: the pin
+    /// and its row in the commit anchored at the root, under the root's
+    /// lock, with the project's ledger, and nothing of the commit's own is
+    /// left behind (no lock file, no journal, no stage file). A second run
+    /// is in sync, and the undo through the same commit returns the
+    /// checkout to what it was. With nothing staged under a root it is the
+    /// project's group commit and nothing else.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_production_commit_lands_a_plan_under_its_bazel_root() {
         let (repo, source) = (Repo::new(true), Serves::the_artifact());
-        let before = repo.tree();
-        let engine = engine(&source, &NoAnchoredCommit, false);
+        let pristine = repo.tree();
+        let engine = engine(&source, &AnchoredCommit, false);
         let (verdict, env) = repo.route(lane::PURL, &engine).await;
-        let code = "vendor_commit_failed";
-        assert!(
-            matches!(&verdict, Routed::Refused { code: said, .. } if said == code),
-            "{verdict:?} {:?}",
-            env.events
+        assert_eq!(verdict, Routed::Vendored, "{:?}", env.events);
+        let pin = lane::pinned(ARTIFACT, &lane::digest());
+        let expected = lane::LOCK_TEXT.replace(lane::UPSTREAM, &pin);
+        assert_eq!(repo.get(lane::LOCK).as_deref(), Some(expected.as_str()));
+        assert_eq!(repo.index().pins.len(), 1);
+        // Exactly the artifact, the pin, the index and the ledger.
+        let mut written: Vec<String> = repo.tree().into_keys().collect();
+        written.retain(|path| !pristine.contains_key(path));
+        assert_eq!(written, [INDEX_PATH, ARTIFACT, VENDOR_STATE_REL]);
+        let entry = repo.entry().expect("a ledger entry");
+
+        let wired = repo.tree();
+        let (again, env) = repo.route(lane::PURL, &engine).await;
+        assert_eq!(again, Routed::InSync, "{:?}", env.events);
+        assert_eq!(repo.tree(), wired);
+
+        // The undo, through the same commit, and then the ledger entry
+        // as the revert loop drops it.
+        let opts = RevertOpts::new(false);
+        let loader = reader();
+        let undone = revert_entry(
+            &entry,
+            &repo.top,
+            opts,
+            lane::TABLE,
+            &AnchoredCommit,
+            &loader,
         );
-        assert_eq!(repo.tree(), before);
+        let undone = undone.await;
+        assert!(undone.success && !undone.kept_artifact, "{undone:?}");
+        assert_eq!(undone.warnings.len(), 0, "{undone:?}");
+        std::fs::remove_file(below(&repo.top, VENDOR_STATE_REL)).expect("drop the ledger");
+        assert_eq!(repo.tree(), pristine);
 
         // With nothing staged it is the group commit, and commits it.
         let group = GroupCommit::begin(&repo.top);
-        let committed = NoAnchoredCommit.commit(Some(group), &[]).await;
+        let committed = AnchoredCommit.commit(Some(group), &[]).await;
         assert_eq!(committed.expect("a commit"), Vec::new());
+    }
+
+    /// The anchored commit compares before it replaces: a file a plan
+    /// edits that changed on disk after the run sealed it refuses the
+    /// whole commit, the user's change is kept, and the run takes back
+    /// what it had put on disk, the project's ledger included.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_production_commit_refuses_a_file_that_changed_under_it() {
+        let (repo, source) = (Repo::new(true), Serves::the_artifact());
+        let common = repo.common();
+        let asks = [(lane::PURL, lane::UUID)];
+        let judged = judge(&common, (lane::TABLE, lane::PROOFS), &asks).await;
+        let engine = engine(&source, &AnchoredCommit, false);
+        let (ledger, mut staged) = (VendorState::default(), Staged::default());
+        let (planned, patch) = (judged.planned(lane::PURL).expect("a plan"), record());
+        let carried = carry_out(
+            planned,
+            lane::PURL,
+            &patch,
+            &common,
+            &engine,
+            &ledger,
+            &mut staged,
+        );
+        assert!(carried.await.is_ok());
+        staged.seal(&common).await.expect("the run seals");
+        let edited = format!("{}# a line the user added meanwhile\n", lane::LOCK_TEXT);
+        repo.put(lane::LOCK, &edited);
+        let refused = AnchoredCommit.commit(None, staged.roots()).await;
+        let refused = refused.expect_err("the commit replaced a file that changed");
+        assert!(!root_pending(&refused), "{refused}");
+        assert_eq!(repo.get(lane::LOCK), Some(edited));
+        assert!(!repo.has(INDEX_PATH), "nothing landed: {refused}");
+        assert_eq!(staged.unwind(&common).await.len(), 0);
+        assert!(!repo.has(".socket/vendor") && !repo.has(".socket/bazel"));
+    }
+
+    /// A plan with a command the user runs afterwards is carried out like
+    /// any other: the pin lands, `run::finish` lets it stand (no tool is
+    /// run), and the run names the command once, with the package.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_works_after_plan_lands_and_names_its_command() {
+        let (repo, source) = (Repo::new(true), Serves::the_artifact());
+        repo.put(lane::LOCK, lane::faults_lock_text());
+        let engine = engine(&source, &AnchoredCommit, false);
+        let purl = lane::RUNS_AFTER_PURL;
+        let (verdict, env) = repo.route(purl, &engine).await;
+        assert_eq!(verdict, Routed::Vendored, "{:?}", env.events);
+        assert!(repo
+            .get(lane::LOCK)
+            .expect("the lock")
+            .contains("tarball: file:"));
+        let required = Code::VendorRunRequired.as_str();
+        let named = |event: &&crate::json_envelope::PatchEvent| {
+            event.error_code.as_deref() == Some(required)
+        };
+        let told: Vec<_> = env.events.iter().filter(named).collect();
+        let [advisory] = told.as_slice() else {
+            panic!("one advisory: {:?}", env.events);
+        };
+        assert_eq!(advisory.purl.as_deref(), Some(purl));
+        let reason = advisory.reason.as_deref().unwrap_or_default();
+        assert!(reason.contains(lane::RUNS_AFTER_COMMAND), "{reason}");
     }
 
     /// The lock of [`lane::LOCK_TEXT`] with one more package in it.
@@ -2603,7 +2848,7 @@ mod tests {
             };
             let paths: Vec<&String> = txn.changes.keys().collect();
             assert_eq!(paths, [lane::LOCK], "late={late}");
-            assert_eq!(txn.plans.len(), 2);
+            assert_eq!(txn.plans().len(), 2);
 
             staged.seal(&common).await.expect("the run seals");
             let landed = Lands.commit(None, staged.roots()).await;
