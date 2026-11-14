@@ -1866,6 +1866,30 @@ The scan output names what it changed:
 Added `source:` to 2 gem declarations in Gemfile (puma and rack); added 1 line for the transitive dependency nokogiri.
 ```
 
+**A patched gem stays at its version.** The patch's source serves the patched version and no
+other, and it is now the gem's only source. So Bundler sees nothing newer for that gem:
+`bundle outdated` no longer lists it and `bundle update`, with or without the gem's name, leaves
+it where it is, even when the Gemfile requirement is a range (`"~> 3.1"`) and upstream has
+released a later version. A gem that was a transitive dependency no longer floats with the gems
+that depend on it either: its added line pins the exact version. The other gems update as before.
+The scan says which gems it now holds, once, when it wires them:
+
+```text
+Bundler now takes puma, rack, and nokogiri from their Socket patch source only, which serves the patched version and no other: `bundle outdated` no longer lists them and `bundle update` cannot move them. To move one to a newer release, run `socket-patch rollback`, then `bundle update <gem>`, then `socket-patch scan` again.
+```
+
+To take a newer upstream release of a patched gem (a later security release included), undo the
+pin, update, and scan again, which patches the new version if it still needs a patch:
+
+```sh
+socket-patch rollback pkg:gem/rack@3.1.8   # or `socket-patch rollback` for every patch
+bundle update rack
+socket-patch scan
+```
+
+A re-scan that changes nothing does not repeat the line, and `--json` output does not carry it;
+`socket-patch list` shows the gems on a hosted patch at any time.
+
 **When a gem is left alone.** The scan never writes a pair Bundler would refuse. A gem it cannot
 wire is skipped, neither file changes for it, and the warning says why and what to do:
 

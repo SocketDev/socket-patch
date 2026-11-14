@@ -2165,6 +2165,10 @@ async fn run_redirect_selected_untracked(
             for line in format_gem_manifest_edits(&rewrite.edits, common.dry_run) {
                 println!("{line}");
             }
+            // And what that costs: Bundler can no longer update those gems.
+            if let Some(note) = format_gem_hold_note(&rewrite.edits, common.dry_run) {
+                println!("{note}");
+            }
             let human_warnings: Vec<(&str, &str)> = warnings
                 .iter()
                 .map(|w| (w.code.as_str(), w.detail.as_str()))
@@ -2653,6 +2657,57 @@ fn format_gem_manifest_edits(
             format!("{}.", crate::ui::sentence_case(&parts.join("; ")))
         })
         .collect()
+}
+
+/// What wiring a gem to its patch source costs the project's update
+/// workflow, said once per run under [`format_gem_manifest_edits`]' lines.
+///
+/// A hosted gem's only source is its patch's own registry, which serves the
+/// one patched version. Bundler therefore sees nothing newer: the gem drops
+/// out of `bundle outdated` and `bundle update` leaves it where it is, even
+/// under a range requirement, until the pin is rolled back. Names the gems
+/// this run newly wired (a refreshed source URL holds nothing that was not
+/// held before), each once, in first-edit order. `None` when there are none.
+fn format_gem_hold_note(
+    edits: &[socket_patch_core::patch::redirect::FileEdit],
+    dry_run: bool,
+) -> Option<String> {
+    let mut gems: Vec<String> = Vec::new();
+    for edit in edits {
+        if !matches!(
+            edit.kind.as_str(),
+            "redirect_gemfile_source_option" | "redirect_gemfile_dependency_line"
+        ) {
+            continue;
+        }
+        let Some(name) = edit.key.as_deref().filter(|name| !name.is_empty()) else {
+            continue;
+        };
+        if !gems.iter().any(|gem| gem == name) {
+            gems.push(name.to_string());
+        }
+    }
+    let one = match gems.as_slice() {
+        [] => return None,
+        [one] => Some(one.as_str()),
+        _ => None,
+    };
+    let (its, them, move_one, update_arg) = match one {
+        Some(name) => ("its", "it", "it", name),
+        None => ("their", "them", "one", "<gem>"),
+    };
+    let (takes, lists, moves) = if dry_run {
+        ("would then take", "would no longer list", "could not move")
+    } else {
+        ("now takes", "no longer lists", "cannot move")
+    };
+    Some(format!(
+        "Bundler {takes} {names} from {its} Socket patch source only, which serves the patched \
+         version and no other: `bundle outdated` {lists} {them} and `bundle update` {moves} \
+         {them}. To move {move_one} to a newer release, run `socket-patch rollback`, then \
+         `bundle update {update_arg}`, then `socket-patch scan` again.",
+        names = join_names(&gems, 6),
+    ))
 }
 
 /// [`format_redirect_summary`] for a run that confirmed `confirmed`
@@ -5073,6 +5128,71 @@ mod tests {
             ["Refreshed the Socket source of 1 gem declaration in Gemfile (rack)."]
         );
         assert!(super::format_gem_manifest_edits(&edits[5..], false).is_empty());
+    }
+
+    /// A gem newly wired to its patch source is held at its version: that
+    /// source serves one version, so `bundle outdated` and `bundle update`
+    /// no longer see upstream's releases (#2070). The run says so once,
+    /// naming the gems and the way past the hold.
+    #[test]
+    fn gem_hold_note_names_the_gems_bundler_can_no_longer_update() {
+        use socket_patch_core::patch::redirect::FileEdit;
+        let edit = |path: &str, kind: &str, key: &str| FileEdit {
+            path: path.to_string(),
+            kind: kind.to_string(),
+            action: "added".to_string(),
+            key: Some(key.to_string()),
+            original: None,
+            new: None,
+        };
+        let edits = [
+            edit("Gemfile", "redirect_gemfile_source_option", "rack"),
+            edit("Gemfile.lock", "redirect_gemfile_lock_gem_source", "rack"),
+            edit("Gemfile", "redirect_gemfile_dependency_line", "nokogiri"),
+            // The same gem in a second manifest is named once.
+            edit("api/Gemfile", "redirect_gemfile_source_option", "rack"),
+            edit("package-lock.json", "redirect_npm_lock", "lodash"),
+        ];
+        assert_eq!(
+            super::format_gem_hold_note(&edits, false).as_deref(),
+            Some(
+                "Bundler now takes rack and nokogiri from their Socket patch source only, \
+                 which serves the patched version and no other: `bundle outdated` no longer \
+                 lists them and `bundle update` cannot move them. To move one to a newer \
+                 release, run `socket-patch rollback`, then `bundle update <gem>`, then \
+                 `socket-patch scan` again."
+            )
+        );
+        assert_eq!(
+            super::format_gem_hold_note(&edits[..1], false).as_deref(),
+            Some(
+                "Bundler now takes rack from its Socket patch source only, which serves the \
+                 patched version and no other: `bundle outdated` no longer lists it and \
+                 `bundle update` cannot move it. To move it to a newer release, run \
+                 `socket-patch rollback`, then `bundle update rack`, then `socket-patch scan` \
+                 again."
+            )
+        );
+        let dry = super::format_gem_hold_note(&edits[..1], true).unwrap();
+        assert!(
+            dry.starts_with("Bundler would then take rack from its Socket patch source only"),
+            "{dry}"
+        );
+        assert!(
+            dry.contains("`bundle outdated` would no longer list it"),
+            "{dry}"
+        );
+        assert!(dry.contains("`bundle update` could not move it"), "{dry}");
+        // A refreshed source URL holds nothing new, and other ecosystems'
+        // edits are not Bundler's.
+        assert_eq!(
+            super::format_gem_hold_note(
+                &[edit("Gemfile", "redirect_gemfile_source_url", "rack")],
+                false
+            ),
+            None
+        );
+        assert_eq!(super::format_gem_hold_note(&edits[4..], false), None);
     }
 
     #[test]
