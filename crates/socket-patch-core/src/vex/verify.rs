@@ -53,9 +53,9 @@ pub struct VerifyOutcome {
     /// manager re-installs. An ABSENT installed tree is the expected
     /// post-vendor state and is never flagged.
     pub vendored_out_of_sync: Vec<String>,
-    /// `(purl, copy)` for every installed copy that put a purl in
+    /// `(purl, copy)` for the installed copies that put a purl in
     /// `vendored_out_of_sync`, in crawl order, so a caller can name the
-    /// directories.
+    /// directories: every drifted copy of a gem, the first one otherwise.
     pub vendored_out_of_sync_copies: Vec<(String, PathBuf)>,
     /// Maven / Gradle: `(purl, copy)` for every installed copy of a failed
     /// purl that does not verify — the copy a build may still load
@@ -250,6 +250,8 @@ pub async fn applied_patches_with_copies(
                         .unwrap_or_default()
                         .iter()
                         .filter(|p| !crate::crawlers::gradle_cache::is_gradle_version_dir(p));
+                    let every_copy = Ecosystem::from_purl(purl) == Some(Ecosystem::Gem);
+                    let mut drifted = false;
                     for pkg_path in installed {
                         let in_sync = if is_vlt_dir_entry(entry) {
                             vlt_installed_copy_matches(&ctx.project_root, pkg_path, entry, record)
@@ -262,9 +264,15 @@ pub async fn applied_patches_with_copies(
                         if !in_sync {
                             out.vendored_out_of_sync_copies
                                 .push((purl.clone(), pkg_path.clone()));
+                            drifted = true;
+                            // Only a gem's warning lists each copy (its
+                            // remedy is per gem home).
+                            if !every_copy {
+                                break;
+                            }
                         }
                     }
-                    if matches!(out.vendored_out_of_sync_copies.last(), Some((p, _)) if p == purl) {
+                    if drifted {
                         out.vendored_out_of_sync.push(purl.clone());
                     }
                 }
@@ -1978,6 +1986,55 @@ mod tests {
             out.vendored_out_of_sync_copies,
             vec![(purl.to_string(), root.path().join("drifted"))]
         );
+    }
+
+    /// #2076: a gem's warning names every gem-home copy that drifted (each
+    /// gem home needs its own cleanup), where other ecosystems stop at the
+    /// first. The purl is still flagged once.
+    #[tokio::test]
+    async fn vendored_drift_probe_lists_every_drifted_gem_copy() {
+        for (eco, listed) in [("gem", 2), ("cargo", 1)] {
+            let purl = &format!("pkg:{eco}/rack@2.2.8");
+            let root = tempfile::tempdir().unwrap();
+            let rel = format!(".socket/vendor/{eco}/{VUUID}/rack-2.2.8");
+            let patched = b"patched-content";
+            let vdir = root.path().join(&rel);
+            tokio::fs::create_dir_all(&vdir).await.unwrap();
+            tokio::fs::write(vdir.join("index.js"), patched)
+                .await
+                .unwrap();
+            let mut installed = Vec::new();
+            for home in ["home-a", "home-b"] {
+                let dir = root.path().join(home).join("gems/rack-2.2.8");
+                tokio::fs::create_dir_all(&dir).await.unwrap();
+                tokio::fs::write(dir.join("index.js"), b"pristine")
+                    .await
+                    .unwrap();
+                installed.push(dir);
+            }
+
+            let mut rec = record_with_one_file(&compute_git_sha256_from_bytes(patched));
+            rec.uuid = VUUID.to_string();
+            let mut manifest = PatchManifest::new();
+            manifest.patches.insert(purl.to_string(), rec);
+            let ctx = VendorContext {
+                project_root: root.path().to_path_buf(),
+                entries: HashMap::from([(purl.to_string(), vendor_entry(purl, &rel))]),
+                go_patches: HashMap::new(),
+                hosted: HashMap::new(),
+            };
+            let copies = HashMap::from([(purl.to_string(), installed.clone())]);
+
+            let out = applied_patches_with_copies(&manifest, &copies, Some(&ctx)).await;
+            assert_eq!(out.vendored, vec![purl.to_string()]);
+            assert_eq!(out.vendored_out_of_sync, vec![purl.to_string()]);
+            let expected: Vec<(String, PathBuf)> = installed
+                .into_iter()
+                .take(listed)
+                .map(|copy| (purl.to_string(), copy))
+                .collect();
+            assert_eq!(out.vendored_out_of_sync_copies, expected, "{purl}");
+        }
     }
 
     /// Go vendored: the crawler's module-cache `M@v` is pristine by

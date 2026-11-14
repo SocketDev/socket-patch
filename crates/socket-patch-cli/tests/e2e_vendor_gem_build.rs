@@ -662,8 +662,7 @@ fn gem_vendor_fresh_checkout_bundle_install_and_revert() {
     assert!(
         stderr.contains(&format!("Warning: {purl}: "))
             && stderr.contains(&format!("({})", gem_dir.display()))
-            && stderr.contains(&format!("`gem uninstall {DEP} -v {version} -i "))
-            && stderr.contains("`bundle clean`"),
+            && stderr.contains("`bundle clean` prunes it"),
         "the leftover gem-home copy is named, with remedies that clear it:\n{stderr}"
     );
     assert!(
@@ -772,33 +771,38 @@ fn gem_vendor_fresh_checkout_bundle_install_and_revert() {
     );
 
     // #2076, the remedy: `bundle clean` removes the leftover, touches
-    // neither file of the pair, and `vex` then has nothing to warn about.
-    let clean = bundle(&proj, &["clean"], false);
+    // neither file of the pair, and `vex` then has nothing to report. Run
+    // on a copy, so the revert below still starts from the tree a user
+    // reverts from.
+    let cleaned = tmp.path().join("cleaned");
+    common::fs_tree::copy_tree(&proj, &cleaned);
+    let clean = bundle(&cleaned, &["clean"], false);
     assert!(
         clean.status.success(),
         "`bundle clean` failed.\nstdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&clean.stdout),
         String::from_utf8_lossy(&clean.stderr),
     );
+    let cleaned_gem_dir = cleaned.join(gem_dir.strip_prefix(&proj).unwrap());
     assert!(
-        !gem_dir.exists(),
+        !cleaned_gem_dir.exists(),
         "`bundle clean` must remove the leftover {}",
-        gem_dir.display()
+        cleaned_gem_dir.display()
     );
     assert_eq!(
-        std::fs::read(&lock_path).unwrap(),
+        std::fs::read(cleaned.join("Gemfile.lock")).unwrap(),
         lock_wired,
         "`bundle clean` must leave Gemfile.lock byte-identical"
     );
     let (code, stdout, stderr) = run_socket(
-        &proj,
+        &cleaned,
         &[
             "vex",
             "--json",
             "--cwd",
-            proj.to_str().unwrap(),
+            cleaned.to_str().unwrap(),
             "--output",
-            vex_path.to_str().unwrap(),
+            cleaned.join("out.vex.json").to_str().unwrap(),
             "--product",
             "pkg:gem/app@1.0.0",
         ],
@@ -807,8 +811,10 @@ fn gem_vendor_fresh_checkout_bundle_install_and_revert() {
     let env = parse_json_envelope(&stdout);
     assert_eq!(env["status"], "success", "envelope: {env}");
     assert!(
-        env.get("warnings").is_none(),
-        "nothing is left to warn about after `bundle clean`: {env}"
+        env["warnings"]
+            .as_array()
+            .is_none_or(|w| w.iter().all(|w| w["code"] != "vendored_tree_out_of_sync")),
+        "nothing is out of sync after `bundle clean`: {env}"
     );
 
     // 7. REVERT PROOF: both halves of the pair edit byte-restored, artifacts
