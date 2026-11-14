@@ -619,14 +619,22 @@ mod tests {
         };
         assert!(!project.common.global);
         assert_eq!(project.paths, ["packages/*"]);
-        assert_eq!(project.common.manifest_path, "/state/project/manifest.json");
+        // Compared as paths: the separator `Path::join` writes is the
+        // platform's, and a `/` in a literal is one on every platform.
+        assert_eq!(
+            Path::new(&project.common.manifest_path),
+            Path::new("/state/project/manifest.json")
+        );
         // Go is the global pass's: a project run would rewrite `go.mod`.
         assert!(!ecosystems(project).contains(&"golang"));
         assert!(ecosystems(project).contains(&"npm"));
         assert!(global.common.global);
         assert!(global.paths.is_empty());
         assert_eq!(global.common.ecosystems, None);
-        assert_eq!(global.common.manifest_path, "/state/global/manifest.json");
+        assert_eq!(
+            Path::new(&global.common.manifest_path),
+            Path::new("/state/global/manifest.json")
+        );
     }
 
     #[test]
