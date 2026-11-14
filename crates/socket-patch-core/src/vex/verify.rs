@@ -15,7 +15,6 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use crate::crawlers::ruby_crawler::is_default_gem_copy;
 use crate::crawlers::Ecosystem;
 use crate::manifest::schema::{PatchManifest, PatchRecord};
 use crate::patch::apply::{verify_file_patch, VerifyStatus};
@@ -239,26 +238,14 @@ pub async fn applied_patches_with_copies(
                     // build resolves the GAV from the committed repository
                     // only (exclusiveContent), so the cache copy is a
                     // pristine sibling the build never reads.
-                    //
-                    // So is a gem-home copy of a vendored gem (#2076): the
-                    // lock takes the gem from its `PATH` source, so Bundler
-                    // loads the committed directory and installs nothing
-                    // for it. The registry copy an earlier `bundle install`
-                    // left behind stays until `bundle clean`, and no
-                    // install resyncs it. A default gem's copy still
-                    // counts: RubyGems can have loaded it before Bundler
-                    // sets the load path.
-                    let ecosystem = Ecosystem::from_purl(purl);
-                    let go_cache_copy = ecosystem == Some(Ecosystem::Golang);
-                    let gem = ecosystem == Some(Ecosystem::Gem);
+                    let go_cache_copy = Ecosystem::from_purl(purl) == Some(Ecosystem::Golang);
                     let installed = package_copies
                         .get(purl)
                         .filter(|_| !go_cache_copy)
                         .map(Vec::as_slice)
                         .unwrap_or_default()
                         .iter()
-                        .filter(|p| !crate::crawlers::gradle_cache::is_gradle_version_dir(p))
-                        .filter(|p| !gem || is_default_gem_copy(p));
+                        .filter(|p| !crate::crawlers::gradle_cache::is_gradle_version_dir(p));
                     for pkg_path in installed {
                         let in_sync = if is_vlt_dir_entry(entry) {
                             vlt_installed_copy_matches(&ctx.project_root, pkg_path, entry, record)
@@ -2024,65 +2011,6 @@ mod tests {
             out.vendored_out_of_sync.is_empty(),
             "the pristine module cache is not drift: {:?}",
             out.vendored_out_of_sync
-        );
-    }
-
-    /// Regression (#2076): once the lock takes a vendored gem from its
-    /// `PATH` source, Bundler loads the vendored directory and installs
-    /// nothing for the gem, so the registry copy an earlier `bundle install`
-    /// left in the gem home is a leftover no install resyncs. It is not
-    /// reported out of sync. A default gem's copy still is: RubyGems can
-    /// have loaded it before Bundler sets the load path.
-    #[tokio::test]
-    async fn gem_home_leftover_of_a_vendored_gem_is_not_out_of_sync() {
-        let root = tempfile::tempdir().unwrap();
-        let purl = "pkg:gem/rack@2.2.8";
-        let rel = format!(".socket/vendor/gem/{VUUID}/rack-2.2.8");
-        let patched = b"module Rack; end # patched\n";
-        let vdir = root.path().join(&rel);
-        tokio::fs::create_dir_all(&vdir).await.unwrap();
-        tokio::fs::write(vdir.join("index.js"), patched)
-            .await
-            .unwrap();
-        let home = root.path().join("vendor/bundle/ruby/3.3.0");
-        let leftover = home.join("gems/rack-2.2.8");
-        tokio::fs::create_dir_all(&leftover).await.unwrap();
-        tokio::fs::write(leftover.join("index.js"), b"module Rack; end\n")
-            .await
-            .unwrap();
-
-        let mut rec = record_with_one_file(&compute_git_sha256_from_bytes(patched));
-        rec.uuid = VUUID.to_string();
-        let mut manifest = PatchManifest::new();
-        manifest.patches.insert(purl.to_string(), rec);
-        let ctx = VendorContext {
-            project_root: root.path().to_path_buf(),
-            entries: HashMap::from([(purl.to_string(), vendor_entry(purl, &rel))]),
-            go_patches: HashMap::new(),
-            hosted: HashMap::new(),
-        };
-        let paths = HashMap::from([(purl.to_string(), leftover)]);
-
-        let out = applied_patches_with_vendor(&manifest, &paths, Some(&ctx)).await;
-        assert_eq!(out.applied, vec![purl.to_string()]);
-        assert_eq!(out.vendored, vec![purl.to_string()]);
-        assert!(
-            out.vendored_out_of_sync.is_empty(),
-            "Bundler does not load the gem-home leftover: {:?}",
-            out.vendored_out_of_sync
-        );
-
-        let default_specs = home.join("specifications/default");
-        tokio::fs::create_dir_all(&default_specs).await.unwrap();
-        tokio::fs::write(default_specs.join("rack-2.2.8.gemspec"), b"")
-            .await
-            .unwrap();
-        let out = applied_patches_with_vendor(&manifest, &paths, Some(&ctx)).await;
-        assert_eq!(out.vendored, vec![purl.to_string()]);
-        assert_eq!(
-            out.vendored_out_of_sync,
-            vec![purl.to_string()],
-            "a default gem's copy can load ahead of Bundler"
         );
     }
 

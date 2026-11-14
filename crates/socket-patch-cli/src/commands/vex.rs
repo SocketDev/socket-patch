@@ -1325,13 +1325,7 @@ async fn generate_vex(
             warnings,
             common,
             "vendored_tree_out_of_sync",
-            format!(
-                "{purl}: the installed tree does not match its vendored artifact; the \
-                 attestation is based on the committed .socket/vendor artifact (the project's \
-                 lockfile or package-manager config wires it in), but the live tree carries \
-                 different bytes — re-run your package manager's install to resync it.\
-                 {hatch_note}{pdm_note}"
-            ),
+            vendored_out_of_sync_detail(purl, &format!("{hatch_note}{pdm_note}")),
         );
     }
 
@@ -1807,6 +1801,40 @@ async fn withhold_stale_go_tools(
             purl,
             reason: GO_INSTALLED_TOOL_STALE.to_string(),
         }));
+}
+
+/// The `vendored_tree_out_of_sync` detail for `purl`; `notes` are the
+/// manager-specific remedies (Hatch, PDM) appended to the generic one.
+///
+/// A gem gets its own wording (#2076). Once `Gemfile.lock` takes the gem
+/// from the vendored `path:` source, Bundler loads that directory and
+/// installs nothing for the gem, so the registry copy an earlier install
+/// left in the gem home stays as it is: "re-run your install" never clears
+/// the warning, and "the live tree" misnames a copy Bundler no longer
+/// loads. The copy is still disclosed, because a load that bypasses
+/// Bundler (plain `ruby`, a stale `--standalone` setup script) runs it.
+fn vendored_out_of_sync_detail(purl: &str, notes: &str) -> String {
+    use socket_patch_core::utils::purl::{purl_name_version, strip_purl_qualifiers};
+    let base = strip_purl_qualifiers(purl);
+    let gem = purl_name_version(base).filter(|_| base.starts_with("pkg:gem/"));
+    match gem {
+        Some((name, version)) => format!(
+            "{purl}: a copy of this gem left in the gem home by an earlier install does not \
+             match its vendored artifact. The attestation is based on the committed \
+             .socket/vendor artifact: Gemfile.lock takes the gem from that path, so Bundler \
+             loads the patched copy and `bundle install` neither replaces nor removes the \
+             other one, which only code that loads the gem without Bundler still runs. \
+             Remove it with `bundle clean` when the project has its own bundle path, or \
+             with `gem uninstall {name} -v {version}` in a gem home no other project needs \
+             it from.{notes}"
+        ),
+        None => format!(
+            "{purl}: the installed tree does not match its vendored artifact; the \
+             attestation is based on the committed .socket/vendor artifact (the project's \
+             lockfile or package-manager config wires it in), but the live tree carries \
+             different bytes — re-run your package manager's install to resync it.{notes}"
+        ),
+    }
 }
 
 /// Record a run-level advisory the way `update`/`vendor` do: stderr
@@ -2469,6 +2497,35 @@ mod tests {
     //! lives in `tests/e2e_vex*.rs`.
     use super::*;
     use clap::Parser;
+
+    /// #2076: `bundle install` never replaces a vendored gem's gem-home
+    /// leftover, so the gem warning names the commands that do remove it
+    /// and does not call the leftover the live tree. Other ecosystems keep
+    /// the install remedy and their manager-specific notes.
+    #[test]
+    fn out_of_sync_detail_names_a_remedy_bundler_honors() {
+        for purl in [
+            "pkg:gem/rack@2.2.8",
+            "pkg:gem/ffi@1.17.0?platform=x86_64-linux",
+        ] {
+            let detail = vendored_out_of_sync_detail(purl, "");
+            assert!(detail.starts_with(&format!("{purl}: ")), "{detail}");
+            assert!(detail.contains("`bundle clean`"), "{detail}");
+            assert!(!detail.contains("re-run your package manager"), "{detail}");
+            assert!(!detail.contains("live tree"), "{detail}");
+        }
+        let detail = vendored_out_of_sync_detail("pkg:gem/rack@2.2.8", "");
+        assert!(detail.contains("`gem uninstall rack -v 2.2.8`"), "{detail}");
+        let detail = vendored_out_of_sync_detail("pkg:gem/ffi@1.17.0?platform=x86_64-linux", "");
+        assert!(detail.contains("`gem uninstall ffi -v 1.17.0`"), "{detail}");
+
+        let detail = vendored_out_of_sync_detail("pkg:pypi/idna@3.6", " Hatch note.");
+        assert!(
+            detail.ends_with("re-run your package manager's install to resync it. Hatch note."),
+            "{detail}"
+        );
+        assert!(!detail.contains("bundle"), "{detail}");
+    }
 
     /// The go-patches synthesis guards its copy-dir keys with core's
     /// `are_safe_redirect_coords`; pin the accept/reject set from the CLI

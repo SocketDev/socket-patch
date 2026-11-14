@@ -656,46 +656,16 @@ fn gem_vendor_fresh_checkout_bundle_install_and_revert() {
 
     // REGRESSION (#2076): the registry copy the first `bundle install` put
     // in the gem home is a leftover now. Bundler loads the vendored path
-    // and installs nothing for rack, so the install the run prescribes
-    // keeps the leftover, unpatched. `vex` must not report it as an
-    // out-of-sync live tree, before that install or after it.
+    // and installs nothing for rack, so no install replaces that copy. The
+    // warning about it must name a remedy that removes it (`bundle clean`,
+    // run below), not a reinstall.
     assert!(
-        !stderr.contains("vendored artifact"),
-        "a gem-home leftover is no out-of-sync tree:\n{stderr}"
+        stderr.contains(&format!("Warning: {purl}: ")) && stderr.contains("`bundle clean`"),
+        "the leftover gem-home copy is disclosed with a remedy that clears it:\n{stderr}"
     );
-    let reinstall = bundle(&proj, &["install"], false);
     assert!(
-        reinstall.status.success(),
-        "`bundle install` over the vendored pair must succeed.\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&reinstall.stdout),
-        String::from_utf8_lossy(&reinstall.stderr),
-    );
-    assert_eq!(
-        std::fs::read(&installed_rb).expect("the leftover lib/rack.rb"),
-        orig,
-        "bundler keeps the gem-home copy it no longer loads (test premise)"
-    );
-    let (code, stdout, stderr) = run_socket(
-        &proj,
-        &[
-            "vex",
-            "--json",
-            "--cwd",
-            proj.to_str().unwrap(),
-            "--output",
-            vex_path.to_str().unwrap(),
-            "--product",
-            "pkg:gem/app@1.0.0",
-        ],
-    );
-    assert_eq!(code, 0, "vex failed.\nstdout:\n{stdout}\nstderr:\n{stderr}");
-    let env = parse_json_envelope(&stdout);
-    assert_eq!(env["status"], "success", "envelope: {env}");
-    assert!(
-        env["warnings"]
-            .as_array()
-            .is_none_or(|w| w.iter().all(|w| w["code"] != "vendored_tree_out_of_sync")),
-        "a gem-home leftover is no out-of-sync tree: {env}"
+        !stderr.contains("re-run your package manager"),
+        "no install resyncs a vendored gem's leftover:\n{stderr}"
     );
 
     // 5. FRESH-CHECKOUT PROOF: ONLY the committable files, frozen lock. The
@@ -796,6 +766,46 @@ fn gem_vendor_fresh_checkout_bundle_install_and_revert() {
         std::fs::read(&lock_path).unwrap(),
         lock_wired,
         "re-vendor must leave Gemfile.lock byte-identical"
+    );
+
+    // #2076, the remedy: `bundle clean` removes the leftover, touches
+    // neither file of the pair, and `vex` then has nothing to warn about.
+    let clean = bundle(&proj, &["clean"], false);
+    assert!(
+        clean.status.success(),
+        "`bundle clean` failed.\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&clean.stdout),
+        String::from_utf8_lossy(&clean.stderr),
+    );
+    assert!(
+        !gem_dir.exists(),
+        "`bundle clean` must remove the leftover {}",
+        gem_dir.display()
+    );
+    assert_eq!(
+        std::fs::read(&lock_path).unwrap(),
+        lock_wired,
+        "`bundle clean` must leave Gemfile.lock byte-identical"
+    );
+    let (code, stdout, stderr) = run_socket(
+        &proj,
+        &[
+            "vex",
+            "--json",
+            "--cwd",
+            proj.to_str().unwrap(),
+            "--output",
+            vex_path.to_str().unwrap(),
+            "--product",
+            "pkg:gem/app@1.0.0",
+        ],
+    );
+    assert_eq!(code, 0, "vex failed.\nstdout:\n{stdout}\nstderr:\n{stderr}");
+    let env = parse_json_envelope(&stdout);
+    assert_eq!(env["status"], "success", "envelope: {env}");
+    assert!(
+        env.get("warnings").is_none(),
+        "nothing is left to warn about after `bundle clean`: {env}"
     );
 
     // 7. REVERT PROOF: both halves of the pair edit byte-restored, artifacts
