@@ -36,7 +36,9 @@ use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use crate::bazel_common::{assert_restore_policy, assert_same_tree, changes, snapshot};
-use crate::common::envelope::{all_codes, event_for, event_purls, has_event, parse_json_envelope};
+use crate::common::envelope::{
+    all_codes, event_for, event_purls, events, has_event, parse_json_envelope,
+};
 use crate::common::{
     envelope_error_code, git_sha256, run_with_env, write_minimal_manifest, PatchEntry,
 };
@@ -811,7 +813,10 @@ async fn a_record_stays_while_the_hosted_pin_of_its_patch_stands() {
     let before = snapshot(&ws.root);
     let (code, envelope) = run(&ws.root, &["rollback", "--json", "--yes"], &server).await;
     assert_eq!(code, 1, "{envelope:#}");
-    let refused = events_of(&envelope, "failed", "hosted_restore_refused");
+    let refused: Vec<&Value> = events(&envelope)
+        .iter()
+        .filter(|e| e["action"] == "failed" && e["errorCode"] == "hosted_restore_refused")
+        .collect();
     let [refused] = refused.as_slice() else {
         panic!("the pin is refused: {envelope:#}");
     };
@@ -857,13 +862,6 @@ async fn a_record_stays_while_the_hosted_pin_of_its_patch_stands() {
         of("input", "Cargo.lock"),
         "{envelope:#}"
     );
-}
-
-/// The `failed` events of `code` an envelope carries.
-fn events_of(envelope: &Value, action: &str, code: &str) -> Vec<Value> {
-    let events = envelope["events"].as_array().cloned().unwrap_or_default();
-    let of = |event: &Value| event["action"] == action && event["errorCode"] == code;
-    events.into_iter().filter(of).collect()
 }
 
 const ROW_LANES: &[LaneSpec] = &[
