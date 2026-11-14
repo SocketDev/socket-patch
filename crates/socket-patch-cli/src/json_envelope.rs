@@ -27,8 +27,15 @@
 
 use serde::Serialize;
 use socket_patch_core::manifest::cleanup_blobs::CleanupResult;
+use std::collections::HashMap;
 
 use socket_patch_core::patch::sidecars::SidecarRecord;
+
+#[derive(Debug, Clone)]
+struct OptInMetadata {
+    requires_opt_in: Option<bool>,
+    opt_in_note: Option<String>,
+}
 
 /// Top-level JSON envelope (see the module doc for which commands emit it).
 #[derive(Debug, Clone, Serialize)]
@@ -97,6 +104,12 @@ pub struct Envelope {
     /// enforces that.
     #[serde(flatten)]
     pub extra: serde_json::Map<String, serde_json::Value>,
+    #[serde(skip)]
+    opt_in_by_patch: HashMap<(String, String), OptInMetadata>,
+    #[serde(skip)]
+    opt_in_by_purl: HashMap<String, OptInMetadata>,
+    #[serde(skip)]
+    opt_in_by_uuid: HashMap<String, OptInMetadata>,
 }
 
 /// The keys every envelope owns. [`Envelope::set_extra`] refuses them so a
@@ -187,7 +200,77 @@ impl Envelope {
             vex: None,
             gc: None,
             extra: serde_json::Map::new(),
+            opt_in_by_patch: HashMap::new(),
+            opt_in_by_purl: HashMap::new(),
+            opt_in_by_uuid: HashMap::new(),
         }
+    }
+
+    pub(crate) fn register_opt_in(
+        &mut self,
+        purl: &str,
+        uuid: &str,
+        requires_opt_in: Option<bool>,
+        opt_in_note: Option<&str>,
+    ) {
+        if requires_opt_in.is_none() && opt_in_note.is_none() {
+            return;
+        }
+        let metadata = OptInMetadata {
+            requires_opt_in,
+            opt_in_note: opt_in_note.map(str::to_string),
+        };
+        self.opt_in_by_patch
+            .insert((purl.to_string(), uuid.to_string()), metadata.clone());
+        self.opt_in_by_purl
+            .insert(purl.to_string(), metadata.clone());
+        self.opt_in_by_uuid.insert(uuid.to_string(), metadata);
+    }
+
+    fn add_registered_opt_in(&self, event: &mut PatchEvent) {
+        let metadata = event
+            .purl
+            .as_deref()
+            .zip(event.uuid.as_deref())
+            .and_then(|(purl, uuid)| {
+                self.opt_in_by_patch
+                    .get(&(purl.to_string(), uuid.to_string()))
+            })
+            .or_else(|| {
+                event
+                    .uuid
+                    .as_deref()
+                    .and_then(|uuid| self.opt_in_by_uuid.get(uuid))
+            })
+            .or_else(|| {
+                event
+                    .purl
+                    .as_deref()
+                    .and_then(|purl| self.opt_in_by_purl.get(purl))
+            });
+        let Some(metadata) = metadata else {
+            return;
+        };
+        let mut details = event
+            .details
+            .take()
+            .filter(serde_json::Value::is_object)
+            .unwrap_or_else(|| serde_json::json!({}));
+        if let Some(requires_opt_in) = metadata.requires_opt_in {
+            details["requiresOptIn"] = serde_json::json!(requires_opt_in);
+        }
+        if let Some(opt_in_note) = &metadata.opt_in_note {
+            details["optInNote"] = serde_json::json!(opt_in_note);
+        }
+        event.details = Some(details);
+    }
+
+    pub(crate) fn add_registered_opt_in_to_events(&mut self) {
+        let mut events = std::mem::take(&mut self.events);
+        for event in &mut events {
+            self.add_registered_opt_in(event);
+        }
+        self.events = events;
     }
 
     /// Set a command-specific top-level key (see [`Envelope::extra`]).
@@ -229,7 +312,8 @@ impl Envelope {
     /// relying on every command to remember a follow-up
     /// `mark_partial_failure` call. A run can never end up reporting
     /// `Success` while carrying a `Failed` event.
-    pub fn record(&mut self, event: PatchEvent) {
+    pub fn record(&mut self, mut event: PatchEvent) {
+        self.add_registered_opt_in(&mut event);
         self.summary.bump(event.action);
         if matches!(event.action, PatchAction::Failed) {
             self.mark_partial_failure();

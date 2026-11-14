@@ -4305,6 +4305,8 @@ mod tests {
             description: "test patch".to_string(),
             license: "MIT".to_string(),
             tier: "free".to_string(),
+            requires_opt_in: None,
+            opt_in_note: None,
         }
     }
 

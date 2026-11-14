@@ -117,6 +117,12 @@ pub fn build_document_marking_unverified(
             if unverified_set.contains(purl.as_str()) {
                 part.push_str(NOT_VERIFIED_SUFFIX);
             }
+            if record.requires_opt_in == Some(true) {
+                if let Some(note) = &record.opt_in_note {
+                    part.push_str("; opt-in required: ");
+                    part.push_str(note);
+                }
+            }
             entry.impact_parts.insert(part);
         }
     }
@@ -231,6 +237,8 @@ mod tests {
             description: String::new(),
             license: "MIT".to_string(),
             tier: "free".to_string(),
+            requires_opt_in: None,
+            opt_in_note: None,
         }
     }
 

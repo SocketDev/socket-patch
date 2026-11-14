@@ -284,6 +284,8 @@ mod tests {
                 description: String::new(),
                 license: "MIT".to_string(),
                 tier: "free".to_string(),
+                requires_opt_in: None,
+                opt_in_note: None,
             },
         );
         manifest

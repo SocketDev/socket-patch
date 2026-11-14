@@ -414,6 +414,8 @@ fn patch_record(uuid: &str, ghsa: &str) -> PatchRecord {
         description: "x".to_string(),
         license: "MIT".to_string(),
         tier: "free".to_string(),
+        requires_opt_in: None,
+        opt_in_note: None,
     }
 }
 

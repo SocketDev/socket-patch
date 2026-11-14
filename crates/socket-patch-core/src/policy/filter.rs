@@ -717,6 +717,8 @@ mod tests {
                     )
                 })
                 .collect(),
+            requires_opt_in: None,
+            opt_in_note: None,
         }
     }
 

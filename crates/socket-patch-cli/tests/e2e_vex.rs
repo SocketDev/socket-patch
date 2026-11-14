@@ -99,6 +99,8 @@ fn make_record(
         description: format!("Patch {uuid}"),
         license: "MIT".to_string(),
         tier: "free".to_string(),
+        requires_opt_in: None,
+        opt_in_note: None,
     }
 }
 

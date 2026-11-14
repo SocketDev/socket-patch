@@ -316,6 +316,8 @@ fn record(uuid: &str, files: &[(&str, &[u8], &[u8])]) -> PatchRecord {
         description: "ledger record".to_string(),
         license: "MIT".to_string(),
         tier: "free".to_string(),
+        requires_opt_in: None,
+        opt_in_note: None,
     }
 }
 

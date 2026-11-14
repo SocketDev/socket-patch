@@ -421,6 +421,7 @@ pub(crate) fn merge_vendor_envelope(env: &mut Envelope, venv: Envelope) {
             .into_iter()
             .map(|e| tag_mode(e, Some("vendored"))),
     );
+    env.add_registered_opt_in_to_events();
     env.warnings.extend(venv.warnings);
     env.sidecars.extend(venv.sidecars);
     // A hard engine error (an unreadable vendor ledger, a refused group
@@ -1201,6 +1202,8 @@ mod migration_tests {
             description: "fixture".into(),
             license: "MIT".into(),
             tier: "free".into(),
+            requires_opt_in: None,
+            opt_in_note: None,
         }
     }
 
@@ -1588,6 +1591,8 @@ mod preview_tests {
             license: "MIT".into(),
             tier: "free".into(),
             vulnerabilities: HashMap::new(),
+            requires_opt_in: None,
+            opt_in_note: None,
         }
     }
 
@@ -2216,6 +2221,8 @@ mod npm_lock_entry_refusal_tests {
             license: "MIT".into(),
             tier: "free".into(),
             vulnerabilities: HashMap::new(),
+            requires_opt_in: None,
+            opt_in_note: None,
         }
     }
 

@@ -1014,6 +1014,8 @@ mod lock_text_refusal_tests {
             description: String::new(),
             license: String::new(),
             tier: String::new(),
+            requires_opt_in: None,
+            opt_in_note: None,
         }
     }
 
@@ -2128,6 +2130,8 @@ mod tests {
             description: String::new(),
             license: String::new(),
             tier: String::new(),
+            requires_opt_in: None,
+            opt_in_note: None,
         };
         (tmp, record)
     }
@@ -3074,6 +3078,8 @@ mod tests {
             description: String::new(),
             license: String::new(),
             tier: String::new(),
+            requires_opt_in: None,
+            opt_in_note: None,
         }
     }
 

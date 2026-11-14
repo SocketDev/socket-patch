@@ -1501,6 +1501,23 @@ fn collect_apply_outcomes(
     (applied, skipped)
 }
 
+type OptInPatches = Vec<(String, String, Option<bool>, Option<String>)>;
+
+fn opt_in_patches(manifest: &PatchManifest) -> OptInPatches {
+    manifest
+        .patches
+        .iter()
+        .map(|(purl, patch)| {
+            (
+                purl.clone(),
+                patch.uuid.clone(),
+                patch.requires_opt_in,
+                patch.opt_in_note.clone(),
+            )
+        })
+        .collect()
+}
+
 /// The locked half of `apply`: everything from the manifest read on — the
 /// package-manager layout gate, the apply loop, embedded VEX, output and
 /// telemetry — over a `lock` the caller already holds and the caller's
@@ -1557,6 +1574,7 @@ pub(crate) async fn run_locked(
 
     // Packages the project patched itself sit this run out (warned); every
     // other record still applies. The read-only `--check` verifies them all.
+    let opt_ins = opt_in_patches(&manifest);
     let mut manifest = manifest;
     let (user_patch_warnings, user_patch_skips) = if args.check {
         Default::default()
@@ -1830,6 +1848,15 @@ pub(crate) async fn run_locked(
                 for line in block {
                     println!("{line}");
                 }
+                if args.nested.is_none() {
+                    let notes = format_opt_in_notes(&opt_ins, &results, &unmatched);
+                    if !notes.is_empty() {
+                        println!("\nOpt-in required:");
+                        for note in notes {
+                            println!("{note}");
+                        }
+                    }
+                }
                 if args.common.verbose && !results.is_empty() {
                     print_verbose_verification(&results);
                 }
@@ -1872,6 +1899,9 @@ pub(crate) async fn run_locked(
             if args.common.json {
                 let mut env = Envelope::new(Command::Apply);
                 env.dry_run = args.common.dry_run;
+                for (purl, uuid, requires_opt_in, opt_in_note) in &opt_ins {
+                    env.register_opt_in(purl, uuid, *requires_opt_in, opt_in_note.as_deref());
+                }
                 for skip in &user_patch_skips {
                     env.record(skip.clone());
                 }
@@ -2365,6 +2395,36 @@ fn format_dry_run_summary(tally: &ApplyTally, not_found: usize) -> Vec<String> {
         ));
     }
     lines
+}
+
+fn format_opt_in_notes(
+    opt_ins: &OptInPatches,
+    results: &[ApplyResult],
+    unmatched: &[String],
+) -> Vec<String> {
+    let shown: HashSet<&str> = results
+        .iter()
+        .map(|result| result.package_key.as_str())
+        .chain(unmatched.iter().map(String::as_str))
+        .collect();
+    let mut notes: Vec<(&str, &str)> = opt_ins
+        .iter()
+        .filter_map(|(purl, _, requires_opt_in, opt_in_note)| {
+            if requires_opt_in != &Some(true) || !shown.contains(purl.as_str()) {
+                return None;
+            }
+            let note = opt_in_note.as_deref()?;
+            (!note.trim().is_empty()).then_some((purl.as_str(), note))
+        })
+        .collect();
+    notes.sort_unstable();
+    notes
+        .into_iter()
+        .map(|(purl, note)| {
+            let note = crate::ui::terminal_text(note).replace('\n', "\n    ");
+            format!("  {}: {note}", normalize_purl(purl))
+        })
+        .collect()
 }
 
 /// One `Patched packages:` line. `copy` names the physical copy when a

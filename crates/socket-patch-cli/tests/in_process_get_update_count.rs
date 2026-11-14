@@ -77,6 +77,8 @@ fn search_result(uuid: &str, purl: &str) -> PatchSearchResult {
         license: "MIT".into(),
         tier: "free".into(),
         vulnerabilities: HashMap::new(),
+        requires_opt_in: None,
+        opt_in_note: None,
     }
 }
 

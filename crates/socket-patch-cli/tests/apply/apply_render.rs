@@ -180,6 +180,49 @@ fn verbose_dry_run_prints_per_file_labels_and_hashes() {
     }
 }
 
+#[test]
+fn opt_in_note_renders_in_human_and_json_apply_output() {
+    const NAME: &str = "opt-in-note";
+    const PURL: &str = "pkg:npm/opt-in-note@1.0.0";
+    const UUID: &str = "75757575-7575-4757-8757-757575757575";
+    const NOTE: &str =
+        "Set `safeMode` to `true`.\x1b[2J\x1b]0;bad\x07\r\nDefaults remain vulnerable.";
+    let tmp = tempfile::tempdir().unwrap();
+    write_root_package_json(tmp.path());
+    let installed = install_npm_pkg(tmp.path(), NAME, "1.0.0", Some(MM_BEFORE));
+    let mut record = patch_record(UUID, one_file("package/index.js", MM_BEFORE, MM_AFTER));
+    record["requiresOptIn"] = json!(true);
+    record["optInNote"] = json!(NOTE);
+    write_manifest(tmp.path(), json!({ PURL: record }));
+    stage_blob(tmp.path(), &git_sha256(MM_AFTER), MM_AFTER);
+
+    let (code, stdout, stderr) = run_apply(tmp.path(), &["--offline"], &[]);
+    assert_eq!(code, 0, "stderr={stderr}");
+    assert_eq!(std::fs::read(installed).unwrap(), MM_AFTER);
+    assert!(
+        stdout.contains(&format!(
+            "Opt-in required:\n  {PURL}: Set `safeMode` to `true`.[2J]0;bad\n    Defaults remain vulnerable."
+        )),
+        "stdout={stdout}"
+    );
+    assert!(
+        !stdout.contains('\x1b') && !stdout.contains('\x07') && !stdout.contains('\r'),
+        "terminal controls must be stripped: {stdout:?}"
+    );
+
+    let (code, stdout, stderr) = run_apply(tmp.path(), &["--offline", "--json"], &[]);
+    assert_eq!(code, 0, "stderr={stderr}");
+    let envelope: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let event = envelope["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|event| event["purl"] == PURL)
+        .unwrap();
+    assert_eq!(event["details"]["requiresOptIn"], true);
+    assert_eq!(event["details"]["optInNote"], NOTE);
+}
+
 // ═══════════ layout notes and refusals ═══════════
 
 /// A pnpm store layout gets the informational stderr note.

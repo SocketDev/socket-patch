@@ -5332,6 +5332,8 @@ mod dispatch_tests {
             description: String::new(),
             license: String::new(),
             tier: String::new(),
+            requires_opt_in: None,
+            opt_in_note: None,
         };
         let sources = PatchSources {
             blobs_path: tmp.path(),
@@ -5392,6 +5394,8 @@ mod plan_gate_tests {
             description: String::new(),
             license: String::new(),
             tier: String::new(),
+            requires_opt_in: None,
+            opt_in_note: None,
         }
     }
 
@@ -5828,6 +5832,8 @@ mod variant_probe_tests {
             description: String::new(),
             license: String::new(),
             tier: String::new(),
+            requires_opt_in: None,
+            opt_in_note: None,
         }
     }
 
@@ -6314,6 +6320,8 @@ mod gc_tests {
                 description: String::new(),
                 license: String::new(),
                 tier: String::new(),
+                requires_opt_in: None,
+                opt_in_note: None,
             },
         );
         let manifest_path = socket.join("manifest.json");
@@ -6759,6 +6767,8 @@ mod gc_tests {
                 description: String::new(),
                 license: String::new(),
                 tier: String::new(),
+                requires_opt_in: None,
+                opt_in_note: None,
             },
         );
         let manifest_path = socket.join("manifest.json");
@@ -7575,6 +7585,8 @@ mod persist_tests {
             description: String::new(),
             license: String::new(),
             tier: String::new(),
+            requires_opt_in: None,
+            opt_in_note: None,
         }
     }
 

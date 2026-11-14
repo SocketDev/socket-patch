@@ -248,6 +248,13 @@ pub fn truncate(s: &str, max: usize) -> String {
     format!("{}{ELLIPSIS}", head.trim_end())
 }
 
+pub(crate) fn terminal_text(s: &str) -> String {
+    s.replace("\r\n", "\n")
+        .chars()
+        .filter(|&c| c == '\n' || c == '\t' || !c.is_control())
+        .collect()
+}
+
 /// `word` as one argument a user can paste into their shell: bare when it
 /// holds only characters no shell treats specially, otherwise quoted (POSIX
 /// single quotes; double quotes on Windows, which cmd and PowerShell both

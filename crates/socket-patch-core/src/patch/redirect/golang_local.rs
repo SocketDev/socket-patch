@@ -1121,6 +1121,8 @@ mod tests {
                 description: String::new(),
                 license: String::new(),
                 tier: String::new(),
+                requires_opt_in: None,
+                opt_in_note: None,
             },
         );
         m
@@ -2898,6 +2900,8 @@ mod tests {
                 description: String::new(),
                 license: String::new(),
                 tier: String::new(),
+                requires_opt_in: None,
+                opt_in_note: None,
             },
         );
         let desired: HashSet<String> = [unsafe_purl.to_string()].into_iter().collect();

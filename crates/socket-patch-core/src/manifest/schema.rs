@@ -52,6 +52,10 @@ pub struct PatchRecord {
     pub description: String,
     pub license: String,
     pub tier: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requires_opt_in: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opt_in_note: Option<String>,
 }
 
 /// Legacy `setup` configuration, written by the `setup` command that v5
@@ -173,8 +177,27 @@ mod tests {
 
         // Verify round-trip
         let serialized = serde_json::to_string_pretty(&manifest).unwrap();
-        let reparsed: PatchManifest = serde_json::from_str(&serialized).unwrap();
+        assert!(!serialized.contains("requiresOptIn"));
+        assert!(!serialized.contains("optInNote"));
+        let mut reparsed: PatchManifest = serde_json::from_str(&serialized).unwrap();
         assert_eq!(manifest, reparsed);
+        let record = reparsed
+            .patches
+            .get_mut("pkg:npm/simplehttpserver@0.0.6")
+            .unwrap();
+        assert_eq!(record.requires_opt_in, None);
+        assert_eq!(record.opt_in_note, None);
+        record.requires_opt_in = Some(true);
+        record.opt_in_note = Some("Set `safeMode` to `true`; defaults remain vulnerable.".into());
+        let serialized = serde_json::to_string_pretty(&reparsed).unwrap();
+        let opted_in: PatchManifest = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(reparsed, opted_in);
+        let record = &opted_in.patches["pkg:npm/simplehttpserver@0.0.6"];
+        assert_eq!(record.requires_opt_in, Some(true));
+        assert_eq!(
+            record.opt_in_note.as_deref(),
+            Some("Set `safeMode` to `true`; defaults remain vulnerable.")
+        );
     }
 
     #[test]
@@ -200,6 +223,8 @@ mod tests {
             description: "test".to_string(),
             license: "MIT".to_string(),
             tier: "free".to_string(),
+            requires_opt_in: None,
+            opt_in_note: None,
         };
         let json = serde_json::to_string(&record).unwrap();
         assert!(json.contains("exportedAt"));
@@ -386,6 +411,8 @@ mod tests {
             description: "d".to_string(),
             license: "MIT".to_string(),
             tier: "free".to_string(),
+            requires_opt_in: None,
+            opt_in_note: None,
         };
 
         // Insert in deliberately reverse-sorted order.
@@ -457,6 +484,8 @@ mod tests {
                 description: "d".to_string(),
                 license: "MIT".to_string(),
                 tier: "free".to_string(),
+                requires_opt_in: None,
+                opt_in_note: None,
             }
         };
 

@@ -120,6 +120,8 @@ fn populated_manifest() -> PatchManifest {
             description: "Test patch".to_string(),
             license: "MIT".to_string(),
             tier: "free".to_string(),
+            requires_opt_in: None,
+            opt_in_note: None,
         },
     );
 
@@ -622,6 +624,8 @@ fn multi_manifest() -> PatchManifest {
             description: format!("description for {uuid}"),
             license: "MIT".to_string(),
             tier: "free".to_string(),
+            requires_opt_in: None,
+            opt_in_note: None,
         }
     }
 
@@ -972,6 +976,8 @@ fn hosted_record(uuid: &str) -> PatchRecord {
         description: "Hosted patch".to_string(),
         license: "MIT".to_string(),
         tier: "free".to_string(),
+        requires_opt_in: None,
+        opt_in_note: None,
     }
 }
 

@@ -185,6 +185,12 @@ fn build_list_envelope(entries: &[ListEntry<'_>]) -> Envelope {
             details["lockfiles"] = serde_json::json!(entry.lockfiles);
         }
 
+        env.register_opt_in(
+            entry.purl,
+            &patch.uuid,
+            patch.requires_opt_in,
+            patch.opt_in_note.as_deref(),
+        );
         env.record(
             PatchEvent::new(PatchAction::Discovered, entry.purl.to_string())
                 .with_uuid(patch.uuid.clone())
@@ -246,10 +252,7 @@ fn failed_listing(
 /// control characters that would rewrite the terminal (ESC, a stray
 /// `\r`), keeping newlines and tabs, and normalize `\r\n`.
 fn sanitize(s: &str) -> String {
-    s.replace("\r\n", "\n")
-        .chars()
-        .filter(|&c| c == '\n' || c == '\t' || !c.is_control())
-        .collect()
+    crate::ui::terminal_text(s)
 }
 
 /// `"{indent}{label}: {value}"`, or `None` when the value is blank (no
@@ -290,6 +293,11 @@ fn format_entry(entry: &ListEntry<'_>, color: bool) -> String {
     lines.extend(field("  ", "License", &patch.license));
     lines.extend(field("  ", "Exported", &patch.exported_at));
     lines.extend(field("  ", "Description", &patch.description));
+    if patch.requires_opt_in == Some(true) {
+        if let Some(note) = &patch.opt_in_note {
+            lines.extend(field("  ", "Opt-in required", note));
+        }
+    }
 
     let mut vuln_entries: Vec<_> = patch.vulnerabilities.iter().collect();
     vuln_entries.sort_by(|a, b| a.0.cmp(b.0));
@@ -667,6 +675,8 @@ mod tests {
                 description: "Fixes prototype pollution".to_string(),
                 license: "MIT".to_string(),
                 tier: "free".to_string(),
+                requires_opt_in: None,
+                opt_in_note: None,
             },
         );
 
@@ -712,6 +722,8 @@ mod tests {
                 description: "desc".to_string(),
                 license: "MIT".to_string(),
                 tier: "free".to_string(),
+                requires_opt_in: None,
+                opt_in_note: None,
             }
         }
 

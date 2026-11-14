@@ -46,6 +46,10 @@ pub struct PatchResponse {
     pub description: String,
     pub license: String,
     pub tier: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requires_opt_in: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opt_in_note: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -80,6 +84,10 @@ pub struct PatchSearchResult {
     pub license: String,
     pub tier: String,
     pub vulnerabilities: HashMap<String, VulnerabilityResponse>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requires_opt_in: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opt_in_note: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -109,6 +117,10 @@ pub struct BatchPatchInfo {
     /// fills it in from the per-package search results.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub published_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requires_opt_in: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opt_in_note: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -237,10 +249,17 @@ mod tests {
             },
             "description": "Fix path traversal",
             "license": "MIT",
-            "tier": "free"
+            "tier": "free",
+            "requiresOptIn": true,
+            "optInNote": "Set `safeMode` to `true`; defaults remain vulnerable."
         }"#;
         let pr: PatchResponse = serde_json::from_str(json).unwrap();
         assert_eq!(pr.published_at, "2024-01-01T00:00:00Z");
+        assert_eq!(pr.requires_opt_in, Some(true));
+        assert_eq!(
+            pr.opt_in_note.as_deref(),
+            Some("Set `safeMode` to `true`; defaults remain vulnerable.")
+        );
 
         let file = pr.files.get("package/index.js").expect("file present");
         assert_eq!(
@@ -314,6 +333,8 @@ mod tests {
         assert_eq!(patches[0].severity.as_deref(), Some("high"));
         assert!(patches[1].severity.is_none());
         assert!(patches[1].cve_ids.is_empty());
+        assert_eq!(patches[0].requires_opt_in, None);
+        assert_eq!(patches[0].opt_in_note, None);
     }
 
     /// `scan --json` serializes the batch packages verbatim, so their
@@ -331,6 +352,8 @@ mod tests {
                 severity: None,
                 title: "Patch one".into(),
                 published_at: None,
+                requires_opt_in: None,
+                opt_in_note: None,
             }],
         };
         assert_eq!(
@@ -440,6 +463,8 @@ mod tests {
         assert_eq!(sr.patches.len(), 1);
         assert!(!sr.can_access_paid_patches);
         assert_eq!(sr.patches[0].published_at, "2024-01-01T00:00:00Z");
+        assert_eq!(sr.patches[0].requires_opt_in, None);
+        assert_eq!(sr.patches[0].opt_in_note, None);
     }
 
     #[test]

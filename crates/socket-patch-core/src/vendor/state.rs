@@ -1867,6 +1867,8 @@ mod tests {
             description: "fixes prototype pollution".into(),
             license: "MIT".into(),
             tier: "free".into(),
+            requires_opt_in: None,
+            opt_in_note: None,
         });
         let mut state = VendorState::new();
         state

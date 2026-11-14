@@ -235,6 +235,8 @@ async fn run_removes_matching_patch_and_exits_zero() {
             description: "test".to_string(),
             license: "MIT".to_string(),
             tier: "free".to_string(),
+            requires_opt_in: None,
+            opt_in_note: None,
         }
     }
 

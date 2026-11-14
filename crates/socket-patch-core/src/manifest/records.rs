@@ -44,6 +44,8 @@ pub fn build_patch_record(
         description: patch.description.clone(),
         license: patch.license.clone(),
         tier: patch.tier.clone(),
+        requires_opt_in: patch.requires_opt_in,
+        opt_in_note: patch.opt_in_note.clone(),
     }
 }
 

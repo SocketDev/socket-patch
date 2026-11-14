@@ -354,6 +354,91 @@ async fn human_search_results_show_paid_access_and_fixes_lines() {
     assert_eq!(manifest_json(tmp.path())["patches"][PURL]["uuid"], UUID);
 }
 
+#[tokio::test]
+async fn opt_in_note_renders_and_persists_in_human_and_json_get() {
+    const NOTE: &str =
+        "Set `safeMode` to `true`.\x1b[2J\x1b]0;bad\x07\r\nDefaults remain vulnerable.";
+    let server = MockServer::start().await;
+    let cve = "CVE-2024-4243";
+    Mock::given(method("GET"))
+        .and(path(format!("/v0/orgs/{ORG}/patches/by-cve/{cve}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "patches": [{
+                "uuid": UUID, "purl": PURL,
+                "publishedAt": "2024-01-01T00:00:00Z",
+                "description": "Opt-in patch", "license": "MIT", "tier": "free",
+                "vulnerabilities": {},
+                "requiresOptIn": true,
+                "optInNote": NOTE,
+            }],
+            "canAccessPaidPatches": false,
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/v0/orgs/{ORG}/patches/view/{UUID}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "uuid": UUID,
+            "purl": PURL,
+            "publishedAt": "2024-01-01T00:00:00Z",
+            "files": good_files(),
+            "vulnerabilities": {},
+            "description": "Opt-in patch",
+            "license": "MIT",
+            "tier": "free",
+            "requiresOptIn": true,
+            "optInNote": NOTE,
+        })))
+        .mount(&server)
+        .await;
+
+    let human = tempfile::tempdir().unwrap();
+    let (code, stdout, stderr) = run_get_bin(human.path(), &server.uri(), &[cve, "--save-only"]);
+    assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
+    assert!(
+        stdout.contains(
+            "Opt-in required: Set `safeMode` to `true`.[2J]0;bad\n       Defaults remain vulnerable."
+        ),
+        "stdout={stdout}"
+    );
+    assert!(
+        !stdout.contains('\x1b') && !stdout.contains('\x07') && !stdout.contains('\r'),
+        "terminal controls must be stripped: {stdout:?}"
+    );
+    let record = &manifest_json(human.path())["patches"][PURL];
+    assert_eq!(record["requiresOptIn"], true);
+    assert_eq!(record["optInNote"], NOTE);
+
+    let uuid_human = tempfile::tempdir().unwrap();
+    let (code, stdout, stderr) =
+        run_get_bin(uuid_human.path(), &server.uri(), &[UUID, "--save-only"]);
+    assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
+    assert!(
+        stdout.contains(&format!(
+            "Opt-in required for {PURL}: Set `safeMode` to `true`.[2J]0;bad\n  Defaults remain vulnerable."
+        )),
+        "stdout={stdout}"
+    );
+    assert!(
+        !stdout.contains('\x1b') && !stdout.contains('\x07') && !stdout.contains('\r'),
+        "UUID terminal controls must be stripped: {stdout:?}"
+    );
+
+    let json = tempfile::tempdir().unwrap();
+    let (code, stdout, stderr) =
+        run_get_bin(json.path(), &server.uri(), &[UUID, "--save-only", "--json"]);
+    assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
+    let envelope: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let event = envelope["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|event| event["uuid"] == UUID)
+        .unwrap();
+    assert_eq!(event["details"]["requiresOptIn"], true);
+    assert_eq!(event["details"]["optInNote"], NOTE);
+}
+
 /// Human paid-only search: the subscription message, exit 0, no download.
 #[tokio::test]
 async fn human_paid_only_search_prints_subscription_message() {

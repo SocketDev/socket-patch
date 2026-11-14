@@ -2880,6 +2880,8 @@ fn convert_search_result_to_batch_info(patch: PatchSearchResult) -> BatchPatchIn
         // `ranking` (the tiebreak after severity and advisory count) — and
         // it is the one path where we definitely have it.
         published_at: Some(patch.published_at),
+        requires_opt_in: patch.requires_opt_in,
+        opt_in_note: patch.opt_in_note,
     }
 }
 
@@ -3428,6 +3430,8 @@ mod tests {
             license: "MIT".into(),
             tier: "free".into(),
             vulnerabilities: vulns,
+            requires_opt_in: Some(true),
+            opt_in_note: Some("Set `safeMode` to `true`.".into()),
         };
 
         let info = convert_search_result_to_batch_info(patch);
@@ -3436,6 +3440,11 @@ mod tests {
         assert_eq!(info.ghsa_ids, vec!["GHSA-1234-5678-9abc"]);
         assert_eq!(info.severity, Some("high".into()));
         assert_eq!(info.title, "Test vulnerability");
+        assert_eq!(info.requires_opt_in, Some(true));
+        assert_eq!(
+            info.opt_in_note.as_deref(),
+            Some("Set `safeMode` to `true`.")
+        );
     }
 
     #[tokio::test]
@@ -3785,6 +3794,8 @@ mod tests {
             license: "MIT".into(),
             tier: "free".into(),
             vulnerabilities: vulns,
+            requires_opt_in: None,
+            opt_in_note: None,
         }
     }
 
@@ -4508,6 +4519,8 @@ mod tests {
                     license: "MIT".into(),
                     tier: "free".into(),
                     vulnerabilities: HashMap::new(),
+                    requires_opt_in: None,
+                    opt_in_note: None,
                 })
                 .collect(),
             can_access_paid_patches,

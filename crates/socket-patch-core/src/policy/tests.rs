@@ -179,6 +179,8 @@ fn floor_filter_uses_max_advisory_severity() {
                 )
             })
             .collect::<HashMap<_, _>>(),
+        requires_opt_in: None,
+        opt_in_note: None,
     };
     let policy = load(&[("socket.yml", "version: 2\npatches:\n  minSeverity: high\n")]);
     let (kept, dropped) = policy.floor_filter(vec![

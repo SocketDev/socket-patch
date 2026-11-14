@@ -367,6 +367,12 @@ fn format_search_results(
         if !desc.is_empty() {
             out.push_str(&format!("     Description: {desc}\n"));
         }
+        if patch.requires_opt_in == Some(true) {
+            if let Some(note) = &patch.opt_in_note {
+                let note = crate::ui::terminal_text(note).replace('\n', "\n       ");
+                out.push_str(&format!("     Opt-in required: {note}\n"));
+            }
+        }
         let mut fixes: Vec<(String, String)> = patch
             .vulnerabilities
             .iter()
@@ -1284,6 +1290,15 @@ pub async fn run(args: GetArgs) -> i32 {
                             crate::ui::stderr_color(),
                         )
                     );
+                    if patch.requires_opt_in == Some(true) {
+                        if let Some(note) = &patch.opt_in_note {
+                            let note = crate::ui::terminal_text(note).replace('\n', "\n  ");
+                            println!(
+                                "Opt-in required for {}: {note}",
+                                normalize_purl(&patch.purl)
+                            );
+                        }
+                    }
                 }
 
                 // Record the fetch BEFORE the save+apply step so the
@@ -1802,6 +1817,7 @@ pub async fn run(args: GetArgs) -> i32 {
         verbose: args.common.verbose,
     };
     let mut env = new_envelope(&args.common);
+    register_opt_ins(&mut env, &selected);
     // The narrowing skips came first (before any download).
     fold_narrowing_into_result(&mut env, &narrow_skips, &narrow_warnings);
     // The engine records into `env` and never prints it: exactly one JSON
@@ -1904,6 +1920,7 @@ async fn agent_dry_run(
     if args.common.json {
         let mut env = new_envelope(&args.common);
         env.dry_run = true;
+        register_opt_ins(&mut env, selected);
         fold_narrowing_into_result(&mut env, narrow_skips, narrow_warnings);
         for event in events {
             env.record(event);
@@ -2159,6 +2176,12 @@ async fn save_and_apply_patch(
 
     if args.common.json {
         let mut env = new_envelope(&args.common);
+        env.register_opt_in(
+            &patch.purl,
+            &patch.uuid,
+            patch.requires_opt_in,
+            patch.opt_in_note.as_deref(),
+        );
         fold_narrowing_into_result(&mut env, &[], run_warnings);
         // The metadata rides only a changed record — an `already_in_manifest`
         // skip means the consumer already saw it last time.
@@ -2206,6 +2229,19 @@ fn search_result_from_response(patch: &PatchResponse) -> PatchSearchResult {
         license: patch.license.clone(),
         tier: patch.tier.clone(),
         vulnerabilities: patch.vulnerabilities.clone(),
+        requires_opt_in: patch.requires_opt_in,
+        opt_in_note: patch.opt_in_note.clone(),
+    }
+}
+
+fn register_opt_ins(env: &mut Envelope, patches: &[PatchSearchResult]) {
+    for patch in patches {
+        env.register_opt_in(
+            &patch.purl,
+            &patch.uuid,
+            patch.requires_opt_in,
+            patch.opt_in_note.as_deref(),
+        );
     }
 }
 
@@ -2254,6 +2290,7 @@ async fn run_get_hosted(
     // common.json (see run_redirect_selected's doc).
     let scan_result = args.common.json.then(|| {
         let mut env = new_envelope(&args.common);
+        register_opt_ins(&mut env, selected);
         fold_narrowing_into_result(&mut env, narrow_skips, narrow_warnings);
         env
     });
@@ -2305,6 +2342,7 @@ async fn run_get_vendored(
     telemetry: &TelemetryAuth,
 ) -> i32 {
     let mut env = new_envelope(&args.common);
+    register_opt_ins(&mut env, selected);
     fold_narrowing_into_result(&mut env, narrow_skips, narrow_warnings);
     // Dry run: ledger-classification preview only (scan's posture) — no
     // download, no vendor step, no writes.
@@ -2568,6 +2606,8 @@ mod tests {
             license: "MIT".into(),
             tier: tier.into(),
             vulnerabilities: HashMap::<String, VulnerabilityResponse>::new(),
+            requires_opt_in: None,
+            opt_in_note: None,
         }
     }
 
@@ -2899,6 +2939,8 @@ mod tests {
                 description: String::new(),
                 license: String::new(),
                 tier: "free".to_string(),
+                requires_opt_in: None,
+                opt_in_note: None,
             },
         );
         m
@@ -3080,6 +3122,8 @@ mod tests {
             description: "desc".into(),
             license: "MIT".into(),
             tier: "free".into(),
+            requires_opt_in: None,
+            opt_in_note: None,
         };
         let meta = patch_event_metadata(&patch);
         assert!(meta.as_object().unwrap().get("severity").is_none());
@@ -3110,6 +3154,8 @@ mod tests {
             description: "Fixes prototype pollution in minimist".into(),
             license: "MIT".into(),
             tier: "free".into(),
+            requires_opt_in: None,
+            opt_in_note: None,
         };
         let meta = patch_event_metadata(&patch);
         assert_eq!(meta["description"], "Fixes prototype pollution in minimist");
@@ -3151,6 +3197,8 @@ mod tests {
             description: String::new(),
             license: String::new(),
             tier: String::new(),
+            requires_opt_in: None,
+            opt_in_note: None,
         };
         let meta = patch_event_metadata(&patch);
         let ids: Vec<&str> = meta["vulnerabilities"]
@@ -3173,6 +3221,8 @@ mod tests {
             description: "desc".into(),
             license: "MIT".into(),
             tier: "free".into(),
+            requires_opt_in: None,
+            opt_in_note: None,
         };
         let meta = patch_event_metadata(&patch);
         // `severity` is intentionally omitted (not null) when there
@@ -3748,6 +3798,8 @@ mod tests {
             description: "desc".into(),
             license: "MIT".into(),
             tier: "free".into(),
+            requires_opt_in: None,
+            opt_in_note: None,
         }
     }
 

@@ -1975,6 +1975,8 @@ pub async fn preview_refusals(
             description: String::new(),
             license: String::new(),
             tier: String::new(),
+            requires_opt_in: None,
+            opt_in_note: None,
         };
         if let Err(VendorOutcome::Refused { code, detail }) = pypi_prelude(
             purl,
@@ -4775,6 +4777,8 @@ mod tests {
             description: String::new(),
             license: String::new(),
             tier: String::new(),
+            requires_opt_in: None,
+            opt_in_note: None,
         };
         E2eFixture {
             _tmp: tmp,

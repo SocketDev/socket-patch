@@ -494,6 +494,8 @@ fn patch_record(uuid: &str) -> PatchRecord {
         description: String::new(),
         license: String::new(),
         tier: String::new(),
+        requires_opt_in: None,
+        opt_in_note: None,
     }
 }
 

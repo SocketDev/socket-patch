@@ -244,6 +244,8 @@ mod tests {
             license: "MIT".to_string(),
             tier: tier.to_string(),
             vulnerabilities: vulns(&refs),
+            requires_opt_in: None,
+            opt_in_note: None,
         }
     }
 
@@ -276,6 +278,8 @@ mod tests {
             severity: severity.map(str::to_string),
             title: String::new(),
             published_at: published.map(str::to_string),
+            requires_opt_in: None,
+            opt_in_note: None,
         }
     }
 

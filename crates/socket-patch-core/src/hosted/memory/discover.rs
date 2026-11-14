@@ -530,6 +530,8 @@ mod tests {
                             severity: None,
                             title: String::new(),
                             published_at: None,
+                            requires_opt_in: None,
+                            opt_in_note: None,
                         }],
                     }],
                     can_access_paid_patches: false,

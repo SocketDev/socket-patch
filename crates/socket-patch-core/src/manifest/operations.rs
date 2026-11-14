@@ -254,6 +254,8 @@ mod tests {
                 description: "Test patch 1".to_string(),
                 license: "MIT".to_string(),
                 tier: "free".to_string(),
+                requires_opt_in: None,
+                opt_in_note: None,
             },
         );
 
@@ -276,6 +278,8 @@ mod tests {
                 description: "Test patch 2".to_string(),
                 license: "MIT".to_string(),
                 tier: "free".to_string(),
+                requires_opt_in: None,
+                opt_in_note: None,
             },
         );
 

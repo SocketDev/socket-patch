@@ -148,6 +148,12 @@ pub(crate) fn patch_event_metadata(patch: &PatchResponse) -> serde_json::Value {
         serde_json::Value::String(patch.license.clone()),
     );
     meta.insert("tier".into(), serde_json::Value::String(patch.tier.clone()));
+    if let Some(requires_opt_in) = patch.requires_opt_in {
+        meta.insert("requiresOptIn".into(), serde_json::json!(requires_opt_in));
+    }
+    if let Some(opt_in_note) = &patch.opt_in_note {
+        meta.insert("optInNote".into(), serde_json::json!(opt_in_note));
+    }
     meta.insert(
         "exportedAt".into(),
         serde_json::Value::String(patch.published_at.clone()),

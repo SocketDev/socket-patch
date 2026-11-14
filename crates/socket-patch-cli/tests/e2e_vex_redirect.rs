@@ -131,6 +131,8 @@ fn make_record(uuid: &str, after_hash: &str, vuln_id: &str, cves: &[&str]) -> Pa
         description: format!("Patch {uuid}"),
         license: "MIT".to_string(),
         tier: "free".to_string(),
+        requires_opt_in: None,
+        opt_in_note: None,
     }
 }
 

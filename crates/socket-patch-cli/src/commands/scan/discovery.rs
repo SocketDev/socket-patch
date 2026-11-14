@@ -936,6 +936,8 @@ mod tests {
                     severity: None,
                     title: String::new(),
                     published_at: None,
+                    requires_opt_in: None,
+                    opt_in_note: None,
                 })
                 .collect(),
         }
@@ -958,6 +960,8 @@ mod tests {
                     severity: Some((*severity).to_string()),
                     title: String::new(),
                     published_at: Some((*published).to_string()),
+                    requires_opt_in: None,
+                    opt_in_note: None,
                 })
                 .collect(),
         }
@@ -1768,6 +1772,8 @@ mod tests {
                 severity: None,
                 title: String::new(),
                 published_at: None,
+                requires_opt_in: None,
+                opt_in_note: None,
             }],
         }
     }
@@ -1786,6 +1792,8 @@ mod tests {
             severity: None,
             title: String::new(),
             published_at: None,
+            requires_opt_in: None,
+            opt_in_note: None,
         }
     }
 
@@ -1811,6 +1819,8 @@ mod tests {
                     ((*id).to_string(), vuln)
                 })
                 .collect(),
+            requires_opt_in: None,
+            opt_in_note: None,
         }
     }
 
@@ -2082,6 +2092,8 @@ mod tests {
             license: String::new(),
             tier: "free".to_string(),
             vulnerabilities: std::collections::HashMap::new(),
+            requires_opt_in: None,
+            opt_in_note: None,
         }
     }
 
@@ -2412,6 +2424,8 @@ mod tests {
             description: String::new(),
             license: "MIT".into(),
             tier: "free".into(),
+            requires_opt_in: None,
+            opt_in_note: None,
         };
         let entry = |uuid: &str, detached: bool| VendorEntry {
             detached,
@@ -2576,6 +2590,8 @@ mod tests {
                     description: String::new(),
                     license: "MIT".into(),
                     tier: "free".into(),
+                    requires_opt_in: None,
+                    opt_in_note: None,
                 }),
                 ..VendorEntry::new(
                     "npm".into(),

@@ -3995,6 +3995,8 @@ mod tests {
                     description: String::new(),
                     license: String::new(),
                     tier: "free".to_string(),
+                    requires_opt_in: None,
+                    opt_in_note: None,
                 },
             );
         }
@@ -4144,6 +4146,8 @@ mod tests {
             description: String::new(),
             license: "MIT".to_string(),
             tier: "free".to_string(),
+            requires_opt_in: None,
+            opt_in_note: None,
         }
     }
 
@@ -4410,6 +4414,8 @@ mod tests {
             license: "MIT".to_string(),
             tier: "free".to_string(),
             vulnerabilities: HashMap::new(),
+            requires_opt_in: None,
+            opt_in_note: None,
         };
         let mut state = VendorState::new();
         let entry: socket_patch_core::vendor::VendorEntry = serde_json::from_value(

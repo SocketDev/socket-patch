@@ -331,6 +331,8 @@ mod tests {
             description: String::new(),
             license: String::new(),
             tier: "free".to_string(),
+            requires_opt_in: None,
+            opt_in_note: None,
         }
     }
 

@@ -208,7 +208,9 @@ fn write_sparse_manifest(root: &Path) {
       }},
       "description": "Fixes an advisory with no CVE id",
       "license": "MIT",
-      "tier": "free"
+      "tier": "free",
+      "requiresOptIn": true,
+      "optInNote": "Set `safeMode` to `true`; defaults remain vulnerable."
     }},
     "pkg:npm/bare@1.0.0": {{
       "uuid": "22222222-2222-4222-8222-222222222222",
@@ -298,6 +300,42 @@ fn list_non_json_minimal_record_omits_empty_sections() {
         !bare_block.contains("Description:"),
         "an empty description must be omitted; got: {bare_block}"
     );
+}
+
+#[test]
+fn list_renders_opt_in_note_in_human_and_json_output() {
+    const PURL: &str = "pkg:npm/ghsa-only@1.0.0";
+    const NOTE: &str = "Set `safeMode` to `true`; defaults remain vulnerable.";
+    let tmp = tempfile::tempdir().unwrap();
+    write_sparse_manifest(tmp.path());
+
+    let (code, stdout, stderr) =
+        common::run_with_env(tmp.path(), &["list"], &[("SOCKET_TELEMETRY_DISABLED", "1")]);
+    assert_eq!(code, 0, "stderr:\n{stderr}");
+    assert!(
+        package_block(&stdout, PURL).contains(&format!("Opt-in required: {NOTE}")),
+        "stdout={stdout}"
+    );
+    assert!(
+        !package_block(&stdout, "pkg:npm/bare@1.0.0").contains("Opt-in required"),
+        "legacy records omit the note: {stdout}"
+    );
+
+    let (code, stdout, stderr) = common::run_with_env(
+        tmp.path(),
+        &["list", "--json"],
+        &[("SOCKET_TELEMETRY_DISABLED", "1")],
+    );
+    assert_eq!(code, 0, "stderr:\n{stderr}");
+    let envelope: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let event = envelope["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|event| event["purl"] == PURL)
+        .unwrap();
+    assert_eq!(event["details"]["requiresOptIn"], true);
+    assert_eq!(event["details"]["optInNote"], NOTE);
 }
 
 /// A vlt vendored entry (the `flavor: "vlt"` directory artifact) lists as a

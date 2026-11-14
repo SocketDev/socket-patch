@@ -107,6 +107,8 @@ async fn fixture(root: &Path) -> (std::path::PathBuf, std::path::PathBuf, PatchR
         description: String::new(),
         license: String::new(),
         tier: String::new(),
+        requires_opt_in: None,
+        opt_in_note: None,
     };
     (installed, blobs, record)
 }

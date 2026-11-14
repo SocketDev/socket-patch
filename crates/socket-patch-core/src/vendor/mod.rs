@@ -982,6 +982,8 @@ pub async fn lock_text_refusals(
         description: String::new(),
         license: String::new(),
         tier: String::new(),
+        requires_opt_in: None,
+        opt_in_note: None,
     };
     let mut refusals = HashMap::new();
     let npm: Vec<(&str, crate::manifest::schema::PatchRecord)> = candidates
@@ -1107,6 +1109,8 @@ mod harvest_tests {
                 description: String::new(),
                 license: "MIT".to_string(),
                 tier: "free".to_string(),
+                requires_opt_in: None,
+                opt_in_note: None,
             },
         )
     }

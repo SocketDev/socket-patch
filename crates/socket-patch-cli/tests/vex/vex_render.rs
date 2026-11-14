@@ -5,6 +5,7 @@
 //! per message family.
 
 use crate::vex_fixture::*;
+use socket_patch_core::manifest::schema::PatchManifest;
 
 #[test]
 fn dry_run_with_output_writes_nothing_and_says_so() {
@@ -64,6 +65,35 @@ fn output_dash_means_stdout() {
         "{stderr}"
     );
     assert_eq!(lines[1], "Emitted 1 VEX statement");
+}
+
+#[test]
+fn opt_in_note_is_appended_to_the_vex_impact_statement() {
+    const PURL: &str = "pkg:npm/a@1.0.0";
+    const UUID: &str = "00000001-1111-4111-8111-111111111111";
+    const NOTE: &str = "Set `safeMode` to `true`; defaults remain vulnerable.";
+    let tmp = tempfile::tempdir().unwrap();
+    let mut record = make_record(
+        UUID,
+        "package/index.js",
+        &"a".repeat(64),
+        &"b".repeat(64),
+        "GHSA-test-0",
+        &[],
+    );
+    record.requires_opt_in = Some(true);
+    record.opt_in_note = Some(NOTE.to_string());
+    let mut manifest = PatchManifest::new();
+    manifest.patches.insert(PURL.to_string(), record);
+    write_manifest(tmp.path(), &manifest);
+
+    let o = vex(tmp.path(), &["--no-verify", "-O", "-"]);
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    let doc: Value = serde_json::from_slice(&o.stdout).expect("document on stdout");
+    assert_eq!(
+        doc["statements"][0]["impact_statement"],
+        format!("Patched via Socket patch {UUID}; not verified on disk; opt-in required: {NOTE}")
+    );
 }
 
 #[test]
