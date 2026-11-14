@@ -469,13 +469,16 @@ pub(crate) fn remove_registry_block(config: &str, reg: &str) -> Option<String> {
 }
 
 /// Invert the cargo rewriter's append of a `[registries.…]` block: it wrote
-/// `config + "\n" + block` (just `block` into an empty config), or
-/// `config + "\n\n" + block` when the config lacked a final newline.
-/// Removing the block plus the one newline before it restores the config's
-/// exact bytes, a missing final newline or trailing blank lines included,
-/// and anything the user appended after the block kept. An all-CRLF file is
-/// inverted as LF and written back CRLF. `None` when the block is not in
-/// the file.
+/// `config + "\n" + block` (just `block` into an empty config), whether or
+/// not the config ended in a newline. Removing the block plus the one
+/// newline before it restores the config's exact bytes, a missing final
+/// newline or trailing blank lines included, and anything the user appended
+/// after the block kept. An all-CRLF file is inverted as LF and written back
+/// CRLF. `None` when the block is not in the file.
+///
+/// Earlier releases wrote `config + "\n\n" + block` into a config with no
+/// final newline. Nothing in the file tells that apart from a config that
+/// had one, so a config they patched comes back with a final newline added.
 fn remove_appended_cargo_block(content: &str, fragment: &str) -> Option<String> {
     if !content.is_empty() && content.matches('\n').count() == content.matches("\r\n").count() {
         return remove_appended_cargo_block(
@@ -816,6 +819,19 @@ mod tests {
         let (outcome, after) = restore_b(&manifest(""), &config).await;
         assert_eq!(outcome.restored().count(), 1, "{:?}", outcome.pins);
         assert_eq!(after, None, "the emptied config must be deleted");
+    }
+
+    /// A config that had no final newline before the rewriter appended its
+    /// block comes back without one: the restore takes away the block and
+    /// the one newline put before it, nothing more and nothing less.
+    #[tokio::test]
+    async fn restore_gives_back_a_config_with_no_final_newline() {
+        for original in ["[net]\nretry = 3", "[net]\nretry = 3\n"] {
+            let hosted = format!("{original}\n{}", block(B));
+            let (outcome, after) = restore_b(&manifest(""), &hosted).await;
+            assert_eq!(outcome.restored().count(), 1, "{:?}", outcome.pins);
+            assert_eq!(after.as_deref(), Some(original), "{original:?}");
+        }
     }
 
     /// A generation the restore did not select that a manifest still pins
