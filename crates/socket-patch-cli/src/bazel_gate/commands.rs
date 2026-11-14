@@ -264,12 +264,25 @@ fn unwritten(outcome: &mut RestoreOutcome, why: String) {
 }
 
 /// The files a restore changes, by path under the Bazel root.
+///
+/// A change set of the Bazel side is the whole restore
+/// (`restore_upstream_under_bazel`): it holds the native files too, as the
+/// rows' lanes left them, and a file it names is never replaced by what
+/// the native restorer alone staged. Without one the staged text is the
+/// restore.
+///
+/// A staged file the Bazel side's set does not name is one the root
+/// cannot name (`RestoreOutcome::outside_bazel_root`). It keeps its entry
+/// under the key as spelled, which the commit anchored at the root
+/// refuses: the restore lands whole or not at all, never without it.
 fn changes_of(outcome: &RestoreOutcome, below: &str) -> Changes {
     let side = outcome.bazel.as_ref();
     let mut changes = side.map(|undo| undo.changes.clone()).unwrap_or_default();
     for (path, text) in &outcome.staged_text {
-        let bytes = text.as_ref().map(|text| text.clone().into_bytes());
-        changes.insert(format!("{below}{path}"), bytes);
+        let bytes = || text.as_ref().map(|text| text.clone().into_bytes());
+        changes
+            .entry(format!("{below}{path}"))
+            .or_insert_with(bytes);
     }
     changes
 }
@@ -1509,5 +1522,89 @@ mod tests {
         plain.record(PatchEvent::new(PatchAction::RolledBack, PURL));
         Undone::default().mark(&mut plain);
         assert!(plain.events[0].details.is_none());
+    }
+
+    /// The change set of the Bazel side is the whole restore: a native
+    /// file it holds lands as the rows' lanes left it, not as the native
+    /// restorer alone staged it. Without a Bazel side the staged text is
+    /// the restore, at its place under the root.
+    #[test]
+    fn a_restore_lands_a_native_file_as_the_bazel_side_left_it() {
+        let staged = |text: &str| Some(text.as_bytes().to_vec());
+        let mut outcome = RestoreOutcome::default();
+        let native = Some("upstream\n".to_string());
+        outcome.staged_text.insert(LOCK.to_string(), native);
+        outcome.staged_text.insert("package.json".to_string(), None);
+        let alone = changes_of(&outcome, "svc/");
+        let expected: Changes = [
+            ("svc/package.json".to_string(), None),
+            (format!("svc/{LOCK}"), staged("upstream\n")),
+        ]
+        .into();
+        assert_eq!(alone, expected);
+        // An undo that is planned and changes nothing is no Bazel side.
+        outcome.bazel = Some(Undo::default());
+        assert_eq!(changes_of(&outcome, "svc/"), expected);
+
+        let mut undo = Undo::default();
+        let both = staged("upstream\nand the lane's own line\n");
+        undo.changes.insert(format!("svc/{LOCK}"), both.clone());
+        undo.changes.insert(INDEX_PATH.to_string(), None);
+        undo.changes.insert("svc/package.json".to_string(), None);
+        outcome.bazel = Some(undo);
+        let whole = changes_of(&outcome, "svc/");
+        assert_eq!(whole.get(&format!("svc/{LOCK}")), Some(&both));
+        assert_eq!(whole.get(INDEX_PATH), Some(&None));
+        assert_eq!(whole.get("svc/package.json"), Some(&None));
+        assert_eq!(whole.len(), 3);
+    }
+
+    /// A native file the Bazel root cannot name is in no change set of
+    /// the Bazel side. Its entry stays, spelled as the restore named it,
+    /// and the commit anchored at the root refuses that spelling whatever
+    /// the run captured: nothing of the restore is written without it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_restore_with_a_file_the_root_cannot_name_is_refused_whole() {
+        let mut spellings = vec!["../../.npmrc", "/abs/ws/.npmrc"];
+        if cfg!(windows) {
+            spellings.push("C:\\ws\\.npmrc");
+        }
+        for outside in spellings {
+            let tmp = tempfile::tempdir().expect("a temporary directory");
+            let root = std::fs::canonicalize(tmp.path()).expect("its real path");
+            let lock = root.join("svc").join(LOCK);
+            std::fs::create_dir_all(root.join("svc")).expect("mkdir");
+            std::fs::write(&lock, b"patched\n").expect("write");
+
+            let mut outcome = RestoreOutcome::default();
+            let upstream = Some("upstream\n".to_string());
+            outcome.staged_text.insert(LOCK.to_string(), upstream);
+            outcome.staged_text.insert(outside.to_string(), None);
+            outcome.outside_bazel_root.push(outside.to_string());
+            let mut undo = Undo::default();
+            let at_root = format!("svc/{LOCK}");
+            let restored = Some(b"upstream\n".to_vec());
+            undo.changes.insert(at_root.clone(), restored);
+            outcome.bazel = Some(undo);
+
+            let changes = changes_of(&outcome, "svc/");
+            assert_eq!(changes.len(), 2, "{outside}: {changes:?}");
+            // Captured or not: every path of the set is listed.
+            let touched: Vec<String> = changes.keys().cloned().collect();
+            let read = |rel: &str| (rel == at_root).then(|| b"patched\n".to_vec());
+            let staged = anchored(&changes, read);
+            let staged = Staged {
+                root: &root,
+                touched: &touched,
+                changes: &staged,
+            };
+            let landed = land(staged, async { Ok::<(), String>(()) }).await;
+            let Err(Unlanded::Root { why, pending }) = landed else {
+                panic!("{outside}: the commit at the root refuses");
+            };
+            assert!(!pending && why.contains(".npmrc"), "{outside}: {why}");
+            let held = std::fs::read(&lock).expect("read");
+            assert_eq!(held, b"patched\n", "{outside}");
+        }
     }
 }
