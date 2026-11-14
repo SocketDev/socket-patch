@@ -143,10 +143,15 @@ impl Workspace {
         std::fs::write(path, bytes).unwrap();
     }
 
+    /// The directory of the copy.
+    fn copy_dir(&self) -> PathBuf {
+        let levels = COPY.split('/');
+        levels.fold(self.root.clone(), |dir, level| dir.join(level))
+    }
+
     /// The copy's file `name`.
     fn copied(&self, name: &str) -> PathBuf {
-        let levels = COPY.split('/').chain([name]);
-        levels.fold(self.root.clone(), |dir, level| dir.join(level))
+        self.copy_dir().join(name)
     }
 
     fn run(&self, args: &[&str], more: &[(&str, &str)]) -> (i32, String, String) {
@@ -164,6 +169,24 @@ impl Workspace {
         let (code, stdout, stderr) = self.run(&args, &[]);
         assert!(!stdout.is_empty(), "no envelope (exit {code}):\n{stderr}");
         (code, parse_json_envelope(&stdout))
+    }
+
+    /// [`Workspace::apply`], wet, with a module cache that holds nothing:
+    /// the upstream module is not installed, so `apply` can only reuse the
+    /// copy that is there.
+    fn apply_without_upstream(&self) -> (i32, Value) {
+        let empty = self.cache.with_file_name("empty-modcache");
+        std::fs::create_dir_all(&empty).unwrap();
+        let args = ["apply", "--offline", "--json", "--ecosystems", "golang"];
+        let (code, stdout, stderr) = self.run(&args, &[("GOMODCACHE", empty.to_str().unwrap())]);
+        assert!(!stdout.is_empty(), "no envelope (exit {code}):\n{stderr}");
+        (code, parse_json_envelope(&stdout))
+    }
+
+    /// A set-aside original of the copy's `a.go`, as an interrupted run
+    /// names one.
+    fn leftover(&self) -> PathBuf {
+        self.copied(&format!(".socket-orig-a.go-{UUID}"))
     }
 
     /// Whether an enabled lane serves the workspace's Go hub in agent
@@ -198,6 +221,19 @@ fn leftovers(tree: &Snapshot) -> Vec<&String> {
     tree.keys().filter(left).collect()
 }
 
+/// The details of the run-level entries of `code` in the envelope. A run
+/// with nothing to say has no `warnings` member at all.
+fn warnings_of(envelope: &Value, code: Code) -> Vec<&str> {
+    let entries = envelope["warnings"].as_array();
+    let entries = entries.map(Vec::as_slice).unwrap_or_default();
+    let of_code = entries
+        .iter()
+        .filter(|entry| entry["code"] == code.as_str());
+    of_code
+        .map(|entry| entry["detail"].as_str().expect("a detail"))
+        .collect()
+}
+
 /// The failed event of a refused Go write: the agent Go code as its
 /// `errorCode`, and a sentence that leads with the code and ends with
 /// "nothing was written". Returns its `details`.
@@ -230,6 +266,16 @@ fn a_go_deps_hub_refuses_the_write_with_its_code_token_and_lift() {
         let lift = json!({ "kind": "enable_lane", "lane": "A-GO1" });
         assert_eq!(details["lift"], lift, "{envelope:#}");
         assert_eq!(events(&envelope).len(), 1, "{envelope:#}");
+        // The refusal is the package's event. The advisory says that the
+        // installed copy is patched all the same and the exit code
+        // unchanged, which is false of a package nothing was written for:
+        // it does not name this one. What the run says about the
+        // workspace is said all the same.
+        let advised = warnings_of(&envelope, Code::AgentNotConsumed);
+        let names = |detail: &&str| detail.contains(PURL);
+        assert!(!advised.iter().any(names), "{envelope:#}");
+        let detected = warnings_of(&envelope, Code::WorkspaceDetected);
+        assert_eq!(detected.len(), 1, "{envelope:#}");
         assert_same_tree(&before, &snapshot(&ws.root));
     }
     // A person reads the code and the remedy on stderr, also when silent.
@@ -461,4 +507,147 @@ fn a_bazel_root_above_the_repository_refuses_until_it_can_be_read() {
     assert_eq!(code, 0, "{envelope:#}");
     ws.assert_patched();
     assert!(!ws.root.join(".bazelignore").exists());
+}
+
+/// A `WORKSPACE` file left beside a `MODULE.bazel` that builds no Go is
+/// one Bazel 8 does not evaluate and Bazel 9 cannot. Its `go_repository`
+/// builds nothing, so the patch is applied as it is without the file:
+/// the same exit code and the same tree, and no agent Go refusal.
+#[test]
+fn a_dead_workspace_file_changes_nothing_for_a_module_file_with_no_go() {
+    for bazel in ["8.4.2", "9.3.2"] {
+        let fixture = Some((GO_REPOSITORY, bazel));
+        let (dead, clean) = (Workspace::new(fixture), Workspace::new(fixture));
+        dead.put("MODULE.bazel", NO_HUB);
+        clean.put("MODULE.bazel", NO_HUB);
+        std::fs::remove_file(clean.root.join("WORKSPACE")).unwrap();
+        for dry_run in [true, false] {
+            let (dead_code, dead_run) = dead.apply(dry_run);
+            let (clean_code, clean_run) = clean.apply(dry_run);
+            let said = format!("Bazel {bazel}\n{dead_run:#}\n{clean_run:#}");
+            assert_eq!((dead_code, clean_code), (0, 0), "{said}");
+            assert_eq!(
+                event_for(&dead_run, PURL)["action"],
+                event_for(&clean_run, PURL)["action"],
+                "{said}"
+            );
+            assert_eq!(dead_run["summary"], clean_run["summary"], "{said}");
+            let unsupported = Code::AgentGoUnsupported.as_str();
+            assert!(!dead_run.to_string().contains(unsupported), "{said}");
+            // Bazel builds the module from no lock here, so nothing says
+            // that its build does not get the patch.
+            assert!(
+                warnings_of(&dead_run, Code::AgentNotConsumed).is_empty(),
+                "{said}"
+            );
+        }
+        dead.assert_patched();
+        clean.assert_patched();
+        let mut with_the_file = snapshot(&dead.root);
+        assert!(with_the_file.remove("WORKSPACE").is_some());
+        assert_same_tree(&snapshot(&clean.root), &with_the_file);
+    }
+}
+
+/// A copy that is already there under a Bazel root above the repository
+/// is not refused (design 3, HZ-04; 11.3, O15). Its rebuild leaves
+/// `go.mod` as it is, so the workspace nobody can read is handed nothing
+/// it does not have already: the copy is patched again and the run says
+/// that the tree needs a line it cannot write. A copy that is not there
+/// is a new tree, and creating one stays refused.
+#[test]
+fn a_stale_copy_under_a_bazel_root_above_the_repository_is_rebuilt() {
+    let ws = Workspace::new(None);
+    std::fs::remove_file(ws.root.join("MODULE.bazel")).unwrap();
+    let (code, envelope) = ws.apply(false);
+    assert_eq!(code, 0, "{envelope:#}");
+    ws.assert_patched();
+
+    // Somebody builds the directory above the repository with Bazel.
+    let above = ws.root.parent().unwrap().to_path_buf();
+    std::fs::write(above.join("WORKSPACE"), "").unwrap();
+    std::fs::write(above.join(".bazelversion"), "7.7.2\n").unwrap();
+    let in_sync = snapshot(&ws.root);
+    let (code, envelope) = ws.apply(false);
+    assert_eq!(code, 0, "{envelope:#}");
+    assert_same_tree(&in_sync, &snapshot(&ws.root));
+
+    // One file of the copy is the upstream one again.
+    std::fs::write(ws.copied("a.go"), FILES[0].1).unwrap();
+    let stale = snapshot(&ws.root);
+    let (code, envelope) = ws.apply(true);
+    assert_eq!(code, 0, "{envelope:#}");
+    assert_ne!(event_for(&envelope, PURL)["action"], "failed");
+    assert_same_tree(&stale, &snapshot(&ws.root));
+    let (code, envelope) = ws.apply(false);
+    assert_eq!(code, 0, "{envelope:#}");
+    assert_eq!(
+        event_for(&envelope, PURL)["action"],
+        "applied",
+        "{envelope:#}"
+    );
+    ws.assert_patched();
+    // `go.mod` and everything else is what it was while in sync.
+    assert_same_tree(&in_sync, &snapshot(&ws.root));
+    let needed = Code::WorkspaceIgnoreLineNeeded;
+    assert!(
+        !warnings_of(&envelope, needed).is_empty(),
+        "the tree is reported: {envelope:#}"
+    );
+
+    // The copy is gone and `go.mod` still points at it: the rebuild would
+    // create a tree under a root whose `.bazelignore` nobody can write.
+    std::fs::remove_dir_all(ws.copy_dir()).unwrap();
+    let gone = snapshot(&ws.root);
+    for dry_run in [true, false] {
+        let (code, envelope) = ws.apply(dry_run);
+        assert_eq!(code, 1, "{envelope:#}");
+        let details = refused(&envelope);
+        assert_eq!(
+            details["token"], "bazel_root_outside_repository",
+            "{envelope:#}"
+        );
+        assert_same_tree(&gone, &snapshot(&ws.root));
+    }
+}
+
+/// Hazard HZ-27 on the runs that rebuild nothing. After a run that was
+/// cut short, the next run finds no upstream module to rebuild from and
+/// fails: the stage and the set-aside originals go all the same. And a
+/// copy that is in sync is swept by the run that leaves it alone,
+/// whichever way `apply` reaches it. No lane is asked in either case.
+#[test]
+fn a_run_that_rebuilds_nothing_leaves_no_stage_or_original_either() {
+    let ws = Workspace::new(None);
+    let args = ["apply", "--offline", "--json", "--ecosystems", "golang"];
+    let crash = [("SOCKET_PATCH_FAILPOINT", "patch_file_committed")];
+    let (code, _, stderr) = ws.run(&args, &crash);
+    assert_eq!(code, 86, "{stderr}");
+    assert!(!leftovers(&snapshot(&ws.root)).is_empty());
+    let (code, envelope) = ws.apply_without_upstream();
+    assert_eq!(code, 1, "{envelope:#}");
+    let event = event_for(&envelope, PURL);
+    assert_eq!(event["action"], "failed", "{envelope:#}");
+    assert_eq!(event["errorCode"], "apply_failed", "{envelope:#}");
+    assert_eq!(leftovers(&snapshot(&ws.root)), Vec::<&String>::new());
+
+    // In sync: the run with the upstream module, then the one without.
+    let (code, envelope) = ws.apply(false);
+    assert_eq!(code, 0, "{envelope:#}");
+    ws.assert_patched();
+    let in_sync = snapshot(&ws.root);
+    for reuse in [false, true] {
+        std::fs::write(ws.leftover(), b"old").unwrap();
+        let (code, envelope) = match reuse {
+            true => ws.apply_without_upstream(),
+            false => ws.apply(false),
+        };
+        assert_eq!(code, 0, "reuse={reuse}: {envelope:#}");
+        assert_ne!(event_for(&envelope, PURL)["action"], "failed");
+        assert!(!ws.leftover().exists(), "reuse={reuse}: left behind");
+    }
+    // The sweep removed the leftover and nothing else. Only the empty
+    // module cache of the second run is new, and it lies beside the
+    // checkout.
+    assert_same_tree(&in_sync, &snapshot(&ws.root));
 }

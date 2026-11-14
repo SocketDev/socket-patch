@@ -13,6 +13,13 @@
 //!   refusal with the agent Go code, the gate's token and what would lift
 //!   it, and nothing is written. The writer asks only when a write is
 //!   due, so a run over redirects that are in sync reads no workspace.
+//!   Two answers are made before the gate is asked, because the gate
+//!   judges a lock rewrite and this write is not one. A root whose Go
+//!   hubs are all declarations Bazel never evaluates builds no Go, and
+//!   the project is written as it is under a root with no Go hub
+//!   ([`builds_no_go`]). And a rebuild that leaves `go.mod` as it is adds
+//!   nothing for a root above the repository to read, so the roots
+//!   inside the repository decide it alone ([`probe_for`]).
 //! - [`keep_hub_records`] is the prune guard of `scan --prune`. A record
 //!   of a package that only a lock Bazel reads resolves is not installed
 //!   anywhere the crawl looks, and the prune would drop it with its blobs.
@@ -28,14 +35,13 @@ use std::path::Path;
 use std::sync::Arc;
 
 use socket_patch_core::bazel::codes::Code;
-use socket_patch_core::bazel::gate::{
-    self, GateCx, PatchRequest, Roots, OWNED_FILE_MODIFIED, TOOL_RUN_DISALLOWED,
-};
-use socket_patch_core::bazel::inventory::{self, Inventory};
-use socket_patch_core::bazel::lanes;
+use socket_patch_core::bazel::gate::{self, GateCx, PatchRequest, Roots, OWNED_FILE_MODIFIED};
+use socket_patch_core::bazel::govern;
+use socket_patch_core::bazel::inventory::{self, may_build, Inventory};
+use socket_patch_core::bazel::lanes::{self, Proofs};
 use socket_patch_core::bazel::model::{
-    ClaimOs, GateOutcome, Governance, LaneTable, Lift, Mode, Probe, Reason, Refusal, Ruleset,
-    RunPolicy, RunRequired,
+    BazelWorkspace, ClaimOs, GateOutcome, Governance, Hub, LaneTable, Lift, Mode, Plan, Probe,
+    Reason, Refusal, RootRef, Ruleset, RunPolicy, RunRequired, LANE_NOT_ENABLED,
 };
 use socket_patch_core::bazel::owned_index::INDEX_PATH;
 use socket_patch_core::crawlers::types::Ecosystem;
@@ -69,6 +75,8 @@ const NAMED: usize = 10;
 #[derive(Clone, Copy)]
 struct Asker {
     lanes: &'static LaneTable,
+    /// What executed cells prove about `lanes`.
+    proofs: &'static Proofs,
     run: RunPolicy,
     allow_patch_conflicts: bool,
 }
@@ -82,10 +90,12 @@ pub struct Gate {
 impl Gate {
     /// The gate of one run, over the lanes this release ships.
     pub fn of(common: &GlobalArgs) -> Arc<dyn AgentGoGate> {
-        Arc::new(Self::over(common, &lanes::PRODUCTION))
+        Arc::new(Self::over(common, &lanes::PRODUCTION, &Proofs::PRODUCTION))
     }
 
-    fn over(common: &GlobalArgs, lanes: &'static LaneTable) -> Self {
+    /// The gate over `lanes` and what executed cells prove about them:
+    /// a test hands in its own table with a claim beside it.
+    fn over(common: &GlobalArgs, lanes: &'static LaneTable, proofs: &'static Proofs) -> Self {
         let run = RunCx {
             dry_run: common.dry_run,
             offline: common.offline,
@@ -93,6 +103,7 @@ impl Gate {
         };
         let asker = Asker {
             lanes,
+            proofs,
             run: run_policy(&run),
             allow_patch_conflicts: common.allow_patch_conflicts,
         };
@@ -133,11 +144,18 @@ fn under_bazel(probe: &Probe) -> bool {
 /// agent mode has one code for the one write the gate can stop. The
 /// sentence first says what the write is to the Bazel build, because the
 /// gate's own words are about a lock and a hub, and the user ran `apply`
-/// on an installed tree.
-fn refuse(refusal: Refusal) -> GoGateAnswer {
+/// on an installed tree. It says what `write` would do to `go.mod`, and
+/// never that a `replace` would be added where the file holds it.
+fn refuse(refusal: Refusal, write: &GoWrite) -> GoGateAnswer {
+    let what = match write.wires {
+        true => "where the patch would add a directory `replace`",
+        false => {
+            "which holds the directory `replace` of the patch, and the patched copy that it \
+             points at would be rebuilt"
+        }
+    };
     let detail = format!(
-        "a Bazel build of this workspace may read `go.mod`, where the patch would add a \
-         directory `replace`: {}",
+        "a Bazel build of this workspace may read `go.mod`, {what}: {}",
         refusal.detail
     );
     GoGateAnswer::Refuse(GoRefusal {
@@ -151,18 +169,74 @@ fn refuse(refusal: Refusal) -> GoGateAnswer {
 }
 
 /// A write that needs a command run after it. An agent run has no way to
-/// carry one yet: the code that names the command to the user, and the
-/// step that would run it, land with the seam that owns tool runs. Until
-/// then the write is refused with the command as its lift, never made
-/// with the command dropped.
-fn needs_run(run: &RunRequired) -> Refusal {
-    let why = format!(
-        "the write needs `{}` to run after it, and an agent run cannot ask for that yet",
-        run.command
+/// carry one yet: the step that settles a plan's follow-up
+/// (`bazel_gate::run::finish`) lands with the seam that owns tool runs.
+/// Until then the write is refused, never made with the command dropped.
+/// What lifts the refusal is a release that carries the lane out, not the
+/// command: it is due after a write that was not made, and a run after it
+/// would be refused again.
+fn needs_run(plan: &Plan, run: &RunRequired) -> Refusal {
+    let detail = format!(
+        "lane {} plans a write that needs `{}` to run after it, and an agent run does not \
+         carry that out yet; nothing was written",
+        plan.lane.0, run.command
     );
-    let command = run.command.clone();
-    let lift = Lift::Run { command };
-    lanes::refuse(Reason::RulesetUnsupported, TOOL_RUN_DISALLOWED, why, lift)
+    let lift = Lift::EnableLane(plan.lane);
+    Refusal::new(Reason::RulesetUnsupported, LANE_NOT_ENABLED, detail, lift)
+}
+
+/// The root probe's answer, as the gate is asked with it about `write`.
+///
+/// A Bazel root that somebody builds above the repository is one nobody
+/// reads: whether it builds the project's Go modules is not known, and a
+/// write that edits `go.mod` is refused under it. A rebuild that leaves
+/// `go.mod` and `go.work` as they are hands that build no input it does
+/// not have already. The copy is there, or the root channel refuses to
+/// create it, and a tree that is already there is reported and not
+/// refused (design 3, HZ-04 and HZ-19; 11.3, O15). So for such a write
+/// the roots inside the repository answer, as they do with nothing above
+/// them. The variant of the probe and that fact of the write decide,
+/// never a token.
+fn probe_for(loaded: &Loaded, write: &GoWrite) -> Probe {
+    let found = loaded.probe();
+    let unread_above = matches!(
+        found,
+        Probe::RootOutsideBoundary {
+            confirmed: true,
+            ..
+        }
+    );
+    if write.wires || !unread_above {
+        return found;
+    }
+    let inside: Vec<RootRef> = loaded.roots().map(|root| root.root().clone()).collect();
+    match inside.as_slice() {
+        [] => Probe::NotBazel,
+        [only] => Probe::Workspace(only.clone()),
+        _ => Probe::Nested(inside),
+    }
+}
+
+/// Whether Bazel builds no Go module of the project under the root `ws`:
+/// no declaration names its `go.mod`, or the ones that do are inactive
+/// and no Go hub of the root is one Bazel may build from
+/// (`inventory::may_build`, the rule the advisory, the inventory and the
+/// attestation go by). Such a hub is dead under every dependency system
+/// the workspace may run, a `WORKSPACE` file left beside a `MODULE.bazel`,
+/// or shadowed, and a `replace` in `go.mod` is no input of that build.
+///
+/// `Governance::Inactive` names the first candidate alone, so every Go
+/// hub of the root is asked: a dead `go_repository` listed before a
+/// `go_deps` nobody imports must not hide a hub that may build. A hub
+/// that is not imported, a dev dependency that may be dropped and a hub
+/// of another module may build, and stay refused.
+fn builds_no_go(governed: &Governance, ws: &BazelWorkspace) -> bool {
+    let golang = |hub: &&Hub| hub.ecosystem == Ecosystem::Golang;
+    match governed {
+        Governance::NotGoverned => true,
+        Governance::Inactive(..) => !ws.hubs.iter().filter(golang).any(may_build),
+        _ => false,
+    }
 }
 
 /// What the gate says about one agent Go write, for the project `loaded`
@@ -174,20 +248,28 @@ fn needs_run(run: &RunRequired) -> Refusal {
 /// decides alone: a project Bazel does not build Go for is written as it
 /// is without a workspace, and every other answer refuses.
 fn verdict(loaded: &Loaded, asker: &Asker, write: &GoWrite) -> GoGateAnswer {
-    let ungoverned = || loaded.governance(Ecosystem::Golang) == Governance::NotGoverned;
+    let probe = probe_for(loaded, write);
+    let governed = govern::governance_over(&probe, loaded.models(), Ecosystem::Golang);
     let nearest = loaded.roots().next();
     let read = nearest.and_then(|root| Some((root, root.model().ok()?)));
     let Some((root, ws)) = read else {
         // No root inside the repository, or one that could not be read.
-        return match loaded.governance(Ecosystem::Golang) {
-            Governance::NotGoverned => GoGateAnswer::Write(Vec::new()),
-            Governance::Undetermined(gaps) => refuse(gate::undetermined(&gaps)),
-            _ => refuse(gate::undetermined(&[])),
+        return match governed {
+            Governance::NotGoverned => GoGateAnswer::Write,
+            Governance::Undetermined(gaps) => refuse(gate::undetermined(&gaps), write),
+            _ => refuse(gate::undetermined(&[]), write),
         };
     };
+    // Before the gate, whose first obligations are about a lock rewrite:
+    // it refuses a dead hub in every mode, and on Bazel 9 the workspace
+    // that still holds a `WORKSPACE` hub. Before the index too, which
+    // says nothing about Go here and is the root channel's to refuse a
+    // line over.
+    if builds_no_go(&governed, ws) {
+        return GoGateAnswer::Write;
+    }
     let index = match root.index() {
         IndexState::Ours(index) => index,
-        IndexState::Faulty(_) if ungoverned() => return GoGateAnswer::Write(Vec::new()),
         // No lane writes beside an index that cannot be relied on.
         IndexState::Faulty(fault) => {
             let lift = Lift::UserEdit {
@@ -196,10 +278,9 @@ fn verdict(loaded: &Loaded, asker: &Asker, write: &GoWrite) -> GoGateAnswer {
             };
             let why = format!("the owned index cannot be relied on ({fault})");
             let reason = Reason::OwnedFileModified;
-            return refuse(lanes::refuse(reason, OWNED_FILE_MODIFIED, why, lift));
+            return refuse(lanes::refuse(reason, OWNED_FILE_MODIFIED, why, lift), write);
         }
     };
-    let probe = loaded.probe();
     let request = PatchRequest {
         ecosystem: Ecosystem::Golang,
         name: &write.module,
@@ -215,20 +296,26 @@ fn verdict(loaded: &Loaded, asker: &Asker, write: &GoWrite) -> GoGateAnswer {
         run: asker.run,
         host: HOST,
         allow_patch_conflicts: asker.allow_patch_conflicts,
+        proofs: asker.proofs,
         ..GateCx::new(Mode::Agent, ws, root.files(), index)
     };
-    answer(gate::gate(&cx, asker.lanes, &request))
+    answer(gate::gate(&cx, asker.lanes, &request), write)
 }
 
-/// The writer's answer for what the gate decided. The Go writer carries a
-/// plan out itself (the copy, the `replace`, the line through the root
-/// channel), so of a plan only what it says to the user rides along.
-fn answer(outcome: GateOutcome) -> GoGateAnswer {
+/// The writer's answer for what the gate decided about `write`. The Go
+/// writer carries a plan out itself (the copy, the `replace`, the line
+/// through the root channel), so of a plan two things ride along: what
+/// it says to the user, and its lane, which is handed on and not read
+/// here. The writer is the executor of one lane and writes for no other.
+fn answer(outcome: GateOutcome, write: &GoWrite) -> GoGateAnswer {
     match outcome {
-        GateOutcome::NotBazel => GoGateAnswer::Write(Vec::new()),
-        GateOutcome::Proceed(plan) => GoGateAnswer::Write(plan.advisories),
-        GateOutcome::ProceedAfter(_, run) => refuse(needs_run(&run)),
-        GateOutcome::Refuse(refusal) => refuse(refusal),
+        GateOutcome::NotBazel => GoGateAnswer::Write,
+        GateOutcome::Proceed(plan) => GoGateAnswer::Planned {
+            lane: plan.lane,
+            notes: plan.advisories,
+        },
+        GateOutcome::ProceedAfter(plan, run) => refuse(needs_run(&plan, &run), write),
+        GateOutcome::Refuse(refusal) => refuse(refusal, write),
     }
 }
 
@@ -375,7 +462,7 @@ mod tests {
 
     use socket_patch_core::bazel::model::{
         Advisory, Anchor, AttestBasis, CellClaim, ClaimSystem, HubId, LaneCx, LaneId, LaneOps,
-        LaneSpec, Plan, WriteClass,
+        LaneSpec, WriteClass,
     };
 
     use super::*;
@@ -427,7 +514,21 @@ mod tests {
             std::fs::write(path, text).expect("write");
         }
 
+        /// The answer for a first write of the patch at `rel`, which adds
+        /// the `replace`, over `lanes` with nothing proven about them.
         fn asked(&self, rel: &str, lanes: &'static LaneTable) -> GoGateAnswer {
+            self.ask(rel, (lanes, &Proofs::PRODUCTION), true)
+        }
+
+        /// The answer for a write at `rel` that edits `go.mod` (`wires`)
+        /// or rebuilds the copy alone, over a lane table and what is
+        /// proven about it.
+        fn ask(
+            &self,
+            rel: &str,
+            (lanes, proofs): (&'static LaneTable, &'static Proofs),
+            wires: bool,
+        ) -> GoGateAnswer {
             let common = GlobalArgs {
                 cwd: self.at(rel),
                 ..GlobalArgs::default()
@@ -437,8 +538,9 @@ mod tests {
                 module: MODULE.to_string(),
                 version: "v1.0.0".to_string(),
                 uuid: UUID.to_string(),
+                wires,
             };
-            Gate::over(&common, lanes).ask(&write)
+            Gate::over(&common, lanes, proofs).ask(&write)
         }
 
         fn kept(&self, purls: &[&str]) -> Kept {
@@ -455,7 +557,19 @@ mod tests {
     fn refusal(answer: GoGateAnswer) -> GoRefusal {
         match answer {
             GoGateAnswer::Refuse(refusal) => refusal,
-            GoGateAnswer::Write(notes) => panic!("the gate let the write through: {notes:?}"),
+            through => panic!("the gate let the write through: {through:?}"),
+        }
+    }
+
+    /// A first write of the patch: the one the sentence of a refusal is
+    /// about where a test asks [`answer`] alone.
+    fn first_write() -> GoWrite {
+        GoWrite {
+            project_root: PathBuf::new(),
+            module: MODULE.to_string(),
+            version: "v1.0.0".to_string(),
+            uuid: UUID.to_string(),
+            wires: true,
         }
     }
 
@@ -494,6 +608,17 @@ mod tests {
         ..LaneOps::disabled(&[TOY])
     };
     const TOY_TABLE: LaneTable = LaneTable(&[(Ruleset::Gazelle, &ADMITS)]);
+    /// An agent lane wires a path, so the gate asks for a cell of it on
+    /// the host. The toy lane claims every system the suites run on.
+    const TOY_PROOFS: Proofs = Proofs {
+        os: &[
+            (TOY.id, ClaimOs::Linux),
+            (TOY.id, ClaimOs::Macos),
+            (TOY.id, ClaimOs::Windows),
+        ],
+        ..Proofs::PRODUCTION
+    };
+    const PROVEN: (&LaneTable, &Proofs) = (&TOY_TABLE, &TOY_PROOFS);
 
     /// Whether `lanes` serves the Go hub of the root at the top of `repo`
     /// in agent mode: what every expectation below is computed from.
@@ -512,7 +637,7 @@ mod tests {
     #[test]
     fn a_project_bazel_builds_no_go_for_is_written_as_without_a_workspace() {
         let common = GlobalArgs::default();
-        let gate = Gate::over(&common, &lanes::PRODUCTION);
+        let gate = Gate::over(&common, &lanes::PRODUCTION, &Proofs::PRODUCTION);
         // No workspace file at all: one probe, and nothing to ask.
         let plain = Repo::new(&[("go.mod", GO_MOD)]);
         assert!(!gate.bazel(&plain.top));
@@ -522,17 +647,60 @@ mod tests {
             ("go.mod", GO_MOD),
         ]);
         assert!(gate.bazel(&js.top));
-        assert_eq!(
-            js.asked("", &lanes::PRODUCTION),
-            GoGateAnswer::Write(Vec::new())
-        );
+        assert_eq!(js.asked("", &lanes::PRODUCTION), GoGateAnswer::Write);
         // An index that is not socket-patch's is the root channel's to
         // refuse a line over; it says nothing about Go.
         js.put(INDEX_PATH, "{}");
-        assert_eq!(
-            js.asked("", &lanes::PRODUCTION),
-            GoGateAnswer::Write(Vec::new())
-        );
+        assert_eq!(js.asked("", &lanes::PRODUCTION), GoGateAnswer::Write);
+    }
+
+    /// A `WORKSPACE` file left beside a `MODULE.bazel` that builds no Go
+    /// is one Bazel 8 does not evaluate and Bazel 9 cannot: its
+    /// `go_repository` builds nothing, and the project is written as it
+    /// is without that file, whatever the lane table and beside an index
+    /// that is not socket-patch's. A hub Bazel may still build from keeps
+    /// the write refused, also when the dead one is listed first.
+    #[test]
+    fn a_hub_bazel_never_evaluates_is_written_as_a_workspace_with_no_go() {
+        let no_go = "module(name = \"ws\")\n";
+        for bazel in ["8.4.2\n", "9.3.2\n"] {
+            let files = [
+                ("WORKSPACE", GO_REPOSITORY),
+                ("MODULE.bazel", no_go),
+                ("go.mod", GO_MOD),
+                (".bazelversion", bazel),
+            ];
+            let repo = Repo::new(&files);
+            let loaded = Loader::new(RunCx::default()).load(&repo.top);
+            let governed = loaded.governance(Ecosystem::Golang);
+            assert!(
+                matches!(governed, Governance::Inactive(..)),
+                "{bazel}: {governed:?}"
+            );
+            for table in [&lanes::PRODUCTION, &TOY_TABLE] {
+                assert_eq!(repo.asked("", table), GoGateAnswer::Write, "{bazel}");
+            }
+            repo.put(INDEX_PATH, "{}");
+            assert_eq!(
+                repo.asked("", &lanes::PRODUCTION),
+                GoGateAnswer::Write,
+                "{bazel}"
+            );
+
+            // The same dead file beside a `go_deps` that no `use_repo`
+            // imports: Bazel may build from a spoke of that one.
+            let unimported = GO_DEPS.replace("use_repo(go_deps, \"com_example_upstream\")\n", "");
+            assert_ne!(unimported, GO_DEPS);
+            let files = [
+                ("WORKSPACE", GO_REPOSITORY),
+                ("MODULE.bazel", unimported.as_str()),
+                ("go.mod", GO_MOD),
+                (".bazelversion", bazel),
+            ];
+            let repo = Repo::new(&files);
+            let refused = refusal(repo.asked("", &lanes::PRODUCTION));
+            assert_eq!(refused.refused.code, Code::AgentGoUnsupported, "{bazel}");
+        }
     }
 
     #[test]
@@ -547,10 +715,7 @@ mod tests {
         assert!(!admitted(&repo, &lanes::PRODUCTION));
         let refused = refusal(repo.asked("", &lanes::PRODUCTION));
         assert_eq!(refused.refused.code, Code::AgentGoUnsupported);
-        assert_eq!(
-            refused.refused.token,
-            Some(socket_patch_core::bazel::model::LANE_NOT_ENABLED)
-        );
+        assert_eq!(refused.refused.token, Some(LANE_NOT_ENABLED));
         let lift = Some(Lift::EnableLane(LaneId("A-GO1")));
         assert_eq!(refused.refused.lift, lift);
         assert!(
@@ -560,24 +725,33 @@ mod tests {
 
         // A lane that serves the cell is asked, and its plan is held to
         // every obligation: the last one a path-shaped lane meets is the
-        // host's operating system, which no lane of a test can claim in
-        // this release, so the write is still refused, under that token
-        // and with the lane to enable.
+        // host's operating system. With no cell of the lane run on it the
+        // write is still refused, under that token and with the lane to
+        // enable.
         assert!(admitted(&repo, &TOY_TABLE));
         let asked = refusal(repo.asked("", &TOY_TABLE));
         assert_eq!(asked.refused.token, Some(gate::PLATFORM_UNVERIFIED));
         assert_eq!(asked.refused.lift, Some(Lift::EnableLane(TOY.id)));
 
+        // With the claim beside the table the plan leaves the gate, and
+        // the writer is handed its lane and what it says to the user.
+        let GoGateAnswer::Planned { lane, notes } = repo.ask("", PROVEN, true) else {
+            panic!("a lane that serves the cell on this host admits the write");
+        };
+        assert_eq!(lane, TOY.id);
+        let codes: Vec<Code> = notes.iter().map(|note| note.code).collect();
+        assert_eq!(codes, [Code::WorkspaceOutOfScope]);
+
         // Beside an index that cannot be relied on no lane is asked.
         repo.put(INDEX_PATH, "{}");
-        let modified = refusal(repo.asked("", &TOY_TABLE));
+        let modified = refusal(repo.ask("", PROVEN, true));
         assert_eq!(modified.refused.token, Some(OWNED_FILE_MODIFIED));
         assert!(modified.detail.contains(INDEX_PATH), "{modified:?}");
     }
 
     /// What the writer is told for each outcome of the gate.
     #[test]
-    fn a_plan_lets_the_write_through_and_a_run_it_cannot_carry_refuses() {
+    fn a_plan_hands_its_lane_on_and_a_run_it_cannot_carry_refuses() {
         use socket_patch_core::bazel::model::{Actor, Interim, RunKind};
         let request = PatchRequest {
             ecosystem: Ecosystem::Golang,
@@ -586,18 +760,20 @@ mod tests {
             uuid: UUID,
             project_rel: "",
         };
-        assert_eq!(
-            answer(GateOutcome::NotBazel),
-            GoGateAnswer::Write(Vec::new())
-        );
-        // What the plan says to the user rides along.
-        let GoGateAnswer::Write(notes) = answer(admit_outcome(&request)) else {
+        let write = first_write();
+        assert_eq!(answer(GateOutcome::NotBazel, &write), GoGateAnswer::Write);
+        // The plan's lane and what it says to the user ride along.
+        let planned = answer(GateOutcome::Proceed(plan(&request)), &write);
+        let GoGateAnswer::Planned { lane, notes } = planned else {
             panic!("a plan lets the write through");
         };
+        assert_eq!(lane, TOY.id);
         assert_eq!(notes.len(), 1);
         assert_eq!(notes[0].code, Code::WorkspaceOutOfScope);
         // A write that needs a command afterwards is not made with the
-        // command dropped.
+        // command dropped. The sentence names the command; what lifts the
+        // refusal is the lane, never a command that is due after a write
+        // nobody made.
         let command = "bazel mod deps --lockfile_mode=update".to_string();
         let run = RunRequired {
             kind: RunKind::Lockfile,
@@ -610,15 +786,33 @@ mod tests {
             platforms: Vec::new(),
             gates_vex: false,
         };
-        let after = refusal(answer(GateOutcome::ProceedAfter(plan(&request), run)));
+        let outcome = GateOutcome::ProceedAfter(plan(&request), run);
+        let after = refusal(answer(outcome, &write));
         assert_eq!(after.refused.code, Code::AgentGoUnsupported);
-        assert_eq!(after.refused.token, Some(TOOL_RUN_DISALLOWED));
-        assert_eq!(after.refused.lift, Some(Lift::Run { command }));
+        assert_eq!(after.refused.token, Some(LANE_NOT_ENABLED));
+        assert_eq!(after.refused.lift, Some(Lift::EnableLane(TOY.id)));
+        assert!(after.detail.contains(&command), "{after:?}");
         assert!(after.detail.ends_with("nothing was written"), "{after:?}");
     }
 
-    fn admit_outcome(request: &PatchRequest<'_>) -> GateOutcome {
-        GateOutcome::Proceed(plan(request))
+    /// The sentence of a refusal says what the write would do to
+    /// `go.mod`: add the `replace`, or leave the one it holds.
+    #[test]
+    fn a_refusal_never_says_a_replace_is_added_where_it_is_in_place() {
+        let files = [
+            ("MODULE.bazel", GO_DEPS),
+            ("go.mod", GO_MOD),
+            (".bazelversion", "9.3.2\n"),
+        ];
+        let repo = Repo::new(&files);
+        let table = (&lanes::PRODUCTION, &Proofs::PRODUCTION);
+        let adds = refusal(repo.ask("", table, true));
+        assert!(adds.detail.contains("would add a directory `replace`"));
+        let rebuilds = refusal(repo.ask("", table, false));
+        assert!(!rebuilds.detail.contains("would add"), "{rebuilds:?}");
+        assert!(rebuilds.detail.contains("would be rebuilt"), "{rebuilds:?}");
+        // Under a hub inside the repository both are refused alike.
+        assert_eq!(adds.refused, rebuilds.refused);
     }
 
     #[test]
@@ -639,13 +833,20 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_workspace_nobody_can_read_refuses_and_is_never_ungoverned() {
-        // A root above the repository that somebody builds at.
+    /// A checkout `nested` below a directory that somebody builds with
+    /// Bazel and that is in no checkout itself.
+    fn below_a_built_root() -> Repo {
         let outer = Repo::new(&[("WORKSPACE", ""), (".bazelversion", "7.7.2\n")]);
         outer.put("nested/.git/HEAD", "ref: refs/heads/main\n");
         outer.put("nested/go.mod", GO_MOD);
         std::fs::remove_dir_all(outer.at(".git")).expect("the outer checkout is none");
+        outer
+    }
+
+    #[test]
+    fn a_workspace_nobody_can_read_refuses_and_is_never_ungoverned() {
+        // A root above the repository that somebody builds at.
+        let outer = below_a_built_root();
         let above = refusal(outer.asked("nested", &TOY_TABLE));
         assert_eq!(above.refused.code, Code::AgentGoUnsupported);
         assert_eq!(
@@ -653,12 +854,50 @@ mod tests {
             Some(socket_patch_core::utils::bazel_root_writes::BAZEL_ROOT_OUTSIDE_REPOSITORY)
         );
         assert_eq!(above.refused.lift, Some(Lift::Owner("O15")));
-        let gate = Gate::over(&GlobalArgs::default(), &lanes::PRODUCTION);
+        let production = (&lanes::PRODUCTION, &Proofs::PRODUCTION);
+        let gate = Gate::over(&GlobalArgs::default(), production.0, production.1);
         assert!(gate.bazel(&outer.at("nested")));
         // A stray workspace file up there governs nothing.
         std::fs::remove_file(outer.at(".bazelversion")).expect("remove");
-        let gate = Gate::over(&GlobalArgs::default(), &lanes::PRODUCTION);
+        let gate = Gate::over(&GlobalArgs::default(), production.0, production.1);
         assert!(!gate.bazel(&outer.at("nested")));
+    }
+
+    /// A rebuild that leaves `go.mod` as it is hands a root above the
+    /// repository nothing to read that it does not have (design 3,
+    /// HZ-04; 11.3, O15: a tree that is already there is not refused).
+    /// The roots inside the repository answer for it alone, as they do
+    /// with nothing above them; a write that edits `go.mod` stays refused
+    /// whatever they say.
+    #[test]
+    fn a_rebuild_that_leaves_go_mod_alone_is_decided_inside_the_repository() {
+        let production = (&lanes::PRODUCTION, &Proofs::PRODUCTION);
+        let edit_refused = |outer: &Repo, table| {
+            let edits = refusal(outer.ask("nested", table, true));
+            assert_eq!(edits.refused.lift, Some(Lift::Owner("O15")));
+        };
+        // No root inside.
+        let outer = below_a_built_root();
+        assert_eq!(outer.ask("nested", production, false), GoGateAnswer::Write);
+        edit_refused(&outer, production);
+        // A root inside that builds no Go.
+        outer.put("nested/MODULE.bazel", "module(name = \"ws\")\n");
+        assert_eq!(outer.ask("nested", production, false), GoGateAnswer::Write);
+        edit_refused(&outer, production);
+        // A hub inside that builds the module: refused, unless a lane
+        // admits the write.
+        let outer = below_a_built_root();
+        outer.put("nested/MODULE.bazel", GO_DEPS);
+        outer.put("nested/.bazelversion", "9.3.2\n");
+        let inside = refusal(outer.ask("nested", production, false));
+        assert_eq!(inside.refused.token, Some(LANE_NOT_ENABLED));
+        assert_eq!(inside.refused.lift, Some(Lift::EnableLane(LaneId("A-GO1"))));
+        let planned = outer.ask("nested", PROVEN, false);
+        assert!(
+            matches!(planned, GoGateAnswer::Planned { lane, .. } if lane == TOY.id),
+            "{planned:?}"
+        );
+        edit_refused(&outer, PROVEN);
     }
 
     /// Nested roots each build the project, and they are not one build:

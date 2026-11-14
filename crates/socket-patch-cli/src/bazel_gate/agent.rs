@@ -992,8 +992,16 @@ fn take_held(common: &GlobalArgs) -> Vec<(String, String)> {
 }
 
 /// [`report`] and [`held_advisory`] over `loader` and `lanes`, without
-/// the run state.
-fn build(loader: &Loader, lanes: &LaneTable, project: &Path, ask: Ask<'_>, did: Did) -> Report {
+/// the run state. `refused` are the packages whose write the asking
+/// command refused under a code of its own.
+fn build(
+    loader: &Loader,
+    lanes: &LaneTable,
+    project: &Path,
+    ask: Ask<'_>,
+    did: Did,
+    refused: &[String],
+) -> Report {
     let mut report = Report::default();
     if ask.records.is_empty() && ask.jars.is_empty() {
         // Nothing to ask about: the probe alone, which reads no file. It
@@ -1004,7 +1012,17 @@ fn build(loader: &Loader, lanes: &LaneTable, project: &Path, ask: Ask<'_>, did: 
         (report.patches, report.sidecars) = judge(&loaded, lanes, ask);
     }
     report.warnings = loader.take_warnings();
-    let open = not_consumed(&report.patches);
+    // The advisory speaks of installed copies and of an exit code it
+    // leaves alone. The event of a refused package says that nothing was
+    // written for it, and that refusal fails the run: the advisory does
+    // not name the package beside it. Its verdict stays for its event,
+    // and so does what the run says about the workspace.
+    let refused = |patch: &&Patch| {
+        let same = |purl: &String| *purl == patch.purl || PurlKey::same(purl, &patch.purl);
+        refused.iter().any(same)
+    };
+    let mut open = not_consumed(&report.patches);
+    open.retain(|patch| !refused(patch));
     report.warnings.extend(advisory(&open, did));
     report
 }
@@ -1015,7 +1033,10 @@ fn build(loader: &Loader, lanes: &LaneTable, project: &Path, ask: Ask<'_>, did: 
 /// command owns: the caller leaves out the ones `vendor` owns (what the
 /// build makes of a vendored package is the vendored seam's to say), and
 /// the ones outside `--ecosystems` are left out here. An apply also
-/// speaks for what the scan that runs it holds ([`hold`]).
+/// speaks for what the scan that runs it holds ([`hold`]). A package
+/// whose write the apply refused under a code of its own (a Go patch
+/// under a gazelle hub) is left out of the advisory: its event says that
+/// nothing was written.
 ///
 /// A run on the global installs patches another tree and asks nothing.
 /// Under no Bazel root this is one stat-only probe, and the report is
@@ -1029,6 +1050,13 @@ pub async fn report(
         return Report::default();
     }
     let mut records = records;
+    let refused: Vec<String> = match command {
+        Command::Apply { results } => {
+            let refused = results.iter().filter(|result| result.refusal.is_some());
+            refused.map(|result| result.package_key.clone()).collect()
+        }
+        Command::Check { .. } => Vec::new(),
+    };
     let (wide, did, in_tree, jars) = match command {
         Command::Apply { results } => {
             let known = |held: &(String, String)| records.contains(held);
@@ -1065,7 +1093,7 @@ pub async fn report(
             wide,
             jars: &jars,
         };
-        build(&loader, lanes, &project, ask, did)
+        build(&loader, lanes, &project, ask, did, &refused)
     });
     // The advisory is advice: a panic in it must not fail a command that
     // has already patched.
@@ -1108,7 +1136,7 @@ pub async fn held_advisory(common: &GlobalArgs) -> Vec<(String, String)> {
             jars: &[],
         };
         let lanes = &lanes::PRODUCTION;
-        build(&loader, lanes, &project, ask, Did::Nothing).warnings
+        build(&loader, lanes, &project, ask, Did::Nothing, &[]).warnings
     });
     let said = task.await.unwrap_or_default();
     said.into_iter().map(entry).collect()
@@ -1342,7 +1370,7 @@ mod tests {
             jars: &[],
         };
         let did = if wide { Did::Checked } else { Did::Patched };
-        build(loader, lanes, project, ask, did)
+        build(loader, lanes, project, ask, did, &[])
     }
 
     /// `(purl, governed, state)` of each patch.
@@ -1547,6 +1575,48 @@ mod tests {
         }
     }
 
+    /// A package whose write the run refused is told so by its own
+    /// event, and that refusal fails the run. The advisory, which speaks
+    /// of installed copies and of an exit code it leaves alone, does not
+    /// name it. Its verdict stays for the event, the other packages stay
+    /// in the advisory, and what the run says about the workspace is said
+    /// all the same.
+    #[test]
+    fn a_refused_package_is_left_out_of_the_advisory_and_nothing_else_is() {
+        let files = [GO, GO_MOD, ("go.sum", ""), BAZEL_9];
+        let repo = Repo::new(&files);
+        let other = "pkg:golang/github.com/foo/baz@v1.0.0";
+        let asked = [record(BAR), record(other)];
+        let advisories = |refused: &[String]| {
+            let loader = Loader::new(RunCx::default());
+            let ask = Ask {
+                records: &asked,
+                wide: false,
+                jars: &[],
+            };
+            let lanes = &lanes::PRODUCTION;
+            let report = build(&loader, lanes, &repo.top, ask, Did::Patched, refused);
+            assert_eq!(report.state_of(BAR), Some(State::NotConsumed));
+            let said = report.run_warnings();
+            let detected = Code::WorkspaceDetected.as_str();
+            assert!(said.iter().any(|w| w.code == detected), "{said:?}");
+            let advisory = Code::AgentNotConsumed.as_str();
+            let advised = said.into_iter().filter(|w| w.code == advisory);
+            advised.map(|w| w.detail).collect::<Vec<String>>()
+        };
+        let [both] = &advisories(&[])[..] else {
+            panic!("one advisory");
+        };
+        assert!(both.contains(BAR) && both.contains(other), "{both}");
+        let [one] = &advisories(&[BAR.to_string()])[..] else {
+            panic!("one advisory");
+        };
+        assert!(!one.contains(BAR) && one.contains(other), "{one}");
+        // Every governed package of the run was refused: no advisory.
+        let all = [BAR.to_string(), other.to_string()];
+        assert_eq!(advisories(&all), Vec::<String>::new());
+    }
+
     // ── A pin that passes ────────────────────────────────────────────
 
     /// A patch whose pin `attest` accepts is consumed, and drops out of
@@ -1584,7 +1654,7 @@ mod tests {
             wide: false,
             jars: &[],
         };
-        let report = build(&loader, &TOY, &repo.top, ask, Did::Patched);
+        let report = build(&loader, &TOY, &repo.top, ask, Did::Patched, &[]);
         assert_eq!(report.state_of(BAR), Some(State::Consumed));
         let said: Vec<String> = report.run_warnings().into_iter().map(|w| w.code).collect();
         assert!(
@@ -2157,7 +2227,14 @@ mod tests {
             wide: false,
             jars: &jars,
         };
-        let report = build(&loader, &lanes::PRODUCTION, &repo.top, ask, Did::Patched);
+        let report = build(
+            &loader,
+            &lanes::PRODUCTION,
+            &repo.top,
+            ask,
+            Did::Patched,
+            &[],
+        );
         assert_eq!(report.sidecars, hazards);
         assert_eq!(report.sidecars(), hazards.as_slice());
         let lines: Vec<&str> = report.hazards().collect();
