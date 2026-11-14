@@ -1325,12 +1325,15 @@ async fn generate_vex(
             warnings,
             common,
             "vendored_tree_out_of_sync",
-            format!(
-                "{purl}: the installed tree does not match its vendored artifact; the \
-                 attestation is based on the committed .socket/vendor artifact (the project's \
-                 lockfile or package-manager config wires it in), but the live tree carries \
-                 different bytes — re-run your package manager's install to resync it.\
-                 {hatch_note}{pdm_note}"
+            vendored_out_of_sync_detail(
+                purl,
+                &outcome
+                    .vendored_out_of_sync_copies
+                    .iter()
+                    .filter(|(drifted, _)| drifted == purl)
+                    .map(|(_, copy)| copy.as_path())
+                    .collect::<Vec<_>>(),
+                &format!("{hatch_note}{pdm_note}"),
             ),
         );
     }
@@ -1807,6 +1810,43 @@ async fn withhold_stale_go_tools(
             purl,
             reason: GO_INSTALLED_TOOL_STALE.to_string(),
         }));
+}
+
+/// The `vendored_tree_out_of_sync` detail for `purl`. `copies` are the
+/// installed copies that drifted, `notes` the manager-specific remedies
+/// (Hatch, PDM) appended to the generic one.
+///
+/// A gem gets its own wording (#2076). Once Bundler's lock takes the gem
+/// from the vendored path, Bundler loads that directory and installs
+/// nothing for the gem, so the registry copy an earlier install left in a
+/// gem home stays as it is: "re-run your install" never clears the warning.
+/// The copy is still disclosed, because a load outside that Bundler setup
+/// runs it. The remedies are described, not spelled as a command: the purl
+/// comes from committed files, and which `gem uninstall` flags work depends
+/// on the gem home.
+fn vendored_out_of_sync_detail(purl: &str, copies: &[&Path], notes: &str) -> String {
+    use socket_patch_core::utils::purl::strip_purl_qualifiers;
+    if !strip_purl_qualifiers(purl).starts_with("pkg:gem/") || copies.is_empty() {
+        return format!(
+            "{purl}: the installed tree does not match its vendored artifact; the \
+             attestation is based on the committed .socket/vendor artifact (the project's \
+             lockfile or package-manager config wires it in), but the live tree carries \
+             different bytes — re-run your package manager's install to resync it.{notes}"
+        );
+    }
+    let copies: Vec<String> = copies.iter().map(|p| p.display().to_string()).collect();
+    format!(
+        "{purl}: an installed copy of this gem does not match the vendored artifact ({}). \
+         Bundler's lock takes the gem from the committed .socket/vendor path, which the \
+         attestation is based on, so a Bundler run of that lock loads the patched copy, and \
+         `bundle install` neither replaces nor removes what an earlier install left in a \
+         gem home. Code that loads the gem outside that Bundler setup still runs such a \
+         copy (plain `ruby`, or RubyGems activating a default gem before Bundler runs). \
+         `bundle clean` prunes it from the project's own bundle path; in any other gem \
+         home, `gem uninstall` it there if no other project uses it (a default gem that \
+         ships with Ruby cannot be uninstalled).",
+        copies.join(", ")
+    )
 }
 
 /// Record a run-level advisory the way `update`/`vendor` do: stderr
@@ -2469,6 +2509,56 @@ mod tests {
     //! lives in `tests/e2e_vex*.rs`.
     use super::*;
     use clap::Parser;
+
+    /// #2076: `bundle install` never replaces a vendored gem's gem-home
+    /// leftover, so the gem warning names each copy and the commands that
+    /// remove one, and never a reinstall. Nothing from the purl is spelled
+    /// into a command. Other ecosystems keep the install remedy and their
+    /// manager-specific notes; a gem never gets those.
+    #[test]
+    fn out_of_sync_detail_names_a_remedy_bundler_honors() {
+        let detail = |purl: &str, copies: &[&Path]| {
+            vendored_out_of_sync_detail(purl, copies, " Hatch note.")
+        };
+        let local = Path::new("vendor/bundle/ruby/3.3.0/gems/ffi-1.17.0");
+        let shared = Path::new("/opt/gems/gems/ffi-1.17.0-x86_64-linux");
+        let remedy = |text: &str| text.split_once("). ").map(|(_, rest)| rest.to_string());
+
+        for purl in [
+            "pkg:gem/ffi@1.17.0",
+            "pkg:gem/ffi@1.17.0?platform=x86_64-linux",
+            "pkg:gem/ffi@1.17.0?platform=%24%28id%29",
+        ] {
+            let text = detail(purl, &[local, shared]);
+            let head = format!(
+                "{purl}: an installed copy of this gem does not match the vendored artifact \
+                 ({}, {}). ",
+                local.display(),
+                shared.display()
+            );
+            let rest = text.strip_prefix(&head).unwrap_or_else(|| panic!("{text}"));
+            assert!(rest.contains("`bundle clean` prunes it"), "{text}");
+            assert!(rest.contains("`gem uninstall` it there"), "{text}");
+            assert!(!rest.contains("re-run your package manager"), "{text}");
+            assert!(!rest.contains("Hatch"), "{text}");
+            // The remedy text is fixed: no purl part reaches it.
+            assert_eq!(
+                Some(rest.to_string()),
+                remedy(&detail("pkg:gem/a@1", &[local, shared]))
+            );
+        }
+
+        for (purl, copies) in [
+            ("pkg:pypi/idna@3.6", vec![local]),
+            ("pkg:gem/rack@2.2.8", vec![]),
+        ] {
+            let text = detail(purl, &copies);
+            assert!(
+                text.ends_with("re-run your package manager's install to resync it. Hatch note."),
+                "{text}"
+            );
+        }
+    }
 
     /// The go-patches synthesis guards its copy-dir keys with core's
     /// `are_safe_redirect_coords`; pin the accept/reject set from the CLI

@@ -654,6 +654,22 @@ fn gem_vendor_fresh_checkout_bundle_install_and_revert() {
         "vendored attestation must carry the (vendored) marker: {impact}"
     );
 
+    // REGRESSION (#2076): the registry copy the first `bundle install` put
+    // in the gem home is a leftover now. Bundler loads the vendored path
+    // and installs nothing for rack, so no install replaces that copy. The
+    // warning about it must name the copy and a remedy that removes it
+    // (`bundle clean`, run below), not a reinstall.
+    assert!(
+        stderr.contains(&format!("Warning: {purl}: "))
+            && stderr.contains(&format!("({})", gem_dir.display()))
+            && stderr.contains("`bundle clean` prunes it"),
+        "the leftover gem-home copy is named, with remedies that clear it:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("re-run your package manager"),
+        "no install resyncs a vendored gem's leftover:\n{stderr}"
+    );
+
     // 5. FRESH-CHECKOUT PROOF: ONLY the committable files, frozen lock. The
     //    vendored path source is the only provider of rack (the fresh dir
     //    has no vendor/bundle), and the patched constant must be visible at
@@ -752,6 +768,53 @@ fn gem_vendor_fresh_checkout_bundle_install_and_revert() {
         std::fs::read(&lock_path).unwrap(),
         lock_wired,
         "re-vendor must leave Gemfile.lock byte-identical"
+    );
+
+    // #2076, the remedy: `bundle clean` removes the leftover, touches
+    // neither file of the pair, and `vex` then has nothing to report. Run
+    // on a copy, so the revert below still starts from the tree a user
+    // reverts from.
+    let cleaned = tmp.path().join("cleaned");
+    common::fs_tree::copy_tree(&proj, &cleaned);
+    let clean = bundle(&cleaned, &["clean"], false);
+    assert!(
+        clean.status.success(),
+        "`bundle clean` failed.\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&clean.stdout),
+        String::from_utf8_lossy(&clean.stderr),
+    );
+    let cleaned_gem_dir = cleaned.join(gem_dir.strip_prefix(&proj).unwrap());
+    assert!(
+        !cleaned_gem_dir.exists(),
+        "`bundle clean` must remove the leftover {}",
+        cleaned_gem_dir.display()
+    );
+    assert_eq!(
+        std::fs::read(cleaned.join("Gemfile.lock")).unwrap(),
+        lock_wired,
+        "`bundle clean` must leave Gemfile.lock byte-identical"
+    );
+    let (code, stdout, stderr) = run_socket(
+        &cleaned,
+        &[
+            "vex",
+            "--json",
+            "--cwd",
+            cleaned.to_str().unwrap(),
+            "--output",
+            cleaned.join("out.vex.json").to_str().unwrap(),
+            "--product",
+            "pkg:gem/app@1.0.0",
+        ],
+    );
+    assert_eq!(code, 0, "vex failed.\nstdout:\n{stdout}\nstderr:\n{stderr}");
+    let env = parse_json_envelope(&stdout);
+    assert_eq!(env["status"], "success", "envelope: {env}");
+    assert!(
+        env["warnings"]
+            .as_array()
+            .is_none_or(|w| w.iter().all(|w| w["code"] != "vendored_tree_out_of_sync")),
+        "nothing is out of sync after `bundle clean`: {env}"
     );
 
     // 7. REVERT PROOF: both halves of the pair edit byte-restored, artifacts
