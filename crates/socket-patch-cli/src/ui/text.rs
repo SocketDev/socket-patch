@@ -330,6 +330,12 @@ impl ShownOptIn {
     }
 }
 
+pub(crate) fn opt_in_preview<'a>(
+    entries: impl IntoIterator<Item = OptInEntry<'a>>,
+) -> Option<String> {
+    opt_in_note_block(entries)
+}
+
 pub(crate) fn opt_in_note_block<'a>(
     entries: impl IntoIterator<Item = OptInEntry<'a>>,
 ) -> Option<String> {

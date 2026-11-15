@@ -603,6 +603,21 @@ async fn run_check(args: &ApplyArgs, manifest_path: &Path) -> i32 {
         }
     }
 
+    if !args.common.json && !args.common.silent {
+        if let Some(notes) =
+            crate::ui::opt_in_note_block(manifest.patches.iter().map(|(purl, record)| {
+                crate::ui::OptInEntry {
+                    purl,
+                    uuid: &record.uuid,
+                    requires_opt_in: record.requires_opt_in,
+                    opt_in_note: record.opt_in_note.as_deref(),
+                }
+            }))
+        {
+            println!("\n{notes}");
+        }
+    }
+
     if drifts.is_empty() {
         if args.common.json {
             let mut env = Envelope::new(Command::Apply);
@@ -1333,6 +1348,7 @@ pub async fn run(args: ApplyArgs) -> i32 {
                 _ => {}
             }
         }
+        print_vendor_opt_in_notes(&args.common).await;
         return i32::from(matches!(vex_result, Some(ManifestlessVex::Failed(_))));
     }
 
@@ -1500,6 +1516,27 @@ fn collect_apply_outcomes(
     skipped.sort_by(|a, b| (&a.purl, &a.error_code).cmp(&(&b.purl, &b.error_code)));
     skipped.dedup_by(|a, b| a.purl == b.purl && a.error_code == b.error_code);
     (applied, skipped)
+}
+
+async fn print_vendor_opt_in_notes(common: &GlobalArgs) {
+    if common.json || common.silent || common.is_global() {
+        return;
+    }
+    let Ok(state) = socket_patch_core::vendor::load_state(&common.cwd).await else {
+        return;
+    };
+    let entries = state.entries.values().filter_map(|entry| {
+        let record = entry.record.as_ref()?;
+        Some(crate::ui::OptInEntry {
+            purl: &entry.base_purl,
+            uuid: &record.uuid,
+            requires_opt_in: record.requires_opt_in,
+            opt_in_note: record.opt_in_note.as_deref(),
+        })
+    });
+    if let Some(notes) = crate::ui::opt_in_note_block(entries) {
+        println!("\n{notes}");
+    }
 }
 
 type OptInPatches = Vec<(String, String, Option<bool>, Option<String>)>;

@@ -3615,7 +3615,7 @@ async fn scan_project(
 
     if selected.is_empty() && (!reapply || already_recorded.is_empty()) {
         if !silent {
-            if let Some(notes) = ui::opt_in_note_block(
+            if let Some(notes) = ui::opt_in_preview(
                 selected
                     .iter()
                     .chain(&already_recorded)
@@ -3689,8 +3689,8 @@ async fn scan_project(
         }
     }
 
-    if !silent && (vendor || report_only || args.common.dry_run) {
-        if let Some(notes) = ui::opt_in_note_block(
+    if !silent && (report_only || args.common.dry_run) {
+        if let Some(notes) = ui::opt_in_preview(
             selected
                 .iter()
                 .chain(&already_recorded)

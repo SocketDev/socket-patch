@@ -1356,7 +1356,7 @@ pub async fn run(args: GetArgs) -> i32 {
                         .await
                     }
                 };
-                if !quiet {
+                if !quiet && mode == super::scan::ScanMode::Agent {
                     if let Some(notes) =
                         crate::ui::opt_in_note_block([crate::ui::OptInEntry::from_response(&patch)])
                     {
@@ -1925,6 +1925,11 @@ async fn agent_dry_run(
         for line in &lines {
             println!("{line}");
         }
+        if let Some(notes) =
+            crate::ui::opt_in_preview(selected.iter().map(crate::ui::OptInEntry::from_search))
+        {
+            println!("\n{notes}");
+        }
         let action = if args.save_only {
             "download and record"
         } else {
@@ -2371,6 +2376,11 @@ async fn run_get_vendored(
             emit(&env);
         } else if !args.common.silent {
             preview.print_human();
+            if let Some(notes) =
+                crate::ui::opt_in_preview(selected.iter().map(crate::ui::OptInEntry::from_search))
+            {
+                println!("\n{notes}");
+            }
         }
         return 0;
     }
@@ -2501,11 +2511,6 @@ async fn run_get_vendored(
             1
         }
     };
-    if !args.common.json && !args.common.silent {
-        if let Some(notes) = env.opt_in_note_block() {
-            println!("\n{notes}");
-        }
-    }
     code
 }
 

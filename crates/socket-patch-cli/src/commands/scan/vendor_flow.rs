@@ -588,6 +588,20 @@ async fn vendor_under_lock(
             Some(Box::new(env)),
         ));
     }
+    if !common.json && !common.silent {
+        if let Some(notes) =
+            crate::ui::opt_in_note_block(manifest.patches.iter().map(|(purl, record)| {
+                crate::ui::OptInEntry {
+                    purl,
+                    uuid: &record.uuid,
+                    requires_opt_in: record.requires_opt_in,
+                    opt_in_note: record.opt_in_note.as_deref(),
+                }
+            }))
+        {
+            println!("\n{notes}");
+        }
+    }
     migrate_legacy_manifest_records(common, &manifest_path, &manifest.patches, &mut env).await;
     if has_errors {
         env.mark_partial_failure();

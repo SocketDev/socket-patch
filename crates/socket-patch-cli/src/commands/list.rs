@@ -274,7 +274,12 @@ fn field(indent: &str, label: &str, value: &str) -> Option<String> {
 }
 
 /// One entry of the human listing (no trailing newline).
+#[cfg(test)]
 fn format_entry(entry: &ListEntry<'_>, color: bool) -> String {
+    format_entry_inner(entry, color, true)
+}
+
+fn format_entry_inner(entry: &ListEntry<'_>, color: bool, show_opt_in: bool) -> String {
     let patch = entry.record;
     let mut lines = vec![format!("Package: {}", sanitize(entry.purl))];
     lines.extend(field("  ", "UUID", &patch.uuid));
@@ -293,7 +298,7 @@ fn format_entry(entry: &ListEntry<'_>, color: bool) -> String {
     lines.extend(field("  ", "License", &patch.license));
     lines.extend(field("  ", "Exported", &patch.exported_at));
     lines.extend(field("  ", "Description", &patch.description));
-    if patch.requires_opt_in == Some(true) {
+    if show_opt_in && patch.requires_opt_in == Some(true) {
         if let Some(note) = &patch.opt_in_note {
             lines.extend(field("  ", "Opt-in required", note));
         }
@@ -348,7 +353,22 @@ fn format_listing(entries: &[ListEntry<'_>], color: bool) -> String {
         "Found {}:\n\n",
         crate::ui::plural(entries.len(), "patch", "patches")
     );
-    let blocks: Vec<String> = entries.iter().map(|e| format_entry(e, color)).collect();
+    let mut shown_opt_ins = std::collections::HashSet::new();
+    let blocks: Vec<String> = entries
+        .iter()
+        .map(|entry| {
+            let show_opt_in = match (
+                entry.record.requires_opt_in,
+                entry.record.opt_in_note.as_deref(),
+            ) {
+                (Some(true), Some(note)) if !note.trim().is_empty() => {
+                    shown_opt_ins.insert((entry.record.uuid.as_str(), note))
+                }
+                _ => false,
+            };
+            format_entry_inner(entry, color, show_opt_in)
+        })
+        .collect();
     out.push_str(&blocks.join("\n\n"));
     out
 }
@@ -1229,6 +1249,21 @@ mod tests {
         assert!(out.starts_with("Package: pkg:npm/日本@1\n"), "{out}");
         assert!(out.contains("  Description: 修复 — é\n"), "{out}");
         assert!(out.contains("      Summary: 漏洞\n"), "{out}");
+    }
+
+    #[test]
+    fn format_listing_deduplicates_identical_opt_in_notes_per_uuid() {
+        let mut manifest = sample_manifest();
+        let mut other = manifest.patches["pkg:npm/minimist@1.2.2"].clone();
+        other.requires_opt_in = Some(true);
+        other.opt_in_note = Some("Enable safe mode.".into());
+        manifest.patches.insert("pkg:npm/other@1.0.0".into(), other);
+        let first = manifest.patches.get_mut("pkg:npm/minimist@1.2.2").unwrap();
+        first.requires_opt_in = Some(true);
+        first.opt_in_note = Some("Enable safe mode.".into());
+
+        let out = format_listing(&combined_entries(Some(&manifest), &[], None), false);
+        assert_eq!(out.matches("Enable safe mode.").count(), 1, "{out}");
     }
 
     #[test]
