@@ -1356,7 +1356,7 @@ pub async fn run(args: GetArgs) -> i32 {
                         .await
                     }
                 };
-                if !quiet && mode == super::scan::ScanMode::Agent {
+                if !quiet && !args.common.dry_run && mode == super::scan::ScanMode::Agent {
                     if let Some(notes) =
                         crate::ui::opt_in_note_block([crate::ui::OptInEntry::from_response(&patch)])
                     {

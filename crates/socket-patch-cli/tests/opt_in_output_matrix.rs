@@ -33,6 +33,7 @@ enum Action {
     Real,
     DryRun,
     SaveOnly,
+    Check,
 }
 
 impl CommandKind {
@@ -62,6 +63,7 @@ impl Action {
             Self::Real => "real",
             Self::DryRun => "dry-run",
             Self::SaveOnly => "save-only",
+            Self::Check => "check",
         }
     }
 }
@@ -165,6 +167,7 @@ fn get_args(server: &MockServer, mode: Mode, action: Action) -> Vec<String> {
         Action::Real => {}
         Action::DryRun => args.push("--dry-run".into()),
         Action::SaveOnly => args.push("--save-only".into()),
+        Action::Check => args.push("--check".into()),
     }
     args
 }
@@ -206,6 +209,11 @@ async fn stage_state(
             AFTER_BYTES,
         )
         .unwrap();
+        std::fs::write(
+            root.join("node_modules").join(NAME).join("index.js"),
+            AFTER_BYTES,
+        )
+        .unwrap();
     }
 }
 
@@ -222,8 +230,24 @@ fn opt_in_output_matrix() {
             for action in [Action::Real, Action::DryRun, Action::SaveOnly] {
                 runtime.block_on(run_case(command, mode, action));
             }
+            if matches!(command, CommandKind::Apply) {
+                runtime.block_on(run_case(command, mode, Action::Check));
+            }
         }
     }
+}
+
+fn assert_json_opt_in(stdout: &str, stderr: &str, label: &str) {
+    let doc: serde_json::Value = serde_json::from_str(stdout)
+        .unwrap_or_else(|e| panic!("{label}: JSON {e}; stdout={stdout}\nstderr={stderr}"));
+    let event = doc["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|event| event["uuid"] == UUID || event["purl"] == PURL)
+        .unwrap_or_else(|| panic!("{label}: no matching event in {doc}"));
+    assert_eq!(event["details"]["requiresOptIn"], true, "{label}: {event}");
+    assert_eq!(event["details"]["optInNote"], NOTE, "{label}: {event}");
 }
 
 async fn run_case(command: CommandKind, mode: Mode, action: Action) {
@@ -252,7 +276,12 @@ async fn run_case(command: CommandKind, mode: Mode, action: Action) {
             args.push("--save-only".into());
         }
     }
+    if matches!(command, CommandKind::Apply) && matches!(action, Action::Check) {
+        args.push("--check".into());
+    }
 
+    let mut json_args = args.clone();
+    json_args.push("--json".into());
     let (code, stdout, stderr) = if matches!(command, CommandKind::Apply | CommandKind::List) {
         stage_state(tmp.path(), &server, mode, command).await;
         server.reset().await;
@@ -271,6 +300,34 @@ async fn run_case(command: CommandKind, mode: Mode, action: Action) {
         assert!(
             received_paths(&server).await.is_empty(),
             "{label} must not fetch patch metadata"
+        );
+    }
+
+    if matches!(action, Action::Check) && matches!(mode, Mode::Agent) {
+        std::fs::write(
+            tmp.path().join("node_modules").join(NAME).join("index.js"),
+            BEFORE_BYTES,
+        )
+        .unwrap();
+    }
+    let (code, json, stderr) = run_argv(tmp.path(), json_args);
+    if valid {
+        let expected_code = if matches!(action, Action::Check) && matches!(mode, Mode::Agent) {
+            1
+        } else {
+            0
+        };
+        assert_eq!(
+            code, expected_code,
+            "{label} JSON: stdout={json}\nstderr={stderr}"
+        );
+        assert_json_opt_in(&json, &stderr, &label);
+    } else {
+        assert_ne!(code, 0, "{label} JSON: stdout={json}\nstderr={stderr}");
+        assert!(!json.contains(NOTE), "{label}: {json}");
+        assert!(
+            received_paths(&server).await.is_empty(),
+            "{label} JSON must not fetch patch metadata"
         );
     }
 }

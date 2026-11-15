@@ -422,6 +422,9 @@ async fn run_check(args: &ApplyArgs, manifest_path: &Path) -> i32 {
         Err(e) => return refuse_unreadable_manifest(args, manifest_path, &e),
     };
 
+    let mut opt_ins = opt_in_patches(&manifest);
+    opt_ins.extend(vendor_opt_in_patches(&args.common).await);
+
     // (purl_or_name, reason_code, detail) for each drift.
     let mut drifts: Vec<(String, String, String)> = Vec::new();
     let mut checked: usize = 0;
@@ -604,16 +607,14 @@ async fn run_check(args: &ApplyArgs, manifest_path: &Path) -> i32 {
     }
 
     if !args.common.json && !args.common.silent {
-        if let Some(notes) =
-            crate::ui::opt_in_note_block(manifest.patches.iter().map(|(purl, record)| {
-                crate::ui::OptInEntry {
-                    purl,
-                    uuid: &record.uuid,
-                    requires_opt_in: record.requires_opt_in,
-                    opt_in_note: record.opt_in_note.as_deref(),
-                }
-            }))
-        {
+        if let Some(notes) = crate::ui::opt_in_note_block(opt_ins.iter().map(
+            |(purl, uuid, requires_opt_in, opt_in_note)| crate::ui::OptInEntry {
+                purl,
+                uuid,
+                requires_opt_in: *requires_opt_in,
+                opt_in_note: opt_in_note.as_deref(),
+            },
+        )) {
             println!("\n{notes}");
         }
     }
@@ -621,6 +622,7 @@ async fn run_check(args: &ApplyArgs, manifest_path: &Path) -> i32 {
     if drifts.is_empty() {
         if args.common.json {
             let mut env = Envelope::new(Command::Apply);
+            register_opt_ins(&mut env, &opt_ins);
             record_check_skips(&mut env, &in_sync, &not_installed);
             for event in unchecked_events {
                 env.record(event);
@@ -637,6 +639,7 @@ async fn run_check(args: &ApplyArgs, manifest_path: &Path) -> i32 {
     } else {
         if args.common.json {
             let mut env = Envelope::new(Command::Apply);
+            register_opt_ins(&mut env, &opt_ins);
             for (id, code, detail) in &drifts {
                 env.record(
                     PatchEvent::new(PatchAction::Failed, id.clone())
@@ -1305,6 +1308,21 @@ pub async fn run(args: ApplyArgs) -> i32 {
             env.status = Status::NoManifest;
             env.dry_run = args.common.dry_run;
             env.warnings.extend(below.warnings());
+            let vendor_patches = vendor_opt_in_patches(&args.common).await;
+            for (purl, uuid, requires_opt_in, opt_in_note) in &vendor_patches {
+                if requires_opt_in != &Some(true) && opt_in_note.is_none() {
+                    continue;
+                }
+                env.register_opt_in(purl, uuid, *requires_opt_in, opt_in_note.as_deref());
+                env.record(
+                    PatchEvent::new(PatchAction::Skipped, purl.clone())
+                        .with_uuid(uuid.clone())
+                        .with_reason(
+                            "already_vendored",
+                            "vendored patch is recorded in .socket/vendor/state.json",
+                        ),
+                );
+            }
             match &vex_result {
                 Some(ManifestlessVex::Written(summary)) => {
                     env.vex = Some(VexSummary {
@@ -1519,21 +1537,19 @@ fn collect_apply_outcomes(
 }
 
 async fn print_vendor_opt_in_notes(common: &GlobalArgs) {
-    if common.json || common.silent || common.is_global() {
+    if common.json || common.silent {
         return;
     }
-    let Ok(state) = socket_patch_core::vendor::load_state(&common.cwd).await else {
-        return;
-    };
-    let entries = state.entries.values().filter_map(|entry| {
-        let record = entry.record.as_ref()?;
-        Some(crate::ui::OptInEntry {
-            purl: &entry.base_purl,
-            uuid: &record.uuid,
-            requires_opt_in: record.requires_opt_in,
-            opt_in_note: record.opt_in_note.as_deref(),
-        })
-    });
+    let patches = vendor_opt_in_patches(common).await;
+    let entries =
+        patches.iter().map(
+            |(purl, uuid, requires_opt_in, opt_in_note)| crate::ui::OptInEntry {
+                purl,
+                uuid,
+                requires_opt_in: *requires_opt_in,
+                opt_in_note: opt_in_note.as_deref(),
+            },
+        );
     if let Some(notes) = crate::ui::opt_in_note_block(entries) {
         println!("\n{notes}");
     }
@@ -1554,6 +1570,34 @@ fn opt_in_patches(manifest: &PatchManifest) -> OptInPatches {
             )
         })
         .collect()
+}
+
+async fn vendor_opt_in_patches(common: &GlobalArgs) -> OptInPatches {
+    if common.is_global() {
+        return Vec::new();
+    }
+    let Ok(state) = socket_patch_core::vendor::load_state(&common.cwd).await else {
+        return Vec::new();
+    };
+    state
+        .entries
+        .into_iter()
+        .filter_map(|(purl, entry)| {
+            let record = entry.record?;
+            Some((
+                purl,
+                record.uuid,
+                record.requires_opt_in,
+                record.opt_in_note,
+            ))
+        })
+        .collect()
+}
+
+fn register_opt_ins(env: &mut Envelope, patches: &OptInPatches) {
+    for (purl, uuid, requires_opt_in, opt_in_note) in patches {
+        env.register_opt_in(purl, uuid, *requires_opt_in, opt_in_note.as_deref());
+    }
 }
 
 /// The locked half of `apply`: everything from the manifest read on — the
@@ -1612,7 +1656,8 @@ pub(crate) async fn run_locked(
 
     // Packages the project patched itself sit this run out (warned); every
     // other record still applies. The read-only `--check` verifies them all.
-    let opt_ins = opt_in_patches(&manifest);
+    let mut opt_ins = opt_in_patches(&manifest);
+    opt_ins.extend(vendor_opt_in_patches(&args.common).await);
     let mut manifest = manifest;
     let (user_patch_warnings, user_patch_skips) = if args.check {
         Default::default()
@@ -1937,9 +1982,7 @@ pub(crate) async fn run_locked(
             if args.common.json {
                 let mut env = Envelope::new(Command::Apply);
                 env.dry_run = args.common.dry_run;
-                for (purl, uuid, requires_opt_in, opt_in_note) in &opt_ins {
-                    env.register_opt_in(purl, uuid, *requires_opt_in, opt_in_note.as_deref());
-                }
+                register_opt_ins(&mut env, &opt_ins);
                 for skip in &user_patch_skips {
                     env.record(skip.clone());
                 }
