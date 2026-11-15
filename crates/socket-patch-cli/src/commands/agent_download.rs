@@ -364,6 +364,7 @@ pub struct DownloadParams {
     pub global_prefix: Option<PathBuf>,
     pub json: bool,
     pub silent: bool,
+    pub offline: bool,
     /// When `false` (the default — narrow), a release-variant package (PyPI
     /// `?artifact_id=`, RubyGems `?platform=`, Maven `?classifier=`) is
     /// filtered down to the variant(s) matching the locally-installed
@@ -390,7 +391,6 @@ pub struct DownloadParams {
     /// `--patch-server-url`: the extra origin whose URLs count as hosted
     /// when lockfile discovery reads the project's hosted pins.
     pub patch_server_url: Option<String>,
-    pub opt_in_notes_shown: Vec<crate::ui::ShownOptIn>,
 }
 
 impl DownloadParams {
@@ -853,7 +853,8 @@ pub(crate) fn claimed_purls(
 }
 
 /// The record a detached ledger entry already carries for `purl` at
-/// exactly `uuid` — the ledger store's idempotency skip (no view fetch).
+/// exactly `uuid`. Online reuse still fetches its view for authoritative
+/// activation metadata; offline reuse keeps the existing fields.
 /// Always `None` for the manifest store.
 pub(crate) fn detached_ledger_record<'a>(
     store: RecordStore<'a>,
@@ -973,12 +974,39 @@ pub(crate) async fn fetch_selected_patches(
         }
 
         // Idempotency (ledger store): a detached entry already at this uuid
-        // carries its own record — no view fetch needed.
+        // retains its artifact and wiring; its view still governs activation metadata.
         if let Some(mut record) = detached_ledger_record(store, purl, uuid).cloned() {
-            if let Some(patch) = prefetched.get(uuid) {
+            if !params.offline {
+                let view = match prefetched.remove(uuid) {
+                    Some(patch) => Ok(Some(patch)),
+                    None => api_client.fetch_patch(uuid).await,
+                };
+                let patch = match view {
+                    Ok(Some(patch)) => patch,
+                    Ok(None) => {
+                        batch.fail(
+                            params.json,
+                            Some(format!("[fail] {purl} (could not fetch details)")),
+                            (purl, uuid),
+                            DOWNLOAD_FAILED,
+                            "could not fetch details",
+                        );
+                        continue;
+                    }
+                    Err(e) => {
+                        batch.fail(
+                            params.json,
+                            Some(format!("[fail] {purl} ({e})")),
+                            (purl, uuid),
+                            DOWNLOAD_FAILED,
+                            &e.to_string(),
+                        );
+                        continue;
+                    }
+                };
                 record.requires_opt_in = patch.requires_opt_in;
                 record.opt_in_note = patch.opt_in_note.clone();
-                batch.metadata_refreshes.push(patch.clone());
+                batch.metadata_refreshes.push(patch);
             }
             if !quiet {
                 eprintln!("{}", format_record_skip(purl, "already vendored"));
@@ -1177,6 +1205,13 @@ impl DetachedDownload {
         for (purl, record) in &self.records {
             if self.authoritative.contains(&record.uuid) {
                 env.register_view_opt_in(
+                    purl,
+                    &record.uuid,
+                    record.requires_opt_in,
+                    record.opt_in_note.as_deref(),
+                );
+            } else {
+                env.register_opt_in(
                     purl,
                     &record.uuid,
                     record.requires_opt_in,
@@ -1859,6 +1894,16 @@ pub async fn download_and_apply_patches_into(
         );
     }
 
+    if !quiet {
+        if let Some(notes) = env.opt_in_note_block() {
+            println!("\n{notes}");
+        }
+    }
+    let shown_opt_ins: Vec<_> = recorded
+        .iter()
+        .filter_map(|(_, uuid)| env.shown_opt_ins(uuid))
+        .collect();
+
     // Auto-apply unless --save-only (the lock decision above).
     let mut apply_report: Option<ApplyRunReport> = None;
     if let Some(lock) = apply_lock {
@@ -1874,7 +1919,7 @@ pub async fn download_and_apply_patches_into(
                 nested_apply_args_from_params(params, run, &manifest_path),
                 params.json,
                 !params.user_patch_skips_reported,
-                params.opt_in_notes_shown.clone(),
+                shown_opt_ins,
                 &recorded,
                 run.api_client,
                 lock,

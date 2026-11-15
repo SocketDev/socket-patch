@@ -289,6 +289,26 @@ impl Envelope {
         event.details = Some(details);
     }
 
+    pub(crate) fn opt_in_note_block(&self) -> Option<String> {
+        crate::ui::opt_in_note_block(self.opt_in_by_patch.iter().map(|((purl, uuid), metadata)| {
+            crate::ui::OptInEntry {
+                purl,
+                uuid,
+                requires_opt_in: metadata.requires_opt_in,
+                opt_in_note: metadata.opt_in_note.as_deref(),
+            }
+        }))
+    }
+
+    pub(crate) fn shown_opt_ins(&self, uuid: &str) -> Option<crate::ui::ShownOptIn> {
+        let metadata = self.opt_in_by_uuid.get(uuid)?;
+        Some(crate::ui::ShownOptIn::new(
+            uuid,
+            metadata.requires_opt_in,
+            metadata.opt_in_note.as_deref(),
+        ))
+    }
+
     pub(crate) fn add_registered_opt_in_to_events(&mut self) {
         let mut events = std::mem::take(&mut self.events);
         for event in &mut events {

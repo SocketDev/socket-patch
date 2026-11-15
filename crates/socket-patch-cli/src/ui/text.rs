@@ -279,6 +279,15 @@ impl<'a> OptInEntry<'a> {
             opt_in_note: patch.opt_in_note.as_deref(),
         }
     }
+
+    pub fn from_response(patch: &'a socket_patch_core::api::types::PatchResponse) -> Self {
+        Self {
+            purl: &patch.purl,
+            uuid: &patch.uuid,
+            requires_opt_in: patch.requires_opt_in,
+            opt_in_note: patch.opt_in_note.as_deref(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -289,20 +298,16 @@ pub struct ShownOptIn {
 }
 
 impl ShownOptIn {
-    fn new(uuid: &str, requires_opt_in: Option<bool>, opt_in_note: Option<&str>) -> Self {
+    pub(crate) fn new(
+        uuid: &str,
+        requires_opt_in: Option<bool>,
+        opt_in_note: Option<&str>,
+    ) -> Self {
         Self {
             uuid: uuid.to_string(),
             requires_opt_in,
             opt_in_note: opt_in_note.map(str::to_string),
         }
-    }
-
-    pub fn from_search(patch: &socket_patch_core::api::types::PatchSearchResult) -> Self {
-        Self::new(
-            &patch.uuid,
-            patch.requires_opt_in,
-            patch.opt_in_note.as_deref(),
-        )
     }
 
     pub fn from_response(patch: &socket_patch_core::api::types::PatchResponse) -> Self {
@@ -340,7 +345,7 @@ pub(crate) fn opt_in_note_block<'a>(
             continue;
         };
         let note = terminal_text(note);
-        if note.trim().is_empty() || !seen.insert(entry.uuid) {
+        if note.trim().is_empty() || !seen.insert((entry.uuid.to_string(), note.clone())) {
             continue;
         }
         let note = note.replace('\n', "\n    ");

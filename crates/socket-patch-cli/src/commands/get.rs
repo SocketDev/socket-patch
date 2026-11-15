@@ -369,12 +369,6 @@ fn format_search_results(
         if !desc.is_empty() {
             out.push_str(&format!("     Description: {desc}\n"));
         }
-        if patch.requires_opt_in == Some(true) {
-            if let Some(note) = &patch.opt_in_note {
-                let note = crate::ui::terminal_text(note).replace('\n', "\n       ");
-                out.push_str(&format!("     Opt-in required: {note}\n"));
-            }
-        }
         let mut fixes: Vec<(String, String)> = patch
             .vulnerabilities
             .iter()
@@ -1292,15 +1286,6 @@ pub async fn run(args: GetArgs) -> i32 {
                             crate::ui::stderr_color(),
                         )
                     );
-                    if patch.requires_opt_in == Some(true) {
-                        if let Some(note) = &patch.opt_in_note {
-                            let note = crate::ui::terminal_text(note).replace('\n', "\n  ");
-                            println!(
-                                "Opt-in required for {}: {note}",
-                                crate::ui::terminal_purl(&patch.purl)
-                            );
-                        }
-                    }
                 }
 
                 // Record the fetch BEFORE the save+apply step so the
@@ -1349,7 +1334,7 @@ pub async fn run(args: GetArgs) -> i32 {
                 // re-fetching with a fresh one, which would re-hit the
                 // 401/403 the fallback just recovered from. An explicit
                 // UUID is exempt from installed narrowing (exact intent).
-                return match mode {
+                let code = match mode {
                     // Save to manifest and apply in place.
                     super::scan::ScanMode::Agent => {
                         save_and_apply_patch(&args, &api_client, &patch, &uuid_warnings).await
@@ -1371,6 +1356,14 @@ pub async fn run(args: GetArgs) -> i32 {
                         .await
                     }
                 };
+                if !quiet {
+                    if let Some(notes) =
+                        crate::ui::opt_in_note_block([crate::ui::OptInEntry::from_response(&patch)])
+                    {
+                        println!("\n{notes}");
+                    }
+                }
+                return code;
             }
             // The public proxy answers a paid patch with 403 rather than
             // a tier=paid view: the same outcome as the branch above, not
@@ -1812,11 +1805,7 @@ pub async fn run(args: GetArgs) -> i32 {
     }
 
     // Download and apply (agent mode), with the run's client and flags.
-    let mut params = get_download_params(&args, args.save_only, /*persist_blobs=*/ true);
-    params.opt_in_notes_shown = selected
-        .iter()
-        .map(crate::ui::ShownOptIn::from_search)
-        .collect();
+    let params = get_download_params(&args, args.save_only, /*persist_blobs=*/ true);
     let run = DownloadRun {
         api_client: &api_client,
         lock_timeout: args.common.lock_timeout,
@@ -2285,7 +2274,7 @@ fn get_download_params(args: &GetArgs, save_only: bool, persist_blobs: bool) -> 
         ecosystems: args.common.ecosystems.clone(),
         persist_blobs,
         patch_server_url: args.common.patch_server_url.clone(),
-        opt_in_notes_shown: Vec::new(),
+        offline: args.common.offline,
     }
 }
 
@@ -2319,7 +2308,7 @@ async fn run_get_hosted(
     // default-off VexEmbedArgs — deliberately NOT env-bound here, so an
     // ambient SOCKET_VEX only affects commands that declare the flag.
     let vex = crate::commands::vex::VexEmbedArgs::default();
-    super::scan::boxed_run_redirect_selected(
+    let code = super::scan::boxed_run_redirect_selected(
         &args.common,
         &vex,
         /*prune_requested=*/ false,
@@ -2331,7 +2320,15 @@ async fn run_get_hosted(
         None,
         "get",
     )
-    .await
+    .await;
+    if !args.common.json && !args.common.silent {
+        if let Some(notes) =
+            crate::ui::opt_in_note_block(selected.iter().map(crate::ui::OptInEntry::from_search))
+        {
+            println!("\n{notes}");
+        }
+    }
+    code
 }
 
 /// `get … --mode vendored`, both identifier paths: scan's vendored posture
@@ -2462,7 +2459,7 @@ async fn run_get_vendored(
     // records fetched above (moved in — nothing here needs them afterwards)
     // and over this run's client, then the run's telemetry. A per-patch
     // download failure does not skip it (scan parity).
-    match super::scan::boxed_vendor_step(super::scan::VendorStep {
+    let code = match super::scan::boxed_vendor_step(super::scan::VendorStep {
         common: &args.common,
         records,
         client: api_client.clone(),
@@ -2503,7 +2500,13 @@ async fn run_get_vendored(
             }
             1
         }
+    };
+    if !args.common.json && !args.common.silent {
+        if let Some(notes) = env.opt_in_note_block() {
+            println!("\n{notes}");
+        }
     }
+    code
 }
 
 #[cfg(test)]
@@ -4090,7 +4093,7 @@ mod tests {
             ecosystems: None,
             persist_blobs: false,
             patch_server_url: None,
-            opt_in_notes_shown: Vec::new(),
+            offline: false,
         }
     }
 
@@ -4791,7 +4794,7 @@ mod tests {
             // The vendor-detached posture this fn exists for.
             persist_blobs: false,
             patch_server_url: None,
-            opt_in_notes_shown: Vec::new(),
+            offline: false,
         }
     }
 
@@ -5540,6 +5543,8 @@ mod tests {
                         "description": "embedded",
                         "license": "MIT",
                         "tier": "free",
+                        "requiresOptIn": true,
+                        "optInNote": "Keep the embedded instruction offline",
                     }
                 }}
             }))
@@ -5551,6 +5556,7 @@ mod tests {
         let mut params = detached_params(tmp.path());
         params.json = false;
         params.silent = false;
+        params.offline = true;
         let (code, json, records) = download_patch_records(&selected, &params, &server.uri()).await;
 
         assert_eq!(code, 0, "json={json}");
@@ -5561,6 +5567,11 @@ mod tests {
             records.get(purl).map(|r| r.uuid.as_str()),
             Some(uuid),
             "the ledger's embedded record must be reused"
+        );
+        assert_eq!(records[purl].requires_opt_in, Some(true));
+        assert_eq!(
+            records[purl].opt_in_note.as_deref(),
+            Some("Keep the embedded instruction offline")
         );
         assert!(
             server
@@ -6159,9 +6170,9 @@ mod tests {
         )
         .mount(&server)
         .await;
-        // `d` is held in memory and `e` is reused from the ledger: never
-        // requested.
-        for u in [&d, &e] {
+        // `d` is held in memory. `e` is reused from the ledger, but its view
+        // still supplies current activation metadata without a download event.
+        for u in [&d] {
             Mock::given(method("GET"))
                 .and(wm_path(format!("/v0/orgs/test-org/patches/view/{u}")))
                 .respond_with(ResponseTemplate::new(500))
@@ -6169,6 +6180,12 @@ mod tests {
                 .mount(&server)
                 .await;
         }
+        mount(
+            &e,
+            ResponseTemplate::new(200).set_body_json(view(&e, &purl("e"))),
+        )
+        .mount(&server)
+        .await;
         mount(
             &f,
             ResponseTemplate::new(200).set_body_json(view(&f, &purl("f"))),
@@ -6252,8 +6269,8 @@ mod tests {
                 row("b", "failed", "could not fetch details"),
                 row("c", "failed", "API request failed with status 500: boom"),
                 row("d", "downloaded", ""),
-                // e: the ledger already holds it at this uuid — reused, no
-                // fetch and no event (the vendor engine reports it).
+                // e: its view refreshes activation metadata; the vendor engine
+                // reports the reuse, so the download phase still has no event.
                 row("f", "downloaded", ""),
             ],
             "json={json}"

@@ -397,7 +397,7 @@ async fn opt_in_note_renders_and_persists_in_human_and_json_get() {
     assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
     assert!(
         stdout.contains(
-            "Opt-in required: Set `safeMode` to `true`.[2J]0;bad\n       Defaults remain vulnerable."
+            "Opt-in required:\n  pkg:npm/covgap-pkg@1.0.0: Set `safeMode` to `true`.[2J]0;bad\n    Defaults remain vulnerable."
         ),
         "stdout={stdout}"
     );
@@ -415,7 +415,7 @@ async fn opt_in_note_renders_and_persists_in_human_and_json_get() {
     assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
     assert!(
         stdout.contains(&format!(
-            "Opt-in required for {PURL}: Set `safeMode` to `true`.[2J]0;bad\n  Defaults remain vulnerable."
+            "Opt-in required:\n  {PURL}: Set `safeMode` to `true`.[2J]0;bad\n    Defaults remain vulnerable."
         )),
         "stdout={stdout}"
     );
@@ -467,6 +467,15 @@ async fn get_json_uses_fetched_view_instead_of_stale_search_opt_in_metadata() {
         .respond_with(ResponseTemplate::new(200).set_body_json(view))
         .mount(&server)
         .await;
+    let human = tempfile::tempdir().unwrap();
+    let (code, stdout, stderr) = run_get_bin(human.path(), &server.uri(), &[cve, "--save-only"]);
+    assert_eq!(code, 0, "save-only: stdout={stdout}\nstderr={stderr}");
+    assert!(
+        stdout.contains(&format!("Opt-in required:\n  {PURL}: {LATEST}")),
+        "save-only must show the fetched view: {stdout}"
+    );
+    assert!(!stdout.contains(STALE), "{stdout}");
+
     let tmp = tempfile::tempdir().unwrap();
 
     let (code, stdout, stderr) =
@@ -487,7 +496,7 @@ async fn get_json_uses_fetched_view_instead_of_stale_search_opt_in_metadata() {
 }
 
 #[tokio::test]
-async fn changed_view_opt_in_note_is_not_suppressed_in_nested_apply() {
+async fn get_renders_latest_view_note_not_stale_search_preview() {
     const PREVIEW_NOTE: &str = "Preview configuration instruction.";
     const LATEST_NOTE: &str = "Latest configuration instruction.";
     let server = MockServer::start().await;
@@ -527,7 +536,11 @@ async fn changed_view_opt_in_note_is_not_suppressed_in_nested_apply() {
 
     let (code, stdout, stderr) = run_get_bin(tmp.path(), &server.uri(), &[cve]);
     assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
-    assert!(stdout.contains(PREVIEW_NOTE), "{stdout}");
+    assert!(
+        !stdout.contains(PREVIEW_NOTE),
+        "the search note must not print: {stdout}"
+    );
+    assert_eq!(stdout.matches(LATEST_NOTE).count(), 1, "{stdout}");
     assert!(
         stdout.contains(&format!("Opt-in required:\n  {PURL}: {LATEST_NOTE}")),
         "nested apply must show the refreshed view's note: {stdout}"
@@ -894,7 +907,7 @@ async fn human_vendored_uuid_rerun_prints_already_vendored_skip() {
 }
 
 #[tokio::test]
-async fn vendored_same_uuid_view_refresh_updates_state_list_and_vex() {
+async fn vendored_search_reuse_refreshes_view_metadata_everywhere() {
     const NOTE: &str = "Set `safeMode` to `true`; defaults remain vulnerable.";
     let server = MockServer::start().await;
     let files = serde_json::json!({
@@ -953,12 +966,37 @@ async fn vendored_same_uuid_view_refresh_updates_state_list_and_vex() {
         .respond_with(ResponseTemplate::new(200).set_body_json(view))
         .mount(&server)
         .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/v0/orgs/{ORG}/patches/by-cve/CVE-2024-4247")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "patches": [{
+                "uuid": UUID, "purl": PURL,
+                "publishedAt": "2024-01-01T00:00:00Z",
+                "description": "Search must not govern reuse", "license": "MIT", "tier": "free",
+                "vulnerabilities": {}, "requiresOptIn": false,
+            }],
+            "canAccessPaidPatches": false,
+        })))
+        .mount(&server)
+        .await;
     let (code, stdout, stderr) = run_get_bin(
         tmp.path(),
         &server.uri(),
-        &[UUID, "--mode", "vendored", "--vendor-source", "service"],
+        &[
+            "CVE-2024-4247",
+            "--mode",
+            "vendored",
+            "--vendor-source",
+            "service",
+        ],
     );
     assert_eq!(code, 0, "reused vendor: stdout={stdout}\nstderr={stderr}");
+    assert!(stdout.contains(NOTE), "latest fetched note: {stdout}");
+    assert_eq!(
+        requests_containing(&server, "/patches/view/").await,
+        1,
+        "search-based reuse must fetch the authoritative view"
+    );
     let entry = &vendor_state(tmp.path())["entries"][PURL];
     assert_eq!(entry["record"]["requiresOptIn"], true, "{entry}");
     assert_eq!(entry["record"]["optInNote"], NOTE, "{entry}");
