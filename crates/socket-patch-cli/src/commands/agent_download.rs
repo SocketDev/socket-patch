@@ -24,7 +24,7 @@ use socket_patch_core::vendor::refusals::{
     vendor_refusals, LedgerLoad, RefusalScope, VendorRefusal, VendorRefusals,
 };
 use socket_patch_core::vendor::{load_state, lookup_entry, VendorEntry, VendorState};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -974,7 +974,12 @@ pub(crate) async fn fetch_selected_patches(
 
         // Idempotency (ledger store): a detached entry already at this uuid
         // carries its own record — no view fetch needed.
-        if let Some(record) = detached_ledger_record(store, purl, uuid).cloned() {
+        if let Some(mut record) = detached_ledger_record(store, purl, uuid).cloned() {
+            if let Some(patch) = prefetched.get(uuid) {
+                record.requires_opt_in = patch.requires_opt_in;
+                record.opt_in_note = patch.opt_in_note.clone();
+                batch.metadata_refreshes.push(patch.clone());
+            }
             if !quiet {
                 eprintln!("{}", format_record_skip(purl, "already vendored"));
             }
@@ -1153,6 +1158,7 @@ pub(crate) async fn fetch_selected_patches(
 /// envelope, how many patches failed, and the records the vendor step
 /// consumes.
 pub(crate) struct DetachedDownload {
+    authoritative: HashSet<String>,
     pub(crate) code: i32,
     pub(crate) events: Vec<PatchEvent>,
     pub(crate) warnings: Vec<RunWarning>,
@@ -1168,6 +1174,16 @@ impl DetachedDownload {
         self,
         env: &mut Envelope,
     ) -> (i32, usize, HashMap<String, PatchRecord>) {
+        for (purl, record) in &self.records {
+            if self.authoritative.contains(&record.uuid) {
+                env.register_view_opt_in(
+                    purl,
+                    &record.uuid,
+                    record.requires_opt_in,
+                    record.opt_in_note.as_deref(),
+                );
+            }
+        }
         for event in self.events {
             env.record(event);
         }
@@ -1251,11 +1267,18 @@ pub(crate) async fn download_patch_records_preflighted(
     )
     .await;
 
+    let mut authoritative: HashSet<String> = batch
+        .metadata_refreshes
+        .iter()
+        .map(|patch| patch.uuid.clone())
+        .collect();
     let mut records: HashMap<String, PatchRecord> = batch.reused.into_iter().collect();
     for FetchedPatch { patch, files, .. } in batch.fetched {
+        authoritative.insert(patch.uuid.clone());
         records.insert(patch.purl.clone(), build_patch_record(&patch, files));
     }
     DetachedDownload {
+        authoritative,
         code: i32::from(batch.failed > 0),
         events: batch.events,
         warnings: release_warnings(batch.warnings),
@@ -1722,6 +1745,23 @@ pub async fn download_and_apply_patches_into(
     // matching the per-patch event (`downloaded` / `updated`) and the
     // single-uuid flow's summary in `save_and_apply_patch`; their sum gates
     // the apply step.
+    for fetched in &batch.fetched {
+        env.register_view_opt_in(
+            &fetched.patch.purl,
+            &fetched.patch.uuid,
+            fetched.patch.requires_opt_in,
+            fetched.patch.opt_in_note.as_deref(),
+        );
+    }
+    for patch in &batch.metadata_refreshes {
+        env.register_view_opt_in(
+            &patch.purl,
+            &patch.uuid,
+            patch.requires_opt_in,
+            patch.opt_in_note.as_deref(),
+        );
+    }
+
     let mut metadata_changed = false;
     for patch in &batch.metadata_refreshes {
         if let Some(record) = manifest.patches.get_mut(&patch.purl) {

@@ -216,6 +216,26 @@ impl Envelope {
         if requires_opt_in.is_none() && opt_in_note.is_none() {
             return;
         }
+        self.insert_opt_in(purl, uuid, requires_opt_in, opt_in_note);
+    }
+
+    pub(crate) fn register_view_opt_in(
+        &mut self,
+        purl: &str,
+        uuid: &str,
+        requires_opt_in: Option<bool>,
+        opt_in_note: Option<&str>,
+    ) {
+        self.insert_opt_in(purl, uuid, requires_opt_in, opt_in_note);
+    }
+
+    fn insert_opt_in(
+        &mut self,
+        purl: &str,
+        uuid: &str,
+        requires_opt_in: Option<bool>,
+        opt_in_note: Option<&str>,
+    ) {
         let metadata = OptInMetadata {
             requires_opt_in,
             opt_in_note: opt_in_note.map(str::to_string),
@@ -257,10 +277,14 @@ impl Envelope {
             .filter(serde_json::Value::is_object)
             .unwrap_or_else(|| serde_json::json!({}));
         if let Some(requires_opt_in) = metadata.requires_opt_in {
-            details["requiresOptIn"] = serde_json::json!(requires_opt_in);
+            if details.get("requiresOptIn").is_none() {
+                details["requiresOptIn"] = serde_json::json!(requires_opt_in);
+            }
         }
         if let Some(opt_in_note) = &metadata.opt_in_note {
-            details["optInNote"] = serde_json::json!(opt_in_note);
+            if details.get("optInNote").is_none() {
+                details["optInNote"] = serde_json::json!(opt_in_note);
+            }
         }
         event.details = Some(details);
     }

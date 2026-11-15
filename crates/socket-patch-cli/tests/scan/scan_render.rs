@@ -409,6 +409,37 @@ async fn repeated_agent_scan_prints_opt_in_note_once() {
 }
 
 #[tokio::test]
+async fn agent_scan_json_uses_fetched_view_over_stale_search_metadata() {
+    let mock = MockServer::start().await;
+    mount_batch_free(&mock, &[(MINIMIST, UUID)]).await;
+    mount_by_package_body(
+        &mock,
+        MINIMIST,
+        serde_json::json!({
+            "patches": [{
+                "uuid": UUID, "purl": MINIMIST,
+                "publishedAt": "2024-01-01T00:00:00Z",
+                "description": "Stale search metadata",
+                "license": "MIT", "tier": "free", "vulnerabilities": {},
+                "requiresOptIn": false,
+                "optInNote": "Stale search instruction.",
+            }],
+            "canAccessPaidPatches": false,
+        }),
+    )
+    .await;
+    mount_view_with_opt_in(&mock, MINIMIST, UUID, b"before\n", Some(OPT_IN_NOTE)).await;
+    let tmp = minimist_project(b"before\n");
+
+    let (code, stdout, stderr) = run_scan_agent(tmp.path(), &mock.uri(), &["--json"]);
+    assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
+    assert_opt_in_event(&serde_json::from_str(&stdout).unwrap());
+    let record = &read_manifest(tmp.path())["patches"][MINIMIST];
+    assert_eq!(record["requiresOptIn"], true);
+    assert_eq!(record["optInNote"], OPT_IN_NOTE);
+}
+
+#[tokio::test]
 async fn scan_json_events_carry_opt_in_fields_in_hosted_and_repeated_agent_runs() {
     let hosted_mock = MockServer::start().await;
     mount_opt_in_patch_api(&hosted_mock, b"x\n", OPT_IN_NOTE).await;

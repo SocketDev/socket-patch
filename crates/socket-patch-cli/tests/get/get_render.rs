@@ -440,6 +440,53 @@ async fn opt_in_note_renders_and_persists_in_human_and_json_get() {
 }
 
 #[tokio::test]
+async fn get_json_uses_fetched_view_instead_of_stale_search_opt_in_metadata() {
+    const STALE: &str = "Stale search instruction.";
+    const LATEST: &str = "Latest view instruction.";
+    let server = MockServer::start().await;
+    let cve = "CVE-2024-4246";
+    Mock::given(method("GET"))
+        .and(path(format!("/v0/orgs/{ORG}/patches/by-cve/{cve}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "patches": [{
+                "uuid": UUID, "purl": PURL,
+                "publishedAt": "2024-01-01T00:00:00Z",
+                "description": "View metadata is authoritative",
+                "license": "MIT", "tier": "free", "vulnerabilities": {},
+                "requiresOptIn": false, "optInNote": STALE,
+            }],
+            "canAccessPaidPatches": false,
+        })))
+        .mount(&server)
+        .await;
+    let mut view = view_json(UUID, PURL, good_files());
+    view["requiresOptIn"] = serde_json::json!(true);
+    view["optInNote"] = serde_json::json!(LATEST);
+    Mock::given(method("GET"))
+        .and(path(format!("/v0/orgs/{ORG}/patches/view/{UUID}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(view))
+        .mount(&server)
+        .await;
+    let tmp = tempfile::tempdir().unwrap();
+
+    let (code, stdout, stderr) =
+        run_get_bin(tmp.path(), &server.uri(), &[cve, "--save-only", "--json"]);
+    assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
+    let envelope: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let event = envelope["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|event| event["uuid"] == UUID)
+        .unwrap();
+    assert_eq!(event["details"]["requiresOptIn"], true, "{event}");
+    assert_eq!(event["details"]["optInNote"], LATEST, "{event}");
+    let record = &manifest_json(tmp.path())["patches"][PURL];
+    assert_eq!(record["requiresOptIn"], true);
+    assert_eq!(record["optInNote"], LATEST);
+}
+
+#[tokio::test]
 async fn changed_view_opt_in_note_is_not_suppressed_in_nested_apply() {
     const PREVIEW_NOTE: &str = "Preview configuration instruction.";
     const LATEST_NOTE: &str = "Latest configuration instruction.";
@@ -844,6 +891,104 @@ async fn human_vendored_uuid_rerun_prints_already_vendored_skip() {
         .join(UUID)
         .join(format!("{NAME}-1.0.0.tgz"));
     assert!(artifact.is_file(), "stdout={stdout}\nstderr={stderr}");
+}
+
+#[tokio::test]
+async fn vendored_same_uuid_view_refresh_updates_state_list_and_vex() {
+    const NOTE: &str = "Set `safeMode` to `true`; defaults remain vulnerable.";
+    let server = MockServer::start().await;
+    let files = serde_json::json!({
+        "package/index.js": {
+            "beforeHash": git_hash(BEFORE_BYTES),
+            "afterHash": git_hash(AFTER_BYTES),
+            "blobContent": b64(AFTER_BYTES),
+        }
+    });
+    let mut view = view_json(UUID, PURL, files);
+    view["vulnerabilities"] = serde_json::json!({
+        GHSA: {
+            "cves": ["CVE-2024-4247"],
+            "summary": "Activation metadata refresh",
+            "severity": "high",
+            "description": "d",
+        }
+    });
+    Mock::given(method("GET"))
+        .and(path(format!("/v0/orgs/{ORG}/patches/view/{UUID}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(view.clone()))
+        .mount(&server)
+        .await;
+    crate::prebuilt_common::mount_view(&server, &view, None).await;
+    let tmp = tempfile::tempdir().unwrap();
+    write_project(tmp.path());
+
+    let (code, stdout, stderr) = run_get_bin(
+        tmp.path(),
+        &server.uri(),
+        &[
+            UUID,
+            "--mode",
+            "vendored",
+            "--vendor-source",
+            "service",
+            "--json",
+        ],
+    );
+    assert_eq!(code, 0, "initial vendor: stdout={stdout}\nstderr={stderr}");
+    let entry = &vendor_state(tmp.path())["entries"][PURL];
+    assert!(entry["record"].get("requiresOptIn").is_none());
+    assert!(entry["record"].get("optInNote").is_none());
+    let artifact = tmp
+        .path()
+        .join(".socket/vendor/npm")
+        .join(UUID)
+        .join(format!("{NAME}-1.0.0.tgz"));
+    let artifact_before = std::fs::read(&artifact).unwrap();
+
+    server.reset().await;
+    view["requiresOptIn"] = serde_json::json!(true);
+    view["optInNote"] = serde_json::json!(NOTE);
+    Mock::given(method("GET"))
+        .and(path(format!("/v0/orgs/{ORG}/patches/view/{UUID}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(view))
+        .mount(&server)
+        .await;
+    let (code, stdout, stderr) = run_get_bin(
+        tmp.path(),
+        &server.uri(),
+        &[UUID, "--mode", "vendored", "--vendor-source", "service"],
+    );
+    assert_eq!(code, 0, "reused vendor: stdout={stdout}\nstderr={stderr}");
+    let entry = &vendor_state(tmp.path())["entries"][PURL];
+    assert_eq!(entry["record"]["requiresOptIn"], true, "{entry}");
+    assert_eq!(entry["record"]["optInNote"], NOTE, "{entry}");
+    assert_eq!(std::fs::read(&artifact).unwrap(), artifact_before);
+
+    let (code, stdout, stderr) = crate::common::run_with_env(
+        tmp.path(),
+        &["list", "--offline"],
+        &[("SOCKET_TELEMETRY_DISABLED", "1")],
+    );
+    assert_eq!(code, 0, "list: stdout={stdout}\nstderr={stderr}");
+    assert!(
+        stdout.contains(&format!("Opt-in required: {NOTE}")),
+        "{stdout}"
+    );
+
+    let (code, stdout, stderr) = crate::common::run_with_env(
+        tmp.path(),
+        &["vex", "--no-verify"],
+        &[("SOCKET_TELEMETRY_DISABLED", "1")],
+    );
+    assert_eq!(code, 0, "vex: stdout={stdout}\nstderr={stderr}");
+    let document: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let impact = document["statements"][0]["impact_statement"]
+        .as_str()
+        .unwrap();
+    assert!(
+        impact.contains(&format!("opt-in required: {NOTE}")),
+        "{document}"
+    );
 }
 
 /// Agent-mode `--dry-run` (search path) previews and writes NOTHING: no

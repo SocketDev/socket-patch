@@ -581,6 +581,13 @@ async fn vendor_under_lock(
         )
         .await;
     let has_errors = applied;
+    if let Err(e) = synchronize_embedded_opt_in_metadata(common, &manifest.patches).await {
+        return Err((
+            "vendor_state_write_failed",
+            format!("could not persist the vendor records' activation metadata: {e}"),
+            Some(Box::new(env)),
+        ));
+    }
     migrate_legacy_manifest_records(common, &manifest_path, &manifest.patches, &mut env).await;
     if has_errors {
         env.mark_partial_failure();
@@ -593,6 +600,41 @@ async fn vendor_under_lock(
 /// whose resolved `base_purl` equals it (see [`lookup_entry`]).
 fn ledger_key_for(state: &VendorState, purl: &str) -> Option<String> {
     socket_patch_core::vendor::state::lookup_entry_kv(&state.entries, purl).map(|(k, _)| k.clone())
+}
+
+async fn synchronize_embedded_opt_in_metadata(
+    common: &GlobalArgs,
+    records: &HashMap<String, PatchRecord>,
+) -> std::io::Result<()> {
+    if common.dry_run {
+        return Ok(());
+    }
+    let mut state = load_state(&common.cwd).await?;
+    let mut changed = false;
+    for (purl, record) in records {
+        let Some(key) = ledger_key_for(&state, purl) else {
+            continue;
+        };
+        let entry = state.entries.get_mut(&key).expect("ledger key was present");
+        if entry.uuid != record.uuid {
+            continue;
+        }
+        let Some(existing) = entry.record.as_mut() else {
+            continue;
+        };
+        if existing.requires_opt_in == record.requires_opt_in
+            && existing.opt_in_note == record.opt_in_note
+        {
+            continue;
+        }
+        existing.requires_opt_in = record.requires_opt_in;
+        existing.opt_in_note = record.opt_in_note.clone();
+        changed = true;
+    }
+    if changed {
+        save_state(&common.cwd, &state).await?;
+    }
+    Ok(())
 }
 
 /// Migrate a project vendored by an older, manifest-mode CLI. For the purls
