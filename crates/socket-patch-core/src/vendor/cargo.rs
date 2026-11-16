@@ -1445,18 +1445,32 @@ pub(crate) async fn workspace_root_refusal(
         else {
             continue;
         };
-        let rel = root.strip_prefix(ancestor).ok()?;
-        let listed = |key: &str| {
+        let rel = root
+            .strip_prefix(ancestor)
+            .ok()?
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/");
+        let entries = |key: &str| -> Vec<String> {
             ws.get(key)
                 .and_then(toml_edit::Item::as_array)
-                .is_some_and(|paths| {
-                    paths.iter().filter_map(|v| v.as_str()).any(|p| {
-                        let p = p.trim_start_matches("./").trim_end_matches('/');
-                        !p.is_empty() && rel.starts_with(p)
-                    })
+                .map(|paths| {
+                    paths
+                        .iter()
+                        .filter_map(|v| v.as_str())
+                        .map(str::to_string)
+                        .collect()
                 })
+                .unwrap_or_default()
         };
-        if listed("exclude") && !listed("members") {
+        // The rule the member walk applies from the root, so a directory is
+        // a member from both sides or from neither.
+        if crate::utils::cargo_workspace::is_excluded(
+            &entries("members"),
+            &entries("exclude"),
+            &rel,
+        ) {
             continue;
         }
         return Some(format!(
@@ -5609,6 +5623,53 @@ mod tests {
             NOT_WORKSPACE_ROOT,
         );
         assert!(detail.contains("package.workspace"), "{detail}");
+    }
+
+    /// The upward check reads `members` / `exclude` by cargo's `is_excluded`,
+    /// the rule the member walk applies from the root
+    /// (`cargo_workspace::is_excluded`): a literal member (`.` is the whole
+    /// workspace) keeps a directory `exclude` names, `exclude = ["."]`
+    /// leaves every directory out, and a prefix is whole path segments.
+    #[tokio::test]
+    async fn workspace_root_refusal_reads_exclude_as_the_member_walk_does() {
+        let dir = tempfile::tempdir().unwrap();
+        let outer = dir.path();
+        let member = outer.join("crates/legacy");
+        tokio::fs::create_dir_all(&member).await.unwrap();
+        let text = "[package]\nname = \"legacy\"\nversion = \"0.1.0\"\n";
+        tokio::fs::write(member.join("Cargo.toml"), text)
+            .await
+            .unwrap();
+        let doc = cargo_manifest::parse_manifest(text).unwrap();
+        for (ws, is_member) in [
+            (
+                "members = [\"crates/*\"]\nexclude = [\"crates/legacy\"]\n",
+                false,
+            ),
+            (
+                "members = [\".\", \"crates/*\"]\nexclude = [\"crates/legacy\"]\n",
+                true,
+            ),
+            (
+                "members = [\"crates/legacy\"]\nexclude = [\"crates\"]\n",
+                true,
+            ),
+            ("members = [\"crates/*\"]\nexclude = [\".\"]\n", false),
+            (
+                "members = [\"crates/*\"]\nexclude = [\"./crates/\"]\n",
+                false,
+            ),
+            (
+                "members = [\"crates/*\"]\nexclude = [\"crates/leg\"]\n",
+                true,
+            ),
+        ] {
+            tokio::fs::write(outer.join("Cargo.toml"), format!("[workspace]\n{ws}"))
+                .await
+                .unwrap();
+            let refusal = workspace_root_refusal(&member, &doc, "hint").await;
+            assert_eq!(refusal.is_some(), is_member, "{ws}: {refusal:?}");
+        }
     }
 
     /// Cargo lets a config `[patch]` item replace the manifest item with the
