@@ -3058,6 +3058,192 @@ async fn unwind_after_superseding_rescan(command: &str) {
     );
 }
 
+/// #2090: one gem vendored, then another hosted. The vendored gem's lock
+/// record names no `GEM` section (its spec came out of the only one), and
+/// the hosted gem's patch-registry section sorts ahead of the upstream one.
+/// Unwinding the vendored gem used to put its spec into the hosted gem's
+/// section: a fresh `bundle install` then looked for it on the patch
+/// registry and failed, and the hosted gem could no longer be unwound.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "host capstone: shells out to a real ruby/gem/bundler; \
+            the unpinned `test` job skips it, an e2e job with a pinned toolchain runs it via --ignored"]
+async fn gem_vendored_unwind_beside_a_hosted_gem_restores_the_upstream_section() {
+    for command in ["rollback", "remove"] {
+        vendored_unwind_beside_a_hosted_gem(command).await;
+    }
+}
+
+async fn vendored_unwind_beside_a_hosted_gem(command: &str) {
+    let Some(fx) = redirect_scanned_project(
+        &format!("vendored-beside-hosted-{command}"),
+        Spelling::Gemfile,
+        false,
+        true,
+        None,
+        Driver::ScanVex,
+    )
+    .await
+    else {
+        return;
+    };
+    const VULN_GEN2: &str = "10000000-1a2b-4a1b-8c2d-3e4f5a6b7c8d";
+    const TINY_GEN2: &str = "80000000-1a2b-4a1b-8c2d-3e4f5a6b7c8d";
+    let tiny_purl = format!("pkg:gem/{TRANSITIVE}@1.0.0");
+    let api = fx._server.uri();
+    let upstream = format!("{api}/upstream");
+    let cwd = fx.proj.to_str().expect("utf8 tmp path");
+    let gemfile_path = fx.proj.join(fx.gemfile_name);
+    let lock_path = fx.proj.join(fx.lock_name);
+    let socket = |what: &str, head: &[&str]| {
+        let mut argv = head.to_vec();
+        argv.extend([
+            "--json",
+            "--cwd",
+            cwd,
+            "--api-url",
+            &api,
+            "--org",
+            ORG,
+            "--api-token",
+            "fake",
+            "--patch-server-url",
+            &api,
+        ]);
+        let (code, stdout, stderr) =
+            run_socket_env(&fx.proj, &argv, &[("SOCKET_RUBYGEMS_URL", &upstream)]);
+        assert_eq!(
+            code, 0,
+            "{command}: {what}:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        stdout
+    };
+    let install = |what: &str, dir: &Path, frozen: bool| {
+        let envs: &[(&str, &str)] = if frozen {
+            &[("BUNDLE_FROZEN", "true")]
+        } else {
+            &[]
+        };
+        let out = bundle_env(dir, &["install"], envs);
+        assert!(
+            out.status.success(),
+            "{command}: {what}: bundle install:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    let assert_pristine = |what: &str| {
+        assert_eq!(
+            std::fs::read_to_string(&gemfile_path).unwrap(),
+            String::from_utf8_lossy(&fx.pristine_gemfile),
+            "{command}: {what}: the Gemfile must come back byte for byte"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&lock_path).unwrap(),
+            String::from_utf8_lossy(&fx.pristine_lock),
+            "{command}: {what}: the lock must come back byte for byte"
+        );
+    };
+
+    // Back to the upstream pair: the fixture's own hosted scan is not part
+    // of this scenario.
+    socket("unwind the fixture scan", &["rollback", PURL]);
+    assert_pristine("fixture unwind");
+    install("upstream pair", &fx.proj, false);
+
+    // The first patch generation covers the direct gem only; vendor it.
+    let stage = fx.tmp.path().join("generation-stage");
+    let vuln_gem = build_gem(
+        &stage.join(VULN_GEN2),
+        DEP,
+        DEP_VERSION,
+        "vuln_gem.rb",
+        &patched_lib(),
+        &[TRANSITIVE],
+    );
+    let vuln = || GenerationGem {
+        name: DEP,
+        uuid: VULN_GEN2,
+        deps: vec![format!("{TRANSITIVE}:>= 0")],
+        lib_file: "vuln_gem.rb",
+        orig: orig_lib(),
+        patched: patched_lib(),
+        gem: vuln_gem.clone(),
+    };
+    let tiny_patched = TINY_LIB.replace("tiny-ok", "tiny-patched");
+    let tiny = GenerationGem {
+        name: TRANSITIVE,
+        uuid: TINY_GEN2,
+        deps: vec![],
+        lib_file: "tiny_dep.rb",
+        orig: TINY_LIB.to_string(),
+        gem: build_gem(
+            &stage.join(TINY_GEN2),
+            TRANSITIVE,
+            "1.0.0",
+            "tiny_dep.rb",
+            &tiny_patched,
+            &[],
+        ),
+        patched: tiny_patched,
+    };
+    mount_patch_generation(&fx._server, 2, &[vuln()]).await;
+    socket("vendored scan", &["scan", "--mode", "vendored", "--yes"]);
+    let lock = std::fs::read_to_string(&lock_path).unwrap();
+    assert!(
+        lock.starts_with(&format!(
+            "PATH\n  remote: .socket/vendor/gem/{VULN_GEN2}/{DEP}-{DEP_VERSION}\n"
+        )),
+        "{command}: {DEP} must be vendored:\n{lock}"
+    );
+    install("vendored pair", &fx.proj, false);
+
+    // The next generation also patches the transitive gem. A hosted scan
+    // leaves the vendored gem alone and hosts the other one, whose section
+    // bundler sorts ahead of the upstream one.
+    mount_patch_generation(&fx._server, 1, &[vuln(), tiny]).await;
+    socket("hosted scan", &["scan", "--mode", "hosted", "--yes"]);
+    install("vendored and hosted pair", &fx.proj, false);
+    let lock = std::fs::read_to_string(&lock_path).unwrap();
+    let hosted_remote = format!("{api}/patch-registry/gem/{TOKEN}/{TINY_GEN2}/");
+    let remotes = gem_remotes(&lock);
+    assert_eq!(
+        remotes.first().copied(),
+        Some(hosted_remote.as_str()),
+        "{command}: the hosted section must be the lock's first GEM section:\n{lock}"
+    );
+    assert!(
+        lock.contains(&format!("{VULN_GEN2}/{DEP}-{DEP_VERSION}\n")),
+        "{command}: {DEP} must still be vendored:\n{lock}"
+    );
+
+    if command == "remove" {
+        // Un-vendoring one gem keeps the other hosted, and a cold checkout
+        // of that pair still installs.
+        socket("remove the vendored gem", &["remove", PURL, "--yes"]);
+        let lock = std::fs::read_to_string(&lock_path).unwrap();
+        assert!(
+            lock.contains(&format!(
+                "GEM\n  remote: {hosted_remote}\n  specs:\n    {TRANSITIVE} (1.0.0)\n\n\
+                 GEM\n  remote: {upstream}/\n  specs:\n    {DEP} ({DEP_VERSION})\n"
+            )),
+            "{command}: {DEP} must return to the upstream section:\n{lock}"
+        );
+        let fresh = stage_fresh_checkout(&fx, "one-gem-left-hosted");
+        install("cold checkout with one gem left hosted", &fresh, true);
+        assert_eq!(
+            std::fs::read_to_string(fresh.join(fx.lock_name)).unwrap(),
+            lock,
+            "{command}: the frozen install leaves the lock as is"
+        );
+        socket("remove the hosted gem", &["remove", &tiny_purl, "--yes"]);
+    } else {
+        socket("rollback both gems", &["rollback"]);
+    }
+    assert_pristine("unwind of both gems");
+    let fresh = stage_fresh_checkout(&fx, "unwound");
+    install("cold checkout of the unwound pair", &fresh, true);
+}
+
 /// Bundler's modern `gems.rb`/`gems.locked` spelling, end to end: the
 /// candidate list must read the pair, the rewriter must key its edits to it,
 /// and the real bundler must install the patched gem from the redirected
