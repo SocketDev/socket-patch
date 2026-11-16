@@ -1440,14 +1440,18 @@ fn plan_gemfile_edit(
             // trailing options verbatim.
             let body = original_line.strip_suffix('\r').unwrap_or(&original_line);
             let mut new_line = body.replacen(prev_rel, rel, 1);
-            // A block line that ends at its `path:` is the one releases up
-            // to 5.1 appended: it gains the `require: false` the block is
-            // now written with (#2084). A line with anything after the
-            // `path:` (an option, a comment) was edited by hand and keeps
-            // its bytes, as does a declaration outside the block, which the
-            // Gemfile had before the patch.
-            if in_block && keywords_after_path(rest).is_empty() && !rest.contains('#') {
-                new_line.truncate(new_line.trim_end().len());
+            // A block line that ends at its `path:` value is the one
+            // releases up to 5.1 appended: it gains the `require: false`
+            // the block is now written with (#2084). A line with anything
+            // after that value (an option, a comment, a modifier, a `;`)
+            // was edited by hand and keeps its bytes: text added behind it
+            // could land outside the call's arguments. So does a
+            // declaration outside the block, which the Gemfile had before
+            // the patch.
+            let ends_at_path = rest
+                .strip_suffix(['"', '\''])
+                .is_some_and(|code| code.ends_with(prev_rel));
+            if in_block && ends_at_path && keywords_after_path(rest).is_empty() {
                 new_line.push_str(REQUIRE_FALSE);
             }
             new_line.push_str(cr);
@@ -5885,6 +5889,12 @@ mod tests {
             ", require: false",
             ", group: :web",
             " # pinned",
+            " if ENV[\"CI\"]",
+            " unless ENV[\"CI\"]",
+            " rescue nil",
+            ";",
+            "; gem \"foo\"",
+            " ",
         ] {
             let line = |rel: &str| format!("gem \"rack\", \"3.2.6\", path: \"{rel}\"{tail}");
             let text = format!(
