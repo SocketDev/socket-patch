@@ -337,7 +337,8 @@ pub fn plan_with_selection(
                 warnings.push(degraded(
                     "version_not_selected",
                     format!(
-                        "{rel} resolves {g}:{a} at {version}, not {v}; {root} is not pinned,                          since a pin there would change the version {rel} resolves"
+                        "{rel} resolves {g}:{a} at {version}, not {v}; {root} is not pinned, \
+                         since a pin there would change the version {rel} resolves"
                     ),
                 ));
                 unpinned.insert(root);
@@ -345,7 +346,8 @@ pub fn plan_with_selection(
                 warnings.push(degraded(
                     "selection_undetermined",
                     format!(
-                        "which version of {g}:{a} {rel} resolves cannot be told ({why}); the                          pin of {root} is left as it is"
+                        "which version of {g}:{a} {rel} resolves cannot be told ({why}); the \
+                         pin of {root} is left as it is"
                     ),
                 ));
                 held.insert(root);
@@ -5132,12 +5134,11 @@ mod tests {
             .iter()
             .find(|w| w.detail.starts_with("reason: version_not_selected: "))
             .unwrap();
-        assert!(
-            warning
-                .detail
-                .contains("b/pom.xml resolves org.apache.commons:commons-text at 1.11.0"),
-            "{}",
-            warning.detail
+        assert_eq!(
+            warning.detail,
+            "reason: version_not_selected: b/pom.xml resolves \
+             org.apache.commons:commons-text at 1.11.0, not 1.10.0; pom.xml is not pinned, \
+             since a pin there would change the version b/pom.xml resolves"
         );
         let refusal = left_unwired(&files, &plan).expect("nothing wired");
         assert_eq!(refusal_reason(&refusal), "nothing_wired");
