@@ -662,16 +662,23 @@ hang() {{
   wait
   exit 1
 }}
+# The Ruby this stands in for: 3.4, or 3.3 once the test says so.
+version=3.4.1
+abi=3.4.0
+if [ -e "$state/ruby-3.3" ]; then
+  version=3.3.6
+  abi=3.3.0
+fi
 case "$mode" in
 extensions_dir)
-  printf 'sp_extensions_dir\t%s\n' "$4/extensions/x86_64-linux/3.4.0"
+  printf 'sp_extensions_dir\t%s\n' "$4/extensions/x86_64-linux/$abi"
   runs=''
   if [ -n "$5" ]; then
     runs=yes
     [ -e "$state/other-platform" ] && runs=no
     printf '%s\n' "$5" > "$state/platform-asked"
   fi
-  printf 'sp_ruby\t3.4.1\t3.6.2\tso\tx86_64-linux\t%s\n' "$runs"
+  printf 'sp_ruby\t%s\t3.6.2\tso\tx86_64-linux\t%s\n' "$version" "$runs"
   ;;
 unpack)
   # The "archive" is the tree the test laid in <state>/source.
@@ -689,7 +696,7 @@ missing_deps)
   ;;
 stage_build)
   full=$(basename "$4" .gemspec)
-  ext="$5/extensions/x86_64-linux/3.4.0/$full"
+  ext="$5/extensions/x86_64-linux/$abi/$full"
   [ -e "$state/hang" ] && hang
   if [ -e "$state/fail-stage-build" ]; then
     echo "sp_native.c:7: error: this is not C (in the stage)" >&2
@@ -699,6 +706,7 @@ stage_build)
   # What was "compiled": the staged source, so a test can tell the build
   # came from the patched tree.
   {{ printf 'rebuilt from: '; cat "$5/gems/$full/ext/sp_native/sp_native.c"; }} > "$ext/sp_native/sp_native.so"
+  [ -e "$state/ruby-3.3" ] && printf ' (by Ruby 3.3)' >> "$ext/sp_native/sp_native.so"
   cp "$ext/sp_native/sp_native.so" "$5/gems/$full/lib/sp_native/sp_native.so"
   : > "$ext/gem.build_complete"
   printf 'sp_built\t%s\n' "$ext"
@@ -778,6 +786,11 @@ esac
     fn fail_builds(&self) {
         self.fail_staged_builds();
         std::fs::write(self.state.join("fail-build"), b"").unwrap();
+    }
+
+    /// Stand in for Ruby 3.3 from now on (3.4 until then).
+    fn become_ruby_33(&self) {
+        std::fs::write(self.state.join("ruby-3.3"), b"").unwrap();
     }
 
     /// Make every later build in a stage fail, and none in place.
@@ -2876,4 +2889,216 @@ async fn the_source_gem_is_downloaded_and_checked_against_the_registry_index() {
         );
         assert!(!home.join(".socket-patch-build").exists());
     }
+}
+
+/// `sp_wrap`: a gem whose build leaves its library in the gem's own tree
+/// and loads it from there, as an FFI gem does (argon2's
+/// `ext/argon2_wrap/libargon2_wrap.so`). Its `extconf.rb` compiles the
+/// library itself and writes a Makefile with nothing to do, so RubyGems'
+/// extension dir holds no artifact at all.
+const WRAP_PURL: &str = "pkg:gem/sp_wrap@1.0.0";
+const WRAP_C_KEY: &str = "ext/sp_wrap/wrap.c";
+const WRAP_EXTCONF: &str = r##"require "rbconfig"
+Dir.chdir(__dir__)
+name = RbConfig::CONFIG["host_os"] =~ /darwin/ ? "libsp_wrap.dylib" : "libsp_wrap.so"
+cc = RbConfig::CONFIG["CC"].split
+abort "could not build #{name}" unless system(*cc, "-shared", "-fPIC", "-o", name, "wrap.c")
+File.write("Makefile", "all:\n\ninstall:\n\nclean:\n\n")
+"##;
+const WRAP_LIB: &str = r##"require "fiddle"
+module SpWrap
+  def self.value
+    path = Dir[File.expand_path("../ext/sp_wrap/libsp_wrap.{so,dylib}", __dir__)].first
+    Fiddle::Function.new(Fiddle.dlopen(path)["sp_wrap_value"], [], Fiddle::TYPE_INT).call
+  end
+end
+"##;
+
+fn wrap_c(value: u32) -> String {
+    format!("int sp_wrap_value(void) {{ return {value}; }}\n")
+}
+
+/// A gem that loads its library from its own tree is not left running the
+/// old one: a build staged elsewhere cannot stand in for a library the
+/// installed copy loads from where it was built, so the staged build is
+/// set aside and the gem is rebuilt where it is installed.
+#[test]
+#[ignore = "host capstone: compiles a C extension with the real ruby/gem toolchain; \
+            the unpinned `test` job skips it, the pinned-Ruby e2e leg runs it via --ignored"]
+fn a_gem_that_loads_its_library_from_its_own_tree_is_rebuilt_in_place() {
+    let Some(abi) = toolchain() else {
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let scratch = tmp.path().to_path_buf();
+    let src = scratch.join("sp_wrap");
+    std::fs::create_dir_all(src.join("ext/sp_wrap")).unwrap();
+    std::fs::create_dir_all(src.join("lib")).unwrap();
+    std::fs::write(src.join("ext/sp_wrap/extconf.rb"), WRAP_EXTCONF).unwrap();
+    std::fs::write(src.join(WRAP_C_KEY), wrap_c(1)).unwrap();
+    std::fs::write(src.join("lib/sp_wrap.rb"), WRAP_LIB).unwrap();
+    std::fs::write(
+        src.join("sp_wrap.gemspec"),
+        "Gem::Specification.new do |s|\n  s.name = \"sp_wrap\"\n  s.version = \"1.0.0\"\n  \
+         s.summary = \"t\"\n  s.authors = [\"t\"]\n  \
+         s.files = Dir[\"lib/**/*.rb\", \"ext/**/*.{c,rb}\"]\n  \
+         s.extensions = [\"ext/sp_wrap/extconf.rb\"]\nend\n",
+    )
+    .unwrap();
+    gem(&scratch, &src, &["build", "sp_wrap.gemspec"], &[]);
+    let proj = scratch.join("proj");
+    let home = proj.join("vendor/bundle/ruby").join(&abi);
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(
+        proj.join("Gemfile"),
+        "source \"https://rubygems.org\"\ngem \"sp_wrap\"\n",
+    )
+    .unwrap();
+    gem(
+        &scratch,
+        &scratch,
+        &[
+            "install",
+            "--local",
+            "--no-document",
+            "--install-dir",
+            home.to_str().unwrap(),
+            src.join("sp_wrap-1.0.0.gem").to_str().unwrap(),
+        ],
+        &[],
+    );
+    let gem_dir = home.join("gems/sp_wrap-1.0.0");
+    let value = || {
+        let out = Command::new("ruby")
+            .args(["-W0", "-e", "require 'sp_wrap'; print SpWrap.value"])
+            .env("GEM_PATH", &home)
+            .env_remove("GEM_HOME")
+            .env_remove("RUBYOPT")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "loading sp_wrap failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    assert_eq!(value(), "1");
+    assert!(home.join("cache/sp_wrap-1.0.0.gem").is_file());
+    let (before, after) = (wrap_c(1), wrap_c(2));
+    write_record(
+        &proj.join(".socket"),
+        WRAP_PURL,
+        &[(WRAP_C_KEY, Some(&before), &after)],
+    );
+    let run =
+        |args: &[&str]| common::run_with_env(&proj, args, &[("SOCKET_RUBYGEMS_URL", NO_REGISTRY)]);
+
+    let (code, stdout, stderr) = run(&["apply", "--json", "--offline"]);
+    assert_eq!(code, 0, "apply failed:\n{stdout}\n{stderr}");
+    assert_eq!(
+        value(),
+        "2",
+        "Ruby must load the library built from the patched source:\n{stdout}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(gem_dir.join(WRAP_C_KEY)).unwrap(),
+        after
+    );
+    assert!(gem_dir.join(".socket-patch-native-build.json").is_file());
+    assert!(!home.join(".socket-patch-build").exists());
+    let (code, stdout, stderr) = run(&["apply", "--check"]);
+    assert_eq!(code, 0, "a rebuilt patch checks clean:\n{stdout}\n{stderr}");
+
+    // (Rollback restores the sources and the extension dir. The library in
+    // the gem's own tree is no part of what an in-place rebuild backs up,
+    // here as before the stage existed.)
+    let (code, stdout, stderr) = run(&["rollback", "--json", "--offline"]);
+    assert_eq!(code, 0, "rollback failed:\n{stdout}\n{stderr}");
+    assert_eq!(
+        std::fs::read_to_string(gem_dir.join(WRAP_C_KEY)).unwrap(),
+        before
+    );
+}
+
+/// A precompiled gem ships one binary per Ruby minor, and a graft replaces
+/// the one of the Ruby that ran `apply`. In a gem home that two Rubies
+/// build into, the other Ruby would go on loading the unpatched binary:
+/// the copy is not attested, `apply` says which binary is left, and under
+/// that Ruby it grafts that one too. Then, and only then, `apply --check`
+/// and `vex` attest it. Rollback gives both binaries back.
+#[cfg(unix)]
+#[test]
+fn a_home_of_two_rubies_is_attested_once_both_binaries_are_grafted() {
+    let (_tmp, proj, gem_dir) = fake_precompiled_gem(true);
+    // A second Ruby built a gem into this home.
+    let home = proj.join("vendor/bundle/ruby/3.4.0");
+    let other = home.join("extensions/x86_64-linux/3.3.0/racc-1.8.1");
+    std::fs::create_dir_all(&other).unwrap();
+    std::fs::write(other.join("gem.build_complete"), b"").unwrap();
+    let (before, after) = (c_source(1), c_source(2));
+    write_record(
+        &proj.join(".socket"),
+        PURL,
+        &[(C_KEY, Some(&before), &after)],
+    );
+    let ruby = FakeRuby::new();
+    ruby.serve_source_gem(&c_source(1));
+    let (for_33, for_34) = (
+        gem_dir.join("lib/sp_native/3.3/sp_native.so"),
+        gem_dir.join("lib/sp_native/3.4/sp_native.so"),
+    );
+    let tree_before = walk_files(&proj.join("vendor"));
+    let run = |args: &[&str]| ruby.run(&proj, args, &[]);
+    let built = ["extensions_dir", "unpack", "missing_deps", "stage_build"];
+
+    // Ruby 3.4 applies: its binary is the build, 3.3's is not.
+    let (code, stdout, stderr) = run(&["apply", "--json", "--offline"]);
+    assert_eq!(code, 0, "apply failed:\n{stdout}\n{stderr}");
+    assert_eq!(event_action(&stdout), "applied", "{stdout}");
+    assert_eq!(ruby.calls(), built);
+    assert_eq!(
+        std::fs::read_to_string(&for_34).unwrap(),
+        built_from(&c_source(2))
+    );
+    assert_eq!(std::fs::read_to_string(&for_33).unwrap(), prebuilt("3.3"));
+    assert!(
+        stdout.contains("native_extension_not_rebuilt")
+            && stdout.contains("lib/sp_native/3.3/sp_native.so"),
+        "apply must say which binary is still unpatched: {stdout}"
+    );
+    let (code, stdout, _) = run(&["apply", "--check", "--json"]);
+    assert_ne!(
+        code, 0,
+        "attested while Ruby 3.3 loads the old code: {stdout}"
+    );
+    assert!(stdout.contains("native_extension_not_rebuilt"), "{stdout}");
+    assert!(!vex_attests(run), "vex attested a half-grafted copy");
+    // Again under 3.4: asked which Ruby it is, then nothing left to build.
+    let (code, stdout, stderr) = run(&["apply", "--json", "--offline"]);
+    assert_eq!(code, 0, "{stdout}\n{stderr}");
+    assert!(stdout.contains("native_extension_not_rebuilt"), "{stdout}");
+    assert_eq!(ruby.calls(), [&built[..], &["extensions_dir"]].concat());
+
+    // Ruby 3.3 applies: it grafts its own binary beside the other.
+    ruby.become_ruby_33();
+    let (code, stdout, stderr) = run(&["apply", "--json", "--offline"]);
+    assert_eq!(code, 0, "apply under 3.3 failed:\n{stdout}\n{stderr}");
+    assert!(!stdout.contains("native_extension_not_rebuilt"), "{stdout}");
+    assert_eq!(
+        std::fs::read_to_string(&for_33).unwrap(),
+        format!("{} (by Ruby 3.3)", built_from(&c_source(2)))
+    );
+    assert_eq!(
+        std::fs::read_to_string(&for_34).unwrap(),
+        built_from(&c_source(2)),
+        "the other Ruby's graft is kept"
+    );
+    let (code, stdout, stderr) = run(&["apply", "--check"]);
+    assert_eq!(code, 0, "{stdout}\n{stderr}");
+    assert!(vex_attests(run), "vex attests once every binary is grafted");
+
+    let (code, stdout, stderr) = run(&["rollback", "--json", "--offline"]);
+    assert_eq!(code, 0, "rollback failed:\n{stdout}\n{stderr}");
+    assert_tree(&proj.join("vendor"), &tree_before, "after rollback");
 }
