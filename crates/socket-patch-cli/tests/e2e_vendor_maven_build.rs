@@ -683,6 +683,195 @@ mod mediation {
         std::fs::write(proj.join(".socket/blobs").join(git_sha256(&after)), after).unwrap();
     }
 
+    /// The committed wiring is the record of where a patch is pinned: it
+    /// checks clean and a re-run leaves it alone on any machine, whatever
+    /// that machine's local repository holds. A project whose parent pom
+    /// comes from a repository is vendored on a machine that never
+    /// resolved it (what Maven selects cannot be told there, so the
+    /// declaration is rewritten and no pin is written). On a machine that
+    /// did resolve it, `vendor --check` passes, a second `vendor` changes
+    /// no byte, and Maven builds the patched jar.
+    #[test]
+    #[ignore = "real Maven + Maven Central (dependency plugin); run with --ignored"]
+    fn maven_vendored_wiring_checks_clean_and_stays_put_on_any_machine() {
+        let Some(mvn) = Mvn::detect(SUITE) else {
+            return;
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let root: PathBuf = tmp.path().canonicalize().unwrap();
+        let (warm, cold) = (root.join("m2-warm"), root.join("m2-cold"));
+        let settings = root.join("settings.xml");
+        write_settings(&settings, &[]);
+        let server = Server::start();
+        fixture::publish(&server);
+        let proj = root.join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::write(proj.join("pom.xml"), fixture::parented_pom(&server)).unwrap();
+        let Some(before) = fixture::resolve(SUITE, &mvn, &proj, &warm, &settings, "target/before")
+        else {
+            return;
+        };
+        assert!(before.contains_key(&fixture::victim_jar_name(fixture::BASE)));
+        // The other machine holds the installed victim and nothing else of
+        // this build: not the parent pom its selection hangs on.
+        let installed = fixture::victim_dir(&cold, fixture::BASE);
+        std::fs::create_dir_all(&installed).unwrap();
+        for entry in std::fs::read_dir(fixture::victim_dir(&warm, fixture::BASE)).unwrap() {
+            let entry = entry.unwrap();
+            std::fs::copy(entry.path(), installed.join(entry.file_name())).unwrap();
+        }
+        let vendor = |m2: &Path, args: &[&str]| {
+            let mut all = vec!["vendor"];
+            all.extend_from_slice(args);
+            all.extend_from_slice(&["--json", "--cwd", proj.to_str().unwrap()]);
+            socket(&proj, m2, &all)
+        };
+
+        stage(&proj);
+        let (code, env, stderr) = vendor(&cold, &["--offline"]);
+        assert_eq!(code, Some(0), "vendor on the cold machine: {env}\n{stderr}");
+        assert_eq!(env["summary"]["applied"], 1, "{env}");
+        let sv = suffixed();
+        let pom = std::fs::read_to_string(proj.join("pom.xml")).unwrap();
+        assert!(pom.contains(&format!("<version>{sv}</version>")), "{pom}");
+        assert!(
+            !pom.contains("<!-- socket-patch 7"),
+            "nothing could be told of the build there, so no pin:\n{pom}"
+        );
+        let committed = fixture::snapshot(&proj);
+
+        // The machine that resolved the project sees the same checkout.
+        let (code, env, stderr) = vendor(&warm, &["--check"]);
+        assert_eq!(
+            code,
+            Some(0),
+            "vendor --check on the warm machine: {env}\n{stderr}"
+        );
+        assert_eq!(fixture::snapshot(&proj), committed, "{env}");
+        let (code, env, stderr) = vendor(&warm, &["--offline"]);
+        assert_eq!(code, Some(0), "vendor on the warm machine: {env}\n{stderr}");
+        assert_eq!(env["summary"]["failed"], 0, "{env}");
+        assert_eq!(
+            fixture::snapshot(&proj),
+            committed,
+            "a re-run must not rewrite a committed pom: {env}"
+        );
+        let after = fixture::resolve_warm(&mvn, &proj, &warm, &settings, "target/after", &[]);
+        assert_eq!(
+            fixture::unsuffixed(after.keys()),
+            before.keys().cloned().collect()
+        );
+        assert_eq!(
+            after
+                .get(&fixture::victim_jar_name(&sv))
+                .and_then(|jar| jar_member(jar, fixture::MEMBER)),
+            Some(fixture::patched_member())
+        );
+    }
+
+    /// A pin must not outlive the selection it was written for. A project
+    /// is vendored while Maven selects the base version two levels down;
+    /// then it gains a dependency that brings a newer version in nearer
+    /// the root. The pin would keep forcing the old version, so the next
+    /// run takes it out, says so, and Maven resolves the version it
+    /// selects.
+    #[test]
+    #[ignore = "real Maven + Maven Central (dependency plugin); run with --ignored"]
+    fn maven_vendored_pin_is_removed_when_the_build_selects_another_version() {
+        let Some(mvn) = Mvn::detect(SUITE) else {
+            return;
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let root: PathBuf = tmp.path().canonicalize().unwrap();
+        let m2 = root.join("m2");
+        let settings = root.join("settings.xml");
+        write_settings(&settings, &[]);
+        let server = Server::start();
+        fixture::publish(&server);
+        let proj = root.join("proj");
+        fixture::write_project(&proj, Shape::Selected, &server);
+        if fixture::resolve(SUITE, &mvn, &proj, &m2, &settings, "target/before").is_none() {
+            return;
+        }
+        let vendor = |args: &[&str]| {
+            let mut all = vec!["vendor"];
+            all.extend_from_slice(args);
+            all.extend_from_slice(&["--json", "--cwd", proj.to_str().unwrap()]);
+            socket(&proj, &m2, &all)
+        };
+        stage(&proj);
+        let (code, env, stderr) = vendor(&["--offline"]);
+        assert_eq!(code, Some(0), "vendor: {env}\n{stderr}");
+        assert_eq!(env["summary"]["applied"], 1, "{env}");
+        let sv = suffixed();
+        let pinned = std::fs::read_to_string(proj.join("pom.xml")).unwrap();
+        assert!(
+            pinned.contains(&format!("<version>{sv}</version>")),
+            "{pinned}"
+        );
+
+        // The build moves on: lib-new brings the newer victim in nearer.
+        // (The project's own `<dependencies>`, not the pin's section.)
+        let with_lib_new = |pom: &str| {
+            pom.replace(
+                "\n  <dependencies>\n",
+                &format!(
+                    "\n  <dependencies>\n{}",
+                    fixture::dependency("lib-new", "1.0", "")
+                ),
+            )
+        };
+        let moved = with_lib_new(&pinned);
+        assert_ne!(moved, pinned);
+        std::fs::write(proj.join("pom.xml"), &moved).unwrap();
+        let forced = fixture::resolve_warm(&mvn, &proj, &m2, &settings, "target/forced", &[]);
+        assert!(
+            forced.contains_key(&fixture::victim_jar_name(&sv)),
+            "the stale pin forces the old version: {:?}",
+            forced.keys()
+        );
+
+        let (code, env, stderr) = vendor(&["--offline"]);
+        assert_eq!(code, Some(0), "vendor after the change: {env}\n{stderr}");
+        assert_eq!(env["summary"]["failed"], 0, "{env}");
+        let skip = skip_of(&env).unwrap_or_else(|| panic!("no skip: {env}"));
+        assert_eq!(
+            skip["errorCode"], "vendor_maven_version_not_selected",
+            "{env}"
+        );
+        let reason = skip["reason"].as_str().unwrap_or_default();
+        assert!(
+            reason.contains(&format!("{} {}", fixture::VICTIM, fixture::NEWER))
+                && reason.contains("was removed"),
+            "{reason}"
+        );
+        let unpinned = std::fs::read_to_string(proj.join("pom.xml")).unwrap();
+        assert!(!unpinned.contains(&sv), "the pin is gone:\n{unpinned}");
+        let after = fixture::resolve_warm(&mvn, &proj, &m2, &settings, "target/after", &[]);
+        assert!(
+            after.contains_key(&fixture::victim_jar_name(fixture::NEWER))
+                && !after.keys().any(|name| name.contains("-socket.")),
+            "Maven resolves what it selects: {:?}",
+            after.keys()
+        );
+        // A second run has nothing left to take out, and the revert of the
+        // leftover entry restores the project as the user now has it.
+        let (code, env, stderr) = vendor(&["--offline"]);
+        assert_eq!(code, Some(0), "second run: {env}\n{stderr}");
+        assert_eq!(
+            std::fs::read_to_string(proj.join("pom.xml")).unwrap(),
+            unpinned
+        );
+        let (code, env, stderr) = vendor(&["--revert"]);
+        assert_eq!(code, Some(0), "revert: {env}\n{stderr}");
+        let expected = with_lib_new(&fixture::project_pom(Shape::Selected, &server));
+        assert_eq!(
+            std::fs::read_to_string(proj.join("pom.xml")).unwrap(),
+            expected,
+            "the revert leaves the user's pom, byte for byte: {env}"
+        );
+    }
+
     fn skip_of<'e>(env: &'e serde_json::Value) -> Option<&'e serde_json::Value> {
         env["events"]
             .as_array()

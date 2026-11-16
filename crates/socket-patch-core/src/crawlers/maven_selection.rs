@@ -39,7 +39,9 @@ use std::rc::Rc;
 
 use super::maven_scope::{is_import, normalize, Chain, Node, Walk};
 use crate::formats::maven::version::{MavenVersion, VersionRange};
-use crate::formats::maven::{interpolate_strict, maven_config_properties, split_socket_version};
+use crate::formats::maven::{
+    interpolate_strict, lookup_property, maven_config_properties, split_socket_version, PomLayer,
+};
 use crate::vendor::jvm::maven_reactor::MAVEN_CONFIG;
 
 /// Most distinct nodes one module's graph may hold; a bigger one is left
@@ -127,16 +129,50 @@ impl MavenSelection {
     /// The selection of the project at `project_root` over the Maven local
     /// repository this process resolves against.
     pub fn for_project(project_root: &Path) -> Self {
-        match super::maven_crawler::JvmEnv::from_process().m2_repo {
+        Self::for_project_in(project_root, None)
+    }
+
+    /// [`Self::for_project`] over the local repository `repo` when one is
+    /// given.
+    pub fn for_project_in(project_root: &Path, repo: Option<&Path>) -> Self {
+        let repo = match repo {
+            Some(repo) => Some(repo.to_path_buf()),
+            None => super::maven_crawler::JvmEnv::from_process().m2_repo,
+        };
+        match repo {
             Some(repo) => Self::of(project_root, &repo),
             None => Self::unavailable("no Maven local repository is configured"),
         }
     }
 
     /// The selection of the project at `project_root` over the local
-    /// repository `repo`.
+    /// repository `repo`. One run asks for it once per patch and command
+    /// stage, so the last answer is kept and reused while every file it
+    /// was read from (the project's poms and configuration, each pom
+    /// looked up in the repository, each version list) is as it was: a
+    /// few hundred `stat`s in place of as many parses. What a run writes
+    /// itself (a pin, a rewritten declaration) changes a pom and is read
+    /// again.
     pub fn of(project_root: &Path, repo: &Path) -> Self {
-        select(project_root, repo)
+        static LAST: std::sync::Mutex<Option<Kept>> = std::sync::Mutex::new(None);
+        let key = (project_root.to_path_buf(), repo.to_path_buf());
+        let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(kept) = last.as_ref() {
+            if kept.key == key && kept.sources.iter().all(|(path, was)| stamp(path) == *was) {
+                return kept.selection.clone();
+            }
+        }
+        let (selection, sources) = select(project_root, repo);
+        *last = Some(Kept {
+            key,
+            sources: sources
+                .into_iter()
+                .map(|p| (stamp(&p), p))
+                .map(|(s, p)| (p, s))
+                .collect::<Vec<_>>(),
+            selection: selection.clone(),
+        });
+        selection
     }
 
     /// The poms of the modules that were modelled.
@@ -187,6 +223,25 @@ impl MavenSelection {
                  range, which a pin would freeze"
             )),
         }
+    }
+
+    /// The first module whose selection of `group:artifact` cannot be
+    /// told, and why.
+    pub fn undetermined_in(
+        &self,
+        group: &str,
+        artifact: &str,
+        base: &str,
+    ) -> Option<(String, String)> {
+        if let Some(why) = &self.unavailable {
+            return Some(("pom.xml".to_string(), why.clone()));
+        }
+        self.modules.iter().find_map(|module| {
+            match self.verdict(&module.pom, group, artifact, base) {
+                Verdict::Undetermined(why) => Some((module.pom.clone(), why)),
+                _ => None,
+            }
+        })
     }
 
     /// [`Self::verdict`] over every module.
@@ -256,6 +311,22 @@ impl MavenSelection {
     }
 }
 
+/// The last selection [`MavenSelection::of`] read, and the project files
+/// it was read from as they were.
+struct Kept {
+    key: (PathBuf, PathBuf),
+    sources: Vec<(PathBuf, Stamp)>,
+    selection: MavenSelection,
+}
+
+/// A file's length and modification time (`None`: not there).
+type Stamp = Option<(u64, Option<std::time::SystemTime>)>;
+
+fn stamp(path: &Path) -> Stamp {
+    let meta = std::fs::metadata(path).ok()?;
+    Some((meta.len(), meta.modified().ok()))
+}
+
 /// The one line that says a patch's base version is not part of the
 /// build: which versions Maven selects instead.
 pub fn not_selected_detail(group: &str, artifact: &str, base: &str, others: &[String]) -> String {
@@ -273,13 +344,30 @@ pub fn not_selected_detail(group: &str, artifact: &str, base: &str, others: &[St
     }
 }
 
+/// What every "not cached" cause names: resolving the project fills it.
+const NOT_CACHED: &str = "the local Maven repository";
+
 /// The one line that says the selection of an artifact could not be told,
-/// with its remedy.
+/// with the remedy that can work for `why`. Resolving the project helps
+/// only when a pom or version list is missing from the local repository;
+/// anything else (a profile that may change the graph, Maven 4, a cycle, a
+/// relocation, a range a pin would freeze, an undefined property) stays as
+/// it is however often the project is resolved, and a declaration of the
+/// artifact at the base version, which is patched where it stands, is the
+/// way through.
 pub fn undetermined_detail(group: &str, artifact: &str, base: &str, why: &str) -> String {
+    let declare = format!(
+        "declare {group}:{artifact} {base} in the pom of each module that should take the \
+         patch (a declaration that names the version is patched where it stands)"
+    );
+    let remedy = if why.contains(NOT_CACHED) {
+        format!("resolve the project once (`mvn -q dependency:resolve`) and re-run, or {declare}")
+    } else {
+        format!("resolving the project again will not change that: {declare}")
+    };
     format!(
         "which version of {group}:{artifact} Maven selects cannot be told ({why}), so nothing \
-         was pinned for {base}: resolve the project once (`mvn -q dependency:resolve`) and \
-         re-run, or declare {group}:{artifact} {base} in the pom"
+         was pinned for {base}: {remedy}"
     )
 }
 
@@ -445,11 +533,26 @@ struct Selector<'w> {
     key_ids: HashMap<Key, u32>,
     exclusion_sets: Vec<BTreeSet<Ga>>,
     exclusion_ids: HashMap<BTreeSet<Ga>, u32>,
-    /// The versions each artifact's cached metadata lists.
-    listed: HashMap<Ga, Option<Vec<String>>>,
+    /// The versions each artifact's cached metadata lists for the module
+    /// being read.
+    listed: HashMap<Ga, Result<Option<Vec<String>>, String>>,
+    /// The repositories the module being read resolves from, by id.
+    repositories: BTreeSet<String>,
+    /// The directories whose version lists were read.
+    listings: BTreeSet<PathBuf>,
 }
 
-fn select(cwd: &Path, repo: &Path) -> MavenSelection {
+/// The selection, and the project files it was read from.
+fn select(cwd: &Path, repo: &Path) -> (MavenSelection, Vec<PathBuf>) {
+    let mut sources: Vec<PathBuf> = ["pom.xml", MAVEN_CONFIG, WRAPPER_PROPERTIES]
+        .iter()
+        .map(|rel| cwd.join(rel))
+        .collect();
+    let selection = select_from(cwd, repo, &mut sources);
+    (selection, sources)
+}
+
+fn select_from(cwd: &Path, repo: &Path, sources: &mut Vec<PathBuf>) -> MavenSelection {
     let read = |rel: &str| {
         crate::utils::fs::read_regular_to_bytes_sync(&cwd.join(rel))
             .ok()
@@ -481,11 +584,14 @@ fn select(cwd: &Path, repo: &Path) -> MavenSelection {
         exclusion_sets: Vec::new(),
         exclusion_ids: HashMap::new(),
         listed: HashMap::new(),
+        repositories: BTreeSet::new(),
+        listings: BTreeSet::new(),
     };
     let Some(chains) = selector.walk.reactor_poms() else {
         return MavenSelection::unavailable("the project's pom.xml could not be read");
     };
     for chain in &chains {
+        sources.extend(chain.iter().filter(|n| n.local).map(|n| n.path.clone()));
         if let Some(gav) = selector.own_gav(chain) {
             selector.reactor.entry(gav).or_insert(chain[0].clone());
         }
@@ -510,6 +616,10 @@ fn select(cwd: &Path, repo: &Path) -> MavenSelection {
         }
         modules.push(module);
     }
+    // Every pom looked at (cached or not) and every version list read: the
+    // answer holds for as long as they are what they were.
+    sources.extend(selector.walk.looked_at().cloned());
+    sources.extend(selector.listings.iter().cloned());
     modules.sort_by(|a, b| a.pom.cmp(&b.pom));
     MavenSelection {
         modules,
@@ -539,10 +649,13 @@ impl Selector<'_> {
         id
     }
 
-    /// `${name}` interpolation of `text` as `chain`'s head reads it, or
-    /// why its value cannot be told: a name nothing defines, or one a
-    /// profile on the chain redefines (its value then depends on which
-    /// profiles are active).
+    /// `${name}` interpolation of `text` as `chain`'s head reads it, in
+    /// Maven's order ([`lookup_property`]): a `project.*` reference, the
+    /// command line's properties, the `<properties>` up the chain, then a
+    /// deprecated bare model reference (`${version}`). Or why its value
+    /// cannot be told: a name nothing defines, or one a profile on the
+    /// chain redefines (its value then depends on which profiles are
+    /// active).
     fn interpolate(&self, text: &str, chain: &Chain) -> Result<String, String> {
         if !text.contains("${") {
             return Ok(text.to_string());
@@ -555,12 +668,8 @@ impl Selector<'_> {
             let (g, a, v, _) = own.parent.as_ref()?;
             [g, a, v][i].clone()
         };
-        let moved = std::cell::RefCell::new(None::<String>);
-        let lookup = |name: &str| -> Option<String> {
-            if !self.walk.work.spend() {
-                return None;
-            }
-            let model = match name {
+        let model = |name: &str| -> Option<String> {
+            match name {
                 "project.version" | "pom.version" | "version" => {
                     own.version.clone().or_else(|| parent_field(2))
                 }
@@ -571,20 +680,33 @@ impl Selector<'_> {
                 "project.parent.version" | "parent.version" => parent_field(2),
                 "project.parent.groupId" | "parent.groupId" => parent_field(0),
                 _ => None,
-            };
-            if model.is_some() {
-                return model;
             }
-            if chain.iter().any(|n| n.model.profiles.props.contains(name)) {
+        };
+        let moved = std::cell::RefCell::new(None::<String>);
+        let no_user = BTreeMap::new();
+        let lookup = |name: &str| -> Option<String> {
+            if !self.walk.work.spend() {
+                return None;
+            }
+            let layers = || {
+                chain.iter().map(|n| PomLayer {
+                    own: &n.model.props,
+                    profiles: Vec::new(),
+                })
+            };
+            let prefixed = name.starts_with("project.") || name.starts_with("pom.");
+            if !(prefixed && model(name).is_some())
+                && chain.iter().any(|n| n.model.profiles.props.contains(name))
+            {
                 moved.borrow_mut().get_or_insert(name.to_string());
             }
-            let declared = || chain.iter().find_map(|n| n.model.props.get(name).cloned());
             // The command line's properties win in the project's own poms;
             // a dependency's pom reads them after its own.
             if head.local {
-                self.user.get(name).cloned().or_else(declared)
+                lookup_property(name, &model, &self.user, layers())
             } else {
-                declared().or_else(|| self.user.get(name).cloned())
+                lookup_property(name, &model, &no_user, layers())
+                    .or_else(|| self.user.get(name).cloned())
             }
         };
         let value = interpolate_strict(text, &lookup);
@@ -872,21 +994,37 @@ impl Selector<'_> {
         out
     }
 
-    /// The versions the local repository's metadata lists for `ga`, and
-    /// the reactor's own; `None` when no metadata file is cached.
-    fn listed_versions(&mut self, ga: &Ga) -> Option<Vec<String>> {
+    /// The versions Maven lists for `ga` when it resolves a range in the
+    /// module being read: those of the `maven-metadata-<id>.xml` files the
+    /// local repository caches for the repositories the module's poms
+    /// declare (and Maven's own `central` and `local`), and the reactor's
+    /// own. `Ok(None)` when none is cached; `Err` when a file is cached
+    /// for a repository the module does not declare (another project's,
+    /// or a mirror from the user settings, which are not read): Maven may
+    /// or may not consult it, so the list cannot be told.
+    fn listed_versions(&mut self, ga: &Ga) -> Result<Option<Vec<String>>, String> {
         if let Some(found) = self.listed.get(ga) {
             return found.clone();
         }
         let safe =
             |s: &str| !s.is_empty() && !s.contains(['/', '\\', '$', '{', '}']) && !s.contains("..");
         let mut versions: Option<Vec<String>> = None;
+        let mut foreign: Vec<String> = Vec::new();
         if safe(&ga.0) && safe(&ga.1) {
             let dir = self.walk.repo.join(ga.0.replace('.', "/")).join(&ga.1);
+            self.listings.insert(dir.clone());
             for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
                 let name = entry.file_name();
                 let name = name.to_string_lossy();
-                if !(name.starts_with("maven-metadata") && name.ends_with(".xml")) {
+                let Some(id) = name
+                    .strip_prefix("maven-metadata")
+                    .and_then(|rest| rest.strip_suffix(".xml"))
+                else {
+                    continue;
+                };
+                let id = id.strip_prefix('-').unwrap_or(id);
+                if !self.repositories.contains(id) {
+                    foreign.push(id.to_string());
                     continue;
                 }
                 let Ok(bytes) = crate::utils::fs::read_regular_to_bytes_sync(&entry.path()) else {
@@ -897,18 +1035,29 @@ impl Selector<'_> {
                     .extend(metadata_versions(&String::from_utf8_lossy(&bytes)));
             }
         }
-        if let Some(versions) = versions.as_mut() {
-            versions.extend(
-                self.reactor
-                    .keys()
-                    .filter(|(g, a, _)| *g == ga.0 && *a == ga.1)
-                    .map(|(_, _, v)| v.clone()),
-            );
-            versions.sort_by_key(|v| MavenVersion::parse(v));
-            versions.dedup();
-        }
-        self.listed.insert(ga.clone(), versions.clone());
-        versions
+        let listed = if foreign.is_empty() {
+            if let Some(versions) = versions.as_mut() {
+                versions.extend(
+                    self.reactor
+                        .keys()
+                        .filter(|(g, a, _)| *g == ga.0 && *a == ga.1)
+                        .map(|(_, _, v)| v.clone()),
+                );
+                versions.sort_by_key(|v| MavenVersion::parse(v));
+                versions.dedup();
+            }
+            Ok(versions)
+        } else {
+            foreign.sort();
+            Err(format!(
+                "versions of {}:{} are cached for repositories this build does not declare ({})",
+                ga.0,
+                ga.1,
+                foreign.join(", ")
+            ))
+        };
+        self.listed.insert(ga.clone(), listed.clone());
+        listed
     }
 
     /// The edges a declaration of `key` at `version` makes: one, or one
@@ -946,13 +1095,20 @@ impl Selector<'_> {
             return vec![edge(0, Ver::Known(exact), Some(range))];
         }
         let ga = (key.group.clone(), key.artifact.clone());
-        let Some(listed) = self.listed_versions(&ga) else {
-            let why = format!(
-                "{}:{} is declared as the range {raw} and the local Maven repository lists no \
-                 versions of it",
-                ga.0, ga.1
-            );
-            return vec![edge(0, Ver::Unknown(why), None)];
+        let listed = match self.listed_versions(&ga) {
+            Ok(Some(listed)) => listed,
+            Ok(None) => {
+                let why = format!(
+                    "{}:{} is declared as the range {raw} and the local Maven repository lists \
+                     no versions of it",
+                    ga.0, ga.1
+                );
+                return vec![edge(0, Ver::Unknown(why), None)];
+            }
+            Err(why) => {
+                let why = format!("{why}, so the range {raw} cannot be resolved");
+                return vec![edge(0, Ver::Unknown(why), None)];
+            }
         };
         let range = Rc::new(Range { raw, set });
         let within: Vec<String> = listed
@@ -1067,6 +1223,13 @@ impl Selector<'_> {
 
     /// What Maven selects in the module whose pom heads `chain`.
     fn module(&mut self, pom: String, chain: &Chain) -> Module {
+        // Maven's own repositories, then the ones the module's poms name.
+        self.repositories = ["central", "local"]
+            .into_iter()
+            .map(str::to_string)
+            .chain(chain.iter().flat_map(|n| n.model.repositories.clone()))
+            .collect();
+        self.listed.clear();
         let root = self.management(chain, 0);
         let direct = self.direct(chain, &root);
         let mut module = Module {

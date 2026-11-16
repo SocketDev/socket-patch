@@ -1996,8 +1996,8 @@ command's integration tests check its output.
 | `vendor_unsupported_ecosystem` | `skipped`   | vendor: no vendor backend for this purl's ecosystem (jsr). |
 | `already_vendored`        | `skipped`        | vendor: artifact + wiring already in sync for this patch uuid. |
 | `vendor_gem_version_not_locked` | `skipped` (benign; exit 0) | vendor / scan / get `--mode vendored` (gem): no section of the project's `Gemfile.lock` resolves the gem at this version (typically a gem Ruby ships in the gem home, or another project's copy in a shared gem home, which the crawl of that gem home returns). Decided before any download: the patch is not fetched, the Gemfile and lock stay byte-identical, and nothing is written. Human: `[skip] <purl> (vendor_gem_version_not_locked): …` in the download phase of `scan` / `get` (both identifier paths) and in their dry run, `Skipping <purl>: …` in `vendor`. The vendored twin of `redirect_gem_version_not_locked`. |
-| `vendor_maven_version_not_selected` | `skipped` (benign; exit 0) | vendor / scan / get `--mode vendored` (Maven): no module of the build resolves the artifact at the patch's base version; the reason names the versions Maven selects instead (a nearer declaration, the project's own declaration or management, an `<exclusion>`, a version range), or says that no module resolves the artifact. Decided before any download: the patch is not fetched and no file is written. Human: `[skip] <purl> (vendor_maven_version_not_selected): …` in the download phase of `scan` / `get` and in their dry run, `Skipping <purl>: …` in `vendor`. The vendored twin of `redirect_maven_version_not_selected`. See [Maven version selection](#maven-version-selection-hosted-and-vendored-maven). |
-| `vendor_maven_selection_undetermined` | `skipped` (benign; exit 0) | vendor / scan / get `--mode vendored` (Maven): what the build selects for the artifact cannot be read (the reason says why: typically a pom the local repository does not hold, because the project was never resolved) and no declaration names the patch's base version, so nothing is pinned on a guess and no file is written. The reason carries the remedy: resolve the project once (`mvn -q dependency:resolve`) and re-run, or declare the artifact at the base version. The vendored twin of `redirect_maven_selection_undetermined`. |
+| `vendor_maven_version_not_selected` | `skipped` (benign; exit 0) | vendor / scan / get `--mode vendored` (Maven): no module of the build resolves the artifact at the patch's base version; the reason names the versions Maven selects instead (a nearer declaration, the project's own declaration or management, an `<exclusion>`, a version range), or says that no module resolves the artifact. Decided before any download: the patch is not fetched and no file is written, except that a pin an earlier run wrote for that version is taken out of the poms (the reason says so), since it would keep forcing a version the build no longer selects. Human: `[skip] <purl> (vendor_maven_version_not_selected): …` in the download phase of `scan` / `get` and in their dry run, `Skipping <purl>: …` in `vendor`. The vendored twin of `redirect_maven_version_not_selected`. See [Maven version selection](#maven-version-selection-hosted-and-vendored-maven). |
+| `vendor_maven_selection_undetermined` | `skipped` (benign; exit 0) | vendor / scan / get `--mode vendored` (Maven): what the build selects for the artifact cannot be read (the reason says why: typically a pom the local repository does not hold, because the project was never resolved) and no declaration names the patch's base version, so nothing is pinned on a guess and no file is written. The reason carries the remedy that fits its cause (resolve the project once and re-run when a pom is missing from the local repository; otherwise declare the artifact at the base version). The vendored twin of `redirect_maven_selection_undetermined`. |
 | `vendor_prebuilt_pending` / `vendor_prebuilt_unavailable` | `skipped` | vendor / scan / get `--mode vendored` (every ecosystem, #954, #1235): the package is already vendored at another patch uuid, and the patch service has no prebuilt artifact for the selected (superseding) uuid — still building (`pending_build`) / not served (`build_failed`, `not_found`, `withdrawn`, no usable artifact). Nothing is touched: the older patch's artifact, wiring and ledger entry stay in force, the detail names both uuids (`kept the vendored patch <old>: prebuilt <artifact> is still building for patch <new>`, where `<artifact>` is the backend's artifact kind: `artifact` for the npm family, `.gem`, `crate`, `module zip`, `dist zip`, `wheel`, `.jar`, `.nupkg`, …), and the run does not fail (exit 0), the way hosted mode keeps its pin and lists the upgrade in `redirect.skipped[]`. A re-run picks the new patch up once the service serves it. A package with no vendored patch to keep still fails (`failed`, error `prebuilt <artifact> is still building` / `prebuilt <artifact> unavailable: <status>`; outside the npm family under `vendor_prebuilt_required`), as does a request/transport failure. |
 | `unsafe_coordinates`      | `failed`         | vendor: purl/uuid would escape `.socket/vendor/` (tampered manifest/state); refused before any write. |
 | `revert_failed`           | `failed`         | vendor --revert: a recorded entry could not be reverted. |
@@ -2723,8 +2723,10 @@ module's own and inherited `<dependencies>`, then each artifact's `compile` /
 `runtime`, non-optional dependencies, less what an `<exclusion>` removes; a
 declared version, else the managed one (parent chain, then imported BOMs), the
 module's management overriding every transitive version; a version range as
-the highest version in it that the cached `maven-metadata-*.xml` lists; and
-mediation: the nearest declaration wins, the first declared on a tie, and what
+the highest version in it that the cached `maven-metadata-<id>.xml` files list
+for the repositories the module's poms declare (and Maven's own `central` and
+`local`; a list cached for any other repository id, such as another project's
+or a settings mirror's, leaves the range undetermined); and mediation: the nearest declaration wins, the first declared on a tie, and what
 a losing version depends on leaves the graph. A `<base>-socket.<hex8>` version
 an earlier run wrote reads as its base version, and a pin vendoring wrote is
 not read as the project's management.
@@ -2750,8 +2752,28 @@ inherits it resolves the artifact at the base version or not at all. A module
 that resolves another version leaves the root unpinned (`vendor_jvm_degraded`,
 `reason: version_not_selected`, naming the module and its version); a patch
 that then reaches no pom is refused as `nothing_wired` with that reason.
-`vendor --check` accepts the pins a run with the local repository's current
-answer writes and the pins a run with no such answer writes.
+
+Where the pins go is decided when a patch is first wired, and the committed
+poms are the record of it. A later run over poms that already wire the patch (a
+pin of its version, or a declaration at its `-socket.<hex8>` version) keeps
+every pin where it is and adds none, whatever the local repository of that
+machine holds: the same checkout plans the same on every machine, and a re-run
+is a no-op. `vendor --check` does not judge where a pin belongs at all; it
+takes every pin, and every absence of one, as committed. Two things still
+change a wired pom. A pin of a superseded patch of the same version moves to
+the new suffix where it stands. And a pin that is certain to move a module to
+another version than Maven selects for it is taken out: when no module selects
+the pinned version any more (a dependency was added or upgraded since), the run
+removes the pin from the poms, reports the `vendor_maven_version_not_selected`
+skip saying so, and leaves the ledger entry and tree for `vendor --revert` or
+`scan --mode vendored --prune`.
+
+The undetermined line names the remedy that fits its cause: resolving the
+project (`mvn -q dependency:resolve`) when a pom or version list is missing
+from the local repository; otherwise (a profile that changes the graph, Maven
+4, a cycle, a relocation, a range a pin would freeze, an undefined property)
+a declaration of the artifact at the base version in the module that should
+take the patch.
 
 The not-selected line reads `Maven selects <g>:<a> <version> in this build,
 not <base>, so the patch for <base> has nothing to patch here` (or `no module

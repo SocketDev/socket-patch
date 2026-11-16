@@ -665,7 +665,7 @@ fn the_lines_name_what_maven_selects() {
          has nothing to patch here"
     );
     assert!(not_selected_detail(G, A, "2.7.9.2", &[]).starts_with("no module of this build"));
-    assert!(undetermined_detail(G, A, "2.7.9.2", "why").contains("mvn -q dependency:resolve"));
+    assert!(undetermined_detail(G, A, "2.7.9.2", "why").contains("cannot be told (why)"));
 }
 
 #[test]
@@ -785,4 +785,127 @@ fn a_dependency_declared_twice_reads_as_its_last_declaration() {
     cache(&f.repo, "corp-parent", "3", &deps(&[x(A, "2.9.10")]));
     f.cache(A, "2.7.9.2", &[]);
     assert_eq!(f.verdict("2.7.9.2"), Verdict::Selected);
+}
+
+/// Maven resolves a range against the repositories the build declares.
+/// A version list cached for any other repository (another project's, or
+/// a mirror from the user settings) may or may not count, so the range is
+/// not resolved on it.
+#[test]
+fn a_version_list_of_a_repository_the_build_does_not_declare_resolves_no_range() {
+    let corp = |f: &Fixture| {
+        write(
+            &f.repo,
+            "org/x/victim/maven-metadata-corp.xml",
+            "<metadata><versioning><versions><version>2.9.9</version></versions></versioning>\
+             </metadata>",
+        );
+    };
+    let f = Fixture::new();
+    f.app(&deps(&[x("lib-r", "1.0")]))
+        .cache("lib-r", "1.0", &[x(A, "[2.9.0,2.9.10]")])
+        .cache(A, "2.9.10", &[]);
+    list(&f.repo, A, &["2.9.0", "2.9.10"]);
+    assert_eq!(f.verdict("2.7.9.2"), other("2.9.10"));
+    corp(&f);
+    let why = f.verdict("2.7.9.2");
+    assert!(undetermined(&why).contains("(corp)"), "{why:?}");
+
+    // The build declares that repository: its list counts.
+    let f = Fixture::new();
+    f.app(&format!(
+        "<repositories><repository><id>corp</id><url>https://corp.example/repo</url>\
+         </repository></repositories>{}",
+        deps(&[x("lib-r", "1.0")])
+    ))
+    .cache("lib-r", "1.0", &[x(A, "[2.9.0,2.9.10]")])
+    .cache(A, "2.9.9", &[])
+    .cache(A, "2.9.10", &[]);
+    list(&f.repo, A, &["2.9.0", "2.9.10"]);
+    corp(&f);
+    assert_eq!(f.verdict("2.7.9.2"), other("2.9.10"));
+}
+
+/// Resolving the project helps only when something is missing from the
+/// local repository; for every other cause the line names the remedy that
+/// can work, a declaration of the artifact at the base version.
+#[test]
+fn the_remedy_fits_the_cause() {
+    let resolve = "mvn -q dependency:resolve";
+    let declare = "declare org.x:victim 2.7.9.2 in the pom";
+    // A pom the local repository lacks.
+    let f = Fixture::new();
+    f.app(&deps(&[x("never-resolved", "1.0")]));
+    let line = undetermined_detail(G, A, "2.7.9.2", undetermined(&f.verdict("2.7.9.2")));
+    assert!(line.contains(resolve) && line.contains(declare), "{line}");
+    // A range no cached list resolves.
+    let f = Fixture::new();
+    f.app(&deps(&[x(A, "[2.0,3.0)")]));
+    let line = undetermined_detail(G, A, "2.7.9.2", undetermined(&f.verdict("2.7.9.2")));
+    assert!(line.contains(resolve), "{line}");
+
+    // A profile that declares dependencies: no resolve changes that.
+    let f = Fixture::new();
+    f.app(&format!(
+        "{}<profiles><profile><id>p</id>{}</profile></profiles>",
+        deps(&[x("lib-a", "1.0")]),
+        deps(&[x("lib-x", "1.0")])
+    ))
+    .cache("lib-a", "1.0", &[x(A, "2.7.9.2")])
+    .cache(A, "2.7.9.2", &[]);
+    let line = undetermined_detail(G, A, "2.7.9.2", undetermined(&f.verdict("2.7.9.2")));
+    assert!(!line.contains(resolve) && line.contains(declare), "{line}");
+    for why in [
+        "the project builds with Maven 4, whose dependency management is not modelled",
+        "org.x:victim is part of a dependency cycle",
+        "a profile redefines ${v}",
+        "pom.xml selects org.x:victim 2.7.9.2 as the highest version of a version range, which \
+         a pin would freeze",
+        "versions of org.x:victim are cached for repositories this build does not declare (corp)",
+        "${nowhere} is not defined",
+    ] {
+        let line = undetermined_detail(G, A, "2.7.9.2", why);
+        assert!(!line.contains(resolve) && line.contains(declare), "{line}");
+    }
+}
+
+/// `${version}` is a property of that name before it is the project's own
+/// version (Maven reads the bare model references last).
+#[test]
+fn a_bare_model_reference_reads_a_property_of_that_name_first() {
+    let f = Fixture::new();
+    f.app(&format!(
+        "<properties><version>2.9.10</version></properties>{}",
+        deps(&[x(A, "${version}")])
+    ))
+    .cache(A, "2.9.10", &[])
+    .cache(A, "1", &[]);
+    assert_eq!(f.verdict("2.9.10"), Verdict::Selected);
+
+    let f = Fixture::new();
+    f.app(&deps(&[
+        x(A, "${version}"),
+        x("lib-a", "${project.version}"),
+    ]))
+    .cache(A, "1", &[])
+    .cache("lib-a", "1", &[]);
+    let selection = f.select();
+    assert_eq!(selection.verdict("pom.xml", G, A, "1"), Verdict::Selected);
+    assert_eq!(
+        selection.verdict("pom.xml", G, "lib-a", "1"),
+        Verdict::Selected
+    );
+}
+
+/// One run asks for the selection once per patch: the answer is kept
+/// while the project's files are as they were, and read again once one of
+/// them changes.
+#[test]
+fn the_selection_is_read_again_when_a_project_file_changes() {
+    let f = Fixture::new();
+    f.app(&deps(&[x(A, "2.7.9.2")])).cache(A, "2.7.9.2", &[]);
+    assert_eq!(f.verdict("2.7.9.2"), Verdict::Selected);
+    assert_eq!(f.verdict("2.7.9.2"), Verdict::Selected);
+    f.app(&deps(&[x(A, "2.9.10"), x("pad", "1")]));
+    assert_eq!(f.verdict("2.7.9.2"), other("2.9.10"));
 }

@@ -2711,8 +2711,11 @@ async fn rewrite_once(
     } else {
         CratesIoSource::Registry
     };
+    // Asked only for a pom the rewriter will edit: it refuses a reactor
+    // root whole, whatever Maven selects there.
     let maven_selection = (rewrite_overrides.iter().any(|o| o.ecosystem == "maven")
-        && files.contains_key("pom.xml"))
+        && files.contains_key("pom.xml")
+        && !crate::patch::redirect::maven_reactor_root(&files))
     .then(|| (options.maven_selection)())
     .flatten();
     let (files, mut rewrite) = if options.blocking {

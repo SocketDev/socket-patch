@@ -121,7 +121,8 @@ impl Shape {
     }
 }
 
-fn dependency(artifact: &str, version: &str, extra: &str) -> String {
+/// One `<dependency>` on a fixture artifact, as the project poms write it.
+pub fn dependency(artifact: &str, version: &str, extra: &str) -> String {
     format!(
         "    <dependency>\n      <groupId>{GROUP}</groupId>\n      \
          <artifactId>{artifact}</artifactId>\n      <version>{version}</version>{extra}\n    \
@@ -226,6 +227,17 @@ pub fn publish(server: &Server) {
             &jar(&pristine_member(artifact, version)),
         );
     }
+    // A parent pom a project inherits from the repository.
+    serve(
+        server,
+        &format!("{GROUP_PATH}/{PARENT}/1.0/{PARENT}-1.0.pom"),
+        fixture_pom(PARENT, "1.0", &[])
+            .replace(
+                "<version>1.0</version>\n",
+                "<version>1.0</version>\n  <packaging>pom</packaging>\n",
+            )
+            .as_bytes(),
+    );
     let versions: String = [OLDER, BASE, NEWER]
         .iter()
         .map(|v| format!("      <version>{v}</version>\n"))
@@ -256,6 +268,27 @@ pub fn project_pom(shape: Shape, server: &Server) -> String {
         server.uri(),
         shape.dependencies()
     )
+}
+
+/// A parent pom the fixture repository serves.
+pub const PARENT: &str = "lib-parent";
+
+/// The `pom.xml` of a project that inherits [`PARENT`] from the repository
+/// and declares the base victim itself.
+pub fn parented_pom(server: &Server) -> String {
+    project_pom(Shape::Selected, server)
+        .replace(
+            "  <groupId>com.example</groupId>\n",
+            &format!(
+                "  <parent>\n    <groupId>{GROUP}</groupId>\n    \
+                 <artifactId>{PARENT}</artifactId>\n    <version>1.0</version>\n    \
+                 <relativePath/>\n  </parent>\n  <groupId>com.example</groupId>\n"
+            ),
+        )
+        .replace(
+            &dependency("lib-deep", "1.0", ""),
+            &dependency(VICTIM, BASE, ""),
+        )
 }
 
 /// Write the project of `shape` into `dir`.
