@@ -1450,7 +1450,17 @@ async fn recover_interrupted_rebuild(copy: &GemCopy) -> std::io::Result<bool> {
 /// Why an unfinished rebuild of `copy` could not be put right, as the
 /// reason of a refusal.
 fn recovery_refusal(copy: &GemCopy, error: &std::io::Error) -> String {
-    if error.kind() == std::io::ErrorKind::WouldBlock {
+    let unlockable = error
+        .get_ref()
+        .is_some_and(|inner| inner.to_string() == UNLOCKED_STAGE_IN_USE);
+    if unlockable {
+        format!(
+            "a rebuild of this gem's extension is running right now, or one was interrupted \
+             less than {} minutes ago (a directory cannot be locked here, so the two cannot \
+             be told apart); run again when it has finished, or after that time",
+            UNLOCKED_STAGE_AGE.as_secs() / 60
+        )
+    } else if error.kind() == std::io::ErrorKind::WouldBlock {
         "another socket-patch run is rebuilding this gem's extension right now; run again \
          when it has finished"
             .to_string()
@@ -2239,21 +2249,89 @@ fn stage_root(copy: &GemCopy) -> PathBuf {
     copy.home.join(BUILD_STAGE_DIR).join(&copy.full_name)
 }
 
+/// The stage dirs of `copy`, `<home>/.socket-patch-build` and the
+/// `<full_name>` dir inside it, when each is a real directory or not there
+/// at all. The gem tree can come from the repository being scanned, and a
+/// stage is created, emptied and deleted by path: a link (or a file)
+/// planted at either name would steer those writes and deletes into
+/// whatever it points at. `Err` names the entry that is in the way. Every
+/// use of the stage goes through here.
+fn stage_dirs(copy: &GemCopy) -> Result<(PathBuf, PathBuf), PathBuf> {
+    let parent = copy.home.join(BUILD_STAGE_DIR);
+    let root = stage_root(copy);
+    for dir in [&parent, &root] {
+        if std::fs::symlink_metadata(dir).is_ok_and(|meta| !meta.is_dir()) {
+            return Err(dir.clone());
+        }
+    }
+    Ok((parent, root))
+}
+
+/// The file a staged rebuild rewrites before each of its steps, in the
+/// stage dir: where a directory cannot be locked, its age is what tells a
+/// stage a run is still building in from one a dead run left.
+const STAGE_HEARTBEAT: &str = "alive";
+
+/// How long after its last heartbeat a stage that cannot be locked is
+/// taken for dead: no step of a staged rebuild outlives [`BUILD_TIMEOUT`].
+const UNLOCKED_STAGE_AGE: Duration = Duration::from_secs(BUILD_TIMEOUT.as_secs() + 5 * 60);
+
+/// The error of a stage that cannot be locked and is too young to be told
+/// from a live one ([`recovery_refusal`] words it).
+const UNLOCKED_STAGE_IN_USE: &str = "a staged rebuild may still be running";
+
+/// Whether the stage at `root`, which no lock vouches for, was last used
+/// longer ago than any live step lasts.
+fn unlocked_stage_is_dead(root: &Path) -> bool {
+    let modified = |path: &Path| std::fs::symlink_metadata(path).and_then(|m| m.modified());
+    let newest = [modified(&root.join(STAGE_HEARTBEAT)), modified(root)]
+        .into_iter()
+        .flatten()
+        .max();
+    match newest.map(|at| at.elapsed()) {
+        // A clock that ran backwards says nothing: not provably dead.
+        Some(Ok(age)) => age > UNLOCKED_STAGE_AGE,
+        _ => false,
+    }
+}
+
 /// Drop the stage a rebuild of `copy` left behind when its process was
 /// interrupted or killed. Nothing of the installed copy is in a stage, so
 /// one that is left is only disk space. `Err` of kind `WouldBlock`: a run
-/// that is still alive holds it ([`lock_build_dir`]).
+/// that is still alive holds it ([`lock_build_dir`]); or, where a
+/// directory cannot be locked, it is not old enough to be provably dead
+/// ([`unlocked_stage_is_dead`]). A link planted where the stage goes is
+/// left alone, with whatever it points at ([`stage_dirs`]).
 fn sweep_stale_stage(copy: &GemCopy) -> std::io::Result<()> {
-    let root = stage_root(copy);
+    sweep_stale_stage_with(copy, lock_build_dir)
+}
+
+/// [`sweep_stale_stage`], with the way a stage dir is locked.
+fn sweep_stale_stage_with(
+    copy: &GemCopy,
+    lock: impl Fn(&Path) -> std::io::Result<Option<std::fs::File>>,
+) -> std::io::Result<()> {
+    let Ok((parent, root)) = stage_dirs(copy) else {
+        return Ok(());
+    };
     if is_real_dir(&root) {
-        match lock_build_dir(&root) {
-            Ok(_lock) => crate::patch::copy_tree::force_remove_dir_all(&root)?,
+        match lock(&root) {
+            Ok(Some(_lock)) => crate::patch::copy_tree::force_remove_dir_all(&root)?,
+            Ok(None) if unlocked_stage_is_dead(&root) => {
+                crate::patch::copy_tree::force_remove_dir_all(&root)?
+            }
+            Ok(None) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    UNLOCKED_STAGE_IN_USE,
+                ))
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(e),
         }
     }
     // Gone with its last stage; a dir that still holds one stays.
-    let _ = std::fs::remove_dir(copy.home.join(BUILD_STAGE_DIR));
+    let _ = std::fs::remove_dir(parent);
     Ok(())
 }
 
@@ -2267,21 +2345,25 @@ struct Stage {
     _lock: Option<std::fs::File>,
 }
 
+impl Stage {
+    /// Say the stage is in use, before a step that may take a while
+    /// ([`STAGE_HEARTBEAT`]). Best effort.
+    fn beat(&self) {
+        let _ = std::fs::write(self.root.join(STAGE_HEARTBEAT), b"");
+    }
+}
+
 /// Open an empty stage for `copy` inside its gem home. `Err` says why the
 /// build cannot be staged there.
 fn open_stage(copy: &GemCopy) -> Result<Stage, String> {
-    let parent = copy.home.join(BUILD_STAGE_DIR);
-    let root = stage_root(copy);
     // The stage is emptied and written under the gem home. A link planted
     // where it goes would move both somewhere else.
-    for dir in [&parent, &root] {
-        if std::fs::symlink_metadata(dir).is_ok_and(|meta| !meta.is_dir()) {
-            return Err(format!(
-                "its stage directory {} is not a directory",
-                dir.display()
-            ));
-        }
-    }
+    let (parent, root) = stage_dirs(copy).map_err(|planted| {
+        format!(
+            "its stage directory {} is not a directory",
+            planted.display()
+        )
+    })?;
     let failed = |e: std::io::Error| {
         if e.kind() == std::io::ErrorKind::WouldBlock {
             recovery_refusal(copy, &e)
@@ -2293,20 +2375,27 @@ fn open_stage(copy: &GemCopy) -> Result<Stage, String> {
     let home = root.join("home");
     std::fs::create_dir_all(&home).map_err(failed)?;
     let lock = lock_build_dir(&root).map_err(failed)?;
-    Ok(Stage {
+    let stage = Stage {
         root,
         home,
         _lock: lock,
-    })
+    };
+    stage.beat();
+    Ok(stage)
 }
 
 /// Remove `stage`, and the stage dir of the gem home when that left it
 /// empty. Best effort: a stage that stays is swept by the next run.
 async fn close_stage(stage: Stage, copy: &GemCopy) {
-    let parent = copy.home.join(BUILD_STAGE_DIR);
+    let copy = copy.clone();
     crate::utils::fs::run_blocking(move || {
-        let _ = crate::patch::copy_tree::force_remove_dir_all(&stage.root);
-        let _ = std::fs::remove_dir(parent);
+        // By the same guarded names it was opened under.
+        if let Ok((parent, root)) = stage_dirs(&copy) {
+            if root == stage.root {
+                let _ = crate::patch::copy_tree::force_remove_dir_all(&root);
+            }
+            let _ = std::fs::remove_dir(parent);
+        }
     })
     .await;
 }
@@ -2379,6 +2468,7 @@ async fn unpack_in_stage(
         stage_home: &stage.home,
         full_name: &full_name,
     };
+    stage.beat();
     let stdout = run_ruby(&probe.ruby, run, copy, env, UNPACK_TIMEOUT).await?;
     let unpacked = tagged_lines(&stdout, "sp_unpacked")
         .into_iter()
@@ -2501,6 +2591,7 @@ async fn stage_dependencies(
             spec: &staged.spec_path,
             stage_home: &stage.home,
         };
+        stage.beat();
         let stdout = run_ruby(&probe.ruby, run, copy, env, PROBE_TIMEOUT).await?;
         if !stdout
             .lines()
@@ -2529,6 +2620,7 @@ async fn stage_dependencies(
             if staged_names.contains(&name) || staged_names.len() >= MAX_STAGED_DEPENDENCIES {
                 return Err(format!("{needed} and could not be staged for the build"));
             }
+            stage.beat();
             let (id, bytes) = gems
                 .dependency(&name, &requirement, &versions)
                 .await
@@ -2544,6 +2636,7 @@ async fn stage_dependencies(
                 archive: &archive,
                 stage_home: &stage.home,
             };
+            stage.beat();
             let stdout = run_ruby(&probe.ruby, run, copy, env, BUILD_TIMEOUT)
                 .await
                 .map_err(|why| format!("{needed} and did not install into the stage:\n{why}"))?;
@@ -2574,6 +2667,7 @@ async fn build_staged(
         spec: &staged.spec_path,
         stage_home: &stage.home,
     };
+    stage.beat();
     let stdout = run_ruby(&probe.ruby, run, copy, env, BUILD_TIMEOUT)
         .await
         .map_err(StageFailure::Build)?;
@@ -5684,5 +5778,104 @@ mod tests {
         .unwrap();
         let telling = discriminating_files(&java_dir, "pkg:gem/a@1", &record).await;
         assert_eq!(keys(&telling), keys(&record));
+    }
+
+    /// A gem tree can come from the repository being scanned, so nothing in
+    /// it may steer a delete: a link planted where the stage dir goes (to
+    /// the home's own `gems/`, or to a dir outside it) is neither swept
+    /// through nor staged into. The dir named `<gem>-<version>` behind the
+    /// link stays.
+    #[cfg(unix)]
+    #[test]
+    fn a_planted_stage_link_steers_no_delete() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(outside.join("a-1")).unwrap();
+        std::fs::write(outside.join("a-1/keep"), b"x").unwrap();
+        for (case, target) in [
+            ("the home's gems dir", PathBuf::from("gems")),
+            ("a dir outside the home", outside.clone()),
+        ] {
+            let home = tmp.path().join(case.replace([' ', '\''], "_"));
+            let copy = installed_gem(&home, "lib");
+            std::fs::write(copy.gem_dir.join("lib/a.rb"), b"x").unwrap();
+            std::os::unix::fs::symlink(&target, home.join(BUILD_STAGE_DIR)).unwrap();
+
+            // The start of every native apply, gem rollback and refresh.
+            assert!(
+                !recover_interrupted_rebuild_sync(&copy, Some("lib")).unwrap(),
+                "{case}"
+            );
+            sweep_stale_stage(&copy).unwrap();
+            assert!(
+                copy.gem_dir.join("lib/a.rb").is_file(),
+                "{case}: the gem was deleted"
+            );
+            assert!(outside.join("a-1/keep").is_file(), "{case}");
+            assert!(
+                is_symlink(&home.join(BUILD_STAGE_DIR)),
+                "{case}: the link is left"
+            );
+            let why = open_stage(&copy).err().unwrap();
+            assert!(why.contains("is not a directory"), "{case}: {why}");
+            assert!(copy.gem_dir.join("lib/a.rb").is_file(), "{case}");
+            assert!(outside.join("a-1/keep").is_file(), "{case}");
+        }
+
+        // The stage dir itself as a link, under a real stage root.
+        let home = tmp.path().join("leaf");
+        let copy = installed_gem(&home, "lib");
+        std::fs::create_dir_all(home.join(BUILD_STAGE_DIR)).unwrap();
+        std::os::unix::fs::symlink(outside.join("a-1"), stage_root(&copy)).unwrap();
+        sweep_stale_stage(&copy).unwrap();
+        assert!(outside.join("a-1/keep").is_file());
+        assert!(open_stage(&copy).is_err());
+        assert!(outside.join("a-1/keep").is_file());
+    }
+
+    /// Where a directory cannot be locked, nothing vouches that a stage is
+    /// dead: one whose heartbeat is younger than any live step lasts is
+    /// left to the run that may still be building in it, and the purl is
+    /// refused until it is older.
+    #[test]
+    fn an_unlockable_stage_is_swept_only_when_provably_dead() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let copy = installed_gem(&home, "lib");
+        let root = stage_root(&copy);
+        std::fs::create_dir_all(root.join("home/gems/a-1")).unwrap();
+        std::fs::write(root.join("home/gems/a-1/half"), b"x").unwrap();
+        std::fs::write(root.join(STAGE_HEARTBEAT), b"").unwrap();
+        let unlockable = |_: &Path| -> std::io::Result<Option<std::fs::File>> { Ok(None) };
+
+        let refused = sweep_stale_stage_with(&copy, unlockable).unwrap_err();
+        assert_eq!(refused.kind(), std::io::ErrorKind::WouldBlock);
+        assert!(
+            root.join("home/gems/a-1/half").is_file(),
+            "a live stage was swept"
+        );
+        let why = recovery_refusal(&copy, &refused);
+        assert!(why.contains("cannot be locked here"), "{why}");
+
+        // The heartbeat and the dir both older than any step of a build.
+        let long_ago = std::time::SystemTime::now() - UNLOCKED_STAGE_AGE - Duration::from_secs(60);
+        for path in [root.join(STAGE_HEARTBEAT), root.clone()] {
+            let times = std::fs::FileTimes::new().set_modified(long_ago);
+            // A directory opens for this on Unix; elsewhere the heartbeat
+            // file alone is aged, and the dir's own time still holds it.
+            if let Ok(file) = std::fs::File::open(&path) {
+                let _ = file.set_times(times);
+            }
+        }
+        #[cfg(unix)]
+        assert!(unlocked_stage_is_dead(&root), "an aged stage is dead");
+        if unlocked_stage_is_dead(&root) {
+            sweep_stale_stage_with(&copy, unlockable).unwrap();
+            assert!(!root.exists(), "a dead stage is swept");
+            assert!(!home.join(BUILD_STAGE_DIR).exists());
+        }
+        // A stage with no heartbeat at all is judged by its dir alone.
+        std::fs::create_dir_all(&root).unwrap();
+        assert!(!unlocked_stage_is_dead(&root));
     }
 }
