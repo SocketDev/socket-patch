@@ -16,13 +16,15 @@
 //! # What is a build input
 //!
 //! A gem is native when its installed gemspec declares extensions, or its
-//! platform is not `ruby` (a precompiled gem). In a native gem every
-//! patched file is a build input unless it clearly is not one (`classify`):
+//! platform is not `ruby` (a precompiled gem). In a native gem a patched
+//! file is a build input unless it clearly is not one (`classify`):
 //! `extconf.rb` builds from whatever the gem packs. nokogiri's builds its
 //! vendored libxml2 from `patches/libxml2/*.patch`, `ports/**` and
 //! `dependencies.yml`, so a record whose only file is an added
-//! `patches/libxml2/<n>.patch` changes the compiled library. A gem that is
-//! not native has no build inputs but a C source under `ext/`.
+//! `patches/libxml2/<n>.patch` changes the compiled library. Ruby source
+//! outside `ext/` and a build script's dir is not one, wherever the gem
+//! keeps it: Ruby loads it as it is. A gem that is not native has no build
+//! inputs but a C source under `ext/`.
 //!
 //! # What it is built from
 //!
@@ -40,24 +42,28 @@
 //!    `specifications/` entry beside `gems/`) of a native gem, with a Ruby
 //!    to try; a gem RubyGems built must have its extension dir on disk; a
 //!    precompiled one must have a way to its source gem (the cached
-//!    archive, or a run that is not offline). Otherwise the purl is refused
-//!    with [`UNSUPPORTED_CODE`] and nothing is written. So is the JRuby
-//!    build of a gem, whose jars no source gem's build scripts produce.
+//!    archive, or a run that may download it). Otherwise the purl is
+//!    refused with [`UNSUPPORTED_CODE`] and nothing is written. So is the
+//!    JRuby build of a gem, whose jars no source gem's build scripts
+//!    produce.
 //! 2. The record's files are verified against the copy, and the Ruby that
 //!    owns the install is found (or the purl is refused as in 1).
 //! 3. The source gem is unpacked into a stage inside the gem home
-//!    (`<home>/.socket-patch-build/<gem>`), and the record is laid over it
-//!    with [`apply_package_patch`]: every `beforeHash` must hold in the
-//!    pristine gem, or the archive is not the gem the patch was written for
-//!    and the run stops.
-//! 4. RubyGems builds the staged gem's extension in the stage, with the
+//!    (`<home>/.socket-patch-build/<gem>`) and proven to be the installed
+//!    copy's own source: every file the two trees share is byte-identical
+//!    (`prove_own_source`). An archive is found by name and version, and a
+//!    name does not say whose gem it is; the files do.
+//! 4. The record is laid over it with [`apply_package_patch`]: every
+//!    `beforeHash` must hold in the pristine gem, or the archive is not
+//!    the gem the patch was written for.
+//! 5. RubyGems builds the staged gem's extension in the stage, with the
 //!    build arguments it recorded for the installed copy. A gem the build
 //!    needs and the install lacks (a precompiled nokogiri has no
 //!    `mini_portile2`) is installed into the stage home, never into the
-//!    user's. Until the build has finished, nothing of the installed copy
-//!    is touched: a failed build fails the purl with [`BUILD_FAILED_CODE`]
-//!    and leaves the copy as it was.
-//! 5. The record's files are written into the installed copy, and the
+//!    user's. A build that leaves what Ruby loads in the gem's own tree
+//!    (an FFI gem's `ext/<name>/lib<name>.so`) cannot be moved in from a
+//!    stage (`in_tree_products`).
+//! 6. The record's files are written into the installed copy, and the
 //!    build takes the place of the compiled code Ruby loads. For a gem
 //!    RubyGems built, the staged extension dir replaces the installed one
 //!    (parked while it moves in) and its artifacts replace the `lib/`
@@ -66,21 +72,29 @@
 //!    more than one, is refused with nothing written. The first time, the
 //!    original build (the prebuilt binaries) is copied to a backup inside
 //!    the gem dir ([`BACKUP_DIR`]).
-//! 6. A marker ([`MARKER_FILE`]) records the source hashes the build was
+//! 7. A marker ([`MARKER_FILE`]) records the source hashes the build was
 //!    made from and the hash of every artifact put in place.
 //!
-//! When the source gem cannot be had, a gem RubyGems built is rebuilt in
-//! place, from its own tree (`rebuild`): the patched sources are written,
-//! the current build is moved aside, and RubyGems builds into a fresh
+//! Nothing of the installed copy is touched before step 6. Whatever stops
+//! the run before it (no archive, a stage that cannot be opened, steps 3
+//! to 5) leaves a gem RubyGems built the rebuild it always had: in place,
+//! from its own tree (`rebuild`). The patched sources are written, the
+//! current build is moved aside, and RubyGems builds into a fresh
 //! extension dir; a failed build puts the old build and the original
-//! sources back. A precompiled gem has no such fallback and is refused,
-//! with what it needs: network access to the registry once, or the source
-//! gem in the home's `cache/`.
+//! sources back, and its error names both failures. (The one exception:
+//! another run building the same gem right now.) A precompiled gem has no
+//! such fallback and is refused, with what it needs: network access to the
+//! registry once, or the source gem in the home's `cache/`.
 //!
 //! `vex` and `apply --check` attest a copy only when its marker matches the
 //! record's patched sources and every recorded artifact still hashes as
-//! built ([`verify_native_build`]), whichever way it was built. `rollback`
-//! puts the backed-up original build back ([`restore_original_build`]),
+//! built ([`verify_native_build`]), whichever way it was built. A
+//! precompiled gem ships one binary per Ruby minor, and a graft replaces
+//! the one of the Ruby that ran `apply`: such a copy is attested only when
+//! no other of them could be loaded from its gem home
+//! (`ungrafted_binaries`): the home is laid out for that one Ruby, or each
+//! Ruby that the gem ships a binary for has run `apply`. `rollback` puts
+//! the backed-up original build back ([`restore_original_build`]),
 //! prebuilt binaries byte for byte.
 //!
 //! # What is executed, and when
@@ -96,7 +110,7 @@
 //! A real run starts a program only after the record's files verified
 //! against the installed copy (each holds its `beforeHash` or `afterHash`
 //! content, or a mismatch the caller's policy overwrites; a build input
-//! the copy does not hold is checked in step 3 instead), and then, in this
+//! the copy does not hold is checked in step 4 instead), and then, in this
 //! order:
 //!
 //! 1. The host Ruby alone, asked where it builds extensions for the copy's
@@ -109,7 +123,8 @@
 //!    from the registry, verified against its index and installed into the
 //!    stage home (`RubyRun::Install`), which runs that gem's build scripts
 //!    if it has any.
-//! 3. With the record laid over the staged gem, RubyGems' extension builder
+//! 3. With the unpacked gem proven to be the installed copy's own source
+//!    and the record laid over it, RubyGems' extension builder
 //!    (`RubyRun::StageBuild`). It runs the archive's own build scripts
 //!    (`extconf.rb`, a Rakefile, `make`, the compiler), as `gem install`
 //!    ran them, and loads the gemspec `unpack` wrote from the archive. The
@@ -152,7 +167,11 @@
 //! went with its process. The next `apply` or `rollback` of the copy drops
 //! it (`sweep_stale_stage`). A stage a run in another process still holds
 //! (a gem home shared between projects) is left alone, and the purl is
-//! refused.
+//! refused. Where a directory cannot be locked, a stage counts as held
+//! until its heartbeat is older than any step of a build lasts. The stage
+//! is only ever named through `stage_dirs`, which refuses a link planted
+//! where it goes: the gem tree may be the scanned repository's, and nothing
+//! in it steers a delete.
 //!
 //! While a finished build moves in, and for the whole of an in-place
 //! build, the previous build is parked beside the extension dir

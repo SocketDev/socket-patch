@@ -2004,12 +2004,20 @@ How each mode gets the patched code running:
 where RubyGems and Bundler keep it for a gem they built. For a precompiled gem, or a pruned cache,
 it downloads the archive from rubygems.org and checks it against the sha256 the registry's index
 records. Your `Gemfile.lock` never chooses where the archive comes from; a gem it resolves from
-another source (a private gem server, a git source) is not downloaded. With no archive to be had
-(`--offline` and nothing cached, or a private gem), a gem RubyGems built is rebuilt from its
-installed tree instead, and a precompiled gem is refused with `native_extensions_unsupported`:
-run `apply` once with network access, or put the source gem in that `cache/` directory. If you
-install from a mirror of rubygems.org, set `SOCKET_RUBYGEMS_URL` to it. The JRuby (`-java`) build
-of a gem ships jars and is always refused for such a patch.
+another source (a private gem server, a git source) is not downloaded. Before anything of the
+archive is built, `apply` checks that it is the installed gem's own source: every file the two
+share must be identical. With no usable archive (`--offline` and nothing cached, a private gem),
+or when the build from it fails, a gem RubyGems built is rebuilt from its installed tree instead,
+as in 5.1.0, and a precompiled gem is refused with `native_extensions_unsupported`: run `apply`
+once with network access, or put the source gem in that `cache/` directory. If you install from a
+mirror of rubygems.org, set `SOCKET_RUBYGEMS_URL` to it. The JRuby (`-java`) build of a gem ships
+jars and is always refused for such a patch.
+
+A gem that builds a library into its own directory and loads it from there (an FFI gem such as
+argon2) is always rebuilt from its installed tree.
+
+Ruby files are never build inputs outside `ext/` and a build script's directory: a patch that only
+changes `.rb` or `.rbs` files needs no compiler, wherever the gem keeps them.
 
 The build happens in a stage directory inside the gem home (`.socket-patch-build/`), which is
 removed afterwards. A gem the build needs that the install lacks (a precompiled nokogiri has no
@@ -2038,8 +2046,15 @@ without a rebuild, with a `native_extension_not_rebuilt` warning, and `vex` does
 directory (the install-time build, or a precompiled gem's prebuilt binary), so `rollback`
 restores it byte for byte without recompiling, and records what it built in
 `.socket-patch-native-build.json`. `vex` attests the patch only while that record matches the
-installed binary: after `gem pristine`, a reinstall, or a switch to another Ruby minor version,
-run `apply` again.
+installed binary: after `gem pristine` or a reinstall, run `apply` again.
+
+A precompiled gem ships one binary for each Ruby version it supports, and `apply` rebuilds the one
+for the Ruby it runs with. In a gem home that belongs to one Ruby (`vendor/bundle/ruby/3.4.0`, a
+Ruby's own gem directory, or any home that holds a compiled gem) that is the only binary ever
+loaded, and `vex` attests the patch. A custom `GEM_HOME` with nothing in it that ties it to one
+Ruby could be used by several: there `apply` warns that the binaries for the other Ruby versions
+are still the prebuilt ones, and `vex` attests the patch only after `apply` has run under each
+Ruby version the gem ships a binary for.
 
 Interrupting `apply` during a rebuild (Ctrl-C, a cancelled CI job) stops the build with it. A
 build from the source gem had not touched the installed gem yet, so the gem is as it was; the
