@@ -2742,19 +2742,22 @@ mod tests {
             ..local
         };
         // A global crawl also reads the Coursier and Ivy caches of the
-        // machine running the suite (they are not part of `JvmEnv`), so the
-        // pinned repository's packages are looked up, not counted.
-        let found = purls(MavenCrawler::new().crawl_all_with(&global, &env).await);
-        for purl in [
-            "pkg:maven/junit/junit@4.13.2",
-            "pkg:maven/org.apache.commons/commons-lang3@3.12.0",
-            "pkg:maven/org.hamcrest/hamcrest-core@1.3",
-        ] {
-            assert!(
-                found.iter().any(|p| p == purl),
-                "a global crawl is not scoped: {purl} is missing from {found:?}"
-            );
-        }
+        // machine running the suite (they are not part of `JvmEnv`), so
+        // only the packages it reports from the pinned repository are
+        // compared, and those exactly. The repository is crawled before
+        // those caches and the first copy of a purl wins, so a copy of one
+        // of these in the machine's caches is never the one reported.
+        let mut pinned = MavenCrawler::new().crawl_all_with(&global, &env).await;
+        pinned.retain(|p| p.path.starts_with(&repo));
+        assert_eq!(
+            purls(pinned),
+            [
+                "pkg:maven/junit/junit@4.13.2",
+                "pkg:maven/org.apache.commons/commons-lang3@3.12.0",
+                "pkg:maven/org.hamcrest/hamcrest-core@1.3",
+            ],
+            "a global crawl is not scoped"
+        );
     }
 
     #[tokio::test]

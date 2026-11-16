@@ -86,17 +86,25 @@ impl Server {
 
     fn project_with_bind(root: &Path, env: &[(&str, &str)], docker: bool) -> Self {
         let root = root.to_path_buf();
-        let extra: Vec<_> = env
+        // Each cache the test hands over, with the purl type it holds.
+        let extra: Vec<CacheRoot> = env
             .iter()
-            .filter_map(|(k, v)| match *k {
-                "CARGO_HOME" | "GOMODCACHE" | "MAVEN_REPO_LOCAL" | "NUGET_PACKAGES"
-                | "GEM_HOME" | "VIRTUAL_ENV" | "BUNDLE_PATH" => Some(PathBuf::from(v)),
-                // The explicit JVM caches (`jvm_env::EXPLICIT`) are served
-                // as maven2 repositories from their `files-2.1` trees.
-                "GRADLE_USER_HOME" => Some(PathBuf::from(v).join(GRADLE_FILES21)),
-                "GRADLE_RO_DEP_CACHE" => Some(PathBuf::from(v).join(RO_FILES21)),
-                // sbt: "COURSIER_CACHE" => …
-                _ => None,
+            .filter_map(|(k, v)| {
+                let dir = PathBuf::from(v);
+                Some(match *k {
+                    "CARGO_HOME" => ("cargo", dir),
+                    "GOMODCACHE" => ("golang", dir),
+                    "MAVEN_REPO_LOCAL" => ("maven", dir),
+                    "NUGET_PACKAGES" => ("nuget", dir),
+                    "GEM_HOME" | "BUNDLE_PATH" => ("gem", dir),
+                    "VIRTUAL_ENV" => ("pypi", dir),
+                    // The explicit JVM caches (`jvm_env::EXPLICIT`) are served
+                    // as maven2 repositories from their `files-2.1` trees.
+                    "GRADLE_USER_HOME" => ("maven", dir.join(GRADLE_FILES21)),
+                    "GRADLE_RO_DEP_CACHE" => ("maven", dir.join(RO_FILES21)),
+                    // sbt: "COURSIER_CACHE" => …
+                    _ => return None,
+                })
             })
             .collect();
         let (ready_tx, ready_rx) = mpsc::channel();
@@ -140,7 +148,11 @@ pub async fn mount_project(server: &MockServer, root: &Path) {
     mount_project_with_roots(server, root, Vec::new()).await;
 }
 
-async fn mount_project_with_roots(server: &MockServer, root: &Path, extra: Vec<PathBuf>) {
+/// A package cache a test handed to the fixture server: the purl type it
+/// holds, and its directory.
+type CacheRoot = (&'static str, PathBuf);
+
+async fn mount_project_with_roots(server: &MockServer, root: &Path, extra: Vec<CacheRoot>) {
     let mut records = std::fs::read(root.join(".socket/manifest.json"))
         .ok()
         .and_then(|b| serde_json::from_slice::<PatchManifest>(&b).ok())
@@ -166,8 +178,8 @@ async fn mount_project_with_roots(server: &MockServer, root: &Path, extra: Vec<P
     if store.is_dir() {
         roots.push(store);
     }
-    let repositories = extra.clone();
-    roots.extend(extra);
+    let repositories: Vec<PathBuf> = extra.iter().map(|(_, dir)| dir.clone()).collect();
+    roots.extend(repositories.iter().cloned());
     let paths = list_dirs(&roots);
     let mut metadata = MAVEN_METADATA
         .get_or_init(Default::default)
@@ -248,6 +260,11 @@ async fn mount_project_with_roots(server: &MockServer, root: &Path, extra: Vec<P
                 let Ok(package) = archive(&purl, &source, &record, &sources).await else {
                     continue;
                 };
+                if fallback.is_some() {
+                    if let Some(notice) = stand_in_notice(&purl, &extra) {
+                        eprintln!("{notice}");
+                    }
+                }
                 PUBLISHED
                     .get()
                     .unwrap()
@@ -480,12 +497,7 @@ fn source_dir(root: &Path, paths: &[PathBuf], purl: &str) -> PathBuf {
                         .is_dir()
             }
             "cargo" | "gem" => leaf == format!("{name}-{version}"),
-            // The purl spells the module path with `/`, whatever the
-            // platform separates the cache's directories with.
-            "golang" => dir
-                .to_string_lossy()
-                .replace('\\', "/")
-                .ends_with(&format!("{name}@{version}")),
+            "golang" => is_go_module_dir(dir, name, &version),
             "maven" => {
                 let jar = format!("{}-{version}.jar", name.rsplit('/').next().unwrap());
                 if dir.join(&jar).is_file() {
@@ -508,6 +520,68 @@ fn source_dir(root: &Path, paths: &[PathBuf], purl: &str) -> PathBuf {
         }
     }
     root.join("missing")
+}
+
+/// Whether `dir` is where Go's module cache keeps `module@version`: the
+/// path's last components spell the module path and the version, both
+/// case-escaped, starting at a component boundary (the directory of
+/// `sigs.k8s.io/x` is not that of `k8s.io/x`). The purl spells the module
+/// path with `/`, whatever the platform separates the cache's directories
+/// with.
+fn is_go_module_dir(dir: &Path, module: &str, version: &str) -> bool {
+    let wanted = format!("{}@{}", go_case_escape(module), go_case_escape(version));
+    dir.to_string_lossy()
+        .replace('\\', "/")
+        .strip_suffix(&wanted)
+        .is_some_and(|before| before.is_empty() || before.ends_with('/'))
+}
+
+/// Go's module cache spells an upper-case ASCII letter as `!` and its
+/// lower-case form (`github.com/Azure` is `github.com/!azure`), in a module
+/// path and in a version alike. The same rule as the product's
+/// `socket_patch_core::crawlers::go_crawler::encode_module_path`, written
+/// out here so the fixture does not take the rule from the code under test.
+fn go_case_escape(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len());
+    for ch in text.chars() {
+        if ch.is_ascii_uppercase() {
+            escaped.push('!');
+        }
+        escaped.push(ch.to_ascii_lowercase());
+    }
+    escaped
+}
+
+/// The line the fixture server prints when it archives the stand-in of
+/// `package_layout` for `purl` although the test handed it a cache for
+/// that ecosystem; `None` when no such cache was handed over (the
+/// stand-in is then the intended source). It is printed once per package
+/// of a project: a later server for the same project serves the archive
+/// already published. The stand-in holds the patched files and none of
+/// the package's own, so a package that is installed and that `source_dir`
+/// failed to find shows up far away, as a build that misses a file: the
+/// line names the cause in that test's output. It is a notice and not a
+/// failure because two tests hand over, on purpose, a Cargo home that
+/// holds no crate, for a crate that is locked or patched and not
+/// installed (`vendor_rerun_no_network_e2e`).
+fn stand_in_notice(purl: &str, handed: &[CacheRoot]) -> Option<String> {
+    let kind = purl
+        .trim_start_matches("pkg:")
+        .split('/')
+        .next()
+        .unwrap_or_default();
+    let caches: Vec<String> = handed
+        .iter()
+        .filter(|(holds, _)| *holds == kind)
+        .map(|(_, dir)| dir.display().to_string())
+        .collect();
+    (!caches.is_empty()).then(|| {
+        format!(
+            "prebuilt fixture: {purl} was not found in the project or under the cache \
+             handed over ({}); serving the stand-in of package_layout",
+            caches.join(", ")
+        )
+    })
 }
 
 pub async fn mount_view(server: &MockServer, view: &serde_json::Value, gemspec: Option<&[u8]>) {
@@ -822,6 +896,101 @@ mod prebuilt_common_selftests {
         // Another version of the module is not its source.
         let other = [PathBuf::from(r"C:\Temp\modcache\example.com\m@v1.0.1")];
         assert_eq!(source_dir(root, &other, purl), root.join("missing"));
+    }
+
+    /// The module path is matched from a path-component boundary: the
+    /// directory of a module on a longer host name (`sigs.k8s.io/x` beside
+    /// `k8s.io/x`) ends with the same text and is another module.
+    #[test]
+    fn a_go_module_on_a_longer_host_is_not_taken() {
+        let root = Path::new("project");
+        for (purl, longer, own) in [
+            (
+                "pkg:golang/example.com/m@v1.0.0",
+                "/tmp/modcache/notexample.com/m@v1.0.0",
+                "/tmp/modcache/example.com/m@v1.0.0",
+            ),
+            (
+                "pkg:golang/k8s.io/x@v0.1.0",
+                r"C:\Temp\modcache\sigs.k8s.io\x@v0.1.0",
+                r"C:\Temp\modcache\k8s.io\x@v0.1.0",
+            ),
+        ] {
+            let alone = [PathBuf::from(longer)];
+            assert_eq!(
+                source_dir(root, &alone, purl),
+                root.join("missing"),
+                "{longer}"
+            );
+            let both = [longer, own].map(PathBuf::from);
+            assert_eq!(source_dir(root, &both, purl), PathBuf::from(own), "{own}");
+        }
+        // A listed path that is the module directory and nothing more.
+        let bare = [PathBuf::from("example.com/m@v1.0.0")];
+        let purl = "pkg:golang/example.com/m@v1.0.0";
+        assert_eq!(source_dir(root, &bare, purl), bare[0]);
+    }
+
+    /// Go's module cache spells an upper-case letter as `!` and its
+    /// lower-case form, in the module path and in the version, and a purl
+    /// keeps the letter: the escaped directory is the module's.
+    #[test]
+    fn a_go_module_directory_is_found_under_its_case_escaped_name() {
+        assert_eq!(
+            go_case_escape("github.com/Azure/go-autorest"),
+            "github.com/!azure/go-autorest"
+        );
+        assert_eq!(go_case_escape("v1.0.0-RC1"), "v1.0.0-!r!c1");
+        assert_eq!(go_case_escape("example.com/m"), "example.com/m");
+        let root = Path::new("project");
+        for (purl, found) in [
+            (
+                "pkg:golang/github.com/Azure/go-autorest@v14.2.0%2Bincompatible",
+                "/tmp/modcache/github.com/!azure/go-autorest@v14.2.0+incompatible",
+            ),
+            (
+                "pkg:golang/github.com/BurntSushi/toml@v1.3.2",
+                r"C:\Temp\modcache\github.com\!burnt!sushi\toml@v1.3.2",
+            ),
+            (
+                "pkg:golang/example.com/m@v1.0.0-RC1",
+                "/tmp/modcache/example.com/m@v1.0.0-!r!c1",
+            ),
+        ] {
+            let listed = [PathBuf::from(found)];
+            assert_eq!(source_dir(root, &listed, purl), listed[0], "{purl}");
+        }
+        // The cache never holds the unescaped spelling; it is not matched.
+        let unescaped = [PathBuf::from(
+            "/tmp/modcache/github.com/Azure/go-autorest@v14.2.0",
+        )];
+        let purl = "pkg:golang/github.com/Azure/go-autorest@v14.2.0";
+        assert_eq!(source_dir(root, &unescaped, purl), root.join("missing"));
+    }
+
+    /// The stand-in served for a package of an ecosystem the test handed a
+    /// cache over for is announced with the purl and every such cache;
+    /// with no cache for that ecosystem the stand-in is the intended
+    /// source and nothing is said.
+    #[test]
+    fn a_stand_in_served_despite_a_handed_cache_is_announced() {
+        let purl = "pkg:maven/com.example/lib@1.0.0";
+        let (m2, gradle) = (PathBuf::from("m2-repo"), PathBuf::from("gradle-files"));
+        assert_eq!(stand_in_notice(purl, &[]), None);
+        assert_eq!(stand_in_notice(purl, &[("cargo", m2.clone())]), None);
+        let handed = [
+            ("maven", m2),
+            ("golang", "modcache".into()),
+            ("maven", gradle),
+        ];
+        let notice = stand_in_notice(purl, &handed).expect("two Maven caches were handed over");
+        for part in [purl, "m2-repo", "gradle-files", "stand-in"] {
+            assert!(notice.contains(part), "{part} is missing from: {notice}");
+        }
+        assert!(
+            !notice.contains("modcache") && !notice.contains('\n'),
+            "{notice}"
+        );
     }
 
     #[test]
