@@ -617,16 +617,22 @@ mod tests {
         let [(PROJECT, project), (GLOBAL, global)] = passes.as_slice() else {
             panic!("a project pass and a global pass, got {}", passes.len());
         };
+        // The paths as `passes` builds them: the separator `Path::join`
+        // writes is the platform's, so a `/`-joined literal is not it.
+        let manifest = |scope: &str| {
+            let path = state.join(scope).join("manifest.json");
+            path.to_string_lossy().into_owned()
+        };
         assert!(!project.common.global);
         assert_eq!(project.paths, ["packages/*"]);
-        assert_eq!(project.common.manifest_path, "/state/project/manifest.json");
+        assert_eq!(project.common.manifest_path, manifest(PROJECT));
         // Go is the global pass's: a project run would rewrite `go.mod`.
         assert!(!ecosystems(project).contains(&"golang"));
         assert!(ecosystems(project).contains(&"npm"));
         assert!(global.common.global);
         assert!(global.paths.is_empty());
         assert_eq!(global.common.ecosystems, None);
-        assert_eq!(global.common.manifest_path, "/state/global/manifest.json");
+        assert_eq!(global.common.manifest_path, manifest(GLOBAL));
     }
 
     #[test]
