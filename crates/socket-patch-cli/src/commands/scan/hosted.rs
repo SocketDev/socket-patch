@@ -1527,6 +1527,21 @@ async fn run_redirect_selected_untracked(
     // parent directory's and `$CARGO_HOME`'s): a directory source or local
     // registry in any of them refuses the cargo rewrite like a project one.
     let cargo_outer = || CargoCrawler::crates_io_source_for(&common.cwd);
+    // What Maven selects in each module, from the poms its local repository
+    // holds: a pin is written only where that is the patch's base version.
+    // Read once: the rewrite may run several times.
+    let maven_selection_once = std::sync::OnceLock::new();
+    let maven_selection = || {
+        Some(
+            maven_selection_once
+                .get_or_init(|| {
+                    socket_patch_core::crawlers::maven_selection::MavenSelection::for_project(
+                        &common.cwd,
+                    )
+                })
+                .clone(),
+        )
+    };
     // The scan runs in the install's environment: a pnpm setting there
     // (`pnpm_config_trust_lockfile`) overrides the project's files.
     let pnpm_env = |var: &str| std::env::var(var).ok();
@@ -1544,6 +1559,7 @@ async fn run_redirect_selected_untracked(
         npm_outer: &npm_outer,
         yarn_classic_outer: &yarn_classic_outer,
         cargo_outer: &cargo_outer,
+        maven_selection: &maven_selection,
         pnpm_env: &pnpm_env,
         blocking: true,
         takeover_uuids: takeover_uuids.clone(),

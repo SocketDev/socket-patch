@@ -31,6 +31,9 @@ use std::path::Path;
 
 use super::{JvmRefusal, JvmWarning, Shape};
 use crate::crawlers::jvm_cache::debug_log;
+use crate::crawlers::maven_selection::{
+    not_selected_detail, undetermined_detail, MavenSelection, Standing,
+};
 use crate::formats::sbt::build::declared_newer;
 use crate::formats::sbt::evidence::ResolutionDoc;
 use crate::formats::sbt::gate::{self, GateRefusal, GateWarning};
@@ -52,7 +55,19 @@ pub const SKIP_CODES: &[&str] = &[
     "vendor_scala_cli_resolution_missing",
     "vendor_scala_cli_resolution_stale",
     "vendor_scala_cli_not_resolved",
+    MAVEN_NOT_SELECTED,
+    MAVEN_UNDETERMINED,
 ];
+
+/// A Maven build that selects another version of the artifact than the
+/// patch's base in every module (or resolves it in none): the base version
+/// is not part of the build, so there is nothing to vendor.
+pub const MAVEN_NOT_SELECTED: &str = "vendor_maven_version_not_selected";
+
+/// A Maven build whose selection of the artifact cannot be told, with no
+/// declaration naming the base version to rewrite: nothing is pinned on a
+/// guess.
+pub const MAVEN_UNDETERMINED: &str = "vendor_maven_selection_undetermined";
 
 /// The code of a [`GateStop::Silent`] outcome.
 pub const NOT_RESOLVED: &str = "vendor_jvm_not_resolved";
@@ -117,23 +132,50 @@ pub struct GatePass {
 pub(crate) struct ShapePass {
     pub warnings: Vec<VendorWarning>,
     pub deps_digest: Option<String>,
+    /// What Maven selects in each module of a Maven root: the planner pins
+    /// only where that is the patch's base version.
+    pub maven: Option<MavenSelection>,
 }
 
-/// The gate of a project of `shape` ([`check`] for sbt,
-/// [`super::coursier_gate::check`] for scala-cli, none otherwise).
+/// The gate of a project of `shape`: [`check`] for sbt,
+/// [`super::coursier_gate::check`] for scala-cli, and for a Maven root what
+/// Maven selects in each module ([`MavenSelection`], read over the local
+/// repository `maven_repo`, or the one this process resolves against): a
+/// patch whose base version no module selects is skipped
+/// ([`MAVEN_NOT_SELECTED`]).
 pub(crate) fn for_shape(
     shape: Shape,
     project_root: &Path,
     g: &str,
     a: &str,
     base: &str,
+    maven_repo: Option<&Path>,
 ) -> Result<ShapePass, GateStop> {
+    let mut maven = None;
     let pass = match shape {
         Shape::Sbt => check(project_root, g, a, base)?,
         Shape::ScalaCli => GatePass {
             warnings: super::coursier_gate::check(project_root, g, a, base)?,
             deps_digest: None,
         },
+        Shape::MavenReactor | Shape::Mixed => {
+            let selection = match maven_repo {
+                Some(repo) => MavenSelection::of(project_root, repo),
+                None => MavenSelection::for_project(project_root),
+            };
+            // A mixed root's Gradle half may still resolve the base
+            // version: only the planner's pins follow the selection there.
+            if shape == Shape::MavenReactor {
+                if let Standing::NotSelected(others) = selection.standing(g, a, base) {
+                    return Err(GateStop::Skip(warning(
+                        MAVEN_NOT_SELECTED,
+                        not_selected_detail(g, a, base, &others),
+                    )));
+                }
+            }
+            maven = Some(selection);
+            GatePass::default()
+        }
         _ => GatePass::default(),
     };
     Ok(ShapePass {
@@ -143,7 +185,31 @@ pub(crate) fn for_shape(
             .map(|w| VendorWarning::new(w.code, w.detail))
             .collect(),
         deps_digest: pass.deps_digest,
+        maven,
     })
+}
+
+/// The skip of a Maven patch whose `plan` wired nothing only because
+/// `selection` could not tell what the build selects. `None` when it
+/// could, or when the plan passed a declaration over for a reason of its
+/// own: the plan's refusal then stands.
+pub(crate) fn maven_undetermined(
+    selection: Option<&MavenSelection>,
+    plan: &super::JvmPlan,
+    g: &str,
+    a: &str,
+    base: &str,
+) -> Option<VendorOutcome> {
+    if !super::maven_reactor::unwired_by_selection_alone(plan) {
+        return None;
+    }
+    match selection?.standing(g, a, base) {
+        Standing::Undetermined(why) => Some(refused(
+            MAVEN_UNDETERMINED,
+            undetermined_detail(g, a, base, &why),
+        )),
+        _ => None,
+    }
 }
 
 /// Gate vendoring `g:a` at upstream `base` into the sbt build at

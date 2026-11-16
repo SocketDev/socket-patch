@@ -394,15 +394,30 @@ pub fn plan_with_external(
     config_enabled: bool,
     external: Option<&maven_reactor::ExternalPoms>,
 ) -> Result<JvmPlan, JvmRefusal> {
+    plan_with_selection(shape, read, list, patch, config_enabled, external, None)
+}
+
+/// [`plan_with_external`] that pins a Maven root only where Maven selects
+/// the patch's base version already (see
+/// [`maven_reactor::plan_with_selection`]).
+pub fn plan_with_selection(
+    shape: Shape,
+    read: ReadFn<'_>,
+    list: ListFn<'_>,
+    patch: &JvmPatch<'_>,
+    config_enabled: bool,
+    external: Option<&maven_reactor::ExternalPoms>,
+    selection: Option<&crate::crawlers::maven_selection::MavenSelection>,
+) -> Result<JvmPlan, JvmRefusal> {
+    let maven = |read: ReadFn<'_>, list: ListFn<'_>| {
+        maven_reactor::plan_with_selection(read, list, patch, config_enabled, external, selection)
+    };
     match shape {
-        Shape::MavenReactor => {
-            maven_reactor::plan_with_external(read, list, patch, config_enabled, external)
-        }
+        Shape::MavenReactor => maven(read, list),
         Shape::Gradle => gradle::plan(read, list, patch),
         Shape::Mixed => {
             // Both halves or neither: a refusal of either writes nothing.
-            let maven =
-                maven_reactor::plan_with_external(read, list, patch, config_enabled, external)?;
+            let maven = maven(read, list)?;
             let gradle = gradle::plan(read, list, patch)?;
             Ok(compose(maven, gradle))
         }

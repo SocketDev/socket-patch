@@ -1314,15 +1314,35 @@ pub fn check_entry_in(
             attempts.push((as_committed, None));
         }
     }
+    // Likewise the pins: `vendor` writes one only where Maven selects the
+    // base version, as far as the local repository told it. What that
+    // repository says now, and the pins a run with no such answer writes,
+    // are both in sync.
+    let selection = matches!(shape, Shape::MavenReactor | Shape::Mixed).then(|| match local_repo {
+        Some(repo) => crate::crawlers::maven_selection::MavenSelection::of(root, repo),
+        None => crate::crawlers::maven_selection::MavenSelection::unavailable(
+            "no Maven local repository was read",
+        ),
+    });
+    let attempts: Vec<_> = [selection.as_ref(), None]
+        .into_iter()
+        .take(if selection.is_some() { 2 } else { 1 })
+        .flat_map(|selection| {
+            attempts
+                .iter()
+                .map(move |(patch, external)| (patch, *external, selection))
+        })
+        .collect();
     let mut drift: Option<String> = None;
     let mut in_sync: Option<super::JvmPlan> = None;
-    for (patch, external) in &attempts {
-        let outcome = super::plan_with_external(shape, &read, &list, patch, config, *external)
-            .map_err(|e| e.detail)
-            .and_then(|plan| match plan.writes.first() {
-                Some(w) => Err(format!("vendored wiring or metadata drifted: {}", w.rel)),
-                None => Ok(plan),
-            });
+    for (patch, external, selection) in &attempts {
+        let outcome =
+            super::plan_with_selection(shape, &read, &list, patch, config, *external, *selection)
+                .map_err(|e| e.detail)
+                .and_then(|plan| match plan.writes.first() {
+                    Some(w) => Err(format!("vendored wiring or metadata drifted: {}", w.rel)),
+                    None => Ok(plan),
+                });
         match outcome {
             Ok(plan) => {
                 in_sync = Some(plan);

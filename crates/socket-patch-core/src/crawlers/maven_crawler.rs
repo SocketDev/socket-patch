@@ -862,6 +862,44 @@ fn holds_artifact(dir: &Path) -> bool {
     })
 }
 
+/// Whether `dir`, the version directory of `artifact`:`version`, is one of
+/// a Maven local repository that holds the pom and no artifact: Maven read
+/// the version's pom (every version it weighs during mediation, every
+/// parent and BOM) and never downloaded a jar, so there is no installed
+/// copy to patch in place.
+pub fn pom_only_version_dir(dir: &Path, artifact: &str, version: &str) -> bool {
+    // What Maven keeps beside an artifact: poms and Gradle modules, their
+    // checksum and signature sidecars, its own bookkeeping, and the marks
+    // of a failed or unfinished download.
+    const NOT_ARTIFACTS: &[&str] = &[
+        ".pom",
+        ".module",
+        ".sha1",
+        ".md5",
+        ".sha256",
+        ".sha512",
+        ".asc",
+        ".lastUpdated",
+        ".part",
+        ".lock",
+        ".repositories",
+        ".properties",
+    ];
+    if !dir.join(format!("{artifact}-{version}.pom")).is_file() {
+        return false;
+    }
+    !std::fs::read_dir(dir).is_ok_and(|entries| {
+        entries.flatten().any(|e| {
+            let name = e.file_name();
+            let name = name.to_string_lossy();
+            !name.starts_with('.')
+                && !name.starts_with("maven-metadata")
+                && !NOT_ARTIFACTS.iter().any(|ext| name.ends_with(ext))
+                && e.file_type().is_ok_and(|t| t.is_file())
+        })
+    })
+}
+
 /// Maven/Java ecosystem crawler for discovering packages in the JVM
 /// artifact caches: the local Maven repository (`~/.m2/repository/`),
 /// Gradle's module cache (`~/.gradle/caches/modules-2/files-2.1`, plus the
@@ -2502,6 +2540,33 @@ mod tests {
             result.is_empty(),
             "traversal PURL must not resolve to an out-of-tree directory, got {result:?}"
         );
+    }
+
+    /// A version Maven only read the pom of (beside its tracking files) is
+    /// no installed copy; a jar of any classifier is one.
+    #[test]
+    fn a_version_dir_with_only_its_pom_holds_no_artifact() {
+        let dir = tempfile::tempdir().unwrap();
+        let version = dir.path().join("org/x/lib/1.0");
+        std::fs::create_dir_all(&version).unwrap();
+        assert!(!pom_only_version_dir(&version, "lib", "1.0"), "no pom");
+        for name in [
+            "lib-1.0.pom",
+            "lib-1.0.pom.sha1",
+            "lib-1.0.jar.lastUpdated",
+            "_remote.repositories",
+            "resolver-status.properties",
+            "m2e-lastUpdated.properties",
+            "maven-metadata-central.xml",
+        ] {
+            std::fs::write(version.join(name), b"x").unwrap();
+        }
+        assert!(pom_only_version_dir(&version, "lib", "1.0"));
+        std::fs::write(version.join("lib-1.0-tests.jar"), b"x").unwrap();
+        assert!(!pom_only_version_dir(&version, "lib", "1.0"));
+        std::fs::remove_file(version.join("lib-1.0-tests.jar")).unwrap();
+        std::fs::write(version.join("lib-1.0.jar"), b"x").unwrap();
+        assert!(!pom_only_version_dir(&version, "lib", "1.0"));
     }
 
     // ---- m2_repo_path env tests ----
