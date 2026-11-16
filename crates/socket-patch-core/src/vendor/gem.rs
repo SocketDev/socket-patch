@@ -36,7 +36,8 @@
 //! The Gemfile gains `path:` on the gem's declaration (rewritten in place when
 //! it is a statically-parseable single top-level line, quote style and
 //! trailing options like `require: false` preserved) or, for a transitive
-//! dependency, a managed block appended at EOF. Anything
+//! dependency, a managed block appended at EOF whose declaration is
+//! `require: false`, so `Bundler.require` does not start loading the gem. Anything
 //! the conservative line grammar cannot prove safe to rewrite is REFUSED —
 //! never guessed at. The one exception is OUR OWN previous wiring: a patch
 //! update moves the manifest to a new uuid (same purl), and a `path:` that
@@ -112,6 +113,12 @@ const LOCK_CHECKSUM_WIRING_KIND: &str = "gemfile_lock_checksum";
 /// Managed-block fence for transitive (not-Gemfile-declared) gems.
 const MANAGED_OPEN: &str = "# >>> socket-patch vendor (managed) >>>";
 const MANAGED_CLOSE: &str = "# <<< socket-patch vendor (managed) <<<";
+/// The option that ends the managed block's declaration. The block declares
+/// a gem the Gemfile did not, and `Bundler.require` loads every declared
+/// gem of the groups it is given unless the declaration says
+/// `require: false` (#2084). Hosted mode writes the same option on the line
+/// it adds for such a gem.
+const REQUIRE_FALSE: &str = ", require: false";
 
 /// Everything [`vendor_gem`] decides before it can first ask the patch
 /// service, up to its dry-run branch: the coordinate guards, the no-op of an
@@ -1381,11 +1388,13 @@ fn plan_gemfile_edit(
             ));
         }
         // The block takes the file's line endings: an LF block in a CRLF
-        // Gemfile leaves it mixed (#1821).
+        // Gemfile leaves it mixed (#1821). Its declaration is one the
+        // Gemfile did not have, so it is `require: false`: without the
+        // option `Bundler.require` starts loading the gem at boot (#2084).
         let nl = line_endings::terminator(text);
         return Ok(GemfilePlan::Append {
             block: format!(
-                "{MANAGED_OPEN}{nl}gem \"{name}\", \"{version}\", path: \"{rel}\"{nl}{MANAGED_CLOSE}{nl}"
+                "{MANAGED_OPEN}{nl}gem \"{name}\", \"{version}\", path: \"{rel}\"{REQUIRE_FALSE}{nl}{MANAGED_CLOSE}{nl}"
             ),
         });
     }
@@ -1417,11 +1426,6 @@ fn plan_gemfile_edit(
     if let Some(prev_rel) = gem_line_path_value(rest) {
         if is_our_vendor_rel(prev_rel, name, version) {
             let original_line = lines[idx].to_string();
-            // The rel appears exactly once (its charset excludes quotes and
-            // `#`, and the code before `path:` cannot contain a `/`-bearing
-            // token); swapping just the value preserves quote style and
-            // trailing options verbatim.
-            let new_line = original_line.replacen(prev_rel, rel, 1);
             // The fence lines are matched and recorded with their own
             // endings, so the record is the block as it stands in the file.
             let fence = |i: usize, want: &str| {
@@ -1429,9 +1433,26 @@ fn plan_gemfile_edit(
                     .get(i)
                     .is_some_and(|l| l.strip_suffix('\r').unwrap_or(l) == want)
             };
+            let in_block = idx > 0 && fence(idx - 1, MANAGED_OPEN) && fence(idx + 1, MANAGED_CLOSE);
+            // The rel appears exactly once (its charset excludes quotes and
+            // `#`, and the code before `path:` cannot contain a `/`-bearing
+            // token); swapping just the value preserves quote style and
+            // trailing options verbatim.
+            let body = original_line.strip_suffix('\r').unwrap_or(&original_line);
+            let mut new_line = body.replacen(prev_rel, rel, 1);
+            // A block line that ends at its `path:` is the one releases up
+            // to 5.1 appended: it gains the `require: false` the block is
+            // now written with (#2084). A line with anything after the
+            // `path:` (an option, a comment) was edited by hand and keeps
+            // its bytes, as does a declaration outside the block, which the
+            // Gemfile had before the patch.
+            if in_block && keywords_after_path(rest).is_empty() && !rest.contains('#') {
+                new_line.truncate(new_line.trim_end().len());
+                new_line.push_str(REQUIRE_FALSE);
+            }
+            new_line.push_str(cr);
             let managed_block =
-                (idx > 0 && fence(idx - 1, MANAGED_OPEN) && fence(idx + 1, MANAGED_CLOSE))
-                    .then(|| format!("{}\n{new_line}\n{}\n", lines[idx - 1], lines[idx + 1]));
+                in_block.then(|| format!("{}\n{new_line}\n{}\n", lines[idx - 1], lines[idx + 1]));
             return Ok(GemfilePlan::RewireOurs {
                 original_line,
                 new_line,

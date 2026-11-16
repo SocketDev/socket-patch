@@ -1047,6 +1047,32 @@ fn gem_vendor_transitive_dep_fresh_checkout_and_revert() {
         "frozen install must leave the committed Gemfile.lock byte-identical"
     );
 
+    // BOOT PROOF (#2084): `Bundler.require` is what an app runs at boot. It
+    // loads the declared `rack-test`, and must not load `rack`, which the
+    // Gemfile did not declare before the managed block: `rack/test` leaves
+    // `lib/rack.rb` (and with it the probe constant) unloaded, so only an
+    // auto-require of the block's own declaration defines it.
+    let boot = bundle(
+        &fresh,
+        &[
+            "exec",
+            "ruby",
+            "-e",
+            "require \"bundler/setup\"\n\
+             Bundler.require(:default)\n\
+             abort \"rack-test was not required at boot\" unless defined?(Rack::Test)\n\
+             abort \"Bundler.require loaded the vendored transitive gem\" if defined?(Rack::SOCKET_PATCH_VENDOR_E2E)\n\
+             abort \"lib/rack.rb loaded at boot\" if $LOADED_FEATURES.grep(%r{/rack\\.rb\\z}).any?",
+        ],
+        false,
+    );
+    assert!(
+        boot.status.success(),
+        "`Bundler.require` must not load a gem the Gemfile did not declare.\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&boot.stdout),
+        String::from_utf8_lossy(&boot.stderr),
+    );
+
     // `require "rack/test"` proves the direct dep still resolves alongside
     // the vendored transitive; it does not itself load `lib/rack.rb`, so the
     // marker is probed through an explicit `require "rack"` in the same VM.
