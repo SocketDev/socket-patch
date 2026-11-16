@@ -983,14 +983,14 @@ fn download_params(args: &ScanArgs, save_only: bool, json: bool, silent: bool) -
 }
 
 /// The run-level context the agent engine borrows from scan: the client
-/// `run` already built (proxy fallback included) and the flags the nested
-/// apply inherits — so `scan --mode agent` honors `--lock-timeout` and never
-/// rebuilds the client.
-fn download_run<'a>(args: &ScanArgs, api_client: &'a ApiClient) -> DownloadRun<'a> {
+/// `run` already built (proxy fallback included) and the caller's flags,
+/// which the nested apply inherits — so `scan --mode agent` honors
+/// `--lock-timeout` and `--no-gem-native-rebuild` and never rebuilds the
+/// client.
+fn download_run<'a>(args: &'a ScanArgs, api_client: &'a ApiClient) -> DownloadRun<'a> {
     DownloadRun {
         api_client,
-        lock_timeout: args.common.lock_timeout,
-        verbose: args.common.verbose,
+        common: &args.common,
     }
 }
 

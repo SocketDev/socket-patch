@@ -37,10 +37,10 @@ pub async fn download_and_apply_patches(
         proxy_url: None,
     })
     .await;
+    let flags = socket_patch_cli::args::GlobalArgs::default();
     let run = DownloadRun {
         api_client: &api_client,
-        lock_timeout: None,
-        verbose: false,
+        common: &flags,
     };
     let (code, env) = download_and_apply_patches_with(selected, params, &run).await;
     (code, env.to_value())
