@@ -102,6 +102,7 @@ use crate::patch::apply::{
     ApplyResult, MismatchPolicy, PatchSources,
 };
 use crate::patch::file_hash::compute_file_git_sha256_sync;
+use crate::patch::gem_source::{GemId, GemSource, RubyVersions};
 use crate::utils::fs::read_regular_to_bytes_sync;
 
 /// The refusal when a native-extension patch cannot be rebuilt in place
@@ -127,8 +128,18 @@ pub const BACKUP_DIR: &str = ".socket-patch-native-orig";
 /// The backup's description file, inside [`BACKUP_DIR`].
 const BACKUP_INFO: &str = "backup.json";
 
+/// The stage a rebuild from the source gem builds in, inside the gem home
+/// (the same filesystem as the build it replaces, so the finished extension
+/// dir is renamed into place): `<home>/.socket-patch-build/<full_name>`.
+const BUILD_STAGE_DIR: &str = ".socket-patch-build";
+
 /// How long one Ruby probe may take.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(60);
+/// How long unpacking one source gem into the stage may take.
+const UNPACK_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+/// How many gems one build may need staged beside it before the run gives
+/// up on it (a build needs one or two: `mini_portile2`, `rb_sys`).
+const MAX_STAGED_DEPENDENCIES: usize = 12;
 /// How long one extension build may take (nokogiri's vendored libxml2 build
 /// takes minutes).
 const BUILD_TIMEOUT: Duration = Duration::from_secs(30 * 60);
@@ -146,23 +157,47 @@ const NATIVE_SOURCE_EXTENSIONS: &[&str] = &[
     "c", "h", "cc", "cpp", "cxx", "hh", "hpp", "hxx", "m", "y", "rl",
 ];
 
+/// Sources a native gem compiles that are not C-family: a JRuby gem's Java,
+/// a Rust extension's crate.
+const NATIVE_BUILD_EXTENSIONS: &[&str] = &["java", "rs"];
+
+/// Build-system manifests, which are build inputs of a native gem wherever
+/// they sit (a `CMakeLists.txt` at the gem root is no document).
+const NATIVE_BUILD_FILES: &[&str] = &[
+    "CMakeLists.txt",
+    "Makefile",
+    "GNUmakefile",
+    "Cargo.toml",
+    "Cargo.lock",
+    "build.rs",
+];
+
+/// Top-level dirs of a gem that take no part in building its extension:
+/// executables, tests and documentation.
+const NOT_BUILT_DIRS: &[&str] = &[
+    "bin", "exe", "test", "spec", "features", "doc", "docs", "man",
+];
+
 /// Grammar sources a gem ships already generated (racc / ragel output is a
 /// `.rb` or `.c` file the gem packs): in a gem that builds no extension they
 /// compile nothing at install time.
 const GENERATED_GRAMMAR_EXTENSIONS: &[&str] = &["y", "rl"];
 
 /// The probe/build program run by the gem's Ruby ([`RubyRun`] names its
-/// two modes and their arguments). One line: `-e` with an embedded newline
+/// modes and their arguments). One line: `-e` with an embedded newline
 /// is fragile through a Windows command line. Ruby 1.8 does not load
 /// RubyGems by default (and `RUBYOPT` is cleared), so it is required
 /// explicitly; a RubyGems older than 2.2 (no per-gem extension dir, no
-/// `raw_require_paths`) is refused by name. The probe line carries an
-/// `sp_` key so stray output (an `operating_system.rb`, a shim) is skipped.
+/// `raw_require_paths`) is refused by name. Every line the program answers
+/// with carries an `sp_` key so stray output (an `operating_system.rb`, a
+/// shim) is skipped.
 ///
-/// `extensions_dir <home>` evaluates nothing of the gem: it is
+/// `extensions_dir <home> [<platform>]` evaluates nothing of the gem: it is
 /// `Gem::BasicSpecification#extensions_dir` for a spec in `<home>`, a
 /// function of this Ruby's platform and ABI (and a packager's
-/// `default_ext_dir_for`) alone.
+/// `default_ext_dir_for`) alone. A second line names this Ruby: its
+/// version, its RubyGems, the suffix of the extensions it loads, its
+/// platform, and whether a gem of `<platform>` runs on it.
 ///
 /// `build <gemspec> <extension dir> <require path>` loads the gemspec,
 /// which evaluates it, and builds only when it describes the layout its
@@ -177,7 +212,23 @@ const GENERATED_GRAMMAR_EXTENSIONS: &[&str] = &["y", "rl"];
 /// (`<installed home>/build_info/`). It evaluates nothing of the project:
 /// the spec is the archive's own metadata and the build scripts are the
 /// archive's.
-const RUBY_SCRIPT: &str = "require 'rubygems'; mode, a, b, c = ARGV; \
+///
+/// `unpack <archive> <stage home> <full name>` extracts a `.gem` into
+/// `<stage home>/gems/<full name>` and writes its gemspec beside it, as
+/// the installer does, without building anything: the archive must be the
+/// gem `<full name>` and declare extensions. Nothing of it is evaluated
+/// (its metadata is YAML, loaded as data).
+///
+/// `missing_deps <staged gemspec>` names the runtime dependencies of the
+/// staged gem, and of the gems that meet them, that no gem on `GEM_PATH`
+/// meets: what its build scripts may `require` and would not find.
+///
+/// `stage_build <staged gemspec> <stage home> <installed home> <installed
+/// full name>` builds the staged gem's extensions inside the stage home,
+/// with the build arguments RubyGems recorded for the installed copy. It
+/// loads the gemspec `unpack` wrote and runs the archive's build scripts
+/// over the staged tree.
+const RUBY_SCRIPT: &str = "require 'rubygems'; mode, a, b, c, d = ARGV; \
 unless Gem::Specification.respond_to?(:load) && \
 Gem::Specification.method_defined?(:extension_dir) && \
 Gem::Specification.method_defined?(:raw_require_paths) then \
@@ -188,6 +239,9 @@ if mode == 'extensions_dir' then \
 dir = (Gem.respond_to?(:default_ext_dir_for) && Gem.default_ext_dir_for(a)) || \
 File.join(a, 'extensions', Gem::Platform.local.to_s, Gem.extension_api_version); \
 puts \"sp_extensions_dir\\t#{File.expand_path(dir)}\"; \
+runs = b ? (Gem::Platform.new(b) === Gem::Platform.local ? 'yes' : 'no') : ''; \
+puts \"sp_ruby\\t#{RUBY_VERSION}\\t#{Gem::VERSION}\\t#{RbConfig::CONFIG['DLEXT']}\\t\
+#{Gem::Platform.local}\\t#{runs}\"; \
 elsif mode == 'install' then \
 require 'rubygems/installer'; \
 abort(\"RubyGems #{Gem::VERSION} is older than 2.5, whose installer cannot stage a gem\") \
@@ -200,6 +254,44 @@ inst = Gem::Installer.at(a, :install_dir => b, :ignore_dependencies => true, :wr
 :env_shebang => true, :document => [], :post_install_message => false, :build_args => args); \
 inst.install; \
 puts \"sp_installed\\t#{inst.spec.full_name}\\t#{File.expand_path(inst.spec.extension_dir)}\"; \
+elsif mode == 'unpack' then \
+require 'rubygems/package'; require 'fileutils'; \
+pkg = Gem::Package.new(a); spec = pkg.spec; \
+abort(\"the archive holds #{spec.full_name}, not #{c}\") unless spec.full_name == c; \
+abort(\"#{spec.full_name} declares no extensions to build\") if spec.extensions.empty?; \
+dir = File.join(b, 'gems', spec.full_name); FileUtils.mkdir_p(dir); \
+pkg.extract_files(dir); \
+specs = File.join(b, 'specifications'); FileUtils.mkdir_p(specs); \
+File.open(File.join(specs, \"#{spec.full_name}.gemspec\"), 'wb') { |f| f.write(spec.to_ruby_for_cache) }; \
+puts \"sp_unpacked\\t#{spec.full_name}\\t#{spec.raw_require_paths.first}\"; \
+elsif mode == 'missing_deps' then \
+spec = Gem::Specification.load(a) or abort(\"cannot load #{a}\"); \
+seen = {}; todo = [spec]; \
+until todo.empty? do \
+todo.shift.runtime_dependencies.each do |dep| \
+next if seen[dep.name]; \
+seen[dep.name] = true; \
+found = dep.matching_specs; \
+if found.empty? then \
+puts \"sp_missing\\t#{dep.name}\\t#{dep.requirement.as_list.join(',')}\"; \
+else \
+todo << found.sort_by { |s| s.version }.last; \
+end; \
+end; \
+end; \
+puts 'sp_deps_checked'; \
+elsif mode == 'stage_build' then \
+spec = Gem::Specification.load(a) or abort(\"cannot load #{a}\"); \
+unless File.expand_path(spec.base_dir) == File.expand_path(b) then \
+abort(\"#{a} is not a gem of #{b}\"); \
+end; \
+abort(\"#{a} declares no extensions\") if spec.extensions.empty?; \
+require 'rubygems/ext'; \
+Gem::DefaultUserInteraction.ui = Gem::SilentUI.new; \
+info = File.join(c, 'build_info', \"#{d}.info\"); \
+args = File.file?(info) ? File.readlines(info).map { |l| l.chomp } : []; \
+Gem::Ext::Builder.new(spec, args).build_extensions; \
+puts \"sp_built\\t#{File.expand_path(spec.extension_dir)}\"; \
 else \
 spec = Gem::Specification.load(a) or abort(\"cannot load #{a}\"); \
 unless File.expand_path(spec.extension_dir) == File.expand_path(b) then \
@@ -307,31 +399,55 @@ fn parse_extensions(spec_text: &str) -> ExtensionDecl {
     }
 }
 
-/// The gem's first require path (`lib`), parsed out of an installed
-/// gemspec's `s.require_paths = ["lib".freeze]` (`Specification#to_ruby`
-/// always writes the assignment). RubyGems installs the built extension's
-/// copies under it. A spec that assigns none has RubyGems' default, `lib`;
-/// an assignment whose first entry is not a string literal is `None`.
-fn parse_require_path(spec_text: &str) -> Option<String> {
-    for raw in spec_text.lines() {
+/// The right-hand side of every `<receiver>.<attr> = …` line of an
+/// installed gemspec (`Specification#to_ruby` writes one assignment per
+/// attribute), comments stripped. A comparison (`==`) or a longer attribute
+/// name (`require_paths_extra`) is not one.
+fn assignments<'t>(spec_text: &'t str, attr: &'t str) -> impl Iterator<Item = &'t str> + 't {
+    spec_text.lines().filter_map(move |raw| {
         let line = raw.split('#').next().unwrap_or("");
-        let Some(idx) = line.find(".require_paths") else {
-            continue;
-        };
-        let after = &line[idx + ".require_paths".len()..];
+        let needle = line
+            .match_indices(attr)
+            .find(|(at, _)| line[..*at].ends_with('.'))?;
+        let after = &line[needle.0 + attr.len()..];
         if after
             .chars()
             .next()
             .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
         {
-            continue;
+            return None;
         }
-        let assigned = after.trim_start().strip_prefix('=');
-        if let Some(rhs) = assigned.filter(|r| !r.starts_with('=')) {
-            return string_literals(rhs).into_iter().next();
-        }
+        after
+            .trim_start()
+            .strip_prefix('=')
+            .filter(|rhs| !rhs.starts_with('='))
+    })
+}
+
+/// The gem's require paths (`lib`), parsed out of an installed gemspec's
+/// `s.require_paths = ["lib".freeze]` (`Specification#to_ruby` always
+/// writes the assignment). RubyGems installs the built extension's copies
+/// under the first. A spec that assigns none has RubyGems' default, `lib`;
+/// an assignment that lists no string literal is `None`.
+fn parse_require_paths(spec_text: &str) -> Option<Vec<String>> {
+    match assignments(spec_text, "require_paths").next() {
+        Some(rhs) => Some(string_literals(rhs)).filter(|paths| !paths.is_empty()),
+        None => Some(vec!["lib".to_string()]),
     }
-    Some("lib".to_string())
+}
+
+/// The gem's first require path ([`parse_require_paths`]).
+fn parse_require_path(spec_text: &str) -> Option<String> {
+    parse_require_paths(spec_text).and_then(|paths| paths.into_iter().next())
+}
+
+/// The string an installed gemspec assigns to `attr` (`s.name =
+/// "nokogiri".freeze`): `None` when it assigns none, or something that is
+/// not a string literal (`s.platform = Gem::Platform::RUBY`).
+fn parse_string_attr(spec_text: &str, attr: &str) -> Option<String> {
+    assignments(spec_text, attr)
+        .next()
+        .and_then(|rhs| string_literals(rhs).into_iter().next())
 }
 
 /// The double- and single-quoted string literals in `text`, in order.
@@ -361,6 +477,65 @@ fn string_literals(text: &str) -> Vec<String> {
     out
 }
 
+/// What an installed gemspec's text says about the gem's compiled code.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct SpecFacts {
+    extensions: ExtensionDecl,
+    /// The platform of a platform gem (`arm64-darwin`, `x86_64-linux-gnu`,
+    /// `java`): the gem's dir name carries it after `<name>-<version>-`,
+    /// and its gemspec assigns it. `None` for the `ruby` platform.
+    platform: Option<String>,
+    /// Every require path the gemspec names (`lib`).
+    require_paths: Vec<String>,
+    /// The release the copy was installed from, when the gemspec names it
+    /// and the dir name agrees: what its source archive is called.
+    release: Option<GemId>,
+}
+
+impl SpecFacts {
+    /// Read the gemspec text of the copy whose gem dir is `full_name`.
+    fn of(spec_text: &str, full_name: &str) -> SpecFacts {
+        let name = parse_string_attr(spec_text, "name");
+        let version = parse_string_attr(spec_text, "version");
+        // `<name>-<version>` is the ruby platform; `<name>-<version>-<p>` is
+        // the platform gem `p`.
+        let suffix = match (&name, &version) {
+            (Some(name), Some(version)) => full_name
+                .strip_prefix(&format!("{name}-{version}"))
+                .filter(|rest| rest.is_empty() || rest.starts_with('-')),
+            _ => None,
+        };
+        let from_dir = suffix.and_then(|rest| rest.strip_prefix('-'));
+        let assigned = parse_string_attr(spec_text, "platform").filter(|p| p != "ruby");
+        let platform = from_dir
+            .map(str::to_string)
+            .or(assigned)
+            .filter(|p| !p.is_empty());
+        let release = match (name, version, suffix) {
+            (Some(name), Some(version), Some(_)) => Some(GemId {
+                name,
+                version,
+                platform: from_dir.map(str::to_string),
+            }),
+            _ => None,
+        };
+        SpecFacts {
+            extensions: parse_extensions(spec_text),
+            platform,
+            require_paths: parse_require_paths(spec_text).unwrap_or_default(),
+            release,
+        }
+    }
+}
+
+/// Whether `platform` is JRuby's: a `java` gem ships its compiled code as
+/// jars built from Java sources, which no source gem's `extconf.rb` builds.
+fn is_java_platform(platform: &str) -> bool {
+    platform
+        .split('-')
+        .any(|part| part.eq_ignore_ascii_case("java") || part.eq_ignore_ascii_case("jruby"))
+}
+
 /// Whether a (normalized) gem file path is a native-extension build input by
 /// its name alone: a C/C++/Objective-C source or header, a racc/ragel
 /// grammar, an `extconf.rb`, or a `depend` file under `ext/`.
@@ -380,33 +555,100 @@ fn is_generated_grammar(path: &str) -> bool {
     })
 }
 
+/// Whether a file of a native gem is a build file by its name, wherever it
+/// sits: a Java or Rust source, or the manifest of a build system.
+fn is_build_file_by_name(path: &str) -> bool {
+    let leaf = path.rsplit('/').next().unwrap_or(path);
+    NATIVE_BUILD_FILES.contains(&leaf)
+        || leaf.rsplit_once('.').is_some_and(|(stem, ext)| {
+            !stem.is_empty() && NATIVE_BUILD_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str())
+        })
+}
+
+/// Whether a file of a native gem clearly takes no part in its build: a
+/// file under a require path (Ruby loads it as it is), an executable, a
+/// test, documentation, or the gem's own packaging files.
+fn is_clearly_not_built(path: &str, require_paths: &[String]) -> bool {
+    let under_require_path = require_paths.iter().any(|require_path| {
+        let dir = require_path.trim_start_matches("./").trim_end_matches('/');
+        // A gem that requires from its root says nothing about a file.
+        !dir.is_empty()
+            && dir != "."
+            && path
+                .strip_prefix(dir)
+                .is_some_and(|rest| rest.starts_with('/'))
+    });
+    if under_require_path {
+        return true;
+    }
+    match path.split_once('/') {
+        Some((top, _)) => NOT_BUILT_DIRS.contains(&top),
+        None => {
+            let upper = path.to_ascii_uppercase();
+            ["README", "LICENSE", "LICENCE", "CHANGELOG", "GEMFILE"]
+                .iter()
+                .any(|prefix| upper.starts_with(prefix))
+                || [".MD", ".TXT", ".GEMSPEC"]
+                    .iter()
+                    .any(|suffix| upper.ends_with(suffix))
+        }
+    }
+}
+
 /// A gem record's native-extension build inputs on one installed copy.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct NativeScope {
     /// The record's keys that are build inputs, sorted.
     inputs: Vec<String>,
     /// The installed spec declares extensions (RubyGems builds them at
-    /// install time). `false` with inputs left: the gem's compiled code, if
-    /// any, ships precompiled.
+    /// install time).
     builds_extensions: bool,
+    /// The platform of a precompiled platform gem: its spec declares no
+    /// extensions and its platform is not `ruby`, so the compiled code it
+    /// runs was built from the ruby-platform source gem before it was
+    /// packed.
+    precompiled: Option<String>,
+    /// The release the copy was installed from ([`SpecFacts::release`]).
+    release: Option<GemId>,
 }
 
-/// Classify `files` against the extension declaration `decl`.
+impl NativeScope {
+    /// The archive the copy's extension is rebuilt from: its own for a gem
+    /// RubyGems built at install time, the ruby-platform source gem of the
+    /// same version for a precompiled one.
+    fn source_gem(&self) -> Option<GemId> {
+        let release = self.release.clone()?;
+        Some(match &self.precompiled {
+            Some(_) => GemId {
+                platform: None,
+                ..release
+            },
+            None => release,
+        })
+    }
+}
+
+/// Classify `files` against what the installed gemspec says (`facts`).
 ///
-/// In a gem that declares extensions, a key is a build input by name
-/// ([`is_native_by_name`]) or by living under the dir of a declared build
-/// script (a Rust extension's `.rs` sources, a `Rakefile`-built tree); a
-/// script at the gem root (`extensions = ["extconf.rb"]`) makes the files
-/// beside it inputs, the ones mkmf compiles, not every file of the gem. A
-/// declaration whose scripts are unknown makes everything under `ext/` an
-/// input.
+/// A gem is native when its gemspec declares extensions or its platform is
+/// not `ruby` (a precompiled platform gem). In a native gem every patched
+/// file is a build input unless it clearly is not one
+/// ([`is_clearly_not_built`]): `extconf.rb` builds from whatever the gem
+/// packs (nokogiri's reads `patches/**`, `ports/**` and
+/// `dependencies.yml`), so only a file known to take no part counts as
+/// plain. A source by name ([`is_native_by_name`], [`is_build_file_by_name`])
+/// and anything under `ext/` or the dir of a declared build script is
+/// always an input; a script at the gem root (`extensions =
+/// ["extconf.rb"]`) makes the files beside it inputs. A grammar under a
+/// require path of a precompiled gem is not one: its generated output is
+/// what the gem packs and Ruby loads.
 ///
-/// In a gem that declares none, only a name-matched source under `ext/`
-/// counts: that is where a precompiled platform gem keeps the sources of
-/// the binary it ships. C or Objective-C files elsewhere (a template, a
-/// test fixture) compile nothing, and neither do grammar sources, whose
-/// generated output the gem packs.
-fn classify(decl: &ExtensionDecl, files: &HashMap<String, PatchFileInfo>) -> NativeScope {
+/// In a gem that is not native (no extensions, the `ruby` platform), only a
+/// name-matched source under `ext/` counts. C or Objective-C files
+/// elsewhere (a template, a test fixture) compile nothing, and neither do
+/// grammar sources, whose generated output the gem packs.
+fn classify(facts: &SpecFacts, files: &HashMap<String, PatchFileInfo>) -> NativeScope {
+    let decl = &facts.extensions;
     // `None`: a script at the gem root.
     let dirs: Vec<Option<String>> = decl
         .entries
@@ -423,18 +665,26 @@ fn classify(decl: &ExtensionDecl, files: &HashMap<String, PatchFileInfo>) -> Nat
             None => !path.contains('/'),
         })
     };
-    let unknown_scripts = decl.declared && decl.entries.is_empty();
+    let precompiled = facts.platform.clone().filter(|_| !decl.declared);
+    let native = decl.declared || precompiled.is_some();
     let mut inputs: Vec<String> = files
         .keys()
         .filter(|key| {
             let path = normalize_file_path(key);
-            if decl.declared {
-                is_native_by_name(path)
-                    || under_script_dir(path)
-                    || (unknown_scripts && path.starts_with("ext/"))
-            } else {
-                path.starts_with("ext/") && is_native_by_name(path) && !is_generated_grammar(path)
+            if !native {
+                return path.starts_with("ext/")
+                    && is_native_by_name(path)
+                    && !is_generated_grammar(path);
             }
+            let plain = is_clearly_not_built(path, &facts.require_paths);
+            if precompiled.is_some() && plain && is_generated_grammar(path) {
+                return false;
+            }
+            is_native_by_name(path)
+                || is_build_file_by_name(path)
+                || under_script_dir(path)
+                || path.starts_with("ext/")
+                || !plain
         })
         .cloned()
         .collect();
@@ -442,6 +692,8 @@ fn classify(decl: &ExtensionDecl, files: &HashMap<String, PatchFileInfo>) -> Nat
     NativeScope {
         inputs,
         builds_extensions: decl.declared,
+        precompiled,
+        release: facts.release.clone(),
     }
 }
 
@@ -459,11 +711,11 @@ async fn scope_of(
             .ok(),
         None => None,
     };
-    let decl = spec_text
-        .as_deref()
-        .map(parse_extensions)
-        .unwrap_or_default();
-    let scope = classify(&decl, files);
+    let facts = match (&copy, &spec_text) {
+        (Some(copy), Some(text)) => SpecFacts::of(text, &copy.full_name),
+        _ => SpecFacts::default(),
+    };
+    let scope = classify(&facts, files);
     // Without a readable spec nothing proves which scripts the gem builds;
     // name-matched inputs still count, and the copy is unusable for a build.
     (scope, copy.filter(|_| spec_text.is_some()))
@@ -478,15 +730,27 @@ pub struct BuildMarker {
     pub sources: BTreeMap<String, String>,
     /// The extension dir built into, relative to the gem home:
     /// `extensions/<platform>/<abi>/<full_name>` (see [`confined_ext_dir`]).
+    /// Empty for a grafted build.
     pub extension_dir: String,
     /// Artifact path relative to the extension dir → git-sha256.
     pub ext_artifacts: BTreeMap<String, String>,
     /// The artifacts' copies RubyGems put under the gem's require dir:
-    /// path relative to the gem dir → git-sha256.
+    /// path relative to the gem dir → git-sha256. For a grafted build, the
+    /// prebuilt binaries the build replaced.
     pub lib_artifacts: BTreeMap<String, String>,
+    /// The copy is a precompiled platform gem, and `lib_artifacts` are its
+    /// prebuilt binaries replaced by a build of the source gem (schema
+    /// [`GRAFT_MARKER_SCHEMA`]).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub grafted: bool,
 }
 
+/// The marker of an extension dir RubyGems' builder filled.
 const MARKER_SCHEMA: u32 = 1;
+/// The marker of a precompiled copy whose prebuilt binaries were replaced
+/// ([`BuildMarker::grafted`]). A release that only knows schema 1 reads it
+/// as no marker, and so attests nothing it does not understand.
+const GRAFT_MARKER_SCHEMA: u32 = 2;
 
 /// The extension dir a marker or backup names, only when it is
 /// `extensions/<platform>/<abi>/<full_name>` under the copy's home: those
@@ -510,12 +774,20 @@ fn read_marker_sync(gem_dir: &Path) -> Option<BuildMarker> {
     let text = crate::utils::fs::read_regular_to_string_sync(&gem_dir.join(MARKER_FILE)).ok()?;
     serde_json::from_str::<BuildMarker>(&text)
         .ok()
-        .filter(|m| m.schema == MARKER_SCHEMA)
+        .filter(|m| match m.schema {
+            MARKER_SCHEMA => !m.grafted,
+            GRAFT_MARKER_SCHEMA => m.grafted,
+            _ => false,
+        })
 }
 
 /// Whether `marker` was built from exactly the record's patched native
 /// inputs, and every artifact it recorded is still on disk with the bytes it
 /// was built with. An artifact path that escapes its dir never verifies.
+///
+/// A marker speaks for the kind of copy it was written for: one of an
+/// extension dir for a gem that builds its extensions, a grafted one for a
+/// precompiled gem, which must name at least one replaced binary.
 fn marker_holds(
     marker: &BuildMarker,
     copy: &GemCopy,
@@ -528,28 +800,43 @@ fn marker_holds(
     if !sources_match || marker.sources.len() != scope.inputs.len() {
         return false;
     }
-    let Some(ext_dir) = confined_ext_dir(copy, &marker.extension_dir) else {
-        return false;
-    };
     let artifact_ok = |base: &Path, rel: &str, hash: &str| {
         is_safe_relative_subpath(rel)
             && compute_file_git_sha256_sync(&base.join(rel)).is_ok_and(|h| h == hash)
+    };
+    let lib_ok = || {
+        marker
+            .lib_artifacts
+            .iter()
+            .all(|(rel, hash)| artifact_ok(&copy.gem_dir, rel, hash))
+    };
+    if marker.grafted {
+        return scope.precompiled.is_some()
+            && !scope.builds_extensions
+            && marker.ext_artifacts.is_empty()
+            && !marker.lib_artifacts.is_empty()
+            && lib_ok();
+    }
+    if !scope.builds_extensions {
+        return false;
+    }
+    let Some(ext_dir) = confined_ext_dir(copy, &marker.extension_dir) else {
+        return false;
     };
     marker
         .ext_artifacts
         .iter()
         .all(|(rel, hash)| artifact_ok(&ext_dir, rel, hash))
-        && marker
-            .lib_artifacts
-            .iter()
-            .all(|(rel, hash)| artifact_ok(&copy.gem_dir, rel, hash))
+        && lib_ok()
 }
 
 /// `vex` / `apply --check`: the installed gem copy at `pkg_path`, whose
 /// record files already verify, runs code built from them. A record with no
 /// native input on this copy passes; one with native inputs passes only when
-/// the copy's build marker holds ([`BuildMarker`]). Errors carry
-/// [`NOT_REBUILT_REASON`].
+/// the copy's build marker holds ([`BuildMarker`]): for a gem RubyGems built
+/// at install time, the marker of its rebuilt extension dir; for a
+/// precompiled platform gem, the marker of the prebuilt binaries replaced
+/// by a build of the source gem. Errors carry [`NOT_REBUILT_REASON`].
 pub async fn verify_native_build(
     pkg_path: &Path,
     files: &HashMap<String, PatchFileInfo>,
@@ -558,7 +845,7 @@ pub async fn verify_native_build(
     if scope.inputs.is_empty() {
         return Ok(());
     }
-    let Some(copy) = copy.filter(|_| scope.builds_extensions) else {
+    let Some(copy) = copy else {
         return Err(NOT_REBUILT_REASON.to_string());
     };
     let files = files.clone();
@@ -591,6 +878,9 @@ pub struct RubyEnv {
     /// caller compiles them itself, so patched sources are written without
     /// a build, as before #1996, with a [`NOT_REBUILT_REASON`] warning.
     pub rebuild: bool,
+    /// `--offline`: a source gem that is not in the gem home's `cache/` is
+    /// not downloaded, and neither is a gem its build needs.
+    pub offline: bool,
 }
 
 /// The Ruby that builds a gem copy's extension, and where the build lands.
@@ -605,6 +895,42 @@ struct Probe {
     require_path: String,
     /// `gem_dir` / `require_path`: where RubyGems copies the artifacts.
     lib_dir: PathBuf,
+    /// What `ruby` said of itself, when it did.
+    facts: Option<RubyFacts>,
+}
+
+/// What a Ruby says of itself in a [`RubyRun::ExtensionsDir`] run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RubyFacts {
+    /// `RUBY_VERSION` (`3.4.10`).
+    ruby_version: String,
+    /// `Gem::VERSION`.
+    rubygems_version: String,
+    /// The suffix of the extensions it loads (`so`, `bundle`).
+    dlext: String,
+    /// `Gem::Platform.local` (`arm64-darwin-25`).
+    platform: String,
+    /// Whether a gem of the platform the run named runs on it; `None` when
+    /// the run named none.
+    runs_platform: Option<bool>,
+}
+
+impl RubyFacts {
+    /// `RUBY_VERSION[/\d+\.\d+/]`: the dir a precompiled gem keeps the
+    /// binary for this Ruby in (`3.4`).
+    fn minor(&self) -> Option<String> {
+        let mut parts = self.ruby_version.split('.');
+        let (major, minor) = (parts.next()?, parts.next()?);
+        let numeric = |part: &str| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit());
+        (numeric(major) && numeric(minor)).then(|| format!("{major}.{minor}"))
+    }
+
+    fn versions(&self) -> RubyVersions {
+        RubyVersions {
+            ruby: Some(self.ruby_version.clone()),
+            rubygems: Some(self.rubygems_version.clone()),
+        }
+    }
 }
 
 /// The `sp_extensions_dir` line of a [`RubyRun::ExtensionsDir`] run.
@@ -612,6 +938,28 @@ fn parse_extensions_dir(stdout: &str) -> Option<PathBuf> {
     stdout.lines().find_map(|line| {
         let (key, value) = line.split_once('\t')?;
         (key == "sp_extensions_dir" && !value.is_empty()).then(|| PathBuf::from(value))
+    })
+}
+
+/// The `sp_ruby` line of a [`RubyRun::ExtensionsDir`] run.
+fn parse_ruby_facts(stdout: &str) -> Option<RubyFacts> {
+    stdout.lines().find_map(|line| {
+        let mut fields = line.split('\t');
+        (fields.next()? == "sp_ruby").then_some(())?;
+        let (ruby_version, rubygems_version) = (fields.next()?, fields.next()?);
+        let (dlext, platform) = (fields.next()?, fields.next()?);
+        let runs_platform = match fields.next() {
+            Some("yes") => Some(true),
+            Some("no") => Some(false),
+            _ => None,
+        };
+        (!ruby_version.is_empty() && !dlext.is_empty()).then(|| RubyFacts {
+            ruby_version: ruby_version.to_string(),
+            rubygems_version: rubygems_version.to_string(),
+            dlext: dlext.to_string(),
+            platform: platform.to_string(),
+            runs_platform,
+        })
     })
 }
 
@@ -649,11 +997,13 @@ fn ruby_candidates(copy: &GemCopy, project: &Path) -> Vec<PathBuf> {
     out
 }
 
-/// The `GEM_PATH` a build runs with: the copy's home first (an `extconf.rb`
-/// requiring `mini_portile2` or `rb_sys` finds the copy installed beside
-/// it), then the caller's, then RubyGems' defaults (the trailing separator).
-fn gem_path_for(home: &Path) -> Option<OsString> {
-    let mut paths = vec![home.to_path_buf()];
+/// The `GEM_PATH` a build runs with: `homes` first (the copy's own, so an
+/// `extconf.rb` requiring `mini_portile2` or `rb_sys` finds the copy
+/// installed beside it; before it, a stage home holding the gems the build
+/// needs and the install lacks), then the caller's, then RubyGems'
+/// defaults (the trailing separator).
+fn gem_path_for(homes: &[&Path]) -> Option<OsString> {
+    let mut paths: Vec<PathBuf> = homes.iter().map(|home| home.to_path_buf()).collect();
     if let Some(existing) = std::env::var_os("GEM_PATH") {
         paths.extend(std::env::split_paths(&existing).filter(|p| !p.as_os_str().is_empty()));
     }
@@ -664,9 +1014,10 @@ fn gem_path_for(home: &Path) -> Option<OsString> {
 
 /// What a run of [`RUBY_SCRIPT`] is for.
 enum RubyRun<'a> {
-    /// Ask where this Ruby builds extensions for the copy's gem home. Loads
-    /// RubyGems and nothing of the gem.
-    ExtensionsDir,
+    /// Ask where this Ruby builds extensions for the copy's gem home, and
+    /// what it is. Loads RubyGems and nothing of the gem. With `platform`
+    /// it also says whether a gem of that platform runs on it.
+    ExtensionsDir { platform: Option<&'a str> },
     /// Build the copy's extensions into `probe.extension_dir`: loads the
     /// installed gemspec and runs the gem's build scripts.
     Build(&'a Probe),
@@ -674,6 +1025,25 @@ enum RubyRun<'a> {
     /// its extensions there: runs the archive's own build scripts.
     Install {
         archive: &'a Path,
+        stage_home: &'a Path,
+    },
+    /// Extract the `.gem` at `archive`, which must be the gem `full_name`
+    /// and declare extensions, into `stage_home`. Runs nothing of it.
+    Unpack {
+        archive: &'a Path,
+        stage_home: &'a Path,
+        full_name: &'a str,
+    },
+    /// Name the gems the staged gem at `spec` depends on that neither the
+    /// stage home nor the copy's home (nor the caller's `GEM_PATH`) holds.
+    MissingDeps {
+        spec: &'a Path,
+        stage_home: &'a Path,
+    },
+    /// Build the extensions of the staged gem at `spec` inside
+    /// `stage_home`: runs the staged tree's build scripts.
+    StageBuild {
+        spec: &'a Path,
         stage_home: &'a Path,
     },
 }
@@ -693,8 +1063,11 @@ async fn run_ruby(
     let mut command = command_for(ruby);
     command.arg("-e").arg(RUBY_SCRIPT).current_dir(&env.cwd);
     let mode = match run {
-        RubyRun::ExtensionsDir => {
+        RubyRun::ExtensionsDir { platform } => {
             command.arg("extensions_dir").arg(&copy.home);
+            if let Some(platform) = platform {
+                command.arg(platform);
+            }
             "extensions_dir"
         }
         RubyRun::Build(probe) => {
@@ -703,7 +1076,7 @@ async fn run_ruby(
                 .arg(&copy.spec_path)
                 .arg(&probe.extension_dir)
                 .arg(&probe.require_path);
-            if let Some(gem_path) = gem_path_for(&copy.home) {
+            if let Some(gem_path) = gem_path_for(&[&copy.home]) {
                 command.env("GEM_PATH", gem_path);
             }
             "build"
@@ -719,10 +1092,43 @@ async fn run_ruby(
                 .arg(&copy.home);
             // The installed copy's home, where the gems its build scripts
             // require were installed beside it.
-            if let Some(gem_path) = gem_path_for(&copy.home) {
+            if let Some(gem_path) = gem_path_for(&[&copy.home]) {
                 command.env("GEM_PATH", gem_path);
             }
             "install"
+        }
+        RubyRun::Unpack {
+            archive,
+            stage_home,
+            full_name,
+        } => {
+            command
+                .arg("unpack")
+                .arg(archive)
+                .arg(stage_home)
+                .arg(full_name);
+            "unpack"
+        }
+        RubyRun::MissingDeps { spec, stage_home } => {
+            command.arg("missing_deps").arg(spec);
+            if let Some(gem_path) = gem_path_for(&[stage_home, &copy.home]) {
+                command.env("GEM_PATH", gem_path);
+            }
+            "missing_deps"
+        }
+        RubyRun::StageBuild { spec, stage_home } => {
+            command
+                .arg("stage_build")
+                .arg(spec)
+                .arg(stage_home)
+                .arg(&copy.home)
+                .arg(&copy.full_name);
+            // The stage home first: the gems the build needs and the
+            // install lacks were put there, and nowhere else.
+            if let Some(gem_path) = gem_path_for(&[stage_home, &copy.home]) {
+                command.env("GEM_PATH", gem_path);
+            }
+            "stage_build"
         }
     };
     // A Bundler-run parent (`bundle exec`, the Bundler plugin) must not
@@ -891,6 +1297,10 @@ fn recover_interrupted_rebuild_sync(
     copy: &GemCopy,
     require_path: Option<&str>,
 ) -> std::io::Result<bool> {
+    // The stage of a rebuild from the source gem that never finished is
+    // dropped too: nothing of the copy is in it. One a live run holds is
+    // that run's (`WouldBlock`).
+    sweep_stale_stage(copy)?;
     let mut recovered = false;
     for ext in extension_dir_slots(copy) {
         let parked = parked_build_path(&ext);
@@ -1042,6 +1452,42 @@ async fn rebuild_preflight(copy: &GemCopy, env: &RubyEnv) -> Result<Preflight, S
     })
 }
 
+/// What a rebuild of a precompiled copy needs that files alone tell
+/// ([`rebuild_preflight`] for a gem RubyGems built): a require path its
+/// prebuilt binaries sit under and a Ruby to try. It has no extension dir;
+/// `installed` are the home's `extensions/<platform>/<abi>` dirs, where the
+/// Ruby that owns the home built its other gems.
+async fn graft_preflight(copy: &GemCopy, env: &RubyEnv) -> Result<Preflight, String> {
+    let require_path = require_path_of(copy).await.ok_or_else(|| {
+        format!(
+            "{} does not name a require path inside the gem",
+            copy.spec_path.display()
+        )
+    })?;
+    let candidates = ruby_candidates(copy, &env.cwd);
+    if candidates.is_empty() {
+        return Err("no `ruby` was found on PATH to rebuild it with".to_string());
+    }
+    let installed = {
+        let copy = copy.clone();
+        crate::utils::fs::run_blocking(move || {
+            let mut dirs: Vec<PathBuf> = extension_dir_slots(&copy)
+                .iter()
+                .filter_map(|slot| slot.parent().map(Path::to_path_buf))
+                .filter(|abi| is_real_dir(abi))
+                .collect();
+            dirs.dedup();
+            dirs
+        })
+        .await
+    };
+    Ok(Preflight {
+        installed,
+        candidates,
+        require_path,
+    })
+}
+
 /// Find the Ruby that owns `copy`'s install: the one whose extension dir
 /// for this gem is the installed `<home>/extensions/<platform>/<abi>/` one
 /// (its platform and ABI). Each candidate is asked where it builds
@@ -1055,7 +1501,8 @@ async fn find_ruby(copy: &GemCopy, env: &RubyEnv, preflight: Preflight) -> Resul
     } = preflight;
     let mut reasons = Vec::new();
     for ruby in candidates {
-        let stdout = match run_ruby(&ruby, RubyRun::ExtensionsDir, copy, env, PROBE_TIMEOUT).await {
+        let run = RubyRun::ExtensionsDir { platform: None };
+        let stdout = match run_ruby(&ruby, run, copy, env, PROBE_TIMEOUT).await {
             Ok(s) => s,
             Err(e) => {
                 reasons.push(format!("{}: {e}", ruby.display()));
@@ -1086,6 +1533,100 @@ async fn find_ruby(copy: &GemCopy, env: &RubyEnv, preflight: Preflight) -> Resul
             extension_dir,
             lib_dir: copy.gem_dir.join(&require_path),
             require_path,
+            facts: parse_ruby_facts(&stdout),
+        });
+    }
+    Err(format!(
+        "no Ruby owning this install was found ({})",
+        reasons.join("; ")
+    ))
+}
+
+/// Whether a gem home's leaf dir names a Ruby ABI (`3.4.0`), as the homes
+/// RubyGems and Bundler lay out do (`<prefix>/lib/ruby/gems/3.4.0`,
+/// `vendor/bundle/ruby/3.4.0`, `~/.gem/ruby/3.4.0`).
+fn abi_of_home(home: &Path) -> Option<String> {
+    let leaf = home.file_name()?.to_str()?;
+    let versioned = leaf.starts_with(|c: char| c.is_ascii_digit())
+        && leaf.contains('.')
+        && leaf.bytes().all(|b| b.is_ascii_digit() || b == b'.');
+    versioned.then(|| leaf.to_string())
+}
+
+/// [`find_ruby`] for a precompiled copy of the platform `platform`, which
+/// has no extension dir to match a Ruby to. The Ruby that owns it:
+///
+/// * runs gems of that platform (`Gem::Platform#===`, as RubyGems picks a
+///   platform gem), and
+/// * builds its extensions where this gem home has some (the home's
+///   `extensions/<platform>/<abi>` dirs, from its other native gems); in a
+///   home with none, its ABI is the one the home's dir name carries
+///   (`…/ruby/3.4.0`), when it carries one.
+///
+/// Its facts are part of the answer: the build is grafted over the binary
+/// the gem keeps for that Ruby's `major.minor`.
+async fn find_platform_ruby(
+    copy: &GemCopy,
+    env: &RubyEnv,
+    preflight: Preflight,
+    platform: &str,
+) -> Result<Probe, String> {
+    let Preflight {
+        installed,
+        candidates,
+        require_path,
+    } = preflight;
+    let mut reasons = Vec::new();
+    for ruby in candidates {
+        let run = RubyRun::ExtensionsDir {
+            platform: Some(platform),
+        };
+        let stdout = match run_ruby(&ruby, run, copy, env, PROBE_TIMEOUT).await {
+            Ok(s) => s,
+            Err(e) => {
+                reasons.push(format!("{}: {e}", ruby.display()));
+                continue;
+            }
+        };
+        let (Some(extensions_dir), Some(facts)) =
+            (parse_extensions_dir(&stdout), parse_ruby_facts(&stdout))
+        else {
+            reasons.push(format!("{}: unreadable probe output", ruby.display()));
+            continue;
+        };
+        if facts.runs_platform != Some(true) {
+            reasons.push(format!(
+                "{} is a {} Ruby, which does not run {platform} gems",
+                ruby.display(),
+                facts.platform
+            ));
+            continue;
+        }
+        let abi = extensions_dir
+            .file_name()
+            .map(|n| n.to_string_lossy().trim_end_matches("-static").to_string())
+            .unwrap_or_default();
+        let owns = if !installed.is_empty() {
+            installed.iter().any(|dir| same_path(dir, &extensions_dir))
+        } else {
+            abi_of_home(&copy.home).is_none_or(|home_abi| home_abi == abi)
+        };
+        if !owns {
+            reasons.push(format!(
+                "{} builds extensions into {}, which is not where this gem home has its own \
+                 (another Ruby's)",
+                ruby.display(),
+                extensions_dir.display()
+            ));
+            continue;
+        }
+        return Ok(Probe {
+            ruby,
+            gem_dir: copy.gem_dir.clone(),
+            extension_dir: extensions_dir.join(&copy.full_name),
+            lib_dir: copy.gem_dir.join(&require_path),
+            require_path,
+            facts: Some(facts),
         });
     }
     Err(format!(
@@ -1263,6 +1804,17 @@ struct BackupInfo {
     had_extension_dir: bool,
     /// The lib copies backed up under `lib/` (paths relative to the gem dir).
     lib_files: Vec<String>,
+    /// The backup is of a precompiled copy: `lib_files` are the prebuilt
+    /// binaries a build of the source gem replaced, and there is no
+    /// extension dir.
+    #[serde(default)]
+    grafted: bool,
+    /// Build inputs of the record that the precompiled copy did not ship
+    /// and the patch wrote into it (normalized paths): `rollback` removes
+    /// them instead of restoring content the copy never held
+    /// ([`rollback_files`]).
+    #[serde(default)]
+    absent_files: Vec<String>,
 }
 
 /// [`BuildMarker::extension_dir`] for `ext_dir` (one of the copy's
@@ -1328,6 +1880,7 @@ fn back_up_original(copy: &GemCopy, probe: &Probe) -> std::io::Result<bool> {
         extension_dir: ext_dir_label(&copy.home, &probe.extension_dir),
         had_extension_dir,
         lib_files,
+        ..BackupInfo::default()
     };
     std::fs::write(
         stage.join(BACKUP_INFO),
@@ -1458,19 +2011,25 @@ fn commit_build(
         }
         marker.ext_artifacts.insert(rel, hash);
     }
-    let bytes = serde_json::to_vec_pretty(&marker).map_err(std::io::Error::other)?;
-    let marker_path = copy.gem_dir.join(MARKER_FILE);
-    let stage = copy.gem_dir.join(format!("{MARKER_FILE}.tmp"));
-    if let Err(e) =
-        std::fs::write(&stage, bytes).and_then(|()| std::fs::rename(&stage, &marker_path))
-    {
-        let _ = std::fs::remove_file(&stage);
-        return Err(e);
-    }
+    write_marker(copy, &marker)?;
     if let Some(old) = &aside.old_ext {
         let _ = remove_dir_if_exists(old);
     }
     Ok(())
+}
+
+/// Record `marker` in the gem dir: staged beside its place and renamed, so
+/// a marker is always whole.
+fn write_marker(copy: &GemCopy, marker: &BuildMarker) -> std::io::Result<()> {
+    let bytes = serde_json::to_vec_pretty(marker).map_err(std::io::Error::other)?;
+    let marker_path = copy.gem_dir.join(MARKER_FILE);
+    let stage = copy.gem_dir.join(format!("{MARKER_FILE}.tmp"));
+    let written =
+        std::fs::write(&stage, bytes).and_then(|()| std::fs::rename(&stage, &marker_path));
+    if written.is_err() {
+        let _ = std::fs::remove_file(&stage);
+    }
+    written
 }
 
 /// Rebuild `copy`'s extension from the sources on disk with `probe.ruby`.
@@ -1546,6 +2105,796 @@ async fn rebuild(
     .await
 }
 
+/// `<home>/.socket-patch-build/<full_name>`: where a rebuild of `copy` from
+/// its source gem is staged.
+fn stage_root(copy: &GemCopy) -> PathBuf {
+    copy.home.join(BUILD_STAGE_DIR).join(&copy.full_name)
+}
+
+/// Drop the stage a rebuild of `copy` left behind when its process was
+/// interrupted or killed. Nothing of the installed copy is in a stage, so
+/// one that is left is only disk space. `Err` of kind `WouldBlock`: a run
+/// that is still alive holds it ([`lock_build_dir`]).
+fn sweep_stale_stage(copy: &GemCopy) -> std::io::Result<()> {
+    let root = stage_root(copy);
+    if is_real_dir(&root) {
+        match lock_build_dir(&root) {
+            Ok(_lock) => crate::patch::copy_tree::force_remove_dir_all(&root)?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+    }
+    // Gone with its last stage; a dir that still holds one stays.
+    let _ = std::fs::remove_dir(copy.home.join(BUILD_STAGE_DIR));
+    Ok(())
+}
+
+/// The stage of one rebuild from a source gem, held (an advisory lock on
+/// its dir) for as long as the value lives.
+struct Stage {
+    root: PathBuf,
+    /// The stage gem home, `<root>/home`: RubyGems unpacks, builds and
+    /// installs the build's missing dependencies here, and nowhere else.
+    home: PathBuf,
+    _lock: Option<std::fs::File>,
+}
+
+/// Open an empty stage for `copy` inside its gem home. `Err` says why the
+/// build cannot be staged there.
+fn open_stage(copy: &GemCopy) -> Result<Stage, String> {
+    let parent = copy.home.join(BUILD_STAGE_DIR);
+    let root = stage_root(copy);
+    // The stage is emptied and written under the gem home. A link planted
+    // where it goes would move both somewhere else.
+    for dir in [&parent, &root] {
+        if std::fs::symlink_metadata(dir).is_ok_and(|meta| !meta.is_dir()) {
+            return Err(format!(
+                "its stage directory {} is not a directory",
+                dir.display()
+            ));
+        }
+    }
+    let failed = |e: std::io::Error| {
+        if e.kind() == std::io::ErrorKind::WouldBlock {
+            recovery_refusal(copy, &e)
+        } else {
+            format!("a build could not be staged in {}: {e}", parent.display())
+        }
+    };
+    sweep_stale_stage(copy).map_err(failed)?;
+    let home = root.join("home");
+    std::fs::create_dir_all(&home).map_err(failed)?;
+    let lock = lock_build_dir(&root).map_err(failed)?;
+    Ok(Stage {
+        root,
+        home,
+        _lock: lock,
+    })
+}
+
+/// Remove `stage`, and the stage dir of the gem home when that left it
+/// empty. Best effort: a stage that stays is swept by the next run.
+async fn close_stage(stage: Stage, copy: &GemCopy) {
+    let parent = copy.home.join(BUILD_STAGE_DIR);
+    crate::utils::fs::run_blocking(move || {
+        let _ = crate::patch::copy_tree::force_remove_dir_all(&stage.root);
+        let _ = std::fs::remove_dir(parent);
+    })
+    .await;
+}
+
+/// The fields after the key of every `<key>\t…` line of a Ruby run's
+/// output.
+fn tagged_lines<'s>(stdout: &'s str, key: &str) -> Vec<Vec<&'s str>> {
+    stdout
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split('\t');
+            (fields.next()? == key).then(|| fields.collect())
+        })
+        .collect()
+}
+
+/// A source gem unpacked into a stage home.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StagedGem {
+    /// `<stage home>/gems/<full name>`: the gem's files, as the archive
+    /// packs them.
+    gem_dir: PathBuf,
+    /// `<stage home>/specifications/<full name>.gemspec`.
+    spec_path: PathBuf,
+}
+
+/// A staged gem whose extensions RubyGems built in the stage home.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StagedBuild {
+    gem: StagedGem,
+    /// The extension dir the build filled:
+    /// `<stage home>/extensions/<platform>/<abi>/<full name>`.
+    extension_dir: PathBuf,
+    /// That dir relative to the stage home.
+    label: String,
+}
+
+/// Why a staged gem did not build.
+#[derive(Debug)]
+enum StageFailure {
+    /// A gem its build scripts depend on is not installed and could not be
+    /// staged beside it.
+    Dependencies(String),
+    /// RubyGems' builder failed: the build's diagnostic.
+    Build(String),
+}
+
+/// Unpack `archive` (the source gem `source`) into `stage` with the Ruby
+/// that owns the copy. The archive must be that gem and declare
+/// extensions; nothing of it is run. `Err` says why it cannot be the
+/// source of a rebuild.
+async fn unpack_in_stage(
+    copy: &GemCopy,
+    probe: &Probe,
+    source: &GemId,
+    archive: Vec<u8>,
+    stage: &Stage,
+    env: &RubyEnv,
+) -> Result<StagedGem, String> {
+    let full_name = source.full_name();
+    let path = stage.root.join(format!("{full_name}.gem"));
+    {
+        let path = path.clone();
+        crate::utils::fs::run_blocking(move || std::fs::write(path, archive))
+            .await
+            .map_err(|e| format!("it could not be staged: {e}"))?;
+    }
+    let run = RubyRun::Unpack {
+        archive: &path,
+        stage_home: &stage.home,
+        full_name: &full_name,
+    };
+    let stdout = run_ruby(&probe.ruby, run, copy, env, UNPACK_TIMEOUT).await?;
+    let unpacked = tagged_lines(&stdout, "sp_unpacked")
+        .into_iter()
+        .any(|fields| fields.first() == Some(&full_name.as_str()));
+    let staged = StagedGem {
+        gem_dir: stage.home.join("gems").join(&full_name),
+        spec_path: stage
+            .home
+            .join("specifications")
+            .join(format!("{full_name}.gemspec")),
+    };
+    if !unpacked || !is_real_dir(&staged.gem_dir) || !staged.spec_path.is_file() {
+        return Err(format!(
+            "{}: unreadable unpack output",
+            probe.ruby.display()
+        ));
+    }
+    Ok(staged)
+}
+
+/// Lay the record's files over the staged source gem, with the engine that
+/// patches an installed copy. Every `beforeHash` is checked against the
+/// pristine gem (`Strict`, whatever the run's policy for the installed
+/// copy): a mismatch means the archive is not the gem the patch was written
+/// for. A file the record changes and the source gem does not pack is left
+/// out when it is no build input (a platform gem's own file). `Err` is the
+/// engine's reason.
+async fn patch_staged_gem(
+    read_scope: crate::utils::repo_root::ReadScope,
+    package_key: &str,
+    staged: &StagedGem,
+    scope: &NativeScope,
+    files: &HashMap<String, PatchFileInfo>,
+    sources: &PatchSources<'_>,
+) -> Result<(), String> {
+    let mut staged_files = files.clone();
+    for (key, info) in files {
+        if info.before_hash.is_empty() || scope.inputs.contains(key) {
+            continue;
+        }
+        let path = normalize_file_path(key);
+        let missing = is_safe_relative_subpath(path)
+            && matches!(
+                tokio::fs::symlink_metadata(staged.gem_dir.join(path)).await,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound
+            );
+        if missing {
+            staged_files.remove(key);
+        }
+    }
+    let applied = apply_package_patch(
+        read_scope,
+        package_key,
+        &staged.gem_dir,
+        &staged_files,
+        sources,
+        false,
+        MismatchPolicy::Strict,
+    )
+    .await;
+    if applied.success {
+        Ok(())
+    } else {
+        Err(applied
+            .error
+            .unwrap_or_else(|| "the patch did not apply".to_string()))
+    }
+}
+
+/// The patched content the stage is built from: the caller's in-memory
+/// blobs for the record, and the bytes of every record file the installed
+/// copy already holds patched. A copy whose sources an earlier run patched
+/// is rebuilt from them even when their blobs are no longer on disk.
+async fn stage_blobs(
+    pkg_path: &Path,
+    files: &HashMap<String, PatchFileInfo>,
+    sources: &PatchSources<'_>,
+) -> HashMap<String, Vec<u8>> {
+    let mut out = HashMap::new();
+    for (key, info) in files {
+        if let Some(bytes) = sources.mem_blobs.and_then(|m| m.get(&info.after_hash)) {
+            out.insert(info.after_hash.clone(), bytes.clone());
+            continue;
+        }
+        let path = normalize_file_path(key);
+        if !is_safe_relative_subpath(path) {
+            continue;
+        }
+        if let Ok(bytes) = crate::utils::fs::read_regular_to_bytes(&pkg_path.join(path)).await {
+            if compute_git_sha256_from_bytes(&bytes) == info.after_hash {
+                out.insert(info.after_hash.clone(), bytes);
+            }
+        }
+    }
+    out
+}
+
+/// Put the gems the staged gem's build depends on, and no gem on the
+/// build's `GEM_PATH` provides, into the stage home: each is the newest
+/// release its requirement allows, downloaded from the gem's source and
+/// verified against that source's index, then installed there by RubyGems.
+/// The user's gem home is never written. `Err` names what is missing.
+async fn stage_dependencies(
+    copy: &GemCopy,
+    probe: &Probe,
+    source: &GemId,
+    staged: &StagedGem,
+    stage: &Stage,
+    gems: &GemSource,
+    env: &RubyEnv,
+) -> Result<(), String> {
+    let versions = probe
+        .facts
+        .as_ref()
+        .map(RubyFacts::versions)
+        .unwrap_or_default();
+    let mut bases = gems.bases(source);
+    let default = crate::patch::redirect::upstream::rubygems_base();
+    if !bases.contains(&default) {
+        bases.push(default);
+    }
+    let mut staged_names: Vec<String> = Vec::new();
+    loop {
+        let run = RubyRun::MissingDeps {
+            spec: &staged.spec_path,
+            stage_home: &stage.home,
+        };
+        let stdout = run_ruby(&probe.ruby, run, copy, env, PROBE_TIMEOUT).await?;
+        if !stdout
+            .lines()
+            .any(|line| line.trim_end() == "sp_deps_checked")
+        {
+            return Err(format!(
+                "{}: unreadable dependency output",
+                probe.ruby.display()
+            ));
+        }
+        let missing: Vec<(String, String)> = tagged_lines(&stdout, "sp_missing")
+            .into_iter()
+            .filter_map(|fields| Some((fields.first()?.to_string(), fields.get(1)?.to_string())))
+            .collect();
+        if missing.is_empty() {
+            return Ok(());
+        }
+        for (name, requirement) in missing {
+            let needed =
+                format!("its build needs the gem {name} ({requirement}), which is not installed");
+            if gems.offline() {
+                return Err(format!("{needed}, and this run is offline"));
+            }
+            // Staged a moment ago and still missing: installing it again
+            // would loop.
+            if staged_names.contains(&name) || staged_names.len() >= MAX_STAGED_DEPENDENCIES {
+                return Err(format!("{needed} and could not be staged for the build"));
+            }
+            let (id, bytes) = gems
+                .dependency(&bases, &name, &requirement, &versions)
+                .await
+                .map_err(|why| format!("{needed} and could not be downloaded ({why})"))?;
+            let archive = stage.root.join(format!("{}.gem", id.full_name()));
+            {
+                let archive = archive.clone();
+                crate::utils::fs::run_blocking(move || std::fs::write(archive, bytes))
+                    .await
+                    .map_err(|e| format!("{needed} and could not be staged ({e})"))?;
+            }
+            let run = RubyRun::Install {
+                archive: &archive,
+                stage_home: &stage.home,
+            };
+            let stdout = run_ruby(&probe.ruby, run, copy, env, BUILD_TIMEOUT)
+                .await
+                .map_err(|why| format!("{needed} and did not install into the stage:\n{why}"))?;
+            if parse_installed(&stdout).is_none_or(|(full_name, _)| full_name != id.full_name()) {
+                return Err(format!("{needed} and did not install into the stage"));
+            }
+            staged_names.push(name);
+        }
+    }
+}
+
+/// Build the staged gem's extensions inside the stage home, with the Ruby
+/// that owns the copy and the build arguments RubyGems recorded for it.
+/// Nothing of the installed copy is touched.
+async fn build_staged(
+    copy: &GemCopy,
+    probe: &Probe,
+    source: &GemId,
+    staged: StagedGem,
+    stage: &Stage,
+    gems: &GemSource,
+    env: &RubyEnv,
+) -> Result<StagedBuild, StageFailure> {
+    stage_dependencies(copy, probe, source, &staged, stage, gems, env)
+        .await
+        .map_err(StageFailure::Dependencies)?;
+    let run = RubyRun::StageBuild {
+        spec: &staged.spec_path,
+        stage_home: &stage.home,
+    };
+    let stdout = run_ruby(&probe.ruby, run, copy, env, BUILD_TIMEOUT)
+        .await
+        .map_err(StageFailure::Build)?;
+    let built = tagged_lines(&stdout, "sp_built")
+        .into_iter()
+        .find_map(|fields| fields.first().map(PathBuf::from))
+        .ok_or_else(|| {
+            StageFailure::Build(format!("{}: unreadable build output", probe.ruby.display()))
+        })?;
+    // The one dir RubyGems builds this gem into, inside the stage home.
+    let label = ext_dir_label(&stage.home, &built);
+    let parts: Vec<&str> = label.split('/').collect();
+    let confined = parts.len() == 4
+        && parts[0] == "extensions"
+        && parts[3] == source.full_name()
+        && is_safe_relative_subpath(&label);
+    let extension_dir = stage.home.join(&label);
+    if !confined || !extension_dir.join(BUILD_COMPLETE).is_file() {
+        return Err(StageFailure::Build(format!(
+            "the build exited cleanly but left no finished extension in the stage ({})",
+            built.display()
+        )));
+    }
+    Ok(StagedBuild {
+        gem: staged,
+        extension_dir,
+        label,
+    })
+}
+
+/// Move the tree `from` to `to` (which is not there): a rename on one
+/// filesystem, a copy across two.
+fn move_tree(from: &Path, to: &Path) -> std::io::Result<()> {
+    if let Some(parent) = to.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    match std::fs::rename(from, to) {
+        Ok(()) => Ok(()),
+        Err(_) => copy_tree_sync(from, to),
+    }
+}
+
+/// A regular file, not a symlink to one.
+fn is_real_file(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|m| m.is_file())
+}
+
+/// Replace `dst` with the bytes of the regular file `src` ([`replace_file`]),
+/// with `mode`'s permissions, or `src`'s when there is none to keep.
+fn replace_with_file(
+    src: &Path,
+    dst: &Path,
+    mode: Option<std::fs::Permissions>,
+) -> std::io::Result<()> {
+    let bytes = read_regular_to_bytes_sync(src)?;
+    let perms = match mode {
+        Some(perms) => perms,
+        None => std::fs::metadata(src)?.permissions(),
+    };
+    replace_file(dst, |stage| {
+        std::fs::write(stage, &bytes)?;
+        std::fs::set_permissions(stage, perms)
+    })
+}
+
+/// Put a staged build in the place of the installed copy's: the staged
+/// extension dir becomes the copy's, and the `lib/` copies RubyGems made of
+/// its artifacts in the stage replace the installed ones. The original
+/// build is backed up first (`back_up`), the current one is parked while
+/// the new one moves in, and the marker records the result, exactly as an
+/// in-place [`rebuild`] leaves them. On failure the previous build is put
+/// back.
+fn install_staged_build(
+    copy: &GemCopy,
+    probe: &Probe,
+    scope: &NativeScope,
+    files: &HashMap<String, PatchFileInfo>,
+    staged: &StagedBuild,
+    back_up: bool,
+) -> Result<(), String> {
+    // The stage was built by the Ruby that owns the copy, so both name the
+    // same `extensions/<platform>/<abi>/<full_name>`.
+    if staged.label != ext_dir_label(&copy.home, &probe.extension_dir) {
+        return Err(format!(
+            "the staged build is in {}, not the installed extension's {}",
+            staged.label,
+            probe.extension_dir.display()
+        ));
+    }
+    let made_backup = if back_up {
+        back_up_original(copy, probe)
+            .map_err(|e| format!("could not back up the original extension build: {e}"))?
+    } else {
+        false
+    };
+    let drop_new_backup = || {
+        if made_backup {
+            let _ = remove_dir_if_exists(&copy.gem_dir.join(BACKUP_DIR));
+        }
+    };
+    let aside = match set_aside(copy, probe) {
+        Ok(aside) => aside,
+        Err(e) => {
+            drop_new_backup();
+            return Err(format!(
+                "could not move the current extension build aside: {e}"
+            ));
+        }
+    };
+    let moved_in = (|| -> std::io::Result<()> {
+        move_tree(&staged.extension_dir, &probe.extension_dir)?;
+        for rel in artifact_rels(&probe.extension_dir) {
+            let Some(lib) = lib_rel(probe, &rel) else {
+                continue;
+            };
+            // RubyGems copies an artifact under the require dir unless
+            // `Gem.install_extension_in_lib` is off: the staged gem shows
+            // which it did.
+            if is_real_file(&staged.gem.gem_dir.join(&lib)) {
+                replace_with_file(
+                    &probe.extension_dir.join(&rel),
+                    &copy.gem_dir.join(&lib),
+                    None,
+                )?;
+            }
+        }
+        commit_build(copy, probe, scope, files, &aside)
+    })();
+    let Err(error) = moved_in else {
+        return Ok(());
+    };
+    match put_back(copy, probe, aside) {
+        Ok(()) => {
+            drop_new_backup();
+            Err(format!(
+                "the rebuilt extension could not be moved into place: {error}"
+            ))
+        }
+        Err(e) => Err(format!(
+            "the rebuilt extension could not be moved into place: {error}\n(the previous build \
+             could not be put back: {e}; run `gem pristine {} --extensions` to rebuild it)",
+            gem_name_of(&copy.full_name)
+        )),
+    }
+}
+
+/// One prebuilt binary of a precompiled copy, and the staged artifact that
+/// replaces it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Graft {
+    staged: PathBuf,
+    /// The prebuilt binary, relative to the gem dir
+    /// (`lib/nokogiri/3.4/nokogiri.bundle`).
+    target: String,
+}
+
+/// Every regular file named `leaf` under `dir`, as paths relative to
+/// `base`, `/`-separated. Symlinks are not followed.
+fn files_named(dir: &Path, leaf: &str, base: &Path) -> Vec<String> {
+    walkdir::WalkDir::new(dir)
+        .follow_links(false)
+        .sort_by_file_name()
+        .into_iter()
+        .flatten()
+        .filter(|entry| entry.file_type().is_file() && entry.file_name() == leaf)
+        .filter_map(|entry| {
+            let rel = entry.path().strip_prefix(base).ok()?;
+            Some(
+                rel.components()
+                    .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                    .collect::<Vec<_>>()
+                    .join("/"),
+            )
+        })
+        .collect()
+}
+
+/// Match every extension the staged build produced to the prebuilt binary
+/// of `copy` that Ruby loads in its place.
+///
+/// A precompiled gem keeps one binary per Ruby minor in the rake-compiler
+/// layout, `<require path>/<dir>/<major.minor>/<file>` (nokogiri's
+/// `lib/nokogiri/3.4/nokogiri.bundle`, sqlite3's
+/// `lib/sqlite3/3.3/sqlite3_native.so`), where a source build has
+/// `<dir>/<file>`; the building Ruby's minor picks the one. A gem that
+/// keeps a single binary elsewhere is matched by its file name when exactly
+/// one file under the require path has it. `Err` when an extension has no
+/// counterpart, or more than one: grafting on a guess would leave Ruby
+/// loading the old code.
+fn plan_graft(copy: &GemCopy, probe: &Probe, staged: &StagedBuild) -> Result<Vec<Graft>, String> {
+    let facts = probe
+        .facts
+        .as_ref()
+        .ok_or_else(|| format!("{} did not say which Ruby it is", probe.ruby.display()))?;
+    let minor = facts.minor().ok_or_else(|| {
+        format!(
+            "{} reports the Ruby version {:?}",
+            probe.ruby.display(),
+            facts.ruby_version
+        )
+    })?;
+    let built: Vec<String> = artifact_rels(&staged.extension_dir)
+        .into_iter()
+        .filter(|rel| {
+            rel.rsplit_once('.')
+                .is_some_and(|(_, ext)| ext == facts.dlext)
+        })
+        .collect();
+    if built.is_empty() {
+        return Err(format!(
+            "the source gem's build left no .{} extension to replace a prebuilt one with",
+            facts.dlext
+        ));
+    }
+    let gem_root = canonical(&copy.gem_dir);
+    let mut grafts: Vec<Graft> = Vec::new();
+    for rel in built {
+        let (dir, leaf) = match rel.rsplit_once('/') {
+            Some((dir, leaf)) => (format!("{dir}/"), leaf),
+            None => (String::new(), rel.as_str()),
+        };
+        let exact = format!("{}/{dir}{minor}/{leaf}", probe.require_path);
+        let target = if is_real_file(&copy.gem_dir.join(&exact)) {
+            exact
+        } else {
+            let mut named = files_named(&probe.lib_dir, leaf, &copy.gem_dir);
+            match named.len() {
+                1 => named.remove(0),
+                0 => {
+                    return Err(format!(
+                        "the gem ships no prebuilt {leaf} for Ruby {minor} ({exact} is not there)"
+                    ))
+                }
+                _ => {
+                    return Err(format!(
+                        "the gem ships no prebuilt {leaf} for Ruby {minor} ({exact} is not \
+                         there), only {}",
+                        named.join(", ")
+                    ))
+                }
+            }
+        };
+        // Inside the gem dir, whatever links its tree holds.
+        let confined = is_safe_relative_subpath(&target)
+            && match (&gem_root, canonical(&copy.gem_dir.join(&target))) {
+                (Some(root), Some(path)) => path.starts_with(root),
+                _ => false,
+            };
+        if !confined || grafts.iter().any(|g| g.target == target) {
+            return Err(format!(
+                "the prebuilt binary {target} cannot be told apart from another file to replace"
+            ));
+        }
+        grafts.push(Graft {
+            staged: staged.extension_dir.join(&rel),
+            target,
+        });
+    }
+    Ok(grafts)
+}
+
+/// Back up the prebuilt binaries a graft is about to replace to
+/// [`BACKUP_DIR`], with the record's files the copy never shipped
+/// (`absent`), unless a backup exists or the current binaries are
+/// socket-patch's (a marker exists). An existing backup of a precompiled
+/// copy learns of `absent` files it does not list. `Ok(true)` when this
+/// call made the backup.
+fn back_up_prebuilt(copy: &GemCopy, grafts: &[Graft], absent: &[String]) -> std::io::Result<bool> {
+    let backup = copy.gem_dir.join(BACKUP_DIR);
+    let write_info = |dir: &Path, info: &BackupInfo| -> std::io::Result<()> {
+        let stage = dir.join(format!("{BACKUP_INFO}.tmp"));
+        std::fs::write(
+            &stage,
+            serde_json::to_vec_pretty(info).map_err(std::io::Error::other)?,
+        )?;
+        std::fs::rename(&stage, dir.join(BACKUP_INFO))
+    };
+    if std::fs::symlink_metadata(&backup).is_ok() {
+        let known = read_regular_to_bytes_sync(&backup.join(BACKUP_INFO))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<BackupInfo>(&bytes).ok());
+        if let Some(mut info) = known.filter(|info| info.grafted && is_real_dir(&backup)) {
+            let before = info.absent_files.len();
+            for path in absent {
+                if !info.absent_files.contains(path) {
+                    info.absent_files.push(path.clone());
+                }
+            }
+            if info.absent_files.len() != before {
+                write_info(&backup, &info)?;
+            }
+        }
+        return Ok(false);
+    }
+    if std::fs::symlink_metadata(copy.gem_dir.join(MARKER_FILE)).is_ok() {
+        return Ok(false);
+    }
+    let stage = copy.gem_dir.join(format!("{BACKUP_DIR}.tmp"));
+    remove_dir_if_exists(&stage)?;
+    std::fs::create_dir_all(&stage)?;
+    let mut lib_files = Vec::new();
+    for graft in grafts {
+        let src = copy.gem_dir.join(&graft.target);
+        let dst = stage.join("lib").join(&graft.target);
+        if let Some(parent) = dst.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&dst, read_regular_to_bytes_sync(&src)?)?;
+        std::fs::set_permissions(&dst, std::fs::symlink_metadata(&src)?.permissions())?;
+        lib_files.push(graft.target.clone());
+    }
+    let info = BackupInfo {
+        lib_files,
+        grafted: true,
+        absent_files: absent.to_vec(),
+        ..BackupInfo::default()
+    };
+    write_info(&stage, &info)?;
+    std::fs::rename(&stage, &backup)?;
+    Ok(true)
+}
+
+/// Replace each prebuilt binary with the staged build's ([`replace_file`]:
+/// a Ruby that has the old one mapped keeps its pages), then record the
+/// marker that attests them. A step that fails puts every binary back as
+/// it was.
+fn graft_binaries(
+    copy: &GemCopy,
+    scope: &NativeScope,
+    files: &HashMap<String, PatchFileInfo>,
+    grafts: &[Graft],
+) -> std::io::Result<()> {
+    let mut previous: Vec<LibSnapshot> = Vec::new();
+    for graft in grafts {
+        let path = copy.gem_dir.join(&graft.target);
+        let perms = std::fs::symlink_metadata(&path)?.permissions();
+        previous.push((
+            graft.target.clone(),
+            read_regular_to_bytes_sync(&path)?,
+            perms,
+        ));
+    }
+    let grafted = (|| -> std::io::Result<()> {
+        let mut marker = BuildMarker {
+            schema: GRAFT_MARKER_SCHEMA,
+            grafted: true,
+            ..BuildMarker::default()
+        };
+        for key in &scope.inputs {
+            if let Some(info) = files.get(key) {
+                marker.sources.insert(
+                    normalize_file_path(key).to_string(),
+                    info.after_hash.clone(),
+                );
+            }
+        }
+        for (graft, (_, _, perms)) in grafts.iter().zip(&previous) {
+            let path = copy.gem_dir.join(&graft.target);
+            replace_with_file(&graft.staged, &path, Some(perms.clone()))?;
+            marker
+                .lib_artifacts
+                .insert(graft.target.clone(), compute_file_git_sha256_sync(&path)?);
+        }
+        write_marker(copy, &marker)
+    })();
+    if grafted.is_err() {
+        for (target, bytes, perms) in &previous {
+            let _ = replace_file(&copy.gem_dir.join(target), |stage| {
+                std::fs::write(stage, bytes)?;
+                std::fs::set_permissions(stage, perms.clone())
+            });
+        }
+    }
+    grafted
+}
+
+/// The record as a precompiled copy takes it: a build input the copy does
+/// not ship (it is in the source gem alone, like nokogiri's `patches/**`)
+/// is added to it, whatever content the record says it replaces. That
+/// content is checked where it exists: in the source gem the extension is
+/// rebuilt from ([`patch_staged_gem`]). Returns the record so adjusted and
+/// the (normalized) paths it adds.
+async fn files_for_precompiled(
+    copy: &GemCopy,
+    scope: &NativeScope,
+    files: &HashMap<String, PatchFileInfo>,
+) -> (HashMap<String, PatchFileInfo>, Vec<String>) {
+    let mut out = files.clone();
+    let mut absent = Vec::new();
+    for key in &scope.inputs {
+        let Some(info) = out.get_mut(key).filter(|i| !i.before_hash.is_empty()) else {
+            continue;
+        };
+        let path = normalize_file_path(key);
+        let missing = is_safe_relative_subpath(path)
+            && matches!(
+                tokio::fs::symlink_metadata(copy.gem_dir.join(path)).await,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound
+            );
+        if missing {
+            info.before_hash.clear();
+            absent.push(path.to_string());
+        }
+    }
+    (out, absent)
+}
+
+/// The record's files as `rollback` undoes them on the gem copy at
+/// `pkg_path`. A build input `apply` added to a precompiled copy that never
+/// shipped it ([`files_for_precompiled`]; the copy's backup lists them) is
+/// removed, not restored to the content it has in the source gem. Any
+/// other copy: `files` as they are.
+pub async fn rollback_files(
+    pkg_path: &Path,
+    files: &HashMap<String, PatchFileInfo>,
+) -> HashMap<String, PatchFileInfo> {
+    let mut out = files.clone();
+    let Some(copy) = GemCopy::of(pkg_path) else {
+        return out;
+    };
+    let info = crate::utils::fs::run_blocking(move || {
+        let backup = copy.gem_dir.join(BACKUP_DIR);
+        if is_symlink(&backup) {
+            return None;
+        }
+        let bytes = read_regular_to_bytes_sync(&backup.join(BACKUP_INFO)).ok()?;
+        serde_json::from_slice::<BackupInfo>(&bytes).ok()
+    })
+    .await;
+    let Some(info) = info.filter(|info| info.grafted) else {
+        return out;
+    };
+    for (key, file) in out.iter_mut() {
+        if info
+            .absent_files
+            .iter()
+            .any(|path| path == normalize_file_path(key))
+        {
+            file.before_hash.clear();
+        }
+    }
+    out
+}
+
 /// `name` of a `name-version[-platform]` dir, for the `gem pristine` hint:
 /// the first `-` followed by a digit starts the version (gem names rarely
 /// hold one).
@@ -1587,6 +2936,134 @@ fn list_inputs(scope: &NativeScope) -> String {
     }
 }
 
+/// [`apply_package_patch`] over a gem copy, with no warning of its own.
+async fn plain_apply(
+    read_scope: crate::utils::repo_root::ReadScope,
+    package_key: &str,
+    pkg_path: &Path,
+    files: &HashMap<String, PatchFileInfo>,
+    sources: &PatchSources<'_>,
+    dry_run: bool,
+    policy: MismatchPolicy,
+) -> GemApplied {
+    GemApplied {
+        result: apply_package_patch(
+            read_scope,
+            package_key,
+            pkg_path,
+            files,
+            sources,
+            dry_run,
+            policy,
+        )
+        .await,
+        warning: None,
+    }
+}
+
+/// One gem copy's record, verified against the copy and about to be built.
+struct Job<'a> {
+    read_scope: crate::utils::repo_root::ReadScope,
+    package_key: &'a str,
+    pkg_path: &'a Path,
+    /// The record's files.
+    files: &'a HashMap<String, PatchFileInfo>,
+    /// The record as the installed copy takes it
+    /// ([`files_for_precompiled`]).
+    installed_files: &'a HashMap<String, PatchFileInfo>,
+    sources: &'a PatchSources<'a>,
+    policy: MismatchPolicy,
+    env: &'a RubyEnv,
+    copy: &'a GemCopy,
+    scope: &'a NativeScope,
+    /// [`list_inputs`] of the scope, for the messages.
+    inputs: &'a str,
+}
+
+impl Job<'_> {
+    fn refuse(&self, code: &str, detail: String) -> GemApplied {
+        refusal(self.package_key, self.pkg_path, code, detail)
+    }
+
+    /// The bytes each record file holds now, to put back if what follows
+    /// fails.
+    async fn originals(&self) -> Vec<(String, Option<Vec<u8>>)> {
+        let keys: Vec<String> = self.files.keys().cloned().collect();
+        let dir = self.pkg_path.to_path_buf();
+        crate::utils::fs::run_blocking(move || {
+            keys.into_iter()
+                .filter(|k| is_safe_relative_subpath(normalize_file_path(k)))
+                .map(|k| {
+                    let bytes = read_regular_to_bytes_sync(&dir.join(normalize_file_path(&k))).ok();
+                    (k, bytes)
+                })
+                .collect()
+        })
+        .await
+    }
+
+    /// Write the record's patched files into the installed copy. A write
+    /// that fails is undone here: the result then lists nothing as patched.
+    async fn write_sources(&self, originals: &[(String, Option<Vec<u8>>)]) -> ApplyResult {
+        let mut result = apply_package_patch(
+            self.read_scope,
+            self.package_key,
+            self.pkg_path,
+            self.installed_files,
+            self.sources,
+            false,
+            self.policy,
+        )
+        .await;
+        if !result.success {
+            revert_sources(self.pkg_path, originals, &result.files_patched).await;
+            result.files_patched.clear();
+            result.applied_via.clear();
+        }
+        result
+    }
+
+    /// The outcome of a copy whose sources are written and whose compiled
+    /// code was built from them.
+    fn built(&self, result: ApplyResult) -> GemApplied {
+        let warning = result.files_patched.is_empty().then(|| {
+            (
+                REBUILT_CODE.to_string(),
+                format!(
+                    "{}: its native extension was rebuilt from sources an earlier run \
+                     patched without rebuilding ({})",
+                    self.package_key, self.inputs
+                ),
+            )
+        });
+        GemApplied { result, warning }
+    }
+
+    /// The outcome of a copy that is as it was before the run, because
+    /// `detail` (a [`BUILD_FAILED_CODE`] failure).
+    async fn not_built(
+        &self,
+        mut result: ApplyResult,
+        originals: &[(String, Option<Vec<u8>>)],
+        detail: String,
+    ) -> GemApplied {
+        revert_sources(self.pkg_path, originals, &result.files_patched).await;
+        result.success = false;
+        result.files_patched.clear();
+        result.applied_via.clear();
+        result.error = Some(format!("{BUILD_FAILED_CODE}: {detail}"));
+        GemApplied {
+            result,
+            warning: Some((BUILD_FAILED_CODE.to_string(), detail)),
+        }
+    }
+}
+
+/// The remedy a refusal names for a gem RubyGems built at install time:
+/// hosted mode installs the patched ruby-platform gem.
+const HOSTED_HINT: &str = "Use `socket-patch scan --mode hosted`, which installs the patched gem \
+                           through Bundler so RubyGems compiles it.";
+
 /// [`apply_package_patch`] for one installed gem copy, rebuilding its
 /// native extension when the record changes a build input (see the module
 /// docs). A record without native inputs is applied exactly as
@@ -1603,23 +3080,17 @@ pub async fn apply_gem_package_patch(
     env: &RubyEnv,
 ) -> GemApplied {
     let (scope, copy) = scope_of(pkg_path, files).await;
-    let plain = || async {
-        GemApplied {
-            result: apply_package_patch(
-                read_scope,
-                package_key,
-                pkg_path,
-                files,
-                sources,
-                dry_run,
-                policy,
-            )
-            .await,
-            warning: None,
-        }
-    };
     if scope.inputs.is_empty() {
-        return plain().await;
+        return plain_apply(
+            read_scope,
+            package_key,
+            pkg_path,
+            files,
+            sources,
+            dry_run,
+            policy,
+        )
+        .await;
     }
     let inputs = list_inputs(&scope);
     // A rebuild of this copy that an earlier run started and did not finish
@@ -1645,7 +3116,16 @@ pub async fn apply_gem_package_patch(
     // (the patches evaluation harness does), so the sources are written as
     // before #1996, and the warning says the build is the caller's.
     if !env.rebuild {
-        let mut applied = plain().await;
+        let mut applied = plain_apply(
+            read_scope,
+            package_key,
+            pkg_path,
+            files,
+            sources,
+            dry_run,
+            policy,
+        )
+        .await;
         if applied.result.success {
             applied.warning = Some((
                 NOT_REBUILT_REASON.to_string(),
@@ -1658,8 +3138,6 @@ pub async fn apply_gem_package_patch(
         }
         return applied;
     }
-    let hosted_hint = "Use `socket-patch scan --mode hosted`, which installs the patched gem \
-                       through Bundler so RubyGems compiles it.";
     let Some(copy) = copy else {
         return refusal(
             package_key,
@@ -1668,24 +3146,43 @@ pub async fn apply_gem_package_patch(
             format!(
                 "the patch changes native-extension sources ({inputs}), but {} is not a \
                  RubyGems install with a specification to rebuild the extension from; \
-                 nothing was written. {hosted_hint}",
+                 nothing was written. {HOSTED_HINT}",
                 pkg_path.display()
             ),
         );
     };
-    if !scope.builds_extensions {
+    if !scope.builds_extensions && scope.precompiled.is_none() {
         return refusal(
             package_key,
             pkg_path,
             UNSUPPORTED_CODE,
             format!(
                 "the patch changes native-extension sources ({inputs}), but the installed gem \
-                 builds no extension at install time (a precompiled platform gem ships its \
-                 compiled code), so they cannot take effect; nothing was written. Install the \
-                 `ruby` platform gem and use `socket-patch scan --mode hosted`."
+                 builds no extension at install time and is not a precompiled platform gem, \
+                 so nothing here compiles them and they cannot take effect; nothing was \
+                 written."
             ),
         );
     }
+    if let Some(platform) = scope.precompiled.as_deref().filter(|p| is_java_platform(p)) {
+        return refusal(
+            package_key,
+            pkg_path,
+            UNSUPPORTED_CODE,
+            format!(
+                "the patch changes native-extension sources ({inputs}), but the installed gem \
+                 is the JRuby build ({platform}), whose compiled code ships as jars built from \
+                 Java sources; they cannot be rebuilt from the source gem here, so the patch \
+                 cannot take effect; nothing was written."
+            ),
+        );
+    }
+    let precompiled = scope.precompiled.is_some();
+    let (installed_files, absent) = if precompiled {
+        files_for_precompiled(&copy, &scope, files).await
+    } else {
+        (files.clone(), Vec::new())
+    };
 
     // Already patched and built from these sources: nothing to do.
     let built = {
@@ -1696,9 +3193,25 @@ pub async fn apply_gem_package_patch(
         .await
     };
     if built {
-        return plain().await;
+        return plain_apply(
+            read_scope,
+            package_key,
+            pkg_path,
+            &installed_files,
+            sources,
+            dry_run,
+            policy,
+        )
+        .await;
     }
 
+    // A gem RubyGems built can also be installed patched through hosted
+    // mode; a precompiled one cannot (hosted mode refuses platform gems).
+    let hint = if precompiled {
+        String::new()
+    } else {
+        format!(" {HOSTED_HINT}")
+    };
     let unbuildable = |why: String| {
         refusal(
             package_key,
@@ -1707,15 +3220,73 @@ pub async fn apply_gem_package_patch(
             format!(
                 "the patch changes native-extension sources ({inputs}), which only take \
                  effect once the extension is rebuilt, and it cannot be rebuilt here: \
-                 {why}; nothing was written. {hosted_hint}"
+                 {why}; nothing was written.{hint}"
             ),
         )
     };
     // What files alone tell: a build to replace and a Ruby to try.
-    let preflight = match rebuild_preflight(&copy, env).await {
+    let preflight = if precompiled {
+        graft_preflight(&copy, env).await
+    } else {
+        rebuild_preflight(&copy, env).await
+    };
+    let preflight = match preflight {
         Ok(p) => p,
         Err(why) => return unbuildable(why),
     };
+    // A precompiled gem's extension can only be rebuilt from the source gem
+    // of its version. Without that archive in the gem home's cache and
+    // without the network, files alone tell there is no way to it.
+    let gems = GemSource::of(&env.cwd, env.offline).await;
+    let source = scope.source_gem();
+    let needs_source_gem = |source: Option<&GemId>, why: String, missing: bool| {
+        let archive = match source {
+            Some(source) => format!("{}.gem", source.full_name()),
+            None => "its ruby-platform gem".to_string(),
+        };
+        let remedy = if missing {
+            format!(
+                " Run `socket-patch apply` once with network access to the gem's source, or \
+                 put {archive} in {}.",
+                copy.home.join("cache").display()
+            )
+        } else {
+            String::new()
+        };
+        refusal(
+            package_key,
+            pkg_path,
+            UNSUPPORTED_CODE,
+            format!(
+                "the patch changes native-extension sources ({inputs}) of the precompiled gem \
+                 {}, which only take effect once its extension is rebuilt from the source gem \
+                 ({archive}), and that cannot be done here: {why}; nothing was written.{remedy}",
+                copy.full_name
+            ),
+        )
+    };
+    if precompiled {
+        let Some(source) = &source else {
+            return needs_source_gem(
+                None,
+                format!(
+                    "{} does not name the gem and version it was installed from",
+                    copy.spec_path.display()
+                ),
+                false,
+            );
+        };
+        if !gems.may_have(&copy.home, source).await {
+            return needs_source_gem(
+                Some(source),
+                format!(
+                    "{} is not there and this run is offline",
+                    crate::patch::gem_source::cache_path(&copy.home, source).display()
+                ),
+                true,
+            );
+        }
+    }
 
     // No program runs until the record's files verify against this copy:
     // until then nothing says the tree is the package the patch is for.
@@ -1724,7 +3295,7 @@ pub async fn apply_gem_package_patch(
         read_scope,
         package_key,
         pkg_path,
-        files,
+        &installed_files,
         sources,
         true,
         policy,
@@ -1747,27 +3318,39 @@ pub async fn apply_gem_package_patch(
                 .files_verified
                 .iter()
                 .all(|v| v.status == crate::patch::apply::VerifyStatus::AlreadyPatched);
-        let parked = preflight
-            .installed
-            .iter()
-            .any(|dir| is_real_dir(&parked_build_path(dir)));
+        let parked = !precompiled
+            && preflight
+                .installed
+                .iter()
+                .any(|dir| is_real_dir(&parked_build_path(dir)));
         let unfinished = if parked {
             "; an earlier rebuild did not finish, and apply first puts back the build it parked"
         } else {
             ""
         };
-        let detail = if all_patched {
-            format!(
+        let detail = match (all_patched, precompiled) {
+            (true, false) => format!(
                 "{package_key}: dry run: its sources are already patched, but its native \
                  extension was not built from them ({inputs}); apply would rebuild \
                  it{unfinished}"
-            )
-        } else {
-            format!(
+            ),
+            (false, false) => format!(
                 "{package_key}: dry run: apply would write its patched sources and rebuild \
                  its native extension from them ({inputs}); no Ruby was run to check that \
                  it can{unfinished}"
-            )
+            ),
+            (true, true) => format!(
+                "{package_key}: dry run: its sources are already patched, but the gem's \
+                 precompiled extension was not built from them ({inputs}); apply would \
+                 rebuild it from the source gem and replace the prebuilt binary with that \
+                 build"
+            ),
+            (false, true) => format!(
+                "{package_key}: dry run: apply would write its patched sources, rebuild its \
+                 native extension from the source gem and replace the gem's prebuilt binary \
+                 with that build ({inputs}); no Ruby was run and nothing was downloaded to \
+                 check that it can"
+            ),
         };
         return GemApplied {
             result: verified,
@@ -1775,77 +3358,282 @@ pub async fn apply_gem_package_patch(
         };
     }
 
-    let probe = match find_ruby(&copy, env, preflight).await {
+    let found = match &scope.precompiled {
+        Some(platform) => find_platform_ruby(&copy, env, preflight, platform).await,
+        None => find_ruby(&copy, env, preflight).await,
+    };
+    let probe = match found {
         Ok(p) => p,
         Err(why) => return unbuildable(why),
     };
-
-    // The bytes each file holds now, to put back if the build fails.
-    let originals: Vec<(String, Option<Vec<u8>>)> = {
-        let keys: Vec<String> = files.keys().cloned().collect();
-        let dir = pkg_path.to_path_buf();
-        crate::utils::fs::run_blocking(move || {
-            keys.into_iter()
-                .filter(|k| is_safe_relative_subpath(normalize_file_path(k)))
-                .map(|k| {
-                    let bytes = read_regular_to_bytes_sync(&dir.join(normalize_file_path(&k))).ok();
-                    (k, bytes)
-                })
-                .collect()
-        })
-        .await
-    };
-
-    let mut result = apply_package_patch(
+    let job = Job {
         read_scope,
         package_key,
         pkg_path,
         files,
+        installed_files: &installed_files,
         sources,
-        false,
         policy,
-    )
-    .await;
+        env,
+        copy: &copy,
+        scope: &scope,
+        inputs: &inputs,
+    };
+
+    // The source gem holds every build input, where the installed copy may
+    // not (a build deletes what it no longer needs; a precompiled gem never
+    // shipped them): the extension is rebuilt from it when it can be had.
+    let archive = match &source {
+        Some(source) => gems.archive(&copy.home, source).await,
+        None => Err(format!(
+            "{} does not name the gem and version it was installed from",
+            copy.spec_path.display()
+        )),
+    };
+    match (archive, &source) {
+        (Ok(archive), Some(source)) => {
+            match rebuild_from_source_gem(&job, &probe, source, archive, &gems, &absent).await {
+                Ok(applied) => applied,
+                Err(why) if precompiled => needs_source_gem(Some(source), why, false),
+                // Not an archive this copy can be rebuilt from: its own
+                // tree is what is left to build.
+                Err(_) => rebuild_in_place(&job, &probe).await,
+            }
+        }
+        (Err(why), _) if precompiled => needs_source_gem(source.as_ref(), why, true),
+        _ => rebuild_in_place(&job, &probe).await,
+    }
+}
+
+/// Write the patched sources and rebuild the extension from the installed
+/// copy's own tree ([`rebuild`]): what is left when its source gem cannot
+/// be had. A failed build puts the sources and the previous build back.
+async fn rebuild_in_place(job: &Job<'_>, probe: &Probe) -> GemApplied {
+    let originals = job.originals().await;
+    let result = job.write_sources(&originals).await;
     if !result.success {
-        revert_sources(pkg_path, &originals, &result.files_patched).await;
-        result.files_patched.clear();
-        result.applied_via.clear();
         return GemApplied {
             result,
             warning: None,
         };
     }
-
-    match rebuild(&copy, &probe, &scope, files, env, true).await {
-        Ok(()) => {
-            let warning = result.files_patched.is_empty().then(|| {
-                (
-                    REBUILT_CODE.to_string(),
-                    format!(
-                        "{}: its native extension was rebuilt from sources an earlier run \
-                         patched without rebuilding ({inputs})",
-                        package_key
-                    ),
-                )
-            });
-            GemApplied { result, warning }
-        }
+    match rebuild(job.copy, probe, job.scope, job.files, job.env, true).await {
+        Ok(()) => job.built(result),
         Err(diagnostic) => {
-            revert_sources(pkg_path, &originals, &result.files_patched).await;
             let detail = format!(
-                "the native extension did not build from the patched sources ({inputs}); the \
+                "the native extension did not build from the patched sources ({}); the \
                  sources and the previous build were put back. Install a compiler toolchain \
                  and the Ruby headers and apply again, or use `socket-patch scan --mode \
-                 hosted`.\n{diagnostic}"
+                 hosted`.\n{diagnostic}",
+                job.inputs
             );
-            result.success = false;
-            result.files_patched.clear();
-            result.applied_via.clear();
-            result.error = Some(format!("{BUILD_FAILED_CODE}: {detail}"));
-            GemApplied {
-                result,
-                warning: Some((BUILD_FAILED_CODE.to_string(), detail)),
-            }
+            job.not_built(result, &originals, detail).await
+        }
+    }
+}
+
+/// Rebuild the copy's extension from its source gem (`archive`, the gem
+/// `source`), with the record's files laid over it in a stage, and put the
+/// build in the installed copy's place. The installed copy is not touched
+/// until the build has finished. `Err` when the archive is not one the
+/// copy can be rebuilt from (it is another gem, or declares no
+/// extensions): nothing was built or written.
+async fn rebuild_from_source_gem(
+    job: &Job<'_>,
+    probe: &Probe,
+    source: &GemId,
+    archive: Vec<u8>,
+    gems: &GemSource,
+    absent: &[String],
+) -> Result<GemApplied, String> {
+    let stage = {
+        let copy = job.copy.clone();
+        crate::utils::fs::run_blocking(move || open_stage(&copy)).await
+    };
+    let stage = match stage {
+        Ok(stage) => stage,
+        Err(why) => {
+            return Ok(job.refuse(
+                UNSUPPORTED_CODE,
+                format!(
+                    "the patch changes native-extension sources ({}), which only take effect \
+                     once the extension is rebuilt, and it cannot be rebuilt here: {why}; \
+                     nothing was written.",
+                    job.inputs
+                ),
+            ))
+        }
+    };
+    let outcome = rebuild_in_stage(job, probe, source, archive, gems, absent, &stage).await;
+    close_stage(stage, job.copy).await;
+    outcome
+}
+
+/// [`rebuild_from_source_gem`], inside its open stage.
+async fn rebuild_in_stage(
+    job: &Job<'_>,
+    probe: &Probe,
+    source: &GemId,
+    archive: Vec<u8>,
+    gems: &GemSource,
+    absent: &[String],
+    stage: &Stage,
+) -> Result<GemApplied, String> {
+    let (copy, inputs) = (job.copy, job.inputs);
+    let staged = unpack_in_stage(copy, probe, source, archive, stage, job.env).await?;
+    // The record over the pristine source gem, before anything runs.
+    let blobs = stage_blobs(job.pkg_path, job.files, job.sources).await;
+    let staged_sources = PatchSources {
+        blobs_path: job.sources.blobs_path,
+        mem_blobs: Some(&blobs),
+    };
+    let patched = patch_staged_gem(
+        job.read_scope,
+        job.package_key,
+        &staged,
+        job.scope,
+        job.files,
+        &staged_sources,
+    )
+    .await;
+    if let Err(why) = patched {
+        return Ok(job.refuse(
+            UNSUPPORTED_CODE,
+            format!(
+                "the patch changes native-extension sources ({inputs}), which only take \
+                 effect once the extension is rebuilt from the source gem ({}.gem), and the \
+                 patch does not apply to that gem: {why}; nothing was written.",
+                source.full_name()
+            ),
+        ));
+    }
+    let built = match build_staged(copy, probe, source, staged, stage, gems, job.env).await {
+        Ok(built) => built,
+        Err(StageFailure::Dependencies(why)) => {
+            return Ok(job.refuse(
+                UNSUPPORTED_CODE,
+                format!(
+                    "the patch changes native-extension sources ({inputs}), which only take \
+                     effect once the extension is rebuilt, and it cannot be rebuilt here: \
+                     {why}; nothing was written."
+                ),
+            ))
+        }
+        Err(StageFailure::Build(diagnostic)) => {
+            let detail = format!(
+                "the native extension did not build from the patched sources ({inputs}); \
+                 nothing of the installed gem was changed. Install a compiler toolchain and \
+                 the Ruby headers and apply again.\n{diagnostic}"
+            );
+            return Ok(job.refuse(BUILD_FAILED_CODE, detail));
+        }
+    };
+
+    if job.scope.precompiled.is_some() {
+        return Ok(graft_into_copy(job, probe, &built, absent).await);
+    }
+    // A gem RubyGems built: its sources are written in place, and the
+    // staged build takes the place of its extension dir.
+    let originals = job.originals().await;
+    let result = job.write_sources(&originals).await;
+    if !result.success {
+        return Ok(GemApplied {
+            result,
+            warning: None,
+        });
+    }
+    let installed = {
+        let (copy, probe, scope) = (copy.clone(), probe.clone(), job.scope.clone());
+        let (files, built) = (job.files.clone(), built.clone());
+        crate::utils::fs::run_blocking(move || {
+            install_staged_build(&copy, &probe, &scope, &files, &built, true)
+        })
+        .await
+    };
+    Ok(match installed {
+        Ok(()) => job.built(result),
+        Err(why) => {
+            let detail = format!(
+                "the native extension was rebuilt from the patched sources ({inputs}), but \
+                 {why}; the sources and the previous build were put back."
+            );
+            job.not_built(result, &originals, detail).await
+        }
+    })
+}
+
+/// Put a staged build into a precompiled copy: the record's files are
+/// written into the copy, and each prebuilt binary Ruby loads is replaced
+/// by the build's ([`plan_graft`]), after the originals are backed up. A
+/// step that fails leaves the copy as it was.
+async fn graft_into_copy(
+    job: &Job<'_>,
+    probe: &Probe,
+    built: &StagedBuild,
+    absent: &[String],
+) -> GemApplied {
+    let (copy, inputs) = (job.copy, job.inputs);
+    let planned = {
+        let (copy, probe, built) = (copy.clone(), probe.clone(), built.clone());
+        crate::utils::fs::run_blocking(move || plan_graft(&copy, &probe, &built)).await
+    };
+    let unplaceable = |why: String| {
+        job.refuse(
+            UNSUPPORTED_CODE,
+            format!(
+                "the patch changes native-extension sources ({inputs}) of the precompiled gem \
+                 {}, and its extension was rebuilt from the source gem, but the build cannot \
+                 take the place of the gem's prebuilt binary: {why}; nothing was written.",
+                copy.full_name
+            ),
+        )
+    };
+    let grafts = match planned {
+        Ok(grafts) => grafts,
+        Err(why) => return unplaceable(why),
+    };
+    let made_backup = {
+        let (copy, grafts, absent) = (copy.clone(), grafts.clone(), absent.to_vec());
+        crate::utils::fs::run_blocking(move || back_up_prebuilt(&copy, &grafts, &absent)).await
+    };
+    let made_backup = match made_backup {
+        Ok(made) => made,
+        Err(e) => {
+            let stage = copy.gem_dir.join(format!("{BACKUP_DIR}.tmp"));
+            let _ = crate::utils::fs::run_blocking(move || remove_dir_if_exists(&stage)).await;
+            return unplaceable(format!("the prebuilt binary could not be backed up ({e})"));
+        }
+    };
+    let drop_new_backup = || async {
+        if made_backup {
+            let backup = copy.gem_dir.join(BACKUP_DIR);
+            let _ = crate::utils::fs::run_blocking(move || remove_dir_if_exists(&backup)).await;
+        }
+    };
+    let originals = job.originals().await;
+    let result = job.write_sources(&originals).await;
+    if !result.success {
+        drop_new_backup().await;
+        return GemApplied {
+            result,
+            warning: None,
+        };
+    }
+    let grafted = {
+        let (copy, scope) = (copy.clone(), job.scope.clone());
+        let (files, grafts) = (job.files.clone(), grafts.clone());
+        crate::utils::fs::run_blocking(move || graft_binaries(&copy, &scope, &files, &grafts)).await
+    };
+    match grafted {
+        Ok(()) => job.built(result),
+        Err(e) => {
+            drop_new_backup().await;
+            let detail = format!(
+                "the native extension was rebuilt from the patched sources ({inputs}), but \
+                 the build could not replace the gem's prebuilt binary ({e}); the sources and \
+                 the prebuilt binary were put back."
+            );
+            job.not_built(result, &originals, detail).await
         }
     }
 }
@@ -1877,10 +3665,14 @@ async fn revert_sources(
 
 /// After `rollback` put a gem copy's sources back: put its original compiled
 /// extension back too. The backup [`apply_gem_package_patch`] took is
-/// restored whenever it exists: it is this gem version's install-time build,
-/// right whether the current build is socket-patch's (marker present) or one
+/// restored whenever it exists: it is this gem version's install-time build
+/// (for a precompiled copy, the prebuilt binaries the gem shipped), right
+/// whether the current build is socket-patch's (marker present) or one
 /// whose marker never got written. Without a backup, a copy carrying a
-/// socket-patch build (a marker) is rebuilt from the restored sources.
+/// socket-patch build (a marker) is rebuilt from the restored sources: from
+/// its source gem when that can be had, else in place. A precompiled copy
+/// without its backup is not rebuilt (that would not give the prebuilt
+/// binaries back): the error names `gem pristine`, which reinstalls them.
 /// A rebuild an earlier run did not finish is put right first
 /// ([`recover_interrupted_rebuild`]), so the build parked by it is back
 /// before any of that. `Ok(true)` when a build was restored, `Ok(false)`
@@ -1921,8 +3713,15 @@ pub async fn restore_original_build(pkg_path: &Path, env: &RubyEnv) -> Result<bo
                 )
             });
     }
-    if marker.is_none() {
+    let Some(marker) = marker else {
         return Ok(recovered);
+    };
+    if marker.grafted {
+        return Err(format!(
+            "the gem's prebuilt binary still holds the patched build, and the backup of the \
+             original is gone; run `gem pristine {}` to reinstall the gem as it shipped",
+            gem_name_of(&copy.full_name)
+        ));
     }
     if !env.rebuild {
         return Err(format!(
@@ -1943,59 +3742,129 @@ pub async fn restore_original_build(pkg_path: &Path, env: &RubyEnv) -> Result<bo
             gem_name_of(&copy.full_name)
         )
     })?;
-    let scope = NativeScope::default();
-    rebuild(&copy, &probe, &scope, &HashMap::new(), env, false)
-        .await
-        .map_err(|diagnostic| {
-            format!(
-                "the extension did not rebuild from the restored sources; run `gem pristine \
-                 {} --extensions`.\n{diagnostic}",
-                gem_name_of(&copy.full_name)
-            )
-        })?;
+    let rebuilt = match rebuild_unpatched_from_source_gem(&copy, &probe, env).await {
+        Some(rebuilt) => rebuilt,
+        None => {
+            let scope = NativeScope::default();
+            rebuild(&copy, &probe, &scope, &HashMap::new(), env, false).await
+        }
+    };
+    rebuilt.map_err(|diagnostic| {
+        format!(
+            "the extension did not rebuild from the restored sources; run `gem pristine \
+             {} --extensions`.\n{diagnostic}",
+            gem_name_of(&copy.full_name)
+        )
+    })?;
     let _ = tokio::fs::remove_file(copy.gem_dir.join(MARKER_FILE)).await;
     Ok(true)
 }
 
+/// Rebuild `copy`'s extension from its source gem as it shipped (no record
+/// over it), for a rollback that has no backup of the original build.
+/// `None` when the source gem cannot be had or used: the in-place rebuild
+/// is what is left.
+async fn rebuild_unpatched_from_source_gem(
+    copy: &GemCopy,
+    probe: &Probe,
+    env: &RubyEnv,
+) -> Option<Result<(), String>> {
+    let spec_text = crate::utils::fs::read_regular_to_string(&copy.spec_path)
+        .await
+        .ok()?;
+    let facts = SpecFacts::of(&spec_text, &copy.full_name);
+    let source = facts.release.filter(|_| facts.extensions.declared)?;
+    let gems = GemSource::of(&env.cwd, env.offline).await;
+    let archive = gems.archive(&copy.home, &source).await.ok()?;
+    let stage = {
+        let copy = copy.clone();
+        crate::utils::fs::run_blocking(move || open_stage(&copy)).await
+    };
+    let stage = match stage {
+        Ok(stage) => stage,
+        Err(why) => return Some(Err(why)),
+    };
+    let outcome = async {
+        let staged = unpack_in_stage(copy, probe, &source, archive, &stage, env)
+            .await
+            .ok()?;
+        let built = match build_staged(copy, probe, &source, staged, &stage, &gems, env).await {
+            Ok(built) => built,
+            Err(StageFailure::Dependencies(why) | StageFailure::Build(why)) => {
+                return Some(Err(why))
+            }
+        };
+        let (copy, probe) = (copy.clone(), probe.clone());
+        Some(
+            crate::utils::fs::run_blocking(move || {
+                let scope = NativeScope::default();
+                install_staged_build(&copy, &probe, &scope, &HashMap::new(), &built, false)
+            })
+            .await,
+        )
+    }
+    .await;
+    close_stage(stage, copy).await;
+    outcome
+}
+
 /// Put the backed-up original build back over socket-patch's build, then
-/// drop the marker and the backup. The extension dir the backup names must
-/// be this gem's under the home ([`confined_ext_dir`]) and no symlink, or
-/// nothing is touched.
+/// drop the marker and the backup. For a gem RubyGems built, the extension
+/// dir the backup names must be this gem's under the home
+/// ([`confined_ext_dir`]) and no symlink, or nothing is touched. For a
+/// precompiled copy the backup holds its prebuilt binaries, which go back
+/// where they were under the gem dir, bytes and mode.
 fn restore_backup(copy: &GemCopy, marker: Option<&BuildMarker>) -> std::io::Result<()> {
     let backup = copy.gem_dir.join(BACKUP_DIR);
     let info: BackupInfo =
         serde_json::from_slice(&read_regular_to_bytes_sync(&backup.join(BACKUP_INFO))?)
             .map_err(std::io::Error::other)?;
-    let ext_dir = confined_ext_dir(copy, &info.extension_dir)
-        .filter(|dir| !is_symlink(dir))
-        .ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!(
-                    "the backup names {:?}, which is not this gem's extension dir under {}",
-                    info.extension_dir,
-                    copy.home.display()
-                ),
-            )
-        })?;
-    // socket-patch's lib copies go; the originals come back.
-    for lib in marker.iter().flat_map(|m| m.lib_artifacts.keys()) {
-        if is_safe_relative_subpath(lib) && !info.lib_files.contains(lib) {
-            let _ = std::fs::remove_file(copy.gem_dir.join(lib));
+    let restore_lib_files = || -> std::io::Result<()> {
+        for lib in &info.lib_files {
+            if !is_safe_relative_subpath(lib) {
+                continue;
+            }
+            let saved = backup.join("lib").join(lib);
+            let bytes = read_regular_to_bytes_sync(&saved)?;
+            let perms = std::fs::symlink_metadata(&saved)?.permissions();
+            replace_file(&copy.gem_dir.join(lib), |stage| {
+                std::fs::write(stage, &bytes)?;
+                // The mode the backup kept (a prebuilt binary's); a backup
+                // of `lib/` copies was written with the default one.
+                if info.grafted {
+                    std::fs::set_permissions(stage, perms)?;
+                }
+                Ok(())
+            })?;
         }
-    }
-    remove_dir_if_exists(&ext_dir)?;
-    if info.had_extension_dir {
-        copy_tree_sync(&backup.join("ext"), &ext_dir)?;
-    }
-    for lib in &info.lib_files {
-        if !is_safe_relative_subpath(lib) {
-            continue;
+        Ok(())
+    };
+    if info.grafted {
+        restore_lib_files()?;
+    } else {
+        let ext_dir = confined_ext_dir(copy, &info.extension_dir)
+            .filter(|dir| !is_symlink(dir))
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "the backup names {:?}, which is not this gem's extension dir under {}",
+                        info.extension_dir,
+                        copy.home.display()
+                    ),
+                )
+            })?;
+        // socket-patch's lib copies go; the originals come back.
+        for lib in marker.iter().flat_map(|m| m.lib_artifacts.keys()) {
+            if is_safe_relative_subpath(lib) && !info.lib_files.contains(lib) {
+                let _ = std::fs::remove_file(copy.gem_dir.join(lib));
+            }
         }
-        let bytes = read_regular_to_bytes_sync(&backup.join("lib").join(lib))?;
-        replace_file(&copy.gem_dir.join(lib), |stage| {
-            std::fs::write(stage, &bytes)
-        })?;
+        remove_dir_if_exists(&ext_dir)?;
+        if info.had_extension_dir {
+            copy_tree_sync(&backup.join("ext"), &ext_dir)?;
+        }
+        restore_lib_files()?;
     }
     match std::fs::remove_file(copy.gem_dir.join(MARKER_FILE)) {
         Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
@@ -2019,6 +3888,19 @@ mod tests {
         keys.iter()
             .map(|k| (k.to_string(), info(&"a".repeat(64))))
             .collect()
+    }
+
+    /// What the gemspec of a gem RubyGems builds says: the `ruby` platform,
+    /// `lib` as its require path, and `scripts` as its extensions.
+    fn built_gem(scripts: &[&str]) -> SpecFacts {
+        SpecFacts {
+            extensions: ExtensionDecl {
+                declared: true,
+                entries: scripts.iter().map(|s| s.to_string()).collect(),
+            },
+            require_paths: vec!["lib".to_string()],
+            ..SpecFacts::default()
+        }
     }
 
     #[test]
@@ -2078,10 +3960,7 @@ mod tests {
 
     #[test]
     fn classify_counts_files_under_declared_script_dirs() {
-        let decl = ExtensionDecl {
-            declared: true,
-            entries: vec!["ext/foo/Cargo.toml".into()],
-        };
+        let decl = built_gem(&["ext/foo/Cargo.toml"]);
         let scope = classify(
             &decl,
             &files(&["ext/foo/src/lib.rs", "lib/foo.rb", "package/ext/foo/x.c"]),
@@ -2096,12 +3975,12 @@ mod tests {
     #[test]
     fn classify_without_extensions_keeps_c_but_drops_grammars() {
         let scope = classify(
-            &ExtensionDecl::default(),
+            &SpecFacts::default(),
             &files(&["lib/parser.y", "lib/parser.rb", "ext/x.c"]),
         );
         assert_eq!(scope.inputs, vec!["ext/x.c"]);
         assert!(!scope.builds_extensions);
-        let ruby_only = classify(&ExtensionDecl::default(), &files(&["lib/parser.y"]));
+        let ruby_only = classify(&SpecFacts::default(), &files(&["lib/parser.y"]));
         assert!(ruby_only.inputs.is_empty());
     }
 
@@ -2110,7 +3989,7 @@ mod tests {
     #[test]
     fn classify_without_extensions_ignores_c_outside_ext() {
         let scope = classify(
-            &ExtensionDecl::default(),
+            &SpecFacts::default(),
             &files(&["lib/templates/App.m", "test/fixtures/a.c", "lib/a.h"]),
         );
         assert!(scope.inputs.is_empty());
@@ -2119,10 +3998,7 @@ mod tests {
     /// A root-level script makes the files beside it inputs, not `lib/`.
     #[test]
     fn classify_root_level_script_counts_top_level_files_only() {
-        let decl = ExtensionDecl {
-            declared: true,
-            entries: vec!["extconf.rb".into()],
-        };
+        let decl = built_gem(&["extconf.rb"]);
         let scope = classify(&decl, &files(&["extconf.rb", "foo.c", "lib/foo.rb"]));
         assert_eq!(scope.inputs, vec!["extconf.rb", "foo.c"]);
     }
@@ -2148,10 +4024,7 @@ mod tests {
 
     #[test]
     fn unknown_scripts_make_ext_tree_native() {
-        let decl = ExtensionDecl {
-            declared: true,
-            entries: Vec::new(),
-        };
+        let decl = built_gem(&[]);
         let scope = classify(&decl, &files(&["ext/foo/build.rs", "lib/a.rb"]));
         assert_eq!(scope.inputs, vec!["ext/foo/build.rs"]);
     }
@@ -2308,6 +4181,7 @@ mod tests {
         let env = RubyEnv {
             cwd: tmp.path().to_path_buf(),
             rebuild: true,
+            offline: true,
         };
         let mut preflight = Preflight {
             installed: installed_extension_dirs(&copy),
@@ -2344,6 +4218,7 @@ mod tests {
         let env = RubyEnv {
             cwd: tmp.path().to_path_buf(),
             rebuild: true,
+            offline: true,
         };
         for require_path in ["../../elsewhere", "/abs"] {
             let home = tmp.path().join(require_path.replace(['/', '.'], "_"));
@@ -2372,6 +4247,7 @@ mod tests {
         let env = RubyEnv {
             cwd: tmp.path().to_path_buf(),
             rebuild: true,
+            offline: true,
         };
         // Without a `ruby` on PATH the preflight still refuses, for that.
         match rebuild_preflight(&copy, &env).await {
@@ -2493,6 +4369,7 @@ mod tests {
             extension_dir: ext.clone(),
             require_path: "lib".to_string(),
             lib_dir: copy.gem_dir.join("lib"),
+            facts: None,
         };
 
         let aside = set_aside(&copy, &probe).unwrap();
@@ -2567,6 +4444,7 @@ mod tests {
             extension_dir: "extensions/p/3.4.0/a-1".into(),
             had_extension_dir: true,
             lib_files: vec!["lib/a/a.so".into()],
+            ..BackupInfo::default()
         };
         std::fs::write(backup.join(BACKUP_INFO), serde_json::to_vec(&info).unwrap()).unwrap();
         if with_marker {
@@ -2604,6 +4482,7 @@ mod tests {
                 extension_dir: label,
                 had_extension_dir: true,
                 lib_files: Vec::new(),
+                ..BackupInfo::default()
             };
             std::fs::write(
                 gem_dir.join(BACKUP_DIR).join(BACKUP_INFO),
@@ -2613,6 +4492,7 @@ mod tests {
             let env = RubyEnv {
                 cwd: home.clone(),
                 rebuild: true,
+                offline: true,
             };
             assert!(restore_original_build(&gem_dir, &env).await.is_err());
             assert!(
@@ -2639,6 +4519,7 @@ mod tests {
         let env = RubyEnv {
             cwd: home.clone(),
             rebuild: true,
+            offline: true,
         };
         let restored = tokio::time::timeout(
             std::time::Duration::from_secs(10),
@@ -2663,6 +4544,7 @@ mod tests {
             let env = RubyEnv {
                 cwd: home.to_path_buf(),
                 rebuild: true,
+                offline: true,
             };
             assert_eq!(restore_original_build(&gem_dir, &env).await, Ok(true));
             let ext = home.join("extensions/p/3.4.0/a-1");
@@ -2705,6 +4587,7 @@ mod tests {
         let scope = NativeScope {
             inputs: vec!["ext/a/a.c".into()],
             builds_extensions: true,
+            ..NativeScope::default()
         };
         let marker = BuildMarker {
             schema: MARKER_SCHEMA,
@@ -2712,6 +4595,7 @@ mod tests {
             extension_dir: "extensions/p/3.4.0/a-1".into(),
             ext_artifacts: [("a/a.so".to_string(), hash.clone())].into(),
             lib_artifacts: [("lib/a/a.so".to_string(), hash.clone())].into(),
+            grafted: false,
         };
         assert!(marker_holds(&marker, &copy, &scope, &record));
 

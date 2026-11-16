@@ -695,6 +695,7 @@ mod tests {
         RubyEnv {
             cwd: cwd.to_path_buf(),
             rebuild: true,
+            offline: true,
         }
     }
 
@@ -1065,6 +1066,7 @@ mod tests {
             &RubyEnv {
                 cwd: tmp.path().to_path_buf(),
                 rebuild: false,
+                offline: true,
             },
         )
         .await;

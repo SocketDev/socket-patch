@@ -121,6 +121,7 @@ impl Policy {
             ruby: RubyEnv {
                 cwd: common.cwd.clone(),
                 rebuild: !common.no_gem_native_rebuild,
+                offline: common.offline,
             },
         }
     }
@@ -778,6 +779,7 @@ mod tests {
             ruby: RubyEnv {
                 cwd: root.to_path_buf(),
                 rebuild: true,
+                offline: true,
             },
         }
     }

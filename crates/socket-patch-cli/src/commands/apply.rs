@@ -2987,6 +2987,7 @@ async fn apply_patches_inner(
                             &gem_ext::RubyEnv {
                                 cwd: args.common.cwd.clone(),
                                 rebuild: !args.common.no_gem_native_rebuild,
+                                offline: args.common.offline,
                             },
                         )
                         .await;

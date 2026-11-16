@@ -100,7 +100,7 @@ fn crates_index_path(name: &str) -> Option<String> {
 /// The RubyGems compact index root; override with `SOCKET_RUBYGEMS_URL`.
 pub(crate) const DEFAULT_RUBYGEMS: &str = "https://rubygems.org";
 
-pub(super) fn rubygems_base() -> String {
+pub(crate) fn rubygems_base() -> String {
     std::env::var("SOCKET_RUBYGEMS_URL")
         .ok()
         .map(|v| v.trim().trim_end_matches('/').to_string())
