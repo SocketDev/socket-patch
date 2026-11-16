@@ -2587,3 +2587,91 @@ async fn a_precompiled_gem_is_rebuilt_from_its_source_gem_and_grafted() {
     assert_eq!(code, 0, "apply failed:\n{stdout}\n{stderr}");
     assert_eq!(fx.loaded().0, PATCHED_BUILD);
 }
+
+/// The source gem of a precompiled copy, when the home's `cache/` does not
+/// hold it, is downloaded from the registry and used only when it has the
+/// sha256 the registry's compact index records for the ruby-platform gem.
+/// (The stand-in Ruby builds; the download and its check are the CLI's.)
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn the_source_gem_is_downloaded_and_checked_against_the_registry_index() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    const ARCHIVE: &[u8] = b"the source gem, as the registry serves it";
+
+    // (the sha256 the index records, whether the archive is the indexed one)
+    for (indexed, genuine) in [
+        (common::sha256_hex(ARCHIVE), true),
+        (common::sha256_hex(b"another archive"), false),
+    ] {
+        let server = MockServer::start().await;
+        // The platform gem's line comes first: it is not the source gem's.
+        let info = format!(
+            "---\n1.0.0-x86_64-linux |checksum:{}\n1.0.0 |checksum:{indexed}\n",
+            "0".repeat(64)
+        );
+        Mock::given(method("GET"))
+            .and(path("/info/sp_native"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(info))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/gems/sp_native-1.0.0.gem"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(ARCHIVE, "application/octet-stream"),
+            )
+            .mount(&server)
+            .await;
+        let registry = server.uri();
+        let (_tmp, proj, gem_dir) = fake_precompiled_gem(false);
+        write_precompiled_record(&proj);
+        let ruby = FakeRuby::new();
+        ruby.serve_source_gem(&c_source(1));
+        let home = proj.join("vendor/bundle/ruby/3.4.0");
+        let tree_before = walk_files(&proj.join("vendor"));
+
+        let (code, stdout, stderr) = ruby.run(
+            &proj,
+            &["apply", "--json"],
+            &[("SOCKET_RUBYGEMS_URL", registry.as_str())],
+        );
+        let asked: Vec<String> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|request| request.url.path().to_string())
+            .collect();
+        assert_eq!(asked, ["/info/sp_native", "/gems/sp_native-1.0.0.gem"]);
+        if !genuine {
+            assert_eq!(code, 1, "{stdout}\n{stderr}");
+            assert!(stdout.contains("native_extensions_unsupported"), "{stdout}");
+            assert!(
+                stdout.contains("does not have the sha256 the registry's index records"),
+                "{stdout}"
+            );
+            assert_eq!(ruby.calls(), ["extensions_dir"], "nothing was unpacked");
+            assert_tree(
+                &proj.join("vendor"),
+                &tree_before,
+                "after a refused download",
+            );
+            continue;
+        }
+        assert_eq!(code, 0, "apply failed:\n{stdout}\n{stderr}");
+        assert_eq!(event_action(&stdout), "applied", "{stdout}");
+        assert_eq!(
+            ruby.calls(),
+            ["extensions_dir", "unpack", "missing_deps", "stage_build"]
+        );
+        assert_eq!(
+            std::fs::read_to_string(gem_dir.join("lib/sp_native/3.4/sp_native.so")).unwrap(),
+            built_from(&c_source(2))
+        );
+        assert!(
+            !home.join("cache/sp_native-1.0.0.gem").exists(),
+            "the download is not put into the user's gem home"
+        );
+        assert!(!home.join(".socket-patch-build").exists());
+    }
+}

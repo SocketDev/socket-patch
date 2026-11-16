@@ -2979,7 +2979,9 @@ pub async fn discriminating_files<'f>(
     use std::borrow::Cow;
     let ruby_record = crate::utils::purl::purl_qualifier(key, "platform")
         .is_none_or(|platform| platform.eq_ignore_ascii_case("ruby"));
-    if !key.starts_with("pkg:gem/") || !ruby_record {
+    let is_gem = crate::crawlers::types::Ecosystem::from_purl(key)
+        == Some(crate::crawlers::types::Ecosystem::Gem);
+    if !is_gem || !ruby_record {
         return Cow::Borrowed(files);
     }
     let (scope, copy) = scope_of(pkg_path, files).await;
