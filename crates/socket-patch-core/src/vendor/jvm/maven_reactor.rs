@@ -220,9 +220,12 @@ pub fn plan_with_external(
 /// modules that select them. A module whose answer is not certain gets no
 /// new pin and keeps the one it has (`selection_undetermined`). A
 /// declaration that names the base version is rewritten either way: that
-/// replaces the version where it stands, and moves nothing. `None` plans
-/// without the check and pins every local root (callers that only probe a
-/// shape).
+/// replaces the version where it stands, and moves nothing. A parent pom
+/// that resolves the base version itself above a module that resolves
+/// another takes no pin (`pin_would_move_module`). `None` plans without
+/// the check: a patch no pom wires yet is pinned in every local root, and
+/// one the poms already wire keeps the pins it has, in whichever pom they
+/// are (callers that only probe a shape).
 pub fn plan_with_selection(
     read: ReadFn<'_>,
     list: ListFn<'_>,
@@ -312,66 +315,91 @@ pub fn plan_with_selection(
         }
     }
 
+    // What the modules at and below each pom select, read once.
+    let under = selection.map(|selection| reactor.under(selection, patch));
+    if let Some(under) = &under {
+        // A module that declares another version itself resolves that
+        // version: its declaration is no conflict to report, and the pins
+        // go where the base version is selected.
+        warnings.retain(|w| {
+            !under.iter().any(|(rel, u)| {
+                u.own == Some(Own::Other)
+                    && w.detail.contains(" is declared at ")
+                    && w.detail
+                        .starts_with(&format!("reason: conflicting_literal_version: {rel}:"))
+            })
+        });
+    }
     // Where the pin goes, and the poms whose pin stays as it is.
     let mut pins: BTreeSet<String> = BTreeSet::new();
     let mut held: BTreeSet<String> = BTreeSet::new();
-    let mut undetermined: BTreeMap<String, String> = BTreeMap::new();
+    let closed = |rel: &String| unpinned.contains(rel) || managed_roots.contains(rel);
     // Where the pins go is decided when a patch is first wired, and the
     // committed poms are the record of it: what this machine's local
     // repository happens to hold must not move them, or the same checkout
     // would plan differently from one machine to the next. A patch the
     // poms already wire therefore keeps every pin it has and gets no new
-    // one. The one exception is a pin that is certain to move a module to
-    // another version than Maven selects for it, which no run should have
-    // left: the pins are then placed afresh.
-    let settled = selection.is_some_and(|selection| {
-        reactor.wired_before(patch)
-            && !reactor.scope.iter().any(|rel| {
-                pin_of(&reactor.poms[rel].doc, patch).is_some()
-                    && reactor.reactor.iter().any(|module| {
-                        reactor.chain(module).any(|p| p == rel)
-                            && matches!(selection.verdict(module, g, a, v), Verdict::Other(_))
-                    })
-            })
+    // one, with or without a selection. The one exception is a pin that
+    // is certain to move a module to another version than Maven selects
+    // for it, which no run should have left: the pins are then placed
+    // afresh.
+    let moves = under.as_ref().is_some_and(|under| {
+        reactor.scope.iter().any(|rel| {
+            pin_of(&reactor.poms[rel].doc, patch).is_some()
+                && under.get(rel).is_some_and(|u| u.other.is_some())
+        })
     });
-    if settled {
+    if reactor.wired_before(patch) && !moves {
         // (A local root a declaration ruled out stays ruled out.)
-        held.extend(
-            reactor
-                .scope
-                .iter()
-                .filter(|rel| !unpinned.contains(*rel) && !managed_roots.contains(*rel))
-                .cloned(),
-        );
+        held.extend(reactor.scope.iter().filter(|rel| !closed(rel)).cloned());
     } else {
+        let mut stranded: Vec<String> = Vec::new();
         for root in reactor.wired_roots() {
-            let open = !unpinned.contains(&root) && !managed_roots.contains(&root);
-            match selection {
+            let open = !closed(&root);
+            match &under {
                 None if open => {
                     pins.insert(root);
                 }
                 None => {}
-                Some(selection) => {
+                Some(under) => {
                     let mut placing = Placing {
-                        selection,
+                        under,
                         patch,
                         pins: &mut pins,
                         held: &mut held,
-                        undetermined: &mut undetermined,
+                        stranded: &mut stranded,
                     };
                     reactor.place(&root, open, &mut placing, 0);
                 }
             }
         }
-    }
-    for (module, why) in undetermined {
-        warnings.push(degraded(
-            "selection_undetermined",
-            format!(
-                "which version of {g}:{a} {module} resolves cannot be told ({why}); no pin \
-                 is written for it, and one already there is left as it is"
-            ),
-        ));
+        warnings.extend(
+            stranded
+                .into_iter()
+                .map(|detail| degraded("pin_would_move_module", detail)),
+        );
+        // One line for every module that cannot be told, however many.
+        let unknown: Vec<(&String, &String)> = under
+            .iter()
+            .flatten()
+            .filter_map(|(rel, u)| match &u.own {
+                Some(Own::Unknown(why)) => Some((rel, why)),
+                _ => None,
+            })
+            .collect();
+        if let Some((module, why)) = unknown.first() {
+            let more = match unknown.len() - 1 {
+                0 => String::new(),
+                n => format!(", and {n} more"),
+            };
+            warnings.push(degraded(
+                "selection_undetermined",
+                format!(
+                    "which version of {g}:{a} {module} resolves cannot be told ({why}){more}; \
+                     no pin is written where that is so, and one already there is left as it is"
+                ),
+            ));
+        }
     }
 
     let banning = reactor
@@ -394,7 +422,13 @@ pub fn plan_with_selection(
         let pinned = pins.contains(rel);
         let held = held.contains(rel);
         match pin_of(doc, patch) {
-            Some(pin) if !pinned && !held => file_edits.push(Edit::plain(pin.start, pin.end, "")),
+            Some(pin) if !pinned && !held => {
+                // The section the first run may have created for the pin
+                // stays this patch's to undo: its record is carried over,
+                // so the revert still takes the empty shell out.
+                records.push(adopt(rel, POM_FRAGMENT_KIND, "pin_section"));
+                file_edits.push(Edit::plain(pin.start, pin.end, ""));
+            }
             Some(pin) if pin.uuid == patch.uuid => {}
             // A pin of an earlier patch of this version moves to the new
             // suffix where it stands, held or not: the tree it names is
@@ -674,7 +708,8 @@ pub fn references_checked(
 /// The degraded reasons that leave a declaration or a root alone; the
 /// repository and config notes (and a mixed root's Gradle warnings) say
 /// nothing about why a reactor is unwired.
-const UNWIRING: [&str; 8] = [
+const UNWIRING: [&str; 9] = [
+    "pin_would_move_module",
     "property_unresolved",
     "conflicting_literal_version",
     "conflicting_managed_version",
@@ -761,9 +796,11 @@ pub fn unpin_plan(read: ReadFn<'_>, list: ListFn<'_>, c: &Coords<'_>) -> Option<
     })
 }
 
-/// Whether the only thing that left `plan` without a pin is that what Maven
-/// selects could not be told (`selection_undetermined`): no declaration
-/// was passed over for a reason of its own.
+/// Whether the only thing that left `plan` without a pin is what Maven
+/// selects: it could not be told (`selection_undetermined`), or the only
+/// poms that select the base version are parents whose pin would move a
+/// module below them (`pin_would_move_module`). No declaration was passed
+/// over for a reason of its own.
 pub fn unwired_by_selection_alone(plan: &JvmPlan) -> bool {
     let reasons: Vec<&str> = plan
         .warnings
@@ -772,7 +809,20 @@ pub fn unwired_by_selection_alone(plan: &JvmPlan) -> bool {
         .filter_map(|w| w.detail.strip_prefix("reason: ")?.split(':').next())
         .filter(|reason| UNWIRING.contains(reason))
         .collect();
-    !reasons.is_empty() && reasons.iter().all(|r| *r == "selection_undetermined")
+    !reasons.is_empty()
+        && reasons
+            .iter()
+            .all(|r| matches!(*r, "selection_undetermined" | "pin_would_move_module"))
+}
+
+/// The `pin_would_move_module` reason of `plan`, when it has one: a parent
+/// pom resolves the base version itself and cannot be pinned without
+/// moving a module that inherits it.
+pub fn pin_would_move(plan: &JvmPlan) -> Option<&str> {
+    plan.warnings
+        .iter()
+        .filter(|w| w.code == DEGRADED)
+        .find_map(|w| w.detail.strip_prefix("reason: pin_would_move_module: "))
 }
 
 /// [`wired_checked`], and no declaration of `c`'s g:a is left at a version
@@ -1341,60 +1391,122 @@ pub fn external_poms_needed(
     need
 }
 
+/// What one reactor module selects for a patch's artifact.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Own {
+    /// The patch's base version.
+    Selected,
+    /// Another version.
+    Other,
+    /// It cannot be told, and why.
+    Unknown(String),
+}
+
+/// What the modules at and below one pom (the pom itself, when it is a
+/// reactor module, and every module that inherits it) select.
+#[derive(Debug, Clone, Default)]
+struct Under {
+    /// The pom's own answer, when it is a module that resolves the
+    /// artifact.
+    own: Option<Own>,
+    /// Some module selects the base version.
+    selected: bool,
+    /// A module that is certain to resolve another version, and which.
+    other: Option<(String, String)>,
+    /// Some module's answer cannot be told.
+    unknown: bool,
+}
+
 /// What [`Reactor::place`] decides for one patch.
 struct Placing<'p> {
-    selection: &'p MavenSelection,
+    under: &'p BTreeMap<String, Under>,
     patch: &'p JvmPatch<'p>,
     /// The poms that get the pin.
     pins: &'p mut BTreeSet<String>,
     /// The poms whose pin stays as it is.
     held: &'p mut BTreeSet<String>,
-    /// The modules whose selection cannot be told, and why.
-    undetermined: &'p mut BTreeMap<String, String>,
+    /// Why a pom that resolves the base version itself takes no pin.
+    stranded: &'p mut Vec<String>,
 }
 
 /// Deepest chain of local parents a pin is placed down.
 const MAX_PLACING_DEPTH: usize = 64;
 
 impl Reactor {
+    /// What the modules at and below each pom select for `patch`: every
+    /// module is asked once, and its answer marked on each pom of its
+    /// chain.
+    fn under(&self, selection: &MavenSelection, patch: &JvmPatch<'_>) -> BTreeMap<String, Under> {
+        let (g, a, v) = (patch.group_id, patch.artifact_id, patch.version);
+        let mut out: BTreeMap<String, Under> = BTreeMap::new();
+        for module in &self.reactor {
+            let (own, version) = match selection.verdict(module, g, a, v) {
+                Verdict::Selected => (Own::Selected, None),
+                Verdict::Other(version) => (Own::Other, Some(version)),
+                Verdict::Undetermined(why) => (Own::Unknown(why), None),
+                Verdict::Absent => continue,
+            };
+            for pom in self.chain(module) {
+                let under = out.entry(pom.to_string()).or_default();
+                match (&own, &version) {
+                    (Own::Selected, _) => under.selected = true,
+                    (Own::Other, Some(version)) => {
+                        under
+                            .other
+                            .get_or_insert_with(|| (module.clone(), version.clone()));
+                    }
+                    (Own::Other, None) => {}
+                    (Own::Unknown(_), _) => under.unknown = true,
+                }
+            }
+            out.entry(module.clone()).or_default().own = Some(own);
+        }
+        out
+    }
+
     /// Place the patch's pin at or below `rel`: in `rel` itself when every
-    /// reactor module that inherits it (or is it) resolves the artifact at
-    /// the base version or not at all, and one of them does resolve it;
-    /// else in the poms below it for which that holds. A pom some module
-    /// of which cannot be told is held, and gets no new pin. `open` is
-    /// false for a pom that takes no pin of its own (a local root a
-    /// declaration ruled out, or one that manages the artifact itself).
+    /// reactor module at or below it resolves the artifact at the base
+    /// version or not at all, and one of them does resolve it; else in the
+    /// poms below it for which that holds. `open` is false for a local
+    /// root that takes no pin of its own (a declaration ruled it out, or
+    /// it manages the artifact itself): the poms below it are still
+    /// placed. A pom some module of which cannot be told, and none of
+    /// which is certain to resolve another version, is held: it gets no
+    /// new pin and keeps the one it has. A pom with a module that is
+    /// certain to resolve another version is never held, so a pin there
+    /// goes.
     fn place(&self, rel: &str, open: bool, placing: &mut Placing<'_>, depth: usize) {
         let (g, a, v) = (
             placing.patch.group_id,
             placing.patch.artifact_id,
             placing.patch.version,
         );
-        let (mut selected, mut other, mut unknown) = (false, false, false);
-        for module in &self.reactor {
-            if !self.chain(module).any(|p| p == rel) {
-                continue;
+        let under = placing.under.get(rel).cloned().unwrap_or_default();
+        if under.other.is_none() && !under.unknown {
+            if !under.selected {
+                return;
             }
-            match placing.selection.verdict(module, g, a, v) {
-                Verdict::Selected => selected = true,
-                Verdict::Other(_) => other = true,
-                Verdict::Absent => {}
-                Verdict::Undetermined(why) => {
-                    unknown = true;
-                    placing.undetermined.entry(module.clone()).or_insert(why);
+            if open {
+                // The user's own management on the chain already decides
+                // the version here: a base one was rewritten in place.
+                if !self.manages(rel, g, a) {
+                    placing.pins.insert(rel.to_string());
                 }
+                return;
             }
-        }
-        if unknown {
+        } else if under.other.is_none() && open {
             placing.held.insert(rel.to_string());
         }
-        if !unknown && !other {
-            // The user's own management on the chain already decides the
-            // version here: a base one was rewritten in place.
-            if selected && open && !self.manages(rel, g, a) {
-                placing.pins.insert(rel.to_string());
-            }
-            return;
+        // A parent pom that resolves the base version itself, above a
+        // module that resolves another: a pin here is inherited by that
+        // module and would move it, and Maven has no management that
+        // reaches a parent and not its children.
+        if let (Some(Own::Selected), Some((module, version))) = (&under.own, &under.other) {
+            placing.stranded.push(format!(
+                "{rel} resolves {g}:{a} at {v} itself, but a pin there is inherited by \
+                 {module}, which resolves {version}, and would move it; {rel} is not pinned \
+                 (the modules below it that select {v} are)"
+            ));
         }
         if depth >= MAX_PLACING_DEPTH {
             return;
@@ -1417,6 +1529,75 @@ impl Reactor {
                 .any(|(dep, _)| doc.is_top_level_managed(*dep) && doc.is_main_jar(*dep))
         })
     }
+
+    /// Whether the patch `c` is wired for `module`: Maven reads its
+    /// suffixed version there from the nearest management on the module's
+    /// chain (a pin, or the project's own entry), or from a declaration
+    /// the module makes or inherits.
+    fn covers(&self, module: &str, c: &Coords<'_>) -> bool {
+        let sv = c.suffixed_version();
+        if self
+            .managed_version(module, c.group_id, c.artifact_id)
+            .as_deref()
+            == Some(sv.as_str())
+        {
+            return true;
+        }
+        self.chain(module).any(|p| {
+            let doc = &self.poms[p].doc;
+            self.keyed_declarations(p, c.group_id, c.artifact_id)
+                .iter()
+                .any(|(dep, _)| {
+                    let section = doc.section_of(*dep);
+                    !section.ends_with("dependencyManagement")
+                        && !section.starts_with("profile:")
+                        && doc.is_main_jar(*dep)
+                        && doc
+                            .child(*dep, "version")
+                            .and_then(|version| self.interpolate(module, &doc.text_of(version)))
+                            .as_deref()
+                            == Some(sv.as_str())
+                })
+        })
+    }
+}
+
+/// Why `vex` must not attest the patch `c` although a pom wires it: a
+/// module that resolves the base version (or may: its selection cannot be
+/// told) is reached by no pin and no declaration of the patch, so it
+/// builds the unpatched jar. A pin can sit in one module's pom while a
+/// sibling was left out (undetermined when the patch was first wired, or
+/// added since). `None` when every such module is wired.
+pub fn unwired_modules(
+    read: ReadFn<'_>,
+    list: ListFn<'_>,
+    c: &Coords<'_>,
+    selection: &MavenSelection,
+) -> Result<Option<String>, JvmRefusal> {
+    let reactor = Reactor::discover(read, list)?;
+    let (g, a, v) = (c.group_id, c.artifact_id, c.version);
+    let open: Vec<String> = reactor
+        .reactor
+        .iter()
+        .filter(|module| !reactor.covers(module, c))
+        .filter_map(|module| match selection.verdict(module, g, a, v) {
+            Verdict::Selected => Some(format!("{module} resolves it unpatched")),
+            Verdict::Undetermined(why) => {
+                Some(format!("{module} may resolve it unpatched ({why})"))
+            }
+            Verdict::Other(_) | Verdict::Absent => None,
+        })
+        .collect();
+    Ok(open.first().map(|first| {
+        let more = match open.len() - 1 {
+            0 => String::new(),
+            n => format!(", and {n} more"),
+        };
+        format!(
+            "the patch of {g}:{a}:{v} is not wired in every module that resolves it: \
+             {first}{more}"
+        )
+    }))
 }
 
 /// One pom outside the checkout, parsed.
@@ -5585,6 +5766,274 @@ mod tests {
         );
         let read = |p: &str| after.get(p).cloned();
         assert!(unpin_plan(&read, &lister(&after), &patch().coords()).is_none());
+    }
+
+    /// A parent and the modules `names`, none of which declares the
+    /// artifact.
+    fn modules_under_root(names: &[&str]) -> Fs {
+        let listed: String = names
+            .iter()
+            .map(|name| format!("    <module>{name}</module>\n"))
+            .collect();
+        let root =
+            PARENT_OF_TWO.replace("    <module>a</module>\n    <module>b</module>\n", &listed);
+        let mut files = vec![("pom.xml".to_string(), root)];
+        files.extend(
+            names
+                .iter()
+                .map(|name| (format!("{name}/pom.xml"), inheriting(name))),
+        );
+        let files: Vec<(&str, &str)> = files
+            .iter()
+            .map(|(p, c)| (p.as_str(), c.as_str()))
+            .collect();
+        fs(&files)
+    }
+
+    /// The selection of a root and its modules: `picks` name the modules
+    /// that resolve the artifact.
+    fn answering(files: &Fs, picks: &[(&str, Result<&str, &str>)]) -> MavenSelection {
+        let modules: Vec<&str> = files
+            .keys()
+            .filter(|rel| rel.ends_with("pom.xml"))
+            .map(String::as_str)
+            .collect();
+        let picks: Vec<_> = picks
+            .iter()
+            .map(|(pom, pick)| (*pom, GA.0, GA.1, *pick))
+            .collect();
+        MavenSelection::answering(&modules, &picks)
+    }
+
+    /// A pin that moves a module goes even when another module under the
+    /// same pom cannot be told: holding it would keep the module that is
+    /// certain to resolve another version on the wrong one.
+    #[test]
+    fn a_pin_that_moves_a_module_is_not_held_for_an_undetermined_sibling() {
+        let files = modules_under_root(&["a", "b", "d"]);
+        let (_, pinned) = vendor(&files);
+        assert!(text(&pinned, "pom.xml").contains(SV));
+        let selection = answering(
+            &pinned,
+            &[
+                ("a/pom.xml", Ok("1.10.0")),
+                ("b/pom.xml", Ok("1.11.0")),
+                (
+                    "d/pom.xml",
+                    Err("the pom of x:y:1 is not in the local Maven repository"),
+                ),
+            ],
+        );
+        let plan = run_selecting(&pinned, &selection);
+        let after = applied(&pinned, &plan);
+        assert!(
+            !text(&after, "pom.xml").contains(SV),
+            "{}",
+            text(&after, "pom.xml")
+        );
+        assert!(text(&after, "a/pom.xml").contains(&format!("<version>{SV}</version>")));
+        assert_eq!(after["b/pom.xml"], files["b/pom.xml"]);
+        assert_eq!(after["d/pom.xml"], files["d/pom.xml"]);
+        // The section the first run created in the root stays this
+        // patch's to undo.
+        assert!(plan.records.iter().any(|w| w.file == "pom.xml"
+            && w.kind == POM_FRAGMENT_KIND
+            && w.key.as_deref() == Some("pin_section")));
+    }
+
+    /// A parent that resolves the base version itself above a module that
+    /// resolves another cannot take a pin: the module would inherit it.
+    /// The plan says so, pins the siblings that select the base version,
+    /// and is a skip of its own when nothing else wires the patch.
+    #[test]
+    fn a_parent_above_a_module_on_another_version_is_reported_not_pinned() {
+        let files = two_modules();
+        let alone = answering(
+            &files,
+            &[("pom.xml", Ok("1.10.0")), ("b/pom.xml", Ok("1.11.0"))],
+        );
+        let plan = run_selecting(&files, &alone);
+        let after = applied(&files, &plan);
+        for rel in ["pom.xml", "a/pom.xml", "b/pom.xml"] {
+            assert!(!text(&after, rel).contains(SV), "{rel}");
+        }
+        let why = pin_would_move(&plan).expect("the reason");
+        assert_eq!(
+            why,
+            "pom.xml resolves org.apache.commons:commons-text at 1.10.0 itself, but a pin \
+             there is inherited by b/pom.xml, which resolves 1.11.0, and would move it; pom.xml \
+             is not pinned (the modules below it that select 1.10.0 are)"
+        );
+        assert!(left_unwired(&files, &plan).is_some());
+        let skip =
+            super::super::sbt_gate::maven_undetermined(Some(&alone), &plan, GA.0, GA.1, "1.10.0");
+        let Some(crate::vendor::VendorOutcome::Refused { code, detail }) = skip else {
+            panic!("a skip");
+        };
+        assert_eq!(code, "vendor_maven_pin_would_move_module");
+        assert!(
+            detail.contains("b/pom.xml, which resolves 1.11.0"),
+            "{detail}"
+        );
+
+        // With a sibling that selects the base version, that one is pinned
+        // and the parent is still named.
+        let beside = answering(
+            &files,
+            &[
+                ("pom.xml", Ok("1.10.0")),
+                ("a/pom.xml", Ok("1.10.0")),
+                ("b/pom.xml", Ok("1.11.0")),
+            ],
+        );
+        let plan = run_selecting(&files, &beside);
+        let after = applied(&files, &plan);
+        assert!(text(&after, "a/pom.xml").contains(&format!("<version>{SV}</version>")));
+        assert!(!text(&after, "pom.xml").contains(SV));
+        assert!(pin_would_move(&plan).is_some());
+        assert!(left_unwired(&files, &plan).is_none());
+    }
+
+    /// A sibling that declares another version itself resolves that
+    /// version: its declaration is no conflict to report once the
+    /// selection says so.
+    #[test]
+    fn a_sibling_declaring_another_version_is_no_conflict_under_a_selection() {
+        let mut files = two_modules();
+        files.insert(
+            "b/pom.xml".to_string(),
+            inheriting("b")
+                .replace(
+                    "</project>",
+                    &format!(
+                        "  <dependencies>{}</dependencies>\n</project>",
+                        dep("1.11.0")
+                    ),
+                )
+                .into_bytes(),
+        );
+        let conflict = "conflicting_literal_version".to_string();
+        assert!(reasons(&run(&files).expect("plan")).contains(&conflict));
+        let selection = answering(
+            &files,
+            &[("a/pom.xml", Ok("1.10.0")), ("b/pom.xml", Ok("1.11.0"))],
+        );
+        let plan = run_selecting(&files, &selection);
+        assert!(!reasons(&plan).contains(&conflict), "{:?}", reasons(&plan));
+        let after = applied(&files, &plan);
+        assert!(text(&after, "a/pom.xml").contains(&format!("<version>{SV}</version>")));
+        assert_eq!(after["b/pom.xml"], files["b/pom.xml"]);
+    }
+
+    /// However many modules cannot be told, the plan says so once.
+    #[test]
+    fn undetermined_modules_are_reported_in_one_line() {
+        let files = modules_under_root(&["a", "b", "d"]);
+        let unread = Err("the pom of x:y:1 is not in the local Maven repository");
+        let selection = answering(
+            &files,
+            &[
+                ("a/pom.xml", unread),
+                ("b/pom.xml", unread),
+                ("d/pom.xml", unread),
+            ],
+        );
+        let plan = run_selecting(&files, &selection);
+        let lines: Vec<&JvmWarning> = plan
+            .warnings
+            .iter()
+            .filter(|w| w.detail.starts_with("reason: selection_undetermined: "))
+            .collect();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(
+            lines[0]
+                .detail
+                .contains("a/pom.xml resolves cannot be told")
+                && lines[0].detail.contains(", and 2 more"),
+            "{}",
+            lines[0].detail
+        );
+    }
+
+    /// A root a declaration rules out takes no pin, with or without a
+    /// module that resolves another version beside it: the modules below
+    /// it that select the base version are pinned either way.
+    #[test]
+    fn a_closed_root_does_not_keep_its_modules_from_their_pins() {
+        let mut files = two_modules();
+        // `b` manages another version it never uses.
+        files.insert(
+            "b/pom.xml".to_string(),
+            inheriting("b")
+                .replace(
+                    "</project>",
+                    &format!(
+                        "  <dependencyManagement><dependencies>{}</dependencies>\
+                         </dependencyManagement>\n</project>",
+                        dep("1.11.0")
+                    ),
+                )
+                .into_bytes(),
+        );
+        let selection = answering(&files, &[("a/pom.xml", Ok("1.10.0"))]);
+        let plan = run_selecting(&files, &selection);
+        let after = applied(&files, &plan);
+        assert!(text(&after, "a/pom.xml").contains(&format!("<version>{SV}</version>")));
+        assert!(!text(&after, "pom.xml").contains(SV));
+        assert_eq!(after["b/pom.xml"], files["b/pom.xml"]);
+        assert!(left_unwired(&files, &plan).is_none());
+    }
+
+    /// A plan without a selection keeps the pins the poms hold, in
+    /// whichever pom they are: it must not pull a module's pin up into the
+    /// root, where it would move the sibling it was kept away from.
+    #[test]
+    fn a_plan_without_a_selection_keeps_module_pins_where_they_are() {
+        let files = two_modules();
+        let selection = selecting(Some(Ok("1.10.0")), Some(Ok("1.11.0")));
+        let pinned = applied(&files, &run_selecting(&files, &selection));
+        assert!(text(&pinned, "a/pom.xml").contains(PIN_TAG));
+        let again = run(&pinned).expect("plan");
+        assert!(again.writes.is_empty(), "{:?}", pom_rels(&again));
+    }
+
+    /// `vex` attests a patch only when every module that resolves the base
+    /// version is wired: a pin in one module's pom says nothing of a
+    /// sibling that resolves it too, or may.
+    #[test]
+    fn a_module_left_without_the_patch_withholds_attestation() {
+        let files = two_modules();
+        let pinned = applied(
+            &files,
+            &run_selecting(&files, &selecting(Some(Ok("1.10.0")), Some(Ok("1.11.0")))),
+        );
+        let read = |p: &str| pinned.get(p).cloned();
+        let unwired = |selection: &MavenSelection| {
+            unwired_modules(&read, &lister(&pinned), &patch().coords(), selection).unwrap()
+        };
+        // `b` resolves another version: the pin in `a` is all there is to
+        // wire.
+        assert_eq!(
+            unwired(&selecting(Some(Ok("1.10.0")), Some(Ok("1.11.0")))),
+            None
+        );
+        // `b` resolves the base version too (added or changed since).
+        let why = unwired(&selecting(Some(Ok("1.10.0")), Some(Ok("1.10.0")))).expect("withheld");
+        assert!(why.contains("b/pom.xml resolves it unpatched"), "{why}");
+        // What `b` resolves cannot be told.
+        let why = unwired(&selecting(Some(Ok("1.10.0")), Some(Err("unread")))).expect("withheld");
+        assert!(
+            why.contains("b/pom.xml may resolve it unpatched (unread)"),
+            "{why}"
+        );
+        // A pin in the root reaches every module, told or not.
+        let (_, rooted) = vendor(&files);
+        let read = |p: &str| rooted.get(p).cloned();
+        let all = selecting(Some(Err("unread")), Some(Err("unread")));
+        assert_eq!(
+            unwired_modules(&read, &lister(&rooted), &patch().coords(), &all).unwrap(),
+            None
+        );
     }
 
     /// A declaration that names the base version is rewritten whatever

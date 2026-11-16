@@ -155,7 +155,13 @@ select the base version or do not resolve the artifact: the local root when
 the whole reactor under it agrees, else the poms below it that do, down to one
 module's own `pom.xml`. A module that resolves another version is never
 reached by a pin, and a patch for that other version is pinned in that module
-beside the first. A pom that manages the artifact itself takes no pin. When no
+beside the first. A pom that manages the artifact itself takes no pin, and
+neither does a root a conflicting declaration rules out; the poms below them
+are still placed. A parent that resolves the base version itself above a
+module that resolves another takes no pin either (`pin_would_move_module`):
+Maven's management always reaches the children, so there is no pin that
+patches the parent and leaves the child alone. `vex` attests the patch only
+when every module that resolves the base version is reached by its wiring. When no
 module of the build selects the base version the patch is skipped before
 anything is downloaded (`vendor_maven_version_not_selected`, exit 0, naming
 the version Maven selects). When a module's selection cannot be read (a pom

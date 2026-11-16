@@ -45,7 +45,12 @@ pub const MARKER: &str = "SOCKET-PATCH-MEDIATION-MARKER";
 const REPO_ROUTE: &str = "/fixture-repo";
 
 pub fn purl() -> String {
-    format!("pkg:maven/{GROUP}/{VICTIM}@{BASE}")
+    purl_of(BASE)
+}
+
+/// The purl of the victim at `version`.
+pub fn purl_of(version: &str) -> String {
+    format!("pkg:maven/{GROUP}/{VICTIM}@{version}")
 }
 
 /// How a project reaches the victim.
@@ -275,8 +280,27 @@ pub fn project_pom(shape: Shape, server: &Server) -> String {
     )
 }
 
-/// The modules of [`write_reactor`], and the victim version each selects.
-pub const REACTOR_MODULES: [(&str, &str); 3] = [("a", BASE), ("b", NEWER), ("c", BASE)];
+/// The modules of [`write_reactor`]: its name, the victim version it
+/// selects, and the one dependency it declares (artifact, version).
+pub const REACTOR_MODULES: [(&str, &str, &str, &str); 3] = [
+    ("a", BASE, "lib-deep", "1.0"),
+    ("b", NEWER, "lib-new", "1.0"),
+    ("c", BASE, VICTIM, BASE),
+];
+
+/// The `pom.xml` of a reactor module `name` that declares `artifact` at
+/// `version`.
+pub fn module_pom(name: &str, artifact: &str, version: &str) -> String {
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <project xmlns=\"http://maven.apache.org/POM/4.0.0\">\n  \
+         <modelVersion>4.0.0</modelVersion>\n  <parent>\n    \
+         <groupId>com.example</groupId>\n    <artifactId>parent</artifactId>\n    \
+         <version>1.0.0</version>\n  </parent>\n  <artifactId>{name}</artifactId>\n  \
+         <dependencies>\n{}  </dependencies>\n</project>\n",
+        dependency(artifact, version, "")
+    )
+}
 
 /// Write a reactor into `dir` (the table's V3): a parent pom that three
 /// modules inherit, `a` reaching the base version two levels down, `b` a
@@ -285,7 +309,7 @@ pub const REACTOR_MODULES: [(&str, &str); 3] = [("a", BASE), ("b", NEWER), ("c",
 pub fn write_reactor(dir: &Path, server: &Server) {
     let modules: String = REACTOR_MODULES
         .iter()
-        .map(|(name, _)| format!("    <module>{name}</module>\n"))
+        .map(|(name, ..)| format!("    <module>{name}</module>\n"))
         .collect();
     std::fs::create_dir_all(dir).unwrap();
     std::fs::write(
@@ -302,22 +326,11 @@ pub fn write_reactor(dir: &Path, server: &Server) {
         ),
     )
     .unwrap();
-    for (name, deps) in [
-        ("a", dependency("lib-deep", "1.0", "")),
-        ("b", dependency("lib-new", "1.0", "")),
-        ("c", dependency(VICTIM, BASE, "")),
-    ] {
+    for (name, _, artifact, version) in REACTOR_MODULES {
         std::fs::create_dir_all(dir.join(name)).unwrap();
         std::fs::write(
             dir.join(name).join("pom.xml"),
-            format!(
-                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
-                 <project xmlns=\"http://maven.apache.org/POM/4.0.0\">\n  \
-                 <modelVersion>4.0.0</modelVersion>\n  <parent>\n    \
-                 <groupId>com.example</groupId>\n    <artifactId>parent</artifactId>\n    \
-                 <version>1.0.0</version>\n  </parent>\n  <artifactId>{name}</artifactId>\n  \
-                 <dependencies>\n{deps}  </dependencies>\n</project>\n"
-            ),
+            module_pom(name, artifact, version),
         )
         .unwrap();
     }
@@ -333,7 +346,7 @@ pub fn resolve_reactor(
     settings: &Path,
     out_rel: &str,
 ) -> Option<BTreeMap<String, BTreeMap<String, Vec<u8>>>> {
-    for (module, _) in REACTOR_MODULES {
+    for (module, ..) in REACTOR_MODULES {
         let _ = std::fs::remove_dir_all(proj.join(module).join(out_rel));
     }
     let out = with_central_fallback(suite, "reactor resolution", settings, |s, extra| {
@@ -349,7 +362,7 @@ pub fn resolve_reactor(
     Some(
         REACTOR_MODULES
             .iter()
-            .map(|(module, _)| (module.to_string(), copied(&proj.join(module), out_rel)))
+            .map(|(module, ..)| (module.to_string(), copied(&proj.join(module), out_rel)))
             .collect(),
     )
 }

@@ -1098,6 +1098,19 @@ fn entry_wiring_checked(root: &Path, entry: &VendorEntry, attest: bool) -> Resul
         if maven && wired == Ok(true) {
             wired = maven_reactor::attestable_checked(&read, &list, &c).map_err(|e| e.detail);
         }
+        // A pin can sit in one module's pom: the patch is attested only
+        // when every module that resolves the base version (or may, where
+        // that cannot be told) is wired. `vendor --check` does not ask
+        // this (`attest` is false there): it would make the check depend
+        // on what the machine's local repository holds.
+        if attest && maven && wired == Ok(true) {
+            let selection = crate::crawlers::maven_selection::MavenSelection::for_project(root);
+            wired = match maven_reactor::unwired_modules(&read, &list, &c, &selection) {
+                Ok(None) => Ok(true),
+                Ok(Some(why)) => Err(why),
+                Err(e) => Err(e.detail),
+            };
+        }
         wired
     };
     if let Some(e) = reader.read_error.borrow().as_ref() {

@@ -57,7 +57,14 @@ pub const SKIP_CODES: &[&str] = &[
     "vendor_scala_cli_not_resolved",
     MAVEN_NOT_SELECTED,
     MAVEN_UNDETERMINED,
+    MAVEN_PIN_WOULD_MOVE,
 ];
+
+/// A Maven reactor in which the only poms that resolve the patch's base
+/// version are parents of a module that resolves another version: a pin
+/// in the parent is inherited by that module and would move it, so
+/// nothing is pinned.
+pub const MAVEN_PIN_WOULD_MOVE: &str = "vendor_maven_pin_would_move_module";
 
 /// A Maven build that selects another version of the artifact than the
 /// patch's base in every module (or resolves it in none): the base version
@@ -185,11 +192,13 @@ pub(crate) fn for_shape(
     })
 }
 
-/// The skip of a Maven patch whose `plan` wired nothing only because
-/// `selection` could not tell what some module selects (the pom that
-/// would take the pin is then held, whatever the other modules select).
-/// `None` when the plan passed a declaration over for a reason of its own:
-/// the plan's refusal then stands.
+/// The skip of a Maven patch whose `plan` wired nothing only because of
+/// what Maven selects: `selection` could not tell what some module selects
+/// (the pom that would take the pin is then held, whatever the other
+/// modules select), or the only poms that select the base version are
+/// parents whose pin would move a module below them. `None` when the plan
+/// passed a declaration over for a reason of its own: the plan's refusal
+/// then stands.
 pub(crate) fn maven_undetermined(
     selection: Option<&MavenSelection>,
     plan: &super::JvmPlan,
@@ -200,10 +209,16 @@ pub(crate) fn maven_undetermined(
     if !super::maven_reactor::unwired_by_selection_alone(plan) {
         return None;
     }
-    let (module, why) = selection?.undetermined_in(g, a, base)?;
+    if let Some((module, why)) = selection?.undetermined_in(g, a, base) {
+        return Some(refused(
+            MAVEN_UNDETERMINED,
+            undetermined_detail(g, a, base, &format!("{module}: {why}")),
+        ));
+    }
+    let why = super::maven_reactor::pin_would_move(plan)?;
     Some(refused(
-        MAVEN_UNDETERMINED,
-        undetermined_detail(g, a, base, &format!("{module}: {why}")),
+        MAVEN_PIN_WOULD_MOVE,
+        format!("{why}; nothing was written for the patch of {base}"),
     ))
 }
 
