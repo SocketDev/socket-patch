@@ -691,8 +691,8 @@ stage_build)
   full=$(basename "$4" .gemspec)
   ext="$5/extensions/x86_64-linux/3.4.0/$full"
   [ -e "$state/hang" ] && hang
-  if [ -e "$state/fail-build" ]; then
-    echo "sp_native.c:7: error: this is not C" >&2
+  if [ -e "$state/fail-stage-build" ]; then
+    echo "sp_native.c:7: error: this is not C (in the stage)" >&2
     exit 1
   fi
   mkdir -p "$ext/sp_native" "$5/gems/$full/lib/sp_native"
@@ -719,6 +719,10 @@ build)
     echo $! > "$state/compiler.pid"
     : > "$state/building"
     wait
+    exit 1
+  fi
+  if [ -e "$state/fail-build" ]; then
+    echo "sp_native.c:7: error: this is not C (in place)" >&2
     exit 1
   fi
   mkdir -p "$ext/sp_native" "$lib/sp_native"
@@ -769,9 +773,16 @@ esac
         std::fs::write(source.join("patches/0001-base.patch"), "base\n").unwrap();
     }
 
-    /// Make every later staged build fail, as a compile error does.
+    /// Make every later build fail, staged or in place, as a compile error
+    /// does.
     fn fail_builds(&self) {
+        self.fail_staged_builds();
         std::fs::write(self.state.join("fail-build"), b"").unwrap();
+    }
+
+    /// Make every later build in a stage fail, and none in place.
+    fn fail_staged_builds(&self) {
+        std::fs::write(self.state.join("fail-stage-build"), b"").unwrap();
     }
 
     /// The modes this Ruby was run in, in order.
@@ -1713,39 +1724,69 @@ fn a_precompiled_copy_without_its_source_gem_is_refused() {
     }
 }
 
-/// The record is laid over the pristine source gem before anything is
-/// built, and every `beforeHash` must hold there: an archive that is not
-/// the gem the patch was written for stops the run with nothing written to
-/// the installed copy.
+/// An archive is built only when it is the installed gem's own source and
+/// the record applies to it: both are checked on the unpacked tree before
+/// anything of it runs. An archive whose files are not the installed
+/// copy's (another gem of that name), and one whose build input is not
+/// what the patch was written for, stop a precompiled copy's run with
+/// nothing written.
 #[cfg(unix)]
 #[test]
-fn a_record_that_does_not_fit_the_source_gem_stops_before_the_build() {
-    let (_tmp, proj, _gem_dir) = fake_precompiled_gem(true);
-    write_precompiled_record(&proj);
-    let ruby = FakeRuby::new();
-    // The installed copy holds the C source the record replaces; the
-    // "source gem" holds another.
-    ruby.serve_source_gem(&c_source(7));
-    let tree_before = walk_files(&proj.join("vendor"));
+fn an_archive_that_is_not_the_gems_own_source_is_not_built() {
+    // (what the "source gem" holds, the reason it is not used)
+    let cases: [(&str, &str, &str); 2] = [
+        // Another C source than the installed copy's.
+        (
+            "another source",
+            "is not the installed gem's own source",
+            "ext/sp_native/sp_native.c differs",
+        ),
+        // The copy's own files, but another libxml2-style patch file than
+        // the record replaces (the copy never shipped it: only the strict
+        // apply to the source gem can tell).
+        (
+            "another build input",
+            "the patch does not apply to the source gem",
+            "0001-base.patch",
+        ),
+    ];
+    for (case, reason, names) in cases {
+        let (_tmp, proj, _gem_dir) = fake_precompiled_gem(true);
+        write_precompiled_record(&proj);
+        let ruby = FakeRuby::new();
+        if case == "another source" {
+            ruby.serve_source_gem(&c_source(7));
+        } else {
+            ruby.serve_source_gem(&c_source(1));
+            let other = ruby.state.join("source/patches/0001-base.patch");
+            std::fs::write(other, "not the base\n").unwrap();
+        }
+        let tree_before = walk_files(&proj.join("vendor"));
 
-    let (code, stdout, stderr) = ruby.run(&proj, &["apply", "--json", "--offline"], &[]);
-    assert_eq!(code, 1, "{stdout}\n{stderr}");
-    assert!(stdout.contains("native_extensions_unsupported"), "{stdout}");
-    assert!(
-        stdout.contains("the patch does not apply to that gem"),
-        "{stdout}"
-    );
-    assert_eq!(
-        ruby.calls(),
-        ["extensions_dir", "unpack"],
-        "nothing was built"
-    );
-    assert_tree(&proj.join("vendor"), &tree_before, "");
+        let (code, stdout, stderr) = ruby.run(&proj, &["apply", "--json", "--offline"], &[]);
+        assert_eq!(code, 1, "{case}: {stdout}\n{stderr}");
+        assert!(
+            stdout.contains("native_extensions_unsupported"),
+            "{case}: {stdout}"
+        );
+        assert!(
+            stdout.contains(reason) && stdout.contains(names),
+            "{case}: {stdout}"
+        );
+        assert_eq!(
+            ruby.calls(),
+            ["extensions_dir", "unpack"],
+            "{case}: nothing was built"
+        );
+        assert_tree(&proj.join("vendor"), &tree_before, case);
+    }
 }
 
-/// A build that fails in the stage never touched the installed copy: a
-/// precompiled gem keeps its prebuilt binary, a gem RubyGems built keeps
-/// its extension dir, and neither gets a patched source.
+/// A build that fails in the stage never touched the installed copy. A
+/// precompiled gem has nothing else to build from: it keeps its prebuilt
+/// binary. A gem RubyGems built is then built where it is installed, as it
+/// was before there was a stage; when that fails too the copy is put back
+/// as it was, and the error names both failures.
 #[cfg(unix)]
 #[test]
 fn a_failed_staged_build_changes_nothing() {
@@ -1772,25 +1813,186 @@ fn a_failed_staged_build_changes_nothing() {
             "precompiled {precompiled}: {stdout}"
         );
         assert!(
-            stdout.contains("this is not C"),
+            stdout.contains("this is not C (in the stage)"),
             "the compiler error is shown: {stdout}"
         );
-        assert!(
-            stdout.contains("nothing of the installed gem was changed"),
-            "{stdout}"
-        );
-        assert_eq!(
-            ruby.calls(),
-            ["extensions_dir", "unpack", "missing_deps", "stage_build"],
-            "precompiled {precompiled}: the gem's own tree is not built after its source gem \
-             failed to"
-        );
+        let staged = ["extensions_dir", "unpack", "missing_deps", "stage_build"];
+        if precompiled {
+            assert!(
+                stdout.contains("nothing of the installed gem was changed"),
+                "{stdout}"
+            );
+            assert_eq!(ruby.calls(), staged);
+        } else {
+            assert!(
+                stdout.contains("this is not C (in place)")
+                    && stdout.contains("the sources and the previous build were put back"),
+                "both failures are named: {stdout}"
+            );
+            assert_eq!(ruby.calls(), [&staged[..], &["build"]].concat());
+        }
         assert_tree(
             &proj.join("vendor"),
             &tree_before,
             &format!("precompiled {precompiled}"),
         );
     }
+}
+
+/// Whatever keeps a gem RubyGems built from being rebuilt from its source
+/// gem, before anything of the installed copy is written, leaves it the
+/// rebuild it had before there was a stage: from its own tree, in place.
+/// The cached archive not being its own source (a patched archive a hosted
+/// install left there), a record that does not apply to it, a stage that
+/// cannot be opened, a build that fails in the stage.
+#[cfg(unix)]
+#[test]
+fn a_built_gem_falls_back_to_its_own_tree() {
+    for case in [
+        "not its own source",
+        "record does not apply",
+        "no stage",
+        "staged build fails",
+    ] {
+        let (_tmp, proj, gem_dir) = fake_native_gem(true);
+        let home = proj.join("vendor/bundle/ruby/3.4.0");
+        std::fs::create_dir_all(home.join("cache")).unwrap();
+        std::fs::write(home.join("cache/sp_native-1.0.0.gem"), b"the source gem").unwrap();
+        let ruby = FakeRuby::new();
+        ruby.serve_source_gem(&c_source(1));
+        let (before, after) = (c_source(1), c_source(2));
+        let mut record: Vec<RecordFile<'_>> = vec![(C_KEY, Some(&before), &after)];
+        let mut staged_steps = vec!["unpack"];
+        match case {
+            "not its own source" => {
+                let lib = ruby.state.join("source/lib/sp_native.rb");
+                std::fs::write(lib, "# another gem's\n").unwrap();
+            }
+            "record does not apply" => {
+                // A file the source gem alone holds, with other content
+                // than the record replaces.
+                record.push((
+                    "patches/0001-base.patch",
+                    Some("not the base\n"),
+                    "the fix\n",
+                ));
+            }
+            "no stage" => {
+                // Something that is no directory where the stage goes.
+                std::fs::write(home.join(".socket-patch-build"), b"").unwrap();
+                staged_steps.clear();
+            }
+            _ => {
+                ruby.fail_staged_builds();
+                staged_steps.extend(["missing_deps", "stage_build"]);
+            }
+        }
+        write_record(&proj.join(".socket"), PURL, &record);
+
+        let (code, stdout, stderr) = ruby.run(&proj, &["apply", "--json", "--offline"], &[]);
+        if case == "record does not apply" {
+            // The record changes a file the copy does not hold: only the
+            // source gem could have vouched for it, so there is nothing to
+            // fall back to.
+            assert_eq!(code, 1, "{case}: {stdout}\n{stderr}");
+            assert!(
+                stdout.contains("native_extensions_unsupported")
+                    && stdout.contains("the patch does not apply to the source gem"),
+                "{case}: {stdout}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(gem_dir.join(C_KEY)).unwrap(),
+                c_source(1),
+                "{case}"
+            );
+            continue;
+        }
+        assert_eq!(code, 0, "{case}: apply failed:\n{stdout}\n{stderr}");
+        assert_eq!(event_action(&stdout), "applied", "{case}: {stdout}");
+        let expected = [&["extensions_dir"][..], &staged_steps[..], &["build"]].concat();
+        assert_eq!(ruby.calls(), expected, "{case}");
+        assert_eq!(
+            std::fs::read(gem_dir.join("lib/sp_native/sp_native.so")).unwrap(),
+            b"rebuilt",
+            "{case}: the in-place build"
+        );
+        assert_eq!(
+            std::fs::read_to_string(gem_dir.join(C_KEY)).unwrap(),
+            c_source(2),
+            "{case}"
+        );
+        if case != "no stage" {
+            assert!(!home.join(".socket-patch-build").exists(), "{case}");
+        }
+        let (code, stdout, stderr) = ruby.run(&proj, &["apply", "--check"], &[]);
+        assert_eq!(code, 0, "{case}: {stdout}\n{stderr}");
+    }
+}
+
+/// A record written for a platform gem's own platform is the one applied
+/// to that gem's copy, and the only one: the `ruby` platform's record of
+/// the same version matches the copy too (its C source is the one the
+/// copy ships) and is not applied on top.
+#[cfg(unix)]
+#[test]
+fn a_platform_copy_takes_its_own_platforms_record_alone() {
+    let (_tmp, proj, gem_dir) = fake_precompiled_gem(true);
+    let socket = proj.join(".socket");
+    let ruby_key = format!("{PURL}?platform=ruby");
+    let own_key = format!("{PURL}?platform=x86_64-linux");
+    let (c_before, c_after) = (c_source(1), c_source(2));
+    let rb_after = "require \"sp_native/sp_native\"\n# patched for x86_64-linux\n";
+    let record = |uuid: &str, key: &str, before: &str, after: &str| {
+        write_blob(&socket, &git_sha256(before.as_bytes()), before.as_bytes());
+        write_blob(&socket, &git_sha256(after.as_bytes()), after.as_bytes());
+        serde_json::json!({
+            "uuid": uuid,
+            "exportedAt": "2026-01-01T00:00:00Z",
+            "files": { key: {
+                "beforeHash": git_sha256(before.as_bytes()),
+                "afterHash": git_sha256(after.as_bytes()),
+            }},
+            "vulnerabilities": {},
+            "description": "synthetic test patch",
+            "license": "MIT",
+            "tier": "free",
+        })
+    };
+    std::fs::create_dir_all(&socket).unwrap();
+    let manifest = serde_json::json!({ "patches": {
+        ruby_key.as_str(): record(UUID, C_KEY, &c_before, &c_after),
+        own_key.as_str(): record(
+            "29962996-2996-4996-8996-299629962996",
+            "lib/sp_native.rb",
+            LIB_RB,
+            rb_after,
+        ),
+    }});
+    std::fs::write(
+        socket.join("manifest.json"),
+        serde_json::to_string_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+    let ruby = FakeRuby::new();
+    ruby.serve_source_gem(&c_source(1));
+
+    let (code, stdout, stderr) = ruby.run(&proj, &["apply", "--json", "--offline"], &[]);
+    assert_eq!(code, 0, "apply failed:\n{stdout}\n{stderr}");
+    assert_eq!(
+        std::fs::read_to_string(gem_dir.join("lib/sp_native.rb")).unwrap(),
+        rb_after,
+        "the copy's own platform's record is applied"
+    );
+    assert_eq!(
+        std::fs::read_to_string(gem_dir.join(C_KEY)).unwrap(),
+        c_source(1),
+        "the ruby-platform record was applied on top"
+    );
+    assert_eq!(ruby.calls(), Vec::<String>::new(), "nothing was rebuilt");
+    assert_eq!(
+        std::fs::read_to_string(gem_dir.join("lib/sp_native/3.4/sp_native.so")).unwrap(),
+        prebuilt("3.4")
+    );
 }
 
 /// A gem RubyGems built, with its archive still in the home's `cache/`

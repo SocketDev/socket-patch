@@ -963,6 +963,38 @@ pub(crate) fn variant_matches_installed(first_file_status: Option<&VerifyStatus>
     }
 }
 
+/// Of the manifest's records for one gem version (`variants`), the one
+/// written for the copy at `pkg_path` itself: the record whose `platform`
+/// qualifier names the platform of that (platform gem) copy, when it
+/// matches what is installed there (or under `--force`, which asks no
+/// file). That record alone is then applied to the copy. `None`: the copy
+/// is the `ruby` platform's, no record names its platform, or the one that
+/// does is for other bytes; every matching record is applied, as for any
+/// other package.
+async fn own_platform_variant<'v>(
+    pkg_path: &Path,
+    variants: &'v [String],
+    manifest: &PatchManifest,
+    force: bool,
+) -> Option<&'v String> {
+    if variants.len() < 2 {
+        return None;
+    }
+    let platform = gem_ext::copy_platform(pkg_path).await?;
+    let own = variants
+        .iter()
+        .find(|variant| gem_ext::names_platform(variant, &platform))?;
+    if force {
+        return Some(own);
+    }
+    let patch = manifest.patches.get(own)?;
+    let status = match representative_file(&patch.files) {
+        Some((name, info)) => Some(verify_file_patch(pkg_path, name, info).await.status),
+        None => None,
+    };
+    variant_matches_installed(status.as_ref()).then_some(own)
+}
+
 /// The file whose verify status decides whether a release variant
 /// describes the installed distribution (fed to
 /// [`variant_matches_installed`]).
@@ -2917,7 +2949,22 @@ async fn apply_patches_inner(
                 // that copy is a real on-disk gem some bundler loads.
                 let mut attempted = false;
 
+                // A platform gem's copy takes the record written for its
+                // own platform, when the manifest has one that matches
+                // it, and only that one. The ruby-platform record of the
+                // same version can match such a copy too (its sources are
+                // what the copy's binary was built from) and must not be
+                // applied on top.
+                let only_variant = if Ecosystem::from_purl(purl) == Some(Ecosystem::Gem) {
+                    own_platform_variant(pkg_path, &variants, &manifest, args.force).await
+                } else {
+                    None
+                };
+
                 for variant_purl in &variants {
+                    if only_variant.is_some_and(|only| only != variant_purl) {
+                        continue;
+                    }
                     let patch = match manifest.patches.get(variant_purl) {
                         Some(p) => p,
                         None => continue,

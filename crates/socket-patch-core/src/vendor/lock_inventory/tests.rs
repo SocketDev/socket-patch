@@ -4246,17 +4246,12 @@ const PINNED_REFERENCES: &[(&str, &str, &str)] = &[
     (
         "patch/gem_source.rs",
         "download",
-        "let bytes = download(&self.http, url).await?;",
+        "let bytes = download(self.http.get_or_init(build_registry_client), &url).await?;",
     ),
     (
         "patch/gem_source.rs",
         "download",
-        "let bytes = download(&self.http, &url).await?;",
-    ),
-    (
-        "patch/gem_source.rs",
-        "download",
-        "let bytes = download(&self.http, &url).await?;",
+        "let bytes = download(self.http.get_or_init(build_registry_client), &url).await?;",
     ),
     (
         "patch/redirect/upstream/client.rs",
