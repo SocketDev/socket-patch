@@ -994,7 +994,7 @@ fn gem_vendor_transitive_dep_fresh_checkout_and_revert() {
     let gemfile = std::fs::read_to_string(&gemfile_path).unwrap();
     let expected_gemfile = format!(
         "{}# >>> socket-patch vendor (managed) >>>\ngem \"{DEP}\", \"{version}\", \
-         path: \"{copy_rel}\"\n# <<< socket-patch vendor (managed) <<<\n",
+         path: \"{copy_rel}\", require: false\n# <<< socket-patch vendor (managed) <<<\n",
         String::from_utf8_lossy(&gemfile_before)
     );
     assert_eq!(

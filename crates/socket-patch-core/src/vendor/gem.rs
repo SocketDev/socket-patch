@@ -3734,7 +3734,7 @@ mod tests {
         assert_eq!(
             gemfile,
             format!(
-                "source \"https://rubygems.org\"\n\ngem \"puma\"\n{MANAGED_OPEN}\ngem \"rack\", \"3.2.6\", path: \"{}\"\n{MANAGED_CLOSE}\n",
+                "source \"https://rubygems.org\"\n\ngem \"puma\"\n{MANAGED_OPEN}\ngem \"rack\", \"3.2.6\", path: \"{}\", require: false\n{MANAGED_CLOSE}\n",
                 copy_rel()
             )
         );
@@ -4508,7 +4508,7 @@ mod tests {
                 GEMFILE_TRANSITIVE,
                 LOCK_TRANSITIVE,
                 format!(
-                    "{MANAGED_OPEN}\r\ngem \"rack\", \"3.2.6\", path: \"{}\"\r\n{MANAGED_CLOSE}\r\n",
+                    "{MANAGED_OPEN}\r\ngem \"rack\", \"3.2.6\", path: \"{}\", require: false\r\n{MANAGED_CLOSE}\r\n",
                     copy_rel()
                 ),
             ),
@@ -4576,7 +4576,7 @@ mod tests {
         assert!(r2.success, "{:?}", r2.error);
 
         let new_block = format!(
-            "{MANAGED_OPEN}\r\ngem \"rack\", \"3.2.6\", path: \".socket/vendor/gem/{UUID2}/rack-3.2.6\"\r\n{MANAGED_CLOSE}\r\n"
+            "{MANAGED_OPEN}\r\ngem \"rack\", \"3.2.6\", path: \".socket/vendor/gem/{UUID2}/rack-3.2.6\", require: false\r\n{MANAGED_CLOSE}\r\n"
         );
         assert_eq!(
             tokio::fs::read_to_string(root.join(GEMFILE)).await.unwrap(),
@@ -5696,7 +5696,7 @@ mod tests {
 
         let new_rel = format!(".socket/vendor/gem/{UUID2}/rack-3.2.6");
         let new_block = format!(
-            "{MANAGED_OPEN}\ngem \"rack\", \"3.2.6\", path: \"{new_rel}\"\n{MANAGED_CLOSE}\n"
+            "{MANAGED_OPEN}\ngem \"rack\", \"3.2.6\", path: \"{new_rel}\", require: false\n{MANAGED_CLOSE}\n"
         );
         assert_eq!(
             tokio::fs::read_to_string(root.join(GEMFILE)).await.unwrap(),
@@ -5733,6 +5733,182 @@ mod tests {
                 .unwrap(),
             LOCK_TRANSITIVE
         );
+    }
+
+    /// The managed block as releases up to 5.1 wrote it, without
+    /// `require: false` (#2084): what a project vendored by one of them
+    /// carries in its Gemfile and its ledger.
+    fn block_without_require(nl: &str) -> String {
+        format!(
+            "{MANAGED_OPEN}{nl}gem \"rack\", \"3.2.6\", path: \"{}\"{nl}{MANAGED_CLOSE}{nl}",
+            copy_rel()
+        )
+    }
+
+    /// Vendor the transitive fixture, then put the Gemfile and the ledger
+    /// record in the state an older release left: the block without
+    /// `require: false`.
+    async fn vendored_by_an_older_release(
+        nl: &str,
+    ) -> (
+        tempfile::TempDir,
+        PathBuf,
+        PathBuf,
+        PathBuf,
+        PatchRecord,
+        VendorEntry,
+        String,
+    ) {
+        let gemfile = GEMFILE_TRANSITIVE.replace('\n', nl);
+        let (tmp, root, installed, blobs, record) = fixture(&gemfile, LOCK_TRANSITIVE).await;
+        let (r1, e1, _) = unwrap_done(run_vendor(&root, &blobs, &installed, &record, false).await);
+        assert!(r1.success, "{:?}", r1.error);
+        let mut entry = e1.unwrap();
+        let old_block = block_without_require(nl);
+        tokio::fs::write(root.join(GEMFILE), format!("{gemfile}{old_block}"))
+            .await
+            .unwrap();
+        entry.wiring[0].new = Some(Value::String(old_block));
+        (tmp, root, installed, blobs, record, entry, gemfile)
+    }
+
+    /// #2084: the declaration the managed block adds is one `Bundler.require`
+    /// must not load at boot, since the gem was not in the Gemfile before.
+    #[test]
+    fn appended_block_declares_the_gem_require_false() {
+        for nl in ["\n", "\r\n"] {
+            let text = GEMFILE_TRANSITIVE.replace('\n', nl);
+            let rel = copy_rel();
+            let Ok(GemfilePlan::Append { block }) = plan_gemfile_edit(&text, "rack", "3.2.6", &rel)
+            else {
+                panic!("a gem the Gemfile does not declare is appended");
+            };
+            assert_eq!(
+                block,
+                format!(
+                    "{MANAGED_OPEN}{nl}gem \"rack\", \"3.2.6\", path: \"{rel}\", require: false{nl}{MANAGED_CLOSE}{nl}"
+                )
+            );
+        }
+    }
+
+    /// #2084: a block an older release wrote gains `require: false` when a
+    /// patch update re-vendors the gem, and the record holds the block as
+    /// written, so the revert still deletes it.
+    #[tokio::test]
+    async fn revendor_adds_require_false_to_an_older_block() {
+        for nl in ["\n", "\r\n"] {
+            let (_tmp, root, installed, blobs, record, entry1, gemfile) =
+                vendored_by_an_older_release(nl).await;
+            let mut record2 = record.clone();
+            record2.uuid = UUID2.to_string();
+            let (r2, e2, _) =
+                unwrap_done(run_vendor(&root, &blobs, &installed, &record2, false).await);
+            assert!(r2.success, "{:?}", r2.error);
+
+            let new_block = format!(
+                "{MANAGED_OPEN}{nl}gem \"rack\", \"3.2.6\", path: \".socket/vendor/gem/{UUID2}/rack-3.2.6\", require: false{nl}{MANAGED_CLOSE}{nl}"
+            );
+            assert_eq!(
+                tokio::fs::read_to_string(root.join(GEMFILE)).await.unwrap(),
+                format!("{gemfile}{new_block}"),
+                "{nl:?}"
+            );
+            let mut entry2 = e2.unwrap();
+            assert_eq!(entry2.wiring[0].action, WiringAction::Added);
+            assert_eq!(
+                entry2.wiring[0].new.as_ref().unwrap(),
+                &Value::String(new_block)
+            );
+
+            carry_forward_originals(&entry1, &mut entry2);
+            let outcome = revert_gem(&entry2, &root, false).await;
+            assert!(outcome.success, "{:?}", outcome.error);
+            assert_eq!(
+                tokio::fs::read_to_string(root.join(GEMFILE)).await.unwrap(),
+                gemfile
+            );
+        }
+    }
+
+    /// #2084: the revert still takes a block an older release wrote and
+    /// recorded, the one without `require: false`.
+    #[tokio::test]
+    async fn revert_removes_an_older_block_without_require_false() {
+        for nl in ["\n", "\r\n"] {
+            let (_tmp, root, _installed, _blobs, _record, entry, gemfile) =
+                vendored_by_an_older_release(nl).await;
+            let outcome = revert_gem(&entry, &root, false).await;
+            assert!(outcome.success, "{:?}", outcome.error);
+            assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+            assert_eq!(
+                tokio::fs::read_to_string(root.join(GEMFILE)).await.unwrap(),
+                gemfile
+            );
+            assert_eq!(
+                tokio::fs::read_to_string(root.join(GEMFILE_LOCK))
+                    .await
+                    .unwrap(),
+                LOCK_TRANSITIVE
+            );
+        }
+    }
+
+    /// A managed-block line someone gave options or a comment is theirs: a
+    /// re-vendor repoints its `path:` and changes nothing else on it.
+    #[test]
+    fn revendor_keeps_an_edited_block_line_as_it_is() {
+        let new_rel = format!(".socket/vendor/gem/{UUID2}/rack-3.2.6");
+        for tail in [
+            ", require: \"rack/lite\"",
+            ", require: false",
+            ", group: :web",
+            " # pinned",
+        ] {
+            let line = |rel: &str| format!("gem \"rack\", \"3.2.6\", path: \"{rel}\"{tail}");
+            let text = format!(
+                "{GEMFILE_TRANSITIVE}{MANAGED_OPEN}\n{}\n{MANAGED_CLOSE}\n",
+                line(&copy_rel())
+            );
+            let Ok(GemfilePlan::RewireOurs {
+                new_line,
+                managed_block,
+                ..
+            }) = plan_gemfile_edit(&text, "rack", "3.2.6", &new_rel)
+            else {
+                panic!("our own block is rewired: {tail}");
+            };
+            assert_eq!(new_line, line(&new_rel), "{tail}");
+            assert_eq!(
+                managed_block.unwrap(),
+                format!("{MANAGED_OPEN}\n{}\n{MANAGED_CLOSE}\n", line(&new_rel))
+            );
+        }
+    }
+
+    /// A top-level declaration we rewired (not in the managed fence) was in
+    /// the Gemfile before the patch: a re-vendor never gives it
+    /// `require: false`.
+    #[test]
+    fn revendor_never_adds_require_false_outside_the_block() {
+        let new_rel = format!(".socket/vendor/gem/{UUID2}/rack-3.2.6");
+        let text = format!(
+            "{GEMFILE_TRANSITIVE}gem \"rack\", \"3.2.6\", path: \"{}\"\n",
+            copy_rel()
+        );
+        let Ok(GemfilePlan::RewireOurs {
+            new_line,
+            managed_block,
+            ..
+        }) = plan_gemfile_edit(&text, "rack", "3.2.6", &new_rel)
+        else {
+            panic!("our own declaration is rewired");
+        };
+        assert_eq!(
+            new_line,
+            format!("gem \"rack\", \"3.2.6\", path: \"{new_rel}\"")
+        );
+        assert!(managed_block.is_none());
     }
 
     /// A re-vendor must RE-SORT: the replacement PATH section lands wherever
@@ -8842,7 +9018,7 @@ mod tests {
         assert_eq!(
             tokio::fs::read_to_string(root.join(GEMFILE)).await.unwrap(),
             format!(
-                "source \"https://rubygems.org\"\n\ngem \"puma\"\n{MANAGED_OPEN}\ngem \"rack\", \"3.2.6\", path: \"{}\"\n{MANAGED_CLOSE}\n",
+                "source \"https://rubygems.org\"\n\ngem \"puma\"\n{MANAGED_OPEN}\ngem \"rack\", \"3.2.6\", path: \"{}\", require: false\n{MANAGED_CLOSE}\n",
                 copy_rel()
             ),
             "a newline is inserted before the block — never line concatenation"
