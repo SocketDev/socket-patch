@@ -165,7 +165,12 @@ pub fn pristine_member(artifact: &str, version: &str) -> Vec<u8> {
 
 /// What the patch makes of the base victim's [`MEMBER`].
 pub fn patched_member() -> Vec<u8> {
-    let mut out = pristine_member(VICTIM, BASE);
+    patched_member_of(BASE)
+}
+
+/// What a patch of the victim at `version` makes of its [`MEMBER`].
+pub fn patched_member_of(version: &str) -> Vec<u8> {
+    let mut out = pristine_member(VICTIM, version);
     out.extend_from_slice(format!("{MARKER}\n").as_bytes());
     out
 }
@@ -255,6 +260,85 @@ pub fn project_pom(shape: Shape, server: &Server) -> String {
          <dependencies>\n{}  </dependencies>\n</project>\n",
         server.uri(),
         shape.dependencies()
+    )
+}
+
+/// The modules of [`write_reactor`], and the victim version each selects.
+pub const REACTOR_MODULES: [(&str, &str); 3] = [("a", BASE), ("b", NEWER), ("c", BASE)];
+
+/// Write a reactor into `dir` (the table's V3): a parent pom that three
+/// modules inherit, `a` reaching the base version two levels down, `b` a
+/// newer version through another artifact, `c` declaring the base version
+/// itself.
+pub fn write_reactor(dir: &Path, server: &Server) {
+    let modules: String = REACTOR_MODULES
+        .iter()
+        .map(|(name, _)| format!("    <module>{name}</module>\n"))
+        .collect();
+    std::fs::create_dir_all(dir).unwrap();
+    std::fs::write(
+        dir.join("pom.xml"),
+        format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+             <project xmlns=\"http://maven.apache.org/POM/4.0.0\">\n  \
+             <modelVersion>4.0.0</modelVersion>\n  <groupId>com.example</groupId>\n  \
+             <artifactId>parent</artifactId>\n  <version>1.0.0</version>\n  \
+             <packaging>pom</packaging>\n  <modules>\n{modules}  </modules>\n  \
+             <repositories>\n    <repository>\n      <id>fixture</id>\n      \
+             <url>{}{REPO_ROUTE}</url>\n    </repository>\n  </repositories>\n</project>\n",
+            server.uri()
+        ),
+    )
+    .unwrap();
+    for (name, deps) in [
+        ("a", dependency("lib-deep", "1.0", "")),
+        ("b", dependency("lib-new", "1.0", "")),
+        ("c", dependency(VICTIM, BASE, "")),
+    ] {
+        std::fs::create_dir_all(dir.join(name)).unwrap();
+        std::fs::write(
+            dir.join(name).join("pom.xml"),
+            format!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+                 <project xmlns=\"http://maven.apache.org/POM/4.0.0\">\n  \
+                 <modelVersion>4.0.0</modelVersion>\n  <parent>\n    \
+                 <groupId>com.example</groupId>\n    <artifactId>parent</artifactId>\n    \
+                 <version>1.0.0</version>\n  </parent>\n  <artifactId>{name}</artifactId>\n  \
+                 <dependencies>\n{deps}  </dependencies>\n</project>\n"
+            ),
+        )
+        .unwrap();
+    }
+}
+
+/// The jars Maven resolves for each module of the reactor at `proj`
+/// (see [`resolve`]), by module name.
+pub fn resolve_reactor(
+    suite: &str,
+    mvn: &Mvn,
+    proj: &Path,
+    m2: &Path,
+    settings: &Path,
+    out_rel: &str,
+) -> Option<BTreeMap<String, BTreeMap<String, Vec<u8>>>> {
+    for (module, _) in REACTOR_MODULES {
+        let _ = std::fs::remove_dir_all(proj.join(module).join(out_rel));
+    }
+    let out = with_central_fallback(suite, "reactor resolution", settings, |s, extra| {
+        copy_dependencies(mvn, proj, m2, s, out_rel, extra)
+    });
+    if !ok(&out) {
+        crate::maven_build_common::skip(
+            suite,
+            &format!("resolving {} failed:\n{}", proj.display(), dump(&out)),
+        );
+        return None;
+    }
+    Some(
+        REACTOR_MODULES
+            .iter()
+            .map(|(module, _)| (module.to_string(), copied(&proj.join(module), out_rel)))
+            .collect(),
     )
 }
 
