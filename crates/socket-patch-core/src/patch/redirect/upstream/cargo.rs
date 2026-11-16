@@ -438,63 +438,72 @@ fn unpin_line(line: &str, reg: &str) -> Option<Option<String>> {
     Some(Some(rebuilt))
 }
 
-/// The config with its `[registries.<reg>]` block (and the blank separator
-/// the rewriter put before it) removed; `None` when absent.
+/// The config with its `[registries.<reg>]` block removed, together with
+/// the one newline the rewriter put before it; `None` when absent.
+///
+/// The rewriter wrote `config + "\n" + block` (just `block` into an empty
+/// config), whether or not the config ended in a newline: that newline is
+/// a blank separator line after a final newline, and the line ending of a
+/// config that had none. Taking the block and that newline back restores
+/// the config's exact bytes, a missing final newline or trailing blank
+/// lines included. A file whose every line ends in CRLF is edited as LF
+/// and written back CRLF, as the rewriter does; mixed endings stay as they
+/// are.
+///
+/// The block is the header and the keys under it. Blank lines and comments
+/// after its last key are the user's (a separator, or the heading of the
+/// next section) and stay, as does everything after them. When the user
+/// put content straight after the block of a config that had no final
+/// newline, the newline stays too: without it the config's last line and
+/// that content would become one line.
+///
+/// Earlier releases wrote `config + "\n\n" + block` into a config with no
+/// final newline. Nothing in the file tells that apart from a config that
+/// had one, so a config they patched comes back with a final newline added.
 pub(crate) fn remove_registry_block(config: &str, reg: &str) -> Option<String> {
-    let crlf = config.contains("\r\n");
-    let lf = config.replace("\r\n", "\n");
+    let lf = super::super::crlf_to_lf(config);
+    let text = lf.as_deref().unwrap_or(config);
     let header = format!("[registries.{reg}]");
-    let lines: Vec<&str> = lf.split('\n').collect();
+    let lines: Vec<&str> = text.split('\n').collect();
     let i = lines.iter().position(|l| l.trim() == header)?;
-    let mut end = lines.len();
-    for (j, l) in lines.iter().enumerate().skip(i + 1) {
-        if l.trim_start().starts_with('[') {
-            end = j;
+    let mut end = lines[i + 1..]
+        .iter()
+        .position(|l| l.trim_start().starts_with('['))
+        .map_or(lines.len(), |next| i + 1 + next);
+    while end > i + 1 {
+        let line = lines[end - 1].trim();
+        if !(line.is_empty() || line.starts_with('#')) {
             break;
         }
-    }
-    while end > i + 1 && lines[end - 1].trim().is_empty() {
         end -= 1;
     }
-    let fragment = format!("{}\n", lines[i..end].join("\n"));
-    let removed = remove_appended_cargo_block(&lf, &fragment).or_else(|| {
-        // The block ends the file with no final newline.
-        remove_appended_cargo_block(&lf, fragment.trim_end_matches('\n'))
-    })?;
-    Some(if crlf {
+    let bytes = |lines: &[&str]| lines.iter().map(|l| l.len() + 1).sum::<usize>();
+    let start = bytes(&lines[..i]);
+    // The last line of a file with no final newline has no newline to take.
+    let stop = (start + bytes(&lines[i..end])).min(text.len());
+    let (before, after) = (&text[..start], &text[stop..]);
+    let unseparated = before
+        .strip_suffix("\r\n")
+        .or_else(|| before.strip_suffix('\n'))
+        .unwrap_or(before);
+    // Without the newline, would the line before the block and what follows
+    // it still be separate lines?
+    let lines_stay_apart = unseparated.is_empty()
+        || unseparated.ends_with('\n')
+        || after.is_empty()
+        || after.starts_with('\n')
+        || after.starts_with("\r\n");
+    let kept = if lines_stay_apart {
+        unseparated
+    } else {
+        before
+    };
+    let removed = format!("{kept}{after}");
+    Some(if lf.is_some() {
         removed.replace('\n', "\r\n")
     } else {
         removed
     })
-}
-
-/// Invert the cargo rewriter's append of a `[registries.…]` block: it wrote
-/// `config + "\n" + block` (just `block` into an empty config), or
-/// `config + "\n\n" + block` when the config lacked a final newline.
-/// Removing the block plus the one newline before it restores the config's
-/// exact bytes, a missing final newline or trailing blank lines included,
-/// and anything the user appended after the block kept. An all-CRLF file is
-/// inverted as LF and written back CRLF. `None` when the block is not in
-/// the file.
-fn remove_appended_cargo_block(content: &str, fragment: &str) -> Option<String> {
-    if !content.is_empty() && content.matches('\n').count() == content.matches("\r\n").count() {
-        return remove_appended_cargo_block(
-            &content.replace("\r\n", "\n"),
-            &fragment.replace("\r\n", "\n"),
-        )
-        .map(|lf| lf.replace('\n', "\r\n"));
-    }
-    let lf_fragment = fragment.replace("\r\n", "\n");
-    let (pos, len) = match content.find(fragment) {
-        Some(pos) => (pos, fragment.len()),
-        None => (content.find(&lf_fragment)?, lf_fragment.len()),
-    };
-    let before = &content[..pos];
-    let before = before
-        .strip_suffix("\r\n")
-        .or_else(|| before.strip_suffix('\n'))
-        .unwrap_or(before);
-    Some(format!("{before}{}", &content[pos + len..]))
 }
 
 /// Respell the dependents' references to each merged hit's crate the way
@@ -816,6 +825,95 @@ mod tests {
         let (outcome, after) = restore_b(&manifest(""), &config).await;
         assert_eq!(outcome.restored().count(), 1, "{:?}", outcome.pins);
         assert_eq!(after, None, "the emptied config must be deleted");
+    }
+
+    /// The rewriter's own append (`plan_cargo_config`), undone by the
+    /// restore `remove` runs: a config comes back as it was, with no final
+    /// newline when it had none.
+    #[tokio::test]
+    async fn restore_gives_back_a_config_with_no_final_newline() {
+        for original in [
+            "[net]\nretry = 3",
+            "[net]\nretry = 3\n",
+            "[net]\nretry = 3\n\n",
+        ] {
+            let hosted = super::super::super::plan_cargo_config(
+                original,
+                ".cargo/config.toml",
+                &format!("socket-patch-{B}"),
+                "sparse+https://patch.socket.dev/patch-registry/cargo/tok/b/index/",
+            )
+            .expect("block appended")
+            .content;
+            let (outcome, after) = restore_b(&manifest(""), &hosted).await;
+            assert_eq!(outcome.restored().count(), 1, "{:?}", outcome.pins);
+            assert_eq!(after.as_deref(), Some(original), "{original:?}");
+        }
+    }
+
+    /// What the user wrote after the block stays, on lines of its own.
+    #[test]
+    fn content_after_the_block_is_kept() {
+        let block = format!("[registries.{REG}]\nindex = \"sparse+https://x/\"\n");
+        let rest = "[build]\njobs = 4\n";
+        // A config with no final newline, then `[build]` put straight after
+        // the block: the newline before the block has to stay, or
+        // `retry = 3[build]` is one line cargo cannot parse.
+        assert_eq!(
+            remove_registry_block(&format!("[net]\nretry = 3\n{block}{rest}"), REG).as_deref(),
+            Some("[net]\nretry = 3\n[build]\njobs = 4\n")
+        );
+        // Behind a blank line, or after a config that ended in a newline,
+        // the newline before the block goes as it does at the end of the
+        // file.
+        assert_eq!(
+            remove_registry_block(&format!("[net]\nretry = 3\n{block}\n{rest}"), REG).as_deref(),
+            Some("[net]\nretry = 3\n[build]\njobs = 4\n")
+        );
+        assert_eq!(
+            remove_registry_block(&format!("[net]\nretry = 3\n\n{block}{rest}"), REG).as_deref(),
+            Some("[net]\nretry = 3\n[build]\njobs = 4\n")
+        );
+        // A comment heading the next section is the user's, with the blank
+        // line before it.
+        assert_eq!(
+            remove_registry_block(
+                &format!("[net]\nretry = 3\n\n{block}\n# build settings\n{rest}"),
+                REG
+            )
+            .as_deref(),
+            Some("[net]\nretry = 3\n\n# build settings\n[build]\njobs = 4\n")
+        );
+        // So is a comment at the end of the file.
+        assert_eq!(
+            remove_registry_block(&format!("[net]\nretry = 3\n{block}# note"), REG).as_deref(),
+            Some("[net]\nretry = 3\n# note")
+        );
+    }
+
+    /// A file of mixed line endings is not an all-CRLF file: the lines the
+    /// block never touched keep the endings they had.
+    #[test]
+    fn mixed_line_endings_are_left_as_they_are() {
+        let block = format!("[registries.{REG}]\nindex = \"sparse+https://x/\"\n");
+        for original in ["[a]\r\nx = 1\ny = 2", "[a]\r\nx = 1\ny = 2\n"] {
+            assert_eq!(
+                remove_registry_block(&format!("{original}\n{block}"), REG).as_deref(),
+                Some(original),
+                "{original:?}"
+            );
+        }
+        let crlf = "[a]\r\nx = 1\r\n";
+        assert_eq!(
+            remove_registry_block(
+                &format!("{crlf}\n{block}")
+                    .replace("\r\n", "\n")
+                    .replace('\n', "\r\n"),
+                REG
+            )
+            .as_deref(),
+            Some(crlf)
+        );
     }
 
     /// A generation the restore did not select that a manifest still pins
