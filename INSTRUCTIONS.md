@@ -57,7 +57,10 @@ Keep the ledger small. Every run pays to read it.
 ## Each run
 1. **Load state.** `git fetch origin bughunt/ledger main`, then read
    `state/{SLUG}.md` and the two newest entries with `git show`. List the open
-   issues labelled `pm:{SLUG}` (numbers, titles and labels only).
+   issues labelled `pm:{SLUG}` (numbers, titles and labels only). If 20 or
+   more of them carry `bughunt`, the fixers are behind and more reports
+   won't help yet: do step 3, update the `Last run` line in the state file,
+   push, and stop without hunting or adding an entry.
 2. **Update to main.** Check out `origin/main` and note its SHA and the latest
    release tag. If the state file records the same SHA, no new {NAME} release
    has come out since, and the backlog is empty, there is nothing new to
