@@ -910,12 +910,16 @@ there compiles it.
 copy does not hold everything its extension was built from: a build deletes what it is done with
 (nokogiri's `ports/`), and a precompiled gem never shipped the build's inputs. The archive is the
 copy's own for a gem RubyGems built, and the ruby-platform `<name>-<version>.gem` for a precompiled
-one. It is taken from the gem home's `cache/`, where RubyGems and Bundler keep it, with no network
-(unless `Gemfile.lock` pins another `CHECKSUMS` sha256 for it). Otherwise, and not under
-`--offline`, it is downloaded from the gem's source: the `remote:` of the lock's `GEM` section
-that lists the gem, else `https://rubygems.org` (`SOCKET_RUBYGEMS_URL`), as `<source>/gems/<file>`.
-The download must have the sha256 the lock's `CHECKSUMS` pins for that gem, else the one the
-source's compact index (`<source>/info/<name>`) records; an archive nothing pins is not used.
+one. It is taken from the gem home's `cache/`, where RubyGems and Bundler keep it, as it is and
+with no network. Otherwise, and not under `--offline`, it is downloaded from the default registry,
+`https://rubygems.org` or the registry `SOCKET_RUBYGEMS_URL` names (a mirror), as
+`<registry>/gems/<file>`, and used only when its sha256 is the one that registry's compact index
+(`<registry>/info/<name>`) records. Nothing in the project's lock chooses the URL or the hash: not
+a `remote:`, not `CHECKSUMS`. The lock is read to withhold the download: a gem that
+`Gemfile.lock` / `gems.locked` resolves from another source (a `GEM` section with a remote that
+is not the registry, a private gem server or Socket's patch registry among them; a `GIT` or `PATH`
+section) is not the registry's gem of that name, and nothing is fetched for it. Its cached archive
+is then the only way to its source.
 
 **The rebuild.** The archive is unpacked into a stage inside the gem home
 (`<home>/.socket-patch-build/<gem>-<version>[-<platform>]/`), by RubyGems, and must be that gem and
@@ -926,8 +930,8 @@ staged gem's extension in the stage, with the build arguments it recorded for th
 (`build_info/`). A gem the staged gem depends on at runtime that is not on the build's `GEM_PATH`
 (the stage home, the copy's home, the caller's `GEM_PATH`, RubyGems' defaults) is staged too: the
 newest ruby-platform release the requirement allows that runs on the building Ruby, downloaded
-from the same source and verified against its compact index, and installed into the stage home. A
-precompiled nokogiri has no `mini_portile2`, which its build needs. Nothing is ever installed into
+from the registry under the same rules and verified against its compact index, and installed into
+the stage home. A precompiled nokogiri has no `mini_portile2`, which its build needs. Nothing is ever installed into
 the user's gem home, and the stage is removed when the run ends. Until the build has finished,
 nothing of the installed copy is touched.
 
@@ -944,13 +948,17 @@ place of the compiled code:
   `lib/sqlite3/3.3/sqlite3_native.so`), for the building Ruby's `major.minor`. When that path is
   not there, the one file of that name under the require path is taken. No such file, or more than
   one, is refused with nothing written. The binaries the gem ships for other Rubies are left as
-  they are. The owning Ruby is the one that runs the gem's platform and builds its extensions where
-  the gem home has its other gems' (`extensions/<platform>/<abi>/`); in a home with none, the one
-  whose ABI the home's directory name carries (`…/ruby/3.4.0`).
+  they are. The owning Ruby is the one that runs the gem's platform and builds extensions for the
+  Ruby ABI the gem home's other native gems were built for (the `<abi>` of its
+  `extensions/<platform>/<abi>/` directories); in a home with none, the one whose ABI the home's
+  directory name carries (`…/ruby/3.4.0`). A home that shows neither is taken to be that Ruby's.
 
 A build input the installed copy does not hold (a precompiled gem never shipped `patches/**`; a
 build removed `ports/**`) is written into the copy even when the record replaces existing content:
-that content was checked in the source gem. `rollback` removes such a file again.
+that content was checked in the source gem. `rollback` removes such a file again. Its absence
+also does not count against the ruby-platform record (`?platform=ruby`, or no qualifier) when a
+release variant is matched to the installed copy, as a missing file otherwise does; a record
+qualified for another platform is matched as before.
 
 **Without the source gem.** A gem RubyGems built is rebuilt in place, from its own tree: the
 patched sources are written, the current build is moved aside, and RubyGems builds into a fresh
@@ -958,7 +966,8 @@ extension directory; a failed build puts the old build and the original sources 
 work for a gem whose build removed its inputs, and a record that changes a removed input is
 refused instead. A precompiled gem has no such fallback: it is refused with
 `native_extensions_unsupported`, and the message says what is needed (one run with network access
-to the gem's source, or the source gem in the home's `cache/`). The JRuby build of a gem (the
+to the registry, or the source gem in the home's `cache/`; for a gem the lock resolves from
+another source, only the latter). The JRuby build of a gem (the
 `java` platform) ships jars compiled from Java sources, which no source gem's build produces: a
 record that changes its build inputs is always refused.
 
@@ -1017,7 +1026,7 @@ a file the copy does not hold is not written: the record fails on it as on any m
 
 | Code | Run result | Meaning |
 |---|---|---|
-| `native_extensions_unsupported` | refused, exit 1 | The record changes build inputs that cannot be rebuilt here: the copy is not a RubyGems install with a `specifications/` entry (a Bundler git checkout); the gem neither declares extensions nor is a platform gem; it is the JRuby (`java`) build; no Ruby that owns the install was found; a precompiled gem's source gem is neither in the home's `cache/` nor downloadable (offline, not served, not pinned by a checksum); the record does not apply to the source gem; a gem the build needs is not installed and could not be staged; the build has no counterpart among the gem's prebuilt binaries. Nothing is written. Also: another run is rebuilding the same gem right now, or an interrupted rebuild could not be undone (the error says which). |
+| `native_extensions_unsupported` | refused, exit 1 | The record changes build inputs that cannot be rebuilt here: the copy is not a RubyGems install with a `specifications/` entry (a Bundler git checkout); the gem neither declares extensions nor is a platform gem; it is the JRuby (`java`) build; no Ruby that owns the install was found; a precompiled gem's source gem is neither in the home's `cache/` nor downloadable (offline, locked from another source, not served or not listed with a checksum by the registry); the record does not apply to the source gem; a gem the build needs is not installed and could not be staged; the build has no counterpart among the gem's prebuilt binaries. Nothing is written. Also: another run is rebuilding the same gem right now, or an interrupted rebuild could not be undone (the error says which). |
 | `native_extension_build_failed` | refused, exit 1 | The extension did not build from the patched sources (no compiler or Ruby headers, a build error), or the finished build could not be moved into place. The installed copy is as it was before the run; the error carries the build output's tail. |
 | `native_extension_rebuilt` | warning | The sources were already patched (by a release before #1996, or with `--no-gem-native-rebuild`) and the extension was rebuilt from them. Under `--dry-run`: the rebuild a real `apply` would run; no Ruby is started and nothing is downloaded to check that it can. |
 | `native_extension_not_rebuilt` | warning | `--no-gem-native-rebuild`: the sources were written without a rebuild; Ruby loads the old build until the caller compiles it. |
@@ -1895,7 +1904,7 @@ Env-only knobs used for hosted upstream restoration and JVM metadata verificatio
 | `SOCKET_CRATES_INDEX` | `https://index.crates.io` | v5.0 upstream restore: the crates.io sparse index whose `checksum` a restored `Cargo.lock` entry gets back. |
 | `SOCKET_GOSUMDB_URL` | `https://sum.golang.org` | v5.0 upstream restore: the checksum database the restored go.sum lines are checked against. Without it, `GOSUMDB=off` or a module matching `GONOSUMDB` (default `GOPRIVATE`) skips the database and the hashes come from the module proxy's bytes alone (`SOCKET_GOPROXY` above). |
 | `SOCKET_PYPI_JSON_API` | `https://pypi.org/pypi` | PyPI's JSON API (`<base>/<name>/<version>/json`): the release files whose sha256 the upstream restore writes back into every Python lock format. |
-| `SOCKET_RUBYGEMS_URL` | `https://rubygems.org` | v5.0 upstream restore: the compact index (`/info/<name>`) a restored `CHECKSUMS` entry is re-pinned from. Agent mode: where the source gem of a native-extension gem (`/gems/<file>`), and a gem its build lacks, are downloaded and their checksums read (`/info/<name>`) when the lock names rubygems.org or no source for them. |
+| `SOCKET_RUBYGEMS_URL` | `https://rubygems.org` | v5.0 upstream restore: the compact index (`/info/<name>`) a restored `CHECKSUMS` entry is re-pinned from. Agent mode: the registry the source gem of a native-extension gem (`/gems/<file>`), and a gem its build lacks, are downloaded from and their checksums read from (`/info/<name>`); a lock `remote:` equal to it counts as the registry. |
 | `SOCKET_PACKAGIST_URL` | `https://repo.packagist.org` | v5.0 upstream restore: packagist's composer v2 metadata (`/p2/<vendor>/<package>.json`) a restored `composer.lock` `dist` / `source` comes from. |
 | `SOCKET_NUGET_URL` | `https://api.nuget.org` | v5.0 upstream restore: the nuget.org API host whose catalog `packageHash` a restored `packages.lock.json` `contentHash` comes from. |
 

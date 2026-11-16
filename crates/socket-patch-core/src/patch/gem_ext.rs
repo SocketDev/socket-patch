@@ -28,8 +28,10 @@
 //!
 //! The source gem, `<name>-<version>.gem`, when it can be had
 //! ([`crate::patch::gem_source`]): from the gem home's `cache/`, where
-//! RubyGems and Bundler keep it, else downloaded from the gem's source and
-//! verified against the sha256 the lock or that source's index pins. An
+//! RubyGems and Bundler keep it, else downloaded from the default registry
+//! and verified against the sha256 its compact index records. Nothing in
+//! the project's lock chooses the URL or the hash; a gem the lock resolves
+//! from another source is not downloaded at all. An
 //! installed copy does not hold everything its extension was built from: a
 //! build deletes what it is done with (nokogiri's `ports/`), and a
 //! precompiled gem never shipped the build's inputs. The rebuild:
@@ -72,8 +74,8 @@
 //! the current build is moved aside, and RubyGems builds into a fresh
 //! extension dir; a failed build puts the old build and the original
 //! sources back. A precompiled gem has no such fallback and is refused,
-//! with what it needs: network access to the gem's source once, or the
-//! source gem in the home's `cache/`.
+//! with what it needs: network access to the registry once, or the source
+//! gem in the home's `cache/`.
 //!
 //! `vex` and `apply --check` attest a copy only when its marker matches the
 //! record's patched sources and every recorded artifact still hashes as
@@ -103,10 +105,10 @@
 //! 2. RubyGems, unpacking the source gem into the stage
 //!    (`RubyRun::Unpack`) and naming the gems its build depends on that are
 //!    not installed (`RubyRun::MissingDeps`). The archive's metadata is
-//!    read as data; none of its code runs. A missing gem is downloaded,
-//!    verified against its source's index and installed into the stage
-//!    home (`RubyRun::Install`), which runs that gem's build scripts if it
-//!    has any.
+//!    read as data; none of its code runs. A missing gem is downloaded
+//!    from the registry, verified against its index and installed into the
+//!    stage home (`RubyRun::Install`), which runs that gem's build scripts
+//!    if it has any.
 //! 3. With the record laid over the staged gem, RubyGems' extension builder
 //!    (`RubyRun::StageBuild`). It runs the archive's own build scripts
 //!    (`extconf.rb`, a Rakefile, `make`, the compiler), as `gem install`
@@ -1633,10 +1635,11 @@ fn abi_of_home(home: &Path) -> Option<String> {
 ///
 /// * runs gems of that platform (`Gem::Platform#===`, as RubyGems picks a
 ///   platform gem), and
-/// * builds its extensions where this gem home has some (the home's
-///   `extensions/<platform>/<abi>` dirs, from its other native gems); in a
-///   home with none, its ABI is the one the home's dir name carries
-///   (`…/ruby/3.4.0`), when it carries one.
+/// * builds extensions for the ABI this gem home has some for (the
+///   `<abi>` of its `extensions/<platform>/<abi>` dirs, from its other
+///   native gems); in a home with none, its ABI is the one the home's dir
+///   name carries (`…/ruby/3.4.0`), when it carries one. A home that shows
+///   neither is taken to be the candidate's.
 ///
 /// Its facts are part of the answer: the build is grafted over the binary
 /// the gem keeps for that Ruby's `major.minor`.
@@ -1677,19 +1680,25 @@ async fn find_platform_ruby(
             ));
             continue;
         }
-        let abi = extensions_dir
-            .file_name()
+        // The `<abi>` dir this Ruby builds into (`3.4.0`): the platform dir
+        // above it may be spelled for another OS release (`arm64-darwin-24`
+        // after an upgrade), and the gem's own platform was just checked.
+        let abi_dir = extensions_dir.file_name().map(|n| n.to_os_string());
+        let abi = abi_dir
+            .as_ref()
             .map(|n| n.to_string_lossy().trim_end_matches("-static").to_string())
             .unwrap_or_default();
         let owns = if !installed.is_empty() {
-            installed.iter().any(|dir| same_path(dir, &extensions_dir))
+            installed
+                .iter()
+                .any(|dir| dir.file_name().map(|n| n.to_os_string()) == abi_dir)
         } else {
             abi_of_home(&copy.home).is_none_or(|home_abi| home_abi == abi)
         };
         if !owns {
             reasons.push(format!(
-                "{} builds extensions into {}, which is not where this gem home has its own \
-                 (another Ruby's)",
+                "{} builds extensions into {}, and this gem home's are built for another Ruby \
+                 ABI",
                 ruby.display(),
                 extensions_dir.display()
             ));
@@ -2469,13 +2478,13 @@ async fn stage_blobs(
 
 /// Put the gems the staged gem's build depends on, and no gem on the
 /// build's `GEM_PATH` provides, into the stage home: each is the newest
-/// release its requirement allows, downloaded from the gem's source and
-/// verified against that source's index, then installed there by RubyGems.
-/// The user's gem home is never written. `Err` names what is missing.
+/// release its requirement allows, downloaded from the default registry
+/// and verified against its index ([`GemSource::dependency`]), then
+/// installed there by RubyGems. The user's gem home is never written.
+/// `Err` names what is missing.
 async fn stage_dependencies(
     copy: &GemCopy,
     probe: &Probe,
-    source: &GemId,
     staged: &StagedGem,
     stage: &Stage,
     gems: &GemSource,
@@ -2486,11 +2495,6 @@ async fn stage_dependencies(
         .as_ref()
         .map(RubyFacts::versions)
         .unwrap_or_default();
-    let mut bases = gems.bases(source);
-    let default = crate::patch::redirect::upstream::rubygems_base();
-    if !bases.contains(&default) {
-        bases.push(default);
-    }
     let mut staged_names: Vec<String> = Vec::new();
     loop {
         let run = RubyRun::MissingDeps {
@@ -2526,7 +2530,7 @@ async fn stage_dependencies(
                 return Err(format!("{needed} and could not be staged for the build"));
             }
             let (id, bytes) = gems
-                .dependency(&bases, &name, &requirement, &versions)
+                .dependency(&name, &requirement, &versions)
                 .await
                 .map_err(|why| format!("{needed} and could not be downloaded ({why})"))?;
             let archive = stage.root.join(format!("{}.gem", id.full_name()));
@@ -2563,7 +2567,7 @@ async fn build_staged(
     gems: &GemSource,
     env: &RubyEnv,
 ) -> Result<StagedBuild, StageFailure> {
-    stage_dependencies(copy, probe, source, &staged, stage, gems, env)
+    stage_dependencies(copy, probe, &staged, stage, gems, env)
         .await
         .map_err(StageFailure::Dependencies)?;
     let run = RubyRun::StageBuild {
@@ -2956,6 +2960,49 @@ async fn files_as_installed(
     (out, absent)
 }
 
+/// The files of the record `key` (a manifest purl) that can tell whether the
+/// gem copy at `pkg_path` is the distribution the record was written for.
+/// A release variant is matched to an installed copy by a file it replaces
+/// ([`select_installed_variants`](crate::patch::apply::select_installed_variants)):
+/// one that is missing means another distribution. That does not hold for a
+/// build input of the ruby-platform record that an installed native gem
+/// does not hold ([`files_as_installed`]): its absence says the copy was
+/// built, not that it is another gem, and the source gem is where its
+/// content is checked. Those files are left out. Any other record or copy:
+/// `files` as they are (a `java` record stays unmatched on an MRI copy, and
+/// the ruby record on a JRuby copy, which nothing here rebuilds).
+pub async fn discriminating_files<'f>(
+    pkg_path: &Path,
+    key: &str,
+    files: &'f HashMap<String, PatchFileInfo>,
+) -> std::borrow::Cow<'f, HashMap<String, PatchFileInfo>> {
+    use std::borrow::Cow;
+    let ruby_record = crate::utils::purl::purl_qualifier(key, "platform")
+        .is_none_or(|platform| platform.eq_ignore_ascii_case("ruby"));
+    if !key.starts_with("pkg:gem/") || !ruby_record {
+        return Cow::Borrowed(files);
+    }
+    let (scope, copy) = scope_of(pkg_path, files).await;
+    let Some(copy) = copy.filter(|_| !scope.inputs.is_empty()) else {
+        return Cow::Borrowed(files);
+    };
+    let rebuilt_from_source = scope.builds_extensions
+        || scope
+            .precompiled
+            .as_deref()
+            .is_some_and(|platform| !is_java_platform(platform));
+    if !rebuilt_from_source {
+        return Cow::Borrowed(files);
+    }
+    let (_, absent) = files_as_installed(&copy, &scope, files).await;
+    if absent.is_empty() {
+        return Cow::Borrowed(files);
+    }
+    let mut telling = files.clone();
+    telling.retain(|key, _| !absent.iter().any(|path| path == normalize_file_path(key)));
+    Cow::Owned(telling)
+}
+
 /// The record's files as `rollback` undoes them on the gem copy at
 /// `pkg_path`. A build input `apply` added to a copy that did not hold it
 /// ([`files_as_installed`]; the copy's backup lists them) is removed, not
@@ -3338,14 +3385,9 @@ pub async fn apply_gem_package_patch(
             Some(source) => format!("{}.gem", source.full_name()),
             None => "its ruby-platform gem".to_string(),
         };
-        let remedy = if missing {
-            format!(
-                " Run `socket-patch apply` once with network access to the gem's source, or \
-                 put {archive} in {}.",
-                copy.home.join("cache").display()
-            )
-        } else {
-            String::new()
+        let remedy = match source {
+            Some(source) if missing => format!(" {}", gems.remedy(&copy.home, source)),
+            _ => String::new(),
         };
         refusal(
             package_key,
@@ -3359,43 +3401,35 @@ pub async fn apply_gem_package_patch(
             ),
         )
     };
+    let unnamed = || {
+        format!(
+            "{} does not name the gem and version it was installed from",
+            copy.spec_path.display()
+        )
+    };
     if precompiled {
         let Some(source) = &source else {
-            return needs_source_gem(
-                None,
-                format!(
-                    "{} does not name the gem and version it was installed from",
-                    copy.spec_path.display()
-                ),
-                false,
-            );
+            return needs_source_gem(None, unnamed(), false);
         };
-        if !gems.may_have(&copy.home, source).await {
-            return needs_source_gem(
-                Some(source),
-                format!(
-                    "{} is not there and this run is offline",
-                    crate::patch::gem_source::cache_path(&copy.home, source).display()
-                ),
-                true,
-            );
+        if let Some(why) = gems.out_of_reach(&copy.home, source).await {
+            return needs_source_gem(Some(source), why, true);
         }
     }
 
     // So can a gem RubyGems built, when the record changes an input its
     // build removed from the installed copy.
     if !precompiled && !absent.is_empty() {
-        let reachable = match &source {
-            Some(source) => gems.may_have(&copy.home, source).await,
-            None => false,
+        let out_of_reach = match &source {
+            Some(source) => gems.out_of_reach(&copy.home, source).await,
+            None => Some(unnamed()),
         };
-        if !reachable {
-            let why = "its archive is not in the gem home's cache and this run is offline";
+        if let Some(why) = out_of_reach {
+            let remedy = source.as_ref().map(|s| gems.remedy(&copy.home, s));
             return refusal(
                 package_key,
                 pkg_path,
                 UNSUPPORTED_CODE,
-                absent_inputs_detail(&inputs, &absent, &copy, why),
+                absent_inputs_detail(&inputs, &absent, &why, remedy.as_deref()),
             );
         }
     }
@@ -3495,28 +3529,23 @@ pub async fn apply_gem_package_patch(
     // The source gem holds every build input, where the installed copy may
     // not (a build deletes what it no longer needs; a precompiled gem never
     // shipped them): the extension is rebuilt from it when it can be had.
-    let archive = match &source {
-        Some(source) => gems.archive(&copy.home, source).await,
-        None => Err(format!(
-            "{} does not name the gem and version it was installed from",
-            copy.spec_path.display()
-        )),
+    let Some(source) = &source else {
+        return rebuild_in_place(&job, &probe, &absent, &unnamed(), None).await;
     };
-    match (archive, &source) {
-        (Ok(archive), Some(source)) => {
+    match gems.archive(&copy.home, source).await {
+        Ok(archive) => {
             match rebuild_from_source_gem(&job, &probe, source, archive, &gems, &absent).await {
                 Ok(applied) => applied,
                 Err(why) if precompiled => needs_source_gem(Some(source), why, false),
                 // Not an archive this copy can be rebuilt from: its own
                 // tree is what is left to build.
-                Err(why) => rebuild_in_place(&job, &probe, &absent, &why).await,
+                Err(why) => rebuild_in_place(&job, &probe, &absent, &why, None).await,
             }
         }
-        (Err(why), _) if precompiled => needs_source_gem(source.as_ref(), why, true),
-        (Err(why), _) => rebuild_in_place(&job, &probe, &absent, &why).await,
-        (Ok(_), None) => {
-            let why = "its gemspec does not name the gem it was installed from";
-            rebuild_in_place(&job, &probe, &absent, why).await
+        Err(why) if precompiled => needs_source_gem(Some(source), why, true),
+        Err(why) => {
+            let remedy = gems.remedy(&copy.home, source);
+            rebuild_in_place(&job, &probe, &absent, &why, Some(&remedy)).await
         }
     }
 }
@@ -3524,34 +3553,39 @@ pub async fn apply_gem_package_patch(
 /// The refusal of a record that changes build inputs the installed copy of
 /// a gem RubyGems built no longer holds (`absent`), when the source gem
 /// that packs them cannot be had (`why`).
-fn absent_inputs_detail(inputs: &str, absent: &[String], copy: &GemCopy, why: &str) -> String {
+fn absent_inputs_detail(
+    inputs: &str,
+    absent: &[String],
+    why: &str,
+    remedy: Option<&str>,
+) -> String {
+    let remedy = remedy.map(|r| format!(" {r}")).unwrap_or_default();
     format!(
         "the patch changes native-extension sources ({inputs}), and the installed gem does not \
          hold {} (a build removes what it is done with), so the extension can only be rebuilt \
-         from the source gem, which could not be had: {why}; nothing was written. Run \
-         `socket-patch apply` once with network access to the gem's source, or put the gem's \
-         archive in {}.",
-        absent.join(", "),
-        copy.home.join("cache").display()
+         from the source gem, and that cannot be done here: {why}; nothing was written.{remedy}",
+        absent.join(", ")
     )
 }
 
 /// Write the patched sources and rebuild the extension from the installed
 /// copy's own tree ([`rebuild`]): what is left when its source gem cannot
-/// be had (`no_source_gem` says why). A failed build puts the sources and
-/// the previous build back. A record that changes a build input the copy
-/// no longer holds (`absent`) cannot be built this way: nothing here has
-/// the file's content to check the record against.
+/// be had (`no_source_gem` says why, `remedy` what would get it). A failed
+/// build puts the sources and the previous build back. A record that
+/// changes a build input the copy no longer holds (`absent`) cannot be
+/// built this way: nothing here has the file's content to check the record
+/// against.
 async fn rebuild_in_place(
     job: &Job<'_>,
     probe: &Probe,
     absent: &[String],
     no_source_gem: &str,
+    remedy: Option<&str>,
 ) -> GemApplied {
     if !absent.is_empty() {
         return job.refuse(
             UNSUPPORTED_CODE,
-            absent_inputs_detail(job.inputs, absent, job.copy, no_source_gem),
+            absent_inputs_detail(job.inputs, absent, no_source_gem, remedy),
         );
     }
     let originals = job.originals().await;
@@ -5463,5 +5497,180 @@ mod tests {
         let why = open_stage(&copy).err().unwrap();
         assert!(why.contains("is not a directory"), "{why}");
         assert_eq!(std::fs::read_dir(&elsewhere).unwrap().count(), 0);
+    }
+
+    /// A stand-in `ruby` for a precompiled copy's probe: it builds
+    /// extensions into `<home>/extensions/<platform dir>/<abi>` and says
+    /// `runs` when asked whether it runs the gem's platform.
+    #[cfg(unix)]
+    fn fake_platform_ruby(dir: &Path, platform_dir: &str, abi: &str, runs: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::create_dir_all(dir).unwrap();
+        let ruby = dir.join("ruby");
+        std::fs::write(
+            &ruby,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$3 $4 $5\" >> '{}'\n\
+                 printf 'sp_extensions_dir\\t%s\\n' \"$4/extensions/{platform_dir}/{abi}\"\n\
+                 printf 'sp_ruby\\t3.4.10\\t3.6.9\\tbundle\\t{platform_dir}\\t{runs}\\n'\n",
+                dir.join("calls").display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&ruby, std::fs::Permissions::from_mode(0o755)).unwrap();
+        ruby
+    }
+
+    /// [`find_platform_ruby`] over a script written a moment ago
+    /// ([`find_fresh_ruby`] says why it is tried again).
+    #[cfg(unix)]
+    async fn find_fresh_platform_ruby(
+        copy: &GemCopy,
+        env: &RubyEnv,
+        preflight: &Preflight,
+    ) -> Result<Probe, String> {
+        loop {
+            match find_platform_ruby(copy, env, preflight.clone(), "arm64-darwin").await {
+                Err(why) if why.contains("os error 26") => {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                found => return found,
+            }
+        }
+    }
+
+    /// A precompiled copy has no extension dir to match a Ruby to. Its
+    /// owner runs the gem's platform and builds for the ABI the home's
+    /// other native gems were built for, or, in a home with none, the ABI
+    /// the home's dir name carries.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_precompiled_copys_ruby_is_matched_by_platform_and_abi() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("vendor/bundle/ruby/3.4.0");
+        let copy = precompiled_gem(&home);
+        let env = RubyEnv {
+            cwd: tmp.path().to_path_buf(),
+            rebuild: true,
+            offline: true,
+        };
+        let bin = tmp.path().join("bin");
+        let preflight = |candidates: Vec<PathBuf>| {
+            let installed = extension_dir_slots(&copy)
+                .iter()
+                .filter_map(|slot| slot.parent().map(Path::to_path_buf))
+                .collect();
+            Preflight {
+                installed,
+                candidates,
+                require_path: "lib".to_string(),
+            }
+        };
+
+        // No extension dirs in the home: its dir name carries the ABI.
+        let ruby = fake_platform_ruby(&bin.join("a"), "arm64-darwin-25", "3.4.0", "yes");
+        let probe = find_fresh_platform_ruby(&copy, &env, &preflight(vec![ruby.clone()]))
+            .await
+            .unwrap();
+        assert_eq!(probe.ruby, ruby);
+        assert_eq!(probe.lib_dir, copy.gem_dir.join("lib"));
+        assert_eq!(
+            probe.facts.as_ref().and_then(RubyFacts::minor).as_deref(),
+            Some("3.4")
+        );
+        assert_eq!(
+            std::fs::read_to_string(bin.join("a/calls")).unwrap(),
+            format!("extensions_dir {} arm64-darwin\n", home.display()),
+            "the probe names the gem home and the gem's platform, nothing of the gem"
+        );
+        let other_abi = fake_platform_ruby(&bin.join("b"), "arm64-darwin-25", "3.3.0", "yes");
+        let why = find_fresh_platform_ruby(&copy, &env, &preflight(vec![other_abi.clone()]))
+            .await
+            .unwrap_err();
+        assert!(why.contains("another Ruby ABI"), "{why}");
+        // The first candidate that owns the home is the one.
+        let both = preflight(vec![other_abi, ruby.clone()]);
+        let probe = find_fresh_platform_ruby(&copy, &env, &both).await.unwrap();
+        assert_eq!(probe.ruby, ruby);
+
+        // A Ruby that does not run the gem's platform.
+        let foreign = fake_platform_ruby(&bin.join("c"), "x86_64-linux", "3.4.0", "no");
+        let why = find_fresh_platform_ruby(&copy, &env, &preflight(vec![foreign]))
+            .await
+            .unwrap_err();
+        assert!(why.contains("does not run arm64-darwin gems"), "{why}");
+
+        // The home's other native gems were built for 3.4.0, under an OS
+        // release's platform dir this Ruby no longer spells the same way.
+        std::fs::create_dir_all(home.join("extensions/arm64-darwin-24/3.4.0/racc-1.8.1")).unwrap();
+        let probe = find_fresh_platform_ruby(&copy, &env, &preflight(vec![ruby.clone()]))
+            .await
+            .unwrap();
+        assert_eq!(probe.ruby, ruby);
+        let static_ruby =
+            fake_platform_ruby(&bin.join("d"), "arm64-darwin-25", "3.4.0-static", "yes");
+        let why = find_fresh_platform_ruby(&copy, &env, &preflight(vec![static_ruby]))
+            .await
+            .unwrap_err();
+        assert!(why.contains("another Ruby ABI"), "{why}");
+    }
+
+    /// A release variant is matched to an installed copy by a file it
+    /// replaces. A build input of the ruby-platform record that a native
+    /// copy does not hold is not such a file: the copy was built (or
+    /// shipped prebuilt), it is not another gem. Records and copies nothing
+    /// here rebuilds from the source gem keep every file.
+    #[tokio::test]
+    async fn absent_build_inputs_do_not_decide_the_installed_variant() {
+        let tmp = tempfile::tempdir().unwrap();
+        let copy = precompiled_gem(&tmp.path().join("home"));
+        let record: HashMap<String, PatchFileInfo> = [
+            ("ext/a/a.c".to_string(), info(&"c".repeat(64))),
+            ("patches/0001.patch".to_string(), info(&"d".repeat(64))),
+            ("lib/a/gone.rb".to_string(), info(&"e".repeat(64))),
+        ]
+        .into();
+        let keys = |files: &HashMap<String, PatchFileInfo>| {
+            let mut keys: Vec<String> = files.keys().cloned().collect();
+            keys.sort();
+            keys
+        };
+        // The source gem's record, qualified or not: the input the copy
+        // never shipped is left out; a missing Ruby file still tells.
+        for purl in ["pkg:gem/a@1", "pkg:gem/a@1?platform=ruby"] {
+            let telling = discriminating_files(&copy.gem_dir, purl, &record).await;
+            assert_eq!(keys(&telling), ["ext/a/a.c", "lib/a/gone.rb"], "{purl}");
+        }
+        // Another platform's record, and another ecosystem's.
+        for purl in [
+            "pkg:gem/a@1?platform=java",
+            "pkg:gem/a@1?platform=arm64-darwin",
+            "pkg:pypi/a@1",
+        ] {
+            let telling = discriminating_files(&copy.gem_dir, purl, &record).await;
+            assert_eq!(keys(&telling), keys(&record), "{purl}");
+        }
+
+        // A gem RubyGems built, whose build removed an input.
+        let built = installed_gem(&tmp.path().join("built"), "lib");
+        let removed: HashMap<String, PatchFileInfo> =
+            [("ports/value.txt".to_string(), info(&"c".repeat(64)))].into();
+        let telling = discriminating_files(&built.gem_dir, "pkg:gem/a@1", &removed).await;
+        assert!(telling.is_empty(), "{:?}", keys(&telling));
+
+        // The JRuby build is not rebuilt from the source gem: a file it
+        // lacks still says the ruby record is not its record.
+        let java_home = tmp.path().join("java");
+        let java_dir = java_home.join("gems/a-1-java");
+        std::fs::create_dir_all(java_dir.join("lib")).unwrap();
+        std::fs::create_dir_all(java_home.join("specifications")).unwrap();
+        std::fs::write(
+            java_home.join("specifications/a-1-java.gemspec"),
+            "Gem::Specification.new do |s|\n  s.name = \"a\".freeze\n  \
+             s.version = \"1\".freeze\n  s.platform = \"java\".freeze\nend\n",
+        )
+        .unwrap();
+        let telling = discriminating_files(&java_dir, "pkg:gem/a@1", &record).await;
+        assert_eq!(keys(&telling), keys(&record));
     }
 }

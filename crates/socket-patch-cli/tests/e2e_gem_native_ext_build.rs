@@ -1657,7 +1657,7 @@ fn a_precompiled_copy_without_its_source_gem_is_refused() {
         for needle in [
             "sp_native-1.0.0.gem",
             "this run is offline",
-            "with network access to the gem's source",
+            "with network access to",
             "cache",
         ] {
             assert!(error.contains(needle), "{args:?}: no {needle:?} in {error}");
@@ -1674,6 +1674,43 @@ fn a_precompiled_copy_without_its_source_gem_is_refused() {
     assert!(stdout.contains("could not be downloaded"), "{stdout}");
     assert_eq!(ruby.calls(), ["extensions_dir"]);
     assert_tree(&proj.join("vendor"), &tree_before, "");
+
+    // Online, for a gem the lock resolves from another source: the
+    // registry's gem of that name is not this gem, and the lock's remote
+    // is not a place the run downloads from. Nothing is asked of anyone.
+    std::fs::write(
+        proj.join("Gemfile.lock"),
+        "GEM\n  remote: https://gems.example.test/private/\n  specs:\n    \
+         sp_native (1.0.0-x86_64-linux)\n\nPLATFORMS\n  x86_64-linux\n\n\
+         DEPENDENCIES\n  sp_native\n\nCHECKSUMS\n  \
+         sp_native (1.0.0) sha256=0000000000000000000000000000000000000000000000000000000000000000\n",
+    )
+    .unwrap();
+    let ruby = FakeRuby::new();
+    for args in [&["apply", "--json"][..], &["apply", "--json", "--dry-run"]] {
+        let (code, stdout, stderr) = ruby.run(&proj, args, &[]);
+        assert_eq!(code, 1, "{args:?}: {stdout}\n{stderr}");
+        let env = parse_json_envelope(&stdout);
+        let error = common::envelope::event_for(&env, PURL)["error"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            error.starts_with("native_extensions_unsupported:"),
+            "{args:?}: {stdout}"
+        );
+        assert!(
+            error.contains("resolves sp_native from https://gems.example.test/private")
+                && error.contains("is not downloaded"),
+            "{args:?}: {error}"
+        );
+        assert!(
+            error.contains("Put sp_native-1.0.0.gem in") && !error.contains("network access"),
+            "{args:?}: {error}"
+        );
+        assert_eq!(ruby.calls(), Vec::<String>::new(), "{args:?}: Ruby ran");
+        assert_tree(&proj.join("vendor"), &tree_before, &format!("{args:?}"));
+    }
 }
 
 /// The record is laid over the pristine source gem before anything is

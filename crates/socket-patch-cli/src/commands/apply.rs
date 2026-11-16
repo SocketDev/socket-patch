@@ -2959,7 +2959,14 @@ async fn apply_patches_inner(
                             || (Ecosystem::from_purl(purl) == Some(Ecosystem::Gem)
                                 && has_build_sibling(pkg_path, copy_paths)))
                     {
-                        let first_status = match representative_file(&patch.files) {
+                        // A native gem's copy does not hold every build
+                        // input of its source gem (a build removes them; a
+                        // precompiled gem never shipped them): those cannot
+                        // tell distributions apart.
+                        let telling =
+                            gem_ext::discriminating_files(pkg_path, variant_purl, &patch.files)
+                                .await;
+                        let first_status = match representative_file(&telling) {
                             Some((file_name, file_info)) => Some(
                                 verify_file_patch(pkg_path, file_name, file_info)
                                     .await

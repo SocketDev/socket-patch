@@ -2002,12 +2002,14 @@ How each mode gets the patched code running:
 
 `apply` takes the source gem (`<name>-<version>.gem`) from the gem home's `cache/` directory,
 where RubyGems and Bundler keep it for a gem they built. For a precompiled gem, or a pruned cache,
-it downloads the archive from the gem's source (the lock's `remote:`, else rubygems.org) and
-checks it against the lock's `CHECKSUMS` or the source's index. With `--offline` and no cached
-archive, a gem RubyGems built is rebuilt from its installed tree instead, and a precompiled gem is
-refused with `native_extensions_unsupported`: run `apply` once with network access, or put the
-source gem in that `cache/` directory. The JRuby (`-java`) build of a gem ships jars and is always
-refused for such a patch.
+it downloads the archive from rubygems.org and checks it against the sha256 the registry's index
+records. Your `Gemfile.lock` never chooses where the archive comes from; a gem it resolves from
+another source (a private gem server, a git source) is not downloaded. With no archive to be had
+(`--offline` and nothing cached, or a private gem), a gem RubyGems built is rebuilt from its
+installed tree instead, and a precompiled gem is refused with `native_extensions_unsupported`:
+run `apply` once with network access, or put the source gem in that `cache/` directory. If you
+install from a mirror of rubygems.org, set `SOCKET_RUBYGEMS_URL` to it. The JRuby (`-java`) build
+of a gem ships jars and is always refused for such a patch.
 
 The build happens in a stage directory inside the gem home (`.socket-patch-build/`), which is
 removed afterwards. A gem the build needs that the install lacks (a precompiled nokogiri has no

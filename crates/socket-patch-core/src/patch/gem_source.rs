@@ -10,20 +10,33 @@
 //! archive, `<name>-<version>.gem`. This module finds it:
 //!
 //! 1. In the gem home's `cache/`, where RubyGems and Bundler keep the
-//!    archive of every gem they install from source. It is used as it is,
-//!    unless the project's lock pins a `CHECKSUMS` sha256 for the gem that
-//!    it does not have. No network is involved.
-//! 2. Else downloaded from the gem's source: the `remote:` of the lock's
-//!    `GEM` section that lists the gem, else rubygems.org
-//!    (`SOCKET_RUBYGEMS_URL`). The bytes must have the sha256 the lock's
-//!    `CHECKSUMS` pins for the ruby-platform gem, else the one that source's
-//!    compact index (`info/<name>`) records. An archive nothing pins is not
-//!    used. `--offline` skips this step.
+//!    archive of every gem they install from source. It is used as it is:
+//!    it has the trust of the installed copy beside it, and no network is
+//!    involved.
+//! 2. Else downloaded from the default registry: rubygems.org, or the
+//!    registry `SOCKET_RUBYGEMS_URL` names (a mirror). The URL is built
+//!    from the gem's name and version, and the bytes are used only when
+//!    their sha256 is the one that registry's compact index
+//!    (`info/<name>`) records. `--offline` skips this step.
+//!
+//! # What the lock is read for
+//!
+//! Nothing a lock entry holds drives a download: not its `remote:`, not
+//! its `CHECKSUMS` (see `lock_pinned_locations_never_drive_a_download` in
+//! `vendor::lock_inventory`). A lock entry may be Socket-hosted, where the
+//! remote serves patched bytes and the checksum pins them, and a lock is a
+//! file of the repository being scanned, which must not choose where code
+//! that is about to be built comes from. The lock is read for one thing:
+//! to *withhold* the download. A gem the lock resolves from another source
+//! (a private gem server, a mirror, a git or path source, Socket's patch
+//! registry) is not the registry's gem of that name, so nothing is fetched
+//! for it ([`Origin::Elsewhere`]); its cached archive is the only way to
+//! its source.
 //!
 //! A gem the build needs and the install lacks (a precompiled nokogiri has
-//! no `mini_portile2`) is resolved from the same sources' compact index:
-//! the newest ruby-platform release that meets the requirement and runs on
-//! the building Ruby, verified against the index's checksum.
+//! no `mini_portile2`) is resolved from the registry's compact index the
+//! same way: the newest ruby-platform release that meets the requirement
+//! and runs on the building Ruby, verified against the index's checksum.
 
 use std::cmp::Ordering;
 use std::path::Path;
@@ -33,7 +46,7 @@ use crate::patch::redirect::upstream::{compact_index_checksum, rubygems_base};
 use crate::utils::digest::{sha256_hex, sha256_hex_of};
 use crate::vendor::registry_fetch::{build_registry_client, download, RegistryClient};
 
-/// The default gem source, as a lock's `remote:` spells it.
+/// The default registry, as a lock's `remote:` spells it.
 const RUBYGEMS_REMOTE: &str = "https://rubygems.org";
 
 /// One gem release: `<name>-<version>[-<platform>]`.
@@ -46,7 +59,7 @@ pub(crate) struct GemId {
 }
 
 impl GemId {
-    /// The release as a lock or a compact index names it: `<version>` or
+    /// The release as a compact index names it: `<version>` or
     /// `<version>-<platform>`.
     pub(crate) fn token(&self) -> String {
         match &self.platform {
@@ -69,53 +82,63 @@ impl GemId {
     }
 }
 
-/// What the project's lock says about a gem release.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct Locked {
-    /// The remotes of the `GEM` sections that list the gem at this version
-    /// (any platform of it), as download bases, in lock order.
-    pub bases: Vec<String>,
-    /// The sha256 `CHECKSUMS` pins for exactly this release.
-    pub sha256: Option<String>,
+/// Where a project's lock resolves a gem from, as far as a download from
+/// the default registry is concerned.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Origin {
+    /// The default registry, or nothing the lock says: the registry's gem
+    /// of that name is the gem.
+    Registry,
+    /// Another source, named as the lock names it: the registry's gem of
+    /// that name is not this gem, and nothing is downloaded for it.
+    Elsewhere(String),
 }
 
-/// Read [`Locked`] for `id` out of a Bundler lock's text.
-pub(crate) fn locked(lock: &str, id: &GemId) -> Locked {
-    let token = id.token();
+/// Whether `remote` is the default registry (or its `SOCKET_RUBYGEMS_URL`
+/// stand-in).
+fn is_registry(remote: &str) -> bool {
+    gem::same_remote(remote, RUBYGEMS_REMOTE) || gem::same_remote(remote, &rubygems_base())
+}
+
+/// Read the [`Origin`] of the gem `name` out of a Bundler lock's text:
+/// of its `version` when one is given (any platform of it), else of any
+/// version. A `GEM` section counts as the registry only when every one of
+/// its remotes is (a section with several remotes does not say which
+/// serves the gem), and a gem that any source section lists from somewhere
+/// else is from elsewhere.
+pub(crate) fn origin(lock: &str, name: &str, version: Option<&str>) -> Origin {
     let text = crate::utils::line_endings::to_lf(lock);
     let parsed = gem::parse(&text);
-    let mut bases: Vec<String> = Vec::new();
-    for section in parsed.gem_sections() {
+    let mut elsewhere: Option<String> = None;
+    for section in &parsed.sections {
         let lists = section
             .specs
             .iter()
             .filter_map(|line| line.parsed)
-            .any(|spec| spec.name == id.name && spec.version == id.version);
+            .any(|spec| spec.name == name && version.is_none_or(|v| spec.version == v));
         if !lists {
             continue;
         }
-        for base in section.remote_bases() {
-            if !bases.iter().any(|b| b == base) {
-                bases.push(base.to_string());
-            }
+        if section.header != "GEM" {
+            let kind = section.header.to_ascii_lowercase();
+            elsewhere.get_or_insert_with(|| format!("a {kind} source"));
+            continue;
+        }
+        let other = section.remote_bases().find(|remote| !is_registry(remote));
+        if let Some(remote) = other {
+            elsewhere
+                .get_or_insert_with(|| crate::utils::redact::redact_urls_in(remote).into_owned());
         }
     }
-    let sha256 = parsed.checksum(&id.name, &token).map(str::to_string);
-    Locked { bases, sha256 }
-}
-
-/// The base a lock remote is downloaded from: rubygems.org goes through its
-/// `SOCKET_RUBYGEMS_URL` stand-in (a mirror, a test server).
-fn download_base(remote: &str) -> String {
-    if gem::same_remote(remote, RUBYGEMS_REMOTE) {
-        rubygems_base()
-    } else {
-        remote.trim_end_matches('/').to_string()
+    match elsewhere {
+        Some(source) => Origin::Elsewhere(source),
+        None => Origin::Registry,
     }
 }
 
-/// Where gem archives come from in one run: the project's lock, read once,
-/// and the registry client.
+/// Where gem archives come from in one run: the gem homes' caches and the
+/// default registry, with the project's lock (read once) to say which gems
+/// are not the registry's.
 pub(crate) struct GemSource {
     lock: Option<String>,
     offline: bool,
@@ -145,31 +168,29 @@ impl GemSource {
         self.offline
     }
 
-    fn locked(&self, id: &GemId) -> Locked {
-        self.lock
-            .as_deref()
-            .map(|lock| locked(lock, id))
-            .unwrap_or_default()
+    fn origin(&self, name: &str, version: Option<&str>) -> Origin {
+        match &self.lock {
+            Some(lock) => origin(lock, name, version),
+            None => Origin::Registry,
+        }
     }
 
-    /// The bases `id` may be downloaded from, best first: the lock's
-    /// remotes for it, else the default registry.
-    pub(crate) fn bases(&self, id: &GemId) -> Vec<String> {
-        let mut bases: Vec<String> = Vec::new();
-        for remote in self.locked(id).bases {
-            let base = download_base(&remote);
-            if !bases.contains(&base) {
-                bases.push(base);
-            }
+    /// Why nothing is downloaded for the gem `name` (at `version`, when one
+    /// is given): the run is offline, or the lock resolves the gem from
+    /// another source. `None` when the registry may be asked.
+    fn withheld(&self, name: &str, version: Option<&str>) -> Option<String> {
+        if let Origin::Elsewhere(source) = self.origin(name, version) {
+            return Some(format!(
+                "the project's lock resolves {name} from {source}, not from {}, so it is not \
+                 downloaded",
+                rubygems_base()
+            ));
         }
-        if bases.is_empty() {
-            bases.push(rubygems_base());
-        }
-        bases
+        self.offline.then(|| "this run is offline".to_string())
     }
 
     /// The archive of `id` in the gem home `home`'s `cache/`, when it is
-    /// there and is not one the lock's `CHECKSUMS` contradicts.
+    /// there.
     pub(crate) async fn cached(&self, home: &Path, id: &GemId) -> Option<Vec<u8>> {
         if !id.is_plain() {
             return None;
@@ -179,22 +200,44 @@ impl GemSource {
         if !meta.is_file() || meta.len() > crate::vendor::registry_fetch::MAX_DOWNLOAD_BYTES {
             return None;
         }
-        let bytes = crate::utils::fs::read_regular_to_bytes(&path).await.ok()?;
-        match self.locked(id).sha256 {
-            Some(pinned) if pinned != sha256_hex_of(&bytes) => None,
-            _ => Some(bytes),
+        crate::utils::fs::read_regular_to_bytes(&path).await.ok()
+    }
+
+    /// Why [`Self::archive`] cannot produce `id` for `home`, as far as
+    /// files alone tell: its cached archive is not there, and nothing may
+    /// be downloaded for it. `None` when it is cached, or the registry may
+    /// be asked. Read-only, for a refusal a dry run makes too.
+    pub(crate) async fn out_of_reach(&self, home: &Path, id: &GemId) -> Option<String> {
+        if self.cached(home, id).await.is_some() {
+            return None;
+        }
+        let withheld = self.withheld(&id.name, Some(&id.version))?;
+        Some(format!(
+            "{} is not there and {withheld}",
+            cache_path(home, id).display()
+        ))
+    }
+
+    /// What gets `id` within reach of [`Self::archive`] for `home`: the
+    /// sentence a refusal ends with.
+    pub(crate) fn remedy(&self, home: &Path, id: &GemId) -> String {
+        let (file, cache) = (
+            format!("{}.gem", id.full_name()),
+            home.join("cache").display().to_string(),
+        );
+        match self.origin(&id.name, Some(&id.version)) {
+            Origin::Registry => format!(
+                "Run `socket-patch apply` once with network access to {}, or put {file} in \
+                 {cache}.",
+                rubygems_base()
+            ),
+            Origin::Elsewhere(_) => format!("Put {file} in {cache}."),
         }
     }
 
-    /// Whether [`Self::archive`] can possibly produce `id` for `home`: its
-    /// cached archive is there, or the run may download. Read-only, for a
-    /// dry run's refusal.
-    pub(crate) async fn may_have(&self, home: &Path, id: &GemId) -> bool {
-        !self.offline || self.cached(home, id).await.is_some()
-    }
-
-    /// The archive of `id`, sha256-verified: the home's cached copy, else a
-    /// download from its source. `Err` is why there is none.
+    /// The archive of `id`: the home's cached copy, else a download from
+    /// the default registry, verified against the sha256 its compact index
+    /// records. `Err` is why there is none.
     pub(crate) async fn archive(&self, home: &Path, id: &GemId) -> Result<Vec<u8>, String> {
         let file = format!("{}.gem", id.full_name());
         if !id.is_plain() {
@@ -204,72 +247,45 @@ impl GemSource {
             return Ok(bytes);
         }
         let cache = cache_path(home, id);
-        if self.offline {
-            return Err(format!(
-                "{} is not there and this run is offline",
-                cache.display()
-            ));
+        if let Some(withheld) = self.withheld(&id.name, Some(&id.version)) {
+            return Err(format!("{} is not there and {withheld}", cache.display()));
         }
-        let pinned = self.locked(id).sha256;
-        let mut reasons: Vec<String> = Vec::new();
-        for base in self.bases(id) {
-            let want = match &pinned {
-                Some(sha) => sha.clone(),
-                None => match self.index_checksum(&base, id).await {
-                    Ok(sha) => sha,
-                    Err(why) => {
-                        reasons.push(why);
-                        continue;
-                    }
-                },
-            };
+        let fetched = async {
+            let base = rubygems_base();
+            let info = self.index(&format!("{base}/info/{}", id.name)).await?;
+            let want = compact_index_checksum(&info, &id.token()).ok_or_else(|| {
+                format!("{base} lists no {} {} with a checksum", id.name, id.token())
+            })?;
             let url = format!("{base}/gems/{file}");
-            match download(&self.http, &url).await {
-                Ok(bytes) if sha256_hex_of(&bytes) == want => return Ok(bytes),
-                Ok(_) => reasons.push(format!(
-                    "{} does not have the sha256 {} pins for it",
-                    crate::utils::redact::redact_urls_in(&url),
-                    if pinned.is_some() {
-                        "the lock's CHECKSUMS"
-                    } else {
-                        "its source's index"
-                    }
-                )),
-                Err(why) => reasons.push(why),
+            let bytes = download(&self.http, &url).await?;
+            if sha256_hex_of(&bytes) == want {
+                Ok(bytes)
+            } else {
+                Err(format!(
+                    "{url} does not have the sha256 the registry's index records for it"
+                ))
             }
-        }
-        Err(format!(
-            "{} is not there and it could not be downloaded ({})",
-            cache.display(),
-            reasons.join("; ")
-        ))
-    }
-
-    /// The sha256 the compact index at `base` records for `id`.
-    async fn index_checksum(&self, base: &str, id: &GemId) -> Result<String, String> {
-        let url = format!("{base}/info/{}", id.name);
-        let info = self.index(&url).await?;
-        compact_index_checksum(&info, &id.token()).ok_or_else(|| {
+        };
+        fetched.await.map_err(|why: String| {
             format!(
-                "{} lists no {} with a checksum",
-                crate::utils::redact::redact_urls_in(&url),
-                id.token()
+                "{} is not there and it could not be downloaded ({why})",
+                cache.display()
             )
         })
     }
 
+    /// A compact index document.
     async fn index(&self, url: &str) -> Result<String, String> {
         let bytes = download(&self.http, url).await?;
-        String::from_utf8(bytes)
-            .map_err(|_| format!("{} is not UTF-8", crate::utils::redact::redact_urls_in(url)))
+        String::from_utf8(bytes).map_err(|_| format!("{url} is not UTF-8"))
     }
 
     /// A ruby-platform release of the gem `name` that meets `requirement`
-    /// (`~> 2.8.2`, `>= 1.0,< 3`) and runs on `ruby`, from the first of
-    /// `bases` that has one: its id and its verified archive.
+    /// (`~> 2.8.2`, `>= 1.0,< 3`) and runs on `ruby`, from the default
+    /// registry: its id and its archive, verified against the sha256 the
+    /// registry's compact index records.
     pub(crate) async fn dependency(
         &self,
-        bases: &[String],
         name: &str,
         requirement: &str,
         ruby: &RubyVersions,
@@ -277,45 +293,30 @@ impl GemSource {
         if !gem::is_plain_gem_token(name) {
             return Err(format!("{name:?} is not a plain gem name"));
         }
-        if self.offline {
-            return Err("this run is offline".to_string());
+        if let Some(withheld) = self.withheld(name, None) {
+            return Err(withheld);
         }
-        let mut reasons: Vec<String> = Vec::new();
-        for base in bases {
-            let url = format!("{base}/info/{name}");
-            let info = match self.index(&url).await {
-                Ok(info) => info,
-                Err(why) => {
-                    reasons.push(why);
-                    continue;
-                }
-            };
-            let Some((version, sha)) = pick_release(&info, requirement, ruby) else {
-                reasons.push(format!(
-                    "{} lists no release that meets {requirement}",
-                    crate::utils::redact::redact_urls_in(&url)
-                ));
-                continue;
-            };
-            let id = GemId {
-                name: name.to_string(),
-                version,
-                platform: None,
-            };
-            if !id.is_plain() {
-                continue;
-            }
-            let archive = format!("{base}/gems/{}.gem", id.full_name());
-            match download(&self.http, &archive).await {
-                Ok(bytes) if sha256_hex_of(&bytes) == sha => return Ok((id, bytes)),
-                Ok(_) => reasons.push(format!(
-                    "{} does not have the sha256 its source's index pins for it",
-                    crate::utils::redact::redact_urls_in(&archive)
-                )),
-                Err(why) => reasons.push(why),
-            }
+        let base = rubygems_base();
+        let info = self.index(&format!("{base}/info/{name}")).await?;
+        let (version, sha) = pick_release(&info, requirement, ruby)
+            .ok_or_else(|| format!("{base} lists no release of {name} that meets {requirement}"))?;
+        let id = GemId {
+            name: name.to_string(),
+            version,
+            platform: None,
+        };
+        if !id.is_plain() {
+            return Err(format!("{} is not a plain gem name", id.full_name()));
         }
-        Err(reasons.join("; "))
+        let url = format!("{base}/gems/{}.gem", id.full_name());
+        let bytes = download(&self.http, &url).await?;
+        if sha256_hex_of(&bytes) == sha {
+            Ok((id, bytes))
+        } else {
+            Err(format!(
+                "{url} does not have the sha256 the registry's index records for it"
+            ))
+        }
     }
 }
 
@@ -694,39 +695,56 @@ mod tests {
     const LOCK: &str = "GEM\n  remote: https://rubygems.org/\n  specs:\n    \
         nokogiri (1.18.3-arm64-darwin)\n      racc (~> 1.4)\n    \
         nokogiri (1.18.3-x86_64-linux-gnu)\n      racc (~> 1.4)\n    racc (1.8.1)\n\n\
-        GEM\n  remote: https://gems.example.test/private/\n  specs:\n    inhouse (2.0.0)\n\n\
+        GEM\n  remote: https://user:secret@gems.example.test/private/\n  specs:\n    \
+        inhouse (2.0.0)\n    sqlite3 (2.6.0-arm64-darwin)\n\n\
+        GEM\n  remote: https://rubygems.org/\n  remote: https://patch.example.test/gem/\n  \
+        specs:\n    merged (1.0.0)\n\n\
+        GIT\n  remote: https://github.com/example/forked.git\n  revision: abc\n  specs:\n    \
+        forked (0.1.0)\n\n\
         PLATFORMS\n  arm64-darwin\n\nDEPENDENCIES\n  nokogiri (= 1.18.3)\n\n\
         CHECKSUMS\n  \
         nokogiri (1.18.3-arm64-darwin) sha256=ce088965cd424b8e752d82087dcf017069d55791f157098ed1f671d966857610\n  \
         racc (1.8.1) sha256=4a7f6929691dbec8b5209a0b373bc2614882b55fc5d2e447a21aaa691303d62f\n\n\
         BUNDLED WITH\n  4.0.15\n";
 
-    /// A gem locked only as platform gems still names the source of its
-    /// ruby-platform archive; a `CHECKSUMS` line pins only the release it
-    /// names.
+    /// A gem locked only as platform gems is still the registry's gem, so
+    /// its ruby-platform archive may be fetched there. A gem any section
+    /// resolves from another source is not: a private server, a section
+    /// whose remotes are not all the registry (a merged Socket remote), a
+    /// git source. Credentials in a remote are not repeated.
     #[test]
-    fn locked_reads_the_gems_remote_and_its_own_checksum() {
-        let source = locked(LOCK, &id("nokogiri", "1.18.3", None));
-        assert_eq!(source.bases, ["https://rubygems.org"]);
-        assert_eq!(source.sha256, None, "only the platform gem is pinned");
-        let platform = locked(LOCK, &id("nokogiri", "1.18.3", Some("arm64-darwin")));
+    fn origin_tells_the_registrys_gems_from_others() {
+        assert_eq!(origin(LOCK, "nokogiri", Some("1.18.3")), Origin::Registry);
+        assert_eq!(origin(LOCK, "racc", None), Origin::Registry);
         assert_eq!(
-            platform.sha256.as_deref(),
-            Some("ce088965cd424b8e752d82087dcf017069d55791f157098ed1f671d966857610")
+            origin(&LOCK.replace('\n', "\r\n"), "racc", Some("1.8.1")),
+            Origin::Registry
         );
-        let racc = locked(&LOCK.replace('\n', "\r\n"), &id("racc", "1.8.1", None));
-        assert_eq!(racc.bases, ["https://rubygems.org"]);
-        assert!(racc.sha256.is_some());
+        // Not in the lock at all, or another version of a locked gem.
+        assert_eq!(origin(LOCK, "mini_portile2", None), Origin::Registry);
+        assert_eq!(origin(LOCK, "inhouse", Some("9.9.9")), Origin::Registry);
+
+        let Origin::Elsewhere(private) = origin(LOCK, "inhouse", Some("2.0.0")) else {
+            panic!("a private gem is not the registry's");
+        };
+        assert!(private.contains("gems.example.test"), "{private}");
+        assert!(!private.contains("secret"), "{private}");
+        assert!(matches!(
+            origin(LOCK, "sqlite3", Some("2.6.0")),
+            Origin::Elsewhere(_)
+        ));
+        assert!(matches!(
+            origin(LOCK, "inhouse", None),
+            Origin::Elsewhere(_)
+        ));
+        let Origin::Elsewhere(merged) = origin(LOCK, "merged", Some("1.0.0")) else {
+            panic!("a section with another remote does not say the registry serves the gem");
+        };
+        assert!(merged.contains("patch.example.test"), "{merged}");
         assert_eq!(
-            locked(LOCK, &id("inhouse", "2.0.0", None)).bases,
-            ["https://gems.example.test/private"]
+            origin(LOCK, "forked", None),
+            Origin::Elsewhere("a git source".to_string())
         );
-        // Another version of the gem, or a gem the lock does not list.
-        assert_eq!(
-            locked(LOCK, &id("nokogiri", "1.18.4", None)),
-            Locked::default()
-        );
-        assert_eq!(locked(LOCK, &id("other", "1.0", None)), Locked::default());
     }
 
     #[test]
@@ -743,9 +761,10 @@ mod tests {
         assert!(!id("x", "1.0/..", None).is_plain());
     }
 
-    /// The home's cached archive is used as it is, with no request made,
-    /// unless the lock pins another sha256 for the gem; an offline run has
-    /// nothing else to offer.
+    /// The home's cached archive is used as it is, with no request made.
+    /// Without it, an offline run has nothing to offer, and neither has any
+    /// run for a gem the lock resolves from another source: the registry's
+    /// gem of that name is never fetched in its place.
     #[tokio::test]
     async fn the_cached_archive_needs_no_network() {
         let tmp = tempfile::tempdir().unwrap();
@@ -755,18 +774,47 @@ mod tests {
         let racc = id("racc", "1.8.1", None);
         std::fs::write(cache_path(&home, &racc), b"archive").unwrap();
 
-        let source = GemSource::of(&project, true).await;
-        assert_eq!(source.archive(&home, &racc).await.unwrap(), b"archive");
-        assert!(source.may_have(&home, &racc).await);
+        let offline = GemSource::of(&project, true).await;
+        assert_eq!(offline.archive(&home, &racc).await.unwrap(), b"archive");
+        assert_eq!(offline.out_of_reach(&home, &racc).await, None);
         let missing = id("nokogiri", "1.18.3", None);
-        assert!(!source.may_have(&home, &missing).await);
-        let why = source.archive(&home, &missing).await.unwrap_err();
+        let why = offline.out_of_reach(&home, &missing).await.unwrap();
         assert!(why.contains("this run is offline"), "{why}");
+        let why = offline.archive(&home, &missing).await.unwrap_err();
+        assert!(why.contains("this run is offline"), "{why}");
+        let remedy = offline.remedy(&home, &missing);
+        assert!(
+            remedy.contains("with network access") && remedy.contains("nokogiri-1.18.3.gem"),
+            "{remedy}"
+        );
 
-        // The lock pins racc 1.8.1 to another sha256: not that archive.
+        // Online: the registry may be asked for its own gems only. The
+        // lock is the cached archive's too: whatever `CHECKSUMS` says of
+        // racc, the archive in the home is the one that is used.
         std::fs::write(project.join("Gemfile.lock"), LOCK).unwrap();
-        let pinned = GemSource::of(&project, true).await;
-        assert!(pinned.cached(&home, &racc).await.is_none());
-        assert_eq!(pinned.bases(&racc), [rubygems_base()]);
+        let online = GemSource::of(&project, false).await;
+        assert_eq!(online.archive(&home, &racc).await.unwrap(), b"archive");
+        assert_eq!(online.out_of_reach(&home, &missing).await, None);
+        let private = id("inhouse", "2.0.0", None);
+        for why in [
+            online.out_of_reach(&home, &private).await.unwrap(),
+            online.archive(&home, &private).await.unwrap_err(),
+            online
+                .dependency("inhouse", ">= 0", &RubyVersions::default())
+                .await
+                .unwrap_err(),
+        ] {
+            assert!(
+                why.contains("gems.example.test") && why.contains("is not downloaded"),
+                "{why}"
+            );
+            assert!(!why.contains("secret"), "{why}");
+        }
+        let remedy = online.remedy(&home, &private);
+        assert!(!remedy.contains("network access"), "{remedy}");
+        assert!(remedy.contains("inhouse-2.0.0.gem"), "{remedy}");
+        // In the home's cache, even a private gem's archive is its source.
+        std::fs::write(cache_path(&home, &private), b"private").unwrap();
+        assert_eq!(online.archive(&home, &private).await.unwrap(), b"private");
     }
 }
