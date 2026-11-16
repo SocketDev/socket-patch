@@ -757,3 +757,32 @@ fn a_module_that_cannot_be_read_leaves_the_build_undetermined() {
         other => panic!("{other:?}"),
     }
 }
+
+/// A pom that declares one dependency twice is read as its last
+/// declaration (Maven warns and builds on); a parent's declaration never
+/// replaces the module's own.
+#[test]
+fn a_dependency_declared_twice_reads_as_its_last_declaration() {
+    let f = Fixture::new();
+    f.app(&deps(&[x(A, "2.9.10"), x("lib-a", "1.0"), x(A, "2.7.9.2")]))
+        .cache("lib-a", "1.0", &[])
+        .cache(A, "2.9.10", &[])
+        .cache(A, "2.7.9.2", &[]);
+    assert_eq!(f.verdict("2.7.9.2"), Verdict::Selected);
+    assert_eq!(f.verdict("2.9.10"), other("2.7.9.2"));
+
+    let f = Fixture::new();
+    write(
+        &f.cwd,
+        "pom.xml",
+        &format!(
+            "<project><modelVersion>4.0.0</modelVersion><parent><groupId>{G}</groupId>\
+             <artifactId>corp-parent</artifactId><version>3</version><relativePath/></parent>\
+             <artifactId>app</artifactId>{}</project>",
+            deps(&[x(A, "2.7.9.2")])
+        ),
+    );
+    cache(&f.repo, "corp-parent", "3", &deps(&[x(A, "2.9.10")]));
+    f.cache(A, "2.7.9.2", &[]);
+    assert_eq!(f.verdict("2.7.9.2"), Verdict::Selected);
+}

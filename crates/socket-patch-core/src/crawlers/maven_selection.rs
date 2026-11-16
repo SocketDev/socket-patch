@@ -806,6 +806,10 @@ impl Selector<'_> {
                     describe(node)
                 ));
             }
+            // Where this pom's own declarations stand: Maven reads a pom
+            // that declares one dependency twice as its last declaration,
+            // in the place of the first.
+            let mut own: HashMap<Key, usize> = HashMap::new();
             for decl in node.model.own_deps() {
                 let key = match self.key_of(decl, chain) {
                     Ok(key) => key,
@@ -819,7 +823,7 @@ impl Selector<'_> {
                         continue;
                     }
                 };
-                if !seen.insert(key.clone()) {
+                if seen.contains(&key) {
                     continue;
                 }
                 let managed = management.entries.get(&key);
@@ -846,14 +850,22 @@ impl Selector<'_> {
                 if exclusions.is_empty() {
                     exclusions = managed.map(|m| m.exclusions.clone()).unwrap_or_default();
                 }
-                out.deps.push(Dep {
-                    key,
+                let dep = Dep {
+                    key: key.clone(),
                     version,
                     scope,
                     optional: decl.optional,
                     exclusions,
-                });
+                };
+                match own.get(&key) {
+                    Some(&at) => out.deps[at] = dep,
+                    None => {
+                        own.insert(key, out.deps.len());
+                        out.deps.push(dep);
+                    }
+                }
             }
+            seen.extend(own.into_keys());
         }
         let out = Rc::new(out);
         self.deps.insert(path, Rc::clone(&out));
