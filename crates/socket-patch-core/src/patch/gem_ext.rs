@@ -1995,34 +1995,34 @@ pub(crate) async fn install_staged(
     Ok(staged)
 }
 
-/// Every regular file under `dir`, relative, `/`-separated, sorted;
-/// RubyGems' metadata files at the top level and the stage dirs a build
-/// leaves are skipped.
-fn artifact_rels(dir: &Path) -> Vec<String> {
-    let mut out = Vec::new();
-    for entry in walkdir::WalkDir::new(dir)
+/// Every regular file under `dir`, relative and `/`-separated, sorted.
+/// Links are neither followed nor listed.
+fn tree_files(dir: &Path) -> Vec<String> {
+    walkdir::WalkDir::new(dir)
         .follow_links(false)
         .sort_by_file_name()
         .into_iter()
         .flatten()
-    {
-        if !entry.file_type().is_file() {
-            continue;
-        }
-        let Ok(rel) = entry.path().strip_prefix(dir) else {
-            continue;
-        };
-        let rel = rel
-            .components()
-            .map(|c| c.as_os_str().to_string_lossy().into_owned())
-            .collect::<Vec<_>>()
-            .join("/");
-        if EXT_DIR_METADATA.contains(&rel.as_str()) || rel == MARKER_FILE {
-            continue;
-        }
-        out.push(rel);
-    }
-    out
+        .filter(|entry| entry.file_type().is_file())
+        .filter_map(|entry| {
+            let rel = entry.path().strip_prefix(dir).ok()?;
+            Some(
+                rel.components()
+                    .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                    .collect::<Vec<_>>()
+                    .join("/"),
+            )
+        })
+        .collect()
+}
+
+/// The artifacts of the extension dir `dir`: its files ([`tree_files`]),
+/// RubyGems' metadata files at the top level aside.
+fn artifact_rels(dir: &Path) -> Vec<String> {
+    tree_files(dir)
+        .into_iter()
+        .filter(|rel| !EXT_DIR_METADATA.contains(&rel.as_str()) && rel != MARKER_FILE)
+        .collect()
 }
 
 /// An extension-dir artifact's copy in the gem's require dir, relative to
@@ -2727,27 +2727,6 @@ async fn unpack_in_stage(
     Ok(staged)
 }
 
-/// Every regular file under `dir`, relative and `/`-separated, sorted.
-/// Links are neither followed nor listed.
-fn tree_files(dir: &Path) -> Vec<String> {
-    walkdir::WalkDir::new(dir)
-        .follow_links(false)
-        .sort_by_file_name()
-        .into_iter()
-        .flatten()
-        .filter(|entry| entry.file_type().is_file())
-        .filter_map(|entry| {
-            let rel = entry.path().strip_prefix(dir).ok()?;
-            Some(
-                rel.components()
-                    .map(|c| c.as_os_str().to_string_lossy().into_owned())
-                    .collect::<Vec<_>>()
-                    .join("/"),
-            )
-        })
-        .collect()
-}
-
 /// Prove that the gem unpacked at `staged` is the installed copy's own
 /// source, before anything of it is built: every file the two trees share
 /// must be byte-identical. `Ok` is the number of files that agreed.
@@ -3315,23 +3294,23 @@ struct Graft {
     target: String,
 }
 
-/// Every regular file named `leaf` under `dir`, as paths relative to
-/// `base`, `/`-separated. Symlinks are not followed.
+/// Every regular file named `leaf` under `dir`, a dir inside `base`, as
+/// paths relative to `base` ([`tree_files`]).
 fn files_named(dir: &Path, leaf: &str, base: &Path) -> Vec<String> {
-    walkdir::WalkDir::new(dir)
-        .follow_links(false)
-        .sort_by_file_name()
+    let Ok(prefix) = dir.strip_prefix(base) else {
+        return Vec::new();
+    };
+    let prefix: Vec<String> = prefix
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect();
+    tree_files(dir)
         .into_iter()
-        .flatten()
-        .filter(|entry| entry.file_type().is_file() && entry.file_name() == leaf)
-        .filter_map(|entry| {
-            let rel = entry.path().strip_prefix(base).ok()?;
-            Some(
-                rel.components()
-                    .map(|c| c.as_os_str().to_string_lossy().into_owned())
-                    .collect::<Vec<_>>()
-                    .join("/"),
-            )
+        .filter(|rel| leaf_of(rel) == leaf)
+        .map(|rel| {
+            let mut parts = prefix.clone();
+            parts.push(rel);
+            parts.join("/")
         })
         .collect()
 }
@@ -3977,11 +3956,23 @@ pub async fn apply_gem_package_patch(
     let precompiled = scope.precompiled.is_some();
     let (installed_files, absent) = files_as_installed(&copy, &scope, files).await;
 
-    // Already patched and built from these sources: nothing to do.
-    let built = {
+    // Already patched and built from these sources: nothing to do. A
+    // precompiled copy can also be built for one Ruby and not for another
+    // that its gem home serves (`grafted`): whether anything is left to
+    // build then depends on the Ruby that runs, which is asked below.
+    let (built, grafted) = {
         let (copy, scope, files) = (copy.clone(), scope.clone(), files.clone());
         crate::utils::fs::run_blocking(move || {
-            read_marker_sync(&copy.gem_dir).is_some_and(|m| marker_holds(&m, &copy, &scope, &files))
+            let marker = read_marker_sync(&copy.gem_dir);
+            let built = marker
+                .as_ref()
+                .is_some_and(|m| marker_holds(m, &copy, &scope, &files));
+            let grafted = marker.is_some_and(|m| {
+                m.grafted
+                    && marker_sources_match(&m, &scope, &files)
+                    && marker_artifacts_hold(&m, &copy, &scope)
+            });
+            (built, grafted)
         })
         .await
     };
@@ -4054,7 +4045,7 @@ pub async fn apply_gem_package_patch(
             copy.spec_path.display()
         )
     };
-    if precompiled {
+    if precompiled && !grafted {
         let Some(source) = &source else {
             return needs_source_gem(None, unnamed(), false);
         };

@@ -3074,11 +3074,16 @@ fn a_home_of_two_rubies_is_attested_once_both_binaries_are_grafted() {
     );
     assert!(stdout.contains("native_extension_not_rebuilt"), "{stdout}");
     assert!(!vex_attests(run), "vex attested a half-grafted copy");
-    // Again under 3.4: asked which Ruby it is, then nothing left to build.
+    // Again under 3.4: asked which Ruby it is, then nothing left to build,
+    // with or without a source gem within reach.
+    let cached = home.join("cache/sp_native-1.0.0.gem");
+    let parked = proj.join("sp_native-1.0.0.gem.parked");
+    std::fs::rename(&cached, &parked).unwrap();
     let (code, stdout, stderr) = run(&["apply", "--json", "--offline"]);
     assert_eq!(code, 0, "{stdout}\n{stderr}");
     assert!(stdout.contains("native_extension_not_rebuilt"), "{stdout}");
     assert_eq!(ruby.calls(), [&built[..], &["extensions_dir"]].concat());
+    std::fs::rename(&parked, &cached).unwrap();
 
     // Ruby 3.3 applies: it grafts its own binary beside the other.
     ruby.become_ruby_33();
