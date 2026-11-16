@@ -3599,11 +3599,21 @@ async fn rebuild_in_place(
     match rebuild(job.copy, probe, job.scope, job.files, job.env, true).await {
         Ok(()) => job.built(result),
         Err(diagnostic) => {
+            // An installed tree may no longer hold what its build needs
+            // (nokogiri's deletes `ports/`): the source gem would.
+            let from_own_tree = match remedy {
+                Some(remedy) => format!(
+                    " It was built from the installed gem's own files, which a build can \
+                     leave incomplete, because its source gem could not be had \
+                     ({no_source_gem}). {remedy}"
+                ),
+                None => String::new(),
+            };
             let detail = format!(
                 "the native extension did not build from the patched sources ({}); the \
                  sources and the previous build were put back. Install a compiler toolchain \
                  and the Ruby headers and apply again, or use `socket-patch scan --mode \
-                 hosted`.\n{diagnostic}",
+                 hosted`.{from_own_tree}\n{diagnostic}",
                 job.inputs
             );
             job.not_built(result, &originals, detail).await
