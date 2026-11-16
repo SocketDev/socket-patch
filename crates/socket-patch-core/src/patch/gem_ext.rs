@@ -1809,9 +1809,9 @@ struct BackupInfo {
     /// extension dir.
     #[serde(default)]
     grafted: bool,
-    /// Build inputs of the record that the precompiled copy did not ship
-    /// and the patch wrote into it (normalized paths): `rollback` removes
-    /// them instead of restoring content the copy never held
+    /// Build inputs of the record that the installed copy did not hold and
+    /// the patch wrote into it (normalized paths): `rollback` removes them
+    /// instead of restoring content the copy never held
     /// ([`rollback_files`]).
     #[serde(default)]
     absent_files: Vec<String>,
@@ -1846,12 +1846,16 @@ fn ext_dir_label(home: &Path, ext_dir: &Path) -> String {
 /// copies of its artifacts) to [`BACKUP_DIR`], unless a backup exists or the
 /// current build is one socket-patch made (a marker exists: its original is
 /// gone). Staged and renamed into place, so a backup dir is always whole.
-/// `Ok(true)` when this call made the backup.
-fn back_up_original(copy: &GemCopy, probe: &Probe) -> std::io::Result<bool> {
+/// The backup also lists `absent`, the record's files the copy did not hold
+/// ([`files_as_installed`]); one that exists learns of those it does not
+/// list. `Ok(true)` when this call made the backup.
+fn back_up_original(copy: &GemCopy, probe: &Probe, absent: &[String]) -> std::io::Result<bool> {
     let backup = copy.gem_dir.join(BACKUP_DIR);
-    if std::fs::symlink_metadata(&backup).is_ok()
-        || std::fs::symlink_metadata(copy.gem_dir.join(MARKER_FILE)).is_ok()
-    {
+    if std::fs::symlink_metadata(&backup).is_ok() {
+        note_absent_files(&backup, absent)?;
+        return Ok(false);
+    }
+    if std::fs::symlink_metadata(copy.gem_dir.join(MARKER_FILE)).is_ok() {
         return Ok(false);
     }
     let stage = copy.gem_dir.join(format!("{BACKUP_DIR}.tmp"));
@@ -1886,14 +1890,48 @@ fn back_up_original(copy: &GemCopy, probe: &Probe) -> std::io::Result<bool> {
         extension_dir: ext_dir_label(&copy.home, &probe.extension_dir),
         had_extension_dir,
         lib_files,
+        absent_files: absent.to_vec(),
         ..BackupInfo::default()
     };
-    std::fs::write(
-        stage.join(BACKUP_INFO),
-        serde_json::to_vec_pretty(&info).map_err(std::io::Error::other)?,
-    )?;
+    write_backup_info(&stage, &info)?;
     std::fs::rename(&stage, &backup)?;
     Ok(true)
+}
+
+/// Write a backup's description into `dir`: staged beside its place and
+/// renamed, so it is always whole.
+fn write_backup_info(dir: &Path, info: &BackupInfo) -> std::io::Result<()> {
+    let stage = dir.join(format!("{BACKUP_INFO}.tmp"));
+    std::fs::write(
+        &stage,
+        serde_json::to_vec_pretty(info).map_err(std::io::Error::other)?,
+    )?;
+    std::fs::rename(&stage, dir.join(BACKUP_INFO))
+}
+
+/// Add `absent` (files a later apply writes into a copy that did not hold
+/// them) to an existing backup's list, so `rollback` removes them too. A
+/// backup that is not a dir this tool wrote is left as it is.
+fn note_absent_files(backup: &Path, absent: &[String]) -> std::io::Result<()> {
+    if absent.is_empty() || !is_real_dir(backup) {
+        return Ok(());
+    }
+    let known = read_regular_to_bytes_sync(&backup.join(BACKUP_INFO))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<BackupInfo>(&bytes).ok());
+    let Some(mut info) = known else {
+        return Ok(());
+    };
+    let before = info.absent_files.len();
+    for path in absent {
+        if !info.absent_files.contains(path) {
+            info.absent_files.push(path.clone());
+        }
+    }
+    if info.absent_files.len() != before {
+        write_backup_info(backup, &info)?;
+    }
+    Ok(())
 }
 
 /// One lib copy read into memory: gem-dir-relative path, bytes, mode.
@@ -2061,7 +2099,7 @@ async fn rebuild(
         let (copy, probe) = (copy.clone(), probe.clone());
         crate::utils::fs::run_blocking(move || {
             let made = if back_up {
-                back_up_original(&copy, &probe)
+                back_up_original(&copy, &probe, &[])
                     .map_err(|e| format!("could not back up the original extension build: {e}"))?
             } else {
                 false
@@ -2525,17 +2563,17 @@ fn replace_with_file(
 /// Put a staged build in the place of the installed copy's: the staged
 /// extension dir becomes the copy's, and the `lib/` copies RubyGems made of
 /// its artifacts in the stage replace the installed ones. The original
-/// build is backed up first (`back_up`), the current one is parked while
-/// the new one moves in, and the marker records the result, exactly as an
-/// in-place [`rebuild`] leaves them. On failure the previous build is put
-/// back.
+/// build is backed up first (`back_up`: with the record's files the copy
+/// did not hold), the current one is parked while the new one moves in, and
+/// the marker records the result, exactly as an in-place [`rebuild`] leaves
+/// them. On failure the previous build is put back.
 fn install_staged_build(
     copy: &GemCopy,
     probe: &Probe,
     scope: &NativeScope,
     files: &HashMap<String, PatchFileInfo>,
     staged: &StagedBuild,
-    back_up: bool,
+    back_up: Option<&[String]>,
 ) -> Result<(), String> {
     // The stage was built by the Ruby that owns the copy, so both name the
     // same `extensions/<platform>/<abi>/<full_name>`.
@@ -2546,11 +2584,10 @@ fn install_staged_build(
             probe.extension_dir.display()
         ));
     }
-    let made_backup = if back_up {
-        back_up_original(copy, probe)
-            .map_err(|e| format!("could not back up the original extension build: {e}"))?
-    } else {
-        false
+    let made_backup = match back_up {
+        Some(absent) => back_up_original(copy, probe, absent)
+            .map_err(|e| format!("could not back up the original extension build: {e}"))?,
+        None => false,
     };
     let drop_new_backup = || {
         if made_backup {
@@ -2721,34 +2758,12 @@ fn plan_graft(copy: &GemCopy, probe: &Probe, staged: &StagedBuild) -> Result<Vec
 /// Back up the prebuilt binaries a graft is about to replace to
 /// [`BACKUP_DIR`], with the record's files the copy never shipped
 /// (`absent`), unless a backup exists or the current binaries are
-/// socket-patch's (a marker exists). An existing backup of a precompiled
-/// copy learns of `absent` files it does not list. `Ok(true)` when this
-/// call made the backup.
+/// socket-patch's (a marker exists). An existing backup learns of `absent`
+/// files it does not list. `Ok(true)` when this call made the backup.
 fn back_up_prebuilt(copy: &GemCopy, grafts: &[Graft], absent: &[String]) -> std::io::Result<bool> {
     let backup = copy.gem_dir.join(BACKUP_DIR);
-    let write_info = |dir: &Path, info: &BackupInfo| -> std::io::Result<()> {
-        let stage = dir.join(format!("{BACKUP_INFO}.tmp"));
-        std::fs::write(
-            &stage,
-            serde_json::to_vec_pretty(info).map_err(std::io::Error::other)?,
-        )?;
-        std::fs::rename(&stage, dir.join(BACKUP_INFO))
-    };
     if std::fs::symlink_metadata(&backup).is_ok() {
-        let known = read_regular_to_bytes_sync(&backup.join(BACKUP_INFO))
-            .ok()
-            .and_then(|bytes| serde_json::from_slice::<BackupInfo>(&bytes).ok());
-        if let Some(mut info) = known.filter(|info| info.grafted && is_real_dir(&backup)) {
-            let before = info.absent_files.len();
-            for path in absent {
-                if !info.absent_files.contains(path) {
-                    info.absent_files.push(path.clone());
-                }
-            }
-            if info.absent_files.len() != before {
-                write_info(&backup, &info)?;
-            }
-        }
+        note_absent_files(&backup, absent)?;
         return Ok(false);
     }
     if std::fs::symlink_metadata(copy.gem_dir.join(MARKER_FILE)).is_ok() {
@@ -2774,7 +2789,7 @@ fn back_up_prebuilt(copy: &GemCopy, grafts: &[Graft], absent: &[String]) -> std:
         absent_files: absent.to_vec(),
         ..BackupInfo::default()
     };
-    write_info(&stage, &info)?;
+    write_backup_info(&stage, &info)?;
     std::fs::rename(&stage, &backup)?;
     Ok(true)
 }
@@ -2833,13 +2848,15 @@ fn graft_binaries(
     grafted
 }
 
-/// The record as a precompiled copy takes it: a build input the copy does
-/// not ship (it is in the source gem alone, like nokogiri's `patches/**`)
-/// is added to it, whatever content the record says it replaces. That
-/// content is checked where it exists: in the source gem the extension is
-/// rebuilt from ([`patch_staged_gem`]). Returns the record so adjusted and
-/// the (normalized) paths it adds.
-async fn files_for_precompiled(
+/// The record as the installed copy takes it. A build input the copy does
+/// not hold is added to it, whatever content the record says it replaces:
+/// the source gem packs files an installed copy lacks (a precompiled gem
+/// never shipped nokogiri's `patches/**`; a build deletes its `ports/**`
+/// once it is done). That content is checked where it exists, in the
+/// source gem the extension is rebuilt from ([`patch_staged_gem`]), so the
+/// result is only used for a rebuild from that gem. Returns the record so
+/// adjusted and the (normalized) paths it adds.
+async fn files_as_installed(
     copy: &GemCopy,
     scope: &NativeScope,
     files: &HashMap<String, PatchFileInfo>,
@@ -2865,10 +2882,10 @@ async fn files_for_precompiled(
 }
 
 /// The record's files as `rollback` undoes them on the gem copy at
-/// `pkg_path`. A build input `apply` added to a precompiled copy that never
-/// shipped it ([`files_for_precompiled`]; the copy's backup lists them) is
-/// removed, not restored to the content it has in the source gem. Any
-/// other copy: `files` as they are.
+/// `pkg_path`. A build input `apply` added to a copy that did not hold it
+/// ([`files_as_installed`]; the copy's backup lists them) is removed, not
+/// restored to the content it has in the source gem. Any other copy:
+/// `files` as they are.
 pub async fn rollback_files(
     pkg_path: &Path,
     files: &HashMap<String, PatchFileInfo>,
@@ -2886,7 +2903,7 @@ pub async fn rollback_files(
         serde_json::from_slice::<BackupInfo>(&bytes).ok()
     })
     .await;
-    let Some(info) = info.filter(|info| info.grafted) else {
+    let Some(info) = info else {
         return out;
     };
     for (key, file) in out.iter_mut() {
@@ -2975,7 +2992,7 @@ struct Job<'a> {
     /// The record's files.
     files: &'a HashMap<String, PatchFileInfo>,
     /// The record as the installed copy takes it
-    /// ([`files_for_precompiled`]).
+    /// ([`files_as_installed`]).
     installed_files: &'a HashMap<String, PatchFileInfo>,
     sources: &'a PatchSources<'a>,
     policy: MismatchPolicy,
@@ -3184,11 +3201,7 @@ pub async fn apply_gem_package_patch(
         );
     }
     let precompiled = scope.precompiled.is_some();
-    let (installed_files, absent) = if precompiled {
-        files_for_precompiled(&copy, &scope, files).await
-    } else {
-        (files.clone(), Vec::new())
-    };
+    let (installed_files, absent) = files_as_installed(&copy, &scope, files).await;
 
     // Already patched and built from these sources: nothing to do.
     let built = {
@@ -3290,6 +3303,24 @@ pub async fn apply_gem_package_patch(
                     crate::patch::gem_source::cache_path(&copy.home, source).display()
                 ),
                 true,
+            );
+        }
+    }
+
+    // So can a gem RubyGems built, when the record changes an input its
+    // build removed from the installed copy.
+    if !precompiled && !absent.is_empty() {
+        let reachable = match &source {
+            Some(source) => gems.may_have(&copy.home, source).await,
+            None => false,
+        };
+        if !reachable {
+            let why = "its archive is not in the gem home's cache and this run is offline";
+            return refusal(
+                package_key,
+                pkg_path,
+                UNSUPPORTED_CODE,
+                absent_inputs_detail(&inputs, &absent, &copy, why),
             );
         }
     }
@@ -3403,18 +3434,51 @@ pub async fn apply_gem_package_patch(
                 Err(why) if precompiled => needs_source_gem(Some(source), why, false),
                 // Not an archive this copy can be rebuilt from: its own
                 // tree is what is left to build.
-                Err(_) => rebuild_in_place(&job, &probe).await,
+                Err(why) => rebuild_in_place(&job, &probe, &absent, &why).await,
             }
         }
         (Err(why), _) if precompiled => needs_source_gem(source.as_ref(), why, true),
-        _ => rebuild_in_place(&job, &probe).await,
+        (Err(why), _) => rebuild_in_place(&job, &probe, &absent, &why).await,
+        (Ok(_), None) => {
+            let why = "its gemspec does not name the gem it was installed from";
+            rebuild_in_place(&job, &probe, &absent, why).await
+        }
     }
+}
+
+/// The refusal of a record that changes build inputs the installed copy of
+/// a gem RubyGems built no longer holds (`absent`), when the source gem
+/// that packs them cannot be had (`why`).
+fn absent_inputs_detail(inputs: &str, absent: &[String], copy: &GemCopy, why: &str) -> String {
+    format!(
+        "the patch changes native-extension sources ({inputs}), and the installed gem does not \
+         hold {} (a build removes what it is done with), so the extension can only be rebuilt \
+         from the source gem, which could not be had: {why}; nothing was written. Run \
+         `socket-patch apply` once with network access to the gem's source, or put the gem's \
+         archive in {}.",
+        absent.join(", "),
+        copy.home.join("cache").display()
+    )
 }
 
 /// Write the patched sources and rebuild the extension from the installed
 /// copy's own tree ([`rebuild`]): what is left when its source gem cannot
-/// be had. A failed build puts the sources and the previous build back.
-async fn rebuild_in_place(job: &Job<'_>, probe: &Probe) -> GemApplied {
+/// be had (`no_source_gem` says why). A failed build puts the sources and
+/// the previous build back. A record that changes a build input the copy
+/// no longer holds (`absent`) cannot be built this way: nothing here has
+/// the file's content to check the record against.
+async fn rebuild_in_place(
+    job: &Job<'_>,
+    probe: &Probe,
+    absent: &[String],
+    no_source_gem: &str,
+) -> GemApplied {
+    if !absent.is_empty() {
+        return job.refuse(
+            UNSUPPORTED_CODE,
+            absent_inputs_detail(job.inputs, absent, job.copy, no_source_gem),
+        );
+    }
     let originals = job.originals().await;
     let result = job.write_sources(&originals).await;
     if !result.success {
@@ -3550,9 +3614,9 @@ async fn rebuild_in_stage(
     }
     let installed = {
         let (copy, probe, scope) = (copy.clone(), probe.clone(), job.scope.clone());
-        let (files, built) = (job.files.clone(), built.clone());
+        let (files, built, absent) = (job.files.clone(), built.clone(), absent.to_vec());
         crate::utils::fs::run_blocking(move || {
-            install_staged_build(&copy, &probe, &scope, &files, &built, true)
+            install_staged_build(&copy, &probe, &scope, &files, &built, Some(&absent))
         })
         .await
     };
@@ -3804,7 +3868,7 @@ async fn rebuild_unpatched_from_source_gem(
         Some(
             crate::utils::fs::run_blocking(move || {
                 let scope = NativeScope::default();
-                install_staged_build(&copy, &probe, &scope, &HashMap::new(), &built, false)
+                install_staged_build(&copy, &probe, &scope, &HashMap::new(), &built, None)
             })
             .await,
         )
@@ -5051,7 +5115,7 @@ mod tests {
         );
 
         // The copy takes the file it never shipped as an addition.
-        let (installed, absent) = files_for_precompiled(&copy, &scope, &record).await;
+        let (installed, absent) = files_as_installed(&copy, &scope, &record).await;
         assert_eq!(absent, ["patches/0001.patch"]);
         assert_eq!(installed["patches/0001.patch"].before_hash, "");
         assert_eq!(installed["ext/a/a.c"], record["ext/a/a.c"]);
@@ -5248,12 +5312,12 @@ mod tests {
             label: "extensions/p/3.3.0/a-1".to_string(),
             ..built.clone()
         };
-        let why = install_staged_build(&copy, &probe, &scope, &record, &foreign, true);
+        let why = install_staged_build(&copy, &probe, &scope, &record, &foreign, Some(&[]));
         assert!(why.unwrap_err().contains("not the installed extension's"));
         assert_eq!(std::fs::read(ext.join("a/a.so")).unwrap(), b"original");
         assert!(!copy.gem_dir.join(BACKUP_DIR).exists());
 
-        install_staged_build(&copy, &probe, &scope, &record, &built, true).unwrap();
+        install_staged_build(&copy, &probe, &scope, &record, &built, Some(&[])).unwrap();
         assert_eq!(std::fs::read(ext.join("a/a.so")).unwrap(), b"rebuilt");
         assert!(ext.join(BUILD_COMPLETE).is_file());
         assert_eq!(
