@@ -1866,12 +1866,18 @@ fn back_up_original(copy: &GemCopy, probe: &Probe) -> std::io::Result<bool> {
                 continue;
             };
             // Only a regular file: a FIFO there would block the read.
-            if let Ok(bytes) = read_regular_to_bytes_sync(&copy.gem_dir.join(&lib)) {
+            let src = copy.gem_dir.join(&lib);
+            if let Ok(bytes) = read_regular_to_bytes_sync(&src) {
                 let dst = stage.join("lib").join(&lib);
                 if let Some(parent) = dst.parent() {
                     std::fs::create_dir_all(parent)?;
                 }
                 std::fs::write(&dst, bytes)?;
+                // The copy's mode too (RubyGems installs a shared object
+                // executable), so the restore gives back the file as it was.
+                if let Ok(meta) = std::fs::metadata(&src) {
+                    let _ = std::fs::set_permissions(&dst, meta.permissions());
+                }
                 lib_files.push(lib);
             }
         }
@@ -3827,14 +3833,10 @@ fn restore_backup(copy: &GemCopy, marker: Option<&BuildMarker>) -> std::io::Resu
             let saved = backup.join("lib").join(lib);
             let bytes = read_regular_to_bytes_sync(&saved)?;
             let perms = std::fs::symlink_metadata(&saved)?.permissions();
+            // With the mode the backup kept.
             replace_file(&copy.gem_dir.join(lib), |stage| {
                 std::fs::write(stage, &bytes)?;
-                // The mode the backup kept (a prebuilt binary's); a backup
-                // of `lib/` copies was written with the default one.
-                if info.grafted {
-                    std::fs::set_permissions(stage, perms)?;
-                }
-                Ok(())
+                std::fs::set_permissions(stage, perms)
             })?;
         }
         Ok(())
@@ -4609,5 +4611,718 @@ mod tests {
         let mut escaping = marker.clone();
         escaping.lib_artifacts = [("../x".to_string(), hash)].into();
         assert!(!marker_holds(&escaping, &copy, &scope, &record));
+    }
+
+    // ── native gems: what is a build input ──────────────────────────────
+
+    /// The gemspec RubyGems writes for an installed gem, as `to_ruby`
+    /// shapes it. `platform` is `None` for the `ruby` platform.
+    fn to_ruby(name: &str, platform: Option<&str>, extensions: &[&str]) -> String {
+        let mut text = format!(
+            "# -*- encoding: utf-8 -*-\n# stub: {name} 1.18.3 {} lib\n",
+            platform.unwrap_or("ruby")
+        );
+        text.push_str("\nGem::Specification.new do |s|\n");
+        text.push_str(&format!("  s.name = \"{name}\".freeze\n"));
+        text.push_str("  s.version = \"1.18.3\".freeze\n");
+        if let Some(platform) = platform {
+            text.push_str(&format!("  s.platform = \"{platform}\".freeze\n"));
+        }
+        text.push_str(
+            "\n  s.required_rubygems_version = Gem::Requirement.new(\">= 0\".freeze) if \
+             s.respond_to? :required_rubygems_version=\n  s.require_paths = [\"lib\".freeze]\n",
+        );
+        if !extensions.is_empty() {
+            let list: Vec<String> = extensions
+                .iter()
+                .map(|e| format!("\"{e}\".freeze"))
+                .collect();
+            text.push_str(&format!("  s.extensions = [{}]\n", list.join(", ")));
+        }
+        text.push_str("  s.rubygems_version = \"3.3.26\".freeze\n");
+        text.push_str("  s.installed_by_version = \"4.0.15\".freeze\nend\n");
+        text
+    }
+
+    /// Files a nokogiri record may change that take part in its build:
+    /// the C sources, and what `extconf.rb` builds the vendored libxml2 and
+    /// libgumbo from.
+    const NOKOGIRI_BUILT: &[&str] = &[
+        "Cargo.lock",
+        "Cargo.toml",
+        "dependencies.yml",
+        "ext/java/nokogiri/XmlNode.java",
+        "ext/nokogiri/depend",
+        "ext/nokogiri/extconf.rb",
+        "ext/nokogiri/xml_node.c",
+        "gumbo-parser/src/parser.c",
+        "gumbo-parser/src/tag_lookup.gperf",
+        "patches/libxml2/0100-CVE-2025-0000.patch",
+        "patches/libxslt/0001-update-config.guess.patch",
+        "ports/archives/libxml2-2.13.6.tar.xz",
+        "vendor/libfoo/foo.c",
+    ];
+
+    /// Files of the same gem that Ruby loads as they are, or that nothing
+    /// loads.
+    const NOKOGIRI_PLAIN: &[&str] = &[
+        "CHANGELOG.md",
+        "Gemfile",
+        "LICENSE-DEPENDENCIES.md",
+        "LICENSE.md",
+        "README.md",
+        "bin/nokogiri",
+        "doc/guide.md",
+        "lib/nokogiri/3.4/nokogiri.bundle",
+        "lib/nokogiri/version/constant.rb",
+        "lib/nokogiri/xml/node.rb",
+        "nokogiri.gemspec",
+        "spec/node_spec.rb",
+        "test/xml/test_node.rb",
+    ];
+
+    fn nokogiri_files(extra: &[&str]) -> HashMap<String, PatchFileInfo> {
+        let all: Vec<&str> = NOKOGIRI_BUILT
+            .iter()
+            .chain(NOKOGIRI_PLAIN)
+            .chain(extra)
+            .copied()
+            .collect();
+        files(&all)
+    }
+
+    /// In the source-built gem (its gemspec declares the extension)
+    /// everything `extconf.rb` may build from is an input, not just the C
+    /// files under the script's dir: a record that only adds
+    /// `patches/libxml2/<n>.patch` changes the compiled library.
+    #[test]
+    fn classify_nokogiri_built_from_source() {
+        let spec = to_ruby("nokogiri", None, &["ext/nokogiri/extconf.rb"]);
+        let facts = SpecFacts::of(&spec, "nokogiri-1.18.3");
+        assert_eq!(facts.platform, None);
+        let scope = classify(&facts, &nokogiri_files(&["lib/nokogiri/css/parser.y"]));
+        let mut expected: Vec<&str> = NOKOGIRI_BUILT.to_vec();
+        // A grammar counts in a gem that builds, as before.
+        expected.push("lib/nokogiri/css/parser.y");
+        expected.sort();
+        assert_eq!(scope.inputs, expected);
+        assert!(scope.builds_extensions);
+        assert_eq!(scope.precompiled, None);
+        assert_eq!(
+            scope.source_gem().map(|g| g.full_name()).as_deref(),
+            Some("nokogiri-1.18.3")
+        );
+
+        let only_a_patch = classify(
+            &facts,
+            &files(&["patches/libxml2/0100-CVE-2025-0000.patch"]),
+        );
+        assert_eq!(
+            only_a_patch.inputs,
+            ["patches/libxml2/0100-CVE-2025-0000.patch"]
+        );
+    }
+
+    /// The precompiled platform gem declares no extensions and still runs
+    /// compiled code: the same files are inputs, rebuilt from the
+    /// ruby-platform gem of its version. A grammar under `lib/` is not one
+    /// (the gem packs its generated parser, which Ruby loads).
+    #[test]
+    fn classify_nokogiri_precompiled() {
+        let spec = to_ruby("nokogiri", Some("arm64-darwin"), &[]);
+        let facts = SpecFacts::of(&spec, "nokogiri-1.18.3-arm64-darwin");
+        assert_eq!(facts.platform.as_deref(), Some("arm64-darwin"));
+        let scope = classify(&facts, &nokogiri_files(&["lib/nokogiri/css/parser.y"]));
+        assert_eq!(scope.inputs, NOKOGIRI_BUILT);
+        assert!(!scope.builds_extensions);
+        assert_eq!(scope.precompiled.as_deref(), Some("arm64-darwin"));
+        let source = scope.source_gem().unwrap();
+        assert_eq!(source.full_name(), "nokogiri-1.18.3");
+        assert_eq!(source.platform, None, "the ruby-platform source gem");
+
+        let ruby_only = classify(&facts, &files(NOKOGIRI_PLAIN));
+        assert!(ruby_only.inputs.is_empty(), "{:?}", ruby_only.inputs);
+    }
+
+    /// A pure-Ruby gem (no extensions, the `ruby` platform) is classified
+    /// as before: whatever its files are called, only a C source under
+    /// `ext/` is taken for one, and nothing else needs a build.
+    #[test]
+    fn classify_pure_ruby_gem_is_unchanged() {
+        let spec = to_ruby("rack", None, &[]);
+        let facts = SpecFacts::of(&spec, "rack-1.18.3");
+        assert_eq!(facts.platform, None);
+        let scope = classify(
+            &facts,
+            &files(&[
+                "data/x.yml",
+                "lib/rack.rb",
+                "patches/a.patch",
+                "ports/archives/a.tar.xz",
+                "dependencies.yml",
+                "Cargo.toml",
+                "vendor/x.c",
+                "gumbo-parser/src/parser.c",
+            ]),
+        );
+        assert!(scope.inputs.is_empty(), "{:?}", scope.inputs);
+        assert!(!scope.builds_extensions);
+        assert_eq!(scope.precompiled, None);
+        let with_ext = classify(&facts, &files(&["data/x.yml", "ext/x.c"]));
+        assert_eq!(with_ext.inputs, ["ext/x.c"]);
+    }
+
+    /// The JRuby build of a gem ships jars: its Java sources are inputs
+    /// (nothing here rebuilds them, so the patch is refused, never called
+    /// applied), while its Ruby files and a jar replaced whole are plain.
+    #[test]
+    fn classify_java_gem() {
+        let spec = to_ruby("nokogiri", Some("java"), &[]);
+        let facts = SpecFacts::of(&spec, "nokogiri-1.18.3-java");
+        let scope = classify(
+            &facts,
+            &files(&[
+                "ext/java/nokogiri/XmlNode.java",
+                "lib/nokogiri/xml/node.rb",
+                "lib/nokogiri/nokogiri.jar",
+                "lib/nokogiri/internals/Helper.java",
+            ]),
+        );
+        assert_eq!(
+            scope.inputs,
+            [
+                "ext/java/nokogiri/XmlNode.java",
+                "lib/nokogiri/internals/Helper.java"
+            ]
+        );
+        assert_eq!(scope.precompiled.as_deref(), Some("java"));
+        assert!(is_java_platform("java"));
+        assert!(is_java_platform("universal-java-17"));
+        for platform in ["arm64-darwin", "x86_64-linux-gnu", "x64-mingw-ucrt"] {
+            assert!(!is_java_platform(platform), "{platform}");
+        }
+    }
+
+    /// A build system's manifest is an input wherever it sits, and a gem
+    /// that requires from its root says nothing about any file.
+    #[test]
+    fn classify_native_gem_edges() {
+        let facts = built_gem(&["ext/a/extconf.rb"]);
+        let scope = classify(
+            &facts,
+            &files(&["CMakeLists.txt", "NOTES.txt", "Rakefile", "lib/a.rb"]),
+        );
+        assert_eq!(scope.inputs, ["CMakeLists.txt", "Rakefile"]);
+        let rooted = SpecFacts {
+            require_paths: vec![".".to_string()],
+            ..built_gem(&["ext/a/extconf.rb"])
+        };
+        assert_eq!(classify(&rooted, &files(&["a.rb"])).inputs, ["a.rb"]);
+    }
+
+    /// The platform is the dir name's suffix after `<name>-<version>`, or
+    /// what the gemspec assigns; the release names the archive.
+    #[test]
+    fn spec_facts_read_the_release_and_platform() {
+        let ruby = SpecFacts::of(
+            &to_ruby("ruby-prof", None, &["ext/a/extconf.rb"]),
+            "ruby-prof-1.18.3",
+        );
+        assert_eq!(ruby.platform, None);
+        assert_eq!(
+            ruby.release.as_ref().map(GemId::full_name).as_deref(),
+            Some("ruby-prof-1.18.3")
+        );
+        assert!(ruby.extensions.declared);
+        assert_eq!(ruby.require_paths, ["lib"]);
+
+        // The gemspec's own spelling of the platform may differ from the
+        // dir's (an older RubyGems drops `-gnu`): the dir names the archive.
+        let linux = SpecFacts::of(
+            &to_ruby("nokogiri", Some("x86_64-linux-gnu"), &[]),
+            "nokogiri-1.18.3-x86_64-linux",
+        );
+        assert_eq!(linux.platform.as_deref(), Some("x86_64-linux"));
+        assert_eq!(
+            linux.release.as_ref().map(GemId::full_name).as_deref(),
+            Some("nokogiri-1.18.3-x86_64-linux")
+        );
+
+        // A dir that is not this gemspec's release: the assigned platform
+        // still marks a platform gem, and there is no archive to name.
+        let moved = SpecFacts::of(&to_ruby("nokogiri", Some("java"), &[]), "something-else");
+        assert_eq!(moved.platform.as_deref(), Some("java"));
+        assert_eq!(moved.release, None);
+        // `nokogiri-1.18.30` is not `nokogiri-1.18.3` plus a platform.
+        let longer = SpecFacts::of(&to_ruby("nokogiri", None, &[]), "nokogiri-1.18.30");
+        assert_eq!((longer.platform, longer.release), (None, None));
+        // `s.platform = Gem::Platform::RUBY` assigns no string.
+        let explicit = "Gem::Specification.new do |s|\n  s.name = \"a\"\n  s.version = \"1\"\n  \
+                        s.platform = Gem::Platform::RUBY\nend\n";
+        assert_eq!(SpecFacts::of(explicit, "a-1").platform, None);
+    }
+
+    #[test]
+    fn ruby_facts_parse() {
+        let facts = parse_ruby_facts(
+            "noise\nsp_extensions_dir\t/h/extensions/arm64-darwin-25/3.4.0\n\
+             sp_ruby\t3.4.10\t4.0.15\tbundle\tarm64-darwin-25\tyes\n",
+        )
+        .unwrap();
+        assert_eq!(facts.minor().as_deref(), Some("3.4"));
+        assert_eq!(facts.dlext, "bundle");
+        assert_eq!(facts.runs_platform, Some(true));
+        assert_eq!(facts.versions().ruby.as_deref(), Some("3.4.10"));
+        let unasked = parse_ruby_facts("sp_ruby\t3.3.0\t3.5.3\tso\tx86_64-linux\t\n").unwrap();
+        assert_eq!(unasked.runs_platform, None);
+        let other = parse_ruby_facts("sp_ruby\t3.3.0\t3.5.3\tso\tx86_64-linux\tno\n").unwrap();
+        assert_eq!(other.runs_platform, Some(false));
+        for unreadable in ["", "sp_ruby\t3.4.10\n", "sp_extensions_dir\t/x\n"] {
+            assert_eq!(parse_ruby_facts(unreadable), None, "{unreadable:?}");
+        }
+        assert_eq!(
+            tagged_lines(
+                "sp_missing\ta\t~> 1.0\nx\nsp_missing\tb\t>= 0,< 2\n",
+                "sp_missing"
+            ),
+            [vec!["a", "~> 1.0"], vec!["b", ">= 0,< 2"]]
+        );
+        assert_eq!(
+            abi_of_home(Path::new("/p/vendor/bundle/ruby/3.4.0")).as_deref(),
+            Some("3.4.0")
+        );
+        assert_eq!(abi_of_home(Path::new("/opt/gems")), None);
+    }
+
+    // ── a precompiled copy ──────────────────────────────────────────────
+
+    const PREBUILT: &[u8] = b"\xcf\xfa\xed\xfe prebuilt";
+
+    /// A precompiled `a-1-arm64-darwin` copy in `home`, with a prebuilt
+    /// binary for Ruby 3.3 and 3.4 in the rake-compiler layout.
+    fn precompiled_gem(home: &Path) -> GemCopy {
+        let gem_dir = home.join("gems/a-1-arm64-darwin");
+        for minor in ["3.3", "3.4"] {
+            let dir = gem_dir.join("lib/a").join(minor);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("a.bundle"), PREBUILT).unwrap();
+        }
+        std::fs::create_dir_all(gem_dir.join("ext/a")).unwrap();
+        std::fs::write(gem_dir.join("ext/a/a.c"), b"int a;").unwrap();
+        std::fs::create_dir_all(home.join("specifications")).unwrap();
+        std::fs::write(
+            home.join("specifications/a-1-arm64-darwin.gemspec"),
+            "Gem::Specification.new do |s|\n  s.name = \"a\".freeze\n  \
+             s.version = \"1\".freeze\n  s.platform = \"arm64-darwin\".freeze\n  \
+             s.require_paths = [\"lib\".freeze]\nend\n",
+        )
+        .unwrap();
+        GemCopy::of(&gem_dir).unwrap()
+    }
+
+    fn probe_for(copy: &GemCopy, ruby_version: &str) -> Probe {
+        Probe {
+            ruby: PathBuf::from("/r"),
+            gem_dir: copy.gem_dir.clone(),
+            extension_dir: copy.home.join("extensions/p/3.4.0").join(&copy.full_name),
+            require_path: "lib".to_string(),
+            lib_dir: copy.gem_dir.join("lib"),
+            facts: Some(RubyFacts {
+                ruby_version: ruby_version.to_string(),
+                rubygems_version: "3.6.9".to_string(),
+                dlext: "bundle".to_string(),
+                platform: "arm64-darwin-25".to_string(),
+                runs_platform: Some(true),
+            }),
+        }
+    }
+
+    /// A build of the source gem `a-1` in the stage home `stage`: its
+    /// extension dir holds `rels`, each with the bytes `built`.
+    fn staged_build(stage: &Path, rels: &[&str], built: &[u8]) -> StagedBuild {
+        let label = "extensions/arm64-darwin-25/3.4.0/a-1".to_string();
+        let extension_dir = stage.join(&label);
+        let gem_dir = stage.join("gems/a-1");
+        for rel in rels {
+            for base in [&extension_dir, &gem_dir.join("lib")] {
+                let path = base.join(rel);
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(path, built).unwrap();
+            }
+        }
+        std::fs::write(extension_dir.join(BUILD_COMPLETE), b"").unwrap();
+        std::fs::write(extension_dir.join("gem_make.out"), b"log").unwrap();
+        StagedBuild {
+            gem: StagedGem {
+                gem_dir,
+                spec_path: stage.join("specifications/a-1.gemspec"),
+            },
+            extension_dir,
+            label,
+        }
+    }
+
+    /// The build is matched to the binary the gem keeps for the building
+    /// Ruby's minor; a single binary kept elsewhere is matched by name; no
+    /// counterpart, or several, is refused.
+    #[test]
+    fn a_graft_replaces_the_binary_ruby_loads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let copy = precompiled_gem(&tmp.path().join("home"));
+        let staged = staged_build(&tmp.path().join("stage"), &["a/a.bundle", "a/a.rb"], b"new");
+
+        let grafts = plan_graft(&copy, &probe_for(&copy, "3.4.10"), &staged).unwrap();
+        assert_eq!(grafts.len(), 1, "only the loadable extension is grafted");
+        assert_eq!(grafts[0].target, "lib/a/3.4/a.bundle");
+        assert_eq!(grafts[0].staged, staged.extension_dir.join("a/a.bundle"));
+        let older = plan_graft(&copy, &probe_for(&copy, "3.3.6"), &staged).unwrap();
+        assert_eq!(older[0].target, "lib/a/3.3/a.bundle");
+
+        // No binary for this Ruby, and two that share the name.
+        let why = plan_graft(&copy, &probe_for(&copy, "3.5.0"), &staged).unwrap_err();
+        assert!(why.contains("no prebuilt a.bundle for Ruby 3.5"), "{why}");
+        assert!(
+            why.contains("lib/a/3.3/a.bundle, lib/a/3.4/a.bundle"),
+            "{why}"
+        );
+
+        // One binary, wherever the gem keeps it.
+        std::fs::remove_dir_all(copy.gem_dir.join("lib/a/3.3")).unwrap();
+        std::fs::rename(
+            copy.gem_dir.join("lib/a/3.4/a.bundle"),
+            copy.gem_dir.join("lib/a.bundle"),
+        )
+        .unwrap();
+        let single = plan_graft(&copy, &probe_for(&copy, "3.5.0"), &staged).unwrap();
+        assert_eq!(single[0].target, "lib/a.bundle");
+
+        std::fs::remove_file(copy.gem_dir.join("lib/a.bundle")).unwrap();
+        let why = plan_graft(&copy, &probe_for(&copy, "3.4.10"), &staged).unwrap_err();
+        assert!(why.contains("no prebuilt a.bundle"), "{why}");
+
+        // A build that left no loadable extension has nothing to graft.
+        let empty = staged_build(&tmp.path().join("stage2"), &["a/a.rb"], b"new");
+        let why = plan_graft(&copy, &probe_for(&copy, "3.4.10"), &empty).unwrap_err();
+        assert!(why.contains("no .bundle extension"), "{why}");
+    }
+
+    /// A graft is attested like a rebuilt extension dir: only while the
+    /// marker's sources are the record's and the replaced binary still has
+    /// the built bytes. Rollback puts the prebuilt binary back, bytes and
+    /// mode, and removes what the patch added to the copy.
+    #[tokio::test]
+    async fn a_grafted_copy_is_attested_and_rolled_back() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let copy = precompiled_gem(&home);
+        let target = copy.gem_dir.join("lib/a/3.4/a.bundle");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let before_c = compute_git_sha256_from_bytes(b"int a;");
+        let record: HashMap<String, PatchFileInfo> = [
+            (
+                "ext/a/a.c".to_string(),
+                PatchFileInfo {
+                    before_hash: before_c,
+                    after_hash: "c".repeat(64),
+                },
+            ),
+            // In the source gem alone: the precompiled copy never had it.
+            (
+                "patches/0001.patch".to_string(),
+                PatchFileInfo {
+                    before_hash: "b".repeat(64),
+                    after_hash: "d".repeat(64),
+                },
+            ),
+        ]
+        .into();
+        let (scope, found) = scope_of(&copy.gem_dir, &record).await;
+        assert!(found.is_some());
+        assert_eq!(scope.inputs, ["ext/a/a.c", "patches/0001.patch"]);
+        assert_eq!(scope.precompiled.as_deref(), Some("arm64-darwin"));
+        assert_eq!(
+            verify_native_build(&copy.gem_dir, &record).await,
+            Err(NOT_REBUILT_REASON.to_string()),
+            "patched sources over the prebuilt binary attest nothing"
+        );
+
+        // The copy takes the file it never shipped as an addition.
+        let (installed, absent) = files_for_precompiled(&copy, &scope, &record).await;
+        assert_eq!(absent, ["patches/0001.patch"]);
+        assert_eq!(installed["patches/0001.patch"].before_hash, "");
+        assert_eq!(installed["ext/a/a.c"], record["ext/a/a.c"]);
+
+        let staged = staged_build(&tmp.path().join("stage"), &["a/a.bundle"], b"rebuilt");
+        let grafts = plan_graft(&copy, &probe_for(&copy, "3.4.10"), &staged).unwrap();
+        assert!(back_up_prebuilt(&copy, &grafts, &absent).unwrap());
+        assert!(
+            !back_up_prebuilt(&copy, &grafts, &["patches/0002.patch".to_string()]).unwrap(),
+            "the original is backed up once"
+        );
+        graft_binaries(&copy, &scope, &record, &grafts).unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"rebuilt");
+        assert_eq!(
+            std::fs::read(copy.gem_dir.join("lib/a/3.3/a.bundle")).unwrap(),
+            PREBUILT,
+            "another Ruby's binary is not this build's to replace"
+        );
+        let marker = read_marker_sync(&copy.gem_dir).unwrap();
+        assert!(marker.grafted);
+        assert_eq!(marker.schema, GRAFT_MARKER_SCHEMA);
+        assert_eq!(
+            marker.lib_artifacts.keys().collect::<Vec<_>>(),
+            ["lib/a/3.4/a.bundle"]
+        );
+        assert_eq!(verify_native_build(&copy.gem_dir, &record).await, Ok(()));
+
+        // Another record, or a binary that is no longer the built one.
+        let mut other = record.clone();
+        other.get_mut("ext/a/a.c").unwrap().after_hash = "e".repeat(64);
+        assert!(verify_native_build(&copy.gem_dir, &other).await.is_err());
+        std::fs::write(&target, b"reinstalled").unwrap();
+        assert!(verify_native_build(&copy.gem_dir, &record).await.is_err());
+        std::fs::write(&target, b"rebuilt").unwrap();
+
+        // Rollback: the added file is removed (an empty `beforeHash`), the
+        // one the copy shipped is restored.
+        let undo = rollback_files(&copy.gem_dir, &record).await;
+        assert_eq!(undo["patches/0001.patch"].before_hash, "");
+        assert_eq!(undo["ext/a/a.c"], record["ext/a/a.c"]);
+        let env = RubyEnv {
+            cwd: home.clone(),
+            rebuild: true,
+            offline: true,
+        };
+        assert_eq!(restore_original_build(&copy.gem_dir, &env).await, Ok(true));
+        assert_eq!(std::fs::read(&target).unwrap(), PREBUILT);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&target).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o755, "the binary keeps its mode");
+        }
+        assert!(!copy.gem_dir.join(MARKER_FILE).exists());
+        assert!(!copy.gem_dir.join(BACKUP_DIR).exists());
+        assert_eq!(rollback_files(&copy.gem_dir, &record).await, record);
+        assert_eq!(restore_original_build(&copy.gem_dir, &env).await, Ok(false));
+    }
+
+    /// A marker speaks for the kind of copy it was written for, and a
+    /// grafted one must name what it replaced.
+    #[test]
+    fn a_marker_of_the_wrong_kind_attests_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let copy = precompiled_gem(&tmp.path().join("home"));
+        let after = "c".repeat(64);
+        let record: HashMap<String, PatchFileInfo> =
+            [("ext/a/a.c".to_string(), info(&after))].into();
+        let scope = NativeScope {
+            inputs: vec!["ext/a/a.c".into()],
+            precompiled: Some("arm64-darwin".into()),
+            ..NativeScope::default()
+        };
+        let grafted = BuildMarker {
+            schema: GRAFT_MARKER_SCHEMA,
+            sources: [("ext/a/a.c".to_string(), after.clone())].into(),
+            lib_artifacts: [(
+                "lib/a/3.4/a.bundle".to_string(),
+                compute_git_sha256_from_bytes(PREBUILT),
+            )]
+            .into(),
+            grafted: true,
+            ..BuildMarker::default()
+        };
+        assert!(marker_holds(&grafted, &copy, &scope, &record));
+        // Nothing replaced: nothing attested.
+        let empty = BuildMarker {
+            lib_artifacts: BTreeMap::new(),
+            ..grafted.clone()
+        };
+        assert!(!marker_holds(&empty, &copy, &scope, &record));
+        // A gem RubyGems builds is not attested by a graft, nor a
+        // precompiled one by an extension dir's marker.
+        let built = NativeScope {
+            builds_extensions: true,
+            precompiled: None,
+            ..scope.clone()
+        };
+        assert!(!marker_holds(&grafted, &copy, &built, &record));
+        let dir_marker = BuildMarker {
+            schema: MARKER_SCHEMA,
+            grafted: false,
+            extension_dir: "extensions/p/3.4.0/a-1-arm64-darwin".into(),
+            ..grafted.clone()
+        };
+        assert!(!marker_holds(&dir_marker, &copy, &scope, &record));
+
+        // On disk: each schema is read only in its own shape.
+        let write = |marker: &BuildMarker| {
+            std::fs::write(
+                copy.gem_dir.join(MARKER_FILE),
+                serde_json::to_vec(marker).unwrap(),
+            )
+            .unwrap();
+            read_marker_sync(&copy.gem_dir)
+        };
+        assert_eq!(write(&grafted), Some(grafted.clone()));
+        assert_eq!(write(&dir_marker), Some(dir_marker.clone()));
+        for (schema, is_graft) in [
+            (MARKER_SCHEMA, true),
+            (GRAFT_MARKER_SCHEMA, false),
+            (3, true),
+        ] {
+            let odd = BuildMarker {
+                schema,
+                grafted: is_graft,
+                ..grafted.clone()
+            };
+            assert_eq!(write(&odd), None, "schema {schema}, grafted {is_graft}");
+        }
+        // The marker a release before the graft wrote still reads.
+        std::fs::write(
+            copy.gem_dir.join(MARKER_FILE),
+            "{\"schema\":1,\"sources\":{},\"extensionDir\":\"extensions/p/3.4.0/a-1\",\
+             \"extArtifacts\":{},\"libArtifacts\":{}}",
+        )
+        .unwrap();
+        assert!(read_marker_sync(&copy.gem_dir).is_some_and(|m| !m.grafted));
+    }
+
+    // ── a build staged from the source gem ──────────────────────────────
+
+    /// A staged build takes the place of the installed extension dir and
+    /// its `lib/` copies, with the original backed up and the marker
+    /// written, as an in-place rebuild leaves them; rollback restores it.
+    #[tokio::test]
+    async fn a_staged_build_replaces_the_installed_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let copy = installed_gem(&home, "lib");
+        let ext = home.join("extensions/p/3.4.0/a-1");
+        std::fs::create_dir_all(ext.join("a")).unwrap();
+        std::fs::write(ext.join("a/a.so"), b"original").unwrap();
+        std::fs::write(ext.join(BUILD_COMPLETE), b"").unwrap();
+        std::fs::create_dir_all(copy.gem_dir.join("lib/a")).unwrap();
+        std::fs::write(copy.gem_dir.join("lib/a/a.so"), b"original").unwrap();
+        let probe = Probe {
+            ruby: PathBuf::from("/r"),
+            gem_dir: copy.gem_dir.clone(),
+            extension_dir: ext.clone(),
+            require_path: "lib".to_string(),
+            lib_dir: copy.gem_dir.join("lib"),
+            facts: None,
+        };
+        let stage = open_stage(&copy).unwrap();
+        assert!(stage.home.starts_with(&home), "staged inside the gem home");
+        let label = "extensions/p/3.4.0/a-1".to_string();
+        let staged_ext = stage.home.join(&label);
+        let staged_gem = stage.home.join("gems/a-1");
+        std::fs::create_dir_all(staged_ext.join("a")).unwrap();
+        std::fs::create_dir_all(staged_gem.join("lib/a")).unwrap();
+        std::fs::write(staged_ext.join("a/a.so"), b"rebuilt").unwrap();
+        std::fs::write(staged_ext.join(BUILD_COMPLETE), b"").unwrap();
+        std::fs::write(staged_gem.join("lib/a/a.so"), b"rebuilt").unwrap();
+        let built = StagedBuild {
+            gem: StagedGem {
+                gem_dir: staged_gem,
+                spec_path: stage.home.join("specifications/a-1.gemspec"),
+            },
+            extension_dir: staged_ext,
+            label,
+        };
+        let after = "c".repeat(64);
+        let record: HashMap<String, PatchFileInfo> =
+            [("ext/a/a.c".to_string(), info(&after))].into();
+        let scope = NativeScope {
+            inputs: vec!["ext/a/a.c".into()],
+            builds_extensions: true,
+            ..NativeScope::default()
+        };
+
+        // A build for another ABI is not this copy's.
+        let foreign = StagedBuild {
+            label: "extensions/p/3.3.0/a-1".to_string(),
+            ..built.clone()
+        };
+        let why = install_staged_build(&copy, &probe, &scope, &record, &foreign, true);
+        assert!(why.unwrap_err().contains("not the installed extension's"));
+        assert_eq!(std::fs::read(ext.join("a/a.so")).unwrap(), b"original");
+        assert!(!copy.gem_dir.join(BACKUP_DIR).exists());
+
+        install_staged_build(&copy, &probe, &scope, &record, &built, true).unwrap();
+        assert_eq!(std::fs::read(ext.join("a/a.so")).unwrap(), b"rebuilt");
+        assert!(ext.join(BUILD_COMPLETE).is_file());
+        assert_eq!(
+            std::fs::read(copy.gem_dir.join("lib/a/a.so")).unwrap(),
+            b"rebuilt"
+        );
+        assert!(!parked_build_path(&ext).exists());
+        let marker = read_marker_sync(&copy.gem_dir).unwrap();
+        assert_eq!(marker.schema, MARKER_SCHEMA);
+        assert!(marker_holds(&marker, &copy, &scope, &record));
+        close_stage(stage, &copy).await;
+        assert!(!home.join(BUILD_STAGE_DIR).exists(), "the stage is gone");
+
+        let env = RubyEnv {
+            cwd: home.clone(),
+            rebuild: true,
+            offline: true,
+        };
+        assert_eq!(restore_original_build(&copy.gem_dir, &env).await, Ok(true));
+        assert_eq!(std::fs::read(ext.join("a/a.so")).unwrap(), b"original");
+        assert_eq!(
+            std::fs::read(copy.gem_dir.join("lib/a/a.so")).unwrap(),
+            b"original"
+        );
+    }
+
+    /// A stage an interrupted run left is only disk space: the next run of
+    /// the copy drops it. One a live run holds is left to that run.
+    #[cfg(unix)]
+    #[test]
+    fn a_stale_stage_is_swept_and_a_live_one_is_not() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let copy = installed_gem(&home, "lib");
+        let root = stage_root(&copy);
+        std::fs::create_dir_all(root.join("home/gems/a-1")).unwrap();
+        std::fs::write(root.join("home/gems/a-1/half"), b"x").unwrap();
+
+        // Left behind: recovery (the start of `apply` and `rollback`)
+        // removes it and the dir that held it.
+        assert!(!recover_interrupted_rebuild_sync(&copy, Some("lib")).unwrap());
+        assert!(!home.join(BUILD_STAGE_DIR).exists());
+
+        // Held by a run that is still building.
+        let stage = open_stage(&copy).unwrap();
+        let refused = sweep_stale_stage(&copy).unwrap_err();
+        assert_eq!(refused.kind(), std::io::ErrorKind::WouldBlock);
+        let why = open_stage(&copy).err().unwrap();
+        assert!(why.contains("right now"), "{why}");
+        assert!(stage.home.is_dir());
+        drop(stage);
+        // The holder gone: a sibling test forking right now keeps a copy
+        // of the descriptor, and the lock with it, until it execs.
+        loop {
+            match sweep_stale_stage(&copy) {
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                swept => break swept.unwrap(),
+            }
+        }
+        assert!(!root.exists());
+
+        // A link planted where the stage goes is not written through.
+        let elsewhere = tmp.path().join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, home.join(BUILD_STAGE_DIR)).unwrap();
+        let why = open_stage(&copy).err().unwrap();
+        assert!(why.contains("is not a directory"), "{why}");
+        assert_eq!(std::fs::read_dir(&elsewhere).unwrap().count(), 0);
     }
 }
