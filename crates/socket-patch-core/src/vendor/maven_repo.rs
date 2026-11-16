@@ -296,33 +296,50 @@ fn detect_shape(project_root: &Path) -> super::jvm::Shape {
     super::jvm::detect(&|rel: &str| reader.read(rel), &|dir: &str| reader.list(dir))
 }
 
-/// The skip of each of `purls` whose base version no module of the Maven
-/// build at `project_root` selects (the gate [`jvm_prelude`] runs,
-/// [`super::jvm::sbt_gate::MAVEN_NOT_SELECTED`]), for the refusals a run
-/// decides before it downloads anything. Empty for any other build.
+/// The skip of each of `candidates` (`(purl, uuid)`) whose base version no
+/// module of the Maven build at `project_root` selects (the gate
+/// [`jvm_prelude`] runs, [`super::jvm::sbt_gate::MAVEN_NOT_SELECTED`]),
+/// for the refusals a run decides before it downloads anything. A
+/// candidate an earlier run pinned is left to the backend, which takes the
+/// pin out ([`unpin_unselected`]). Empty for any other build.
 pub(super) fn maven_not_selected_refusals(
     project_root: &Path,
-    purls: &[String],
+    candidates: &[(String, String)],
 ) -> Vec<(String, (&'static str, String))> {
     use crate::crawlers::maven_selection::{not_selected_detail, MavenSelection, Standing};
     if detect_shape(project_root) != super::jvm::Shape::MavenReactor {
         return Vec::new();
     }
     let selection = MavenSelection::for_project(project_root);
-    purls
+    let reader = super::jvm::apply::ProjectReader::new(project_root);
+    candidates
         .iter()
-        .filter_map(|purl| {
+        .filter_map(|(purl, uuid)| {
             let (g, a, v) = parse_maven_purl(purl)?;
-            match selection.standing(&g, &a, &v) {
-                Standing::NotSelected(others) => Some((
+            let Standing::NotSelected(others) = selection.standing(&g, &a, &v) else {
+                return None;
+            };
+            let coords = super::jvm::Coords {
+                group_id: &g,
+                artifact_id: &a,
+                version: &v,
+                uuid,
+            };
+            let pinned = super::jvm::maven_reactor::unpin_plan(
+                &|rel| reader.read(rel),
+                &|dir| reader.list(dir),
+                &coords,
+            )
+            .is_some();
+            (!pinned).then(|| {
+                (
                     purl.clone(),
                     (
                         super::jvm::sbt_gate::MAVEN_NOT_SELECTED,
                         not_selected_detail(&g, &a, &v, &others),
                     ),
-                )),
-                _ => None,
-            }
+                )
+            })
         })
         .collect()
 }
@@ -628,7 +645,8 @@ pub async fn jvm_gate_preflight(
         return Err(("vendor_jvm_shape_unsupported", legacy_root_detail()));
     }
     let shape = detect_shape(project_root);
-    super::jvm::sbt_gate::for_shape(shape, project_root, &g, &a, &v, None)
+    let selection = maven_selection(shape, project_root, None).await;
+    super::jvm::sbt_gate::for_shape(shape, project_root, &g, &a, &v, selection)
         .map_err(|stop| stop.code_and_detail(purl))?;
     // Checked here too, so a hosted->vendored takeover keeps its pin
     // instead of restoring upstream and then refusing (#1061).
@@ -734,6 +752,82 @@ async fn jvm_committed_patch(
         .then_some((committed, extras))
 }
 
+/// What Maven selects in each module of a Maven root, read off the async
+/// runtime (the walk reads a pom per artifact of the build) over the local
+/// repository `repo`, or the one this process resolves against. `None` for
+/// any other shape.
+async fn maven_selection(
+    shape: super::jvm::Shape,
+    project_root: &Path,
+    repo: Option<&Path>,
+) -> Option<crate::crawlers::maven_selection::MavenSelection> {
+    use crate::crawlers::maven_selection::MavenSelection;
+    if !matches!(
+        shape,
+        super::jvm::Shape::MavenReactor | super::jvm::Shape::Mixed
+    ) {
+        return None;
+    }
+    let (root, repo) = (project_root.to_path_buf(), repo.map(Path::to_path_buf));
+    tokio::task::spawn_blocking(move || MavenSelection::for_project_in(&root, repo.as_deref()))
+        .await
+        .ok()
+}
+
+/// A patch the gate skipped because no module selects its base version
+/// may still be pinned by an earlier run (the build has moved on since: a
+/// dependency was added or upgraded). That pin keeps forcing the version
+/// Maven no longer selects, so it is taken out of the poms here and the
+/// skip says so; any other outcome is returned as it is.
+async fn unpin_unselected(
+    outcome: VendorOutcome,
+    purl: &str,
+    project_root: &Path,
+    record: &PatchRecord,
+    dry_run: bool,
+) -> VendorOutcome {
+    let VendorOutcome::Refused { code, detail } = outcome else {
+        return outcome;
+    };
+    let keep = |detail: String| VendorOutcome::Refused { code, detail };
+    if code != super::jvm::sbt_gate::MAVEN_NOT_SELECTED {
+        return keep(detail);
+    }
+    let Some((g, a, v)) = parse_maven_purl(purl) else {
+        return keep(detail);
+    };
+    let coords = super::jvm::Coords {
+        group_id: &g,
+        artifact_id: &a,
+        version: &v,
+        uuid: &record.uuid,
+    };
+    let reader = super::jvm::apply::ProjectReader::new(project_root);
+    let plan = super::jvm::maven_reactor::unpin_plan(
+        &|rel| reader.read(rel),
+        &|dir| reader.list(dir),
+        &coords,
+    );
+    let Some(plan) = plan.filter(|_| reader.escaped().is_none()) else {
+        return keep(detail);
+    };
+    let poms: Vec<&str> = plan.writes.iter().map(|w| w.rel.as_str()).collect();
+    let poms = poms.join(", ");
+    if dry_run {
+        return keep(format!(
+            "{detail}; the pin an earlier run wrote in {poms} still forces {v} and would be              removed"
+        ));
+    }
+    match super::jvm::apply::write_plan(project_root, &plan).await {
+        Ok(_) => keep(format!(
+            "{detail}; the pin an earlier run wrote in {poms} still forced {v} and was removed              (`socket-patch vendor --revert` or `scan --mode vendored --prune` drops the              vendored copy it pointed at)"
+        )),
+        Err(e) => keep(format!(
+            "{detail}; the pin an earlier run wrote in {poms} still forces {v} and could not be              removed ({e}): run `socket-patch vendor --revert`"
+        )),
+    }
+}
+
 /// The Maven-layout repository `installed_dir` is a version directory of
 /// (`<root>/<group path>/<artifact>/<version>`), when it is one: the local
 /// repository the installed copy of `purl` was found in, which holds the
@@ -798,13 +892,14 @@ async fn jvm_prelude(
         .await
         .map_err(|e| refused("vendor_state_unreadable", e.to_string()))?;
     // sbt / scala-cli pins are gated on the build's own resolution first.
+    let selection = maven_selection(shape, project_root, maven_repo).await;
     let gate_pass = super::jvm::sbt_gate::for_shape(
         shape,
         project_root,
         &group_id,
         &artifact_id,
         &version,
-        maven_repo,
+        selection,
     )
     .map_err(|stop| stop.into_outcome(purl))?;
     // The tree must survive the commit the vendored workflow ends with.
@@ -854,7 +949,9 @@ async fn vendor_maven_jvm(
     .await
     {
         Ok(prelude) => prelude,
-        Err(outcome) => return outcome,
+        Err(outcome) => {
+            return unpin_unselected(outcome, purl, project_root, record, dry_run).await
+        }
     };
     let state = Some(state);
     let gradle = matches!(shape, Shape::Gradle | Shape::Mixed);
@@ -2308,7 +2405,7 @@ mod tests {
         };
         let (dir, blobs, installed, record) = fixture(Some(&declaring("1.11.0")), true, true).await;
         let root = dir.path();
-        let refusals = maven_not_selected_refusals(root, &[PURL.to_string()]);
+        let refusals = maven_not_selected_refusals(root, &[(PURL.to_string(), UUID.to_string())]);
         let [(purl, (code, detail))] = refusals.as_slice() else {
             panic!("{refusals:?}");
         };
@@ -2333,7 +2430,9 @@ mod tests {
         );
 
         std::fs::write(root.join(PROJECT_POM), declaring("1.10.0")).unwrap();
-        assert!(maven_not_selected_refusals(root, &[PURL.to_string()]).is_empty());
+        assert!(
+            maven_not_selected_refusals(root, &[(PURL.to_string(), UUID.to_string())]).is_empty()
+        );
     }
 
     #[tokio::test]

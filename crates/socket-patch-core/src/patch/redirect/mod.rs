@@ -8910,6 +8910,16 @@ fn find_maven_dependency_matches(
         .collect()
 }
 
+/// Whether the root `pom.xml` among `files` heads a multi-module reactor
+/// (`<modules>` / `<subprojects>`, or Maven 4 subproject discovery), which
+/// the pom rewriter refuses whole: nothing it would ask about the build,
+/// such as what Maven selects, is needed then.
+pub fn maven_reactor_root(files: &BTreeMap<String, String>) -> bool {
+    let read = |rel: &str| files.get(rel).map(|t| t.as_bytes().to_vec());
+    let list = |dir: &str| gradle::key_list(files, dir);
+    crate::vendor::jvm::maven_reactor::is_reactor_root(&read, &list)
+}
+
 fn rewrite_maven_pom(
     files: &BTreeMap<String, String>,
     overrides: &[DepOverride],
@@ -8936,11 +8946,7 @@ fn rewrite_maven_pom(
     // vendored mode's reactor planner rewrites each module's declaration.
     // Maven 4 subprojects found by discovery count too (#1809): the engine
     // reads each direct subdirectory's `pom.xml` beside such a root.
-    if pom.is_some() && {
-        let read = |rel: &str| files.get(rel).map(|t| t.as_bytes().to_vec());
-        let list = |dir: &str| gradle::key_list(files, dir);
-        crate::vendor::jvm::maven_reactor::is_reactor_root(&read, &list)
-    } {
+    if pom.is_some() && maven_reactor_root(files) {
         let gas: Vec<String> = maven
             .iter()
             .map(|dep| match &dep.namespace {
@@ -11573,7 +11579,7 @@ mod tests {
     #[test]
     fn maven_undetermined_selection_pins_nothing_new() {
         let unread = Some(Err(
-            "the pom of ch.qos.logback:logback-classic:1.4.14 is not cached",
+            "the pom of ch.qos.logback:logback-classic:1.4.14 is not in the local Maven repository",
         ));
         let r = rewrite_pom_selecting(TRANSITIVE_ONLY_POM, unread);
         assert!(r.files.is_empty() && r.edits.is_empty(), "{:?}", r.files);
@@ -11583,7 +11589,7 @@ mod tests {
         );
         let detail = &r.warnings[0].detail;
         assert!(
-            detail.contains("logback-classic:1.4.14 is not cached")
+            detail.contains("logback-classic:1.4.14 is not in the local Maven repository")
                 && detail.contains("mvn -q dependency:resolve"),
             "{detail}"
         );

@@ -1314,24 +1314,22 @@ pub fn check_entry_in(
             attempts.push((as_committed, None));
         }
     }
-    // Likewise the pins: `vendor` writes one only where Maven selects the
-    // base version, as far as the local repository told it. What that
-    // repository says now, and the pins a run with no such answer writes,
-    // are both in sync.
-    let selection = matches!(shape, Shape::MavenReactor | Shape::Mixed).then(|| match local_repo {
-        Some(repo) => crate::crawlers::maven_selection::MavenSelection::of(root, repo),
-        None => crate::crawlers::maven_selection::MavenSelection::unavailable(
-            "no Maven local repository was read",
-        ),
+    // Where the pins are is not judged here. `vendor` places them when a
+    // patch is first wired, from what the local repository of that machine
+    // could tell it, and keeps them where they are afterwards: the
+    // committed poms are the record. Checking them against this machine's
+    // local repository would pass or fail the same checkout depending on
+    // what happens to be cached, so every pin (and every absence of one)
+    // is taken as it stands; a patch no pom wires at all still fails
+    // below.
+    let as_committed = matches!(shape, Shape::MavenReactor | Shape::Mixed).then(|| {
+        crate::crawlers::maven_selection::MavenSelection::unavailable(
+            "vendor --check does not judge where a pin belongs",
+        )
     });
-    let attempts: Vec<_> = [selection.as_ref(), None]
-        .into_iter()
-        .take(if selection.is_some() { 2 } else { 1 })
-        .flat_map(|selection| {
-            attempts
-                .iter()
-                .map(move |(patch, external)| (patch, *external, selection))
-        })
+    let attempts: Vec<_> = attempts
+        .iter()
+        .map(|(patch, external)| (patch, *external, as_committed.as_ref()))
         .collect();
     let mut drift: Option<String> = None;
     let mut in_sync: Option<super::JvmPlan> = None;

@@ -903,8 +903,11 @@ Honest limits of the Maven and NuGet flows — documented behavior, not bugs:
   the project was never resolved, so the local repository lacks its poms), a
   declaration that already names the base version is still rewritten where it stands,
   and no new pin is written (`redirect_maven_selection_undetermined`, vendored
-  `vendor_maven_selection_undetermined`): run `mvn -q dependency:resolve` once and scan
-  again. Agent mode patches a cached jar in place under its own coordinates, which
+  `vendor_maven_selection_undetermined`): the line names the remedy, `mvn -q
+  dependency:resolve` and a re-scan when a pom is missing from the local repository,
+  else a declaration of the artifact at the patched version. Vendored pins are placed
+  when a patch is first wired and stay where they are on every machine afterwards; a
+  pin for a version the build no longer selects is removed on the next run. Agent mode patches a cached jar in place under its own coordinates, which
   cannot change what a build resolves; a version Maven only read the pom of has no jar
   to patch and is left out of an agent scan. Maven 4 builds, profiles that declare
   dependencies or management, relocations and dependency cycles are not modelled: the

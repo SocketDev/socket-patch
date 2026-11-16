@@ -163,8 +163,18 @@ the local repository lacks, a profile that may change the graph, a Maven 4
 build), it gets no new pin and an existing one is left alone
 (`selection_undetermined`); a declaration that names the base version is
 rewritten either way, since that replaces a version where it stands.
-`vendor --check` accepts the pins either answer writes. The fallback
-repository stays in each local root, whichever pom holds the pin.
+The fallback repository stays in each local root, whichever pom holds the
+pin.
+
+Where the pins go is decided when a patch is first wired, and the committed
+poms are the record: a later run over poms that already wire the patch keeps
+every pin where it is and adds none, whatever that machine's local repository
+holds, so a checkout plans the same everywhere and a re-run is a no-op.
+`vendor --check` does not judge where a pin belongs. A pin of a superseded
+patch still moves to the new suffix in place, and a pin that is certain to
+move a module is taken out: when the build no longer selects a pinned version
+at all, the run removes the pin and says so in its
+`vendor_maven_version_not_selected` skip.
 
 Maven 3.9.2+ can read the repository tail without copying jars into `~/.m2` and
 without routing through mirrors. Older Maven versions use the fallback file

@@ -167,6 +167,11 @@ impl<'w> Walk<'w> {
         }
     }
 
+    /// Every pom path this walk looked at, found or not.
+    pub(super) fn looked_at(&self) -> impl Iterator<Item = &PathBuf> {
+        self.models.keys()
+    }
+
     pub(super) fn repo_pom(&self, (g, a, v): &Gav) -> Option<PathBuf> {
         let safe = |s: &str| {
             !s.is_empty()

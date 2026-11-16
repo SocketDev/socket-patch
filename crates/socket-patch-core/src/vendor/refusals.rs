@@ -180,10 +180,10 @@ async fn maven_refusals(
     project_root: &Path,
     candidates: &[(&str, &str)],
 ) -> Vec<(String, (&'static str, String))> {
-    let maven: Vec<String> = candidates
+    let maven: Vec<(String, String)> = candidates
         .iter()
-        .map(|(purl, _)| purl.to_string())
-        .filter(|purl| Ecosystem::from_purl(purl) == Some(Ecosystem::Maven))
+        .filter(|(purl, _)| Ecosystem::from_purl(purl) == Some(Ecosystem::Maven))
+        .map(|(purl, uuid)| (purl.to_string(), uuid.to_string()))
         .collect();
     if maven.is_empty() {
         return Vec::new();

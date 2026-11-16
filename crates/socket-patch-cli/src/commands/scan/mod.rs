@@ -2461,14 +2461,8 @@ async fn scan_project(
     // and it must not end the run as a targeted patch that matched no
     // installed package.
     if apply {
-        filtered_crawled.retain(|package| {
-            Ecosystem::from_purl(&package.purl) != Some(Ecosystem::Maven)
-                || !socket_patch_core::crawlers::maven_crawler::pom_only_version_dir(
-                    &package.path,
-                    &package.name,
-                    &package.version,
-                )
-        });
+        filtered_crawled =
+            socket_patch_core::crawlers::MavenCrawler::with_an_artifact(filtered_crawled).await;
     }
 
     // Gradle discovery notes (m2 gating, the user home) ride the run-level

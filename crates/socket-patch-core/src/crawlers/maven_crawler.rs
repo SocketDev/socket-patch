@@ -848,14 +848,32 @@ fn coursier_spelled(path: &Path) -> bool {
 /// for the versions it picks, and an evicted version's pom-only directory
 /// is no installed copy (Ivy's crawler likewise requires the jar).
 fn holds_artifact(dir: &Path) -> bool {
+    // What a cache keeps beside an artifact: poms and Gradle modules,
+    // their checksum and signature sidecars, the resolver's own
+    // bookkeeping (`_remote.repositories`, `resolver-status.properties`,
+    // `maven-metadata-*.xml`), and the marks of a failed or unfinished
+    // download.
     const NOT_ARTIFACTS: &[&str] = &[
-        ".pom", ".module", ".sha1", ".md5", ".sha256", ".sha512", ".asc", ".json",
+        ".pom",
+        ".module",
+        ".sha1",
+        ".md5",
+        ".sha256",
+        ".sha512",
+        ".asc",
+        ".json",
+        ".lastUpdated",
+        ".part",
+        ".lock",
+        ".repositories",
+        ".properties",
     ];
     std::fs::read_dir(dir).is_ok_and(|entries| {
         entries.flatten().any(|e| {
             let name = e.file_name();
             let name = name.to_string_lossy();
             !name.starts_with('.')
+                && !name.starts_with("maven-metadata")
                 && !NOT_ARTIFACTS.iter().any(|ext| name.ends_with(ext))
                 && e.file_type().is_ok_and(|t| t.is_file())
         })
@@ -868,36 +886,7 @@ fn holds_artifact(dir: &Path) -> bool {
 /// parent and BOM) and never downloaded a jar, so there is no installed
 /// copy to patch in place.
 pub fn pom_only_version_dir(dir: &Path, artifact: &str, version: &str) -> bool {
-    // What Maven keeps beside an artifact: poms and Gradle modules, their
-    // checksum and signature sidecars, its own bookkeeping, and the marks
-    // of a failed or unfinished download.
-    const NOT_ARTIFACTS: &[&str] = &[
-        ".pom",
-        ".module",
-        ".sha1",
-        ".md5",
-        ".sha256",
-        ".sha512",
-        ".asc",
-        ".lastUpdated",
-        ".part",
-        ".lock",
-        ".repositories",
-        ".properties",
-    ];
-    if !dir.join(format!("{artifact}-{version}.pom")).is_file() {
-        return false;
-    }
-    !std::fs::read_dir(dir).is_ok_and(|entries| {
-        entries.flatten().any(|e| {
-            let name = e.file_name();
-            let name = name.to_string_lossy();
-            !name.starts_with('.')
-                && !name.starts_with("maven-metadata")
-                && !NOT_ARTIFACTS.iter().any(|ext| name.ends_with(ext))
-                && e.file_type().is_ok_and(|t| t.is_file())
-        })
-    })
+    dir.join(format!("{artifact}-{version}.pom")).is_file() && !holds_artifact(dir)
 }
 
 /// Maven/Java ecosystem crawler for discovering packages in the JVM
@@ -1165,6 +1154,26 @@ impl MavenCrawler {
         }
 
         packages
+    }
+
+    /// `packages` less the Maven ones whose version directory holds a pom
+    /// and no artifact ([`pom_only_version_dir`]), for a crawl whose
+    /// packages are patched where they lie (agent mode): there is no jar
+    /// to patch, and such a package must not end the run as a targeted
+    /// patch that matched no installed copy. Hosted and vendored mode keep
+    /// them: a pin needs the pom, not the jar.
+    pub async fn with_an_artifact(packages: Vec<CrawledPackage>) -> Vec<CrawledPackage> {
+        run_walk(move || {
+            packages
+                .into_iter()
+                .filter(|p| {
+                    !(super::types::Ecosystem::from_purl(&p.purl)
+                        == Some(super::types::Ecosystem::Maven)
+                        && pom_only_version_dir(&p.path, &p.name, &p.version))
+                })
+                .collect()
+        })
+        .await
     }
 
     /// Find specific packages by PURL inside a single Maven repository path.

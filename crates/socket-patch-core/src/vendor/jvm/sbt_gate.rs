@@ -139,17 +139,16 @@ pub(crate) struct ShapePass {
 
 /// The gate of a project of `shape`: [`check`] for sbt,
 /// [`super::coursier_gate::check`] for scala-cli, and for a Maven root what
-/// Maven selects in each module ([`MavenSelection`], read over the local
-/// repository `maven_repo`, or the one this process resolves against): a
-/// patch whose base version no module selects is skipped
-/// ([`MAVEN_NOT_SELECTED`]).
+/// Maven selects in each module (`selection`, which an async caller reads off
+/// the runtime; else read here): a patch whose base version no module
+/// selects is skipped ([`MAVEN_NOT_SELECTED`]).
 pub(crate) fn for_shape(
     shape: Shape,
     project_root: &Path,
     g: &str,
     a: &str,
     base: &str,
-    maven_repo: Option<&Path>,
+    selection: Option<MavenSelection>,
 ) -> Result<ShapePass, GateStop> {
     let mut maven = None;
     let pass = match shape {
@@ -159,10 +158,7 @@ pub(crate) fn for_shape(
             deps_digest: None,
         },
         Shape::MavenReactor | Shape::Mixed => {
-            let selection = match maven_repo {
-                Some(repo) => MavenSelection::of(project_root, repo),
-                None => MavenSelection::for_project(project_root),
-            };
+            let selection = selection.unwrap_or_else(|| MavenSelection::for_project(project_root));
             // A mixed root's Gradle half may still resolve the base
             // version: only the planner's pins follow the selection there.
             if shape == Shape::MavenReactor {
@@ -190,9 +186,10 @@ pub(crate) fn for_shape(
 }
 
 /// The skip of a Maven patch whose `plan` wired nothing only because
-/// `selection` could not tell what the build selects. `None` when it
-/// could, or when the plan passed a declaration over for a reason of its
-/// own: the plan's refusal then stands.
+/// `selection` could not tell what some module selects (the pom that
+/// would take the pin is then held, whatever the other modules select).
+/// `None` when the plan passed a declaration over for a reason of its own:
+/// the plan's refusal then stands.
 pub(crate) fn maven_undetermined(
     selection: Option<&MavenSelection>,
     plan: &super::JvmPlan,
@@ -203,13 +200,11 @@ pub(crate) fn maven_undetermined(
     if !super::maven_reactor::unwired_by_selection_alone(plan) {
         return None;
     }
-    match selection?.standing(g, a, base) {
-        Standing::Undetermined(why) => Some(refused(
-            MAVEN_UNDETERMINED,
-            undetermined_detail(g, a, base, &why),
-        )),
-        _ => None,
-    }
+    let (module, why) = selection?.undetermined_in(g, a, base)?;
+    Some(refused(
+        MAVEN_UNDETERMINED,
+        undetermined_detail(g, a, base, &format!("{module}: {why}")),
+    ))
 }
 
 /// Gate vendoring `g:a` at upstream `base` into the sbt build at
