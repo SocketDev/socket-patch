@@ -1987,42 +1987,64 @@ mode warns `redirect_gem_version_not_locked`, vendored mode reports a `skipped` 
 
 ## Ruby gems: native extensions
 
-Some gem fixes change only a C extension's sources (`ext/**/*.c`, `*.h`, `extconf.rb`). Ruby
-never loads those sources: it loads the shared object RubyGems compiled when it installed the
-gem. How each mode gets the patched code running:
+Some gem fixes change only what a native extension is built from: its C sources
+(`ext/**/*.c`, `*.h`, `extconf.rb`), or the files its build script reads (nokogiri builds its
+vendored libxml2 from `patches/libxml2/*.patch`). Ruby never loads those files. It loads the
+shared object RubyGems compiled when it installed the gem, or, for a precompiled platform gem
+(`nokogiri-1.18.3-x86_64-linux-gnu`, the default install of nokogiri), the binary the gem ships.
+How each mode gets the patched code running:
 
 | Mode | What happens |
 |---|---|
 | Hosted | Bundler installs the patched `.gem` from the patch registry, and RubyGems compiles it like any registry gem. A precompiled platform gem (`x86_64-linux`) is refused with `redirect_gem_platform_unsupported`. |
 | Vendored | Refused with `native_extensions_unsupported`: Bundler builds no extensions for path-sourced gems. |
-| Agent (`apply`) | The patched sources are written, then the extension is rebuilt in place with RubyGems' builder, the step `gem pristine --extensions` runs, against the Ruby that owns the install. |
+| Agent (`apply`) | The extension is rebuilt from the gem's source archive with the patch laid over it, using RubyGems' builder and the Ruby that owns the install, and the build is put where Ruby loads it: the extension directory of a gem RubyGems built, the prebuilt binary of a precompiled gem. |
+
+`apply` takes the source gem (`<name>-<version>.gem`) from the gem home's `cache/` directory,
+where RubyGems and Bundler keep it for a gem they built. For a precompiled gem, or a pruned cache,
+it downloads the archive from the gem's source (the lock's `remote:`, else rubygems.org) and
+checks it against the lock's `CHECKSUMS` or the source's index. With `--offline` and no cached
+archive, a gem RubyGems built is rebuilt from its installed tree instead, and a precompiled gem is
+refused with `native_extensions_unsupported`: run `apply` once with network access, or put the
+source gem in that `cache/` directory. The JRuby (`-java`) build of a gem ships jars and is always
+refused for such a patch.
+
+The build happens in a stage directory inside the gem home (`.socket-patch-build/`), which is
+removed afterwards. A gem the build needs that the install lacks (a precompiled nokogiri has no
+`mini_portile2`) is installed into that stage, never into your gem home. The installed gem is not
+touched until the build has finished.
 
 An agent-mode rebuild needs a compiler toolchain and the Ruby headers (`ruby-dev` /
 `ruby-devel` on Linux distributions, the Xcode command line tools on macOS), the same
-requirements as `gem install` for that gem. When the build fails, `apply` puts the original
-sources and build back and fails that package with `native_extension_build_failed`, showing the
-tail of the build output. When it can't rebuild at all (a precompiled platform gem, a Bundler git
-checkout, or no matching Ruby), nothing is written and the package fails with
-`native_extensions_unsupported`. Use hosted mode for those.
+requirements as `gem install` for the ruby-platform gem. It takes as long as that install: about
+a minute for nokogiri. When the build fails, the installed gem is left as it was and the package
+fails with `native_extension_build_failed`, showing the tail of the build output. When it can't
+rebuild at all (a Bundler git checkout, no matching Ruby, no source gem for a precompiled gem),
+nothing is written and the package fails with `native_extensions_unsupported`.
 
 The rebuild runs the gem's own build scripts (`extconf.rb`, `make`), as `gem install` did, and
-only after the patch's files verified against the installed gem. Nothing of the gem is run
-before that: `apply --dry-run` starts no Ruby and reports that a rebuild is pending. Ruby and the
-build run without the Socket token in their environment.
+only after the patch's files verified against the installed gem and against the source gem.
+Nothing of the gem is run before that: `apply --dry-run` starts no Ruby, downloads nothing, and
+reports that a rebuild is pending. Ruby and the build run without the Socket token in their
+environment.
 
 A tool that compiles the extension itself after `apply` (as the patches evaluation harness does)
 passes `--no-gem-native-rebuild` (or `SOCKET_NO_GEM_NATIVE_REBUILD=1`): the sources are written
 without a rebuild, with a `native_extension_not_rebuilt` warning, and `vex` does not attest them.
 
-`apply` keeps the install-time build in `.socket-patch-native-orig/` inside the gem directory, so
-`rollback` restores it without recompiling, and records what it built in
+`apply` keeps the original compiled code in `.socket-patch-native-orig/` inside the gem
+directory (the install-time build, or a precompiled gem's prebuilt binary), so `rollback`
+restores it byte for byte without recompiling, and records what it built in
 `.socket-patch-native-build.json`. `vex` attests the patch only while that record matches the
-installed extension: after `gem pristine` or a reinstall, run `apply` again.
+installed binary: after `gem pristine`, a reinstall, or a switch to another Ruby minor version,
+run `apply` again.
 
-Interrupting `apply` during a rebuild (Ctrl-C, a cancelled CI job) stops the build with it. The
-gem is then left with its patched sources and no finished extension until Socket Patch runs
-again: `apply` puts the previous build back and completes the rebuild, and `rollback` restores the
-original sources and build.
+Interrupting `apply` during a rebuild (Ctrl-C, a cancelled CI job) stops the build with it. A
+build from the source gem had not touched the installed gem yet, so the gem is as it was; the
+stage directory it leaves is removed by the next `apply` or `rollback`. A rebuild from the
+installed tree leaves the gem with its patched sources and no finished extension until Socket
+Patch runs again: `apply` puts the previous build back and completes the rebuild, and `rollback`
+restores the original sources and build.
 
 ## Supported platforms
 

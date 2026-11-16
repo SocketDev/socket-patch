@@ -3624,8 +3624,9 @@ pub(crate) async fn rollback_patches_inner(
                 None => {
                     use socket_patch_core::patch::gem_ext;
                     let is_gem = Ecosystem::from_purl(purl) == Some(Ecosystem::Gem);
-                    // A build input `apply` added to a precompiled gem copy
-                    // that never shipped it is removed, not restored.
+                    // A build input `apply` added to a gem copy that did not
+                    // hold it (a precompiled gem never shipped it; a build
+                    // removed it) is removed, not restored.
                     let gem_files = if is_gem {
                         Some(gem_ext::rollback_files(pkg_path, &patch.files).await)
                     } else {
