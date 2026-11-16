@@ -58,7 +58,8 @@ const MAX_METADATA_BYTES: u64 = 16 * 1024 * 1024;
 pub enum Source<'a> {
     /// The patch server's serve routes.
     PatchServer(&'a crate::api::client::ApiClient),
-    /// A public gem registry.
+    /// A public gem registry, reached over `https` (or on this machine):
+    /// [`crate::vendor::registry_fetch::SecureRegistryClient`].
     Registry,
     /// `--offline`: only what is already on disk.
     DiskOnly,
@@ -156,9 +157,11 @@ async fn obtain(wanted: &Wanted, source: &Source<'_>) -> Result<Vec<u8>, String>
                 .download_artifact(url)
                 .await
                 .map_err(|e| crate::utils::redact::redact_urls_in(&e.to_string()).into_owned()),
+            // The gem is installed, and built when it has a native
+            // extension: over https, or from this machine, and nothing else.
             Source::Registry => {
-                let client = crate::vendor::registry_fetch::build_registry_client();
-                crate::vendor::registry_fetch::download(&client, url).await
+                let registry = crate::vendor::registry_fetch::SecureRegistryClient::new();
+                registry.download(url).await
             }
         };
         match fetched {

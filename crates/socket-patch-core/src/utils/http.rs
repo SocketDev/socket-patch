@@ -240,9 +240,191 @@ pub(crate) async fn read_capped_typed(
     Ok(bytes)
 }
 
+/// Why `url` must not be asked for bytes that are built or installed as
+/// fetched, or for the checksum such bytes are verified against: `None`
+/// for an `https` URL, and for a plain `http` one whose host is this
+/// machine (`localhost`, a loopback address), which a local mirror and the
+/// hermetic tests use. Over any other `http` URL whoever sits on the
+/// network path chooses the archive and the checksum served beside it, so
+/// verifying one against the other proves nothing. The reason quotes the
+/// URL redacted.
+pub(crate) fn insecure_transport(url: &str) -> Option<String> {
+    let url = url.trim();
+    let secure =
+        reqwest::Url::parse(url).is_ok_and(|url| url.scheme() == "https" || is_loopback_http(&url));
+    (!secure).then(|| {
+        format!(
+            "`{}` is not an https URL (plain http is accepted for a loopback host only)",
+            crate::utils::redact::redact_urls_in(url)
+        )
+    })
+}
+
+/// Whether `url` is plain `http` to this machine: `localhost`, or an IP
+/// address in a loopback range (`127.0.0.1`, `::1`).
+fn is_loopback_http(url: &reqwest::Url) -> bool {
+    let Some(host) = url.host_str().filter(|_| url.scheme() == "http") else {
+        return false;
+    };
+    // An IPv6 host is spelled in brackets.
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
+/// The redirects a client follows when the bytes it fetches are built or
+/// installed ([`insecure_transport`]): at most ten, and none that leaves
+/// `https` for `http` or leads to an `http` host other than this machine
+/// ([`redirect_refusal`]). reqwest's default policy follows a redirect
+/// from `https` to `http`.
+pub(crate) fn no_downgrade_redirects() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(|attempt| {
+        if attempt.previous().len() >= 10 {
+            return attempt.error("too many redirects");
+        }
+        let refusal = attempt
+            .previous()
+            .last()
+            .and_then(|from| redirect_refusal(from, attempt.url()));
+        match refusal {
+            Some(why) => attempt.error(why),
+            None => attempt.follow(),
+        }
+    })
+}
+
+/// Why a redirect from `from` to `to` is not followed
+/// ([`no_downgrade_redirects`]). Followed: any redirect to `https`, and one
+/// between plain `http` URLs of this machine. Refused: every redirect that
+/// leaves `https` (to a loopback host too: the registry does not get to
+/// point the download at a local port), and every one to an `http` host
+/// that is not this machine.
+fn redirect_refusal(from: &reqwest::Url, to: &reqwest::Url) -> Option<String> {
+    let followed = to.scheme() == "https" || (from.scheme() != "https" && is_loopback_http(to));
+    (!followed).then(|| {
+        format!(
+            "refusing a redirect from {} to {}, which is not an https URL",
+            crate::utils::redact::redact_urls_in(from.as_str()),
+            crate::utils::redact::redact_urls_in(to.as_str())
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Bytes that are built or installed come over https, or from this
+    /// machine: every other URL is refused, with its credentials redacted.
+    #[test]
+    fn only_https_and_loopback_http_carry_bytes_to_build() {
+        for url in [
+            "https://rubygems.org",
+            "https://gems.example.test/mirror/",
+            "HTTPS://RubyGems.org",
+            "http://127.0.0.1:9292",
+            "http://127.0.0.1",
+            "http://127.8.9.10:80/gems",
+            "http://localhost:8080/upstream",
+            "http://LOCALHOST",
+            "http://[::1]:3000",
+            " http://127.0.0.1:1 ",
+        ] {
+            assert_eq!(insecure_transport(url), None, "{url}");
+        }
+        for url in [
+            "http://rubygems.org",
+            "http://gems.example.test:8080/mirror",
+            "http://10.0.0.5",
+            "http://192.168.1.2:9292",
+            "http://0.0.0.0:9292",
+            "http://localhost.example.test",
+            "http://127.0.0.1.example.test",
+            "http://notlocalhost",
+            "http://[::ffff:127.0.0.1]",
+            "http://[fe80::1]",
+            "ftp://127.0.0.1/gems",
+            "file:///tmp/gems",
+            "rubygems.org",
+            "//rubygems.org",
+            "",
+        ] {
+            let why = insecure_transport(url).unwrap_or_else(|| panic!("{url:?} was accepted"));
+            assert!(why.contains("is not an https URL"), "{why}");
+        }
+        let why = insecure_transport("http://user:hunter2@gems.example.test/x").unwrap();
+        assert!(why.contains("gems.example.test"), "{why}");
+        assert!(!why.contains("hunter2"), "{why}");
+    }
+
+    /// No redirect leaves https, and none leads to an http host that is not
+    /// this machine.
+    #[test]
+    fn a_redirect_never_downgrades_the_transport() {
+        let url = |text: &str| reqwest::Url::parse(text).unwrap();
+        for (from, to) in [
+            (
+                "https://rubygems.org/gems/a-1.gem",
+                "https://cdn.example.test/a-1.gem",
+            ),
+            (
+                "http://127.0.0.1:9292/gems/a-1.gem",
+                "https://rubygems.org/gems/a-1.gem",
+            ),
+            (
+                "http://127.0.0.1:9292/gems/a-1.gem",
+                "http://127.0.0.1:9293/a-1.gem",
+            ),
+            (
+                "http://localhost:9292/gems/a-1.gem",
+                "http://[::1]:9293/a-1.gem",
+            ),
+        ] {
+            assert_eq!(
+                redirect_refusal(&url(from), &url(to)),
+                None,
+                "{from} -> {to}"
+            );
+        }
+        for (from, to) in [
+            (
+                "https://rubygems.org/gems/a-1.gem",
+                "http://rubygems.org/gems/a-1.gem",
+            ),
+            (
+                "https://rubygems.org/gems/a-1.gem",
+                "http://cdn.example.test/a-1.gem",
+            ),
+            (
+                "https://rubygems.org/gems/a-1.gem",
+                "http://127.0.0.1:9292/a-1.gem",
+            ),
+            (
+                "https://rubygems.org/gems/a-1.gem",
+                "http://localhost/a-1.gem",
+            ),
+            (
+                "http://127.0.0.1:9292/gems/a-1.gem",
+                "http://cdn.example.test/a-1.gem",
+            ),
+            (
+                "http://127.0.0.1:9292/gems/a-1.gem",
+                "ftp://127.0.0.1/a-1.gem",
+            ),
+        ] {
+            let why = redirect_refusal(&url(from), &url(to))
+                .unwrap_or_else(|| panic!("{from} -> {to} was followed"));
+            assert!(why.contains("refusing a redirect"), "{why}");
+        }
+        let why = redirect_refusal(
+            &url("https://rubygems.org/gems/a-1.gem"),
+            &url("http://user:hunter2@cdn.example.test/a-1.gem"),
+        )
+        .unwrap();
+        assert!(!why.contains("hunter2"), "{why}");
+    }
 
     /// Serve one raw HTTP/1.1 response on loopback and return a response
     /// whose body is still unread.

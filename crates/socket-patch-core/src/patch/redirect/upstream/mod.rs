@@ -45,8 +45,12 @@ mod sbt;
 mod uv;
 mod vlt;
 
+#[cfg(test)]
+pub(crate) use client::secure_gem_registry;
 pub(crate) use client::UpstreamClient;
-pub(crate) use client::{compact_index_checksum, is_rubygems_remote, rubygems_base};
+pub(crate) use client::{
+    compact_index_checksum, is_rubygems_remote, rubygems_base, rubygems_secure_base,
+};
 pub(crate) use uv::{
     declared_lock_specifier, lock_cutoff, pylock_no_binary, respell_lock_specifier,
     root_uv_settings, LockRequirementArray,

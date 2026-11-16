@@ -1699,6 +1699,41 @@ fn a_precompiled_copy_without_its_source_gem_is_refused() {
     assert_eq!(ruby.calls(), ["extensions_dir"]);
     assert_tree(&proj.join("vendor"), &tree_before, "");
 
+    // Online, with a registry reached over plain http that is not this
+    // machine: whoever sits on the path would choose the archive and the
+    // checksum it is verified against, and the archive's build scripts
+    // would run. It is not asked, in a dry run either, and the refusal
+    // says to use https.
+    let ruby = FakeRuby::new();
+    for args in [&["apply", "--json"][..], &["apply", "--json", "--dry-run"]] {
+        let (code, stdout, stderr) = ruby.run(
+            &proj,
+            args,
+            &[("SOCKET_RUBYGEMS_URL", "http://gems.example.test/mirror")],
+        );
+        assert_eq!(code, 1, "{args:?}: {stdout}\n{stderr}");
+        let env = parse_json_envelope(&stdout);
+        let error = common::envelope::event_for(&env, PURL)["error"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            error.starts_with("native_extensions_unsupported:"),
+            "{args:?}: {stdout}"
+        );
+        for needle in [
+            "sp_native-1.0.0.gem",
+            "SOCKET_RUBYGEMS_URL",
+            "`http://gems.example.test/mirror` is not an https URL",
+            "set it to an https URL",
+            "nothing was written",
+        ] {
+            assert!(error.contains(needle), "{args:?}: no {needle:?} in {error}");
+        }
+        assert_eq!(ruby.calls(), Vec::<String>::new(), "{args:?}: Ruby ran");
+        assert_tree(&proj.join("vendor"), &tree_before, &format!("{args:?}"));
+    }
+
     // Online, for a gem the lock resolves from another source: the
     // registry's gem of that name is not this gem, and the lock's remote
     // is not a place the run downloads from. Nothing is asked of anyone.
@@ -1857,7 +1892,8 @@ fn a_failed_staged_build_changes_nothing() {
 /// rebuild it had before there was a stage: from its own tree, in place.
 /// The cached archive not being its own source (a patched archive a hosted
 /// install left there), a record that does not apply to it, a stage that
-/// cannot be opened, a build that fails in the stage.
+/// cannot be opened, a build that fails in the stage, no cached archive
+/// and a registry that is not asked because it is reached over plain http.
 #[cfg(unix)]
 #[test]
 fn a_built_gem_falls_back_to_its_own_tree() {
@@ -1866,6 +1902,7 @@ fn a_built_gem_falls_back_to_its_own_tree() {
         "record does not apply",
         "no stage",
         "staged build fails",
+        "registry over plain http",
     ] {
         let (_tmp, proj, gem_dir) = fake_native_gem(true);
         let home = proj.join("vendor/bundle/ruby/3.4.0");
@@ -1895,6 +1932,10 @@ fn a_built_gem_falls_back_to_its_own_tree() {
                 std::fs::write(home.join(".socket-patch-build"), b"").unwrap();
                 staged_steps.clear();
             }
+            "registry over plain http" => {
+                std::fs::remove_file(home.join("cache/sp_native-1.0.0.gem")).unwrap();
+                staged_steps.clear();
+            }
             _ => {
                 ruby.fail_staged_builds();
                 staged_steps.extend(["missing_deps", "stage_build"]);
@@ -1902,7 +1943,17 @@ fn a_built_gem_falls_back_to_its_own_tree() {
         }
         write_record(&proj.join(".socket"), PURL, &record);
 
-        let (code, stdout, stderr) = ruby.run(&proj, &["apply", "--json", "--offline"], &[]);
+        // Online for the registry case: nothing is asked of a registry
+        // that is neither https nor this machine.
+        let (args, env): (&[&str], &[(&str, &str)]) = if case == "registry over plain http" {
+            (
+                &["apply", "--json"],
+                &[("SOCKET_RUBYGEMS_URL", "http://gems.example.test/mirror")],
+            )
+        } else {
+            (&["apply", "--json", "--offline"], &[])
+        };
+        let (code, stdout, stderr) = ruby.run(&proj, args, env);
         if case == "record does not apply" {
             // The record changes a file the copy does not hold: only the
             // source gem could have vouched for it, so there is nothing to

@@ -968,6 +968,37 @@ async fn download_unredacted(client: &reqwest::Client, url: &str) -> Result<Vec<
         .map_err(|e| format!("{url}: {e}"))
 }
 
+/// The registry client for bytes that socket-patch itself builds or
+/// installs as fetched (a gem whose `extconf.rb` is about to run), and for
+/// the checksum such bytes are verified against. A checksum read from the
+/// registry that serves the archive vouches for it only when nobody on the
+/// network path can rewrite both, so this client talks `https`, or plain
+/// `http` to this machine (a local mirror, the hermetic tests), and nothing
+/// else: a URL that is neither is refused before any request
+/// ([`crate::utils::http::insecure_transport`]), and so is a redirect that
+/// would leave `https` or lead to another `http` host
+/// ([`crate::utils::http::no_downgrade_redirects`]).
+pub(crate) struct SecureRegistryClient(RegistryClient);
+
+impl SecureRegistryClient {
+    pub(crate) fn new() -> Self {
+        SecureRegistryClient(
+            registry_client_builder(USER_AGENT)
+                .redirect(crate::utils::http::no_downgrade_redirects())
+                .build()
+                .expect("failed to build registry HTTP client"),
+        )
+    }
+
+    /// [`download`] of `url`, over a transport nobody can rewrite.
+    pub(crate) async fn download(&self, url: &str) -> Result<Vec<u8>, String> {
+        if let Some(why) = crate::utils::http::insecure_transport(url) {
+            return Err(format!("no request is made: {why}"));
+        }
+        download(&self.0, url).await
+    }
+}
+
 /// Verify archive bytes against lock-recorded integrity. Berry cache checksums
 /// require server metadata because they identify a different archive format.
 pub fn artifact_matches_integrity(
@@ -2562,6 +2593,84 @@ mod tests {
         let wrong = b64.encode(Sha256::digest(b"other"));
         let err = verify_sri(bytes, &format!("sha256-{wrong}")).unwrap_err();
         assert!(err.contains("sha256"), "{err}");
+    }
+
+    /// The client for bytes that are built or installed makes no request to
+    /// a plain-http host that is not this machine, and follows no redirect
+    /// to one. A loopback registry (a local mirror, the hermetic tests) is
+    /// served, redirects between its own URLs included.
+    #[tokio::test]
+    async fn the_secure_client_talks_https_or_loopback_only() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        let serve = |from: &'static str, response: ResponseTemplate| {
+            Mock::given(method("GET"))
+                .and(path(from))
+                .respond_with(response)
+                .mount(&server)
+        };
+        serve(
+            "/gems/a-1.gem",
+            ResponseTemplate::new(200).set_body_bytes(b"the gem".to_vec()),
+        )
+        .await;
+        serve(
+            "/moved/a-1.gem",
+            ResponseTemplate::new(302).insert_header("location", "/gems/a-1.gem"),
+        )
+        .await;
+        // To a host that does not exist: following it would fail on the
+        // name lookup, not on the policy.
+        serve(
+            "/away/a-1.gem",
+            ResponseTemplate::new(302)
+                .insert_header("location", "http://gems.example.test/gems/a-1.gem"),
+        )
+        .await;
+        let client = SecureRegistryClient::new();
+        let base = server.uri();
+        assert!(base.starts_with("http://127.0.0.1:"), "{base}");
+
+        for served in ["/gems/a-1.gem", "/moved/a-1.gem"] {
+            assert_eq!(
+                client.download(&format!("{base}{served}")).await.unwrap(),
+                b"the gem",
+                "{served}"
+            );
+        }
+        let why = client
+            .download(&format!("{base}/away/a-1.gem"))
+            .await
+            .unwrap_err();
+        assert!(
+            why.contains("refusing a redirect") && why.contains("gems.example.test"),
+            "{why}"
+        );
+        // The plain client follows it (and fails on the name).
+        let followed = download(&build_registry_client(), &format!("{base}/away/a-1.gem"))
+            .await
+            .unwrap_err();
+        assert!(!followed.contains("refusing a redirect"), "{followed}");
+
+        // Refused before any request: nothing listens at these.
+        let asked_before = server.received_requests().await.unwrap().len();
+        for url in [
+            "http://gems.example.test/gems/a-1.gem",
+            "http://user:hunter2@10.0.0.5/gems/a-1.gem",
+            "ftp://127.0.0.1/gems/a-1.gem",
+        ] {
+            let why = client.download(url).await.unwrap_err();
+            assert!(
+                why.contains("no request is made") && why.contains("is not an https URL"),
+                "{why}"
+            );
+            assert!(!why.contains("hunter2"), "{why}");
+        }
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            asked_before
+        );
     }
 
     /// Every `download` error quotes its URL redacted: a refused scheme, an

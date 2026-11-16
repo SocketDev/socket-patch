@@ -18,6 +18,14 @@
 //!    their sha256 is the one that registry's compact index
 //!    (`info/<name>`) records. `--offline` skips this step.
 //!
+//! The index vouches for the archive only when nobody on the network path
+//! can rewrite both, and the archive's build scripts are about to run: the
+//! registry is asked over `https`, or over plain `http` on this machine (a
+//! local mirror, the hermetic tests), and over nothing else. A
+//! `SOCKET_RUBYGEMS_URL` that is neither is refused before any request, and
+//! so is a redirect that would leave `https`
+//! ([`SecureRegistryClient`]); the gem then has no archive but a cached one.
+//!
 //! Wherever it comes from, the archive is only a candidate: before
 //! anything of it is built, `gem_ext` proves it is the installed copy's
 //! own source, file by file (`prove_own_source` there). That, not this
@@ -52,9 +60,11 @@ use std::path::Path;
 use std::sync::OnceLock;
 
 use crate::formats::gem::{self, BUNDLER_LOCKS};
-use crate::patch::redirect::upstream::{compact_index_checksum, is_rubygems_remote, rubygems_base};
+use crate::patch::redirect::upstream::{
+    compact_index_checksum, is_rubygems_remote, rubygems_base, rubygems_secure_base,
+};
 use crate::utils::digest::{sha256_hex, sha256_hex_of};
-use crate::vendor::registry_fetch::{build_registry_client, download, RegistryClient};
+use crate::vendor::registry_fetch::SecureRegistryClient;
 
 /// One gem release: `<name>-<version>[-<platform>]`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -126,9 +136,12 @@ pub(crate) struct GemSource {
     /// [`resolved_elsewhere`] of the project's lock.
     elsewhere: HashMap<String, String>,
     offline: bool,
+    /// The default registry's base URL, or why nothing is downloaded from
+    /// it: it is reached over plain http ([`rubygems_secure_base`]).
+    registry: Result<String, String>,
     /// Built by the first download: a dry run, an offline run and a run
     /// that finds its archive cached never make one.
-    http: OnceLock<RegistryClient>,
+    http: OnceLock<SecureRegistryClient>,
 }
 
 impl GemSource {
@@ -146,6 +159,7 @@ impl GemSource {
         GemSource {
             elsewhere,
             offline,
+            registry: rubygems_secure_base(),
             http: OnceLock::new(),
         }
     }
@@ -155,8 +169,8 @@ impl GemSource {
     }
 
     /// Why nothing is downloaded for the gem `name`: the lock resolves it
-    /// from another source, or the run is offline. `None` when the
-    /// registry may be asked.
+    /// from another source, the run is offline, or the registry is reached
+    /// over plain http. `None` when the registry may be asked.
     fn withheld(&self, name: &str) -> Option<String> {
         if let Some(source) = self.elsewhere.get(name) {
             return Some(format!(
@@ -165,7 +179,10 @@ impl GemSource {
                 rubygems_base()
             ));
         }
-        self.offline.then(|| "this run is offline".to_string())
+        if self.offline {
+            return Some("this run is offline".to_string());
+        }
+        self.registry.as_ref().err().cloned()
     }
 
     /// Whether the archive of `id` is in the gem home `home`'s `cache/`
@@ -214,13 +231,17 @@ impl GemSource {
             home.join("cache").display().to_string(),
         );
         if self.elsewhere.contains_key(&id.name) {
-            format!("Put {file} in {cache}.")
-        } else {
-            format!(
-                "Run `socket-patch apply` once with network access to {}, or put {file} in \
-                 {cache}.",
-                rubygems_base()
-            )
+            return format!("Put {file} in {cache}.");
+        }
+        match &self.registry {
+            Ok(base) => format!(
+                "Run `socket-patch apply` once with network access to {base}, or put {file} in \
+                 {cache}."
+            ),
+            Err(_) => format!(
+                "With an https registry (or SOCKET_RUBYGEMS_URL unset), run `socket-patch \
+                 apply` once with network access, or put {file} in {cache}."
+            ),
         }
     }
 
@@ -242,12 +263,12 @@ impl GemSource {
             return Err(format!("{} is not there and {withheld}", cache.display()));
         }
         let fetched = async {
-            let base = rubygems_base();
-            let info = self.index(&base, &id.name).await?;
+            let base = self.registry.as_ref().map_err(String::clone)?;
+            let info = self.index(base, &id.name).await?;
             let want = compact_index_checksum(&info, &id.token()).ok_or_else(|| {
                 format!("{base} lists no {} {} with a checksum", id.name, id.token())
             })?;
-            self.fetch_verified(&base, id, &want).await
+            self.fetch_verified(base, id, &want).await
         };
         fetched.await.map_err(|why: String| {
             format!(
@@ -257,10 +278,18 @@ impl GemSource {
         })
     }
 
+    /// `url`'s bytes, from the registry and over a transport nobody can
+    /// rewrite ([`SecureRegistryClient`]): the one way this module makes a
+    /// request.
+    async fn get(&self, url: &str) -> Result<Vec<u8>, String> {
+        let registry = self.http.get_or_init(SecureRegistryClient::new);
+        registry.download(url).await
+    }
+
     /// The registry's compact index document of the gem `name`.
     async fn index(&self, base: &str, name: &str) -> Result<String, String> {
         let url = format!("{base}/info/{name}");
-        let bytes = download(self.http.get_or_init(build_registry_client), &url).await?;
+        let bytes = self.get(&url).await?;
         String::from_utf8(bytes).map_err(|_| format!("{url} is not UTF-8"))
     }
 
@@ -268,7 +297,7 @@ impl GemSource {
     /// (what the registry's index records for it).
     async fn fetch_verified(&self, base: &str, id: &GemId, want: &str) -> Result<Vec<u8>, String> {
         let url = format!("{base}/gems/{}.gem", id.full_name());
-        let bytes = download(self.http.get_or_init(build_registry_client), &url).await?;
+        let bytes = self.get(&url).await?;
         if sha256_hex_of(&bytes) == want {
             Ok(bytes)
         } else {
@@ -294,8 +323,8 @@ impl GemSource {
         if let Some(withheld) = self.withheld(name) {
             return Err(withheld);
         }
-        let base = rubygems_base();
-        let info = self.index(&base, name).await?;
+        let base = self.registry.as_ref().map_err(String::clone)?;
+        let info = self.index(base, name).await?;
         let (version, sha) = pick_release(&info, requirement, ruby)
             .ok_or_else(|| format!("{base} lists no release of {name} that meets {requirement}"))?;
         let id = GemId {
@@ -306,7 +335,7 @@ impl GemSource {
         if !id.is_plain() {
             return Err(format!("{} is not a plain gem name", id.full_name()));
         }
-        let bytes = self.fetch_verified(&base, &id, &sha).await?;
+        let bytes = self.fetch_verified(base, &id, &sha).await?;
         Ok((id, bytes))
     }
 }
@@ -789,5 +818,128 @@ mod tests {
         // In the home's cache, even a private gem's archive is its source.
         std::fs::write(cache_path(&home, &private), b"private").unwrap();
         assert_eq!(online.archive(&home, &private).await.unwrap(), b"private");
+    }
+
+    /// A source with nothing in its lock, online, asking `registry`.
+    fn asking(registry: Result<String, String>) -> GemSource {
+        GemSource {
+            elsewhere: HashMap::new(),
+            offline: false,
+            registry,
+            http: OnceLock::new(),
+        }
+    }
+
+    /// A registry reached over plain http is never asked: whoever sits on
+    /// the path would choose the archive and the checksum it is verified
+    /// against, and the archive's build scripts run. The gem is as far out
+    /// of reach as offline, the reason says to use https, and the home's
+    /// cached archive is still its source.
+    #[tokio::test]
+    async fn a_registry_over_plain_http_is_never_asked() {
+        use crate::patch::redirect::upstream::secure_gem_registry;
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(home.join("cache")).unwrap();
+        let racc = id("racc", "1.8.1", None);
+        let nokogiri = id("nokogiri", "1.18.3", None);
+        std::fs::write(cache_path(&home, &racc), b"archive").unwrap();
+
+        // Nothing answers at this name: a request would fail on the lookup,
+        // with another message.
+        let base = "http://user:hunter2@gems.example.test/mirror".to_string();
+        let gems = asking(secure_gem_registry(base));
+        for why in [
+            gems.out_of_reach(&home, &nokogiri).await.unwrap(),
+            gems.archive(&home, &nokogiri).await.unwrap_err(),
+            gems.dependency("mini_portile2", "~> 2.8.2", &RubyVersions::default())
+                .await
+                .unwrap_err(),
+        ] {
+            assert!(
+                why.contains("SOCKET_RUBYGEMS_URL")
+                    && why.contains("gems.example.test")
+                    && why.contains("is not an https URL")
+                    && why.contains("set it to an https URL"),
+                "{why}"
+            );
+            assert!(!why.contains("hunter2"), "{why}");
+        }
+        let remedy = gems.remedy(&home, &nokogiri);
+        assert!(
+            remedy.contains("With an https registry") && remedy.contains("nokogiri-1.18.3.gem"),
+            "{remedy}"
+        );
+        assert!(gems.http.get().is_none(), "no client was built");
+        assert_eq!(gems.archive(&home, &racc).await.unwrap(), b"archive");
+        assert_eq!(gems.out_of_reach(&home, &racc).await, None);
+    }
+
+    /// A registry on this machine (a local mirror, the hermetic tests) is
+    /// asked over plain http: the archive is the one its index records.
+    /// A redirect from it to a plain-http host elsewhere is not followed,
+    /// for the index or for the archive.
+    #[tokio::test]
+    async fn a_loopback_registry_is_asked_and_no_redirect_leaves_it() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        let serve = |from: &'static str, response: ResponseTemplate| {
+            Mock::given(method("GET"))
+                .and(path(from))
+                .respond_with(response)
+                .mount(&server)
+        };
+        let away = |to: &str| {
+            ResponseTemplate::new(302)
+                .insert_header("location", format!("http://gems.example.test{to}").as_str())
+        };
+        let archive = b"the source gem".to_vec();
+        let listed = |sha: &str| {
+            ResponseTemplate::new(200).set_body_string(format!("---\n1.0.0 |checksum:{sha}\n"))
+        };
+        serve("/info/good", listed(&sha256_hex_of(&archive))).await;
+        serve(
+            "/gems/good-1.0.0.gem",
+            ResponseTemplate::new(200).set_body_bytes(archive.clone()),
+        )
+        .await;
+        // Its archive is not the one the index records.
+        serve("/info/swapped", listed(SHA_A)).await;
+        serve(
+            "/gems/swapped-1.0.0.gem",
+            ResponseTemplate::new(200).set_body_bytes(archive.clone()),
+        )
+        .await;
+        // Its archive, and the other's index, are redirected elsewhere.
+        serve("/info/moved", listed(&sha256_hex_of(&archive))).await;
+        serve("/gems/moved-1.0.0.gem", away("/gems/moved-1.0.0.gem")).await;
+        serve("/info/gone", away("/info/gone")).await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let gems = asking(Ok(server.uri()));
+        let of = |name: &str| id(name, "1.0.0", None);
+        assert_eq!(gems.archive(&home, &of("good")).await.unwrap(), archive);
+        let (picked, bytes) = gems
+            .dependency("good", ">= 0", &RubyVersions::default())
+            .await
+            .unwrap();
+        assert_eq!((picked, bytes), (of("good"), archive));
+
+        let why = gems.archive(&home, &of("swapped")).await.unwrap_err();
+        assert!(why.contains("does not have the sha256"), "{why}");
+        for name in ["moved", "gone"] {
+            let why = gems.archive(&home, &of(name)).await.unwrap_err();
+            assert!(
+                why.contains("refusing a redirect") && why.contains("gems.example.test"),
+                "{name}: {why}"
+            );
+            let why = gems
+                .dependency(name, ">= 0", &RubyVersions::default())
+                .await
+                .unwrap_err();
+            assert!(why.contains("refusing a redirect"), "{name}: {why}");
+        }
     }
 }

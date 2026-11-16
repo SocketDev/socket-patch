@@ -924,7 +924,13 @@ one. It is taken from the gem home's `cache/`, where RubyGems and Bundler keep i
 network. Otherwise, and not under `--offline`, it is downloaded from the default registry,
 `https://rubygems.org` or the registry `SOCKET_RUBYGEMS_URL` names (a mirror), as
 `<registry>/gems/<file>`, and used only when its sha256 is the one that registry's compact index
-(`<registry>/info/<name>`) records. Nothing in the project's lock chooses the URL or the hash: not
+(`<registry>/info/<name>`) records. The index vouches for the archive only when nobody on the
+network path can rewrite both, and the archive's build scripts are about to run, so the registry
+is asked over `https` only. Plain `http` is accepted for a loopback host (`localhost`,
+`127.0.0.1`, `[::1]`: a local mirror). A `SOCKET_RUBYGEMS_URL` that is neither is refused before
+any request with a message that says to use an https URL, and a redirect that leaves `https`, or
+leads to an `http` host that is not this machine, is not followed; the gem then has no archive
+but a cached one, as offline. Nothing in the project's lock chooses the URL or the hash: not
 a `remote:`, not `CHECKSUMS`. The lock at the project root is read to withhold the download: a gem
 name that `Gemfile.lock` / `gems.locked` resolves from another source at any version (a `GEM`
 section with a remote that is not the registry, a private gem server or Socket's patch registry
@@ -1956,7 +1962,7 @@ Env-only knobs used for hosted upstream restoration and JVM metadata verificatio
 | `SOCKET_CRATES_INDEX` | `https://index.crates.io` | v5.0 upstream restore: the crates.io sparse index whose `checksum` a restored `Cargo.lock` entry gets back. |
 | `SOCKET_GOSUMDB_URL` | `https://sum.golang.org` | v5.0 upstream restore: the checksum database the restored go.sum lines are checked against. Without it, `GOSUMDB=off` or a module matching `GONOSUMDB` (default `GOPRIVATE`) skips the database and the hashes come from the module proxy's bytes alone (`SOCKET_GOPROXY` above). |
 | `SOCKET_PYPI_JSON_API` | `https://pypi.org/pypi` | PyPI's JSON API (`<base>/<name>/<version>/json`): the release files whose sha256 the upstream restore writes back into every Python lock format. |
-| `SOCKET_RUBYGEMS_URL` | `https://rubygems.org` | v5.0 upstream restore: the compact index (`/info/<name>`) a restored `CHECKSUMS` entry is re-pinned from. Agent mode: the registry the source gem of a native-extension gem (`/gems/<file>`), and a gem its build lacks, are downloaded from and their checksums read from (`/info/<name>`); a lock `remote:` equal to it counts as the registry. |
+| `SOCKET_RUBYGEMS_URL` | `https://rubygems.org` | v5.0 upstream restore: the compact index (`/info/<name>`) a restored `CHECKSUMS` entry is re-pinned from. Agent mode: the registry the source gem of a native-extension gem (`/gems/<file>`), and a gem its build lacks, are downloaded from and their checksums read from (`/info/<name>`); a lock `remote:` equal to it counts as the registry. Must be an `https` URL, or plain `http` to a loopback host (`localhost`, `127.0.0.1`, `[::1]`): gems fetched from it are installed and built, and their checksums pinned, so any other value is refused before a request is made, with a message that says to use an https URL, and a redirect that leaves `https` is not followed. The outcome is that of a registry that cannot be reached: a pin whose `CHECKSUMS` entry must be re-pinned is not restored, an installed copy is not refreshed, a source gem is not downloaded. |
 | `SOCKET_PACKAGIST_URL` | `https://repo.packagist.org` | v5.0 upstream restore: packagist's composer v2 metadata (`/p2/<vendor>/<package>.json`) a restored `composer.lock` `dist` / `source` comes from. |
 | `SOCKET_NUGET_URL` | `https://api.nuget.org` | v5.0 upstream restore: the nuget.org API host whose catalog `packageHash` a restored `packages.lock.json` `contentHash` comes from. |
 
