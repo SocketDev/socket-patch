@@ -90,12 +90,13 @@
 //! record's patched sources and every recorded artifact still hashes as
 //! built ([`verify_native_build`]), whichever way it was built. A
 //! precompiled gem ships one binary per Ruby minor, and a graft replaces
-//! the one of the Ruby that ran `apply`: such a copy is attested only when
-//! no other of them could be loaded from its gem home
-//! (`ungrafted_binaries`): the home is laid out for that one Ruby, or each
-//! Ruby that the gem ships a binary for has run `apply`. `rollback` puts
-//! the backed-up original build back ([`restore_original_build`]),
-//! prebuilt binaries byte for byte.
+//! the one of the Ruby that ran `apply`, as `gem install` builds for the
+//! Ruby that runs it: the copy is attested from then on, and the binaries
+//! the gem ships for other Rubies are not held against it. `apply` under
+//! another Ruby of the same gem home grafts that Ruby's binary into the
+//! same marker and backup (`built_state`). `rollback` puts the backed-up
+//! original build back ([`restore_original_build`]), prebuilt binaries
+//! byte for byte.
 //!
 //! # What is executed, and when
 //!
@@ -207,8 +208,9 @@ pub const UNSUPPORTED_CODE: &str = "native_extensions_unsupported";
 /// The extension failed to build from the patched sources; the installed
 /// copy is as it was before the run.
 pub const BUILD_FAILED_CODE: &str = "native_extension_build_failed";
-/// Advisory: sources an earlier run patched were rebuilt into the extension
-/// (a release before #1996 patched them without a rebuild).
+/// Advisory: sources that were already patched were rebuilt into the
+/// extension (a release before #1996 patched them without a rebuild; a
+/// precompiled gem's were built for another Ruby of its gem home).
 pub const REBUILT_CODE: &str = "native_extension_rebuilt";
 /// `rollback` restored the sources but could not put the original compiled
 /// extension back.
@@ -1024,73 +1026,78 @@ fn prebuilt_siblings(gem_dir: &Path, target: &str) -> Vec<String> {
     out
 }
 
-/// The prebuilt binaries a Ruby could still load unpatched from the
-/// grafted copy `marker` describes: empty when the graft reaches every one.
-///
-/// A graft replaces the binary of the Ruby that built it, and a precompiled
-/// gem ships one per Ruby minor. Which of them a gem home's Ruby loads is
-/// only known when the home is laid out for one Ruby ([`home_minor`]):
-/// then that Ruby's binary is the one that must be grafted, and the others
-/// are never loaded. A home that is tied to no Ruby (a custom `GEM_HOME`
-/// with no compiled gem in it) can be used by any: every prebuilt binary
-/// must be grafted before nothing unpatched can be loaded from it.
-fn ungrafted_binaries(marker: &BuildMarker, copy: &GemCopy) -> Vec<String> {
-    let tied = home_minor(copy);
-    let mut out: Vec<String> = Vec::new();
-    for target in marker.lib_artifacts.keys() {
-        let Some((base, minor, leaf)) = minor_layout(target) else {
-            continue;
-        };
-        let needed = match &tied {
-            Some(tied) if tied == minor => Vec::new(),
-            Some(tied) => vec![[base, tied.as_str(), leaf].join("/")],
-            None => prebuilt_siblings(&copy.gem_dir, target),
-        };
-        for binary in needed {
-            if !marker.lib_artifacts.contains_key(&binary) && !out.contains(&binary) {
-                out.push(binary);
-            }
-        }
-    }
-    out.sort();
-    out
-}
-
-/// For a precompiled copy whose binary for the Ruby `minor` is already the
-/// build of this record (its marker lists these sources, every binary it
-/// lists is still the built one, and one of them is that Ruby's): the
-/// prebuilt binaries the graft does not reach ([`ungrafted_binaries`]).
-/// `None` when that Ruby's binary is still to be built.
-fn ungrafted_after(
-    copy: &GemCopy,
-    scope: &NativeScope,
-    files: &HashMap<String, PatchFileInfo>,
-    minor: &str,
-) -> Option<Vec<String>> {
-    let marker = read_marker_sync(&copy.gem_dir)?;
-    let built_for_it = marker.grafted
-        && marker_sources_match(&marker, scope, files)
-        && marker_artifacts_hold(&marker, copy, scope)
-        && marker
-            .lib_artifacts
-            .keys()
-            .any(|target| minor_layout(target).is_some_and(|(_, m, _)| m == minor));
-    built_for_it.then(|| ungrafted_binaries(&marker, copy))
-}
-
 /// Whether `marker` was built from exactly the record's patched native
-/// inputs, every artifact it recorded is still on disk with the bytes it
-/// was built with, and, for a grafted copy, no prebuilt binary a Ruby
-/// could load from its gem home is left unpatched.
+/// inputs, and every artifact it recorded is still on disk with the bytes
+/// it was built with.
+///
+/// That is all a grafted copy is held to as well. `gem install` builds an
+/// extension for the Ruby that runs it and promises nothing to another
+/// Ruby pointed at the same gem home; a graft is the same build, of the
+/// same sources, for the Ruby that ran `apply`. The binaries a precompiled
+/// gem ships for other Rubies are not this build's to answer for.
 fn marker_holds(
     marker: &BuildMarker,
     copy: &GemCopy,
     scope: &NativeScope,
     files: &HashMap<String, PatchFileInfo>,
 ) -> bool {
-    marker_sources_match(marker, scope, files)
-        && marker_artifacts_hold(marker, copy, scope)
-        && (!marker.grafted || ungrafted_binaries(marker, copy).is_empty())
+    marker_sources_match(marker, scope, files) && marker_artifacts_hold(marker, copy, scope)
+}
+
+/// What a copy's build marker says is left for `apply` to do for a record,
+/// as far as files tell.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Built {
+    /// No marker that holds: the extension is still to be built.
+    No,
+    /// The marker holds, and no other Ruby could be the one asking.
+    Yes,
+    /// The marker holds, for the Rubies whose `major.minor` it lists, and
+    /// the gem ships a prebuilt binary for another Ruby, which may be the
+    /// one running `apply` now: its binary is then grafted too. Only the
+    /// Ruby itself can say.
+    ForRubies(Vec<String>),
+}
+
+/// The [`Built`] state of `copy` for a record.
+///
+/// A precompiled gem ships one binary per Ruby minor, and a graft replaces
+/// the one of the Ruby that ran `apply`. Another Ruby can only be asking
+/// when the gem ships a binary the marker does not list
+/// ([`prebuilt_siblings`]) and the gem home is not laid out for one Ruby
+/// whose binary is already grafted ([`home_minor`]: the Ruby that owns
+/// such a home is the only one [`find_ruby`] accepts for it).
+fn built_state(
+    copy: &GemCopy,
+    scope: &NativeScope,
+    files: &HashMap<String, PatchFileInfo>,
+) -> Built {
+    let Some(marker) =
+        read_marker_sync(&copy.gem_dir).filter(|m| marker_holds(m, copy, scope, files))
+    else {
+        return Built::No;
+    };
+    if !marker.grafted {
+        return Built::Yes;
+    }
+    let mut grafted: Vec<String> = marker
+        .lib_artifacts
+        .keys()
+        .filter_map(|target| minor_layout(target).map(|(_, minor, _)| minor.to_string()))
+        .collect();
+    grafted.sort();
+    grafted.dedup();
+    let ships_another = marker.lib_artifacts.keys().any(|target| {
+        prebuilt_siblings(&copy.gem_dir, target)
+            .iter()
+            .any(|sibling| !marker.lib_artifacts.contains_key(sibling))
+    });
+    let its_own_ruby_done = home_minor(copy).is_some_and(|tied| grafted.contains(&tied));
+    if ships_another && !its_own_ruby_done {
+        Built::ForRubies(grafted)
+    } else {
+        Built::Yes
+    }
 }
 
 /// `vex` / `apply --check`: the installed gem copy at `pkg_path`, whose
@@ -1787,7 +1794,9 @@ fn ruby_minor(version: &str) -> Option<String> {
 /// to exactly one: the ABI its dir name carries (`…/ruby/3.4.0`) and the
 /// ABI of every `extensions/<platform>/<abi>` dir in it agree. `None` for a
 /// home that shows no ABI (a custom `GEM_HOME` holding no compiled gem) or
-/// more than one: any Ruby may be pointed at such a home.
+/// more than one: any Ruby may be pointed at such a home. It decides one
+/// thing: whether a grafted copy needs a Ruby asked which one is running
+/// `apply` ([`built_state`]). It is no condition of attestation.
 fn home_minor(copy: &GemCopy) -> Option<String> {
     let mut minors: Vec<String> = abi_dirs(copy)
         .iter()
@@ -3477,14 +3486,13 @@ fn back_up_prebuilt(copy: &GemCopy, grafts: &[Graft], absent: &[String]) -> std:
 /// marker that attests them. The marker keeps the binaries an earlier
 /// graft of the same record replaced for another Ruby, while they are
 /// still the built ones. A step that fails puts every binary back as it
-/// was. `Ok` lists the prebuilt binaries the graft does not reach
-/// ([`ungrafted_binaries`]).
+/// was.
 fn graft_binaries(
     copy: &GemCopy,
     scope: &NativeScope,
     files: &HashMap<String, PatchFileInfo>,
     grafts: &[Graft],
-) -> std::io::Result<Vec<String>> {
+) -> std::io::Result<()> {
     let mut previous: Vec<LibSnapshot> = Vec::new();
     for graft in grafts {
         let path = copy.gem_dir.join(&graft.target);
@@ -3498,7 +3506,7 @@ fn graft_binaries(
     let earlier = read_marker_sync(&copy.gem_dir).filter(|m| {
         m.grafted && marker_sources_match(m, scope, files) && marker_artifacts_hold(m, copy, scope)
     });
-    let grafted = (|| -> std::io::Result<Vec<String>> {
+    let grafted = (|| -> std::io::Result<()> {
         let mut marker = BuildMarker {
             schema: GRAFT_MARKER_SCHEMA,
             grafted: true,
@@ -3520,8 +3528,7 @@ fn graft_binaries(
                 .lib_artifacts
                 .insert(graft.target.clone(), compute_file_git_sha256_sync(&path)?);
         }
-        write_marker(copy, &marker)?;
-        Ok(ungrafted_binaries(&marker, copy))
+        write_marker(copy, &marker)
     })();
     if grafted.is_err() {
         for (target, bytes, perms) in &previous {
@@ -3806,8 +3813,8 @@ impl Job<'_> {
             (
                 REBUILT_CODE.to_string(),
                 format!(
-                    "{}: its native extension was rebuilt from sources an earlier run \
-                     patched without rebuilding ({})",
+                    "{}: its native extension was rebuilt from sources that were already \
+                     patched ({})",
                     self.package_key, self.inputs
                 ),
             )
@@ -3956,28 +3963,17 @@ pub async fn apply_gem_package_patch(
     let precompiled = scope.precompiled.is_some();
     let (installed_files, absent) = files_as_installed(&copy, &scope, files).await;
 
-    // Already patched and built from these sources: nothing to do. A
-    // precompiled copy can also be built for one Ruby and not for another
-    // that its gem home serves (`grafted`): whether anything is left to
-    // build then depends on the Ruby that runs, which is asked below.
-    let (built, grafted) = {
+    // Already patched and built from these sources: nothing to do, and no
+    // Ruby is started. The one exception is a precompiled copy grafted for
+    // one Ruby whose gem home another Ruby may share: `apply` under that
+    // other Ruby grafts its binary too, and only the Ruby that runs can
+    // say which it is. A dry run asks nothing.
+    let built = {
         let (copy, scope, files) = (copy.clone(), scope.clone(), files.clone());
-        crate::utils::fs::run_blocking(move || {
-            let marker = read_marker_sync(&copy.gem_dir);
-            let built = marker
-                .as_ref()
-                .is_some_and(|m| marker_holds(m, &copy, &scope, &files));
-            let grafted = marker.is_some_and(|m| {
-                m.grafted
-                    && marker_sources_match(&m, &scope, &files)
-                    && marker_artifacts_hold(&m, &copy, &scope)
-            });
-            (built, grafted)
-        })
-        .await
+        crate::utils::fs::run_blocking(move || built_state(&copy, &scope, &files)).await
     };
-    if built {
-        return plain_apply(
+    let unchanged = || {
+        plain_apply(
             read_scope,
             package_key,
             pkg_path,
@@ -3986,8 +3982,13 @@ pub async fn apply_gem_package_patch(
             dry_run,
             policy,
         )
-        .await;
-    }
+    };
+    let grafted_for = match built {
+        Built::Yes => return unchanged().await,
+        Built::ForRubies(_) if dry_run => return unchanged().await,
+        Built::ForRubies(minors) => Some(minors),
+        Built::No => None,
+    };
 
     // A gem RubyGems built can also be installed patched through hosted
     // mode; a precompiled one cannot (hosted mode refuses platform gems).
@@ -4011,6 +4012,8 @@ pub async fn apply_gem_package_patch(
     // What files alone tell: a build to replace and a Ruby to try.
     let preflight = match rebuild_preflight(&copy, env, precompiled).await {
         Ok(p) => p,
+        // Built already, and no Ruby here to ask whether it is another's.
+        Err(_) if grafted_for.is_some() => return unchanged().await,
         Err(why) => return unbuildable(why),
     };
     // A precompiled gem's extension can only be rebuilt from the source gem
@@ -4045,7 +4048,7 @@ pub async fn apply_gem_package_patch(
             copy.spec_path.display()
         )
     };
-    if precompiled && !grafted {
+    if precompiled && grafted_for.is_none() {
         let Some(source) = &source else {
             return needs_source_gem(None, unnamed(), false);
         };
@@ -4144,8 +4147,19 @@ pub async fn apply_gem_package_patch(
 
     let probe = match find_ruby(&copy, env, preflight, scope.precompiled.as_deref()).await {
         Ok(p) => p,
+        Err(_) if grafted_for.is_some() => return unchanged().await,
         Err(why) => return unbuildable(why),
     };
+    // A copy grafted already: this Ruby's binary is among the grafted ones
+    // (or it did not say which Ruby it is), and nothing is left to build.
+    // Otherwise it is another Ruby of a shared gem home, and its binary is
+    // grafted beside the others.
+    if let Some(grafted) = &grafted_for {
+        let minor = probe.facts.as_ref().and_then(RubyFacts::minor);
+        if minor.is_none_or(|minor| grafted.contains(&minor)) {
+            return unchanged().await;
+        }
+    }
     let job = Job {
         read_scope,
         package_key,
@@ -4159,36 +4173,6 @@ pub async fn apply_gem_package_patch(
         scope: &scope,
         inputs: &inputs,
     };
-
-    // A precompiled copy whose binary for this Ruby was already replaced by
-    // a build of these sources has nothing left to build here: what keeps
-    // it from being attested is the binaries it ships for other Rubies.
-    if precompiled {
-        let grafted = {
-            let (copy, scope, files) = (copy.clone(), scope.clone(), files.clone());
-            let minor = probe.facts.as_ref().and_then(RubyFacts::minor);
-            crate::utils::fs::run_blocking(move || {
-                minor.and_then(|minor| ungrafted_after(&copy, &scope, &files, &minor))
-            })
-            .await
-        };
-        if let Some(ungrafted) = grafted {
-            let mut applied = plain_apply(
-                read_scope,
-                package_key,
-                pkg_path,
-                &installed_files,
-                sources,
-                false,
-                policy,
-            )
-            .await;
-            if applied.result.success {
-                applied.warning = other_rubies_warning(package_key, &copy, &ungrafted);
-            }
-            return applied;
-        }
-    }
 
     // The source gem holds every build input, where the installed copy may
     // not (a build deletes what it no longer needs; a precompiled gem never
@@ -4364,29 +4348,6 @@ async fn move_into_copy(
     }
 }
 
-/// The warning of a precompiled copy whose graft does not reach every
-/// prebuilt binary a Ruby could load from its gem home (`ungrafted`):
-/// `None` when it reaches them all.
-fn other_rubies_warning(
-    package_key: &str,
-    copy: &GemCopy,
-    ungrafted: &[String],
-) -> Option<(String, String)> {
-    (!ungrafted.is_empty()).then(|| {
-        (
-            NOT_REBUILT_REASON.to_string(),
-            format!(
-                "{package_key}: its extension was rebuilt for the Ruby that ran this, but the \
-                 gem also ships prebuilt binaries for other Ruby versions ({}), and nothing \
-                 ties the gem home {} to one Ruby; run `socket-patch apply` under each Ruby \
-                 that uses it. Until every one is rebuilt, vex does not attest the patch",
-                ungrafted.join(", "),
-                copy.home.display()
-            ),
-        )
-    })
-}
-
 /// Put a staged build into a precompiled copy: the record's files are
 /// written into the copy, and each prebuilt binary the owning Ruby loads is
 /// replaced by the build's ([`plan_graft`]), after the originals are backed
@@ -4450,14 +4411,7 @@ async fn graft_into_copy(
         crate::utils::fs::run_blocking(move || graft_binaries(&copy, &scope, &files, &grafts)).await
     };
     match grafted {
-        Ok(ungrafted) => {
-            let mut applied = job.built(result);
-            // The binaries of other Rubies outrank the note on a rebuild.
-            if let Some(warning) = other_rubies_warning(job.package_key, copy, &ungrafted) {
-                applied.warning = Some(warning);
-            }
-            applied
-        }
+        Ok(()) => job.built(result),
         Err(e) => {
             drop_new_backup().await;
             let detail = format!(
@@ -5947,7 +5901,7 @@ mod tests {
     #[tokio::test]
     async fn a_grafted_copy_is_attested_and_rolled_back() {
         let tmp = tempfile::tempdir().unwrap();
-        // A home laid out for one Ruby: only its binary is ever loaded.
+        // A project's bundle path, as Bundler lays it out for Ruby 3.4.
         let home = tmp.path().join("vendor/bundle/ruby/3.4.0");
         let copy = precompiled_gem(&home);
         let target = copy.gem_dir.join("lib/a/3.4/a.bundle");
@@ -6538,14 +6492,14 @@ mod tests {
         assert!(!unlocked_stage_is_dead(&root));
     }
 
-    /// A grafted marker attests only when no prebuilt binary a Ruby could
-    /// load from the gem home is left unpatched. A home laid out for one
-    /// Ruby loads that Ruby's binary alone. A home tied to none can be
-    /// used by any Ruby the gem ships a binary for: each must run `apply`,
-    /// which grafts its own binary and keeps the others', and only then
-    /// is the copy attested. Rollback restores every one.
+    /// A grafted copy is held to what a normal install is: the build is
+    /// for the Ruby that made it. It is attested as soon as its marker
+    /// holds, in a gem home that names no Ruby too, whatever binaries the
+    /// gem ships for other Rubies. A second Ruby's `apply` adds its binary
+    /// to the same marker and backup; a grafted binary that no longer
+    /// hashes as built attests nothing; rollback restores every one.
     #[tokio::test]
-    async fn a_home_shared_by_rubies_is_attested_once_every_binary_is_grafted() {
+    async fn a_grafted_copy_is_attested_from_its_first_graft() {
         let tmp = tempfile::tempdir().unwrap();
         // No ABI in its name, no compiled gem in it: any Ruby's home.
         let home = tmp.path().join("gems-home");
@@ -6555,23 +6509,18 @@ mod tests {
             copy.gem_dir.join("lib/a/3.3/a.bundle"),
             copy.gem_dir.join("lib/a/3.4/a.bundle"),
         );
-        let after = "c".repeat(64);
         let record: HashMap<String, PatchFileInfo> = [(
             "ext/a/a.c".to_string(),
             PatchFileInfo {
                 before_hash: compute_git_sha256_from_bytes(b"int a;"),
-                after_hash: after,
+                after_hash: "c".repeat(64),
             },
         )]
         .into();
         let (scope, _) = scope_of(&copy.gem_dir, &record).await;
-        assert_eq!(
-            prebuilt_siblings(&copy.gem_dir, "lib/a/3.4/a.bundle"),
-            ["lib/a/3.3/a.bundle"]
-        );
-        assert!(prebuilt_siblings(&copy.gem_dir, "lib/a.bundle").is_empty());
+        assert_eq!(built_state(&copy, &scope, &record), Built::No);
 
-        // Ruby 3.4 runs `apply`.
+        // Ruby 3.4 runs `apply`: attested from here on.
         let staged = staged_build(
             &tmp.path().join("stage34"),
             &["a/a.bundle"],
@@ -6579,27 +6528,14 @@ mod tests {
         );
         let grafts = plan_graft(&copy, &probe_for(&copy, "3.4.10"), &staged).unwrap();
         assert!(back_up_prebuilt(&copy, &grafts, &[]).unwrap());
-        let ungrafted = graft_binaries(&copy, &scope, &record, &grafts).unwrap();
-        assert_eq!(ungrafted, ["lib/a/3.3/a.bundle"]);
+        graft_binaries(&copy, &scope, &record, &grafts).unwrap();
+        assert_eq!(std::fs::read(&for_33).unwrap(), PREBUILT);
+        assert_eq!(verify_native_build(&copy.gem_dir, &record).await, Ok(()));
+        // Another Ruby may be the one running `apply` next: it is asked.
         assert_eq!(
-            std::fs::read(&for_33).unwrap(),
-            PREBUILT,
-            "3.3 still loads the old code"
+            built_state(&copy, &scope, &record),
+            Built::ForRubies(vec!["3.4".to_string()])
         );
-        assert_eq!(
-            verify_native_build(&copy.gem_dir, &record).await,
-            Err(NOT_REBUILT_REASON.to_string()),
-            "attested while Ruby 3.3 would load an unpatched binary"
-        );
-        assert!(other_rubies_warning("pkg:gem/a@1", &copy, &ungrafted)
-            .is_some_and(|(code, detail)| code == NOT_REBUILT_REASON
-                && detail.contains("lib/a/3.3/a.bundle")));
-        // Under 3.4 again there is nothing to build; under 3.3 there is.
-        assert_eq!(
-            ungrafted_after(&copy, &scope, &record, "3.4"),
-            Some(vec!["lib/a/3.3/a.bundle".to_string()])
-        );
-        assert_eq!(ungrafted_after(&copy, &scope, &record, "3.3"), None);
 
         // Ruby 3.3 runs `apply`: its binary joins the marker and the backup.
         let staged = staged_build(
@@ -6609,9 +6545,7 @@ mod tests {
         );
         let grafts = plan_graft(&copy, &probe_for(&copy, "3.3.6"), &staged).unwrap();
         assert!(!back_up_prebuilt(&copy, &grafts, &[]).unwrap());
-        assert!(graft_binaries(&copy, &scope, &record, &grafts)
-            .unwrap()
-            .is_empty());
+        graft_binaries(&copy, &scope, &record, &grafts).unwrap();
         assert_eq!(std::fs::read(&for_33).unwrap(), b"built by 3.3");
         assert_eq!(std::fs::read(&for_34).unwrap(), b"built by 3.4");
         let marker = read_marker_sync(&copy.gem_dir).unwrap();
@@ -6620,9 +6554,17 @@ mod tests {
             ["lib/a/3.3/a.bundle", "lib/a/3.4/a.bundle"]
         );
         assert_eq!(verify_native_build(&copy.gem_dir, &record).await, Ok(()));
-        // One of them reinstalled: neither is attested.
+        // Every binary the gem ships is grafted: no Ruby is left to ask.
+        assert_eq!(built_state(&copy, &scope, &record), Built::Yes);
+
+        // A grafted binary that is no longer the built one (the gem was
+        // reinstalled over it): the marker attests nothing.
         std::fs::write(&for_33, PREBUILT).unwrap();
-        assert!(verify_native_build(&copy.gem_dir, &record).await.is_err());
+        assert_eq!(
+            verify_native_build(&copy.gem_dir, &record).await,
+            Err(NOT_REBUILT_REASON.to_string())
+        );
+        assert_eq!(built_state(&copy, &scope, &record), Built::No);
         std::fs::write(&for_33, b"built by 3.3").unwrap();
 
         let env = RubyEnv {
@@ -6641,35 +6583,77 @@ mod tests {
         }
     }
 
-    /// A home laid out for one Ruby is attested by that Ruby's binary, and
-    /// by no other: a graft for 3.3 in a 3.4 home patches nothing 3.4
-    /// loads.
+    /// A copy built from these sources starts no Ruby on the next `apply`,
+    /// with one exception: a grafted copy whose gem ships a binary for
+    /// another Ruby that may be sharing its gem home. A home laid out for
+    /// the Ruby already grafted is shared with no other.
     #[test]
-    fn a_tied_home_is_attested_by_its_own_rubys_binary() {
+    fn a_ruby_is_asked_only_when_another_may_share_the_home() {
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path().join("gems-home");
         let copy = precompiled_gem(&home);
-        // Another gem's extension, built for 3.4: the home's Ruby.
+        let after = "c".repeat(64);
+        let record: HashMap<String, PatchFileInfo> =
+            [("ext/a/a.c".to_string(), info(&after))].into();
+        let scope = NativeScope {
+            inputs: vec!["ext/a/a.c".into()],
+            precompiled: Some("arm64-darwin".into()),
+            ..NativeScope::default()
+        };
+        let prebuilt = compute_git_sha256_from_bytes(PREBUILT);
+        let graft = |minors: &[&str]| {
+            let marker = BuildMarker {
+                schema: GRAFT_MARKER_SCHEMA,
+                sources: [("ext/a/a.c".to_string(), after.clone())].into(),
+                lib_artifacts: minors
+                    .iter()
+                    .map(|minor| (format!("lib/a/{minor}/a.bundle"), prebuilt.clone()))
+                    .collect(),
+                grafted: true,
+                ..BuildMarker::default()
+            };
+            write_marker(&copy, &marker).unwrap();
+        };
+        assert_eq!(
+            prebuilt_siblings(&copy.gem_dir, "lib/a/3.4/a.bundle"),
+            ["lib/a/3.3/a.bundle"]
+        );
+        assert!(prebuilt_siblings(&copy.gem_dir, "lib/a.bundle").is_empty());
+
+        // A home that names no Ruby: the gem ships a binary for 3.3 too.
+        graft(&["3.4"]);
+        assert_eq!(home_minor(&copy), None);
+        assert_eq!(
+            built_state(&copy, &scope, &record),
+            Built::ForRubies(vec!["3.4".to_string()])
+        );
+        graft(&["3.3", "3.4"]);
+        assert_eq!(built_state(&copy, &scope, &record), Built::Yes);
+
+        // Another gem's extension, built for 3.4, makes it that Ruby's home.
         std::fs::create_dir_all(home.join("extensions/arm64-darwin-24/3.4.0/racc-1.8.1")).unwrap();
         assert_eq!(home_minor(&copy).as_deref(), Some("3.4"));
-        let grafted = |minor: &str| BuildMarker {
-            schema: GRAFT_MARKER_SCHEMA,
-            lib_artifacts: [(format!("lib/a/{minor}/a.bundle"), String::new())].into(),
-            grafted: true,
-            ..BuildMarker::default()
-        };
-        assert!(ungrafted_binaries(&grafted("3.4"), &copy).is_empty());
+        graft(&["3.4"]);
+        assert_eq!(built_state(&copy, &scope, &record), Built::Yes);
+        // Grafted for a Ruby that is not the home's: the home's is asked.
+        graft(&["3.3"]);
         assert_eq!(
-            ungrafted_binaries(&grafted("3.3"), &copy),
-            ["lib/a/3.4/a.bundle"]
+            built_state(&copy, &scope, &record),
+            Built::ForRubies(vec!["3.3".to_string()])
         );
         // A second ABI in the home: no longer one Ruby's.
         std::fs::create_dir_all(home.join("extensions/arm64-darwin-24/3.3.0/racc-1.8.1")).unwrap();
         assert_eq!(home_minor(&copy), None);
+        graft(&["3.4"]);
         assert_eq!(
-            ungrafted_binaries(&grafted("3.4"), &copy),
-            ["lib/a/3.3/a.bundle"]
+            built_state(&copy, &scope, &record),
+            Built::ForRubies(vec!["3.4".to_string()])
         );
+        // Another record than the marker's: nothing is built yet.
+        let other: HashMap<String, PatchFileInfo> =
+            [("ext/a/a.c".to_string(), info(&"d".repeat(64)))].into();
+        assert_eq!(built_state(&copy, &scope, &other), Built::No);
+
         assert_eq!(ruby_minor("3.4.0-static").as_deref(), Some("3.4"));
         assert_eq!(ruby_minor("3.4.10").as_deref(), Some("3.4"));
         assert_eq!(ruby_minor("ruby"), None);

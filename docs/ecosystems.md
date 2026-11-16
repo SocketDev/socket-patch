@@ -2049,12 +2049,10 @@ restores it byte for byte without recompiling, and records what it built in
 installed binary: after `gem pristine` or a reinstall, run `apply` again.
 
 A precompiled gem ships one binary for each Ruby version it supports, and `apply` rebuilds the one
-for the Ruby it runs with. In a gem home that belongs to one Ruby (`vendor/bundle/ruby/3.4.0`, a
-Ruby's own gem directory, or any home that holds a compiled gem) that is the only binary ever
-loaded, and `vex` attests the patch. A custom `GEM_HOME` with nothing in it that ties it to one
-Ruby could be used by several: there `apply` warns that the binaries for the other Ruby versions
-are still the prebuilt ones, and `vex` attests the patch only after `apply` has run under each
-Ruby version the gem ships a binary for.
+for the Ruby it runs with, the way `gem install` builds a gem for the Ruby that installs it.
+`vex` attests the patch from then on. If a second Ruby version uses the same gem home, run
+`apply` with that Ruby as well: it rebuilds that version's binary beside the first, and
+`rollback` restores both.
 
 Interrupting `apply` during a rebuild (Ctrl-C, a cancelled CI job) stops the build with it. A
 build from the source gem had not touched the installed gem yet, so the gem is as it was; the

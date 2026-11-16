@@ -1070,8 +1070,8 @@ a file the copy does not hold is not written: the record fails on it as on any m
 |---|---|---|
 | `native_extensions_unsupported` | refused, exit 1 | The record changes build inputs that cannot be rebuilt here: the copy is not a RubyGems install with a `specifications/` entry (a Bundler git checkout); the gem neither declares extensions nor is a platform gem; it is the JRuby (`java`) build; no Ruby that owns the install was found; a precompiled gem cannot be built from its source gem (the archive is neither in the home's `cache/` nor downloadable, is not the copy's own source, the record does not apply to it, a gem its build needs could not be staged, its build leaves a library in the gem's own tree, or the build has no counterpart among the gem's prebuilt binaries); a record changes an input a build removed and the source gem cannot be built. Nothing is written. Also: another run is rebuilding the same gem right now, or an interrupted rebuild could not be undone (the error says which). |
 | `native_extension_build_failed` | refused, exit 1 | The extension did not build from the patched sources (no compiler or Ruby headers, a build error), or the finished build could not be moved into place. The installed copy is as it was before the run; the error carries the build output's tail (of the build from the source gem and of the in-place one, when both ran). |
-| `native_extension_rebuilt` | warning | The sources were already patched (by a release before #1996, or with `--no-gem-native-rebuild`) and the extension was rebuilt from them. Under `--dry-run`: the rebuild a real `apply` would run; no Ruby is started and nothing is downloaded to check that it can. |
-| `native_extension_not_rebuilt` | warning | `--no-gem-native-rebuild`: the sources were written without a rebuild; Ruby loads the old build until the caller compiles it. Or: a precompiled gem's binary was rebuilt for the Ruby that ran `apply`, and the gem ships prebuilt binaries for other Ruby versions in a gem home that is not laid out for one Ruby (the warning names them); `vex` does not attest the patch until `apply` has run under each. |
+| `native_extension_rebuilt` | warning | The sources were already patched (by a release before #1996, with `--no-gem-native-rebuild`, or by `apply` under another Ruby version of a precompiled gem) and the extension was rebuilt from them. Under `--dry-run`: the rebuild a real `apply` would run; no Ruby is started and nothing is downloaded to check that it can. |
+| `native_extension_not_rebuilt` | warning | `--no-gem-native-rebuild`: the sources were written without a rebuild; Ruby loads the old build until the caller compiles it. |
 | `native_extension_restore_failed` | rollback: that copy fails | The sources were restored, but the original compiled extension could not be put back. Run `gem pristine <gem> --extensions` (a precompiled gem: `gem pristine <gem>`). |
 
 `vex` and `apply --check` attest such a copy only while its marker matches the record's patched
@@ -1080,16 +1080,17 @@ purl fails with `native_extension_not_rebuilt`. After `gem pristine` or a reinst
 again.
 
 A precompiled gem ships one binary per Ruby minor, and a rebuild replaces the one of the Ruby that
-ran `apply`. Such a copy is attested only when no other of those binaries could be loaded from its
-gem home: the home is laid out for that one Ruby, or every one of them has been replaced. A home
-is laid out for one Ruby when the ABI in its directory name (`vendor/bundle/ruby/3.4.0`,
-`<prefix>/lib/ruby/gems/3.4.0`, `~/.gem/ruby/3.4.0`) and the ABI of every
-`extensions/<platform>/<abi>/` directory in it agree on one `major.minor`. A home that shows no
-ABI (a custom `GEM_HOME` holding no compiled gem) or more than one can be used by any Ruby:
-`apply` then warns `native_extension_not_rebuilt` with the binaries still prebuilt, `apply` under
-another Ruby replaces that Ruby's binary and keeps the others', and the copy is attested once all
-are replaced. Hosted copies are judged on their files alone, since RubyGems compiled them from the
-patched gem.
+ran `apply`, as `gem install` builds an extension for the Ruby that runs it. That is the whole
+rule: the copy is attested as soon as its marker holds, whichever gem home it is in and whatever
+binaries the gem ships for other Rubies, which are left as they are. `apply` under a Ruby version
+whose binary has not been replaced yet builds for that Ruby and replaces its binary too, keeping
+the others', in the same marker and backup; `rollback` restores every one. `apply` under a Ruby
+whose binary is already the build does nothing. To tell the two apart, `apply` asks the host Ruby
+what it is; it starts none when every binary the gem ships has been replaced, or when the gem
+home is laid out for a Ruby whose binary is the build (the ABI in its directory name,
+`vendor/bundle/ruby/3.4.0`, and of every `extensions/<platform>/<abi>/` directory in it agree on
+that `major.minor`). Hosted copies are judged on their files alone, since RubyGems compiled them
+from the patched gem.
 
 ### sbt / Mill / scala-cli caches in agent mode
 

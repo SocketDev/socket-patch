@@ -3022,14 +3022,15 @@ fn a_gem_that_loads_its_library_from_its_own_tree_is_rebuilt_in_place() {
 }
 
 /// A precompiled gem ships one binary per Ruby minor, and a graft replaces
-/// the one of the Ruby that ran `apply`. In a gem home that two Rubies
-/// build into, the other Ruby would go on loading the unpatched binary:
-/// the copy is not attested, `apply` says which binary is left, and under
-/// that Ruby it grafts that one too. Then, and only then, `apply --check`
-/// and `vex` attest it. Rollback gives both binaries back.
+/// the one of the Ruby that ran `apply`, as `gem install` builds for the
+/// Ruby that runs it. The copy is attested from that first graft on, in a
+/// gem home two Rubies build into too. `apply` under the other Ruby grafts
+/// its binary beside the first; `apply` under a Ruby already grafted builds
+/// nothing. A grafted binary that is no longer the built one fails the
+/// check, and rollback gives both binaries back.
 #[cfg(unix)]
 #[test]
-fn a_home_of_two_rubies_is_attested_once_both_binaries_are_grafted() {
+fn a_home_of_two_rubies_is_attested_from_the_first_graft() {
     let (_tmp, proj, gem_dir) = fake_precompiled_gem(true);
     // A second Ruby built a gem into this home.
     let home = proj.join("vendor/bundle/ruby/3.4.0");
@@ -3052,7 +3053,7 @@ fn a_home_of_two_rubies_is_attested_once_both_binaries_are_grafted() {
     let run = |args: &[&str]| ruby.run(&proj, args, &[]);
     let built = ["extensions_dir", "unpack", "missing_deps", "stage_build"];
 
-    // Ruby 3.4 applies: its binary is the build, 3.3's is not.
+    // Ruby 3.4 applies: its binary is the build, and the copy is attested.
     let (code, stdout, stderr) = run(&["apply", "--json", "--offline"]);
     assert_eq!(code, 0, "apply failed:\n{stdout}\n{stderr}");
     assert_eq!(event_action(&stdout), "applied", "{stdout}");
@@ -3063,17 +3064,21 @@ fn a_home_of_two_rubies_is_attested_once_both_binaries_are_grafted() {
     );
     assert_eq!(std::fs::read_to_string(&for_33).unwrap(), prebuilt("3.3"));
     assert!(
-        stdout.contains("native_extension_not_rebuilt")
-            && stdout.contains("lib/sp_native/3.3/sp_native.so"),
-        "apply must say which binary is still unpatched: {stdout}"
+        !stdout.contains("native_extension_not_rebuilt"),
+        "a graft for the Ruby that ran apply is the whole install: {stdout}"
     );
-    let (code, stdout, _) = run(&["apply", "--check", "--json"]);
-    assert_ne!(
-        code, 0,
-        "attested while Ruby 3.3 loads the old code: {stdout}"
+    let (code, stdout, stderr) = run(&["apply", "--check", "--json"]);
+    assert_eq!(code, 0, "the first graft checks clean:\n{stdout}\n{stderr}");
+    assert!(!stdout.contains("native_extension_not_rebuilt"), "{stdout}");
+    assert!(vex_attests(run), "vex attests from the first graft");
+    let (code, stdout, stderr) = run(&["apply", "--json", "--dry-run", "--offline"]);
+    assert_eq!(code, 0, "{stdout}\n{stderr}");
+    assert!(
+        !stdout.contains("native_extension_rebuilt"),
+        "a dry run of a built copy promises no rebuild: {stdout}"
     );
-    assert!(stdout.contains("native_extension_not_rebuilt"), "{stdout}");
-    assert!(!vex_attests(run), "vex attested a half-grafted copy");
+    assert_eq!(ruby.calls(), built, "a check, vex or dry run ran Ruby");
+
     // Again under 3.4: asked which Ruby it is, then nothing left to build,
     // with or without a source gem within reach.
     let cached = home.join("cache/sp_native-1.0.0.gem");
@@ -3081,8 +3086,14 @@ fn a_home_of_two_rubies_is_attested_once_both_binaries_are_grafted() {
     std::fs::rename(&cached, &parked).unwrap();
     let (code, stdout, stderr) = run(&["apply", "--json", "--offline"]);
     assert_eq!(code, 0, "{stdout}\n{stderr}");
-    assert!(stdout.contains("native_extension_not_rebuilt"), "{stdout}");
-    assert_eq!(ruby.calls(), [&built[..], &["extensions_dir"]].concat());
+    assert_eq!(event_action(&stdout), "skipped", "{stdout}");
+    assert!(!stdout.contains("native_extension_not_rebuilt"), "{stdout}");
+    let asked = [&built[..], &["extensions_dir"]].concat();
+    assert_eq!(ruby.calls(), asked);
+    assert_eq!(
+        std::fs::read_to_string(&for_34).unwrap(),
+        built_from(&c_source(2))
+    );
     std::fs::rename(&parked, &cached).unwrap();
 
     // Ruby 3.3 applies: it grafts its own binary beside the other.
@@ -3090,6 +3101,12 @@ fn a_home_of_two_rubies_is_attested_once_both_binaries_are_grafted() {
     let (code, stdout, stderr) = run(&["apply", "--json", "--offline"]);
     assert_eq!(code, 0, "apply under 3.3 failed:\n{stdout}\n{stderr}");
     assert!(!stdout.contains("native_extension_not_rebuilt"), "{stdout}");
+    assert!(
+        stdout.contains("native_extension_rebuilt"),
+        "a rebuild of sources already patched says so: {stdout}"
+    );
+    let both = [&asked[..], &built[..]].concat();
+    assert_eq!(ruby.calls(), both);
     assert_eq!(
         std::fs::read_to_string(&for_33).unwrap(),
         format!("{} (by Ruby 3.3)", built_from(&c_source(2)))
@@ -3101,7 +3118,24 @@ fn a_home_of_two_rubies_is_attested_once_both_binaries_are_grafted() {
     );
     let (code, stdout, stderr) = run(&["apply", "--check"]);
     assert_eq!(code, 0, "{stdout}\n{stderr}");
-    assert!(vex_attests(run), "vex attests once every binary is grafted");
+    assert!(vex_attests(run), "vex attests both grafts");
+    // Every binary the gem ships is grafted: no Ruby is left to ask.
+    let (code, stdout, stderr) = run(&["apply", "--json", "--offline"]);
+    assert_eq!(code, 0, "{stdout}\n{stderr}");
+    assert_eq!(event_action(&stdout), "skipped", "{stdout}");
+    assert_eq!(ruby.calls(), both, "nothing more to run");
+
+    // A grafted binary that is no longer the built one (the gem was
+    // reinstalled over it): neither `apply --check` nor `vex` attests.
+    let grafted = std::fs::read_to_string(&for_33).unwrap();
+    std::fs::write(&for_33, prebuilt("3.3")).unwrap();
+    let (code, stdout, _) = run(&["apply", "--check", "--json"]);
+    assert_ne!(code, 0, "{stdout}");
+    assert!(stdout.contains("native_extension_not_rebuilt"), "{stdout}");
+    assert!(!vex_attests(run), "vex attested a prebuilt binary");
+    std::fs::write(&for_33, grafted).unwrap();
+    let (code, stdout, stderr) = run(&["apply", "--check"]);
+    assert_eq!(code, 0, "{stdout}\n{stderr}");
 
     let (code, stdout, stderr) = run(&["rollback", "--json", "--offline"]);
     assert_eq!(code, 0, "rollback failed:\n{stdout}\n{stderr}");
