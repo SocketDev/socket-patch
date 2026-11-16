@@ -2353,6 +2353,30 @@ async fn run_get_vendored(
         ))
         .await;
         if let Some(VendorRefusal { code, detail }) = refusals.get(&patch.purl) {
+            // An expected skip (a gem version this project doesn't lock)
+            // is not an error: the same `skipped` event and `[skip]` line
+            // as the search path and `scan`, exit 0, nothing written.
+            if socket_patch_core::vendor::refusals::refusal_is_benign(code) {
+                if args.common.json {
+                    env.record(tag_mode(
+                        PatchEvent::new(EventAction::Skipped, patch.purl.as_str())
+                            .with_uuid(patch.uuid.as_str())
+                            .with_reason(*code, detail.as_str()),
+                        Some("vendored"),
+                    ));
+                    emit(&env);
+                } else if !args.common.silent {
+                    eprintln!(
+                        "{}",
+                        crate::commands::agent_download::format_refusal_skip(
+                            &patch.purl,
+                            code,
+                            detail
+                        )
+                    );
+                }
+                return 0;
+            }
             // Same failure telemetry as the vendor-step Err arm below: this
             // run exits 1 without vendoring anything.
             socket_patch_core::telemetry::track_patch_vendor_failed(

@@ -82,7 +82,7 @@ use super::state::{
     write_marker_or_warn, VendorArtifact, VendorEntry, VendorMarker, WiringAction, WiringRecord,
 };
 use super::{RevertOpts, RevertOutcome, VendorOutcome, VendorServiceConfig, VendorWarning};
-use crate::formats::gem::{is_plain_gem_token, split_checksum_entry, split_entry};
+use crate::formats::gem::{is_plain_gem_token, listed_specs, split_checksum_entry, split_entry};
 
 const GEMFILE: &str = "Gemfile";
 const GEMFILE_LOCK: &str = "Gemfile.lock";
@@ -186,6 +186,62 @@ pub async fn gem_manifest_refusal(project_root: &Path) -> Option<(&'static str, 
             loaded.unsupported_detail().unwrap_or_default(),
         )),
     }
+}
+
+/// Refusal code of a gem version the project's `Gemfile.lock` doesn't
+/// resolve. An expected skip, not a failure: the gem belongs to another
+/// project (or to Ruby itself), and there is nothing in this one to wire.
+pub const GEM_VERSION_NOT_LOCKED: &str = "vendor_gem_version_not_locked";
+
+fn version_not_locked_detail(name: &str, version: &str) -> String {
+    format!(
+        "{GEMFILE_LOCK} does not resolve {name} {version}: this project doesn't lock that \
+         version, so there is nothing to vendor"
+    )
+}
+
+/// The gem purls of `purls` whose version the project's `Gemfile.lock`
+/// doesn't resolve, each with the [`GEM_VERSION_NOT_LOCKED`] refusal the
+/// backend raises for it. A project that installs to a shared gem home
+/// (the Bundler default) is crawled together with the versions Ruby ships
+/// and the ones other projects installed; vendoring is a `Gemfile.lock`
+/// edit, and for those versions there is no entry to edit (#2075, the
+/// vendored twin of hosted mode's `redirect_gem_version_not_locked`).
+/// A spec entry in any source section counts as resolved
+/// ([`listed_specs`]).
+///
+/// Read-only. Nothing is returned when bundler loads another manifest or
+/// the lock can't be read: the backend reports those itself.
+pub async fn gem_version_not_locked_refusals(
+    project_root: &Path,
+    purls: &[&str],
+) -> Vec<(String, (&'static str, String))> {
+    let gems: Vec<(&str, String, String)> = purls
+        .iter()
+        .filter_map(|purl| {
+            let (name, version) = parse_gem_purl(purl)?;
+            Some((*purl, name.to_string(), version.to_string()))
+        })
+        .collect();
+    if gems.is_empty() || gem_manifest_refusal(project_root).await.is_some() {
+        return Vec::new();
+    }
+    let Ok(lock_text) = read_regular_to_string(&project_root.join(GEMFILE_LOCK)).await else {
+        return Vec::new();
+    };
+    let listed = listed_specs(&lock_text);
+    gems.into_iter()
+        .filter(|(_, name, version)| !listed.contains(&(name.as_str(), version.as_str())))
+        .map(|(purl, name, version)| {
+            (
+                purl.to_string(),
+                (
+                    GEM_VERSION_NOT_LOCKED,
+                    version_not_locked_detail(&name, &version),
+                ),
+            )
+        })
+        .collect()
 }
 
 /// The per-gem twin of [`gem_manifest_refusal`] for the hosted→vendored
@@ -392,6 +448,15 @@ async fn gem_prelude(
         }
     };
     let (lock_eol, lock_text) = lock_lf_form(lock_text);
+    // A version the lock doesn't resolve has no entry to move into a PATH
+    // section: an expected skip (see [`gem_version_not_locked_refusals`]),
+    // decided before the patch service is asked for anything.
+    if !listed_specs(&lock_text).contains(&(name, version)) {
+        return Err(refused(
+            GEM_VERSION_NOT_LOCKED,
+            version_not_locked_detail(name, version),
+        ));
+    }
 
     let local_stub = {
         let spec_src = installed_path
@@ -4120,10 +4185,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_unwind_on_lock_edit_failure() {
-        // The lock has no GEM spec entry for rack@3.2.6 (version skew): the
-        // lock edit fails AFTER the Gemfile was rewritten, so vendor must
-        // unwind the Gemfile to its original bytes and drop the copy.
-        let lock = LOCK_DIRECT.replace("    rack (3.2.6)", "    rack (3.1.0)");
+        // The lock lists rack@3.2.6 under two sources, which the lock edit
+        // refuses to guess between: it fails AFTER the Gemfile was
+        // rewritten, so vendor must unwind the Gemfile to its original
+        // bytes and drop the copy.
+        let lock = format!(
+            "GEM\n  remote: https://gems.example.com/\n  specs:\n    rack (3.2.6)\n\n{LOCK_DIRECT}"
+        );
         let (_tmp, root, installed, blobs, record) = fixture(GEMFILE_DIRECT, &lock).await;
 
         let (result, entry, _w) =
@@ -4151,6 +4219,41 @@ mod tests {
             !root.join(format!(".socket/vendor/gem/{UUID}")).exists(),
             "half-built copy removed"
         );
+    }
+
+    /// #2075: the installed rack 3.2.6 is a version the lock doesn't
+    /// resolve (it resolves 3.1.0; another project put 3.2.6 in the shared
+    /// gem home). There is no entry to move into a PATH section, so the
+    /// gem is refused as the skip `vendor_gem_version_not_locked`, dry run
+    /// or not, with nothing written. It used to fail the lock edit.
+    #[tokio::test]
+    async fn version_the_lock_does_not_resolve_is_refused_untouched() {
+        let lock = LOCK_DIRECT.replace("    rack (3.2.6)", "    rack (3.1.0)");
+        for (lock, dry_run) in [
+            (lock.clone(), false),
+            (lock.clone(), true),
+            (lock.replace('\n', "\r\n"), false),
+        ] {
+            let (_tmp, root, installed, blobs, record) = fixture(GEMFILE_DIRECT, &lock).await;
+            let (code, detail) =
+                unwrap_refused(run_vendor(&root, &blobs, &installed, &record, dry_run).await);
+            assert_eq!(code, GEM_VERSION_NOT_LOCKED);
+            assert!(
+                detail.contains("Gemfile.lock does not resolve rack 3.2.6"),
+                "{detail}"
+            );
+            assert_eq!(
+                tokio::fs::read_to_string(root.join(GEMFILE)).await.unwrap(),
+                GEMFILE_DIRECT
+            );
+            assert_eq!(
+                tokio::fs::read_to_string(root.join(GEMFILE_LOCK))
+                    .await
+                    .unwrap(),
+                lock
+            );
+            assert!(!root.join(".socket/vendor").exists());
+        }
     }
 
     #[tokio::test]
@@ -9465,6 +9568,88 @@ mod tests {
             edit.source_remote.as_deref(),
             Some("  remote: https://rubygems.org/")
         );
+    }
+
+    /// #2075: what counts as "the lock resolves this version". A spec
+    /// entry in any section does, the portable gem or a platform build of
+    /// it; a dependency subline, a DEPENDENCIES or CHECKSUMS entry, another
+    /// version or a gem whose name only starts the same does not.
+    #[test]
+    fn listed_specs_reads_spec_entries_of_every_section() {
+        let lists =
+            |lock: &str, name: &str, version: &str| listed_specs(lock).contains(&(name, version));
+        assert!(lists(LOCK_DIRECT, "rack", "3.2.6"));
+        assert!(lists(LOCK_TWO_SOURCES, "rack", "3.2.6"));
+        let crlf = LOCK_DIRECT.replace('\n', "\r\n");
+        assert!(lists(&crlf, "rack", "3.2.6"));
+        // Our own PATH section, a user's PATH or GIT section.
+        assert!(lists(&expected_lock_two_sources(), "rack", "3.2.6"));
+        let git = "GIT\n  remote: https://example.com/rack.git\n  revision: abc\n  specs:\n    rack (3.2.6)\n\nGEM\n  specs:\n\nDEPENDENCIES\n  rack!\n";
+        assert!(lists(git, "rack", "3.2.6"));
+        // A platform build of the version is still that version.
+        let platform = "GEM\n  remote: https://rubygems.org/\n  specs:\n    ffi (1.17.2-x86_64-linux-gnu)\n\nCHECKSUMS\n  rake (13.0.6) sha256=00\n";
+        assert!(lists(platform, "ffi", "1.17.2"));
+
+        assert!(!lists(LOCK_DIRECT, "rack", "3.2.5"));
+        assert!(!lists(LOCK_DIRECT, "rack", "3.2"));
+        assert!(!lists(LOCK_DIRECT, "rack", "3.2.60"));
+        assert!(!lists(LOCK_DIRECT, "rac", "3.2.6"));
+        // `nio4r (~> 2.0)` and `base64 (>= 0.1.0)` are dependency sublines.
+        assert!(!lists(LOCK_DIRECT, "base64", ">= 0.1.0"));
+        assert!(!lists(platform, "ffi", "1.17"));
+        assert!(!lists(platform, "rake", "13.0.6"));
+        assert!(!lists("", "rack", "3.2.6"));
+    }
+
+    /// #2075: the refusals name exactly the gem purls the lock doesn't
+    /// resolve, qualified or not, and leave every other ecosystem alone.
+    #[tokio::test]
+    async fn version_not_locked_refusals_name_only_unlocked_gems() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join(GEMFILE), GEMFILE_DIRECT).unwrap();
+        std::fs::write(tmp.path().join(GEMFILE_LOCK), LOCK_DIRECT).unwrap();
+        let purls = [
+            "pkg:gem/rack@3.2.6",
+            "pkg:gem/rack@2.2.8",
+            "pkg:gem/rake@13.0.6?platform=ruby",
+            "pkg:gem/puma@6.4.2?platform=ruby",
+            "pkg:npm/rake@13.0.6",
+        ];
+        let refused = gem_version_not_locked_refusals(tmp.path(), &purls).await;
+        let names: Vec<&str> = refused.iter().map(|(purl, _)| purl.as_str()).collect();
+        assert_eq!(
+            names,
+            ["pkg:gem/rack@2.2.8", "pkg:gem/rake@13.0.6?platform=ruby"]
+        );
+        for (_, (code, detail)) in &refused {
+            assert_eq!(*code, GEM_VERSION_NOT_LOCKED);
+            assert!(
+                detail.contains("this project doesn't lock that version"),
+                "{detail}"
+            );
+        }
+        assert!(refused[0].1 .1.contains("does not resolve rack 2.2.8"));
+    }
+
+    /// With no readable lock, or a manifest bundler doesn't load, nothing
+    /// is judged here: the backend's own refusal names the real problem.
+    #[tokio::test]
+    async fn version_not_locked_refusals_leave_other_problems_to_the_backend() {
+        let purls = ["pkg:gem/rake@13.0.6"];
+        let no_lock = tempfile::tempdir().unwrap();
+        std::fs::write(no_lock.path().join(GEMFILE), GEMFILE_DIRECT).unwrap();
+        assert!(gem_version_not_locked_refusals(no_lock.path(), &purls)
+            .await
+            .is_empty());
+
+        let gems_rb = tempfile::tempdir().unwrap();
+        std::fs::write(gems_rb.path().join(GEMFILE), GEMFILE_DIRECT).unwrap();
+        std::fs::write(gems_rb.path().join(GEMFILE_LOCK), LOCK_DIRECT).unwrap();
+        std::fs::write(gems_rb.path().join("gems.rb"), GEMFILE_DIRECT).unwrap();
+        assert!(gem_manifest_refusal(gems_rb.path()).await.is_some());
+        assert!(gem_version_not_locked_refusals(gems_rb.path(), &purls)
+            .await
+            .is_empty());
     }
 
     /// The first-section case keeps its ledger shape: no source remote is

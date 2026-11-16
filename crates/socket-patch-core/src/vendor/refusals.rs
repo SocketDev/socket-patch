@@ -17,7 +17,10 @@
 //! 2. the npm package-lock project refusal (a lock that is not v2/v3);
 //! 3. the lock-text refusals a hosted pnpm pin's takeover meets (#853);
 //! 4. the lock-text refusals of every other npm and cargo candidate, the
-//!    ones the backend raises on the lock and manifest text alone.
+//!    ones the backend raises on the lock and manifest text alone;
+//! 5. a gem version the project's `Gemfile.lock` doesn't
+//!    resolve (`vendor_gem_version_not_locked`, which the callers report
+//!    as a skip).
 //!
 //! Each check lives in its backend's module; this one only dispatches and
 //! scopes them.
@@ -31,12 +34,27 @@ use crate::crawlers::Ecosystem;
 use crate::patch::redirect::upstream::HostedPin;
 use crate::utils::purl_key::PurlKey;
 use crate::vendor::state::{lookup_entry, VendorEntry};
-use crate::vendor::{bun_lock, lock_inventory, npm_flavor, npm_lock, vlt_lock};
+use crate::vendor::{bun_lock, gem, lock_inventory, npm_flavor, npm_lock, vlt_lock};
 
 /// The vendor ledger as the refusals consume it: the caller's own load
 /// outcome, so an UNREADABLE ledger is a refusal the run can report
 /// instead of a silently empty ledger.
 pub type LedgerLoad<'a> = Result<&'a HashMap<String, VendorEntry>, &'a std::io::Error>;
+
+/// Refusal codes that are expected skips, not command failures: the user's
+/// request is still fully satisfied when these are the only non-successes.
+/// Every vendored entry point (`vendor`, `scan`, `get`, their dry runs)
+/// reads this one answer.
+pub fn refusal_is_benign(code: &str) -> bool {
+    matches!(code, "vendor_unsupported_ecosystem" | "already_vendored")
+        // A gem version another project (or Ruby) put in the shared gem
+        // home: this project doesn't lock it, so there is nothing to wire.
+        || code == gem::GEM_VERSION_NOT_LOCKED
+        // An older vendored patch kept in force while the newer one is
+        // unserved.
+        || super::is_unserved(code)
+        || super::jvm::sbt_gate::SKIP_CODES.contains(&code)
+}
 
 /// A purl the engine would refuse: its stable code and detail.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -144,7 +162,28 @@ pub async fn vendor_refusals(
     for (purl, (code, detail)) in takeover_refusals.into_iter().chain(lock_text) {
         refuse(&mut out, &purl, code, &detail);
     }
+    for (purl, (code, detail)) in gem_refusals(project_root, candidates).await {
+        refuse(&mut out, &purl, code, &detail);
+    }
     out
+}
+
+/// The gem candidates whose version `Gemfile.lock` doesn't resolve
+/// ([`gem::gem_version_not_locked_refusals`]), installed or not: the
+/// backend refuses either before it asks the patch service for anything.
+async fn gem_refusals(
+    project_root: &Path,
+    candidates: &[(&str, &str)],
+) -> Vec<(String, (&'static str, String))> {
+    let gems: Vec<&str> = candidates
+        .iter()
+        .map(|(purl, _)| *purl)
+        .filter(|purl| Ecosystem::from_purl(purl) == Some(Ecosystem::Gem))
+        .collect();
+    if gems.is_empty() {
+        return Vec::new();
+    }
+    gem::gem_version_not_locked_refusals(project_root, &gems).await
 }
 
 fn refuse(out: &mut VendorRefusals, purl: &str, code: &'static str, detail: &str) {
@@ -349,6 +388,49 @@ mod tests {
 
     fn entry(json: serde_json::Value) -> VendorEntry {
         serde_json::from_value(json).unwrap()
+    }
+
+    mod gem {
+        use super::*;
+
+        const LOCKED: &str = "pkg:gem/rack@2.2.8";
+        const UNLOCKED: &str = "pkg:gem/rake@13.0.6";
+
+        fn project() -> tempfile::TempDir {
+            let tmp = tempfile::tempdir().unwrap();
+            std::fs::write(
+                tmp.path().join("Gemfile"),
+                "source \"https://rubygems.org\"\n\ngem \"rack\", \"2.2.8\"\n",
+            )
+            .unwrap();
+            std::fs::write(
+                tmp.path().join("Gemfile.lock"),
+                "GEM\n  remote: https://rubygems.org/\n  specs:\n    rack (2.2.8)\n\nPLATFORMS\n  ruby\n\nDEPENDENCIES\n  rack (= 2.2.8)\n\nBUNDLED WITH\n   2.6.9\n",
+            )
+            .unwrap();
+            tmp
+        }
+
+        /// #2075: a gem version the lock doesn't resolve (one the gem
+        /// home holds for Ruby or another project, or one that is not
+        /// installed at all) is refused before any download; the gem the
+        /// project locks is left to the engine.
+        #[tokio::test]
+        async fn version_the_lock_does_not_resolve_is_refused() {
+            let tmp = project();
+            let pairs = [(LOCKED, UUID), (UNLOCKED, OTHER_UUID)];
+            let state = HashMap::new();
+            let got = run(tmp.path(), &pairs, Ok(&state)).await;
+            assert_eq!(got.keys().collect::<Vec<_>>(), [UNLOCKED]);
+            assert_eq!(got[UNLOCKED].code, "vendor_gem_version_not_locked");
+            assert!(
+                got[UNLOCKED]
+                    .detail
+                    .contains("does not resolve rake 13.0.6"),
+                "{}",
+                got[UNLOCKED].detail
+            );
+        }
     }
 
     mod bun {

@@ -477,6 +477,20 @@ pub(crate) fn locked_specs(lock: &str) -> HashSet<(&str, &str)> {
         .collect()
 }
 
+/// Every `name (version)` spec ANY source section of the Bundler lock
+/// `lock` lists (`GEM`, `PATH`, `GIT`, `PLUGIN SOURCE`; any platform).
+/// Vendored mode only wires what the lock resolves: its own `PATH`
+/// sections count, and so does a section it cannot edit, which the backend
+/// reports for what it is (#2075).
+pub(crate) fn listed_specs(lock: &str) -> HashSet<(&str, &str)> {
+    parse(lock)
+        .sections
+        .iter()
+        .flat_map(|s| s.specs.iter().filter_map(|l| l.parsed))
+        .map(|spec| (spec.name, spec.version))
+        .collect()
+}
+
 /// The plain gem-token charset (letters, digits, `.`, `_`, `-`). The vendor
 /// backend applies it before embedding coordinates into Ruby source and lock
 /// line grammar (see the SECURITY note in `crate::vendor::gem`'s
