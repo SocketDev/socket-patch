@@ -100,12 +100,21 @@ fn crates_index_path(name: &str) -> Option<String> {
 /// The RubyGems compact index root; override with `SOCKET_RUBYGEMS_URL`.
 pub(crate) const DEFAULT_RUBYGEMS: &str = "https://rubygems.org";
 
-pub(super) fn rubygems_base() -> String {
+pub(crate) fn rubygems_base() -> String {
     std::env::var("SOCKET_RUBYGEMS_URL")
         .ok()
         .map(|v| v.trim().trim_end_matches('/').to_string())
         .filter(|v| !v.is_empty())
         .unwrap_or_else(|| DEFAULT_RUBYGEMS.to_string())
+}
+
+/// Whether `remote` (a lock's `remote:`, a download base) is the default
+/// RubyGems registry: rubygems.org, or its `SOCKET_RUBYGEMS_URL` stand-in.
+/// The one test of it, shared by the upstream restore and by the source
+/// gem lookup of a native-extension rebuild (`patch::gem_source`).
+pub(crate) fn is_rubygems_remote(remote: &str) -> bool {
+    use crate::formats::gem::same_remote;
+    same_remote(remote, DEFAULT_RUBYGEMS) || same_remote(remote, &rubygems_base())
 }
 
 /// Packagist's composer v2 metadata repository; override with

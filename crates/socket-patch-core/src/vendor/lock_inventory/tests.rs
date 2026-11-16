@@ -4200,13 +4200,23 @@ fn unsupported_layout_warnings_rewrites_known_codes_and_forwards_unknown_ones() 
 ///   re-resolves the entry from the registry's own metadata and never
 ///   reads the hosted pin's URL or hash, the JVM backend's Maven
 ///   Central fetches (`maven_repo`, `jvm_jar`), whose URLs are built from
-///   coordinates and checked against the upstream checksum files, and the
+///   coordinates and checked against the upstream checksum files, the
 ///   gem refresh after a hosted unwind (`patch::gem_refresh`), which
 ///   fetches `<rubygems base>/gems/<name>-<version>.gem`, a URL built from
 ///   the gem's name and version, and uses the bytes only when their sha256
 ///   is the one the restore re-pinned from the registry's compact index
 ///   (`upstream::gem::upstream_archive`); a lock still on its hosted entry
-///   yields no URL at all.
+///   yields no URL at all; and the source gem an agent-mode native
+///   extension is rebuilt from (`patch::gem_source`), with the gems its
+///   build lacks: `<rubygems base>/gems/<name>-<version>.gem` and
+///   `<rubygems base>/info/<name>`, URLs built from the installed gem's
+///   name and version (a build dependency's from the name the source gem's
+///   own metadata gives), with the bytes used only when their sha256 is
+///   the one the registry's compact index records. That module reads the
+///   lock for one thing, to withhold the download: a gem the lock resolves
+///   from any other source (a Socket-hosted entry among them) is fetched
+///   from nowhere. The lock's `remote:` and `CHECKSUMS` never become a URL
+///   or an expected hash.
 ///
 /// [`PINNED_REFERENCES`] lists every production reference to those three
 /// functions in this crate, by file and line text. What the check catches:
@@ -4224,6 +4234,24 @@ const PINNED_REFERENCES: &[(&str, &str, &str)] = &[
         "patch/gem_refresh.rs",
         "download",
         "crate::vendor::registry_fetch::download(&client, url).await",
+    ),
+    // The source gem of a native-extension rebuild, and a gem its build
+    // lacks: the registry's compact index document, then the archive it
+    // names by sha256. Never a URL or a hash out of the lock.
+    (
+        "patch/gem_source.rs",
+        "download",
+        "use crate::vendor::registry_fetch::{build_registry_client, download, RegistryClient};",
+    ),
+    (
+        "patch/gem_source.rs",
+        "download",
+        "let bytes = download(self.http.get_or_init(build_registry_client), &url).await?;",
+    ),
+    (
+        "patch/gem_source.rs",
+        "download",
+        "let bytes = download(self.http.get_or_init(build_registry_client), &url).await?;",
     ),
     (
         "patch/redirect/upstream/client.rs",

@@ -1100,7 +1100,6 @@ pub(super) async fn upstream_archive(
 /// remote is rubygems.org (or the `SOCKET_RUBYGEMS_URL` stand-in).
 fn rubygems_locked(lock: &str, name: &str, version: &str) -> bool {
     let lines: Vec<&str> = lock.split('\n').collect();
-    let base = super::rubygems_base();
     gem_sections(&lines).iter().any(|sec| {
         sec.entries
             .iter()
@@ -1108,7 +1107,7 @@ fn rubygems_locked(lock: &str, name: &str, version: &str) -> bool {
             && sec
                 .remotes
                 .iter()
-                .any(|(_, r)| same_remote(r, RUBYGEMS_REMOTE) || same_remote(r, &base))
+                .any(|(_, r)| super::is_rubygems_remote(r))
     })
 }
 
