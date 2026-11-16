@@ -58,9 +58,28 @@ pub fn try_linked_level(root: &Path, path: &Path) -> std::io::Result<Option<Path
 }
 
 /// Whether `path` is itself a symlink or a Windows junction (lstat; a
-/// missing or unreadable path is not).
+/// missing or unreadable path is not). Callers that are about to follow,
+/// empty or delete the entry must fail closed on a path that cannot be
+/// probed, and use [`try_entry_type`].
 pub fn is_link(path: &Path) -> bool {
     std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink())
+}
+
+/// What is at `path` itself (lstat: a link there is not followed), or
+/// `Ok(None)` when nothing is. An lstat error other than `NotFound`
+/// (EACCES, ENOTDIR, an I/O error) is returned, naming the path, instead
+/// of being read as "nothing there" or "not a link": an entry that cannot
+/// be probed may be a planted link, and whatever is done next by path
+/// (create, empty, delete) would then land in its target.
+pub fn try_entry_type(path: &Path) -> std::io::Result<Option<std::fs::FileType>> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) => Ok(Some(meta.file_type())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(std::io::Error::new(
+            e.kind(),
+            format!("{} could not be checked ({e})", path.display()),
+        )),
+    }
 }
 
 /// The refusal for writing or deleting `what` through the linked `link`.
@@ -209,6 +228,56 @@ mod tests {
             try_linked_level(root, &root.join("missing/deeper")).unwrap(),
             None
         );
+    }
+
+    /// `try_entry_type` reads only "not found" as nothing there. An entry
+    /// it cannot probe (a parent that is a file; a directory it may not
+    /// search) is an error naming the path, where `is_link` says "no link".
+    #[cfg(unix)]
+    #[test]
+    fn try_entry_type_fails_closed_on_an_unprobeable_path() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir(root.join("dir")).unwrap();
+        std::fs::write(root.join("file"), b"x").unwrap();
+        symlink(root.join("dir"), root.join("link")).unwrap();
+        symlink(root.join("nowhere"), root.join("dangling")).unwrap();
+
+        let kind = |name: &str| try_entry_type(&root.join(name)).unwrap();
+        assert!(kind("dir").unwrap().is_dir());
+        assert!(kind("file").unwrap().is_file());
+        assert!(kind("link").unwrap().is_symlink());
+        assert!(kind("dangling").unwrap().is_symlink());
+        assert!(kind("missing").is_none());
+        assert!(kind("missing/deeper").is_none());
+
+        let through_file = root.join("file/below");
+        let err = try_entry_type(&through_file).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains(&through_file.display().to_string())
+                && err.to_string().contains("could not be checked"),
+            "{err}"
+        );
+        assert!(!is_link(&through_file));
+
+        // Root searches any directory: the permission case needs a user.
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipping the unreadable-directory case: running as root");
+            return;
+        }
+        let locked = root.join("locked");
+        std::fs::create_dir(&locked).unwrap();
+        symlink(root.join("dir"), locked.join("planted")).unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let probed = try_entry_type(&locked.join("planted"));
+        let seen = is_link(&locked.join("planted"));
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let err = probed.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{err}");
+        assert!(err.to_string().contains("planted"), "{err}");
+        assert!(!seen, "`is_link` reads the planted link as no link");
     }
 
     #[cfg(unix)]

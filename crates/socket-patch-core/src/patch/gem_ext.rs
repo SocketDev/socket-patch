@@ -200,6 +200,7 @@ use crate::patch::apply::{
 };
 use crate::patch::file_hash::compute_file_git_sha256_sync;
 use crate::patch::gem_source::{GemId, GemSource, RubyVersions};
+use crate::utils::containment::try_entry_type;
 use crate::utils::fs::read_regular_to_bytes_sync;
 
 /// The refusal when a native-extension patch cannot be rebuilt here (the
@@ -929,8 +930,20 @@ fn is_confined_ext_label(full_name: &str, label: &str) -> bool {
         && is_safe_relative_subpath(label)
 }
 
-fn is_symlink(path: &Path) -> bool {
-    std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink())
+/// `Err` when `path` is a symlink, and when nothing says it is not one:
+/// only "not found" reads as no link, and a path that cannot be probed
+/// (permission denied, a parent that is no directory, an I/O error) is
+/// refused like a link ([`try_entry_type`]). For a path this module is
+/// about to follow, empty or delete; `what` is what belongs there ("an
+/// extension dir"). The error names the path.
+fn refuse_link(path: &Path, what: &str) -> std::io::Result<()> {
+    match try_entry_type(path)? {
+        Some(kind) if kind.is_symlink() => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{} is a symlink, not {what}", path.display()),
+        )),
+        _ => Ok(()),
+    }
 }
 
 fn read_marker_sync(gem_dir: &Path) -> Option<BuildMarker> {
@@ -1581,12 +1594,7 @@ fn recover_interrupted_rebuild_sync(
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(e) => return Err(e),
         };
-        if is_symlink(&ext) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("{} is a symlink, not an extension dir", ext.display()),
-            ));
-        }
+        refuse_link(&ext, "an extension dir")?;
         if ext.join(BUILD_COMPLETE).is_file() {
             remove_dir_if_exists(&parked)?;
         } else {
@@ -2141,11 +2149,13 @@ fn ext_dir_label(home: &Path, ext_dir: &Path) -> String {
 /// list. `Ok(true)` when this call made the backup.
 fn back_up_original(copy: &GemCopy, probe: &Probe, absent: &[String]) -> std::io::Result<bool> {
     let backup = copy.gem_dir.join(BACKUP_DIR);
-    if std::fs::symlink_metadata(&backup).is_ok() {
+    // "Not there" is the one answer a new backup is made on: a backup or a
+    // marker that cannot be probed may hold the original build already.
+    if try_entry_type(&backup)?.is_some() {
         note_absent_files(&backup, absent)?;
         return Ok(false);
     }
-    if std::fs::symlink_metadata(copy.gem_dir.join(MARKER_FILE)).is_ok() {
+    if try_entry_type(&copy.gem_dir.join(MARKER_FILE))?.is_some() {
         return Ok(false);
     }
     let stage = copy.gem_dir.join(format!("{BACKUP_DIR}.tmp"));
@@ -2450,14 +2460,23 @@ fn stage_root(copy: &GemCopy) -> PathBuf {
 /// at all. The gem tree can come from the repository being scanned, and a
 /// stage is created, emptied and deleted by path: a link (or a file)
 /// planted at either name would steer those writes and deletes into
-/// whatever it points at. `Err` names the entry that is in the way. Every
-/// use of the stage goes through here.
-fn stage_dirs(copy: &GemCopy) -> Result<(PathBuf, PathBuf), PathBuf> {
+/// whatever it points at. An entry that cannot be probed is no better: only
+/// "not found" says nothing is there ([`try_entry_type`]). `Err` says which
+/// entry is in the way, and how. Every use of the stage goes through here.
+fn stage_dirs(copy: &GemCopy) -> Result<(PathBuf, PathBuf), String> {
     let parent = copy.home.join(BUILD_STAGE_DIR);
     let root = stage_root(copy);
     for dir in [&parent, &root] {
-        if std::fs::symlink_metadata(dir).is_ok_and(|meta| !meta.is_dir()) {
-            return Err(dir.clone());
+        match try_entry_type(dir) {
+            Ok(None) => {}
+            Ok(Some(kind)) if kind.is_dir() => {}
+            Ok(Some(_)) => {
+                return Err(format!(
+                    "its stage directory {} is not a directory",
+                    dir.display()
+                ))
+            }
+            Err(e) => return Err(format!("its stage directory {e}")),
         }
     }
     Ok((parent, root))
@@ -2496,8 +2515,9 @@ fn unlocked_stage_is_dead(root: &Path) -> bool {
 /// one that is left is only disk space. `Err` of kind `WouldBlock`: a run
 /// that is still alive holds it ([`lock_build_dir`]); or, where a
 /// directory cannot be locked, it is not old enough to be provably dead
-/// ([`unlocked_stage_is_dead`]). A link planted where the stage goes is
-/// left alone, with whatever it points at ([`stage_dirs`]).
+/// ([`unlocked_stage_is_dead`]). A link planted where the stage goes, or
+/// an entry there that cannot be probed, is left alone, with whatever it
+/// points at ([`stage_dirs`]).
 fn sweep_stale_stage(copy: &GemCopy) -> std::io::Result<()> {
     sweep_stale_stage_with(copy, lock_build_dir)
 }
@@ -2555,12 +2575,7 @@ impl Stage {
 fn open_stage(copy: &GemCopy) -> Result<Stage, StageFailure> {
     // The stage is emptied and written under the gem home. A link planted
     // where it goes would move both somewhere else.
-    let (parent, root) = stage_dirs(copy).map_err(|planted| {
-        StageFailure::NoStage(format!(
-            "its stage directory {} is not a directory",
-            planted.display()
-        ))
-    })?;
+    let (parent, root) = stage_dirs(copy).map_err(StageFailure::NoStage)?;
     let failed = |e: std::io::Error| {
         if e.kind() == std::io::ErrorKind::WouldBlock {
             StageFailure::Busy(recovery_refusal(copy, &e))
@@ -2762,12 +2777,15 @@ fn prove_own_source(
     let mut agreed = 0;
     for rel in tree_files(staged) {
         let theirs = installed.join(&rel);
-        match std::fs::symlink_metadata(&theirs) {
-            Err(_) => continue,
-            Ok(meta) if !meta.is_file() => {
+        // Only a file that is not there is one the copy does not hold. One
+        // that cannot be probed is not compared, so it proves nothing.
+        match try_entry_type(&theirs) {
+            Ok(None) => continue,
+            Ok(Some(kind)) if !kind.is_file() => {
                 return Err(format!("{rel} is not a file in the installed gem"))
             }
-            Ok(_) => {}
+            Ok(Some(_)) => {}
+            Err(e) => return Err(format!("{rel}: in the installed gem, {e}")),
         }
         let (Ok(ours), Ok(theirs)) = (
             compute_file_git_sha256_sync(&staged.join(&rel)),
@@ -3432,11 +3450,14 @@ fn back_up_prebuilt(copy: &GemCopy, grafts: &[Graft], absent: &[String]) -> std:
         std::fs::write(&dst, read_regular_to_bytes_sync(&src)?)?;
         std::fs::set_permissions(&dst, std::fs::symlink_metadata(&src)?.permissions())
     };
-    if std::fs::symlink_metadata(&backup).is_ok() {
-        let known = read_regular_to_bytes_sync(&backup.join(BACKUP_INFO))
-            .ok()
+    // As [`back_up_original`]: only "not there" makes a new backup.
+    if let Some(kind) = try_entry_type(&backup)? {
+        let known = kind
+            .is_dir()
+            .then(|| read_regular_to_bytes_sync(&backup.join(BACKUP_INFO)).ok())
+            .flatten()
             .and_then(|bytes| serde_json::from_slice::<BackupInfo>(&bytes).ok());
-        if let Some(mut info) = known.filter(|info| info.grafted && is_real_dir(&backup)) {
+        if let Some(mut info) = known.filter(|info| info.grafted) {
             let before = (info.lib_files.len(), info.absent_files.len());
             for graft in grafts {
                 if original(&graft.target) && !info.lib_files.contains(&graft.target) {
@@ -3457,7 +3478,7 @@ fn back_up_prebuilt(copy: &GemCopy, grafts: &[Graft], absent: &[String]) -> std:
     }
     // A marker that cannot be read says nothing of which binaries are the
     // gem's own.
-    if marker.is_none() && std::fs::symlink_metadata(copy.gem_dir.join(MARKER_FILE)).is_ok() {
+    if marker.is_none() && try_entry_type(&copy.gem_dir.join(MARKER_FILE))?.is_some() {
         return Ok(false);
     }
     let fresh: Vec<&Graft> = grafts.iter().filter(|g| original(&g.target)).collect();
@@ -3656,9 +3677,9 @@ pub async fn rollback_files(
     };
     let info = crate::utils::fs::run_blocking(move || {
         let backup = copy.gem_dir.join(BACKUP_DIR);
-        if is_symlink(&backup) {
-            return None;
-        }
+        // A backup this tool made is a directory. A link there, or an
+        // entry that cannot be told from one, is not read through.
+        refuse_link(&backup, "a backup").ok()?;
         let bytes = read_regular_to_bytes_sync(&backup.join(BACKUP_INFO)).ok()?;
         serde_json::from_slice::<BackupInfo>(&bytes).ok()
     })
@@ -4479,11 +4500,11 @@ pub async fn restore_original_build(pkg_path: &Path, env: &RubyEnv) -> Result<bo
         "run `gem pristine {} --extensions`",
         gem_name_of(&copy.full_name)
     );
-    if is_symlink(&backup) {
-        return Err(format!(
-            "{} is a symlink, not a backup this tool made; left as it is, {pristine_hint}",
-            backup.display()
-        ));
+    {
+        let backup = backup.clone();
+        crate::utils::fs::run_blocking(move || refuse_link(&backup, "a backup this tool made"))
+            .await
+            .map_err(|e| format!("{e}; left as it is, {pristine_hint}"))?;
     }
     let has_backup = tokio::fs::metadata(backup.join(BACKUP_INFO)).await.is_ok();
     if has_backup {
@@ -4610,18 +4631,18 @@ fn restore_backup(copy: &GemCopy, marker: Option<&BuildMarker>) -> std::io::Resu
     if info.grafted {
         restore_lib_files()?;
     } else {
-        let ext_dir = confined_ext_dir(copy, &info.extension_dir)
-            .filter(|dir| !is_symlink(dir))
-            .ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!(
-                        "the backup names {:?}, which is not this gem's extension dir under {}",
-                        info.extension_dir,
-                        copy.home.display()
-                    ),
-                )
-            })?;
+        let ext_dir = confined_ext_dir(copy, &info.extension_dir).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "the backup names {:?}, which is not this gem's extension dir under {}",
+                    info.extension_dir,
+                    copy.home.display()
+                ),
+            )
+        })?;
+        // It is emptied and refilled by path.
+        refuse_link(&ext_dir, "this gem's extension dir")?;
         // socket-patch's lib copies go; the originals come back.
         for lib in marker.iter().flat_map(|m| m.lib_artifacts.keys()) {
             if is_safe_relative_subpath(lib) && !info.lib_files.contains(lib) {
@@ -6426,7 +6447,7 @@ mod tests {
             );
             assert!(outside.join("a-1/keep").is_file(), "{case}");
             assert!(
-                is_symlink(&home.join(BUILD_STAGE_DIR)),
+                crate::utils::containment::is_link(&home.join(BUILD_STAGE_DIR)),
                 "{case}: the link is left"
             );
             let why = open_stage(&copy).err().unwrap().describe();
@@ -6444,6 +6465,112 @@ mod tests {
         assert!(outside.join("a-1/keep").is_file());
         assert!(open_stage(&copy).is_err());
         assert!(outside.join("a-1/keep").is_file());
+    }
+
+    /// Only "not found" says a path holds nothing. One that cannot be
+    /// probed (a parent that is a file; a directory that may not be
+    /// searched) may hold a planted link, so it is refused like one: the
+    /// stage is neither swept nor opened, a backup is not restored through,
+    /// and a file the own-source proof cannot look at proves nothing. Each
+    /// refusal names the path.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_unprobeable_path_is_never_taken_for_a_real_one() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let copy = installed_gem(&home, "lib");
+        std::fs::write(copy.gem_dir.join("lib/a.rb"), b"x").unwrap();
+
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&home, &link).unwrap();
+        let why = refuse_link(&link, "an extension dir").unwrap_err();
+        assert!(
+            why.to_string()
+                .contains("is a symlink, not an extension dir"),
+            "{why}"
+        );
+        refuse_link(&tmp.path().join("missing"), "a dir").unwrap();
+        refuse_link(&home, "a dir").unwrap();
+        // ENOTDIR: a file where a directory is named.
+        let through_file = copy.gem_dir.join("lib/a.rb/below");
+        let why = refuse_link(&through_file, "a dir").unwrap_err().to_string();
+        assert!(
+            why.contains("lib/a.rb/below") && why.contains("could not be checked"),
+            "{why}"
+        );
+
+        // Root searches any directory: the rest needs a user.
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipping the unreadable-directory cases: running as root");
+            return;
+        }
+        let mode = |path: &Path, mode: u32| {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap()
+        };
+
+        // A stage a dead run left, in a gem home that may not be searched.
+        let root = stage_root(&copy);
+        std::fs::create_dir_all(root.join("home")).unwrap();
+        std::fs::write(root.join("home/half"), b"x").unwrap();
+        mode(&home, 0o000);
+        let named = stage_dirs(&copy);
+        let swept = sweep_stale_stage(&copy);
+        let opened = open_stage(&copy).map(|_| ()).map_err(|e| e.describe());
+        mode(&home, 0o755);
+        for why in [named.unwrap_err(), opened.unwrap_err()] {
+            assert!(
+                why.contains(BUILD_STAGE_DIR)
+                    && why.contains("could not be checked")
+                    && why.contains("ermission denied"),
+                "{why}"
+            );
+        }
+        swept.unwrap();
+        assert!(
+            root.join("home/half").is_file(),
+            "an unverified stage was swept"
+        );
+
+        // A file the installed copy holds, where it cannot be looked at: the
+        // archive's differs, and the proof must not pass on the rest.
+        let (installed, staged) = (tmp.path().join("installed"), tmp.path().join("staged"));
+        for (tree, lib) in [(&installed, "theirs"), (&staged, "ours")] {
+            std::fs::create_dir_all(tree.join("lib")).unwrap();
+            std::fs::create_dir_all(tree.join("ext/a")).unwrap();
+            std::fs::write(tree.join("lib/a.rb"), lib).unwrap();
+            std::fs::write(tree.join("ext/a/a.c"), b"int a;").unwrap();
+        }
+        mode(&installed.join("lib"), 0o000);
+        let proved = prove_own_source(&installed, &staged, &HashMap::new());
+        mode(&installed.join("lib"), 0o755);
+        let why = proved.unwrap_err();
+        assert!(
+            why.contains("lib/a.rb") && why.contains("could not be checked"),
+            "{why}"
+        );
+        let why = prove_own_source(&installed, &staged, &HashMap::new()).unwrap_err();
+        assert!(why.contains("lib/a.rb differs"), "{why}");
+
+        // A gem dir that may not be searched: whether it holds a backup (or
+        // a link planted where one goes) cannot be told, so rollback does
+        // not report the copy as carrying none.
+        let env = RubyEnv {
+            cwd: tmp.path().to_path_buf(),
+            rebuild: true,
+            offline: true,
+        };
+        mode(&copy.gem_dir, 0o000);
+        let restored = restore_original_build(&copy.gem_dir, &env).await;
+        mode(&copy.gem_dir, 0o755);
+        let why = restored.unwrap_err();
+        assert!(
+            why.contains(BACKUP_DIR)
+                && why.contains("could not be checked")
+                && why.contains("gem pristine a"),
+            "{why}"
+        );
+        assert_eq!(restore_original_build(&copy.gem_dir, &env).await, Ok(false));
     }
 
     /// Where a directory cannot be locked, nothing vouches that a stage is
