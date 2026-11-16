@@ -37,7 +37,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
-use super::maven_scope::{is_import, normalize, Chain, Node, Walk};
+use super::maven_scope::{is_import, normalize, Chain, Node, Reads, Walk};
 use crate::formats::maven::version::{MavenVersion, VersionRange};
 use crate::formats::maven::{
     interpolate_strict, lookup_property, maven_config_properties, split_socket_version, PomLayer,
@@ -147,32 +147,13 @@ impl MavenSelection {
 
     /// The selection of the project at `project_root` over the local
     /// repository `repo`. One run asks for it once per patch and command
-    /// stage, so the last answer is kept and reused while every file it
-    /// was read from (the project's poms and configuration, each pom
-    /// looked up in the repository, each version list) is as it was: a
-    /// few hundred `stat`s in place of as many parses. What a run writes
-    /// itself (a pin, a rewritten declaration) changes a pom and is read
-    /// again.
+    /// stage, so the last answer is kept, and given again for as long as
+    /// every read of the file system it was made from returns what it
+    /// returned then: content is compared, never a length or a time.
     pub fn of(project_root: &Path, repo: &Path) -> Self {
         static LAST: std::sync::Mutex<Option<Kept>> = std::sync::Mutex::new(None);
-        let key = (project_root.to_path_buf(), repo.to_path_buf());
         let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(kept) = last.as_ref() {
-            if kept.key == key && kept.sources.iter().all(|(path, was)| stamp(path) == *was) {
-                return kept.selection.clone();
-            }
-        }
-        let (selection, sources) = select(project_root, repo);
-        *last = Some(Kept {
-            key,
-            sources: sources
-                .into_iter()
-                .map(|p| (stamp(&p), p))
-                .map(|(s, p)| (p, s))
-                .collect::<Vec<_>>(),
-            selection: selection.clone(),
-        });
-        selection
+        Kept::or_read(&mut last, project_root, repo)
     }
 
     /// The poms of the modules that were modelled.
@@ -311,20 +292,40 @@ impl MavenSelection {
     }
 }
 
-/// The last selection [`MavenSelection::of`] read, and the project files
-/// it was read from as they were.
+/// The last selection [`MavenSelection::of`] read, with every read of the
+/// file system it was made from.
 struct Kept {
     key: (PathBuf, PathBuf),
-    sources: Vec<(PathBuf, Stamp)>,
+    reads: Reads,
     selection: MavenSelection,
 }
 
-/// A file's length and modification time (`None`: not there).
-type Stamp = Option<(u64, Option<std::time::SystemTime>)>;
-
-fn stamp(path: &Path) -> Stamp {
-    let meta = std::fs::metadata(path).ok()?;
-    Some((meta.len(), meta.modified().ok()))
+impl Kept {
+    /// The selection `last` holds, when it is of this project over this
+    /// repository and each of its reads returns the same bytes (or
+    /// directory entries) now: the project's poms and configuration, each
+    /// pom looked up in the repository (found or not), each version list.
+    /// Reading them again and comparing digests costs a fraction of
+    /// parsing them and walking the graph, and cannot take a rewritten
+    /// file for an unchanged one, as its length and modification time can.
+    /// Otherwise the selection is read anew and kept in its place, so what
+    /// a run writes itself (a pin, a rewritten declaration) is read too.
+    fn or_read(last: &mut Option<Kept>, project_root: &Path, repo: &Path) -> MavenSelection {
+        let key = (project_root.to_path_buf(), repo.to_path_buf());
+        if let Some(kept) = last.as_ref() {
+            if kept.key == key && kept.reads.hold() {
+                return kept.selection.clone();
+            }
+        }
+        let reads = Reads::default();
+        let selection = select(project_root, repo, &reads);
+        *last = Some(Kept {
+            key,
+            reads,
+            selection: selection.clone(),
+        });
+        selection
+    }
 }
 
 /// The one line that says a patch's base version is not part of the
@@ -538,24 +539,15 @@ struct Selector<'w> {
     listed: HashMap<Ga, Result<Option<Vec<String>>, String>>,
     /// The repositories the module being read resolves from, by id.
     repositories: BTreeSet<String>,
-    /// The directories whose version lists were read.
-    listings: BTreeSet<PathBuf>,
 }
 
-/// The selection, and the project files it was read from.
-fn select(cwd: &Path, repo: &Path) -> (MavenSelection, Vec<PathBuf>) {
-    let mut sources: Vec<PathBuf> = ["pom.xml", MAVEN_CONFIG, WRAPPER_PROPERTIES]
-        .iter()
-        .map(|rel| cwd.join(rel))
-        .collect();
-    let selection = select_from(cwd, repo, &mut sources);
-    (selection, sources)
-}
-
-fn select_from(cwd: &Path, repo: &Path, sources: &mut Vec<PathBuf>) -> MavenSelection {
+/// The selection of the project at `cwd` over `repo`. Every file and
+/// directory it is read from is read through the walk, which notes each
+/// in `reads`: nothing here touches the file system any other way.
+fn select(cwd: &Path, repo: &Path, reads: &Reads) -> MavenSelection {
+    let walk = Walk::noting(cwd, repo, reads);
     let read = |rel: &str| {
-        crate::utils::fs::read_regular_to_bytes_sync(&cwd.join(rel))
-            .ok()
+        walk.read(&cwd.join(rel))
             .map(|b| String::from_utf8_lossy(&b).into_owned())
     };
     // Maven 4 also applies the management of each dependency's own pom to
@@ -570,11 +562,12 @@ fn select_from(cwd: &Path, repo: &Path, sources: &mut Vec<PathBuf>) -> MavenSele
             "the project builds with Maven 4, whose dependency management is not modelled",
         );
     }
+    let user = read(MAVEN_CONFIG)
+        .map(|config| maven_config_properties(&config))
+        .unwrap_or_default();
     let mut selector = Selector {
-        walk: Walk::new(cwd, repo),
-        user: read(MAVEN_CONFIG)
-            .map(|config| maven_config_properties(&config))
-            .unwrap_or_default(),
+        walk,
+        user,
         reactor: HashMap::new(),
         management: HashMap::new(),
         managing: HashSet::new(),
@@ -585,13 +578,11 @@ fn select_from(cwd: &Path, repo: &Path, sources: &mut Vec<PathBuf>) -> MavenSele
         exclusion_ids: HashMap::new(),
         listed: HashMap::new(),
         repositories: BTreeSet::new(),
-        listings: BTreeSet::new(),
     };
     let Some(chains) = selector.walk.reactor_poms() else {
         return MavenSelection::unavailable("the project's pom.xml could not be read");
     };
     for chain in &chains {
-        sources.extend(chain.iter().filter(|n| n.local).map(|n| n.path.clone()));
         if let Some(gav) = selector.own_gav(chain) {
             selector.reactor.entry(gav).or_insert(chain[0].clone());
         }
@@ -616,10 +607,6 @@ fn select_from(cwd: &Path, repo: &Path, sources: &mut Vec<PathBuf>) -> MavenSele
         }
         modules.push(module);
     }
-    // Every pom looked at (cached or not) and every version list read: the
-    // answer holds for as long as they are what they were.
-    sources.extend(selector.walk.looked_at().cloned());
-    sources.extend(selector.listings.iter().cloned());
     modules.sort_by(|a, b| a.pom.cmp(&b.pom));
     MavenSelection {
         modules,
@@ -1012,10 +999,8 @@ impl Selector<'_> {
         let mut foreign: Vec<String> = Vec::new();
         if safe(&ga.0) && safe(&ga.1) {
             let dir = self.walk.repo.join(ga.0.replace('.', "/")).join(&ga.1);
-            self.listings.insert(dir.clone());
-            for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
-                let name = entry.file_name();
-                let name = name.to_string_lossy();
+            for (entry, _) in self.walk.list(&dir).unwrap_or_default() {
+                let name = entry.to_string_lossy();
                 let Some(id) = name
                     .strip_prefix("maven-metadata")
                     .and_then(|rest| rest.strip_suffix(".xml"))
@@ -1027,7 +1012,7 @@ impl Selector<'_> {
                     foreign.push(id.to_string());
                     continue;
                 }
-                let Ok(bytes) = crate::utils::fs::read_regular_to_bytes_sync(&entry.path()) else {
+                let Some(bytes) = self.walk.read(&dir.join(&entry)) else {
                     continue;
                 };
                 versions

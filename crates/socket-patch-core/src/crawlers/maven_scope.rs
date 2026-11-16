@@ -30,7 +30,9 @@
 //! selects from it, and so where a pin is safe, is
 //! [`maven_selection`](super::maven_selection)'s to say.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::cell::RefCell;
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -103,6 +105,9 @@ pub(super) type Chain = Vec<Node>;
 pub(super) struct Walk<'w> {
     pub(super) cwd: &'w Path,
     pub(super) repo: &'w Path,
+    /// Where [`Walk::read`] and [`Walk::list`] note what they returned,
+    /// for a caller that keeps its answer ([`Walk::noting`]).
+    reads: Option<&'w Reads>,
     /// Parsed poms by path (`None`: missing or unreadable).
     models: HashMap<PathBuf, Option<Arc<PomModel>>>,
     scope: ProjectScope,
@@ -124,6 +129,7 @@ impl<'w> Walk<'w> {
         Walk {
             cwd,
             repo,
+            reads: None,
             models: HashMap::new(),
             scope: ProjectScope::default(),
             queue: VecDeque::new(),
@@ -135,11 +141,43 @@ impl<'w> Walk<'w> {
         }
     }
 
+    /// A walk that notes in `reads` every file and directory it reads:
+    /// each pom looked up (found or not), `.mvn/maven.config`, each
+    /// directory listed for subprojects, and whatever its caller reads
+    /// through [`Walk::read`] and [`Walk::list`]. It is for reading the
+    /// reactor and its poms' chains; the scope's queue ([`Walk::run`]),
+    /// whose listing of an artifact's cached versions is not noted, is
+    /// not run on it.
+    pub(super) fn noting(cwd: &'w Path, repo: &'w Path, reads: &'w Reads) -> Walk<'w> {
+        Walk {
+            reads: Some(reads),
+            ..Walk::new(cwd, repo)
+        }
+    }
+
+    /// The bytes of the regular file at `path` (`None`: missing or not
+    /// readable), as the run's own readers see it.
+    pub(super) fn read(&self, path: &Path) -> Option<Vec<u8>> {
+        match self.reads {
+            Some(reads) => reads.file(path),
+            None => read_file(path),
+        }
+    }
+
+    /// The entries of the directory at `path` (`None`: it cannot be
+    /// listed): each name, and whether it is a directory (through a link).
+    pub(super) fn list(&self, path: &Path) -> Option<Vec<(OsString, bool)>> {
+        match self.reads {
+            Some(reads) => reads.dir(path),
+            None => list_dir(path),
+        }
+    }
+
     pub(super) fn model(&mut self, path: &Path, include_profiles: bool) -> Option<Arc<PomModel>> {
         if let Some(found) = self.models.get(path) {
             return found.clone();
         }
-        let parsed = read_model(path, include_profiles, &self.work);
+        let parsed = parse_model(self.read(path), include_profiles, &self.work);
         self.models.insert(path.to_path_buf(), parsed.clone());
         parsed
     }
@@ -151,12 +189,10 @@ impl<'w> Walk<'w> {
             .filter_map(|gav| self.repo_pom(gav))
             .filter(|path| !self.models.contains_key(path))
             .collect();
-        let work = std::rc::Rc::clone(&self.work);
-        let parsed = paths.into_iter().map(|path| {
-            let model = read_model(&path, false, &work);
-            (path, model)
-        });
-        self.models.extend(parsed);
+        for path in paths {
+            let model = parse_model(self.read(&path), false, &self.work);
+            self.models.insert(path, model);
+        }
     }
 
     /// Whether `path` stays inside the checkout (lexically).
@@ -165,11 +201,6 @@ impl<'w> Walk<'w> {
             (Some(p), Some(root)) => p.starts_with(root),
             _ => false,
         }
-    }
-
-    /// Every pom path this walk looked at, found or not.
-    pub(super) fn looked_at(&self) -> impl Iterator<Item = &PathBuf> {
-        self.models.keys()
     }
 
     pub(super) fn repo_pom(&self, (g, a, v): &Gav) -> Option<PathBuf> {
@@ -286,8 +317,8 @@ impl<'w> Walk<'w> {
         }];
         let mut seen: HashSet<PathBuf> = HashSet::from([root]);
         let mut chains = Vec::new();
-        let config = crate::utils::fs::read_regular_to_bytes_sync(&self.cwd.join(MAVEN_CONFIG))
-            .ok()
+        let config = self
+            .read(&self.cwd.join(MAVEN_CONFIG))
             .map(|b| String::from_utf8_lossy(&b).into_owned());
         while let Some(node) = pending.pop() {
             if seen.len() > MAX_REACTOR || self.work.spent() {
@@ -295,7 +326,7 @@ impl<'w> Walk<'w> {
             }
             let dir = node.path.parent().unwrap_or(self.cwd).to_path_buf();
             let mut modules = node.model.modules.clone();
-            modules.extend(discovered_subprojects(&node.path, &dir, config.as_deref()));
+            modules.extend(self.discovered_subprojects(&node.path, &dir, config.as_deref()));
             for module in modules {
                 if module.is_empty() {
                     continue;
@@ -448,6 +479,7 @@ impl<'w> Walk<'w> {
                 {
                     return;
                 }
+                debug_assert!(self.reads.is_none(), "an unnoted read on a noting walk");
                 let dir = self.repo.join(g.replace('.', "/")).join(a);
                 let Ok(entries) = std::fs::read_dir(&dir) else {
                     return;
@@ -530,46 +562,136 @@ impl<'w> Walk<'w> {
         }
         Some(())
     }
-}
 
-/// The subprojects Maven 4 discovers under the pom at `path` (#1809): when
-/// it lists none ([`may_discover_subprojects`]), the direct subdirectories
-/// of `dir` holding a `pom.xml` ([`implicit_subprojects`]), as `<module>`
-/// names.
-fn discovered_subprojects(path: &Path, dir: &Path, config: Option<&str>) -> Vec<String> {
-    let Ok(bytes) = crate::utils::fs::read_regular_to_bytes_sync(path) else {
-        return Vec::new();
-    };
-    if !may_discover_subprojects(&String::from_utf8_lossy(&bytes), config) {
-        return Vec::new();
-    }
-    // The planners' listing: bare names, directories (followed through a
-    // link) ending in `/`.
-    let list = |rel: &str| -> Vec<String> {
-        let Ok(entries) = std::fs::read_dir(dir.join(rel)) else {
+    /// The subprojects Maven 4 discovers under the pom at `path` (#1809):
+    /// when it lists none ([`may_discover_subprojects`]), the direct
+    /// subdirectories of `dir` holding a `pom.xml`
+    /// ([`implicit_subprojects`]), as `<module>` names.
+    fn discovered_subprojects(&self, path: &Path, dir: &Path, config: Option<&str>) -> Vec<String> {
+        let Some(bytes) = self.read(path) else {
             return Vec::new();
         };
-        entries
-            .flatten()
-            .filter_map(|e| {
-                let name = e.file_name().to_str()?.to_string();
-                Some(if e.path().is_dir() {
-                    format!("{name}/")
-                } else {
-                    name
+        if !may_discover_subprojects(&String::from_utf8_lossy(&bytes), config) {
+            return Vec::new();
+        }
+        // The planners' listing: bare names, directories (followed through
+        // a link) ending in `/`.
+        let list = |rel: &str| -> Vec<String> {
+            self.list(&dir.join(rel))
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|(name, is_dir)| {
+                    let name = name.to_str()?.to_string();
+                    Some(if is_dir { format!("{name}/") } else { name })
                 })
-            })
-            .collect()
-    };
-    let mut out = implicit_subprojects(&list, "");
-    out.sort();
-    out
+                .collect()
+        };
+        let mut out = implicit_subprojects(&list, "");
+        out.sort();
+        out
+    }
 }
 
-/// The pom at `path` parsed, when it is readable. Its size adds to the
+/// Every read of the file system a [`Walk::noting`] walk made, each with
+/// the SHA-256 of what it returned: all that an answer computed from the
+/// walk depends on. The digest is taken from the very bytes (or entries)
+/// the walk went on to use, through the readers [`Reads::hold`] repeats,
+/// so an answer kept with its reads is exactly as old as they say:
+///
+/// - it is content that is compared, never a length or a modification
+///   time, which a file rewritten to the same length within one tick of
+///   the file system's clock leaves as they were;
+/// - a file is read as the run's own readers see it, a write the run has
+///   captured and not committed yet included
+///   ([`group_commit`](crate::utils::group_commit));
+/// - a file that was not there, and a directory's entries, are reads too:
+///   a pom Maven caches later, or a subproject that appears, changes them.
+#[derive(Default)]
+pub(super) struct Reads(RefCell<BTreeSet<(PathBuf, Kind, Digest)>>);
+
+/// Which read of a path a [`Reads`] entry is.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Kind {
+    File,
+    Dir,
+}
+
+/// The SHA-256 of what a read returned (`None`: nothing).
+type Digest = Option<[u8; 32]>;
+
+impl Reads {
+    fn file(&self, path: &Path) -> Option<Vec<u8>> {
+        let bytes = read_file(path);
+        self.note(path, Kind::File, file_digest(bytes.as_deref()));
+        bytes
+    }
+
+    fn dir(&self, path: &Path) -> Option<Vec<(OsString, bool)>> {
+        let entries = list_dir(path);
+        self.note(path, Kind::Dir, dir_digest(entries.as_deref()));
+        entries
+    }
+
+    /// One entry per read and result: a path read twice with two results
+    /// (it changed under the walk) keeps both, and never holds again.
+    fn note(&self, path: &Path, kind: Kind, digest: Digest) {
+        self.0
+            .borrow_mut()
+            .insert((path.to_path_buf(), kind, digest));
+    }
+
+    /// Whether every read returns now what it returned then.
+    pub(super) fn hold(&self) -> bool {
+        self.0.borrow().iter().all(|(path, kind, was)| {
+            *was == match kind {
+                Kind::File => file_digest(read_file(path).as_deref()),
+                Kind::Dir => dir_digest(list_dir(path).as_deref()),
+            }
+        })
+    }
+}
+
+fn read_file(path: &Path) -> Option<Vec<u8>> {
+    crate::utils::fs::read_regular_to_bytes_sync(path).ok()
+}
+
+/// The entries of the directory at `path` by name, each with whether it is
+/// a directory (through a link).
+fn list_dir(path: &Path) -> Option<Vec<(OsString, bool)>> {
+    let mut entries: Vec<(OsString, bool)> = std::fs::read_dir(path)
+        .ok()?
+        .flatten()
+        .map(|entry| (entry.file_name(), entry.path().is_dir()))
+        .collect();
+    entries.sort();
+    Some(entries)
+}
+
+fn file_digest(bytes: Option<&[u8]>) -> Digest {
+    use sha2::Digest as _;
+    bytes.map(|bytes| sha2::Sha256::digest(bytes).into())
+}
+
+fn dir_digest(entries: Option<&[(OsString, bool)]>) -> Digest {
+    use sha2::Digest as _;
+    let mut hash = sha2::Sha256::new();
+    for (name, is_dir) in entries? {
+        let name = name.as_encoded_bytes();
+        hash.update((name.len() as u64).to_le_bytes());
+        hash.update(name);
+        hash.update([u8::from(*is_dir)]);
+    }
+    Some(hash.finalize().into())
+}
+
+/// The pom in `bytes` parsed, when there is one. Its size adds to the
 /// lookups the walk may make.
-fn read_model(path: &Path, include_profiles: bool, work: &Work) -> Option<Arc<PomModel>> {
-    let bytes = crate::utils::fs::read_regular_to_bytes_sync(path).ok()?;
+fn parse_model(
+    bytes: Option<Vec<u8>>,
+    include_profiles: bool,
+    work: &Work,
+) -> Option<Arc<PomModel>> {
+    let bytes = bytes?;
     work.grant(bytes.len());
     String::from_utf8(bytes)
         .ok()

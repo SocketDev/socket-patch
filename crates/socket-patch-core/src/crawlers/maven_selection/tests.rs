@@ -48,24 +48,32 @@ fn cache(repo: &Path, a: &str, v: &str, body: &str) {
 
 /// The versions the repository's metadata lists for `org.x:<a>`.
 fn list(repo: &Path, a: &str, versions: &[&str]) {
+    write(
+        repo,
+        &format!("org/x/{a}/maven-metadata-central.xml"),
+        &metadata(a, versions),
+    );
+}
+
+fn metadata(a: &str, versions: &[&str]) -> String {
     let versions: String = versions
         .iter()
         .map(|v| format!("<version>{v}</version>"))
         .collect();
-    write(
-        repo,
-        &format!("org/x/{a}/maven-metadata-central.xml"),
-        &format!(
-            "<metadata><groupId>{G}</groupId><artifactId>{a}</artifactId><versioning>\
-             <versions>{versions}</versions></versioning></metadata>"
-        ),
-    );
+    format!(
+        "<metadata><groupId>{G}</groupId><artifactId>{a}</artifactId><versioning>\
+         <versions>{versions}</versions></versioning></metadata>"
+    )
 }
 
 struct Fixture {
     _dir: tempfile::TempDir,
     cwd: PathBuf,
     repo: PathBuf,
+    /// This fixture's own kept answer, which no other test's selection
+    /// replaces: every [`Fixture::select`] but the first is one a stale
+    /// answer would fail.
+    kept: std::cell::RefCell<Option<Kept>>,
 }
 
 impl Fixture {
@@ -78,6 +86,7 @@ impl Fixture {
             _dir: dir,
             cwd,
             repo,
+            kept: Default::default(),
         }
     }
 
@@ -93,7 +102,7 @@ impl Fixture {
     }
 
     fn select(&self) -> MavenSelection {
-        MavenSelection::of(&self.cwd, &self.repo)
+        Kept::or_read(&mut self.kept.borrow_mut(), &self.cwd, &self.repo)
     }
 
     /// The verdict of the root module on the victim at `base`.
@@ -908,4 +917,167 @@ fn the_selection_is_read_again_when_a_project_file_changes() {
     assert_eq!(f.verdict("2.7.9.2"), Verdict::Selected);
     f.app(&deps(&[x(A, "2.9.10"), x("pad", "1")]));
     assert_eq!(f.verdict("2.7.9.2"), other("2.9.10"));
+}
+
+/// Write `text` over the file at `path` and leave its length and its
+/// modification time what they were. That is what a rewrite within one
+/// tick of the file system's clock (a few milliseconds on Linux) looks
+/// like, made to happen on any machine: the hardest rewrite to notice,
+/// not a way to help one be noticed.
+fn rewrite_within_the_tick(path: &Path, text: &str) {
+    let before = std::fs::metadata(path).unwrap();
+    std::fs::write(path, text).unwrap();
+    let file = std::fs::File::options().write(true).open(path).unwrap();
+    file.set_modified(before.modified().unwrap()).unwrap();
+    drop(file);
+    let after = std::fs::metadata(path).unwrap();
+    assert_eq!(
+        (after.len(), after.modified().unwrap()),
+        (before.len(), before.modified().unwrap()),
+        "the file's metadata must not show the rewrite"
+    );
+}
+
+/// The kept answer is checked against what the files hold, never their
+/// length or modification time: a file rewritten to the same length with
+/// no delay (a version bumped by one digit) is a new project, the clock
+/// having ticked in between or not.
+#[test]
+fn a_file_rewritten_to_the_same_length_is_read_again() {
+    // The project's own pom.
+    let f = Fixture::new();
+    f.cache(A, "2.7.9.2", &[]).cache(A, "2.7.9.3", &[]);
+    f.app(&deps(&[x(A, "2.7.9.2")]));
+    assert_eq!(f.verdict("2.7.9.2"), Verdict::Selected);
+    f.app(&deps(&[x(A, "2.7.9.3")]));
+    assert_eq!(f.verdict("2.7.9.2"), other("2.7.9.3"));
+    rewrite_within_the_tick(
+        &f.cwd.join("pom.xml"),
+        &pom("com.example", "app", "1", &deps(&[x(A, "2.7.9.2")])),
+    );
+    assert_eq!(f.verdict("2.7.9.2"), Verdict::Selected);
+
+    // A pom of the local repository.
+    let f = Fixture::new();
+    f.app(&deps(&[x("lib-a", "1.0")]))
+        .cache(A, "2.7.9.2", &[])
+        .cache(A, "2.7.9.3", &[]);
+    f.cache("lib-a", "1.0", &[x(A, "2.7.9.2")]);
+    assert_eq!(f.verdict("2.7.9.2"), Verdict::Selected);
+    f.cache("lib-a", "1.0", &[x(A, "2.7.9.3")]);
+    assert_eq!(f.verdict("2.7.9.2"), other("2.7.9.3"));
+    rewrite_within_the_tick(
+        &f.repo.join("org/x/lib-a/1.0/lib-a-1.0.pom"),
+        &pom(G, "lib-a", "1.0", &deps(&[x(A, "2.7.9.2")])),
+    );
+    assert_eq!(f.verdict("2.7.9.2"), Verdict::Selected);
+
+    // A cached version list.
+    let f = Fixture::new();
+    f.app(&deps(&[x(A, "[2.9.0,2.9.9]")]))
+        .cache(A, "2.9.7", &[])
+        .cache(A, "2.9.8", &[]);
+    list(&f.repo, A, &["2.9.7"]);
+    assert_eq!(f.verdict("2.9.6"), other("2.9.7"));
+    list(&f.repo, A, &["2.9.8"]);
+    assert_eq!(f.verdict("2.9.6"), other("2.9.8"));
+    rewrite_within_the_tick(
+        &f.repo.join("org/x/victim/maven-metadata-central.xml"),
+        &metadata(A, &["2.9.7"]),
+    );
+    assert_eq!(f.verdict("2.9.6"), other("2.9.7"));
+}
+
+/// What was not there when the selection was read is part of what it was
+/// read from: a pom Maven has cached since, a version list, a subproject
+/// Maven 4 finds by listing the directory of a pom that names none.
+#[test]
+fn a_file_that_appears_is_read() {
+    let f = Fixture::new();
+    f.app(&deps(&[x("lib-a", "1.0")])).cache(A, "2.7.9.2", &[]);
+    undetermined(&f.verdict("2.7.9.2"));
+    f.cache("lib-a", "1.0", &[x(A, "2.7.9.2")]);
+    assert_eq!(f.verdict("2.7.9.2"), Verdict::Selected);
+
+    let f = Fixture::new();
+    f.app(&deps(&[x(A, "[2.9.0,2.9.9]")]))
+        .cache(A, "2.9.7", &[]);
+    undetermined(&f.verdict("2.9.6"));
+    list(&f.repo, A, &["2.9.7"]);
+    assert_eq!(f.verdict("2.9.6"), other("2.9.7"));
+
+    let f = Fixture::new();
+    f.app("<packaging>pom</packaging><modules><module>a</module></modules>")
+        .cache(A, "2.7.9.2", &[]);
+    write(
+        &f.cwd,
+        "a/pom.xml",
+        "<project xmlns=\"http://maven.apache.org/POM/4.1.0\"><modelVersion>4.1.0</modelVersion>\
+         <groupId>com.example</groupId><artifactId>a</artifactId><version>1</version>\
+         <packaging>pom</packaging></project>",
+    );
+    let sub = |name: &str| {
+        write(
+            &f.cwd,
+            &format!("a/{name}/pom.xml"),
+            &pom("com.example", name, "1", &deps(&[x(A, "2.7.9.2")])),
+        );
+    };
+    sub("one");
+    assert_eq!(
+        f.select().modules().collect::<Vec<_>>(),
+        ["a/one/pom.xml", "a/pom.xml", "pom.xml"]
+    );
+    sub("two");
+    let selection = f.select();
+    assert_eq!(
+        selection.modules().collect::<Vec<_>>(),
+        ["a/one/pom.xml", "a/pom.xml", "a/two/pom.xml", "pom.xml"]
+    );
+    assert_eq!(
+        selection.verdict("a/two/pom.xml", G, A, "2.7.9.2"),
+        Verdict::Selected
+    );
+}
+
+/// A vendored run holds its writes to the project in memory until it
+/// commits them ([`GroupCommit`](crate::utils::group_commit::GroupCommit)),
+/// and its readers answer from them. The selection reads a pom as they
+/// do, and a kept answer is checked the same way: a pom the run has
+/// written is the pom, on disk yet or not.
+#[test]
+fn a_write_the_run_has_not_committed_is_read() {
+    use crate::utils::group_commit::{capture_write, GroupCommit};
+    let f = Fixture::new();
+    f.app(&deps(&[x(A, "2.7.9.2")]))
+        .cache(A, "2.7.9.2", &[])
+        .cache(A, "2.7.9.3", &[]);
+    assert_eq!(f.verdict("2.7.9.2"), Verdict::Selected);
+
+    let run = GroupCommit::begin(&f.cwd);
+    let written = pom("com.example", "app", "1", &deps(&[x(A, "2.7.9.3")]));
+    assert!(capture_write(
+        &f.cwd.join("pom.xml"),
+        written.as_bytes(),
+        false
+    ));
+    assert_eq!(f.verdict("2.7.9.2"), other("2.7.9.3"));
+    // Dropped uncommitted: the pom is the one on disk again.
+    drop(run);
+    assert_eq!(f.verdict("2.7.9.2"), Verdict::Selected);
+}
+
+/// A kept answer is as good as its record of what it was read from: the
+/// selection reads the file system only through its walk, which notes
+/// every read it makes.
+#[test]
+fn the_selection_reads_the_file_system_only_through_its_walk() {
+    let source = include_str!("../maven_selection.rs");
+    for direct in ["std::fs", "utils::fs"] {
+        assert!(
+            !source.contains(direct),
+            "maven_selection.rs uses `{direct}`: read through `Walk::read` and `Walk::list`, \
+             which note what they return"
+        );
+    }
 }
