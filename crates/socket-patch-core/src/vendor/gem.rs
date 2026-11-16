@@ -97,10 +97,9 @@ const GEMFILE_LOCK: &str = "Gemfile.lock";
 /// block and the single 2-space line (if any) other than a `  remote: ` line
 /// is the pre-vendor DEPENDENCIES entry — its absence means the gem was
 /// transitive and revert deletes the added entry. A `  remote: ` line names
-/// the GEM section the block came from, and revert restores into it. It is
-/// left out when that section is the lock's first GEM section (#779) and
-/// not a hosted gem's own ([`hosted_gem_section`]); revert then restores
-/// into the first GEM section that is not a hosted gem's (#2090). In
+/// the GEM section the block came from, and revert restores into it
+/// ([`record_gem_section`]). Records written before #2090 leave it out when
+/// that section was the lock's first GEM section (#779). In
 /// `new`, the last element is the DEPENDENCIES entry we wrote and the rest
 /// is the emitted PATH section.
 ///
@@ -1817,9 +1816,10 @@ struct LockEdit {
     /// drops out of the ledger with the entry being replaced.
     checksum_bare: Option<String>,
     /// The `  remote: ` line of the GEM section the spec block was lifted
-    /// from, unless that is the lock's first GEM section (#779) and not a
-    /// hosted gem's own (#2090). Revert puts the block back into that
-    /// section.
+    /// from; revert puts the block back into that section. `None` only for
+    /// a first GEM section with no `remote:` line (a Gemfile with no
+    /// `source`). Which section is first changes once a hosted scan or a new
+    /// source adds one ahead, so position alone is not recorded (#2090).
     source_remote: Option<String>,
 }
 
@@ -1970,18 +1970,16 @@ fn edit_lock(text: &str, name: &str, version: &str, rel: &str) -> Result<LockEdi
     let mut rewired_ours = false;
     let removed_spec_block: Vec<String> = match hit {
         Some((k, gem_start, gem_end, block_start)) => {
-            if k > 0 || hosted_gem_section(&lines[gem_start..gem_end]) {
-                // Revert must find this section again; without a remote
-                // line there is nothing to find it by.
-                source_remote = Some(
-                    lines[gem_start..gem_end]
-                        .iter()
-                        .find(|l| l.starts_with("  remote: "))
-                        .cloned()
-                        .ok_or_else(|| {
-                            format!("Gemfile.lock GEM section holding `{name} ({version})` has no remote: line")
-                        })?,
-                );
+            // Revert must find this section again, and its `remote:` line
+            // is what it finds it by.
+            source_remote = lines[gem_start..gem_end]
+                .iter()
+                .find(|l| l.starts_with("  remote: "))
+                .cloned();
+            if k > 0 && source_remote.is_none() {
+                return Err(format!(
+                    "Gemfile.lock GEM section holding `{name} ({version})` has no remote: line"
+                ));
             }
             let mut block_end = block_start + 1;
             while block_end < gem_end && lines[block_end].starts_with("      ") {
@@ -2218,10 +2216,10 @@ fn gem_section_spans(lines: &[String]) -> Vec<(usize, usize)> {
 }
 
 /// True when `section` (one GEM section's lines) is a hosted gem's own:
-/// it has a `remote:` line and each one is a Socket patch registry, on any
-/// origin ([`crate::origin::hosted_shape_uuid`]; revert is not told which
-/// patch servers the scan used). Hosted mode writes one such section per
-/// patched gem, and bundler sorts it by its remote, which for
+/// it has a `remote:` line and each one is a Socket gem patch registry
+/// (`…/patch-registry/gem/<token>/<uuid>/`) on any origin; revert is not
+/// told which patch servers the scan used. Hosted mode writes one such
+/// section per patched gem, and bundler sorts it by its remote, which for
 /// `https://patch.socket.dev/` is ahead of `https://rubygems.org/`. A
 /// section that merges a patch registry remote with an upstream one (the
 /// bundler < 2.2 lock layout) holds upstream specs too and is not one.
@@ -2230,21 +2228,39 @@ fn hosted_gem_section(section: &[String]) -> bool {
         .iter()
         .filter_map(|l| l.strip_prefix("  remote: "))
         .peekable();
-    remotes.peek().is_some() && remotes.all(|r| crate::origin::hosted_shape_uuid(r).is_some())
+    remotes.peek().is_some()
+        && remotes.all(|r| {
+            r.contains("/patch-registry/gem/") && crate::origin::hosted_shape_uuid(r).is_some()
+        })
 }
 
-/// The GEM section a `gemfile_lock_spec` record's spec block belongs in:
-/// the one carrying the recorded `remote:` line. With none recorded the
-/// block came from what was the lock's first GEM section when the gem was
-/// vendored, and that is the first GEM section that is not a hosted gem's
-/// own: a hosted scan run since then may have put its sections ahead
-/// (#2090), and a block lifted from a hosted section always records it.
+/// The GEM section a `gemfile_lock_spec` record's spec block belongs in.
+/// A hosted gem's own section ([`hosted_gem_section`]) is one only when the
+/// record names it.
+///
+/// * The section carrying the recorded `remote:` line.
+/// * That line is gone (the user renamed the source): the lock's one other
+///   GEM section, if it has exactly one. With several there is no telling
+///   which, and the caller reports drift.
+/// * No line recorded (a record written before #2090, whose block came out
+///   of what was then the lock's first GEM section): the first GEM section
+///   that is not a hosted gem's. A hosted scan run since the vendoring puts
+///   its sections ahead of the upstream one.
 fn record_gem_section(lines: &[String], source_remote: Option<&str>) -> Option<(usize, usize)> {
-    let mut spans = gem_section_spans(lines).into_iter();
-    match source_remote {
-        None => spans.find(|&(gs, ge)| !hosted_gem_section(&lines[gs..ge])),
-        Some(remote) => spans.find(|&(gs, ge)| lines[gs..ge].iter().any(|l| l == remote)),
+    let spans = gem_section_spans(lines);
+    if let Some(remote) = source_remote {
+        let named = spans
+            .iter()
+            .find(|&&(gs, ge)| lines[gs..ge].iter().any(|l| l == remote));
+        if let Some(&span) = named {
+            return Some(span);
+        }
     }
+    let mut upstream = spans
+        .into_iter()
+        .filter(|&(gs, ge)| !hosted_gem_section(&lines[gs..ge]));
+    let first = upstream.next()?;
+    (source_remote.is_none() || upstream.next().is_none()).then_some(first)
 }
 
 /// The recorded source-section `remote:` line in a `gemfile_lock_spec`
@@ -3737,9 +3753,10 @@ mod tests {
             &vec![
                 Value::String("    rack (3.2.6)".to_string()),
                 Value::String("      base64 (>= 0.1.0)".to_string()),
+                Value::String("  remote: https://rubygems.org/".to_string()),
                 Value::String("  rack (~> 3.1)".to_string()),
             ],
-            "spec block + old DEPENDENCIES line recorded verbatim"
+            "spec block, source remote + old DEPENDENCIES line recorded verbatim"
         );
         let new = lk.new.as_ref().unwrap().as_array().unwrap();
         assert_eq!(
@@ -3803,9 +3820,14 @@ mod tests {
             .unwrap()
             .as_array()
             .unwrap();
-        assert!(
-            orig.iter().all(|l| l.as_str().unwrap().starts_with("    ")),
-            "transitive: only the spec block is recorded: {orig:?}"
+        assert_eq!(
+            orig,
+            &vec![
+                Value::String("    rack (3.2.6)".to_string()),
+                Value::String("      base64 (>= 0.1.0)".to_string()),
+                Value::String("  remote: https://rubygems.org/".to_string()),
+            ],
+            "transitive: only the spec block and its source remote are recorded"
         );
     }
 
@@ -9879,14 +9901,36 @@ mod tests {
             .is_empty());
     }
 
-    /// The first-section case keeps its ledger shape: no source remote is
-    /// recorded, so ledgers written before #779 and after it agree.
+    /// #2090: the first-section case records its source remote too. Which
+    /// section is first changes when a later scan or a new source adds one
+    /// ahead of it, so the position says nothing at revert time.
     #[test]
-    fn edit_lock_first_gem_section_records_no_source_remote() {
+    fn edit_lock_first_gem_section_records_its_source_remote() {
         let edit = edit_lock(LOCK_DIRECT, "rack", "3.2.6", &copy_rel()).unwrap();
-        assert_eq!(edit.source_remote, None);
+        assert_eq!(
+            edit.source_remote.as_deref(),
+            Some("  remote: https://rubygems.org/")
+        );
         let (original, _new) = lock_record_lines(&edit);
-        assert!(original.iter().all(|l| !l.starts_with("  remote: ")));
+        assert_eq!(
+            original,
+            [
+                "    rack (3.2.6)",
+                "      base64 (>= 0.1.0)",
+                "  remote: https://rubygems.org/",
+                "  rack (~> 3.1)"
+            ]
+        );
+        // A Gemfile with no `source` locks a GEM section with no remote:
+        // there is nothing to record, and revert still finds the section.
+        let no_source = LOCK_DIRECT.replacen("  remote: https://rubygems.org/\n", "", 1);
+        let edit = edit_lock(&no_source, "rack", "3.2.6", &copy_rel()).unwrap();
+        assert_eq!(edit.source_remote, None);
+        let (original, new) = lock_record_lines(&edit);
+        assert_eq!(
+            revert_lock_text(&edit.text, &original, &new).as_deref(),
+            Some(no_source.as_str())
+        );
     }
 
     /// SECURITY/fail-closed: the same `name (version)` in two GEM sections
@@ -10057,21 +10101,40 @@ mod tests {
                 1,
             )
             .replacen("\n  puma\n", "\n  puma!\n", 1);
-        assert_ne!(out, lock, "the fixture must change the lock");
+        assert!(
+            out.contains(&hosted) && out.contains("\n  puma!\n"),
+            "the fixture must move puma to a hosted section:\n{out}"
+        );
         out
     }
 
-    /// #2090: rack was vendored out of the lock's only GEM section, so its
-    /// record names no section. A hosted scan of puma then put a patch
-    /// registry section first. Revert must restore rack into the
-    /// rubygems.org section it came from, not into puma's.
+    /// A record as releases before #2090 wrote it for a spec lifted from
+    /// the lock's first GEM section: no source `remote:` line.
+    fn before_2090(original: &[String]) -> Vec<String> {
+        let legacy: Vec<String> = original
+            .iter()
+            .filter(|l| !l.starts_with("  remote: "))
+            .cloned()
+            .collect();
+        assert_eq!(legacy.len() + 1, original.len(), "{original:?}");
+        legacy
+    }
+
+    /// #2090: rack was vendored out of the lock's only GEM section. A
+    /// hosted scan of puma then put a patch registry section first. Revert
+    /// must restore rack into the rubygems.org section it came from, not
+    /// into puma's, for the record a release before the fix wrote (which
+    /// names no section) and for the one written now.
     #[test]
     fn revert_lock_text_skips_a_hosted_gem_section() {
         let edit = edit_lock(LOCK_DIRECT, "rack", "3.2.6", &copy_rel()).unwrap();
-        assert_eq!(edit.source_remote, None);
-        let (original, new) = lock_record_lines(&edit);
+        let (recorded, new) = lock_record_lines(&edit);
         // Socket's own host, and a self-hosted or mock patch server.
-        for origin in ["https://patch.socket.dev", "http://127.0.0.1:8791"] {
+        for (origin, original) in [
+            ("https://patch.socket.dev", before_2090(&recorded)),
+            ("http://127.0.0.1:8791", before_2090(&recorded)),
+            ("https://patch.socket.dev", recorded.clone()),
+        ] {
             let both = with_puma_hosted(&edit.text, origin);
             let want = with_puma_hosted(LOCK_DIRECT, origin);
             assert_eq!(
@@ -10104,28 +10167,81 @@ mod tests {
     fn revert_lock_text_never_restores_into_a_hosted_only_lock() {
         let rack_only = "GEM\n  remote: https://rubygems.org/\n  specs:\n    rack (3.2.6)\n\nPLATFORMS\n  ruby\n\nDEPENDENCIES\n  rack (~> 3.1)\n\nBUNDLED WITH\n   2.5.22\n";
         let edit = edit_lock(rack_only, "rack", "3.2.6", &copy_rel()).unwrap();
-        let (original, new) = lock_record_lines(&edit);
+        let (recorded, new) = lock_record_lines(&edit);
         let hosted_section = "GEM\n  remote: https://patch.socket.dev/patch-registry/gem/tok123/2fc039c8-b97d-545c-b447-879e2b468dfe/\n  specs:\n    puma (6.4.2)\n\n";
         let with_hosted = |lock: &str| lock.replacen("GEM\n", &format!("{hosted_section}GEM\n"), 1);
-        assert_eq!(
-            revert_lock_text(&with_hosted(&edit.text), &original, &new),
-            Some(with_hosted(rack_only))
-        );
         let hosted_only = edit.text.replacen(
             "  remote: https://rubygems.org/\n",
             "  remote: https://patch.socket.dev/patch-registry/gem/tok123/2fc039c8-b97d-545c-b447-879e2b468dfe/\n",
             1,
         );
-        assert_eq!(revert_lock_text(&hosted_only, &original, &new), None);
+        for original in [before_2090(&recorded), recorded] {
+            assert_eq!(
+                revert_lock_text(&with_hosted(&edit.text), &original, &new),
+                Some(with_hosted(rack_only))
+            );
+            assert_eq!(revert_lock_text(&hosted_only, &original, &new), None);
+        }
+    }
+
+    /// #2090: a source added to the Gemfile after the vendoring sorts ahead
+    /// of rubygems.org. The recorded remote still names the section the
+    /// spec came from.
+    #[test]
+    fn revert_lock_text_finds_its_section_behind_a_later_source() {
+        let edit = edit_lock(LOCK_DIRECT, "rack", "3.2.6", &copy_rel()).unwrap();
+        let (original, new) = lock_record_lines(&edit);
+        let private =
+            "GEM\n  remote: https://gems.example.com/\n  specs:\n    aaa-internal (1.0.0)\n\n";
+        let with_private = |lock: &str| lock.replacen("GEM\n", &format!("{private}GEM\n"), 1);
+        let want = with_private(LOCK_DIRECT);
+        assert_eq!(
+            revert_lock_text(&with_private(&edit.text), &original, &new).as_deref(),
+            Some(want.as_str())
+        );
+        assert!(lock_record_converged(&want, &original, &new));
+    }
+
+    /// The recorded source was renamed (rubygems.org to a mirror) and the
+    /// lock has one upstream GEM section: the spec can only belong there,
+    /// with or without a hosted gem's section beside it. (Two upstream
+    /// sections and a missing remote are drift:
+    /// `revert_lock_text_targets_recorded_gem_section`.)
+    #[test]
+    fn revert_lock_text_follows_a_renamed_only_source() {
+        let edit = edit_lock(LOCK_DIRECT, "rack", "3.2.6", &copy_rel()).unwrap();
+        let (original, new) = lock_record_lines(&edit);
+        let mirror = |lock: &str| lock.replace("https://rubygems.org/", "https://mirror.example/");
+        for hosted in [false, true] {
+            let shape = |lock: &str| {
+                let lock = mirror(lock);
+                if hosted {
+                    mirror(&with_puma_hosted(
+                        &lock.replace("https://mirror.example/", "https://rubygems.org/"),
+                        "https://patch.socket.dev",
+                    ))
+                } else {
+                    lock
+                }
+            };
+            let want = shape(LOCK_DIRECT);
+            assert_eq!(
+                revert_lock_text(&shape(&edit.text), &original, &new).as_deref(),
+                Some(want.as_str()),
+                "hosted={hosted}"
+            );
+            assert!(lock_record_converged(&want, &original, &new));
+        }
     }
 
     /// #2090: a GEM section that merges a patch registry remote with an
     /// upstream one (the bundler < 2.2 lock layout) still holds upstream
-    /// specs, so it is where an unrecorded block goes back.
+    /// specs, so it is where a block with no recorded section goes back.
     #[test]
     fn revert_lock_text_keeps_a_merged_gem_section() {
         let edit = edit_lock(LOCK_DIRECT, "rack", "3.2.6", &copy_rel()).unwrap();
-        let (original, new) = lock_record_lines(&edit);
+        let (recorded, new) = lock_record_lines(&edit);
+        let original = before_2090(&recorded);
         let merge = |lock: &str| {
             lock.replacen(
                 "  remote: https://rubygems.org/\n",
@@ -10139,10 +10255,9 @@ mod tests {
         );
     }
 
-    /// #2090: record and revert agree on what "no recorded section" means.
-    /// A spec lifted from a hosted gem's section records that section even
-    /// when it is the lock's first, so revert puts it back there and not
-    /// into the first upstream section.
+    /// #2090: a spec lifted from a hosted gem's section records that
+    /// section like any other, so revert puts it back there and not into
+    /// the upstream section.
     #[test]
     fn edit_lock_records_a_hosted_source_section() {
         let lock = with_puma_hosted(LOCK_DIRECT, "https://patch.socket.dev");

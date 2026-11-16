@@ -3086,6 +3086,16 @@ async fn vendored_unwind_beside_a_hosted_gem(command: &str) {
     else {
         return;
     };
+    // Bundler < 2.2 merges every remote into one GEM section, so no hosted
+    // section can sort ahead of the upstream one there.
+    if !fx.bundler.at_least(2, 2) {
+        println!(
+            "SKIP e2e_redirect_gem_build (vendored-beside-hosted-{command}): bundler {}: \
+             per-source GEM sections need bundler >= 2.2",
+            fx.bundler.version
+        );
+        return;
+    }
     const VULN_GEN2: &str = "10000000-1a2b-4a1b-8c2d-3e4f5a6b7c8d";
     const TINY_GEN2: &str = "80000000-1a2b-4a1b-8c2d-3e4f5a6b7c8d";
     let tiny_purl = format!("pkg:gem/{TRANSITIVE}@1.0.0");
