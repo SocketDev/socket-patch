@@ -199,8 +199,9 @@ pub enum Commands {
 
     // Hot patch mode (EXPERIMENTAL): patch everything installed in place,
     // save nothing, then become the command after `--` (see `hot_patch`).
-    // Hidden and documented as experimental in CLI_CONTRACT.md: no
-    // stability guarantee. Plain `//` comments keep this out of help text.
+    // Hidden, with no stability guarantee, and left out of CLI_CONTRACT.md
+    // on purpose (its Semver policy covers hidden, undescribed commands).
+    // Plain `//` comments keep this out of help text.
     #[command(
         hide = true,
         name = "hot-patch",
