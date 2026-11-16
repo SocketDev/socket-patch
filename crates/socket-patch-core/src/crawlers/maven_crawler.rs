@@ -2741,11 +2741,20 @@ mod tests {
             global: true,
             ..local
         };
-        assert_eq!(
-            purls(MavenCrawler::new().crawl_all_with(&global, &env).await).len(),
-            3,
-            "a global crawl is not scoped"
-        );
+        // A global crawl also reads the Coursier and Ivy caches of the
+        // machine running the suite (they are not part of `JvmEnv`), so the
+        // pinned repository's packages are looked up, not counted.
+        let found = purls(MavenCrawler::new().crawl_all_with(&global, &env).await);
+        for purl in [
+            "pkg:maven/junit/junit@4.13.2",
+            "pkg:maven/org.apache.commons/commons-lang3@3.12.0",
+            "pkg:maven/org.hamcrest/hamcrest-core@1.3",
+        ] {
+            assert!(
+                found.iter().any(|p| p == purl),
+                "a global crawl is not scoped: {purl} is missing from {found:?}"
+            );
+        }
     }
 
     #[tokio::test]
