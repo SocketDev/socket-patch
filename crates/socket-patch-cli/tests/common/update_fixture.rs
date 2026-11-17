@@ -21,6 +21,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use socket_patch_cli::commands::update::UPDATE_TARGET;
 use socket_patch_core::update::asset_name_for_target;
+use socket_patch_core::update::download::MAX_BINARY_BYTES;
 
 /// A TCP endpoint nothing listens on (port 9 = discard, never bound on a
 /// dev host): any request the child makes fails fast and loudly, so a
@@ -209,12 +210,27 @@ pub fn real_binary_hash() -> String {
 /// is the canary that fails loudly if a platform stops tolerating this.
 pub fn make_served_binary() -> (Vec<u8>, bool) {
     let mut bytes = std::fs::read(real_binary()).expect("read real binary");
-    if cfg!(target_os = "macos") {
-        (bytes, false)
-    } else {
+    let byte_distinct = !cfg!(target_os = "macos");
+    if byte_distinct {
         bytes.extend_from_slice(b"\nSOCKET-PATCH-E2E-TRAILER-0123456789abcdef0123456789abcdef\n");
-        (bytes, true)
     }
+    // The updater rejects an extracted binary above `MAX_BINARY_BYTES`. A
+    // test build that outgrows it fails every test that has the updater
+    // extract these bytes with "exceeds the ...-byte cap", far from the
+    // cause: name the cause here, with the updater's own comparison on the
+    // bytes as served. It happened to the coverage build, which keeps
+    // every function of every dependency (ci.yml builds it with
+    // `CARGO_PROFILE_DEV_DEBUG=0`).
+    assert!(
+        bytes.len() as u64 <= MAX_BINARY_BYTES,
+        "the socket-patch binary this fixture serves is {} bytes, above the \
+         updater's {MAX_BINARY_BYTES}-byte cap on an extracted binary, so it \
+         cannot be a release payload: the build carries too much debug info \
+         for this fixture (for the dev profile, build with \
+         CARGO_PROFILE_DEV_DEBUG=0)",
+        bytes.len()
+    );
+    (bytes, byte_distinct)
 }
 
 // ── Archive + SHA256SUMS builders ──────────────────────────────────────

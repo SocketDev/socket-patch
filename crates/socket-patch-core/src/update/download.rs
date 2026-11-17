@@ -28,7 +28,9 @@ const MAX_ARCHIVE_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Hard cap on the single extracted binary, enforced during streaming
 /// decompression so a decompression bomb can't balloon memory.
-const MAX_BINARY_BYTES: u64 = 256 * 1024 * 1024;
+/// Public only so the CLI's self-update test fixture shares the number.
+#[doc(hidden)]
+pub const MAX_BINARY_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Prefix for staged-binary files in the destination directory. The
 /// start-of-run sweep removes stale ones (crash leftovers).

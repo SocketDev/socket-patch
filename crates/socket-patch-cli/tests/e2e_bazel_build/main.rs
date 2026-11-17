@@ -49,4 +49,5 @@ mod hosted_memory_common;
 
 mod go;
 mod harness;
+mod npm;
 mod ruby;
