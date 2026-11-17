@@ -51,3 +51,4 @@ mod go;
 mod harness;
 mod npm;
 mod pypi;
+mod ruby;
