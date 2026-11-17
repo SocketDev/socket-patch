@@ -32,11 +32,11 @@ use crate::commands::agent_download::{
     decide_patch_action, download_patch_records_preflighted, download_patch_records_reusing,
     filter_to_installed_releases, max_vuln_severity, nested_apply_args,
     next_steps as agent_next_steps, patch_event_metadata, record_apply_outcome, recorded_purls,
-    replaced_patch_not_restored_detail, report_lock_failure, roll_back_replaced_patches,
-    run_nested_apply, run_outcome, tag_mode, unwind_new_blobs, vendored_download_refusals,
-    warn_if_manifest_gitignored, warn_on_vendored_uuid_drift, write_all_patch_blobs,
-    DetachedDownload, PatchAction, ALREADY_IN_MANIFEST, BLOB_WRITE_FAILED, RELEASE_NARROWING,
-    REPLACED_PATCH_NOT_RESTORED,
+    report_lock_failure, roll_back_replaced_patches, run_nested_apply, run_outcome, tag_mode,
+    unwind_new_blobs, vendored_download_refusals, warn_if_manifest_gitignored,
+    warn_on_vendored_uuid_drift, write_all_patch_blobs, DetachedDownload, PatchAction,
+    ALREADY_IN_MANIFEST, BLOB_WRITE_FAILED, RELEASE_NARROWING, REPLACED_PATCH_NOT_RESTORED,
+    REPLACED_ROLLED_BACK_UNRECORDED,
 };
 pub use crate::commands::agent_download::{
     download_and_apply_patches_into, download_and_apply_patches_with, DownloadParams, DownloadRun,
@@ -47,7 +47,7 @@ use crate::json_envelope::{
     usage_error, Command as JsonCommand, Envelope, EnvelopeError, PatchAction as EventAction,
     PatchEvent, RunWarning, Status,
 };
-use crate::ui::{plural, print_json, select_one, SelectError};
+use crate::ui::{print_json, select_one, SelectError};
 
 /// Best-effort ecosystem extractor for a `pkg:<eco>/...` PURL. Used as
 /// the telemetry `ecosystem` field. Returns an empty string when the
@@ -2011,6 +2011,7 @@ async fn save_patch_record(
     // After the blob writes, so a patch that cannot be saved changes
     // nothing in the installed package. Boxed like the engine's.
     let mut warnings: Vec<RunWarning> = Vec::new();
+    let mut rolled_back = false;
     if let PatchAction::Updated { old_uuid } = &action {
         let rollback = Box::pin(roll_back_replaced_patches(
             &args.common,
@@ -2020,9 +2021,8 @@ async fn save_patch_record(
             client,
         ))
         .await;
-        if let Some(why) = rollback.refused.get(&patch.purl) {
+        if let Some(detail) = rollback.refusal(&patch.purl, old_uuid) {
             unwind_new_blobs(&blobs_dir, &new_blobs).await;
-            let detail = replaced_patch_not_restored_detail(&patch.purl, old_uuid, why);
             if args.common.json {
                 let mut env = new_envelope(&args.common);
                 env.record(
@@ -2040,19 +2040,8 @@ async fn save_patch_record(
             }
             return Err(1);
         }
-        let quiet = args.common.json || args.common.silent;
-        if let (false, Some(files)) = (quiet, rollback.restored.get(&patch.purl)) {
-            eprintln!(
-                "Restored {} of the replaced patch.",
-                plural(*files, "file", "files")
-            );
-        }
-        for (code, detail) in rollback.warnings {
-            if !quiet {
-                eprintln!("Warning: {detail}");
-            }
-            warnings.push(RunWarning::new(code, detail));
-        }
+        rolled_back = !rollback.restored.is_empty();
+        warnings = rollback.report(args.common.json || args.common.silent);
     }
 
     manifest
@@ -2061,11 +2050,11 @@ async fn save_patch_record(
     if let Err(e) = write_manifest(manifest_path, &manifest).await {
         // No record points at the blobs just written: unwind exactly those.
         unwind_new_blobs(&blobs_dir, &new_blobs).await;
-        return Err(report_error(
-            &args.common,
-            "manifest_write_failed",
-            format!("Failed to write manifest: {e}"),
-        ));
+        let mut msg = format!("Failed to write manifest: {e}");
+        if rolled_back {
+            msg.push_str(REPLACED_ROLLED_BACK_UNRECORDED);
+        }
+        return Err(report_error(&args.common, "manifest_write_failed", msg));
     }
     Ok((action, warnings))
 }

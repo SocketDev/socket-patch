@@ -3986,6 +3986,16 @@ async fn holds_patched_bytes(target: &CopyTarget, files: &HashMap<String, PatchF
     false
 }
 
+/// [`holds_patched_bytes`] for the copy of `purl` at `dir`, for a caller
+/// that holds a failed [`RollbackResult`] and not its target.
+pub(crate) async fn copy_holds_patched_bytes(
+    purl: &str,
+    dir: &Path,
+    files: &HashMap<String, PatchFileInfo>,
+) -> bool {
+    holds_patched_bytes(&CopyTarget::plain(purl, dir), files).await
+}
+
 /// The key `file` of a Maven record as it is joined onto `dir`: a Gradle
 /// hash dir holds the bare file name (`package/` dropped).
 fn maven_target_key(purl: &str, dir: &Path, file: &str) -> String {

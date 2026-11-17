@@ -465,24 +465,63 @@ async fn replacement_is_refused_when_a_dropped_file_cannot_be_restored() {
     }
 }
 
-/// The refusal in the engine's envelope: one `failed` event with its own
-/// code, and no `updated` one.
+/// A recorded patch that is not on the installed copy at all: its hashes
+/// match no file there (it was recorded with `--save-only` for another
+/// build of the version). There is nothing of it to roll back, so the
+/// corrected patch replaces it and applies.
 #[tokio::test]
 #[serial]
-async fn refused_replacement_is_a_failed_event_with_its_own_code() {
+async fn replacement_of_a_patch_that_was_never_applied_goes_through() {
+    const OTHER_BUILD: &[u8] = b"module.exports = 'another build';\n";
+    const OTHER_PATCHED: &[u8] = b"module.exports = 'another build, patched';\n";
+    let server = MockServer::start().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    install(root);
+    serve(&server, UUID_A, &[(INDEX, OTHER_BUILD, OTHER_PATCHED)]).await;
+    assert_eq!(agent_get(root, &server, UUID_A, true).await, 0);
+    assert_eq!(recorded_uuid(root), UUID_A);
+    assert_eq!(read(root, INDEX), INDEX_ORIGINAL);
+
+    serve(&server, UUID_B, PATCH_B).await;
+    assert_eq!(agent_scan(root, &server).await, 0);
+
+    assert_eq!(recorded_uuid(root), UUID_B);
+    assert_eq!(read(root, INDEX), INDEX_B);
+    assert_eq!(read(root, EXTRA), EXTRA_ORIGINAL);
+}
+
+/// The original bytes of patch A's files are gone from `.socket/blobs`
+/// and the API does not serve them: patch A cannot be rolled back, so it
+/// stays recorded and applied.
+#[tokio::test]
+#[serial]
+async fn replacement_is_refused_when_an_original_blob_cannot_be_had() {
+    let server = MockServer::start().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    project_with_patch_a(root, &server).await;
+    // Patch B carries `index.js`'s original; only `lib/extra.js`'s is lost.
+    std::fs::remove_file(root.join(".socket/blobs").join(git_sha256(EXTRA_ORIGINAL))).unwrap();
+
+    serve(&server, UUID_B, PATCH_B).await;
+    assert_eq!(agent_scan(root, &server).await, 1);
+
+    assert_eq!(recorded_uuid(root), UUID_A);
+    assert_eq!(read(root, INDEX), INDEX_A);
+    assert_eq!(read(root, EXTRA), EXTRA_A);
+}
+
+/// Replace the recorded patch with patch B through the engine `scan` and
+/// `get` share, for its envelope: `(exit code, envelope)`.
+async fn engine_replace_with_b(root: &Path, server: &MockServer) -> (i32, serde_json::Value) {
     use socket_patch_cli::commands::get::{
         download_and_apply_patches_with, DownloadParams, DownloadRun,
     };
     use socket_patch_core::api::client::{get_api_client_with_overrides, ApiClientEnvOverrides};
     use socket_patch_core::api::types::PatchSearchResult;
 
-    let server = MockServer::start().await;
-    let tmp = tempfile::tempdir().unwrap();
-    let root = tmp.path();
-    project_with_patch_a(root, &server).await;
-    std::fs::write(installed(root, EXTRA), b"edited by hand\n").unwrap();
-    serve(&server, UUID_B, PATCH_B).await;
-
+    serve(server, UUID_B, PATCH_B).await;
     let (api_client, _) = get_api_client_with_overrides(ApiClientEnvOverrides {
         api_url: Some(server.uri()),
         api_token: Some("fake".to_string()),
@@ -490,7 +529,7 @@ async fn refused_replacement_is_a_failed_event_with_its_own_code() {
         proxy_url: None,
     })
     .await;
-    let flags = common(root, &server);
+    let flags = common(root, server);
     let params = DownloadParams {
         cwd: root.to_path_buf(),
         manifest_path: root.join(".socket/manifest.json"),
@@ -521,7 +560,62 @@ async fn refused_replacement_is_a_failed_event_with_its_own_code() {
         common: &flags,
     };
     let (code, env) = download_and_apply_patches_with(&selected, &params, &run).await;
-    let json = env.to_value();
+    (code, env.to_value())
+}
+
+/// The recorded patch changed one file, and that file was edited by hand
+/// afterwards: no file of the copy holds the patch's bytes, so there is
+/// nothing the rollback could restore. The replacement goes through, the
+/// edited file is left alone, and a run warning names the copy.
+#[tokio::test]
+#[serial]
+async fn replacement_warns_about_a_copy_the_old_patch_is_not_on() {
+    let drifted: &[u8] = b"module.exports = 'edited by hand';\n";
+    let server = MockServer::start().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    install(root);
+    serve(&server, UUID_A, &[(EXTRA, EXTRA_ORIGINAL, EXTRA_A)]).await;
+    assert_eq!(agent_scan(root, &server).await, 0);
+    assert_eq!(read(root, EXTRA), EXTRA_A);
+    std::fs::write(installed(root, EXTRA), drifted).unwrap();
+
+    let (code, json) = engine_replace_with_b(root, &server).await;
+
+    assert_eq!(code, 0, "json={json}");
+    assert_eq!(json["summary"]["updated"], 1, "json={json}");
+    assert_eq!(recorded_uuid(root), UUID_B);
+    assert_eq!(read(root, INDEX), INDEX_B);
+    assert_eq!(read(root, EXTRA), drifted, "the edited file is left alone");
+    let warnings: Vec<&serde_json::Value> = json["warnings"]
+        .as_array()
+        .map(|warnings| {
+            warnings
+                .iter()
+                .filter(|warning| warning["code"] == "replaced_patch_not_on_copy")
+                .collect()
+        })
+        .unwrap_or_default();
+    assert_eq!(warnings.len(), 1, "json={json}");
+    let detail = warnings[0]["detail"].as_str().unwrap();
+    assert!(
+        detail.contains(PURL) && detail.contains("aaaaaaaa"),
+        "the warning names the package and the replaced patch: {detail}"
+    );
+}
+
+/// The refusal in the engine's envelope: one `failed` event with its own
+/// code, and no `updated` one.
+#[tokio::test]
+#[serial]
+async fn refused_replacement_is_a_failed_event_with_its_own_code() {
+    let server = MockServer::start().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    project_with_patch_a(root, &server).await;
+    std::fs::write(installed(root, EXTRA), b"edited by hand\n").unwrap();
+
+    let (code, json) = engine_replace_with_b(root, &server).await;
 
     assert_eq!(code, 1, "json={json}");
     assert_eq!(json["status"], "partialFailure", "json={json}");
