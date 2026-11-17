@@ -2999,60 +2999,89 @@ fn wrap_c(value: u32) -> String {
     format!("int sp_wrap_value(void) {{ return {value}; }}\n")
 }
 
-/// A gem that loads its library from its own tree is not left running the
-/// old one: a build staged elsewhere cannot stand in for a library the
-/// installed copy loads from where it was built, so the staged build is
-/// set aside and the gem is rebuilt where it is installed.
-#[test]
-#[ignore = "host capstone: compiles a C extension with the real ruby/gem toolchain; \
-            the unpinned `test` job skips it, the pinned-Ruby e2e leg runs it via --ignored"]
-fn a_gem_that_loads_its_library_from_its_own_tree_is_rebuilt_in_place() {
-    let Some(abi) = toolchain() else {
-        return;
-    };
-    let tmp = tempfile::tempdir().unwrap();
-    let scratch = tmp.path().to_path_buf();
-    let src = scratch.join("sp_wrap");
-    std::fs::create_dir_all(src.join("ext/sp_wrap")).unwrap();
-    std::fs::create_dir_all(src.join("lib")).unwrap();
-    std::fs::write(src.join("ext/sp_wrap/extconf.rb"), WRAP_EXTCONF).unwrap();
-    std::fs::write(src.join(WRAP_C_KEY), wrap_c(1)).unwrap();
-    std::fs::write(src.join("lib/sp_wrap.rb"), WRAP_LIB).unwrap();
-    std::fs::write(
-        src.join("sp_wrap.gemspec"),
-        "Gem::Specification.new do |s|\n  s.name = \"sp_wrap\"\n  s.version = \"1.0.0\"\n  \
-         s.summary = \"t\"\n  s.authors = [\"t\"]\n  \
-         s.files = Dir[\"lib/**/*.rb\", \"ext/**/*.{c,rb}\"]\n  \
-         s.extensions = [\"ext/sp_wrap/extconf.rb\"]\nend\n",
-    )
-    .unwrap();
-    gem(&scratch, &src, &["build", "sp_wrap.gemspec"], &[]);
-    let proj = scratch.join("proj");
-    let home = proj.join("vendor/bundle/ruby").join(&abi);
-    std::fs::create_dir_all(&home).unwrap();
-    std::fs::write(
-        proj.join("Gemfile"),
-        "source \"https://rubygems.org\"\ngem \"sp_wrap\"\n",
-    )
-    .unwrap();
-    gem(
-        &scratch,
-        &scratch,
-        &[
-            "install",
-            "--local",
-            "--no-document",
-            "--install-dir",
-            home.to_str().unwrap(),
-            src.join("sp_wrap-1.0.0.gem").to_str().unwrap(),
-        ],
-        &[],
-    );
-    let gem_dir = home.join("gems/sp_wrap-1.0.0");
-    let value = || {
+/// `sp_wrap` with a build that takes a library it finds for current, as a
+/// Rakefile whose library task does not depend on the C sources does
+/// (digest-crc): run again over an installed tree, it compiles nothing.
+const STALE_EXTCONF: &str = r##"require "rbconfig"
+Dir.chdir(__dir__)
+name = RbConfig::CONFIG["host_os"] =~ /darwin/ ? "libsp_wrap.dylib" : "libsp_wrap.so"
+cc = RbConfig::CONFIG["CC"].split
+unless File.exist?(name)
+  abort "could not build #{name}" unless system(*cc, "-shared", "-fPIC", "-o", name, "wrap.c")
+end
+File.write("Makefile", "all:\n\ninstall:\n\nclean:\n\n")
+"##;
+
+/// A project with `sp_wrap` (built by `extconf`) installed into
+/// `vendor/bundle/ruby/<abi>` by the real `gem`, its archive in the home's
+/// `cache/`, and a record that changes `SpWrap.value` from 1 to 2.
+struct WrapGem {
+    _tmp: tempfile::TempDir,
+    proj: PathBuf,
+    home: PathBuf,
+    gem_dir: PathBuf,
+}
+
+impl WrapGem {
+    fn new(abi: &str, extconf: &str) -> WrapGem {
+        let tmp = tempfile::tempdir().unwrap();
+        let scratch = tmp.path().to_path_buf();
+        let src = scratch.join("sp_wrap");
+        std::fs::create_dir_all(src.join("ext/sp_wrap")).unwrap();
+        std::fs::create_dir_all(src.join("lib")).unwrap();
+        std::fs::write(src.join("ext/sp_wrap/extconf.rb"), extconf).unwrap();
+        std::fs::write(src.join(WRAP_C_KEY), wrap_c(1)).unwrap();
+        std::fs::write(src.join("lib/sp_wrap.rb"), WRAP_LIB).unwrap();
+        std::fs::write(
+            src.join("sp_wrap.gemspec"),
+            "Gem::Specification.new do |s|\n  s.name = \"sp_wrap\"\n  s.version = \"1.0.0\"\n  \
+             s.summary = \"t\"\n  s.authors = [\"t\"]\n  \
+             s.files = Dir[\"lib/**/*.rb\", \"ext/**/*.{c,rb}\"]\n  \
+             s.extensions = [\"ext/sp_wrap/extconf.rb\"]\nend\n",
+        )
+        .unwrap();
+        gem(&scratch, &src, &["build", "sp_wrap.gemspec"], &[]);
+        let proj = scratch.join("proj");
+        let home = proj.join("vendor/bundle/ruby").join(abi);
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(
+            proj.join("Gemfile"),
+            "source \"https://rubygems.org\"\ngem \"sp_wrap\"\n",
+        )
+        .unwrap();
+        gem(
+            &scratch,
+            &scratch,
+            &[
+                "install",
+                "--local",
+                "--no-document",
+                "--install-dir",
+                home.to_str().unwrap(),
+                src.join("sp_wrap-1.0.0.gem").to_str().unwrap(),
+            ],
+            &[],
+        );
+        assert!(home.join("cache/sp_wrap-1.0.0.gem").is_file());
+        write_record(
+            &proj.join(".socket"),
+            WRAP_PURL,
+            &[(WRAP_C_KEY, Some(&wrap_c(1)), &wrap_c(2))],
+        );
+        let gem_dir = home.join("gems/sp_wrap-1.0.0");
+        WrapGem {
+            _tmp: tmp,
+            proj,
+            home,
+            gem_dir,
+        }
+    }
+
+    /// `SpWrap.value` as the installed gem's Ruby loads it.
+    fn value(&self) -> String {
         let out = Command::new("ruby")
             .args(["-W0", "-e", "require 'sp_wrap'; print SpWrap.value"])
-            .env("GEM_PATH", &home)
+            .env("GEM_PATH", &self.home)
             .env_remove("GEM_HOME")
             .env_remove("RUBYOPT")
             .output()
@@ -3063,43 +3092,178 @@ fn a_gem_that_loads_its_library_from_its_own_tree_is_rebuilt_in_place() {
             String::from_utf8_lossy(&out.stderr)
         );
         String::from_utf8_lossy(&out.stdout).into_owned()
-    };
-    assert_eq!(value(), "1");
-    assert!(home.join("cache/sp_wrap-1.0.0.gem").is_file());
-    let (before, after) = (wrap_c(1), wrap_c(2));
-    write_record(
-        &proj.join(".socket"),
-        WRAP_PURL,
-        &[(WRAP_C_KEY, Some(&before), &after)],
-    );
-    let run =
-        |args: &[&str]| common::run_with_env(&proj, args, &[("SOCKET_RUBYGEMS_URL", NO_REGISTRY)]);
+    }
 
-    let (code, stdout, stderr) = run(&["apply", "--json", "--offline"]);
+    fn c_file(&self) -> String {
+        std::fs::read_to_string(self.gem_dir.join(WRAP_C_KEY)).unwrap()
+    }
+
+    /// The library the gem loads, relative to the gem dir.
+    fn library(&self) -> String {
+        ["libsp_wrap.so", "libsp_wrap.dylib"]
+            .iter()
+            .map(|name| format!("ext/sp_wrap/{name}"))
+            .find(|rel| self.gem_dir.join(rel).is_file())
+            .expect("the gem's library is in its own tree")
+    }
+
+    fn run(&self, args: &[&str]) -> (i32, String, String) {
+        common::run_with_env(&self.proj, args, &[("SOCKET_RUBYGEMS_URL", NO_REGISTRY)])
+    }
+}
+
+/// A gem that loads its library from its own tree is not left running the
+/// old one: a build staged elsewhere cannot stand in for a library the
+/// installed copy loads from where it was built, so the staged build is
+/// set aside and the gem is rebuilt where it is installed. The library
+/// that build replaces is backed up and recorded like one in the extension
+/// dir: `apply --check` notices it changing, and `rollback` gives the
+/// original back byte for byte (#2104).
+#[test]
+#[ignore = "host capstone: compiles a C extension with the real ruby/gem toolchain; \
+            the unpinned `test` job skips it, the pinned-Ruby e2e leg runs it via --ignored"]
+fn a_gem_that_loads_its_library_from_its_own_tree_is_rebuilt_in_place() {
+    let Some(abi) = toolchain() else {
+        return;
+    };
+    let fx = WrapGem::new(&abi, WRAP_EXTCONF);
+    assert_eq!(fx.value(), "1");
+    let installed = walk_files(&fx.gem_dir);
+    let extensions = walk_files(&fx.home.join("extensions"));
+    let library = fx.library();
+
+    let (code, stdout, stderr) = fx.run(&["apply", "--json", "--offline"]);
     assert_eq!(code, 0, "apply failed:\n{stdout}\n{stderr}");
     assert_eq!(
-        value(),
+        fx.value(),
         "2",
         "Ruby must load the library built from the patched source:\n{stdout}"
     );
-    assert_eq!(
-        std::fs::read_to_string(gem_dir.join(WRAP_C_KEY)).unwrap(),
-        after
+    assert_eq!(fx.c_file(), wrap_c(2));
+    assert!(!fx.home.join(".socket-patch-build").exists());
+    let marker: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(fx.gem_dir.join(".socket-patch-native-build.json")).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        marker["libArtifacts"][&library].is_string(),
+        "the build record names the library built in the gem's tree: {marker}"
     );
-    assert!(gem_dir.join(".socket-patch-native-build.json").is_file());
-    assert!(!home.join(".socket-patch-build").exists());
-    let (code, stdout, stderr) = run(&["apply", "--check"]);
+    let (code, stdout, stderr) = fx.run(&["apply", "--check"]);
     assert_eq!(code, 0, "a rebuilt patch checks clean:\n{stdout}\n{stderr}");
+    assert!(vex_attests(|args| fx.run(args)));
 
-    // (Rollback restores the sources and the extension dir. The library in
-    // the gem's own tree is no part of what an in-place rebuild backs up,
-    // here as before the stage existed.)
-    let (code, stdout, stderr) = run(&["rollback", "--json", "--offline"]);
+    // A library that is no longer the one that was built is not attested.
+    let built = std::fs::read(fx.gem_dir.join(&library)).unwrap();
+    std::fs::write(fx.gem_dir.join(&library), b"not the build").unwrap();
+    let (code, stdout, stderr) = fx.run(&["apply", "--check"]);
+    assert_ne!(
+        code, 0,
+        "a replaced library must not check clean:\n{stdout}\n{stderr}"
+    );
+    assert!(!vex_attests(|args| fx.run(args)));
+    std::fs::write(fx.gem_dir.join(&library), built).unwrap();
+
+    let (code, stdout, stderr) = fx.run(&["rollback", "--json", "--offline"]);
+    assert_eq!(code, 0, "rollback failed:\n{stdout}\n{stderr}");
+    assert_eq!(fx.value(), "1", "Ruby must load the original library again");
+    assert_tree(&fx.gem_dir, &installed, "after rollback");
+    assert_tree(&fx.home.join("extensions"), &extensions, "after rollback");
+}
+
+/// A build that takes the library it finds in the gem's tree for current
+/// compiles nothing when it runs over an installed copy. The products the
+/// source gem's build was seen to make are removed first, as a fresh
+/// install starts without them, so the library is built from the patched
+/// source (#2105).
+#[test]
+#[ignore = "host capstone: compiles a C extension with the real ruby/gem toolchain; \
+            the unpinned `test` job skips it, the pinned-Ruby e2e leg runs it via --ignored"]
+fn a_build_that_keeps_a_stale_library_is_made_to_rebuild_it() {
+    let Some(abi) = toolchain() else {
+        return;
+    };
+    let fx = WrapGem::new(&abi, STALE_EXTCONF);
+    assert_eq!(fx.value(), "1");
+    let installed = walk_files(&fx.gem_dir);
+
+    let (code, stdout, stderr) = fx.run(&["apply", "--json", "--offline"]);
+    assert_eq!(code, 0, "apply failed:\n{stdout}\n{stderr}");
+    assert_eq!(
+        fx.value(),
+        "2",
+        "Ruby must load the library built from the patched source:\n{stdout}"
+    );
+    let (code, stdout, stderr) = fx.run(&["apply", "--check"]);
+    assert_eq!(code, 0, "a rebuilt patch checks clean:\n{stdout}\n{stderr}");
+    assert!(vex_attests(|args| fx.run(args)));
+
+    let (code, stdout, stderr) = fx.run(&["rollback", "--json", "--offline"]);
+    assert_eq!(code, 0, "rollback failed:\n{stdout}\n{stderr}");
+    assert_eq!(fx.value(), "1", "Ruby must load the original library again");
+    assert_tree(&fx.gem_dir, &installed, "after rollback");
+
+    // A rollback that has lost the backup rebuilds from the restored
+    // source, and that build must not take the patched library for
+    // current either. (The first rollback dropped the record.)
+    write_record(
+        &fx.proj.join(".socket"),
+        WRAP_PURL,
+        &[(WRAP_C_KEY, Some(&wrap_c(1)), &wrap_c(2))],
+    );
+    let (code, stdout, stderr) = fx.run(&["apply", "--json", "--offline"]);
+    assert_eq!(code, 0, "apply failed:\n{stdout}\n{stderr}");
+    assert_eq!(fx.value(), "2");
+    std::fs::remove_dir_all(fx.gem_dir.join(".socket-patch-native-orig")).unwrap();
+    let (code, stdout, stderr) = fx.run(&["rollback", "--json", "--offline"]);
     assert_eq!(code, 0, "rollback failed:\n{stdout}\n{stderr}");
     assert_eq!(
-        std::fs::read_to_string(gem_dir.join(WRAP_C_KEY)).unwrap(),
-        before
+        fx.value(),
+        "1",
+        "the library is rebuilt from the restored source:\n{stdout}"
     );
+    assert_eq!(fx.c_file(), wrap_c(1));
+}
+
+/// Without the source gem nothing says which files the build makes, so
+/// none can be removed for it. A build that then exits cleanly and leaves
+/// every library as it was has not built the patched source: the patch is
+/// refused, the gem is left exactly as it was, and nothing attests it
+/// (#2105).
+#[test]
+#[ignore = "host capstone: compiles a C extension with the real ruby/gem toolchain; \
+            the unpinned `test` job skips it, the pinned-Ruby e2e leg runs it via --ignored"]
+fn a_build_that_compiles_nothing_is_refused_and_not_attested() {
+    let Some(abi) = toolchain() else {
+        return;
+    };
+    let fx = WrapGem::new(&abi, STALE_EXTCONF);
+    std::fs::remove_file(fx.home.join("cache/sp_wrap-1.0.0.gem")).unwrap();
+    let installed = walk_files(&fx.gem_dir);
+    let extensions = walk_files(&fx.home.join("extensions"));
+
+    let (code, stdout, stderr) = fx.run(&["apply", "--json", "--offline"]);
+    assert_ne!(
+        code, 0,
+        "a build that compiled nothing must not pass for a rebuild:\n{stdout}\n{stderr}"
+    );
+    let env = parse_json_envelope(&stdout);
+    let event = common::envelope::event_for(&env, WRAP_PURL);
+    assert!(
+        event["error"].as_str().is_some_and(|e| {
+            e.starts_with("native_extension_build_failed:") && e.contains("compiled nothing")
+        }),
+        "the refusal says the build compiled nothing:\n{stdout}"
+    );
+    assert_eq!(fx.value(), "1");
+    assert_eq!(fx.c_file(), wrap_c(1), "the source is put back");
+    assert_tree(&fx.gem_dir, &installed, "after the refused apply");
+    assert_tree(
+        &fx.home.join("extensions"),
+        &extensions,
+        "after the refused apply",
+    );
+    assert!(!vex_attests(|args| fx.run(args)));
 }
 
 /// A precompiled gem ships one binary per Ruby minor, and a graft replaces

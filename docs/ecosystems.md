@@ -1952,6 +1952,13 @@ rewrites the lock:
 - an archive in Bundler's cache dir (`vendor/cache`, or the configured `cache_path`). It is a
   committed file: the run lists it with the files to commit.
 
+A gem that agent mode patched in place (`scan --mode agent`, `apply`) counts too. Its files are
+already the patched ones, but the archive RubyGems kept beside it is still the upstream one, and
+`bundle pristine` and `bundle install --redownload` reinstall from that archive: with a
+`CHECKSUMS` section in the lock Bundler removes the gem and fails on the checksum, without one it
+brings the unpatched gem back. So that archive is replaced with the patched one. The installed
+files are left as they are.
+
 They are replaced with the patched `.gem` the lock pins, checked against that sha256 first. A gem
 with a native extension is installed into a staging directory by RubyGems, with the Ruby that
 owns the installed copy, and swapped in once it has compiled; with no such Ruby, or with
@@ -2018,7 +2025,12 @@ are never printed. The JRuby (`-java`) build of a gem ships
 jars and is always refused for such a patch.
 
 A gem that builds a library into its own directory and loads it from there (an FFI gem such as
-argon2) is always rebuilt from its installed tree.
+scrypt, a Rakefile build such as digest-crc) is always rebuilt from its installed tree. The
+libraries the gem's build makes there are removed first, as a fresh install has none of them, so
+a build script that would take an existing library for current compiles the patched source. When
+`apply` can't tell which files those are (no source gem to compare with) and the build exits
+without changing any compiled code, the package fails with `native_extension_build_failed`
+instead of being reported as patched.
 
 Ruby files are never build inputs outside `ext/` and a build script's directory: a patch that only
 changes `.rb` or `.rbs` files needs no compiler, wherever the gem keeps them.
@@ -2047,7 +2059,8 @@ passes `--no-gem-native-rebuild` (or `SOCKET_NO_GEM_NATIVE_REBUILD=1`): the sour
 without a rebuild, with a `native_extension_not_rebuilt` warning, and `vex` does not attest them.
 
 `apply` keeps the original compiled code in `.socket-patch-native-orig/` inside the gem
-directory (the install-time build, or a precompiled gem's prebuilt binary), so `rollback`
+directory (the install-time build, a precompiled gem's prebuilt binary, and every file a rebuild
+in the installed tree replaced there), so `rollback`
 restores it byte for byte without recompiling, and records what it built in
 `.socket-patch-native-build.json`. `vex` attests the patch only while that record matches the
 installed binary: after `gem pristine` or a reinstall, run `apply` again.
