@@ -506,9 +506,12 @@ pub(super) fn preflight_package(
     }
     // A registry record this run would move onto a local tarball: a
     // default-trusted package stays where Bun runs its scripts (#371).
+    // Not when a record is already vendored: Bun trusts by name, so that
+    // one took the default trust from every copy already.
     if matches
         .iter()
         .any(|p| p.version.as_deref() == Some(coords.version.as_str()))
+        && !matches.iter().any(|p| p.version.is_none())
     {
         super::bun_lock::refuse_default_trusted(
             project.manifest.as_deref(),

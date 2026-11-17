@@ -28,11 +28,11 @@
 
 use serde_json::Value;
 
-/// A `package.json` parsed the way the most lenient npm-family installer
-/// reads it: a leading BOM is skipped, and when the text is not strict
-/// JSON, the comments and trailing commas Bun accepts are removed first
-/// ([`strip_jsonc`]). npm, yarn, pnpm and vlt refuse such a file outright,
-/// so only a Bun project can hold one, and reading it is what keeps a Bun
+/// A `package.json` parsed the way Bun reads it: a leading BOM is skipped,
+/// and when the text is not strict JSON, the comments and trailing commas
+/// Bun accepts are removed first ([`strip_jsonc`]). npm, yarn, pnpm and vlt
+/// refuse such a file outright, so this is for readers that know Bun is the
+/// installer (or that only widen): reading it is what keeps a Bun
 /// workspace root from looking like no workspace at all. `None` when Bun
 /// could not parse the text either.
 pub(crate) fn parse(text: &str) -> Option<Value> {
@@ -133,10 +133,20 @@ impl Workspaces {
         }
     }
 
-    /// The field of a `package.json` text, read as [`parse`] reads it (a
-    /// leading BOM is ignored, Bun's comments and trailing commas are
-    /// allowed); `None` when the text is not JSON even so.
+    /// The field of a `package.json` text (a leading BOM is ignored);
+    /// `None` when the text is not JSON. Strict, as npm, yarn, pnpm and
+    /// vlt read it: a manifest with comments is one they cannot install
+    /// from, so it names no workspace of theirs.
     pub(crate) fn parse(package_json: &str) -> Option<Self> {
+        serde_json::from_str(super::text::strip_bom(package_json))
+            .ok()
+            .map(|doc| Self::of(&doc))
+    }
+
+    /// [`Self::parse`] as Bun reads the manifest ([`parse`]): comments and
+    /// trailing commas allowed. For a root Bun installs, and for readers
+    /// that only widen.
+    pub(crate) fn parse_as_bun(package_json: &str) -> Option<Self> {
         parse(package_json).map(|doc| Self::of(&doc))
     }
 
@@ -156,6 +166,12 @@ impl Workspaces {
     /// reader takes from a `package.json` text.
     pub(crate) fn listed_patterns(package_json: &str) -> Option<Vec<String>> {
         Self::parse(package_json)?.into_listed()
+    }
+
+    /// [`Self::listed_patterns`] as Bun reads the manifest
+    /// ([`Self::parse_as_bun`]).
+    pub(crate) fn listed_patterns_as_bun(package_json: &str) -> Option<Vec<String>> {
+        Self::parse_as_bun(package_json)?.into_listed()
     }
 
     /// Whether the field names at least one pattern ([`Self::into_listed`]
@@ -187,23 +203,36 @@ mod tests {
                      \"workspaces\": [\"packages/*\", \"vendor/lib\",],\n}\n";
         assert!(serde_json::from_str::<Value>(jsonc).is_err());
         assert_eq!(
-            Workspaces::listed_patterns(jsonc),
+            Workspaces::listed_patterns_as_bun(jsonc),
             Some(strings(&["packages/*", "vendor/lib"]))
         );
         assert_eq!(parse(jsonc).unwrap()["name"], "mono");
+        // npm, yarn, pnpm and vlt cannot install from it: no workspace of
+        // theirs.
+        assert_eq!(Workspaces::listed_patterns(jsonc), None);
+        assert_eq!(Workspaces::parse(jsonc), None);
         // The object form, behind a BOM.
         let object = "\u{feff}{\"workspaces\": {\"packages\": [\"a\",], }, }";
-        assert_eq!(Workspaces::listed_patterns(object), Some(strings(&["a"])));
+        assert_eq!(
+            Workspaces::listed_patterns_as_bun(object),
+            Some(strings(&["a"]))
+        );
         // Comment markers and commas inside strings are content.
         let strings_kept = r#"{"name": "a//b /* c */", "workspaces": ["x,]", "y,}"],}"#;
         assert_eq!(parse(strings_kept).unwrap()["name"], "a//b /* c */");
         assert_eq!(
-            Workspaces::listed_patterns(strings_kept),
+            Workspaces::listed_patterns_as_bun(strings_kept),
             Some(strings(&["x,]", "y,}"]))
+        );
+        // Strict JSON reads the same either way.
+        let plain = r#"{"workspaces": ["a/*"]}"#;
+        assert_eq!(
+            Workspaces::listed_patterns_as_bun(plain),
+            Workspaces::listed_patterns(plain)
         );
         // Still not JSON: unreadable, as before.
         for broken in ["{\"workspaces\": [}", "{\"workspaces\": [\"a\"]", ""] {
-            assert_eq!(Workspaces::parse(broken), None, "{broken:?}");
+            assert_eq!(Workspaces::parse_as_bun(broken), None, "{broken:?}");
         }
     }
 

@@ -2767,9 +2767,10 @@ async fn rewrite_once(
                 );
                 // A default-trusted package keeps its registry record
                 // too, unless an earlier run already pinned it (#371): the
-                // text rewriter's rule, read off the binary records.
-                let records =
-                    crate::vendor::bun_lockb::BunLockb::parse_packages(&bytes).unwrap_or_default();
+                // text rewriter's rule, read off the binary records. They
+                // are decoded only if some override is on Bun's default
+                // list, which is rare.
+                let records = std::cell::OnceCell::new();
                 let binary_overrides: Vec<DepOverride> = overrides
                     .iter()
                     .filter(|o| {
@@ -2785,29 +2786,35 @@ async fn rewrite_once(
                         ) {
                             return false;
                         }
-                        let already_pinned = records.iter().any(|p| {
-                            p.name == name
-                                && (p.resolution == o.artifact_url
-                                    || crate::patch::redirect::is_prior_hosted_bun_spec(
-                                        &format!("{name}@{}", p.resolution),
-                                        &name,
-                                        &o.artifact_url,
-                                    ))
-                        });
-                        let pins_registry_copy = records.iter().any(|p| {
-                            p.name == name
-                                && p.version.as_deref() == Some(o.version.as_str())
-                                && !p.bundled_only
-                        });
-                        !(pins_registry_copy
-                            && !already_pinned
-                            && crate::patch::redirect::skip_bun_default_trusted(
-                                files.get("package.json").map(String::as_str),
-                                None,
-                                &name,
-                                o,
-                                &mut rewrite,
-                            ))
+                        let newly_pins = || {
+                            let records = records.get_or_init(|| {
+                                crate::vendor::bun_lockb::BunLockb::parse_packages(&bytes)
+                                    .unwrap_or_default()
+                            });
+                            let already_pinned = records.iter().any(|p| {
+                                p.name == name
+                                    && (p.resolution == o.artifact_url
+                                        || crate::patch::redirect::is_prior_hosted_bun_spec(
+                                            &format!("{name}@{}", p.resolution),
+                                            &name,
+                                            &o.artifact_url,
+                                        ))
+                            });
+                            !already_pinned
+                                && records.iter().any(|p| {
+                                    p.name == name
+                                        && p.version.as_deref() == Some(o.version.as_str())
+                                        && !p.bundled_only
+                                })
+                        };
+                        !crate::patch::redirect::skip_bun_default_trusted(
+                            files.get("package.json").map(String::as_str),
+                            None,
+                            &name,
+                            o,
+                            newly_pins,
+                            &mut rewrite,
+                        )
                     })
                     .cloned()
                     .collect();

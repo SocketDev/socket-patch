@@ -6193,18 +6193,23 @@ pub(crate) fn skip_bun_user_patched(
 /// its binding. A working install must not be traded for a patch, so the
 /// package is skipped, loudly, with the way to patch it. Warns, keeps the
 /// in-run VEX from assuming the uuid patched, and keeps any other lock from
-/// confirming it. The caller asks only for a registry copy this run would
-/// newly pin: a pin an earlier run wrote stays, with
-/// [`bun_default_trust_warning`]. `true` when `dep` was skipped.
+/// confirming it. `newly_pins` says whether this run would take a registry
+/// copy off the registry with no copy pinned yet: a pin an earlier run
+/// wrote stays, with [`bun_default_trust_warning`], and a new copy beside
+/// it is pinned too (Bun trusts by name, so the trust is already gone). It
+/// is asked only for a name on Bun's default list, which is rare, so the
+/// per-dep lock scan behind it stays off the hot path (#578). `true` when
+/// `dep` was skipped.
 pub(crate) fn skip_bun_default_trusted(
     manifest: Option<&str>,
     lock: Option<&str>,
     name: &str,
     dep: &DepOverride,
+    newly_pins: impl FnOnce() -> bool,
     result: &mut RewriteResult,
 ) -> bool {
     use crate::vendor::bun_lock_text::{default_trust_skip_detail, loses_default_trust};
-    if !loses_default_trust(manifest, lock, name) {
+    if !loses_default_trust(manifest, lock, name) || !newly_pins() {
         return false;
     }
     result.bundled_skipped_uuids.insert(dep.patch_uuid.clone());
@@ -6263,15 +6268,12 @@ fn rewrite_bun_lock(
     );
 
     // Decode each entry's spec once per lock, not once per (patch, entry)
-    // pair. The bundled flag needs a full JSON parse of the entry's meta
-    // object, so it is computed lazily, only for entries whose spec matches
-    // some patch, and cached (#580: the eager per-patch parse made bun scans
-    // O(entries x patches) JSON parses).
+    // pair (#580). Whether an entry is a bundled copy was decided when the
+    // lock was parsed.
     let specs: Vec<Option<String>> = entries
         .iter()
         .map(|e| e.elems.first().and_then(|s| decode_json_string(s)))
         .collect();
-    let mut bundled: Vec<Option<bool>> = vec![None; entries.len()];
 
     let mut changed = false;
     let mut pinned_any = false;
@@ -6292,30 +6294,23 @@ fn rewrite_bun_lock(
         // A default-trusted package is pinned only where an earlier run
         // already pinned it: taking a registry copy off the registry would
         // stop Bun from running its install scripts (#371).
-        let already_pinned = || {
-            specs.iter().flatten().any(|spec| {
+        let newly_pins = || {
+            let already_pinned = specs.iter().flatten().any(|spec| {
                 *spec == url_spec || is_prior_hosted_bun_spec(spec, &fname, &dep.artifact_url)
-            })
+            });
+            !already_pinned
+                && entries.iter().zip(&specs).any(|(entry, spec)| {
+                    spec.as_deref() == Some(&target_spec) && !is_bundled_entry(entry)
+                })
         };
-        let pins_registry_copy = || {
-            entries.iter().zip(&specs).any(|(entry, spec)| {
-                spec.as_deref() == Some(&target_spec) && !is_bundled_entry(entry)
-            })
-        };
-        if crate::vendor::bun_lock_text::loses_default_trust(
+        if skip_bun_default_trusted(
             files.get("package.json").map(String::as_str),
             Some(content),
             &fname,
-        ) && !already_pinned()
-            && pins_registry_copy()
-            && skip_bun_default_trusted(
-                files.get("package.json").map(String::as_str),
-                Some(content),
-                &fname,
-                dep,
-                result,
-            )
-        {
+            dep,
+            newly_pins,
+            result,
+        ) {
             continue;
         }
         let mut matched_any = false;
@@ -6330,23 +6325,37 @@ fn rewrite_bun_lock(
             // reads the entry's spec (#469), so a rewrite here would count
             // as redirected (and VEX-attest the patch) while the unpatched
             // bundled bytes keep installing. Mirrors npm's `inBundle` guard.
-            // The cheap spec match runs first; the bundled parse only for
-            // a match (#580).
-            if (spec == target_spec
-                || spec == url_spec
-                || is_prior_hosted_bun_spec(spec, &fname, &dep.artifact_url))
-                && *bundled[i].get_or_insert_with(|| is_bundled_entry(entry))
+            if is_bundled_entry(entry)
+                && (spec == target_spec
+                    || spec == url_spec
+                    || is_prior_hosted_bun_spec(spec, &fname, &dep.artifact_url))
             {
                 matched_any = true;
                 result.bundled_skipped_uuids.insert(dep.patch_uuid.clone());
-                result.warnings.push(RewriteWarning {
-                    code: "redirect_bun_bundled_instance_skipped".into(),
-                    detail: format!(
+                // An entry Bun flags is a name the parent bundles. One it
+                // does not flag is a dependency of such a copy: Bun writes
+                // it from the registry's metadata and installs what the
+                // parent packed, which need not be this version.
+                let detail = if crate::vendor::bun_lock_text::declares_bundled(entry) {
+                    format!(
                         "bun.lock entry `{}` is bundled inside its parent's tarball and \
                          CANNOT be redirected — that copy stays UNPATCHED; vendor or update \
                          the bundling parent to cover it",
                         entry.key
-                    ),
+                    )
+                } else {
+                    format!(
+                        "bun.lock entry `{}` belongs to a copy bundled inside a parent's \
+                         tarball: Bun installs what the parent packed there (which may be \
+                         another version than the lock says) and never reads this entry, so \
+                         it CANNOT be redirected — any copy of {fname} in that tarball stays \
+                         UNPATCHED; vendor or update the bundling parent to cover it",
+                        entry.key
+                    )
+                };
+                result.warnings.push(RewriteWarning {
+                    code: "redirect_bun_bundled_instance_skipped".into(),
+                    detail,
                 });
                 continue;
             }
@@ -16141,6 +16150,13 @@ mod tests {
         );
         assert_ne!(mirrored, lock);
         assert!(run(&mirrored, None).warnings.is_empty());
+        // Bun takes the list from package.json: with a readable manifest
+        // that declares none, a copy left in the lock keeps no script
+        // running, so the package is still left on the registry.
+        assert_eq!(
+            warning_codes(&run(&mirrored, Some(manifest))),
+            vec!["redirect_bun_default_trust_skipped"]
+        );
 
         // A bundled copy is not rewired, so its trust is not the rewire's
         // to lose (its own warning says it stays unpatched).

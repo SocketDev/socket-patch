@@ -86,9 +86,10 @@ const DEFAULT_TRUSTED: &str = include_str!("bun_default_trusted.txt");
 /// only to packages resolved from the npm registry, so a package on a hosted
 /// URL or a local tarball loses it: `bun install` skips its `install` /
 /// `postinstall` script without failing, and a native addon is left
-/// unbuilt. An explicit list (in the root manifest, or the copy Bun mirrors
-/// at the top of a text `bun.lock`) already decides trust by name alone,
-/// so the rewire changes nothing there.
+/// unbuilt. An explicit list in the root manifest already decides trust by
+/// name alone, so the rewire changes nothing there. The copy Bun mirrors
+/// at the top of a text `bun.lock` counts only when the manifest cannot be
+/// read: Bun itself takes the list from `package.json`.
 pub(crate) fn loses_default_trust(manifest: Option<&str>, lock: Option<&str>, name: &str) -> bool {
     // The list lookup is cheap and almost always false, so it runs first:
     // the hosted rewriter calls this per wired dep, and the manifest parse
@@ -101,15 +102,21 @@ pub(crate) fn loses_default_trust(manifest: Option<&str>, lock: Option<&str>, na
     {
         return false;
     }
-    let declared = manifest.and_then(parse_manifest).is_some_and(|value| {
-        value
+    // Bun reads the list from package.json alone: a copy left only in
+    // bun.lock does not keep the scripts running (a frozen install blocks
+    // them, a plain one deletes the copy; Bun 1.3.14 and 1.4.4). So a
+    // manifest that can be read decides, and the lock's mirror stands in
+    // only when it cannot.
+    let declared = match manifest.and_then(parse_manifest) {
+        Some(value) => value
             .get("trustedDependencies")
-            .is_some_and(|v| v.is_array())
-    }) || lock.is_some_and(|lock| {
-        lock.split('\n')
-            .map(|l| l.strip_suffix('\r').unwrap_or(l))
-            .any(|l| l.starts_with("  \"trustedDependencies\": ["))
-    });
+            .is_some_and(|v| v.is_array()),
+        None => lock.is_some_and(|lock| {
+            lock.split('\n')
+                .map(|l| l.strip_suffix('\r').unwrap_or(l))
+                .any(|l| l.starts_with("  \"trustedDependencies\": ["))
+        }),
+    };
     !declared
 }
 
@@ -1036,9 +1043,7 @@ pub(crate) fn heal_workspace_literals(
         }
         let declared = manifests
             .entry(dep.workspace.clone())
-            .or_insert_with(|| {
-                manifest(&dep.workspace).and_then(|text| serde_json::from_str(&text).ok())
-            })
+            .or_insert_with(|| manifest(&dep.workspace).and_then(|text| parse_manifest(&text)))
             .as_ref()
             .and_then(|json| json.get(&dep.group))
             .and_then(|group| group.get(&dep.name))

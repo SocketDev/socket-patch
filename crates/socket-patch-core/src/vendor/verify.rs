@@ -144,15 +144,18 @@ pub async fn verify_vendored_patch_record(
         }
         return Ok(());
     }
-    // An npm tarball is read strictly: the installers strip the first path
-    // segment whatever it is and let a later member overwrite an earlier
-    // one, so a tarball carrying the patched file under `package/` and the
-    // original under another root (or a second spelling of the same name)
-    // would verify here and install unpatched. Every tarball vendoring
-    // writes is in the canonical shape; one that is not was edited.
-    let strict_npm = is_tarball && entry.ecosystem == "npm";
+    // An npm tarball's patched files must be the ones the installers
+    // extract: they strip the first path segment whatever it is and let a
+    // later entry overwrite an earlier one, so a tarball carrying the
+    // patched file under `package/` and the original under another root
+    // (or a second spelling of the same name, or a link) would verify here
+    // and install unpatched. Only the record's files are judged: an
+    // upstream tarball with a link or a non-ASCII name elsewhere, which
+    // vendoring accepts, keeps verifying.
+    let patched_files: Option<Vec<String>> =
+        (is_tarball && entry.ecosystem == "npm").then(|| record.files.keys().cloned().collect());
     let map = tokio::task::spawn_blocking(move || {
-        if strict_npm {
+        if let Some(patched_files) = patched_files {
             let (file, meta) = crate::utils::fs::open_regular_file_sync(&artifact)
                 .map_err(|_| "vendor_artifact_unreadable".to_string())?;
             if meta.len() > MAX_HEALTH_HASH_BYTES {
@@ -165,12 +168,13 @@ pub async fn verify_vendored_patch_record(
             if bytes.len() as u64 > MAX_HEALTH_HASH_BYTES {
                 return Err("vendor_artifact_unreadable".to_string());
             }
-            crate::patch::package::read_archive_bytes_to_map_strict(&bytes).map_err(|e| match e {
-                crate::patch::package::ArchiveError::NonCanonical(_) => {
-                    "vendor_artifact_non_canonical".to_string()
-                }
-                _ => "vendor_artifact_unreadable".to_string(),
-            })
+            match crate::patch::package::shadowed_member(&bytes, &patched_files) {
+                Ok(None) => {}
+                Ok(Some(_)) => return Err("vendor_artifact_non_canonical".to_string()),
+                Err(_) => return Err("vendor_artifact_unreadable".to_string()),
+            }
+            crate::patch::package::read_archive_bytes_to_map(&bytes)
+                .map_err(|_| "vendor_artifact_unreadable".to_string())
         } else if is_tarball {
             read_archive_to_map(&artifact).map_err(|_| "vendor_artifact_unreadable".to_string())
         } else {
@@ -858,8 +862,9 @@ pub async fn describe_artifact_failure(
                 "file_not_found" => "is missing a patched file",
                 "vendor_artifact_unreadable" => "cannot be read",
                 "vendor_artifact_non_canonical" => {
-                    "is not laid out the way vendoring writes it (an entry outside package/, a \
-                     duplicate or a non-file entry)"
+                    "holds a second entry the package manager would extract over a patched \
+                     file (another top-level directory, a second spelling of the name, or a \
+                     link)"
                 }
                 "vendor_inventory_mismatch" => "has files that differ from its recorded inventory",
                 _ => "failed verification",

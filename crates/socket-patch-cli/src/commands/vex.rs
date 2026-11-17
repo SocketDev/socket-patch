@@ -2382,9 +2382,9 @@ fn omission_phrase(reason: &str) -> &'static str {
         "vendor_artifact_missing" => "the vendored artifact is missing",
         "vendor_artifact_unreadable" => "the vendored artifact cannot be read",
         "vendor_artifact_non_canonical" => {
-            "the vendored tarball is not laid out the way vendoring writes it (an entry \
-             outside package/, a duplicate or a non-file entry), so the package manager \
-             would not extract what was checked"
+            "the vendored tarball holds a second entry the package manager would extract \
+             over a patched file (another top-level directory, a second spelling of the \
+             name, or a link), so what installs is not what was checked"
         }
         "vendor_lock_pin_mismatch" => {
             "the lockfile pins the vendored tarball to a sha512 that is not that file's, so \
