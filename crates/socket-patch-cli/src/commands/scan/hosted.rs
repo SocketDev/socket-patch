@@ -1530,10 +1530,9 @@ async fn run_redirect_selected_untracked(
     // What Maven selects in each module, from the poms its local repository
     // holds: a pin is written only where that is the patch's base version.
     // Read once per run, off the runtime (the walk reads a pom per artifact
-    // of the build), and only for a pom the rewriter will edit.
+    // of the build), for a single pom and for every module of a reactor.
     let maven_selection_read = if candidates.iter().any(|c| c.dep.ecosystem == "maven")
         && read.files.contains_key("pom.xml")
-        && !socket_patch_core::patch::redirect::maven_reactor_root(&read.files)
     {
         let cwd = common.cwd.clone();
         tokio::task::spawn_blocking(move || {

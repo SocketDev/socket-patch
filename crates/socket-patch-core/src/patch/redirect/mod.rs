@@ -406,6 +406,22 @@ pub struct RewriteResult {
         serde(skip_serializing_if = "std::collections::BTreeSet::is_empty")
     )]
     pub refused_gradle_uuids: std::collections::BTreeSet<String>,
+    /// Maven patch uuids the reactor planner decided (a reactor root, or a
+    /// single pom's `${property}` version): their pins may sit in module
+    /// poms, a property or a comment-recorded declaration, so the pom
+    /// rewriter's own report confirms them, never a substring.
+    #[cfg_attr(
+        test,
+        serde(skip_serializing_if = "std::collections::BTreeSet::is_empty")
+    )]
+    pub maven_reactor_uuids: std::collections::BTreeSet<String>,
+    /// Those of [`Self::maven_reactor_uuids`] some pom wires once the
+    /// rewrite is written (by this run, or already).
+    #[cfg_attr(
+        test,
+        serde(skip_serializing_if = "std::collections::BTreeSet::is_empty")
+    )]
+    pub confirmed_maven_reactor_uuids: std::collections::BTreeSet<String>,
     /// Patch uuids pinned in `socket-patch.sbt` and verified against the
     /// build's resolution evidence (kept or added by this run). On a pure
     /// sbt root ([`sbt::owns_maven_root`]) maven confirmation keys off this
@@ -852,6 +868,8 @@ fn merge_group_delta(result: &mut RewriteResult, delta: RewriteResult) {
         gradle_uuids,
         confirmed_gradle_uuids,
         refused_gradle_uuids,
+        maven_reactor_uuids,
+        confirmed_maven_reactor_uuids,
         confirmed_sbt_uuids,
         refused_sbt_uuids,
     } = delta;
@@ -896,6 +914,10 @@ fn merge_group_delta(result: &mut RewriteResult, delta: RewriteResult) {
     result.gradle_uuids.extend(gradle_uuids);
     result.confirmed_gradle_uuids.extend(confirmed_gradle_uuids);
     result.refused_gradle_uuids.extend(refused_gradle_uuids);
+    result.maven_reactor_uuids.extend(maven_reactor_uuids);
+    result
+        .confirmed_maven_reactor_uuids
+        .extend(confirmed_maven_reactor_uuids);
     result.bundled_skipped_uuids.extend(bundled_skipped_uuids);
     for (uuid, keys) in alias_skipped_entries {
         result
@@ -8939,30 +8961,15 @@ fn rewrite_maven_pom(
         return;
     }
     let mut pom = files.get("pom.xml").cloned();
-    // A reactor root: this rewriter reads only the root pom, and a module's
-    // own literal `<version>` beats any pin written here, so that module
-    // would keep the unpatched upstream jar while the dep counts as
-    // redirected and VEX attests it (#261). Refuse the whole root, untouched;
-    // vendored mode's reactor planner rewrites each module's declaration.
-    // Maven 4 subprojects found by discovery count too (#1809): the engine
-    // reads each direct subdirectory's `pom.xml` beside such a root.
-    if pom.is_some() && maven_reactor_root(files) {
-        let gas: Vec<String> = maven
-            .iter()
-            .map(|dep| match &dep.namespace {
-                Some(ns) => format!("{ns}:{}", dep.name),
-                None => dep.name.clone(),
-            })
-            .collect();
-        result.warnings.push(RewriteWarning {
-            code: "redirect_maven_multimodule_unsupported".into(),
-            detail: format!(
-                "pom.xml heads a multi-module reactor (<modules>/<subprojects>, or Maven 4 subproject discovery); hosted mode reads only the root pom, so a module's own <version> of {} would stay unpatched. pom.xml and .mvn/ were left as they are and the dep is not counted as redirected; use `scan --mode vendored`, which pins each module's declaration",
-                gas.join(", ")
-            ),
-        });
-        return;
-    }
+    // A reactor root (`<modules>` / `<subprojects>`, or Maven 4 subproject
+    // discovery, #1809) is planned over all of its poms by the reactor
+    // planner ([`plan_maven_reactor`]): a module's own `<version>` beats any
+    // pin in the root pom (#261), so the pins go where each module selects
+    // the patched version. A single pom is rewritten below, and hands a
+    // `${property}` version to the same planner.
+    let reactor_root = pom.is_some() && maven_reactor_root(files);
+    // The module poms the reactor planner changed, as they read now.
+    let mut module_poms: BTreeMap<String, String> = BTreeMap::new();
     let mut pom_changed = false;
     // The hosted generations whose `socket-patch-<uuid>` repository the pom
     // declared before this run: only a suffixed literal one of these minted
@@ -9088,6 +9095,56 @@ fn rewrite_maven_pom(
                 continue;
             }
         };
+        if reactor_root {
+            let _ = idx;
+            let planned = plan_maven_reactor(
+                files,
+                pom_text,
+                &mut module_poms,
+                ReactorDep {
+                    dep,
+                    group_id: &group_id,
+                    artifact_id: &artifact_id,
+                    suffixed: suffixed_version.as_deref(),
+                    repo_id: &repo_id,
+                    index_url: &ov.index_url,
+                    refusal: "redirect_maven_multimodule_unsupported",
+                },
+                selection,
+                &user_properties,
+                result,
+            );
+            pom_changed |= files.get("pom.xml") != Some(&*pom_text);
+            index = pom
+                .as_deref()
+                .map(|pom| maven_index::PomIndex::build(pom, &user_properties));
+            let (Some(run), Some(suffixed)) = (planned, suffixed_version.as_deref()) else {
+                continue;
+            };
+            if checksum_hashes.is_some() && run.wired {
+                pinned_jar_paths.push(crate::vendor::jvm::layout::artifact_path(
+                    &group_id,
+                    &artifact_id,
+                    suffixed,
+                    None,
+                    "jar",
+                ));
+            }
+            checksum_drops.extend(run.superseded_paths);
+            if run.landed {
+                pin_maven_checksums(
+                    files,
+                    (&group_id, &artifact_id, suffixed),
+                    checksum_hashes.as_ref(),
+                    bad_checksum_hashes,
+                    &mut mvn_config,
+                    &mut mvn_config_changed,
+                    &mut checksum_entries,
+                    result,
+                );
+            }
+            continue;
+        }
         // A `<dependencyManagement>` pin makes every occurrence of the GA
         // one version, so it is safe only where Maven selects the patch's
         // base version already. A build that selects another version (or
@@ -9413,20 +9470,61 @@ fn rewrite_maven_pom(
             continue;
         }
 
-        // A `${property}` version on any match: refuse this dep entirely.
-        // Editing the literal would break the property reference, and a depMgmt
-        // pin could strand sibling artifacts sharing the property.
-        if let Some(prop) = matches
+        // A `${property}` version on any match: the reactor planner wires
+        // it (this pom is a reactor of one). It rewrites the property's own
+        // value when nothing else reads that property, so no sibling
+        // artifact is stranded; else it replaces the one declaration and
+        // records the text it replaced beside it.
+        if matches
             .iter()
-            .find(|m| m.version_text.as_deref().is_some_and(|v| v.contains("${")))
+            .any(|m| m.version_text.as_deref().is_some_and(|v| v.contains("${")))
         {
-            result.warnings.push(RewriteWarning {
-                code: "redirect_maven_dep_unpinned".into(),
-                detail: format!(
-                    "{group_id}:{artifact_id} <version> is a property placeholder ({}); refusing to pin the suffixed version (a property edit could strand sibling artifacts)",
-                    prop.version_text.as_deref().unwrap_or_default()
-                ),
-            });
+            let planned = plan_maven_reactor(
+                files,
+                pom_text,
+                &mut module_poms,
+                ReactorDep {
+                    dep,
+                    group_id: &group_id,
+                    artifact_id: &artifact_id,
+                    suffixed: Some(&suffixed_version),
+                    repo_id: &repo_id,
+                    index_url: &ov.index_url,
+                    refusal: "redirect_maven_dep_unpinned",
+                },
+                selection,
+                &user_properties,
+                result,
+            );
+            pom_changed |= files.get("pom.xml") != Some(&*pom_text);
+            index = pom
+                .as_deref()
+                .map(|pom| maven_index::PomIndex::build(pom, &user_properties));
+            let Some(run) = planned else {
+                continue;
+            };
+            if checksum_hashes.is_some() && run.wired {
+                pinned_jar_paths.push(crate::vendor::jvm::layout::artifact_path(
+                    &group_id,
+                    &artifact_id,
+                    &suffixed_version,
+                    None,
+                    "jar",
+                ));
+            }
+            checksum_drops.extend(run.superseded_paths);
+            if run.landed {
+                pin_maven_checksums(
+                    files,
+                    (&group_id, &artifact_id, &suffixed_version),
+                    checksum_hashes.as_ref(),
+                    bad_checksum_hashes,
+                    &mut mvn_config,
+                    &mut mvn_config_changed,
+                    &mut checksum_entries,
+                    result,
+                );
+            }
             continue;
         }
 
@@ -9630,66 +9728,16 @@ fn rewrite_maven_pom(
             });
         }
 
-        // Trusted Checksums: only when BOTH the jar sha256 and the served pom
-        // sha256 are known. Two entries per dep — the jar and the pom — under
-        // the SUFFIXED version's local-repo path.
-        if bad_checksum_hashes {
-            result.warnings.push(RewriteWarning {
-                code: "redirect_maven_trusted_checksums_invalid_hash".into(),
-                detail: format!(
-                    "{group_id}:{artifact_id}: the grant's sha256 is not 64 hex digits; \
-                     no Trusted Checksums pin written to {MVN_CHECKSUMS} (the -socket \
-                     version suffix still pins the patched artifact)"
-                ),
-            });
-        }
-        if let Some((jar, pom_hash)) = &checksum_hashes {
-            let (merged, conflicts) =
-                merge_mvn_config(&mvn_config, &format!("{group_id}:{artifact_id}"));
-            for conflict in conflicts {
-                result.warnings.push(RewriteWarning {
-                    code: "redirect_maven_trusted_checksums_conflict".into(),
-                    detail: conflict,
-                });
-            }
-            if merged != mvn_config {
-                let action = if files.contains_key(MVN_CONFIG) {
-                    "rewritten"
-                } else {
-                    "added"
-                };
-                mvn_config = merged;
-                mvn_config_changed = true;
-                result.edits.push(FileEdit {
-                    path: MVN_CONFIG.into(),
-                    kind: "redirect_maven_config".into(),
-                    action: action.into(),
-                    key: Some("trustedChecksums".into()),
-                    original: None,
-                    new: None,
-                });
-            }
-            checksum_entries.push((
-                crate::vendor::jvm::layout::artifact_path(
-                    &group_id,
-                    &artifact_id,
-                    &suffixed_version,
-                    None,
-                    "jar",
-                ),
-                jar.clone(),
-            ));
-            checksum_entries.push((
-                crate::vendor::jvm::layout::artifact_path(
-                    &group_id,
-                    &artifact_id,
-                    &suffixed_version,
-                    None,
-                    "pom",
-                ),
-                pom_hash.clone(),
-            ));
-        }
+        pin_maven_checksums(
+            files,
+            (&group_id, &artifact_id, &suffixed_version),
+            checksum_hashes.as_ref(),
+            bad_checksum_hashes,
+            &mut mvn_config,
+            &mut mvn_config_changed,
+            &mut checksum_entries,
+            result,
+        );
     }
 
     if pom_changed {
@@ -9697,6 +9745,7 @@ fn rewrite_maven_pom(
             result.files.insert("pom.xml".into(), p);
         }
     }
+    result.files.extend(module_poms);
     if mvn_config_changed {
         result.files.insert(MVN_CONFIG.into(), mvn_config);
     }
@@ -9752,6 +9801,417 @@ fn rewrite_maven_pom(
             ),
         });
     }
+}
+
+/// The Trusted Checksums pin of one dep whose version pin landed this run:
+/// only when BOTH the jar sha256 and the served pom sha256 are known. Two
+/// entries per dep — the jar and the pom — under the SUFFIXED version's
+/// local-repo path.
+#[allow(clippy::too_many_arguments)]
+fn pin_maven_checksums(
+    files: &BTreeMap<String, String>,
+    (group_id, artifact_id, suffixed_version): (&str, &str, &str),
+    checksum_hashes: Option<&(String, String)>,
+    bad_checksum_hashes: bool,
+    mvn_config: &mut String,
+    mvn_config_changed: &mut bool,
+    checksum_entries: &mut Vec<(String, String)>,
+    result: &mut RewriteResult,
+) {
+    if bad_checksum_hashes {
+        result.warnings.push(RewriteWarning {
+            code: "redirect_maven_trusted_checksums_invalid_hash".into(),
+            detail: format!(
+                "{group_id}:{artifact_id}: the grant's sha256 is not 64 hex digits; \
+                 no Trusted Checksums pin written to {MVN_CHECKSUMS} (the -socket \
+                 version suffix still pins the patched artifact)"
+            ),
+        });
+    }
+    let Some((jar, pom_hash)) = checksum_hashes else {
+        return;
+    };
+    let (merged, conflicts) = merge_mvn_config(mvn_config, &format!("{group_id}:{artifact_id}"));
+    for conflict in conflicts {
+        result.warnings.push(RewriteWarning {
+            code: "redirect_maven_trusted_checksums_conflict".into(),
+            detail: conflict,
+        });
+    }
+    if merged != *mvn_config {
+        let action = if files.contains_key(MVN_CONFIG) {
+            "rewritten"
+        } else {
+            "added"
+        };
+        *mvn_config = merged;
+        *mvn_config_changed = true;
+        result.edits.push(FileEdit {
+            path: MVN_CONFIG.into(),
+            kind: "redirect_maven_config".into(),
+            action: action.into(),
+            key: Some("trustedChecksums".into()),
+            original: None,
+            new: None,
+        });
+    }
+    for (ext, hash) in [("jar", jar), ("pom", pom_hash)] {
+        checksum_entries.push((
+            crate::vendor::jvm::layout::artifact_path(
+                group_id,
+                artifact_id,
+                suffixed_version,
+                None,
+                ext,
+            ),
+            hash.clone(),
+        ));
+    }
+}
+
+/// One dep handed to the reactor planner.
+struct ReactorDep<'a> {
+    dep: &'a DepOverride,
+    group_id: &'a str,
+    artifact_id: &'a str,
+    /// The grant's suffixed version (`None`: a same-GAV grant).
+    suffixed: Option<&'a str>,
+    repo_id: &'a str,
+    index_url: &'a str,
+    /// The code a dep the planner cannot take is reported under: the one
+    /// the pom rewriter gave that shape before the planner read it.
+    refusal: &'static str,
+}
+
+/// What [`plan_maven_reactor`] did for one dep.
+struct ReactorRun {
+    /// A version, property or pin was written this run.
+    landed: bool,
+    /// Some pom wires the patch once the run is written.
+    wired: bool,
+    /// Trusted-checksum paths of the earlier patches of this version whose
+    /// pins moved to this one.
+    superseded_paths: Vec<String>,
+}
+
+/// The hosted warning a reactor planner note is reported under.
+fn reactor_note_code(reason: &str) -> &'static str {
+    match reason {
+        "classifier_declared" => "redirect_maven_classifier_unsupported",
+        "coordinates_overridden" => "redirect_maven_profile_coordinates_unpatched",
+        "conflicting_literal_version" | "range" => "redirect_maven_dep_version_mismatch",
+        "selection_undetermined" => "redirect_maven_selection_undetermined",
+        "pin_would_move_module" => "redirect_maven_pin_would_move_module",
+        "edit_not_reversible" => "redirect_maven_edit_not_reversible",
+        _ => "redirect_maven_dep_unpinned",
+    }
+}
+
+/// Wire one dep through the reactor planner
+/// ([`crate::vendor::jvm::maven_reactor::plan_hosted`]): over every pom of
+/// a reactor root, or over a single pom whose declaration reads a
+/// `${property}`. The poms it changes land in `pom_text` (the root) and
+/// `module_poms`; the `<repository>` goes in each local root a wired pom
+/// inherits from. `None` when nothing wires the patch (the warning says
+/// why); the `.mvn` files are the caller's.
+fn plan_maven_reactor(
+    files: &BTreeMap<String, String>,
+    pom_text: &mut String,
+    module_poms: &mut BTreeMap<String, String>,
+    of: ReactorDep<'_>,
+    selection: Option<&MavenSelection>,
+    user_properties: &BTreeMap<String, String>,
+    result: &mut RewriteResult,
+) -> Option<ReactorRun> {
+    use crate::vendor::jvm::maven_reactor::{plan_hosted, HostedEditKind};
+    let (dep, g, a) = (of.dep, of.group_id, of.artifact_id);
+    let ga = format!("{g}:{a}");
+    let coords = crate::vendor::jvm::Coords {
+        group_id: g,
+        artifact_id: a,
+        version: &dep.version,
+        uuid: &dep.patch_uuid,
+    };
+    let refuse = |result: &mut RewriteResult, why: String| {
+        result.warnings.push(RewriteWarning {
+            code: of.refusal.into(),
+            detail: format!(
+                "{ga}: {why}; the poms and .mvn/ were left as they are and the dep is not \
+                 counted as redirected (`scan --mode vendored` commits the patched artifact \
+                 instead)"
+            ),
+        });
+    };
+    result.maven_reactor_uuids.insert(dep.patch_uuid.clone());
+    // The planner writes the suffix the patch uuid gives; a grant that
+    // serves another one (or none: a same-GAV grant) is not planned.
+    let suffixed = coords.suffixed_version();
+    if of.suffixed != Some(suffixed.as_str()) || dep.patch_uuid.len() != 36 {
+        refuse(
+            result,
+            match of.suffixed {
+                Some(served) => {
+                    format!("the grant serves {served}, not the {suffixed} its patch uuid names")
+                }
+                None => "the grant serves the patched artifact under its original version, \
+                         which a pin in one pom cannot keep apart from the upstream one in \
+                         another"
+                    .to_string(),
+            },
+        );
+        return None;
+    }
+    let before: BTreeMap<String, String> = module_poms.clone();
+    let plan = {
+        let read = |rel: &str| {
+            let text = match rel {
+                "pom.xml" => Some(&*pom_text),
+                _ => module_poms.get(rel).or_else(|| files.get(rel)),
+            };
+            text.map(|text| text.as_bytes().to_vec())
+        };
+        let list = |dir: &str| gradle::key_list(files, dir);
+        plan_hosted(&read, &list, &coords, selection)
+    };
+    let plan = match plan {
+        Ok(plan) => plan,
+        Err(refusal) => {
+            refuse(
+                result,
+                refusal
+                    .detail
+                    .strip_prefix("reason: ")
+                    .unwrap_or(&refusal.detail)
+                    .to_string(),
+            );
+            return None;
+        }
+    };
+    if let Some(others) = &plan.not_selected {
+        result.warnings.push(RewriteWarning {
+            code: "redirect_maven_version_not_selected".into(),
+            detail: format!(
+                "{}; the poms were left as they are",
+                crate::crawlers::maven_selection::not_selected_detail(g, a, &dep.version, others)
+            ),
+        });
+        return None;
+    }
+    for (reason, detail) in &plan.notes {
+        result.warnings.push(RewriteWarning {
+            code: reactor_note_code(reason).into(),
+            detail: detail.clone(),
+        });
+    }
+    // Earlier patches of this version whose wiring this run moves on.
+    let generations = |texts: &dyn Fn(&str) -> Option<String>, rels: &[String]| {
+        let mut found: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        let prefix = format!("{}-socket.", dep.version);
+        for rel in rels {
+            let Some(text) = texts(rel) else { continue };
+            let masked = crate::formats::xml::blank_non_markup(&text).unwrap_or(text);
+            for (at, _) in masked.match_indices(&prefix) {
+                let hex8 = masked.get(at + prefix.len()..at + prefix.len() + 8);
+                if let Some(hex8) = hex8.filter(|h| h.bytes().all(|b| b.is_ascii_hexdigit())) {
+                    found.insert(format!("{prefix}{hex8}"));
+                }
+            }
+        }
+        found
+    };
+    let changed: Vec<String> = plan.poms.keys().cloned().collect();
+    let old_text = |rel: &str| match rel {
+        "pom.xml" => Some(pom_text.clone()),
+        _ => before.get(rel).or_else(|| files.get(rel)).cloned(),
+    };
+    let had = generations(&old_text, &changed);
+    for (rel, text) in &plan.poms {
+        match rel.as_str() {
+            "pom.xml" => *pom_text = text.clone(),
+            _ => {
+                module_poms.insert(rel.clone(), text.clone());
+            }
+        }
+    }
+    for edit in &plan.edits {
+        let (kind, action, key, new) = match edit.kind {
+            HostedEditKind::Version => (
+                "redirect_maven_dep_version",
+                "rewritten",
+                ga.clone(),
+                Some(Value::String(suffixed.clone())),
+            ),
+            HostedEditKind::Property => (
+                "redirect_maven_property",
+                "rewritten",
+                edit.property.clone().unwrap_or_default(),
+                Some(Value::String(suffixed.clone())),
+            ),
+            HostedEditKind::Pin => (
+                "redirect_maven_dep_management",
+                "added",
+                ga.clone(),
+                Some(json!({ "groupId": g, "artifactId": a, "version": suffixed })),
+            ),
+            HostedEditKind::PinMoved => (
+                "redirect_maven_dep_management",
+                "rewritten",
+                ga.clone(),
+                Some(json!({ "groupId": g, "artifactId": a, "version": suffixed })),
+            ),
+            HostedEditKind::PinRemoved => {
+                ("redirect_maven_dep_management", "removed", ga.clone(), None)
+            }
+        };
+        result.edits.push(FileEdit {
+            path: edit.rel.clone(),
+            kind: kind.into(),
+            action: action.into(),
+            key: Some(key),
+            original: edit.original.clone().map(Value::String),
+            new,
+        });
+        match edit.kind {
+            HostedEditKind::Pin => result.warnings.push(RewriteWarning {
+                code: "redirect_maven_dep_management_added".into(),
+                detail: format!(
+                    "{ga}: added a <dependencyManagement> pin for the suffixed version \
+                     {suffixed} to {}, where every module selects {} already",
+                    edit.rel, dep.version
+                ),
+            }),
+            HostedEditKind::PinRemoved => result.warnings.push(RewriteWarning {
+                code: "redirect_maven_pin_would_move_module".into(),
+                detail: format!(
+                    "{ga}: the pin of {} in {} was removed: a module it reaches now resolves \
+                     another version, which the pin would hold back",
+                    dep.version, edit.rel
+                ),
+            }),
+            _ => {}
+        }
+    }
+    let landed = plan
+        .edits
+        .iter()
+        .any(|edit| edit.kind != HostedEditKind::PinRemoved);
+    let superseded: Vec<String> = {
+        let new_text = |rel: &str| match rel {
+            "pom.xml" => Some(pom_text.clone()),
+            _ => module_poms.get(rel).or_else(|| files.get(rel)).cloned(),
+        };
+        had.difference(&generations(&new_text, &changed))
+            .filter(|old| **old != suffixed)
+            .cloned()
+            .collect()
+    };
+    if !plan.wired {
+        if plan.notes.is_empty() && plan.edits.is_empty() {
+            refuse(
+                result,
+                format!("no pom of the build could take the pin of {}", dep.version),
+            );
+        }
+        return None;
+    }
+    result
+        .confirmed_maven_reactor_uuids
+        .insert(dep.patch_uuid.clone());
+    if !plan.nested_mvn.is_empty() && landed {
+        result.warnings.push(RewriteWarning {
+            code: "redirect_maven_trusted_checksums_unenforced".into(),
+            detail: format!(
+                "{} has a .mvn directory of its own: a Maven started there reads that one, \
+                 not the project root's, so the Trusted Checksums pin in {MVN_CHECKSUMS} is \
+                 not enforced for such a build (the -socket version suffix still pins the \
+                 patched artifact)",
+                plan.nested_mvn.join(", ")
+            ),
+        });
+    }
+    // The repository, where every wired pom inherits it; an earlier
+    // patch's goes once nothing names its suffix any more.
+    for root in &plan.roots {
+        let current = match root.as_str() {
+            "pom.xml" => Some(&*pom_text),
+            _ => module_poms.get(root).or_else(|| files.get(root)),
+        };
+        let Some(mut text) = current.cloned() else {
+            continue;
+        };
+        let Ok(mut index) = maven_index::PomIndex::build(&text, user_properties) else {
+            continue;
+        };
+        let mut edit = |action: &str, key: &str, new: Option<Value>, kind: &str| {
+            result.edits.push(FileEdit {
+                path: root.clone(),
+                kind: kind.into(),
+                action: action.into(),
+                key: Some(key.to_string()),
+                original: None,
+                new,
+            });
+        };
+        let named = json!({ "id": of.repo_id, "url": of.index_url });
+        if !index.has_repository(of.repo_id) {
+            index.insert_repository(&mut text, of.repo_id, of.index_url);
+            edit(
+                "added",
+                of.repo_id,
+                Some(named),
+                "redirect_maven_repository",
+            );
+        } else if index.refresh_repository_url(&mut text, of.repo_id, of.index_url) {
+            edit(
+                "rewritten",
+                of.repo_id,
+                Some(named),
+                "redirect_maven_repository",
+            );
+        }
+        for old in &superseded {
+            let hex8 = crate::formats::maven::split_socket_version(old)
+                .map(|(_, h)| h)
+                .unwrap_or_default();
+            if text.contains(&format!("-socket.{hex8}")) {
+                continue;
+            }
+            for old_uuid in generation::named_generations(&text) {
+                if old_uuid == dep.patch_uuid || !old_uuid.starts_with(hex8) {
+                    continue;
+                }
+                let old_id = generation::hosted_pin_name(&old_uuid);
+                if index.remove_repository(&mut text, &old_id) {
+                    edit(
+                        "removed",
+                        &old_id,
+                        None,
+                        "redirect_maven_superseded_repository_removed",
+                    );
+                }
+            }
+        }
+        match root.as_str() {
+            "pom.xml" => *pom_text = text,
+            _ => {
+                if files.get(root) != Some(&text) || module_poms.contains_key(root) {
+                    module_poms.insert(root.clone(), text);
+                }
+            }
+        }
+    }
+    let superseded_paths = superseded
+        .iter()
+        .flat_map(|old| {
+            ["jar", "pom"]
+                .map(|ext| crate::vendor::jvm::layout::artifact_path(g, a, old, None, ext))
+        })
+        .collect();
+    Some(ReactorRun {
+        landed,
+        wired: true,
+        superseded_paths,
+    })
 }
 
 static MAVEN_REPOSITORY_RE: LazyLock<Regex> = LazyLock::new(|| {
@@ -10719,6 +11179,19 @@ mod tests {
         }
     }
 
+    const MAVEN_UUID: &str = "aaaaaaaa-1111-4222-8333-444444444444";
+
+    /// [`maven_override`] as the patch service grants it: the suffix is the
+    /// first eight hex digits of the patch uuid, which is what ties a pin
+    /// to its repository and what the reactor planner writes.
+    fn granted_maven_override() -> DepOverride {
+        let mut dep = maven_override();
+        dep.patch_uuid = MAVEN_UUID.into();
+        dep.registry_override.as_mut().unwrap().index_url =
+            format!("https://patch.socket.dev/patch-registry/maven/tok/{MAVEN_UUID}/maven2");
+        dep
+    }
+
     /// A legacy override — no suffixed version, no sha256 (same-GAV serving).
     fn legacy_maven_override() -> DepOverride {
         let mut dep = maven_override();
@@ -11126,11 +11599,13 @@ mod tests {
 
     /// #1809: a Maven 4 (model 4.1.0) `pom`-packaged root that lists no
     /// subprojects builds every direct subdirectory holding a `pom.xml`, so
-    /// it is a reactor like a declared one and refused untouched. Without
-    /// such a subdirectory, under a 4.0.0 model, or with discovery turned
-    /// off in `.mvn/maven.config`, it is a single pom and still rewritten.
+    /// it is a reactor like a declared one: each pom's own declaration of
+    /// the version is rewritten, and the repository goes in the root they
+    /// inherit. Without such a subdirectory, under a 4.0.0 model, or with
+    /// discovery turned off in `.mvn/maven.config`, it is a single pom and
+    /// rewritten alone.
     #[test]
-    fn maven_4_implicit_subprojects_root_is_refused() {
+    fn maven_4_implicit_subprojects_are_rewritten_with_their_root() {
         let dep = "<dependencies>\n    <dependency>\n      <groupId>org.slf4j</groupId>\n      <artifactId>slf4j-api</artifactId>\n      <version>1.7.36</version>\n    </dependency>\n  </dependencies>\n";
         let root = |model: &str| {
             format!(
@@ -11141,23 +11616,35 @@ mod tests {
         let tree = |model: &str, extra: &[(&str, &str)]| {
             let mut files = BTreeMap::from([("pom.xml".to_string(), root(model))]);
             files.extend(extra.iter().map(|(k, v)| (k.to_string(), v.to_string())));
-            rewrite_registry_redirect(&files, &[maven_override()])
+            rewrite_registry_redirect(&files, &[granted_maven_override()])
         };
 
         let r = tree("4.1.0", &[("child/pom.xml", child)]);
+        for rel in ["pom.xml", "child/pom.xml"] {
+            let text = r.files.get(rel).map(String::as_str).unwrap_or_default();
+            assert!(
+                text.contains(&format!("<version>{MAVEN_SUFFIXED}</version>")),
+                "{rel} declares the version itself: {text} {:?}",
+                r.warnings
+            );
+        }
         assert!(
-            r.files.is_empty() && r.edits.is_empty(),
-            "an implicit reactor root must not be edited: files={:?} edits={:?}",
-            r.files.keys(),
-            r.edits
+            r.files["pom.xml"].contains("<id>socket-patch-")
+                && !r.files["child/pom.xml"].contains("<repository>"),
+            "one repository, in the root the subproject inherits"
         );
+        assert!(
+            !warning_codes(&r).contains(&"redirect_maven_multimodule_unsupported"),
+            "{:?}",
+            r.warnings
+        );
+        // Nothing of it is planned when a subproject's pom cannot be read.
+        let r = tree("4.1.0", &[("child/pom.xml", "<project>")]);
+        assert!(r.files.is_empty() && r.edits.is_empty(), "{:?}", r.files);
         assert_eq!(
             warning_codes(&r),
             vec!["redirect_maven_multimodule_unsupported"]
         );
-        assert!(r.warnings[0]
-            .detail
-            .contains("Maven 4 subproject discovery"));
 
         let off = "-Dmaven.project.discoverSubprojects=false\n";
         for (case, r) in [
@@ -11180,6 +11667,247 @@ mod tests {
                 "{case}"
             );
         }
+    }
+
+    /// Hosted-redirects slf4j-api over `files`, each module selecting what
+    /// `picks` says for it (a module left out does not resolve it).
+    fn rewrite_poms_selecting(
+        files: &BTreeMap<String, String>,
+        picks: &[(&str, Result<&str, &str>)],
+    ) -> RewriteResult {
+        let modules: Vec<&str> = files
+            .keys()
+            .map(String::as_str)
+            .filter(|rel| rel.ends_with("pom.xml"))
+            .collect();
+        let picks: Vec<_> = picks
+            .iter()
+            .map(|(pom, pick)| (*pom, "org.slf4j", "slf4j-api", *pick))
+            .collect();
+        let selection = MavenSelection::answering(&modules, &picks);
+        rewrite_registry_redirect_with_host(
+            files,
+            &[granted_maven_override()],
+            &BTreeMap::new(),
+            None,
+            false,
+            &std::collections::BTreeSet::new(),
+            &yarnrc::OuterYarnMirror::default(),
+            &CratesIoSource::Registry,
+            Some(&selection),
+        )
+    }
+
+    fn poms(files: &[(&str, &str)]) -> BTreeMap<String, String> {
+        files
+            .iter()
+            .map(|(rel, text)| (rel.to_string(), text.to_string()))
+            .collect()
+    }
+
+    const REACTOR_ROOT: &str = "<project>\n  <modelVersion>4.0.0</modelVersion>\n  \
+        <groupId>com.example</groupId>\n  <artifactId>root</artifactId>\n  \
+        <version>1.0.0</version>\n  <packaging>pom</packaging>\n  <modules>\n    \
+        <module>a</module>\n    <module>b</module>\n  </modules>\n</project>\n";
+
+    /// The module `name` of [`REACTOR_ROOT`], depending on logback (which
+    /// brings slf4j-api in) and on `more`.
+    fn reactor_module(name: &str, more: &str) -> String {
+        format!(
+            "<project>\n  <modelVersion>4.0.0</modelVersion>\n  <parent>\n    \
+             <groupId>com.example</groupId>\n    <artifactId>root</artifactId>\n    \
+             <version>1.0.0</version>\n  </parent>\n  <artifactId>{name}</artifactId>\n  \
+             <dependencies>\n    <dependency>\n      <groupId>ch.qos.logback</groupId>\n      \
+             <artifactId>logback-classic</artifactId>\n      <version>1.4.14</version>\n    \
+             </dependency>\n{more}  </dependencies>\n</project>\n"
+        )
+    }
+
+    /// A reactor is pinned module by module: the pin goes in the pom of
+    /// the module that selects the patch's version, the module that
+    /// resolves another one is not touched, and the repository and the
+    /// Trusted Checksums go where the whole reactor reads them.
+    #[test]
+    fn maven_reactor_is_pinned_in_the_modules_that_select_the_version() {
+        let files = poms(&[
+            ("pom.xml", REACTOR_ROOT),
+            ("a/pom.xml", &reactor_module("a", "")),
+            ("b/pom.xml", &reactor_module("b", "")),
+        ]);
+        let picks = [("a/pom.xml", Ok("1.7.36")), ("b/pom.xml", Ok("2.0.9"))];
+        let r = rewrite_poms_selecting(&files, &picks);
+        assert_eq!(
+            r.files.keys().collect::<Vec<_>>(),
+            [MVN_CHECKSUMS, MVN_CONFIG, "a/pom.xml", "pom.xml"],
+            "b/pom.xml is not written: {:?}",
+            r.warnings
+        );
+        let pin = format!(
+            "<!-- socket-patch {MAVEN_UUID}: org.slf4j:slf4j-api:1.7.36 -->\n      \
+             <dependency>\n        <groupId>org.slf4j</groupId>\n        \
+             <artifactId>slf4j-api</artifactId>\n        <version>{MAVEN_SUFFIXED}</version>\n      \
+             </dependency>"
+        );
+        assert!(
+            r.files["a/pom.xml"].contains(&pin),
+            "{}",
+            r.files["a/pom.xml"]
+        );
+        assert!(!r.files["a/pom.xml"].contains("<repository>"));
+        let root = &r.files["pom.xml"];
+        assert!(
+            root.contains(&format!("<id>socket-patch-{MAVEN_UUID}</id>"))
+                && !root.contains(MAVEN_SUFFIXED),
+            "the root takes the repository and no pin: {root}"
+        );
+        assert_eq!(
+            r.edits
+                .iter()
+                .map(|e| (e.path.as_str(), e.kind.as_str(), e.action.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                ("a/pom.xml", "redirect_maven_dep_management", "added"),
+                ("pom.xml", "redirect_maven_repository", "added"),
+                (MVN_CONFIG, "redirect_maven_config", "added"),
+                (MVN_CHECKSUMS, "redirect_maven_trusted_checksums", "added"),
+            ]
+        );
+        assert_eq!(warning_codes(&r), ["redirect_maven_dep_management_added"]);
+        assert!(r.confirmed_maven_reactor_uuids.contains(MAVEN_UUID));
+
+        // A second run over what the first wrote changes nothing, and
+        // still counts the patch as pinned.
+        let mut after = files.clone();
+        after.extend(r.files.clone());
+        let again = rewrite_poms_selecting(&after, &picks);
+        assert!(
+            again.files.is_empty() && again.edits.is_empty(),
+            "{:?} {:?}",
+            again.files.keys(),
+            again.edits
+        );
+        assert!(again.confirmed_maven_reactor_uuids.contains(MAVEN_UUID));
+
+        // No module selects the version: nothing is written, and the line
+        // says what the build selects instead.
+        let r = rewrite_poms_selecting(
+            &files,
+            &[("a/pom.xml", Ok("2.0.9")), ("b/pom.xml", Ok("2.0.9"))],
+        );
+        assert!(r.files.is_empty() && r.edits.is_empty());
+        assert_eq!(warning_codes(&r), ["redirect_maven_version_not_selected"]);
+        assert!(r.warnings[0].detail.contains("2.0.9"), "{:?}", r.warnings);
+        assert!(r.confirmed_maven_reactor_uuids.is_empty());
+    }
+
+    /// A reactor none of whose poms can be told is left as it is, but for
+    /// a declaration that names the version: that one is rewritten where
+    /// it stands, which moves nothing.
+    #[test]
+    fn maven_reactor_without_a_selection_rewrites_declarations_only() {
+        let declaring = "    <dependency>\n      <groupId>org.slf4j</groupId>\n      \
+                         <artifactId>slf4j-api</artifactId>\n      <version>1.7.36</version>\n    \
+                         </dependency>\n";
+        let files = poms(&[
+            ("pom.xml", REACTOR_ROOT),
+            ("a/pom.xml", &reactor_module("a", declaring)),
+            ("b/pom.xml", &reactor_module("b", "")),
+        ]);
+        let r = rewrite_registry_redirect(&files, &[granted_maven_override()]);
+        assert_eq!(
+            r.files["a/pom.xml"],
+            files["a/pom.xml"].replace("<version>1.7.36<", &format!("<version>{MAVEN_SUFFIXED}<"))
+        );
+        assert!(!r.files.contains_key("b/pom.xml"));
+        assert_eq!(
+            warning_codes(&r),
+            ["redirect_maven_selection_undetermined"],
+            "b may resolve it too, and is not pinned on a guess"
+        );
+        assert!(r.confirmed_maven_reactor_uuids.contains(MAVEN_UUID));
+    }
+
+    fn property_pom(properties: &str, more: &str) -> String {
+        format!(
+            "<project>\n  <modelVersion>4.0.0</modelVersion>\n  <groupId>com.example</groupId>\n  \
+             <artifactId>app</artifactId>\n  <version>1.0.0</version>\n  <properties>\n    \
+             {properties}\n  </properties>\n  <dependencies>\n    <dependency>\n      \
+             <groupId>org.slf4j</groupId>\n      <artifactId>slf4j-api</artifactId>\n      \
+             <version>${{slf4j.version}}</version>\n    </dependency>\n{more}  \
+             </dependencies>\n</project>\n"
+        )
+    }
+
+    /// A `${property}` version is wired, no longer refused: the property
+    /// itself when only this artifact reads it, else the one declaration,
+    /// with the text it replaced recorded right after it so a rollback
+    /// can put it back.
+    #[test]
+    fn maven_property_version_is_wired_without_stranding_a_sibling() {
+        let picks = [("pom.xml", Ok("1.7.36"))];
+
+        let own = poms(&[(
+            "pom.xml",
+            &property_pom("<slf4j.version>1.7.36</slf4j.version>", ""),
+        )]);
+        let r = rewrite_poms_selecting(&own, &picks);
+        assert!(
+            r.files["pom.xml"]
+                .contains(&format!("<slf4j.version>{MAVEN_SUFFIXED}</slf4j.version>"))
+                && r.files["pom.xml"].contains("<version>${slf4j.version}</version>"),
+            "{}",
+            r.files["pom.xml"]
+        );
+        assert_eq!(r.edits[0].kind, "redirect_maven_property");
+        assert_eq!(r.edits[0].key.as_deref(), Some("slf4j.version"));
+        assert!(warning_codes(&r).is_empty(), "{:?}", r.warnings);
+        assert!(r.confirmed_maven_reactor_uuids.contains(MAVEN_UUID));
+
+        let sibling = "    <dependency>\n      <groupId>org.slf4j</groupId>\n      \
+                       <artifactId>slf4j-simple</artifactId>\n      \
+                       <version>${slf4j.version}</version>\n    </dependency>\n";
+        let shared = poms(&[(
+            "pom.xml",
+            &property_pom("<slf4j.version>1.7.36</slf4j.version>", sibling),
+        )]);
+        let r = rewrite_poms_selecting(&shared, &picks);
+        let pom = &r.files["pom.xml"];
+        assert!(
+            pom.contains(&format!(
+                "<artifactId>slf4j-api</artifactId>\n      <version>{MAVEN_SUFFIXED}</version>\
+                 <!-- socket-patch:version ${{slf4j.version}} -->"
+            )),
+            "{pom}"
+        );
+        assert!(
+            pom.contains("<slf4j.version>1.7.36</slf4j.version>")
+                && pom.contains(
+                    "<artifactId>slf4j-simple</artifactId>\n      \
+                     <version>${slf4j.version}</version>"
+                ),
+            "the property and its other reader are as they were: {pom}"
+        );
+        assert_eq!(r.edits[0].kind, "redirect_maven_dep_version");
+        assert_eq!(
+            r.edits[0].original,
+            Some(Value::String("${slf4j.version}".into()))
+        );
+        let mut after = shared.clone();
+        after.extend(r.files.clone());
+        let again = rewrite_poms_selecting(&after, &picks);
+        assert!(
+            again.files.is_empty() && again.edits.is_empty(),
+            "{:?}",
+            again.edits
+        );
+
+        // A property no pom of the checkout defines, in a build whose
+        // selection is not known: left as it is, with the reason.
+        let undefined = poms(&[("pom.xml", &property_pom("<other>1</other>", ""))]);
+        let r = rewrite_registry_redirect(&undefined, &[granted_maven_override()]);
+        assert!(r.files.is_empty() && r.edits.is_empty(), "{:?}", r.files);
+        assert!(warning_codes(&r).contains(&"redirect_maven_dep_unpinned"));
+        assert!(r.confirmed_maven_reactor_uuids.is_empty());
     }
 
     /// A direct declaration whose groupId / artifactId is a property of
