@@ -40,20 +40,22 @@ other npm lockfile flavors.
 
 | Input | Hosted (`scan` / `get --mode hosted`) | Vendored (`scan` / `get --mode vendored`, `vendor`) | Agent / discovery |
 |-------|------|------|------|
-| Text `bun.lock`, lockfileVersion 0, 1 or 2, no `workspace:` packages | Registry 4-tuple `["name@ver", "<registry>", {deps}, "sha512-…"]` → URL 3-tuple `["name@https://patch.socket.dev/…/name-ver.tgz", {deps}, "sha512-<patched>"]`; the `{deps}` meta object (dependencies, bin, …), the lock's version line and its line endings are kept verbatim. | Same entry → local 3-tuple `["name@.socket/vendor/npm/<uuid>/name-ver.tgz", {deps}, "sha512-<ours>"]`, tarball committed under `.socket/vendor/npm/<uuid>/`; the patch record lives in `.socket/vendor/state.json` (the ledger embeds it — vendored mode writes no `.socket/manifest.json`). | The installed tree is patched in place; the lock's registry tuples are inventoried, so lockfile-only packages join discovery. |
+| Text `bun.lock`, lockfileVersion 0 to 3, no `workspace:` packages (3 is what Bun 1.4+ writes for a nested override or a yarn-style path resolution in `package.json`; golden `lock-v3-nested-overrides`) | Registry 4-tuple `["name@ver", "<registry>", {deps}, "sha512-…"]` → URL 3-tuple `["name@https://patch.socket.dev/…/name-ver.tgz", {deps}, "sha512-<patched>"]`; the `{deps}` meta object (dependencies, bin, …), the lock's version line and its line endings are kept verbatim. | Same entry → local 3-tuple `["name@.socket/vendor/npm/<uuid>/name-ver.tgz", {deps}, "sha512-<ours>"]`, tarball committed under `.socket/vendor/npm/<uuid>/`; the patch record lives in `.socket/vendor/state.json` (the ledger embeds it — vendored mode writes no `.socket/manifest.json`). | The installed tree is patched in place; the lock's registry tuples are inventoried, so lockfile-only packages join discovery. |
 | Version-0 lock (Bun 1.1.39–1.1.45 `--save-text-lockfile`) with `workspace:` packages — 2-tuple entries `"consumer": ["consumer@workspace:packages/consumer", { "dependencies": { … } }]` | Refused `redirect_bun_workspace_unsupported`, lock untouched, exit 0. Remedy: delete `bun.lock` and re-lock with Bun ≥ 1.2 (writes lockfileVersion 1, which hosted mode accepts; 2 on Bun ≥ 1.4). A plain in-place `bun install` bumps the version only when a workspace depends on another workspace (root → member — the matrix's `workspace` shape, the only shape it was measured on); otherwise Bun 1.2.0 keeps version 0 and 1.2.23+ fail to resolve (see [In-place re-versioning](#installer-boundaries-measured)). | Refused `vendor_bun_workspace_unsupported` (pre-version-2 policy, next row); its remedy tail for a version-0 lock says to re-lock with Bun ≥ 1.2 before trying `--mode hosted`, which refuses version 0 too. | Works. |
 | Version-1 lock (Bun 1.2–1.3 default) with `workspace:` packages — 1-tuple entries `["consumer@workspace:packages/consumer"]` | Rewritten (golden `lock-v1-workspace`; matrix 1.2.0–1.3.14 `workspace` / `workspace-nested`). | Refused `vendor_bun_workspace_unsupported` before any write. Policy, not a grammar limit: Bun 1.2.x–1.3.x resolve a workspace member's local-tarball path relative to the MEMBER (our root-relative tuple ENOENTs on `bun install`), 1.4.x relative to the lockfile, and a committed lockfileVersion-2 lock is the only proof that every consumer runs Bun ≥ 1.4 (1.3.x cannot parse v2). A deliberate over-approximation: a package declared only by the workspace ROOT vendors and installs on v1 too, but the lock cannot cheaply prove which workspace declares a hoisted entry. Remedy in the detail: delete `bun.lock`, re-run `bun install` with Bun ≥ 1.4 (an in-place `bun install` keeps the existing version), or — version 1 — use `--mode hosted`, which accepts version-1 workspace locks (a version-0 lock is told to re-lock with Bun ≥ 1.2 first). NOT refused: purls the vendor ledger wires at the selected uuid, purls whose every matching lock tuple already points into `.socket/vendor/npm/` (any uuid — a superseding patch re-pins in place; the lock-derived rule the engine uses), in-sync re-runs and `repair` rebuilds. `vendor` and the vendor step run the same preflight BEFORE a hosted → vendored takeover's revert, so a hosted-redirected purl on such a lock stays hosted-patched (`failed vendor_bun_workspace_unsupported`, lock and ledgers untouched; `vendor --dry-run` previews the same code). A `.socket/vendor/state.json` the preflight cannot read is `vendor_state_unreadable`, fail-closed. | Works. |
 | Version-2 lock (Bun 1.4+) with `workspace:` packages, nested versions included | Rewritten (golden `lock-v2-workspace-nested` — provenance: its nested same-version `consumer/left-pad` entry is a synthetic, grammar-valid extension of the 1.4.2 capture; bun hoists identical resolutions and never writes that entry itself, but bun 1.4.2 installs the fixture unchanged, and it is the only case pinning the rewrite of every matching tuple in one lock). | Vendored (matrix 1.4.0 / 1.4.2 `workspace`, `workspace-nested`, `already-vendored-workspace`). | Works. |
 | Binary `bun.lockb` (binary format revisions 1, 2 and 3) | Package resolution and integrity records are rewritten in place. The CLI does not spawn Bun or produce a text lock. `rollback` / `remove` cannot restore a hosted `bun.lockb` entry to its upstream registry entry (v5.0 keeps no ledger to replay, and the binary lock is not re-derived), so they refuse it with the `git checkout -- bun.lockb` remedy. | Native local-tarball wiring, committed artifact, repair and vendored → hosted takeover. Hosted → vendored rebuilds a hosted `bun.lockb` pin's npm registry record from the registry (byte-exact for a lock socket-patch wired hosted), then vendors; `vendor --revert` returns the pre-hosted lock. Offline it refuses (`redirect_revert_failed`), leaving it hosted. | Registry package records are inventoried directly, including lockfile-only projects without `node_modules`. |
 | A package the project patches itself with `bun patch` (a `patchedDependencies` key for its `name@version`, or its bare name, in the root `package.json` or mirrored in `bun.lock`) (#367); on Bun 1.4, a `bun patch` made after a rewire is keyed by the resolution instead, `name@<hosted url>` or `name@.socket/vendor/npm/<uuid>/<name>-<version>.tgz` (#1019) | Left where it resolves (text and binary lock): Bun applies the user's patch only to the resolution it is keyed on, so moving the entry (to a hosted URL, or a superseding one, or a vendored → hosted takeover, which keeps the vendored wiring) would drop it from every install with exit 0. Warns `redirect_bun_patched_dependency_skipped` naming the key, and the in-run VEX never assumes the patch applied; other packages in the lock are still rewired. A key for the URL the run would pin anyway (an in-sync re-run) is no conflict. A wet `rollback` / `remove` that takes out the hosted URL a patch is keyed by still restores the registry entry, and warns `redirect_bun_patched_dependency_dropped`. | Refused `vendor_lock_entry_unsupported` before any write or download (text and binary lock), naming the key, a hosted → vendored takeover included. A wet revert that takes out the vendored path a patch is keyed by warns `vendor_bun_patched_dependency_dropped`. | The installed tree is patched in place, as for any package. |
-| A package on Bun's default trusted list (better-sqlite3, esbuild, sharp, …) in a project that declares no `trustedDependencies` (root `package.json`, or mirrored in `bun.lock`) (#371) | Rewired (text and binary lock), with warning `redirect_bun_default_trust_lost`: Bun 1.3.5+ apply the default list only to npm-registry resolutions, so a hosted URL makes `bun install` skip the package's install scripts with exit 0 (measured: 1.3.4 runs them, 1.3.5–1.4.2 do not). The remedy is adding the package to `trustedDependencies`, which replaces the default list. | Same, `vendor_bun_default_trust_lost`, for the local tarball tuple (text and binary lock). | Not affected: the installed tree keeps its registry resolution. |
+| A package on Bun's default trusted list (better-sqlite3, esbuild, sharp, sqlite3, …) in a project that declares no `trustedDependencies` (root `package.json`, or mirrored in `bun.lock`) (#371) | Left on the registry, unpatched, with warning `redirect_bun_default_trust_skipped` (text and binary lock); other packages are still rewired. Bun 1.3.5+ apply the default list only to npm-registry resolutions, so a hosted URL makes `bun install` skip the package's install scripts with exit 0 (measured: 1.3.4 runs them, 1.3.5–1.4.4 do not; `sqlite3@5.1.4` on 1.4.4 installs without its native binding and `require` throws). Bun reads `trustedDependencies` from `package.json` only: a copy written into `bun.lock` alone leaves the script blocked on a frozen install and is deleted by a plain one (1.3.14, 1.4.4), so a lockfile edit cannot keep it running. The remedy is adding the package to `trustedDependencies`, which replaces the default list, and re-running. A pin an earlier release wrote stays, with warning `redirect_bun_default_trust_lost` on every run. | Refused `vendor_bun_default_trust_refused` before any write or download whenever the run would move a registry copy onto a local tarball (text and binary lock), a hosted → vendored takeover included (the hosted wiring is put back). A package an earlier release vendored stays, with warning `vendor_bun_default_trust_lost`. | Not affected: the installed tree keeps its registry resolution. |
 | Truncated, corrupt or unrecognized binary `bun.lockb` | Refused with `redirect_bun_lockb_invalid`, preserving the lock. | Refused with `vendor_bun_lockb_invalid` before downloads or artifact creation. | The inventory reports the malformed lock. |
-| `bun.lock` with a `lockfileVersion` ≥ 3, no integer version, or a `packages` section outside bun's single-line grammar | Refused `redirect_bun_lock_unsupported`. | Refused `vendor_lockfile_version_unsupported` (preflight and engine). | The inventory skips the lock. |
+| `bun.lock` with a `lockfileVersion` ≥ 4, no integer version, or a `packages` section outside bun's single-line grammar (a comment line, a re-indent) | Refused `redirect_bun_lock_unsupported`. | Refused `vendor_lockfile_version_unsupported` (preflight and engine). | The inventory does not read the lock and says so (`bun_lock_unsupported`, a scan warning): installed packages are still crawled, and a checkout without `node_modules` ends `No packages found (see the warning).` |
+| A root `package.json` with comments or trailing commas, which Bun installs from (1.1.45 to 1.4.4) and npm, yarn, pnpm and vlt refuse | Read as Bun reads it: its `workspaces` patterns name the workspace root, so a member directory is refused with the root named, and a stray lock inside a member is never rewired or attested. | Same. | Members under directory names the crawl prunes (`vendor/`, `build/`, `dist/`, …) are found through the patterns and patched. `vex` reads the product name and version from it. |
+| A copy inside a bundled tree: an entry Bun flags `"bundled": true`, or an unflagged entry (record, in `bun.lockb`) that only bundled copies depend on. Bun writes the dependencies of a bundled copy as ordinary entries and never installs them; `npm@6.14.18` has 123 flagged and 399 unflagged ones | Not rewired; warns `redirect_bun_bundled_instance_skipped` naming the entry, and the in-run VEX never assumes the patch applied. A registry copy of the same version elsewhere in the lock is still rewired, and is not attested while the bundled copy ships unpatched. | Not vendored: `vendor_lock_entry_not_rewritable` when every copy is bundled, `vendor_bundled_instance_skipped` when a registry copy is vendored beside it. | The installed copy is patched in place. |
 | `bun.lock` listing the patched package's `packages` key on more than one line (a merge that kept both sides) | No duplicate check: the line grammar takes each line as an entry. | Refused `vendor_lockfile_version_unsupported` for that package before any write (a revert finds its line by key); a ledger written before this refusal still reverts, each record restoring its own line. | Each line is read as an entry. |
 
 One detail text serves both modes for the version gate: a newer version says
 "update socket-patch, or re-lock with a Bun release that writes
-lockfileVersion 0–2" (re-locking with a newer Bun would reproduce it); a
+lockfileVersion 0–3" (re-locking with a newer Bun would reproduce it); a
 missing integer says "re-lock with Bun ≥ 1.2".
 
 **Pre-download preflight (vendored).** `scan --mode vendored` and
@@ -216,9 +218,41 @@ runners) from the GitHub releases and verifies it against `SHASUMS256.txt`. Ever
   trailing commas, no `configVersion`, 2-tuple workspace entries);
   `--lockfile-only` exists from 1.1.43; text is the default from 1.2.0
   (lockfileVersion 1) through 1.3.x; 1.4.0 writes 2 for a FRESH lock behind
-  an unchanged grammar. Registry 4-tuples are byte-identical across 0/1/2,
-  so the rewrite is version-independent; the workspace grammar, the
+  an unchanged grammar, and 3 instead when `package.json` has a nested
+  override (`"overrides": {"rc": {"minimist": "1.2.2"}}`) or a yarn-style
+  path resolution (`"resolutions": {"rc/minimist": "1.2.2"}`): measured on
+  1.4.0, 1.4.2, 1.4.3 and 1.4.4. A version-3 lock differs from a version-2
+  one only in its head, where `overrides` holds nested objects; Bun 1.3.14
+  cannot read it ("Ignoring lockfile"), as it cannot read version 2.
+  Registry 4-tuples are byte-identical across 0/1/2/3, so the rewrite is
+  version-independent (a hosted or local tuple written into a version-3
+  lock installs frozen and stays put on 1.4.4); the workspace grammar, the
   binary layout and digest enforcement are not.
+- **Which commands keep a pin.** Measured on 1.4.4 from a committed,
+  patched and installed project, hosted and vendored alike. Kept: `bun
+  install` (plain, `--force`, `--frozen-lockfile`, `--production`,
+  `--no-save`, `--lockfile-only`, `--linker isolated|hoisted`, `--backend
+  hardlink`), `bun ci`, `bun add <other>`, `bun remove <other>`, `bun update
+  <other>`, and `bun add <patched>@<same version>`. Dropped: a bare `bun
+  update` and `bun update <patched>`, which write the registry tuple back
+  with exit 0 and no message even though the version does not change
+  (also measured on 1.1.45, 1.2.23 and 1.3.14). The installed copy stays
+  patched until the next reinstall, so the tree and the lock disagree until
+  then. `vendor --check` reports the lost wiring (exit 1); hosted mode
+  keeps no ledger, so only the lock diff shows it. A rescan re-pins.
+- **Bundled trees.** For a package with `bundleDependencies`, Bun writes
+  an entry for each bundled name (flagged `"bundled": true`) and for every
+  dependency of those copies (unflagged, with registry specs and digests),
+  and installs none of them: they are unpacked from the parent's tarball,
+  at the versions the parent packed. Measured on 1.4.4 by installing into
+  an empty cache and listing what was fetched: `npm@6.14.18` (523 entries,
+  1 fetched), `npm@10.9.0` (254, 1), `fsevents@1.2.9` (75, 2: `fsevents`
+  and `nan`; its tree's `minimist` is 0.0.8 on disk where the lock says
+  1.2.8) and a 1,069-entry lock holding `semantic-release` (322 fetched).
+  In each, the entries left over after removing the flagged ones and those
+  reached only through them are exactly the packages fetched. The captures
+  are `tests/fixtures/bun-lock-bundled/transitive` and
+  `tests/fixtures/bun-lockb-bundled/transitive`.
 - **In-place re-versioning.** Bun never bumps an existing version-1 lock in
   place — 1.4.x `install`, `add`, `update`, `--force` and
   `--save-text-lockfile` all keep 1; only deleting `bun.lock` and re-locking
@@ -486,7 +520,8 @@ branch, so the depscan submodule bump that adopts them must either port
 `bun.ts` or extend `TS_LAGGING` — otherwise its golden suite fails:
 
 - **`TS_LAGGING` entries the bump needs**, all under `npm/bun/`: `lock-v0`
-  (pre-existing: TS refuses lockfileVersion 0), `alias`, `lock-v2-crlf`,
+  (pre-existing: TS refuses lockfileVersion 0), `lock-v3-nested-overrides`
+  (TS refuses lockfileVersion 3), `alias`, `lock-v2-crlf`,
   `lock-v2-workspace-nested`, `re-redirect-stale-url`,
   `digestless-hosted-already-wired`, `digestless-hosted-stale-url-repin`,
   and `lock-v0-workspace-refusal` for as long as `bun.ts` lacks the version-0
@@ -502,7 +537,7 @@ branch, so the depscan submodule bump that adopts them must either port
   `redirect_npm_no_lockfile` suppression for bun-only projects is ported, that
   assertion fails every bun case that ships the file.
 - **`bun.ts` porting items** (what lifts each case out of `TS_LAGGING`):
-  `SUPPORTED_LOCK_VERSIONS = [0, 1, 2]` with the shared gate text; the
+  `SUPPORTED_LOCK_VERSIONS = [0, 1, 2, 3]` with the shared gate text; the
   version-0 workspace gate; CR re-emit on the rewritten line; the prior-URL
   re-pin arm (a hosted URL left by an earlier grant of the same
   `name@version` is re-pinned in place); the digest-less 2-tuple heal
