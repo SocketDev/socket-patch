@@ -29,8 +29,8 @@ use super::{
 
 mod hosted;
 pub use hosted::{
-    hosted_sites, plan_hosted, readable_for_hosted, unwire_hosted, HostedEdit, HostedEditKind,
-    HostedPlan, HostedSite, ORIGINAL_TAG,
+    hosted_sites, hosted_unattestable, plan_hosted, readable_for_hosted, unwire_hosted, HostedEdit,
+    HostedEditKind, HostedPlan, HostedSite, ORIGINAL_TAG,
 };
 
 /// The committed maven2 tree.
@@ -874,14 +874,18 @@ pub fn unattestable_checked(
     list: ListFn<'_>,
     c: &Coords<'_>,
 ) -> Result<Option<String>, JvmRefusal> {
+    Ok(unattestable_in(&Reactor::discover(read, list)?, c))
+}
+
+/// [`unattestable_checked`] over a reactor already read.
+fn unattestable_in(reactor: &Reactor, c: &Coords<'_>) -> Option<String> {
     let sv = c.suffixed_version();
     let ga = format!("{}:{}", c.group_id, c.artifact_id);
-    let reactor = Reactor::discover(read, list)?;
     if !reactor.wires(c) {
-        return Ok(Some(format!(
+        return Some(format!(
             "no dependency or dependencyManagement declaration Maven always reads names \
              {ga}:{sv}"
-        )));
+        ));
     }
     let patch = coords_patch(c);
     let mut edits = BTreeMap::new();
@@ -901,7 +905,7 @@ pub fn unattestable_checked(
     }
     let mut at: Vec<String> = edits.into_keys().collect();
     at.extend(uncertain);
-    Ok((!at.is_empty()).then(|| {
+    (!at.is_empty()).then(|| {
         format!(
             "{} may still build {ga}:{} rather than {sv}: a base version declared since \
              vendoring, a version a property, profile or unpinned root may move, or an \
@@ -909,7 +913,7 @@ pub fn unattestable_checked(
             at.join(", "),
             c.version
         )
-    }))
+    })
 }
 
 /// `c` as a patch with no bytes: for planning that reads only what a
@@ -1614,7 +1618,11 @@ pub fn unwired_modules(
     c: &Coords<'_>,
     selection: &MavenSelection,
 ) -> Result<Option<String>, JvmRefusal> {
-    let reactor = Reactor::discover(read, list)?;
+    Ok(unwired_in(&Reactor::discover(read, list)?, c, selection))
+}
+
+/// [`unwired_modules`] over a reactor already read.
+fn unwired_in(reactor: &Reactor, c: &Coords<'_>, selection: &MavenSelection) -> Option<String> {
     let (g, a, v) = (c.group_id, c.artifact_id, c.version);
     let open: Vec<String> = reactor
         .reactor
@@ -1628,7 +1636,7 @@ pub fn unwired_modules(
             Verdict::Other(_) | Verdict::Absent => None,
         })
         .collect();
-    Ok(open.first().map(|first| {
+    open.first().map(|first| {
         let more = match open.len() - 1 {
             0 => String::new(),
             n => format!(", and {n} more"),
@@ -1637,7 +1645,7 @@ pub fn unwired_modules(
             "the patch of {g}:{a}:{v} is not wired in every module that resolves it: \
              {first}{more}"
         )
-    }))
+    })
 }
 
 /// One pom outside the checkout, parsed.

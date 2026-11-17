@@ -27,7 +27,8 @@ use std::ops::Range;
 
 use super::{
     apply_edits, coords_patch, forget_other_versions, is_base_like, line_span, pin_edit, pin_of,
-    pin_update, place_pins, safe_coordinates, Doc, Edit, Pin, Reactor, Role,
+    pin_update, place_pins, safe_coordinates, unattestable_in, unwired_in, Doc, Edit, Pin, Reactor,
+    Role,
 };
 use crate::crawlers::maven_selection::{MavenSelection, Standing, Verdict};
 use crate::formats::maven::split_socket_version;
@@ -626,6 +627,21 @@ pub fn unwire_hosted(
 /// which files the planner takes.
 pub fn readable_for_hosted(read: ReadFn<'_>, list: ListFn<'_>) -> bool {
     Reactor::discover_for(read, list, true).is_ok()
+}
+
+/// Why `vex` must not attest the hosted patch `c` although the reactor's
+/// poms wire it, as vendored mode weighs its own wiring: a declaration
+/// that may still build the base version ([`unattestable_in`]), or a
+/// module that resolves it (or may, by `selection`) and no pin or
+/// declaration reaches ([`unwired_in`]). `None` when nothing does.
+pub fn hosted_unattestable(
+    read: ReadFn<'_>,
+    list: ListFn<'_>,
+    c: &Coords<'_>,
+    selection: &MavenSelection,
+) -> Result<Option<String>, JvmRefusal> {
+    let reactor = Reactor::discover_for(read, list, true)?;
+    Ok(unattestable_in(&reactor, c).or_else(|| unwired_in(&reactor, c, selection)))
 }
 
 /// One artifact some pom of a reactor builds at a Socket suffixed version.
