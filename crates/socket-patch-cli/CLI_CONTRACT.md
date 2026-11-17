@@ -2106,7 +2106,7 @@ command's integration tests check its output.
 | `redirect_maven_selection_undetermined` | `warnings[]` (warning) | scan / get `--mode hosted` (Maven): what the build selects for the artifact cannot be read and `pom.xml` declares no version of it to replace, so no `<dependencyManagement>` pin is written on a guess. `pom.xml` and `.mvn/` stay byte-identical; the detail carries the reason and the remedy (resolve the project once and re-run, or declare the artifact at the base version). In a reactor it names the first module whose selection cannot be read and counts the rest: those modules get no new pin, while the modules that are certain are still pinned and a declaration that names the base version is still rewritten, so the dep may be counted as redirected beside this warning. |
 | `redirect_maven_multimodule_unsupported` | `warnings[]` (warning) | scan / get `--mode hosted` (Maven): the root `pom.xml` heads a reactor that cannot be planned: a module pom is missing or not readable as a pom, a `<module>` path is a property or leaves the project, or the grant serves the patched artifact under its original version (a same-GAV grant). The detail carries the reason. The poms and `.mvn/` stay byte-identical and the dep is not counted as redirected. A reactor that can be read is patched module by module: see [Hosted Maven reactors and property versions](#hosted-maven-reactors-and-property-versions). |
 | `redirect_maven_pin_would_move_module` | `warnings[]` (warning) | scan / get `--mode hosted` (Maven reactor): a parent pom resolves the base version itself above a module that resolves another version, so the parent takes no pin (Maven's management always reaches the children); the modules below it that select the base version are pinned. Also reported when a pin an earlier run wrote is taken out because a module it reaches now resolves another version, which the pin would hold back (the `redirect_maven_dep_management` edit has `action: "removed"`). Exit 0. |
-| `redirect_maven_edit_not_reversible` | `warnings[]` (warning) | scan / get `--mode hosted` (Maven): a pom would take an edit that `rollback` could not undo byte for byte from the pom alone (a pin in a `<dependencyManagement>` that holds no entry, which would be left changed or removed). That pom is left as it is; the modules it would have wired stay unpatched, and `vex` withholds the statement while one of them resolves the base version. Exit 0. |
+| `redirect_maven_edit_not_reversible` | `warnings[]` (warning) | scan / get `--mode hosted` (Maven): a pom would take an edit that `rollback` could not undo byte for byte from the pom alone. A pin in a `<dependencyManagement>` that holds no entry (which would be left changed or removed) leaves that one pom as it is: the modules it would have wired stay unpatched, and `vex` withholds the statement while one of them resolves the base version. Any other case (a `<repositories>` section that would not come back as it was) refuses the whole plan for the patch: nothing is written and the dep is not counted as redirected. Exit 0. See [Hosted Maven reactors and property versions](#hosted-maven-reactors-and-property-versions). |
 | `redirect_gem_no_checksums_section` | `warnings[]` (warning) | scan/get `--mode hosted` (gem): the lock has no `CHECKSUMS` section (Bundler < 2.6 does not write one), so it cannot record the sha256 of the patched gems. They are redirected all the same (manifest and lock converged, frozen installs accept the pair) and pinned by source alone. Reported once per run, naming the gems; relock with Bundler ≥ 2.6 (`bundle lock --add-checksums`) and re-run to pin the checksums too. |
 | `redirect_gem_merged_lock_layout` | `warnings[]` (warning) | scan/get `--mode hosted` (gem): the lock was written by Bundler < 2.2 (`BUNDLED WITH`), which lists every gem source in ONE `GEM` section, so this run added the patch registry to that section's `remote:` lines. The pair installs with that Bundler, frozen / deployment mode included. Newer Bundlers deprecate such a section and from 2.5 on refuse the pair under frozen / deployment mode: if a newer Bundler installs the project, run `bundle lock` with it, commit the lock and re-run the hosted scan. Raised only by a run that wrote the lock. |
 | `redirect_gem_unrecognized_declaration` | `warnings[]` (warning) | scan/get `--mode hosted` (gem): the gem's declaration cannot take a `source:` option in place (the detail gives the reason). The gem is skipped and the manifest and lock stay byte-identical for it; write the declaration as one `gem "<name>", …` call with literal arguments on a line of its own, or use `--mode vendored` / `--mode agent`. |
@@ -2835,12 +2835,55 @@ can undo exactly from the pom:
 No ledger records these edits. Each says what it replaced by its own text: the
 base version is the suffix's prefix, a pin is its commented entry (and the
 section that held nothing else), a recorded declaration carries its comment.
-The planner undoes every pom it would change before it writes anything, and
-leaves a pom alone when that does not give back the text it had
-(`redirect_maven_edit_not_reversible`). `rollback` and `remove` undo the wiring
-in every pom `list` finds it in, or in none: each pom returns to its bytes
-before the scan, the `<repository>` goes from whichever pom declares it, and
-the `.mvn/` lines and files hosted mode wrote are removed.
+
+**A plan is written whole or not at all.** For each patch the planner plans the
+declarations, the property, the pins and the `<repository>` together, then
+holds the result to one rule before any file is written:
+
+- no pom names the patched version unless the `<repository>` that serves it is
+  declared in that pom's local root, and a declaration Maven always reads
+  resolves to it, so `list`, `vex`, `rollback` and `remove` find the patch and
+  every pom that carries part of it;
+- `rollback`, run over the text about to be written, returns every pom the plan
+  is the first to wire to the bytes it has now.
+
+A plan that cannot keep the rule writes nothing, and the warning says why:
+
+- the only declaration of the version sits inside `<profiles>`
+  (`redirect_maven_profile_dependency_unpatched`): Maven reads it only while
+  that profile is active, so nothing would be certain to resolve the patched
+  version and no rollback would find the edit. Beside a declaration Maven
+  always reads, a profile's one is rewritten with it;
+- the pom that must declare the repository cannot take it
+  (`redirect_maven_pom_unreadable`);
+- a pom could not be put back exactly, for instance a self-closed
+  `<repositories/>` that would be expanded
+  (`redirect_maven_edit_not_reversible`). A pin in a `<dependencyManagement>`
+  that holds no entry is the one case handled pom by pom: that pom is left as
+  it is under the same code, and the rest of the plan stands.
+
+The same rule holds for what a later scan takes away. When the last pin of a
+patch goes (`redirect_maven_pin_would_move_module`: the module it reached now
+resolves another version) and no pom names the patched version any more, its
+`<repository>` is removed (`redirect_maven_repository`, `action: "removed"`)
+and its lines leave `.mvn/checksums/checksums.sha256`. An earlier patch's
+repository and checksum lines go only once no pom of the reactor names that
+patch's version, whether or not the scan changed that pom.
+
+`rollback` and `remove` read the reactor themselves and undo a patch in every
+pom that carries part of it, whatever `list` showed, or in none: each pom
+returns to its bytes before the scan, the `<repository>` goes from whichever
+pom declares it, and the `.mvn/` lines and files hosted mode wrote are removed.
+A pom that still names the patched version and can no longer be read as a pom
+refuses the patch, with nothing changed.
+
+A reactor is read once per run, each pom fetched and parsed once, however many
+modules it has. A module pom that is a symbolic link, or that cannot be read as
+text, counts as missing: the reactor is then refused
+(`redirect_maven_multimodule_unsupported`), never the run. A single pom that
+inherits from a parent pom inside the checkout is read with that parent: a
+property the parent defines is rewritten there, and the repository goes in the
+parent the pom inherits it from.
 
 A later scan keeps every pin where an earlier one wrote it, so a second scan
 changes nothing. It adds a pin only for a module that nothing reaches yet and
@@ -2857,7 +2900,9 @@ module that resolves the base version, or may, is reached by a pin or a
 declaration of the patch, and no declaration may still build the base version.
 Otherwise the statement is withheld and the module named
 (`vex_maven_reactor_root`). What each module selects is read from the Maven
-local repository of the machine that runs `vex`.
+local repository of the machine that runs `vex`. A reactor one of whose poms
+cannot be read is read for the pins of the others: they are listed and can be
+rolled back, and none is attested.
 
 A hosted pin an earlier release wrote in a single pom carries no comment. It
 is still found, rolled back and removed as before. When that pom has since

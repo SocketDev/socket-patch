@@ -320,30 +320,33 @@ pub fn module_pom(name: &str, artifact: &str, version: &str) -> String {
     )
 }
 
+/// The root pom `com.example:parent:1.0.0` of a reactor over `modules`,
+/// which every [`module_pom`] inherits: it names the fixture repository.
+pub fn reactor_root_pom(modules: &[&str], server: &Server) -> String {
+    let modules: String = modules
+        .iter()
+        .map(|name| format!("    <module>{name}</module>\n"))
+        .collect();
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <project xmlns=\"http://maven.apache.org/POM/4.0.0\">\n  \
+         <modelVersion>4.0.0</modelVersion>\n  <groupId>com.example</groupId>\n  \
+         <artifactId>parent</artifactId>\n  <version>1.0.0</version>\n  \
+         <packaging>pom</packaging>\n  <modules>\n{modules}  </modules>\n  \
+         <repositories>\n    <repository>\n      <id>fixture</id>\n      \
+         <url>{}{REPO_ROUTE}</url>\n    </repository>\n  </repositories>\n</project>\n",
+        server.uri()
+    )
+}
+
 /// Write a reactor into `dir` (the table's V3): a parent pom that three
 /// modules inherit, `a` reaching the base version two levels down, `b` a
 /// newer version through another artifact, `c` declaring the base version
 /// itself.
 pub fn write_reactor(dir: &Path, server: &Server) {
-    let modules: String = REACTOR_MODULES
-        .iter()
-        .map(|(name, ..)| format!("    <module>{name}</module>\n"))
-        .collect();
+    let names: Vec<&str> = REACTOR_MODULES.iter().map(|(name, ..)| *name).collect();
     std::fs::create_dir_all(dir).unwrap();
-    std::fs::write(
-        dir.join("pom.xml"),
-        format!(
-            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
-             <project xmlns=\"http://maven.apache.org/POM/4.0.0\">\n  \
-             <modelVersion>4.0.0</modelVersion>\n  <groupId>com.example</groupId>\n  \
-             <artifactId>parent</artifactId>\n  <version>1.0.0</version>\n  \
-             <packaging>pom</packaging>\n  <modules>\n{modules}  </modules>\n  \
-             <repositories>\n    <repository>\n      <id>fixture</id>\n      \
-             <url>{}{REPO_ROUTE}</url>\n    </repository>\n  </repositories>\n</project>\n",
-            server.uri()
-        ),
-    )
-    .unwrap();
+    std::fs::write(dir.join("pom.xml"), reactor_root_pom(&names, server)).unwrap();
     for (name, _, artifact, version) in REACTOR_MODULES {
         std::fs::create_dir_all(dir.join(name)).unwrap();
         std::fs::write(

@@ -928,11 +928,19 @@ Honest limits of the Maven and NuGet flows — documented behavior, not bugs:
   started in a module directory or with `-f`; a module with a `.mvn` of its own is
   reported (`redirect_maven_trusted_checksums_unenforced`), since a Maven started there
   reads that one. A reactor one of whose poms cannot be read is left untouched
-  (`redirect_maven_multimodule_unsupported`, with the reason). `vex` attests the patch
+  (`redirect_maven_multimodule_unsupported`, with the reason). The plan for a patch is
+  written whole or not at all: a pom is never left naming a patched version without the
+  repository that serves it, its checksum lines, and wiring a rollback can find. So a
+  declaration only a `<profile>` holds is not rewritten on its own
+  (`redirect_maven_profile_dependency_unpatched`), and neither is anything when the pom
+  that must take the repository cannot (`redirect_maven_pom_unreadable`), or when a
+  rollback could not put a pom back exactly (`redirect_maven_edit_not_reversible`). When
+  a later scan takes out the last pin of a patch (the module it reached moved to another
+  version), the repository and the checksum lines go with it. `vex` attests the patch
   only when every module that resolves the patched version, or may, is reached by a pin
   or a declaration; otherwise it withholds the statement and names the module
-  (`vex_maven_reactor_root`). `rollback` and `remove` undo the wiring in every pom and
-  restore each byte for byte.
+  (`vex_maven_reactor_root`). `rollback` and `remove` undo the wiring in every pom that
+  carries part of it, or in none, and restore each byte for byte.
 * **Property versions (hosted Maven).** A declaration whose `<version>` is a
   `${property}` is patched in one of two ways, and neither moves another artifact. When
   the reactor's own poms define the property once and nothing but declarations of the
@@ -949,7 +957,10 @@ Honest limits of the Maven and NuGet flows — documented behavior, not bugs:
   declaration; when that cannot be told (the parent pom is not in the local Maven
   repository yet) the declaration is left as it is (`redirect_maven_dep_unpinned`).
   A version-less declaration a parent or BOM manages needs no edit of its own: the
-  `<dependencyManagement>` pin overrides the management.
+  `<dependencyManagement>` pin overrides the management. A single pom that inherits
+  from a parent pom inside the checkout is read together with it: a property that parent
+  defines is rewritten there, and the repository goes in the parent the pom inherits it
+  from; `list`, `vex`, `rollback` and `remove` read both poms.
 * **A parent pom can override a managed pin (hosted Maven).** For a dependency with no
   literal `<version>` in the root pom (a transitive one, or one whose version a parent
   manages), hosted mode pins it in the root pom's `<dependencyManagement>`
