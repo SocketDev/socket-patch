@@ -1399,7 +1399,11 @@ async fn revert_vendored_matches(
     let mut leg = RemoveVendorLeg::default();
     // Stops at the first hard failure: remove aborts there, leaving the
     // remaining matches (and the manifest) untouched.
-    let backend = VendoredBackend::new(&args.common, None);
+    let mut backend = VendoredBackend::new(&args.common, None);
+    if !args.preserve_state {
+        // The manifest record of an unwound package is removed with it.
+        backend = backend.dropping_manifest_records();
+    }
     let reverted = backend.revert(keys, state, opts, true).await;
     for (key, w) in backend.go_undo_warnings(&reverted).await {
         if loud {

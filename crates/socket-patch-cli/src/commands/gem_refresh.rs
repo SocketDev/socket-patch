@@ -11,6 +11,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use socket_patch_core::crawlers::Ecosystem;
+use socket_patch_core::manifest::schema::PatchRecord;
 use socket_patch_core::patch::gem_ext::RubyEnv;
 use socket_patch_core::patch::gem_refresh::{refresh, Source, Target, Wanted};
 
@@ -831,31 +832,42 @@ enum Scope {
 /// upstream sha256; a purl without an entry is not judged. A purl whose
 /// sha256 is `None` (the registry that would give it was refused) cannot
 /// be judged either, and every installed copy of it is listed.
+///
+/// `records` holds the patch record of each gem that has one to judge by
+/// (a vendored unwind's ledger entry). An installed copy whose files are
+/// that record's patched ones is stale whatever its archive says, and
+/// whether or not `upstream` has its purl: agent mode patched it in place
+/// beside the upstream archive (#2093).
 async fn stale_after_restore(
     common: &GlobalArgs,
     upstream: &BTreeMap<String, Option<String>>,
+    records: &BTreeMap<String, PatchRecord>,
     scope: Scope,
 ) -> Vec<StaleGem> {
     use socket_patch_core::vendor::file_sha256_hex;
 
-    let purls: Vec<String> = upstream.keys().cloned().collect();
+    let purls: Vec<String> = upstream
+        .keys()
+        .chain(records.keys())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .cloned()
+        .collect();
     let mut out = Vec::new();
     for copy in installed_with_archives(common, &purls).await {
-        let Some(sha) = upstream.get(&copy.purl) else {
-            continue;
-        };
         // With no upstream sha256 (the registry that would give it was
         // refused) nothing can be judged, so the copy is listed whether
         // or not its archive is still in the home's cache. With one,
         // only a readable archive that is not the upstream gem makes
         // the copy stale.
-        let listed = match sha {
-            None => true,
-            Some(sha) => {
+        let listed = match upstream.get(&copy.purl) {
+            None => false,
+            Some(None) => true,
+            Some(Some(sha)) => {
                 matches!(file_sha256_hex(&copy.archive).await, Some(got) if &got != sha)
             }
         };
-        if listed {
+        if listed || holds_patch(&copy, records).await {
             out.push(StaleGem {
                 purl: copy.purl,
                 leaf: copy.leaf,
@@ -895,6 +907,20 @@ async fn stale_after_restore(
     out
 }
 
+/// Whether the files of the installed `copy` are the patched ones of its
+/// gem's record in `records`: every file the record lists hashes to its
+/// `afterHash`. `false` for a gem with no record.
+async fn holds_patch(copy: &InstalledCopy, records: &BTreeMap<String, PatchRecord>) -> bool {
+    match records.get(&copy.purl) {
+        Some(record) => {
+            socket_patch_core::vex::verify::judge_installed_record(&copy.dir, record)
+                .await
+                .patched
+        }
+        None => false,
+    }
+}
+
 /// What an unwind's refresh did, for [`crate::commands::hosted_unwind`]
 /// and the vendored unwind ([`crate::commands::vendored_backend`]).
 #[derive(Debug, Default)]
@@ -919,13 +945,19 @@ pub(crate) async fn after_restore(
     restored: &[String],
     staged: &BTreeMap<String, Option<String>>,
 ) -> RestoreRefresh {
-    refresh_restored(common, restored, staged, Scope::All).await
+    refresh_restored(common, restored, staged, &BTreeMap::new(), Scope::All).await
 }
 
 /// After a wet vendored unwind put the gems `unwound` back on their
 /// upstream entries (the lock on disk says so): Bundler loads their
 /// installed copies again, and a copy that a hosted scan replaced with the
 /// patched build before the gem was vendored is still that build (#2083).
+/// So is a copy agent mode patched in place before the gem was vendored:
+/// the takeover moved its manifest record into the vendor ledger and kept
+/// the patched files, so once the ledger entry is gone nothing else could
+/// undo them (#2093). `records` is each unwound gem's ledger record, by
+/// purl; a copy whose files are the record's patched ones is such a copy,
+/// whatever archive its gem home holds.
 /// Those copies are brought back to the upstream gem exactly as
 /// [`after_restore`] does it. An archive in Bundler's cache dir is not
 /// touched: the vendored unwind names it (`upstream_gem_stale_cache`).
@@ -936,24 +968,33 @@ pub(crate) async fn after_restore(
 pub(crate) async fn after_vendored_unwind(
     common: &GlobalArgs,
     unwound: &[String],
+    records: &BTreeMap<String, PatchRecord>,
 ) -> RestoreRefresh {
-    let installed: BTreeSet<String> = installed_with_archives(common, unwound)
-        .await
-        .into_iter()
-        .filter(|copy| copy.archive.is_file())
-        .map(|copy| copy.purl)
-        .collect();
+    let mut installed: BTreeSet<String> = BTreeSet::new();
+    for copy in installed_with_archives(common, unwound).await {
+        if copy.archive.is_file() || holds_patch(&copy, records).await {
+            installed.insert(copy.purl);
+        }
+    }
     if installed.is_empty() {
         return RestoreRefresh::default();
     }
     let installed: Vec<String> = installed.into_iter().collect();
-    refresh_restored(common, &installed, &BTreeMap::new(), Scope::Installed).await
+    refresh_restored(
+        common,
+        &installed,
+        &BTreeMap::new(),
+        records,
+        Scope::Installed,
+    )
+    .await
 }
 
 async fn refresh_restored(
     common: &GlobalArgs,
     restored: &[String],
     staged: &BTreeMap<String, Option<String>>,
+    records: &BTreeMap<String, PatchRecord>,
     scope: Scope,
 ) -> RestoreRefresh {
     use socket_patch_core::patch::redirect::upstream::{gem_upstream_archive, UpstreamArchive};
@@ -966,6 +1007,12 @@ async fn refresh_restored(
     // The gems whose upstream sha256 the registry is not asked for, each
     // with why: their installed copies are reported, not passed over.
     let mut unverified: BTreeMap<String, String> = BTreeMap::new();
+    // The records an installed copy is judged by as well: those of the
+    // gems known to be back on their upstream entries. A copy holding its
+    // record's patch is stale even when nothing proves the upstream
+    // sha256 (`--offline` under a lock without `CHECKSUMS`): it is then
+    // reported, not refreshed.
+    let mut judged: BTreeMap<String, PatchRecord> = BTreeMap::new();
     for purl in restored
         .iter()
         .filter(|p| Ecosystem::from_purl(p) == Some(Ecosystem::Gem))
@@ -984,21 +1031,33 @@ async fn refresh_restored(
                 }
                 shas.insert(purl.clone(), Some(sha256));
                 urls.insert(purl.clone(), url);
+                judged.extend(
+                    records
+                        .get_key_value(purl)
+                        .map(|(k, v)| (k.clone(), v.clone())),
+                );
             }
             // (Only a gem the lock resolves from rubygems.org comes back
             // unverified, so the vendored unwind's rule holds for it too.)
             Some(UpstreamArchive::Unverified(why)) => {
                 unverified.insert(purl.clone(), why);
             }
-            None => {}
+            None => {
+                judged.extend(
+                    records
+                        .get_key_value(purl)
+                        .map(|(k, v)| (k.clone(), v.clone())),
+                );
+            }
         }
     }
-    if shas.is_empty() && unverified.is_empty() {
+    if shas.is_empty() && unverified.is_empty() && judged.is_empty() {
         return RestoreRefresh::default();
     }
-    let stale = stale_after_restore(common, &shas, scope).await;
+    let stale = stale_after_restore(common, &shas, &judged, scope).await;
     let unjudged = unverified.keys().map(|purl| (purl.clone(), None)).collect();
-    let unchecked = stale_after_restore(common, &unjudged, Scope::Installed).await;
+    let unchecked =
+        stale_after_restore(common, &unjudged, &BTreeMap::new(), Scope::Installed).await;
     if stale.is_empty() && unchecked.is_empty() {
         return RestoreRefresh::default();
     }
@@ -1020,7 +1079,7 @@ async fn refresh_restored(
     };
     let mut pass = attempt(&stale, wanted, &source, &policy, direction).await;
     let still = if pass.changed(&policy) {
-        stale_after_restore(common, &shas, scope).await
+        stale_after_restore(common, &shas, &judged, scope).await
     } else {
         stale
     };

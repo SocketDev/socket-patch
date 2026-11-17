@@ -3450,6 +3450,82 @@ async fn vendored_unwind_names_an_agent_patched_install_it_leaves() {
     }
 }
 
+/// Standalone `vendor` works from the manifest and leaves the record in
+/// it, so the in-place patch is still agent mode's.
+///
+/// `vendor --revert` undoes the vendoring only: the manifest keeps the
+/// record and the installed copy keeps the patch it describes, untouched.
+///
+/// `rollback` and `remove` drop that record with the vendored gem (they
+/// leave a vendored package to the vendored unwind and restore no file
+/// from its blobs), so for them it is the same case as #2093: nothing
+/// would record the patch any more, and the unwind puts the upstream gem
+/// back.
+#[tokio::test(flavor = "multi_thread")]
+async fn vendored_unwind_follows_the_manifest_record_of_a_standalone_vendor() {
+    for unwind in VENDORED_UNWINDS {
+        let server = MockServer::start().await;
+        let (patched, upstream) = (real_gem(PATCHED_LIB), real_gem(UPSTREAM_LIB));
+        mount_api_for(&server, None, &sha256_of(&patched)).await;
+        serve_upstream_gem(&server, &upstream).await;
+        mount_vendored_grant(&server, &patched).await;
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        write_manifest_pair(&proj);
+        let home = project_home(&proj);
+        let gem_dir = agent_patched_install(&proj, &home);
+        let uri = server.uri();
+        let (code, stdout, stderr) = unwind_run(&proj, &uri, &["vendor", "--yes", "--json"]);
+        assert_eq!(code, 0, "vendor:\n{stdout}\n{stderr}");
+        let manifest_path = proj.join(".socket").join("manifest.json");
+        let recorded = || {
+            std::fs::read_to_string(&manifest_path)
+                .unwrap()
+                .contains(PURL)
+        };
+        assert!(
+            std::fs::read_to_string(proj.join("Gemfile"))
+                .unwrap()
+                .contains(".socket/vendor/gem/")
+                && recorded(),
+            "premise: vendored, and the manifest keeps the record:\n{stdout}"
+        );
+
+        let mut args = unwind.to_vec();
+        args.push("--json");
+        let (code, stdout, stderr) = unwind_run(&proj, &uri, &args);
+        let env = common::parse_json_envelope(&stdout);
+        assert_eq!(code, 0, "{unwind:?}: {env}\nstderr:\n{stderr}");
+        let text = env.to_string();
+        assert!(
+            !text.contains("upstream_gem_stale_install"),
+            "{unwind:?}: {env}"
+        );
+        let keeps_record = unwind[0] == "vendor";
+        assert_eq!(recorded(), keeps_record, "{unwind:?}: {env}");
+        assert_eq!(
+            installed_lib(&gem_dir),
+            if keeps_record {
+                PATCHED_LIB
+            } else {
+                UPSTREAM_LIB
+            },
+            "{unwind:?}: {env}"
+        );
+        assert_eq!(
+            gem_dir.join(".socket-patch-kept").is_file(),
+            keeps_record,
+            "{unwind:?}: only a copy with no record left is reinstalled: {env}"
+        );
+        assert_eq!(
+            text.contains("upstream_gem_install_refreshed"),
+            !keeps_record,
+            "{unwind:?}: {env}"
+        );
+    }
+}
+
 /// The human run says what it replaced, and rollback's "keeps its patched
 /// bytes" note no longer counts the gem.
 #[tokio::test(flavor = "multi_thread")]

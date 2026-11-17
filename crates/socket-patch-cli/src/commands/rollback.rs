@@ -1026,7 +1026,11 @@ async fn run_vendored_leg(
         keep_artifact: preserve,
     };
     let loud = !common.json && !common.silent;
-    let backend = VendoredBackend::new(common, None);
+    let mut backend = VendoredBackend::new(common, None);
+    if !preserve {
+        // The manifest cleanup drops an unwound package's record.
+        backend = backend.dropping_manifest_records();
+    }
     let reverted = backend.revert(keys, state, opts, false).await;
     for (_, w) in backend.go_undo_warnings(&reverted).await {
         if loud {
