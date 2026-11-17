@@ -3249,6 +3249,234 @@ async fn vendored_unwind_leaves_an_upstream_install_alone() {
     }
 }
 
+/// A project whose gem agent mode patched in place and a vendored scan
+/// then took over: the takeover moved the manifest record into the vendor
+/// ledger and left the installed copy (patched files, upstream archive in
+/// the gem home's `cache/`) alone. Returns the installed gem dir and that
+/// archive.
+async fn agent_then_vendored(server: &MockServer, proj: &Path) -> (PathBuf, PathBuf) {
+    let (patched, upstream) = (real_gem(PATCHED_LIB), real_gem(UPSTREAM_LIB));
+    mount_api_for(server, None, &sha256_of(&patched)).await;
+    serve_upstream_gem(server, &upstream).await;
+    mount_vendored_grant(server, &patched).await;
+    std::fs::create_dir_all(proj).unwrap();
+    write_manifest_pair(proj);
+    let home = project_home(proj);
+    let gem_dir = agent_patched_install(proj, &home);
+    let archive = home.join("cache").join(format!("{DEP}-{DEP_VERSION}.gem"));
+
+    let uri = server.uri();
+    let (code, stdout, stderr) = unwind_run(
+        proj,
+        &uri,
+        &["scan", "--mode", "vendored", "--yes", "--json"],
+    );
+    assert_eq!(code, 0, "takeover:\n{stdout}\n{stderr}");
+    let gemfile = std::fs::read_to_string(proj.join("Gemfile")).unwrap();
+    assert!(
+        gemfile.contains(".socket/vendor/gem/"),
+        "premise:\n{gemfile}"
+    );
+    let manifest = std::fs::read_to_string(proj.join(".socket").join("manifest.json")).unwrap();
+    assert!(
+        stdout.contains("vendor_manifest_record_migrated") && !manifest.contains(PURL),
+        "premise: the takeover owns the record now:\n{stdout}\n{manifest}"
+    );
+    assert_eq!(installed_lib(&gem_dir), PATCHED_LIB, "premise");
+    assert_eq!(std::fs::read(&archive).unwrap(), upstream, "premise");
+    (gem_dir, archive)
+}
+
+/// The gem downloads (`/gems/<leaf>.gem`, from any registry) among the
+/// requests `server` received after the first `skip`.
+async fn gem_downloads_since(server: &MockServer, skip: usize) -> Vec<String> {
+    server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .skip(skip)
+        .map(|request| request.url.path().to_string())
+        .filter(|path| path.contains("/gems/"))
+        .collect()
+}
+
+/// #2093: a vendored takeover of a gem agent mode patched in place drops
+/// the manifest record and keeps the patched files in the installed copy.
+/// Once the vendored gem is unwound Bundler loads that copy again, and no
+/// record is left that could undo the patch. The unwind therefore puts
+/// the upstream gem back, from the upstream archive RubyGems kept in the
+/// gem home (nothing is downloaded), and leaves nothing of agent mode's
+/// in the gem dir.
+#[tokio::test(flavor = "multi_thread")]
+async fn vendored_unwind_restores_an_install_agent_mode_patched() {
+    for unwind in VENDORED_UNWINDS {
+        let server = MockServer::start().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("proj");
+        let (gem_dir, archive) = agent_then_vendored(&server, &proj).await;
+        let asked_before = server.received_requests().await.unwrap().len();
+
+        let mut args = unwind.to_vec();
+        args.push("--json");
+        let (code, stdout, stderr) = unwind_run(&proj, &server.uri(), &args);
+        let env = common::parse_json_envelope(&stdout);
+        assert_eq!(code, 0, "{unwind:?}: {env}\nstderr:\n{stderr}");
+        let pair = format!(
+            "{}{}",
+            std::fs::read_to_string(proj.join("Gemfile")).unwrap(),
+            std::fs::read_to_string(proj.join("Gemfile.lock")).unwrap()
+        );
+        assert!(
+            !pair.contains(".socket/vendor/"),
+            "{unwind:?}: the gem is back on its upstream entry:\n{pair}"
+        );
+        assert_eq!(
+            installed_lib(&gem_dir),
+            UPSTREAM_LIB,
+            "{unwind:?}: the installed copy is the upstream build again: {env}"
+        );
+        assert!(
+            !gem_dir.join(".socket-patch-kept").exists(),
+            "{unwind:?}: the copy is a fresh install of the upstream gem: {env}"
+        );
+        assert_eq!(
+            std::fs::read(&archive).unwrap(),
+            real_gem(UPSTREAM_LIB),
+            "{unwind:?}: the upstream archive is untouched: {env}"
+        );
+        let fetched = gem_downloads_since(&server, asked_before).await;
+        assert!(fetched.is_empty(), "{unwind:?}: downloaded {fetched:?}");
+        let text = env.to_string();
+        assert!(
+            text.contains("upstream_gem_install_refreshed")
+                && !text.contains("upstream_gem_stale_install"),
+            "{unwind:?}: {env}"
+        );
+    }
+}
+
+/// The same with the gem home's `cache/` pruned (Bundler 4.1 `prune`, a
+/// Docker image's `rm -rf ruby/*/cache`): the ledger's record still proves
+/// the installed files are the patched ones, so the upstream gem is
+/// downloaded and installed over them.
+#[tokio::test(flavor = "multi_thread")]
+async fn vendored_unwind_restores_an_agent_patched_install_without_its_archive() {
+    for unwind in VENDORED_UNWINDS {
+        let server = MockServer::start().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("proj");
+        let (gem_dir, archive) = agent_then_vendored(&server, &proj).await;
+        std::fs::remove_dir_all(archive.parent().unwrap()).unwrap();
+        let asked_before = server.received_requests().await.unwrap().len();
+
+        let mut args = unwind.to_vec();
+        args.push("--json");
+        let (code, stdout, stderr) = unwind_run(&proj, &server.uri(), &args);
+        let env = common::parse_json_envelope(&stdout);
+        assert_eq!(code, 0, "{unwind:?}: {env}\nstderr:\n{stderr}");
+        assert_eq!(
+            installed_lib(&gem_dir),
+            UPSTREAM_LIB,
+            "{unwind:?}: the installed copy is the upstream build again: {env}"
+        );
+        assert_eq!(
+            gem_downloads_since(&server, asked_before).await,
+            [format!("/upstream/gems/{DEP}-{DEP_VERSION}.gem")],
+            "{unwind:?}: one download, of the upstream gem"
+        );
+        let text = env.to_string();
+        assert!(
+            text.contains("upstream_gem_install_refreshed")
+                && !text.contains("upstream_gem_stale_install"),
+            "{unwind:?}: {env}"
+        );
+    }
+}
+
+/// An agent-patched copy the unwind may not replace
+/// (`--no-gem-install-refresh`) or cannot (`--offline` with the archive
+/// pruned) is left exactly as it was and named with the files to remove,
+/// not passed over as if it were the upstream build.
+#[tokio::test(flavor = "multi_thread")]
+async fn vendored_unwind_names_an_agent_patched_install_it_leaves() {
+    for (unwind, opt_out) in VENDORED_UNWINDS
+        .into_iter()
+        .flat_map(|unwind| [(unwind, true), (unwind, false)])
+    {
+        let server = MockServer::start().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("proj");
+        let (gem_dir, archive) = agent_then_vendored(&server, &proj).await;
+        let home = project_home(&proj);
+        if !opt_out {
+            std::fs::remove_dir_all(archive.parent().unwrap()).unwrap();
+        }
+        let held_before = snapshot(&home);
+
+        let mut args = unwind.to_vec();
+        args.push("--json");
+        args.push(if opt_out {
+            "--no-gem-install-refresh"
+        } else {
+            "--offline"
+        });
+        let (code, stdout, stderr) = unwind_run(&proj, &server.uri(), &args);
+        let env = common::parse_json_envelope(&stdout);
+        let case = format!("{unwind:?} opt_out={opt_out}");
+        assert_eq!(code, 0, "{case}: {env}\nstderr:\n{stderr}");
+        assert!(
+            snapshot(&home) == held_before,
+            "{case}: the gem home changed: {env}"
+        );
+        let text = env.to_string();
+        let spec = home
+            .join("specifications")
+            .join(format!("{DEP}-{DEP_VERSION}.gemspec"));
+        for needle in [
+            "upstream_gem_stale_install",
+            gem_dir.to_str().unwrap(),
+            spec.to_str().unwrap(),
+            "bundle install",
+        ] {
+            // The envelope JSON-escapes a Windows path's backslashes.
+            let needle = needle.replace('\\', "\\\\");
+            assert!(text.contains(&needle), "{case}: no {needle:?} in {env}");
+        }
+        assert!(
+            !text.contains("upstream_gem_install_refreshed"),
+            "{case}: {env}"
+        );
+    }
+}
+
+/// The human run says what it replaced, and rollback's "keeps its patched
+/// bytes" note no longer counts the gem.
+#[tokio::test(flavor = "multi_thread")]
+async fn vendored_unwind_reports_the_agent_patched_refresh_in_a_human_run() {
+    for unwind in VENDORED_UNWINDS {
+        let server = MockServer::start().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("proj");
+        let (gem_dir, _) = agent_then_vendored(&server, &proj).await;
+
+        let (code, stdout, stderr) = unwind_run(&proj, &server.uri(), unwind);
+        assert_eq!(code, 0, "{unwind:?}: {stdout}\n{stderr}");
+        assert_eq!(installed_lib(&gem_dir), UPSTREAM_LIB, "{unwind:?}");
+        assert!(
+            stdout.contains(&format!(
+                "Replaced the installed copy of 1 gem with the upstream build: {DEP} \
+                 {DEP_VERSION}."
+            )),
+            "{unwind:?}: {stdout}\n{stderr}"
+        );
+        assert!(
+            !stdout.contains("keeps its patched bytes") && !stderr.contains("still holds"),
+            "{unwind:?}: {stdout}\n{stderr}"
+        );
+    }
+}
+
 /// What `scan --mode agent` leaves of the fixture gem under `home`: the
 /// upstream install with its lib patched in place, the upstream archive
 /// still in the home's `cache/`, and the manifest record (with both blobs)
