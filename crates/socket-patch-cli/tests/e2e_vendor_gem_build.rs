@@ -783,12 +783,37 @@ fn gem_vendor_fresh_checkout_bundle_install_and_revert() {
         String::from_utf8_lossy(&clean.stdout),
         String::from_utf8_lossy(&clean.stderr),
     );
-    let cleaned_gem_dir = cleaned.join(gem_dir.strip_prefix(&proj).unwrap());
+    let clean_out = String::from_utf8_lossy(&clean.stdout).into_owned();
     assert!(
-        !cleaned_gem_dir.exists(),
-        "`bundle clean` must remove the leftover {}",
-        cleaned_gem_dir.display()
+        clean_out.contains(&format!("Removing {DEP} ({version})")),
+        "`bundle clean` must name the leftover as stale (bundler {}):\n{clean_out}",
+        bundler.version
     );
+    let cleaned_gem_dir = cleaned.join(gem_dir.strip_prefix(&proj).unwrap());
+    let ruby_major: u32 = api
+        .split('.')
+        .next()
+        .and_then(|major| major.parse().ok())
+        .unwrap_or_else(|| panic!("unparseable ruby api version {api:?}"));
+    if bundler.clean_leaves_directories(ruby_major) {
+        // #2115: this bundler cannot delete a directory on this Ruby (see
+        // `clean_leaves_directories`), so finish its removal by hand. The
+        // assertion keeps this arm from outliving the defect.
+        assert!(
+            cleaned_gem_dir.exists(),
+            "bundler {} on Ruby {api} removed {}: `clean_leaves_directories` is out of date",
+            bundler.version,
+            cleaned_gem_dir.display()
+        );
+        std::fs::remove_dir_all(&cleaned_gem_dir).unwrap();
+    } else {
+        assert!(
+            !cleaned_gem_dir.exists(),
+            "`bundle clean` must remove the leftover {} (bundler {}, Ruby {api})",
+            cleaned_gem_dir.display(),
+            bundler.version
+        );
+    }
     assert_eq!(
         std::fs::read(cleaned.join("Gemfile.lock")).unwrap(),
         lock_wired,
