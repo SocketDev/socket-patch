@@ -2562,6 +2562,90 @@ async fn refresh_after_rollback_restores_the_upstream_gem() {
     );
 }
 
+/// A registry that is refused (plain http, and not this machine) is not
+/// asked what the upstream gem is. `rollback` still puts the lock back,
+/// leaves the installed copy as it is, and says so: the copy is reported as
+/// one it could not check, with the reason, not passed over in silence
+/// while it still holds the patched build.
+#[tokio::test(flavor = "multi_thread")]
+async fn rollback_reports_the_copy_a_refused_registry_left_unchecked() {
+    let server = MockServer::start().await;
+    let patched = real_gem(PATCHED_LIB);
+    mount_api_for(&server, None, &sha256_of(&patched)).await;
+    serve_patched_gem(&server, patched.clone()).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    write_manifest_pair(&proj);
+    let home = project_home(&proj);
+    let gem_dir = install_real_gem(&home, UPSTREAM_LIB);
+    let leaf = format!("{DEP}-{DEP_VERSION}");
+    let cache = home.join("cache").join(format!("{leaf}.gem"));
+
+    let uri = server.uri();
+    let (code, _, stderr) = common::run_with_env(&proj, &scan_args(&proj, &uri, &["--json"]), &[]);
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(installed_lib(&gem_dir), PATCHED_LIB, "scan refreshed it");
+    std::fs::write(proj.join("Gemfile.lock"), converged_lock(&uri)).unwrap();
+    let asked_before = server.received_requests().await.unwrap().len();
+
+    // Refused before any request: nothing is looked up or sent.
+    const REFUSED: &str = "http://gemstash.example.test:9292";
+    let args = [
+        "rollback",
+        PURL,
+        "--cwd",
+        proj.to_str().unwrap(),
+        "--api-url",
+        uri.as_str(),
+        "--org",
+        ORG,
+        "--api-token",
+        "fake",
+        "--patch-server-url",
+        uri.as_str(),
+        "--json",
+    ];
+    let (code, stdout, stderr) =
+        common::run_with_env(&proj, &args, &[("SOCKET_RUBYGEMS_URL", REFUSED)]);
+    let env: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("not JSON: {e}\n{stdout}\n{stderr}"));
+    assert_eq!(code, 0, "{env}\n{stderr}");
+    let lock = std::fs::read_to_string(proj.join("Gemfile.lock")).unwrap();
+    assert!(
+        !lock.contains("/patch-registry/"),
+        "the lock is back on upstream:\n{lock}"
+    );
+    assert_eq!(installed_lib(&gem_dir), PATCHED_LIB, "left as it is");
+    assert_eq!(std::fs::read(&cache).unwrap(), patched);
+    assert!(
+        warnings_with_code(&env, "upstream_gem_install_refreshed").is_empty(),
+        "{env}"
+    );
+    let unchecked = warnings_with_code(&env, "upstream_gem_stale_install");
+    assert_eq!(unchecked.len(), 1, "the copy is reported: {env}");
+    for needle in [
+        PURL,
+        "could not be checked against the upstream gem",
+        "`http://gemstash.example.test:9292` is not an https URL",
+        "set it to an https URL",
+        "it still holds the patched build",
+        "run `bundle install`",
+        gem_dir.to_str().unwrap(),
+    ] {
+        assert!(
+            unchecked[0].contains(needle),
+            "missing {needle:?}: {}",
+            unchecked[0]
+        );
+    }
+    assert_eq!(
+        server.received_requests().await.unwrap().len(),
+        asked_before,
+        "the rollback asked a registry"
+    );
+}
+
 /// The vendored half of the patch API for the fixture's patch: the grant
 /// names the patched `.gem` and the stub gemspec a path source loads, each
 /// with its sha512, beside the hosted registry override. Priority 1, so it

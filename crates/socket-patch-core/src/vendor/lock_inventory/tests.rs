@@ -4248,7 +4248,7 @@ const PINNED_REFERENCES: &[(&str, &str, &str)] = &[
     (
         "patch/gem_refresh.rs",
         "download",
-        "registry.download(url).await",
+        "Source::Registry(registry) => registry.download(url).await,",
     ),
     // The source gem of a native-extension rebuild, and a gem its build
     // lacks: the registry's compact index document, then the archive it

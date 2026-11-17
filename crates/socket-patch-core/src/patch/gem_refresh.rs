@@ -58,9 +58,9 @@ const MAX_METADATA_BYTES: u64 = 16 * 1024 * 1024;
 pub enum Source<'a> {
     /// The patch server's serve routes.
     PatchServer(&'a crate::api::client::ApiClient),
-    /// A public gem registry, reached over `https` (or on this machine):
-    /// [`crate::vendor::registry_fetch::SecureRegistryClient`].
-    Registry,
+    /// A public gem registry, reached over `https` (or on this machine)
+    /// through the run's one client for it.
+    Registry(&'a crate::vendor::registry_fetch::SecureRegistryClient),
     /// `--offline`: only what is already on disk.
     DiskOnly,
 }
@@ -159,10 +159,7 @@ async fn obtain(wanted: &Wanted, source: &Source<'_>) -> Result<Vec<u8>, String>
                 .map_err(|e| crate::utils::redact::redact_urls_in(&e.to_string()).into_owned()),
             // The gem is installed, and built when it has a native
             // extension: over https, or from this machine, and nothing else.
-            Source::Registry => {
-                let registry = crate::vendor::registry_fetch::SecureRegistryClient::new();
-                registry.download(url).await
-            }
+            Source::Registry(registry) => registry.download(url).await,
         };
         match fetched {
             Ok(bytes) if wanted.sha256.contains(&sha256_hex_of(&bytes)) => return Ok(bytes),
