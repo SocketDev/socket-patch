@@ -1,16 +1,18 @@
 name: Bazel patch compatibility (Go)
 
-# The Go flow of the real-Bazel tests (`go::` in `e2e_bazel_build`): hosted
-# mode for a module that gazelle's `go_deps` resolves from `go.mod`, on
-# each Bazel release below. bazel-compatibility.yml holds the legs and what
-# every ecosystem shares; this file says when the Go legs run and on which
-# releases.
+# The Go flows of the real-Bazel tests (`go::` in `e2e_bazel_build`):
+# hosted, vendored and agent mode for a module that gazelle's `go_deps`
+# resolves from `go.mod`, on each Bazel release below.
+# bazel-compatibility.yml holds the legs and what every ecosystem shares;
+# this file says when the Go legs run and on which releases.
 #
 # Beyond what every leg needs, a Go leg downloads the Go SDK from
 # dl.google.com (about 100 MB, held by its repository cache) and asks go.dev
 # for the Go release list on every run. A Go module under test never comes
 # from the repository cache: `go` fetches a module into the output base,
-# which every test makes anew.
+# which every test makes anew. The same holds for the modules gazelle is
+# built from, which a test that runs `bazel run //:gazelle` has `go` fetch
+# from proxy.golang.org.
 #
 # Not required for merge: no `merge_group` trigger, and no job here is a
 # `needs` of ci.yml's `ci-ok`.

@@ -1,8 +1,8 @@
-//! Hosted mode for a Go module that comes through gazelle's
-//! `go_deps.from_file(go_mod = "//:go.mod")` under Bzlmod.
+//! A Go module that comes through gazelle's
+//! `go_deps.from_file(go_mod = "//:go.mod")` under Bzlmod, in each mode.
 //!
-//! One flow, on the Bazel the run is given ([`FIXTURE`] says which rulesets
-//! go with its release), in a fresh output base:
+//! Hosted mode is one flow, on the Bazel the run is given ([`FIXTURE`] says
+//! which rulesets go with its release), in a fresh output base:
 //!
 //! - (a) `bazel build` and `bazel run //:consumer` print the unpatched
 //!   marker.
@@ -21,6 +21,13 @@
 //!   fails the build on the sum, and the upstream module is not fetched in
 //!   its place.
 //!
+//! Vendored and agent mode keep a patched copy of the module in the
+//! checkout and point `go.mod` at it with a directory `replace`
+//! ([`kept_copy_flow`]): the same steps (a) to (d), and between (c) and (d)
+//! what the user does next in a gazelle workspace, `bazel run //:gazelle`
+//! and a build, or `bazel build //...` when the module ships a BUILD file
+//! of its own.
+//!
 //! The marker is read from what Bazel built, and the patched one holds an
 //! id made for the run, so no cache of an earlier run can supply it.
 //!
@@ -34,20 +41,24 @@
 //! first build on and step (c) changes no flag. `go` asks the first entry
 //! and goes on to the second after a 404, as it goes from the public proxy
 //! to the real patch host in a build outside these tests. No public proxy
-//! is in the list: on these gazelle releases the two modules of the test
-//! are all that `go` asks a proxy for. The caller's other fetch settings
-//! are pinned beside it ([`go_env`]), so a `GOPRIVATE` of the machine
-//! cannot send `go` past the stand-ins.
+//! is in the hosted flow's list: on these gazelle releases the two modules
+//! of the test are all that `go` asks a proxy for. The vendored and agent
+//! flows have the public proxy last in their list, for the modules gazelle
+//! itself is built from. The caller's other fetch settings are pinned
+//! beside it ([`go_env`]), so a `GOPRIVATE` of the machine cannot send `go`
+//! past the stand-ins.
 
 use std::io::Write as _;
 use std::time::Instant;
 
 use base64::Engine as _;
 use serde_json::json;
-use sha2::{Digest, Sha256};
+use sha2::{Digest, Sha256, Sha512};
+use socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes;
 
-use crate::harness::{fixture_path, Cell, Fixture, StandIn, CONSUMER};
-use crate::hosted_memory_common::Patch;
+use crate::envelope::find_event;
+use crate::harness::{changed, fixture_path, Cell, Fixture, Ran, StandIn, CONSUMER};
+use crate::hosted_memory_common::{Patch, ORG};
 
 /// The workspace the test builds, and the rulesets each Bazel release
 /// builds it with.
@@ -92,10 +103,10 @@ fn h1(files: &[(String, &[u8])]) -> String {
     format!("h1:{encoded}")
 }
 
-/// One version of a module holding [`GO_MOD`] and a `lib.go`, as a Go
-/// module proxy serves it. An `h1:` covers the names and the contents of
-/// the files, not the bytes of the zip, so the zip is built here and no
-/// binary is committed.
+/// One version of a module holding [`GO_MOD`], a `lib.go` and whatever
+/// else it ships, as a Go module proxy serves it. An `h1:` covers the names
+/// and the contents of the files, not the bytes of the zip, so the zip is
+/// built here and no binary is committed.
 struct Module {
     path: String,
     version: String,
@@ -108,8 +119,18 @@ struct Module {
 
 impl Module {
     fn new(path: &str, version: &str, lib: &[u8]) -> Module {
+        Module::shipping(path, version, lib, &[])
+    }
+
+    /// The module with the files `shipped` beside its two.
+    fn shipping(path: &str, version: &str, lib: &[u8], shipped: &[(&str, &[u8])]) -> Module {
         let name = |file: &str| format!("{path}@{version}/{file}");
-        let files = [(name("go.mod"), GO_MOD), (name("lib.go"), lib)];
+        let own: [(&str, &[u8]); 2] = [("go.mod", GO_MOD), ("lib.go", lib)];
+        let files: Vec<(String, &[u8])> = own
+            .iter()
+            .chain(shipped)
+            .map(|(file, bytes)| (name(file), *bytes))
+            .collect();
         let mut archive = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
         for (name, bytes) in &files {
             let options = zip::write::SimpleFileOptions::default();
@@ -359,6 +380,324 @@ fn hosted_go_deps() {
         standin.asked(&socket_zip),
         started.elapsed()
     );
+}
+
+/// The BUILD file of a module that is itself built with Bazel, as such a
+/// module ships it in its zip: it loads rules_go under the name rules_go
+/// had before Bzlmod, which gazelle maps for the module's own repository
+/// and nothing maps for a package of the checkout.
+const SHIPPED_BUILD: &[u8] = b"load(\"@io_bazel_rules_go//go:def.bzl\", \"go_library\")
+
+go_library(
+    name = \"upstream\",
+    srcs = [\"lib.go\"],
+    importpath = \"example.com/upstream\",
+    visibility = [\"//visibility:public\"],
+)
+";
+
+/// A mode that keeps a patched copy of the module in the checkout and
+/// points `go.mod` at it with a directory `replace`.
+#[derive(Clone, Copy, PartialEq)]
+enum Kept {
+    /// `scan --mode vendored`: the copy is the archive the patch service
+    /// serves, committed under `.socket/vendor/golang`.
+    Vendored,
+    /// `scan --mode agent`, then the `apply` of every later install: the
+    /// copy is made from the module in the user's module cache, under
+    /// `.socket/go-patches`.
+    Agent,
+}
+
+impl Kept {
+    /// The directory that holds every copy of the mode, from the project.
+    fn copies(self) -> &'static str {
+        match self {
+            Kept::Vendored => ".socket/vendor/golang",
+            Kept::Agent => ".socket/go-patches",
+        }
+    }
+
+    /// The directory of the copy for the patch `uuid`, from the project.
+    fn copy_dir(self, uuid: &str) -> String {
+        match self {
+            Kept::Vendored => format!("{}/{uuid}/{MODULE}@{VERSION}", self.copies()),
+            Kept::Agent => format!("{}/{MODULE}@{VERSION}", self.copies()),
+        }
+    }
+
+    /// The command of the mode.
+    fn scan(self) -> [&'static str; 4] {
+        let mode = match self {
+            Kept::Vendored => "vendored",
+            Kept::Agent => "agent",
+        };
+        ["scan", "--mode", mode, "--yes"]
+    }
+}
+
+/// The Socket API on `standin` for a [`Kept`] mode: one free patch of the
+/// upstream module, which changes its `lib.go` to `lib`. Vendored mode
+/// downloads the whole patched module, `copy` (the upstream's names with
+/// the patched file); agent mode patches the user's own copy from the
+/// patch record, which replaces the record [`StandIn::api`] answers with.
+fn grant_copy(standin: &StandIn, uuid: &str, copy: &Module, lib: &[u8]) {
+    let b64 = |bytes: &[u8]| base64::engine::general_purpose::STANDARD.encode(bytes);
+    let archive = format!("/artifacts/{uuid}/upstream.zip");
+    standin.serve(5, &archive, &copy.zip);
+    let url = format!("{}{archive}", standin.origin());
+    let integrity = json!({ "sha512": format!("sha512-{}", b64(&Sha512::digest(&copy.zip))) });
+    let reference = json!({
+        "status": "granted",
+        "url": url,
+        "purl": PURL,
+        "artifacts": [{ "kind": "tarball", "url": url, "integrity": integrity }],
+    });
+    let patch = Patch {
+        purl: PURL.to_string(),
+        uuid: uuid.to_string(),
+        reference,
+    };
+    standin.api(&[patch]);
+    let record = json!({
+        "uuid": uuid,
+        "purl": PURL,
+        "publishedAt": "2026-01-01T00:00:00Z",
+        "files": { "lib.go": {
+            "beforeHash": compute_git_sha256_from_bytes(UPSTREAM_LIB),
+            "afterHash": compute_git_sha256_from_bytes(lib),
+            "blobContent": b64(lib),
+            "beforeBlobContent": b64(UPSTREAM_LIB),
+        }},
+        "vulnerabilities": { "GHSA-test-aaaa-bbbb": {
+            "cves": ["CVE-2024-0001"], "summary": "s", "severity": "high", "description": "d",
+        }},
+        "description": "fixture",
+        "license": "MIT",
+        "tier": "free",
+    });
+    let route = format!("/v0/orgs/{ORG}/patches/view/{uuid}");
+    standin.serve(1, &route, record.to_string().as_bytes());
+}
+
+/// What a [`Kept`] flow patches with: a stand-in that serves the upstream
+/// module and grants one patch of it, and the module cache of the user.
+struct Patching {
+    standin: StandIn,
+    /// The id of the patch, new for every run.
+    uuid: String,
+    /// The `lib.go` the patch makes, which holds the id.
+    lib: String,
+    upstream: Module,
+    /// `GOMODCACHE`: the upstream module as `go mod download` leaves it,
+    /// which agent mode copies.
+    modcache: tempfile::TempDir,
+}
+
+impl Patching {
+    /// For an upstream module that ships the files `shipped` beside its
+    /// two.
+    fn new(shipped: &[(&str, &[u8])]) -> Patching {
+        let uuid = uuid::Uuid::new_v4().to_string();
+        let lib =
+            format!("package upstream\n\nfunc Greeting() string {{ return \"PATCHED {uuid}\" }}\n");
+        let upstream = Module::shipping(MODULE, VERSION, UPSTREAM_LIB, shipped);
+        let copy = Module::shipping(MODULE, VERSION, lib.as_bytes(), shipped);
+        let standin = StandIn::start();
+        serve_module(&standin, PROXY, &upstream);
+        grant_copy(&standin, &uuid, &copy, lib.as_bytes());
+        let modcache = tempfile::tempdir().expect("a module cache");
+        let cached = modcache.path().join(format!("{MODULE}@{VERSION}"));
+        std::fs::create_dir_all(&cached).expect("the cached module");
+        let own: [(&str, &[u8]); 2] = [("go.mod", GO_MOD), ("lib.go", UPSTREAM_LIB)];
+        for (file, bytes) in own.iter().chain(shipped) {
+            std::fs::write(cached.join(file), bytes).expect("a file of the cached module");
+        }
+        Patching {
+            standin,
+            uuid,
+            lib,
+            upstream,
+            modcache,
+        }
+    }
+
+    /// `socket-patch <args>` in `cell`, which exits 0 with the status
+    /// `success`.
+    fn run(&self, cell: &Cell, args: &[&str]) -> Ran {
+        let modcache = self.modcache.path().to_str().expect("a UTF-8 path");
+        let env = [("GOMODCACHE", modcache)];
+        let ran = cell.socket_patch(&self.standin.origin(), args, &env);
+        assert_eq!(ran.code, 0, "{}: {}", cell.test, ran.dump);
+        let status = &ran.envelope["status"];
+        assert_eq!(*status, "success", "{}: {}", cell.test, ran.dump);
+        ran
+    }
+}
+
+/// The user's `bazel run //:gazelle`, which passes.
+fn gazelle(cell: &Cell) {
+    let ran = cell.bazel("run", &["//:gazelle"]);
+    assert!(ran.ok(), "{}: {}", cell.test, ran.dump());
+}
+
+/// The flow of a [`Kept`] mode, for a module that ships `SHIPPED_BUILD`
+/// (`ships_build`) or no BUILD file:
+///
+/// - (a) The unpatched build, and for a module without a BUILD file the
+///   user's `bazel run //:gazelle`, which leaves the fixture as it is.
+/// - (b) The command of the mode writes the copy and the one `replace` line
+///   of `go.mod`.
+/// - (c) `bazel build` and `bazel run //:consumer` print the patched marker,
+///   Bazel changed no file, and a `--lockfile_mode=error` build passes.
+/// - (d) What the user does next: `bazel run //:gazelle` and a build, or,
+///   for a module that ships a BUILD file, `bazel build //...`. The build
+///   breaks here: gazelle writes a BUILD file into the copy, or the copy
+///   holds the one the module ships, `go_deps` copies the directory with
+///   it, and Bazel reads the file as a package that cannot load rules_go.
+/// - (e) The undo of the mode removes the copy and the `replace` line, and
+///   the build prints the unpatched marker again.
+fn kept_copy_flow(test: &str, mode: Kept, ships_build: bool) {
+    let started = Instant::now();
+    let Some(mut cell) = Cell::open(test, &FIXTURE) else {
+        return;
+    };
+    let release = cell.release().to_string();
+    let shipped: &[(&str, &[u8])] = if ships_build {
+        &[("BUILD.bazel", SHIPPED_BUILD)]
+    } else {
+        &[]
+    };
+    let with = Patching::new(shipped);
+    let patched = format!("OUT: PATCHED {}", with.uuid);
+    let copy_dir = mode.copy_dir(&with.uuid);
+    // The public proxy is last, for the modules gazelle is built from: the
+    // stand-in has the module of the test, and no flow here has a Socket
+    // module.
+    let origin = with.standin.origin();
+    cell.repo_env = go_env(&format!("{origin}/{PROXY},https://proxy.golang.org"));
+    if ships_build {
+        cell.write("go.sum", with.upstream.go_sum().join("\n") + "\n");
+    }
+
+    // (a) The unpatched build. The fixture's BUILD file is the one gazelle
+    // writes, so whatever a later gazelle run changes comes from the patch.
+    cell.builds_unpatched(UNPATCHED);
+    if !ships_build {
+        gazelle(&cell);
+    }
+    let before = cell.tree();
+    let fixture = std::fs::read(fixture_path(FIXTURE.dir).join("common/BUILD.bazel"));
+    assert_eq!(
+        before["BUILD.bazel"],
+        fixture.expect("the fixture"),
+        "{test}"
+    );
+
+    // (b) The command of the mode: the copy, and the one `replace` line.
+    let scan = with.run(&cell, &mode.scan());
+    let event = find_event(&scan.envelope, "applied", None);
+    assert_eq!(event["purl"], PURL, "{test}: {}", scan.dump);
+    if mode == Kept::Agent {
+        with.run(&cell, &["apply"]);
+    }
+    let pinned = cell.tree();
+    let wrote = changed(&before, &pinned);
+    let outside: Vec<&String> = wrote
+        .iter()
+        .filter(|f| !f.starts_with(".socket/"))
+        .collect();
+    assert_eq!(outside, ["go.mod"], "{test}: {wrote:?}");
+    let lib = &pinned[&format!("{copy_dir}/lib.go")];
+    assert_eq!(*lib, with.lib.as_bytes(), "{test}");
+    let go_mod = String::from_utf8(pinned["go.mod"].clone()).expect("a text file");
+    let replace = format!("replace {MODULE} {VERSION} => ./{copy_dir}");
+    let replaces = go_mod.lines().filter(|line| line.trim() == replace).count();
+    assert_eq!(replaces, 1, "{test}: go.mod:\n{go_mod}");
+
+    // (c) The next build is patched, from the copy.
+    cell.builds_patched(&pinned, &patched);
+
+    // (d) The user's next step breaks the build.
+    let (build, sign) = if ships_build {
+        let sign = "No repository visible as '@io_bazel_rules_go'";
+        (cell.bazel("build", &["//..."]), sign)
+    } else {
+        gazelle(&cell);
+        let wrote = changed(&pinned, &cell.tree());
+        assert_eq!(wrote, [format!("{copy_dir}/BUILD.bazel")], "{test}");
+        let sign = "No repository visible as '@rules_go'";
+        (cell.bazel("build", &[CONSUMER]), sign)
+    };
+    assert!(
+        !build.ok() && build.stderr().contains(sign),
+        "{test}: the build did not fail on {sign:?}:\n{}",
+        build.dump()
+    );
+
+    // (e) The undo. An agent rollback keeps its emptied manifest.
+    let (undo, counted, left): (&[&str], &str, &[&str]) = match mode {
+        Kept::Vendored => (&["vendor", "--revert", "--yes"], "removed", &[]),
+        Kept::Agent => (
+            &["rollback", "--yes"],
+            "rolledBack",
+            &[".socket/manifest.json"],
+        ),
+    };
+    let undo = with.run(&cell, undo);
+    let count = &undo.envelope["summary"][counted];
+    assert_eq!(*count, 1, "{test}: {}", undo.dump);
+    assert_eq!(
+        changed(&before, &cell.tree()),
+        left,
+        "{test}: {}",
+        undo.dump
+    );
+    cell.builds(UNPATCHED);
+    assert_eq!(changed(&before, &cell.tree()), left, "{test}");
+
+    println!(
+        "{test}: Bazel {release} built {patched:?} from {copy_dir} after the command of the mode; \
+         then the build failed ({sign}); the undo left {left:?} and the {UNPATCHED:?} build; {:?}",
+        started.elapsed()
+    );
+}
+
+/// `scan --mode vendored` for a module without a BUILD file. What the code
+/// does today: the build is patched after the command; the user's
+/// `bazel run //:gazelle` then writes a BUILD.bazel into the copy, and the
+/// next build fails to load the module
+/// (`No repository visible as '@rules_go'`); `vendor --revert` leaves the
+/// checkout as it was before the command.
+#[test]
+#[ignore = "real Bazel; run with --ignored"]
+fn vendored_go_deps() {
+    kept_copy_flow("go::vendored_go_deps", Kept::Vendored, false);
+}
+
+/// Agent mode (`scan --mode agent`, then `apply`) for a module without a
+/// BUILD file. What the code does today: the build is patched after the
+/// commands; the user's `bazel run //:gazelle` then writes a BUILD.bazel
+/// into the copy, and the next build fails to load the module
+/// (`No repository visible as '@rules_go'`); `rollback` leaves the checkout
+/// as it was before, but for the emptied `.socket/manifest.json`.
+#[test]
+#[ignore = "real Bazel; run with --ignored"]
+fn agent_go_deps() {
+    kept_copy_flow("go::agent_go_deps", Kept::Agent, false);
+}
+
+/// `scan --mode vendored` for a module that ships a BUILD file of its own.
+/// What the code does today: `//:consumer` builds patched after the
+/// command, and `bazel build //...` fails right away on the BUILD file in
+/// the copy (`No repository visible as '@io_bazel_rules_go'`);
+/// `vendor --revert` leaves the checkout as it was before the command. This
+/// test runs no gazelle.
+#[test]
+#[ignore = "real Bazel; run with --ignored"]
+fn vendored_go_deps_module_with_a_build_file() {
+    let test = "go::vendored_go_deps_module_with_a_build_file";
+    kept_copy_flow(test, Kept::Vendored, true);
 }
 
 /// Without a Bazel: the fixture's directories are those of its table, and
