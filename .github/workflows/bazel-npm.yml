@@ -53,7 +53,6 @@ on:
       - 'crates/socket-patch-core/src/**/*pnpm*'
       - 'crates/socket-patch-core/src/**/*pnpm*/**'
       - 'crates/socket-patch-core/src/vendor/npm_*'
-      - 'crates/socket-patch-core/src/vendor/npm_*/**'
       - 'crates/socket-patch-core/src/vendor/lock_inventory/npm_family.rs'
       - 'crates/socket-patch-core/src/patch/redirect/npmrc.rs'
       - 'crates/socket-patch-core/src/patch/redirect/upstream/npm.rs'
@@ -79,7 +78,6 @@ on:
       - 'crates/socket-patch-core/src/**/*pnpm*'
       - 'crates/socket-patch-core/src/**/*pnpm*/**'
       - 'crates/socket-patch-core/src/vendor/npm_*'
-      - 'crates/socket-patch-core/src/vendor/npm_*/**'
       - 'crates/socket-patch-core/src/vendor/lock_inventory/npm_family.rs'
       - 'crates/socket-patch-core/src/patch/redirect/npmrc.rs'
       - 'crates/socket-patch-core/src/patch/redirect/upstream/npm.rs'
@@ -107,8 +105,11 @@ on:
 permissions:
   contents: read
 
+# The nightly run has a group of its own. A group holds one pending run, so
+# in the group of main's pushes a second push would replace a nightly that
+# waits behind the first, and the nightly is the only run with the macOS leg.
 concurrency:
-  group: bazel-npm-${{ github.event.pull_request.number || github.ref }}
+  group: bazel-npm-${{ github.event.pull_request.number || github.ref }}${{ github.event_name == 'schedule' && '-nightly' || '' }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:

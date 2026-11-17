@@ -3,7 +3,7 @@
   "version": "0.0.0",
   "private": true,
   "dependencies": {
-    "fixture-upstream": "1.0.0"
+    "@socketsecurity/bazel-fixture-upstream": "1.0.0"
   },
   "pnpm": {
     "onlyBuiltDependencies": []

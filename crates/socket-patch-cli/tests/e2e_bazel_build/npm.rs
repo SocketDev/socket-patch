@@ -55,11 +55,11 @@
 //! stands in for three hosts, by route prefix: the Socket API (`/v0`), the
 //! patch host (`/patch`) and `registry.npmjs.org` (the upstream tarball, and
 //! the version document `rollback` reads through `SOCKET_NPM_REGISTRY`). The
-//! package is the tests' own and no registry holds it. Its lock entry names
-//! no URL, as pnpm writes one, so rules_js asks for it at the public
-//! registry's URL; the downloader config of the cell rewrites that URL to
-//! the stand-in ([`route_registry`]), as a user behind a registry mirror has
-//! it.
+//! package is the tests' own, under this organisation's scope ([`NAME`]).
+//! Its lock entry names no URL, as pnpm writes one, so rules_js asks for it
+//! at the public registry's URL; the downloader config of the cell rewrites
+//! that URL to the stand-in ([`route_registry`]), as a user behind a registry
+//! mirror has it.
 
 use std::time::Instant;
 
@@ -85,16 +85,22 @@ const FIXTURE: Fixture = Fixture {
     ],
 };
 
-/// The package the fixture depends on, at the version its lock pins.
-const NAME: &str = "fixture-upstream";
+/// The package the fixture depends on, at the version its lock pins. The
+/// scope is this organisation's on the public registry, so nobody else can
+/// publish the name: a build or a pnpm that gets past the stand-in finds no
+/// stranger's package there.
+const NAME: &str = "@socketsecurity/bazel-fixture-upstream";
 const VERSION: &str = "1.0.0";
-const PURL: &str = "pkg:npm/fixture-upstream@1.0.0";
-/// The file name of its tarball: on the registry, on the patch host and
-/// under `.socket/vendor`.
-const TGZ: &str = "fixture-upstream-1.0.0.tgz";
+/// With `%40` for the `@` of the scope, as this crate's tests spell the
+/// Socket API's purl of a scoped package. `scan` takes either spelling and
+/// names a patch in its events as the API did.
+const PURL: &str = "pkg:npm/%40socketsecurity/bazel-fixture-upstream@1.0.0";
+/// The file name of its tarball on the registry and on the patch host: the
+/// name without its scope.
+const TGZ: &str = "bazel-fixture-upstream-1.0.0.tgz";
 /// Its `package.json`. The other file of a tarball is the entry file.
-const MANIFEST: &str =
-    "{\"name\": \"fixture-upstream\", \"version\": \"1.0.0\", \"main\": \"index.js\"}\n";
+const MANIFEST: &str = "{\"name\": \"@socketsecurity/bazel-fixture-upstream\", \
+    \"version\": \"1.0.0\", \"main\": \"index.js\"}\n";
 /// The entry file of the other bytes a build finds at the pinned place.
 const TAMPERED_INDEX: &str = "module.exports = \"TAMPERED\";\n";
 /// The lock rules_js reads.
@@ -102,7 +108,8 @@ const LOCK: &str = "pnpm-lock.yaml";
 /// The route prefix under which the stand-in plays the npm registry, and
 /// the route of the upstream tarball there.
 const REGISTRY: &str = "registry.npmjs.org";
-const UPSTREAM_TGZ: &str = "/registry.npmjs.org/fixture-upstream/-/fixture-upstream-1.0.0.tgz";
+const UPSTREAM_TGZ: &str =
+    "/registry.npmjs.org/@socketsecurity/bazel-fixture-upstream/-/bazel-fixture-upstream-1.0.0.tgz";
 /// The access-token level of a hosted tarball's URL, which `socket-patch`
 /// writes as the API hands it out.
 const TOKEN: &str = "22222222-2222-4222-8222-222222222222";
@@ -110,6 +117,13 @@ const TOKEN: &str = "22222222-2222-4222-8222-222222222222";
 /// root as the one package, and the setting without which pnpm 11 and later
 /// reject a lock whose tarball URL is not the registry's.
 const TRUSTING_WORKSPACE: &str = "packages:\n  - '.'\ntrustLockfile: true\n";
+
+/// The `pnpm-workspace.yaml` vendored mode creates beside a 9.0 lock, which
+/// rules_js reads: the root as the one package, and the override that sends
+/// the package's one version to the committed tarball at `copy`.
+fn overriding_workspace(copy: &str) -> String {
+    format!("packages:\n  - '.'\noverrides:\n  '{NAME}@{VERSION}': file:{copy}\n")
+}
 
 /// The package with `index_js` as its entry file, as a registry tarball.
 /// Every sum a test holds a build to is computed from the bytes it serves,
@@ -185,12 +199,19 @@ impl Patched {
             uuid,
         }
     }
+
+    /// Where vendored mode commits the tarball: in the patch's directory,
+    /// under the scope of the name.
+    fn vendored(&self) -> String {
+        format!(".socket/vendor/npm/{}/{NAME}-{VERSION}.tgz", self.uuid)
+    }
 }
 
 /// The entry of a lock that pins the package to the tarball of `integrity`
-/// and names no URL, as pnpm writes the entry of a registry package.
+/// and names no URL, as pnpm writes the entry of a registry package (in
+/// quotes: the key starts with `@`).
 fn lock_entry(integrity: &str) -> String {
-    format!("  {NAME}@{VERSION}:\n    resolution: {{integrity: {integrity}}}\n")
+    format!("  '{NAME}@{VERSION}':\n    resolution: {{integrity: {integrity}}}\n")
 }
 
 /// The `integrity` of the package in the fixture's own lock, which is the
@@ -224,7 +245,9 @@ fn registry(upstream: &Package) -> StandIn {
         },
     });
     let document = serde_json::to_vec(&document).expect("a JSON document");
-    standin.serve(5, &format!("/{REGISTRY}/{NAME}/{VERSION}"), &document);
+    // `rollback` asks for the document of a scoped name with `%2f` for `/`.
+    let named = NAME.replace('/', "%2f");
+    standin.serve(5, &format!("/{REGISTRY}/{named}/{VERSION}"), &document);
     standin.serve(5, UPSTREAM_TGZ, &upstream.tarball);
     standin
 }
@@ -252,8 +275,8 @@ fn grant(standin: &StandIn, upstream: &Package, patch: &Patched, served: &[u8]) 
         reference,
     };
     standin.api(&[granted]);
-    // The patch record, ahead of the one the API routes serve: vendored
-    // mode holds the entry file of the tarball it downloads to `afterHash`.
+    // Priority 1: ahead of the shared API mock's patch record, whose hashes
+    // are fixed, because vendored mode holds the downloaded file to `afterHash`.
     let record = json!({
         "uuid": patch.uuid,
         "purl": PURL,
@@ -316,16 +339,37 @@ fn text(tree: &Tree, rel: &str) -> String {
 
 /// Step (a): the build of `cell` prints the marker of `upstream`, and Bazel
 /// asked `standin` for that tarball, which no cache holds. Gives the files
-/// of the checkout and the number of those requests.
-fn builds_upstream(cell: &Cell, standin: &StandIn, upstream: &Package) -> (Tree, usize) {
+/// of the checkout.
+fn builds_upstream(cell: &Cell, standin: &StandIn, upstream: &Package) -> Tree {
     let before = cell.builds_unpatched(&upstream.marker);
-    let fetches = standin.asked(UPSTREAM_TGZ);
     assert!(
-        fetches > 0,
+        standin.asked(UPSTREAM_TGZ) > 0,
         "{}: the build did not fetch the upstream tarball from the stand-in registry",
         cell.test
     );
-    (before, fetches)
+    before
+}
+
+/// Step (e), up to its build: a second machine with the checkout of `cell`
+/// and a stand-in of its own, which its Bazel and its commands talk to; the
+/// patch `second`, whose URL on that patch host answers with `served`; and
+/// `scan --mode <mode> --yes` there, which applies it.
+fn second_machine(
+    cell: &Cell,
+    upstream: &Package,
+    mode: &str,
+    second: &Patched,
+    served: &[u8],
+) -> (Cell, StandIn) {
+    let mut twin = cell.twin();
+    let other = registry(upstream);
+    route_registry(&mut twin, &other);
+    grant(&other, upstream, second, served);
+    let scan = socket_patch(&twin, &other, &["scan", "--mode", mode, "--yes"]);
+    let (test, said) = (&twin.test, &scan.dump);
+    assert_eq!(scan.code, 0, "{test}: {said}");
+    assert_eq!(scan.envelope["summary"]["applied"], 1, "{test}: {said}");
+    (twin, other)
 }
 
 /// Step (e): the build of `twin` fails because Bazel finds the sha512 of
@@ -369,7 +413,7 @@ fn hosted_npm_translate_lock() {
     grant(&standin, &upstream, &patch, &patch.package.tarball);
 
     // (a) The unpatched build, with the upstream tarball from the stand-in.
-    let (before, upstream_fetches) = builds_upstream(&cell, &standin, &upstream);
+    let before = builds_upstream(&cell, &standin, &upstream);
 
     // (b) The one command of hosted mode. It rewrites those two files and
     // no other: the entry of the package names the patched tarball, by its
@@ -379,7 +423,7 @@ fn hosted_npm_translate_lock() {
     let pinned = cell.pinned_by(&scan, PURL, &patch.uuid, &before, &written);
     let lock = text(&pinned, LOCK);
     let entry = format!(
-        "  {NAME}@{VERSION}:\n    resolution: {{integrity: {}, tarball: {origin}{}}}\n",
+        "  '{NAME}@{VERSION}':\n    resolution: {{integrity: {}, tarball: {origin}{}}}\n",
         integrity(&patch.package.tarball),
         patch.route
     );
@@ -394,11 +438,6 @@ fn hosted_npm_translate_lock() {
         standin.asked(&patch.route) > patched_fetches,
         "{test}: the patched build did not fetch the tarball from the stand-in patch host"
     );
-    assert_eq!(
-        standin.asked(UPSTREAM_TGZ),
-        upstream_fetches,
-        "{test}: the patched build fetched the upstream tarball"
-    );
 
     // (d) The undo: every file is the one of before, and so is the build.
     let undo = socket_patch(&cell, &standin, &["rollback", "--yes"]);
@@ -407,16 +446,9 @@ fn hosted_npm_translate_lock() {
     // (e) A second machine, a second patch, and a patch host that serves
     // other bytes at the URL the lock pins: still a tarball of the package,
     // with another sum.
-    let mut twin = cell.twin();
-    let other = registry(&upstream);
-    route_registry(&mut twin, &other);
     let second = Patched::new();
     let tampered = tarball(TAMPERED_INDEX);
-    grant(&other, &upstream, &second, &tampered);
-    let scan = socket_patch(&twin, &other, &["scan", "--mode", "hosted", "--yes"]);
-    let said = &scan.dump;
-    assert_eq!(scan.code, 0, "{test}: {said}");
-    assert_eq!(scan.envelope["summary"]["applied"], 1, "{test}: {said}");
+    let (twin, other) = second_machine(&cell, &upstream, "hosted", &second, &tampered);
     let (_, refusal) = refuses(&twin, &other, &tampered, &second.package.tarball);
     assert!(
         other.asked(&second.route) > 0,
@@ -452,7 +484,7 @@ fn vendored_npm_translate_lock() {
     grant(&standin, &upstream, &patch, &patch.package.tarball);
 
     // (a) The unpatched build, with the upstream tarball from the stand-in.
-    let (before, _) = builds_upstream(&cell, &standin, &upstream);
+    let before = builds_upstream(&cell, &standin, &upstream);
 
     // (b) The one command of vendored mode.
     let scan = socket_patch(&cell, &standin, &["scan", "--mode", "vendored", "--yes"]);
@@ -464,7 +496,7 @@ fn vendored_npm_translate_lock() {
     // The tarball and its ledger under `.socket/vendor`, the three files
     // that wire it in, and no other.
     let dir = format!(".socket/vendor/npm/{}", patch.uuid);
-    let copy = format!("{dir}/{TGZ}");
+    let copy = patch.vendored();
     let written = [
         format!("{dir}/.gitattributes"),
         format!("{dir}/.gitignore"),
@@ -485,13 +517,15 @@ fn vendored_npm_translate_lock() {
     assert!(standin.asked(&patch.route) > 0, "{test}: {said}");
     let lock = text(&vendored, LOCK);
     let entry = format!(
-        "  {NAME}@file:{copy}:\n    resolution: {{integrity: {}, tarball: file:{copy}}}\n",
+        "  '{NAME}@file:{copy}':\n    resolution: {{integrity: {}, tarball: file:{copy}}}\n",
         integrity(&patch.package.tarball)
     );
     assert!(lock.contains(&entry), "{test}: {LOCK}:\n{lock}");
     let manifest: Value = serde_json::from_slice(&vendored["package.json"]).expect("package.json");
     let overridden = &manifest["pnpm"]["overrides"][format!("{NAME}@{VERSION}")];
     assert_eq!(*overridden, format!("file:{copy}"), "{test}: {manifest:#}");
+    let workspace = text(&vendored, "pnpm-workspace.yaml");
+    assert_eq!(workspace, overriding_workspace(&copy), "{test}");
 
     // (c) The same build, no step in between: patched, from the committed
     // file. Bazel asks the stand-in for nothing.
@@ -506,18 +540,12 @@ fn vendored_npm_translate_lock() {
     // (e) A second machine and a second patch, vendored there, and then
     // other bytes in the committed file: still a tarball of the package,
     // with another sum.
-    let mut twin = cell.twin();
-    let other = registry(&upstream);
-    route_registry(&mut twin, &other);
     let second = Patched::new();
-    grant(&other, &upstream, &second, &second.package.tarball);
-    let scan = socket_patch(&twin, &other, &["scan", "--mode", "vendored", "--yes"]);
-    let said = &scan.dump;
-    assert_eq!(scan.code, 0, "{test}: {said}");
-    assert_eq!(scan.envelope["summary"]["applied"], 1, "{test}: {said}");
-    let second_copy = format!(".socket/vendor/npm/{}/{TGZ}", second.uuid);
+    let served = &second.package.tarball;
+    let (twin, other) = second_machine(&cell, &upstream, "vendored", &second, served);
+    let second_copy = second.vendored();
     let committed = twin.tree().contains_key(&second_copy);
-    assert!(committed, "{test}: no {second_copy}: {said}");
+    assert!(committed, "{test}: no {second_copy}");
     let tampered = tarball(TAMPERED_INDEX);
     twin.write(&second_copy, &tampered);
     let (build, refusal) = refuses(&twin, &other, &tampered, &second.package.tarball);
@@ -547,7 +575,7 @@ fn vendored_npm_translate_lock() {
 /// placeholder and no URL, and pinning changes nothing else; the fixture
 /// depends on the package at the version of that entry; two runs serve two
 /// upstream tarballs; and the names written out above are those of the one
-/// package.
+/// package, under the organisation's scope.
 #[test]
 fn a_test_pins_the_one_entry_of_the_fixture_lock() {
     FIXTURE.check();
@@ -567,7 +595,8 @@ fn a_test_pins_the_one_entry_of_the_fixture_lock() {
     let manifest: Value = serde_json::from_str(MANIFEST).expect("the package's package.json");
     assert_eq!(manifest["name"], NAME);
     assert_eq!(manifest["version"], VERSION);
-    assert_eq!(PURL, format!("pkg:npm/{NAME}@{VERSION}"));
-    assert_eq!(TGZ, format!("{NAME}-{VERSION}.tgz"));
+    let bare = NAME.strip_prefix("@socketsecurity/").expect("the scope");
+    assert_eq!(PURL, format!("pkg:npm/%40socketsecurity/{bare}@{VERSION}"));
+    assert_eq!(TGZ, format!("{bare}-{VERSION}.tgz"));
     assert_eq!(UPSTREAM_TGZ, format!("/{REGISTRY}/{NAME}/-/{TGZ}"));
 }

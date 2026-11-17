@@ -8,15 +8,15 @@ importers:
 
   .:
     dependencies:
-      fixture-upstream:
+      '@socketsecurity/bazel-fixture-upstream':
         specifier: 1.0.0
         version: 1.0.0
 
 packages:
 
-  fixture-upstream@1.0.0:
+  '@socketsecurity/bazel-fixture-upstream@1.0.0':
     resolution: {integrity: sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==}
 
 snapshots:
 
-  fixture-upstream@1.0.0: {}
+  '@socketsecurity/bazel-fixture-upstream@1.0.0': {}

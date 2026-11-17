@@ -1,1 +1,1 @@
-console.log("OUT: " + require("fixture-upstream"));
+console.log("OUT: " + require("@socketsecurity/bazel-fixture-upstream"));
