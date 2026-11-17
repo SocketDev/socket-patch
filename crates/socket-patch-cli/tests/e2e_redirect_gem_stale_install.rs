@@ -2923,7 +2923,16 @@ async fn hosted_then_vendored(server: &MockServer, proj: &Path) -> (PathBuf, Pat
 
 /// Run `args` in `proj` against the mock API, with rubygems.org's stand-in.
 fn unwind_run(proj: &Path, uri: &str, args: &[&str]) -> (i32, String, String) {
-    let rubygems = format!("{uri}/upstream");
+    unwind_run_with_registry(proj, uri, args, &format!("{uri}/upstream"))
+}
+
+/// [`unwind_run`], with `rubygems` as the gem registry (`SOCKET_RUBYGEMS_URL`).
+fn unwind_run_with_registry(
+    proj: &Path,
+    uri: &str,
+    args: &[&str],
+    rubygems: &str,
+) -> (i32, String, String) {
     let mut args = args.to_vec();
     args.extend([
         "--cwd",
@@ -2937,7 +2946,7 @@ fn unwind_run(proj: &Path, uri: &str, args: &[&str]) -> (i32, String, String) {
         "--patch-server-url",
         uri,
     ]);
-    common::run_with_env(proj, &args, &[("SOCKET_RUBYGEMS_URL", rubygems.as_str())])
+    common::run_with_env(proj, &args, &[("SOCKET_RUBYGEMS_URL", rubygems)])
 }
 
 /// The commands that unwind a vendored gem.
@@ -3125,6 +3134,65 @@ async fn vendored_unwind_warns_once_in_a_human_run() {
                 "{stdout}"
             );
         }
+    }
+}
+
+/// A registry that is refused (plain http, and not this machine) is not
+/// asked what the upstream gem is, in a vendored unwind as in a hosted one:
+/// the installed copy is left exactly as it was and reported as one that
+/// could not be checked, with the reason, not passed over while it still
+/// holds the patched build.
+#[tokio::test(flavor = "multi_thread")]
+async fn vendored_unwind_reports_the_copy_a_refused_registry_left_unchecked() {
+    for unwind in VENDORED_UNWINDS {
+        let server = MockServer::start().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("proj");
+        let (gem_dir, _) = hosted_then_vendored(&server, &proj).await;
+        let home = project_home(&proj);
+        let held_before = snapshot(&home);
+        let asked_before = server.received_requests().await.unwrap().len();
+
+        let mut args = unwind.to_vec();
+        args.push("--json");
+        // Refused before any request: nothing is looked up or sent.
+        let (code, stdout, stderr) = unwind_run_with_registry(
+            &proj,
+            &server.uri(),
+            &args,
+            "http://gemstash.example.test:9292",
+        );
+        let env = common::parse_json_envelope(&stdout);
+        let case = format!("{unwind:?}");
+        assert_eq!(code, 0, "{case}: {env}\nstderr:\n{stderr}");
+        assert!(
+            snapshot(&home) == held_before,
+            "{case}: the gem home changed: {env}"
+        );
+        let text = env.to_string();
+        for needle in [
+            "upstream_gem_stale_install",
+            "could not be checked against the upstream gem",
+            "`http://gemstash.example.test:9292` is not an https URL",
+            "set it to an https URL",
+            gem_dir.to_str().unwrap(),
+        ] {
+            // The envelope JSON-escapes a Windows path's backslashes.
+            let needle = needle.replace('\\', "\\\\");
+            assert!(text.contains(&needle), "{case}: no {needle:?} in {env}");
+        }
+        assert!(
+            !text.contains("upstream_gem_install_refreshed"),
+            "{case}: {env}"
+        );
+        let upstream_asked = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .skip(asked_before)
+            .any(|request| request.url.path().starts_with("/upstream/"));
+        assert!(!upstream_asked, "{case}: the unwind asked a registry");
     }
 }
 
