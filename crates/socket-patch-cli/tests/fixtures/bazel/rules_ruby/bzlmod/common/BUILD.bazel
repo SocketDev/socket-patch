@@ -1,0 +1,9 @@
+load("@rules_ruby//ruby:defs.bzl", "rb_binary")
+
+# Prints OUT: PRISTINE until the gem is patched.
+rb_binary(
+    name = "consumer",
+    srcs = ["consumer.rb"],
+    main = "consumer.rb",
+    deps = ["@bundle"],
+)

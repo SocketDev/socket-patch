@@ -1,0 +1,19 @@
+GEM
+  remote: https://rubygems.org/
+  specs:
+    sp-other (1.0.0)
+    sp-victim (1.0.0)
+
+PLATFORMS
+  ruby
+
+DEPENDENCIES
+  sp-other (= 1.0.0)
+  sp-victim (= 1.0.0)
+
+CHECKSUMS
+  sp-other (1.0.0) sha256=fc13e2a56faef279a95986dc8fb8f5b6966bb9568efcffdd921df01c019f0b6b
+  sp-victim (1.0.0) sha256=9cd80cdb316b05a7f666a4b737cf175a795b4158c7e10c4e0e8964c2a8ca61e4
+
+BUNDLED WITH
+  4.0.15

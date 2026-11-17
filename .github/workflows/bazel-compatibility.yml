@@ -13,6 +13,10 @@ name: Bazel patch compatibility
 # release, and the ruleset archives), dl.google.com (the Go SDK) and, on
 # every run, bcr.bazel.build (the registry) and go.dev (the Go release
 # list). A repository cache saved from main holds the archives and the SDK.
+# A Ruby leg (`ruby::`) downloads no Go SDK. It needs the prebuilt Ruby of
+# bazel-contrib/portable-ruby from GitHub (90 MB on Linux), cdn.azul.com
+# (the JDK that the rules of rules_ruby resolve and never run, 210 MB) and
+# rubygems.org (the bundler gem), all of them held by its repository cache.
 #
 # Not required for merge: no `merge_group` trigger, and no job here is a
 # `needs` of ci.yml's `ci-ok`. Setting the repository variable
@@ -44,6 +48,10 @@ on:
       - 'crates/*/src/**/*golang*'
       - 'crates/*/src/**/*golang*/**'
       - 'crates/socket-patch-core/src/vendor/go*.rs'
+      # The RubyGems files, by the same name pattern; no workflow of their
+      # own lists them.
+      - 'crates/*/src/**/*gem*'
+      - 'crates/*/src/**/*gem*/**'
   push:
     branches: [main]
     # The PR paths, the shared engine code and test helpers the tests run
@@ -58,6 +66,8 @@ on:
       - 'crates/*/src/**/*golang*'
       - 'crates/*/src/**/*golang*/**'
       - 'crates/socket-patch-core/src/vendor/go*.rs'
+      - 'crates/*/src/**/*gem*'
+      - 'crates/*/src/**/*gem*/**'
       - 'crates/socket-patch-core/src/patch/redirect/**'
       - 'crates/socket-patch-core/src/hosted/**'
       - 'crates/socket-patch-cli/src/commands/**'
@@ -99,6 +109,9 @@ jobs:
           - {os: ubuntu-latest, bazel: '9.3.2', eco: go, fixtures: gazelle}
           - {os: ubuntu-latest, bazel: '8.8.2', eco: go, fixtures: gazelle}
           - {os: ubuntu-latest, bazel: '7.7.2', eco: go, fixtures: gazelle}
+          - {os: ubuntu-latest, bazel: '9.3.2', eco: ruby, fixtures: rules_ruby}
+          - {os: ubuntu-latest, bazel: '8.8.2', eco: ruby, fixtures: rules_ruby}
+          - {os: ubuntu-latest, bazel: '7.7.2', eco: ruby, fixtures: rules_ruby}
     runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS != 'true' && (matrix.os == 'ubuntu-latest' && 'depot-ubuntu-24.04-4' || matrix.os == 'ubuntu-22.04' && 'depot-ubuntu-22.04-4') || matrix.os }}
     timeout-minutes: 45
     steps: &bazel-steps
@@ -156,6 +169,8 @@ jobs:
         # cache is content-addressed, so an older one is still correct,
         # only incomplete. The package under test never comes from it: `go`
         # fetches a module into the output base, which every test makes anew.
+        # For Ruby it is about 350 MB, and a gem under test cannot come from
+        # it either: Bazel is given no checksum to look one up by.
         id: bazel-repos
         uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
         timeout-minutes: 5
@@ -201,6 +216,7 @@ jobs:
       matrix:
         include:
           - {os: macos-latest, bazel: '9.3.2', eco: go, fixtures: gazelle}
+          - {os: macos-latest, bazel: '9.3.2', eco: ruby, fixtures: rules_ruby}
     runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS != 'true' && (matrix.os == 'ubuntu-latest' && 'depot-ubuntu-24.04-4' || matrix.os == 'ubuntu-22.04' && 'depot-ubuntu-22.04-4') || matrix.os }}
     timeout-minutes: 45
     steps: *bazel-steps
