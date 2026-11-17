@@ -1,10 +1,11 @@
 name: Bazel patch compatibility
 
 # socket-patch in a Bazel workspace, on a real Bazel: one leg per Bazel
-# release and ecosystem runs that ecosystem's `#[ignore]` tests of
-# `e2e_bazel_build`, by name prefix (`go::b9_` on Bazel 9.3.2). A test builds
-# a fixture workspace, runs the built binary in it and reads the result from
-# what Bazel builds next.
+# release and ecosystem runs the `#[ignore]` tests of that ecosystem's module
+# of `e2e_bazel_build` (`go::`) on the release it installed. A test builds a
+# fixture workspace, runs the built binary in it and reads the result from
+# what Bazel builds next; the test code says which fixture files go with
+# which release.
 #
 # The package under test and every Socket host are loopback stand-ins. A leg
 # still needs the network for the ruleset and the toolchain: github.com and
@@ -17,10 +18,14 @@ name: Bazel patch compatibility
 # `needs` of ci.yml's `ci-ok`. Setting the repository variable
 # BAZEL_COMPAT_DISABLED to `true` turns every leg off without a merge.
 #
-# A leg selects its tests by the major of its release, so a major has one
-# release here. To add a Bazel major: one line per platform in
-# scripts/bazel-pins.txt and one matrix line here. To add an ecosystem: its
-# module in `e2e_bazel_build` and one matrix line per release.
+# To add a Bazel release: one line per platform in scripts/bazel-pins.txt
+# and one matrix line here. To add an ecosystem: its module in
+# `e2e_bazel_build` and one matrix line per release.
+#
+# No job has a `name:`. GitHub does not expand a matrix expression in the
+# name of a job that its `if` skips, so such a name shows up as its source
+# text in a pull request's checks. The default title of a leg is the job's
+# id and its matrix values: `bazel (ubuntu-latest, 9.3.2, go, gazelle)`.
 
 on:
   pull_request:
@@ -83,14 +88,14 @@ env:
 
 jobs:
   bazel:
-    name: ${{ matrix.eco }} / Bazel ${{ matrix.bazel }} (${{ matrix.os }})
     if: github.event.pull_request.draft != true && vars.BAZEL_COMPAT_DISABLED != 'true'
     strategy:
       fail-fast: false
       matrix:
         include:
-          # `fixtures`: the ecosystem's directory under
-          # tests/fixtures/bazel, which keys its repository cache.
+          # `eco`: the ecosystem's module of the test target. `fixtures`:
+          # its directory under tests/fixtures/bazel, which keys its
+          # repository cache.
           - {os: ubuntu-latest, bazel: '9.3.2', eco: go, fixtures: gazelle}
           - {os: ubuntu-latest, bazel: '8.8.2', eco: go, fixtures: gazelle}
           - {os: ubuntu-latest, bazel: '7.7.2', eco: go, fixtures: gazelle}
@@ -127,7 +132,9 @@ jobs:
       - name: Install Bazel ${{ matrix.bazel }}
         env:
           BAZEL_VERSION: ${{ matrix.bazel }}
-        # Prints SOCKET_PATCH_BAZEL_E2E_BAZEL, the pinned and verified binary.
+        # Prints one line, SOCKET_PATCH_BAZEL_E2E_BAZEL=<the pinned and
+        # verified binary>. A line of $GITHUB_ENV is a name, `=` and the
+        # value up to the end of the line, so a space in the path is kept.
         run: scripts/install-bazel.sh "$BAZEL_VERSION" "$RUNNER_TEMP/bazel-dist" >> "$GITHUB_ENV"
 
       - name: Save the Bazel ${{ matrix.bazel }} binary
@@ -161,24 +168,19 @@ jobs:
 
       - name: Run the ${{ matrix.eco }} tests on Bazel ${{ matrix.bazel }}
         env:
-          # A missing Bazel or another release fails the leg instead of
-          # printing SKIP.
+          # A missing Bazel fails the leg instead of printing SKIP, and so
+          # does a Bazel that is not the release of this leg.
           SOCKET_PATCH_BAZEL_E2E_REQUIRED: '1'
+          SOCKET_PATCH_BAZEL_E2E_VERSION: ${{ matrix.bazel }}
           SOCKET_PATCH_BAZEL_E2E_REPO_CACHE: ${{ runner.temp }}/bazel-repos
-          BAZEL_VERSION: ${{ matrix.bazel }}
           ECO: ${{ matrix.eco }}
-        # Two tests at a time: each runs a Bazel server of its own.
+        # The ecosystem's module holds one `#[ignore]` test per flow, and a
+        # test takes its release from the Bazel installed above, so the
+        # filter is the module's name and nothing is derived from the
+        # release. Two tests at a time: each runs a Bazel server of its own.
         run: |
-          set -euo pipefail
-          filter="${ECO}::b${BAZEL_VERSION%%.*}_"
           cargo test --locked -p socket-patch-cli --test e2e_bazel_build -- \
-            --ignored "$filter" --test-threads=2 --nocapture 2>&1 | tee "$RUNNER_TEMP/bazel-tests.log"
-          # A filter that selects no test passes for cargo.
-          passed=$(sed -n 's/^test result: .* \([0-9][0-9]*\) passed;.*/\1/p' "$RUNNER_TEMP/bazel-tests.log" | head -n 1)
-          if [ "${passed:-0}" = 0 ]; then
-            echo "::error::no test of e2e_bazel_build matches $filter"
-            exit 1
-          fi
+            --ignored "${ECO}::" --test-threads=2 --nocapture
 
       - name: Save the repository cache
         if: >-
@@ -193,7 +195,6 @@ jobs:
   # The macOS rows of `bazel`: nightly and on demand, never on a pull
   # request or a push, so they do not queue on the small macOS runner pool.
   bazel-macos:
-    name: ${{ matrix.eco }} / Bazel ${{ matrix.bazel }} (${{ matrix.os }})
     if: (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && vars.BAZEL_COMPAT_DISABLED != 'true'
     strategy:
       fail-fast: false

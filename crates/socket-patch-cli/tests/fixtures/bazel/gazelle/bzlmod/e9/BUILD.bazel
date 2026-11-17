@@ -1,8 +1,0 @@
-load("@rules_go//go:def.bzl", "go_binary")
-
-# Prints OUT: PRISTINE until the module is patched.
-go_binary(
-    name = "consumer",
-    srcs = ["main.go"],
-    deps = ["@com_example_upstream//:upstream"],
-)

@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 # Install one pinned Bazel release binary for the real-Bazel tests
-# (`e2e_bazel_build`), then print the variable a CI step appends to
-# $GITHUB_ENV.
+# (`e2e_bazel_build`) and print where it is.
 #
 #   scripts/install-bazel.sh <bazel-version> <dir>
 #
@@ -15,8 +14,11 @@
 # The tests run the verified binary directly, so no bazelisk, `.bazelversion`
 # or network version lookup is involved.
 #
-# Prints (stdout):
+# Prints one line on stdout, and everything else on stderr:
 #   SOCKET_PATCH_BAZEL_E2E_BAZEL=<bazel binary>
+# A CI step appends that line to $GITHUB_ENV, and a shell takes it with
+#   export "$(scripts/install-bazel.sh <bazel-version> <dir>)"
+# Both keep a space in <dir>.
 set -euo pipefail
 
 die() {
@@ -25,11 +27,13 @@ die() {
 }
 
 if [ $# -ne 2 ]; then
-  sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//' >&2
+  sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//' >&2
   exit 2
 fi
 VERSION="$1"
 DIR="$2"
+# What is printed is one line.
+case "$DIR" in *$'\n'*) die "<dir> must not hold a newline" ;; esac
 PINS="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/bazel-pins.txt"
 
 # The version becomes part of two URLs and an awk variable.
@@ -88,9 +92,17 @@ fetch() {
   # interrupted or tampered download never sits where a later run (or a
   # cache save) would pick it up.
   local tmp="$bazel.download"
+  # A stalled transfer must not sit until the job times out, and a file an
+  # origin does not have must not be asked for again. Per attempt: 20 s to
+  # connect, an end after 30 s below 30 kB/s, and 10 minutes in all (the
+  # binary is about 60 MB, so that is a link of 1 Mbit/s). curl retries only
+  # what it calls transient (a timeout, HTTP 408, 429, 500, 502, 503 and
+  # 504) and starts no retry after 5 minutes. Any other failure, a 404
+  # included, goes to the next origin at once.
   for url in "$@"; do
     rm -f "$tmp"
-    if curl -fsSL --retry 5 --retry-all-errors "$url" -o "$tmp"; then
+    if curl -fsSL --connect-timeout 20 --speed-limit 30000 --speed-time 30 \
+      --max-time 600 --retry 3 --retry-max-time 300 "$url" -o "$tmp"; then
       got="$(sha256_of "$tmp")"
       if [ "$got" = "$sha" ]; then
         mv -f "$tmp" "$bazel"

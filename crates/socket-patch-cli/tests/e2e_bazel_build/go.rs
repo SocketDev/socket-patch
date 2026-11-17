@@ -1,7 +1,8 @@
 //! Hosted mode for a Go module that comes through gazelle's
 //! `go_deps.from_file(go_mod = "//:go.mod")` under Bzlmod.
 //!
-//! One flow per Bazel release, in a fresh output base:
+//! One flow, on the Bazel the run is given ([`FIXTURE`] says which rulesets
+//! go with its release), in a fresh output base:
 //!
 //! - (a) `bazel build` and `bazel run //:consumer` print the unpatched
 //!   marker.
@@ -34,7 +35,9 @@
 //! and goes on to the second after a 404, as it goes from the public proxy
 //! to the real patch host in a build outside these tests. No public proxy
 //! is in the list: on these gazelle releases the two modules of the test
-//! are all that `go` asks a proxy for.
+//! are all that `go` asks a proxy for. The caller's other fetch settings
+//! are pinned beside it ([`go_env`]), so a `GOPRIVATE` of the machine
+//! cannot send `go` past the stand-ins.
 
 use std::io::Write as _;
 use std::time::Instant;
@@ -46,14 +49,27 @@ use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use crate::envelope::event_for;
-use crate::harness::{changed, fixture_path, Cell, CONSUMER};
+use crate::harness::{changed, fixture_path, Cell, Fixture, CONSUMER};
 use crate::hosted_memory_common::{mount_api, Patch};
 
-/// The module both fixtures require, and the version `go.sum` pins.
+/// The workspace the test builds, and the rulesets each Bazel release
+/// builds it with.
+const FIXTURE: Fixture = Fixture {
+    name: "go::FIXTURE",
+    dir: "gazelle/bzlmod",
+    eras: &[
+        // gazelle 0.45.0 and rules_go 0.53.0, with Go 1.23.4.
+        ((7, 0, 0)..(8, 0, 0), "e7"),
+        // gazelle 0.54.0 and rules_go 0.65.0, with Go 1.26.0.
+        ((8, 0, 0)..(10, 0, 0), "e9"),
+    ],
+};
+
+/// The module the fixture requires, and the version `go.sum` pins.
 const MODULE: &str = "example.com/upstream";
 const VERSION: &str = "v1.0.0";
 const PURL: &str = "pkg:golang/example.com/upstream@v1.0.0";
-/// Its two files. The fixtures' `go.sum` holds the `h1:` of these bytes.
+/// Its two files. The fixture's `go.sum` holds the `h1:` of these bytes.
 const GO_MOD: &[u8] = b"module example.com/upstream\n\ngo 1.21\n";
 const UPSTREAM_LIB: &[u8] = b"package upstream\n\nfunc Greeting() string { return \"PRISTINE\" }\n";
 const UNPATCHED: &str = "OUT: PRISTINE";
@@ -218,13 +234,45 @@ impl StandIn {
     }
 }
 
-/// The flow of the module docs for `test`, on Bazel `release` and the
-/// fixture workspace `fixture`.
-fn hosted(test: &str, release: &str, fixture: &str) {
+/// What a `go` that Bazel starts reads in place of the caller's settings,
+/// for [`Cell::repo_env`]: the proxy list, and every other setting that
+/// decides where `go` fetches a module from and what it trusts. gazelle
+/// hands `GOPROXY`, `GOPRIVATE`, `GONOPROXY`, `GONOSUMDB`, `GOSUMDB` and
+/// (0.54) `GOAUTH` on to `go mod download` and clears the rest of the
+/// environment, so a `GOPRIVATE=patch.socket.dev` of the machine would
+/// send that fetch past the stand-ins to the real host.
+fn go_env(proxies: &str) -> Vec<(String, String)> {
+    let pins = [
+        ("GOPROXY", proxies),
+        ("GOPRIVATE", ""),
+        ("GONOPROXY", ""),
+        ("GONOSUMDB", ""),
+        // No checksum database. gazelle turns it off for the fetch, which
+        // it holds to `go.sum`; any other `go` that asked one would fail
+        // on this name instead of asking sum.golang.org about a module of
+        // the test.
+        ("GOSUMDB", "sum.invalid.example"),
+        // No credential helper of the machine.
+        ("GOAUTH", "off"),
+        // Not handed on by gazelle, but read by a `go` that a rule starts
+        // with the environment it inherits.
+        ("GOFLAGS", ""),
+        ("GOINSECURE", ""),
+    ];
+    let owned = pins.map(|(name, value)| (name.to_string(), value.to_string()));
+    owned.to_vec()
+}
+
+/// The flow of the module docs.
+#[test]
+#[ignore = "real Bazel; run with --ignored"]
+fn hosted_go_deps() {
+    let test = "go::hosted_go_deps";
     let started = Instant::now();
-    let Some(mut cell) = Cell::open(test, release, fixture) else {
+    let Some(mut cell) = Cell::open(test, &FIXTURE) else {
         return;
     };
+    let release = cell.release().to_string();
 
     // The Socket module: the upstream files with `lib.go` patched, under a
     // path that is new for every run.
@@ -255,7 +303,7 @@ fn hosted(test: &str, release: &str, fixture: &str) {
         cell.socket_patch(&origin, args, &[("SOCKET_GOSUMDB_URL", sumdb.as_str())])
     };
     let proxies = format!("{origin}/{PROXY},{origin}/{PATCH_HOST}");
-    cell.repo_env.push(("GOPROXY".to_string(), proxies));
+    cell.repo_env = go_env(&proxies);
     let (upstream_zip, socket_zip) = (
         upstream.route(PROXY, "zip"),
         socket.route(PATCH_HOST, "zip"),
@@ -370,40 +418,23 @@ fn hosted(test: &str, release: &str, fixture: &str) {
     println!(
         "{test}: Bazel {release} built {patched:?} from {socket_path}@{SOCKET_VERSION} after \
          `scan --mode hosted`; `rollback` restored all {} files and the {UNPATCHED:?} build; other \
-         bytes at the patch host failed a second machine's build ({refusal}); {:?}",
+         bytes at the patch host failed a second machine's build ({refusal}); {origin} answered \
+         {} requests for the upstream zip and {} for the Socket zip; {:?}",
         before.len(),
+        standin.asked(&upstream_zip),
+        standin.asked(&socket_zip),
         started.elapsed()
     );
 }
 
-/// The fixtures pin the module these tests build: without a Bazel, this
-/// holds the `h1:` arithmetic to sums that `go` computed.
+/// Without a Bazel: the fixture's directories are those of its table, and
+/// its `go.sum` pins the module the test serves, which holds the `h1:`
+/// arithmetic here to sums that `go` computed.
 #[test]
-fn the_fixtures_pin_the_upstream_module_the_tests_serve() {
-    for era in ["e9", "e7"] {
-        let path = fixture_path(&format!("gazelle/bzlmod/{era}/go.sum"));
-        let go_sum = std::fs::read_to_string(&path).expect("the fixture's go.sum");
-        let lines: Vec<&str> = go_sum.lines().collect();
-        assert_eq!(lines, upstream().go_sum(), "{}", path.display());
-    }
-}
-
-#[test]
-#[ignore = "real Bazel; run with --ignored"]
-fn b9_hosted_go_deps() {
-    hosted("b9_hosted_go_deps", "9.3.2", "gazelle/bzlmod/e9");
-}
-
-#[test]
-#[ignore = "real Bazel; run with --ignored"]
-fn b8_hosted_go_deps() {
-    hosted("b8_hosted_go_deps", "8.8.2", "gazelle/bzlmod/e9");
-}
-
-// The fixture for Bazel 7 pins older rulesets: gazelle 0.45.0 and
-// rules_go 0.53.0.
-#[test]
-#[ignore = "real Bazel; run with --ignored"]
-fn b7_hosted_go_deps() {
-    hosted("b7_hosted_go_deps", "7.7.2", "gazelle/bzlmod/e7");
+fn the_fixture_pins_the_upstream_module_the_test_serves() {
+    FIXTURE.check();
+    let path = fixture_path(FIXTURE.dir).join("common/go.sum");
+    let go_sum = std::fs::read_to_string(&path).expect("the fixture's go.sum");
+    let lines: Vec<&str> = go_sum.lines().collect();
+    assert_eq!(lines, upstream().go_sum(), "{}", path.display());
 }

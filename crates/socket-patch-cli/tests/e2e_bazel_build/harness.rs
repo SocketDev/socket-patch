@@ -1,10 +1,12 @@
 //! What every real-Bazel test shares: the variables that configure a run,
+//! the Bazel a run is given and the fixture files that go with its release,
 //! the scratch root that holds everything one Bazel writes, the Bazel
 //! command line, and the `socket-patch` child that runs in the workspace
 //! copy.
 
 use std::collections::BTreeMap;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -14,10 +16,15 @@ use crate::fs_tree;
 use crate::hosted_memory_common::{hermetic, read_tree, ORG};
 
 /// The Bazel binary or launcher to run, by absolute path: every child runs
-/// in the workspace copy. Unset: `bazel` on `PATH`.
+/// in the workspace copy. Unset: `bazel` on `PATH`. A test runs on the
+/// release this Bazel says it is.
 pub const BAZEL: &str = "SOCKET_PATCH_BAZEL_E2E_BAZEL";
-/// Non-empty: a test that cannot run here (no Bazel, or another release)
-/// fails. Unset: it prints `SKIP <why>` and passes.
+/// The release that Bazel must be (`9.3.2`), so that a workflow leg cannot
+/// pass on another one: a test fails when `bazel --version` says otherwise.
+/// Unset: any release.
+pub const VERSION: &str = "SOCKET_PATCH_BAZEL_E2E_VERSION";
+/// Non-empty: a test fails when no Bazel runs here. Unset: it prints
+/// `SKIP <why>` and passes.
 pub const REQUIRED: &str = "SOCKET_PATCH_BAZEL_E2E_REQUIRED";
 /// A repository cache shared by the tests of a run, so that only the first
 /// downloads the rulesets and the toolchain. Unset: an empty one per test.
@@ -28,14 +35,19 @@ pub const SOCKET_BIN: &str = "SOCKET_PATCH_BAZEL_E2E_SOCKET_BIN";
 
 /// Removed from every Bazel child. `TEST_TMPDIR` puts a Bazel server in
 /// test mode, where a failing module extension on 7.x is a crash (exit 37)
-/// instead of an error. `USE_BAZEL_VERSION` is set again from the test's
-/// release. `XDG_CACHE_HOME` would move a tool's cache out of the scratch
-/// home. The CI markers change what some rulesets do, and a test must do
-/// the same on a runner and on a developer's machine.
+/// instead of an error. An `XDG_*_HOME` directory would move what a tool
+/// keeps out of the scratch home: a cache, or on Linux the telemetry
+/// counters of a Go SDK command that a ruleset starts, which Go puts under
+/// `XDG_CONFIG_HOME` and no variable turns off. Without them a tool falls
+/// back to a directory under `HOME`. The CI markers change what some
+/// rulesets do, and a test must do the same on a runner and on a
+/// developer's machine.
 const REMOVED: &[&str] = &[
     "TEST_TMPDIR",
-    "USE_BAZEL_VERSION",
     "XDG_CACHE_HOME",
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "XDG_STATE_HOME",
     "CI",
     "GITHUB_ACTIONS",
 ];
@@ -56,12 +68,86 @@ fn var(name: &str) -> Option<OsString> {
     std::env::var_os(name).filter(|value| !value.is_empty())
 }
 
-/// `9.3.2` as three numbers; `None` for anything else.
-fn numbers(release: &str) -> Option<(u32, u32, u32)> {
-    let parts: Option<Vec<u32>> = release.split('.').map(|part| part.parse().ok()).collect();
-    match parts?[..] {
-        [major, minor, patch] => Some((major, minor, patch)),
-        _ => None,
+/// The program `name` names, which must be an absolute path: a relative
+/// one names nothing in the workspace copy a child runs in. A wrong
+/// setting is a mistake, not a missing tool, so it fails and never skips.
+fn program(name: &str) -> Option<PathBuf> {
+    let path = PathBuf::from(var(name)?);
+    assert!(
+        path.is_absolute(),
+        "{name}={} must be an absolute path: the tests run it from a workspace copy",
+        path.display()
+    );
+    Some(path)
+}
+
+/// A Bazel release as three numbers: `9.3.2` is `(9, 3, 2)`.
+pub type Release = (u32, u32, u32);
+
+/// The three numbers `release` starts with, whatever a build adds after
+/// them: `9.3.2` and `9.3.2-homebrew` are `(9, 3, 2)`. `None` for anything
+/// else.
+fn numbers(release: &str) -> Option<Release> {
+    let mut parts = release.splitn(3, '.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    let patch = parts.next()?;
+    let digits = patch
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(patch.len());
+    Some((major, minor, patch[..digits].parse().ok()?))
+}
+
+/// One line of a fixture's table: the Bazel releases of the range (its end
+/// is the first release after it) build the workspace with the files of
+/// the directory of that name.
+pub type Era = (Range<Release>, &'static str);
+
+/// A fixture workspace. Its directory `common` holds the files every Bazel
+/// release builds, and one directory per era holds the rest: the
+/// `MODULE.bazel` that pins the rulesets of that era. A test copies both
+/// into one workspace, so Bazel never meets two `MODULE.bazel` in a tree.
+/// A new era is one such directory and one line of `eras`.
+pub struct Fixture {
+    /// Where the constant is written (`go::FIXTURE`), for the failure of a
+    /// release its table does not hold.
+    pub name: &'static str,
+    /// The directory under `tests/fixtures/bazel/`.
+    pub dir: &'static str,
+    /// The one place that says which release builds which era.
+    pub eras: &'static [Era],
+}
+
+impl Fixture {
+    /// The era directory for `release`.
+    fn era(&self, release: &str) -> Option<&'static str> {
+        let numbers = numbers(release)?;
+        let line = self.eras.iter().find(|(range, _)| range.contains(&numbers));
+        line.map(|(_, era)| *era)
+    }
+
+    /// Without a Bazel: the directories of the fixture are `common` and the
+    /// eras of the table, and each era holds a `MODULE.bazel`, which
+    /// `common` does not.
+    pub fn check(&self) {
+        let root = fixture_path(self.dir);
+        let mut found: Vec<String> = std::fs::read_dir(&root)
+            .unwrap_or_else(|e| panic!("read {}: {e}", root.display()))
+            .map(|entry| entry.expect("a directory entry").path())
+            .filter(|path| path.is_dir())
+            .filter_map(|path| Some(path.file_name()?.to_string_lossy().into_owned()))
+            .collect();
+        found.sort();
+        let mut named: Vec<&str> = self.eras.iter().map(|(_, era)| *era).collect();
+        named.push("common");
+        named.sort_unstable();
+        named.dedup();
+        assert_eq!(found, named, "{}: {}", self.name, root.display());
+        assert!(!root.join("common/MODULE.bazel").exists(), "{}", self.name);
+        for era in named.iter().filter(|era| **era != "common") {
+            let module = root.join(era).join("MODULE.bazel");
+            assert!(module.is_file(), "{}: no {}", self.name, module.display());
+        }
     }
 }
 
@@ -84,8 +170,8 @@ pub fn changed(before: &Tree, after: &Tree) -> Vec<String> {
     differing
 }
 
-/// This machine cannot run `test`: a failure under [`REQUIRED`], else a
-/// `SKIP` line.
+/// No Bazel runs on this machine for `test`: a failure under [`REQUIRED`],
+/// else a `SKIP` line.
 fn unavailable(test: &str, why: &str) {
     assert!(
         var(REQUIRED).is_none(),
@@ -96,7 +182,8 @@ fn unavailable(test: &str, why: &str) {
 
 /// The temp root of one workspace copy, with a fixed place for everything a
 /// Bazel run writes. Nothing lands in the developer's `~/.cache/bazel`, the
-/// shared temp directory or the real home.
+/// shared temp directory or the real home, but for the one cache of a
+/// launcher ([`launcher_cache`]).
 struct Scratch {
     /// The workspace copy Bazel and `socket-patch` run in.
     workspace: PathBuf,
@@ -170,37 +257,83 @@ impl Drop for Scratch {
     }
 }
 
+/// Where a launcher (bazelisk) keeps the Bazel releases it downloads: the
+/// caller's own `BAZELISK_HOME`, or the directory bazelisk picks for the
+/// caller without one (Go's `os.UserCacheDir()`, then `bazelisk`). Every
+/// child gets it as `BAZELISK_HOME`: with the scratch `HOME` alone, a
+/// launcher would download a whole release for every cell and every twin.
+/// A release there is the caller's tool, like the `bazel` on `PATH`, and
+/// nothing a workspace under test or a package manager wrote; a temp
+/// directory of the test process would cost a download per run instead.
+fn launcher_cache() -> Option<PathBuf> {
+    if let Some(home) = var("BAZELISK_HOME") {
+        return Some(PathBuf::from(home));
+    }
+    let macos = cfg!(target_os = "macos");
+    let caches = match var("XDG_CACHE_HOME") {
+        Some(dir) if !macos => PathBuf::from(dir),
+        _ => PathBuf::from(var("HOME")?).join(if macos { "Library/Caches" } else { ".cache" }),
+    };
+    Some(caches.join("bazelisk"))
+}
+
+/// `program` in the workspace copy, with the environment of every Bazel
+/// child and no arguments. Built on `hermetic::command`, the one way this
+/// crate's tests spawn a child; what is set here lands after its scrub.
+fn child(program: &OsStr, scratch: &Scratch) -> Command {
+    let mut cmd = hermetic::command(Path::new(program));
+    for name in REMOVED {
+        cmd.env_remove(name);
+    }
+    // A bazelisk's other variables change what it does around a command
+    // (`BAZELISK_CLEAN`) and where it gets a release from.
+    for (name, _) in std::env::vars_os() {
+        if name.to_string_lossy().starts_with("BAZELISK_") {
+            cmd.env_remove(name);
+        }
+    }
+    if let Some(cache) = launcher_cache() {
+        cmd.env("BAZELISK_HOME", cache);
+    }
+    // The `go` a ruleset runs must not read the developer's module cache,
+    // flags or `go env -w` file.
+    hermetic::scrub_extra(&mut cmd, &[hermetic::Extra::Go]);
+    cmd.env("HOME", &scratch.home)
+        .env("TMPDIR", &scratch.tmp)
+        .current_dir(&scratch.workspace);
+    cmd
+}
+
 /// The Bazel a test runs.
 #[derive(Clone)]
 struct Bazel {
     /// A release binary, or a launcher that reads `USE_BAZEL_VERSION`.
     program: OsString,
+    /// What `--version` printed after `bazel `.
     release: String,
 }
 
 impl Bazel {
-    /// The Bazel of [`BAZEL`], if it is `release`. `bazel --version` is
-    /// answered by the client: no server starts. `Err` says why this
-    /// machine cannot run the test.
-    fn detect(scratch: &Scratch, release: &str) -> Result<Bazel, String> {
-        let program = var(BAZEL).unwrap_or_else(|| "bazel".into());
-        let bazel = Bazel {
-            program,
-            release: release.to_string(),
-        };
-        let shown = bazel.program.to_string_lossy().into_owned();
-        let out = bazel
-            .child(scratch)
+    /// `program` (`bazel` on `PATH` without one) and the release it says
+    /// it is. `bazel --version` is answered by the client: no server
+    /// starts. A launcher answers for the release the caller's own
+    /// `USE_BAZEL_VERSION` picks. `Err` says why no Bazel runs here.
+    fn detect(scratch: &Scratch, program: Option<PathBuf>) -> Result<Bazel, String> {
+        let program = program.map_or_else(|| "bazel".into(), PathBuf::into_os_string);
+        let shown = program.to_string_lossy().into_owned();
+        let out = child(&program, scratch)
             .arg("--version")
             .output()
             .map_err(|e| format!("`{shown}` did not run: {e}"))?;
         let stdout = String::from_utf8_lossy(&out.stdout);
-        let found = stdout
+        let release = stdout
             .lines()
             .find_map(|line| line.trim().strip_prefix("bazel "));
-        match found {
-            Some(found) if found == release => Ok(bazel),
-            Some(found) => Err(format!("`{shown}` is Bazel {found}, not {release}")),
+        match release {
+            Some(release) => Ok(Bazel {
+                program,
+                release: release.to_string(),
+            }),
             None => Err(format!(
                 "`{shown} --version` printed no `bazel <release>` line:\n{stdout}{}",
                 String::from_utf8_lossy(&out.stderr)
@@ -208,43 +341,20 @@ impl Bazel {
         }
     }
 
-    /// The program with the environment of every Bazel child and no
-    /// arguments. Built on `hermetic::command`, the one way this crate's
-    /// tests spawn a child; what is set here lands after its scrub.
-    fn child(&self, scratch: &Scratch) -> Command {
-        let mut cmd = hermetic::command(Path::new(&self.program));
-        for name in REMOVED {
-            cmd.env_remove(name);
-        }
-        // A bazelisk's other variables change which Bazel it runs.
-        for (name, _) in std::env::vars_os() {
-            if name.to_string_lossy().starts_with("BAZELISK_") {
-                cmd.env_remove(name);
-            }
-        }
-        // The `go` a ruleset runs must not read the developer's module
-        // cache, flags or `go env -w` file.
-        hermetic::scrub_extra(&mut cmd, &[hermetic::Extra::Go]);
-        cmd.env("USE_BAZEL_VERSION", &self.release)
-            .env("HOME", &scratch.home)
-            .env("TMPDIR", &scratch.tmp);
-        cmd
-    }
-
     /// `bazel <startup options> <command>` in the workspace copy. The
     /// startup options never vary within a test: another set restarts the
     /// server. They keep the rc files of the machine out and every write
     /// inside the scratch root; without the two JVM options the server
     /// writes `hsperfdata_<user>` and its native libraries into the shared
-    /// temp directory.
+    /// temp directory. A launcher is held to the release it answered for.
     fn command(&self, scratch: &Scratch, command: &str) -> Command {
         let joined = |flag: &str, path: &Path| {
             let mut arg = OsString::from(flag);
             arg.push(path);
             arg
         };
-        let mut cmd = self.child(scratch);
-        cmd.current_dir(&scratch.workspace)
+        let mut cmd = child(&self.program, scratch);
+        cmd.env("USE_BAZEL_VERSION", &self.release)
             .arg("--nohome_rc")
             .arg("--nosystem_rc")
             .arg(joined("--output_user_root=", &scratch.output_user_root))
@@ -307,50 +417,78 @@ pub struct Ran {
 /// output base of its own.
 pub struct Cell {
     pub test: String,
-    /// `--repo_env=NAME=VALUE` pairs for every Bazel command (`GOPROXY`).
+    /// What every repository rule must read in place of the caller's own
+    /// setting (`GOPROXY`): each pair is a variable of every Bazel command
+    /// and its `--repo_env=NAME=VALUE`. On Bazel 7, 8 and 9 a rule reads the
+    /// client's environment with `--repo_env` on top, and under
+    /// `--experimental_strict_repo_env` the flag alone.
     pub repo_env: Vec<(String, String)>,
     bazel: Bazel,
+    numbers: Release,
+    /// [`SOCKET_BIN`].
+    socket_bin: Option<PathBuf>,
     // Dropped after `Cell::drop` has stopped the server.
     scratch: Scratch,
 }
 
 impl Cell {
-    /// The checkout of the fixture workspace `fixture` for `test`, which
-    /// runs on Bazel `release`. `None` after a `SKIP` line when this machine
-    /// has no such Bazel; a panic instead under [`REQUIRED`].
-    pub fn open(test: &str, release: &str, fixture: &str) -> Option<Cell> {
-        let (major, _, _) =
-            numbers(release).unwrap_or_else(|| panic!("{test}: {release} is no Bazel release"));
-        // A workflow leg selects the tests of its Bazel by this prefix.
-        assert!(
-            test.starts_with(&format!("b{major}_")),
-            "{test} runs on Bazel {release}: its name must start with b{major}_"
-        );
+    /// The checkout of `fixture` for `test`, on the Bazel of [`BAZEL`]:
+    /// the files of the fixture's `common` and of the era its table names
+    /// for that Bazel's release. `None` after a `SKIP` line when no Bazel
+    /// runs here; a panic instead under [`REQUIRED`]. A panic always for a
+    /// relative [`BAZEL`] or [`SOCKET_BIN`], a release that is not
+    /// [`VERSION`], and a release the table does not hold.
+    pub fn open(test: &str, fixture: &Fixture) -> Option<Cell> {
+        let (program, socket_bin) = (program(BAZEL), program(SOCKET_BIN));
         let shared = var(REPO_CACHE).map(PathBuf::from);
         let scratch = Scratch::new(shared);
-        let bazel = match Bazel::detect(&scratch, release) {
+        let bazel = match Bazel::detect(&scratch, program) {
             Ok(bazel) => bazel,
             Err(why) => {
                 unavailable(test, &why);
                 return None;
             }
         };
-        let source = fixture_path(fixture);
-        assert!(source.is_dir(), "{test}: no fixture {}", source.display());
-        fs_tree::copy_tree(&source, &scratch.workspace);
+        let release = &bazel.release;
+        let shown = bazel.program.to_string_lossy().into_owned();
+        if let Some(wanted) = var(VERSION) {
+            assert!(
+                wanted.to_string_lossy() == *release,
+                "{test}: {VERSION}={} but `{shown}` is Bazel {release}",
+                wanted.to_string_lossy()
+            );
+        }
+        let (Some(numbers), Some(era)) = (numbers(release), fixture.era(release)) else {
+            panic!(
+                "{test}: `{shown}` is Bazel {release}, which no line of the era table of {} \
+                 holds ({:?}): add its line, and its directory under {}",
+                fixture.name,
+                fixture.eras,
+                fixture_path(fixture.dir).display()
+            );
+        };
+        for part in ["common", era] {
+            let source = fixture_path(fixture.dir).join(part);
+            assert!(source.is_dir(), "{test}: no fixture {}", source.display());
+            fs_tree::copy_tree(&source, &scratch.workspace);
+        }
         // The checkout is its own repository: `socket-patch` looks no
         // higher for a `socket.yml` or a project root.
         std::fs::create_dir(scratch.workspace.join(".git")).expect("create .git");
-        println!(
-            "{test}: Bazel {release} ({})",
-            bazel.program.to_string_lossy()
-        );
+        println!("{test}: Bazel {release} ({shown}), {}/{era}", fixture.dir);
         Some(Cell {
             test: test.to_string(),
             repo_env: Vec::new(),
             bazel,
+            numbers,
+            socket_bin,
             scratch,
         })
+    }
+
+    /// The release of this cell's Bazel, as its `--version` prints it.
+    pub fn release(&self) -> &str {
+        &self.bazel.release
     }
 
     /// A second machine with the same checkout: the files of this one, in
@@ -366,6 +504,8 @@ impl Cell {
             test: self.test.clone(),
             repo_env: self.repo_env.clone(),
             bazel: self.bazel.clone(),
+            numbers: self.numbers,
+            socket_bin: self.socket_bin.clone(),
             scratch: Scratch::new(Some(self.scratch.repository_cache.clone())),
         };
         for (rel, bytes) in self.tree() {
@@ -402,7 +542,8 @@ impl Cell {
     fn bazel_with(&self, lockfile_mode: &str, command: &str, args: &[&str]) -> Run {
         let scratch = &self.scratch;
         let mut cmd = self.bazel.command(scratch, command);
-        let mut joined = |flag: &str, value: &std::ffi::OsStr| {
+        cmd.envs(self.repo_env.iter().map(|(name, value)| (name, value)));
+        let mut joined = |flag: &str, value: &OsStr| {
             let mut arg = OsString::from(flag);
             arg.push(value);
             cmd.arg(arg);
@@ -416,8 +557,7 @@ impl Cell {
         }
         // Stated, so no test depends on a release's default.
         joined("--lockfile_mode=", lockfile_mode.as_ref());
-        let release = numbers(&self.bazel.release).expect("checked by Cell::open");
-        if release >= (9, 0, 0) {
+        if self.numbers >= (9, 0, 0) {
             // Bazel 9 keeps the repositories it fetched in a contents cache,
             // by default under the repository cache, and hands them to the
             // next workspace copy without a fetch. The cache stays on, as a
@@ -450,8 +590,8 @@ impl Cell {
     /// and temp directory are the cell's, and every proxy is a closed port,
     /// so it reaches no host but loopback.
     pub fn socket_patch(&self, api: &str, args: &[&str], env: &[(&str, &str)]) -> Ran {
-        let mut cmd = match var(SOCKET_BIN) {
-            Some(bin) => hermetic::command(Path::new(&bin)),
+        let mut cmd = match &self.socket_bin {
+            Some(bin) => hermetic::command(bin),
             None => hermetic::binary_command(),
         };
         cmd.current_dir(&self.scratch.workspace)
@@ -514,7 +654,32 @@ impl Drop for Cell {
 fn a_release_is_read_as_three_numbers() {
     assert_eq!(numbers("9.3.2"), Some((9, 3, 2)));
     assert_eq!(numbers("7.7.2"), Some((7, 7, 2)));
-    for unreadable in ["9.3", "9.3.2.1", "10.0.0rc3", ""] {
+    assert_eq!(numbers("9.3.2-homebrew"), Some((9, 3, 2)));
+    assert_eq!(numbers("10.0.0rc3"), Some((10, 0, 0)));
+    for unreadable in ["9.3", "9.x.2", "no_version", ""] {
         assert_eq!(numbers(unreadable), None, "{unreadable:?}");
+    }
+}
+
+#[test]
+fn a_release_builds_the_era_whose_range_holds_it() {
+    let fixture = Fixture {
+        name: "a table",
+        dir: "none",
+        eras: &[
+            ((7, 0, 0)..(8, 0, 0), "old"),
+            ((8, 0, 0)..(10, 0, 0), "new"),
+        ],
+    };
+    for (release, era) in [
+        ("7.0.0", Some("old")),
+        ("7.7.2", Some("old")),
+        ("8.0.0", Some("new")),
+        ("9.3.2-homebrew", Some("new")),
+        ("6.5.0", None),
+        ("10.0.0", None),
+        ("no_version", None),
+    ] {
+        assert_eq!(fixture.era(release), era, "{release}");
     }
 }
