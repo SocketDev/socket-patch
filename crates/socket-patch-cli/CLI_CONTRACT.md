@@ -1041,10 +1041,10 @@ whose marker matches is `already_patched`; sources an earlier release patched wi
 with a `native_extension_rebuilt` warning. `rollback` (and `remove`) puts the backed-up build back
 with the sources, bytes and file mode; without a backup it rebuilds a gem RubyGems built from the
 restored sources, and fails a precompiled gem with `native_extension_restore_failed` (`gem
-pristine <gem>` reinstalls it). An in-place rebuild backs up and restores RubyGems' extension
-directory and its `lib/` copies only: a library a gem builds into its own tree stays as last
-built. Only the gem's own extension dir under its home, and files under the gem directory, are
-ever replaced, whatever path the backup or marker names.
+pristine <gem>` reinstalls it). An in-place rebuild backs up and restores what it replaced in
+the gem's own tree as well, and removes what it added there. Only the gem's own extension dir
+under its home, and files under the gem directory, are ever replaced, whatever path the backup or
+marker names.
 
 A build runs in a process group of its own: an interrupted `apply` (Ctrl-C, SIGTERM, SIGHUP) kills
 that group and waits for it before it releases the lock, so no compiler is left running. A build
