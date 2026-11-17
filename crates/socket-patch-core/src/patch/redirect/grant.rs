@@ -102,21 +102,6 @@ fn is_url_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || "-._~:/?[]@!()*+,=%".contains(c)
 }
 
-/// Whether `url`'s host is the local machine, where a plain-`http` request
-/// never crosses a network.
-fn is_loopback(url: &reqwest::Url) -> bool {
-    let Some(host) = url.host_str() else {
-        return false;
-    };
-    host == "localhost"
-        || host.ends_with(".localhost")
-        || host
-            .trim_start_matches('[')
-            .trim_end_matches(']')
-            .parse::<std::net::IpAddr>()
-            .is_ok_and(|ip| ip.is_loopback())
-}
-
 /// `url` (the grant's `what`) as a lockfile takes it: an `https` URL of
 /// [`is_url_char`]s with a host. Plain `http` is taken only from the local
 /// machine or from one of `origins`, the operator's own patch servers
@@ -134,7 +119,9 @@ fn check_url(what: &str, url: &str, origins: &[String]) -> Result<(), Flaw> {
     let Some(host) = parsed.host_str() else {
         return Err(malformed());
     };
-    if parsed.scheme() == "https" || is_loopback(&parsed) || on_configured_origin(&parsed, origins)
+    if parsed.scheme() == "https"
+        || crate::utils::http::is_loopback_host(&parsed)
+        || on_configured_origin(&parsed, origins)
     {
         return Ok(());
     }
@@ -631,6 +618,8 @@ mod tests {
             // The host after the userinfo is the one that counts.
             ("http://127.0.0.1@evil.example", "evil.example"),
             ("http://localhost.evil.example", "localhost.evil.example"),
+            // A name under `.localhost` is whatever the resolver says.
+            ("http://patch.localhost:8080", "patch.localhost:8080"),
         ] {
             let Err(Flaw::InsecureUrl(reason)) = check(&at(origin), &configured) else {
                 panic!("{origin} must be refused as insecure");

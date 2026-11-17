@@ -2858,6 +2858,12 @@ async fn a_precompiled_gem_is_rebuilt_from_its_source_gem_and_grafted() {
 /// hold it, is downloaded from the registry and used only when it has the
 /// sha256 the registry's compact index records for the ruby-platform gem.
 /// (The stand-in Ruby builds; the download and its check are the CLI's.)
+///
+/// The registry here is on this machine, reached over plain http, which is
+/// taken only because such a request crosses no network. So it is sent
+/// straight there: with `HTTP_PROXY` / `ALL_PROXY` set and no `NO_PROXY`,
+/// nothing of it goes to the proxy, which would carry it in clear text to
+/// another host.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn the_source_gem_is_downloaded_and_checked_against_the_registry_index() {
@@ -2871,6 +2877,9 @@ async fn the_source_gem_is_downloaded_and_checked_against_the_registry_index() {
         (common::sha256_hex(b"another archive"), false),
     ] {
         let server = MockServer::start().await;
+        // A proxy that answers nothing (404): a request sent through it
+        // fails, and is counted.
+        let proxy = MockServer::start().await;
         // The platform gem's line comes first: it is not the source gem's.
         let info = format!(
             "---\n1.0.0-x86_64-linux |checksum:{}\n1.0.0 |checksum:{indexed}\n",
@@ -2896,10 +2905,31 @@ async fn the_source_gem_is_downloaded_and_checked_against_the_registry_index() {
         let home = proj.join("vendor/bundle/ruby/3.4.0");
         let tree_before = walk_files(&proj.join("vendor"));
 
+        let proxied = proxy.uri();
         let (code, stdout, stderr) = ruby.run(
             &proj,
             &["apply", "--json"],
-            &[("SOCKET_RUBYGEMS_URL", registry.as_str())],
+            &[
+                ("SOCKET_RUBYGEMS_URL", registry.as_str()),
+                ("HTTP_PROXY", proxied.as_str()),
+                ("http_proxy", proxied.as_str()),
+                ("ALL_PROXY", proxied.as_str()),
+                ("all_proxy", proxied.as_str()),
+                ("NO_PROXY", ""),
+                ("no_proxy", ""),
+            ],
+        );
+        let through_proxy: Vec<String> = proxy
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|request| request.url.to_string())
+            .collect();
+        assert_eq!(
+            through_proxy,
+            Vec::<String>::new(),
+            "a loopback request went through the proxy"
         );
         let asked: Vec<String> = server
             .received_requests()

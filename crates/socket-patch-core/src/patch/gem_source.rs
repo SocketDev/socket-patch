@@ -168,6 +168,18 @@ impl GemSource {
         self.offline
     }
 
+    /// The registry as a message names it: its base URL with any
+    /// credentials redacted (`SOCKET_RUBYGEMS_URL` may carry a mirror's
+    /// `user:token@`, and these messages reach `--json` output and CI
+    /// logs). Every message of this module that names the registry, or a
+    /// URL under it, goes through [`shown`].
+    fn registry_name(&self) -> String {
+        match &self.registry {
+            Ok(base) => shown(base),
+            Err(_) => shown(&rubygems_base()),
+        }
+    }
+
     /// Why nothing is downloaded for the gem `name`: the lock resolves it
     /// from another source, the run is offline, or the registry is reached
     /// over plain http. `None` when the registry may be asked.
@@ -176,7 +188,7 @@ impl GemSource {
             return Some(format!(
                 "the project's lock resolves {name} from {source}, not from {}, so it is not \
                  downloaded",
-                rubygems_base()
+                self.registry_name()
             ));
         }
         if self.offline {
@@ -234,9 +246,10 @@ impl GemSource {
             return format!("Put {file} in {cache}.");
         }
         match &self.registry {
-            Ok(base) => format!(
-                "Run `socket-patch apply` once with network access to {base}, or put {file} in \
-                 {cache}."
+            Ok(_) => format!(
+                "Run `socket-patch apply` once with network access to {}, or put {file} in \
+                 {cache}.",
+                self.registry_name()
             ),
             Err(_) => format!(
                 "With an https registry (or SOCKET_RUBYGEMS_URL unset), run `socket-patch \
@@ -272,8 +285,9 @@ impl GemSource {
         };
         fetched.await.map_err(|why: String| {
             format!(
-                "{} is not there and it could not be downloaded ({why})",
-                cache.display()
+                "{} is not there and it could not be downloaded ({})",
+                cache.display(),
+                shown(&why)
             )
         })
     }
@@ -323,21 +337,31 @@ impl GemSource {
         if let Some(withheld) = self.withheld(name) {
             return Err(withheld);
         }
-        let base = self.registry.as_ref().map_err(String::clone)?;
-        let info = self.index(base, name).await?;
-        let (version, sha) = pick_release(&info, requirement, ruby)
-            .ok_or_else(|| format!("{base} lists no release of {name} that meets {requirement}"))?;
-        let id = GemId {
-            name: name.to_string(),
-            version,
-            platform: None,
+        let fetched = async {
+            let base = self.registry.as_ref().map_err(String::clone)?;
+            let info = self.index(base, name).await?;
+            let (version, sha) = pick_release(&info, requirement, ruby).ok_or_else(|| {
+                format!("{base} lists no release of {name} that meets {requirement}")
+            })?;
+            let id = GemId {
+                name: name.to_string(),
+                version,
+                platform: None,
+            };
+            if !id.is_plain() {
+                return Err(format!("{} is not a plain gem name", id.full_name()));
+            }
+            let bytes = self.fetch_verified(base, &id, &sha).await?;
+            Ok((id, bytes))
         };
-        if !id.is_plain() {
-            return Err(format!("{} is not a plain gem name", id.full_name()));
-        }
-        let bytes = self.fetch_verified(base, &id, &sha).await?;
-        Ok((id, bytes))
+        fetched.await.map_err(|why: String| shown(&why))
     }
+}
+
+/// `text` as a message carries it: the credentials of every URL in it
+/// redacted.
+fn shown(text: &str) -> String {
+    crate::utils::redact::redact_urls_in(text).into_owned()
 }
 
 /// `<home>/cache/<full name>.gem`.
@@ -878,7 +902,10 @@ mod tests {
     /// A registry on this machine (a local mirror, the hermetic tests) is
     /// asked over plain http: the archive is the one its index records.
     /// A redirect from it to a plain-http host elsewhere is not followed,
-    /// for the index or for the archive.
+    /// for the index or for the archive. (The host "elsewhere" is
+    /// `0.0.0.0`: no loopback address to the rule, and nothing sent to it
+    /// leaves this machine, so the test is off the network even if the
+    /// rule broke.)
     #[tokio::test]
     async fn a_loopback_registry_is_asked_and_no_redirect_leaves_it() {
         use wiremock::matchers::{method, path};
@@ -892,7 +919,7 @@ mod tests {
         };
         let away = |to: &str| {
             ResponseTemplate::new(302)
-                .insert_header("location", format!("http://gems.example.test{to}").as_str())
+                .insert_header("location", format!("http://0.0.0.0:9{to}").as_str())
         };
         let archive = b"the source gem".to_vec();
         let listed = |sha: &str| {
@@ -932,7 +959,7 @@ mod tests {
         for name in ["moved", "gone"] {
             let why = gems.archive(&home, &of(name)).await.unwrap_err();
             assert!(
-                why.contains("refusing a redirect") && why.contains("gems.example.test"),
+                why.contains("refusing a redirect") && why.contains("0.0.0.0"),
                 "{name}: {why}"
             );
             let why = gems
@@ -940,6 +967,89 @@ mod tests {
                 .await
                 .unwrap_err();
             assert!(why.contains("refusing a redirect"), "{name}: {why}");
+        }
+    }
+
+    /// `SOCKET_RUBYGEMS_URL` may carry a mirror's credentials. No message
+    /// of this module repeats them: not the remedy, not a registry that
+    /// lists no such gem, not an archive or an index that is not what it
+    /// should be, not a gem the lock resolves elsewhere.
+    #[tokio::test]
+    async fn no_message_repeats_the_registrys_credentials() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        let serve = |from: &'static str, response: ResponseTemplate| {
+            Mock::given(method("GET"))
+                .and(path(from))
+                .respond_with(response)
+                .mount(&server)
+        };
+        let listed =
+            ResponseTemplate::new(200).set_body_string(format!("---\n1.0.0 |checksum:{SHA_A}\n"));
+        serve("/mirror/info/listed", listed).await;
+        serve(
+            "/mirror/gems/listed-1.0.0.gem",
+            ResponseTemplate::new(200).set_body_bytes(b"another archive".to_vec()),
+        )
+        .await;
+        serve(
+            "/mirror/info/garbled",
+            ResponseTemplate::new(200).set_body_bytes(vec![0xff, 0xfe]),
+        )
+        .await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let base = format!(
+            "{}/mirror",
+            server.uri().replace("http://", "http://deploy:hunter2@")
+        );
+        let mut gems = asking(Ok(base));
+        gems.elsewhere
+            .insert("inhouse".to_string(), "a git source".to_string());
+        let of = |name: &str, version: &str| id(name, version, None);
+        let any = RubyVersions::default();
+        let said = [
+            // The remedy of a refusal, and a gem the lock resolves elsewhere.
+            gems.remedy(&home, &of("listed", "1.0.0")),
+            gems.out_of_reach(&home, &of("inhouse", "1.0.0"))
+                .await
+                .unwrap(),
+            // The registry lists no such release.
+            gems.archive(&home, &of("listed", "2.0.0"))
+                .await
+                .unwrap_err(),
+            gems.dependency("listed", "~> 9.0", &any).await.unwrap_err(),
+            // Its archive is not the one its index records.
+            gems.archive(&home, &of("listed", "1.0.0"))
+                .await
+                .unwrap_err(),
+            gems.dependency("listed", ">= 0", &any).await.unwrap_err(),
+            // Its index is not text; it has none (HTTP 404).
+            gems.archive(&home, &of("garbled", "1.0.0"))
+                .await
+                .unwrap_err(),
+            gems.dependency("absent", ">= 0", &any).await.unwrap_err(),
+        ];
+        for (text, expected) in said.iter().zip([
+            "with network access to http://",
+            "not from http://",
+            "lists no listed 2.0.0 with a checksum",
+            "lists no release of listed that meets ~> 9.0",
+            "does not have the sha256",
+            "does not have the sha256",
+            "is not UTF-8",
+            "HTTP 404",
+        ]) {
+            assert!(text.contains(expected), "no {expected:?} in {text}");
+            assert!(
+                text.contains("/mirror"),
+                "the registry is still named: {text}"
+            );
+            for secret in ["hunter2", "deploy:"] {
+                assert!(!text.contains(secret), "{secret} in {text}");
+            }
         }
     }
 }

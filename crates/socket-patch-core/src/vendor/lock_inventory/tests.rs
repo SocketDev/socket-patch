@@ -4243,7 +4243,7 @@ const PINNED_REFERENCES: &[(&str, &str, &str)] = &[
     (
         "vendor/registry_fetch.rs",
         "download",
-        "download(&self.0, url).await",
+        "download(client, url.as_str()).await",
     ),
     (
         "patch/gem_refresh.rs",

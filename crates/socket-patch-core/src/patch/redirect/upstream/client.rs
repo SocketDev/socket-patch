@@ -591,14 +591,30 @@ impl UpstreamClient {
         if let Some(hit) = self.rubygems.lock().await.get(&key) {
             return hit.clone();
         }
-        let result = async {
-            if self.offline {
-                return Err(OFFLINE.to_string());
-            }
-            if !crate::formats::gem::is_plain_gem_token(name) {
-                return Err(format!("{name:?} is not a plain gem name"));
-            }
-            let url = format!("{}/info/{name}", rubygems_secure_base()?);
+        let result = self
+            .rubygems_sha256_at(rubygems_secure_base(), name, version)
+            .await;
+        self.rubygems.lock().await.insert(key, result.clone());
+        result
+    }
+
+    /// [`Self::rubygems_sha256`], uncached, from the registry at `base`
+    /// ([`rubygems_secure_base`]: its URL, or why it is not asked). The
+    /// base may carry a mirror's credentials: no error repeats them.
+    async fn rubygems_sha256_at(
+        &self,
+        base: Result<String, String>,
+        name: &str,
+        version: &str,
+    ) -> Result<String, String> {
+        if self.offline {
+            return Err(OFFLINE.to_string());
+        }
+        if !crate::formats::gem::is_plain_gem_token(name) {
+            return Err(format!("{name:?} is not a plain gem name"));
+        }
+        let url = format!("{}/info/{name}", base?);
+        let looked_up = async {
             let registry = self.secure.get_or_init(SecureRegistryClient::new);
             let bytes = {
                 let _permit = self.permit().await;
@@ -607,10 +623,10 @@ impl UpstreamClient {
             let text = String::from_utf8(bytes).map_err(|_| format!("{url} is not UTF-8"))?;
             compact_index_checksum(&text, version)
                 .ok_or_else(|| format!("{url} lists no ruby-platform {version} with a checksum"))
-        }
-        .await;
-        self.rubygems.lock().await.insert(key, result.clone());
-        result
+        };
+        looked_up
+            .await
+            .map_err(|why: String| crate::utils::redact::redact_urls_in(&why).into_owned())
     }
 
     /// Every version packagist serves for the composer package `name`
@@ -967,6 +983,63 @@ mod tests {
             );
             assert!(!why.contains("hunter2"), "{why}");
         }
+    }
+
+    /// The registry's base may carry a mirror's credentials
+    /// (`SOCKET_RUBYGEMS_URL=https://user:token@…`): the checksum is read
+    /// with them, and no error of the lookup repeats them. A registry that
+    /// is refused is not asked at all.
+    #[tokio::test]
+    async fn a_gem_checksum_lookup_never_repeats_the_registrys_credentials() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        let sha = "a".repeat(64);
+        Mock::given(method("GET"))
+            .and(path("/info/rails"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(format!("---\n7.0.0 |checksum:{sha}\n")),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/info/garbled"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![0xff, 0xfe]))
+            .mount(&server)
+            .await;
+        let base = server.uri().replace("http://", "http://deploy:hunter2@");
+        let client = UpstreamClient::new(false);
+        let at = |name: &'static str, version: &'static str| {
+            client.rubygems_sha256_at(Ok(base.clone()), name, version)
+        };
+        assert_eq!(at("rails", "7.0.0").await, Ok(sha));
+        for (name, version, expected) in [
+            (
+                "rails",
+                "7.1.0",
+                "lists no ruby-platform 7.1.0 with a checksum",
+            ),
+            ("garbled", "1.0.0", "is not UTF-8"),
+            ("absent", "1.0.0", "HTTP 404"),
+        ] {
+            let why = at(name, version).await.unwrap_err();
+            assert!(why.contains(expected), "{why}");
+            assert!(why.contains(&format!("/info/{name}")), "{why}");
+            assert!(
+                !why.contains("hunter2") && !why.contains("deploy:"),
+                "{why}"
+            );
+        }
+
+        let asked = server.received_requests().await.unwrap().len();
+        let refused = secure_gem_registry("http://deploy:hunter2@gems.example.test".to_string());
+        let why = client
+            .rubygems_sha256_at(refused, "rails", "7.0.0")
+            .await
+            .unwrap_err();
+        assert!(why.contains("set it to an https URL"), "{why}");
+        assert!(!why.contains("hunter2"), "{why}");
+        assert_eq!(server.received_requests().await.unwrap().len(), asked);
     }
 
     #[test]
