@@ -3,7 +3,8 @@ load("@npm//:defs.bzl", "npm_link_all_packages")
 
 npm_link_all_packages(name = "node_modules")
 
-# Prints OUT: PRISTINE until the package is patched.
+# Prints `OUT: PRISTINE <id>` until the package is patched: a test builds the
+# package anew, with an id of its own in the entry file.
 js_binary(
     name = "consumer",
     data = [":node_modules/fixture-upstream"],

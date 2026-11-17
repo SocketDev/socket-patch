@@ -13,7 +13,8 @@
 //! says which ruleset goes with its release), each in a fresh output base:
 //!
 //! - (a) `bazel build` and `bazel run //:consumer` print the unpatched
-//!   marker.
+//!   marker, and Bazel fetched the upstream tarball from the stand-in
+//!   registry.
 //! - (b) The one command of the mode writes its files and no other.
 //!   `scan --mode hosted --yes` gives the package's entry of
 //!   `pnpm-lock.yaml` the integrity of the patched tarball and its URL on
@@ -33,19 +34,22 @@
 //!   the checkout is the one of before, byte for byte, and the build prints
 //!   the unpatched marker again.
 //! - (e) On a second machine (a new output base and, on Bazel 9, a new
-//!   contents cache) the command runs against a second patch, whose tarball
-//!   no cache can hold, and the pinned place holds other bytes: the patch
-//!   host serves them (hosted), or they replace the committed file
-//!   (vendored). The build fails on the checksum and does not take the
-//!   registry's tarball in its place.
+//!   contents cache) the command runs against a second patch, and the
+//!   pinned place holds other bytes: the patch host serves them (hosted),
+//!   or they replace the committed file (vendored). The build fails on the
+//!   checksum and does not take the registry's tarball in its place.
 //!
-//! What the checksum guards is a fetch, and an output base fetches a
-//! repository once. The vendored flow holds that too, between (c) and (d):
-//! with other bytes in the committed file, the output base that has fetched
-//! it goes on building the patched tarball, with no error.
-//!
-//! The marker is read from what Bazel built, and the patched one holds an
-//! id made for the run, so no cache of an earlier run can supply it.
+//! A marker is read from what Bazel built. Bazel's downloader keeps every
+//! file it fetches in the repository cache, under its checksum, and hands it
+//! out again without a request; the tests of a leg share that cache, and CI
+//! restores it from earlier runs. So every tarball of a run is new. The
+//! entry file of the upstream package and of each patch holds an id made
+//! for the run, which the marker shows, and the lock of the workspace copy
+//! gets the upstream `integrity` from the bytes the run serves
+//! ([`lock_pinning`]); the fixture's own lock holds a placeholder there.
+//! Step (a) has to fetch the upstream tarball then, and counts the
+//! requests: a downloader rewrite or a registry route that stopped working
+//! fails it on every run, not on an empty cache alone.
 //!
 //! One loopback server per checkout (the second machine of (e) has its own)
 //! stands in for three hosts, by route prefix: the Socket API (`/v0`), the
@@ -53,15 +57,9 @@
 //! the version document `rollback` reads through `SOCKET_NPM_REGISTRY`). The
 //! package is the tests' own and no registry holds it. Its lock entry names
 //! no URL, as pnpm writes one, so rules_js asks for it at the public
-//! registry's URL; a downloader config in the checkout rewrites that URL to
+//! registry's URL; the downloader config of the cell rewrites that URL to
 //! the stand-in ([`route_registry`]), as a user behind a registry mirror has
-//! it. The lock pins the sha512 of the tarball built here, so those bytes
-//! come from a stand-in: this run's, or an earlier run's through the
-//! repository cache the tests of a leg share, which is why no test counts
-//! the requests for the upstream tarball in (a). It is also why a rewrite
-//! that stopped applying would show on an empty cache only: Bazel then asks
-//! the public registry for the name, and (a) fails on the answer or on the
-//! lock's sha512.
+//! it.
 
 use std::time::Instant;
 
@@ -69,18 +67,18 @@ use base64::Engine as _;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha512};
 use socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes;
-use wiremock::matchers::{method, path};
-use wiremock::{Mock, MockServer, ResponseTemplate};
 
-use crate::envelope::event_for;
-use crate::harness::{changed, fixture_path, Cell, Fixture, Ran, Run, Tree, CONSUMER};
-use crate::hosted_memory_common::{self, mount_api, ORG};
+use crate::harness::{
+    changed, fixture_path, rewrite, Cell, Fixture, Ran, Run, StandIn, Tree, CONSUMER,
+};
+use crate::hosted_memory_common::{Patch, ORG};
 
 /// The workspace the tests build, and the ruleset each Bazel release builds
 /// it with.
 const FIXTURE: Fixture = Fixture {
     name: "npm::FIXTURE",
     dir: "rules_js/bzlmod",
+    workflow: "bazel-npm.yml",
     eras: &[
         // aspect_rules_js 3.6.0, which asks for Bazel 7.6.0 or later.
         ((7, 6, 0)..(10, 0, 0), "e9"),
@@ -94,14 +92,13 @@ const PURL: &str = "pkg:npm/fixture-upstream@1.0.0";
 /// The file name of its tarball: on the registry, on the patch host and
 /// under `.socket/vendor`.
 const TGZ: &str = "fixture-upstream-1.0.0.tgz";
-/// Its two files. The fixture's lock holds the sha512 of the tarball of
-/// these bytes ([`tarball`]).
+/// Its `package.json`. The other file of a tarball is the entry file.
 const MANIFEST: &str =
     "{\"name\": \"fixture-upstream\", \"version\": \"1.0.0\", \"main\": \"index.js\"}\n";
-const UPSTREAM_INDEX: &str = "module.exports = \"PRISTINE\";\n";
-const UNPATCHED: &str = "OUT: PRISTINE";
 /// The entry file of the other bytes a build finds at the pinned place.
 const TAMPERED_INDEX: &str = "module.exports = \"TAMPERED\";\n";
+/// The lock rules_js reads.
+const LOCK: &str = "pnpm-lock.yaml";
 /// The route prefix under which the stand-in plays the npm registry, and
 /// the route of the upstream tarball there.
 const REGISTRY: &str = "registry.npmjs.org";
@@ -113,17 +110,13 @@ const TOKEN: &str = "22222222-2222-4222-8222-222222222222";
 /// root as the one package, and the setting without which pnpm 11 and later
 /// reject a lock whose tarball URL is not the registry's.
 const TRUSTING_WORKSPACE: &str = "packages:\n  - '.'\ntrustLockfile: true\n";
-/// What [`changed`] gives for two equal trees.
-const NOTHING: [&str; 0] = [];
 
 /// The package with `index_js` as its entry file, as a registry tarball.
-/// The gzip layer stores the archive without compressing it and no header
-/// holds a time or an owner, so the bytes follow from the two files alone:
-/// the fixture's lock pins the upstream tarball built here, and no binary
-/// is committed.
+/// Every sum a test holds a build to is computed from the bytes it serves,
+/// so nothing depends on the exact bytes the archive crates emit.
 fn tarball(index_js: &str) -> Vec<u8> {
-    let stored = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::none());
-    let mut archive = tar::Builder::new(stored);
+    let gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    let mut archive = tar::Builder::new(gzip);
     for (name, text) in [
         ("package/package.json", MANIFEST),
         ("package/index.js", index_js),
@@ -135,24 +128,50 @@ fn tarball(index_js: &str) -> Vec<u8> {
             .append_data(&mut header, name, text.as_bytes())
             .expect("tar");
     }
-    let stored = archive.into_inner().expect("tar");
-    stored.finish().expect("gzip")
+    let gzip = archive.into_inner().expect("tar");
+    gzip.finish().expect("gzip")
 }
 
-/// The `integrity` of a tarball, as a pnpm lock and Bazel spell it.
-fn integrity(tarball: &[u8]) -> String {
-    let digest = base64::engine::general_purpose::STANDARD.encode(Sha512::digest(tarball));
+/// A sha512 as a pnpm lock and Bazel spell an `integrity`.
+fn sri(sha512: &[u8]) -> String {
+    let digest = base64::engine::general_purpose::STANDARD.encode(sha512);
     format!("sha512-{digest}")
 }
 
-/// One patch of the package. Its id and its entry file are new for every
-/// run, so no cache holds its tarball.
-struct Patched {
-    uuid: String,
+/// The `integrity` of a tarball.
+fn integrity(tarball: &[u8]) -> String {
+    sri(&Sha512::digest(tarball))
+}
+
+/// One build of the package: an entry file that exports `<word> <id>`, the
+/// tarball of it, and the line the consumer prints once Bazel built that
+/// tarball in. The id is new for every run, so no cache holds the tarball.
+struct Package {
     index_js: String,
     tarball: Vec<u8>,
-    /// What the consumer prints once the tarball is built in.
     marker: String,
+}
+
+impl Package {
+    fn new(word: &str, id: &str) -> Package {
+        let index_js = format!("module.exports = \"{word} {id}\";\n");
+        Package {
+            tarball: tarball(&index_js),
+            marker: format!("OUT: {word} {id}"),
+            index_js,
+        }
+    }
+
+    /// The package as the registry of one run has it.
+    fn upstream() -> Package {
+        Package::new("PRISTINE", &uuid::Uuid::new_v4().to_string())
+    }
+}
+
+/// One patch of the package, under an id that is new for every run.
+struct Patched {
+    uuid: String,
+    package: Package,
     /// The route of the tarball on the patch host.
     route: String,
 }
@@ -160,159 +179,121 @@ struct Patched {
 impl Patched {
     fn new() -> Patched {
         let uuid = uuid::Uuid::new_v4().to_string();
-        let index_js = format!("module.exports = \"PATCHED {uuid}\";\n");
         Patched {
-            tarball: tarball(&index_js),
-            marker: format!("OUT: PATCHED {uuid}"),
+            package: Package::new("PATCHED", &uuid),
             route: format!("/patch/npm/{NAME}/{VERSION}/{TOKEN}/{uuid}/{TGZ}"),
-            index_js,
             uuid,
         }
     }
 }
 
-/// The loopback server behind every host of one checkout.
-struct StandIn {
-    // Dropped before the runtime it runs on.
-    server: MockServer,
-    runtime: tokio::runtime::Runtime,
+/// The entry of a lock that pins the package to the tarball of `integrity`
+/// and names no URL, as pnpm writes the entry of a registry package.
+fn lock_entry(integrity: &str) -> String {
+    format!("  {NAME}@{VERSION}:\n    resolution: {{integrity: {integrity}}}\n")
 }
 
-impl StandIn {
-    /// A server that holds the upstream package as the registry does: the
-    /// tarball, and the version document with its integrity and the URL the
-    /// public registry would have it at.
-    fn start() -> StandIn {
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-            .expect("a runtime for the stand-in");
-        let server = runtime.block_on(MockServer::start());
-        let standin = StandIn { server, runtime };
-        let upstream = tarball(UPSTREAM_INDEX);
-        let document = json!({
-            "name": NAME,
-            "version": VERSION,
-            "dist": {
-                "tarball": format!("https://{REGISTRY}/{NAME}/-/{TGZ}"),
-                "integrity": integrity(&upstream),
-            },
-        });
-        let document_route = format!("/{REGISTRY}/{NAME}/{VERSION}");
-        let ok = || ResponseTemplate::new(200);
-        standin.serve(&document_route, ok().set_body_json(document));
-        standin.serve(UPSTREAM_TGZ, ok().set_body_bytes(upstream));
-        standin
-    }
+/// The `integrity` of the package in the fixture's own lock, which is the
+/// sum of no tarball: sixty-four zero bytes.
+fn placeholder() -> String {
+    sri(&[0; 64])
+}
 
-    /// `http://127.0.0.1:<port>`.
-    fn origin(&self) -> String {
-        self.server.uri()
-    }
+/// The fixture's lock with `upstream` in place of the placeholder: the lock
+/// a test writes into its workspace copy before the first build.
+fn lock_pinning(upstream: &Package) -> String {
+    let path = fixture_path(FIXTURE.dir).join("common").join(LOCK);
+    let lock = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    let unpinned = lock_entry(&placeholder());
+    let entries = lock.matches(&unpinned).count();
+    assert_eq!(entries, 1, "{}: not one\n{unpinned}", path.display());
+    lock.replace(&unpinned, &lock_entry(&integrity(&upstream.tarball)))
+}
 
-    /// Answer `GET <route>` with `response`, ahead of the routes
-    /// [`mount_api`] mounts: wiremock asks the mocks of the lowest priority
-    /// number first. Any other route is a 404.
-    fn serve(&self, route: &str, response: ResponseTemplate) {
-        let mock = Mock::given(method("GET"))
-            .and(path(route))
-            .respond_with(response)
-            .with_priority(1);
-        self.runtime.block_on(mock.mount(&self.server));
-    }
+/// A stand-in that holds `upstream` as the registry does: the tarball, and
+/// the version document with its integrity and the URL the public registry
+/// would have it at.
+fn registry(upstream: &Package) -> StandIn {
+    let standin = StandIn::start();
+    let document = json!({
+        "name": NAME,
+        "version": VERSION,
+        "dist": {
+            "tarball": format!("https://{REGISTRY}/{NAME}/-/{TGZ}"),
+            "integrity": integrity(&upstream.tarball),
+        },
+    });
+    let document = serde_json::to_vec(&document).expect("a JSON document");
+    standin.serve(5, &format!("/{REGISTRY}/{NAME}/{VERSION}"), &document);
+    standin.serve(5, UPSTREAM_TGZ, &upstream.tarball);
+    standin
+}
 
-    /// The Socket API for `patch`, free for every caller, and the patch
-    /// host with `served` at the URL the API hands out for its tarball. The
-    /// API names the sha512 of the patch's own tarball, whatever is served.
-    fn grant(&self, patch: &Patched, served: &[u8]) {
-        let url = format!("{}{}", self.origin(), patch.route);
-        let reference = json!({
-            "status": "granted",
+/// The Socket API on `standin` for `patch` of `upstream`, free for every
+/// caller, and the patch host with `served` at the URL the API hands out
+/// for its tarball. The API names the sha512 of the patch's own tarball,
+/// whatever is served.
+fn grant(standin: &StandIn, upstream: &Package, patch: &Patched, served: &[u8]) {
+    let url = format!("{}{}", standin.origin(), patch.route);
+    let reference = json!({
+        "status": "granted",
+        "url": url,
+        "purl": PURL,
+        "artifacts": [{
+            "kind": "tarball",
             "url": url,
-            "purl": PURL,
-            "artifacts": [{
-                "kind": "tarball",
-                "url": url,
-                "integrity": { "sha512": integrity(&patch.tarball) },
-            }],
-            "registryOverride": null,
-        });
-        let granted = hosted_memory_common::Patch {
-            purl: PURL.to_string(),
-            uuid: patch.uuid.clone(),
-            reference,
-        };
-        self.runtime.block_on(mount_api(&self.server, &[granted]));
-        // The patch record, in place of the one `mount_api` serves: vendored
-        // mode holds the entry file of the tarball it downloads to
-        // `afterHash`.
-        let record = json!({
-            "uuid": patch.uuid,
-            "purl": PURL,
-            "publishedAt": "2026-01-01T00:00:00Z",
-            "files": { "package/index.js": {
-                "beforeHash": compute_git_sha256_from_bytes(UPSTREAM_INDEX.as_bytes()),
-                "afterHash": compute_git_sha256_from_bytes(patch.index_js.as_bytes()),
-            }},
-            "vulnerabilities": { "GHSA-test-aaaa-bbbb": {
-                "cves": ["CVE-2024-0001"], "summary": "s", "severity": "high", "description": "d",
-            }},
-            "description": "fixture",
-            "license": "MIT",
-            "tier": "free",
-        });
-        let record_route = format!("/v0/orgs/{ORG}/patches/view/{}", patch.uuid);
-        let ok = || ResponseTemplate::new(200);
-        self.serve(&record_route, ok().set_body_json(record));
-        self.serve(&patch.route, ok().set_body_bytes(served));
-    }
-
-    /// The path of every request the server has received.
-    fn requests(&self) -> Vec<String> {
-        let received = self.runtime.block_on(self.server.received_requests());
-        let received = received.expect("wiremock records requests");
-        received.iter().map(|r| r.url.path().to_string()).collect()
-    }
-
-    /// How many requests for `route` the server has received.
-    fn asked(&self, route: &str) -> usize {
-        self.requests().iter().filter(|path| *path == route).count()
-    }
-}
-
-/// The option that names a downloader config on `release`: Bazel 8.2.0
-/// dropped the `experimental_` it had until then.
-fn downloader_option(release: &str) -> &'static str {
-    let mut numbers = release.split('.').map(|part| part.parse::<u32>().ok());
-    let line = (numbers.next().flatten(), numbers.next().flatten());
-    if line >= (Some(8), Some(2)) {
-        "downloader_config"
-    } else {
-        "experimental_downloader_config"
-    }
+            "integrity": { "sha512": integrity(&patch.package.tarball) },
+        }],
+        "registryOverride": null,
+    });
+    let granted = Patch {
+        purl: PURL.to_string(),
+        uuid: patch.uuid.clone(),
+        reference,
+    };
+    standin.api(&[granted]);
+    // The patch record, ahead of the one the API routes serve: vendored
+    // mode holds the entry file of the tarball it downloads to `afterHash`.
+    let record = json!({
+        "uuid": patch.uuid,
+        "purl": PURL,
+        "publishedAt": "2026-01-01T00:00:00Z",
+        "files": { "package/index.js": {
+            "beforeHash": compute_git_sha256_from_bytes(upstream.index_js.as_bytes()),
+            "afterHash": compute_git_sha256_from_bytes(patch.package.index_js.as_bytes()),
+        }},
+        "vulnerabilities": { "GHSA-test-aaaa-bbbb": {
+            "cves": ["CVE-2024-0001"], "summary": "s", "severity": "high", "description": "d",
+        }},
+        "description": "fixture",
+        "license": "MIT",
+        "tier": "free",
+    });
+    let record = serde_json::to_vec(&record).expect("a JSON document");
+    let record_route = format!("/v0/orgs/{ORG}/patches/view/{}", patch.uuid);
+    standin.serve(1, &record_route, &record);
+    standin.serve(5, &patch.route, served);
 }
 
 /// Send Bazel's downloader to `standin` for the registry's files of the
-/// package: a `.bazelrc` of the checkout names a downloader config with the
-/// one rewrite. Every other URL stays as it is, the patch host's included,
+/// package. Every other URL stays as it is, the patch host's included,
 /// which a lock names at the stand-in's own origin.
-fn route_registry(cell: &Cell, standin: &StandIn) {
-    let origin = standin.origin();
-    let rewrite =
-        format!("rewrite registry\\.npmjs\\.org/{NAME}/(.*) {origin}/{REGISTRY}/{NAME}/$1\n");
-    cell.write("downloader.cfg", rewrite);
-    let option = downloader_option(cell.release());
-    cell.write(".bazelrc", format!("common --{option}=downloader.cfg\n"));
+fn route_registry(cell: &mut Cell, standin: &StandIn) {
+    let files = format!("{REGISTRY}/{NAME}/");
+    cell.route_downloads(&[rewrite(&files, &standin.origin())]);
 }
 
-/// The checkout of the fixture for `test`, and the stand-in its builds and
-/// its commands talk to. `None` after a `SKIP` line when no Bazel runs here.
-fn open(test: &str) -> Option<(Cell, StandIn)> {
-    let cell = Cell::open(test, &FIXTURE)?;
-    let standin = StandIn::start();
-    route_registry(&cell, &standin);
-    Some((cell, standin))
+/// The checkout of the fixture for `test`, the upstream package of this run,
+/// which the lock of the checkout pins, and the stand-in that holds it,
+/// which the builds and the commands of the checkout talk to. `None` after a
+/// `SKIP` line when no Bazel runs here.
+fn open(test: &str) -> Option<(Cell, StandIn, Package)> {
+    let mut cell = Cell::open(test, &FIXTURE)?;
+    let upstream = Package::upstream();
+    cell.write(LOCK, lock_pinning(&upstream));
+    let standin = registry(&upstream);
+    route_registry(&mut cell, &standin);
+    Some((cell, standin, upstream))
 }
 
 /// `socket-patch <args>` in `cell`, with `standin` as the Socket API, as
@@ -333,37 +314,18 @@ fn text(tree: &Tree, rel: &str) -> String {
     String::from_utf8(tree[rel].clone()).expect("a text file")
 }
 
-/// Step (a): the build of `cell` prints the unpatched marker. Gives the
-/// files of the checkout, Bazel's own lock among them.
-fn builds_unpatched(cell: &Cell) -> Tree {
-    cell.builds(UNPATCHED);
-    let before = cell.tree();
-    let locked = before.contains_key("MODULE.bazel.lock");
-    assert!(locked, "{}: Bazel wrote no lock", cell.test);
-    before
-}
-
-/// Step (c): the build of `cell` prints `marker`, Bazel changed no file of
-/// `pinned`, its own lock included, and that lock still stands when Bazel
-/// may not update it.
-fn builds_patched(cell: &Cell, pinned: &Tree, marker: &str) {
-    cell.builds(marker);
-    assert_eq!(changed(pinned, &cell.tree()), NOTHING, "{}", cell.test);
-    let frozen = cell.frozen_build(&[CONSUMER]);
-    assert!(frozen.ok(), "{}: {}", cell.test, frozen.dump());
-}
-
-/// Step (d): `socket-patch <undo>` counts one package under `counted` of
-/// its summary, every file is the one of `before`, and so is the build.
-fn undoes(cell: &Cell, standin: &StandIn, before: &Tree, undo: &[&str], counted: &str) {
-    let test = &cell.test;
-    let undone = socket_patch(cell, standin, undo);
-    let said = &undone.dump;
-    assert_eq!(undone.code, 0, "{test}: {said}");
-    assert_eq!(undone.envelope["summary"][counted], 1, "{test}: {said}");
-    assert_eq!(changed(before, &cell.tree()), NOTHING, "{test}: {said}");
-    cell.builds(UNPATCHED);
-    assert_eq!(changed(before, &cell.tree()), NOTHING, "{test}");
+/// Step (a): the build of `cell` prints the marker of `upstream`, and Bazel
+/// asked `standin` for that tarball, which no cache holds. Gives the files
+/// of the checkout and the number of those requests.
+fn builds_upstream(cell: &Cell, standin: &StandIn, upstream: &Package) -> (Tree, usize) {
+    let before = cell.builds_unpatched(&upstream.marker);
+    let fetches = standin.asked(UPSTREAM_TGZ);
+    assert!(
+        fetches > 0,
+        "{}: the build did not fetch the upstream tarball from the stand-in registry",
+        cell.test
+    );
+    (before, fetches)
 }
 
 /// Step (e): the build of `twin` fails because Bazel finds the sha512 of
@@ -398,47 +360,36 @@ fn refuses(twin: &Cell, other: &StandIn, found: &[u8], pinned: &[u8]) -> (Run, S
 fn hosted_npm_translate_lock() {
     let test = "npm::hosted_npm_translate_lock";
     let started = Instant::now();
-    let Some((cell, standin)) = open(test) else {
+    let Some((cell, standin, upstream)) = open(test) else {
         return;
     };
     let release = cell.release().to_string();
     let origin = standin.origin();
     let patch = Patched::new();
-    standin.grant(&patch, &patch.tarball);
+    grant(&standin, &upstream, &patch, &patch.package.tarball);
 
-    // (a) The unpatched build.
-    let before = builds_unpatched(&cell);
+    // (a) The unpatched build, with the upstream tarball from the stand-in.
+    let (before, upstream_fetches) = builds_upstream(&cell, &standin, &upstream);
 
-    // (b) The one command of hosted mode.
+    // (b) The one command of hosted mode. It rewrites those two files and
+    // no other: the entry of the package names the patched tarball, by its
+    // sum and by its URL on the patch host.
     let scan = socket_patch(&cell, &standin, &["scan", "--mode", "hosted", "--yes"]);
-    let said = &scan.dump;
-    assert_eq!(scan.code, 0, "{test}: {said}");
-    assert_eq!(scan.envelope["status"], "success", "{test}: {said}");
-    assert_eq!(scan.envelope["summary"]["applied"], 1, "{test}: {said}");
-    let event = event_for(&scan.envelope, PURL);
-    assert_eq!(event["action"], "applied", "{test}: {said}");
-    assert_eq!(event["uuid"], patch.uuid.as_str(), "{test}: {said}");
-    // Those two files and no other: the entry of the package names the
-    // patched tarball, by its sum and by its URL on the patch host.
-    let written = ["pnpm-lock.yaml", "pnpm-workspace.yaml"];
-    let rewritten = &scan.envelope["redirect"]["rewrittenFiles"];
-    assert_eq!(*rewritten, json!(written), "{test}: {said}");
-    let pinned = cell.tree();
-    assert_eq!(changed(&before, &pinned), written, "{test}: {said}");
-    let lock = text(&pinned, "pnpm-lock.yaml");
+    let written = [LOCK, "pnpm-workspace.yaml"];
+    let pinned = cell.pinned_by(&scan, PURL, &patch.uuid, &before, &written);
+    let lock = text(&pinned, LOCK);
     let entry = format!(
         "  {NAME}@{VERSION}:\n    resolution: {{integrity: {}, tarball: {origin}{}}}\n",
-        integrity(&patch.tarball),
+        integrity(&patch.package.tarball),
         patch.route
     );
-    assert!(lock.contains(&entry), "{test}: pnpm-lock.yaml:\n{lock}");
+    assert!(lock.contains(&entry), "{test}: {LOCK}:\n{lock}");
     let workspace = text(&pinned, "pnpm-workspace.yaml");
     assert_eq!(workspace, TRUSTING_WORKSPACE, "{test}");
 
     // (c) The same build, no step in between: patched, from the patch host.
-    let (patched_fetches, upstream_fetches) =
-        (standin.asked(&patch.route), standin.asked(UPSTREAM_TGZ));
-    builds_patched(&cell, &pinned, &patch.marker);
+    let patched_fetches = standin.asked(&patch.route);
+    cell.builds_patched(&pinned, &patch.package.marker);
     assert!(
         standin.asked(&patch.route) > patched_fetches,
         "{test}: the patched build did not fetch the tarball from the stand-in patch host"
@@ -450,23 +401,23 @@ fn hosted_npm_translate_lock() {
     );
 
     // (d) The undo: every file is the one of before, and so is the build.
-    let undo = ["rollback", "--yes"];
-    undoes(&cell, &standin, &before, &undo, "rolledBack");
+    let undo = socket_patch(&cell, &standin, &["rollback", "--yes"]);
+    cell.undone(&undo, "rolledBack", &before, &upstream.marker);
 
     // (e) A second machine, a second patch, and a patch host that serves
     // other bytes at the URL the lock pins: still a tarball of the package,
     // with another sum.
-    let twin = cell.twin();
-    let other = StandIn::start();
-    route_registry(&twin, &other);
+    let mut twin = cell.twin();
+    let other = registry(&upstream);
+    route_registry(&mut twin, &other);
     let second = Patched::new();
     let tampered = tarball(TAMPERED_INDEX);
-    other.grant(&second, &tampered);
+    grant(&other, &upstream, &second, &tampered);
     let scan = socket_patch(&twin, &other, &["scan", "--mode", "hosted", "--yes"]);
     let said = &scan.dump;
     assert_eq!(scan.code, 0, "{test}: {said}");
     assert_eq!(scan.envelope["summary"]["applied"], 1, "{test}: {said}");
-    let (_, refusal) = refuses(&twin, &other, &tampered, &second.tarball);
+    let (_, refusal) = refuses(&twin, &other, &tampered, &second.package.tarball);
     assert!(
         other.asked(&second.route) > 0,
         "{test}: the patch host was not asked, so the failed build proves nothing"
@@ -474,12 +425,13 @@ fn hosted_npm_translate_lock() {
 
     println!(
         "{test}: Bazel {release} built {:?} from {origin}{} after `scan --mode hosted`; `rollback` \
-         restored all {} files and the {UNPATCHED:?} build; other bytes at the patch host failed a \
-         second machine's build ({refusal}); the stand-in answered {} requests for the upstream \
-         tarball and {} for the patched one; {:?}",
-        patch.marker,
+         restored all {} files and the {:?} build; other bytes at the patch host failed a second \
+         machine's build ({refusal}); the stand-in answered {} requests for the upstream tarball \
+         and {} for the patched one; {:?}",
+        patch.package.marker,
         patch.route,
         before.len(),
+        upstream.marker,
         standin.asked(UPSTREAM_TGZ),
         standin.asked(&patch.route),
         started.elapsed()
@@ -492,16 +444,15 @@ fn hosted_npm_translate_lock() {
 fn vendored_npm_translate_lock() {
     let test = "npm::vendored_npm_translate_lock";
     let started = Instant::now();
-    let Some((cell, standin)) = open(test) else {
+    let Some((cell, standin, upstream)) = open(test) else {
         return;
     };
     let release = cell.release().to_string();
     let patch = Patched::new();
-    standin.grant(&patch, &patch.tarball);
-    let tampered = tarball(TAMPERED_INDEX);
+    grant(&standin, &upstream, &patch, &patch.package.tarball);
 
-    // (a) The unpatched build.
-    let before = builds_unpatched(&cell);
+    // (a) The unpatched build, with the upstream tarball from the stand-in.
+    let (before, _) = builds_upstream(&cell, &standin, &upstream);
 
     // (b) The one command of vendored mode.
     let scan = socket_patch(&cell, &standin, &["scan", "--mode", "vendored", "--yes"]);
@@ -521,7 +472,7 @@ fn vendored_npm_translate_lock() {
         format!("{dir}/socket-patch.vendor.json"),
         ".socket/vendor/state.json".to_string(),
         "package.json".to_string(),
-        "pnpm-lock.yaml".to_string(),
+        LOCK.to_string(),
         "pnpm-workspace.yaml".to_string(),
     ];
     let vendored = cell.tree();
@@ -529,14 +480,15 @@ fn vendored_npm_translate_lock() {
     // The committed tarball is the one the patch host served; the lock
     // names it by path and by sum, and the override sends the package's one
     // version there.
-    assert!(vendored[&copy] == patch.tarball, "{test}: {copy} differs");
+    let committed = vendored[&copy] == patch.package.tarball;
+    assert!(committed, "{test}: {copy} differs");
     assert!(standin.asked(&patch.route) > 0, "{test}: {said}");
-    let lock = text(&vendored, "pnpm-lock.yaml");
+    let lock = text(&vendored, LOCK);
     let entry = format!(
         "  {NAME}@file:{copy}:\n    resolution: {{integrity: {}, tarball: file:{copy}}}\n",
-        integrity(&patch.tarball)
+        integrity(&patch.package.tarball)
     );
-    assert!(lock.contains(&entry), "{test}: pnpm-lock.yaml:\n{lock}");
+    assert!(lock.contains(&entry), "{test}: {LOCK}:\n{lock}");
     let manifest: Value = serde_json::from_slice(&vendored["package.json"]).expect("package.json");
     let overridden = &manifest["pnpm"]["overrides"][format!("{NAME}@{VERSION}")];
     assert_eq!(*overridden, format!("file:{copy}"), "{test}: {manifest:#}");
@@ -544,29 +496,21 @@ fn vendored_npm_translate_lock() {
     // (c) The same build, no step in between: patched, from the committed
     // file. Bazel asks the stand-in for nothing.
     let requests = standin.requests();
-    builds_patched(&cell, &vendored, &patch.marker);
+    cell.builds_patched(&vendored, &patch.package.marker);
     assert_eq!(standin.requests(), requests, "{test}: Bazel asked a host");
-    // What the checksum guards is the fetch, and this output base has
-    // fetched: other bytes in the committed file are not read, so the build
-    // neither fails nor changes. That is Bazel and the ruleset, not
-    // `socket-patch`: a release that reads the file again fails here, and
-    // then this step goes, and the caveat with it.
-    cell.write(&copy, &tampered);
-    cell.builds(&patch.marker);
-    cell.write(&copy, &patch.tarball);
 
     // (d) The undo: every file is the one of before, and so is the build.
-    let undo = ["vendor", "--revert"];
-    undoes(&cell, &standin, &before, &undo, "removed");
+    let undo = socket_patch(&cell, &standin, &["vendor", "--revert"]);
+    cell.undone(&undo, "removed", &before, &upstream.marker);
 
     // (e) A second machine and a second patch, vendored there, and then
     // other bytes in the committed file: still a tarball of the package,
     // with another sum.
-    let twin = cell.twin();
-    let other = StandIn::start();
-    route_registry(&twin, &other);
+    let mut twin = cell.twin();
+    let other = registry(&upstream);
+    route_registry(&mut twin, &other);
     let second = Patched::new();
-    other.grant(&second, &second.tarball);
+    grant(&other, &upstream, &second, &second.package.tarball);
     let scan = socket_patch(&twin, &other, &["scan", "--mode", "vendored", "--yes"]);
     let said = &scan.dump;
     assert_eq!(scan.code, 0, "{test}: {said}");
@@ -574,8 +518,9 @@ fn vendored_npm_translate_lock() {
     let second_copy = format!(".socket/vendor/npm/{}/{TGZ}", second.uuid);
     let committed = twin.tree().contains_key(&second_copy);
     assert!(committed, "{test}: no {second_copy}: {said}");
+    let tampered = tarball(TAMPERED_INDEX);
     twin.write(&second_copy, &tampered);
-    let (build, refusal) = refuses(&twin, &other, &tampered, &second.tarball);
+    let (build, refusal) = refuses(&twin, &other, &tampered, &second.package.tarball);
     assert!(
         build.stderr().contains(&format!("file:{second_copy}")),
         "{test}: the build did not fail on the committed tarball:\n{}",
@@ -584,48 +529,45 @@ fn vendored_npm_translate_lock() {
 
     println!(
         "{test}: Bazel {release} built {:?} from {copy} after `scan --mode vendored`, with no \
-         request to the stand-in, and went on building it with other bytes in that file; `vendor \
-         --revert` restored all {} files and the {UNPATCHED:?} build; other bytes in the committed \
-         tarball failed a second machine's build ({refusal}); the stand-in answered {} requests \
-         for the upstream tarball and {} for the patched one; {:?}",
-        patch.marker,
+         request to the stand-in; `vendor --revert` restored all {} files and the {:?} build; \
+         other bytes in the committed tarball failed a second machine's build ({refusal}); the \
+         stand-in answered {} requests for the upstream tarball and {} for the patched one; {:?}",
+        patch.package.marker,
         before.len(),
+        upstream.marker,
         standin.asked(UPSTREAM_TGZ),
         standin.asked(&patch.route),
         started.elapsed()
     );
 }
 
-/// Without a Bazel: the fixture's directories are those of its table, its
-/// lock pins the upstream tarball the tests serve, and the names written
-/// out above are those of the one package.
+/// Without a Bazel, what stays fixed now that no sum is committed: the
+/// fixture's directories and the legs of its workflow are those of its
+/// table; the fixture's lock holds the one entry a test pins, with the
+/// placeholder and no URL, and pinning changes nothing else; the fixture
+/// depends on the package at the version of that entry; two runs serve two
+/// upstream tarballs; and the names written out above are those of the one
+/// package.
 #[test]
-fn the_fixture_pins_the_upstream_tarball_the_tests_serve() {
+fn a_test_pins_the_one_entry_of_the_fixture_lock() {
     FIXTURE.check();
-    let path = fixture_path(FIXTURE.dir).join("common/pnpm-lock.yaml");
-    let lock = std::fs::read_to_string(&path).expect("the fixture's pnpm-lock.yaml");
-    let entry = format!(
-        "  {NAME}@{VERSION}:\n    resolution: {{integrity: {}}}\n",
-        integrity(&tarball(UPSTREAM_INDEX))
-    );
-    assert!(lock.contains(&entry), "{}: no\n{entry}", path.display());
+    let common = fixture_path(FIXTURE.dir).join("common");
+    let read = |rel: &str| std::fs::read_to_string(common.join(rel)).expect(rel);
+
+    let upstream = Package::upstream();
+    let pinned = lock_pinning(&upstream);
+    let entry = lock_entry(&integrity(&upstream.tarball));
+    assert!(pinned.contains(&entry), "no\n{entry}in\n{pinned}");
+    let unpinned = pinned.replace(&entry, &lock_entry(&placeholder()));
+    assert_eq!(unpinned, read(LOCK));
+    assert_ne!(Package::upstream().tarball, upstream.tarball);
+
+    let fixture: Value = serde_json::from_str(&read("package.json")).expect("package.json");
+    assert_eq!(fixture["dependencies"][NAME], VERSION);
     let manifest: Value = serde_json::from_str(MANIFEST).expect("the package's package.json");
     assert_eq!(manifest["name"], NAME);
     assert_eq!(manifest["version"], VERSION);
     assert_eq!(PURL, format!("pkg:npm/{NAME}@{VERSION}"));
     assert_eq!(TGZ, format!("{NAME}-{VERSION}.tgz"));
     assert_eq!(UPSTREAM_TGZ, format!("/{REGISTRY}/{NAME}/-/{TGZ}"));
-}
-
-#[test]
-fn the_downloader_option_follows_the_release() {
-    for (release, option) in [
-        ("7.7.2", "experimental_downloader_config"),
-        ("8.1.1", "experimental_downloader_config"),
-        ("8.2.0", "downloader_config"),
-        ("8.8.2", "downloader_config"),
-        ("9.3.2-homebrew", "downloader_config"),
-    ] {
-        assert_eq!(downloader_option(release), option, "{release}");
-    }
 }
