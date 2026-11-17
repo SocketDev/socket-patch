@@ -2783,3 +2783,251 @@ async fn refresh_is_not_run_by_a_hosted_to_vendored_takeover() {
         }
     }
 }
+
+/// A project whose gem went hosted, then vendored: the hosted scan
+/// replaced the project's installed copy and its gem-home archive with the
+/// patched build, and the takeover (`scan --mode vendored`) left them
+/// alone. Returns the installed gem dir and that archive.
+async fn hosted_then_vendored(server: &MockServer, proj: &Path) -> (PathBuf, PathBuf) {
+    let (patched, upstream) = (real_gem(PATCHED_LIB), real_gem(UPSTREAM_LIB));
+    mount_api_for(server, None, &sha256_of(&patched)).await;
+    serve_patched_gem(server, patched.clone()).await;
+    serve_upstream_gem(server, &upstream).await;
+    mount_vendored_grant(server, &patched).await;
+    std::fs::create_dir_all(proj).unwrap();
+    write_manifest_pair(proj);
+    let home = project_home(proj);
+    let gem_dir = install_real_gem(&home, UPSTREAM_LIB);
+    let archive = home.join("cache").join(format!("{DEP}-{DEP_VERSION}.gem"));
+
+    let uri = server.uri();
+    let (code, _, stderr) = common::run_with_env(proj, &scan_args(proj, &uri, &["--json"]), &[]);
+    assert_eq!(code, 0, "hosted scan:\n{stderr}");
+    std::fs::write(proj.join("Gemfile.lock"), converged_lock(&uri)).unwrap();
+    let (code, stdout, stderr) = unwind_run(
+        proj,
+        &uri,
+        &["scan", "--mode", "vendored", "--yes", "--json"],
+    );
+    assert_eq!(code, 0, "takeover:\n{stdout}\n{stderr}");
+    let gemfile = std::fs::read_to_string(proj.join("Gemfile")).unwrap();
+    assert!(
+        gemfile.contains(".socket/vendor/gem/"),
+        "premise:\n{gemfile}"
+    );
+    assert_eq!(installed_lib(&gem_dir), PATCHED_LIB, "premise");
+    assert_eq!(std::fs::read(&archive).unwrap(), patched, "premise");
+    (gem_dir, archive)
+}
+
+/// Run `args` in `proj` against the mock API, with rubygems.org's stand-in.
+fn unwind_run(proj: &Path, uri: &str, args: &[&str]) -> (i32, String, String) {
+    let rubygems = format!("{uri}/upstream");
+    let mut args = args.to_vec();
+    args.extend([
+        "--cwd",
+        proj.to_str().unwrap(),
+        "--api-url",
+        uri,
+        "--org",
+        ORG,
+        "--api-token",
+        "fake",
+        "--patch-server-url",
+        uri,
+    ]);
+    common::run_with_env(proj, &args, &[("SOCKET_RUBYGEMS_URL", rubygems.as_str())])
+}
+
+/// The commands that unwind a vendored gem.
+const VENDORED_UNWINDS: [&[&str]; 3] = [
+    &["rollback", "--yes"],
+    &["remove", PURL, "--yes"],
+    &["vendor", "--revert", "--yes"],
+];
+
+/// #2083: once a vendored gem is unwound, Bundler loads the installed copy
+/// again. If a hosted scan made that copy the patched build before the
+/// gem was vendored, the unwind puts the upstream gem back, as the hosted
+/// unwind does: otherwise the app keeps running the patch under an
+/// upstream lock, and `bundle pristine` fails on the upstream checksum.
+#[tokio::test(flavor = "multi_thread")]
+async fn vendored_unwind_restores_an_install_a_hosted_scan_patched() {
+    for unwind in VENDORED_UNWINDS {
+        let server = MockServer::start().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("proj");
+        let (gem_dir, archive) = hosted_then_vendored(&server, &proj).await;
+
+        let mut args = unwind.to_vec();
+        args.push("--json");
+        let (code, stdout, stderr) = unwind_run(&proj, &server.uri(), &args);
+        let env = common::parse_json_envelope(&stdout);
+        assert_eq!(code, 0, "{unwind:?}: {env}\nstderr:\n{stderr}");
+        let pair = format!(
+            "{}{}",
+            std::fs::read_to_string(proj.join("Gemfile")).unwrap(),
+            std::fs::read_to_string(proj.join("Gemfile.lock")).unwrap()
+        );
+        assert!(
+            !pair.contains(".socket/vendor/") && !pair.contains("/patch-registry/"),
+            "{unwind:?}: the gem is back on its upstream entry:\n{pair}"
+        );
+        assert_eq!(
+            installed_lib(&gem_dir),
+            UPSTREAM_LIB,
+            "{unwind:?}: the installed copy is the upstream build again: {env}"
+        );
+        assert_eq!(
+            std::fs::read(&archive).unwrap(),
+            real_gem(UPSTREAM_LIB),
+            "{unwind:?}: so is the archive `bundle pristine` reinstalls from: {env}"
+        );
+        let text = env.to_string();
+        assert!(
+            text.contains("upstream_gem_install_refreshed")
+                && !text.contains("upstream_gem_stale_install"),
+            "{unwind:?}: {env}"
+        );
+    }
+}
+
+/// The human run says what it replaced, and its "keeps its patched bytes"
+/// note no longer counts the gem.
+#[tokio::test(flavor = "multi_thread")]
+async fn vendored_unwind_reports_the_refresh_in_a_human_run() {
+    let server = MockServer::start().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    let (gem_dir, _) = hosted_then_vendored(&server, &proj).await;
+
+    let (code, stdout, stderr) = unwind_run(&proj, &server.uri(), &["rollback", "--yes"]);
+    assert_eq!(code, 0, "{stdout}\n{stderr}");
+    assert_eq!(installed_lib(&gem_dir), UPSTREAM_LIB);
+    let reverted = stdout
+        .find(&format!("Reverted vendoring for {PURL}"))
+        .unwrap_or_else(|| panic!("{stdout}"));
+    let replaced = stdout
+        .find(&format!(
+            "Replaced the installed copy of 1 gem with the upstream build: {DEP} {DEP_VERSION}."
+        ))
+        .unwrap_or_else(|| panic!("{stdout}"));
+    assert!(reverted < replaced, "{stdout}");
+    assert!(
+        !stdout.contains("patched bytes in installed trees"),
+        "nothing is left for a reinstall:\n{stdout}"
+    );
+}
+
+/// A copy the unwind may not or cannot refresh is left exactly as it was
+/// and named with a remedy that works: `--no-gem-install-refresh`, and an
+/// upstream gem that cannot be downloaded.
+#[tokio::test(flavor = "multi_thread")]
+async fn vendored_unwind_names_an_install_it_leaves_on_the_patched_build() {
+    for (unwind, opt_out) in VENDORED_UNWINDS
+        .into_iter()
+        .flat_map(|unwind| [(unwind, true), (unwind, false)])
+    {
+        let server = MockServer::start().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("proj");
+        let (gem_dir, archive) = hosted_then_vendored(&server, &proj).await;
+        let home = project_home(&proj);
+        let held_before = snapshot(&home);
+        if !opt_out {
+            // rubygems.org names the upstream sha256 but its download fails.
+            Mock::given(method("GET"))
+                .and(path(format!("/upstream/gems/{DEP}-{DEP_VERSION}.gem")))
+                .respond_with(ResponseTemplate::new(503))
+                .with_priority(1)
+                .mount(&server)
+                .await;
+        }
+
+        let mut args = unwind.to_vec();
+        args.push("--json");
+        if opt_out {
+            args.push("--no-gem-install-refresh");
+        }
+        let (code, stdout, stderr) = unwind_run(&proj, &server.uri(), &args);
+        let env = common::parse_json_envelope(&stdout);
+        let case = format!("{unwind:?} opt_out={opt_out}");
+        assert_eq!(code, 0, "{case}: {env}\nstderr:\n{stderr}");
+        assert!(
+            snapshot(&home) == held_before,
+            "{case}: the gem home changed: {env}"
+        );
+        let text = env.to_string();
+        let spec = home
+            .join("specifications")
+            .join(format!("{DEP}-{DEP_VERSION}.gemspec"));
+        for needle in [
+            "upstream_gem_stale_install",
+            gem_dir.to_str().unwrap(),
+            spec.to_str().unwrap(),
+            archive.to_str().unwrap(),
+            "bundle install",
+        ] {
+            // The envelope JSON-escapes a Windows path's backslashes.
+            let needle = needle.replace('\\', "\\\\");
+            assert!(text.contains(&needle), "{case}: no {needle:?} in {env}");
+        }
+        assert!(
+            !text.contains("upstream_gem_install_refreshed"),
+            "{case}: {env}"
+        );
+    }
+}
+
+/// A gem that was only ever vendored still has the upstream build
+/// installed: its unwind changes nothing in the gem home, downloads no
+/// gem and raises nothing about it.
+#[tokio::test(flavor = "multi_thread")]
+async fn vendored_unwind_leaves_an_upstream_install_alone() {
+    for unwind in VENDORED_UNWINDS {
+        let server = MockServer::start().await;
+        let (patched, upstream) = (real_gem(PATCHED_LIB), real_gem(UPSTREAM_LIB));
+        mount_api_for(&server, None, &sha256_of(&patched)).await;
+        serve_upstream_gem(&server, &upstream).await;
+        mount_vendored_grant(&server, &patched).await;
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        write_manifest_pair(&proj);
+        let home = project_home(&proj);
+        install_real_gem(&home, UPSTREAM_LIB);
+        let uri = server.uri();
+        let (code, stdout, stderr) = unwind_run(
+            &proj,
+            &uri,
+            &["scan", "--mode", "vendored", "--yes", "--json"],
+        );
+        assert_eq!(code, 0, "vendored scan:\n{stdout}\n{stderr}");
+        let held_before = snapshot(&home);
+        let requests_before = server.received_requests().await.unwrap_or_default().len();
+
+        let mut args = unwind.to_vec();
+        args.push("--json");
+        let (code, stdout, stderr) = unwind_run(&proj, &uri, &args);
+        let env = common::parse_json_envelope(&stdout);
+        assert_eq!(code, 0, "{unwind:?}: {env}\nstderr:\n{stderr}");
+        assert!(
+            snapshot(&home) == held_before,
+            "{unwind:?}: the gem home changed: {env}"
+        );
+        let fetched: Vec<String> = server.received_requests().await.unwrap_or_default()
+            [requests_before..]
+            .iter()
+            .map(|r| r.url.path().to_string())
+            .filter(|path| path.contains("/gems/"))
+            .collect();
+        assert!(fetched.is_empty(), "{unwind:?}: downloaded {fetched:?}");
+        let text = env.to_string();
+        for code in [
+            "upstream_gem_install_refreshed",
+            "upstream_gem_stale_install",
+        ] {
+            assert!(!text.contains(code), "{unwind:?}: {code} in {env}");
+        }
+    }
+}
