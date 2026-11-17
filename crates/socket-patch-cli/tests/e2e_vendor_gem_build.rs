@@ -783,27 +783,58 @@ fn gem_vendor_fresh_checkout_bundle_install_and_revert() {
         String::from_utf8_lossy(&clean.stdout),
         String::from_utf8_lossy(&clean.stderr),
     );
-    let clean_out = String::from_utf8_lossy(&clean.stdout).into_owned();
-    assert!(
-        clean_out.contains(&format!("Removing {DEP} ({version})")),
-        "`bundle clean` must name the leftover as stale (bundler {}):\n{clean_out}",
-        bundler.version
-    );
     let cleaned_gem_dir = cleaned.join(gem_dir.strip_prefix(&proj).unwrap());
+    let vex_cleaned = || {
+        let (code, stdout, stderr) = run_socket(
+            &cleaned,
+            &[
+                "vex",
+                "--json",
+                "--cwd",
+                cleaned.to_str().unwrap(),
+                "--output",
+                cleaned.join("out.vex.json").to_str().unwrap(),
+                "--product",
+                "pkg:gem/app@1.0.0",
+            ],
+        );
+        assert_eq!(code, 0, "vex failed.\nstdout:\n{stdout}\nstderr:\n{stderr}");
+        let env = parse_json_envelope(&stdout);
+        assert_eq!(env["status"], "success", "envelope: {env}");
+        env
+    };
+    let out_of_sync = |env: &serde_json::Value| {
+        env["warnings"]
+            .as_array()
+            .is_some_and(|w| w.iter().any(|w| w["code"] == "vendored_tree_out_of_sync"))
+    };
     let ruby_major: u32 = api
         .split('.')
         .next()
         .and_then(|major| major.parse().ok())
         .unwrap_or_else(|| panic!("unparseable ruby api version {api:?}"));
     if bundler.clean_leaves_directories(ruby_major) {
-        // #2115: this bundler cannot delete a directory on this Ruby (see
-        // `clean_leaves_directories`), so finish its removal by hand. The
-        // assertion keeps this arm from outliving the defect.
+        // #2115: this bundler decides to remove the leftover and cannot
+        // delete a non-empty directory on this Ruby (see
+        // `clean_leaves_directories`). The two assertions keep this arm from
+        // outliving the defect; `vex` keeps warning for as long as the
+        // directory is there. Then finish the removal by hand.
+        let clean_out = String::from_utf8_lossy(&clean.stdout);
+        assert!(
+            clean_out.contains(&format!("Removing {DEP} ({version})")),
+            "`bundle clean` must name the leftover as stale (bundler {}):\n{clean_out}",
+            bundler.version
+        );
         assert!(
             cleaned_gem_dir.exists(),
             "bundler {} on Ruby {api} removed {}: `clean_leaves_directories` is out of date",
             bundler.version,
             cleaned_gem_dir.display()
+        );
+        let env = vex_cleaned();
+        assert!(
+            out_of_sync(&env),
+            "the leftover this `bundle clean` could not delete is still reported: {env}"
         );
         std::fs::remove_dir_all(&cleaned_gem_dir).unwrap();
     } else {
@@ -819,27 +850,10 @@ fn gem_vendor_fresh_checkout_bundle_install_and_revert() {
         lock_wired,
         "`bundle clean` must leave Gemfile.lock byte-identical"
     );
-    let (code, stdout, stderr) = run_socket(
-        &cleaned,
-        &[
-            "vex",
-            "--json",
-            "--cwd",
-            cleaned.to_str().unwrap(),
-            "--output",
-            cleaned.join("out.vex.json").to_str().unwrap(),
-            "--product",
-            "pkg:gem/app@1.0.0",
-        ],
-    );
-    assert_eq!(code, 0, "vex failed.\nstdout:\n{stdout}\nstderr:\n{stderr}");
-    let env = parse_json_envelope(&stdout);
-    assert_eq!(env["status"], "success", "envelope: {env}");
+    let env = vex_cleaned();
     assert!(
-        env["warnings"]
-            .as_array()
-            .is_none_or(|w| w.iter().all(|w| w["code"] != "vendored_tree_out_of_sync")),
-        "nothing is out of sync after `bundle clean`: {env}"
+        !out_of_sync(&env),
+        "nothing is out of sync once the leftover is gone: {env}"
     );
 
     // 7. REVERT PROOF: both halves of the pair edit byte-restored, artifacts

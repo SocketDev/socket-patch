@@ -71,11 +71,13 @@ impl Bundler {
 
     /// `bundle clean` on this bundler, run by a Ruby of major version
     /// `ruby_major`, names a stale gem directory (`Removing rack (3.2.8)`),
-    /// exits 0 and leaves the directory on disk. The FileUtils copy bundler
-    /// vendors before 2.1 lists a directory with `Dir.entries(path, {})`;
-    /// Ruby >= 3.0 rejects the positional hash, and `rm_rf` swallows the
-    /// error. Stale files (`cache/*.gem`, `specifications/*.gemspec`) are
-    /// still deleted.
+    /// exits 0 and leaves it on disk unless it is empty. The FileUtils copy
+    /// bundler vendors before 2.1 lists a directory with a positional
+    /// options hash (`Dir.entries(path, {})` in 1.17, `Dir.children(path,
+    /// opts)` in 2.0); Ruby >= 3.0 rejects it, so the directory's contents
+    /// are never visited and `rm_rf` swallows the failed `rmdir`. 2.1 passes
+    /// `**opts`. Stale files (`cache/*.gem`, `specifications/*.gemspec`)
+    /// are still deleted.
     pub fn clean_leaves_directories(&self, ruby_major: u32) -> bool {
         !self.at_least(2, 1) && ruby_major >= 3
     }
