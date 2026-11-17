@@ -1952,6 +1952,12 @@ rewrites the lock:
 - an archive in Bundler's cache dir (`vendor/cache`, or the configured `cache_path`). It is a
   committed file: the run lists it with the files to commit.
 
+A gem that agent mode patched in place (`scan --mode agent`, `apply`) counts too. Its files are
+already the patched ones, but the archive RubyGems kept beside it is still the upstream one, and
+`bundle pristine` and `bundle install --redownload` reinstall from that archive: with a
+`CHECKSUMS` section in the lock Bundler removes the gem and fails on the checksum, without one it
+brings the unpatched gem back. So the copy and its archive are replaced like any other.
+
 They are replaced with the patched `.gem` the lock pins, checked against that sha256 first. A gem
 with a native extension is installed into a staging directory by RubyGems, with the Ruby that
 owns the installed copy, and swapped in once it has compiled; with no such Ruby, or with

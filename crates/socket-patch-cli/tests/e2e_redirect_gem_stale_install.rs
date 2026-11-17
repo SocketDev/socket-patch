@@ -2878,7 +2878,9 @@ async fn refresh_replaces_the_upstream_archive_beside_an_agent_patched_install()
     let (code, _, stderr) = common::run_with_env(&proj, &scan_args(&proj, &uri, &[]), &[]);
     assert_eq!(code, 0, "{stderr}");
     assert!(
-        !stderr.contains("Replaced") && !stderr.contains("Warning"),
+        !stderr.contains("Replaced")
+            && !stderr.contains("upstream archive")
+            && !stderr.contains("still unpatched"),
         "{stderr}"
     );
 

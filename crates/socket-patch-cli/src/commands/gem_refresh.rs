@@ -95,6 +95,10 @@ pub(crate) struct StaleGem {
     pub(crate) installed: Option<(PathBuf, bool)>,
     /// The stale archive in Bundler's cache dir.
     pub(crate) cache_archive: Option<PathBuf>,
+    /// The installed files already hold the patch (agent mode patched them
+    /// in place); what is stale is the upstream archive RubyGems kept
+    /// beside them, `<home>/cache/<leaf>.gem`.
+    pub(crate) in_place: bool,
 }
 
 /// What the run may refresh.
@@ -179,6 +183,9 @@ pub(crate) struct Attempt {
     pub(crate) refreshed: Vec<(String, Target)>,
     /// Why a target the pass did not refresh is as it was, by its path.
     left: BTreeMap<PathBuf, Why>,
+    /// The installed dirs among the targets whose files were patched in
+    /// place ([`StaleGem::in_place`]).
+    in_place: BTreeSet<PathBuf>,
 }
 
 impl Attempt {
@@ -219,6 +226,9 @@ pub(crate) async fn attempt(
     let mut out = Attempt::default();
     let mut by_leaf: BTreeMap<&str, LeafRefresh<'_>> = BTreeMap::new();
     for gem in gems {
+        if let (true, Some((dir, _))) = (gem.in_place, &gem.installed) {
+            out.in_place.insert(dir.clone());
+        }
         let mut targets = Vec::new();
         let candidates = [
             gem.installed
@@ -331,6 +341,12 @@ fn files_to_remove(gem: &StaleGem) -> Vec<PathBuf> {
     files
 }
 
+/// What the upstream archive beside an in-place patch does once the lock
+/// pins the patched gem.
+const IN_PLACE_REINSTALL: &str = "`bundle pristine` and `bundle install --redownload` reinstall \
+     from that archive: with a `CHECKSUMS` section in the lock Bundler removes the gem and fails \
+     on the checksum, without one it brings the unpatched gem back";
+
 fn display_list(paths: &[PathBuf]) -> String {
     paths
         .iter()
@@ -373,6 +389,35 @@ pub(crate) fn stale_detail(direction: Direction, gem: &StaleGem, why: Option<&Wh
     let (stale, wanted) = (direction.stale(), direction.wanted());
     let reuse =
         format!("`bundle install` reuses an installed gem instead of fetching the {wanted} one");
+    if let (true, Some((dir, project_local))) = (gem.in_place, &gem.installed) {
+        let archive = home_cache_archive(dir).unwrap_or_default();
+        let held = format!(
+            "{purl} {switched}, but the copy patched in place at {} still has its upstream \
+             archive at {}",
+            dir.display(),
+            archive.display()
+        );
+        return if !project_local && !matches!(why, Some(Why::Disabled | Why::Failed(_))) {
+            format!(
+                "{held}. {IN_PLACE_REINSTALL}. Other projects may load that shared gem home, so \
+                 it was left alone. Install the {wanted} gem for this project only with \
+                 `{LOCAL_PATH_REMEDY}`, or re-run with `--gem-refresh-shared` to replace the \
+                 shared copy"
+            )
+        } else {
+            format!(
+                "{held}, which was not replaced{}. {IN_PLACE_REINSTALL}. {}",
+                reason(why),
+                after_hint(
+                    retry_hint(direction, why),
+                    &format!(
+                        "remove {} and run `bundle install`",
+                        display_list(&files_to_remove(gem))
+                    )
+                ),
+            )
+        };
+    }
     match &gem.installed {
         Some((dir, false)) if !matches!(why, Some(Why::Disabled | Why::Failed(_))) => format!(
             "{purl} {switched}, but the shared gem home still holds its {stale} install at \
@@ -495,19 +540,23 @@ pub(crate) fn report(
     let (mut installed, mut archives) = (Vec::new(), Vec::new());
     for (purl, target) in &attempt.refreshed {
         let what = match target {
-            Target::Installed(_) => {
+            Target::Installed(dir) => {
                 installed.push(purl.as_str());
-                "install"
+                if attempt.in_place.contains(dir) {
+                    "install patched in place (and its upstream archive)".to_string()
+                } else {
+                    format!("{stale_word} install")
+                }
             }
             Target::CacheArchive(_) => {
                 archives.push(purl.as_str());
-                "archive"
+                format!("{stale_word} archive")
             }
         };
         out.warnings.push((
             code,
             format!(
-                "{purl}: {would} the {stale_word} {what} at {} with the {wanted} gem",
+                "{purl}: {would} the {what} at {} with the {wanted} gem",
                 target.path().display()
             ),
         ));
@@ -557,6 +606,14 @@ pub(crate) fn report(
         .collect::<BTreeSet<_>>()
         .len();
     let headline = match direction {
+        Direction::Patched if stale.iter().all(|gem| gem.in_place) => format!(
+            "{} on disk after the switch to hosted patches",
+            plural(
+                count,
+                "gem patched in place still has its upstream archive",
+                "gems patched in place still have their upstream archives"
+            )
+        ),
         Direction::Patched => format!(
             "{} still unpatched on disk after the switch to hosted patches",
             plural(count, "gem is", "gems are")
@@ -652,6 +709,7 @@ async fn stale_after_restore(
                     leaf,
                     installed: Some((pkg.path.clone(), home.project_local)),
                     cache_archive: None,
+                    in_place: false,
                 }),
                 _ => {}
             }
@@ -669,6 +727,7 @@ async fn stale_after_restore(
                 leaf,
                 installed: None,
                 cache_archive: Some(archive),
+                in_place: false,
             }),
             _ => {}
         }
@@ -793,6 +852,7 @@ mod tests {
             leaf: format!("{name}-1.0.0"),
             installed: Some((dir, project_local)),
             cache_archive: None,
+            in_place: false,
         }
     }
 
@@ -933,7 +993,7 @@ mod tests {
                     Target::CacheArchive(PathBuf::from("vendor/cache/rack-2.2.3.gem")),
                 ),
             ],
-            left: BTreeMap::new(),
+            ..Attempt::default()
         };
         let root = Path::new(".");
         let out = report(
@@ -975,6 +1035,88 @@ mod tests {
         assert!(out.warnings.iter().all(|(code, detail)| *code
             == "upstream_gem_install_would_refresh"
             && detail.contains("would replace the patched")));
+    }
+
+    /// A copy agent mode patched in place is stale by its upstream archive
+    /// only (#2089), and every message says so: the dry-run note, the
+    /// warning of a copy left alone, and the headline when no gem under it
+    /// is actually unpatched.
+    #[tokio::test]
+    async fn in_place_patched_gems_are_never_called_unpatched() {
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("proj");
+        let in_place = |name: &str, home: &Path, project_local: bool| StaleGem {
+            in_place: true,
+            ..installed(name, home, project_local)
+        };
+        let local = in_place("rack", &proj.join("vendor/bundle/ruby/3.4.0"), true);
+        let shared_home = tmp.path().join("gemhome");
+        let shared = in_place("rexml", &shared_home, false);
+        let gems = vec![local.clone(), shared.clone()];
+
+        // A dry run plans the project's own copy.
+        let dry = policy(&proj, true, false, true);
+        let out = report(Direction::Patched, &[], &pass(&gems, &dry).await, &dry);
+        assert_eq!(out.warnings.len(), 1, "{:?}", out.warnings);
+        assert!(
+            out.warnings[0].1.contains(
+                "would replace the install patched in place (and its upstream archive) at"
+            ),
+            "{}",
+            out.warnings[0].1
+        );
+
+        // Refresh off: both are left, each with its own remedy.
+        let off = policy(&proj, false, false, false);
+        let out = report(Direction::Patched, &gems, &pass(&gems, &off).await, &off);
+        let summary = out.summary.expect("a summary");
+        assert_eq!(
+            summary.headline,
+            "2 gems patched in place still have their upstream archives on disk after the \
+             switch to hosted patches"
+        );
+        assert_eq!(out.warnings.len(), 2);
+        for (_, detail) in &out.warnings {
+            assert!(
+                detail.contains("patched in place")
+                    && detail.contains("upstream archive at")
+                    && detail.contains("`bundle pristine`")
+                    && !detail.contains("unpatched install"),
+                "{detail}"
+            );
+        }
+        let of = |gem: &StaleGem| {
+            let needle = gem.purl.as_str();
+            out.warnings
+                .iter()
+                .find(|(_, detail)| detail.starts_with(needle))
+                .map(|(_, detail)| detail.clone())
+                .unwrap()
+        };
+        let cache = home_cache_archive(&local.installed.as_ref().unwrap().0).unwrap();
+        assert!(
+            of(&local).contains("`--no-gem-install-refresh` is set")
+                && of(&local).contains(&format!("{}", cache.display()))
+                && of(&local).ends_with("and run `bundle install`"),
+            "{}",
+            of(&local)
+        );
+        assert!(
+            of(&shared).contains("`--gem-refresh-shared`")
+                && of(&shared).contains(LOCAL_PATH_REMEDY)
+                && !of(&shared).to_lowercase().contains("remove "),
+            "a shared home never gets a delete list: {}",
+            of(&shared)
+        );
+
+        // Beside a gem that is unpatched, the usual headline stands.
+        let mixed = vec![local, installed("puma", &shared_home, false)];
+        let out = report(Direction::Patched, &mixed, &pass(&mixed, &off).await, &off);
+        assert!(out
+            .summary
+            .expect("a summary")
+            .headline
+            .starts_with("2 gems are still unpatched on disk"),);
     }
 
     /// What a pass may replace: the project's own copies; a shared home, or
