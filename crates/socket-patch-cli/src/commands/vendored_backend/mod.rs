@@ -52,8 +52,6 @@ pub(crate) struct VendoredBackend<'a> {
     pub(crate) service: Option<&'a VendorServiceConfig>,
     /// See [`VendoredBackend::with_closing_lines`].
     pub(crate) closing_lines: Option<&'a ClosingLines<'a>>,
-    /// See [`VendoredBackend::dropping_manifest_records`].
-    pub(crate) drops_manifest_records: bool,
 }
 
 /// Lines for the human close of a vendor run to print under its summary
@@ -92,19 +90,7 @@ impl<'a> VendoredBackend<'a> {
             common: common.at_project_root(),
             service,
             closing_lines: None,
-            drops_manifest_records: false,
         }
-    }
-
-    /// The caller removes the `.socket/manifest.json` record of every
-    /// package [`VendoredBackend::revert`] unwinds, without restoring the
-    /// files that record patched in place (`rollback` and `remove` leave a
-    /// vendored package to the vendored unwind alone). The unwind's gem
-    /// refresh then treats such a record as one the unwind ends: an
-    /// installed copy holding its patch is put back on the upstream gem.
-    pub(crate) fn dropping_manifest_records(mut self) -> Self {
-        self.drops_manifest_records = true;
-        self
     }
 
     /// Have [`VendoredBackend::apply`]'s human close print what `lines`
@@ -294,7 +280,7 @@ impl<'a> VendoredBackend<'a> {
         };
         let (first, last) = (*first, unwound[unwound.len() - 1].0);
         let purls: Vec<String> = unwound.iter().map(|(_, purl)| purl.clone()).collect();
-        let records = self.ended_records(&purls, records).await;
+        let records = self.ended_records(records).await;
         let records = &records;
         let refresh =
             crate::commands::gem_refresh::after_vendored_unwind(&self.common, &purls, records)
@@ -330,45 +316,33 @@ impl<'a> VendoredBackend<'a> {
     }
 
     /// The patch record each unwound gem's installed copies are judged by:
-    /// the one this unwind ends, after which nothing records an in-place
-    /// patch of the gem. For a gem `.socket/manifest.json` has no record
-    /// for, that is the ledger's own (`ledger`, from a detached entry). A
-    /// manifest record means the in-place patch is agent mode's: the
-    /// record is the one judged by when the caller drops it
-    /// ([`Self::dropping_manifest_records`]), and the gem is not judged at
-    /// all when it stays (`vendor --revert` leaves the patch applied and
-    /// on record). A manifest that cannot be read proves nothing, so no
-    /// gem is judged then.
+    /// `ledger` (the records of detached entries, which the ledger alone
+    /// owned) without the gems `.socket/manifest.json` has a record for.
+    /// The in-place patch of such a gem is agent mode's and on record
+    /// there, so this unwind does not end it. A manifest that cannot be
+    /// read proves nothing, so no gem is judged then.
     async fn ended_records(
         &self,
-        unwound: &[String],
         ledger: &std::collections::BTreeMap<String, PatchRecord>,
     ) -> std::collections::BTreeMap<String, PatchRecord> {
-        use socket_patch_core::utils::purl::strip_purl_qualifiers;
+        use socket_patch_core::utils::purl_key::PurlKey;
+        if ledger.is_empty() {
+            return Default::default();
+        }
         let manifest = socket_patch_core::manifest::operations::read_manifest(
             &self.common.resolved_manifest_path(),
         )
         .await;
-        let manifest = match manifest {
-            Ok(Some(manifest)) => manifest,
-            Ok(None) => return ledger.clone(),
+        let in_manifest: std::collections::HashSet<PurlKey> = match manifest {
+            Ok(Some(manifest)) => manifest.patches.keys().map(|k| PurlKey::new(k)).collect(),
+            Ok(None) => Default::default(),
             Err(_) => return Default::default(),
         };
-        let mut out = ledger.clone();
-        for (purl, record) in &manifest.patches {
-            let base = strip_purl_qualifiers(purl);
-            let Some(gem) = unwound
-                .iter()
-                .find(|gem| strip_purl_qualifiers(gem) == base)
-            else {
-                continue;
-            };
-            out.remove(gem);
-            if self.drops_manifest_records {
-                out.insert(gem.clone(), record.clone());
-            }
-        }
-        out
+        ledger
+            .iter()
+            .filter(|(purl, _)| !in_manifest.contains(&PurlKey::new(purl)))
+            .map(|(purl, record)| (purl.clone(), record.clone()))
+            .collect()
     }
 
     /// Dropping a vendored Go `replace` leaves a committed

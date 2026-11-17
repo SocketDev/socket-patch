@@ -1122,6 +1122,20 @@ pub(super) async fn upstream_archive(
     })
 }
 
+/// Whether the lock at `root` resolves the ruby-platform gem `purl` from
+/// rubygems.org ([`rubygems_locked`]). `false` with no readable lock.
+pub(super) async fn resolves_from_rubygems(root: &std::path::Path, purl: &str) -> bool {
+    let Some((_, name, version)) = crate::utils::purl::purl_parts(purl) else {
+        return false;
+    };
+    for file in BUNDLER_LOCKS {
+        if let Ok(text) = crate::utils::fs::read_regular_to_string(&root.join(file)).await {
+            return rubygems_locked(&to_lf(&text), &name, &version);
+        }
+    }
+    false
+}
+
 /// Whether `lock` resolves `name (version)` from a `GEM` section whose
 /// remote is rubygems.org (or the `SOCKET_RUBYGEMS_URL` stand-in).
 fn rubygems_locked(lock: &str, name: &str, version: &str) -> bool {

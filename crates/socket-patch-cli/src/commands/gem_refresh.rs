@@ -997,7 +997,9 @@ async fn refresh_restored(
     records: &BTreeMap<String, PatchRecord>,
     scope: Scope,
 ) -> RestoreRefresh {
-    use socket_patch_core::patch::redirect::upstream::{gem_upstream_archive, UpstreamArchive};
+    use socket_patch_core::patch::redirect::upstream::{
+        gem_resolves_from_rubygems, gem_upstream_archive, UpstreamArchive,
+    };
     use socket_patch_core::vendor::registry_fetch::SecureRegistryClient;
 
     let policy = Policy::of(common);
@@ -1008,10 +1010,11 @@ async fn refresh_restored(
     // with why: their installed copies are reported, not passed over.
     let mut unverified: BTreeMap<String, String> = BTreeMap::new();
     // The records an installed copy is judged by as well: those of the
-    // gems known to be back on their upstream entries. A copy holding its
-    // record's patch is stale even when nothing proves the upstream
-    // sha256 (`--offline` under a lock without `CHECKSUMS`): it is then
-    // reported, not refreshed.
+    // gems the lock resolves from rubygems.org, which are back on their
+    // upstream entries. A copy holding its record's patch is stale even
+    // when nothing proves the upstream sha256 (`--offline` or a registry
+    // error, under a lock without `CHECKSUMS`): it is then reported, not
+    // refreshed.
     let mut judged: BTreeMap<String, PatchRecord> = BTreeMap::new();
     for purl in restored
         .iter()
@@ -1031,11 +1034,9 @@ async fn refresh_restored(
                 }
                 shas.insert(purl.clone(), Some(sha256));
                 urls.insert(purl.clone(), url);
-                judged.extend(
-                    records
-                        .get_key_value(purl)
-                        .map(|(k, v)| (k.clone(), v.clone())),
-                );
+                if let Some(record) = records.get(purl) {
+                    judged.insert(purl.clone(), record.clone());
+                }
             }
             // (Only a gem the lock resolves from rubygems.org comes back
             // unverified, so the vendored unwind's rule holds for it too.)
@@ -1043,11 +1044,11 @@ async fn refresh_restored(
                 unverified.insert(purl.clone(), why);
             }
             None => {
-                judged.extend(
-                    records
-                        .get_key_value(purl)
-                        .map(|(k, v)| (k.clone(), v.clone())),
-                );
+                if let Some(record) = records.get(purl) {
+                    if gem_resolves_from_rubygems(&common.cwd, purl).await {
+                        judged.insert(purl.clone(), record.clone());
+                    }
+                }
             }
         }
     }
