@@ -1411,6 +1411,7 @@ async fn revert_vendored_matches(
     for RevertedEntry {
         key,
         warnings,
+        progress,
         step,
         ..
     } in reverted
@@ -1523,6 +1524,12 @@ async fn revert_vendored_matches(
                     e,
                 );
                 return Err(1);
+            }
+        }
+        if loud {
+            for line in &progress {
+                println!("{line}");
+                leg.printed = true;
             }
         }
     }

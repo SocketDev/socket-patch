@@ -1958,7 +1958,10 @@ owns the installed copy, and swapped in once it has compiled; with no such Ruby,
 `--no-gem-native-rebuild`, it is left alone. After the scan `bundle exec` runs the patched code,
 and every kind of reinstall keeps it. `rollback` and `remove` do the same with the upstream gem.
 Vendoring a gem that was hosted (`vendor`, `scan --mode vendored`) leaves the installed copies as
-they are: Bundler loads the vendored copy from then on.
+they are: Bundler loads the vendored copy from then on. When that vendored gem is later unwound
+(`rollback`, `remove`, `vendor --revert`), Bundler loads the installed copy again, so the unwind
+puts the upstream gem back there too. A gem that was only ever vendored still has the upstream
+build installed, and its unwind changes nothing in the gem home.
 
 Nothing is changed when the patched gem cannot be downloaded or verified: the run still exits 0
 and warns (`redirect_gem_stale_install`), naming the files to remove by hand. `--dry-run` only

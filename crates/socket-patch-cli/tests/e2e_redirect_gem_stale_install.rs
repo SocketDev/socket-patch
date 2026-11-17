@@ -2892,31 +2892,42 @@ async fn vendored_unwind_restores_an_install_a_hosted_scan_patched() {
     }
 }
 
-/// The human run says what it replaced, and its "keeps its patched bytes"
-/// note no longer counts the gem.
+/// The human run says what it replaced, after its own line for the gem,
+/// and rollback's "keeps its patched bytes" note no longer counts the gem.
 #[tokio::test(flavor = "multi_thread")]
 async fn vendored_unwind_reports_the_refresh_in_a_human_run() {
-    let server = MockServer::start().await;
-    let tmp = tempfile::tempdir().unwrap();
-    let proj = tmp.path().join("proj");
-    let (gem_dir, _) = hosted_then_vendored(&server, &proj).await;
+    let own_lines = [
+        format!("Reverted vendoring for {PURL}"),
+        format!("Reverted vendoring for {PURL}"),
+        "Reverted 1 vendored package".to_string(),
+    ];
+    for (unwind, own_line) in VENDORED_UNWINDS.into_iter().zip(own_lines) {
+        let server = MockServer::start().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("proj");
+        let (gem_dir, _) = hosted_then_vendored(&server, &proj).await;
 
-    let (code, stdout, stderr) = unwind_run(&proj, &server.uri(), &["rollback", "--yes"]);
-    assert_eq!(code, 0, "{stdout}\n{stderr}");
-    assert_eq!(installed_lib(&gem_dir), UPSTREAM_LIB);
-    let reverted = stdout
-        .find(&format!("Reverted vendoring for {PURL}"))
-        .unwrap_or_else(|| panic!("{stdout}"));
-    let replaced = stdout
-        .find(&format!(
+        let (code, stdout, stderr) = unwind_run(&proj, &server.uri(), unwind);
+        assert_eq!(code, 0, "{unwind:?}: {stdout}\n{stderr}");
+        assert_eq!(installed_lib(&gem_dir), UPSTREAM_LIB, "{unwind:?}");
+        let replaced = format!(
             "Replaced the installed copy of 1 gem with the upstream build: {DEP} {DEP_VERSION}."
-        ))
-        .unwrap_or_else(|| panic!("{stdout}"));
-    assert!(reverted < replaced, "{stdout}");
-    assert!(
-        !stdout.contains("patched bytes in installed trees"),
-        "nothing is left for a reinstall:\n{stdout}"
-    );
+        );
+        assert_eq!(stdout.matches(&replaced).count(), 1, "{unwind:?}: {stdout}");
+        assert!(stdout.contains(&own_line), "{unwind:?}: {stdout}");
+        if unwind[0] != "vendor" {
+            assert!(
+                stdout.find(&own_line) < stdout.find(&replaced),
+                "{unwind:?}: {stdout}"
+            );
+        }
+        assert!(
+            !stdout.contains("patched bytes in installed trees")
+                && !stderr.contains("upstream_gem")
+                && !stderr.contains("Warning:"),
+            "{unwind:?}: nothing is left to warn about:\n{stdout}\n{stderr}"
+        );
+    }
 }
 
 /// A copy the unwind may not or cannot refresh is left exactly as it was
@@ -2976,6 +2987,43 @@ async fn vendored_unwind_names_an_install_it_leaves_on_the_patched_build() {
             !text.contains("upstream_gem_install_refreshed"),
             "{case}: {env}"
         );
+    }
+}
+
+/// The human run of the same: one warning with the remedy as a command,
+/// and rollback's reinstall note still counts the gem.
+#[tokio::test(flavor = "multi_thread")]
+async fn vendored_unwind_warns_once_in_a_human_run() {
+    for unwind in VENDORED_UNWINDS {
+        let server = MockServer::start().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("proj");
+        let (gem_dir, archive) = hosted_then_vendored(&server, &proj).await;
+
+        let mut args = unwind.to_vec();
+        args.push("--no-gem-install-refresh");
+        let (code, stdout, stderr) = unwind_run(&proj, &server.uri(), &args);
+        assert_eq!(code, 0, "{unwind:?}: {stdout}\n{stderr}");
+        assert_eq!(installed_lib(&gem_dir), PATCHED_LIB, "{unwind:?}");
+        let warning = "Warning: 1 gem still holds the patched build on disk after the switch \
+                       back to the upstream registry";
+        assert_eq!(stderr.matches(warning).count(), 1, "{unwind:?}: {stderr}");
+        assert!(
+            stderr.contains(&format!("rm -f {}", project_home(&proj).display()))
+                && stderr.contains(&format!("{} && bundle install", archive.display())),
+            "{unwind:?}: {stderr}"
+        );
+        assert!(
+            !stderr.contains("Re-run"),
+            "{unwind:?}: a second unwind has nothing to unwind: {stderr}"
+        );
+        assert!(!stdout.contains("Replaced the installed copy"), "{stdout}");
+        if unwind[0] == "rollback" {
+            assert!(
+                stdout.contains("1 unwired package keeps its patched bytes"),
+                "{stdout}"
+            );
+        }
     }
 }
 

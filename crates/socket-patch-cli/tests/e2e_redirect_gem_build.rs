@@ -5613,6 +5613,130 @@ async fn gem_vendored_unwind_names_a_patched_archive_in_vendor_cache() {
     }
 }
 
+/// #2083 through one vendored unwind `command`: the project installed the
+/// hosted pin, so its installed gem and the archive RubyGems keeps beside
+/// it are the PATCHED build. A hosted → vendored takeover leaves them (the
+/// vendored copy is loaded instead), and the later unwind puts the pair
+/// back on the upstream `GEM` entry, where bundler loads the installed
+/// copy again. The unwind must put the upstream gem back: the app then
+/// loads the upstream code, and every kind of reinstall succeeds and
+/// keeps it.
+fn vendored_unwind_restores_the_installed_gem(fx: &RedirectFixture, command: &str) {
+    let dir = stage_fresh_checkout(fx, &format!("vendored-install-{command}"));
+    let install = bundle(&dir, &["install"]);
+    assert!(
+        install.status.success(),
+        "{command}: hosted install:\n{}",
+        String::from_utf8_lossy(&install.stderr)
+    );
+    let installed = fresh_installed_lib(&dir, &format!("{DEP}-{DEP_VERSION}"), "vuln_gem.rb");
+    assert!(
+        std::fs::read(&installed).unwrap() == patched_lib().into_bytes(),
+        "{command}: premise"
+    );
+
+    let api = fx._server.uri();
+    let upstream = format!("{api}/upstream");
+    let cwd = dir.to_str().expect("utf8 tmp path");
+    let common = [
+        "--json",
+        "--cwd",
+        cwd,
+        "--api-url",
+        &api,
+        "--org",
+        ORG,
+        "--api-token",
+        "fake",
+        "--patch-server-url",
+        &api,
+    ];
+    let envs = [("SOCKET_RUBYGEMS_URL", upstream.as_str())];
+    let mut takeover = vec!["get", UUID, "--mode", "vendored", "--yes"];
+    takeover.extend(common);
+    let (code, stdout, stderr) = run_socket_env(&dir, &takeover, &envs);
+    assert_eq!(
+        code, 0,
+        "{command}: takeover:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    let vendored = bundle(&dir, &["install"]);
+    assert!(
+        vendored.status.success(),
+        "{command}: vendored install:\n{}",
+        String::from_utf8_lossy(&vendored.stderr)
+    );
+    assert!(
+        std::fs::read(&installed).unwrap() == patched_lib().into_bytes(),
+        "{command}: premise: the takeover and its install leave the installed copy"
+    );
+
+    let mut argv: Vec<&str> = match command {
+        "vendor --revert" => vec!["vendor", "--revert", "--yes"],
+        "remove" => vec!["remove", PURL, "--yes"],
+        _ => vec![command, PURL],
+    };
+    argv.extend(common);
+    let (code, stdout, stderr) = run_socket_env(&dir, &argv, &envs);
+    let env: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_else(|e| {
+        panic!("{command}: not JSON: {e}\nstdout:\n{stdout}\nstderr:\n{stderr}")
+    });
+    assert_eq!(code, 0, "{command}: {env}\nstderr:\n{stderr}");
+    assert!(
+        env.to_string().contains("upstream_gem_install_refreshed")
+            && !env.to_string().contains("upstream_gem_stale_install"),
+        "{command}: {env}"
+    );
+    assert!(
+        std::fs::read(&installed).unwrap() == orig_lib().into_bytes(),
+        "{command}: the installed copy is the upstream build again: {env}"
+    );
+
+    let redownload = if fx.bundler.at_least(2, 0) {
+        "--redownload"
+    } else {
+        "--force"
+    };
+    let probe = "require \"vuln_gem\"; print VulnGem.status";
+    for args in [&["install"][..], &["install", redownload], &["pristine"]] {
+        let out = bundle(&dir, args);
+        assert!(
+            out.status.success(),
+            "{command}: bundle {args:?} after the unwind:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let run = bundle(&dir, &["exec", "ruby", "-e", probe]);
+        assert_eq!(
+            String::from_utf8_lossy(&run.stdout),
+            "VULNERABLE",
+            "{command}: bundle {args:?} leaves the upstream code loaded:\n{}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "host capstone: shells out to a real ruby/gem/bundler (>= 1.17); the unpinned `test` \
+            job skips it, an e2e job with a pinned toolchain runs it via --ignored"]
+async fn gem_vendored_unwind_restores_an_install_the_hosted_scan_patched() {
+    let Some(fx) = redirect_scanned_project(
+        "vendored-install-unwind",
+        Spelling::Gemfile,
+        false,
+        true,
+        None,
+        Driver::ScanVex,
+    )
+    .await
+    else {
+        return;
+    };
+    mount_vendored_grant(&fx).await;
+    for command in ["remove", "rollback", "vendor --revert"] {
+        vendored_unwind_restores_the_installed_gem(&fx, command);
+    }
+}
+
 /// #1831: a hosted redirect over a CRLF Gemfile (a Windows checkout, or
 /// `core.autocrlf=true`) keeps it CRLF throughout: the edit is the option
 /// alone, the real bundler installs the pair frozen and has nothing to

@@ -339,10 +339,13 @@ fn display_list(paths: &[PathBuf]) -> String {
         .join(", ")
 }
 
-/// How a refresh that did not happen is retried.
+/// How a refresh that did not happen is retried. An unwind can't be: its
+/// first run removed the wiring a second one would look for.
 fn retry_hint(direction: Direction, why: Option<&Why>) -> &'static str {
     match (why, direction) {
-        (Some(Why::Disabled), _) => "Re-run without `--no-gem-install-refresh`, or ",
+        (Some(Why::Disabled), Direction::Patched) => {
+            "Re-run without `--no-gem-install-refresh`, or "
+        }
         (Some(Why::Failed(_)), Direction::Patched) => "Re-run `socket-patch scan` to retry, or ",
         _ => "",
     }
@@ -603,35 +606,24 @@ pub(crate) fn report(
     out
 }
 
-/// The stale materializations of the gems a hosted unwind just put back on
-/// their upstream entries, judged like the hosted scan's guard, with the
-/// roles swapped: an installed copy (ruby platform) is stale when the
-/// archive RubyGems installed it from, `<home>/cache/<leaf>.gem`, is
-/// readable and is not the upstream one, and so is such an archive in
-/// Bundler's cache dir. `upstream` is each purl's upstream sha256; a purl
-/// without one is not judged.
-async fn stale_after_restore(
-    common: &GlobalArgs,
-    upstream: &BTreeMap<String, String>,
-) -> Vec<StaleGem> {
+/// The installed copies (ruby platform) of `purls` in the gem homes Bundler
+/// installs the project's gems into, each with the archive RubyGems
+/// installed it from, `<home>/cache/<leaf>.gem`.
+async fn installed_with_archives(common: &GlobalArgs, purls: &[String]) -> Vec<InstalledCopy> {
     use socket_patch_core::crawlers::types::CrawlerOptions;
     use socket_patch_core::crawlers::RubyCrawler;
-    use socket_patch_core::vendor::file_sha256_hex;
 
-    let purls: Vec<String> = upstream.keys().cloned().collect();
     let crawler = RubyCrawler::new();
     let options = CrawlerOptions {
         cwd: common.cwd.clone(),
         global: common.global,
         global_prefix: common.global_prefix.clone(),
     };
-    let app_cache =
-        socket_patch_core::crawlers::ruby_crawler::bundler_app_cache_dir(&common.cwd).await;
     let mut out = Vec::new();
     for home in crawler.bundler_install_homes(&options).await {
-        let found = crawler.find_each_by_purl(&home.gems_dir, &purls).await;
+        let found = crawler.find_each_by_purl(&home.gems_dir, purls).await;
         for (purl, pkg) in purls.iter().zip(found) {
-            let (Some(pkg), Some(sha)) = (pkg, upstream.get(purl)) else {
+            let Some(pkg) = pkg else {
                 continue;
             };
             let Some((_, name, version)) = socket_patch_core::utils::purl::purl_parts(purl) else {
@@ -646,17 +638,71 @@ async fn stale_after_restore(
             let Some(archive) = home_cache_archive(&pkg.path) else {
                 continue;
             };
-            match file_sha256_hex(&archive).await {
-                Some(got) if &got != sha => out.push(StaleGem {
-                    purl: purl.clone(),
-                    leaf,
-                    installed: Some((pkg.path.clone(), home.project_local)),
-                    cache_archive: None,
-                }),
-                _ => {}
-            }
+            out.push(InstalledCopy {
+                purl: purl.clone(),
+                leaf,
+                dir: pkg.path.clone(),
+                project_local: home.project_local,
+                archive,
+            });
         }
     }
+    out
+}
+
+/// One installed copy [`installed_with_archives`] found.
+struct InstalledCopy {
+    purl: String,
+    leaf: String,
+    dir: PathBuf,
+    project_local: bool,
+    archive: PathBuf,
+}
+
+/// Which materializations an unwind's refresh covers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Scope {
+    /// Installed copies and the archives in Bundler's cache dir.
+    All,
+    /// Installed copies only.
+    Installed,
+}
+
+/// The stale materializations of the gems an unwind just put back on
+/// their upstream entries, judged like the hosted scan's guard, with the
+/// roles swapped: an installed copy (ruby platform) is stale when the
+/// archive RubyGems installed it from, `<home>/cache/<leaf>.gem`, is
+/// readable and is not the upstream one, and so is (in [`Scope::All`])
+/// such an archive in Bundler's cache dir. `upstream` is each purl's
+/// upstream sha256; a purl without one is not judged.
+async fn stale_after_restore(
+    common: &GlobalArgs,
+    upstream: &BTreeMap<String, String>,
+    scope: Scope,
+) -> Vec<StaleGem> {
+    use socket_patch_core::vendor::file_sha256_hex;
+
+    let purls: Vec<String> = upstream.keys().cloned().collect();
+    let mut out = Vec::new();
+    for copy in installed_with_archives(common, &purls).await {
+        let Some(sha) = upstream.get(&copy.purl) else {
+            continue;
+        };
+        match file_sha256_hex(&copy.archive).await {
+            Some(got) if &got != sha => out.push(StaleGem {
+                purl: copy.purl,
+                leaf: copy.leaf,
+                installed: Some((copy.dir, copy.project_local)),
+                cache_archive: None,
+            }),
+            _ => {}
+        }
+    }
+    if scope == Scope::Installed {
+        return out;
+    }
+    let app_cache =
+        socket_patch_core::crawlers::ruby_crawler::bundler_app_cache_dir(&common.cwd).await;
     for (purl, sha) in upstream {
         let Some((_, name, version)) = socket_patch_core::utils::purl::purl_parts(purl) else {
             continue;
@@ -676,7 +722,8 @@ async fn stale_after_restore(
     out
 }
 
-/// What the hosted unwind's refresh did, for [`crate::commands::hosted_unwind`].
+/// What an unwind's refresh did, for [`crate::commands::hosted_unwind`]
+/// and the vendored unwind ([`crate::commands::vendored_backend`]).
 #[derive(Debug, Default)]
 pub(crate) struct RestoreRefresh {
     pub(crate) report: Report,
@@ -699,6 +746,42 @@ pub(crate) async fn after_restore(
     restored: &[String],
     staged: &BTreeMap<String, Option<String>>,
 ) -> RestoreRefresh {
+    refresh_restored(common, restored, staged, Scope::All).await
+}
+
+/// After a wet vendored unwind put the gems `unwound` back on their
+/// upstream entries (the lock on disk says so): Bundler loads their
+/// installed copies again, and a copy that a hosted scan replaced with the
+/// patched build before the gem was vendored is still that build (#2083).
+/// Those copies are brought back to the upstream gem exactly as
+/// [`after_restore`] does it. An archive in Bundler's cache dir is not
+/// touched: the vendored unwind names it (`upstream_gem_stale_cache`).
+///
+/// A gem with no installed copy to judge costs no registry lookup: a
+/// vendored unwind then needs no network, as before.
+pub(crate) async fn after_vendored_unwind(
+    common: &GlobalArgs,
+    unwound: &[String],
+) -> RestoreRefresh {
+    let installed: BTreeSet<String> = installed_with_archives(common, unwound)
+        .await
+        .into_iter()
+        .filter(|copy| copy.archive.is_file())
+        .map(|copy| copy.purl)
+        .collect();
+    if installed.is_empty() {
+        return RestoreRefresh::default();
+    }
+    let installed: Vec<String> = installed.into_iter().collect();
+    refresh_restored(common, &installed, &BTreeMap::new(), Scope::Installed).await
+}
+
+async fn refresh_restored(
+    common: &GlobalArgs,
+    restored: &[String],
+    staged: &BTreeMap<String, Option<String>>,
+    scope: Scope,
+) -> RestoreRefresh {
     use socket_patch_core::patch::redirect::upstream::gem_upstream_archive;
 
     let policy = Policy::of(common);
@@ -719,7 +802,7 @@ pub(crate) async fn after_restore(
     if shas.is_empty() {
         return RestoreRefresh::default();
     }
-    let stale = stale_after_restore(common, &shas).await;
+    let stale = stale_after_restore(common, &shas, scope).await;
     if stale.is_empty() {
         return RestoreRefresh::default();
     }
@@ -739,7 +822,7 @@ pub(crate) async fn after_restore(
     };
     let pass = attempt(&stale, wanted, &source, &policy, direction).await;
     let still = if pass.changed(&policy) {
-        stale_after_restore(common, &shas).await
+        stale_after_restore(common, &shas, scope).await
     } else {
         stale
     };
@@ -1046,6 +1129,23 @@ mod tests {
                     .contains("Re-run without `--no-gem-install-refresh`"),
             "{}",
             out.warnings[1].1
+        );
+
+        // An unwind names no re-run: nothing is left for one to unwind.
+        let out = report(Direction::Upstream, &gems, &tried, &policy_off);
+        assert!(
+            out.warnings[1]
+                .1
+                .contains("`--no-gem-install-refresh` is set")
+                && !out.warnings[1].1.contains("Re-run")
+                && out.warnings[1].1.contains("and run `bundle install`"),
+            "{}",
+            out.warnings[1].1
+        );
+        let summary = out.summary.expect("stale gems").paragraph();
+        assert!(
+            !summary.contains("Re-run without") && summary.contains("Run `rm -f "),
+            "{summary}"
         );
     }
 }
