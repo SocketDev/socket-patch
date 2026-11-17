@@ -1536,11 +1536,19 @@ async fn run_redirect_selected_untracked(
         && !socket_patch_core::patch::redirect::maven_reactor_root(&read.files)
     {
         let cwd = common.cwd.clone();
-        tokio::task::spawn_blocking(move || {
-            socket_patch_core::crawlers::maven_selection::MavenSelection::for_project(&cwd)
-        })
-        .await
-        .ok()
+        Some(
+            tokio::task::spawn_blocking(move || {
+                socket_patch_core::crawlers::maven_selection::MavenSelection::for_project(&cwd)
+            })
+            .await
+            // A selection that could not be read answers "undetermined", never
+            // "no selection": `None` would let the rewriter pin unchecked.
+            .unwrap_or_else(|err| {
+                socket_patch_core::crawlers::maven_selection::MavenSelection::unavailable(format!(
+                    "the Maven selection could not be read ({err})"
+                ))
+            }),
+        )
     } else {
         None
     };

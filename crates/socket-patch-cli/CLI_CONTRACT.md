@@ -2749,7 +2749,8 @@ binds at any depth, so a module with such a file missing is never reported to
 select the base version, however near the module the declaration that would
 win is. The other modules of the build keep their own answers. Such a module
 is still reported to select another version: that writes no new pin (the patch
-is skipped, and a pin of that version already there is taken out). Resolving
+is skipped, and in vendored mode a pin of that version already there is taken
+out; a hosted pin a scan wrote earlier is not re-checked). Resolving
 the project fills the files in, and the reason given names the missing file.
 The pom of a version that loses mediation is not part of what the module
 resolves, and a base version whose pom is cached only for its

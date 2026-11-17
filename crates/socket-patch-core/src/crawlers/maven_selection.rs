@@ -1058,8 +1058,15 @@ impl Selector<'_> {
         if let Some(found) = self.listed.get(ga) {
             return found.clone();
         }
-        let safe =
-            |s: &str| !s.is_empty() && !s.contains(['/', '\\', '$', '{', '}']) && !s.contains("..");
+        // A leading or trailing `.` would turn into a `/` that roots the
+        // path outside the repository; `:` would name a Windows drive.
+        let safe = |s: &str| {
+            !s.is_empty()
+                && !s.starts_with('.')
+                && !s.ends_with('.')
+                && !s.contains(['/', '\\', ':', '$', '{', '}'])
+                && !s.contains("..")
+        };
         let mut versions: Option<Vec<String>> = None;
         let mut foreign: Vec<String> = Vec::new();
         if safe(&ga.0) && safe(&ga.1) {
