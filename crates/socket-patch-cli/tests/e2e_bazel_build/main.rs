@@ -11,7 +11,8 @@
 //! and a host that does not answer fails them. The package under test and
 //! every Socket host are loopback stand-ins.
 //! `.github/workflows/bazel-compatibility.yml` runs them, one leg per Bazel
-//! release and ecosystem. Locally:
+//! release, for the ecosystem of the workflow that calls it
+//! (`bazel-go.yml`). Locally:
 //!
 //! ```sh
 //! export "$(scripts/install-bazel.sh 9.3.2 "$HOME/.cache/socket-patch-bazel")"
@@ -30,9 +31,13 @@
 //! `MODULE.bazel` per era of rulesets; the fixture's table in the test code
 //! says which releases build which era (`harness::Fixture`). So another
 //! Bazel release is one line per platform in `scripts/bazel-pins.txt` and
-//! one line of the workflow's matrix; another era is one `MODULE.bazel`
+//! one line of the ecosystem's workflow; another era is one `MODULE.bazel`
 //! and one line of the table; another ecosystem is its module, its fixture
-//! and one line of the workflow's matrix per release.
+//! and a workflow of its own, which calls `bazel-compatibility.yml` as
+//! `bazel-go.yml` does. `harness.rs` holds what the flows share: the
+//! stand-in server, the steps of a flow, the downloader config for a
+//! ruleset that fetches with Bazel's own downloader, and the environment
+//! of every Bazel child.
 
 #[path = "../common/envelope.rs"]
 mod envelope;
