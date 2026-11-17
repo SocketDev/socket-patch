@@ -111,6 +111,30 @@ async fn setup_mock(
     installed_before_bytes: &[u8],
     installed_after_bytes: &[u8],
 ) {
+    setup_mock_with_other(
+        server,
+        installed_before_hash,
+        installed_after_hash,
+        installed_before_bytes,
+        installed_after_bytes,
+        UUID_OTHER,
+        &darwin_after_bytes(),
+    )
+    .await;
+}
+
+/// [`setup_mock`] with the darwin variant's patch chosen by the caller:
+/// its uuid (`other_uuid`) and patched bytes (`other_after`).
+#[allow(clippy::too_many_arguments)]
+async fn setup_mock_with_other(
+    server: &MockServer,
+    installed_before_hash: &str,
+    installed_after_hash: &str,
+    installed_before_bytes: &[u8],
+    installed_after_bytes: &[u8],
+    other_uuid: &str,
+    other_after: &[u8],
+) {
     let base = base_purl();
 
     Mock::given(method("POST"))
@@ -122,7 +146,7 @@ async fn setup_mock(
                     { "uuid": UUID_INSTALLED, "purl": qualified(PLATFORM_INSTALLED),
                       "tier": "free", "cveIds": [], "ghsaIds": [],
                       "severity": "high", "title": "linux gem" },
-                    { "uuid": UUID_OTHER, "purl": qualified(PLATFORM_OTHER),
+                    { "uuid": other_uuid, "purl": qualified(PLATFORM_OTHER),
                       "tier": "free", "cveIds": [], "ghsaIds": [],
                       "severity": "high", "title": "darwin gem" },
                 ]
@@ -141,7 +165,7 @@ async fn setup_mock(
                 { "uuid": UUID_INSTALLED, "purl": qualified(PLATFORM_INSTALLED),
                   "publishedAt": "2024-01-01T00:00:00Z", "description": "linux gem",
                   "license": "MIT", "tier": "free", "vulnerabilities": {} },
-                { "uuid": UUID_OTHER, "purl": qualified(PLATFORM_OTHER),
+                { "uuid": other_uuid, "purl": qualified(PLATFORM_OTHER),
                   "publishedAt": "2024-01-01T00:00:00Z", "description": "darwin gem",
                   "license": "MIT", "tier": "free", "vulnerabilities": {} },
             ],
@@ -164,15 +188,14 @@ async fn setup_mock(
 
     // Other (darwin) variant: a different distribution's bytes, so its
     // beforeHash never matches the installed linux gem.
-    let other_after = darwin_after_bytes();
     mount_view(
         server,
-        UUID_OTHER,
+        other_uuid,
         &qualified(PLATFORM_OTHER),
         &git_sha256(DARWIN_BEFORE_BYTES),
-        &git_sha256(&other_after),
+        &git_sha256(other_after),
         DARWIN_BEFORE_BYTES,
-        &other_after,
+        other_after,
     )
     .await;
 }
@@ -747,5 +770,61 @@ async fn rollback_all_over_broad_manifest_succeeds() {
     assert!(
         manifest_keys(tmp.path()).is_empty(),
         "the rolled-back variant group must leave the manifest"
+    );
+}
+
+/// A broad manifest whose UNINSTALLED variant's patch is replaced by a
+/// newer one (#2096). Replacing a record rolls the recorded patch back
+/// first, but nothing of the darwin record was ever applied to the linux
+/// gem on disk: the re-scan must replace the record without trying to
+/// roll it back on that copy (a hash mismatch that would refuse the
+/// replacement on every scan), and must leave the linux gem patched.
+#[tokio::test]
+#[serial]
+async fn broad_rescan_replaces_the_uninstalled_variants_patch() {
+    const UUID_OTHER_NEW: &str = "33333333-3333-4333-8333-cccccccccccc";
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (gem_file, server) = fixture(tmp.path()).await;
+    assert_eq!(scan_run(scan_args(tmp.path(), server.uri(), true)).await, 0);
+    assert_eq!(read_file(&gem_file), patched_bytes());
+
+    // The API now serves a newer patch for the darwin variant only.
+    let mut darwin_new = DARWIN_BEFORE_BYTES.to_vec();
+    darwin_new.extend_from_slice(b"\n# DARWIN-MARKER-2\n");
+    server.reset().await;
+    setup_mock_with_other(
+        &server,
+        &git_sha256(ORIGINAL_BYTES),
+        &git_sha256(&patched_bytes()),
+        ORIGINAL_BYTES,
+        &patched_bytes(),
+        UUID_OTHER_NEW,
+        &darwin_new,
+    )
+    .await;
+    assert_eq!(
+        scan_run(scan_args(tmp.path(), server.uri(), true)).await,
+        0,
+        "replacing the uninstalled variant's record must not fail"
+    );
+
+    assert_variant_record(
+        tmp.path(),
+        &qualified(PLATFORM_OTHER),
+        UUID_OTHER_NEW,
+        DARWIN_BEFORE_BYTES,
+        &darwin_new,
+    );
+    assert_variant_record(
+        tmp.path(),
+        &qualified(PLATFORM_INSTALLED),
+        UUID_INSTALLED,
+        ORIGINAL_BYTES,
+        &patched_bytes(),
+    );
+    assert_eq!(
+        read_file(&gem_file),
+        patched_bytes(),
+        "the installed variant stays patched"
     );
 }
