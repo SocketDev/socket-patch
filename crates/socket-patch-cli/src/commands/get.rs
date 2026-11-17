@@ -32,10 +32,11 @@ use crate::commands::agent_download::{
     decide_patch_action, download_patch_records_preflighted, download_patch_records_reusing,
     filter_to_installed_releases, max_vuln_severity, nested_apply_args,
     next_steps as agent_next_steps, patch_event_metadata, record_apply_outcome, recorded_purls,
-    report_lock_failure, run_nested_apply, run_outcome, tag_mode, unwind_new_blobs,
-    vendored_download_refusals, warn_if_manifest_gitignored, warn_on_vendored_uuid_drift,
-    write_all_patch_blobs, DetachedDownload, PatchAction, ALREADY_IN_MANIFEST, BLOB_WRITE_FAILED,
-    RELEASE_NARROWING,
+    replaced_patch_not_restored_detail, report_lock_failure, restore_dropped_files,
+    run_nested_apply, run_outcome, tag_mode, unwind_new_blobs, vendored_download_refusals,
+    warn_if_manifest_gitignored, warn_on_vendored_uuid_drift, write_all_patch_blobs,
+    DetachedDownload, PatchAction, ALREADY_IN_MANIFEST, BLOB_WRITE_FAILED, RELEASE_NARROWING,
+    REPLACED_PATCH_NOT_RESTORED,
 };
 pub use crate::commands::agent_download::{
     download_and_apply_patches_into, download_and_apply_patches_with, DownloadParams, DownloadRun,
@@ -46,7 +47,7 @@ use crate::json_envelope::{
     usage_error, Command as JsonCommand, Envelope, EnvelopeError, PatchAction as EventAction,
     PatchEvent, RunWarning, Status,
 };
-use crate::ui::{print_json, select_one, SelectError};
+use crate::ui::{plural, print_json, select_one, SelectError};
 
 /// Best-effort ecosystem extractor for a `pkg:<eco>/...` PURL. Used as
 /// the telemetry `ecosystem` field. Returns an empty string when the
@@ -1940,6 +1941,7 @@ async fn save_patch_record(
     manifest_path: &Path,
     socket_dir: &Path,
     patch: &PatchResponse,
+    client: &ApiClient,
 ) -> Result<PatchAction, i32> {
     let mut manifest = match read_manifest(manifest_path).await {
         Ok(Some(m)) => m,
@@ -1977,6 +1979,50 @@ async fn save_patch_record(
     let action = decide_patch_action(&manifest, &patch.purl, &patch.uuid);
     if action == PatchAction::Skipped {
         return Ok(action);
+    }
+
+    // Replacing another patch's record: put back the files only that patch
+    // changed, or keep its record (#2096; same step as the multi-patch
+    // engine's).
+    if let PatchAction::Updated { old_uuid } = &action {
+        let restore = restore_dropped_files(
+            &args.common,
+            socket_dir,
+            &manifest,
+            &[(patch.purl.as_str(), &files)],
+            client,
+        )
+        .await;
+        if let Some(why) = restore.refused.get(&patch.purl) {
+            let detail = replaced_patch_not_restored_detail(&patch.purl, old_uuid, why);
+            if args.common.json {
+                let mut env = new_envelope(&args.common);
+                env.record(
+                    PatchEvent::new(EventAction::Failed, patch.purl.as_str())
+                        .with_uuid(patch.uuid.as_str())
+                        .with_error(REPLACED_PATCH_NOT_RESTORED, detail.as_str()),
+                );
+                env.mark_error(EnvelopeError::new(REPLACED_PATCH_NOT_RESTORED, detail));
+                emit(&env);
+            } else {
+                eprintln!(
+                    "Error: Cannot replace the patch of {}: {detail}",
+                    normalize_purl(&patch.purl)
+                );
+            }
+            return Err(1);
+        }
+        if !(args.common.json || args.common.silent) {
+            if let Some(files) = restore.restored.get(&patch.purl) {
+                eprintln!(
+                    "Restored {} only the replaced patch changed.",
+                    plural(*files, "file", "files")
+                );
+            }
+            for (_, detail) in &restore.warnings {
+                eprintln!("Warning: {detail}");
+            }
+        }
     }
 
     let blobs_dir = socket_dir.join("blobs");
@@ -2068,7 +2114,7 @@ async fn save_and_apply_patch(
     };
     let commit_recovery = crate::commands::lock_cli::commit_recovery_warning(&guard);
 
-    let action = match save_patch_record(args, &manifest_path, &socket_dir, patch).await {
+    let action = match save_patch_record(args, &manifest_path, &socket_dir, patch, client).await {
         Ok(action) => action,
         Err(code) => return code,
     };
