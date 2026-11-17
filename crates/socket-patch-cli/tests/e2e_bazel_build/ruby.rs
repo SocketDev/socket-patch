@@ -53,17 +53,16 @@ use std::io::Write as _;
 use std::time::Instant;
 
 use serde_json::json;
+use sha2::{Digest, Sha256};
 
 use crate::harness::{fixture_path, rewrite, Cell, Fixture, StandIn, CONSUMER};
 use crate::hosted_memory_common::Patch;
 
-// The helpers every test target of this crate shares, for `sha256_hex`. The
-// root of this target loads some of their files one by one, so those are
-// loaded a second time here.
-#[allow(clippy::duplicate_mod)]
-#[path = "../common/mod.rs"]
-mod common;
-use common::sha256_hex;
+/// The sha256 of `bytes` in lowercase hex, as a `Gemfile.lock` and the gem
+/// index spell a sum.
+fn sha256_hex(bytes: &[u8]) -> String {
+    hex::encode(Sha256::digest(bytes))
+}
 
 /// The workspace the test builds, and the ruleset each Bazel release builds
 /// it with.
