@@ -95,6 +95,9 @@ mod rollback_json;
 mod common;
 use common::{binary, hermetic};
 
+#[path = "common/patch_view.rs"]
+mod patch_view;
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -350,24 +353,7 @@ fn scan_hosted(cwd: &Path, extra: &[&str]) -> serde_json::Value {
 /// The production record `GET /patch/view/<uuid>` serves (the public
 /// proxy), fetched on a private runtime so the sync legs can call it.
 fn published_view_record_blocking(uuid: &str) -> serde_json::Value {
-    let url = format!("{PROXY}/patch/view/{uuid}");
-    tokio::runtime::Runtime::new()
-        .expect("tokio runtime")
-        .block_on(async {
-            let resp = reqwest::Client::new()
-                .get(&url)
-                .header("Accept", "application/json")
-                .send()
-                .await
-                .unwrap_or_else(|e| panic!("GET {url}: {e}"));
-            let status = resp.status();
-            let body = resp
-                .text()
-                .await
-                .unwrap_or_else(|e| panic!("GET {url}: reading body: {e}"));
-            assert!(status.is_success(), "GET {url}: HTTP {status}\n{body}");
-            serde_json::from_str(&body).unwrap_or_else(|e| panic!("GET {url}: bad JSON ({e})"))
-        })
+    patch_view::record_blocking(PROXY, uuid)
 }
 
 /// Assert the hosted redirect actually rewrote something, and return the list
@@ -664,37 +650,7 @@ async fn published_patch_dates(purl: &str) -> Result<Vec<(String, String)>, Stri
 async fn published_patch_files(
     uuid: &str,
 ) -> Result<Vec<(String, Option<String>, Option<String>)>, String> {
-    let url = format!("{PROXY}/patch/view/{uuid}");
-    let resp = reqwest::Client::new()
-        .get(&url)
-        .header("Accept", "application/json")
-        .send()
-        .await
-        .map_err(|e| format!("GET {url}: {e}"))?;
-    let status = resp.status();
-    let body = resp
-        .text()
-        .await
-        .map_err(|e| format!("GET {url}: reading body: {e}"))?;
-    if !status.is_success() {
-        return Err(format!("GET {url}: HTTP {status}\n{body}"));
-    }
-    let v: serde_json::Value =
-        serde_json::from_str(&body).map_err(|e| format!("GET {url}: bad JSON ({e}):\n{body}"))?;
-    Ok(v["files"]
-        .as_object()
-        .map(|m| {
-            m.iter()
-                .map(|(path, f)| {
-                    (
-                        path.clone(),
-                        f["beforeHash"].as_str().map(str::to_string),
-                        f["afterHash"].as_str().map(str::to_string),
-                    )
-                })
-                .collect()
-        })
-        .unwrap_or_default())
+    Ok(patch_view::files(&patch_view::record(PROXY, uuid).await?))
 }
 
 /// The `sha256=` hex value the lock's CHECKSUMS section pins for

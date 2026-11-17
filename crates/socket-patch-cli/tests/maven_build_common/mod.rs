@@ -118,6 +118,10 @@ pub fn skip(suite: &str, why: &str) {
 pub struct Mvn {
     program: OsString,
     pub version: String,
+    /// The Java runtime the launcher runs on, as its `mvn -v` banner names
+    /// it (`runtime: /usr/lib/jvm/…`); `None` when the banner has no such
+    /// line.
+    pub runtime: Option<PathBuf>,
 }
 
 impl Mvn {
@@ -168,7 +172,16 @@ impl Mvn {
             "{suite}: driving Maven {version} ({})",
             program.to_string_lossy()
         );
-        Some(Mvn { program, version })
+        // `Java version: 17.0.21, vendor: Eclipse Adoptium, runtime: /usr/lib/jvm/…`
+        let runtime = banner
+            .lines()
+            .find_map(|l| l.split_once("runtime: "))
+            .map(|(_, home)| PathBuf::from(home.trim()));
+        Some(Mvn {
+            program,
+            version,
+            runtime,
+        })
     }
 
     /// `[major, minor, patch]` (a pre-release tail such as `-rc-6` dropped).
@@ -195,18 +208,25 @@ impl Mvn {
         self.numeric() >= vec![3, 9, 4]
     }
 
-    /// The launcher with the ambient Maven configuration and CI markers
-    /// scrubbed, for a caller that sets its own environment and arguments
-    /// (the production legs give Maven a home directory of its own).
-    pub fn command(&self) -> Command {
-        mvn_command(&self.program)
-    }
-
     /// `mvn -B <args>` in `cwd` against the local repository `m2`, with the
     /// user settings file `settings`.
     pub fn run(&self, cwd: &Path, m2: &Path, settings: &Path, args: &[&str]) -> Output {
-        mvn_command(&self.program)
-            .current_dir(cwd)
+        self.run_with(cwd, m2, settings, args, |_| {})
+    }
+
+    /// [`Self::run`] after `configure` has set the child's environment (the
+    /// production legs give Maven a home directory of its own).
+    pub fn run_with(
+        &self,
+        cwd: &Path,
+        m2: &Path,
+        settings: &Path,
+        args: &[&str],
+        configure: impl FnOnce(&mut Command),
+    ) -> Output {
+        let mut cmd = mvn_command(&self.program);
+        configure(&mut cmd);
+        cmd.current_dir(cwd)
             .arg("-B")
             .arg("-s")
             .arg(settings)
@@ -274,7 +294,7 @@ fn write_fallback_settings(path: &Path) {
 /// Whether a failed Maven run failed to FETCH from the remote repository
 /// (a CDN blip that briefly serves a released plugin/artifact as absent, a
 /// dropped connection), as opposed to any other build failure.
-fn is_resolution_failure(out: &Output) -> bool {
+pub fn is_resolution_failure(out: &Output) -> bool {
     let text = format!(
         "{}{}",
         String::from_utf8_lossy(&out.stdout),
@@ -518,11 +538,12 @@ pub fn sha1_hex(bytes: &[u8]) -> String {
 // ── files ───────────────────────────────────────────────────────────────
 
 /// A "fresh checkout" of `proj` in `dst`: only the committable files —
-/// `pom.xml`, `.mvn/` and `.socket/` (never `target/`).
+/// `pom.xml`, `.mvn/`, `.socket/` and the sources under `src/` (never
+/// `target/`).
 pub fn fresh_checkout(proj: &Path, dst: &Path) {
     std::fs::create_dir_all(dst).unwrap();
     std::fs::copy(proj.join("pom.xml"), dst.join("pom.xml")).unwrap();
-    for dir in [".mvn", ".socket"] {
+    for dir in [".mvn", ".socket", "src"] {
         if proj.join(dir).is_dir() {
             fs_tree::copy_tree(&proj.join(dir), &dst.join(dir));
         }

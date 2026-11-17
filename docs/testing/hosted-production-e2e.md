@@ -109,12 +109,21 @@ on. Each is read from `JAVA_HOME_<n>_<arch>`, and a missing one fails the leg. W
 it is unset, the check runs on every `JAVA_HOME_<n>_<arch>` in the environment,
 `JAVA_HOME` and the JDK Maven runs on.
 
-CI runs the check on Java 8, 11, 17, 21 and 25, the JDKs of GitHub's Ubuntu 24.04
-runner image (`actions/setup-java` installs any the runner lacks). Java 8 is the
-oldest runtime CI has: no `setup-java` distribution offers Java 6 or 7 for Linux
-x64. In CI the Java 6 level of this jar is therefore checked by class-file version,
-not by running on Java 6. To run on an older runtime, point `JAVA_HOME_6_X64` at a
-Java 6 JDK (any directory with `bin/java` and `bin/javac`) and add `6` to the list.
+CI runs the check on Java 8, 11, 17 and 21 from the runner image
+(`actions/setup-java` installs any the runner lacks), and on Java 25 when the
+image has it. No `setup-java` distribution offers Java 6 or 7 for Linux x64, so
+Java 6 runs in a container:
+[`scripts/container-jdk.sh`](../../scripts/container-jdk.sh) makes a stand-in JDK
+home whose `java` and `javac` run in the `azul/zulu-openjdk:6` image (Zulu
+6.22.0.3, pinned by digest), without network and with only the legs' temp
+directory mounted. That part is best effort: when Docker is missing, the pull
+does not finish in two minutes or the image does not run, the job warns and the
+check covers Java 8 and later only. Each leg prints the Java versions it ran on.
+
+A JDK here is any directory with `bin/java` and `bin/javac`. To add a runtime
+locally, point `JAVA_HOME_<n>_<arch>` at one (for Java 6,
+`scripts/container-jdk.sh <image@sha256:…> <dir> "$TMPDIR"`) and list `<n>` in
+`SOCKET_PATCH_MAVEN_E2E_JAVA`.
 
 ## Running
 
@@ -147,9 +156,10 @@ server, npm, PyPI, RubyGems, and Maven Central.
 
 The [`hosted-e2e` job](../../.github/workflows/ci.yml) runs independently of the
 other test jobs and retries production failures up to three times. It also runs
-the vendored vlt production proof, validates vlt leg output, and runs the Maven
-vendored and agent legs. Branch protection settings are configured separately
-from the workflow.
+the vendored vlt production proof and validates vlt leg output. The three Maven
+legs run in a step of their own, with their own three attempts, so a Maven
+failure does not rerun the other legs and theirs do not rerun Maven's. Branch
+protection settings are configured separately from the workflow.
 
 The job runs on every push to `main`, on pull requests that are not drafts, in the
 merge queue, nightly, and on manual dispatch (unless the dispatch selects only

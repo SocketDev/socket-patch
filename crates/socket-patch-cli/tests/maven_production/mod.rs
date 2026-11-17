@@ -34,10 +34,11 @@
 //!
 //! Toolchain: the Maven that `maven_build_common` selects
 //! (`SOCKET_PATCH_MAVEN_E2E_{MVN,VERSION,REQUIRED}`) and the JDKs of
-//! [`JAVA_ENV`]. [`delivery`] returns `Err` when it cannot run at all (no
-//! Maven, no JDK, Maven Central unreachable for the fixture), which the
-//! suites turn into their soft skip, a hard failure under their STRICT
-//! flag. Everything after the fixture is a hard failure.
+//! [`JAVA_ENV`]. [`delivery`] returns `Err` when it cannot run at all: no
+//! Maven, no JDK, or an upstream build that could not resolve from Maven
+//! Central. The suites turn that into their soft skip, a hard failure under
+//! their STRICT flag. Every other failure panics, the upstream build's
+//! included.
 
 #![allow(dead_code)]
 
@@ -60,6 +61,9 @@ mod maven_build_common;
 #[allow(clippy::duplicate_mod)]
 #[path = "../common/oracle.rs"]
 mod oracle;
+#[allow(clippy::duplicate_mod)]
+#[path = "../common/patch_view.rs"]
+mod patch_view;
 
 use maven_build_common::{dump, ok, sha1_hex, sha256_hex, Mvn, DEPENDENCY_PLUGIN};
 
@@ -333,27 +337,9 @@ fn pom() -> String {
 impl Fixture {
     /// `mvn` with this run's home, settings and local repository.
     fn mvn(&self, cwd: &Path, settings: &Path, args: &[&str]) -> Output {
-        let mut cmd = self.mvn.command();
-        cmd.current_dir(cwd)
-            .env("HOME", &self.home)
-            .env("USERPROFILE", &self.home);
-        // `user.home` is where Maven itself looks for `~/.m2`; the JVM
-        // takes it from the account, not from $HOME. MAVEN_OPTS is split on
-        // whitespace by the launcher, so a path with a space keeps the
-        // account's home (the settings file and the local repository are
-        // still this run's own).
-        let home = self.home.to_string_lossy();
-        if !home.contains(char::is_whitespace) {
-            cmd.env("MAVEN_OPTS", format!("-Duser.home={home}"));
-        }
-        cmd.arg("-B")
-            .arg("-s")
-            .arg(settings)
-            .arg(format!("-Dmaven.repo.local={}", self.m2.display()))
-            .arg("-Dstyle.color=never")
-            .args(args)
-            .output()
-            .expect("spawn mvn")
+        self.mvn.run_with(cwd, &self.m2, settings, args, |cmd| {
+            maven_env(cmd, &self.home)
+        })
     }
 
     /// Compile the project in `cwd` and write the classpath Maven resolved
@@ -484,18 +470,64 @@ impl Fixture {
     }
 }
 
+/// Give a Maven child `home` as its home directory, the way
+/// `jvm_env::isolate_cli` does for the CLI: no ambient Maven or JVM options,
+/// and the version-manager roots (asdf, mise, SDKMAN, …) carried over, so a
+/// `mvn` or `java` that is a shim still resolves once `HOME` moves.
+fn maven_env(cmd: &mut Command, home: &Path) {
+    jvm_env::isolate_cli(cmd);
+    cmd.env("HOME", home).env("USERPROFILE", home);
+    // `user.home` is where Maven itself looks for `~/.m2`; the JVM takes it
+    // from the account, not from $HOME. MAVEN_OPTS is split on whitespace by
+    // the launcher, so a path with a space keeps the account's home (the
+    // settings file and the local repository are still this run's own).
+    let home = home.to_string_lossy();
+    if !home.contains(char::is_whitespace) {
+        cmd.env("MAVEN_OPTS", format!("-Duser.home={home}"));
+    }
+}
+
+#[test]
+fn maven_env_moves_home_and_keeps_what_the_cli_isolation_carries() {
+    let home = Path::new("/nonexistent/maven-production-home");
+    let mut maven = Command::new("mvn");
+    maven_env(&mut maven, home);
+    let env: BTreeMap<_, _> = maven.get_envs().collect();
+    for key in ["HOME", "USERPROFILE"] {
+        assert_eq!(
+            env[std::ffi::OsStr::new(key)],
+            Some(home.as_os_str()),
+            "{key}"
+        );
+    }
+    assert_eq!(
+        env[std::ffi::OsStr::new("MAVEN_OPTS")],
+        Some(std::ffi::OsStr::new(
+            "-Duser.home=/nonexistent/maven-production-home"
+        ))
+    );
+    // Everything else the CLI's isolation sets or removes (the
+    // version-manager roots among it) reaches Maven unchanged.
+    let mut cli = Command::new("socket-patch");
+    jvm_env::isolate_cli(&mut cli);
+    for (key, value) in cli.get_envs() {
+        if !["HOME", "USERPROFILE", "MAVEN_OPTS"]
+            .iter()
+            .any(|k| key == *k)
+        {
+            assert_eq!(env.get(key), Some(&value), "{key:?}");
+        }
+    }
+}
+
 /// The Maven launcher, the `java` it runs on and the drop-in JDKs.
 fn toolchain(leg: &str) -> Result<(Mvn, PathBuf, Vec<Jdk>), String> {
     let mvn =
         Mvn::detect(leg).ok_or("Maven is not available (see the SKIP line above)".to_string())?;
-    let out = mvn.command().args(["-v", "-B"]).output().expect("mvn -v");
-    let banner = String::from_utf8_lossy(&out.stdout).into_owned();
-    // `Java version: 17.0.21, vendor: Eclipse Adoptium, runtime: /usr/lib/jvm/…`
-    let runtime = banner
-        .lines()
-        .find_map(|l| l.split_once("runtime: ").map(|(_, home)| home.trim()))
-        .map(PathBuf::from)
-        .ok_or_else(|| format!("`mvn -v` names no Java runtime:\n{banner}"))?;
+    let runtime = mvn
+        .runtime
+        .clone()
+        .ok_or("`mvn -v` names no Java runtime".to_string())?;
     let java = tool(&runtime, "java");
     if !java.is_file() {
         return Err(format!("Maven's Java runtime has no {}", java.display()));
@@ -645,40 +677,12 @@ fn class_version_reads_the_class_file_header() {
 /// The files the production record of [`UUID`] replaces, as
 /// `(jar member, beforeHash, afterHash)` (git-blob sha256).
 fn patch_record(leg: &str) -> Vec<(String, String, String)> {
-    let url = format!("{PROXY}/patch/view/{UUID}");
-    let record: serde_json::Value = tokio::runtime::Runtime::new()
-        .expect("tokio runtime")
-        .block_on(async {
-            let resp = reqwest::Client::new()
-                .get(&url)
-                .header("Accept", "application/json")
-                .send()
-                .await
-                .unwrap_or_else(|e| panic!("{leg}: GET {url}: {e}"));
-            let status = resp.status();
-            let body = resp
-                .text()
-                .await
-                .unwrap_or_else(|e| panic!("{leg}: GET {url}: reading body: {e}"));
-            assert!(
-                status.is_success(),
-                "{leg}: GET {url}: HTTP {status}\n{body}"
-            );
-            serde_json::from_str(&body)
-                .unwrap_or_else(|e| panic!("{leg}: GET {url}: bad JSON ({e})"))
-        });
-    let files: Vec<(String, String, String)> = record["files"]
-        .as_object()
+    let record = patch_view::record_blocking(PROXY, UUID);
+    let files: Vec<(String, String, String)> = patch_view::files(&record)
         .into_iter()
-        .flatten()
-        .map(|(path, file)| {
-            let hash = |key: &str| {
-                file[key]
-                    .as_str()
-                    .unwrap_or_else(|| panic!("{leg}: {path} has no {key}:\n{record:#}"))
-                    .to_string()
-            };
-            (path.clone(), hash("beforeHash"), hash("afterHash"))
+        .map(|(path, before, after)| match (before, after) {
+            (Some(before), Some(after)) => (path, before, after),
+            _ => panic!("{leg}: {path} is not a replaced file of {UUID}:\n{record:#}"),
         })
         .collect();
     assert!(
@@ -824,27 +828,6 @@ fn tree_diff_names_what_was_added_removed_and_changed() {
         tree_diff(&before, &after),
         ["-gone", "~pom.xml", "+.mvn/maven.config"]
     );
-}
-
-/// A fresh checkout of the project: everything but the build output.
-fn fresh_checkout(proj: &Path, dst: &Path) {
-    fn copy(src: &Path, dst: &Path, top: bool) {
-        std::fs::create_dir_all(dst).unwrap();
-        for entry in std::fs::read_dir(src).unwrap() {
-            let entry = entry.unwrap();
-            if top && entry.file_name() == "target" {
-                continue;
-            }
-            let to = dst.join(entry.file_name());
-            if entry.file_type().unwrap().is_dir() {
-                copy(&entry.path(), &to, false);
-            } else {
-                std::fs::copy(entry.path(), &to).unwrap();
-            }
-        }
-    }
-    let _ = std::fs::remove_dir_all(dst);
-    copy(proj, dst, true);
 }
 
 // ── The drop-in check ───────────────────────────────────────────────────
@@ -1020,21 +1003,27 @@ fn names_package(event: &serde_json::Value) -> bool {
 }
 
 /// The UUID of the patch a `get` / `scan` run delivered for the package:
-/// it must have an `applied` event.
+/// the one on its `applied` event, which must exist. Vendored mode names
+/// the patch on the `downloaded` event instead, so that is read next.
 fn delivered_uuid(leg: &str, envelope: &serde_json::Value) -> String {
-    let events = envelope::events(envelope);
-    assert!(
-        events
+    let about: Vec<&serde_json::Value> = envelope::events(envelope)
+        .iter()
+        .filter(|e| names_package(e))
+        .collect();
+    let uuid_of = |action: &str| {
+        about
             .iter()
-            .any(|e| names_package(e) && e["action"] == "applied"),
+            .filter(|e| e["action"] == action)
+            .find_map(|e| e["uuid"].as_str())
+    };
+    assert!(
+        about.iter().any(|e| e["action"] == "applied"),
         "{leg}: no `applied` event for {PURL}. The patch is published and the package is \
          resolved, so discovery or delivery broke:\n{envelope:#}"
     );
-    events
-        .iter()
-        .filter(|e| names_package(e))
-        .find_map(|e| e["uuid"].as_str())
-        .unwrap_or_else(|| panic!("{leg}: no event names the patch UUID:\n{envelope:#}"))
+    uuid_of("applied")
+        .or_else(|| uuid_of("downloaded"))
+        .unwrap_or_else(|| panic!("{leg}: no event names the delivered patch:\n{envelope:#}"))
         .to_string()
 }
 
@@ -1042,16 +1031,15 @@ fn delivered_uuid(leg: &str, envelope: &serde_json::Value) -> String {
 /// patch, and (agent mode) the Maven local repository as it was.
 struct Pristine {
     proj: BTreeMap<String, String>,
-    m2: BTreeMap<String, String>,
-    repo_dir: BTreeMap<String, String>,
+    /// The local repository, hashed only where a mode writes to it.
+    m2: Option<BTreeMap<String, String>>,
 }
 
 impl Pristine {
     fn of(fx: &Fixture) -> Pristine {
         Pristine {
             proj: tree(&fx.proj, &["target"]),
-            m2: tree(&fx.m2, &[]),
-            repo_dir: tree(&fx.repo_dir(VERSION), &[]),
+            m2: (fx.mode == Mode::Agent).then(|| tree(&fx.m2, &[])),
         }
     }
 
@@ -1059,7 +1047,7 @@ impl Pristine {
     fn assert_restored(&self, fx: &Fixture, original: &Artifact, undo: &str) {
         let leg = &fx.leg;
         let mut diff = tree_diff(&self.proj, &tree(&fx.proj, &["target"]));
-        if fx.mode == Mode::Agent {
+        if let Some(m2) = &self.m2 {
             // Agent mode keeps its (now empty) manifest and the original
             // jar it backed up; `jvm_jar` never deletes that backup.
             let manifest = fx.proj.join(".socket/manifest.json");
@@ -1077,23 +1065,20 @@ impl Pristine {
                 "{leg}: the kept backup must be the original jar"
             );
             diff.retain(|d| *d != "+.socket/manifest.json" && *d != format!("+{backup}"));
-            // The local repository: the version directory holds the same
-            // files with the same bytes, and nothing else Maven had cached
-            // changed. (Files a later Maven run added are Maven's own.)
-            assert_eq!(
-                tree_diff(&self.repo_dir, &tree(&fx.repo_dir(VERSION), &[])),
-                Vec::<String>::new(),
-                "{leg}: {undo} must restore {} byte for byte",
-                fx.repo_dir(VERSION).display()
-            );
-            let changed: Vec<String> = tree_diff(&self.m2, &tree(&fx.m2, &[]))
+            // The local repository: the artifact's directory holds the
+            // same files with the same bytes, and nothing else Maven had
+            // cached changed. (Files a later Maven run added elsewhere are
+            // Maven's own.)
+            let artifact_dir = format!("{GROUP_PATH}/{ARTIFACT}/{VERSION}/");
+            let changed: Vec<String> = tree_diff(m2, &tree(&fx.m2, &[]))
                 .into_iter()
-                .filter(|d| !d.starts_with('+'))
+                .filter(|d| !d.starts_with('+') || d[1..].starts_with(&artifact_dir))
                 .collect();
             assert_eq!(
                 changed,
                 Vec::<String>::new(),
-                "{leg}: {undo} must leave the rest of the local repository alone"
+                "{leg}: {undo} must restore the local repository byte for byte (+added, \
+                 -removed, ~changed)"
             );
         }
         assert_eq!(
@@ -1158,6 +1143,15 @@ pub fn delivery(mode: Mode) -> Result<(), String> {
     };
     let leg = &fx.leg;
     std::fs::create_dir_all(&fx.home).unwrap();
+    // asdf and mise read the global tool versions from `$HOME/.tool-versions`
+    // and take no path to it from the environment, so a `mvn` shim needs the
+    // file in the moved home too.
+    if let Some(real) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
+        let _ = std::fs::copy(
+            Path::new(&real).join(".tool-versions"),
+            fx.home.join(".tool-versions"),
+        );
+    }
     std::fs::create_dir_all(fx.proj.join("src/main/java")).unwrap();
     std::fs::write(fx.proj.join("pom.xml"), pom()).unwrap();
     std::fs::write(fx.proj.join("src/main/java/Probe.java"), PROBE_JAVA).unwrap();
@@ -1179,8 +1173,15 @@ pub fn delivery(mode: Mode) -> Result<(), String> {
         |settings, extra| fx.build(&fx.proj, settings, extra),
     );
     if !ok(&out) {
+        // Only Maven Central (and its mirror) failing to serve the fixture
+        // is a reason not to run. Anything else is this leg's own failure.
+        assert!(
+            maven_build_common::is_resolution_failure(&out),
+            "{leg}: the upstream build failed, and not on resolving from Maven Central:\n{}",
+            dump(&out)
+        );
         return Err(format!(
-            "the upstream build against Maven Central failed:\n{}",
+            "the upstream build could not resolve from Maven Central:\n{}",
             dump(&out)
         ));
     }
@@ -1241,7 +1242,7 @@ pub fn delivery(mode: Mode) -> Result<(), String> {
                 "{leg}: hosted mode must leave the download to Maven"
             );
             let fresh = fx.root.join("fresh");
-            fresh_checkout(&fx.proj, &fresh);
+            maven_build_common::fresh_checkout(&fx.proj, &fresh);
             // The suffixed version exists only on the Socket repository, so
             // a build that resolves it fetched it from production.
             let after = fx.build_ok(&fresh, "the build of the hosted checkout", &[]);
@@ -1268,7 +1269,7 @@ pub fn delivery(mode: Mode) -> Result<(), String> {
                 "{leg}: no vendored artifact at {committed}:\n{envelope:#}"
             );
             let fresh = fx.root.join("fresh");
-            fresh_checkout(&fx.proj, &fresh);
+            maven_build_common::fresh_checkout(&fx.proj, &fresh);
             // Offline: the committed jar needs no Socket service and no
             // registry (the other artifacts are in the local repository).
             // Maven before 3.9.2 has no repository tail to read it from
