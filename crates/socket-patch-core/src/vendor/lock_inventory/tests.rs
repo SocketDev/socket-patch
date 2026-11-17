@@ -4218,6 +4218,14 @@ fn unsupported_layout_warnings_rewrites_known_codes_and_forwards_unknown_ones() 
 ///   from nowhere. The lock's `remote:` and `CHECKSUMS` never become a URL
 ///   or an expected hash.
 ///
+/// The gem downloads (the refresh, the source gem and its build's gems)
+/// are installed or built as fetched, so they and the compact index
+/// checksum they are verified against (`UpstreamClient::rubygems_sha256`)
+/// go through `registry_fetch::SecureRegistryClient`: the same `download`,
+/// refused unless the URL is `https` or plain `http` to this machine, with
+/// no redirect followed out of `https`. Its method is named `download`
+/// too, so a new caller of it is a reference this check sees.
+///
 /// [`PINNED_REFERENCES`] lists every production reference to those three
 /// functions in this crate, by file and line text. What the check catches:
 /// any new reference by name — a call through any path, a method call, a
@@ -4230,28 +4238,32 @@ fn unsupported_layout_warnings_rewrites_known_codes_and_forwards_unknown_ones() 
 /// Those stay a review matter: read the pristine source from the
 /// registry, never from a lock entry that might be Socket-hosted.
 const PINNED_REFERENCES: &[(&str, &str, &str)] = &[
+    // `SecureRegistryClient::download`: the one `download` behind every
+    // gem that is installed or built as fetched, and behind its checksum.
+    (
+        "vendor/registry_fetch.rs",
+        "download",
+        "download(client, url.as_str()).await",
+    ),
     (
         "patch/gem_refresh.rs",
         "download",
-        "crate::vendor::registry_fetch::download(&client, url).await",
+        "Source::Registry(registry) => registry.download(url).await,",
     ),
     // The source gem of a native-extension rebuild, and a gem its build
     // lacks: the registry's compact index document, then the archive it
-    // names by sha256. Never a URL or a hash out of the lock.
+    // names by sha256 (`GemSource::get`, the module's one request). Never
+    // a URL or a hash out of the lock.
     (
         "patch/gem_source.rs",
         "download",
-        "use crate::vendor::registry_fetch::{build_registry_client, download, RegistryClient};",
+        "registry.download(url).await",
     ),
+    // `rubygems_sha256`: the compact index document of the gem's name.
     (
-        "patch/gem_source.rs",
+        "patch/redirect/upstream/client.rs",
         "download",
-        "let bytes = download(self.http.get_or_init(build_registry_client), &url).await?;",
-    ),
-    (
-        "patch/gem_source.rs",
-        "download",
-        "let bytes = download(self.http.get_or_init(build_registry_client), &url).await?;",
+        "registry.download(&url).await?",
     ),
     (
         "patch/redirect/upstream/client.rs",

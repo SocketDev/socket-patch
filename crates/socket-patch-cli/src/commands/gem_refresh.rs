@@ -176,6 +176,10 @@ pub(crate) enum Why {
     Disabled,
     /// The refresh was tried, or could not be.
     Failed(String),
+    /// Nothing says which build the copy holds: the sha256 of the wanted
+    /// gem could not be had, for this reason. It is not known to be stale,
+    /// and not known not to be.
+    Unverified(String),
 }
 
 /// What one refresh pass did.
@@ -399,7 +403,7 @@ fn after_hint(hint: &str, action: &str) -> String {
 
 fn reason(why: Option<&Why>) -> String {
     match why {
-        Some(Why::Failed(reason)) => format!(" ({reason})"),
+        Some(Why::Failed(reason) | Why::Unverified(reason)) => format!(" ({reason})"),
         Some(Why::Disabled) => " (`--no-gem-install-refresh` is set)".to_string(),
         _ => String::new(),
     }
@@ -442,6 +446,20 @@ pub(crate) fn stale_detail(direction: Direction, gem: &StaleGem, why: Option<&Wh
         };
     }
     match &gem.installed {
+        Some((dir, _)) if matches!(why, Some(Why::Unverified(_))) => format!(
+            "{purl} {switched}, but its install at {} could not be checked against the \
+             {wanted} gem{}. If it was installed before the switch it still holds the {stale} \
+             build, and {reuse}. {}",
+            dir.display(),
+            reason(why),
+            after_hint(
+                "",
+                &format!(
+                    "remove {} and run `bundle install`",
+                    display_list(&files_to_remove(gem))
+                )
+            ),
+        ),
         Some((dir, false)) if !matches!(why, Some(Why::Disabled | Why::Failed(_))) => format!(
             "{purl} {switched}, but the shared gem home still holds its {stale} install at \
              {}, and {reuse}. Other projects may load that gem home, so it was left alone. \
@@ -637,14 +655,26 @@ pub(crate) fn report(
             _ => local.entry(why).or_default().push(gem),
         }
     }
+    // A gem whose copy could not be checked is not known to be stale: it
+    // is counted apart from the ones that are.
+    let unchecked: BTreeSet<&str> = local
+        .iter()
+        .filter(|(why, _)| matches!(why, Why::Unverified(_)))
+        .flat_map(|(_, gems)| gems.iter().map(|gem| gem.purl.as_str()))
+        .collect();
     let count = stale
         .iter()
         .map(|gem| gem.purl.as_str())
+        .filter(|purl| !unchecked.contains(purl))
         .collect::<BTreeSet<_>>()
         .len();
-    let headline = match direction {
+    let switch = match direction {
+        Direction::Patched => "the switch to hosted patches",
+        Direction::Upstream => "the switch back to the upstream registry",
+    };
+    let known = match direction {
         Direction::Patched if stale.iter().all(|gem| gem.in_place) => format!(
-            "{} on disk after the switch to hosted patches",
+            "{} on disk after {switch}",
             plural(
                 count,
                 "gem patched in place still has its upstream archive",
@@ -652,16 +682,27 @@ pub(crate) fn report(
             )
         ),
         Direction::Patched if stale.iter().any(|gem| gem.in_place) => format!(
-            "{} unpatched files or archives on disk after the switch to hosted patches",
+            "{} unpatched files or archives on disk after {switch}",
             plural(count, "gem still has", "gems still have")
         ),
         Direction::Patched => format!(
-            "{} still unpatched on disk after the switch to hosted patches",
+            "{} still unpatched on disk after {switch}",
             plural(count, "gem is", "gems are")
         ),
         Direction::Upstream => format!(
-            "{} the patched build on disk after the switch back to the upstream registry",
+            "{} the patched build on disk after {switch}",
             plural(count, "gem still holds", "gems still hold")
+        ),
+    };
+    let headline = match (count, unchecked.len()) {
+        (_, 0) => known,
+        (0, n) => format!(
+            "{} on disk could not be checked after {switch}",
+            plural(n, "gem", "gems")
+        ),
+        (_, n) => format!(
+            "{known}, and {} could not be checked",
+            plural(n, "gem", "gems")
         ),
     };
     let mut bullets = Vec::new();
@@ -700,15 +741,20 @@ pub(crate) fn report(
     for (why, gems) in &local {
         let files: Vec<PathBuf> = gems.iter().flat_map(|gem| files_to_remove(gem)).collect();
         let files: Vec<String> = files.iter().map(|p| p.display().to_string()).collect();
-        bullets.push(format!(
-            "Not refreshed{}: {}. {}.",
-            reason(Some(why)),
-            labels(gems.iter().map(|gem| gem.purl.as_str())),
-            after_hint(
-                retry_hint(direction, Some(why)),
-                &format!("run `rm -f {} && bundle install`", files.join(" "))
+        let reinstall = format!("run `rm -f {} && bundle install`", files.join(" "));
+        let names = labels(gems.iter().map(|gem| gem.purl.as_str()));
+        bullets.push(match why {
+            Why::Unverified(_) => format!(
+                "Not checked against the {wanted} gem{}: {names}. A copy installed before \
+                 the switch still holds the {stale_word} build; to be sure, {reinstall}.",
+                reason(Some(why)),
             ),
-        ));
+            _ => format!(
+                "Not refreshed{}: {names}. {}.",
+                reason(Some(why)),
+                after_hint(retry_hint(direction, Some(why)), &reinstall),
+            ),
+        });
     }
     out.summary = Some(Summary { headline, bullets });
     out
@@ -782,10 +828,12 @@ enum Scope {
 /// archive RubyGems installed it from, `<home>/cache/<leaf>.gem`, is
 /// readable and is not the upstream one, and so is (in [`Scope::All`])
 /// such an archive in Bundler's cache dir. `upstream` is each purl's
-/// upstream sha256; a purl without one is not judged.
+/// upstream sha256; a purl without an entry is not judged. A purl whose
+/// sha256 is `None` (the registry that would give it was refused) cannot
+/// be judged either, and every installed copy of it is listed.
 async fn stale_after_restore(
     common: &GlobalArgs,
-    upstream: &BTreeMap<String, String>,
+    upstream: &BTreeMap<String, Option<String>>,
     scope: Scope,
 ) -> Vec<StaleGem> {
     use socket_patch_core::vendor::file_sha256_hex;
@@ -796,23 +844,38 @@ async fn stale_after_restore(
         let Some(sha) = upstream.get(&copy.purl) else {
             continue;
         };
-        match file_sha256_hex(&copy.archive).await {
-            Some(got) if &got != sha => out.push(StaleGem {
+        // With no upstream sha256 (the registry that would give it was
+        // refused) nothing can be judged, so the copy is listed whether
+        // or not its archive is still in the home's cache. With one,
+        // only a readable archive that is not the upstream gem makes
+        // the copy stale.
+        let listed = match sha {
+            None => true,
+            Some(sha) => {
+                matches!(file_sha256_hex(&copy.archive).await, Some(got) if &got != sha)
+            }
+        };
+        if listed {
+            out.push(StaleGem {
                 purl: copy.purl,
                 leaf: copy.leaf,
                 installed: Some((copy.dir, copy.project_local)),
                 cache_archive: None,
                 in_place: false,
-            }),
-            _ => {}
+            });
         }
     }
     if scope == Scope::Installed {
         return out;
     }
+    // (An archive in Bundler's cache dir that cannot be checked is the
+    // restore's own `upstream_gem_stale_cache` to name.)
     let app_cache =
         socket_patch_core::crawlers::ruby_crawler::bundler_app_cache_dir(&common.cwd).await;
     for (purl, sha) in upstream {
+        let Some(sha) = sha else {
+            continue;
+        };
         let Some((_, name, version)) = socket_patch_core::utils::purl::purl_parts(purl) else {
             continue;
         };
@@ -893,60 +956,75 @@ async fn refresh_restored(
     staged: &BTreeMap<String, Option<String>>,
     scope: Scope,
 ) -> RestoreRefresh {
-    use socket_patch_core::patch::redirect::upstream::gem_upstream_archive;
+    use socket_patch_core::patch::redirect::upstream::{gem_upstream_archive, UpstreamArchive};
+    use socket_patch_core::vendor::registry_fetch::SecureRegistryClient;
 
     let policy = Policy::of(common);
     let direction = Direction::Upstream;
-    let mut shas: BTreeMap<String, String> = BTreeMap::new();
+    let mut shas: BTreeMap<String, Option<String>> = BTreeMap::new();
     let mut urls: BTreeMap<String, Option<String>> = BTreeMap::new();
+    // The gems whose upstream sha256 the registry is not asked for, each
+    // with why: their installed copies are reported, not passed over.
+    let mut unverified: BTreeMap<String, String> = BTreeMap::new();
     for purl in restored
         .iter()
         .filter(|p| Ecosystem::from_purl(p) == Some(Ecosystem::Gem))
     {
-        if let Some((sha, url)) =
-            gem_upstream_archive(&common.cwd, staged, purl, common.offline).await
-        {
-            // A vendored revert does not prove where the lock resolves the
-            // gem from: an entry vendored over hosted wiring before v5
-            // reverts to its hosted pin, whose `CHECKSUMS` sha256 is the
-            // patched gem's (the hosted unwind restores that pin next, and
-            // refreshes then). Only a gem the lock resolves from
-            // rubygems.org is known to be back on its upstream entry.
-            if scope == Scope::Installed && url.is_none() {
-                continue;
+        match gem_upstream_archive(&common.cwd, staged, purl, common.offline).await {
+            Some(UpstreamArchive::Known { sha256, url }) => {
+                // A vendored revert does not prove where the lock resolves
+                // the gem from: an entry vendored over hosted wiring before
+                // v5 reverts to its hosted pin, whose `CHECKSUMS` sha256 is
+                // the patched gem's (the hosted unwind restores that pin
+                // next, and refreshes then). Only a gem the lock resolves
+                // from rubygems.org is known to be back on its upstream
+                // entry.
+                if scope == Scope::Installed && url.is_none() {
+                    continue;
+                }
+                shas.insert(purl.clone(), Some(sha256));
+                urls.insert(purl.clone(), url);
             }
-            shas.insert(purl.clone(), sha);
-            urls.insert(purl.clone(), url);
+            // (Only a gem the lock resolves from rubygems.org comes back
+            // unverified, so the vendored unwind's rule holds for it too.)
+            Some(UpstreamArchive::Unverified(why)) => {
+                unverified.insert(purl.clone(), why);
+            }
+            None => {}
         }
     }
-    if shas.is_empty() {
+    if shas.is_empty() && unverified.is_empty() {
         return RestoreRefresh::default();
     }
     let stale = stale_after_restore(common, &shas, scope).await;
-    if stale.is_empty() {
+    let unjudged = unverified.keys().map(|purl| (purl.clone(), None)).collect();
+    let unchecked = stale_after_restore(common, &unjudged, Scope::Installed).await;
+    if stale.is_empty() && unchecked.is_empty() {
         return RestoreRefresh::default();
     }
     let wanted = |gem: &StaleGem| {
         Some(Wanted {
             leaf: gem.leaf.clone(),
             kind: direction.wanted(),
-            sha256: BTreeSet::from([shas.get(&gem.purl)?.clone()]),
+            sha256: BTreeSet::from([shas.get(&gem.purl)?.clone()?]),
             urls: urls.get(&gem.purl)?.iter().cloned().collect(),
             on_disk: Vec::new(),
         })
     };
-    let source = if common.offline {
-        Source::DiskOnly
-    } else {
-        Source::Registry
+    // One client for the run's downloads, when there is something to
+    // download.
+    let registry = (!common.offline && !stale.is_empty()).then(SecureRegistryClient::new);
+    let source = match &registry {
+        Some(registry) => Source::Registry(registry),
+        None => Source::DiskOnly,
     };
-    let pass = attempt(&stale, wanted, &source, &policy, direction).await;
+    let mut pass = attempt(&stale, wanted, &source, &policy, direction).await;
     let still = if pass.changed(&policy) {
         stale_after_restore(common, &shas, scope).await
     } else {
         stale
     };
-    let installed: Vec<StaleGem> = still
+    let mut installed: Vec<StaleGem> = still
         .into_iter()
         .filter(|gem| gem.installed.is_some())
         .collect();
@@ -958,6 +1036,13 @@ async fn refresh_restored(
         })
         .map(|(purl, _)| purl.clone())
         .collect();
+    for gem in unchecked {
+        if let (Some((dir, _)), Some(why)) = (&gem.installed, unverified.get(&gem.purl)) {
+            pass.left
+                .insert(dir.clone(), Why::Unverified(why.to_string()));
+            installed.push(gem);
+        }
+    }
     RestoreRefresh {
         refreshed_installs,
         report: report(direction, &installed, &pass, &policy),
@@ -1066,6 +1151,95 @@ mod tests {
         );
         let fixed = summary.paragraph().len() - home.display().to_string().len();
         assert!(fixed < 480, "the whole warning stays short: {fixed}");
+    }
+
+    /// A copy that could not be checked against the upstream gem (the
+    /// registry that would say is refused) is reported with the reason and
+    /// the files to remove, apart from the copies known to be stale: it is
+    /// not said to hold the patched build, and it is not passed over. In a
+    /// shared gem home too, where nothing was tried either way.
+    #[tokio::test]
+    async fn a_copy_that_could_not_be_checked_is_reported_with_the_reason() {
+        const WHY: &str = "SOCKET_RUBYGEMS_URL is not used as the gem registry: \
+                           `http://gemstash:9292` is not an https URL; set it to an https URL";
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("vendor/bundle/ruby/3.4.0");
+        let shared = tmp.path().join("elsewhere/gemhome");
+        let unchecked = [
+            installed("rack", &home, true),
+            installed("rexml", &shared, false),
+        ];
+        let stale = installed("nokogiri", &home, true);
+        let policy = policy(tmp.path(), true, false, false);
+        let mut pass = attempt(
+            std::slice::from_ref(&stale),
+            unobtainable,
+            &Source::DiskOnly,
+            &policy,
+            Direction::Upstream,
+        )
+        .await;
+        for gem in &unchecked {
+            let (dir, _) = gem.installed.clone().unwrap();
+            pass.left.insert(dir, Why::Unverified(WHY.to_string()));
+        }
+
+        // Unchecked copies alone.
+        let out = report(Direction::Upstream, &unchecked, &pass, &policy);
+        assert_eq!(out.warnings.len(), 2);
+        for ((code, detail), gem) in out.warnings.iter().zip(&unchecked) {
+            let (dir, _) = gem.installed.clone().unwrap();
+            assert_eq!(*code, "upstream_gem_stale_install");
+            for needle in [
+                gem.purl.as_str(),
+                "is back on its upstream registry entry",
+                "could not be checked against the upstream gem",
+                WHY,
+                "If it was installed before the switch it still holds the patched build",
+                "run `bundle install`",
+                &dir.display().to_string(),
+                &format!("{}.gemspec", gem.leaf),
+            ] {
+                assert!(detail.contains(needle), "missing {needle:?}: {detail}");
+            }
+            assert!(!detail.contains("--gem-refresh-shared"), "{detail}");
+            assert!(!detail.contains("its patched install"), "{detail}");
+        }
+        let summary = out.summary.expect("a summary");
+        assert_eq!(
+            summary.headline,
+            "2 gems on disk could not be checked after the switch back to the upstream registry"
+        );
+        assert_eq!(summary.bullets.len(), 1, "{:?}", summary.bullets);
+        assert!(
+            summary.bullets[0].starts_with(&format!(
+                "Not checked against the upstream gem ({WHY}): rack 1.0.0, rexml 1.0.0. A copy \
+                 installed before the switch still holds the patched build; to be sure, run \
+                 `rm -f "
+            )),
+            "{}",
+            summary.bullets[0]
+        );
+
+        // Beside a copy that is known to be stale.
+        let all = [vec![stale], unchecked.to_vec()].concat();
+        let out = report(Direction::Upstream, &all, &pass, &policy);
+        assert_eq!(out.warnings.len(), 3);
+        let summary = out.summary.expect("a summary");
+        assert_eq!(
+            summary.headline,
+            "1 gem still holds the patched build on disk after the switch back to the upstream \
+             registry, and 2 gems could not be checked"
+        );
+        assert_eq!(summary.bullets.len(), 2, "{:?}", summary.bullets);
+
+        // A dry run switched nothing: nothing is stale or unchecked yet.
+        let dry = Policy {
+            dry_run: true,
+            ..policy
+        };
+        let out = report(Direction::Upstream, &all, &pass, &dry);
+        assert!(out.summary.is_none());
     }
 
     /// A project-local copy the refresh could not fix says why and names

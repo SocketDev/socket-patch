@@ -204,6 +204,7 @@ use crate::patch::apply::{
 };
 use crate::patch::file_hash::compute_file_git_sha256_sync;
 use crate::patch::gem_source::{GemId, GemSource, RubyVersions};
+use crate::utils::containment::{ensure_dir_or_absent, try_entry_type};
 use crate::utils::fs::read_regular_to_bytes_sync;
 
 /// The refusal when a native-extension patch cannot be rebuilt here (the
@@ -936,8 +937,38 @@ fn is_confined_ext_label(full_name: &str, label: &str) -> bool {
         && is_safe_relative_subpath(label)
 }
 
-fn is_symlink(path: &Path) -> bool {
-    std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink())
+/// `Err` when `path` is a symlink, and when nothing says it is not one:
+/// only "not found" reads as no link, and a path that cannot be probed
+/// (permission denied, a parent that is no directory, an I/O error) is
+/// refused like a link ([`try_entry_type`]). For a path this module is
+/// about to follow, empty or delete; `what` is what belongs there ("an
+/// extension dir"). The error names the path.
+fn refuse_link(path: &Path, what: &str) -> std::io::Result<()> {
+    match try_entry_type(path)? {
+        Some(kind) if kind.is_symlink() => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{} is a symlink, not {what}", path.display()),
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// [`read_marker_sync`] for a caller that must not take a marker it cannot
+/// read for no marker (a rollback deciding whether the compiled code is the
+/// gem's own): `Ok(None)` only when no marker file is there. One that
+/// cannot be probed, read or understood (another schema) is an error
+/// naming it.
+fn read_marker_strict(gem_dir: &Path) -> std::io::Result<Option<BuildMarker>> {
+    let path = gem_dir.join(MARKER_FILE);
+    if try_entry_type(&path)?.is_none() {
+        return Ok(None);
+    }
+    read_marker_sync(gem_dir).map(Some).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{} could not be read as a build marker", path.display()),
+        )
+    })
 }
 
 fn read_marker_sync(gem_dir: &Path) -> Option<BuildMarker> {
@@ -1608,20 +1639,21 @@ fn recover_interrupted_rebuild_sync(
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(e) => return Err(e),
         };
-        if is_symlink(&ext) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("{} is a symlink, not an extension dir", ext.display()),
-            ));
-        }
+        refuse_link(&ext, "an extension dir")?;
         // An in-place build was under way: the gem's own tree goes back to
         // what it was before it ([`TreeSnapshot`]), whichever way the
         // extension dir is settled, since no marker speaks for what the
         // build left there. Unless one does: a run that died after it
         // recorded the build, before it dropped the parked one, left a
         // finished build that stands with its tree.
+        //
+        // Whether there is a snapshot is not guessed: one that cannot be
+        // probed may be all that says the tree holds a half-made build, and
+        // settling the extension dir without it would leave that build in
+        // the tree with nothing to undo it from.
         let snapshot = tree_snapshot_path(&ext);
-        let in_place = is_real_dir(&snapshot) && !build_committed_since(copy, &ext, &snapshot);
+        let taken = try_entry_type(&snapshot)?.is_some_and(|kind| kind.is_dir());
+        let in_place = taken && !build_committed_since(copy, &ext, &snapshot)?;
         if in_place {
             restore_tree(copy, &snapshot)?;
         }
@@ -2191,11 +2223,13 @@ fn ext_dir_label(home: &Path, ext_dir: &Path) -> String {
 /// list. `Ok(true)` when this call made the backup.
 fn back_up_original(copy: &GemCopy, probe: &Probe, absent: &[String]) -> std::io::Result<bool> {
     let backup = copy.gem_dir.join(BACKUP_DIR);
-    if std::fs::symlink_metadata(&backup).is_ok() {
+    // "Not there" is the one answer a new backup is made on: a backup or a
+    // marker that cannot be probed may hold the original build already.
+    if try_entry_type(&backup)?.is_some() {
         note_absent_files(&backup, absent)?;
         return Ok(false);
     }
-    if std::fs::symlink_metadata(copy.gem_dir.join(MARKER_FILE)).is_ok() {
+    if try_entry_type(&copy.gem_dir.join(MARKER_FILE))?.is_some() {
         return Ok(false);
     }
     let stage = copy.gem_dir.join(format!("{BACKUP_DIR}.tmp"));
@@ -2240,8 +2274,33 @@ fn back_up_original(copy: &GemCopy, probe: &Probe, absent: &[String]) -> std::io
 
 /// The description of the backup dir `backup`, when it has a readable one.
 fn read_backup_info(backup: &Path) -> Option<BackupInfo> {
-    let bytes = read_regular_to_bytes_sync(&backup.join(BACKUP_INFO)).ok()?;
-    serde_json::from_slice(&bytes).ok()
+    try_read_backup_info(backup).ok().flatten()
+}
+
+/// [`read_backup_info`] for a caller that is about to add to the backup,
+/// and must not take a description it cannot read for none: `Ok(None)`
+/// only when the backup has no description file. One that cannot be
+/// probed, read or parsed is an error naming it. (A rollback removes what
+/// the marker lists and the backup does not hold: a build recorded in the
+/// marker and not in a backup that is there would lose its files to it.)
+fn try_read_backup_info(backup: &Path) -> std::io::Result<Option<BackupInfo>> {
+    let path = backup.join(BACKUP_INFO);
+    if try_entry_type(&path)?.is_none() {
+        return Ok(None);
+    }
+    let unreadable = |why: String| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "{} could not be read as a backup's description ({why})",
+                path.display()
+            ),
+        )
+    };
+    let bytes = read_regular_to_bytes_sync(&path).map_err(|e| unreadable(e.to_string()))?;
+    serde_json::from_slice(&bytes)
+        .map(Some)
+        .map_err(|e| unreadable(e.to_string()))
 }
 
 /// Write a backup's description into `dir`: staged beside its place and
@@ -2262,7 +2321,7 @@ fn note_absent_files(backup: &Path, absent: &[String]) -> std::io::Result<()> {
     if absent.is_empty() || !is_real_dir(backup) {
         return Ok(());
     }
-    let Some(mut info) = read_backup_info(backup) else {
+    let Some(mut info) = try_read_backup_info(backup)? else {
         return Ok(());
     };
     let before = info.absent_files.len();
@@ -2443,6 +2502,50 @@ fn gem_tree_files(gem_dir: &Path) -> Vec<String> {
         .collect()
 }
 
+/// [`tree_files`] for a caller that acts on what the listing lacks (a file
+/// that is not in a snapshot is removed; one that was not snapshotted
+/// cannot be put back): `Err`, naming the tree, when any part of it cannot
+/// be read, where `tree_files` leaves that part out. Only a `dir` that is
+/// not there has no files.
+fn try_tree_files(dir: &Path) -> std::io::Result<Vec<String>> {
+    if try_entry_type(dir)?.is_none() {
+        return Ok(Vec::new());
+    }
+    let mut files = Vec::new();
+    for entry in walkdir::WalkDir::new(dir)
+        .follow_links(false)
+        .sort_by_file_name()
+    {
+        let entry = entry.map_err(|e| {
+            let kind = e
+                .io_error()
+                .map_or(std::io::ErrorKind::Other, std::io::Error::kind);
+            std::io::Error::new(kind, format!("{} could not be listed ({e})", dir.display()))
+        })?;
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        if let Ok(rel) = entry.path().strip_prefix(dir) {
+            files.push(
+                rel.components()
+                    .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                    .collect::<Vec<_>>()
+                    .join("/"),
+            );
+        }
+    }
+    Ok(files)
+}
+
+/// [`gem_tree_files`], failing where it would leave part of the tree out
+/// ([`try_tree_files`]).
+fn try_gem_tree_files(gem_dir: &Path) -> std::io::Result<Vec<String>> {
+    Ok(try_tree_files(gem_dir)?
+        .into_iter()
+        .filter(|rel| !is_own_entry(rel))
+        .collect())
+}
+
 /// The gem's own tree as it was before an in-place build: a copy of every
 /// file, beside the parked build ([`tree_snapshot_path`]).
 ///
@@ -2507,7 +2610,9 @@ fn snapshot_tree(copy: &GemCopy, ext: &Path, left: &[String]) -> std::io::Result
     std::fs::create_dir_all(&stage)?;
     let taken = (|| {
         let mut files = BTreeMap::new();
-        for rel in gem_tree_files(&copy.gem_dir) {
+        // The whole tree, or no snapshot: a file that is not in it is one
+        // the undo of a failed build removes.
+        for rel in try_gem_tree_files(&copy.gem_dir)? {
             if left.contains(&rel) {
                 continue;
             }
@@ -2564,15 +2669,39 @@ fn tree_changes(copy: &GemCopy, snapshot: &TreeSnapshot) -> TreeChanges {
 /// back (through [`replace_file`]), and the snapshot is dropped. A file
 /// that is as it was is not written, and the paths the snapshot left out
 /// are not touched. A snapshot that does not say which those are is not
-/// used: `Err`, with the tree as it is.
+/// used: `Err`, with the tree as it is. Neither is one whose copies cannot
+/// all be listed, nor is a tree that cannot be: every file the listing of
+/// the snapshot lacks is removed, so a listing that left some out would
+/// delete the gem's own files ([`try_tree_files`]). Nor is one that names a
+/// file under a link in the gem dir, which would be written through it.
 fn restore_tree(copy: &GemCopy, snapshot_dir: &Path) -> std::io::Result<()> {
     let left: Vec<String> = serde_json::from_slice(&read_regular_to_bytes_sync(
         &snapshot_dir.join(SNAPSHOT_LEFT),
     )?)
     .map_err(std::io::Error::other)?;
     let saved_tree = snapshot_dir.join(SNAPSHOT_TREE);
-    let kept: std::collections::BTreeSet<String> = tree_files(&saved_tree).into_iter().collect();
-    for rel in gem_tree_files(&copy.gem_dir) {
+    let kept: std::collections::BTreeSet<String> =
+        try_tree_files(&saved_tree)?.into_iter().collect();
+    // Each file goes back by path. A snapshot this module took holds no
+    // file under a link (links are not walked when it is taken), so one
+    // that names such a path was not taken of this tree: a gem home can
+    // come from the repository being scanned, with a snapshot planted
+    // beside a parked build and a link in the gem dir to write through.
+    // Checked for every file before any is removed or written.
+    for rel in &kept {
+        let path = copy.gem_dir.join(rel);
+        if let Some(link) = crate::utils::containment::try_linked_level(&copy.gem_dir, &path)? {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "{} is a symlink, and the snapshot at {} names {rel} under it",
+                    link.display(),
+                    snapshot_dir.display()
+                ),
+            ));
+        }
+    }
+    for rel in try_gem_tree_files(&copy.gem_dir)? {
         if !kept.contains(&rel) && !left.contains(&rel) {
             std::fs::remove_file(copy.gem_dir.join(&rel))?;
         }
@@ -2595,13 +2724,19 @@ fn restore_tree(copy: &GemCopy, snapshot_dir: &Path) -> std::io::Result<()> {
 /// for hash, what is in the gem's tree. ([`commit_build`] writes the
 /// marker before it drops the parked build, and the snapshot goes after
 /// both.)
-fn build_committed_since(copy: &GemCopy, ext: &Path, snapshot: &Path) -> bool {
+///
+/// With no marker file there, no build was recorded. A marker that cannot
+/// be probed says neither: `Err`, and the tree is not touched on a guess.
+fn build_committed_since(copy: &GemCopy, ext: &Path, snapshot: &Path) -> std::io::Result<bool> {
+    let marker = copy.gem_dir.join(MARKER_FILE);
+    if try_entry_type(&marker)?.is_none() {
+        return Ok(false);
+    }
     let written = |path: &Path| std::fs::symlink_metadata(path).and_then(|meta| meta.modified());
-    let (Ok(marked), Ok(taken)) = (written(&copy.gem_dir.join(MARKER_FILE)), written(snapshot))
-    else {
-        return false;
+    let (Ok(marked), Ok(taken)) = (written(&marker), written(snapshot)) else {
+        return Ok(false);
     };
-    ext.join(BUILD_COMPLETE).is_file()
+    Ok(ext.join(BUILD_COMPLETE).is_file()
         && marked >= taken
         && read_marker_sync(&copy.gem_dir).is_some_and(|marker| {
             !marker.grafted
@@ -2610,7 +2745,7 @@ fn build_committed_since(copy: &GemCopy, ext: &Path, snapshot: &Path) -> bool {
                         && compute_file_git_sha256_sync(&copy.gem_dir.join(rel))
                             .is_ok_and(|now| &now == hash)
                 })
-        })
+        }))
 }
 
 /// Drop what a run that died left of a [`TreeSnapshot`] of `copy`, once no
@@ -2639,6 +2774,11 @@ fn drop_stale_tree_snapshots(copy: &GemCopy) {
 /// left as recorded: that is the original, and this build ran over
 /// socket-patch's own. Without a backup of a build RubyGems made there is
 /// nothing to add to (the original is gone, and `rollback` rebuilds).
+///
+/// "Without a backup" is a backup dir, or its description, that is not
+/// there. One that is there and cannot be probed or read is an error: the
+/// build is then not recorded, and is undone
+/// ([`try_read_backup_info`]).
 fn back_up_tree_changes(
     copy: &GemCopy,
     snapshot: &TreeSnapshot,
@@ -2646,8 +2786,10 @@ fn back_up_tree_changes(
     changes: &TreeChanges,
 ) -> std::io::Result<()> {
     let backup = copy.gem_dir.join(BACKUP_DIR);
-    let known = read_backup_info(&backup).filter(|info| !info.grafted && is_real_dir(&backup));
-    let Some(mut info) = known else {
+    if !try_entry_type(&backup)?.is_some_and(|kind| kind.is_dir()) {
+        return Ok(());
+    }
+    let Some(mut info) = try_read_backup_info(&backup)?.filter(|info| !info.grafted) else {
         return Ok(());
     };
     let before = (info.lib_files.len(), info.created_files.len());
@@ -2830,11 +2972,13 @@ async fn rebuild(
                 Err(e) => {
                     // The parked build stays where it is when the tree
                     // cannot be put back: the next run tries again.
+                    // (A snapshot that cannot be probed is not taken for
+                    // none: files may be gone from the tree by now.)
                     let snapshot_dir = tree_snapshot_path(&probe.extension_dir);
-                    let undone = if is_real_dir(&snapshot_dir) {
-                        restore_tree(&copy, &snapshot_dir)
-                    } else {
-                        Ok(())
+                    let undone = match try_entry_type(&snapshot_dir) {
+                        Ok(Some(kind)) if kind.is_dir() => restore_tree(&copy, &snapshot_dir),
+                        Ok(_) => Ok(()),
+                        Err(e) => Err(e),
                     };
                     let undone = undone.and_then(|()| put_back(&copy, &probe, aside));
                     if undone.is_ok() {
@@ -2920,15 +3064,15 @@ fn stage_root(copy: &GemCopy) -> PathBuf {
 /// at all. The gem tree can come from the repository being scanned, and a
 /// stage is created, emptied and deleted by path: a link (or a file)
 /// planted at either name would steer those writes and deletes into
-/// whatever it points at. `Err` names the entry that is in the way. Every
-/// use of the stage goes through here.
-fn stage_dirs(copy: &GemCopy) -> Result<(PathBuf, PathBuf), PathBuf> {
+/// whatever it points at. An entry that cannot be probed is no better: only
+/// "not found" says nothing is there ([`ensure_dir_or_absent`]). `Err` says
+/// which entry is in the way, and how. Every use of the stage goes through
+/// here.
+fn stage_dirs(copy: &GemCopy) -> Result<(PathBuf, PathBuf), String> {
     let parent = copy.home.join(BUILD_STAGE_DIR);
     let root = stage_root(copy);
     for dir in [&parent, &root] {
-        if std::fs::symlink_metadata(dir).is_ok_and(|meta| !meta.is_dir()) {
-            return Err(dir.clone());
-        }
+        ensure_dir_or_absent(dir).map_err(|e| format!("its stage directory {e}"))?;
     }
     Ok((parent, root))
 }
@@ -2966,8 +3110,9 @@ fn unlocked_stage_is_dead(root: &Path) -> bool {
 /// one that is left is only disk space. `Err` of kind `WouldBlock`: a run
 /// that is still alive holds it ([`lock_build_dir`]); or, where a
 /// directory cannot be locked, it is not old enough to be provably dead
-/// ([`unlocked_stage_is_dead`]). A link planted where the stage goes is
-/// left alone, with whatever it points at ([`stage_dirs`]).
+/// ([`unlocked_stage_is_dead`]). A link planted where the stage goes, or
+/// an entry there that cannot be probed, is left alone, with whatever it
+/// points at ([`stage_dirs`]).
 fn sweep_stale_stage(copy: &GemCopy) -> std::io::Result<()> {
     sweep_stale_stage_with(copy, lock_build_dir)
 }
@@ -3025,12 +3170,7 @@ impl Stage {
 fn open_stage(copy: &GemCopy) -> Result<Stage, StageFailure> {
     // The stage is emptied and written under the gem home. A link planted
     // where it goes would move both somewhere else.
-    let (parent, root) = stage_dirs(copy).map_err(|planted| {
-        StageFailure::NoStage(format!(
-            "its stage directory {} is not a directory",
-            planted.display()
-        ))
-    })?;
+    let (parent, root) = stage_dirs(copy).map_err(StageFailure::NoStage)?;
     let failed = |e: std::io::Error| {
         if e.kind() == std::io::ErrorKind::WouldBlock {
             StageFailure::Busy(recovery_refusal(copy, &e))
@@ -3237,12 +3377,15 @@ fn prove_own_source(
     let mut agreed = 0;
     for rel in tree_files(staged) {
         let theirs = installed.join(&rel);
-        match std::fs::symlink_metadata(&theirs) {
-            Err(_) => continue,
-            Ok(meta) if !meta.is_file() => {
+        // Only a file that is not there is one the copy does not hold. One
+        // that cannot be probed is not compared, so it proves nothing.
+        match try_entry_type(&theirs) {
+            Ok(None) => continue,
+            Ok(Some(kind)) if !kind.is_file() => {
                 return Err(format!("{rel} is not a file in the installed gem"))
             }
-            Ok(_) => {}
+            Ok(Some(_)) => {}
+            Err(e) => return Err(format!("{rel}: in the installed gem, {e}")),
         }
         let (Ok(ours), Ok(theirs)) = (
             compute_file_git_sha256_sync(&staged.join(&rel)),
@@ -3919,11 +4062,14 @@ fn back_up_prebuilt(copy: &GemCopy, grafts: &[Graft], absent: &[String]) -> std:
         std::fs::write(&dst, read_regular_to_bytes_sync(&src)?)?;
         std::fs::set_permissions(&dst, std::fs::symlink_metadata(&src)?.permissions())
     };
-    if std::fs::symlink_metadata(&backup).is_ok() {
-        let known = read_regular_to_bytes_sync(&backup.join(BACKUP_INFO))
-            .ok()
+    // As [`back_up_original`]: only "not there" makes a new backup.
+    if let Some(kind) = try_entry_type(&backup)? {
+        let known = kind
+            .is_dir()
+            .then(|| read_regular_to_bytes_sync(&backup.join(BACKUP_INFO)).ok())
+            .flatten()
             .and_then(|bytes| serde_json::from_slice::<BackupInfo>(&bytes).ok());
-        if let Some(mut info) = known.filter(|info| info.grafted && is_real_dir(&backup)) {
+        if let Some(mut info) = known.filter(|info| info.grafted) {
             let before = (info.lib_files.len(), info.absent_files.len());
             for graft in grafts {
                 if original(&graft.target) && !info.lib_files.contains(&graft.target) {
@@ -3944,7 +4090,7 @@ fn back_up_prebuilt(copy: &GemCopy, grafts: &[Graft], absent: &[String]) -> std:
     }
     // A marker that cannot be read says nothing of which binaries are the
     // gem's own.
-    if marker.is_none() && std::fs::symlink_metadata(copy.gem_dir.join(MARKER_FILE)).is_ok() {
+    if marker.is_none() && try_entry_type(&copy.gem_dir.join(MARKER_FILE))?.is_some() {
         return Ok(false);
     }
     let fresh: Vec<&Graft> = grafts.iter().filter(|g| original(&g.target)).collect();
@@ -4143,9 +4289,9 @@ pub async fn rollback_files(
     };
     let info = crate::utils::fs::run_blocking(move || {
         let backup = copy.gem_dir.join(BACKUP_DIR);
-        if is_symlink(&backup) {
-            return None;
-        }
+        // A backup this tool made is a directory. A link there, or an
+        // entry that cannot be told from one, is not read through.
+        refuse_link(&backup, "a backup").ok()?;
         let bytes = read_regular_to_bytes_sync(&backup.join(BACKUP_INFO)).ok()?;
         serde_json::from_slice::<BackupInfo>(&bytes).ok()
     })
@@ -4962,22 +5108,31 @@ pub async fn restore_original_build(pkg_path: &Path, env: &RubyEnv) -> Result<bo
     let recovered = recover_interrupted_rebuild(&copy)
         .await
         .map_err(|e| recovery_refusal(&copy, &e))?;
-    let marker = {
-        let gem_dir = copy.gem_dir.clone();
-        crate::utils::fs::run_blocking(move || read_marker_sync(&gem_dir)).await
-    };
     let backup = copy.gem_dir.join(BACKUP_DIR);
     let pristine_hint = format!(
         "run `gem pristine {} --extensions`",
         gem_name_of(&copy.full_name)
     );
-    if is_symlink(&backup) {
-        return Err(format!(
-            "{} is a symlink, not a backup this tool made; left as it is, {pristine_hint}",
-            backup.display()
-        ));
-    }
-    let has_backup = tokio::fs::metadata(backup.join(BACKUP_INFO)).await.is_ok();
+    // What the copy carries. Only "not there" says it has no backup and no
+    // marker: one that cannot be probed or read may be all that says the
+    // compiled code is not the gem's own, and taking it for absent would
+    // report a copy with nothing to restore, or rebuild over a backup that
+    // was never put back.
+    let carried = {
+        let (gem_dir, backup) = (copy.gem_dir.clone(), backup.clone());
+        crate::utils::fs::run_blocking(move || -> std::io::Result<_> {
+            refuse_link(&backup, "a backup this tool made")?;
+            if try_entry_type(&backup.join(BACKUP_INFO))?.is_some() {
+                // The backup is this gem version's install-time build
+                // whatever the marker says, or fails to say.
+                return Ok((true, read_marker_sync(&gem_dir)));
+            }
+            Ok((false, read_marker_strict(&gem_dir)?))
+        })
+        .await
+    };
+    let (has_backup, marker) =
+        carried.map_err(|e| format!("{e}; left as it is, {pristine_hint}"))?;
     if has_backup {
         let c = copy.clone();
         return crate::utils::fs::run_blocking(move || restore_backup(&c, marker.as_ref()))
@@ -5111,18 +5266,18 @@ fn restore_backup(copy: &GemCopy, marker: Option<&BuildMarker>) -> std::io::Resu
     if info.grafted {
         restore_lib_files()?;
     } else {
-        let ext_dir = confined_ext_dir(copy, &info.extension_dir)
-            .filter(|dir| !is_symlink(dir))
-            .ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!(
-                        "the backup names {:?}, which is not this gem's extension dir under {}",
-                        info.extension_dir,
-                        copy.home.display()
-                    ),
-                )
-            })?;
+        let ext_dir = confined_ext_dir(copy, &info.extension_dir).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "the backup names {:?}, which is not this gem's extension dir under {}",
+                    info.extension_dir,
+                    copy.home.display()
+                ),
+            )
+        })?;
+        // It is emptied and refilled by path.
+        refuse_link(&ext_dir, "this gem's extension dir")?;
         // socket-patch's lib copies go; the originals come back.
         for lib in marker.iter().flat_map(|m| m.lib_artifacts.keys()) {
             if is_safe_relative_subpath(lib) && !info.lib_files.contains(lib) {
@@ -6933,7 +7088,7 @@ mod tests {
             );
             assert!(outside.join("a-1/keep").is_file(), "{case}");
             assert!(
-                is_symlink(&home.join(BUILD_STAGE_DIR)),
+                crate::utils::containment::is_link(&home.join(BUILD_STAGE_DIR)),
                 "{case}: the link is left"
             );
             let why = open_stage(&copy).err().unwrap().describe();
@@ -6951,6 +7106,166 @@ mod tests {
         assert!(outside.join("a-1/keep").is_file());
         assert!(open_stage(&copy).is_err());
         assert!(outside.join("a-1/keep").is_file());
+    }
+
+    /// Only "not found" says a path holds nothing. One that cannot be
+    /// probed (a parent that is a file; a directory that may not be
+    /// searched) may hold a planted link, so it is refused like one: the
+    /// stage is neither swept nor opened, a backup is not restored through,
+    /// and a file the own-source proof cannot look at proves nothing. Each
+    /// refusal names the path.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_unprobeable_path_is_never_taken_for_a_real_one() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let copy = installed_gem(&home, "lib");
+        std::fs::write(copy.gem_dir.join("lib/a.rb"), b"x").unwrap();
+
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&home, &link).unwrap();
+        let why = refuse_link(&link, "an extension dir").unwrap_err();
+        assert!(
+            why.to_string()
+                .contains("is a symlink, not an extension dir"),
+            "{why}"
+        );
+        refuse_link(&tmp.path().join("missing"), "a dir").unwrap();
+        refuse_link(&home, "a dir").unwrap();
+        // ENOTDIR: a file where a directory is named.
+        let through_file = copy.gem_dir.join("lib/a.rb/below");
+        let why = refuse_link(&through_file, "a dir").unwrap_err().to_string();
+        assert!(
+            why.contains("lib/a.rb/below") && why.contains("could not be checked"),
+            "{why}"
+        );
+
+        // Root searches any directory: the rest needs a user.
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipping the unreadable-directory cases: running as root");
+            return;
+        }
+        let mode = |path: &Path, mode: u32| {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap()
+        };
+
+        // A stage a dead run left, in a gem home that may not be searched.
+        let root = stage_root(&copy);
+        std::fs::create_dir_all(root.join("home")).unwrap();
+        std::fs::write(root.join("home/half"), b"x").unwrap();
+        mode(&home, 0o000);
+        let named = stage_dirs(&copy);
+        let swept = sweep_stale_stage(&copy);
+        let opened = open_stage(&copy).map(|_| ()).map_err(|e| e.describe());
+        mode(&home, 0o755);
+        for why in [named.unwrap_err(), opened.unwrap_err()] {
+            assert!(
+                why.contains(BUILD_STAGE_DIR)
+                    && why.contains("could not be checked")
+                    && why.contains("ermission denied"),
+                "{why}"
+            );
+        }
+        swept.unwrap();
+        assert!(
+            root.join("home/half").is_file(),
+            "an unverified stage was swept"
+        );
+
+        // A file the installed copy holds, where it cannot be looked at: the
+        // archive's differs, and the proof must not pass on the rest.
+        let (installed, staged) = (tmp.path().join("installed"), tmp.path().join("staged"));
+        for (tree, lib) in [(&installed, "theirs"), (&staged, "ours")] {
+            std::fs::create_dir_all(tree.join("lib")).unwrap();
+            std::fs::create_dir_all(tree.join("ext/a")).unwrap();
+            std::fs::write(tree.join("lib/a.rb"), lib).unwrap();
+            std::fs::write(tree.join("ext/a/a.c"), b"int a;").unwrap();
+        }
+        mode(&installed.join("lib"), 0o000);
+        let proved = prove_own_source(&installed, &staged, &HashMap::new());
+        mode(&installed.join("lib"), 0o755);
+        let why = proved.unwrap_err();
+        assert!(
+            why.contains("lib/a.rb") && why.contains("could not be checked"),
+            "{why}"
+        );
+        let why = prove_own_source(&installed, &staged, &HashMap::new()).unwrap_err();
+        assert!(why.contains("lib/a.rb differs"), "{why}");
+
+        // A gem dir that may not be searched: whether it holds a backup (or
+        // a link planted where one goes) cannot be told, so rollback does
+        // not report the copy as carrying none.
+        let env = RubyEnv {
+            cwd: tmp.path().to_path_buf(),
+            rebuild: true,
+            offline: true,
+        };
+        mode(&copy.gem_dir, 0o000);
+        let restored = restore_original_build(&copy.gem_dir, &env).await;
+        mode(&copy.gem_dir, 0o755);
+        let why = restored.unwrap_err();
+        assert!(
+            why.contains(BACKUP_DIR)
+                && why.contains("could not be checked")
+                && why.contains("gem pristine a"),
+            "{why}"
+        );
+        assert_eq!(restore_original_build(&copy.gem_dir, &env).await, Ok(false));
+
+        // A backup dir that may not be searched: its description cannot be
+        // probed, so the backup is not taken for missing (which would have
+        // rollback rebuild in place over it, or report nothing to restore).
+        let backup = copy.gem_dir.join(BACKUP_DIR);
+        std::fs::create_dir_all(&backup).unwrap();
+        std::fs::write(backup.join(BACKUP_INFO), b"{}").unwrap();
+        mode(&backup, 0o000);
+        let restored = restore_original_build(&copy.gem_dir, &env).await;
+        mode(&backup, 0o755);
+        let why = restored.unwrap_err();
+        assert!(
+            why.contains(BACKUP_INFO)
+                && why.contains("could not be checked")
+                && why.contains("gem pristine a"),
+            "{why}"
+        );
+        assert!(backup.join(BACKUP_INFO).is_file());
+    }
+
+    /// A marker that is there and cannot be read is not "no marker": a
+    /// rollback with no backup to restore does not report such a copy as
+    /// carrying nothing. With no marker file at all, it does.
+    #[tokio::test]
+    async fn a_marker_that_cannot_be_read_is_not_taken_for_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let copy = installed_gem(&tmp.path().join("home"), "lib");
+        let env = RubyEnv {
+            cwd: tmp.path().to_path_buf(),
+            rebuild: true,
+            offline: true,
+        };
+        assert_eq!(read_marker_strict(&copy.gem_dir).unwrap(), None);
+        assert_eq!(restore_original_build(&copy.gem_dir, &env).await, Ok(false));
+
+        let marker = copy.gem_dir.join(MARKER_FILE);
+        for unreadable in [
+            "not json".to_string(),
+            // A schema this version does not know.
+            serde_json::json!({ "schema": 99, "sources": {} }).to_string(),
+        ] {
+            std::fs::write(&marker, &unreadable).unwrap();
+            assert_eq!(read_marker_sync(&copy.gem_dir), None);
+            let why = restore_original_build(&copy.gem_dir, &env)
+                .await
+                .unwrap_err();
+            assert!(
+                why.contains(MARKER_FILE)
+                    && why.contains("could not be read as a build marker")
+                    && why.contains("gem pristine a"),
+                "{unreadable}: {why}"
+            );
+            assert!(marker.is_file(), "the marker is left");
+        }
     }
 
     /// Where a directory cannot be locked, nothing vouches that a stage is
@@ -7665,6 +7980,141 @@ mod tests {
         assert_eq!(
             std::fs::read(copy.gem_dir.join("ext/a/liba.bundle")).unwrap(),
             b"committed"
+        );
+    }
+
+    /// The snapshot and the backup of an in-place build are acted on by
+    /// what they lack: a file the snapshot does not list is removed, and a
+    /// build the backup does not record loses its files to a rollback. So
+    /// neither is used when it cannot be read whole. A gem tree that
+    /// cannot be listed gets no snapshot; a snapshot whose copies cannot be
+    /// listed restores nothing and removes nothing; a backup whose
+    /// description is there and cannot be read is not taken for no backup.
+    #[cfg(unix)]
+    #[test]
+    fn a_snapshot_or_backup_that_cannot_be_read_is_never_taken_for_none() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let (copy, probe) = in_tree_gem(tmp.path());
+        let installed = tree_bytes(&copy.gem_dir);
+        let absent = ["patches/a.patch".to_string()];
+
+        // A backup whose description is there and is not one.
+        let backup = copy.gem_dir.join(BACKUP_DIR);
+        std::fs::create_dir_all(&backup).unwrap();
+        std::fs::write(backup.join(BACKUP_INFO), b"not json").unwrap();
+        let snapshot = snapshot_tree(&copy, &probe.extension_dir, &record_paths()).unwrap();
+        build_in_tree(&copy, &probe);
+        let changes = tree_changes(&copy, &snapshot);
+        assert!(read_backup_info(&backup).is_none());
+        for why in [
+            back_up_tree_changes(&copy, &snapshot, &[], &changes).unwrap_err(),
+            note_absent_files(&backup, &absent).unwrap_err(),
+        ] {
+            let why = why.to_string();
+            assert!(
+                why.contains(BACKUP_INFO)
+                    && why.contains("could not be read as a backup's description"),
+                "{why}"
+            );
+        }
+        assert!(!backup.join("lib").exists(), "nothing was added to it");
+        // With no description at all there is no backup to add to.
+        std::fs::remove_file(backup.join(BACKUP_INFO)).unwrap();
+        back_up_tree_changes(&copy, &snapshot, &[], &changes).unwrap();
+        note_absent_files(&backup, &absent).unwrap();
+        std::fs::remove_dir_all(&backup).unwrap();
+        restore_tree(&copy, &snapshot.dir).unwrap();
+        assert_eq!(tree_bytes(&copy.gem_dir), installed);
+
+        // Root reads any directory: the rest needs a user.
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipping the unreadable-directory cases: running as root");
+            return;
+        }
+        let mode = |path: &Path, mode: u32| {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap()
+        };
+
+        // A dir of the gem's tree that cannot be listed: no snapshot is
+        // taken of the rest, since undoing a build from it would remove
+        // nothing it does not show, and put back nothing it does not hold.
+        let hidden = copy.gem_dir.join("ext/a");
+        mode(&hidden, 0o000);
+        let taken = snapshot_tree(&copy, &probe.extension_dir, &record_paths());
+        mode(&hidden, 0o755);
+        let why = taken
+            .err()
+            .expect("a partial snapshot was taken")
+            .to_string();
+        assert!(why.contains("could not be listed"), "{why}");
+        let dir = tree_snapshot_path(&probe.extension_dir);
+        assert!(!dir.exists() && !tree_snapshot_stage(&dir).exists());
+
+        // A snapshot whose copies cannot be listed: read as holding none,
+        // it would have every file of the gem removed.
+        let snapshot = snapshot_tree(&copy, &probe.extension_dir, &record_paths()).unwrap();
+        build_in_tree(&copy, &probe);
+        let built = tree_bytes(&copy.gem_dir);
+        let copies = snapshot.dir.join(SNAPSHOT_TREE);
+        mode(&copies, 0o000);
+        let restored = restore_tree(&copy, &snapshot.dir);
+        mode(&copies, 0o755);
+        let why = restored.unwrap_err().to_string();
+        assert!(why.contains("could not be listed"), "{why}");
+        assert_eq!(
+            tree_bytes(&copy.gem_dir),
+            built,
+            "the gem's files were removed"
+        );
+        assert!(
+            snapshot.dir.is_dir(),
+            "the snapshot is kept for the next run"
+        );
+        restore_tree(&copy, &snapshot.dir).unwrap();
+        assert_eq!(tree_bytes(&copy.gem_dir), installed);
+    }
+
+    /// A gem home can come from the repository being scanned, and recovery
+    /// runs before anything else is looked at. A snapshot planted beside a
+    /// parked build, naming a file under a link in the gem dir, writes
+    /// nothing through that link: no file is created or replaced outside
+    /// the gem dir, and none of the gem's own is removed.
+    #[cfg(unix)]
+    #[test]
+    fn a_planted_tree_snapshot_writes_nothing_through_a_link() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (copy, probe) = in_tree_gem(tmp.path());
+        let installed = tree_bytes(&copy.gem_dir);
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("existing"), b"mine").unwrap();
+        std::fs::create_dir_all(parked_build_path(&probe.extension_dir)).unwrap();
+        let planted = tree_snapshot_path(&probe.extension_dir);
+        std::fs::create_dir_all(planted.join(SNAPSHOT_TREE).join("out")).unwrap();
+        for name in ["created", "existing"] {
+            let file = planted.join(SNAPSHOT_TREE).join("out").join(name);
+            std::fs::write(file, b"planted").unwrap();
+        }
+        std::fs::write(planted.join(SNAPSHOT_LEFT), b"[]").unwrap();
+        std::os::unix::fs::symlink(&outside, copy.gem_dir.join("out")).unwrap();
+
+        let why = recover_interrupted_rebuild_sync(&copy, Some("lib"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            why.contains("is a symlink") && why.contains("out/created"),
+            "{why}"
+        );
+        assert!(
+            !outside.join("created").exists(),
+            "written through the link"
+        );
+        assert_eq!(std::fs::read(outside.join("existing")).unwrap(), b"mine");
+        assert_eq!(
+            tree_bytes(&copy.gem_dir),
+            installed,
+            "the gem's own files were removed"
         );
     }
 }

@@ -1051,6 +1051,20 @@ pub(super) async fn unwound_stale_cache(
     stale_cache_warning(root, purl, &name, &version, lock.as_deref(), &client).await
 }
 
+/// What is known of the upstream archive of a gem that is back on its
+/// registry entry ([`upstream_archive`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UpstreamArchive {
+    /// Its sha256 (lowercase hex) and, when the lock resolves the gem from
+    /// rubygems.org, the URL it is served at.
+    Known { sha256: String, url: Option<String> },
+    /// The lock resolves the gem from rubygems.org and pins no sha256 for
+    /// it, and the registry is not asked for one: why (it is reached over
+    /// plain http, `rubygems_secure_base`). An installed copy can then
+    /// not be told from the patched build, and the caller says so.
+    Unverified(String),
+}
+
 /// The upstream archive of the ruby-platform gem `purl`, as the lock at
 /// `root` pins it once the gem is back on its registry entry: its sha256
 /// (the `CHECKSUMS` entry, else the rubygems.org compact index, unless
@@ -1059,13 +1073,14 @@ pub(super) async fn unwound_stale_cache(
 /// it (a restore's staged text; a dry run never wrote it), else the lock is
 /// read from disk. `None` when nothing proves the sha256: a gem from
 /// another remote with no `CHECKSUMS` entry, an offline run, a registry
-/// error.
+/// error. A registry that is refused, not merely out of reach, is
+/// [`UpstreamArchive::Unverified`]: that is a setting to report.
 pub(super) async fn upstream_archive(
     root: &std::path::Path,
     restored: Option<&str>,
     purl: &str,
     offline: bool,
-) -> Option<(String, Option<String>)> {
+) -> Option<UpstreamArchive> {
     let (_, name, version) = crate::utils::purl::purl_parts(purl)?;
     let mut lock = restored.map(str::to_string);
     if lock.is_none() {
@@ -1081,10 +1096,18 @@ pub(super) async fn upstream_archive(
     let rubygems = rubygems_locked(&lock, &name, &version);
     let sha = match lock_checksum(&lock, &name, &version) {
         Some(sha) => sha,
-        None if rubygems => UpstreamClient::new(offline)
-            .rubygems_sha256(&name, &version)
-            .await
-            .ok()?,
+        None if rubygems => {
+            if offline {
+                return None;
+            }
+            if let Err(why) = super::rubygems_secure_base() {
+                return Some(UpstreamArchive::Unverified(why));
+            }
+            UpstreamClient::new(offline)
+                .rubygems_sha256(&name, &version)
+                .await
+                .ok()?
+        }
         None => return None,
     };
     let url = rubygems.then(|| {
@@ -1093,7 +1116,10 @@ pub(super) async fn upstream_archive(
             super::rubygems_base().trim_end_matches('/')
         )
     });
-    Some((sha.to_ascii_lowercase(), url))
+    Some(UpstreamArchive::Known {
+        sha256: sha.to_ascii_lowercase(),
+        url,
+    })
 }
 
 /// Whether `lock` resolves `name (version)` from a `GEM` section whose

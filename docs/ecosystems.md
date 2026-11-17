@@ -2020,7 +2020,11 @@ share must be identical. With no usable archive (`--offline` and nothing cached,
 or when the build from it fails, a gem RubyGems built is rebuilt from its installed tree instead,
 as in 5.1.0, and a precompiled gem is refused with `native_extensions_unsupported`: run `apply`
 once with network access, or put the source gem in that `cache/` directory. If you install from a
-mirror of rubygems.org, set `SOCKET_RUBYGEMS_URL` to it. The JRuby (`-java`) build of a gem ships
+mirror of rubygems.org, set `SOCKET_RUBYGEMS_URL` to it. The mirror must be reached over `https`
+(plain `http` is accepted only for a mirror on the same machine, such as `http://localhost:9292`,
+and such a request never goes through a proxy): the gem's build scripts run, so its archive and
+checksum are not fetched over a connection someone else could rewrite. Credentials in the URL
+are never printed. The JRuby (`-java`) build of a gem ships
 jars and is always refused for such a patch.
 
 A gem that builds a library into its own directory and loads it from there (an FFI gem such as
