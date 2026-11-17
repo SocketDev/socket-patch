@@ -34,10 +34,13 @@ on:
     # (pdm, pipenv, poetry, uv), where this flow does no more than find
     # that the project is not theirs. Nothing another ecosystem's flow owns
     # is here, so a change to one ecosystem starts that ecosystem's legs
-    # only.
+    # only. Three PyPI helpers that those files call, and that are no other
+    # project manager's own, are listed with them: the finder of a
+    # project's Python lock files, the spelling of a version in a wheel's
+    # file name, and the hosted scan's check of an installed wheel.
     #
     # What it does not cover: shared engine code (patch/redirect/mod.rs,
-    # hosted/, the rest of commands/), the shared test helpers and the
+    # the rest of hosted/ and of commands/), the shared test helpers and the
     # toolchain files. A change there gets its run on the push to main
     # (when the file is in the list below) or in the nightly run, not on
     # the pull request: that is the price of not running every ecosystem's
@@ -55,13 +58,16 @@ on:
       - 'crates/socket-patch-cli/src/commands/pypi_reinstall.rs'
       - 'crates/socket-patch-cli/src/commands/scan/hosted/python.rs'
       - 'crates/socket-patch-core/src/crawlers/python_crawler.rs'
+      - 'crates/socket-patch-core/src/hosted/wheel_record.rs'
       - 'crates/socket-patch-core/src/patch/redirect/requirements.rs'
       - 'crates/socket-patch-core/src/patch/redirect/upstream/pypi.rs'
       - 'crates/socket-patch-core/src/utils/pep440.rs'
+      - 'crates/socket-patch-core/src/utils/python_lock.rs'
       - 'crates/socket-patch-core/src/utils/requirements.rs'
       - 'crates/socket-patch-core/src/vendor/lock_inventory/pypi.rs'
       - 'crates/socket-patch-core/src/vendor/pypi_distribution.rs'
       - 'crates/socket-patch-core/src/vendor/pypi_requirements.rs'
+      - 'crates/socket-patch-core/src/vendor/pypi_wheel.rs'
       - 'crates/socket-patch-core/src/vex/discover/pypi_other.rs'
   push:
     branches: [main]
@@ -83,13 +89,16 @@ on:
       - 'crates/socket-patch-cli/src/commands/pypi_reinstall.rs'
       - 'crates/socket-patch-cli/src/commands/scan/hosted/python.rs'
       - 'crates/socket-patch-core/src/crawlers/python_crawler.rs'
+      - 'crates/socket-patch-core/src/hosted/wheel_record.rs'
       - 'crates/socket-patch-core/src/patch/redirect/requirements.rs'
       - 'crates/socket-patch-core/src/patch/redirect/upstream/pypi.rs'
       - 'crates/socket-patch-core/src/utils/pep440.rs'
+      - 'crates/socket-patch-core/src/utils/python_lock.rs'
       - 'crates/socket-patch-core/src/utils/requirements.rs'
       - 'crates/socket-patch-core/src/vendor/lock_inventory/pypi.rs'
       - 'crates/socket-patch-core/src/vendor/pypi_distribution.rs'
       - 'crates/socket-patch-core/src/vendor/pypi_requirements.rs'
+      - 'crates/socket-patch-core/src/vendor/pypi_wheel.rs'
       - 'crates/socket-patch-core/src/vex/discover/pypi_other.rs'
       - 'crates/socket-patch-cli/tests/e2e_bazel_build/main.rs'
       - 'crates/socket-patch-core/src/patch/redirect/**'
@@ -111,8 +120,11 @@ on:
 permissions:
   contents: read
 
+# The nightly run has a group of its own. A group holds one pending run, so
+# in the group of main's pushes a second push would replace a nightly that
+# waits behind the first, and the nightly is the only run with the macOS leg.
 concurrency:
-  group: bazel-pypi-${{ github.event.pull_request.number || github.ref }}
+  group: bazel-pypi-${{ github.event.pull_request.number || github.ref }}${{ github.event_name == 'schedule' && '-nightly' || '' }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:

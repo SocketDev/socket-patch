@@ -11,8 +11,14 @@
 //!   so no cache holds them.
 //! - (b) `socket-patch scan --mode hosted --yes` rewrites
 //!   `requirements.txt`, and nothing else: the pin of the package becomes a
-//!   direct reference to the patched wheel, with its sha256.
-//! - (c) The same two Bazel commands, with no step in between, print the
+//!   direct reference to the patched wheel, with its sha256. Where Bazel's
+//!   lock records what the hub learned from the index (Bazel 8.5 and
+//!   later), that leaves `MODULE.bazel.lock` stale: a build that may not
+//!   update it (`--lockfile_mode=error`, as a CI with a frozen lock runs
+//!   it) fails right after the scan, until a build that may update the
+//!   lock, or `bazel mod deps --lockfile_mode=update`, has rewritten it
+//!   and the user has committed that. On an older Bazel that build passes.
+//! - (c) With no other step, the two Bazel commands of (a) print the
 //!   patched marker. The wheel came from the stand-in patch host, and the
 //!   hub did not ask the index about the package. Where Bazel's lock
 //!   records what the hub learned from the index (Bazel 8.5 and later),
@@ -22,19 +28,18 @@
 //!   checkout stands: the next build changes no file, and a
 //!   `--lockfile_mode=error` build passes.
 //! - (d) `socket-patch rollback --yes` restores `requirements.txt` byte for
-//!   byte, at once. Bazel's change to its own lock stays until the next
-//!   build, which asks the index about the package again, prints the
-//!   unpatched marker and writes the lock of before: from then on every
-//!   file of the checkout is the one of before.
+//!   byte, at once. Bazel's change to its own lock stays, so on Bazel 8.5
+//!   and later the lock is stale again and a `--lockfile_mode=error` build
+//!   fails right after the rollback as it did right after the scan. The
+//!   next build that may update the lock asks the index about the package
+//!   again, prints the unpatched marker and writes the lock of before:
+//!   from then on every file of the checkout is the one of before.
 //! - (e) On a second machine (a new output base), a patch service grants
 //!   another patch of the package and its host serves other bytes than the
 //!   grant pins: after the same `scan`, the build fails on the sha256.
 //!
 //! The marker is read from what Bazel built, and the patched one holds an
-//! id made for the run, so no cache of an earlier run can supply it. Step
-//! (d) is written out here and not taken from the harness, whose undo
-//! expects every file back before the next build: here that build brings
-//! back Bazel's lock.
+//! id made for the run, so no cache of an earlier run can supply it.
 //!
 //! One loopback server stands in for four hosts. The Socket API and the
 //! patch host answer at their own paths; `pypi.org` (the project pages of
@@ -94,6 +99,8 @@ const FIXTURE: Fixture = Fixture {
     workflow: "bazel-pypi.yml",
     eras: &[
         // rules_python 2.5.0-rc4, with the Python 3.11 of its toolchain.
+        // It ran on Bazel 9.3.2, 8.8.2 and 7.7.2, the legs of the workflow:
+        // every other release of the range is untested.
         ((7, 0, 0)..(10, 0, 0), "e9"),
     ],
 };
@@ -226,7 +233,9 @@ fn publish(standin: &StandIn, wheel: &Wheel) {
 
 /// The Socket API on `standin`: one free patch of the package, granted as a
 /// wheel with the sha256 of `pinned` on the patch host this server plays.
-/// Returns the route of that wheel, which is not served yet.
+/// Returns the route of that wheel, which is not served yet. The reference
+/// is the one `patched_wheel::mount_grant` also writes, for a server of the
+/// in-process suites: a change to the shape of a grant is a change to both.
 fn grant(standin: &StandIn, uuid: &str, pinned: &Wheel) -> String {
     let filename = pinned.filename();
     let route = format!("/patch/pypi/{NAME}/{VERSION}/grant-token/{uuid}/{filename}");
@@ -287,6 +296,32 @@ fn forget(lock: &mut Value, name: &str) {
     }
 }
 
+/// The build of a CI that holds Bazel's lock frozen, right after the
+/// `socket-patch` command `after` and before any build that may update the
+/// lock. `stale` says whether the command left the lock stale, which it
+/// does exactly where the lock records what the hub learned from the index:
+/// there Bazel must refuse the build over the facts the hub changed, and
+/// elsewhere the build must pass.
+fn frozen_build(cell: &Cell, after: &str, stale: bool) {
+    let build = cell.bazel("build", &["--lockfile_mode=error", CONSUMER]);
+    let refused = build.stderr().contains("has changed its facts");
+    assert!(
+        build.ok() != stale && refused == stale,
+        "{}: right after `{after}`, a `--lockfile_mode=error` build on Bazel {} must {}. From \
+         Bazel 8.5 on, {LOCK} is stale after the command: a user has to run a build that may \
+         update it, or `bazel mod deps --lockfile_mode=update`, and commit the lock before a CI \
+         with a frozen lock passes. An older Bazel keeps nothing of the index in its lock.\n{}",
+        cell.test,
+        cell.release(),
+        if stale {
+            "fail on the facts the hub changed"
+        } else {
+            "pass"
+        },
+        build.dump()
+    );
+}
+
 /// The flow of the module docs.
 #[test]
 #[ignore = "real Bazel; run with --ignored"]
@@ -342,6 +377,11 @@ fn hosted_pip_parse() {
     // before without the index entry of the package. Bazel records such
     // entries from 8.5 on, so 9.3.2 and 8.8.2 have one to drop and 7.7.2
     // has none: each release is held to its case, and so to its undo.
+    // 8.5.0 is read from Bazel's source: it is the first release whose
+    // lock keeps the facts of a module extension (bazelbuild/bazel#27296;
+    // `Facts.java` is in the tag 8.5.0 and not in 8.4.2), which is where
+    // rules_python keeps what the index said. No release between 7.7.2
+    // and 8.8.2 ran.
     let lock = |tree: &Tree| -> Value { serde_json::from_slice(&tree[LOCK]).expect("a JSON lock") };
     let mut patched_lock = lock(&before);
     forget(&mut patched_lock, NAME);
@@ -372,8 +412,11 @@ fn hosted_pip_parse() {
     );
     assert_eq!(standin.asked(&patched_route), 0, "{test}: {said}");
     let index_requests = standin.asked(&page);
+    // The scan left Bazel's lock as it was, so a frozen lock fails here
+    // where that lock records the index.
+    frozen_build(&cell, "scan --mode hosted", recorded);
 
-    // (c) The same build, no step in between: patched, from the patch
+    // (c) The build of (a) and no other step: patched, from the patch
     // host, and without a question to the index about the package.
     cell.builds(&marker);
     assert!(
@@ -394,9 +437,12 @@ fn hosted_pip_parse() {
     cell.builds_patched(&built, &marker);
 
     // (d) The undo: `requirements.txt` is the one of before at once, and
-    // the lock is still the one of the patched build. The next build asks
+    // the lock is still the one of the patched build, so a frozen lock
+    // fails again where that lock records the index. The next build asks
     // the index about the package again, prints the unpatched marker and
-    // puts the lock back.
+    // puts the lock back. The step is written out and not `Cell::undone`,
+    // which expects every file back before that build: here it is that
+    // build which brings back Bazel's lock.
     let undo = socket_patch(&cell, &standin, &["rollback", "--yes"]);
     let said = &undo.dump;
     assert_eq!(undo.code, 0, "{test}: {said}");
@@ -408,6 +454,7 @@ fn hosted_pip_parse() {
         bazel_rewrites,
         "{test}: {said}"
     );
+    frozen_build(&cell, "rollback", recorded);
     cell.builds(UNPATCHED);
     assert_eq!(changed(&before, &cell.tree()), NOTHING, "{test}");
     assert!(
@@ -451,11 +498,17 @@ fn hosted_pip_parse() {
 
     println!(
         "{test}: Bazel {release} built {marker:?} from `{direct}` after `scan --mode hosted`, and \
-         rewrote {bazel_rewrites:?} itself; `rollback` restored {REQUIREMENTS} at once, and the \
-         next build printed {UNPATCHED:?} and left all {} files as before; other bytes at the \
+         rewrote {bazel_rewrites:?} itself; a `--lockfile_mode=error` build right after the scan, \
+         and again right after `rollback`, {}; `rollback` restored {REQUIREMENTS} at once, and \
+         the next build printed {UNPATCHED:?} and left all {} files as before; other bytes at the \
          patch host failed a second machine's build ({refusal}); the stand-in answered {} \
          requests for the project page, {} for the upstream wheel, {} for the patched wheel and \
          {} for the pages of other projects; {:?}",
+        if recorded {
+            "failed on the stale lock"
+        } else {
+            "passed"
+        },
         before.len(),
         standin.asked(&page),
         standin.asked(&upstream_route),
