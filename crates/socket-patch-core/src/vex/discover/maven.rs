@@ -214,32 +214,56 @@ pub(crate) async fn extract(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
     }
 
     let gas = live_gas(&pom.deps);
-    let reactor = crate::vendor::jvm::maven_reactor::declares_modules(&raw)
-        || (crate::vendor::jvm::maven_reactor::may_discover_subprojects(&raw, config.as_deref())
-            && !crate::vendor::jvm::maven_reactor::implicit_subprojects_in(&ctx.view)
-                .await
-                .is_empty());
-    // A reactor is read whole; one whose poms cannot all be read falls
-    // back to its root pom, whose pin then stays a ref and is not attested.
-    let unread_reactor = match reactor {
-        true => {
-            extract_hosted_reactor(ctx, &raw, config.as_deref(), &user_properties, &hosted, out)
-                .await
-                .err()
-        }
-        false => None,
+    // The project as the hosted rewriter reads it: every pom of a reactor,
+    // and each parent pom one inherits from inside the checkout. Hosted
+    // wiring may sit in any of them, so whenever there is more than the
+    // root pom they are read together. A pom of the reactor that cannot
+    // be read is left out: the pins of the others are still refs, and
+    // none is attested. Only a root pom the reactor reader cannot parse
+    // falls back to the single-pom reading below.
+    use crate::vendor::jvm::maven_reactor::{heads_reactor_in, read_reactor, HostedReactor};
+    let texts = read_reactor(&ctx.view, &raw, config.as_deref(), |rel| async move {
+        ctx.read_text_quiet(&rel).await
+    })
+    .await;
+    let heads_reactor = heads_reactor_in(&ctx.view, &raw, config.as_deref()).await;
+    let reactor = {
+        let read = |rel: &str| texts.get(rel).map(|text| text.clone().into_bytes());
+        let list = |dir: &str| crate::patch::redirect::gradle::key_list(&texts, dir);
+        HostedReactor::read_what_is_there(&read, &list)
     };
-    if !reactor || unread_reactor.is_some() {
-        extract_hosted(
-            ctx,
-            (&raw, &pom),
-            &gas,
-            &hosted,
-            unread_reactor.as_deref(),
-            config.as_deref(),
-            out,
-        )
-        .await;
+    match reactor {
+        Ok((reactor, unread)) if heads_reactor || reactor.scope().len() > 1 => {
+            extract_hosted_reactor(
+                ctx,
+                (&reactor, &unread),
+                &texts,
+                config.as_deref(),
+                &user_properties,
+                &hosted,
+                out,
+            )
+            .await;
+        }
+        reactor => {
+            let unread = reactor.err().filter(|_| heads_reactor).map(|refusal| {
+                refusal
+                    .detail
+                    .strip_prefix("reason: ")
+                    .unwrap_or(&refusal.detail)
+                    .to_string()
+            });
+            extract_hosted(
+                ctx,
+                (&raw, &pom),
+                &gas,
+                &hosted,
+                unread.as_deref(),
+                config.as_deref(),
+                out,
+            )
+            .await;
+        }
     }
     if !vendored.is_empty() {
         extract_vendored(ctx, &pom.deps, &vendored, out).await;
@@ -530,72 +554,12 @@ async fn extract_hosted(
 
 // ── hosted, in a reactor ─────────────────────────────────────────────────
 
-/// How many rounds [`reactor_texts`] reads (see the hosted engine's
-/// `read_maven_reactor`, which reads the same poms the same way).
-const MAX_REACTOR_READ_ROUNDS: usize = 64;
-
-/// Every pom the reactor planner reads for the root pom `root`, by
-/// root-relative path (the root and `.mvn/maven.config` included): it is
-/// asked what it reads until it asks for nothing new.
-async fn reactor_texts(
-    ctx: &DiscoverCtx<'_>,
-    root: &str,
-    config: Option<&str>,
-    out: &mut Discovery,
-) -> BTreeMap<String, String> {
-    use crate::vendor::jvm::maven_reactor::{
-        implicit_subprojects_in, may_discover_subprojects, readable_for_hosted,
-    };
-    let mut texts = BTreeMap::from([(POM.to_string(), root.to_string())]);
-    if let Some(config) = config {
-        texts.insert(MVN_CONFIG.to_string(), config.to_string());
-    }
-    if may_discover_subprojects(root, config) {
-        for dir in implicit_subprojects_in(&ctx.view).await {
-            let rel = format!("{dir}/{POM}");
-            if let Some(text) = ctx.read_text(&rel, out).await {
-                texts.insert(rel, text);
-            }
-        }
-    }
-    let mut asked: BTreeSet<String> = BTreeSet::new();
-    for _ in 0..MAX_REACTOR_READ_ROUNDS {
-        let wanted: std::cell::RefCell<BTreeSet<String>> = Default::default();
-        {
-            let read = |rel: &str| match texts.get(rel) {
-                Some(text) => Some(text.clone().into_bytes()),
-                None => {
-                    // A pom only: what else the planner asks about (a
-                    // module's `.mvn`, a module path that is a directory)
-                    // does not change what the poms wire.
-                    if rel.ends_with(".xml") && !asked.contains(rel) {
-                        wanted.borrow_mut().insert(rel.to_string());
-                    }
-                    None
-                }
-            };
-            let list = |dir: &str| crate::patch::redirect::gradle::key_list(&texts, dir);
-            readable_for_hosted(&read, &list);
-        }
-        let wanted = wanted.into_inner();
-        if wanted.is_empty() {
-            break;
-        }
-        for rel in wanted {
-            if let Some(text) = ctx.read_text(&rel, out).await {
-                texts.insert(rel.clone(), text);
-            }
-            asked.insert(rel);
-        }
-    }
-    texts
-}
-
-/// The hosted pins of a reactor (`patch::redirect::plan_maven_reactor`):
-/// read from every pom the reactor planner reads, since a pin sits in the
-/// pom of the modules that select the patched version, a declaration is
-/// rewritten where it stands, and a `${property}` version may be wired
-/// through the property in another pom. The `<repository>` (in the local
+/// The hosted pins of a reactor, or of a single pom that inherits from a
+/// parent pom inside the checkout (the reactor planner's wiring,
+/// `HostedReactor::plan`): read from every pom the planner reads, since a
+/// pin sits in the pom of the modules that select the patched version, a
+/// declaration is rewritten where it stands, and a `${property}` version
+/// may be wired through the property in another pom. The `<repository>` (in the local
 /// root a wired pom inherits from) names the patch uuid; a pin's comment
 /// names it too, and any other suffixed version is tied to it by its
 /// 8-hex suffix, as in a single pom.
@@ -604,23 +568,20 @@ async fn reactor_texts(
 /// remove undo each). The patch is attested only when every module that
 /// resolves the base version, or may, is reached by a pin or a declaration
 /// of the patch, and no declaration may still build the base version
-/// ([`hosted_unattestable`](crate::vendor::jvm::maven_reactor::hosted_unattestable),
+/// ([`HostedReactor::unattestable`](crate::vendor::jvm::maven_reactor::HostedReactor::unattestable),
 /// the rule vendored mode attests by). What Maven selects is read from the
 /// local Maven repository, on disk only: in memory, a module the wiring
 /// does not reach withholds the attestation.
 async fn extract_hosted_reactor(
     ctx: &DiscoverCtx<'_>,
-    root: &str,
+    (reactor, unread): (&crate::vendor::jvm::maven_reactor::HostedReactor, &[String]),
+    texts: &BTreeMap<String, String>,
     config: Option<&str>,
     user_properties: &BTreeMap<String, String>,
     root_hosted: &BTreeMap<String, String>,
     out: &mut Discovery,
-) -> Result<(), String> {
+) {
     use crate::crawlers::maven_selection::MavenSelection;
-    use crate::vendor::jvm::maven_reactor::{hosted_sites, hosted_unattestable};
-    let texts = reactor_texts(ctx, root, config, out).await;
-    let read = |rel: &str| texts.get(rel).map(|text| text.clone().into_bytes());
-    let list = |dir: &str| crate::patch::redirect::gradle::key_list(&texts, dir);
 
     // uuid -> its repository's url, and the poms that declare it.
     let mut hosted: BTreeMap<String, (String, BTreeSet<String>)> = root_hosted
@@ -632,11 +593,11 @@ async fn extract_hosted_reactor(
             )
         })
         .collect();
-    for (rel, text) in texts.iter().filter(|(rel, _)| rel.ends_with(".xml")) {
-        if rel == POM {
-            continue;
-        }
-        let Ok(pom) = parse_pom_with(text, user_properties) else {
+    for rel in reactor.scope().iter().filter(|rel| *rel != POM) {
+        let Some(Ok(pom)) = texts
+            .get(rel)
+            .map(|text| parse_pom_with(text, user_properties))
+        else {
             continue;
         };
         for repo in pom.repos.iter().filter(|repo| !repo.in_profile) {
@@ -655,13 +616,7 @@ async fn extract_hosted_reactor(
         }
     }
 
-    let sites = hosted_sites(&read, &list).map_err(|refusal| {
-        refusal
-            .detail
-            .strip_prefix("reason: ")
-            .unwrap_or(&refusal.detail)
-            .to_string()
-    })?;
+    let sites = reactor.sites();
     // uuid -> the (purl, g, a, suffixed version, poms) pins that tie to it.
     type Tie = (String, String, String, String, BTreeSet<String>);
     let mut ties: BTreeMap<String, Vec<Tie>> = BTreeMap::new();
@@ -816,14 +771,14 @@ async fn extract_hosted_reactor(
             version: base,
             uuid,
         };
-        let why = match hosted_unattestable(
-            &read,
-            &list,
-            &coords,
-            selection.as_ref().expect("read above"),
-        ) {
-            Ok(why) => why,
-            Err(refusal) => Some(refusal.detail),
+        // A pom that could not be read may declare the base version
+        // itself, whatever the others are wired to.
+        let why = match unread.first() {
+            Some(first) => Some(format!(
+                "a pom of it cannot be read ({first}), so whether that module builds \
+                 {group}:{artifact} unpatched is not known"
+            )),
+            None => reactor.unattestable(&coords, selection.as_ref().expect("read above")),
         };
         if let Some(why) = why {
             out.unattested(
@@ -839,7 +794,6 @@ async fn extract_hosted_reactor(
             );
         }
     }
-    Ok(())
 }
 
 /// Whether the root pom itself declares `group:artifact`'s main jar among
@@ -2424,6 +2378,68 @@ mod tests {
         let out = run(&p).await;
         assert_eq!(sources(&out), ["a/pom.xml", "pom.xml"]);
         assert!(out.unattested.is_empty(), "{:?}", out.unattested);
+    }
+
+    /// A single pom that inherits from a parent pom inside the checkout
+    /// (no `<modules>`) may be wired through that parent: the property
+    /// the declaration reads, and the repository, sit in the parent's pom.
+    /// Both poms are read, and the parent is a file of the ref, so
+    /// rollback and remove undo it there.
+    #[tokio::test]
+    async fn hosted_wiring_in_a_parent_pom_of_the_checkout_is_found() {
+        let p = Project::new();
+        p.write(
+            "pom.xml",
+            format!(
+                "<project>\n<modelVersion>4.0.0</modelVersion>\n<parent>\n\
+                 <groupId>com.example</groupId>\n<artifactId>parent</artifactId>\n\
+                 <version>1.0.0</version>\n<relativePath>parent/pom.xml</relativePath>\n\
+                 </parent>\n<artifactId>app</artifactId>\n<dependencies>\n{}</dependencies>\n\
+                 </project>\n",
+                dep("org.slf4j", "slf4j-api", Some("${slf4j.version}"))
+            ),
+        );
+        p.write(
+            "parent/pom.xml",
+            format!(
+                "<project>\n<modelVersion>4.0.0</modelVersion>\n<groupId>com.example</groupId>\n\
+                 <artifactId>parent</artifactId>\n<version>1.0.0</version>\n\
+                 <packaging>pom</packaging>\n<properties>\n<slf4j.version>{}</slf4j.version>\n\
+                 </properties>\n<repositories>\n{}</repositories>\n</project>\n",
+                suffixed(UUID_A),
+                hosted_repo_a()
+            ),
+        );
+        let out = run(&p).await;
+        assert_eq!(sources(&out), ["parent/pom.xml"]);
+        assert_refs(&out, &[(FX_PURL, UUID_A, WiringMode::Hosted)]);
+        assert!(out.unattested.is_empty(), "{:?}", out.unattested);
+    }
+
+    /// A reactor one of whose poms cannot be read is still read for the
+    /// pins of the others, which stay refs (rollback, remove and list find
+    /// them) and are not attested: the unread module may declare the base
+    /// version itself.
+    #[tokio::test]
+    async fn hosted_pins_of_a_reactor_with_an_unread_module_are_found_not_attested() {
+        let pin = format!(
+            "<dependencyManagement>\n<dependencies>\n<!-- socket-patch {UUID_A}: \
+             org.slf4j:slf4j-api:1.7.36 -->\n{}</dependencies>\n</dependencyManagement>\n",
+            dep("org.slf4j", "slf4j-api", Some(&suffixed(UUID_A)))
+        );
+        let p = Project::new();
+        p.write("pom.xml", reactor_root(""));
+        p.write("a/pom.xml", reactor_module("a", &pin));
+        // (b is listed and missing.)
+        let out = run(&p).await;
+        assert_eq!(sources(&out), ["a/pom.xml", "pom.xml"]);
+        assert_eq!(out.unattested.len(), 1, "{:?}", out.unattested);
+        assert_eq!(out.unattested[0].kind, UnattestedKind::MavenReactorRoot);
+        assert!(
+            out.unattested[0].detail.contains("<module>b</module>"),
+            "{}",
+            out.unattested[0].detail
+        );
     }
 
     /// #1809: a Maven 4 (model 4.1.0) `pom`-packaged root listing no

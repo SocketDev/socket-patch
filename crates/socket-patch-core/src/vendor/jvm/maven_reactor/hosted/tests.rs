@@ -89,7 +89,11 @@ fn selecting(files: &Fs, picks: &[(&str, Result<&str, &str>)]) -> MavenSelection
     MavenSelection::answering(&modules, &picks)
 }
 
-fn planned(files: &Fs, selection: Option<&MavenSelection>) -> HostedPlan {
+/// Where the grant serves the patch from.
+const INDEX_URL: &str =
+    "https://patch.socket.dev/patch-registry/maven/tok/4d5e6f70-8192-4a3b-9c4d-5e6f708192a3/maven2";
+
+fn reactor(files: &Fs) -> HostedReactor {
     let read = |rel: &str| files.get(rel).map(|text| text.clone().into_bytes());
     let list = |dir: &str| {
         let bytes: BTreeMap<String, Vec<u8>> = files
@@ -98,7 +102,29 @@ fn planned(files: &Fs, selection: Option<&MavenSelection>) -> HostedPlan {
             .collect();
         crate::vendor::jvm::testing::list_of(&bytes, dir)
     };
-    plan_hosted(&read, &list, &coords(), selection).expect("a plan")
+    HostedReactor::read(&read, &list).expect("a reactor")
+}
+
+/// Whether `files` head a reactor, which is how a rollback reads them.
+fn heads_reactor(files: &Fs) -> bool {
+    files.keys().filter(|rel| rel.ends_with("pom.xml")).count() > 1
+}
+
+/// The plan for `c` over `files`, with the hosted rewriter's own
+/// repository edits and restore.
+fn planned_for(files: &Fs, c: &Coords<'_>, selection: Option<&MavenSelection>) -> HostedPlan {
+    let index_url = INDEX_URL.replace(UUID, c.uuid);
+    crate::patch::redirect::with_hosted_repository(
+        c,
+        &index_url,
+        &BTreeMap::new(),
+        heads_reactor(files),
+        |repository| reactor(files).plan(c, selection, repository),
+    )
+}
+
+fn planned(files: &Fs, selection: Option<&MavenSelection>) -> HostedPlan {
+    planned_for(files, &coords(), selection)
 }
 
 fn written(files: &Fs, plan: &HostedPlan) -> Fs {
@@ -107,20 +133,103 @@ fn written(files: &Fs, plan: &HostedPlan) -> Fs {
     out
 }
 
-/// Every pom of `after` unwired again, which must be `before`.
+/// `files` as a rollback of the patch `c` leaves them: every pom through
+/// the restore `rollback` runs.
+fn rolled_back_for(files: &Fs, c: &Coords<'_>) -> Fs {
+    let index_url = INDEX_URL.replace(UUID, c.uuid);
+    let pin = crate::patch::redirect::upstream::maven::PinIn {
+        group: c.group_id,
+        artifact: c.artifact_id,
+        base: c.version,
+        uuid: c.uuid,
+        reactor: heads_reactor(files),
+    };
+    let hosted_uuid = |url: &str| (url == index_url).then(|| c.uuid.to_string());
+    files
+        .iter()
+        .map(|(rel, text)| {
+            let done = crate::patch::redirect::upstream::maven::restore_pom(
+                rel,
+                text,
+                &BTreeMap::new(),
+                &pin,
+                &hosted_uuid,
+            )
+            .unwrap_or_else(|why| panic!("{rel}: {why}"));
+            (rel.clone(), done.text)
+        })
+        .collect()
+}
+
+/// Every pom of `after` rolled back, which must be `before`.
 fn assert_unwires_to(after: &Fs, before: &Fs) {
-    for (rel, text) in after {
-        assert_eq!(
-            unwire_hosted(text, &coords(), false, true).as_deref(),
-            Ok(before[rel].as_str()),
-            "{rel}"
-        );
+    assert_eq!(&rolled_back_for(after, &coords()), before);
+}
+
+/// THE INVARIANT, on poms as written: a pom names a `-socket.<hex8>`
+/// version only when a declaration Maven always reads resolves to it (so
+/// discovery finds it, in every pom that names it) and its local root
+/// declares the repository that serves it; and no pom declares a hosted
+/// repository whose suffix no pom names.
+fn assert_invariant(files: &Fs) {
+    let reactor = reactor(files);
+    let sites = reactor.sites();
+    let repositories = |text: &str| -> Vec<String> {
+        crate::patch::redirect::generation::named_generations(text)
+            .into_iter()
+            .collect()
+    };
+    for (rel, text) in files {
+        let (masked, _) = super::super::mask(text);
+        for (at, _) in masked.match_indices("-socket.") {
+            let hex8 = &masked[at + 8..at + 16];
+            let site = sites
+                .iter()
+                .find(|site| site.suffixed.ends_with(hex8) && site.rels.contains(rel))
+                .unwrap_or_else(|| panic!("{rel} names -socket.{hex8}, which discovery cannot find: {sites:?}\n{text}"));
+            // The root of the chain: the last pom a child inherits from.
+            let served = files.iter().any(|(_, other)| {
+                repositories(other)
+                    .iter()
+                    .any(|uuid| uuid.starts_with(hex8))
+            });
+            assert!(
+                served,
+                "{rel} names {} with no repository for it",
+                site.suffixed
+            );
+        }
+        for uuid in repositories(text) {
+            assert!(
+                sites.iter().any(|site| site.suffixed.ends_with(&uuid[..8])),
+                "{rel} declares the repository of {uuid}, which no pom names: {text}"
+            );
+        }
     }
 }
 
+fn is_repository(kind: HostedEditKind) -> bool {
+    matches!(
+        kind,
+        HostedEditKind::Repository
+            | HostedEditKind::RepositoryUrl
+            | HostedEditKind::RepositoryRemoved
+    )
+}
+
+/// The pom edits of `plan`, the repository's apart ([`repositories`]).
 fn kinds(plan: &HostedPlan) -> Vec<(&str, HostedEditKind)> {
     plan.edits
         .iter()
+        .filter(|edit| !is_repository(edit.kind))
+        .map(|edit| (edit.rel.as_str(), edit.kind))
+        .collect()
+}
+
+fn repositories(plan: &HostedPlan) -> Vec<(&str, HostedEditKind)> {
+    plan.edits
+        .iter()
+        .filter(|edit| is_repository(edit.kind))
         .map(|edit| (edit.rel.as_str(), edit.kind))
         .collect()
 }
@@ -150,7 +259,10 @@ fn a_pin_goes_in_the_module_that_selects_the_version_and_no_other() {
     let plan = planned(&files, Some(&selection));
     assert_eq!(kinds(&plan), [("a/pom.xml", HostedEditKind::Pin)]);
     assert!(plan.wired);
-    assert_eq!(plan.roots, ["pom.xml"]);
+    assert_eq!(
+        repositories(&plan),
+        [("pom.xml", HostedEditKind::Repository)]
+    );
     let a = &plan.poms["a/pom.xml"];
     assert!(
         a.contains(&format!(
@@ -210,6 +322,10 @@ fn a_declaration_of_the_version_is_rewritten_and_needs_no_pin() {
         files["a/pom.xml"].replace(BASE, SV),
         "only the version text changes"
     );
+    assert_eq!(
+        repositories(&plan),
+        [("pom.xml", HostedEditKind::Repository)]
+    );
     assert!(reasons(&plan).is_empty(), "{:?}", plan.notes);
     assert_unwires_to(&written(&files, &plan), &files);
     // The declaration is rewritten whatever Maven selects elsewhere, since
@@ -238,12 +354,10 @@ fn a_property_only_the_artifact_reads_is_rewritten_itself() {
     assert_eq!(kinds(&plan), [("pom.xml", HostedEditKind::Property)]);
     assert_eq!(plan.edits[0].property.as_deref(), Some("victim.version"));
     assert_eq!(plan.edits[0].original.as_deref(), Some(BASE));
-    assert_eq!(
-        plan.poms["pom.xml"],
-        files["pom.xml"].replace(
-            "<victim.version>1.10.0</victim.version>",
-            &format!("<victim.version>{SV}</victim.version>")
-        )
+    assert!(
+        plan.poms["pom.xml"].contains(&format!("<victim.version>{SV}</victim.version>"))
+            && !plan.poms.contains_key("a/pom.xml"),
+        "the property takes the version, the declarations keep their text"
     );
     assert!(plan.wired);
     let after = written(&files, &plan);
@@ -275,13 +389,19 @@ fn a_property_a_sibling_reads_is_left_alone() {
     assert_eq!(kinds(&plan), [("pom.xml", HostedEditKind::Version)]);
     assert_eq!(plan.edits[0].original.as_deref(), Some("${lib.version}"));
     let pom = &plan.poms["pom.xml"];
-    assert_eq!(
-        *pom,
-        files["pom.xml"].replacen(
-            "<version>${lib.version}</version>",
-            &format!("<version>{SV}</version><!-- socket-patch:version ${{lib.version}} -->"),
-            1
-        )
+    assert!(
+        pom.starts_with(
+            files["pom.xml"]
+                .replacen(
+                    "<version>${lib.version}</version>",
+                    &format!(
+                        "<version>{SV}</version><!-- socket-patch:version ${{lib.version}} -->"
+                    ),
+                    1
+                )
+                .trim_end_matches("</project>\n")
+        ),
+        "{pom}"
     );
     assert!(
         pom.contains("<lib.version>1.10.0</lib.version>")
@@ -475,8 +595,28 @@ fn a_pin_that_would_move_a_module_is_taken_out() {
             ("a/pom.xml", HostedEditKind::Pin)
         ]
     );
-    assert_eq!(plan.poms["pom.xml"], files["pom.xml"]);
-    assert_unwires_to(&written(&pinned, &plan), &files);
+    assert!(
+        !plan.poms["pom.xml"].contains(SV) && plan.poms["pom.xml"].contains("<repository>"),
+        "the pin goes from the root, the repository a still needs stays"
+    );
+    let after = written(&pinned, &plan);
+    assert_invariant(&after);
+    assert_unwires_to(&after, &files);
+
+    // No module selects the version any more: the last pin goes, and the
+    // repository with it, so nothing of the patch is left to roll back.
+    let none = selecting(
+        &after,
+        &[("a/pom.xml", Ok("1.11.0")), ("b/pom.xml", Ok("1.11.0"))],
+    );
+    let plan = planned(&after, Some(&none));
+    assert_eq!(kinds(&plan), [("a/pom.xml", HostedEditKind::PinRemoved)]);
+    assert_eq!(
+        repositories(&plan),
+        [("pom.xml", HostedEditKind::RepositoryRemoved)]
+    );
+    assert!(plan.unnamed && !plan.wired);
+    assert_eq!(written(&after, &plan), files, "as before the first scan");
 }
 
 /// A pin of an earlier patch of the same version moves to this patch
@@ -494,6 +634,14 @@ fn a_pin_of_an_earlier_patch_moves_to_this_one() {
     )]);
     let plan = planned(&earlier, Some(&selection));
     assert_eq!(kinds(&plan), [("pom.xml", HostedEditKind::PinMoved)]);
+    assert_eq!(
+        repositories(&plan),
+        [
+            ("pom.xml", HostedEditKind::Repository),
+            ("pom.xml", HostedEditKind::RepositoryRemoved)
+        ]
+    );
+    assert_eq!(plan.superseded, ["1.10.0-socket.0a1b2c3d"]);
     assert_eq!(plan.poms["pom.xml"], pinned["pom.xml"]);
 }
 
@@ -548,9 +696,12 @@ fn unwiring_takes_out_only_what_it_is_asked_for() {
         unwire_hosted(&after["pom.xml"], &other, false, true).as_deref(),
         Ok(after["pom.xml"].as_str())
     );
-    assert_eq!(
-        unwire_hosted(&after["pom.xml"], &other, true, true).as_deref(),
-        Ok(files["pom.xml"].as_str())
+    let unwired = unwire_hosted(&after["pom.xml"], &other, true, true).unwrap();
+    assert!(
+        !unwired.contains(SV)
+            && !unwired.contains(ORIGINAL_TAG)
+            && unwired.matches("<version>${lib.version}</version>").count() == 2,
+        "{unwired}"
     );
 
     let literal = single(&deps(&dep(A, Some(SV))));
@@ -579,10 +730,7 @@ fn the_wiring_of_a_reactor_is_found_in_every_pom_that_carries_it() {
     ]);
     let selection = selecting(&files, &[("a/pom.xml", Ok(BASE)), ("b/pom.xml", Ok(BASE))]);
     let after = written(&files, &planned(&files, Some(&selection)));
-    let sites = |files: &Fs| {
-        let read = |rel: &str| files.get(rel).map(|text| text.clone().into_bytes());
-        hosted_sites(&read, &|_| Vec::new()).unwrap()
-    };
+    let sites = |files: &Fs| reactor(files).sites();
     let site = |uuid: Option<&str>, rels: &[&str]| HostedSite {
         group: G.to_string(),
         artifact: A.to_string(),
@@ -601,4 +749,251 @@ fn the_wiring_of_a_reactor_is_found_in_every_pom_that_carries_it() {
     let selection = selecting(&pinned, &[("pom.xml", Ok(BASE))]);
     let pinned = written(&pinned, &planned(&pinned, Some(&selection)));
     assert_eq!(sites(&pinned), [site(Some(UUID), &["pom.xml"])]);
+}
+
+/// A declaration Maven reads only while a profile is active wires
+/// nothing on its own: rewriting it would name a version no build is
+/// certain to resolve and no discovery reads, with no repository to serve
+/// it. The plan is refused whole, and the reactor is as it was read.
+#[test]
+fn a_declaration_only_a_profile_holds_is_not_rewritten_alone() {
+    let profiled = format!(
+        "<project>\n  <modelVersion>4.0.0</modelVersion>\n  <parent>\n    <groupId>t</groupId>\n    \
+         <artifactId>root</artifactId>\n    <version>1</version>\n  </parent>\n  \
+         <artifactId>a</artifactId>\n  <profiles>\n    <profile>\n      <id>extra</id>\n      \
+         <dependencies>\n    {}      </dependencies>\n    </profile>\n  </profiles>\n</project>\n",
+        dep(A, Some(BASE))
+    );
+    let files = fs(&[
+        ("pom.xml", &root("")),
+        ("a/pom.xml", &profiled),
+        ("b/pom.xml", &module("b", &dep("lib-y", Some("1.0")))),
+    ]);
+    for selection in [None, Some(selecting(&files, &[("b/pom.xml", Err("cold"))]))] {
+        let mut reactor = reactor(&files);
+        let plan = crate::patch::redirect::with_hosted_repository(
+            &coords(),
+            INDEX_URL,
+            &BTreeMap::new(),
+            true,
+            |repository| reactor.plan(&coords(), selection.as_ref(), repository),
+        );
+        assert_eq!(
+            plan.refused.as_ref().map(|(reason, _)| reason.as_str()),
+            Some("nothing_wired"),
+            "{:?}",
+            plan.notes
+        );
+        assert!(plan.poms.is_empty() && plan.edits.is_empty() && !plan.wired);
+        for (rel, text) in &files {
+            assert_eq!(
+                reactor.text(rel),
+                Some(text.as_str()),
+                "{rel} is as it was read"
+            );
+        }
+    }
+    // Beside a declaration Maven always reads, the profile's one is
+    // rewritten with it: the repository then serves both.
+    let both = fs(&[
+        ("pom.xml", &root("")),
+        (
+            "a/pom.xml",
+            &profiled.replace(
+                "  <profiles>",
+                &format!("{}  <profiles>", deps(&dep(A, Some(BASE)))),
+            ),
+        ),
+        ("b/pom.xml", &module("b", &dep("lib-y", Some("1.0")))),
+    ]);
+    let plan = planned(&both, None);
+    assert!(plan.wired && plan.refused.is_none(), "{:?}", plan.refused);
+    assert_eq!(plan.poms["a/pom.xml"].matches(SV).count(), 2);
+    let after = written(&both, &plan);
+    assert_invariant(&after);
+    assert_unwires_to(&after, &both);
+}
+
+/// A plan is written whole or not at all. When the pom that must declare
+/// the repository cannot take it, nothing is written: not the pin in the
+/// module below, which would name a version nothing serves.
+#[test]
+fn a_plan_whose_repository_cannot_be_declared_writes_nothing() {
+    let files = fs(&[
+        ("pom.xml", &root("")),
+        ("a/pom.xml", &module("a", &dep(A, Some(BASE)))),
+        ("b/pom.xml", &module("b", &dep("lib-y", Some("1.0")))),
+    ]);
+    let selection = selecting(&files, &[("a/pom.xml", Ok(BASE)), ("b/pom.xml", Ok(BASE))]);
+    let mut reactor = reactor(&files);
+    let plan = crate::patch::redirect::with_hosted_repository(
+        &coords(),
+        INDEX_URL,
+        &BTreeMap::new(),
+        true,
+        |real| {
+            let unreadable = HostedRepository {
+                ensure: &|_| Err("not readable as a pom".to_string()),
+                remove: real.remove,
+                declared: real.declared,
+                restored: real.restored,
+            };
+            reactor.plan(&coords(), Some(&selection), &unreadable)
+        },
+    );
+    assert_eq!(
+        plan.refused.as_ref().map(|(reason, _)| reason.as_str()),
+        Some("repository_unwritable")
+    );
+    assert!(plan.poms.is_empty() && plan.edits.is_empty() && !plan.wired);
+    for (rel, text) in &files {
+        assert_eq!(
+            reactor.text(rel),
+            Some(text.as_str()),
+            "{rel} is as it was read"
+        );
+    }
+
+    // A `<repositories>` in a shape a rollback could not put back (a
+    // self-closed one is expanded to take the repository) refuses the
+    // plan the same way.
+    let self_closed = fs(&[
+        ("pom.xml", &root("  <repositories/>\n")),
+        ("a/pom.xml", &module("a", &dep(A, Some(BASE)))),
+        ("b/pom.xml", &module("b", &dep("lib-y", Some("1.0")))),
+    ]);
+    let plan = planned(&self_closed, Some(&selection));
+    assert_eq!(
+        plan.refused.as_ref().map(|(reason, _)| reason.as_str()),
+        Some("edit_not_reversible"),
+        "{:?}",
+        plan.poms
+    );
+    assert!(plan.poms.is_empty());
+}
+
+/// An earlier patch's repository goes only once no pom of the reactor
+/// names that patch's suffix: a pom this plan did not change counts. Here
+/// module b still reads the earlier suffix through a property a profile
+/// may redefine, which this plan leaves alone, while the pin moves on.
+#[test]
+fn an_earlier_patch_keeps_its_repository_while_any_pom_names_it() {
+    const EARLIER: &str = "0a1b2c3d-8192-4a3b-9c4d-5e6f708192a3";
+    const EARLIER_SV: &str = "1.10.0-socket.0a1b2c3d";
+    let earlier = Coords {
+        uuid: EARLIER,
+        ..coords()
+    };
+    let files = fs(&[
+        ("pom.xml", &root("")),
+        ("a/pom.xml", &module("a", &dep("lib-x", Some("1.0")))),
+        (
+            "b/pom.xml",
+            &module("b", &dep(A, Some("${victim.version}"))).replace(
+                "  <dependencies>",
+                &format!(
+                    "{}  <dependencies>",
+                    properties(&[("victim.version", BASE)])
+                ),
+            ),
+        ),
+    ]);
+    let selection = selecting(&files, &[("a/pom.xml", Ok(BASE)), ("b/pom.xml", Ok(BASE))]);
+    let first = planned_for(&files, &earlier, Some(&selection));
+    assert!(first.wired, "{:?}", first.refused);
+    let mut wired = written(&files, &first);
+    assert!(wired["b/pom.xml"].contains(&format!("<victim.version>{EARLIER_SV}<")));
+    assert!(
+        wired["pom.xml"].contains(EARLIER_SV),
+        "a is pinned, through the root: {:?}",
+        first.edits
+    );
+    // b's property comes to be redefined by a profile: no later plan may
+    // rewrite it, since the profile's build must keep its own version.
+    let b = wired["b/pom.xml"].replace(
+        "</project>",
+        "  <profiles>\n    <profile>\n      <id>old</id>\n      <properties>\n        \
+         <victim.version>1.9</victim.version>\n      </properties>\n    </profile>\n  \
+         </profiles>\n</project>",
+    );
+    wired.insert("b/pom.xml".to_string(), b);
+
+    // (b's declaration now rules the root out, so the pin is written
+    // afresh below it; what matters here is what becomes of the earlier
+    // patch's repository.)
+    let plan = planned(&wired, Some(&selection));
+    assert!(plan.wired, "{:?}", plan.refused);
+    assert_eq!(
+        repositories(&plan),
+        [("pom.xml", HostedEditKind::Repository)]
+    );
+    assert!(
+        plan.superseded.is_empty(),
+        "b still names it: {:?}",
+        plan.superseded
+    );
+    let after = written(&wired, &plan);
+    assert!(
+        after["pom.xml"].contains(&format!("socket-patch-{EARLIER}"))
+            && after["pom.xml"].contains(&format!("socket-patch-{UUID}")),
+        "both repositories serve a pom: {}",
+        after["pom.xml"]
+    );
+    assert!(
+        after["b/pom.xml"].contains(&format!("<victim.version>{EARLIER_SV}<"))
+            && after["a/pom.xml"].contains(SV),
+        "b keeps the version it reads, a moves on: {after:#?}"
+    );
+    assert_invariant(&after);
+
+    // Once b moves on too, the earlier repository goes with its last use.
+    let mut moved = after.clone();
+    let b = moved["b/pom.xml"].replace(EARLIER_SV, SV);
+    moved.insert("b/pom.xml".to_string(), b);
+    moved.insert("pom.xml".to_string(), wired["pom.xml"].clone());
+    let plan = planned(&moved, Some(&selection));
+    assert_eq!(kinds(&plan), [("pom.xml", HostedEditKind::PinMoved)]);
+    assert_eq!(plan.superseded, [EARLIER_SV]);
+    let after = written(&moved, &plan);
+    assert!(!after["pom.xml"].contains(EARLIER), "{}", after["pom.xml"]);
+    assert_invariant(&after);
+}
+
+/// One reactor is read once and planned over for every patch of a run:
+/// the second patch is planned over what the first wrote.
+#[test]
+fn every_patch_of_a_run_is_planned_over_one_reactor() {
+    let files = fs(&[
+        ("pom.xml", &root("")),
+        ("a/pom.xml", &module("a", &dep(A, Some(BASE)))),
+        ("b/pom.xml", &module("b", &dep("other", Some("2.0")))),
+    ]);
+    let other = Coords {
+        group_id: G,
+        artifact_id: "other",
+        version: "2.0",
+        uuid: "0a1b2c3d-8192-4a3b-9c4d-5e6f708192a3",
+    };
+    let mut reactor = reactor(&files);
+    let mut all = files.clone();
+    for c in [coords(), other] {
+        let index_url = INDEX_URL.replace(UUID, c.uuid);
+        let plan = crate::patch::redirect::with_hosted_repository(
+            &c,
+            &index_url,
+            &BTreeMap::new(),
+            true,
+            |repository| reactor.plan(&c, None, repository),
+        );
+        assert!(plan.wired, "{:?}", plan.refused);
+        all.extend(plan.poms);
+    }
+    for (rel, text) in &all {
+        assert_eq!(reactor.text(rel), Some(text.as_str()), "{rel}");
+    }
+    assert!(
+        all["pom.xml"].matches("<repository>").count() == 2
+            && all["b/pom.xml"].contains("2.0-socket.0a1b2c3d")
+    );
+    assert_invariant(&all);
 }

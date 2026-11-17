@@ -2303,6 +2303,20 @@ impl<'a> DiscoverCtx<'a> {
         self.ignored.contains(&rel)
     }
 
+    /// [`Self::read_text`] for a path that may be no file at all (one the
+    /// Maven reactor reader asks about: a module named by its directory, a
+    /// module's `.mvn` file): missing or unreadable, it is `None` with no
+    /// diagnostic. What is read is recognized and logged all the same.
+    pub(crate) async fn read_text_quiet(&self, rel: &str) -> Option<String> {
+        if self.is_ignored(rel) {
+            return None;
+        }
+        let text = self.view.read_text(rel).await.ok()?;
+        self.log_read(rel, true);
+        self.recognize_text(rel, &text);
+        Some(text)
+    }
+
     /// Guarded UTF-8 read of root-relative `rel`: `None` when missing
     /// (silent) or unreadable ([`DIAG_LOCKFILE_UNREADABLE`] recorded). The
     /// content is swept for the Socket identities it mentions BEFORE any

@@ -28,10 +28,12 @@ use super::{
 };
 
 mod hosted;
+mod reader;
 pub use hosted::{
-    hosted_sites, hosted_unattestable, plan_hosted, readable_for_hosted, unwire_hosted, HostedEdit,
-    HostedEditKind, HostedPlan, HostedSite, ORIGINAL_TAG,
+    unwire_hosted, HostedEdit, HostedEditKind, HostedPlan, HostedReactor, HostedRepository,
+    HostedSite, RepositoryEdit, ORIGINAL_TAG,
 };
+pub use reader::read_reactor;
 
 /// The committed maven2 tree.
 use super::layout::MAVEN2_TREE as TREE_ROOT;
@@ -113,16 +115,44 @@ pub fn may_discover_subprojects(pom: &str, maven_config: Option<&str>) -> bool {
 pub async fn implicit_subprojects_in(
     view: &crate::vendor::lock_inventory::ProjectView<'_>,
 ) -> Vec<String> {
+    subprojects_in(view, "").await
+}
+
+/// [`implicit_subprojects_in`] under the directory `dir` (`""`: the
+/// root), as names relative to it.
+async fn subprojects_in(
+    view: &crate::vendor::lock_inventory::ProjectView<'_>,
+    dir: &str,
+) -> Vec<String> {
+    let under = |name: &str| match dir {
+        "" => name.to_string(),
+        _ => format!("{dir}/{name}"),
+    };
     let mut out = Vec::new();
-    for entry in view.list_dir("").await.unwrap_or_default() {
-        if entry.name == GIT_DIR || !(entry.is_dir || view.is_symlink(&entry.name)) {
+    for entry in view.list_dir(dir).await.unwrap_or_default() {
+        let path = under(&entry.name);
+        if entry.name == GIT_DIR || !(entry.is_dir || view.is_symlink(&path)) {
             continue;
         }
-        if view.is_file(&format!("{}/{}", entry.name, layout::POM_FILE)) {
+        if view.is_file(&format!("{path}/{}", layout::POM_FILE)) {
             out.push(entry.name);
         }
     }
     out
+}
+
+/// Whether the root pom `pom` of the project `view` reads heads a reactor
+/// ([`is_reactor_root`], for a caller that holds the pom and reads the
+/// project through a view): the one question the hosted rewriter's
+/// discovery and its restore both ask.
+pub async fn heads_reactor_in(
+    view: &crate::vendor::lock_inventory::ProjectView<'_>,
+    pom: &str,
+    maven_config: Option<&str>,
+) -> bool {
+    declares_modules(pom)
+        || (may_discover_subprojects(pom, maven_config)
+            && !implicit_subprojects_in(view).await.is_empty())
 }
 
 /// A checkout's git directory: never a subproject, whatever it holds (the
@@ -329,7 +359,15 @@ pub fn plan_with_selection(
     }
     // Where the pin goes, and the poms whose pin stays as it is.
     let closed = |rel: &String| unpinned.contains(rel) || managed_roots.contains(rel);
-    let (pins, held) = place_pins(&reactor, patch, under.as_ref(), &closed, &mut warnings);
+    let kept = keeps_placement(&reactor, patch, under.as_ref());
+    let (pins, held) = place_pins(
+        &reactor,
+        patch,
+        under.as_ref(),
+        &closed,
+        kept,
+        &mut warnings,
+    );
 
     let banning = reactor
         .scope
@@ -495,17 +533,20 @@ fn forget_other_versions(warnings: &mut Vec<JvmWarning>, under: &BTreeMap<String
 /// already wire therefore keeps every pin it has and gets no new one, with
 /// or without a selection. The one exception is a pin that is certain to
 /// move a module to another version than Maven selects for it, which no
-/// run should have left: the pins are then placed afresh.
+/// run should have left: the pins are then placed afresh. `kept` is that
+/// decision ([`keeps_placement`]), taken on the poms as they were before
+/// the plan rewrote anything.
 fn place_pins(
     reactor: &Reactor,
     patch: &JvmPatch<'_>,
     under: Option<&BTreeMap<String, Under>>,
     closed: &dyn Fn(&String) -> bool,
+    kept: bool,
     warnings: &mut Vec<JvmWarning>,
 ) -> (BTreeSet<String>, BTreeSet<String>) {
     let mut pins: BTreeSet<String> = BTreeSet::new();
     let mut held: BTreeSet<String> = BTreeSet::new();
-    if keeps_placement(reactor, patch, under) {
+    if kept {
         // (A local root a declaration ruled out stays ruled out.)
         held.extend(reactor.scope.iter().filter(|rel| !closed(rel)).cloned());
         return (pins, held);
@@ -547,13 +588,22 @@ fn keeps_placement(
     patch: &JvmPatch<'_>,
     under: Option<&BTreeMap<String, Under>>,
 ) -> bool {
-    let moves = under.is_some_and(|under| {
+    reactor.wired_before(patch) && !pin_moves(reactor, patch, under)
+}
+
+/// Whether a pin of `patch` is certain (by `under`) to move a module to
+/// another version than Maven selects for it.
+fn pin_moves(
+    reactor: &Reactor,
+    patch: &JvmPatch<'_>,
+    under: Option<&BTreeMap<String, Under>>,
+) -> bool {
+    under.is_some_and(|under| {
         reactor.scope.iter().any(|rel| {
             pin_of(&reactor.poms[rel].doc, patch).is_some()
                 && under.get(rel).is_some_and(|u| u.other.is_some())
         })
-    });
-    reactor.wired_before(patch) && !moves
+    })
 }
 
 /// One line for every module of `under` whose selection cannot be told,
@@ -2221,6 +2271,30 @@ impl Reactor {
         list: ListFn<'_>,
         hosted: bool,
     ) -> Result<Reactor, JvmRefusal> {
+        Self::discover_with(read, list, hosted, None)
+    }
+
+    /// [`Self::discover_for`]. With `unread`, a module or a parent pom
+    /// that cannot be found or parsed is left out and named there instead
+    /// of refusing the reactor: for finding the wiring a reactor carries,
+    /// never for planning over it.
+    fn discover_with(
+        read: ReadFn<'_>,
+        list: ListFn<'_>,
+        hosted: bool,
+        mut unread: Option<&mut Vec<String>>,
+    ) -> Result<Reactor, JvmRefusal> {
+        // Leave out what cannot be read, when the caller allows it.
+        let mut skip = |refusal: JvmRefusal| -> Result<(), JvmRefusal> {
+            match unread.as_mut() {
+                Some(unread) => {
+                    let why = refusal.detail.strip_prefix("reason: ");
+                    unread.push(why.unwrap_or(&refusal.detail).to_string());
+                    Ok(())
+                }
+                None => Err(refusal),
+            }
+        };
         let root = read("pom.xml")
             .ok_or_else(|| shape_refusal("no_build_file", "no pom.xml at the project root"))?;
         let cli_props = read(MAVEN_CONFIG)
@@ -2240,14 +2314,27 @@ impl Reactor {
                 modules.extend(implicit_subprojects(list, &poms[&rel].dir));
             }
             for module in modules {
-                let (module_rel, bytes) = resolve_module(read, &poms[&rel].dir, &rel, &module)?;
+                let (module_rel, bytes) = match resolve_module(read, &poms[&rel].dir, &rel, &module)
+                {
+                    Ok(found) => found,
+                    Err(refusal) => {
+                        skip(refusal)?;
+                        continue;
+                    }
+                };
                 if poms.contains_key(&module_rel) {
                     if !reactor.contains(&module_rel) {
                         reactor.push(module_rel);
                     }
                     continue;
                 }
-                let pom = Pom::parse(&module_rel, bytes)?;
+                let pom = match Pom::parse(&module_rel, bytes) {
+                    Ok(pom) => pom,
+                    Err(refusal) => {
+                        skip(refusal)?;
+                        continue;
+                    }
+                };
                 let nested = NESTED_MVN_FILES.iter().find(|f| {
                     !pom.dir.is_empty() && read(&format!("{}/.mvn/{f}", pom.dir)).is_some()
                 });
@@ -2272,8 +2359,13 @@ impl Reactor {
         for rel in &reactor {
             let mut cur = rel.clone();
             while !local_parent.contains_key(&cur) {
-                let Some(parent_rel) = local_parent_of(read, &mut poms, &cur)? else {
-                    break;
+                let parent_rel = match local_parent_of(read, &mut poms, &cur) {
+                    Ok(Some(parent_rel)) => parent_rel,
+                    Ok(None) => break,
+                    Err(refusal) => {
+                        skip(refusal)?;
+                        break;
+                    }
                 };
                 local_parent.insert(cur.clone(), parent_rel.clone());
                 if !scope.contains(&parent_rel) {

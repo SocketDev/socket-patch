@@ -147,7 +147,12 @@ fn dm_sections(pom: &str) -> Vec<(usize, usize)> {
 /// Remove the `socket-patch-<uuid>` repository of `pom`: the element and
 /// the line break before it (the rewriter's own insertion), when it sits
 /// on lines of its own.
-fn remove_repository(rel: &str, pom: &str, uuid: &str, ctx: &Ctx<'_>) -> Result<String, String> {
+fn remove_repository(
+    rel: &str,
+    pom: &str,
+    uuid: &str,
+    hosted_uuid: &dyn Fn(&str) -> Option<String>,
+) -> Result<String, String> {
     let id = generation::hosted_pin_name(uuid);
     let (start, end) = match maven_repositories_with_id(pom, &id)[..] {
         [one] => one,
@@ -159,7 +164,7 @@ fn remove_repository(rel: &str, pom: &str, uuid: &str, ctx: &Ctx<'_>) -> Result<
         }
     };
     let url = maven_tag_text_in(pom, "url", start, end).unwrap_or_default();
-    if ctx.hosted_uuid(&url).as_deref() != Some(uuid) {
+    if hosted_uuid(&url).as_deref() != Some(uuid) {
         return Err(format!(
             "the {rel} repository {id} does not point at the Socket patch server"
         ));
@@ -168,24 +173,63 @@ fn remove_repository(rel: &str, pom: &str, uuid: &str, ctx: &Ctx<'_>) -> Result<
         .ok_or_else(|| format!("the {rel} repository {id} is not on lines of its own"))
 }
 
-/// What [`restore_pin`] took out of one pom.
-struct Restored {
-    text: String,
+/// `pom` without the `<repository>` whose id is `id`, and without the
+/// `<repositories>` section the rewriter authored for it once that holds
+/// nothing else; `None` unless exactly one such repository sits on lines
+/// of its own. What the rewriter itself runs when it takes a repository
+/// out (the last pin of a patch went, or a newer patch superseded it), so
+/// a scan leaves what a rollback would.
+pub(crate) fn without_repository(pom: &str, id: &str) -> Option<String> {
+    let mut text = remove_maven_repository(pom, id)?;
+    if text.contains(EMPTY_REPOSITORIES) && !pom.contains(EMPTY_REPOSITORIES) {
+        text = text.replacen(EMPTY_REPOSITORIES, "</project>", 1);
+    }
+    Some(text)
+}
+
+/// What [`restore_pom`] took out of one pom.
+pub(crate) struct Restored {
+    pub(crate) text: String,
     /// The pin's `<repository>` was declared here.
-    repository: bool,
+    pub(crate) repository: bool,
     /// A pin, a declaration or a property of the patch was here.
-    wiring: bool,
+    pub(crate) wiring: bool,
 }
 
 /// One pin and where it is restored.
-struct PinIn<'a> {
-    group: &'a str,
-    artifact: &'a str,
-    base: &'a str,
-    uuid: &'a str,
+pub(crate) struct PinIn<'a> {
+    pub(crate) group: &'a str,
+    pub(crate) artifact: &'a str,
+    pub(crate) base: &'a str,
+    pub(crate) uuid: &'a str,
     /// The project root heads a reactor: its poms are the reactor
     /// planner's to read, none an earlier release pinned.
-    reactor: bool,
+    pub(crate) reactor: bool,
+}
+
+/// The pom `rel` (`pom`) as restoring `pin` leaves it, or why it cannot
+/// be restored: the pin taken out ([`restore_pin`]), the wrappers the
+/// rewriter authored from scratch gone once emptied, and what is left
+/// still a readable pom. `hosted_uuid` says which patch a repository URL
+/// serves. It reads nothing but `pom`, so the rewriter runs it over the
+/// text it plans to write: an edit this would not take back is not made.
+pub(crate) fn restore_pom(
+    rel: &str,
+    pom: &str,
+    user_properties: &BTreeMap<String, String>,
+    pin: &PinIn<'_>,
+    hosted_uuid: &dyn Fn(&str) -> Option<String>,
+) -> Result<Restored, String> {
+    let mut done = restore_pin(rel, pom, user_properties, pin, hosted_uuid)?;
+    // The from-scratch wrappers, once emptied (repositories come last).
+    for empty in [EMPTY_REPOSITORIES, EMPTY_DEP_MANAGEMENT] {
+        if done.text.contains(empty) && !pom.contains(empty) {
+            done.text = done.text.replacen(empty, "</project>", 1);
+        }
+    }
+    crate::formats::maven::parse_pom(&done.text)
+        .map_err(|why| format!("restoring {rel} would not leave a readable pom: {why}"))?;
+    Ok(done)
 }
 
 /// Restore one pin in the pom `rel` (`pom`), or say why not.
@@ -194,7 +238,7 @@ fn restore_pin(
     pom: &str,
     user_properties: &BTreeMap<String, String>,
     pin: &PinIn<'_>,
-    ctx: &Ctx<'_>,
+    hosted_uuid: &dyn Fn(&str) -> Option<String>,
 ) -> Result<Restored, String> {
     let PinIn {
         group,
@@ -213,7 +257,7 @@ fn restore_pin(
     let name = generation::hosted_pin_name(uuid);
     let repository = !maven_repositories_with_id(pom, &name).is_empty();
     let mut text = match repository {
-        true => remove_repository(rel, pom, uuid, ctx)?,
+        true => remove_repository(rel, pom, uuid, hosted_uuid)?,
         false => pom.to_string(),
     };
     // What the reactor planner wrote. A pom that carries none of its marks
@@ -330,11 +374,35 @@ pub(crate) async fn restore(
     files: &[String],
     ctx: &Ctx<'_>,
 ) -> FormatResult {
-    use crate::vendor::jvm::maven_reactor::{
-        declares_modules, implicit_subprojects_in, may_discover_subprojects,
-    };
+    use crate::vendor::jvm::maven_reactor::{heads_reactor_in, read_reactor};
+    use crate::vendor::lock_inventory::ProjectView;
     let mut result = FormatResult::default();
     let pins = by_uuid(pins);
+    // `.mvn/maven.config`'s `-D` user properties, which Maven reads over
+    // the pom's own when it interpolates a coordinate.
+    let config = view.read(MVN_CONFIG).await.ok().flatten();
+    let user_properties = config
+        .as_deref()
+        .map(crate::formats::maven::maven_config_properties)
+        .unwrap_or_default();
+    // The reactor, read as the rewriter and discovery read it. A pin is
+    // restored in every pom of it that carries part of the pin, whether or
+    // not discovery listed that pom: a reactor discovery could not read
+    // whole (a module pom since deleted or broken) is found by its root
+    // alone, and restoring only the root would leave a module naming a
+    // version nothing serves any more.
+    let disk = ProjectView::Disk(view.root);
+    let root_pom = view.read("pom.xml").await.ok().flatten();
+    let (reactor, reactor_poms) = match &root_pom {
+        Some(root) => (
+            heads_reactor_in(&disk, root, config.as_deref()).await,
+            read_reactor(&disk, root, config.as_deref(), |rel| async move {
+                disk.read_text(&rel).await.ok()
+            })
+            .await,
+        ),
+        None => (false, BTreeMap::new()),
+    };
     // The poms as they are, and as they read once the pins so far are out.
     let mut originals: BTreeMap<String, String> = BTreeMap::new();
     for rel in files {
@@ -343,24 +411,6 @@ pub(crate) async fn restore(
         }
     }
     let mut texts = originals.clone();
-    // `.mvn/maven.config`'s `-D` user properties, which Maven reads over
-    // the pom's own when it interpolates a coordinate.
-    let config = view.read(MVN_CONFIG).await.ok().flatten();
-    let user_properties = config
-        .as_deref()
-        .map(crate::formats::maven::maven_config_properties)
-        .unwrap_or_default();
-    // A reactor as discovery reads one: the root lists modules, or Maven 4
-    // finds a subproject under it.
-    let root_pom = view.read("pom.xml").await.ok().flatten();
-    let reactor = match &root_pom {
-        Some(root) if declares_modules(root) => true,
-        Some(root) if may_discover_subprojects(root, config.as_deref()) => {
-            let disk = crate::vendor::lock_inventory::ProjectView::Disk(view.root);
-            !implicit_subprojects_in(&disk).await.is_empty()
-        }
-        _ => false,
-    };
     // Checksum-file path prefixes of the restored pins.
     let mut checksum_dirs: Vec<String> = Vec::new();
     let mut restored: Vec<&str> = Vec::new();
@@ -382,6 +432,20 @@ pub(crate) async fn restore(
             continue;
         }
         let suffixed = format!("{base}-socket.{}", &pin.uuid[..8]);
+        let repository_id = generation::hosted_pin_name(&pin.uuid);
+        let tag = format!(
+            "{}{}:",
+            crate::vendor::jvm::maven_reactor::PIN_TAG,
+            pin.uuid
+        );
+        let mut poms: Vec<String> = pin.files.clone();
+        for (rel, text) in &reactor_poms {
+            let carries =
+                text.contains(&suffixed) || text.contains(&repository_id) || text.contains(&tag);
+            if carries && !rel.contains(".mvn/") && !poms.contains(rel) {
+                poms.push(rel.clone());
+            }
+        }
         let of = PinIn {
             group,
             artifact,
@@ -391,29 +455,30 @@ pub(crate) async fn restore(
         };
         // Every pom the pin is wired in, or none: a pin refused in one of
         // its poms is restored in none of them.
-        let mut staged: BTreeMap<&String, String> = BTreeMap::new();
+        let mut staged: BTreeMap<String, String> = BTreeMap::new();
         let (mut repository, mut wiring) = (false, false);
         let mut refusal = None;
-        for rel in &pin.files {
-            let next = restore_pin(rel, &texts[rel], &user_properties, &of, ctx).and_then(|done| {
-                let mut text = done.text;
-                // The from-scratch wrappers, once emptied (repositories
-                // come last).
-                for empty in [EMPTY_REPOSITORIES, EMPTY_DEP_MANAGEMENT] {
-                    if text.contains(empty) && !originals[rel].contains(empty) {
-                        text = text.replacen(empty, "</project>", 1);
+        for rel in &poms {
+            let current = match texts.get(rel) {
+                Some(text) => text.clone(),
+                None => match view.read(rel).await {
+                    Ok(Some(text)) => {
+                        originals.insert(rel.clone(), text.clone());
+                        text
                     }
-                }
-                crate::formats::maven::parse_pom(&text).map_err(|why| {
-                    format!("restoring {rel} would not leave a readable pom: {why}")
-                })?;
-                repository |= done.repository;
-                wiring |= done.wiring;
-                Ok(text)
-            });
-            match next {
-                Ok(text) => {
-                    staged.insert(rel, text);
+                    Ok(None) => continue,
+                    Err(why) => {
+                        refusal = Some(why);
+                        break;
+                    }
+                },
+            };
+            let hosted_uuid = |url: &str| ctx.hosted_uuid(url);
+            match restore_pom(rel, &current, &user_properties, &of, &hosted_uuid) {
+                Ok(done) => {
+                    repository |= done.repository;
+                    wiring |= done.wiring;
+                    staged.insert(rel.clone(), done.text);
                 }
                 Err(why) => {
                     refusal = Some(why);
@@ -421,14 +486,15 @@ pub(crate) async fn restore(
                 }
             }
         }
-        let poms = pin.files.join(", ");
+        let named = poms.join(", ");
         let refusal = refusal.or_else(|| {
             if !repository {
-                let id = generation::hosted_pin_name(&pin.uuid);
-                Some(format!("{poms} has no <repository> with id {id}"))
+                Some(format!(
+                    "{named} has no <repository> with id {repository_id}"
+                ))
             } else if !wiring {
                 Some(format!(
-                    "{poms} declares no {group}:{artifact} <version>{suffixed}</version>"
+                    "{named} declares no {group}:{artifact} <version>{suffixed}</version>"
                 ))
             } else {
                 None
@@ -438,9 +504,7 @@ pub(crate) async fn restore(
             result.refuse(&pin.uuid, why);
             continue;
         }
-        for (rel, text) in staged {
-            texts.insert(rel.clone(), text);
-        }
+        texts.extend(staged);
         checksum_dirs.push(format!(
             "{}/",
             crate::vendor::jvm::layout::version_dir(group, artifact, &suffixed)
@@ -450,14 +514,14 @@ pub(crate) async fn restore(
     if restored.is_empty() {
         return result;
     }
-    for (rel, text) in texts {
-        if originals[&rel] != text {
-            view.write(&rel, text);
+    for (rel, text) in &texts {
+        if originals.get(rel) != Some(text) {
+            view.write(rel, text.clone());
         }
     }
     // The Trusted Checksums files, where the rewriter keeps them: at the
     // project root (and beside a pom an earlier release pinned on its own).
-    let mut dirs: std::collections::BTreeSet<String> = originals
+    let mut dirs: std::collections::BTreeSet<String> = texts
         .keys()
         .map(|rel| {
             rel.rsplit_once('/')
@@ -533,6 +597,8 @@ async fn restore_mvn(
 #[cfg(test)]
 mod tests {
     use super::super::{restore_upstream, HostedPin, PinStatus, RestoreOptions, RestoreOutcome};
+    use super::{generation, MVN_CHECKSUMS, MVN_CONFIG};
+    use crate::patch::redirect::RewriteResult;
     use std::collections::BTreeMap;
 
     const UUID: &str = "77777777-7777-7777-7777-777777777777";
@@ -860,22 +926,27 @@ mod tests {
         }
     }
 
-    /// What hosted mode writes for slf4j-api over `files` (each module
-    /// selecting what `picks` says), discovered again from the tree and
-    /// restored: the tree after, which must be `files`.
-    async fn round_trip(
-        files: &[(&str, String)],
-        picks: &[(&str, Result<&str, &str>)],
-    ) -> BTreeMap<String, String> {
+    /// A second patch of the same version, which supersedes [`UUID`]'s.
+    const NEWER: &str = "88888888-8888-4888-8888-888888888888";
+
+    /// What each module selects for slf4j-api (a module left out does not
+    /// resolve it).
+    type Picks<'a> = &'a [(&'a str, Result<&'a str, &'a str>)];
+
+    /// One hosted scan of the tree at `root` for the slf4j-api patch
+    /// `uuid`, each module selecting what `picks` says: the rewrite, with
+    /// its files written.
+    fn scan(root: &std::path::Path, uuid: &str, picks: Picks<'_>) -> RewriteResult {
         use crate::crawlers::maven_selection::MavenSelection;
         use crate::patch::redirect::{
             DepOverride, Integrity, RegistryOverride, RegistryOverrideIdentifiers,
         };
-        let before: BTreeMap<String, String> = files
-            .iter()
-            .map(|(rel, text)| (rel.to_string(), text.clone()))
+        let tree = read_tree(root);
+        let modules: Vec<&str> = tree
+            .keys()
+            .map(String::as_str)
+            .filter(|rel| rel.ends_with("pom.xml"))
             .collect();
-        let modules: Vec<&str> = files.iter().map(|(rel, _)| *rel).collect();
         let picks: Vec<_> = picks
             .iter()
             .map(|(pom, pick)| (*pom, "org.slf4j", "slf4j-api", *pick))
@@ -886,19 +957,19 @@ mod tests {
             namespace: Some("org.slf4j".into()),
             version: "1.7.36".into(),
             token: "tok".into(),
-            patch_uuid: UUID.into(),
+            patch_uuid: uuid.into(),
             artifact_url: format!(
-                "https://patch.socket.dev/patch/maven/org.slf4j/slf4j-api/1.7.36/tok/{UUID}/slf4j-api-1.7.36.jar"
+                "https://patch.socket.dev/patch/maven/org.slf4j/slf4j-api/1.7.36/tok/{uuid}/slf4j-api-1.7.36.jar"
             ),
             registry_override: Some(RegistryOverride {
                 kind: "maven2".into(),
-                index_url: format!("https://patch.socket.dev/patch-registry/maven/tok/{UUID}/maven2"),
+                index_url: format!("https://patch.socket.dev/patch-registry/maven/tok/{uuid}/maven2"),
                 identifiers: RegistryOverrideIdentifiers {
                     name: "org.slf4j/slf4j-api".into(),
                     version: "1.7.36".into(),
                     maven_group_id: Some("org.slf4j".into()),
                     maven_artifact_id: Some("slf4j-api".into()),
-                    maven_suffixed_version: Some(SUFFIXED.into()),
+                    maven_suffixed_version: Some(format!("1.7.36-socket.{}", &uuid[..8])),
                     maven_pom_sha256: Some("d".repeat(64)),
                     ..Default::default()
                 },
@@ -909,7 +980,7 @@ mod tests {
             },
         };
         let written = crate::patch::redirect::rewrite_registry_redirect_with_host(
-            &before,
+            &tree,
             &[dep],
             &BTreeMap::new(),
             None,
@@ -919,40 +990,177 @@ mod tests {
             &crate::formats::cargo::source_replacement::CratesIoSource::Registry,
             Some(&MavenSelection::answering(&modules, &picks)),
         );
-        assert!(
-            written.files.values().any(|text| text.contains(SUFFIXED)),
-            "nothing was pinned: {:?}",
-            written.warnings
-        );
-        let tmp = tempfile::tempdir().unwrap();
-        write_tree(tmp.path(), files);
-        let hosted: Vec<(&str, String)> = written
+        let files: Vec<(&str, String)> = written
             .files
             .iter()
             .map(|(rel, text)| (rel.as_str(), text.clone()))
             .collect();
-        write_tree(tmp.path(), &hosted);
+        write_tree(root, &files);
+        written
+    }
 
-        let view = crate::vendor::lock_inventory::ProjectView::Disk(tmp.path());
-        let pins = HostedPin::discover(view, &[]).await;
-        assert_eq!(pins.len(), 1, "{pins:?}");
-        assert_eq!(
-            (pins[0].purl.as_str(), pins[0].uuid.as_str()),
-            ("pkg:maven/org.slf4j/slf4j-api@1.7.36", UUID)
-        );
-        // Every pom hosted mode wrote is one the pin is found in.
-        for rel in written.files.keys().filter(|rel| rel.ends_with("pom.xml")) {
-            assert!(pins[0].files.contains(rel), "{rel}: {:?}", pins[0].files);
+    /// The hosted pins discovery reads from the tree at `root`.
+    async fn discovered(root: &std::path::Path) -> Vec<HostedPin> {
+        HostedPin::discover(crate::vendor::lock_inventory::ProjectView::Disk(root), &[]).await
+    }
+
+    /// THE INVARIANT, on the tree at `root` as a build and a rollback
+    /// would find it. No pom names a `-socket.<hex8>` version, and no pom
+    /// declares a `socket-patch-<uuid>` repository, but as part of a pin
+    /// discovery finds in that very pom (so a rollback undoes it); every
+    /// pin has the checksum lines of its jar and pom; and no checksum line
+    /// is left for a suffix no pin has. The pins found.
+    async fn assert_invariant(case: &str, root: &std::path::Path) -> Vec<HostedPin> {
+        let tree = read_tree(root);
+        let pins = discovered(root).await;
+        let found = |hex8: &str, rel: &str| {
+            pins.iter()
+                .any(|pin| pin.uuid.starts_with(hex8) && pin.files.iter().any(|f| f == rel))
+        };
+        for (rel, text) in &tree {
+            if !rel.ends_with(".xml") || rel.contains(".mvn/") {
+                continue;
+            }
+            let live = crate::formats::xml::blank_non_markup(text).unwrap();
+            for (at, _) in live.match_indices("-socket.") {
+                let hex8 = &live[at + 8..at + 16];
+                assert!(
+                    found(hex8, rel),
+                    "{case}: {rel} names -socket.{hex8}, which no pin found there covers: \
+                     {pins:?}\n{text}"
+                );
+            }
+            for uuid in generation::named_generations(text) {
+                assert!(
+                    found(&uuid[..8], rel),
+                    "{case}: {rel} declares the repository of {uuid}, which no pin found \
+                     there uses: {pins:?}\n{text}"
+                );
+            }
+        }
+        let sums = tree.get(MVN_CHECKSUMS).cloned().unwrap_or_default();
+        for line in sums.lines().filter(|line| line.contains("-socket.")) {
+            assert!(
+                pins.iter()
+                    .any(|pin| line.contains(&format!("-socket.{}/", &pin.uuid[..8]))),
+                "{case}: a checksum line is left for a suffix no pin has: {line}"
+            );
+        }
+        for pin in &pins {
+            let suffix = format!("-socket.{}/", &pin.uuid[..8]);
+            assert_eq!(
+                sums.lines().filter(|line| line.contains(&suffix)).count(),
+                2,
+                "{case}: the jar and pom checksum lines of {}: {sums}",
+                pin.uuid
+            );
+        }
+        pins
+    }
+
+    /// Roll every hosted pin of the tree at `root` back.
+    async fn roll_back(case: &str, root: &std::path::Path) {
+        let pins = discovered(root).await;
+        if pins.is_empty() {
+            return;
         }
         let opts = RestoreOptions {
             offline: true,
             ..RestoreOptions::default()
         };
-        let outcome = restore_upstream(tmp.path(), &pins, &opts).await;
-        assert_eq!(outcome.pins[0].status, PinStatus::Restored);
+        let outcome = restore_upstream(root, &pins, &opts).await;
+        for pin in &outcome.pins {
+            assert_eq!(pin.status, PinStatus::Restored, "{case}: {}", pin.purl);
+        }
+    }
+
+    /// One fixture through the life of a hosted patch, the invariant
+    /// checked after every step ([`assert_invariant`]):
+    ///
+    /// - scanned, scanned again (which writes nothing), rolled back: the
+    ///   tree is `files` again, byte for byte, with no file left over;
+    /// - scanned, then scanned for a newer patch of the same version
+    ///   (which takes the place of the first everywhere), then with every
+    ///   module resolving another version (which takes out the pins), then
+    ///   rolled back: every pom is as in `files`, and nothing of either
+    ///   patch is left.
+    ///
+    /// `wired` is whether the scan is expected to pin the patch at all.
+    async fn lifecycle(case: &str, files: &[(&str, String)], picks: Picks<'_>, wired: bool) {
+        let before: BTreeMap<String, String> = files
+            .iter()
+            .map(|(rel, text)| (rel.to_string(), text.clone()))
+            .collect();
+        let suffixed_in =
+            |tree: &BTreeMap<String, String>| tree.values().any(|text| text.contains("-socket."));
+
+        let tmp = tempfile::tempdir().unwrap();
+        write_tree(tmp.path(), files);
+        let first = scan(tmp.path(), UUID, picks);
+        assert_eq!(
+            suffixed_in(&first.files),
+            wired,
+            "{case}: {:?}",
+            first.warnings
+        );
+        let pins = assert_invariant(case, tmp.path()).await;
+        assert_eq!(pins.len(), usize::from(wired), "{case}: {pins:?}");
+        for pin in &pins {
+            assert_eq!(
+                (pin.purl.as_str(), pin.uuid.as_str()),
+                ("pkg:maven/org.slf4j/slf4j-api@1.7.36", UUID)
+            );
+        }
+        let again = scan(tmp.path(), UUID, picks);
+        assert!(
+            again.files.is_empty() && again.edits.is_empty(),
+            "{case}: a second scan writes nothing: {:?} {:?}",
+            again.files.keys(),
+            again.edits
+        );
+        roll_back(case, tmp.path()).await;
+        assert_eq!(
+            read_tree(tmp.path()),
+            before,
+            "{case}: a rollback puts every file back and leaves none"
+        );
+
+        let tmp = tempfile::tempdir().unwrap();
+        write_tree(tmp.path(), files);
+        scan(tmp.path(), UUID, picks);
+        scan(tmp.path(), NEWER, picks);
+        let pins = assert_invariant(&format!("{case}, superseded"), tmp.path()).await;
+        assert!(
+            pins.iter().all(|pin| pin.uuid == NEWER) && pins.len() == usize::from(wired),
+            "{case}: the newer patch takes the place of the first: {pins:?}"
+        );
+        assert!(
+            !read_tree(tmp.path())
+                .values()
+                .any(|text| text.contains(&UUID[..8])),
+            "{case}: nothing of the first patch is left: {:#?}",
+            read_tree(tmp.path())
+        );
+        let again = scan(tmp.path(), NEWER, picks);
+        assert!(again.files.is_empty(), "{case}: {:?}", again.files.keys());
+        let elsewhere: Vec<(&str, Result<&str, &str>)> =
+            picks.iter().map(|(pom, _)| (*pom, Ok("2.0.9"))).collect();
+        scan(tmp.path(), NEWER, &elsewhere);
+        assert_invariant(&format!("{case}, moved on"), tmp.path()).await;
+        roll_back(case, tmp.path()).await;
         let after = read_tree(tmp.path());
-        assert_eq!(after, before, "every file is back, and none is left over");
-        after
+        assert!(!suffixed_in(&after), "{case}: {after:#?}");
+        for (rel, text) in &before {
+            assert_eq!(after.get(rel), Some(text), "{case}: {rel}");
+        }
+        // (A scan that took out the last pin itself cannot delete the
+        // `.mvn` files it once wrote: they stay, with no line of a patch.)
+        for rel in after.keys().filter(|rel| !before.contains_key(*rel)) {
+            assert!(
+                [MVN_CONFIG, MVN_CHECKSUMS].contains(&rel.as_str()),
+                "{case}: {rel} is left over"
+            );
+        }
     }
 
     const REACTOR_ROOT: &str = "<project>\n  <modelVersion>4.0.0</modelVersion>\n  \
@@ -977,34 +1185,50 @@ mod tests {
         )
     }
 
+    /// A single pom declaring slf4j-api at `${slf4j.version}`, with
+    /// `properties` and `more` dependencies.
+    fn property_pom(properties: &str, more: &str) -> String {
+        format!(
+            "<project>\n  <modelVersion>4.0.0</modelVersion>\n  \
+             <groupId>com.example</groupId>\n  <artifactId>app</artifactId>\n  \
+             <version>1.0.0</version>\n  <properties>\n    {properties}\n  </properties>\n  \
+             <dependencies>\n{}{more}  </dependencies>\n</project>\n",
+            dependency("org.slf4j", "slf4j-api", Some("${slf4j.version}"))
+        )
+    }
+
     /// A reactor's wiring is spread over its poms (a pin in the module
     /// that selects the version, a declaration rewritten where it stands,
-    /// the repository in the root, the checksums at the root): restoring
-    /// the patch puts every file back byte for byte and leaves none behind.
+    /// the repository in the root, the checksums at the root). Through
+    /// scan, re-scan, a superseding patch, pins taken out and rollback,
+    /// no pom is ever left naming a version without the repository and
+    /// checksum lines that serve it and a pin a rollback finds; and a
+    /// rollback puts every file back byte for byte.
     #[tokio::test]
-    async fn reactor_wiring_round_trips() {
+    async fn reactor_wiring_keeps_the_invariant_through_its_life() {
         let logback = dependency("ch.qos.logback", "logback-classic", Some("1.4.14"));
-        // A pin in one module's pom; its sibling resolves another version.
-        round_trip(
+        let declaring = dependency("org.slf4j", "slf4j-api", Some("1.7.36"));
+        let both = [("a/pom.xml", Ok("1.7.36")), ("b/pom.xml", Ok("1.7.36"))];
+        lifecycle(
+            "a pin in one module, its sibling on another version",
             &[
                 ("pom.xml", REACTOR_ROOT.to_string()),
                 ("a/pom.xml", reactor_module("a", &logback)),
                 ("b/pom.xml", reactor_module("b", &logback)),
             ],
             &[("a/pom.xml", Ok("1.7.36")), ("b/pom.xml", Ok("2.0.9"))],
+            true,
         )
         .await;
-        // One pin in the root both inherit, beside a declaration.
-        round_trip(
+        lifecycle(
+            "a pin in the root both inherit, beside a declaration",
             &[
                 ("pom.xml", REACTOR_ROOT.to_string()),
-                (
-                    "a/pom.xml",
-                    reactor_module("a", &dependency("org.slf4j", "slf4j-api", Some("1.7.36"))),
-                ),
+                ("a/pom.xml", reactor_module("a", &declaring)),
                 ("b/pom.xml", reactor_module("b", &logback)),
             ],
-            &[("a/pom.xml", Ok("1.7.36")), ("b/pom.xml", Ok("1.7.36"))],
+            &both,
+            true,
         )
         .await;
         // The root manages the version in the shape an added entry has:
@@ -1014,10 +1238,11 @@ mod tests {
             &format!(
                 "  <dependencyManagement>\n    <dependencies>\n  {}    </dependencies>\n  \
                  </dependencyManagement>\n</project>",
-                dependency("org.slf4j", "slf4j-api", Some("1.7.36")).replace("\n    ", "\n      ")
+                declaring.replace("\n    ", "\n      ")
             ),
         );
-        round_trip(
+        lifecycle(
+            "the root's own management",
             &[
                 ("pom.xml", managing),
                 (
@@ -1026,48 +1251,91 @@ mod tests {
                 ),
                 ("b/pom.xml", reactor_module("b", &logback)),
             ],
-            &[("a/pom.xml", Ok("1.7.36")), ("b/pom.xml", Ok("1.7.36"))],
+            &both,
+            true,
+        )
+        .await;
+        lifecycle(
+            "a property of the root the modules read",
+            &[
+                (
+                    "pom.xml",
+                    REACTOR_ROOT.replace(
+                        "  <packaging>pom</packaging>\n",
+                        "  <packaging>pom</packaging>\n  <properties>\n    \
+                         <slf4j.version>1.7.36</slf4j.version>\n  </properties>\n",
+                    ),
+                ),
+                (
+                    "a/pom.xml",
+                    reactor_module(
+                        "a",
+                        &dependency("org.slf4j", "slf4j-api", Some("${slf4j.version}")),
+                    ),
+                ),
+                ("b/pom.xml", reactor_module("b", &logback)),
+            ],
+            &both,
+            true,
+        )
+        .await;
+        // The only declaration is one Maven reads while a profile is
+        // active: nothing is written at any step.
+        let profiled = reactor_module("a", "").replace(
+            "</project>",
+            &format!(
+                "  <profiles>\n    <profile>\n      <id>extra</id>\n      <dependencies>\n\
+                 {declaring}      </dependencies>\n    </profile>\n  </profiles>\n</project>"
+            ),
+        );
+        lifecycle(
+            "a declaration only a profile holds",
+            &[
+                ("pom.xml", REACTOR_ROOT.to_string()),
+                ("a/pom.xml", profiled),
+                ("b/pom.xml", reactor_module("b", "")),
+            ],
+            &[],
+            false,
         )
         .await;
     }
 
-    /// A `${property}` version is put back as it was written: the
-    /// property's own value, or the declaration's recorded text.
+    /// The same for a single pom: a `${property}` version put back as it
+    /// was written (the property's own value, or the declaration's
+    /// recorded text), wiring that sits in a parent pom of the checkout,
+    /// and the pins an earlier release's rewriter still writes.
     #[tokio::test]
-    async fn property_wiring_round_trips() {
-        let pom = |properties: &str, more: &str| {
-            format!(
-                "<project>\n  <modelVersion>4.0.0</modelVersion>\n  \
-                 <groupId>com.example</groupId>\n  <artifactId>app</artifactId>\n  \
-                 <version>1.0.0</version>\n  <properties>\n    {properties}\n  </properties>\n  \
-                 <dependencies>\n{}{more}  </dependencies>\n</project>\n",
-                dependency("org.slf4j", "slf4j-api", Some("${slf4j.version}"))
-            )
-        };
+    async fn single_pom_wiring_keeps_the_invariant_through_its_life() {
         let picks = [("pom.xml", Ok("1.7.36"))];
-        // Only the patched artifact reads the property.
-        round_trip(
-            &[("pom.xml", pom("<slf4j.version>1.7.36</slf4j.version>", ""))],
-            &picks,
-        )
-        .await;
-        // A sibling reads it too.
-        round_trip(
+        lifecycle(
+            "a property only the artifact reads",
             &[(
                 "pom.xml",
-                pom(
+                property_pom("<slf4j.version>1.7.36</slf4j.version>", ""),
+            )],
+            &picks,
+            true,
+        )
+        .await;
+        lifecycle(
+            "a property a sibling reads too",
+            &[(
+                "pom.xml",
+                property_pom(
                     "<slf4j.version>1.7.36</slf4j.version>",
                     &dependency("org.slf4j", "slf4j-simple", Some("${slf4j.version}")),
                 ),
             )],
             &picks,
+            true,
         )
         .await;
-        // No pom of the checkout defines it (a parent from a repository).
-        round_trip(
+        lifecycle(
+            "a property a parent from a repository defines",
             &[(
                 "pom.xml",
-                pom("<other>1</other>", "").replace(
+                property_pom("<other>1</other>", "").replace(
                     "  <groupId>com.example</groupId>",
                     "  <parent>\n    <groupId>corp</groupId>\n    <artifactId>parent</artifactId>\n    \
                      <version>7</version>\n    <relativePath/>\n  </parent>\n  \
@@ -1075,6 +1343,49 @@ mod tests {
                 ),
             )],
             &picks,
+            true,
+        )
+        .await;
+        // The wiring lands in a parent pom the project lists no module
+        // for: discovery and rollback must read that pom too.
+        lifecycle(
+            "a property a parent pom of the checkout defines",
+            &[
+                (
+                    "pom.xml",
+                    property_pom("<other>1</other>", "").replace(
+                        "  <groupId>com.example</groupId>",
+                        "  <parent>\n    <groupId>com.example</groupId>\n    \
+                         <artifactId>parent</artifactId>\n    <version>1.0.0</version>\n    \
+                         <relativePath>parent/pom.xml</relativePath>\n  </parent>\n  \
+                         <groupId>com.example</groupId>",
+                    ),
+                ),
+                (
+                    "parent/pom.xml",
+                    "<project>\n  <modelVersion>4.0.0</modelVersion>\n  \
+                     <groupId>com.example</groupId>\n  <artifactId>parent</artifactId>\n  \
+                     <version>1.0.0</version>\n  <packaging>pom</packaging>\n  <properties>\n    \
+                     <slf4j.version>1.7.36</slf4j.version>\n  </properties>\n</project>\n"
+                        .to_string(),
+                ),
+            ],
+            &picks,
+            true,
+        )
+        .await;
+        lifecycle(
+            "a literal declaration",
+            &[("pom.xml", fixture("basic", "input", "pom.xml"))],
+            &picks,
+            true,
+        )
+        .await;
+        lifecycle(
+            "no declaration: an added management entry",
+            &[("pom.xml", fixture("transitive-depmgmt", "input", "pom.xml"))],
+            &picks,
+            true,
         )
         .await;
     }
@@ -1116,6 +1427,88 @@ mod tests {
         let (outcome, after) = run(&[("pom.xml", hosted)]).await;
         assert_eq!(outcome.pins[0].status, PinStatus::Restored);
         assert_eq!(after["pom.xml"], input);
+    }
+
+    /// A reactor one of whose module poms has gone missing is still read
+    /// for the pins of the others: the pin in a module's pom is found with
+    /// the repository in the root, and a rollback takes out both.
+    #[tokio::test]
+    async fn a_reactor_with_a_missing_module_is_still_rolled_back_whole() {
+        let logback = dependency("ch.qos.logback", "logback-classic", Some("1.4.14"));
+        let files = [
+            ("pom.xml", REACTOR_ROOT.to_string()),
+            ("a/pom.xml", reactor_module("a", &logback)),
+            ("b/pom.xml", reactor_module("b", &logback)),
+        ];
+        let tmp = tempfile::tempdir().unwrap();
+        write_tree(tmp.path(), &files);
+        scan(
+            tmp.path(),
+            UUID,
+            &[("a/pom.xml", Ok("1.7.36")), ("b/pom.xml", Ok("2.0.9"))],
+        );
+        std::fs::remove_file(tmp.path().join("b/pom.xml")).unwrap();
+        let pins = discovered(tmp.path()).await;
+        assert_eq!(pins.len(), 1, "{pins:?}");
+        assert_eq!(pins[0].files, ["a/pom.xml", "pom.xml"]);
+        roll_back("a missing module", tmp.path()).await;
+        let after = read_tree(tmp.path());
+        assert_eq!(after["a/pom.xml"], files[1].1);
+        assert_eq!(after["pom.xml"], files[0].1);
+        assert!(!after.contains_key(MVN_CHECKSUMS), "{:?}", after.keys());
+    }
+
+    /// A pin is restored in every pom of the reactor that carries part of
+    /// it, whatever discovery listed, or in none: restoring the root alone
+    /// would take the repository from under a module that still names the
+    /// suffixed version.
+    #[tokio::test]
+    async fn a_pin_is_restored_in_every_pom_that_carries_it_or_in_none() {
+        let logback = dependency("ch.qos.logback", "logback-classic", Some("1.4.14"));
+        let files = [
+            ("pom.xml", REACTOR_ROOT.to_string()),
+            ("a/pom.xml", reactor_module("a", &logback)),
+            ("b/pom.xml", reactor_module("b", &logback)),
+        ];
+        let root_only = [HostedPin {
+            purl: "pkg:maven/org.slf4j/slf4j-api@1.7.36".into(),
+            uuid: UUID.into(),
+            files: vec!["pom.xml".into()],
+        }];
+        let opts = RestoreOptions {
+            offline: true,
+            ..RestoreOptions::default()
+        };
+        let wire = || {
+            let tmp = tempfile::tempdir().unwrap();
+            write_tree(tmp.path(), &files);
+            scan(
+                tmp.path(),
+                UUID,
+                &[("a/pom.xml", Ok("1.7.36")), ("b/pom.xml", Ok("2.0.9"))],
+            );
+            tmp
+        };
+
+        // The module's pin goes with the root's repository.
+        let tmp = wire();
+        let outcome = restore_upstream(tmp.path(), &root_only, &opts).await;
+        assert_eq!(outcome.pins[0].status, PinStatus::Restored);
+        let after = read_tree(tmp.path());
+        for (rel, text) in &files {
+            assert_eq!(after.get(*rel), Some(text), "{rel}");
+        }
+
+        // A module that still names the pin and can no longer be read as
+        // a pom: nothing is restored, the root keeps its repository.
+        let tmp = wire();
+        let broken = read_tree(tmp.path())["a/pom.xml"].replace("</project>", "");
+        std::fs::write(tmp.path().join("a/pom.xml"), &broken).unwrap();
+        let wired = read_tree(tmp.path());
+        let outcome = restore_upstream(tmp.path(), &root_only, &opts).await;
+        let why = refusal(&outcome);
+        assert!(why.contains("a/pom.xml"), "{why}");
+        assert_eq!(read_tree(tmp.path()), wired, "nothing changed");
     }
 
     /// An earlier release's pin is read by its shape only in a single pom.

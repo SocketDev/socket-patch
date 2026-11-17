@@ -750,54 +750,34 @@ async fn read_advisory(
     }
 }
 
-/// How many rounds [`read_maven_reactor`] reads: a reactor nested deeper
-/// than this is read as far as that, and its planner then refuses it for
-/// the module it cannot find.
-const MAX_REACTOR_READ_ROUNDS: usize = 64;
-
-/// Read every pom the Maven reactor planner reads for the root `pom.xml`:
-/// the modules it lists (theirs in turn), and each local parent on a
-/// module's chain. The planner is asked what it reads until it asks for
-/// nothing new, so the files are exactly the ones it will plan over.
+/// Read every file the Maven reactor planner reads for the root `pom.xml`
+/// ([`read_reactor`](crate::vendor::jvm::maven_reactor::read_reactor), the
+/// reader discovery and restore share, so each finds what the others
+/// wrote): every pom is fetched and parsed once, however many modules.
 ///
-/// A module pom that cannot be read as text, or that is a symbolic link
-/// (the rewrite would replace the link with a copy), is left out: the
-/// planner then finds the reactor incomplete and refuses it with nothing
-/// written, which is what a reactor got before module poms were read at
-/// all. It never fails the run, as an unreadable root candidate does.
+/// They are advisory input: a module pom that cannot be read as text, or
+/// that is a symbolic link, is left out, and the planner then finds the
+/// reactor incomplete and refuses it with nothing written. That is what a
+/// reactor got before module poms were read at all; it never fails the
+/// run, as an unreadable root candidate does.
 async fn read_maven_reactor(
     view: &ProjectView<'_>,
     unreadable: &BTreeSet<String>,
     out: &mut CandidateFiles,
 ) {
-    let mut asked: BTreeSet<String> = BTreeSet::new();
-    for _ in 0..MAX_REACTOR_READ_ROUNDS {
-        let wanted: std::cell::RefCell<BTreeSet<String>> = Default::default();
-        {
-            let read = |rel: &str| match out.files.get(rel) {
-                Some(text) => Some(text.clone().into_bytes()),
-                None => {
-                    if !asked.contains(rel) {
-                        wanted.borrow_mut().insert(rel.to_string());
-                    }
-                    None
-                }
-            };
-            let list = |dir: &str| crate::patch::redirect::gradle::key_list(&out.files, dir);
-            crate::vendor::jvm::maven_reactor::readable_for_hosted(&read, &list);
-        }
-        let wanted = wanted.into_inner();
-        if wanted.is_empty() {
-            break;
-        }
-        for rel in wanted {
-            if !view.is_symlink(&rel) {
-                if let Some(text) = read_advisory(view, unreadable, &rel).await {
-                    out.files.insert(rel.clone(), text);
-                }
-            }
-            asked.insert(rel);
-        }
+    let Some(root) = out.files.get("pom.xml") else {
+        return;
+    };
+    let config = out.files.get(crate::patch::redirect::MVN_CONFIG);
+    let read = crate::vendor::jvm::maven_reactor::read_reactor(
+        view,
+        root,
+        config.map(String::as_str),
+        |rel| async move { read_advisory(view, unreadable, &rel).await },
+    )
+    .await;
+    for (rel, text) in read {
+        out.files.entry(rel).or_insert(text);
     }
 }
 
@@ -1096,29 +1076,12 @@ pub async fn read_candidate_files(
         read_go_workspace(view, unreadable, &mut out).await;
     }
 
-    // A Maven 4 root that discovers its subprojects (#1809): each direct
-    // subdirectory holding a `pom.xml` is a module, which the pom rewriter
-    // must see to refuse the root as a reactor (it pins only the root pom).
-    // Advisory: keyed `<dir>/pom.xml`, never rewritten, and one that cannot
-    // be read still counts as present.
+    // Every pom of a Maven reactor (the modules the root lists, theirs in
+    // turn, each parent pom one inherits from inside the checkout, and the
+    // subprojects Maven 4 discovers, #1809): the rewriter pins a patch in
+    // the poms of the modules that select it.
     if candidates.iter().any(|c| c.dep.ecosystem == "maven") {
-        if let Some(pom) = out.files.get("pom.xml") {
-            let config = out.files.get(crate::patch::redirect::MVN_CONFIG);
-            if crate::vendor::jvm::maven_reactor::may_discover_subprojects(
-                pom,
-                config.map(String::as_str),
-            ) {
-                for dir in crate::vendor::jvm::maven_reactor::implicit_subprojects_in(view).await {
-                    let rel = format!("{dir}/pom.xml");
-                    let text = read_advisory(view, unreadable, &rel).await;
-                    out.files.insert(rel, text.unwrap_or_default());
-                }
-            }
-            // Every pom of the reactor (and a local parent outside the
-            // module list): the rewriter pins a patch in the module poms
-            // that select it, so each is a rewrite target.
-            read_maven_reactor(view, unreadable, &mut out).await;
-        }
+        read_maven_reactor(view, unreadable, &mut out).await;
     }
 
     // NuGet merges the user config and every parent directory's config
@@ -6278,6 +6241,49 @@ snapshots:
         assert!(!read.files.keys().any(|k| k.ends_with("/pom.xml")));
         assert!(done.rewrite.files["pom.xml"].contains("1.10.0-socket.4d5e6f70"));
         assert_eq!(done.confirmed.len(), 1);
+    }
+
+    /// A reactor of hundreds of modules is read and planned whole: every
+    /// module pom is a candidate file, and each one that declares the
+    /// version is rewritten. (The reader learned one module per round, and
+    /// stopped after 64.)
+    #[tokio::test]
+    async fn a_reactor_of_hundreds_of_modules_is_read_and_planned_whole() {
+        let declaring = "  <dependencies>\n    <dependency>\n      <groupId>com.socketfixture</groupId>\n      <artifactId>victim</artifactId>\n      <version>1.10.0</version>\n    </dependency>\n  </dependencies>\n";
+        let names: Vec<String> = (0..200).map(|n| format!("module-{n}")).collect();
+        let listed: String = names
+            .iter()
+            .map(|name| format!("    <module>{name}</module>\n"))
+            .collect();
+        let mut p = MemoryProject::new();
+        p.insert_text(
+            "pom.xml",
+            format!(
+                "<project>\n  <modelVersion>4.0.0</modelVersion>\n  <groupId>x</groupId>\n  <artifactId>y</artifactId>\n  <version>1</version>\n  <packaging>pom</packaging>\n  <modules>\n{listed}  </modules>\n</project>\n"
+            )
+            .as_str(),
+        );
+        for name in &names {
+            p.insert_text(
+                format!("{name}/pom.xml"),
+                format!(
+                    "<project>\n  <modelVersion>4.0.0</modelVersion>\n  <parent>\n    <groupId>x</groupId>\n    <artifactId>y</artifactId>\n    <version>1</version>\n  </parent>\n  <artifactId>{name}</artifactId>\n{declaring}</project>\n"
+                )
+                .as_str(),
+            );
+        }
+        let (read, done) = gradle_rewrite(&p).await;
+        for name in &names {
+            let rel = format!("{name}/pom.xml");
+            assert!(read.files.contains_key(&rel), "{rel} was not read");
+            assert!(
+                done.rewrite.files[&rel].contains("<version>1.10.0-socket.4d5e6f70</version>"),
+                "{rel} was not rewritten: {:?}",
+                done.rewrite.warnings
+            );
+        }
+        assert!(done.rewrite.files["pom.xml"].contains("<id>socket-patch-"));
+        assert_eq!(done.confirmed.len(), 1, "{:?}", done.rewrite.warnings);
     }
 
     /// A module pom that is a symbolic link, or that is there without
