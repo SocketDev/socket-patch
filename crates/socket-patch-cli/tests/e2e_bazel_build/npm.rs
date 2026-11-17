@@ -34,11 +34,13 @@
 //!   run of a pipeline, and `vex` is asked for its document. Bazel has built
 //!   in the checkout by now and keeps its `bazel-*` links there, and the
 //!   first run left a `pnpm-workspace.yaml` that lists the root as its one
-//!   workspace package. Both commands take the link to Bazel's execution
-//!   root, where the checkout's `package.json` shows up again, for a
-//!   workspace member they cannot inspect: the scan exits 0 with status
-//!   `success` and skips the package as `user_patch_conflict`, and `vex`
-//!   exits 1 and writes no document. No file changes.
+//!   workspace package. That pattern names the root alone, so no link at
+//!   the root is taken for a workspace member, the one to Bazel's execution
+//!   root included, where the checkout's `package.json` shows up again:
+//!   both commands see the package as they do in a checkout without the
+//!   links. The hosted scan reports the patch applied again and the
+//!   vendored one reports it `already_vendored`, `vex` attests the package,
+//!   no file changes, and the build is still the patched one.
 //! - (d) The undo (`rollback --yes`, or `vendor --revert`): every file of
 //!   the checkout is the one of before, byte for byte, and the build prints
 //!   the unpatched marker again.
@@ -79,7 +81,7 @@ use sha2::{Digest, Sha512};
 use socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes;
 use socket_patch_core::utils::purl::canonical_purl;
 
-use crate::envelope::{event_triples, find_event};
+use crate::envelope::event_triples;
 use crate::harness::{
     changed, fixture_path, rewrite, Cell, Fixture, Ran, Run, StandIn, Tree, CONSUMER, NOTHING,
 };
@@ -401,12 +403,20 @@ fn second_machine(
 }
 
 /// The second half of step (c), in the checkout of `cell` that Bazel has
-/// built in and that holds the files of `patched`: beside Bazel's links,
-/// `scan --mode <mode> --yes` skips the package as `user_patch_conflict`,
-/// for the link to the execution root, and scans none; `vex` fails with one
-/// event, which omits the package, and writes no document; and no file of
-/// the checkout changes.
-fn runs_again(cell: &Cell, standin: &StandIn, mode: &str, patched: &Tree) {
+/// built in and that holds the files of `patched`. Beside Bazel's links,
+/// `scan --mode <mode> --yes` scans the package and reports the one event
+/// `seen` for it (an action and an error code), which is what it reports in
+/// a checkout without those links; `vex` attests the package in its
+/// document; no file of the checkout changes; and the build still prints
+/// `marker`.
+fn runs_again(
+    cell: &Cell,
+    standin: &StandIn,
+    mode: &str,
+    seen: (&str, &str),
+    patched: &Tree,
+    marker: &str,
+) {
     let test = &cell.test;
     // Bazel says where the checkout is, and its links are there.
     let info = cell.bazel("info", &["workspace"]);
@@ -424,13 +434,9 @@ fn runs_again(cell: &Cell, standin: &StandIn, mode: &str, patched: &Tree) {
     let said = &scan.dump;
     assert_eq!(scan.code, 0, "{test}: {said}");
     assert_eq!(scan.envelope["status"], "success", "{test}: {said}");
-    let conflict = "user_patch_conflict";
-    let skipped = one("skipped", conflict);
-    assert_eq!(reported(&scan.envelope), skipped, "{test}: {said}");
-    let reason = find_event(&scan.envelope, "skipped", Some(conflict))["reason"].as_str();
-    let link = "/bazel-ws (linked workspace cannot be inspected safely)";
-    assert!(reason.is_some_and(|r| r.contains(link)), "{test}: {said}");
-    assert_eq!(scan.envelope["scannedPackages"], 0, "{test}: {said}");
+    let seen = one(seen.0, seen.1);
+    assert_eq!(reported(&scan.envelope), seen, "{test}: {said}");
+    assert_eq!(scan.envelope["scannedPackages"], 1, "{test}: {said}");
 
     // The document goes beside the checkout, into the scratch root of the
     // cell, where nothing has that name: it is no file of the checkout, and
@@ -440,12 +446,17 @@ fn runs_again(cell: &Cell, standin: &StandIn, mode: &str, patched: &Tree) {
     let output = document.to_string_lossy();
     let vex = socket_patch(cell, standin, &["vex", "--output", &output]);
     let said = &vex.dump;
-    assert_eq!(vex.code, 1, "{test}: {said}");
-    let omitted = one("skipped", "vex_npm_patched_dependency");
-    assert_eq!(reported(&vex.envelope), omitted, "{test}: {said}");
-    assert!(!document.exists(), "{test}: {said}");
+    assert_eq!(vex.code, 0, "{test}: {said}");
+    let attested = one("verified", "");
+    assert_eq!(reported(&vex.envelope), attested, "{test}: {said}");
+    let written = std::fs::read_to_string(&document).unwrap_or_default();
+    // With its closing quote, as the document writes `"@id": "<purl>"`: a
+    // longer version that only starts so is another package.
+    let names = written.contains(&format!("\"{PURL}\""));
+    assert!(names, "{test}: {said}\n{written}");
 
     assert_eq!(changed(patched, &cell.tree()), NOTHING, "{test}");
+    cell.builds_patched(patched, marker);
 }
 
 /// Step (e): the build of `twin` fails because Bazel finds the sha512 of
@@ -474,9 +485,9 @@ fn refuses(twin: &Cell, other: &StandIn, found: &[u8], pinned: &[u8]) -> (Run, S
     (build, refusal)
 }
 
-/// The hosted flow of the module docs. Today its second scan, beside the
-/// links of the Bazel that built in the checkout, skips the package as
-/// `user_patch_conflict`, and `vex` writes no document.
+/// The hosted flow of the module docs. Its second scan, beside the links of
+/// the Bazel that built in the checkout, reports the patch applied again,
+/// and `vex` writes a document that attests the package.
 #[test]
 #[ignore = "real Bazel; run with --ignored"]
 fn hosted_npm_translate_lock() {
@@ -518,7 +529,8 @@ fn hosted_npm_translate_lock() {
     );
 
     // The same command and `vex`, now that Bazel has built in the checkout.
-    runs_again(&cell, &standin, "hosted", &pinned);
+    let (seen, marker) = (("applied", ""), &patch.package.marker);
+    runs_again(&cell, &standin, "hosted", seen, &pinned, marker);
 
     // (d) The undo: every file is the one of before, and so is the build.
     let undo = socket_patch(&cell, &standin, &["rollback", "--yes"]);
@@ -538,10 +550,10 @@ fn hosted_npm_translate_lock() {
 
     println!(
         "{test}: Bazel {release} built {:?} from {origin}{} after `scan --mode hosted`; beside \
-         Bazel's links a second scan skipped the package as user_patch_conflict and `vex` wrote \
-         no document; `rollback` restored all {} files and the {:?} build; other bytes at the \
-         patch host failed a second machine's build ({refusal}); the stand-in answered {} \
-         requests for the upstream tarball and {} for the patched one; {:?}",
+         Bazel's links a second scan reported the patch applied again, `vex` attested the \
+         package and the build stayed patched; `rollback` restored all {} files and the {:?} \
+         build; other bytes at the patch host failed a second machine's build ({refusal}); the \
+         stand-in answered {} requests for the upstream tarball and {} for the patched one; {:?}",
         patch.package.marker,
         patch.route,
         before.len(),
@@ -552,9 +564,9 @@ fn hosted_npm_translate_lock() {
     );
 }
 
-/// The vendored flow of the module docs. Today its second scan, beside the
-/// links of the Bazel that built in the checkout, skips the package as
-/// `user_patch_conflict`, and `vex` writes no document.
+/// The vendored flow of the module docs. Its second scan, beside the links
+/// of the Bazel that built in the checkout, reports the package
+/// `already_vendored`, and `vex` writes a document that attests it.
 #[test]
 #[ignore = "real Bazel; run with --ignored"]
 fn vendored_npm_translate_lock() {
@@ -618,7 +630,8 @@ fn vendored_npm_translate_lock() {
     assert_eq!(standin.requests(), requests, "{test}: Bazel asked a host");
 
     // The same command and `vex`, now that Bazel has built in the checkout.
-    runs_again(&cell, &standin, "vendored", &vendored);
+    let (seen, marker) = (("skipped", "already_vendored"), &patch.package.marker);
+    runs_again(&cell, &standin, "vendored", seen, &vendored, marker);
 
     // (d) The undo: every file is the one of before, and so is the build.
     let undo = socket_patch(&cell, &standin, &["vendor", "--revert"]);
@@ -644,11 +657,11 @@ fn vendored_npm_translate_lock() {
 
     println!(
         "{test}: Bazel {release} built {:?} from {copy} after `scan --mode vendored`, with no \
-         request to the stand-in; beside Bazel's links a second scan skipped the package as \
-         user_patch_conflict and `vex` wrote no document; `vendor --revert` restored all {} \
-         files and the {:?} build; other bytes in the committed tarball failed a second \
-         machine's build ({refusal}); the stand-in answered {} requests for the upstream tarball \
-         and {} for the patched one; {:?}",
+         request to the stand-in; beside Bazel's links a second scan reported the package \
+         already_vendored, `vex` attested it and the build stayed patched; `vendor --revert` \
+         restored all {} files and the {:?} build; other bytes in the committed tarball failed \
+         a second machine's build ({refusal}); the stand-in answered {} requests for the \
+         upstream tarball and {} for the patched one; {:?}",
         patch.package.marker,
         before.len(),
         upstream.marker,
