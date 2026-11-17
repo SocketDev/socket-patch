@@ -758,9 +758,13 @@ const MAX_REACTOR_READ_ROUNDS: usize = 64;
 /// Read every pom the Maven reactor planner reads for the root `pom.xml`:
 /// the modules it lists (theirs in turn), and each local parent on a
 /// module's chain. The planner is asked what it reads until it asks for
-/// nothing new, so the files are exactly the ones it will plan over. A pom
-/// is a rewrite target and read as one; a module's `.mvn` files, which the
-/// planner only asks about, are advisory.
+/// nothing new, so the files are exactly the ones it will plan over.
+///
+/// A module pom that cannot be read as text, or that is a symbolic link
+/// (the rewrite would replace the link with a copy), is left out: the
+/// planner then finds the reactor incomplete and refuses it with nothing
+/// written, which is what a reactor got before module poms were read at
+/// all. It never fails the run, as an unreadable root candidate does.
 async fn read_maven_reactor(
     view: &ProjectView<'_>,
     unreadable: &BTreeSet<String>,
@@ -787,10 +791,10 @@ async fn read_maven_reactor(
             break;
         }
         for rel in wanted {
-            if rel.ends_with(".xml") && !rel.contains(".mvn/") {
-                out.read(view, unreadable, &rel).await;
-            } else if let Some(text) = read_advisory(view, unreadable, &rel).await {
-                out.files.insert(rel.clone(), text);
+            if !view.is_symlink(&rel) {
+                if let Some(text) = read_advisory(view, unreadable, &rel).await {
+                    out.files.insert(rel.clone(), text);
+                }
             }
             asked.insert(rel);
         }
@@ -6274,6 +6278,63 @@ snapshots:
         assert!(!read.files.keys().any(|k| k.ends_with("/pom.xml")));
         assert!(done.rewrite.files["pom.xml"].contains("1.10.0-socket.4d5e6f70"));
         assert_eq!(done.confirmed.len(), 1);
+    }
+
+    /// A module pom that is a symbolic link, or that is there without
+    /// readable content, is no reason to fail the run: the reactor is left
+    /// as it is, with the reason, as every reactor was before module poms
+    /// were read. The guard that refuses a linked or unreadable rewrite
+    /// target has nothing to refuse.
+    #[tokio::test]
+    async fn a_reactor_with_an_unreadable_module_pom_is_left_alone_not_failed() {
+        let root = "<project>\n  <modelVersion>4.0.0</modelVersion>\n  <groupId>x</groupId>\n  <artifactId>y</artifactId>\n  <version>1</version>\n  <packaging>pom</packaging>\n  <modules>\n    <module>a</module>\n  </modules>\n  <dependencies>\n    <dependency>\n      <groupId>com.socketfixture</groupId>\n      <artifactId>victim</artifactId>\n      <version>1.10.0</version>\n    </dependency>\n  </dependencies>\n</project>\n";
+        let left_alone = |view: &ProjectView<'_>, read: &CandidateFiles, done: &Rewritten| {
+            assert!(
+                read.symlinked_reads.is_empty()
+                    && read.unreadable_reads.is_empty()
+                    && read.undecodable_reads.is_empty(),
+                "{read:?}"
+            );
+            assert!(done.rewrite.files.is_empty(), "{:?}", done.rewrite.files);
+            assert!(done.confirmed.is_empty(), "{:?}", done.confirmed);
+            assert!(done
+                .rewrite
+                .warnings
+                .iter()
+                .any(|w| w.code == "redirect_maven_multimodule_unsupported"));
+            assert!(guard(view, done, &[gradle_candidate()]).is_none());
+        };
+        for entry in [MemoryEntry::Symlink, MemoryEntry::Present] {
+            let mut p = MemoryProject::new();
+            p.insert_text("pom.xml", root);
+            p.insert("a/pom.xml", entry);
+            let view = ProjectView::Memory(&p);
+            let (read, done) = gradle_rewrite_in(&view).await;
+            left_alone(&view, &read, &done);
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("pom.xml"), root).unwrap();
+        std::fs::create_dir(tmp.path().join("a")).unwrap();
+        // Not UTF-8.
+        std::fs::write(tmp.path().join("a/pom.xml"), [0xff, 0xfe, 0x00]).unwrap();
+        let view = ProjectView::Disk(tmp.path());
+        let (read, done) = gradle_rewrite_in(&view).await;
+        left_alone(&view, &read, &done);
+        // A link, to a pom that would otherwise be planned.
+        #[cfg(unix)]
+        {
+            std::fs::remove_file(tmp.path().join("a/pom.xml")).unwrap();
+            std::fs::write(
+                tmp.path().join("real.xml"),
+                "<project>\n  <modelVersion>4.0.0</modelVersion>\n  <parent>\n    <groupId>x</groupId>\n    <artifactId>y</artifactId>\n    <version>1</version>\n  </parent>\n  <artifactId>a</artifactId>\n</project>\n",
+            )
+            .unwrap();
+            std::os::unix::fs::symlink(tmp.path().join("real.xml"), tmp.path().join("a/pom.xml"))
+                .unwrap();
+            let (read, done) = gradle_rewrite_in(&view).await;
+            left_alone(&view, &read, &done);
+        }
     }
 
     /// An sbt build beside a Gradle build: the Gradle planner pinning a
