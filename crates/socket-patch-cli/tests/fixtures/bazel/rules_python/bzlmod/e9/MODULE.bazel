@@ -1,0 +1,20 @@
+module(name = "socket_fixture", version = "0.0.0")
+
+# 2.5.0-rc4 is the commit the 2.5.0 tag names; the registry listed only the
+# release candidates when this was pinned.
+bazel_dep(name = "rules_python", version = "2.5.0-rc4")
+single_version_override(module_name = "rules_python", version = "2.5.0-rc4")
+
+python = use_extension("@rules_python//python/extensions:python.bzl", "python")
+python.toolchain(
+    is_default = True,
+    python_version = "3.11",
+)
+
+pip = use_extension("@rules_python//python/extensions:pip.bzl", "pip")
+pip.parse(
+    hub_name = "pip",
+    python_version = "3.11",
+    requirements_lock = "//:requirements.txt",
+)
+use_repo(pip, "pip")

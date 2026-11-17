@@ -2,10 +2,10 @@ name: Bazel patch compatibility
 
 # socket-patch in a Bazel workspace, on a real Bazel: one leg per Bazel
 # release and ecosystem runs the `#[ignore]` tests of that ecosystem's module
-# of `e2e_bazel_build` (`go::`) on the release it installed. A test builds a
-# fixture workspace, runs the built binary in it and reads the result from
-# what Bazel builds next; the test code says which fixture files go with
-# which release.
+# of `e2e_bazel_build` (`go::`, `pypi::`) on the release it installed. A test
+# builds a fixture workspace, runs the built binary in it and reads the
+# result from what Bazel builds next; the test code says which fixture files
+# go with which release.
 #
 # The package under test and every Socket host are loopback stand-ins. A leg
 # still needs the network for the ruleset and the toolchain: github.com and
@@ -13,6 +13,10 @@ name: Bazel patch compatibility
 # release, and the ruleset archives), dl.google.com (the Go SDK) and, on
 # every run, bcr.bazel.build (the registry) and go.dev (the Go release
 # list). A repository cache saved from main holds the archives and the SDK.
+# A `pypi` leg takes the Python toolchain from github.com as well. On every
+# run it also asks pypi.org for the index pages of the packages the rulesets
+# pin for their own tools, which no cache holds: about 30 requests on Bazel
+# 9.3.2, 65 on 8.8.2 and 205 on 7.7.2.
 #
 # Not required for merge: no `merge_group` trigger, and no job here is a
 # `needs` of ci.yml's `ci-ok`. Setting the repository variable
@@ -30,8 +34,9 @@ name: Bazel patch compatibility
 on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
-    # The suite's own files and the Go files its tests run through, as
-    # go-compatibility.yml lists them. Shared engine code
+    # The suite's own files and the Go and PyPI files its tests run through,
+    # as go-compatibility.yml and the PyPI package managers' compatibility
+    # workflows list theirs. Shared engine code
     # (patch/redirect/mod.rs, hosted/, commands/) gets its run on push to
     # main (when it is in the push filter below) or nightly, or on demand
     # via workflow_dispatch on the PR branch.
@@ -44,6 +49,10 @@ on:
       - 'crates/*/src/**/*golang*'
       - 'crates/*/src/**/*golang*/**'
       - 'crates/socket-patch-core/src/vendor/go*.rs'
+      - 'crates/*/src/**/*pypi*'
+      - 'crates/*/src/**/*python*'
+      - 'crates/*/src/**/*python*/**'
+      - 'crates/*/src/**/*requirements*'
   push:
     branches: [main]
     # The PR paths, the shared engine code and test helpers the tests run
@@ -58,6 +67,10 @@ on:
       - 'crates/*/src/**/*golang*'
       - 'crates/*/src/**/*golang*/**'
       - 'crates/socket-patch-core/src/vendor/go*.rs'
+      - 'crates/*/src/**/*pypi*'
+      - 'crates/*/src/**/*python*'
+      - 'crates/*/src/**/*python*/**'
+      - 'crates/*/src/**/*requirements*'
       - 'crates/socket-patch-core/src/patch/redirect/**'
       - 'crates/socket-patch-core/src/hosted/**'
       - 'crates/socket-patch-cli/src/commands/**'
@@ -99,6 +112,9 @@ jobs:
           - {os: ubuntu-latest, bazel: '9.3.2', eco: go, fixtures: gazelle}
           - {os: ubuntu-latest, bazel: '8.8.2', eco: go, fixtures: gazelle}
           - {os: ubuntu-latest, bazel: '7.7.2', eco: go, fixtures: gazelle}
+          - {os: ubuntu-latest, bazel: '9.3.2', eco: pypi, fixtures: rules_python}
+          - {os: ubuntu-latest, bazel: '8.8.2', eco: pypi, fixtures: rules_python}
+          - {os: ubuntu-latest, bazel: '7.7.2', eco: pypi, fixtures: rules_python}
     runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS != 'true' && (matrix.os == 'ubuntu-latest' && 'depot-ubuntu-24.04-4' || matrix.os == 'ubuntu-22.04' && 'depot-ubuntu-22.04-4') || matrix.os }}
     timeout-minutes: 45
     steps: &bazel-steps
@@ -154,8 +170,10 @@ jobs:
         # fixture does not make this leg save a new copy; a run whose
         # fixtures changed starts from the newest cache of its leg. The
         # cache is content-addressed, so an older one is still correct,
-        # only incomplete. The package under test never comes from it: `go`
-        # fetches a module into the output base, which every test makes anew.
+        # only incomplete. The patched package never comes from it: `go`
+        # fetches a module into the output base, which every test makes anew,
+        # and a patched wheel holds an id made for its run, so no earlier run
+        # saved a file with its checksum.
         id: bazel-repos
         uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
         timeout-minutes: 5
@@ -201,6 +219,7 @@ jobs:
       matrix:
         include:
           - {os: macos-latest, bazel: '9.3.2', eco: go, fixtures: gazelle}
+          - {os: macos-latest, bazel: '9.3.2', eco: pypi, fixtures: rules_python}
     runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS != 'true' && (matrix.os == 'ubuntu-latest' && 'depot-ubuntu-24.04-4' || matrix.os == 'ubuntu-22.04' && 'depot-ubuntu-22.04-4') || matrix.os }}
     timeout-minutes: 45
     steps: *bazel-steps
