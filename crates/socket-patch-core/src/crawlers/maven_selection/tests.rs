@@ -402,6 +402,37 @@ fn a_range_overrules_a_nearer_version_outside_it() {
     undetermined(&f.verdict("1.0"));
 }
 
+/// A range is a hard requirement at any depth, so one the model cannot
+/// resolve (here its only version list is a mirror's) leaves a nearer plain
+/// version undetermined: Maven may select a version inside the range.
+#[test]
+fn an_unresolved_deeper_range_leaves_a_nearer_version_undetermined() {
+    let f = Fixture::new();
+    f.app(&deps(&[x("lib-a", "1.0"), x("lib-y", "1.0")]))
+        .cache("lib-a", "1.0", &[x(A, "1.0")])
+        .cache("lib-y", "1.0", &[x("lib-r", "1.0")])
+        .cache("lib-r", "1.0", &[x(A, "[2.0,3.0)")])
+        .cache(A, "1.0", &[])
+        .cache(A, "2.5", &[]);
+    write(
+        &f.repo,
+        &format!("org/x/{A}/maven-metadata-nexus.xml"),
+        &metadata(A, &["1.0", "2.5", "3.0"]),
+    );
+    let why = f.verdict("1.0");
+    assert!(undetermined(&why).contains("[2.0,3.0)"), "{why:?}");
+
+    // The same deeper declaration at a plain version loses to the nearer one.
+    let f = Fixture::new();
+    f.app(&deps(&[x("lib-a", "1.0"), x("lib-y", "1.0")]))
+        .cache("lib-a", "1.0", &[x(A, "1.0")])
+        .cache("lib-y", "1.0", &[x("lib-r", "1.0")])
+        .cache("lib-r", "1.0", &[x(A, "2.5")])
+        .cache(A, "1.0", &[])
+        .cache(A, "2.5", &[]);
+    assert_eq!(f.verdict("1.0"), Verdict::Selected);
+}
+
 /// The table's V5 for a project that was never resolved: a pom missing
 /// from the local repository leaves everything at its depth or deeper
 /// undetermined, and nothing nearer.

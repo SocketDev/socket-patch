@@ -485,6 +485,9 @@ struct Edge {
     exclusions: u32,
     /// A `system` dependency: a file on the machine, with no pom to follow.
     leaf: bool,
+    /// A range that cannot be resolved: a hard requirement at any depth,
+    /// so it leaves the artifact's selection undetermined however deep it is.
+    hard: bool,
 }
 
 /// A node's dependencies.
@@ -505,6 +508,7 @@ struct Item {
     range: Option<Rc<Range>>,
     exclusions: u32,
     leaf: bool,
+    hard: bool,
 }
 
 impl Item {
@@ -517,6 +521,7 @@ impl Item {
             range: edge.range.clone(),
             exclusions: edge.exclusions,
             leaf: edge.leaf,
+            hard: edge.hard,
         }
     }
 }
@@ -1058,6 +1063,14 @@ impl Selector<'_> {
             range,
             exclusions,
             leaf,
+            hard: false,
+        };
+        // A range Maven obeys but this model cannot resolve.
+        let hard = |why: String| {
+            vec![Edge {
+                hard: true,
+                ..edge(0, Ver::Unknown(why), None)
+            }]
         };
         let raw = match version {
             Ver::Unknown(why) => return vec![edge(0, Ver::Unknown(why), None)],
@@ -1070,7 +1083,7 @@ impl Selector<'_> {
         let Some(set) = VersionRange::parse(&raw) else {
             if raw.starts_with(['[', '(']) || raw.contains(',') {
                 let why = format!("the version range {raw} cannot be read");
-                return vec![edge(0, Ver::Unknown(why), None)];
+                return hard(why);
             }
             return vec![edge(0, Ver::Known(raw), None)];
         };
@@ -1088,11 +1101,11 @@ impl Selector<'_> {
                      no versions of it",
                     ga.0, ga.1
                 );
-                return vec![edge(0, Ver::Unknown(why), None)];
+                return hard(why);
             }
             Err(why) => {
                 let why = format!("{why}, so the range {raw} cannot be resolved");
-                return vec![edge(0, Ver::Unknown(why), None)];
+                return hard(why);
             }
         };
         let range = Rc::new(Range { raw, set });
@@ -1105,7 +1118,7 @@ impl Selector<'_> {
                 "no version of {}:{} the local Maven repository lists is in the range {}",
                 ga.0, ga.1, range.raw
             );
-            return vec![edge(0, Ver::Unknown(why), None)];
+            return hard(why);
         }
         within
             .into_iter()
@@ -1308,9 +1321,14 @@ impl Selector<'_> {
         // A declaration at a version that cannot be read may be the one
         // Maven selects, and brings in whatever that version depends on.
         let mut unread: Option<(usize, String)> = None;
+        // A range that cannot be resolved binds the selection at any depth.
+        let mut hard: Option<String> = None;
         for item in &items {
             if let Ver::Unknown(why) = &item.version {
                 note(module, item.path.len() + 1, why);
+                if item.hard && hard.is_none() {
+                    hard = Some(why.clone());
+                }
                 if unread.as_ref().is_none_or(|(at, _)| item.path.len() < *at) {
                     unread = Some((item.path.len(), why.clone()));
                 }
@@ -1331,6 +1349,9 @@ impl Selector<'_> {
                     if *unread_depth <= depth {
                         doubt.get_or_insert_with(|| why.clone());
                     }
+                }
+                if let Some(why) = &hard {
+                    doubt.get_or_insert_with(|| why.clone());
                 }
                 let node = (key, version.to_string(), item.exclusions);
                 let below = match graph.expanded.get(&node) {

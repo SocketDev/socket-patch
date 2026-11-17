@@ -815,15 +815,15 @@ async fn unpin_unselected(
     let poms = poms.join(", ");
     if dry_run {
         return keep(format!(
-            "{detail}; the pin an earlier run wrote in {poms} still forces {v} and would be              removed"
+            "{detail}; the pin an earlier run wrote in {poms} still forces {v} and would be removed"
         ));
     }
     match super::jvm::apply::write_plan(project_root, &plan).await {
         Ok(_) => keep(format!(
-            "{detail}; the pin an earlier run wrote in {poms} still forced {v} and was removed              (`socket-patch vendor --revert` or `scan --mode vendored --prune` drops the              vendored copy it pointed at)"
+            "{detail}; the pin an earlier run wrote in {poms} still forced {v} and was removed (`socket-patch vendor --revert` or `scan --mode vendored --prune` drops the vendored copy it pointed at)"
         )),
         Err(e) => keep(format!(
-            "{detail}; the pin an earlier run wrote in {poms} still forces {v} and could not be              removed ({e}): run `socket-patch vendor --revert`"
+            "{detail}; the pin an earlier run wrote in {poms} still forces {v} and could not be removed ({e}): run `socket-patch vendor --revert`"
         )),
     }
 }
