@@ -36,7 +36,7 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::formats::maven::interpolate_strict;
+use crate::formats::maven::{interpolate_strict, split_socket_version};
 use crate::vendor::jvm::maven_reactor::{
     implicit_subprojects, may_discover_subprojects, pom_model, PomDecl, PomModel, MAVEN_CONFIG,
 };
@@ -221,6 +221,29 @@ impl<'w> Walk<'w> {
                 .join(v)
                 .join(format!("{a}-{v}.pom")),
         )
+    }
+
+    /// The `<version>-socket.<hex8>` copies of `gav` the local repository
+    /// holds, in name order.
+    pub(super) fn socket_copies(&self, gav: &Gav) -> Vec<Gav> {
+        let (g, a, v) = gav;
+        let Some(dir) = self
+            .repo_pom(gav)
+            .and_then(|pom| Some(pom.parent()?.parent()?.to_path_buf()))
+        else {
+            return Vec::new();
+        };
+        let mut copies: Vec<Gav> = self
+            .list(&dir)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|(_, is_dir)| *is_dir)
+            .filter_map(|(name, _)| name.into_string().ok())
+            .filter(|name| split_socket_version(name).is_some_and(|(base, _)| base == v))
+            .map(|name| (g.clone(), a.clone(), name))
+            .collect();
+        copies.sort();
+        copies
     }
 
     /// `node` and its parents: a reactor pom's local parent by

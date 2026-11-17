@@ -433,11 +433,14 @@ fn an_unresolved_deeper_range_leaves_a_nearer_version_undetermined() {
     assert_eq!(f.verdict("1.0"), Verdict::Selected);
 }
 
-/// The table's V5 for a project that was never resolved: a pom missing
+/// The table's V5 for a project that was never resolved. A pom missing
 /// from the local repository leaves everything at its depth or deeper
-/// undetermined, and nothing nearer.
+/// undetermined. Nearer than that the module still answers which other
+/// version it selects, but never that it selects the base version: what
+/// the missing pom depends on is not known, and a version range among it
+/// would overrule a nearer version.
 #[test]
-fn a_missing_pom_leaves_only_what_it_could_change_undetermined() {
+fn a_missing_pom_leaves_no_base_version_selected() {
     let f = Fixture::new();
     f.app(&deps(&[
         x("lib-x", "1.0"),
@@ -447,21 +450,256 @@ fn a_missing_pom_leaves_only_what_it_could_change_undetermined() {
     .cache("lib-x", "1.0", &[x(A, "2.9.10")])
     .cache(A, "2.9.10", &[])
     .cache("direct", "1.0", &[]);
-    let why = f.verdict("2.9.10");
-    assert!(
-        undetermined(&why).contains("never-resolved"),
-        "names the missing pom: {why:?}"
-    );
+    let names_the_pom = |verdict: Verdict| {
+        assert!(
+            undetermined(&verdict).contains("never-resolved"),
+            "names the missing pom: {verdict:?}"
+        );
+    };
+    names_the_pom(f.verdict("2.9.10"));
     let selection = f.select();
+    // Declared by the module itself, nearer than the missing pom.
+    names_the_pom(selection.verdict("pom.xml", G, "direct", "1.0"));
     assert_eq!(
-        selection.verdict("pom.xml", G, "direct", "1.0"),
-        Verdict::Selected
+        selection.verdict("pom.xml", G, "direct", "0.9"),
+        other("1.0")
     );
-    undetermined(&selection.verdict("pom.xml", G, "absent", "1.0"));
+    assert_eq!(
+        selection.standing(G, "direct", "0.9"),
+        Standing::NotSelected(vec!["1.0".to_string()])
+    );
+    names_the_pom(selection.verdict("pom.xml", G, "absent", "1.0"));
     assert!(matches!(
         selection.standing(G, A, "2.7.9.2"),
         Standing::Undetermined(_)
     ));
+}
+
+/// The downgrade a missing pom could hide. The nearest declaration of the
+/// artifact is 1.0, two levels down. `lib-r`, three levels down, is not in
+/// the local repository; were it to require `[2.0,3.0)`, Maven would
+/// select 2.5 and a pin of 1.0 would move the build.
+#[test]
+fn a_pom_missing_below_the_winner_leaves_it_undetermined() {
+    let graph = |f: &Fixture| {
+        f.app(&deps(&[x("lib-a", "1.0"), x("lib-y", "1.0")]))
+            .cache("lib-a", "1.0", &[x(A, "1.0")])
+            .cache("lib-y", "1.0", &[x("lib-r", "1.0")])
+            .cache(A, "1.0", &[]);
+    };
+    let f = Fixture::new();
+    graph(&f);
+    let why = f.verdict("1.0");
+    assert!(
+        undetermined(&why).contains("lib-r"),
+        "names the missing pom: {why:?}"
+    );
+    assert!(
+        undetermined_detail(G, A, "1.0", undetermined(&why)).contains("dependency:resolve"),
+        "resolving the project is the remedy"
+    );
+    // A patch of another version still learns what the build selects.
+    assert_eq!(f.verdict("0.9"), other("1.0"));
+
+    // With the pom there the answer is certain, whichever way it goes.
+    let f = Fixture::new();
+    graph(&f);
+    f.cache("lib-r", "1.0", &[]);
+    assert_eq!(f.verdict("1.0"), Verdict::Selected);
+
+    let f = Fixture::new();
+    graph(&f);
+    f.cache("lib-r", "1.0", &[x(A, "[2.0,3.0)")])
+        .cache(A, "2.5", &[]);
+    list(&f.repo, A, &["1.0", "2.5"]);
+    assert_eq!(f.verdict("1.0"), other("2.5"));
+
+    // A version that loses mediation takes what it depends on out of the
+    // graph, so its missing pom casts no doubt.
+    let f = Fixture::new();
+    f.app(&deps(&[x(A, "1.0"), x("lib-a", "1.0")]))
+        .cache("lib-a", "1.0", &[x(A, "2.5")])
+        .cache(A, "1.0", &[]);
+    assert_eq!(f.verdict("1.0"), Verdict::Selected);
+}
+
+/// Each other file a resolved project has in the local repository, missing
+/// where it leaves unread only what is deeper than the victim's nearest
+/// declaration: a parent pom, an imported BOM, the version list of a range.
+#[test]
+fn each_file_the_local_repository_lacks_holds_the_base_version_back() {
+    // `lib-t` is two levels down, as the victim is, with `body` in its
+    // pom: what it brings in is three levels down.
+    let graph = |f: &Fixture, body: &str| {
+        f.app(&deps(&[x("lib-a", "1.0"), x("lib-y", "1.0")]))
+            .cache("lib-a", "1.0", &[x(A, "1.0")])
+            .cache("lib-y", "1.0", &[x("lib-t", "1.0")])
+            .cache(A, "1.0", &[])
+            .cache("leaf", "1.0", &[]);
+        cache(&f.repo, "lib-t", "1.0", body);
+    };
+    let held_back_by = |f: &Fixture, what: &str| {
+        let why = f.verdict("1.0");
+        assert!(undetermined(&why).contains(what), "{why:?}");
+        assert!(
+            undetermined_detail(G, A, "1.0", undetermined(&why)).contains("dependency:resolve"),
+            "resolving the project is the remedy: {why:?}"
+        );
+        assert_eq!(f.verdict("0.9"), other("1.0"));
+    };
+
+    // A parent pom. A second cause in the same pom, a coordinate through
+    // a property the parent would define, does not hide it.
+    let parent = format!(
+        "<parent><groupId>{G}</groupId><artifactId>t-parent</artifactId>\
+         <version>1</version></parent>"
+    );
+    let with_parent = format!("{parent}{}", deps(&[x("leaf_${series}", "1.0")]));
+    let f = Fixture::new();
+    graph(&f, &with_parent);
+    held_back_by(&f, "t-parent");
+    // Every answer of the module names the missing parent, the remedy
+    // that works, and not the undefined property it leaves behind.
+    let absent = f.select().verdict("pom.xml", G, "absent", "1.0");
+    assert!(undetermined(&absent).contains("t-parent"), "{absent:?}");
+    let f = Fixture::new();
+    graph(&f, &with_parent);
+    cache(
+        &f.repo,
+        "t-parent",
+        "1",
+        "<packaging>pom</packaging><properties><series>2</series></properties>",
+    );
+    f.cache("leaf_2", "1.0", &[]);
+    assert_eq!(f.verdict("1.0"), Verdict::Selected);
+
+    // An imported BOM.
+    let import = dep(
+        G,
+        "t-bom",
+        Some("1"),
+        "<type>pom</type><scope>import</scope>",
+    );
+    let with_bom = format!("{}{}", managed(&[import]), deps(&[x("leaf", "1.0")]));
+    let f = Fixture::new();
+    graph(&f, &with_bom);
+    held_back_by(&f, "t-bom");
+    let f = Fixture::new();
+    graph(&f, &with_bom);
+    cache(&f.repo, "t-bom", "1", "<packaging>pom</packaging>");
+    assert_eq!(f.verdict("1.0"), Verdict::Selected);
+
+    // The version list of a range on another artifact.
+    let with_range = deps(&[x("leaf", "[1.0,2.0)")]);
+    let f = Fixture::new();
+    graph(&f, &with_range);
+    held_back_by(&f, "[1.0,2.0)");
+    let f = Fixture::new();
+    graph(&f, &with_range);
+    list(&f.repo, "leaf", &["1.0"]);
+    assert_eq!(f.verdict("1.0"), Verdict::Selected);
+
+    // A cause resolving the project does not change keeps its reach: a
+    // relocation three levels down leaves the nearer version certain.
+    let f = Fixture::new();
+    graph(&f, &deps(&[x("lib-u", "1.0")]));
+    cache(
+        &f.repo,
+        "lib-u",
+        "1.0",
+        "<distributionManagement><relocation><artifactId>lib-u-ng</artifactId></relocation>\
+         </distributionManagement>",
+    );
+    assert_eq!(f.verdict("1.0"), Verdict::Selected);
+}
+
+/// A range on a module of the reactor that was never installed has no
+/// version list in the local repository, and resolving the project
+/// writes none: Maven lists the module from the build. That leaves the
+/// module's own selection untold, as before, and holds nothing else back.
+#[test]
+fn a_range_on_a_module_of_the_reactor_is_no_gap_in_the_local_repository() {
+    let f = Fixture::new();
+    write(
+        &f.cwd,
+        "pom.xml",
+        &pom(
+            "com.example",
+            "parent",
+            "1",
+            "<packaging>pom</packaging><modules><module>a</module><module>b</module></modules>",
+        ),
+    );
+    let module = |name: &str, list: &[String]| {
+        format!(
+            "<project><modelVersion>4.0.0</modelVersion><parent><groupId>com.example</groupId>\
+             <artifactId>parent</artifactId><version>1</version></parent>\
+             <artifactId>{name}</artifactId>{}</project>",
+            deps(list)
+        )
+    };
+    write(
+        &f.cwd,
+        "a/pom.xml",
+        &module(
+            "a",
+            &[x(A, "1.0"), dep("com.example", "b", Some("[1,2)"), "")],
+        ),
+    );
+    write(&f.cwd, "b/pom.xml", &module("b", &[]));
+    f.cache(A, "1.0", &[]);
+    let selection = f.select();
+    assert_eq!(
+        selection.verdict("a/pom.xml", G, A, "1.0"),
+        Verdict::Selected
+    );
+    undetermined(&selection.verdict("a/pom.xml", "com.example", "b", "1"));
+}
+
+/// A build pinned to a patched copy fetches the copy's pom and never the
+/// base version's, so a fresh machine holds only the copy. The model reads
+/// the project without its pins, at the base version, and takes what that
+/// version depends on from the copy: an earlier patch does not hold the
+/// next one back.
+#[test]
+fn a_base_version_only_its_patched_copy_is_cached_for_reads_the_copy() {
+    let f = Fixture::new();
+    f.app(&format!(
+        "<dependencyManagement><dependencies>\n\
+         <!-- socket-patch 8e82692a-a5bd-40ac-97a7-4f1483449fd6: {G}:{A}:2.7.9.2 -->\n\
+         {}</dependencies></dependencyManagement>{}",
+        x(A, "2.7.9.2-socket.8e82692a"),
+        deps(&[x("lib-a", "1.0"), x("lib-b", "1.0")])
+    ))
+    .cache("lib-a", "1.0", &[x(A, "2.7.9.2")])
+    .cache("lib-b", "1.0", &[x("next", "1")])
+    .cache(A, "2.7.9.2-socket.8e82692a", &[x("below", "1")])
+    .cache("below", "1", &[])
+    .cache("next", "1", &[]);
+    let selection = f.select();
+    assert_eq!(
+        selection.verdict("pom.xml", G, A, "2.7.9.2"),
+        Verdict::Selected
+    );
+    // Read through the copy's pom.
+    assert_eq!(
+        selection.verdict("pom.xml", G, "below", "1"),
+        Verdict::Selected
+    );
+    // The artifact the next patch is for.
+    assert_eq!(
+        selection.verdict("pom.xml", G, "next", "1"),
+        Verdict::Selected
+    );
+
+    // A copy of another version is not this version's.
+    let f = Fixture::new();
+    f.app(&deps(&[x("lib-a", "1.0"), x("lib-b", "1.0")]))
+        .cache("lib-a", "1.0", &[x(A, "2.7.9.2")])
+        .cache("lib-b", "1.0", &[x("next", "1")])
+        .cache(A, "2.7.9.1-socket.8e82692a", &[])
+        .cache("next", "1", &[]);
+    assert!(undetermined(&f.select().verdict("pom.xml", G, "next", "1")).contains(A));
 }
 
 #[test]

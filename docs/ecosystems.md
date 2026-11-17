@@ -900,7 +900,9 @@ Honest limits of the Maven and NuGet flows — documented behavior, not bugs:
   Maven selects instead (`redirect_maven_version_not_selected`, vendored
   `vendor_maven_version_not_selected`). A patch for the version that is selected is
   still looked up and applied. When the selection cannot be read (most often because
-  the project was never resolved, so the local repository lacks its poms), a
+  the project was never resolved, so the local repository lacks its poms; one pom
+  missing among what a module resolves holds back every new pin in that module, since
+  it may hold a version range and a range binds at any depth), a
   declaration that already names the base version is still rewritten where it stands,
   and no new pin is written (`redirect_maven_selection_undetermined`, vendored
   `vendor_maven_selection_undetermined`): the line names the remedy, `mvn -q

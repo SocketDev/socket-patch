@@ -2742,6 +2742,21 @@ a model 4.1.0 pom: its dependency management differs). A version selected as
 the highest of a range is never pinned either, since a pin would freeze the
 range.
 
+A file the local repository lacks (the pom of an artifact the module resolves,
+a parent pom, an imported BOM, the version list of a range) weighs more than
+the other causes. A version range may be in what was not read, and a range
+binds at any depth, so a module with such a file missing is never reported to
+select the base version, however near the module the declaration that would
+win is. The other modules of the build keep their own answers. Such a module
+is still reported to select another version: that writes no new pin (the patch
+is skipped, and a pin of that version already there is taken out). Resolving
+the project fills the files in, and the reason given names the missing file.
+The pom of a version that loses mediation is not part of what the module
+resolves, and a base version whose pom is cached only for its
+`<base>-socket.<hex8>` copy (a build pinned to the copy fetches no other) reads
+the copy's. An artifact published without any pom stays a missing file. Any
+other cause leaves a declaration nearer the module than it is certain.
+
 | Mode | The build selects another version, or does not resolve the artifact | The selection is not certain |
 |---|---|---|
 | hosted | `redirect_maven_version_not_selected` (warning); nothing written | a declaration that names the base version is rewritten where it stands (that replaces the version in place and moves nothing); otherwise `redirect_maven_selection_undetermined` (warning), nothing written |
