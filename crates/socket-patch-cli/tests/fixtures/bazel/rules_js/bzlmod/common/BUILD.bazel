@@ -1,0 +1,11 @@
+load("@aspect_rules_js//js:defs.bzl", "js_binary")
+load("@npm//:defs.bzl", "npm_link_all_packages")
+
+npm_link_all_packages(name = "node_modules")
+
+# Prints OUT: PRISTINE until the package is patched.
+js_binary(
+    name = "consumer",
+    data = [":node_modules/fixture-upstream"],
+    entry_point = "consumer.js",
+)

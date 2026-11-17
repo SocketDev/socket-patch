@@ -1,0 +1,22 @@
+lockfileVersion: '9.0'
+
+settings:
+  autoInstallPeers: true
+  excludeLinksFromLockfile: false
+
+importers:
+
+  .:
+    dependencies:
+      fixture-upstream:
+        specifier: 1.0.0
+        version: 1.0.0
+
+packages:
+
+  fixture-upstream@1.0.0:
+    resolution: {integrity: sha512-Z3lOFVPqD/UIckYygD1lO7tCL0A6CtpPaEaGWDgQ4jE8492xKwPZsIKj9/gEhBxCaYFgUYvAF8X4uHcokLRvbA==}
+
+snapshots:
+
+  fixture-upstream@1.0.0: {}
