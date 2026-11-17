@@ -1956,7 +1956,8 @@ A gem that agent mode patched in place (`scan --mode agent`, `apply`) counts too
 already the patched ones, but the archive RubyGems kept beside it is still the upstream one, and
 `bundle pristine` and `bundle install --redownload` reinstall from that archive: with a
 `CHECKSUMS` section in the lock Bundler removes the gem and fails on the checksum, without one it
-brings the unpatched gem back. So the copy and its archive are replaced like any other.
+brings the unpatched gem back. So that archive is replaced with the patched one. The installed
+files are left as they are.
 
 They are replaced with the patched `.gem` the lock pins, checked against that sha256 first. A gem
 with a native extension is installed into a staging directory by RubyGems, with the Ruby that

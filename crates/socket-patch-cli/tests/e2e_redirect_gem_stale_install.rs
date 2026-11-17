@@ -2791,21 +2791,17 @@ async fn refresh_is_not_run_by_a_hosted_to_vendored_takeover() {
 fn agent_patched_install(proj: &Path, home: &Path) -> PathBuf {
     let gem_dir = install_real_gem(home, UPSTREAM_LIB);
     std::fs::write(gem_dir.join("lib").join("stale_probe_gem.rb"), PATCHED_LIB).unwrap();
-    let before = compute_git_sha256_from_bytes(UPSTREAM_LIB.as_bytes());
-    let after = compute_git_sha256_from_bytes(PATCHED_LIB.as_bytes());
-    let socket_dir = proj.join(".socket");
-    common::write_minimal_manifest(
-        &socket_dir,
+    common::write_in_place_patch_record(
+        &proj.join(".socket"),
         PURL,
         UUID,
-        &[common::PatchEntry {
-            file_name: "lib/stale_probe_gem.rb",
-            before_hash: &before,
-            after_hash: &after,
-        }],
+        "lib/stale_probe_gem.rb",
+        UPSTREAM_LIB.as_bytes(),
+        PATCHED_LIB.as_bytes(),
     );
-    common::write_blob(&socket_dir, &before, UPSTREAM_LIB.as_bytes());
-    common::write_blob(&socket_dir, &after, PATCHED_LIB.as_bytes());
+    // A file of agent mode's own inside the gem dir (a native gem keeps its
+    // original build there).
+    std::fs::write(gem_dir.join(".socket-patch-kept"), "kept").unwrap();
     gem_dir
 }
 
@@ -2814,9 +2810,9 @@ fn agent_patched_install(proj: &Path, home: &Path) -> PathBuf {
 /// checksum in the lock, `bundle pristine` and `bundle install
 /// --redownload` reinstall from that archive: Bundler 2.6 and later remove
 /// the gem and fail on the checksum, older ones bring the unpatched gem
-/// back. So the scan replaces the copy and its archive with the patched
-/// gem, like any other copy Bundler already holds, and `rollback` still
-/// gives the upstream gem back.
+/// back. So the scan replaces that archive with the patched gem and leaves
+/// the gem dir, whose files are patched already, exactly as it is;
+/// `rollback` still gives the upstream gem back.
 #[tokio::test(flavor = "multi_thread")]
 async fn refresh_replaces_the_upstream_archive_beside_an_agent_patched_install() {
     let server = MockServer::start().await;
@@ -2860,8 +2856,14 @@ async fn refresh_replaces_the_upstream_archive_beside_an_agent_patched_install()
     );
     let notes = warnings_with_code(&env, "redirect_gem_install_refreshed");
     assert!(
-        notes.len() == 1 && notes[0].contains(&gem_dir.display().to_string()),
-        "the install, with its archive: {env}"
+        notes.len() == 1
+            && notes[0].contains(&cache.display().to_string())
+            && notes[0].contains("patched in place"),
+        "the archive, and only it: {env}"
+    );
+    assert!(
+        gem_dir.join(".socket-patch-kept").is_file(),
+        "the gem dir is not replaced"
     );
     assert_eq!(
         std::fs::read(&cache).unwrap(),
@@ -2948,9 +2950,7 @@ async fn an_agent_patched_install_the_run_may_not_replace_is_warned_about() {
     for needle in [
         "patched in place",
         "`--no-gem-install-refresh` is set",
-        &cache.display().to_string(),
-        &spec.display().to_string(),
-        "run `bundle install`",
+        &format!("emove {} and run `bundle install`", cache.display()),
     ] {
         assert!(
             details[0].contains(needle),
@@ -2958,8 +2958,9 @@ async fn an_agent_patched_install_the_run_may_not_replace_is_warned_about() {
         );
     }
     assert!(
-        !details[0].contains("unpatched install"),
-        "the installed files are patched: {details:?}"
+        !details[0].contains("unpatched install")
+            && !details[0].contains(&spec.display().to_string()),
+        "the installed files are patched, and stay installed: {details:?}"
     );
     assert_eq!(installed_lib(&gem_dir), PATCHED_LIB);
     assert_eq!(std::fs::read(&cache).unwrap(), upstream);
@@ -3007,4 +3008,5 @@ async fn an_agent_patched_install_the_run_may_not_replace_is_warned_about() {
     assert!(stale_warnings(&env).is_empty(), "{env}");
     assert_eq!(installed_lib(&gem_dir), PATCHED_LIB);
     assert_eq!(std::fs::read(&cache).unwrap(), patched);
+    assert!(gem_dir.join(".socket-patch-kept").is_file());
 }
