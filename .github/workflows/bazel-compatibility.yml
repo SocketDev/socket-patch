@@ -1,0 +1,205 @@
+name: Bazel patch compatibility
+
+# socket-patch in a Bazel workspace, on a real Bazel: one leg per Bazel
+# release and ecosystem runs that ecosystem's `#[ignore]` tests of
+# `e2e_bazel_build`, by name prefix (`go::b9_` on Bazel 9.3.2). A test builds
+# a fixture workspace, runs the built binary in it and reads the result from
+# what Bazel builds next.
+#
+# The package under test and every Socket host are loopback stand-ins. A leg
+# still needs the network for the ruleset and the toolchain: github.com and
+# release-assets.githubusercontent.com (the Bazel release, cached per
+# release, and the ruleset archives), dl.google.com (the Go SDK) and, on
+# every run, bcr.bazel.build (the registry) and go.dev (the Go release
+# list). A repository cache saved from main holds the archives and the SDK.
+#
+# Not required for merge: no `merge_group` trigger, and no job here is a
+# `needs` of ci.yml's `ci-ok`. Setting the repository variable
+# BAZEL_COMPAT_DISABLED to `true` turns every leg off without a merge.
+#
+# A leg selects its tests by the major of its release, so a major has one
+# release here. To add a Bazel major: one line per platform in
+# scripts/bazel-pins.txt and one matrix line here. To add an ecosystem: its
+# module in `e2e_bazel_build` and one matrix line per release.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    # The suite's own files and the Go files its tests run through, as
+    # go-compatibility.yml lists them. Shared engine code
+    # (patch/redirect/mod.rs, hosted/, commands/) gets its run on push to
+    # main (when it is in the push filter below) or nightly, or on demand
+    # via workflow_dispatch on the PR branch.
+    paths:
+      - '.github/workflows/bazel-compatibility.yml'
+      - 'scripts/install-bazel.sh'
+      - 'scripts/bazel-pins.txt'
+      - 'crates/socket-patch-cli/tests/e2e_bazel_build/**'
+      - 'crates/socket-patch-cli/tests/fixtures/bazel/**'
+      - 'crates/*/src/**/*golang*'
+      - 'crates/*/src/**/*golang*/**'
+      - 'crates/socket-patch-core/src/vendor/go*.rs'
+  push:
+    branches: [main]
+    # The PR paths, the shared engine code and test helpers the tests run
+    # through, and the toolchain files. A main push outside this set waits
+    # for the nightly run below.
+    paths:
+      - '.github/workflows/bazel-compatibility.yml'
+      - 'scripts/install-bazel.sh'
+      - 'scripts/bazel-pins.txt'
+      - 'crates/socket-patch-cli/tests/e2e_bazel_build/**'
+      - 'crates/socket-patch-cli/tests/fixtures/bazel/**'
+      - 'crates/*/src/**/*golang*'
+      - 'crates/*/src/**/*golang*/**'
+      - 'crates/socket-patch-core/src/vendor/go*.rs'
+      - 'crates/socket-patch-core/src/patch/redirect/**'
+      - 'crates/socket-patch-core/src/hosted/**'
+      - 'crates/socket-patch-cli/src/commands/**'
+      - 'crates/socket-patch-cli/tests/common/**'
+      - 'crates/socket-patch-cli/tests/hosted_memory_common/**'
+      - 'Cargo.lock'
+      - 'Cargo.toml'
+      - 'crates/*/Cargo.toml'
+      - 'rust-toolchain.toml'
+      - '.cargo/**'
+  schedule:
+    # Nightly, so a main change outside the push filter still gets a run
+    # within a day.
+    - cron: '17 4 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bazel-compat-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  SOCKET_NO_CONFIG: '1'
+  SOCKET_NO_UPDATE_CHECK: '1'
+  SOCKET_TELEMETRY_DISABLED: '1'
+
+jobs:
+  bazel:
+    name: ${{ matrix.eco }} / Bazel ${{ matrix.bazel }} (${{ matrix.os }})
+    if: github.event.pull_request.draft != true && vars.BAZEL_COMPAT_DISABLED != 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # `fixtures`: the ecosystem's directory under
+          # tests/fixtures/bazel, which keys its repository cache.
+          - {os: ubuntu-latest, bazel: '9.3.2', eco: go, fixtures: gazelle}
+          - {os: ubuntu-latest, bazel: '8.8.2', eco: go, fixtures: gazelle}
+          - {os: ubuntu-latest, bazel: '7.7.2', eco: go, fixtures: gazelle}
+    runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS != 'true' && (matrix.os == 'ubuntu-latest' && 'depot-ubuntu-24.04-4' || matrix.os == 'ubuntu-22.04' && 'depot-ubuntu-22.04-4') || matrix.os }}
+    timeout-minutes: 45
+    steps: &bazel-steps
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Shellcheck the Bazel installer
+        # shellcheck is pre-installed on the Linux runners only.
+        if: runner.os == 'Linux'
+        run: shellcheck scripts/install-bazel.sh
+
+      - run: rustup show
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          shared-key: dev-${{ matrix.os }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Restore the Bazel ${{ matrix.bazel }} binary
+        # The installer checks a restored file against its pin too, so a
+        # miss or a stale entry only means a download. Saved from main.
+        id: bazel-dist
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        timeout-minutes: 5
+        continue-on-error: true
+        with:
+          path: ${{ runner.temp }}/bazel-dist
+          key: bazel-dist-${{ matrix.bazel }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/bazel-pins.txt', 'scripts/install-bazel.sh') }}
+
+      - name: Install Bazel ${{ matrix.bazel }}
+        env:
+          BAZEL_VERSION: ${{ matrix.bazel }}
+        # Prints SOCKET_PATCH_BAZEL_E2E_BAZEL, the pinned and verified binary.
+        run: scripts/install-bazel.sh "$BAZEL_VERSION" "$RUNNER_TEMP/bazel-dist" >> "$GITHUB_ENV"
+
+      - name: Save the Bazel ${{ matrix.bazel }} binary
+        if: >-
+          github.ref == 'refs/heads/main'
+          && steps.bazel-dist.outputs.cache-hit != 'true'
+          && steps.bazel-dist.outcome == 'success'
+        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        with:
+          path: ${{ runner.temp }}/bazel-dist
+          key: ${{ steps.bazel-dist.outputs.cache-primary-key }}
+
+      - name: Restore the repository cache
+        # What Bazel downloads for the fixtures: ruleset archives and the
+        # language toolchain (about 100 MB for Go). Keyed by the
+        # ecosystem's fixtures, which pin all of it, so another ecosystem's
+        # fixture does not make this leg save a new copy; a run whose
+        # fixtures changed starts from the newest cache of its leg. The
+        # cache is content-addressed, so an older one is still correct,
+        # only incomplete. The package under test never comes from it: `go`
+        # fetches a module into the output base, which every test makes anew.
+        id: bazel-repos
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        timeout-minutes: 5
+        continue-on-error: true
+        with:
+          path: ${{ runner.temp }}/bazel-repos
+          key: bazel-repos-${{ matrix.eco }}-${{ matrix.bazel }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles(format('crates/socket-patch-cli/tests/fixtures/bazel/{0}/**', matrix.fixtures)) }}
+          restore-keys: |
+            bazel-repos-${{ matrix.eco }}-${{ matrix.bazel }}-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Run the ${{ matrix.eco }} tests on Bazel ${{ matrix.bazel }}
+        env:
+          # A missing Bazel or another release fails the leg instead of
+          # printing SKIP.
+          SOCKET_PATCH_BAZEL_E2E_REQUIRED: '1'
+          SOCKET_PATCH_BAZEL_E2E_REPO_CACHE: ${{ runner.temp }}/bazel-repos
+          BAZEL_VERSION: ${{ matrix.bazel }}
+          ECO: ${{ matrix.eco }}
+        # Two tests at a time: each runs a Bazel server of its own.
+        run: |
+          set -euo pipefail
+          filter="${ECO}::b${BAZEL_VERSION%%.*}_"
+          cargo test --locked -p socket-patch-cli --test e2e_bazel_build -- \
+            --ignored "$filter" --test-threads=2 --nocapture 2>&1 | tee "$RUNNER_TEMP/bazel-tests.log"
+          # A filter that selects no test passes for cargo.
+          passed=$(sed -n 's/^test result: .* \([0-9][0-9]*\) passed;.*/\1/p' "$RUNNER_TEMP/bazel-tests.log" | head -n 1)
+          if [ "${passed:-0}" = 0 ]; then
+            echo "::error::no test of e2e_bazel_build matches $filter"
+            exit 1
+          fi
+
+      - name: Save the repository cache
+        if: >-
+          github.ref == 'refs/heads/main'
+          && steps.bazel-repos.outputs.cache-hit != 'true'
+          && steps.bazel-repos.outcome == 'success'
+        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        with:
+          path: ${{ runner.temp }}/bazel-repos
+          key: ${{ steps.bazel-repos.outputs.cache-primary-key }}
+
+  # The macOS rows of `bazel`: nightly and on demand, never on a pull
+  # request or a push, so they do not queue on the small macOS runner pool.
+  bazel-macos:
+    name: ${{ matrix.eco }} / Bazel ${{ matrix.bazel }} (${{ matrix.os }})
+    if: (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && vars.BAZEL_COMPAT_DISABLED != 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {os: macos-latest, bazel: '9.3.2', eco: go, fixtures: gazelle}
+    runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS != 'true' && (matrix.os == 'ubuntu-latest' && 'depot-ubuntu-24.04-4' || matrix.os == 'ubuntu-22.04' && 'depot-ubuntu-22.04-4') || matrix.os }}
+    timeout-minutes: 45
+    steps: *bazel-steps
