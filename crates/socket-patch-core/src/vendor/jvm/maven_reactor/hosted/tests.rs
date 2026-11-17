@@ -406,6 +406,49 @@ fn an_undetermined_module_is_not_pinned_and_its_sibling_is() {
     assert_eq!(reasons(&unread), ["selection_undetermined"]);
 }
 
+/// A scan over a cold local repository wires what it can tell; the next
+/// one, once Maven has resolved the project, pins the module the first
+/// could not, and moves nothing the first wrote. Told nothing new, it
+/// writes nothing.
+#[test]
+fn a_later_scan_completes_what_an_earlier_one_could_not_tell() {
+    let files = fs(&[
+        ("pom.xml", &root("")),
+        ("a/pom.xml", &module("a", &dep("lib-x", Some("1.0")))),
+        ("b/pom.xml", &module("b", &dep(A, Some(BASE)))),
+    ]);
+    let cold = selecting(
+        &files,
+        &[
+            ("a/pom.xml", Err("lib-x:1.0 is not cached")),
+            ("b/pom.xml", Ok(BASE)),
+        ],
+    );
+    let first = planned(&files, Some(&cold));
+    assert_eq!(kinds(&first), [("b/pom.xml", HostedEditKind::Version)]);
+    assert_eq!(reasons(&first), ["selection_undetermined"]);
+    let after = written(&files, &first);
+    let again = planned(
+        &after,
+        Some(&selecting(
+            &after,
+            &[("a/pom.xml", Err("still")), ("b/pom.xml", Ok(BASE))],
+        )),
+    );
+    assert!(again.poms.is_empty(), "{:?}", again.edits);
+    assert_eq!(reasons(&again), ["selection_undetermined"]);
+
+    let warm = selecting(&after, &[("a/pom.xml", Ok(BASE)), ("b/pom.xml", Ok(BASE))]);
+    let second = planned(&after, Some(&warm));
+    // (In the root: both modules select the version now.)
+    assert_eq!(kinds(&second), [("pom.xml", HostedEditKind::Pin)]);
+    assert!(reasons(&second).is_empty(), "{:?}", second.notes);
+    let done = written(&after, &second);
+    assert_unwires_to(&done, &files);
+    let third = planned(&done, Some(&warm));
+    assert!(third.poms.is_empty() && third.wired, "{:?}", third.edits);
+}
+
 /// A pin that now reaches a module resolving another version is taken out
 /// again (it would hold that module back), leaving the pom as it was
 /// before the pin.

@@ -503,16 +503,9 @@ fn place_pins(
     closed: &dyn Fn(&String) -> bool,
     warnings: &mut Vec<JvmWarning>,
 ) -> (BTreeSet<String>, BTreeSet<String>) {
-    let (g, a) = (patch.group_id, patch.artifact_id);
     let mut pins: BTreeSet<String> = BTreeSet::new();
     let mut held: BTreeSet<String> = BTreeSet::new();
-    let moves = under.is_some_and(|under| {
-        reactor.scope.iter().any(|rel| {
-            pin_of(&reactor.poms[rel].doc, patch).is_some()
-                && under.get(rel).is_some_and(|u| u.other.is_some())
-        })
-    });
-    if reactor.wired_before(patch) && !moves {
+    if keeps_placement(reactor, patch, under) {
         // (A local root a declaration ruled out stays ruled out.)
         held.extend(reactor.scope.iter().filter(|rel| !closed(rel)).cloned());
         return (pins, held);
@@ -542,29 +535,50 @@ fn place_pins(
             .into_iter()
             .map(|detail| degraded("pin_would_move_module", detail)),
     );
-    // One line for every module that cannot be told, however many.
+    warnings.extend(under.and_then(|under| undetermined_note(patch, under)));
+    (pins, held)
+}
+
+/// Whether the pins of `patch` stay where the poms have them: the poms
+/// already wire the patch, and no pin is certain (by `under`) to move a
+/// module to another version than Maven selects for it.
+fn keeps_placement(
+    reactor: &Reactor,
+    patch: &JvmPatch<'_>,
+    under: Option<&BTreeMap<String, Under>>,
+) -> bool {
+    let moves = under.is_some_and(|under| {
+        reactor.scope.iter().any(|rel| {
+            pin_of(&reactor.poms[rel].doc, patch).is_some()
+                && under.get(rel).is_some_and(|u| u.other.is_some())
+        })
+    });
+    reactor.wired_before(patch) && !moves
+}
+
+/// One line for every module of `under` whose selection cannot be told,
+/// however many: the first, and how many more.
+fn undetermined_note(patch: &JvmPatch<'_>, under: &BTreeMap<String, Under>) -> Option<JvmWarning> {
+    let (g, a) = (patch.group_id, patch.artifact_id);
     let unknown: Vec<(&String, &String)> = under
-        .into_iter()
-        .flatten()
+        .iter()
         .filter_map(|(rel, u)| match &u.own {
             Some(Own::Unknown(why)) => Some((rel, why)),
             _ => None,
         })
         .collect();
-    if let Some((module, why)) = unknown.first() {
-        let more = match unknown.len() - 1 {
-            0 => String::new(),
-            n => format!(", and {n} more"),
-        };
-        warnings.push(degraded(
-            "selection_undetermined",
-            format!(
-                "which version of {g}:{a} {module} resolves cannot be told ({why}){more}; \
-                 no pin is written where that is so, and one already there is left as it is"
-            ),
-        ));
-    }
-    (pins, held)
+    let (module, why) = unknown.first()?;
+    let more = match unknown.len() - 1 {
+        0 => String::new(),
+        n => format!(", and {n} more"),
+    };
+    Some(degraded(
+        "selection_undetermined",
+        format!(
+            "which version of {g}:{a} {module} resolves cannot be told ({why}){more}; \
+             no pin is written where that is so, and one already there is left as it is"
+        ),
+    ))
 }
 
 fn op_of_value(op: &Value) -> &str {

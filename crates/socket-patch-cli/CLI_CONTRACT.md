@@ -2842,13 +2842,15 @@ in every pom `list` finds it in, or in none: each pom returns to its bytes
 before the scan, the `<repository>` goes from whichever pom declares it, and
 the `.mvn/` lines and files hosted mode wrote are removed.
 
-Where the pins go is decided when a patch is first wired, as in vendored mode:
-a later scan keeps every pin where it is and adds none, so a second scan
-changes nothing. The exceptions are the same: a pin of an earlier patch of the
-same version moves to the new suffix where it stands (its repository and
-checksum lines are replaced), and a pin that now reaches a module resolving
-another version is taken out and written where it belongs
-(`redirect_maven_pin_would_move_module`).
+A later scan keeps every pin where an earlier one wrote it, so a second scan
+changes nothing. It adds a pin only for a module that nothing reaches yet and
+that is now certain to select the base version: a first scan over a cold Maven
+local repository wires what it can tell (`redirect_maven_selection_undetermined`
+names the rest), and the next one, once the project was resolved there,
+completes it. A pin of an earlier patch of the same version moves to the new
+suffix where it stands (its repository and checksum lines are replaced), and a
+pin that now reaches a module resolving another version is taken out and
+written where it belongs (`redirect_maven_pin_would_move_module`).
 
 `vex` attests a hosted patch in a reactor by the vendored rule above: every
 module that resolves the base version, or may, is reached by a pin or a

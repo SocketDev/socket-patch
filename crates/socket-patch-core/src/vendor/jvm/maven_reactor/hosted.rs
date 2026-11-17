@@ -9,7 +9,9 @@
 //! - a `<dependencyManagement>` pin is the entry vendored mode writes, with
 //!   its `<!-- socket-patch <uuid>: g:a:v -->` comment, in the poms
 //!   [`place_pins`] picks (where every module at or below selects the base
-//!   version already, or does not resolve the artifact);
+//!   version already, or does not resolve the artifact). A later scan
+//!   keeps every pin where it is, and adds one only for a module nothing
+//!   reaches yet that is certain to select the base version;
 //! - a declaration whose version is one `${property}` the reactor's own
 //!   poms define, with nothing else reading that property, has the
 //!   property's value rewritten instead: the declaration keeps its text;
@@ -26,9 +28,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 
 use super::{
-    apply_edits, coords_patch, forget_other_versions, is_base_like, line_span, pin_edit, pin_of,
-    pin_update, place_pins, safe_coordinates, unattestable_in, unwired_in, Doc, Edit, Pin, Reactor,
-    Role,
+    apply_edits, coords_patch, degraded, forget_other_versions, is_base_like, keeps_placement,
+    line_span, pin_edit, pin_of, pin_update, place_pins, safe_coordinates, unattestable_in,
+    undetermined_note, unwired_in, Doc, Edit, Pin, Placing, Reactor, Role,
 };
 use crate::crawlers::maven_selection::{MavenSelection, Standing, Verdict};
 use crate::formats::maven::split_socket_version;
@@ -171,7 +173,34 @@ pub fn plan_hosted(
         rewritten.wired_without_pin(module, c)
     });
     let closed = |rel: &String| unpinned.contains(rel) || managed_roots.contains(rel);
-    let (pins, held) = place_pins(&reactor, &patch, Some(&under), &closed, &mut warnings);
+    let (mut pins, mut held) = place_pins(&reactor, &patch, Some(&under), &closed, &mut warnings);
+    // A patch the poms already wire keeps its pins where they are, and a
+    // module nothing reaches yet that is certain to select the base version
+    // is pinned all the same: a scan over a cold local repository wires
+    // what it can tell, and the next one, once the project was resolved,
+    // completes it. Nothing a pom already holds is moved by this.
+    if keeps_placement(&reactor, &patch, Some(&under)) {
+        let unreached = rewritten.under(selection, &patch, &|module| rewritten.covers(module, c));
+        let (mut more, mut ignored, mut stranded) = (BTreeSet::new(), BTreeSet::new(), Vec::new());
+        for root in reactor.wired_roots() {
+            let mut placing = Placing {
+                under: &unreached,
+                patch: &patch,
+                pins: &mut more,
+                held: &mut ignored,
+                stranded: &mut stranded,
+            };
+            reactor.place(&root, !closed(&root), &mut placing, 0);
+        }
+        held.retain(|rel| !more.contains(rel));
+        pins.extend(more);
+        warnings.extend(
+            stranded
+                .into_iter()
+                .map(|detail| degraded("pin_would_move_module", detail)),
+        );
+        warnings.extend(undetermined_note(&patch, &unreached));
+    }
     for rel in &rewritten.scope {
         let doc = &rewritten.poms[rel].doc;
         let (pinned, held) = (pins.contains(rel), held.contains(rel));
