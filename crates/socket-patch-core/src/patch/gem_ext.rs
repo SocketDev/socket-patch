@@ -200,7 +200,7 @@ use crate::patch::apply::{
 };
 use crate::patch::file_hash::compute_file_git_sha256_sync;
 use crate::patch::gem_source::{GemId, GemSource, RubyVersions};
-use crate::utils::containment::try_entry_type;
+use crate::utils::containment::{ensure_dir_or_absent, try_entry_type};
 use crate::utils::fs::read_regular_to_bytes_sync;
 
 /// The refusal when a native-extension patch cannot be rebuilt here (the
@@ -944,6 +944,24 @@ fn refuse_link(path: &Path, what: &str) -> std::io::Result<()> {
         )),
         _ => Ok(()),
     }
+}
+
+/// [`read_marker_sync`] for a caller that must not take a marker it cannot
+/// read for no marker (a rollback deciding whether the compiled code is the
+/// gem's own): `Ok(None)` only when no marker file is there. One that
+/// cannot be probed, read or understood (another schema) is an error
+/// naming it.
+fn read_marker_strict(gem_dir: &Path) -> std::io::Result<Option<BuildMarker>> {
+    let path = gem_dir.join(MARKER_FILE);
+    if try_entry_type(&path)?.is_none() {
+        return Ok(None);
+    }
+    read_marker_sync(gem_dir).map(Some).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{} could not be read as a build marker", path.display()),
+        )
+    })
 }
 
 fn read_marker_sync(gem_dir: &Path) -> Option<BuildMarker> {
@@ -2461,23 +2479,14 @@ fn stage_root(copy: &GemCopy) -> PathBuf {
 /// stage is created, emptied and deleted by path: a link (or a file)
 /// planted at either name would steer those writes and deletes into
 /// whatever it points at. An entry that cannot be probed is no better: only
-/// "not found" says nothing is there ([`try_entry_type`]). `Err` says which
-/// entry is in the way, and how. Every use of the stage goes through here.
+/// "not found" says nothing is there ([`ensure_dir_or_absent`]). `Err` says
+/// which entry is in the way, and how. Every use of the stage goes through
+/// here.
 fn stage_dirs(copy: &GemCopy) -> Result<(PathBuf, PathBuf), String> {
     let parent = copy.home.join(BUILD_STAGE_DIR);
     let root = stage_root(copy);
     for dir in [&parent, &root] {
-        match try_entry_type(dir) {
-            Ok(None) => {}
-            Ok(Some(kind)) if kind.is_dir() => {}
-            Ok(Some(_)) => {
-                return Err(format!(
-                    "its stage directory {} is not a directory",
-                    dir.display()
-                ))
-            }
-            Err(e) => return Err(format!("its stage directory {e}")),
-        }
+        ensure_dir_or_absent(dir).map_err(|e| format!("its stage directory {e}"))?;
     }
     Ok((parent, root))
 }
@@ -4491,22 +4500,31 @@ pub async fn restore_original_build(pkg_path: &Path, env: &RubyEnv) -> Result<bo
     let recovered = recover_interrupted_rebuild(&copy)
         .await
         .map_err(|e| recovery_refusal(&copy, &e))?;
-    let marker = {
-        let gem_dir = copy.gem_dir.clone();
-        crate::utils::fs::run_blocking(move || read_marker_sync(&gem_dir)).await
-    };
     let backup = copy.gem_dir.join(BACKUP_DIR);
     let pristine_hint = format!(
         "run `gem pristine {} --extensions`",
         gem_name_of(&copy.full_name)
     );
-    {
-        let backup = backup.clone();
-        crate::utils::fs::run_blocking(move || refuse_link(&backup, "a backup this tool made"))
-            .await
-            .map_err(|e| format!("{e}; left as it is, {pristine_hint}"))?;
-    }
-    let has_backup = tokio::fs::metadata(backup.join(BACKUP_INFO)).await.is_ok();
+    // What the copy carries. Only "not there" says it has no backup and no
+    // marker: one that cannot be probed or read may be all that says the
+    // compiled code is not the gem's own, and taking it for absent would
+    // report a copy with nothing to restore, or rebuild over a backup that
+    // was never put back.
+    let carried = {
+        let (gem_dir, backup) = (copy.gem_dir.clone(), backup.clone());
+        crate::utils::fs::run_blocking(move || -> std::io::Result<_> {
+            refuse_link(&backup, "a backup this tool made")?;
+            if try_entry_type(&backup.join(BACKUP_INFO))?.is_some() {
+                // The backup is this gem version's install-time build
+                // whatever the marker says, or fails to say.
+                return Ok((true, read_marker_sync(&gem_dir)));
+            }
+            Ok((false, read_marker_strict(&gem_dir)?))
+        })
+        .await
+    };
+    let (has_backup, marker) =
+        carried.map_err(|e| format!("{e}; left as it is, {pristine_hint}"))?;
     if has_backup {
         let c = copy.clone();
         return crate::utils::fs::run_blocking(move || restore_backup(&c, marker.as_ref()))
@@ -6571,6 +6589,60 @@ mod tests {
             "{why}"
         );
         assert_eq!(restore_original_build(&copy.gem_dir, &env).await, Ok(false));
+
+        // A backup dir that may not be searched: its description cannot be
+        // probed, so the backup is not taken for missing (which would have
+        // rollback rebuild in place over it, or report nothing to restore).
+        let backup = copy.gem_dir.join(BACKUP_DIR);
+        std::fs::create_dir_all(&backup).unwrap();
+        std::fs::write(backup.join(BACKUP_INFO), b"{}").unwrap();
+        mode(&backup, 0o000);
+        let restored = restore_original_build(&copy.gem_dir, &env).await;
+        mode(&backup, 0o755);
+        let why = restored.unwrap_err();
+        assert!(
+            why.contains(BACKUP_INFO)
+                && why.contains("could not be checked")
+                && why.contains("gem pristine a"),
+            "{why}"
+        );
+        assert!(backup.join(BACKUP_INFO).is_file());
+    }
+
+    /// A marker that is there and cannot be read is not "no marker": a
+    /// rollback with no backup to restore does not report such a copy as
+    /// carrying nothing. With no marker file at all, it does.
+    #[tokio::test]
+    async fn a_marker_that_cannot_be_read_is_not_taken_for_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let copy = installed_gem(&tmp.path().join("home"), "lib");
+        let env = RubyEnv {
+            cwd: tmp.path().to_path_buf(),
+            rebuild: true,
+            offline: true,
+        };
+        assert_eq!(read_marker_strict(&copy.gem_dir).unwrap(), None);
+        assert_eq!(restore_original_build(&copy.gem_dir, &env).await, Ok(false));
+
+        let marker = copy.gem_dir.join(MARKER_FILE);
+        for unreadable in [
+            "not json".to_string(),
+            // A schema this version does not know.
+            serde_json::json!({ "schema": 99, "sources": {} }).to_string(),
+        ] {
+            std::fs::write(&marker, &unreadable).unwrap();
+            assert_eq!(read_marker_sync(&copy.gem_dir), None);
+            let why = restore_original_build(&copy.gem_dir, &env)
+                .await
+                .unwrap_err();
+            assert!(
+                why.contains(MARKER_FILE)
+                    && why.contains("could not be read as a build marker")
+                    && why.contains("gem pristine a"),
+                "{unreadable}: {why}"
+            );
+            assert!(marker.is_file(), "the marker is left");
+        }
     }
 
     /// Where a directory cannot be locked, nothing vouches that a stage is

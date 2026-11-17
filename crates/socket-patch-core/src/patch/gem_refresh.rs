@@ -383,17 +383,8 @@ async fn refresh_installed(
             // entry that cannot be probed may be one: only "not found"
             // says nothing is there.
             for dir in [install.home.join(STAGE_DIR), install.stage()] {
-                match crate::utils::containment::try_entry_type(&dir) {
-                    Ok(None) => {}
-                    Ok(Some(kind)) if kind.is_dir() => {}
-                    Ok(Some(_)) => {
-                        return Err(format!(
-                            "its stage directory {} is not a directory",
-                            dir.display()
-                        ))
-                    }
-                    Err(e) => return Err(format!("its stage directory {e}")),
-                }
+                crate::utils::containment::ensure_dir_or_absent(&dir)
+                    .map_err(|e| format!("its stage directory {e}"))?;
             }
             let spec = crate::utils::fs::read_regular_to_string_sync(&install.spec())
                 .map_err(|e| format!("its installed gemspec is unreadable: {e}"))?;

@@ -82,6 +82,22 @@ pub fn try_entry_type(path: &Path) -> std::io::Result<Option<std::fs::FileType>>
     }
 }
 
+/// `Err` unless `path` is a real directory or not there at all: the check
+/// before a directory is created, emptied or deleted by path (a stage dir
+/// inside a gem home that the repository being scanned may have laid out).
+/// A link or a file there is refused, and so is an entry that cannot be
+/// probed ([`try_entry_type`]). The error names the path and says which.
+pub fn ensure_dir_or_absent(path: &Path) -> std::io::Result<()> {
+    match try_entry_type(path)? {
+        None => Ok(()),
+        Some(kind) if kind.is_dir() => Ok(()),
+        Some(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{} is not a directory", path.display()),
+        )),
+    }
+}
+
 /// The refusal for writing or deleting `what` through the linked `link`.
 fn linked_level_refusal(action: &str, what: &Path, link: &Path) -> std::io::Error {
     std::io::Error::other(format!(
@@ -251,6 +267,22 @@ mod tests {
         assert!(kind("dangling").unwrap().is_symlink());
         assert!(kind("missing").is_none());
         assert!(kind("missing/deeper").is_none());
+
+        // The one check for a directory that is made, emptied or deleted
+        // by path: a real directory, or nothing.
+        ensure_dir_or_absent(&root.join("dir")).unwrap();
+        ensure_dir_or_absent(&root.join("missing")).unwrap();
+        for (name, why) in [
+            ("file", "is not a directory"),
+            ("link", "is not a directory"),
+            ("dangling", "is not a directory"),
+            ("file/below", "could not be checked"),
+        ] {
+            let err = ensure_dir_or_absent(&root.join(name))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(why) && err.contains(name), "{name}: {err}");
+        }
 
         let through_file = root.join("file/below");
         let err = try_entry_type(&through_file).unwrap_err();
