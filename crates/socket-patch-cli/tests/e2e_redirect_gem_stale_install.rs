@@ -2569,6 +2569,18 @@ async fn refresh_after_rollback_restores_the_upstream_gem() {
 /// while it still holds the patched build.
 #[tokio::test(flavor = "multi_thread")]
 async fn rollback_reports_the_copy_a_refused_registry_left_unchecked() {
+    refused_registry_leaves_the_copy_reported(true).await;
+}
+
+/// The same with the copy's archive gone from the home's cache (a pruned
+/// `cache/`, as slim images have). With nothing to judge the copy by it is
+/// still reported, not passed over.
+#[tokio::test(flavor = "multi_thread")]
+async fn rollback_reports_an_unchecked_copy_whose_cached_archive_is_gone() {
+    refused_registry_leaves_the_copy_reported(false).await;
+}
+
+async fn refused_registry_leaves_the_copy_reported(cached_archive: bool) {
     let server = MockServer::start().await;
     let patched = real_gem(PATCHED_LIB);
     mount_api_for(&server, None, &sha256_of(&patched)).await;
@@ -2588,6 +2600,9 @@ async fn rollback_reports_the_copy_a_refused_registry_left_unchecked() {
     assert_eq!(installed_lib(&gem_dir), PATCHED_LIB, "scan refreshed it");
     std::fs::write(proj.join("Gemfile.lock"), converged_lock(&uri)).unwrap();
     let asked_before = server.received_requests().await.unwrap().len();
+    if !cached_archive {
+        std::fs::remove_file(&cache).unwrap();
+    }
 
     // Refused before any request: nothing is looked up or sent.
     const REFUSED: &str = "http://gemstash.example.test:9292";
@@ -2617,7 +2632,9 @@ async fn rollback_reports_the_copy_a_refused_registry_left_unchecked() {
         "the lock is back on upstream:\n{lock}"
     );
     assert_eq!(installed_lib(&gem_dir), PATCHED_LIB, "left as it is");
-    assert_eq!(std::fs::read(&cache).unwrap(), patched);
+    if cached_archive {
+        assert_eq!(std::fs::read(&cache).unwrap(), patched);
+    }
     assert!(
         warnings_with_code(&env, "upstream_gem_install_refreshed").is_empty(),
         "{env}"

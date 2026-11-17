@@ -691,17 +691,27 @@ async fn stale_after_restore(
             if pkg.path.file_name().and_then(|n| n.to_str()) != Some(leaf.as_str()) {
                 continue;
             }
-            let Some(archive) = home_cache_archive(&pkg.path) else {
-                continue;
+            // With no upstream sha256 (the registry that would give it was
+            // refused) nothing can be judged, so the copy is listed whether
+            // or not its archive is still in the home's cache. With one,
+            // only a readable archive that is not the upstream gem makes
+            // the copy stale.
+            let listed = match sha {
+                None => true,
+                Some(sha) => match home_cache_archive(&pkg.path) {
+                    Some(archive) => {
+                        matches!(file_sha256_hex(&archive).await, Some(got) if &got != sha)
+                    }
+                    None => false,
+                },
             };
-            match file_sha256_hex(&archive).await {
-                Some(got) if sha.as_ref() != Some(&got) => out.push(StaleGem {
+            if listed {
+                out.push(StaleGem {
                     purl: purl.clone(),
                     leaf,
                     installed: Some((pkg.path.clone(), home.project_local)),
                     cache_archive: None,
-                }),
-                _ => {}
+                });
             }
         }
     }
