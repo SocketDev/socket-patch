@@ -122,6 +122,11 @@ async fn serve(server: &MockServer, uuid: &str, files: &[PatchFile]) {
         })))
         .mount(server)
         .await;
+    mount_view(server, PURL, uuid, files).await;
+}
+
+/// Serve the view of patch `uuid` for `purl`, changing `files`.
+async fn mount_view(server: &MockServer, purl: &str, uuid: &str, files: &[PatchFile]) {
     let b64 = |bytes: &[u8]| base64::engine::general_purpose::STANDARD.encode(bytes);
     let files: serde_json::Map<String, serde_json::Value> = files
         .iter()
@@ -141,7 +146,7 @@ async fn serve(server: &MockServer, uuid: &str, files: &[PatchFile]) {
         .and(path(format!("/v0/orgs/{ORG}/patches/view/{uuid}")))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "uuid": uuid,
-            "purl": PURL,
+            "purl": purl,
             "publishedAt": "2024-01-01T00:00:00Z",
             "files": files,
             "vulnerabilities": {},
@@ -515,13 +520,23 @@ async fn replacement_is_refused_when_an_original_blob_cannot_be_had() {
 /// Replace the recorded patch with patch B through the engine `scan` and
 /// `get` share, for its envelope: `(exit code, envelope)`.
 async fn engine_replace_with_b(root: &Path, server: &MockServer) -> (i32, serde_json::Value) {
+    serve(server, UUID_B, PATCH_B).await;
+    engine_get(root, server, &[(PURL, UUID_B)]).await
+}
+
+/// Run the engine `scan` and `get` share over `selected` (`(purl, uuid)`
+/// of patches whose views the mock serves): `(exit code, envelope)`.
+async fn engine_get(
+    root: &Path,
+    server: &MockServer,
+    selected: &[(&str, &str)],
+) -> (i32, serde_json::Value) {
     use socket_patch_cli::commands::get::{
         download_and_apply_patches_with, DownloadParams, DownloadRun,
     };
     use socket_patch_core::api::client::{get_api_client_with_overrides, ApiClientEnvOverrides};
     use socket_patch_core::api::types::PatchSearchResult;
 
-    serve(server, UUID_B, PATCH_B).await;
     let (api_client, _) = get_api_client_with_overrides(ApiClientEnvOverrides {
         api_url: Some(server.uri()),
         api_token: Some("fake".to_string()),
@@ -546,21 +561,116 @@ async fn engine_replace_with_b(root: &Path, server: &MockServer) -> (i32, serde_
         patch_server_url: None,
         all_releases: true,
     };
-    let selected = [PatchSearchResult {
-        uuid: UUID_B.into(),
-        purl: PURL.into(),
-        published_at: "2024-06-01T00:00:00Z".into(),
-        description: "x".into(),
-        license: "MIT".into(),
-        tier: "free".into(),
-        vulnerabilities: Default::default(),
-    }];
+    let selected: Vec<PatchSearchResult> = selected
+        .iter()
+        .map(|(purl, uuid)| PatchSearchResult {
+            uuid: (*uuid).into(),
+            purl: (*purl).into(),
+            published_at: "2024-06-01T00:00:00Z".into(),
+            description: "x".into(),
+            license: "MIT".into(),
+            tier: "free".into(),
+            vulnerabilities: Default::default(),
+        })
+        .collect();
     let run = DownloadRun {
         api_client: &api_client,
         common: &flags,
     };
     let (code, env) = download_and_apply_patches_with(&selected, &params, &run).await;
     (code, env.to_value())
+}
+
+/// Two packages are replaced in one run and the original blob of one is
+/// gone. That one is refused. The other does not depend on the blob: its
+/// old patch is rolled back and its replacement applied.
+#[tokio::test]
+#[serial]
+async fn a_missing_blob_refuses_only_the_package_that_needs_it() {
+    const OTHER: &str = "agent-replace-two";
+    const OTHER_PURL: &str = "pkg:npm/agent-replace-two@1.0.0";
+    const OTHER_A: &str = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+    const OTHER_B: &str = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+    const TWO_ORIGINAL: &[u8] = b"module.exports = 'two original';\n";
+    const TWO_A: &[u8] = b"module.exports = 'two patch A';\n";
+    const TWO_EXTRA_ORIGINAL: &[u8] = b"module.exports = 'two extra original';\n";
+    const TWO_EXTRA_A: &[u8] = b"module.exports = 'two extra patch A';\n";
+    const TWO_B: &[u8] = b"module.exports = 'two patch B';\n";
+
+    let server = MockServer::start().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    install(root);
+    let other = root.join("node_modules").join(OTHER);
+    std::fs::create_dir_all(other.join("lib")).unwrap();
+    std::fs::write(
+        other.join("package.json"),
+        format!(r#"{{ "name": "{OTHER}", "version": "{VERSION}" }}"#),
+    )
+    .unwrap();
+    std::fs::write(other.join(INDEX), TWO_ORIGINAL).unwrap();
+    std::fs::write(other.join(EXTRA), TWO_EXTRA_ORIGINAL).unwrap();
+
+    mount_view(&server, PURL, UUID_A, PATCH_A).await;
+    mount_view(
+        &server,
+        OTHER_PURL,
+        OTHER_A,
+        &[
+            (INDEX, TWO_ORIGINAL, TWO_A),
+            (EXTRA, TWO_EXTRA_ORIGINAL, TWO_EXTRA_A),
+        ],
+    )
+    .await;
+    let (code, json) = engine_get(root, &server, &[(PURL, UUID_A), (OTHER_PURL, OTHER_A)]).await;
+    assert_eq!(code, 0, "json={json}");
+    assert_eq!(read(root, EXTRA), EXTRA_A);
+    assert_eq!(std::fs::read(other.join(EXTRA)).unwrap(), TWO_EXTRA_A);
+
+    // The first package's dropped file loses its original blob.
+    std::fs::remove_file(root.join(".socket/blobs").join(git_sha256(EXTRA_ORIGINAL))).unwrap();
+    server.reset().await;
+    mount_view(&server, PURL, UUID_B, PATCH_B).await;
+    mount_view(
+        &server,
+        OTHER_PURL,
+        OTHER_B,
+        &[(INDEX, TWO_ORIGINAL, TWO_B)],
+    )
+    .await;
+    let (code, json) = engine_get(root, &server, &[(PURL, UUID_B), (OTHER_PURL, OTHER_B)]).await;
+
+    assert_eq!(code, 1, "json={json}");
+    assert_eq!(
+        recorded_uuid(root),
+        UUID_A,
+        "the first package keeps patch A"
+    );
+    assert_eq!(read(root, INDEX), INDEX_A);
+    assert_eq!(read(root, EXTRA), EXTRA_A);
+    assert_eq!(
+        manifest(root)["patches"][OTHER_PURL]["uuid"],
+        OTHER_B,
+        "the second package is replaced; json={json}"
+    );
+    assert_eq!(std::fs::read(other.join(INDEX)).unwrap(), TWO_B);
+    assert_eq!(
+        std::fs::read(other.join(EXTRA)).unwrap(),
+        TWO_EXTRA_ORIGINAL
+    );
+    let refused: Vec<&serde_json::Value> = json["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|event| event["errorCode"] == "replaced_patch_not_restored")
+        .collect();
+    assert_eq!(refused.len(), 1, "json={json}");
+    assert_eq!(refused[0]["purl"], PURL, "json={json}");
+    let error = refused[0]["error"].as_str().unwrap();
+    assert!(
+        error.contains("stays recorded and applied"),
+        "nothing of the refused package was written: {error}"
+    );
 }
 
 /// The recorded patch changed one file, and that file was edited by hand

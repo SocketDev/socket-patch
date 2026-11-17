@@ -3996,6 +3996,46 @@ pub(crate) async fn copy_holds_patched_bytes(
     holds_patched_bytes(&CopyTarget::plain(purl, dir), files).await
 }
 
+/// Whether the copy at `dir` is one the record with `files` accounts for
+/// whole: every file is at the record's patched or original bytes (a file
+/// the patch adds may be absent) and at least one is at the patched
+/// bytes. A file at any other bytes, a missing original file, an unsafe
+/// key or an unreadable file makes it `false`.
+pub(crate) async fn copy_carries_record(
+    dir: &Path,
+    files: &HashMap<String, PatchFileInfo>,
+) -> bool {
+    let mut patched = false;
+    for (file, info) in files {
+        let rel = Path::new(file.strip_prefix("package/").unwrap_or(file));
+        if rel.as_os_str().is_empty()
+            || !rel
+                .components()
+                .all(|c| matches!(c, std::path::Component::Normal(_)))
+        {
+            return false;
+        }
+        match socket_patch_core::utils::fs::read_regular_to_bytes(&dir.join(rel)).await {
+            Ok(bytes) => {
+                let hash =
+                    socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes(&bytes);
+                if hash == info.after_hash {
+                    patched = true;
+                } else if hash != info.before_hash {
+                    return false;
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if !info.before_hash.is_empty() {
+                    return false;
+                }
+            }
+            Err(_) => return false,
+        }
+    }
+    patched
+}
+
 /// The key `file` of a Maven record as it is joined onto `dir`: a Gradle
 /// hash dir holds the bare file name (`package/` dropped).
 fn maven_target_key(purl: &str, dir: &Path, file: &str) -> String {

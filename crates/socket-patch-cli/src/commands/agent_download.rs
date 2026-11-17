@@ -878,100 +878,156 @@ struct PassOutcome {
     restored: HashMap<String, usize>,
     /// Purls with a copy the record's patch is on (a dry pass).
     patched: std::collections::HashSet<String>,
+    /// Purls with a copy this pass wrote to, or may have (a wet pass).
+    wrote: std::collections::HashSet<String>,
     /// `(purl, copy, failure)` of each copy left alone because it holds
     /// none of the record's patched bytes.
     not_on_copy: Vec<(String, String, String)>,
     warnings: Vec<(String, String)>,
 }
 
-/// One muted pass of the in-place rollback engine over `records`.
+/// Whether the copy at `dir` belongs to a release variant recorded beside
+/// `purl` that this run does not roll back: the sibling's record accounts
+/// for every one of its files there. The engine narrows variants only
+/// among the records it is handed, so it would otherwise judge `purl`'s
+/// record against its sibling's distribution, whose files can share
+/// bytes with it.
+async fn sibling_variant_owns(
+    manifest: &PatchManifest,
+    rolled_back: &PatchManifest,
+    purl: &str,
+    dir: &Path,
+) -> bool {
+    let base = strip_purl_qualifiers(purl);
+    for (other, record) in &manifest.patches {
+        if other != purl
+            && strip_purl_qualifiers(other) == base
+            && !rolled_back.patches.contains_key(other)
+            && super::rollback::copy_carries_record(dir, &record.files).await
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// One muted pass of the in-place rollback engine over `records` (taken
+/// from `manifest`).
 ///
 /// A copy that failed without holding any of the record's patched bytes
 /// is not a failure here: the patch is not on it (it was never applied
 /// there, or the copy is another distribution's), so there is nothing of
-/// it to roll back, and the engine wrote nothing to it. A copy the patch
-/// may be on (a patched or unreadable file) fails its purl. So does every
-/// purl without a result when the engine stopped at its before-blob gate:
-/// it restored nothing.
+/// it to roll back, and the engine wrote nothing to it. The same goes for
+/// a copy a sibling release variant's record owns
+/// ([`sibling_variant_owns`]). A copy the patch may be on (a patched or
+/// unreadable file) fails its purl.
+///
+/// When the engine stops at its before-blob gate it has restored nothing
+/// and reports only the packages that need a missing blob: those fail,
+/// and the pass runs again over the rest.
 async fn rollback_pass(
     common: &GlobalArgs,
     context: &RollbackContext<'_>,
     records: &PatchManifest,
+    manifest: &PatchManifest,
 ) -> PassOutcome {
     let mut pass = PassOutcome::default();
-    let purls: std::collections::HashSet<String> = records.patches.keys().cloned().collect();
-    let outcome = super::rollback::rollback_patches_inner(
-        common,
-        context.socket_dir,
-        records,
-        &context.vendored_keys,
-        super::rollback::InnerSelection::Scope {
-            purls: &purls,
-            announce_empty: false,
-        },
-        &super::rollback::superseded_by_hosted(records, &context.hosted_pins),
-        &context.api_client,
-    )
-    .await;
-    let outcome = match outcome {
-        Ok(outcome) => outcome,
-        Err(e) => {
-            pass.failed = purls.into_iter().map(|purl| (purl, e.clone())).collect();
-            return pass;
-        }
-    };
-    for result in outcome.results {
-        let purl = result.package_key;
-        // A Go redirect and a Maven copy are undone as a unit; their
-        // results do not say what the copy holds.
-        let unit = matches!(
-            Ecosystem::from_purl(&purl),
-            Some(Ecosystem::Golang | Ecosystem::Maven)
-        );
-        if result.success {
-            let patched = unit
-                || result.files_verified.is_empty()
-                || result.files_verified.iter().any(|file| {
-                    file.status == socket_patch_core::patch::rollback::VerifyRollbackStatus::Ready
-                });
-            if patched {
-                pass.patched.insert(purl.clone());
+    let mut todo = records.clone();
+    while !todo.patches.is_empty() {
+        let purls: std::collections::HashSet<String> = todo.patches.keys().cloned().collect();
+        let outcome = super::rollback::rollback_patches_inner(
+            common,
+            context.socket_dir,
+            &todo,
+            &context.vendored_keys,
+            super::rollback::InnerSelection::Scope {
+                purls: &purls,
+                announce_empty: false,
+            },
+            &super::rollback::superseded_by_hosted(&todo, &context.hosted_pins),
+            &context.api_client,
+        )
+        .await;
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(e) => {
+                pass.failed
+                    .extend(purls.into_iter().map(|purl| (purl, e.clone())));
+                break;
             }
-            *pass.restored.entry(purl).or_default() += result.files_rolled_back.len();
-            continue;
+        };
+        if outcome.aborted {
+            let mut gated = false;
+            for result in outcome.results {
+                gated |= todo.patches.remove(&result.package_key).is_some();
+                pass.failed.entry(result.package_key).or_insert(
+                    result
+                        .error
+                        .unwrap_or_else(|| "an original blob is missing".to_string()),
+                );
+            }
+            if gated {
+                continue;
+            }
+            // The gate named no package of this pass: fail them all.
+            pass.failed.extend(purls.into_iter().map(|purl| {
+                (
+                    purl,
+                    "the rollback stopped before it restored anything".to_string(),
+                )
+            }));
+            break;
         }
-        let holds_patch = unit
-            || !result.files_rolled_back.is_empty()
-            || match records.patches.get(&purl) {
-                Some(record) => {
-                    super::rollback::copy_holds_patched_bytes(
-                        &purl,
-                        Path::new(&result.package_path),
-                        &record.files,
-                    )
-                    .await
+        for result in outcome.results {
+            let purl = result.package_key;
+            let dir = Path::new(&result.package_path);
+            // A Go redirect and a Maven copy are undone as a unit; their
+            // results do not say what the copy holds.
+            let unit = matches!(
+                Ecosystem::from_purl(&purl),
+                Some(Ecosystem::Golang | Ecosystem::Maven)
+            );
+            if !result.files_rolled_back.is_empty() || (unit && !result.success) {
+                pass.wrote.insert(purl.clone());
+            }
+            let siblings = !unit
+                && result.files_rolled_back.is_empty()
+                && sibling_variant_owns(manifest, records, &purl, dir).await;
+            if result.success {
+                let patched = unit
+                    || result.files_verified.is_empty()
+                    || result.files_verified.iter().any(|file| {
+                        file.status
+                            == socket_patch_core::patch::rollback::VerifyRollbackStatus::Ready
+                    });
+                if patched && !siblings {
+                    pass.patched.insert(purl.clone());
                 }
-                None => true,
-            };
-        let why = result
-            .error
-            .unwrap_or_else(|| "the rollback failed".to_string());
-        if holds_patch {
-            pass.failed.entry(purl).or_insert(why);
-        } else {
-            pass.not_on_copy.push((purl, result.package_path, why));
+                *pass.restored.entry(purl).or_default() += result.files_rolled_back.len();
+                continue;
+            }
+            let holds_patch = !siblings
+                && (unit
+                    || !result.files_rolled_back.is_empty()
+                    || match records.patches.get(&purl) {
+                        Some(record) => {
+                            super::rollback::copy_holds_patched_bytes(&purl, dir, &record.files)
+                                .await
+                        }
+                        None => true,
+                    });
+            let why = result
+                .error
+                .unwrap_or_else(|| "the rollback failed".to_string());
+            if holds_patch {
+                pass.failed.entry(purl).or_insert(why);
+            } else if !siblings {
+                pass.not_on_copy.push((purl, result.package_path, why));
+            }
         }
+        pass.warnings = outcome.warnings;
+        break;
     }
-    if outcome.aborted {
-        for purl in purls {
-            pass.failed.entry(purl).or_insert_with(|| {
-                "the rollback stopped before it restored anything: an original blob \
-                 another replaced patch needs is missing"
-                    .to_string()
-            });
-        }
-    }
-    pass.warnings = outcome.warnings;
     pass
 }
 
@@ -1051,7 +1107,7 @@ pub(crate) async fn roll_back_replaced_patches(
         dry_run: true,
         ..muted.clone()
     };
-    let verified = rollback_pass(&verify, &context, &records).await;
+    let verified = rollback_pass(&verify, &context, &records, manifest).await;
     rollback.refused = verified.failed;
     // A copy left alone may hold a file edited after the patch was
     // applied: say so, once, for the purls this run goes on to replace.
@@ -1088,9 +1144,14 @@ pub(crate) async fn roll_back_replaced_patches(
         dry_run: false,
         ..muted
     };
-    let done = rollback_pass(&wet, &context, &records).await;
+    let done = rollback_pass(&wet, &context, &records, manifest).await;
     for (purl, why) in done.failed {
-        rollback.partial.insert(purl.clone());
+        // A failure before anything of the package was written (an
+        // original blob that could not be downloaded a second time) left
+        // it as it was.
+        if done.wrote.contains(&purl) {
+            rollback.partial.insert(purl.clone());
+        }
         rollback.refused.insert(purl, why);
     }
     rollback.restored = done.restored;

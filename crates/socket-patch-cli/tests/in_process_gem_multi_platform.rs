@@ -828,3 +828,138 @@ async fn broad_rescan_replaces_the_uninstalled_variants_patch() {
         "the installed variant stays patched"
     );
 }
+
+/// Make the mock serve the installed (linux) variant's patch with
+/// `linux_files` and the darwin variant's patch `darwin_uuid` with
+/// `darwin_files` (each a patch view's `files` object), replacing whatever
+/// it served before.
+async fn serve_variants(
+    server: &MockServer,
+    linux_files: &serde_json::Value,
+    darwin_uuid: &str,
+    darwin_files: serde_json::Value,
+) {
+    server.reset().await;
+    let listing = |uuid: &str, platform: &str| {
+        serde_json::json!({
+            "uuid": uuid, "purl": qualified(platform),
+            "tier": "free", "cveIds": [], "ghsaIds": [],
+            "severity": "high", "title": platform,
+            "publishedAt": "2024-01-01T00:00:00Z", "description": platform,
+            "license": "MIT", "vulnerabilities": {}
+        })
+    };
+    let patches = serde_json::json!([
+        listing(UUID_INSTALLED, PLATFORM_INSTALLED),
+        listing(darwin_uuid, PLATFORM_OTHER),
+    ]);
+    Mock::given(method("POST"))
+        .and(path(format!("/v0/orgs/{ORG}/patches/batch")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "packages": [{ "purl": base_purl(), "patches": patches }],
+            "canAccessPaidPatches": false,
+        })))
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path_regex(format!(
+            "^/v0/orgs/{ORG}/patches/by-package/.+$"
+        )))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "patches": patches,
+            "canAccessPaidPatches": false,
+        })))
+        .mount(server)
+        .await;
+    for (uuid, platform, files) in [
+        (UUID_INSTALLED, PLATFORM_INSTALLED, linux_files.clone()),
+        (darwin_uuid, PLATFORM_OTHER, darwin_files),
+    ] {
+        Mock::given(method("GET"))
+            .and(path(format!("/v0/orgs/{ORG}/patches/view/{uuid}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "uuid": uuid,
+                "purl": qualified(platform),
+                "publishedAt": "2024-01-01T00:00:00Z",
+                "files": files,
+                "vulnerabilities": {},
+                "description": "gem sibling fixture",
+                "license": "MIT",
+                "tier": "free",
+            })))
+            .mount(server)
+            .await;
+    }
+}
+
+/// The uninstalled variant's record shares a file with the installed
+/// variant's (a pure-Ruby file both distributions ship and both patches
+/// change the same way), and a newer patch for it drops that file
+/// (#2096). The linux copy holds that file's patched bytes, but they are
+/// the linux record's: replacing the darwin record must neither be
+/// refused over the copy's other file nor take the shared file back.
+#[tokio::test]
+#[serial]
+async fn broad_rescan_leaves_a_file_the_installed_sibling_variant_shares() {
+    const UUID_OTHER_NEW: &str = "44444444-4444-4444-8444-dddddddddddd";
+    const SHARED: &str = "lib/nokogiri/shared.rb";
+    const SHARED_ORIGINAL: &[u8] = b"# shared by every platform\n";
+    const SHARED_PATCHED: &[u8] = b"# shared by every platform\n# SHARED-FIX\n";
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let gem_file = install_platform_gem(tmp.path(), PLATFORM_INSTALLED, ORIGINAL_BYTES);
+    let shared_file = gem_file.parent().unwrap().join("nokogiri/shared.rb");
+    std::fs::create_dir_all(shared_file.parent().unwrap()).unwrap();
+    std::fs::write(&shared_file, SHARED_ORIGINAL).unwrap();
+
+    let entry = |before: &[u8], after: &[u8]| {
+        serde_json::json!({
+            "beforeHash": git_sha256(before),
+            "afterHash": git_sha256(after),
+            "blobContent": b64(after),
+            "beforeBlobContent": b64(before),
+        })
+    };
+    let shared = entry(SHARED_ORIGINAL, SHARED_PATCHED);
+    let linux_files = serde_json::json!({
+        "lib/nokogiri.rb": entry(ORIGINAL_BYTES, &patched_bytes()),
+        SHARED: shared.clone(),
+    });
+    let darwin_main = entry(DARWIN_BEFORE_BYTES, &darwin_after_bytes());
+    let server = MockServer::start().await;
+    serve_variants(
+        &server,
+        &linux_files,
+        UUID_OTHER,
+        serde_json::json!({ "lib/nokogiri.rb": darwin_main.clone(), SHARED: shared }),
+    )
+    .await;
+    assert_eq!(scan_run(scan_args(tmp.path(), server.uri(), true)).await, 0);
+    assert_eq!(read_file(&gem_file), patched_bytes());
+    assert_eq!(read_file(&shared_file), SHARED_PATCHED);
+
+    // The darwin variant's newer patch no longer lists the shared file.
+    serve_variants(
+        &server,
+        &linux_files,
+        UUID_OTHER_NEW,
+        serde_json::json!({ "lib/nokogiri.rb": darwin_main }),
+    )
+    .await;
+    assert_eq!(
+        scan_run(scan_args(tmp.path(), server.uri(), true)).await,
+        0,
+        "the replacement must not be refused over the sibling's copy"
+    );
+
+    assert_eq!(
+        manifest_record(tmp.path(), &qualified(PLATFORM_OTHER))["uuid"],
+        UUID_OTHER_NEW
+    );
+    assert_eq!(read_file(&gem_file), patched_bytes());
+    assert_eq!(
+        read_file(&shared_file),
+        SHARED_PATCHED,
+        "the shared file is the installed variant's to keep"
+    );
+}
