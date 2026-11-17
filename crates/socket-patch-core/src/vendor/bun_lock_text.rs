@@ -20,7 +20,18 @@
 /// this integer; verified empirically). Our URL/local 3-tuples always carry
 /// a sha512, so they satisfy the v2 off-registry-integrity rule by
 /// construction.
-const SUPPORTED_LOCK_VERSIONS: [u64; 3] = [0, 1, 2];
+///
+/// Bun 1.4.0 and later write 3 instead of 2 when the root `package.json`
+/// has a nested override (`"overrides": {"rc": {"minimist": "1.2.2"}}`) or
+/// a yarn-style path resolution (`"resolutions": {"rc/minimist": "1.2.2"}`).
+/// The only difference is in the lock's head, where `overrides` then holds
+/// nested objects; the `packages` section this module splices is the same
+/// grammar (measured on 1.4.0, 1.4.2, 1.4.3 and 1.4.4: a hosted or local
+/// tuple written into a version-3 lock installs frozen and stays put). Bun
+/// 1.3 cannot read a version-3 lock, as it cannot read a version-2 one, so
+/// every rule keyed on "version 2 or later means Bun 1.4 or later" holds
+/// for 3 as well.
+const SUPPORTED_LOCK_VERSIONS: [u64; 4] = [0, 1, 2, 3];
 
 /// The `patchedDependencies` keys a Bun project declares: the root
 /// `package.json`'s object, which `bun patch --commit` writes and every
@@ -54,13 +65,12 @@ pub(crate) fn patched_dependency_keys(manifest: Option<&str>, lock: Option<&str>
     keys
 }
 
+pub(crate) use crate::formats::package_json::strip_jsonc;
+
 /// A root `package.json` parsed as Bun reads it: a leading BOM, comments
 /// and trailing commas allowed. `None` when Bun could not parse it either.
 fn parse_manifest(text: &str) -> Option<serde_json::Value> {
-    let text = crate::formats::text::strip_bom(text);
-    serde_json::from_str(text)
-        .or_else(|_| serde_json::from_str(&strip_jsonc(text)))
-        .ok()
+    crate::formats::package_json::parse(text)
 }
 
 /// Bun's built-in default-trusted package names, the union of every release
@@ -118,56 +128,26 @@ pub(crate) fn default_trust_detail(name: &str, version: &str, target: &str) -> S
     )
 }
 
-/// `text` with the JSONC Bun accepts in a `package.json` removed: `//` and
-/// `/* */` comments and a comma before a closing `}` or `]`, all outside
-/// strings. Everything else, strings included, is kept byte for byte.
-pub(crate) fn strip_jsonc(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut chars = text.chars().peekable();
-    let mut in_string = false;
-    while let Some(c) = chars.next() {
-        if in_string {
-            out.push(c);
-            if c == '\\' {
-                if let Some(escaped) = chars.next() {
-                    out.push(escaped);
-                }
-            } else if c == '"' {
-                in_string = false;
-            }
-            continue;
-        }
-        match c {
-            '"' => {
-                in_string = true;
-                out.push(c);
-            }
-            '/' if chars.peek() == Some(&'/') => {
-                while chars.peek().is_some_and(|&n| n != '\n') {
-                    chars.next();
-                }
-            }
-            '/' if chars.peek() == Some(&'*') => {
-                chars.next();
-                let mut prev = '\0';
-                for n in chars.by_ref() {
-                    if prev == '*' && n == '/' {
-                        break;
-                    }
-                    prev = n;
-                }
-            }
-            '}' | ']' => {
-                let kept = out.trim_end_matches(char::is_whitespace).len();
-                if out[..kept].ends_with(',') {
-                    out.remove(kept - 1);
-                }
-                out.push(c);
-            }
-            _ => out.push(c),
-        }
-    }
-    out
+/// The user-facing reason a default-trusted package ([`loses_default_trust`])
+/// is left on the registry, unpatched, instead of being rewired to `target`,
+/// shared by the hosted and vendored paths.
+///
+/// Bun reads `trustedDependencies` from `package.json` alone: a copy written
+/// only into `bun.lock` leaves the install script blocked on a frozen
+/// install and is deleted by a plain one (measured on Bun 1.3.14 and
+/// 1.4.4), so a lockfile edit cannot keep the script running.
+pub(crate) fn default_trust_skip_detail(name: &str, version: &str, target: &str) -> String {
+    format!(
+        "{name}@{version} is on Bun's default trusted list, which Bun 1.3.5 and later apply \
+         only to packages installed from the npm registry; resolving it to {target} would \
+         make `bun install` skip its install scripts without failing, which can leave native \
+         bindings unbuilt, so it was left on the registry and stays UNPATCHED. To patch it, \
+         add \"{name}\" to \"trustedDependencies\" in package.json (declaring \
+         trustedDependencies replaces Bun's default list, so also list any other \
+         default-trusted dependency whose scripts you rely on), run `bun install`, and run \
+         socket-patch again. `--mode agent` patches the installed copy without changing how \
+         it resolves"
+    )
 }
 
 /// The `patchedDependencies` key that makes Bun apply a project-authored
@@ -279,6 +259,11 @@ pub(crate) struct BunEntry {
     /// Verbatim top-level tuple elements (trimmed).
     pub(crate) elems: Vec<String>,
     pub(crate) trailing_comma: bool,
+    /// Bun never installs this entry from its own spec: it is unpacked from
+    /// a bundling ancestor's tarball ([`is_bundled_entry`]). Set by
+    /// [`parse_packages_section`], which sees the whole lock; an entry
+    /// parsed on its own ([`parse_entry_line`]) is `false`.
+    pub(crate) in_bundled_copy: bool,
 }
 
 /// `name@spec` split at the FIRST `@` past the leading character: a name's
@@ -349,7 +334,7 @@ pub(crate) fn is_user_tarball_spec(spec: &str, name: &str, version: &str) -> boo
 /// The `Err` text is the user-facing refusal detail for BOTH the vendored
 /// and the hosted (`redirect_bun_lock_unsupported`) paths, so the two modes
 /// never drift apart. Each arm's remedy is the one that can actually work:
-/// every accepted version is 0, 1 or 2 and the parser yields a `u64`, so an
+/// every accepted version is 0 to 3 and the parser yields a `u64`, so an
 /// unsupported `Some(v)` is a lock newer than this release knows — written
 /// by a Bun newer than any we test — and "re-lock with a newer Bun" would
 /// just reproduce it; updating socket-patch (or re-locking with an older
@@ -360,11 +345,11 @@ pub(crate) fn check_lock_version(text: &str) -> Result<(), String> {
         Some(v) if SUPPORTED_LOCK_VERSIONS.contains(&v) => Ok(()),
         Some(v) => Err(format!(
             "bun.lock has lockfileVersion {v}, newer than this socket-patch release supports \
-             (0, 1 and 2) — update socket-patch, or re-lock with a Bun release that writes \
-             lockfileVersion 0–2"
+             (0 to 3) — update socket-patch, or re-lock with a Bun release that writes \
+             lockfileVersion 0–3"
         )),
         None => Err(
-            "bun.lock has no integer lockfileVersion in its head; only 0, 1 and 2 are \
+            "bun.lock has no integer lockfileVersion in its head; only 0 to 3 are \
              supported — re-lock with Bun ≥ 1.2 (`bun install`)"
                 .to_string(),
         ),
@@ -392,24 +377,33 @@ pub(crate) fn has_workspace_packages(entries: &[BunEntry]) -> bool {
 
 #[cfg(test)]
 thread_local! {
-    /// [`is_bundled_entry`] calls this thread made. Each one JSON-parses the
-    /// entry's meta, so a rewrite loop over N deps × M entries must check the
-    /// cheap spec match first and pay it only for matching entries (#578).
+    /// Entry metas this thread JSON-parsed to look for `"bundled": true`
+    /// ([`declares_bundled`] past its substring fast path). Parsing a lock
+    /// pays one per entry that spells `bundled`, and no rewrite loop over
+    /// N deps × M entries may add any (#578, #580).
     pub(crate) static BUNDLED_CHECKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-/// True when `entry` is a `bundleDependencies` copy: bun records it as its
-/// own `parent/child` entry whose `{meta}` object carries `"bundled": true`,
-/// and unpacks it from the PARENT's tarball without ever reading the
-/// entry's spec (#469). No rewire of it reaches the installed bytes, so the
-/// rewriters skip it and lockfile discovery never takes it as a ref. The
+/// True when Bun installs `entry` from a bundling ancestor's tarball and
+/// never reads the entry's spec (#469): no rewire of it reaches the
+/// installed bytes, so the rewriters skip it and lockfile discovery never
+/// takes it as a ref. That is an entry whose `{meta}` carries
+/// `"bundled": true` (a name in the parent's `bundleDependencies`), and
+/// every entry reached only through such entries: Bun also writes the
+/// bundled copies' own dependencies into the lock, as unflagged
+/// `parent/child` entries with registry specs, but it never fetches them —
+/// they too come out of the parent's tarball, at whatever version the
+/// parent packed. See [`mark_bundled_copies`].
+pub(crate) fn is_bundled_entry(entry: &BunEntry) -> bool {
+    entry.in_bundled_copy
+}
+
+/// True when `entry`'s own `{meta}` object carries `"bundled": true`. The
 /// meta is the first object element (index 2 of a registry 4-tuple, 1 of a
 /// tarball tuple). A meta that does not parse as JSON but mentions
 /// `"bundled"` counts as bundled: fail closed, never rewire or attest it.
-pub(crate) fn is_bundled_entry(entry: &BunEntry) -> bool {
-    #[cfg(test)]
-    BUNDLED_CHECKS.with(|checks| checks.set(checks.get() + 1));
-    let Some(meta) = entry.elems.iter().skip(1).find(|e| e.starts_with('{')) else {
+pub(crate) fn declares_bundled(entry: &BunEntry) -> bool {
+    let Some(meta) = entry_meta(entry) else {
         return false;
     };
     // Fast path (#580): a meta that never spells `bundled` cannot carry the
@@ -418,10 +412,191 @@ pub(crate) fn is_bundled_entry(entry: &BunEntry) -> bool {
     if !meta.contains("bundled") && !meta.contains('\\') {
         return false;
     }
+    #[cfg(test)]
+    BUNDLED_CHECKS.with(|checks| checks.set(checks.get() + 1));
     match serde_json::from_str::<serde_json::Value>(meta) {
         Ok(value) => value.get("bundled").and_then(serde_json::Value::as_bool) == Some(true),
         Err(_) => meta.contains("\"bundled\""),
     }
+}
+
+/// The `{meta}` object of a tuple, verbatim.
+fn entry_meta(entry: &BunEntry) -> Option<&str> {
+    entry
+        .elems
+        .iter()
+        .skip(1)
+        .map(String::as_str)
+        .find(|e| e.starts_with('{'))
+}
+
+/// The package names of a packages key, outermost first: `a/b` is `b`
+/// nested under `a`, and a scoped name keeps its own slash
+/// (`@scope/a/@scope/b`).
+fn key_segments(key: &str) -> Vec<&str> {
+    let mut segments = Vec::new();
+    let mut rest = key;
+    while !rest.is_empty() {
+        let mut end = rest.find('/').unwrap_or(rest.len());
+        if rest.starts_with('@') && end < rest.len() {
+            end = rest[end + 1..]
+                .find('/')
+                .map_or(rest.len(), |next| end + 1 + next);
+        }
+        segments.push(&rest[..end]);
+        rest = rest[end..].strip_prefix('/').unwrap_or("");
+    }
+    segments
+}
+
+/// Set [`BunEntry::in_bundled_copy`] on every entry Bun unpacks from a
+/// bundling ancestor's tarball.
+///
+/// Bun flags only the names a package lists in `bundleDependencies`
+/// (`"bundled": true`). The dependencies of those copies get ordinary
+/// looking entries under the same parent, which Bun writes but never
+/// installs: a project that depends on `npm` has hundreds. So an unflagged
+/// entry counts too when it is nested, some entry depends on it, and every
+/// entry that depends on it is itself a bundled copy. A dependency name is
+/// resolved the way Bun's text lock does it, to the nearest key walking up
+/// from the dependent (`a/b` needs `c`: `a/b/c`, then `a/c`, then `c`).
+/// Top-level entries and a workspace member's own nested entries are never
+/// inferred: the project's manifests can depend on those, and their
+/// dependency lists are not in the packages section. Measured against what
+/// Bun 1.4.4 downloads into an empty cache for `npm@6.14.18`,
+/// `npm@10.9.0`, `fsevents@1.2.9` and a 1,069-entry lock holding
+/// `semantic-release`: the entries left unmarked are exactly the packages
+/// Bun fetched.
+///
+/// A lock with no flagged entry costs one substring search per entry. A
+/// meta that is not JSON leaves only the flagged entries marked: without
+/// every dependency list, nothing can be inferred.
+fn mark_bundled_copies(entries: &mut [BunEntry]) {
+    let flagged: Vec<bool> = entries.iter().map(declares_bundled).collect();
+    if !flagged.contains(&true) {
+        return;
+    }
+    for (entry, flag) in entries.iter_mut().zip(&flagged) {
+        entry.in_bundled_copy = *flag;
+    }
+    let Some(inferred) = inferred_bundled_copies(entries, &flagged) else {
+        return;
+    };
+    for (entry, inferred) in entries.iter_mut().zip(inferred) {
+        entry.in_bundled_copy |= inferred;
+    }
+}
+
+/// The unflagged entries [`mark_bundled_copies`] infers, or `None` when a
+/// meta cannot be read.
+fn inferred_bundled_copies(entries: &[BunEntry], flagged: &[bool]) -> Option<Vec<bool>> {
+    use std::collections::HashMap;
+
+    let mut index: HashMap<&str, usize> = HashMap::with_capacity(entries.len());
+    for (i, entry) in entries.iter().enumerate() {
+        index.entry(entry.key.as_str()).or_insert(i);
+    }
+    let segments: Vec<Vec<&str>> = entries.iter().map(|e| key_segments(&e.key)).collect();
+
+    // What each entry depends on, and what depends on each entry.
+    let mut dependencies: Vec<Vec<usize>> = vec![Vec::new(); entries.len()];
+    let mut dependents: Vec<Vec<usize>> = vec![Vec::new(); entries.len()];
+    let mut candidate_key = String::new();
+    for (i, entry) in entries.iter().enumerate() {
+        let Some(meta) = entry_meta(entry) else {
+            continue;
+        };
+        if meta == "{}" {
+            continue;
+        }
+        let meta: serde_json::Value = serde_json::from_str(meta).ok()?;
+        for group in ["dependencies", "optionalDependencies", "peerDependencies"] {
+            let Some(names) = meta.get(group).and_then(serde_json::Value::as_object) else {
+                continue;
+            };
+            for name in names.keys() {
+                let resolved = (0..=segments[i].len()).rev().find_map(|depth| {
+                    candidate_key.clear();
+                    for segment in &segments[i][..depth] {
+                        candidate_key.push_str(segment);
+                        candidate_key.push('/');
+                    }
+                    candidate_key.push_str(name);
+                    index.get(candidate_key.as_str()).copied()
+                });
+                if let Some(target) = resolved {
+                    if target != i && !dependencies[i].contains(&target) {
+                        dependencies[i].push(target);
+                        dependents[target].push(i);
+                    }
+                }
+            }
+        }
+    }
+
+    let is_workspace = |i: usize| {
+        entries[i]
+            .elems
+            .first()
+            .and_then(|raw| decode_json_string(raw))
+            .is_some_and(|spec| {
+                split_name_spec(&spec).is_some_and(|(_, version)| version.starts_with("workspace:"))
+            })
+    };
+    // Nested, and not directly under a workspace member.
+    let inferable = |i: usize| {
+        let Some((_, parents)) = segments[i].split_last() else {
+            return false;
+        };
+        !parents.is_empty()
+            && index
+                .get(parents.join("/").as_str())
+                .is_none_or(|&parent| !is_workspace(parent))
+    };
+
+    // Everything a flagged entry reaches is a candidate ...
+    let mut inferred = vec![false; entries.len()];
+    let mut reached = flagged.to_vec();
+    let mut stack: Vec<usize> = (0..entries.len()).filter(|&i| flagged[i]).collect();
+    while let Some(i) = stack.pop() {
+        for &target in &dependencies[i] {
+            if !reached[target] {
+                reached[target] = true;
+                stack.push(target);
+            }
+        }
+    }
+    for i in 0..entries.len() {
+        inferred[i] = reached[i] && !flagged[i] && inferable(i) && !dependents[i].is_empty();
+    }
+    // ... until something Bun does install depends on it. Dropping one
+    // candidate can expose the candidates it depends on, so they are
+    // looked at again.
+    let mut queue: Vec<usize> = (0..entries.len()).filter(|&i| inferred[i]).collect();
+    while let Some(i) = queue.pop() {
+        if inferred[i]
+            && dependents[i]
+                .iter()
+                .any(|&dependent| !flagged[dependent] && !inferred[dependent])
+        {
+            inferred[i] = false;
+            queue.extend(dependencies[i].iter().copied().filter(|&d| inferred[d]));
+        }
+    }
+    // An entry stored under a bundled copy lives inside that copy's
+    // directory, which Bun does not populate.
+    for i in 0..entries.len() {
+        if flagged[i] || inferred[i] || segments[i].len() < 2 {
+            continue;
+        }
+        let under_bundled_copy = (1..segments[i].len()).any(|depth| {
+            index
+                .get(segments[i][..depth].join("/").as_str())
+                .is_some_and(|&ancestor| flagged[ancestor] || inferred[ancestor])
+        });
+        inferred[i] = under_bundled_copy;
+    }
+    Some(inferred)
 }
 
 /// `(header_idx, close_idx)` of the `"packages": {` section.
@@ -471,6 +646,7 @@ pub(crate) fn parse_packages_section(lines: &[String]) -> Result<Vec<BunEntry>, 
         entry.line_idx = idx;
         entries.push(entry);
     }
+    mark_bundled_copies(&mut entries);
     Ok(entries)
 }
 
@@ -511,6 +687,7 @@ pub(crate) fn parse_entry_line(line: &str) -> Result<BunEntry, String> {
         key_raw: key_raw.to_string(),
         elems,
         trailing_comma,
+        in_bundled_copy: false, // set by `parse_packages_section`
     })
 }
 
@@ -1011,7 +1188,7 @@ mod tests {
     /// rewritten tarball tuple, and a meta that is not plain JSON.
     #[test]
     fn bundled_meta_flag_is_detected() {
-        let bundled = |line: &str| is_bundled_entry(&parse_entry_line(line).unwrap());
+        let bundled = |line: &str| declares_bundled(&parse_entry_line(line).unwrap());
         assert!(bundled(
             r#"    "@bh/bund/is-number": ["is-number@7.0.0", "", { "bundled": true }, "sha512-X=="],"#
         ));
@@ -1030,12 +1207,139 @@ mod tests {
         ));
     }
 
+    /// A lock section with the given entry lines, parsed whole.
+    fn section(entry_lines: &[&str]) -> Vec<BunEntry> {
+        let mut lines = vec!["{".to_string(), "  \"packages\": {".to_string()];
+        lines.extend(entry_lines.iter().map(|l| format!("    {l},")));
+        lines.extend(["  }".to_string(), "}".to_string()]);
+        parse_packages_section(&lines).unwrap()
+    }
+
+    fn bundled_copies(entries: &[BunEntry]) -> Vec<&str> {
+        entries
+            .iter()
+            .filter(|e| is_bundled_entry(e))
+            .map(|e| e.key.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn key_segments_keep_scoped_names_whole() {
+        assert_eq!(key_segments("a"), ["a"]);
+        assert_eq!(key_segments("a/b/c"), ["a", "b", "c"]);
+        assert_eq!(key_segments("@s/a"), ["@s/a"]);
+        assert_eq!(key_segments("@s/a/@t/b/c"), ["@s/a", "@t/b", "c"]);
+        assert_eq!(key_segments("a/@t/b"), ["a", "@t/b"]);
+        assert!(key_segments("").is_empty());
+    }
+
+    /// Bun flags only the names in a parent's `bundleDependencies`; the
+    /// copies' own dependencies are written as ordinary nested entries it
+    /// never installs. An entry is in a bundled copy when it is flagged, or
+    /// nested and depended on only by bundled copies (cycles included), or
+    /// stored under one. A nested entry the parent itself or any other
+    /// installed entry needs, and every top-level entry, stays installable.
+    #[test]
+    fn dependencies_of_bundled_copies_are_bundled_copies() {
+        let entries = section(&[
+            r#""app-dep": ["app-dep@1.0.0", "", { "dependencies": { "shared": "^1.0.0" } }, "sha512-A=="]"#,
+            r#""bundler": ["bundler@1.0.0", "", { "dependencies": { "inner": "^1.0.0", "plain": "^2.0.0" } }, "sha512-A=="]"#,
+            r#""bundler/both": ["both@1.0.0", "", { "dependencies": { "leaf": "^1.0.0" } }, "sha512-A=="]"#,
+            r#""bundler/both/leaf": ["leaf@1.0.0", "", {}, "sha512-A=="]"#,
+            r#""bundler/cyc": ["cyc@1.0.0", "", { "dependencies": { "deep": "^1.0.0" } }, "sha512-A=="]"#,
+            r#""bundler/deep": ["deep@1.0.0", "", { "dependencies": { "cyc": "^1.0.0" } }, "sha512-A=="]"#,
+            r#""bundler/inner": ["inner@1.0.0", "", { "dependencies": { "both": "^1.0.0", "deep": "^1.0.0", "shared": "^2.0.0", "top-only": "^1.0.0" }, "bundled": true }, "sha512-A=="]"#,
+            r#""bundler/inner/own": ["own@1.0.0", "", {}, "sha512-A=="]"#,
+            r#""bundler/plain": ["plain@2.0.0", "", { "dependencies": { "both": "^1.0.0" } }, "sha512-A=="]"#,
+            r#""bundler/shared": ["shared@2.0.0", "", { "optionalDependencies": { "@s/opt": "^1.0.0" } }, "sha512-A=="]"#,
+            r#""bundler/@s/opt": ["@s/opt@1.0.0", "", {}, "sha512-A=="]"#,
+            r#""plain": ["plain@1.0.0", "", {}, "sha512-A=="]"#,
+            r#""shared": ["shared@1.0.0", "", {}, "sha512-A=="]"#,
+            r#""top-only": ["top-only@1.0.0", "", {}, "sha512-A=="]"#,
+            r#""ws": ["ws@workspace:packages/ws"]"#,
+            r#""ws/tool": ["tool@1.0.0", "", {}, "sha512-A=="]"#,
+        ]);
+        assert_eq!(
+            bundled_copies(&entries),
+            [
+                "bundler/cyc",
+                "bundler/deep",
+                "bundler/inner",
+                "bundler/inner/own",
+                "bundler/shared",
+                "bundler/@s/opt",
+            ],
+            "`bundler/plain` is the parent's own nested dependency, `bundler/both` is \
+             also needed by it, `bundler/both/leaf` follows `both`, and `top-only` is \
+             top-level, where the project's manifests may depend on it"
+        );
+    }
+
+    /// Real Bun 1.4.4 lock of a project depending on `fsevents@1.2.9`,
+    /// whose tarball bundles `node-pre-gyp` and its whole dependency tree.
+    /// Bun flags `fsevents/node-pre-gyp` alone, writes 72 more entries for
+    /// that tree, and installs none of the 73: an empty cache ends up
+    /// holding `fsevents` and `nan` only (the tree's on-disk versions are
+    /// the tarball's — `minimist` 0.0.8 where the lock says 1.2.8).
+    #[test]
+    fn real_capture_marks_the_whole_bundled_tree() {
+        let lock = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/bun-lock-bundled/transitive/bun.lock"),
+        )
+        .unwrap();
+        let lines: Vec<String> = lock.lines().map(str::to_string).collect();
+        let entries = parse_packages_section(&lines).unwrap();
+        assert_eq!(entries.len(), 75);
+        let flagged: Vec<&str> = entries
+            .iter()
+            .filter(|e| declares_bundled(e))
+            .map(|e| e.key.as_str())
+            .collect();
+        assert_eq!(flagged, ["fsevents/node-pre-gyp"]);
+        let installed: Vec<&str> = entries
+            .iter()
+            .filter(|e| !is_bundled_entry(e))
+            .map(|e| e.key.as_str())
+            .collect();
+        assert_eq!(installed, ["fsevents", "nan"]);
+        let minimist = entries
+            .iter()
+            .find(|e| e.key == "fsevents/minimist")
+            .unwrap();
+        assert!(is_bundled_entry(minimist) && !declares_bundled(minimist));
+    }
+
+    /// Without a flagged entry nothing is inferred and no meta is parsed;
+    /// with a meta that is not JSON only the flagged entries count.
+    #[test]
+    fn bundled_copies_need_a_flag_and_readable_metas() {
+        let plain = section(&[
+            r#""a": ["a@1.0.0", "", { "dependencies": { "b": "^1.0.0" } }, "sha512-A=="]"#,
+            r#""a/b": ["b@1.0.0", "", {}, "sha512-A=="]"#,
+        ]);
+        BUNDLED_CHECKS.with(|checks| checks.set(0));
+        let again = section(&[
+            r#""a": ["a@1.0.0", "", { "dependencies": { "b": "^1.0.0" } }, "sha512-A=="]"#,
+            r#""a/b": ["b@1.0.0", "", {}, "sha512-A=="]"#,
+        ]);
+        assert_eq!(BUNDLED_CHECKS.with(std::cell::Cell::get), 0);
+        assert!(bundled_copies(&plain).is_empty() && bundled_copies(&again).is_empty());
+
+        let unreadable = section(&[
+            r#""a": ["a@1.0.0", "", { "dependencies": { "b": "^1.0.0" } }, "sha512-A=="]"#,
+            r#""a/b": ["b@1.0.0", "", { "dependencies": { "c": "^1.0.0" }, "bundled": true }, "sha512-A=="]"#,
+            r#""a/c": ["c@1.0.0", "", { "dependencies": { "d": , } }, "sha512-A=="]"#,
+        ]);
+        assert_eq!(bundled_copies(&unreadable), ["a/b"]);
+    }
+
     /// The substring fast path (#580) never changes the answer: a meta that
     /// never spells `bundled` is not bundled, a malformed meta that does
     /// still fails closed, and a JSON-escaped key still takes the parse.
     #[test]
     fn bundled_fast_path_matches_the_full_parse() {
-        let bundled = |line: &str| is_bundled_entry(&parse_entry_line(line).unwrap());
+        let bundled = |line: &str| declares_bundled(&parse_entry_line(line).unwrap());
         assert!(!bundled(
             r#"    "q": ["q@1.0.0", "", { "dependencies": { "a": "1" } }, "sha512-X=="],"#
         ));
@@ -1242,29 +1546,32 @@ mod tests {
 
     /// bun 1.3 emits `"lockfileVersion": 1`; bun 1.4 emits 2 over the SAME
     /// grammar (the bump gates stricter parse checks, not new entry shapes —
-    /// same-fixture locks are byte-identical except the integer). Both must
-    /// pass; anything else — or a missing/non-integer head — fails closed.
+    /// same-fixture locks are byte-identical except the integer), and 3 when
+    /// the manifest has a nested override or a path resolution (the head's
+    /// `overrides` then nests; the `packages` grammar is unchanged). All
+    /// must pass; anything else — or a missing/non-integer head — fails
+    /// closed.
     #[test]
-    fn lock_version_gate_accepts_0_1_and_2_only() {
-        for v in [0u64, 1, 2] {
+    fn lock_version_gate_accepts_0_to_3_only() {
+        for v in [0u64, 1, 2, 3] {
             assert!(
                 check_lock_version(&format!("{{\n  \"lockfileVersion\": {v},\n}}\n")).is_ok(),
                 "lockfileVersion {v} must be accepted"
             );
         }
-        // Every unsupported integer is ≥ 3, i.e. written by a Bun NEWER than
+        // Every unsupported integer is ≥ 4, i.e. written by a Bun NEWER than
         // this release tests: the remedy must be "update socket-patch" (or
         // downgrade the writer) — never "re-lock with a newer Bun", which
         // would reproduce the same head.
-        for v in [3u64, 99] {
+        for v in [4u64, 99] {
             let err =
                 check_lock_version(&format!("{{\n  \"lockfileVersion\": {v},\n}}\n")).unwrap_err();
             assert!(
                 err.contains(&format!(
                     "lockfileVersion {v}, newer than this socket-patch release"
-                )) && err.contains("(0, 1 and 2)")
+                )) && err.contains("(0 to 3)")
                     && err.contains("update socket-patch")
-                    && err.contains("re-lock with a Bun release that writes lockfileVersion 0–2"),
+                    && err.contains("re-lock with a Bun release that writes lockfileVersion 0–3"),
                 "the refusal must name the found version and a remedy that can work: {err}"
             );
             assert!(
@@ -1283,7 +1590,7 @@ mod tests {
             let err = check_lock_version(head).unwrap_err();
             assert!(
                 err.contains("no integer lockfileVersion")
-                    && err.contains("only 0, 1 and 2 are supported")
+                    && err.contains("only 0 to 3 are supported")
                     && err.contains("re-lock with Bun ≥ 1.2 (`bun install`)"),
                 "a head without an integer version must point at a Bun re-lock: {err}"
             );

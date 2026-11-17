@@ -41,10 +41,10 @@ use crate::patch::apply::PatchSources;
 use crate::utils::fs::{atomic_write_bytes_preserving_mode, read_regular_to_string};
 use crate::utils::socket_dir::remove_tree_and_prune;
 use crate::vendor::bun_lock_text::{
-    decode_json_string, default_trust_detail, has_workspace_packages, is_bundled_entry,
-    is_user_tarball_entry, live_resolution_keys, lock_version, loses_default_trust,
-    packages_bounds, parse_entry_line, patched_dependency_detail, patched_dependency_key,
-    patched_dependency_keys, split_name_spec, BunEntry,
+    decode_json_string, default_trust_detail, default_trust_skip_detail, has_workspace_packages,
+    is_bundled_entry, is_user_tarball_entry, live_resolution_keys, lock_version,
+    loses_default_trust, packages_bounds, parse_entry_line, patched_dependency_detail,
+    patched_dependency_key, patched_dependency_keys, split_name_spec, BunEntry,
 };
 
 use super::common::refused;
@@ -667,6 +667,28 @@ pub(super) fn default_trust_warning(
     })
 }
 
+/// Refuse to move a registry copy of a default-trusted package onto a local
+/// tarball when the project relies on Bun's default trust to run its
+/// install scripts (#371): Bun 1.3.5 and later would skip them on every
+/// install and exit 0, leaving a native addon without its binding. A
+/// working install is not traded for a patch. The caller asks only when
+/// the run would write a new local tuple: a package an earlier run already
+/// vendored keeps its wiring, with [`default_trust_warning`].
+pub(super) fn refuse_default_trusted(
+    manifest: Option<&str>,
+    lock: Option<&str>,
+    name: &str,
+    version: &str,
+) -> Result<(), Box<VendorOutcome>> {
+    if !loses_default_trust(manifest, lock, name) {
+        return Ok(());
+    }
+    Err(Box::new(refused(
+        "vendor_bun_default_trust_refused",
+        default_trust_skip_detail(name, version, "a vendored local tarball"),
+    )))
+}
+
 /// Refuse to vendor a package the project patches itself with `bun patch`
 /// (#367): Bun applies that patch only to the resolution it is keyed on
 /// (the registry `name@version`, or a hosted or older vendored tarball,
@@ -820,6 +842,12 @@ pub(super) fn preflight_package(
         )
     });
     if writes_new_local_tuple {
+        refuse_default_trusted(
+            project.manifest.as_deref(),
+            Some(&project.lock_text),
+            name,
+            version,
+        )?;
         if let Err((code, detail)) =
             check_workspace_compatibility(&project.lock_text, &project.entries)
         {
@@ -2785,11 +2813,10 @@ mod tests {
         assert!(!fx.root().join(".socket/vendor").exists());
     }
 
-    /// Vendor `purl` from `fx` and return the run's
-    /// `vendor_bun_default_trust_lost` details.
-    async fn trust_lost_details(fx: &Fixture, purl: &str) -> Vec<String> {
+    /// Vendor `purl` from `fx`.
+    async fn vendor_purl(fx: &Fixture, purl: &str) -> VendorOutcome {
         let blobs = fx.root().join(".socket/blobs");
-        let outcome = crate::vendor::test_support::vendor_bun(
+        crate::vendor::test_support::vendor_bun(
             purl,
             &fx.installed,
             fx.root(),
@@ -2800,8 +2827,13 @@ mod tests {
             false,
             None,
         )
-        .await;
-        let (result, _, warnings) = expect_done(outcome);
+        .await
+    }
+
+    /// Vendor `purl` from `fx` and return the run's
+    /// `vendor_bun_default_trust_lost` details.
+    async fn trust_lost_details(fx: &Fixture, purl: &str) -> Vec<String> {
+        let (result, _, warnings) = expect_done(vendor_purl(fx, purl).await);
         assert!(result.success, "{:?}", result.error);
         warnings
             .into_iter()
@@ -2813,14 +2845,46 @@ mod tests {
     /// REGRESSION (#371): from Bun 1.3.5 on, Bun's default trusted list
     /// applies only to packages resolved from the npm registry, so a
     /// default-trusted package vendored to a local tarball has its install
-    /// scripts skipped with exit 0. Vendoring says so, unless the project
+    /// scripts skipped with exit 0. Vendoring refuses to take such a
+    /// package off the registry, before any write, unless the project
     /// declares `trustedDependencies` (package.json, or bun.lock's mirror),
-    /// which decides trust by name alone.
+    /// which decides trust by name alone. One an earlier run already
+    /// vendored keeps its wiring and the warning.
     #[tokio::test]
-    async fn default_trusted_package_warns_that_trust_is_lost() {
+    async fn default_trusted_package_is_not_taken_off_the_registry() {
         let lock = BN3_BEFORE_LOCK.replace("left-pad", "simple-git-hooks");
         let purl = "pkg:npm/simple-git-hooks@1.3.0";
         let fx = fixture_with(&lock, "node_modules/simple-git-hooks").await;
+        let detail = expect_refused(
+            vendor_purl(&fx, purl).await,
+            "vendor_bun_default_trust_refused",
+        );
+        assert!(
+            detail.contains("simple-git-hooks@1.3.0")
+                && detail.contains("trustedDependencies")
+                && detail.contains("stays UNPATCHED"),
+            "{detail}"
+        );
+        assert_eq!(fx.read_lock().await, lock, "refused before any write");
+        assert!(!fx.root().join(".socket/vendor").exists());
+
+        // Vendored while the project declared its trust, which it then
+        // dropped: the wiring stays, the in-sync re-run says what it costs.
+        let declared = BN3_PKG.replacen(
+            "\"version\": \"1.0.0\",",
+            "\"version\": \"1.0.0\",\n  \"trustedDependencies\": [\"simple-git-hooks\"],",
+            1,
+        );
+        assert_ne!(declared, BN3_PKG);
+        tokio::fs::write(fx.root().join("package.json"), &declared)
+            .await
+            .unwrap();
+        assert!(trust_lost_details(&fx, purl).await.is_empty());
+        let vendored = fx.read_lock().await;
+        assert!(vendored.contains(".socket/vendor/npm/"), "{vendored}");
+        tokio::fs::write(fx.root().join("package.json"), BN3_PKG)
+            .await
+            .unwrap();
         let lost = trust_lost_details(&fx, purl).await;
         assert_eq!(lost.len(), 1, "{lost:?}");
         assert!(
@@ -2828,6 +2892,7 @@ mod tests {
             "{}",
             lost[0]
         );
+        assert_eq!(fx.read_lock().await, vendored, "in sync");
 
         let mirrored = lock.replacen(
             "  \"packages\": {",
@@ -2859,10 +2924,11 @@ mod tests {
     }
 
     /// REGRESSION (#371), `bun.lockb`: the binary lock has no text mirror,
-    /// so the root manifest's `trustedDependencies` alone decides. Real Bun
-    /// 1.4.2 fixture: `simple-git-hooks` is on the default list.
+    /// so the root manifest's `trustedDependencies` alone decides whether
+    /// the registry record may be vendored. Real Bun 1.4.2 fixture:
+    /// `simple-git-hooks` is on the default list.
     #[tokio::test]
-    async fn binary_default_trusted_package_warns_that_trust_is_lost() {
+    async fn binary_default_trusted_package_is_not_taken_off_the_registry() {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/bun-lockb-trusted");
         let manifest = std::fs::read_to_string(dir.join("package.json")).unwrap();
@@ -2872,7 +2938,8 @@ mod tests {
             1,
         );
         assert_ne!(declared, manifest);
-        for (manifest, warns) in [(&manifest, true), (&declared, false)] {
+        let purl = "pkg:npm/simple-git-hooks@2.11.1";
+        for (manifest, refused) in [(&manifest, true), (&declared, false)] {
             let fx = fixture_with("", "node_modules/simple-git-hooks").await;
             tokio::fs::remove_file(fx.root().join(BUN_LOCK))
                 .await
@@ -2883,8 +2950,29 @@ mod tests {
             tokio::fs::write(fx.root().join("package.json"), manifest)
                 .await
                 .unwrap();
-            let lost = trust_lost_details(&fx, "pkg:npm/simple-git-hooks@2.11.1").await;
-            assert_eq!(lost.len(), usize::from(warns), "{lost:?}");
+            if refused {
+                let detail = expect_refused(
+                    vendor_purl(&fx, purl).await,
+                    "vendor_bun_default_trust_refused",
+                );
+                assert!(detail.contains("simple-git-hooks@2.11.1"), "{detail}");
+                assert_eq!(
+                    tokio::fs::read(fx.root().join("bun.lockb")).await.unwrap(),
+                    std::fs::read(dir.join("bun.lockb")).unwrap(),
+                    "refused before any write"
+                );
+                assert!(!fx.root().join(".socket/vendor").exists());
+            } else {
+                assert!(trust_lost_details(&fx, purl).await.is_empty());
+                // Trust dropped after vendoring: the wiring stays, warned.
+                tokio::fs::write(
+                    fx.root().join("package.json"),
+                    std::fs::read_to_string(dir.join("package.json")).unwrap(),
+                )
+                .await
+                .unwrap();
+                assert_eq!(trust_lost_details(&fx, purl).await.len(), 1);
+            }
         }
     }
 
@@ -2923,13 +3011,13 @@ mod tests {
         let detail = expect_refused(fx.vendor(false).await, "vendor_lockfile_missing");
         assert!(detail.contains("bun install"), "{detail}");
 
-        let lock = BN3_BEFORE_LOCK.replace("\"lockfileVersion\": 1,", "\"lockfileVersion\": 3,");
+        let lock = BN3_BEFORE_LOCK.replace("\"lockfileVersion\": 1,", "\"lockfileVersion\": 4,");
         let fx = fixture_with(&lock, "node_modules/left-pad").await;
         let detail = expect_refused(
             fx.vendor(false).await,
             "vendor_lockfile_version_unsupported",
         );
-        assert!(detail.contains('3'), "{detail}");
+        assert!(detail.contains("lockfileVersion 4"), "{detail}");
     }
 
     /// bun >= 1.4 writes `"lockfileVersion": 2` over the SAME emitted grammar
@@ -2947,6 +3035,34 @@ mod tests {
         assert!(
             rewritten.contains("\"lockfileVersion\": 2,"),
             "the version line must be preserved verbatim: {rewritten}"
+        );
+        assert!(
+            rewritten.contains(".socket/vendor/npm/"),
+            "the packages entry must point at the vendored tarball: {rewritten}"
+        );
+    }
+
+    /// bun >= 1.4 writes `"lockfileVersion": 3` when package.json has a
+    /// nested override or a yarn-style path resolution. Only the head
+    /// differs (`overrides` holds nested objects); the packages grammar is
+    /// the v2 one, so vendoring proceeds and both the version line and the
+    /// nested head survive verbatim, and a revert restores the lock.
+    #[tokio::test]
+    async fn lock_v3_with_nested_overrides_vendors_like_v2() {
+        const NESTED: &str =
+            "  \"overrides\": {\n    \"rc\": {\n      \"left-pad\": \"1.3.0\",\n    },\n  },\n";
+        let lock = BN3_BEFORE_LOCK
+            .replace("\"lockfileVersion\": 1,", "\"lockfileVersion\": 3,")
+            .replace("  \"packages\": {", &format!("{NESTED}  \"packages\": {{"));
+        assert!(lock.contains(NESTED), "replacement must hit: {lock}");
+        let fx = fixture_with(&lock, "node_modules/left-pad").await;
+        let (_, entry, _) = expect_done(fx.vendor(false).await);
+        assert!(entry.is_some(), "the vendor run must record an entry");
+        let rewritten = fx.read_lock().await;
+        assert!(
+            rewritten.contains("\"lockfileVersion\": 3,") && rewritten.contains(NESTED),
+            "the version line and the nested overrides head must be preserved verbatim: \
+             {rewritten}"
         );
         assert!(
             rewritten.contains(".socket/vendor/npm/"),
@@ -5385,7 +5501,7 @@ mod tests {
         );
 
         let absent = BN3_BEFORE_LOCK.replace("left-pad@1.3.0", "left-pad@1.2.0");
-        let v3 = BN3_BEFORE_LOCK.replace("\"lockfileVersion\": 1,", "\"lockfileVersion\": 3,");
+        let v4 = BN3_BEFORE_LOCK.replace("\"lockfileVersion\": 1,", "\"lockfileVersion\": 4,");
         let malformed = BN3_BEFORE_LOCK.replace(
             "    \"left-pad\": [\"left-pad@1.3.0\", \"\", {}, \"sha512-XI5MPzVNApjAyhQzphX8BkmKsKUxD4LdyK24iZeQGinBN9yTQT3bFlCBy/aVx2HrNcqQGsdot8ghrjyrvMCoEA==\"],",
             "    \"left-pad\": {\"not\": \"a tuple\"},",
@@ -5395,8 +5511,8 @@ mod tests {
         let cases: [(&str, &str, &str); 4] = [
             ("absent entry", &absent, "vendor_lock_entry_not_found"),
             (
-                "lockfileVersion 3",
-                &v3,
+                "lockfileVersion 4",
+                &v4,
                 "vendor_lockfile_version_unsupported",
             ),
             (
@@ -5432,25 +5548,30 @@ mod tests {
     /// REGRESSION (#578): the vendor twin of the hosted hot loop. Every
     /// per-target scan (`classify_rewritable`, `bundled_matches`) ran the
     /// JSON-parsing bundled check on EVERY entry before the cheap spec
-    /// match; it may run only on the entries that resolve the target.
+    /// match. Parsing the lock now decides it once per entry that spells
+    /// `bundled`; the per-target scans read that answer and parse nothing.
     #[test]
     fn bundled_check_runs_only_on_matching_entries() {
-        use crate::vendor::bun_lock_text::BUNDLED_CHECKS;
+        use crate::vendor::bun_lock_text::{parse_packages_section, BUNDLED_CHECKS};
 
         const ENTRIES: usize = 200;
-        let mut entries: Vec<BunEntry> = (0..ENTRIES)
-            .map(|i| {
-                parse_entry_line(&format!(
-                    "\"pkg{i}\": [\"pkg{i}@1.0.0\", \"\", {{}}, \"sha512-OLD==\"],"
-                ))
-                .unwrap()
-            })
-            .collect();
-        entries.push(
-            parse_entry_line(
-                "\"parent/pkg0\": [\"pkg0@1.0.0\", \"\", { \"bundled\": true }, \"sha512-OLD==\"],",
-            )
-            .unwrap(),
+        let mut lines = vec!["{".to_string(), "  \"packages\": {".to_string()];
+        lines.extend(
+            (0..ENTRIES).map(|i| {
+                format!("    \"pkg{i}\": [\"pkg{i}@1.0.0\", \"\", {{}}, \"sha512-OLD==\"],")
+            }),
+        );
+        lines.push(
+            "    \"parent/pkg0\": [\"pkg0@1.0.0\", \"\", { \"bundled\": true }, \"sha512-OLD==\"],"
+                .to_string(),
+        );
+        lines.extend(["  }".to_string(), "}".to_string()]);
+        BUNDLED_CHECKS.with(|checks| checks.set(0));
+        let entries: Vec<BunEntry> = parse_packages_section(&lines).unwrap();
+        assert_eq!(
+            BUNDLED_CHECKS.with(std::cell::Cell::get),
+            1,
+            "parsing reads the one meta that spells `bundled`"
         );
 
         BUNDLED_CHECKS.with(|checks| checks.set(0));
@@ -5468,9 +5589,10 @@ mod tests {
         assert_eq!(rewritable, 1, "only the registry tuple is rewritable");
         assert_eq!(bundled, vec!["parent/pkg0".to_string()]);
         assert!(user_tarballs.is_empty());
-        // Two matching entries, two scans: at most four checks, not 3 × 201.
+        // The scans read the parse's answer: no further meta is parsed
+        // (before #578: 3 × 201).
         assert!(
-            checks <= 4,
+            checks == 0,
             "{checks} bundled checks over {} entries",
             ENTRIES + 1
         );

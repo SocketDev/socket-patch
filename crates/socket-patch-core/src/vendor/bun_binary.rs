@@ -504,6 +504,19 @@ pub(super) fn preflight_package(
             ),
         )));
     }
+    // A registry record this run would move onto a local tarball: a
+    // default-trusted package stays where Bun runs its scripts (#371).
+    if matches
+        .iter()
+        .any(|p| p.version.as_deref() == Some(coords.version.as_str()))
+    {
+        super::bun_lock::refuse_default_trusted(
+            project.manifest.as_deref(),
+            None,
+            &coords.name,
+            &coords.version,
+        )?;
+    }
     let targets: Vec<usize> = matches.iter().map(|p| p.id).collect();
     let mirrors = match project
         .lock

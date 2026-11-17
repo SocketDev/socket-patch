@@ -28,6 +28,72 @@
 
 use serde_json::Value;
 
+/// A `package.json` parsed the way the most lenient npm-family installer
+/// reads it: a leading BOM is skipped, and when the text is not strict
+/// JSON, the comments and trailing commas Bun accepts are removed first
+/// ([`strip_jsonc`]). npm, yarn, pnpm and vlt refuse such a file outright,
+/// so only a Bun project can hold one, and reading it is what keeps a Bun
+/// workspace root from looking like no workspace at all. `None` when Bun
+/// could not parse the text either.
+pub(crate) fn parse(text: &str) -> Option<Value> {
+    let text = super::text::strip_bom(text);
+    serde_json::from_str(text)
+        .or_else(|_| serde_json::from_str(&strip_jsonc(text)))
+        .ok()
+}
+
+/// `text` with the JSONC Bun accepts in a `package.json` removed: `//` and
+/// `/* */` comments and a comma before a closing `}` or `]`, all outside
+/// strings. Everything else, strings included, is kept byte for byte.
+pub(crate) fn strip_jsonc(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    let mut in_string = false;
+    while let Some(c) = chars.next() {
+        if in_string {
+            out.push(c);
+            if c == '\\' {
+                if let Some(escaped) = chars.next() {
+                    out.push(escaped);
+                }
+            } else if c == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match c {
+            '"' => {
+                in_string = true;
+                out.push(c);
+            }
+            '/' if chars.peek() == Some(&'/') => {
+                while chars.peek().is_some_and(|&n| n != '\n') {
+                    chars.next();
+                }
+            }
+            '/' if chars.peek() == Some(&'*') => {
+                chars.next();
+                let mut prev = '\0';
+                for n in chars.by_ref() {
+                    if prev == '*' && n == '/' {
+                        break;
+                    }
+                    prev = n;
+                }
+            }
+            '}' | ']' => {
+                let kept = out.trim_end_matches(char::is_whitespace).len();
+                if out[..kept].ends_with(',') {
+                    out.remove(kept - 1);
+                }
+                out.push(c);
+            }
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 /// What a `package.json` `workspaces` field declares.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Workspaces {
@@ -67,12 +133,11 @@ impl Workspaces {
         }
     }
 
-    /// The field of a `package.json` text (a leading BOM is ignored);
-    /// `None` when the text is not JSON.
+    /// The field of a `package.json` text, read as [`parse`] reads it (a
+    /// leading BOM is ignored, Bun's comments and trailing commas are
+    /// allowed); `None` when the text is not JSON even so.
     pub(crate) fn parse(package_json: &str) -> Option<Self> {
-        serde_json::from_str(super::text::strip_bom(package_json))
-            .ok()
-            .map(|doc| Self::of(&doc))
+        parse(package_json).map(|doc| Self::of(&doc))
     }
 
     /// The patterns a widening reader takes: every string item of a
@@ -109,6 +174,37 @@ mod tests {
 
     fn strings(items: &[&str]) -> Vec<String> {
         items.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Bun installs from a `package.json` with comments and trailing
+    /// commas (measured on Bun 1.1.45 to 1.4.4), so its workspace root must
+    /// read as one: a strict reader saw no workspace, which let a member's
+    /// stray lock be attested and left members in pruned directories
+    /// uncrawled.
+    #[test]
+    fn reads_the_comments_and_trailing_commas_bun_accepts() {
+        let jsonc = "{\n  // workspace root\n  \"name\": \"mono\", /* private */\n  \
+                     \"workspaces\": [\"packages/*\", \"vendor/lib\",],\n}\n";
+        assert!(serde_json::from_str::<Value>(jsonc).is_err());
+        assert_eq!(
+            Workspaces::listed_patterns(jsonc),
+            Some(strings(&["packages/*", "vendor/lib"]))
+        );
+        assert_eq!(parse(jsonc).unwrap()["name"], "mono");
+        // The object form, behind a BOM.
+        let object = "\u{feff}{\"workspaces\": {\"packages\": [\"a\",], }, }";
+        assert_eq!(Workspaces::listed_patterns(object), Some(strings(&["a"])));
+        // Comment markers and commas inside strings are content.
+        let strings_kept = r#"{"name": "a//b /* c */", "workspaces": ["x,]", "y,}"],}"#;
+        assert_eq!(parse(strings_kept).unwrap()["name"], "a//b /* c */");
+        assert_eq!(
+            Workspaces::listed_patterns(strings_kept),
+            Some(strings(&["x,]", "y,}"]))
+        );
+        // Still not JSON: unreadable, as before.
+        for broken in ["{\"workspaces\": [}", "{\"workspaces\": [\"a\"]", ""] {
+            assert_eq!(Workspaces::parse(broken), None, "{broken:?}");
+        }
     }
 
     #[test]

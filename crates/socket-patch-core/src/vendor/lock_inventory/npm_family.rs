@@ -13,7 +13,9 @@ use crate::utils::pnpm_workspace::lockfile_disabled;
 use crate::utils::purl::npm_purl;
 use crate::vendor::npm_flavor::NpmLockFlavor;
 
-use super::bun::{bun_text_lock_drives, inventory_bun_binary_in, inventory_bun_in};
+use super::bun::{
+    bun_text_lock_drives, inventory_bun_binary_in, inventory_bun_in, unsupported_bun_lock_in,
+};
 #[cfg(test)]
 use super::dedup_prefer_integrity;
 use super::npm::{invalid_package_lock_in, inventory_package_lock_in};
@@ -243,7 +245,15 @@ async fn inventory_npm_router_lock_raw_in(
         NpmLockFlavor::YarnBerry => inventory_yarn_berry_in(view).await,
         NpmLockFlavor::Bun => {
             if bun_text_lock_drives(view) {
-                inventory_bun_in(view).await
+                match inventory_bun_in(view).await {
+                    Some(entries) => Some(entries),
+                    // A lock the grammar refuses is unreadable, not empty:
+                    // say so, as for a malformed `bun.lockb`.
+                    None => match unsupported_bun_lock_in(view).await {
+                        Some(diagnosis) => return Err(diagnosis),
+                        None => None,
+                    },
+                }
             } else {
                 Some(inventory_bun_binary_in(view).await?)
             }

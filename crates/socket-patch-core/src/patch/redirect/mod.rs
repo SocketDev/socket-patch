@@ -6185,6 +6185,37 @@ pub(crate) fn skip_bun_user_patched(
     true
 }
 
+/// Leave `dep` on its registry resolution when the project relies on Bun's
+/// default trust to run its install scripts (#371): Bun 1.3.5 and later
+/// trust a default-listed package only while it resolves from the npm
+/// registry, so a pin to `dep`'s URL makes every later `bun install` skip
+/// the scripts and exit 0, and a native addon (`sqlite3`) is left without
+/// its binding. A working install must not be traded for a patch, so the
+/// package is skipped, loudly, with the way to patch it. Warns, keeps the
+/// in-run VEX from assuming the uuid patched, and keeps any other lock from
+/// confirming it. The caller asks only for a registry copy this run would
+/// newly pin: a pin an earlier run wrote stays, with
+/// [`bun_default_trust_warning`]. `true` when `dep` was skipped.
+pub(crate) fn skip_bun_default_trusted(
+    manifest: Option<&str>,
+    lock: Option<&str>,
+    name: &str,
+    dep: &DepOverride,
+    result: &mut RewriteResult,
+) -> bool {
+    use crate::vendor::bun_lock_text::{default_trust_skip_detail, loses_default_trust};
+    if !loses_default_trust(manifest, lock, name) {
+        return false;
+    }
+    result.bundled_skipped_uuids.insert(dep.patch_uuid.clone());
+    result.refused_bun_uuids.insert(dep.patch_uuid.clone());
+    result.warnings.push(RewriteWarning {
+        code: "redirect_bun_default_trust_skipped".into(),
+        detail: default_trust_skip_detail(name, &dep.version, "a hosted tarball URL"),
+    });
+    true
+}
+
 fn rewrite_bun_lock(
     files: &BTreeMap<String, String>,
     overrides: &[DepOverride],
@@ -6258,6 +6289,35 @@ fn rewrite_bun_lock(
         };
         let target_spec = format!("{fname}@{}", dep.version);
         let url_spec = format!("{fname}@{}", dep.artifact_url);
+        // A default-trusted package is pinned only where an earlier run
+        // already pinned it: taking a registry copy off the registry would
+        // stop Bun from running its install scripts (#371).
+        let already_pinned = || {
+            specs.iter().flatten().any(|spec| {
+                *spec == url_spec || is_prior_hosted_bun_spec(spec, &fname, &dep.artifact_url)
+            })
+        };
+        let pins_registry_copy = || {
+            entries.iter().zip(&specs).any(|(entry, spec)| {
+                spec.as_deref() == Some(&target_spec) && !is_bundled_entry(entry)
+            })
+        };
+        if crate::vendor::bun_lock_text::loses_default_trust(
+            files.get("package.json").map(String::as_str),
+            Some(content),
+            &fname,
+        ) && !already_pinned()
+            && pins_registry_copy()
+            && skip_bun_default_trusted(
+                files.get("package.json").map(String::as_str),
+                Some(content),
+                &fname,
+                dep,
+                result,
+            )
+        {
+            continue;
+        }
         let mut matched_any = false;
         // A non-bundled instance now resolves to the hosted URL.
         let mut wired = false;
@@ -6453,7 +6513,7 @@ fn rewrite_bun_lock(
 /// override — nothing about the patch server's URL layout is assumed — and
 /// anything that fails to parse fails the match (closed): user URL deps live
 /// on other origins, and another version's artifact has a different leaf.
-fn is_prior_hosted_bun_spec(spec: &str, fname: &str, current_url: &str) -> bool {
+pub(crate) fn is_prior_hosted_bun_spec(spec: &str, fname: &str, current_url: &str) -> bool {
     let Some(old_url) = spec
         .strip_prefix(fname)
         .and_then(|rest| rest.strip_prefix('@'))
@@ -15077,13 +15137,42 @@ mod tests {
         assert!(out.contains("http://p.test/lp.tgz"), "{out}");
         assert!(r.warnings.is_empty(), "{:?}", r.warnings);
 
-        // Unsupported lockfileVersion (a future 3) → refusal.
+        // lockfileVersion 3 (bun >= 1.4 with a nested override or a path
+        // resolution in package.json): the head's `overrides` nests, the
+        // `packages` grammar is unchanged, so the rewrite proceeds too.
         let mut files = BTreeMap::new();
         files.insert(
             "bun.lock".to_string(),
             bun_lock_file(
                 "\"left-pad\": [\"left-pad@1.3.0\", \"\", {}, \"sha512-OLD==\"]",
                 3,
+            )
+            .replace(
+                "  \"packages\": {",
+                "  \"overrides\": {\n    \"rc\": {\n      \"left-pad\": \"1.3.0\",\n    },\n  },\n  \"packages\": {",
+            ),
+        );
+        let mut r = RewriteResult::default();
+        rewrite_bun_lock(&files, std::slice::from_ref(&ovr), &mut r);
+        let out = r
+            .files
+            .get("bun.lock")
+            .expect("a lockfileVersion-3 lock must be rewritten like a v2 lock");
+        assert!(out.contains("\"lockfileVersion\": 3,"), "{out}");
+        assert!(
+            out.contains("    \"rc\": {\n      \"left-pad\": \"1.3.0\",\n    },"),
+            "the nested overrides head must survive verbatim: {out}"
+        );
+        assert!(out.contains("http://p.test/lp.tgz"), "{out}");
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+
+        // Unsupported lockfileVersion (a future 4) → refusal.
+        let mut files = BTreeMap::new();
+        files.insert(
+            "bun.lock".to_string(),
+            bun_lock_file(
+                "\"left-pad\": [\"left-pad@1.3.0\", \"\", {}, \"sha512-OLD==\"]",
+                4,
             ),
         );
         let mut r = RewriteResult::default();
@@ -15093,11 +15182,11 @@ mod tests {
         assert!(
             r.warnings[0]
                 .detail
-                .contains("lockfileVersion 3, newer than this socket-patch release supports")
-                && r.warnings[0].detail.contains("(0, 1 and 2)")
+                .contains("lockfileVersion 4, newer than this socket-patch release supports")
+                && r.warnings[0].detail.contains("(0 to 3)")
                 && r.warnings[0].detail.contains("update socket-patch"),
             "the refusal must name the found version, the supported set and a remedy that \
-             can work (a v3 lock was written by a NEWER Bun): {}",
+             can work (a v4 lock was written by a NEWER Bun): {}",
             r.warnings[0].detail
         );
         // One message for both modes: the hosted detail IS the shared gate's
@@ -15942,15 +16031,18 @@ mod tests {
     }
 
     /// REGRESSION (#371): from Bun 1.3.5 on, Bun's default trusted list
-    /// (better-sqlite3, esbuild, sharp, simple-git-hooks, …) applies only to
-    /// packages resolved from the npm registry, so a default-trusted package
-    /// rewired to a hosted URL has its install scripts skipped with exit 0.
-    /// The rewrite says so, on the first run and on an already-wired re-run;
-    /// a project that declares `trustedDependencies` (in package.json or
-    /// bun.lock's mirror) decides trust by name alone and is not warned, nor
-    /// is a package off the default list.
+    /// (better-sqlite3, esbuild, sharp, simple-git-hooks, sqlite3, …)
+    /// applies only to packages resolved from the npm registry, so a
+    /// default-trusted package rewired to a hosted URL has its install
+    /// scripts skipped with exit 0 (measured: `sqlite3@5.1.4` installs
+    /// without its native binding and `require` throws). Such a package is
+    /// left on the registry, unpatched, with the way to patch it; one an
+    /// earlier run already pinned keeps its pin and the warning. A project
+    /// that declares `trustedDependencies` (in package.json or bun.lock's
+    /// mirror) decides trust by name alone and is rewired without a word,
+    /// as is a package off the default list.
     #[test]
-    fn bun_lock_default_trusted_package_warns_that_trust_is_lost() {
+    fn bun_lock_default_trusted_package_is_left_on_the_registry() {
         let sha512 = format!("sha512-{}==", "A".repeat(86));
         let hooks = npm_override(
             "simple-git-hooks",
@@ -15979,11 +16071,19 @@ mod tests {
 
         let lock = bun_lock_file(entries, 1);
         let first = run(&lock, Some(manifest));
-        let wired = first.files.get("bun.lock").expect("both rewired").clone();
-        assert_eq!(first.edits.len(), 2, "{:?}", first.edits);
+        let rewritten = first.files.get("bun.lock").expect("is-number rewired");
+        assert_eq!(first.edits.len(), 1, "{:?}", first.edits);
+        assert_eq!(first.edits[0].key.as_deref(), Some("is-number"));
+        assert!(
+            rewritten.contains(
+                "\"simple-git-hooks\": [\"simple-git-hooks@2.11.1\", \"\", { \"bin\": \
+                 { \"simple-git-hooks\": \"cli.js\" } }, \"sha512-OLD==\"],"
+            ),
+            "the default-trusted package keeps its registry entry: {rewritten}"
+        );
         assert_eq!(
             warning_codes(&first),
-            vec!["redirect_bun_default_trust_lost"],
+            vec!["redirect_bun_default_trust_skipped"],
             "{:?}",
             first.warnings
         );
@@ -15991,21 +16091,37 @@ mod tests {
         assert!(
             detail.contains("simple-git-hooks@2.11.1")
                 && detail.contains("trustedDependencies")
-                && detail.contains("1.3.5"),
+                && detail.contains("1.3.5")
+                && detail.contains("stays UNPATCHED"),
             "{detail}"
         );
+        // Never assumed patched, and no other lock may confirm it.
+        assert!(first.bundled_skipped_uuids.contains(&hooks.patch_uuid));
+        assert!(first.refused_bun_uuids.contains(&hooks.patch_uuid));
+        assert!(!first.bundled_skipped_uuids.contains(&other.patch_uuid));
         // Without a readable manifest Bun still has no explicit list.
         assert_eq!(
             warning_codes(&run(&lock, None)),
-            vec!["redirect_bun_default_trust_lost"]
+            vec!["redirect_bun_default_trust_skipped"]
         );
-        // An already-wired re-run keeps saying so until trust is declared.
+        // A lock an earlier release already pinned keeps its pin, and
+        // keeps hearing that the scripts do not run until trust is declared.
+        let wired = run(
+            &lock,
+            Some(r#"{"name":"app","trustedDependencies":["simple-git-hooks"]}"#),
+        )
+        .files
+        .get("bun.lock")
+        .expect("both rewired once trust is declared")
+        .clone();
+        assert!(wired.contains("http://p.test/simple-git-hooks-2.11.1.tgz"));
         let rerun = run(&wired, Some(manifest));
         assert!(rerun.files.is_empty() && rerun.edits.is_empty());
         assert_eq!(
             warning_codes(&rerun),
             vec!["redirect_bun_default_trust_lost"]
         );
+        assert!(!rerun.refused_bun_uuids.contains(&hooks.patch_uuid));
 
         // An explicit list (even one that omits the package: Bun then never
         // trusted it by default) leaves trust unchanged by the rewire.
@@ -16035,7 +16151,9 @@ mod tests {
         );
         let r = run(&bundled, Some(manifest));
         assert!(
-            !warning_codes(&r).contains(&"redirect_bun_default_trust_lost"),
+            !warning_codes(&r)
+                .iter()
+                .any(|code| code.starts_with("redirect_bun_default_trust")),
             "{:?}",
             r.warnings
         );
