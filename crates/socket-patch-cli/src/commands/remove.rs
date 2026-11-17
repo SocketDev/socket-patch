@@ -1517,6 +1517,12 @@ async fn revert_vendored_matches(
                 );
             }
             VendorRevertStep::LedgerWriteFailed(e) => {
+                // The revert landed, and so did the gem refresh after it.
+                if loud {
+                    for line in &progress {
+                        println!("{line}");
+                    }
+                }
                 emit_error_envelope(
                     args.common.json,
                     args.common.dry_run,

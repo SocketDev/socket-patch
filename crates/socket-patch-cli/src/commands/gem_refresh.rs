@@ -757,8 +757,9 @@ pub(crate) async fn after_restore(
 /// [`after_restore`] does it. An archive in Bundler's cache dir is not
 /// touched: the vendored unwind names it (`upstream_gem_stale_cache`).
 ///
-/// A gem with no installed copy to judge costs no registry lookup: a
-/// vendored unwind then needs no network, as before.
+/// Only a gem the lock now resolves from rubygems.org is judged. A gem
+/// with no installed copy to judge costs no registry lookup: a vendored
+/// unwind then needs no network, as before.
 pub(crate) async fn after_vendored_unwind(
     common: &GlobalArgs,
     unwound: &[String],
@@ -795,6 +796,15 @@ async fn refresh_restored(
         if let Some((sha, url)) =
             gem_upstream_archive(&common.cwd, staged, purl, common.offline).await
         {
+            // A vendored revert does not prove where the lock resolves the
+            // gem from: an entry vendored over hosted wiring before v5
+            // reverts to its hosted pin, whose `CHECKSUMS` sha256 is the
+            // patched gem's (the hosted unwind restores that pin next, and
+            // refreshes then). Only a gem the lock resolves from
+            // rubygems.org is known to be back on its upstream entry.
+            if scope == Scope::Installed && url.is_none() {
+                continue;
+            }
             shas.insert(purl.clone(), sha);
             urls.insert(purl.clone(), url);
         }
