@@ -229,11 +229,8 @@ pub const MARKER_FILE: &str = ".socket-patch-native-build.json";
 pub const BACKUP_DIR: &str = ".socket-patch-native-orig";
 /// The backup's description file, inside [`BACKUP_DIR`].
 const BACKUP_INFO: &str = "backup.json";
-/// The gem's own tree as it was before an in-place build, in the gem dir
-/// for as long as that build runs (see [`TreeSnapshot`]).
-const TREE_SNAPSHOT_DIR: &str = ".socket-patch-native-tree";
 /// What every entry this module keeps in a gem dir starts with: the
-/// marker, the backup, the tree snapshot and their stages.
+/// marker, the backup and their stages.
 const OWN_ENTRY_PREFIX: &str = ".socket-patch-native";
 
 /// The stage a rebuild from the source gem builds in, inside the gem home
@@ -1505,6 +1502,26 @@ fn parked_build_path(ext: &Path) -> PathBuf {
     ext.with_file_name(format!(".{leaf}.socket-patch-old"))
 }
 
+/// Where an in-place rebuild keeps the gem's own tree as it was before the
+/// build ([`TreeSnapshot`]): beside the parked build of the extension dir
+/// `ext`, outside the gem dir, where the gem's build scripts do not look
+/// for sources.
+fn tree_snapshot_path(ext: &Path) -> PathBuf {
+    let leaf = ext
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    ext.with_file_name(format!(".{leaf}.socket-patch-tree"))
+}
+
+/// Where the snapshot at `snapshot` ([`tree_snapshot_path`]) is staged
+/// while it is taken.
+fn tree_snapshot_stage(snapshot: &Path) -> PathBuf {
+    let mut name = snapshot.as_os_str().to_os_string();
+    name.push(".tmp");
+    PathBuf::from(name)
+}
+
 /// Take the rebuild lock of a build dir (an extension dir about to be
 /// parked, or a parked one): an exclusive advisory lock on the directory
 /// itself. It follows the directory through its renames and goes when the
@@ -1601,7 +1618,7 @@ fn recover_interrupted_rebuild_sync(
         // what it was before it ([`TreeSnapshot`]), whichever way the
         // extension dir is settled, since no marker speaks for what the
         // build left there.
-        let snapshot = copy.gem_dir.join(TREE_SNAPSHOT_DIR);
+        let snapshot = tree_snapshot_path(&ext);
         let in_place = is_real_dir(&snapshot);
         if in_place {
             restore_tree(copy, &snapshot)?;
@@ -1621,7 +1638,7 @@ fn recover_interrupted_rebuild_sync(
         recovered = true;
     }
     // No rebuild is under way now, so a snapshot that is left is nobody's.
-    drop_stale_tree_snapshot(copy);
+    drop_stale_tree_snapshots(copy);
     Ok(recovered)
 }
 
@@ -2219,6 +2236,12 @@ fn back_up_original(copy: &GemCopy, probe: &Probe, absent: &[String]) -> std::io
     Ok(true)
 }
 
+/// The description of the backup dir `backup`, when it has a readable one.
+fn read_backup_info(backup: &Path) -> Option<BackupInfo> {
+    let bytes = read_regular_to_bytes_sync(&backup.join(BACKUP_INFO)).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
 /// Write a backup's description into `dir`: staged beside its place and
 /// renamed, so it is always whole.
 fn write_backup_info(dir: &Path, info: &BackupInfo) -> std::io::Result<()> {
@@ -2237,10 +2260,7 @@ fn note_absent_files(backup: &Path, absent: &[String]) -> std::io::Result<()> {
     if absent.is_empty() || !is_real_dir(backup) {
         return Ok(());
     }
-    let known = read_regular_to_bytes_sync(&backup.join(BACKUP_INFO))
-        .ok()
-        .and_then(|bytes| serde_json::from_slice::<BackupInfo>(&bytes).ok());
-    let Some(mut info) = known else {
+    let Some(mut info) = read_backup_info(backup) else {
         return Ok(());
     };
     let before = info.absent_files.len();
@@ -2422,7 +2442,7 @@ fn gem_tree_files(gem_dir: &Path) -> Vec<String> {
 }
 
 /// The gem's own tree as it was before an in-place build: a copy of every
-/// file, in [`TREE_SNAPSHOT_DIR`] inside the gem dir.
+/// file, beside the parked build ([`tree_snapshot_path`]).
 ///
 /// A build run in the installed tree writes there too: its objects and
 /// Makefiles, and for a gem that loads its library from its own tree (an
@@ -2463,19 +2483,23 @@ struct TreeChanges {
 }
 
 /// Copy `from` to `to` with its mode, creating `to`'s directory.
-fn copy_file_with_mode(from: &Path, to: &Path) -> std::io::Result<()> {
+/// The git-sha256 of what was copied.
+fn copy_file_with_mode(from: &Path, to: &Path) -> std::io::Result<String> {
     if let Some(parent) = to.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(to, read_regular_to_bytes_sync(from)?)?;
-    std::fs::set_permissions(to, std::fs::metadata(from)?.permissions())
+    let bytes = read_regular_to_bytes_sync(from)?;
+    std::fs::write(to, &bytes)?;
+    std::fs::set_permissions(to, std::fs::metadata(from)?.permissions())?;
+    Ok(compute_git_sha256_from_bytes(&bytes))
 }
 
-/// Take the [`TreeSnapshot`] of `copy`, leaving the paths `left` out:
-/// staged and renamed into place, so a snapshot dir is always whole.
-fn snapshot_tree(copy: &GemCopy, left: &[String]) -> std::io::Result<TreeSnapshot> {
-    let dir = copy.gem_dir.join(TREE_SNAPSHOT_DIR);
-    let stage = copy.gem_dir.join(format!("{TREE_SNAPSHOT_DIR}.tmp"));
+/// Take the [`TreeSnapshot`] of `copy` beside its extension dir `ext`,
+/// leaving the paths `left` out: staged and renamed into place, so a
+/// snapshot dir is always whole.
+fn snapshot_tree(copy: &GemCopy, ext: &Path, left: &[String]) -> std::io::Result<TreeSnapshot> {
+    let dir = tree_snapshot_path(ext);
+    let stage = tree_snapshot_stage(&dir);
     remove_dir_if_exists(&dir)?;
     remove_dir_if_exists(&stage)?;
     std::fs::create_dir_all(&stage)?;
@@ -2486,8 +2510,8 @@ fn snapshot_tree(copy: &GemCopy, left: &[String]) -> std::io::Result<TreeSnapsho
                 continue;
             }
             let src = copy.gem_dir.join(&rel);
-            copy_file_with_mode(&src, &stage.join(SNAPSHOT_TREE).join(&rel))?;
-            files.insert(rel, compute_file_git_sha256_sync(&src)?);
+            let hash = copy_file_with_mode(&src, &stage.join(SNAPSHOT_TREE).join(&rel))?;
+            files.insert(rel, hash);
         }
         std::fs::write(
             stage.join(SNAPSHOT_LEFT),
@@ -2553,7 +2577,7 @@ fn restore_tree(copy: &GemCopy, snapshot_dir: &Path) -> std::io::Result<()> {
     }
     for rel in &kept {
         let (saved, path) = (saved_tree.join(rel), copy.gem_dir.join(rel));
-        let same = std::fs::symlink_metadata(&path).is_ok_and(|meta| meta.is_file())
+        let same = is_real_file(&path)
             && compute_file_git_sha256_sync(&path).ok()
                 == compute_file_git_sha256_sync(&saved).ok();
         if !same {
@@ -2563,17 +2587,16 @@ fn restore_tree(copy: &GemCopy, snapshot_dir: &Path) -> std::io::Result<()> {
     remove_dir_if_exists(snapshot_dir)
 }
 
-/// Drop what a run that died left of a [`TreeSnapshot`] in `copy`, once no
+/// Drop what a run that died left of a [`TreeSnapshot`] of `copy`, once no
 /// parked build says a rebuild was under way: the tree it was taken of is
 /// either untouched or the committed build's.
-fn drop_stale_tree_snapshot(copy: &GemCopy) {
-    for name in [
-        TREE_SNAPSHOT_DIR.to_string(),
-        format!("{TREE_SNAPSHOT_DIR}.tmp"),
-    ] {
-        let dir = copy.gem_dir.join(name);
-        if is_real_dir(&dir) {
-            let _ = remove_dir_if_exists(&dir);
+fn drop_stale_tree_snapshots(copy: &GemCopy) {
+    for ext in extension_dir_slots(copy) {
+        let snapshot = tree_snapshot_path(&ext);
+        for dir in [tree_snapshot_stage(&snapshot), snapshot] {
+            if is_real_dir(&dir) {
+                let _ = remove_dir_if_exists(&dir);
+            }
         }
     }
 }
@@ -2581,7 +2604,11 @@ fn drop_stale_tree_snapshot(copy: &GemCopy) {
 /// Add what an in-place build did to the gem's own tree (`changes`) to the
 /// backup of the original build, so `rollback` undoes it
 /// ([`restore_backup`]): the content each replaced file had before the
-/// build, from `snapshot`, and the names of the files it added. A file the
+/// build, from `snapshot`, and the names of the files it added. The
+/// products taken out of the build's way (`removed`) count as replaced
+/// whether or not they came back with other bytes: the marker lists them,
+/// and the restore removes whatever a marker lists that the backup does
+/// not hold. A file the
 /// backup already holds, or already lists as added by an earlier build, is
 /// left as recorded: that is the original, and this build ran over
 /// socket-patch's own. Without a backup of a build RubyGems made there is
@@ -2589,20 +2616,19 @@ fn drop_stale_tree_snapshot(copy: &GemCopy) {
 fn back_up_tree_changes(
     copy: &GemCopy,
     snapshot: &TreeSnapshot,
+    removed: &[String],
     changes: &TreeChanges,
 ) -> std::io::Result<()> {
     let backup = copy.gem_dir.join(BACKUP_DIR);
-    let known = read_regular_to_bytes_sync(&backup.join(BACKUP_INFO))
-        .ok()
-        .and_then(|bytes| serde_json::from_slice::<BackupInfo>(&bytes).ok());
-    let Some(mut info) = known.filter(|info| !info.grafted && is_real_dir(&backup)) else {
+    let known = read_backup_info(&backup).filter(|info| !info.grafted && is_real_dir(&backup));
+    let Some(mut info) = known else {
         return Ok(());
     };
     let before = (info.lib_files.len(), info.created_files.len());
     let recorded = |info: &BackupInfo, rel: &String| {
         info.lib_files.contains(rel) || info.created_files.contains(rel)
     };
-    for rel in &changes.replaced {
+    for rel in changes.replaced.iter().chain(removed) {
         if !recorded(&info, rel) {
             let saved = snapshot.dir.join(SNAPSHOT_TREE).join(rel);
             copy_file_with_mode(&saved, &backup.join("lib").join(rel))?;
@@ -2621,15 +2647,18 @@ fn back_up_tree_changes(
 }
 
 /// The files an in-place build left in the gem's own tree for Ruby to load
-/// (under a require path, or a shared library by name: [`loadable_files`]),
-/// to attest in its marker: those of `changes`, and those the backup says
-/// an earlier build of socket-patch's replaced or added, which a build
-/// that writes the same bytes again does not change.
-fn in_tree_artifacts(copy: &GemCopy, probe: &Probe, changes: &TreeChanges) -> Vec<String> {
+/// ([`is_loadable`]), to attest in its marker: those of `changes`, the
+/// products it was made to build again (`removed`), and those the backup
+/// says an earlier build of socket-patch's replaced or added. A build that
+/// writes the same bytes again changes none of the last two.
+fn in_tree_artifacts(
+    copy: &GemCopy,
+    probe: &Probe,
+    removed: &[String],
+    changes: &TreeChanges,
+) -> Vec<String> {
     let dlext = probe.facts.as_ref().map(|facts| facts.dlext.as_str());
-    let recorded = read_regular_to_bytes_sync(&copy.gem_dir.join(BACKUP_DIR).join(BACKUP_INFO))
-        .ok()
-        .and_then(|bytes| serde_json::from_slice::<BackupInfo>(&bytes).ok())
+    let recorded = read_backup_info(&copy.gem_dir.join(BACKUP_DIR))
         .filter(|info| !info.grafted)
         .map(|info| [info.lib_files, info.created_files].concat())
         .unwrap_or_default();
@@ -2637,14 +2666,11 @@ fn in_tree_artifacts(copy: &GemCopy, probe: &Probe, changes: &TreeChanges) -> Ve
         .replaced
         .iter()
         .chain(&changes.created)
+        .chain(removed)
         .chain(&recorded)
         .filter(|rel| is_safe_relative_subpath(rel) && !is_own_entry(rel))
-        .filter(|rel| {
-            under_require_path(rel, &probe.require_paths) || is_library_name(leaf_of(rel), dlext)
-        })
-        .filter(|rel| {
-            std::fs::symlink_metadata(copy.gem_dir.join(rel)).is_ok_and(|meta| meta.is_file())
-        })
+        .filter(|rel| is_loadable(rel, &probe.require_paths, dlext))
+        .filter(|rel| is_real_file(&copy.gem_dir.join(rel)))
         .cloned()
         .collect();
     rels.sort();
@@ -2652,26 +2678,28 @@ fn in_tree_artifacts(copy: &GemCopy, probe: &Probe, changes: &TreeChanges) -> Ve
     rels
 }
 
-/// Why a build that exited cleanly is not one of the patched sources, when
+/// Why a build that exited cleanly is not one of the sources on disk, when
 /// that shows in the files it left: `None` when nothing does.
 ///
 /// A build run over an installed tree finds the products of the install
 /// there, and one that takes them for current compiles nothing (a Rakefile
 /// whose library task does not depend on the C sources). `removed` are the
 /// products taken out of its way beforehand, each of which it must have
-/// made again. With none known, a record that changes a build input must
-/// leave compiled code somewhere: an artifact in the extension dir, or a
-/// changed file in the gem's tree that Ruby could load.
+/// made again. With none known, a gem that keeps a shared library in its
+/// own tree must show compiled code from the build: an artifact in the
+/// extension dir, or a changed file in the tree that Ruby could load. (A
+/// gem with no library in its tree and none in its extension dir compiles
+/// nothing on this platform, and there is nothing stale for Ruby to load.)
 fn stale_build(
     copy: &GemCopy,
     probe: &Probe,
-    scope: &NativeScope,
     removed: &[String],
+    snapshot: &TreeSnapshot,
     changes: &TreeChanges,
 ) -> Option<String> {
     let missing: Vec<&str> = removed
         .iter()
-        .filter(|rel| !copy.gem_dir.join(rel).is_file())
+        .filter(|rel| !is_real_file(&copy.gem_dir.join(rel)))
         .map(String::as_str)
         .collect();
     if !missing.is_empty() {
@@ -2681,19 +2709,25 @@ fn stale_build(
             missing.join(", ")
         ));
     }
-    if scope.inputs.is_empty() || !removed.is_empty() {
+    if !removed.is_empty() {
         return None;
     }
     let dlext = probe.facts.as_ref().map(|facts| facts.dlext.as_str());
+    let keeps_library = snapshot
+        .files
+        .keys()
+        .any(|rel| is_library_name(leaf_of(rel), dlext));
     let compiled = !artifact_rels(&probe.extension_dir).is_empty()
-        || changes.replaced.iter().chain(&changes.created).any(|rel| {
-            under_require_path(rel, &probe.require_paths) || is_library_name(leaf_of(rel), dlext)
-        });
-    (!compiled).then(|| {
+        || changes
+            .replaced
+            .iter()
+            .chain(&changes.created)
+            .any(|rel| is_loadable(rel, &probe.require_paths, dlext));
+    (keeps_library && !compiled).then(|| {
         "the build exited cleanly but compiled nothing: it left no artifact in the extension \
          dir and changed no file of the gem's own tree that Ruby loads, so the gem still runs \
-         its previous build (a build script that takes the library it finds for current \
-         does this)"
+         the library that was there (a build script that takes the library it finds for \
+         current does this)"
             .to_string()
     })
 }
@@ -2710,7 +2744,8 @@ fn stale_build(
 /// On failure every build product, in the extension dir and in the gem's
 /// tree, is put back as it was; `Err` is the build's diagnostic. A build
 /// that exits cleanly without building the sources fails too
-/// ([`stale_build`]).
+/// ([`stale_build`]): that holds for a rollback's rebuild of the restored
+/// sources as for a patch's.
 async fn rebuild(
     copy: &GemCopy,
     probe: &Probe,
@@ -2754,7 +2789,7 @@ async fn rebuild(
             };
             // Under the parked build's lock, and only files the snapshot
             // holds are removed: each can be put back.
-            let prepared = snapshot_tree(&copy, &left).and_then(|snapshot| {
+            let prepared = snapshot_tree(&copy, &probe.extension_dir, &left).and_then(|snapshot| {
                 let mut removed = Vec::new();
                 for rel in stale {
                     if snapshot.files.contains_key(&rel) {
@@ -2767,13 +2802,15 @@ async fn rebuild(
             match prepared {
                 Ok((snapshot, removed)) => Ok((aside, made, snapshot, removed)),
                 Err(e) => {
-                    let snapshot_dir = copy.gem_dir.join(TREE_SNAPSHOT_DIR);
+                    // The parked build stays where it is when the tree
+                    // cannot be put back: the next run tries again.
+                    let snapshot_dir = tree_snapshot_path(&probe.extension_dir);
                     let undone = if is_real_dir(&snapshot_dir) {
                         restore_tree(&copy, &snapshot_dir)
                     } else {
                         Ok(())
                     };
-                    let undone = undone.and(put_back(&copy, &probe, aside));
+                    let undone = undone.and_then(|()| put_back(&copy, &probe, aside));
                     if undone.is_ok() {
                         drop_new_backup(&copy, made);
                     }
@@ -2799,14 +2836,14 @@ async fn rebuild(
             )),
             Ok(_) => {
                 let changes = tree_changes(&copy, &snapshot);
-                match stale_build(&copy, &probe, &scope, &removed, &changes) {
+                match stale_build(&copy, &probe, &removed, &snapshot, &changes) {
                     Some(why) => Err(why),
                     // The backup learns of the tree's changes before the
                     // marker says the build is done: a run that dies in
                     // between is undone from the snapshot.
-                    None => back_up_tree_changes(&copy, &snapshot, &changes)
+                    None => back_up_tree_changes(&copy, &snapshot, &removed, &changes)
                         .and_then(|()| {
-                            let in_tree = in_tree_artifacts(&copy, &probe, &changes);
+                            let in_tree = in_tree_artifacts(&copy, &probe, &removed, &changes);
                             commit_build(&copy, &probe, &scope, &files, &aside, &in_tree)
                         })
                         .map_err(|e| {
@@ -2827,8 +2864,10 @@ async fn rebuild(
             Err(diagnostic) => diagnostic,
         };
         // The gem's own tree first, while the parked build still says a
-        // rebuild is under way.
-        let undone = restore_tree(&copy, &snapshot.dir).and(put_back(&copy, &probe, aside));
+        // rebuild is under way: if it cannot be put back, the parked build
+        // stays, and the next run tries again from the snapshot.
+        let undone =
+            restore_tree(&copy, &snapshot.dir).and_then(|()| put_back(&copy, &probe, aside));
         match undone {
             Ok(()) => {
                 drop_new_backup(&copy, made_backup);
@@ -3385,9 +3424,14 @@ fn is_library_name(leaf: &str, dlext: Option<&str>) -> bool {
         })
 }
 
-/// The files of the gem tree at `gem_dir` that Ruby could load, each with
-/// its git-sha256: every file under a require path, and every shared
-/// library by name wherever it sits.
+/// Whether Ruby could load the gem file `rel`: it is under a require path,
+/// or a shared library by name wherever it sits.
+fn is_loadable(rel: &str, require_paths: &[String], dlext: Option<&str>) -> bool {
+    under_require_path(rel, require_paths) || is_library_name(leaf_of(rel), dlext)
+}
+
+/// The files of the gem tree at `gem_dir` that Ruby could load
+/// ([`is_loadable`]), each with its git-sha256.
 fn loadable_files(
     gem_dir: &Path,
     require_paths: &[String],
@@ -3395,9 +3439,7 @@ fn loadable_files(
 ) -> BTreeMap<String, String> {
     tree_files(gem_dir)
         .into_iter()
-        .filter(|rel| {
-            under_require_path(rel, require_paths) || is_library_name(leaf_of(rel), dlext)
-        })
+        .filter(|rel| is_loadable(rel, require_paths, dlext))
         .filter_map(|rel| {
             let hash = compute_file_git_sha256_sync(&gem_dir.join(&rel)).ok()?;
             Some((rel, hash))
@@ -4953,10 +4995,10 @@ pub async fn restore_original_build(pkg_path: &Path, env: &RubyEnv) -> Result<bo
         )
     })?;
     let rebuilt = match rebuild_unpatched_from_source_gem(&copy, &probe, env).await {
-        Some(rebuilt) => rebuilt,
-        None => {
+        Ok(rebuilt) => rebuilt,
+        Err(stale) => {
             let scope = NativeScope::default();
-            rebuild(&copy, &probe, &scope, &HashMap::new(), env, false, &[]).await
+            rebuild(&copy, &probe, &scope, &HashMap::new(), env, false, &stale).await
         }
     };
     rebuilt.map_err(|diagnostic| {
@@ -4972,25 +5014,34 @@ pub async fn restore_original_build(pkg_path: &Path, env: &RubyEnv) -> Result<bo
 
 /// Rebuild `copy`'s extension from its source gem as it shipped (no record
 /// over it), for a rollback that has no backup of the original build.
-/// `None` when it cannot be built from the source gem
-/// ([`build_from_source_gem`]): the in-place rebuild is what is left.
+/// `Err` when it cannot be built from the source gem
+/// ([`build_from_source_gem`]): the in-place rebuild is what is left, and
+/// the error holds the files that build is known to make in the gem's own
+/// tree ([`StageFailure::InTree`]), for [`rebuild`] to take out of its way.
 async fn rebuild_unpatched_from_source_gem(
     copy: &GemCopy,
     probe: &Probe,
     env: &RubyEnv,
-) -> Option<Result<(), String>> {
+) -> Result<Result<(), String>, Vec<String>> {
     let spec_text = crate::utils::fs::read_regular_to_string(&copy.spec_path)
         .await
-        .ok()?;
+        .map_err(|_| Vec::new())?;
     let facts = SpecFacts::of(&spec_text, &copy.full_name);
-    let source = facts.release.filter(|_| facts.extensions.declared)?;
+    let source = facts
+        .release
+        .filter(|_| facts.extensions.declared)
+        .ok_or_else(Vec::new)?;
     let gems = GemSource::of(&env.cwd, env.offline).await;
-    let archive = gems.archive(&copy.home, &source).await.ok()?;
+    let archive = gems
+        .archive(&copy.home, &source)
+        .await
+        .map_err(|_| Vec::new())?;
     let (stage, built) =
         match build_from_source_gem(copy, probe, &source, archive, &gems, env, None).await {
             Ok(staged) => staged,
-            Err(StageFailure::Busy(why)) => return Some(Err(why)),
-            Err(_) => return None,
+            Err(StageFailure::Busy(why)) => return Ok(Err(why)),
+            Err(StageFailure::InTree { created, .. }) => return Err(created),
+            Err(_) => return Err(Vec::new()),
         };
     let moved_in = {
         let (copy, probe) = (copy.clone(), probe.clone());
@@ -5001,7 +5052,7 @@ async fn rebuild_unpatched_from_source_gem(
         .await
     };
     close_stage(stage, copy).await;
-    Some(moved_in)
+    Ok(moved_in)
 }
 
 /// Put the backed-up original build back over socket-patch's build, then
@@ -7359,7 +7410,7 @@ mod tests {
 
         assert!(back_up_original(&copy, &probe, &[]).unwrap());
         let aside = set_aside(&copy, &probe).unwrap();
-        let snapshot = snapshot_tree(&copy, &record_paths()).unwrap();
+        let snapshot = snapshot_tree(&copy, &probe.extension_dir, &record_paths()).unwrap();
         build_in_tree(&copy, &probe);
         let changes = tree_changes(&copy, &snapshot);
         assert_eq!(
@@ -7373,9 +7424,9 @@ mod tests {
                 created: vec!["ext/a/mkmf.log".to_string()],
             }
         );
-        assert_eq!(stale_build(&copy, &probe, &scope, &[], &changes), None);
-        back_up_tree_changes(&copy, &snapshot, &changes).unwrap();
-        let in_tree = in_tree_artifacts(&copy, &probe, &changes);
+        assert_eq!(stale_build(&copy, &probe, &[], &snapshot, &changes), None);
+        back_up_tree_changes(&copy, &snapshot, &[], &changes).unwrap();
+        let in_tree = in_tree_artifacts(&copy, &probe, &[], &changes);
         assert_eq!(in_tree, ["ext/a/liba.bundle"]);
         commit_build(&copy, &probe, &scope, &record, &aside, &in_tree).unwrap();
         remove_dir_if_exists(&snapshot.dir).unwrap();
@@ -7396,14 +7447,14 @@ mod tests {
         // original of what the first replaced, and the file the first
         // added still goes with the restore.
         let aside = set_aside(&copy, &probe).unwrap();
-        let snapshot = snapshot_tree(&copy, &record_paths()).unwrap();
+        let snapshot = snapshot_tree(&copy, &probe.extension_dir, &record_paths()).unwrap();
         std::fs::write(copy.gem_dir.join("ext/a/liba.bundle"), b"built again").unwrap();
         std::fs::write(copy.gem_dir.join("ext/a/mkmf.log"), b"log 2").unwrap();
         std::fs::create_dir_all(&probe.extension_dir).unwrap();
         std::fs::write(probe.extension_dir.join(BUILD_COMPLETE), b"").unwrap();
         let changes = tree_changes(&copy, &snapshot);
-        back_up_tree_changes(&copy, &snapshot, &changes).unwrap();
-        let in_tree = in_tree_artifacts(&copy, &probe, &changes);
+        back_up_tree_changes(&copy, &snapshot, &[], &changes).unwrap();
+        let in_tree = in_tree_artifacts(&copy, &probe, &[], &changes);
         commit_build(&copy, &probe, &scope, &record, &aside, &in_tree).unwrap();
         remove_dir_if_exists(&snapshot.dir).unwrap();
 
@@ -7416,6 +7467,41 @@ mod tests {
         );
     }
 
+    /// A product taken out of the build's way and made again with the
+    /// bytes it had is attested like one that changed, so the backup holds
+    /// it too: the restore removes what a marker lists and the backup
+    /// does not, and this file is the gem's own.
+    #[test]
+    fn a_product_rebuilt_with_the_same_bytes_survives_the_restore() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (copy, probe) = in_tree_gem(tmp.path());
+        let (scope, record) = in_tree_scope();
+        let installed = (tree_bytes(&copy.gem_dir), tree_bytes(&probe.extension_dir));
+        let removed = ["ext/a/liba.bundle".to_string()];
+
+        assert!(back_up_original(&copy, &probe, &[]).unwrap());
+        let aside = set_aside(&copy, &probe).unwrap();
+        let snapshot = snapshot_tree(&copy, &probe.extension_dir, &record_paths()).unwrap();
+        std::fs::remove_file(copy.gem_dir.join(&removed[0])).unwrap();
+        std::fs::write(copy.gem_dir.join(&removed[0]), b"original library").unwrap();
+        std::fs::create_dir_all(&probe.extension_dir).unwrap();
+        std::fs::write(probe.extension_dir.join(BUILD_COMPLETE), b"").unwrap();
+        let changes = tree_changes(&copy, &snapshot);
+        assert_eq!(changes, TreeChanges::default());
+        back_up_tree_changes(&copy, &snapshot, &removed, &changes).unwrap();
+        let in_tree = in_tree_artifacts(&copy, &probe, &removed, &changes);
+        assert_eq!(in_tree, removed);
+        commit_build(&copy, &probe, &scope, &record, &aside, &in_tree).unwrap();
+        remove_dir_if_exists(&snapshot.dir).unwrap();
+
+        let marker = read_marker_sync(&copy.gem_dir);
+        restore_backup(&copy, marker.as_ref()).unwrap();
+        assert_eq!(
+            (tree_bytes(&copy.gem_dir), tree_bytes(&probe.extension_dir)),
+            installed
+        );
+    }
+
     /// A build that fails part-way has already written into the gem's own
     /// tree. The snapshot puts every file back, and goes.
     #[test]
@@ -7423,14 +7509,14 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let (copy, probe) = in_tree_gem(tmp.path());
         let installed = tree_bytes(&copy.gem_dir);
-        let snapshot = snapshot_tree(&copy, &record_paths()).unwrap();
+        let snapshot = snapshot_tree(&copy, &probe.extension_dir, &record_paths()).unwrap();
         build_in_tree(&copy, &probe);
         restore_tree(&copy, &snapshot.dir).unwrap();
         assert_eq!(tree_bytes(&copy.gem_dir), installed);
 
         // A snapshot that does not say which files it left out is not
         // used: it would take the record's files for the build's.
-        let snapshot = snapshot_tree(&copy, &record_paths()).unwrap();
+        let snapshot = snapshot_tree(&copy, &probe.extension_dir, &record_paths()).unwrap();
         std::fs::remove_file(snapshot.dir.join(SNAPSHOT_LEFT)).unwrap();
         build_in_tree(&copy, &probe);
         assert!(restore_tree(&copy, &snapshot.dir).is_err());
@@ -7438,47 +7524,51 @@ mod tests {
         assert!(copy.gem_dir.join("ext/a/mkmf.log").is_file());
     }
 
-    /// A build that exits cleanly and compiles nothing is not a rebuild of
-    /// a changed build input, and neither is one that leaves a product it
-    /// was made to build again unbuilt (#2105).
+    /// A build that exits cleanly and compiles nothing, over a tree that
+    /// keeps a library, has left Ruby the library that was there. So has
+    /// one that leaves a product it was made to build again unbuilt
+    /// (#2105). A gem with no library anywhere compiles nothing here, and
+    /// that is not stale.
     #[test]
     fn a_build_that_leaves_no_compiled_code_is_stale() {
         let tmp = tempfile::tempdir().unwrap();
         let (copy, probe) = in_tree_gem(tmp.path());
-        let (scope, _) = in_tree_scope();
-        let snapshot = snapshot_tree(&copy, &record_paths()).unwrap();
+        let snapshot = snapshot_tree(&copy, &probe.extension_dir, &record_paths()).unwrap();
 
         // Nothing changed, or only what Ruby does not load.
         let nothing = tree_changes(&copy, &snapshot);
         assert_eq!(nothing, TreeChanges::default());
-        let why = stale_build(&copy, &probe, &scope, &[], &nothing).unwrap();
+        let why = stale_build(&copy, &probe, &[], &snapshot, &nothing).unwrap();
         assert!(why.contains("compiled nothing"), "{why}");
         std::fs::write(copy.gem_dir.join("ext/a/mkmf.log"), b"log").unwrap();
         let log_only = tree_changes(&copy, &snapshot);
-        assert!(stale_build(&copy, &probe, &scope, &[], &log_only).is_some());
-        // A rebuild of no changed input (a rollback's) has nothing to show.
-        let unpatched = NativeScope {
-            inputs: Vec::new(),
-            ..scope.clone()
-        };
-        assert_eq!(stale_build(&copy, &probe, &unpatched, &[], &nothing), None);
+        assert!(stale_build(&copy, &probe, &[], &snapshot, &log_only).is_some());
         // An artifact in the extension dir is compiled code.
         std::fs::create_dir_all(probe.extension_dir.join("a")).unwrap();
         std::fs::write(probe.extension_dir.join("a/a.bundle"), b"built").unwrap();
-        assert_eq!(stale_build(&copy, &probe, &scope, &[], &nothing), None);
+        assert_eq!(stale_build(&copy, &probe, &[], &snapshot, &nothing), None);
         std::fs::remove_dir_all(probe.extension_dir.join("a")).unwrap();
 
-        // A product taken out of the build's way must be there again.
+        // A product taken out of the build's way must be there again, and
+        // is attested though its bytes are the ones it had.
         let removed = ["ext/a/liba.bundle".to_string()];
         assert_eq!(
-            stale_build(&copy, &probe, &scope, &removed, &nothing),
-            None,
-            "made again, with the same bytes or not"
+            stale_build(&copy, &probe, &removed, &snapshot, &nothing),
+            None
+        );
+        assert_eq!(
+            in_tree_artifacts(&copy, &probe, &removed, &nothing),
+            removed
         );
         std::fs::remove_file(copy.gem_dir.join("ext/a/liba.bundle")).unwrap();
         let gone = tree_changes(&copy, &snapshot);
-        let why = stale_build(&copy, &probe, &scope, &removed, &gone).unwrap();
+        let why = stale_build(&copy, &probe, &removed, &snapshot, &gone).unwrap();
         assert!(why.contains("ext/a/liba.bundle"), "{why}");
+
+        // No library in the tree and none built: nothing for Ruby to load.
+        let plain = snapshot_tree(&copy, &probe.extension_dir, &record_paths()).unwrap();
+        let nothing = tree_changes(&copy, &plain);
+        assert_eq!(stale_build(&copy, &probe, &[], &plain, &nothing), None);
     }
 
     /// A run that died during an in-place build left the gem's own tree
@@ -7493,7 +7583,7 @@ mod tests {
         let (copy, probe) = in_tree_gem(tmp.path());
         let mut installed = (tree_bytes(&copy.gem_dir), tree_bytes(&probe.extension_dir));
         let aside = set_aside(&copy, &probe).unwrap();
-        let snapshot = snapshot_tree(&copy, &record_paths()).unwrap();
+        let snapshot = snapshot_tree(&copy, &probe.extension_dir, &record_paths()).unwrap();
         std::fs::write(copy.gem_dir.join("ext/a/liba.bundle"), b"half").unwrap();
         std::fs::remove_file(copy.gem_dir.join("ext/a/a.o")).unwrap();
         std::fs::write(copy.gem_dir.join("ext/a/mkmf.log"), b"log").unwrap();
@@ -7510,7 +7600,7 @@ mod tests {
         );
         assert!(!snapshot.dir.exists());
 
-        let stale = snapshot_tree(&copy, &record_paths()).unwrap();
+        let stale = snapshot_tree(&copy, &probe.extension_dir, &record_paths()).unwrap();
         std::fs::write(copy.gem_dir.join("ext/a/liba.bundle"), b"committed").unwrap();
         assert!(!recover_interrupted_rebuild_sync(&copy, Some("lib")).unwrap());
         assert!(!stale.dir.exists());

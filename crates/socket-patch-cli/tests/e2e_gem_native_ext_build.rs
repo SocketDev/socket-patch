@@ -3048,6 +3048,7 @@ fn a_gem_that_loads_its_library_from_its_own_tree_is_rebuilt_in_place() {
     let fx = WrapGem::new(&abi, WRAP_EXTCONF);
     assert_eq!(fx.value(), "1");
     let installed = walk_files(&fx.gem_dir);
+    let extensions = walk_files(&fx.home.join("extensions"));
     let library = fx.library();
 
     let (code, stdout, stderr) = fx.run(&["apply", "--json", "--offline"]);
@@ -3059,7 +3060,6 @@ fn a_gem_that_loads_its_library_from_its_own_tree_is_rebuilt_in_place() {
     );
     assert_eq!(fx.c_file(), wrap_c(2));
     assert!(!fx.home.join(".socket-patch-build").exists());
-    assert!(!fx.gem_dir.join(".socket-patch-native-tree").exists());
     let marker: serde_json::Value = serde_json::from_str(
         &std::fs::read_to_string(fx.gem_dir.join(".socket-patch-native-build.json")).unwrap(),
     )
@@ -3087,6 +3087,7 @@ fn a_gem_that_loads_its_library_from_its_own_tree_is_rebuilt_in_place() {
     assert_eq!(code, 0, "rollback failed:\n{stdout}\n{stderr}");
     assert_eq!(fx.value(), "1", "Ruby must load the original library again");
     assert_tree(&fx.gem_dir, &installed, "after rollback");
+    assert_tree(&fx.home.join("extensions"), &extensions, "after rollback");
 }
 
 /// A build that takes the library it finds in the gem's tree for current
@@ -3120,6 +3121,27 @@ fn a_build_that_keeps_a_stale_library_is_made_to_rebuild_it() {
     assert_eq!(code, 0, "rollback failed:\n{stdout}\n{stderr}");
     assert_eq!(fx.value(), "1", "Ruby must load the original library again");
     assert_tree(&fx.gem_dir, &installed, "after rollback");
+
+    // A rollback that has lost the backup rebuilds from the restored
+    // source, and that build must not take the patched library for
+    // current either. (The first rollback dropped the record.)
+    write_record(
+        &fx.proj.join(".socket"),
+        WRAP_PURL,
+        &[(WRAP_C_KEY, Some(&wrap_c(1)), &wrap_c(2))],
+    );
+    let (code, stdout, stderr) = fx.run(&["apply", "--json", "--offline"]);
+    assert_eq!(code, 0, "apply failed:\n{stdout}\n{stderr}");
+    assert_eq!(fx.value(), "2");
+    std::fs::remove_dir_all(fx.gem_dir.join(".socket-patch-native-orig")).unwrap();
+    let (code, stdout, stderr) = fx.run(&["rollback", "--json", "--offline"]);
+    assert_eq!(code, 0, "rollback failed:\n{stdout}\n{stderr}");
+    assert_eq!(
+        fx.value(),
+        "1",
+        "the library is rebuilt from the restored source:\n{stdout}"
+    );
+    assert_eq!(fx.c_file(), wrap_c(1));
 }
 
 /// Without the source gem nothing says which files the build makes, so
