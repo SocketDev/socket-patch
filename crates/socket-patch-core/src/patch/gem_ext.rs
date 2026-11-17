@@ -1617,9 +1617,11 @@ fn recover_interrupted_rebuild_sync(
         // An in-place build was under way: the gem's own tree goes back to
         // what it was before it ([`TreeSnapshot`]), whichever way the
         // extension dir is settled, since no marker speaks for what the
-        // build left there.
+        // build left there. Unless one does: a run that died after it
+        // recorded the build, before it dropped the parked one, left a
+        // finished build that stands with its tree.
         let snapshot = tree_snapshot_path(&ext);
-        let in_place = is_real_dir(&snapshot);
+        let in_place = is_real_dir(&snapshot) && !build_committed_since(copy, &ext, &snapshot);
         if in_place {
             restore_tree(copy, &snapshot)?;
         }
@@ -2585,6 +2587,30 @@ fn restore_tree(copy: &GemCopy, snapshot_dir: &Path) -> std::io::Result<()> {
         }
     }
     remove_dir_if_exists(snapshot_dir)
+}
+
+/// Whether the in-place build that took the snapshot at `snapshot` was
+/// committed: the extension dir `ext` is a finished build, and the copy's
+/// marker was written after the snapshot was taken and still names, hash
+/// for hash, what is in the gem's tree. ([`commit_build`] writes the
+/// marker before it drops the parked build, and the snapshot goes after
+/// both.)
+fn build_committed_since(copy: &GemCopy, ext: &Path, snapshot: &Path) -> bool {
+    let written = |path: &Path| std::fs::symlink_metadata(path).and_then(|meta| meta.modified());
+    let (Ok(marked), Ok(taken)) = (written(&copy.gem_dir.join(MARKER_FILE)), written(snapshot))
+    else {
+        return false;
+    };
+    ext.join(BUILD_COMPLETE).is_file()
+        && marked >= taken
+        && read_marker_sync(&copy.gem_dir).is_some_and(|marker| {
+            !marker.grafted
+                && marker.lib_artifacts.iter().all(|(rel, hash)| {
+                    is_safe_relative_subpath(rel)
+                        && compute_file_git_sha256_sync(&copy.gem_dir.join(rel))
+                            .is_ok_and(|now| &now == hash)
+                })
+        })
 }
 
 /// Drop what a run that died left of a [`TreeSnapshot`] of `copy`, once no
@@ -7465,6 +7491,38 @@ mod tests {
             installed,
             "the gem is as `gem install` left it"
         );
+    }
+
+    /// A run that died after it recorded an in-place build, before it
+    /// dropped the parked one and the snapshot, left a finished build. The
+    /// next run keeps it with its tree: putting the old library back
+    /// under the new marker would leave the gem running unpatched code.
+    #[test]
+    fn a_committed_in_place_build_is_not_undone_by_the_next_run() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (copy, probe) = in_tree_gem(tmp.path());
+        let (scope, record) = in_tree_scope();
+        let parked = parked_build_path(&probe.extension_dir);
+
+        assert!(back_up_original(&copy, &probe, &[]).unwrap());
+        let aside = set_aside(&copy, &probe).unwrap();
+        let snapshot = snapshot_tree(&copy, &probe.extension_dir, &record_paths()).unwrap();
+        build_in_tree(&copy, &probe);
+        let changes = tree_changes(&copy, &snapshot);
+        back_up_tree_changes(&copy, &snapshot, &[], &changes).unwrap();
+        let in_tree = in_tree_artifacts(&copy, &probe, &[], &changes);
+        commit_build(&copy, &probe, &scope, &record, &aside, &in_tree).unwrap();
+        drop(aside);
+        // As the run that died left it: the parked build still there.
+        std::fs::create_dir_all(&parked).unwrap();
+        let built = tree_bytes(&copy.gem_dir);
+
+        assert!(recover_interrupted_rebuild_sync(&copy, Some("lib")).unwrap());
+        assert_eq!(tree_bytes(&copy.gem_dir), built);
+        assert!(!parked.exists());
+        assert!(!snapshot.dir.exists());
+        let marker = read_marker_sync(&copy.gem_dir).unwrap();
+        assert!(marker_holds(&marker, &copy, &scope, &record));
     }
 
     /// A product taken out of the build's way and made again with the
