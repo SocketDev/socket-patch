@@ -181,3 +181,5 @@ Documented limitations and verified false positives. One bullet each. Search thi
 - `digest-crc`'s `crc12_3gpp_ext.so` is built but never required by the gem (there is no `lib/digest/crc12_3gpp.rb`). Use `crc32` to observe a patch; the no-op rebuild itself is #2105 (2026-11-17).
 - An agent rebuild of precompiled nokogiri links the system `liblzma` / `libz` and `libruby` dynamically, unlike the self-contained prebuilt binary. That is what `gem install --platform ruby` gives on the same machine; not filed (2026-11-17).
 - `apply --check` exits 0 after printing "Patches are OUT OF SYNC" only when piped through `tail`; the exit code read was `tail`'s. Read `${PIPESTATUS[0]}` (2026-11-17).
+- Bundler 1.x is not refused anywhere: the docs describe the 1.17 merged-`GEM` lock as a supported shape, and hosted, vendored and agent all pass on 1.17.3 (11-17). Do not file "1.x not refused".
+- A failed native rebuild (no compiler, missing dev library, `--offline` without the source gem) leaves the gem byte-identical; only the message is at fault (#2117).
