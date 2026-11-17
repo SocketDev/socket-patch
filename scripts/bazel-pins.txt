@@ -4,8 +4,8 @@
 #
 # Read by scripts/install-bazel.sh, which installs nothing that is not listed
 # here. Platforms use the spelling of Bazel's release files. A release that
-# .github/workflows/bazel-compatibility.yml runs needs a line for each
-# platform it runs on.
+# a caller of .github/workflows/bazel-compatibility.yml runs (bazel-go.yml
+# and its siblings) needs a line for each platform it runs on.
 #
 # Each digest is the published `.sha256` sibling of the release file:
 #   https://releases.bazel.build/<version>/release/bazel-<version>-<platform>.sha256
