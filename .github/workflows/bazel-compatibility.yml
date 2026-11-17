@@ -170,15 +170,19 @@ jobs:
         # The ecosystem's module holds one `#[ignore]` test per flow, and a
         # test takes its release from the Bazel installed above, so the
         # filter is the module's name and nothing is derived from the
-        # release. The first command lists the tests of the filter and fails
-        # when there is none: a module name that matches nothing would run
-        # no test and pass. Two tests at a time: each runs a Bazel server of
-        # its own.
+        # release. The tests are chosen by the module's name as a prefix and
+        # run by their exact names: a test filter is a substring, and `go::`
+        # is also inside `cargo::`. The step fails when the module has no
+        # test: a name that matches nothing would run no test and pass. Two
+        # tests at a time: each runs a Bazel server of its own.
         run: |
+          names=$(cargo test --locked -p socket-patch-cli --test e2e_bazel_build -- \
+            --ignored --list | sed -n "s/^\(${ECO}::.*\): test\$/\1/p")
+          test -n "$names"
+          echo "$names"
+          # shellcheck disable=SC2086 # one test name per word
           cargo test --locked -p socket-patch-cli --test e2e_bazel_build -- \
-            --ignored "${ECO}::" --list | grep ': test$'
-          cargo test --locked -p socket-patch-cli --test e2e_bazel_build -- \
-            --ignored "${ECO}::" --test-threads=2 --nocapture
+            --ignored --exact $names --test-threads=2 --nocapture
 
       - name: Save the repository cache
         # The first leg of an era to finish on main saves it. Another leg
