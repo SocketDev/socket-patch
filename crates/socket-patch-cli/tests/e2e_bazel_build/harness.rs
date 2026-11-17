@@ -1034,11 +1034,30 @@ fn a_downloader_config_is_named_by_the_option_of_the_release() {
 /// then plays the shell of a developer.
 const PLAYS_THE_SHELL: &str = "SOCKET_PATCH_BAZEL_E2E_PLAYS_THE_SHELL";
 
-/// What such a shell has set that must not reach a Bazel child: every name
-/// of [`REMOVED`], one name under each of [`REMOVED_PREFIXES`], and what
-/// each scrub of [`EXTRAS`] removes.
+/// What such a shell has set that must not reach a Bazel child. Written
+/// out, not read from [`REMOVED`] and [`REMOVED_PREFIXES`]: a name dropped
+/// from either list, or from a scrub of [`EXTRAS`], fails the test.
 fn settings_of_a_shell() -> Vec<String> {
-    let scrubbed = [
+    let names = [
+        // `REMOVED`.
+        "TEST_TMPDIR",
+        "XDG_CACHE_HOME",
+        "XDG_CONFIG_HOME",
+        "XDG_DATA_HOME",
+        "XDG_STATE_HOME",
+        "CI",
+        "GITHUB_ACTIONS",
+        "GEM_HOME",
+        "GEM_PATH",
+        "NODE_OPTIONS",
+        "NODE_PATH",
+        "PYTHONHOME",
+        "PYTHONPATH",
+        "PYTHONSTARTUP",
+        // One name under each of `REMOVED_PREFIXES`.
+        "BAZELISK_SETTING",
+        "PIP_SETTING",
+        "UV_SETTING",
         // `Extra::Go`.
         "GOFLAGS",
         "GOWORK",
@@ -1055,11 +1074,15 @@ fn settings_of_a_shell() -> Vec<String> {
         // `Extra::Venv`.
         "VIRTUAL_ENV",
     ];
-    let named = REMOVED.iter().chain(&scrubbed).map(|name| name.to_string());
-    let prefixed = REMOVED_PREFIXES
-        .iter()
-        .map(|prefix| format!("{prefix}SETTING"));
-    named.chain(prefixed).collect()
+    // The other direction: a name added to a list is added here too.
+    for name in REMOVED {
+        assert!(names.contains(name), "{name} is removed and not tested");
+    }
+    for prefix in REMOVED_PREFIXES {
+        let tested = names.iter().any(|name| name.starts_with(prefix));
+        assert!(tested, "{prefix}* is removed and not tested");
+    }
+    names.iter().map(|name| name.to_string()).collect()
 }
 
 /// A child of [`child`] sees none of the tool settings of the process that
