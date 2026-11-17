@@ -1,95 +1,78 @@
-name: Bazel patch compatibility
+name: Bazel patch compatibility (legs)
 
-# socket-patch in a Bazel workspace, on a real Bazel: one leg per Bazel
-# release and ecosystem runs the `#[ignore]` tests of that ecosystem's module
-# of `e2e_bazel_build` (`go::`) on the release it installed. A test builds a
-# fixture workspace, runs the built binary in it and reads the result from
-# what Bazel builds next; the test code says which fixture files go with
-# which release.
+# socket-patch in a Bazel workspace, on a real Bazel: the legs of one
+# ecosystem. One leg per Bazel release runs the `#[ignore]` tests of the
+# ecosystem's module of `e2e_bazel_build` (`go::`) on the release it
+# installed. A test builds a fixture workspace, runs the built binary in it
+# and reads the result from what Bazel builds next; the test code says which
+# fixture files go with which release.
+#
+# This is a reusable workflow, and nothing starts it but a caller. Each
+# ecosystem has one (bazel-go.yml), which says when its legs run (its
+# triggers and path lists, its concurrency group) and on which Bazel
+# releases (the inputs below). Another ecosystem is one more caller, and no
+# change here or in another ecosystem's caller. A called workflow runs with
+# the event, the ref and the token of its caller: every `github.*` below is
+# the caller's, the token is the `contents: read` the caller grants, and the
+# file is the one of the caller's commit, so a pull request that changes it
+# runs its own version.
 #
 # The package under test and every Socket host are loopback stand-ins. A leg
 # still needs the network for the ruleset and the toolchain: github.com and
 # release-assets.githubusercontent.com (the Bazel release, cached per
-# release, and the ruleset archives), dl.google.com (the Go SDK) and, on
-# every run, bcr.bazel.build (the registry) and go.dev (the Go release
-# list). A repository cache saved from main holds the archives and the SDK.
-# A Ruby leg (`ruby::`) downloads no Go SDK. It needs the prebuilt Ruby of
-# bazel-contrib/portable-ruby from GitHub (90 MB on Linux), cdn.azul.com
-# (the JDK that the rules of rules_ruby resolve and never run, 210 MB) and
-# rubygems.org (the bundler gem), all of them held by its repository cache.
+# release, and the ruleset archives), bcr.bazel.build (the registry) on
+# every run, and the hosts of the ecosystem's toolchain, which its caller
+# names. A repository cache saved from main holds the archives and the
+# toolchain.
 #
-# Not required for merge: no `merge_group` trigger, and no job here is a
-# `needs` of ci.yml's `ci-ok`. Setting the repository variable
-# BAZEL_COMPAT_DISABLED to `true` turns every leg off without a merge.
+# Not required for merge: no caller has a `merge_group` trigger, and no job
+# here is a `needs` of ci.yml's `ci-ok`. Setting the repository variable
+# BAZEL_COMPAT_DISABLED to `true` turns every leg of every ecosystem off
+# without a merge.
 #
 # To add a Bazel release: one line per platform in scripts/bazel-pins.txt
-# and one matrix line here. To add an ecosystem: its module in
-# `e2e_bazel_build` and one matrix line per release.
+# and one line of `releases` in each caller that runs it.
 #
 # No job has a `name:`. GitHub does not expand a matrix expression in the
 # name of a job that its `if` skips, so such a name shows up as its source
-# text in a pull request's checks. The default title of a leg is the job's
-# id and its matrix values: `bazel (ubuntu-latest, 9.3.2, go, gazelle)`.
+# text in a pull request's checks. The default title of a leg is the
+# caller's job, the job's id here and its matrix values:
+# `go / bazel (9.3.2, e9)`.
 
 on:
-  pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
-    # The suite's own files and the Go files its tests run through, as
-    # go-compatibility.yml lists them. Shared engine code
-    # (patch/redirect/mod.rs, hosted/, commands/) gets its run on push to
-    # main (when it is in the push filter below) or nightly, or on demand
-    # via workflow_dispatch on the PR branch.
-    paths:
-      - '.github/workflows/bazel-compatibility.yml'
-      - 'scripts/install-bazel.sh'
-      - 'scripts/bazel-pins.txt'
-      - 'crates/socket-patch-cli/tests/e2e_bazel_build/**'
-      - 'crates/socket-patch-cli/tests/fixtures/bazel/**'
-      - 'crates/*/src/**/*golang*'
-      - 'crates/*/src/**/*golang*/**'
-      - 'crates/socket-patch-core/src/vendor/go*.rs'
-      # The RubyGems files, by the same name pattern; no workflow of their
-      # own lists them.
-      - 'crates/*/src/**/*gem*'
-      - 'crates/*/src/**/*gem*/**'
-  push:
-    branches: [main]
-    # The PR paths, the shared engine code and test helpers the tests run
-    # through, and the toolchain files. A main push outside this set waits
-    # for the nightly run below.
-    paths:
-      - '.github/workflows/bazel-compatibility.yml'
-      - 'scripts/install-bazel.sh'
-      - 'scripts/bazel-pins.txt'
-      - 'crates/socket-patch-cli/tests/e2e_bazel_build/**'
-      - 'crates/socket-patch-cli/tests/fixtures/bazel/**'
-      - 'crates/*/src/**/*golang*'
-      - 'crates/*/src/**/*golang*/**'
-      - 'crates/socket-patch-core/src/vendor/go*.rs'
-      - 'crates/*/src/**/*gem*'
-      - 'crates/*/src/**/*gem*/**'
-      - 'crates/socket-patch-core/src/patch/redirect/**'
-      - 'crates/socket-patch-core/src/hosted/**'
-      - 'crates/socket-patch-cli/src/commands/**'
-      - 'crates/socket-patch-cli/tests/common/**'
-      - 'crates/socket-patch-cli/tests/hosted_memory_common/**'
-      - 'Cargo.lock'
-      - 'Cargo.toml'
-      - 'crates/*/Cargo.toml'
-      - 'rust-toolchain.toml'
-      - '.cargo/**'
-  schedule:
-    # Nightly, so a main change outside the push filter still gets a run
-    # within a day.
-    - cron: '17 4 * * *'
-  workflow_dispatch:
+  workflow_call:
+    inputs:
+      eco:
+        description: >-
+          The ecosystem's module of the `e2e_bazel_build` test target
+          (`go`). A leg runs the `#[ignore]` tests of that module.
+        required: true
+        type: string
+      fixtures:
+        description: >-
+          The ecosystem's fixture, a directory under
+          crates/socket-patch-cli/tests/fixtures/bazel (`gazelle/bzlmod`).
+        required: true
+        type: string
+      releases:
+        description: >-
+          The Linux legs, as a JSON list with one
+          {"bazel": "<release>", "era": "<directory>"} per leg: a Bazel
+          release that scripts/bazel-pins.txt pins, and the directory of the
+          fixture that holds the `MODULE.bazel` this release builds. The
+          test code decides the era of a release, and the hermetic test of
+          the ecosystem's module fails when a leg names another.
+        required: true
+        type: string
+      macos:
+        description: >-
+          The macOS legs, in the same form. They run nightly and on demand
+          only.
+        required: true
+        type: string
 
 permissions:
   contents: read
-
-concurrency:
-  group: bazel-compat-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   SOCKET_NO_CONFIG: '1'
@@ -102,17 +85,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          # `eco`: the ecosystem's module of the test target. `fixtures`:
-          # its directory under tests/fixtures/bazel, which keys its
-          # repository cache.
-          - {os: ubuntu-latest, bazel: '9.3.2', eco: go, fixtures: gazelle}
-          - {os: ubuntu-latest, bazel: '8.8.2', eco: go, fixtures: gazelle}
-          - {os: ubuntu-latest, bazel: '7.7.2', eco: go, fixtures: gazelle}
-          - {os: ubuntu-latest, bazel: '9.3.2', eco: ruby, fixtures: rules_ruby}
-          - {os: ubuntu-latest, bazel: '8.8.2', eco: ruby, fixtures: rules_ruby}
-          - {os: ubuntu-latest, bazel: '7.7.2', eco: ruby, fixtures: rules_ruby}
-    runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS != 'true' && (matrix.os == 'ubuntu-latest' && 'depot-ubuntu-24.04-4' || matrix.os == 'ubuntu-22.04' && 'depot-ubuntu-22.04-4') || matrix.os }}
+        include: ${{ fromJSON(inputs.releases) }}
+    runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS == 'true' && 'ubuntu-latest' || 'depot-ubuntu-24.04-4' }}
     timeout-minutes: 45
     steps: &bazel-steps
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -128,12 +102,14 @@ jobs:
 
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
-          shared-key: dev-${{ matrix.os }}
+          # The key the other workflows give the runner image of this job.
+          shared-key: dev-${{ runner.os == 'macOS' && 'macos-latest' || 'ubuntu-latest' }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Restore the Bazel ${{ matrix.bazel }} binary
         # The installer checks a restored file against its pin too, so a
-        # miss or a stale entry only means a download. Saved from main.
+        # miss or a stale entry only means a download. Saved from main, and
+        # shared by every ecosystem that runs the release.
         id: bazel-dist
         uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
         timeout-minutes: 5
@@ -161,43 +137,53 @@ jobs:
           key: ${{ steps.bazel-dist.outputs.cache-primary-key }}
 
       - name: Restore the repository cache
-        # What Bazel downloads for the fixtures: ruleset archives and the
-        # language toolchain (about 100 MB for Go). Keyed by the
-        # ecosystem's fixtures, which pin all of it, so another ecosystem's
-        # fixture does not make this leg save a new copy; a run whose
-        # fixtures changed starts from the newest cache of its leg. The
-        # cache is content-addressed, so an older one is still correct,
-        # only incomplete. The package under test never comes from it: `go`
-        # fetches a module into the output base, which every test makes anew.
-        # For Ruby it is about 350 MB, and a gem under test cannot come from
-        # it either: Bazel is given no checksum to look one up by.
+        # What Bazel downloads for the fixture: the ruleset archives and the
+        # language toolchain. One cache per ecosystem and fixture era, keyed
+        # by the files that pin all of it: `common` and the era's
+        # directory. The legs of one era share it, whatever their Bazel
+        # release, and another era or another ecosystem never makes a leg
+        # save a new copy. A run whose fixture changed starts from the
+        # newest cache of its era. The cache is content-addressed, so an
+        # older one, or one that another release of the era saved, is still
+        # correct, only incomplete: a leg downloads what it lacks, which for
+        # a second release of an era is what that Bazel resolves for its own
+        # built-in modules. Whether the package under test can come from it
+        # is the ecosystem's matter, and its test says how it rules that out.
         id: bazel-repos
         uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
         timeout-minutes: 5
         continue-on-error: true
         with:
           path: ${{ runner.temp }}/bazel-repos
-          key: bazel-repos-${{ matrix.eco }}-${{ matrix.bazel }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles(format('crates/socket-patch-cli/tests/fixtures/bazel/{0}/**', matrix.fixtures)) }}
+          key: bazel-repos-${{ inputs.eco }}-${{ matrix.era }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles(format('crates/socket-patch-cli/tests/fixtures/bazel/{0}/common/**', inputs.fixtures), format('crates/socket-patch-cli/tests/fixtures/bazel/{0}/{1}/**', inputs.fixtures, matrix.era)) }}
           restore-keys: |
-            bazel-repos-${{ matrix.eco }}-${{ matrix.bazel }}-${{ runner.os }}-${{ runner.arch }}-
+            bazel-repos-${{ inputs.eco }}-${{ matrix.era }}-${{ runner.os }}-${{ runner.arch }}-
 
-      - name: Run the ${{ matrix.eco }} tests on Bazel ${{ matrix.bazel }}
+      - name: Run the ${{ inputs.eco }} tests on Bazel ${{ matrix.bazel }}
         env:
           # A missing Bazel fails the leg instead of printing SKIP, and so
           # does a Bazel that is not the release of this leg.
           SOCKET_PATCH_BAZEL_E2E_REQUIRED: '1'
           SOCKET_PATCH_BAZEL_E2E_VERSION: ${{ matrix.bazel }}
           SOCKET_PATCH_BAZEL_E2E_REPO_CACHE: ${{ runner.temp }}/bazel-repos
-          ECO: ${{ matrix.eco }}
+          ECO: ${{ inputs.eco }}
         # The ecosystem's module holds one `#[ignore]` test per flow, and a
         # test takes its release from the Bazel installed above, so the
         # filter is the module's name and nothing is derived from the
-        # release. Two tests at a time: each runs a Bazel server of its own.
+        # release. The first command lists the tests of the filter and fails
+        # when there is none: a module name that matches nothing would run
+        # no test and pass. Two tests at a time: each runs a Bazel server of
+        # its own.
         run: |
+          cargo test --locked -p socket-patch-cli --test e2e_bazel_build -- \
+            --ignored "${ECO}::" --list | grep ': test$'
           cargo test --locked -p socket-patch-cli --test e2e_bazel_build -- \
             --ignored "${ECO}::" --test-threads=2 --nocapture
 
       - name: Save the repository cache
+        # The first leg of an era to finish on main saves it. Another leg
+        # of the era that also missed finds the key taken, which the action
+        # logs without failing the step.
         if: >-
           github.ref == 'refs/heads/main'
           && steps.bazel-repos.outputs.cache-hit != 'true'
@@ -207,16 +193,14 @@ jobs:
           path: ${{ runner.temp }}/bazel-repos
           key: ${{ steps.bazel-repos.outputs.cache-primary-key }}
 
-  # The macOS rows of `bazel`: nightly and on demand, never on a pull
-  # request or a push, so they do not queue on the small macOS runner pool.
+  # The macOS legs: nightly and on demand, never on a pull request or a
+  # push, so they do not queue on the small macOS runner pool.
   bazel-macos:
     if: (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && vars.BAZEL_COMPAT_DISABLED != 'true'
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - {os: macos-latest, bazel: '9.3.2', eco: go, fixtures: gazelle}
-          - {os: macos-latest, bazel: '9.3.2', eco: ruby, fixtures: rules_ruby}
-    runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS != 'true' && (matrix.os == 'ubuntu-latest' && 'depot-ubuntu-24.04-4' || matrix.os == 'ubuntu-22.04' && 'depot-ubuntu-22.04-4') || matrix.os }}
+        include: ${{ fromJSON(inputs.macos) }}
+    runs-on: macos-latest
     timeout-minutes: 45
     steps: *bazel-steps
