@@ -5296,7 +5296,15 @@ fn stage_warm_install(fx: &RedirectFixture, name: &str) -> PathBuf {
 /// (`install`, `--redownload`, `pristine`, a frozen install) must succeed
 /// and keep it: before the refresh they kept the upstream bytes, failed on
 /// the pinned checksum (exit 37), or left the gem dir deleted.
-async fn scan_refreshes_a_warm_install(tag: &str, checksums_lock: bool) {
+///
+/// `agent_patched` (#2089): agent mode patched the installed gem in place
+/// before the hosted scan, and its manifest record proves it. The files
+/// are the patched ones already, but the archive RubyGems reinstalls from
+/// is still the upstream one, so `pristine` and `--redownload` removed the
+/// gem and failed on the lock's checksum, or brought the unpatched gem
+/// back. The scan must replace that archive, and leave the gem dir (where
+/// agent mode keeps a native gem's original build) as it is.
+async fn scan_refreshes_a_warm_install(tag: &str, checksums_lock: bool, agent_patched: bool) {
     let Some(fx) = redirect_scanned_project(
         tag,
         Spelling::Gemfile,
@@ -5316,6 +5324,27 @@ async fn scan_refreshes_a_warm_install(tag: &str, checksums_lock: bool) {
         orig_lib().into_bytes(),
         "premise: the upstream gem is installed before the scan"
     );
+    // A file of agent mode's own inside the gem dir.
+    let kept_in_gem_dir = agent_patched.then(|| {
+        lib.parent()
+            .and_then(Path::parent)
+            .expect("<gem dir>/lib/<file>")
+            .join(".socket-patch-kept")
+    });
+    if agent_patched {
+        // What `scan --mode agent` leaves: the lib patched in place, the
+        // record of it, and both blobs.
+        std::fs::write(&lib, patched_lib()).unwrap();
+        common::write_in_place_patch_record(
+            &dir.join(".socket"),
+            PURL,
+            UUID,
+            "lib/vuln_gem.rb",
+            orig_lib().as_bytes(),
+            patched_lib().as_bytes(),
+        );
+        std::fs::write(kept_in_gem_dir.as_ref().unwrap(), "kept").unwrap();
+    }
 
     let api = fx._server.uri();
     let (code, stdout, stderr) = run_hosted_scan(&dir, &api);
@@ -5338,6 +5367,12 @@ async fn scan_refreshes_a_warm_install(tag: &str, checksums_lock: bool) {
         patched_lib().into_bytes(),
         "the installed gem is the patched one right after the scan"
     );
+    if let Some(kept) = &kept_in_gem_dir {
+        assert!(
+            kept.is_file(),
+            "only the archive beside a gem patched in place is replaced"
+        );
+    }
 
     // With no CHECKSUMS section the scan leaves the lock for one unfrozen
     // `bundle install` to converge (`redirect_gem_frozen_install`); with
@@ -5384,14 +5419,28 @@ async fn scan_refreshes_a_warm_install(tag: &str, checksums_lock: bool) {
 #[ignore = "host capstone: shells out to a real ruby/gem/bundler (>= 1.17); \
             the unpinned `test` job skips it, an e2e job with a pinned toolchain runs it via --ignored"]
 async fn gem_hosted_scan_refreshes_a_warm_install() {
-    scan_refreshes_a_warm_install("warm-refresh", false).await;
+    scan_refreshes_a_warm_install("warm-refresh", false, false).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "host capstone: shells out to a real ruby/gem/bundler (>= 2.6 for the CHECKSUMS lock); \
             the unpinned `test` job skips it, an e2e job with a pinned toolchain runs it via --ignored"]
 async fn gem_hosted_scan_refreshes_a_warm_install_with_a_checksums_lock() {
-    scan_refreshes_a_warm_install("warm-refresh-checksums", true).await;
+    scan_refreshes_a_warm_install("warm-refresh-checksums", true, false).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "host capstone: shells out to a real ruby/gem/bundler (>= 1.17); \
+            the unpinned `test` job skips it, an e2e job with a pinned toolchain runs it via --ignored"]
+async fn gem_hosted_scan_refreshes_an_agent_patched_warm_install() {
+    scan_refreshes_a_warm_install("warm-refresh-agent", false, true).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "host capstone: shells out to a real ruby/gem/bundler (>= 2.6 for the CHECKSUMS lock); \
+            the unpinned `test` job skips it, an e2e job with a pinned toolchain runs it via --ignored"]
+async fn gem_hosted_scan_refreshes_an_agent_patched_warm_install_with_a_checksums_lock() {
+    scan_refreshes_a_warm_install("warm-refresh-agent-checksums", true, true).await;
 }
 
 /// The vendored half of the patch API for the fixture's patch: the
