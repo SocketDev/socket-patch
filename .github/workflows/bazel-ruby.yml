@@ -1,0 +1,140 @@
+name: Bazel patch compatibility (RubyGems)
+
+# The RubyGems flow of the real-Bazel tests (`ruby::` in `e2e_bazel_build`):
+# hosted mode for a gem that rules_ruby's `ruby.bundle_fetch` reads from
+# `Gemfile` and `Gemfile.lock`, on each Bazel release below.
+# bazel-compatibility.yml holds the legs and what every ecosystem shares;
+# this file says when the Ruby legs run and on which releases.
+#
+# Beyond what every leg needs, a Ruby leg downloads the prebuilt Ruby of
+# bazel-contrib/portable-ruby from GitHub (about 90 MB on Linux) and the
+# bundler gem from rubygems.org, both held by its repository cache. It
+# downloads no JDK and needs none on the runner: rules_ruby's rules name a
+# Java runtime toolchain that only JRuby uses, and the fixture registers
+# one with nothing behind it. A gem under test never comes from the
+# repository cache: the fixture names no `gem_checksums`, so rules_ruby
+# gives Bazel no checksum for a gem, and Bazel looks a file up in that
+# cache by its checksum only.
+#
+# Not required for merge: no `merge_group` trigger, and no job here is a
+# `needs` of ci.yml's `ci-ok`.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    # What a pull request run covers: the RubyGems flow and its fixture, the
+    # harness and the workflows that run it, the Bazel installer and its
+    # pins, and the RubyGems files that `scan --mode hosted` and `rollback`
+    # run through in the fixture, each by its own path: the readers of a
+    # Bundler lock and a Gemfile with the lock half of the hosted rewrite
+    # (formats/gem), lock discovery, the lock inventory, the Ruby crawler
+    # (it says which lock Bundler loads), the upstream restore of
+    # `rollback`, and the stale-install guard that both commands end with.
+    # Each file has the directory of its name beside it, so a file that is
+    # split into one stays covered. Nothing another ecosystem's flow owns
+    # is here, so a change to one ecosystem starts that ecosystem's legs
+    # only.
+    #
+    # What it does not cover: shared engine code. The other half of the
+    # hosted rewrite is there (`rewrite_gem` and its planner in
+    # patch/redirect/mod.rs, the file of every ecosystem's rewriter), and
+    # so are patch/redirect/grant.rs, hosted/engine.rs and
+    # commands/scan/hosted.rs, the shared test helpers and the toolchain
+    # files. vendor/gem.rs is the vendored backend, which the flow only
+    # borrows two readers of a `gem` line from. A change to one of those
+    # gets its run on the push to main (when the file is in the list below)
+    # or in the nightly run, not on the pull request: that is the price of
+    # not running every ecosystem's legs on every shared change. The flow
+    # does not run the native extension rebuild of agent mode
+    # (patch/gem_ext.rs, patch/gem_source.rs), which is in neither list. On
+    # demand, workflow_dispatch runs the legs on any branch.
+    paths:
+      - '.github/workflows/bazel-ruby.yml'
+      - '.github/workflows/bazel-compatibility.yml'
+      - 'scripts/install-bazel.sh'
+      - 'scripts/bazel-pins.txt'
+      - 'crates/socket-patch-cli/tests/e2e_bazel_build/ruby.rs'
+      - 'crates/socket-patch-cli/tests/e2e_bazel_build/harness.rs'
+      - 'crates/socket-patch-cli/tests/fixtures/bazel/rules_ruby/**'
+      - 'crates/socket-patch-core/src/formats/gem/**'
+      - 'crates/socket-patch-core/src/vex/discover/gem.rs'
+      - 'crates/socket-patch-core/src/vex/discover/gem/**'
+      - 'crates/socket-patch-core/src/vendor/lock_inventory/gem.rs'
+      - 'crates/socket-patch-core/src/vendor/lock_inventory/gem/**'
+      - 'crates/socket-patch-core/src/crawlers/ruby_crawler.rs'
+      - 'crates/socket-patch-core/src/crawlers/ruby_crawler/**'
+      - 'crates/socket-patch-core/src/patch/redirect/upstream/gem.rs'
+      - 'crates/socket-patch-core/src/patch/redirect/upstream/gem/**'
+      - 'crates/*/src/**/gem_refresh.rs'
+      - 'crates/*/src/**/gem_refresh/**'
+  push:
+    branches: [main]
+    # The pull request paths, and what only a push to main covers: the
+    # root of the test target (it changes when an ecosystem's module is
+    # added; ci.yml builds the target and runs its hermetic tests on every
+    # pull request), the vendored backend, the shared engine code and test
+    # helpers the flow runs through, and the toolchain files. A main push
+    # outside this list waits for the nightly run below.
+    paths:
+      - '.github/workflows/bazel-ruby.yml'
+      - '.github/workflows/bazel-compatibility.yml'
+      - 'scripts/install-bazel.sh'
+      - 'scripts/bazel-pins.txt'
+      - 'crates/socket-patch-cli/tests/e2e_bazel_build/ruby.rs'
+      - 'crates/socket-patch-cli/tests/e2e_bazel_build/harness.rs'
+      - 'crates/socket-patch-cli/tests/fixtures/bazel/rules_ruby/**'
+      - 'crates/socket-patch-core/src/formats/gem/**'
+      - 'crates/socket-patch-core/src/vex/discover/gem.rs'
+      - 'crates/socket-patch-core/src/vex/discover/gem/**'
+      - 'crates/socket-patch-core/src/vendor/lock_inventory/gem.rs'
+      - 'crates/socket-patch-core/src/vendor/lock_inventory/gem/**'
+      - 'crates/socket-patch-core/src/crawlers/ruby_crawler.rs'
+      - 'crates/socket-patch-core/src/crawlers/ruby_crawler/**'
+      - 'crates/socket-patch-core/src/patch/redirect/upstream/gem.rs'
+      - 'crates/socket-patch-core/src/patch/redirect/upstream/gem/**'
+      - 'crates/*/src/**/gem_refresh.rs'
+      - 'crates/*/src/**/gem_refresh/**'
+      - 'crates/socket-patch-cli/tests/e2e_bazel_build/main.rs'
+      - 'crates/socket-patch-core/src/vendor/gem.rs'
+      - 'crates/socket-patch-core/src/vendor/gem/**'
+      - 'crates/socket-patch-core/src/patch/redirect/**'
+      - 'crates/socket-patch-core/src/hosted/**'
+      - 'crates/socket-patch-cli/src/commands/**'
+      - 'crates/socket-patch-cli/tests/common/**'
+      - 'crates/socket-patch-cli/tests/hosted_memory_common/**'
+      - 'Cargo.lock'
+      - 'Cargo.toml'
+      - 'crates/*/Cargo.toml'
+      - 'rust-toolchain.toml'
+      - '.cargo/**'
+  schedule:
+    # Nightly, so a main change outside the push list still gets a run
+    # within a day. The macOS leg runs here and on demand only.
+    - cron: '47 4 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bazel-ruby-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  ruby:
+    uses: ./.github/workflows/bazel-compatibility.yml
+    with:
+      eco: ruby
+      fixtures: rules_ruby/bzlmod
+      # One leg per line: a Bazel release, and the era of the fixture that
+      # `ruby::FIXTURE` gives it.
+      releases: >-
+        [
+          {"bazel": "9.3.2", "era": "e9"},
+          {"bazel": "8.8.2", "era": "e9"},
+          {"bazel": "7.7.2", "era": "e9"}
+        ]
+      macos: >-
+        [
+          {"bazel": "9.3.2", "era": "e9"}
+        ]

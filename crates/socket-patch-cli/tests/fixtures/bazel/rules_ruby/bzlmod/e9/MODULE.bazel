@@ -20,3 +20,7 @@ ruby.bundle_fetch(
 use_repo(ruby, "bundle", "ruby", "ruby_toolchains")
 
 register_toolchains("@ruby_toolchains//:all")
+
+# The root module's toolchains come before those of rules_java, so the Java
+# runtime that rules_ruby's rules name resolves to the empty one.
+register_toolchains("//:no_java_runtime_toolchain")

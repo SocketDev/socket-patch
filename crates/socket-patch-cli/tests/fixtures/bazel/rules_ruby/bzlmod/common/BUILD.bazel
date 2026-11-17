@@ -1,4 +1,5 @@
 load("@rules_ruby//ruby:defs.bzl", "rb_binary")
+load(":no_java.bzl", "no_java_runtime")
 
 # Prints OUT: PRISTINE until the gem is patched.
 rb_binary(
@@ -6,4 +7,17 @@ rb_binary(
     srcs = ["consumer.rb"],
     main = "consumer.rb",
     deps = ["@bundle"],
+)
+
+# rules_ruby's rules name a Java runtime toolchain and read it under JRuby
+# only. Bazel resolves it for every Ruby all the same: by default to the JDK
+# of the machine, and without one the build stops at "Cannot find Java
+# binary". MODULE.bazel registers this one ahead of it, so no build here
+# needs a JDK on the machine or downloads one.
+no_java_runtime(name = "no_java_runtime")
+
+toolchain(
+    name = "no_java_runtime_toolchain",
+    toolchain = ":no_java_runtime",
+    toolchain_type = "@bazel_tools//tools/jdk:runtime_toolchain_type",
 )

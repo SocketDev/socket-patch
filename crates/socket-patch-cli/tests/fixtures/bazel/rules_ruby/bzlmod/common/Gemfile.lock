@@ -12,8 +12,8 @@ DEPENDENCIES
   sp-victim (= 1.0.0)
 
 CHECKSUMS
-  sp-other (1.0.0) sha256=fc13e2a56faef279a95986dc8fb8f5b6966bb9568efcffdd921df01c019f0b6b
-  sp-victim (1.0.0) sha256=9cd80cdb316b05a7f666a4b737cf175a795b4158c7e10c4e0e8964c2a8ca61e4
+  sp-other (1.0.0) sha256=95cd9fb27e0e5f85a3a7efff6192385a3e0593413b5e077ee02375e50665f269
+  sp-victim (1.0.0) sha256=da9bfea3e7f178882f1c5020b3988ef91ba7d412689ba32db0c661ce53e79691
 
 BUNDLED WITH
   4.0.15

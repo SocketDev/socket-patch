@@ -1,8 +1,3 @@
-# rules_ruby's rules ask for a Java runtime, which only JRuby uses. Bazel's
-# default is the JDK of the machine, and without one the build stops at
-# "Cannot find Java binary", so a remote one is named.
-build --java_runtime_version=remotejdk_21
-
 # Bundler runs in a build action, where HOME is not set and Ruby would take
 # the user's home directory from the system. With this an action gets the
 # HOME of the Bazel client.
