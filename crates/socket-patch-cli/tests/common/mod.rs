@@ -367,6 +367,33 @@ pub fn write_minimal_manifest(
     path
 }
 
+/// What agent mode records for one file it patched in place: the manifest
+/// record of `purl` (`uuid`) for `file_name`, with both blobs. The caller
+/// writes `after` over the installed file.
+pub fn write_in_place_patch_record(
+    socket_dir: &Path,
+    purl: &str,
+    uuid: &str,
+    file_name: &str,
+    before: &[u8],
+    after: &[u8],
+) {
+    let before_hash = git_sha256(before);
+    let after_hash = git_sha256(after);
+    write_minimal_manifest(
+        socket_dir,
+        purl,
+        uuid,
+        &[PatchEntry {
+            file_name,
+            before_hash: &before_hash,
+            after_hash: &after_hash,
+        }],
+    );
+    write_blob(socket_dir, &before_hash, before);
+    write_blob(socket_dir, &after_hash, after);
+}
+
 /// Write a hosted redirect ledger (`.socket/vendor/redirect-state.json`)
 /// under `root` with the given PURL → record entries — the records-only
 /// shape `scan --mode hosted` persists (tests that need recorded `edits`
