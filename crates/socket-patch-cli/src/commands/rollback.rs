@@ -1002,6 +1002,10 @@ struct VendoredLegOutcome {
     /// could not be saved.
     failed: Vec<(String, &'static str, String)>,
     warnings: Vec<(String, String)>,
+    /// The gems (ledger keys) whose installed copies the unwind brought
+    /// back to the upstream build: nothing of theirs is left for a
+    /// reinstall.
+    refreshed_installs: std::collections::BTreeSet<String>,
     /// `removed` / `vendor_orphan_removed` events for the orphan uuid
     /// dirs (no ledger entry) swept, also on dry-run.
     orphans_removed: Vec<PatchEvent>,
@@ -1033,10 +1037,15 @@ async fn run_vendored_leg(
     for RevertedEntry {
         key,
         warnings,
+        progress,
+        gem_install_refreshed,
         step,
         ..
     } in reverted
     {
+        if gem_install_refreshed {
+            out.refreshed_installs.insert(key.clone());
+        }
         for w in &warnings {
             if loud {
                 eprintln!("Warning: {}", w.detail);
@@ -1095,6 +1104,11 @@ async fn run_vendored_leg(
                     eprintln!("Error: Failed to revert vendoring for {key}: {why}");
                 }
                 out.failed.push((key, "vendor_state_write_failed", why));
+            }
+        }
+        if loud {
+            for line in &progress {
+                println!("{line}");
             }
         }
     }
@@ -2844,6 +2858,7 @@ async fn run_project(args: RollbackArgs, below: BelowNotes) -> i32 {
                             // A gem the hosted leg already brought back to
                             // its upstream build.
                             && !hosted_leg.refreshed_installs.contains(key.as_str())
+                            && !vendored_leg.refreshed_installs.contains(key.as_str())
                     })
                     .count();
                 if still_patched > 0 {
@@ -6675,6 +6690,7 @@ mod tests {
                 "boom".to_string(),
             )],
             warnings: Vec::new(),
+            refreshed_installs: Default::default(),
             orphans_removed: Vec::new(),
         };
         let hosted = HostedLegOutcome {
