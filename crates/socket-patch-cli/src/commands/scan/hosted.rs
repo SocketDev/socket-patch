@@ -4316,6 +4316,75 @@ mod tests {
         assert!(out.stale_purls.is_empty());
     }
 
+    /// #2089: an agent-mode record proves the installed files patched, but
+    /// an in-place patch keeps the upstream archive in the home's `cache/`.
+    /// Once the lock pins the patched gem's sha256 that archive is what
+    /// `bundle pristine` and `--redownload` reinstall from, so the copy is
+    /// stale by its archive. The patched archive, or none at all, is quiet.
+    #[tokio::test]
+    async fn gem_stale_probe_flags_an_upstream_archive_beside_an_in_place_patch() {
+        use sha2::{Digest as _, Sha256};
+        let tmp = tempfile::tempdir().unwrap();
+        let gem_dir = materialize_gem(tmp.path(), GEM_PATCHED);
+        let home = gem_home(tmp.path());
+        let cache = home.join("cache").join(format!("{GEM_LEAF}.gem"));
+        let shas = std::collections::BTreeMap::from([(
+            ("stale-unit".to_string(), "1.0.0".to_string()),
+            std::collections::BTreeSet::from([hex::encode(Sha256::digest(b"patched .gem"))]),
+        )]);
+        let (confirmed, records) = (one_confirmed(), one_record());
+        let run = || async {
+            gem_stale_install_warnings(
+                tmp.path(),
+                false,
+                None,
+                &confirmed,
+                &records,
+                &shas,
+                &mut super::ViewFallback::offline(),
+            )
+            .await
+        };
+
+        let out = run().await;
+        assert_eq!(out.warnings.len(), 1, "{:?}", out.warnings);
+        let detail = detail_of(&out.warnings[0]);
+        assert!(detail.contains("patched in place"), "{detail}");
+        assert!(
+            !detail.contains("unpatched install"),
+            "the installed files are patched: {detail}"
+        );
+        let spec = home
+            .join("specifications")
+            .join(format!("{GEM_LEAF}.gemspec"));
+        for path in [&gem_dir, &cache, &spec] {
+            assert!(detail.contains(&path.display().to_string()), "{detail}");
+        }
+        assert_eq!(
+            out.stale_purls,
+            std::collections::BTreeSet::from([GEM_PURL.to_string()])
+        );
+        assert_eq!(out.gems.len(), 1, "handed to the refresh");
+        assert_eq!(
+            out.gems[0].installed,
+            Some((gem_dir.clone(), true)),
+            "the dir and its archive are refreshed together"
+        );
+
+        // The patched archive beside the patched files: nothing is stale.
+        std::fs::write(&cache, b"patched .gem").unwrap();
+        let out = run().await;
+        assert!(out.warnings.is_empty(), "{:?}", out.warnings);
+        assert!(out.stale_purls.is_empty());
+
+        // No archive: nothing a reinstall could bring back, so the record's
+        // verdict stands.
+        std::fs::remove_file(&cache).unwrap();
+        let out = run().await;
+        assert!(out.warnings.is_empty(), "{:?}", out.warnings);
+        assert!(out.stale_purls.is_empty() && out.unjudged_purls.is_empty());
+    }
+
     /// Committed `vendor/cache` handling, folded flavor: a stale install
     /// whose project also commits `vendor/cache/<leaf>.gem` gets that
     /// archive in the SAME delete list — bundler installs from it first,
