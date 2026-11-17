@@ -30,10 +30,8 @@ on:
     # (formats/gem), lock discovery, the lock inventory, the Ruby crawler
     # (it says which lock Bundler loads), the upstream restore of
     # `rollback`, and the stale-install guard that both commands end with.
-    # Each file has the directory of its name beside it, so a file that is
-    # split into one stays covered. Nothing another ecosystem's flow owns
-    # is here, so a change to one ecosystem starts that ecosystem's legs
-    # only.
+    # Nothing another ecosystem's flow owns is here, so a change to one
+    # ecosystem starts that ecosystem's legs only.
     #
     # What it does not cover: shared engine code. The other half of the
     # hosted rewrite is there (`rewrite_gem` and its planner in
@@ -58,15 +56,10 @@ on:
       - 'crates/socket-patch-cli/tests/fixtures/bazel/rules_ruby/**'
       - 'crates/socket-patch-core/src/formats/gem/**'
       - 'crates/socket-patch-core/src/vex/discover/gem.rs'
-      - 'crates/socket-patch-core/src/vex/discover/gem/**'
       - 'crates/socket-patch-core/src/vendor/lock_inventory/gem.rs'
-      - 'crates/socket-patch-core/src/vendor/lock_inventory/gem/**'
       - 'crates/socket-patch-core/src/crawlers/ruby_crawler.rs'
-      - 'crates/socket-patch-core/src/crawlers/ruby_crawler/**'
       - 'crates/socket-patch-core/src/patch/redirect/upstream/gem.rs'
-      - 'crates/socket-patch-core/src/patch/redirect/upstream/gem/**'
       - 'crates/*/src/**/gem_refresh.rs'
-      - 'crates/*/src/**/gem_refresh/**'
   push:
     branches: [main]
     # The pull request paths, and what only a push to main covers: the
@@ -85,18 +78,12 @@ on:
       - 'crates/socket-patch-cli/tests/fixtures/bazel/rules_ruby/**'
       - 'crates/socket-patch-core/src/formats/gem/**'
       - 'crates/socket-patch-core/src/vex/discover/gem.rs'
-      - 'crates/socket-patch-core/src/vex/discover/gem/**'
       - 'crates/socket-patch-core/src/vendor/lock_inventory/gem.rs'
-      - 'crates/socket-patch-core/src/vendor/lock_inventory/gem/**'
       - 'crates/socket-patch-core/src/crawlers/ruby_crawler.rs'
-      - 'crates/socket-patch-core/src/crawlers/ruby_crawler/**'
       - 'crates/socket-patch-core/src/patch/redirect/upstream/gem.rs'
-      - 'crates/socket-patch-core/src/patch/redirect/upstream/gem/**'
       - 'crates/*/src/**/gem_refresh.rs'
-      - 'crates/*/src/**/gem_refresh/**'
       - 'crates/socket-patch-cli/tests/e2e_bazel_build/main.rs'
       - 'crates/socket-patch-core/src/vendor/gem.rs'
-      - 'crates/socket-patch-core/src/vendor/gem/**'
       - 'crates/socket-patch-core/src/patch/redirect/**'
       - 'crates/socket-patch-core/src/hosted/**'
       - 'crates/socket-patch-cli/src/commands/**'
@@ -116,8 +103,11 @@ on:
 permissions:
   contents: read
 
+# The nightly run has a group of its own. A group holds one pending run, so
+# in the group of main's pushes a second push would replace a nightly that
+# waits behind the first, and the nightly is the only run with the macOS leg.
 concurrency:
-  group: bazel-ruby-${{ github.event.pull_request.number || github.ref }}
+  group: bazel-ruby-${{ github.event.pull_request.number || github.ref }}${{ github.event_name == 'schedule' && '-nightly' || '' }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:

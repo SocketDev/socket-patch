@@ -7,7 +7,7 @@
 //! goes with its release), in a fresh output base:
 //!
 //! - (a) `bazel build` and `bazel run //:consumer` print the unpatched
-//!   marker.
+//!   marker, and Bazel fetched the upstream gem from the stand-in.
 //! - (b) `socket-patch scan --mode hosted --yes` rewrites `Gemfile` (a
 //!   `source:` option on the gem's declaration) and `Gemfile.lock` (a `GEM`
 //!   section of the gem's own, whose remote is the patch registry, and the
@@ -24,16 +24,27 @@
 //!   patch registry that serves other bytes fails the build, and the
 //!   upstream gem is not fetched in its place.
 //!
-//! The marker is read from what Bazel built, and the patched one holds an
-//! id made for the run, so no cache of an earlier run can supply it.
+//! Both markers are read from what Bazel built, and each holds an id made
+//! for the run, so no cache of an earlier run can supply either gem. The
+//! fixture's lock therefore holds no sha256 of a gem: it has a placeholder
+//! for each of its two gems, and the test writes the sums of the gems it
+//! built into the lock of the workspace copy before the first build
+//! ([`lock_pinning`]). No committed value depends on the bytes that the
+//! gzip and tar libraries of the test emit.
 //!
 //! What fails the build in (e) is the lock's `CHECKSUMS` section and
 //! nothing else. rules_ruby gives Bazel's downloader a sha256 only for a
 //! gem that `gem_checksums` names, so here Bazel takes whatever the
 //! registry serves, and it is Bundler, in the `bundle install` action of
-//! the build, that holds the file to the lock. A lock without the section
-//! (Bundler before 2.6 writes none) pins a gem by its source alone and
-//! would build the other bytes; this fixture is not that lock.
+//! the build, that holds the file to the lock. The fixture's lock has the
+//! section. The flow proves nothing for a lock without one: there Bundler
+//! has no sum to hold a gem to, the gem is pinned by its source alone, and
+//! the build takes whatever bytes the patch registry serves. Many projects
+//! have that lock. Bundler writes the section into a new lock by default
+//! only from 4.0.0 on; from 2.6.0 it writes one on request (`bundle lock
+//! --add-checksums`, or the `lockfile_checksums` setting for a new lock),
+//! and a lock that exists keeps what it has. The fixture's lock names
+//! Bundler 4.0.15; the Bundler of its Ruby 3.4.10 is 2.6.9.
 //!
 //! One loopback server stands in for three hosts, by route prefix: the
 //! Socket API, `rubygems.org` (the fixture's two gems, and the
@@ -84,14 +95,14 @@ const VERSION: &str = "1.0.0";
 const PURL: &str = "pkg:gem/sp-victim@1.0.0";
 /// The gem declared beside it, which has no patch.
 const NEIGHBOUR: &str = "sp-other";
-const UNPATCHED: &str = "OUT: PRISTINE";
+/// What the fixture's lock holds as the sha256 of each upstream gem: the
+/// sum of no file.
+const PLACEHOLDER: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 /// The route prefixes of the stand-in, one per host it plays.
 const RUBYGEMS: &str = "rubygems.org";
 const PATCH_HOST: &str = "patch.socket.dev";
 
-/// gzip of `bytes`, stored and not compressed, with no time and no file
-/// name in its header: the same bytes on every run, as the sha256 in the
-/// fixture's lock needs.
+/// gzip of `bytes`, stored and not compressed.
 fn gzip(bytes: &[u8]) -> Vec<u8> {
     let stored = flate2::Compression::none();
     let mut gz = flate2::GzBuilder::new().write(Vec::new(), stored);
@@ -116,8 +127,7 @@ fn archive(files: &[(&str, &[u8])]) -> Vec<u8> {
 /// Version [`VERSION`] of a pure-Ruby gem, as a registry serves it: a tar
 /// of the gzipped specification and of the gzipped tar of its files. Its
 /// one file, `lib/<name>.rb` with `_` for `-`, holds `source`. Built here,
-/// so no binary is committed; the fixture's lock pins the sha256 of what
-/// this gives for the two upstream gems. `real_gem` of
+/// so no binary is committed, and no sha256 of one. `real_gem` of
 /// `e2e_redirect_gem_stale_install.rs` builds a gem the same way in a test
 /// target of its own; the two are not shared yet.
 fn gem(name: &str, source: &str) -> Vec<u8> {
@@ -155,6 +165,27 @@ fn victim(status: &str) -> Vec<u8> {
 /// The gem beside it.
 fn neighbour() -> Vec<u8> {
     gem(NEIGHBOUR, "module SpOther\nend\n")
+}
+
+/// The line of a lock's `CHECKSUMS` section that pins version [`VERSION`]
+/// of the gem `name` to `sha256`.
+fn checksum(name: &str, sha256: &str) -> String {
+    format!("  {name} ({VERSION}) sha256={sha256}\n")
+}
+
+/// The fixture's lock with the sha256 of the two upstream gems, `neighbour`
+/// and `upstream`, each in place of its placeholder: the lock a test writes
+/// into its workspace copy before the first build.
+fn lock_pinning(neighbour: &[u8], upstream: &[u8]) -> String {
+    let path = fixture_path(FIXTURE.dir).join("common/Gemfile.lock");
+    let mut lock = std::fs::read_to_string(&path).expect("the fixture's Gemfile.lock");
+    for (name, gem) in [(NEIGHBOUR, neighbour), (NAME, upstream)] {
+        let unpinned = checksum(name, PLACEHOLDER);
+        let lines = lock.matches(&unpinned).count();
+        assert_eq!(lines, 1, "{}: not one\n{unpinned}", path.display());
+        lock = lock.replace(&unpinned, &checksum(name, &sha256_hex(gem)));
+    }
+    lock
 }
 
 /// The route of gem `name` on the registry the stand-in plays under
@@ -198,15 +229,18 @@ fn hosted_bundle_fetch() {
     };
     let release = cell.release().to_string();
 
-    // The patched gem: the upstream gem with another text in its one file,
-    // which holds an id that is new for every run. The grant names the
-    // patch host as production does, with a token and the patch id in the
-    // paths of the artifact and of the patch registry.
+    // The upstream gem and the patched gem: one gem with two texts in its
+    // one file, each with an id that is new for every run. The grant names
+    // the patch host as production does, with a token and the patch id in
+    // the paths of the artifact and of the patch registry.
+    let run = uuid::Uuid::new_v4().to_string();
     let uuid = uuid::Uuid::new_v4().to_string();
     let token = uuid::Uuid::new_v4().to_string();
+    let unpatched = format!("OUT: PRISTINE {run}");
     let patched = format!("OUT: PATCHED {uuid}");
     let patched_gem = victim(&format!("PATCHED {uuid}"));
-    let upstream_gem = victim("PRISTINE");
+    let upstream_gem = victim(&format!("PRISTINE {run}"));
+    let neighbour_gem = neighbour();
     let registry = format!("{PATCH_HOST}/patch-registry/gem/{token}/{uuid}");
     let index = format!("https://{registry}/");
     let artifact = format!(
@@ -217,7 +251,7 @@ fn hosted_bundle_fetch() {
     let standin = StandIn::start();
     let origin = standin.origin();
     standin.serve(5, &upstream_route, &upstream_gem);
-    standin.serve(5, &gem_route(RUBYGEMS, NEIGHBOUR), &neighbour());
+    standin.serve(5, &gem_route(RUBYGEMS, NEIGHBOUR), &neighbour_gem);
     standin.serve(5, &patched_route, &patched_gem);
     // What `rollback` reads to restore the upstream `CHECKSUMS` line: the
     // gem's file of the compact index, one line per version.
@@ -240,8 +274,10 @@ fn hosted_bundle_fetch() {
         format!("block {PATCH_HOST}"),
     ]);
 
-    // (a) The unpatched build, with the upstream gem from the stand-in.
-    let before = cell.builds_unpatched(UNPATCHED);
+    // (a) The unpatched build. The lock of the checkout pins the two
+    // upstream gems of this run, which only the stand-in has.
+    cell.write("Gemfile.lock", lock_pinning(&neighbour_gem, &upstream_gem));
+    let before = cell.builds_unpatched(&unpatched);
     let upstream_fetches = standin.asked(&upstream_route);
     assert!(
         upstream_fetches > 0,
@@ -261,7 +297,7 @@ fn hosted_bundle_fetch() {
     let declared = gemfile.lines().filter(|line| *line == declaration).count();
     assert_eq!(declared, 1, "{test}: Gemfile:\n{gemfile}");
     let section = format!("GEM\n  remote: {index}\n  specs:\n    {NAME} ({VERSION})\n\n");
-    let sum = |gem: &[u8]| format!("  {NAME} ({VERSION}) sha256={}\n", sha256_hex(gem));
+    let sum = |gem: &[u8]| checksum(NAME, &sha256_hex(gem));
     assert!(
         lock.contains(&section) && lock.contains(&sum(&patched_gem)),
         "{test}: Gemfile.lock:\n{lock}"
@@ -288,7 +324,7 @@ fn hosted_bundle_fetch() {
 
     // (d) The undo: every file is the one of before, and so is the build.
     let undo = socket_patch(&cell, &["rollback", "--yes"]);
-    cell.undone(&undo, "rolledBack", &before, UNPATCHED);
+    cell.undone(&undo, "rolledBack", &before, &unpatched);
 
     // (e) A second machine with the rewritten files, and a patch registry
     // that serves other bytes at the pinned URL: still a gem RubyGems
@@ -330,7 +366,7 @@ fn hosted_bundle_fetch() {
 
     println!(
         "{test}: Bazel {release} built {patched:?} from {index} after `scan --mode hosted`; \
-         `rollback` restored all {} files and the {UNPATCHED:?} build; other bytes at the patch \
+         `rollback` restored all {} files and the {unpatched:?} build; other bytes at the patch \
          registry failed a second machine's build (Bundler: mismatched checksums); {origin} \
          answered {} requests for the upstream gem and {} for the patched gem; {:?}",
         before.len(),
@@ -340,24 +376,18 @@ fn hosted_bundle_fetch() {
     );
 }
 
-/// Without a Bazel: the fixture's directories are those of its table, and
-/// the `CHECKSUMS` section of its lock pins the two gems the test serves
-/// from the rubygems.org stand-in.
+/// Without a Bazel, what stays fixed now that no sum is committed: the
+/// fixture's directories and the legs of its workflow are those of its
+/// table, and the `CHECKSUMS` section of the fixture's lock is one line per
+/// gem the test serves, each with the placeholder, so that a pinned lock
+/// holds the sums of those two gems and no other.
 #[test]
-fn the_fixture_pins_the_upstream_gems_the_test_serves() {
+fn a_test_pins_the_two_upstream_gems_of_the_fixture_lock() {
     FIXTURE.check();
-    let path = fixture_path(FIXTURE.dir).join("common/Gemfile.lock");
-    let lock = std::fs::read_to_string(&path).expect("the fixture's Gemfile.lock");
-    let pin = |name: &str, gem: &[u8]| format!("  {name} ({VERSION}) sha256={}", sha256_hex(gem));
-    let pins = [pin(NEIGHBOUR, &neighbour()), pin(NAME, &victim("PRISTINE"))];
-    let section: Vec<&str> = lock
-        .lines()
-        .skip_while(|line| *line != "CHECKSUMS")
-        .skip(1)
-        .take_while(|line| !line.is_empty())
-        .collect();
-    // A sum is over the bytes [`gzip`] gives, so a release of flate2 that
-    // stores them another way fails here: the lines on the right are then
-    // the ones the lock must hold.
-    assert_eq!(section, pins, "{}", path.display());
+    let (other, upstream) = (neighbour(), victim("PRISTINE of a run"));
+    let pinned = lock_pinning(&other, &upstream);
+    let sum = |name, gem: &[u8]| checksum(name, &sha256_hex(gem));
+    let sums = sum(NEIGHBOUR, &other) + &sum(NAME, &upstream);
+    let section = format!("\nCHECKSUMS\n{sums}\n");
+    assert!(pinned.contains(&section), "{pinned}");
 }
