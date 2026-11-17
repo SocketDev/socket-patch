@@ -2021,7 +2021,12 @@ mirror of rubygems.org, set `SOCKET_RUBYGEMS_URL` to it. The JRuby (`-java`) bui
 jars and is always refused for such a patch.
 
 A gem that builds a library into its own directory and loads it from there (an FFI gem such as
-argon2) is always rebuilt from its installed tree.
+scrypt, a Rakefile build such as digest-crc) is always rebuilt from its installed tree. The
+libraries the gem's build makes there are removed first, as a fresh install has none of them, so
+a build script that would take an existing library for current compiles the patched source. When
+`apply` can't tell which files those are (no source gem to compare with) and the build exits
+without changing any compiled code, the package fails with `native_extension_build_failed`
+instead of being reported as patched.
 
 Ruby files are never build inputs outside `ext/` and a build script's directory: a patch that only
 changes `.rb` or `.rbs` files needs no compiler, wherever the gem keeps them.
@@ -2050,7 +2055,8 @@ passes `--no-gem-native-rebuild` (or `SOCKET_NO_GEM_NATIVE_REBUILD=1`): the sour
 without a rebuild, with a `native_extension_not_rebuilt` warning, and `vex` does not attest them.
 
 `apply` keeps the original compiled code in `.socket-patch-native-orig/` inside the gem
-directory (the install-time build, or a precompiled gem's prebuilt binary), so `rollback`
+directory (the install-time build, a precompiled gem's prebuilt binary, and every file a rebuild
+in the installed tree replaced there), so `rollback`
 restores it byte for byte without recompiling, and records what it built in
 `.socket-patch-native-build.json`. `vex` attests the patch only while that record matches the
 installed binary: after `gem pristine` or a reinstall, run `apply` again.

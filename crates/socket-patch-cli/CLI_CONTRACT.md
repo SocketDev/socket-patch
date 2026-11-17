@@ -1022,11 +1022,13 @@ Ruby inside the project is never run, and every run goes without the Socket cred
 
 The first rebuild of a copy backs up the original compiled code to `.socket-patch-native-orig/` in
 the gem directory (the install-time extension directory and `lib/` copies; a precompiled gem's
-prebuilt binaries, each when it is first replaced), and every rebuild records
+prebuilt binaries, each when it is first replaced; every file of the gem's own tree an in-place
+rebuild replaced, with the names of those it added), and every rebuild records
 `.socket-patch-native-build.json` there: the source hashes it was built from and the hash of every
 artifact it put in place (`"grafted": true` for a precompiled gem's replaced binaries, whose paths
-name the Ruby minors they were built for). A record whose sources are patched and whose marker
-matches is `already_patched`; sources an earlier release patched without a rebuild are rebuilt,
+name the Ruby minors they were built for; for an in-place rebuild, `libArtifacts` also lists what
+the build left in the gem's own tree for Ruby to load). A record whose sources are patched and
+whose marker matches is `already_patched`; sources an earlier release patched without a rebuild are rebuilt,
 with a `native_extension_rebuilt` warning. `rollback` (and `remove`) puts the backed-up build back
 with the sources, bytes and file mode; without a backup it rebuilds a gem RubyGems built from the
 restored sources, and fails a precompiled gem with `native_extension_restore_failed` (`gem
@@ -1067,7 +1069,7 @@ a file the copy does not hold is not written: the record fails on it as on any m
 | Code | Run result | Meaning |
 |---|---|---|
 | `native_extensions_unsupported` | refused, exit 1 | The record changes build inputs that cannot be rebuilt here: the copy is not a RubyGems install with a `specifications/` entry (a Bundler git checkout); the gem neither declares extensions nor is a platform gem; it is the JRuby (`java`) build; no Ruby that owns the install was found; a precompiled gem cannot be built from its source gem (the archive is neither in the home's `cache/` nor downloadable, is not the copy's own source, the record does not apply to it, a gem its build needs could not be staged, its build leaves a library in the gem's own tree, or the build has no counterpart among the gem's prebuilt binaries); a record changes an input a build removed and the source gem cannot be built. Nothing is written. Also: another run is rebuilding the same gem right now, or an interrupted rebuild could not be undone (the error says which). |
-| `native_extension_build_failed` | refused, exit 1 | The extension did not build from the patched sources (no compiler or Ruby headers, a build error), or the finished build could not be moved into place. The installed copy is as it was before the run; the error carries the build output's tail (of the build from the source gem and of the in-place one, when both ran). |
+| `native_extension_build_failed` | refused, exit 1 | The extension did not build from the patched sources (no compiler or Ruby headers, a build error, an in-place build that exited cleanly without compiling anything), or the finished build could not be moved into place. The installed copy is as it was before the run; the error carries the build output's tail (of the build from the source gem and of the in-place one, when both ran). |
 | `native_extension_rebuilt` | warning | The sources were already patched (by a release before #1996, with `--no-gem-native-rebuild`, or by `apply` under another Ruby version of a precompiled gem) and the extension was rebuilt from them. Under `--dry-run`: the rebuild a real `apply` would run; no Ruby is started and nothing is downloaded to check that it can. |
 | `native_extension_not_rebuilt` | warning | `--no-gem-native-rebuild`: the sources were written without a rebuild; Ruby loads the old build until the caller compiles it. |
 | `native_extension_restore_failed` | rollback: that copy fails | The sources were restored, but the original compiled extension could not be put back. Run `gem pristine <gem> --extensions` (a precompiled gem: `gem pristine <gem>`). |
