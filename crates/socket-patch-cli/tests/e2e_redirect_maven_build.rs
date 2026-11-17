@@ -525,6 +525,8 @@ fn maven_scan_hosted_fresh_checkout_install_and_manifestless_vex() {
 // ── a pin follows the version Maven selects ─────────────────────────────
 
 mod mediation {
+    use std::collections::BTreeMap;
+
     use super::maven_mediation_common::{self as fixture, Shape};
     use super::*;
 
@@ -730,5 +732,387 @@ mod mediation {
         // The base version now sits in the local repository, jar and all,
         // and no pom of this project names it: a range selects another.
         unselected(Shape::Ranged).expect("the local repository is warm");
+    }
+    /// What a hosted mediation test runs against: the fixture repository,
+    /// the patch API and the Socket repository of [`PATCH`] on one server,
+    /// a cold local repository, and Maven settings without and with the
+    /// Socket repository mirrored to that server.
+    struct Bench {
+        _tmp: tempfile::TempDir,
+        root: PathBuf,
+        m2: PathBuf,
+        plain: PathBuf,
+        mirrored: PathBuf,
+        server: Server,
+        patched_jar: Vec<u8>,
+        suffixed: String,
+        view: serde_json::Value,
+    }
+
+    impl Bench {
+        fn new() -> Bench {
+            let tmp = tempfile::tempdir().unwrap();
+            let root: PathBuf = tmp.path().canonicalize().unwrap();
+            let plain = root.join("settings-plain.xml");
+            write_settings(&plain, &[]);
+            let server = Server::start();
+            fixture::publish(&server);
+            let patched_jar = fixture::patched_victim_jar();
+            let suffixed = PATCH.suffixed();
+            let served_pom = fixture::served_victim_pom(&suffixed).into_bytes();
+            let view = patch_view(
+                UUID,
+                &fixture::purl(),
+                &[(
+                    &fixture::victim_jar_name(fixture::BASE),
+                    &git_sha256(&patched_jar),
+                )],
+                &[(PATCH.ghsa, &[PATCH.cve])],
+            );
+            hosted_maven_common::mount_api(&server, &PATCH, &patched_jar, &served_pom, &view);
+            fixture::answer_lookups_only_for(&server, ORG, &fixture::purl()["pkg:maven/".len()..]);
+            server.serve_repo(&PATCH, &patched_jar, &served_pom, None);
+            let mirrored = root.join("settings-socket.xml");
+            let mirror_url = format!("{}{}", server.uri(), PATCH.repo_path());
+            write_settings(&mirrored, &[(&format!("socket-patch-{UUID}"), &mirror_url)]);
+            Bench {
+                m2: root.join("m2"),
+                _tmp: tmp,
+                root,
+                plain,
+                mirrored,
+                server,
+                patched_jar,
+                suffixed,
+                view,
+            }
+        }
+
+        fn scan(&self, proj: &Path) -> (Option<i32>, serde_json::Value, String) {
+            socket(
+                proj,
+                &self.m2,
+                &[
+                    "scan",
+                    "--mode",
+                    "hosted",
+                    "--json",
+                    "--yes",
+                    "--cwd",
+                    proj.to_str().unwrap(),
+                    "--api-url",
+                    &self.server.uri(),
+                    "--org",
+                    ORG,
+                    "--api-token",
+                    "fake",
+                ],
+            )
+        }
+
+        /// Roll the project back (Maven's restore needs no network), and
+        /// check that it is the hosted pin of the victim that went.
+        fn rollback(&self, proj: &Path) {
+            let (code, env, stderr) = socket(
+                proj,
+                &self.m2,
+                &[
+                    "rollback",
+                    "--json",
+                    "--offline",
+                    "--cwd",
+                    proj.to_str().unwrap(),
+                ],
+            );
+            assert_eq!(code, Some(0), "rollback: {env}\n{stderr}");
+            assert_eq!(
+                rollback_json::hosted_reverted(&env),
+                serde_json::json!([fixture::purl()]),
+                "rollback restores the hosted pin: {env}"
+            );
+        }
+
+        /// A second scan finds the wiring of the first and writes nothing.
+        fn assert_rescan_is_a_no_op(&self, proj: &Path) {
+            let pinned = fixture::snapshot(proj);
+            let (code, env, stderr) = self.scan(proj);
+            assert_eq!(code, Some(0), "rescan: {env}\n{stderr}");
+            assert_eq!(
+                fixture::snapshot(proj),
+                pinned,
+                "a rescan is a no-op: {env}"
+            );
+        }
+
+        /// The invariant: `after` holds the artifacts of `before`, the
+        /// base victim in its patched build and every other jar as it was.
+        fn assert_only_the_victim_is_patched(
+            &self,
+            what: &str,
+            before: &BTreeMap<String, Vec<u8>>,
+            after: &BTreeMap<String, Vec<u8>>,
+        ) {
+            assert_eq!(
+                fixture::unsuffixed(after.keys()),
+                before.keys().cloned().collect(),
+                "{what}: the same artifacts, the victim in its patched build"
+            );
+            assert_eq!(
+                after.get(&fixture::victim_jar_name(&self.suffixed)),
+                Some(&self.patched_jar),
+                "{what}: Maven resolves the patched jar: {:?}",
+                after.keys()
+            );
+            for (name, bytes) in before {
+                if *name != fixture::victim_jar_name(fixture::BASE) {
+                    assert_eq!(after.get(name), Some(bytes), "{what}: {name} is untouched");
+                }
+            }
+        }
+    }
+
+    /// A `${property}` version is patched in hosted mode, with pom edits
+    /// only, and no artifact that shares the property is moved:
+    ///
+    /// - a property only the patched artifact reads is rewritten itself;
+    /// - a property a sibling artifact reads too stays as it is, and the
+    ///   one declaration takes the patched version, the text it replaced
+    ///   recorded beside it;
+    /// - so does a declaration whose property a parent pom resolved from a
+    ///   repository defines.
+    ///
+    /// In each, Maven resolves what it resolved before but for the patched
+    /// build of the victim, a second scan writes nothing, and a rollback
+    /// restores every file byte for byte and leaves none behind.
+    #[test]
+    #[ignore = "real Maven + Maven Central (dependency plugin); run with --ignored"]
+    fn maven_hosted_patches_a_property_version_and_rolls_back_clean() {
+        use fixture::Property;
+        let Some(mvn) = Mvn::detect(SUITE) else {
+            return;
+        };
+        let bench = Bench::new();
+        let suffixed = &bench.suffixed;
+        for property in [Property::Own, Property::Shared, Property::OfParent] {
+            let what = property.name();
+            let proj = bench.root.join(what);
+            std::fs::create_dir_all(&proj).unwrap();
+            std::fs::write(
+                proj.join("pom.xml"),
+                fixture::property_pom(property, &bench.server),
+            )
+            .unwrap();
+            let Some(before) =
+                fixture::resolve(SUITE, &mvn, &proj, &bench.m2, &bench.plain, "target/before")
+            else {
+                return;
+            };
+            assert!(
+                before.contains_key(&fixture::victim_jar_name(fixture::BASE)),
+                "{what}: {:?}",
+                before.keys()
+            );
+            let pristine = fixture::snapshot(&proj);
+
+            let (code, env, stderr) = bench.scan(&proj);
+            assert_eq!(code, Some(0), "{what}: {env}\n{stderr}");
+            assert_eq!(env["summary"]["applied"], 1, "{what}: {env}");
+            let wired = std::fs::read_to_string(proj.join("pom.xml")).unwrap();
+            let reference = property.reference();
+            match property {
+                Property::Own => assert!(
+                    wired.contains(&format!("<victim.version>{suffixed}</victim.version>"))
+                        && wired.contains(&format!("<version>{reference}</version>")),
+                    "the property takes the patched version, the declaration keeps its \
+                     text:\n{wired}"
+                ),
+                Property::Shared | Property::OfParent => assert!(
+                    wired.contains(&format!(
+                        "<version>{suffixed}</version><!-- socket-patch:version {reference} -->"
+                    )),
+                    "{what}: the declaration takes the patched version, and says what it \
+                     replaced:\n{wired}"
+                ),
+            }
+            if property == Property::Shared {
+                assert!(
+                    wired.contains(&format!(
+                        "<fixture.version>{}</fixture.version>",
+                        fixture::BASE
+                    )) && wired.contains(&fixture::dependency(fixture::SIBLING, &reference, "")),
+                    "the property and the sibling that reads it are as they were:\n{wired}"
+                );
+            }
+            assert!(
+                wired.contains(&format!("<id>socket-patch-{UUID}</id>")),
+                "{what}:\n{wired}"
+            );
+
+            let after =
+                fixture::resolve_warm(&mvn, &proj, &bench.m2, &bench.mirrored, "target/after", &[]);
+            bench.assert_only_the_victim_is_patched(what, &before, &after);
+            bench.assert_rescan_is_a_no_op(&proj);
+
+            bench.rollback(&proj);
+            assert_eq!(
+                fixture::snapshot(&proj),
+                pristine,
+                "{what}: rollback restores every file byte for byte and leaves none behind"
+            );
+        }
+    }
+
+    /// A multi-module reactor is patched in hosted mode module by module
+    /// (the table's V3): the module that reaches the base version through
+    /// another artifact gets the pin in its own pom, the module that
+    /// declares it has that declaration rewritten, and the module that
+    /// resolves a newer version is not touched and resolves what it
+    /// resolved before. The repository and the Trusted Checksums sit at
+    /// the root every module inherits, so a Maven started in a module
+    /// directory resolves the patched jar too. `vex` attests the patch
+    /// while every module that resolves the base version is wired, and
+    /// withholds it, naming the module, once one is not. A rollback
+    /// restores every pom byte for byte and removes what the scan created.
+    #[test]
+    #[ignore = "real Maven + Maven Central (dependency plugin); run with --ignored"]
+    fn maven_hosted_patches_a_reactor_module_by_module_and_rolls_back_clean() {
+        let Some(mvn) = Mvn::detect(SUITE) else {
+            return;
+        };
+        let bench = Bench::new();
+        let suffixed = &bench.suffixed;
+        let proj = bench.root.join("reactor");
+        fixture::write_reactor(&proj, &bench.server);
+        let Some(before) =
+            fixture::resolve_reactor(SUITE, &mvn, &proj, &bench.m2, &bench.plain, "target/before")
+        else {
+            return;
+        };
+        let pristine = fixture::snapshot(&proj);
+        let was = |rel: &str| String::from_utf8(pristine[rel].clone()).unwrap();
+        let now = |rel: &str| std::fs::read_to_string(proj.join(rel)).unwrap();
+
+        let (code, env, stderr) = bench.scan(&proj);
+        assert_eq!(code, Some(0), "{env}\n{stderr}");
+        assert_eq!(env["summary"]["applied"], 1, "{env}");
+        assert!(
+            warning(&env, "redirect_maven_multimodule_unsupported").is_none(),
+            "{env}"
+        );
+        let a = now("a/pom.xml");
+        assert!(
+            a.contains(&format!(
+                "<!-- socket-patch {UUID}: {}:{}:{} -->",
+                fixture::GROUP,
+                fixture::VICTIM,
+                fixture::BASE
+            )) && a.contains(&format!("<version>{suffixed}</version>")),
+            "a reaches the base version through another artifact, and is pinned:\n{a}"
+        );
+        assert_eq!(
+            now("c/pom.xml"),
+            was("c/pom.xml").replace(
+                &format!("<version>{}</version>", fixture::BASE),
+                &format!("<version>{suffixed}</version>")
+            ),
+            "c declares the base version, and only that version text changes"
+        );
+        assert_eq!(
+            now("b/pom.xml"),
+            was("b/pom.xml"),
+            "b resolves another version and is not touched"
+        );
+        let root = now("pom.xml");
+        assert!(
+            root.contains(&format!("<id>socket-patch-{UUID}</id>")) && !root.contains(suffixed),
+            "the root takes the repository every module inherits, and no pin:\n{root}"
+        );
+        assert!(proj.join(".mvn/checksums/checksums.sha256").is_file());
+        for module in ["a", "b", "c"] {
+            assert!(
+                !proj.join(module).join(".mvn").exists(),
+                "{module}: the Trusted Checksums are the root's"
+            );
+        }
+
+        let after = fixture::resolve_reactor(
+            SUITE,
+            &mvn,
+            &proj,
+            &bench.m2,
+            &bench.mirrored,
+            "target/after",
+        )
+        .expect("the local repository is warm");
+        for (module, selects, ..) in fixture::REACTOR_MODULES {
+            if selects == fixture::BASE {
+                bench.assert_only_the_victim_is_patched(module, &before[module], &after[module]);
+            } else {
+                assert_eq!(
+                    after[module], before[module],
+                    "{module} resolves what it resolved before"
+                );
+            }
+        }
+        // Started in a module directory, Maven reads the parent pom for the
+        // repository and the root's `.mvn` for the checksums.
+        let from_module = fixture::resolve_warm(
+            &mvn,
+            &proj.join("a"),
+            &bench.m2,
+            &bench.mirrored,
+            "target/from-module",
+            &[],
+        );
+        bench.assert_only_the_victim_is_patched(
+            "a, from its directory",
+            &before["a"],
+            &from_module,
+        );
+        bench.assert_rescan_is_a_no_op(&proj);
+
+        // VEX: attested while every module that resolves the base version
+        // is wired.
+        let api = PatchApi::start(vec![(UUID.to_string(), bench.view.clone())]);
+        let run = VexRun {
+            proxy_url: Some(api.uri()),
+            ..vex_run(&bench.m2)
+        };
+        let out = run_vex(&binary(), &proj, &run);
+        assert_eq!(out.code, Some(0), "{out}");
+        assert_attested(
+            out.doc(),
+            &fixture::purl(),
+            UUID,
+            Marker::Redirected,
+            &[(PATCH.ghsa, &[PATCH.cve])],
+        );
+        // A module that comes to declare the base version itself builds the
+        // unpatched jar, whatever its siblings are wired to.
+        let wired_b = now("b/pom.xml");
+        std::fs::write(
+            proj.join("b/pom.xml"),
+            fixture::module_pom("b", fixture::VICTIM, fixture::BASE),
+        )
+        .unwrap();
+        let out = run_vex(&binary(), &proj, &run);
+        assert_omitted(
+            &out,
+            &fixture::purl(),
+            "vex_maven_reactor_root",
+            "a module that builds the unpatched version",
+        );
+        assert!(
+            out.envelope.to_string().contains("b/pom.xml"),
+            "the note names the module: {out}"
+        );
+        std::fs::write(proj.join("b/pom.xml"), wired_b).unwrap();
+
+        bench.rollback(&proj);
+        assert_eq!(
+            fixture::snapshot(&proj),
+            pristine,
+            "rollback restores every pom byte for byte and removes what the scan created"
+        );
     }
 }

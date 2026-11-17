@@ -326,8 +326,9 @@ fn unattested_note(kind: UnattestedKind) -> (&'static str, &'static str) {
         ),
         UnattestedKind::MavenReactorRoot => (
             NOTE_MAVEN_REACTOR_ROOT,
-            "not attested while the root declares modules (roll it back and re-patch the \
-             reactor with `scan --mode vendored`)",
+            "not attested while a module of the reactor may build the unpatched version \
+             (re-run `scan` once that module resolves it, or patch the reactor with `scan \
+             --mode vendored`)",
         ),
         UnattestedKind::MavenClassifierUnpatched => (
             NOTE_MAVEN_CLASSIFIER_UNPATCHED,
