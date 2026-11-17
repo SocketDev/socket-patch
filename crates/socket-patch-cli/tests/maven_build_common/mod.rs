@@ -195,6 +195,13 @@ impl Mvn {
         self.numeric() >= vec![3, 9, 4]
     }
 
+    /// The launcher with the ambient Maven configuration and CI markers
+    /// scrubbed, for a caller that sets its own environment and arguments
+    /// (the production legs give Maven a home directory of its own).
+    pub fn command(&self) -> Command {
+        mvn_command(&self.program)
+    }
+
     /// `mvn -B <args>` in `cwd` against the local repository `m2`, with the
     /// user settings file `settings`.
     pub fn run(&self, cwd: &Path, m2: &Path, settings: &Path, args: &[&str]) -> Output {

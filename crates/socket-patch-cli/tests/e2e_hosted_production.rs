@@ -36,20 +36,28 @@
 //! | npm    | `pkg:npm/minimist@1.2.2`        | `642d7f02-ebc1-4ab0-99e2-07f5dd8463cb` | GHSA-xvch-5gv4-984h (CVE-2021-44906) |
 //! | PyPI   | `pkg:pypi/urllib3@1.26.18`      | *any of three* (see [`PYPI_UUIDS`])    | GHSA-gm62-xv2j-4w53 &co |
 //! | gem    | `pkg:gem/activestorage@6.0.3`   | *any of* [`GEM_UUIDS`] (six today; the sixth merges three advisories) | GHSA-m42x-37p3-fv5w (CVE-2020-8162), GHSA-w749-p3v6-hccq (CVE-2022-21831), GHSA-9xrj-h377-fr87 (CVE-2026-33195), GHSA-r4mg-4433-c7g3 (CVE-2025-24293), GHSA-xr9x-r78c-5hrm (CVE-2026-66066) |
+//! | Maven  | `pkg:maven/com.fasterxml.jackson.core/jackson-databind@2.7.9.2` | `8e82692a-a5bd-40ac-97a7-4f1483449fd6` | GHSA-qr7j-h6gg-jmgc (CVE-2018-11307) |
 //!
 //! `docs/testing/hosted-production-e2e.md` explains how these were chosen and
 //! how to re-pick one if it is ever withdrawn.
 //!
-//! # Ecosystems with no coverage, and why
+//! # Ecosystems with other coverage, or none, and why
 //!
-//! * **cargo / maven / nuget / composer** — hosted mode is implemented and
-//!   documented for all four, but production currently publishes **zero**
+//! * **cargo / nuget / composer** — hosted mode is implemented and
+//!   documented for all three, but production currently publishes **zero**
 //!   free-tier patches for them, so there is nothing real to redirect to.
 //!   Rather than silently skipping, [`canary_unpublished_ecosystems`] probes
 //!   production every run and tells us the moment that changes. cargo carried
 //!   a full sparse-registry install proof until 2026-09-01: production's free
 //!   cargo tier emptied on 2026-08-28, so the leg was demoted to the canary
 //!   (`docs/testing/hosted-production-e2e.md` says how to re-promote it).
+//! * **maven** — on that canary until production published its first free
+//!   Maven patch on 2026-10-23. [`maven_hosted_jackson_databind_delivery`]
+//!   (`maven_production/mod.rs`) builds a real Maven project against it:
+//!   Maven itself downloads the patched jar from `patch.socket.dev`, a JVM
+//!   loads the patched class, the jar is checked as a drop-in replacement on
+//!   every JDK the run provides, and `rollback` / `remove` restore the
+//!   project.
 //! * **golang** — pgx/v5 v5.7.0 must deliver the function-call decoder fix
 //!   through a hosted `/v5` module with both go.sum pins, including a fresh
 //!   checkout. Missing hosted metadata is a failure.
@@ -59,11 +67,11 @@
 //!
 //! Toolchains (each leg soft-skips if its own toolchain is absent, unless
 //! `SOCKET_PATCH_HOSTED_E2E_STRICT=1`): `npm`, `pnpm`, `yarn` (classic),
-//! `corepack` (berry), `bun`, `uv`, `ruby` + `bundle`, `go`.
+//! `corepack` (berry), `bun`, `uv`, `ruby` + `bundle`, `go`, `mvn` + a JDK.
 //!
 //! Network egress to: `patches-api.socket.dev`, `patch.socket.dev`,
 //! `registry.npmjs.org`, `pypi.org`, `files.pythonhosted.org`,
-//! `rubygems.org`.
+//! `rubygems.org`, `repo.maven.apache.org`.
 //!
 //! No API token is used or needed — the suite deliberately runs against the
 //! **free public proxy**, which is the surface every unauthenticated user
@@ -204,15 +212,9 @@ const UNPUBLISHED_ECOSYSTEMS: &[(&str, &[&str])] = &[
             "pkg:cargo/smallvec",
         ],
     ),
-    (
-        "maven",
-        &[
-            "pkg:maven/org.apache.logging.log4j/log4j-core",
-            "pkg:maven/com.fasterxml.jackson.core/jackson-databind",
-            "pkg:maven/org.yaml/snakeyaml",
-            "pkg:maven/commons-io/commons-io",
-        ],
-    ),
+    // maven left this list on 2026-11-17: production has published a free
+    // jackson-databind 2.7.9.2 patch since 2026-10-23, and
+    // `maven_hosted_jackson_databind_delivery` now builds against it.
     (
         "nuget",
         &[
@@ -824,6 +826,7 @@ async fn preflight_required_patches_are_published() {
         (NPM_PURL, vec![NPM_UUID]),
         (PYPI_PURL, PYPI_UUIDS.to_vec()),
         (GEM_PURL, GEM_UUIDS.to_vec()),
+        (maven_production::PURL, vec![maven_production::UUID]),
     ];
 
     let mut failures: Vec<String> = Vec::new();
@@ -876,7 +879,7 @@ async fn canary_patches_name_advisories_so_merge_state_is_inferable() {
     let mut failures: Vec<String> = Vec::new();
     let mut coverage_seen: Vec<(String, String, usize)> = Vec::new();
 
-    let canary_purls = vec![NPM_PURL, PYPI_PURL, GEM_PURL];
+    let canary_purls = vec![NPM_PURL, PYPI_PURL, GEM_PURL, maven_production::PURL];
     for purl in canary_purls {
         match published_patch_advisory_counts(purl).await {
             Err(e) => failures.push(format!("{purl}: production probe failed: {e}")),
@@ -2505,6 +2508,22 @@ fn golang_hosted_pgx_delivery() {
     golang_production::delivery("hosted");
 }
 
+#[path = "maven_production/mod.rs"]
+mod maven_production;
+
+/// Maven's hosted loop against production's free jackson-databind patch:
+/// the pom is pinned to `2.7.9.2-socket.<hex8>` on the Socket repository, a
+/// fresh checkout's Maven build downloads that jar from `patch.socket.dev`
+/// and a JVM loads the patched class from it (see `maven_production/mod.rs`).
+#[test]
+#[ignore = "live production API + real Maven + Maven Central. Run with --ignored."]
+fn maven_hosted_jackson_databind_delivery() {
+    const LEG: &str = "maven_hosted_jackson_databind_delivery";
+    if let Err(why) = maven_production::delivery(maven_production::Mode::Hosted) {
+        soft_skip!(LEG, "{why}");
+    }
+}
+
 /// Deno hosted mode is not supported. Same shape as the golang guard.
 #[test]
 #[ignore = "live production API. Run with --ignored."]
@@ -2551,7 +2570,7 @@ fn deno_hosted_is_unsupported() {
 // Canary — ecosystems whose hosted support has nothing to test against
 // ===========================================================================
 
-/// cargo, maven, nuget and composer all implement hosted mode, but production
+/// cargo, nuget and composer all implement hosted mode, but production
 /// publishes no free-tier patches for them, so there is no honest end-to-end
 /// leg to write. (cargo used to have one — the pinned sparse-registry install
 /// proof retired 2026-09-01 when production's free cargo tier emptied.) This
@@ -2561,7 +2580,10 @@ fn deno_hosted_is_unsupported() {
 /// It deliberately does NOT fail when patches appear: production publishing a
 /// new patch is not a socket-patch regression, and a required check must not
 /// go red for it. `SOCKET_PATCH_HOSTED_E2E_CANARY_STRICT=1` makes it fail, for
-/// use in a scheduled run where a nag is the point.
+/// use in a scheduled run where a nag is the point. No workflow sets that
+/// flag, so in CI the report is the `NOTE` line below in a passing job's
+/// log: maven's first free patch (2026-10-23) was reported that way on every
+/// run until its leg was added on 2026-11-17.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "live production API. Run with --ignored."]
 async fn canary_unpublished_ecosystems() {
@@ -2589,8 +2611,8 @@ async fn canary_unpublished_ecosystems() {
 
     if newly_published.is_empty() {
         println!(
-            "canary_unpublished_ecosystems: cargo / maven / nuget / composer \
-             still have no free-tier published patches — their hosted-mode legs \
+            "canary_unpublished_ecosystems: cargo / nuget / composer still \
+             have no free-tier published patches — their hosted-mode legs \
              remain untestable end-to-end against production."
         );
         return;

@@ -3041,6 +3041,82 @@ jobs:
           go-version: '1.24.13' # exact: bump deliberately (#1645)
           cache: false
 
+      - name: Select the JDKs (Maven legs)
+        id: jdks
+        if: steps.gate.outputs.run == 'true'
+        # The Maven legs build with Maven on JDK 17 and run their drop-in
+        # check (every class of the original jar and of the patched jar,
+        # loaded and linked) on each feature release listed here. All five
+        # come with GitHub's ubuntu-24.04 runner image as JAVA_HOME_<N>_X64;
+        # setup-java below installs them when this runner lacks one. Java 8
+        # is the oldest runtime either source has for linux x64: no setup-java
+        # distribution publishes Java 6 or 7 there (the Azul metadata API
+        # that `distribution: zulu` queries starts at 8), so the legs check
+        # the Java 6 class-file level of their jar without running on Java 6.
+        env:
+          JAVA_FEATURES: '8 11 17 21 25'
+        run: |
+          set -euo pipefail
+          missing=''
+          for feature in $JAVA_FEATURES; do
+            var="JAVA_HOME_${feature}_X64"
+            if [ -z "${!var:-}" ]; then missing="$missing $feature"; fi
+          done
+          if [ -z "$missing" ]; then
+            echo "JAVA_HOME=$JAVA_HOME_17_X64" >> "$GITHUB_ENV"
+            echo "$JAVA_HOME_17_X64/bin" >> "$GITHUB_PATH"
+            echo "runner-jdks=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "JDKs not on the runner image:$missing"
+            echo "runner-jdks=false" >> "$GITHUB_OUTPUT"
+          fi
+          # The legs fail if one of these has no JAVA_HOME_<N>_<arch>.
+          echo "SOCKET_PATCH_MAVEN_E2E_JAVA=${JAVA_FEATURES// /,}" >> "$GITHUB_ENV"
+
+      - name: Setup Java (JDKs not on the runner image)
+        if: (steps.gate.outputs.run == 'true') && steps.jdks.outputs.runner-jdks != 'true'
+        uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+        timeout-minutes: 10
+        with:
+          distribution: temurin
+          # Every listed JDK gets its JAVA_HOME_<N>_X64; the last one becomes
+          # JAVA_HOME, the JDK Maven runs on.
+          java-version: |
+            8
+            11
+            21
+            25
+            17
+
+      - name: Install Maven 3.9.16 (Maven legs)
+        if: steps.gate.outputs.run == 'true'
+        # The same pinned tarball as the `e2e` job's Maven legs: Maven
+        # Central's CDN first, the Apache archive as the fallback, and either
+        # must match the committed SHA512 in scripts/maven-sha512.json.
+        env:
+          MAVEN_VERSION: '3.9.16'
+        run: |
+          file="apache-maven-${MAVEN_VERSION}-bin.tar.gz"
+          url="https://repo.maven.apache.org/maven2/org/apache/maven/apache-maven/${MAVEN_VERSION}/${file}"
+          archive_url="https://archive.apache.org/dist/maven/maven-3/${MAVEN_VERSION}/binaries/${file}"
+          if ! curl -fsSL --retry 5 --retry-all-errors "$url" -o "$RUNNER_TEMP/maven.tgz"; then
+            echo "::warning::Maven Central download failed; falling back to the Apache archive."
+            curl -fsSL --retry 5 --retry-all-errors "$archive_url" -o "$RUNNER_TEMP/maven.tgz"
+          fi
+          python - "$MAVEN_VERSION" "$RUNNER_TEMP/maven.tgz" <<'PY'
+          import hashlib, json, sys
+          from pathlib import Path
+          expected = json.loads(Path("scripts/maven-sha512.json").read_text())[sys.argv[1]]
+          if hashlib.sha512(Path(sys.argv[2]).read_bytes()).hexdigest() != expected:
+              raise SystemExit("Maven archive SHA512 mismatch")
+          PY
+          python -m tarfile -e "$RUNNER_TEMP/maven.tgz" "$RUNNER_TEMP"
+          {
+            echo "SOCKET_PATCH_MAVEN_E2E_MVN=$RUNNER_TEMP/apache-maven-${MAVEN_VERSION}/bin/mvn"
+            echo "SOCKET_PATCH_MAVEN_E2E_VERSION=$MAVEN_VERSION"
+            echo "SOCKET_PATCH_MAVEN_E2E_REQUIRED=1"
+          } >> "$GITHUB_ENV"
+
       - name: Run hosted-mode production e2e
         if: steps.gate.outputs.run == 'true'
         env:
@@ -3099,6 +3175,40 @@ jobs:
             sleep $((attempt * 20))
           done
           echo "::error title=hosted-e2e::the vendored vlt production proof failed on all 3 attempts"
+          exit 1
+
+      - name: Run vendored- and agent-mode production e2e (Maven)
+        if: steps.gate.outputs.run == 'true'
+        # The other two modes of the Maven leg the hosted suite just ran:
+        # production's free jackson-databind 2.7.9.2 patch, vendored (a fresh
+        # checkout builds offline against the committed jar) and agent (the
+        # jar in the Maven local repository is swapped), each through real
+        # Maven and the drop-in check on the JDKs selected above.
+        env:
+          SOCKET_PATCH_VENDORED_E2E_STRICT: '1'
+        run: |
+          set -uo pipefail
+          for attempt in 1 2 3; do
+            echo "::group::vendored and agent Maven production attempt $attempt"
+            status=0
+            cargo test -p socket-patch-cli --test e2e_vendored_production -- \
+              --ignored maven_ --nocapture 2>&1 | tee maven-vendored-production.log || status=$?
+            echo "::endgroup::"
+            if [ "$status" -eq 0 ]; then
+              # A name filter that matches no test passes too, so require
+              # each leg's last report line.
+              for mode in vendored agent; do
+                if ! grep -q "^MAVEN-PROD mode=$mode .* step=remove pass" maven-vendored-production.log; then
+                  echo "::error title=hosted-e2e::the Maven $mode production leg did not run"
+                  exit 1
+                fi
+              done
+              exit 0
+            fi
+            echo "::warning title=vendored and agent Maven production attempt $attempt failed::retrying"
+            sleep $((attempt * 20))
+          done
+          echo "::error title=hosted-e2e::the vendored and agent Maven production legs failed on all 3 attempts"
           exit 1
 
   # The aggregate required status check for the merge queue (and PRs). It needs
