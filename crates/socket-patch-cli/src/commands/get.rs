@@ -2017,7 +2017,7 @@ async fn save_patch_record(
             &args.common,
             socket_dir,
             &manifest,
-            &[patch.purl.as_str()],
+            &[(patch.purl.as_str(), &files)],
             client,
         ))
         .await;

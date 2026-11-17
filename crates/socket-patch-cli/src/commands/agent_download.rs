@@ -975,15 +975,16 @@ async fn rollback_pass(
     pass
 }
 
-/// Before the manifest records of `replaced` (purls) are replaced by
-/// other patches: roll the recorded patch of each back in every installed
-/// copy (#2096), so a replacement is "roll back the old patch, record the
-/// new one, apply it".
+/// Before the manifest records of `replaced` (each purl with the files of
+/// the patch that replaces its record) are replaced: where the new patch
+/// does not list every file the recorded one changed, roll the recorded
+/// patch back in every installed copy (#2096), so that replacement is
+/// "roll back the old patch, record the new one, apply it".
 ///
-/// The new patch need not list every file the recorded one changed. Once
-/// the record is replaced nothing lists such a file, so one left patched
-/// would pass `apply --check` and `vex`, and no `rollback` could restore
-/// it. Rolling back the whole record (not those files alone) keeps the
+/// Once the record is replaced nothing lists a file the new patch dropped,
+/// so one left patched would pass `apply --check` and `vex`, and no
+/// `rollback` could restore it. Rolling back the whole record (not those
+/// files alone) keeps the
 /// engine on records as `rollback` and `remove` run it: a Go redirect, a
 /// swapped jar and a rebuilt gem extension are undone as one unit, and
 /// the nested apply starts from the original files.
@@ -999,13 +1000,19 @@ pub(crate) async fn roll_back_replaced_patches(
     common: &GlobalArgs,
     socket_dir: &Path,
     manifest: &PatchManifest,
-    replaced: &[&str],
+    replaced: &[(&str, &HashMap<String, PatchFileInfo>)],
     api_client: &ApiClient,
 ) -> ReplacedRollback {
     let mut rollback = ReplacedRollback::default();
     let mut records = PatchManifest::new();
-    for purl in replaced {
-        if let Some(old) = manifest.patches.get(*purl) {
+    for (purl, new_files) in replaced {
+        let Some(old) = manifest.patches.get(*purl) else {
+            continue;
+        };
+        // A new patch that lists every file of the recorded one leaves
+        // nothing unrecorded: the nested apply moves each file to it, as
+        // it always has, and needs no original blob to do so.
+        if old.files.keys().any(|file| !new_files.contains_key(file)) {
             records.patches.insert((*purl).to_string(), old.clone());
         }
     }
@@ -2071,11 +2078,11 @@ pub async fn download_and_apply_patches_into(
     // patch back first, or keep its record (#2096). Boxed: this runs the
     // rollback engine on the scan → download → apply chain, whose futures
     // must fit the main thread's stack.
-    let replaced: Vec<&str> = batch
+    let replaced: Vec<(&str, &HashMap<String, PatchFileInfo>)> = batch
         .fetched
         .iter()
         .filter(|f| matches!(f.action, PatchAction::Updated { .. }))
-        .map(|f| f.patch.purl.as_str())
+        .map(|f| (f.patch.purl.as_str(), &f.files))
         .collect();
     if !replaced.is_empty() {
         // About to write to installed packages: a hot-patch pass is no
