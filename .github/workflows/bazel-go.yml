@@ -80,8 +80,11 @@ on:
 permissions:
   contents: read
 
+# The nightly run has a group of its own. A group holds one pending run, so
+# in the group of main's pushes a second push would replace a nightly that
+# waits behind the first, and the nightly is the only run with the macOS leg.
 concurrency:
-  group: bazel-go-${{ github.event.pull_request.number || github.ref }}
+  group: bazel-go-${{ github.event.pull_request.number || github.ref }}${{ github.event_name == 'schedule' && '-nightly' || '' }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
