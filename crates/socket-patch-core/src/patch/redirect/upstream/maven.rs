@@ -330,7 +330,9 @@ pub(crate) async fn restore(
     files: &[String],
     ctx: &Ctx<'_>,
 ) -> FormatResult {
-    use crate::vendor::jvm::maven_reactor::{declares_modules, may_discover_subprojects};
+    use crate::vendor::jvm::maven_reactor::{
+        declares_modules, implicit_subprojects_in, may_discover_subprojects,
+    };
     let mut result = FormatResult::default();
     let pins = by_uuid(pins);
     // The poms as they are, and as they read once the pins so far are out.
@@ -348,14 +350,17 @@ pub(crate) async fn restore(
         .as_deref()
         .map(crate::formats::maven::maven_config_properties)
         .unwrap_or_default();
-    let reactor = view
-        .read("pom.xml")
-        .await
-        .ok()
-        .flatten()
-        .is_some_and(|root| {
-            declares_modules(&root) || may_discover_subprojects(&root, config.as_deref())
-        });
+    // A reactor as discovery reads one: the root lists modules, or Maven 4
+    // finds a subproject under it.
+    let root_pom = view.read("pom.xml").await.ok().flatten();
+    let reactor = match &root_pom {
+        Some(root) if declares_modules(root) => true,
+        Some(root) if may_discover_subprojects(root, config.as_deref()) => {
+            let disk = crate::vendor::lock_inventory::ProjectView::Disk(view.root);
+            !implicit_subprojects_in(&disk).await.is_empty()
+        }
+        _ => false,
+    };
     // Checksum-file path prefixes of the restored pins.
     let mut checksum_dirs: Vec<String> = Vec::new();
     let mut restored: Vec<&str> = Vec::new();
@@ -1111,6 +1116,58 @@ mod tests {
         let (outcome, after) = run(&[("pom.xml", hosted)]).await;
         assert_eq!(outcome.pins[0].status, PinStatus::Restored);
         assert_eq!(after["pom.xml"], input);
+    }
+
+    /// An earlier release's pin is read by its shape only in a single pom.
+    /// A Maven 4 root that could discover subprojects but has none is one:
+    /// the entry that release added goes, as before. With a subproject
+    /// beside it the root heads a reactor, where a managed entry at the
+    /// suffixed version is a rewritten one of the project's and keeps its
+    /// place at the base version.
+    #[tokio::test]
+    async fn an_earlier_pin_is_told_by_its_shape_only_in_a_single_pom() {
+        let maven_4 = |pom: String| {
+            pom.replace("POM/4.0.0", "POM/4.1.0")
+                .replace("<modelVersion>4.0.0", "<modelVersion>4.1.0")
+                .replace("<packaging>jar</packaging>", "<packaging>pom</packaging>")
+        };
+        let input = maven_4(fixture("transitive-depmgmt", "input", "pom.xml"));
+        let hosted = maven_4(fixture("transitive-depmgmt", "expected", "pom.xml"));
+        assert!(hosted.contains("<dependencyManagement>") && !input.contains("Management"));
+
+        let (outcome, after) = run(&[("pom.xml", hosted.clone())]).await;
+        assert_eq!(outcome.pins[0].status, PinStatus::Restored);
+        assert_eq!(after["pom.xml"], input, "the added entry goes");
+
+        let child = "<project xmlns=\"http://maven.apache.org/POM/4.1.0\">\n  <modelVersion>4.1.0</modelVersion>\n  <parent/>\n  <artifactId>child</artifactId>\n</project>\n";
+        let tmp = tempfile::tempdir().unwrap();
+        write_tree(
+            tmp.path(),
+            &[
+                ("pom.xml", hosted.clone()),
+                ("child/pom.xml", child.to_string()),
+            ],
+        );
+        let pins = [HostedPin {
+            purl: "pkg:maven/org.slf4j/slf4j-api@1.7.36".into(),
+            uuid: UUID.into(),
+            files: vec!["pom.xml".into()],
+        }];
+        let opts = RestoreOptions {
+            offline: true,
+            ..RestoreOptions::default()
+        };
+        let outcome = restore_upstream(tmp.path(), &pins, &opts).await;
+        assert_eq!(outcome.pins[0].status, PinStatus::Restored);
+        let after = read_tree(tmp.path());
+        assert!(
+            after["pom.xml"].contains("<version>1.7.36</version>\n      </dependency>\n    </dependencies>\n  </dependencyManagement>")
+                && !after["pom.xml"].contains(SUFFIXED)
+                && !after["pom.xml"].contains("socket-patch-"),
+            "the managed entry stays, at the base version: {}",
+            after["pom.xml"]
+        );
+        assert_eq!(after["child/pom.xml"], child);
     }
 
     #[tokio::test]
