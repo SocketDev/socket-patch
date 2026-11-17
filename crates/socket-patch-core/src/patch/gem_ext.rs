@@ -2672,7 +2672,8 @@ fn tree_changes(copy: &GemCopy, snapshot: &TreeSnapshot) -> TreeChanges {
 /// used: `Err`, with the tree as it is. Neither is one whose copies cannot
 /// all be listed, nor is a tree that cannot be: every file the listing of
 /// the snapshot lacks is removed, so a listing that left some out would
-/// delete the gem's own files ([`try_tree_files`]).
+/// delete the gem's own files ([`try_tree_files`]). Nor is one that names a
+/// file under a link in the gem dir, which would be written through it.
 fn restore_tree(copy: &GemCopy, snapshot_dir: &Path) -> std::io::Result<()> {
     let left: Vec<String> = serde_json::from_slice(&read_regular_to_bytes_sync(
         &snapshot_dir.join(SNAPSHOT_LEFT),
@@ -2681,6 +2682,25 @@ fn restore_tree(copy: &GemCopy, snapshot_dir: &Path) -> std::io::Result<()> {
     let saved_tree = snapshot_dir.join(SNAPSHOT_TREE);
     let kept: std::collections::BTreeSet<String> =
         try_tree_files(&saved_tree)?.into_iter().collect();
+    // Each file goes back by path. A snapshot this module took holds no
+    // file under a link (links are not walked when it is taken), so one
+    // that names such a path was not taken of this tree: a gem home can
+    // come from the repository being scanned, with a snapshot planted
+    // beside a parked build and a link in the gem dir to write through.
+    // Checked for every file before any is removed or written.
+    for rel in &kept {
+        let path = copy.gem_dir.join(rel);
+        if let Some(link) = crate::utils::containment::try_linked_level(&copy.gem_dir, &path)? {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "{} is a symlink, and the snapshot at {} names {rel} under it",
+                    link.display(),
+                    snapshot_dir.display()
+                ),
+            ));
+        }
+    }
     for rel in try_gem_tree_files(&copy.gem_dir)? {
         if !kept.contains(&rel) && !left.contains(&rel) {
             std::fs::remove_file(copy.gem_dir.join(&rel))?;
@@ -8053,5 +8073,48 @@ mod tests {
         );
         restore_tree(&copy, &snapshot.dir).unwrap();
         assert_eq!(tree_bytes(&copy.gem_dir), installed);
+    }
+
+    /// A gem home can come from the repository being scanned, and recovery
+    /// runs before anything else is looked at. A snapshot planted beside a
+    /// parked build, naming a file under a link in the gem dir, writes
+    /// nothing through that link: no file is created or replaced outside
+    /// the gem dir, and none of the gem's own is removed.
+    #[cfg(unix)]
+    #[test]
+    fn a_planted_tree_snapshot_writes_nothing_through_a_link() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (copy, probe) = in_tree_gem(tmp.path());
+        let installed = tree_bytes(&copy.gem_dir);
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("existing"), b"mine").unwrap();
+        std::fs::create_dir_all(parked_build_path(&probe.extension_dir)).unwrap();
+        let planted = tree_snapshot_path(&probe.extension_dir);
+        std::fs::create_dir_all(planted.join(SNAPSHOT_TREE).join("out")).unwrap();
+        for name in ["created", "existing"] {
+            let file = planted.join(SNAPSHOT_TREE).join("out").join(name);
+            std::fs::write(file, b"planted").unwrap();
+        }
+        std::fs::write(planted.join(SNAPSHOT_LEFT), b"[]").unwrap();
+        std::os::unix::fs::symlink(&outside, copy.gem_dir.join("out")).unwrap();
+
+        let why = recover_interrupted_rebuild_sync(&copy, Some("lib"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            why.contains("is a symlink") && why.contains("out/created"),
+            "{why}"
+        );
+        assert!(
+            !outside.join("created").exists(),
+            "written through the link"
+        );
+        assert_eq!(std::fs::read(outside.join("existing")).unwrap(), b"mine");
+        assert_eq!(
+            tree_bytes(&copy.gem_dir),
+            installed,
+            "the gem's own files were removed"
+        );
     }
 }
