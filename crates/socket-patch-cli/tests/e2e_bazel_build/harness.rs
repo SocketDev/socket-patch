@@ -736,6 +736,11 @@ impl Cell {
         std::fs::write(&path, bytes).unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
     }
 
+    /// The path of `rel` in the workspace copy.
+    pub fn path(&self, rel: &str) -> PathBuf {
+        self.scratch.workspace.join(rel)
+    }
+
     /// Every regular file of the workspace copy. Bazel's `bazel-*` links
     /// into the output base are links, so they are not followed.
     pub fn tree(&self) -> Tree {
@@ -870,18 +875,18 @@ impl Cell {
         assert_eq!(changed(before, &self.tree()), NOTHING, "{test}");
     }
 
-    /// `socket-patch <args> --json` in the workspace copy, as a user in
-    /// that directory runs it, against the Socket API at `api`. Its home
-    /// and temp directory are the cell's, and every proxy is a closed port,
-    /// so it reaches no host but loopback.
-    pub fn socket_patch(&self, api: &str, args: &[&str], env: &[(&str, &str)]) -> Ran {
+    /// `socket-patch <args>` in the workspace copy, as a user in that
+    /// directory runs it, against the Socket API at `api`. Its home and
+    /// temp directory are the cell's, and every proxy is a closed port, so
+    /// it reaches no host but loopback.
+    fn socket_patch_command(&self, api: &str, args: &[&str], env: &[(&str, &str)]) -> Command {
         let mut cmd = match &self.socket_bin {
             Some(bin) => hermetic::command(bin),
             None => hermetic::binary_command(),
         };
         cmd.current_dir(&self.scratch.workspace)
             .args(args)
-            .args(["--json", "--api-url", api, "--org", ORG])
+            .args(["--api-url", api, "--org", ORG])
             .args(["--api-token", "fake-token"]);
         hermetic::scrub_crawler_inputs(&mut cmd);
         cmd.env("HOME", &self.scratch.home)
@@ -893,6 +898,14 @@ impl Cell {
         cmd.env("NO_PROXY", LOOPBACK.join(","));
         cmd.env("no_proxy", LOOPBACK.join(","));
         cmd.envs(env.iter().copied());
+        cmd
+    }
+
+    /// [`Cell::socket_patch_command`] with `--json`: the run and its
+    /// envelope.
+    pub fn socket_patch(&self, api: &str, args: &[&str], env: &[(&str, &str)]) -> Ran {
+        let mut cmd = self.socket_patch_command(api, args, env);
+        cmd.arg("--json");
         let line = format!("{cmd:?}");
         let out = cmd.output().unwrap_or_else(|e| panic!("spawn {line}: {e}"));
         let stdout = String::from_utf8_lossy(&out.stdout);
@@ -906,6 +919,19 @@ impl Cell {
             envelope,
             dump,
         }
+    }
+
+    /// [`Cell::socket_patch_command`] as a person runs it, without
+    /// `--json`: what it printed on stdout and on stderr.
+    pub fn socket_patch_person(
+        &self,
+        api: &str,
+        args: &[&str],
+        env: &[(&str, &str)],
+    ) -> [String; 2] {
+        let mut cmd = self.socket_patch_command(api, args, env);
+        let out = cmd.output().expect("spawn socket-patch");
+        [out.stdout, out.stderr].map(|stream| String::from_utf8_lossy(&stream).into_owned())
     }
 
     /// `bazel shutdown`, when the pid file of a server is there. No command
@@ -971,8 +997,9 @@ fn a_release_builds_the_era_whose_range_holds_it() {
 }
 
 /// A cell no Bazel stands behind, for what is decided without one: the
-/// command line of the release `release`.
-fn cell_without_bazel(release: &str) -> Cell {
+/// command line of the release `release`, and what `socket-patch` writes
+/// in a checkout. Its workspace copy is empty.
+pub fn cell_without_bazel(release: &str) -> Cell {
     Cell {
         test: "a test".to_string(),
         repo_env: Vec::new(),

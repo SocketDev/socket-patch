@@ -620,6 +620,8 @@ async fn vendor_under_lock(
         env.mark_partial_failure();
     }
     note_classic_migration_risk(&mut env, &common.cwd, common);
+    env.warnings
+        .extend(crate::commands::sync_bazelignore(common, true).await);
     Ok((has_errors, env))
 }
 

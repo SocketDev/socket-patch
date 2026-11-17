@@ -2048,6 +2048,12 @@ async fn run_redirect_selected_untracked(
                 .push(socket_patch_core::patch::redirect::RewriteWarning { code, detail });
         }
     }
+    // A run that took the lock may have removed a vendored Go copy (a
+    // takeover). One that took none may write no file (`socket.yml`).
+    let ignored = match &lock {
+        Some(_) => crate::commands::sync_bazelignore(common, true).await,
+        None => Vec::new(),
+    };
     let mut warnings: Vec<RunWarning> = engine_warnings
         .iter()
         .map(|w| RunWarning::new(w.code.as_str(), w.detail.as_str()))
@@ -2092,6 +2098,7 @@ async fn run_redirect_selected_untracked(
         record_hosted_events(&mut env, &confirmed, &unconfirmed, &skipped, common.dry_run);
         env.set_extra("redirect", redirect_block(done.rewritten.clone()));
         env.warnings.extend(warnings);
+        env.warnings.extend(ignored);
         // Taking the lock may have finished an interrupted run's commit
         // (stderr said so then).
         env.warnings.extend(

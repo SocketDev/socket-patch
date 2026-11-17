@@ -1109,7 +1109,11 @@ pub async fn run(args: RemoveArgs) -> i32 {
     // Artifacts the sweep examined (repair's `details.checked`), and the
     // passes that failed (`cleanup_failed` run warnings under `--json`).
     let mut gc_checked = 0usize;
-    let mut cleanup_warnings: Vec<(String, String)> = Vec::new();
+    // The rollback, the vendored revert and the orphan sweep above are
+    // done with the Go copies.
+    let ignored = crate::commands::sync_bazelignore(&args.common, true).await;
+    let mut cleanup_warnings: Vec<(String, String)> =
+        ignored.into_iter().map(|w| (w.code, w.detail)).collect();
     if !args.preserve_state {
         let sweep = references.sweep(&socket_dir, args.common.dry_run).await;
         // repair's posture: a failed pass (or a pass that could not unlink
@@ -1851,6 +1855,8 @@ async fn remove_ledger_only(
     let mut env = Envelope::new(Command::Remove);
     env.dry_run = args.common.dry_run;
     env.warnings.extend(commit_recovery);
+    env.warnings
+        .extend(crate::commands::sync_bazelignore(&args.common, true).await);
     // The reverts ARE the removal: every event is recorded, so
     // `summary.removed` counts the reverted entries (`summary.verified`
     // the would-be removals on --dry-run).

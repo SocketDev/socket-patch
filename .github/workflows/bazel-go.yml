@@ -22,8 +22,9 @@ on:
     types: [opened, synchronize, reopened, ready_for_review]
     # What a pull request run covers: the Go flow and its fixture, the
     # harness and the workflows that run it, the Bazel installer and its
-    # pins, and the Go files the flow runs through, as go-compatibility.yml
-    # lists them. Nothing another ecosystem's flow owns is here, so a change
+    # pins, the Go files the flow runs through, as go-compatibility.yml
+    # lists them, and what socket-patch does only in a Bazel workspace
+    # (`bazel/`). Nothing another ecosystem's flow owns is here, so a change
     # to one ecosystem starts that ecosystem's legs only.
     #
     # What it does not cover: shared engine code (patch/redirect/mod.rs,
@@ -43,6 +44,7 @@ on:
       - 'crates/*/src/**/*golang*'
       - 'crates/*/src/**/*golang*/**'
       - 'crates/socket-patch-core/src/vendor/go*.rs'
+      - 'crates/socket-patch-core/src/bazel/**'
   push:
     branches: [main]
     # The pull request paths, and what only a push to main covers: the
@@ -62,6 +64,7 @@ on:
       - 'crates/*/src/**/*golang*'
       - 'crates/*/src/**/*golang*/**'
       - 'crates/socket-patch-core/src/vendor/go*.rs'
+      - 'crates/socket-patch-core/src/bazel/**'
       - 'crates/socket-patch-cli/tests/e2e_bazel_build/main.rs'
       - 'crates/socket-patch-core/src/patch/redirect/**'
       - 'crates/socket-patch-core/src/hosted/**'

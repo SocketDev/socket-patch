@@ -1634,6 +1634,118 @@ with the command that does, and
 | `go_vendor_modules_txt_out_of_sync` | A committed `vendor/` directory (`go mod vendor`; `go work vendor` for a workspace) whose `vendor/modules.txt` does not record a socket `replace`, or still records one that was removed. go builds with `-mod=vendor` and fails with "inconsistent vendoring" | `go mod vendor` (or `go work vendor`), then commit `vendor/` |
 | `go_requirements_out_of_sync` | The patched module's own `go.mod` requires a dependency at a version above the one the project's `go.mod` lists (agent and vendored modes; `apply` also reports a requirement the patch added). The default `-mod=readonly` build fails with "updates to go.mod needed" or "missing go.sum entry" | `go mod tidy`, then commit `go.mod` and `go.sum` |
 
+### Bazel workspaces: `.bazelignore`
+
+In a Bazel workspace the module copies of vendored and agent mode are directories that Bazel
+and gazelle walk like any other. A BUILD file in a copy (one the module ships, or the one
+`bazel run //:gazelle` writes there) is then a package of the workspace, gazelle's `go_deps`
+copies the directory with that file, and every target that uses the module fails to load
+(`No repository visible as '@rules_go'`). So socket-patch keeps the copies out of the
+workspace's packages with `.bazelignore`.
+
+A project is in a Bazel workspace when its directory, or one above it up to the root of its git
+checkout, holds a regular file `MODULE.bazel`, `REPO.bazel`, `WORKSPACE` or `WORKSPACE.bazel`
+(the names Bazel itself looks for); the nearest such directory is the Bazel root. The checkout
+is the one the `socket.yml` lookup takes for the repository root: on Unix its `.git` belongs to
+you, to root, or to the user `sudo` ran for (a root process takes any owner's). A project in no
+such checkout is looked for in its own directory only: nothing above it is read or written. In
+a Bazel workspace, every command that can write or remove a copy (`scan`, `get`, `apply`,
+`vendor`, `vendor --revert`, `rollback`, `remove`, `repair`) ends by bringing the root's
+`.bazelignore` in line with the copies on disk, unless it is a dry run. A command whose
+`--ecosystems` leaves `golang` out adds no line; it still takes away the pair of a copy that is
+gone:
+
+- While `<project>/.socket/vendor/golang` (vendored mode) or `<project>/.socket/go-patches`
+  (agent mode) exists, the file names that directory by its path from the Bazel root, on a line
+  of its own under the comment line
+  `# socket-patch: patched Go module copies, not Bazel packages (to opt out, comment out the next line)`.
+  The two lines are added at the end of the file, in its line breaks, and the file is created
+  when it is missing. Nothing is added when a line already covers the directory: its path or a
+  directory above it. Bazel reads a line literally, so a pattern, or a line with a space before
+  or after it, covers nothing.
+- Once the directory is gone, the pair is removed, and the file is the one of before, byte for
+  byte: a last line that had no line break has none again. A file that is left empty is
+  deleted, also when it was an empty file of yours. socket-patch knows its pair by the start
+  of the comment line, `# socket-patch:`: a path line under a line that starts so is its own,
+  whatever the rest of that line says, and a line without one above it is never changed. Only a
+  directory that is not there is gone: one that cannot be looked at (a directory above it that
+  you may not search) keeps its pair, and gets none. `rollback --preserve-state` keeps a
+  vendored copy on disk, and with it the line.
+- To keep the copies visible to Bazel (see the first limit below), comment the path line out
+  and leave the comment line above it: `# .socket/vendor/golang`. socket-patch then adds no
+  line for that directory, gives no warning about it, and never touches the two lines again.
+  The commented path may end in one `/` or start with `./`. Deleting both lines is no opt-out:
+  the next command writes them back. Neither is commenting out both lines, or a path line
+  changed in any other way (a space after it, a second `#`, a blank line above it).
+
+Commit `.bazelignore` with `go.mod` and the copy. A command that changed the file says so
+(`Updated <path>` or `Removed <path>`, on stdout, not under `--json` or `--silent`). With a
+`--manifest-path` into another project, the agent copies are those of `--cwd` and the vendored
+ones those of the manifest's project, and the command brings the file of each project's Bazel
+root in line. Bazel 8 and 9 also take `ignore_directories` in `REPO.bazel`, which socket-patch
+does not read: a workspace that ignores `.socket` there gets the line as well, and both
+together are fine.
+
+When the file cannot be written (a symbolic link or a directory in its place, a read-only
+directory, a read-only file, which is neither replaced nor deleted), the command still succeeds
+and warns `bazelignore_not_updated` with the line to add, or, for a copy that is gone, that its
+two lines can be deleted.
+
+Side effects and limits:
+
+- Bazel leaves an ignored directory out of every `glob()` of a package above it as well. A
+  target that hands the project's Go files to a `go` command of its own through such a glob (a
+  `genrule` that runs `go build`, a source archive, an image layer) no longer receives the
+  copies, and its `go build` fails in the sandbox:
+  `replacement directory ./.socket/vendor/golang/... does not exist` (Bazel 9.3.2). Without the
+  line the same target builds until the first `bazel run //:gazelle`, whose BUILD file in the
+  copy takes the copy out of the glob in the same way. With the line it builds when it names
+  the files of the copy one by one beside the glob, or runs outside the sandbox. Such a
+  workspace can opt out as above.
+- Only Go module copies are covered. The unpacked packages other ecosystems keep under
+  `.socket/vendor/` get no line.
+- A Bazel root that socket-patch does not look for gets no line, and no warning is given: add
+  the line by hand, with the directory's path from that root. That is a root above the root of
+  the project's git checkout (the project is a git submodule, or several checkouts sit below
+  one Bazel workspace), and a root above a project that is in no git checkout (a Docker build
+  context, an unpacked source archive) or in a checkout of another user. Nothing outside the
+  checkout, or above such a project, is read.
+- The Bazel root is the nearest directory with a workspace file. When that workspace is nested
+  in a larger one (`outer/MODULE.bazel`, `outer/inner/MODULE.bazel`, the project in `inner`),
+  the line is in `inner/.bazelignore`, which only a Bazel or gazelle run from `inner` reads. A
+  run from `outer` takes `inner` for part of its own tree (Bazel 9.3.2, gazelle 0.54.0):
+  `bazel build //...` loads the packages under `inner`, a BUILD file in the copy among them,
+  and `bazel run //:gazelle` writes a `BUILD.bazel` into the copy, after which the build in
+  `inner` fails as above. Unless `outer/.bazelignore` already names `inner`, add the line there
+  with the path from the outer root: `inner/.socket/vendor/golang`.
+- A project patched by an earlier socket-patch gets its line from the next `scan` or `get`
+  that patches in the project's mode, `repair`, `rollback`, `remove` or `vendor --revert`, and
+  from `apply` or `vendor` where the project has a manifest (a project that is only vendored
+  has none, and both end before this step). A `scan` that writes nothing else (hosted mode with
+  nothing to pin, `patches.enabled: false` in `socket.yml`) does not write this file either,
+  and `list`, `vex` and the `--check` audits never do. So the first such command after an
+  upgrade changes `.bazelignore` in a workspace that already has a copy: commit it. The line
+  does not undo what gazelle wrote before: a gazelle run may have left a `BUILD.bazel` inside
+  the copy, and the build stays broken until that file is gone. In vendored mode the next
+  `scan --mode vendored` rebuilds the copy; in agent mode delete the `BUILD.bazel` files under
+  `.socket/go-patches` by hand.
+- `scan --prune` removes vendored copies the project no longer uses after the scan's own step
+  has brought the file in line, and then takes away the pair of a copy it removed. A warning
+  the scan gave for that copy before is then out of date, and a file that pass cannot write is
+  reported by the next command.
+- Two projects under one Bazel root share the file. Each command edits it under an advisory
+  lock on the root directory itself (no lock file is made anywhere, and a command with nothing
+  to change takes no lock), so commands that run at the same moment each keep their lines.
+  Without the lock (on Windows, where a directory cannot be locked this way; on a file system
+  without such locks; when the lock stays held for a second) a pair that one project adds while
+  another project's pair is removed can be lost until the next command in that project. Pairs
+  that are only added are safe without it: each is one write at the end of the file. A command
+  that fails after it removed a copy can leave the pair of that copy behind, which ignores
+  nothing; the next command removes it.
+- A project directory whose path from the Bazel root starts with `#` or white space, or holds
+  `*`, `?` or `[`, cannot be named in `.bazelignore`: the line is written, and Bazel or gazelle
+  does not honour it.
+
 ### Go workspaces (go.work)
 
 Every Go path (`apply`, `vendor`, `scan --mode hosted`, `vex`, `list`,

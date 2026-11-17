@@ -2641,6 +2641,9 @@ async fn run_project(args: RollbackArgs, below: BelowNotes) -> i32 {
                 .iter()
                 .chain(hosted_leg.warnings.iter())
                 .for_each(|(code, detail)| run_warnings.push((code.clone(), detail.clone())));
+            // Every leg and the orphan sweep are done with the Go copies.
+            let ignored = crate::commands::sync_bazelignore(&args.common, true).await;
+            run_warnings.extend(ignored.into_iter().map(|w| (w.code, w.detail)));
             // A restored package whose ownership could not be put back, or
             // whose stale bytecode could not be removed (the engine reports
             // it on `error` with `success: true`), is restored but worth a
