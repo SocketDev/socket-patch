@@ -295,6 +295,85 @@ pub async fn wired_instances_all_ours(
     Ok(matched > 0)
 }
 
+/// Why the Bun lock does not install `entry`'s committed tarball although it
+/// names it: a tuple (record, in `bun.lockb`) resolving to the artifact
+/// carries a sha512 that is not the artifact's own. Bun 1.3.10 and later
+/// check that digest, so a cold install then fails `Integrity check failed`,
+/// and Bun 1.4 keys its tarball cache by it, so a cache that already holds a
+/// tarball with the pinned digest installs THAT one without opening the
+/// path. Either way the lock does not deliver the vendored bytes, so
+/// `vendor --check` reports it and `vex` does not attest the patch. `None`
+/// when every pin matches, when the lock carries none for the artifact (the
+/// digest-less tuple Bun 1.1.39 to 1.3.9 re-save), or when the lock or the
+/// artifact cannot be read (their own checks say so).
+pub async fn lock_pin_mismatch(entry: &VendorEntry, project_root: &Path) -> Option<String> {
+    let artifact = entry.artifact.path.trim_start_matches("./").to_string();
+    if !(artifact.ends_with(".tgz") || artifact.ends_with(".tar.gz")) {
+        return None;
+    }
+    // The canonical path, and the same path under a workspace member (the
+    // copies a binary workspace lock resolves through).
+    let resolves_to_artifact = |target: &str| {
+        let target = target.trim_start_matches("./").replace('\\', "/");
+        target == artifact || target.ends_with(&format!("/{artifact}"))
+    };
+    let pins: Vec<String> = if binary_lock_drives(project_root) {
+        let bytes = crate::utils::fs::read_regular_to_bytes(&project_root.join("bun.lockb"))
+            .await
+            .ok()?;
+        super::bun_lockb::BunLockb::parse_packages(&bytes)
+            .ok()?
+            .into_iter()
+            .filter(|p| !p.bundled_only && resolves_to_artifact(&p.resolution))
+            .filter_map(|p| p.integrity)
+            .collect()
+    } else {
+        let text = read_regular_to_string(&project_root.join(BUN_LOCK))
+            .await
+            .ok()?;
+        let lock = BunTextLock::parse_shared(&text).ok()?;
+        lock.entries
+            .iter()
+            .filter(|e| !is_bundled_entry(e) && matches!(e.elems.len(), 2 | 3))
+            .filter(|e| {
+                e.elems
+                    .first()
+                    .and_then(|raw| decode_json_string(raw))
+                    .and_then(|spec| {
+                        crate::vendor::bun_lock_text::split_name_spec(&spec)
+                            .map(|(_, target)| resolves_to_artifact(target))
+                    })
+                    .unwrap_or(false)
+            })
+            .filter_map(|e| e.elems.get(2).and_then(|raw| decode_json_string(raw)))
+            .collect()
+    };
+    let pins: Vec<String> = pins
+        .into_iter()
+        .filter(|pin| pin.starts_with("sha512-"))
+        .collect();
+    if pins.is_empty() {
+        return None;
+    }
+    let bytes = crate::utils::fs::read_regular_to_bytes(&project_root.join(&artifact))
+        .await
+        .ok()?;
+    let actual = crate::utils::digest::sha512_sri_of(&bytes);
+    let lock = if binary_lock_drives(project_root) {
+        "bun.lockb"
+    } else {
+        BUN_LOCK
+    };
+    pins.iter().any(|pin| *pin != actual).then(|| {
+        format!(
+            "{lock} pins {artifact} to a sha512 that is not that file's, so `bun install` \
+             does not install the vendored tarball (it fails the integrity check, or \
+             installs a cached tarball with the pinned digest); re-run `socket-patch scan \
+             --mode vendored` to rewrite the pin"
+        )
+    })
+}
+
 /// Active vendor resolutions in a binary lock. Old string-pool contents are
 /// deliberately ignored so repair and garbage collection cannot resurrect
 /// a package whose resolution has already been reverted.
@@ -3067,6 +3146,100 @@ mod tests {
         assert!(
             rewritten.contains(".socket/vendor/npm/"),
             "the packages entry must point at the vendored tarball: {rewritten}"
+        );
+    }
+
+    /// The lock must pin the vendored tarball to that tarball's own sha512.
+    /// With any other digest Bun does not install it: a cold install fails
+    /// the integrity check and Bun 1.4, which keys its cache by the pin,
+    /// installs whatever cached tarball has that digest. `vendor --check`
+    /// names it and `vex` does not attest it; the digest-less tuple Bun
+    /// 1.1.39 to 1.3.9 re-save carries no pin to be wrong.
+    #[tokio::test]
+    async fn a_lock_pin_that_is_not_the_artifacts_is_reported() {
+        let fx = fixture_with(BN3_BEFORE_LOCK, "node_modules/left-pad").await;
+        let (_, entry, _) = expect_done(fx.vendor(false).await);
+        let entry = entry.unwrap();
+        assert_eq!(lock_pin_mismatch(&entry, fx.root()).await, None);
+        assert_eq!(
+            crate::vendor::npm_flavor::check_npm_wiring(&entry, fx.root()).await,
+            Ok(())
+        );
+        assert_eq!(
+            crate::vendor::verify::verify_vendored_patch_record(fx.root(), &entry, &fx.record)
+                .await,
+            Ok(()),
+            "the tarball vendoring packs passes the strict reader"
+        );
+
+        let wired = fx.read_lock().await;
+        let pin = fx.actual_integrity().await;
+        assert!(wired.contains(&pin), "{wired}");
+        let other = format!("sha512-{}==", "B".repeat(86));
+        tokio::fs::write(fx.root().join(BUN_LOCK), wired.replace(&pin, &other))
+            .await
+            .unwrap();
+        let detail = lock_pin_mismatch(&entry, fx.root())
+            .await
+            .expect("a foreign pin is a mismatch");
+        assert!(
+            detail.contains("bun.lock pins") && detail.contains(&fx.rel_tgz()),
+            "{detail}"
+        );
+        assert_eq!(
+            crate::vendor::npm_flavor::check_npm_wiring(&entry, fx.root()).await,
+            Err(detail)
+        );
+
+        // The 2-tuple an older Bun re-saves has no pin.
+        let digestless = wired.replace(&format!(", \"{pin}\"]"), "]");
+        assert_ne!(digestless, wired, "replacement must hit");
+        tokio::fs::write(fx.root().join(BUN_LOCK), digestless)
+            .await
+            .unwrap();
+        assert_eq!(lock_pin_mismatch(&entry, fx.root()).await, None);
+    }
+
+    /// npm-family installers strip the first path segment whatever it is,
+    /// so a tarball holding the patched file under `package/` and the
+    /// original under another root installs the original. The committed
+    /// tarball is read as they extract it: one that is not in the shape
+    /// vendoring writes does not verify.
+    #[tokio::test]
+    async fn a_tarball_with_a_second_root_does_not_verify() {
+        use std::io::Read as _;
+        let fx = fixture_with(BN3_BEFORE_LOCK, "node_modules/left-pad").await;
+        let (_, entry, _) = expect_done(fx.vendor(false).await);
+        let entry = entry.unwrap();
+        let path = fx.root().join(fx.rel_tgz());
+        let tgz = tokio::fs::read(&path).await.unwrap();
+
+        let mut out = tar::Builder::new(flate2::write::GzEncoder::new(
+            Vec::new(),
+            flate2::Compression::default(),
+        ));
+        let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(&tgz[..]));
+        for member in archive.entries().unwrap() {
+            let mut member = member.unwrap();
+            let header = member.header().clone();
+            let mut data = Vec::new();
+            member.read_to_end(&mut data).unwrap();
+            out.append(&header, &data[..]).unwrap();
+        }
+        let original = b"module.exports = 'unpatched';\n";
+        let mut header = tar::Header::new_gnu();
+        header.set_size(original.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        out.append_data(&mut header, "other-root/index.js", &original[..])
+            .unwrap();
+        let tampered = out.into_inner().unwrap().finish().unwrap();
+        tokio::fs::write(&path, &tampered).await.unwrap();
+
+        assert_eq!(
+            crate::vendor::verify::verify_vendored_patch_record(fx.root(), &entry, &fx.record)
+                .await,
+            Err("vendor_artifact_non_canonical".to_string())
         );
     }
 

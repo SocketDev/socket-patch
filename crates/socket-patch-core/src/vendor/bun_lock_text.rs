@@ -599,11 +599,9 @@ fn inferred_bundled_copies(entries: &[BunEntry], flagged: &[bool]) -> Option<Vec
     Some(inferred)
 }
 
-/// `(header_idx, close_idx)` of the `"packages": {` section.
+/// `(header_idx, close_idx)` of the lock's own `"packages": {` section.
 pub(crate) fn packages_bounds(lines: &[String]) -> Option<(usize, usize)> {
-    let start = lines
-        .iter()
-        .position(|l| l.trim_end() == "  \"packages\": {")?;
+    let start = top_level_packages_header(lines)?;
     let end = lines
         .iter()
         .enumerate()
@@ -611,6 +609,56 @@ pub(crate) fn packages_bounds(lines: &[String]) -> Option<(usize, usize)> {
         .find(|(_, l)| matches!(l.trim_end(), "  }" | "  },"))
         .map(|(i, _)| i)?;
     Some((start, end))
+}
+
+/// The line holding the lock's top-level `"packages"` key, in bun's emitted
+/// spelling: the first such line that is a key of the root object and not
+/// inside a comment. The lock is JSONC, so the same text can also sit in a
+/// `/* … */` block or under some other key, where Bun does not read it as
+/// the package list; taking that line would attest (or rewire) entries
+/// Bun never installs. Bun itself takes the first of two top-level keys.
+/// Only the lock's head is walked: the scan stops at the header.
+fn top_level_packages_header(lines: &[String]) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut in_block_comment = false;
+    for (idx, line) in lines.iter().enumerate() {
+        if depth == 1 && !in_block_comment && line.trim_end() == "  \"packages\": {" {
+            return Some(idx);
+        }
+        let bytes = line.as_bytes();
+        // A JSON string cannot span lines.
+        let mut in_string = false;
+        let mut i = 0;
+        while i < bytes.len() {
+            let byte = bytes[i];
+            if in_block_comment {
+                if byte == b'*' && bytes.get(i + 1) == Some(&b'/') {
+                    in_block_comment = false;
+                    i += 1;
+                }
+            } else if in_string {
+                match byte {
+                    b'\\' => i += 1,
+                    b'"' => in_string = false,
+                    _ => {}
+                }
+            } else {
+                match byte {
+                    b'"' => in_string = true,
+                    b'/' if bytes.get(i + 1) == Some(&b'/') => break,
+                    b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                        in_block_comment = true;
+                        i += 1;
+                    }
+                    b'{' | b'[' => depth += 1,
+                    b'}' | b']' => depth = depth.saturating_sub(1),
+                    _ => {}
+                }
+            }
+            i += 1;
+        }
+    }
+    None
 }
 
 /// Strictly parse every entry line of the packages section. Any line that
@@ -623,8 +671,16 @@ pub(crate) fn parse_packages_section(lines: &[String]) -> Result<Vec<BunEntry>, 
         // emitted shape (tab/4-space re-indent, `"packages" : {`) must refuse
         // rather than read as "no entries" — treating it as empty would make
         // the caller silently skip a lock bun itself parses fine.
-        return if lines.iter().any(|l| l.trim_end() == "  \"packages\": {") {
+        return if top_level_packages_header(lines).is_some() {
             Err("unterminated \"packages\" section".to_string())
+        } else if lines.iter().any(|l| l.trim_end() == "  \"packages\": {") {
+            // Spelled as bun spells it, but not a key of the root object
+            // (inside a comment, or under another key): not the package
+            // list Bun reads, and no reason to read the lock as empty.
+            Err(
+                "the only \"packages\" section is inside a comment or under another key"
+                    .to_string(),
+            )
         } else if lines.iter().any(|l| {
             l.trim_start()
                 .strip_prefix("\"packages\"")
@@ -1205,6 +1261,82 @@ mod tests {
         assert!(!bundled(
             r#"    "q": ["q@1.0.0", "", { "bundled": false }, "sha512-X=="],"#
         ));
+    }
+
+    /// The package list is the root object's `"packages"` key. The same
+    /// text inside a comment, or under another key, is not what Bun reads:
+    /// a decoy placed ahead of the real section (holding a Socket-wired
+    /// entry while the real one stays on the registry) must not be the
+    /// section that is parsed, attested or rewired.
+    #[test]
+    fn only_the_root_objects_packages_key_is_the_package_list() {
+        let real = "    \"left-pad\": [\"left-pad@1.3.0\", \"\", {}, \"sha512-REAL==\"],";
+        let decoy = "    \"left-pad\": [\"left-pad@https://patch.socket.dev/x/left-pad-1.3.0.tgz\", {}, \"sha512-DECOY==\"],";
+        let lock = |head: &[&str]| -> Vec<String> {
+            let mut lines = vec!["{", "  \"lockfileVersion\": 2,"];
+            lines.extend_from_slice(head);
+            lines.extend_from_slice(&["  \"packages\": {", real, "  }", "}", ""]);
+            lines.into_iter().map(str::to_string).collect()
+        };
+        let specs = |lines: &[String]| -> Vec<String> {
+            parse_packages_section(lines)
+                .unwrap()
+                .iter()
+                .map(|e| decode_json_string(&e.elems[0]).unwrap())
+                .collect()
+        };
+        for head in [
+            // A block comment holding a whole decoy section.
+            &["  /*", "  \"packages\": {", decoy, "  }", "  */"][..],
+            // The same on one opening line, and closed mid-line.
+            &["  /* x", "  \"packages\": {", decoy, "  } */"][..],
+            // Under another top-level key, indented like a top-level key.
+            &[
+                "  \"x-decoy\": {",
+                "  \"packages\": {",
+                decoy,
+                "  }",
+                "  },",
+            ][..],
+            // Comment markers inside a string are content.
+            &["  \"note\": \"/* not a comment\","][..],
+            &["  \"url\": \"https://example.test/a\","][..],
+            // A line comment mentioning a brace.
+            &["  // {{{"][..],
+            // The plain head.
+            &[][..],
+        ] {
+            let lines = lock(head);
+            assert_eq!(specs(&lines), ["left-pad@1.3.0"], "{head:?}");
+        }
+        // Two top-level keys: the first, as Bun reads it.
+        let twice: Vec<String> = [
+            "{",
+            "  \"lockfileVersion\": 2,",
+            "  \"packages\": {",
+            real,
+            "  },",
+            "  \"packages\": {",
+            decoy,
+            "  }",
+            "}",
+        ]
+        .iter()
+        .map(|l| l.to_string())
+        .collect();
+        assert_eq!(specs(&twice), ["left-pad@1.3.0"]);
+        // No real section at all: refused, not read as an empty lock.
+        let only_decoy: Vec<String> = ["{", "  /*", "  \"packages\": {", decoy, "  }", "  */", "}"]
+            .iter()
+            .map(|l| l.to_string())
+            .collect();
+        let err = parse_packages_section(&only_decoy)
+            .err()
+            .expect("a lock whose only section is a decoy is refused");
+        assert!(
+            err.contains("inside a comment or under another key"),
+            "{err}"
+        );
     }
 
     /// A lock section with the given entry lines, parsed whole.

@@ -144,8 +144,34 @@ pub async fn verify_vendored_patch_record(
         }
         return Ok(());
     }
+    // An npm tarball is read strictly: the installers strip the first path
+    // segment whatever it is and let a later member overwrite an earlier
+    // one, so a tarball carrying the patched file under `package/` and the
+    // original under another root (or a second spelling of the same name)
+    // would verify here and install unpatched. Every tarball vendoring
+    // writes is in the canonical shape; one that is not was edited.
+    let strict_npm = is_tarball && entry.ecosystem == "npm";
     let map = tokio::task::spawn_blocking(move || {
-        if is_tarball {
+        if strict_npm {
+            let (file, meta) = crate::utils::fs::open_regular_file_sync(&artifact)
+                .map_err(|_| "vendor_artifact_unreadable".to_string())?;
+            if meta.len() > MAX_HEALTH_HASH_BYTES {
+                return Err("vendor_artifact_unreadable".to_string());
+            }
+            let mut bytes = Vec::new();
+            file.take(MAX_HEALTH_HASH_BYTES + 1)
+                .read_to_end(&mut bytes)
+                .map_err(|_| "vendor_artifact_unreadable".to_string())?;
+            if bytes.len() as u64 > MAX_HEALTH_HASH_BYTES {
+                return Err("vendor_artifact_unreadable".to_string());
+            }
+            crate::patch::package::read_archive_bytes_to_map_strict(&bytes).map_err(|e| match e {
+                crate::patch::package::ArchiveError::NonCanonical(_) => {
+                    "vendor_artifact_non_canonical".to_string()
+                }
+                _ => "vendor_artifact_unreadable".to_string(),
+            })
+        } else if is_tarball {
             read_archive_to_map(&artifact).map_err(|_| "vendor_artifact_unreadable".to_string())
         } else {
             read_wheel_to_map(&artifact)
@@ -743,6 +769,7 @@ pub async fn check_vendored_artifact(
                 "vendor_hash_mismatch"
                 | "file_not_found"
                 | "vendor_artifact_unreadable"
+                | "vendor_artifact_non_canonical"
                 | "vendor_inventory_mismatch"
                 | "vendor_workspace_artifact_missing"
                 | "vendor_workspace_artifact_corrupt" => ArtifactHealth::Corrupt { reason: tag },
@@ -830,6 +857,10 @@ pub async fn describe_artifact_failure(
                 "vendor_hash_mismatch" => "has a patched file that does not match the patch",
                 "file_not_found" => "is missing a patched file",
                 "vendor_artifact_unreadable" => "cannot be read",
+                "vendor_artifact_non_canonical" => {
+                    "is not laid out the way vendoring writes it (an entry outside package/, a \
+                     duplicate or a non-file entry)"
+                }
                 "vendor_inventory_mismatch" => "has files that differ from its recorded inventory",
                 _ => "failed verification",
             };

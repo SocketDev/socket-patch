@@ -51,6 +51,8 @@ other npm lockfile flavors.
 | `bun.lock` with a `lockfileVersion` ≥ 4, no integer version, or a `packages` section outside bun's single-line grammar (a comment line, a re-indent) | Refused `redirect_bun_lock_unsupported`. | Refused `vendor_lockfile_version_unsupported` (preflight and engine). | The inventory does not read the lock and says so (`bun_lock_unsupported`, a scan warning): installed packages are still crawled, and a checkout without `node_modules` ends `No packages found (see the warning).` |
 | A root `package.json` with comments or trailing commas, which Bun installs from (1.1.45 to 1.4.4) and npm, yarn, pnpm and vlt refuse | Read as Bun reads it: its `workspaces` patterns name the workspace root, so a member directory is refused with the root named, and a stray lock inside a member is never rewired or attested. | Same. | Members under directory names the crawl prunes (`vendor/`, `build/`, `dist/`, …) are found through the patterns and patched. `vex` reads the product name and version from it. |
 | A copy inside a bundled tree: an entry Bun flags `"bundled": true`, or an unflagged entry (record, in `bun.lockb`) that only bundled copies depend on. Bun writes the dependencies of a bundled copy as ordinary entries and never installs them; `npm@6.14.18` has 123 flagged and 399 unflagged ones | Not rewired; warns `redirect_bun_bundled_instance_skipped` naming the entry, and the in-run VEX never assumes the patch applied. A registry copy of the same version elsewhere in the lock is still rewired, and is not attested while the bundled copy ships unpatched. | Not vendored: `vendor_lock_entry_not_rewritable` when every copy is bundled, `vendor_bundled_instance_skipped` when a registry copy is vendored beside it. | The installed copy is patched in place. |
+| A `"packages": {` line that is not the root object's key: inside a `/* … */` comment, or under another key (the lock is JSONC, and Bun reads neither as the package list) | Ignored: the section read is the root object's first `packages` key, the one Bun reads. A lock holding only such a line is refused `redirect_bun_lock_unsupported`. | Same, `vendor_lockfile_version_unsupported`. | Same section for the inventory and for `vex`, so entries Bun never installs are neither listed nor attested. |
+| A vendored tuple (record) whose sha512 is not the committed tarball's, or a committed tarball with an entry outside `package/`, a duplicate name or a non-file entry | — | `vendor --check` fails: the lock pin as a wiring failure, the tarball shape as a corrupt artifact (`vendor_artifact_non_canonical`). A re-run of `scan --mode vendored` rewrites the pin; `repair` restores the tarball. | `vex` omits the patch (`vendor_lock_pin_mismatch`, `vendor_artifact_non_canonical`). |
 | `bun.lock` listing the patched package's `packages` key on more than one line (a merge that kept both sides) | No duplicate check: the line grammar takes each line as an entry. | Refused `vendor_lockfile_version_unsupported` for that package before any write (a revert finds its line by key); a ledger written before this refusal still reverts, each record restoring its own line. | Each line is read as an entry. |
 
 One detail text serves both modes for the version gate: a newer version says
@@ -279,14 +281,18 @@ runners) from the GitHub releases and verifies it against `SHASUMS256.txt`. Ever
   `bun install --save-text-lockfile` carries that path into `bun.lock`
   (`"consumer": "packages/consumer"`), and its text reader then re-resolves
   the workspace: frozen installs fail and an unfrozen install drops the
-  pins (#803). Bun 1.3.14 accepts the path. A hosted or vendored re-run on
+  pins (#803). Bun 1.3.14 accepts the path, and Bun 1.4.4 writes the
+  manifest's `workspace:*` itself when it migrates, so there is nothing to
+  heal there. A hosted or vendored re-run on
   the migrated lock restores the manifest's `workspace:` literal (Bun's own
   spelling) whenever the lock holds a pin; version-0 locks, where Bun 1.1
   writes the bare path itself, are left alone. Covered by
   `e2e_bun_lockb::workspace_text_migration_heals_on_rerun`
   on the 1.4.2 leg.
 - **Binary → text migration of a vendored lock.** The migration deletes
-  `bun.lockb` and carries the vendored tuples into `bun.lock`, while the
+  `bun.lockb` (Bun 1.2 and later; 1.1.39–1.1.45 `--save-text-lockfile`
+  keeps it beside the new `bun.lock`, and Bun then installs from
+  `bun.lock`: measured on 1.1.45 and 1.4.4) and carries the vendored tuples into `bun.lock`, while the
   vendor state still records `bun.lockb` package snapshots. `vendor
   --revert`, `rollback` and the hosted takeover then restore each recorded
   registry package as the tuple Bun writes for it (an empty registry slot

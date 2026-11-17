@@ -927,10 +927,15 @@ pub async fn revert_npm_any(
 /// human reason) when the lock installs a copy of the entry's
 /// `name@version` the vendored artifact does not reach (#588), and for
 /// yarn classic when a wired block names a dependency the lock never
-/// resolves (#1379). The other flavors' wiring is left to the artifact
-/// check and `vex`.
+/// resolves (#1379), and for bun when the lock pins the artifact to a
+/// digest that is not its own ([`bun_lock::lock_pin_mismatch`]). The other
+/// flavors' wiring is left to the artifact check and `vex`.
 pub async fn check_npm_wiring(entry: &VendorEntry, project_root: &Path) -> Result<(), String> {
     match NpmLockFlavor::from_recorded(entry.flavor.as_deref()) {
+        Some(NpmLockFlavor::Bun) => match bun_lock::lock_pin_mismatch(entry, project_root).await {
+            Some(detail) => Err(detail),
+            None => Ok(()),
+        },
         Some(NpmLockFlavor::PackageLock) => {
             npm_lock::check_wiring(entry, project_root).await?;
             // A lock npm's `allow-file` refuses fails every install (#969).
