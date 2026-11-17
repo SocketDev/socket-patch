@@ -2107,7 +2107,7 @@ mod tests {
     async fn unwired_rewriter_inputs_yield_nothing() {
         for case in [
             "basic",
-            "property-version-warn",
+            "property-version",
             "version-mismatch-skip",
             "transitive-depmgmt",
         ] {
