@@ -2120,9 +2120,10 @@ so a patch that only adds a fix to that packed copy changes nothing there. `appl
 the package (`native_extensions_unsupported`, or `native_extension_build_failed` when the gem
 was rebuilt in place) and leaves the gem as it was, instead of reporting a patch that is in no
 compiled code: on such an install the library is the operating system's package, and updating
-that package is what fixes it. A patch to the gem's own C sources is rebuilt as usual. The check
-needs a filesystem that records file reads; on one that does not (a `noatime` mount, Windows by
-default) the build is taken as it is.
+that package is what fixes it. A patch to the gem's own C sources is rebuilt as usual. On Linux
+the check asks the kernel which files the build opened. Elsewhere it needs a filesystem that
+records file reads; on one that does not (a `noatime` mount, Windows by default) the build is
+taken as it is.
 
 A gem RubyGems compiled is rebuilt with the build arguments RubyGems recorded when it was
 installed. A precompiled gem is rebuilt with none: arguments Bundler recorded for it (a

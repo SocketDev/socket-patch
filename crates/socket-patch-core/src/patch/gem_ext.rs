@@ -2940,18 +2940,6 @@ fn mark_unread(path: &Path) -> bool {
     set && accessed(path) == Some(unread_time())
 }
 
-/// Mark the record's build inputs under `gem_dir` unread, right before a
-/// build of them, and name those that took the mark. An input the record
-/// deletes is not there to mark.
-fn mark_inputs_unread(gem_dir: &Path, scope: &NativeScope) -> Vec<String> {
-    scope
-        .inputs
-        .iter()
-        .map(|key| normalize_file_path(key).to_string())
-        .filter(|rel| is_safe_relative_subpath(rel) && mark_unread(&gem_dir.join(rel)))
-        .collect()
-}
-
 /// Whether a read of a file in `dir` shows in its access time. A
 /// filesystem mounted `noatime`, and Windows by default, record none.
 fn records_reads(dir: &Path) -> bool {
@@ -2964,9 +2952,103 @@ fn records_reads(dir: &Path) -> bool {
     recorded
 }
 
+/// A kernel watch on files for being opened or read (Linux inotify). It
+/// sees a read whatever the mount options: CI runners and container hosts
+/// are often mounted `noatime`, where an access time says nothing.
+#[cfg(target_os = "linux")]
+struct OpenWatch(std::os::fd::OwnedFd);
+
+#[cfg(target_os = "linux")]
+impl OpenWatch {
+    /// A watch on every one of `paths`, or none at all: a file that cannot
+    /// be watched could be the one the build reads.
+    fn on(paths: &[PathBuf]) -> Option<OpenWatch> {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        use std::os::unix::ffi::OsStrExt;
+        // SAFETY: a plain syscall; the fd it returns is owned from here on.
+        let raw = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
+        if raw < 0 {
+            return None;
+        }
+        // SAFETY: `raw` is a fresh fd nothing else holds.
+        let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+        for path in paths {
+            let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+            // SAFETY: `c_path` is a NUL-terminated string that outlives the call.
+            let watch = unsafe {
+                libc::inotify_add_watch(
+                    fd.as_raw_fd(),
+                    c_path.as_ptr(),
+                    libc::IN_OPEN | libc::IN_ACCESS,
+                )
+            };
+            if watch < 0 {
+                return None;
+            }
+        }
+        Some(OpenWatch(fd))
+    }
+
+    /// Whether any watched file was opened, read or replaced since the
+    /// watch was set (a replaced file ends its watch, which is an event
+    /// too: nothing is concluded about a file that is no longer the one
+    /// watched).
+    fn fired(&self) -> bool {
+        use std::os::fd::AsRawFd;
+        let mut events = [0u8; 4096];
+        // SAFETY: the buffer is valid for `events.len()` bytes; the fd is
+        // non-blocking, so a queue with no event returns at once.
+        let read =
+            unsafe { libc::read(self.0.as_raw_fd(), events.as_mut_ptr().cast(), events.len()) };
+        read > 0
+    }
+}
+
+/// What tells, after a build, whether it read any of a record's build
+/// inputs ([`watch_inputs`]).
+struct InputWatch {
+    /// The record's build inputs that are files under the gem dir (one the
+    /// record deletes is not there to read).
+    inputs: Vec<String>,
+    /// Those given the access time [`unread_time`].
+    marked: Vec<String>,
+    #[cfg(target_os = "linux")]
+    opens: Option<OpenWatch>,
+}
+
+/// Start watching the record's build inputs under `gem_dir` for a read,
+/// right before a build of them: a kernel watch where there is one
+/// ([`OpenWatch`]), and an access time in the past everywhere, for the
+/// filesystems that record reads.
+fn watch_inputs(gem_dir: &Path, scope: &NativeScope) -> InputWatch {
+    let inputs: Vec<String> = scope
+        .inputs
+        .iter()
+        .map(|key| normalize_file_path(key).to_string())
+        .filter(|rel| is_safe_relative_subpath(rel) && is_real_file(&gem_dir.join(rel)))
+        .collect();
+    let marked = inputs
+        .iter()
+        .filter(|rel| mark_unread(&gem_dir.join(rel)))
+        .cloned()
+        .collect();
+    // After the marks: setting one opens the file.
+    #[cfg(target_os = "linux")]
+    let opens = {
+        let paths: Vec<PathBuf> = inputs.iter().map(|rel| gem_dir.join(rel)).collect();
+        (!paths.is_empty()).then(|| OpenWatch::on(&paths)).flatten()
+    };
+    InputWatch {
+        inputs,
+        marked,
+        #[cfg(target_os = "linux")]
+        opens,
+    }
+}
+
 /// The build inputs of a record that a build which has just exited cleanly
-/// did not read, when it read NONE of them and that can be told
-/// (`marked`: [`mark_inputs_unread`]'s answer for `gem_dir`; `probe_dir`: a
+/// did not read, when it read NONE of them and that can be told (`watch`:
+/// [`watch_inputs`]'s, set on `gem_dir` before the build; `probe_dir`: a
 /// writable dir on the same filesystem).
 ///
 /// A compiler reads what it compiles, and a build script reads the patch
@@ -2978,19 +3060,24 @@ fn records_reads(dir: &Path) -> bool {
 /// broad on purpose, and a build does not read every file a record
 /// carries (a manifest listing the files it adds).
 ///
-/// `None` wherever a read leaves no trace: nothing is concluded from
-/// silence the filesystem imposes.
-fn unread_inputs(gem_dir: &Path, marked: &[String], probe_dir: &Path) -> Option<Vec<String>> {
-    if marked.is_empty() {
+/// `None` wherever a read leaves no trace (no kernel watch, and a
+/// filesystem that records no access): nothing is concluded from silence.
+fn unread_inputs(gem_dir: &Path, watch: &InputWatch, probe_dir: &Path) -> Option<Vec<String>> {
+    #[cfg(target_os = "linux")]
+    if let Some(opens) = &watch.opens {
+        return (!opens.fired()).then(|| watch.inputs.clone());
+    }
+    if watch.marked.is_empty() {
         return None;
     }
-    let read_any = marked
+    let read_any = watch
+        .marked
         .iter()
         .any(|rel| accessed(&gem_dir.join(rel)) != Some(unread_time()));
     if read_any || !records_reads(probe_dir) {
         return None;
     }
-    Some(marked.to_vec())
+    Some(watch.marked.clone())
 }
 
 /// What a refusal says of a build that read none of the record's inputs.
@@ -3160,11 +3247,11 @@ async fn rebuild(
     // Nothing reads the tree between here and the check after the build
     // but the build. A rebuild without record files (a rollback's, of the
     // original sources) has no patch to look for.
-    let marked = if files.is_empty() {
-        Vec::new()
+    let watch = if files.is_empty() {
+        None
     } else {
         let (gem_dir, scope) = (copy.gem_dir.clone(), scope.clone());
-        crate::utils::fs::run_blocking(move || mark_inputs_unread(&gem_dir, &scope)).await
+        Some(crate::utils::fs::run_blocking(move || watch_inputs(&gem_dir, &scope)).await)
     };
     let built = run_ruby(&probe.ruby, RubyRun::Build(probe), copy, env, BUILD_TIMEOUT).await;
     let (copy, probe, scope, files) = (copy.clone(), probe.clone(), scope.clone(), files.clone());
@@ -3178,7 +3265,10 @@ async fn rebuild(
                 "the build exited cleanly but left no extension in {}",
                 probe.extension_dir.display()
             )),
-            Ok(_) => match unread_inputs(&copy.gem_dir, &marked, &snapshot.dir) {
+            Ok(_) => match watch
+                .as_ref()
+                .and_then(|watch| unread_inputs(&copy.gem_dir, watch, &snapshot.dir))
+            {
                 // Before anything else reads the tree: a build that read
                 // nothing of the patch is undone like a failed one.
                 Some(unread) => Err(unread_detail(&unread)),
@@ -3953,22 +4043,23 @@ async fn build_in_stage(
     stage.beat();
     // Nothing reads the staged tree between here and the check below but
     // the build.
-    let marked = match record {
+    let watch = match record {
         Some(record) => {
             let (gem_dir, scope) = (staged.gem_dir.clone(), record.scope.clone());
-            crate::utils::fs::run_blocking(move || mark_inputs_unread(&gem_dir, &scope)).await
+            Some(crate::utils::fs::run_blocking(move || watch_inputs(&gem_dir, &scope)).await)
         }
-        None => Vec::new(),
+        None => None,
     };
     let stdout = run_ruby(&probe.ruby, run, copy, env, BUILD_TIMEOUT)
         .await
         .map_err(StageFailure::Build)?;
-    let unread = {
+    if let Some(watch) = watch {
         let (gem_dir, root) = (staged.gem_dir.clone(), stage.root.clone());
-        crate::utils::fs::run_blocking(move || unread_inputs(&gem_dir, &marked, &root)).await
-    };
-    if let Some(unread) = unread {
-        return Err(StageFailure::NotRead(unread));
+        let unread =
+            crate::utils::fs::run_blocking(move || unread_inputs(&gem_dir, &watch, &root)).await;
+        if let Some(unread) = unread {
+            return Err(StageFailure::NotRead(unread));
+        }
     }
     let reported = tagged_lines(&stdout, "sp_built")
         .into_iter()
@@ -6440,12 +6531,14 @@ mod tests {
     }
 
     /// A build that read none of a record's inputs is told from one that
-    /// read any of them, by access times, and nothing is concluded where a
-    /// read leaves no trace or nothing could be marked.
+    /// read any of them, and nothing is concluded where a read leaves no
+    /// trace.
     #[test]
     fn a_build_that_read_none_of_the_inputs_is_told_from_one_that_read_any() {
         let tmp = tempfile::tempdir().unwrap();
-        if !records_reads(tmp.path()) {
+        // A kernel watch on Linux, access times elsewhere when the
+        // filesystem keeps them.
+        if !cfg!(target_os = "linux") && !records_reads(tmp.path()) {
             eprintln!("SKIP: this filesystem does not record reads in access times");
             return;
         }
@@ -6463,26 +6556,31 @@ mod tests {
             builds_extensions: true,
             ..NativeScope::default()
         };
+        let both = [
+            "ext/a/a.c".to_string(),
+            "patches/lib/0001.patch".to_string(),
+        ];
 
-        // An input the record deletes is not there to mark.
-        let marked = mark_inputs_unread(&gem_dir, &scope);
-        assert_eq!(marked, ["ext/a/a.c", "patches/lib/0001.patch"]);
-        assert_eq!(
-            unread_inputs(&gem_dir, &marked, tmp.path()),
-            Some(marked.clone())
-        );
+        // An input the record deletes is not there to watch.
+        let watch = watch_inputs(&gem_dir, &scope);
+        assert_eq!(watch.inputs, both);
         // Looking at a file, or listing its dir, is not reading it.
         std::fs::metadata(gem_dir.join("ext/a/a.c")).unwrap();
         assert_eq!(std::fs::read_dir(gem_dir.join("ext/a")).unwrap().count(), 1);
-        assert!(unread_inputs(&gem_dir, &marked, tmp.path()).is_some());
-        assert!(unread_detail(&marked).contains("ext/a/a.c, patches/lib/0001.patch"));
+        assert_eq!(
+            unread_inputs(&gem_dir, &watch, tmp.path()),
+            Some(both.to_vec())
+        );
+        assert!(unread_detail(&both).contains("ext/a/a.c, patches/lib/0001.patch"));
 
         // One read is a build of something the patch changes.
+        let watch = watch_inputs(&gem_dir, &scope);
         std::fs::read(gem_dir.join("patches/lib/0001.patch")).unwrap();
-        assert_eq!(unread_inputs(&gem_dir, &marked, tmp.path()), None);
+        assert_eq!(unread_inputs(&gem_dir, &watch, tmp.path()), None);
 
-        // Nothing marked, nothing concluded.
-        assert_eq!(unread_inputs(&gem_dir, &[], tmp.path()), None);
+        // Nothing to watch, nothing concluded.
+        let none = watch_inputs(&gem_dir, &NativeScope::default());
+        assert_eq!(unread_inputs(&gem_dir, &none, tmp.path()), None);
         assert!(!tmp.path().join(".socket-patch-read-probe").exists());
     }
 

@@ -1782,12 +1782,16 @@ fn built_gem_with_its_archive() -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf
     (tmp, proj, gem_dir, home)
 }
 
-/// Whether a read of a file under `dir` shows in its access time, as the
-/// CLI asks before it concludes anything from a file nobody read. A
-/// filesystem mounted `noatime` records none, and there the check under
-/// test cannot run.
+/// Whether the CLI can tell that a build read a file under `dir`: always
+/// on Linux, where the kernel says which files were opened; elsewhere when
+/// a read shows in a file's access time, which a filesystem mounted
+/// `noatime` does not record. Without either the check under test cannot
+/// run.
 #[cfg(unix)]
 fn records_reads(dir: &Path) -> bool {
+    if cfg!(target_os = "linux") {
+        return true;
+    }
     let probe = dir.join("read-probe");
     std::fs::write(&probe, b"probe").unwrap();
     let old = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000);
@@ -1819,7 +1823,7 @@ fn a_build_that_reads_nothing_of_the_patch_does_not_apply_it() {
     let library_patch: [RecordFile<'_>; 1] = [("patches/libsp/0100-CVE-test.patch", None, "fix\n")];
     let (_tmp, proj, gem_dir, home) = built_gem_with_its_archive();
     if !records_reads(&home) {
-        eprintln!("SKIP: this filesystem does not record reads in access times");
+        eprintln!("SKIP: no way to tell here whether a build read a file");
         return;
     }
     write_record(&proj.join(".socket"), PURL, &library_patch);
@@ -1894,7 +1898,7 @@ fn an_in_place_build_that_reads_nothing_of_the_patch_is_undone() {
     let (_tmp, proj, gem_dir) = fake_native_gem(true);
     let home = proj.join("vendor/bundle/ruby/3.4.0");
     if !records_reads(&home) {
-        eprintln!("SKIP: this filesystem does not record reads in access times");
+        eprintln!("SKIP: no way to tell here whether a build read a file");
         return;
     }
     // A build input the installed tree holds and the stand-in build never

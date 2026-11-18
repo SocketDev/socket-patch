@@ -977,15 +977,17 @@ place (below), a precompiled gem is refused.
 the patch: what a gem compiles depends on how its build is configured. A gem set up to link the
 system's copy of a library it packs (nokogiri installed with `--use-system-libraries`) never
 opens the packed copy's sources, so a record that changes only those would be written, rebuilt
-and attested with nothing of it in what Ruby loads. `apply` knows no gem's switches. It gives
-the record's build inputs an access time in the past before the build, staged or in place, and
-looks at them right after it: a build that read NONE of them did not build the patch. One read
+and attested with nothing of it in what Ruby loads. `apply` knows no gem's switches. It watches
+the record's build inputs during the build, staged or in place: on Linux with a kernel watch on
+those files being opened (inotify, which works whatever the mount options), elsewhere by giving
+them an access time in the past and looking at it right after. A build that read NONE of them
+did not build the patch. One read
 is enough, because a record also carries files no build opens. From the stage this fails the
 package with `native_extensions_unsupported` and nothing is written; from the installed tree
 it fails with `native_extension_build_failed` and the sources and the previous build are put
-back. Either way the copy is never attested. Where a read leaves no trace in a file's access
-time (a `noatime` mount, Windows by default), which `apply` tests with a file of its own,
-nothing is concluded and the build is taken as it is.
+back. Either way the copy is never attested. Off Linux, where a read leaves no trace in a
+file's access time (a `noatime` mount, Windows by default), which `apply` tests with a file of
+its own, nothing is concluded and the build is taken as it is.
 
 **Into the installed copy.** The record's files are written into the copy, and the build takes the
 place of the compiled code:
