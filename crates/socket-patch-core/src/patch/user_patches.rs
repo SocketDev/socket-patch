@@ -625,10 +625,12 @@ impl UserPatchIndex {
         let max_depth = if pattern.contains("**") {
             32
         } else {
-            pattern
-                .split('/')
-                .count()
-                .saturating_sub(prefix.components().count())
+            // One level for each segment after the literal prefix. A pattern
+            // with no segment left (`.`, `./`) names its base alone, as a
+            // literal path does: a package manager takes that one directory
+            // for it, so nothing below the base is listed. (Split again at
+            // `/`, the empty pattern would count as one segment.)
+            segments.len().saturating_sub(prefix.components().count())
         };
         let skipped = |name: &str| WALK_SKIP.contains(&name);
         let mut out = Vec::new();
@@ -1765,6 +1767,151 @@ mod tests {
         std::os::unix::fs::symlink(outside.path(), tmp.path().join("packages")).unwrap();
         let index = UserPatchIndex::discover(tmp.path()).await;
         assert!(!index.conflicts("pkg:npm/child@1.0.0").is_empty());
+    }
+
+    /// A project, in `proj` of a new directory, that lists `patterns` as its
+    /// workspace packages: in `pnpm-workspace.yaml`, or in the `workspaces`
+    /// of its `package.json`. It is its own git repository, so the walk
+    /// reads nothing above it. Three links lead to a directory outside it
+    /// that holds a `package.json`: `result` at the root, `packages/linked`
+    /// beside the member `packages/real`, and `packages/real/deep` inside
+    /// that member. The root holds a patch-package patch.
+    #[cfg(unix)]
+    fn linked_project(patterns: &[&str], in_manifest: bool) -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        let (root, out) = (tmp.path().join("proj"), tmp.path().join("out"));
+        let patterns = serde_json::json!(patterns);
+        write(&out, "package.json", "{}");
+        write(&root, ".git/HEAD", "ref: refs/heads/main\n");
+        if in_manifest {
+            let manifest = serde_json::json!({ "workspaces": patterns });
+            write(&root, "package.json", &manifest.to_string());
+        } else {
+            write(&root, "package.json", "{}");
+            let workspace = format!("packages: {patterns}\n");
+            write(&root, "pnpm-workspace.yaml", &workspace);
+        }
+        write(&root, "patches/mine+1.0.0.patch", "diff");
+        write(&root, "packages/real/package.json", "{}");
+        write(&root, "other/package.json", "{}");
+        for link in ["result", "packages/linked", "packages/real/deep"] {
+            std::os::unix::fs::symlink(&out, root.join(link)).unwrap();
+        }
+        tmp
+    }
+
+    /// Holds what the walk does in a [`linked_project`] of `patterns`,
+    /// listed in either file, through the consent gate (which names a
+    /// source by its full path) and through the view the hosted engine and
+    /// `vex` read. It reads the root and the directories `members` (both
+    /// lists are sorted, with a space between entries) and no other; it
+    /// finds the root's own patch; and `links`, and nothing else, protect
+    /// an npm package no patch names, each as a workspace member that
+    /// cannot be inspected.
+    #[cfg(unix)]
+    async fn walks(patterns: &[&str], members: &str, links: &str) {
+        let why = "(linked workspace cannot be inspected safely)";
+        for in_manifest in [false, true] {
+            let said = format!("{patterns:?} in_manifest={in_manifest}");
+            let tmp = linked_project(patterns, in_manifest);
+            let root = tmp.path().join("proj");
+            let disk = ProjectView::Disk(&root);
+            let scope = ReadScope::Workspace;
+            let gate = UserPatchIndex::walk(&disk, Some(&root), Scope::Gate, scope).await;
+            let view = UserPatchIndex::walk(&disk, None, Scope::NpmFamily, scope).await;
+            for ((index, dirs), base) in [(gate, root.as_path()), (view, Path::new(""))] {
+                let dirs: Vec<&Path> = dirs.iter().map(|dir| dir.as_path()).collect();
+                let read = [""].into_iter().chain(members.split_whitespace());
+                assert_eq!(dirs, read.map(Path::new).collect::<Vec<_>>(), "{said}");
+                let shown = |rel: &str| base.join(rel).display().to_string();
+                let named = links
+                    .split_whitespace()
+                    .map(|l| format!("{} {why}", shown(l)));
+                let unknown = index.conflicts("pkg:npm/other@1.0.0");
+                assert_eq!(unknown, named.collect::<Vec<_>>(), "{said}");
+                let mine = index.conflicts("pkg:npm/mine@1.0.0");
+                let patch = shown("patches/mine+1.0.0.patch");
+                assert!(mine.contains(&patch), "{said}: {mine:?}");
+            }
+        }
+    }
+
+    /// A pattern that names the workspace root alone has one member, the
+    /// root, which the walk reads before it looks at any pattern. pnpm
+    /// globs for the file `<pattern>/package.json` and npm for the folder
+    /// `<pattern>/`, so `.` finds the root and no other directory: nothing
+    /// below the root is a member, and a link there is none either,
+    /// wherever it leads. So the root's children are not listed, in any
+    /// spelling of the root. Beside a pattern with a segment of its own,
+    /// that pattern's link is still recorded and the root's is not. (A `!`
+    /// pattern never reaches the walk, so `!.` alone lists nothing under
+    /// any rule.)
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_pattern_that_names_the_root_takes_the_root_alone() {
+        let spellings = [".", "./", "", "./.", ".//", "packages/..", "!."];
+        for root in spellings {
+            walks(&[root], "", "").await;
+        }
+        walks(&[".", "!packages/*"], "", "").await;
+        walks(&[".", "packages/*"], "packages/real", "packages/linked").await;
+    }
+
+    /// The twin of the test above: a pattern with a segment of its own is
+    /// walked to the depth of its segments and no deeper, as it was before
+    /// the root was told apart, and a link there that is or leads to a
+    /// member is recorded. `*` lists the root's children; `packages/*`
+    /// those of `packages` and nothing inside a member; a literal path its
+    /// one directory; `**` every directory.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_pattern_with_a_segment_still_records_its_linked_members() {
+        let every_link = "packages/linked packages/real/deep result";
+        // The pattern, the members read, the links recorded.
+        let cases = [
+            ("*", "other", "result"),
+            ("packages/*", "packages/real", "packages/linked"),
+            ("packages/real/*", "", "packages/real/deep"),
+            ("packages/real", "packages/real", ""),
+            ("result", "", "result"),
+            ("packages/linked", "", "packages/linked"),
+            ("**", "other packages/real", every_link),
+        ];
+        for (pattern, members, links) in cases {
+            walks(&[pattern], members, links).await;
+        }
+    }
+
+    /// An in-memory project, where a link leads nowhere: a pattern that
+    /// names the root records none, and a pattern that names a link
+    /// records that link.
+    #[tokio::test]
+    async fn an_in_memory_root_pattern_takes_the_root_alone() {
+        use crate::vendor::lock_inventory::{MemoryEntry, MemoryProject};
+
+        let recorded = ["result (linked workspace cannot be inspected safely)"];
+        let cases: [(&str, &[&str]); 4] = [
+            ("['.']", &[]),
+            ("['./']", &[]),
+            ("['result']", &recorded),
+            ("['.', 'result']", &recorded),
+        ];
+        for (patterns, links) in cases {
+            let mut memory = MemoryProject::new();
+            let workspace = format!("packages: {patterns}\n");
+            memory.insert("pnpm-workspace.yaml", MemoryEntry::Text(workspace.into()));
+            memory.insert("package.json", MemoryEntry::Text("{}".into()));
+            memory.insert("patches/mine+1.0.0.patch", MemoryEntry::Text("diff".into()));
+            memory.insert("result", MemoryEntry::Symlink);
+            let index = UserPatchIndex::npm_family_in(&ProjectView::Memory(&memory), &[]).await;
+            assert_eq!(index.conflicts("pkg:npm/other@1.0.0"), links, "{patterns}");
+            let mine = index.conflicts("pkg:npm/mine@1.0.0");
+            // A source is a path, which Windows writes with `\`.
+            let found = mine
+                .iter()
+                .any(|source| source.replace('\\', "/") == "patches/mine+1.0.0.patch");
+            assert!(found, "{patterns}: {mine:?}");
+        }
     }
 
     #[tokio::test]

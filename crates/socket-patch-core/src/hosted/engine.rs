@@ -2798,16 +2798,58 @@ async fn rewrite_once(
                     files.get("package.json").map(String::as_str),
                     None,
                 );
+                // A default-trusted package keeps its registry record
+                // too, unless an earlier run already pinned it (#371): the
+                // text rewriter's rule, read off the binary records. They
+                // are decoded only if some override is on Bun's default
+                // list, which is rare.
+                let records = std::cell::OnceCell::new();
                 let binary_overrides: Vec<DepOverride> = overrides
                     .iter()
                     .filter(|o| {
-                        o.ecosystem != "npm"
-                            || !crate::patch::redirect::skip_bun_user_patched(
-                                &user_patched,
-                                &crate::patch::redirect::full_name(o),
-                                o,
-                                &mut rewrite,
-                            )
+                        if o.ecosystem != "npm" {
+                            return true;
+                        }
+                        let name = crate::patch::redirect::full_name(o);
+                        if crate::patch::redirect::skip_bun_user_patched(
+                            &user_patched,
+                            &name,
+                            o,
+                            &mut rewrite,
+                        ) {
+                            return false;
+                        }
+                        let newly_pins = || {
+                            let records = records.get_or_init(|| {
+                                crate::vendor::bun_lockb::BunLockb::parse_packages(&bytes)
+                                    .unwrap_or_default()
+                            });
+                            // A bundled-only record is never a pin.
+                            let already_pinned = records.iter().any(|p| {
+                                p.name == name
+                                    && !p.bundled_only
+                                    && (p.resolution == o.artifact_url
+                                        || crate::patch::redirect::is_prior_hosted_bun_spec(
+                                            &format!("{name}@{}", p.resolution),
+                                            &name,
+                                            &o.artifact_url,
+                                        ))
+                            });
+                            !already_pinned
+                                && records.iter().any(|p| {
+                                    p.name == name
+                                        && p.version.as_deref() == Some(o.version.as_str())
+                                        && !p.bundled_only
+                                })
+                        };
+                        !crate::patch::redirect::skip_bun_default_trusted(
+                            files.get("package.json").map(String::as_str),
+                            None,
+                            &name,
+                            o,
+                            newly_pins,
+                            &mut rewrite,
+                        )
                     })
                     .cloned()
                     .collect();
@@ -5675,12 +5717,14 @@ snapshots:
 
     /// REGRESSION (#371), binary lock: a default-trusted package pinned to
     /// its hosted URL in a `bun.lockb` loses Bun 1.3.5+'s default trust, so
-    /// its install scripts are silently skipped; the run says so unless the
-    /// root manifest declares `trustedDependencies`. The fixture is real Bun
-    /// 1.4.2 output: `simple-git-hooks` is on the default list, `is-number`
-    /// is not.
+    /// its install scripts are silently skipped. Unless the root manifest
+    /// declares `trustedDependencies`, its registry record is left alone
+    /// and the run says how to patch it; a record an earlier run already
+    /// pinned keeps its pin and the warning. The fixture is real Bun 1.4.2
+    /// output: `simple-git-hooks` is on the default list, `is-number` is
+    /// not.
     #[tokio::test]
-    async fn issue_371_bun_lockb_default_trusted_package_warns_that_trust_is_lost() {
+    async fn issue_371_bun_lockb_default_trusted_package_keeps_its_registry_record() {
         use crate::patch::redirect::Integrity;
         let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/bun-lockb-trusted");
@@ -5712,9 +5756,17 @@ snapshots:
             1,
         );
         assert_ne!(declared, manifest);
-        for trusted in [false, true] {
+        // The lock a run under a declared trust list writes: what an
+        // earlier release left behind in a project that declares none.
+        let mut pinned_lock: Option<Vec<u8>> = None;
+        for (trusted, already_pinned) in [(true, false), (false, false), (false, true)] {
             let tmp = tempfile::tempdir().unwrap();
-            std::fs::copy(fixture.join("bun.lockb"), tmp.path().join("bun.lockb")).unwrap();
+            match (&pinned_lock, already_pinned) {
+                (Some(bytes), true) => std::fs::write(tmp.path().join("bun.lockb"), bytes).unwrap(),
+                _ => {
+                    std::fs::copy(fixture.join("bun.lockb"), tmp.path().join("bun.lockb")).unwrap();
+                }
+            }
             std::fs::write(
                 tmp.path().join("package.json"),
                 if trusted { &declared } else { &manifest },
@@ -5741,27 +5793,67 @@ snapshots:
             };
             let read = read_candidate_files(&view, &BTreeSet::new(), &candidates).await;
             let done = rewrite(&view, read, &candidates, BTreeMap::new(), options).await;
-            assert!(
-                done.rewrite.binary_files.contains_key("bun.lockb"),
-                "{:?}",
-                done.rewrite.warnings
-            );
-            assert_eq!(done.confirmed.len(), 2, "{:?}", done.confirmed);
-            let lost: Vec<&RewriteWarning> = done
+            let trust_codes: Vec<&str> = done
                 .rewrite
                 .warnings
                 .iter()
-                .filter(|w| w.code == "redirect_bun_default_trust_lost")
+                .filter(|w| w.code.starts_with("redirect_bun_default_trust"))
+                .map(|w| w.code.as_str())
                 .collect();
-            if trusted {
-                assert!(lost.is_empty(), "{:?}", done.rewrite.warnings);
-            } else {
-                assert_eq!(lost.len(), 1, "{:?}", done.rewrite.warnings);
-                assert!(
-                    lost[0].detail.contains("simple-git-hooks@2.11.1"),
-                    "{}",
-                    lost[0].detail
-                );
+            let confirmed: Vec<&str> = done.confirmed.iter().map(|c| c.0.as_str()).collect();
+            let case = format!("trusted={trusted} already_pinned={already_pinned}");
+            match (trusted, already_pinned) {
+                // Declared trust: both pinned, nothing to say.
+                (true, _) => {
+                    assert!(
+                        trust_codes.is_empty(),
+                        "{case}: {:?}",
+                        done.rewrite.warnings
+                    );
+                    assert_eq!(confirmed.len(), 2, "{case}: {confirmed:?}");
+                    pinned_lock = Some(done.rewrite.binary_files["bun.lockb"].clone());
+                }
+                // No declared trust: the default-trusted package stays on
+                // the registry; the other one is still pinned.
+                (false, false) => {
+                    assert_eq!(
+                        trust_codes,
+                        ["redirect_bun_default_trust_skipped"],
+                        "{case}: {:?}",
+                        done.rewrite.warnings
+                    );
+                    assert_eq!(confirmed, ["pkg:npm/is-number@7.0.0"], "{case}");
+                    assert!(done.rewrite.refused_bun_uuids.contains("uuid-hooks"));
+                    let lock = &done.rewrite.binary_files["bun.lockb"];
+                    let records = crate::vendor::bun_lockb::BunLockb::parse_packages(lock).unwrap();
+                    let hooks = records
+                        .iter()
+                        .find(|p| p.name == "simple-git-hooks")
+                        .unwrap();
+                    assert_eq!(hooks.version.as_deref(), Some("2.11.1"), "{hooks:?}");
+                    let detail = &done
+                        .rewrite
+                        .warnings
+                        .iter()
+                        .find(|w| w.code == "redirect_bun_default_trust_skipped")
+                        .unwrap()
+                        .detail;
+                    assert!(
+                        detail.contains("simple-git-hooks@2.11.1")
+                            && detail.contains("stays UNPATCHED"),
+                        "{detail}"
+                    );
+                }
+                // A pin an earlier run wrote stays, and keeps the warning.
+                (false, true) => {
+                    assert_eq!(
+                        trust_codes,
+                        ["redirect_bun_default_trust_lost"],
+                        "{case}: {:?}",
+                        done.rewrite.warnings
+                    );
+                    assert_eq!(confirmed.len(), 2, "{case}: {confirmed:?}");
+                }
             }
         }
     }

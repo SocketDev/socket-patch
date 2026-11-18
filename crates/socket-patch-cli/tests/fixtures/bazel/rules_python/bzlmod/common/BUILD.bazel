@@ -1,0 +1,10 @@
+load("@rules_python//python:defs.bzl", "py_binary")
+
+# Prints OUT: PRISTINE until the package is patched.
+py_binary(
+    name = "consumer",
+    srcs = ["consumer.py"],
+    # The default is deprecated, and rules_python says so in every build.
+    legacy_create_init = 0,
+    deps = ["@pip//spvictim"],
+)

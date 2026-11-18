@@ -11,6 +11,7 @@ use tokio::sync::{Mutex, Semaphore, SemaphorePermit};
 use crate::api::client::network_error_detail;
 use crate::vendor::registry_fetch::{
     build_registry_client, npm_registry_base, pypi_json_api_base, RegistryClient,
+    SecureRegistryClient,
 };
 
 /// An npm version's `dist` block.
@@ -100,12 +101,43 @@ fn crates_index_path(name: &str) -> Option<String> {
 /// The RubyGems compact index root; override with `SOCKET_RUBYGEMS_URL`.
 pub(crate) const DEFAULT_RUBYGEMS: &str = "https://rubygems.org";
 
-pub(super) fn rubygems_base() -> String {
+pub(crate) fn rubygems_base() -> String {
     std::env::var("SOCKET_RUBYGEMS_URL")
         .ok()
         .map(|v| v.trim().trim_end_matches('/').to_string())
         .filter(|v| !v.is_empty())
         .unwrap_or_else(|| DEFAULT_RUBYGEMS.to_string())
+}
+
+/// [`rubygems_base`] as the registry a gem's sha256 is read from and a gem
+/// that is built or installed is downloaded from: `Err` when it is not an
+/// `https` URL, nor plain `http` to this machine
+/// ([`crate::utils::http::insecure_transport`]). The default is `https`, so
+/// only `SOCKET_RUBYGEMS_URL` can name such a base. A checksum and an
+/// archive read over plain http are whatever the network path serves: no
+/// request is made, and the reason says to use an https URL.
+pub(crate) fn rubygems_secure_base() -> Result<String, String> {
+    secure_gem_registry(rubygems_base())
+}
+
+/// `base` when a gem and its checksum may be fetched from it
+/// ([`rubygems_secure_base`]).
+pub(crate) fn secure_gem_registry(base: String) -> Result<String, String> {
+    match crate::utils::http::insecure_transport(&base) {
+        None => Ok(base),
+        Some(why) => Err(format!(
+            "SOCKET_RUBYGEMS_URL is not used as the gem registry: {why}; set it to an https URL"
+        )),
+    }
+}
+
+/// Whether `remote` (a lock's `remote:`, a download base) is the default
+/// RubyGems registry: rubygems.org, or its `SOCKET_RUBYGEMS_URL` stand-in.
+/// The one test of it, shared by the upstream restore and by the source
+/// gem lookup of a native-extension rebuild (`patch::gem_source`).
+pub(crate) fn is_rubygems_remote(remote: &str) -> bool {
+    use crate::formats::gem::same_remote;
+    same_remote(remote, DEFAULT_RUBYGEMS) || same_remote(remote, &rubygems_base())
 }
 
 /// Packagist's composer v2 metadata repository; override with
@@ -188,6 +220,9 @@ type RegistryCache<T> = Mutex<HashMap<(String, Option<String>, String, String), 
 /// (#1220).
 pub(crate) struct UpstreamClient {
     http: RegistryClient,
+    /// The client a gem's sha256 is read with ([`Self::rubygems_sha256`]),
+    /// built by the first such lookup.
+    secure: std::sync::OnceLock<SecureRegistryClient>,
     /// At most [`crate::utils::concurrent::registry_concurrency`] requests
     /// in flight at once. Every request this client sends takes a slot: the
     /// public registries, a project's private registry or mirror, and the
@@ -213,6 +248,7 @@ impl UpstreamClient {
     pub(crate) fn with_concurrency(offline: bool, limit: usize) -> Self {
         UpstreamClient {
             http: build_registry_client(),
+            secure: std::sync::OnceLock::new(),
             permits: Semaphore::new(limit.max(1)),
             offline,
             npm: Mutex::default(),
@@ -539,6 +575,13 @@ impl UpstreamClient {
 
     /// The rubygems.org sha256 of the ruby-platform `name-version.gem`,
     /// from the compact index bundler itself reads (`info/<name>`).
+    ///
+    /// The lock's `CHECKSUMS` entry is re-pinned from it, and after an
+    /// unwind the installed copy is replaced by the archive that has it
+    /// (`patch::gem_refresh`), which RubyGems builds when the gem has a
+    /// native extension. So it is read over a transport nobody can rewrite
+    /// ([`rubygems_secure_base`], [`SecureRegistryClient`]): a registry
+    /// reached over plain http is not asked.
     pub(crate) async fn rubygems_sha256(
         &self,
         name: &str,
@@ -548,21 +591,42 @@ impl UpstreamClient {
         if let Some(hit) = self.rubygems.lock().await.get(&key) {
             return hit.clone();
         }
-        let result = async {
-            if self.offline {
-                return Err(OFFLINE.to_string());
-            }
-            if !crate::formats::gem::is_plain_gem_token(name) {
-                return Err(format!("{name:?} is not a plain gem name"));
-            }
-            let url = format!("{}/info/{name}", rubygems_base());
-            let text = self.get_text(&url).await?;
-            compact_index_checksum(&text, version)
-                .ok_or_else(|| format!("{url} lists no ruby-platform {version} with a checksum"))
-        }
-        .await;
+        let result = self
+            .rubygems_sha256_at(rubygems_secure_base(), name, version)
+            .await;
         self.rubygems.lock().await.insert(key, result.clone());
         result
+    }
+
+    /// [`Self::rubygems_sha256`], uncached, from the registry at `base`
+    /// ([`rubygems_secure_base`]: its URL, or why it is not asked). The
+    /// base may carry a mirror's credentials: no error repeats them.
+    async fn rubygems_sha256_at(
+        &self,
+        base: Result<String, String>,
+        name: &str,
+        version: &str,
+    ) -> Result<String, String> {
+        if self.offline {
+            return Err(OFFLINE.to_string());
+        }
+        if !crate::formats::gem::is_plain_gem_token(name) {
+            return Err(format!("{name:?} is not a plain gem name"));
+        }
+        let url = format!("{}/info/{name}", base?);
+        let looked_up = async {
+            let registry = self.secure.get_or_init(SecureRegistryClient::new);
+            let bytes = {
+                let _permit = self.permit().await;
+                registry.download(&url).await?
+            };
+            let text = String::from_utf8(bytes).map_err(|_| format!("{url} is not UTF-8"))?;
+            compact_index_checksum(&text, version)
+                .ok_or_else(|| format!("{url} lists no ruby-platform {version} with a checksum"))
+        };
+        looked_up
+            .await
+            .map_err(|why: String| crate::utils::redact::redact_urls_in(&why).into_owned())
     }
 
     /// Every version packagist serves for the composer package `name`
@@ -886,6 +950,96 @@ mod tests {
                 assert_eq!(why, format!("{name:?} is not a crates.io crate name"));
             }
         }
+    }
+
+    /// A gem's checksum, and a gem that is built or installed, come from
+    /// an https registry or one on this machine. Another base is refused
+    /// with what to do about it, its credentials not repeated.
+    #[test]
+    fn a_gem_registry_reached_over_plain_http_is_refused() {
+        for base in [
+            DEFAULT_RUBYGEMS,
+            "https://gems.example.test/mirror",
+            "http://127.0.0.1:9292/upstream",
+            "http://localhost:9292",
+            "http://[::1]:9292",
+        ] {
+            assert_eq!(
+                secure_gem_registry(base.to_string()).as_deref(),
+                Ok(base),
+                "{base}"
+            );
+        }
+        for base in [
+            "http://gems.example.test",
+            "http://user:hunter2@10.1.2.3:9292/mirror",
+            "gems.example.test",
+            "file:///srv/gems",
+        ] {
+            let why = secure_gem_registry(base.to_string()).unwrap_err();
+            assert!(
+                why.contains("SOCKET_RUBYGEMS_URL") && why.contains("set it to an https URL"),
+                "{why}"
+            );
+            assert!(!why.contains("hunter2"), "{why}");
+        }
+    }
+
+    /// The registry's base may carry a mirror's credentials
+    /// (`SOCKET_RUBYGEMS_URL=https://user:token@…`): the checksum is read
+    /// with them, and no error of the lookup repeats them. A registry that
+    /// is refused is not asked at all.
+    #[tokio::test]
+    async fn a_gem_checksum_lookup_never_repeats_the_registrys_credentials() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        let sha = "a".repeat(64);
+        Mock::given(method("GET"))
+            .and(path("/info/rails"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(format!("---\n7.0.0 |checksum:{sha}\n")),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/info/garbled"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![0xff, 0xfe]))
+            .mount(&server)
+            .await;
+        let base = server.uri().replace("http://", "http://deploy:hunter2@");
+        let client = UpstreamClient::new(false);
+        let at = |name: &'static str, version: &'static str| {
+            client.rubygems_sha256_at(Ok(base.clone()), name, version)
+        };
+        assert_eq!(at("rails", "7.0.0").await, Ok(sha));
+        for (name, version, expected) in [
+            (
+                "rails",
+                "7.1.0",
+                "lists no ruby-platform 7.1.0 with a checksum",
+            ),
+            ("garbled", "1.0.0", "is not UTF-8"),
+            ("absent", "1.0.0", "HTTP 404"),
+        ] {
+            let why = at(name, version).await.unwrap_err();
+            assert!(why.contains(expected), "{why}");
+            assert!(why.contains(&format!("/info/{name}")), "{why}");
+            assert!(
+                !why.contains("hunter2") && !why.contains("deploy:"),
+                "{why}"
+            );
+        }
+
+        let asked = server.received_requests().await.unwrap().len();
+        let refused = secure_gem_registry("http://deploy:hunter2@gems.example.test".to_string());
+        let why = client
+            .rubygems_sha256_at(refused, "rails", "7.0.0")
+            .await
+            .unwrap_err();
+        assert!(why.contains("set it to an https URL"), "{why}");
+        assert!(!why.contains("hunter2"), "{why}");
+        assert_eq!(server.received_requests().await.unwrap().len(), asked);
     }
 
     #[test]

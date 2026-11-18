@@ -45,8 +45,12 @@ mod sbt;
 mod uv;
 mod vlt;
 
-use client::rubygems_base;
+#[cfg(test)]
+pub(crate) use client::secure_gem_registry;
 pub(crate) use client::UpstreamClient;
+pub(crate) use client::{
+    compact_index_checksum, is_rubygems_remote, rubygems_base, rubygems_secure_base,
+};
 pub(crate) use uv::{
     declared_lock_specifier, lock_cutoff, pylock_no_binary, respell_lock_specifier,
     root_uv_settings, LockRequirementArray,
@@ -927,6 +931,8 @@ fn format_of(rel: &str) -> Format {
 /// once its gem is back on the upstream registry entry (#1260, #1594).
 pub const GEM_STALE_CACHE: &str = gem::STALE_CACHE;
 
+pub use gem::UpstreamArchive;
+
 /// The [`GEM_STALE_CACHE`] advisory, as `(code, detail)`, for the gem
 /// `purl` a vendored unwind just put back on its upstream entry in the
 /// project at `root` (#1594). `None` when Bundler's cache dir holds no
@@ -942,24 +948,34 @@ pub async fn gem_stale_cache_after_unwind(
 }
 
 /// The upstream `.gem` of a gem `purl` that is back on its registry entry
-/// in the project at `root`: `(sha256, download url)`. The sha256 is what
-/// the restored lock pins (its `CHECKSUMS` entry, else the rubygems.org
-/// compact index, unless `offline`); the url is set when the lock resolves
-/// the gem from rubygems.org. `staged` is a restore's
-/// [`RestoreOutcome::staged_text`]: the restored lock is read from it when
-/// it is there (a dry run's lock is not on disk), else from disk. `None`
-/// when nothing proves the sha256, so there is nothing to judge an
-/// installed copy or a cached archive by.
+/// in the project at `root`: its sha256 and download url
+/// ([`UpstreamArchive::Known`]). The sha256 is what the restored lock pins
+/// (its `CHECKSUMS` entry, else the rubygems.org compact index, unless
+/// `offline`); the url is set when the lock resolves the gem from
+/// rubygems.org. `staged` is a restore's [`RestoreOutcome::staged_text`]:
+/// the restored lock is read from it when it is there (a dry run's lock is
+/// not on disk), else from disk. `None` when nothing proves the sha256, so
+/// there is nothing to judge an installed copy or a cached archive by;
+/// [`UpstreamArchive::Unverified`] when the registry that would is refused
+/// (plain http), which the caller reports.
 pub async fn gem_upstream_archive(
     root: &Path,
     staged: &BTreeMap<String, Option<String>>,
     purl: &str,
     offline: bool,
-) -> Option<(String, Option<String>)> {
+) -> Option<UpstreamArchive> {
     let restored = crate::formats::gem::BUNDLER_LOCKS
         .iter()
         .find_map(|lock| staged.get(*lock)?.as_deref());
     gem::upstream_archive(root, restored, purl, offline).await
+}
+
+/// Whether the lock on disk at `root` resolves the ruby-platform gem `purl`
+/// from rubygems.org: the gem is then on its upstream registry entry, also
+/// where [`gem_upstream_archive`] is `None` because nothing proves the
+/// archive's sha256 (an offline run, a registry error).
+pub async fn gem_resolves_from_rubygems(root: &Path, purl: &str) -> bool {
+    gem::resolves_from_rubygems(root, purl).await
 }
 
 /// Restore every pin in `pins` to its default upstream registry entry.

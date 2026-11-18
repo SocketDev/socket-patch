@@ -963,6 +963,38 @@ pub(crate) fn variant_matches_installed(first_file_status: Option<&VerifyStatus>
     }
 }
 
+/// Of the manifest's records for one gem version (`variants`), the one
+/// written for the copy at `pkg_path` itself: the record whose `platform`
+/// qualifier names the platform of that (platform gem) copy, when it
+/// matches what is installed there (or under `--force`, which asks no
+/// file). That record alone is then applied to the copy. `None`: the copy
+/// is the `ruby` platform's, no record names its platform, or the one that
+/// does is for other bytes; every matching record is applied, as for any
+/// other package.
+async fn own_platform_variant<'v>(
+    pkg_path: &Path,
+    variants: &'v [String],
+    manifest: &PatchManifest,
+    force: bool,
+) -> Option<&'v String> {
+    if variants.len() < 2 {
+        return None;
+    }
+    let platform = gem_ext::copy_platform(pkg_path).await?;
+    let own = variants
+        .iter()
+        .find(|variant| gem_ext::names_platform(variant, &platform))?;
+    if force {
+        return Some(own);
+    }
+    let patch = manifest.patches.get(own)?;
+    let status = match representative_file(&patch.files) {
+        Some((name, info)) => Some(verify_file_patch(pkg_path, name, info).await.status),
+        None => None,
+    };
+    variant_matches_installed(status.as_ref()).then_some(own)
+}
+
 /// The file whose verify status decides whether a release variant
 /// describes the installed distribution (fed to
 /// [`variant_matches_installed`]).
@@ -1764,7 +1796,13 @@ pub(crate) async fn run_locked(
                     // Sources-unavailable codes restate the staging layer's
                     // own `Error:` diagnostic (already printed, even under
                     // --silent); they exist for the JSON envelope.
-                    if !is_stage_failure_code(&w.code) {
+                    //
+                    // So does the coded copy of a package's refusal (a gem
+                    // whose native extension cannot be rebuilt): the
+                    // package's own `Error: Failed to patch` line carries
+                    // the same text, and a build failure's is many lines
+                    // long (#2117).
+                    if !is_stage_failure_code(&w.code) && !restates_a_failure(w, &results) {
                         eprintln!("Warning: {}", w.detail);
                     }
                 }
@@ -2233,6 +2271,20 @@ const SOURCES_DOWNLOAD_FAILED: &str = "sources_download_failed";
 /// `Error:` line on the human path, so `run` keeps them for JSON only.
 fn is_stage_failure_code(code: &str) -> bool {
     code == OFFLINE_MISSING_SOURCES || code == SOURCES_DOWNLOAD_FAILED
+}
+
+/// Whether `warning` is the coded copy of a failed result's error (`<code>:
+/// <detail>`, how a gem refusal is carried for the JSON envelope): the
+/// human path already printed that text as the package's `Error: Failed to
+/// patch` line.
+fn restates_a_failure(warning: &RunWarning, results: &[ApplyResult]) -> bool {
+    results.iter().filter(|r| !r.success).any(|r| {
+        r.error
+            .as_deref()
+            .and_then(|error| error.strip_prefix(warning.code.as_str()))
+            .and_then(|rest| rest.strip_prefix(": "))
+            == Some(warning.detail.as_str())
+    })
 }
 
 /// Why nothing could be applied when the patch sources are unavailable —
@@ -2917,7 +2969,22 @@ async fn apply_patches_inner(
                 // that copy is a real on-disk gem some bundler loads.
                 let mut attempted = false;
 
+                // A platform gem's copy takes the record written for its
+                // own platform, when the manifest has one that matches
+                // it, and only that one. The ruby-platform record of the
+                // same version can match such a copy too (its sources are
+                // what the copy's binary was built from) and must not be
+                // applied on top.
+                let only_variant = if Ecosystem::from_purl(purl) == Some(Ecosystem::Gem) {
+                    own_platform_variant(pkg_path, &variants, &manifest, args.force).await
+                } else {
+                    None
+                };
+
                 for variant_purl in &variants {
+                    if only_variant.is_some_and(|only| only != variant_purl) {
+                        continue;
+                    }
                     let patch = match manifest.patches.get(variant_purl) {
                         Some(p) => p,
                         None => continue,
@@ -2959,7 +3026,14 @@ async fn apply_patches_inner(
                             || (Ecosystem::from_purl(purl) == Some(Ecosystem::Gem)
                                 && has_build_sibling(pkg_path, copy_paths)))
                     {
-                        let first_status = match representative_file(&patch.files) {
+                        // A native gem's copy does not hold every build
+                        // input of its source gem (a build removes them; a
+                        // precompiled gem never shipped them): those cannot
+                        // tell distributions apart.
+                        let telling =
+                            gem_ext::discriminating_files(pkg_path, variant_purl, &patch.files)
+                                .await;
+                        let first_status = match representative_file(&telling) {
                             Some((file_name, file_info)) => Some(
                                 verify_file_patch(pkg_path, file_name, file_info)
                                     .await
@@ -2987,6 +3061,7 @@ async fn apply_patches_inner(
                             &gem_ext::RubyEnv {
                                 cwd: args.common.cwd.clone(),
                                 rebuild: !args.common.no_gem_native_rebuild,
+                                offline: args.common.offline,
                             },
                         )
                         .await;
@@ -4072,6 +4147,43 @@ mod tests {
         assert_eq!(expected_hash_label(""), "(new file)");
         let h = "a".repeat(64);
         assert_eq!(expected_hash_label(&h), h);
+    }
+
+    /// A gem refusal reaches the run as a failed result (`<code>:
+    /// <detail>`) and as a coded warning with the same detail: only that
+    /// warning restates a failure the human path already printed.
+    #[test]
+    fn only_the_coded_copy_of_a_failed_result_restates_it() {
+        let warning = |code: &str, detail: &str| RunWarning {
+            code: code.to_string(),
+            detail: detail.to_string(),
+        };
+        let mut failed = sample_applied(VerifyStatus::Ready);
+        failed.success = false;
+        failed.error =
+            Some("native_extension_build_failed: it did not build\nmake: Error 1".into());
+        let mut advised = sample_applied(VerifyStatus::Ready);
+        advised.error = Some("native_extension_rebuilt: rebuilt".into());
+        let results = [failed, advised, sample_applied(VerifyStatus::Ready)];
+
+        assert!(restates_a_failure(
+            &warning(
+                "native_extension_build_failed",
+                "it did not build\nmake: Error 1"
+            ),
+            &results
+        ));
+        // Another detail, another code, or a result that succeeded.
+        for other in [
+            warning("native_extension_build_failed", "it did not build"),
+            warning(
+                "native_extensions_unsupported",
+                "it did not build\nmake: Error 1",
+            ),
+            warning("native_extension_rebuilt", "rebuilt"),
+        ] {
+            assert!(!restates_a_failure(&other, &results), "{}", other.detail);
+        }
     }
 
     /// Build a successful `ApplyResult` with one patched file and one

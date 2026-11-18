@@ -1,0 +1,4 @@
+# Bundler runs in a build action, where HOME is not set and Ruby would take
+# the user's home directory from the system. With this an action gets the
+# HOME of the Bazel client.
+build --action_env=HOME

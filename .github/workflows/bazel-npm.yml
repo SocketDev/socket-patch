@@ -1,0 +1,140 @@
+name: Bazel patch compatibility (npm)
+
+# The npm flows of the real-Bazel tests (`npm::` in `e2e_bazel_build`):
+# hosted and vendored mode for a package that aspect_rules_js links from a
+# pnpm lock, on each Bazel release below. bazel-compatibility.yml holds the
+# legs and what every ecosystem shares; this file says when the npm legs run
+# and on which releases.
+#
+# Beyond what every leg needs, an npm leg downloads Node from nodejs.org and
+# ruleset archives from codeload.github.com; its repository cache holds them
+# and comes to about 100 MB. An npm tarball under test passes through that
+# cache as well: Bazel's downloader fetches it and keeps it under its
+# sha512. So a test builds the upstream tarball and each patched one anew,
+# with an id of the run in the entry file, and writes the upstream sum into
+# the lock of its workspace copy. No cache holds a tarball of the run, and
+# the test counts the requests for the upstream one.
+#
+# Not required for merge: no `merge_group` trigger, and no job here is a
+# `needs` of ci.yml's `ci-ok`.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    # What a pull request run covers: the npm flows and their fixture, the
+    # harness and the workflows that run it, the Bazel installer and its
+    # pins, and the npm-family files of socket-patch-core that the two
+    # flows run through (a coverage build of the binary showed which): the
+    # pnpm lock's model and hosted planner (formats/pnpm/), the pnpm
+    # vendored backend with the npm code beside it (vendor/pnpm_*,
+    # vendor/npm_*, the lock inventory), the `pnpm-workspace.yaml` lookup,
+    # the npm-family lock and config readers (vex/discover/npm.rs,
+    # patch/redirect/npmrc.rs), the upstream restore of `rollback`, the
+    # crawler every `scan` starts, and the `package.json` reader. One file
+    # is here for what the flows assert, not for that build:
+    # patch/user_patches.rs, the inspection of the project's own patches.
+    # Its walk of the pnpm workspace decides what the second run of each
+    # flow reports, and no other test runs it beside Bazel's links. That
+    # file also holds the Composer, Cargo and Go parts of the gate, so a
+    # change to those starts the npm legs too. The
+    # globs name that one crate, so no bench fixture is here, and nothing
+    # another ecosystem's flow owns: a change to one ecosystem starts that
+    # ecosystem's legs only.
+    #
+    # What it does not cover: shared engine code (patch/redirect/mod.rs,
+    # the rest of vendor/, hosted/, commands/), the shared test helpers and
+    # the toolchain files. A change there gets its run on the push to main
+    # (when the file is in the list below) or in the nightly run, not on the
+    # pull request: that is the price of not running every ecosystem's legs
+    # on every shared change. On demand, workflow_dispatch runs the legs on
+    # any branch.
+    paths:
+      - '.github/workflows/bazel-npm.yml'
+      - '.github/workflows/bazel-compatibility.yml'
+      - 'scripts/install-bazel.sh'
+      - 'scripts/bazel-pins.txt'
+      - 'crates/socket-patch-cli/tests/e2e_bazel_build/npm.rs'
+      - 'crates/socket-patch-cli/tests/e2e_bazel_build/harness.rs'
+      - 'crates/socket-patch-cli/tests/fixtures/bazel/rules_js/**'
+      - 'crates/socket-patch-core/src/**/*pnpm*'
+      - 'crates/socket-patch-core/src/**/*pnpm*/**'
+      - 'crates/socket-patch-core/src/vendor/npm_*'
+      - 'crates/socket-patch-core/src/vendor/lock_inventory/npm_family.rs'
+      - 'crates/socket-patch-core/src/patch/redirect/npmrc.rs'
+      - 'crates/socket-patch-core/src/patch/redirect/upstream/npm.rs'
+      - 'crates/socket-patch-core/src/vex/discover/npm.rs'
+      - 'crates/socket-patch-core/src/crawlers/npm_crawler.rs'
+      - 'crates/socket-patch-core/src/formats/package_json.rs'
+      - 'crates/socket-patch-core/src/patch/user_patches.rs'
+  push:
+    branches: [main]
+    # The pull request paths, and what only a push to main covers: the
+    # root of the test target (it changes when an ecosystem's module is
+    # added; ci.yml builds the target and runs its hermetic tests on every
+    # pull request), the shared engine code and test helpers the flows run
+    # through, and the toolchain files. A main push outside this list waits
+    # for the nightly run below.
+    paths:
+      - '.github/workflows/bazel-npm.yml'
+      - '.github/workflows/bazel-compatibility.yml'
+      - 'scripts/install-bazel.sh'
+      - 'scripts/bazel-pins.txt'
+      - 'crates/socket-patch-cli/tests/e2e_bazel_build/npm.rs'
+      - 'crates/socket-patch-cli/tests/e2e_bazel_build/harness.rs'
+      - 'crates/socket-patch-cli/tests/fixtures/bazel/rules_js/**'
+      - 'crates/socket-patch-core/src/**/*pnpm*'
+      - 'crates/socket-patch-core/src/**/*pnpm*/**'
+      - 'crates/socket-patch-core/src/vendor/npm_*'
+      - 'crates/socket-patch-core/src/vendor/lock_inventory/npm_family.rs'
+      - 'crates/socket-patch-core/src/patch/redirect/npmrc.rs'
+      - 'crates/socket-patch-core/src/patch/redirect/upstream/npm.rs'
+      - 'crates/socket-patch-core/src/vex/discover/npm.rs'
+      - 'crates/socket-patch-core/src/crawlers/npm_crawler.rs'
+      - 'crates/socket-patch-core/src/formats/package_json.rs'
+      - 'crates/socket-patch-core/src/patch/user_patches.rs'
+      - 'crates/socket-patch-cli/tests/e2e_bazel_build/main.rs'
+      - 'crates/socket-patch-core/src/patch/redirect/**'
+      - 'crates/socket-patch-core/src/vendor/**'
+      - 'crates/socket-patch-core/src/hosted/**'
+      - 'crates/socket-patch-cli/src/commands/**'
+      - 'crates/socket-patch-cli/tests/common/**'
+      - 'crates/socket-patch-cli/tests/hosted_memory_common/**'
+      - 'Cargo.lock'
+      - 'Cargo.toml'
+      - 'crates/*/Cargo.toml'
+      - 'rust-toolchain.toml'
+      - '.cargo/**'
+  schedule:
+    # Nightly, so a main change outside the push list still gets a run
+    # within a day. The macOS leg runs here and on demand only.
+    - cron: '27 4 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# The nightly run has a group of its own. A group holds one pending run, so
+# in the group of main's pushes a second push would replace a nightly that
+# waits behind the first, and the nightly is the only run with the macOS leg.
+concurrency:
+  group: bazel-npm-${{ github.event.pull_request.number || github.ref }}${{ github.event_name == 'schedule' && '-nightly' || '' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  npm:
+    uses: ./.github/workflows/bazel-compatibility.yml
+    with:
+      eco: npm
+      fixtures: rules_js/bzlmod
+      # One leg per line: a Bazel release, and the era of the fixture that
+      # `npm::FIXTURE` gives it.
+      releases: >-
+        [
+          {"bazel": "9.3.2", "era": "e9"},
+          {"bazel": "8.8.2", "era": "e9"},
+          {"bazel": "7.7.2", "era": "e9"}
+        ]
+      macos: >-
+        [
+          {"bazel": "9.3.2", "era": "e9"}
+        ]
