@@ -242,8 +242,19 @@ impl GemSource {
             format!("{}.gem", id.full_name()),
             home.join("cache").display().to_string(),
         );
-        if self.elsewhere.contains_key(&id.name) {
-            return format!("Put {file} in {cache}.");
+        if let Some(source) = self.elsewhere.get(&id.name) {
+            // A gem server the lock names may be a mirror of the registry
+            // (Artifactory, a pull-through cache): it serves this archive,
+            // and only the user can say it is one.
+            let mirror = if source.starts_with("http") {
+                format!(
+                    ", or, if {source} is a mirror of rubygems.org, set SOCKET_RUBYGEMS_URL to \
+                     it and apply again"
+                )
+            } else {
+                String::new()
+            };
+            return format!("Put {file} in {cache}{mirror}.");
         }
         match &self.registry {
             Ok(_) => format!(
@@ -839,6 +850,13 @@ mod tests {
         let remedy = online.remedy(&home, &private);
         assert!(!remedy.contains("network access"), "{remedy}");
         assert!(remedy.contains("inhouse-9.9.9.gem"), "{remedy}");
+        // The lock names a gem server, which may be a mirror: the remedy
+        // says how to name it, without its credentials.
+        assert!(
+            remedy.contains("gems.example.test") && remedy.contains("SOCKET_RUBYGEMS_URL"),
+            "{remedy}"
+        );
+        assert!(!remedy.contains("secret"), "{remedy}");
         // In the home's cache, even a private gem's archive is its source.
         std::fs::write(cache_path(&home, &private), b"private").unwrap();
         assert_eq!(online.archive(&home, &private).await.unwrap(), b"private");
