@@ -290,6 +290,15 @@ async fn parity_gemfile() {
     assert_parity(case("gem/bundler/basic")).await;
 }
 
+/// A gem the lock resolves only as precompiled platform builds. The lock
+/// inventory has no ruby-platform entry to list it by, so both hosted
+/// engines find it through the lock's platform specs (nothing is
+/// installed here), and both move every build to its prebuild.
+#[tokio::test]
+async fn parity_gemfile_platform_prebuilds() {
+    assert_parity(case("gem/bundler/platform-prebuilds")).await;
+}
+
 #[tokio::test]
 async fn parity_golang() {
     assert_parity(case("golang/gomod/basic")).await;
