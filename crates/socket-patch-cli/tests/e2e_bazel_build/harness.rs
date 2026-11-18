@@ -72,6 +72,9 @@ const REMOVED: &[&str] = &[
     "PYTHONHOME",
     "PYTHONPATH",
     "PYTHONSTARTUP",
+    // rules_rust: its switch for a repin of a crate hub, which it reads
+    // under this name and under `CARGO_BAZEL_REPIN` (a prefix below).
+    "REPIN",
 ];
 
 /// Removed from every Bazel child under every name that starts so.
@@ -84,6 +87,13 @@ const REMOVED_PREFIXES: &[&str] = &[
     "PIP_",
     // uv: the same.
     "UV_",
+    // The cargo a ruleset starts (rules_rust's, for a crate hub): its home
+    // and every setting of its config (`CARGO_NET_OFFLINE`,
+    // `CARGO_SOURCE_*`, `CARGO_REGISTRIES_*`, `CARGO_HTTP_*`), and what
+    // `cargo test` sets for this process. And rules_rust itself: its
+    // `CARGO_BAZEL_*` switches, the repin among them. A flow sets what it
+    // needs of these through [`Cell::repo_env`], after this scrub.
+    "CARGO_",
 ];
 
 /// The scrubs of `hermetic` that every Bazel child gets, for the tools a
@@ -1054,10 +1064,12 @@ fn settings_of_a_shell() -> Vec<String> {
         "PYTHONHOME",
         "PYTHONPATH",
         "PYTHONSTARTUP",
+        "REPIN",
         // One name under each of `REMOVED_PREFIXES`.
         "BAZELISK_SETTING",
         "PIP_SETTING",
         "UV_SETTING",
+        "CARGO_SETTING",
         // `Extra::Go`.
         "GOFLAGS",
         "GOWORK",
