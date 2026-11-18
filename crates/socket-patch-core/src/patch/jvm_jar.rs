@@ -30,13 +30,13 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::crawlers::gradle_cache;
-use crate::hash::git_sha256::{compute_git_sha256_from_bytes, zip_member_git_sha256};
+use crate::hash::git_sha256::compute_git_sha256_from_bytes;
 use crate::manifest::schema::PatchFileInfo;
 use crate::patch::apply::{
     apply_file_patch_at, files_in_order, normalize_file_path, ApplyResult, VerifyResult,
     VerifyStatus,
 };
-use crate::patch::jar_members::{difference_outside_patch, Difference, Digests, JarError};
+use crate::patch::jar_members::{difference_outside_patch, Difference, Digests, Jar, JarError};
 use crate::patch::rollback::{RollbackResult, VerifyRollbackResult, VerifyRollbackStatus};
 use crate::patch::sidecars::{self, maven as maven_sidecars};
 use crate::utils::purl::{parse_maven_purl, purl_qualifier};
@@ -132,19 +132,59 @@ pub fn classify(purl: &str, files: &HashMap<String, PatchFileInfo>) -> RecordSha
 /// key order: a member at its `afterHash` is `AlreadyPatched`, at its
 /// `beforeHash` `Ready`, anything else `HashMismatch`; an absent member is
 /// `NotFound` (or `Ready` when the patch adds it). An unreadable jar makes
-/// every member `NotFound`.
+/// every member `NotFound`, and so does one past the jar limits (a caller
+/// that tells the two apart asks [`member_statuses`]).
 pub fn verify_member_bytes(
     jar: &[u8],
     files: &HashMap<String, PatchFileInfo>,
 ) -> Vec<VerifyResult> {
-    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(jar)).ok();
+    member_statuses(jar, files).unwrap_or_else(|_| statuses(files, |_| None))
+}
+
+/// [`verify_member_bytes`], read within the jar limits
+/// ([`super::jar_members`]) from the first byte: the limits on the
+/// archive's entry count and central directory are held to its end records
+/// before anything parses the directory, and a member is inflated only
+/// within the pass's budget. `Err` is a jar past a limit; nothing of it was
+/// parsed or inflated beyond that limit.
+fn member_statuses(
+    jar: &[u8],
+    files: &HashMap<String, PatchFileInfo>,
+) -> Result<Vec<VerifyResult>, JarError> {
+    let mut archive = match Jar::of_bytes(jar) {
+        Ok(archive) => Some(archive),
+        Err(e) if e.is_too_large() => return Err(e),
+        Err(_) => None,
+    };
+    let mut too_large = None;
+    let results = statuses(files, |member| {
+        match archive.as_mut()?.member_git_sha256(member) {
+            Ok(hash) => hash,
+            Err(e) => {
+                if e.is_too_large() {
+                    too_large.get_or_insert(e);
+                }
+                None
+            }
+        }
+    });
+    match too_large {
+        Some(e) => Err(e),
+        None => Ok(results),
+    }
+}
+
+/// The verify result of each record member, given its current git-blob
+/// hash in the jar (`None` when the jar does not hold it).
+fn statuses(
+    files: &HashMap<String, PatchFileInfo>,
+    mut hash_of: impl FnMut(&str) -> Option<String>,
+) -> Vec<VerifyResult> {
     files_in_order(files)
         .into_iter()
         .map(|(key, info)| {
             let member = normalize_file_path(key);
-            let hash = archive
-                .as_mut()
-                .and_then(|a| zip_member_git_sha256(a, member)?.ok());
+            let hash = hash_of(member);
             let (status, current) = match hash {
                 None if info.before_hash.is_empty() => (VerifyStatus::Ready, None),
                 None => (VerifyStatus::NotFound, None),
@@ -499,7 +539,25 @@ async fn swap_copies(
                 continue;
             }
         };
-        result.files_verified = verify_member_bytes(&original, swap.files);
+        // The bounded reader is the first thing to parse the copy: one past
+        // the jar limits is refused here, before anything allocates for it.
+        result.files_verified = match member_statuses(&original, swap.files) {
+            Ok(verified) => verified,
+            Err(e) => {
+                let refusal = SwapRefusal::new(
+                    JAR_TOO_LARGE,
+                    format!(
+                        "{} cannot be read within the jar limits: {e}. It was left as it is. \
+                         `--mode hosted` does not read the jar.",
+                        dir.join(swap.jar_leaf).display()
+                    ),
+                );
+                result.error = Some(format!("{}: {}", refusal.code, refusal.message));
+                refusals.insert(results.len(), refusal);
+                results.push(result);
+                continue;
+            }
+        };
         match aggregate(&result.files_verified) {
             VerifyStatus::AlreadyPatched => result.success = true,
             VerifyStatus::Ready => pending.push((results.len(), original)),
@@ -964,7 +1022,22 @@ pub async fn rollback_jar_swap(
                 continue;
             }
         };
-        let verified = verify_member_bytes(&current, restore.files);
+        // The bounded reader is the first thing to parse the copy: one past
+        // the jar limits fails here, before any backup is read or anything
+        // is downloaded.
+        let verified = match member_statuses(&current, restore.files) {
+            Ok(verified) => verified,
+            Err(e) => {
+                result.error = Some(format!(
+                    "{JAR_TOO_LARGE}: {} cannot be read within the jar limits: {e}. It was \
+                     left as it is; delete {} so the build downloads the jar again.",
+                    path.display(),
+                    dir.display()
+                ));
+                out.push(result);
+                continue;
+            }
+        };
         result.files_verified = rollback_verify(&verified);
         let all = |s: VerifyStatus| verified.iter().all(|v| v.status == s);
         if all(VerifyStatus::Ready) {
@@ -1892,6 +1965,75 @@ mod tests {
         let back = rollback_jar_swap(&restore(&files, &socket, true), &[copy.clone()]).await;
         assert!(back[0].success, "{:?}", back[0].error);
         assert_eq!(std::fs::read(copy.join("lib-1.0.jar")).unwrap(), UPSTREAM);
+    }
+
+    /// The bounded reader is the first thing that parses a copy, on apply
+    /// and on rollback. This archive's end records declare 200,001 entries
+    /// and it holds no central directory at all: only a reader that holds
+    /// the records to the limit before parsing can call it too large. The
+    /// apply needs no service for it, and the rollback reads no backup and
+    /// downloads nothing.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_copy_past_the_limits_is_refused_before_it_is_parsed() {
+        let entries = 200_001u64;
+        let mut hostile = vec![0u8; entries as usize * 46];
+        let at = hostile.len() as u64;
+        hostile.extend_from_slice(b"PK\x06\x06");
+        hostile.extend_from_slice(&[0; 20]);
+        hostile.extend_from_slice(&entries.to_le_bytes());
+        hostile.extend_from_slice(&entries.to_le_bytes());
+        hostile.extend_from_slice(&(entries * 46).to_le_bytes());
+        hostile.extend_from_slice(&[0; 8]);
+        hostile.extend_from_slice(b"PK\x06\x07\0\0\0\0");
+        hostile.extend_from_slice(&at.to_le_bytes());
+        hostile.extend_from_slice(&1u32.to_le_bytes());
+        hostile.extend_from_slice(b"PK\x05\x06\0\0\0\0");
+        hostile.extend_from_slice(&[0xff; 12]);
+        hostile.extend_from_slice(&[0; 2]);
+        let limit = "it holds 200001 entries, over the limit of 200000";
+        let files = record();
+        assert_eq!(
+            member_statuses(&hostile, &files).unwrap_err().to_string(),
+            limit
+        );
+        // The callers that only ask for statuses see nothing verified.
+        assert_eq!(
+            aggregate(&verify_member_bytes(&hostile, &files)),
+            VerifyStatus::NotFound
+        );
+
+        let server = wiremock::MockServer::start().await;
+        let _registry = EnvGuard::set("SOCKET_MAVEN_REGISTRY", server.uri());
+        let d = tempfile::tempdir().unwrap();
+        let socket = d.path().join(".socket");
+        write_backup(&socket, &pristine_jar()).await.unwrap();
+        let copy = d.path().join("m2/com/example/lib/1.0");
+        std::fs::create_dir_all(&copy).unwrap();
+        std::fs::write(copy.join("lib-1.0.jar"), &hostile).unwrap();
+
+        let out = apply_jar_swap(&swap(&files, &socket, false), &[copy.clone()], None)
+            .await
+            .unwrap();
+        let refusal = out[0].refusal.as_ref().expect("a coded refusal");
+        assert_eq!(refusal.code, JAR_TOO_LARGE);
+        assert!(refusal.message.contains(limit), "{}", refusal.message);
+        assert!(!out[0].success);
+
+        let back = rollback_jar_swap(&restore(&files, &socket, false), &[copy.clone()]).await;
+        let error = back[0].error.as_deref().unwrap();
+        assert!(
+            !back[0].success
+                && error.starts_with("jvm_jar_too_large: ")
+                && error.contains(limit)
+                && !error.contains("has no backup"),
+            "{error}"
+        );
+        assert!(std::fs::read(copy.join("lib-1.0.jar")).unwrap() == hostile);
+        assert!(
+            server.received_requests().await.unwrap().is_empty(),
+            "nothing is downloaded for a copy past the limits"
+        );
     }
 
     /// A copy that holds another revision of the patch (applied from another

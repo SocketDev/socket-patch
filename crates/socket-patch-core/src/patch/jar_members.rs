@@ -635,6 +635,38 @@ mod tests {
     const OLD_ENTRIES: usize = 10_000;
     const OLD_BYTES: u64 = 64 * 1024 * 1024;
 
+    /// A member's git hash is the buffered hash of its bytes, stored,
+    /// deflated or empty; an absent member is `None`.
+    #[test]
+    fn a_member_hashes_as_its_bytes() {
+        use std::io::Write as _;
+        let members: [(&str, &[u8], zip::CompressionMethod); 3] = [
+            ("stored.txt", b"hello world", zip::CompressionMethod::Stored),
+            (
+                "deflated.txt",
+                &[b'a'; 100_000],
+                zip::CompressionMethod::Deflated,
+            ),
+            ("empty.txt", b"", zip::CompressionMethod::Deflated),
+        ];
+        let mut out = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        for (name, bytes, method) in &members {
+            let opts = zip::write::SimpleFileOptions::default().compression_method(*method);
+            out.start_file(*name, opts).unwrap();
+            out.write_all(bytes).unwrap();
+        }
+        let bytes = out.finish().unwrap().into_inner();
+        let mut jar = Jar::of_bytes(&bytes).unwrap();
+        for (name, content, _) in &members {
+            assert_eq!(
+                jar.member_git_sha256(name).unwrap().unwrap(),
+                compute_git_sha256_from_bytes(content),
+                "{name}"
+            );
+        }
+        assert_eq!(jar.member_git_sha256("missing.txt").unwrap(), None);
+    }
+
     #[test]
     fn a_jar_over_the_wheel_limits_is_read_member_by_member() {
         let bytes = big_jar(
