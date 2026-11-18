@@ -88,6 +88,67 @@ pub(crate) fn is_registry_source(source: &str) -> bool {
     s.starts_with("sparse+") || s.starts_with("registry+")
 }
 
+/// The crates.io index as a git repository: the one URL a `[patch]` table
+/// may spell crates.io by.
+pub const CRATES_IO_INDEX_URL: &str = "https://github.com/rust-lang/crates.io-index";
+
+/// How cargo writes crates.io in a `Cargo.lock` `source` (it keeps this
+/// spelling even when it fetches over the sparse protocol).
+pub(crate) const CRATES_IO_SOURCE: &str = "registry+https://github.com/rust-lang/crates.io-index";
+
+/// The crates.io sparse index.
+const CRATES_IO_SPARSE_URL: &str = "https://index.crates.io";
+
+/// Whether `url` is the crates.io git index, compared the way cargo's
+/// `CanonicalUrl` compares a repository: one trailing `/` and a `.git`
+/// suffix do not make another source, and a GitHub URL has no case.
+pub fn is_crates_io_git_index(url: &str) -> bool {
+    let url = url.trim();
+    let url = url.strip_suffix('/').unwrap_or(url);
+    let url = match url.len().checked_sub(".git".len()) {
+        Some(at) if url.is_char_boundary(at) && url[at..].eq_ignore_ascii_case(".git") => {
+            &url[..at]
+        }
+        _ => url,
+    };
+    url.eq_ignore_ascii_case(CRATES_IO_INDEX_URL)
+}
+
+/// Whether `url` is the crates.io sparse index. A sparse URL is compared
+/// as written but for the host's case and one trailing `/`: cargo drops no
+/// `.git` from it.
+fn is_crates_io_sparse_index(url: &str) -> bool {
+    let url = url.trim();
+    url.strip_suffix('/')
+        .unwrap_or(url)
+        .eq_ignore_ascii_case(CRATES_IO_SPARSE_URL)
+}
+
+/// Whether a `Cargo.lock` `source` names crates.io: the git index behind
+/// `registry+`, or the sparse index behind `sparse+`. The one rule for
+/// that question. The whole URL is compared, so a host or a path that only
+/// contains crates.io's is another source, and so is either index behind
+/// the other kind.
+///
+/// A `[patch.<table>]` key is another question: [`is_crates_io_patch_table`].
+pub(crate) fn is_crates_io_source(source: &str) -> bool {
+    let source = source.trim();
+    if let Some(url) = source.strip_prefix("registry+") {
+        return is_crates_io_git_index(url);
+    }
+    source
+        .strip_prefix("sparse+")
+        .is_some_and(is_crates_io_sparse_index)
+}
+
+/// Whether a `[patch.<table>]` key names crates.io: `crates-io`, or the git
+/// index by URL. Those are the only spellings cargo applies to crates.io
+/// (checked with cargo 1.98: under `[patch."sparse+https://index.crates.io/"]`
+/// or `[patch."registry+…"]` it reports the patch as unused).
+pub fn is_crates_io_patch_table(table: &str) -> bool {
+    table == "crates-io" || is_crates_io_git_index(table)
+}
+
 /// Every `[[package]]` of `doc` (lock formats v1–v4), in lock order; an
 /// entry without a string `name` and `version` is skipped. A lock with no
 /// packages has no `package` key and yields nothing.
@@ -480,8 +541,7 @@ impl CargoLock {
             let Some(purl) = simple_purl("cargo", &pkg.name, &version) else {
                 continue;
             };
-            let crates_io = source.contains("github.com/rust-lang/crates.io-index")
-                || source.contains("index.crates.io");
+            let crates_io = is_crates_io_source(source);
             // The crates.io provenance is recorded exactly where the checksum
             // is kept as the `.crate`'s sha256.
             let (integrity, source_kind) = match &pkg.checksum {
@@ -537,5 +597,124 @@ impl CargoLock {
             uuid,
             copy_tagged,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// crates.io under every spelling cargo reads as it, and nothing that
+    /// only looks like it.
+    #[test]
+    fn a_lock_source_is_crates_io_only_as_a_whole_url() {
+        for source in [
+            CRATES_IO_SOURCE,
+            "sparse+https://index.crates.io/",
+            "sparse+https://index.crates.io",
+            "registry+https://github.com/rust-lang/crates.io-index/",
+            "registry+https://github.com/rust-lang/crates.io-index.git",
+            "registry+https://github.com/rust-lang/crates.io-index.git/",
+            "registry+https://GitHub.com/Rust-Lang/crates.io-index",
+            "sparse+https://INDEX.crates.io/",
+            " registry+https://github.com/rust-lang/crates.io-index ",
+        ] {
+            assert!(is_crates_io_source(source), "{source}");
+        }
+        for source in [
+            // A host or a path that contains crates.io's.
+            "sparse+https://index.crates.io.evil.example/",
+            "sparse+https://evil.example/index.crates.io/",
+            "registry+https://github.com/rust-lang/crates.io-index-fork",
+            "registry+https://github.com/evil/rust-lang/crates.io-index",
+            "registry+https://evil.example/github.com/rust-lang/crates.io-index",
+            // `.git` is dropped from a repository path, never from a sparse
+            // URL, where it would be part of the host.
+            "sparse+https://index.crates.io.git/",
+            "sparse+https://index.crates.io.git",
+            // Either index behind the other kind is another source.
+            "registry+https://index.crates.io",
+            "sparse+https://github.com/rust-lang/crates.io-index",
+            // One trailing `/` is dropped, not two.
+            "registry+https://github.com/rust-lang/crates.io-index//",
+            "sparse+https://index.crates.io//",
+            // No kind: not a lock source.
+            "https://github.com/rust-lang/crates.io-index",
+            "crates-io",
+            "registry+https://my-corp.example/index",
+            "git+https://github.com/rust-lang/crates.io-index#0123456789abcdef",
+            "registry+",
+            "",
+        ] {
+            assert!(!is_crates_io_source(source), "{source}");
+        }
+    }
+
+    /// A `[patch]` table is crates.io's under the name and under the git
+    /// index URL, which are the spellings cargo applies.
+    #[test]
+    fn a_patch_table_is_crates_io_by_name_or_by_the_git_index_url() {
+        for table in [
+            "crates-io",
+            CRATES_IO_INDEX_URL,
+            "https://github.com/rust-lang/crates.io-index/",
+            "https://github.com/rust-lang/crates.io-index.git",
+            "https://GitHub.com/Rust-Lang/crates.io-index",
+        ] {
+            assert!(is_crates_io_patch_table(table), "{table}");
+        }
+        for table in [
+            "sparse+https://index.crates.io/",
+            "https://index.crates.io/",
+            CRATES_IO_SOURCE,
+            "https://github.com/rust-lang/crates.io-index-fork",
+            "https://example.com/index",
+            "Crates-IO",
+            "my-corp",
+            "",
+        ] {
+            assert!(!is_crates_io_patch_table(table), "{table}");
+        }
+        assert_eq!(CRATES_IO_SOURCE, format!("registry+{CRATES_IO_INDEX_URL}"));
+    }
+
+    /// The inventory records crates.io provenance, and with it the
+    /// `.crate` checksum to verify against, only for a crates.io source.
+    #[test]
+    fn only_a_crates_io_entry_carries_the_crates_io_verifier() {
+        let cksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801";
+        let lock = |source: &str| {
+            CargoLock::parse(&format!(
+                "version = 4\n\n[[package]]\nname = \"cfg-if\"\nversion = \"1.0.4\"\n\
+                 source = \"{source}\"\nchecksum = \"{cksum}\"\n"
+            ))
+            .unwrap()
+        };
+        let kind = |source: &str| {
+            let entries = lock(source).entries();
+            assert_eq!(entries.len(), 1, "{source}");
+            (entries[0].source_kind, entries[0].integrity.clone())
+        };
+        for source in [CRATES_IO_SOURCE, "sparse+https://index.crates.io/"] {
+            assert_eq!(
+                kind(source),
+                (
+                    SourceKind::CratesIo,
+                    LockIntegrity::Sha256Hex(cksum.to_string())
+                ),
+                "{source}"
+            );
+        }
+        for source in [
+            "sparse+https://index.crates.io.evil.example/",
+            "registry+https://github.com/rust-lang/crates.io-index-fork",
+            "registry+https://my-corp.example/index",
+        ] {
+            assert_eq!(
+                kind(source),
+                (SourceKind::Unspecified, LockIntegrity::None),
+                "{source}"
+            );
+        }
     }
 }
