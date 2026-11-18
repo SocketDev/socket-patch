@@ -513,7 +513,12 @@ fn maven_scan_hosted_fresh_checkout_install_and_manifestless_vex() {
         pristine_pom,
         "rollback restores the pom byte-for-byte"
     );
-    for rel in [".mvn/checksums/checksums.sha256", ".mvn/maven.config"] {
+    let filter = format!(".mvn/socket-patch/prefixes-socket-patch-{UUID}.txt");
+    for rel in [
+        ".mvn/checksums/checksums.sha256",
+        ".mvn/maven.config",
+        filter.as_str(),
+    ] {
         assert!(
             !proj.join(rel).exists(),
             "rollback removes the {rel} hosted mode wrote"
@@ -1456,5 +1461,182 @@ mod mediation {
             "b still builds the earlier patch, from its repository: {:?}",
             b.keys()
         );
+    }
+
+    /// Every file under `from`, copied into the new directory `to`.
+    fn copy_tree(from: &Path, to: &Path) {
+        std::fs::create_dir_all(to).unwrap();
+        for entry in std::fs::read_dir(from).unwrap() {
+            let entry = entry.unwrap();
+            let target = to.join(entry.file_name());
+            if entry.file_type().unwrap().is_dir() {
+                copy_tree(&entry.path(), &target);
+            } else {
+                std::fs::copy(entry.path(), &target).unwrap();
+            }
+        }
+    }
+
+    /// A pom's `<repository>` is asked, before Maven Central, for every
+    /// artifact and parent pom the local repository does not hold yet. The
+    /// hosted scan therefore commits, with each pin, the prefix file that
+    /// limits its Socket repository to the pinned version
+    /// (`.mvn/socket-patch/prefixes-socket-patch-<uuid>.txt`) and the two
+    /// resolver lines that make Maven read it.
+    ///
+    /// For a single pom and for a reactor, on a local repository that
+    /// holds none of the project's artifacts:
+    ///
+    /// - Maven 3.9.2 and later (Maven 4 too) ask the Socket repository for
+    ///   the patched version's jar and pom and their checksums, and for
+    ///   nothing else;
+    /// - an older Maven reads no such file and asks it for the rest too,
+    ///   and still builds (asserted, so a change either way is noticed);
+    /// - without the file (the wiring of an earlier release) every Maven
+    ///   asks for the rest, which also shows the repository was cold;
+    /// - a rollback takes the file and the lines out again, byte for byte.
+    #[test]
+    #[ignore = "real Maven + Maven Central (dependency plugin); run with --ignored"]
+    fn maven_hosted_asks_the_socket_repository_only_for_the_patched_version() {
+        use std::collections::BTreeSet;
+        let Some(mvn) = Mvn::detect(SUITE) else {
+            return;
+        };
+        let b = Bench::new();
+        // The prefix file is read by repository id, and a mirror gives a
+        // repository its own: this one keeps the id the pom declares, as
+        // the repository has on a machine that reaches patch.socket.dev.
+        let id = format!("socket-patch-{UUID}");
+        let settings = b.root.join("settings-socket-id.xml");
+        let mirror_url = format!("{}{}", b.server.uri(), PATCH.repo_path());
+        write_settings_with_ids(&settings, &[(&id, &id, &mirror_url)]);
+        let repo = format!("{}/", PATCH.repo_path());
+        let victim: BTreeSet<String> = ["jar", "jar.sha1", "pom", "pom.sha1"]
+            .iter()
+            .map(|ext| PATCH.served_path(ext)[repo.len()..].to_string())
+            .collect();
+        // What Maven asked of the Socket repository since request `mark`.
+        let asked = |mark: usize| -> BTreeSet<String> {
+            b.server.paths()[mark..]
+                .iter()
+                .filter_map(|path| path.strip_prefix(repo.as_str()).map(str::to_string))
+                .collect()
+        };
+
+        for reactor in [false, true] {
+            let name = if reactor { "reactor" } else { "single" };
+            let proj = b.root.join(name);
+            if reactor {
+                fixture::write_reactor(&proj, &b.server);
+            } else {
+                fixture::write_project(&proj, Shape::Selected, &b.server);
+            }
+            // Warm the dependency plugin, and resolve what the scan reads
+            // the selection from.
+            let warmed = if reactor {
+                fixture::resolve_reactor(SUITE, &mvn, &proj, &b.m2, &b.plain, "target/before")
+                    .is_some()
+            } else {
+                fixture::resolve(SUITE, &mvn, &proj, &b.m2, &b.plain, "target/before").is_some()
+            };
+            if !warmed {
+                return;
+            }
+            // The wired project, resolved into the local repository `m2`
+            // (no fallback: nothing here may reach beyond the test's server).
+            let resolve = |m2: &Path, what: &str| {
+                let out = mvn.copy_dependencies(&proj, m2, &settings, "target/after");
+                assert!(ok(&out), "{name}, {what}:\n{}", dump(&out));
+                let _ = std::fs::remove_dir_all(proj.join("target"));
+                for (module, ..) in fixture::REACTOR_MODULES {
+                    let _ = std::fs::remove_dir_all(proj.join(module).join("target"));
+                }
+            };
+            let pristine = fixture::snapshot(&proj);
+
+            let (code, env, stderr) = b.scan(&proj);
+            assert_eq!(code, Some(0), "{name}: {env}\n{stderr}");
+            assert_eq!(env["summary"]["applied"], 1, "{name}: {env}");
+            let filter = proj.join(format!(".mvn/socket-patch/prefixes-{id}.txt"));
+            let listed = std::fs::read_to_string(&filter)
+                .unwrap_or_else(|e| panic!("{name}: {}: {e}", filter.display()));
+            assert_eq!(
+                listed.lines().last(),
+                Some(
+                    format!(
+                        "/{}/{}/{}",
+                        fixture::GROUP_PATH,
+                        fixture::VICTIM,
+                        b.suffixed
+                    )
+                    .as_str()
+                ),
+                "{name}: {listed}"
+            );
+            assert!(
+                warning(&env, "redirect_maven_repository_filter_conflict").is_none(),
+                "{name}: {env}"
+            );
+
+            // A local repository with the dependency plugin and none of
+            // the project's artifacts.
+            let cold = |tag: &str| -> PathBuf {
+                let m2 = b.root.join(format!("m2-{name}-{tag}"));
+                copy_tree(&b.m2, &m2);
+                std::fs::remove_dir_all(m2.join("com").join("socketfixture")).unwrap();
+                m2
+            };
+            let rest = |asked: &BTreeSet<String>| -> Vec<String> {
+                asked.difference(&victim).cloned().collect()
+            };
+
+            let mark = b.server.paths().len();
+            resolve(&cold("filtered"), "with the prefix file");
+            let filtered = asked(mark);
+            assert!(
+                filtered.is_superset(&victim),
+                "{name}: the patched version comes from the Socket repository: {filtered:?}"
+            );
+            if mvn.filters_repositories() {
+                assert_eq!(
+                    rest(&filtered),
+                    Vec::<String>::new(),
+                    "{name}: Maven {} asks the Socket repository for nothing else",
+                    mvn.version
+                );
+            } else {
+                assert!(
+                    !rest(&filtered).is_empty(),
+                    "{name}: Maven {} reads no prefix file: {filtered:?}",
+                    mvn.version
+                );
+            }
+
+            std::fs::remove_file(&filter).unwrap();
+            let mark = b.server.paths().len();
+            resolve(&cold("unfiltered"), "without the prefix file");
+            let unfiltered = asked(mark);
+            assert!(
+                unfiltered.is_superset(&victim) && !rest(&unfiltered).is_empty(),
+                "{name}: without the file every Maven asks for the rest: {unfiltered:?}"
+            );
+            std::fs::write(&filter, listed).unwrap();
+
+            b.rollback(&proj);
+            let after = fixture::snapshot(&proj);
+            // (Maven 4 keeps copies of the reactor's poms, as it last built
+            // them, in a project-local repository under `.mvn/target/`.)
+            let differ: BTreeSet<&String> = after
+                .keys()
+                .chain(pristine.keys())
+                .filter(|rel| !rel.starts_with(".mvn/target/"))
+                .filter(|rel| after.get(*rel) != pristine.get(*rel))
+                .collect();
+            assert!(
+                differ.is_empty(),
+                "{name}: a rollback takes the filter and its lines out again; these differ: \
+                 {differ:?}"
+            );
+        }
     }
 }
