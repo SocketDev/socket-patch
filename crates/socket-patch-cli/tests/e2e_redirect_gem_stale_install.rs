@@ -2663,6 +2663,250 @@ async fn refused_registry_leaves_the_copy_reported(cached_archive: bool) {
     );
 }
 
+/// The commands that unwind a hosted gem.
+const HOSTED_UNWINDS: [&[&str]; 2] = [&["rollback", "--yes"], &["remove", PURL, "--yes"]];
+
+/// A project whose gem a hosted scan pinned, with the lock as `bundle
+/// install` leaves it, in a gem home that has no `cache/` dir (Bundler
+/// 4.1's `prune` setting, the `rm -rf "${BUNDLE_PATH}"/ruby/*/cache` of the
+/// Dockerfile Rails generates, `gem cleanup`). With `refreshed` the scan
+/// replaced the installed copy with the patched build; without, it was told
+/// not to (`--no-gem-install-refresh`) and the copy is still the upstream
+/// one. Returns the installed gem dir and the gem home.
+async fn hosted_with_pruned_home_cache(
+    server: &MockServer,
+    proj: &Path,
+    refreshed: bool,
+) -> (PathBuf, PathBuf) {
+    std::fs::create_dir_all(proj).unwrap();
+    write_manifest_pair(proj);
+    let home = project_home(proj);
+    let gem_dir = install_real_gem(&home, UPSTREAM_LIB);
+    let uri = server.uri();
+    let flags: &[&str] = if refreshed {
+        &["--json"]
+    } else {
+        &["--json", "--no-gem-install-refresh"]
+    };
+    let (code, _, stderr) = common::run_with_env(proj, &scan_args(proj, &uri, flags), &[]);
+    assert_eq!(code, 0, "{stderr}");
+    let expected = if refreshed { PATCHED_LIB } else { UPSTREAM_LIB };
+    assert_eq!(installed_lib(&gem_dir), expected, "premise");
+    std::fs::write(proj.join("Gemfile.lock"), converged_lock(&uri)).unwrap();
+    std::fs::remove_dir_all(home.join("cache")).unwrap();
+    (gem_dir, home)
+}
+
+/// Every `detail` (a warning's) or `reason` (an event's) that `--json`
+/// output carries under `code`, wherever the command puts it.
+fn details_with_code(env: &serde_json::Value, code: &str) -> Vec<String> {
+    fn walk(value: &serde_json::Value, code: &str, out: &mut Vec<String>) {
+        match value {
+            serde_json::Value::Object(map) => {
+                if map
+                    .get("code")
+                    .or(map.get("errorCode"))
+                    .and_then(|c| c.as_str())
+                    == Some(code)
+                {
+                    let detail = map.get("detail").or(map.get("reason"));
+                    out.push(
+                        detail
+                            .and_then(|d| d.as_str())
+                            .unwrap_or_default()
+                            .to_string(),
+                    );
+                }
+                map.values().for_each(|v| walk(v, code, out));
+            }
+            serde_json::Value::Array(items) => items.iter().for_each(|v| walk(v, code, out)),
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    walk(env, code, &mut out);
+    out
+}
+
+/// #2092: a gem home with no `cache/` dir has no archive to judge the
+/// installed copy by. The hosted unwind judges it by the pin's patch record
+/// instead, as the scan does in that home, and puts the upstream gem back:
+/// otherwise the app keeps loading the patch under the restored lock, and
+/// no later `bundle install` changes that.
+#[tokio::test(flavor = "multi_thread")]
+async fn hosted_unwind_restores_an_install_whose_home_cache_was_pruned() {
+    for command in HOSTED_UNWINDS {
+        let server = MockServer::start().await;
+        let (patched, upstream) = (real_gem(PATCHED_LIB), real_gem(UPSTREAM_LIB));
+        mount_api_for(&server, None, &sha256_of(&patched)).await;
+        serve_patched_gem(&server, patched.clone()).await;
+        serve_upstream_gem(&server, &upstream).await;
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("proj");
+        let (gem_dir, home) = hosted_with_pruned_home_cache(&server, &proj, true).await;
+        let views_before = view_requests(&server).await;
+
+        let mut args = command.to_vec();
+        args.push("--json");
+        let (code, stdout, stderr) = unwind_run(&proj, &server.uri(), &args);
+        let env: serde_json::Value = serde_json::from_str(&stdout)
+            .unwrap_or_else(|e| panic!("{command:?}: not JSON: {e}\n{stdout}\n{stderr}"));
+        assert_eq!(code, 0, "{command:?}: {env}\n{stderr}");
+        let lock = std::fs::read_to_string(proj.join("Gemfile.lock")).unwrap();
+        assert!(!lock.contains("/patch-registry/"), "{command:?}:\n{lock}");
+        assert_eq!(
+            installed_lib(&gem_dir),
+            UPSTREAM_LIB,
+            "{command:?}: the upstream gem is back: {env}"
+        );
+        assert_eq!(
+            details_with_code(&env, "upstream_gem_install_refreshed").len(),
+            1,
+            "{command:?}: {env}"
+        );
+        assert!(
+            details_with_code(&env, "upstream_gem_stale_install").is_empty(),
+            "{command:?}: nothing is left on the patched build: {env}"
+        );
+        assert!(
+            !home.join("cache").exists(),
+            "{command:?}: a pruned cache dir is not created"
+        );
+        assert_eq!(
+            view_requests(&server).await - views_before,
+            1,
+            "{command:?}: one patch record, for that pin"
+        );
+    }
+}
+
+/// The same in a human run: the refresh is a progress line, and the gem is
+/// not counted among the packages that keep their patched bytes.
+#[tokio::test(flavor = "multi_thread")]
+async fn hosted_unwind_reports_the_pruned_home_refresh_in_a_human_run() {
+    let server = MockServer::start().await;
+    let (patched, upstream) = (real_gem(PATCHED_LIB), real_gem(UPSTREAM_LIB));
+    mount_api_for(&server, None, &sha256_of(&patched)).await;
+    serve_patched_gem(&server, patched.clone()).await;
+    serve_upstream_gem(&server, &upstream).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    let (gem_dir, _) = hosted_with_pruned_home_cache(&server, &proj, true).await;
+
+    // A dry run says what it would do and changes nothing.
+    let would = format!(
+        "Would replace the installed copy of 1 gem with the upstream build: {DEP} {DEP_VERSION}."
+    );
+    let (code, stdout, stderr) =
+        unwind_run(&proj, &server.uri(), &["rollback", "--yes", "--dry-run"]);
+    assert_eq!(code, 0, "{stdout}\n{stderr}");
+    assert!(stdout.contains(&would), "{stdout}\n{stderr}");
+    assert_eq!(installed_lib(&gem_dir), PATCHED_LIB);
+
+    let (code, stdout, stderr) = unwind_run(&proj, &server.uri(), &["rollback", "--yes"]);
+    assert_eq!(code, 0, "{stdout}\n{stderr}");
+    assert_eq!(installed_lib(&gem_dir), UPSTREAM_LIB, "{stdout}\n{stderr}");
+    assert!(
+        stdout.contains(&format!(
+            "Replaced the installed copy of 1 gem with the upstream build: {DEP} {DEP_VERSION}."
+        )),
+        "{stdout}\n{stderr}"
+    );
+    assert!(
+        !stdout.contains("patched bytes") && !stderr.contains("still"),
+        "nothing is left to reinstall:\n{stdout}\n{stderr}"
+    );
+}
+
+/// #2092: when no patch record can be had for such a copy (the API fails,
+/// or `--offline`), nothing tells it from the patched build. It is left as
+/// it is and named as a copy that could not be checked, with the reason and
+/// the files to remove: never passed over in silence.
+#[tokio::test(flavor = "multi_thread")]
+async fn hosted_unwind_names_a_pruned_home_install_no_record_can_judge() {
+    for (offline, reason) in [
+        (false, "its patch record could not be fetched"),
+        (true, "`--offline` is set"),
+    ] {
+        let server = MockServer::start().await;
+        let (patched, upstream) = (real_gem(PATCHED_LIB), real_gem(UPSTREAM_LIB));
+        // The view answers 500.
+        mount_api_for(&server, Some(0), &sha256_of(&patched)).await;
+        serve_patched_gem(&server, patched.clone()).await;
+        serve_upstream_gem(&server, &upstream).await;
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("proj");
+        let (gem_dir, home) = hosted_with_pruned_home_cache(&server, &proj, true).await;
+        let before = snapshot(&home);
+
+        let mut args = vec!["rollback", "--yes", "--json"];
+        if offline {
+            args.push("--offline");
+        }
+        let (code, stdout, stderr) = unwind_run(&proj, &server.uri(), &args);
+        let env: serde_json::Value = serde_json::from_str(&stdout)
+            .unwrap_or_else(|e| panic!("offline={offline}: not JSON: {e}\n{stdout}\n{stderr}"));
+        assert_eq!(code, 0, "offline={offline}: {env}\n{stderr}");
+        assert_eq!(snapshot(&home), before, "offline={offline}: left as it is");
+        assert!(
+            details_with_code(&env, "upstream_gem_install_refreshed").is_empty(),
+            "offline={offline}: {env}"
+        );
+        let unchecked = details_with_code(&env, "upstream_gem_stale_install");
+        assert_eq!(unchecked.len(), 1, "offline={offline}: reported: {env}");
+        let spec = home
+            .join("specifications")
+            .join(format!("{DEP}-{DEP_VERSION}.gemspec"));
+        for needle in [
+            PURL,
+            "could not be checked against the upstream gem",
+            reason,
+            "it still holds the patched build",
+            "run `bundle install`",
+            gem_dir.to_str().unwrap(),
+            spec.to_str().unwrap(),
+        ] {
+            assert!(
+                unchecked[0].contains(needle),
+                "offline={offline}: missing {needle:?}: {}",
+                unchecked[0]
+            );
+        }
+    }
+}
+
+/// The record judges, it does not assume: an installed copy that is still
+/// the upstream gem (the scan was told not to refresh it) is left alone in
+/// a home with no `cache/` dir too, with no warning and no gem download.
+#[tokio::test(flavor = "multi_thread")]
+async fn hosted_unwind_leaves_an_upstream_install_in_a_pruned_home_alone() {
+    let server = MockServer::start().await;
+    let (patched, upstream) = (real_gem(PATCHED_LIB), real_gem(UPSTREAM_LIB));
+    mount_api_for(&server, None, &sha256_of(&patched)).await;
+    serve_patched_gem(&server, patched.clone()).await;
+    serve_upstream_gem(&server, &upstream).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    let (_, home) = hosted_with_pruned_home_cache(&server, &proj, false).await;
+    let before = snapshot(&home);
+    let asked_before = server.received_requests().await.unwrap().len();
+
+    let (code, stdout, stderr) = unwind_run(&proj, &server.uri(), &["rollback", "--yes", "--json"]);
+    let env: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("not JSON: {e}\n{stdout}\n{stderr}"));
+    assert_eq!(code, 0, "{env}\n{stderr}");
+    assert_eq!(snapshot(&home), before, "nothing changed");
+    assert!(
+        details_with_code(&env, "upstream_gem_install_refreshed").is_empty()
+            && details_with_code(&env, "upstream_gem_stale_install").is_empty(),
+        "{env}"
+    );
+    assert!(
+        gem_downloads_since(&server, asked_before).await.is_empty(),
+        "no gem was downloaded"
+    );
+}
+
 /// The vendored half of the patch API for the fixture's patch: the grant
 /// names the patched `.gem` and the stub gemspec a path source loads, each
 /// with its sha512, beside the hosted registry override. Priority 1, so it
