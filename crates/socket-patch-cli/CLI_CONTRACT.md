@@ -955,10 +955,11 @@ name: nothing of it is run. This holds whatever lock governs the gem home.
 declare extensions, and be the copy's own source (above). The record's files are laid over the
 staged gem, and every `beforeHash` must hold there, whatever the mismatch policy of the run.
 RubyGems then builds the staged gem's extension in the stage. A gem RubyGems built is rebuilt the
-way it was built, with the build arguments RubyGems recorded for the installed copy
-(`build_info/`). A precompiled gem is rebuilt the way its publisher built it, from the libraries
-the gem packs: build arguments recorded for it were never used to build it and are not used now,
-and `NOKOGIRI_USE_SYSTEM_LIBRARIES` is removed from the build's environment. (Bundler's
+way it was built: with the build arguments RubyGems recorded for the installed copy
+(`build_info/`), and against the libraries its installed build linked (below). A precompiled gem
+is rebuilt the way its publisher built it, from the libraries the gem packs: build arguments
+recorded for it were never used to build it and are not used now, and
+`NOKOGIRI_USE_SYSTEM_LIBRARIES` is removed from the build's environment. (Bundler's
 `build.nokogiri --use-system-libraries`, which many projects kept from the years before nokogiri
 shipped precompiled gems, is recorded for the platform gem too; following it would replace the
 libxml2 the gem ships with the system's.) A gem the staged gem depends on at runtime that is not on
@@ -976,16 +977,30 @@ loaded from where it was built. The staged build is set aside: a gem RubyGems bu
 place (below), a precompiled gem is refused.
 
 **A gem built against the system's libraries.** A gem that packs a library (nokogiri packs
-libxml2 and libxslt) and was built against the system's copy instead compiles nothing of the
-copy it packs. A record that changes the packed copy (a file under `patches/` or `ports/`, or
-`dependencies.yml`: mini_portile's layout) cannot take effect in such an install, whose library is
-the operating system's. It is refused with `native_extensions_unsupported` and nothing is
-written, so `apply --check` and `vex` never attest it. Three things say a copy is such a build,
-each read without running anything: `--use-system-libraries` or `--enable-system-libraries`
-among the build arguments RubyGems recorded for it, "using system libraries" in the log of its
-installed build (`gem_make.out`), or `NOKOGIRI_USE_SYSTEM_LIBRARIES` in the environment of the
-run, which a rebuild would follow. A record of the gem's own sources (`ext/**`) is rebuilt
-against the system's libraries as before. A precompiled gem is never such a build.
+libxml2 and libxslt) can be built against the system's copy instead, and then compiles nothing of
+the copy it packs. What the installed build of a gem RubyGems built linked is read from files,
+without running anything: the log of that build (`gem_make.out`, where nokogiri writes "using
+system libraries" or "using packaged libraries"), else the build arguments RubyGems recorded for
+the copy, read as mkmf reads them (`--enable-system-libraries`, then
+`--disable-system-libraries`, then `--use-system-libraries`, each with any value; a line that
+holds several arguments, as Bundler 1 recorded a `build.<gem>` setting, is read word by word).
+
+- A rebuild links what the installed build linked, whatever `NOKOGIRI_USE_SYSTEM_LIBRARIES` is
+  when `apply` runs: the variable is set for the build of a copy built against the system's
+  libraries, removed for one built from the libraries it packs, and left as it is when neither
+  the log nor the arguments say.
+- A record that changes the packed library (a file under `patches/` or `ports/`, or
+  `dependencies.yml`: mini_portile's layout) cannot take effect in a copy built against the
+  system's libraries, whose library is the operating system's. It is refused with
+  `native_extensions_unsupported` and nothing is written. So is one for a nokogiri whose log and
+  arguments say nothing while `NOKOGIRI_USE_SYSTEM_LIBRARIES` is set, which its rebuild would
+  follow. `apply --check` and `vex` do not attest such a record on a copy built against the
+  system's libraries, whatever marker the copy holds. A record of the gem's own sources
+  (`ext/**`) is rebuilt, against the system's libraries.
+
+A precompiled gem is never such a build. Gems that keep a packed library elsewhere (rugged's
+`vendor/libgit2`, ffi's `ext/ffi_c/libffi`) are not recognised: a record for the packed library
+of one built against the system's is still rebuilt and attested.
 
 **Into the installed copy.** The record's files are written into the copy, and the build takes the
 place of the compiled code:

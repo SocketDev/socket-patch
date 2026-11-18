@@ -2120,8 +2120,11 @@ packs. A patch to that packed library (a file under `patches/` or `ports/`, or
 `dependencies.yml`) changes nothing in such an install, so it fails with
 `native_extensions_unsupported` and nothing is written: the library that install runs is the
 operating system's package, and updating that package is what fixes it. A patch to the gem's own
-C sources is still rebuilt, against the system's libraries. A precompiled gem always carries the
-libraries it packs, and is rebuilt with them even when the project still has that Bundler setting.
+C sources is still rebuilt, against the system's libraries: a rebuild links what the installed
+build linked (its build log and recorded build arguments say which), even when
+`NOKOGIRI_USE_SYSTEM_LIBRARIES` was set only for the install. A precompiled gem always carries
+the libraries it packs, and is rebuilt with them even when the project still has that Bundler
+setting.
 
 The build happens in a stage directory inside the gem home (`.socket-patch-build/`), which is
 removed afterwards. A gem the build needs that the install lacks (a precompiled nokogiri has no

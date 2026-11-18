@@ -207,7 +207,8 @@ class NokogiriE2E
     settings = {}
     settings["BUNDLE_PATH"] = "vendor/bundle" if project_home?
     settings["BUNDLE_FORCE_RUBY_PLATFORM"] = "true" if %w[source system-libraries].include?(want)
-    settings["BUNDLE_BUILD__NOKOGIRI"] = "--use-system-libraries" if want == "system-libraries"
+    by_variable = @opts[:system_libraries_by] == "variable"
+    settings["BUNDLE_BUILD__NOKOGIRI"] = "--use-system-libraries" if want == "system-libraries" && !by_variable
     (@opts[:settings] || []).each do |pair|
       key, value = pair.split("=", 2)
       settings[key] = value.to_s
@@ -217,6 +218,10 @@ class NokogiriE2E
       lines = settings.map { |k, v| "#{k}: \"#{v}\"" }
       File.write(File.join(@proj, ".bundle", "config"), (["---"] + lines).join("\n") + "\n")
       @install_env = {}
+      # For the install alone, as `RUN NOKOGIRI_USE_SYSTEM_LIBRARIES=1 bundle
+      # install` sets it: RubyGems records no build argument, and nothing
+      # that runs later sees the variable.
+      @install_env["NOKOGIRI_USE_SYSTEM_LIBRARIES"] = "1" if want == "system-libraries" && by_variable
     else
       # The ambient configuration is not this script's to write: the
       # settings ride on the install's environment instead.
@@ -229,8 +234,10 @@ class NokogiriE2E
       attempts += 1
       sh!(@install_env, *bundle("install", "--jobs", "4", "--retry", "3"))
     rescue Failure => e
-      # A registry blip, not a result: one more try before giving up.
-      raise if attempts >= 2 || e.message !~ /Network error|Gem::RemoteFetcher|HTTP|timed out|Timeout/i
+      # A registry blip, not a result: one more try before giving up. (Not
+      # "HTTP": Bundler names https://rubygems.org in every failure.)
+      blip = /Network error|Gem::RemoteFetcher::FetchError|Net::(Open|Read)Timeout|Could not (reach|fetch)/
+      raise if attempts >= 2 || e.message !~ blip
       retry
     end
 
@@ -597,7 +604,7 @@ puts "sp_probe\t" + JSON.generate(result)
 end
 
 opts = { :install => "any", :build => "ok", :gem_home => "project", :scenarios => %w[ruby c libxml2], :gems => [],
-         :settings => [] }
+         :settings => [], :system_libraries_by => "setting" }
 parser = OptionParser.new do |o|
   o.banner = "usage: ruby nokogiri_e2e.rb --socket-patch BIN --nokogiri VERSION [options]"
   o.on("--socket-patch BIN", "the socket-patch binary under test") { |v| opts[:socket_patch] = v }
@@ -606,6 +613,10 @@ parser = OptionParser.new do |o|
        "the install to make and require: precompiled (Bundler's default where a platform gem exists),",
        "source (the ruby platform gem, compiled here), system-libraries (compiled against the system's",
        "libxml2), java, or any (default)") { |v| opts[:install] = v }
+  o.on("--system-libraries-by HOW", %w[setting variable],
+       "how a system-libraries install is asked for: setting (default: Bundler's `build.nokogiri",
+       "--use-system-libraries`, which RubyGems records) or variable (NOKOGIRI_USE_SYSTEM_LIBRARIES",
+       "set for the install alone; only with --gem-home project)") { |v| opts[:system_libraries_by] = v }
   o.on("--build RESULT", %w[ok unavailable refused],
        "what a patch that needs a rebuild must do: ok (default), unavailable (no toolchain: fail,",
        "change nothing), refused (a JRuby install)") { |v| opts[:build] = v }

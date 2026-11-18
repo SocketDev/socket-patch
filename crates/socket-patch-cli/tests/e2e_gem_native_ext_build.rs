@@ -1729,7 +1729,7 @@ fn a_precompiled_copy_is_rebuilt_without_the_build_arguments_recorded_for_it() {
     let ruby = FakeRuby::new();
     ruby.serve_source_gem(&c_source(1));
 
-    let env = [("NOKOGIRI_USE_SYSTEM_LIBRARIES", "1")];
+    let env = [(SYSTEM_LIBRARIES, "1")];
     let (code, stdout, stderr) = ruby.run(&proj, &["apply", "--json", "--offline"], &env);
     assert_eq!(code, 0, "apply failed:\n{stdout}\n{stderr}");
     assert_eq!(event_action(&stdout), "applied", "{stdout}");
@@ -1739,9 +1739,7 @@ fn a_precompiled_copy_is_rebuilt_without_the_build_arguments_recorded_for_it() {
         "the build was given the arguments recorded for the platform gem"
     );
     assert!(
-        !ruby
-            .env_seen("stage_build")
-            .contains("NOKOGIRI_USE_SYSTEM_LIBRARIES"),
+        !ruby.env_seen("stage_build").contains(SYSTEM_LIBRARIES),
         "the build was told to use the system's libraries"
     );
     assert_eq!(
@@ -1750,48 +1748,61 @@ fn a_precompiled_copy_is_rebuilt_without_the_build_arguments_recorded_for_it() {
     );
 }
 
+/// The variable nokogiri's build reads for linking the system's libxml2.
+const SYSTEM_LIBRARIES: &str = "NOKOGIRI_USE_SYSTEM_LIBRARIES";
+
+/// [`fake_native_gem`] with its source gem in the home's `cache/`, and its
+/// gem home.
+#[cfg(unix)]
+fn built_gem_with_its_archive() -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf) {
+    let (tmp, proj, gem_dir) = fake_native_gem(true);
+    let home = proj.join("vendor/bundle/ruby/3.4.0");
+    std::fs::create_dir_all(home.join("cache")).unwrap();
+    std::fs::write(home.join("cache/sp_native-1.0.0.gem"), b"the source gem").unwrap();
+    std::fs::create_dir_all(home.join("build_info")).unwrap();
+    (tmp, proj, gem_dir, home)
+}
+
+/// Say, in the log of the installed build, which libraries it linked.
+#[cfg(unix)]
+fn write_build_log(home: &Path, libraries: &str) {
+    std::fs::write(
+        home.join("extensions/x86_64-linux/3.4.0")
+            .join(FULL_NAME)
+            .join("gem_make.out"),
+        format!("ruby extconf.rb\nBuilding sp_native using {libraries} libraries.\n"),
+    )
+    .unwrap();
+}
+
 /// A gem built against the system's copy of a library compiles nothing of
 /// the copy it packs, so a record that changes the packed copy (the shape
 /// of a third of the published nokogiri patches: one more
 /// `patches/libxml2/*.patch`) cannot take effect there. It is refused from
-/// files alone, whichever way the build says what it linked, and never
-/// attested: before, it was written, "rebuilt" against the same system
-/// library and attested as patched. A record of the gem's own sources is
-/// still rebuilt, with the arguments RubyGems recorded.
+/// files alone, whichever way the installed build says what it linked, and
+/// never attested: before, it was written, "rebuilt" against the same
+/// system library and attested as patched. The same record on a copy built
+/// from what the gem packs is built.
 #[cfg(unix)]
 #[test]
 fn a_packed_library_patch_to_a_system_library_build_is_refused() {
     let library_patch: [RecordFile<'_>; 1] = [("patches/libsp/0100-CVE-test.patch", None, "fix\n")];
-    let new_gem = || {
-        let (tmp, proj, gem_dir) = fake_native_gem(true);
-        let home = proj.join("vendor/bundle/ruby/3.4.0");
-        std::fs::create_dir_all(home.join("cache")).unwrap();
-        std::fs::write(home.join("cache/sp_native-1.0.0.gem"), b"the source gem").unwrap();
-        std::fs::create_dir_all(home.join("build_info")).unwrap();
-        (tmp, proj, gem_dir, home)
-    };
-    let recorded = |home: &Path| {
-        std::fs::write(
-            home.join("build_info").join(format!("{FULL_NAME}.info")),
-            "--with-cflags=-O2\n--use-system-libraries\n",
-        )
-        .unwrap();
-    };
 
-    for evidence in ["arguments", "log", "environment"] {
-        let (_tmp, proj, _gem_dir, home) = new_gem();
+    for evidence in ["arguments", "arguments in one line", "log"] {
+        let (_tmp, proj, _gem_dir, home) = built_gem_with_its_archive();
         write_record(&proj.join(".socket"), PURL, &library_patch);
-        let mut env = Vec::new();
+        let info = home.join("build_info").join(format!("{FULL_NAME}.info"));
         match evidence {
-            "arguments" => recorded(&home),
-            "log" => std::fs::write(
-                home.join("extensions/x86_64-linux/3.4.0")
-                    .join(FULL_NAME)
-                    .join("gem_make.out"),
-                "ruby extconf.rb\nBuilding sp_native using system libraries.\n",
+            "arguments" => {
+                std::fs::write(info, "--with-cflags=-O2\n--use-system-libraries\n").unwrap()
+            }
+            // As Bundler 1 recorded a `build.<gem>` setting.
+            "arguments in one line" => std::fs::write(
+                info,
+                "--use-system-libraries --with-sp-include=/usr/include\n",
             )
             .unwrap(),
-            _ => env.push(("NOKOGIRI_USE_SYSTEM_LIBRARIES", "1")),
+            _ => write_build_log(&home, "system"),
         }
         let ruby = FakeRuby::new();
         ruby.serve_source_gem(&c_source(1));
@@ -1801,7 +1812,7 @@ fn a_packed_library_patch_to_a_system_library_build_is_refused() {
             &["apply", "--json", "--offline"][..],
             &["apply", "--json", "--offline", "--dry-run"],
         ] {
-            let (code, stdout, stderr) = ruby.run(&proj, args, &env);
+            let (code, stdout, stderr) = ruby.run(&proj, args, &[]);
             assert_eq!(code, 1, "{evidence} {args:?}: {stdout}\n{stderr}");
             let envelope = parse_json_envelope(&stdout);
             let error = common::envelope::event_for(&envelope, PURL)["error"]
@@ -1811,9 +1822,13 @@ fn a_packed_library_patch_to_a_system_library_build_is_refused() {
             assert!(
                 error.contains("native_extensions_unsupported")
                     && error.contains("patches/libsp/0100-CVE-test.patch")
-                    && error.contains("the system's copy of that library")
-                    && error.contains("nothing was written"),
+                    && error.contains("was built against the system's copy of that library")
+                    && error.contains("cannot take effect; nothing was written"),
                 "{evidence} {args:?}: {error}"
+            );
+            assert!(
+                !error.contains("  "),
+                "the message has a gap in it: {error}"
             );
         }
         assert_eq!(
@@ -1822,40 +1837,100 @@ fn a_packed_library_patch_to_a_system_library_build_is_refused() {
             "{evidence}: Ruby ran for a patch that cannot take effect"
         );
         assert_tree(&proj.join("vendor"), &tree_before, evidence);
-        let (code, stdout, stderr) = ruby.run(&proj, &["apply", "--check"], &env);
+        let (code, stdout, stderr) = ruby.run(&proj, &["apply", "--check"], &[]);
         assert_ne!(code, 0, "{evidence}: {stdout}\n{stderr}");
         assert!(
-            !vex_attests(|args| ruby.run(&proj, args, &env)),
+            !vex_attests(|args| ruby.run(&proj, args, &[])),
             "{evidence}: vex attested a patch that is compiled into nothing"
         );
     }
 
-    // The same record on a copy built from what the gem packs is built.
-    let (_tmp, proj, gem_dir, _home) = new_gem();
+    // A copy built from what the gem packs builds the same record, with the
+    // variable set or not: its log says what it links.
+    let (_tmp, proj, gem_dir, home) = built_gem_with_its_archive();
+    write_build_log(&home, "packaged");
     write_record(&proj.join(".socket"), PURL, &library_patch);
     let ruby = FakeRuby::new();
     ruby.serve_source_gem(&c_source(1));
-    let (code, stdout, stderr) = ruby.run(&proj, &["apply", "--json", "--offline"], &[]);
+    let env = [(SYSTEM_LIBRARIES, "1")];
+    let (code, stdout, stderr) = ruby.run(&proj, &["apply", "--json", "--offline"], &env);
     assert_eq!(code, 0, "apply failed:\n{stdout}\n{stderr}");
     assert_eq!(event_action(&stdout), "applied", "{stdout}");
     assert!(gem_dir.join("patches/libsp/0100-CVE-test.patch").is_file());
-    assert!(vex_attests(|args| ruby.run(&proj, args, &[])));
+    assert!(vex_attests(|args| ruby.run(&proj, args, &env)));
+    // Applied and built: a second run has nothing to refuse.
+    let (code, stdout, stderr) = ruby.run(&proj, &["apply", "--json", "--offline"], &env);
+    assert_eq!(code, 0, "{stdout}\n{stderr}");
+    assert_eq!(event_action(&stdout), "skipped", "{stdout}");
 
-    // And a record of the gem's own sources is rebuilt against the system's
-    // libraries, as the installed build was.
-    let (_tmp, proj, _gem_dir, home) = new_gem();
-    recorded(&home);
+    // A marker over a build that links the system's libraries attests
+    // nothing of the packed library, whoever wrote it.
+    write_build_log(&home, "system");
+    let (code, stdout, stderr) = ruby.run(&proj, &["apply", "--check"], &[]);
+    assert_ne!(code, 0, "{stdout}\n{stderr}");
+    assert!(!vex_attests(|args| ruby.run(&proj, args, &[])));
+}
+
+/// A record of the gem's own sources is rebuilt against the libraries the
+/// installed build linked, whatever the environment says by the time
+/// `apply` runs: a gem installed with the variable set for that one
+/// command is rebuilt with it, and a gem built from the libraries it packs
+/// is rebuilt without it. The arguments RubyGems recorded are given again.
+#[cfg(unix)]
+#[test]
+fn a_rebuild_links_the_libraries_the_installed_build_linked() {
+    // Built against the system's, by the variable alone; `apply` runs
+    // without it.
+    let (_tmp, proj, _gem_dir, home) = built_gem_with_its_archive();
+    write_build_log(&home, "system");
     write_manifest(&proj.join(".socket"), &c_source(1), &c_source(2));
     let ruby = FakeRuby::new();
     ruby.serve_source_gem(&c_source(1));
     let (code, stdout, stderr) = ruby.run(&proj, &["apply", "--json", "--offline"], &[]);
     assert_eq!(code, 0, "apply failed:\n{stdout}\n{stderr}");
     assert_eq!(event_action(&stdout), "applied", "{stdout}");
+    assert!(
+        ruby.env_seen("stage_build")
+            .contains(&format!("{SYSTEM_LIBRARIES}=1")),
+        "the rebuild of a system-library build was not told to link them"
+    );
+    assert_eq!(ruby.stage_build_args_of(), FULL_NAME);
+
+    // Built from what the gem packs; `apply` runs with the variable set.
+    let (_tmp, proj, _gem_dir, home) = built_gem_with_its_archive();
+    write_build_log(&home, "packaged");
+    std::fs::write(
+        home.join("build_info").join(format!("{FULL_NAME}.info")),
+        "--with-cflags=-O2\n",
+    )
+    .unwrap();
+    write_manifest(&proj.join(".socket"), &c_source(1), &c_source(2));
+    let ruby = FakeRuby::new();
+    ruby.serve_source_gem(&c_source(1));
+    let env = [(SYSTEM_LIBRARIES, "1")];
+    let (code, stdout, stderr) = ruby.run(&proj, &["apply", "--json", "--offline"], &env);
+    assert_eq!(code, 0, "apply failed:\n{stdout}\n{stderr}");
+    assert!(
+        !ruby.env_seen("stage_build").contains(SYSTEM_LIBRARIES),
+        "the rebuild of a packaged build was told to link the system's libraries"
+    );
     assert_eq!(
         ruby.stage_build_args_of(),
         FULL_NAME,
         "the rebuild takes the arguments RubyGems recorded for the copy"
     );
+
+    // The in-place rebuild (no source gem to stage) is made the same way.
+    let (_tmp, proj, _gem_dir) = fake_native_gem(true);
+    let home = proj.join("vendor/bundle/ruby/3.4.0");
+    write_build_log(&home, "system");
+    write_manifest(&proj.join(".socket"), &c_source(1), &c_source(2));
+    let ruby = FakeRuby::new();
+    let (code, stdout, stderr) = ruby.run(&proj, &["apply", "--json", "--offline"], &[]);
+    assert_eq!(code, 0, "apply failed:\n{stdout}\n{stderr}");
+    assert!(ruby
+        .env_seen("build")
+        .contains(&format!("{SYSTEM_LIBRARIES}=1")));
 }
 
 /// Without the source gem there is nothing to build from: offline and not
