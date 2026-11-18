@@ -393,7 +393,7 @@ async fn gem_prelude(
                 "platform_gem_unsupported",
                 format!(
                     "`{name}@{version}` is a platform-specific gem build (`platform={platform}`); precompiled platform gems cannot be vendored portably. {}",
-                    platform_gem_remedy(&name)
+                    platform_gem_remedy(name)
                 ),
             ));
         }
@@ -414,7 +414,7 @@ async fn gem_prelude(
             "platform_gem_unsupported",
             format!(
                 "installed dir `{dir_name}` is not the portable `{leaf}` gem (platform-specific or unexpected gem builds cannot be vendored portably). {}",
-                    platform_gem_remedy(&name)
+                    platform_gem_remedy(name)
             ),
         ));
     }
@@ -492,7 +492,7 @@ async fn gem_prelude(
                 "native_extensions_unsupported",
                 format!(
                     "{leaf}.gemspec declares native extensions; bundler does not build extensions for path-sourced gems. {}",
-                    native_extensions_remedy(&name)
+                    native_extensions_remedy(name)
                 ),
             ));
         }
@@ -1049,7 +1049,7 @@ pub(super) async fn gem_service_copy(
             format!(
                 "the served stub gemspec for {name} declares native extensions; bundler does \
                  not build extensions for path-sourced gems. {}",
-                native_extensions_remedy(&name)
+                native_extensions_remedy(name)
             ),
         ));
     }
