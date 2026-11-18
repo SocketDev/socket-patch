@@ -2,7 +2,8 @@
 //! Maven itself uses (#423): `M2_HOME` is the Maven install, not a local
 //! repository; `<localRepository>` in the user or global `settings.xml`
 //! and `-Dmaven.repo.local` relocate it; on Windows `user.home` is the
-//! profile directory, whatever `HOME` says.
+//! profile directory, whatever `HOME` says. A project's `.mvn/maven.config`
+//! can relocate it too, for the builds run in that project.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -19,6 +20,11 @@ fn env(pairs: &[(&str, &Path)]) -> HashMap<String, String> {
 
 fn m2_repo(env: &HashMap<String, String>, os: Os) -> Option<PathBuf> {
     JvmEnv::resolve(env, os, None).m2_repo
+}
+
+/// The local repository of a build run in `project`.
+fn m2_repo_in(env: &HashMap<String, String>, project: &Path) -> Option<PathBuf> {
+    JvmEnv::resolve_in(env, Os::current(), None, Some(project)).m2_repo
 }
 
 fn write(p: &Path, text: &str) {
@@ -306,4 +312,155 @@ fn maven_args_user_home_does_not_move_the_m2_directory() {
         m2_repo(&e, Os::current()),
         Some(home.path().join(".m2").join("repository"))
     );
+}
+
+/// `-Dmaven.repo.local` in the project's `.mvn/maven.config` is the local
+/// repository of every build run there, in Maven's order: below
+/// `MAVEN_REPO_LOCAL` and the command line (`MAVEN_ARGS`), above
+/// `MAVEN_OPTS` and the settings files.
+#[test]
+fn maven_config_local_repository_is_honoured_in_mavens_order() {
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let from_settings = tempfile::tempdir().unwrap();
+    let from_config = tempfile::tempdir().unwrap();
+    let from_opts = tempfile::tempdir().unwrap();
+    let from_args = tempfile::tempdir().unwrap();
+    let from_env = tempfile::tempdir().unwrap();
+    write(
+        &home.path().join(".m2").join("settings.xml"),
+        &settings(from_settings.path().to_str().unwrap()),
+    );
+    let config = project.path().join(".mvn").join("maven.config");
+    write(
+        &config,
+        &format!(
+            "# the team's shared cache\n-B\n-Dmaven.repo.local={}\n-T 4\n",
+            from_config.path().display()
+        ),
+    );
+    let mut e = env(&[("HOME", home.path())]);
+    assert_eq!(
+        m2_repo_in(&e, project.path()),
+        Some(from_config.path().to_path_buf())
+    );
+    // Without the project the environment alone decides, as before.
+    assert_eq!(
+        m2_repo(&e, Os::current()),
+        Some(from_settings.path().to_path_buf())
+    );
+
+    e.insert(
+        "MAVEN_OPTS".into(),
+        format!("-Dmaven.repo.local={}", from_opts.path().display()),
+    );
+    assert_eq!(
+        m2_repo_in(&e, project.path()),
+        Some(from_config.path().to_path_buf()),
+        "a user property (maven.config) is read before a JVM one (MAVEN_OPTS)"
+    );
+    e.insert(
+        "MAVEN_ARGS".into(),
+        format!("-Dmaven.repo.local={}", from_args.path().display()),
+    );
+    assert_eq!(
+        m2_repo_in(&e, project.path()),
+        Some(from_args.path().to_path_buf()),
+        "the command line is merged over maven.config"
+    );
+    e.insert(
+        "MAVEN_REPO_LOCAL".into(),
+        from_env.path().to_str().unwrap().into(),
+    );
+    assert_eq!(
+        m2_repo_in(&e, project.path()),
+        Some(from_env.path().to_path_buf())
+    );
+}
+
+/// The config is the one Maven's launcher finds from a module directory:
+/// in the nearest directory above that holds `.mvn`. A relative value is
+/// taken from the directory Maven runs in, and Maven's own placeholders
+/// resolve.
+#[test]
+fn maven_config_is_found_above_a_module_and_interpolated() {
+    let home = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let module = root.path().join("services").join("api");
+    std::fs::create_dir_all(&module).unwrap();
+    let config = root.path().join(".mvn").join("maven.config");
+    let e = env(&[("HOME", home.path())]);
+
+    write(
+        &config,
+        "-Dmaven.repo.local=${session.rootDirectory}/.m2/repository\n",
+    );
+    let in_root = Some(root.path().join(".m2").join("repository"));
+    assert_eq!(m2_repo_in(&e, &module), in_root);
+    assert_eq!(m2_repo_in(&e, root.path()), in_root);
+
+    write(&config, "-Dmaven.repo.local=${user.home}/cache/m2\n");
+    assert_eq!(
+        m2_repo_in(&e, &module),
+        Some(home.path().join("cache").join("m2"))
+    );
+
+    // Maven before 3.9 split the whole file on whitespace; the last
+    // occurrence wins either way.
+    write(
+        &config,
+        "-B -Dmaven.repo.local=first -Dmaven.repo.local=.repo -q\n",
+    );
+    assert_eq!(m2_repo_in(&e, &module), Some(module.join(".repo")));
+    assert_eq!(m2_repo_in(&e, root.path()), Some(root.path().join(".repo")));
+
+    // A nearer `.mvn` is the one the launcher stops at, config or not.
+    std::fs::create_dir_all(module.join(".mvn")).unwrap();
+    assert_eq!(
+        m2_repo_in(&e, &module),
+        Some(home.path().join(".m2").join("repository"))
+    );
+}
+
+/// A config that does not set the property, or is not a file, changes
+/// nothing. One that sets it to a value not used here (empty, or with a
+/// placeholder nothing defines) still decides, as it does in Maven.
+#[test]
+fn an_unusable_maven_config_changes_nothing() {
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let from_opts = tempfile::tempdir().unwrap();
+    let config = project.path().join(".mvn").join("maven.config");
+    let mut e = env(&[("HOME", home.path())]);
+    let default = Some(home.path().join(".m2").join("repository"));
+
+    std::fs::create_dir_all(project.path().join(".mvn")).unwrap();
+    assert_eq!(m2_repo_in(&e, project.path()), default, "no config");
+    e.insert(
+        "MAVEN_OPTS".into(),
+        format!("-Dmaven.repo.local={}", from_opts.path().display()),
+    );
+    let opts = Some(from_opts.path().to_path_buf());
+    for text in [
+        "-B\n-Dmaven.repo.locale=/elsewhere\n",
+        "-Dmaven.repo.local.tail=/a/tail\n",
+        "# -Dmaven.repo.local=/commented\n",
+    ] {
+        write(&config, text);
+        assert_eq!(m2_repo_in(&e, project.path()), opts, "{text:?}");
+    }
+    std::fs::remove_file(&config).unwrap();
+    std::fs::create_dir(&config).unwrap();
+    assert_eq!(m2_repo_in(&e, project.path()), opts, "a directory");
+    std::fs::remove_dir(&config).unwrap();
+
+    // Set, but not used here: Maven takes the config's value, so the
+    // repository MAVEN_OPTS names (which Maven does not reach) is not it.
+    for text in [
+        "-Dmaven.repo.local=${some.build.property}/m2\n",
+        "-Dmaven.repo.local=\n",
+    ] {
+        write(&config, text);
+        assert_eq!(m2_repo_in(&e, project.path()), default, "{text:?}");
+    }
 }

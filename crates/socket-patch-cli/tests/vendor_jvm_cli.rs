@@ -359,6 +359,74 @@ fn cold_cache_rerun_vex_repair_and_revert() {
     }
 }
 
+/// A jar over the limits jars once shared with Python wheels (10,000
+/// entries, 64 MiB inflated) is vendored, held to upstream by an online
+/// re-run, attested by `vex`, passes `vendor --check`, and is rebuilt by
+/// `repair`. Each of those used to stop at the wheel reader's caps.
+#[test]
+fn a_jar_over_the_old_reader_limits_vendors_attests_and_repairs() {
+    let big = {
+        let mut zw = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let opts = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        zw.start_file(MEMBER, opts).unwrap();
+        zw.write_all(b"NOTICE foo\n").unwrap();
+        let mut body = vec![0x5au8; 6800];
+        for i in 0..10_001u64 {
+            body[..8].copy_from_slice(&i.to_le_bytes());
+            zw.start_file(format!("p/C{i}.class"), opts).unwrap();
+            zw.write_all(&body).unwrap();
+        }
+        zw.finish().unwrap().into_inner()
+    };
+    assert!(big.len() > 64 * 1024 * 1024);
+    for shape in [Shape::Reactor, Shape::Gradle] {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fixture(root, shape, &[("foo", FOO_UUID)]);
+        std::fs::write(root.join("m2/org/example/foo/1.0/foo-1.0.jar"), &big).unwrap();
+        let env = ok(root, &["vendor"]);
+        assert_eq!(env["events"][0]["action"], "applied", "{env}");
+        let tree_jar = root.join(if shape == Shape::Reactor {
+            "proj/.socket/vendor/maven2/org/example/foo/1.0-socket.1d3c1fd2/foo-1.0-socket.1d3c1fd2.jar"
+        } else {
+            "proj/.socket/vendor/gradle/org/example/foo/1.0/foo-1.0.jar"
+        });
+        let vendored = std::fs::read(&tree_jar).unwrap();
+        assert!(vendored.len() > 64 * 1024 * 1024);
+
+        let env = ok(root, &["vendor"]);
+        assert_eq!(
+            events(&env),
+            [(
+                purl("foo"),
+                "skipped".to_string(),
+                "already_vendored".to_string()
+            )],
+            "{env}"
+        );
+        ok(root, &["vendor", "--check"]);
+        let vex = root.join("vex.json");
+        ok(
+            root,
+            &[
+                "vex",
+                "-O",
+                vex.to_str().unwrap(),
+                "--product",
+                "pkg:generic/x@1",
+            ],
+        );
+        let doc: serde_json::Value = serde_json::from_slice(&std::fs::read(&vex).unwrap()).unwrap();
+        assert_eq!(doc["statements"][0]["status"], "not_affected", "{doc}");
+
+        std::fs::remove_file(&tree_jar).unwrap();
+        let env = ok(root, &["repair"]);
+        assert_eq!(env["events"][0]["action"], "rebuilt", "{env}");
+        assert!(std::fs::read(&tree_jar).unwrap() == vendored);
+    }
+}
+
 /// #656: a file the index does not list in the vendored tree (a Finder
 /// `.DS_Store`) fails the Gradle build and `vendor --check`. Re-running
 /// `vendor`, the remedy the build error names, and `repair` both sweep

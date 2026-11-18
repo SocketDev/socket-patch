@@ -3703,6 +3703,15 @@ async fn apply_maven_base(m: &MavenBase<'_>) -> MavenApplied {
                     for mut result in results {
                         check_derived_copies(&mut out, &mut result, &jar_leaf, args, m.derived)
                             .await;
+                        // A copy's own coded refusal is a run warning too,
+                        // as a whole-swap one is.
+                        let coded = result.error.as_deref().and_then(|error| {
+                            let code = jvm_jar::copy_failure_code(error)?;
+                            Some((code, error[code.len() + 2..].to_string()))
+                        });
+                        if let Some((code, detail)) = coded {
+                            out.warn(code, detail);
+                        }
                         out.record(args, result);
                     }
                 }

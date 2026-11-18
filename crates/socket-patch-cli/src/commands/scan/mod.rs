@@ -1381,7 +1381,11 @@ async fn gradle_scan(
             &cwd,
             socket_patch_core::vendor::jvm::layout::BuildTool::Gradle,
         );
-        let env = JvmEnv::from_process();
+        let env = if global {
+            JvmEnv::from_process()
+        } else {
+            JvmEnv::for_project(&cwd)
+        };
         let gate = (!global && gradle_build).then(|| m2_gate(&cwd, &env));
         // The cwd's build locks annotate Gradle-cached packages in a global
         // run too; without a Gradle build at the cwd there is nothing to

@@ -1093,10 +1093,19 @@ then `.gradle` in the account's home directory. On Unix that is the passwd entry
 `$HOME`; when they differ, scan notes `gradle_user_home_differs`.
 
 `~/.m2` here means the Maven local repository, found the way Maven finds it:
-`MAVEN_REPO_LOCAL`, then `-Dmaven.repo.local` in `MAVEN_ARGS` or `MAVEN_OPTS`, then
+`MAVEN_REPO_LOCAL`, then `-Dmaven.repo.local` in `MAVEN_ARGS` (the command line), in
+the project's `.mvn/maven.config`, or in `MAVEN_OPTS`, in that order, then
 `<localRepository>` in `~/.m2/settings.xml`, then in the install's `conf/settings.xml`
 (`MAVEN_HOME` or `M2_HOME`), then `.m2/repository` in `user.home`. `M2_HOME` itself
 never names a local repository. On Windows `user.home` is `USERPROFILE`, not `HOME`.
+
+The `.mvn/maven.config` read is the one Maven's launcher finds from the project
+directory: in the nearest directory at or above it that holds a `.mvn` directory. A
+line is one argument (`#` starts a comment), the last `-Dmaven.repo.local=` wins,
+`${session.rootDirectory}`, `${session.topDirectory}`, `${user.home}` and
+`${env.NAME}` are filled in, and a relative path is taken from the project directory,
+where Maven would run. A `--global` run reads no project's config. Maven before 3.9
+does not read `MAVEN_ARGS`; socket-patch reads it whatever Maven is installed.
 
 A Gradle-only build reads `~/.m2` only through `mavenLocal()`. Scan looks for it in
 every settings, build, `buildSrc`, included-build, applied and init script, including
@@ -1111,8 +1120,19 @@ cannot be read literally, `~/.m2` stays in the scan and scan notes
 `apply` patches every copy the build consumes. Gradle keeps one hash directory per
 download of a version, and each one holding the patched files is patched. Records
 keyed by members inside a jar swap in the patch service's build of the whole jar, so
-they need network access (`jvm_agent_service_required` offline). The original is
-backed up under `.socket/jvm-originals/` and `rollback` restores from it. `rollback`
+they need network access (`jvm_agent_service_required` offline). Before the swap the
+service's jar is compared with the installed one member by member: everything the
+JVM would load outside the patched members and signature files must be identical, or
+that copy is left alone (`jvm_agent_service_jar_mismatch`, naming the members). Jars
+of up to 200,000 entries and 1 GiB inflated are handled; one past that is
+`jvm_jar_too_large`. The original is
+backed up under `.socket/jvm-originals/` and `rollback` restores from it. A `~/.m2`
+jar that another project (or an earlier workspace over a cached `~/.m2`) patched has
+no backup in this project: online, `rollback` downloads the original from the
+registry and uses it only when it matches the registry's checksum and is the jar the
+copy was patched from; otherwise it fails with `jvm_jar_backup_missing` and says how
+to recover (roll back from the project that applied the patch, or delete the version
+directory so the build downloads the jar again). `rollback`
 and `remove` restore every patched writable copy, including a `~/.m2` copy the build
 no longer reads (an earlier apply patched it while `mavenLocal()` was declared).
 Such a copy never fails the run: one another build re-patched or rebuilt, or whose

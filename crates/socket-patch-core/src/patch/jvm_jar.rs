@@ -11,13 +11,17 @@
 //!   would need a deterministic local repack, which nothing downstream could
 //!   verify, so the whole jar is swapped for the patch service's build of it
 //!   instead ([`apply_jar_swap`]): its patched members must hash to the
-//!   record's `afterHash`es and every other member must equal the installed
-//!   jar's. The original jar is kept at
+//!   record's `afterHash`es and every other member a JVM would load must
+//!   equal the installed jar's ([`super::jar_members`], which also sets the
+//!   size limits a jar is read within). The original jar is kept at
 //!   `<.socket>/jvm-originals/<sha256>.jar` — outside `blobs/`, so no blob
 //!   cleanup ever removes it — and [`rollback_jar_swap`] restores it byte
-//!   for byte. A Gradle copy without a backup can still be restored from
-//!   upstream: its hash directory names the pristine jar's sha1, so a
-//!   download is accepted only when it hashes to exactly that.
+//!   for byte. A copy this project holds no backup of (another project or
+//!   an earlier workspace patched it) can still be restored from upstream:
+//!   a Gradle copy when the download hashes to its hash directory's name,
+//!   a `~/.m2` copy when the download matches the registry's checksum and
+//!   is the patched copy's jar with the record's members at their
+//!   `beforeHash`.
 //!
 //! Offline, or without the patch service, a member record writes nothing
 //! (`jvm_agent_service_required`): vendored or hosted mode carry it instead.
@@ -32,6 +36,7 @@ use crate::patch::apply::{
     apply_file_patch_at, files_in_order, normalize_file_path, ApplyResult, VerifyResult,
     VerifyStatus,
 };
+use crate::patch::jar_members::{unpatched_difference, Digests, JarError};
 use crate::patch::rollback::{RollbackResult, VerifyRollbackResult, VerifyRollbackStatus};
 use crate::patch::sidecars::{self, maven as maven_sidecars};
 use crate::utils::purl::{parse_maven_purl, purl_qualifier};
@@ -39,6 +44,27 @@ use crate::vendor::VendorServiceConfig;
 
 /// Where original jars are kept, under the manifest's `.socket/` directory.
 pub const ORIGINALS_DIR: &str = "jvm-originals";
+
+/// A jar is past a limit [`super::jar_members`] reads jars within: the
+/// service's jar refuses the whole swap, an installed one fails its copy.
+pub const JAR_TOO_LARGE: &str = "jvm_jar_too_large";
+/// The service's jar is not the record's patch of an installed jar: it
+/// lacks the `afterHash` members or cannot be read (the whole swap is
+/// refused), or it differs from one copy outside the patched members (that
+/// copy fails).
+pub const SERVICE_JAR_MISMATCH: &str = "jvm_agent_service_jar_mismatch";
+
+/// The reason code a copy's own failure starts with, when it is one a run
+/// reports as a warning too ([`JAR_TOO_LARGE`], [`SERVICE_JAR_MISMATCH`]).
+pub fn copy_failure_code(error: &str) -> Option<&'static str> {
+    [JAR_TOO_LARGE, SERVICE_JAR_MISMATCH]
+        .into_iter()
+        .find(|code| {
+            error
+                .strip_prefix(code)
+                .is_some_and(|rest| rest.starts_with(": "))
+        })
+}
 
 /// The two shapes of a Maven patch record (see the module docs).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -330,18 +356,9 @@ fn result_for(swap: &JarSwap<'_>, dir: &Path) -> ApplyResult {
     }
 }
 
-/// The members of a jar other than `patched` and signature files, for the
-/// "everything else is upstream's" comparison.
-fn unpatched_members(
-    jar: &[u8],
-    patched: &HashMap<String, PatchFileInfo>,
-) -> Result<HashMap<String, Vec<u8>>, String> {
-    let keys: Vec<&str> = patched.keys().map(|k| normalize_file_path(k)).collect();
-    let mut members = crate::vendor::verify::read_zip_bytes_to_map(jar)?;
-    members.retain(|name, _| {
-        !keys.contains(&name.as_str()) && !crate::vendor::jvm::is_signature(name)
-    });
-    Ok(members)
+/// The member names a record patches, as a jar spells them.
+fn patched_names(files: &HashMap<String, PatchFileInfo>) -> Vec<&str> {
+    files.keys().map(|k| normalize_file_path(k)).collect()
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -464,11 +481,25 @@ pub async fn apply_jar_swap(
                         !matches!(v.status, VerifyStatus::Ready | VerifyStatus::AlreadyPatched)
                     })
                     .expect("a NotFound or HashMismatch member exists");
-                result.error = Some(format!(
+                let mut error = format!(
                     "Cannot apply patch: {} - {}",
                     bad.file,
                     bad.message.clone().unwrap_or_default()
-                ));
+                );
+                if bad.status == VerifyStatus::HashMismatch {
+                    // Not the original and not this patch: most often an
+                    // earlier revision of the patch, applied from another
+                    // project or workspace whose backup is not here.
+                    error.push_str(&format!(
+                        ". {} holds neither the original member nor this patch's: another \
+                         revision of the patch may have been applied from another project or \
+                         workspace, or the jar was rebuilt. Roll that patch back where it was \
+                         applied, or delete {} so the build downloads the jar again, then apply.",
+                        dir.join(swap.jar_leaf).display(),
+                        dir.display()
+                    ));
+                }
+                result.error = Some(error);
             }
         }
         results.push(result);
@@ -478,30 +509,58 @@ pub async fn apply_jar_swap(
     }
 
     let jar = service_jar(service, swap.uuid).await?;
+    // Every member's content, read within the jar limits before anything
+    // else inflates the download.
+    let service_members = Digests::of_bytes(&jar).map_err(|e| match e {
+        JarError::TooLarge(why) => SwapRefusal::new(
+            JAR_TOO_LARGE,
+            format!(
+                "the patch service's build of {} cannot be checked against the installed jar: \
+                 {why}. Nothing was written. `--mode hosted` does not read the jar.",
+                swap.jar_leaf
+            ),
+        ),
+        JarError::Unreadable(why) => SwapRefusal::new(
+            SERVICE_JAR_MISMATCH,
+            format!("the patch service's jar cannot be read: {why}"),
+        ),
+    })?;
+    // After the bounded pass: this one inflates only what that one did.
     if !crate::vendor::common::zip_bytes_match_after_hashes(&jar, swap.files) {
         return Err(SwapRefusal::new(
-            "jvm_agent_service_jar_mismatch",
+            SERVICE_JAR_MISMATCH,
             "the patch service's jar does not carry the record's patched members",
         ));
     }
-    let service_rest = unpatched_members(&jar, swap.files).map_err(|e| {
-        SwapRefusal::new(
-            "jvm_agent_service_jar_mismatch",
-            format!("the patch service's jar is unreadable: {e}"),
-        )
-    })?;
     // Per copy: everything the patch does not touch must be upstream's.
+    let patched = patched_names(swap.files);
     pending.retain(|(i, original)| {
-        let same =
-            unpatched_members(original, swap.files).is_ok_and(|members| members == service_rest);
-        if !same {
-            results[*i].error = Some(format!(
-                "Cannot apply patch: {} - the patch service's jar differs from the installed jar \
-                 outside the patched members",
-                swap.jar_leaf
-            ));
-        }
-        same
+        let path = Path::new(&results[*i].package_path).join(swap.jar_leaf);
+        let failure = match Digests::of_bytes(original) {
+            Ok(members) => {
+                let difference = unpatched_difference(&members, &service_members, &patched);
+                if difference.is_empty() {
+                    return true;
+                }
+                format!(
+                    "{SERVICE_JAR_MISMATCH}: the patch service's jar differs from {} outside the \
+                     patched members: {}. The two are not the same jar apart from the patch, so \
+                     that copy was left as it is.",
+                    path.display(),
+                    difference.describe()
+                )
+            }
+            Err(JarError::TooLarge(why)) => format!(
+                "{JAR_TOO_LARGE}: {} cannot be checked against the patch service's jar: {why}. \
+                 It was left as it is. `--mode hosted` does not read the jar.",
+                path.display()
+            ),
+            Err(JarError::Unreadable(why)) => {
+                format!("Cannot apply patch: {} - {why}", path.display())
+            }
+        };
+        results[*i].error = Some(failure);
+        false
     });
     if swap.dry_run {
         for (i, _) in &pending {
@@ -621,7 +680,7 @@ pub struct JarRestore<'a> {
 /// member equal to `current`'s, and — for a Gradle hash dir — hashing to the
 /// directory's name. Backups are tried in name order.
 async fn find_backup(restore: &JarRestore<'_>, dir: &Path, current: &[u8]) -> Option<Vec<u8>> {
-    let rest = unpatched_members(current, restore.files).ok()?;
+    let current = Digests::of_bytes(current).ok()?;
     let gradle_hash = maven_sidecars::is_gradle_hash_dir(dir)
         .then(|| dir.file_name()?.to_str().map(str::to_string))
         .flatten();
@@ -642,21 +701,30 @@ async fn find_backup(restore: &JarRestore<'_>, dir: &Path, current: &[u8]) -> Op
                 continue;
             }
         }
-        // Each member at its `beforeHash`; a member the patch adds (empty
-        // `beforeHash`) must be absent from the original.
-        let originals = verify_member_bytes(&bytes, restore.files);
-        if originals.iter().all(|v| {
-            v.status == VerifyStatus::Ready
-                && restore
-                    .files
-                    .get(&v.file)
-                    .is_some_and(|i| v.current_hash.as_deref().unwrap_or("") == i.before_hash)
-        }) && unpatched_members(&bytes, restore.files).is_ok_and(|m| m == rest)
-        {
+        if is_original_of(&bytes, &current, restore.files) {
             return Some(bytes);
         }
     }
     None
+}
+
+/// Whether the jar `candidate` is the original of a patched copy whose
+/// members are `patched_copy`: each record member at its `beforeHash` (a
+/// member the patch adds, with an empty `beforeHash`, absent), and every
+/// other member the patched copy's.
+fn is_original_of(
+    candidate: &[u8],
+    patched_copy: &Digests,
+    files: &HashMap<String, PatchFileInfo>,
+) -> bool {
+    verify_member_bytes(candidate, files).iter().all(|v| {
+        v.status == VerifyStatus::Ready
+            && files
+                .get(&v.file)
+                .is_some_and(|i| v.current_hash.as_deref().unwrap_or("") == i.before_hash)
+    }) && Digests::of_bytes(candidate).is_ok_and(|members| {
+        unpatched_difference(&members, patched_copy, &patched_names(files)).is_empty()
+    })
 }
 
 /// The upstream jar of a Gradle copy, accepted only when it hashes to the
@@ -677,6 +745,44 @@ async fn upstream_for_gradle_copy(purl: &str, jar_leaf: &str, dir: &Path) -> Opt
     .await
     .ok()?;
     gradle_cache::hash_eq(hash, &sha1_hex(&bytes)).then_some(bytes)
+}
+
+/// The upstream jar of a `~/.m2` copy, which no hash directory vouches
+/// for: a registry download is accepted only when it matches the checksum
+/// the registry publishes beside it (`.sha512`, else `.sha1`) and is the
+/// original of the patched copy `current` ([`is_original_of`]: the record's
+/// members at their `beforeHash`, every other member the copy's own). The
+/// `.sha1` Maven wrote beside the jar cannot vouch for it: the swap rewrote
+/// that file for the patched jar. `Err` says what was missing.
+async fn upstream_for_m2_copy(restore: &JarRestore<'_>, current: &[u8]) -> Result<Vec<u8>, String> {
+    let (group, artifact, version) =
+        parse_maven_purl(restore.purl).ok_or("its purl names no Maven coordinates")?;
+    let bytes = crate::vendor::maven_repo::verified_registry_file(
+        &group,
+        &artifact,
+        &version,
+        restore.jar_leaf,
+    )
+    .await?;
+    let current = Digests::of_bytes(current).map_err(|e| format!("the copy {e}"))?;
+    if !is_original_of(&bytes, &current, restore.files) {
+        return Err(format!(
+            "the registry's {} is not the jar this copy was patched from",
+            restore.jar_leaf
+        ));
+    }
+    Ok(bytes)
+}
+
+/// What to do about a copy with no original to restore: said with every
+/// [`rollback_jar_swap`] failure for want of one.
+fn recover_hint(dir: &Path) -> String {
+    format!(
+        "To recover, run the rollback from the project that applied the patch (its \
+         .socket/{ORIGINALS_DIR} holds the original), or delete {} so the build downloads the \
+         jar again.",
+        dir.display()
+    )
 }
 
 fn rollback_result(purl: &str, dir: &Path) -> RollbackResult {
@@ -711,11 +817,12 @@ fn rollback_verify(results: &[VerifyResult]) -> Vec<VerifyRollbackResult> {
 }
 
 /// Restore the original jar of every copy in `copies` that holds the
-/// patched members: from its [`ORIGINALS_DIR`] backup, else — for a Gradle
-/// copy, online — from upstream when the download hashes to the copy's hash
-/// directory. A copy with neither fails with `jvm_jar_backup_missing` and
-/// is left as it is; so is a copy whose members match neither side. A copy
-/// already original is a no-op. One result per copy.
+/// patched members: from its [`ORIGINALS_DIR`] backup, else, online, from
+/// upstream: a Gradle copy when the download hashes to the copy's hash
+/// directory, a `~/.m2` copy when it passes [`upstream_for_m2_copy`]. A
+/// copy with neither fails with `jvm_jar_backup_missing`, says why and how
+/// to recover, and is left as it is; so is a copy whose members match
+/// neither side. A copy already original is a no-op. One result per copy.
 pub async fn rollback_jar_swap(
     restore: &JarRestore<'_>,
     copies: &[PathBuf],
@@ -755,28 +862,28 @@ pub async fn rollback_jar_swap(
             continue;
         }
         let gradle = maven_sidecars::is_gradle_hash_dir(dir);
+        // Why upstream could not stand in for a missing backup.
         let original = match find_backup(restore, dir, &current).await {
-            Some(bytes) => Some(bytes),
-            None if gradle && !restore.offline => {
-                upstream_for_gradle_copy(restore.purl, restore.jar_leaf, dir).await
-            }
-            None => None,
+            Some(bytes) => Ok(bytes),
+            None if restore.offline => Err("--offline prevents downloading it again".to_string()),
+            None if gradle => upstream_for_gradle_copy(restore.purl, restore.jar_leaf, dir)
+                .await
+                .ok_or_else(|| "no upstream download matches its hash directory".to_string()),
+            None => upstream_for_m2_copy(restore, &current).await,
         };
-        let Some(original) = original else {
-            result.error = Some(format!(
-                "jvm_jar_backup_missing: no original of {} under {} (and {})",
-                path.display(),
-                restore.socket_dir.join(ORIGINALS_DIR).display(),
-                if gradle && restore.offline {
-                    "--offline prevents re-downloading it"
-                } else if gradle {
-                    "no upstream download matches its hash directory"
-                } else {
-                    "a ~/.m2 copy cannot be re-downloaded and verified"
-                }
-            ));
-            out.push(result);
-            continue;
+        let original = match original {
+            Ok(bytes) => bytes,
+            Err(why) => {
+                result.error = Some(format!(
+                    "jvm_jar_backup_missing: {} holds this patch, but {} has no backup of the \
+                     original (another project or an earlier workspace applied it), and {why}. {}",
+                    path.display(),
+                    restore.socket_dir.join(ORIGINALS_DIR).display(),
+                    recover_hint(dir)
+                ));
+                out.push(result);
+                continue;
+            }
         };
         if restore.dry_run {
             result.success = true;
@@ -1195,19 +1302,32 @@ mod tests {
             ("a/Backdoor.class", b"evil"),
         ]);
         let wrong_after = jar(&[("META-INF/NOTICE.txt", b"other"), ("a/B.class", b"code")]);
-        // (served, sri over, whole-swap refusal code or None for a per-copy error)
-        let cases: Vec<(Vec<u8>, Vec<u8>, Option<&str>)> = vec![
+        // An added class under symlink mode bits: a JVM loads it by name
+        // whatever its mode, so it counts like any other member.
+        let smuggled = crate::patch::jar_members::testing::jar_with_modes(&[
+            ("META-INF/NOTICE.txt", b"patched", None),
+            ("a/B.class", b"code", None),
+            ("a/Backdoor.class", b"evil", Some(0o120777)),
+        ]);
+        // (served, sri over, whole-swap refusal code or the difference a
+        // per-copy failure names)
+        let cases: Vec<(Vec<u8>, Vec<u8>, Result<&str, &str>)> = vec![
             (
                 wrong_after.clone(),
                 wrong_after,
-                Some("jvm_agent_service_jar_mismatch"),
+                Ok("jvm_agent_service_jar_mismatch"),
             ),
-            (altered.clone(), altered, None),
-            (extra.clone(), extra, None),
+            (altered.clone(), altered, Err("1 changed (`a/B.class`)")),
+            (extra.clone(), extra, Err("1 added (`a/Backdoor.class`)")),
+            (
+                smuggled.clone(),
+                smuggled,
+                Err("1 added (`a/Backdoor.class`)"),
+            ),
             (
                 patched_jar(),
                 b"not the served bytes".to_vec(),
-                Some("jvm_agent_service_integrity"),
+                Ok("jvm_agent_service_integrity"),
             ),
         ];
         for (served, sri_of, refusal) in cases {
@@ -1221,18 +1341,20 @@ mod tests {
             let out =
                 apply_jar_swap(&swap(&files, &socket, false), &[copy.clone()], Some(&cfg)).await;
             match refusal {
-                Some(code) => assert_eq!(out.unwrap_err().code, code),
-                None => {
+                Ok(code) => assert_eq!(out.unwrap_err().code, code),
+                Err(difference) => {
                     let out = out.unwrap();
                     assert!(!out[0].success);
+                    let error = out[0].error.as_deref().unwrap();
+                    // The copy's failure carries the contract's code and
+                    // says which members differ.
+                    assert_eq!(copy_failure_code(error), Some(SERVICE_JAR_MISMATCH));
                     assert!(
-                        out[0]
-                            .error
-                            .as_deref()
-                            .unwrap()
-                            .contains("differs from the installed jar"),
-                        "{:?}",
-                        out[0].error
+                        error.starts_with(
+                            "jvm_agent_service_jar_mismatch: the patch service's jar differs from "
+                        ) && error.contains(&format!("outside the patched members: {difference}."))
+                            && error.contains("lib-1.0.jar"),
+                        "{error}"
                     );
                 }
             }
@@ -1281,6 +1403,286 @@ mod tests {
         let back = rollback_jar_swap(&restore, &[copy.clone()]).await;
         assert!(back[0].success, "{:?}", back[0].error);
         assert_eq!(std::fs::read(copy.join("lib-1.0.jar")).unwrap(), original);
+    }
+
+    fn restore<'a>(
+        files: &'a HashMap<String, PatchFileInfo>,
+        socket: &'a Path,
+        offline: bool,
+    ) -> JarRestore<'a> {
+        JarRestore {
+            purl: PURL,
+            jar_leaf: "lib-1.0.jar",
+            files,
+            socket_dir: socket,
+            dry_run: false,
+            offline,
+        }
+    }
+
+    /// A jar over both limits of the wheel reader the swap used to compare
+    /// through (10,000 entries, 64 MiB inflated) is swapped and rolled back
+    /// like any other. It used to be refused as "the patch service's jar is
+    /// unreadable".
+    #[tokio::test]
+    async fn a_jar_over_the_wheel_reader_limits_swaps_and_rolls_back() {
+        use crate::patch::jar_members::testing::big_jar;
+        const ENTRIES: usize = 10_001;
+        const BYTES: u64 = 65 * 1024 * 1024;
+        let original = big_jar(ENTRIES, BYTES, &[("META-INF/NOTICE.txt", b"pristine")]);
+        let service = big_jar(ENTRIES, BYTES, &[("META-INF/NOTICE.txt", b"patched")]);
+        assert!(crate::vendor::verify::read_zip_bytes_to_map(&service).is_err());
+        let (_server, cfg) = mock_service(&service, &service).await;
+
+        let d = tempfile::tempdir().unwrap();
+        let socket = d.path().join(".socket");
+        let copy = d.path().join("m2/com/example/lib/1.0");
+        std::fs::create_dir_all(&copy).unwrap();
+        std::fs::write(copy.join("lib-1.0.jar"), &original).unwrap();
+        let files = record();
+        let out = apply_jar_swap(&swap(&files, &socket, false), &[copy.clone()], Some(&cfg))
+            .await
+            .unwrap();
+        assert!(out[0].success, "{:?}", out[0].error);
+        assert!(std::fs::read(copy.join("lib-1.0.jar")).unwrap() == service);
+
+        let back = rollback_jar_swap(&restore(&files, &socket, true), &[copy.clone()]).await;
+        assert!(back[0].success, "{:?}", back[0].error);
+        assert!(std::fs::read(copy.join("lib-1.0.jar")).unwrap() == original);
+    }
+
+    /// A jar past the jar limits says which limit, and whose jar: the
+    /// service's refuses the whole swap, an installed one fails its copy.
+    /// Nothing is written either way.
+    #[tokio::test]
+    async fn a_jar_past_the_jar_limits_names_the_limit() {
+        // 65 MiB of zeros deflates to a few kilobytes: over the 64 MiB a
+        // small archive may inflate to.
+        let bomb = |notice: &[u8], with_bomb: bool| {
+            use std::io::Read as _;
+            let mut out = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+            let opts = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated);
+            out.start_file("META-INF/NOTICE.txt", opts).unwrap();
+            out.write_all(notice).unwrap();
+            out.start_file("a/B.class", opts).unwrap();
+            out.write_all(b"code").unwrap();
+            if with_bomb {
+                out.start_file("a/zeros.bin", opts).unwrap();
+                std::io::copy(&mut std::io::repeat(0).take(65 * 1024 * 1024), &mut out).unwrap();
+            }
+            out.finish().unwrap().into_inner()
+        };
+        let limit = "it inflates to more than 64 MiB, over 100 times its own size (1 MiB) and \
+                     the 64 MiB every jar may use";
+        let files = record();
+        // (service jar, installed jar, whole-swap refusal?)
+        for (service, installed, whole) in [
+            (bomb(b"patched", true), bomb(b"pristine", true), true),
+            (bomb(b"patched", false), bomb(b"pristine", true), false),
+        ] {
+            let (_server, cfg) = mock_service(&service, &service).await;
+            let d = tempfile::tempdir().unwrap();
+            let socket = d.path().join(".socket");
+            let copy = d.path().join("m2/com/example/lib/1.0");
+            std::fs::create_dir_all(&copy).unwrap();
+            std::fs::write(copy.join("lib-1.0.jar"), &installed).unwrap();
+            let out =
+                apply_jar_swap(&swap(&files, &socket, false), &[copy.clone()], Some(&cfg)).await;
+            if whole {
+                let refusal = out.unwrap_err();
+                assert_eq!(refusal.code, JAR_TOO_LARGE);
+                assert!(
+                    refusal.message.starts_with(
+                        "the patch service's build of lib-1.0.jar cannot be checked against the \
+                         installed jar: it inflates"
+                    ) && refusal.message.contains(limit),
+                    "{}",
+                    refusal.message
+                );
+            } else {
+                let out = out.unwrap();
+                let error = out[0].error.as_deref().unwrap();
+                assert!(!out[0].success);
+                assert_eq!(copy_failure_code(error), Some(JAR_TOO_LARGE));
+                assert!(
+                    error.contains("lib-1.0.jar cannot be checked against the patch service's jar")
+                        && error.contains(limit),
+                    "{error}"
+                );
+            }
+            assert!(std::fs::read(copy.join("lib-1.0.jar")).unwrap() == installed);
+            assert!(!socket.exists(), "no backup may be written");
+        }
+    }
+
+    /// The reason codes a copy's failure may start with, and nothing else.
+    #[test]
+    fn copy_failure_code_reads_only_a_leading_code() {
+        assert_eq!(
+            copy_failure_code("jvm_jar_too_large: x.jar: it holds 5 entries"),
+            Some(JAR_TOO_LARGE)
+        );
+        assert_eq!(
+            copy_failure_code("jvm_agent_service_jar_mismatch: the patch service's jar differs"),
+            Some(SERVICE_JAR_MISMATCH)
+        );
+        for other in [
+            "Cannot apply patch: x - jvm_jar_too_large: y",
+            "jvm_jar_too_large",
+            "jvm_jar_too_larger: x",
+            "",
+        ] {
+            assert_eq!(copy_failure_code(other), None, "{other}");
+        }
+    }
+
+    /// A registry serving `jar` at lib-1.0.jar with the `.sha1` of `summed`
+    /// (`None`: it publishes no checksum).
+    async fn registry(jar: &[u8], summed: Option<&[u8]>) -> wiremock::MockServer {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/com/example/lib/1.0/lib-1.0.jar"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(jar.to_vec()))
+            .mount(&server)
+            .await;
+        if let Some(summed) = summed {
+            Mock::given(method("GET"))
+                .and(path("/com/example/lib/1.0/lib-1.0.jar.sha1"))
+                .respond_with(ResponseTemplate::new(200).set_body_string(sha1_hex(summed)))
+                .mount(&server)
+                .await;
+        }
+        server
+    }
+
+    /// A `~/.m2` copy another project (or an earlier workspace) patched has
+    /// no backup under this project's `.socket/`. Its rollback downloads the
+    /// original, and takes it only when it matches the registry's checksum
+    /// and is the jar the copy was patched from. The copy and its `.sha1`
+    /// come back byte for byte.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn an_m2_copy_patched_elsewhere_is_restored_from_verified_upstream() {
+        let d = tempfile::tempdir().unwrap();
+        let socket = d.path().join("second-project/.socket");
+        let copy = d.path().join("m2/com/example/lib/1.0");
+        std::fs::create_dir_all(&copy).unwrap();
+        let (original, patched) = (pristine_jar(), patched_jar());
+        // What the first project's apply left: the service jar and a
+        // `.sha1` that describes it.
+        let patch_copy = || {
+            std::fs::write(copy.join("lib-1.0.jar"), &patched).unwrap();
+            std::fs::write(copy.join("lib-1.0.jar.sha1"), sha1_hex(&patched)).unwrap();
+        };
+        let files = record();
+
+        patch_copy();
+        let server = registry(&original, Some(&original)).await;
+        let _registry = EnvGuard::set("SOCKET_MAVEN_REGISTRY", server.uri());
+        let back = rollback_jar_swap(&restore(&files, &socket, false), &[copy.clone()]).await;
+        assert!(back[0].success, "{:?}", back[0].error);
+        assert_eq!(back[0].files_rolled_back, ["META-INF/NOTICE.txt"]);
+        assert_eq!(std::fs::read(copy.join("lib-1.0.jar")).unwrap(), original);
+        assert_eq!(
+            std::fs::read_to_string(copy.join("lib-1.0.jar.sha1")).unwrap(),
+            sha1_hex(&original)
+        );
+        assert!(!socket.exists(), "a rollback writes no backup");
+        drop(_registry);
+
+        // Anything less leaves the copy as it is and says what to do.
+        let other_base = jar(&[
+            ("META-INF/NOTICE.txt", b"pristine"),
+            ("a/B.class", b"other"),
+        ]);
+        let cases: Vec<(wiremock::MockServer, bool, &str)> = vec![
+            (
+                registry(&original, Some(b"some other bytes")).await,
+                false,
+                "the download does not match the registry's checksum",
+            ),
+            (
+                registry(&original, None).await,
+                false,
+                "the registry publishes no checksum for it",
+            ),
+            (
+                registry(&other_base, Some(&other_base)).await,
+                false,
+                "the registry's lib-1.0.jar is not the jar this copy was patched from",
+            ),
+            (
+                // The patched jar itself is not its own original.
+                registry(&patched, Some(&patched)).await,
+                false,
+                "the registry's lib-1.0.jar is not the jar this copy was patched from",
+            ),
+            (
+                wiremock::MockServer::start().await,
+                false,
+                "the registry did not serve it",
+            ),
+            (
+                registry(&original, Some(&original)).await,
+                true,
+                "--offline prevents downloading it again",
+            ),
+        ];
+        for (server, offline, why) in cases {
+            patch_copy();
+            let _registry = EnvGuard::set("SOCKET_MAVEN_REGISTRY", server.uri());
+            let back = rollback_jar_swap(&restore(&files, &socket, offline), &[copy.clone()]).await;
+            let error = back[0].error.as_deref().unwrap();
+            assert!(!back[0].success, "{why}");
+            assert!(
+                error.starts_with("jvm_jar_backup_missing: ")
+                    && error.contains("has no backup of the original (another project or an earlier workspace applied it)")
+                    && error.contains(why)
+                    && error.contains("To recover, run the rollback from the project that applied the patch")
+                    && error.contains(&format!("or delete {} so the build downloads the jar again", copy.display())),
+                "{why}: {error}"
+            );
+            assert_eq!(std::fs::read(copy.join("lib-1.0.jar")).unwrap(), patched);
+        }
+    }
+
+    /// A copy that holds another revision of the patch (applied from another
+    /// project) is neither side of this record: the apply fails that copy
+    /// and says what the bytes may be and how to get back to the original.
+    #[tokio::test]
+    async fn a_copy_holding_another_revision_says_how_to_recover() {
+        let d = tempfile::tempdir().unwrap();
+        let copy = d.path().join("m2/com/example/lib/1.0");
+        std::fs::create_dir_all(&copy).unwrap();
+        let other_revision = jar(&[
+            ("META-INF/NOTICE.txt", b"an earlier revision"),
+            ("a/B.class", b"code"),
+        ]);
+        std::fs::write(copy.join("lib-1.0.jar"), &other_revision).unwrap();
+        let files = record();
+        let out = apply_jar_swap(
+            &swap(&files, &d.path().join(".socket"), false),
+            &[copy.clone()],
+            None,
+        )
+        .await
+        .unwrap();
+        let error = out[0].error.as_deref().unwrap();
+        assert!(!out[0].success);
+        assert!(
+            error.starts_with("Cannot apply patch: META-INF/NOTICE.txt - Jar member hash does not match expected value. ")
+                && error.contains("holds neither the original member nor this patch's")
+                && error.contains("another revision of the patch may have been applied from another project or workspace")
+                && error.contains(&format!("or delete {} so the build downloads the jar again, then apply", copy.display())),
+            "{error}"
+        );
+        assert_eq!(
+            std::fs::read(copy.join("lib-1.0.jar")).unwrap(),
+            other_revision
+        );
     }
 
     /// A large deflated member is verified by streaming it through the

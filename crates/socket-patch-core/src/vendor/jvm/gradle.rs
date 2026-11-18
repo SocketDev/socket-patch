@@ -189,17 +189,19 @@ pub fn committed_patched(read: ReadFn<'_>, c: &Coords<'_>) -> Vec<String> {
 /// holds with other content than the patched `jar`: a build consuming that
 /// classifier stays unpatched (#533).
 fn unpatched_copy(bytes: &[u8], jar: &[u8], patched: &[String]) -> Option<String> {
-    use crate::vendor::verify::read_zip_bytes_to_map;
-    let members = read_zip_bytes_to_map(bytes).ok()?;
-    let patched_jar = read_zip_bytes_to_map(jar).ok()?;
+    // Only the patched members are inflated, within the jar limits: the
+    // wheel-sized reader this went through gave up on a large jar, which
+    // then passed unchecked.
+    use crate::patch::jar_members::Jar;
+    let mut copy = Jar::of_bytes(bytes).ok()?;
+    let mut patched_jar = Jar::of_bytes(jar).ok()?;
     let mut names: Vec<&String> = patched.iter().collect();
     names.sort();
     names
         .into_iter()
-        .find(|name| {
-            members
-                .get(*name)
-                .is_some_and(|copy| patched_jar.get(*name) != Some(copy))
+        .find(|name| match copy.member_git_sha256(name) {
+            Ok(Some(held)) => patched_jar.member_git_sha256(name).ok().flatten() != Some(held),
+            _ => false,
         })
         .cloned()
 }

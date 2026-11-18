@@ -1978,7 +1978,7 @@ Env-only knobs used for hosted upstream restoration and JVM metadata verificatio
 |---|---|---|
 | `SOCKET_NPM_REGISTRY` | `https://registry.npmjs.org` | Base for npm version documents (`<base>/<name>/<version>`, a scoped name's `/` as `%2f`; `dist.tarball` / `integrity` / `shasum`) the npm-family and vlt upstream restore reads, unless the project names another registry (yarn berry `npmRegistryServer`, pnpm's lock-sibling `.npmrc` `registry` / `@scope:registry` or pnpm-workspace.yaml `registry` / `registries` as the pnpm major reads them, vlt's node registry), whose document is read first. |
 | `SOCKET_GOPROXY` | `https://proxy.golang.org` | Go module proxy used for upstream restoration, honoring `GOPROXY`, `GONOPROXY` and `GOPRIVATE`. Like every Go setting socket-patch reads (`GOMODCACHE`, `GOPATH`, `GOWORK`, `GOFLAGS`, `GOSUMDB`, `GONOSUMDB`), each resolves as go resolves it: the environment, then the `go env -w` file (`$GOENV`, default `os.UserConfigDir()/go/env`; `GOENV=off` disables it), then go's default. |
-| `SOCKET_MAVEN_REGISTRY` | `https://repo1.maven.org/maven2` | maven2 base for the fallback upstream-pom download. |
+| `SOCKET_MAVEN_REGISTRY` | `https://repo1.maven.org/maven2` | maven2 base for the upstream files the JVM backends read: the fallback upstream-pom download, the upstream jar and checksums vendoring compares a patched jar with, and the original jar an agent-mode `rollback` restores when the project holds no backup. |
 | `SOCKET_CRATES_INDEX` | `https://index.crates.io` | v5.0 upstream restore: the crates.io sparse index whose `checksum` a restored `Cargo.lock` entry gets back. |
 | `SOCKET_GOSUMDB_URL` | `https://sum.golang.org` | v5.0 upstream restore: the checksum database the restored go.sum lines are checked against. Without it, `GOSUMDB=off` or a module matching `GONOSUMDB` (default `GOPRIVATE`) skips the database and the hashes come from the module proxy's bytes alone (`SOCKET_GOPROXY` above). |
 | `SOCKET_PYPI_JSON_API` | `https://pypi.org/pypi` | PyPI's JSON API (`<base>/<name>/<version>/json`): the release files whose sha256 the upstream restore writes back into every Python lock format. |
@@ -2183,7 +2183,7 @@ command's integration tests check its output.
 | `vendor_unwired`          | `skipped`        | vex: a vendor-ledger entry whose committed artifact no lockfile/config wires any more (reverted lock, leftover ledger or artifact). Applies under `--no-verify` too. |
 | `redirect_unwired`        | `skipped`        | vex: a hosted record (this run's, or a pre-v5 redirect ledger's) whose hosted patch no lockfile wires any more (and no manifest entry owns the purl). Applies under `--no-verify` too. |
 | `wiring_conflict`         | `skipped`        | vex (manifest-less): the lockfiles wire one package to two or more different patches (e.g. a stale sibling lock); which one the build installs is undecidable, so none is attested. |
-| `hash_mismatch` / `not_applied` / `file_not_found` / `package_not_found` / `no_files` / `vendor_*` | `skipped` | vex: verification omissions — the installed copy (agent / hosted) or the committed artifact (`vendor_hash_mismatch`, `vendor_artifact_missing`, `vendor_artifact_unreadable`, `vendor_artifact_non_canonical`, `vendor_inventory_mismatch`, `vendor_uuid_mismatch`, `vendor_path_unsafe`) does not carry the patched bytes, or nothing is installed. `vendor_artifact_non_canonical`: a committed npm tarball holds a second entry the installers would extract over one of the patch's files — the same path under another top-level directory, a second or case-variant spelling of the name, a link, or a non-directory where one of the file's parent directories must be. npm-family installers strip the first path segment whatever it is, extract links as well as files and let a later entry overwrite an earlier one, so such a tarball can hold the patched file where it is checked and install the original (`vendor --check` reports it as a corrupt artifact that `repair` restores). Only the patch's own files are judged: an upstream tarball with a link, a non-ASCII name or a case twin elsewhere, which vendoring accepts, keeps verifying. `vendor_lock_pin_mismatch` (bun): the artifact holds the patch, but the `bun.lock` tuple or `bun.lockb` record that resolves to it carries a digest that is not the tarball's sha512 (a pin under any other algorithm is not one vendoring wrote), so an install does not deliver it — Bun 1.3.10+ fails the integrity check on a cold cache, and Bun 1.4 keys its tarball cache by that digest and installs whatever cached tarball has it. `vendor --check` reports the same as a wiring failure (exit 1) with the remedy, re-running `scan --mode vendored`, which rewrites the pin. A tuple without a digest (the 2-tuple Bun 1.1.39 to 1.3.9 re-save) has no pin to be wrong. `vendor_manifest_unverifiable`: a vendored vlt directory verified without its vendor ledger (from `vlt-lock.json` alone) holds a `package.json` with its devDependencies stripped, and the patched `package.json` blob is not in `.socket/blobs`, so it cannot be checked. A lockfile-pinned hosted reference with nothing installed attests instead of `package_not_found` (see "Manifest-less VEX"). |
+| `hash_mismatch` / `not_applied` / `file_not_found` / `package_not_found` / `no_files` / `vendor_*` | `skipped` | vex: verification omissions — the installed copy (agent / hosted) or the committed artifact (`vendor_hash_mismatch`, `vendor_artifact_missing`, `vendor_artifact_unreadable`, `vendor_artifact_too_large`, `vendor_artifact_non_canonical`, `vendor_inventory_mismatch`, `vendor_uuid_mismatch`, `vendor_path_unsafe`) does not carry the patched bytes, or nothing is installed. `vendor_artifact_too_large` (jars): the committed jar is past the limits jars are read within (see [Vendored JVM support](#vendored-jvm-support-v5)), so its contents were not checked (`vendor --check` reports it as a corrupt artifact that `repair` restores from the recorded jar). `vendor_artifact_non_canonical`: a committed npm tarball holds a second entry the installers would extract over one of the patch's files — the same path under another top-level directory, a second or case-variant spelling of the name, a link, or a non-directory where one of the file's parent directories must be. npm-family installers strip the first path segment whatever it is, extract links as well as files and let a later entry overwrite an earlier one, so such a tarball can hold the patched file where it is checked and install the original (`vendor --check` reports it as a corrupt artifact that `repair` restores). Only the patch's own files are judged: an upstream tarball with a link, a non-ASCII name or a case twin elsewhere, which vendoring accepts, keeps verifying. `vendor_lock_pin_mismatch` (bun): the artifact holds the patch, but the `bun.lock` tuple or `bun.lockb` record that resolves to it carries a digest that is not the tarball's sha512 (a pin under any other algorithm is not one vendoring wrote), so an install does not deliver it — Bun 1.3.10+ fails the integrity check on a cold cache, and Bun 1.4 keys its tarball cache by that digest and installs whatever cached tarball has it. `vendor --check` reports the same as a wiring failure (exit 1) with the remedy, re-running `scan --mode vendored`, which rewrites the pin. A tuple without a digest (the 2-tuple Bun 1.1.39 to 1.3.9 re-save) has no pin to be wrong. `vendor_manifest_unverifiable`: a vendored vlt directory verified without its vendor ledger (from `vlt-lock.json` alone) holds a `package.json` with its devDependencies stripped, and the patched `package.json` blob is not in `.socket/blobs`, so it cannot be checked. A lockfile-pinned hosted reference with nothing installed attests instead of `package_not_found` (see "Manifest-less VEX"). |
 | `not_applied` / `hash_mismatch` / `file_not_found` / `no_matching_variant` | `failed` | `apply --check` (v5.0): an installed copy of the patch does not verify (still unpatched; neither the original nor the patched bytes; a patched file missing; a copy of a release-variant base that holds none of the manifest's variants, keyed by the base purl). Exit 1, status `partialFailure`. |
 | `redirect_unconfirmed`    | `skipped` (`details.mode: "hosted"`) | hosted `scan` / `get` (v5.0, additive): the patch was granted but no lockfile entry pinning it could be rewritten. The status and exit code are unchanged for now, pending the open hosted exit-policy decision (#704); `--silent` hides the human line. |
 | `lockfile_unreadable` / `lockfile_unparseable` / `patched_ref_invalid` / `patched_ref_unattributable` | run-level `warnings[]` | vex (every form): lockfile-discovery diagnostics — see "Manifest-less VEX (lockfile discovery)". Never flip the exit on their own. |
@@ -2824,6 +2824,28 @@ entries use ecosystem `jvm` with Maven PURLs. Revert, remove, rollback and repai
 share the v5 vendored backend; existing prototype wiring remains readable.
 See [the JVM design](../../docs/design/maven-vendoring.md) for supported shapes.
 
+A vendored jar must be upstream's jar outside the patch. Online, the jar (the patch
+service's on a first vendoring, the committed one on a re-run) is compared with the
+upstream jar before anything is written: a cached copy the registry's checksum
+vouches for, else the registry's own download held to the same checksum. Every entry
+the JVM would load must hold the same content in both, whatever unix mode it carries;
+the record's members and signature files (`META-INF/*.SF`, `.RSA`, `.DSA`, `.EC`) are
+exempt and directory entries may differ. A jar that adds, drops or changes anything
+else is refused with `vendor_prebuilt_integrity_mismatch`, the detail naming up to
+three such members, and a first vendoring commits and wires nothing. When no upstream
+jar can be verified the refusal is `vendor_jvm_upstream_unavailable`.
+
+Jars are read within fixed limits, counted on the bytes actually inflated and on the
+archive's own entry count, never on the sizes an archive declares: 200,000 entries,
+and per pass over one jar 1 GiB inflated and at most 100 times the jar's own size (a
+jar smaller than 655 KiB may still inflate to 64 MiB). A jar past a limit is
+`vendor_artifact_too_large`: a refusal when vendoring (the detail names the limit),
+the `vex` omission tag and the `vendor --check` reason for a committed jar, which
+`repair` restores from the recorded one, and the error of a `repair` whose own
+download is past them. Jar names are read as the JVM
+reads them, so non-ASCII names and names that differ only in case (`a.class` beside
+`A.class`) verify and repair like any other.
+
 `vendor --check` is an offline, read-only audit. Healthy entries emit `verified`
 with `vendor_check_ok`; drift emits `failed` with `vendor_check_failed`, a
 `partialFailure` envelope and exit 1. Drift covers the committed artifact and its
@@ -3168,13 +3190,44 @@ across every consumed copy: one download, one backup per distinct original under
 patched bytes: never the read-only cache, but also a `~/.m2` copy a Gradle-only build
 no longer reads (an earlier apply wrote it while the build declared `mavenLocal()`,
 or before v5.0 gated `~/.m2`; leaving it would strand the shared jar patched once
-`remove` drops the record). It restores from the backup, else, online and for a
-Gradle copy only, from an upstream download that hashes to the copy's hash
-directory. Such an unread `~/.m2` copy never fails the run: one that holds bytes
+`remove` drops the record). It restores from the backup in this project's
+`.socket/jvm-originals/`, else, online, from an upstream download. For a Gradle copy
+that is one that hashes to the copy's hash directory. For a `~/.m2` copy it is the
+registry's jar (Maven Central, or `SOCKET_MAVEN_REGISTRY`), taken only when it
+matches the checksum the registry publishes beside it (`.sha512`, else `.sha1`) and
+is the jar the copy was patched from: the record's members at their `beforeHash`,
+every other member the patched copy's own. The `.sha1` beside the jar cannot vouch
+for it, since the swap rewrote that file for the patched jar. This is what restores a
+jar that another project, or an earlier workspace over a persistent `~/.m2`, patched:
+a copy that is already patched when `apply` finds it gets no backup here. Such an
+unread `~/.m2` copy never fails the run: one that holds bytes
 that are neither side of the record (another build applied a different patch there,
 or `mvn install` rebuilt it), lacks a file, or is a swapped jar whose original this
 project never backed up is left as it is with `gradle_m2_copy_not_restored`, and
 `remove` still drops the record.
+
+Before a swap the service's jar is compared with each installed jar, member by
+member, hashing as it goes: every entry the JVM would load must hold the same content
+in both, whatever unix mode the entry carries (the JVM ignores it, so an entry with
+a symlink's mode bits is a class like any other). The record's members and signature
+files (`META-INF/*.SF`, `.RSA`, `.DSA`, `.EC`) are exempt, and directory entries may
+differ. A copy that differs fails with `jvm_agent_service_jar_mismatch`, naming up
+to three added, missing or changed members, and is left as it is; the other copies
+are still swapped.
+
+Jars are read within fixed limits, counted on the bytes actually inflated and on the
+archive's own entry count, never on the sizes an archive declares: 200,000 entries,
+and per pass over one jar 1 GiB inflated and at most 100 times the jar's own size (a
+jar smaller than 655 KiB may still inflate to 64 MiB). The largest jars measured on
+Maven Central are far inside them (`hive-exec-3.1.3.jar`: 23,728 entries, 93 MiB
+inflated). A jar past a limit is `jvm_jar_too_large`, and the message names the
+limit; hosted mode, which never reads the jar, still applies.
+
+A copy whose patched member is neither the original nor this patch's (another
+revision of the patch applied from another project or workspace, or a rebuilt jar)
+fails as a hash mismatch; the message says so and how to get back to the original
+(roll that patch back where it was applied, or delete the version directory so the
+build downloads the jar again).
 
 Run-level `warnings[]` codes (a refusal is also a `failed` event whose `error`
 starts with the code):
@@ -3191,10 +3244,11 @@ starts with the code):
 | `gradle_jar_locked_by_daemon` | that copy fails | Windows only: the jar is held open (errors 32, 33, 303, or 5 on an existing writable file), normally by a Gradle daemon. Also reported by rollback. Run `gradle --stop` and retry. |
 | `jvm_agent_service_required` | refused, exit 1 | A member-keyed record needs the patch service's jar, and the run is offline, the service is disabled or pending, or it did not provide one. Nothing is written. |
 | `jvm_agent_service_integrity` | refused, exit 1 | The service jar failed transfer-integrity verification. Nothing is written. |
-| `jvm_agent_service_jar_mismatch` | refused, exit 1 | The service jar does not carry the record's `afterHash` members, is unreadable, or differs from the installed jar outside the patched members. Nothing is written. |
+| `jvm_agent_service_jar_mismatch` | refused, exit 1; or that copy fails | The service jar does not carry the record's `afterHash` members or cannot be read: the swap is refused and nothing is written. Or it differs from one installed jar outside the patched members: that copy fails and is left as it is (its `error` starts with the code and names the members), the other copies are still swapped, and the run exits 1. |
+| `jvm_jar_too_large` | refused, exit 1; or that copy fails | A jar is past the limits jars are read within (above). The service's jar refuses the swap with nothing written; an installed jar fails its copy, which is left as it is. The message names the limit that was passed. |
 | `jvm_jar_backup_failed` | refused, exit 1 | The original jar could not be backed up before the swap. Nothing is written. |
 | `gradle_rollback_hash_mismatch` | rollback: that copy fails | A file restored into a Gradle hash directory does not hash to the directory's name (the sha1 Gradle verified on download): the before-blob is not that download. The file is left as it is and the result fails; delete that hash directory so Gradle downloads it again. |
-| `jvm_jar_backup_missing` | rollback: that copy fails | No backup of the original jar exists (and, for a Gradle copy, no upstream download matched its hash directory, or the run is offline). The copy is left as it is. |
+| `jvm_jar_backup_missing` | rollback: that copy fails | This project's `.socket/jvm-originals/` holds no backup of the original jar (another project or an earlier workspace applied the patch), and no upstream copy could be verified: the run is offline, the registry does not serve the jar or publishes no checksum for it, the download does not match that checksum or is not the jar the copy was patched from, or, for a Gradle copy, it does not hash to the hash directory. The copy is left as it is. The message says which of these it was and how to recover: run the rollback from the project that applied the patch, or delete the version directory so the build downloads the jar again. |
 | `gradle_m2_copy_not_restored` | rollback / remove: warning | A `~/.m2` copy this Gradle-only build does not read could not be restored (its bytes are neither side of the record, a file is missing, or it is a swapped jar with no backup in this project). It is left as it is and does not fail the run. A file that is there but cannot be read (permissions, not a regular file) may still hold the patched bytes, so it fails the run and `remove` keeps the record. |
 
 Each patched Gradle copy's sidecar record (`PatchEvent.sidecar`) carries an advisory

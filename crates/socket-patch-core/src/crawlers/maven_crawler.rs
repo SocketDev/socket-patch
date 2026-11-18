@@ -532,7 +532,8 @@ fn coursier_repo_root(path: PathBuf) -> JvmCacheRoot {
 
 /// The JVM caches a run resolves against: the Maven local repository and
 /// the Gradle user home. [`JvmEnv::from_process`] reads the process
-/// environment; [`JvmEnv::resolve`] an explicit one (tests).
+/// environment, [`JvmEnv::for_project`] also the project's
+/// `.mvn/maven.config`; [`JvmEnv::resolve`] an explicit one (tests).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JvmEnv {
     /// The Maven local repository (see [`MavenCrawler::get_maven_repo_paths`]);
@@ -552,11 +553,47 @@ impl JvmEnv {
         }
     }
 
+    /// [`Self::from_process`] for the build Maven would run in `project`:
+    /// a `-Dmaven.repo.local` in its `.mvn/maven.config` names the local
+    /// repository too ([`m2_repo_path_in`]). For a project run; a `--global`
+    /// one is about the machine's caches and keeps [`Self::from_process`].
+    pub fn for_project(project: &Path) -> Self {
+        Self {
+            m2_repo: m2_repo_path_in(
+                &gradle_cache::ProcessEnv,
+                Os::current(),
+                None,
+                Some(project),
+            ),
+            gradle: gradle_cache::home_from_process_env(),
+        }
+    }
+
+    /// The caches of a crawl with `options`: the project's
+    /// ([`Self::for_project`]) unless the crawl is global.
+    pub fn for_crawl(options: &CrawlerOptions) -> Self {
+        if options.global || options.global_prefix.is_some() {
+            Self::from_process()
+        } else {
+            Self::for_project(&options.cwd)
+        }
+    }
+
     /// The caches `env` names. `home_dir` is the account's home (on Unix
     /// the passwd entry's), which Gradle prefers to `$HOME`.
     pub fn resolve(env: &dyn Env, os: Os, home_dir: Option<&Path>) -> Self {
+        Self::resolve_in(env, os, home_dir, None)
+    }
+
+    /// [`Self::resolve`] for the build Maven would run in `project`.
+    pub fn resolve_in(
+        env: &dyn Env,
+        os: Os,
+        home_dir: Option<&Path>,
+        project: Option<&Path>,
+    ) -> Self {
         Self {
-            m2_repo: m2_repo_path_with(env, os, home_dir),
+            m2_repo: m2_repo_path_in(env, os, home_dir, project),
             gradle: GradleHome::resolve(env, os, home_dir),
         }
     }
@@ -596,10 +633,20 @@ pub fn is_ro_root(path: &Path) -> bool {
     JvmEnv::from_process().is_ro_root(path)
 }
 
-/// The Maven local repository `env` names, in Maven's own order (#423):
+/// [`m2_repo_path_in`] with no project: the environment alone.
+pub fn m2_repo_path_with(env: &dyn Env, os: Os, home_dir: Option<&Path>) -> Option<PathBuf> {
+    m2_repo_path_in(env, os, home_dir, None)
+}
+
+/// The Maven local repository `env` names for a build run in `project`,
+/// in Maven's own order (#423):
 ///
 /// 1. `$MAVEN_REPO_LOCAL` (socket-patch's override);
-/// 2. `-Dmaven.repo.local` in `$MAVEN_ARGS`, then `$MAVEN_OPTS`;
+/// 2. `-Dmaven.repo.local` in `$MAVEN_ARGS`, then in the project's
+///    `.mvn/maven.config` ([`maven_config_repo_local`]), then in
+///    `$MAVEN_OPTS`. Maven puts the config file's arguments before the
+///    command line's, so the command line wins, and both are user
+///    properties, which it reads before the JVM's system properties;
 /// 3. `<localRepository>` in the user settings
 ///    (`<user.home>/.m2/settings.xml`), then in the global settings
 ///    (`conf/settings.xml` under `$MAVEN_HOME`, else `$M2_HOME`);
@@ -616,7 +663,15 @@ pub fn is_ro_root(path: &Path) -> bool {
 /// when nothing names a repository and there is no usable home: a relative
 /// or literal `~` would resolve against the working directory and treat a
 /// `~/.m2` inside the scanned project as the user's local repository (B66).
-pub fn m2_repo_path_with(env: &dyn Env, os: Os, home_dir: Option<&Path>) -> Option<PathBuf> {
+/// A relative `-Dmaven.repo.local` in `.mvn/maven.config` is the one
+/// exception: it is the project's own statement about the build run there,
+/// and is resolved against `project`.
+pub fn m2_repo_path_in(
+    env: &dyn Env,
+    os: Os,
+    home_dir: Option<&Path>,
+    project: Option<&Path>,
+) -> Option<PathBuf> {
     use crate::gradle::home::system_property;
     use crate::utils::fs::is_usable_home;
 
@@ -632,6 +687,11 @@ pub fn m2_repo_path_with(env: &dyn Env, os: Os, home_dir: Option<&Path>) -> Opti
                 .and_then(|opts| system_property(&opts, name, os))
                 .filter(|v| !v.is_empty())
         })
+    };
+    let argument = |k: &str| {
+        set(k)
+            .and_then(|opts| system_property(&opts, "maven.repo.local", os))
+            .filter(|v| !v.is_empty())
     };
     // `user.home` is fixed when the JVM starts: the launcher's MAVEN_OPTS
     // can move it, a command-line `-D` (MAVEN_ARGS) comes too late for the
@@ -652,10 +712,24 @@ pub fn m2_repo_path_with(env: &dyn Env, os: Os, home_dir: Option<&Path>) -> Opti
                 .filter(|h| is_usable_home(h))
                 .map(Path::to_path_buf)
         });
-    if let Some(repo) = property("maven.repo.local")
-        .map(PathBuf::from)
-        .filter(|p| p.has_root())
-    {
+    // The first source that sets the property decides, as in Maven: a
+    // command-line value it cannot use does not fall back to the next.
+    let lookup = |name: &str| match name {
+        "user.home" => user_home.as_ref().map(|h| h.display().to_string()),
+        _ => match name.strip_prefix("env.") {
+            Some(var) => set(var),
+            None => property(name),
+        },
+    };
+    let rooted = |value: Option<String>| value.map(PathBuf::from).filter(|p| p.has_root());
+    let repo_local = match argument("MAVEN_ARGS") {
+        Some(value) => rooted(Some(value)),
+        None => match project.and_then(|p| maven_config_repo_local(p, &lookup)) {
+            Some(value) => value,
+            None => rooted(argument("MAVEN_OPTS")),
+        },
+    };
+    if let Some(repo) = repo_local {
         return Some(repo);
     }
     let maven_home = set("MAVEN_HOME").or_else(|| set("M2_HOME"));
@@ -665,19 +739,73 @@ pub fn m2_repo_path_with(env: &dyn Env, os: Os, home_dir: Option<&Path>) -> Opti
             .map(|h| h.join(".m2").join("settings.xml")),
         maven_home.map(|m| PathBuf::from(m).join("conf").join("settings.xml")),
     ];
-    let lookup = |name: &str| match name {
-        "user.home" => user_home.as_ref().map(|h| h.display().to_string()),
-        _ => match name.strip_prefix("env.") {
-            Some(var) => set(var),
-            None => property(name),
-        },
-    };
     for path in settings_files.into_iter().flatten() {
         if let Some(repo) = settings_local_repository(&path, &lookup) {
             return Some(repo);
         }
     }
     Some(user_home?.join(".m2").join("repository"))
+}
+
+/// The largest `.mvn/maven.config` read: it holds a handful of arguments.
+const MAX_MAVEN_CONFIG_BYTES: u64 = 256 * 1024;
+
+/// The local repository a `-Dmaven.repo.local=…` in the `.mvn/maven.config`
+/// of the build Maven would run in `project` names. `None` when no config
+/// sets the property; `Some(None)` when one does with a value that is not
+/// used here: an empty one (Maven then takes the directory it runs in for
+/// its repository) or a placeholder nothing here defines. The config still
+/// decides, as it does in Maven: no later source is consulted.
+///
+/// The file is the one Maven's launcher finds: `.mvn/maven.config` in the
+/// nearest directory at or above `project` that holds a `.mvn` directory.
+/// Each line is one argument (Maven 3.9 and later; `#` starts a comment
+/// line); a line that is not the property itself is also split on
+/// whitespace, which is how earlier Mavens read the whole file. The last
+/// occurrence wins. Maven interpolates the arguments (3.9.2 and later):
+/// `${session.rootDirectory}` and `${maven.multiModuleProjectDirectory}`
+/// are that directory, `${session.topDirectory}` and `${user.dir}` are
+/// `project`, and anything else is asked of `lookup` (`${user.home}`,
+/// `${env.NAME}`, a `-D` of the environment). A relative path is taken
+/// from `project`, where Maven would run.
+fn maven_config_repo_local(
+    project: &Path,
+    lookup: &dyn Fn(&str) -> Option<String>,
+) -> Option<Option<PathBuf>> {
+    const FLAG: &str = "-Dmaven.repo.local=";
+    // `.` has no ancestors to search.
+    let project = std::path::absolute(project).ok()?;
+    let root = project.ancestors().find(|dir| dir.join(".mvn").is_dir())?;
+    let config = root.join(".mvn").join("maven.config");
+    // Bounded, and FIFO-safe: the file is in the project's own tree.
+    if std::fs::metadata(&config).ok()?.len() > MAX_MAVEN_CONFIG_BYTES {
+        return None;
+    }
+    let text = crate::utils::fs::read_regular_to_string_sync(&config).ok()?;
+    let value = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .filter_map(|line| match line.strip_prefix(FLAG) {
+            Some(value) => Some(value),
+            None => line
+                .split_whitespace()
+                .filter_map(|arg| arg.strip_prefix(FLAG))
+                .next_back(),
+        })
+        .next_back()?
+        .trim();
+    if value.is_empty() {
+        return Some(None);
+    }
+    let lookup = |name: &str| match name {
+        "session.rootDirectory" | "maven.multiModuleProjectDirectory" => {
+            Some(root.display().to_string())
+        }
+        "session.topDirectory" | "user.dir" => Some(project.display().to_string()),
+        _ => lookup(name),
+    };
+    Some(interpolate(value, &lookup).map(|value| project.join(value)))
 }
 
 /// The `<localRepository>` a Maven `settings.xml` at `path` names, with
@@ -811,13 +939,13 @@ pub fn m2_gate(cwd: &Path, env: &JvmEnv) -> M2Gate {
 /// Whether a Gradle-only build at `cwd` ignores the Maven local repository
 /// (process environment; see [`m2_gate`]).
 pub fn gradle_m2_ignored(cwd: &Path) -> bool {
-    m2_gate(cwd, &JvmEnv::from_process()) == M2Gate::Ignored
+    m2_gate(cwd, &JvmEnv::for_project(cwd)) == M2Gate::Ignored
 }
 
 /// Why `mavenLocal()` could not be ruled out for the Gradle build at
 /// `cwd`, when m2 is kept for that reason (process environment).
 pub fn maven_local_undetermined(cwd: &Path) -> Option<String> {
-    match m2_gate(cwd, &JvmEnv::from_process()) {
+    match m2_gate(cwd, &JvmEnv::for_project(cwd)) {
         M2Gate::Undetermined(why) => Some(why),
         _ => None,
     }
@@ -910,7 +1038,7 @@ impl MavenCrawler {
     /// its layout ([`Self::get_jvm_cache_roots_with`] over the process
     /// environment).
     pub async fn get_jvm_cache_roots(&self, options: &CrawlerOptions) -> Vec<JvmCacheRoot> {
-        self.get_jvm_cache_roots_with(options, &JvmEnv::from_process())
+        self.get_jvm_cache_roots_with(options, &JvmEnv::for_crawl(options))
             .await
     }
 
@@ -1016,7 +1144,7 @@ impl MavenCrawler {
         &self,
         options: &CrawlerOptions,
     ) -> Result<Vec<PathBuf>, std::io::Error> {
-        self.get_maven_repo_paths_with(options, &JvmEnv::from_process())
+        self.get_maven_repo_paths_with(options, &JvmEnv::for_crawl(options))
             .await
     }
 
@@ -1042,7 +1170,7 @@ impl MavenCrawler {
         &self,
         options: &CrawlerOptions,
     ) -> Result<Vec<PathBuf>, std::io::Error> {
-        self.get_maven_copy_paths_with(options, &JvmEnv::from_process())
+        self.get_maven_copy_paths_with(options, &JvmEnv::for_crawl(options))
             .await
     }
 
@@ -1088,7 +1216,8 @@ impl MavenCrawler {
     /// #265): another project's cached artifacts are not this project's
     /// packages. A root pom that is not readable leaves the crawl unscoped.
     pub async fn crawl_all(&self, options: &CrawlerOptions) -> Vec<CrawledPackage> {
-        self.crawl_all_with(options, &JvmEnv::from_process()).await
+        self.crawl_all_with(options, &JvmEnv::for_crawl(options))
+            .await
     }
 
     /// [`Self::crawl_all`] under the caches `env` names.
