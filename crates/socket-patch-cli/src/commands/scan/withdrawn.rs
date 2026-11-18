@@ -246,7 +246,10 @@ pub(super) async fn sweep(
     };
 
     let to_restore: Vec<HostedPin> = gone.iter().map(|(pin, _)| pin.clone()).collect();
-    let leg = crate::commands::hosted_unwind::run_hosted_leg(common, &to_restore).await;
+    // The scan's own client, for a patch record the gem leg may need.
+    let run_client = crate::args::RunApiClient::new_with(Some(api_client.clone()));
+    let leg =
+        crate::commands::hosted_unwind::run_hosted_leg(common, &to_restore, &run_client).await;
     out.half_restored = leg.half_applied().map(str::to_string);
 
     let action = if common.dry_run {
