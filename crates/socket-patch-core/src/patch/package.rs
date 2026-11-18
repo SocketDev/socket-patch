@@ -207,12 +207,21 @@ pub(crate) fn shadowed_member(
 ) -> Result<Option<String>, ArchiveError> {
     use tar::EntryType;
 
+    // Extractors normalize `..` as well as `.` and empty segments, so
+    // `package/x/../index.js` lands on `index.js`. A `..` above the start
+    // is dropped: what it would reach is outside the package either way.
     let fold = |path: &str| -> String {
-        path.split('/')
-            .filter(|segment| !segment.is_empty() && *segment != ".")
-            .map(str::to_ascii_lowercase)
-            .collect::<Vec<_>>()
-            .join("/")
+        let mut segments: Vec<String> = Vec::new();
+        for segment in path.split('/') {
+            match segment {
+                "" | "." => {}
+                ".." => {
+                    segments.pop();
+                }
+                _ => segments.push(segment.to_ascii_lowercase()),
+            }
+        }
+        segments.join("/")
     };
     let mut writers: HashMap<String, usize> = files
         .iter()
@@ -878,6 +887,8 @@ mod tests {
             (("package/./index.js", FILE), "index.js"),
             (("package//index.js", FILE), "index.js"),
             (("package/INDEX.JS", FILE), "index.js"),
+            (("package/x/../index.js", FILE), "index.js"),
+            (("package/lib/../lib/util.js", FILE), "lib/util.js"),
             (("package/index.js", SYMLINK), "index.js"),
             (("package/index.js", FILE), "index.js"),
             (("x/lib/util.js", FILE), "lib/util.js"),

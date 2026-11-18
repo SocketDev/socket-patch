@@ -6293,10 +6293,17 @@ fn rewrite_bun_lock(
         let url_spec = format!("{fname}@{}", dep.artifact_url);
         // A default-trusted package is pinned only where an earlier run
         // already pinned it: taking a registry copy off the registry would
-        // stop Bun from running its install scripts (#371).
+        // stop Bun from running its install scripts (#371). A bundled entry
+        // never counts as a pin: Bun unpacks it from its parent's tarball
+        // and never reads its spec, so a hosted URL there says nothing
+        // about where a registry copy installs from.
         let newly_pins = || {
-            let already_pinned = specs.iter().flatten().any(|spec| {
-                *spec == url_spec || is_prior_hosted_bun_spec(spec, &fname, &dep.artifact_url)
+            let already_pinned = entries.iter().zip(&specs).any(|(entry, spec)| {
+                !is_bundled_entry(entry)
+                    && spec.as_deref().is_some_and(|spec| {
+                        spec == url_spec
+                            || is_prior_hosted_bun_spec(spec, &fname, &dep.artifact_url)
+                    })
             });
             !already_pinned
                 && entries.iter().zip(&specs).any(|(entry, spec)| {
@@ -16173,6 +16180,24 @@ mod tests {
             "{:?}",
             r.warnings
         );
+
+        // A bundled copy that carries the hosted URL is not a pin either:
+        // Bun never reads its spec, so the registry copy beside it still
+        // runs its scripts and stays on the registry.
+        let bundled_url = bun_lock_file(
+            "\"p/simple-git-hooks\": [\"simple-git-hooks@http://p.test/simple-git-hooks-2.11.1.tgz\", \
+             { \"bundled\": true }, \"sha512-OLD==\"],\n    \
+             \"simple-git-hooks\": [\"simple-git-hooks@2.11.1\", \"\", {}, \"sha512-OLD==\"],",
+            1,
+        );
+        let r = run(&bundled_url, Some(manifest));
+        assert!(r.files.is_empty() && r.edits.is_empty(), "{:?}", r.edits);
+        assert!(
+            warning_codes(&r).contains(&"redirect_bun_default_trust_skipped"),
+            "{:?}",
+            r.warnings
+        );
+        assert!(r.refused_bun_uuids.contains(&hooks.patch_uuid));
     }
 
     /// A CRLF bun.lock (Windows `core.autocrlf` checkout) must keep CRLF on

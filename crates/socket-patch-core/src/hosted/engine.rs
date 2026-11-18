@@ -2791,8 +2791,10 @@ async fn rewrite_once(
                                 crate::vendor::bun_lockb::BunLockb::parse_packages(&bytes)
                                     .unwrap_or_default()
                             });
+                            // A bundled-only record is never a pin.
                             let already_pinned = records.iter().any(|p| {
                                 p.name == name
+                                    && !p.bundled_only
                                     && (p.resolution == o.artifact_url
                                         || crate::patch::redirect::is_prior_hosted_bun_spec(
                                             &format!("{name}@{}", p.resolution),
