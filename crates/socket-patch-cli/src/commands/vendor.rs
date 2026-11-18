@@ -4571,6 +4571,9 @@ fn commit_hint(wired: &HashSet<String>, pnpm_workspace: bool) -> String {
                 pnpm-workspace.yaml)"
             .to_string();
     }
+    if wired.contains("rush-pnpm") {
+        return RUSH_COMMIT_HINT.to_string();
+    }
     if wired.contains("vlt") {
         return VLT_COMMIT_HINT.to_string();
     }
@@ -4598,6 +4601,12 @@ fn commit_hint(wired: &HashSet<String>, pnpm_workspace: bool) -> String {
     }
 }
 
+/// What a Rush-wired run commits (the "Commit …" next step): the wiring
+/// is spread over the locks, the config Rush generates pnpm's overrides
+/// from, and the manifest of each project that depends on the package
+/// directly.
+const RUSH_COMMIT_HINT: &str = ".socket/vendor/, the pnpm-lock.yaml and pnpm-config.json files      under common/config/, and each project package.json this run edited, to make the patches      portable";
+
 /// What a vlt-wired run commits (the "Commit …" next step).
 const VLT_COMMIT_HINT: &str = "package.json (and workspace package.json files), \
      vlt-lock.json and .socket/vendor/ (the .gitignore there re-includes the payload and keeps \
@@ -4617,6 +4626,8 @@ fn flavor_install_command(flavor: &str) -> Option<&'static str> {
         // the moved-checkout recovery — pnpm <= 8 absolutizes file: override
         // specifiers, so `--frozen-lockfile` only passes at the vendoring path.
         "pnpm" | "pnpm-legacy" => Some("pnpm install"),
+        // Rush runs pnpm itself, from the lock it copies into common/temp.
+        "rush-pnpm" => Some("rush install"),
         "bun" => Some("bun install"),
         "vlt" => Some("vlt install"),
         // Not an install: the JVM build re-resolves from the vendored tree.
@@ -4910,7 +4921,12 @@ async fn run_revert(args: &VendorArgs, env: &mut Envelope) -> i32 {
                 .filter(|pin| reverted.contains(&PurlKey::new(&pin.purl)))
                 .collect();
         if !rehosted.is_empty() {
-            let leg = crate::commands::hosted_unwind::run_hosted_leg(common, &rehosted).await;
+            let leg = crate::commands::hosted_unwind::run_hosted_leg(
+                common,
+                &rehosted,
+                &crate::args::RunApiClient::new(),
+            )
+            .await;
             for purl in &leg.reverted {
                 record_warning(
                     env,
@@ -7317,6 +7333,7 @@ mod scope_and_hint_tests {
         assert_eq!(flavor_install_command("yarn-berry"), Some("yarn install"));
         assert_eq!(flavor_install_command("pnpm"), Some("pnpm install"));
         assert_eq!(flavor_install_command("pnpm-legacy"), Some("pnpm install"));
+        assert_eq!(flavor_install_command("rush-pnpm"), Some("rush install"));
         assert_eq!(flavor_install_command("bun"), Some("bun install"));
         assert_eq!(flavor_install_command("vlt"), Some("vlt install"));
         assert_eq!(flavor_install_command("cargo"), None);
@@ -7326,6 +7343,22 @@ mod scope_and_hint_tests {
             flavor_install_command("scala-cli"),
             Some("scala-cli compile --test .")
         );
+    }
+
+    /// A Rush run wires three kinds of file, and a commit that leaves one
+    /// out fails `rush install` on the next checkout.
+    #[test]
+    fn rush_commit_hint_names_the_config_and_the_manifests() {
+        let wired: HashSet<String> = ["rush-pnpm".to_string()].into();
+        let hint = commit_hint(&wired, false);
+        for part in [
+            ".socket/vendor/",
+            "pnpm-lock.yaml",
+            "pnpm-config.json",
+            "package.json",
+        ] {
+            assert!(hint.contains(part), "{hint}");
+        }
     }
 
     #[test]

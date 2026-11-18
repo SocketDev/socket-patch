@@ -25,7 +25,7 @@
 //!      patch uuid survives into `vendor/composer/installed.json`
 //!      (`dist.reference`).
 //!      Then the **manifest-less VEX legs** run on that fresh checkout (the shape a
-//!      depscan PR / a `scan --mode vendored` checkout has): with
+//!      GitHub-app PR / a `scan --mode vendored` checkout has): with
 //!      `.socket/manifest.json` deleted, standalone `vex` (and embedded
 //!      `vendor --vex` / `apply --vex`) still attests `(vendored)` from the
 //!      ledger; with both ledgers deleted too it attests from the
@@ -38,7 +38,7 @@
 //!   7. **Revert proof**: `vendor --revert` restores composer.lock
 //!      byte-for-byte and removes `.socket/vendor/` entirely.
 //!
-//! A third twin drives `scan --mode vendored --vex` (the depscan-style
+//! A third twin drives `scan --mode vendored --vex` (the GitHub-app-style
 //! front door: batch discovery → vendored copy + lock wiring, NO manifest,
 //! embedded VEX in the same run) against the same mocked API, then the same
 //! fresh-checkout install and manifest-less VEX legs.
@@ -917,7 +917,7 @@ async fn composer_get_uuid_vendored_fresh_checkout_install() {
 
     // Manifest-less VEX legs on the get-produced checkout: `get --mode
     // vendored` writes no manifest, so this checkout already is the
-    // depscan / detached shape.
+    // GitHub-app / detached shape.
     tokio::task::block_in_place(|| {
         assert_manifestless_vendored_vex(tmp.path(), &fresh, &purl, &patched, &lock_before, "get")
     });

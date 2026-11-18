@@ -18,11 +18,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use regex::Regex;
 
 use super::{Ctx, FormatResult, HostedPin, View};
-use crate::formats::cargo::CargoLock;
-
-/// How Cargo.lock names crates.io (cargo keeps this spelling even when it
-/// fetches over the sparse protocol).
-const CRATES_IO_SOURCE: &str = "registry+https://github.com/rust-lang/crates.io-index";
+use crate::formats::cargo::{CargoLock, CRATES_IO_SOURCE};
 
 /// The project cargo configs, in cargo's read preference.
 const CARGO_CONFIGS: [&str; 2] = [".cargo/config", ".cargo/config.toml"];
