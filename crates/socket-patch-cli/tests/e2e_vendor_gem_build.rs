@@ -784,37 +784,76 @@ fn gem_vendor_fresh_checkout_bundle_install_and_revert() {
         String::from_utf8_lossy(&clean.stderr),
     );
     let cleaned_gem_dir = cleaned.join(gem_dir.strip_prefix(&proj).unwrap());
-    assert!(
-        !cleaned_gem_dir.exists(),
-        "`bundle clean` must remove the leftover {}",
-        cleaned_gem_dir.display()
-    );
+    let vex_cleaned = || {
+        let (code, stdout, stderr) = run_socket(
+            &cleaned,
+            &[
+                "vex",
+                "--json",
+                "--cwd",
+                cleaned.to_str().unwrap(),
+                "--output",
+                cleaned.join("out.vex.json").to_str().unwrap(),
+                "--product",
+                "pkg:gem/app@1.0.0",
+            ],
+        );
+        assert_eq!(code, 0, "vex failed.\nstdout:\n{stdout}\nstderr:\n{stderr}");
+        let env = parse_json_envelope(&stdout);
+        assert_eq!(env["status"], "success", "envelope: {env}");
+        env
+    };
+    let out_of_sync = |env: &serde_json::Value| {
+        env["warnings"]
+            .as_array()
+            .is_some_and(|w| w.iter().any(|w| w["code"] == "vendored_tree_out_of_sync"))
+    };
+    let ruby_major: u32 = api
+        .split('.')
+        .next()
+        .and_then(|major| major.parse().ok())
+        .unwrap_or_else(|| panic!("unparseable ruby api version {api:?}"));
+    if bundler.clean_leaves_directories(ruby_major) {
+        // #2115: this bundler decides to remove the leftover and cannot
+        // delete a non-empty directory on this Ruby (see
+        // `clean_leaves_directories`). The two assertions keep this arm from
+        // outliving the defect; `vex` keeps warning for as long as the
+        // directory is there. Then finish the removal by hand.
+        let clean_out = String::from_utf8_lossy(&clean.stdout);
+        assert!(
+            clean_out.contains(&format!("Removing {DEP} ({version})")),
+            "`bundle clean` must name the leftover as stale (bundler {}):\n{clean_out}",
+            bundler.version
+        );
+        assert!(
+            cleaned_gem_dir.exists(),
+            "bundler {} on Ruby {api} removed {}: `clean_leaves_directories` is out of date",
+            bundler.version,
+            cleaned_gem_dir.display()
+        );
+        let env = vex_cleaned();
+        assert!(
+            out_of_sync(&env),
+            "the leftover this `bundle clean` could not delete is still reported: {env}"
+        );
+        std::fs::remove_dir_all(&cleaned_gem_dir).unwrap();
+    } else {
+        assert!(
+            !cleaned_gem_dir.exists(),
+            "`bundle clean` must remove the leftover {} (bundler {}, Ruby {api})",
+            cleaned_gem_dir.display(),
+            bundler.version
+        );
+    }
     assert_eq!(
         std::fs::read(cleaned.join("Gemfile.lock")).unwrap(),
         lock_wired,
         "`bundle clean` must leave Gemfile.lock byte-identical"
     );
-    let (code, stdout, stderr) = run_socket(
-        &cleaned,
-        &[
-            "vex",
-            "--json",
-            "--cwd",
-            cleaned.to_str().unwrap(),
-            "--output",
-            cleaned.join("out.vex.json").to_str().unwrap(),
-            "--product",
-            "pkg:gem/app@1.0.0",
-        ],
-    );
-    assert_eq!(code, 0, "vex failed.\nstdout:\n{stdout}\nstderr:\n{stderr}");
-    let env = parse_json_envelope(&stdout);
-    assert_eq!(env["status"], "success", "envelope: {env}");
+    let env = vex_cleaned();
     assert!(
-        env["warnings"]
-            .as_array()
-            .is_none_or(|w| w.iter().all(|w| w["code"] != "vendored_tree_out_of_sync")),
-        "nothing is out of sync after `bundle clean`: {env}"
+        !out_of_sync(&env),
+        "nothing is out of sync once the leftover is gone: {env}"
     );
 
     // 7. REVERT PROOF: both halves of the pair edit byte-restored, artifacts
@@ -994,7 +1033,7 @@ fn gem_vendor_transitive_dep_fresh_checkout_and_revert() {
     let gemfile = std::fs::read_to_string(&gemfile_path).unwrap();
     let expected_gemfile = format!(
         "{}# >>> socket-patch vendor (managed) >>>\ngem \"{DEP}\", \"{version}\", \
-         path: \"{copy_rel}\"\n# <<< socket-patch vendor (managed) <<<\n",
+         path: \"{copy_rel}\", require: false\n# <<< socket-patch vendor (managed) <<<\n",
         String::from_utf8_lossy(&gemfile_before)
     );
     assert_eq!(
@@ -1045,6 +1084,32 @@ fn gem_vendor_transitive_dep_fresh_checkout_and_revert() {
         std::fs::read(fresh.join("Gemfile.lock")).unwrap(),
         lock_wired,
         "frozen install must leave the committed Gemfile.lock byte-identical"
+    );
+
+    // BOOT PROOF (#2084): `Bundler.require` is what an app runs at boot. It
+    // loads the declared `rack-test`, and must not load `rack`, which the
+    // Gemfile did not declare before the managed block: `rack/test` leaves
+    // `lib/rack.rb` (and with it the probe constant) unloaded, so only an
+    // auto-require of the block's own declaration defines it.
+    let boot = bundle(
+        &fresh,
+        &[
+            "exec",
+            "ruby",
+            "-e",
+            "require \"bundler/setup\"\n\
+             Bundler.require(:default)\n\
+             abort \"rack-test was not required at boot\" unless defined?(Rack::Test)\n\
+             abort \"Bundler.require loaded the vendored transitive gem\" if defined?(Rack::SOCKET_PATCH_VENDOR_E2E)\n\
+             abort \"lib/rack.rb loaded at boot\" if $LOADED_FEATURES.grep(%r{/rack\\.rb\\z}).any?",
+        ],
+        false,
+    );
+    assert!(
+        boot.status.success(),
+        "`Bundler.require` must not load a gem the Gemfile did not declare.\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&boot.stdout),
+        String::from_utf8_lossy(&boot.stderr),
     );
 
     // `require "rack/test"` proves the direct dep still resolves alongside

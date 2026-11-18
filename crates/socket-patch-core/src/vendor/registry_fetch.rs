@@ -968,6 +968,75 @@ async fn download_unredacted(client: &reqwest::Client, url: &str) -> Result<Vec<
         .map_err(|e| format!("{url}: {e}"))
 }
 
+/// The registry client for bytes that socket-patch itself builds or
+/// installs as fetched (a gem whose `extconf.rb` is about to run), and for
+/// the checksum such bytes are verified against. A checksum read from the
+/// registry that serves the archive vouches for it only when nobody on the
+/// network path can rewrite both, so this client talks `https`, or plain
+/// `http` to this machine (a local mirror, the hermetic tests), and nothing
+/// else:
+///
+/// * a URL that is neither is refused before any request
+///   ([`crate::utils::http::secure_url`]), and the request is made to the
+///   URL that check parsed;
+/// * a redirect that would leave `https`, or lead to another `http` host,
+///   is not followed ([`crate::utils::http::no_downgrade_redirects`]);
+/// * a plain-`http` request to this machine is sent straight to it, never
+///   through a proxy. `HTTP_PROXY` / `ALL_PROXY` would otherwise carry it,
+///   in clear text, to the proxy host, which is the network the loopback
+///   exemption assumes it never reaches. An `https` request keeps the
+///   system proxy: it is tunnelled, and still verified end to end.
+///
+/// One per run: it holds a connection pool for each of the two routes.
+pub struct SecureRegistryClient {
+    /// For `https` URLs, through the system proxy when there is one.
+    https: RegistryClient,
+    /// For plain `http` to this machine: no proxy. Built by the first such
+    /// request (most runs make none).
+    direct: std::sync::OnceLock<RegistryClient>,
+}
+
+impl Default for SecureRegistryClient {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SecureRegistryClient {
+    pub fn new() -> Self {
+        SecureRegistryClient {
+            https: Self::builder()
+                .build()
+                .expect("failed to build registry HTTP client"),
+            direct: std::sync::OnceLock::new(),
+        }
+    }
+
+    fn builder() -> reqwest::ClientBuilder {
+        registry_client_builder(USER_AGENT).redirect(crate::utils::http::no_downgrade_redirects())
+    }
+
+    /// [`download`] of `url`, over a transport nobody can rewrite.
+    pub(crate) async fn download(&self, url: &str) -> Result<Vec<u8>, String> {
+        let url = crate::utils::http::secure_url(url)
+            .map_err(|why| format!("no request is made: {why}"))?;
+        // `secure_url` passes https and loopback http alone, and no
+        // redirect leads from https to http: the proxied client never
+        // speaks plain http, and the direct one never uses a proxy.
+        let client = if url.scheme() == "https" {
+            &self.https
+        } else {
+            self.direct.get_or_init(|| {
+                Self::builder()
+                    .no_proxy()
+                    .build()
+                    .expect("failed to build registry HTTP client")
+            })
+        };
+        download(client, url.as_str()).await
+    }
+}
+
 /// Verify archive bytes against lock-recorded integrity. Berry cache checksums
 /// require server metadata because they identify a different archive format.
 pub fn artifact_matches_integrity(
@@ -2562,6 +2631,120 @@ mod tests {
         let wrong = b64.encode(Sha256::digest(b"other"));
         let err = verify_sri(bytes, &format!("sha256-{wrong}")).unwrap_err();
         assert!(err.contains("sha256"), "{err}");
+    }
+
+    /// The client for bytes that are built or installed makes no request to
+    /// a plain-http host that is not this machine, and follows no redirect
+    /// to one. A loopback registry (a local mirror, the hermetic tests) is
+    /// served, redirects between its own URLs included, up to the one hop
+    /// limit; and the URL that is fetched is the one that was judged,
+    /// however its scheme is written.
+    ///
+    /// Every URL here names this machine, the refused ones too (`0.0.0.0`
+    /// is no loopback address to the rule, and no packet for it leaves the
+    /// host): the test stays off the network even if the rule broke.
+    #[tokio::test]
+    async fn the_secure_client_talks_https_or_loopback_only() {
+        use wiremock::matchers::{method, path, path_regex};
+        use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+        const ELSEWHERE: &str = "http://0.0.0.0:9";
+        let server = MockServer::start().await;
+        let serve = |from: &'static str, response: ResponseTemplate| {
+            Mock::given(method("GET"))
+                .and(path(from))
+                .respond_with(response)
+                .mount(&server)
+        };
+        serve(
+            "/gems/a-1.gem",
+            ResponseTemplate::new(200).set_body_bytes(b"the gem".to_vec()),
+        )
+        .await;
+        serve(
+            "/moved/a-1.gem",
+            ResponseTemplate::new(302).insert_header("location", "/gems/a-1.gem"),
+        )
+        .await;
+        serve(
+            "/away/a-1.gem",
+            ResponseTemplate::new(302)
+                .insert_header("location", format!("{ELSEWHERE}/gems/a-1.gem").as_str()),
+        )
+        .await;
+        // `/chain/<n>/<i>`: redirect `i` of `n`, the last of which leads to
+        // the gem.
+        Mock::given(method("GET"))
+            .and(path_regex(r"^/chain/\d+/\d+$"))
+            .respond_with(|request: &Request| {
+                let numbers: Vec<usize> = request
+                    .url
+                    .path()
+                    .split('/')
+                    .filter_map(|part| part.parse().ok())
+                    .collect();
+                let (hops, at) = (numbers[0], numbers[1]);
+                let next = if at < hops {
+                    format!("/chain/{hops}/{}", at + 1)
+                } else {
+                    "/gems/a-1.gem".to_string()
+                };
+                ResponseTemplate::new(302).insert_header("location", next.as_str())
+            })
+            .mount(&server)
+            .await;
+        let client = SecureRegistryClient::new();
+        let base = server.uri();
+        assert!(base.starts_with("http://127.0.0.1:"), "{base}");
+
+        let shouted = base.replace("http://", "HTTP://");
+        for served in [
+            format!("{base}/gems/a-1.gem"),
+            format!("{base}/moved/a-1.gem"),
+            // The scheme in capitals: the same URL to the gate and the fetch.
+            format!("{shouted}/gems/a-1.gem"),
+            // Ten redirects, the limit: `/chain/10/1` … `/chain/10/10`, then
+            // the gem.
+            format!("{base}/chain/10/1"),
+        ] {
+            assert_eq!(
+                client.download(&served).await.unwrap(),
+                b"the gem",
+                "{served}"
+            );
+        }
+        let why = client
+            .download(&format!("{base}/chain/11/1"))
+            .await
+            .unwrap_err();
+        assert!(why.contains("too many redirects"), "{why}");
+        let why = client
+            .download(&format!("{base}/away/a-1.gem"))
+            .await
+            .unwrap_err();
+        assert!(
+            why.contains("refusing a redirect") && why.contains("0.0.0.0"),
+            "{why}"
+        );
+
+        // Refused before any request.
+        let asked_before = server.received_requests().await.unwrap().len();
+        for url in [
+            format!("{ELSEWHERE}/gems/a-1.gem"),
+            "http://user:hunter2@0.0.0.0:9/gems/a-1.gem".to_string(),
+            "ftp://127.0.0.1/gems/a-1.gem".to_string(),
+            base.replace("http://", ""),
+        ] {
+            let why = client.download(&url).await.unwrap_err();
+            assert!(
+                why.contains("no request is made") && why.contains("is not an https URL"),
+                "{why}"
+            );
+            assert!(!why.contains("hunter2"), "{why}");
+        }
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            asked_before
+        );
     }
 
     /// Every `download` error quotes its URL redacted: a refused scheme, an

@@ -240,20 +240,18 @@ pub fn sha256sums_entry(sums: &str, file: &str) -> Result<String, UpdateError> {
 /// MITM tamper with whichever leg it captures (the SHA256SUMS leg is the
 /// integrity root, so it needs this exactly as much as the archive leg).
 /// Overridden bases (wiremock fixtures, mirrors) are plain-`http` loopback
-/// by design, so there the policy is only hop-count-limited.
+/// by design, so there the policy is only hop-count-limited. Both count
+/// hops the same way: the crate's one policy
+/// ([`crate::utils::http::redirects_unless`]) and its one limit.
 pub(crate) fn follow_redirect_policy(endpoints: &UpdateEndpoints) -> reqwest::redirect::Policy {
+    use crate::utils::http::{redirects_unless, MAX_REDIRECTS};
     if endpoints.is_default() {
-        reqwest::redirect::Policy::custom(|attempt| {
-            if attempt.previous().len() > 10 {
-                attempt.error("too many redirects")
-            } else if attempt.url().scheme() != "https" {
-                attempt.error("refusing insecure (non-HTTPS) redirect for release metadata")
-            } else {
-                attempt.follow()
-            }
+        redirects_unless(|_, to| {
+            (to.scheme() != "https")
+                .then(|| "refusing insecure (non-HTTPS) redirect for release metadata".to_string())
         })
     } else {
-        reqwest::redirect::Policy::limited(10)
+        reqwest::redirect::Policy::limited(MAX_REDIRECTS)
     }
 }
 

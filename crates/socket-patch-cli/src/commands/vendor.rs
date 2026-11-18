@@ -635,6 +635,16 @@ fn takeover_detail(code: &str, detail: &str) -> String {
     }
 }
 
+/// A reverted entry's progress lines ([`RevertedEntry::progress`]), for a
+/// human run.
+fn print_progress(common: &GlobalArgs, lines: &[String]) {
+    if !common.silent && !common.json {
+        for line in lines {
+            println!("{line}");
+        }
+    }
+}
+
 pub(crate) fn record_warning(
     env: &mut Envelope,
     purl: &str,
@@ -4724,6 +4734,7 @@ pub(crate) async fn reconcile_dropped(
     for RevertedEntry {
         key: purl,
         warnings,
+        progress,
         step,
         ..
     } in reverted
@@ -4789,6 +4800,7 @@ pub(crate) async fn reconcile_dropped(
                 );
             }
         }
+        print_progress(common, &progress);
     }
     (had_error, Ok(state))
 }
@@ -4831,7 +4843,9 @@ async fn run_revert(args: &VendorArgs, env: &mut Envelope) -> i32 {
         key: purl,
         flavor,
         warnings,
+        progress,
         step,
+        ..
     } in reverted
     {
         let purl = &purl;
@@ -4886,6 +4900,7 @@ async fn run_revert(args: &VendorArgs, env: &mut Envelope) -> i32 {
                 );
             }
         }
+        print_progress(common, &progress);
     }
 
     // `--revert` returns to UPSTREAM: a package vendored over hosted wiring

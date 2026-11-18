@@ -32,10 +32,11 @@ use crate::commands::agent_download::{
     decide_patch_action, download_patch_records_preflighted, download_patch_records_reusing,
     filter_to_installed_releases, max_vuln_severity, nested_apply_args,
     next_steps as agent_next_steps, patch_event_metadata, record_apply_outcome, recorded_purls,
-    report_lock_failure, run_nested_apply, run_outcome, tag_mode, unwind_new_blobs,
-    vendored_download_refusals, warn_if_manifest_gitignored, warn_on_vendored_uuid_drift,
-    write_all_patch_blobs, DetachedDownload, PatchAction, ALREADY_IN_MANIFEST, BLOB_WRITE_FAILED,
-    RELEASE_NARROWING,
+    report_lock_failure, roll_back_replaced_patches, run_nested_apply, run_outcome, tag_mode,
+    unwind_new_blobs, vendored_download_refusals, warn_if_manifest_gitignored,
+    warn_on_vendored_uuid_drift, write_all_patch_blobs, DetachedDownload, PatchAction,
+    ALREADY_IN_MANIFEST, BLOB_WRITE_FAILED, RELEASE_NARROWING, REPLACED_PATCH_NOT_RESTORED,
+    REPLACED_ROLLED_BACK_UNRECORDED,
 };
 pub use crate::commands::agent_download::{
     download_and_apply_patches_into, download_and_apply_patches_with, DownloadParams, DownloadRun,
@@ -1925,7 +1926,9 @@ async fn agent_dry_run(
 /// The manifest-record half of the agent single-uuid save, under the apply
 /// lock: fail-closed manifest read, the no-applicable-files guardrail,
 /// action classification against the manifest, and — unless the same uuid
-/// is already recorded — the blob writes and the manifest write. Takes the
+/// is already recorded — the blob writes, the rollback of a recorded patch
+/// this one replaces (its run warnings are returned with the action), and
+/// the manifest write. Takes the
 /// `PatchResponse` the caller fetched rather than re-fetching by UUID: the
 /// caller's client may have fallen back to the public proxy after a
 /// 401/403, and a fresh client would hit the same auth failure again. A
@@ -1940,7 +1943,8 @@ async fn save_patch_record(
     manifest_path: &Path,
     socket_dir: &Path,
     patch: &PatchResponse,
-) -> Result<PatchAction, i32> {
+    client: &ApiClient,
+) -> Result<(PatchAction, Vec<RunWarning>), i32> {
     let mut manifest = match read_manifest(manifest_path).await {
         Ok(Some(m)) => m,
         Ok(None) => PatchManifest::new(),
@@ -1976,7 +1980,7 @@ async fn save_patch_record(
     // not `added` — consumers diff manifest replacements on that action.
     let action = decide_patch_action(&manifest, &patch.purl, &patch.uuid);
     if action == PatchAction::Skipped {
-        return Ok(action);
+        return Ok((action, Vec::new()));
     }
 
     let blobs_dir = socket_dir.join("blobs");
@@ -2002,19 +2006,57 @@ async fn save_patch_record(
         return Err(1);
     };
 
+    // Replacing another patch's record: roll the recorded patch back
+    // first, or keep its record (#2096; the multi-patch engine's step).
+    // After the blob writes, so a patch that cannot be saved changes
+    // nothing in the installed package. Boxed like the engine's.
+    let mut warnings: Vec<RunWarning> = Vec::new();
+    let mut rolled_back = false;
+    if let PatchAction::Updated { old_uuid } = &action {
+        let rollback = Box::pin(roll_back_replaced_patches(
+            &args.common,
+            socket_dir,
+            &manifest,
+            &[(patch.purl.as_str(), &files)],
+            client,
+        ))
+        .await;
+        if let Some(detail) = rollback.refusal(&patch.purl, old_uuid) {
+            unwind_new_blobs(&blobs_dir, &new_blobs).await;
+            if args.common.json {
+                let mut env = new_envelope(&args.common);
+                env.record(
+                    PatchEvent::new(EventAction::Failed, patch.purl.as_str())
+                        .with_uuid(patch.uuid.as_str())
+                        .with_error(REPLACED_PATCH_NOT_RESTORED, detail.as_str()),
+                );
+                env.mark_error(EnvelopeError::new(REPLACED_PATCH_NOT_RESTORED, detail));
+                emit(&env);
+            } else {
+                eprintln!(
+                    "Error: Cannot replace the patch of {}: {detail}",
+                    normalize_purl(&patch.purl)
+                );
+            }
+            return Err(1);
+        }
+        rolled_back = !rollback.restored.is_empty();
+        warnings = rollback.report(args.common.json || args.common.silent);
+    }
+
     manifest
         .patches
         .insert(patch.purl.clone(), build_patch_record(patch, files));
     if let Err(e) = write_manifest(manifest_path, &manifest).await {
         // No record points at the blobs just written: unwind exactly those.
         unwind_new_blobs(&blobs_dir, &new_blobs).await;
-        return Err(report_error(
-            &args.common,
-            "manifest_write_failed",
-            format!("Failed to write manifest: {e}"),
-        ));
+        let mut msg = format!("Failed to write manifest: {e}");
+        if rolled_back {
+            msg.push_str(REPLACED_ROLLED_BACK_UNRECORDED);
+        }
+        return Err(report_error(&args.common, "manifest_write_failed", msg));
     }
-    Ok(action)
+    Ok((action, warnings))
 }
 
 /// The uuid path's agent arm: record `patch` in the manifest and, unless
@@ -2068,10 +2110,11 @@ async fn save_and_apply_patch(
     };
     let commit_recovery = crate::commands::lock_cli::commit_recovery_warning(&guard);
 
-    let action = match save_patch_record(args, &manifest_path, &socket_dir, patch).await {
-        Ok(action) => action,
-        Err(code) => return code,
-    };
+    let (action, rollback_warnings) =
+        match save_patch_record(args, &manifest_path, &socket_dir, patch, client).await {
+            Ok(saved) => saved,
+            Err(code) => return code,
+        };
     let changed = action != PatchAction::Skipped;
     // The record is now in the manifest whatever `action` says, so the
     // nested apply follows unless `--save-only`: a same-uuid re-get must
@@ -2089,6 +2132,7 @@ async fn save_and_apply_patch(
     // different one, VEX verification fails closed (`vendor_uuid_mismatch`)
     // until a `vendor` run refreshes the committed artifact.
     let mut warnings: Vec<RunWarning> = commit_recovery.into_iter().collect();
+    warnings.extend(rollback_warnings);
     let recorded = [(patch.purl.clone(), patch.uuid.clone())];
     if changed {
         warn_on_vendored_uuid_drift(&args.common.project_root(), quiet, &recorded, &mut warnings)

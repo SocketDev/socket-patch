@@ -58,8 +58,9 @@ const MAX_METADATA_BYTES: u64 = 16 * 1024 * 1024;
 pub enum Source<'a> {
     /// The patch server's serve routes.
     PatchServer(&'a crate::api::client::ApiClient),
-    /// A public gem registry.
-    Registry,
+    /// A public gem registry, reached over `https` (or on this machine)
+    /// through the run's one client for it.
+    Registry(&'a crate::vendor::registry_fetch::SecureRegistryClient),
     /// `--offline`: only what is already on disk.
     DiskOnly,
 }
@@ -156,10 +157,9 @@ async fn obtain(wanted: &Wanted, source: &Source<'_>) -> Result<Vec<u8>, String>
                 .download_artifact(url)
                 .await
                 .map_err(|e| crate::utils::redact::redact_urls_in(&e.to_string()).into_owned()),
-            Source::Registry => {
-                let client = crate::vendor::registry_fetch::build_registry_client();
-                crate::vendor::registry_fetch::download(&client, url).await
-            }
+            // The gem is installed, and built when it has a native
+            // extension: over https, or from this machine, and nothing else.
+            Source::Registry(registry) => registry.download(url).await,
         };
         match fetched {
             Ok(bytes) if wanted.sha256.contains(&sha256_hex_of(&bytes)) => return Ok(bytes),
@@ -379,14 +379,12 @@ async fn refresh_installed(
                 return Err(format!("{} is not a directory", install.gem_dir.display()));
             }
             // The stage is emptied and written under the gem home. A link
-            // planted where it goes would move both somewhere else.
+            // planted where it goes would move both somewhere else, and an
+            // entry that cannot be probed may be one: only "not found"
+            // says nothing is there.
             for dir in [install.home.join(STAGE_DIR), install.stage()] {
-                if std::fs::symlink_metadata(&dir).is_ok_and(|meta| !meta.is_dir()) {
-                    return Err(format!(
-                        "its stage directory {} is not a directory",
-                        dir.display()
-                    ));
-                }
+                crate::utils::containment::ensure_dir_or_absent(&dir)
+                    .map_err(|e| format!("its stage directory {e}"))?;
             }
             let spec = crate::utils::fs::read_regular_to_string_sync(&install.spec())
                 .map_err(|e| format!("its installed gemspec is unreadable: {e}"))?;
@@ -695,6 +693,7 @@ mod tests {
         RubyEnv {
             cwd: cwd.to_path_buf(),
             rebuild: true,
+            offline: true,
         }
     }
 
@@ -827,6 +826,53 @@ mod tests {
             std::fs::read(outside.join("rack-2.2.3/keep")).unwrap(),
             b"mine",
             "nothing outside the gem home is removed"
+        );
+        assert_eq!(
+            std::fs::read(gem_dir.join("lib/rack.rb")).unwrap(),
+            UPSTREAM_LIB
+        );
+    }
+
+    /// Only "not found" says nothing is where the stage goes. A stage
+    /// entry that cannot be probed may be a planted link: the refresh
+    /// refuses, names it, and touches nothing.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_unprobeable_stage_directory_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        // Root searches any directory.
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipping: running as root, directory perms are not enforced");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let gem_dir = install(&home, "VULNERABLE\n", &upstream());
+        let archive = tmp.path().join("patched.gem");
+        std::fs::write(&archive, patched()).unwrap();
+        // The stage dir of the home may not be searched: what is at the
+        // gem's own stage inside it cannot be told.
+        let stages = home.join(STAGE_DIR);
+        std::fs::create_dir_all(stages.join("rack-2.2.3")).unwrap();
+        std::fs::write(stages.join("rack-2.2.3/keep"), b"left").unwrap();
+        std::fs::set_permissions(&stages, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let out = refresh(
+            &wanted(&patched(), &[&archive]),
+            &[Target::Installed(gem_dir.clone())],
+            &Source::DiskOnly,
+            &ruby(tmp.path()),
+        )
+        .await;
+        std::fs::set_permissions(&stages, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let why = out[0].clone().expect_err("an unprobeable stage is refused");
+        assert!(
+            why.contains("could not be checked") && why.contains("rack-2.2.3"),
+            "{why}"
+        );
+        assert_eq!(
+            std::fs::read(stages.join("rack-2.2.3/keep")).unwrap(),
+            b"left"
         );
         assert_eq!(
             std::fs::read(gem_dir.join("lib/rack.rb")).unwrap(),
@@ -1065,6 +1111,7 @@ mod tests {
             &RubyEnv {
                 cwd: tmp.path().to_path_buf(),
                 rebuild: false,
+                offline: true,
             },
         )
         .await;

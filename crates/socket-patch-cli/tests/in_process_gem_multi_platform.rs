@@ -111,6 +111,30 @@ async fn setup_mock(
     installed_before_bytes: &[u8],
     installed_after_bytes: &[u8],
 ) {
+    setup_mock_with_other(
+        server,
+        installed_before_hash,
+        installed_after_hash,
+        installed_before_bytes,
+        installed_after_bytes,
+        UUID_OTHER,
+        &darwin_after_bytes(),
+    )
+    .await;
+}
+
+/// [`setup_mock`] with the darwin variant's patch chosen by the caller:
+/// its uuid (`other_uuid`) and patched bytes (`other_after`).
+#[allow(clippy::too_many_arguments)]
+async fn setup_mock_with_other(
+    server: &MockServer,
+    installed_before_hash: &str,
+    installed_after_hash: &str,
+    installed_before_bytes: &[u8],
+    installed_after_bytes: &[u8],
+    other_uuid: &str,
+    other_after: &[u8],
+) {
     let base = base_purl();
 
     Mock::given(method("POST"))
@@ -122,7 +146,7 @@ async fn setup_mock(
                     { "uuid": UUID_INSTALLED, "purl": qualified(PLATFORM_INSTALLED),
                       "tier": "free", "cveIds": [], "ghsaIds": [],
                       "severity": "high", "title": "linux gem" },
-                    { "uuid": UUID_OTHER, "purl": qualified(PLATFORM_OTHER),
+                    { "uuid": other_uuid, "purl": qualified(PLATFORM_OTHER),
                       "tier": "free", "cveIds": [], "ghsaIds": [],
                       "severity": "high", "title": "darwin gem" },
                 ]
@@ -141,7 +165,7 @@ async fn setup_mock(
                 { "uuid": UUID_INSTALLED, "purl": qualified(PLATFORM_INSTALLED),
                   "publishedAt": "2024-01-01T00:00:00Z", "description": "linux gem",
                   "license": "MIT", "tier": "free", "vulnerabilities": {} },
-                { "uuid": UUID_OTHER, "purl": qualified(PLATFORM_OTHER),
+                { "uuid": other_uuid, "purl": qualified(PLATFORM_OTHER),
                   "publishedAt": "2024-01-01T00:00:00Z", "description": "darwin gem",
                   "license": "MIT", "tier": "free", "vulnerabilities": {} },
             ],
@@ -164,15 +188,14 @@ async fn setup_mock(
 
     // Other (darwin) variant: a different distribution's bytes, so its
     // beforeHash never matches the installed linux gem.
-    let other_after = darwin_after_bytes();
     mount_view(
         server,
-        UUID_OTHER,
+        other_uuid,
         &qualified(PLATFORM_OTHER),
         &git_sha256(DARWIN_BEFORE_BYTES),
-        &git_sha256(&other_after),
+        &git_sha256(other_after),
         DARWIN_BEFORE_BYTES,
-        &other_after,
+        other_after,
     )
     .await;
 }
@@ -747,5 +770,196 @@ async fn rollback_all_over_broad_manifest_succeeds() {
     assert!(
         manifest_keys(tmp.path()).is_empty(),
         "the rolled-back variant group must leave the manifest"
+    );
+}
+
+/// A broad manifest whose UNINSTALLED variant's patch is replaced by a
+/// newer one (#2096). Replacing a record rolls the recorded patch back
+/// first, but nothing of the darwin record was ever applied to the linux
+/// gem on disk: the re-scan must replace the record without trying to
+/// roll it back on that copy (a hash mismatch that would refuse the
+/// replacement on every scan), and must leave the linux gem patched.
+#[tokio::test]
+#[serial]
+async fn broad_rescan_replaces_the_uninstalled_variants_patch() {
+    const UUID_OTHER_NEW: &str = "33333333-3333-4333-8333-cccccccccccc";
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (gem_file, server) = fixture(tmp.path()).await;
+    assert_eq!(scan_run(scan_args(tmp.path(), server.uri(), true)).await, 0);
+    assert_eq!(read_file(&gem_file), patched_bytes());
+
+    // The API now serves a newer patch for the darwin variant only.
+    let mut darwin_new = DARWIN_BEFORE_BYTES.to_vec();
+    darwin_new.extend_from_slice(b"\n# DARWIN-MARKER-2\n");
+    server.reset().await;
+    setup_mock_with_other(
+        &server,
+        &git_sha256(ORIGINAL_BYTES),
+        &git_sha256(&patched_bytes()),
+        ORIGINAL_BYTES,
+        &patched_bytes(),
+        UUID_OTHER_NEW,
+        &darwin_new,
+    )
+    .await;
+    assert_eq!(
+        scan_run(scan_args(tmp.path(), server.uri(), true)).await,
+        0,
+        "replacing the uninstalled variant's record must not fail"
+    );
+
+    assert_variant_record(
+        tmp.path(),
+        &qualified(PLATFORM_OTHER),
+        UUID_OTHER_NEW,
+        DARWIN_BEFORE_BYTES,
+        &darwin_new,
+    );
+    assert_variant_record(
+        tmp.path(),
+        &qualified(PLATFORM_INSTALLED),
+        UUID_INSTALLED,
+        ORIGINAL_BYTES,
+        &patched_bytes(),
+    );
+    assert_eq!(
+        read_file(&gem_file),
+        patched_bytes(),
+        "the installed variant stays patched"
+    );
+}
+
+/// Make the mock serve the installed (linux) variant's patch with
+/// `linux_files` and the darwin variant's patch `darwin_uuid` with
+/// `darwin_files` (each a patch view's `files` object), replacing whatever
+/// it served before.
+async fn serve_variants(
+    server: &MockServer,
+    linux_files: &serde_json::Value,
+    darwin_uuid: &str,
+    darwin_files: serde_json::Value,
+) {
+    server.reset().await;
+    let listing = |uuid: &str, platform: &str| {
+        serde_json::json!({
+            "uuid": uuid, "purl": qualified(platform),
+            "tier": "free", "cveIds": [], "ghsaIds": [],
+            "severity": "high", "title": platform,
+            "publishedAt": "2024-01-01T00:00:00Z", "description": platform,
+            "license": "MIT", "vulnerabilities": {}
+        })
+    };
+    let patches = serde_json::json!([
+        listing(UUID_INSTALLED, PLATFORM_INSTALLED),
+        listing(darwin_uuid, PLATFORM_OTHER),
+    ]);
+    Mock::given(method("POST"))
+        .and(path(format!("/v0/orgs/{ORG}/patches/batch")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "packages": [{ "purl": base_purl(), "patches": patches }],
+            "canAccessPaidPatches": false,
+        })))
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path_regex(format!(
+            "^/v0/orgs/{ORG}/patches/by-package/.+$"
+        )))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "patches": patches,
+            "canAccessPaidPatches": false,
+        })))
+        .mount(server)
+        .await;
+    for (uuid, platform, files) in [
+        (UUID_INSTALLED, PLATFORM_INSTALLED, linux_files.clone()),
+        (darwin_uuid, PLATFORM_OTHER, darwin_files),
+    ] {
+        Mock::given(method("GET"))
+            .and(path(format!("/v0/orgs/{ORG}/patches/view/{uuid}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "uuid": uuid,
+                "purl": qualified(platform),
+                "publishedAt": "2024-01-01T00:00:00Z",
+                "files": files,
+                "vulnerabilities": {},
+                "description": "gem sibling fixture",
+                "license": "MIT",
+                "tier": "free",
+            })))
+            .mount(server)
+            .await;
+    }
+}
+
+/// The uninstalled variant's record shares a file with the installed
+/// variant's (a pure-Ruby file both distributions ship and both patches
+/// change the same way), and a newer patch for it drops that file
+/// (#2096). The linux copy holds that file's patched bytes, but they are
+/// the linux record's: replacing the darwin record must neither be
+/// refused over the copy's other file nor take the shared file back.
+#[tokio::test]
+#[serial]
+async fn broad_rescan_leaves_a_file_the_installed_sibling_variant_shares() {
+    const UUID_OTHER_NEW: &str = "44444444-4444-4444-8444-dddddddddddd";
+    const SHARED: &str = "lib/nokogiri/shared.rb";
+    const SHARED_ORIGINAL: &[u8] = b"# shared by every platform\n";
+    const SHARED_PATCHED: &[u8] = b"# shared by every platform\n# SHARED-FIX\n";
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let gem_file = install_platform_gem(tmp.path(), PLATFORM_INSTALLED, ORIGINAL_BYTES);
+    let shared_file = gem_file.parent().unwrap().join("nokogiri/shared.rb");
+    std::fs::create_dir_all(shared_file.parent().unwrap()).unwrap();
+    std::fs::write(&shared_file, SHARED_ORIGINAL).unwrap();
+
+    let entry = |before: &[u8], after: &[u8]| {
+        serde_json::json!({
+            "beforeHash": git_sha256(before),
+            "afterHash": git_sha256(after),
+            "blobContent": b64(after),
+            "beforeBlobContent": b64(before),
+        })
+    };
+    let shared = entry(SHARED_ORIGINAL, SHARED_PATCHED);
+    let linux_files = serde_json::json!({
+        "lib/nokogiri.rb": entry(ORIGINAL_BYTES, &patched_bytes()),
+        SHARED: shared.clone(),
+    });
+    let darwin_main = entry(DARWIN_BEFORE_BYTES, &darwin_after_bytes());
+    let server = MockServer::start().await;
+    serve_variants(
+        &server,
+        &linux_files,
+        UUID_OTHER,
+        serde_json::json!({ "lib/nokogiri.rb": darwin_main.clone(), SHARED: shared }),
+    )
+    .await;
+    assert_eq!(scan_run(scan_args(tmp.path(), server.uri(), true)).await, 0);
+    assert_eq!(read_file(&gem_file), patched_bytes());
+    assert_eq!(read_file(&shared_file), SHARED_PATCHED);
+
+    // The darwin variant's newer patch no longer lists the shared file.
+    serve_variants(
+        &server,
+        &linux_files,
+        UUID_OTHER_NEW,
+        serde_json::json!({ "lib/nokogiri.rb": darwin_main }),
+    )
+    .await;
+    assert_eq!(
+        scan_run(scan_args(tmp.path(), server.uri(), true)).await,
+        0,
+        "the replacement must not be refused over the sibling's copy"
+    );
+
+    assert_eq!(
+        manifest_record(tmp.path(), &qualified(PLATFORM_OTHER))["uuid"],
+        UUID_OTHER_NEW
+    );
+    assert_eq!(read_file(&gem_file), patched_bytes());
+    assert_eq!(
+        read_file(&shared_file),
+        SHARED_PATCHED,
+        "the shared file is the installed variant's to keep"
     );
 }

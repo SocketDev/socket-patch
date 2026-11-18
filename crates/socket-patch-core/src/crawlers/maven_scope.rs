@@ -36,7 +36,7 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::formats::maven::interpolate_strict;
+use crate::formats::maven::{interpolate_strict, split_socket_version};
 use crate::vendor::jvm::maven_reactor::{
     implicit_subprojects, may_discover_subprojects, pom_model, PomDecl, PomModel, MAVEN_CONFIG,
 };
@@ -205,10 +205,12 @@ impl<'w> Walk<'w> {
 
     pub(super) fn repo_pom(&self, (g, a, v): &Gav) -> Option<PathBuf> {
         let safe = |s: &str| {
+            // A leading or trailing `.` would turn into a `/` that roots the
+            // path outside the repository; `:` would name a Windows drive.
             !s.is_empty()
-                && s != "."
-                && s != ".."
-                && !s.contains(['/', '\\', '$', '{', '}'])
+                && !s.starts_with('.')
+                && !s.ends_with('.')
+                && !s.contains(['/', '\\', ':', '$', '{', '}'])
                 && !s.contains("..")
         };
         if !(safe(g) && safe(a) && safe(v)) {
@@ -221,6 +223,29 @@ impl<'w> Walk<'w> {
                 .join(v)
                 .join(format!("{a}-{v}.pom")),
         )
+    }
+
+    /// The `<version>-socket.<hex8>` copies of `gav` the local repository
+    /// holds, in name order.
+    pub(super) fn socket_copies(&self, gav: &Gav) -> Vec<Gav> {
+        let (g, a, v) = gav;
+        let Some(dir) = self
+            .repo_pom(gav)
+            .and_then(|pom| Some(pom.parent()?.parent()?.to_path_buf()))
+        else {
+            return Vec::new();
+        };
+        let mut copies: Vec<Gav> = self
+            .list(&dir)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|(_, is_dir)| *is_dir)
+            .filter_map(|(name, _)| name.into_string().ok())
+            .filter(|name| split_socket_version(name).is_some_and(|(base, _)| base == v))
+            .map(|name| (g.clone(), a.clone(), name))
+            .collect();
+        copies.sort();
+        copies
     }
 
     /// `node` and its parents: a reactor pom's local parent by
@@ -806,6 +831,28 @@ pub(super) fn normalize(path: &Path) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repo_pom_stays_inside_the_repository() {
+        let repo = Path::new("/repo");
+        let walk = Walk::new(Path::new("/project"), repo);
+        let gav = |g: &str, a: &str, v: &str| (g.to_string(), a.to_string(), v.to_string());
+        assert_eq!(
+            walk.repo_pom(&gav("org.example", "lib", "1.0")),
+            Some(repo.join("org/example/lib/1.0/lib-1.0.pom"))
+        );
+        // A leading `.` becomes a leading `/`, which `join` takes as a new
+        // root; a trailing one or a `:` (a Windows drive) escapes as well.
+        for bad in [
+            gav(".etc", "lib", "1.0"),
+            gav("org.", "lib", "1.0"),
+            gav("C:", "lib", "1.0"),
+            gav("org", ".", "1.0"),
+            gav("org", "lib", ".."),
+        ] {
+            assert_eq!(walk.repo_pom(&bad), None, "{bad:?}");
+        }
+    }
 
     fn write(root: &Path, rel: &str, body: &str) {
         let p = root.join(rel);

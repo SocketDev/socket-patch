@@ -165,8 +165,9 @@ when every module that resolves the base version is reached by its wiring. When 
 module of the build selects the base version the patch is skipped before
 anything is downloaded (`vendor_maven_version_not_selected`, exit 0, naming
 the version Maven selects). When a module's selection cannot be read (a pom
-the local repository lacks, a profile that may change the graph, a Maven 4
-build), it gets no new pin and an existing one is left alone
+the local repository lacks among what the module resolves, a profile that may
+change the graph, a Maven 4 build), it gets no new pin and an existing one is
+left alone
 (`selection_undetermined`); a declaration that names the base version is
 rewritten either way, since that replaces a version where it stands.
 The fallback repository stays in each local root, whichever pom holds the

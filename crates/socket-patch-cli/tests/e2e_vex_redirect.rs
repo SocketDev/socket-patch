@@ -2808,3 +2808,74 @@ fn gem_hosted_ref_is_verified_under_an_out_of_tree_config_bundle_path() {
     // Read-only: vex never writes the refused root.
     assert_eq!(std::fs::read(bundle.join(installed)).unwrap(), patched);
 }
+
+/// Gem (#2087): a project that moved from a precompiled build to the
+/// `ruby` platform build so hosted mode could patch it, then ran the scan's
+/// remedy (`rm -f specifications/<leaf>.gemspec cache/<leaf>.gem && bundle
+/// install`), has the patched `rails-7.0.0/` beside a `rails-7.0.0-
+/// x86_64-linux/` dir with no gemspec. Nothing loads that dir, so `vex`
+/// attests the gem, in the project's bundle path and in an out-of-tree
+/// one alike. With its gemspec back the platform build is installed and
+/// unpatched, and `vex` refuses again (#1092).
+#[test]
+fn gem_hosted_ref_is_attested_beside_a_leftover_platform_dir_with_no_gemspec() {
+    const U: &str = "77777777-7777-7777-7777-777777777777";
+    let purl = "pkg:gem/rails@7.0.0";
+    let (pristine, patched) = (
+        &b"module Rails; STATUS = :vulnerable; end\n"[..],
+        &b"module Rails; STATUS = :patched; end\n"[..],
+    );
+    for out_of_tree in [false, true] {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path().join("app");
+        std::fs::create_dir_all(&cwd).unwrap();
+        for file in ["Gemfile", "Gemfile.lock"] {
+            let text = redirect_fixture(&format!("gem/bundler/basic/expected/{file}"));
+            std::fs::write(cwd.join(file), text).unwrap();
+        }
+        let (bundle, configured) = if out_of_tree {
+            let bundle = tmp.path().join("outside bundle");
+            (bundle.clone(), bundle.display().to_string())
+        } else {
+            (cwd.join("vendor/bundle"), "vendor/bundle".to_string())
+        };
+        put(
+            &cwd,
+            ".bundle/config",
+            format!("---\nBUNDLE_PATH: \"{configured}\"\n").as_bytes(),
+        );
+        let (_rt, server) = serve_patch_views(vec![(
+            U.to_string(),
+            one_file_view(U, purl, "lib/rails.rb", pristine, patched),
+        )]);
+        let args = ["--proxy-url", &server.uri()];
+        let home = bundle.join("ruby/3.3.0");
+        put(&home, "gems/rails-7.0.0/lib/rails.rb", patched);
+        put(&home, "specifications/rails-7.0.0.gemspec", b"");
+        let leftover = "gems/rails-7.0.0-x86_64-linux/lib/rails.rb";
+        put(&home, leftover, pristine);
+
+        let (code, env) = vex_json(&cwd, &args);
+        let label = format!("leftover platform dir (out of tree: {out_of_tree})");
+        assert_attested(&cwd, code, &env, U, &label);
+        // Read-only: the leftover dir is not touched.
+        assert_eq!(std::fs::read(home.join(leftover)).unwrap(), pristine);
+
+        put(
+            &home,
+            "specifications/rails-7.0.0-x86_64-linux.gemspec",
+            b"",
+        );
+        let (code, env) = vex_json(&cwd, &args);
+        assert_eq!(
+            code,
+            Some(1),
+            "an installed unpatched platform build (out of tree: {out_of_tree}): {env}"
+        );
+        let reason = skipped_reason(&env, purl);
+        assert!(
+            reason == "not_applied" || reason == "hash_mismatch",
+            "the platform build was read and failed verification, got {reason}: {env}"
+        );
+    }
+}

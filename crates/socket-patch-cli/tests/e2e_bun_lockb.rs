@@ -1742,7 +1742,11 @@ async fn vendored_text_migration_rerun_and_supersede_revert() {
 /// an unfrozen one drops the pin. A hosted re-run must restore the
 /// manifest's `workspace:*`, after which a fresh frozen install from the
 /// text lock gets the patched bytes. Needs a Bun >= 1.4 reader (the only
-/// releases whose text reader re-resolves on the path literal). Not named
+/// releases whose text reader re-resolves on the path literal). Bun 1.4.4
+/// writes the manifest's `workspace:*` itself when it migrates (1.4.2
+/// carries the path), so there the re-run has nothing to heal and must
+/// leave the lock alone; the fresh frozen install is checked either way.
+/// Not named
 /// `native_binary_*`: scripts/backtest-bun-lockb.py runs exactly those
 /// three tests per writer/reader cell; this one has its own 1.4.2 CI leg.
 #[tokio::test(flavor = "multi_thread")]
@@ -1788,22 +1792,26 @@ async fn workspace_text_migration_heals_on_rerun() {
         .unwrap();
     require_success(output, "bun.lockb -> bun.lock migration");
     let migrated = std::fs::read_to_string(project.join("bun.lock")).unwrap();
+    let carries_path = migrated.contains("\"consumer\": \"packages/consumer\"");
     assert!(
-        migrated.contains("\"consumer\": \"packages/consumer\""),
-        "the migration carries the normalized path literal:\n{migrated}"
+        carries_path || migrated.contains("\"consumer\": \"workspace:*\""),
+        "the migration carries the normalized path literal (Bun 1.4.2) or the manifest's \
+         own spelling (Bun 1.4.4):\n{migrated}"
     );
     assert!(migrated.contains("/patch/npm/minimist/"), "{migrated}");
 
     let rerun = scan(project, &server, "hosted", &[]);
-    assert_eq!(rerun["summary"]["applied"], 1, "{rerun}");
     let healed = std::fs::read_to_string(project.join("bun.lock")).unwrap();
+    if carries_path {
+        assert_eq!(rerun["summary"]["applied"], 1, "{rerun}");
+    }
     assert_eq!(
         healed,
         migrated.replace(
             "\"consumer\": \"packages/consumer\"",
             "\"consumer\": \"workspace:*\""
         ),
-        "only the literal changes"
+        "only the literal changes, and nothing when Bun wrote `workspace:*` itself"
     );
 
     // A fresh checkout of the healed text lock installs frozen, patched.
