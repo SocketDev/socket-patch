@@ -970,6 +970,14 @@ pub async fn gem_upstream_archive(
     gem::upstream_archive(root, restored, purl, offline).await
 }
 
+/// Whether the lock on disk at `root` resolves the ruby-platform gem `purl`
+/// from rubygems.org: the gem is then on its upstream registry entry, also
+/// where [`gem_upstream_archive`] is `None` because nothing proves the
+/// archive's sha256 (an offline run, a registry error).
+pub async fn gem_resolves_from_rubygems(root: &Path, purl: &str) -> bool {
+    gem::resolves_from_rubygems(root, purl).await
+}
+
 /// Restore every pin in `pins` to its default upstream registry entry.
 /// See the module docs for the contract.
 pub async fn restore_upstream(
