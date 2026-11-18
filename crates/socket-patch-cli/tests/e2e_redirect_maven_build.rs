@@ -30,9 +30,14 @@
 //!      patched jar and the commons-lang3 transitive resolves.
 //!   5. TAMPER probes: a stale `.sha1` is rejected by `checksumPolicy=fail`
 //!      on every Maven line; a jar re-signed with a MATCHING `.sha1` is
-//!      rejected by the trusted-checksums summary on Maven ≥ 3.9 (older
-//!      lines ignore the `aether.*` properties — asserted, so a change in
-//!      either direction is noticed).
+//!      rejected by the trusted-checksums summary on Maven ≥ 3.9.4 (older
+//!      lines do not read it: asserted, so a change in either direction
+//!      is noticed). Both hold when the build is started with
+//!      `-f <checkout>/pom.xml` from outside the project, which every
+//!      Maven must survive: the line naming the checksums directory once
+//!      stopped Maven 3.9.2 to 3.9.8 from starting there. The project's
+//!      Maven Wrapper pins the Maven under test, so on Maven 4 the
+//!      directory is spelled the one way Maven 4 reads.
 //!   6. MANIFEST-LESS VEX over the fresh checkout (`vex_e2e_common`):
 //!      * online → attested from the pom wiring + the API record (the
 //!        installed suffixed copy hash-verifies, `(redirected)`);
@@ -388,6 +393,62 @@ fn maven_scan_hosted_fresh_checkout_install_and_manifestless_vex() {
     );
     let installed = repo_dir(&m2, &sfx).join(format!("{ARTIFACT}-{sfx}.jar"));
     assert_eq!(std::fs::read(&installed).unwrap(), patched_jar);
+    std::fs::remove_dir_all(fresh.join("target")).unwrap();
+
+    // 4b. FROM OUTSIDE THE PROJECT: `mvn -f <checkout>/pom.xml` started in
+    // another directory, as CI jobs commonly do. The line that names the
+    // checksums directory must not stop any Maven from starting: spelled
+    // with `${session.rootDirectory}`, as releases up to 5.1.0 wrote it,
+    // Maven 3.9.2 to 3.9.8 refuse to start here (`Illegal use of undefined
+    // property`). And where the pin is enforced it is enforced from here
+    // too: the re-signed jar is rejected by the same Mavens as in 5b.
+    let elsewhere = root.join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    let fresh_pom = fresh.join("pom.xml");
+    let goal = format!("{DEPENDENCY_PLUGIN}:copy-dependencies");
+    let from_outside = |settings: &Path, out_dir: &Path| {
+        purge(&m2);
+        let out_arg = format!("-DoutputDirectory={}", out_dir.display());
+        mvn.run(
+            &elsewhere,
+            &m2,
+            settings,
+            &["-f", fresh_pom.to_str().unwrap(), &goal, &out_arg],
+        )
+    };
+    let outside = root.join("outside-dep");
+    let out = from_outside(&mirrored, &outside);
+    assert!(
+        ok(&out),
+        "Maven {} started with -f from outside the project:\n{}",
+        mvn.version,
+        dump(&out)
+    );
+    assert_eq!(
+        std::fs::read(outside.join(format!("{ARTIFACT}-{sfx}.jar"))).unwrap(),
+        patched_jar,
+        "and it resolves the patched jar"
+    );
+    let out = from_outside(&resigned_settings, &root.join("outside-resigned"));
+    assert_eq!(
+        !ok(&out),
+        mvn.enforces_trusted_checksums(),
+        "Maven {}: the re-signed jar, with -f from outside the project:\n{}",
+        mvn.version,
+        dump(&out)
+    );
+    if !ok(&out) {
+        let log = dump(&out).to_ascii_lowercase();
+        assert!(
+            log.contains("checksum") && log.contains(&sha256_hex(&patched_jar)),
+            "the rejection is the trusted sha256 pin, not the line itself:\n{}",
+            dump(&out)
+        );
+    }
+    let _ = std::fs::remove_dir_all(fresh.join("target"));
+    purge(&m2);
+    let out = mvn.copy_dependencies(&fresh, &m2, &mirrored, "target/dep");
+    assert!(ok(&out), "{}", dump(&out));
     std::fs::remove_dir_all(fresh.join("target")).unwrap();
 
     // 6. MANIFEST-LESS VEX.

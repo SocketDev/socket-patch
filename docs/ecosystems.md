@@ -985,10 +985,33 @@ Honest limits of the Maven and NuGet flows — documented behavior, not bugs:
   Older releases leave the `.mvn/*` files inert, and only the transport `.sha1` check
   guards the Socket-served bytes. The version suffixing above still fails closed on its
   own.
-  - **3.9.0 / 3.9.1** do not interpolate the `${session.rootDirectory}` basedir the config
-    uses, so the summary file is never found.
+  - **3.9.0 / 3.9.1** do not interpolate the basedir the config uses, so the summary
+    file is never found.
   - **3.9.2 / 3.9.3** ignore `checksumAlgorithms=SHA-256` and check SHA-1 only.
   - **Below 3.9** there is no Trusted Checksums post-processor.
+  - **Maven 4** enforces the pin only in a project that declares Maven 4 (below).
+
+  **How the directory is named.** Maven reads a relative `basedir` from the local
+  repository, so the config names `.mvn/checksums` through a property, and no property
+  is right on every Maven:
+  - `${maven.multiModuleProjectDirectory}/.mvn/checksums` is what hosted mode writes by
+    default. Every Maven 3 launcher defines it wherever the build is started (the
+    project root, a module directory, `mvn -f <project>/pom.xml` from another
+    directory), so the line breaks no build and the pin is enforced from 3.9.4 on.
+    Maven 4 does not interpolate it: a Maven 4 build of such a project runs as if the
+    pin were not there.
+  - `${session.rootDirectory}/.mvn/checksums` is written for a project that declares
+    Maven 4: its Maven Wrapper pins Apache Maven 4, or its root `pom.xml` is of model
+    4.1.0 or later. Maven 4 defines it in every invocation. Releases up to 5.1.0 wrote
+    this form for every project, which stopped **Maven 3.9.2 to 3.9.8** from starting at
+    all with `-f` from outside the project (`Illegal use of undefined property:
+    session.rootDirectory`).
+
+  A project wired by an earlier release is healed by its next `scan --mode hosted`: the
+  one line is rewritten in place (`redirect_maven_config`, `rewritten`), provided the six
+  settings stand together as hosted mode wrote them. A directory line you wrote yourself
+  is yours and is left alone, as is any other setting; `rollback` and `remove` recognise
+  either form.
 
   When `.mvn/wrapper/maven-wrapper.properties` pins a Maven older than 3.9.4, the rewriter
   still writes the files and warns `redirect_maven_trusted_checksums_unenforced`. Without
@@ -1002,8 +1025,9 @@ Honest limits of the Maven and NuGet flows — documented behavior, not bugs:
   (and drops any line an earlier run wrote for that suffixed version) and warns
   `redirect_maven_trusted_checksums_invalid_hash`. `vex` attests a pin's checksum only
   when `maven.config` enforces the file as Maven 3.9+ reads it (all five settings above
-  with the values hosted writes; `failIfMissing` aside) and the wrapper, if any, pins
-  Maven 3.9.4 or later.
+  with the values hosted writes, the directory in either form; `failIfMissing` aside) and
+  the wrapper, if any, pins a Maven that enforces that form (3.9.4 or later, and below
+  Maven 4 for the default form).
 * **A Maven project's scan is scoped to its dependency graph.** The Maven local
   repository is shared by every project on the machine, so in project mode (no
   `--global` / `--global-prefix`) a Maven build's crawl (a `pom.xml`, no Gradle or

@@ -29,7 +29,7 @@ use super::{by_uuid, read_or_refuse, refuse_all_in, Ctx, FormatResult, HostedPin
 use crate::formats::maven::trusted_checksums;
 use crate::patch::redirect::{
     generation, maven_repositories_with_id, maven_tag_inner_range, maven_tag_text_in,
-    remove_maven_repository, MAVEN_DEPENDENCY_BLOCK_RE, MVN_CHECKSUMS, MVN_CONFIG, MVN_CONFIG_ARGS,
+    remove_maven_repository, MAVEN_DEPENDENCY_BLOCK_RE, MVN_CHECKSUMS, MVN_CONFIG,
 };
 
 /// The line break and indent `insert_maven_dependency_management` writes
@@ -419,7 +419,6 @@ async fn restore_mvn(
         return;
     }
     let config = view.read(&config_rel).await.ok().flatten();
-    let written_config = format!("{}\n", MVN_CONFIG_ARGS.join("\n"));
     // Whether settings hosted mode may have written are left over, read as
     // `trusted_checksums::config_enforces` reads them but by presence: a
     // partial or switched-off set is still lines the user may want gone.
@@ -428,7 +427,12 @@ async fn restore_mvn(
         .is_some_and(trusted_checksums::config_has_written_settings);
     if rest.trim().is_empty() {
         view.remove(&sums_rel);
-        if config.as_deref() == Some(written_config.as_str()) {
+        // (In either spelling of the directory: the one this release
+        // writes, or an earlier release's.)
+        if config
+            .as_deref()
+            .is_some_and(trusted_checksums::is_written_config)
+        {
             view.remove(&config_rel);
             return;
         }
@@ -805,11 +809,43 @@ mod tests {
         assert_eq!(after["pom.xml"], input);
     }
 
+    /// The `.mvn` files hosted mode wrote are removed whichever way the
+    /// checksums directory is spelled: as this release writes it for a
+    /// Maven 3 project, or with the session's root directory, as an
+    /// earlier release wrote it and as a Maven 4 project still has it.
+    #[tokio::test]
+    async fn the_mvn_files_are_removed_in_either_spelling_of_the_directory() {
+        use super::trusted_checksums::{
+            self,
+            Basedir::{Launcher, Session},
+        };
+        for form in [Launcher, Session] {
+            let config = format!("{}\n", trusted_checksums::config_args(form).join("\n"));
+            let files = vec![
+                ("pom.xml", fixture("basic", "expected", "pom.xml")),
+                (".mvn/maven.config", config),
+                (
+                    ".mvn/checksums/checksums.sha256",
+                    fixture("basic", "expected", ".mvn/checksums/checksums.sha256"),
+                ),
+            ];
+            let (outcome, after) = run(&files).await;
+            assert_eq!(outcome.pins[0].status, PinStatus::Restored, "{form:?}");
+            assert_eq!(
+                after.keys().collect::<Vec<_>>(),
+                ["pom.xml"],
+                "{form:?}: {:?}",
+                outcome.warnings
+            );
+            assert_eq!(after["pom.xml"], fixture("basic", "input", "pom.xml"));
+        }
+    }
+
     #[tokio::test]
     async fn existing_mvn_lines_are_kept_and_warned() {
         let config = format!(
             "-Dmaven.test.skip=true\n{}\n",
-            super::MVN_CONFIG_ARGS.join("\n")
+            super::trusted_checksums::CONFIG_ARGS.join("\n")
         );
         let files = vec![
             ("pom.xml", fixture("basic", "expected", "pom.xml")),

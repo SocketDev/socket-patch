@@ -1,0 +1,8 @@
+[
+  {
+    "path": ".mvn/maven.config",
+    "kind": "redirect_maven_config",
+    "action": "rewritten",
+    "key": "trustedChecksums"
+  }
+]
