@@ -1362,12 +1362,13 @@ fn native_extensions_remedy(name: &str, hosted: bool) -> String {
 
 /// Whether a `gem "<name>"` declaration of the Gemfile `text` picks the
 /// gem's source: it sits inside a `source` / `git` / `github` / `path`
-/// block, or carries one of the source options. Hosted mode refuses such a
-/// gem (`redirect_gem_source_option`), so a remedy must not name it.
-/// Errs towards `true`: a mode left out of a remedy costs less than one
-/// that refuses.
+/// block, or carries a source option, read by the shared
+/// [`gemfile::source_option`] that hosted mode refuses with (so `gitlab:`
+/// and custom `git_source` keys count too). Hosted mode refuses such a gem
+/// (`redirect_gem_source_option`), so a remedy must not name it. Errs
+/// towards `true`: a mode left out of a remedy costs less than one that
+/// refuses.
 fn declaration_selects_source(text: &str, name: &str) -> bool {
-    const SOURCE_OPTIONS: [&str; 6] = ["source", "git", "github", "path", "gist", "bitbucket"];
     let mut line_start = 0;
     for line in text.split('\n') {
         let start = line_start;
@@ -1385,15 +1386,7 @@ fn declaration_selects_source(text: &str, name: &str) -> bool {
         {
             return true;
         }
-        let code = decl.rest.split('#').next().unwrap_or("");
-        let names_source = code
-            .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == ':'))
-            .any(|word| {
-                // `git: "…"` and the hash-rocket `:git => "…"`.
-                let key = word.strip_suffix(':').or_else(|| word.strip_prefix(':'));
-                key.is_some_and(|key| SOURCE_OPTIONS.contains(&key))
-            });
-        if names_source {
+        if gemfile::source_option(decl.rest).is_some() {
             return true;
         }
     }
@@ -4233,6 +4226,9 @@ mod tests {
             ("gem \"rack\", github: \"rack/rack\"\r\n", true),
             ("gem \"rack\", :git => \"https://git.example/rack.git\"\n", true),
             ("gem \"rack\", source: \"https://gems.example\"\n", true),
+            // Hosted mode refuses every source key, not only the built-in ones.
+            ("gem \"rack\", gitlab: \"rack/rack\"\n", true),
+            ("gem \"rack\", \"~> 3.1\", forge: \"rack/rack\"\n", true),
             ("path \"components\" do\n  gem \"rack\"\nend\n", true),
             (
                 "group :test do\n  source \"https://gems.example\" do\n    gem \"rack\"\n  end\nend\n",
