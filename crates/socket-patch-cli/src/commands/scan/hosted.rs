@@ -241,15 +241,7 @@ impl<'a> ViewFallback<'a> {
     ) -> Option<&socket_patch_core::manifest::schema::PatchRecord> {
         if !self.fetched.contains_key(uuid) {
             let record = match self.api {
-                Some(api) => api
-                    .fetch_patch(uuid)
-                    .await
-                    .ok()
-                    .flatten()
-                    .map(|view| {
-                        socket_patch_core::manifest::records::record_from_patch_response(&view).1
-                    })
-                    .filter(|record| record.uuid == uuid && !record.files.is_empty()),
+                Some(api) => gem_refresh::view_record(api, uuid).await,
                 None => None,
             };
             self.fetched.insert(uuid.to_string(), record);

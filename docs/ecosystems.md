@@ -2030,6 +2030,11 @@ with a native extension is installed into a staging directory by RubyGems, with 
 owns the installed copy, and swapped in once it has compiled; with no such Ruby, or with
 `--no-gem-native-rebuild`, it is left alone. After the scan `bundle exec` runs the patched code,
 and every kind of reinstall keeps it. `rollback` and `remove` do the same with the upstream gem.
+That holds in a gem home with no `cache/` directory too (Bundler 4.1's `prune` setting, an image
+that deletes it, `gem cleanup`): with no archive to compare, the installed files are checked
+against the patch itself, in both directions. If the patch can't be looked up during a `rollback`
+or `remove`, the copy is left alone and the run warns (`upstream_gem_stale_install`), naming the
+files to remove before `bundle install`.
 Vendoring a gem that was hosted (`vendor`, `scan --mode vendored`) leaves the installed copies as
 they are: Bundler loads the vendored copy from then on. When that vendored gem is later unwound
 (`rollback`, `remove`, `vendor --revert`), Bundler loads the installed copy again, so the unwind

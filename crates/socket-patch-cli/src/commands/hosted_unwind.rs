@@ -85,15 +85,21 @@ async fn refresh_restored_gems(
     use crate::commands::gem_refresh::{after_restore, Direction};
     use socket_patch_core::patch::redirect::upstream::GEM_STALE_CACHE;
 
-    let restored: Vec<String> = outcome
+    // Each restored gem with the patch it was pinned to (the first pin's,
+    // for a gem two pins named).
+    let mut pins: std::collections::BTreeMap<String, String> = Default::default();
+    for pin in outcome
         .restored()
         .filter(|pin| pin.purl.starts_with("pkg:gem/"))
-        .map(|pin| pin.purl.clone())
-        .collect();
-    if restored.is_empty() {
+    {
+        pins.entry(pin.purl.clone())
+            .or_insert_with(|| pin.uuid.clone());
+    }
+    if pins.is_empty() {
         return;
     }
-    let refresh = after_restore(common, &restored, &outcome.staged_text).await;
+    let restored: Vec<String> = pins.keys().cloned().collect();
+    let refresh = after_restore(common, &restored, &outcome.staged_text, &pins).await;
     out.warnings.retain(|(code, detail)| {
         code != GEM_STALE_CACHE
             || !refresh

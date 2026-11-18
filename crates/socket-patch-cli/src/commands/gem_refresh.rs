@@ -940,12 +940,124 @@ pub(crate) struct RestoreRefresh {
 /// the restore's staged text (the restored lock). Only installed copies
 /// are reported as still stale here: the restore itself names an archive
 /// left in Bundler's cache dir (`upstream_gem_stale_cache`).
+///
+/// `pins` is the patch uuid each restored gem was pinned to, by purl. An
+/// installed copy whose gem home keeps no readable archive of it (a pruned
+/// `cache/`: Bundler 4.1's `prune`, a slim image, `gem cleanup`) is judged
+/// by that patch's record, as the hosted scan judges it (#2092): see
+/// [`pinned_records`].
 pub(crate) async fn after_restore(
     common: &GlobalArgs,
     restored: &[String],
     staged: &BTreeMap<String, Option<String>>,
+    pins: &BTreeMap<String, String>,
 ) -> RestoreRefresh {
-    refresh_restored(common, restored, staged, &BTreeMap::new(), Scope::All).await
+    refresh_restored(common, restored, staged, &BTreeMap::new(), pins, Scope::All).await
+}
+
+/// `uuid`'s patch record as the patch API's view gives it; `None` when
+/// there is none to judge by (a failed or not-found fetch, another patch's
+/// record, or one listing no files).
+pub(crate) async fn view_record(
+    api: &socket_patch_core::api::client::ApiClient,
+    uuid: &str,
+) -> Option<PatchRecord> {
+    api.fetch_patch(uuid)
+        .await
+        .ok()
+        .flatten()
+        .map(|view| socket_patch_core::manifest::records::record_from_patch_response(&view).1)
+        .filter(|record| record.uuid == uuid && !record.files.is_empty())
+}
+
+/// The patch record ([`view_record`]) of the patch `uuid` a gem was pinned
+/// to, to judge an installed copy by, or why there is none: the reason
+/// completes "could not be checked against the upstream gem (…)".
+/// `--offline` fetches nothing. `client` is the run's API client for these
+/// lookups, built on the first one.
+async fn pinned_record(
+    common: &GlobalArgs,
+    client: &mut Option<socket_patch_core::api::client::ApiClient>,
+    uuid: &str,
+) -> Result<PatchRecord, String> {
+    let record = if common.offline {
+        None
+    } else {
+        let client = match client {
+            Some(client) => client,
+            None => client.insert(
+                socket_patch_core::api::client::get_api_client_with_overrides(
+                    common.api_client_overrides(),
+                )
+                .await
+                .0,
+            ),
+        };
+        view_record(client, uuid).await
+    };
+    record.ok_or_else(|| {
+        "its gem home has no archive of it and its patch record could not be fetched".to_string()
+    })
+}
+
+/// What judges the installed copies a hosted unwind's archive check cannot
+/// (#2092): those of the gems `upstream` has a sha256 for whose gem home
+/// keeps no readable `<home>/cache/<leaf>.gem`. Nothing else tells such a
+/// copy from the patched build the hosted scan may have replaced it with,
+/// and no later `bundle install` replaces it.
+///
+/// Each such gem's patch record (`pins`: its patch uuid, by purl) is added
+/// to `judged`, for [`holds_patch`]. The copies of a gem with no record to
+/// be had are returned, each with why: they are reported as not checked.
+/// A run with no such copy fetches nothing.
+async fn pinned_records(
+    common: &GlobalArgs,
+    upstream: &BTreeMap<String, Option<String>>,
+    pins: &BTreeMap<String, String>,
+    judged: &mut BTreeMap<String, PatchRecord>,
+) -> Vec<(StaleGem, String)> {
+    let purls: Vec<String> = upstream
+        .iter()
+        .filter(|(purl, sha)| sha.is_some() && pins.contains_key(*purl))
+        .map(|(purl, _)| purl.clone())
+        .collect();
+    if purls.is_empty() {
+        return Vec::new();
+    }
+    let mut client = None;
+    let mut no_record: BTreeMap<String, String> = BTreeMap::new();
+    let mut unjudged = Vec::new();
+    for copy in installed_with_archives(common, &purls).await {
+        if socket_patch_core::vendor::file_sha256_hex(&copy.archive)
+            .await
+            .is_some()
+        {
+            continue;
+        }
+        if !judged.contains_key(&copy.purl) && !no_record.contains_key(&copy.purl) {
+            match pinned_record(common, &mut client, &pins[&copy.purl]).await {
+                Ok(record) => {
+                    judged.insert(copy.purl.clone(), record);
+                }
+                Err(why) => {
+                    no_record.insert(copy.purl.clone(), why);
+                }
+            }
+        }
+        if let Some(why) = no_record.get(&copy.purl) {
+            unjudged.push((
+                StaleGem {
+                    purl: copy.purl,
+                    leaf: copy.leaf,
+                    installed: Some((copy.dir, copy.project_local)),
+                    cache_archive: None,
+                    in_place: false,
+                },
+                why.clone(),
+            ));
+        }
+    }
+    unjudged
 }
 
 /// After a wet vendored unwind put the gems `unwound` back on their
@@ -985,6 +1097,7 @@ pub(crate) async fn after_vendored_unwind(
         &installed,
         &BTreeMap::new(),
         records,
+        &BTreeMap::new(),
         Scope::Installed,
     )
     .await
@@ -995,6 +1108,7 @@ async fn refresh_restored(
     restored: &[String],
     staged: &BTreeMap<String, Option<String>>,
     records: &BTreeMap<String, PatchRecord>,
+    pins: &BTreeMap<String, String>,
     scope: Scope,
 ) -> RestoreRefresh {
     use socket_patch_core::patch::redirect::upstream::{
@@ -1055,11 +1169,14 @@ async fn refresh_restored(
     if shas.is_empty() && unverified.is_empty() && judged.is_empty() {
         return RestoreRefresh::default();
     }
+    // A hosted unwind's copies with no archive to judge them by: judged by
+    // their pin's patch record, or reported when there is none (#2092).
+    let no_record = pinned_records(common, &shas, pins, &mut judged).await;
     let stale = stale_after_restore(common, &shas, &judged, scope).await;
     let unjudged = unverified.keys().map(|purl| (purl.clone(), None)).collect();
     let unchecked =
         stale_after_restore(common, &unjudged, &BTreeMap::new(), Scope::Installed).await;
-    if stale.is_empty() && unchecked.is_empty() {
+    if stale.is_empty() && unchecked.is_empty() && no_record.is_empty() {
         return RestoreRefresh::default();
     }
     let wanted = |gem: &StaleGem| {
@@ -1100,6 +1217,12 @@ async fn refresh_restored(
         if let (Some((dir, _)), Some(why)) = (&gem.installed, unverified.get(&gem.purl)) {
             pass.left
                 .insert(dir.clone(), Why::Unverified(why.to_string()));
+            installed.push(gem);
+        }
+    }
+    for (gem, why) in no_record {
+        if let Some((dir, _)) = &gem.installed {
+            pass.left.insert(dir.clone(), Why::Unverified(why));
             installed.push(gem);
         }
     }
