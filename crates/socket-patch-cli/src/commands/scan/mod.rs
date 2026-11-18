@@ -1695,16 +1695,6 @@ fn discovers_projects(args: &ScanArgs, invocation: &InvocationPolicy) -> bool {
         && matches!(args.mode, Some(ScanMode::Hosted) | Some(ScanMode::Vendored))
 }
 
-/// Whether an agent-mode scan names the project directories below `--cwd`
-/// it left unscanned: the bare project scan [`discovers_projects`] is for
-/// the other two modes. PATHs scope the run to what the user named.
-fn names_projects_left(args: &ScanArgs, invocation: &InvocationPolicy) -> bool {
-    args.paths.is_empty()
-        && !args.common.is_global()
-        && args.rollout.carry.is_none()
-        && invocation.in_git_repo
-}
-
 /// Run a hosted or vendored scan once per project directory, as if each
 /// were `--cwd`: the directories its PATHs name, or the ones a bare scan
 /// found. The exit code is the worst of the runs. `--json` takes one
@@ -2123,29 +2113,39 @@ async fn scan_project(
     // it covers the one project at `--cwd`. It names the project
     // directories below whose packages that crawl did not read (#2125):
     // without it the run reads as empty, or as a success for the checkout.
+    // PATHs scope the run to what the user named, and a run for one
+    // directory of several (`carry`) leaves the rest to its parent.
     let mut projects_left = false;
-    if apply && names_projects_left(&args, invocation) {
-        let left = crate::commands::projects_below::not_crawled(
-            &args.common,
-            &invocation.policy,
-            &invocation.repo_root,
-        )
-        .await;
-        if let Some(first) = left.first() {
+    if apply && args.paths.is_empty() && args.rollout.carry.is_none() {
+        use crate::commands::projects_below;
+        let left =
+            projects_below::not_crawled(&args.common, &invocation.policy, &invocation.repo_root)
+                .await;
+        if let Some(first) = left.dirs.first() {
             let shown: Vec<String> = left
+                .dirs
                 .iter()
-                .map(|dir| {
-                    crate::commands::projects_below::shown_project_dir(&args.common.cwd, dir)
-                })
+                .map(|dir| projects_below::shown_project_dir(&args.common.cwd, dir))
                 .collect();
-            let command = crate::commands::projects_below::project_command(
-                first,
-                &args.common,
-                "scan --mode agent",
-            );
+            // The run for a directory is asked as this one was: only an
+            // explicit `--mode` converts a project (#1088).
+            let scan = if args.sync {
+                "scan --sync"
+            } else if mode_explicit {
+                "scan --mode agent"
+            } else {
+                "scan"
+            };
+            let command = projects_below::project_command(first, &args.common, scan);
             let detail = render::unscanned_agent_projects_detail(&shown, &command);
             layout_refusals.push((render::PROJECTS_NOT_SCANNED.to_string(), detail));
             projects_left = true;
+        }
+        if left.truncated {
+            layout_refusals.push((
+                projects_below::PROJECTS_BELOW_NOT_SEARCHED.to_string(),
+                projects_below::NOT_CRAWLED_TRUNCATED.to_string(),
+            ));
         }
     }
     // A token whose org could not be resolved put the whole run on the

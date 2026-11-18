@@ -268,10 +268,12 @@ fn run_agent_scan(cwd: &Path, api_url: &str, extra: &[&str]) -> (i32, String, St
     let mut cmd = hermetic_command(&binary());
     cmd.arg("scan").current_dir(cwd);
     hermetic::scrub_extra(&mut cmd, &[Extra::Venv, Extra::Bundle]);
+    // `--sync` is agent mode too, and takes no `--mode` beside it.
+    if !extra.contains(&"--sync") {
+        cmd.args(["--mode", "agent"]);
+    }
     let out = cmd
         .args([
-            "--mode",
-            "agent",
             "--dry-run",
             "--api-url",
             api_url,
@@ -347,6 +349,15 @@ async fn agent_scan_names_the_projects_below_it_left() {
         "{detail}"
     );
 
+    // The command is asked as the run was: `--sync` stays `--sync`.
+    let (_, stdout, _) = run_agent_scan(tmp.path(), &server.uri(), &["--json", "--sync"]);
+    let detail = not_scanned_detail(&stdout)
+        .unwrap_or_else(|| panic!("no projects_not_scanned warning: {stdout}"));
+    assert!(
+        detail.contains("`socket-patch scan --sync --dry-run --cwd api`"),
+        "{detail}"
+    );
+
     // The run the warning names scans that project and warns of nothing.
     let server = MockServer::start().await;
     mock_batch_empty(&server).await;
@@ -381,9 +392,11 @@ async fn agent_scan_of_a_root_project_names_the_projects_below_it_left() {
 }
 
 /// An agent-mode scan warns only of a project it did not reach. Its npm
-/// crawl walks every `node_modules` below `--cwd`, so a nested npm
-/// project is scanned from the root and is not named. Nor is any project
-/// when the scan names PATHs or runs outside a git checkout.
+/// crawl walks the `node_modules` below `--cwd`, so a nested npm project
+/// is scanned from the root and is not named. Nor is a project with no
+/// install directory of its own (a Python project with no environment),
+/// nor any project when the scan names PATHs or runs outside a git
+/// checkout.
 #[tokio::test]
 async fn agent_scan_does_not_name_a_project_it_reached() {
     let server = MockServer::start().await;
@@ -399,6 +412,11 @@ async fn agent_scan_does_not_name_a_project_it_reached() {
         r#"{ "name": "web-dep", "version": "1.0.0" }"#,
     )
     .unwrap();
+    // Nothing was installed for it here: the machine's own Python is not
+    // this project's install directory.
+    std::fs::create_dir_all(root.join("docs")).unwrap();
+    std::fs::write(root.join("docs/requirements.txt"), "six==1.16.0\n").unwrap();
+
     let (code, stdout, stderr) = run_agent_scan(root, &server.uri(), &["--json"]);
     assert_eq!(code, 0, "{stdout}\n{stderr}");
     assert_eq!(not_scanned_detail(&stdout), None, "{stdout}");
@@ -456,4 +474,32 @@ async fn agent_scan_names_a_python_project_below_with_its_own_venv() {
     assert_eq!(code, 0, "{stdout}\n{stderr}");
     assert_eq!(not_scanned_detail(&stdout), None, "{stdout}");
     assert_eq!(queried(&server).await, ["pkg:pypi/six@1.16.0"]);
+}
+
+/// The npm walk from `--cwd` skips hidden directories, so an npm project
+/// in one (a GitHub action with its own lockfile and `node_modules`) is
+/// not reached, and is named.
+#[tokio::test]
+async fn agent_scan_names_an_npm_project_its_walk_skips() {
+    let server = MockServer::start().await;
+    mock_batch_empty(&server).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    std::fs::create_dir_all(root.join(".git")).unwrap();
+    let action = root.join(".github/actions/lint");
+    write_npm_project(&action, "action-dep");
+    let installed = action.join("node_modules/action-dep");
+    std::fs::create_dir_all(&installed).unwrap();
+    std::fs::write(
+        installed.join("package.json"),
+        r#"{ "name": "action-dep", "version": "1.0.0" }"#,
+    )
+    .unwrap();
+
+    let (code, stdout, stderr) = run_agent_scan(root, &server.uri(), &["--json"]);
+    assert_eq!(code, 0, "{stdout}\n{stderr}");
+    let detail = not_scanned_detail(&stdout)
+        .unwrap_or_else(|| panic!("no projects_not_scanned warning: {stdout}"));
+    assert!(detail.contains("(.github/actions/lint)"), "{detail}");
+    assert_eq!(queried(&server).await, [""; 0], "the walk skipped it");
 }

@@ -342,8 +342,9 @@ pub(super) fn discovery_notes(ignored: usize, truncated: bool, filter_paths: boo
     lines
 }
 
-/// Warning code: a `--json` or `--vex` scan found more project
-/// directories than the one it can report on.
+/// Warning code: a scan found project directories below `--cwd` that it
+/// did not scan. A `--json` or `--vex` scan reports on one directory, and
+/// an agent-mode scan patches the packages installed for one.
 pub(super) const PROJECTS_NOT_SCANNED: &str = "projects_not_scanned";
 
 /// The [`PROJECTS_NOT_SCANNED`] detail: which directories, and the run
@@ -351,26 +352,37 @@ pub(super) const PROJECTS_NOT_SCANNED: &str = "projects_not_scanned";
 pub(super) fn unscanned_projects_detail(dirs: &[String], json: bool) -> String {
     let flag = if json { "--json" } else { "--vex" };
     format!(
-        "{} below this one {} not scanned ({}): {flag} takes one project directory. \
+        "{}: {flag} takes one project directory. \
          Run one scan per directory, e.g. `socket-patch scan {}`",
-        plural(dirs.len(), "project directory", "project directories"),
-        if dirs.len() == 1 { "was" } else { "were" },
-        dirs.join(", "),
+        projects_left(dirs.len(), &dirs.join(", ")),
         ui::shell_word(&dirs[0]),
     )
 }
 
 /// The [`PROJECTS_NOT_SCANNED`] detail of an agent-mode scan: the project
 /// directories below `--cwd` (`dirs`) whose installed packages it did not
-/// read, and `command`, the run that covers the first.
+/// read, and `command`, the run that covers the first. A long list is cut
+/// short: a checkout can hold hundreds of projects.
 pub(super) fn unscanned_agent_projects_detail(dirs: &[String], command: &str) -> String {
+    let names: Vec<&str> = dirs.iter().map(String::as_str).collect();
     format!(
-        "{} below this one {} not scanned ({}): an agent-mode scan patches the packages \
-         installed for the one project directory it runs in. Run one scan per directory, \
-         e.g. `{command}`",
-        plural(dirs.len(), "project directory", "project directories"),
-        if dirs.len() == 1 { "was" } else { "were" },
-        dirs.join(", "),
+        "{}: an agent-mode scan patches the packages installed for the one project \
+         directory it runs in. Run one scan per directory, e.g. `{command}`",
+        projects_left(
+            dirs.len(),
+            &crate::commands::projects_below::spelled_out(&names)
+        ),
+    )
+}
+
+/// `2 project directories below this one were not scanned (a, b)`: how a
+/// [`PROJECTS_NOT_SCANNED`] detail opens, for `count` directories listed
+/// as `names`.
+fn projects_left(count: usize, names: &str) -> String {
+    format!(
+        "{} below this one {} not scanned ({names})",
+        plural(count, "project directory", "project directories"),
+        if count == 1 { "was" } else { "were" },
     )
 }
 
@@ -996,6 +1008,15 @@ mod tests {
         assert!(
             two.starts_with("2 project directories below this one were not scanned (api, web): "),
             "{two}"
+        );
+        let many: Vec<String> = (0..12).map(|n| format!("p{n:02}")).collect();
+        let cut = unscanned_agent_projects_detail(&many, "socket-patch scan --cwd p00");
+        assert!(
+            cut.starts_with(
+                "12 project directories below this one were not scanned (p00, p01, p02, p03, \
+                 p04, p05, p06, p07, p08, p09, and 2 more): "
+            ),
+            "{cut}"
         );
     }
 

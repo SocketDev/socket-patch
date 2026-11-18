@@ -350,54 +350,108 @@ pub(crate) fn project_command(dir: &Path, common: &GlobalArgs, command: &str) ->
     )
 }
 
+/// What [`not_crawled`] found.
+#[derive(Default)]
+pub(crate) struct NotCrawled {
+    /// The project directories a crawl from `--cwd` does not cover, in
+    /// [`discovered`]'s (sorted) order.
+    pub dirs: Vec<PathBuf>,
+    /// The walk gave up before it had seen the whole tree: `dirs` may be
+    /// short.
+    pub truncated: bool,
+}
+
+/// How many project directories [`not_crawled`] resolves install
+/// directories for at a time: a gem home lookup can run `gem env`.
+const PROBES_AT_ONCE: usize = 8;
+
 /// The project directories below `--cwd` whose installed packages a crawl
-/// from `--cwd` does not read, in [`discovered`]'s order: the ones an
-/// agent-mode scan, which patches the copies its crawl finds, leaves
-/// unscanned. A directory is one of them when a crawl from it reads an
-/// install directory ([`project_install_roots`]) the crawl from `--cwd`
-/// does not, so a project with nothing installed, or one that shares a
-/// user-wide cache with `--cwd`, is not.
+/// from `--cwd` does not read: the ones an agent-mode scan, which patches
+/// the copies its crawl finds, leaves unscanned. A directory is one of
+/// them when it has an install directory of its own
+/// ([`own_install_roots`]) that the crawl from `--cwd` does not read
+/// ([`crawled_install_roots`]). So a project with nothing installed in a
+/// directory of its own is not, nor one whose `node_modules` the walk
+/// from `--cwd` reaches, nor one whose gem home `--cwd` reads too.
 ///
 /// Like [`patched`] it reaches only the directories [`discovered`]
 /// returns, and none outside [`searches_below`].
+///
+/// [`own_install_roots`]: crate::ecosystem_dispatch::own_install_roots
+/// [`crawled_install_roots`]: crate::ecosystem_dispatch::crawled_install_roots
 pub(crate) async fn not_crawled(
     common: &GlobalArgs,
     policy: &SelectionPolicy,
     repo_root: &Path,
-) -> Vec<PathBuf> {
-    use crate::ecosystem_dispatch::project_install_roots;
+) -> NotCrawled {
+    use crate::ecosystem_dispatch::{crawled_install_roots, own_install_roots};
+    use futures_util::StreamExt as _;
+    use socket_patch_core::crawlers::walk_pool::fd_limit_is_tight;
+    use std::collections::HashSet;
+
+    let mut out = NotCrawled::default();
     if !searches_below(common) {
-        return Vec::new();
+        return out;
     }
     let found = discovered(common, policy, repo_root).await;
-    let below: Vec<&PathBuf> = found
+    out.truncated = found.truncated;
+    let below: Vec<PathBuf> = found
         .dirs
-        .iter()
+        .into_iter()
         .filter(|(_, explicit)| !explicit)
         .map(|(dir, _)| dir)
         .collect();
     if below.is_empty() {
-        return Vec::new();
+        return out;
     }
-    let real = |path: PathBuf| std::fs::canonicalize(&path).unwrap_or(path);
     let only = common.ecosystems.as_deref();
     let options = common.crawler_options();
-    let here: std::collections::HashSet<PathBuf> = project_install_roots(&options, only)
-        .await
-        .into_iter()
-        .map(real)
+    // Each directory's own install directories, a few directories at a
+    // time (one under a tight descriptor limit, like the crawl itself).
+    let at_once = if fd_limit_is_tight() {
+        1
+    } else {
+        PROBES_AT_ONCE
+    };
+    let own: Vec<(PathBuf, Vec<_>)> = futures_util::stream::iter(below)
+        .map(|dir| {
+            let mut options = options.clone();
+            options.cwd = dir.clone();
+            async move {
+                let roots = own_install_roots(&options, only).await;
+                (dir, roots)
+            }
+        })
+        .buffered(at_once)
+        .collect()
+        .await;
+    // What the crawl from `--cwd` read, for the ecosystems in question.
+    let ecosystems: HashSet<_> = own
+        .iter()
+        .flat_map(|(_, roots)| roots.iter().map(|(ecosystem, _)| *ecosystem))
         .collect();
-    let mut left = Vec::new();
-    for dir in below {
-        let mut options = options.clone();
-        options.cwd = dir.clone();
-        let roots = project_install_roots(&options, only).await;
-        if roots.into_iter().any(|root| !here.contains(&real(root))) {
-            left.push(dir.clone());
+    if ecosystems.is_empty() {
+        return out;
+    }
+    let real = |path: &Path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let here: HashSet<PathBuf> = crawled_install_roots(&options, &ecosystems)
+        .await
+        .iter()
+        .map(|root| real(root))
+        .collect();
+    for (dir, roots) in own {
+        if roots.iter().any(|(_, root)| !here.contains(&real(root))) {
+            out.dirs.push(dir);
         }
     }
-    left
+    out
 }
+
+/// The [`PROJECTS_BELOW_NOT_SEARCHED`] detail of an agent-mode scan whose
+/// search for the project directories it left gave up.
+pub(crate) const NOT_CRAWLED_TRUNCATED: &str =
+    "this directory tree is too large to search for project directories; some that this \
+     scan did not reach may not be named";
 
 /// What [`patched`] found.
 #[derive(Default)]
@@ -526,7 +580,7 @@ pub(crate) struct Advice {
 const SPELLED_OUT: usize = 10;
 
 /// `a, b, c`, or the first [`SPELLED_OUT`] and `and N more`.
-fn spelled_out(names: &[&str]) -> String {
+pub(crate) fn spelled_out(names: &[&str]) -> String {
     match names.len().checked_sub(SPELLED_OUT) {
         Some(more @ 1..) => format!("{}, and {more} more", names[..SPELLED_OUT].join(", ")),
         _ => names.join(", "),

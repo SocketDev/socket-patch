@@ -36,9 +36,10 @@ directory: each directory with its own lockfile is scanned as its own project, u
 and `socket.yml` path filters apply. `--json` and `--vex` still report on one directory:
 they scan the current one and list the others in a `projects_not_scanned` warning.
 An agent-mode scan patches the packages installed for the project in the current
-directory only. When project directories below it hold installed packages it did not
-reach, it lists them in the same warning with the command to run for each
-(`socket-patch scan --mode agent --cwd <dir>`).
+directory only. When project directories below it have installed packages it did not
+reach (their own `vendor/bundle` or `.venv`, for example), it lists them in the same
+warning with the command to run for one of them
+(`socket-patch scan --mode agent --cwd <dir>`). Run it once per directory.
 
 What that scan patched can be seen and undone from the same directory. `list` shows
 the patches of the current directory (headed `== . ==`, as in the scan) and of each
