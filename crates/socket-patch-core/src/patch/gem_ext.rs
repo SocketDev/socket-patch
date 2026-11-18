@@ -5507,6 +5507,71 @@ mod tests {
         );
     }
 
+    /// #2117: for a failed `extconf.rb` the last lines of the output are
+    /// mkmf's list of configuration options and a pointer to an `mkmf.log`
+    /// that is removed with the failed build; the cause comes before both.
+    #[test]
+    fn stderr_tail_keeps_the_cause_of_a_failed_extconf() {
+        let mut text = String::from(
+            "ERROR: Failed to build gem native extension.\n\n\
+             checking for libpq-fe.h... no\n\
+             Can't find the 'libpq-fe.h header\n\
+             \x20 sudo apt install libpq-dev\n\
+             *** extconf.rb failed ***\n\
+             Could not create Makefile due to some reason, probably lack of necessary\n\
+             libraries and/or headers.  Check the mkmf.log file for more details.  You may\n\
+             need configuration options.\n\n\
+             Provided configuration options:\n",
+        );
+        for i in 0..40 {
+            text.push_str(&format!("\t--with-opt-{i}\n"));
+        }
+        text.push_str(
+            "\nTo see why this extension failed to compile, please check the mkmf.log which \
+             can be found here:\n\n  /home/.socket-patch-build/pg-1.6.2/home/extensions/x/3.3.0/\
+             pg-1.6.2/mkmf.log\n\nextconf failed, exit code 1\n\n\
+             Gem files will remain installed in /x for inspection.\n\
+             Results logged to /x/gem_make.out\n",
+        );
+        let tail = stderr_tail(&text);
+        assert_eq!(
+            tail,
+            "ERROR: Failed to build gem native extension.\n\
+             checking for libpq-fe.h... no\n\
+             Can't find the 'libpq-fe.h header\n\
+             \x20 sudo apt install libpq-dev\n\
+             *** extconf.rb failed ***\n\
+             Could not create Makefile due to some reason, probably lack of necessary\n\
+             libraries and/or headers.  Check the mkmf.log file for more details.  You may\n\
+             need configuration options.\n\
+             extconf failed, exit code 1"
+        );
+    }
+
+    /// Only mkmf's own block is dropped: tab-indented lines elsewhere (a
+    /// Ruby backtrace, `make` output) stay, and so does a line after the
+    /// pointer that is not the log's path.
+    #[test]
+    fn stderr_tail_keeps_indented_lines_outside_the_option_list() {
+        let text = "extconf.rb:5:in `rename': No such file (Errno::ENOENT)\n\
+                    \tfrom extconf.rb:5:in `<main>'\n\
+                    Provided configuration options:\n\
+                    \t--with-opt-dir\n\
+                    make: *** [Makefile:245: pg.o] Error 1\n\
+                    \tcompilation terminated.\n\
+                    To see why this extension failed to compile, please check the mkmf.log \
+                    which can be found here:\n\
+                    make failed, exit code 2\n";
+        assert_eq!(
+            stderr_tail(text),
+            "extconf.rb:5:in `rename': No such file (Errno::ENOENT)\n\
+             \tfrom extconf.rb:5:in `<main>'\n\
+             make: *** [Makefile:245: pg.o] Error 1\n\
+             \tcompilation terminated.\n\
+             make failed, exit code 2"
+        );
+    }
+
     #[test]
     fn probe_output_parses() {
         assert_eq!(
