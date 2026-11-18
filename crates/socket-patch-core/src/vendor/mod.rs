@@ -71,6 +71,7 @@ pub(crate) mod go_sum_backup;
 pub mod go_sum_edit;
 pub mod go_workspace;
 pub mod golang;
+pub(crate) mod jsonc;
 pub mod jvm;
 pub(crate) mod ledger_snapshots;
 pub mod lock_inventory;

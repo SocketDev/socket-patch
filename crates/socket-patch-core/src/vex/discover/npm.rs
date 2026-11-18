@@ -1007,6 +1007,22 @@ async fn extract_pnpm_lock(
     let Some(text) = ctx.read_text(file, out).await else {
         return;
     };
+    // A Rush lock is installed from `common/temp`, so it spells this
+    // project's vendored artifacts relative to that directory: read them as
+    // the root-anchored references they are. A path it spells from the
+    // root names a file under that temp directory instead.
+    if let Some(line) = crate::vendor::pnpm_lock::rush::misplaced_vendored_path(file, &text) {
+        out.diag(
+            DIAG_REF_INVALID,
+            file,
+            format!(
+                "{file}: `{line}` is a root-relative vendored path in a Rush lock, which pnpm \
+                 resolves against Rush's temp directory, not the committed artifact; it is \
+                 ignored"
+            ),
+        );
+    }
+    let text = crate::vendor::pnpm_lock::rush::root_relative_lock_text(file, text);
     let lock = PnpmLock::parse(&text);
     if !lock.is_pnpm_lock() {
         out.diag(
@@ -1583,12 +1599,15 @@ fn pnpm_vendored_ref(
     };
     // pnpm resolves a lock's `file:` tarball against the lock's own
     // directory, so only the root lock's root-relative path is the
-    // committed artifact. A member or Rush lock's names a file under its
-    // own directory, which nothing here hashes (no vendor backend writes
-    // one there).
-    if Path::new(tree.file)
-        .parent()
-        .is_some_and(|dir| dir != Path::new(""))
+    // committed artifact. A member lock's names a file under its own
+    // directory, which nothing here hashes (no vendor backend writes one
+    // there). A Rush lock is installed from Rush's temp directory, and
+    // [`extract_pnpm_lock`] has already rebased its paths from there to the
+    // root, so a root-relative path in one is the committed artifact.
+    if !crate::vendor::pnpm_lock::rush::is_lock_rel(tree.file)
+        && Path::new(tree.file)
+            .parent()
+            .is_some_and(|dir| dir != Path::new(""))
     {
         return invalid(
             out,
@@ -4381,9 +4400,13 @@ mod tests {
     /// directory (real pnpm 10.34.1 and 11.27.0, `sharedWorkspaceLockfile:
     /// false`: `packages/a/pnpm-lock.yaml`'s `file:vendor/x.tgz` installs
     /// `packages/a/vendor/x.tgz`). A root-relative `.socket/vendor/…` path
-    /// in a member or Rush lock therefore names a file under that lock's
+    /// in a member lock therefore names a file under that lock's
     /// directory, never the committed artifact `vex` hashes, and no vendor
-    /// backend writes one there: it is diagnosed, not a ref.
+    /// backend writes one there: it is diagnosed, not a ref. A Rush lock is
+    /// installed from `common/temp`, so there the same spelling names a
+    /// file under that directory, and the committed artifact is spelled
+    /// `file:../../.socket/vendor/…` (what `vendor::pnpm_lock::rush`
+    /// writes).
     #[tokio::test]
     async fn pnpm_vendored_path_in_a_member_or_rush_lock_is_not_the_root_artifact() {
         let rel = format!(".socket/vendor/npm/{UUID_B}/left-pad-1.3.0.tgz");
@@ -4393,7 +4416,7 @@ mod tests {
              left-pad@file:{rel}:\n    resolution: {{integrity: {SRI}, tarball: file:{rel}}}\n    \
              version: 1.3.0\n"
         );
-        let refused = |out: &Discovery, file: &str| {
+        let refused = |out: &Discovery, file: &str, why: &str| {
             assert_refs(out, &[]);
             let invalid: Vec<&Diag> = out
                 .diagnostics
@@ -4402,7 +4425,7 @@ mod tests {
                 .collect();
             assert!(
                 matches!(invalid.as_slice(), [d] if d.file == Path::new(file)
-                    && d.detail.contains("the lock's own directory")),
+                    && d.detail.contains(why)),
                 "{file}: {:#?}",
                 out.diagnostics
             );
@@ -4423,12 +4446,41 @@ mod tests {
         );
         p.write("packages/a/package.json", "{}");
         p.write("packages/a/pnpm-lock.yaml", &lock);
-        refused(&run(&p).await, "packages/a/pnpm-lock.yaml");
+        refused(
+            &run(&p).await,
+            "packages/a/pnpm-lock.yaml",
+            "the lock's own directory",
+        );
 
         let p = Project::new();
         p.write("rush.json", "{}");
         p.write("common/config/rush/pnpm-lock.yaml", &lock);
-        refused(&run(&p).await, "common/config/rush/pnpm-lock.yaml");
+        refused(
+            &run(&p).await,
+            "common/config/rush/pnpm-lock.yaml",
+            "Rush's temp directory",
+        );
+
+        // The spelling relative to Rush's temp directory is the artifact.
+        let p = Project::new();
+        p.write("rush.json", "{}");
+        p.write(
+            "common/config/rush/pnpm-lock.yaml",
+            lock.replace(&format!("file:{rel}"), &format!("file:../../{rel}"))
+                .replace("\n  .:\n", "\n  ../../apps/app:\n"),
+        );
+        assert_refs(
+            &run(&p).await,
+            &[("pkg:npm/left-pad@1.3.0", UUID_B, WiringMode::Vendored)],
+        );
+        // One level too many names another checkout's store: not ours.
+        let p = Project::new();
+        p.write("rush.json", "{}");
+        p.write(
+            "common/config/rush/pnpm-lock.yaml",
+            lock.replace(&format!("file:{rel}"), &format!("file:../../../{rel}")),
+        );
+        assert_refs(&run(&p).await, &[]);
     }
 
     /// With pnpm's lock off, a vendored entry of the unread lock installs

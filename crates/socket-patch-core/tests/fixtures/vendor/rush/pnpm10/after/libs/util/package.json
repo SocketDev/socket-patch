@@ -1,0 +1,8 @@
+{
+  "version": "1.0.0",
+  "private": true,
+  "name": "util",
+  "dependencies": {
+    "minimist": "file:../../.socket/vendor/npm/8cccd65b-5a7c-4ec5-8068-ebc66c727d8c/minimist-0.0.8.tgz"
+  }
+}
