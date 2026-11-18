@@ -1987,7 +1987,7 @@ fn a_failed_extconf_shows_its_cause_once() {
         );
         if precompiled {
             assert!(
-                stderr.contains("gem install sp_native --platform ruby")
+                stderr.contains("`gem install sp_native -v 1.0.0 --platform ruby`")
                     && stderr.contains("the libraries the gem builds against"),
                 "{case}: the remedy says what a precompiled gem's rebuild needs: {stderr}"
             );
@@ -2028,6 +2028,42 @@ fn a_failed_extconf_shows_its_cause_once() {
         assert!(!stdout.contains("--redownload"), "{case}: {stdout}");
         assert_tree(&proj.join("vendor"), &tree_before, &case);
     }
+}
+
+/// A failed build puts back what this run wrote, and no more: a file an
+/// earlier run left patched stays patched, so the copy is still advised
+/// that `bundle install --redownload` reverts it.
+#[cfg(unix)]
+#[test]
+fn a_failed_build_keeps_the_advisory_of_a_file_patched_before() {
+    let (_tmp, proj, gem_dir) = fake_native_gem(true);
+    let (before, after) = (c_source(1), c_source(2));
+    let lib_after = format!("{LIB_RB}# patched\n");
+    write_record(
+        &proj.join(".socket"),
+        PURL,
+        &[
+            (C_KEY, Some(&before), &after),
+            ("lib/sp_native.rb", Some(LIB_RB), &lib_after),
+        ],
+    );
+    std::fs::write(gem_dir.join("lib/sp_native.rb"), &lib_after).unwrap();
+    let ruby = FakeRuby::new();
+    ruby.fail_builds();
+    let tree_before = walk_files(&proj.join("vendor"));
+
+    let (code, stdout, stderr) = ruby.run(&proj, &["apply", "--offline"], &[]);
+    assert_eq!(code, 1, "{stdout}\n{stderr}");
+    assert!(
+        stderr.contains("native_extension_build_failed:"),
+        "{stderr}"
+    );
+    assert_eq!(
+        stderr.matches("bundle install --redownload").count(),
+        1,
+        "{stderr}"
+    );
+    assert_tree(&proj.join("vendor"), &tree_before, "after the failed build");
 }
 
 /// Whatever keeps a gem RubyGems built from being rebuilt from its source

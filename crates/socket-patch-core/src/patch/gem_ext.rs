@@ -4504,8 +4504,16 @@ impl Job<'_> {
         result.files_patched.clear();
         result.applied_via.clear();
         // What the written sources were advised about (`bundle install
-        // --redownload` reverts them) is not true of a copy put back.
-        result.sidecar = None;
+        // --redownload` reverts them) is not true of a copy put back. It
+        // still is of one an earlier run left a patched file in, which
+        // this run did not write and so did not put back.
+        let patched_before = result
+            .files_verified
+            .iter()
+            .any(|v| v.status == crate::patch::apply::VerifyStatus::AlreadyPatched);
+        if !patched_before {
+            result.sidecar = None;
+        }
         result.error = Some(format!("{BUILD_FAILED_CODE}: {detail}"));
         GemApplied {
             result,
@@ -4891,22 +4899,35 @@ pub async fn apply_gem_package_patch(
         failure if !precompiled => {
             rebuild_in_place(&job, &probe, &absent, &failure, remedy.as_deref()).await
         }
-        StageFailure::Build(diagnostic) => refusal(
-            package_key,
-            pkg_path,
-            BUILD_FAILED_CODE,
-            format!(
-                "the native extension did not build from the patched sources ({inputs}); \
-                 nothing of the installed gem was changed. {} was installed precompiled, so \
-                 nothing of it was built on this machine before: the rebuild needs what `gem \
-                 install {} --platform ruby` needs, which is a compiler toolchain, the Ruby \
-                 headers and the libraries the gem builds against. The build output below \
-                 says what failed; install what it names as missing and apply again.\
-                 \n{diagnostic}",
-                copy.full_name,
-                gem_name_of(&copy.full_name)
-            ),
-        ),
+        StageFailure::Build(diagnostic) => {
+            // The source gem the stage was built from, by name and
+            // version: what the same build is run with outside this tool.
+            let install = match &source {
+                Some(source) => format!(
+                    "gem install {} -v {} --platform ruby",
+                    source.name, source.version
+                ),
+                None => format!(
+                    "gem install {} --platform ruby",
+                    gem_name_of(&copy.full_name)
+                ),
+            };
+            refusal(
+                package_key,
+                pkg_path,
+                BUILD_FAILED_CODE,
+                format!(
+                    "the native extension did not build from the patched sources ({inputs}); \
+                     nothing of the installed gem was changed. {} was installed precompiled, \
+                     so nothing of it was built on this machine before: the rebuild needs \
+                     what `{install}` needs, which is a compiler toolchain, the Ruby headers \
+                     and the libraries the gem builds against. The lines below say what \
+                     failed; when they name something as missing, install it and apply \
+                     again.\n{diagnostic}",
+                    copy.full_name
+                ),
+            )
+        }
         failure => needs_source_gem(source.as_ref(), failure.describe(), remedy.is_some()),
     }
 }
@@ -4983,9 +5004,9 @@ async fn rebuild_in_place(
             };
             let detail = format!(
                 "the native extension did not build from the patched sources ({}); the \
-                 sources and the previous build were put back. The build output below says \
-                 what failed: when it is a missing compiler, the Ruby headers or a library \
-                 the gem builds against, install that and apply again; otherwise use \
+                 sources and the previous build were put back. The lines below say what \
+                 failed: when it is a missing compiler, the Ruby headers or a library the \
+                 gem builds against, install that and apply again; otherwise use \
                  `socket-patch scan --mode hosted`.{both}\n{diagnostic}",
                 job.inputs
             );

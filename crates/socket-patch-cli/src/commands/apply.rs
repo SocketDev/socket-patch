@@ -4149,6 +4149,43 @@ mod tests {
         assert_eq!(expected_hash_label(&h), h);
     }
 
+    /// A gem refusal reaches the run as a failed result (`<code>:
+    /// <detail>`) and as a coded warning with the same detail: only that
+    /// warning restates a failure the human path already printed.
+    #[test]
+    fn only_the_coded_copy_of_a_failed_result_restates_it() {
+        let warning = |code: &str, detail: &str| RunWarning {
+            code: code.to_string(),
+            detail: detail.to_string(),
+        };
+        let mut failed = sample_applied(VerifyStatus::Ready);
+        failed.success = false;
+        failed.error =
+            Some("native_extension_build_failed: it did not build\nmake: Error 1".into());
+        let mut advised = sample_applied(VerifyStatus::Ready);
+        advised.error = Some("native_extension_rebuilt: rebuilt".into());
+        let results = [failed, advised, sample_applied(VerifyStatus::Ready)];
+
+        assert!(restates_a_failure(
+            &warning(
+                "native_extension_build_failed",
+                "it did not build\nmake: Error 1"
+            ),
+            &results
+        ));
+        // Another detail, another code, or a result that succeeded.
+        for other in [
+            warning("native_extension_build_failed", "it did not build"),
+            warning(
+                "native_extensions_unsupported",
+                "it did not build\nmake: Error 1",
+            ),
+            warning("native_extension_rebuilt", "rebuilt"),
+        ] {
+            assert!(!restates_a_failure(&other, &results), "{}", other.detail);
+        }
+    }
+
     /// Build a successful `ApplyResult` with one patched file and one
     /// verified file. Used as the base for action-routing tests.
     fn sample_applied(status: VerifyStatus) -> ApplyResult {
