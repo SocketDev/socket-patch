@@ -100,7 +100,7 @@ use crate::constants::npm_family::{BUN_LOCK, BUN_LOCKB};
 use crate::patch::redirect::{hosted_url_version, NpmUserPatches};
 use crate::utils::digest::is_sri_pin;
 use crate::vendor::bun_lock_text::{
-    decode_json_string, is_bundled_entry, split_name_spec, user_tarball_version,
+    declares_bundled, decode_json_string, is_bundled_entry, split_name_spec, user_tarball_version,
 };
 use crate::vendor::bun_lockb::BunLockb;
 use crate::vendor::lock_inventory::bun::bun_text_entries;
@@ -165,7 +165,7 @@ async fn extract_text(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
                 && !target.starts_with("workspace:"),
         };
         if is_bundled_entry(entry) {
-            bundled.record(ctx, BUN_LOCK, classified, out);
+            bundled.record(ctx, BUN_LOCK, classified, declares_bundled(entry), out);
         } else {
             let user_tarball = user_tarball_version(name, target).is_some();
             unwired.record(
@@ -241,13 +241,32 @@ impl Bundled {
     /// Record the bundled `entry`: it is classified on its own, so a ref it
     /// would make is withdrawn (and diagnosed) rather than deduped into a
     /// regular entry's identical ref, and its other findings are kept.
-    fn record(&mut self, ctx: &DiscoverCtx<'_>, file: &str, entry: Entry<'_>, out: &mut Discovery) {
+    ///
+    /// `flagged` is whether Bun itself marks the entry bundled. One that
+    /// is only inferred to sit inside a bundled copy (reached through
+    /// bundled copies alone) looked like any other entry to releases up to
+    /// 5.1, which rewired it: a ref found there is kept for
+    /// [`Bundled::contest`] to shadow, so it is never attested but `list`,
+    /// `rollback`, `remove` and the vendored takeover can still undo it.
+    fn record(
+        &mut self,
+        ctx: &DiscoverCtx<'_>,
+        file: &str,
+        entry: Entry<'_>,
+        flagged: bool,
+        out: &mut Discovery,
+    ) {
         let (label, name, target) = (entry.label.to_string(), entry.name, entry.target);
         let mut alone = Discovery::default();
         classify(ctx, file, entry, &mut alone);
         out.diagnostics.extend(alone.diagnostics);
         let mut purls: Vec<String> = alone.elsewhere.into_iter().map(|e| e.purl).collect();
         for r in alone.refs {
+            if !flagged {
+                purls.push(r.purl.clone());
+                out.push(r);
+                continue;
+            }
             out.diag(
                 DIAG_REF_UNATTRIBUTABLE,
                 file,
@@ -371,7 +390,7 @@ async fn extract_binary(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
         // still the pin the hosted writer wired for that regular install
         // (#1243), so it is shadowed rather than dropped.
         if p.bundled_only {
-            bundled.record(ctx, BUN_LOCKB, classified, out);
+            bundled.record(ctx, BUN_LOCKB, classified, !p.bundled_only_inferred, out);
         } else if p.bundled {
             bundled.share(ctx, BUN_LOCKB, classified, out);
         } else {
@@ -740,6 +759,7 @@ mod tests {
             "lock-v2",
             "lock-v2-crlf",
             "lock-v2-workspace-nested",
+            "lock-v3-nested-overrides",
             "nested-entry",
             "re-redirect-stale-url",
         ] {
@@ -779,6 +799,7 @@ mod tests {
             "lock-v2",
             "lock-v2-crlf",
             "lock-v2-workspace-nested",
+            "lock-v3-nested-overrides",
             "missing-sha512",
             "nested-entry",
             "scoped-package",

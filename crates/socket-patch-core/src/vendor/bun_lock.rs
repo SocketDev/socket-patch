@@ -41,10 +41,10 @@ use crate::patch::apply::PatchSources;
 use crate::utils::fs::{atomic_write_bytes_preserving_mode, read_regular_to_string};
 use crate::utils::socket_dir::remove_tree_and_prune;
 use crate::vendor::bun_lock_text::{
-    decode_json_string, default_trust_detail, has_workspace_packages, is_bundled_entry,
-    is_user_tarball_entry, live_resolution_keys, lock_version, loses_default_trust,
-    packages_bounds, parse_entry_line, patched_dependency_detail, patched_dependency_key,
-    patched_dependency_keys, split_name_spec, BunEntry,
+    decode_json_string, default_trust_detail, default_trust_skip_detail, has_workspace_packages,
+    is_bundled_entry, is_user_tarball_entry, live_resolution_keys, lock_version,
+    loses_default_trust, packages_bounds, parse_entry_line, patched_dependency_detail,
+    patched_dependency_key, patched_dependency_keys, split_name_spec, BunEntry,
 };
 
 use super::common::refused;
@@ -293,6 +293,80 @@ pub async fn wired_instances_all_ours(
         }
     }
     Ok(matched > 0)
+}
+
+/// Why the Bun lock does not install `entry`'s committed tarball although it
+/// names it: a tuple (record, in `bun.lockb`) resolving to the artifact
+/// carries a sha512 that is not the artifact's own. Bun 1.3.10 and later
+/// check that digest, so a cold install then fails `Integrity check failed`,
+/// and Bun 1.4 keys its tarball cache by it, so a cache that already holds a
+/// tarball with the pinned digest installs THAT one without opening the
+/// path. Either way the lock does not deliver the vendored bytes, so
+/// `vendor --check` reports it and `vex` does not attest the patch. `None`
+/// when every pin matches, when the lock carries none for the artifact (the
+/// digest-less tuple Bun 1.1.39 to 1.3.9 re-save), or when the lock or the
+/// artifact cannot be read (their own checks say so).
+pub async fn lock_pin_mismatch(entry: &VendorEntry, project_root: &Path) -> Option<String> {
+    let artifact = entry.artifact.path.trim_start_matches("./").to_string();
+    if !(artifact.ends_with(".tgz") || artifact.ends_with(".tar.gz")) {
+        return None;
+    }
+    // The canonical path, and the same path under a workspace member (the
+    // copies a binary workspace lock resolves through).
+    let resolves_to_artifact = |target: &str| {
+        let target = target.trim_start_matches("./").replace('\\', "/");
+        target == artifact || target.ends_with(&format!("/{artifact}"))
+    };
+    let binary = binary_lock_drives(project_root);
+    let pins: Vec<String> = if binary {
+        let bytes = crate::utils::fs::read_regular_to_bytes(&project_root.join("bun.lockb"))
+            .await
+            .ok()?;
+        super::bun_lockb::BunLockb::parse_packages(&bytes)
+            .ok()?
+            .into_iter()
+            .filter(|p| !p.bundled_only && resolves_to_artifact(&p.resolution))
+            .filter_map(|p| p.integrity)
+            .collect()
+    } else {
+        let text = read_regular_to_string(&project_root.join(BUN_LOCK))
+            .await
+            .ok()?;
+        let lock = BunTextLock::parse_shared(&text).ok()?;
+        lock.entries
+            .iter()
+            .filter(|e| !is_bundled_entry(e) && matches!(e.elems.len(), 2 | 3))
+            .filter(|e| {
+                e.elems
+                    .first()
+                    .and_then(|raw| decode_json_string(raw))
+                    .and_then(|spec| {
+                        crate::vendor::bun_lock_text::split_name_spec(&spec)
+                            .map(|(_, target)| resolves_to_artifact(target))
+                    })
+                    .unwrap_or(false)
+            })
+            .filter_map(|e| e.elems.get(2).and_then(|raw| decode_json_string(raw)))
+            .collect()
+    };
+    if pins.is_empty() {
+        return None;
+    }
+    let bytes = crate::utils::fs::read_regular_to_bytes(&project_root.join(&artifact))
+        .await
+        .ok()?;
+    // Vendoring pins sha512. A pin under any other algorithm is not one it
+    // wrote, and cannot be the digest of these bytes that Bun checks.
+    let actual = crate::utils::digest::sha512_sri_of(&bytes);
+    let lock = if binary { "bun.lockb" } else { BUN_LOCK };
+    pins.iter().any(|pin| *pin != actual).then(|| {
+        format!(
+            "{lock} pins {artifact} to a digest that is not that file's sha512, so `bun \
+             install` does not install the vendored tarball (it fails the integrity check, \
+             or installs a cached tarball with the pinned digest); re-run `socket-patch scan \
+             --mode vendored` to rewrite the pin"
+        )
+    })
 }
 
 /// Active vendor resolutions in a binary lock. Old string-pool contents are
@@ -667,6 +741,28 @@ pub(super) fn default_trust_warning(
     })
 }
 
+/// Refuse to move a registry copy of a default-trusted package onto a local
+/// tarball when the project relies on Bun's default trust to run its
+/// install scripts (#371): Bun 1.3.5 and later would skip them on every
+/// install and exit 0, leaving a native addon without its binding. A
+/// working install is not traded for a patch. The caller asks only when
+/// the run would write a new local tuple: a package an earlier run already
+/// vendored keeps its wiring, with [`default_trust_warning`].
+pub(super) fn refuse_default_trusted(
+    manifest: Option<&str>,
+    lock: Option<&str>,
+    name: &str,
+    version: &str,
+) -> Result<(), Box<VendorOutcome>> {
+    if !loses_default_trust(manifest, lock, name) {
+        return Ok(());
+    }
+    Err(Box::new(refused(
+        "vendor_bun_default_trust_refused",
+        default_trust_skip_detail(name, version, "a vendored local tarball"),
+    )))
+}
+
 /// Refuse to vendor a package the project patches itself with `bun patch`
 /// (#367): Bun applies that patch only to the resolution it is keyed on
 /// (the registry `name@version`, or a hosted or older vendored tarball,
@@ -820,6 +916,24 @@ pub(super) fn preflight_package(
         )
     });
     if writes_new_local_tuple {
+        // Bun trusts by name, so one vendored copy has already taken the
+        // default trust from every copy: a registry copy beside it (a later
+        // re-resolve adds one) is then vendored like the rest, as hosted
+        // mode pins a new copy beside an existing pin.
+        let already_vendored = project.entries.iter().any(|e| {
+            matches!(
+                classify_rewritable(e, &target_spec, name, &target_leaf),
+                Some(TupleShape::Ours { .. })
+            )
+        });
+        if !already_vendored {
+            refuse_default_trusted(
+                project.manifest.as_deref(),
+                Some(&project.lock_text),
+                name,
+                version,
+            )?;
+        }
         if let Err((code, detail)) =
             check_workspace_compatibility(&project.lock_text, &project.entries)
         {
@@ -1394,18 +1508,17 @@ enum TupleShape {
 
 /// [`classify`] for the instances vendoring may rewrite: a bundled entry
 /// ([`is_bundled_entry`]) is unpacked from its parent's tarball and never
-/// read, so it is no rewrite target whatever its spec says (#469). The
-/// bundled check JSON-parses the meta, so it runs only on a match (#578).
+/// read, so it is no rewrite target whatever its spec says (#469).
 fn classify_rewritable(
     entry: &BunEntry,
     target_spec: &str,
     name: &str,
     target_leaf: &str,
 ) -> Option<TupleShape> {
-    // The cheap spec match runs first; the bundled parse only for a match
-    // (#580).
-    let shape = classify(entry, target_spec, name, target_leaf)?;
-    (!is_bundled_entry(entry)).then_some(shape)
+    if is_bundled_entry(entry) {
+        return None;
+    }
+    classify(entry, target_spec, name, target_leaf)
 }
 
 /// Keys of the bundled entries that resolve the target `name@version`.
@@ -1424,8 +1537,7 @@ fn bundled_matches(
 
 /// Keys of the non-bundled entries that install `name@version` from a user
 /// URL / `file:` tarball (#497): bun installs those from their own spec, so
-/// no vendored tuple reaches them. The spec check runs first: the bundled
-/// check JSON-parses the meta, so it may run only on a match (#578).
+/// no vendored tuple reaches them.
 fn user_tarball_matches(entries: &[BunEntry], name: &str, version: &str) -> Vec<String> {
     entries
         .iter()
@@ -2785,11 +2897,10 @@ mod tests {
         assert!(!fx.root().join(".socket/vendor").exists());
     }
 
-    /// Vendor `purl` from `fx` and return the run's
-    /// `vendor_bun_default_trust_lost` details.
-    async fn trust_lost_details(fx: &Fixture, purl: &str) -> Vec<String> {
+    /// Vendor `purl` from `fx`.
+    async fn vendor_purl(fx: &Fixture, purl: &str) -> VendorOutcome {
         let blobs = fx.root().join(".socket/blobs");
-        let outcome = crate::vendor::test_support::vendor_bun(
+        crate::vendor::test_support::vendor_bun(
             purl,
             &fx.installed,
             fx.root(),
@@ -2800,8 +2911,13 @@ mod tests {
             false,
             None,
         )
-        .await;
-        let (result, _, warnings) = expect_done(outcome);
+        .await
+    }
+
+    /// Vendor `purl` from `fx` and return the run's
+    /// `vendor_bun_default_trust_lost` details.
+    async fn trust_lost_details(fx: &Fixture, purl: &str) -> Vec<String> {
+        let (result, _, warnings) = expect_done(vendor_purl(fx, purl).await);
         assert!(result.success, "{:?}", result.error);
         warnings
             .into_iter()
@@ -2813,20 +2929,77 @@ mod tests {
     /// REGRESSION (#371): from Bun 1.3.5 on, Bun's default trusted list
     /// applies only to packages resolved from the npm registry, so a
     /// default-trusted package vendored to a local tarball has its install
-    /// scripts skipped with exit 0. Vendoring says so, unless the project
+    /// scripts skipped with exit 0. Vendoring refuses to take such a
+    /// package off the registry, before any write, unless the project
     /// declares `trustedDependencies` (package.json, or bun.lock's mirror),
-    /// which decides trust by name alone.
+    /// which decides trust by name alone. One an earlier run already
+    /// vendored keeps its wiring and the warning.
     #[tokio::test]
-    async fn default_trusted_package_warns_that_trust_is_lost() {
+    async fn default_trusted_package_is_not_taken_off_the_registry() {
         let lock = BN3_BEFORE_LOCK.replace("left-pad", "simple-git-hooks");
         let purl = "pkg:npm/simple-git-hooks@1.3.0";
         let fx = fixture_with(&lock, "node_modules/simple-git-hooks").await;
+        let detail = expect_refused(
+            vendor_purl(&fx, purl).await,
+            "vendor_bun_default_trust_refused",
+        );
+        assert!(
+            detail.contains("simple-git-hooks@1.3.0")
+                && detail.contains("trustedDependencies")
+                && detail.contains("stays UNPATCHED"),
+            "{detail}"
+        );
+        assert_eq!(fx.read_lock().await, lock, "refused before any write");
+        assert!(!fx.root().join(".socket/vendor").exists());
+
+        // Vendored while the project declared its trust, which it then
+        // dropped: the wiring stays, the in-sync re-run says what it costs.
+        let declared = BN3_PKG.replacen(
+            "\"version\": \"1.0.0\",",
+            "\"version\": \"1.0.0\",\n  \"trustedDependencies\": [\"simple-git-hooks\"],",
+            1,
+        );
+        assert_ne!(declared, BN3_PKG);
+        tokio::fs::write(fx.root().join("package.json"), &declared)
+            .await
+            .unwrap();
+        assert!(trust_lost_details(&fx, purl).await.is_empty());
+        let vendored = fx.read_lock().await;
+        assert!(vendored.contains(".socket/vendor/npm/"), "{vendored}");
+        tokio::fs::write(fx.root().join("package.json"), BN3_PKG)
+            .await
+            .unwrap();
         let lost = trust_lost_details(&fx, purl).await;
         assert_eq!(lost.len(), 1, "{lost:?}");
         assert!(
             lost[0].contains("simple-git-hooks@1.3.0") && lost[0].contains("trustedDependencies"),
             "{}",
             lost[0]
+        );
+        assert_eq!(fx.read_lock().await, vendored, "in sync");
+
+        // A second copy the lock resolves from the registry (a later
+        // re-resolve nests one) is vendored beside the first: Bun trusts
+        // by name, so the first already took the default trust from both.
+        let second = "    \"haspad/simple-git-hooks\": [\"simple-git-hooks@1.3.0\", \"\", {}, \"sha512-XI5MPzVNApjAyhQzphX8BkmKsKUxD4LdyK24iZeQGinBN9yTQT3bFlCBy/aVx2HrNcqQGsdot8ghrjyrvMCoEA==\"],\n  }\n}\n";
+        let with_second = vendored.replacen("  }\n}\n", second, 1);
+        assert_ne!(with_second, vendored, "replacement must hit");
+        tokio::fs::write(fx.root().join(BUN_LOCK), &with_second)
+            .await
+            .unwrap();
+        let (result, _, warnings) = expect_done(vendor_purl(&fx, purl).await);
+        assert!(result.success, "{:?}", result.error);
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.code == "vendor_bun_default_trust_lost"),
+            "{warnings:?}"
+        );
+        let rewired = fx.read_lock().await;
+        assert_eq!(
+            rewired.matches(".socket/vendor/npm/").count(),
+            2,
+            "both copies resolve to the vendored tarball: {rewired}"
         );
 
         let mirrored = lock.replacen(
@@ -2835,7 +3008,18 @@ mod tests {
             1,
         );
         assert_ne!(mirrored, lock);
+        // Bun takes the list from package.json: a copy left only in the
+        // lock keeps no script running, so a manifest that can be read and
+        // declares none still refuses. The mirror stands in only when the
+        // manifest cannot be read.
         let fx = fixture_with(&mirrored, "node_modules/simple-git-hooks").await;
+        expect_refused(
+            vendor_purl(&fx, purl).await,
+            "vendor_bun_default_trust_refused",
+        );
+        tokio::fs::remove_file(fx.root().join("package.json"))
+            .await
+            .unwrap();
         assert!(trust_lost_details(&fx, purl).await.is_empty());
 
         let fx = fixture_with(&lock, "node_modules/simple-git-hooks").await;
@@ -2859,10 +3043,11 @@ mod tests {
     }
 
     /// REGRESSION (#371), `bun.lockb`: the binary lock has no text mirror,
-    /// so the root manifest's `trustedDependencies` alone decides. Real Bun
-    /// 1.4.2 fixture: `simple-git-hooks` is on the default list.
+    /// so the root manifest's `trustedDependencies` alone decides whether
+    /// the registry record may be vendored. Real Bun 1.4.2 fixture:
+    /// `simple-git-hooks` is on the default list.
     #[tokio::test]
-    async fn binary_default_trusted_package_warns_that_trust_is_lost() {
+    async fn binary_default_trusted_package_is_not_taken_off_the_registry() {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/bun-lockb-trusted");
         let manifest = std::fs::read_to_string(dir.join("package.json")).unwrap();
@@ -2872,7 +3057,8 @@ mod tests {
             1,
         );
         assert_ne!(declared, manifest);
-        for (manifest, warns) in [(&manifest, true), (&declared, false)] {
+        let purl = "pkg:npm/simple-git-hooks@2.11.1";
+        for (manifest, refused) in [(&manifest, true), (&declared, false)] {
             let fx = fixture_with("", "node_modules/simple-git-hooks").await;
             tokio::fs::remove_file(fx.root().join(BUN_LOCK))
                 .await
@@ -2883,8 +3069,29 @@ mod tests {
             tokio::fs::write(fx.root().join("package.json"), manifest)
                 .await
                 .unwrap();
-            let lost = trust_lost_details(&fx, "pkg:npm/simple-git-hooks@2.11.1").await;
-            assert_eq!(lost.len(), usize::from(warns), "{lost:?}");
+            if refused {
+                let detail = expect_refused(
+                    vendor_purl(&fx, purl).await,
+                    "vendor_bun_default_trust_refused",
+                );
+                assert!(detail.contains("simple-git-hooks@2.11.1"), "{detail}");
+                assert_eq!(
+                    tokio::fs::read(fx.root().join("bun.lockb")).await.unwrap(),
+                    std::fs::read(dir.join("bun.lockb")).unwrap(),
+                    "refused before any write"
+                );
+                assert!(!fx.root().join(".socket/vendor").exists());
+            } else {
+                assert!(trust_lost_details(&fx, purl).await.is_empty());
+                // Trust dropped after vendoring: the wiring stays, warned.
+                tokio::fs::write(
+                    fx.root().join("package.json"),
+                    std::fs::read_to_string(dir.join("package.json")).unwrap(),
+                )
+                .await
+                .unwrap();
+                assert_eq!(trust_lost_details(&fx, purl).await.len(), 1);
+            }
         }
     }
 
@@ -2923,13 +3130,13 @@ mod tests {
         let detail = expect_refused(fx.vendor(false).await, "vendor_lockfile_missing");
         assert!(detail.contains("bun install"), "{detail}");
 
-        let lock = BN3_BEFORE_LOCK.replace("\"lockfileVersion\": 1,", "\"lockfileVersion\": 3,");
+        let lock = BN3_BEFORE_LOCK.replace("\"lockfileVersion\": 1,", "\"lockfileVersion\": 4,");
         let fx = fixture_with(&lock, "node_modules/left-pad").await;
         let detail = expect_refused(
             fx.vendor(false).await,
             "vendor_lockfile_version_unsupported",
         );
-        assert!(detail.contains('3'), "{detail}");
+        assert!(detail.contains("lockfileVersion 4"), "{detail}");
     }
 
     /// bun >= 1.4 writes `"lockfileVersion": 2` over the SAME emitted grammar
@@ -2951,6 +3158,137 @@ mod tests {
         assert!(
             rewritten.contains(".socket/vendor/npm/"),
             "the packages entry must point at the vendored tarball: {rewritten}"
+        );
+    }
+
+    /// bun >= 1.4 writes `"lockfileVersion": 3` when package.json has a
+    /// nested override or a yarn-style path resolution. Only the head
+    /// differs (`overrides` holds nested objects); the packages grammar is
+    /// the v2 one, so vendoring proceeds and both the version line and the
+    /// nested head survive verbatim, and a revert restores the lock.
+    #[tokio::test]
+    async fn lock_v3_with_nested_overrides_vendors_like_v2() {
+        const NESTED: &str =
+            "  \"overrides\": {\n    \"rc\": {\n      \"left-pad\": \"1.3.0\",\n    },\n  },\n";
+        let lock = BN3_BEFORE_LOCK
+            .replace("\"lockfileVersion\": 1,", "\"lockfileVersion\": 3,")
+            .replace("  \"packages\": {", &format!("{NESTED}  \"packages\": {{"));
+        assert!(lock.contains(NESTED), "replacement must hit: {lock}");
+        let fx = fixture_with(&lock, "node_modules/left-pad").await;
+        let (_, entry, _) = expect_done(fx.vendor(false).await);
+        assert!(entry.is_some(), "the vendor run must record an entry");
+        let rewritten = fx.read_lock().await;
+        assert!(
+            rewritten.contains("\"lockfileVersion\": 3,") && rewritten.contains(NESTED),
+            "the version line and the nested overrides head must be preserved verbatim: \
+             {rewritten}"
+        );
+        assert!(
+            rewritten.contains(".socket/vendor/npm/"),
+            "the packages entry must point at the vendored tarball: {rewritten}"
+        );
+    }
+
+    /// The lock must pin the vendored tarball to that tarball's own sha512.
+    /// With any other digest Bun does not install it: a cold install fails
+    /// the integrity check and Bun 1.4, which keys its cache by the pin,
+    /// installs whatever cached tarball has that digest. `vendor --check`
+    /// names it and `vex` does not attest it; the digest-less tuple Bun
+    /// 1.1.39 to 1.3.9 re-save carries no pin to be wrong.
+    #[tokio::test]
+    async fn a_lock_pin_that_is_not_the_artifacts_is_reported() {
+        let fx = fixture_with(BN3_BEFORE_LOCK, "node_modules/left-pad").await;
+        let (_, entry, _) = expect_done(fx.vendor(false).await);
+        let entry = entry.unwrap();
+        assert_eq!(lock_pin_mismatch(&entry, fx.root()).await, None);
+        assert_eq!(
+            crate::vendor::npm_flavor::check_npm_wiring(&entry, fx.root()).await,
+            Ok(())
+        );
+        assert_eq!(
+            crate::vendor::verify::verify_vendored_patch_record(fx.root(), &entry, &fx.record)
+                .await,
+            Ok(()),
+            "the tarball vendoring packs passes the strict reader"
+        );
+
+        let wired = fx.read_lock().await;
+        let pin = fx.actual_integrity().await;
+        assert!(wired.contains(&pin), "{wired}");
+        let other = format!("sha512-{}==", "B".repeat(86));
+        tokio::fs::write(fx.root().join(BUN_LOCK), wired.replace(&pin, &other))
+            .await
+            .unwrap();
+        let detail = lock_pin_mismatch(&entry, fx.root())
+            .await
+            .expect("a foreign pin is a mismatch");
+        assert!(
+            detail.contains("bun.lock pins") && detail.contains(&fx.rel_tgz()),
+            "{detail}"
+        );
+        assert_eq!(
+            crate::vendor::npm_flavor::check_npm_wiring(&entry, fx.root()).await,
+            Err(detail)
+        );
+
+        // A pin under another algorithm is not one vendoring wrote.
+        tokio::fs::write(
+            fx.root().join(BUN_LOCK),
+            wired.replace(&pin, "sha1-2jmj7l5rSw0yVb/vlWAYkK/YBwk="),
+        )
+        .await
+        .unwrap();
+        assert!(lock_pin_mismatch(&entry, fx.root()).await.is_some());
+
+        // The 2-tuple an older Bun re-saves has no pin.
+        let digestless = wired.replace(&format!(", \"{pin}\"]"), "]");
+        assert_ne!(digestless, wired, "replacement must hit");
+        tokio::fs::write(fx.root().join(BUN_LOCK), digestless)
+            .await
+            .unwrap();
+        assert_eq!(lock_pin_mismatch(&entry, fx.root()).await, None);
+    }
+
+    /// npm-family installers strip the first path segment whatever it is,
+    /// so a tarball holding the patched file under `package/` and the
+    /// original under another root installs the original. The committed
+    /// tarball is read as they extract it: one that is not in the shape
+    /// vendoring writes does not verify.
+    #[tokio::test]
+    async fn a_tarball_with_a_second_root_does_not_verify() {
+        use std::io::Read as _;
+        let fx = fixture_with(BN3_BEFORE_LOCK, "node_modules/left-pad").await;
+        let (_, entry, _) = expect_done(fx.vendor(false).await);
+        let entry = entry.unwrap();
+        let path = fx.root().join(fx.rel_tgz());
+        let tgz = tokio::fs::read(&path).await.unwrap();
+
+        let mut out = tar::Builder::new(flate2::write::GzEncoder::new(
+            Vec::new(),
+            flate2::Compression::default(),
+        ));
+        let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(&tgz[..]));
+        for member in archive.entries().unwrap() {
+            let mut member = member.unwrap();
+            let header = member.header().clone();
+            let mut data = Vec::new();
+            member.read_to_end(&mut data).unwrap();
+            out.append(&header, &data[..]).unwrap();
+        }
+        let original = b"module.exports = 'unpatched';\n";
+        let mut header = tar::Header::new_gnu();
+        header.set_size(original.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        out.append_data(&mut header, "other-root/index.js", &original[..])
+            .unwrap();
+        let tampered = out.into_inner().unwrap().finish().unwrap();
+        tokio::fs::write(&path, &tampered).await.unwrap();
+
+        assert_eq!(
+            crate::vendor::verify::verify_vendored_patch_record(fx.root(), &entry, &fx.record)
+                .await,
+            Err("vendor_artifact_non_canonical".to_string())
         );
     }
 
@@ -5385,7 +5723,7 @@ mod tests {
         );
 
         let absent = BN3_BEFORE_LOCK.replace("left-pad@1.3.0", "left-pad@1.2.0");
-        let v3 = BN3_BEFORE_LOCK.replace("\"lockfileVersion\": 1,", "\"lockfileVersion\": 3,");
+        let v4 = BN3_BEFORE_LOCK.replace("\"lockfileVersion\": 1,", "\"lockfileVersion\": 4,");
         let malformed = BN3_BEFORE_LOCK.replace(
             "    \"left-pad\": [\"left-pad@1.3.0\", \"\", {}, \"sha512-XI5MPzVNApjAyhQzphX8BkmKsKUxD4LdyK24iZeQGinBN9yTQT3bFlCBy/aVx2HrNcqQGsdot8ghrjyrvMCoEA==\"],",
             "    \"left-pad\": {\"not\": \"a tuple\"},",
@@ -5395,8 +5733,8 @@ mod tests {
         let cases: [(&str, &str, &str); 4] = [
             ("absent entry", &absent, "vendor_lock_entry_not_found"),
             (
-                "lockfileVersion 3",
-                &v3,
+                "lockfileVersion 4",
+                &v4,
                 "vendor_lockfile_version_unsupported",
             ),
             (
@@ -5432,25 +5770,30 @@ mod tests {
     /// REGRESSION (#578): the vendor twin of the hosted hot loop. Every
     /// per-target scan (`classify_rewritable`, `bundled_matches`) ran the
     /// JSON-parsing bundled check on EVERY entry before the cheap spec
-    /// match; it may run only on the entries that resolve the target.
+    /// match. Parsing the lock now decides it once per entry that spells
+    /// `bundled`; the per-target scans read that answer and parse nothing.
     #[test]
     fn bundled_check_runs_only_on_matching_entries() {
-        use crate::vendor::bun_lock_text::BUNDLED_CHECKS;
+        use crate::vendor::bun_lock_text::{parse_packages_section, BUNDLED_CHECKS};
 
         const ENTRIES: usize = 200;
-        let mut entries: Vec<BunEntry> = (0..ENTRIES)
-            .map(|i| {
-                parse_entry_line(&format!(
-                    "\"pkg{i}\": [\"pkg{i}@1.0.0\", \"\", {{}}, \"sha512-OLD==\"],"
-                ))
-                .unwrap()
-            })
-            .collect();
-        entries.push(
-            parse_entry_line(
-                "\"parent/pkg0\": [\"pkg0@1.0.0\", \"\", { \"bundled\": true }, \"sha512-OLD==\"],",
-            )
-            .unwrap(),
+        let mut lines = vec!["{".to_string(), "  \"packages\": {".to_string()];
+        lines.extend(
+            (0..ENTRIES).map(|i| {
+                format!("    \"pkg{i}\": [\"pkg{i}@1.0.0\", \"\", {{}}, \"sha512-OLD==\"],")
+            }),
+        );
+        lines.push(
+            "    \"parent/pkg0\": [\"pkg0@1.0.0\", \"\", { \"bundled\": true }, \"sha512-OLD==\"],"
+                .to_string(),
+        );
+        lines.extend(["  }".to_string(), "}".to_string()]);
+        BUNDLED_CHECKS.with(|checks| checks.set(0));
+        let entries: Vec<BunEntry> = parse_packages_section(&lines).unwrap();
+        assert_eq!(
+            BUNDLED_CHECKS.with(std::cell::Cell::get),
+            1,
+            "parsing reads the one meta that spells `bundled`"
         );
 
         BUNDLED_CHECKS.with(|checks| checks.set(0));
@@ -5468,9 +5811,10 @@ mod tests {
         assert_eq!(rewritable, 1, "only the registry tuple is rewritable");
         assert_eq!(bundled, vec!["parent/pkg0".to_string()]);
         assert!(user_tarballs.is_empty());
-        // Two matching entries, two scans: at most four checks, not 3 × 201.
+        // The scans read the parse's answer: no further meta is parsed
+        // (before #578: 3 × 201).
         assert!(
-            checks <= 4,
+            checks == 0,
             "{checks} bundled checks over {} entries",
             ENTRIES + 1
         );

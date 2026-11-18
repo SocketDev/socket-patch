@@ -1934,20 +1934,67 @@ async fn scan_redirect_rewrites_bun_lock_v2() {
     bun_manifestless_vex(tmp.path(), &lock_before, "bun-v2");
 }
 
-/// A future `lockfileVersion` (3) has no byte-exact fixtures: the rewrite
+/// `"lockfileVersion": 3` is what bun 1.4 writes when package.json has a
+/// nested override or a yarn-style path resolution. Only the lock's head
+/// differs (its `overrides` object nests); the packages grammar is the v2
+/// one, so the rewrite proceeds exactly like v2 and keeps the version line
+/// and the nested head verbatim.
+#[tokio::test]
+#[serial]
+async fn scan_redirect_rewrites_bun_lock_v3() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+    mock_view(&server).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_bun_project(tmp.path(), 3);
+    const NESTED_OVERRIDES: &str =
+        "  \"overrides\": {\n    \"rc\": {\n      \"ini\": \"1.3.5\",\n    },\n  },\n";
+    let lock_path = tmp.path().join("bun.lock");
+    let with_head = std::fs::read_to_string(&lock_path).unwrap().replacen(
+        "  \"packages\": {",
+        &format!("{NESTED_OVERRIDES}  \"packages\": {{"),
+        1,
+    );
+    assert!(with_head.contains(NESTED_OVERRIDES));
+    std::fs::write(&lock_path, &with_head).unwrap();
+    let lock_before = std::fs::read(&lock_path).unwrap();
+
+    let code = run(redirect_args(tmp.path(), server.uri())).await;
+    assert_eq!(code, 0, "scan --mode hosted (bun, lock v3) should succeed");
+
+    let lock = std::fs::read_to_string(&lock_path).unwrap();
+    assert!(
+        lock.contains("\"lockfileVersion\": 3,") && lock.contains(NESTED_OVERRIDES),
+        "the version line and the nested overrides head must be preserved verbatim; got:\n{lock}"
+    );
+    assert!(
+        lock.contains(&format!("\"{NAME}@{HOSTED_URL}\"")),
+        "the tuple's spec must be name@<hosted url>; got:\n{lock}"
+    );
+    assert!(
+        lock.contains(PATCHED_SHA512),
+        "integrity must be the patched sha512"
+    );
+    vlt_hosted_common::assert_no_ledger(tmp.path());
+    bun_manifestless_vex(tmp.path(), &lock_before, "bun-v3");
+}
+
+/// A future `lockfileVersion` (4) has no byte-exact fixtures: the rewrite
 /// must refuse whole (fail closed), leave the lock byte-identical, count
 /// nothing redirected, and surface `redirect_bun_lock_unsupported` in the
 /// `--json` envelope. Subprocess so `redirected` and `warnings[]` can be
 /// read back.
 #[tokio::test]
 #[serial]
-async fn scan_redirect_refuses_bun_lock_v3() {
+async fn scan_redirect_refuses_bun_lock_v4() {
     let server = MockServer::start().await;
     mock_discovery(&server).await;
     mock_reference(&server).await;
 
     let tmp = tempfile::tempdir().unwrap();
-    write_bun_project(tmp.path(), 3);
+    write_bun_project(tmp.path(), 4);
     let before = std::fs::read_to_string(tmp.path().join("bun.lock")).unwrap();
 
     let env = run_redirect_subprocess(tmp.path(), &server.uri());

@@ -146,9 +146,18 @@ pub(crate) struct BinaryPackage {
     /// to this record: that copy is unpacked from the parent's tarball,
     /// whatever the record's resolution says (#469).
     pub(crate) bundled: bool,
-    /// EVERY edge resolving to this record is bundled (and there is at
-    /// least one): rewiring its resolution installs nothing.
+    /// Bun never installs this record from its own resolution, so rewiring
+    /// it installs nothing: EVERY edge resolving to it (and there is at
+    /// least one) is bundled, or comes from a record that is itself only
+    /// ever unpacked from a bundling parent's tarball. Bun records the
+    /// dependencies of a bundled copy as ordinary edges to ordinary
+    /// looking records, which it never fetches.
     pub(crate) bundled_only: bool,
+    /// [`Self::bundled_only`] holds only by inference: some edge resolving
+    /// to this record is not bundled itself, it comes from a record Bun
+    /// never installs. Releases up to 5.1 rewired such records, so wiring
+    /// found on one is still listed and can be undone.
+    pub(crate) bundled_only_inferred: bool,
     /// Bun installs the record from its own spec — a local or remote
     /// tarball, git, a folder or a link — not from the registry, and it is
     /// neither the root nor a workspace member (#497).
@@ -321,27 +330,78 @@ impl BunLockb {
             )?;
             packages.push(package);
         }
-        // (bundled edges, other edges) resolving to each record.
-        let mut edges = vec![(0usize, 0usize); self.count];
         let dependencies = self.dependency_array()?;
         let resolutions = self.buffer_array(2)?;
         if dependencies.data.len() / 26 != resolutions.data.len() / 4 {
             return Err("bun.lockb: dependency and resolution buffer lengths differ".into());
         }
-        for index in 0..dependencies.data.len() / 26 {
-            let behavior = self.data[dependencies.data.start + index * 26 + 16];
-            let id = u32_at(&self.data, resolutions.data.start + index * 4)? as usize;
-            if let Some((bundled, other)) = edges.get_mut(id) {
-                if behavior & BEHAVIOR_BUNDLED != 0 {
-                    *bundled += 1;
-                } else {
-                    *other += 1;
+        let slots = dependencies.data.len() / 26;
+        // The record each dependency slot belongs to. A slot no record
+        // claims, or two records share, has no known owner.
+        const UNOWNED: usize = usize::MAX;
+        let mut owner = vec![UNOWNED; slots];
+        let mut shared = vec![false; slots];
+        for id in 0..self.count {
+            let Ok(range) = self.package_dependency_range(id) else {
+                continue;
+            };
+            for index in range {
+                if owner[index] == UNOWNED && !shared[index] {
+                    owner[index] = id;
+                } else if owner[index] != id {
+                    owner[index] = UNOWNED;
+                    shared[index] = true;
                 }
             }
         }
-        for (package, (bundled, other)) in packages.iter_mut().zip(edges) {
-            package.bundled = bundled > 0;
-            package.bundled_only = bundled > 0 && other == 0;
+        // The edges resolving to each record: (owning record, bundled).
+        let mut incoming: Vec<Vec<(usize, bool)>> = vec![Vec::new(); self.count];
+        let mut outgoing: Vec<Vec<usize>> = vec![Vec::new(); self.count];
+        for (index, &from) in owner.iter().enumerate() {
+            let behavior = self.data[dependencies.data.start + index * 26 + 16];
+            let id = u32_at(&self.data, resolutions.data.start + index * 4)? as usize;
+            if id >= self.count {
+                continue;
+            }
+            incoming[id].push((from, behavior & BEHAVIOR_BUNDLED != 0));
+            if let Some(targets) = outgoing.get_mut(from) {
+                targets.push(id);
+            }
+        }
+        // A record is only ever unpacked from a bundling parent's tarball
+        // when a bundled edge reaches it, directly or through other such
+        // records, and nothing Bun installs depends on it: every record a
+        // bundled edge leads to is a candidate, until an edge that is not
+        // bundled arrives from a record that is not one. Dropping a
+        // candidate can expose the ones it depends on, which are looked at
+        // again.
+        let mut bundled_only = vec![false; self.count];
+        let mut stack: Vec<usize> = (0..self.count)
+            .filter(|&id| incoming[id].iter().any(|&(_, bundled)| bundled))
+            .collect();
+        while let Some(id) = stack.pop() {
+            if !bundled_only[id] {
+                bundled_only[id] = true;
+                stack.extend(outgoing[id].iter().copied().filter(|&t| !bundled_only[t]));
+            }
+        }
+        let mut queue: Vec<usize> = (0..self.count).filter(|&id| bundled_only[id]).collect();
+        while let Some(id) = queue.pop() {
+            if bundled_only[id]
+                && incoming[id].iter().any(|&(from, bundled)| {
+                    !bundled && !bundled_only.get(from).copied().unwrap_or(false)
+                })
+            {
+                bundled_only[id] = false;
+                queue.extend(outgoing[id].iter().copied().filter(|&t| bundled_only[t]));
+            }
+        }
+        for ((package, edges), bundled_only) in packages.iter_mut().zip(&incoming).zip(bundled_only)
+        {
+            package.bundled = edges.iter().any(|&(_, bundled)| bundled);
+            package.bundled_only = bundled_only;
+            package.bundled_only_inferred =
+                bundled_only && !edges.iter().all(|&(_, bundled)| bundled);
         }
         Ok(packages)
     }
@@ -457,6 +517,7 @@ impl BunLockb {
             integrity,
             bundled: false,
             bundled_only: false,
+            bundled_only_inferred: false,
             own_source: !matches!(tag, 0 | 1 | 2 | 72),
         })
     }
@@ -2586,6 +2647,36 @@ mod tests {
         "0.8.1-production",
         "1.0.0-production",
     ];
+
+    /// Real Bun 1.4.4 binary lock of a project depending on
+    /// `fsevents@1.2.9`, whose tarball bundles `node-pre-gyp` and its
+    /// whole dependency tree. Only the edge to `node-pre-gyp` is bundled;
+    /// the tree's own edges are ordinary, and Bun installs none of those
+    /// records (an empty cache ends up holding `fsevents` and `nan` only).
+    #[test]
+    fn records_reached_only_through_bundled_copies_are_bundled_only() {
+        let bytes = std::fs::read(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/bun-lockb-bundled/transitive/bun.lockb"),
+        )
+        .unwrap();
+        let packages = BunLockb::parse_packages(&bytes).unwrap();
+        let installed: Vec<&str> = packages
+            .iter()
+            .filter(|p| !p.bundled_only)
+            .map(|p| p.name.as_str())
+            .collect();
+        assert_eq!(installed, ["x", "fsevents", "nan"], "{packages:?}");
+        let directly: Vec<&str> = packages
+            .iter()
+            .filter(|p| p.bundled)
+            .map(|p| p.name.as_str())
+            .collect();
+        assert_eq!(directly, ["node-pre-gyp"]);
+        assert!(packages
+            .iter()
+            .any(|p| p.name == "minimist" && p.bundled_only && !p.bundled));
+    }
 
     /// REGRESSION (#469): a record reached by a bundled edge is flagged —
     /// only through that edge (`only`), or shared with a regular root

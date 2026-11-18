@@ -114,6 +114,27 @@ pub(super) async fn inventory_bun(root: &Path) -> Option<Vec<LockfileEntry>> {
     inventory_bun_in(&ProjectView::Disk(root)).await
 }
 
+/// The diagnosis for a text `bun.lock` that is there but that the line
+/// grammar refuses: a `lockfileVersion` newer than this release knows, or
+/// a `packages` section out of Bun's emitted shape (a comment, a
+/// re-indent). Such a lock lists packages nobody read, which is not the
+/// same as listing none: without this a checkout with no `node_modules`
+/// scans as an empty project and says so. `None` when the lock
+/// [`inventory_bun_in`] reads parses, or when it cannot be read at all.
+pub(super) async fn unsupported_bun_lock_in(
+    view: &ProjectView<'_>,
+) -> Option<UnsupportedNpmLayout> {
+    let text = view.read_text(BUN_LOCK).await.ok()?;
+    let detail = bun_text_entries(&text).err()?;
+    Some(UnsupportedNpmLayout {
+        code: "bun_lock_unsupported",
+        detail: format!(
+            "{detail}, so the packages it lists were NOT read from the lockfile: a package \
+             that is locked but not installed was not scanned"
+        ),
+    })
+}
+
 pub(super) async fn inventory_bun_in(view: &ProjectView<'_>) -> Option<Vec<LockfileEntry>> {
     let text = view.read_text(BUN_LOCK).await.ok()?;
     let lock = bun_text_entries(&text).ok()?;
