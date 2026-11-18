@@ -14,10 +14,11 @@
 //!   crate (the hosted planner's unpinnable-dependents refusal);
 //! * [`CargoLock::vendored_in_use`] — whether the lock builds a vendored
 //!   `[patch]` copy ([`CopyClaim`]);
-//! * [`CargoLock::plan_hosted`] ([`hosted`]) — the hosted planner's lock
-//!   splice, at the byte spans [`CargoLock::parse`] records, and the
+//! * [`CargoLock::plan_hosted_splices`] ([`hosted`]) — the hosted planner's
+//!   lock splice, at the byte spans [`CargoLock::parse`] records, and the
 //!   [`CargoLock::is_locked`] / [`CargoLock::locked_versions`] probes the
-//!   hosted rewriter reads with;
+//!   hosted rewriter reads with, all through the one parse a
+//!   [`hosted::CargoHostedLock`] holds for a rewrite;
 //! * the vendored planner (`vendor::cargo_lock`) edits the same document
 //!   with `toml_edit`;
 //!

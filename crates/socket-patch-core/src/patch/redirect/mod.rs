@@ -38,6 +38,8 @@ pub use bun_binary::{preflight_bun_binary, rewrite_bun_binary};
 #[cfg(test)]
 mod cargo_lock_equivalence_tests;
 #[cfg(test)]
+mod cargo_rewrite_order_tests;
+#[cfg(test)]
 mod composer_equivalence_tests;
 pub(crate) mod generation;
 #[cfg(test)]
@@ -58,9 +60,9 @@ mod pipenv_pylock_tests;
 pub mod presence;
 // The pnpm hosted planner lives with the format's model.
 use crate::crawlers::maven_selection::{MavenSelection, Verdict};
-use crate::formats::cargo::hosted::CargoLockPlan;
 #[cfg(test)]
 use crate::formats::cargo::hosted::CARGO_LOCK_REFERENCE_KIND;
+use crate::formats::cargo::hosted::{CargoHostedLock, CargoLockRepoint, PlannedRepoint};
 use crate::formats::cargo::source_replacement::{crates_io_source, ConfigLayer, CratesIoSource};
 use crate::formats::cargo::CargoLock;
 use crate::formats::composer::hosted::rewrite_composer_lock;
@@ -1945,10 +1947,11 @@ fn rewrite_cargo_with(
     let edits_before = result.edits.len();
     let mut changed_manifests: std::collections::BTreeSet<String> =
         std::collections::BTreeSet::new();
+    // Parsed once, by the first probe or plan below that reads it.
     let mut cargo_lock = files
         .get("Cargo.lock")
         .cloned()
-        .map(|t| to_lf("Cargo.lock", t));
+        .map(|t| CargoHostedLock::new(to_lf("Cargo.lock", t)));
     // Cargo reads the LEGACY extensionless `.cargo/config` in preference to
     // `config.toml` when both exist (it warns about the duplicate), so a
     // managed `[registries.…]` block written to `config.toml` there is
@@ -2147,8 +2150,8 @@ fn rewrite_cargo_with(
             });
             continue;
         }
-        let other_versions =
-            cargo_lock_other_versions(cargo_lock.as_deref(), &dep.name, &dep.version);
+        let lock_model = cargo_lock.as_ref().and_then(CargoHostedLock::model);
+        let other_versions = cargo_lock_other_versions(lock_model, &dep.name, &dep.version);
         let (toml_plans, excluded) =
             match plan_cargo_tomls(&manifests, &dep.name, &dep.version, &other_versions, &reg) {
                 Ok(planned) => planned,
@@ -2174,7 +2177,7 @@ fn rewrite_cargo_with(
                     &dep.name,
                     &dep.version,
                     &excluded,
-                    cargo_lock.as_deref(),
+                    lock_model,
                 ),
             });
             continue;
@@ -2186,7 +2189,7 @@ fn rewrite_cargo_with(
                     &dep.name,
                     &dep.version,
                     manifests.len(),
-                    cargo_lock.as_deref(),
+                    lock_model,
                 ),
             });
             continue;
@@ -2213,14 +2216,14 @@ fn rewrite_cargo_with(
         // package whose manifest was not planned (outside the project, behind
         // a symlink) — keeps resolving it from crates.io, so the repointed
         // lock is unsatisfiable and that consumer compiles the unpatched copy.
-        if let Some(lock_text) = cargo_lock.as_deref() {
+        if let Some(lock) = cargo_lock.as_ref() {
             let pinned_packages: std::collections::BTreeSet<(&str, &str)> = toml_plans
                 .iter()
                 .filter_map(|(i, _)| manifest_packages[*i].as_ref())
                 .map(|(name, version)| (name.as_str(), version.as_str()))
                 .collect();
             let blocking =
-                cargo_unpinnable_dependents(lock_text, &dep.name, &dep.version, &pinned_packages);
+                cargo_unpinnable_dependents(lock, &dep.name, &dep.version, &pinned_packages);
             if !blocking.is_empty() {
                 result.warnings.push(RewriteWarning {
                     code: "redirect_cargo_transitive_dependents".into(),
@@ -2258,16 +2261,15 @@ fn rewrite_cargo_with(
         // pin alone then forces the next resolution through the managed
         // registry, which serves the patched checksum.
         enum LockCommit {
-            Write(String, Vec<FileEdit>),
+            Write(PlannedRepoint),
             InPlace,
             Absent,
         }
-        let lock_commit = if let Some(lock_text) = cargo_lock.as_ref() {
+        let lock_commit = if let Some(lock) = cargo_lock.as_mut() {
             // A lock that does not parse never reaches here: the dependents
             // check above refuses it.
-            let parsed = CargoLock::parse(lock_text).ok();
-            let overridden = parsed.as_ref().and_then(|lock| {
-                cargo_lock_override_source(lock, &dep.name, &dep.version, || {
+            let overridden = lock.model().and_then(|model| {
+                cargo_lock_override_source(model, &dep.name, &dep.version, || {
                     cargo_patch_override_table(&manifests, files, &dep.name)
                 })
             });
@@ -2277,13 +2279,10 @@ fn rewrite_cargo_with(
                     .push(cargo_overridden_warning(&dep.name, &dep.version, &how));
                 continue;
             }
-            let plan = parsed.map_or(CargoLockPlan::NotFound, |lock| {
-                lock.plan_hosted(lock_text, &dep.name, &dep.version, index_url, &cksum)
-            });
-            match plan {
-                CargoLockPlan::Rewritten { content, edits } => LockCommit::Write(content, edits),
-                CargoLockPlan::AlreadyRedirected => LockCommit::InPlace,
-                CargoLockPlan::NotFound => {
+            match lock.plan(&dep.name, &dep.version, index_url, &cksum) {
+                CargoLockRepoint::Rewritten(planned) => LockCommit::Write(planned),
+                CargoLockRepoint::AlreadyRedirected => LockCommit::InPlace,
+                CargoLockRepoint::NotFound => {
                     result.warnings.push(RewriteWarning {
                         code: "redirect_cargo_lock_pkg_not_found".into(),
                         detail: format!(
@@ -2294,7 +2293,7 @@ fn rewrite_cargo_with(
                     });
                     continue;
                 }
-                CargoLockPlan::Ambiguous => {
+                CargoLockRepoint::Ambiguous => {
                     result.warnings.push(RewriteWarning {
                         code: "redirect_cargo_lock_pkg_ambiguous".into(),
                         detail: format!(
@@ -2331,15 +2330,20 @@ fn rewrite_cargo_with(
             }
         }
         match lock_commit {
-            LockCommit::Write(content, edits) => {
-                cargo_lock = Some(content);
-                result.edits.extend(edits);
-                lock_changed = true;
+            LockCommit::Write(planned) => {
+                // The lock gives a repoint's edits out as it makes it.
+                if let Some(lock) = cargo_lock.as_mut() {
+                    let edits = lock.commit(planned);
+                    lock_changed |= !edits.is_empty();
+                    result.edits.extend(edits);
+                }
             }
             LockCommit::InPlace | LockCommit::Absent => {}
         }
         result.confirmed_cargo_uuids.insert(dep.patch_uuid.clone());
     }
+
+    let cargo_lock: Option<String> = cargo_lock.map(CargoHostedLock::into_text);
 
     // A re-pin to a superseding patch moved every declaration off the old
     // generation's registry: its `[registries.socket-patch-<old>]` block is
@@ -2450,7 +2454,7 @@ fn cargo_not_declared_detail(
     crate_name: &str,
     version: &str,
     manifests: usize,
-    lock: Option<&str>,
+    lock: Option<&CargoLock>,
 ) -> String {
     let scope = if manifests > 1 {
         format!("any of the {manifests} workspace manifests")
@@ -2480,7 +2484,7 @@ fn cargo_requirement_excludes_detail(
     crate_name: &str,
     version: &str,
     excluded: &[(String, String)],
-    lock: Option<&str>,
+    lock: Option<&CargoLock>,
 ) -> String {
     let declared = excluded
         .iter()
@@ -2685,12 +2689,12 @@ fn cargo_patch_override_table(
 /// `"name version (source)"` id — so a v1 lock and a twin's full id are
 /// covered alike. A lock that does not parse yields one entry saying so.
 fn cargo_unpinnable_dependents(
-    lock: &str,
+    lock: &CargoHostedLock,
     crate_name: &str,
     version: &str,
     pinned_packages: &std::collections::BTreeSet<(&str, &str)>,
 ) -> Vec<String> {
-    let Ok(lock) = CargoLock::parse(lock) else {
+    let Some(lock) = lock.model() else {
         return vec!["Cargo.lock (it does not parse as TOML)".to_string()];
     };
     let mut out = Vec::new();
@@ -3728,17 +3732,18 @@ enum CargoWorkspaceEntry {
 
 /// Whether a Cargo.lock (when there is one, and it parses) resolves
 /// `crate_name`@`version`.
-fn cargo_lock_holds(lock: Option<&str>, crate_name: &str, version: &str) -> bool {
-    lock.and_then(|lock| CargoLock::parse(lock).ok())
-        .is_some_and(|lock| lock.is_locked(crate_name, version))
+fn cargo_lock_holds(lock: Option<&CargoLock>, crate_name: &str, version: &str) -> bool {
+    lock.is_some_and(|lock| lock.is_locked(crate_name, version))
 }
 
-/// Every version of `crate_name` a Cargo.lock holds other than `version`.
-fn cargo_lock_other_versions(lock: Option<&str>, crate_name: &str, version: &str) -> Vec<String> {
+/// Every version of `crate_name` a Cargo.lock (when there is one, and it
+/// parses) holds other than `version`.
+fn cargo_lock_other_versions(
+    lock: Option<&CargoLock>,
+    crate_name: &str,
+    version: &str,
+) -> Vec<String> {
     let Some(lock) = lock else {
-        return Vec::new();
-    };
-    let Ok(lock) = CargoLock::parse(lock) else {
         return Vec::new();
     };
     let mut versions = lock.locked_versions(crate_name);
