@@ -1998,17 +1998,21 @@ mode warns `redirect_gem_version_not_locked`, vendored mode reports a `skipped` 
 ## Ruby gems: gems vendored mode refuses
 
 Vendored mode rewrites one top-level `gem` line to a `path:` source, and Bundler builds nothing
-for a path-sourced gem. It refuses a gem that doesn't fit and changes nothing for it; the
-other gems of the run are still vendored, and the run exits 1. Each error names the way out:
+for a path-sourced gem. It refuses a gem that doesn't fit and changes nothing for it; the other
+gems of the run are still vendored, and the run exits 1. These three refusals name another mode
+that can patch the gem:
 
-| Code | The gem | What to do |
+| Code | The gem | What the error offers |
 |---|---|---|
-| `gemfile_declaration_not_editable` | is declared inside a block: `group :test do`, `platforms … do`, a conditional. Every Rails Gemfile declares its development and test gems this way. | Declare it at the top level with the `group:` option (`gem "capybara", group: :test`), or run `socket-patch scan --mode hosted`, which patches a gem inside a block. |
-| `native_extensions_unsupported` | builds a native extension (puma, bootsnap). | Run `socket-patch scan --mode hosted` or `socket-patch scan --mode agent`. Both build the extension. |
-| `platform_gem_unsupported` | is installed as a precompiled platform build (`nokogiri-1.18.3-x86_64-linux-gnu`). | Run `socket-patch scan --mode agent`. Hosted mode refuses a precompiled build too. |
+| `gemfile_declaration_not_editable` ("is indented") | is declared inside a block: `group :test do`, `platforms … do`, a conditional. Every Rails Gemfile declares its development and test gems this way. | Move the declaration to the top level (for a plain `group` block the error spells the option that replaces it, `group: :test`), or patch the gem with `--mode hosted`, which edits a declaration where it is. Inside a `source`, `git`, `github` or `path` block hosted mode refuses the gem too, and the error names `--mode agent`. |
+| `native_extensions_unsupported` | builds a native extension (puma, bootsnap). | `--mode hosted` or `--mode agent`. Both build the extension. |
+| `platform_gem_unsupported` | is installed as a precompiled platform build (`nokogiri-1.18.3-x86_64-linux-gnu`). | `--mode agent`. Hosted mode refuses a precompiled build too. |
 
-A hosted scan run after the vendored one patches the gems it can and leaves the vendored gems as
-they are.
+To patch one gem in another mode, name it: `socket-patch get <gem> --mode hosted`. A whole-project
+`scan --mode hosted` leaves vendored gems as they are, but it moves the vendored patches of the
+other ecosystems (npm, PyPI, Cargo, Go, Composer, Gradle) to hosted mode. Once a project holds
+patches of two modes, a `scan` with no `--mode` stops and asks which mode to use, so pass `--mode`
+on later runs.
 
 ## Ruby gems: native extensions
 
