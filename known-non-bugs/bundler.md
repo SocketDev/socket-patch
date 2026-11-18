@@ -183,3 +183,6 @@ Documented limitations and verified false positives. One bullet each. Search thi
 - `apply --check` exits 0 after printing "Patches are OUT OF SYNC" only when piped through `tail`; the exit code read was `tail`'s. Read `${PIPESTATUS[0]}` (2026-11-17).
 - Bundler 1.x is not refused anywhere: the docs describe the 1.17 merged-`GEM` lock as a supported shape, and hosted, vendored and agent all pass on 1.17.3 (11-17). Do not file "1.x not refused".
 - A failed native rebuild (no compiler, missing dev library, `--offline` without the source gem) leaves the gem byte-identical; only the message is at fault (#2117).
+- `apply --check` reports a native gem "not compiled into the extension Ruby loads" when the project has an agent record and a hosted pin and Bundler built the patched gem itself (`bundle pristine`, fresh clone). Documented: run `apply` again after a reinstall; it does (2026-11-18).
+- `vex` on a deployment clone installed without dev/test groups attests the hosted gems of those groups: hosted attestation is read from the lock (2026-11-18).
+- `scan --mode agent <subdir>` says "No installed packages found under the given path": agent PATHs are globs over the installed packages of the project at `--cwd`; use `--cwd <subdir>`. The missing hint is #2125 (2026-11-18).
