@@ -1094,6 +1094,13 @@ impl RubyCrawler {
                 if !self.verify_gem_at_path(&gem_dir).await {
                     continue;
                 }
+                // Nor is the leftover dir of a build the gem home no
+                // longer lists (#2087), which `find_by_purls` would not
+                // find again.
+                let (dir, n, v) = (gem_dir.clone(), name.clone(), version.clone());
+                if run_blocking(move || is_leftover_build_sync(&dir, &n, &v)).await {
+                    continue;
+                }
 
                 let purl = crate::utils::purl::build_gem_purl(&name, &version);
 
@@ -1255,6 +1262,9 @@ impl RubyCrawler {
 /// append a `-<platform>` suffix (`<name>-<version>-x86_64-linux/`). A gem
 /// home can hold several of them at once, so every verifying one is
 /// returned: the plain dir first, then the platform dirs in name order.
+///
+/// The leftover dir of a build the gem home no longer lists is not an
+/// installed copy ([`is_leftover_build_sync`]).
 fn locate_gem_dirs_sync(
     gem_path: &Path,
     name: &str,
@@ -1263,7 +1273,7 @@ fn locate_gem_dirs_sync(
 ) -> Vec<PathBuf> {
     let mut dirs = Vec::new();
     let exact = gem_path.join(format!("{name}-{version}"));
-    if verify_gem_at_path_sync(&exact) {
+    if verify_gem_at_path_sync(&exact) && !is_leftover_build_sync(&exact, name, version) {
         dirs.push(exact);
     }
     let names = super::listing::names_memoized(gem_path, names);
@@ -1276,9 +1286,57 @@ fn locate_gem_dirs_sync(
         siblings
             .into_iter()
             .map(|dir_name| gem_path.join(dir_name))
-            .filter(|dir| verify_gem_at_path_sync(dir)),
+            .filter(|dir| {
+                verify_gem_at_path_sync(dir) && !is_leftover_build_sync(dir, name, version)
+            }),
     );
     dirs
+}
+
+/// Whether the gem dir `<home>/gems/<leaf>`, a build of `name` `version`,
+/// is a leftover: its gem home has no gemspec for it
+/// (`specifications/<leaf>.gemspec`, or the same file under
+/// `specifications/default/` for a default gem) but has one for another
+/// build of that version.
+///
+/// RubyGems and Bundler find a gem by its gemspec alone, so nothing loads
+/// such a dir. It is what `rm specifications/<leaf>.gemspec && bundle
+/// install` (the stale-install remedy) leaves of a precompiled build once
+/// the project moved to the `ruby` platform build, which is installed
+/// beside it. Counting it as an installed copy made `vex` refuse the
+/// patched gem over the unpatched files of a dir that is not installed
+/// (#2087).
+///
+/// A dir is judged only against a home that lists its gem version: where
+/// the home has no `specifications/` dir, or no gemspec for any build of
+/// the version, nothing says what is installed, and the dir stays a copy.
+fn is_leftover_build_sync(gem_dir: &Path, name: &str, version: &str) -> bool {
+    use crate::utils::fs::is_dir_sync;
+    let (Some(leaf), Some(home)) = (gem_dir.file_name(), gem_dir.parent().and_then(Path::parent))
+    else {
+        return false;
+    };
+    let specs = home.join("specifications");
+    if !is_dir_sync(&specs) {
+        return false;
+    }
+    let spec_dirs = [specs.join("default"), specs];
+    let mut own = leaf.to_os_string();
+    own.push(".gemspec");
+    if spec_dirs.iter().any(|dir| dir.join(&own).is_file()) {
+        return false;
+    }
+    let exact = format!("{name}-{version}");
+    spec_dirs.iter().any(|dir| {
+        super::listing::list_dir_sync(dir).iter().any(|entry| {
+            entry
+                .name
+                .to_str()
+                .and_then(|file| file.strip_suffix(".gemspec"))
+                .is_some_and(|build| build == exact || is_platform_dir_of(build, name, version))
+                && dir.join(&entry.name).is_file()
+        })
+    })
 }
 
 /// Blocking twin of `RubyCrawler::verify_gem_at_path`: a directory holding

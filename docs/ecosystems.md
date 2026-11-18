@@ -1975,6 +1975,12 @@ and warns (`redirect_gem_stale_install`), naming the files to remove by hand. `-
 says what it would replace. `--no-gem-install-refresh` (or `SOCKET_NO_GEM_INSTALL_REFRESH=1`)
 turns the refresh off.
 
+Removing those files can leave a gem directory behind with no gemspec: after a project moves from
+a precompiled build to the `ruby` platform build, `gems/nokogiri-1.16.0-x86_64-linux/` stays next
+to the patched `gems/nokogiri-1.16.0/`. RubyGems and Bundler load a gem by its
+`specifications/` entry, so nothing loads that directory, and `socket-patch vex` and
+`apply --check` don't count it as an installed copy. `bundle clean --force` deletes it.
+
 Gems in a gem home **outside** the project (the system gems, `~/.gem`, an rbenv or asdf home) are
 not touched: another project on the machine may use the same copy. The run prints one warning
 naming them. Either install the project's gems into the project, where Bundler fetches the patched

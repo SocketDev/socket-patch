@@ -1211,7 +1211,14 @@ the model is **not uniform** today:
   is matched to its own release variant. A build is then not the only candidate, so the default
   mismatch policy never overwrites it: a build whose bytes match no manifest variant is left
   untouched, fails `apply` (`no matching variant found`) and withholds the `vex` statement, and
-  `rollback` skips it. PyPI follows the same rule: when the crawler resolves
+  `rollback` skips it. A build's dir is not a copy when its gem home has no gemspec for it
+  (`specifications/<leaf>.gemspec`, or `specifications/default/<leaf>.gemspec`) but has one for
+  another build of the same version: RubyGems and Bundler load a gem by that file alone, so nothing
+  loads the dir. It is what the stale-install remedy (`rm -f specifications/<leaf>.gemspec … &&
+  bundle install`) leaves of a precompiled build once the `ruby` platform build is installed
+  beside it. No command patches, restores or verifies it, and `vex` does not withhold a statement
+  over it (#2087); `bundle clean --force` removes it. A version the home has no gemspec for at
+  all is not judged this way. PyPI follows the every-copy rule too: when the crawler resolves
   one release in several site-packages dirs (a Pipenv WORKON_HOME venv beside an auto-detected
   `./.venv`, or the user site beside a system dir in global scope), agent `apply` patches **every**
   copy, one summary event per copy, because any of them may be the one the interpreter imports.
