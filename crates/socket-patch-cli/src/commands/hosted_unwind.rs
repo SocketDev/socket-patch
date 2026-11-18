@@ -101,8 +101,7 @@ async fn refresh_restored_gems(
     if pins.is_empty() {
         return;
     }
-    let restored: Vec<String> = pins.keys().cloned().collect();
-    let refresh = after_restore(common, &restored, &outcome.staged_text, &pins, api).await;
+    let refresh = after_restore(common, &outcome.staged_text, &pins, api).await;
     out.warnings.retain(|(code, detail)| {
         code != GEM_STALE_CACHE
             || !refresh
