@@ -2381,6 +2381,15 @@ fn omission_phrase(reason: &str) -> &'static str {
         "go_vendor_content_mismatch" => "the native Go vendor tree does not contain the patch; run go mod vendor (or go work vendor for a workspace)",
         "vendor_artifact_missing" => "the vendored artifact is missing",
         "vendor_artifact_unreadable" => "the vendored artifact cannot be read",
+        "vendor_artifact_non_canonical" => {
+            "the vendored tarball holds a second entry the package manager would extract \
+             over a patched file (another top-level directory, a second spelling of the \
+             name, or a link), so what installs is not what was checked"
+        }
+        "vendor_lock_pin_mismatch" => {
+            "the lockfile pins the vendored tarball to a sha512 that is not that file's, so \
+             an install does not deliver it; re-run socket-patch scan --mode vendored"
+        }
         "vendor_path_unsafe" => "the vendored artifact path is unsafe",
         "vendor_uuid_mismatch" => "the vendored artifact belongs to a different patch",
         "vendor_inventory_mismatch" => {

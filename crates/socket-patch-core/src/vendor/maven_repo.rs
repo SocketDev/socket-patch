@@ -90,7 +90,9 @@ pub(crate) async fn service_preflight(
     if shape == super::jvm::Shape::Other {
         return None;
     }
-    jvm_prelude(shape, purl, project_root, record).await.ok()?;
+    jvm_prelude(shape, purl, project_root, record, None)
+        .await
+        .ok()?;
     (!record.files.is_empty()).then_some(())?;
     jvm_committed_patch(shape, purl, project_root, record)
         .await
@@ -292,6 +294,54 @@ fn legacy_root_detail() -> String {
 fn detect_shape(project_root: &Path) -> super::jvm::Shape {
     let reader = super::jvm::apply::ProjectReader::new(project_root);
     super::jvm::detect(&|rel: &str| reader.read(rel), &|dir: &str| reader.list(dir))
+}
+
+/// The skip of each of `candidates` (`(purl, uuid)`) whose base version no
+/// module of the Maven build at `project_root` selects (the gate
+/// [`jvm_prelude`] runs, [`super::jvm::sbt_gate::MAVEN_NOT_SELECTED`]),
+/// for the refusals a run decides before it downloads anything. A
+/// candidate an earlier run pinned is left to the backend, which takes the
+/// pin out ([`unpin_unselected`]). Empty for any other build.
+pub(super) fn maven_not_selected_refusals(
+    project_root: &Path,
+    candidates: &[(String, String)],
+) -> Vec<(String, (&'static str, String))> {
+    use crate::crawlers::maven_selection::{not_selected_detail, MavenSelection, Standing};
+    if detect_shape(project_root) != super::jvm::Shape::MavenReactor {
+        return Vec::new();
+    }
+    let selection = MavenSelection::for_project(project_root);
+    let reader = super::jvm::apply::ProjectReader::new(project_root);
+    candidates
+        .iter()
+        .filter_map(|(purl, uuid)| {
+            let (g, a, v) = parse_maven_purl(purl)?;
+            let Standing::NotSelected(others) = selection.standing(&g, &a, &v) else {
+                return None;
+            };
+            let coords = super::jvm::Coords {
+                group_id: &g,
+                artifact_id: &a,
+                version: &v,
+                uuid,
+            };
+            let pinned = super::jvm::maven_reactor::unpin_plan(
+                &|rel| reader.read(rel),
+                &|dir| reader.list(dir),
+                &coords,
+            )
+            .is_some();
+            (!pinned).then(|| {
+                (
+                    purl.clone(),
+                    (
+                        super::jvm::sbt_gate::MAVEN_NOT_SELECTED,
+                        not_selected_detail(&g, &a, &v, &others),
+                    ),
+                )
+            })
+        })
+        .collect()
 }
 
 /// The root's ledger still holds a pre-v5 single-pom entry (a
@@ -595,7 +645,8 @@ pub async fn jvm_gate_preflight(
         return Err(("vendor_jvm_shape_unsupported", legacy_root_detail()));
     }
     let shape = detect_shape(project_root);
-    super::jvm::sbt_gate::for_shape(shape, project_root, &g, &a, &v)
+    let selection = maven_selection(shape, project_root, None).await;
+    super::jvm::sbt_gate::for_shape(shape, project_root, &g, &a, &v, selection)
         .map_err(|stop| stop.code_and_detail(purl))?;
     // Checked here too, so a hosted->vendored takeover keeps its pin
     // instead of restoring upstream and then refusing (#1061).
@@ -701,6 +752,98 @@ async fn jvm_committed_patch(
         .then_some((committed, extras))
 }
 
+/// What Maven selects in each module of a Maven root, read off the async
+/// runtime (the walk reads a pom per artifact of the build) over the local
+/// repository `repo`, or the one this process resolves against. `None` for
+/// any other shape.
+async fn maven_selection(
+    shape: super::jvm::Shape,
+    project_root: &Path,
+    repo: Option<&Path>,
+) -> Option<crate::crawlers::maven_selection::MavenSelection> {
+    use crate::crawlers::maven_selection::MavenSelection;
+    if !matches!(
+        shape,
+        super::jvm::Shape::MavenReactor | super::jvm::Shape::Mixed
+    ) {
+        return None;
+    }
+    let (root, repo) = (project_root.to_path_buf(), repo.map(Path::to_path_buf));
+    tokio::task::spawn_blocking(move || MavenSelection::for_project_in(&root, repo.as_deref()))
+        .await
+        .ok()
+}
+
+/// A patch the gate skipped because no module selects its base version
+/// may still be pinned by an earlier run (the build has moved on since: a
+/// dependency was added or upgraded). That pin keeps forcing the version
+/// Maven no longer selects, so it is taken out of the poms here and the
+/// skip says so; any other outcome is returned as it is.
+async fn unpin_unselected(
+    outcome: VendorOutcome,
+    purl: &str,
+    project_root: &Path,
+    record: &PatchRecord,
+    dry_run: bool,
+) -> VendorOutcome {
+    let VendorOutcome::Refused { code, detail } = outcome else {
+        return outcome;
+    };
+    let keep = |detail: String| VendorOutcome::Refused { code, detail };
+    if code != super::jvm::sbt_gate::MAVEN_NOT_SELECTED {
+        return keep(detail);
+    }
+    let Some((g, a, v)) = parse_maven_purl(purl) else {
+        return keep(detail);
+    };
+    let coords = super::jvm::Coords {
+        group_id: &g,
+        artifact_id: &a,
+        version: &v,
+        uuid: &record.uuid,
+    };
+    let reader = super::jvm::apply::ProjectReader::new(project_root);
+    let plan = super::jvm::maven_reactor::unpin_plan(
+        &|rel| reader.read(rel),
+        &|dir| reader.list(dir),
+        &coords,
+    );
+    let Some(plan) = plan.filter(|_| reader.escaped().is_none()) else {
+        return keep(detail);
+    };
+    let poms: Vec<&str> = plan.writes.iter().map(|w| w.rel.as_str()).collect();
+    let poms = poms.join(", ");
+    if dry_run {
+        return keep(format!(
+            "{detail}; the pin an earlier run wrote in {poms} still forces {v} and would be removed"
+        ));
+    }
+    match super::jvm::apply::write_plan(project_root, &plan).await {
+        Ok(_) => keep(format!(
+            "{detail}; the pin an earlier run wrote in {poms} still forced {v} and was removed (`socket-patch vendor --revert` or `scan --mode vendored --prune` drops the vendored copy it pointed at)"
+        )),
+        Err(e) => keep(format!(
+            "{detail}; the pin an earlier run wrote in {poms} still forces {v} and could not be removed ({e}): run `socket-patch vendor --revert`"
+        )),
+    }
+}
+
+/// The Maven-layout repository `installed_dir` is a version directory of
+/// (`<root>/<group path>/<artifact>/<version>`), when it is one: the local
+/// repository the installed copy of `purl` was found in, which holds the
+/// poms of the build that resolved it.
+fn maven2_root(installed_dir: &Path, purl: &str) -> Option<PathBuf> {
+    let (g, a, v) = parse_maven_purl(purl)?;
+    let mut dir = installed_dir;
+    for part in [v.as_ref(), a.as_ref()].into_iter().chain(g.rsplit('.')) {
+        if dir.file_name()?.to_str()? != part {
+            return None;
+        }
+        dir = dir.parent()?;
+    }
+    dir.is_dir().then(|| dir.to_path_buf())
+}
+
 /// What [`vendor_maven_jvm`] establishes before anything else: the
 /// coordinates, the ledger, and the sbt / scala-cli resolution gate's pass.
 struct JvmPrelude {
@@ -720,6 +863,7 @@ async fn jvm_prelude(
     purl: &str,
     project_root: &Path,
     record: &PatchRecord,
+    maven_repo: Option<&Path>,
 ) -> Result<JvmPrelude, VendorOutcome> {
     let Some((group_id, artifact_id, version)) = parse_maven_purl(purl) else {
         return Err(refused(
@@ -748,9 +892,16 @@ async fn jvm_prelude(
         .await
         .map_err(|e| refused("vendor_state_unreadable", e.to_string()))?;
     // sbt / scala-cli pins are gated on the build's own resolution first.
-    let gate_pass =
-        super::jvm::sbt_gate::for_shape(shape, project_root, &group_id, &artifact_id, &version)
-            .map_err(|stop| stop.into_outcome(purl))?;
+    let selection = maven_selection(shape, project_root, maven_repo).await;
+    let gate_pass = super::jvm::sbt_gate::for_shape(
+        shape,
+        project_root,
+        &group_id,
+        &artifact_id,
+        &version,
+        selection,
+    )
+    .map_err(|stop| stop.into_outcome(purl))?;
     // The tree must survive the commit the vendored workflow ends with.
     if let Some((code, detail)) = ignored_tree_root(shape, project_root).await {
         return Err(refused(code, detail));
@@ -788,9 +939,19 @@ async fn vendor_maven_jvm(
         version,
         state,
         gate_pass,
-    } = match jvm_prelude(shape, purl, project_root, record).await {
+    } = match jvm_prelude(
+        shape,
+        purl,
+        project_root,
+        record,
+        maven2_root(installed_dir, purl).as_deref(),
+    )
+    .await
+    {
         Ok(prelude) => prelude,
-        Err(outcome) => return outcome,
+        Err(outcome) => {
+            return unpin_unselected(outcome, purl, project_root, record, dry_run).await
+        }
     };
     let state = Some(state);
     let gradle = matches!(shape, Shape::Gradle | Shape::Mixed);
@@ -810,11 +971,14 @@ async fn vendor_maven_jvm(
             extra_artifacts: &[],
             patched_members: &[],
         };
-        let plan = super::jvm::plan(
+        let plan = super::jvm::plan_with_selection(
             shape,
             &|rel| reader.read(rel),
             &|dir| reader.list(dir),
             &patch,
+            true,
+            None,
+            gate_pass.maven.as_ref(),
         );
         if let Some(rel) = reader.escaped() {
             return refused(
@@ -833,7 +997,14 @@ async fn vendor_maven_jvm(
                 if let Err(e) =
                     super::jvm::maven_reactor::refuse_unwired(&read, &list, &patch.coords(), &plan)
                 {
-                    return refused(e.code, e.detail);
+                    return super::jvm::sbt_gate::maven_undetermined(
+                        gate_pass.maven.as_ref(),
+                        &plan,
+                        &group_id,
+                        &artifact_id,
+                        &version,
+                    )
+                    .unwrap_or_else(|| refused(e.code, e.detail));
                 }
             }
             _ => {}
@@ -847,6 +1018,7 @@ async fn vendor_maven_jvm(
 
     let local = LocalSources::new(project_root, installed_dir, &group_id);
     let gav = (group_id.clone(), artifact_id.clone(), version.clone());
+    let selection = gate_pass.maven;
     let mut warnings: Vec<VendorWarning> = gate_pass.warnings;
     let committed = jvm_committed_patch(shape, purl, project_root, record).await;
     let was_committed = committed.is_some();
@@ -1047,13 +1219,14 @@ async fn vendor_maven_jvm(
         ),
         Shape::MavenReactor | Shape::Mixed => {
             let external = external_maven_poms(&read, &list, &patch, &local, service).await;
-            super::jvm::plan_with_external(
+            super::jvm::plan_with_selection(
                 shape,
                 &read,
                 &list,
                 &patch,
                 config_enabled,
                 Some(&external),
+                selection.as_ref(),
             )
         }
         _ => super::jvm::plan_with_config(shape, &read, &list, &patch, config_enabled),
@@ -1072,7 +1245,16 @@ async fn vendor_maven_jvm(
         if let Err(refusal) =
             super::jvm::maven_reactor::refuse_unwired(&read, &list, &patch.coords(), &plan)
         {
-            return refused(refusal.code, refusal.detail);
+            // Nothing names the base version to rewrite, and what the build
+            // selects cannot be told: nothing is pinned on a guess.
+            return super::jvm::sbt_gate::maven_undetermined(
+                selection.as_ref(),
+                &plan,
+                &group_id,
+                &artifact_id,
+                &version,
+            )
+            .unwrap_or_else(|| refused(refusal.code, refusal.detail));
         }
     }
     if gradle
@@ -2205,6 +2387,54 @@ mod tests {
         Some(out)
     }
 
+    /// A build that declares another version of the artifact itself does
+    /// not select the patch's base version, whatever its local repository
+    /// holds: the patch is a skip decided before any download. A build
+    /// that declares the base version is none.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_version_the_build_does_not_select_is_skipped_before_any_download() {
+        let declaring = |version: &str| {
+            format!(
+                "<project>\n  <modelVersion>4.0.0</modelVersion>\n  <groupId>com.example</groupId>\n  \
+                 <artifactId>app</artifactId>\n  <version>1.0.0</version>\n  <dependencies>\n    \
+                 <dependency>\n      <groupId>org.apache.commons</groupId>\n      \
+                 <artifactId>commons-text</artifactId>\n      <version>{version}</version>\n    \
+                 </dependency>\n  </dependencies>\n</project>\n"
+            )
+        };
+        let (dir, blobs, installed, record) = fixture(Some(&declaring("1.11.0")), true, true).await;
+        let root = dir.path();
+        let refusals = maven_not_selected_refusals(root, &[(PURL.to_string(), UUID.to_string())]);
+        let [(purl, (code, detail))] = refusals.as_slice() else {
+            panic!("{refusals:?}");
+        };
+        assert_eq!(
+            (purl.as_str(), *code),
+            (PURL, "vendor_maven_version_not_selected")
+        );
+        assert!(
+            detail.contains("Maven selects org.apache.commons:commons-text 1.11.0")
+                && detail.contains("not 1.10.0"),
+            "{detail}"
+        );
+        assert!(crate::vendor::refusals::refusal_is_benign(code));
+        // The backend stops at the same gate, and writes nothing.
+        let (code, _) = unwrap_refused(run_vendor(root, &blobs, &installed, &record, false).await);
+        assert_eq!(code, "vendor_maven_version_not_selected");
+        assert!(service_preflight(PURL, root, &record).await.is_none());
+        assert!(!root.join(".socket").exists());
+        assert_eq!(
+            std::fs::read_to_string(root.join(PROJECT_POM)).unwrap(),
+            declaring("1.11.0")
+        );
+
+        std::fs::write(root.join(PROJECT_POM), declaring("1.10.0")).unwrap();
+        assert!(
+            maven_not_selected_refusals(root, &[(PURL.to_string(), UUID.to_string())]).is_empty()
+        );
+    }
+
     #[tokio::test]
     #[serial_test::serial]
     async fn missing_reactor_module_is_refused_without_writes() {
@@ -2236,6 +2466,13 @@ mod tests {
              \x20 <artifactId>app</artifactId>\n\
              \x20 <version>1.0.0</version>\n\
              \x20 <!-- <modules><module>old</module></modules> -->\n\
+             \x20 <dependencies>\n\
+             \x20   <dependency>\n\
+             \x20     <groupId>org.apache.commons</groupId>\n\
+             \x20     <artifactId>commons-text</artifactId>\n\
+             \x20     <version>1.10.0</version>\n\
+             \x20   </dependency>\n\
+             \x20 </dependencies>\n\
              </project>\n";
         let (dir, blobs, installed, record) = fixture(Some(commented), true, true).await;
         let root = dir.path();
@@ -3954,6 +4191,29 @@ mod tests {
              </project>",
         )
         .unwrap();
+        // The pom of what brings commons-text in: the pin is written only
+        // because Maven selects 1.10.0 through it.
+        let uses = root.join("m2/com/corp/uses-commons-text/1");
+        std::fs::create_dir_all(&uses).unwrap();
+        std::fs::write(
+            uses.join("uses-commons-text-1.pom"),
+            "<project><modelVersion>4.0.0</modelVersion><groupId>com.corp</groupId>\
+             <artifactId>uses-commons-text</artifactId><version>1</version><dependencies>\
+             <dependency><groupId>org.apache.commons</groupId>\
+             <artifactId>commons-text</artifactId><version>1.10.0</version></dependency>\
+             </dependencies></project>",
+        )
+        .unwrap();
+        // What commons-text depends on, as a resolved project holds it:
+        // with a pom missing, the build is not known to select 1.10.0.
+        let lang3 = root.join("m2/org/apache/commons/commons-lang3/3.12.0");
+        std::fs::create_dir_all(&lang3).unwrap();
+        std::fs::write(
+            lang3.join("commons-lang3-3.12.0.pom"),
+            "<project><modelVersion>4.0.0</modelVersion><groupId>org.apache.commons</groupId>\
+             <artifactId>commons-lang3</artifactId><version>3.12.0</version></project>",
+        )
+        .unwrap();
         let (result, entry, warnings) =
             unwrap_done(run_jvm(root, &blobs, &installed, &record, None).await);
         assert!(result.success, "{result:?}");
@@ -4228,7 +4488,9 @@ mod tests {
             module.join("pom.xml"),
             "<project><modelVersion>4.0.0</modelVersion><parent><groupId>com.example</groupId>\
              <artifactId>parent</artifactId><version>1.0</version></parent>\
-             <artifactId>app</artifactId></project>\n",
+             <artifactId>app</artifactId><dependencies><dependency>\
+             <groupId>org.apache.commons</groupId><artifactId>commons-text</artifactId>\
+             <version>1.10.0</version></dependency></dependencies></project>\n",
         )
         .unwrap();
         let before = crate::vendor::test_support::tree_snapshot(root);

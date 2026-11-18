@@ -52,6 +52,7 @@
 //! | npm    | `pkg:npm/minimist@1.2.2`        | `642d7f02-ebc1-4ab0-99e2-07f5dd8463cb` | `Socket Community Patch` header |
 //! | PyPI   | `pkg:pypi/urllib3@1.26.18`      | *any of three* (see [`PYPI_UUIDS`])    | `Socket Community Patch` header |
 //! | gem    | `pkg:gem/activestorage@6.0.3`   | *any of* [`GEM_PATCHES`]               | `Socket Community Patch` header |
+//! | Maven  | `pkg:maven/com.fasterxml.jackson.core/jackson-databind@2.7.9.2` | `8e82692a-a5bd-40ac-97a7-4f1483449fd6` | the patched `SubTypeValidator.class` (the record's `afterHash`) |
 //!
 //! # Ecosystem coverage notes (gaps, and one resolved gap)
 //!
@@ -61,7 +62,17 @@
 //!   must provide a valid `gem-stub-gemspec` with summary and authors; invalid
 //!   stubs fail closed without constructing a local replacement.
 //! * **golang** — pgx/v5 v5.7.0 exercises directory replacements and cold-cache delivery.
-//! * **cargo / maven / nuget / composer** — vendored mode is implemented, but
+//! * **maven** — jackson-databind 2.7.9.2, production's first free Maven
+//!   patch (2026-10-23; on the canary until 2026-11-17).
+//!   [`maven_vendored_jackson_databind_delivery`] builds a fresh checkout
+//!   offline against the committed jar, and
+//!   [`maven_agent_jackson_databind_delivery`] builds against the jar swapped
+//!   into the Maven local repository. Both run a JVM on the classpath Maven
+//!   resolved, check the jar as a drop-in replacement on every JDK the run
+//!   provides, and undo with `rollback` and `remove`
+//!   (`maven_production/mod.rs`). Unlike the legs above, this one does
+//!   exercise the fix: the patched class's deny list is read back.
+//! * **cargo / nuget / composer** — vendored mode is implemented, but
 //!   production publishes **zero** free-tier patches for them.
 //!   [`canary_unpublished_vendored_ecosystems`] probes production every run and
 //!   reports the moment that changes. cargo carried a full
@@ -75,11 +86,12 @@
 //!
 //! Toolchains (each leg soft-skips if its own toolchain is absent, unless
 //! `SOCKET_PATCH_VENDORED_E2E_STRICT=1`): `npm`, `pnpm`, `corepack` (yarn
-//! classic + berry), `bun`, `uv`, `python3` (pip), `ruby` + `bundle`, `go`.
+//! classic + berry), `bun`, `uv`, `python3` (pip), `ruby` + `bundle`, `go`,
+//! `mvn` + a JDK.
 //!
 //! Network egress to: `patches-api.socket.dev`, `patch.socket.dev`,
 //! `registry.npmjs.org`, `pypi.org`, `files.pythonhosted.org`,
-//! `rubygems.org`.
+//! `rubygems.org`, `repo.maven.apache.org`.
 //!
 //! No API token is used or needed — the suite deliberately runs against the
 //! **free public proxy** with `SOCKET_NO_CONFIG=true` so a developer's
@@ -224,14 +236,9 @@ const UNPUBLISHED_ECOSYSTEMS: &[(&str, &[&str])] = &[
         "cargo",
         &["pkg:cargo/openssl", "pkg:cargo/tokio", "pkg:cargo/smallvec"],
     ),
-    (
-        "maven",
-        &[
-            "pkg:maven/org.apache.logging.log4j/log4j-core",
-            "pkg:maven/com.fasterxml.jackson.core/jackson-databind",
-            "pkg:maven/org.yaml/snakeyaml",
-        ],
-    ),
+    // maven left this list on 2026-11-17: production has published a free
+    // jackson-databind 2.7.9.2 patch since 2026-10-23, and the
+    // `maven_*_jackson_databind_delivery` legs now build against it.
     (
         "nuget",
         &[
@@ -739,6 +746,7 @@ async fn preflight_required_patches_are_published() {
         (NPM_PURL, vec![NPM_UUID]),
         (PYPI_PURL, PYPI_UUIDS.to_vec()),
         (GEM_PURL, GEM_PATCHES.iter().map(|(u, _)| *u).collect()),
+        (maven_production::PURL, vec![maven_production::UUID]),
     ];
 
     let mut failures: Vec<String> = Vec::new();
@@ -2498,7 +2506,7 @@ fn gem_manifestless_vex(
 }
 
 // ===========================================================================
-// Documented gaps — golang (nothing to vendor), deno (unsupported), canary
+// golang, maven, then the documented gaps: deno (unsupported), canary
 // ===========================================================================
 
 #[path = "golang_production/mod.rs"]
@@ -2511,6 +2519,35 @@ fn golang_vendored_pgx_delivery() {
         soft_skip!("golang_vendored", "go not on PATH");
     }
     golang_production::delivery("vendored");
+}
+
+#[path = "maven_production/mod.rs"]
+mod maven_production;
+
+/// Maven's vendored loop against production's free jackson-databind patch:
+/// the patched jar is committed under `.socket/vendor/maven2`, and a fresh
+/// checkout builds against it offline (see `maven_production/mod.rs`).
+#[test]
+#[ignore = "live production API + real Maven + Maven Central. Run with --ignored."]
+fn maven_vendored_jackson_databind_delivery() {
+    const LEG: &str = "maven_vendored_jackson_databind_delivery";
+    if let Err(why) = maven_production::delivery(maven_production::Mode::Vendored) {
+        soft_skip!(LEG, "{why}");
+    }
+}
+
+/// Maven's agent loop against the same patch: the jar in the Maven local
+/// repository is swapped for the patch service's build of it, the build
+/// keeps it under `mvn -C -U`, and the undo restores the cached jar byte for
+/// byte. It lives here beside the golang agent leg: agent mode has no
+/// production suite of its own.
+#[test]
+#[ignore = "live production API + real Maven + Maven Central. Run with --ignored."]
+fn maven_agent_jackson_databind_delivery() {
+    const LEG: &str = "maven_agent_jackson_databind_delivery";
+    if let Err(why) = maven_production::delivery(maven_production::Mode::Agent) {
+        soft_skip!(LEG, "{why}");
+    }
 }
 
 /// Deno vendored mode is not supported. Same shape as the golang guard.
@@ -2554,12 +2591,14 @@ fn deno_vendored_is_unsupported() {
     assert!(out.doc.is_none(), "{LEG}: no document: {out}");
 }
 
-/// cargo, maven, nuget and composer all implement vendored mode, but
-/// production publishes no free-tier patches for them. This probes production every run and reports the moment that
-/// changes, so coverage can be extended deliberately rather than by accident.
-/// It does not fail when patches appear;
-/// `SOCKET_PATCH_VENDORED_E2E_CANARY_STRICT=1` makes it fail, for a scheduled
-/// nag run.
+/// cargo, nuget and composer all implement vendored mode, but production
+/// publishes no free-tier patches for them. This probes production whenever
+/// the suite runs and reports the moment that changes, so coverage can be
+/// extended deliberately rather than by accident. It does not fail when
+/// patches appear; `SOCKET_PATCH_VENDORED_E2E_CANARY_STRICT=1` makes it fail,
+/// for a scheduled nag run. No workflow runs this test: CI's report comes
+/// from the hosted suite's `canary_unpublished_ecosystems`, which watches the
+/// same ecosystems.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "live production API. Run with --ignored."]
 async fn canary_unpublished_vendored_ecosystems() {
@@ -2587,8 +2626,8 @@ async fn canary_unpublished_vendored_ecosystems() {
 
     if newly_published.is_empty() {
         println!(
-            "canary_unpublished_vendored_ecosystems: cargo / maven / nuget / composer still \
-             have no free-tier published patches — their vendored-mode legs remain untestable \
+            "canary_unpublished_vendored_ecosystems: cargo / nuget / composer still have no \
+             free-tier published patches — their vendored-mode legs remain untestable \
              end-to-end against production."
         );
         return;

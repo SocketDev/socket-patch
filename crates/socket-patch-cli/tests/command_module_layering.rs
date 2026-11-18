@@ -62,6 +62,12 @@ const ALLOWED_COMMAND_IMPORTS: &[(&str, &str, &str)] = &[
         "vendor",
         "lock refusals reuse vendor's pristine-fetch verification",
     ),
+    // Replacing a recorded patch rolls it back first (#2096).
+    (
+        "agent_download",
+        "rollback",
+        "a replaced patch is rolled back by rollback's agent engine; #894",
+    ),
     // Embedded `--vex` (decision #966 Q2 / E42).
     ("apply", "vex", "embedded --vex"),
     ("scan", "vex", "embedded --vex"),

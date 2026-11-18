@@ -57,6 +57,7 @@ mod pipenv;
 mod pipenv_pylock_tests;
 pub mod presence;
 // The pnpm hosted planner lives with the format's model.
+use crate::crawlers::maven_selection::{MavenSelection, Verdict};
 use crate::formats::cargo::hosted::CargoLockPlan;
 #[cfg(test)]
 use crate::formats::cargo::hosted::CARGO_LOCK_REFERENCE_KIND;
@@ -605,6 +606,7 @@ pub fn rewrite_registry_redirect_with_pipenv_version(
         &std::collections::BTreeSet::new(),
         &yarnrc::OuterYarnMirror::default(),
         &CratesIoSource::Registry,
+        None,
     )
 }
 
@@ -671,7 +673,10 @@ fn withhold_pypi_platform_wheels<'a>(
 /// [`rewrite_registry_redirect_with_pipenv_version`] with the inputs only
 /// the host can resolve. `gradle_unreadable` are the Gradle build files
 /// the host found but could not read as text: the Gradle planner refuses
-/// the build rather than take them for absent.
+/// the build rather than take them for absent. `maven` is what Maven
+/// selects in each module of the project, read from the local repository:
+/// the pom rewriter pins a patch only where that is its base version
+/// (`None`: no such answer, and it pins as it did before there was one).
 #[allow(clippy::too_many_arguments)]
 pub fn rewrite_registry_redirect_with_host(
     files: &BTreeMap<String, String>,
@@ -682,6 +687,7 @@ pub fn rewrite_registry_redirect_with_host(
     gradle_unreadable: &std::collections::BTreeSet<String>,
     yarn_outer: &yarnrc::OuterYarnMirror,
     cargo_outer: &CratesIoSource,
+    maven: Option<&MavenSelection>,
 ) -> RewriteResult {
     let mut result = RewriteResult::default();
     let overrides = withhold_pypi_platform_wheels(overrides, &mut result);
@@ -707,6 +713,7 @@ pub fn rewrite_registry_redirect_with_host(
         gradle_unreadable,
         yarn_outer,
         cargo_outer,
+        maven,
     );
     let mut result = rewrite_groups_parallel(result, &groups);
     result.vlt_drives = vlt::vlt_drives(files, bun_lockb_present);
@@ -733,6 +740,7 @@ fn rewriter_groups<'a>(
     gradle_unreadable: &'a std::collections::BTreeSet<String>,
     yarn_outer: &'a yarnrc::OuterYarnMirror,
     cargo_outer: &'a CratesIoSource,
+    maven: Option<&'a MavenSelection>,
 ) -> Vec<RewriterGroup<'a>> {
     vec![
         Box::new(move |result| {
@@ -754,7 +762,7 @@ fn rewriter_groups<'a>(
         Box::new(move |result| rewrite_composer_lock(files, overrides, result)),
         Box::new(move |result| rewrite_nuget(files, overrides, result)),
         Box::new(move |result| rewrite_gem(files, overrides, result)),
-        Box::new(move |result| rewrite_maven_pom(files, overrides, result)),
+        Box::new(move |result| rewrite_maven_pom(files, overrides, maven, result)),
         Box::new(move |result| {
             gradle::rewrite_gradle_hosted(files, gradle_unreadable, overrides, result)
         }),
@@ -6185,6 +6193,42 @@ pub(crate) fn skip_bun_user_patched(
     true
 }
 
+/// Leave `dep` on its registry resolution when the project relies on Bun's
+/// default trust to run its install scripts (#371): Bun 1.3.5 and later
+/// trust a default-listed package only while it resolves from the npm
+/// registry, so a pin to `dep`'s URL makes every later `bun install` skip
+/// the scripts and exit 0, and a native addon (`sqlite3`) is left without
+/// its binding. A working install must not be traded for a patch, so the
+/// package is skipped, loudly, with the way to patch it. Warns, keeps the
+/// in-run VEX from assuming the uuid patched, and keeps any other lock from
+/// confirming it. `newly_pins` says whether this run would take a registry
+/// copy off the registry with no copy pinned yet: a pin an earlier run
+/// wrote stays, with [`bun_default_trust_warning`], and a new copy beside
+/// it is pinned too (Bun trusts by name, so the trust is already gone). It
+/// is asked only for a name on Bun's default list, which is rare, so the
+/// per-dep lock scan behind it stays off the hot path (#578). `true` when
+/// `dep` was skipped.
+pub(crate) fn skip_bun_default_trusted(
+    manifest: Option<&str>,
+    lock: Option<&str>,
+    name: &str,
+    dep: &DepOverride,
+    newly_pins: impl FnOnce() -> bool,
+    result: &mut RewriteResult,
+) -> bool {
+    use crate::vendor::bun_lock_text::{default_trust_skip_detail, loses_default_trust};
+    if !loses_default_trust(manifest, lock, name) || !newly_pins() {
+        return false;
+    }
+    result.bundled_skipped_uuids.insert(dep.patch_uuid.clone());
+    result.refused_bun_uuids.insert(dep.patch_uuid.clone());
+    result.warnings.push(RewriteWarning {
+        code: "redirect_bun_default_trust_skipped".into(),
+        detail: default_trust_skip_detail(name, &dep.version, "a hosted tarball URL"),
+    });
+    true
+}
+
 fn rewrite_bun_lock(
     files: &BTreeMap<String, String>,
     overrides: &[DepOverride],
@@ -6232,15 +6276,12 @@ fn rewrite_bun_lock(
     );
 
     // Decode each entry's spec once per lock, not once per (patch, entry)
-    // pair. The bundled flag needs a full JSON parse of the entry's meta
-    // object, so it is computed lazily, only for entries whose spec matches
-    // some patch, and cached (#580: the eager per-patch parse made bun scans
-    // O(entries x patches) JSON parses).
+    // pair (#580). Whether an entry is a bundled copy was decided when the
+    // lock was parsed.
     let specs: Vec<Option<String>> = entries
         .iter()
         .map(|e| e.elems.first().and_then(|s| decode_json_string(s)))
         .collect();
-    let mut bundled: Vec<Option<bool>> = vec![None; entries.len()];
 
     let mut changed = false;
     let mut pinned_any = false;
@@ -6258,6 +6299,35 @@ fn rewrite_bun_lock(
         };
         let target_spec = format!("{fname}@{}", dep.version);
         let url_spec = format!("{fname}@{}", dep.artifact_url);
+        // A default-trusted package is pinned only where an earlier run
+        // already pinned it: taking a registry copy off the registry would
+        // stop Bun from running its install scripts (#371). A bundled entry
+        // never counts as a pin: Bun unpacks it from its parent's tarball
+        // and never reads its spec, so a hosted URL there says nothing
+        // about where a registry copy installs from.
+        let newly_pins = || {
+            let already_pinned = entries.iter().zip(&specs).any(|(entry, spec)| {
+                !is_bundled_entry(entry)
+                    && spec.as_deref().is_some_and(|spec| {
+                        spec == url_spec
+                            || is_prior_hosted_bun_spec(spec, &fname, &dep.artifact_url)
+                    })
+            });
+            !already_pinned
+                && entries.iter().zip(&specs).any(|(entry, spec)| {
+                    spec.as_deref() == Some(&target_spec) && !is_bundled_entry(entry)
+                })
+        };
+        if skip_bun_default_trusted(
+            files.get("package.json").map(String::as_str),
+            Some(content),
+            &fname,
+            dep,
+            newly_pins,
+            result,
+        ) {
+            continue;
+        }
         let mut matched_any = false;
         // A non-bundled instance now resolves to the hosted URL.
         let mut wired = false;
@@ -6270,23 +6340,37 @@ fn rewrite_bun_lock(
             // reads the entry's spec (#469), so a rewrite here would count
             // as redirected (and VEX-attest the patch) while the unpatched
             // bundled bytes keep installing. Mirrors npm's `inBundle` guard.
-            // The cheap spec match runs first; the bundled parse only for
-            // a match (#580).
-            if (spec == target_spec
-                || spec == url_spec
-                || is_prior_hosted_bun_spec(spec, &fname, &dep.artifact_url))
-                && *bundled[i].get_or_insert_with(|| is_bundled_entry(entry))
+            if is_bundled_entry(entry)
+                && (spec == target_spec
+                    || spec == url_spec
+                    || is_prior_hosted_bun_spec(spec, &fname, &dep.artifact_url))
             {
                 matched_any = true;
                 result.bundled_skipped_uuids.insert(dep.patch_uuid.clone());
-                result.warnings.push(RewriteWarning {
-                    code: "redirect_bun_bundled_instance_skipped".into(),
-                    detail: format!(
+                // An entry Bun flags is a name the parent bundles. One it
+                // does not flag is a dependency of such a copy: Bun writes
+                // it from the registry's metadata and installs what the
+                // parent packed, which need not be this version.
+                let detail = if crate::vendor::bun_lock_text::declares_bundled(entry) {
+                    format!(
                         "bun.lock entry `{}` is bundled inside its parent's tarball and \
                          CANNOT be redirected — that copy stays UNPATCHED; vendor or update \
                          the bundling parent to cover it",
                         entry.key
-                    ),
+                    )
+                } else {
+                    format!(
+                        "bun.lock entry `{}` belongs to a copy bundled inside a parent's \
+                         tarball: Bun installs what the parent packed there (which may be \
+                         another version than the lock says) and never reads this entry, so \
+                         it CANNOT be redirected — any copy of {fname} in that tarball stays \
+                         UNPATCHED; vendor or update the bundling parent to cover it",
+                        entry.key
+                    )
+                };
+                result.warnings.push(RewriteWarning {
+                    code: "redirect_bun_bundled_instance_skipped".into(),
+                    detail,
                 });
                 continue;
             }
@@ -6453,7 +6537,7 @@ fn rewrite_bun_lock(
 /// override — nothing about the patch server's URL layout is assumed — and
 /// anything that fails to parse fails the match (closed): user URL deps live
 /// on other origins, and another version's artifact has a different leaf.
-fn is_prior_hosted_bun_spec(spec: &str, fname: &str, current_url: &str) -> bool {
+pub(crate) fn is_prior_hosted_bun_spec(spec: &str, fname: &str, current_url: &str) -> bool {
     let Some(old_url) = spec
         .strip_prefix(fname)
         .and_then(|rest| rest.strip_prefix('@'))
@@ -8902,9 +8986,20 @@ fn find_maven_dependency_matches(
         .collect()
 }
 
+/// Whether the root `pom.xml` among `files` heads a multi-module reactor
+/// (`<modules>` / `<subprojects>`, or Maven 4 subproject discovery), which
+/// the pom rewriter refuses whole: nothing it would ask about the build,
+/// such as what Maven selects, is needed then.
+pub fn maven_reactor_root(files: &BTreeMap<String, String>) -> bool {
+    let read = |rel: &str| files.get(rel).map(|t| t.as_bytes().to_vec());
+    let list = |dir: &str| gradle::key_list(files, dir);
+    crate::vendor::jvm::maven_reactor::is_reactor_root(&read, &list)
+}
+
 fn rewrite_maven_pom(
     files: &BTreeMap<String, String>,
     overrides: &[DepOverride],
+    selection: Option<&MavenSelection>,
     result: &mut RewriteResult,
 ) {
     let maven: Vec<&DepOverride> = overrides
@@ -8927,11 +9022,7 @@ fn rewrite_maven_pom(
     // vendored mode's reactor planner rewrites each module's declaration.
     // Maven 4 subprojects found by discovery count too (#1809): the engine
     // reads each direct subdirectory's `pom.xml` beside such a root.
-    if pom.is_some() && {
-        let read = |rel: &str| files.get(rel).map(|t| t.as_bytes().to_vec());
-        let list = |dir: &str| gradle::key_list(files, dir);
-        crate::vendor::jvm::maven_reactor::is_reactor_root(&read, &list)
-    } {
+    if pom.is_some() && maven_reactor_root(files) {
         let gas: Vec<String> = maven
             .iter()
             .map(|dep| match &dep.namespace {
@@ -9073,6 +9164,33 @@ fn rewrite_maven_pom(
                 continue;
             }
         };
+        // A `<dependencyManagement>` pin makes every occurrence of the GA
+        // one version, so it is safe only where Maven selects the patch's
+        // base version already. A build that selects another version (or
+        // does not resolve the GA at all) has nothing for this patch to
+        // replace: it is left exactly as it is, and the line says which
+        // version Maven selects instead.
+        let verdict =
+            selection.map(|s| s.verdict("pom.xml", &group_id, &artifact_id, &dep.version));
+        if let Some(Verdict::Other(_) | Verdict::Absent) = &verdict {
+            let others = match verdict {
+                Some(Verdict::Other(version)) => vec![version],
+                _ => Vec::new(),
+            };
+            result.warnings.push(RewriteWarning {
+                code: "redirect_maven_version_not_selected".into(),
+                detail: format!(
+                    "{}; pom.xml was left as it is",
+                    crate::crawlers::maven_selection::not_selected_detail(
+                        &group_id,
+                        &artifact_id,
+                        &dep.version,
+                        &others
+                    )
+                ),
+            });
+            continue;
+        }
         let all_matches = find_maven_dependency_matches(idx, &group_id, &artifact_id);
         // Only the GA's main jar is granted: the served maven2 tail holds
         // `<a>-<suffixed>.jar/.pom` and nothing else. A classifier variant
@@ -9458,6 +9576,24 @@ fn rewrite_maven_pom(
         // as a versioned match, so `versioned` is non-empty and this branch is
         // skipped (idempotent).
         if versioned.is_empty() {
+            // Nothing in this pom names a version to replace, and what
+            // Maven selects cannot be told: a pin would be a guess that
+            // may change the version the build resolves.
+            if let Some(Verdict::Undetermined(why)) = &verdict {
+                result.warnings.push(RewriteWarning {
+                    code: "redirect_maven_selection_undetermined".into(),
+                    detail: format!(
+                        "{}; pom.xml was left as it is",
+                        crate::crawlers::maven_selection::undetermined_detail(
+                            &group_id,
+                            &artifact_id,
+                            &dep.version,
+                            why
+                        )
+                    ),
+                });
+                continue;
+            }
             idx.insert_dependency_management(pom_text, &group_id, &artifact_id, &suffixed_version);
             pom_changed = true;
             pin_landed = true;
@@ -11448,6 +11584,103 @@ mod tests {
                 "redirect_maven_trusted_checksums",
             ]
         );
+    }
+
+    /// Hosted-redirects slf4j-api in a lone `pom.xml` whose module selects
+    /// `pick` for it (`None`: does not resolve it).
+    fn rewrite_pom_selecting(pom: &str, pick: Option<Result<&str, &str>>) -> RewriteResult {
+        let picks: Vec<_> = pick
+            .into_iter()
+            .map(|pick| ("pom.xml", "org.slf4j", "slf4j-api", pick))
+            .collect();
+        let selection = MavenSelection::answering(&["pom.xml"], &picks);
+        let files = BTreeMap::from([("pom.xml".to_string(), pom.to_string())]);
+        rewrite_registry_redirect_with_host(
+            &files,
+            &[maven_override()],
+            &BTreeMap::new(),
+            None,
+            false,
+            &std::collections::BTreeSet::new(),
+            &yarnrc::OuterYarnMirror::default(),
+            &CratesIoSource::Registry,
+            Some(&selection),
+        )
+    }
+
+    const TRANSITIVE_ONLY_POM: &str = "<project>\n  <dependencies>\n    <dependency>\n      \
+        <groupId>ch.qos.logback</groupId>\n      <artifactId>logback-classic</artifactId>\n      \
+        <version>1.4.14</version>\n    </dependency>\n  </dependencies>\n</project>\n";
+
+    /// A `<dependencyManagement>` pin makes every occurrence of the GA one
+    /// version, so it is written only where Maven selects the patch's
+    /// base version already.
+    #[test]
+    fn maven_pin_is_written_only_where_maven_selects_the_base_version() {
+        // Selected through another artifact: pinned, as before.
+        let r = rewrite_pom_selecting(TRANSITIVE_ONLY_POM, Some(Ok("1.7.36")));
+        let out = r.files.get("pom.xml").expect("pom rewritten");
+        assert!(
+            out.contains(&format!("<version>{MAVEN_SUFFIXED}</version>")),
+            "{out}"
+        );
+        assert!(warning_codes(&r).contains(&"redirect_maven_dep_management_added"));
+
+        // Maven selects another version, or does not resolve the GA:
+        // nothing is written, and the line says what Maven selects.
+        for (pick, says) in [
+            (
+                Some(Ok("2.0.9")),
+                "Maven selects org.slf4j:slf4j-api 2.0.9 in this build, not 1.7.36",
+            ),
+            (None, "no module of this build resolves org.slf4j:slf4j-api"),
+        ] {
+            let r = rewrite_pom_selecting(TRANSITIVE_ONLY_POM, pick);
+            assert!(r.files.is_empty() && r.edits.is_empty(), "{:?}", r.files);
+            assert_eq!(
+                warning_codes(&r),
+                vec!["redirect_maven_version_not_selected"]
+            );
+            assert!(
+                r.warnings[0].detail.contains(says),
+                "{}",
+                r.warnings[0].detail
+            );
+        }
+    }
+
+    /// What Maven selects cannot be told: no pin is written on a guess,
+    /// but a declaration that names the base version is still rewritten
+    /// where it stands.
+    #[test]
+    fn maven_undetermined_selection_pins_nothing_new() {
+        let unread = Some(Err(
+            "the pom of ch.qos.logback:logback-classic:1.4.14 is not in the local Maven repository",
+        ));
+        let r = rewrite_pom_selecting(TRANSITIVE_ONLY_POM, unread);
+        assert!(r.files.is_empty() && r.edits.is_empty(), "{:?}", r.files);
+        assert_eq!(
+            warning_codes(&r),
+            vec!["redirect_maven_selection_undetermined"]
+        );
+        let detail = &r.warnings[0].detail;
+        assert!(
+            detail.contains("logback-classic:1.4.14 is not in the local Maven repository")
+                && detail.contains("mvn -q dependency:resolve"),
+            "{detail}"
+        );
+
+        let direct = "<project>\n  <dependencies>\n    <dependency>\n      \
+            <groupId>org.slf4j</groupId>\n      <artifactId>slf4j-api</artifactId>\n      \
+            <version>1.7.36</version>\n    </dependency>\n  </dependencies>\n</project>\n";
+        let r = rewrite_pom_selecting(direct, unread);
+        let out = r.files.get("pom.xml").expect("pom rewritten");
+        assert!(
+            out.contains(&format!("<version>{MAVEN_SUFFIXED}</version>")),
+            "{out}"
+        );
+        assert!(!out.contains("<dependencyManagement>"), "{out}");
+        assert!(!warning_codes(&r).contains(&"redirect_maven_selection_undetermined"));
     }
 
     /// Fail-closed refusals: a `${property}` version refuses the whole dep (no
@@ -14346,6 +14579,7 @@ mod tests {
             &std::collections::BTreeSet::new(),
             &refusing[3],
             &CratesIoSource::Registry,
+            None,
         );
         assert!(!r.files.contains_key("yarn.lock"));
         assert!(r
@@ -15077,13 +15311,42 @@ mod tests {
         assert!(out.contains("http://p.test/lp.tgz"), "{out}");
         assert!(r.warnings.is_empty(), "{:?}", r.warnings);
 
-        // Unsupported lockfileVersion (a future 3) → refusal.
+        // lockfileVersion 3 (bun >= 1.4 with a nested override or a path
+        // resolution in package.json): the head's `overrides` nests, the
+        // `packages` grammar is unchanged, so the rewrite proceeds too.
         let mut files = BTreeMap::new();
         files.insert(
             "bun.lock".to_string(),
             bun_lock_file(
                 "\"left-pad\": [\"left-pad@1.3.0\", \"\", {}, \"sha512-OLD==\"]",
                 3,
+            )
+            .replace(
+                "  \"packages\": {",
+                "  \"overrides\": {\n    \"rc\": {\n      \"left-pad\": \"1.3.0\",\n    },\n  },\n  \"packages\": {",
+            ),
+        );
+        let mut r = RewriteResult::default();
+        rewrite_bun_lock(&files, std::slice::from_ref(&ovr), &mut r);
+        let out = r
+            .files
+            .get("bun.lock")
+            .expect("a lockfileVersion-3 lock must be rewritten like a v2 lock");
+        assert!(out.contains("\"lockfileVersion\": 3,"), "{out}");
+        assert!(
+            out.contains("    \"rc\": {\n      \"left-pad\": \"1.3.0\",\n    },"),
+            "the nested overrides head must survive verbatim: {out}"
+        );
+        assert!(out.contains("http://p.test/lp.tgz"), "{out}");
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+
+        // Unsupported lockfileVersion (a future 4) → refusal.
+        let mut files = BTreeMap::new();
+        files.insert(
+            "bun.lock".to_string(),
+            bun_lock_file(
+                "\"left-pad\": [\"left-pad@1.3.0\", \"\", {}, \"sha512-OLD==\"]",
+                4,
             ),
         );
         let mut r = RewriteResult::default();
@@ -15093,11 +15356,11 @@ mod tests {
         assert!(
             r.warnings[0]
                 .detail
-                .contains("lockfileVersion 3, newer than this socket-patch release supports")
-                && r.warnings[0].detail.contains("(0, 1 and 2)")
+                .contains("lockfileVersion 4, newer than this socket-patch release supports")
+                && r.warnings[0].detail.contains("(0 to 3)")
                 && r.warnings[0].detail.contains("update socket-patch"),
             "the refusal must name the found version, the supported set and a remedy that \
-             can work (a v3 lock was written by a NEWER Bun): {}",
+             can work (a v4 lock was written by a NEWER Bun): {}",
             r.warnings[0].detail
         );
         // One message for both modes: the hosted detail IS the shared gate's
@@ -15942,15 +16205,18 @@ mod tests {
     }
 
     /// REGRESSION (#371): from Bun 1.3.5 on, Bun's default trusted list
-    /// (better-sqlite3, esbuild, sharp, simple-git-hooks, …) applies only to
-    /// packages resolved from the npm registry, so a default-trusted package
-    /// rewired to a hosted URL has its install scripts skipped with exit 0.
-    /// The rewrite says so, on the first run and on an already-wired re-run;
-    /// a project that declares `trustedDependencies` (in package.json or
-    /// bun.lock's mirror) decides trust by name alone and is not warned, nor
-    /// is a package off the default list.
+    /// (better-sqlite3, esbuild, sharp, simple-git-hooks, sqlite3, …)
+    /// applies only to packages resolved from the npm registry, so a
+    /// default-trusted package rewired to a hosted URL has its install
+    /// scripts skipped with exit 0 (measured: `sqlite3@5.1.4` installs
+    /// without its native binding and `require` throws). Such a package is
+    /// left on the registry, unpatched, with the way to patch it; one an
+    /// earlier run already pinned keeps its pin and the warning. A project
+    /// that declares `trustedDependencies` (in package.json or bun.lock's
+    /// mirror) decides trust by name alone and is rewired without a word,
+    /// as is a package off the default list.
     #[test]
-    fn bun_lock_default_trusted_package_warns_that_trust_is_lost() {
+    fn bun_lock_default_trusted_package_is_left_on_the_registry() {
         let sha512 = format!("sha512-{}==", "A".repeat(86));
         let hooks = npm_override(
             "simple-git-hooks",
@@ -15979,11 +16245,19 @@ mod tests {
 
         let lock = bun_lock_file(entries, 1);
         let first = run(&lock, Some(manifest));
-        let wired = first.files.get("bun.lock").expect("both rewired").clone();
-        assert_eq!(first.edits.len(), 2, "{:?}", first.edits);
+        let rewritten = first.files.get("bun.lock").expect("is-number rewired");
+        assert_eq!(first.edits.len(), 1, "{:?}", first.edits);
+        assert_eq!(first.edits[0].key.as_deref(), Some("is-number"));
+        assert!(
+            rewritten.contains(
+                "\"simple-git-hooks\": [\"simple-git-hooks@2.11.1\", \"\", { \"bin\": \
+                 { \"simple-git-hooks\": \"cli.js\" } }, \"sha512-OLD==\"],"
+            ),
+            "the default-trusted package keeps its registry entry: {rewritten}"
+        );
         assert_eq!(
             warning_codes(&first),
-            vec!["redirect_bun_default_trust_lost"],
+            vec!["redirect_bun_default_trust_skipped"],
             "{:?}",
             first.warnings
         );
@@ -15991,21 +16265,37 @@ mod tests {
         assert!(
             detail.contains("simple-git-hooks@2.11.1")
                 && detail.contains("trustedDependencies")
-                && detail.contains("1.3.5"),
+                && detail.contains("1.3.5")
+                && detail.contains("stays UNPATCHED"),
             "{detail}"
         );
+        // Never assumed patched, and no other lock may confirm it.
+        assert!(first.bundled_skipped_uuids.contains(&hooks.patch_uuid));
+        assert!(first.refused_bun_uuids.contains(&hooks.patch_uuid));
+        assert!(!first.bundled_skipped_uuids.contains(&other.patch_uuid));
         // Without a readable manifest Bun still has no explicit list.
         assert_eq!(
             warning_codes(&run(&lock, None)),
-            vec!["redirect_bun_default_trust_lost"]
+            vec!["redirect_bun_default_trust_skipped"]
         );
-        // An already-wired re-run keeps saying so until trust is declared.
+        // A lock an earlier release already pinned keeps its pin, and
+        // keeps hearing that the scripts do not run until trust is declared.
+        let wired = run(
+            &lock,
+            Some(r#"{"name":"app","trustedDependencies":["simple-git-hooks"]}"#),
+        )
+        .files
+        .get("bun.lock")
+        .expect("both rewired once trust is declared")
+        .clone();
+        assert!(wired.contains("http://p.test/simple-git-hooks-2.11.1.tgz"));
         let rerun = run(&wired, Some(manifest));
         assert!(rerun.files.is_empty() && rerun.edits.is_empty());
         assert_eq!(
             warning_codes(&rerun),
             vec!["redirect_bun_default_trust_lost"]
         );
+        assert!(!rerun.refused_bun_uuids.contains(&hooks.patch_uuid));
 
         // An explicit list (even one that omits the package: Bun then never
         // trusted it by default) leaves trust unchanged by the rewire.
@@ -16025,6 +16315,13 @@ mod tests {
         );
         assert_ne!(mirrored, lock);
         assert!(run(&mirrored, None).warnings.is_empty());
+        // Bun takes the list from package.json: with a readable manifest
+        // that declares none, a copy left in the lock keeps no script
+        // running, so the package is still left on the registry.
+        assert_eq!(
+            warning_codes(&run(&mirrored, Some(manifest))),
+            vec!["redirect_bun_default_trust_skipped"]
+        );
 
         // A bundled copy is not rewired, so its trust is not the rewire's
         // to lose (its own warning says it stays unpatched).
@@ -16035,10 +16332,30 @@ mod tests {
         );
         let r = run(&bundled, Some(manifest));
         assert!(
-            !warning_codes(&r).contains(&"redirect_bun_default_trust_lost"),
+            !warning_codes(&r)
+                .iter()
+                .any(|code| code.starts_with("redirect_bun_default_trust")),
             "{:?}",
             r.warnings
         );
+
+        // A bundled copy that carries the hosted URL is not a pin either:
+        // Bun never reads its spec, so the registry copy beside it still
+        // runs its scripts and stays on the registry.
+        let bundled_url = bun_lock_file(
+            "\"p/simple-git-hooks\": [\"simple-git-hooks@http://p.test/simple-git-hooks-2.11.1.tgz\", \
+             { \"bundled\": true }, \"sha512-OLD==\"],\n    \
+             \"simple-git-hooks\": [\"simple-git-hooks@2.11.1\", \"\", {}, \"sha512-OLD==\"],",
+            1,
+        );
+        let r = run(&bundled_url, Some(manifest));
+        assert!(r.files.is_empty() && r.edits.is_empty(), "{:?}", r.edits);
+        assert!(
+            warning_codes(&r).contains(&"redirect_bun_default_trust_skipped"),
+            "{:?}",
+            r.warnings
+        );
+        assert!(r.refused_bun_uuids.contains(&hooks.patch_uuid));
     }
 
     /// A CRLF bun.lock (Windows `core.autocrlf` checkout) must keep CRLF on

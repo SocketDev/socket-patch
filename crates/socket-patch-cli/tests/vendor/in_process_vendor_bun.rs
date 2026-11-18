@@ -14,7 +14,7 @@
 //!   the 2-tuple `["consumer@workspace:packages/consumer", { "dependencies":
 //!   { … } }]`;
 //! * a malformed `bun.lockb` with no text lock;
-//! * a malformed lock (`lockfileVersion` 3, non-canonical `"packages" : {`
+//! * a malformed lock (`lockfileVersion` 4, non-canonical `"packages" : {`
 //!   header, unterminated entry) and — on Unix — a FIFO squatting
 //!   `bun.lock`.
 //!
@@ -158,9 +158,9 @@ const DIRECT_V1_TEMPLATE: &str = r#"{
 }
 "#;
 
-/// A future/hand-edited lock the version gate refuses: lockfileVersion 3,
+/// A future/hand-edited lock the version gate refuses: lockfileVersion 4,
 /// a non-canonical `"packages" : {` header and an unterminated entry.
-const MALFORMED_V3_LOCK: &str = "{\n  \"lockfileVersion\": 3,\n  \"packages\" : {\n    \"left-pad\": [\"left-pad@1.3.0\", \"\",\n  }\n}\n";
+const MALFORMED_V4_LOCK: &str = "{\n  \"lockfileVersion\": 4,\n  \"packages\" : {\n    \"left-pad\": [\"left-pad@1.3.0\", \"\",\n  }\n}\n";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LockShape {
@@ -170,7 +170,7 @@ enum LockShape {
     V0Direct,
     V1Direct,
     MalformedLockb,
-    MalformedV3,
+    MalformedV4,
 }
 
 impl LockShape {
@@ -190,7 +190,7 @@ impl LockShape {
             LockShape::V0Workspace => WS_V0_TEMPLATE.to_string(),
             LockShape::V0Direct => DIRECT_V0_TEMPLATE.to_string(),
             LockShape::V1Direct => DIRECT_V1_TEMPLATE.to_string(),
-            LockShape::MalformedV3 => return Some(MALFORMED_V3_LOCK.to_string()),
+            LockShape::MalformedV4 => return Some(MALFORMED_V4_LOCK.to_string()),
             LockShape::MalformedLockb => return None,
         };
         Some(text.replace("{REGISTRY}", &registry))
@@ -550,7 +550,7 @@ async fn scan_vendored_refuses_malformed_bun_lockb_before_download() {
 
 #[tokio::test]
 async fn scan_vendored_refuses_malformed_v3_lock_before_download() {
-    assert_scan_refuses(LockShape::MalformedV3, VERSION_CODE).await;
+    assert_scan_refuses(LockShape::MalformedV4, VERSION_CODE).await;
 }
 
 /// A refused scan on a project with a legacy (agent-mode) manifest: the

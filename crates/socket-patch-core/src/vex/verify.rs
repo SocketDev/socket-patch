@@ -193,7 +193,18 @@ pub async fn applied_patches_with_copies(
         let vendor_entry =
             vendor.and_then(|ctx| lookup_entry(&ctx.entries, purl).map(|e| (ctx, e)));
         let result = if let Some((ctx, entry)) = vendor_entry {
-            verify_vendored_patch_record(&ctx.project_root, entry, record).await
+            match verify_vendored_patch_record(&ctx.project_root, entry, record).await {
+                // The artifact holds the patch; the Bun lock must also be
+                // pinned to these very bytes for an install to deliver it.
+                Ok(()) if entry.flavor.as_deref() == Some("bun") => {
+                    match crate::vendor::bun_lock::lock_pin_mismatch(entry, &ctx.project_root).await
+                    {
+                        Some(_) => Err("vendor_lock_pin_mismatch".to_string()),
+                        None => Ok(()),
+                    }
+                }
+                verdict => verdict,
+            }
         } else if let Some(copy_dir) = vendor.and_then(|ctx| ctx.go_patches.get(purl)) {
             verify_patch_record(copy_dir, record).await
         } else if let Some(copies) = vendor.and_then(|ctx| ctx.hosted.get(purl)) {

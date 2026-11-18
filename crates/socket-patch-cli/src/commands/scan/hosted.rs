@@ -1553,6 +1553,32 @@ async fn run_redirect_selected_untracked(
     // parent directory's and `$CARGO_HOME`'s): a directory source or local
     // registry in any of them refuses the cargo rewrite like a project one.
     let cargo_outer = || CargoCrawler::crates_io_source_for(&common.cwd);
+    // What Maven selects in each module, from the poms its local repository
+    // holds: a pin is written only where that is the patch's base version.
+    // Read once per run, off the runtime (the walk reads a pom per artifact
+    // of the build), and only for a pom the rewriter will edit.
+    let maven_selection_read = if candidates.iter().any(|c| c.dep.ecosystem == "maven")
+        && read.files.contains_key("pom.xml")
+        && !socket_patch_core::patch::redirect::maven_reactor_root(&read.files)
+    {
+        let cwd = common.cwd.clone();
+        Some(
+            tokio::task::spawn_blocking(move || {
+                socket_patch_core::crawlers::maven_selection::MavenSelection::for_project(&cwd)
+            })
+            .await
+            // A selection that could not be read answers "undetermined", never
+            // "no selection": `None` would let the rewriter pin unchecked.
+            .unwrap_or_else(|err| {
+                socket_patch_core::crawlers::maven_selection::MavenSelection::unavailable(format!(
+                    "the Maven selection could not be read ({err})"
+                ))
+            }),
+        )
+    } else {
+        None
+    };
+    let maven_selection = || maven_selection_read.clone();
     // The scan runs in the install's environment: a pnpm setting there
     // (`pnpm_config_trust_lockfile`) overrides the project's files.
     let pnpm_env = |var: &str| std::env::var(var).ok();
@@ -1570,6 +1596,7 @@ async fn run_redirect_selected_untracked(
         npm_outer: &npm_outer,
         yarn_classic_outer: &yarn_classic_outer,
         cargo_outer: &cargo_outer,
+        maven_selection: &maven_selection,
         pnpm_env: &pnpm_env,
         blocking: true,
         takeover_uuids: takeover_uuids.clone(),

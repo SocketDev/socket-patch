@@ -1098,6 +1098,19 @@ fn entry_wiring_checked(root: &Path, entry: &VendorEntry, attest: bool) -> Resul
         if maven && wired == Ok(true) {
             wired = maven_reactor::attestable_checked(&read, &list, &c).map_err(|e| e.detail);
         }
+        // A pin can sit in one module's pom: the patch is attested only
+        // when every module that resolves the base version (or may, where
+        // that cannot be told) is wired. `vendor --check` does not ask
+        // this (`attest` is false there): it would make the check depend
+        // on what the machine's local repository holds.
+        if attest && maven && wired == Ok(true) {
+            let selection = crate::crawlers::maven_selection::MavenSelection::for_project(root);
+            wired = match maven_reactor::unwired_modules(&read, &list, &c, &selection) {
+                Ok(None) => Ok(true),
+                Ok(Some(why)) => Err(why),
+                Err(e) => Err(e.detail),
+            };
+        }
         wired
     };
     if let Some(e) = reader.read_error.borrow().as_ref() {
@@ -1314,15 +1327,33 @@ pub fn check_entry_in(
             attempts.push((as_committed, None));
         }
     }
+    // Where the pins are is not judged here. `vendor` places them when a
+    // patch is first wired, from what the local repository of that machine
+    // could tell it, and keeps them where they are afterwards: the
+    // committed poms are the record. Checking them against this machine's
+    // local repository would pass or fail the same checkout depending on
+    // what happens to be cached, so every pin (and every absence of one)
+    // is taken as it stands; a patch no pom wires at all still fails
+    // below.
+    let as_committed = matches!(shape, Shape::MavenReactor | Shape::Mixed).then(|| {
+        crate::crawlers::maven_selection::MavenSelection::unavailable(
+            "vendor --check does not judge where a pin belongs",
+        )
+    });
+    let attempts: Vec<_> = attempts
+        .iter()
+        .map(|(patch, external)| (patch, *external, as_committed.as_ref()))
+        .collect();
     let mut drift: Option<String> = None;
     let mut in_sync: Option<super::JvmPlan> = None;
-    for (patch, external) in &attempts {
-        let outcome = super::plan_with_external(shape, &read, &list, patch, config, *external)
-            .map_err(|e| e.detail)
-            .and_then(|plan| match plan.writes.first() {
-                Some(w) => Err(format!("vendored wiring or metadata drifted: {}", w.rel)),
-                None => Ok(plan),
-            });
+    for (patch, external, selection) in &attempts {
+        let outcome =
+            super::plan_with_selection(shape, &read, &list, patch, config, *external, *selection)
+                .map_err(|e| e.detail)
+                .and_then(|plan| match plan.writes.first() {
+                    Some(w) => Err(format!("vendored wiring or metadata drifted: {}", w.rel)),
+                    None => Ok(plan),
+                });
         match outcome {
             Ok(plan) => {
                 in_sync = Some(plan);

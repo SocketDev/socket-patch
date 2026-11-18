@@ -159,8 +159,11 @@ impl<'a> VendoredBackend<'a> {
     ) -> Vec<RevertedEntry> {
         let mut out = Vec::with_capacity(keys.len());
         // The gems a wet revert put back on their upstream entries: the
-        // index of each one's element in `out`, and its purl.
+        // index of each one's element in `out`, and its purl. With the
+        // patch record of each one the ledger alone owned (a detached
+        // entry), which the entry takes with it.
         let mut unwound_gems: Vec<(usize, String)> = Vec::new();
+        let mut gem_records = std::collections::BTreeMap::new();
         for key in keys {
             let Some(entry) = state.entries.get(key).cloned() else {
                 out.push(RevertedEntry {
@@ -228,6 +231,9 @@ impl<'a> VendoredBackend<'a> {
                     .await;
                     if is_gem(&entry.ecosystem) {
                         unwound_gems.push((out.len(), entry.base_purl.clone()));
+                        if let (true, Some(record)) = (entry.detached, &entry.record) {
+                            gem_records.insert(entry.base_purl.clone(), record.clone());
+                        }
                     }
                 }
             }
@@ -243,7 +249,8 @@ impl<'a> VendoredBackend<'a> {
                 break;
             }
         }
-        self.refresh_unwound_gems(&unwound_gems, &mut out).await;
+        self.refresh_unwound_gems(&unwound_gems, &gem_records, &mut out)
+            .await;
         out
     }
 
@@ -251,7 +258,10 @@ impl<'a> VendoredBackend<'a> {
     /// that a hosted scan replaced with the patched build before the gem
     /// was vendored still is that build, so the app would keep running the
     /// patch under an upstream lock, and `bundle pristine` would fail on
-    /// the upstream checksum (#2083). Bring those copies back to the
+    /// the upstream checksum (#2083). One that agent mode patched in place
+    /// before the gem was vendored still holds the patched files, and
+    /// `records` (the record of each unwound gem that the ledger alone
+    /// owned) is the last thing that can tell (#2093). Bring those copies back to the
     /// upstream gem as the hosted unwind does, and name what is left (the
     /// "Gem stale-install guard" section of CLI_CONTRACT.md).
     ///
@@ -259,14 +269,22 @@ impl<'a> VendoredBackend<'a> {
     /// one, on the entry of its gem. A human run gets the progress lines on
     /// the last unwound gem's entry, so they print once every revert is
     /// reported, and ONE warning for the gems still on their patched build.
-    async fn refresh_unwound_gems(&self, unwound: &[(usize, String)], out: &mut [RevertedEntry]) {
+    async fn refresh_unwound_gems(
+        &self,
+        unwound: &[(usize, String)],
+        records: &std::collections::BTreeMap<String, PatchRecord>,
+        out: &mut [RevertedEntry],
+    ) {
         let Some((first, _)) = unwound.first() else {
             return;
         };
         let (first, last) = (*first, unwound[unwound.len() - 1].0);
         let purls: Vec<String> = unwound.iter().map(|(_, purl)| purl.clone()).collect();
+        let records = self.ended_records(records).await;
+        let records = &records;
         let refresh =
-            crate::commands::gem_refresh::after_vendored_unwind(&self.common, &purls).await;
+            crate::commands::gem_refresh::after_vendored_unwind(&self.common, &purls, records)
+                .await;
         for (index, purl) in unwound {
             if refresh.refreshed_installs.contains(purl) {
                 out[*index].gem_install_refreshed = true;
@@ -295,6 +313,36 @@ impl<'a> VendoredBackend<'a> {
                 summary.paragraph(),
             ));
         }
+    }
+
+    /// The patch record each unwound gem's installed copies are judged by:
+    /// `ledger` (the records of detached entries, which the ledger alone
+    /// owned) without the gems `.socket/manifest.json` has a record for.
+    /// The in-place patch of such a gem is agent mode's and on record
+    /// there, so this unwind does not end it. A manifest that cannot be
+    /// read proves nothing, so no gem is judged then.
+    async fn ended_records(
+        &self,
+        ledger: &std::collections::BTreeMap<String, PatchRecord>,
+    ) -> std::collections::BTreeMap<String, PatchRecord> {
+        use socket_patch_core::utils::purl_key::PurlKey;
+        if ledger.is_empty() {
+            return Default::default();
+        }
+        let manifest = socket_patch_core::manifest::operations::read_manifest(
+            &self.common.resolved_manifest_path(),
+        )
+        .await;
+        let in_manifest: std::collections::HashSet<PurlKey> = match manifest {
+            Ok(Some(manifest)) => manifest.patches.keys().map(|k| PurlKey::new(k)).collect(),
+            Ok(None) => Default::default(),
+            Err(_) => return Default::default(),
+        };
+        ledger
+            .iter()
+            .filter(|(purl, _)| !in_manifest.contains(&PurlKey::new(purl)))
+            .map(|(purl, record)| (purl.clone(), record.clone()))
+            .collect()
     }
 
     /// Dropping a vendored Go `replace` leaves a committed

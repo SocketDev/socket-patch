@@ -181,6 +181,94 @@ pub(crate) fn read_archive_bytes_to_map_any_root(
     Ok(out)
 }
 
+/// The first of `files` (package-relative paths, as a patch record keys
+/// them) that an npm-family installer could write from an archive entry
+/// other than the one the lenient decoder read, or `None` when each is
+/// written exactly once.
+///
+/// The installers (npm, pnpm, yarn, bun) strip the FIRST path segment of
+/// every entry whatever it is, extract links and other entry types as
+/// well as regular files, and let a later entry overwrite an earlier one;
+/// on a case-insensitive filesystem names differing only in case collide
+/// too. The decoder strips only a literal `package/` and keeps regular
+/// files. So an archive can hold the patched `package/index.js`, which is
+/// what gets hashed, and a second `other/index.js`, `package/./index.js`,
+/// `package/INDEX.JS` or a link named `package/index.js`, which is what
+/// gets installed. A file counts as shadowed when more than one entry
+/// lands on its path (ASCII case folded), or when an entry that is not a
+/// directory sits where one of its parent directories must be.
+///
+/// Unlike [`read_archive_bytes_to_map_strict`] this judges only the listed
+/// files: an upstream tarball with a link, a non-ASCII name or a case twin
+/// somewhere else still passes.
+pub(crate) fn shadowed_member(
+    bytes: &[u8],
+    files: &[String],
+) -> Result<Option<String>, ArchiveError> {
+    use tar::EntryType;
+
+    // Extractors normalize `..` as well as `.` and empty segments, so
+    // `package/x/../index.js` lands on `index.js`. A `..` above the start
+    // is dropped: what it would reach is outside the package either way.
+    let fold = |path: &str| -> String {
+        let mut segments: Vec<String> = Vec::new();
+        for segment in path.split('/') {
+            match segment {
+                "" | "." => {}
+                ".." => {
+                    segments.pop();
+                }
+                _ => segments.push(segment.to_ascii_lowercase()),
+            }
+        }
+        segments.join("/")
+    };
+    let mut writers: HashMap<String, usize> = files
+        .iter()
+        .map(|file| (fold(normalize_file_path(file)), 0))
+        .collect();
+    let bounded = GzDecoder::new(bytes).take(MAX_TOTAL_DECOMPRESSED_BYTES);
+    let mut tar = Archive::new(bounded);
+    let mut entry_count: usize = 0;
+    for entry in tar.entries()? {
+        let entry = entry?;
+        entry_count += 1;
+        if entry_count > MAX_ENTRIES {
+            return Err(ArchiveError::TooManyEntries(MAX_ENTRIES));
+        }
+        let entry_type = entry.header().entry_type();
+        if matches!(
+            entry_type,
+            EntryType::XGlobalHeader
+                | EntryType::XHeader
+                | EntryType::GNULongName
+                | EntryType::GNULongLink
+                | EntryType::Directory
+        ) {
+            continue;
+        }
+        let raw = entry.path()?.to_string_lossy().replace('\\', "/");
+        let folded = fold(&raw);
+        // What is left after the installer drops the first segment.
+        let Some((_, installed)) = folded.split_once('/') else {
+            continue;
+        };
+        if let Some(count) = writers.get_mut(installed) {
+            *count += 1;
+        } else if let Some(file) = writers.keys().find(|file| {
+            file.strip_prefix(installed)
+                .is_some_and(|rest| rest.starts_with('/'))
+        }) {
+            return Ok(Some(file.clone()));
+        }
+    }
+    Ok(writers
+        .into_iter()
+        .filter(|(_, count)| *count > 1)
+        .map(|(file, _)| file)
+        .min())
+}
+
 /// Read a source distribution without npm's `package/` prefix convention.
 /// Uses the same strict member checks and decompression limits.
 pub(crate) fn read_sdist_tar_bytes_to_map_strict(
@@ -747,6 +835,73 @@ mod tests {
         let mut gz = GzEncoder::new(file, Compression::default());
         gz.write_all(&tar_bytes).unwrap();
         gz.finish().unwrap();
+    }
+
+    /// The raw `entries` (name, ustar type flag, data) as a `.tar.gz`.
+    fn raw_tar_gz(entries: &[(&str, u8, &[u8])]) -> Vec<u8> {
+        let mut tar_bytes = Vec::new();
+        for (name, kind, data) in entries {
+            tar_bytes.extend_from_slice(&ustar_block(name.as_bytes(), *kind, data.len() as u64));
+            tar_bytes.extend_from_slice(data);
+            tar_bytes.extend(std::iter::repeat_n(0u8, (512 - (data.len() % 512)) % 512));
+        }
+        tar_bytes.extend([0u8; 1024]);
+        let mut gz = GzEncoder::new(Vec::new(), Compression::default());
+        gz.write_all(&tar_bytes).unwrap();
+        gz.finish().unwrap()
+    }
+
+    /// npm-family installers strip the first path segment whatever it is,
+    /// extract links as well as files, and let a later entry win. A patched
+    /// file is shadowed when another entry lands on its path or where one
+    /// of its directories must be; anything odd elsewhere in the archive
+    /// (which upstream tarballs do contain, and vendoring accepts) is not
+    /// this check's business.
+    #[test]
+    fn shadowed_member_judges_only_the_listed_files() {
+        const FILE: u8 = b'0';
+        const SYMLINK: u8 = b'2';
+        const DIR: u8 = b'5';
+        let files = vec!["package/index.js".to_string(), "lib/util.js".to_string()];
+        let base: &[(&str, u8, &[u8])] = &[
+            ("package/", DIR, b""),
+            ("package/index.js", FILE, b"patched"),
+            ("package/lib/", DIR, b""),
+            ("package/lib/util.js", FILE, b"patched"),
+            ("package/README.md", FILE, b"docs"),
+        ];
+        let with = |extra: &[(&'static str, u8, &'static [u8])]| {
+            let mut entries = base.to_vec();
+            entries.extend_from_slice(extra);
+            shadowed_member(&raw_tar_gz(&entries), &files).unwrap()
+        };
+        assert_eq!(with(&[]), None, "the canonical shape");
+        // Oddities that touch no patched file.
+        assert_eq!(with(&[("package/docs", SYMLINK, b"")]), None);
+        assert_eq!(with(&[("package/caf\u{e9}.txt", FILE, b"x")]), None);
+        assert_eq!(with(&[("package/readme.md", FILE, b"case twin")]), None);
+        assert_eq!(with(&[("other/unrelated.js", FILE, b"x")]), None);
+        // A second entry the installer writes over a patched file.
+        for (extra, shadowed) in [
+            (("other/index.js", FILE), "index.js"),
+            (("package/./index.js", FILE), "index.js"),
+            (("package//index.js", FILE), "index.js"),
+            (("package/INDEX.JS", FILE), "index.js"),
+            (("package/x/../index.js", FILE), "index.js"),
+            (("package/lib/../lib/util.js", FILE), "lib/util.js"),
+            (("package/index.js", SYMLINK), "index.js"),
+            (("package/index.js", FILE), "index.js"),
+            (("x/lib/util.js", FILE), "lib/util.js"),
+            // Not a directory where `lib/` must be.
+            (("other/lib", SYMLINK), "lib/util.js"),
+            (("package/LIB", FILE), "lib/util.js"),
+        ] {
+            assert_eq!(
+                with(&[(extra.0, extra.1, b"original")]),
+                Some(shadowed.to_string()),
+                "{extra:?}"
+            );
+        }
     }
 
     #[test]

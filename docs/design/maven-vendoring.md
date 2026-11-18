@@ -72,7 +72,9 @@ The backend writes:
   jar, suffixed POM, SHA-1 sidecars, and an ownership marker.
 - `.socket/vendor/maven2/.gitattributes`: disables line-ending conversion of
   committed repository bytes.
-- A shared file repository and dependency-management pins in each local root.
+- A shared file repository in each local root, and dependency-management pins
+  where Maven selects the patched version (the local root, or the modules
+  that select it when their siblings do not; see below).
 - Rewrites of conflicting base-version literals and resolved local properties,
   including profiles and local parent POMs outside the module list.
 - Two lines in `.mvn/maven.config`: offline file protocol access and the local
@@ -141,6 +143,45 @@ fetched, the root is not pinned either (`management_unresolved`, resolve the
 project once and vendor again). A re-run after a BOM bump drops the pin the
 same way. `vendor --check` reads that metadata from the local repository only
 and accepts either decision when some of it is missing.
+
+A pin makes every occurrence of the artifact one version, in its pom and in
+every module that inherits it, so it is written only where Maven selects the
+patch's base version already. The selection is read from the reactor's poms
+and the poms the Maven local repository holds: nearest declaration first, the
+first declared on a tie, the module's own management over every transitive
+version, `<exclusions>`, `optional`, scopes and version ranges as Maven 3's
+resolver applies them. The pin goes in the highest pom whose modules all
+select the base version or do not resolve the artifact: the local root when
+the whole reactor under it agrees, else the poms below it that do, down to one
+module's own `pom.xml`. A module that resolves another version is never
+reached by a pin, and a patch for that other version is pinned in that module
+beside the first. A pom that manages the artifact itself takes no pin, and
+neither does a root a conflicting declaration rules out; the poms below them
+are still placed. A parent that resolves the base version itself above a
+module that resolves another takes no pin either (`pin_would_move_module`):
+Maven's management always reaches the children, so there is no pin that
+patches the parent and leaves the child alone. `vex` attests the patch only
+when every module that resolves the base version is reached by its wiring. When no
+module of the build selects the base version the patch is skipped before
+anything is downloaded (`vendor_maven_version_not_selected`, exit 0, naming
+the version Maven selects). When a module's selection cannot be read (a pom
+the local repository lacks among what the module resolves, a profile that may
+change the graph, a Maven 4 build), it gets no new pin and an existing one is
+left alone
+(`selection_undetermined`); a declaration that names the base version is
+rewritten either way, since that replaces a version where it stands.
+The fallback repository stays in each local root, whichever pom holds the
+pin.
+
+Where the pins go is decided when a patch is first wired, and the committed
+poms are the record: a later run over poms that already wire the patch keeps
+every pin where it is and adds none, whatever that machine's local repository
+holds, so a checkout plans the same everywhere and a re-run is a no-op.
+`vendor --check` does not judge where a pin belongs. A pin of a superseded
+patch still moves to the new suffix in place, and a pin that is certain to
+move a module is taken out: when the build no longer selects a pinned version
+at all, the run removes the pin and says so in its
+`vendor_maven_version_not_selected` skip.
 
 Maven 3.9.2+ can read the repository tail without copying jars into `~/.m2` and
 without routing through mirrors. Older Maven versions use the fallback file

@@ -146,7 +146,9 @@ pub async fn detect_product(cwd: &Path) -> DetectResult {
 }
 
 fn parse_package_json(content: &str) -> Option<String> {
-    let v: serde_json::Value = serde_json::from_str(strip_bom(content)).ok()?;
+    // As Bun reads it: a `package.json` with comments or trailing commas
+    // still installs there, and still names the project.
+    let v = crate::formats::package_json::parse(content)?;
     let name = v.get("name")?.as_str()?;
     let version = v.get("version")?.as_str()?;
     if name.is_empty() || version.is_empty() {
@@ -1587,6 +1589,21 @@ mod tests {
             .unwrap();
         let r = detect_product(dir.path()).await;
         assert!(r.purl.is_none());
+    }
+
+    /// Bun installs from a `package.json` with comments and trailing
+    /// commas; it still names the project.
+    #[tokio::test]
+    async fn package_json_with_comments_and_trailing_commas_is_read() {
+        let dir = tempfile::tempdir().unwrap();
+        tokio::fs::write(
+            dir.path().join("package.json"),
+            "{\n  // my app\n  \"name\": \"demo\",\n  \"version\": \"1.0.0\",\n}\n",
+        )
+        .await
+        .unwrap();
+        let r = detect_product(dir.path()).await;
+        assert_eq!(r.purl.as_deref(), Some("pkg:npm/demo@1.0.0"));
     }
 
     /// `package.json` with empty `name` string → None (is_empty check).

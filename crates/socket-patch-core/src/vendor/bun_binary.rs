@@ -504,6 +504,22 @@ pub(super) fn preflight_package(
             ),
         )));
     }
+    // A registry record this run would move onto a local tarball: a
+    // default-trusted package stays where Bun runs its scripts (#371).
+    // Not when a record is already vendored: Bun trusts by name, so that
+    // one took the default trust from every copy already.
+    if matches
+        .iter()
+        .any(|p| p.version.as_deref() == Some(coords.version.as_str()))
+        && !matches.iter().any(|p| p.version.is_none())
+    {
+        super::bun_lock::refuse_default_trusted(
+            project.manifest.as_deref(),
+            None,
+            &coords.name,
+            &coords.version,
+        )?;
+    }
     let targets: Vec<usize> = matches.iter().map(|p| p.id).collect();
     let mirrors = match project
         .lock
@@ -587,13 +603,28 @@ pub(crate) async fn revert(entry: &VendorEntry, root: &Path, opts: RevertOpts) -
         Ok(v) => v,
         Err(o) => return o,
     };
-    if crate::utils::fs::is_symlink(&root.join(LOCK)).await {
+    // The lock Bun installs from is the one to restore. A text `bun.lock`
+    // beside the binary lock wins (`bun install --save-text-lockfile` on
+    // Bun 1.1.39 to 1.1.45 writes it and KEEPS bun.lockb, later releases
+    // delete the binary lock): restoring only bun.lockb there and then
+    // removing the tarball left bun.lock pointing at a file that was gone,
+    // and every install failed `ENOENT extracting tarball`. Such a
+    // bun.lockb is read as absent, which is how Bun reads it.
+    let text_drives = super::lock_inventory::bun_text_lock_drives(
+        &super::lock_inventory::ProjectView::Disk(root),
+    );
+    if !text_drives && crate::utils::fs::is_symlink(&root.join(LOCK)).await {
         return RevertOutcome::failed(
             "bun.lockb is a symbolic link; replace it with a regular file before reverting",
         );
     }
     let mut outcome = RevertOutcome::ok();
-    let (mut lock, original_bytes) = match read_regular_to_bytes_sync(&root.join(LOCK)) {
+    let binary = if text_drives {
+        Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+    } else {
+        read_regular_to_bytes_sync(&root.join(LOCK))
+    };
+    let (mut lock, original_bytes) = match binary {
         Ok(bytes) => match BunLockb::parse(&bytes) {
             Ok(v) => (RevertLock::Binary(v), bytes),
             Err(e) => return RevertOutcome::failed(e),
@@ -833,6 +864,29 @@ pub(crate) async fn revert(entry: &VendorEntry, root: &Path, opts: RevertOpts) -
                 ),
             ));
             outcome.keep_artifact_for_reference(&dir);
+        }
+    }
+    // The binary lock Bun no longer reads is left as it is; say so when it
+    // still names the tarball this revert removes.
+    if text_drives && !opts.keep_artifact {
+        let uuid = entry.uuid.to_ascii_lowercase();
+        let stale = read_regular_to_bytes_sync(&root.join(LOCK))
+            .ok()
+            .and_then(|bytes| BunLockb::parse_packages(&bytes).ok())
+            .is_some_and(|packages| {
+                packages
+                    .iter()
+                    .any(|p| p.resolution.to_ascii_lowercase().contains(&uuid))
+            });
+        if stale {
+            outcome.warnings.push(VendorWarning::new(
+                "vendor_bun_stale_binary_lock",
+                format!(
+                    "{LOCK} beside {TEXT_LOCK} still names the vendored tarball this revert \
+                     removes; Bun installs from {TEXT_LOCK} and does not read it, so it was \
+                     left as it is. Delete the stale {LOCK}"
+                ),
+            ));
         }
     }
     if opts.dry_run {
@@ -2379,6 +2433,13 @@ mod rebuild_tests {
     /// Vendor the binary fixture, then migrate it as `bun` would: bun.lockb
     /// is gone and bun.lock carries the vendored tuple.
     async fn vendored_then_migrated(vendored: &str) -> (Fixture, VendorEntry) {
+        vendored_then_text_lock(vendored, false).await
+    }
+
+    /// [`vendored_then_migrated`], optionally keeping the vendored
+    /// bun.lockb beside the new bun.lock, as `bun install
+    /// --save-text-lockfile` on Bun 1.1.39 to 1.1.45 leaves it.
+    async fn vendored_then_text_lock(vendored: &str, keep_binary: bool) -> (Fixture, VendorEntry) {
         let fx = fixture_with(MIGRATED_LOCKB);
         let (result, entry, _) = ts::expect_done(flip_run(&fx, None).await);
         assert!(result.success, "{result:?}");
@@ -2393,9 +2454,54 @@ mod rebuild_tests {
                 "the fixture was captured from this packing"
             );
         }
-        std::fs::remove_file(fx.root().join(LOCK)).unwrap();
+        if !keep_binary {
+            std::fs::remove_file(fx.root().join(LOCK)).unwrap();
+        }
         std::fs::write(fx.root().join(TEXT_LOCK), vendored).unwrap();
         (fx, entry)
+    }
+
+    /// `bun install --save-text-lockfile` on Bun 1.1.39 to 1.1.45 writes
+    /// bun.lock and keeps bun.lockb; Bun then installs from bun.lock.
+    /// Reverting must restore that lock. It used to restore bun.lockb and
+    /// remove the tarball, leaving bun.lock pointing at a file that was
+    /// gone (`ENOENT extracting tarball` on Bun 1.1.45 and 1.4.4).
+    #[tokio::test]
+    async fn revert_restores_the_text_lock_bun_installs_from_when_the_binary_lock_was_kept() {
+        for (bun, pristine, vendored) in MIGRATIONS {
+            let (fx, entry) = vendored_then_text_lock(vendored, true).await;
+            let stale = std::fs::read(fx.root().join(LOCK)).unwrap();
+            for dry_run in [true, false] {
+                let outcome = super::super::bun_lock::revert_bun_opts(
+                    &entry,
+                    fx.root(),
+                    RevertOpts::new(dry_run),
+                )
+                .await;
+                assert!(outcome.success, "{bun} dry_run={dry_run}: {outcome:?}");
+                let mut codes: Vec<&str> = outcome.warnings.iter().map(|w| w.code).collect();
+                codes.sort_unstable();
+                assert_eq!(
+                    codes,
+                    [
+                        super::super::bun_lock::REINSTALL_REQUIRED,
+                        "vendor_bun_stale_binary_lock"
+                    ],
+                    "{bun} dry_run={dry_run}: {outcome:?}"
+                );
+            }
+            assert_eq!(
+                std::fs::read_to_string(fx.root().join(TEXT_LOCK)).unwrap(),
+                pristine,
+                "{bun}: the lock Bun installs from is restored"
+            );
+            assert!(!fx.root().join(".socket/vendor/npm").exists(), "{bun}");
+            assert_eq!(
+                std::fs::read(fx.root().join(LOCK)).unwrap(),
+                stale,
+                "{bun}: the binary lock Bun does not read is left alone"
+            );
+        }
     }
 
     /// After Bun migrates a vendored bun.lockb to bun.lock, revert restores
