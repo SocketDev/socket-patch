@@ -11,17 +11,14 @@
   },
   "routines": {
     "audit-core": {
-      "trigger_id": "trig_01HsW456BQWRLq1bxEDoXeMv",
       "name": "socket-patch arch audit: core",
       "cron": "40 0,6,12,18 * * *"
     },
     "audit-cli-tests": {
-      "trigger_id": "trig_01WmdhNjdQxeti1B4cuedRk2",
       "name": "socket-patch arch audit: CLI and tests",
       "cron": "40 3,9,15,21 * * *"
     },
     "refactor": {
-      "trigger_id": "trig_016qiS4DEccutYafgpit2qUt",
       "name": "socket-patch arch refactor",
       "cron": "55 */2 * * *"
     }
