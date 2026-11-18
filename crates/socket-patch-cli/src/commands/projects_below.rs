@@ -316,14 +316,7 @@ impl PatchedProject {
     /// arguments, already shell-quoted) for this project, as the run
     /// `common` was asked to: a preview stays a preview.
     pub(crate) fn command(&self, common: &GlobalArgs, command: &str) -> String {
-        // `--cwd .` joins to `./api`; the bare relative path names the same
-        // directory.
-        let dir = self.dir.strip_prefix(".").unwrap_or(&self.dir);
-        let dry_run = if common.dry_run { " --dry-run" } else { "" };
-        format!(
-            "socket-patch {command}{dry_run} --cwd {}",
-            shell_word(&dir.to_string_lossy())
-        )
+        project_command(&self.dir, common, command)
     }
 
     /// Whether a command acting on `work` has anything to do here.
@@ -341,6 +334,69 @@ impl PatchedProject {
             .iter()
             .any(|(purl, uuid)| target.matches_patch(purl, uuid))
     }
+}
+
+/// The command line that runs `command` (the subcommand and its arguments,
+/// already shell-quoted) for the project directory `dir`, as the run
+/// `common` was asked to: a preview stays a preview.
+pub(crate) fn project_command(dir: &Path, common: &GlobalArgs, command: &str) -> String {
+    // `--cwd .` joins to `./api`; the bare relative path names the same
+    // directory.
+    let dir = dir.strip_prefix(".").unwrap_or(dir);
+    let dry_run = if common.dry_run { " --dry-run" } else { "" };
+    format!(
+        "socket-patch {command}{dry_run} --cwd {}",
+        shell_word(&dir.to_string_lossy())
+    )
+}
+
+/// The project directories below `--cwd` whose installed packages a crawl
+/// from `--cwd` does not read, in [`discovered`]'s order: the ones an
+/// agent-mode scan, which patches the copies its crawl finds, leaves
+/// unscanned. A directory is one of them when a crawl from it reads an
+/// install directory ([`project_install_roots`]) the crawl from `--cwd`
+/// does not, so a project with nothing installed, or one that shares a
+/// user-wide cache with `--cwd`, is not.
+///
+/// Like [`patched`] it reaches only the directories [`discovered`]
+/// returns, and none outside [`searches_below`].
+pub(crate) async fn not_crawled(
+    common: &GlobalArgs,
+    policy: &SelectionPolicy,
+    repo_root: &Path,
+) -> Vec<PathBuf> {
+    use crate::ecosystem_dispatch::project_install_roots;
+    if !searches_below(common) {
+        return Vec::new();
+    }
+    let found = discovered(common, policy, repo_root).await;
+    let below: Vec<&PathBuf> = found
+        .dirs
+        .iter()
+        .filter(|(_, explicit)| !explicit)
+        .map(|(dir, _)| dir)
+        .collect();
+    if below.is_empty() {
+        return Vec::new();
+    }
+    let real = |path: PathBuf| std::fs::canonicalize(&path).unwrap_or(path);
+    let only = common.ecosystems.as_deref();
+    let options = common.crawler_options();
+    let here: std::collections::HashSet<PathBuf> = project_install_roots(&options, only)
+        .await
+        .into_iter()
+        .map(real)
+        .collect();
+    let mut left = Vec::new();
+    for dir in below {
+        let mut options = options.clone();
+        options.cwd = dir.clone();
+        let roots = project_install_roots(&options, only).await;
+        if roots.into_iter().any(|root| !here.contains(&real(root))) {
+            left.push(dir.clone());
+        }
+    }
+    left
 }
 
 /// What [`patched`] found.

@@ -242,9 +242,10 @@ pub(super) fn lockfile_only_note(n: usize) -> String {
     )
 }
 
-/// What an empty crawl says when `warnings` lockfiles or layouts could not
-/// be read (each has its warning on stderr): that is why nothing was found,
-/// so the generic "install first" hint would send the user the wrong way.
+/// What an empty crawl says when `warnings` on stderr say why nothing was
+/// found (a lockfile or layout that could not be read, project directories
+/// below that an agent-mode scan left): the generic "install first" hint
+/// would send the user the wrong way.
 pub(crate) fn no_packages_unreadable(warnings: usize) -> String {
     if warnings == 1 {
         "No packages found (see the warning).".to_string()
@@ -356,6 +357,20 @@ pub(super) fn unscanned_projects_detail(dirs: &[String], json: bool) -> String {
         if dirs.len() == 1 { "was" } else { "were" },
         dirs.join(", "),
         ui::shell_word(&dirs[0]),
+    )
+}
+
+/// The [`PROJECTS_NOT_SCANNED`] detail of an agent-mode scan: the project
+/// directories below `--cwd` (`dirs`) whose installed packages it did not
+/// read, and `command`, the run that covers the first.
+pub(super) fn unscanned_agent_projects_detail(dirs: &[String], command: &str) -> String {
+    format!(
+        "{} below this one {} not scanned ({}): an agent-mode scan patches the packages \
+         installed for the one project directory it runs in. Run one scan per directory, \
+         e.g. `{command}`",
+        plural(dirs.len(), "project directory", "project directories"),
+        if dirs.len() == 1 { "was" } else { "were" },
+        dirs.join(", "),
     )
 }
 
@@ -955,6 +970,32 @@ mod tests {
         assert_eq!(
             lockfile_only_note(3),
             "Note: 3 packages from project lockfiles are not yet installed (lockfile-only)."
+        );
+    }
+
+    /// An agent-mode scan's `projects_not_scanned` detail names the
+    /// directories it left and the command for the first (#2125).
+    #[test]
+    fn unscanned_agent_projects_detail_names_the_dirs_and_the_command() {
+        let one = unscanned_agent_projects_detail(
+            &["api".to_string()],
+            "socket-patch scan --mode agent --cwd api",
+        );
+        assert!(
+            one.starts_with("1 project directory below this one was not scanned (api): "),
+            "{one}"
+        );
+        assert!(
+            one.ends_with("e.g. `socket-patch scan --mode agent --cwd api`"),
+            "{one}"
+        );
+        let two = unscanned_agent_projects_detail(
+            &["api".to_string(), "web".to_string()],
+            "socket-patch scan --mode agent --cwd api",
+        );
+        assert!(
+            two.starts_with("2 project directories below this one were not scanned (api, web): "),
+            "{two}"
         );
     }
 

@@ -1695,6 +1695,16 @@ fn discovers_projects(args: &ScanArgs, invocation: &InvocationPolicy) -> bool {
         && matches!(args.mode, Some(ScanMode::Hosted) | Some(ScanMode::Vendored))
 }
 
+/// Whether an agent-mode scan names the project directories below `--cwd`
+/// it left unscanned: the bare project scan [`discovers_projects`] is for
+/// the other two modes. PATHs scope the run to what the user named.
+fn names_projects_left(args: &ScanArgs, invocation: &InvocationPolicy) -> bool {
+    args.paths.is_empty()
+        && !args.common.is_global()
+        && args.rollout.carry.is_none()
+        && invocation.in_git_repo
+}
+
 /// Run a hosted or vendored scan once per project directory, as if each
 /// were `--cwd`: the directories its PATHs name, or the ones a bare scan
 /// found. The exit code is the worst of the runs. `--json` takes one
@@ -2108,6 +2118,35 @@ async fn scan_project(
             eprintln!("Warning: {detail}");
         }
         layout_refusals.push((render::PROJECTS_NOT_SCANNED.to_string(), detail));
+    }
+    // A bare agent-mode scan patches the copies the crawl above found, so
+    // it covers the one project at `--cwd`. It names the project
+    // directories below whose packages that crawl did not read (#2125):
+    // without it the run reads as empty, or as a success for the checkout.
+    let mut projects_left = false;
+    if apply && names_projects_left(&args, invocation) {
+        let left = crate::commands::projects_below::not_crawled(
+            &args.common,
+            &invocation.policy,
+            &invocation.repo_root,
+        )
+        .await;
+        if let Some(first) = left.first() {
+            let shown: Vec<String> = left
+                .iter()
+                .map(|dir| {
+                    crate::commands::projects_below::shown_project_dir(&args.common.cwd, dir)
+                })
+                .collect();
+            let command = crate::commands::projects_below::project_command(
+                first,
+                &args.common,
+                "scan --mode agent",
+            );
+            let detail = render::unscanned_agent_projects_detail(&shown, &command);
+            layout_refusals.push((render::PROJECTS_NOT_SCANNED.to_string(), detail));
+            projects_left = true;
+        }
     }
     // A token whose org could not be resolved put the whole run on the
     // public proxy (the client already warned on stderr): `--json`
@@ -2570,13 +2609,16 @@ async fn scan_project(
                 ) {
                     println!("{line}");
                 }
-            } else if !lockfile_only.unsupported.is_empty() {
-                // A lockfile or layout that could not be read is why
-                // nothing was found (its warning is on stderr): an install
-                // is not the fix.
+            } else if !lockfile_only.unsupported.is_empty() || projects_left {
+                // A lockfile or layout that could not be read, or project
+                // directories below that this run left, is why nothing
+                // was found (its warning is on stderr): an install is not
+                // the fix.
                 println!(
                     "{}",
-                    render::no_packages_unreadable(lockfile_only.unsupported.len())
+                    render::no_packages_unreadable(
+                        lockfile_only.unsupported.len() + usize::from(projects_left)
+                    )
                 );
             } else if !policy.root_excluded() {
                 println!(

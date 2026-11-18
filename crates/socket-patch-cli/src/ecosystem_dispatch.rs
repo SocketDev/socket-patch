@@ -1508,6 +1508,58 @@ fn crawl_selects(only: Option<&[String]>, eco: Ecosystem) -> bool {
     only.is_none_or(|list| list.iter().any(|name| name == eco.cli_name()))
 }
 
+/// The directories a project crawl of `options` reads installed packages
+/// from, for the ecosystems whose install directories are resolved from
+/// `--cwd` alone: PyPI, Cargo, RubyGems, Go and Composer, less the ones
+/// `only` leaves out. A crawl from a directory above therefore reads a
+/// project's packages only when it resolves the same directories (a
+/// user-wide cache, an activated environment).
+///
+/// npm is left out on purpose: its crawl walks every `node_modules` below
+/// `--cwd`, so a project below is always within a crawl from above.
+pub(crate) async fn project_install_roots(
+    options: &CrawlerOptions,
+    only: Option<&[String]>,
+) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if crawl_selects(only, Ecosystem::Pypi) {
+        roots.extend(
+            PythonCrawler::new()
+                .get_site_packages_paths(options)
+                .await
+                .unwrap_or_default(),
+        );
+    }
+    if crawl_selects(only, Ecosystem::Cargo) {
+        roots.extend(
+            CargoCrawler
+                .get_crate_source_paths(options)
+                .await
+                .unwrap_or_default(),
+        );
+    }
+    if crawl_selects(only, Ecosystem::Gem) {
+        roots.extend(RubyCrawler.get_gem_paths(options).await.unwrap_or_default());
+    }
+    if crawl_selects(only, Ecosystem::Golang) {
+        roots.extend(
+            GoCrawler
+                .get_module_cache_paths(options)
+                .await
+                .unwrap_or_default(),
+        );
+    }
+    if crawl_selects(only, Ecosystem::Composer) {
+        roots.extend(
+            ComposerCrawler
+                .get_vendor_paths(options)
+                .await
+                .unwrap_or_default(),
+        );
+    }
+    roots
+}
+
 /// The crawl behind the entry points above; the fourth element is the npm
 /// crawler's `node_modules` roots (empty when npm was not selected).
 async fn crawl_every_ecosystem(
