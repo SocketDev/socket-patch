@@ -186,3 +186,6 @@ Documented limitations and verified false positives. One bullet each. Search thi
 - `apply --check` reports a native gem "not compiled into the extension Ruby loads" when the project has an agent record and a hosted pin and Bundler built the patched gem itself (`bundle pristine`, fresh clone). Documented: run `apply` again after a reinstall; it does (2026-11-18).
 - `vex` on a deployment clone installed without dev/test groups attests the hosted gems of those groups: hosted attestation is read from the lock (2026-11-18).
 - `scan --mode agent <subdir>` says "No installed packages found under the given path": agent PATHs are globs over the installed packages of the project at `--cwd`; use `--cwd <subdir>`. The missing hint is #2125 (2026-11-18).
+- After project A runs hosted `--gem-refresh-shared`, project B's `bundle pristine` in the same gem home fails on the checksum and removes the gems: documented in "Ruby gems: gems already installed" (2026-11-18).
+- `vendor --revert` on a project with hosted and vendored gems leaves the hosted pins: it reverts vendored gems only; `rollback` undoes both (2026-11-18).
+- `rollback --offline` cannot restore a hosted gem pin ("must be re-resolved from the registry"): refused with a `git checkout` remedy, exit 1, the pair still installs (2026-11-18).
