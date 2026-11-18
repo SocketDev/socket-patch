@@ -54,10 +54,18 @@ pub(crate) struct LockfileSupplement {
 /// crawled): an entry of an ecosystem the crawl skipped is never counted
 /// lockfile-only, since there is no crawl to tell whether it is installed.
 /// `entries` still holds the full inventory.
+///
+/// `hosted`: the run is a hosted scan. The inventory leaves out a gem the
+/// Bundler lock resolves only as precompiled platform builds (`nokogiri
+/// (1.18.10-arm64-darwin)`: no one `.gem` stands for it, so it cannot be
+/// vendored from the lock, and an in-place patch needs the installed copy).
+/// Hosted mode redirects such a gem to its per-platform prebuilds from the
+/// lock alone, so a hosted supplement names it too.
 pub(crate) async fn lockfile_supplement(
     ctx: &crate::commands::context::ProjectContext<'_>,
     crawled: &[socket_patch_core::crawlers::types::CrawledPackage],
     only: Option<&[String]>,
+    hosted: bool,
 ) -> LockfileSupplement {
     let common = ctx.common;
     let mut out = LockfileSupplement::default();
@@ -67,12 +75,47 @@ pub(crate) async fn lockfile_supplement(
     let locks = ctx.locks().await;
     out.unsupported = locks.unsupported.clone();
     let entries = &locks.entries;
-    if entries.is_empty() {
+    let platform_gems = if hosted {
+        platform_only_gems(ctx).await
+    } else {
+        Vec::new()
+    };
+    if entries.is_empty() && platform_gems.is_empty() {
         return out;
     }
-    (out.packages, out.purls) = lockfile_only_packages(entries, crawled, only, &common.cwd);
+    let discovered: Vec<LockfileEntry> = entries.iter().cloned().chain(platform_gems).collect();
+    (out.packages, out.purls) = lockfile_only_packages(&discovered, crawled, only, &common.cwd);
     out.entries = entries.clone();
     out
+}
+
+/// The gems the project's Bundler lock resolves only as precompiled
+/// platform builds, as discovery-only lock entries (no archive URL, no
+/// checksum: each platform build has its own).
+async fn platform_only_gems(
+    ctx: &crate::commands::context::ProjectContext<'_>,
+) -> Vec<LockfileEntry> {
+    use socket_patch_core::vendor::lock_inventory::{
+        gem_platform_only_purls_in, LockIntegrity, ProjectView, SourceKind,
+    };
+    let view = ProjectView::Disk(&ctx.common.cwd);
+    gem_platform_only_purls_in(&view)
+        .await
+        .into_iter()
+        .filter_map(|purl| {
+            let (_, name, version) = socket_patch_core::utils::purl::purl_parts(&purl)?;
+            Some(LockfileEntry {
+                ecosystem: "gem",
+                source_kind: SourceKind::Unspecified,
+                pnpm_env: false,
+                purl,
+                resolved: None,
+                name,
+                version,
+                integrity: LockIntegrity::None,
+            })
+        })
+        .collect()
 }
 
 /// The lockfile entries with no crawled counterpart, fabricated as crawl

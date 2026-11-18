@@ -949,7 +949,10 @@ pub async fn gem_stale_cache_after_unwind(
 
 /// The upstream `.gem` of a gem `purl` that is back on its registry entry
 /// in the project at `root`: its sha256 and download url
-/// ([`UpstreamArchive::Known`]). The sha256 is what the restored lock pins
+/// ([`UpstreamArchive::Known`]). `platform` names the build: `None` for the
+/// ruby-platform gem, else the platform of a precompiled build the lock
+/// names (`<name>-<version>-<platform>.gem`), which has a sha256 and a url
+/// of its own. The sha256 is what the restored lock pins
 /// (its `CHECKSUMS` entry, else the rubygems.org compact index, unless
 /// `offline`); the url is set when the lock resolves the gem from
 /// rubygems.org. `staged` is a restore's [`RestoreOutcome::staged_text`]:
@@ -962,12 +965,29 @@ pub async fn gem_upstream_archive(
     root: &Path,
     staged: &BTreeMap<String, Option<String>>,
     purl: &str,
+    platform: Option<&str>,
     offline: bool,
 ) -> Option<UpstreamArchive> {
     let restored = crate::formats::gem::BUNDLER_LOCKS
         .iter()
         .find_map(|lock| staged.get(*lock)?.as_deref());
-    gem::upstream_archive(root, restored, purl, offline).await
+    gem::upstream_archive(root, restored, purl, platform, offline).await
+}
+
+/// The platforms of the precompiled builds the lock at `root` names for
+/// the gem `purl` (`arm64-darwin` for `name (version-arm64-darwin)`), in
+/// lock order: empty for a gem locked as its ruby-platform gem alone.
+/// `staged` is a restore's [`RestoreOutcome::staged_text`], read as
+/// [`gem_upstream_archive`] reads it.
+pub async fn gem_locked_platforms(
+    root: &Path,
+    staged: &BTreeMap<String, Option<String>>,
+    purl: &str,
+) -> Vec<String> {
+    let restored = crate::formats::gem::BUNDLER_LOCKS
+        .iter()
+        .find_map(|lock| staged.get(*lock)?.as_deref());
+    gem::locked_platforms(root, restored, purl).await
 }
 
 /// Whether the lock on disk at `root` resolves the ruby-platform gem `purl`

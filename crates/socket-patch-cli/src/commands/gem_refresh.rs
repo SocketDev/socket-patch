@@ -768,9 +768,12 @@ pub(crate) fn report(
     out
 }
 
-/// The installed copies (ruby platform) of `purls` in the gem homes Bundler
-/// installs the project's gems into, each with the archive RubyGems
-/// installed it from, `<home>/cache/<leaf>.gem`.
+/// The installed copies of `purls` in the gem homes Bundler installs the
+/// project's gems into, each with the archive RubyGems installed it from,
+/// `<home>/cache/<leaf>.gem`. A copy is the ruby-platform build
+/// (`<name>-<version>`) or, for a gem installed as a precompiled platform
+/// gem, that build (`<name>-<version>-<platform>`): its leaf says which,
+/// and each build has an upstream archive of its own.
 async fn installed_with_archives(common: &GlobalArgs, purls: &[String]) -> Vec<InstalledCopy> {
     use socket_patch_core::crawlers::types::CrawlerOptions;
     use socket_patch_core::crawlers::RubyCrawler;
@@ -792,21 +795,15 @@ async fn installed_with_archives(common: &GlobalArgs, purls: &[String]) -> Vec<I
             let Some(pkg) = pkg else {
                 continue;
             };
-            let Some((_, name, version)) = socket_patch_core::utils::purl::purl_parts(purl) else {
+            let Some(leaf) = pkg.path.file_name().and_then(|n| n.to_str()) else {
                 continue;
             };
-            let leaf = format!("{name}-{version}");
-            // A platform gem's archive is not the one the lock's
-            // ruby-platform checksum names.
-            if pkg.path.file_name().and_then(|n| n.to_str()) != Some(leaf.as_str()) {
-                continue;
-            }
             let Some(archive) = home_cache_archive(&pkg.path) else {
                 continue;
             };
             out.push(InstalledCopy {
                 purl: purl.clone(),
-                leaf,
+                leaf: leaf.to_string(),
                 dir: pkg.path.clone(),
                 project_local: home.project_local,
                 archive,
@@ -836,13 +833,14 @@ enum Scope {
 
 /// The stale materializations of the gems an unwind just put back on
 /// their upstream entries, judged like the hosted scan's guard, with the
-/// roles swapped: an installed copy (ruby platform) is stale when the
-/// archive RubyGems installed it from, `<home>/cache/<leaf>.gem`, is
-/// readable and is not the upstream one, and so is (in [`Scope::All`])
-/// such an archive in Bundler's cache dir. `upstream` is each purl's
-/// upstream sha256; a purl without an entry is not judged. A purl whose
-/// sha256 is `None` (the registry that would give it was refused) cannot
-/// be judged either, and every installed copy of it is listed.
+/// roles swapped: an installed copy is stale when the archive RubyGems
+/// installed it from, `<home>/cache/<leaf>.gem`, is readable and is not
+/// the upstream one, and so is (in [`Scope::All`]) such an archive in
+/// Bundler's cache dir. `upstream` is the upstream sha256 of each build
+/// ([`Build`]: a gem's ruby-platform gem, or one of its platform builds),
+/// by leaf; a build without an entry is not judged. A build whose sha256
+/// is `None` (the registry that would give it was refused) cannot be
+/// judged either, and every installed copy of it is listed.
 ///
 /// `records` holds the patch record of each gem that has one to judge by
 /// (a vendored unwind's ledger entry). An installed copy whose files are
@@ -851,14 +849,15 @@ enum Scope {
 /// beside the upstream archive (#2093).
 async fn stale_after_restore(
     common: &GlobalArgs,
-    upstream: &BTreeMap<String, Option<String>>,
+    upstream: &BTreeMap<String, Build>,
     records: &BTreeMap<String, PatchRecord>,
     scope: Scope,
 ) -> Vec<StaleGem> {
     use socket_patch_core::vendor::file_sha256_hex;
 
     let purls: Vec<String> = upstream
-        .keys()
+        .values()
+        .map(|build| &build.purl)
         .chain(records.keys())
         .collect::<BTreeSet<_>>()
         .into_iter()
@@ -871,7 +870,7 @@ async fn stale_after_restore(
         // or not its archive is still in the home's cache. With one,
         // only a readable archive that is not the upstream gem makes
         // the copy stale.
-        let listed = match upstream.get(&copy.purl) {
+        let listed = match upstream.get(&copy.leaf).map(|build| &build.sha256) {
             None => false,
             Some(None) => true,
             Some(Some(sha)) => {
@@ -895,19 +894,15 @@ async fn stale_after_restore(
     // restore's own `upstream_gem_stale_cache` to name.)
     let app_cache =
         socket_patch_core::crawlers::ruby_crawler::bundler_app_cache_dir(&common.cwd).await;
-    for (purl, sha) in upstream {
-        let Some(sha) = sha else {
+    for (leaf, build) in upstream {
+        let Some(sha) = &build.sha256 else {
             continue;
         };
-        let Some((_, name, version)) = socket_patch_core::utils::purl::purl_parts(purl) else {
-            continue;
-        };
-        let leaf = format!("{name}-{version}");
         let archive = app_cache.join(format!("{leaf}.gem"));
         match file_sha256_hex(&archive).await {
             Some(got) if &got != sha => out.push(StaleGem {
-                purl: purl.clone(),
-                leaf,
+                purl: build.purl.clone(),
+                leaf: leaf.clone(),
                 installed: None,
                 cache_archive: Some(archive),
                 in_place: false,
@@ -916,6 +911,89 @@ async fn stale_after_restore(
         }
     }
     out
+}
+
+/// One build of a restored gem, as [`stale_after_restore`] judges it by its
+/// leaf (`<name>-<version>`, or `<name>-<version>-<platform>` for a
+/// precompiled platform gem).
+#[derive(Debug, Clone)]
+struct Build {
+    purl: String,
+    /// The upstream archive's sha256; `None` when the registry that would
+    /// give it was refused.
+    sha256: Option<String>,
+}
+
+/// The builds of the gem `purl` that may have a materialization to judge:
+/// the ruby-platform gem, then each of `platforms` (the platform builds the
+/// restored lock names) that is installed in a gem home Bundler uses or (in
+/// [`Scope::All`]) archived in Bundler's cache dir. `(leaf, platform)`
+/// each, the platform `None` for the ruby-platform gem. A lock names a
+/// build for every platform the project supports, and this machine holds
+/// one of them: only that one costs a lookup of its upstream archive. A
+/// gem the lock names no platform build for is looked at nowhere.
+async fn materialized_builds(
+    common: &GlobalArgs,
+    purl: &str,
+    platforms: &[String],
+    scope: Scope,
+) -> Vec<(String, Option<String>)> {
+    let Some((_, name, version)) = socket_patch_core::utils::purl::purl_parts(purl) else {
+        return Vec::new();
+    };
+    let mut builds = vec![(format!("{name}-{version}"), None)];
+    if platforms.is_empty() {
+        return builds;
+    }
+    let mut held: BTreeSet<String> = installed_with_archives(common, &[purl.to_string()])
+        .await
+        .into_iter()
+        .map(|copy| copy.leaf)
+        .collect();
+    if scope == Scope::All {
+        let app_cache =
+            socket_patch_core::crawlers::ruby_crawler::bundler_app_cache_dir(&common.cwd).await;
+        held.extend(
+            cached_platform_archives(&app_cache, &name, &version)
+                .await
+                .iter()
+                .filter_map(|archive| Some(archive.file_stem()?.to_str()?.to_string())),
+        );
+    }
+    for platform in platforms {
+        let leaf = format!("{name}-{version}-{platform}");
+        if held.contains(&leaf) {
+            builds.push((leaf, Some(platform.clone())));
+        }
+    }
+    builds
+}
+
+/// The archives of `name` `version`'s platform builds in Bundler's cache
+/// dir, `<name>-<version>-<platform>.gem`, in name order. A platform starts
+/// with a letter: `foo-1.0-2.0.gem` is the gem `foo-1.0` at `2.0`.
+pub(crate) async fn cached_platform_archives(
+    app_cache: &Path,
+    name: &str,
+    version: &str,
+) -> Vec<PathBuf> {
+    let prefix = format!("{name}-{version}-");
+    let mut found = Vec::new();
+    let Ok(mut entries) = tokio::fs::read_dir(app_cache).await else {
+        return found;
+    };
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let file = entry.file_name();
+        let platform = file
+            .to_str()
+            .and_then(|file| file.strip_suffix(".gem"))
+            .and_then(|leaf| leaf.strip_prefix(&prefix));
+        if platform.is_some_and(|p| p.starts_with(|c: char| c.is_ascii_alphabetic())) {
+            found.push(entry.path());
+        }
+    }
+    found.sort();
+    found
 }
 
 /// Whether the files of the installed `copy` are the patched ones of its
@@ -1143,6 +1221,13 @@ pub(crate) async fn after_vendored_unwind(
 ) -> RestoreRefresh {
     let mut installed: BTreeSet<String> = BTreeSet::new();
     for copy in installed_with_archives(common, unwound).await {
+        // A vendored gem is the ruby-platform gem: a platform build
+        // installed beside it was never the vendored copy's stand-in.
+        let ruby_platform = socket_patch_core::utils::purl::purl_parts(&copy.purl)
+            .is_some_and(|(_, name, version)| copy.leaf == format!("{name}-{version}"));
+        if !ruby_platform {
+            continue;
+        }
         if copy.archive.is_file() || holds_patch(&copy, records).await {
             installed.insert(copy.purl);
         }
@@ -1171,17 +1256,20 @@ async fn refresh_restored(
     scope: Scope,
 ) -> RestoreRefresh {
     use socket_patch_core::patch::redirect::upstream::{
-        gem_resolves_from_rubygems, gem_upstream_archive, UpstreamArchive,
+        gem_locked_platforms, gem_resolves_from_rubygems, gem_upstream_archive, UpstreamArchive,
     };
     use socket_patch_core::vendor::registry_fetch::SecureRegistryClient;
 
     let policy = Policy::of(common);
     let direction = Direction::Upstream;
-    let mut shas: BTreeMap<String, Option<String>> = BTreeMap::new();
+    // By leaf: a gem locked as precompiled platform builds is installed
+    // and cached as `<name>-<version>-<platform>`, and each build has its
+    // own upstream archive.
+    let mut shas: BTreeMap<String, Build> = BTreeMap::new();
     let mut urls: BTreeMap<String, Option<String>> = BTreeMap::new();
-    // The gems whose upstream sha256 the registry is not asked for, each
+    // The builds whose upstream sha256 the registry is not asked for, each
     // with why: their installed copies are reported, not passed over.
-    let mut unverified: BTreeMap<String, String> = BTreeMap::new();
+    let mut unverified: BTreeMap<String, (String, String)> = BTreeMap::new();
     // The records an installed copy is judged by as well: those of the
     // gems the lock resolves from rubygems.org, which are back on their
     // upstream entries. A copy holding its record's patch is stale even
@@ -1197,41 +1285,61 @@ async fn refresh_restored(
         .iter()
         .filter(|p| Ecosystem::from_purl(p) == Some(Ecosystem::Gem))
     {
-        match gem_upstream_archive(&common.cwd, staged, purl, common.offline).await {
-            Some(UpstreamArchive::Known { sha256, url }) => {
-                // A vendored revert does not prove where the lock resolves
-                // the gem from: an entry vendored over hosted wiring before
-                // v5 reverts to its hosted pin, whose `CHECKSUMS` sha256 is
-                // the patched gem's (the hosted unwind restores that pin
-                // next, and refreshes then). Only a gem the lock resolves
-                // from rubygems.org is known to be back on its upstream
-                // entry.
-                if scope == Scope::Installed && url.is_none() {
-                    continue;
-                }
-                shas.insert(purl.clone(), Some(sha256));
-                urls.insert(purl.clone(), url);
-                if let Some(record) = records.get(purl) {
-                    judged.insert(purl.clone(), record.clone());
-                }
-                if pin_judge.is_some() {
-                    pinned.push(purl.clone());
-                }
-            }
-            // (Only a gem the lock resolves from rubygems.org comes back
-            // unverified, so the vendored unwind's rule holds for it too.)
-            Some(UpstreamArchive::Unverified(why)) => {
-                unverified.insert(purl.clone(), why);
-            }
-            None => {
-                if let Some(record) = records.get(purl) {
-                    if gem_resolves_from_rubygems(&common.cwd, purl).await {
+        let platforms = gem_locked_platforms(&common.cwd, staged, purl).await;
+        for (leaf, platform) in materialized_builds(common, purl, &platforms, scope).await {
+            let archive = gem_upstream_archive(
+                &common.cwd,
+                staged,
+                purl,
+                platform.as_deref(),
+                common.offline,
+            )
+            .await;
+            match archive {
+                Some(UpstreamArchive::Known { sha256, url }) => {
+                    // A vendored revert does not prove where the lock
+                    // resolves the gem from: an entry vendored over hosted
+                    // wiring before v5 reverts to its hosted pin, whose
+                    // `CHECKSUMS` sha256 is the patched gem's (the hosted
+                    // unwind restores that pin next, and refreshes then).
+                    // Only a gem the lock resolves from rubygems.org is
+                    // known to be back on its upstream entry.
+                    if scope == Scope::Installed && url.is_none() {
+                        continue;
+                    }
+                    let build = Build {
+                        purl: purl.clone(),
+                        sha256: Some(sha256),
+                    };
+                    shas.insert(leaf.clone(), build);
+                    urls.insert(leaf, url);
+                    if let Some(record) = records.get(purl) {
                         judged.insert(purl.clone(), record.clone());
                     }
+                    if pin_judge.is_some() && !pinned.contains(purl) {
+                        pinned.push(purl.clone());
+                    }
                 }
-                if pin_judge.is_some() {
-                    pinned.push(purl.clone());
+                // (Only a gem the lock resolves from rubygems.org comes
+                // back unverified, so the vendored unwind's rule holds for
+                // it too.)
+                Some(UpstreamArchive::Unverified(why)) => {
+                    unverified.insert(leaf, (purl.clone(), why));
                 }
+                // A platform build the lock does not name is not this
+                // project's: only the ruby-platform gem is judged by its
+                // record.
+                None if platform.is_none() => {
+                    if let Some(record) = records.get(purl) {
+                        if gem_resolves_from_rubygems(&common.cwd, purl).await {
+                            judged.insert(purl.clone(), record.clone());
+                        }
+                    }
+                    if pin_judge.is_some() && !pinned.contains(purl) {
+                        pinned.push(purl.clone());
+                    }
+                }
+                None => {}
             }
         }
     }
@@ -1247,7 +1355,16 @@ async fn refresh_restored(
     let pin_stale_any = !pin_stale.is_empty();
     let mut stale = stale_after_restore(common, &shas, &judged, scope).await;
     stale.extend(pin_stale);
-    let unjudged = unverified.keys().map(|purl| (purl.clone(), None)).collect();
+    let unjudged = unverified
+        .iter()
+        .map(|(leaf, (purl, _))| {
+            let build = Build {
+                purl: purl.clone(),
+                sha256: None,
+            };
+            (leaf.clone(), build)
+        })
+        .collect();
     let unchecked =
         stale_after_restore(common, &unjudged, &BTreeMap::new(), Scope::Installed).await;
     if stale.is_empty() && unchecked.is_empty() && no_record.is_empty() {
@@ -1257,8 +1374,8 @@ async fn refresh_restored(
         Some(Wanted {
             leaf: gem.leaf.clone(),
             kind: direction.wanted(),
-            sha256: BTreeSet::from([shas.get(&gem.purl)?.clone()?]),
-            urls: urls.get(&gem.purl)?.iter().cloned().collect(),
+            sha256: BTreeSet::from([shas.get(&gem.leaf)?.sha256.clone()?]),
+            urls: urls.get(&gem.leaf)?.iter().cloned().collect(),
             on_disk: Vec::new(),
         })
     };
@@ -1295,7 +1412,7 @@ async fn refresh_restored(
         .map(|(purl, _)| purl.clone())
         .collect();
     for gem in unchecked {
-        if let (Some((dir, _)), Some(why)) = (&gem.installed, unverified.get(&gem.purl)) {
+        if let (Some((dir, _)), Some((_, why))) = (&gem.installed, unverified.get(&gem.leaf)) {
             pass.left
                 .insert(dir.clone(), Why::Unverified(why.to_string()));
             installed.push(gem);

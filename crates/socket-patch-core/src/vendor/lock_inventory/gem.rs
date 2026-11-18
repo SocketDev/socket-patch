@@ -58,6 +58,22 @@ pub(super) async fn inventory_gemfile_lock_raw_in(
     GemfileLock::parse(&text).entries()
 }
 
+/// The gems the Bundler lock bundler loads resolves only as precompiled
+/// platform builds ([`GemfileLock::platform_only_purls`]), which
+/// [`inventory_gemfile_lock`] leaves out. Hosted mode's lockfile discovery
+/// adds them: it redirects such a gem to its per-platform prebuilds, so a
+/// lock that has no installed copy beside it (a fresh checkout, the
+/// in-memory engine) must still name it.
+pub async fn gem_platform_only_purls_in(view: &ProjectView<'_>) -> Vec<String> {
+    let Some(lock) = bundler_loaded_lock_in(view).await else {
+        return Vec::new();
+    };
+    match view.read_text(lock).await {
+        Ok(text) => GemfileLock::parse(&text).platform_only_purls(),
+        Err(_) => Vec::new(),
+    }
+}
+
 /// Why the project's Bundler lock was not inventoried, when it holds gem
 /// files ([`GEM_FILES`]) but bundler loads no lock socket-patch reads
 /// ([`bundler_loaded_lock_diagnosed_in`]): an unsupported `BUNDLE_GEMFILE`

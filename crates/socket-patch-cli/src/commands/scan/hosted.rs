@@ -337,6 +337,10 @@ fn stale_cache_gem(purl: &str, cache_path: &Path) -> StaleGem {
 /// * A committed `vendor/cache/<leaf>.gem` whose sha256 is not a patched
 ///   artifact's is stale too (bundler installs from it first): folded into
 ///   a project-local warning's delete list, or warned alone.
+/// * A gem locked as precompiled platform builds is installed as
+///   `<name>-<version>-<platform>`, and cached under that name: each is
+///   judged the same way, against the patched artifacts of the gem, which
+///   include its prebuilds.
 async fn gem_stale_install_warnings(
     cwd: &Path,
     global: bool,
@@ -513,7 +517,8 @@ async fn gem_stale_install_warnings(
     // carries the committed vendor/cache archive when one is present and not
     // proven to be the patched artifact — bundler installs from it first, so
     // a remedy that leaves it behind silently reinstates the stale bytes.
-    let mut cache_covered: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    let mut cache_covered: std::collections::BTreeSet<std::path::PathBuf> =
+        std::collections::BTreeSet::new();
     for (dir, j) in &dir_state {
         // Files patched in place beside the upstream archive (#2089).
         let in_place = j.patched && j.upstream_archive;
@@ -541,8 +546,8 @@ async fn gem_stale_install_warnings(
         } else {
             None
         };
-        if folded_cache.is_some() {
-            cache_covered.insert(j.purl.as_str());
+        if let Some(archive) = &folded_cache {
+            cache_covered.insert(archive.clone());
         }
         let gem = stale_installed_gem(
             &j.purl,
@@ -560,35 +565,36 @@ async fn gem_stale_install_warnings(
     }
 
     // Pass 3: standalone vendor/cache staleness — a committed archive whose
-    // sha256 is readable and differs from the patched artifact's, for purls
-    // whose project-local install warning did not already fold it in (a
-    // fresh checkout with a committed stale cache has no installed dir at
-    // all, and would otherwise never warn).
+    // sha256 is readable and differs from the patched artifact's, unless a
+    // project-local install warning already folded it in (a fresh checkout
+    // with a committed stale cache has no installed dir at all, and would
+    // otherwise never warn). The ruby gem's archive, then the archive of
+    // each platform build bundler cached.
     for (purl, _, _) in &candidates {
-        if cache_covered.contains(purl) {
-            continue;
-        }
         let Some(want_shas) = gem_artifact_shas.get(&gem_sha_key(purl)) else {
             continue;
         };
         let Some((_, name, version)) = purl_parts(purl) else {
             continue;
         };
-        let cache_path = app_cache.join(format!("{name}-{version}.gem"));
-        if !cache_path.is_file() {
-            continue;
+        let mut archives = vec![app_cache.join(format!("{name}-{version}.gem"))];
+        archives.extend(gem_refresh::cached_platform_archives(&app_cache, &name, &version).await);
+        for cache_path in archives {
+            if cache_covered.contains(&cache_path) || !cache_path.is_file() {
+                continue;
+            }
+            // Unreadable → no positive evidence, never a guess.
+            let Some(got) = file_sha256_hex(&cache_path).await else {
+                continue;
+            };
+            if want_shas.contains(&got) {
+                continue; // the PATCHED archive — healthy commit, nothing stale
+            }
+            let gem = stale_cache_gem(purl, &cache_path);
+            out.warnings.push(gem_stale_warning(&gem, None));
+            out.gems.push(gem);
+            out.stale_purls.insert((*purl).to_string());
         }
-        // Unreadable → no positive evidence, never a guess.
-        let Some(got) = file_sha256_hex(&cache_path).await else {
-            continue;
-        };
-        if want_shas.contains(&got) {
-            continue; // the PATCHED archive — healthy commit, nothing stale
-        }
-        let gem = stale_cache_gem(purl, &cache_path);
-        out.warnings.push(gem_stale_warning(&gem, None));
-        out.gems.push(gem);
-        out.stale_purls.insert((*purl).to_string());
     }
     out
 }
@@ -686,14 +692,30 @@ async fn refresh_stale_gems(
     policy.enabled &= common.dry_run || locked;
     // The patched archive: what bundler itself would download from the
     // patch registry (`<index>/gems/<leaf>.gem`), else the grant's own
-    // artifact, verified against the sha256 the lock pins.
+    // artifact, verified against the sha256 the lock pins. A platform
+    // build (`<name>-<version>-<platform>`) is the patch's prebuild for
+    // that platform, pinned by its own sha256; a platform gem declares no
+    // extensions, so replacing one builds nothing.
     let wanted = |gem: &StaleGem| {
         let (name, version) = gem_sha_key(&gem.purl);
-        let sha256 = gem_artifact_shas
-            .get(&(name.clone(), version.clone()))?
+        let platform = gem.leaf.strip_prefix(&format!("{name}-{version}-"));
+        let prebuilt: std::collections::BTreeSet<String> = overrides
             .iter()
-            .map(|sha| sha.to_ascii_lowercase())
+            .filter(|o| o.ecosystem == "gem" && o.name == name && o.version == version)
+            .filter_map(|o| o.registry_override.as_ref())
+            .flat_map(|ro| &ro.identifiers.gem_platforms)
+            .filter(|prebuild| Some(prebuild.platform.as_str()) == platform)
+            .map(|prebuild| prebuild.gem_checksum_sha256.to_ascii_lowercase())
             .collect();
+        let sha256 = if prebuilt.is_empty() {
+            gem_artifact_shas
+                .get(&(name.clone(), version.clone()))?
+                .iter()
+                .map(|sha| sha.to_ascii_lowercase())
+                .collect()
+        } else {
+            prebuilt
+        };
         let file = format!("{}.gem", gem.leaf);
         let mut urls: Vec<String> = Vec::new();
         for o in overrides
@@ -1783,8 +1805,9 @@ async fn run_redirect_selected_untracked(
     //
     // purl-coordinate → every PATCHED .gem artifact's sha256 (registry
     // override identifier, tarball integrity fallback; one per platform
-    // variant) — judges the installed and committed archives, and verifies
-    // the archive a refresh installs.
+    // variant, and one per prebuild: the patched platform gem a lock that
+    // names platform builds is pinned to) — judges the installed and
+    // committed archives, and verifies the archive a refresh installs.
     let mut gem_artifact_shas: std::collections::BTreeMap<
         (String, String),
         std::collections::BTreeSet<String>,
@@ -1795,7 +1818,12 @@ async fn run_redirect_selected_untracked(
             .as_ref()
             .and_then(|ro| ro.identifiers.gem_checksum_sha256.clone())
             .or_else(|| o.integrity.sha256.clone());
-        if let Some(sha) = sha {
+        let prebuilds = o
+            .registry_override
+            .iter()
+            .flat_map(|ro| &ro.identifiers.gem_platforms)
+            .map(|prebuild| prebuild.gem_checksum_sha256.clone());
+        for sha in sha.into_iter().chain(prebuilds) {
             gem_artifact_shas
                 .entry((o.name.clone(), o.version.clone()))
                 .or_default()

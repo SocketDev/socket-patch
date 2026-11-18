@@ -609,6 +609,129 @@ async fn gem_edge_shapes_round_trip() {
     }
 }
 
+/// [`gem_override`] with a prebuild for each of `platforms`: the patch
+/// registry serves a patched platform gem for it too.
+fn gem_override_prebuilt(name: &str, version: &str, platforms: &[&str]) -> serde_json::Value {
+    let mut overrides = gem_override(name, version);
+    overrides[0]["registryOverride"]["identifiers"]["gemPlatforms"] = platforms
+        .iter()
+        .map(|platform| {
+            serde_json::json!({"platform": platform, "gemChecksumSha256": "ab".repeat(32)})
+        })
+        .collect();
+    overrides
+}
+
+/// A bundler 4 lock that resolves nokogiri as precompiled platform builds:
+/// one entry per platform, and no ruby-platform `nokogiri (1.18.10)`.
+const GEM_PLATFORM_LOCK: &str = "GEM\n  remote: https://rubygems.org/\n  specs:\n    nokogiri (1.18.10-arm64-darwin)\n      racc (~> 1.4)\n    nokogiri (1.18.10-x86_64-linux-gnu)\n      racc (~> 1.4)\n    nokogiri-happymapper (0.10.0)\n    puma (6.0.0)\n      nio4r (~> 2.0)\n    racc (1.8.1)\n\nPLATFORMS\n  arm64-darwin\n  x86_64-linux-gnu\n\nDEPENDENCIES\n  nokogiri (= 1.18.10)\n  puma\n\nCHECKSUMS\n  nokogiri (1.18.10-arm64-darwin) sha256=4444444444444444444444444444444444444444444444444444444444444444\n  nokogiri (1.18.10-x86_64-linux-gnu) sha256=5555555555555555555555555555555555555555555555555555555555555555\n  nokogiri-happymapper (0.10.0) sha256=6666666666666666666666666666666666666666666666666666666666666666\n  puma (6.0.0) sha256=1111111111111111111111111111111111111111111111111111111111111111\n  racc (1.8.1) sha256=3333333333333333333333333333333333333333333333333333333333333333\n\nBUNDLED WITH\n  4.0.15\n";
+
+/// A gem locked as precompiled platform builds, redirected to its
+/// prebuilds and restored: every platform entry is back in the upstream
+/// section where Bundler sorts it, the `DEPENDENCIES` pin (or added entry)
+/// is gone, and each `CHECKSUMS` entry is back on its own build's upstream
+/// sha256 — the pre-scan pair, byte for byte.
+#[tokio::test]
+#[serial]
+async fn gem_platform_prebuilds_round_trip() {
+    let platforms = ["arm64-darwin", "x86_64-linux-gnu"];
+    let gemfile =
+        "source \"https://rubygems.org\"\n\ngem \"nokogiri\", \"1.18.10\"\ngem \"puma\"\n";
+    let (checksums_at, bundled_at) = (
+        GEM_PLATFORM_LOCK.find("CHECKSUMS\n").unwrap(),
+        GEM_PLATFORM_LOCK.find("BUNDLED WITH").unwrap(),
+    );
+    let no_checksums = format!(
+        "{}{}",
+        &GEM_PLATFORM_LOCK[..checksums_at],
+        &GEM_PLATFORM_LOCK[bundled_at..]
+    );
+    // The ruby-platform entry beside the platform builds.
+    let with_ruby = GEM_PLATFORM_LOCK
+        .replace(
+            "  specs:\n",
+            "  specs:\n    nokogiri (1.18.10)\n      mini_portile2 (~> 2.8.2)\n      racc (~> 1.4)\n",
+        )
+        .replace("PLATFORMS\n", "PLATFORMS\n  ruby\n")
+        .replace(
+            "CHECKSUMS\n",
+            "CHECKSUMS\n  nokogiri (1.18.10) sha256=7777777777777777777777777777777777777777777777777777777777777777\n",
+        );
+    // Not declared: puma depends on it, and the rewriter adds the line.
+    let transitive_gemfile = "source \"https://rubygems.org\"\n\ngem \"puma\"\n";
+    let transitive = GEM_PLATFORM_LOCK
+        .replace(
+            "      nio4r (~> 2.0)\n",
+            "      nio4r (~> 2.0)\n      nokogiri (>= 1.18)\n",
+        )
+        .replace("  nokogiri (= 1.18.10)\n", "");
+    let overrides = || gem_override_prebuilt("nokogiri", "1.18.10", &platforms);
+    let cases = [
+        synthetic(
+            "platform-builds",
+            &[("Gemfile", gemfile), ("Gemfile.lock", GEM_PLATFORM_LOCK)],
+            overrides(),
+        ),
+        synthetic(
+            "platform-builds-no-checksums",
+            &[("Gemfile", gemfile), ("Gemfile.lock", &no_checksums)],
+            overrides(),
+        ),
+        synthetic(
+            "platform-builds-beside-ruby",
+            &[("Gemfile", gemfile), ("Gemfile.lock", &with_ruby)],
+            overrides(),
+        ),
+        synthetic(
+            "platform-builds-crlf",
+            &[
+                ("Gemfile", &gemfile.replace('\n', "\r\n")),
+                ("Gemfile.lock", &GEM_PLATFORM_LOCK.replace('\n', "\r\n")),
+            ],
+            overrides(),
+        ),
+        synthetic(
+            "platform-builds-transitive",
+            &[
+                ("Gemfile", transitive_gemfile),
+                ("Gemfile.lock", &transitive),
+            ],
+            overrides(),
+        ),
+    ];
+    for case in &cases {
+        let hosted = &case.expected[if case.expected.contains_key("gems.locked") {
+            "gems.locked"
+        } else {
+            "Gemfile.lock"
+        }];
+        assert!(
+            hosted.contains(&format!(
+                "  remote: {GEM_INDEX}\n  specs:\n    nokogiri (1.18.10"
+            )) || hosted.contains(&format!(
+                "  remote: {GEM_INDEX}\r\n  specs:\r\n    nokogiri (1.18.10"
+            )),
+            "{}: the rewrite moved the builds:\n{hosted}",
+            case.dir.display()
+        );
+        let server = gem_mock(case).await;
+        let _env = EnvGuard::set("SOCKET_RUBYGEMS_URL", server.uri());
+        let (after, statuses) = run_case(case).await;
+        assert_round_trip(case, &after, &statuses);
+        // One `info/nokogiri` document lists every build: it is read once
+        // however many `CHECKSUMS` entries are re-pinned from it.
+        let asked = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|request| request.url.path() == "/info/nokogiri")
+            .count();
+        let pinned = case.input.values().any(|text| text.contains("CHECKSUMS"));
+        assert_eq!(asked, usize::from(pinned), "{}", case.dir.display());
+    }
+}
+
 #[tokio::test]
 #[serial]
 async fn gem_pre_checksums_states() {

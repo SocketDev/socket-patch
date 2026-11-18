@@ -182,15 +182,22 @@ pub struct PackageVendorResult {
 }
 
 /// One served artifact: the native tarball (`kind: "tarball"`), or a
-/// second artifact — npm's yarn-berry cache zip (`kind: "yarn-berry-zip"`) or
-/// gem's path-source stub gemspec (`kind: "gem-stub-gemspec"`). `url` is null
-/// only when the artifact isn't stored yet (e.g. an unbuilt berry zip).
+/// second artifact — npm's yarn-berry cache zip (`kind: "yarn-berry-zip"`),
+/// gem's path-source stub gemspec (`kind: "gem-stub-gemspec"`), or, per
+/// built prebuild of a gem patch, the patched platform gem (`kind:
+/// "gem-platform"`) and its stub gemspec (`kind:
+/// "gem-platform-stub-gemspec"`). `url` is null only when the artifact isn't
+/// stored yet (e.g. an unbuilt berry zip).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PackageVendorArtifact {
     pub kind: String,
     #[serde(default)]
     pub url: Option<String>,
+    /// The gem platform (`x86_64-linux-gnu`, `arm64-darwin`) the artifact
+    /// is built for: present exactly on the two per-prebuild kinds.
+    #[serde(default)]
+    pub platform: Option<String>,
     /// Every ecosystem's tarball populates `sha512` (npm SRI form
     /// `sha512-<b64>`) + `sha1` + `md5`; golang additionally `dirhash_h1`
     /// (`h1:<b64>`); the npm yarn-berry zip carries only `yarn_berry10c0`
@@ -489,5 +496,72 @@ mod tests {
             sr.patches[0].vulnerabilities["GHSA-4hjh-wcwx-xvwj"].severity,
             "HIGH"
         );
+    }
+
+    /// A gem patch with a built prebuild: the per-platform artifacts carry
+    /// `platform`, and the override lists each platform's sha256 under
+    /// `gemPlatforms`. Both are absent from a patch with no prebuild, which
+    /// reads as none.
+    #[test]
+    fn package_vendor_result_reads_gem_prebuilds() {
+        let sha = "ab".repeat(32);
+        let json = serde_json::json!({
+            "status": "granted",
+            "purl": "pkg:gem/nokogiri@1.18.10?platform=ruby",
+            "url": "https://patch.socket.dev/patch/gem/nokogiri-1.18.10.gem",
+            "artifacts": [
+                { "kind": "tarball", "url": "https://patch.socket.dev/a.gem",
+                  "integrity": { "sha256": sha } },
+                { "kind": "gem-platform", "platform": "x86_64-linux-gnu",
+                  "url": "https://patch.socket.dev/a-x86_64-linux-gnu.gem",
+                  "contentType": "application/octet-stream", "sizeBytes": 4000000,
+                  "integrity": { "sha256": sha } },
+                { "kind": "gem-platform-stub-gemspec", "platform": "x86_64-linux-gnu",
+                  "url": "https://patch.socket.dev/a-x86_64-linux-gnu.gemspec",
+                  "integrity": {} }
+            ],
+            "registryOverride": {
+                "kind": "rubygems-compact-index",
+                "indexUrl": "https://patch.socket.dev/patch-registry/gem/t/u/",
+                "identifiers": {
+                    "name": "nokogiri", "version": "1.18.10",
+                    "gemChecksumSha256": sha,
+                    "gemPlatforms": [
+                        { "platform": "x86_64-linux-gnu", "gemChecksumSha256": sha }
+                    ]
+                }
+            }
+        });
+        let result: PackageVendorResult = serde_json::from_value(json.clone()).unwrap();
+        let artifacts = result.artifacts.as_deref().unwrap();
+        let platforms: Vec<_> = artifacts
+            .iter()
+            .map(|a| (a.kind.as_str(), a.platform.as_deref()))
+            .collect();
+        assert_eq!(
+            platforms,
+            [
+                ("tarball", None),
+                ("gem-platform", Some("x86_64-linux-gnu")),
+                ("gem-platform-stub-gemspec", Some("x86_64-linux-gnu")),
+            ]
+        );
+        let ids = result.registry_override.unwrap().identifiers;
+        assert_eq!(ids.gem_platforms.len(), 1);
+        assert_eq!(ids.gem_platforms[0].platform, "x86_64-linux-gnu");
+        assert_eq!(ids.gem_platforms[0].gem_checksum_sha256, sha);
+
+        let mut bare = json;
+        bare["registryOverride"]["identifiers"]
+            .as_object_mut()
+            .unwrap()
+            .remove("gemPlatforms");
+        let result: PackageVendorResult = serde_json::from_value(bare).unwrap();
+        assert!(result
+            .registry_override
+            .unwrap()
+            .identifiers
+            .gem_platforms
+            .is_empty());
     }
 }
