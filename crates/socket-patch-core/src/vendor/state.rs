@@ -1225,6 +1225,17 @@ async fn wiring_file_refusal(rec: &WiringRecord, project_root: &Path) -> Option<
         "yarn_berry_resolution" | "yarn_berry_lock_entry" | "yarn_berry_lock_entry_pruned" => {
             one_of(&["yarn.lock", "package.json"])
         }
+        // The Rush layout records the same lock kinds against Rush's own
+        // locks, plus its config override and project manifest edits.
+        kind if kind.starts_with("pnpm_lock_") && super::pnpm_lock::rush::is_lock_rel(file) => None,
+        super::pnpm_lock::rush::KIND_GLOBAL_OVERRIDE => unless(
+            super::pnpm_lock::rush::is_pnpm_config(file),
+            "a Rush pnpm-config.json",
+        ),
+        super::pnpm_lock::rush::KIND_PROJECT_DEP => unless(
+            super::pnpm_lock::rush::is_project_manifest(file),
+            "a Rush project's package.json",
+        ),
         kind if kind.starts_with("pnpm_lock_")
             || kind.starts_with("pnpm_pkg_")
             || kind.starts_with("pnpm_ws_") =>

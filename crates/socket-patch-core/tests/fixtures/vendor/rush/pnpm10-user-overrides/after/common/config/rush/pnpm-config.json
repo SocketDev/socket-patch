@@ -1,0 +1,104 @@
+{
+  "$schema": "https://developer.microsoft.com/json-schemas/rush/v5/pnpm-config.schema.json",
+
+  "useWorkspaces": true,
+
+  // "resolutionMode": "time-based",
+
+  // "autoInstallPeers": false,
+
+  // "minimumReleaseAgeMinutes": 1440,
+
+  // "minimumReleaseAgeExclude": ["@myorg/*"],
+
+  // "trustPolicy": "no-downgrade",
+
+  // "trustPolicyExclude": ["@myorg/*"],
+
+  // "trustPolicyIgnoreAfterMinutes": 20160,
+
+  // "strictPeerDependencies": true,
+
+  // "environmentVariables": {
+  //   "NODE_OPTIONS": {
+  //     "value": "--max-old-space-size=4096",
+  //     "override": false
+  //   }
+  // },
+
+  // "pnpmStore": "global",
+
+  // "preventManualShrinkwrapChanges": true,
+
+  // "alwaysInjectDependenciesFromOtherSubspaces": false,
+
+  "pnpmLockfilePolicies": {
+
+    // "disallowInsecureSha1": {
+    //    //   "enabled": true,
+    // 
+    //    //   "exemptPackageVersions": {
+    //     "example1": ["1.0.0"],
+    //     "example2": ["2.0.0", "2.0.1"]
+    //   }
+    // }
+  },
+
+  "globalOverrides": {
+    "once@1.4.0>wrappy": "1.0.1", // pinned by the team
+    "left-pad": "1.2.0",
+    "mkdirp@0.5.1>minimist@0.0.8": "file:../../.socket/vendor/npm/8cccd65b-5a7c-4ec5-8068-ebc66c727d8c/minimist-0.0.8.tgz",
+    // "example1": "^1.0.0",
+    // "example2": "npm:@company/example2@^1.0.0"
+  },
+
+  "globalPeerDependencyRules": {
+    // "ignoreMissing": ["@eslint/*"],
+    // "allowedVersions": { "react": "17" },
+    // "allowAny": ["@babel/*"]
+  },
+
+  "globalPackageExtensions": {
+    // "fork-ts-checker-webpack-plugin": {
+    //   "dependencies": {
+    //     "@babel/core": "1"
+    //   },
+    //   "peerDependencies": {
+    //     "eslint": ">= 6"
+    //   },
+    //   "peerDependenciesMeta": {
+    //     "eslint": {
+    //       "optional": true
+    //     }
+    //   }
+    // }
+  },
+
+  "globalNeverBuiltDependencies": [
+    // "fsevents"
+  ],
+
+  // "globalOnlyBuiltDependencies": [
+  //   "esbuild"
+  // ],
+
+  "globalIgnoredOptionalDependencies": [
+    // "fsevents"
+  ],
+
+  "globalAllowedDeprecatedVersions": {
+    // "request": "*"
+  },
+
+  "globalPatchedDependencies": { },
+
+  "unsupportedPackageJsonSettings": {
+    // "dependencies": {
+    //   "not-a-good-practice": "*"
+    // },
+    // "scripts": {
+    //   "do-something": "echo Also not a good practice"
+    // },
+    // "pnpm": { "futurePnpmFeature": true }
+  }
+}
