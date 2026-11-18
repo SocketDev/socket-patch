@@ -1,0 +1,150 @@
+name: SPIKE nokogiri prebuild
+
+# Throwaway: never merge. Proves that a patched nokogiri platform gem can be
+# built from nokogiri's own tag with nokogiri's own cross-build
+# (rake-compiler-dock), and that the result is a drop-in for the gem
+# rubygems.org serves: same file list, same gemspec, and a binary per Ruby
+# minor that loads with the patch compiled in.
+
+on:
+  push:
+    branches: [spike/nokogiri-prebuild]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build ${{ matrix.nokogiri }} ${{ matrix.platform }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {nokogiri: '1.18.10', rcd: '1.7.0', platform: x86_64-linux-gnu}
+          - {nokogiri: '1.18.10', rcd: '1.7.0', platform: aarch64-linux-gnu}
+          - {nokogiri: '1.18.10', rcd: '1.7.0', platform: x86_64-linux-musl}
+          - {nokogiri: '1.18.10', rcd: '1.7.0', platform: arm64-darwin}
+          - {nokogiri: '1.18.10', rcd: '1.7.0', platform: x64-mingw-ucrt}
+          - {nokogiri: '1.13.10', rcd: '1.2.2', platform: x86_64-linux}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Fetch nokogiri at its tag
+        env:
+          NOKOGIRI: ${{ matrix.nokogiri }}
+        run: git clone --depth 1 --branch "v$NOKOGIRI" https://github.com/sparklemotion/nokogiri nokogiri
+      - uses: ruby/setup-ruby@319994f95fa847cf3fb3cd3dbe89f6dcde9f178f # v1.295.0
+        with:
+          ruby-version: '3.3'
+      - name: Lay a patch over the tree
+        working-directory: nokogiri
+        # The three shapes of the published nokogiri patches: a Ruby file,
+        # a C source, a new patch for the vendored libxml2.
+        run: |
+          ruby - <<'RUBY'
+          rb = "lib/nokogiri.rb"
+          File.write(rb, File.read(rb) + "\nmodule Nokogiri\n  SOCKET_PATCH_E2E_RB = 1\nend\n")
+          c = "ext/nokogiri/nokogiri.c"
+          anchor = /^[ \t]*mNokogiri[ \t]*=[ \t]*rb_define_module\("Nokogiri"\);[ \t]*$/
+          src = File.read(c)
+          abort "no anchor in #{c}" unless src =~ anchor
+          File.write(c, src.sub(anchor) { |l| "#{l}\n  rb_define_const(mNokogiri, \"SOCKET_PATCH_E2E_C\", INT2FIX(1));" })
+          File.write("patches/libxml2/0100-socket-patch-e2e.patch", <<~PATCH)
+            diff --git a/socket-patch-e2e.txt b/socket-patch-e2e.txt
+            new file mode 100644
+            --- /dev/null
+            +++ b/socket-patch-e2e.txt
+            @@ -0,0 +1 @@
+            +Added by the socket-patch nokogiri prebuild spike.
+          PATCH
+          RUBY
+          git status --short
+      - name: Build the platform gem with nokogiri's own cross-build
+        working-directory: nokogiri
+        env:
+          RCD: ${{ matrix.rcd }}
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          gem install rake-compiler-dock -v "$RCD" --no-document
+          time ruby -e '
+            gem "rake-compiler-dock", ENV.fetch("RCD")
+            require "rake_compiler_dock"
+            plat = ENV.fetch("PLATFORM")
+            RakeCompilerDock.sh("git config --global --add safe.directory $(pwd) && gem install bundler --no-document && bundle && bundle exec rake gem:#{plat}:builder MAKE=\"nice make -j$(nproc)\"", platform: plat, verbose: true)
+          '
+          ls -la pkg/*.gem
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: gem-${{ matrix.nokogiri }}-${{ matrix.platform }}
+          path: nokogiri/pkg/*.gem
+          if-no-files-found: error
+          retention-days: 3
+
+  verify:
+    name: verify ${{ matrix.nokogiri }} ${{ matrix.platform }} on ${{ matrix.ruby }} (${{ matrix.os }})
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {os: ubuntu-latest, ruby: '3.1', nokogiri: '1.18.10', platform: x86_64-linux-gnu}
+          - {os: ubuntu-latest, ruby: '3.4', nokogiri: '1.18.10', platform: x86_64-linux-gnu}
+          - {os: ubuntu-24.04-arm, ruby: '3.4', nokogiri: '1.18.10', platform: aarch64-linux-gnu}
+          - {os: macos-latest, ruby: '3.4', nokogiri: '1.18.10', platform: arm64-darwin}
+          - {os: windows-latest, ruby: '3.4', nokogiri: '1.18.10', platform: x64-mingw-ucrt}
+          - {os: ubuntu-latest, ruby: '2.7', nokogiri: '1.13.10', platform: x86_64-linux}
+          - {os: ubuntu-latest, ruby: '3.1', nokogiri: '1.13.10', platform: x86_64-linux}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: gem-${{ matrix.nokogiri }}-${{ matrix.platform }}
+          path: built
+      - uses: ruby/setup-ruby@319994f95fa847cf3fb3cd3dbe89f6dcde9f178f # v1.295.0
+        with:
+          ruby-version: ${{ matrix.ruby }}
+      - name: Compare with the gem rubygems.org serves, then install and load
+        shell: bash
+        env:
+          NOKOGIRI: ${{ matrix.nokogiri }}
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          set -euo pipefail
+          built="$(ls built/*.gem)"
+          echo "built: $built"
+          mkdir upstream && (cd upstream && gem fetch nokogiri -v "$NOKOGIRI" --platform "$PLATFORM")
+          up="$(ls upstream/*.gem)"
+          [ "$(basename "$built")" = "$(basename "$up")" ] || { echo "::error::file name differs: $built vs $up"; exit 1; }
+          ruby - "$built" "$up" <<'RUBY'
+          require "rubygems/package"
+          built, up = ARGV.map { |f| Gem::Package.new(f) }
+          bf, uf = built.contents.sort, up.contents.sort
+          puts "files: built #{bf.size}, upstream #{uf.size}"
+          puts "only in built: #{(bf - uf).inspect}"
+          puts "only in upstream: #{(uf - bf).inspect}"
+          a, b = built.spec, up.spec
+          same = %w[name version platform required_ruby_version required_rubygems_version require_paths extensions executables bindir licenses metadata].map do |f|
+            eq = a.send(f) == b.send(f)
+            puts "spec.#{f}: #{eq ? 'same' : "DIFFERS built=#{a.send(f).inspect} upstream=#{b.send(f).inspect}"}"
+            eq
+          end
+          deps = a.runtime_dependencies.map(&:to_s).sort == b.runtime_dependencies.map(&:to_s).sort
+          puts "runtime dependencies: #{deps ? 'same' : 'DIFFER'} #{a.runtime_dependencies.map(&:to_s).inspect}"
+          abort "not a drop-in" unless bf == uf && same.all? && deps
+          RUBY
+          export GEM_HOME="$PWD/home" GEM_PATH="$PWD/home"
+          gem install --no-document "$built"
+          ruby - <<'RUBY'
+          require "nokogiri"
+          lx = Nokogiri::VERSION_INFO["libxml"]
+          bin = $LOADED_FEATURES.grep(/nokogiri\.(so|bundle)\z/).first
+          puts "ruby #{RUBY_VERSION} loads #{bin}"
+          puts "precompiled=#{lx['precompiled'].inspect} libxml2=#{lx['loaded']} patches=#{lx['patches'].inspect}"
+          abort "not precompiled" unless lx["precompiled"]
+          abort "C patch not compiled in" unless Nokogiri.const_defined?(:SOCKET_PATCH_E2E_C) && Nokogiri::SOCKET_PATCH_E2E_C == 1
+          abort "Ruby patch missing" unless Nokogiri.const_defined?(:SOCKET_PATCH_E2E_RB)
+          abort "libxml2 patch not compiled in" unless lx["patches"].include?("0100-socket-patch-e2e.patch")
+          abort "does not parse" unless Nokogiri::XML("<a><b>ok</b></a>").at("b").text == "ok"
+          puts "PREBUILD OK"
+          RUBY
