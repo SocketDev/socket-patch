@@ -698,52 +698,91 @@ fn drop_duplicate_block(
     true
 }
 
+/// How an override selects the package of snapshot `key`:
+/// `<name>@<version>`. `None` when the lock does not say its version.
+fn override_parent(
+    lines: &[String],
+    packages: &[(String, usize, usize)],
+    key: &str,
+) -> Option<String> {
+    // A peer or patch suffix is not part of the package's identity.
+    let bare = key.split_once('(').map_or(key, |(k, _)| k);
+    // Past the first character: a scope's `@` is not the separator.
+    let at = bare
+        .char_indices()
+        .skip(1)
+        .find_map(|(i, c)| (c == '@').then_some(i))?;
+    let (parent, locator) = (&bare[..at], &bare[at + 1..]);
+    if locator.starts_with(|c: char| c.is_ascii_digit()) {
+        return Some(format!("{parent}@{locator}"));
+    }
+    // A `file:`, git or url entry spells its version in the entry.
+    let (_, header, end) = packages.iter().find(|(k, _, _)| k == bare)?;
+    lines[header + 1..*end].iter().find_map(|line| {
+        let (field, _, rest) = parse_key_line(line, 4)?;
+        (field == "version").then(|| format!("{parent}@{}", unquote_value(rest)))
+    })
+}
+
+/// What each snapshot that depends on `name` resolves it to:
+/// `(snapshot key, resolved value)`.
+fn snapshot_edges(lines: &[String], name: &str) -> Vec<(String, String)> {
+    section_blocks(lines, "snapshots")
+        .into_iter()
+        .filter_map(|(key, header, end)| {
+            let rest = lines[header + 1..end].iter().find_map(|line| {
+                parse_key_line(line, 6)
+                    .filter(|(dep, _, _)| *dep == name)
+                    .map(|(_, _, rest)| rest.to_string())
+            })?;
+            Some((key, rest))
+        })
+        .collect()
+}
+
 /// The override key of every registry package whose snapshot resolves the
 /// vendored package: `<parent>@<version>><name>@<version>`, sorted.
 fn parent_override_keys(lines: &[String], ctx: &EditCtx<'_>) -> Result<Vec<String>, String> {
     let mut keys = BTreeSet::new();
     let packages = section_blocks(lines, "packages");
-    for (key, header, end) in section_blocks(lines, "snapshots") {
-        let resolves = lines[header + 1..end].iter().any(|line| {
-            parse_key_line(line, 6)
-                .is_some_and(|(dep, _, rest)| dep == ctx.name && rest == ctx.spec)
-        });
-        if !resolves {
+    for (key, rest) in snapshot_edges(lines, ctx.name) {
+        if rest != ctx.spec {
             continue;
         }
-        // A peer or patch suffix is not part of the package's identity.
-        let bare = key.split_once('(').map_or(key.as_str(), |(k, _)| k);
-        let at = bare[1..]
-            .find('@')
-            .map(|i| i + 1)
-            .ok_or_else(|| format!("snapshot key `{key}` names no version"))?;
-        let (parent, locator) = (&bare[..at], &bare[at + 1..]);
-        let parent_version = match locator.starts_with(|c: char| c.is_ascii_digit()) {
-            true => locator.to_string(),
-            // A `file:`, git or url entry spells its version in the entry.
-            false => packages
-                .iter()
-                .find(|(k, _, _)| k == bare)
-                .and_then(|(_, h, e)| {
-                    lines[h + 1..*e].iter().find_map(|line| {
-                        let (field, _, rest) = parse_key_line(line, 4)?;
-                        (field == "version").then(|| rest.to_string())
-                    })
-                })
-                .ok_or_else(|| {
-                    format!(
-                        "`{key}` depends on {}@{} but its own version cannot be read, so no \
-                         override can select it",
-                        ctx.name, ctx.version
-                    )
-                })?,
-        };
-        keys.insert(format!(
-            "{parent}@{parent_version}>{}@{}",
-            ctx.name, ctx.version
-        ));
+        let parent = override_parent(lines, &packages, &key).ok_or_else(|| {
+            format!(
+                "`{key}` depends on {}@{} but its own version cannot be read, so no override \
+                 can select it",
+                ctx.name, ctx.version
+            )
+        })?;
+        keys.insert(format!("{parent}>{}@{}", ctx.name, ctx.version));
     }
     Ok(keys.into_iter().collect())
+}
+
+/// The first dependent in `lines` that one of `keys` selects but that
+/// resolves `name` to something other than `spec`: `(override key, snapshot
+/// key, what it resolves to)`. pnpm applies an override to every lock that
+/// reads the config, so that dependent would move to the vendored release
+/// the next time pnpm resolves it.
+fn other_resolution(
+    lines: &[String],
+    keys: &[String],
+    name: &str,
+    spec: &str,
+) -> Option<(String, String, String)> {
+    let packages = section_blocks(lines, "packages");
+    snapshot_edges(lines, name)
+        .into_iter()
+        .filter(|(_, rest)| rest != spec)
+        .find_map(|(snapshot, rest)| {
+            let parent = override_parent(lines, &packages, &snapshot)?;
+            let key = keys
+                .iter()
+                .find(|key| key.split_once('>').is_some_and(|(p, _)| p == parent))?;
+            Some((key.clone(), snapshot, rest))
+        })
 }
 
 /// The `overrides:` entries of a lock, as `(line, key, value)`.
@@ -907,6 +946,7 @@ async fn plan(
         let mut lines = (*doc.lines).clone();
         let mut records: Vec<WiringRecord> = Vec::new();
         let specifiers_before = distinct_specifiers(&lines, name);
+        let mut injected_hash_inputs = false;
 
         // Direct edges: the importer entry and the project's package.json.
         for dep in importer_deps(&lines, name) {
@@ -943,6 +983,7 @@ async fn plan(
             )
             .await?;
             if edited {
+                injected_hash_inputs |= dep.field != "devDependencies";
                 edited_manifests.push(manifest_rel);
             }
             if dep.version == spec && dep.specifier == importer_spec {
@@ -1038,6 +1079,7 @@ async fn plan(
             lines,
             records,
             specifiers_before: Some(specifiers_before),
+            injected_hash_inputs,
         });
     }
     if edits.iter().all(Option::is_none) {
@@ -1064,17 +1106,38 @@ async fn plan(
     // Every lock that reads a config carries that config's overrides,
     // whether or not it installs the package.
     for (at, doc) in project.locks.iter().enumerate() {
-        let keys = lock_configs[at]
+        let Some(shared) = lock_configs[at]
             .as_ref()
             .and_then(|rel| config_keys.iter().find(|c| &c.file == rel))
-            .map_or(&[][..], |c| c.keys.as_slice());
-        if keys.is_empty() {
+        else {
             continue;
+        };
+        // A lock Rush installs from another depth cannot carry the config's
+        // path (a leftover of a layout the repository moved off): it does
+        // not install the package, so it is left as it is.
+        if shared.keys.is_empty() || shared.temp_prefix != doc.layout.temp_prefix() {
+            continue;
+        }
+        let keys = shared.keys.as_slice();
+        let current = edits[at].as_ref().map_or(&**doc.lines, |e| &e.lines[..]);
+        if let Some((key, dependent, other)) = other_resolution(current, keys, name, &spec) {
+            return Err((
+                VENDOR_RUSH_UNSUPPORTED,
+                format!(
+                    "{} reads {} too, and there `{dependent}` resolves {name} to `{other}`, \
+                     not {version}: the override `{key}` that vendoring {name}@{version} needs \
+                     in that config would move it to the vendored release the next time pnpm \
+                     resolves that lockfile. Give one of the subspaces its own {PNPM_CONFIG}, \
+                     or use `socket-patch scan --mode hosted`; nothing was written",
+                    doc.layout.lock_rel, shared.file
+                ),
+            ));
         }
         let edit = edits[at].get_or_insert_with(|| LockEdit {
             lines: (*doc.lines).clone(),
             records: Vec::new(),
             specifiers_before: None,
+            injected_hash_inputs: false,
         });
         edit_overrides(
             &mut edit.lines,
@@ -1087,11 +1150,13 @@ async fn plan(
 
     let mut lock_writes = Vec::new();
     let mut stale_repo_state: Vec<String> = Vec::new();
+    let mut stale_injected_hash: Vec<String> = Vec::new();
     for (doc, edit) in project.locks.iter().zip(edits) {
         let Some(LockEdit {
             lines,
             mut records,
             specifiers_before,
+            injected_hash_inputs,
         }) = edit
         else {
             continue;
@@ -1100,7 +1165,12 @@ async fn plan(
         if let Some(before) = specifiers_before {
             let policy = version_policy(files, &doc.layout, name).await?;
             if project.consistent_versions || policy.consistent_versions {
-                let after = distinct_specifiers(&lines, name);
+                let mut after = distinct_specifiers(&lines, name);
+                let mut before = before;
+                if let Some(preferred) = &policy.preferred_version {
+                    after.insert(preferred.clone());
+                    before.insert(preferred.clone());
+                }
                 let disallowed = |set: &BTreeSet<String>| {
                     set.iter()
                         .filter(|s| !policy.allowed_alternatives.contains(*s))
@@ -1123,6 +1193,19 @@ async fn plan(
                 }
             }
         }
+        // Rush records two hashes beside the lock, and `rush install`
+        // refuses a repository whose files no longer match them.
+        let repo_state = format!("{}/repo-state.json", doc.layout.config_dir);
+        let recorded = files
+            .text(&repo_state)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|text| crate::formats::package_json::parse(&text));
+        let records_hash = |field: &str| recorded.as_ref().is_some_and(|v| v.get(field).is_some());
+        if injected_hash_inputs && records_hash("packageJsonInjectedDependenciesHash") {
+            stale_injected_hash.push(repo_state.clone());
+        }
         if lines == *doc.lines {
             continue;
         }
@@ -1135,16 +1218,8 @@ async fn plan(
             new: doc.render(&lines),
             original: doc.eol.restore(&doc.text).into_owned().into_bytes(),
         });
-        // `preventManualShrinkwrapChanges` records the lock's hash beside it.
-        let repo_state = format!("{}/repo-state.json", doc.layout.config_dir);
-        let hashed = files
-            .text(&repo_state)
-            .await
-            .ok()
-            .flatten()
-            .and_then(|text| crate::formats::package_json::parse(&text))
-            .is_some_and(|v| v.get("pnpmShrinkwrapHash").is_some());
-        if hashed {
+        // `preventManualShrinkwrapChanges` records the lock's hash.
+        if records_hash("pnpmShrinkwrapHash") {
             stale_repo_state.push(repo_state);
         }
     }
@@ -1200,6 +1275,20 @@ async fn plan(
             ),
         ));
     }
+    if !stale_injected_hash.is_empty() {
+        out.warnings.push(VendorWarning::new(
+            VENDOR_RUSH_REPO_STATE_STALE,
+            format!(
+                "{} records a hash of the package.json files behind injected workspace \
+                 dependencies (`packageJsonInjectedDependenciesHash`), and this run changed \
+                 {name}'s spec in {}: if one of those projects is among them, `rush install` \
+                 fails until `rush update` refreshes the hash. `rush update` keeps the vendored \
+                 wiring",
+                stale_injected_hash.join(", "),
+                edited_manifests.join(", ")
+            ),
+        ));
+    }
     Ok(out)
 }
 
@@ -1211,6 +1300,10 @@ struct LockEdit {
     /// The importers' specifiers for the package before the edit; `None`
     /// for a lock that only mirrors a shared config's overrides.
     specifiers_before: Option<BTreeSet<String>>,
+    /// Whether this run edited a project manifest field that Rush hashes
+    /// for injected workspace dependencies (every field but
+    /// `devDependencies`).
+    injected_hash_inputs: bool,
 }
 
 /// The overrides one `pnpm-config.json` gets from this run.
@@ -1226,7 +1319,7 @@ struct ConfigKeys {
 fn distinct_specifiers(lines: &[String], name: &str) -> BTreeSet<String> {
     importer_deps(lines, name)
         .into_iter()
-        .map(|dep| dep.specifier)
+        .map(|dep| unquote_value(&dep.specifier).to_string())
         .collect()
 }
 
@@ -1266,16 +1359,33 @@ async fn edit_manifest(
             dep.field, dep.specifier
         ))
     };
-    let token = dependency_token(text, dep.field, name).map_err(|_| stale())?;
+    let token = match dependency_token(text, dep.field, name) {
+        Ok(token) => token,
+        // pnpm installs a workspace project's own peer dependency for it and
+        // locks it under `dependencies`, beside a `devDependencies` spec or
+        // without one. Rush moves the entry to `devDependencies` once that
+        // spec is a `file:` one, an edit this layout does not make.
+        Err(_) if dependency_token(text, "peerDependencies", name).is_ok() => {
+            return Err(refuse(format!(
+                "{manifest_rel} lists `{name}` under peerDependencies. pnpm locks a workspace \
+                 project's own peer dependency under `dependencies` in {lock_rel}, where the \
+                 project has no spec that vendoring can move to the tarball. Vendored mode \
+                 does not wire this shape: use `socket-patch scan --mode hosted`; nothing was \
+                 written"
+            )))
+        }
+        Err(_) => return Err(stale()),
+    };
     let current: String = serde_json::from_str(&token).map_err(|_| stale())?;
     if current == importer_spec {
         return Ok(false);
     }
     // The registry spec the lock was resolved from, or an earlier
-    // vendoring's spec for the same release.
+    // vendoring's spec for the same release. The lock quotes a spec YAML
+    // would misread (`'*'`, `'1'`).
     let ours = parse_vendor_path_from(project_rel, &current)
         .is_some_and(|p| p.eco == "npm" && p.leaf == tgz_rel_leaf(name, version));
-    if current != dep.specifier && !ours {
+    if current != unquote_value(&dep.specifier) && !ours {
         return Err(stale());
     }
     let raw = Value::String(importer_spec.to_string()).to_string();
@@ -1298,37 +1408,40 @@ struct ConfigFacts {
     consistent_versions: bool,
     /// `allowedAlternativeVersions` for the package.
     allowed_alternatives: Vec<String>,
+    /// `preferredVersions` for the package: Rush's consistency check counts
+    /// it beside the projects' own specs.
+    preferred_version: Option<String>,
 }
 
-/// The version policy of the lock's subspace for package `name`
-/// (common-versions.json: the subspace's own, else the shared one).
+/// The version policy of the lock's subspace for package `name`: its own
+/// common-versions.json (Rush reads no shared one for a subspace).
 async fn version_policy(
     files: &mut Files<'_>,
     layout: &Layout,
     name: &str,
 ) -> Result<ConfigFacts, Refusal> {
     let mut facts = ConfigFacts::default();
-    for rel in layout.config_candidates("common-versions.json") {
-        let Some(text) = files
-            .text(&rel)
-            .await
-            .map_err(|detail| (VENDOR_RUSH_UNSUPPORTED, detail))?
-        else {
-            continue;
-        };
-        if let Some(doc) = crate::formats::package_json::parse(&text) {
-            facts.consistent_versions =
-                doc.get("ensureConsistentVersions").and_then(Value::as_bool) == Some(true);
-            facts.allowed_alternatives = doc
-                .get("allowedAlternativeVersions")
-                .and_then(|table| table.get(name))
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-                .filter_map(|v| v.as_str().map(str::to_string))
-                .collect();
-        }
-        break;
+    let rel = format!("{}/common-versions.json", layout.config_dir);
+    let text = files
+        .text(&rel)
+        .await
+        .map_err(|detail| (VENDOR_RUSH_UNSUPPORTED, detail))?;
+    if let Some(doc) = text.and_then(|text| crate::formats::package_json::parse(&text)) {
+        facts.consistent_versions =
+            doc.get("ensureConsistentVersions").and_then(Value::as_bool) == Some(true);
+        facts.allowed_alternatives = doc
+            .get("allowedAlternativeVersions")
+            .and_then(|table| table.get(name))
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect();
+        facts.preferred_version = doc
+            .get("preferredVersions")
+            .and_then(|table| table.get(name))
+            .and_then(Value::as_str)
+            .map(str::to_string);
     }
     Ok(facts)
 }
@@ -1420,6 +1533,19 @@ async fn edit_config(
     }
     if shared.keys.is_empty() {
         return Ok(());
+    }
+    // Rush merges a config into the one it `extends` property by property:
+    // a `globalOverrides` table here replaces the inherited one whole.
+    let inherits = crate::formats::package_json::parse(text)
+        .is_some_and(|doc| doc.get("extends").is_some() && doc.get(GLOBAL_OVERRIDES).is_none());
+    if inherits {
+        return Err(unreadable(format!(
+            "{config_rel} takes its `{GLOBAL_OVERRIDES}` from the file it `extends`, and a \
+             table written here would replace the inherited one whole. Add a \
+             `{GLOBAL_OVERRIDES}` table to {config_rel} holding the entries it inherits (an \
+             empty one when there are none) and run `rush update`, then vendor again; \
+             nothing was written"
+        )));
     }
     let entries: Vec<(String, String)> = shared
         .keys
@@ -1653,6 +1779,43 @@ pub(crate) async fn entry_in_use(entry: &VendorEntry, project_root: &Path) -> Op
     any_read.then_some(false)
 }
 
+/// Every file the Rush layout may wire, project-relative: each pnpm lock,
+/// the `pnpm-config.json` files Rush reads for it, and the `package.json`
+/// of every project `rush.json` lists. Empty outside a Rush repository;
+/// sorted, and entries need not exist.
+pub async fn wiring_files(project_root: &Path) -> Vec<String> {
+    let view = ProjectView::Disk(project_root);
+    if !is_rush(view).await {
+        return Vec::new();
+    }
+    let mut files = BTreeSet::new();
+    for rel in rush_lock_rels(view).await {
+        if let Some(layout) = Layout::of(&rel) {
+            files.extend(layout.config_candidates(PNPM_CONFIG));
+        }
+        files.insert(rel);
+    }
+    let rush = read_regular_to_string(&project_root.join(RUSH_JSON))
+        .await
+        .ok()
+        .and_then(|text| crate::formats::package_json::parse(&text));
+    let folders = rush
+        .iter()
+        .filter_map(|rush| rush.get("projects")?.as_array())
+        .flatten()
+        .filter_map(|project| project.get("projectFolder")?.as_str());
+    for folder in folders {
+        let folder = folder.replace('\\', "/");
+        let manifest = format!("{}/{PACKAGE_JSON}", folder.trim_matches('/'));
+        // `rush.json` is the repository's own, and still only a plain
+        // folder inside it is read.
+        if is_project_manifest(&manifest) {
+            files.insert(manifest);
+        }
+    }
+    files.into_iter().collect()
+}
+
 /// Whether `rel` is a Rush pnpm lock: the common one or a subspace's.
 pub(crate) fn is_lock_rel(rel: &str) -> bool {
     Layout::of(rel).is_some()
@@ -1859,6 +2022,43 @@ pub async fn revert_rush_pnpm_opts(
                     .into_owned()
                     .into_bytes(),
             ));
+        }
+    }
+
+    // A lock the vendoring never wrote (a subspace added since, reading the
+    // same config) can resolve through the artifact too, and no record
+    // restores it.
+    if !opts.keep_artifact {
+        let uuid = entry.uuid.to_ascii_lowercase();
+        for lock_rel in rush_lock_rels(ProjectView::Disk(project_root)).await {
+            if lock_records.contains_key(&lock_rel) {
+                continue;
+            }
+            let Ok((text, _)) = read_pnpm_text(project_root, &lock_rel).await else {
+                continue;
+            };
+            let lines = split_lines(split_v9_lock(&text).map_or(text.as_str(), |(_, p)| p));
+            let declared = section_bounds(&lines, "overrides").unwrap_or((0, 0));
+            let left = lines.iter().enumerate().find(|(i, line)| {
+                !(declared.0..declared.1).contains(i) && line.to_ascii_lowercase().contains(&uuid)
+            });
+            if let Some((_, line)) = left {
+                let detail = format!(
+                    "refusing to revert {uuid_dir_rel}: {lock_rel}, which the vendoring did not \
+                     write, resolves through it too (`{}`), and deleting the tarball would \
+                     break that install; nothing was reverted — remove what makes it use the \
+                     tarball (the entries for it under `{GLOBAL_OVERRIDES}`, or a `file:` spec \
+                     in one of that subspace's projects) and run `rush update`, then re-run \
+                     `vendor --revert`",
+                    line.trim()
+                );
+                outcome.success = false;
+                outcome.error = Some(detail.clone());
+                outcome
+                    .warnings
+                    .push(VendorWarning::new(revert::STILL_WIRED_CODE, detail));
+                return outcome;
+            }
         }
     }
 
@@ -2484,6 +2684,117 @@ mod tests {
         assert!(detail.contains("rush update"), "{detail}");
     }
 
+    /// The lock quotes a spec YAML would misread (`'*'`); the manifest
+    /// spells the same spec bare, and the two still agree.
+    #[tokio::test]
+    async fn a_spec_the_lock_quotes_matches_the_manifest() {
+        let repo = Repo::new("pnpm10");
+        let manifest = repo
+            .read("libs/util/package.json")
+            .replace("\"0.0.8\"", "\"*\"");
+        repo.write("libs/util/package.json", &manifest);
+        let importer =
+            "  ../../libs/util:\n    dependencies:\n      minimist:\n        specifier: ";
+        let lock = repo.read(RUSH_COMMON_LOCK_REL);
+        assert!(lock.contains(&format!("{importer}0.0.8")));
+        let lock = lock.replace(&format!("{importer}0.0.8"), &format!("{importer}'*'"));
+        repo.write(RUSH_COMMON_LOCK_REL, &lock);
+
+        let (result, entry, _) = expect_done(repo.vendor(MINIMIST_008).await);
+        assert!(result.success, "{:?}", result.error);
+        assert!(repo
+            .read("libs/util/package.json")
+            .contains("file:../../.socket/vendor/"));
+        let outcome = revert_npm_any(&entry.unwrap(), repo.root(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert_eq!(repo.read("libs/util/package.json"), manifest);
+        assert_eq!(repo.read(RUSH_COMMON_LOCK_REL), lock);
+    }
+
+    /// pnpm installs a project's own peer dependency for it and locks it
+    /// under `dependencies`, with or without a `devDependencies` spec
+    /// beside it: `rush update` is not what is missing.
+    #[tokio::test]
+    async fn a_projects_own_peer_dependency_is_refused_by_name() {
+        let own = "\"dependencies\": {\n    \"minimist\": \"0.0.8\"\n  }";
+        for manifest in [
+            "\"peerDependencies\": {\n    \"minimist\": \"0.0.8\"\n  }".to_string(),
+            "\"peerDependencies\": {\n    \"minimist\": \"0.0.8\"\n  },\n  \"devDependencies\": {\n    \"minimist\": \"0.0.8\"\n  }".to_string(),
+        ] {
+            let repo = Repo::new("pnpm10");
+            let before = repo.read("libs/util/package.json");
+            assert!(before.contains(own), "{before}");
+            repo.write("libs/util/package.json", &before.replace(own, &manifest));
+            let (code, detail) = refused(&repo, MINIMIST_008).await;
+            assert_eq!(code, VENDOR_RUSH_PROJECT_MANIFEST);
+            assert!(detail.contains("peerDependencies"), "{detail}");
+            assert!(detail.contains("--mode hosted"), "{detail}");
+            assert!(!detail.contains("  "), "{detail}");
+        }
+    }
+
+    /// Rush replaces an inherited `globalOverrides` table with the one the
+    /// extending config declares: writing a first table there would drop
+    /// every inherited override.
+    #[tokio::test]
+    async fn a_config_that_inherits_its_overrides_is_refused() {
+        let repo = Repo::new("pnpm10");
+        let config_rel = format!("{RUSH_CONFIG_DIR}/{PNPM_CONFIG}");
+        repo.write(
+            &config_rel,
+            "{\n  \"extends\": \"../shared/pnpm-config.json\",\n  \"useWorkspaces\": true\n}\n",
+        );
+        let (code, detail) = refused(&repo, MINIMIST_008).await;
+        assert_eq!(code, VENDOR_RUSH_UNSUPPORTED);
+        assert!(detail.contains("extends"), "{detail}");
+
+        // Its own table is the one Rush uses: the overrides go there.
+        repo.write(
+            &config_rel,
+            "{\n  \"extends\": \"../shared/pnpm-config.json\",\n  \"useWorkspaces\": true,\n  \"globalOverrides\": {}\n}\n",
+        );
+        let (result, entry, _) = expect_done(repo.vendor(MINIMIST_008).await);
+        assert!(result.success && entry.is_some(), "{:?}", result.error);
+        assert!(repo
+            .read(&config_rel)
+            .contains("mkdirp@0.5.1>minimist@0.0.8"));
+    }
+
+    /// Two subspaces read one config, and the same dependent resolves the
+    /// package to another release in the second: the override the first
+    /// needs would move the second's the next time pnpm resolves it.
+    #[tokio::test]
+    async fn a_shared_override_that_would_move_another_lock_is_refused() {
+        let repo = Repo::new("subspaces-shared-config");
+        let other = format!("{RUSH_SUBSPACES_DIR}/team-b/{PNPM_LOCK}");
+        let lock = repo.read(&other);
+        repo.write(
+            &other,
+            &format!("{lock}\n  mkdirp@0.5.1:\n    dependencies:\n      minimist: 0.0.10\n"),
+        );
+        let (code, detail) = refused(&repo, MINIMIST_008).await;
+        assert_eq!(code, VENDOR_RUSH_UNSUPPORTED);
+        assert!(detail.contains(&other), "{detail}");
+        assert!(detail.contains("mkdirp@0.5.1>minimist@0.0.8"), "{detail}");
+        assert!(detail.contains("its own pnpm-config.json"), "{detail}");
+    }
+
+    /// A lock Rush installs from another depth reads the same config but
+    /// cannot spell its path, and does not install the package: it is a
+    /// leftover, and stays as it is.
+    #[tokio::test]
+    async fn a_leftover_lock_at_another_depth_is_left_alone() {
+        let repo = Repo::new("pnpm10");
+        let leftover = format!("{RUSH_SUBSPACES_DIR}/old/{PNPM_LOCK}");
+        let text = "lockfileVersion: '9.0'\n\nimporters:\n\n  .: {}\n\npackages:\n\n  left-pad@1.3.0:\n    resolution: {integrity: sha512-x}\n\nsnapshots:\n\n  left-pad@1.3.0: {}\n";
+        repo.write(&leftover, text);
+        let (result, entry, _) = expect_done(repo.vendor(MINIMIST_008).await);
+        assert!(result.success, "{:?}", result.error);
+        assert_eq!(repo.read(&leftover), text);
+        let entry = entry.unwrap();
+        assert!(entry.wiring.iter().all(|rec| rec.file != leftover));
+    }
+
     #[test]
     fn only_parent_scoped_vendored_overrides_are_this_layouts_own() {
         let tgz = |v: &str| {
@@ -2578,6 +2889,40 @@ mod tests {
         assert!(result.success && entry.is_some(), "{:?}", result.error);
     }
 
+    /// Rush's consistency check counts `preferredVersions` beside the
+    /// projects' own specs: a preferred registry version and one `file:`
+    /// spec are two versions.
+    #[tokio::test]
+    async fn a_preferred_version_counts_in_the_consistency_policy() {
+        let repo = Repo::new("pnpm10");
+        let rush = repo.read(RUSH_JSON).replace(
+            "\"projects\":",
+            "\"ensureConsistentVersions\": true,\n  \"projects\":",
+        );
+        repo.write(RUSH_JSON, &rush);
+        let versions_rel = format!("{RUSH_CONFIG_DIR}/common-versions.json");
+        let rel_tgz = format!(".socket/vendor/npm/{}/minimist-0.0.8.tgz", MINIMIST_008.2);
+        // One of the two `file:` specs is allowed: one version is left.
+        let allowed = repo.read(&versions_rel).replace(
+            "\"allowedAlternativeVersions\": {",
+            &format!(
+                "\"allowedAlternativeVersions\": {{\n    \"minimist\": [\"file:../../{rel_tgz}\"],"
+            ),
+        );
+        let preferred = allowed.replace(
+            "\"preferredVersions\": {",
+            "\"preferredVersions\": {\n    \"minimist\": \"0.0.8\",",
+        );
+        assert_ne!(preferred, allowed);
+        repo.write(&versions_rel, &preferred);
+        let (code, _) = refused(&repo, MINIMIST_008).await;
+        assert_eq!(code, VENDOR_RUSH_INCONSISTENT_VERSIONS);
+
+        repo.write(&versions_rel, &allowed);
+        let (result, entry, _) = expect_done(repo.vendor(MINIMIST_008).await);
+        assert!(result.success && entry.is_some(), "{:?}", result.error);
+    }
+
     // ── warnings ───────────────────────────────────────────────────────
 
     #[tokio::test]
@@ -2590,7 +2935,7 @@ mod tests {
         repo.write(RUSH_JSON, &rush);
         repo.write(
             &format!("{RUSH_CONFIG_DIR}/repo-state.json"),
-            "// DO NOT MODIFY THIS FILE MANUALLY BUT DO COMMIT IT.\n{\n  \"pnpmShrinkwrapHash\": \"9514ab4e\"\n}\n",
+            "// DO NOT MODIFY THIS FILE MANUALLY BUT DO COMMIT IT.\n{\n  \"pnpmShrinkwrapHash\": \"9514ab4e\",\n  \"packageJsonInjectedDependenciesHash\": \"0c1f\"\n}\n",
         );
         let (result, _, warnings) = expect_done(repo.vendor(MINIMIST_008).await);
         assert!(result.success, "{:?}", result.error);
@@ -2608,6 +2953,71 @@ mod tests {
             .find(|w| w.code == VENDOR_RUSH_REPO_STATE_STALE)
             .expect("the stale lock hash is announced");
         assert!(stale.detail.contains("repo-state.json"), "{}", stale.detail);
+        // The other hash covers `dependencies`, which libs/util's edit is.
+        let injected = warnings
+            .iter()
+            .find(|w| w.detail.contains("packageJsonInjectedDependenciesHash"))
+            .expect("the stale injected-dependencies hash is announced");
+        assert_eq!(injected.code, VENDOR_RUSH_REPO_STATE_STALE);
+        assert!(
+            injected.detail.contains("libs/util/package.json"),
+            "{}",
+            injected.detail
+        );
+    }
+
+    // ── revert ─────────────────────────────────────────────────────────
+
+    /// A subspace added since the vendoring resolves through the tarball
+    /// in a lock no record names: the revert must not delete it.
+    #[tokio::test]
+    async fn revert_keeps_an_artifact_an_unrecorded_lock_installs() {
+        let repo = Repo::new("pnpm10");
+        let (result, entry, _) = expect_done(repo.vendor(MINIMIST_008).await);
+        assert!(result.success, "{:?}", result.error);
+        let entry = entry.unwrap();
+        let added = format!("{RUSH_SUBSPACES_DIR}/added/{PNPM_LOCK}");
+        repo.write(&added, &repo.read(RUSH_COMMON_LOCK_REL));
+        let wired = tree_snapshot(repo.root());
+
+        let outcome = revert_npm_any(&entry, repo.root(), false).await;
+        assert!(!outcome.success);
+        assert!(codes(&outcome.warnings).contains(&revert::STILL_WIRED_CODE));
+        assert!(outcome.error.unwrap().contains(&added));
+        assert_eq!(tree_snapshot(repo.root()), wired, "a refused revert wrote");
+
+        std::fs::remove_file(repo.root().join(&added)).unwrap();
+        let outcome = revert_npm_any(&entry, repo.root(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        repo.assert_is("pnpm10", "before");
+    }
+
+    /// The cleanup commands ask which files may still name an artifact.
+    #[tokio::test]
+    async fn the_wiring_files_are_the_locks_configs_and_project_manifests() {
+        let repo = Repo::new("subspaces-shared-config");
+        let rush = repo.read(RUSH_JSON).replace(
+            "\"projectFolder\": \"top\"",
+            "\"projectFolder\": \"../outside\"",
+        );
+        repo.write(RUSH_JSON, &rush);
+        let files = wiring_files(repo.root()).await;
+        for rel in [
+            "common/config/rush/pnpm-config.json",
+            "common/config/rush/pnpm-lock.yaml",
+            "common/config/subspaces/default/pnpm-config.json",
+            "common/config/subspaces/default/pnpm-lock.yaml",
+            "common/config/subspaces/team-b/pnpm-lock.yaml",
+            "apps/app/package.json",
+            "libs/util/package.json",
+            "tools/deep/cli/package.json",
+        ] {
+            assert!(files.iter().any(|f| f == rel), "{rel}: {files:?}");
+        }
+        assert!(files.iter().all(|f| !f.contains("..")), "{files:?}");
+        // Not a Rush repository: nothing.
+        let plain = tempfile::tempdir().unwrap();
+        assert!(wiring_files(plain.path()).await.is_empty());
     }
 
     // ── helpers ────────────────────────────────────────────────────────
@@ -2784,6 +3194,36 @@ mod tests {
             parent_override_keys(&snapshot, &ctx).unwrap(),
             ["@scope/parent@2.1.0>minimist@0.0.8"]
         );
+        // The same dependent resolving another release is what a shared
+        // override would move.
+        let keys = ["@scope/parent@2.1.0>minimist@0.0.8".to_string()];
+        assert_eq!(
+            other_resolution(&snapshot, &keys, "minimist", "file:x.tgz"),
+            None
+        );
+        assert_eq!(
+            other_resolution(&snapshot, &keys, "minimist", "file:y.tgz"),
+            Some((
+                keys[0].clone(),
+                "@scope/parent@2.1.0(react@18.0.0)".to_string(),
+                "file:x.tgz".to_string()
+            ))
+        );
+        // A key that names no version is an error, never a panic.
+        for key in ["é", "@scope/parent", "parent"] {
+            assert_eq!(override_parent(&snapshot, &[], key), None, "{key}");
+        }
+        let odd: Vec<String> = [
+            "snapshots:",
+            "",
+            "  é:",
+            "    dependencies:",
+            "      minimist: file:x.tgz",
+            "",
+        ]
+        .map(String::from)
+        .to_vec();
+        assert!(parent_override_keys(&odd, &ctx).is_err());
     }
 
     #[test]

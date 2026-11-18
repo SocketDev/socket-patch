@@ -713,7 +713,20 @@ Things to know:
   projects at different folder depths get different spellings, which that policy rejects.
   Vendoring refuses this case (`vendor_rush_inconsistent_versions`) and writes nothing. List
   the specs it names under `allowedAlternativeVersions` in `common-versions.json` and run it
-  again.
+  again. A `preferredVersions` entry for the package counts as one more spec.
+- **Peer dependencies.** A project that lists the package under `peerDependencies` gets it
+  installed by pnpm and locked under `dependencies`, with or without a `devDependencies`
+  spec beside it. The project has no spec vendoring can move, so the package is refused
+  (`vendor_rush_project_manifest`). Hosted mode covers it.
+- **Subspaces that share a `pnpm-config.json`.** The overrides go to every lock that reads
+  the config. When another of those locks resolves the package to a different release for
+  the same dependent, pnpm would move it to the vendored release the next time it resolves,
+  so vendoring refuses (`vendor_rush_unsupported`). Give one subspace its own
+  `pnpm-config.json`.
+- **`extends` in `pnpm-config.json`.** Rush replaces an inherited `globalOverrides` table
+  with the one the extending file declares. Vendoring writes only into a table the file
+  already has, and refuses otherwise (`vendor_rush_unsupported`): add the table, holding the
+  entries the file inherits.
 - **New dependents.** A project or package that starts depending on the patched version
   later installs the registry copy until `socket-patch scan --mode vendored` runs again.
   Installs keep working in the meantime, and `vex` and `vendor --check` report the
@@ -727,6 +740,11 @@ Things to know:
 
 With `preventManualShrinkwrapChanges` on, run `rush update` once after vendoring. It refreshes
 the lock hash in `repo-state.json` and changes nothing else (`vendor_rush_repo_state_stale`).
+The same holds for a repo with injected workspace dependencies when a project behind one of
+them got its spec edited: Rush hashes those `package.json` files in `repo-state.json` too.
+
+`vendor --revert` refuses (`vendor_lock_still_wired_revert_blocked`) while a Rush lock the vendoring never wrote,
+such as a subspace added since, still installs the tarball.
 
 Not wired, and refused before anything is written: a Rush repo that installs with npm or
 yarn, one with no pnpm lock yet, installs without pnpm workspaces (`vendor_rush_unsupported`),
