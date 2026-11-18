@@ -45,6 +45,11 @@ const REMOVED: &[&str] = &[
     // Bazel: `TEST_TMPDIR` puts a server in test mode, where a failing
     // module extension on 7.x is a crash (exit 37) instead of an error.
     "TEST_TMPDIR",
+    // Bazel's `http_archive` and downloader, and rules_csharp for every
+    // package: the credentials file of the shell. A path that names no
+    // file fails the first fetch, and a file's login for loopback, or its
+    // `default` one, goes to a stand-in with every download sent there.
+    "NETRC",
     // Any tool: an `XDG_*_HOME` directory would move what it keeps out of
     // the scratch home: a cache, or on Linux the telemetry counters of a Go
     // SDK command that a ruleset starts, which Go puts under
@@ -1041,6 +1046,7 @@ fn settings_of_a_shell() -> Vec<String> {
     let names = [
         // `REMOVED`.
         "TEST_TMPDIR",
+        "NETRC",
         "XDG_CACHE_HOME",
         "XDG_CONFIG_HOME",
         "XDG_DATA_HOME",
