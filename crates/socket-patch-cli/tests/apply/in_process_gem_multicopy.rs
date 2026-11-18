@@ -346,6 +346,61 @@ fn vex_and_check_refuse_an_unpatched_platform_variant_copy() {
     );
 }
 
+/// #2087: the hosted scan's stale-install remedy (`rm -f
+/// specifications/<leaf>.gemspec cache/<leaf>.gem && bundle install`)
+/// leaves the old platform build's `gems/<leaf>/` dir behind with no
+/// gemspec, beside the installed ruby-platform build. RubyGems and Bundler
+/// load a gem by its gemspec alone, so that dir is not an installed copy: `vex` attests the patched ruby-platform
+/// build, `apply --check` reports it in sync, and `apply` leaves the dir
+/// alone. With its gemspec back, the platform build is a copy again and
+/// both gates refuse it (#1092).
+#[test]
+fn the_leftover_dir_of_an_unlisted_platform_build_is_not_a_copy() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (root, plain_file, platform_file, original, patched) =
+        build_platform_variant_project(tmp.path());
+    let specs = root.join("vendor/bundle/ruby/3.2.0/specifications");
+    std::fs::create_dir_all(&specs).unwrap();
+    std::fs::write(specs.join("rack-3.1.0.gemspec"), "").unwrap();
+    std::fs::write(&plain_file, &patched).unwrap();
+
+    let (code, stdout, stderr) = run_raw(&root, &["vex", "--product", "pkg:gem/app@1.0.0"]);
+    assert_eq!(code, 0, "vex\nstdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(stdout.contains("not_affected"), "vex doc:\n{stdout}");
+    assert!(
+        !stderr.contains("not_applied"),
+        "vex must not judge the dir nothing loads\nstderr:\n{stderr}"
+    );
+    let (code, stdout, stderr) = run_raw(&root, &["apply", "--check"]);
+    assert_eq!(
+        code, 0,
+        "apply --check\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    let (code, v) = run_json(&root, &["apply"]);
+    assert_eq!(code, 0, "apply; envelope={v}");
+    assert_eq!(
+        std::fs::read(&platform_file).unwrap(),
+        original,
+        "apply must not write to a dir that is not installed; envelope={v}"
+    );
+
+    // The platform build installed again (its gemspec is back): RubyGems
+    // loads it, and it is unpatched.
+    std::fs::write(specs.join("rack-3.1.0-x86_64-linux.gemspec"), "").unwrap();
+    let (code, stdout, stderr) = run_raw(&root, &["vex", "--product", "pkg:gem/app@1.0.0"]);
+    assert!(
+        !stdout.contains("not_affected"),
+        "vex must not attest an unpatched installed platform copy (exit {code})\
+         \nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    let (code, stdout, stderr) = run_raw(&root, &["apply", "--check"]);
+    assert_ne!(
+        code, 0,
+        "apply --check must flag the installed platform copy\
+         \nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+}
+
 /// #1092, global mode: `apply -g --global-prefix <gem home>/gems` patches
 /// the platform build too (plain RubyGems activates it, no Bundler needed).
 #[test]

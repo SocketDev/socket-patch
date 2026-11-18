@@ -5965,6 +5965,89 @@ mod tests {
         assert_eq!(one[&purl].path, exact);
     }
 
+    /// #2087: in a gem home that lists one build of a gem version, the
+    /// dir of another build with no `specifications` entry of its own is a
+    /// leftover nothing loads, not an installed copy. A default gem's entry
+    /// is under `specifications/default/`. A version the home lists no
+    /// build of is not judged.
+    #[tokio::test]
+    async fn find_all_by_purls_skips_the_leftover_dir_of_an_unlisted_build() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gems = tmp.path().join("gems");
+        let specs = tmp.path().join("specifications");
+        std::fs::create_dir_all(specs.join("default")).unwrap();
+        let dir = |leaf: &str| {
+            std::fs::create_dir_all(gems.join(leaf).join("lib")).unwrap();
+            gems.join(leaf)
+        };
+        let purls: Vec<String> = ["nokogiri@1.16.0", "ffi@1.17.2", "json@2.7.2", "rack@3.1.8"]
+            .iter()
+            .map(|g| format!("pkg:gem/{g}"))
+            .collect();
+
+        // The ruby build is installed; the platform dir lost its gemspec.
+        let nokogiri = dir("nokogiri-1.16.0");
+        dir("nokogiri-1.16.0-x86_64-linux");
+        std::fs::write(specs.join("nokogiri-1.16.0.gemspec"), "").unwrap();
+        // The reverse: only the platform build is installed.
+        dir("ffi-1.17.2");
+        let ffi = dir("ffi-1.17.2-x86_64-linux-gnu");
+        std::fs::write(specs.join("ffi-1.17.2-x86_64-linux-gnu.gemspec"), "").unwrap();
+        // A default gem, beside a leftover platform dir.
+        let json = dir("json-2.7.2");
+        dir("json-2.7.2-java");
+        std::fs::write(specs.join("default").join("json-2.7.2.gemspec"), "").unwrap();
+        // The home lists no build of this version (a directory is not a
+        // gemspec): nothing says what is installed, so both dirs stay.
+        let rack = dir("rack-3.1.8");
+        let rack_java = dir("rack-3.1.8-java");
+        std::fs::create_dir_all(specs.join("rack-3.1.8-java.gemspec")).unwrap();
+
+        let crawler = RubyCrawler::new();
+        let all = crawler.find_all_by_purls(&gems, &purls).await.unwrap();
+        let paths = |purl: &str| -> Vec<PathBuf> {
+            all.get(purl)
+                .map(|copies| copies.iter().map(|p| p.path.clone()).collect())
+                .unwrap_or_default()
+        };
+        assert_eq!(paths(&purls[0]), vec![nokogiri.clone()]);
+        assert_eq!(paths(&purls[1]), vec![ffi.clone()]);
+        assert_eq!(paths(&purls[2]), vec![json.clone()]);
+        assert_eq!(paths(&purls[3]), vec![rack.clone(), rack_java]);
+
+        // The one-copy lookups agree.
+        let each = crawler.find_each_by_purl(&gems, &purls).await;
+        let each: Vec<Option<PathBuf>> = each.into_iter().map(|p| p.map(|p| p.path)).collect();
+        assert_eq!(
+            each,
+            vec![
+                Some(nokogiri.clone()),
+                Some(ffi.clone()),
+                Some(json.clone()),
+                Some(rack.clone())
+            ]
+        );
+
+        // And so does the scan's discovery: each gem is found at a dir
+        // the lookups resolve it to, never at a leftover.
+        let options = CrawlerOptions {
+            cwd: tmp.path().to_path_buf(),
+            global: false,
+            global_prefix: Some(gems.clone()),
+        };
+        let crawled: HashMap<String, PathBuf> = crawler
+            .crawl_all(&options)
+            .await
+            .into_iter()
+            .map(|p| (p.purl, p.path))
+            .collect();
+        assert_eq!(crawled.len(), 4, "{crawled:?}");
+        assert_eq!(crawled[&purls[0]], nokogiri);
+        assert_eq!(crawled[&purls[1]], ffi);
+        assert_eq!(crawled[&purls[2]], json);
+        assert!(crawled[&purls[3]].starts_with(&gems), "{crawled:?}");
+    }
+
     /// A dir that merely starts with `<name>-<version>-` is not a platform
     /// copy when it parses as another gem (`foo-1.0` at `2.0`).
     #[test]
