@@ -2818,61 +2818,69 @@ async fn hosted_unwind_reports_the_pruned_home_refresh_in_a_human_run() {
     );
 }
 
-/// #2092: when no patch record can be had for such a copy (the API fails,
-/// or `--offline`), nothing tells it from the patched build. It is left as
-/// it is and named as a copy that could not be checked, with the reason and
-/// the files to remove: never passed over in silence.
+/// #2092: when no patch record can be had for such a copy (the API fails),
+/// nothing tells it from the patched build. It is left as it is and named
+/// as a copy that could not be checked, with the reason and the files to
+/// remove: never passed over in silence.
 #[tokio::test(flavor = "multi_thread")]
 async fn hosted_unwind_names_a_pruned_home_install_no_record_can_judge() {
-    for (offline, reason) in [
-        (false, "its patch record could not be fetched"),
-        (true, "`--offline` is set"),
-    ] {
-        let server = MockServer::start().await;
-        let (patched, upstream) = (real_gem(PATCHED_LIB), real_gem(UPSTREAM_LIB));
-        // The view answers 500.
-        mount_api_for(&server, Some(0), &sha256_of(&patched)).await;
-        serve_patched_gem(&server, patched.clone()).await;
-        serve_upstream_gem(&server, &upstream).await;
-        let tmp = tempfile::tempdir().unwrap();
-        let proj = tmp.path().join("proj");
-        let (gem_dir, home) = hosted_with_pruned_home_cache(&server, &proj, true).await;
-        let before = snapshot(&home);
+    let server = MockServer::start().await;
+    let (patched, upstream) = (real_gem(PATCHED_LIB), real_gem(UPSTREAM_LIB));
+    // The view answers 500.
+    mount_api_for(&server, Some(0), &sha256_of(&patched)).await;
+    serve_patched_gem(&server, patched.clone()).await;
+    serve_upstream_gem(&server, &upstream).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    let (gem_dir, home) = hosted_with_pruned_home_cache(&server, &proj, true).await;
+    let before = snapshot(&home);
+    let asked_before = server.received_requests().await.unwrap().len();
 
-        let mut args = vec!["rollback", "--yes", "--json"];
-        if offline {
-            args.push("--offline");
-        }
-        let (code, stdout, stderr) = unwind_run(&proj, &server.uri(), &args);
-        let env: serde_json::Value = serde_json::from_str(&stdout)
-            .unwrap_or_else(|e| panic!("offline={offline}: not JSON: {e}\n{stdout}\n{stderr}"));
-        assert_eq!(code, 0, "offline={offline}: {env}\n{stderr}");
-        assert_eq!(snapshot(&home), before, "offline={offline}: left as it is");
+    let (code, stdout, stderr) = unwind_run(&proj, &server.uri(), &["rollback", "--yes", "--json"]);
+    let env: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("not JSON: {e}\n{stdout}\n{stderr}"));
+    assert_eq!(code, 0, "{env}\n{stderr}");
+    assert_eq!(snapshot(&home), before, "left as it is");
+    assert!(
+        details_with_code(&env, "upstream_gem_install_refreshed").is_empty(),
+        "{env}"
+    );
+    assert!(
+        gem_downloads_since(&server, asked_before).await.is_empty(),
+        "no gem was downloaded for a copy nothing judged"
+    );
+    let unchecked = details_with_code(&env, "upstream_gem_stale_install");
+    assert_eq!(unchecked.len(), 1, "the copy is reported: {env}");
+    let spec = home
+        .join("specifications")
+        .join(format!("{DEP}-{DEP_VERSION}.gemspec"));
+    for needle in [
+        PURL,
+        "could not be checked against the upstream gem",
+        "its gem home has no archive of it and its patch record could not be fetched",
+        "it still holds the patched build",
+        "run `bundle install`",
+        gem_dir.to_str().unwrap(),
+        spec.to_str().unwrap(),
+    ] {
         assert!(
-            details_with_code(&env, "upstream_gem_install_refreshed").is_empty(),
-            "offline={offline}: {env}"
+            unchecked[0].contains(needle),
+            "missing {needle:?}: {}",
+            unchecked[0]
         );
-        let unchecked = details_with_code(&env, "upstream_gem_stale_install");
-        assert_eq!(unchecked.len(), 1, "offline={offline}: reported: {env}");
-        let spec = home
-            .join("specifications")
-            .join(format!("{DEP}-{DEP_VERSION}.gemspec"));
-        for needle in [
-            PURL,
-            "could not be checked against the upstream gem",
-            reason,
-            "it still holds the patched build",
-            "run `bundle install`",
-            gem_dir.to_str().unwrap(),
-            spec.to_str().unwrap(),
-        ] {
-            assert!(
-                unchecked[0].contains(needle),
-                "offline={offline}: missing {needle:?}: {}",
-                unchecked[0]
-            );
-        }
     }
+
+    // A human run counts it apart, in one warning.
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    hosted_with_pruned_home_cache(&server, &proj, true).await;
+    let (code, stdout, stderr) = unwind_run(&proj, &server.uri(), &["rollback", "--yes"]);
+    assert_eq!(code, 0, "{stdout}\n{stderr}");
+    assert!(
+        stderr.contains("1 gem on disk could not be checked")
+            && stderr.contains("its patch record could not be fetched"),
+        "{stdout}\n{stderr}"
+    );
 }
 
 /// The record judges, it does not assume: an installed copy that is still
