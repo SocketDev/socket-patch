@@ -30,7 +30,13 @@ on:
     # vendor/npm_*, the lock inventory), the `pnpm-workspace.yaml` lookup,
     # the npm-family lock and config readers (vex/discover/npm.rs,
     # patch/redirect/npmrc.rs), the upstream restore of `rollback`, the
-    # crawler every `scan` starts, and the `package.json` reader. The
+    # crawler every `scan` starts, and the `package.json` reader. One file
+    # is here for what the flows assert, not for that build:
+    # patch/user_patches.rs, the inspection of the project's own patches.
+    # Its walk of the pnpm workspace decides what the second run of each
+    # flow reports, and no other test runs it beside Bazel's links. That
+    # file also holds the Composer, Cargo and Go parts of the gate, so a
+    # change to those starts the npm legs too. The
     # globs name that one crate, so no bench fixture is here, and nothing
     # another ecosystem's flow owns: a change to one ecosystem starts that
     # ecosystem's legs only.
@@ -59,6 +65,7 @@ on:
       - 'crates/socket-patch-core/src/vex/discover/npm.rs'
       - 'crates/socket-patch-core/src/crawlers/npm_crawler.rs'
       - 'crates/socket-patch-core/src/formats/package_json.rs'
+      - 'crates/socket-patch-core/src/patch/user_patches.rs'
   push:
     branches: [main]
     # The pull request paths, and what only a push to main covers: the
@@ -84,6 +91,7 @@ on:
       - 'crates/socket-patch-core/src/vex/discover/npm.rs'
       - 'crates/socket-patch-core/src/crawlers/npm_crawler.rs'
       - 'crates/socket-patch-core/src/formats/package_json.rs'
+      - 'crates/socket-patch-core/src/patch/user_patches.rs'
       - 'crates/socket-patch-cli/tests/e2e_bazel_build/main.rs'
       - 'crates/socket-patch-core/src/patch/redirect/**'
       - 'crates/socket-patch-core/src/vendor/**'
