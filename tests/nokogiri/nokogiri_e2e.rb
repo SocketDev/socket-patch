@@ -26,7 +26,9 @@
 #            a rebuilt extension.
 #   libxml2  a new `patches/libxml2/*.patch` (`ports/patches/libxml2` before
 #            1.6.7). nokogiri's build applies it to its vendored libxml2 and
-#            compiles the patch's name into the extension.
+#            compiles the patch's name into the extension. An install built
+#            with `--use-system-libraries` compiles no vendored libxml2, so
+#            there the record must be refused and nothing written.
 #
 # Each scenario runs `apply --check` (not in sync), `apply`, a load of
 # nokogiri through `bundle exec` in a fresh Ruby, `apply --check` (in sync),
@@ -189,7 +191,16 @@ class NokogiriE2E
 
   def install
     gemfile = ["source \"https://rubygems.org\"", "gem \"nokogiri\", \"#{@version}\""]
-    gemfile << "gem \"rails\", \"#{@opts[:rails]}\"" if @opts[:rails]
+    if @opts[:rails]
+      gemfile << "gem \"rails\", \"#{@opts[:rails]}\""
+      # loofah 2.20 and later need `Nokogiri::HTML4` (nokogiri 1.12) while
+      # still declaring `nokogiri >= 1.5.9`, so a fresh resolve gives an
+      # older nokogiri a loofah that cannot load on it. A lock of those
+      # years holds the loofah and the sanitizer of those years.
+      if Gem::Version.new(@version) < Gem::Version.new("1.12")
+        gemfile << "gem \"loofah\", \"< 2.20\"" << "gem \"rails-html-sanitizer\", \"< 1.5\""
+      end
+    end
     (@opts[:gems] || []).each { |line| gemfile << line }
     File.write(File.join(@proj, "Gemfile"), gemfile.join("\n") + "\n")
     want = @opts.fetch(:install)
@@ -197,6 +208,10 @@ class NokogiriE2E
     settings["BUNDLE_PATH"] = "vendor/bundle" if project_home?
     settings["BUNDLE_FORCE_RUBY_PLATFORM"] = "true" if %w[source system-libraries].include?(want)
     settings["BUNDLE_BUILD__NOKOGIRI"] = "--use-system-libraries" if want == "system-libraries"
+    (@opts[:settings] || []).each do |pair|
+      key, value = pair.split("=", 2)
+      settings[key] = value.to_s
+    end
     if project_home?
       FileUtils.mkdir_p(File.join(@proj, ".bundle"))
       lines = settings.map { |k, v| "#{k}: \"#{v}\"" }
@@ -402,8 +417,10 @@ class NokogiriE2E
     when "libxml2"
       record = libxml2_record
       return skip("this release reads no libxml2 patch directory") && nil unless record
-      return skip("built against the system's libxml2, which no gem patch changes") && nil if @shape == "system-libraries"
       return skip("JRuby loads no libxml2") && nil if @java && @opts[:build] == "ok"
+      # Built against the system's libxml2: nothing compiles the copy the
+      # gem packs, so a patch to that copy cannot take effect.
+      return not_applied(record, "native_extensions_unsupported") if @shape == "system-libraries"
       native(record) do |now|
         now["libxml_patches"].include?(LIBXML2_PATCH) &&
           (@baseline["libxml_patches"] - now["libxml_patches"]).empty?
@@ -579,7 +596,8 @@ puts "sp_probe\t" + JSON.generate(result)
   RUBY
 end
 
-opts = { :install => "any", :build => "ok", :gem_home => "project", :scenarios => %w[ruby c libxml2], :gems => [] }
+opts = { :install => "any", :build => "ok", :gem_home => "project", :scenarios => %w[ruby c libxml2], :gems => [],
+         :settings => [] }
 parser = OptionParser.new do |o|
   o.banner = "usage: ruby nokogiri_e2e.rb --socket-patch BIN --nokogiri VERSION [options]"
   o.on("--socket-patch BIN", "the socket-patch binary under test") { |v| opts[:socket_patch] = v }
@@ -601,6 +619,8 @@ parser = OptionParser.new do |o|
   o.on("--scenarios LIST", Array, "of ruby,c,libxml2 (default: all three)") { |v| opts[:scenarios] = v }
   o.on("--rails VERSION", "also install this Rails (a Gemfile requirement, for example '~> 7.1.0') and check",
        "that a booted application sanitizes HTML through the patched nokogiri") { |v| opts[:rails] = v }
+  o.on("--bundle-setting KEY=VALUE", "one more Bundler setting for the install, for example",
+       "BUNDLE_BUILD__NOKOGIRI=--use-system-libraries") { |v| opts[:settings] << v }
   o.on("--gem LINE", "one more Gemfile line, for example 'gem \"rails\", \"7.1.5\"'") { |v| opts[:gems] << v }
   o.on("--work DIR", "build the project in DIR and keep it") { |v| opts[:work] = v }
 end

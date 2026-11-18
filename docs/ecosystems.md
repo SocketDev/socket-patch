@@ -2113,6 +2113,16 @@ instead of being reported as patched.
 Ruby files are never build inputs outside `ext/` and a build script's directory: a patch that only
 changes `.rb` or `.rbs` files needs no compiler, wherever the gem keeps them.
 
+A gem that packs a library and was installed with `--use-system-libraries` (nokogiri with the
+system's libxml2, through `gem install nokogiri -- --use-system-libraries`, Bundler's
+`build.nokogiri` setting or `NOKOGIRI_USE_SYSTEM_LIBRARIES`) does not compile the library it
+packs. A patch to that packed library (a file under `patches/` or `ports/`, or
+`dependencies.yml`) changes nothing in such an install, so it fails with
+`native_extensions_unsupported` and nothing is written: the library that install runs is the
+operating system's package, and updating that package is what fixes it. A patch to the gem's own
+C sources is still rebuilt, against the system's libraries. A precompiled gem always carries the
+libraries it packs, and is rebuilt with them even when the project still has that Bundler setting.
+
 The build happens in a stage directory inside the gem home (`.socket-patch-build/`), which is
 removed afterwards. A gem the build needs that the install lacks (a precompiled nokogiri has no
 `mini_portile2`) is installed into that stage, never into your gem home. The installed gem is not

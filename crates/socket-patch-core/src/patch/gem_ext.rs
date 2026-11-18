@@ -56,8 +56,10 @@
 //! 4. The record is laid over it with [`apply_package_patch`]: every
 //!    `beforeHash` must hold in the pristine gem, or the archive is not
 //!    the gem the patch was written for.
-//! 5. RubyGems builds the staged gem's extension in the stage, with the
-//!    build arguments it recorded for the installed copy. A gem the build
+//! 5. RubyGems builds the staged gem's extension in the stage: a gem it
+//!    built, with the build arguments it recorded for the installed copy;
+//!    a precompiled gem, as its publisher built it, with none
+//!    ([`RubyRun::StageBuild`]). A gem the build
 //!    needs and the install lacks (a precompiled nokogiri has no
 //!    `mini_portile2`) is installed into the stage home, never into the
 //!    user's. A build that leaves what Ruby loads in the gem's own tree
@@ -89,6 +91,13 @@
 //! another run building the same gem right now.) A precompiled gem has no
 //! such fallback and is refused, with what it needs: network access to the
 //! registry once, or the source gem in the home's `cache/`.
+//!
+//! A gem that packs a library and was built against the system's copy of
+//! it (nokogiri with `--use-system-libraries`) compiles nothing of the
+//! copy it packs. A record that changes that copy (`patches/**`, `ports/**`,
+//! `dependencies.yml`) would be written, "rebuilt" against the same system
+//! library and attested, with nothing of it in what Ruby loads. It is
+//! refused from files alone instead ([`system_library_build`]).
 //!
 //! `vex` and `apply --check` attest a copy only when its marker matches the
 //! record's patched sources and every recorded artifact still hashes as
@@ -255,8 +264,27 @@ const BUILD_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 /// ignores it.
 const BUILD_COMPLETE: &str = "gem.build_complete";
 
+/// The log RubyGems keeps of a build, in its extension dir.
+const BUILD_LOG: &str = "gem_make.out";
+
 /// Files RubyGems writes into an extension dir that are not build products.
-const EXT_DIR_METADATA: &[&str] = &[BUILD_COMPLETE, "gem_make.out", "mkmf.log"];
+const EXT_DIR_METADATA: &[&str] = &[BUILD_COMPLETE, BUILD_LOG, "mkmf.log"];
+
+/// Build arguments that make a gem link the system's copy of a library it
+/// would otherwise build from the sources it packs. mini_portile's
+/// convention: nokogiri takes both spellings, sqlite3 the second.
+const SYSTEM_LIBRARY_ARGS: &[&str] = &["--use-system-libraries", "--enable-system-libraries"];
+
+/// The environment variable nokogiri's build takes for the same.
+const SYSTEM_LIBRARY_ENV: &str = "NOKOGIRI_USE_SYSTEM_LIBRARIES";
+
+/// What nokogiri's `extconf.rb` writes into the log of such a build
+/// ("Building nokogiri using system libraries.").
+const SYSTEM_LIBRARY_LOG: &str = "using system libraries";
+
+/// How much of a build log is read for [`SYSTEM_LIBRARY_LOG`]: the line is
+/// among the first an `extconf.rb` prints, and a log is not bounded.
+const BUILD_LOG_HEAD: u64 = 1024 * 1024;
 
 /// Source and build-script extensions a native extension compiles.
 const NATIVE_SOURCE_EXTENSIONS: &[&str] = &[
@@ -352,9 +380,10 @@ const GENERATED_GRAMMAR_EXTENSIONS: &[&str] = &["y", "rl"];
 /// staged gem, and of the gems that meet them, that no gem on `GEM_PATH`
 /// meets: what its build scripts may `require` and would not find.
 ///
-/// `stage_build <staged gemspec> <stage home> <installed home> <installed
-/// full name>` builds the staged gem's extensions inside the stage home,
-/// with the build arguments RubyGems recorded for the installed copy. It
+/// `stage_build <staged gemspec> <stage home> <installed home> [<installed
+/// full name>]` builds the staged gem's extensions inside the stage home,
+/// with the build arguments RubyGems recorded for the installed copy when
+/// it is named (a precompiled copy is not: see [`RubyRun::StageBuild`]). It
 /// loads the gemspec `unpack` wrote and runs the archive's build scripts
 /// over the staged tree.
 const RUBY_SCRIPT: &str = "require 'rubygems'; mode, a, b, c, d = ARGV; \
@@ -418,7 +447,7 @@ abort(\"#{a} declares no extensions\") if spec.extensions.empty?; \
 require 'rubygems/ext'; \
 Gem::DefaultUserInteraction.ui = Gem::SilentUI.new; \
 info = File.join(c, 'build_info', \"#{d}.info\"); \
-args = File.file?(info) ? File.readlines(info).map { |l| l.chomp } : []; \
+args = (d && File.file?(info)) ? File.readlines(info).map { |l| l.chomp } : []; \
 Gem::Ext::Builder.new(spec, args).build_extensions; \
 puts \"sp_built\\t#{File.expand_path(spec.extension_dir)}\"; \
 else \
@@ -734,6 +763,88 @@ fn is_clearly_not_built(path: &str, require_paths: &[String]) -> bool {
                     .any(|suffix| upper.ends_with(suffix))
         }
     }
+}
+
+/// Whether `path` is an input of a library the gem builds from sources it
+/// packs, by mini_portile's layout (nokogiri, sqlite3): a patch for it
+/// (`patches/libxml2/…`, `ports/patches/…` before nokogiri 1.6.7), its
+/// archive (`ports/archives/…`), or the file that names its version and
+/// checksum (`dependencies.yml`).
+fn is_vendored_library_input(path: &str) -> bool {
+    let path = normalize_file_path(path);
+    path == "dependencies.yml" || path.starts_with("patches/") || path.starts_with("ports/")
+}
+
+/// Whether the build argument `arg` asks for the system's libraries
+/// ([`SYSTEM_LIBRARY_ARGS`], bare or with a value that is not a "no").
+fn is_system_library_arg(arg: &str) -> bool {
+    SYSTEM_LIBRARY_ARGS
+        .iter()
+        .any(|name| match arg.strip_prefix(name) {
+            Some("") => true,
+            Some(rest) => rest.strip_prefix('=').is_some_and(|value| {
+                !matches!(value.to_ascii_lowercase().as_str(), "no" | "false" | "0")
+            }),
+            None => false,
+        })
+}
+
+/// Whether the build log at `log` says the build used the system's
+/// libraries ([`SYSTEM_LIBRARY_LOG`]). A log that cannot be read says
+/// nothing.
+fn log_says_system_libraries(log: &Path) -> bool {
+    use std::io::Read as _;
+    let Ok((file, _)) = crate::utils::fs::open_regular_file_sync(log) else {
+        return false;
+    };
+    let mut head = Vec::new();
+    if file.take(BUILD_LOG_HEAD).read_to_end(&mut head).is_err() {
+        return false;
+    }
+    String::from_utf8_lossy(&head).contains(SYSTEM_LIBRARY_LOG)
+}
+
+/// What says the extension of `copy`, a gem RubyGems built, links the
+/// system's libraries instead of the ones the gem packs, when something
+/// does. Any of three, read from files and the environment alone:
+///
+/// * the build arguments RubyGems recorded for the copy
+///   (`<home>/build_info/<full_name>.info`; `gem install … --
+///   --use-system-libraries`, Bundler's `build.<gem>` setting), which a
+///   rebuild is given again;
+/// * the log of the build that is installed;
+/// * [`SYSTEM_LIBRARY_ENV`], which a rebuild would follow.
+///
+/// Such a build compiles nothing of a library the gem packs, so a record's
+/// [`is_vendored_library_input`] files cannot take effect in it.
+fn system_library_build(copy: &GemCopy) -> Option<String> {
+    system_library_evidence(copy, std::env::var_os(SYSTEM_LIBRARY_ENV).is_some())
+}
+
+/// [`system_library_build`], told whether [`SYSTEM_LIBRARY_ENV`] is set.
+fn system_library_evidence(copy: &GemCopy, env_set: bool) -> Option<String> {
+    let info = copy
+        .home
+        .join("build_info")
+        .join(format!("{}.info", copy.full_name));
+    if let Ok(args) = crate::utils::fs::read_regular_to_string_sync(&info) {
+        if let Some(arg) = args
+            .lines()
+            .map(str::trim)
+            .find(|a| is_system_library_arg(a))
+        {
+            return Some(format!(
+                "`{arg}` is among the build arguments RubyGems recorded for it"
+            ));
+        }
+    }
+    if installed_extension_dirs(copy)
+        .iter()
+        .any(|ext| log_says_system_libraries(&ext.join(BUILD_LOG)))
+    {
+        return Some("the log of its build says so".to_string());
+    }
+    env_set.then(|| format!("`{SYSTEM_LIBRARY_ENV}` is set, and a rebuild follows it"))
 }
 
 /// A gem record's native-extension build inputs on one installed copy.
@@ -1349,9 +1460,21 @@ enum RubyRun<'a> {
     },
     /// Build the extensions of the staged gem at `spec` inside
     /// `stage_home`: runs the staged tree's build scripts.
+    ///
+    /// `as_installed`: the installed copy is one RubyGems built, and the
+    /// rebuild is made the way that build was, with the arguments RubyGems
+    /// recorded for it. A precompiled copy was built by its publisher from
+    /// the libraries the gem packs, whatever this machine is set up to
+    /// build with: arguments recorded for it were never used (Bundler's
+    /// `build.nokogiri --use-system-libraries`, left in a project from the
+    /// years before nokogiri shipped precompiled gems, is recorded for the
+    /// platform gem too), so its rebuild takes none, and not
+    /// [`SYSTEM_LIBRARY_ENV`] either. Following them would replace the
+    /// library the gem ships with whichever the system has.
     StageBuild {
         spec: &'a Path,
         stage_home: &'a Path,
+        as_installed: bool,
     },
 }
 
@@ -1423,13 +1546,21 @@ async fn run_ruby(
             }
             "missing_deps"
         }
-        RubyRun::StageBuild { spec, stage_home } => {
+        RubyRun::StageBuild {
+            spec,
+            stage_home,
+            as_installed,
+        } => {
             command
                 .arg("stage_build")
                 .arg(spec)
                 .arg(stage_home)
-                .arg(&copy.home)
-                .arg(&copy.full_name);
+                .arg(&copy.home);
+            if as_installed {
+                command.arg(&copy.full_name);
+            } else {
+                command.env_remove(SYSTEM_LIBRARY_ENV);
+            }
             // The stage home first: the gems the build needs and the
             // install lacks were put there, and nowhere else.
             if let Some(gem_path) = gem_path_for(&[stage_home, &copy.home]) {
@@ -3798,6 +3929,9 @@ async fn build_in_stage(
     let run = RubyRun::StageBuild {
         spec: &staged.spec_path,
         stage_home: &stage.home,
+        // The source gem of a copy RubyGems built is the copy's own gem; a
+        // precompiled copy's is the ruby-platform gem of its version.
+        as_installed: source.full_name() == copy.full_name,
     };
     stage.beat();
     let stdout = run_ruby(&probe.ruby, run, copy, env, BUILD_TIMEOUT)
@@ -4639,6 +4773,46 @@ pub async fn apply_gem_package_patch(
                  cannot take effect; nothing was written."
             ),
         );
+    }
+    // A gem built against the system's copy of a library compiles nothing
+    // of the copy it packs, and a rebuild is made the way the installed
+    // build was. So the inputs of the packed copy that the record changes
+    // would be written and never built: the library the gem loads is the
+    // operating system's, which no gem patch reaches.
+    if scope.builds_extensions {
+        let vendored: Vec<&str> = scope
+            .inputs
+            .iter()
+            .map(|key| normalize_file_path(key))
+            .filter(|path| is_vendored_library_input(path))
+            .collect();
+        let system = if vendored.is_empty() {
+            None
+        } else {
+            let copy = copy.clone();
+            crate::utils::fs::run_blocking(move || system_library_build(&copy)).await
+        };
+        if let Some(evidence) = system {
+            let shown = vendored
+                .iter()
+                .take(3)
+                .copied()
+                .collect::<Vec<_>>()
+                .join(", ");
+            let more = match vendored.len().saturating_sub(3) {
+                0 => String::new(),
+                n => format!(" and {n} more"),
+            };
+            return refusal(
+                package_key,
+                pkg_path,
+                UNSUPPORTED_CODE,
+                format!(
+                    "the patch changes a library the gem packs ({shown}{more}), but {} was built                      against the system's copy of that library ({evidence}), so nothing the                      patch changes there is compiled into it and the patch cannot take effect;                      nothing was written. What this install runs is the library the operating                      system provides: update that package, or reinstall the gem without                      `--use-system-libraries` so that it builds the library it packs, and                      apply again.",
+                    copy.full_name
+                ),
+            );
+        }
     }
     let precompiled = scope.precompiled.is_some();
     let (installed_files, absent) = files_as_installed(&copy, &scope, files).await;
@@ -6258,6 +6432,92 @@ mod tests {
             .copied()
             .collect();
         files(&all)
+    }
+
+    /// The inputs of a library the gem packs are told from the gem's own
+    /// sources: only the former go unbuilt in a system-library build.
+    #[test]
+    fn vendored_library_inputs_are_the_packed_librarys_alone() {
+        for path in [
+            "patches/libxml2/0100-CVE-2025-0000.patch",
+            "patches/libxslt/0001-fix.patch",
+            "ports/patches/libxml2/0001-fix.patch",
+            "ports/archives/libxml2-2.13.6.tar.xz",
+            "dependencies.yml",
+        ] {
+            assert!(is_vendored_library_input(path), "{path}");
+        }
+        for path in [
+            "ext/nokogiri/xml_node.c",
+            "ext/nokogiri/extconf.rb",
+            "ext/nokogiri/patches/a.patch",
+            "gumbo-parser/src/parser.c",
+            "lib/nokogiri/xml/node.rb",
+            "Manifest.txt",
+            "dependencies.yml.orig",
+            "patches",
+        ] {
+            assert!(!is_vendored_library_input(path), "{path}");
+        }
+    }
+
+    #[test]
+    fn system_library_arguments_are_told_from_the_rest() {
+        for arg in [
+            "--use-system-libraries",
+            "--enable-system-libraries",
+            "--use-system-libraries=true",
+            "--enable-system-libraries=yes",
+        ] {
+            assert!(is_system_library_arg(arg), "{arg}");
+        }
+        for arg in [
+            "--use-system-libraries=false",
+            "--use-system-libraries=No",
+            "--enable-system-libraries=0",
+            "--disable-system-libraries",
+            "--use-system-librariesx",
+            "--with-xml2-dir=/usr",
+            "",
+        ] {
+            assert!(!is_system_library_arg(arg), "{arg}");
+        }
+    }
+
+    /// A copy RubyGems built links the system's libraries when its recorded
+    /// build arguments, the log of its build or the environment says so,
+    /// and not when none does.
+    #[test]
+    fn a_system_library_build_is_told_from_arguments_log_or_environment() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        let copy = installed_gem(home, "lib");
+        let log = home.join("extensions/p/3.4.0/a-1").join(BUILD_LOG);
+        let info = home.join("build_info/a-1.info");
+        std::fs::create_dir_all(info.parent().unwrap()).unwrap();
+
+        // Built from what the gem packs, with arguments of another kind,
+        // beside a gem that was not.
+        std::fs::write(&log, "Building a using packaged libraries.\n").unwrap();
+        std::fs::write(&info, "--with-cflags=-O2\n--use-system-libraries=false\n").unwrap();
+        std::fs::write(home.join("build_info/b-1.info"), "--use-system-libraries\n").unwrap();
+        assert_eq!(system_library_evidence(&copy, false), None);
+
+        let by_env = system_library_evidence(&copy, true).unwrap();
+        assert!(by_env.contains(SYSTEM_LIBRARY_ENV), "{by_env}");
+
+        std::fs::write(
+            &log,
+            "ruby extconf.rb\nBuilding a using system libraries.\n",
+        )
+        .unwrap();
+        let by_log = system_library_evidence(&copy, false).unwrap();
+        assert!(by_log.contains("log"), "{by_log}");
+
+        std::fs::write(&log, "Building a using packaged libraries.\n").unwrap();
+        std::fs::write(&info, "--with-cflags=-O2\n  --enable-system-libraries\n").unwrap();
+        let by_args = system_library_evidence(&copy, false).unwrap();
+        assert!(by_args.contains("`--enable-system-libraries`"), "{by_args}");
     }
 
     /// In the source-built gem (its gemspec declares the extension)

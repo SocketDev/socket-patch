@@ -22,7 +22,12 @@ name: nokogiri patch compatibility
 #                 `force_ruby_platform` or a Ruby newer than the precompiled
 #                 gem's range gives on a current release.
 #   system-libraries  `--use-system-libraries`: the extension is rebuilt
-#                 with the recorded build arguments.
+#                 with the recorded build arguments, and a patch to the
+#                 vendored libxml2, which such a build does not compile, is
+#                 refused. The `legacy setting` leg is a precompiled install
+#                 in a project that still carries that Bundler setting from
+#                 the years before precompiled gems: its rebuild must keep
+#                 the libxml2 the gem ships, not link the system's.
 #   unavailable   a precompiled install on a machine with no compiler: the
 #                 patch must fail, name what is missing and change nothing.
 #   java          JRuby loads no C extension: a C record is refused.
@@ -120,7 +125,8 @@ jobs:
           - {os: ubuntu-latest, ruby: '2.5', nokogiri: '1.8.5', install: source, rails: '~> 5.1.0'}
           - {os: ubuntu-latest, ruby: '2.3', nokogiri: '1.6.8.1', install: source, rails: '~> 4.2.0', bundler: '1'}
           - {os: ubuntu-latest, ruby: '3.4', nokogiri: '1.18.10', install: source}
-          - {os: ubuntu-latest, ruby: '3.4', nokogiri: '1.18.10', install: system-libraries}
+          - {os: ubuntu-latest, ruby: '3.4', nokogiri: '1.18.10', install: system-libraries, system-libxml2: true}
+          - {os: ubuntu-latest, ruby: '3.4', nokogiri: '1.18.10', install: precompiled, system-libxml2: true, args: '--bundle-setting BUNDLE_BUILD__NOKOGIRI=--use-system-libraries', note: legacy setting}
           # No compiler on PATH: nothing may change.
           - {os: ubuntu-latest, ruby: '3.4', nokogiri: '1.18.10', install: precompiled, build: unavailable, args: '--hide-toolchain', note: no toolchain}
           # JRuby: the Ruby-only record applies, a C record is refused.
@@ -129,7 +135,9 @@ jobs:
           - {os: ubuntu-24.04-arm, ruby: '3.4', nokogiri: '1.18.10', install: precompiled}
           - {os: macos-latest, ruby: '3.4', nokogiri: '1.18.10', install: precompiled}
           - {os: macos-latest, ruby: '3.4', nokogiri: '1.18.10', install: source}
-          - {os: windows-latest, ruby: '3.4', nokogiri: '1.18.10', install: precompiled}
+          # A short project path: the MinGW tools stop at 260 characters,
+          # and a build in the stage is some 60 deeper than one in place.
+          - {os: windows-latest, ruby: '3.4', nokogiri: '1.18.10', install: precompiled, args: '--work "$RUNNER_TEMP/n"'}
     runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS != 'true' && matrix.os == 'ubuntu-latest' && 'depot-ubuntu-24.04-4' || matrix.os }}
     timeout-minutes: 60
     steps:
@@ -159,7 +167,7 @@ jobs:
           ruby-version: ${{ matrix.ruby }}
           bundler: ${{ matrix.bundler || 'default' }}
       - name: Install the system libxml2 and libxslt headers
-        if: matrix.install == 'system-libraries'
+        if: matrix.system-libxml2
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libxml2-dev libxslt1-dev
       - name: Patch a real nokogiri ${{ matrix.nokogiri }} install
         shell: bash
@@ -173,10 +181,11 @@ jobs:
           E2E_ARGS: ${{ matrix.args }}
         run: |
           ruby --version
-          # shellcheck disable=SC2086 # E2E_ARGS is a list of flags
+          # E2E_ARGS is a shell-quoted list of flags from the matrix above.
+          eval "set -- $E2E_ARGS"
           ruby tests/nokogiri/nokogiri_e2e.rb --socket-patch target/debug/socket-patch \
             --nokogiri "$E2E_NOKOGIRI" --install "$E2E_INSTALL" --build "$E2E_BUILD" \
-            ${E2E_RAILS:+--rails "$E2E_RAILS"} $E2E_ARGS
+            ${E2E_RAILS:+--rails "$E2E_RAILS"} "$@"
 
   static-cli:
     name: static socket-patch for the container legs
