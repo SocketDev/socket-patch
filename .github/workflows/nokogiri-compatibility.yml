@@ -158,16 +158,18 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libxml2-dev libxslt1-dev
       - name: Patch a real nokogiri ${{ matrix.nokogiri }} install
         shell: bash
+        # The names carry a prefix because a build reads its environment:
+        # libxml2's configure script takes `INSTALL` for the install program.
         env:
-          NOKOGIRI: ${{ matrix.nokogiri }}
-          INSTALL: ${{ matrix.install }}
-          BUILD: ${{ matrix.build || 'ok' }}
-          ARGS: ${{ matrix.args }}
+          E2E_NOKOGIRI: ${{ matrix.nokogiri }}
+          E2E_INSTALL: ${{ matrix.install }}
+          E2E_BUILD: ${{ matrix.build || 'ok' }}
+          E2E_ARGS: ${{ matrix.args }}
         run: |
           ruby --version
-          # shellcheck disable=SC2086 # ARGS is a list of flags
+          # shellcheck disable=SC2086 # E2E_ARGS is a list of flags
           ruby tests/nokogiri/nokogiri_e2e.rb --socket-patch target/debug/socket-patch \
-            --nokogiri "$NOKOGIRI" --install "$INSTALL" --build "$BUILD" $ARGS
+            --nokogiri "$E2E_NOKOGIRI" --install "$E2E_INSTALL" --build "$E2E_BUILD" $E2E_ARGS
 
   static-cli:
     name: static socket-patch for the container legs
@@ -261,12 +263,12 @@ jobs:
           verify: test -s static-cli/socket-patch
       - name: Patch a real nokogiri ${{ matrix.nokogiri }} install in ${{ matrix.image }}
         env:
-          IMAGE: ${{ matrix.image }}@${{ matrix.digest }}
-          NOKOGIRI: ${{ matrix.nokogiri }}
-          INSTALL: ${{ matrix.install }}
-          BUILD: ${{ matrix.build || 'ok' }}
-          SETUP: ${{ matrix.setup || 'true' }}
-          ARGS: ${{ matrix.args }}
+          E2E_IMAGE: ${{ matrix.image }}@${{ matrix.digest }}
+          E2E_NOKOGIRI: ${{ matrix.nokogiri }}
+          E2E_INSTALL: ${{ matrix.install }}
+          E2E_BUILD: ${{ matrix.build || 'ok' }}
+          E2E_SETUP: ${{ matrix.setup || 'true' }}
+          E2E_ARGS: ${{ matrix.args }}
         # The script and the binary are mounted read-only; the project it
         # builds lives in the container's own temp dir, and the gems go
         # where the image's Bundler settings put them.
@@ -275,11 +277,11 @@ jobs:
           docker run --rm \
             -v "$PWD/tests/nokogiri:/e2e:ro" -v "$PWD/static-cli:/cli:ro" \
             -e SOCKET_NO_CONFIG -e SOCKET_NO_UPDATE_CHECK -e SOCKET_TELEMETRY_DISABLED \
-            -e NOKOGIRI -e INSTALL -e BUILD -e SETUP -e ARGS \
-            "$IMAGE" sh -ec '
-              sh -ec "$SETUP"
+            -e E2E_NOKOGIRI -e E2E_INSTALL -e E2E_BUILD -e E2E_SETUP -e E2E_ARGS \
+            "$E2E_IMAGE" sh -ec '
+              sh -ec "$E2E_SETUP"
               ruby --version
-              eval "set -- $ARGS"
+              eval "set -- $E2E_ARGS"
               ruby /e2e/nokogiri_e2e.rb --socket-patch /cli/socket-patch \
-                --nokogiri "$NOKOGIRI" --install "$INSTALL" --build "$BUILD" --gem-home ambient "$@"
+                --nokogiri "$E2E_NOKOGIRI" --install "$E2E_INSTALL" --build "$E2E_BUILD" --gem-home ambient "$@"
             '
