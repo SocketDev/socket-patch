@@ -393,16 +393,53 @@ pub(crate) async fn restore(
     // version nothing serves any more.
     let disk = ProjectView::Disk(view.root);
     let root_pom = view.read("pom.xml").await.ok().flatten();
+    // A pom that is there but is not UTF-8 text is not a missing module:
+    // it may hold part of a pin, and nothing can tell.
+    let undecodable = std::sync::Mutex::new(Vec::new());
     let (reactor, reactor_poms) = match &root_pom {
         Some(root) => (
             heads_reactor_in(&disk, root, config.as_deref()).await,
-            read_reactor(&disk, root, config.as_deref(), |rel| async move {
-                disk.read_text(&rel).await.ok()
+            read_reactor(&disk, root, config.as_deref(), |rel| {
+                let undecodable = &undecodable;
+                async move {
+                    match disk.read_text(&rel).await {
+                        Ok(text) => Some(text),
+                        Err(e) => {
+                            if e.kind() == std::io::ErrorKind::InvalidData {
+                                undecodable
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                    .push(rel);
+                            }
+                            None
+                        }
+                    }
+                }
             })
             .await,
         ),
         None => (false, BTreeMap::new()),
     };
+    // A pin is restored in every pom that carries part of it, or in none.
+    // With a pom of the reactor unread, "every" cannot be kept: restoring
+    // the others would leave that one naming a version whose repository is
+    // gone. Every pin is refused, and nothing is written.
+    let mut undecodable = undecodable
+        .into_inner()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    undecodable.sort();
+    if let Some(rel) = undecodable.first() {
+        for pin in pins.values() {
+            result.refuse(
+                &pin.uuid,
+                format!(
+                    "{rel} is there but is not UTF-8 text, so whether it holds part of the \
+                     pin cannot be told; re-save it as UTF-8 and re-run"
+                ),
+            );
+        }
+        return result;
+    }
     // The poms as they are, and as they read once the pins so far are out.
     let mut originals: BTreeMap<String, String> = BTreeMap::new();
     for rel in files {
@@ -1456,6 +1493,76 @@ mod tests {
         assert_eq!(after["a/pom.xml"], files[1].1);
         assert_eq!(after["pom.xml"], files[0].1);
         assert!(!after.contains_key(MVN_CHECKSUMS), "{:?}", after.keys());
+    }
+
+    /// A module pom that is there but is not UTF-8 text is not a missing
+    /// one. Its content is unknown, and here it holds one of the pins:
+    /// restoring the poms that can be read would take the repository from
+    /// under it. Discovery still finds the pin in those; the rollback
+    /// refuses it, names the file, and changes nothing.
+    #[tokio::test]
+    async fn a_reactor_with_an_undecodable_module_is_not_rolled_back_in_part() {
+        let logback = dependency("ch.qos.logback", "logback-classic", Some("1.4.14"));
+        let root = REACTOR_ROOT.replace(
+            "<module>b</module>",
+            "<module>b</module>\n    <module>c</module>",
+        );
+        assert_ne!(root, REACTOR_ROOT);
+        let files = [
+            ("pom.xml", root),
+            ("a/pom.xml", reactor_module("a", &logback)),
+            ("b/pom.xml", reactor_module("b", &logback)),
+            ("c/pom.xml", reactor_module("c", &logback)),
+        ];
+        let tmp = tempfile::tempdir().unwrap();
+        write_tree(tmp.path(), &files);
+        // `a` and `c` select the base version and take a pin each; `b`
+        // resolves another, so the root takes none.
+        scan(
+            tmp.path(),
+            UUID,
+            &[
+                ("a/pom.xml", Ok("1.7.36")),
+                ("b/pom.xml", Ok("2.0.9")),
+                ("c/pom.xml", Ok("1.7.36")),
+            ],
+        );
+        // The pom of `c`, pin and all, re-saved in another encoding (a
+        // Latin-1 "é" in a comment).
+        let pinned = std::fs::read(tmp.path().join("c/pom.xml")).unwrap();
+        assert!(String::from_utf8_lossy(&pinned).contains("-socket."));
+        let mut latin1 = b"<!-- r\xe9sum\xe9 -->\n".to_vec();
+        latin1.extend_from_slice(&pinned);
+        std::fs::write(tmp.path().join("c/pom.xml"), &latin1).unwrap();
+        let bytes = |root: &std::path::Path| -> BTreeMap<String, Vec<u8>> {
+            walkdir::WalkDir::new(root)
+                .into_iter()
+                .filter_map(Result::ok)
+                .filter(|entry| entry.file_type().is_file())
+                .map(|entry| {
+                    let rel = entry.path().strip_prefix(root).unwrap();
+                    (
+                        rel.to_string_lossy().replace('\\', "/"),
+                        std::fs::read(entry.path()).unwrap(),
+                    )
+                })
+                .collect()
+        };
+        let before = bytes(tmp.path());
+
+        let pins = discovered(tmp.path()).await;
+        assert_eq!(pins.len(), 1, "{pins:?}");
+        let opts = RestoreOptions {
+            offline: true,
+            ..RestoreOptions::default()
+        };
+        let outcome = restore_upstream(tmp.path(), &pins, &opts).await;
+        let why = refusal(&outcome);
+        assert!(
+            why.contains("c/pom.xml") && why.contains("not UTF-8"),
+            "{why}"
+        );
+        assert_eq!(bytes(tmp.path()), before, "nothing was written");
     }
 
     /// A pin is restored in every pom of the reactor that carries part of

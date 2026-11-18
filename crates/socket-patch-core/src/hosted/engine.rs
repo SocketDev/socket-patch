@@ -619,6 +619,12 @@ pub struct CandidateFiles {
     /// are left out of `files`; a project whose candidates could rewrite
     /// one is refused rather than read as if the file were absent.
     pub undecodable_reads: Vec<String>,
+    /// Poms of the Maven reactor (a module's, or a parent's inside the
+    /// checkout, whatever the file is called) that exist but are not UTF-8
+    /// text. A Maven candidate could rewrite any of them, so the run is
+    /// refused like for [`Self::undecodable_reads`], never planned as if
+    /// the pom were missing.
+    pub undecodable_maven_poms: Vec<String>,
     /// Gradle build files the script graph reached that exist but cannot be
     /// read as text (any view): the hosted Gradle planner refuses the build
     /// instead of taking them for absent (and creating a settings file over
@@ -735,18 +741,37 @@ async fn read_advisory(
     unreadable: &BTreeSet<String>,
     rel: &str,
 ) -> Option<String> {
+    read_pom_text(view, unreadable, rel).await.ok().flatten()
+}
+
+/// The file `rel` is there, but is not UTF-8 text.
+struct Undecodable;
+
+/// [`read_advisory`] that tells a file which is there but is not UTF-8
+/// text (`Err`) from one that is missing, linked or not readable at all
+/// (`Ok(None)`): the first is a file whose content this run does not know,
+/// and must never be taken for an absent one.
+async fn read_pom_text(
+    view: &ProjectView<'_>,
+    unreadable: &BTreeSet<String>,
+    rel: &str,
+) -> Result<Option<String>, Undecodable> {
     match view {
-        ProjectView::Disk(_) | ProjectView::Snapshot(_) => view.read_text(rel).await.ok(),
+        ProjectView::Disk(_) | ProjectView::Snapshot(_) => match view.read_text(rel).await {
+            Ok(text) => Ok(Some(text)),
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidData => Err(Undecodable),
+            Err(_) => Ok(None),
+        },
         ProjectView::Memory(project) if !project.is_symlink(rel) && !unreadable.contains(rel) => {
             match project.get(rel) {
-                Some(MemoryEntry::Text(text)) => Some(text.to_string()),
-                Some(MemoryEntry::Binary(bytes)) => {
-                    std::str::from_utf8(bytes).ok().map(str::to_string)
-                }
-                _ => None,
+                Some(MemoryEntry::Text(text)) => Ok(Some(text.to_string())),
+                Some(MemoryEntry::Binary(bytes)) => std::str::from_utf8(bytes)
+                    .map(|text| Some(text.to_string()))
+                    .map_err(|_| Undecodable),
+                _ => Ok(None),
             }
         }
-        ProjectView::Memory(_) => None,
+        ProjectView::Memory(_) => Ok(None),
     }
 }
 
@@ -755,11 +780,14 @@ async fn read_advisory(
 /// reader discovery and restore share, so each finds what the others
 /// wrote): every pom is fetched and parsed once, however many modules.
 ///
-/// They are advisory input: a module pom that cannot be read as text, or
-/// that is a symbolic link, is left out, and the planner then finds the
-/// reactor incomplete and refuses it with nothing written. That is what a
-/// reactor got before module poms were read at all; it never fails the
-/// run, as an unreadable root candidate does.
+/// They are advisory input: a module pom that is a symbolic link, or that
+/// cannot be opened, is left out, and the planner then finds the reactor
+/// incomplete and refuses it with nothing written. That is what a reactor
+/// got before module poms were read at all; it never fails the run, as an
+/// unreadable root candidate does. A pom that is there but is not UTF-8
+/// text is another matter: its content is unknown, not absent, so it is
+/// recorded ([`CandidateFiles::undecodable_maven_poms`]) and the guard
+/// refuses the run for it, as for an undecodable root pom.
 async fn read_maven_reactor(
     view: &ProjectView<'_>,
     unreadable: &BTreeSet<String>,
@@ -769,16 +797,40 @@ async fn read_maven_reactor(
         return;
     };
     let config = out.files.get(crate::patch::redirect::MVN_CONFIG);
+    // A pom that is there but is not UTF-8 text is not a missing module:
+    // its content is unknown, so it is recorded like any other undecodable
+    // candidate and the run is refused for it (`candidate_file_unreadable`),
+    // instead of the reactor being reported as short of a pom it has.
+    let undecodable = std::sync::Mutex::new(Vec::new());
     let read = crate::vendor::jvm::maven_reactor::read_reactor(
         view,
         root,
         config.map(String::as_str),
-        |rel| async move { read_advisory(view, unreadable, &rel).await },
+        |rel| {
+            let undecodable = &undecodable;
+            async move {
+                match read_pom_text(view, unreadable, &rel).await {
+                    Ok(text) => text,
+                    Err(Undecodable) => {
+                        undecodable
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .push(rel);
+                        None
+                    }
+                }
+            }
+        },
     )
     .await;
     for (rel, text) in read {
         out.files.entry(rel).or_insert(text);
     }
+    let mut undecodable = undecodable
+        .into_inner()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    undecodable.sort();
+    out.undecodable_maven_poms = undecodable;
 }
 
 /// Hand the pom rewriter the mirrors Maven is configured with on this
@@ -2087,6 +2139,8 @@ pub struct Rewritten {
     pub symlinked_reads: Vec<String>,
     pub unreadable_reads: Vec<String>,
     pub undecodable_reads: Vec<String>,
+    /// [`CandidateFiles::undecodable_maven_poms`].
+    pub undecodable_maven_poms: Vec<String>,
     /// The rewriters' override slice (the candidates' deps).
     pub overrides: Vec<DepOverride>,
     pub rewrite: RewriteResult,
@@ -2714,6 +2768,7 @@ async fn rewrite_once(
         symlinked_reads,
         unreadable_reads,
         undecodable_reads,
+        undecodable_maven_poms,
         gradle_unreadable,
         gem_refusal,
         pnpm_refusal,
@@ -2983,6 +3038,7 @@ async fn rewrite_once(
         symlinked_reads,
         unreadable_reads,
         undecodable_reads,
+        undecodable_maven_poms,
         overrides,
         rewrite,
         rewritten,
@@ -3971,6 +4027,17 @@ pub fn undecodable_guard(undecodable: &[String], candidates: &[Candidate]) -> Op
         .map(|rel| undecodable_refusal(rel))
 }
 
+/// The non-UTF-8 rule for the poms of a Maven reactor
+/// ([`CandidateFiles::undecodable_maven_poms`]): with a Maven candidate,
+/// the first of them refuses the run, as an undecodable root `pom.xml`
+/// does. A module's pom may be a file of any name, so these are judged by
+/// what read them, not by their name.
+pub fn undecodable_maven_guard(poms: &[String], candidates: &[Candidate]) -> Option<Refusal> {
+    poms.first()
+        .filter(|_| candidates.iter().any(|c| c.dep.ecosystem == "maven"))
+        .map(|rel| undecodable_refusal(rel))
+}
+
 /// SYMLINK GUARD — fail-closed, whole rewrite, before any write (hosted
 /// rewrites are transactional). The writer stages next to
 /// the path and renames over it, which REPLACES a symbolic link with a
@@ -4003,6 +4070,9 @@ pub fn guard(
         return Some(symlink_refusal(linked));
     }
     if let Some(refusal) = undecodable_guard(&done.undecodable_reads, candidates) {
+        return Some(refusal);
+    }
+    if let Some(refusal) = undecodable_maven_guard(&done.undecodable_maven_poms, candidates) {
         return Some(refusal);
     }
     let candidate_ecosystems: BTreeSet<&str> = candidates
@@ -6482,7 +6552,8 @@ snapshots:
     /// readable content, is no reason to fail the run: the reactor is left
     /// as it is, with the reason, as every reactor was before module poms
     /// were read. The guard that refuses a linked or unreadable rewrite
-    /// target has nothing to refuse.
+    /// target has nothing to refuse. A module pom that is there but is not
+    /// UTF-8 text is refused by name instead: it must never look absent.
     #[tokio::test]
     async fn a_reactor_with_an_unreadable_module_pom_is_left_alone_not_failed() {
         let root = "<project>\n  <modelVersion>4.0.0</modelVersion>\n  <groupId>x</groupId>\n  <artifactId>y</artifactId>\n  <version>1</version>\n  <packaging>pom</packaging>\n  <modules>\n    <module>a</module>\n  </modules>\n  <dependencies>\n    <dependency>\n      <groupId>com.socketfixture</groupId>\n      <artifactId>victim</artifactId>\n      <version>1.10.0</version>\n    </dependency>\n  </dependencies>\n</project>\n";
@@ -6511,14 +6582,47 @@ snapshots:
             left_alone(&view, &read, &done);
         }
 
+        // A pom that is there but is not UTF-8 text is not a missing one:
+        // its content is unknown, so the run is refused for it by name,
+        // as for an undecodable root pom, with nothing written. On disk and
+        // in memory alike.
+        let undecodable = |view: &ProjectView<'_>, read: &CandidateFiles, done: &Rewritten| {
+            assert_eq!(read.undecodable_maven_poms, ["a/pom.xml"]);
+            assert!(done.rewrite.files.is_empty(), "{:?}", done.rewrite.files);
+            assert!(done.confirmed.is_empty(), "{:?}", done.confirmed);
+            let refusal = guard(view, done, &[gradle_candidate()]).expect("refused");
+            assert_eq!(refusal.code, UNREADABLE_REFUSAL);
+            assert!(refusal.message.contains("a/pom.xml"), "{}", refusal.message);
+        };
+        let mut p = MemoryProject::new();
+        p.insert_text("pom.xml", root);
+        p.insert(
+            "a/pom.xml",
+            MemoryEntry::Binary(vec![0xff, 0xfe, 0x00].into()),
+        );
+        let view = ProjectView::Memory(&p);
+        let (read, done) = gradle_rewrite_in(&view).await;
+        undecodable(&view, &read, &done);
+
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("pom.xml"), root).unwrap();
         std::fs::create_dir(tmp.path().join("a")).unwrap();
-        // Not UTF-8.
         std::fs::write(tmp.path().join("a/pom.xml"), [0xff, 0xfe, 0x00]).unwrap();
         let view = ProjectView::Disk(tmp.path());
         let (read, done) = gradle_rewrite_in(&view).await;
-        left_alone(&view, &read, &done);
+        undecodable(&view, &read, &done);
+        // A module pom of another name is one too.
+        std::fs::write(
+            tmp.path().join("pom.xml"),
+            root.replace("<module>a</module>", "<module>a/build.xml</module>"),
+        )
+        .unwrap();
+        std::fs::rename(tmp.path().join("a/pom.xml"), tmp.path().join("a/build.xml")).unwrap();
+        let (read, done) = gradle_rewrite_in(&view).await;
+        assert_eq!(read.undecodable_maven_poms, ["a/build.xml"]);
+        assert!(guard(&view, &done, &[gradle_candidate()]).is_some());
+        std::fs::rename(tmp.path().join("a/build.xml"), tmp.path().join("a/pom.xml")).unwrap();
+        std::fs::write(tmp.path().join("pom.xml"), root).unwrap();
         // A link, to a pom that would otherwise be planned.
         #[cfg(unix)]
         {
