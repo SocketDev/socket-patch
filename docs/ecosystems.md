@@ -968,7 +968,11 @@ Honest limits of the Maven and NuGet flows — documented behavior, not bugs:
   started in a module directory or with `-f`; a module with a `.mvn` of its own is
   reported (`redirect_maven_trusted_checksums_unenforced`), since a Maven started there
   reads that one. A reactor one of whose poms cannot be read is left untouched
-  (`redirect_maven_multimodule_unsupported`, with the reason). The plan for a patch is
+  (`redirect_maven_multimodule_unsupported`, with the reason). A pom that is there but is
+  not UTF-8 text (re-saved as Latin-1 or UTF-16, say) is never taken for a missing one:
+  the scan refuses the run and names it (`candidate_file_unreadable`), `vex` reports it
+  as unreadable and attests no pin of that reactor, and `rollback` / `remove` change
+  nothing until it is UTF-8 again, since it may hold part of a pin. The plan for a patch is
   written whole or not at all: a pom is never left naming a patched version without the
   repository that serves it, its checksum lines, and wiring a rollback can find. So a
   declaration only a `<profile>` holds is not rewritten on its own
