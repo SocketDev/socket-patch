@@ -1,0 +1,5 @@
+# Start what `bazel run` built with the interpreter of the toolchain.
+# rules_python's default bootstrap is a Python program behind
+# `/usr/bin/env python3`, so with it the run needs a `python3` on the
+# machine's PATH.
+build --@rules_python//python/config_settings:bootstrap_impl=script

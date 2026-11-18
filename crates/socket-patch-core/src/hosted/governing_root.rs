@@ -919,8 +919,8 @@ async fn listing_workspace(base: &Path, dir: &Path) -> Option<PathBuf> {
         let listed = ancestor.join("rush.json").exists()
             || package_json
                 .ok()
-                .and_then(|text| Workspaces::listed_patterns(&text))
-                .is_some_and(|patterns| lists(&patterns, &rel))
+                .and_then(|text| workspace_patterns(ancestor, &text))
+                .is_some_and(|(patterns, _)| lists(&patterns, &rel))
             || read_regular_to_string(&ancestor.join(VLT_JSON))
                 .await
                 .ok()
@@ -983,7 +983,7 @@ async fn package_json_workspace_root(root: &Path) -> Option<(PathBuf, Vec<&'stat
         let Ok(text) = read_regular_to_string(&ancestor.join("package.json")).await else {
             continue;
         };
-        let Some(patterns) = Workspaces::listed_patterns(&text) else {
+        let Some((patterns, bun_only)) = workspace_patterns(ancestor, &text) else {
             continue;
         };
         let Ok(rel) = member.strip_prefix(ancestor) else {
@@ -1006,11 +1006,17 @@ async fn package_json_workspace_root(root: &Path) -> Option<(PathBuf, Vec<&'stat
             .iter()
             .flat_map(|family| family.files().iter().copied())
             .filter(|name| ancestor.join(name).is_file())
+            // A manifest only Bun can parse names no other package
+            // manager's workspace.
+            .filter(|name| !bun_only || matches!(*name, BUN_LOCK | BUN_LOCKB))
             .collect();
         // vlt falls back to `package.json` `workspaces` when the root's
         // `vlt.json` declares none (Bugbot on #1073), so its lock there
         // governs the member too.
-        if ancestor.join(VLT_LOCK).is_file() && !vlt_json_declares_workspaces(ancestor).await {
+        if !bun_only
+            && ancestor.join(VLT_LOCK).is_file()
+            && !vlt_json_declares_workspaces(ancestor).await
+        {
             locks.push(VLT_LOCK);
         }
         // Only the locks whose package manager lists the member govern it;
@@ -1038,6 +1044,20 @@ async fn package_json_workspace_root(root: &Path) -> Option<(PathBuf, Vec<&'stat
         return Some((ancestor.to_path_buf(), locks));
     }
     None
+}
+
+/// The `workspaces` patterns of the `package.json` text at `root`, and
+/// whether only Bun can read them. A manifest with comments or trailing
+/// commas is one Bun installs from and npm, yarn, pnpm and vlt refuse, so
+/// it names a workspace only where Bun's lock sits beside it.
+fn workspace_patterns(root: &Path, package_json: &str) -> Option<(Vec<String>, bool)> {
+    if let Some(patterns) = Workspaces::listed_patterns(package_json) {
+        return Some((patterns, false));
+    }
+    if !root.join(BUN_LOCK).is_file() && !root.join(BUN_LOCKB).is_file() {
+        return None;
+    }
+    Workspaces::listed_patterns_as_bun(package_json).map(|patterns| (patterns, true))
 }
 
 /// Whether the package manager that reads `lock` at `root` lists the
@@ -2825,6 +2845,39 @@ mod tests {
             code(&tmp.path().join("apps/web"), "npm").await.as_deref(),
             Some(PNPM_LOCKFILE_ELSEWHERE)
         );
+    }
+
+    /// A `package.json` with comments or trailing commas is one Bun
+    /// installs from and npm, yarn, pnpm and vlt refuse. It names a
+    /// workspace root where Bun's lock sits beside it, and only Bun's; an
+    /// npm or yarn project below such a manifest keeps its own lock.
+    #[test]
+    fn a_jsonc_manifest_names_a_workspace_only_beside_a_bun_lock() {
+        let jsonc = "{\n  // root\n  \"workspaces\": [\"packages/*\",],\n}\n";
+        let strict = r#"{"workspaces": ["packages/*"]}"#;
+        let patterns = vec!["packages/*".to_string()];
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(workspace_patterns(tmp.path(), jsonc), None);
+        assert_eq!(
+            workspace_patterns(tmp.path(), strict),
+            Some((patterns.clone(), false))
+        );
+        std::fs::write(tmp.path().join("package-lock.json"), "{}").unwrap();
+        assert_eq!(workspace_patterns(tmp.path(), jsonc), None);
+        for lock in [BUN_LOCK, BUN_LOCKB] {
+            let tmp = tempfile::tempdir().unwrap();
+            std::fs::write(tmp.path().join(lock), "").unwrap();
+            assert_eq!(
+                workspace_patterns(tmp.path(), jsonc),
+                Some((patterns.clone(), true)),
+                "{lock}"
+            );
+            assert_eq!(
+                workspace_patterns(tmp.path(), strict),
+                Some((patterns.clone(), false)),
+                "{lock}"
+            );
+        }
     }
 
     /// Both workspace readers skip one leading BOM (`formats::text`); a

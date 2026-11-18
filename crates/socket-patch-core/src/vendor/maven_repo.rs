@@ -4204,6 +4204,16 @@ mod tests {
              </dependencies></project>",
         )
         .unwrap();
+        // What commons-text depends on, as a resolved project holds it:
+        // with a pom missing, the build is not known to select 1.10.0.
+        let lang3 = root.join("m2/org/apache/commons/commons-lang3/3.12.0");
+        std::fs::create_dir_all(&lang3).unwrap();
+        std::fs::write(
+            lang3.join("commons-lang3-3.12.0.pom"),
+            "<project><modelVersion>4.0.0</modelVersion><groupId>org.apache.commons</groupId>\
+             <artifactId>commons-lang3</artifactId><version>3.12.0</version></project>",
+        )
+        .unwrap();
         let (result, entry, warnings) =
             unwrap_done(run_jvm(root, &blobs, &installed, &record, None).await);
         assert!(result.success, "{result:?}");

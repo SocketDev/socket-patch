@@ -124,7 +124,8 @@ fn skipped_members_of(root: &Path) -> Vec<PathBuf> {
 
     let Some(patterns) = crate::utils::fs::read_regular_to_string_sync(&root.join("package.json"))
         .ok()
-        .and_then(|text| crate::formats::package_json::Workspaces::listed_patterns(&text))
+        // As Bun reads it too: an extra root can only keep a copy.
+        .and_then(|text| crate::formats::package_json::Workspaces::listed_patterns_as_bun(&text))
     else {
         return Vec::new();
     };
@@ -998,7 +999,7 @@ fn bun_workspace_pattern_members_sync(root: &Path) -> Option<Vec<PathBuf>> {
 
     // Bun refuses to install from a malformed field (#1900), so it names
     // no member set.
-    let patterns = match Workspaces::parse(&text)? {
+    let patterns = match Workspaces::parse_as_bun(&text)? {
         Workspaces::None => Vec::new(),
         Workspaces::Patterns(patterns) => patterns,
         Workspaces::Malformed(_) => return None,

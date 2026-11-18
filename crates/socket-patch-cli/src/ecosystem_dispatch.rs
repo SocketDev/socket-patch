@@ -1314,6 +1314,20 @@ pub async fn find_manifest_package_copies_reusing(
             }
         }
     }
+    // The dir of a gem build whose gemspec is gone, beside a copy of the
+    // version that the gem home does list, is no copy RubyGems or Bundler
+    // loads, so an unpatched one must not block the attestation (#2087).
+    // Rollback and remove, which resolve without this, still restore it.
+    for (_, paths) in copies
+        .iter_mut()
+        .filter(|(purl, paths)| purl.starts_with("pkg:gem/") && paths.len() > 1)
+    {
+        *paths = socket_patch_core::crawlers::ruby_crawler::retain_loaded_gem_builds(
+            std::mem::take(paths),
+        )
+        .await;
+    }
+    copies.retain(|_, paths| !paths.is_empty());
     copies
 }
 
@@ -1506,6 +1520,110 @@ pub async fn crawl_ecosystems_with_npm(
 /// Whether a crawl limited to `only` visits `eco` (`None`: every one).
 fn crawl_selects(only: Option<&[String]>, eco: Ecosystem) -> bool {
     only.is_none_or(|list| list.iter().any(|name| name == eco.cli_name()))
+}
+
+/// The install directories a project crawl of `options` reads for each of
+/// `ecosystems` (npm, PyPI, RubyGems and Composer; the others resolve
+/// none here): every `node_modules` at and below `--cwd`, the Python
+/// environments, the gem homes and the Composer vendor directory.
+pub(crate) async fn crawled_install_roots(
+    options: &CrawlerOptions,
+    ecosystems: &HashSet<Ecosystem>,
+) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if ecosystems.contains(&Ecosystem::Npm) {
+        roots.extend(
+            NpmCrawler::for_options(options)
+                .get_node_modules_paths(options)
+                .await
+                .unwrap_or_default(),
+        );
+    }
+    if ecosystems.contains(&Ecosystem::Pypi) {
+        roots.extend(
+            PythonCrawler::new()
+                .get_site_packages_paths(options)
+                .await
+                .unwrap_or_default(),
+        );
+    }
+    if ecosystems.contains(&Ecosystem::Gem) {
+        roots.extend(RubyCrawler.get_gem_paths(options).await.unwrap_or_default());
+    }
+    if ecosystems.contains(&Ecosystem::Composer) {
+        roots.extend(
+            ComposerCrawler
+                .get_vendor_paths(options)
+                .await
+                .unwrap_or_default(),
+        );
+    }
+    roots
+}
+
+/// The install directories that hold the packages of the project at
+/// `options.cwd` itself, for the ecosystems `only` selects: the ones a
+/// crawl from a directory above has to read to cover that project.
+///
+/// * A directory inside the project: its `node_modules`, its Python
+///   environments (`.venv`, `venv`, a manager's in-project env) and its
+///   Composer vendor directory.
+/// * Every gem home a crawl from it reads: its `vendor/bundle`, or the
+///   user-wide homes, where Bundler installs a project's gems by default.
+///
+/// A user-wide Python environment, and the Cargo and Go caches, are left
+/// out: they say nothing about whether this project's packages are
+/// installed, and a project with none there would always be reported.
+pub(crate) async fn own_install_roots(
+    options: &CrawlerOptions,
+    only: Option<&[String]>,
+) -> Vec<(Ecosystem, PathBuf)> {
+    use socket_patch_core::crawlers::python_crawler::find_local_venv_site_packages;
+    let project = std::fs::canonicalize(&options.cwd).unwrap_or_else(|_| options.cwd.clone());
+    let inside = |root: &PathBuf| {
+        std::fs::canonicalize(root)
+            .unwrap_or_else(|_| root.clone())
+            .starts_with(&project)
+    };
+    let mut roots = Vec::new();
+    if crawl_selects(only, Ecosystem::Npm) {
+        let found = NpmCrawler::for_options(options)
+            .get_node_modules_paths(options)
+            .await
+            .unwrap_or_default();
+        roots.extend(
+            found
+                .into_iter()
+                .filter(&inside)
+                .map(|root| (Ecosystem::Npm, root)),
+        );
+    }
+    if crawl_selects(only, Ecosystem::Pypi) {
+        let found = find_local_venv_site_packages(&options.cwd).await;
+        roots.extend(
+            found
+                .into_iter()
+                .filter(&inside)
+                .map(|root| (Ecosystem::Pypi, root)),
+        );
+    }
+    if crawl_selects(only, Ecosystem::Gem) {
+        let found = RubyCrawler.get_gem_paths(options).await.unwrap_or_default();
+        roots.extend(found.into_iter().map(|root| (Ecosystem::Gem, root)));
+    }
+    if crawl_selects(only, Ecosystem::Composer) {
+        let found = ComposerCrawler
+            .get_vendor_paths(options)
+            .await
+            .unwrap_or_default();
+        roots.extend(
+            found
+                .into_iter()
+                .filter(&inside)
+                .map(|root| (Ecosystem::Composer, root)),
+        );
+    }
+    roots
 }
 
 /// The crawl behind the entry points above; the fourth element is the npm

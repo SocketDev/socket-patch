@@ -1002,6 +1002,10 @@ struct VendoredLegOutcome {
     /// could not be saved.
     failed: Vec<(String, &'static str, String)>,
     warnings: Vec<(String, String)>,
+    /// The gems (ledger keys) whose installed copies the unwind brought
+    /// back to the upstream build: nothing of theirs is left for a
+    /// reinstall.
+    refreshed_installs: std::collections::BTreeSet<String>,
     /// `removed` / `vendor_orphan_removed` events for the orphan uuid
     /// dirs (no ledger entry) swept, also on dry-run.
     orphans_removed: Vec<PatchEvent>,
@@ -1033,10 +1037,15 @@ async fn run_vendored_leg(
     for RevertedEntry {
         key,
         warnings,
+        progress,
+        gem_install_refreshed,
         step,
         ..
     } in reverted
     {
+        if gem_install_refreshed {
+            out.refreshed_installs.insert(key.clone());
+        }
         for w in &warnings {
             if loud {
                 eprintln!("Warning: {}", w.detail);
@@ -1095,6 +1104,11 @@ async fn run_vendored_leg(
                     eprintln!("Error: Failed to revert vendoring for {key}: {why}");
                 }
                 out.failed.push((key, "vendor_state_write_failed", why));
+            }
+        }
+        if loud {
+            for line in &progress {
+                println!("{line}");
             }
         }
     }
@@ -2844,6 +2858,7 @@ async fn run_project(args: RollbackArgs, below: BelowNotes) -> i32 {
                             // A gem the hosted leg already brought back to
                             // its upstream build.
                             && !hosted_leg.refreshed_installs.contains(key.as_str())
+                            && !vendored_leg.refreshed_installs.contains(key.as_str())
                     })
                     .count();
                 if still_patched > 0 {
@@ -3622,11 +3637,21 @@ pub(crate) async fn rollback_patches_inner(
             match try_rollback_local_go(purl, pkg_path, patch, common).await {
                 Some(r) => r,
                 None => {
+                    use socket_patch_core::patch::gem_ext;
+                    let is_gem = Ecosystem::from_purl(purl) == Some(Ecosystem::Gem);
+                    // A build input `apply` added to a gem copy that did not
+                    // hold it (a precompiled gem never shipped it; a build
+                    // removed it) is removed, not restored.
+                    let gem_files = if is_gem {
+                        Some(gem_ext::rollback_files(pkg_path, &patch.files).await)
+                    } else {
+                        None
+                    };
                     let mut result = rollback_package_patch(
                         common.read_scope(),
                         purl,
                         pkg_path,
-                        &patch.files,
+                        gem_files.as_ref().unwrap_or(&patch.files),
                         &blobs_path,
                         common.dry_run,
                     )
@@ -3634,14 +3659,11 @@ pub(crate) async fn rollback_patches_inner(
                     // A gem whose native extension `apply` rebuilt gets its
                     // original compiled extension back with its sources
                     // (#1996).
-                    if result.success
-                        && !common.dry_run
-                        && Ecosystem::from_purl(purl) == Some(Ecosystem::Gem)
-                    {
-                        use socket_patch_core::patch::gem_ext;
+                    if result.success && !common.dry_run && is_gem {
                         let env = gem_ext::RubyEnv {
                             cwd: common.cwd.clone(),
                             rebuild: !common.no_gem_native_rebuild,
+                            offline: common.offline,
                         };
                         if let Err(e) = gem_ext::restore_original_build(pkg_path, &env).await {
                             result.success = false;
@@ -3962,6 +3984,56 @@ async fn holds_patched_bytes(target: &CopyTarget, files: &HashMap<String, PatchF
         }
     }
     false
+}
+
+/// [`holds_patched_bytes`] for the copy of `purl` at `dir`, for a caller
+/// that holds a failed [`RollbackResult`] and not its target.
+pub(crate) async fn copy_holds_patched_bytes(
+    purl: &str,
+    dir: &Path,
+    files: &HashMap<String, PatchFileInfo>,
+) -> bool {
+    holds_patched_bytes(&CopyTarget::plain(purl, dir), files).await
+}
+
+/// Whether the copy at `dir` is one the record with `files` accounts for
+/// whole: every file is at the record's patched or original bytes (a file
+/// the patch adds may be absent) and at least one is at the patched
+/// bytes. A file at any other bytes, a missing original file, an unsafe
+/// key or an unreadable file makes it `false`.
+pub(crate) async fn copy_carries_record(
+    dir: &Path,
+    files: &HashMap<String, PatchFileInfo>,
+) -> bool {
+    let mut patched = false;
+    for (file, info) in files {
+        let rel = Path::new(file.strip_prefix("package/").unwrap_or(file));
+        if rel.as_os_str().is_empty()
+            || !rel
+                .components()
+                .all(|c| matches!(c, std::path::Component::Normal(_)))
+        {
+            return false;
+        }
+        match socket_patch_core::utils::fs::read_regular_to_bytes(&dir.join(rel)).await {
+            Ok(bytes) => {
+                let hash =
+                    socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes(&bytes);
+                if hash == info.after_hash {
+                    patched = true;
+                } else if hash != info.before_hash {
+                    return false;
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if !info.before_hash.is_empty() {
+                    return false;
+                }
+            }
+            Err(_) => return false,
+        }
+    }
+    patched
 }
 
 /// The key `file` of a Maven record as it is joined onto `dir`: a Gradle
@@ -6668,6 +6740,7 @@ mod tests {
                 "boom".to_string(),
             )],
             warnings: Vec::new(),
+            refreshed_installs: Default::default(),
             orphans_removed: Vec::new(),
         };
         let hosted = HostedLegOutcome {

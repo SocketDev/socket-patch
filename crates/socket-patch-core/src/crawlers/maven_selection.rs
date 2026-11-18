@@ -32,6 +32,18 @@
 //! through a property that is undefined or that a profile redefines, a
 //! profile that declares dependencies or management, a relocation, or a
 //! dependency cycle. A caller never pins on an uncertain answer.
+//!
+//! A file the local repository does not hold (the pom of an artifact the
+//! module resolves, a parent pom, an imported BOM, the version list of a
+//! range) weighs more than the other causes. A version range may be in
+//! what was not read, and a range binds at any depth, so a module with
+//! such a file missing never answers "selects the base version", however
+//! near the declaration that would win. It still answers "selects another
+//! version": that writes no new pin (the patch is skipped, and a pin of
+//! that version already there is taken out), so the worst a hidden range
+//! can do to it is a patch not applied. Resolving the project fills the
+//! files in. The other causes stay however often the project is resolved,
+//! and leave a declaration nearer the module than they are certain.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -103,6 +115,11 @@ struct Module {
     /// The depth from which the module's graph may hold artifacts that
     /// were not read, and why.
     unknown: Option<(usize, String)>,
+    /// Why part of what the module resolves was not read for want of a
+    /// file in the local repository. A version range may be in that part,
+    /// and a range binds at any depth, so the module is not known to
+    /// select the base version of any artifact.
+    uncached: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -179,14 +196,17 @@ impl MavenSelection {
                 .filter(|(from, _)| *from <= depth)
                 .map(|(_, why)| why.clone())
         };
+        // Whatever else is in doubt, a file the local repository lacks is
+        // the reason given: resolving the project comes first.
+        let because = |why: String| module.uncached.clone().unwrap_or(why);
         let Some(pick) = module.picks.get(&(group.to_string(), artifact.to_string())) else {
             return match unread(usize::MAX) {
-                Some(why) => Verdict::Undetermined(why),
+                Some(why) => Verdict::Undetermined(because(why)),
                 None => Verdict::Absent,
             };
         };
         if let Some(why) = pick.doubt.clone().or_else(|| unread(pick.depth)) {
-            return Verdict::Undetermined(why);
+            return Verdict::Undetermined(because(why));
         }
         let Some(version) = &pick.version else {
             return Verdict::Undetermined(format!(
@@ -195,6 +215,11 @@ impl MavenSelection {
         };
         let selected =
             version == base || split_socket_version(version).is_some_and(|(of, _)| of == base);
+        // A range in what the local repository lacks would overrule this
+        // version, and a pin of it would then move the build.
+        if let (true, Some(why)) = (selected, &module.uncached) {
+            return Verdict::Undetermined(why.clone());
+        }
         match (selected, pick.ranged) {
             (false, _) => Verdict::Other(version.clone()),
             (true, false) => Verdict::Selected,
@@ -282,6 +307,7 @@ impl MavenSelection {
                     })
                     .collect(),
                 unknown: None,
+                uncached: None,
             })
             .collect();
         MavenSelection {
@@ -439,6 +465,9 @@ struct Management {
     entries: HashMap<Key, Managed>,
     /// Why entries may be missing or different.
     incomplete: Option<String>,
+    /// The same when the cause is a pom the local repository does not
+    /// hold (a parent, an imported BOM).
+    uncached: Option<String>,
     /// What a profile manages: its version depends on the active profiles.
     profile_keys: HashSet<Key>,
 }
@@ -462,6 +491,9 @@ struct Deps {
     /// The same for declarations Maven follows only from the module that
     /// makes them (optional, `test` or `provided`).
     unknown_own: Option<String>,
+    /// Why a pom the local repository does not hold (a parent, an imported
+    /// BOM) may change these.
+    uncached: Option<String>,
 }
 
 /// A hard version requirement, as written.
@@ -488,6 +520,9 @@ struct Edge {
     /// A range that cannot be resolved: a hard requirement at any depth,
     /// so it leaves the artifact's selection undetermined however deep it is.
     hard: bool,
+    /// The version cannot be read for want of a file in the local
+    /// repository (the version list of its range).
+    uncached: bool,
 }
 
 /// A node's dependencies.
@@ -497,6 +532,9 @@ struct Expanded {
     /// Why the node may bring in artifacts that were not read, and how far
     /// below it they start (0: the node itself may be another artifact).
     unknown: Option<(usize, String)>,
+    /// The same when the cause is a file the local repository does not
+    /// hold.
+    uncached: Option<String>,
 }
 
 /// One surviving declaration of an artifact.
@@ -509,6 +547,7 @@ struct Item {
     exclusions: u32,
     leaf: bool,
     hard: bool,
+    uncached: bool,
 }
 
 impl Item {
@@ -522,6 +561,7 @@ impl Item {
             exclusions: edge.exclusions,
             leaf: edge.leaf,
             hard: edge.hard,
+            uncached: edge.uncached,
         }
     }
 }
@@ -730,25 +770,38 @@ impl Selector<'_> {
 
     /// The pom of `gav`: a module of the reactor, else the local
     /// repository's copy. A `<base>-socket.<hex8>` version no repository
-    /// holds reads its base version's pom, which it is a copy of.
+    /// holds reads its base version's pom, which it is a copy of. The
+    /// other way round too: a build pinned to such a copy fetches the
+    /// copy's pom and never the base version's.
     fn pom_of(&mut self, gav: &Gav) -> Option<Node> {
         if let Some(node) = self.reactor.get(gav) {
             return Some(node.clone());
         }
-        let found = self.walk.repo_pom(gav).and_then(|path| {
-            let model = self.walk.model(&path, false)?;
-            Some(Node {
-                model,
-                path,
-                local: false,
-            })
-        });
-        if found.is_some() {
-            return found;
+        if let Some(found) = self.repo_node(gav) {
+            return Some(found);
         }
-        let (base, _) = split_socket_version(&gav.2)?;
-        let base = (gav.0.clone(), gav.1.clone(), base.to_string());
-        self.pom_of(&base)
+        match split_socket_version(&gav.2) {
+            Some((base, _)) => {
+                let base = (gav.0.clone(), gav.1.clone(), base.to_string());
+                self.pom_of(&base)
+            }
+            None => self
+                .walk
+                .socket_copies(gav)
+                .iter()
+                .find_map(|copy| self.repo_node(copy)),
+        }
+    }
+
+    /// The local repository's pom of `gav`.
+    fn repo_node(&mut self, gav: &Gav) -> Option<Node> {
+        let path = self.walk.repo_pom(gav)?;
+        let model = self.walk.model(&path, false)?;
+        Some(Node {
+            model,
+            path,
+            local: false,
+        })
     }
 
     /// Why `chain` is not the whole parent chain of its head.
@@ -808,6 +861,7 @@ impl Selector<'_> {
         }
         let mut out = Management {
             incomplete: Self::chain_gap(chain),
+            uncached: Self::chain_gap(chain),
             ..Management::default()
         };
         // A BOM that imports itself, or imports nested too deep.
@@ -870,10 +924,12 @@ impl Selector<'_> {
                 }
             };
             let Some(node) = self.pom_of(&gav) else {
-                out.incomplete = Some(format!(
+                let why = format!(
                     "the BOM {}:{}:{} is not in the local Maven repository",
                     gav.0, gav.1, gav.2
-                ));
+                );
+                out.uncached.get_or_insert_with(|| why.clone());
+                out.incomplete = Some(why);
                 continue;
             };
             let bom = self.walk.chain(node);
@@ -887,6 +943,9 @@ impl Selector<'_> {
                 .extend(imported.profile_keys.iter().cloned());
             if out.incomplete.is_none() {
                 out.incomplete = imported.incomplete.clone();
+            }
+            if out.uncached.is_none() {
+                out.uncached = imported.uncached.clone();
             }
         }
         self.managing.remove(&path);
@@ -911,6 +970,7 @@ impl Selector<'_> {
             deps: Vec::new(),
             unknown: Self::chain_gap(chain),
             unknown_own: None,
+            uncached: management.uncached.clone(),
         };
         let mut seen = HashSet::new();
         for node in chain {
@@ -998,8 +1058,15 @@ impl Selector<'_> {
         if let Some(found) = self.listed.get(ga) {
             return found.clone();
         }
-        let safe =
-            |s: &str| !s.is_empty() && !s.contains(['/', '\\', '$', '{', '}']) && !s.contains("..");
+        // A leading or trailing `.` would turn into a `/` that roots the
+        // path outside the repository; `:` would name a Windows drive.
+        let safe = |s: &str| {
+            !s.is_empty()
+                && !s.starts_with('.')
+                && !s.ends_with('.')
+                && !s.contains(['/', '\\', ':', '$', '{', '}'])
+                && !s.contains("..")
+        };
         let mut versions: Option<Vec<String>> = None;
         let mut foreign: Vec<String> = Vec::new();
         if safe(&ga.0) && safe(&ga.1) {
@@ -1064,11 +1131,26 @@ impl Selector<'_> {
             exclusions,
             leaf,
             hard: false,
+            uncached: false,
         };
         // A range Maven obeys but this model cannot resolve.
         let hard = |why: String| {
             vec![Edge {
                 hard: true,
+                ..edge(0, Ver::Unknown(why), None)
+            }]
+        };
+        // The same for want of a version list. Resolving the project
+        // fetches one, except for a module of the reactor: Maven lists
+        // that from the build itself.
+        let in_reactor = self
+            .reactor
+            .keys()
+            .any(|(g, a, _)| *g == key.group && *a == key.artifact);
+        let unlisted = |why: String| {
+            vec![Edge {
+                hard: true,
+                uncached: !in_reactor,
                 ..edge(0, Ver::Unknown(why), None)
             }]
         };
@@ -1101,7 +1183,7 @@ impl Selector<'_> {
                      no versions of it",
                     ga.0, ga.1
                 );
-                return hard(why);
+                return unlisted(why);
             }
             Err(why) => {
                 let why = format!("{why}, so the range {raw} cannot be resolved");
@@ -1118,7 +1200,7 @@ impl Selector<'_> {
                 "no version of {}:{} the local Maven repository lists is in the range {}",
                 ga.0, ga.1, range.raw
             );
-            return hard(why);
+            return unlisted(why);
         }
         within
             .into_iter()
@@ -1139,6 +1221,7 @@ impl Selector<'_> {
                 .or_else(|| deps.unknown_own.clone())
                 .or_else(|| root.incomplete.clone())
                 .map(|why| (1, why)),
+            uncached: deps.uncached.clone(),
         };
         for (slot, dep) in deps.deps.iter().enumerate() {
             let mut exclusions: BTreeSet<Ga> = dep.exclusions.iter().cloned().collect();
@@ -1161,15 +1244,14 @@ impl Selector<'_> {
         }
         let gav = (key.group.clone(), key.artifact.clone(), version.to_string());
         let Some(node) = self.pom_of(&gav) else {
+            let why = format!(
+                "the pom of {}:{}:{version} is not in the local Maven repository",
+                key.group, key.artifact
+            );
             return Expanded {
                 edges: Vec::new(),
-                unknown: Some((
-                    1,
-                    format!(
-                        "the pom of {}:{}:{version} is not in the local Maven repository",
-                        key.group, key.artifact
-                    ),
-                )),
+                unknown: Some((1, why.clone())),
+                uncached: Some(why),
             };
         };
         // Maven builds the artifact the stub names in its place.
@@ -1183,6 +1265,7 @@ impl Selector<'_> {
                         key.group, key.artifact
                     ),
                 )),
+                uncached: None,
             };
         }
         let chain = self.walk.chain(node);
@@ -1196,6 +1279,7 @@ impl Selector<'_> {
         let mut out = Expanded {
             edges: Vec::new(),
             unknown: deps.unknown.clone().map(|why| (1, why)),
+            uncached: deps.uncached.clone(),
         };
         for (slot, dep) in deps.deps.iter().enumerate() {
             if matches!(dep.scope.as_str(), "test" | "provided") || dep.optional || excluded(dep) {
@@ -1234,6 +1318,7 @@ impl Selector<'_> {
             pom,
             picks: HashMap::new(),
             unknown: direct.unknown.clone(),
+            uncached: direct.uncached.clone(),
         };
 
         // Every distinct node, for the order artifacts are settled in: an
@@ -1326,6 +1411,9 @@ impl Selector<'_> {
         for item in &items {
             if let Ver::Unknown(why) = &item.version {
                 note(module, item.path.len() + 1, why);
+                if item.uncached && module.uncached.is_none() {
+                    module.uncached = Some(why.clone());
+                }
                 if item.hard && hard.is_none() {
                     hard = Some(why.clone());
                 }
@@ -1361,6 +1449,9 @@ impl Selector<'_> {
                 };
                 if let Some((offset, why)) = &below.unknown {
                     note(module, depth + offset, why);
+                }
+                if module.uncached.is_none() {
+                    module.uncached = below.uncached.clone();
                 }
                 for edge in &below.edges {
                     pending

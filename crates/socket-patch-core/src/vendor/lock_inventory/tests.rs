@@ -1518,13 +1518,14 @@ const BUN_LOCK: &str = r#"{
 
 #[tokio::test]
 async fn bun_registry_tuples_parse_and_locals_are_skipped() {
-    // lockfileVersion 0 (bun 1.1.39–1.1.45 text opt-in), 1 (bun 1.2/1.3)
-    // and 2 (bun 1.4) share one registry-tuple grammar, so inventory
-    // must read all three identically. The workspace entries carry the
+    // lockfileVersion 0 (bun 1.1.39–1.1.45 text opt-in), 1 (bun 1.2/1.3),
+    // 2 (bun 1.4) and 3 (bun 1.4 with a nested override or a path
+    // resolution) share one registry-tuple grammar, so inventory must read
+    // all four identically. The workspace entries carry the
     // real v0 spelling — a 2-tuple with the member's deps object
     // (`{}` when dep-less) — and are skipped like every non-registry
     // shape.
-    for version in [0u64, 1, 2] {
+    for version in [0u64, 1, 2, 3] {
         let lock = BUN_LOCK.replace(
             "\"lockfileVersion\": 1,",
             &format!("\"lockfileVersion\": {version},"),
@@ -1551,16 +1552,56 @@ async fn bun_registry_tuples_parse_and_locals_are_skipped() {
         assert_eq!(entries.len(), 2, "lockfileVersion {version}: {entries:?}");
     }
 
-    // An unsupported lockfileVersion (a future 3) yields no inventory at
-    // all — fail closed, same posture as the vendor/redirect gates.
-    let lock = BUN_LOCK.replace("\"lockfileVersion\": 1,", "\"lockfileVersion\": 3,");
+    // An unsupported lockfileVersion (a future 4) yields no inventory at
+    // all — fail closed, same posture as the vendor/redirect gates — and
+    // says so: the lock lists packages nobody read, which a scan of a
+    // checkout without node_modules must not report as "no packages".
+    let lock = BUN_LOCK.replace("\"lockfileVersion\": 1,", "\"lockfileVersion\": 4,");
     assert_ne!(lock, BUN_LOCK, "replacement must hit");
     let tmp = tempfile::tempdir().unwrap();
     write(tmp.path(), "bun.lock", &lock).await;
+    let refusal = inventory_npm_lock(tmp.path())
+        .await
+        .expect_err("a lockfileVersion-4 bun.lock must not be inventoried");
+    assert_eq!(refusal.code, "bun_lock_unsupported");
     assert!(
-        inventory_npm_lock(tmp.path()).await.unwrap().is_none(),
-        "a lockfileVersion-3 bun.lock must not be inventoried"
+        refusal.detail.contains("lockfileVersion 4")
+            && refusal.detail.contains("update socket-patch")
+            && refusal.detail.contains("NOT read from the lockfile"),
+        "{}",
+        refusal.detail
     );
+    let (entries, unsupported) = inventory_project_diagnosed(tmp.path()).await;
+    assert!(entries.is_empty(), "{entries:?}");
+    assert_eq!(
+        unsupported.iter().map(|u| u.code).collect::<Vec<_>>(),
+        ["bun_lock_unsupported"]
+    );
+
+    // A `packages` section out of Bun's emitted shape (a comment line Bun
+    // itself accepts) is refused the same way, never read as empty.
+    let commented = BUN_LOCK.replace(
+        "  \"packages\": {\n",
+        "  \"packages\": {\n    // a comment\n",
+    );
+    assert_ne!(commented, BUN_LOCK, "replacement must hit");
+    let tmp = tempfile::tempdir().unwrap();
+    write(tmp.path(), "bun.lock", &commented).await;
+    let refusal = inventory_npm_lock(tmp.path())
+        .await
+        .expect_err("a bun.lock outside the line grammar must not be inventoried");
+    assert_eq!(refusal.code, "bun_lock_unsupported");
+    assert!(
+        refusal.detail.starts_with("bun.lock: "),
+        "{}",
+        refusal.detail
+    );
+
+    // A lock with no `packages` object at all is an empty project, quietly.
+    let tmp = tempfile::tempdir().unwrap();
+    write(tmp.path(), "bun.lock", "{\n  \"lockfileVersion\": 1,\n}\n").await;
+    let (_, entries) = inventory_npm_lock(tmp.path()).await.unwrap().unwrap();
+    assert!(entries.is_empty(), "{entries:?}");
 }
 
 // ── shared semantics ──────────────────────────────────────────────────
@@ -3061,6 +3102,7 @@ async fn bun_text_hosted_pins_inventory_as_their_registry_package() {
         "lock-v2",
         "lock-v2-crlf",
         "lock-v2-workspace-nested",
+        "lock-v3-nested-overrides",
         "nested-entry",
         "re-redirect-stale-url",
     ] {
@@ -4200,13 +4242,31 @@ fn unsupported_layout_warnings_rewrites_known_codes_and_forwards_unknown_ones() 
 ///   re-resolves the entry from the registry's own metadata and never
 ///   reads the hosted pin's URL or hash, the JVM backend's Maven
 ///   Central fetches (`maven_repo`, `jvm_jar`), whose URLs are built from
-///   coordinates and checked against the upstream checksum files, and the
+///   coordinates and checked against the upstream checksum files, the
 ///   gem refresh after a hosted unwind (`patch::gem_refresh`), which
 ///   fetches `<rubygems base>/gems/<name>-<version>.gem`, a URL built from
 ///   the gem's name and version, and uses the bytes only when their sha256
 ///   is the one the restore re-pinned from the registry's compact index
 ///   (`upstream::gem::upstream_archive`); a lock still on its hosted entry
-///   yields no URL at all.
+///   yields no URL at all; and the source gem an agent-mode native
+///   extension is rebuilt from (`patch::gem_source`), with the gems its
+///   build lacks: `<rubygems base>/gems/<name>-<version>.gem` and
+///   `<rubygems base>/info/<name>`, URLs built from the installed gem's
+///   name and version (a build dependency's from the name the source gem's
+///   own metadata gives), with the bytes used only when their sha256 is
+///   the one the registry's compact index records. That module reads the
+///   lock for one thing, to withhold the download: a gem the lock resolves
+///   from any other source (a Socket-hosted entry among them) is fetched
+///   from nowhere. The lock's `remote:` and `CHECKSUMS` never become a URL
+///   or an expected hash.
+///
+/// The gem downloads (the refresh, the source gem and its build's gems)
+/// are installed or built as fetched, so they and the compact index
+/// checksum they are verified against (`UpstreamClient::rubygems_sha256`)
+/// go through `registry_fetch::SecureRegistryClient`: the same `download`,
+/// refused unless the URL is `https` or plain `http` to this machine, with
+/// no redirect followed out of `https`. Its method is named `download`
+/// too, so a new caller of it is a reference this check sees.
 ///
 /// [`PINNED_REFERENCES`] lists every production reference to those three
 /// functions in this crate, by file and line text. What the check catches:
@@ -4220,10 +4280,32 @@ fn unsupported_layout_warnings_rewrites_known_codes_and_forwards_unknown_ones() 
 /// Those stay a review matter: read the pristine source from the
 /// registry, never from a lock entry that might be Socket-hosted.
 const PINNED_REFERENCES: &[(&str, &str, &str)] = &[
+    // `SecureRegistryClient::download`: the one `download` behind every
+    // gem that is installed or built as fetched, and behind its checksum.
+    (
+        "vendor/registry_fetch.rs",
+        "download",
+        "download(client, url.as_str()).await",
+    ),
     (
         "patch/gem_refresh.rs",
         "download",
-        "crate::vendor::registry_fetch::download(&client, url).await",
+        "Source::Registry(registry) => registry.download(url).await,",
+    ),
+    // The source gem of a native-extension rebuild, and a gem its build
+    // lacks: the registry's compact index document, then the archive it
+    // names by sha256 (`GemSource::get`, the module's one request). Never
+    // a URL or a hash out of the lock.
+    (
+        "patch/gem_source.rs",
+        "download",
+        "registry.download(url).await",
+    ),
+    // `rubygems_sha256`: the compact index document of the gem's name.
+    (
+        "patch/redirect/upstream/client.rs",
+        "download",
+        "registry.download(&url).await?",
     ),
     (
         "patch/redirect/upstream/client.rs",

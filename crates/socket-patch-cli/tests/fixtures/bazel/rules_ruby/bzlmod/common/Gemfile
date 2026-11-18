@@ -1,0 +1,4 @@
+source "https://rubygems.org/"
+
+gem "sp-victim", "1.0.0"
+gem "sp-other", "1.0.0"

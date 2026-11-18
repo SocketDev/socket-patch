@@ -68,6 +68,19 @@ impl Bundler {
         argv.extend(["--local".into(), key.into(), value.into()]);
         argv
     }
+
+    /// `bundle clean` on this bundler, run by a Ruby of major version
+    /// `ruby_major`, names a stale gem directory (`Removing rack (3.2.8)`),
+    /// exits 0 and leaves it on disk unless it is empty. The FileUtils copy
+    /// bundler vendors before 2.1 lists a directory with a positional
+    /// options hash (`Dir.entries(path, {})` in 1.17, `Dir.children(path,
+    /// opts)` in 2.0); Ruby >= 3.0 rejects it, so the directory's contents
+    /// are never visited and `rm_rf` swallows the failed `rmdir`. 2.1 passes
+    /// `**opts`. Stale files (`cache/*.gem`, `specifications/*.gemspec`)
+    /// are still deleted.
+    pub fn clean_leaves_directories(&self, ruby_major: u32) -> bool {
+        !self.at_least(2, 1) && ruby_major >= 3
+    }
 }
 
 /// Parse `bundle --version` stdout: `Bundler version 2.7.2` (bundler < 4)
@@ -188,5 +201,10 @@ mod bundler_e2e_selftest {
             b.config_local_args("path", "vendor/bundle"),
             ["config", "set", "--local", "path", "vendor/bundle"]
         );
+        let b1 = parse_version("Bundler version 1.17.3").unwrap();
+        assert!(b1.clean_leaves_directories(3) && !b1.clean_leaves_directories(2));
+        assert!(old.clean_leaves_directories(3));
+        let fixed = parse_version("Bundler version 2.1.4").unwrap();
+        assert!(!fixed.clean_leaves_directories(3) && !b.clean_leaves_directories(3));
     }
 }
