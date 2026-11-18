@@ -99,31 +99,6 @@ impl GemId {
     }
 }
 
-/// `url` without the `user:password@` of its authority. A lock names a gem
-/// server without the credentials Bundler keeps in its own config, while
-/// `SOCKET_RUBYGEMS_URL` carries them: both name one server.
-fn without_userinfo(url: &str) -> String {
-    let Some((scheme, rest)) = url.split_once("://") else {
-        return url.to_string();
-    };
-    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-    match rest[..authority_end].rfind('@') {
-        Some(at) => format!("{scheme}://{}", &rest[at + 1..]),
-        None => url.to_string(),
-    }
-}
-
-/// Whether `remote`, a lock's `remote:`, is the default registry
-/// ([`is_rubygems_remote`]), with or without the credentials
-/// `SOCKET_RUBYGEMS_URL` names it with.
-fn is_registry_remote(remote: &str) -> bool {
-    is_rubygems_remote(remote)
-        || crate::formats::gem::same_remote(
-            &without_userinfo(remote),
-            &without_userinfo(&rubygems_base()),
-        )
-}
-
 /// Whether `source`, a lock's source as [`resolved_elsewhere`] names it,
 /// is a gem server that could be a mirror of the registry and could be
 /// named in `SOCKET_RUBYGEMS_URL`: reached over https (a download is taken
@@ -146,7 +121,7 @@ pub(crate) fn resolved_elsewhere(lock: &str) -> HashMap<String, String> {
         let source = if section.header == "GEM" {
             match section
                 .remote_bases()
-                .find(|remote| !is_registry_remote(remote))
+                .find(|remote| !is_rubygems_remote(remote))
             {
                 Some(remote) => crate::utils::redact::redact_urls_in(remote).into_owned(),
                 None => continue,
@@ -813,7 +788,7 @@ mod tests {
             ),
             ("not a url", "not a url"),
         ] {
-            assert_eq!(without_userinfo(with), without);
+            assert_eq!(crate::utils::redact::strip_url_userinfo(with), without);
         }
         assert!(may_be_a_mirror("https://gems.example.test/api/gems"));
         assert!(may_be_a_mirror(

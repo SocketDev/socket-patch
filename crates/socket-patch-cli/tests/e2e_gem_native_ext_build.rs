@@ -1887,7 +1887,7 @@ fn a_build_that_reads_nothing_of_the_patch_writes_it_and_attests_nothing() {
     let warning = not_rebuilt_warning(&stdout);
     for needle in [
         "the patch's files were written",
-        "without reading any file the patch changes",
+        "without reading any of those files",
         PATCH_REL,
         "vex does not attest the patch",
     ] {
@@ -1916,7 +1916,7 @@ fn a_build_that_reads_nothing_of_the_patch_writes_it_and_attests_nothing() {
     let (code, stdout, stderr) = ruby.run(&proj, &["apply", "--json", "--offline"], &[]);
     assert_eq!(code, 0, "{stdout}\n{stderr}");
     assert!(
-        not_rebuilt_warning(&stdout).contains("without reading any file the patch changes"),
+        not_rebuilt_warning(&stdout).contains("without reading any of those files"),
         "{stdout}"
     );
     assert_tree(&proj.join("vendor"), &written, "after a second apply");
@@ -1997,7 +1997,7 @@ fn an_in_place_build_that_reads_nothing_of_the_patch_keeps_the_previous_build() 
     assert_eq!(event_action(&stdout), "applied", "{stdout}");
     let warning = not_rebuilt_warning(&stdout);
     assert!(
-        warning.contains("without reading any file the patch changes")
+        warning.contains("without reading any of those files")
             && warning.contains("vex does not attest the patch"),
         "{stdout}"
     );

@@ -28,7 +28,8 @@
 #            1.6.7). nokogiri's build applies it to its vendored libxml2 and
 #            compiles the patch's name into the extension. An install built
 #            with `--use-system-libraries` compiles no vendored libxml2, so
-#            there the record must be refused and nothing written.
+#            there the record's file is written, `apply` says that nothing
+#            compiles it, and nothing attests it.
 #
 # Each scenario runs `apply --check` (not in sync), `apply`, a load of
 # nokogiri through `bundle exec` in a fresh Ruby, `apply --check` (in sync),
@@ -155,7 +156,7 @@ class NokogiriE2E
   end
 
   # The CLI, as a CI job runs it: no saved login, no update check, and with
-  # `--no-build` the PATH this script was started with stripped of every
+  # `--hide-toolchain` the PATH this script was started with stripped of every
   # directory that holds a compiler (see `strip_toolchain`).
   def sp(*args)
     env = {

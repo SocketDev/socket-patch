@@ -1238,7 +1238,8 @@ fn took(elapsed: Duration) -> String {
 }
 
 /// Run a build of `copy`'s extension (`run`, `from`: "its source gem with
-/// the patch applied"), saying when it starts and how it ended
+/// the patch applied", "its patched gem"), saying when it starts and how it
+/// ended
 /// ([`RubyEnv::progress`]). What the build was worth is the caller's to
 /// say: one that exits cleanly may still have built nothing of the patch.
 async fn run_build(
@@ -2185,7 +2186,7 @@ pub(crate) async fn install_staged(
         archive,
         stage_home,
     };
-    let stdout = run_ruby(&probe.ruby, run, &copy, env, BUILD_TIMEOUT).await?;
+    let stdout = run_build(&probe, run, &copy, env, "its patched gem").await?;
     let (full_name, built) = parse_installed(&stdout)
         .ok_or_else(|| format!("{}: unreadable install output", probe.ruby.display()))?;
     let staged = StagedInstall {
@@ -3144,23 +3145,15 @@ fn unread_inputs(gem_dir: &Path, watch: &InputWatch, probe_dir: &Path) -> Option
     Some(watch.inputs.clone())
 }
 
-/// What is said of a build that read none of the record's inputs.
-fn unread_detail(unread: &[String]) -> String {
-    let shown = unread.iter().take(3).cloned().collect::<Vec<_>>();
-    let more = match unread.len().saturating_sub(shown.len()) {
-        0 => String::new(),
-        n => format!(" and {n} more"),
-    };
-    format!(
-        "the build exited cleanly without reading any file the patch changes ({}{more}), so \
-         nothing of the patch is compiled into the extension: this install's build does not \
-         use them. A gem set up to build against the system's copy of a library it packs \
-         (`--use-system-libraries`) does this to a patch for the packed copy (what the install \
-         runs is then the operating system's library, and updating that package is what fixes \
-         it), and so does a gem whose build downloads the binary it runs",
-        shown.join(", ")
-    )
-}
+/// What is said of a build that read none of the record's build inputs,
+/// after a message that has just listed them.
+const NOT_READ: &str = "the build exited cleanly without reading any of those files, so nothing \
+                        of the patch is compiled into the extension: this install's build does \
+                        not use them. A gem set up to build against the system's copy of a \
+                        library it packs (`--use-system-libraries`) does this to a patch for the \
+                        packed copy (what the install runs is then the operating system's \
+                        library, and updating that package is what fixes it), and so does a gem \
+                        whose build downloads the binary it runs";
 
 /// What is said of a build that exited cleanly and left no compiled file.
 const NOTHING_BUILT: &str = "the build exited cleanly and left no compiled file to put where \
@@ -3382,7 +3375,7 @@ async fn rebuild(
                     // read nothing either, and a fresh build would: that
                     // is the failure to name.
                     (Some(why), _) => Err(NotRebuilt::Failed(why)),
-                    (None, Some(unread)) => Err(NotRebuilt::NotOfPatch(unread_detail(&unread))),
+                    (None, Some(_)) => Err(NotRebuilt::NotOfPatch(NOT_READ.to_string())),
                     // A record's build that leaves no compiled code has
                     // nothing for the record to be in (#2144). A rollback's
                     // (no record) leaves the gem as its install did.
@@ -3658,7 +3651,7 @@ enum StageFailure {
     /// The build read none of the record's build inputs ([`unread_inputs`]):
     /// it is no build of the patch, and neither would one of the installed
     /// tree be.
-    NotRead(Vec<String>),
+    NotRead,
     /// The build leaves what Ruby loads in the gem's own tree
     /// ([`in_tree_products`]), where a build staged elsewhere cannot stand
     /// in for it.
@@ -3688,7 +3681,7 @@ impl StageFailure {
             StageFailure::Build(diagnostic) => {
                 format!("the source gem did not build:\n{diagnostic}")
             }
-            StageFailure::NotRead(unread) => unread_detail(unread),
+            StageFailure::NotRead => NOT_READ.to_string(),
             StageFailure::InTree { products, .. } => format!(
                 "the source gem's build leaves {} in the gem's own tree, which is where it is \
                  loaded from, and a build staged elsewhere cannot take its place",
@@ -3950,6 +3943,12 @@ async fn stage_dependencies(
                 stage_home: &stage.home,
             };
             stage.beat();
+            // A gem the build needs may have an extension of its own.
+            env.say(&format!(
+                "Installing {} into the build stage: the build of {} needs it.",
+                id.full_name(),
+                copy.full_name
+            ));
             let stdout = run_ruby(&probe.ruby, run, copy, env, BUILD_TIMEOUT)
                 .await
                 .map_err(|why| format!("{needed} and did not install into the stage:\n{why}"))?;
@@ -4180,8 +4179,8 @@ async fn build_in_stage(
         let (gem_dir, root) = (staged.gem_dir.clone(), stage.root.clone());
         let unread =
             crate::utils::fs::run_blocking(move || unread_inputs(&gem_dir, &watch, &root)).await;
-        if let Some(unread) = unread {
-            return Err(StageFailure::NotRead(unread));
+        if unread.is_some() {
+            return Err(StageFailure::NotRead);
         }
     }
     let reported = tagged_lines(&stdout, "sp_built")
@@ -5331,10 +5330,7 @@ pub async fn apply_gem_package_patch(
         StageFailure::Busy(why) => unbuildable(why),
         // A build of the installed tree would read as little: the patch's
         // native part has nothing to take effect in on this install.
-        StageFailure::NotRead(unread) => {
-            job.write_without_build(&absent, &unread_detail(&unread))
-                .await
-        }
+        StageFailure::NotRead => job.write_without_build(&absent, NOT_READ).await,
         // A gem RubyGems built can still be built where it is installed,
         // as it was before there was a stage: nothing was written yet.
         failure if !precompiled => {
@@ -6755,7 +6751,6 @@ mod tests {
             unread_inputs(&gem_dir, &watch, tmp.path()),
             Some(both.to_vec())
         );
-        assert!(unread_detail(&both).contains("ext/a/a.c, patches/lib/0001.patch"));
 
         // One read is a build of something the patch changes.
         let watch = watch_inputs(&gem_dir, &scope);
