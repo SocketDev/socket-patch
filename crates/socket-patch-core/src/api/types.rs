@@ -182,13 +182,22 @@ pub struct PackageVendorResult {
 }
 
 /// One served artifact: the native tarball (`kind: "tarball"`), or a
-/// second artifact — npm's yarn-berry cache zip (`kind: "yarn-berry-zip"`) or
-/// gem's path-source stub gemspec (`kind: "gem-stub-gemspec"`). `url` is null
-/// only when the artifact isn't stored yet (e.g. an unbuilt berry zip).
+/// second artifact — npm's yarn-berry cache zip (`kind: "yarn-berry-zip"`),
+/// gem's path-source stub gemspec (`kind: "gem-stub-gemspec"`), or, per
+/// platform a gem patch has a prebuild for, the patched platform gem
+/// (`kind: "gem-platform"`) and its stub gemspec
+/// (`kind: "gem-platform-stub-gemspec"`). `url` is null only when the
+/// artifact isn't stored yet (e.g. an unbuilt berry zip).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PackageVendorArtifact {
     pub kind: String,
+    /// The gem platform the artifact is for (`x86_64-linux-gnu`,
+    /// `arm64-darwin`, `java`: `Gem::Platform#to_s` as `Gemfile.lock`
+    /// spells it, never `ruby`). Present exactly on the two `gem-platform*`
+    /// kinds; a patch with no prebuild serves neither.
+    #[serde(default)]
+    pub platform: Option<String>,
     #[serde(default)]
     pub url: Option<String>,
     /// Every ecosystem's tarball populates `sha512` (npm SRI form
@@ -347,6 +356,47 @@ mod tests {
                     "title": "Patch one"
                 }]
             })
+        );
+    }
+
+    /// A gem patch with prebuilds serves, beside the ruby gem's `tarball`
+    /// and stub, one `gem-platform` gem and stub per built platform; the
+    /// artifacts every patch served before carry no `platform`.
+    #[test]
+    fn package_vendor_result_reads_the_gem_platform_artifacts() {
+        let json = r#"{
+            "status": "granted",
+            "purl": "pkg:gem/nokogiri@1.18.10?platform=ruby",
+            "url": "https://patch.example/nokogiri-1.18.10.gem",
+            "artifacts": [
+                { "kind": "tarball", "url": "https://patch.example/nokogiri-1.18.10.gem",
+                  "integrity": { "sha512": "sha512-ruby" } },
+                { "kind": "gem-platform", "platform": "x86_64-linux-gnu",
+                  "url": "https://patch.example/nokogiri-1.18.10-x86_64-linux-gnu.gem",
+                  "contentType": "application/octet-stream", "sizeBytes": 4000000,
+                  "integrity": { "sha512": "sha512-prebuild" } },
+                { "kind": "gem-platform-stub-gemspec", "platform": "x86_64-linux-gnu",
+                  "url": "https://patch.example/nokogiri-1.18.10-x86_64-linux-gnu.gemspec",
+                  "integrity": { "sha512": "sha512-stub" } }
+            ]
+        }"#;
+        let result: PackageVendorResult = serde_json::from_str(json).unwrap();
+        let artifacts = result.artifacts.unwrap();
+        let seen: Vec<(&str, Option<&str>)> = artifacts
+            .iter()
+            .map(|a| (a.kind.as_str(), a.platform.as_deref()))
+            .collect();
+        assert_eq!(
+            seen,
+            [
+                ("tarball", None),
+                ("gem-platform", Some("x86_64-linux-gnu")),
+                ("gem-platform-stub-gemspec", Some("x86_64-linux-gnu")),
+            ]
+        );
+        assert_eq!(
+            artifacts[1].integrity.sha512.as_deref(),
+            Some("sha512-prebuild")
         );
     }
 
