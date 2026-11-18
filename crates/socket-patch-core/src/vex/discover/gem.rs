@@ -628,10 +628,13 @@ pub async fn manifest_source_pins(view: &ProjectView<'_>) -> Vec<(String, String
         {
             continue;
         }
+        // Any build names the version: a gem locked as precompiled
+        // platform builds has no ruby-platform spec to read it from, and a
+        // hosted pin of one is a recorded pin like any other.
         let versions: BTreeSet<&str> = locked
             .gem_sections()
             .flat_map(|section| section.specs.iter().filter_map(|line| line.parsed))
-            .filter(|spec| spec.name == name && spec.platform.is_none())
+            .filter(|spec| spec.name == name)
             .map(|spec| spec.version)
             .collect();
         if let [version] = versions.into_iter().collect::<Vec<_>>().as_slice() {
@@ -1765,6 +1768,32 @@ mod tests {
                 Some(true)
             );
         }
+    }
+
+    /// The rollout's recorded view reads a hosted pin from the manifest's
+    /// `source:` option and takes the version from the lock. A gem the lock
+    /// names only as platform builds has no ruby-platform spec to take it
+    /// from: any build names the version, or the pin is never recorded and
+    /// every capped re-scan spends a slot on it again. Builds of two
+    /// versions still name none.
+    #[tokio::test]
+    async fn platform_only_gem_is_a_manifest_source_pin() {
+        let gemfile = manifest(&[hosted_decl("nokogiri", UUID_A)]);
+        for ruby in [false, true] {
+            let lock = platform_builds_lock(ruby, None);
+            let pins = manifest_pins(&[("Gemfile", &gemfile), ("Gemfile.lock", &lock)]).await;
+            assert_eq!(
+                pins,
+                [("pkg:gem/nokogiri@1.18.10".to_string(), UUID_A.to_string())],
+                "ruby entry beside the builds: {ruby}"
+            );
+        }
+        let two_versions = platform_builds_lock(false, None).replace(
+            "nokogiri (1.18.10-x86_64-linux-gnu)",
+            "nokogiri (1.18.9-x86_64-linux-gnu)",
+        );
+        let pins = manifest_pins(&[("Gemfile", &gemfile), ("Gemfile.lock", &two_versions)]).await;
+        assert!(pins.is_empty(), "{pins:?}");
     }
 
     /// A platform build is hosted wiring only in a Socket section of the
