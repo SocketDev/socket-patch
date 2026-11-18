@@ -1995,6 +1995,21 @@ A shared gem home also holds gem versions this project doesn't use: the gems Rub
 mode warns `redirect_gem_version_not_locked`, vendored mode reports a `skipped` event with
 `vendor_gem_version_not_locked` and doesn't download its patch. The run exits 0.
 
+## Ruby gems: gems vendored mode refuses
+
+Vendored mode rewrites one top-level `gem` line to a `path:` source, and Bundler builds nothing
+for a path-sourced gem. It refuses a gem that doesn't fit and changes nothing for it; the
+other gems of the run are still vendored, and the run exits 1. Each error names the way out:
+
+| Code | The gem | What to do |
+|---|---|---|
+| `gemfile_declaration_not_editable` | is declared inside a block: `group :test do`, `platforms … do`, a conditional. Every Rails Gemfile declares its development and test gems this way. | Declare it at the top level with the `group:` option (`gem "capybara", group: :test`), or run `socket-patch scan --mode hosted`, which patches a gem inside a block. |
+| `native_extensions_unsupported` | builds a native extension (puma, bootsnap). | Run `socket-patch scan --mode hosted` or `socket-patch scan --mode agent`. Both build the extension. |
+| `platform_gem_unsupported` | is installed as a precompiled platform build (`nokogiri-1.18.3-x86_64-linux-gnu`). | Run `socket-patch scan --mode agent`. Hosted mode refuses a precompiled build too. |
+
+A hosted scan run after the vendored one patches the gems it can and leaves the vendored gems as
+they are.
+
 ## Ruby gems: native extensions
 
 Some gem fixes change only what a native extension is built from: its C sources
@@ -2007,7 +2022,7 @@ How each mode gets the patched code running:
 | Mode | What happens |
 |---|---|
 | Hosted | Bundler installs the patched `.gem` from the patch registry, and RubyGems compiles it like any registry gem. A precompiled platform gem (`x86_64-linux`) is refused with `redirect_gem_platform_unsupported`. |
-| Vendored | Refused with `native_extensions_unsupported`: Bundler builds no extensions for path-sourced gems. |
+| Vendored | Refused with `native_extensions_unsupported`: Bundler builds no extensions for path-sourced gems. Use hosted or agent mode for the gem. |
 | Agent (`apply`) | The extension is rebuilt from the gem's source archive with the patch laid over it, using RubyGems' builder and the Ruby that owns the install, and the build is put where Ruby loads it: the extension directory of a gem RubyGems built, the prebuilt binary of a precompiled gem. |
 
 `apply` takes the source gem (`<name>-<version>.gem`) from the gem home's `cache/` directory,

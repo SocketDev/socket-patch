@@ -392,7 +392,7 @@ async fn gem_prelude(
             return Err(refused(
                 "platform_gem_unsupported",
                 format!(
-                    "`{name}@{version}` is a platform-specific gem build (`platform={platform}`); precompiled platform gems cannot be vendored portably"
+                    "`{name}@{version}` is a platform-specific gem build (`platform={platform}`); precompiled platform gems cannot be vendored portably. {PLATFORM_GEM_REMEDY}"
                 ),
             ));
         }
@@ -412,7 +412,7 @@ async fn gem_prelude(
         return Err(refused(
             "platform_gem_unsupported",
             format!(
-                "installed dir `{dir_name}` is not the portable `{leaf}` gem (platform-specific or unexpected gem builds cannot be vendored portably)"
+                "installed dir `{dir_name}` is not the portable `{leaf}` gem (platform-specific or unexpected gem builds cannot be vendored portably). {PLATFORM_GEM_REMEDY}"
             ),
         ));
     }
@@ -489,7 +489,7 @@ async fn gem_prelude(
             return Err(refused(
                 "native_extensions_unsupported",
                 format!(
-                    "{leaf}.gemspec declares native extensions; bundler does not build extensions for path-sourced gems"
+                    "{leaf}.gemspec declares native extensions; bundler does not build extensions for path-sourced gems. {NATIVE_EXTENSIONS_REMEDY}"
                 ),
             ));
         }
@@ -1045,7 +1045,7 @@ pub(super) async fn gem_service_copy(
             "native_extensions_unsupported",
             format!(
                 "the served stub gemspec for {name} declares native extensions; bundler does \
-                 not build extensions for path-sourced gems"
+                 not build extensions for path-sourced gems. {NATIVE_EXTENSIONS_REMEDY}"
             ),
         ));
     }
@@ -1338,6 +1338,68 @@ enum GemfilePlan {
     Append { block: String },
 }
 
+/// The way out of a native-extension refusal (#2091): the two modes that
+/// compile the extension. See "Ruby gems: native extensions" in
+/// `docs/ecosystems.md`.
+const NATIVE_EXTENSIONS_REMEDY: &str = "Patch it with `socket-patch scan --mode hosted` or \
+     `socket-patch scan --mode agent`, which build the extension";
+
+/// The way out of a platform-build refusal (#2091). Agent mode only: hosted
+/// mode refuses a precompiled build as well
+/// (`redirect_gem_platform_unsupported`).
+const PLATFORM_GEM_REMEDY: &str =
+    "Patch it where it is installed with `socket-patch scan --mode agent`";
+
+/// The `group:` option that stands for the `group … do` block around the
+/// indented declaration at `lines[idx]`, for the refusal's remedy:
+/// `group: :test`, or `group: [:development, :test]`.
+///
+/// `None` unless the nearest less-indented line above is a `group` call
+/// whose arguments are all plain symbols and which opens the block on that
+/// line. A `source … do`, `platforms … do` or conditional block, a nested
+/// block, and a `group` with options (`optional: true`) have no one-option
+/// spelling that is sure to mean the same, so the remedy names none.
+fn enclosing_group_option(lines: &[&str], idx: usize) -> Option<String> {
+    let indent = |line: &str| line.len() - line.trim_start().len();
+    let own = indent(lines[idx]);
+    let header = lines[..idx].iter().rev().find(|line| {
+        let t = line.trim();
+        !t.is_empty() && !t.starts_with('#') && indent(line) < own
+    })?;
+    // A block that is itself inside a block is not the whole story.
+    if indent(header) != 0 {
+        return None;
+    }
+    let args = header
+        .trim_end()
+        .strip_prefix("group")?
+        .strip_suffix("do")?
+        .trim();
+    let args = args
+        .strip_prefix('(')
+        .and_then(|a| a.strip_suffix(')'))
+        .unwrap_or(args);
+    let mut groups = Vec::new();
+    for arg in args.split(',') {
+        let arg = arg.trim();
+        let ident = arg.strip_prefix(':')?;
+        let mut chars = ident.chars();
+        let plain = chars
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+            && chars.all(|c| c.is_ascii_alphanumeric() || c == '_');
+        if !plain {
+            return None;
+        }
+        groups.push(arg);
+    }
+    match groups.as_slice() {
+        [] => None,
+        [one] => Some(format!("group: {one}")),
+        many => Some(format!("group: [{}]", many.join(", "))),
+    }
+}
+
 /// Decide how to edit the Gemfile, or explain why it cannot be edited.
 ///
 /// Deliberately conservative: only a single, top-level, statically-parseable
@@ -1411,8 +1473,14 @@ fn plan_gemfile_edit(
     let cr = if lines[idx].ends_with('\r') { "\r" } else { "" };
     let rest = rest.strip_suffix('\r').unwrap_or(&rest);
     if !top_level {
+        let top_level_form = match enclosing_group_option(&lines, idx) {
+            Some(option) => format!("declare it at the top level as `gem \"{name}\", {option}`"),
+            None => "declare it on a top-level line".to_string(),
+        };
         return Err(format!(
-            "the `gem \"{name}\"` declaration is indented (inside a group/conditional block)"
+            "the `gem \"{name}\"` declaration is indented (inside a group/conditional block); \
+             {top_level_form}, or use hosted mode for it (`socket-patch scan --mode hosted`), \
+             which patches a gem declared inside a block"
         ));
     }
     if paren {
@@ -3917,6 +3985,63 @@ mod tests {
             gemspec_missing_required_attrs("s.summary_text = \"x\"\ns.author_email = \"x\"\n"),
             vec!["summary", "authors"]
         );
+    }
+
+    /// #2091: the remedy spells the `group:` option of the block around the
+    /// declaration, and names none when one option would not mean the same.
+    #[test]
+    fn enclosing_group_option_spells_only_a_plain_group_block() {
+        let option = |gemfile: &str| {
+            let lines: Vec<&str> = gemfile.split('\n').collect();
+            let idx = lines
+                .iter()
+                .position(|l| l.trim_start().starts_with("gem \"rack\""))
+                .unwrap();
+            enclosing_group_option(&lines, idx)
+        };
+        for (gemfile, want) in [
+            (
+                "group :test do\n  gem \"rack\"\nend\n",
+                Some("group: :test"),
+            ),
+            // CRLF, a comment and a sibling between the header and the gem.
+            (
+                "group :test do\r\n  gem \"puma\"\r\n\r\n  # web\r\n  gem \"rack\"\r\nend\r\n",
+                Some("group: :test"),
+            ),
+            (
+                "group :development, :test do\n\tgem \"rack\"\nend\n",
+                Some("group: [:development, :test]"),
+            ),
+            (
+                "group(:test) do\n  gem \"rack\"\nend\n",
+                Some("group: :test"),
+            ),
+            // No single option is sure to mean the same as these.
+            (
+                "group :test, optional: true do\n  gem \"rack\"\nend\n",
+                None,
+            ),
+            ("group \"test\" do\n  gem \"rack\"\nend\n", None),
+            ("group :test do |g|\n  gem \"rack\"\nend\n", None),
+            ("platforms :mri do\n  gem \"rack\"\nend\n", None),
+            ("if ENV[\"CI\"]\n  gem \"rack\"\nend\n", None),
+            (
+                "source \"https://gems.example\" do\n  gem \"rack\"\nend\n",
+                None,
+            ),
+            (
+                "group :test do\n  platforms :mri do\n    gem \"rack\"\n  end\nend\n",
+                None,
+            ),
+            (
+                "platforms :mri do\n  group :test do\n    gem \"rack\"\n  end\nend\n",
+                None,
+            ),
+            ("  gem \"rack\"\n", None),
+        ] {
+            assert_eq!(option(gemfile).as_deref(), want, "{gemfile:?}");
+        }
     }
 
     /// #2091: a refusal that another mode does not share says so. `detail`
