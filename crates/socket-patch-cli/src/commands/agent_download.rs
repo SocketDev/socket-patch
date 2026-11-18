@@ -752,6 +752,417 @@ pub(crate) const BLOB_WRITE_FAILED: &str = "blob_write_failed";
 /// already records at the same uuid (agent mode still re-applies it).
 pub(crate) const ALREADY_IN_MANIFEST: &str = "already_in_manifest";
 
+/// `errorCode` of a patch that would have replaced a recorded one which
+/// could not be rolled back first (see [`roll_back_replaced_patches`]).
+pub(crate) const REPLACED_PATCH_NOT_RESTORED: &str = "replaced_patch_not_restored";
+
+/// How to get the original files of the package `purl` back, as the start
+/// of a sentence. `bundle install` keeps an installed gem as it is, edits
+/// included, so a gem names the commands that reinstall it.
+fn reinstall_remedy(purl: &str) -> String {
+    match strip_purl_qualifiers(purl)
+        .strip_prefix("pkg:gem/")
+        .and_then(|rest| rest.split('@').next())
+    {
+        Some(gem) => format!("Run `bundle pristine {gem}` (or `gem pristine {gem}`)"),
+        None => "Reinstall the package".to_string(),
+    }
+}
+
+/// Run warning for an installed copy a replaced patch was not rolled back
+/// in, because the copy holds none of that patch's bytes.
+pub(crate) const REPLACED_PATCH_NOT_ON_COPY: &str = "replaced_patch_not_on_copy";
+
+/// Appended to the manifest-write error of a run that had already rolled
+/// replaced patches back: the manifest still records them.
+pub(crate) const REPLACED_ROLLED_BACK_UNRECORDED: &str =
+    ". The patches this run was replacing were rolled back and are still the recorded ones: \
+     run `socket-patch apply` to put them back";
+
+/// What [`roll_back_replaced_patches`] did for the records about to be
+/// replaced.
+#[derive(Default)]
+pub(crate) struct ReplacedRollback {
+    /// Purl -> why its recorded patch could not be rolled back. The caller
+    /// keeps the record of each.
+    pub(crate) refused: HashMap<String, String>,
+    /// The refused purls whose rollback failed after the verification
+    /// passed: some of their files may already be restored.
+    pub(crate) partial: std::collections::HashSet<String>,
+    /// Purl -> how many files were restored, over every installed copy.
+    pub(crate) restored: HashMap<String, usize>,
+    /// The rollback engine's run warnings `(code, detail)`.
+    pub(crate) warnings: Vec<(String, String)>,
+}
+
+impl ReplacedRollback {
+    /// The error text of the replacement of `purl` (recorded at
+    /// `old_uuid`) this rollback refused; `None` when it did not.
+    pub(crate) fn refusal(&self, purl: &str, old_uuid: &str) -> Option<String> {
+        let why = self.refused.get(purl)?.trim_end_matches('.');
+        let old = crate::ui::short_uuid(old_uuid);
+        Some(if self.partial.contains(purl) {
+            format!(
+                "the recorded patch {old} could not be rolled back first: {why}. That \
+                 patch stays recorded, but some of its files were restored before the \
+                 failure. Run `socket-patch apply` to put it back, fix the cause, then \
+                 run this command again."
+            )
+        } else {
+            let remedy = reinstall_remedy(purl);
+            format!(
+                "the recorded patch {old} could not be rolled back first: {why}. That \
+                 patch stays recorded and applied. {remedy} to get the original files \
+                 back, then run this command again."
+            )
+        })
+    }
+
+    /// Print what the rollback restored and warned about (stderr, unless
+    /// `quiet`) and hand back the warnings for the caller's envelope.
+    pub(crate) fn report(&self, quiet: bool) -> Vec<RunWarning> {
+        if !quiet {
+            let mut restored: Vec<(&String, &usize)> = self.restored.iter().collect();
+            restored.sort();
+            for (purl, files) in restored {
+                eprintln!(
+                    "  [restore] {} ({} of the replaced patch)",
+                    normalize_purl(purl),
+                    crate::ui::plural(*files, "file", "files")
+                );
+            }
+        }
+        self.warnings
+            .iter()
+            .map(|(code, detail)| {
+                if !quiet {
+                    eprintln!("Warning: {detail}");
+                }
+                RunWarning::new(code.as_str(), detail.as_str())
+            })
+            .collect()
+    }
+}
+
+/// The flags the engine's steps on installed packages start from: the
+/// caller's own (`run.common`) with the scope `DownloadParams` owns laid
+/// over them and the resolved manifest path, so the project they read
+/// state from is the one the manifest belongs to.
+fn engine_common(params: &DownloadParams, run: &DownloadRun<'_>) -> GlobalArgs {
+    let manifest_path =
+        std::path::absolute(&params.manifest_path).unwrap_or_else(|_| params.manifest_path.clone());
+    GlobalArgs {
+        cwd: params.cwd.clone(),
+        global: params.global,
+        global_prefix: params.global_prefix.clone(),
+        manifest_path: manifest_path.display().to_string(),
+        ..run.common.clone()
+    }
+}
+
+/// What both passes of [`roll_back_replaced_patches`] run the engine with.
+struct RollbackContext<'a> {
+    socket_dir: &'a Path,
+    vendored_keys: std::collections::HashSet<PurlKey>,
+    hosted_pins: Vec<socket_patch_core::patch::redirect::upstream::HostedPin>,
+    api_client: crate::args::RunApiClient,
+}
+
+/// What one pass decided for the purls of its records.
+#[derive(Default)]
+struct PassOutcome {
+    /// Purl -> the failure of a copy that holds the record's patched bytes
+    /// (or may), or of the pass itself.
+    failed: HashMap<String, String>,
+    /// Purl -> files restored (a wet pass).
+    restored: HashMap<String, usize>,
+    /// Purls with a copy the record's patch is on (a dry pass).
+    patched: std::collections::HashSet<String>,
+    /// Purls with a copy this pass wrote to, or may have (a wet pass).
+    wrote: std::collections::HashSet<String>,
+    /// `(purl, copy, failure)` of each copy left alone because it holds
+    /// none of the record's patched bytes.
+    not_on_copy: Vec<(String, String, String)>,
+    warnings: Vec<(String, String)>,
+}
+
+/// Whether the copy at `dir` belongs to a release variant recorded beside
+/// `purl` that this run does not roll back: the sibling's record accounts
+/// for every one of its files there. The engine narrows variants only
+/// among the records it is handed, so it would otherwise judge `purl`'s
+/// record against its sibling's distribution, whose files can share
+/// bytes with it.
+async fn sibling_variant_owns(
+    manifest: &PatchManifest,
+    rolled_back: &PatchManifest,
+    purl: &str,
+    dir: &Path,
+) -> bool {
+    let base = strip_purl_qualifiers(purl);
+    for (other, record) in &manifest.patches {
+        if other != purl
+            && strip_purl_qualifiers(other) == base
+            && !rolled_back.patches.contains_key(other)
+            && super::rollback::copy_carries_record(dir, &record.files).await
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// One muted pass of the in-place rollback engine over `records` (taken
+/// from `manifest`).
+///
+/// A copy that failed without holding any of the record's patched bytes
+/// is not a failure here: the patch is not on it (it was never applied
+/// there, or the copy is another distribution's), so there is nothing of
+/// it to roll back, and the engine wrote nothing to it. The same goes for
+/// a copy a sibling release variant's record owns
+/// ([`sibling_variant_owns`]). A copy the patch may be on (a patched or
+/// unreadable file) fails its purl.
+///
+/// When the engine stops at its before-blob gate it has restored nothing
+/// and reports only the packages that need a missing blob: those fail,
+/// and the pass runs again over the rest.
+async fn rollback_pass(
+    common: &GlobalArgs,
+    context: &RollbackContext<'_>,
+    records: &PatchManifest,
+    manifest: &PatchManifest,
+) -> PassOutcome {
+    let mut pass = PassOutcome::default();
+    let mut todo = records.clone();
+    while !todo.patches.is_empty() {
+        let purls: std::collections::HashSet<String> = todo.patches.keys().cloned().collect();
+        let outcome = super::rollback::rollback_patches_inner(
+            common,
+            context.socket_dir,
+            &todo,
+            &context.vendored_keys,
+            super::rollback::InnerSelection::Scope {
+                purls: &purls,
+                announce_empty: false,
+            },
+            &super::rollback::superseded_by_hosted(&todo, &context.hosted_pins),
+            &context.api_client,
+        )
+        .await;
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(e) => {
+                pass.failed
+                    .extend(purls.into_iter().map(|purl| (purl, e.clone())));
+                break;
+            }
+        };
+        if outcome.aborted {
+            let mut gated = false;
+            for result in outcome.results {
+                gated |= todo.patches.remove(&result.package_key).is_some();
+                pass.failed.entry(result.package_key).or_insert(
+                    result
+                        .error
+                        .unwrap_or_else(|| "an original blob is missing".to_string()),
+                );
+            }
+            if gated {
+                continue;
+            }
+            // The gate named no package of this pass: fail them all.
+            pass.failed.extend(purls.into_iter().map(|purl| {
+                (
+                    purl,
+                    "the rollback stopped before it restored anything".to_string(),
+                )
+            }));
+            break;
+        }
+        for result in outcome.results {
+            let purl = result.package_key;
+            let dir = Path::new(&result.package_path);
+            // A Go redirect and a Maven copy are undone as a unit; their
+            // results do not say what the copy holds.
+            let unit = matches!(
+                Ecosystem::from_purl(&purl),
+                Some(Ecosystem::Golang | Ecosystem::Maven)
+            );
+            if !result.files_rolled_back.is_empty() || (unit && !result.success) {
+                pass.wrote.insert(purl.clone());
+            }
+            let siblings = !unit
+                && result.files_rolled_back.is_empty()
+                && sibling_variant_owns(manifest, records, &purl, dir).await;
+            if result.success {
+                let patched = unit
+                    || result.files_verified.is_empty()
+                    || result.files_verified.iter().any(|file| {
+                        file.status
+                            == socket_patch_core::patch::rollback::VerifyRollbackStatus::Ready
+                    });
+                if patched && !siblings {
+                    pass.patched.insert(purl.clone());
+                }
+                *pass.restored.entry(purl).or_default() += result.files_rolled_back.len();
+                continue;
+            }
+            let holds_patch = !siblings
+                && (unit
+                    || !result.files_rolled_back.is_empty()
+                    || match records.patches.get(&purl) {
+                        Some(record) => {
+                            super::rollback::copy_holds_patched_bytes(&purl, dir, &record.files)
+                                .await
+                        }
+                        None => true,
+                    });
+            let why = result
+                .error
+                .unwrap_or_else(|| "the rollback failed".to_string());
+            if holds_patch {
+                pass.failed.entry(purl).or_insert(why);
+            } else if !siblings {
+                pass.not_on_copy.push((purl, result.package_path, why));
+            }
+        }
+        pass.warnings = outcome.warnings;
+        break;
+    }
+    pass
+}
+
+/// Before the manifest records of `replaced` (each purl with the files of
+/// the patch that replaces its record) are replaced: where the new patch
+/// does not list every file the recorded one changed, roll the recorded
+/// patch back in every installed copy (#2096), so that replacement is
+/// "roll back the old patch, record the new one, apply it".
+///
+/// Once the record is replaced nothing lists a file the new patch dropped,
+/// so one left patched would pass `apply --check` and `vex`, and no
+/// `rollback` could restore it. Rolling back the whole record (not those
+/// files alone) keeps the
+/// engine on records as `rollback` and `remove` run it: a Go redirect, a
+/// swapped jar and a rebuilt gem extension are undone as one unit, and
+/// the nested apply starts from the original files.
+///
+/// Runs the engine muted, under the apply lock the caller holds, in two
+/// passes: a dry run that verifies every copy first, so a package that
+/// cannot be rolled back is refused with nothing of it changed, then the
+/// rollback of the packages the dry run found the patch on. A package
+/// that is not installed, whose copies are already original, or whose
+/// copies hold none of the recorded patch's bytes has nothing to roll
+/// back (see [`rollback_pass`]).
+pub(crate) async fn roll_back_replaced_patches(
+    common: &GlobalArgs,
+    socket_dir: &Path,
+    manifest: &PatchManifest,
+    replaced: &[(&str, &HashMap<String, PatchFileInfo>)],
+    api_client: &ApiClient,
+) -> ReplacedRollback {
+    let mut rollback = ReplacedRollback::default();
+    let mut records = PatchManifest::new();
+    for (purl, new_files) in replaced {
+        let Some(old) = manifest.patches.get(*purl) else {
+            continue;
+        };
+        // A new patch that lists every file of the recorded one leaves
+        // nothing unrecorded: the nested apply moves each file to it, as
+        // it always has, and needs no original blob to do so.
+        if old.files.keys().any(|file| !new_files.contains_key(file)) {
+            records.patches.insert((*purl).to_string(), old.clone());
+        }
+    }
+    if records.patches.is_empty() {
+        return rollback;
+    }
+    // The purls are the scope, so `--ecosystems` does not narrow them.
+    let muted = GlobalArgs {
+        silent: true,
+        json: true,
+        ecosystems: None,
+        ..common.clone()
+    };
+    let project_root = muted.project_root();
+    let context = RollbackContext {
+        socket_dir,
+        vendored_keys: crate::commands::vendor_owned_keys(
+            &muted,
+            &socket_patch_core::vendor::vendored_purl_keys(&project_root).await,
+        )
+        .await,
+        // A record a live hosted pin superseded is left to the hosted leg
+        // where its copy holds neither side of it, as `rollback` and
+        // `remove` do.
+        hosted_pins: if crate::commands::project_state_in_scope(&muted) {
+            crate::commands::hosted_inventory(&muted, &project_root)
+                .await
+                .unwindable()
+        } else {
+            Vec::new()
+        },
+        api_client: crate::args::RunApiClient::new_with(Some(api_client.clone())),
+    };
+
+    let verify = GlobalArgs {
+        dry_run: true,
+        ..muted.clone()
+    };
+    let verified = rollback_pass(&verify, &context, &records, manifest).await;
+    rollback.refused = verified.failed;
+    // A copy left alone may hold a file edited after the patch was
+    // applied: say so, once, for the purls this run goes on to replace.
+    let mut not_on_copy = verified.not_on_copy;
+    not_on_copy.sort();
+    for (purl, copy, why) in not_on_copy {
+        if rollback.refused.contains_key(&purl) {
+            continue;
+        }
+        let old = records
+            .patches
+            .get(&purl)
+            .map(|record| crate::ui::short_uuid(&record.uuid).to_string())
+            .unwrap_or_default();
+        rollback.warnings.push((
+            REPLACED_PATCH_NOT_ON_COPY.to_string(),
+            format!(
+                "{}: the replaced patch {old} was not rolled back in {copy}: no file \
+                 there holds its patched bytes ({}). A file edited after that patch was \
+                 applied stays as it is. {} to get the original files back.",
+                normalize_purl(&purl),
+                why.trim_end_matches('.'),
+                reinstall_remedy(&purl)
+            ),
+        ));
+    }
+    records
+        .patches
+        .retain(|purl, _| verified.patched.contains(purl) && !rollback.refused.contains_key(purl));
+    if records.patches.is_empty() {
+        return rollback;
+    }
+    let wet = GlobalArgs {
+        dry_run: false,
+        ..muted
+    };
+    let done = rollback_pass(&wet, &context, &records, manifest).await;
+    for (purl, why) in done.failed {
+        // A failure before anything of the package was written (an
+        // original blob that could not be downloaded a second time) left
+        // it as it was.
+        if done.wrote.contains(&purl) {
+            rollback.partial.insert(purl.clone());
+        }
+        rollback.refused.insert(purl, why);
+    }
+    rollback.restored = done.restored;
+    let refused = &rollback.refused;
+    rollback
+        .restored
+        .retain(|purl, files| *files > 0 && !refused.contains_key(purl));
+    rollback.warnings.extend(done.warnings);
+    rollback
+}
+
 /// `selected` as the `(purl, uuid)` pairs the vendor refusals judge.
 pub(crate) fn selection_pairs(selected: &[PatchSearchResult]) -> Vec<(&str, &str)> {
     selected
@@ -1392,16 +1803,13 @@ pub(crate) fn nested_apply_args_from_params(
     manifest_path: &Path,
 ) -> GlobalArgs {
     let common = GlobalArgs {
-        cwd: params.cwd.clone(),
-        global: params.global,
-        global_prefix: params.global_prefix.clone(),
         strict: params.strict,
         allow_patch_conflicts: params.allow_patch_conflicts,
         // Scope the nested apply like the caller was scoped: `None` would
         // apply the WHOLE manifest, mutating other ecosystems' packages the
         // user filtered out.
         ecosystems: params.ecosystems.clone(),
-        ..run.common.clone()
+        ..engine_common(params, run)
     };
     nested_apply_args(&common, manifest_path, params.quiet())
 }
@@ -1725,6 +2133,83 @@ pub async fn download_and_apply_patches_into(
         HashMap::new(),
     )
     .await;
+    let mut batch = batch;
+
+    // A record about to be replaced by another patch: roll the recorded
+    // patch back first, or keep its record (#2096). Boxed: this runs the
+    // rollback engine on the scan → download → apply chain, whose futures
+    // must fit the main thread's stack.
+    let replaced: Vec<(&str, &HashMap<String, PatchFileInfo>)> = batch
+        .fetched
+        .iter()
+        .filter(|f| matches!(f.action, PatchAction::Updated { .. }))
+        .map(|f| (f.patch.purl.as_str(), &f.files))
+        .collect();
+    if !replaced.is_empty() {
+        // About to write to installed packages: a hot-patch pass is no
+        // longer dropped at its time limit.
+        crate::hot_patch::mark_apply_started();
+    }
+    let rollback = Box::pin(roll_back_replaced_patches(
+        &engine_common(params, run),
+        &socket_dir,
+        &manifest,
+        &replaced,
+        run.api_client,
+    ))
+    .await;
+    let rollback_warnings = rollback.report(quiet);
+    let (kept, refused): (Vec<FetchedPatch>, Vec<FetchedPatch>) = batch
+        .fetched
+        .drain(..)
+        .partition(|f| !rollback.refused.contains_key(&f.patch.purl));
+    batch.fetched = kept;
+    // A blob a kept patch also lists stays: the fetch that wrote it first
+    // may have been the refused patch's.
+    let kept_blobs: std::collections::HashSet<&str> = batch
+        .fetched
+        .iter()
+        .flat_map(|f| f.files.values())
+        .flat_map(|info| [info.before_hash.as_str(), info.after_hash.as_str()])
+        .collect();
+    let mut refused_blobs: Vec<String> = Vec::new();
+    let mut refusals: Vec<(String, String, String)> = Vec::new();
+    for FetchedPatch {
+        patch,
+        action,
+        new_blobs,
+        ..
+    } in refused
+    {
+        refused_blobs.extend(
+            new_blobs
+                .into_iter()
+                .filter(|hash| !kept_blobs.contains(hash.as_str())),
+        );
+        let old_uuid = match &action {
+            PatchAction::Updated { old_uuid } => old_uuid.as_str(),
+            _ => "",
+        };
+        let detail = rollback.refusal(&patch.purl, old_uuid).unwrap_or_default();
+        refusals.push((patch.purl, patch.uuid, detail));
+    }
+    // Nothing records a refused patch: its blobs go, and its `updated`
+    // event becomes the failure.
+    unwind_new_blobs(&blobs_dir, &refused_blobs).await;
+    for (purl, uuid, detail) in &refusals {
+        batch.events.retain(|event| {
+            !(event.action == EventAction::Updated
+                && event.purl.as_deref() == Some(purl.as_str())
+                && event.uuid.as_deref() == Some(uuid.as_str()))
+        });
+        batch.fail(
+            params.json,
+            Some(format!("[fail] {} ({detail})", normalize_purl(purl))),
+            (purl, uuid),
+            REPLACED_PATCH_NOT_RESTORED,
+            detail,
+        );
+    }
 
     // `added` and `updated` are DISJOINT — one patch lands in exactly one,
     // matching the per-patch event (`downloaded` / `updated`) and the
@@ -1770,7 +2255,10 @@ pub async fn download_and_apply_patches_into(
             // The blobs this run just wrote have no record pointing at them:
             // unwind exactly those (a pre-existing record's blobs stay).
             unwind_new_blobs(&blobs_dir, &new_blobs).await;
-            let msg = format!("Failed to write manifest: {e}");
+            let mut msg = format!("Failed to write manifest: {e}");
+            if !rollback.restored.is_empty() {
+                msg.push_str(REPLACED_ROLLED_BACK_UNRECORDED);
+            }
             if !params.json {
                 eprintln!("Error: {msg}");
             }
@@ -1806,6 +2294,7 @@ pub async fn download_and_apply_patches_into(
     // later. (`scan` never hits this: it filters vendored purls before
     // download.) The nested apply below skips the vendored purl either way.
     let mut warnings = release_warnings(batch.warnings);
+    warnings.extend(rollback_warnings);
     warn_on_vendored_uuid_drift(&params.project_root(), quiet, &changed, &mut warnings).await;
     if !recorded.is_empty() {
         warn_if_manifest_gitignored(&params.project_root(), &manifest_path, quiet, &mut warnings)

@@ -353,3 +353,173 @@ async fn gem_crawler_finds_real_installed_gem() {
         lib_file.display()
     );
 }
+
+// ---------------------------------------------------------------------------
+// A re-scan that replaces the recorded gem patch with another one (#2096)
+// ---------------------------------------------------------------------------
+
+/// Make the mock serve exactly one patch for the gem: `uuid`, changing
+/// `files` (`(path in the gem, original bytes, patched bytes)`). Replaces
+/// whatever it served before.
+async fn serve_gem_patch(server: &MockServer, uuid: &str, files: &[(&str, &[u8], Vec<u8>)]) {
+    let purl = format!("pkg:gem/{GEM_NAME}@{GEM_VERSION}");
+    let b64 = |bytes: &[u8]| base64::engine::general_purpose::STANDARD.encode(bytes);
+    server.reset().await;
+    Mock::given(method("POST"))
+        .and(path(format!("/v0/orgs/{ORG}/patches/batch")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "packages": [{
+                "purl": purl,
+                "patches": [{
+                    "uuid": uuid, "purl": purl,
+                    "tier": "free", "cveIds": [], "ghsaIds": [],
+                    "severity": "medium", "title": "gem replacement fixture"
+                }]
+            }],
+            "canAccessPaidPatches": false,
+        })))
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path_regex(format!(
+            "^/v0/orgs/{ORG}/patches/by-package/.+$"
+        )))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "patches": [{
+                "uuid": uuid, "purl": purl,
+                "publishedAt": "2024-01-01T00:00:00Z",
+                "description": "x", "license": "MIT", "tier": "free",
+                "vulnerabilities": {}
+            }],
+            "canAccessPaidPatches": false,
+        })))
+        .mount(server)
+        .await;
+    let files: serde_json::Map<String, serde_json::Value> = files
+        .iter()
+        .map(|(file, before, after)| {
+            (
+                format!("package/{file}"),
+                serde_json::json!({
+                    "beforeHash": git_sha256(before),
+                    "afterHash": git_sha256(after),
+                    "blobContent": b64(after),
+                    "beforeBlobContent": b64(before),
+                }),
+            )
+        })
+        .collect();
+    Mock::given(method("GET"))
+        .and(path(format!("/v0/orgs/{ORG}/patches/view/{uuid}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "uuid": uuid,
+            "purl": purl,
+            "publishedAt": "2024-01-01T00:00:00Z",
+            "files": files,
+            "vulnerabilities": {},
+            "description": "x", "license": "MIT", "tier": "free",
+        })))
+        .mount(server)
+        .await;
+}
+
+async fn gem_agent_scan(cwd: &Path, server: &MockServer) -> i32 {
+    scan_run(ScanArgs {
+        socket_yml: Default::default(),
+        paths: Vec::new(),
+        packages: Vec::new(),
+        common: socket_patch_cli::args::GlobalArgs {
+            cwd: cwd.to_path_buf(),
+            org: Some(ORG.to_string()),
+            json: true,
+            yes: true,
+            api_url: Some(server.uri()),
+            api_token: Some("fake".to_string()),
+            ecosystems: Some(vec!["gem".to_string()]),
+            ..socket_patch_cli::args::GlobalArgs::default()
+        },
+        batch_size: Some(100),
+        prune: false,
+        sync: true,
+        mode: None,
+        all_releases: false,
+        vex: Default::default(),
+        rollout: Default::default(),
+    })
+    .await
+}
+
+/// Patch A changes `lib/colorize.rb` and `lib/colorize/version.rb`; the
+/// patch that replaces it changes `lib/colorize/version.rb` only. The
+/// re-scan must give `lib/colorize.rb` back: once the record is patch
+/// B's, no command lists, checks or restores that file.
+#[tokio::test]
+#[serial]
+async fn gem_rescan_replacing_a_patch_restores_the_file_the_new_patch_dropped() {
+    if !has_gem() {
+        println!("SKIP: gem not on PATH");
+        return;
+    }
+    const UUID_B: &str = "23232323-2323-4232-8232-232323232323";
+    let marked = |bytes: &[u8], marker: &str| {
+        let mut patched = bytes.to_vec();
+        patched.extend_from_slice(format!("\n# {marker}\n").as_bytes());
+        patched
+    };
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let lib_file = install_colorize(tmp.path());
+    let version_file = lib_file.parent().unwrap().join("colorize/version.rb");
+    let lib_original = std::fs::read(&lib_file).expect("read colorize.rb");
+    let version_original = std::fs::read(&version_file).expect("read colorize/version.rb");
+    let lib_a = marked(&lib_original, "PATCH-A");
+    let version_a = marked(&version_original, "PATCH-A");
+    let version_b = marked(&version_original, "PATCH-B");
+
+    let server = MockServer::start().await;
+    serve_gem_patch(
+        &server,
+        UUID,
+        &[
+            ("lib/colorize.rb", &lib_original, lib_a.clone()),
+            (
+                "lib/colorize/version.rb",
+                &version_original,
+                version_a.clone(),
+            ),
+        ],
+    )
+    .await;
+    assert_eq!(gem_agent_scan(tmp.path(), &server).await, 0);
+    assert_eq!(std::fs::read(&lib_file).unwrap(), lib_a);
+    assert_eq!(std::fs::read(&version_file).unwrap(), version_a);
+
+    serve_gem_patch(
+        &server,
+        UUID_B,
+        &[(
+            "lib/colorize/version.rb",
+            &version_original,
+            version_b.clone(),
+        )],
+    )
+    .await;
+    assert_eq!(gem_agent_scan(tmp.path(), &server).await, 0);
+
+    let manifest: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(tmp.path().join(".socket/manifest.json")).unwrap(),
+    )
+    .unwrap();
+    let purl = format!("pkg:gem/{GEM_NAME}@{GEM_VERSION}");
+    assert_eq!(manifest["patches"][purl.as_str()]["uuid"], UUID_B);
+    assert_eq!(
+        std::fs::read(&version_file).unwrap(),
+        version_b,
+        "the new patch's file is patched"
+    );
+    assert_eq!(
+        std::fs::read(&lib_file).unwrap(),
+        lib_original,
+        "the file only the replaced patch changed must be put back"
+    );
+}
