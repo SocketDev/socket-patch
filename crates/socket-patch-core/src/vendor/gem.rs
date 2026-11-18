@@ -492,7 +492,7 @@ async fn gem_prelude(
                 "native_extensions_unsupported",
                 format!(
                     "{leaf}.gemspec declares native extensions; bundler does not build extensions for path-sourced gems. {}",
-                    native_extensions_remedy(name)
+                    native_extensions_remedy(name, !declaration_selects_source(&gemfile_text, name))
                 ),
             ));
         }
@@ -1049,7 +1049,9 @@ pub(super) async fn gem_service_copy(
             format!(
                 "the served stub gemspec for {name} declares native extensions; bundler does \
                  not build extensions for path-sourced gems. {}",
-                native_extensions_remedy(name)
+                // The Gemfile plan passed before the service was asked, so
+                // the declaration is one hosted mode can edit too.
+                native_extensions_remedy(name, true)
             ),
         ));
     }
@@ -1342,13 +1344,60 @@ enum GemfilePlan {
     Append { block: String },
 }
 
-/// The way out of a native-extension refusal (#2091): the two modes that
+/// The way out of a native-extension refusal (#2091): the modes that
 /// compile the extension ("Ruby gems: native extensions" in
 /// `docs/ecosystems.md`). Worded as hosted mode words its own refusals
 /// ("patch <gem> with `--mode vendored` or `--mode agent`"): it names the
-/// mode for this gem, not a whole-project command.
-fn native_extensions_remedy(name: &str) -> String {
-    format!("Patch {name} with `--mode hosted` or `--mode agent`, which build the extension")
+/// mode for this gem, not a whole-project command. `hosted` is false when
+/// hosted mode would refuse the gem's declaration as well
+/// ([`declaration_selects_source`]), and agent mode alone is named.
+fn native_extensions_remedy(name: &str, hosted: bool) -> String {
+    let modes = if hosted {
+        "`--mode hosted` or `--mode agent`, which build"
+    } else {
+        "`--mode agent`, which builds"
+    };
+    format!("Patch {name} with {modes} the extension")
+}
+
+/// Whether a `gem "<name>"` declaration of the Gemfile `text` picks the
+/// gem's source: it sits inside a `source` / `git` / `github` / `path`
+/// block, or carries one of the source options. Hosted mode refuses such a
+/// gem (`redirect_gem_source_option`), so a remedy must not name it.
+/// Errs towards `true`: a mode left out of a remedy costs less than one
+/// that refuses.
+fn declaration_selects_source(text: &str, name: &str) -> bool {
+    const SOURCE_OPTIONS: [&str; 6] = ["source", "git", "github", "path", "gist", "bitbucket"];
+    let mut line_start = 0;
+    for line in text.split('\n') {
+        let start = line_start;
+        line_start += line.len() + 1;
+        let trimmed = line.trim_start();
+        if trimmed.starts_with('#') {
+            continue;
+        }
+        let Some(decl) = gem_declaration(trimmed, name) else {
+            continue;
+        };
+        if crate::formats::gem::ruby::block_stack(text, start)
+            .iter()
+            .any(|frame| frame.source.is_some())
+        {
+            return true;
+        }
+        let code = decl.rest.split('#').next().unwrap_or("");
+        let names_source = code
+            .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == ':'))
+            .any(|word| {
+                // `git: "…"` and the hash-rocket `:git => "…"`.
+                let key = word.strip_suffix(':').or_else(|| word.strip_prefix(':'));
+                key.is_some_and(|key| SOURCE_OPTIONS.contains(&key))
+            });
+        if names_source {
+            return true;
+        }
+    }
+    false
 }
 
 /// The way out of a platform-build refusal (#2091). Agent mode only: hosted
@@ -4139,6 +4188,59 @@ mod tests {
                 .unwrap(),
             LOCK_DIRECT
         );
+    }
+
+    /// #2091 (review): hosted mode refuses a gem whose declaration picks
+    /// its source, so the native-extension remedy names agent mode alone
+    /// for it.
+    #[tokio::test]
+    async fn test_native_extension_remedy_skips_hosted_for_a_source_selecting_declaration() {
+        for gemfile in [
+            "source \"https://rubygems.org\"\n\nsource \"https://gems.example\" do\n  gem \"rack\", \"~> 3.1\"\nend\n",
+            "source \"https://rubygems.org\"\n\ngem \"rack\", git: \"https://git.example/rack.git\"\n",
+            "source \"https://rubygems.org\"\n\ngem \"rack\", \"~> 3.1\", :source => \"https://gems.example\"\n",
+        ] {
+            let (_tmp, root, installed, blobs, record) = fixture(gemfile, LOCK_DIRECT).await;
+            let spec = installed
+                .parent()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .join("specifications/rack-3.2.6.gemspec");
+            tokio::fs::write(
+                &spec,
+                "Gem::Specification.new do |s|\n  s.name = \"rack\"\n  s.extensions = [\"ext/rack/extconf.rb\"]\nend\n",
+            )
+            .await
+            .unwrap();
+            let (code, detail) =
+                unwrap_refused(run_vendor(&root, &blobs, &installed, &record, false).await);
+            assert_eq!(code, "native_extensions_unsupported", "{gemfile:?}");
+            assert_names_other_modes(&detail, &["agent"]);
+        }
+    }
+
+    #[test]
+    fn declaration_selects_source_reads_blocks_and_options() {
+        for (gemfile, want) in [
+            ("gem \"rack\"\n", false),
+            ("gem \"rack\", \"~> 3.1\", require: false, group: :test\n", false),
+            ("group :test do\n  gem \"rack\"\nend\n", false),
+            // Another gem's source is not this gem's.
+            ("gem \"puma\", git: \"https://git.example/puma.git\"\ngem \"rack\"\n", false),
+            ("gem \"rack\" # path: \"../rack\"\n", false),
+            ("gem \"rack\", path: \"../rack\"\n", true),
+            ("gem \"rack\", github: \"rack/rack\"\r\n", true),
+            ("gem \"rack\", :git => \"https://git.example/rack.git\"\n", true),
+            ("gem \"rack\", source: \"https://gems.example\"\n", true),
+            ("path \"components\" do\n  gem \"rack\"\nend\n", true),
+            (
+                "group :test do\n  source \"https://gems.example\" do\n    gem \"rack\"\n  end\nend\n",
+                true,
+            ),
+        ] {
+            assert_eq!(declaration_selects_source(gemfile, "rack"), want, "{gemfile:?}");
+        }
     }
 
     #[tokio::test]
