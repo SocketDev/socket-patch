@@ -83,6 +83,9 @@ const FIXTURE: Fixture = Fixture {
 const MODULE: &str = "example.com/upstream";
 const VERSION: &str = "v1.0.0";
 const PURL: &str = "pkg:golang/example.com/upstream@v1.0.0";
+/// The product `vex` reads from the fixture's own `go.mod`, which records
+/// a module and no version.
+const PRODUCT: &str = "pkg:golang/example.com/consumer";
 /// Its two files. The fixture's `go.sum` holds the `h1:` of these bytes.
 const GO_MOD: &[u8] = b"module example.com/upstream\n\ngo 1.21\n";
 const UPSTREAM_LIB: &[u8] = b"package upstream\n\nfunc Greeting() string { return \"PRISTINE\" }\n";
@@ -344,6 +347,9 @@ fn hosted_go_deps() {
     // and with `--no-verify` that it checked no file.
     cell.stands_alone(socket_patch, &claim, true);
     cell.stands_alone(socket_patch, &claim, false);
+    // Without a product, as a user types it: the same document for the
+    // module of the checkout's own `go.mod`.
+    cell.detects_product(socket_patch, Some(PRODUCT));
 
     // (d) The undo: every file is the one of before, and so is the build,
     // and `vex` has no document for it.
@@ -702,10 +708,12 @@ fn kept_copy_flow(test: &str, mode: Kept, ships_build: bool) {
     cell.stands_alone(run, &claim, true);
 
     // (c) The next build is patched, from the copy, and `vex` says so; with
-    // `--no-verify` it says that it checked no file.
+    // `--no-verify` it says that it checked no file, and without a product
+    // it says the same for the module of the checkout's own `go.mod`.
     cell.builds_patched(&pinned, &patched);
     cell.stands_alone(run, &claim, true);
     cell.stands_alone(run, &claim, false);
+    cell.detects_product(run, Some(PRODUCT));
 
     // (d) The user's next step: gazelle writes nothing into the copy, the
     // build stays patched, and no package of the checkout is under
@@ -1575,9 +1583,10 @@ fn a_manifest_in_another_project_brings_the_file_of_both_projects_in_line() {
     }
 }
 
-/// Without a Bazel: the fixture's directories are those of its table, and
-/// its `go.sum` pins the module the test serves, which holds the `h1:`
-/// arithmetic here to sums that `go` computed.
+/// Without a Bazel: the fixture's directories are those of its table, its
+/// `go.sum` pins the module the test serves, which holds the `h1:`
+/// arithmetic here to sums that `go` computed, and its `go.mod` names the
+/// module of [`PRODUCT`].
 #[test]
 fn the_fixture_pins_the_upstream_module_the_test_serves() {
     FIXTURE.check();
@@ -1585,4 +1594,8 @@ fn the_fixture_pins_the_upstream_module_the_test_serves() {
     let go_sum = std::fs::read_to_string(&path).expect("the fixture's go.sum");
     let lines: Vec<&str> = go_sum.lines().collect();
     assert_eq!(lines, upstream().go_sum(), "{}", path.display());
+    let go_mod = std::fs::read_to_string(path.with_file_name("go.mod")).expect("go.mod");
+    let module = PRODUCT.strip_prefix("pkg:golang/").expect("a Go module");
+    let line = format!("module {module}");
+    assert!(go_mod.lines().any(|named| named == line), "{go_mod}");
 }

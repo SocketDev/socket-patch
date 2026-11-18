@@ -449,6 +449,9 @@ fn hosted_pip_parse() {
     // and with `--no-verify` that it checked no file.
     cell.stands_alone(run, &claim, true);
     cell.stands_alone(run, &claim, false);
+    // Without a product, as a user types it, `vex` writes none: the
+    // checkout has no file it reads a product from.
+    cell.detects_product(run, None);
 
     // (d) The undo: `requirements.txt` is the one of before at once, and
     // the lock is still the one of the patched build, so a frozen lock

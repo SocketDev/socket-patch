@@ -36,18 +36,21 @@ on:
     # Its walk of the pnpm workspace decides what the second run of each
     # flow reports, and no other test runs it beside Bazel's links. That
     # file also holds the Composer, Cargo and Go parts of the gate, so a
-    # change to those starts the npm legs too. The
-    # globs name that one crate, so no bench fixture is here, and nothing
-    # another ecosystem's flow owns: a change to one ecosystem starts that
-    # ecosystem's legs only.
+    # change to those starts the npm legs too. The `*pnpm*` globs name that
+    # one crate, so no bench fixture is here. Last, the VEX code: `vex/` of
+    # the core and the files of the `vex` command. Every flow holds the
+    # exact document socket-patch writes about its patched build, so a
+    # change to how a document is built or worded starts the legs of every
+    # ecosystem. Nothing else that another ecosystem's flow owns is here:
+    # any other change to one ecosystem starts that ecosystem's legs only.
     #
     # What it does not cover: shared engine code (patch/redirect/mod.rs,
-    # the rest of vendor/, hosted/, commands/), the shared test helpers and
-    # the toolchain files. A change there gets its run on the push to main
-    # (when the file is in the list below) or in the nightly run, not on the
-    # pull request: that is the price of not running every ecosystem's legs
-    # on every shared change. On demand, workflow_dispatch runs the legs on
-    # any branch.
+    # the rest of vendor/, hosted/, the rest of commands/), the shared test
+    # helpers and the toolchain files. A change there gets its run on the
+    # push to main (when the file is in the list below) or in the nightly
+    # run, not on the pull request: that is the price of not running every
+    # ecosystem's legs on every shared change. On demand, workflow_dispatch
+    # runs the legs on any branch.
     paths:
       - '.github/workflows/bazel-npm.yml'
       - '.github/workflows/bazel-compatibility.yml'
@@ -66,6 +69,8 @@ on:
       - 'crates/socket-patch-core/src/crawlers/npm_crawler.rs'
       - 'crates/socket-patch-core/src/formats/package_json.rs'
       - 'crates/socket-patch-core/src/patch/user_patches.rs'
+      - 'crates/socket-patch-core/src/vex/**'
+      - 'crates/socket-patch-cli/src/commands/vex*.rs'
   push:
     branches: [main]
     # The pull request paths, and what only a push to main covers: the
@@ -92,12 +97,13 @@ on:
       - 'crates/socket-patch-core/src/crawlers/npm_crawler.rs'
       - 'crates/socket-patch-core/src/formats/package_json.rs'
       - 'crates/socket-patch-core/src/patch/user_patches.rs'
+      - 'crates/socket-patch-core/src/vex/**'
+      - 'crates/socket-patch-cli/src/commands/vex*.rs'
       - 'crates/socket-patch-cli/tests/e2e_bazel_build/main.rs'
       - 'crates/socket-patch-core/src/patch/redirect/**'
       - 'crates/socket-patch-core/src/vendor/**'
       - 'crates/socket-patch-core/src/hosted/**'
       - 'crates/socket-patch-cli/src/commands/**'
-      - 'crates/socket-patch-core/src/vex/**'
       - 'crates/socket-patch-cli/tests/common/**'
       - 'crates/socket-patch-cli/tests/hosted_memory_common/**'
       - 'Cargo.lock'

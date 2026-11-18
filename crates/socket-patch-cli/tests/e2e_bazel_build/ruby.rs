@@ -336,6 +336,9 @@ fn hosted_bundle_fetch() {
     // and with `--no-verify` that it checked no file.
     cell.stands_alone(socket_patch, &claim, true);
     cell.stands_alone(socket_patch, &claim, false);
+    // Without a product, as a user types it, `vex` writes none: the
+    // checkout has no file it reads a product from.
+    cell.detects_product(socket_patch, None);
 
     // (d) The undo: every file is the one of before, and so is the build,
     // and `vex` has no document for it.

@@ -39,8 +39,14 @@
 //! and the command and `vex` write the same two in a checkout with the
 //! same files that no Bazel has built in. Each document is one statement:
 //! the package under test is `not_affected`, through the patch of this
-//! run. Nothing in `socket-patch` reads a Bazel file for it, so these tests
-//! say for which workspaces the document and the build agree.
+//! run. The documents of a flow are also held to each other: they differ
+//! in their id, their times and the mark of `--no-verify`, and in no other
+//! string. Every form is told one product; `vex` without one, as a user
+//! types it, runs once after the patched build, where it names the project
+//! of the checkout's own `package.json` or `go.mod`, or writes no document
+//! where the fixture has no such file. Nothing in `socket-patch` reads a
+//! Bazel file for it, so these tests say for which workspaces the document
+//! and the build agree.
 //!
 //! A flow is one `#[ignore]`d test in its ecosystem's module, and its
 //! fixture is one directory of files that every release builds beside one

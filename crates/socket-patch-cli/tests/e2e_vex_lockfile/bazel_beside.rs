@@ -9,7 +9,7 @@
 //! package manager installs, as in a checkout without Bazel, and `vex` must
 //! say what it says there: the exit code, both streams and the document of
 //! each form are those of that checkout, byte for byte (but for the path of
-//! the checkout, the id of a document and the time).
+//! the checkout and the time; each form is told the id of its document).
 //!
 //! These two tests are the fixed point for every change to what `vex` says
 //! in a Bazel workspace. A change that makes one of them fail, or that
@@ -30,6 +30,9 @@ const UPSTREAM: &str = "module.exports = (s) => s;\n";
 const PATCHED: &str = "/* patched */\nmodule.exports = (s) => s;\n";
 /// The sum of a tarball, as a lock spells it.
 const INTEGRITY: &str = "sha512-UEFUQ0hFRHBhdGNoZWRQQVRDSEVEcGF0Y2hlZA==";
+/// The id every form is told to give its document (`--doc-id`, and
+/// `--vex-doc-id` for `apply`), where `vex` would make a new one per run.
+const DOCUMENT: &str = "urn:uuid:0b6c7d2e-5a41-4f38-8e9d-1c2b3a4f5e6d";
 
 /// A root `MODULE.bazel` whose one hub is Maven's, and the package of the
 /// root that it builds.
@@ -90,8 +93,7 @@ fn project(resolution: &str) -> Vec<(String, String)> {
 
 /// What a run said: its exit code, its stdout, its stderr and its
 /// document, with what differs from one checkout and one run to the next
-/// in fixed words: the path of the checkout, the id `vex` makes for a
-/// document, and the time.
+/// in fixed words: the path of the checkout and the time.
 fn settled(out: &VexOutcome, checkout: &Path) -> (Option<i32>, String, String, String) {
     let document = std::fs::read_to_string(&out.output).unwrap_or_default();
     // The path as the test names it and as the system resolves it, each as
@@ -103,13 +105,11 @@ fn settled(out: &VexOutcome, checkout: &Path) -> (Option<i32>, String, String, S
         let quoted = serde_json::to_string(&plain).expect("a JSON string");
         paths.extend([quoted[1..quoted.len() - 1].to_string(), plain]);
     }
-    let id = regex::Regex::new("urn:uuid:[0-9a-f-]{36}").expect("an id");
     let time = regex::Regex::new(r#""timestamp": "[^"]*""#).expect("a time");
     let fixed = |text: &str| {
         let text = paths.iter().fold(text.to_string(), |text, path| {
             text.replace(path.as_str(), "<checkout>")
         });
-        let text = id.replace_all(&text, "urn:uuid:<document>");
         time.replace_all(&text, r#""timestamp": "<now>""#)
             .into_owned()
     };
@@ -124,11 +124,16 @@ fn settled(out: &VexOutcome, checkout: &Path) -> (Option<i32>, String, String, S
 /// through the patch, as `marker` says; beside each workspace it says what
 /// it said there.
 fn says_the_same_beside_bazel(files: &[(String, String)], run: VexRun, marker: Marker) {
+    let told = |run: VexRun, option: &str| run.arg(option).arg(DOCUMENT);
     let person = VexRun {
         human: true,
         ..run.clone()
     };
-    let forms = [run.clone(), person, run.via(VexVia::Apply)];
+    let forms = [
+        told(run.clone(), "--doc-id"),
+        told(person, "--doc-id"),
+        told(run.via(VexVia::Apply), "--vex-doc-id"),
+    ];
     let mut without_bazel = Vec::new();
     for (around, bazel) in AROUND {
         let root = tempfile::tempdir().expect("a temp root");

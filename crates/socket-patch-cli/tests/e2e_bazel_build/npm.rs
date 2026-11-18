@@ -113,6 +113,9 @@ const VERSION: &str = "1.0.0";
 /// Socket API's purl of a scoped package. `scan` takes either spelling and
 /// names a patch in its events as the API did.
 const PURL: &str = "pkg:npm/%40socketsecurity/bazel-fixture-upstream@1.0.0";
+/// The product `vex` reads from the fixture's own `package.json`: its name
+/// and its version.
+const PRODUCT: &str = "pkg:npm/socket-fixture@0.0.0";
 /// The file name of its tarball on the registry and on the patch host: the
 /// name without its scope.
 const TGZ: &str = "bazel-fixture-upstream-1.0.0.tgz";
@@ -411,8 +414,9 @@ fn second_machine(
 /// `scan --mode <mode> --yes` scans the package and reports the one event
 /// `seen` for it (an action and an error code), which is what it reports in
 /// a checkout without those links; the document of that run, and those of
-/// `vex` and of `vex --no-verify`, attest `claim`; no file of the checkout
-/// changes; and the build still prints `marker`.
+/// `vex` and of `vex --no-verify`, attest `claim`; `vex` without a product
+/// names the fixture's own; no file of the checkout changes; and the build
+/// still prints `marker`.
 fn runs_again(
     cell: &Cell,
     standin: &StandIn,
@@ -451,6 +455,10 @@ fn runs_again(
     let run = |cell: &Cell, args: &[&str]| socket_patch(cell, standin, args);
     cell.stands_alone(run, claim, true);
     cell.stands_alone(run, claim, false);
+    // Without a product, as a user types it: the same document for the
+    // project of the checkout's own `package.json`, which Bazel's links
+    // show a second time.
+    cell.detects_product(run, Some(PRODUCT));
 
     assert_eq!(changed(patched, &cell.tree()), NOTHING, "{test}");
     cell.builds_patched(patched, marker);
@@ -696,9 +704,10 @@ fn vendored_npm_translate_lock() {
 /// fixture's directories and the legs of its workflow are those of its
 /// table; the fixture's lock holds the one entry a test pins, with the
 /// placeholder and no URL, and pinning changes nothing else; the fixture
-/// depends on the package at the version of that entry; two runs serve two
-/// upstream tarballs; and the names written out above are those of the one
-/// package, under the organisation's scope.
+/// depends on the package at the version of that entry and has the name
+/// and the version of [`PRODUCT`]; two runs serve two upstream tarballs; and
+/// the names written out above are those of the one package, under the
+/// organisation's scope.
 #[test]
 fn a_test_pins_the_one_entry_of_the_fixture_lock() {
     FIXTURE.check();
@@ -715,6 +724,8 @@ fn a_test_pins_the_one_entry_of_the_fixture_lock() {
 
     let fixture: Value = serde_json::from_str(&read("package.json")).expect("package.json");
     assert_eq!(fixture["dependencies"][NAME], VERSION);
+    let named = [&fixture["name"], &fixture["version"]].map(|field| field.as_str().expect("text"));
+    assert_eq!(PRODUCT, format!("pkg:npm/{}@{}", named[0], named[1]));
     let manifest: Value = serde_json::from_str(MANIFEST).expect("the package's package.json");
     assert_eq!(manifest["name"], NAME);
     assert_eq!(manifest["version"], VERSION);

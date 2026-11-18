@@ -2290,7 +2290,10 @@ vendored), PyPI through rules_python's `pip.parse(requirements_lock = "//:requir
 the build prints the patched package, and the document of the run (`--vex`), of `vex` and of
 `vex --no-verify` is one `not_affected` statement that names the package and the patch; the
 first two are the same in a checkout with the same files that Bazel has not built in, and
-after the undo `vex` writes no document.
+after the undo `vex` writes no document. For PyPI on Bazel 8.5 and later a hosted scan leaves
+`MODULE.bazel.lock` stale, so the document is there before a frozen build passes: a build with
+`--lockfile_mode=error` fails until a build that may update the lock has run, and the updated
+lock has to be committed.
 
 In every other Bazel shape nothing checks the document against the build, and in these it was
 measured to be wrong (`not_affected` while Bazel builds the unpatched package, or while the
