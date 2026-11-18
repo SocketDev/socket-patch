@@ -1314,6 +1314,20 @@ pub async fn find_manifest_package_copies_reusing(
             }
         }
     }
+    // The dir of a gem build whose gemspec is gone, beside a copy of the
+    // version that the gem home does list, is no copy RubyGems or Bundler
+    // loads, so an unpatched one must not block the attestation (#2087).
+    // Rollback and remove, which resolve without this, still restore it.
+    for (_, paths) in copies
+        .iter_mut()
+        .filter(|(purl, paths)| purl.starts_with("pkg:gem/") && paths.len() > 1)
+    {
+        *paths = socket_patch_core::crawlers::ruby_crawler::retain_loaded_gem_builds(
+            std::mem::take(paths),
+        )
+        .await;
+    }
+    copies.retain(|_, paths| !paths.is_empty());
     copies
 }
 
