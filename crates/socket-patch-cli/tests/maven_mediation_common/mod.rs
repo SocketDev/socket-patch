@@ -45,7 +45,7 @@ pub const NEWER: &str = "1.11.0";
 pub const MEMBER: &str = "META-INF/NOTICE.txt";
 pub const MARKER: &str = "SOCKET-PATCH-MEDIATION-MARKER";
 /// Where the server serves the fixture repository.
-const REPO_ROUTE: &str = "/fixture-repo";
+pub const REPO_ROUTE: &str = "/fixture-repo";
 
 pub fn purl() -> String {
     purl_of(BASE)
