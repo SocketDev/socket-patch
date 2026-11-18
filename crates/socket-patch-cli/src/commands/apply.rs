@@ -1796,7 +1796,13 @@ pub(crate) async fn run_locked(
                     // Sources-unavailable codes restate the staging layer's
                     // own `Error:` diagnostic (already printed, even under
                     // --silent); they exist for the JSON envelope.
-                    if !is_stage_failure_code(&w.code) {
+                    //
+                    // So does the coded copy of a package's refusal (a gem
+                    // whose native extension cannot be rebuilt): the
+                    // package's own `Error: Failed to patch` line carries
+                    // the same text, and a build failure's is many lines
+                    // long (#2117).
+                    if !is_stage_failure_code(&w.code) && !restates_a_failure(w, &results) {
                         eprintln!("Warning: {}", w.detail);
                     }
                 }
@@ -2265,6 +2271,20 @@ const SOURCES_DOWNLOAD_FAILED: &str = "sources_download_failed";
 /// `Error:` line on the human path, so `run` keeps them for JSON only.
 fn is_stage_failure_code(code: &str) -> bool {
     code == OFFLINE_MISSING_SOURCES || code == SOURCES_DOWNLOAD_FAILED
+}
+
+/// Whether `warning` is the coded copy of a failed result's error (`<code>:
+/// <detail>`, how a gem refusal is carried for the JSON envelope): the
+/// human path already printed that text as the package's `Error: Failed to
+/// patch` line.
+fn restates_a_failure(warning: &RunWarning, results: &[ApplyResult]) -> bool {
+    results.iter().filter(|r| !r.success).any(|r| {
+        r.error
+            .as_deref()
+            .and_then(|error| error.strip_prefix(warning.code.as_str()))
+            .and_then(|rest| rest.strip_prefix(": "))
+            == Some(warning.detail.as_str())
+    })
 }
 
 /// Why nothing could be applied when the patch sources are unavailable —
@@ -4127,6 +4147,43 @@ mod tests {
         assert_eq!(expected_hash_label(""), "(new file)");
         let h = "a".repeat(64);
         assert_eq!(expected_hash_label(&h), h);
+    }
+
+    /// A gem refusal reaches the run as a failed result (`<code>:
+    /// <detail>`) and as a coded warning with the same detail: only that
+    /// warning restates a failure the human path already printed.
+    #[test]
+    fn only_the_coded_copy_of_a_failed_result_restates_it() {
+        let warning = |code: &str, detail: &str| RunWarning {
+            code: code.to_string(),
+            detail: detail.to_string(),
+        };
+        let mut failed = sample_applied(VerifyStatus::Ready);
+        failed.success = false;
+        failed.error =
+            Some("native_extension_build_failed: it did not build\nmake: Error 1".into());
+        let mut advised = sample_applied(VerifyStatus::Ready);
+        advised.error = Some("native_extension_rebuilt: rebuilt".into());
+        let results = [failed, advised, sample_applied(VerifyStatus::Ready)];
+
+        assert!(restates_a_failure(
+            &warning(
+                "native_extension_build_failed",
+                "it did not build\nmake: Error 1"
+            ),
+            &results
+        ));
+        // Another detail, another code, or a result that succeeded.
+        for other in [
+            warning("native_extension_build_failed", "it did not build"),
+            warning(
+                "native_extensions_unsupported",
+                "it did not build\nmake: Error 1",
+            ),
+            warning("native_extension_rebuilt", "rebuilt"),
+        ] {
+            assert!(!restates_a_failure(&other, &results), "{}", other.detail);
+        }
     }
 
     /// Build a successful `ApplyResult` with one patched file and one

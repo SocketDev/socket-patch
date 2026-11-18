@@ -662,6 +662,37 @@ hang() {{
   wait
   exit 1
 }}
+# What RubyGems prints when a gem's extconf.rb gives up on a missing
+# library, building into the extension dir $1: the cause, mkmf's list of
+# configuration options, and where it left mkmf.log.
+extconf_failure() {{
+  echo "ERROR: Failed to build gem native extension."
+  echo
+  echo "checking for libsp.h... no"
+  echo "Can't find the 'libsp.h header"
+  echo "Please install libsp like so:"
+  echo "  sudo apt install libsp-dev"
+  echo "*** extconf.rb failed ***"
+  echo "Could not create Makefile due to some reason, probably lack of necessary"
+  echo "libraries and/or headers.  Check the mkmf.log file for more details.  You may"
+  echo "need configuration options."
+  echo
+  echo "Provided configuration options:"
+  i=0
+  while [ $i -lt 40 ]; do
+    printf '\t--with-opt-%s\n' $i
+    i=$((i+1))
+  done
+  echo
+  echo "To see why this extension failed to compile, please check the mkmf.log which can be found here:"
+  echo
+  echo "  $1/mkmf.log"
+  echo
+  echo "extconf failed, exit code 1"
+  echo
+  echo "Gem files will remain installed in /somewhere for inspection."
+  echo "Results logged to $1/gem_make.out"
+}}
 # The Ruby this stands in for: 3.4, or 3.3 once the test says so.
 version=3.4.1
 abi=3.4.0
@@ -698,6 +729,10 @@ stage_build)
   full=$(basename "$4" .gemspec)
   ext="$5/extensions/x86_64-linux/$abi/$full"
   [ -e "$state/hang" ] && hang
+  if [ -e "$state/fail-extconf" ]; then
+    extconf_failure "$ext" >&2
+    exit 1
+  fi
   if [ -e "$state/fail-stage-build" ]; then
     echo "sp_native.c:7: error: this is not C (in the stage)" >&2
     exit 1
@@ -727,6 +762,10 @@ build)
     echo $! > "$state/compiler.pid"
     : > "$state/building"
     wait
+    exit 1
+  fi
+  if [ -e "$state/fail-extconf" ]; then
+    extconf_failure "$ext" >&2
     exit 1
   fi
   if [ -e "$state/fail-build" ]; then
@@ -786,6 +825,12 @@ esac
     fn fail_builds(&self) {
         self.fail_staged_builds();
         std::fs::write(self.state.join("fail-build"), b"").unwrap();
+    }
+
+    /// Make every later build fail, staged or in place, the way a gem's
+    /// `extconf.rb` does when a library it builds against is missing.
+    fn fail_extconf(&self) {
+        std::fs::write(self.state.join("fail-extconf"), b"").unwrap();
     }
 
     /// Stand in for Ruby 3.3 from now on (3.4 until then).
@@ -1885,6 +1930,140 @@ fn a_failed_staged_build_changes_nothing() {
             &format!("precompiled {precompiled}"),
         );
     }
+}
+
+/// A build that fails because the gem's `extconf.rb` misses a library
+/// (#2117: a precompiled `pg` on a machine without `libpq-dev`) says so.
+/// The error keeps the lines that name the cause and not mkmf's list of
+/// configuration options that follows them, does not point at a log in the
+/// stage (or the extension dir) the failed build was removed with, names
+/// what the rebuild of a precompiled gem needs, and is printed once.
+#[cfg(unix)]
+#[test]
+fn a_failed_extconf_shows_its_cause_once() {
+    for precompiled in [true, false] {
+        let case = format!("precompiled {precompiled}");
+        let (_tmp, proj, _gem_dir) = if precompiled {
+            fake_precompiled_gem(true)
+        } else {
+            let fixture = fake_native_gem(true);
+            let cache = fixture.1.join("vendor/bundle/ruby/3.4.0/cache");
+            std::fs::create_dir_all(&cache).unwrap();
+            std::fs::write(cache.join("sp_native-1.0.0.gem"), b"the source gem").unwrap();
+            fixture
+        };
+        write_manifest(&proj.join(".socket"), &c_source(1), &c_source(2));
+        let ruby = FakeRuby::new();
+        ruby.serve_source_gem(&c_source(1));
+        ruby.fail_extconf();
+        let tree_before = walk_files(&proj.join("vendor"));
+
+        let (code, stdout, stderr) = ruby.run(&proj, &["apply", "--offline"], &[]);
+        assert_eq!(code, 1, "{case}: {stdout}\n{stderr}");
+        assert!(
+            stderr.contains(
+                "Error: Failed to patch pkg:gem/sp_native@1.0.0: native_extension_build_failed:"
+            ),
+            "{case}: {stderr}"
+        );
+        assert!(
+            stderr.contains("Can't find the 'libsp.h header")
+                && stderr.contains("sudo apt install libsp-dev"),
+            "{case}: the cause is shown: {stderr}"
+        );
+        assert!(
+            !stderr.contains("--with-opt-") && !stderr.contains("Provided configuration options"),
+            "{case}: mkmf's option list is not: {stderr}"
+        );
+        assert!(
+            !stderr.contains("mkmf.log which can be found")
+                && !stderr.contains("/mkmf.log")
+                && !stderr.contains("gem_make.out"),
+            "{case}: no pointer to a log that was removed: {stderr}"
+        );
+        assert!(
+            !stderr.contains("Install a compiler toolchain and the Ruby headers and apply again"),
+            "{case}: the remedy does not assume the compiler is what is missing: {stderr}"
+        );
+        if precompiled {
+            assert!(
+                stderr.contains("`gem install sp_native -v 1.0.0 --platform ruby`")
+                    && stderr.contains("the libraries the gem builds against"),
+                "{case}: the remedy says what a precompiled gem's rebuild needs: {stderr}"
+            );
+        } else {
+            assert!(
+                stderr.contains("a library the gem builds against")
+                    && stderr.contains("socket-patch scan --mode hosted"),
+                "{case}: {stderr}"
+            );
+        }
+        assert_eq!(
+            stderr
+                .matches("did not build from the patched sources")
+                .count(),
+            1,
+            "{case}: the failure is printed once: {stderr}"
+        );
+        // Nor is a copy that was put back advised about what reverts its
+        // patch.
+        assert!(!stderr.contains("Warning:"), "{case}: {stderr}");
+        assert_tree(&proj.join("vendor"), &tree_before, &case);
+
+        // The machine channel keeps the failure as the package's error and
+        // as a coded warning.
+        let (code, stdout, stderr) = ruby.run(&proj, &["apply", "--json", "--offline"], &[]);
+        assert_eq!(code, 1, "{case}: {stdout}\n{stderr}");
+        let envelope = parse_json_envelope(&stdout);
+        let warnings = envelope["warnings"].as_array().expect("warnings[]");
+        assert!(
+            warnings.iter().any(|w| {
+                w["code"] == "native_extension_build_failed"
+                    && w["detail"]
+                        .as_str()
+                        .is_some_and(|d| d.contains("Can't find the 'libsp.h header"))
+            }),
+            "{case}: {stdout}"
+        );
+        assert!(!stdout.contains("--redownload"), "{case}: {stdout}");
+        assert_tree(&proj.join("vendor"), &tree_before, &case);
+    }
+}
+
+/// A failed build puts back what this run wrote, and no more: a file an
+/// earlier run left patched stays patched, so the copy is still advised
+/// that `bundle install --redownload` reverts it.
+#[cfg(unix)]
+#[test]
+fn a_failed_build_keeps_the_advisory_of_a_file_patched_before() {
+    let (_tmp, proj, gem_dir) = fake_native_gem(true);
+    let (before, after) = (c_source(1), c_source(2));
+    let lib_after = format!("{LIB_RB}# patched\n");
+    write_record(
+        &proj.join(".socket"),
+        PURL,
+        &[
+            (C_KEY, Some(&before), &after),
+            ("lib/sp_native.rb", Some(LIB_RB), &lib_after),
+        ],
+    );
+    std::fs::write(gem_dir.join("lib/sp_native.rb"), &lib_after).unwrap();
+    let ruby = FakeRuby::new();
+    ruby.fail_builds();
+    let tree_before = walk_files(&proj.join("vendor"));
+
+    let (code, stdout, stderr) = ruby.run(&proj, &["apply", "--offline"], &[]);
+    assert_eq!(code, 1, "{stdout}\n{stderr}");
+    assert!(
+        stderr.contains("native_extension_build_failed:"),
+        "{stderr}"
+    );
+    assert_eq!(
+        stderr.matches("bundle install --redownload").count(),
+        1,
+        "{stderr}"
+    );
+    assert_tree(&proj.join("vendor"), &tree_before, "after the failed build");
 }
 
 /// Whatever keeps a gem RubyGems built from being rebuilt from its source
