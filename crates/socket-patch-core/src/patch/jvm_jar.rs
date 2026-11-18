@@ -616,7 +616,7 @@ async fn swap_copies(
                 .map(|(_, original)| {
                     read.entry(sha2::Sha256::digest(original).into())
                         .or_insert_with(|| {
-                            Digests::of_bytes(original).map(|members| {
+                            Digests::of_bytes(original).and_then(|members| {
                                 difference_outside_patch(
                                     (original, &members),
                                     (&jar, service),
@@ -890,7 +890,8 @@ fn is_original_of(
 ) -> bool {
     members_at_before(candidate, files)
         && Digests::of_bytes(candidate).is_ok_and(|members| {
-            difference_outside_patch((candidate, &members), patched_copy, files).is_empty()
+            difference_outside_patch((candidate, &members), patched_copy, files)
+                .is_ok_and(|difference| difference.is_empty())
         })
 }
 

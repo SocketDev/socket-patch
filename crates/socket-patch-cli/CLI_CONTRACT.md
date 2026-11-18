@@ -2831,8 +2831,9 @@ vouches for, else the registry's own download held to the same checksum. Every e
 the JVM would load must hold the same content in both, whatever unix mode it carries;
 the record's members and signature files (`META-INF/*.SF`, `.RSA`, `.DSA`, `.EC`) are
 exempt and directory entries may differ. The manifest of a jar the patch service
-re-signed may differ in the digests of the patched members, by the rule under
-[Agent mode](#agent-mode-apply-scan---mode-agent). A jar that adds, drops or changes anything
+signed again may differ as that signing leaves it (digest lines changed for the
+patched members and added for the others, sections added for entries it did not
+list), by the rule under [Agent mode](#agent-mode-apply-scan---mode-agent). A jar that adds, drops or changes anything
 else is refused with `vendor_prebuilt_integrity_mismatch`, the detail naming up to
 three such members, and a first vendoring commits and wires nothing.
 
@@ -3253,11 +3254,13 @@ only as follows; anything else is the refusal above with the reason added:
 4. A section is added only for a member the record adds or changes, or for an entry
    that both jars hold with identical bytes and the installed manifest did not list.
    It holds a `Name` and verified digests alone.
-5. A section is removed only for a member the record deletes.
+5. No section is removed.
 
 A digest attribute is one the JDK reads when it verifies a jar: `SHA-256-Digest`,
-`SHA-384-Digest`, `SHA-512-Digest`, `SHA1-Digest`, `SHA-1-Digest`, `MD5-Digest`. An
-added attribute of any other name is a refusal. The manifest is read as the JAR
+`SHA-384-Digest`, `SHA-512-Digest`, `SHA1-Digest`, `SHA-1-Digest`, `MD5-Digest`,
+matched without regard to case. An added or changed attribute of any other name is a
+refusal, the other digests the JDK reads (`SHA-224-Digest`, the SHA-3 ones) among
+them: the service writes none. The manifest is read as the JAR
 specification lays it out (lines end in `\r\n`, `\n` or `\r`, a leading space
 continues a line wrapped at 72 bytes, a blank line ends a section) and its sections
 are compared as the bytes in the file. Blank lines are not compared, so a terminator
@@ -3266,9 +3269,15 @@ manifest with no terminator, which a JVM ignores, may be dropped. The signature
 itself is not verified; that is the JVM's. A rollback finds the original of such a
 copy by the same rule.
 
-A record that lists `META-INF/MANIFEST.MF` itself is not covered: the service's
-manifest must then still be the record's after-blob, byte for byte, as for any member
-the record changes.
+A jar whose patch record itself lists `META-INF/MANIFEST.MF` is refused for now when
+the service signed it again. The manifest is then a member the record changes, held
+to its `afterHash`, and the signed manifest is that blob with its digests completed,
+not the blob. Accepting it needs the record's blob wherever a member is held to its
+`afterHash`, and `rollback`, `vex` and the vendored check do not have it at hand.
+
+A jar past a limit while its manifest is read is `jvm_jar_too_large` (vendored:
+`vendor_artifact_too_large`), never a mismatch; the manifest has no limit of its own
+below those of the jar.
 
 Jars are read within fixed limits, counted on the bytes actually inflated and on the
 archive's own entry count, never on the sizes an archive declares: 200,000 entries

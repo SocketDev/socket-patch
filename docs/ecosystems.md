@@ -1139,9 +1139,11 @@ they need network access (`jvm_agent_service_required` offline). Before the swap
 service's jar is compared with the installed one member by member: everything the
 JVM would load outside the patched members and signature files must be identical, or
 that copy is left alone (`jvm_agent_service_jar_mismatch`, naming the members). A
-signed jar the patch service re-signed (a security provider such as Bouncy Castle's)
-may also differ in the manifest digests of the patched members, and in nothing else
-of the manifest. Jars
+signed jar the patch service signed again (a security provider such as Bouncy
+Castle's) may also differ in its manifest, as that signing leaves it: digest lines
+changed for the patched members and added for the others, and sections added for
+entries the manifest did not list. Nothing else of the manifest may differ; the CLI
+contract has the rule. Jars
 of up to 200,000 entries and 1 GiB inflated are handled; one past that is
 `jvm_jar_too_large`. The original is
 backed up under `.socket/jvm-originals/` and `rollback` restores from it. A `~/.m2`

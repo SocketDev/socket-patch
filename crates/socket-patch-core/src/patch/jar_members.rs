@@ -110,6 +110,8 @@ pub(crate) struct Jar<R> {
     archive_len: u64,
     budget: u64,
     left: u64,
+    /// Member indices by the raw bytes of their names; built on first use.
+    names: Option<std::collections::HashMap<Vec<u8>, usize>>,
 }
 
 impl<'a> Jar<std::io::Cursor<&'a [u8]>> {
@@ -137,7 +139,30 @@ impl<R: Read + Seek> Jar<R> {
             archive_len,
             budget,
             left: budget,
+            names: None,
         })
+    }
+
+    /// The index of the member `name`, matched on the raw bytes of the
+    /// central directory, which is what a JVM matches on and what
+    /// [`Self::content_digests`] keys by. The zip reader's own lookup is by
+    /// a name it decodes as CP437 when the entry lacks the UTF-8 flag, so a
+    /// UTF-8 name written without that flag would be missed. Of two entries
+    /// with one name the last is the member.
+    fn index_of(&mut self, name: &str) -> Option<usize> {
+        if name.ends_with('/') {
+            return None;
+        }
+        if self.names.is_none() {
+            let mut names = std::collections::HashMap::new();
+            for index in 0..self.zip.len() {
+                if let Ok(entry) = self.zip.by_index_raw(index) {
+                    names.insert(entry.name_raw().to_vec(), index);
+                }
+            }
+            self.names = Some(names);
+        }
+        self.names.as_ref()?.get(name.as_bytes()).copied()
     }
 
     fn over_budget(&self) -> JarError {
@@ -203,10 +228,7 @@ impl<R: Read + Seek> Jar<R> {
     /// Inflate the member `name` into `sink`, within the pass's budget.
     /// `false` when the jar has no such member.
     fn stream(&mut self, name: &str, mut sink: impl FnMut(&[u8])) -> Result<bool, JarError> {
-        if name.ends_with('/') {
-            return Ok(false);
-        }
-        let Some(index) = self.zip.index_for_name(name) else {
+        let Some(index) = self.index_of(name) else {
             return Ok(false);
         };
         let mut left = self.left;
@@ -234,27 +256,12 @@ impl<R: Read + Seek> Jar<R> {
         Ok(true)
     }
 
-    /// The bytes of the member `name` when it holds at most `cap` of them;
-    /// `None` when the jar has no such member.
-    pub(crate) fn member_bytes(
-        &mut self,
-        name: &str,
-        cap: u64,
-    ) -> Result<Option<Vec<u8>>, JarError> {
+    /// The bytes of the member `name`, read within the pass's budget (the
+    /// only bound: a member a jar within the limits may hold is one that
+    /// can be read); `None` when the jar has no such member.
+    pub(crate) fn member_bytes(&mut self, name: &str) -> Result<Option<Vec<u8>>, JarError> {
         let mut bytes = Vec::new();
-        let mut over = false;
-        let found = self.stream(name, |chunk| {
-            over |= (bytes.len() + chunk.len()) as u64 > cap;
-            if !over {
-                bytes.extend_from_slice(chunk);
-            }
-        })?;
-        if over {
-            return Err(JarError::TooLarge(format!(
-                "its member `{name}` holds more than {} MiB",
-                mib(cap)
-            )));
-        }
+        let found = self.stream(name, |chunk| bytes.extend_from_slice(chunk))?;
         Ok(found.then_some(bytes))
     }
 
@@ -271,15 +278,14 @@ impl<R: Read + Seek> Jar<R> {
             Sha256(Sha256),
             Sha384(sha2::Sha384),
             Sha512(sha2::Sha512),
-            // No streaming MD5 here: the member is held, within the budget.
-            Md5(Vec<u8>),
+            Md5(Md5),
         }
         let mut hasher = match algorithm.replace('-', "").to_ascii_uppercase().as_str() {
             "SHA1" => Hasher::Sha1(Default::default()),
             "SHA256" => Hasher::Sha256(Default::default()),
             "SHA384" => Hasher::Sha384(Default::default()),
             "SHA512" => Hasher::Sha512(Default::default()),
-            "MD5" => Hasher::Md5(Vec::new()),
+            "MD5" => Hasher::Md5(Md5::new()),
             _ => {
                 return Err(JarError::Unreadable(format!(
                     "the digest algorithm {algorithm} is not one this reads"
@@ -291,24 +297,21 @@ impl<R: Read + Seek> Jar<R> {
             Hasher::Sha256(h) => h.update(chunk),
             Hasher::Sha384(h) => h.update(chunk),
             Hasher::Sha512(h) => h.update(chunk),
-            Hasher::Md5(held) => held.extend_from_slice(chunk),
+            Hasher::Md5(h) => h.update(chunk),
         })?;
         Ok(found.then(|| match hasher {
             Hasher::Sha1(h) => h.finalize().to_vec(),
             Hasher::Sha256(h) => h.finalize().to_vec(),
             Hasher::Sha384(h) => h.finalize().to_vec(),
             Hasher::Sha512(h) => h.finalize().to_vec(),
-            Hasher::Md5(held) => md5(&held).to_vec(),
+            Hasher::Md5(h) => h.finalize().to_vec(),
         }))
     }
 
     /// The git-blob sha256 of the member `name`, `None` when the jar has no
     /// such member. Counts against the pass's budget.
     pub(crate) fn member_git_sha256(&mut self, name: &str) -> Result<Option<String>, JarError> {
-        if name.ends_with('/') {
-            return Ok(None);
-        }
-        let Some(index) = self.zip.index_for_name(name) else {
+        let Some(index) = self.index_of(name) else {
             return Ok(None);
         };
         let entry = self
@@ -330,25 +333,117 @@ impl<R: Read + Seek> Jar<R> {
 }
 
 /// RFC 1321 MD5, for the `MD5-Digest` attributes of old jar manifests (the
-/// crate has no MD5 otherwise, and nothing else here should use one).
-fn md5(input: &[u8]) -> [u8; 16] {
+/// crate has no MD5 otherwise, and nothing else here should use one). Fed
+/// block by block, so a member is never held to be hashed.
+struct Md5 {
+    state: [u32; 4],
+    block: [u8; 64],
+    held: usize,
+    length: u64,
+}
+
+impl Md5 {
+    /// `floor(2^32 * abs(sin(i + 1)))`, as RFC 1321 tabulates it.
+    const K: [u32; 64] = [
+        0xd76a_a478,
+        0xe8c7_b756,
+        0x2420_70db,
+        0xc1bd_ceee,
+        0xf57c_0faf,
+        0x4787_c62a,
+        0xa830_4613,
+        0xfd46_9501,
+        0x6980_98d8,
+        0x8b44_f7af,
+        0xffff_5bb1,
+        0x895c_d7be,
+        0x6b90_1122,
+        0xfd98_7193,
+        0xa679_438e,
+        0x49b4_0821,
+        0xf61e_2562,
+        0xc040_b340,
+        0x265e_5a51,
+        0xe9b6_c7aa,
+        0xd62f_105d,
+        0x0244_1453,
+        0xd8a1_e681,
+        0xe7d3_fbc8,
+        0x21e1_cde6,
+        0xc337_07d6,
+        0xf4d5_0d87,
+        0x455a_14ed,
+        0xa9e3_e905,
+        0xfcef_a3f8,
+        0x676f_02d9,
+        0x8d2a_4c8a,
+        0xfffa_3942,
+        0x8771_f681,
+        0x6d9d_6122,
+        0xfde5_380c,
+        0xa4be_ea44,
+        0x4bde_cfa9,
+        0xf6bb_4b60,
+        0xbebf_bc70,
+        0x289b_7ec6,
+        0xeaa1_27fa,
+        0xd4ef_3085,
+        0x0488_1d05,
+        0xd9d4_d039,
+        0xe6db_99e5,
+        0x1fa2_7cf8,
+        0xc4ac_5665,
+        0xf429_2244,
+        0x432a_ff97,
+        0xab94_23a7,
+        0xfc93_a039,
+        0x655b_59c3,
+        0x8f0c_cc92,
+        0xffef_f47d,
+        0x8584_5dd1,
+        0x6fa8_7e4f,
+        0xfe2c_e6e0,
+        0xa301_4314,
+        0x4e08_11a1,
+        0xf753_7e82,
+        0xbd3a_f235,
+        0x2ad7_d2bb,
+        0xeb86_d391,
+    ];
     const SHIFTS: [u32; 64] = [
         7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 5, 9, 14, 20, 5, 9, 14, 20, 5,
         9, 14, 20, 5, 9, 14, 20, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 6, 10,
         15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21,
     ];
-    let constant = |i: usize| ((i as f64 + 1.0).sin().abs() * 4_294_967_296.0) as u32;
-    let mut state: [u32; 4] = [0x6745_2301, 0xefcd_ab89, 0x98ba_dcfe, 0x1032_5476];
-    let mut message = input.to_vec();
-    message.push(0x80);
-    while message.len() % 64 != 56 {
-        message.push(0);
+
+    fn new() -> Self {
+        Md5 {
+            state: [0x6745_2301, 0xefcd_ab89, 0x98ba_dcfe, 0x1032_5476],
+            block: [0; 64],
+            held: 0,
+            length: 0,
+        }
     }
-    message.extend_from_slice(&(input.len() as u64).wrapping_mul(8).to_le_bytes());
-    for block in message.chunks(64) {
+
+    fn update(&mut self, mut input: &[u8]) {
+        self.length = self.length.wrapping_add(input.len() as u64);
+        while !input.is_empty() {
+            let take = (64 - self.held).min(input.len());
+            self.block[self.held..self.held + take].copy_from_slice(&input[..take]);
+            self.held += take;
+            input = &input[take..];
+            if self.held == 64 {
+                self.compress();
+                self.held = 0;
+            }
+        }
+    }
+
+    fn compress(&mut self) {
+        let block = self.block;
         let word = |i: usize| u32::from_le_bytes(block[4 * i..4 * i + 4].try_into().unwrap());
-        let [mut a, mut b, mut c, mut d] = state;
-        for (i, shift) in SHIFTS.iter().enumerate() {
+        let [mut a, mut b, mut c, mut d] = self.state;
+        for (i, (k, shift)) in Self::K.into_iter().zip(Self::SHIFTS).enumerate() {
             let (mix, at) = match i / 16 {
                 0 => ((b & c) | (!b & d), i),
                 1 => ((d & b) | (!d & c), (5 * i + 1) % 16),
@@ -357,20 +452,29 @@ fn md5(input: &[u8]) -> [u8; 16] {
             };
             let rotated = a
                 .wrapping_add(mix)
-                .wrapping_add(constant(i))
+                .wrapping_add(k)
                 .wrapping_add(word(at))
-                .rotate_left(*shift);
+                .rotate_left(shift);
             (a, d, c, b) = (d, c, b, b.wrapping_add(rotated));
         }
-        for (sum, add) in state.iter_mut().zip([a, b, c, d]) {
+        for (sum, add) in self.state.iter_mut().zip([a, b, c, d]) {
             *sum = sum.wrapping_add(add);
         }
     }
-    let mut out = [0u8; 16];
-    for (bytes, word) in out.chunks_mut(4).zip(state) {
-        bytes.copy_from_slice(&word.to_le_bytes());
+
+    fn finalize(mut self) -> [u8; 16] {
+        let bits = self.length.wrapping_mul(8);
+        self.update(&[0x80]);
+        while self.held != 56 {
+            self.update(&[0]);
+        }
+        self.update(&bits.to_le_bytes());
+        let mut out = [0u8; 16];
+        for (bytes, word) in out.chunks_mut(4).zip(self.state) {
+            bytes.copy_from_slice(&word.to_le_bytes());
+        }
+        out
     }
-    out
 }
 
 /// Hold what an archive's end records declare of its central directory to
@@ -461,8 +565,8 @@ impl Digests {
     }
 
     /// The digest of the member `name`.
-    pub(crate) fn get(&self, name: &str) -> Option<&[u8; 32]> {
-        self.0.get(name.as_bytes())
+    pub(crate) fn get(&self, name: impl AsRef<[u8]>) -> Option<&[u8; 32]> {
+        self.0.get(name.as_ref())
     }
 }
 
@@ -476,8 +580,10 @@ pub(crate) struct Difference {
     pub missing: Vec<String>,
     /// In both, with other content.
     pub changed: Vec<String>,
-    /// Why the manifest, when it is among `changed`, is not the original's
-    /// as a re-signing leaves it ([`super::jar_manifest`]).
+    /// Why the manifest of a signed jar, when it is among `changed`, is not
+    /// the original's as signing the jar again leaves it
+    /// ([`super::jar_manifest`]). `None` for a jar that is not signed: its
+    /// manifest is a changed member like any other.
     pub manifest: Option<String>,
 }
 
@@ -506,7 +612,7 @@ impl Difference {
             format!("{} {kind} ({})", names.len(), shown.join(", "))
         })
         .chain(self.manifest.iter().map(|why| {
-            format!("the manifest is not the original's with a re-signing's digests: {why}")
+            format!("the manifest is not the original's as signing the jar again leaves it: {why}")
         }))
         .collect::<Vec<_>>()
         .join(", ")
@@ -514,29 +620,32 @@ impl Difference {
 }
 
 /// [`unpatched_difference`] of two jars `(bytes, members)` for the record
-/// `files`, less a manifest that differs only as a re-signing of the
-/// patched jar leaves it ([`super::jar_manifest::resigned_refusal`]): the
+/// `files`, less the manifest of a signed jar that differs only as signing
+/// the patched jar again leaves it ([`super::jar_manifest::resigned`]): the
 /// one member outside the patch whose content may change, and only so.
+/// `Err` is a jar past a limit while its manifest was read.
 pub(crate) fn difference_outside_patch(
     original: (&[u8], &Digests),
     patched: (&[u8], &Digests),
     files: &std::collections::HashMap<String, crate::manifest::schema::PatchFileInfo>,
-) -> Difference {
-    use super::jar_manifest::{resigned_refusal, MANIFEST};
+) -> Result<Difference, JarError> {
+    use super::jar_manifest::{resigned, Resigned, MANIFEST};
     let names: Vec<&str> = files
         .keys()
         .map(|key| crate::patch::apply::normalize_file_path(key))
         .collect();
     let mut difference = unpatched_difference(original.1, patched.1, &names);
     if let Some(at) = difference.changed.iter().position(|name| name == MANIFEST) {
-        match resigned_refusal(original, patched, files, None) {
-            None => {
+        match resigned(original, patched, files)? {
+            // Not signed: a base mismatch like any other member's.
+            Resigned::Unsigned => {}
+            Resigned::Accepted => {
                 difference.changed.remove(at);
             }
-            why => difference.manifest = why,
+            Resigned::Refused(why) => difference.manifest = Some(why),
         }
     }
-    difference
+    Ok(difference)
 }
 
 /// How `candidate` differs from `original` outside the members named in
@@ -596,6 +705,20 @@ pub(crate) mod testing {
         out.finish().unwrap().into_inner()
     }
 
+    /// `jar` with the UTF-8 flag cleared on every entry, as an archiver
+    /// that writes UTF-8 names without announcing them leaves it. For jars
+    /// whose member bytes do not spell a zip header.
+    pub(crate) fn without_utf8_flag(mut jar: Vec<u8>) -> Vec<u8> {
+        for at in 0..jar.len().saturating_sub(10) {
+            match &jar[at..at + 4] {
+                b"PK\x03\x04" => jar[at + 7] &= !0x08,
+                b"PK\x01\x02" => jar[at + 9] &= !0x08,
+                _ => {}
+            }
+        }
+        jar
+    }
+
     /// [`jar_with_modes`] of plain files.
     pub(crate) fn jar(members: &[(&str, &[u8])]) -> Vec<u8> {
         let members: Vec<(&str, &[u8], Option<u32>)> =
@@ -634,6 +757,33 @@ mod tests {
     /// The wheel reader's limits, which a jar must be able to pass.
     const OLD_ENTRIES: usize = 10_000;
     const OLD_BYTES: u64 = 64 * 1024 * 1024;
+
+    /// A member is found by the raw bytes of its name. A UTF-8 name written
+    /// without the UTF-8 flag is one the zip reader decodes as CP437, so its
+    /// own lookup misses it; a JVM reads the bytes.
+    #[test]
+    fn a_member_is_found_by_the_raw_bytes_of_its_name() {
+        const NAME: &str = "org/x/\u{dc}n\u{ef}.class";
+        let bytes = testing::without_utf8_flag(jar(&[(NAME, b"code"), ("a/B.class", b"b")]));
+        let decoded: Vec<String> = zip::ZipArchive::new(std::io::Cursor::new(&bytes))
+            .unwrap()
+            .file_names()
+            .map(str::to_string)
+            .collect();
+        assert!(!decoded.iter().any(|name| name == NAME), "{decoded:?}");
+        let mut jar = Jar::of_bytes(&bytes).unwrap();
+        assert_eq!(
+            jar.member_git_sha256(NAME).unwrap(),
+            Some(compute_git_sha256_from_bytes(b"code"))
+        );
+        assert_eq!(
+            jar.member_bytes(NAME).unwrap().as_deref(),
+            Some(&b"code"[..])
+        );
+        assert!(jar.member_digest(NAME, "SHA-1").unwrap().is_some());
+        assert!(Digests::of_bytes(&bytes).unwrap().get(NAME).is_some());
+        assert_eq!(jar.member_git_sha256("org/x/absent.class").unwrap(), None);
+    }
 
     /// A member's git hash is the buffered hash of its bytes, stored,
     /// deflated or empty; an absent member is `None`.
@@ -698,8 +848,50 @@ mod tests {
 
     #[test]
     fn member_digests_are_the_algorithms_a_manifest_names() {
-        assert_eq!(hex::encode(md5(b"abc")), "900150983cd24fb0d6963f7d28e17f72");
-        assert_eq!(hex::encode(md5(b"")), "d41d8cd98f00b204e9800998ecf8427e");
+        // The RFC 1321 test suite, the multi-block vectors among them.
+        let md5 = |input: &[u8]| {
+            let mut whole = Md5::new();
+            whole.update(input);
+            let mut pieces = Md5::new();
+            input.chunks(7).for_each(|piece| pieces.update(piece));
+            let digest = hex::encode(whole.finalize());
+            assert_eq!(digest, hex::encode(pieces.finalize()), "fed in pieces");
+            digest
+        };
+        const LETTERS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+        let digits = b"1234567890".repeat(8);
+        for (input, digest) in [
+            (&b""[..], "d41d8cd98f00b204e9800998ecf8427e"),
+            (b"a", "0cc175b9c0f1b6a831c399e269772661"),
+            (b"abc", "900150983cd24fb0d6963f7d28e17f72"),
+            (b"message digest", "f96b697d7cb7938d525a2f31aaf161d0"),
+            (
+                b"abcdefghijklmnopqrstuvwxyz",
+                "c3fcd3d76192e4007dfb496cca67e13b",
+            ),
+            (LETTERS, "d174ab98d277d9f5a5611c2c9f419d9f"),
+            (&digits, "57edf4a22be3c955ac49da2e2107b67a"),
+        ] {
+            assert_eq!(md5(input), digest, "{:?}", String::from_utf8_lossy(input));
+        }
+        // A member of more than one block, and of many.
+        let long = b"1234567890".repeat(100_000);
+        let big = jar(&[("a/Digits.class", &digits), ("a/Long.class", &long)]);
+        let mut big = Jar::of_bytes(&big).unwrap();
+        assert_eq!(
+            big.member_digest("a/Digits.class", "MD5")
+                .unwrap()
+                .map(hex::encode)
+                .unwrap(),
+            "57edf4a22be3c955ac49da2e2107b67a"
+        );
+        assert_eq!(
+            big.member_digest("a/Long.class", "MD5")
+                .unwrap()
+                .map(hex::encode)
+                .unwrap(),
+            md5(&long)
+        );
         let bytes = jar(&[("a/B.class", b"abc")]);
         let digest = |algorithm: &str| {
             let mut jar = Jar::of_bytes(&bytes).unwrap();

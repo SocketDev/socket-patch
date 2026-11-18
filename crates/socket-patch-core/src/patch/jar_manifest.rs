@@ -14,7 +14,7 @@
 //! original's" comparison ([`super::jar_members::unpatched_difference`]);
 //! the manifest is a member like any other, so that comparison refuses it.
 //!
-//! [`resigned_refusal`] accepts exactly that manifest and nothing wider.
+//! [`resigned`] accepts exactly that manifest and nothing wider.
 //! The patched jar must carry a signature file, and against the original
 //! manifest:
 //!
@@ -29,7 +29,11 @@
 //! 4. a section is added only for a member the record adds or changes, or
 //!    for an entry both jars hold with the same bytes that the original
 //!    manifest did not list; it holds a `Name` and verified digests alone;
-//! 5. a section is removed only for a member the record deletes.
+//! 5. no section is removed.
+//!
+//! A record that lists the manifest itself is outside this: the manifest
+//! is then a member the record changes, held to its `afterHash` like any
+//! other, and a jar signed again does not carry that blob byte for byte.
 //!
 //! A digest attribute is one the JDK reads when it verifies a jar:
 //! `SHA-256-Digest`, `SHA-384-Digest`, `SHA-512-Digest`, `SHA1-Digest`,
@@ -45,18 +49,15 @@
 //! terminator is one a JVM ignores, and is dropped from the original
 //! before the comparison.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use base64::Engine as _;
 
-use super::jar_members::{Digests, Jar};
+use super::jar_members::{Digests, Jar, JarError};
 use crate::manifest::schema::PatchFileInfo;
 use crate::patch::apply::normalize_file_path;
 
 pub(crate) const MANIFEST: &str = "META-INF/MANIFEST.MF";
-/// The largest manifest read. `bcprov-jdk18on`'s, with a section for each
-/// of 4,000 classes, is under 1 MiB.
-const MAX_MANIFEST_BYTES: u64 = 16 * 1024 * 1024;
 
 /// One attribute of a section: its name, its value with continuation lines
 /// joined, and the bytes it takes in the file (terminators included).
@@ -66,11 +67,16 @@ struct Attribute<'a> {
     raw: &'a [u8],
 }
 
-/// A manifest: the main section and the per-entry ones by entry name, each
-/// as the bytes of its lines.
+/// One per-entry section: the bytes of its lines, and its attributes.
+struct Section<'a> {
+    raw: &'a [u8],
+    attributes: Vec<Attribute<'a>>,
+}
+
+/// A manifest: the main section and the per-entry ones by entry name.
 struct Sections<'a> {
     main: &'a [u8],
-    entries: BTreeMap<Vec<u8>, &'a [u8]>,
+    entries: BTreeMap<Vec<u8>, Section<'a>>,
 }
 
 /// The end of the line that starts at `at`: `(content end, next line)`.
@@ -116,7 +122,7 @@ fn attributes(section: &[u8]) -> Result<Vec<Attribute<'_>>, String> {
     Ok(out)
 }
 
-/// Split a manifest into its sections.
+/// Split a manifest into its sections, each parsed once.
 fn sections(manifest: &[u8]) -> Result<Sections<'_>, String> {
     let mut runs: Vec<&[u8]> = Vec::new();
     let mut start = None;
@@ -145,21 +151,25 @@ fn sections(manifest: &[u8]) -> Result<Sections<'_>, String> {
         false => runs.next().unwrap_or(&manifest[..0]),
     };
     let mut entries = BTreeMap::new();
-    for run in runs {
-        let name = match attributes(run)?.first() {
+    for raw in runs {
+        let attributes = attributes(raw)?;
+        let name = match attributes.first() {
             Some(first) if first.name.eq_ignore_ascii_case(b"Name") => first.value.clone(),
             _ => return Err("a section does not start with `Name:`".to_string()),
         };
         let shown = String::from_utf8_lossy(&name).into_owned();
-        if entries.insert(name, run).is_some() {
+        if entries.insert(name, Section { raw, attributes }).is_some() {
             return Err(format!("it holds two sections for `{shown}`"));
         }
     }
     Ok(Sections { main, entries })
 }
 
-/// The algorithm of a digest attribute the JDK reads when it verifies a
-/// jar, as [`Jar::member_digest`] names it.
+/// The algorithm of a digest attribute this reads, as
+/// [`Jar::member_digest`] names it. The JDK reads a few more
+/// (`SHA-224-Digest`, the SHA-3 ones); the patch service writes none of
+/// them, and one that is added or changed is refused like any attribute
+/// that is not a digest.
 fn digest_algorithm(attribute: &[u8]) -> Option<&'static str> {
     [
         ("SHA-256-Digest", "SHA-256"),
@@ -183,9 +193,10 @@ fn terminated(manifest: &[u8]) -> &[u8] {
 }
 
 /// The digest attributes of `is` that must be the member's own, when `is`
-/// is `was` as a re-signing leaves a section: every line of `was` kept in
+/// is `was` as signing again leaves a section: every line of `was` kept in
 /// order, digest attributes added, and, for a member the record `changes`,
-/// digest values changed. `Err` says what else differs.
+/// digest values changed. Attribute names are matched as a manifest reads
+/// them, without regard to case. `Err` says what else differs.
 fn follows<'s, 'a>(
     was: &[Attribute<'a>],
     is: &'s [Attribute<'a>],
@@ -202,7 +213,7 @@ fn follows<'s, 'a>(
                     verify.push(attribute);
                 }
             }
-            Some(old) if changes && digest && old.name == attribute.name => {
+            Some(old) if changes && digest && old.name.eq_ignore_ascii_case(attribute.name) => {
                 kept += 1;
                 verify.push(attribute);
             }
@@ -224,123 +235,156 @@ fn follows<'s, 'a>(
     }
 }
 
-/// Each of `digests` is the digest of `member` in `jar`. `Err` says which
-/// is not.
+/// What a patched jar's manifest is to the original's.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Resigned {
+    /// The patched jar carries no signature file: its manifest is a member
+    /// like any other, and a difference in it an ordinary one.
+    Unsigned,
+    /// The manifest is the original's as signing the jar again leaves it.
+    Accepted,
+    /// It is not: why.
+    Refused(String),
+}
+
+/// Why the comparison stopped: a jar past a limit, or a difference.
+enum Stop {
+    Limit(JarError),
+    Why(String),
+}
+
+impl From<String> for Stop {
+    fn from(why: String) -> Self {
+        Stop::Why(why)
+    }
+}
+
+/// A read that failed: a limit stays a limit, anything else is `why`.
+fn stop(e: JarError, why: impl FnOnce(&JarError) -> String) -> Stop {
+    match e.is_too_large() {
+        true => Stop::Limit(e),
+        false => Stop::Why(why(&e)),
+    }
+}
+
+/// Each of `digests` is the digest of `member` in `jar`. Its SHA-256 is
+/// the one the comparison already has (`known`); only another algorithm
+/// inflates the member again.
 fn digests_hold<R: std::io::Read + std::io::Seek>(
     jar: &mut Jar<R>,
+    known: &Digests,
     member: &str,
     digests: &[&Attribute<'_>],
-) -> Result<(), String> {
+) -> Result<(), Stop> {
     for attribute in digests {
         let algorithm = digest_algorithm(attribute.name).expect("a digest attribute");
-        let actual = jar
-            .member_digest(member, algorithm)
-            .map_err(|e| format!("`{member}` could not be hashed ({e})"))?
-            .ok_or_else(|| {
-                format!("it has a section for `{member}`, which the jar does not hold")
-            })?;
+        let actual = match algorithm {
+            "SHA-256" => known.get(member).map(|digest| digest.to_vec()),
+            _ => jar
+                .member_digest(member, algorithm)
+                .map_err(|e| stop(e, |e| format!("`{member}` could not be hashed ({e})")))?,
+        };
+        let actual = actual.ok_or_else(|| {
+            format!("it has a section for `{member}`, which the jar does not hold")
+        })?;
         let declared = base64::engine::general_purpose::STANDARD
             .decode(&attribute.value)
             .ok();
         if declared.as_deref() != Some(actual.as_slice()) {
-            return Err(format!(
+            return Err(Stop::Why(format!(
                 "its {algorithm} digest of `{member}` does not match the member in the jar"
-            ));
+            )));
         }
     }
     Ok(())
 }
 
-/// Why `patched`'s manifest is not the original's as a re-signing of the
-/// record `files` leaves it (see the module docs); `None` when it is. Each
-/// jar comes with its members' content digests. `record_manifest` is the
-/// record's after-blob of the manifest when the record lists the manifest
-/// itself: the patched manifest is then held to that instead of to the
-/// original jar's.
-pub(crate) fn resigned_refusal(
+/// Whether `patched`'s manifest is the original's as signing the patched
+/// jar again leaves it, for the record `files` (see the module docs). Each
+/// jar comes with its members' content digests. `Err` is a jar past a
+/// limit: that is the caller's too-large refusal, never a difference.
+pub(crate) fn resigned(
     original: (&[u8], &Digests),
     patched: (&[u8], &Digests),
     files: &HashMap<String, PatchFileInfo>,
-    record_manifest: Option<&[u8]>,
-) -> Option<String> {
-    resigned(original, patched, files, record_manifest).err()
+) -> Result<Resigned, JarError> {
+    let mut jar = Jar::of_bytes(patched.0)?;
+    if !jar.has_signature_file() {
+        return Ok(Resigned::Unsigned);
+    }
+    match compare(original, patched.1, &mut jar, files) {
+        Ok(()) => Ok(Resigned::Accepted),
+        Err(Stop::Why(why)) => Ok(Resigned::Refused(why)),
+        Err(Stop::Limit(e)) => Err(e),
+    }
 }
 
-fn resigned(
+fn compare<R: std::io::Read + std::io::Seek>(
     original: (&[u8], &Digests),
-    patched: (&[u8], &Digests),
+    members: &Digests,
+    jar: &mut Jar<R>,
     files: &HashMap<String, PatchFileInfo>,
-    record_manifest: Option<&[u8]>,
-) -> Result<(), String> {
-    let read = |jar: &[u8], whose: &str| -> Result<Vec<u8>, String> {
-        Jar::of_bytes(jar)
-            .and_then(|mut jar| jar.member_bytes(MANIFEST, MAX_MANIFEST_BYTES))
-            .map_err(|e| format!("{whose} manifest cannot be read ({e})"))?
-            .ok_or_else(|| format!("{whose} jar has no manifest"))
-    };
-    let mut jar = Jar::of_bytes(patched.0).map_err(|e| e.to_string())?;
-    if !jar.has_signature_file() {
-        return Err("the patched jar is not signed, so nothing accounts for it".to_string());
-    }
-    let before = match record_manifest {
-        Some(manifest) => manifest.to_vec(),
-        None => read(original.0, "the original")?,
-    };
-    let after = read(patched.0, "the patched")?;
+) -> Result<(), Stop> {
+    let before = Jar::of_bytes(original.0)
+        .and_then(|mut jar| jar.member_bytes(MANIFEST))
+        .map_err(|e| stop(e, |e| format!("the original manifest cannot be read ({e})")))?
+        .ok_or_else(|| "the original jar has no manifest".to_string())?;
+    let after = jar
+        .member_bytes(MANIFEST)
+        .map_err(|e| stop(e, |e| format!("the patched manifest cannot be read ({e})")))?
+        .ok_or_else(|| "the patched jar has no manifest".to_string())?;
     let old =
         sections(terminated(&before)).map_err(|why| format!("the original manifest: {why}"))?;
     let new = sections(&after).map_err(|why| format!("the patched manifest: {why}"))?;
     if old.main != new.main {
-        return Err("its main attributes differ".to_string());
+        return Err(Stop::Why("its main attributes differ".to_string()));
     }
-    let touched: HashMap<&str, &PatchFileInfo> = files
-        .iter()
-        .map(|(key, info)| (normalize_file_path(key), info))
+    let touched: HashSet<&[u8]> = files
+        .keys()
+        .map(|key| normalize_file_path(key).as_bytes())
         .collect();
     let names: std::collections::BTreeSet<&Vec<u8>> =
         old.entries.keys().chain(new.entries.keys()).collect();
     for name in names {
         let member = String::from_utf8_lossy(name);
-        let info = touched.get(member.as_ref());
-        // The record leaves the member in the jar with new bytes.
-        let changes = info.is_some_and(|info| !info.after_hash.is_empty());
-        let section = |why: String| format!("its section for `{member}` {why}");
+        // The record adds the member or changes its bytes.
+        let changes = touched.contains(name.as_slice());
         match (old.entries.get(name), new.entries.get(name)) {
-            (Some(_), None) if info.is_some_and(|info| info.after_hash.is_empty()) => {}
             (Some(_), None) => {
-                return Err(format!(
-                    "it drops the section for `{member}`, which the patch does not delete"
-                ))
+                return Err(Stop::Why(format!("it drops the section for `{member}`")))
             }
             (None, Some(is)) => {
                 let unchanged = matches!(
-                    (original.1.get(&member), patched.1.get(&member)),
+                    (original.1.get(name), members.get(name)),
                     (Some(was), Some(is)) if was == is
                 );
                 if !changes && !unchanged {
-                    return Err(format!(
+                    return Err(Stop::Why(format!(
                         "it adds a section for `{member}`, which is neither a member the patch \
                          adds or changes nor an unchanged entry of the original jar"
-                    ));
+                    )));
                 }
-                let is = attributes(is)?;
-                let digests: Vec<&Attribute<'_>> = is.iter().skip(1).collect();
+                let digests: Vec<&Attribute<'_>> = is.attributes.iter().skip(1).collect();
                 if digests.is_empty() || digests.iter().any(|a| digest_algorithm(a.name).is_none())
                 {
-                    return Err(section("is new and holds other than digests".to_string()));
+                    return Err(Stop::Why(format!(
+                        "its section for `{member}` is new and holds other than digests"
+                    )));
                 }
-                digests_hold(&mut jar, &member, &digests)?;
+                digests_hold(jar, members, &member, &digests)?;
             }
-            (Some(was), Some(is)) if was == is && !changes => {}
+            (Some(was), Some(is)) if was.raw == is.raw && !changes => {}
             (Some(was), Some(is)) => {
-                let (was, is) = (attributes(was)?, attributes(is)?);
-                let digests = follows(&was, &is, changes).map_err(|why| {
-                    section(match changes {
-                        true => why,
-                        false => format!("{why}, though the patch does not touch the member"),
-                    })
+                let digests = follows(&was.attributes, &is.attributes, changes).map_err(|why| {
+                    format!(
+                        "its section for `{member}` {why}{}",
+                        match changes {
+                            true => "",
+                            false => ", though the patch does not touch the member",
+                        }
+                    )
                 })?;
-                digests_hold(&mut jar, &member, &digests)?;
+                digests_hold(jar, members, &member, &digests)?;
             }
             (None, None) => unreachable!("a name comes from one of the two manifests"),
         }
@@ -491,7 +535,7 @@ mod tests {
 
     fn manifest_of(jar: &[u8]) -> String {
         let mut jar = Jar::of_bytes(jar).unwrap();
-        String::from_utf8(jar.member_bytes(MANIFEST, 1 << 20).unwrap().unwrap()).unwrap()
+        String::from_utf8(jar.member_bytes(MANIFEST).unwrap().unwrap()).unwrap()
     }
 
     fn refusal(
@@ -503,12 +547,25 @@ mod tests {
             Digests::of_bytes(upstream).unwrap(),
             Digests::of_bytes(served).unwrap(),
         );
-        let why = resigned_refusal((upstream, &was), (served, &is), files, None);
+        let verdict = resigned((upstream, &was), (served, &is), files).unwrap();
         // The comparison the swap and vendoring make agrees.
-        let difference = difference_outside_patch((upstream, &was), (served, &is), files);
-        assert_eq!(difference.manifest, why);
-        assert_eq!(difference.changed.is_empty(), why.is_none());
-        why
+        let difference = difference_outside_patch((upstream, &was), (served, &is), files).unwrap();
+        match verdict {
+            Resigned::Accepted => {
+                assert!(difference.is_empty(), "{}", difference.describe());
+                None
+            }
+            Resigned::Refused(why) => {
+                assert_eq!(difference.manifest.as_deref(), Some(why.as_str()));
+                assert!(difference.changed.contains(&MANIFEST.to_string()));
+                Some(why)
+            }
+            Resigned::Unsigned => {
+                assert_eq!(difference.manifest, None);
+                assert!(difference.changed.contains(&MANIFEST.to_string()));
+                Some("the patched jar is not signed".to_string())
+            }
+        }
     }
 
     /// The line `attribute: …` of `member`'s section in `manifest`.
@@ -580,11 +637,13 @@ mod tests {
         assert_eq!(refusal(&unix(UPSTREAM), &unix(SERVED), &record()), None);
     }
 
-    /// A record that lists the manifest itself: the served manifest is the
-    /// record's after-blob with its digests completed, and is held to that
-    /// blob, not to the installed manifest.
+    /// A record that lists the manifest itself is outside the rule: the
+    /// manifest is then a member the record changes, held to its
+    /// `afterHash`, and the served manifest (the record's blob with its
+    /// digests completed) is not that blob. The swap and vendoring refuse
+    /// such a jar at that check.
     #[test]
-    fn a_manifest_the_record_lists_is_held_to_the_records_blob() {
+    fn a_record_that_lists_the_manifest_is_not_accepted_yet() {
         let (upstream, served) = service!("manifest-in-record");
         let blob = manifest_of(upstream).replacen("\r\n", "\r\nX-Patched: yes\r\n", 1);
         let mut files = record_of(upstream, served, &[PLAIN], &[]);
@@ -595,18 +654,155 @@ mod tests {
                 after_hash: compute_git_sha256_from_bytes(blob.as_bytes()),
             },
         );
+        assert_ne!(manifest_of(served), blob);
+        assert!(!crate::vendor::common::zip_bytes_match_after_hashes(
+            served, &files
+        ));
+    }
+
+    /// A member is found by the raw bytes of its name, in the manifest rule
+    /// as in the reader: a UTF-8 name written without the UTF-8 flag, which
+    /// the zip reader decodes as something else, still has its digest.
+    #[test]
+    fn a_member_with_a_non_ascii_name_and_no_utf8_flag_is_verified() {
+        use crate::patch::jar_members::testing::without_utf8_flag;
+        const NAME: &str = "fixture/\u{dc}n\u{ef}code.class";
+        let (upstream, served) = service!("sha256");
+        let sha1 = base64::engine::general_purpose::STANDARD
+            .encode(<sha1::Sha1 as sha1::Digest>::digest(b"unicode"));
+        let extra: &[(&str, &[u8])] = &[(NAME, b"unicode")];
+        let upstream = without_utf8_flag(rewritten(upstream, |_| true, |m| m, extra));
+        let served = without_utf8_flag(rewritten(
+            served,
+            |_| true,
+            |m| format!("{m}Name: {NAME}\r\nSHA1-Digest: {sha1}\r\n\r\n"),
+            extra,
+        ));
+        let files = record_of(&upstream, &served, &[PLAIN], &[]);
+        assert_eq!(refusal(&upstream, &served, &files), None);
+    }
+
+    /// A manifest larger than any cap of its own is read within the jar
+    /// limits and accepted; a jar past a limit is the caller's too-large
+    /// refusal, never a difference.
+    #[test]
+    fn a_large_manifest_is_read_and_a_limit_is_a_limit() {
+        let (upstream, served) = service!("sha256");
+        let pad = format!(
+            "Manifest-Version: 1.0\r\nX-Pad: {}",
+            "a".repeat(17 * 1024 * 1024)
+        );
+        let padded = |jar: &[u8]| {
+            rewritten(
+                jar,
+                |_| true,
+                |m| m.replacen("Manifest-Version: 1.0", &pad, 1),
+                &[],
+            )
+        };
+        let (big_upstream, big_served) = (padded(upstream), padded(served));
+        let files = record_of(upstream, served, &[PLAIN], &[]);
+        assert_eq!(refusal(&big_upstream, &big_served, &files), None);
+
+        // A signed jar whose manifest inflates past what its size allows.
+        use std::io::Read as _;
+        let mut bomb = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let opts = zip::write::SimpleFileOptions::default();
+        bomb.start_file(MANIFEST, opts).unwrap();
+        std::io::copy(&mut std::io::repeat(0).take(65 * 1024 * 1024), &mut bomb).unwrap();
+        bomb.start_file("META-INF/SOCKET.SF", opts).unwrap();
+        let bomb = bomb.finish().unwrap().into_inner();
         let (was, is) = (
             Digests::of_bytes(upstream).unwrap(),
             Digests::of_bytes(served).unwrap(),
         );
-        let check =
-            |blob: Option<&[u8]>| resigned_refusal((upstream, &was), (served, &is), &files, blob);
-        assert_eq!(check(Some(blob.as_bytes())), None);
-        assert_eq!(check(None).as_deref(), Some("its main attributes differ"));
-        let other = blob.replace("X-Patched: yes", "X-Patched: no");
+        let limit = resigned((upstream, &was), (&bomb, &is), &files).unwrap_err();
+        assert!(limit.is_too_large(), "{limit:?}");
+        let limit = difference_outside_patch((upstream, &was), (&bomb, &is), &files).unwrap_err();
+        assert!(limit.is_too_large(), "{limit:?}");
+    }
+
+    /// A member's SHA-256 is the one the comparison already holds, so a
+    /// section that lists it beside another digest inflates the member once
+    /// more, not twice: 40 MiB under SHA-1 fits what this jar may inflate,
+    /// 80 MiB would not.
+    #[test]
+    fn a_sha256_digest_is_checked_without_inflating_the_member_again() {
+        use std::io::Write as _;
+        const BIG: &str = "big.bin";
+        let zeros = vec![0u8; 40 * 1024 * 1024];
+        let b64 = |digest: &[u8]| base64::engine::general_purpose::STANDARD.encode(digest);
+        let sha1 = |bytes: &[u8]| b64(&<sha1::Sha1 as sha1::Digest>::digest(bytes));
+        let sha256 = |bytes: &[u8]| b64(&<sha2::Sha256 as sha2::Digest>::digest(bytes));
+        let jar = |manifest: String, big: &[u8], signature: &str| {
+            let mut out = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+            let opts = zip::write::SimpleFileOptions::default();
+            for (name, bytes) in [
+                (MANIFEST, manifest.as_bytes()),
+                (BIG, big),
+                (signature, b"signature"),
+            ] {
+                out.start_file(name, opts).unwrap();
+                out.write_all(bytes).unwrap();
+            }
+            out.finish().unwrap().into_inner()
+        };
+        let head = format!("Manifest-Version: 1.0\r\n\r\nName: {BIG}\r\n");
+        let upstream = jar(
+            format!("{head}SHA1-Digest: {}\r\n\r\n", sha1(b"before")),
+            b"before",
+            "META-INF/UPSTREAM.SF",
+        );
+        let served = jar(
+            format!(
+                "{head}SHA1-Digest: {}\r\nSHA-256-Digest: {}\r\n\r\n",
+                sha1(&zeros),
+                sha256(&zeros)
+            ),
+            &zeros,
+            "META-INF/SOCKET.SF",
+        );
+        let files = record_of(&upstream, &served, &[BIG], &[]);
+        assert_eq!(refusal(&upstream, &served, &files), None);
+    }
+
+    /// Attribute names are matched as a manifest reads them, without regard
+    /// to case: upstream's `SHA-256-digest` is the line the service writes
+    /// back as `SHA-256-Digest`.
+    #[test]
+    fn a_digest_attribute_is_matched_whatever_its_case() {
+        let (upstream, served) = service!("sha256");
+        let lower = rewritten(
+            upstream,
+            |_| true,
+            |m| m.replacen("SHA-256-Digest: ", "SHA-256-digest: ", 1),
+            &[],
+        );
+        assert!(manifest_of(&lower).contains(&format!("Name: {PLAIN}\r\nSHA-256-digest: ")));
+        let files = record_of(upstream, served, &[PLAIN], &[]);
+        assert_eq!(refusal(&lower, served, &files), None);
+    }
+
+    /// Re-signing is named only for a signed jar. An unsigned jar whose
+    /// manifest differs is the ordinary wrong-base case, and reads as one.
+    #[test]
+    fn signing_is_named_only_for_a_signed_jar() {
+        let created = |m: String| m.replace("Created-By: ", "Built-By: ");
+        let describe = |served: &[u8]| {
+            let (was, is) = (
+                Digests::of_bytes(UPSTREAM).unwrap(),
+                Digests::of_bytes(served).unwrap(),
+            );
+            difference_outside_patch((UPSTREAM, &was), (served, &is), &record())
+                .unwrap()
+                .describe()
+        };
+        let unsigned = rewritten(SERVED, |n| !n.starts_with("META-INF/SOCKET."), created, &[]);
+        assert_eq!(describe(&unsigned), "1 changed (`META-INF/MANIFEST.MF`)");
         assert_eq!(
-            check(Some(other.as_bytes())).as_deref(),
-            Some("its main attributes differ")
+            describe(&edited(created)),
+            "1 changed (`META-INF/MANIFEST.MF`), the manifest is not the original's as signing \
+             the jar again leaves it: its main attributes differ"
         );
     }
 
@@ -684,7 +880,7 @@ mod tests {
                 "a dropped section",
                 edit(&|m| m.replace(&format!("Name: {UNTOUCHED}\r\n{existing}\r\n{inserted}\r\n\r\n"), "")),
                 files.clone(),
-                "it drops the section for `fixture/Unicode.class`, which the patch does not delete",
+                "it drops the section for `fixture/Unicode.class`",
             ),
             (
                 "an unsigned jar with the edited manifest",
@@ -709,41 +905,6 @@ mod tests {
         }
     }
 
-    /// A member the record deletes takes its section along.
-    #[test]
-    fn a_section_goes_with_a_member_the_record_deletes() {
-        let (upstream, served) = service!("sha256");
-        let gone = "fixture/Unicode.class";
-        let digest = line(&manifest_of(served), gone, "SHA-256-Digest");
-        let without = rewritten(
-            served,
-            |n| n != gone,
-            |m| m.replace(&format!("Name: {gone}\r\n{digest}\r\n\r\n"), ""),
-            &[],
-        );
-        let mut files = record_of(upstream, served, &[PLAIN], &[]);
-        assert!(refusal(upstream, &without, &files).is_some());
-        let before_hash = record_of(upstream, served, &[gone], &[])[gone]
-            .before_hash
-            .clone();
-        let after_hash = String::new();
-        files.insert(
-            gone.to_string(),
-            PatchFileInfo {
-                before_hash,
-                after_hash,
-            },
-        );
-        let (was, is) = (
-            Digests::of_bytes(upstream).unwrap(),
-            Digests::of_bytes(&without).unwrap(),
-        );
-        assert_eq!(
-            resigned_refusal((upstream, &was), (&without, &is), &files, None),
-            None
-        );
-    }
-
     /// Lines wrap at 72 bytes with a leading space on the continuation, and
     /// may end in `\n` or `\r` alone: a section is its bytes, its name is
     /// the joined value.
@@ -761,12 +922,12 @@ mod tests {
             parsed.entries.keys().collect::<Vec<_>>(),
             [&b"b.class".to_vec(), &long.clone().into_bytes()]
         );
-        let section = attributes(parsed.entries[long.as_bytes()]).unwrap();
+        let section = &parsed.entries[long.as_bytes()].attributes;
         assert_eq!(section.len(), 2);
         assert_eq!(section[0].value, long.as_bytes());
         assert_eq!(section[1].name, b"SHA-256-Digest");
         assert_eq!(
-            parsed.entries[b"b.class".as_slice()],
+            parsed.entries[b"b.class".as_slice()].raw,
             b"Name: b.class\rSHA-256-Digest: BBBB\r"
         );
         for broken in [

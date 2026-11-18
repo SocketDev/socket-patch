@@ -1524,8 +1524,10 @@ async fn acquire_classifier(
 
 /// The patched jar (the service's on a first vendoring, the committed one
 /// on a re-run) must be the upstream jar outside the record's members,
-/// signature files and, for a re-signed jar, the manifest digests of those
-/// members ([`crate::patch::jar_manifest`]): every other member a JVM would load, the
+/// signature files and, for a jar the service signed again, what that
+/// signing does to the manifest: digest lines changed or added, and sections
+/// added for entries it did not list ([`crate::patch::jar_manifest`]):
+/// every other member a JVM would load, the
 /// same in both ([`crate::patch::jar_members`], whose limits also bound
 /// the read). `Err` is the refusal's `(code, detail)`.
 fn verify_unpatched_jar_members(
@@ -1540,21 +1542,22 @@ fn verify_unpatched_jar_members(
     } else {
         "the patch service's jar"
     };
-    let read = |jar: &[u8], whose: &str| {
-        Digests::of_bytes(jar).map_err(|e| match e {
-            JarError::TooLarge(why) => (
-                super::verify::ARTIFACT_TOO_LARGE,
-                format!("{whose} cannot be checked: {why}"),
-            ),
-            JarError::Unreadable(why) => (
-                "vendor_prebuilt_integrity_mismatch",
-                format!("{whose} cannot be read: {why}"),
-            ),
-        })
+    // A jar past a limit is too large, whichever read met the limit; it is
+    // never reported as a jar that differs.
+    let unread = |e: JarError, whose: &str| match e {
+        JarError::TooLarge(why) => (
+            super::verify::ARTIFACT_TOO_LARGE,
+            format!("{whose} cannot be checked: {why}"),
+        ),
+        JarError::Unreadable(why) => (
+            "vendor_prebuilt_integrity_mismatch",
+            format!("{whose} cannot be read: {why}"),
+        ),
     };
-    let original = read(upstream, "the upstream jar")?;
-    let candidate = read(patched, whose)?;
-    let difference = difference_outside_patch((upstream, &original), (patched, &candidate), files);
+    let original = Digests::of_bytes(upstream).map_err(|e| unread(e, "the upstream jar"))?;
+    let candidate = Digests::of_bytes(patched).map_err(|e| unread(e, whose))?;
+    let difference = difference_outside_patch((upstream, &original), (patched, &candidate), files)
+        .map_err(|e| unread(e, whose))?;
     if !difference.is_empty() {
         return Err((
             "vendor_prebuilt_integrity_mismatch",
