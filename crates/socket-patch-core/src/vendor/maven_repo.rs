@@ -1107,15 +1107,11 @@ async fn vendor_maven_jvm(
             }
         };
         if let Some(upstream) = baseline {
-            let names: Vec<String> = record
-                .files
-                .keys()
-                .map(|k| crate::patch::apply::normalize_file_path(k).to_string())
-                .collect();
+            let files = record.files.clone();
             // Off the async workers: a pass inflates up to the jar limits.
             let compared = tokio::task::spawn_blocking(move || {
                 let verdict =
-                    verify_unpatched_jar_members(&upstream, &jar_bytes, &names, was_committed);
+                    verify_unpatched_jar_members(&upstream, &jar_bytes, &files, was_committed);
                 (jar_bytes, verdict)
             })
             .await;
@@ -1527,17 +1523,18 @@ async fn acquire_classifier(
 }
 
 /// The patched jar (the service's on a first vendoring, the committed one
-/// on a re-run) must be the upstream jar outside the record's members
-/// (`patched_members`, as a jar spells them) and signature files: every other member a JVM would load, the
+/// on a re-run) must be the upstream jar outside the record's members,
+/// signature files and, for a re-signed jar, the manifest digests of those
+/// members ([`crate::patch::jar_manifest`]): every other member a JVM would load, the
 /// same in both ([`crate::patch::jar_members`], whose limits also bound
 /// the read). `Err` is the refusal's `(code, detail)`.
 fn verify_unpatched_jar_members(
     upstream: &[u8],
     patched: &[u8],
-    patched_members: &[String],
+    files: &std::collections::HashMap<String, crate::manifest::schema::PatchFileInfo>,
     committed: bool,
 ) -> Result<(), (&'static str, String)> {
-    use crate::patch::jar_members::{unpatched_difference, Digests, JarError};
+    use crate::patch::jar_members::{difference_outside_patch, Digests, JarError};
     let whose = if committed {
         "the committed jar"
     } else {
@@ -1557,8 +1554,7 @@ fn verify_unpatched_jar_members(
     };
     let original = read(upstream, "the upstream jar")?;
     let candidate = read(patched, whose)?;
-    let names: Vec<&str> = patched_members.iter().map(String::as_str).collect();
-    let difference = unpatched_difference(&original, &candidate, &names);
+    let difference = difference_outside_patch((upstream, &original), (patched, &candidate), files);
     if !difference.is_empty() {
         return Err((
             "vendor_prebuilt_integrity_mismatch",
@@ -4493,6 +4489,30 @@ mod tests {
                 said[0]
             );
         }
+    }
+
+    /// The vendored comparison accepts a jar the patch service re-signed
+    /// (its signature files, and the manifest digests of the member the
+    /// patch changes) and refuses any other manifest change.
+    #[test]
+    fn a_resigned_provider_jar_is_upstream_outside_the_patch() {
+        use crate::patch::jar_manifest::fixture::{edited, record as resigned, SERVED, UPSTREAM};
+        let files = resigned();
+        for committed in [false, true] {
+            assert_eq!(
+                verify_unpatched_jar_members(UPSTREAM, SERVED, &files, committed),
+                Ok(())
+            );
+        }
+        let tampered = edited(|m| m.replace("Implementation-Title: ", "Implementation-Title: x"));
+        let (code, detail) =
+            verify_unpatched_jar_members(UPSTREAM, &tampered, &files, false).unwrap_err();
+        assert_eq!(code, "vendor_prebuilt_integrity_mismatch");
+        assert!(
+            detail.contains("1 changed (`META-INF/MANIFEST.MF`)")
+                && detail.contains("its main attributes differ"),
+            "{detail}"
+        );
     }
 
     /// The jar agent mode patched in `~/.m2` is not upstream's: the first

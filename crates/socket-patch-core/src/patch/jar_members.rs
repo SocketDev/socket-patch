@@ -194,6 +194,113 @@ impl<R: Read + Seek> Jar<R> {
         Ok(Digests(out))
     }
 
+    /// Whether the jar holds a signature file (`META-INF/*.SF`, `.RSA`,
+    /// `.DSA`, `.EC`).
+    pub(crate) fn has_signature_file(&self) -> bool {
+        self.zip.file_names().any(crate::vendor::jvm::is_signature)
+    }
+
+    /// Inflate the member `name` into `sink`, within the pass's budget.
+    /// `false` when the jar has no such member.
+    fn stream(&mut self, name: &str, mut sink: impl FnMut(&[u8])) -> Result<bool, JarError> {
+        if name.ends_with('/') {
+            return Ok(false);
+        }
+        let Some(index) = self.zip.index_for_name(name) else {
+            return Ok(false);
+        };
+        let mut left = self.left;
+        {
+            let mut entry = self.zip.by_index(index).map_err(|e| {
+                JarError::Unreadable(format!("member `{name}` cannot be read ({e})"))
+            })?;
+            let mut buf = vec![0u8; 64 * 1024];
+            loop {
+                let n = entry.read(&mut buf).map_err(|e| {
+                    JarError::Unreadable(format!("member `{name}` cannot be inflated ({e})"))
+                })?;
+                if n == 0 {
+                    break;
+                }
+                if n as u64 > left {
+                    drop(entry);
+                    return Err(self.over_budget());
+                }
+                left -= n as u64;
+                sink(&buf[..n]);
+            }
+        }
+        self.left = left;
+        Ok(true)
+    }
+
+    /// The bytes of the member `name` when it holds at most `cap` of them;
+    /// `None` when the jar has no such member.
+    pub(crate) fn member_bytes(
+        &mut self,
+        name: &str,
+        cap: u64,
+    ) -> Result<Option<Vec<u8>>, JarError> {
+        let mut bytes = Vec::new();
+        let mut over = false;
+        let found = self.stream(name, |chunk| {
+            over |= (bytes.len() + chunk.len()) as u64 > cap;
+            if !over {
+                bytes.extend_from_slice(chunk);
+            }
+        })?;
+        if over {
+            return Err(JarError::TooLarge(format!(
+                "its member `{name}` holds more than {} MiB",
+                mib(cap)
+            )));
+        }
+        Ok(found.then_some(bytes))
+    }
+
+    /// The digest of the member `name` under `algorithm`, named as a jar
+    /// manifest names it (`SHA-256`, `SHA1`, `SHA-512`, …); `None` when the
+    /// jar has no such member.
+    pub(crate) fn member_digest(
+        &mut self,
+        name: &str,
+        algorithm: &str,
+    ) -> Result<Option<Vec<u8>>, JarError> {
+        enum Hasher {
+            Sha1(sha1::Sha1),
+            Sha224(sha2::Sha224),
+            Sha256(Sha256),
+            Sha384(sha2::Sha384),
+            Sha512(sha2::Sha512),
+        }
+        let mut hasher = match algorithm.replace('-', "").to_ascii_uppercase().as_str() {
+            "SHA1" => Hasher::Sha1(Default::default()),
+            "SHA224" => Hasher::Sha224(Default::default()),
+            "SHA256" => Hasher::Sha256(Default::default()),
+            "SHA384" => Hasher::Sha384(Default::default()),
+            "SHA512" => Hasher::Sha512(Default::default()),
+            _ => {
+                return Err(JarError::Unreadable(format!(
+                    "the digest algorithm {algorithm} is not one this reads"
+                )))
+            }
+        };
+        let found = self.stream(name, |chunk| match &mut hasher {
+            Hasher::Sha1(h) => h.update(chunk),
+            Hasher::Sha224(h) => h.update(chunk),
+            Hasher::Sha256(h) => h.update(chunk),
+            Hasher::Sha384(h) => h.update(chunk),
+            Hasher::Sha512(h) => h.update(chunk),
+        })?;
+        Ok(found.then(|| match hasher {
+            Hasher::Sha1(h) => h.finalize().to_vec(),
+            Hasher::Sha224(h) => h.finalize().to_vec(),
+            Hasher::Sha256(h) => h.finalize().to_vec(),
+            Hasher::Sha384(h) => h.finalize().to_vec(),
+            Hasher::Sha512(h) => h.finalize().to_vec(),
+        }))
+    }
+
     /// The git-blob sha256 of the member `name`, `None` when the jar has no
     /// such member. Counts against the pass's budget.
     pub(crate) fn member_git_sha256(&mut self, name: &str) -> Result<Option<String>, JarError> {
@@ -325,6 +432,9 @@ pub(crate) struct Difference {
     pub missing: Vec<String>,
     /// In both, with other content.
     pub changed: Vec<String>,
+    /// Why the manifest, when it is among `changed`, is not the original's
+    /// as a re-signing leaves it ([`super::jar_manifest`]).
+    pub manifest: Option<String>,
 }
 
 impl Difference {
@@ -351,9 +461,38 @@ impl Difference {
             }
             format!("{} {kind} ({})", names.len(), shown.join(", "))
         })
+        .chain(self.manifest.iter().map(|why| {
+            format!("the manifest is not the original's with a re-signing's digests: {why}")
+        }))
         .collect::<Vec<_>>()
         .join(", ")
     }
+}
+
+/// [`unpatched_difference`] of two jars `(bytes, members)` for the record
+/// `files`, less a manifest that differs only as a re-signing of the
+/// patched jar leaves it ([`super::jar_manifest::resigned_refusal`]): the
+/// one member outside the patch whose content may change, and only so.
+pub(crate) fn difference_outside_patch(
+    original: (&[u8], &Digests),
+    patched: (&[u8], &Digests),
+    files: &std::collections::HashMap<String, crate::manifest::schema::PatchFileInfo>,
+) -> Difference {
+    use super::jar_manifest::{resigned_refusal, MANIFEST};
+    let names: Vec<&str> = files
+        .keys()
+        .map(|key| crate::patch::apply::normalize_file_path(key))
+        .collect();
+    let mut difference = unpatched_difference(original.1, patched.1, &names);
+    if let Some(at) = difference.changed.iter().position(|name| name == MANIFEST) {
+        match resigned_refusal(original.0, patched.0, files) {
+            None => {
+                difference.changed.remove(at);
+            }
+            why => difference.manifest = why,
+        }
+    }
+    difference
 }
 
 /// How `candidate` differs from `original` outside the members named in
@@ -652,6 +791,7 @@ mod tests {
                 added: vec!["a/New.class".into()],
                 missing: vec!["a/Gone.class".into()],
                 changed: vec!["a/C.class".into()],
+                manifest: None,
             }
         );
         assert_eq!(

@@ -1138,7 +1138,10 @@ keyed by members inside a jar swap in the patch service's build of the whole jar
 they need network access (`jvm_agent_service_required` offline). Before the swap the
 service's jar is compared with the installed one member by member: everything the
 JVM would load outside the patched members and signature files must be identical, or
-that copy is left alone (`jvm_agent_service_jar_mismatch`, naming the members). Jars
+that copy is left alone (`jvm_agent_service_jar_mismatch`, naming the members). A
+signed jar the patch service re-signed (a security provider such as Bouncy Castle's)
+may also differ in the manifest digests of the patched members, and in nothing else
+of the manifest. Jars
 of up to 200,000 entries and 1 GiB inflated are handled; one past that is
 `jvm_jar_too_large`. The original is
 backed up under `.socket/jvm-originals/` and `rollback` restores from it. A `~/.m2`

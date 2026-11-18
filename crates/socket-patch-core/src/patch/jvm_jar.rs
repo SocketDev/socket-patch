@@ -36,7 +36,7 @@ use crate::patch::apply::{
     apply_file_patch_at, files_in_order, normalize_file_path, ApplyResult, VerifyResult,
     VerifyStatus,
 };
-use crate::patch::jar_members::{unpatched_difference, Digests, JarError};
+use crate::patch::jar_members::{difference_outside_patch, Difference, Digests, JarError};
 use crate::patch::rollback::{RollbackResult, VerifyRollbackResult, VerifyRollbackStatus};
 use crate::patch::sidecars::{self, maven as maven_sidecars};
 use crate::utils::purl::{parse_maven_purl, purl_qualifier};
@@ -372,11 +372,6 @@ fn result_for(swap: &JarSwap<'_>, dir: &Path) -> ApplyResult {
     }
 }
 
-/// The member names a record patches, as a jar spells them.
-fn patched_names(files: &HashMap<String, PatchFileInfo>) -> Vec<&str> {
-    files.keys().map(|k| normalize_file_path(k)).collect()
-}
-
 fn sha256_hex(bytes: &[u8]) -> String {
     crate::utils::digest::sha256_hex_of(bytes)
 }
@@ -549,19 +544,28 @@ async fn swap_copies(
     // inflates the download, then of each original. Identical originals
     // (one jar in several caches) are read once, keyed by their sha256.
     let files = swap.files.clone();
-    let (jar, originals, service_members, copy_members) = blocking(move || {
+    let (jar, originals, service_members, differences) = blocking(move || {
         use sha2::Digest as _;
         let service = Digests::of_bytes(&jar).map(|members| {
             // After the bounded pass: this inflates only what that one did.
             crate::vendor::common::zip_bytes_match_after_hashes(&jar, &files).then_some(members)
         });
-        let mut read: HashMap<[u8; 32], Result<Digests, JarError>> = HashMap::new();
-        let copies: Vec<Result<Digests, JarError>> = match &service {
-            Ok(Some(_)) => pending
+        // Per copy: everything the patch does not touch must be upstream's.
+        let mut read: HashMap<[u8; 32], Result<Difference, JarError>> = HashMap::new();
+        let copies: Vec<Result<Difference, JarError>> = match &service {
+            Ok(Some(service)) => pending
                 .iter()
                 .map(|(_, original)| {
                     read.entry(sha2::Sha256::digest(original).into())
-                        .or_insert_with(|| Digests::of_bytes(original))
+                        .or_insert_with(|| {
+                            Digests::of_bytes(original).map(|members| {
+                                difference_outside_patch(
+                                    (original, &members),
+                                    (&jar, service),
+                                    &files,
+                                )
+                            })
+                        })
                         .clone()
                 })
                 .collect(),
@@ -570,8 +574,8 @@ async fn swap_copies(
         (jar, pending, service, copies)
     })
     .await;
-    let service_members = match service_members {
-        Ok(Some(members)) => members,
+    match service_members {
+        Ok(Some(_)) => {}
         Ok(None) => {
             return Err(SwapRefusal::new(
                 SERVICE_JAR_MISMATCH,
@@ -595,14 +599,11 @@ async fn swap_copies(
             ))
         }
     };
-    // Per copy: everything the patch does not touch must be upstream's.
-    let patched = patched_names(swap.files);
     let mut pending = Vec::new();
-    for ((i, original), members) in originals.into_iter().zip(copy_members) {
+    for ((i, original), difference) in originals.into_iter().zip(differences) {
         let path = Path::new(&results[i].package_path).join(swap.jar_leaf);
-        let refusal = match members {
-            Ok(members) => {
-                let difference = unpatched_difference(&members, &service_members, &patched);
+        let refusal = match difference {
+            Ok(difference) => {
                 if difference.is_empty() {
                     pending.push((i, original));
                     continue;
@@ -801,7 +802,7 @@ fn m2_backup(
     };
     let found = backups(socket_dir).into_iter().find_map(|path| {
         let bytes = crate::utils::fs::read_regular_to_bytes_sync(&path).ok()?;
-        is_original_of(&bytes, &members, files).then_some(bytes)
+        is_original_of(&bytes, (current, &members), files).then_some(bytes)
     });
     match found {
         Some(bytes) => M2Original::Backup(bytes),
@@ -826,12 +827,12 @@ fn members_at_before(candidate: &[u8], files: &HashMap<String, PatchFileInfo>) -
 /// other member the patched copy's.
 fn is_original_of(
     candidate: &[u8],
-    patched_copy: &Digests,
+    patched_copy: (&[u8], &Digests),
     files: &HashMap<String, PatchFileInfo>,
 ) -> bool {
     members_at_before(candidate, files)
         && Digests::of_bytes(candidate).is_ok_and(|members| {
-            unpatched_difference(&members, patched_copy, &patched_names(files)).is_empty()
+            difference_outside_patch((candidate, &members), patched_copy, files).is_empty()
         })
 }
 
@@ -864,30 +865,38 @@ async fn upstream_for_gradle_copy(purl: &str, jar_leaf: &str, dir: &Path) -> Opt
 /// that file for the patched jar. `Err` says what was missing.
 async fn upstream_for_m2_copy(
     restore: &JarRestore<'_>,
-    current: Digests,
-) -> Result<Vec<u8>, String> {
-    let (group, artifact, version) =
-        parse_maven_purl(restore.purl).ok_or("its purl names no Maven coordinates")?;
-    let bytes = crate::vendor::maven_repo::verified_registry_file(
+    current: Vec<u8>,
+    members: Digests,
+) -> (Vec<u8>, Result<Vec<u8>, String>) {
+    let Some((group, artifact, version)) = parse_maven_purl(restore.purl) else {
+        let why = "its purl names no Maven coordinates".to_string();
+        return (current, Err(why));
+    };
+    let fetched = crate::vendor::maven_repo::verified_registry_file(
         &group,
         &artifact,
         &version,
         restore.jar_leaf,
     )
-    .await?;
+    .await;
+    let bytes = match fetched {
+        Ok(bytes) => bytes,
+        Err(why) => return (current, Err(why)),
+    };
     let files = restore.files.clone();
-    let (bytes, original) = blocking(move || {
-        let original = is_original_of(&bytes, &current, &files);
-        (bytes, original)
+    let (current, bytes, original) = blocking(move || {
+        let original = is_original_of(&bytes, (&current, &members), &files);
+        (current, bytes, original)
     })
     .await;
     if !original {
-        return Err(format!(
+        let why = format!(
             "the registry's {} is not the jar this copy was patched from",
             restore.jar_leaf
-        ));
+        );
+        return (current, Err(why));
     }
-    Ok(bytes)
+    (current, Ok(bytes))
 }
 
 /// What to do about a copy with no original to restore: said with every
@@ -1001,10 +1010,12 @@ pub async fn rollback_jar_swap(
                 (current, found)
             })
             .await;
-            let original = match found {
-                M2Original::Backup(bytes) => Ok(bytes),
-                M2Original::NoBackup(_) if restore.offline => Err(OFFLINE.to_string()),
-                M2Original::NoBackup(members) => upstream_for_m2_copy(restore, members).await,
+            let (current, original) = match found {
+                M2Original::Backup(bytes) => (current, Ok(bytes)),
+                M2Original::NoBackup(_) if restore.offline => (current, Err(OFFLINE.to_string())),
+                M2Original::NoBackup(members) => {
+                    upstream_for_m2_copy(restore, current, members).await
+                }
                 M2Original::Unread(e) => {
                     let delete = format!(
                         "It was left as it is; delete {} so the build downloads the jar again.",
@@ -1836,6 +1847,51 @@ mod tests {
         let back = rollback_jar_swap(&restore(&files, &socket, true), &[hash_dir.clone()]).await;
         assert!(back[0].success, "{:?}", back[0].error);
         assert!(std::fs::read(hash_dir.join("lib-1.0.jar")).unwrap() == original);
+    }
+
+    /// A signed jar the patch service patched and re-signed differs from
+    /// the installed one in its signature files and in the manifest digests
+    /// of the member the patch changes. It is swapped in, and rolled back to
+    /// the original from the backup. Any other manifest change stays the
+    /// coded refusal, with its reason.
+    #[tokio::test]
+    async fn a_resigned_provider_jar_swaps_and_rolls_back() {
+        use crate::patch::jar_manifest::fixture::{edited, record as resigned, SERVED, UPSTREAM};
+        let files = resigned();
+        let d = tempfile::tempdir().unwrap();
+        let socket = d.path().join(".socket");
+        let copy = d.path().join("m2/com/example/lib/1.0");
+        std::fs::create_dir_all(&copy).unwrap();
+        std::fs::write(copy.join("lib-1.0.jar"), UPSTREAM).unwrap();
+
+        let tampered =
+            edited(|m| m.replace("Implementation-Version: 1.0", "Implementation-Version: 9"));
+        let (_server, cfg) = mock_service(&tampered, &tampered).await;
+        let out = apply_jar_swap(&swap(&files, &socket, false), &[copy.clone()], Some(&cfg))
+            .await
+            .unwrap();
+        let refusal = out[0].refusal.as_ref().expect("a coded refusal");
+        assert_eq!(refusal.code, SERVICE_JAR_MISMATCH);
+        assert!(
+            refusal
+                .message
+                .contains("1 changed (`META-INF/MANIFEST.MF`)")
+                && refusal.message.contains("its main attributes differ"),
+            "{}",
+            refusal.message
+        );
+        assert_eq!(std::fs::read(copy.join("lib-1.0.jar")).unwrap(), UPSTREAM);
+
+        let (_server, cfg) = mock_service(SERVED, SERVED).await;
+        let out = apply_jar_swap(&swap(&files, &socket, false), &[copy.clone()], Some(&cfg))
+            .await
+            .unwrap();
+        assert!(out[0].success, "{:?}", out[0].error);
+        assert_eq!(std::fs::read(copy.join("lib-1.0.jar")).unwrap(), SERVED);
+
+        let back = rollback_jar_swap(&restore(&files, &socket, true), &[copy.clone()]).await;
+        assert!(back[0].success, "{:?}", back[0].error);
+        assert_eq!(std::fs::read(copy.join("lib-1.0.jar")).unwrap(), UPSTREAM);
     }
 
     /// A copy that holds another revision of the patch (applied from another
