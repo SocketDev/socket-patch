@@ -36,6 +36,17 @@ jobs:
       - uses: ruby/setup-ruby@319994f95fa847cf3fb3cd3dbe89f6dcde9f178f # v1.295.0
         with:
           ruby-version: '3.3'
+      - name: Take the vendored library tarballs from the source gem
+        working-directory: nokogiri
+        env:
+          NOKOGIRI: ${{ matrix.nokogiri }}
+        # The git tree has no ports/archives: the build downloads libxml2 and
+        # libxslt from mirrors that drop old releases. The source gem on
+        # rubygems.org packs the exact tarballs its release was built from.
+        run: |
+          mkdir -p /tmp/srcgem && (cd /tmp/srcgem && gem fetch nokogiri -v "$NOKOGIRI" --platform ruby && gem unpack "nokogiri-$NOKOGIRI.gem")
+          mkdir -p ports/archives
+          cp -v "/tmp/srcgem/nokogiri-$NOKOGIRI/ports/archives/"* ports/archives/
       - name: Lay a patch over the tree
         working-directory: nokogiri
         # The three shapes of the published nokogiri patches: a Ruby file,
@@ -91,6 +102,7 @@ jobs:
   verify:
     name: verify ${{ matrix.nokogiri }} ${{ matrix.platform }} on ${{ matrix.ruby }} (${{ matrix.os }})
     needs: build
+    if: ${{ !cancelled() }}
     strategy:
       fail-fast: false
       matrix:
