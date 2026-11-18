@@ -3233,29 +3233,42 @@ to three added, missing or changed members, and is left as it is; the other copi
 are still swapped.
 
 One member outside the patch may change, in one way: `META-INF/MANIFEST.MF` of a jar
-the patch service re-signed. A signed jar's manifest holds each entry's digests and
+the patch service signed again. A signed jar's manifest holds each entry's digests and
 its signature files vouch for the manifest, so patching a class of a signed security
-provider (Bouncy Castle's `bcprov`) means re-signing it: upstream's signature files
-are replaced by the service's (`META-INF/SOCKET.SF`, `SOCKET.RSA`), and the manifest
-sections of the patched members get new digests. Such a manifest is accepted only
-when all of this holds, and is otherwise the refusal above with the reason added:
+provider (Bouncy Castle's `bcprov`) means signing the jar again, as a whole:
+upstream's signature files are replaced by the service's (`META-INF/SOCKET.SF`,
+`SOCKET.RSA`) and every file entry is listed under the signing digest. A current JDK
+ignores SHA-1 digests, so a manifest that holds only those gains a SHA-256 line in
+every section, and an entry upstream never listed gains a section. The service's jar
+must carry a signature file, and its manifest may differ from the installed jar's
+only as follows; anything else is the refusal above with the reason added:
 
-- the service's jar carries at least one signature file (an unsigned jar with an
-  edited manifest is refused);
-- the main attributes are byte for byte the installed jar's;
-- the section of every member the record does not touch is present in both, byte
-  for byte the same;
-- the section of a member the record changes differs only in the values of its
-  `<ALG>-Digest` attributes (same attributes, same order), and every digest in it is
-  the digest of that member in the service's jar (SHA-1, SHA-224, SHA-256, SHA-384
-  and SHA-512 are read; any other algorithm is refused);
-- a section is added only for a member the record adds, holding its name and
-  verified digests alone, and removed only for a member the record deletes.
+1. The main-attributes section is byte for byte the same.
+2. The section of a member the record does not touch keeps every line, byte for byte
+   and in order. It may gain digest attributes, each of which must equal the digest
+   of that member in the service's jar.
+3. The section of a member the record changes may also change the values of its
+   digest attributes. Every digest in it must equal the member's in the service's
+   jar, and no other attribute may change.
+4. A section is added only for a member the record adds or changes, or for an entry
+   that both jars hold with identical bytes and the installed manifest did not list.
+   It holds a `Name` and verified digests alone.
+5. A section is removed only for a member the record deletes.
 
-The manifest is read as the JAR specification lays it out (lines end in `\r\n`,
-`\n` or `\r`, a leading space continues a line wrapped at 72 bytes, a blank line
-ends a section) and its sections are compared as the bytes in the file. A rollback
-finds the original of a re-signed copy by the same rule.
+A digest attribute is one the JDK reads when it verifies a jar: `SHA-256-Digest`,
+`SHA-384-Digest`, `SHA-512-Digest`, `SHA1-Digest`, `SHA-1-Digest`, `MD5-Digest`. An
+added attribute of any other name is a refusal. The manifest is read as the JAR
+specification lays it out (lines end in `\r\n`, `\n` or `\r`, a leading space
+continues a line wrapped at 72 bytes, a blank line ends a section) and its sections
+are compared as the bytes in the file. Blank lines are not compared, so a terminator
+added before appended sections changes nothing, and a last line of the installed
+manifest with no terminator, which a JVM ignores, may be dropped. The signature
+itself is not verified; that is the JVM's. A rollback finds the original of such a
+copy by the same rule.
+
+A record that lists `META-INF/MANIFEST.MF` itself is not covered: the service's
+manifest must then still be the record's after-blob, byte for byte, as for any member
+the record changes.
 
 Jars are read within fixed limits, counted on the bytes actually inflated and on the
 archive's own entry count, never on the sizes an archive declares: 200,000 entries

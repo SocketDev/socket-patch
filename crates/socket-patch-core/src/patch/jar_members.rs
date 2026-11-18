@@ -268,17 +268,18 @@ impl<R: Read + Seek> Jar<R> {
     ) -> Result<Option<Vec<u8>>, JarError> {
         enum Hasher {
             Sha1(sha1::Sha1),
-            Sha224(sha2::Sha224),
             Sha256(Sha256),
             Sha384(sha2::Sha384),
             Sha512(sha2::Sha512),
+            // No streaming MD5 here: the member is held, within the budget.
+            Md5(Vec<u8>),
         }
         let mut hasher = match algorithm.replace('-', "").to_ascii_uppercase().as_str() {
             "SHA1" => Hasher::Sha1(Default::default()),
-            "SHA224" => Hasher::Sha224(Default::default()),
             "SHA256" => Hasher::Sha256(Default::default()),
             "SHA384" => Hasher::Sha384(Default::default()),
             "SHA512" => Hasher::Sha512(Default::default()),
+            "MD5" => Hasher::Md5(Vec::new()),
             _ => {
                 return Err(JarError::Unreadable(format!(
                     "the digest algorithm {algorithm} is not one this reads"
@@ -287,17 +288,17 @@ impl<R: Read + Seek> Jar<R> {
         };
         let found = self.stream(name, |chunk| match &mut hasher {
             Hasher::Sha1(h) => h.update(chunk),
-            Hasher::Sha224(h) => h.update(chunk),
             Hasher::Sha256(h) => h.update(chunk),
             Hasher::Sha384(h) => h.update(chunk),
             Hasher::Sha512(h) => h.update(chunk),
+            Hasher::Md5(held) => held.extend_from_slice(chunk),
         })?;
         Ok(found.then(|| match hasher {
             Hasher::Sha1(h) => h.finalize().to_vec(),
-            Hasher::Sha224(h) => h.finalize().to_vec(),
             Hasher::Sha256(h) => h.finalize().to_vec(),
             Hasher::Sha384(h) => h.finalize().to_vec(),
             Hasher::Sha512(h) => h.finalize().to_vec(),
+            Hasher::Md5(held) => md5(&held).to_vec(),
         }))
     }
 
@@ -326,6 +327,50 @@ impl<R: Read + Seek> Jar<R> {
             .map(Some)
             .map_err(|e| JarError::Unreadable(format!("member `{name}` cannot be inflated ({e})")))
     }
+}
+
+/// RFC 1321 MD5, for the `MD5-Digest` attributes of old jar manifests (the
+/// crate has no MD5 otherwise, and nothing else here should use one).
+fn md5(input: &[u8]) -> [u8; 16] {
+    const SHIFTS: [u32; 64] = [
+        7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 5, 9, 14, 20, 5, 9, 14, 20, 5,
+        9, 14, 20, 5, 9, 14, 20, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 6, 10,
+        15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21,
+    ];
+    let constant = |i: usize| ((i as f64 + 1.0).sin().abs() * 4_294_967_296.0) as u32;
+    let mut state: [u32; 4] = [0x6745_2301, 0xefcd_ab89, 0x98ba_dcfe, 0x1032_5476];
+    let mut message = input.to_vec();
+    message.push(0x80);
+    while message.len() % 64 != 56 {
+        message.push(0);
+    }
+    message.extend_from_slice(&(input.len() as u64).wrapping_mul(8).to_le_bytes());
+    for block in message.chunks(64) {
+        let word = |i: usize| u32::from_le_bytes(block[4 * i..4 * i + 4].try_into().unwrap());
+        let [mut a, mut b, mut c, mut d] = state;
+        for (i, shift) in SHIFTS.iter().enumerate() {
+            let (mix, at) = match i / 16 {
+                0 => ((b & c) | (!b & d), i),
+                1 => ((d & b) | (!d & c), (5 * i + 1) % 16),
+                2 => (b ^ c ^ d, (3 * i + 5) % 16),
+                _ => (c ^ (b | !d), (7 * i) % 16),
+            };
+            let rotated = a
+                .wrapping_add(mix)
+                .wrapping_add(constant(i))
+                .wrapping_add(word(at))
+                .rotate_left(*shift);
+            (a, d, c, b) = (d, c, b, b.wrapping_add(rotated));
+        }
+        for (sum, add) in state.iter_mut().zip([a, b, c, d]) {
+            *sum = sum.wrapping_add(add);
+        }
+    }
+    let mut out = [0u8; 16];
+    for (bytes, word) in out.chunks_mut(4).zip(state) {
+        bytes.copy_from_slice(&word.to_le_bytes());
+    }
+    out
 }
 
 /// Hold what an archive's end records declare of its central directory to
@@ -416,7 +461,6 @@ impl Digests {
     }
 
     /// The digest of the member `name`.
-    #[cfg(test)]
     pub(crate) fn get(&self, name: &str) -> Option<&[u8; 32]> {
         self.0.get(name.as_bytes())
     }
@@ -485,7 +529,7 @@ pub(crate) fn difference_outside_patch(
         .collect();
     let mut difference = unpatched_difference(original.1, patched.1, &names);
     if let Some(at) = difference.changed.iter().position(|name| name == MANIFEST) {
-        match resigned_refusal(original.0, patched.0, files) {
+        match resigned_refusal(original, patched, files, None) {
             None => {
                 difference.changed.remove(at);
             }
@@ -616,6 +660,33 @@ mod tests {
                 .unwrap()
                 .member_git_sha256("gone")
                 .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn member_digests_are_the_algorithms_a_manifest_names() {
+        assert_eq!(hex::encode(md5(b"abc")), "900150983cd24fb0d6963f7d28e17f72");
+        assert_eq!(hex::encode(md5(b"")), "d41d8cd98f00b204e9800998ecf8427e");
+        let bytes = jar(&[("a/B.class", b"abc")]);
+        let digest = |algorithm: &str| {
+            let mut jar = Jar::of_bytes(&bytes).unwrap();
+            jar.member_digest("a/B.class", algorithm)
+                .map(|d| d.map(hex::encode))
+        };
+        assert_eq!(
+            digest("MD5").unwrap().unwrap(),
+            "900150983cd24fb0d6963f7d28e17f72"
+        );
+        assert_eq!(
+            digest("SHA-1").unwrap().unwrap(),
+            "a9993e364706816aba3e25717850c26c9cd0d89d"
+        );
+        assert_eq!(digest("SHA-256").unwrap().unwrap().len(), 64);
+        assert!(digest("SHA-224").is_err());
+        let mut jar = Jar::of_bytes(&bytes).unwrap();
+        assert_eq!(
+            jar.member_digest("a/Absent.class", "SHA-256").unwrap(),
             None
         );
     }
