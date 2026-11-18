@@ -305,7 +305,7 @@ pub async fn gem_vendor_target_preflight(
             .await
             .ok()?,
     };
-    plan_gemfile_edit_for(&gemfile_text, &name, &version, &copy_rel, true)
+    plan_gemfile_edit(&gemfile_text, &name, &version, &copy_rel)
         .and_then(|plan| refuse_append_of_direct_dependency(plan, &lock_text, &name))
         .and_then(|plan| {
             let after = apply_gemfile_plan(&gemfile_text, &plan);
@@ -1369,9 +1369,10 @@ fn platform_gem_remedy(name: &str) -> String {
 /// - Otherwise the top level is a way out, and so is hosted mode, which
 ///   edits a declaration where it is. When exactly one block is open and it
 ///   is a plain `group … do`, the `group:` option that replaces it is
-///   spelled out ([`group_option`]). `hosted` is the takeover and eject
-///   preflight, where the gem is in hosted mode already.
-fn indented_declaration_remedy(text: &str, line_start: usize, name: &str, hosted: bool) -> String {
+///   spelled out ([`group_option`]). The takeover and eject of a hosted gem
+///   raise this refusal too, so hosted mode is worded as the mode to leave
+///   the gem to, which reads true whether or not it is hosted already.
+fn indented_declaration_remedy(text: &str, line_start: usize, name: &str) -> String {
     let frames = crate::formats::gem::ruby::block_stack(text, line_start);
     if frames.iter().any(|frame| frame.source.is_some()) {
         return format!("patch {name} with `--mode agent`");
@@ -1387,11 +1388,7 @@ fn indented_declaration_remedy(text: &str, line_start: usize, name: &str, hosted
         }
         _ => "move it to the top level".to_string(),
     };
-    if hosted {
-        format!("{top_level} to vendor it, or keep {name} in hosted mode")
-    } else {
-        format!("{top_level}, or patch {name} with `--mode hosted`")
-    }
+    format!("{top_level}, or leave {name} to hosted mode (`--mode hosted`)")
 }
 
 /// The `group:` option that stands for the block `header` opens:
@@ -1444,19 +1441,6 @@ fn plan_gemfile_edit(
     name: &str,
     version: &str,
     rel: &str,
-) -> Result<GemfilePlan, String> {
-    plan_gemfile_edit_for(text, name, version, rel, false)
-}
-
-/// [`plan_gemfile_edit`], with `hosted` set when the gem is in hosted mode
-/// already (the takeover and eject preflight): a refusal then does not
-/// offer hosted mode as if it were news.
-fn plan_gemfile_edit_for(
-    text: &str,
-    name: &str,
-    version: &str,
-    rel: &str,
-    hosted: bool,
 ) -> Result<GemfilePlan, String> {
     let lines: Vec<&str> = text.split('\n').collect();
     // (line idx, top-level?, paren-call?, quote, rest-after-name)
@@ -1516,7 +1500,7 @@ fn plan_gemfile_edit_for(
     let rest = rest.strip_suffix('\r').unwrap_or(&rest);
     if !top_level {
         let line_start: usize = lines[..idx].iter().map(|line| line.len() + 1).sum();
-        let remedy = indented_declaration_remedy(text, line_start, name, hosted);
+        let remedy = indented_declaration_remedy(text, line_start, name);
         return Err(format!(
             "the `gem \"{name}\"` declaration is indented (inside a group/conditional block); \
              {remedy}"
@@ -4031,12 +4015,12 @@ mod tests {
     /// only where one option means the same as the block.
     #[test]
     fn indented_declaration_remedy_fits_the_enclosing_block() {
-        let remedy = |gemfile: &str, hosted: bool| {
+        let remedy = |gemfile: &str| {
             let at = gemfile.find("gem \"rack\"").unwrap();
             let line_start = gemfile[..at].rfind('\n').map_or(0, |i| i + 1);
-            indented_declaration_remedy(gemfile, line_start, "rack", hosted)
+            indented_declaration_remedy(gemfile, line_start, "rack")
         };
-        let hosted_too = ", or patch rack with `--mode hosted`";
+        let hosted_too = ", or leave rack to hosted mode (`--mode hosted`)";
         for (gemfile, top_level) in [
             (
                 "group :test do\n  gem \"rack\", \"~> 3.1\", require: false\nend\n",
@@ -4088,13 +4072,8 @@ mod tests {
             ),
         ] {
             assert_eq!(
-                remedy(gemfile, false),
+                remedy(gemfile),
                 format!("{top_level}{hosted_too}"),
-                "{gemfile:?}"
-            );
-            assert_eq!(
-                remedy(gemfile, true),
-                format!("{top_level} to vendor it, or keep rack in hosted mode"),
                 "{gemfile:?}"
             );
         }
@@ -4105,13 +4084,11 @@ mod tests {
             "git \"https://git.example/rack.git\" do\n  gem \"rack\"\nend\n",
             "group :test do\n  source \"https://gems.example\" do\n    gem \"rack\"\n  end\nend\n",
         ] {
-            for hosted in [false, true] {
-                assert_eq!(
-                    remedy(gemfile, hosted),
-                    "patch rack with `--mode agent`",
-                    "{gemfile:?}"
-                );
-            }
+            assert_eq!(
+                remedy(gemfile),
+                "patch rack with `--mode agent`",
+                "{gemfile:?}"
+            );
         }
     }
 
@@ -9952,10 +9929,9 @@ mod tests {
         let (code, detail) = refusal.expect("an indented declaration is not editable");
         assert_eq!(code, "gemfile_declaration_not_editable");
         assert!(detail.contains("indented"), "{detail}");
-        // #2091: the gem is hosted already, so hosted mode is not offered
-        // as a mode to switch to.
-        assert!(detail.contains("keep rails in hosted mode"), "{detail}");
-        assert_names_other_modes(&detail, &[]);
+        // #2091: the gem is hosted already; the remedy reads true for it.
+        assert!(detail.contains("leave rails to hosted mode"), "{detail}");
+        assert_names_other_modes(&detail, &["hosted"]);
         // A preflight: the hosted pair is never written, even though the
         // caller's options are a wet run.
         assert_eq!(std::fs::read_to_string(dir.join(GEMFILE)).unwrap(), gemfile);

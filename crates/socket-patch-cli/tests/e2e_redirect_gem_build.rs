@@ -3675,11 +3675,11 @@ fn vendor_eject_keeps_the_hosted_group_pin(fx: &RedirectFixture, dry_run: bool) 
     );
     // #2091: the refusal says how to get out of it. The gem is declared in
     // a `group :development do` block, which one top-level option replaces,
-    // and it is hosted already, so hosted mode is the mode to keep.
+    // and it is hosted already, so hosted mode is the mode to leave it to.
     let detail = events[0]["error"].as_str().unwrap_or_default();
     assert!(
         detail.contains("move it to the top level with the option `group: :development`")
-            && detail.contains(&format!("or keep {DEP} in hosted mode")),
+            && detail.contains(&format!("or leave {DEP} to hosted mode (`--mode hosted`)")),
         "{label}: the refusal names both ways out: {env}"
     );
     assert_eq!(env["error"]["code"], "eject_refused", "{label}: {env}");
