@@ -66,11 +66,19 @@ jobs:
           PLATFORM: ${{ matrix.platform }}
         run: |
           gem install rake-compiler-dock -v "$RCD" --no-document
+          # nokogiri ships no Gemfile.lock, so its development bundle resolves
+          # to today's releases. psych 5.3 and later need Ruby 3.2 and break
+          # the 3.1 that runs the cross-build: keep the container's own.
+          cat > Gemfile.prebuild <<'GEMFILE'
+          eval_gemfile File.expand_path("Gemfile", __dir__)
+          require "psych"
+          gem "psych", Psych::VERSION
+          GEMFILE
           time ruby -e '
             gem "rake-compiler-dock", ENV.fetch("RCD")
             require "rake_compiler_dock"
             plat = ENV.fetch("PLATFORM")
-            RakeCompilerDock.sh("git config --global --add safe.directory $(pwd) && gem install bundler --no-document && bundle && bundle exec rake gem:#{plat}:builder MAKE=\"nice make -j$(nproc)\"", platform: plat, verbose: true)
+            RakeCompilerDock.sh("git config --global --add safe.directory $(pwd) && export BUNDLE_GEMFILE=$(pwd)/Gemfile.prebuild && gem install bundler --no-document && bundle && bundle exec rake gem:#{plat}:builder MAKE=\"nice make -j$(nproc)\"", platform: plat, verbose: true)
           '
           ls -la pkg/*.gem
       - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
