@@ -104,18 +104,21 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Precompiled, the x86_64-linux-gnu gem of each line.
-          - {os: ubuntu-latest, ruby: '3.4', nokogiri: '1.19.3', install: precompiled}
-          - {os: ubuntu-latest, ruby: '3.4', nokogiri: '1.18.10', install: precompiled}
-          - {os: ubuntu-latest, ruby: '3.3', nokogiri: '1.16.8', install: precompiled}
-          - {os: ubuntu-latest, ruby: '3.1', nokogiri: '1.15.7', install: precompiled}
-          - {os: ubuntu-latest, ruby: '3.0', nokogiri: '1.13.10', install: precompiled}
-          - {os: ubuntu-latest, ruby: '2.7', nokogiri: '1.11.7', install: precompiled}
+          # Precompiled, the x86_64-linux-gnu gem of each line, in a bundle
+          # with the Rails of its years: the test also boots a Rails
+          # application on the patched nokogiri.
+          - {os: ubuntu-latest, ruby: '3.4', nokogiri: '1.19.3', install: precompiled, rails: '~> 8.1.0'}
+          - {os: ubuntu-latest, ruby: '3.4', nokogiri: '1.18.10', install: precompiled, rails: '~> 8.0.0'}
+          - {os: ubuntu-latest, ruby: '3.3', nokogiri: '1.16.8', install: precompiled, rails: '~> 7.1.0'}
+          - {os: ubuntu-latest, ruby: '3.1', nokogiri: '1.15.7', install: precompiled, rails: '~> 7.0.0'}
+          - {os: ubuntu-latest, ruby: '3.0', nokogiri: '1.13.10', install: precompiled, rails: '~> 6.1.0'}
+          - {os: ubuntu-latest, ruby: '2.7', nokogiri: '1.11.7', install: precompiled, rails: '~> 6.0.0'}
           # Compiled by RubyGems: the releases that have no precompiled gem,
-          # and a current one forced to the ruby platform.
-          - {os: ubuntu-latest, ruby: '2.6', nokogiri: '1.10.10', install: source}
-          - {os: ubuntu-latest, ruby: '2.5', nokogiri: '1.8.5', install: source}
-          - {os: ubuntu-latest, ruby: '2.3', nokogiri: '1.6.8.1', install: source}
+          # and a current one forced to the ruby platform. Rails 4.2 needs
+          # Bundler 1.
+          - {os: ubuntu-latest, ruby: '2.6', nokogiri: '1.10.10', install: source, rails: '~> 5.2.0'}
+          - {os: ubuntu-latest, ruby: '2.5', nokogiri: '1.8.5', install: source, rails: '~> 5.1.0'}
+          - {os: ubuntu-latest, ruby: '2.3', nokogiri: '1.6.8.1', install: source, rails: '~> 4.2.0', bundler: '1'}
           - {os: ubuntu-latest, ruby: '3.4', nokogiri: '1.18.10', install: source}
           - {os: ubuntu-latest, ruby: '3.4', nokogiri: '1.18.10', install: system-libraries}
           # No compiler on PATH: nothing may change.
@@ -148,11 +151,13 @@ jobs:
         continue-on-error: true
         with:
           ruby-version: ${{ matrix.ruby }}
+          bundler: ${{ matrix.bundler || 'default' }}
       - name: Setup Ruby (attempt 2)
         if: steps.setup-ruby.outcome != 'success'
         uses: ruby/setup-ruby@319994f95fa847cf3fb3cd3dbe89f6dcde9f178f # v1.295.0
         with:
           ruby-version: ${{ matrix.ruby }}
+          bundler: ${{ matrix.bundler || 'default' }}
       - name: Install the system libxml2 and libxslt headers
         if: matrix.install == 'system-libraries'
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libxml2-dev libxslt1-dev
@@ -164,12 +169,14 @@ jobs:
           E2E_NOKOGIRI: ${{ matrix.nokogiri }}
           E2E_INSTALL: ${{ matrix.install }}
           E2E_BUILD: ${{ matrix.build || 'ok' }}
+          E2E_RAILS: ${{ matrix.rails }}
           E2E_ARGS: ${{ matrix.args }}
         run: |
           ruby --version
           # shellcheck disable=SC2086 # E2E_ARGS is a list of flags
           ruby tests/nokogiri/nokogiri_e2e.rb --socket-patch target/debug/socket-patch \
-            --nokogiri "$E2E_NOKOGIRI" --install "$E2E_INSTALL" --build "$E2E_BUILD" $E2E_ARGS
+            --nokogiri "$E2E_NOKOGIRI" --install "$E2E_INSTALL" --build "$E2E_BUILD" \
+            ${E2E_RAILS:+--rails "$E2E_RAILS"} $E2E_ARGS
 
   static-cli:
     name: static socket-patch for the container legs
@@ -223,7 +230,7 @@ jobs:
             digest: sha256:65680693964528b522a38d85ec5065538c7ab9e75268802aab9770f39ee56de0
             nokogiri: '1.18.10'
             install: precompiled
-            setup: apt-get update -qq && apt-get install -y -qq --no-install-recommends build-essential zlib1g-dev
+            setup: apt-get update -qq && apt-get install -y -qq --no-install-recommends build-essential
           # The same image as it ships: no compiler at all.
           - image: 'ruby:3.4-slim'
             digest: sha256:65680693964528b522a38d85ec5065538c7ab9e75268802aab9770f39ee56de0
@@ -246,7 +253,13 @@ jobs:
             nokogiri: '1.8.5'
             install: source
           - image: 'ruby:2.3'
-            digest: sha256:c0d23ebb3ed63af928b7c4a954de87a5d3c1fe98a2dfcb2a44e685a3e65c3c61
+            digest: sha256:78cc821d95c48621e577b6b0d44c9d509f0f2a4e089b9fd0ca2ae86f274773a8
+            nokogiri: '1.6.8.1'
+            install: source
+          # RubyGems 2.2, the oldest that builds an extension into a dir of
+          # its own, which is what `apply` rebuilds.
+          - image: 'ruby:2.1'
+            digest: sha256:568664cfb53cd74147590cc86e356c4e352e00e28a0011ea1443e8664ca5bad5
             nokogiri: '1.6.8.1'
             install: source
     runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS == 'true' && 'ubuntu-latest' || 'depot-ubuntu-24.04-4' }}

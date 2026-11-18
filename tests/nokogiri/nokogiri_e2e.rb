@@ -189,6 +189,7 @@ class NokogiriE2E
 
   def install
     gemfile = ["source \"https://rubygems.org\"", "gem \"nokogiri\", \"#{@version}\""]
+    gemfile << "gem \"rails\", \"#{@opts[:rails]}\"" if @opts[:rails]
     (@opts[:gems] || []).each { |line| gemfile << line }
     File.write(File.join(@proj, "Gemfile"), gemfile.join("\n") + "\n")
     want = @opts.fetch(:install)
@@ -250,6 +251,14 @@ class NokogiriE2E
              end
     puts "Installed #{@full_name}: #{@shape}, libxml2 #{@baseline['libxml_loaded']} (#{lib}), " \
          "#{@baseline['libxml_patches'].size} libxml2 patches, loads #{@baseline['binary'] || 'no native binary'}"
+    if @opts[:rails]
+      puts "Rails #{@baseline['rails']} boots and sanitizes HTML through it: #{@baseline['rails_sanitize'].inspect}"
+      check(@baseline["rails"].to_s.start_with?(@opts[:rails].sub(/\A[^0-9]*/, "")[/\A\d+\.\d+/]),
+            "the bundle holds Rails #{@opts[:rails]}", "it holds #{@baseline['rails']}")
+      clean = @baseline["rails_sanitize"].to_s
+      check(clean.start_with?("<p>ok") && clean !~ /onclick|<script/i, "Rails sanitizes HTML with this nokogiri",
+            clean.inspect)
+    end
     want = @opts.fetch(:install)
     check(want == "any" || want == @shape, "the install is #{want}", "it is #{@shape}: #{@full_name}")
     check(@baseline[RB_CONST].nil? && @baseline[C_CONST].nil?, "a fresh install carries no test marker")
@@ -258,7 +267,7 @@ class NokogiriE2E
 
   # What a fresh Ruby loads through Bundler, as an application would.
   def probe
-    out = sh!({}, *bundle("exec", RbConfig.ruby, "probe.rb"))
+    out = sh!({}, *bundle("exec", RbConfig.ruby, "probe.rb", *(@opts[:rails] ? ["--rails"] : [])))
     line = out.lines.grep(/\Asp_probe\t/).last
     raise Failure, "the probe printed no result:\n#{tail(out)}" unless line
     JSON.parse(line.split("\t", 2).last)
@@ -454,6 +463,10 @@ class NokogiriE2E
     check(effect.call(now), "Ruby loads the patched code", JSON.pretty_generate(now))
     check(now["smoke"] == @baseline["smoke"], "nokogiri still parses, queries, transforms and validates",
           "before #{@baseline['smoke'].inspect}\nafter  #{now['smoke'].inspect}")
+    if @opts[:rails]
+      check(now["rails_sanitize"] == @baseline["rails_sanitize"],
+            "Rails #{now['rails']} boots on the patched nokogiri and sanitizes as before", now["rails_sanitize"].inspect)
+    end
     if native
       check(now["binary_sha256"] != @baseline["binary_sha256"], "Ruby loads a rebuilt extension")
       check(now["libxml_loaded"] == @baseline["libxml_loaded"],
@@ -546,6 +559,22 @@ result = {
   "SOCKET_PATCH_E2E_C" => Nokogiri.const_defined?(:SOCKET_PATCH_E2E_C) ? Nokogiri::SOCKET_PATCH_E2E_C : nil,
   "smoke" => smoke
 }
+if ARGV.include?("--rails")
+  # A Rails application, booted, sanitizing markup the way a view does:
+  # ActionView hands it to rails-html-sanitizer, which parses with loofah
+  # on this nokogiri. (`logger` first: Rails before 7.1 assumes it loaded.)
+  require "logger"
+  require "rails"
+  require "action_controller/railtie"
+  class SocketPatchE2E < Rails::Application
+    config.eager_load = false
+    config.secret_key_base = "socket-patch-nokogiri-e2e-" * 4
+    config.logger = Logger.new(nil)
+  end
+  SocketPatchE2E.initialize!
+  result["rails"] = Rails.version
+  result["rails_sanitize"] = ActionController::Base.helpers.sanitize("<p onclick='x()'>ok<script>bad()</script></p>")
+end
 puts "sp_probe\t" + JSON.generate(result)
   RUBY
 end
@@ -570,6 +599,8 @@ parser = OptionParser.new do |o|
        "config) or ambient (wherever this environment's Bundler and RubyGems settings say, which",
        "in an official Ruby image is /usr/local/bundle; only for a throwaway environment)") { |v| opts[:gem_home] = v }
   o.on("--scenarios LIST", Array, "of ruby,c,libxml2 (default: all three)") { |v| opts[:scenarios] = v }
+  o.on("--rails VERSION", "also install this Rails (a Gemfile requirement, for example '~> 7.1.0') and check",
+       "that a booted application sanitizes HTML through the patched nokogiri") { |v| opts[:rails] = v }
   o.on("--gem LINE", "one more Gemfile line, for example 'gem \"rails\", \"7.1.5\"'") { |v| opts[:gems] << v }
   o.on("--work DIR", "build the project in DIR and keep it") { |v| opts[:work] = v }
 end
