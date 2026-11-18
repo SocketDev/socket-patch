@@ -1035,9 +1035,15 @@ pub async fn pnpm_takeover_lock_text_refusals(
     project_root: &Path,
     candidates: &[(&str, &str)],
 ) -> HashMap<String, (&'static str, String)> {
+    // A Rush monorepo's locks are pnpm v9 too, and its gates read the same
+    // text (plus Rush's config and project manifests, which the hosted
+    // restore never touches).
     if !matches!(
-        npm_flavor::detect_npm_lock_flavor(project_root).await,
-        Ok((npm_flavor::NpmLockFlavor::Pnpm, _))
+        npm_flavor::detect_vendorable_npm_flavor(project_root).await,
+        Ok((
+            npm_flavor::NpmLockFlavor::Pnpm | npm_flavor::NpmLockFlavor::RushPnpm,
+            _
+        ))
     ) {
         return HashMap::new();
     }

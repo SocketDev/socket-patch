@@ -3,9 +3,10 @@
 //! added, replaced or removed in place, and every other byte (comments,
 //! blank lines, key order, indentation) stays as the user wrote it.
 //!
-//! Rush reads these files with comments allowed and trailing commas not, so
-//! the edits never leave a trailing comma behind. Reading is more tolerant:
-//! [`to_value`] accepts one.
+//! Rush reads these files with comments allowed, and an edit keeps the
+//! file's own comma style: it never adds a trailing comma to a file that
+//! has none. To read such a file as a value, use
+//! [`crate::formats::package_json::parse`].
 
 use serde_json::Value;
 
@@ -153,42 +154,6 @@ pub(crate) fn root_object(text: &str) -> Option<Object> {
     let body = crate::formats::text::strip_bom(text);
     let open = skip_trivia(text.as_bytes(), text.len() - body.len())?;
     object_at(text, open)
-}
-
-/// The document as a JSON value: comments dropped, a trailing comma
-/// forgiven. `None` when what is left is not JSON.
-pub(crate) fn to_value(text: &str) -> Option<Value> {
-    let body = crate::formats::text::strip_bom(text);
-    let b = body.as_bytes();
-    let mut out = String::with_capacity(body.len());
-    let mut i = 0;
-    while i < b.len() {
-        match b[i] {
-            b'"' => {
-                let end = scan_string(b, i)?;
-                out.push_str(&body[i..end]);
-                i = end;
-            }
-            b'/' if matches!(b.get(i + 1), Some(b'/' | b'*')) => {
-                i = skip_trivia(b, i)?;
-                out.push(' ');
-            }
-            b',' => {
-                let next = skip_trivia(b, i + 1)?;
-                if !matches!(b.get(next), Some(b'}' | b']')) {
-                    out.push(',');
-                }
-                i += 1;
-            }
-            _ => {
-                // Copy one whole character (the text is valid UTF-8).
-                let len = body[i..].chars().next().map_or(1, char::len_utf8);
-                out.push_str(&body[i..i + len]);
-                i += len;
-            }
-        }
-    }
-    serde_json::from_str(&out).ok()
 }
 
 /// The whitespace that starts the line holding `at`.
@@ -468,13 +433,6 @@ mod tests {
     }
 
     #[test]
-    fn reads_comments_and_a_trailing_comma() {
-        let v = to_value("// c\n{ \"a\": [1, 2,], /* b */ \"s\": \"x // y\", }\n").unwrap();
-        assert_eq!(v, serde_json::json!({"a": [1, 2], "s": "x // y"}));
-        assert!(to_value("{ /* open").is_none());
-    }
-
-    #[test]
     fn appends_into_a_comment_only_table_and_reverts_byte_exactly() {
         let entries = pairs(&[
             ("a@1>b@2", "file:../../x.tgz"),
@@ -489,10 +447,6 @@ mod tests {
             "{out}"
         );
         assert_eq!(string_members(&out, "globalOverrides").unwrap(), entries);
-        assert_eq!(
-            to_value(&out).unwrap()["globalOverrides"]["c@1>b@2"],
-            "file:../../x.tgz"
-        );
         // In sync: nothing to change.
         assert_eq!(
             upsert_strings(&out, "globalOverrides", &entries).unwrap(),

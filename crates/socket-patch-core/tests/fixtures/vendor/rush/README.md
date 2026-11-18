@@ -21,5 +21,6 @@ the fixtures small; their locks and `package.json` files are untouched.
 | `pnpm11-user-overrides` | pnpm >= 11 keeps the lock's `overrides:` key-sorted; trailing-comma config |
 | `sibling-versions` | two versions of one package vendored; a `~0.0.5` dependent stays on the version it is locked at |
 | `sibling-sorts-after` | the rekeyed entry moves behind a sibling version to keep the keys sorted |
-| `subspaces` | two subspace locks, paths three levels up, the shared `pnpm-config.json` |
+| `subspaces` | two subspace locks, paths three levels up; one subspace has its own `pnpm-config.json` |
+| `subspaces-shared-config` | two subspaces that both read `common/config/rush/pnpm-config.json`: the lock without a matching parent carries the override too |
 | `new-dependents` | a later `rush update` brought the registry entry back for a new direct dependent and a new parent; the re-run moves both and drops it |

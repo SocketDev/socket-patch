@@ -695,7 +695,8 @@ tarball and edits three kinds of file:
 - **`pnpm-config.json`** (the subspace's own, else `common/config/rush/`). Each package
   that depends on the patched one gets a `globalOverrides` entry,
   `"<parent>@<version>><name>@<version>"`. Rush hands these to pnpm, so the patch survives
-  `rush update` and `rush update --full`.
+  `rush update` and `rush update --full`. Every lock that reads the same config gets the
+  entry in its `overrides:` too, as Rush itself writes it.
 - **The `package.json` of every project that lists the package itself.** Its spec becomes
   `file:<path to the tarball from that project>`.
 
@@ -703,7 +704,7 @@ That last edit is specific to Rush. `rush install` compares each project's `pack
 with the lockfile and fails when they differ, so a direct dependency cannot be redirected by
 an override alone, the way it is in a plain pnpm project. The run names the files it edited
 (`vendor_rush_package_json_edited`), and `vendor --revert` puts the registry versions back.
-Three things follow from it:
+Things to know:
 
 - **Published projects.** A project the repo publishes (`shouldPublish` or a version policy
   in `rush.json`) would publish the `file:` spec, which its consumers cannot install. The
@@ -717,6 +718,12 @@ Three things follow from it:
   later installs the registry copy until `socket-patch scan --mode vendored` runs again.
   Installs keep working in the meantime, and `vex` and `vendor --check` report the
   unpatched copy.
+
+- **Build scripts.** A decision in `pnpm-config.json` that lets the package run (or
+  forbids) its install scripts by name (`globalOnlyBuiltDependencies`,
+  `globalNeverBuiltDependencies`, `globalAllowBuilds`) stops matching once the package
+  installs from the tarball. Vendoring does not carry it over; the
+  `vendor_pnpm_build_approval_lost` warning names the id to add.
 
 With `preventManualShrinkwrapChanges` on, run `rush update` once after vendoring. It refreshes
 the lock hash in `repo-state.json` and changes nothing else (`vendor_rush_repo_state_stale`).

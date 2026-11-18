@@ -38,12 +38,13 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
+use std::sync::Arc;
 
 use serde_json::Value;
 
 use crate::constants::npm_family::{PNPM_LOCK, RUSH_COMMON_LOCK_REL, RUSH_SUBSPACES_DIR};
 use crate::formats::pnpm::lines::{
-    next_block, parse_key_line, section_bounds, split_lines, yaml_key,
+    next_block, parse_key_line, section_bounds, split_lines, unquote_value, yaml_key,
 };
 use crate::formats::pnpm::{sniff_lock_grammar, vendored_npm_uuids, PnpmLockGrammar};
 use crate::manifest::schema::PatchRecord;
@@ -60,7 +61,9 @@ use crate::vendor::npm_common::{
     WireCx,
 };
 use crate::vendor::npm_dir::{dependency_token, replace_dependency_token};
+use crate::vendor::parse_memo::ParseMemo;
 use crate::vendor::path::{parse_vendor_path, parse_vendor_path_from};
+use crate::vendor::pnpm_build_approvals::VENDOR_PNPM_BUILD_APPROVAL_LOST;
 use crate::vendor::revert::{self, KeepPolicy};
 use crate::vendor::source::PackageSource;
 use crate::vendor::state::{PnpmMeta, VendorEntry, WiringAction, WiringRecord};
@@ -69,9 +72,9 @@ use crate::vendor::{RevertOpts, RevertOutcome, VendorOutcome, VendorWarning};
 use super::{
     check_rewritable_refs_with, dep_entries, drifted, edit_packages, edit_snapshot_refs,
     edit_snapshot_rekey, is_mixed_line_endings, lock_has_target_package, matching_blocks,
-    override_key_name, overrides_record, read_pnpm_text, revert_lock_record, split_v9_lock,
-    EditCtx, PnpmDialect, RefBlocks, KIND_LOCK_IMPORTER_DEP, KIND_LOCK_PACKAGE, KIND_LOCK_SNAPSHOT,
-    VENDOR_PNPM_LOCK_MULTI_DOCUMENT,
+    override_key_name, overrides_record, read_pnpm_text, restore_dep_map_refs, revert_lock_record,
+    split_v9_lock, EditCtx, PnpmDialect, RefBlocks, KIND_LOCK_IMPORTER_DEP, KIND_LOCK_PACKAGE,
+    KIND_LOCK_SNAPSHOT, VENDOR_CONFIG_DEPENDENCY_UNPATCHED, VENDOR_PNPM_LOCK_MULTI_DOCUMENT,
 };
 
 /// The ledger flavor of a Rush-wired entry.
@@ -273,6 +276,10 @@ fn importer_project_rel(temp_rel: &str, importer: &str) -> Option<String> {
     .then_some(rel)
 }
 
+/// The split, rebased project document of each Rush lock this process read
+/// last, by the lock's bytes and install folder (see [`ParseMemo`]).
+static LOCK_MEMO: ParseMemo<Vec<String>, 4> = ParseMemo::new();
+
 /// One Rush lock as read: its project document, root-relative.
 #[derive(Debug, Clone)]
 struct LockDoc {
@@ -280,7 +287,9 @@ struct LockDoc {
     eol: LineEndings,
     /// An env document ahead of the project document, kept verbatim.
     prefix: String,
-    lines: Vec<String>,
+    /// Shared with the next read of the same bytes ([`LOCK_MEMO`]): a run
+    /// reads every Rush lock once per patched package.
+    lines: Arc<Vec<String>>,
     /// The whole lock as read (LF).
     text: String,
 }
@@ -346,7 +355,7 @@ async fn read_project(project_root: &Path) -> Result<RushProject, Refusal> {
     let rush = read_regular_to_string(&project_root.join(RUSH_JSON))
         .await
         .ok()
-        .and_then(|text| jsonc::to_value(&text))
+        .and_then(|text| crate::formats::package_json::parse(&text))
         .ok_or_else(|| unsupported(format!("cannot read {RUSH_JSON} as JSON with comments")))?;
     let major = rush
         .get("pnpmVersion")
@@ -411,8 +420,17 @@ async fn read_project(project_root: &Path) -> Result<RushProject, Refusal> {
                 format!("{rel}: {why} — use `--mode hosted`; nothing was written"),
             )
         })?;
-        let mut lines = split_lines(project);
-        layout.to_root_relative(&mut lines).map_err(unsupported)?;
+        // The split and rebase are a function of the bytes and of where
+        // Rush installs them from.
+        let mut memo_key = text.as_bytes().to_vec();
+        memo_key.push(0);
+        memo_key.extend_from_slice(layout.temp_rel.as_bytes());
+        let lines = LOCK_MEMO
+            .parse(&memo_key, || {
+                let mut lines = split_lines(project);
+                layout.to_root_relative(&mut lines).map(|()| lines)
+            })
+            .map_err(unsupported)?;
         if lines.iter().any(|l| l.contains("@rush-temp/")) {
             return Err(unsupported(format!(
                 "{rel} was installed without pnpm workspaces (`useWorkspaces` is off in \
@@ -563,23 +581,29 @@ fn section_blocks(lines: &[String], section: &str) -> Vec<(String, usize, usize)
 
 /// Move the block keyed `key` to where pnpm's serializer keeps it: the
 /// section's keys in code-unit order, compared as the lock spells them
-/// (`spelled` maps a root-relative key to that spelling). The other blocks
-/// are left in the order they are in.
-fn resort_block(
-    lines: &mut Vec<String>,
-    section: &str,
-    key: &str,
-    spelled: &dyn Fn(&str) -> String,
-) {
+/// (relative to the layout's temp directory). The other blocks are left in
+/// the order they are in.
+fn resort_block(lines: &mut Vec<String>, section: &str, key: &str, layout: &Layout) {
+    let temp = layout.temp_prefix();
+    let spelled = |key: &str| -> std::borrow::Cow<'_, str> {
+        match key.contains(ROOT_PREFIX) {
+            true => key.replace(ROOT_PREFIX, &temp).into(),
+            false => key.to_string().into(),
+        }
+    };
     let blocks = section_blocks(lines, section);
     let Some(&(_, header, end)) = blocks.iter().find(|(k, _, _)| k == key) else {
         return;
     };
-    let target = spelled(key);
+    let target = spelled(key).into_owned();
+    let after = |other: &str| match other.contains(ROOT_PREFIX) {
+        true => *spelled(other) > *target,
+        false => other > target.as_str(),
+    };
     let next = blocks
         .iter()
         .filter(|(k, _, _)| k != key)
-        .find(|(k, _, _)| spelled(k) > target)
+        .find(|(k, _, _)| after(k))
         .map(|(_, h, _)| *h);
     let in_place = match next {
         Some(h) => blocks
@@ -599,7 +623,7 @@ fn resort_block(
     }
     chunk.push(String::new());
     let blocks = section_blocks(lines, section);
-    let at = match blocks.iter().find(|(k, _, _)| spelled(k) > target) {
+    let at = match blocks.iter().find(|(k, _, _)| after(k)) {
         Some((_, h, _)) => *h,
         None => match blocks.last() {
             // After the last block and the blank line that follows it.
@@ -630,6 +654,46 @@ fn drop_registry_twin(lines: &mut Vec<String>, section: &str, name: &str, versio
     lines.drain(twin.header..twin.end);
     if lines.get(twin.header).is_some_and(String::is_empty) {
         lines.remove(twin.header);
+    }
+    true
+}
+
+/// Reduce the blocks keyed `key` in `section` to one: the block whose lines
+/// are `keep` (a wiring record's original fragment) when one is, else the
+/// first. Returns whether a block went.
+fn drop_duplicate_block(
+    lines: &mut Vec<String>,
+    section: &str,
+    key: &str,
+    keep: Option<&Value>,
+) -> bool {
+    let twins: Vec<(usize, usize)> = section_blocks(lines, section)
+        .into_iter()
+        .filter(|(k, _, _)| k == key)
+        .map(|(_, header, end)| (header, end))
+        .collect();
+    if twins.len() < 2 {
+        return false;
+    }
+    let is_kept = |&(header, end): &(usize, usize)| {
+        keep.and_then(Value::as_array).is_some_and(|want| {
+            want.len() == end - header
+                && want
+                    .iter()
+                    .zip(&lines[header..end])
+                    .all(|(w, line)| w.as_str() == Some(line))
+        })
+    };
+    let kept = twins.iter().position(is_kept).unwrap_or(0);
+    // From the last block back, so the earlier offsets stay valid.
+    for (at, (header, end)) in twins.iter().enumerate().rev() {
+        if at == kept {
+            continue;
+        }
+        lines.drain(*header..*end);
+        if lines.get(*header).is_some_and(String::is_empty) {
+            lines.remove(*header);
+        }
     }
     true
 }
@@ -757,10 +821,8 @@ fn edit_overrides(
 fn is_own_override(key: &str, value: &str, name: &str) -> bool {
     parse_vendor_path(value)
         .filter(|parts| parts.eco == "npm")
-        .and_then(|parts| {
-            let leaf = parts.leaf.rsplit('/').next()?.to_string();
-            tgz_leaf_version(name, &leaf).map(str::to_string)
-        })
+        // The whole leaf: a scoped package's is `@scope/name-<version>.tgz`.
+        .and_then(|parts| tgz_leaf_version(name, &parts.leaf).map(str::to_string))
         .is_some_and(|vendored| key.ends_with(&format!(">{name}@{vendored}")))
 }
 
@@ -810,17 +872,22 @@ async fn plan(
     // file -> (text as read, text after the edits so far).
     let mut manifests: BTreeMap<String, (String, String)> = BTreeMap::new();
     let mut configs: BTreeMap<String, (String, String)> = BTreeMap::new();
-    let mut lock_writes = Vec::new();
     let mut edited_manifests: Vec<String> = Vec::new();
-    let mut stale_repo_state: Vec<String> = Vec::new();
-    let mut found = false;
+    // Per lock: the lines this run edits, once it edits them.
+    let mut edits: Vec<Option<LockEdit>> = project.locks.iter().map(|_| None).collect();
+    // Per lock: the pnpm-config.json Rush reads for it.
+    let mut lock_configs: Vec<Option<String>> = Vec::with_capacity(project.locks.len());
+    // Per config file: the overrides this run needs in it, in the order it
+    // gets them, and how the locks that read it spell a vendored path.
+    let mut config_keys: Vec<ConfigKeys> = Vec::new();
 
-    for doc in &project.locks {
-        if !lock_has_target_package(&doc.lines, name, version) {
+    for (at, doc) in project.locks.iter().enumerate() {
+        let lock_rel = doc.layout.lock_rel.as_str();
+        let config_rel = config_file(files, &doc.layout).await?;
+        lock_configs.push(config_rel.clone());
+        if !lock_has_target_package(&*doc.lines, name, version) {
             continue;
         }
-        found = true;
-        let lock_rel = doc.layout.lock_rel.as_str();
         let unsupported = |detail: String| {
             (
                 "vendor_lock_entry_unsupported",
@@ -837,7 +904,7 @@ async fn plan(
             version,
         )?;
 
-        let mut lines = doc.lines.clone();
+        let mut lines = (*doc.lines).clone();
         let mut records: Vec<WiringRecord> = Vec::new();
         let specifiers_before = distinct_specifiers(&lines, name);
 
@@ -902,57 +969,161 @@ async fn plan(
         }
         edit_packages(&mut lines, &ctx, &mut records).map_err(unsupported)?;
         edit_snapshot_rekey(&mut lines, &ctx, &mut records).map_err(unsupported)?;
-        let spelled = |key: &str| key.replace(ROOT_PREFIX, &doc.layout.temp_prefix());
         for section in ["packages", "snapshots"] {
-            resort_block(&mut lines, section, &ctx.new_key(), &spelled);
+            resort_block(&mut lines, section, &ctx.new_key(), &doc.layout);
         }
 
         // The overrides that keep the transitive edges where the lock has
-        // them: in the lock, and in the config Rush generates pnpm's from.
+        // them go into the config Rush generates pnpm's from. Rush and pnpm
+        // then expect them in EVERY lock that reads that config, so the
+        // locks get them below, once every lock has named its own.
         let keys = parent_override_keys(&lines, &ctx).map_err(unsupported)?;
-        edit_overrides(
-            &mut lines,
-            &keys,
-            &spec,
-            project.sorted_overrides,
-            &mut records,
-        );
-        let config = edit_config(
+        match &config_rel {
+            Some(config_rel) => {
+                let temp = doc.layout.temp_prefix();
+                let at = match config_keys.iter().position(|c| &c.file == config_rel) {
+                    Some(at) => at,
+                    None => {
+                        config_keys.push(ConfigKeys {
+                            file: config_rel.clone(),
+                            temp_prefix: temp.clone(),
+                            keys: Vec::new(),
+                        });
+                        config_keys.len() - 1
+                    }
+                };
+                let shared = &mut config_keys[at];
+                if shared.temp_prefix != temp {
+                    return Err((
+                        VENDOR_RUSH_UNSUPPORTED,
+                        format!(
+                            "{lock_rel} and a lockfile Rush installs from another folder both \
+                             read {config_rel}: an override there cannot name the vendored \
+                             tarball for both. Remove the lockfile Rush no longer uses"
+                        ),
+                    ));
+                }
+                for key in keys {
+                    if !shared.keys.contains(&key) {
+                        shared.keys.push(key);
+                    }
+                }
+            }
+            None if keys.is_empty() => {}
+            None => {
+                return Err((
+                    VENDOR_RUSH_UNSUPPORTED,
+                    format!(
+                        "{RUSH_CONFIG_DIR}/{PNPM_CONFIG} does not exist: vendoring declares \
+                         its overrides in `{GLOBAL_OVERRIDES}` there, which Rush copies into \
+                         the install it runs — create it with `rush init`, or use `socket-patch \
+                         scan --mode hosted`"
+                    ),
+                ))
+            }
+        }
+        // The env document ahead of the project lock is never edited.
+        if lock_has_target_package(&split_lines(&doc.prefix), name, version) {
+            out.warnings.push(VendorWarning::new(
+                VENDOR_CONFIG_DEPENDENCY_UNPATCHED,
+                format!(
+                    "{name}@{version} is also a pnpm config dependency (the first document of \
+                     {lock_rel}); vendoring wires the projects' copy only, and the copy pnpm \
+                     installs under node_modules/.pnpm-config stays unpatched — use `--mode \
+                     hosted` to patch both"
+                ),
+            ));
+        }
+        edits[at] = Some(LockEdit {
+            lines,
+            records,
+            specifiers_before: Some(specifiers_before),
+        });
+    }
+    if edits.iter().all(Option::is_none) {
+        return Err((
+            "vendor_lock_entry_not_found",
+            format!(
+                "no Rush pnpm lockfile has a packages entry for {name}@{version} — make sure \
+                 the package is installed and locked (`rush update`) before vendoring"
+            ),
+        ));
+    }
+
+    for shared in &config_keys {
+        edit_config(
             files,
             &mut configs,
-            &doc.layout,
-            &keys,
+            shared,
             (name, version),
             &spec,
             &mut out,
         )
         .await?;
+    }
+    // Every lock that reads a config carries that config's overrides,
+    // whether or not it installs the package.
+    for (at, doc) in project.locks.iter().enumerate() {
+        let keys = lock_configs[at]
+            .as_ref()
+            .and_then(|rel| config_keys.iter().find(|c| &c.file == rel))
+            .map_or(&[][..], |c| c.keys.as_slice());
+        if keys.is_empty() {
+            continue;
+        }
+        let edit = edits[at].get_or_insert_with(|| LockEdit {
+            lines: (*doc.lines).clone(),
+            records: Vec::new(),
+            specifiers_before: None,
+        });
+        edit_overrides(
+            &mut edit.lines,
+            keys,
+            &spec,
+            project.sorted_overrides,
+            &mut edit.records,
+        );
+    }
 
-        if project.consistent_versions || config.consistent_versions {
-            let after = distinct_specifiers(&lines, name);
-            let allowed = |set: &BTreeSet<String>| {
-                set.iter()
-                    .filter(|s| !config.allowed_alternatives.contains(*s))
-                    .count()
-            };
-            if allowed(&after) > 1 && allowed(&specifiers_before) <= 1 {
-                return Err((
-                    VENDOR_RUSH_INCONSISTENT_VERSIONS,
-                    format!(
-                        "vendoring {name}@{version} gives the projects that depend on it \
-                         directly different `package.json` specs ({}), because a `file:` spec \
-                         is relative to each project's folder, and this repository enforces \
-                         `ensureConsistentVersions`: `rush install` would fail. List those \
-                         specs under `allowedAlternativeVersions` for `{name}` in \
-                         common-versions.json and re-run, or use `socket-patch scan --mode \
-                         hosted`; nothing was written",
-                        after.into_iter().collect::<Vec<_>>().join(", ")
-                    ),
-                ));
+    let mut lock_writes = Vec::new();
+    let mut stale_repo_state: Vec<String> = Vec::new();
+    for (doc, edit) in project.locks.iter().zip(edits) {
+        let Some(LockEdit {
+            lines,
+            mut records,
+            specifiers_before,
+        }) = edit
+        else {
+            continue;
+        };
+        let lock_rel = doc.layout.lock_rel.as_str();
+        if let Some(before) = specifiers_before {
+            let policy = version_policy(files, &doc.layout, name).await?;
+            if project.consistent_versions || policy.consistent_versions {
+                let after = distinct_specifiers(&lines, name);
+                let disallowed = |set: &BTreeSet<String>| {
+                    set.iter()
+                        .filter(|s| !policy.allowed_alternatives.contains(*s))
+                        .count()
+                };
+                if disallowed(&after) > 1 && disallowed(&before) <= 1 {
+                    return Err((
+                        VENDOR_RUSH_INCONSISTENT_VERSIONS,
+                        format!(
+                            "vendoring {name}@{version} gives the projects that depend on it \
+                             directly different `package.json` specs ({}), because a `file:` \
+                             spec is relative to each project's folder, and this repository \
+                             enforces `ensureConsistentVersions`: `rush install` would fail. \
+                             List those specs under `allowedAlternativeVersions` for `{name}` \
+                             in common-versions.json and re-run, or use `socket-patch scan \
+                             --mode hosted`; nothing was written",
+                            after.into_iter().collect::<Vec<_>>().join(", ")
+                        ),
+                    ));
+                }
             }
         }
-
-        if lines == doc.lines {
+        if lines == *doc.lines {
             continue;
         }
         for record in &mut records {
@@ -971,20 +1142,11 @@ async fn plan(
             .await
             .ok()
             .flatten()
-            .and_then(|text| jsonc::to_value(&text))
+            .and_then(|text| crate::formats::package_json::parse(&text))
             .is_some_and(|v| v.get("pnpmShrinkwrapHash").is_some());
         if hashed {
             stale_repo_state.push(repo_state);
         }
-    }
-    if !found {
-        return Err((
-            "vendor_lock_entry_not_found",
-            format!(
-                "no Rush pnpm lockfile has a packages entry for {name}@{version} — make sure \
-                 the package is installed and locked (`rush update`) before vendoring"
-            ),
-        ));
     }
 
     let changed = |(rel, (was, now)): (String, (String, String))| {
@@ -1039,6 +1201,25 @@ async fn plan(
         ));
     }
     Ok(out)
+}
+
+/// One lock's lines as this run edits them.
+struct LockEdit {
+    lines: Vec<String>,
+    /// Lock records, `file` still to be set.
+    records: Vec<WiringRecord>,
+    /// The importers' specifiers for the package before the edit; `None`
+    /// for a lock that only mirrors a shared config's overrides.
+    specifiers_before: Option<BTreeSet<String>>,
+}
+
+/// The overrides one `pnpm-config.json` gets from this run.
+struct ConfigKeys {
+    file: String,
+    /// How the locks that read this config spell a vendored path.
+    temp_prefix: String,
+    /// In the order the config gets them.
+    keys: Vec<String>,
 }
 
 /// Every distinct `specifier` the lock's importers give dependency `name`.
@@ -1119,33 +1300,28 @@ struct ConfigFacts {
     allowed_alternatives: Vec<String>,
 }
 
-/// Mirror the lock's parent-scoped overrides into the `globalOverrides` of
-/// the `pnpm-config.json` Rush reads for this lock, and read the
-/// subspace's version policy.
-#[allow(clippy::too_many_arguments)]
-async fn edit_config(
+/// The version policy of the lock's subspace for package `name`
+/// (common-versions.json: the subspace's own, else the shared one).
+async fn version_policy(
     files: &mut Files<'_>,
-    configs: &mut BTreeMap<String, (String, String)>,
     layout: &Layout,
-    keys: &[String],
-    (name, version): (&str, &str),
-    spec: &str,
-    out: &mut Plan,
+    name: &str,
 ) -> Result<ConfigFacts, Refusal> {
-    let unreadable = |detail: String| (VENDOR_RUSH_UNSUPPORTED, detail);
     let mut facts = ConfigFacts::default();
     for rel in layout.config_candidates("common-versions.json") {
-        let Some(text) = files.text(&rel).await.map_err(unreadable)? else {
+        let Some(text) = files
+            .text(&rel)
+            .await
+            .map_err(|detail| (VENDOR_RUSH_UNSUPPORTED, detail))?
+        else {
             continue;
         };
-        if let Some(doc) = jsonc::to_value(&text) {
+        if let Some(doc) = crate::formats::package_json::parse(&text) {
             facts.consistent_versions =
                 doc.get("ensureConsistentVersions").and_then(Value::as_bool) == Some(true);
             facts.allowed_alternatives = doc
-                .pointer(&format!(
-                    "/allowedAlternativeVersions/{}",
-                    name.replace('~', "~0").replace('/', "~1")
-                ))
+                .get("allowedAlternativeVersions")
+                .and_then(|table| table.get(name))
                 .and_then(Value::as_array)
                 .into_iter()
                 .flatten()
@@ -1154,63 +1330,114 @@ async fn edit_config(
         }
         break;
     }
+    Ok(facts)
+}
 
-    let mut config_rel = None;
+/// The `pnpm-config.json` Rush reads for this lock: the subspace's own,
+/// else the repository-wide one. `None` when neither exists.
+async fn config_file(files: &mut Files<'_>, layout: &Layout) -> Result<Option<String>, Refusal> {
     for rel in layout.config_candidates(PNPM_CONFIG) {
-        if configs.contains_key(&rel) {
-            config_rel = Some(rel);
-            break;
-        }
-        if let Some(text) = files.text(&rel).await.map_err(unreadable)? {
-            configs.insert(rel.clone(), (text.clone(), text));
-            config_rel = Some(rel);
-            break;
+        let found = files
+            .text(&rel)
+            .await
+            .map_err(|detail| (VENDOR_RUSH_UNSUPPORTED, detail))?;
+        if found.is_some() {
+            return Ok(Some(rel));
         }
     }
-    let Some(config_rel) = config_rel else {
-        return match keys.is_empty() {
-            true => Ok(facts),
-            false => Err(unreadable(format!(
-                "{RUSH_CONFIG_DIR}/{PNPM_CONFIG} does not exist: vendoring declares its \
-                 overrides in `{GLOBAL_OVERRIDES}` there, which Rush copies into the install it \
-                 runs — create it with `rush init`, or use `socket-patch scan --mode hosted`"
-            ))),
-        };
-    };
-    let (_, text) = configs.get_mut(&config_rel).expect("just inserted");
-    let temp = layout.temp_prefix();
+    Ok(None)
+}
+
+/// The Rush settings that decide whether a package may run its build
+/// scripts.
+const BUILD_SETTINGS: [&str; 3] = [
+    "globalOnlyBuiltDependencies",
+    "globalNeverBuiltDependencies",
+    "globalAllowBuilds",
+];
+
+/// Put this run's parent-scoped overrides into a `pnpm-config.json`'s
+/// `globalOverrides`, refusing an override of the user's on the package.
+async fn edit_config(
+    files: &mut Files<'_>,
+    configs: &mut BTreeMap<String, (String, String)>,
+    shared: &ConfigKeys,
+    (name, version): (&str, &str),
+    spec: &str,
+    out: &mut Plan,
+) -> Result<(), Refusal> {
+    let unreadable = |detail: String| (VENDOR_RUSH_UNSUPPORTED, detail);
+    let (config_rel, temp) = (shared.file.as_str(), shared.temp_prefix.as_str());
+    if !configs.contains_key(config_rel) {
+        let text = files
+            .text(config_rel)
+            .await
+            .map_err(unreadable)?
+            .ok_or_else(|| unreadable(format!("{config_rel} does not exist")))?;
+        configs.insert(config_rel.to_string(), (text.clone(), text));
+    }
+    let (_, text) = configs.get_mut(config_rel).expect("just inserted");
     let live = jsonc::string_members(text, GLOBAL_OVERRIDES).ok_or_else(|| {
         unreadable(format!(
             "cannot read `{GLOBAL_OVERRIDES}` in {config_rel} as an object of strings"
         ))
     })?;
     override_conflict(
-        &config_rel,
+        config_rel,
         live.iter()
-            .map(|(key, value)| (key.clone(), value.replace(&temp, ROOT_PREFIX))),
+            .map(|(key, value)| (key.clone(), value.replace(temp, ROOT_PREFIX))),
         name,
         version,
     )?;
-    if keys.is_empty() {
-        return Ok(facts);
+    let written = spec.replace(ROOT_PREFIX, temp);
+    // pnpm 10.34.2+ / 11.5.3+ match a build decision against the id a
+    // package installs under, which is now the vendored one (see
+    // `super::build_approvals`). A decision that names the registry package
+    // is not carried over here: say so.
+    if let Some(doc) = crate::formats::package_json::parse(text) {
+        let named = |key: &str| key == name || key.starts_with(&format!("{name}@"));
+        let vendored_id = format!("{name}@{written}");
+        for setting in BUILD_SETTINGS {
+            let keys: Vec<&str> = match doc.get(setting) {
+                Some(Value::Array(items)) => items.iter().filter_map(Value::as_str).collect(),
+                Some(Value::Object(map)) => map.keys().map(String::as_str).collect(),
+                _ => continue,
+            };
+            if keys.iter().any(|key| named(key)) && !keys.contains(&vendored_id.as_str()) {
+                out.warnings.push(VendorWarning::new(
+                    VENDOR_PNPM_BUILD_APPROVAL_LOST,
+                    format!(
+                        "{config_rel} decides {name}'s build scripts under `{setting}` by the \
+                         registry package's name. pnpm 10.34.2+ and 11.5.3+ match that decision \
+                         against the id a package installs under, which is now \
+                         `{vendored_id}`: pnpm 10 no longer applies the decision and pnpm 11 \
+                         and newer fail the install (ERR_PNPM_IGNORED_BUILDS). Add the same \
+                         decision for that id to `{setting}`"
+                    ),
+                ));
+            }
+        }
     }
-    let written = spec.replace(ROOT_PREFIX, &temp);
-    let entries: Vec<(String, String)> = keys
+    if shared.keys.is_empty() {
+        return Ok(());
+    }
+    let entries: Vec<(String, String)> = shared
+        .keys
         .iter()
         .map(|key| (key.clone(), written.clone()))
         .collect();
     let edited = jsonc::upsert_strings(text, GLOBAL_OVERRIDES, &entries)
         .map_err(|why| unreadable(format!("cannot edit {config_rel}: {why}")))?;
     let Some((new_text, created)) = edited else {
-        return Ok(facts);
+        return Ok(());
     };
-    for key in keys {
+    for key in &shared.keys {
         let prior = live.iter().find(|(k, _)| k == key);
         if prior.is_some_and(|(_, value)| value == &written) {
             continue;
         }
         out.wiring.push(WiringRecord {
-            file: config_rel.clone(),
+            file: config_rel.to_string(),
             kind: KIND_GLOBAL_OVERRIDE.to_string(),
             action: match prior {
                 Some(_) => WiringAction::Rewritten,
@@ -1223,7 +1450,7 @@ async fn edit_config(
     }
     out.created_overrides_table |= created;
     *text = new_text;
-    Ok(facts)
+    Ok(())
 }
 
 // ───────────────────────────── vendor backend ─────────────────────────────
@@ -1565,16 +1792,38 @@ pub async fn revert_rush_pnpm_opts(
                 &mut outcome.warnings,
             );
         }
-        // A restored registry entry goes back where pnpm keeps it.
-        let spelled = |key: &str| key.replace(ROOT_PREFIX, &layout.temp_prefix());
+        let target = crate::vendor::npm_common::parse_npm_purl(&entry.base_purl);
         for rec in records.iter() {
             let section = match rec.kind.as_str() {
                 KIND_LOCK_PACKAGE => "packages",
                 KIND_LOCK_SNAPSHOT => "snapshots",
                 _ => continue,
             };
-            if let Some(key) = rec.key.as_deref() {
-                resort_block(&mut lines, section, key, &spelled);
+            let Some(key) = rec.key.as_deref() else {
+                continue;
+            };
+            // A later `rush update` may have resolved the registry entry
+            // again, for a dependent added since: the restore then put a
+            // second block under the same key, which pnpm cannot parse.
+            // The restored one is the entry; the other goes.
+            dirty |= drop_duplicate_block(&mut lines, section, key, rec.original.as_ref());
+            // A restored registry entry goes back where pnpm keeps it.
+            resort_block(&mut lines, section, key, &layout);
+        }
+        // References pnpm itself wrote to the vendored entry since (a new
+        // peer variant of a dependent the override already covers) follow
+        // the entry back to the registry release.
+        if let Some((name, version)) = &target {
+            let registry_key = format!("{name}@{version}");
+            let restored = section_blocks(&lines, "packages")
+                .iter()
+                .any(|(key, _, _)| key == &registry_key);
+            if restored {
+                let ours = |value: &str| {
+                    parse_vendor_path(unquote_value(value))
+                        .is_some_and(|p| p.eco == "npm" && p.uuid == entry.uuid)
+                };
+                dirty |= restore_dep_map_refs(&mut lines, "snapshots", name, version, false, &ours);
             }
         }
         // A reference into the artifact that survives the restore names an
@@ -2037,6 +2286,117 @@ mod tests {
         assert!(!edited.detail.contains("libs/util"), "{}", edited.detail);
     }
 
+    /// Two subspaces that read one `pnpm-config.json`: Rush and pnpm expect
+    /// every override of that config in both locks, so the lock with no
+    /// dependent to redirect gets the entry too.
+    #[tokio::test]
+    async fn a_config_two_subspaces_share_reaches_both_locks() {
+        round_trip("subspaces-shared-config", &[MINIMIST_008]).await;
+    }
+
+    /// The wired files of the repository, replaced by another fixture
+    /// side's: what a later `rush update` left behind.
+    fn overlay(repo: &Repo, case: &str, side: &str) {
+        for (rel, bytes) in tree_snapshot(&fixture(case, side)) {
+            std::fs::write(repo.root().join(&rel), bytes).unwrap();
+        }
+    }
+
+    /// `rush update` brought the registry entry back beside the vendored
+    /// one (new dependents), and the revert runs before any re-vendor: the
+    /// restore must leave ONE registry entry, not two under the same key.
+    #[tokio::test]
+    async fn revert_with_the_registry_entry_back_leaves_one_entry() {
+        let repo = Repo::new("pnpm10");
+        let (_, entry, _) = expect_done(repo.vendor(MINIMIST_008).await);
+        let entry = entry.unwrap();
+        overlay(&repo, "new-dependents", "before");
+        let outcome = revert_npm_any(&entry, repo.root(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        let lock = repo.read(RUSH_COMMON_LOCK_REL);
+        let (packages, snapshots) = lock.split_once("\nsnapshots:\n").unwrap();
+        assert_eq!(packages.matches("\n  minimist@0.0.8:").count(), 1, "{lock}");
+        assert_eq!(
+            snapshots.matches("\n  minimist@0.0.8:").count(),
+            1,
+            "{lock}"
+        );
+        for rel in [
+            RUSH_COMMON_LOCK_REL,
+            "common/config/rush/pnpm-config.json",
+            "libs/util/package.json",
+            "top/package.json",
+        ] {
+            assert!(!repo.read(rel).contains(".socket/vendor"), "{rel}");
+        }
+        // The dependents added since keep their registry edges.
+        assert!(
+            lock.contains("  mkdirp@0.5.0:\n    dependencies:\n      minimist: 0.0.8\n"),
+            "{lock}"
+        );
+    }
+
+    /// pnpm wrote a reference of its own to the vendored entry after
+    /// vendoring (another peer variant of a dependent the override
+    /// covers). No record names it; it follows the entry back.
+    #[tokio::test]
+    async fn revert_restores_references_added_since() {
+        let repo = Repo::new("pnpm10");
+        let (_, entry, _) = expect_done(repo.vendor(MINIMIST_008).await);
+        let entry = entry.unwrap();
+        let lock = repo.read(RUSH_COMMON_LOCK_REL);
+        let vendored_ref = lock
+            .lines()
+            .find(|l| l.starts_with("      minimist: file:"))
+            .expect("mkdirp's ref is vendored")
+            .to_string();
+        let variant = format!("\n  mkdirp@0.5.1(peer@1.0.0):\n    dependencies:\n{vendored_ref}\n");
+        repo.write(
+            RUSH_COMMON_LOCK_REL,
+            &format!("{}\n{variant}", lock.trim_end_matches('\n')),
+        );
+        let outcome = revert_npm_any(&entry, repo.root(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        let lock = repo.read(RUSH_COMMON_LOCK_REL);
+        assert!(!lock.contains(".socket/vendor"), "{lock}");
+        assert!(
+            lock.contains("  mkdirp@0.5.1(peer@1.0.0):\n    dependencies:\n      minimist: 0.0.8"),
+            "{lock}"
+        );
+    }
+
+    /// A build decision that names the registry package stops matching the
+    /// vendored id: it is not carried over, so it is named.
+    #[tokio::test]
+    async fn a_build_decision_on_the_package_is_named() {
+        let repo = Repo::new("pnpm10");
+        let config_rel = format!("{RUSH_CONFIG_DIR}/{PNPM_CONFIG}");
+        let config = repo.read(&config_rel).replace(
+            "\"globalOverrides\": {",
+            "\"globalOnlyBuiltDependencies\": [\"minimist\"],\n  \"globalOverrides\": {",
+        );
+        repo.write(&config_rel, &config);
+        let (result, _, warnings) = expect_done(repo.vendor(MINIMIST_008).await);
+        assert!(result.success, "{:?}", result.error);
+        let lost = warnings
+            .iter()
+            .find(|w| w.code == VENDOR_PNPM_BUILD_APPROVAL_LOST)
+            .expect("the lost build decision is announced");
+        assert!(
+            lost.detail.contains("globalOnlyBuiltDependencies"),
+            "{}",
+            lost.detail
+        );
+        assert!(
+            lost.detail.contains(&format!(
+                "minimist@file:../../.socket/vendor/npm/{}/minimist-0.0.8.tgz",
+                MINIMIST_008.2
+            )),
+            "{}",
+            lost.detail
+        );
+    }
+
     // ── routing ────────────────────────────────────────────────────────
 
     #[tokio::test]
@@ -2143,6 +2503,23 @@ mod tests {
             &tgz("0.0.10"),
             "minimist"
         ));
+        // A scoped package's tarball sits under its scope's folder.
+        let scoped = format!(
+            "file:.socket/vendor/npm/{}/@types/node-18.0.0.tgz",
+            MINIMIST_008.2
+        );
+        let node = "@types/node";
+        assert!(is_own_override(
+            "@scope/parent@1.0.0>@types/node@18.0.0",
+            &scoped,
+            node
+        ));
+        assert!(!is_own_override(
+            "@scope/parent@1.0.0>@types/node@18.0.1",
+            &scoped,
+            node
+        ));
+        assert!(!is_own_override("@types/node@18.0.0", &scoped, node));
         for (key, value) in [
             // What the plain pnpm backend writes: under Rush it would
             // rewrite project importers.
