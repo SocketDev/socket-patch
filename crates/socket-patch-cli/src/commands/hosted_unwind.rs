@@ -5,7 +5,7 @@
 
 use socket_patch_core::patch::redirect::upstream::HostedPin;
 
-use crate::args::GlobalArgs;
+use crate::args::{GlobalArgs, RunApiClient};
 
 /// What the hosted leg did.
 #[derive(Default)]
@@ -65,6 +65,8 @@ pub(crate) fn patch_server_origins_of(patch_server_url: Option<&str>) -> Vec<Str
 /// The gem leg of the unwind's installed-tree care (the "Gem stale-install
 /// guard" section of CLI_CONTRACT.md, in the upstream direction): refresh
 /// what [`crate::commands::gem_refresh::after_restore`] may, then report.
+/// An installed copy with no archive in its gem home is judged by the
+/// record of the patch its pin named (#2092), fetched through `api`.
 /// A human run prints what was refreshed as progress lines and gets ONE
 /// warning for the gems still on their patched build; `--json` carries a
 /// note per refreshed materialization and a warning per stale one. An
@@ -81,25 +83,26 @@ async fn refresh_restored_gems(
     common: &GlobalArgs,
     outcome: &socket_patch_core::patch::redirect::upstream::RestoreOutcome,
     out: &mut HostedLegOutcome,
+    api: &RunApiClient,
 ) {
     use crate::commands::gem_refresh::{after_restore, Direction};
     use socket_patch_core::patch::redirect::upstream::GEM_STALE_CACHE;
 
-    // Each restored gem with the patch it was pinned to (the first pin's,
-    // for a gem two pins named).
-    let mut pins: std::collections::BTreeMap<String, String> = Default::default();
+    // Each restored gem with the patches it was pinned to.
+    let mut pins: std::collections::BTreeMap<String, Vec<String>> = Default::default();
     for pin in outcome
         .restored()
         .filter(|pin| pin.purl.starts_with("pkg:gem/"))
     {
         pins.entry(pin.purl.clone())
-            .or_insert_with(|| pin.uuid.clone());
+            .or_default()
+            .push(pin.uuid.clone());
     }
     if pins.is_empty() {
         return;
     }
     let restored: Vec<String> = pins.keys().cloned().collect();
-    let refresh = after_restore(common, &restored, &outcome.staged_text, &pins).await;
+    let refresh = after_restore(common, &restored, &outcome.staged_text, &pins, api).await;
     out.warnings.retain(|(code, detail)| {
         code != GEM_STALE_CACHE
             || !refresh
@@ -134,8 +137,14 @@ async fn refresh_restored_gems(
 /// Restore the in-scope hosted pins to their default upstream registry
 /// entries (core `patch::redirect::upstream`): v5 hosted mode keeps no
 /// ledger, so each pin's lock entry is re-resolved from the registry, and a
-/// pin that cannot be is refused with the `git checkout` remedy.
-pub(crate) async fn run_hosted_leg(common: &GlobalArgs, pins: &[HostedPin]) -> HostedLegOutcome {
+/// pin that cannot be is refused with the `git checkout` remedy. `api` is
+/// the run's API client, built only when the gem leg needs a patch record
+/// (see `refresh_restored_gems`).
+pub(crate) async fn run_hosted_leg(
+    common: &GlobalArgs,
+    pins: &[HostedPin],
+    api: &RunApiClient,
+) -> HostedLegOutcome {
     use socket_patch_core::patch::redirect::upstream::{
         restore_upstream, PinStatus, RestoreOptions,
     };
@@ -273,7 +282,7 @@ pub(crate) async fn run_hosted_leg(common: &GlobalArgs, pins: &[HostedPin]) -> H
         // names: bring the project's installed copies and cached archives
         // of the restored gems back to the upstream gem, and say what is
         // still the patched build.
-        refresh_restored_gems(common, &outcome, &mut out).await;
+        refresh_restored_gems(common, &outcome, &mut out, api).await;
     }
     let unwound: Vec<_> = vlt_targets
         .into_iter()

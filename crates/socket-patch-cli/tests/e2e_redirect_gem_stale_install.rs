@@ -2883,6 +2883,70 @@ async fn hosted_unwind_names_a_pruned_home_install_no_record_can_judge() {
     );
 }
 
+/// #2092 where nothing proves the upstream gem's sha256 (a lock without
+/// `CHECKSUMS`, with `--offline` or a registry that does not answer): the
+/// copy cannot be replaced, but it is not passed over. Offline no record is
+/// fetched and the copy is named as one that could not be checked; with the
+/// API in reach the record proves it patched and it is named as stale.
+#[tokio::test(flavor = "multi_thread")]
+async fn hosted_unwind_names_a_pruned_home_install_with_no_upstream_sha256() {
+    for (offline, needles) in [
+        (
+            true,
+            [
+                "could not be checked against the upstream gem",
+                "`--offline` is set, so its patch record was not fetched",
+            ],
+        ),
+        (
+            false,
+            [
+                "its patched install at",
+                "nothing pins the sha256 of the upstream gem",
+            ],
+        ),
+    ] {
+        let server = MockServer::start().await;
+        let patched = real_gem(PATCHED_LIB);
+        mount_api_for(&server, None, &sha256_of(&patched)).await;
+        serve_patched_gem(&server, patched.clone()).await;
+        // No rubygems.org stand-in: the compact index is a 404.
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("proj");
+        let (gem_dir, home) = hosted_with_pruned_home_cache(&server, &proj, true).await;
+        let before = snapshot(&home);
+        let views_before = view_requests(&server).await;
+
+        let mut args = vec!["rollback", "--yes", "--json"];
+        if offline {
+            args.push("--offline");
+        }
+        let (code, stdout, stderr) = unwind_run(&proj, &server.uri(), &args);
+        let env: serde_json::Value = serde_json::from_str(&stdout)
+            .unwrap_or_else(|e| panic!("offline={offline}: not JSON: {e}\n{stdout}\n{stderr}"));
+        assert_eq!(code, 0, "offline={offline}: {env}\n{stderr}");
+        assert_eq!(snapshot(&home), before, "offline={offline}: left as it is");
+        let left = details_with_code(&env, "upstream_gem_stale_install");
+        assert_eq!(left.len(), 1, "offline={offline}: reported: {env}");
+        for needle in
+            needles
+                .into_iter()
+                .chain([PURL, "run `bundle install`", gem_dir.to_str().unwrap()])
+        {
+            assert!(
+                left[0].contains(needle),
+                "offline={offline}: missing {needle:?}: {}",
+                left[0]
+            );
+        }
+        assert_eq!(
+            view_requests(&server).await - views_before,
+            usize::from(!offline),
+            "offline={offline}: an offline run fetches no record"
+        );
+    }
+}
+
 /// The record judges, it does not assume: an installed copy that is still
 /// the upstream gem (the scan was told not to refresh it) is left alone in
 /// a home with no `cache/` dir too, with no warning and no gem download.
