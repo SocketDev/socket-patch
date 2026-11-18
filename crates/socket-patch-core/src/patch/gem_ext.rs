@@ -92,14 +92,15 @@
 //! such fallback and is refused, with what it needs: network access to the
 //! registry once, or the source gem in the home's `cache/`.
 //!
-//! A gem that packs a library and was built against the system's copy of
-//! it (nokogiri with `--use-system-libraries`) compiles nothing of the
-//! copy it packs. A record that changes that copy (`patches/**`, `ports/**`,
-//! `dependencies.yml`) would be written, "rebuilt" against the same system
-//! library and attested, with nothing of it in what Ruby loads. It is
-//! refused from files alone instead ([`links_system_libraries`]), and a
-//! rebuild of the gem's own sources links what the installed build linked
-//! ([`link_libraries`]).
+//! A build that exits cleanly has not always built the patch. A gem's
+//! build takes what it compiles from its configuration: one set up to link
+//! the system's copy of a library the gem packs (nokogiri installed with
+//! `--use-system-libraries`) never opens the packed copy's sources, so a
+//! record that changes only those would be written, "rebuilt" and attested
+//! with nothing of it in what Ruby loads. So the record's build inputs are
+//! marked unread before the build, and a build that read none of them is
+//! not taken for a build of the patch (`unread_inputs`): the copy is left
+//! as it was.
 //!
 //! `vex` and `apply --check` attest a copy only when its marker matches the
 //! record's patched sources and every recorded artifact still hashes as
@@ -266,32 +267,8 @@ const BUILD_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 /// ignores it.
 const BUILD_COMPLETE: &str = "gem.build_complete";
 
-/// The log RubyGems keeps of a build, in its extension dir.
-const BUILD_LOG: &str = "gem_make.out";
-
 /// Files RubyGems writes into an extension dir that are not build products.
-const EXT_DIR_METADATA: &[&str] = &[BUILD_COMPLETE, BUILD_LOG, "mkmf.log"];
-
-/// The build argument nokogiri and sqlite3 take for linking the system's
-/// copy of a library the gem packs (mini_portile's convention), the one
-/// that takes it back, and nokogiri's older spelling of the first.
-const ENABLE_SYSTEM_LIBRARIES: &str = "--enable-system-libraries";
-const DISABLE_SYSTEM_LIBRARIES: &str = "--disable-system-libraries";
-const USE_SYSTEM_LIBRARIES: &str = "--use-system-libraries";
-
-/// The environment variable nokogiri's build takes for the same, when no
-/// argument says either way.
-const SYSTEM_LIBRARY_ENV: &str = "NOKOGIRI_USE_SYSTEM_LIBRARIES";
-
-/// What nokogiri's `extconf.rb` writes into the log of a build, one or the
-/// other: "Building nokogiri using system libraries." / "… using packaged
-/// libraries."
-const SYSTEM_LIBRARY_LOG: &str = "using system libraries";
-const PACKED_LIBRARY_LOG: &str = "using packaged libraries";
-
-/// How much of a build log is read for those lines: they are among the
-/// first an `extconf.rb` prints, and a log is not bounded.
-const BUILD_LOG_HEAD: u64 = 1024 * 1024;
+const EXT_DIR_METADATA: &[&str] = &[BUILD_COMPLETE, "gem_make.out", "mkmf.log"];
 
 /// Source and build-script extensions a native extension compiles.
 const NATIVE_SOURCE_EXTENSIONS: &[&str] = &[
@@ -772,139 +749,6 @@ fn is_clearly_not_built(path: &str, require_paths: &[String]) -> bool {
     }
 }
 
-/// Whether `path` is an input of a library the gem builds from sources it
-/// packs, by mini_portile's layout (nokogiri, sqlite3): a patch for it
-/// (`patches/libxml2/…`, `ports/patches/…` before nokogiri 1.6.7), its
-/// archive (`ports/archives/…`), or the file that names its version and
-/// checksum (`dependencies.yml`).
-fn is_vendored_library_input(path: &str) -> bool {
-    let path = normalize_file_path(path);
-    path == "dependencies.yml" || path.starts_with("patches/") || path.starts_with("ports/")
-}
-
-/// Which copy of a library the gem packs an extension is built against.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-enum Libraries {
-    /// Nothing says: the build's arguments and environment decide, as they
-    /// did when the gem was installed.
-    #[default]
-    Unsaid,
-    /// The copy the gem packs.
-    Packed,
-    /// The system's.
-    System,
-}
-
-/// What build arguments say of the libraries a build links, in the order
-/// mkmf asks for them in nokogiri's `extconf.rb`:
-/// [`ENABLE_SYSTEM_LIBRARIES`], then [`DISABLE_SYSTEM_LIBRARIES`], then
-/// [`USE_SYSTEM_LIBRARIES`]. Each counts bare or with any value: mkmf
-/// takes the value as it is, and `=false` is a string, which is true.
-///
-/// `args` is a `build_info` file. A current RubyGems writes one argument a
-/// line; Bundler 1 handed RubyGems a whole `build.<gem>` setting as one
-/// argument, so a line can hold several, and each is read word by word.
-fn libraries_by_args(args: &str) -> Libraries {
-    let has = |flag: &str| {
-        args.split_whitespace().any(|word| {
-            word.strip_prefix(flag)
-                .is_some_and(|rest| rest.is_empty() || rest.starts_with('='))
-        })
-    };
-    if has(ENABLE_SYSTEM_LIBRARIES) {
-        Libraries::System
-    } else if has(DISABLE_SYSTEM_LIBRARIES) {
-        Libraries::Packed
-    } else if has(USE_SYSTEM_LIBRARIES) {
-        Libraries::System
-    } else {
-        Libraries::Unsaid
-    }
-}
-
-/// What the build log at `log` says of the libraries its build linked
-/// ([`SYSTEM_LIBRARY_LOG`], [`PACKED_LIBRARY_LOG`]). A log that cannot be
-/// read says nothing.
-fn libraries_by_log(log: &Path) -> Libraries {
-    use std::io::Read as _;
-    let Ok((file, _)) = crate::utils::fs::open_regular_file_sync(log) else {
-        return Libraries::Unsaid;
-    };
-    let mut head = Vec::new();
-    if file.take(BUILD_LOG_HEAD).read_to_end(&mut head).is_err() {
-        return Libraries::Unsaid;
-    }
-    let head = String::from_utf8_lossy(&head);
-    if head.contains(SYSTEM_LIBRARY_LOG) {
-        Libraries::System
-    } else if head.contains(PACKED_LIBRARY_LOG) {
-        Libraries::Packed
-    } else {
-        Libraries::Unsaid
-    }
-}
-
-/// The libraries the installed extension of `copy`, a gem RubyGems built,
-/// links, and what says so. Read from files alone:
-///
-/// * the log of the build that is installed (or parked while a rebuild
-///   runs), which is the build itself speaking;
-/// * else the build arguments RubyGems recorded for the copy
-///   (`<home>/build_info/<full_name>.info`: `gem install … --
-///   --use-system-libraries`, Bundler's `build.<gem>` setting), which a
-///   rebuild is given again.
-///
-/// A gem installed with [`SYSTEM_LIBRARY_ENV`] alone has only its log to
-/// say so, and one whose log was pruned and whose arguments say nothing is
-/// [`Libraries::Unsaid`].
-fn installed_libraries(copy: &GemCopy) -> (Libraries, String) {
-    for ext in extension_dir_slots(copy) {
-        for dir in [ext.clone(), parked_build_path(&ext)] {
-            let said = libraries_by_log(&dir.join(BUILD_LOG));
-            if said != Libraries::Unsaid {
-                return (said, "the log of its build says so".to_string());
-            }
-        }
-    }
-    let info = copy
-        .home
-        .join("build_info")
-        .join(format!("{}.info", copy.full_name));
-    let said = crate::utils::fs::read_regular_to_string_sync(&info)
-        .map(|args| libraries_by_args(&args))
-        .unwrap_or_default();
-    (
-        said,
-        "the build arguments RubyGems recorded for it say so".to_string(),
-    )
-}
-
-/// Why nothing of a library `copy` packs is compiled into its extension,
-/// when that is so: it links the system's ([`installed_libraries`]), or it
-/// is nokogiri, nothing says what it links, and [`SYSTEM_LIBRARY_ENV`] is
-/// set (`env_set`), which its rebuild would follow. A record's
-/// [`is_vendored_library_input`] files cannot take effect in such a build.
-fn links_system_libraries(copy: &GemCopy, env_set: bool) -> Option<String> {
-    match installed_libraries(copy) {
-        (Libraries::System, evidence) => Some(evidence),
-        (Libraries::Unsaid, _) if env_set && gem_name_of(&copy.full_name) == "nokogiri" => Some(
-            format!("`{SYSTEM_LIBRARY_ENV}` is set, and nothing of its build says otherwise"),
-        ),
-        _ => None,
-    }
-}
-
-/// The record's build inputs that are [`is_vendored_library_input`]s.
-fn vendored_library_inputs(scope: &NativeScope) -> Vec<String> {
-    scope
-        .inputs
-        .iter()
-        .map(|key| normalize_file_path(key))
-        .filter(|path| is_vendored_library_input(path))
-        .map(str::to_string)
-        .collect()
-}
-
 /// A gem record's native-extension build inputs on one installed copy.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct NativeScope {
@@ -1327,14 +1171,7 @@ pub async fn verify_native_build(
     };
     let files = files.clone();
     let holds = crate::utils::fs::run_blocking(move || {
-        // A marker over a build that links the system's libraries says
-        // nothing of a library the gem packs: none of it was built.
-        let unbuilt = scope.builds_extensions
-            && !vendored_library_inputs(&scope).is_empty()
-            && installed_libraries(&copy).0 == Libraries::System;
-        !unbuilt
-            && read_marker_sync(&copy.gem_dir)
-                .is_some_and(|m| marker_holds(&m, &copy, &scope, &files))
+        read_marker_sync(&copy.gem_dir).is_some_and(|m| marker_holds(&m, &copy, &scope, &files))
     })
     .await;
     if holds {
@@ -1383,28 +1220,6 @@ struct Probe {
     lib_dir: PathBuf,
     /// What `ruby` said of itself, when it did.
     facts: Option<RubyFacts>,
-    /// The libraries a rebuild of the copy links ([`link_libraries`]): the
-    /// ones its installed build links, and for a precompiled copy the ones
-    /// the gem packs, which its publisher built it from.
-    libraries: Libraries,
-}
-
-/// Make the build `command` link `libraries`, where nokogiri's build takes
-/// that from the environment: a rebuild is made the way the installed
-/// build was, whatever [`SYSTEM_LIBRARY_ENV`] is by the time `apply` runs.
-/// A gem built with the variable set for its install alone (`RUN
-/// NOKOGIRI_USE_SYSTEM_LIBRARIES=1 bundle install`) is rebuilt with it, and
-/// one built from the libraries it packs is rebuilt without.
-fn link_libraries(command: &mut std::process::Command, libraries: Libraries) {
-    match libraries {
-        Libraries::Packed => {
-            command.env_remove(SYSTEM_LIBRARY_ENV);
-        }
-        Libraries::System => {
-            command.env(SYSTEM_LIBRARY_ENV, "1");
-        }
-        Libraries::Unsaid => {}
-    }
 }
 
 /// What a Ruby says of itself in a [`RubyRun::ExtensionsDir`] run.
@@ -1549,21 +1364,18 @@ enum RubyRun<'a> {
     /// `stage_home`: runs the staged tree's build scripts.
     ///
     /// `recorded_args`: the installed copy is one RubyGems built, and the
-    /// rebuild is given the arguments RubyGems recorded for it. A
-    /// precompiled copy was built by its publisher from the libraries the
-    /// gem packs, whatever this machine is set up to build with: arguments
-    /// recorded for it were never used (Bundler's `build.nokogiri
-    /// --use-system-libraries`, left in a project from the years before
-    /// nokogiri shipped precompiled gems, is recorded for the platform gem
-    /// too), so its rebuild takes none. Following them would replace the
-    /// library the gem ships with whichever the system has.
-    ///
-    /// `libraries`: [`Probe::libraries`].
+    /// rebuild is given the arguments RubyGems recorded for it, as `gem
+    /// pristine` gives them. A precompiled copy was built by its publisher,
+    /// not here: arguments recorded for it were never used to build it
+    /// (Bundler's `build.<gem>` setting is recorded for a platform gem
+    /// too), so its rebuild takes none. Given them, a setting a project
+    /// kept from the years a gem had no precompiled build
+    /// (`build.nokogiri --use-system-libraries`) made the rebuild replace
+    /// the library the gem ships with whichever the system has.
     StageBuild {
         spec: &'a Path,
         stage_home: &'a Path,
         recorded_args: bool,
-        libraries: Libraries,
     },
 }
 
@@ -1595,7 +1407,6 @@ async fn run_ruby(
                 .arg(&copy.spec_path)
                 .arg(&probe.extension_dir)
                 .arg(&probe.require_path);
-            link_libraries(&mut command, probe.libraries);
             if let Some(gem_path) = gem_path_for(&[&copy.home]) {
                 command.env("GEM_PATH", gem_path);
             }
@@ -1640,7 +1451,6 @@ async fn run_ruby(
             spec,
             stage_home,
             recorded_args,
-            libraries,
         } => {
             command
                 .arg("stage_build")
@@ -1650,7 +1460,6 @@ async fn run_ruby(
             if recorded_args {
                 command.arg(&copy.full_name);
             }
-            link_libraries(&mut command, libraries);
             // The stage home first: the gems the build needs and the
             // install lacks were put there, and nowhere else.
             if let Some(gem_path) = gem_path_for(&[stage_home, &copy.home]) {
@@ -2241,13 +2050,6 @@ async fn find_ruby(
             reasons.push(why);
             continue;
         }
-        let libraries = match platform {
-            Some(_) => Libraries::Packed,
-            None => {
-                let copy = copy.clone();
-                crate::utils::fs::run_blocking(move || installed_libraries(&copy).0).await
-            }
-        };
         return Ok(Probe {
             ruby,
             gem_dir: copy.gem_dir.clone(),
@@ -2256,7 +2058,6 @@ async fn find_ruby(
             require_path,
             require_paths,
             facts,
-            libraries,
         });
     }
     Err(format!(
@@ -3111,6 +2912,105 @@ fn in_tree_artifacts(
     rels
 }
 
+/// The access time a build input is given before its build: earlier than
+/// any file's modification time, so that a filesystem that records reads
+/// lazily (Linux `relatime`, APFS) records the first read after it.
+fn unread_time() -> std::time::SystemTime {
+    std::time::UNIX_EPOCH + Duration::from_secs(1_000_000_000)
+}
+
+fn accessed(path: &Path) -> Option<std::time::SystemTime> {
+    std::fs::symlink_metadata(path).ok()?.accessed().ok()
+}
+
+/// Give `path` the access time [`unread_time`]. `false` when the file
+/// cannot take it, or the filesystem does not keep it as given.
+fn mark_unread(path: &Path) -> bool {
+    let times = std::fs::FileTimes::new().set_accessed(unread_time());
+    // A file's owner sets its times through any handle on Unix, and a
+    // patched file can be read-only (it keeps the gem's mode); Windows
+    // wants a handle opened for writing. Opening a file is not a read.
+    let set = [false, true].into_iter().any(|write| {
+        std::fs::OpenOptions::new()
+            .read(!write)
+            .write(write)
+            .open(path)
+            .is_ok_and(|file| file.set_times(times).is_ok())
+    });
+    set && accessed(path) == Some(unread_time())
+}
+
+/// Mark the record's build inputs under `gem_dir` unread, right before a
+/// build of them, and name those that took the mark. An input the record
+/// deletes is not there to mark.
+fn mark_inputs_unread(gem_dir: &Path, scope: &NativeScope) -> Vec<String> {
+    scope
+        .inputs
+        .iter()
+        .map(|key| normalize_file_path(key).to_string())
+        .filter(|rel| is_safe_relative_subpath(rel) && mark_unread(&gem_dir.join(rel)))
+        .collect()
+}
+
+/// Whether a read of a file in `dir` shows in its access time. A
+/// filesystem mounted `noatime`, and Windows by default, record none.
+fn records_reads(dir: &Path) -> bool {
+    let probe = dir.join(".socket-patch-read-probe");
+    let recorded = std::fs::write(&probe, b"probe").is_ok()
+        && mark_unread(&probe)
+        && std::fs::read(&probe).is_ok()
+        && accessed(&probe).is_some_and(|at| at != unread_time());
+    let _ = std::fs::remove_file(&probe);
+    recorded
+}
+
+/// The build inputs of a record that a build which has just exited cleanly
+/// did not read, when it read NONE of them and that can be told
+/// (`marked`: [`mark_inputs_unread`]'s answer for `gem_dir`; `probe_dir`: a
+/// writable dir on the same filesystem).
+///
+/// A compiler reads what it compiles, and a build script reads the patch
+/// files it applies. A build that opened none of the files the patch
+/// changes compiled the same code it would have without them: the gem is
+/// set up not to build that part of itself (the packed library of a gem
+/// built against the system's copy), and the patch is not in what Ruby
+/// loads. One read is enough to pass: the classification of inputs is
+/// broad on purpose, and a build does not read every file a record
+/// carries (a manifest listing the files it adds).
+///
+/// `None` wherever a read leaves no trace: nothing is concluded from
+/// silence the filesystem imposes.
+fn unread_inputs(gem_dir: &Path, marked: &[String], probe_dir: &Path) -> Option<Vec<String>> {
+    if marked.is_empty() {
+        return None;
+    }
+    let read_any = marked
+        .iter()
+        .any(|rel| accessed(&gem_dir.join(rel)) != Some(unread_time()));
+    if read_any || !records_reads(probe_dir) {
+        return None;
+    }
+    Some(marked.to_vec())
+}
+
+/// What a refusal says of a build that read none of the record's inputs.
+fn unread_detail(unread: &[String]) -> String {
+    let shown = unread.iter().take(3).cloned().collect::<Vec<_>>();
+    let more = match unread.len().saturating_sub(shown.len()) {
+        0 => String::new(),
+        n => format!(" and {n} more"),
+    };
+    format!(
+        "the build exited cleanly without reading any file the patch changes ({}{more}), so \
+         nothing of the patch is compiled into the extension: this install's build does not \
+         use them. A gem set up to build against the system's copy of a library it packs \
+         (`--use-system-libraries`) does this to a patch for the packed copy; what the install \
+         runs is then the operating system's library, and updating that package is what fixes \
+         it",
+        shown.join(", ")
+    )
+}
+
 /// Why a build that exited cleanly is not one of the sources on disk, when
 /// that shows in the files it left: `None` when nothing does.
 ///
@@ -3257,6 +3157,15 @@ async fn rebuild(
         })
         .await?
     };
+    // Nothing reads the tree between here and the check after the build
+    // but the build. A rebuild without record files (a rollback's, of the
+    // original sources) has no patch to look for.
+    let marked = if files.is_empty() {
+        Vec::new()
+    } else {
+        let (gem_dir, scope) = (copy.gem_dir.clone(), scope.clone());
+        crate::utils::fs::run_blocking(move || mark_inputs_unread(&gem_dir, &scope)).await
+    };
     let built = run_ruby(&probe.ruby, RubyRun::Build(probe), copy, env, BUILD_TIMEOUT).await;
     let (copy, probe, scope, files) = (copy.clone(), probe.clone(), scope.clone(), files.clone());
     crate::utils::fs::run_blocking(move || {
@@ -3269,7 +3178,11 @@ async fn rebuild(
                 "the build exited cleanly but left no extension in {}",
                 probe.extension_dir.display()
             )),
-            Ok(_) => {
+            Ok(_) => match unread_inputs(&copy.gem_dir, &marked, &snapshot.dir) {
+                // Before anything else reads the tree: a build that read
+                // nothing of the patch is undone like a failed one.
+                Some(unread) => Err(unread_detail(&unread)),
+                None => {
                 let changes = tree_changes(&copy, &snapshot);
                 match stale_build(&copy, &probe, &removed, &snapshot, &changes) {
                     Some(why) => Err(why),
@@ -3288,7 +3201,8 @@ async fn rebuild(
                             )
                         }),
                 }
-            }
+                }
+            },
             Err(diagnostic) => Err(diagnostic),
         };
         let diagnostic = match committed {
@@ -3532,6 +3446,10 @@ enum StageFailure {
     Dependencies(String),
     /// RubyGems' builder failed: the build's diagnostic.
     Build(String),
+    /// The build read none of the record's build inputs ([`unread_inputs`]):
+    /// it is no build of the patch, and neither would one of the installed
+    /// tree be.
+    NotRead(Vec<String>),
     /// The build leaves what Ruby loads in the gem's own tree
     /// ([`in_tree_products`]), where a build staged elsewhere cannot stand
     /// in for it.
@@ -3561,6 +3479,7 @@ impl StageFailure {
             StageFailure::Build(diagnostic) => {
                 format!("the source gem did not build:\n{diagnostic}")
             }
+            StageFailure::NotRead(unread) => unread_detail(unread),
             StageFailure::InTree { products, .. } => format!(
                 "the source gem's build leaves {} in the gem's own tree, which is where it is \
                  loaded from, and a build staged elsewhere cannot take its place",
@@ -4030,12 +3949,27 @@ async fn build_in_stage(
         // The source gem of a copy RubyGems built is the copy's own gem; a
         // precompiled copy's is the ruby-platform gem of its version.
         recorded_args: source.full_name() == copy.full_name,
-        libraries: probe.libraries,
     };
     stage.beat();
+    // Nothing reads the staged tree between here and the check below but
+    // the build.
+    let marked = match record {
+        Some(record) => {
+            let (gem_dir, scope) = (staged.gem_dir.clone(), record.scope.clone());
+            crate::utils::fs::run_blocking(move || mark_inputs_unread(&gem_dir, &scope)).await
+        }
+        None => Vec::new(),
+    };
     let stdout = run_ruby(&probe.ruby, run, copy, env, BUILD_TIMEOUT)
         .await
         .map_err(StageFailure::Build)?;
+    let unread = {
+        let (gem_dir, root) = (staged.gem_dir.clone(), stage.root.clone());
+        crate::utils::fs::run_blocking(move || unread_inputs(&gem_dir, &marked, &root)).await
+    };
+    if let Some(unread) = unread {
+        return Err(StageFailure::NotRead(unread));
+    }
     let reported = tagged_lines(&stdout, "sp_built")
         .into_iter()
         .find_map(|fields| fields.first().map(PathBuf::from))
@@ -4873,43 +4807,6 @@ pub async fn apply_gem_package_patch(
             ),
         );
     }
-    // A gem built against the system's copy of a library compiles nothing
-    // of the copy it packs, and a rebuild is made the way the installed
-    // build was. So the inputs of the packed copy that the record changes
-    // would be written and never built: the library the gem loads is the
-    // operating system's, which no gem patch reaches.
-    if scope.builds_extensions {
-        let vendored = vendored_library_inputs(&scope);
-        let system = if vendored.is_empty() {
-            None
-        } else {
-            let (copy, env_set) = (copy.clone(), std::env::var_os(SYSTEM_LIBRARY_ENV).is_some());
-            crate::utils::fs::run_blocking(move || links_system_libraries(&copy, env_set)).await
-        };
-        if let Some(evidence) = system {
-            let shown = vendored.iter().take(3).cloned().collect::<Vec<_>>();
-            let more = match vendored.len().saturating_sub(shown.len()) {
-                0 => String::new(),
-                n => format!(" and {n} more"),
-            };
-            return refusal(
-                package_key,
-                pkg_path,
-                UNSUPPORTED_CODE,
-                format!(
-                    "the patch changes a library the gem packs ({}{more}), but {} was built \
-                     against the system's copy of that library ({evidence}), so nothing the \
-                     patch changes there is compiled into it and the patch cannot take effect; \
-                     nothing was written. What this install runs is the library the operating \
-                     system provides: update that package, or reinstall the gem without \
-                     `--use-system-libraries` so that it builds the library it packs, and \
-                     apply again.",
-                    shown.join(", "),
-                    copy.full_name
-                ),
-            );
-        }
-    }
     let precompiled = scope.precompiled.is_some();
     let (installed_files, absent) = files_as_installed(&copy, &scope, files).await;
 
@@ -5164,6 +5061,18 @@ pub async fn apply_gem_package_patch(
     match failure {
         // Another run is building this gem: nothing else is tried.
         StageFailure::Busy(why) => unbuildable(why),
+        // A build of the installed tree would read as little: the patch
+        // has nothing to take effect in on this install.
+        StageFailure::NotRead(unread) => refusal(
+            package_key,
+            pkg_path,
+            UNSUPPORTED_CODE,
+            format!(
+                "the patch changes native-extension sources ({inputs}), and they cannot take \
+                 effect on this install: {}; nothing was written.",
+                unread_detail(&unread)
+            ),
+        ),
         // A gem RubyGems built can still be built where it is installed,
         // as it was before there was a stage: nothing was written yet.
         failure if !precompiled => {
@@ -6211,7 +6120,6 @@ mod tests {
             require_paths: vec!["lib".to_string()],
             lib_dir: copy.gem_dir.join("lib"),
             facts: None,
-            libraries: Libraries::default(),
         };
 
         let aside = set_aside(&copy, &probe).unwrap();
@@ -6531,139 +6439,51 @@ mod tests {
         files(&all)
     }
 
-    /// The inputs of a library the gem packs are told from the gem's own
-    /// sources: only the former go unbuilt in a system-library build.
+    /// A build that read none of a record's inputs is told from one that
+    /// read any of them, by access times, and nothing is concluded where a
+    /// read leaves no trace or nothing could be marked.
     #[test]
-    fn vendored_library_inputs_are_the_packed_librarys_alone() {
-        for path in [
-            "patches/libxml2/0100-CVE-2025-0000.patch",
-            "patches/libxslt/0001-fix.patch",
-            "ports/patches/libxml2/0001-fix.patch",
-            "ports/archives/libxml2-2.13.6.tar.xz",
-            "dependencies.yml",
-        ] {
-            assert!(is_vendored_library_input(path), "{path}");
-        }
-        for path in [
-            "ext/nokogiri/xml_node.c",
-            "ext/nokogiri/extconf.rb",
-            "ext/nokogiri/patches/a.patch",
-            "gumbo-parser/src/parser.c",
-            "lib/nokogiri/xml/node.rb",
-            "Manifest.txt",
-            "dependencies.yml.orig",
-            "patches",
-        ] {
-            assert!(!is_vendored_library_input(path), "{path}");
-        }
-    }
-
-    /// mkmf's reading of the arguments, not a guess at it: any value is a
-    /// yes, `--enable` beats `--disable`, which beats `--use`, and a line
-    /// Bundler 1 wrote holds several arguments.
-    #[test]
-    fn build_arguments_say_which_libraries_a_build_links() {
-        for args in [
-            "--use-system-libraries",
-            "--enable-system-libraries",
-            "--use-system-libraries=true",
-            "--use-system-libraries=false",
-            "--enable-system-libraries=no",
-            "--with-cflags=-O2\n  --enable-system-libraries\n",
-            "--use-system-libraries --with-xml2-include=/usr/include/libxml2",
-            "--disable-system-libraries\n--enable-system-libraries",
-        ] {
-            assert_eq!(libraries_by_args(args), Libraries::System, "{args}");
-        }
-        for args in [
-            "--disable-system-libraries",
-            "--use-system-libraries\n--disable-system-libraries",
-        ] {
-            assert_eq!(libraries_by_args(args), Libraries::Packed, "{args}");
-        }
-        for args in [
-            "",
-            "--with-xml2-dir=/usr",
-            "--use-system-librariesx",
-            "--with-opt=--use-system-libraries-not",
-        ] {
-            assert_eq!(libraries_by_args(args), Libraries::Unsaid, "{args}");
-        }
-    }
-
-    /// What the installed build of a copy RubyGems built links is read from
-    /// its log first, then from the arguments RubyGems recorded, and the
-    /// environment of the run counts only for nokogiri, and only when
-    /// neither says.
-    #[test]
-    fn the_installed_build_says_which_libraries_it_links() {
+    fn a_build_that_read_none_of_the_inputs_is_told_from_one_that_read_any() {
         let tmp = tempfile::tempdir().unwrap();
-        let home = tmp.path();
-        let copy = installed_gem(home, "lib");
-        let log = home.join("extensions/p/3.4.0/a-1").join(BUILD_LOG);
-        let info = home.join("build_info/a-1.info");
-        std::fs::create_dir_all(info.parent().unwrap()).unwrap();
-        // Another gem's arguments are not this one's.
-        std::fs::write(home.join("build_info/b-1.info"), "--use-system-libraries\n").unwrap();
+        if !records_reads(tmp.path()) {
+            eprintln!("SKIP: this filesystem does not record reads in access times");
+            return;
+        }
+        let gem_dir = tmp.path().join("gem");
+        std::fs::create_dir_all(gem_dir.join("patches/lib")).unwrap();
+        std::fs::create_dir_all(gem_dir.join("ext/a")).unwrap();
+        std::fs::write(gem_dir.join("ext/a/a.c"), "int a;\n").unwrap();
+        std::fs::write(gem_dir.join("patches/lib/0001.patch"), "fix\n").unwrap();
+        let scope = NativeScope {
+            inputs: vec![
+                "ext/a/a.c".to_string(),
+                "ext/a/deleted.c".to_string(),
+                "patches/lib/0001.patch".to_string(),
+            ],
+            builds_extensions: true,
+            ..NativeScope::default()
+        };
 
-        // Nothing says, and the gem is not nokogiri: the variable is not
-        // about it.
-        assert_eq!(installed_libraries(&copy).0, Libraries::Unsaid);
-        assert_eq!(links_system_libraries(&copy, true), None);
+        // An input the record deletes is not there to mark.
+        let marked = mark_inputs_unread(&gem_dir, &scope);
+        assert_eq!(marked, ["ext/a/a.c", "patches/lib/0001.patch"]);
+        assert_eq!(
+            unread_inputs(&gem_dir, &marked, tmp.path()),
+            Some(marked.clone())
+        );
+        // Looking at a file, or listing its dir, is not reading it.
+        std::fs::metadata(gem_dir.join("ext/a/a.c")).unwrap();
+        assert_eq!(std::fs::read_dir(gem_dir.join("ext/a")).unwrap().count(), 1);
+        assert!(unread_inputs(&gem_dir, &marked, tmp.path()).is_some());
+        assert!(unread_detail(&marked).contains("ext/a/a.c, patches/lib/0001.patch"));
 
-        std::fs::write(&info, "--with-cflags=-O2\n--use-system-libraries\n").unwrap();
-        assert_eq!(installed_libraries(&copy).0, Libraries::System);
-        let by_args = links_system_libraries(&copy, false).unwrap();
-        assert!(by_args.contains("arguments"), "{by_args}");
+        // One read is a build of something the patch changes.
+        std::fs::read(gem_dir.join("patches/lib/0001.patch")).unwrap();
+        assert_eq!(unread_inputs(&gem_dir, &marked, tmp.path()), None);
 
-        // The build's own log outranks them, either way.
-        std::fs::write(
-            &log,
-            "ruby extconf.rb\nBuilding a using packaged libraries.\n",
-        )
-        .unwrap();
-        assert_eq!(installed_libraries(&copy).0, Libraries::Packed);
-        assert_eq!(links_system_libraries(&copy, true), None);
-        std::fs::remove_file(&info).unwrap();
-        std::fs::write(
-            &log,
-            "ruby extconf.rb\nBuilding a using system libraries.\n",
-        )
-        .unwrap();
-        assert_eq!(installed_libraries(&copy).0, Libraries::System);
-        let by_log = links_system_libraries(&copy, false).unwrap();
-        assert!(by_log.contains("log"), "{by_log}");
-
-        // A build parked while its rebuild runs still says what it linked.
-        let ext = home.join("extensions/p/3.4.0/a-1");
-        std::fs::rename(&ext, parked_build_path(&ext)).unwrap();
-        assert_eq!(installed_libraries(&copy).0, Libraries::System);
-    }
-
-    /// nokogiri with nothing to say what it links (its log pruned, no
-    /// arguments recorded) follows the variable when it is rebuilt, so a
-    /// patch to the libxml2 it packs is not known to be built.
-    #[test]
-    fn the_variable_counts_for_nokogiri_when_nothing_else_says() {
-        let tmp = tempfile::tempdir().unwrap();
-        let home = tmp.path();
-        let gem_dir = home.join("gems/nokogiri-1.18.10");
-        std::fs::create_dir_all(&gem_dir).unwrap();
-        std::fs::create_dir_all(home.join("specifications")).unwrap();
-        std::fs::write(home.join("specifications/nokogiri-1.18.10.gemspec"), "").unwrap();
-        let copy = GemCopy::of(&gem_dir).unwrap();
-        assert_eq!(links_system_libraries(&copy, false), None);
-        let by_env = links_system_libraries(&copy, true).unwrap();
-        assert!(by_env.contains(SYSTEM_LIBRARY_ENV), "{by_env}");
-
-        let ext = home.join("extensions/p/3.4.0/nokogiri-1.18.10");
-        std::fs::create_dir_all(&ext).unwrap();
-        std::fs::write(
-            ext.join(BUILD_LOG),
-            "Building nokogiri using packaged libraries.\n",
-        )
-        .unwrap();
-        assert_eq!(links_system_libraries(&copy, true), None);
+        // Nothing marked, nothing concluded.
+        assert_eq!(unread_inputs(&gem_dir, &[], tmp.path()), None);
+        assert!(!tmp.path().join(".socket-patch-read-probe").exists());
     }
 
     /// In the source-built gem (its gemspec declares the extension)
@@ -7026,7 +6846,6 @@ mod tests {
                 platform: "arm64-darwin-25".to_string(),
                 runs_platform: Some(true),
             }),
-            libraries: Libraries::Packed,
         }
     }
 
@@ -7310,7 +7129,6 @@ mod tests {
             require_paths: vec!["lib".to_string()],
             lib_dir: copy.gem_dir.join("lib"),
             facts: None,
-            libraries: Libraries::default(),
         };
         let stage = open_stage(&copy).unwrap();
         assert!(stage.home.starts_with(&home), "staged inside the gem home");

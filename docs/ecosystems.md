@@ -2113,18 +2113,21 @@ instead of being reported as patched.
 Ruby files are never build inputs outside `ext/` and a build script's directory: a patch that only
 changes `.rb` or `.rbs` files needs no compiler, wherever the gem keeps them.
 
-A gem that packs a library and was installed with `--use-system-libraries` (nokogiri with the
-system's libxml2, through `gem install nokogiri -- --use-system-libraries`, Bundler's
-`build.nokogiri` setting or `NOKOGIRI_USE_SYSTEM_LIBRARIES`) does not compile the library it
-packs. A patch to that packed library (a file under `patches/` or `ports/`, or
-`dependencies.yml`) changes nothing in such an install, so it fails with
-`native_extensions_unsupported` and nothing is written: the library that install runs is the
-operating system's package, and updating that package is what fixes it. A patch to the gem's own
-C sources is still rebuilt, against the system's libraries: a rebuild links what the installed
-build linked (its build log and recorded build arguments say which), even when
-`NOKOGIRI_USE_SYSTEM_LIBRARIES` was set only for the install. A precompiled gem always carries
-the libraries it packs, and is rebuilt with them even when the project still has that Bundler
-setting.
+A rebuild is only taken for a build of the patch when the build read at least one of the files
+the patch changes. How a gem builds depends on its configuration: nokogiri installed with
+`--use-system-libraries` links the operating system's libxml2 and never opens the copy it packs,
+so a patch that only adds a fix to that packed copy changes nothing there. `apply` then fails
+the package (`native_extensions_unsupported`, or `native_extension_build_failed` when the gem
+was rebuilt in place) and leaves the gem as it was, instead of reporting a patch that is in no
+compiled code: on such an install the library is the operating system's package, and updating
+that package is what fixes it. A patch to the gem's own C sources is rebuilt as usual. The check
+needs a filesystem that records file reads; on one that does not (a `noatime` mount, Windows by
+default) the build is taken as it is.
+
+A gem RubyGems compiled is rebuilt with the build arguments RubyGems recorded when it was
+installed. A precompiled gem is rebuilt with none: arguments Bundler recorded for it (a
+`build.nokogiri --use-system-libraries` setting kept from before nokogiri shipped precompiled
+gems) were never used to build it, and following them would replace the libraries the gem ships.
 
 The build happens in a stage directory inside the gem home (`.socket-patch-build/`), which is
 removed afterwards. A gem the build needs that the install lacks (a precompiled nokogiri has no

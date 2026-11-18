@@ -207,8 +207,7 @@ class NokogiriE2E
     settings = {}
     settings["BUNDLE_PATH"] = "vendor/bundle" if project_home?
     settings["BUNDLE_FORCE_RUBY_PLATFORM"] = "true" if %w[source system-libraries].include?(want)
-    by_variable = @opts[:system_libraries_by] == "variable"
-    settings["BUNDLE_BUILD__NOKOGIRI"] = "--use-system-libraries" if want == "system-libraries" && !by_variable
+    settings["BUNDLE_BUILD__NOKOGIRI"] = "--use-system-libraries" if want == "system-libraries"
     (@opts[:settings] || []).each do |pair|
       key, value = pair.split("=", 2)
       settings[key] = value.to_s
@@ -218,10 +217,6 @@ class NokogiriE2E
       lines = settings.map { |k, v| "#{k}: \"#{v}\"" }
       File.write(File.join(@proj, ".bundle", "config"), (["---"] + lines).join("\n") + "\n")
       @install_env = {}
-      # For the install alone, as `RUN NOKOGIRI_USE_SYSTEM_LIBRARIES=1 bundle
-      # install` sets it: RubyGems records no build argument, and nothing
-      # that runs later sees the variable.
-      @install_env["NOKOGIRI_USE_SYSTEM_LIBRARIES"] = "1" if want == "system-libraries" && by_variable
     else
       # The ambient configuration is not this script's to write: the
       # settings ride on the install's environment instead.
@@ -425,9 +420,13 @@ class NokogiriE2E
       record = libxml2_record
       return skip("this release reads no libxml2 patch directory") && nil unless record
       return skip("JRuby loads no libxml2") && nil if @java && @opts[:build] == "ok"
-      # Built against the system's libxml2: nothing compiles the copy the
-      # gem packs, so a patch to that copy cannot take effect.
-      return not_applied(record, "native_extensions_unsupported") if @shape == "system-libraries"
+      # Built against the system's libxml2: the build never opens the copy
+      # the gem packs, so a patch to that copy cannot take effect. (Where
+      # the filesystem records no reads the CLI cannot tell, and the leg
+      # says so with --unread-check off.)
+      if @shape == "system-libraries"
+        return @opts[:unread_check] ? not_applied(record, "native_extensions_unsupported") : skip("no read tracking here")
+      end
       native(record) do |now|
         now["libxml_patches"].include?(LIBXML2_PATCH) &&
           (@baseline["libxml_patches"] - now["libxml_patches"]).empty?
@@ -604,7 +603,7 @@ puts "sp_probe\t" + JSON.generate(result)
 end
 
 opts = { :install => "any", :build => "ok", :gem_home => "project", :scenarios => %w[ruby c libxml2], :gems => [],
-         :settings => [], :system_libraries_by => "setting" }
+         :settings => [], :unread_check => true }
 parser = OptionParser.new do |o|
   o.banner = "usage: ruby nokogiri_e2e.rb --socket-patch BIN --nokogiri VERSION [options]"
   o.on("--socket-patch BIN", "the socket-patch binary under test") { |v| opts[:socket_patch] = v }
@@ -613,10 +612,8 @@ parser = OptionParser.new do |o|
        "the install to make and require: precompiled (Bundler's default where a platform gem exists),",
        "source (the ruby platform gem, compiled here), system-libraries (compiled against the system's",
        "libxml2), java, or any (default)") { |v| opts[:install] = v }
-  o.on("--system-libraries-by HOW", %w[setting variable],
-       "how a system-libraries install is asked for: setting (default: Bundler's `build.nokogiri",
-       "--use-system-libraries`, which RubyGems records) or variable (NOKOGIRI_USE_SYSTEM_LIBRARIES",
-       "set for the install alone; only with --gem-home project)") { |v| opts[:system_libraries_by] = v }
+  o.on("--[no-]unread-check", "whether this filesystem records file reads (default: yes), which is what tells",
+       "socket-patch that a system-libraries build read nothing of a libxml2 patch") { |v| opts[:unread_check] = v }
   o.on("--build RESULT", %w[ok unavailable refused],
        "what a patch that needs a rebuild must do: ok (default), unavailable (no toolchain: fail,",
        "change nothing), refused (a JRuby install)") { |v| opts[:build] = v }

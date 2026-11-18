@@ -24,10 +24,7 @@ name: nokogiri patch compatibility
 #   system-libraries  `--use-system-libraries`: the extension is rebuilt
 #                 with the recorded build arguments, and a patch to the
 #                 vendored libxml2, which such a build does not compile, is
-#                 refused. The `by variable` leg asks for it with
-#                 NOKOGIRI_USE_SYSTEM_LIBRARIES set for the install alone,
-#                 so only the build's log says what it linked, and the
-#                 rebuild, run without the variable, must link the same.
+#                 refused: its build reads nothing of the patch.
 #                 The `legacy setting` leg is a precompiled install
 #                 in a project that still carries that Bundler setting from
 #                 the years before precompiled gems: its rebuild must keep
@@ -130,7 +127,6 @@ jobs:
           - {os: ubuntu-latest, ruby: '2.3', nokogiri: '1.6.8.1', install: source, rails: '~> 4.2.0', bundler: '1'}
           - {os: ubuntu-latest, ruby: '3.4', nokogiri: '1.18.10', install: source}
           - {os: ubuntu-latest, ruby: '3.4', nokogiri: '1.18.10', install: system-libraries, system-libxml2: true}
-          - {os: ubuntu-latest, ruby: '3.4', nokogiri: '1.18.10', install: system-libraries, system-libxml2: true, args: '--system-libraries-by variable', note: by variable}
           - {os: ubuntu-latest, ruby: '3.4', nokogiri: '1.18.10', install: precompiled, system-libxml2: true, args: '--bundle-setting BUNDLE_BUILD__NOKOGIRI=--use-system-libraries', note: legacy setting}
           # No compiler on PATH: nothing may change.
           - {os: ubuntu-latest, ruby: '3.4', nokogiri: '1.18.10', install: precompiled, build: unavailable, args: '--hide-toolchain', note: no toolchain}
