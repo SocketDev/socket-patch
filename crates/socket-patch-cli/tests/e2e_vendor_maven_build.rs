@@ -43,13 +43,18 @@
 //! `SOCKET_PATCH_MAVEN_E2E_{MVN,VERSION,REQUIRED}` gates in
 //! `maven_build_common`.
 
+#[path = "hosted_maven_common/mod.rs"]
+mod hosted_maven_common;
 #[path = "maven_build_common/mod.rs"]
 mod maven_build_common;
+#[path = "maven_mediation_common/mod.rs"]
+mod maven_mediation_common;
 #[path = "prebuilt_common/mod.rs"]
 mod prebuilt_common;
 #[path = "vex_e2e_common/mod.rs"]
 mod vex_e2e_common;
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use maven_build_common::*;
@@ -631,4 +636,619 @@ fn maven_vendor_keeps_a_sibling_the_parent_manages_at_the_base_version() {
         Some(patched.as_slice()),
         "Maven consumes the committed, patched jar"
     );
+}
+
+// ── a pin follows the version Maven selects ─────────────────────────────
+
+mod mediation {
+    use super::hosted_maven_common::Server;
+    use super::maven_mediation_common::{self as fixture, Shape};
+    use super::*;
+
+    const UUID: &str = "708192a3-b4c5-4d6e-8f70-8192a3b4c5d6";
+    const ORG: &str = "test-org";
+
+    /// The base victim's version as vendoring pins it.
+    fn suffixed() -> String {
+        format!("{}-socket.{}", fixture::BASE, &UUID[..8])
+    }
+
+    /// What `get` saves for the patch of the base victim.
+    fn stage(proj: &Path) {
+        stage_all(proj, &[(fixture::BASE, UUID)]);
+    }
+
+    /// A second patch, for the newer victim.
+    const NEWER_UUID: &str = "8192a3b4-c5d6-4e7f-9081-92a3b4c5d6e7";
+
+    /// The manifest record `get` saves for a patch of the victim at
+    /// `version`, with its after-hash blob.
+    fn stage_all(proj: &Path, patches: &[(&str, &str)]) {
+        let mut records = serde_json::Map::new();
+        std::fs::create_dir_all(proj.join(".socket/blobs")).unwrap();
+        for (version, uuid) in patches {
+            let (before, after) = (
+                fixture::pristine_member(fixture::VICTIM, version),
+                fixture::patched_member_of(version),
+            );
+            records.insert(
+                fixture::purl_of(version),
+                serde_json::json!({
+                    "uuid": uuid,
+                    "exportedAt": "2026-01-01T00:00:00Z",
+                    "files": { fixture::MEMBER: {
+                        "beforeHash": git_sha256(&before),
+                        "afterHash": git_sha256(&after),
+                    } },
+                    "vulnerabilities": { "GHSA-mediation-maven-vendored": {
+                        "cves": ["CVE-2026-7204"], "summary": "s", "severity": "high",
+                        "description": "d"
+                    } },
+                    "description": "maven mediation capstone",
+                    "license": "MIT",
+                    "tier": "free",
+                }),
+            );
+            std::fs::write(proj.join(".socket/blobs").join(git_sha256(&after)), after).unwrap();
+        }
+        std::fs::write(
+            proj.join(".socket/manifest.json"),
+            serde_json::to_string_pretty(&serde_json::json!({ "patches": records })).unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// The table's V3: in a reactor each module keeps the version it
+    /// selects. A patch of the base version is pinned in the modules that
+    /// select it (one through other artifacts, one by its own
+    /// declaration) and never in the parent they share with a module that
+    /// resolves a newer version, which Maven resolves exactly as before. A
+    /// patch of that newer version is then pinned in its module beside the
+    /// first, and the revert restores every pom.
+    #[test]
+    #[ignore = "real Maven + Maven Central (dependency plugin); run with --ignored"]
+    fn maven_vendored_reactor_pins_each_module_at_the_version_it_selects() {
+        let Some(mvn) = Mvn::detect(SUITE) else {
+            return;
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let root: PathBuf = tmp.path().canonicalize().unwrap();
+        let m2 = root.join("m2");
+        let settings = root.join("settings.xml");
+        write_settings(&settings, &[]);
+        let server = Server::start();
+        fixture::publish(&server);
+        let proj = root.join("reactor");
+        fixture::write_reactor(&proj, &server);
+        let poms = ["pom.xml", "a/pom.xml", "b/pom.xml", "c/pom.xml"];
+        let read_poms = |proj: &Path| -> Vec<Vec<u8>> {
+            poms.iter()
+                .map(|rel| std::fs::read(proj.join(rel)).unwrap())
+                .collect()
+        };
+        let pristine = read_poms(&proj);
+        let vendor = |args: &[&str]| {
+            let mut all = vec!["vendor"];
+            all.extend_from_slice(args);
+            all.extend_from_slice(&["--json", "--cwd", proj.to_str().unwrap()]);
+            socket(&proj, &m2, &all)
+        };
+        let Some(before) =
+            fixture::resolve_reactor(SUITE, &mvn, &proj, &m2, &settings, "target/before")
+        else {
+            return;
+        };
+        for (module, selects, ..) in fixture::REACTOR_MODULES {
+            assert!(
+                before[module].contains_key(&fixture::victim_jar_name(selects)),
+                "{module} selects {selects}: {:?}",
+                before[module].keys()
+            );
+        }
+        let base_sv = suffixed();
+        let newer_sv = format!("{}-socket.{}", fixture::NEWER, &NEWER_UUID[..8]);
+        let resolved = |out_rel: &str| {
+            fixture::resolve_reactor(SUITE, &mvn, &proj, &m2, &settings, out_rel)
+                .expect("the local repository is warm")
+        };
+        // What each module must resolve once `patched` versions are
+        // vendored: the same artifacts, the patched ones in their patched
+        // build, everything else byte for byte.
+        let assert_follows = |after: &BTreeMap<String, BTreeMap<String, Vec<u8>>>,
+                              patched: &[(&str, &str)]| {
+            for (module, selects, ..) in fixture::REACTOR_MODULES {
+                let (was, now) = (&before[module], &after[module]);
+                assert_eq!(
+                    fixture::unsuffixed(now.keys()),
+                    was.keys().cloned().collect(),
+                    "{module} resolves the artifacts it resolved before"
+                );
+                let pristine_name = fixture::victim_jar_name(selects);
+                match patched.iter().find(|(version, _)| *version == selects) {
+                    Some((version, sv)) => {
+                        let jar = now.get(&fixture::victim_jar_name(sv)).unwrap_or_else(|| {
+                            panic!("{module} resolves the patched {version}: {:?}", now.keys())
+                        });
+                        assert_eq!(
+                            jar_member(jar, fixture::MEMBER),
+                            Some(fixture::patched_member_of(version)),
+                            "{module}: the patched jar"
+                        );
+                    }
+                    None => assert_eq!(
+                        now.get(&pristine_name),
+                        was.get(&pristine_name),
+                        "{module} keeps the pristine {selects}"
+                    ),
+                }
+                for (name, bytes) in was {
+                    if *name != pristine_name {
+                        assert_eq!(now.get(name), Some(bytes), "{module}: {name} is untouched");
+                    }
+                }
+            }
+        };
+
+        // The patch of the base version: pinned in `a` and `c`, never in
+        // the parent, and `b` is left exactly as it was.
+        stage_all(&proj, &[(fixture::BASE, UUID)]);
+        let (code, env, stderr) = vendor(&["--offline"]);
+        assert_eq!(code, Some(0), "vendor: {env}\n{stderr}");
+        assert_eq!(env["summary"]["applied"], 1, "{env}");
+        assert_eq!(env["summary"]["failed"], 0, "{env}");
+        let after = read_poms(&proj);
+        let text = |bytes: &[u8]| String::from_utf8_lossy(bytes).into_owned();
+        assert!(
+            !text(&after[0]).contains("-socket."),
+            "the parent takes no pin:\n{}",
+            text(&after[0])
+        );
+        assert!(
+            text(&after[1]).contains(&format!("<version>{base_sv}</version>")),
+            "{}",
+            text(&after[1])
+        );
+        assert_eq!(after[2], pristine[2], "b/pom.xml is untouched");
+        assert!(
+            text(&after[3]).contains(&format!("<version>{base_sv}</version>")),
+            "{}",
+            text(&after[3])
+        );
+        assert_follows(&resolved("target/after-base"), &[(fixture::BASE, &base_sv)]);
+
+        // The patch of the version `b` selects joins it.
+        stage_all(
+            &proj,
+            &[(fixture::BASE, UUID), (fixture::NEWER, NEWER_UUID)],
+        );
+        let (code, env, stderr) = vendor(&["--offline"]);
+        assert_eq!(code, Some(0), "second vendor: {env}\n{stderr}");
+        assert_eq!(env["summary"]["failed"], 0, "{env}");
+        let both = read_poms(&proj);
+        assert!(!text(&both[0]).contains("-socket."), "{}", text(&both[0]));
+        assert_eq!(both[1], after[1], "a/pom.xml keeps its pin");
+        assert!(
+            text(&both[2]).contains(&format!("<version>{newer_sv}</version>")),
+            "{}",
+            text(&both[2])
+        );
+        assert!(!text(&both[2]).contains(&base_sv));
+        assert_eq!(both[3], after[3], "c/pom.xml keeps its pin");
+        assert_follows(
+            &resolved("target/after-both"),
+            &[(fixture::BASE, &base_sv), (fixture::NEWER, &newer_sv)],
+        );
+
+        // In sync, checked, and reverted byte for byte.
+        let wired = fixture::snapshot(&proj);
+        let (code, env, stderr) = vendor(&["--offline"]);
+        assert_eq!(code, Some(0), "re-vendor: {env}\n{stderr}");
+        assert_eq!(
+            fixture::snapshot(&proj),
+            wired,
+            "a third run is a no-op: {env}"
+        );
+        let (code, env, stderr) = vendor(&["--check"]);
+        assert_eq!(code, Some(0), "vendor --check: {env}\n{stderr}");
+        let (code, env, stderr) = vendor(&["--revert"]);
+        assert_eq!(code, Some(0), "revert: {env}\n{stderr}");
+        assert_eq!(read_poms(&proj), pristine, "the revert restores every pom");
+        assert!(!proj.join(".socket/vendor/maven2").exists(), "{env}");
+        assert!(!proj.join(".mvn").exists(), "{env}");
+    }
+
+    /// A pin in a shared parent must go once a module below it resolves
+    /// another version, even while a sibling's selection cannot be told,
+    /// and the revert must restore every pom byte for byte. A reactor
+    /// whose modules all select the base version is vendored (one pin, in
+    /// the parent). Then `b` moves to a newer version and `a` gains a
+    /// dependency this machine never resolved. The next run takes the pin
+    /// out of the parent (it would hold `b` back), keeps the module that
+    /// still certainly selects the base version patched, and Maven builds
+    /// `b` on the version it selects. `vendor --revert` then leaves each
+    /// pom exactly as the user has it: no empty management block where
+    /// the pin was.
+    #[test]
+    #[ignore = "real Maven + Maven Central (dependency plugin); run with --ignored"]
+    fn maven_vendored_parent_pin_goes_when_a_module_moves_on_and_reverts_clean() {
+        let Some(mvn) = Mvn::detect(SUITE) else {
+            return;
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let root: PathBuf = tmp.path().canonicalize().unwrap();
+        let m2 = root.join("m2");
+        let settings = root.join("settings.xml");
+        write_settings(&settings, &[]);
+        let server = Server::start();
+        fixture::publish(&server);
+        let proj = root.join("reactor");
+        fixture::write_reactor(&proj, &server);
+        let poms = ["pom.xml", "a/pom.xml", "b/pom.xml", "c/pom.xml"];
+        let read_poms = |proj: &Path| -> Vec<String> {
+            poms.iter()
+                .map(|rel| std::fs::read_to_string(proj.join(rel)).unwrap())
+                .collect()
+        };
+        // Every module on the base version: `b` through lib-deep, like `a`.
+        let b_on_newer = std::fs::read_to_string(proj.join("b/pom.xml")).unwrap();
+        std::fs::write(
+            proj.join("b/pom.xml"),
+            fixture::module_pom("b", "lib-deep", "1.0"),
+        )
+        .unwrap();
+        if fixture::resolve_reactor(SUITE, &mvn, &proj, &m2, &settings, "target/before").is_none() {
+            return;
+        }
+        let vendor = |args: &[&str]| {
+            let mut all = vec!["vendor"];
+            all.extend_from_slice(args);
+            all.extend_from_slice(&["--json", "--cwd", proj.to_str().unwrap()]);
+            socket(&proj, &m2, &all)
+        };
+        stage(&proj);
+        let (code, env, stderr) = vendor(&["--offline"]);
+        assert_eq!(code, Some(0), "vendor: {env}\n{stderr}");
+        assert_eq!(env["summary"]["applied"], 1, "{env}");
+        let sv = suffixed();
+        let pinned = read_poms(&proj);
+        assert!(
+            pinned[0].contains(&format!("<version>{sv}</version>")),
+            "every module selects the base version, so the parent is pinned:\n{}",
+            pinned[0]
+        );
+
+        // The build moves on.
+        std::fs::write(proj.join("b/pom.xml"), &b_on_newer).unwrap();
+        let a_with_unread = pinned[1].replace(
+            "\n  <dependencies>\n",
+            &format!(
+                "\n  <dependencies>\n{}",
+                fixture::dependency("lib-range", "1.0", "")
+            ),
+        );
+        assert_ne!(a_with_unread, pinned[1]);
+        std::fs::write(proj.join("a/pom.xml"), &a_with_unread).unwrap();
+        let users = read_poms(&proj);
+        // Maven has built `b` since (and nothing else): what `b` selects
+        // can be told, what `a` selects cannot. The pin still forces the
+        // old version on `b`.
+        let goal = format!("{DEPENDENCY_PLUGIN}:copy-dependencies");
+        let out = mvn.run(
+            &proj,
+            &m2,
+            &settings,
+            &[&goal, "-DoutputDirectory=target/forced", "-pl", "b"],
+        );
+        assert!(ok(&out), "{}", dump(&out));
+        assert!(
+            proj.join("b/target/forced")
+                .join(fixture::victim_jar_name(&sv))
+                .is_file(),
+            "the parent's pin holds b on the old version"
+        );
+        std::fs::remove_dir_all(proj.join("b/target")).unwrap();
+
+        let (code, env, stderr) = vendor(&["--offline"]);
+        assert_eq!(code, Some(0), "vendor after the change: {env}\n{stderr}");
+        assert_eq!(env["summary"]["failed"], 0, "{env}");
+        let after = read_poms(&proj);
+        assert!(
+            !after[0].contains(&sv),
+            "the parent's pin would hold b back, so it goes:\n{}",
+            after[0]
+        );
+        assert_eq!(
+            after[1], users[1],
+            "a cannot be told: no pin is written for it"
+        );
+        assert_eq!(after[2], users[2], "b is untouched");
+        assert!(
+            after[3].contains(&format!("<version>{sv}</version>")),
+            "c still selects the base version:\n{}",
+            after[3]
+        );
+        let built = fixture::resolve_reactor(SUITE, &mvn, &proj, &m2, &settings, "target/after")
+            .expect("the local repository is warm");
+        assert!(
+            built["b"].contains_key(&fixture::victim_jar_name(fixture::NEWER))
+                && !built["b"].keys().any(|name| name.contains("-socket.")),
+            "b builds on the version Maven selects for it: {:?}",
+            built["b"].keys()
+        );
+        assert_eq!(
+            built["c"]
+                .get(&fixture::victim_jar_name(&sv))
+                .and_then(|jar| jar_member(jar, fixture::MEMBER)),
+            Some(fixture::patched_member())
+        );
+
+        let (code, env, stderr) = vendor(&["--revert"]);
+        assert_eq!(code, Some(0), "revert: {env}\n{stderr}");
+        let reverted = read_poms(&proj);
+        let pristine_root = {
+            let fresh = root.join("fresh");
+            fixture::write_reactor(&fresh, &server);
+            std::fs::read_to_string(fresh.join("pom.xml")).unwrap()
+        };
+        assert_eq!(
+            reverted[0], pristine_root,
+            "the parent pom, byte for byte: {env}"
+        );
+        assert_eq!(
+            reverted[1],
+            users[1].replace(&sv, fixture::BASE),
+            "a/pom.xml"
+        );
+        assert_eq!(reverted[2], users[2], "b/pom.xml");
+        assert_eq!(
+            reverted[3],
+            fixture::module_pom("c", fixture::VICTIM, fixture::BASE),
+            "c/pom.xml"
+        );
+        assert!(!proj.join(".mvn").exists(), "{env}");
+    }
+
+    fn skip_of<'e>(env: &'e serde_json::Value) -> Option<&'e serde_json::Value> {
+        env["events"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|e| e["action"] == "skipped")
+    }
+
+    /// Vendoring never changes which version of an artifact a Maven build
+    /// resolves, and agent mode never fails on a version Maven did not
+    /// download. For each shape of the bug the patch of the base version is
+    /// skipped with `vendor_maven_version_not_selected` (exit 0, the
+    /// selected version named), the project is byte for byte what it was,
+    /// and Maven resolves the jars it resolved before. Where the base
+    /// version is the one selected, two levels down, it is vendored and
+    /// Maven resolves the patched jar in its place.
+    #[test]
+    #[ignore = "real Maven + Maven Central (dependency plugin); run with --ignored"]
+    fn maven_vendored_pins_follow_the_version_maven_selects() {
+        let Some(mvn) = Mvn::detect(SUITE) else {
+            return;
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let root: PathBuf = tmp.path().canonicalize().unwrap();
+        let m2 = root.join("m2");
+        let settings = root.join("settings.xml");
+        write_settings(&settings, &[]);
+        let server = Server::start();
+        fixture::publish(&server);
+        let vendor = |proj: &Path| {
+            socket(
+                proj,
+                &m2,
+                &[
+                    "vendor",
+                    "--json",
+                    "--offline",
+                    "--cwd",
+                    proj.to_str().unwrap(),
+                ],
+            )
+        };
+
+        let unselected = |shape: Shape| -> Option<()> {
+            let proj = root.join(shape.name());
+            fixture::write_project(&proj, shape, &server);
+            let before = fixture::resolve(SUITE, &mvn, &proj, &m2, &settings, "target/before")?;
+            assert!(
+                before.contains_key(&fixture::victim_jar_name(shape.selects())),
+                "{shape:?}: Maven selects {}: {:?}",
+                shape.selects(),
+                before.keys()
+            );
+            stage(&proj);
+            let pristine = fixture::snapshot(&proj);
+            let (code, env, stderr) = vendor(&proj);
+            assert_eq!(code, Some(0), "{shape:?}: {env}\n{stderr}");
+            assert_eq!(env["status"], "success", "{shape:?}: {env}");
+            assert_eq!(env["summary"]["applied"], 0, "{shape:?}: {env}");
+            assert_eq!(env["summary"]["failed"], 0, "{shape:?}: {env}");
+            assert_eq!(
+                fixture::snapshot(&proj),
+                pristine,
+                "{shape:?}: vendoring must write nothing: {env}"
+            );
+            let skip = skip_of(&env).unwrap_or_else(|| panic!("{shape:?}: no skip: {env}"));
+            // Without the base version's pom in the local repository the
+            // package is not installed at all, which is a skip of its own.
+            let base_pom = fixture::victim_dir(&m2, fixture::BASE).join(format!(
+                "{}-{}.pom",
+                fixture::VICTIM,
+                fixture::BASE
+            ));
+            if base_pom.is_file() {
+                assert_eq!(
+                    skip["errorCode"], "vendor_maven_version_not_selected",
+                    "{shape:?}: {env}"
+                );
+                let reason = skip["reason"].as_str().unwrap_or_default();
+                assert!(
+                    reason.contains(&format!(
+                        "Maven selects {}:{} {}",
+                        fixture::GROUP,
+                        fixture::VICTIM,
+                        shape.selects()
+                    )),
+                    "{shape:?}: the skip names the selected version: {reason}"
+                );
+            }
+            let after = fixture::resolve_warm(&mvn, &proj, &m2, &settings, "target/after", &[]);
+            assert_eq!(
+                after, before,
+                "{shape:?}: Maven resolves what it resolved before"
+            );
+            Some(())
+        };
+
+        // The first shape runs against a local repository that holds
+        // nothing else: Maven read the pom of the base version, which lost,
+        // and never fetched its jar (the table's V5).
+        if unselected(Shape::NearerNewer).is_none() {
+            return;
+        }
+        let base_dir = fixture::victim_dir(&m2, fixture::BASE);
+        let base_jar = base_dir.join(fixture::victim_jar_name(fixture::BASE));
+        assert!(!base_jar.exists(), "Maven never fetched the losing jar");
+
+        // Agent mode patches jars where they lie: a version with no jar is
+        // not a package it can patch, and not a failure either.
+        if base_dir.is_dir() {
+            let proj = root.join(Shape::NearerNewer.name());
+            std::fs::remove_dir_all(proj.join(".socket")).unwrap();
+            let patched_jar = fixture::patched_victim_jar();
+            let view = patch_view(
+                UUID,
+                &fixture::purl(),
+                &[(fixture::MEMBER, &git_sha256(&fixture::patched_member()))],
+                &[("GHSA-mediation-maven-vendored", &["CVE-2026-7204"])],
+            );
+            let patch = hosted_maven_common::Hosted {
+                org: ORG,
+                uuid: UUID,
+                hex8: "708192a3",
+                token: "44444444-5555-4666-8777-888888888888",
+                ghsa: "GHSA-mediation-maven-vendored",
+                cve: "CVE-2026-7204",
+                group: fixture::GROUP,
+                artifact: fixture::VICTIM,
+                version: fixture::BASE,
+                title: "maven mediation capstone",
+            };
+            hosted_maven_common::mount_api(&server, &patch, &patched_jar, b"<project/>", &view);
+            fixture::answer_lookups_only_for(&server, ORG, &fixture::purl()["pkg:maven/".len()..]);
+            let repository = fixture::snapshot(&m2);
+            let pristine = std::fs::read(proj.join("pom.xml")).unwrap();
+            let (code, env, stderr) = socket(
+                &proj,
+                &m2,
+                &[
+                    "scan",
+                    "--mode",
+                    "agent",
+                    "--json",
+                    "--yes",
+                    "--cwd",
+                    proj.to_str().unwrap(),
+                    "--api-url",
+                    &server.uri(),
+                    "--org",
+                    ORG,
+                    "--api-token",
+                    "fake",
+                ],
+            );
+            assert_eq!(code, Some(0), "agent scan: {env}\n{stderr}");
+            assert_eq!(env["status"], "success", "{env}");
+            assert_eq!(env["summary"]["failed"], 0, "{env}");
+            assert!(
+                !stderr.contains("not found on disk") && !stderr.contains("no matching variant"),
+                "a version with no jar is not a failed patch: {stderr}"
+            );
+            assert_eq!(
+                fixture::snapshot(&m2),
+                repository,
+                "the local repository is untouched"
+            );
+            assert_eq!(std::fs::read(proj.join("pom.xml")).unwrap(), pristine);
+            let _ = std::fs::remove_dir_all(proj.join(".socket"));
+        }
+
+        for shape in [Shape::NearerOlder, Shape::DirectOther, Shape::Excluded] {
+            unselected(shape).expect("the local repository is warm");
+        }
+
+        // The base version is the one selected: the patched build takes its
+        // place, and nothing else moves.
+        let proj = root.join(Shape::Selected.name());
+        fixture::write_project(&proj, Shape::Selected, &server);
+        let before = fixture::resolve(SUITE, &mvn, &proj, &m2, &settings, "target/before")
+            .expect("the local repository is warm");
+        assert!(before.contains_key(&fixture::victim_jar_name(fixture::BASE)));
+        stage(&proj);
+        let pristine = fixture::snapshot(&proj);
+        let (code, env, stderr) = vendor(&proj);
+        assert_eq!(code, Some(0), "selected: {env}\n{stderr}");
+        assert_eq!(env["summary"]["applied"], 1, "{env}");
+        assert_eq!(env["summary"]["failed"], 0, "{env}");
+        let sv = suffixed();
+        let wired = std::fs::read_to_string(proj.join("pom.xml")).unwrap();
+        assert!(
+            wired.contains(&format!("<version>{sv}</version>")),
+            "the pinned pom:\n{wired}"
+        );
+        let after = fixture::resolve_warm(&mvn, &proj, &m2, &settings, "target/after", &[]);
+        assert_eq!(
+            fixture::unsuffixed(after.keys()),
+            before.keys().cloned().collect(),
+            "the same artifacts, the victim in its patched build"
+        );
+        let resolved = after
+            .get(&fixture::victim_jar_name(&sv))
+            .unwrap_or_else(|| panic!("Maven resolves the vendored jar: {:?}", after.keys()));
+        assert_eq!(
+            jar_member(resolved, fixture::MEMBER),
+            Some(fixture::patched_member()),
+            "the resolved jar is the patched one"
+        );
+        for (name, bytes) in &before {
+            if *name != fixture::victim_jar_name(fixture::BASE) {
+                assert_eq!(after.get(name), Some(bytes), "{name} is untouched");
+            }
+        }
+        // A second run is in sync, and the revert restores every byte.
+        let vendored = fixture::snapshot(&proj);
+        let (code, env, stderr) = vendor(&proj);
+        assert_eq!(code, Some(0), "re-vendor: {env}\n{stderr}");
+        assert_eq!(
+            fixture::snapshot(&proj),
+            vendored,
+            "a second run is a no-op: {env}"
+        );
+        let (code, env, stderr) = socket(
+            &proj,
+            &m2,
+            &[
+                "vendor",
+                "--revert",
+                "--json",
+                "--cwd",
+                proj.to_str().unwrap(),
+            ],
+        );
+        assert_eq!(code, Some(0), "revert: {env}\n{stderr}");
+        assert_eq!(
+            fixture::snapshot(&proj),
+            pristine,
+            "the revert restores every byte"
+        );
+
+        // The base version now sits in the local repository, jar and all,
+        // and no pom of this project names it: a range selects another.
+        unselected(Shape::Ranged).expect("the local repository is warm");
+    }
 }

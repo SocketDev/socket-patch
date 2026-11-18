@@ -25,6 +25,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::api::types::PackageVendorResult;
 use crate::constants::npm_family::VLT_HIDDEN_LOCK_REL;
+use crate::crawlers::maven_selection::MavenSelection;
 use crate::formats::cargo::source_replacement::CratesIoSource;
 use crate::formats::governing_locks::PYPI_REQUIREMENTS;
 use crate::patch::redirect::npmrc::{
@@ -1988,6 +1989,13 @@ pub struct RewriteOptions<'a> {
     /// resolved only when a cargo dep is rewritten (the cargo rewriter's
     /// offline-source refusal).
     pub cargo_outer: &'a (dyn Fn() -> CratesIoSource + Send + Sync),
+    /// What Maven selects in each module of the project, read from the
+    /// poms the Maven local repository holds; resolved only when a maven
+    /// dep is rewritten. The pom rewriter pins a patch only where Maven
+    /// selects its base version already (a pin anywhere else would change
+    /// the version the build resolves). `None` from a host with no local
+    /// repository to read: the rewriter then pins without that check.
+    pub maven_selection: &'a (dyn Fn() -> Option<MavenSelection> + Send + Sync),
     /// A variable of the environment pnpm installs the project in, by
     /// name: a `pnpm_config_trust_lockfile` there beats the
     /// pnpm-workspace.yaml key the trust auto-config writes (#1514).
@@ -2703,6 +2711,13 @@ async fn rewrite_once(
     } else {
         CratesIoSource::Registry
     };
+    // Asked only for a pom the rewriter will edit: it refuses a reactor
+    // root whole, whatever Maven selects there.
+    let maven_selection = (rewrite_overrides.iter().any(|o| o.ecosystem == "maven")
+        && files.contains_key("pom.xml")
+        && !crate::patch::redirect::maven_reactor_root(&files))
+    .then(|| (options.maven_selection)())
+    .flatten();
     let (files, mut rewrite) = if options.blocking {
         // Pure CPU over every lock text (the independent rewriter groups
         // run concurrently inside), so it runs on the blocking pool rather
@@ -2717,6 +2732,7 @@ async fn rewrite_once(
                 &gradle_unreadable,
                 &yarn_outer,
                 &cargo_outer,
+                maven_selection.as_ref(),
             );
             (files, rewrite)
         })
@@ -2735,6 +2751,7 @@ async fn rewrite_once(
             &gradle_unreadable,
             &yarn_outer,
             &cargo_outer,
+            maven_selection.as_ref(),
         );
         (files, rewrite)
     };
@@ -4165,6 +4182,10 @@ mod tests {
         );
     }
 
+    fn no_maven_selection() -> Option<MavenSelection> {
+        None
+    }
+
     fn no_cargo_outer() -> CratesIoSource {
         CratesIoSource::Registry
     }
@@ -4581,6 +4602,7 @@ mod tests {
             npm_outer: &outer,
             yarn_classic_outer: &OuterYarnMirror::default,
             cargo_outer: &no_cargo_outer,
+            maven_selection: &no_maven_selection,
             pnpm_env: &no_env,
             blocking: false,
             takeover_uuids: Default::default(),
@@ -4644,6 +4666,7 @@ mod tests {
             npm_outer: &outer,
             yarn_classic_outer: &OuterYarnMirror::default,
             cargo_outer: &no_cargo_outer,
+            maven_selection: &no_maven_selection,
             pnpm_env: &no_env,
             blocking: false,
             takeover_uuids: Default::default(),
@@ -4937,6 +4960,7 @@ mod tests {
             npm_outer: &outer,
             yarn_classic_outer: &OuterYarnMirror::default,
             cargo_outer: &no_cargo_outer,
+            maven_selection: &no_maven_selection,
             pnpm_env: env,
             blocking: false,
             takeover_uuids: Default::default(),
@@ -5625,6 +5649,7 @@ snapshots:
                 npm_outer: &outer,
                 yarn_classic_outer: &OuterYarnMirror::default,
                 cargo_outer: &no_cargo_outer,
+                maven_selection: &no_maven_selection,
                 pnpm_env: &no_env,
                 blocking: false,
                 takeover_uuids: Default::default(),
@@ -5732,6 +5757,7 @@ snapshots:
                 npm_outer: &outer,
                 yarn_classic_outer: &OuterYarnMirror::default,
                 cargo_outer: &no_cargo_outer,
+                maven_selection: &no_maven_selection,
                 pnpm_env: &no_env,
                 blocking: false,
                 takeover_uuids: Default::default(),
@@ -5942,6 +5968,7 @@ snapshots:
             npm_outer: &outer,
             yarn_classic_outer: &OuterYarnMirror::default,
             cargo_outer: &no_cargo_outer,
+            maven_selection: &no_maven_selection,
             pnpm_env: &no_env,
             blocking: false,
             takeover_uuids: Default::default(),
@@ -6338,6 +6365,7 @@ snapshots:
             npm_outer: &outer,
             yarn_classic_outer: &OuterYarnMirror::default,
             cargo_outer: &no_cargo_outer,
+            maven_selection: &no_maven_selection,
             pnpm_env: &no_env,
             blocking: false,
             takeover_uuids: Default::default(),
@@ -6546,6 +6574,7 @@ snapshots:
             npm_outer: &outer,
             yarn_classic_outer: &OuterYarnMirror::default,
             cargo_outer: &no_cargo_outer,
+            maven_selection: &no_maven_selection,
             pnpm_env: &no_env,
             blocking: false,
             takeover_uuids: Default::default(),
@@ -6593,6 +6622,7 @@ snapshots:
             npm_outer: &outer,
             yarn_classic_outer: &OuterYarnMirror::default,
             cargo_outer: &no_cargo_outer,
+            maven_selection: &no_maven_selection,
             pnpm_env: &no_env,
             blocking: false,
             takeover_uuids: Default::default(),
@@ -6783,6 +6813,7 @@ snapshots:
                     npm_outer: &outer,
                     yarn_classic_outer: &OuterYarnMirror::default,
                     cargo_outer: &no_cargo_outer,
+                    maven_selection: &no_maven_selection,
                     pnpm_env: &no_env,
                     blocking: false,
                     takeover_uuids: Default::default(),
@@ -7186,6 +7217,7 @@ snapshots:
             npm_outer: &outer,
             yarn_classic_outer: &OuterYarnMirror::default,
             cargo_outer: &no_cargo_outer,
+            maven_selection: &no_maven_selection,
             pnpm_env: &no_env,
             blocking: false,
             takeover_uuids: Default::default(),

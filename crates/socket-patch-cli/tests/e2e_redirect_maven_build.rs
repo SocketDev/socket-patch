@@ -61,6 +61,8 @@ mod rollback_json;
 mod hosted_maven_common;
 #[path = "maven_build_common/mod.rs"]
 mod maven_build_common;
+#[path = "maven_mediation_common/mod.rs"]
+mod maven_mediation_common;
 #[path = "vex_e2e_common/mod.rs"]
 mod vex_e2e_common;
 
@@ -518,4 +520,215 @@ fn maven_scan_hosted_fresh_checkout_install_and_manifestless_vex() {
         );
     }
     assert!(!proj.join(".socket/vendor/redirect-state.json").exists());
+}
+
+// ── a pin follows the version Maven selects ─────────────────────────────
+
+mod mediation {
+    use super::maven_mediation_common::{self as fixture, Shape};
+    use super::*;
+
+    const UUID: &str = "6f708192-a3b4-4c5d-8e6f-708192a3b4c5";
+    const PATCH: Hosted = Hosted {
+        org: ORG,
+        uuid: UUID,
+        hex8: "6f708192",
+        token: "33333333-4444-4555-8666-777777777777",
+        ghsa: "GHSA-mediation-maven-hosted",
+        cve: "CVE-2026-7203",
+        group: fixture::GROUP,
+        artifact: fixture::VICTIM,
+        version: fixture::BASE,
+        title: "maven mediation capstone",
+    };
+
+    fn warning<'e>(env: &'e serde_json::Value, code: &str) -> Option<&'e serde_json::Value> {
+        env["warnings"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|w| w["code"] == code)
+    }
+
+    /// A hosted scan never changes which version of an artifact a Maven
+    /// build resolves. For each shape of the bug (a nearer version, an
+    /// excluded path, a declaration of another version, a range, with the
+    /// patch's base version elsewhere in the graph or only in the local
+    /// repository) the scan leaves the project byte for byte as it was,
+    /// exits 0 and says which version Maven selects; the jars Maven
+    /// resolves afterwards are the jars it resolved before. Where the base
+    /// version is the one selected, two levels down, the scan pins it and
+    /// Maven resolves the patched jar in its place.
+    #[test]
+    #[ignore = "real Maven + Maven Central (dependency plugin); run with --ignored"]
+    fn maven_hosted_pins_follow_the_version_maven_selects() {
+        let Some(mvn) = Mvn::detect(SUITE) else {
+            return;
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let root: PathBuf = tmp.path().canonicalize().unwrap();
+        let m2 = root.join("m2");
+        let plain = root.join("settings-plain.xml");
+        write_settings(&plain, &[]);
+
+        let server = Server::start();
+        fixture::publish(&server);
+        let patched_jar = fixture::patched_victim_jar();
+        let suffixed = PATCH.suffixed();
+        let served_pom = fixture::served_victim_pom(&suffixed).into_bytes();
+        let view = patch_view(
+            UUID,
+            &fixture::purl(),
+            &[(
+                &fixture::victim_jar_name(fixture::BASE),
+                &git_sha256(&patched_jar),
+            )],
+            &[(PATCH.ghsa, &[PATCH.cve])],
+        );
+        hosted_maven_common::mount_api(&server, &PATCH, &patched_jar, &served_pom, &view);
+        fixture::answer_lookups_only_for(&server, ORG, &fixture::purl()["pkg:maven/".len()..]);
+        server.serve_repo(&PATCH, &patched_jar, &served_pom, None);
+        let scan = |proj: &Path| {
+            socket(
+                proj,
+                &m2,
+                &[
+                    "scan",
+                    "--mode",
+                    "hosted",
+                    "--json",
+                    "--yes",
+                    "--cwd",
+                    proj.to_str().unwrap(),
+                    "--api-url",
+                    &server.uri(),
+                    "--org",
+                    ORG,
+                    "--api-token",
+                    "fake",
+                ],
+            )
+        };
+
+        // The base version is not the one selected: nothing may move. The
+        // first shape runs against a local repository that holds nothing
+        // else, where Maven reads the base version's pom and never fetches
+        // its jar (the table's V5).
+        let unselected = |shape: Shape| -> Option<()> {
+            let proj = root.join(shape.name());
+            fixture::write_project(&proj, shape, &server);
+            let before = fixture::resolve(SUITE, &mvn, &proj, &m2, &plain, "target/before")?;
+            assert!(
+                before.contains_key(&fixture::victim_jar_name(shape.selects())),
+                "{shape:?}: Maven selects {}: {:?}",
+                shape.selects(),
+                before.keys()
+            );
+            let pristine = fixture::snapshot(&proj);
+            let (code, env, stderr) = scan(&proj);
+            assert_eq!(code, Some(0), "{shape:?}: {env}\n{stderr}");
+            assert_eq!(
+                fixture::snapshot(&proj),
+                pristine,
+                "{shape:?}: the scan must write nothing: {env}"
+            );
+            // The line is owed whenever the scan saw the base version, which
+            // it does once Maven has cached its pom.
+            let base_pom = fixture::victim_dir(&m2, fixture::BASE).join(format!(
+                "{}-{}.pom",
+                fixture::VICTIM,
+                fixture::BASE
+            ));
+            if base_pom.is_file() {
+                let line = warning(&env, "redirect_maven_version_not_selected")
+                    .unwrap_or_else(|| panic!("{shape:?}: no not-selected line: {env}"));
+                let detail = line["detail"].as_str().unwrap_or_default();
+                assert!(
+                    detail.contains(&format!(
+                        "Maven selects {}:{} {}",
+                        fixture::GROUP,
+                        fixture::VICTIM,
+                        shape.selects()
+                    )) && detail.contains(&format!("not {}", fixture::BASE)),
+                    "{shape:?}: the line names the selected version: {detail}"
+                );
+            }
+            assert_eq!(env["summary"]["failed"], 0, "{shape:?}: {env}");
+            let after = fixture::resolve_warm(&mvn, &proj, &m2, &plain, "target/after", &[]);
+            assert_eq!(
+                after, before,
+                "{shape:?}: Maven resolves what it resolved before"
+            );
+            Some(())
+        };
+        if unselected(Shape::NearerNewer).is_none() {
+            return;
+        }
+        let base_dir = fixture::victim_dir(&m2, fixture::BASE);
+        assert!(
+            !base_dir
+                .join(fixture::victim_jar_name(fixture::BASE))
+                .exists(),
+            "Maven never fetched the jar of the version that lost: {:?}",
+            std::fs::read_dir(&base_dir)
+                .map(|d| d.flatten().map(|e| e.file_name()).collect::<Vec<_>>())
+        );
+        for shape in [Shape::NearerOlder, Shape::DirectOther, Shape::Excluded] {
+            unselected(shape).expect("the local repository is warm");
+        }
+
+        // The base version is the one selected: the patched build takes its
+        // place, and nothing else moves.
+        let proj = root.join(Shape::Selected.name());
+        fixture::write_project(&proj, Shape::Selected, &server);
+        let before = fixture::resolve(SUITE, &mvn, &proj, &m2, &plain, "target/before")
+            .expect("the local repository is warm");
+        assert!(before.contains_key(&fixture::victim_jar_name(fixture::BASE)));
+        let (code, env, stderr) = scan(&proj);
+        assert_eq!(code, Some(0), "selected: {env}\n{stderr}");
+        assert_eq!(env["summary"]["applied"], 1, "{env}");
+        assert!(
+            warning(&env, "redirect_maven_version_not_selected").is_none(),
+            "{env}"
+        );
+        let wired = std::fs::read_to_string(proj.join("pom.xml")).unwrap();
+        assert!(
+            wired.contains(&format!("<version>{suffixed}</version>"))
+                && wired.contains(&format!("<id>socket-patch-{UUID}</id>")),
+            "the pinned pom:\n{wired}"
+        );
+        let mirrored = root.join("settings-socket.xml");
+        let mirror_url = format!("{}{}", server.uri(), PATCH.repo_path());
+        write_settings(&mirrored, &[(&format!("socket-patch-{UUID}"), &mirror_url)]);
+        let after = fixture::resolve_warm(&mvn, &proj, &m2, &mirrored, "target/after", &[]);
+        assert_eq!(
+            fixture::unsuffixed(after.keys()),
+            before.keys().cloned().collect(),
+            "the same artifacts, the victim in its patched build"
+        );
+        assert_eq!(
+            after.get(&fixture::victim_jar_name(&suffixed)),
+            Some(&patched_jar),
+            "Maven resolves the patched jar: {:?}",
+            after.keys()
+        );
+        for (name, bytes) in &before {
+            if *name != fixture::victim_jar_name(fixture::BASE) {
+                assert_eq!(after.get(name), Some(bytes), "{name} is untouched");
+            }
+        }
+        // A second scan finds its pin and changes nothing.
+        let pinned = fixture::snapshot(&proj);
+        let (code, env, stderr) = scan(&proj);
+        assert_eq!(code, Some(0), "rescan: {env}\n{stderr}");
+        assert_eq!(
+            fixture::snapshot(&proj),
+            pinned,
+            "a rescan is a no-op: {env}"
+        );
+
+        // The base version now sits in the local repository, jar and all,
+        // and no pom of this project names it: a range selects another.
+        unselected(Shape::Ranged).expect("the local repository is warm");
+    }
 }

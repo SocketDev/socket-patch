@@ -20,7 +20,9 @@
 //!    ones the backend raises on the lock and manifest text alone;
 //! 5. a gem version the project's `Gemfile.lock` doesn't
 //!    resolve (`vendor_gem_version_not_locked`, which the callers report
-//!    as a skip).
+//!    as a skip);
+//! 6. a Maven version no module of the build selects
+//!    (`vendor_maven_version_not_selected`, a skip too).
 //!
 //! Each check lives in its backend's module; this one only dispatches and
 //! scopes them.
@@ -165,7 +167,34 @@ pub async fn vendor_refusals(
     for (purl, (code, detail)) in gem_refusals(project_root, candidates).await {
         refuse(&mut out, &purl, code, &detail);
     }
+    for (purl, (code, detail)) in maven_refusals(project_root, candidates).await {
+        refuse(&mut out, &purl, code, &detail);
+    }
     out
+}
+
+/// The Maven candidates whose base version no module of the build selects
+/// ([`super::maven_repo::maven_not_selected_refusals`]): the backend skips
+/// them before it asks the patch service for anything.
+async fn maven_refusals(
+    project_root: &Path,
+    candidates: &[(&str, &str)],
+) -> Vec<(String, (&'static str, String))> {
+    let maven: Vec<(String, String)> = candidates
+        .iter()
+        .filter(|(purl, _)| Ecosystem::from_purl(purl) == Some(Ecosystem::Maven))
+        .map(|(purl, uuid)| (purl.to_string(), uuid.to_string()))
+        .collect();
+    if maven.is_empty() {
+        return Vec::new();
+    }
+    let root = project_root.to_path_buf();
+    // The walk reads a pom per artifact of the build: off the runtime.
+    tokio::task::spawn_blocking(move || {
+        super::maven_repo::maven_not_selected_refusals(&root, &maven)
+    })
+    .await
+    .unwrap_or_default()
 }
 
 /// The gem candidates whose version `Gemfile.lock` doesn't resolve

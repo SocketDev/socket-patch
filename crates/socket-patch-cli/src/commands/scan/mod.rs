@@ -2493,6 +2493,17 @@ async fn scan_project(
         args.common.allow_patch_conflicts
     });
 
+    // Agent mode patches the installed jar where it lies. A version whose
+    // directory in the Maven local repository holds only its pom was never
+    // downloaded (Maven reads the pom of every version it weighs, and
+    // fetches the jar of the one it selects): there is nothing to patch,
+    // and it must not end the run as a targeted patch that matched no
+    // installed package.
+    if apply {
+        filtered_crawled =
+            socket_patch_core::crawlers::MavenCrawler::with_an_artifact(filtered_crawled).await;
+    }
+
     // Gradle discovery notes (m2 gating, the user home) ride the run-level
     // warnings; the lock set only annotates `packages[]` below.
     let gradle = gradle_scan(

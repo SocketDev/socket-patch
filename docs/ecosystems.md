@@ -924,6 +924,34 @@ Honest limits of the Maven and NuGet flows — documented behavior, not bugs:
   the classifier-less declarations. A `sources` / `javadoc` variant at the patched release
   only warns; any other variant there (tests, a native build) would keep unpatched code on
   a classpath, so the dep is not redirected.
+* **A pin follows the version Maven selects (hosted and vendored Maven).** A
+  `<dependencyManagement>` pin makes every occurrence of an artifact one version, so it
+  is written only where Maven selects the patch's base version already. The scan reads
+  what Maven selects from the project's poms and the poms the Maven local repository
+  holds, module by module, without running Maven: the nearest declaration wins, the
+  first declared on a tie; the project's own management overrides transitive versions;
+  an `<exclusion>` removes what is below it; a range takes the highest version the
+  cached `maven-metadata-*.xml` lists. When the build selects another version (a newer
+  or older one nearer the root, the project's own declaration, an excluded path, a
+  range), or does not resolve the artifact at all, the patch for that base version has
+  nothing to patch: nothing is written, the run exits 0, and one line names the version
+  Maven selects instead (`redirect_maven_version_not_selected`, vendored
+  `vendor_maven_version_not_selected`). A patch for the version that is selected is
+  still looked up and applied. When the selection cannot be read (most often because
+  the project was never resolved, so the local repository lacks its poms; one pom
+  missing among what a module resolves holds back every new pin in that module, since
+  it may hold a version range and a range binds at any depth), a
+  declaration that already names the base version is still rewritten where it stands,
+  and no new pin is written (`redirect_maven_selection_undetermined`, vendored
+  `vendor_maven_selection_undetermined`): the line names the remedy, `mvn -q
+  dependency:resolve` and a re-scan when a pom is missing from the local repository,
+  else a declaration of the artifact at the patched version. Vendored pins are placed
+  when a patch is first wired and stay where they are on every machine afterwards; a
+  pin for a version the build no longer selects is removed on the next run. Agent mode patches a cached jar in place under its own coordinates, which
+  cannot change what a build resolves; a version Maven only read the pom of has no jar
+  to patch and is left out of an agent scan. Maven 4 builds, profiles that declare
+  dependencies or management, relocations and dependency cycles are not modelled: the
+  artifacts they touch count as not readable.
 * **Multi-module reactors are vendored-only (hosted Maven).** Hosted mode reads only
   the root `pom.xml`, and a module's own literal `<version>` always beats a root
   `<dependencyManagement>` pin, so a root pin would leave that module on the unpatched

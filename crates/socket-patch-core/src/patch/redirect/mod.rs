@@ -57,6 +57,7 @@ mod pipenv;
 mod pipenv_pylock_tests;
 pub mod presence;
 // The pnpm hosted planner lives with the format's model.
+use crate::crawlers::maven_selection::{MavenSelection, Verdict};
 use crate::formats::cargo::hosted::CargoLockPlan;
 #[cfg(test)]
 use crate::formats::cargo::hosted::CARGO_LOCK_REFERENCE_KIND;
@@ -605,6 +606,7 @@ pub fn rewrite_registry_redirect_with_pipenv_version(
         &std::collections::BTreeSet::new(),
         &yarnrc::OuterYarnMirror::default(),
         &CratesIoSource::Registry,
+        None,
     )
 }
 
@@ -671,7 +673,10 @@ fn withhold_pypi_platform_wheels<'a>(
 /// [`rewrite_registry_redirect_with_pipenv_version`] with the inputs only
 /// the host can resolve. `gradle_unreadable` are the Gradle build files
 /// the host found but could not read as text: the Gradle planner refuses
-/// the build rather than take them for absent.
+/// the build rather than take them for absent. `maven` is what Maven
+/// selects in each module of the project, read from the local repository:
+/// the pom rewriter pins a patch only where that is its base version
+/// (`None`: no such answer, and it pins as it did before there was one).
 #[allow(clippy::too_many_arguments)]
 pub fn rewrite_registry_redirect_with_host(
     files: &BTreeMap<String, String>,
@@ -682,6 +687,7 @@ pub fn rewrite_registry_redirect_with_host(
     gradle_unreadable: &std::collections::BTreeSet<String>,
     yarn_outer: &yarnrc::OuterYarnMirror,
     cargo_outer: &CratesIoSource,
+    maven: Option<&MavenSelection>,
 ) -> RewriteResult {
     let mut result = RewriteResult::default();
     let overrides = withhold_pypi_platform_wheels(overrides, &mut result);
@@ -707,6 +713,7 @@ pub fn rewrite_registry_redirect_with_host(
         gradle_unreadable,
         yarn_outer,
         cargo_outer,
+        maven,
     );
     let mut result = rewrite_groups_parallel(result, &groups);
     result.vlt_drives = vlt::vlt_drives(files, bun_lockb_present);
@@ -733,6 +740,7 @@ fn rewriter_groups<'a>(
     gradle_unreadable: &'a std::collections::BTreeSet<String>,
     yarn_outer: &'a yarnrc::OuterYarnMirror,
     cargo_outer: &'a CratesIoSource,
+    maven: Option<&'a MavenSelection>,
 ) -> Vec<RewriterGroup<'a>> {
     vec![
         Box::new(move |result| {
@@ -754,7 +762,7 @@ fn rewriter_groups<'a>(
         Box::new(move |result| rewrite_composer_lock(files, overrides, result)),
         Box::new(move |result| rewrite_nuget(files, overrides, result)),
         Box::new(move |result| rewrite_gem(files, overrides, result)),
-        Box::new(move |result| rewrite_maven_pom(files, overrides, result)),
+        Box::new(move |result| rewrite_maven_pom(files, overrides, maven, result)),
         Box::new(move |result| {
             gradle::rewrite_gradle_hosted(files, gradle_unreadable, overrides, result)
         }),
@@ -8978,9 +8986,20 @@ fn find_maven_dependency_matches(
         .collect()
 }
 
+/// Whether the root `pom.xml` among `files` heads a multi-module reactor
+/// (`<modules>` / `<subprojects>`, or Maven 4 subproject discovery), which
+/// the pom rewriter refuses whole: nothing it would ask about the build,
+/// such as what Maven selects, is needed then.
+pub fn maven_reactor_root(files: &BTreeMap<String, String>) -> bool {
+    let read = |rel: &str| files.get(rel).map(|t| t.as_bytes().to_vec());
+    let list = |dir: &str| gradle::key_list(files, dir);
+    crate::vendor::jvm::maven_reactor::is_reactor_root(&read, &list)
+}
+
 fn rewrite_maven_pom(
     files: &BTreeMap<String, String>,
     overrides: &[DepOverride],
+    selection: Option<&MavenSelection>,
     result: &mut RewriteResult,
 ) {
     let maven: Vec<&DepOverride> = overrides
@@ -9003,11 +9022,7 @@ fn rewrite_maven_pom(
     // vendored mode's reactor planner rewrites each module's declaration.
     // Maven 4 subprojects found by discovery count too (#1809): the engine
     // reads each direct subdirectory's `pom.xml` beside such a root.
-    if pom.is_some() && {
-        let read = |rel: &str| files.get(rel).map(|t| t.as_bytes().to_vec());
-        let list = |dir: &str| gradle::key_list(files, dir);
-        crate::vendor::jvm::maven_reactor::is_reactor_root(&read, &list)
-    } {
+    if pom.is_some() && maven_reactor_root(files) {
         let gas: Vec<String> = maven
             .iter()
             .map(|dep| match &dep.namespace {
@@ -9149,6 +9164,33 @@ fn rewrite_maven_pom(
                 continue;
             }
         };
+        // A `<dependencyManagement>` pin makes every occurrence of the GA
+        // one version, so it is safe only where Maven selects the patch's
+        // base version already. A build that selects another version (or
+        // does not resolve the GA at all) has nothing for this patch to
+        // replace: it is left exactly as it is, and the line says which
+        // version Maven selects instead.
+        let verdict =
+            selection.map(|s| s.verdict("pom.xml", &group_id, &artifact_id, &dep.version));
+        if let Some(Verdict::Other(_) | Verdict::Absent) = &verdict {
+            let others = match verdict {
+                Some(Verdict::Other(version)) => vec![version],
+                _ => Vec::new(),
+            };
+            result.warnings.push(RewriteWarning {
+                code: "redirect_maven_version_not_selected".into(),
+                detail: format!(
+                    "{}; pom.xml was left as it is",
+                    crate::crawlers::maven_selection::not_selected_detail(
+                        &group_id,
+                        &artifact_id,
+                        &dep.version,
+                        &others
+                    )
+                ),
+            });
+            continue;
+        }
         let all_matches = find_maven_dependency_matches(idx, &group_id, &artifact_id);
         // Only the GA's main jar is granted: the served maven2 tail holds
         // `<a>-<suffixed>.jar/.pom` and nothing else. A classifier variant
@@ -9534,6 +9576,24 @@ fn rewrite_maven_pom(
         // as a versioned match, so `versioned` is non-empty and this branch is
         // skipped (idempotent).
         if versioned.is_empty() {
+            // Nothing in this pom names a version to replace, and what
+            // Maven selects cannot be told: a pin would be a guess that
+            // may change the version the build resolves.
+            if let Some(Verdict::Undetermined(why)) = &verdict {
+                result.warnings.push(RewriteWarning {
+                    code: "redirect_maven_selection_undetermined".into(),
+                    detail: format!(
+                        "{}; pom.xml was left as it is",
+                        crate::crawlers::maven_selection::undetermined_detail(
+                            &group_id,
+                            &artifact_id,
+                            &dep.version,
+                            why
+                        )
+                    ),
+                });
+                continue;
+            }
             idx.insert_dependency_management(pom_text, &group_id, &artifact_id, &suffixed_version);
             pom_changed = true;
             pin_landed = true;
@@ -11524,6 +11584,103 @@ mod tests {
                 "redirect_maven_trusted_checksums",
             ]
         );
+    }
+
+    /// Hosted-redirects slf4j-api in a lone `pom.xml` whose module selects
+    /// `pick` for it (`None`: does not resolve it).
+    fn rewrite_pom_selecting(pom: &str, pick: Option<Result<&str, &str>>) -> RewriteResult {
+        let picks: Vec<_> = pick
+            .into_iter()
+            .map(|pick| ("pom.xml", "org.slf4j", "slf4j-api", pick))
+            .collect();
+        let selection = MavenSelection::answering(&["pom.xml"], &picks);
+        let files = BTreeMap::from([("pom.xml".to_string(), pom.to_string())]);
+        rewrite_registry_redirect_with_host(
+            &files,
+            &[maven_override()],
+            &BTreeMap::new(),
+            None,
+            false,
+            &std::collections::BTreeSet::new(),
+            &yarnrc::OuterYarnMirror::default(),
+            &CratesIoSource::Registry,
+            Some(&selection),
+        )
+    }
+
+    const TRANSITIVE_ONLY_POM: &str = "<project>\n  <dependencies>\n    <dependency>\n      \
+        <groupId>ch.qos.logback</groupId>\n      <artifactId>logback-classic</artifactId>\n      \
+        <version>1.4.14</version>\n    </dependency>\n  </dependencies>\n</project>\n";
+
+    /// A `<dependencyManagement>` pin makes every occurrence of the GA one
+    /// version, so it is written only where Maven selects the patch's
+    /// base version already.
+    #[test]
+    fn maven_pin_is_written_only_where_maven_selects_the_base_version() {
+        // Selected through another artifact: pinned, as before.
+        let r = rewrite_pom_selecting(TRANSITIVE_ONLY_POM, Some(Ok("1.7.36")));
+        let out = r.files.get("pom.xml").expect("pom rewritten");
+        assert!(
+            out.contains(&format!("<version>{MAVEN_SUFFIXED}</version>")),
+            "{out}"
+        );
+        assert!(warning_codes(&r).contains(&"redirect_maven_dep_management_added"));
+
+        // Maven selects another version, or does not resolve the GA:
+        // nothing is written, and the line says what Maven selects.
+        for (pick, says) in [
+            (
+                Some(Ok("2.0.9")),
+                "Maven selects org.slf4j:slf4j-api 2.0.9 in this build, not 1.7.36",
+            ),
+            (None, "no module of this build resolves org.slf4j:slf4j-api"),
+        ] {
+            let r = rewrite_pom_selecting(TRANSITIVE_ONLY_POM, pick);
+            assert!(r.files.is_empty() && r.edits.is_empty(), "{:?}", r.files);
+            assert_eq!(
+                warning_codes(&r),
+                vec!["redirect_maven_version_not_selected"]
+            );
+            assert!(
+                r.warnings[0].detail.contains(says),
+                "{}",
+                r.warnings[0].detail
+            );
+        }
+    }
+
+    /// What Maven selects cannot be told: no pin is written on a guess,
+    /// but a declaration that names the base version is still rewritten
+    /// where it stands.
+    #[test]
+    fn maven_undetermined_selection_pins_nothing_new() {
+        let unread = Some(Err(
+            "the pom of ch.qos.logback:logback-classic:1.4.14 is not in the local Maven repository",
+        ));
+        let r = rewrite_pom_selecting(TRANSITIVE_ONLY_POM, unread);
+        assert!(r.files.is_empty() && r.edits.is_empty(), "{:?}", r.files);
+        assert_eq!(
+            warning_codes(&r),
+            vec!["redirect_maven_selection_undetermined"]
+        );
+        let detail = &r.warnings[0].detail;
+        assert!(
+            detail.contains("logback-classic:1.4.14 is not in the local Maven repository")
+                && detail.contains("mvn -q dependency:resolve"),
+            "{detail}"
+        );
+
+        let direct = "<project>\n  <dependencies>\n    <dependency>\n      \
+            <groupId>org.slf4j</groupId>\n      <artifactId>slf4j-api</artifactId>\n      \
+            <version>1.7.36</version>\n    </dependency>\n  </dependencies>\n</project>\n";
+        let r = rewrite_pom_selecting(direct, unread);
+        let out = r.files.get("pom.xml").expect("pom rewritten");
+        assert!(
+            out.contains(&format!("<version>{MAVEN_SUFFIXED}</version>")),
+            "{out}"
+        );
+        assert!(!out.contains("<dependencyManagement>"), "{out}");
+        assert!(!warning_codes(&r).contains(&"redirect_maven_selection_undetermined"));
     }
 
     /// Fail-closed refusals: a `${property}` version refuses the whole dep (no
@@ -14422,6 +14579,7 @@ mod tests {
             &std::collections::BTreeSet::new(),
             &refusing[3],
             &CratesIoSource::Registry,
+            None,
         );
         assert!(!r.files.contains_key("yarn.lock"));
         assert!(r
