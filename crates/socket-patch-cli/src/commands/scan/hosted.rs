@@ -264,19 +264,22 @@ impl<'a> ViewFallback<'a> {
 /// the tree) or one other projects share, and, for a project-local copy,
 /// the project's committed cache-dir archive when it is stale too (bundler
 /// installs from it in preference to fetching, so the same refresh and the
-/// same remedy cover it).
+/// same remedy cover it). `in_place`: the files hold an agent-mode patch
+/// and only the archive RubyGems kept beside them is stale.
 fn stale_installed_gem(
     purl: &str,
     gem_dir: &Path,
     leaf: &str,
     project_local: bool,
     project_cache_gem: Option<&Path>,
+    in_place: bool,
 ) -> StaleGem {
     StaleGem {
         purl: purl.to_string(),
         leaf: leaf.to_string(),
         installed: Some((gem_dir.to_path_buf(), project_local)),
         cache_archive: project_cache_gem.map(Path::to_path_buf),
+        in_place,
     }
 }
 
@@ -307,6 +310,7 @@ fn stale_cache_gem(purl: &str, cache_path: &Path) -> StaleGem {
         leaf,
         installed: None,
         cache_archive: Some(cache_path.to_path_buf()),
+        in_place: false,
     }
 }
 
@@ -319,8 +323,12 @@ fn stale_cache_gem(purl: &str, cache_path: &Path) -> StaleGem {
 /// * An installed dir is judged by the archive RubyGems installed it from,
 ///   `<home>/cache/<leaf>.gem`: one whose sha256 is a patched artifact's is
 ///   patched, any other readable one is stale. An agent-mode manifest
-///   record of the same patch judges the dir by its `afterHash` map instead
-///   (an in-place patch keeps the upstream archive).
+///   record of the same patch judges the dir's files by its `afterHash`
+///   map instead. An in-place patch keeps the upstream archive, though, and
+///   that archive is what `bundle pristine` and `--redownload` reinstall
+///   from: files the record proves patched beside a readable archive that
+///   is not a patched artifact's are stale as well (`StaleGem::in_place`):
+///   the refresh replaces that archive and leaves the dir as it is.
 /// * With neither (no readable archive, or no patched sha to compare it
 ///   with), the patch's view record judges the dir ([`ViewFallback`]). A
 ///   dir that record cannot judge either (the fetch failed, or `--offline`)
@@ -377,6 +385,9 @@ async fn gem_stale_install_warnings(
         leaf: String,
         patched: bool,
         positive: bool,
+        /// An agent-mode record proved the files patched, and the archive
+        /// RubyGems installed the dir from is not a patched artifact's.
+        upstream_archive: bool,
         /// Some variant had no evidence at all (see `unjudged_purls`).
         unjudged: bool,
         /// Every candidate purl installed in this dir.
@@ -438,31 +449,47 @@ async fn gem_stale_install_warnings(
                     leaf: leaf.to_string(),
                     patched: false,
                     positive: false,
+                    upstream_archive: false,
                     unjudged: false,
                     purls: std::collections::BTreeSet::new(),
                     project_local: *project_local,
                 });
             entry.purls.insert((*purl).to_string());
-            let judged = match local {
-                Some(record) => Some(judge_installed_record(&pkg.path, record).await),
-                None => match gem_artifact_shas.get(&gem_sha_key(purl)) {
-                    Some(patched_shas) => {
-                        let archive = pkg
-                            .path
-                            .parent()
-                            .and_then(Path::parent)
-                            .map(|home| home.join("cache").join(format!("{leaf}.gem")));
-                        let sha = match archive {
-                            Some(archive) => file_sha256_hex(&archive).await,
-                            None => None,
-                        };
-                        sha.map(|sha| InstalledRecordJudgment {
-                            patched: patched_shas.contains(&sha),
-                            stale_evidence: !patched_shas.contains(&sha),
+            // Whether the archive RubyGems installed the dir from is a
+            // patched artifact's; `None` without a readable archive or a
+            // patched sha to compare it with.
+            let archive_patched = || async {
+                match (
+                    gem_artifact_shas.get(&gem_sha_key(purl)),
+                    gem_refresh::home_cache_archive(&pkg.path),
+                ) {
+                    (Some(patched_shas), Some(archive)) => {
+                        file_sha256_hex(&archive).await.map(|sha| {
+                            patched_shas
+                                .iter()
+                                .any(|patched| patched.eq_ignore_ascii_case(&sha))
                         })
                     }
-                    None => None,
-                },
+                    _ => None,
+                }
+            };
+            let judged = match local {
+                Some(record) => {
+                    let judged = judge_installed_record(&pkg.path, record).await;
+                    if judged.patched
+                        && !entry.upstream_archive
+                        && archive_patched().await == Some(false)
+                    {
+                        entry.upstream_archive = true;
+                    }
+                    Some(judged)
+                }
+                None => archive_patched()
+                    .await
+                    .map(|patched| InstalledRecordJudgment {
+                        patched,
+                        stale_evidence: !patched,
+                    }),
             };
             match judged {
                 Some(judged) => entry.record(purl, judged),
@@ -492,10 +519,12 @@ async fn gem_stale_install_warnings(
     // a remedy that leaves it behind silently reinstates the stale bytes.
     let mut cache_covered: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
     for (dir, j) in &dir_state {
-        if j.patched {
+        // Files patched in place beside the upstream archive (#2089).
+        let in_place = j.patched && j.upstream_archive;
+        if j.patched && !in_place {
             continue;
         }
-        if !j.positive {
+        if !in_place && !j.positive {
             if j.unjudged {
                 out.unjudged_purls.extend(j.purls.iter().cloned());
             }
@@ -525,6 +554,7 @@ async fn gem_stale_install_warnings(
             &j.leaf,
             j.project_local,
             folded_cache.as_deref(),
+            in_place,
         );
         out.warnings.push(gem_stale_warning(&gem, None));
         out.gems.push(gem);
@@ -580,7 +610,8 @@ struct GemRefreshed {
     summary: Option<gem_refresh::Summary>,
     /// The cache-dir archives replaced: files the project commits.
     replaced_archives: Vec<std::path::PathBuf>,
-    /// An installed copy was replaced with the patched gem.
+    /// An installed copy was replaced with the patched gem, or the upstream
+    /// archive beside one patched in place was.
     replaced_installs: bool,
 }
 
@@ -588,11 +619,12 @@ struct GemRefreshed {
 /// held, as the run's next steps need it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum GemCopies {
-    /// None was found unpatched and none was replaced.
+    /// None was found stale (unpatched, or patched in place beside its
+    /// upstream archive) and none was replaced.
     Untouched,
-    /// Every unpatched one was replaced with the patched gem.
+    /// Every stale one was brought in line with the patched gem.
     Refreshed,
-    /// Some are still unpatched; the run's warning names the command.
+    /// Some are still stale; the run's warning names the command.
     Stale,
 }
 
@@ -730,13 +762,7 @@ async fn refresh_stale_gems(
         } else {
             pass.replaced_archives().map(Path::to_path_buf).collect()
         },
-        replaced_installs: !common.dry_run
-            && pass.refreshed.iter().any(|(_, target)| {
-                matches!(
-                    target,
-                    socket_patch_core::patch::gem_refresh::Target::Installed(_)
-                )
-            }),
+        replaced_installs: !common.dry_run && pass.refreshed_an_install(),
     }
 }
 
@@ -1965,9 +1991,11 @@ async fn run_redirect_selected_untracked(
         params.hosted_gem_mirror_check = true;
         // Stale-flagged purls are EXCLUDED from assume_applied: the same-run
         // envelope carries a redirect_gem_stale_install warning proving the
-        // installed materialization unpatched, so attesting that purl from
-        // this run's records would contradict the run's own warning. Excluded purls
-        // fall back to `vex`'s normal installed-tree verification.
+        // installed materialization unpatched (or, for a copy patched in
+        // place, undone by a reinstall from its upstream archive), so
+        // attesting that purl from this run's records would contradict the
+        // run's own warning. Excluded purls fall back to `vex`'s normal
+        // installed-tree verification, which still attests patched files.
         // A confirmed uuid whose bundled instance (#469) or `npm:` alias
         // entry (#1081) the rewriter had to skip leaves that copy
         // unpatched, so it too is verified, never assumed.
@@ -3669,7 +3697,7 @@ mod tests {
         project_cache_gem: Option<&std::path::Path>,
     ) -> serde_json::Value {
         gem_stale_warning(
-            &stale_installed_gem(purl, gem_dir, leaf, project_local, project_cache_gem),
+            &stale_installed_gem(purl, gem_dir, leaf, project_local, project_cache_gem, false),
             None,
         )
     }
@@ -4341,6 +4369,95 @@ mod tests {
             out.warnings
         );
         assert!(out.stale_purls.is_empty());
+    }
+
+    /// #2089: an agent-mode record proves the installed files patched, but
+    /// an in-place patch keeps the upstream archive in the home's `cache/`.
+    /// Once the lock pins the patched gem's sha256 that archive is what
+    /// `bundle pristine` and `--redownload` reinstall from, so the copy is
+    /// stale by its archive. The patched archive, or none at all, is quiet.
+    #[tokio::test]
+    async fn gem_stale_probe_flags_an_upstream_archive_beside_an_in_place_patch() {
+        use sha2::{Digest as _, Sha256};
+        let tmp = tempfile::tempdir().unwrap();
+        let gem_dir = materialize_gem(tmp.path(), GEM_PATCHED);
+        let home = gem_home(tmp.path());
+        let cache = home.join("cache").join(format!("{GEM_LEAF}.gem"));
+        let shas = std::collections::BTreeMap::from([(
+            ("stale-unit".to_string(), "1.0.0".to_string()),
+            std::collections::BTreeSet::from([hex::encode(Sha256::digest(b"patched .gem"))]),
+        )]);
+        let (confirmed, records) = (one_confirmed(), one_record());
+        let run = || async {
+            gem_stale_install_warnings(
+                tmp.path(),
+                false,
+                None,
+                &confirmed,
+                &records,
+                &shas,
+                &mut super::ViewFallback::offline(),
+            )
+            .await
+        };
+
+        let out = run().await;
+        assert_eq!(out.warnings.len(), 1, "{:?}", out.warnings);
+        let detail = detail_of(&out.warnings[0]);
+        assert!(detail.contains("patched in place"), "{detail}");
+        assert!(
+            !detail.contains("unpatched install"),
+            "the installed files are patched: {detail}"
+        );
+        for path in [&gem_dir, &cache] {
+            assert!(detail.contains(&path.display().to_string()), "{detail}");
+        }
+        assert!(
+            !detail.contains("specifications"),
+            "only the archive is to be removed: {detail}"
+        );
+        assert_eq!(
+            out.stale_purls,
+            std::collections::BTreeSet::from([GEM_PURL.to_string()])
+        );
+        assert_eq!(out.gems.len(), 1, "handed to the refresh");
+        assert!(
+            out.gems[0].in_place && out.gems[0].installed == Some((gem_dir.clone(), true)),
+            "{:?}",
+            out.gems[0]
+        );
+
+        // The grant may spell the sha256 in upper case.
+        let upper = std::collections::BTreeMap::from([(
+            ("stale-unit".to_string(), "1.0.0".to_string()),
+            std::collections::BTreeSet::from([
+                hex::encode(Sha256::digest(b"upstream .gem")).to_uppercase()
+            ]),
+        )]);
+        let out = gem_stale_install_warnings(
+            tmp.path(),
+            false,
+            None,
+            &confirmed,
+            &records,
+            &upper,
+            &mut super::ViewFallback::offline(),
+        )
+        .await;
+        assert!(out.warnings.is_empty(), "{:?}", out.warnings);
+
+        // The patched archive beside the patched files: nothing is stale.
+        std::fs::write(&cache, b"patched .gem").unwrap();
+        let out = run().await;
+        assert!(out.warnings.is_empty(), "{:?}", out.warnings);
+        assert!(out.stale_purls.is_empty());
+
+        // No archive: nothing a reinstall could bring back, so the record's
+        // verdict stands.
+        std::fs::remove_file(&cache).unwrap();
+        let out = run().await;
+        assert!(out.warnings.is_empty(), "{:?}", out.warnings);
+        assert!(out.stale_purls.is_empty() && out.unjudged_purls.is_empty());
     }
 
     /// Committed `vendor/cache` handling, folded flavor: a stale install

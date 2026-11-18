@@ -193,7 +193,7 @@ async fn a_lone_project_and_a_directory_outside_a_checkout_scan_as_before() {
 
 /// `--json` reports on one directory, so it scans `--cwd` alone and names
 /// the projects it left; so does `--vex`. Agent mode and a global scan
-/// never search.
+/// never scan the projects below.
 #[tokio::test]
 async fn one_document_forms_name_the_projects_they_left() {
     let server = MockServer::start().await;
@@ -222,4 +222,284 @@ async fn one_document_forms_name_the_projects_they_left() {
         let (_, stdout, _) = run_scan(tmp.path(), &server.uri(), extra);
         assert!(!stdout.contains("== web =="), "{extra:?}: {stdout}");
     }
+}
+
+/// A Bundler project with one gem installed under its own `vendor/bundle`.
+fn write_gem_project(dir: &Path, gem: &str) {
+    std::fs::create_dir_all(dir).unwrap();
+    std::fs::write(
+        dir.join("Gemfile"),
+        format!("source \"https://rubygems.org\"\n\ngem \"{gem}\", \"1.0.0\"\n"),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("Gemfile.lock"),
+        format!(
+            "GEM\n  remote: https://rubygems.org/\n  specs:\n    {gem} (1.0.0)\n\n\
+             PLATFORMS\n  ruby\n\nDEPENDENCIES\n  {gem} (= 1.0.0)\n\nBUNDLED WITH\n   2.5.22\n"
+        ),
+    )
+    .unwrap();
+    let home = dir.join("vendor/bundle/ruby/3.3.0");
+    let lib = home.join(format!("gems/{gem}-1.0.0/lib"));
+    std::fs::create_dir_all(&lib).unwrap();
+    std::fs::write(lib.join(format!("{gem}.rb")), "module Gem1; end\n").unwrap();
+    std::fs::create_dir_all(home.join("specifications")).unwrap();
+    std::fs::write(
+        home.join(format!("specifications/{gem}-1.0.0.gemspec")),
+        format!(
+            "Gem::Specification.new do |s|\n  s.name = \"{gem}\"\n  s.version = \"1.0.0\"\nend\n"
+        ),
+    )
+    .unwrap();
+}
+
+/// A checkout with two Bundler projects below a root that holds none.
+fn write_gem_monorepo(root: &Path) {
+    std::fs::create_dir_all(root.join(".git")).unwrap();
+    std::fs::write(root.join(".gitignore"), "**/vendor/bundle/\n.bundle/\n").unwrap();
+    write_gem_project(&root.join("api"), "api-gem");
+    write_gem_project(&root.join("web"), "web-gem");
+}
+
+/// [`run_scan`] for an agent-mode scan of a Bundler tree: no ambient
+/// `BUNDLE_*` setting moves the gem crawl.
+fn run_agent_scan(cwd: &Path, api_url: &str, extra: &[&str]) -> (i32, String, String) {
+    let mut cmd = hermetic_command(&binary());
+    cmd.arg("scan").current_dir(cwd);
+    hermetic::scrub_extra(&mut cmd, &[Extra::Venv, Extra::Bundle]);
+    // `--sync` is agent mode too, and takes no `--mode` beside it.
+    if !extra.contains(&"--sync") {
+        cmd.args(["--mode", "agent"]);
+    }
+    let out = cmd
+        .args([
+            "--dry-run",
+            "--api-url",
+            api_url,
+            "--api-token",
+            "fake-token-for-test",
+            "--org",
+            ORG,
+        ])
+        .args(extra)
+        .output()
+        .expect("run socket-patch");
+    (
+        out.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&out.stdout).to_string(),
+        String::from_utf8_lossy(&out.stderr).to_string(),
+    )
+}
+
+/// The `projects_not_scanned` warning's detail in a `--json` envelope.
+fn not_scanned_detail(stdout: &str) -> Option<String> {
+    let envelope: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("not a JSON envelope ({e}): {stdout}"));
+    envelope["warnings"]
+        .as_array()?
+        .iter()
+        .find(|w| w["code"] == "projects_not_scanned")
+        .map(|w| w["detail"].as_str().unwrap().to_string())
+}
+
+/// #2125, shape 1: an agent-mode scan patches the one project at `--cwd`.
+/// From a root with nothing installed, above two Bundler projects with
+/// their gems installed, it names the projects it left and the command
+/// that reaches each, and does not send the user to run an install.
+#[tokio::test]
+async fn agent_scan_names_the_projects_below_it_left() {
+    let server = MockServer::start().await;
+    mock_batch_empty(&server).await;
+    let tmp = tempfile::tempdir().unwrap();
+    write_gem_monorepo(tmp.path());
+
+    let (code, stdout, stderr) = run_agent_scan(tmp.path(), &server.uri(), &[]);
+    assert_eq!(code, 0, "{stdout}\n{stderr}");
+    assert!(
+        stderr.contains("2 project directories below this one were not scanned (api, web)"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("`socket-patch scan --mode agent --dry-run --cwd api`"),
+        "{stderr}"
+    );
+    assert_eq!(
+        stderr.matches("not scanned").count(),
+        1,
+        "said once: {stderr}"
+    );
+    assert!(
+        !stdout.contains("Run your package manager's install first"),
+        "an install is not what is missing: {stdout}"
+    );
+    assert!(
+        stdout.contains("No packages found (see the warning)."),
+        "{stdout}"
+    );
+    assert_eq!(queried(&server).await, [""; 0], "--cwd alone was scanned");
+
+    let (code, stdout, stderr) = run_agent_scan(tmp.path(), &server.uri(), &["--json"]);
+    assert_eq!(code, 0, "{stdout}\n{stderr}");
+    let detail = not_scanned_detail(&stdout)
+        .unwrap_or_else(|| panic!("no projects_not_scanned warning: {stdout}"));
+    assert!(detail.contains("(api, web)"), "{detail}");
+    assert!(
+        detail.contains("`socket-patch scan --mode agent --dry-run --cwd api`"),
+        "{detail}"
+    );
+
+    // The command is asked as the run was: `--sync` stays `--sync`.
+    let (_, stdout, _) = run_agent_scan(tmp.path(), &server.uri(), &["--json", "--sync"]);
+    let detail = not_scanned_detail(&stdout)
+        .unwrap_or_else(|| panic!("no projects_not_scanned warning: {stdout}"));
+    assert!(
+        detail.contains("`socket-patch scan --sync --dry-run --cwd api`"),
+        "{detail}"
+    );
+
+    // The run the warning names scans that project and warns of nothing.
+    let server = MockServer::start().await;
+    mock_batch_empty(&server).await;
+    let (code, stdout, stderr) =
+        run_agent_scan(tmp.path(), &server.uri(), &["--json", "--cwd", "api"]);
+    assert_eq!(code, 0, "{stdout}\n{stderr}");
+    assert_eq!(not_scanned_detail(&stdout), None, "{stdout}");
+    assert_eq!(queried(&server).await, ["pkg:gem/api-gem@1.0.0"]);
+}
+
+/// #2125, shape 2: the root is a Bundler project too. Its gems are
+/// scanned, and the projects below are still named: the run's success
+/// summary is about the root alone.
+#[tokio::test]
+async fn agent_scan_of_a_root_project_names_the_projects_below_it_left() {
+    let server = MockServer::start().await;
+    mock_batch_empty(&server).await;
+    let tmp = tempfile::tempdir().unwrap();
+    write_gem_monorepo(tmp.path());
+    write_gem_project(tmp.path(), "root-gem");
+
+    let (code, stdout, stderr) = run_agent_scan(tmp.path(), &server.uri(), &[]);
+    assert_eq!(code, 0, "{stdout}\n{stderr}");
+    assert!(
+        stderr.contains("2 project directories below this one were not scanned (api, web)"),
+        "{stderr}"
+    );
+    assert_eq!(queried(&server).await, ["pkg:gem/root-gem@1.0.0"]);
+
+    let (_, stdout, _) = run_agent_scan(tmp.path(), &server.uri(), &["--json"]);
+    assert!(not_scanned_detail(&stdout).is_some(), "{stdout}");
+}
+
+/// An agent-mode scan warns only of a project it did not reach. Its npm
+/// crawl walks the `node_modules` below `--cwd`, so a nested npm project
+/// is scanned from the root and is not named. Nor is a project with no
+/// install directory of its own (a Python project with no environment),
+/// nor any project when the scan names PATHs or runs outside a git
+/// checkout.
+#[tokio::test]
+async fn agent_scan_does_not_name_a_project_it_reached() {
+    let server = MockServer::start().await;
+    mock_batch_empty(&server).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    std::fs::create_dir_all(root.join(".git")).unwrap();
+    write_npm_project(&root.join("web"), "web-dep");
+    let installed = root.join("web/node_modules/web-dep");
+    std::fs::create_dir_all(&installed).unwrap();
+    std::fs::write(
+        installed.join("package.json"),
+        r#"{ "name": "web-dep", "version": "1.0.0" }"#,
+    )
+    .unwrap();
+    // Nothing was installed for it here: the machine's own Python is not
+    // this project's install directory.
+    std::fs::create_dir_all(root.join("docs")).unwrap();
+    std::fs::write(root.join("docs/requirements.txt"), "six==1.16.0\n").unwrap();
+
+    let (code, stdout, stderr) = run_agent_scan(root, &server.uri(), &["--json"]);
+    assert_eq!(code, 0, "{stdout}\n{stderr}");
+    assert_eq!(not_scanned_detail(&stdout), None, "{stdout}");
+    assert_eq!(queried(&server).await, ["pkg:npm/web-dep@1.0.0"]);
+
+    // PATHs scope the scan to what the user named.
+    let tmp = tempfile::tempdir().unwrap();
+    write_gem_monorepo(tmp.path());
+    let (_, stdout, _) = run_agent_scan(tmp.path(), &server.uri(), &["--json", "api"]);
+    assert_eq!(not_scanned_detail(&stdout), None, "{stdout}");
+
+    // Outside a checkout nothing bounds the search, so there is none.
+    std::fs::remove_dir_all(tmp.path().join(".git")).unwrap();
+    let (code, stdout, stderr) = run_agent_scan(tmp.path(), &server.uri(), &[]);
+    assert_eq!(code, 0, "{stdout}\n{stderr}");
+    assert!(!stderr.contains("not scanned"), "{stderr}");
+    assert!(
+        stdout.contains("Run your package manager's install first"),
+        "{stdout}"
+    );
+}
+
+/// The same for a PyPI project below with its own `.venv`: a crawl from
+/// the root reads no environment of its own, so the project is named.
+#[tokio::test]
+async fn agent_scan_names_a_python_project_below_with_its_own_venv() {
+    let server = MockServer::start().await;
+    mock_batch_empty(&server).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    std::fs::create_dir_all(root.join(".git")).unwrap();
+    std::fs::write(root.join(".gitignore"), ".venv/\n").unwrap();
+    let svc = root.join("svc");
+    let dist = svc.join(".venv/lib/python3.12/site-packages/six-1.16.0.dist-info");
+    std::fs::create_dir_all(&dist).unwrap();
+    std::fs::write(svc.join(".venv/pyvenv.cfg"), "version = 3.12.0\n").unwrap();
+    std::fs::write(
+        dist.join("METADATA"),
+        "Metadata-Version: 2.1\nName: six\nVersion: 1.16.0\n",
+    )
+    .unwrap();
+    std::fs::write(svc.join("requirements.txt"), "six==1.16.0\n").unwrap();
+
+    let (code, stdout, stderr) = run_agent_scan(root, &server.uri(), &["--json"]);
+    assert_eq!(code, 0, "{stdout}\n{stderr}");
+    let detail = not_scanned_detail(&stdout)
+        .unwrap_or_else(|| panic!("no projects_not_scanned warning: {stdout}"));
+    assert!(
+        detail.starts_with("1 project directory below this one was not scanned (svc): "),
+        "{detail}"
+    );
+    assert_eq!(queried(&server).await, [""; 0], "--cwd alone was scanned");
+
+    let (code, stdout, stderr) = run_agent_scan(root, &server.uri(), &["--json", "--cwd", "svc"]);
+    assert_eq!(code, 0, "{stdout}\n{stderr}");
+    assert_eq!(not_scanned_detail(&stdout), None, "{stdout}");
+    assert_eq!(queried(&server).await, ["pkg:pypi/six@1.16.0"]);
+}
+
+/// The npm walk from `--cwd` skips hidden directories, so an npm project
+/// in one (a GitHub action with its own lockfile and `node_modules`) is
+/// not reached, and is named.
+#[tokio::test]
+async fn agent_scan_names_an_npm_project_its_walk_skips() {
+    let server = MockServer::start().await;
+    mock_batch_empty(&server).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    std::fs::create_dir_all(root.join(".git")).unwrap();
+    let action = root.join(".github/actions/lint");
+    write_npm_project(&action, "action-dep");
+    let installed = action.join("node_modules/action-dep");
+    std::fs::create_dir_all(&installed).unwrap();
+    std::fs::write(
+        installed.join("package.json"),
+        r#"{ "name": "action-dep", "version": "1.0.0" }"#,
+    )
+    .unwrap();
+
+    let (code, stdout, stderr) = run_agent_scan(root, &server.uri(), &["--json"]);
+    assert_eq!(code, 0, "{stdout}\n{stderr}");
+    let detail = not_scanned_detail(&stdout)
+        .unwrap_or_else(|| panic!("no projects_not_scanned warning: {stdout}"));
+    assert!(detail.contains("(.github/actions/lint)"), "{detail}");
+    assert_eq!(queried(&server).await, [""; 0], "the walk skipped it");
 }

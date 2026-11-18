@@ -1,0 +1,8 @@
+{
+  "bun": "1.4.4",
+  "os": "darwin",
+  "arch": "aarch64",
+  "command": "bun install --ignore-scripts (install.saveTextLockfile = false)",
+  "note": "fsevents@1.2.9 declares bundleDependencies [\"node-pre-gyp\"] and ships node-pre-gyp with its whole dependency tree inside its tarball; Bun flags only node-pre-gyp as bundled and records the tree as ordinary entries it never installs (an empty cache ends up holding fsevents and nan only)",
+  "sha256": "c63b8269f986ffaf44049bbfdf1595d55563a4005d89d953a0316de208c8d0fb"
+}

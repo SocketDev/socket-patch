@@ -419,6 +419,9 @@ async fn variant_installed_at(
         }
         return false;
     }
+    // A native gem's copy does not hold every build input of its source
+    // gem; those cannot tell distributions apart (see `gem_ext`).
+    let files = &*crate::patch::gem_ext::discriminating_files(pkg_path, key, files).await;
     // Representative file: only a file that modifies existing content
     // (non-empty `beforeHash`) can discriminate between distributions —
     // a NEW file (empty `beforeHash`) verifies Ready against any

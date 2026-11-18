@@ -13,9 +13,10 @@ It copies only committable project files to a fresh checkout, isolates caches,
 installs from the committed artifacts, and checks the patched bytes. Reruns,
 reversal, and manifest-free VEX exercise the rest of the lifecycle.
 
-This tests patch delivery, not exploit efficacy. The fixture determines which
-other dependencies must be available during installation; vendoring patched
-packages does not itself make every dependency offline.
+This tests patch delivery, not exploit efficacy; only the Maven legs also read the
+fix back from a running JVM. The fixture determines which other dependencies must
+be available during installation; vendoring patched packages does not itself make
+every dependency offline.
 
 ## Catalog fixtures and coverage
 
@@ -27,8 +28,9 @@ when the catalog changes, updating both suites.
 | Coverage | Cases |
 | --- | --- |
 | Native production installs | npm, pnpm, Yarn Classic, Yarn Berry with node-modules, Bun text locks, vlt, pip requirements, uv, and Bundler |
-| Catalog canaries | Cargo, Maven, NuGet, and Composer; require a published free fixture before adding full install proofs |
+| Catalog canaries | Cargo, NuGet, and Composer; require a published free fixture before adding full install proofs |
 | Go | pgx/v5 v5.7.0: vendored and agent get/scan, decoder regression, fresh-cache build, rollback after tidy, cold-cache agent refusal |
+| Maven | jackson-databind 2.7.9.2. Vendored: a fresh checkout builds offline against the committed jar. Agent: the jar in the Maven local repository is swapped and survives `mvn -C -U`. Both: a JVM loads the patched class, the drop-in check, `rollback` and `remove` ([details](hosted-production-e2e.md#maven)) |
 | Deno | Unsupported-mode assertion |
 
 The vlt case installs a committed directory artifact with `vlt ci`. The CLI
@@ -64,8 +66,11 @@ is needed.
 | `SOCKET_PATCH_VLT_E2E_JS` / `SOCKET_PATCH_VLT_E2E_VERSION` | Select the version-pinned vlt executable |
 
 Tools include npm, pnpm, Corepack for Yarn, Bun, vlt, uv, Python/pip, Ruby/Bundler,
-and Go. Networked fixture preparation requires Socket's API and patch server plus
-npm, PyPI, and RubyGems. CI versions and triggers are defined in the
+Go, and Maven with a JDK (the Maven variables are listed in the
+[hosted guide](hosted-production-e2e.md#running)). Networked fixture preparation
+requires Socket's API and patch server plus npm, PyPI, RubyGems, and Maven Central.
+CI versions and triggers are defined in the
 [main workflow](../../.github/workflows/ci.yml) and package-manager workflows.
-The main `hosted-e2e` job includes the vendored vlt proof; it does not imply that
-every vendored production case ran.
+The main `hosted-e2e` job runs the vendored vlt proof and the Maven vendored and
+agent legs (`--ignored maven_`); no workflow runs the other vendored production
+cases, this suite's canary included.

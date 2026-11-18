@@ -1,0 +1,26 @@
+module(name = "socket_fixture", version = "0.0.0")
+
+bazel_dep(name = "rules_ruby", version = "1.0.0-rc2")
+single_version_override(module_name = "rules_ruby", version = "1.0.0-rc2")
+
+# A prebuilt interpreter for the host, so no build compiles one.
+ruby = use_extension("@rules_ruby//ruby:extensions.bzl", "ruby")
+ruby.toolchain(
+    name = "ruby",
+    portable_ruby = True,
+    version = "3.4.10",
+)
+
+# No gem_checksums: the lock's CHECKSUMS section is what pins a gem's bytes.
+ruby.bundle_fetch(
+    name = "bundle",
+    gemfile = "//:Gemfile",
+    gemfile_lock = "//:Gemfile.lock",
+)
+use_repo(ruby, "bundle", "ruby", "ruby_toolchains")
+
+register_toolchains("@ruby_toolchains//:all")
+
+# The root module's toolchains come before those of rules_java, so the Java
+# runtime that rules_ruby's rules name resolves to the empty one.
+register_toolchains("//:no_java_runtime_toolchain")

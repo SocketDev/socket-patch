@@ -1,0 +1,307 @@
+{
+  "bun-lock-bundled/transitive": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:npm/abbrev@1.1.1",
+        "file": "bun.lock"
+      },
+      {
+        "purl": "pkg:npm/ansi-regex@2.1.1",
+        "file": "bun.lock"
+      },
+      {
+        "purl": "pkg:npm/ansi-regex@5.0.1",
+        "file": "bun.lock"
+      },
+      {
+        "purl": "pkg:npm/aproba@1.2.0",
+        "file": "bun.lock"
+      },
+      {
+        "purl": "pkg:npm/are-we-there-yet@1.1.7",
+        "file": "bun.lock"
+      },
+      {
+        "purl": "pkg:npm/balanced-match@1.0.2",
+        "file": "bun.lock"
+      },
+      {
+        "purl": "pkg:npm/brace-expansion@1.1.22",
+        "file": "bun.lock"
+      },
+      {
+        "purl": "pkg:npm/chownr@1.1.4",
+        "file": "bun.lock"
+      },
+      {
+        "purl": "pkg:npm/code-point-at@1.1.0",
+        "file": "bun.lock"
+      },
+      {
+        "purl": "pkg:npm/concat-map@0.0.1",
+        "file": "bun.lock"
+      },
+      {
+        "purl": "pkg:npm/console-control-strings@1.1.0",
+        "file": "bun.lock"
+      },
+      {
+        "purl": "pkg:npm/core-util-is@1.0.3",
+        "file": "bun.lock"
+      },
+      {
+        "purl": "pkg:npm/debug@3.2.7",
+        "file": "bun.lock"
+      },
+      {
+        "purl": "pkg:npm/deep-extend@0.6.0",
+        "file": "bun.lock"
+      },
+      {
+        "purl": "pkg:npm/delegates@1.0.0",
+        "file": "bun.lock"
+      },
+      {
+        "purl": "pkg:npm/detect-libc@1.0.3",
+        "file": "bun.lock"
+      },
+      {
+        "purl": "pkg:npm/emoji-regex@8.0.0",
+        "file": "bun.lock"
+      },
+      {
+        "purl": "pkg:npm/fs-minipass@1.2.7",
+        "file": "bun.lock"
+      },
+      {
+        "purl": "pkg:npm/fs.realpath@1.0.0",
+        "file": "bun.lock"
+      },
+      {
+        "purl": "pkg:npm/fsevents@1.2.9",
+        "file": "bun.lock"
+      },
+      {
+        "purl": "pkg:npm/gauge@2.7.4",
+        "file": "bun.lock"
+      },
+      {
+        "purl": "pkg:npm/glob@7.2.3",
+        "file": "bun.lock"
+      },
+      {
+        "purl": "pkg:npm/has-unicode@2.0.1",
+        "file": "bun.lock"
+      },
+      {
+        "purl": "pkg:npm/iconv-lite@0.4.24",
+        "file": "bun.lock"
+      },
+      {
+        "purl": "pkg:npm/ignore-walk@3.0.4",
+        "file": "bun.lock"
+      },
+      {
+        "purl": "pkg:npm/inflight@1.0.6",
+        "file": "bun.lock"
+      },
+      {
+        "purl": "pkg:npm/inherits@2.0.4",
+        "file": "bun.lock"
+      },
+      {
+        "purl": "pkg:npm/ini@1.3.8",
+        "file": "bun.lock"
+      },
+      {
+        "purl": "pkg:npm/is-fullwidth-code-point@1.0.0",
+        "file": "bun.lock"
+      },
+      {
+        "purl": "pkg:npm/is-fullwidth-code-point@3.0.0",
+        "file": "bun.lock"
+      },
+      {
+        "purl": "pkg:npm/isarray@1.0.0",
+        "file": "bun.lock"
+      },
+      {
+        "purl": "pkg:npm/minimatch@3.1.5",
+        "file": "bun.lock"
+      },
+      {
+        "purl": "pkg:npm/minimist@1.2.8",
+        "file": "bun.lock"
+      },
+      {
+        "purl": "pkg:npm/minipass@2.9.0",
+        "file": "bun.lock"
+      },
+      {
+        "purl": "pkg:npm/minizlib@1.3.3",
+        "file": "bun.lock"
+      },
+      {
+        "purl": "pkg:npm/mkdirp@0.5.6",
+        "file": "bun.lock"
+      },
+      {
+        "purl": "pkg:npm/ms@2.1.3",
+        "file": "bun.lock"
+      },
+      {
+        "purl": "pkg:npm/nan@2.30.0",
+        "file": "bun.lock"
+      },
+      {
+        "purl": "pkg:npm/needle@2.9.1",
+        "file": "bun.lock"
+      },
+      {
+        "purl": "pkg:npm/node-pre-gyp@0.12.0",
+        "file": "bun.lock"
+      },
+      {
+        "purl": "pkg:npm/nopt@4.0.3",
+        "file": "bun.lock"
+      },
+      {
+        "purl": "pkg:npm/npm-bundled@1.1.2",
+        "file": "bun.lock"
+      },
+      {
+        "purl": "pkg:npm/npm-normalize-package-bin@1.0.1",
+        "file": "bun.lock"
+      },
+      {
+        "purl": "pkg:npm/npm-packlist@1.4.8",
+        "file": "bun.lock"
+      },
+      {
+        "purl": "pkg:npm/npmlog@4.1.2",
+        "file": "bun.lock"
+      },
+      {
+        "purl": "pkg:npm/number-is-nan@1.0.1",
+        "file": "bun.lock"
+      },
+      {
+        "purl": "pkg:npm/object-assign@4.1.1",
+        "file": "bun.lock"
+      },
+      {
+        "purl": "pkg:npm/once@1.4.0",
+        "file": "bun.lock"
+      },
+      {
+        "purl": "pkg:npm/os-homedir@1.0.2",
+        "file": "bun.lock"
+      },
+      {
+        "purl": "pkg:npm/os-tmpdir@1.0.2",
+        "file": "bun.lock"
+      },
+      {
+        "purl": "pkg:npm/osenv@0.1.5",
+        "file": "bun.lock"
+      },
+      {
+        "purl": "pkg:npm/path-is-absolute@1.0.1",
+        "file": "bun.lock"
+      },
+      {
+        "purl": "pkg:npm/process-nextick-args@2.0.1",
+        "file": "bun.lock"
+      },
+      {
+        "purl": "pkg:npm/rc@1.2.8",
+        "file": "bun.lock"
+      },
+      {
+        "purl": "pkg:npm/readable-stream@2.3.8",
+        "file": "bun.lock"
+      },
+      {
+        "purl": "pkg:npm/rimraf@2.7.1",
+        "file": "bun.lock"
+      },
+      {
+        "purl": "pkg:npm/safe-buffer@5.1.2",
+        "file": "bun.lock"
+      },
+      {
+        "purl": "pkg:npm/safe-buffer@5.2.1",
+        "file": "bun.lock"
+      },
+      {
+        "purl": "pkg:npm/safer-buffer@2.1.2",
+        "file": "bun.lock"
+      },
+      {
+        "purl": "pkg:npm/sax@1.6.1",
+        "file": "bun.lock"
+      },
+      {
+        "purl": "pkg:npm/semver@5.7.3",
+        "file": "bun.lock"
+      },
+      {
+        "purl": "pkg:npm/set-blocking@2.0.0",
+        "file": "bun.lock"
+      },
+      {
+        "purl": "pkg:npm/signal-exit@3.0.7",
+        "file": "bun.lock"
+      },
+      {
+        "purl": "pkg:npm/string-width@1.0.2",
+        "file": "bun.lock"
+      },
+      {
+        "purl": "pkg:npm/string-width@4.2.3",
+        "file": "bun.lock"
+      },
+      {
+        "purl": "pkg:npm/string_decoder@1.1.1",
+        "file": "bun.lock"
+      },
+      {
+        "purl": "pkg:npm/strip-ansi@3.0.1",
+        "file": "bun.lock"
+      },
+      {
+        "purl": "pkg:npm/strip-ansi@6.0.1",
+        "file": "bun.lock"
+      },
+      {
+        "purl": "pkg:npm/strip-json-comments@2.0.1",
+        "file": "bun.lock"
+      },
+      {
+        "purl": "pkg:npm/tar@4.4.19",
+        "file": "bun.lock"
+      },
+      {
+        "purl": "pkg:npm/util-deprecate@1.0.2",
+        "file": "bun.lock"
+      },
+      {
+        "purl": "pkg:npm/wide-align@1.1.5",
+        "file": "bun.lock"
+      },
+      {
+        "purl": "pkg:npm/wrappy@1.0.2",
+        "file": "bun.lock"
+      },
+      {
+        "purl": "pkg:npm/yallist@3.1.1",
+        "file": "bun.lock"
+      }
+    ],
+    "live_claims": []
+  }
+}
