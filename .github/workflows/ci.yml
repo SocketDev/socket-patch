@@ -68,7 +68,7 @@ concurrency:
 # values stay `ubuntu-latest`/`ubuntu-22.04`, so job names, cache keys and
 # scripts are unchanged; only `runs-on` maps them. Kill switch: set the
 # repository variable DISABLE_DEPOT_RUNNERS=true to fall back to GitHub-hosted
-# runners (the same switch depscan uses). The compile-bound critical-path
+# runners (the same switch Socket's other repos use). The compile-bound critical-path
 # jobs (clippy, coverage, e2e-build, test-release) use 16-vCPU Depot runners
 # (depot-ubuntu-24.04-16). The compatibility workflows follow
 # the same mapping. Release, publish and merge-queue workflows stay

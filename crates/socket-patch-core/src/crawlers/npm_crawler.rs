@@ -2764,9 +2764,9 @@ impl NpmCrawler {
     /// Buffering costs memory the sequential walk did not pay: every root's
     /// events are resident before the merge starts, so peak memory scales
     /// with dirs VISITED (duplicates included) rather than with the unique
-    /// packages that survive the dedup — about +18% on a depscan-sized
+    /// packages that survive the dedup — about +18% on one large monorepo's
     /// tree. Merging each root as its gather finishes would barely help,
-    /// because the tree is one root: 5,080 of depscan's 5,520 packages
+    /// because the tree is one root: 5,080 of that tree's 5,520 packages
     /// live in the root's virtual store, so the largest root's events —
     /// which no per-root scheme shrinks — are the peak. The resolver's
     /// per-level buffering is the one that grew without bound, and that is

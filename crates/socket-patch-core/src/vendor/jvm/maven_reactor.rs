@@ -4166,9 +4166,9 @@ fn indent_unit(masked: &str) -> String {
     }
 }
 
-// ── suffixed pom: a port of depscan's `suffixMavenPom` ─────────────────
+// ── suffixed pom: a port of the patch service's pom suffixer ───────────
 
-/// An element of the depscan pom scan (`maven-pom-scan.ts`).
+/// An element of the pom scan, as the patch service does it.
 #[derive(Debug, Clone)]
 struct ScanEl {
     name: String,
@@ -4209,7 +4209,7 @@ fn byte_at(text: &str, i: usize) -> Option<u8> {
 }
 
 /// `(inner_end, end_tag_close)` of the element whose content starts at
-/// `inner_start` (depth counting, names unchecked, as in depscan).
+/// `inner_start` (depth counting, names unchecked, as in the service).
 fn scan_subtree_end(text: &str, inner_start: usize) -> Option<(usize, usize)> {
     let mut depth = 1usize;
     let mut cursor = inner_start;
@@ -4343,8 +4343,8 @@ fn literalize_project_version_refs(pom: &str, base: &str) -> String {
 }
 
 /// The upstream pom rewritten to advertise `suffixed` instead of `base`, or
-/// `None` to refuse: byte-for-byte the semantics of depscan's
-/// `suffixMavenPom` (`workspaces/app/src/patches/maven-suffix.ts`), so an
+/// `None` to refuse: byte-for-byte the semantics of the patch
+/// service's pom suffixer, so an
 /// offline build serves the pom the service would.
 fn suffix_maven_pom(pom: &str, base: &str, suffixed: &str) -> Option<String> {
     let children = scan_pom_project(pom)?;
@@ -7206,7 +7206,7 @@ mod tests {
         assert_eq!(config(OFFLINE_LINE), ours);
     }
 
-    // ── suffixMavenPom port (goldens shared with depscan's maven-suffix.test.ts) ──
+    // ── pom suffixer port (goldens shared with the patch service's tests) ──
 
     const DS_SV: &str = "2.1.0-socket.3fa85f64";
 

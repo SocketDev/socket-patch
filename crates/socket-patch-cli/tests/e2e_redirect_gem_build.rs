@@ -68,8 +68,8 @@
 //! and gains the `!`, and where the lock has `CHECKSUMS` the entry holds the
 //! patched sha. The canary proves the converged pair installs patched bytes
 //! on a fresh checkout both FROZEN (`BUNDLE_FROZEN=true`, lock
-//! byte-identical) and unfrozen. The depscan TS twin (registry-rewrite
-//! gem.ts) must be ported to match.
+//! byte-identical) and unfrozen. The Socket backend's TS twin of this
+//! rewriter must be ported to match.
 //!
 //! `rollback` / `remove` take the option off again: the pair is the
 //! pre-scan pair, byte for byte.

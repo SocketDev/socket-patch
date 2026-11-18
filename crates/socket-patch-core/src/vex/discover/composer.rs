@@ -61,8 +61,8 @@
 //! version. A Socket-wired entry that still has a `source` (a lock
 //! hand-edited after vendoring, or redirected before the rewriter dropped
 //! it) then installs the pristine upstream commit, so it is diagnosed and
-//! yields no ref: the same veto depscan's SBOM applies
-//! (`composerInstallsFromSource`). `--prefer-source` / `--prefer-dist` and
+//! yields no ref: the same veto Socket's SBOM generation
+//! applies. `--prefer-source` / `--prefer-dist` and
 //! global config are install-time choices the project cannot record.
 //!
 //! Out of scope: `vendor/composer/installed.json` (an install artifact, not a

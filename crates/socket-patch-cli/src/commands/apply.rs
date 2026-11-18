@@ -1263,7 +1263,7 @@ pub async fn run(args: ApplyArgs) -> i32 {
         // Nothing to apply — but `--vex` may still have something to
         // attest: hosted / vendored patches are wired by the lockfiles (and
         // the `.socket/vendor` ledgers), not the manifest, and a
-        // `scan --mode hosted|vendored` or depscan checkout (both modes are
+        // `scan --mode hosted|vendored` or GitHub-app checkout (both modes are
         // manifest-free) has none. Before, this branch returned before VEX
         // generation, so `apply --vex` exited 0 having written NO document
         // (and left a previous run's at the path). Nothing referenced

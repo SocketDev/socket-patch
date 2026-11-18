@@ -1703,7 +1703,7 @@ mod tests {
     const SRI: &str = "sha512-PATCHEDpatchedPATCHEDpatched0123456789==";
 
     /// The committed golden fixture (written by the TS backend — exactly what
-    /// a depscan PR leaves behind: no `.socket/` at all).
+    /// a GitHub-app PR leaves behind: no `.socket/` at all).
     #[tokio::test]
     async fn golden_hosted_fixture_yields_the_patch_uuid_not_the_token() {
         let p = Project::new();
@@ -4055,7 +4055,7 @@ mod tests {
         assert!(out.unattested.is_empty(), "{:#?}", out.unattested);
     }
 
-    /// The committed golden (TS backend output — what a depscan PR leaves).
+    /// The committed golden (TS backend output — what a GitHub-app PR leaves).
     #[tokio::test]
     async fn pnpm_golden_hosted_fixture() {
         let p = Project::new();
