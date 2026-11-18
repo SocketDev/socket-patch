@@ -1213,14 +1213,15 @@ the model is **not uniform** today:
   untouched, fails `apply` (`no matching variant found`) and withholds the `vex` statement, and
   `rollback` skips it. `vex` and `apply --check` leave out one kind of dir: a build whose gem
   home has no gemspec for it (`specifications/<leaf>.gemspec`, or
-  `specifications/default/<leaf>.gemspec`) but has one for another build of the same version.
-  RubyGems and Bundler load a gem by that file alone, so nothing loads the dir. It is what the
-  stale-install remedy (`rm -f specifications/<leaf>.gemspec … && bundle install`) leaves of a
+  `specifications/default/<leaf>.gemspec`) while another copy of the same version in that home has
+  its own. RubyGems and Bundler load a gem by that file alone, so nothing loads the dir. It is what
+  the stale-install remedy (`rm -f specifications/<leaf>.gemspec … && bundle install`) leaves of a
   precompiled build once the `ruby` platform build is installed beside it, and an unpatched one
   no longer withholds the `vex` statement (#2087); `bundle clean --force` removes it. The dir
-  stays a copy when the home has no gemspec for any build of the version, when its own gemspec
-  cannot be probed, and when a standalone bundle's `bundler/setup.rb` names it. `apply` and
-  `rollback` write and restore it like any other dir. PyPI follows the every-copy rule too: when the crawler resolves
+  stays a copy when no copy of the version in its home has a gemspec (so a gem never loses its
+  last copy in a home this way), when its own gemspec cannot be probed, and when a standalone
+  bundle's `bundler/setup.rb` names it. `apply` and `rollback` write and restore it like any
+  other dir. PyPI follows the every-copy rule too: when the crawler resolves
   one release in several site-packages dirs (a Pipenv WORKON_HOME venv beside an auto-detected
   `./.venv`, or the user site beside a system dir in global scope), agent `apply` patches **every**
   copy, one summary event per copy, because any of them may be the one the interpreter imports.

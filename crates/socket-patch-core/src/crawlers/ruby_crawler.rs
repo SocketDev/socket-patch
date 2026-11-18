@@ -1504,77 +1504,103 @@ pub fn is_default_gem_copy(copy: &Path) -> bool {
         .is_file()
 }
 
-/// Whether the installed-looking gem dir `copy` (`<home>/gems/<leaf>`), a
-/// build of the gem `purl` names, is a leftover nothing loads: its gem home has
-/// no gemspec for it (`specifications/<leaf>.gemspec`, or the same file
-/// under `specifications/default/` for a default gem) but has one for
-/// another build of that version.
+/// `copies` (the installed-looking dirs of ONE gem version, as
+/// [`RubyCrawler::find_all_by_purls`] returns them) without the leftover
+/// dirs nothing loads, for a read-only check of what the project runs.
 ///
-/// RubyGems and Bundler find a gem by its gemspec alone. Such a dir is what
-/// `rm specifications/<leaf>.gemspec && bundle install` (the stale-install
-/// remedy) leaves of a precompiled build once the project moved to the
-/// `ruby` platform build, which is installed beside it. A check that counts
-/// it as an installed copy refuses a patched gem over the unpatched files
-/// of a dir that is not installed (#2087).
+/// A dir `<home>/gems/<leaf>` is a leftover when its gem home has no
+/// gemspec for it (`specifications/<leaf>.gemspec`, or the same file under
+/// `specifications/default/` for a default gem) while another of `copies`
+/// in that home has its own. RubyGems and Bundler find a gem by its
+/// gemspec alone. Such a dir is what `rm specifications/<leaf>.gemspec &&
+/// bundle install` (the stale-install remedy) leaves of a precompiled
+/// build once the project moved to the `ruby` platform build, which is
+/// installed beside it. A check that counts it as an installed copy
+/// refuses a patched gem over the unpatched files of a dir that is not
+/// installed (#2087).
 ///
-/// Everything short of proof keeps the dir a copy:
-/// - a home with no `specifications/` dir, or with no gemspec for any build
-///   of the version, does not say what is installed;
-/// - only "not found" proves the dir's own gemspec absent, never another
-///   stat error;
-/// - a `bundle install --standalone` tree loads gems by the paths in
-///   `<bundle path>/bundler/setup.rb`, not by gemspec, so a dir that file
-///   names (or might name: the file cannot be read) is loaded.
-pub fn is_leftover_gem_build(copy: &Path, purl: &str) -> bool {
-    let base = crate::utils::purl::strip_purl_qualifiers(purl);
-    let Some((name, version)) = crate::utils::purl::parse_gem_purl(base) else {
-        return false;
-    };
-    let (name, version) = (name.as_ref(), version.as_ref());
+/// Everything short of proof keeps a dir:
+/// - a home in which no copy of the version has a gemspec does not say
+///   what is installed, so a gem never loses its last copy in a home;
+/// - only "not found" proves a gemspec absent, never another stat error;
+/// - a `bundle install --standalone` tree loads gems by the paths in its
+///   `bundler/setup.rb`, not by gemspec, so a dir that file names (or might
+///   name: the file cannot be read) is loaded.
+pub async fn retain_loaded_gem_builds(copies: Vec<PathBuf>) -> Vec<PathBuf> {
+    run_blocking(move || {
+        let listed: Vec<Option<bool>> = copies.iter().map(|copy| home_lists_copy(copy)).collect();
+        let mut index = 0;
+        let mut copies = copies;
+        let all = copies.clone();
+        copies.retain(|copy| {
+            let own = listed[index];
+            index += 1;
+            let leftover = own == Some(false)
+                && all
+                    .iter()
+                    .zip(&listed)
+                    .any(|(other, own)| *own == Some(true) && other.parent() == copy.parent())
+                && !standalone_setup_may_load(copy);
+            !leftover
+        });
+        copies
+    })
+    .await
+}
+
+/// Whether the gem home of the gem dir `<home>/gems/<leaf>` has a gemspec
+/// for it, under `specifications/` or `specifications/default/`. `None`
+/// where that cannot be told: the dir is not in a `gems/` dir, or a probe
+/// failed with anything but "not found".
+fn home_lists_copy(copy: &Path) -> Option<bool> {
+    let gems = copy.parent()?;
+    if gems.file_name() != Some(OsStr::new("gems")) {
+        return None;
+    }
+    let specs = gems.parent()?.join("specifications");
+    let mut own = copy.file_name()?.to_os_string();
+    own.push(".gemspec");
+    let mut listed = Some(false);
+    for spec in [specs.join(&own), specs.join("default").join(&own)] {
+        match std::fs::metadata(&spec) {
+            Ok(meta) if meta.is_file() => return Some(true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            _ => listed = None,
+        }
+    }
+    listed
+}
+
+/// Whether a standalone bundle's `bundler/setup.rb` names the gem dir
+/// `<home>/gems/<leaf>`, or cannot be read to tell. The file sits in the
+/// bundle path: `<home>/bundler/` for a flat home, two levels up for the
+/// scoped `<bundle path>/<engine>/<abi>` home. An entry is the dir's path
+/// up to a require path, or the dir itself for a gem that loads from its
+/// root.
+fn standalone_setup_may_load(copy: &Path) -> bool {
     let (Some(leaf), Some(home)) = (
         copy.file_name().and_then(OsStr::to_str),
         copy.parent().and_then(Path::parent),
     ) else {
-        return false;
-    };
-    let specs = home.join("specifications");
-    let spec_dirs = [specs.join("default"), specs];
-    let own = format!("{leaf}.gemspec");
-    let own_absent = spec_dirs.iter().all(|dir| {
-        matches!(std::fs::metadata(dir.join(&own)), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
-    });
-    if !own_absent {
-        return false;
-    }
-    let exact = format!("{name}-{version}");
-    let another_build_listed = spec_dirs.iter().any(|dir| {
-        super::listing::list_dir_sync(dir).iter().any(|entry| {
-            entry
-                .name
-                .to_str()
-                .and_then(|file| file.strip_suffix(".gemspec"))
-                .is_some_and(|build| {
-                    build != leaf && (build == exact || is_platform_dir_of(build, name, version))
-                })
-                && dir.join(&entry.name).is_file()
-        })
-    });
-    if !another_build_listed {
-        return false;
-    }
-    // `<bundle path>/<engine>/<abi>` is the home; the standalone setup file
-    // is `<bundle path>/bundler/setup.rb`.
-    let Some(setup) = home
-        .parent()
-        .and_then(Path::parent)
-        .map(|bundle| bundle.join("bundler").join("setup.rb"))
-    else {
         return true;
     };
-    match crate::utils::fs::read_regular_to_string_sync(&setup) {
-        Ok(text) => !text.contains(&format!("/gems/{leaf}/")),
-        Err(e) => e.kind() == std::io::ErrorKind::NotFound,
-    }
+    let needle = format!("/gems/{leaf}");
+    let names = |text: &str| {
+        text.match_indices(&needle).any(|(at, _)| {
+            // The leaf ends here: the next character is not one a longer
+            // dir name (`<leaf>-gnu`, `<leaf>.1`) would continue with.
+            !text[at + needle.len()..]
+                .starts_with(|c: char| c.is_ascii_alphanumeric() || "-._".contains(c))
+        })
+    };
+    let bundle_paths = [Some(home), home.parent().and_then(Path::parent)];
+    bundle_paths.into_iter().flatten().any(|bundle| {
+        let setup = bundle.join("bundler").join("setup.rb");
+        match crate::utils::fs::read_regular_to_string_sync(&setup) {
+            Ok(text) => names(&text),
+            Err(e) => e.kind() != std::io::ErrorKind::NotFound,
+        }
+    })
 }
 
 /// One gem home from [`RubyCrawler::bundler_install_homes`].
@@ -6038,150 +6064,202 @@ mod tests {
         assert_eq!(one[&purl].path, exact);
     }
 
-    /// #2087: in a gem home that lists one build of a gem version, the
-    /// dir of another build with no `specifications` entry of its own is a
-    /// leftover nothing loads. A default gem's entry is under
-    /// `specifications/default/`. A version the home lists no build of is
-    /// not judged, nor is a dir outside a gem home.
-    #[test]
-    fn is_leftover_gem_build_needs_another_build_listed_and_none_of_its_own() {
+    /// A gem home under `root` with a `specifications/` dir; `dir` makes
+    /// a gem dir in it and `spec` its gemspec.
+    struct LeftoverHome {
+        home: PathBuf,
+    }
+    impl LeftoverHome {
+        fn new(home: PathBuf) -> Self {
+            std::fs::create_dir_all(home.join("specifications/default")).unwrap();
+            Self { home }
+        }
+        fn dir(&self, leaf: &str) -> PathBuf {
+            let dir = self.home.join("gems").join(leaf);
+            std::fs::create_dir_all(dir.join("lib")).unwrap();
+            dir
+        }
+        fn spec(&self, leaf: &str) {
+            let spec = self.home.join(format!("specifications/{leaf}.gemspec"));
+            std::fs::write(spec, "").unwrap();
+        }
+    }
+
+    /// #2087: among the copies of a gem version in one gem home, a dir
+    /// with no `specifications` entry is a leftover nothing loads once
+    /// another copy has its own. A default gem's entry is under
+    /// `specifications/default/`.
+    #[tokio::test]
+    async fn retain_loaded_gem_builds_drops_a_dir_with_no_gemspec_beside_a_listed_build() {
         let tmp = tempfile::tempdir().unwrap();
-        let home = tmp.path().join("vendor/bundle/ruby/3.3.0");
-        let gems = home.join("gems");
-        let specs = home.join("specifications");
-        std::fs::create_dir_all(specs.join("default")).unwrap();
-        let dir = |leaf: &str| {
-            std::fs::create_dir_all(gems.join(leaf).join("lib")).unwrap();
-            gems.join(leaf)
-        };
-        let spec = |leaf: &str| std::fs::write(specs.join(format!("{leaf}.gemspec")), "").unwrap();
+        let home = LeftoverHome::new(tmp.path().join("vendor/bundle/ruby/3.3.0"));
 
         // The ruby build is installed; the platform dir lost its gemspec.
-        spec("nokogiri-1.16.0");
-        assert!(is_leftover_gem_build(
-            &dir("nokogiri-1.16.0-x86_64-linux"),
-            "pkg:gem/nokogiri@1.16.0"
-        ));
-        assert!(!is_leftover_gem_build(
-            &dir("nokogiri-1.16.0"),
-            "pkg:gem/nokogiri@1.16.0"
-        ));
-        // A purl carrying a `?platform=` qualifier names the same gem.
-        assert!(is_leftover_gem_build(
-            &dir("nokogiri-1.16.0-x86_64-linux"),
-            "pkg:gem/nokogiri@1.16.0?platform=x86_64-linux"
-        ));
-        assert!(!is_leftover_gem_build(
-            &dir("nokogiri-1.16.0-x86_64-linux"),
-            "pkg:npm/nokogiri@1.16.0"
-        ));
+        let (plain, platform) = (
+            home.dir("nokogiri-1.16.0"),
+            home.dir("nokogiri-1.16.0-x86_64-linux"),
+        );
+        home.spec("nokogiri-1.16.0");
+        assert_eq!(
+            retain_loaded_gem_builds(vec![plain.clone(), platform.clone()]).await,
+            vec![plain.clone()]
+        );
+        // Both builds installed (#1092): both are copies, in order.
+        home.spec("nokogiri-1.16.0-x86_64-linux");
+        assert_eq!(
+            retain_loaded_gem_builds(vec![plain.clone(), platform.clone()]).await,
+            vec![plain.clone(), platform.clone()]
+        );
         // The reverse: only the platform build is installed.
-        spec("ffi-1.17.2-x86_64-linux-gnu");
-        assert!(is_leftover_gem_build(
-            &dir("ffi-1.17.2"),
-            "pkg:gem/ffi@1.17.2"
-        ));
-        assert!(!is_leftover_gem_build(
-            &dir("ffi-1.17.2-x86_64-linux-gnu"),
-            "pkg:gem/ffi@1.17.2"
-        ));
-        // A default gem is listed under `default/`, and vouches for
-        // itself only.
-        std::fs::write(specs.join("default").join("json-2.7.2.gemspec"), "").unwrap();
-        assert!(!is_leftover_gem_build(
-            &dir("json-2.7.2"),
-            "pkg:gem/json@2.7.2"
-        ));
-        assert!(is_leftover_gem_build(
-            &dir("json-2.7.2-java"),
-            "pkg:gem/json@2.7.2"
-        ));
-        // Both builds installed (#1092): neither is a leftover.
-        spec("rack-3.1.0");
-        spec("rack-3.1.0-x86_64-linux");
-        assert!(!is_leftover_gem_build(
-            &dir("rack-3.1.0"),
-            "pkg:gem/rack@3.1.0"
-        ));
-        assert!(!is_leftover_gem_build(
-            &dir("rack-3.1.0-x86_64-linux"),
-            "pkg:gem/rack@3.1.0"
-        ));
-        // The home lists no build of this version: another version's
-        // gemspec, another gem sharing the prefix and a directory named
-        // like a gemspec say nothing about it.
-        spec("puma-6.4.20");
-        spec("puma-6.4.2.1");
-        spec("puma-6.4.2-1.0");
-        spec("puma-plugin-6.4.2");
-        std::fs::create_dir_all(specs.join("puma-6.4.2-java.gemspec")).unwrap();
-        assert!(!is_leftover_gem_build(
-            &dir("puma-6.4.2"),
-            "pkg:gem/puma@6.4.2"
-        ));
-        assert!(!is_leftover_gem_build(
-            &dir("puma-6.4.2-java"),
-            "pkg:gem/puma@6.4.2"
-        ));
-        // Not a gem home, and a path with no home at all.
-        let bare = tmp.path().join("bare/gems/nokogiri-1.16.0-x86_64-linux");
-        std::fs::create_dir_all(bare.join("lib")).unwrap();
-        assert!(!is_leftover_gem_build(&bare, "pkg:gem/nokogiri@1.16.0"));
-        assert!(!is_leftover_gem_build(
-            Path::new("nokogiri-1.16.0-x86_64-linux"),
-            "pkg:gem/nokogiri@1.16.0"
-        ));
+        std::fs::remove_file(home.home.join("specifications/nokogiri-1.16.0.gemspec")).unwrap();
+        assert_eq!(
+            retain_loaded_gem_builds(vec![plain.clone(), platform.clone()]).await,
+            vec![platform.clone()]
+        );
+
+        // A default gem is listed under `default/`.
+        let (json, json_java) = (home.dir("json-2.7.2"), home.dir("json-2.7.2-java"));
+        std::fs::write(
+            home.home.join("specifications/default/json-2.7.2.gemspec"),
+            "",
+        )
+        .unwrap();
+        assert_eq!(
+            retain_loaded_gem_builds(vec![json.clone(), json_java]).await,
+            vec![json]
+        );
+    }
+
+    /// Everything short of proof keeps a dir: a gem never loses its last
+    /// copy in a home, another home's gemspec says nothing, and neither
+    /// does a dir outside a `gems/` dir.
+    #[tokio::test]
+    async fn retain_loaded_gem_builds_keeps_what_no_gemspec_proves_a_leftover() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = LeftoverHome::new(tmp.path().join("a/ruby/3.3.0"));
+        let other = LeftoverHome::new(tmp.path().join("b/ruby/3.3.0"));
+
+        // No copy of the version is listed: a directory is not a gemspec,
+        // and another version's or another gem's entry is not this one's.
+        let (plain, java) = (home.dir("puma-6.4.2"), home.dir("puma-6.4.2-java"));
+        home.spec("puma-6.4.20");
+        home.spec("puma-plugin-6.4.2");
+        std::fs::create_dir_all(home.home.join("specifications/puma-6.4.2-java.gemspec")).unwrap();
+        assert_eq!(
+            retain_loaded_gem_builds(vec![plain.clone(), java.clone()]).await,
+            vec![plain.clone(), java.clone()]
+        );
+        // A lone copy is never dropped, listed or not.
+        assert_eq!(
+            retain_loaded_gem_builds(vec![plain.clone()]).await,
+            vec![plain.clone()]
+        );
+        // The listed copy is in ANOTHER home.
+        let elsewhere = other.dir("puma-6.4.2");
+        other.spec("puma-6.4.2");
+        assert_eq!(
+            retain_loaded_gem_builds(vec![elsewhere.clone(), plain.clone(), java.clone()]).await,
+            vec![elsewhere, plain, java]
+        );
+        // The listed build's own dir is not among the copies (it is
+        // missing, or the crawler did not take it for a gem): the dir
+        // beside it is all there is to judge.
+        let lone = home.dir("ffi-1.17.2-x86_64-linux-gnu");
+        home.spec("ffi-1.17.2");
+        assert_eq!(
+            retain_loaded_gem_builds(vec![lone.clone()]).await,
+            vec![lone]
+        );
+        // Not in a `gems/` dir (a custom `--global-prefix`).
+        let prefix = tmp.path().join("prefix");
+        let (a, b) = (prefix.join("rack-3.1.0"), prefix.join("rack-3.1.0-java"));
+        std::fs::create_dir_all(tmp.path().join("specifications")).unwrap();
+        std::fs::write(tmp.path().join("specifications/rack-3.1.0.gemspec"), "").unwrap();
+        assert_eq!(
+            retain_loaded_gem_builds(vec![a.clone(), b.clone()]).await,
+            vec![a, b]
+        );
+        assert_eq!(
+            retain_loaded_gem_builds(Vec::new()).await,
+            Vec::<PathBuf>::new()
+        );
     }
 
     /// A gemspec that cannot be probed is not proof the build is gone: only
     /// "not found" is. Here the probe fails because `specifications/default`
     /// is a file, so a path under it is "not a directory".
     #[cfg(unix)]
-    #[test]
-    fn is_leftover_gem_build_keeps_a_dir_whose_gemspec_cannot_be_probed() {
+    #[tokio::test]
+    async fn retain_loaded_gem_builds_keeps_a_dir_whose_gemspec_cannot_be_probed() {
         let tmp = tempfile::tempdir().unwrap();
-        let home = tmp.path().join("ruby/3.3.0");
-        let copy = home.join("gems/nokogiri-1.16.0-x86_64-linux");
-        std::fs::create_dir_all(copy.join("lib")).unwrap();
-        let specs = home.join("specifications");
-        std::fs::create_dir_all(&specs).unwrap();
-        std::fs::write(specs.join("nokogiri-1.16.0.gemspec"), "").unwrap();
-        assert!(is_leftover_gem_build(&copy, "pkg:gem/nokogiri@1.16.0"));
-        std::fs::write(specs.join("default"), "").unwrap();
-        assert!(!is_leftover_gem_build(&copy, "pkg:gem/nokogiri@1.16.0"));
+        let home = LeftoverHome::new(tmp.path().join("ruby/3.3.0"));
+        let (plain, platform) = (
+            home.dir("nokogiri-1.16.0"),
+            home.dir("nokogiri-1.16.0-x86_64-linux"),
+        );
+        home.spec("nokogiri-1.16.0");
+        std::fs::remove_dir(home.home.join("specifications/default")).unwrap();
+        std::fs::write(home.home.join("specifications/default"), "").unwrap();
+        assert_eq!(
+            retain_loaded_gem_builds(vec![plain.clone(), platform.clone()]).await,
+            vec![plain, platform]
+        );
     }
 
     /// A `bundle install --standalone` tree loads the dirs its
-    /// `bundler/setup.rb` names, gemspec or not.
-    #[test]
-    fn is_leftover_gem_build_keeps_a_dir_a_standalone_setup_loads() {
-        let tmp = tempfile::tempdir().unwrap();
-        let bundle = tmp.path().join("bundle");
-        let home = bundle.join("ruby/3.3.0");
-        let copy = home.join("gems/nokogiri-1.16.0-x86_64-linux");
-        std::fs::create_dir_all(copy.join("lib")).unwrap();
-        std::fs::create_dir_all(home.join("specifications")).unwrap();
-        std::fs::write(home.join("specifications/nokogiri-1.16.0.gemspec"), "").unwrap();
-        std::fs::create_dir_all(bundle.join("bundler")).unwrap();
-        let setup = bundle.join("bundler/setup.rb");
+    /// `bundler/setup.rb` names, gemspec or not: in the bundle path of a
+    /// scoped home and of a flat one, with or without a require path
+    /// after the dir.
+    #[tokio::test]
+    async fn retain_loaded_gem_builds_keeps_a_dir_a_standalone_setup_loads() {
+        let entry = |leaf: &str, tail: &str| {
+            format!(
+                "$:.unshift File.expand_path(\"#{{__dir__}}/../#{{RUBY_ENGINE}}/\
+                 #{{Gem.ruby_api_version}}/gems/{leaf}{tail}\")\n"
+            )
+        };
+        for (home_rel, bundle_rel) in [("bundle/ruby/3.3.0", "bundle"), ("flat", "flat")] {
+            let tmp = tempfile::tempdir().unwrap();
+            let home = LeftoverHome::new(tmp.path().join(home_rel));
+            let (plain, platform) = (
+                home.dir("nokogiri-1.16.0"),
+                home.dir("nokogiri-1.16.0-x86_64-linux"),
+            );
+            home.spec("nokogiri-1.16.0");
+            let both = vec![plain.clone(), platform.clone()];
+            let setup = tmp.path().join(bundle_rel).join("bundler/setup.rb");
+            std::fs::create_dir_all(setup.parent().unwrap()).unwrap();
 
-        // A setup file that loads the ruby build only.
-        std::fs::write(
-            &setup,
-            "$:.unshift File.expand_path(\"#{__dir__}/../#{RUBY_ENGINE}/#{Gem.ruby_api_version}/gems/nokogiri-1.16.0/lib\")\n",
-        )
-        .unwrap();
-        assert!(is_leftover_gem_build(&copy, "pkg:gem/nokogiri@1.16.0"));
-        // One that still loads the platform build.
-        std::fs::write(
-            &setup,
-            "$:.unshift File.expand_path(\"#{__dir__}/../#{RUBY_ENGINE}/#{Gem.ruby_api_version}/gems/nokogiri-1.16.0-x86_64-linux/lib\")\n",
-        )
-        .unwrap();
-        assert!(!is_leftover_gem_build(&copy, "pkg:gem/nokogiri@1.16.0"));
-        // One that cannot be read (here: not UTF-8) might.
-        std::fs::write(&setup, [0xff, 0xfe]).unwrap();
-        assert!(!is_leftover_gem_build(&copy, "pkg:gem/nokogiri@1.16.0"));
+            // A setup file that loads the ruby build, and a longer-named
+            // build that is not this dir.
+            let other = entry("nokogiri-1.16.0", "/lib")
+                + &entry("nokogiri-1.16.0-x86_64-linux-gnu", "/lib")
+                + &entry("nokogiri-1.16.0-x86_64-linux.1", "");
+            std::fs::write(&setup, &other).unwrap();
+            assert_eq!(
+                retain_loaded_gem_builds(both.clone()).await,
+                vec![plain.clone()],
+                "{home_rel}"
+            );
+            // One that still loads the platform build, from a require
+            // path or from the gem's root.
+            for tail in ["/lib", ""] {
+                let text = other.clone() + &entry("nokogiri-1.16.0-x86_64-linux", tail);
+                std::fs::write(&setup, text).unwrap();
+                assert_eq!(
+                    retain_loaded_gem_builds(both.clone()).await,
+                    both,
+                    "{home_rel} {tail:?}"
+                );
+            }
+            // One that cannot be read (here: not UTF-8) might.
+            std::fs::write(&setup, [0xff, 0xfe]).unwrap();
+            assert_eq!(
+                retain_loaded_gem_builds(both.clone()).await,
+                both,
+                "{home_rel}"
+            );
+        }
     }
 
     /// A dir that merely starts with `<name>-<version>-` is not a platform
