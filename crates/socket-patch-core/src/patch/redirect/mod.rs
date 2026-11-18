@@ -4594,7 +4594,7 @@ fn preflight_yarn_classic_hosted(
 /// segments, for the `original` / `new` strings of a
 /// `redirect_yarn_classic_entry` edit.
 ///
-/// The record is a cross-language contract: the backend's TS rewriter and the
+/// The record is a cross-language contract: the Socket backend's TS rewriter and the
 /// shared `tests/fixtures/redirect/npm/yarn-classic/*/expected-edits.json`
 /// fixtures record the segment (`split("\n\n")` over the LF-normalized
 /// lock) that holds the block, so a block that follows two blank lines
@@ -8864,7 +8864,7 @@ fn rewrite_gem(
 // ── maven (pom.xml version pin + repository + trusted checksums) ────────────
 //
 // Maven has no lockfile, so the patched jar is pinned two ways depending on
-// whether the reference API captured a rewritable upstream pom (the backend's TS
+// whether the reference API captured a rewritable upstream pom (the Socket backend's TS
 // twin carries the full rationale):
 //
 //   FAIL-CLOSED — the override carries `identifiers.mavenSuffixedVersion`

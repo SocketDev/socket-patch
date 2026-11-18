@@ -13,7 +13,7 @@ name: Composer patch compatibility
 # bearing there; 2.10.3 = current, no fallback.
 #
 # PHP: Composer 1 never on 8.5 (broken there). No 7.4 cell: the psr/log
-# 3.0.2 capstones need PHP >= 8.0; the backend's harness covers 7.4.
+# 3.0.2 capstones need PHP >= 8.0; the Socket backend's harness covers 7.4.
 #
 # Each leg runs one checksum-pinned composer.phar through `php` (the
 # capstones' SOCKET_PATCH_COMPOSER_PHAR mode), which is also what makes

@@ -23,7 +23,7 @@ too; `--offline`; the lock reverted to the registry, `--no-verify` too), and
 `rollback` restoring every byte.  Pre-2018 releases are expected to be
 REFUSED (old lock spec for 0–6, vendored for 7–11) without touching the lock.
 
-Shapes mirror the backend's capture harness: direct, dev, category (2022+),
+Shapes mirror the Socket backend's capture harness: direct, dev, category (2022+),
 marker, marker-excluded, extras, transitive, crlf.  Invocations vary how the
 CLI is pointed at the project: in-dir (cwd = project, no --cwd), cwd-flag
 (run from the output root with --cwd), subdir (project nested two levels down,
@@ -571,7 +571,7 @@ def main():
         Modern: uv venv on the tool's interpreter + pip 24 (+ packages).
         Legacy: `native=True` builds the Docker (linux, python 3.6) venv that
         Pipenv itself installs into; otherwise a host uv venv (python 3.8) so
-        the CLI can crawl an installed urllib3 the way the backend's captures did.
+        the CLI can crawl an installed urllib3 the way the Socket backend's captures did.
         """
         if venv.exists():
             shutil.rmtree(venv)

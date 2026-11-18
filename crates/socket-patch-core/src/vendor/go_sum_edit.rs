@@ -19,7 +19,7 @@
 //! the Socket module, which is what makes the hosted redirect committable.
 //!
 //! Everything here is a pure `&str` transform (the hosted rewriters operate on
-//! in-memory file content, mirrored byte-identically by the backend's TS twins).
+//! in-memory file content, mirrored byte-identically by the Socket backend's TS twins).
 //! Unrelated lines are preserved verbatim.
 //! [`GoSumEditor::upsert_module_lines`] inserts at
 //! the whole-line byte-order position, which matches go's `(module, semver)`

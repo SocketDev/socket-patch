@@ -1,7 +1,7 @@
 //! Real-Hatch capstone: HOSTED and VENDORED patches end to end with a pinned
 //! Hatch 1.x release, finishing in manifest-less `socket-patch vex`. Before
 //! this suite no real-Hatch e2e existed in this repo (a backtest script on the
-//! backend side was the only native coverage).
+//! Socket backend side was the only native coverage).
 //!
 //! Per Hatch release (`SOCKET_PATCH_HATCH_E2E_VERSION`, default
 //! [`DEFAULT_VERSION`]) and per declaration flavor — `[project]

@@ -86,7 +86,7 @@ cargo test --locked -p socket-patch-core --lib hatch
 SOCKET_PATCH_HATCH_E2E_REQUIRED=1 cargo test -p socket-patch-cli --test e2e_vex_build -- hatch::hatch_existing_env --ignored
 ```
 
-A companion harness on the backend side runs real released Hatch binaries, actual CLI
+A companion harness on the Socket backend's side runs real released Hatch binaries, actual CLI
 scans, fresh native installs, installed patch-file hash verification,
 wrong-digest rejection, repeated scans and rollback on Linux and Windows.
 It also feeds captured manifests through the real SBOM pipeline and seeded

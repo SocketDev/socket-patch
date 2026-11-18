@@ -6,7 +6,7 @@
 //! re-serialized. DepIDs come in two encodings, decided by prefix only:
 //! legacy (`·`, `encodeURIComponent` with `@` raw and `/` as `§`, vlt ≤
 //! 1.0.0-rc.14) and tilde (`~`, `_X` escapes with `/` as `+`). The codec rows
-//! in the tests are shared verbatim with the backend's TS codec tests.
+//! in the tests are shared verbatim with the Socket backend's TS codec tests.
 
 use std::cmp::Ordering;
 use std::collections::HashMap;
@@ -1273,7 +1273,7 @@ pub(crate) fn parse_vendored_dir_path(path: &str) -> Option<VendoredPath> {
 }
 
 /// The vendored path rule (hosted matching, vendored target analysis, VEX,
-/// the backend): is a decoded `file` path a vendored vlt artifact of `name`?
+/// the Socket backend): is a decoded `file` path a vendored vlt artifact of `name`?
 pub(crate) fn parse_vendored_path(path: &str, name: &str) -> Option<VendoredPath> {
     if let Some(dir) = parse_vendored_dir_path(path) {
         return (dir.name == name).then_some(dir);
@@ -1365,7 +1365,7 @@ mod tests {
         Some((era, kind, first, None, None))
     }
 
-    // Verbatim from the codec rows of the backend's TS tests
+    // Verbatim from the codec rows of the Socket backend's TS tests
     // (cross-checked there against vlt 1.2.0 and rc.14
     // `splitDepID`). Its lone-surrogate row has no Rust `&str` spelling.
     fn codec_rows() -> Vec<CodecRow> {

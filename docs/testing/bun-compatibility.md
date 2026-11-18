@@ -511,7 +511,7 @@ results (`captures/<version>-<shape>-<mode>/`), plus provenance
 (`cliRevision` — the branch-resolvable commit the row is about; `cliBuildSha`
 — the commit actions/checkout actually built, `refs/pull/N/merge` on a pull
 request, `null` when not supplied; `cliSha256`; `bunSha256`;
-`bunArchiveSha256`). The backend's SBOM tests import
+`bunArchiveSha256`). The Socket backend's SBOM tests import
 these captures through their fixture validation framework.
 Vendored artifact contents are verified by the native runner; they are not
 needed for SBOM lockfile annotation.
@@ -536,7 +536,7 @@ lagging — otherwise its golden suite fails:
   moment the TS harness reads the warnings file). `lock-v2-crlf` is not a
   gate lag but a bug twin on the TS side: it drops the `\r` on the rewritten line
   (the defect 532c40b fixed here).
-- **Harness requirement**: the backend's golden test must read the optional
+- **Harness requirement**: the Socket backend's golden test must read the optional
   `expected-warnings.json` and assert the warning-code set, as
   `redirect_golden.rs` does; until the dispatcher-level
   `redirect_npm_no_lockfile` suppression for bun-only projects is ported, that

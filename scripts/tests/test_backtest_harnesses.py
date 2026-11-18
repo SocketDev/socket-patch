@@ -864,7 +864,7 @@ class VltOracleTests(unittest.TestCase):
         self.assertEqual(vlt.observed_verdict({'failingChecks': ['freshCi']}), 'unsafe')
 
     def test_shapes_are_backend_capture_shapes(self):
-        # The backend's capture audit reads these rows by shape name.
+        # The Socket backend's capture audit reads these rows by shape name.
         capture_names = {'direct', 'dev', 'optional', 'optional-mixed', 'alias', 'scoped',
                          'transitive', 'two-versions', 'workspace', 'workspace-member-vendored',
                          'self-referencing-member-vendored', 'peer-variants', 'crlf-lock',

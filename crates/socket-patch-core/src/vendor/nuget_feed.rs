@@ -55,7 +55,7 @@ const NUGET_ORG_SOURCE_URL: &str = "https://api.nuget.org/v3/index.json";
 /// Normalize a NuGet version for the flat-container / registration path:
 /// lowercase, drop build metadata (`+…`), strip per-segment leading zeros, pad
 /// the numeric core to 3 parts, and drop a zero 4th (Revision) segment. Rust
-/// twin of the patch service's TS `normalizeNuGetVersion`; the
+/// twin of the patch service's TypeScript version normalizer; the
 /// two MUST stay in sync so the vendored feed filename, the
 /// `packageSourceMapping` version match, and the server-side registry paths
 /// agree. Mirrors `NuGetVersion.ToNormalizedString().ToLowerInvariant()`.

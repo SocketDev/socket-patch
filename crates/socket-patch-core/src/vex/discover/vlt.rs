@@ -6,7 +6,7 @@
 //!
 //! | shape | written by | recognized node | ref |
 //! |---|---|---|---|
-//! | hosted | `patch::redirect::vlt` (`scan --mode hosted`, the backend twin) | a registry node (any segment) whose slot [3] is a Socket-hosted `/patch/npm/…` URL whose leaf is `<bare>-<version>.tgz` of the DepID's `name@version` and whose embedded `<name>/<version>` (when the URL has them) is that `name@version`, slot [1] == name, slot [2] a `sha512-` SRI | `Hosted { purl, uuid, integrity: slot [2] }` |
+//! | hosted | `patch::redirect::vlt` (`scan --mode hosted`, the Socket backend twin) | a registry node (any segment) whose slot [3] is a Socket-hosted `/patch/npm/…` URL whose leaf is `<bare>-<version>.tgz` of the DepID's `name@version` and whose embedded `<name>/<version>` (when the URL has them) is that `name@version`, slot [1] == name, slot [2] a `sha512-` SRI | `Hosted { purl, uuid, integrity: slot [2] }` |
 //! | vendored | `vendor::vlt_lock` (`vendor`, `scan --mode vendored`) | a `file` node whose decoded path is `.socket/vendor/npm/<uuid>/[@s/]<bare>-<version>/node_modules/[@s/]<bare>`, slot [1] == name, slot [3] (when a string) == the path | `Vendored { purl, uuid, path }` |
 //! | vendored (read-only) | a user's `vlt install` of an npm-flavor artifact | a `file` node whose decoded path is `.socket/vendor/npm/<uuid>/[@s/]<bare>-<version>.tgz`, same slot rules | `Vendored { purl, uuid, path }` |
 //!

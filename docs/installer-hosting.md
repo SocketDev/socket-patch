@@ -119,10 +119,10 @@ mangled publish is caught even when the hash somehow matches expectations.
   through a package manager or a release archive. A `patch.ps1` object on the
   same host would be the natural addition — the hosting side already supports
   it, nothing here does yet.
-- **Objects must stay flat** — for the *bucket-backed* paths only (`patch`,
-  `patch.sha256`, `index.html`). The host serves bucket-root keys only. This
-  does not affect `/patch/dl/**`, which is relayed by a separate service and
-  never touches the bucket.
+- **The hosted files must stay flat.** `patch`, `patch.sha256` and
+  `index.html` are served from the root of the host, and a nested path would
+  not resolve. This does not affect `/patch/dl/**`, which a separate service
+  relays.
 - **The default download origin is still GitHub.** The `SOCKET_PATCH_BASE_URL`
   mechanism ships first; flipping the default to `install.socket.dev` is a
   one-line change, deliberately held until the relay is verified in prod. A

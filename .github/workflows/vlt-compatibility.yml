@@ -10,7 +10,7 @@ name: vlt patch compatibility
 #                  each run through scripts/check-vlt-legs.py
 #   native         scripts/backtest-vlt.py against the production service
 #   lock-diff      the same cell's vlt-lock.json must be byte-identical on
-#                  Linux, macOS and Windows (these rows also feed the backend)
+#                  Linux, macOS and Windows (these rows also feed the Socket backend)
 #   canary         nightly: vlt@latest through every capstone, plus the
 #                  release and lockfileVersion watchdogs
 #   downgrade      nightly: the latest published socket-patch meets vlt

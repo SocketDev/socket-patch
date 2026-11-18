@@ -38,10 +38,10 @@ is `patched` records `blocked-by-server-encoding` without running the CLI.
 That verdict is never recorded without the probe seeing a non-identity
 `Content-Encoding`; any other hosted failure is an error.
 
-Rows are written in the shape of the backend capture harness's `result.json`
+Rows are written in the shape of the Socket backend capture harness's `result.json`
 (`os, vlt, mode, shape, verdict, codes, manifestSha256, patches` plus the
-`tree/` of SBOM inputs), so the backend's capture audit and fixture generator
---captures` read them directly.
+`tree/` of SBOM inputs), so the Socket backend's capture audit and fixture generator
+read them directly.
 
 `--identity-mirror` serves the production API and artifacts through a
 loopback mirror that fetches the artifact with `accept-encoding: identity`
@@ -164,7 +164,7 @@ def unlisted_releases(published, supported, excluded):
 
 
 # ---------------------------------------------------------------------------
-# Shapes (a subset of the backend capture harness's, with the same names).
+# Shapes (a subset of the Socket backend capture harness's, with the same names).
 # The oracle follows the committed boundary table; that harness does not yet
 # match it for optional-only cells on 0.0.0-24 … 0.0.0-31. The production
 # patch is minimist@1.2.2 only, so shapes that need a scoped, transitive-only
@@ -326,7 +326,7 @@ def integrity_enforced(version, optional, code, err, installed, patched_bytes_us
     """The tampered checkout failed on the digest. vlt skips an optional
     dependency that fails to fetch, and 0.0.0-16 then fails reading its
     package.json: when the untampered checkout installed the patched bytes,
-    only the wrong digest kept the target out (the backend capture
+    only the wrong digest kept the target out (the Socket backend capture
     harness's rule)."""
     if code != 0 and 'integrity' in err.lower():
         return True
@@ -534,7 +534,7 @@ def snapshot(project):
 
 
 def captured(name):
-    """The SBOM inputs the backend's fixtures import (DESIGN §7.3 tree list)."""
+    """The SBOM inputs the Socket backend's fixtures import (DESIGN §7.3 tree list)."""
     parts = name.split('/')
     leaf = parts[-1]
     if leaf in ('package.json', 'vlt-lock.json', 'vlt.json', 'vlt-workspaces.json'):
