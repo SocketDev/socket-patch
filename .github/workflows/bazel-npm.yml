@@ -97,6 +97,7 @@ on:
       - 'crates/socket-patch-core/src/vendor/**'
       - 'crates/socket-patch-core/src/hosted/**'
       - 'crates/socket-patch-cli/src/commands/**'
+      - 'crates/socket-patch-core/src/vex/**'
       - 'crates/socket-patch-cli/tests/common/**'
       - 'crates/socket-patch-cli/tests/hosted_memory_common/**'
       - 'Cargo.lock'

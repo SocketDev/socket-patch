@@ -39,7 +39,8 @@
 //!   grant pins: after the same `scan`, the build fails on the sha256.
 //!
 //! The marker is read from what Bazel built, and the patched one holds an
-//! id made for the run, so no cache of an earlier run can supply it.
+//! id made for the run, so no cache of an earlier run can supply it. The
+//! flow asserts the VEX document of its patch as `main.rs` says.
 //!
 //! One loopback server stands in for four hosts. The Socket API and the
 //! patch host answer at their own paths; `pypi.org` (the project pages of
@@ -81,7 +82,8 @@ use base64::Engine as _;
 use serde_json::{json, Value};
 
 use crate::harness::{
-    changed, fixture_path, rewrite, Cell, Fixture, Ran, StandIn, Tree, CONSUMER, NOTHING,
+    changed, fixture_path, rewrite, with_vex, Cell, Claim, Fixture, How, Ran, StandIn, Tree,
+    CONSUMER, NOTHING,
 };
 use crate::hosted_memory_common::Patch;
 
@@ -397,7 +399,11 @@ fn hosted_pip_parse() {
     // (b) The one command of hosted mode. It rewrites that file and no
     // other: the pin of the dependency as it was, and the package as a
     // direct reference to the patched wheel with its sha256.
-    let scan = socket_patch(&cell, &standin, &["scan", "--mode", "hosted", "--yes"]);
+    let hosted = ["scan", "--mode", "hosted", "--yes"];
+    let claim = Claim::new(PURL, &uuid, How::Hosted);
+    let run = |cell: &Cell, args: &[&str]| socket_patch(cell, &standin, args);
+    let in_run = cell.document("in-run");
+    let scan = run(&cell, &[&hosted[..], &with_vex(&in_run)].concat());
     let said = &scan.dump;
     let pinned = cell.pinned_by(&scan, PURL, &uuid, &before, &[REQUIREMENTS]);
     let direct = format!("{NAME} @ {origin}{patched_route}");
@@ -410,6 +416,10 @@ fn hosted_pip_parse() {
         ),
         "{test}"
     );
+    // The document of that run and the one of `vex` say so, in a checkout
+    // Bazel has built in, before anything has fetched the patched wheel.
+    cell.wrote_in_run(&scan, &in_run, &claim);
+    cell.stands_alone(run, &claim, true);
     assert_eq!(standin.asked(&patched_route), 0, "{test}: {said}");
     let index_requests = standin.asked(&page);
     // The scan left Bazel's lock as it was, so a frozen lock fails here
@@ -435,6 +445,10 @@ fn hosted_pip_parse() {
     // From here on the checkout stands: the next build changes no file,
     // and that lock holds when Bazel may not update it.
     cell.builds_patched(&built, &marker);
+    // `vex` says the same of the build that printed the patched marker,
+    // and with `--no-verify` that it checked no file.
+    cell.stands_alone(run, &claim, true);
+    cell.stands_alone(run, &claim, false);
 
     // (d) The undo: `requirements.txt` is the one of before at once, and
     // the lock is still the one of the patched build, so a frozen lock
@@ -461,6 +475,10 @@ fn hosted_pip_parse() {
         standin.asked(&page) > index_requests,
         "{test}: the build after the undo did not ask the index about {NAME}"
     );
+    // `vex` has no document for the checkout of before.
+    cell.attests_nothing(run, 2, "manifest_not_found");
+    // The same two documents where no Bazel has built.
+    cell.attests_unbuilt(run, &hosted, &before, &pinned, &claim);
 
     // (e) A second machine. Bazel keeps a download that has a checksum in
     // the repository cache, which the two machines share, so this one gets

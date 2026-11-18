@@ -24,6 +24,8 @@
 //!   patch registry that serves other bytes fails the build, and the
 //!   upstream gem is not fetched in its place.
 //!
+//! The flow asserts the VEX document of its patch as `main.rs` says.
+//!
 //! Both markers are read from what Bazel built, and each holds an id made
 //! for the run, so no cache of an earlier run can supply either gem. The
 //! fixture's lock therefore holds no sha256 of a gem: it has a placeholder
@@ -66,7 +68,9 @@ use std::time::Instant;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
-use crate::harness::{fixture_path, rewrite, Cell, Fixture, StandIn, CONSUMER};
+use crate::harness::{
+    fixture_path, rewrite, with_vex, Cell, Claim, Fixture, How, StandIn, CONSUMER,
+};
 use crate::hosted_memory_common::Patch;
 
 /// The sha256 of `bytes` in lowercase hex, as a `Gemfile.lock` and the gem
@@ -288,7 +292,10 @@ fn hosted_bundle_fetch() {
     // no other: the declaration gains the patch registry as its source, and
     // the lock resolves the gem from it, in a section of its own, with the
     // sha256 of the patched gem.
-    let scan = socket_patch(&cell, &["scan", "--mode", "hosted", "--yes"]);
+    let hosted = ["scan", "--mode", "hosted", "--yes"];
+    let claim = Claim::new(PURL, &uuid, How::Hosted);
+    let in_run = cell.document("in-run");
+    let scan = socket_patch(&cell, &[&hosted[..], &with_vex(&in_run)].concat());
     let said = &scan.dump;
     let pinned = cell.pinned_by(&scan, PURL, &uuid, &before, &["Gemfile", "Gemfile.lock"]);
     let text = |rel: &str| String::from_utf8(pinned[rel].clone()).expect("a text file");
@@ -306,6 +313,10 @@ fn hosted_bundle_fetch() {
         !lock.contains(&sum(&upstream_gem)),
         "{test}: Gemfile.lock:\n{lock}"
     );
+    // The document of that run and the one of `vex` say so, in a checkout
+    // Bazel has built in, before anything has fetched the patched gem.
+    cell.wrote_in_run(&scan, &in_run, &claim);
+    cell.stands_alone(socket_patch, &claim, true);
     assert_eq!(standin.asked(&patched_route), 0, "{test}: {said}");
 
     // (c) The same build, no step in between: patched, from the patch
@@ -321,10 +332,18 @@ fn hosted_bundle_fetch() {
         upstream_fetches,
         "{test}: the patched build fetched the upstream gem"
     );
+    // `vex` says the same of the build that printed the patched marker,
+    // and with `--no-verify` that it checked no file.
+    cell.stands_alone(socket_patch, &claim, true);
+    cell.stands_alone(socket_patch, &claim, false);
 
-    // (d) The undo: every file is the one of before, and so is the build.
+    // (d) The undo: every file is the one of before, and so is the build,
+    // and `vex` has no document for it.
     let undo = socket_patch(&cell, &["rollback", "--yes"]);
     cell.undone(&undo, "rolledBack", &before, &unpatched);
+    cell.attests_nothing(socket_patch, 2, "manifest_not_found");
+    // The same two documents where no Bazel has built.
+    cell.attests_unbuilt(socket_patch, &hosted, &before, &pinned, &claim);
 
     // (e) A second machine with the rewritten files, and a patch registry
     // that serves other bytes at the pinned URL: still a gem RubyGems
