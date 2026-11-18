@@ -18,9 +18,9 @@ projects using text `bun.lock` or native binary `bun.lockb`. Real-Bun evidence b
 
 Underneath, the hosted and vendored bun rewriters are pinned by shared golden
 fixtures (`crates/socket-patch-core/tests/fixtures/redirect/npm/bun/*`, shared
-with the depscan TypeScript backend, whose golden harness asserts every case it
-does not list as lagging — the cases authored Rust-first here lag until
-`bun.ts` is ported, see [depscan TS parity](#depscan-ts-parity); refusal
+with the TypeScript rewriter in Socket's backend, whose golden harness asserts
+every case it does not list as lagging — the cases authored Rust-first here lag
+until that rewriter is ported, see [Backend parity](#backend-parity); refusal
 fixtures pin their warning code through `expected-warnings.json`) and by
 hermetic CLI suites that
 need no Bun binary (`tests/vendor/in_process_vendor_bun.rs`,
@@ -511,39 +511,38 @@ results (`captures/<version>-<shape>-<mode>/`), plus provenance
 (`cliRevision` — the branch-resolvable commit the row is about; `cliBuildSha`
 — the commit actions/checkout actually built, `refs/pull/N/merge` on a pull
 request, `null` when not supplied; `cliSha256`; `bunSha256`;
-`bunArchiveSha256`). The depscan SBOM tests import
-these captures through their fixture validation framework
-(`bun-compatibility/generate-fixtures.py --captures`, depscan #26453).
+`bunArchiveSha256`). The backend's SBOM tests import
+these captures through their fixture validation framework.
 Vendored artifact contents are verified by the native runner; they are not
 needed for SBOM lockfile annotation.
 
-## depscan TS parity
+## Backend parity
 
-The bun golden fixtures are shared with the depscan TypeScript backend
-(`bun.ts`), whose `golden.test.ts` asserts a byte match for every case it does
-not list in `TS_LAGGING`. Several bun cases were authored Rust-first on this
-branch, so the depscan submodule bump that adopts them must either port
-`bun.ts` or extend `TS_LAGGING` — otherwise its golden suite fails:
+The bun golden fixtures are shared with the TypeScript rewriter in Socket's
+backend, whose golden test asserts a byte match for every case it does not
+list as lagging. Several bun cases were authored Rust-first here, so the
+backend change that adopts them must either port the rewriter or list them as
+lagging — otherwise its golden suite fails:
 
-- **`TS_LAGGING` entries the bump needs**, all under `npm/bun/`: `lock-v0`
+- **Cases that lag**, all under `npm/bun/`: `lock-v0`
   (pre-existing: TS refuses lockfileVersion 0), `lock-v3-nested-overrides`
   (TS refuses lockfileVersion 3), `alias`, `lock-v2-crlf`,
   `lock-v2-workspace-nested`, `re-redirect-stale-url`,
   `digestless-hosted-already-wired`, `digestless-hosted-stale-url-repin`,
-  and `lock-v0-workspace-refusal` for as long as `bun.ts` lacks the version-0
+  and `lock-v0-workspace-refusal` for as long as the TS side lacks the version-0
   workspace gate (TS refuses that lock with `redirect_bun_lock_unsupported`
   while `expected-warnings.json` pins `redirect_bun_workspace_unsupported`,
   so the case matches on files/edits by coincidence today and fails the
   moment the TS harness reads the warnings file). `lock-v2-crlf` is not a
-  gate lag but a `bun.ts` bug twin: it drops the `\r` on the rewritten line
+  gate lag but a bug twin on the TS side: it drops the `\r` on the rewritten line
   (the defect 532c40b fixed here).
-- **Harness requirement**: `golden.test.ts` must read the optional
+- **Harness requirement**: the backend's golden test must read the optional
   `expected-warnings.json` and assert the warning-code set, as
   `redirect_golden.rs` does; until the dispatcher-level
   `redirect_npm_no_lockfile` suppression for bun-only projects is ported, that
   assertion fails every bun case that ships the file.
-- **`bun.ts` porting items** (what lifts each case out of `TS_LAGGING`):
-  `SUPPORTED_LOCK_VERSIONS = [0, 1, 2, 3]` with the shared gate text; the
+- **Porting items** (what lifts each case out of the lagging list):
+  lock versions 0 to 3 with the shared gate text; the
   version-0 workspace gate; CR re-emit on the rewritten line; the prior-URL
   re-pin arm (a hosted URL left by an earlier grant of the same
   `name@version` is re-pinned in place); the digest-less 2-tuple heal

@@ -35,7 +35,7 @@ project, so the product purl must be passed explicitly).
 ## Installer boundaries (measured)
 
 Measured with the last stable release of every published Pipenv major
-(`releases.json` of the depscan harness, PyPI as of 2026-09-17): 0.2.8,
+(the backend capture harness's release list, PyPI as of 2026-09-17): 0.2.8,
 3.6.2, 4.1.4, 5.4.2, 6.2.9, 7.9.10, 8.3.2, 9.1.0, 10.1.2, 11.10.4,
 2018.11.26, 2020.11.15, 2021.11.23, 2022.12.19, 2023.12.1, 2024.4.1,
 2025.1.3, 2026.8.0. Pre-2018 releases run on Python 3.6 (they no longer

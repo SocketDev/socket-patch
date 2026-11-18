@@ -1316,7 +1316,7 @@ mod tests {
 
     // ── classic ──────────────────────────────────────────────────────────
 
-    /// The committed golden fixture (what `scan --mode hosted` / a depscan PR
+    /// The committed golden fixture (what `scan --mode hosted` / a GitHub-app PR
     /// leaves behind): the uuid is the patch's, not the grant token's.
     #[tokio::test]
     async fn classic_golden_hosted_fixture() {

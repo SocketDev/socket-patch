@@ -1,8 +1,8 @@
 //! Registry-redirect rewriters (the hosted-mode `scan` engine).
 //!
 //! Rewrites lockfiles / registry configs so ONLY the patched dependency points
-//! at Socket's HOSTED vendored patches — the Rust counterpart of the depscan
-//! backend's `@socketsecurity/app/patches/registry-rewrite` TS rewriters. Both
+//! at Socket's HOSTED vendored patches — the Rust counterpart of the TS
+//! rewriters in Socket's backend. Both
 //! sides are held byte-consistent by the SHARED golden fixtures under
 //! `tests/fixtures/redirect/` (see `tests/redirect_golden.rs`): a fixture's
 //! `expected/` bytes are produced identically by the TS backend (the GitHub-app
@@ -4594,7 +4594,7 @@ fn preflight_yarn_classic_hosted(
 /// segments, for the `original` / `new` strings of a
 /// `redirect_yarn_classic_entry` edit.
 ///
-/// The record is a cross-language contract: depscan's TS rewriter and the
+/// The record is a cross-language contract: the backend's TS rewriter and the
 /// shared `tests/fixtures/redirect/npm/yarn-classic/*/expected-edits.json`
 /// fixtures record the segment (`split("\n\n")` over the LF-normalized
 /// lock) that holds the block, so a block that follows two blank lines
@@ -8864,8 +8864,8 @@ fn rewrite_gem(
 // ── maven (pom.xml version pin + repository + trusted checksums) ────────────
 //
 // Maven has no lockfile, so the patched jar is pinned two ways depending on
-// whether the reference API captured a rewritable upstream pom (see the TS twin
-// `registry-rewrite/maven-pom.ts` for the full rationale):
+// whether the reference API captured a rewritable upstream pom (the backend's TS
+// twin carries the full rationale):
 //
 //   FAIL-CLOSED — the override carries `identifiers.mavenSuffixedVersion`
 //   (`<base>-socket.<hex8>`) + the `mavenPomSha256` of the served pom. That

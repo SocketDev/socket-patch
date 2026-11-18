@@ -33,7 +33,7 @@
 //! lock keeps the real sha1/integrity pins: the fresh install MUST fail on
 //! the integrity/hash check — the lock pin is enforcement.
 //!
-//! Manifest-less VEX (the depscan / never-committed-manifest shape): once the
+//! Manifest-less VEX (the GitHub-app / never-committed-manifest shape): once the
 //! fresh checkout has installed the hosted bytes, `ManifestlessVex` deletes
 //! `.socket/manifest.json` (and any ledger), and proves the patch is
 //! still attested `(redirected)` from the `yarn.lock` wiring alone (record

@@ -441,7 +441,7 @@ async fn lock_only_pipenv_project_redirects_attests_rescans_and_rolls_back() {
     );
     assert_no_ledger(tmp.path());
 
-    // Manifest-less VEX over the committed state (the depscan / CI shape).
+    // Manifest-less VEX over the committed state (the GitHub-app / CI shape).
     manifestless_vex(tmp.path(), "pipenv lock-only", &|p: &Path| {
         std::fs::write(p.join("Pipfile.lock"), LOCK).unwrap();
     });

@@ -600,7 +600,7 @@ def project_text(version, shape, overrides=True):
 def transitive_pinned_text(version):
     """PDM < 2.0 has no resolution overrides: lock with the pins as direct
     requirements, then restore the real manifest and recompute the content
-    hash (same trick as the depscan reference harness)."""
+    hash (same trick as the backend's reference harness)."""
     if legacy_manifest(version, "transitive"):
         return project_text(version, "transitive") + "".join(f'{n} = "=={p}"\n' for n, p in TRANSITIVE_PINS)
     deps = ["requests==2.31.0"] + [f"{n}=={p}" for n, p in TRANSITIVE_PINS]

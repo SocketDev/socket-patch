@@ -21,7 +21,7 @@
 //! confirmed pins out again must delete the file (no other bytes changed).
 //!
 //! This harness is separate from the TS-authored `redirect_golden.rs`; the
-//! depscan port of these cases is a follow-up.
+//! backend port of these cases is a follow-up.
 //!
 //! `SOCKET_PATCH_BLESS_SBT_GOLDEN=1` rewrites every case's expectations
 //! from the current output (review the diff before committing).

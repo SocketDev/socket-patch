@@ -509,7 +509,7 @@ const SCAN_LEVEL_WARNING_PREFIXES: &[&str] = &[
 
 /// The disk run's hosted outcome in the in-memory engine's `redirect`
 /// shape (`{mode, redirected, rewrittenFiles, skipped, patches, warnings,
-/// dryRun}`, the library API the depscan pipeline consumes), rebuilt from
+/// dryRun}`, the library API Socket's backend consumes), rebuilt from
 /// the v5.0 `scan --json` envelope — its `details.mode: "hosted"` events,
 /// its `redirect.rewrittenFiles` and its non-scan-level warnings — so a
 /// parity test stays one comparison. `skipped[]` comes back purl-sorted;

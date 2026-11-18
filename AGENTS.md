@@ -12,6 +12,24 @@ If a PR you work on already changes `CHANGELOG.md`, restore that file to its
 merge-base version. The only exceptions are release PRs: a `release/v*`
 branch, or the release train's `release-sync` PR.
 
+## This repository is public
+
+Don't name Socket's private repositories here, and don't quote their file
+paths, symbol names, pull request numbers, branch names or infrastructure.
+That covers everything that lands in this repository or on its GitHub pages:
+code, comments, test names, docs, commit messages, PR titles and
+descriptions, review comments, issues, discussions and ledger branches. A
+SocketDev repository is private unless `gh repo view <repo> --json visibility`
+says `PUBLIC`. Identifiers of internal tooling stay out as well: scheduled
+routine trigger ids, internal hostnames and dashboard links.
+
+Say what the other side is, not what it is called: "Socket's backend", "the
+patch service", "the Socket API", "the Socket GitHub app". Describe a
+cross-repo contract by the thing this repository holds, such as a shared
+golden fixture or an endpoint, not by the other repository's files. If a
+change here needs a matching change in a private repository, say "needs a
+matching backend change" and track the details in the private repository.
+
 ## Wait on CI with a monitor, not a polling loop
 
 To wait on a PR's checks or its trip through the merge queue, run

@@ -39,7 +39,7 @@ socket-patch alike.
 
 | Layer | Where | What it proves |
 |---|---|---|
-| Unit and golden | `socket-patch-core` lib tests; `tests/redirect_golden.rs` (`npm/vlt/*`, shared with depscan's TS rewriter), `tests/redirect_golden_reverse_replay.rs`, `tests/vlt_locks.rs` (captured locks of every era, and vendored wiring byte for byte against what real `vlt ci`, `vlt install --frozen-lockfile` and `vlt install <new>` keep on 1.2.0, 1.0.10, 1.0.4, 1.0.0-rc.32 and 1.0.0-rc.14) | DepID codec, collation (`tests/fixtures/vlt/collation-golden.json`), the node-line grammar, the hosted slot rewrite and its slot revert, vendored lock surgery and its inverse, lock inventory, VEX discovery |
+| Unit and golden | `socket-patch-core` lib tests; `tests/redirect_golden.rs` (`npm/vlt/*`, shared with the backend's TS rewriter), `tests/redirect_golden_reverse_replay.rs`, `tests/vlt_locks.rs` (captured locks of every era, and vendored wiring byte for byte against what real `vlt ci`, `vlt install --frozen-lockfile` and `vlt install <new>` keep on 1.2.0, 1.0.10, 1.0.4, 1.0.0-rc.32 and 1.0.0-rc.14) | DepID codec, collation (`tests/fixtures/vlt/collation-golden.json`), the node-line grammar, the hosted slot rewrite and its slot revert, vendored lock surgery and its inverse, lock inventory, VEX discovery |
 | Hermetic suites | `in_process_redirect`, `in_process_vendor`, `in_process_rollback_hosted`, `in_process_vendor_bun_takeover`, `repair::repair_vendor_flavors_e2e`, `e2e_vex_lockfile`, … (the 3-OS `test` job) | every code of the vlt support, the heal, takeovers, repair, the CLI surface |
 | Real-vlt capstones | the five binaries below plus the vlt legs of `e2e_hosted_production` / `e2e_vendored_production` | real installs: `vlt ci` and frozen installs of patched locks, byte-stable locks, integrity enforcement, the heal on a warm tree, re-saves, upgrades, the hardlinked global store |
 | Native backtest | `scripts/backtest-vlt.py` | the production service end to end, per release, mode and project shape, against an oracle of the documented boundaries |
@@ -73,7 +73,7 @@ asserted and each named test or row exists.
   collation golden, and the store linkers auto / hardlink / copy / unpack / a `/dev/shm`
   cache root; a cell `ci.yml`'s `e2e` rows run identically is left to them,
   see `scripts/ci-vlt-proof-suites.py`, except on dispatch); `native` (the backtest against production, artifacts
-  `vlt-results-<os>-<vlt>` in depscan's capture `result.json` shape; on macOS
+  `vlt-results-<os>-<vlt>` in the backend capture harness's `result.json` shape; on macOS
   it first pins the TLS-verified patch hosts in `/etc/hosts` through
   `.github/actions/pin-socket-hosts`, because the hosted macOS resolver
   intermittently loses `patch.socket.dev` for minutes while the service is up);
@@ -142,17 +142,16 @@ package contents after a real install from the restored lock.
 public npm (a `registry` equal to vlt's npmjs default is left out: vlt strips
 it from the lock anyway).
 
-## depscan parity
+## Backend parity
 
-depscan's TypeScript rewriter (`registry-rewrite/vlt.ts`) and its SBOM
-recognition implement the same spec.
-`crates/socket-patch-core/tests/fixtures/redirect/npm/vlt/*` is the single source of truth: depscan runs every case through its golden
-test from the `submodules/socket-patch` pin, with **no** `TS_LAGGING` or
-`TS_WARNING_DRIFT` entry for vlt, and `redirect_golden_reverse_replay.rs`
+The TypeScript rewriter in Socket's backend and its SBOM recognition
+implement the same spec.
+`crates/socket-patch-core/tests/fixtures/redirect/npm/vlt/*` is the single source of truth: the backend runs every case through its golden
+test from a pinned commit of this repository, with **no** lagging or
+warning-drift exception for vlt, and `redirect_golden_reverse_replay.rs`
 proves that socket-patch rolls back what either implementation wrote. The
-`vlt-results-*` artifacts and the cross-OS locks are imported into depscan's
-fixtures (`audit-captures.py`, `generate-fixtures.py --captures`) once the serve
-fix is live.
+`vlt-results-*` artifacts and the cross-OS locks are imported into the
+backend's fixtures once the serve fix is live.
 
 ## Real-vlt capstones
 
