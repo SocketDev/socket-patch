@@ -1082,6 +1082,37 @@ pub async fn read_candidate_files(
     // the poms of the modules that select it.
     if candidates.iter().any(|c| c.dep.ecosystem == "maven") {
         read_maven_reactor(view, unreadable, &mut out).await;
+        // The repository filter files hosted mode keeps under
+        // `.mvn/socket-patch/`, one per patch (so one already there is not
+        // written again, and one whose repository goes is retired), and
+        // Maven's JVM arguments (a resolver filter set there is the user's,
+        // which the rewriter then leaves alone). Advisory, like the module
+        // poms.
+        use crate::formats::maven::repository_filter;
+        let mut rels = vec![crate::patch::redirect::MVN_JVM_CONFIG.to_string()];
+        if let Ok(entries) = view.list_dir(repository_filter::DIR).await {
+            let mut names: Vec<String> = entries.into_iter().map(|e| e.name).collect();
+            names.sort();
+            // (Only a name in the exact grammar is a path segment.)
+            rels.extend(
+                names
+                    .iter()
+                    .filter(|name| {
+                        repository_filter::repository_of(name).is_some_and(|id| {
+                            crate::patch::redirect::generation::pin_name_uuid(id, false).is_some()
+                        })
+                    })
+                    .map(|name| format!("{}/{name}", repository_filter::DIR)),
+            );
+        }
+        for rel in rels {
+            if out.files.contains_key(&rel) {
+                continue;
+            }
+            if let Some(text) = read_advisory(view, unreadable, &rel).await {
+                out.files.insert(rel, text);
+            }
+        }
     }
 
     // NuGet merges the user config and every parent directory's config
@@ -6158,6 +6189,60 @@ snapshots:
         let (_, done) = gradle_rewrite(&p).await;
         assert!(done.rewrite.confirmed_gradle_uuids.contains(GRADLE_UUID));
         assert!(done.confirmed.is_empty(), "{:?}", done.confirmed);
+    }
+
+    /// A pin that lands writes the filter file of its Socket repository,
+    /// and the engine reads what the rewriter weighs for it: the filter
+    /// files the checkout already holds (one whose repository goes is
+    /// retired, none is written twice) and Maven's JVM arguments (a
+    /// prefix filter set there is the user's, and is left to them). On
+    /// disk and in memory alike.
+    #[tokio::test]
+    async fn the_maven_repository_filter_is_written_with_what_the_checkout_holds() {
+        use crate::formats::maven::repository_filter::file_rel;
+        let pom = "<project>\n  <modelVersion>4.0.0</modelVersion>\n  <groupId>x</groupId>\n  <artifactId>y</artifactId>\n  <version>1</version>\n  <dependencies>\n    <dependency>\n      <groupId>com.socketfixture</groupId>\n      <artifactId>victim</artifactId>\n      <version>1.10.0</version>\n    </dependency>\n  </dependencies>\n</project>\n";
+        let filter = file_rel(&format!("socket-patch-{GRADLE_UUID}"));
+        let earlier = file_rel("socket-patch-11111111-2222-4333-8444-555555555555");
+        let jvm = crate::patch::redirect::MVN_JVM_CONFIG;
+        let check = |read: &CandidateFiles, done: &Rewritten, theirs: bool| {
+            let files = &done.rewrite.files;
+            assert!(files["pom.xml"].contains("1.10.0-socket.4d5e6f70"));
+            assert_eq!(read.files.contains_key(jvm), theirs);
+            assert_eq!(
+                files.get(&filter).and_then(|text| text.lines().last()),
+                (!theirs).then_some("/com/socketfixture/victim/1.10.0-socket.4d5e6f70"),
+                "{:?}",
+                done.rewrite.warnings
+            );
+            assert_eq!(
+                done.rewrite
+                    .warnings
+                    .iter()
+                    .any(|w| w.code == "redirect_maven_repository_filter_conflict"),
+                theirs
+            );
+            // A file for a repository no pom declares is read, and left.
+            assert!(read.files.contains_key(&earlier), "{:?}", read.files.keys());
+            assert!(!files.contains_key(&earlier));
+        };
+        for theirs in [false, true] {
+            let mut p = MemoryProject::new();
+            p.insert_text("pom.xml", pom);
+            p.insert_text(&earlier, "");
+            let tmp = tempfile::tempdir().unwrap();
+            std::fs::write(tmp.path().join("pom.xml"), pom).unwrap();
+            std::fs::create_dir_all(tmp.path().join(".mvn/socket-patch")).unwrap();
+            std::fs::write(tmp.path().join(&earlier), "").unwrap();
+            if theirs {
+                let args = "-Xmx1g -Daether.remoteRepositoryFilter.prefixes=true\n";
+                p.insert_text(jvm, args);
+                std::fs::write(tmp.path().join(jvm), args).unwrap();
+            }
+            for view in [ProjectView::Memory(&p), ProjectView::Disk(tmp.path())] {
+                let (read, done) = gradle_rewrite_in(&view).await;
+                check(&read, &done, theirs);
+            }
+        }
     }
 
     /// #1809: a Maven 4 root whose subprojects Maven discovers (model

@@ -1786,6 +1786,17 @@ impl EjectSnapshot {
                 .iter()
                 .map(|s| s.to_string()),
         );
+        // A hosted Maven pin's restore also removes the repository filter
+        // files hosted mode keeps under `.mvn/socket-patch/`, one per patch.
+        const MVN_FILTER_DIR: &str = ".mvn/socket-patch";
+        if let Ok(mut dir) = tokio::fs::read_dir(root.join(MVN_FILTER_DIR)).await {
+            while let Ok(Some(entry)) = dir.next_entry().await {
+                planned.insert(format!(
+                    "{MVN_FILTER_DIR}/{}",
+                    entry.file_name().to_string_lossy()
+                ));
+            }
+        }
         let mut files = std::collections::BTreeMap::new();
         for rel in root_files.iter().chain(planned.iter()) {
             if files.contains_key(rel) {

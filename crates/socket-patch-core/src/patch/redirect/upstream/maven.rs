@@ -530,8 +530,10 @@ pub(crate) async fn restore(
         })
         .collect();
     dirs.insert(String::new());
+    let unscoped = unscope(view, &restored, &texts, &reactor_poms).await;
     for dir in dirs {
-        restore_mvn(view, &dir, &checksum_dirs, &mut result).await;
+        let unscoped = unscoped && dir.is_empty();
+        restore_mvn(view, &dir, &checksum_dirs, unscoped, &mut result).await;
     }
     result
         .handled
@@ -539,16 +541,77 @@ pub(crate) async fn restore(
     result
 }
 
+/// Remove the repository filter files (`.mvn/socket-patch/`) of the
+/// `restored` pins, and any whose repository no pom declares once the
+/// restore is written: a scan writes files and never removes one, so a
+/// patch it superseded or took out leaves its file behind. `true` when the
+/// directory then holds nothing, so the resolver lines that point Maven at
+/// it serve no file.
+async fn unscope(
+    view: &mut View<'_>,
+    restored: &[&str],
+    texts: &BTreeMap<String, String>,
+    reactor_poms: &BTreeMap<String, String>,
+) -> bool {
+    use crate::formats::maven::repository_filter;
+    let mut names = Vec::new();
+    match tokio::fs::read_dir(view.root().join(repository_filter::DIR)).await {
+        Ok(mut entries) => {
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                names.push(entry.file_name().to_string_lossy().into_owned());
+            }
+        }
+        // No directory: no file to take out, and none the lines serve.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return true,
+        Err(_) => return false,
+    }
+    names.sort();
+    let declared = |id: &str| {
+        let after = texts.iter().chain(
+            reactor_poms
+                .iter()
+                .filter(|(rel, _)| !texts.contains_key(*rel)),
+        );
+        after.into_iter().any(|(_, pom)| pom.contains(id))
+    };
+    let mut left = false;
+    for name in names {
+        let ours = repository_filter::repository_of(&name)
+            .and_then(|id| generation::pin_name_uuid(id, false).map(|uuid| (id, uuid)))
+            .filter(|(id, uuid)| restored.contains(uuid) || !declared(id));
+        let rel = format!("{}/{name}", repository_filter::DIR);
+        // Read first: the flush then knows the bytes it removes.
+        if ours.is_some() && matches!(view.read(&rel).await, Ok(Some(_))) {
+            view.remove(&rel);
+        } else {
+            left = true;
+        }
+    }
+    !left
+}
+
 /// Drop the restored pins' trusted-checksum lines, and the `.mvn` files
-/// themselves when nothing but hosted mode's content is left.
+/// themselves when nothing but hosted mode's content is left. With
+/// `unscoped`, the repository filter's resolver lines go first: they name
+/// a directory only hosted mode uses, so they are told from the user's.
 async fn restore_mvn(
     view: &mut View<'_>,
     dir: &str,
     checksum_dirs: &[String],
+    unscoped: bool,
     result: &mut FormatResult,
 ) {
     let sums_rel = format!("{dir}{MVN_CHECKSUMS}");
     let config_rel = format!("{dir}{MVN_CONFIG}");
+    if unscoped {
+        if let Ok(Some(config)) = view.read(&config_rel).await {
+            match crate::formats::maven::repository_filter::strip_config(&config) {
+                Some(rest) if rest.is_empty() => view.remove(&config_rel),
+                Some(rest) => view.write(&config_rel, rest),
+                None => {}
+            }
+        }
+    }
     let Ok(Some(sums)) = view.read(&sums_rel).await else {
         return;
     };
@@ -1055,6 +1118,35 @@ mod tests {
                 pin.uuid
             );
         }
+        // A repository filter file lists the version its repository is
+        // pinned to, or nothing once no pom declares that repository: one
+        // that listed anything else would fail the build of a pin.
+        use crate::formats::maven::repository_filter;
+        for (rel, text) in &tree {
+            let Some(name) = rel.strip_prefix(".mvn/socket-patch/") else {
+                continue;
+            };
+            let id = repository_filter::repository_of(name).expect("a filter file");
+            match pins
+                .iter()
+                .find(|pin| generation::hosted_pin_name(&pin.uuid) == id)
+            {
+                Some(pin) => assert_eq!(
+                    text.lines().last(),
+                    Some(format!("/org/slf4j/slf4j-api/1.7.36-socket.{}", &pin.uuid[..8]).as_str()),
+                    "{case}: {rel}"
+                ),
+                None => assert_eq!(text, "", "{case}: {rel} outlived its repository"),
+            }
+        }
+        // And every pin a scan of this release wired has one.
+        let scoped = tree
+            .get(MVN_CONFIG)
+            .is_some_and(|config| config.contains(repository_filter::DIR));
+        for pin in pins.iter().filter(|_| scoped) {
+            let rel = repository_filter::file_rel(&generation::hosted_pin_name(&pin.uuid));
+            assert!(tree.contains_key(&rel), "{case}: no {rel}");
+        }
         pins
     }
 
@@ -1154,10 +1246,12 @@ mod tests {
             assert_eq!(after.get(rel), Some(text), "{case}: {rel}");
         }
         // (A scan that took out the last pin itself cannot delete the
-        // `.mvn` files it once wrote: they stay, with no line of a patch.)
+        // `.mvn` files it once wrote: they stay, with no line of a patch,
+        // and a filter file with no line at all.)
         for rel in after.keys().filter(|rel| !before.contains_key(*rel)) {
+            let retired = rel.starts_with(".mvn/socket-patch/") && after[rel].is_empty();
             assert!(
-                [MVN_CONFIG, MVN_CHECKSUMS].contains(&rel.as_str()),
+                [MVN_CONFIG, MVN_CHECKSUMS].contains(&rel.as_str()) || retired,
                 "{case}: {rel} is left over"
             );
         }
@@ -1590,6 +1684,60 @@ mod tests {
             "{:?}",
             outcome.warnings
         );
+    }
+
+    /// The repository filter is taken out with its pin: the pin's file, a
+    /// file whose repository no pom declares any more (a scan retires one
+    /// and cannot remove it), and the two resolver lines, which name a
+    /// directory only hosted mode uses. A line of the user's stays where
+    /// it was, and so do the trusted-checksums lines beside it.
+    #[tokio::test]
+    async fn the_repository_filter_goes_with_its_pin() {
+        const FILTER: &str =
+            ".mvn/socket-patch/prefixes-socket-patch-77777777-7777-7777-7777-777777777777.txt";
+        const RETIRED: &str =
+            ".mvn/socket-patch/prefixes-socket-patch-66666666-6666-4666-8666-666666666666.txt";
+        let config = format!("-B\n{}", fixture("basic", "expected", ".mvn/maven.config"));
+        assert!(config.contains(".mvn/socket-patch"), "{config}");
+        let tree = |more: &[(&'static str, String)]| {
+            let mut files = vec![
+                ("pom.xml", fixture("basic", "expected", "pom.xml")),
+                (".mvn/maven.config", config.clone()),
+                (
+                    ".mvn/checksums/checksums.sha256",
+                    fixture("basic", "expected", ".mvn/checksums/checksums.sha256"),
+                ),
+                (FILTER, fixture("basic", "expected", FILTER)),
+                (RETIRED, String::new()),
+            ];
+            files.extend(more.iter().cloned());
+            files
+        };
+        let in_dir = |after: &BTreeMap<String, String>| -> Vec<String> {
+            after
+                .keys()
+                .filter(|rel| rel.starts_with(".mvn/socket-patch/"))
+                .cloned()
+                .collect()
+        };
+
+        let (outcome, after) = run(&tree(&[])).await;
+        assert_eq!(outcome.pins[0].status, PinStatus::Restored);
+        assert_eq!(after["pom.xml"], fixture("basic", "input", "pom.xml"));
+        assert_eq!(in_dir(&after), Vec::<String>::new());
+        assert_eq!(
+            after[".mvn/maven.config"],
+            format!("-B\n{}\n", super::MVN_CONFIG_ARGS.join("\n"))
+        );
+
+        // A file of the user's in that directory keeps the lines that make
+        // Maven read it.
+        const THEIRS: &str = ".mvn/socket-patch/prefixes-central.txt";
+        let theirs = "## repository-prefixes/2.0\n/org\n".to_string();
+        let (outcome, after) = run(&tree(&[(THEIRS, theirs)])).await;
+        assert_eq!(outcome.pins[0].status, PinStatus::Restored);
+        assert_eq!(in_dir(&after), [THEIRS]);
+        assert_eq!(after[".mvn/maven.config"], config);
     }
 
     #[tokio::test]

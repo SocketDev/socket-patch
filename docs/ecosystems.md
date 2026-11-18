@@ -1006,6 +1006,43 @@ Honest limits of the Maven and NuGet flows — documented behavior, not bugs:
   when `maven.config` enforces the file as Maven 3.9+ reads it (all five settings above
   with the values hosted writes; `failIfMissing` aside) and the wrapper, if any, pins
   Maven 3.9.4 or later.
+* **The Socket repository is asked only for the patched version (hosted Maven, 3.9.2+).**
+  Maven asks a `<repository>` a pom declares, before Maven Central, for every artifact
+  and parent pom its local repository does not hold yet. With each pin, hosted mode
+  therefore also writes a prefix file for
+  [Maven Resolver's remote repository filter](https://maven.apache.org/resolver/remote-repository-filtering.html),
+  `.mvn/socket-patch/prefixes-socket-patch-<uuid>.txt`, listing the one path that
+  repository serves (`/<group/path>/<artifact>/<version>-socket.<hex8>`), and two lines
+  in `.mvn/maven.config` that switch the `prefixes` filter on and point it at
+  `.mvn/socket-patch`. Maven then asks the Socket repository for the patched version's
+  jar and pom and for nothing else, from the project root, a module directory or with
+  `-f`. A repository with no file of its own in that directory is not filtered. This
+  needs **Maven 3.9.2 or later** (Maven 4 included). Before 3.9 the two properties mean
+  nothing, and 3.9.0 / 3.9.1 do not interpolate `${session.rootDirectory}`, so the file
+  is never found: those builds run as before, unfiltered. Behind a mirror the repository
+  takes the mirror's id, so its file is not read and nothing is filtered.
+  - **One directory per build.** The filter reads its files from one directory. When
+    `.mvn/maven.config` or `.mvn/jvm.config` already configures the prefix filter,
+    hosted mode writes neither the lines nor the file and warns
+    `redirect_maven_repository_filter_conflict`; the pin still lands and the Socket
+    repository stays unfiltered. To filter it yourself, list the path the warning names
+    in a `prefixes-socket-patch-<uuid>.txt` file of your own directory. A build that
+    switches the filter on from outside the checkout (the command line, `MAVEN_ARGS`)
+    and keeps its prefix files in the local repository's default directory stops reading
+    them once the two lines are committed: name that directory on the same command line
+    (`-Daether.remoteRepositoryFilter.prefixes.basedir=...`, which wins over
+    `maven.config`), or move the files into `.mvn/socket-patch/`.
+  - **Written with the pin.** A file that did not list the pinned version would fail
+    the build, so it is written from the pin's own coordinates, in the same run. A pin
+    an earlier release wrote gets no file on a re-scan (a re-run stays edit-free, as for
+    the Trusted Checksums): `rollback`, then `scan`, writes it. When a scan takes a
+    Socket repository out of the poms (a newer patch replaced it), that repository's
+    file is left empty: a scan writes files and removes none.
+  - **Taken out with the pin.** `rollback` and `remove` delete the files of the pins
+    they restore, and any whose repository no pom declares any more. Once the directory
+    is empty they also take the two lines out of `.mvn/maven.config`, byte for byte
+    (the lines name a directory only hosted mode uses, so they are told from yours); a
+    file of your own in that directory keeps them.
 * **A Maven project's scan is scoped to its dependency graph.** The Maven local
   repository is shared by every project on the machine, so in project mode (no
   `--global` / `--global-prefix`) a Maven build's crawl (a `pom.xml`, no Gradle or

@@ -17,6 +17,7 @@ pub(crate) use properties::{
 
 use super::xml::{blank_non_markup, child_text, elements, open_tags, Element};
 
+pub(crate) mod repository_filter;
 pub(crate) mod trusted_checksums;
 pub(crate) mod version;
 
