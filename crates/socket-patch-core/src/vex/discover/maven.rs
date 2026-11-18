@@ -222,10 +222,41 @@ pub(crate) async fn extract(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
     // none is attested. Only a root pom the reactor reader cannot parse
     // falls back to the single-pom reading below.
     use crate::vendor::jvm::maven_reactor::{heads_reactor_in, read_reactor, HostedReactor};
-    let texts = read_reactor(&ctx.view, &raw, config.as_deref(), |rel| async move {
-        ctx.read_text_quiet(&rel).await
+    // A pom that is there but is not UTF-8 text is reported as unreadable
+    // (as the root pom is), and stands as a pom of the reactor that could
+    // not be read: it may hold a pin, or declare the base version.
+    let undecodable = std::sync::Mutex::new(Vec::new());
+    let texts = read_reactor(&ctx.view, &raw, config.as_deref(), |rel| {
+        let undecodable = &undecodable;
+        async move {
+            match ctx.read_text_quiet(&rel).await {
+                Ok(text) => text,
+                Err(why) => {
+                    undecodable
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .push((rel, why));
+                    None
+                }
+            }
+        }
     })
     .await;
+    let mut undecodable = undecodable
+        .into_inner()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    undecodable.sort();
+    for (rel, why) in &undecodable {
+        out.diag(
+            super::DIAG_LOCKFILE_UNREADABLE,
+            rel,
+            format!("cannot read {rel}: {why}"),
+        );
+    }
+    let undecodable: Vec<String> = undecodable
+        .into_iter()
+        .map(|(rel, _)| format!("{rel} is there but is not UTF-8 text"))
+        .collect();
     let heads_reactor = heads_reactor_in(&ctx.view, &raw, config.as_deref()).await;
     let reactor = {
         let read = |rel: &str| texts.get(rel).map(|text| text.clone().into_bytes());
@@ -234,6 +265,9 @@ pub(crate) async fn extract(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
     };
     match reactor {
         Ok((reactor, unread)) if heads_reactor || reactor.scope().len() > 1 => {
+            // (The undecodable pom first: the reader below only knows that
+            // it found no pom there.)
+            let unread: Vec<String> = undecodable.iter().cloned().chain(unread).collect();
             extract_hosted_reactor(
                 ctx,
                 (&reactor, &unread),
@@ -253,6 +287,7 @@ pub(crate) async fn extract(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
                     .unwrap_or(&refusal.detail)
                     .to_string()
             });
+            let unread = undecodable.first().cloned().or(unread);
             extract_hosted(
                 ctx,
                 (&raw, &pom),
@@ -2440,6 +2475,38 @@ mod tests {
             "{}",
             out.unattested[0].detail
         );
+    }
+
+    /// A module pom that is there but is not UTF-8 text is not a missing
+    /// module: discovery says it cannot read the file, by name, and the
+    /// pins of the other poms are refs that are not attested, for that
+    /// reason and not for a pom the reactor "does not have".
+    #[tokio::test]
+    async fn an_undecodable_module_pom_is_reported_unreadable_not_missing() {
+        let pin = format!(
+            "<dependencyManagement>\n<dependencies>\n<!-- socket-patch {UUID_A}: \
+             org.slf4j:slf4j-api:1.7.36 -->\n{}</dependencies>\n</dependencyManagement>\n",
+            dep("org.slf4j", "slf4j-api", Some(&suffixed(UUID_A)))
+        );
+        let p = Project::new();
+        p.write("pom.xml", reactor_root(""));
+        p.write("a/pom.xml", reactor_module("a", &pin));
+        p.write("b/pom.xml", b"<project>\xff\xfe</project>");
+        let out = run(&p).await;
+        assert_eq!(sources(&out), ["a/pom.xml", "pom.xml"]);
+        assert_eq!(diag_codes(&out), vec![DIAG_LOCKFILE_UNREADABLE]);
+        assert!(
+            out.diagnostics[0].detail.contains("b/pom.xml"),
+            "{:?}",
+            out.diagnostics
+        );
+        assert_eq!(out.unattested.len(), 1, "{:?}", out.unattested);
+        let detail = &out.unattested[0].detail;
+        assert!(
+            detail.contains("b/pom.xml is there but is not UTF-8 text"),
+            "{detail}"
+        );
+        assert!(!detail.contains("has no pom"), "{detail}");
     }
 
     /// #1809: a Maven 4 (model 4.1.0) `pom`-packaged root listing no

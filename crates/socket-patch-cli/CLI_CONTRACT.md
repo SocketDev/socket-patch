@@ -3128,9 +3128,14 @@ A pom that still names the patched version and can no longer be read as a pom
 refuses the patch, with nothing changed.
 
 A reactor is read once per run, each pom fetched and parsed once, however many
-modules it has. A module pom that is a symbolic link, or that cannot be read as
-text, counts as missing: the reactor is then refused
-(`redirect_maven_multimodule_unsupported`), never the run. A single pom that
+modules it has. A module pom that is a symbolic link, or that cannot be opened,
+counts as missing: the reactor is then refused
+(`redirect_maven_multimodule_unsupported`), never the run. A pom of the reactor
+that is there but is not UTF-8 text is not missing: its content is unknown, so
+the scan refuses the run for it by name (`candidate_file_unreadable`, as for an
+undecodable root `pom.xml`), `vex` and `list` report it as unreadable and attest
+no pin of that reactor, and `rollback` / `remove` refuse every pin of it with
+nothing changed, since that pom may hold part of one. A single pom that
 inherits from a parent pom inside the checkout is read with that parent: a
 property the parent defines is rewritten there, and the repository goes in the
 parent the pom inherits it from.
