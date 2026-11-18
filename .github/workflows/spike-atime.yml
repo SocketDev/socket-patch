@@ -1,0 +1,56 @@
+name: SPIKE atime
+
+# Throwaway: never merge. Does this runner's filesystem record a file read
+# in the access time, when the access time is older than the mtime?
+
+on:
+  push:
+    branches: [spike/nokogiri-prebuild]
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04, depot-ubuntu-24.04-4, ubuntu-24.04-arm, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 5
+    steps:
+      - name: Probe
+        shell: bash
+        run: |
+          probe() {
+            dir="$1"
+            python3 - "$dir" <<'PY' || true
+          import os, sys, subprocess
+          d = sys.argv[1]
+          p = os.path.join(d, "atime-probe.txt")
+          open(p, "w").write("x" * 100)
+          st = os.stat(p)
+          os.utime(p, (1000000000, st.st_mtime))
+          open(p, "rb").read()
+          a = os.stat(p).st_atime
+          print(d, "records reads:", a != 1000000000)
+          os.remove(p)
+          PY
+          }
+          probe "$RUNNER_TEMP"
+          probe "$PWD"
+          probe /tmp
+          (findmnt -T "$RUNNER_TEMP" -o TARGET,FSTYPE,OPTIONS || mount | head -20) 2>/dev/null | cut -c1-200
+          if command -v docker >/dev/null 2>&1 && [ "$RUNNER_OS" = Linux ]; then
+            docker run --rm python:3.12-slim python3 -c '
+          import os
+          for d in ("/tmp", "/usr/local", "/root"):
+              p = os.path.join(d, "atime-probe.txt")
+              open(p, "w").write("x" * 100)
+              st = os.stat(p)
+              os.utime(p, (1000000000, st.st_mtime))
+              open(p, "rb").read()
+              print("container", d, "records reads:", os.stat(p).st_atime != 1000000000)
+          print(open("/proc/mounts").read().splitlines()[0][:200])
+          ' || true
+          fi
