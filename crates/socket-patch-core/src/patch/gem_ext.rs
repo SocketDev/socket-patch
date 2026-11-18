@@ -1467,19 +1467,55 @@ async fn run_ruby(
     }
 }
 
-/// The useful end of a failed build's stderr: RubyGems' trailing
-/// "Gem files will remain installed" boilerplate dropped, at most 20 lines.
+/// How many lines of a failed build's output its error carries.
+const DIAGNOSTIC_LINES: usize = 30;
+
+/// The line mkmf prints above every configuration option the failed
+/// `extconf.rb` accepts, one tab-indented line each.
+const MKMF_OPTIONS_HEADING: &str = "Provided configuration options:";
+
+/// How RubyGems starts its pointer to the `mkmf.log` of a failed
+/// `extconf.rb`; the log's path is the next line that is not blank.
+const MKMF_LOG_POINTER: &str = "To see why this extension failed to compile, please check the";
+
+/// The useful end of a failed build's stderr, at most [`DIAGNOSTIC_LINES`]
+/// lines of it. Dropped first, as they say nothing about the failure and
+/// are what RubyGems ends the output of a failed `extconf.rb` with:
+///
+/// * its trailing "Gem files will remain installed" boilerplate;
+/// * mkmf's list of configuration options, which is longer than the tail
+///   for most gems, so the lines that name the cause, printed before it,
+///   would be cut off;
+/// * its pointer to the build's `mkmf.log`. Every build this module runs
+///   is undone when it fails (the stage is removed, an in-place build's
+///   extension dir is replaced with the one it had), and the log with it.
 fn stderr_tail(stderr: &str) -> String {
     let text = stderr
         .split("\nGem files will remain installed")
         .next()
         .unwrap_or(stderr);
-    let lines: Vec<&str> = text
-        .lines()
-        .map(str::trim_end)
-        .filter(|l| !l.is_empty())
-        .collect();
-    let start = lines.len().saturating_sub(20);
+    let mut lines: Vec<&str> = Vec::new();
+    let (mut in_options, mut log_path_next) = (false, false);
+    for line in text.lines().map(str::trim_end) {
+        if line.is_empty() {
+            continue;
+        }
+        if std::mem::take(&mut in_options) && line.starts_with('\t') {
+            in_options = true;
+            continue;
+        }
+        if std::mem::take(&mut log_path_next) && line.ends_with("mkmf.log") {
+            continue;
+        }
+        if line == MKMF_OPTIONS_HEADING {
+            in_options = true;
+        } else if line.starts_with(MKMF_LOG_POINTER) {
+            log_path_next = true;
+        } else {
+            lines.push(line);
+        }
+    }
+    let start = lines.len().saturating_sub(DIAGNOSTIC_LINES);
     let tail = lines[start..].join("\n");
     if tail.is_empty() {
         "the build exited with an error and no output".to_string()
@@ -4467,6 +4503,9 @@ impl Job<'_> {
         result.success = false;
         result.files_patched.clear();
         result.applied_via.clear();
+        // What the written sources were advised about (`bundle install
+        // --redownload` reverts them) is not true of a copy put back.
+        result.sidecar = None;
         result.error = Some(format!("{BUILD_FAILED_CODE}: {detail}"));
         GemApplied {
             result,
@@ -4858,8 +4897,14 @@ pub async fn apply_gem_package_patch(
             BUILD_FAILED_CODE,
             format!(
                 "the native extension did not build from the patched sources ({inputs}); \
-                 nothing of the installed gem was changed. Install a compiler toolchain and \
-                 the Ruby headers and apply again.\n{diagnostic}"
+                 nothing of the installed gem was changed. {} was installed precompiled, so \
+                 nothing of it was built on this machine before: the rebuild needs what `gem \
+                 install {} --platform ruby` needs, which is a compiler toolchain, the Ruby \
+                 headers and the libraries the gem builds against. The build output below \
+                 says what failed; install what it names as missing and apply again.\
+                 \n{diagnostic}",
+                copy.full_name,
+                gem_name_of(&copy.full_name)
             ),
         ),
         failure => needs_source_gem(source.as_ref(), failure.describe(), remedy.is_some()),
@@ -4938,9 +4983,10 @@ async fn rebuild_in_place(
             };
             let detail = format!(
                 "the native extension did not build from the patched sources ({}); the \
-                 sources and the previous build were put back. Install a compiler toolchain \
-                 and the Ruby headers and apply again, or use `socket-patch scan --mode \
-                 hosted`.{both}\n{diagnostic}",
+                 sources and the previous build were put back. The build output below says \
+                 what failed: when it is a missing compiler, the Ruby headers or a library \
+                 the gem builds against, install that and apply again; otherwise use \
+                 `socket-patch scan --mode hosted`.{both}\n{diagnostic}",
                 job.inputs
             );
             job.not_built(result, &originals, detail).await
@@ -5499,8 +5545,12 @@ mod tests {
         let mut text: String = (0..30).map(|i| format!("line {i}\n")).collect();
         text.push_str("\nGem files will remain installed in /x for inspection.\n");
         let tail = stderr_tail(&text);
-        assert!(tail.starts_with("line 10"));
+        assert!(tail.starts_with("line 0\n"));
         assert!(tail.ends_with("line 29"));
+        let long: String = (0..45).map(|i| format!("line {i}\n")).collect();
+        let tail = stderr_tail(&long);
+        assert!(tail.starts_with("line 15\n"));
+        assert!(tail.ends_with("line 44"));
         assert_eq!(
             stderr_tail(""),
             "the build exited with an error and no output"

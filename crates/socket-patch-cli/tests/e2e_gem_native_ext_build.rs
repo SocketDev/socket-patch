@@ -2005,6 +2005,8 @@ fn a_failed_extconf_shows_its_cause_once() {
             1,
             "{case}: the failure is printed once: {stderr}"
         );
+        // Nor is a copy that was put back advised about what reverts its
+        // patch.
         assert!(!stderr.contains("Warning:"), "{case}: {stderr}");
         assert_tree(&proj.join("vendor"), &tree_before, &case);
 
@@ -2023,6 +2025,7 @@ fn a_failed_extconf_shows_its_cause_once() {
             }),
             "{case}: {stdout}"
         );
+        assert!(!stdout.contains("--redownload"), "{case}: {stdout}");
         assert_tree(&proj.join("vendor"), &tree_before, &case);
     }
 }

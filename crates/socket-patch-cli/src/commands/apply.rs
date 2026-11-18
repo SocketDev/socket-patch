@@ -1796,7 +1796,13 @@ pub(crate) async fn run_locked(
                     // Sources-unavailable codes restate the staging layer's
                     // own `Error:` diagnostic (already printed, even under
                     // --silent); they exist for the JSON envelope.
-                    if !is_stage_failure_code(&w.code) {
+                    //
+                    // So does the coded copy of a package's refusal (a gem
+                    // whose native extension cannot be rebuilt): the
+                    // package's own `Error: Failed to patch` line carries
+                    // the same text, and a build failure's is many lines
+                    // long (#2117).
+                    if !is_stage_failure_code(&w.code) && !restates_a_failure(w, &results) {
                         eprintln!("Warning: {}", w.detail);
                     }
                 }
@@ -2265,6 +2271,20 @@ const SOURCES_DOWNLOAD_FAILED: &str = "sources_download_failed";
 /// `Error:` line on the human path, so `run` keeps them for JSON only.
 fn is_stage_failure_code(code: &str) -> bool {
     code == OFFLINE_MISSING_SOURCES || code == SOURCES_DOWNLOAD_FAILED
+}
+
+/// Whether `warning` is the coded copy of a failed result's error (`<code>:
+/// <detail>`, how a gem refusal is carried for the JSON envelope): the
+/// human path already printed that text as the package's `Error: Failed to
+/// patch` line.
+fn restates_a_failure(warning: &RunWarning, results: &[ApplyResult]) -> bool {
+    results.iter().filter(|r| !r.success).any(|r| {
+        r.error
+            .as_deref()
+            .and_then(|error| error.strip_prefix(warning.code.as_str()))
+            .and_then(|rest| rest.strip_prefix(": "))
+            == Some(warning.detail.as_str())
+    })
 }
 
 /// Why nothing could be applied when the patch sources are unavailable —

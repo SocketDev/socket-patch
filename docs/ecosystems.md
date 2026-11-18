@@ -2046,8 +2046,13 @@ touched until the build has finished.
 An agent-mode rebuild needs a compiler toolchain and the Ruby headers (`ruby-dev` /
 `ruby-devel` on Linux distributions, the Xcode command line tools on macOS), the same
 requirements as `gem install` for the ruby-platform gem. It takes as long as that install: about
-a minute for nokogiri. When the build fails, the installed gem is left as it was and the package
-fails with `native_extension_build_failed`, showing the tail of the build output. When it can't
+a minute for nokogiri. A precompiled gem (`pg`, `nokogiri`, `ffi` and most others install that way)
+was never built on your machine, so its rebuild is the first time the gem's own build dependencies
+are needed: the libraries and headers it compiles against (`libpq-dev` for `pg`), which `bundle
+install` did without. When the build fails, the installed gem is left as it was and the package
+fails with `native_extension_build_failed`, showing the tail of the build output: the lines that
+say what failed, without mkmf's list of configuration options or its pointer to an `mkmf.log`,
+which is removed with the failed build. When it can't
 rebuild at all (a Bundler git checkout, no matching Ruby, no source gem for a precompiled gem),
 nothing is written and the package fails with `native_extensions_unsupported`.
 
