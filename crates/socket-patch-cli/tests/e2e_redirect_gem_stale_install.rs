@@ -2512,6 +2512,185 @@ async fn refresh_replaces_a_stale_platform_install_with_its_prebuild() {
     );
 }
 
+/// A shared gem home that holds BOTH builds of the gem's version: another
+/// project's ruby-platform copy (`gems/<name>-<version>`, patched in place
+/// there, its archive pruned) and the platform build this project's lock
+/// names. Which copy is this project's is the lock's to say, by leaf:
+///
+/// * the scan reports the stale PLATFORM build (the one Bundler loads here)
+///   and refreshes it on request. Judging the first dir of the version, the
+///   ruby-platform one, would call the gem patched and leave the loaded
+///   build unpatched and unreported;
+/// * `rollback` puts that platform build back on the upstream gem, and
+///   neither run judges, reports or replaces the ruby-platform copy the
+///   lock does not name.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn stale_guard_follows_the_builds_the_lock_names_in_a_home_with_both() {
+    let server = MockServer::start().await;
+    let (prebuilt, other_prebuilt) = (
+        real_gem_for(PATCHED_LIB, PLATFORM),
+        real_gem_for(PATCHED_LIB, OTHER_PLATFORM),
+    );
+    let (upstream, other_upstream) = (
+        real_gem_for(UPSTREAM_LIB, PLATFORM),
+        real_gem_for(UPSTREAM_LIB, OTHER_PLATFORM),
+    );
+    mount_api_with(
+        &server,
+        None,
+        &sha256_of(&real_gem(PATCHED_LIB)),
+        &[
+            (PLATFORM, sha256_of(&prebuilt)),
+            (OTHER_PLATFORM, sha256_of(&other_prebuilt)),
+        ],
+    )
+    .await;
+    let leaf = format!("{DEP}-{DEP_VERSION}-{PLATFORM}");
+    for (route, body) in [
+        (
+            format!("/patch-registry/gem/{TOKEN}/{UUID}/gems/{leaf}.gem"),
+            prebuilt.clone(),
+        ),
+        (format!("/upstream/gems/{leaf}.gem"), upstream.clone()),
+    ] {
+        Mock::given(method("GET"))
+            .and(path(route))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(body, "application/octet-stream"))
+            .mount(&server)
+            .await;
+    }
+    Mock::given(method("GET"))
+        .and(path(format!("/upstream/info/{DEP}")))
+        .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+            "---\n{DEP_VERSION}-{PLATFORM} |checksum:{}\n{DEP_VERSION}-{OTHER_PLATFORM} \
+             |checksum:{}\n",
+            sha256_of(&upstream),
+            sha256_of(&other_upstream),
+        )))
+        .mount(&server)
+        .await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    let lock = platform_lock(&sha256_of(&upstream), &sha256_of(&other_upstream));
+    std::fs::write(
+        proj.join("Gemfile"),
+        format!("source \"https://rubygems.org\"\ngem \"{DEP}\", \"{DEP_VERSION}\"\n"),
+    )
+    .unwrap();
+    std::fs::write(proj.join("Gemfile.lock"), &lock).unwrap();
+    // The shared home: the other project's ruby-platform copy first, then
+    // this project's platform build beside it.
+    let home = tmp.path().join("system-home");
+    let bin_dir = tmp.path().join("fake-bin");
+    let ruby_dir = stage_system_home_copy(&home, &bin_dir);
+    let ruby_archive = home.join("cache").join(format!("{DEP}-{DEP_VERSION}.gem"));
+    std::fs::write(ruby_dir.join("lib").join("stale_probe_gem.rb"), PATCHED_LIB).unwrap();
+    std::fs::remove_file(&ruby_archive).unwrap();
+    let platform_dir = install_real_gem_for(&home, UPSTREAM_LIB, PLATFORM);
+    let path_env = [("PATH", bin_dir.to_str().unwrap())];
+    let ruby_copy_untouched = || {
+        assert_eq!(
+            installed_lib(&ruby_dir),
+            PATCHED_LIB,
+            "the ruby-platform copy is not this project's"
+        );
+        assert!(!ruby_archive.exists(), "no archive is added beside it");
+    };
+
+    // The scan: the stale copy is the platform build, and a shared home is
+    // left alone.
+    let uri = server.uri();
+    let (code, stdout, stderr) =
+        common::run_with_env(&proj, &scan_args(&proj, &uri, &["--json"]), &path_env);
+    let env = common::parse_json_envelope(&stdout);
+    assert_eq!(code, 0, "{env}\nstderr:\n{stderr}");
+    assert_eq!(hosted_pinned(&env), 1, "{env}");
+    let stale = stale_warnings(&env);
+    assert_eq!(stale.len(), 1, "one stale copy, the platform build: {env}");
+    assert!(
+        stale[0].contains(&format!("install at {}, and", platform_dir.display())),
+        "{stale:?}"
+    );
+    assert_eq!(installed_lib(&platform_dir), UPSTREAM_LIB);
+    ruby_copy_untouched();
+
+    // On request the platform build is refreshed; the other copy is not.
+    let (code, stdout, stderr) = common::run_with_env(
+        &proj,
+        &scan_args(&proj, &uri, &["--json", "--gem-refresh-shared"]),
+        &path_env,
+    );
+    let env = common::parse_json_envelope(&stdout);
+    assert_eq!(code, 0, "{env}\nstderr:\n{stderr}");
+    assert!(stale_warnings(&env).is_empty(), "{env}");
+    let notes = warnings_with_code(&env, "redirect_gem_install_refreshed");
+    assert_eq!(notes.len(), 1, "{env}");
+    assert!(
+        notes[0].contains(&platform_dir.display().to_string()),
+        "{notes:?}"
+    );
+    assert_eq!(installed_lib(&platform_dir), PATCHED_LIB);
+    assert_eq!(
+        std::fs::read(home.join("cache").join(format!("{leaf}.gem"))).unwrap(),
+        prebuilt
+    );
+    ruby_copy_untouched();
+
+    // Rollback: the platform build goes back to the upstream gem. The
+    // ruby-platform copy holds the patch and has no archive, and is still
+    // none of this project's builds: it is neither reported nor replaced.
+    let rubygems = format!("{uri}/upstream");
+    let (code, stdout, stderr) = common::run_with_env(
+        &proj,
+        &[
+            "rollback",
+            PURL,
+            "--json",
+            "--gem-refresh-shared",
+            "--cwd",
+            proj.to_str().unwrap(),
+            "--api-url",
+            uri.as_str(),
+            "--org",
+            ORG,
+            "--api-token",
+            "fake",
+            "--patch-server-url",
+            uri.as_str(),
+        ],
+        &[
+            ("PATH", bin_dir.to_str().unwrap()),
+            ("SOCKET_RUBYGEMS_URL", rubygems.as_str()),
+        ],
+    );
+    let env: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("not JSON: {e}\n{stdout}\n{stderr}"));
+    assert_eq!(code, 0, "{env}\n{stderr}");
+    assert_eq!(
+        std::fs::read_to_string(proj.join("Gemfile.lock")).unwrap(),
+        lock,
+        "rollback restores the lock byte for byte"
+    );
+    assert_eq!(installed_lib(&platform_dir), UPSTREAM_LIB);
+    assert_eq!(
+        std::fs::read(home.join("cache").join(format!("{leaf}.gem"))).unwrap(),
+        upstream
+    );
+    assert_eq!(
+        warnings_with_code(&env, "upstream_gem_install_refreshed").len(),
+        1,
+        "{env}"
+    );
+    assert!(
+        warnings_with_code(&env, "upstream_gem_stale_install").is_empty(),
+        "the copy the lock does not name is not reported: {env}"
+    );
+    ruby_copy_untouched();
+}
+
 /// A fresh checkout: nothing is installed, and the lock names the gem only
 /// as platform builds. The hosted scan reads the gem from the lock alone
 /// and pins every build to its prebuild. With a prebuild missing for one

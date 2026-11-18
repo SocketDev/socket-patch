@@ -732,6 +732,82 @@ async fn gem_platform_prebuilds_round_trip() {
     }
 }
 
+/// A pin socket-patch 5.0 / 5.1 wrote as a `source … do` block, on a lock
+/// that names the gem as platform builds and cannot be converged (here
+/// `DEPENDENCIES` sits before the `GEM` section): the MIXED state the
+/// rewriter keeps. The platform entries still resolve from rubygems.org, so
+/// a prebuild's sha256 on them would fail every `bundle install` on a
+/// checksum mismatch. The rewrite writes none, and the unwind hands the
+/// lock back byte for byte. A lock that does carry prebuild sha256s on such
+/// entries is put back on the upstream ones all the same: the restore
+/// re-pins a platform entry however the lock wires the gem.
+#[tokio::test]
+#[serial]
+async fn gem_platform_builds_on_a_mixed_lock_keep_their_upstream_checksums() {
+    const DEPENDENCIES: &str = "DEPENDENCIES\n  nokogiri (= 1.18.10)\n  puma\n\n";
+    assert!(GEM_PLATFORM_LOCK.contains(DEPENDENCIES));
+    let lock = format!(
+        "{DEPENDENCIES}{}",
+        GEM_PLATFORM_LOCK.replace(DEPENDENCIES, "")
+    );
+    let gemfile =
+        "source \"https://rubygems.org\"\n\ngem \"nokogiri\", \"= 1.18.10\"\ngem \"puma\"\n";
+    let block_gemfile = format!(
+        "source \"https://rubygems.org\"\nsource \"{GEM_INDEX}\" do\n  gem \"nokogiri\", \"1.18.10\"\nend\ngem \"puma\"\n"
+    );
+    let overrides =
+        gem_override_prebuilt("nokogiri", "1.18.10", &["arm64-darwin", "x86_64-linux-gnu"]);
+    let pair = |lock: &str| {
+        BTreeMap::from([
+            ("Gemfile".to_string(), block_gemfile.clone()),
+            ("Gemfile.lock".to_string(), lock.to_string()),
+        ])
+    };
+
+    // The rewrite: the block is kept, and the lock is not touched.
+    let deps: Vec<DepOverride> = serde_json::from_value(overrides.clone()).unwrap();
+    let rewrite =
+        socket_patch_core::patch::redirect::rewrite_registry_redirect(&pair(&lock), &deps);
+    assert!(
+        rewrite.files.is_empty() && rewrite.edits.is_empty(),
+        "a mixed platform lock is left as it is: files={:?} edits={:?}",
+        rewrite.files.keys(),
+        rewrite.edits
+    );
+
+    // The unwind, over the pair the rewrite left and over one whose
+    // platform entries hold prebuild sha256s: the pre-scan lock both times.
+    let prebuild = "ab".repeat(32);
+    let pinned_to_prebuilds = lock
+        .replace(&"4".repeat(64), &prebuild)
+        .replace(&"5".repeat(64), &prebuild);
+    assert_ne!(pinned_to_prebuilds, lock);
+    let pin = HostedPin {
+        purl: "pkg:gem/nokogiri@1.18.10".into(),
+        uuid: GEM_UUID.into(),
+        files: vec!["Gemfile".into()],
+    };
+    for (label, hosted_lock) in [
+        ("as-rewritten", &lock),
+        ("prebuild-pins", &pinned_to_prebuilds),
+    ] {
+        let case = Case {
+            dir: PathBuf::from(format!("synthetic/mixed-platform-builds-{label}")),
+            input: BTreeMap::from([
+                ("Gemfile".to_string(), gemfile.to_string()),
+                ("Gemfile.lock".to_string(), lock.clone()),
+            ]),
+            expected: pair(hosted_lock),
+            overrides: overrides.as_array().unwrap().clone(),
+        };
+        let server = gem_mock(&case).await;
+        let _env = EnvGuard::set("SOCKET_RUBYGEMS_URL", server.uri());
+        let (after, statuses) =
+            run_case_with(&case, Some(vec![pin.clone()]), &RestoreOptions::default()).await;
+        assert_round_trip(&case, &after, &statuses);
+    }
+}
+
 #[tokio::test]
 #[serial]
 async fn gem_pre_checksums_states() {

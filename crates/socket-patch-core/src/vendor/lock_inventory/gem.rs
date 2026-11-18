@@ -74,6 +74,24 @@ pub async fn gem_platform_only_purls_in(view: &ProjectView<'_>) -> Vec<String> {
     }
 }
 
+/// The builds the Bundler lock bundler loads names for each gem of `purls`
+/// ([`locked_gem_builds`](crate::formats::gem::locked_gem_builds)): element
+/// `i` answers `purls[i]`. Empty for every gem when bundler loads no lock
+/// here, or it cannot be read.
+pub async fn gem_locked_builds_in(
+    view: &ProjectView<'_>,
+    purls: &[String],
+) -> Vec<Vec<crate::formats::gem::GemBuild>> {
+    let text = match bundler_loaded_lock_in(view).await {
+        Some(lock) => view.read_text(lock).await.ok(),
+        None => None,
+    };
+    match text {
+        Some(text) => crate::formats::gem::locked_gem_builds(&text, purls),
+        None => vec![Vec::new(); purls.len()],
+    }
+}
+
 /// Why the project's Bundler lock was not inventoried, when it holds gem
 /// files ([`GEM_FILES`]) but bundler loads no lock socket-patch reads
 /// ([`bundler_loaded_lock_diagnosed_in`]): an unsupported `BUNDLE_GEMFILE`

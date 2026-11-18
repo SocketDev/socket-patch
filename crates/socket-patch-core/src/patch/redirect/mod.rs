@@ -202,9 +202,39 @@ pub struct RegistryOverrideIdentifiers {
     /// for. Empty (or absent) when it serves the ruby gem alone. The gem
     /// rewriter moves a lock's platform entries only when every one of
     /// them is listed here.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient_gem_platforms")]
     #[cfg_attr(test, serde(skip_serializing_if = "Vec::is_empty"))]
     pub gem_platforms: Vec<GemPlatformChecksum>,
+}
+
+/// `gemPlatforms` as the patch API may send it, read so that the field can
+/// never fail the response it rides in: one reference response answers for
+/// every package of a batch, and a strict reading of this optional list
+/// would cost all of them their grant. `null`, or anything that is no list,
+/// is no prebuild. An entry without a `platform` or a `gemChecksumSha256`
+/// string (missing, `null`, empty, another type) is dropped: that platform
+/// has no prebuild, so a lock that names it keeps the skip. What an entry
+/// that IS two strings holds is checked later, per grant ([`grant::check`]).
+fn lenient_gem_platforms<'de, D>(deserializer: D) -> Result<Vec<GemPlatformChecksum>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Value::deserialize(deserializer)?;
+    let text = |entry: &Value, key: &str| {
+        let text = entry.get(key)?.as_str()?;
+        (!text.is_empty()).then(|| text.to_string())
+    };
+    Ok(value
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| {
+            Some(GemPlatformChecksum {
+                platform: text(entry, "platform")?,
+                gem_checksum_sha256: text(entry, "gemChecksumSha256")?,
+            })
+        })
+        .collect())
 }
 
 /// One prebuild of a gem patch: a patched platform gem that is a drop-in
@@ -8319,57 +8349,9 @@ fn plan_gem_redirect(
     };
 
     // ── The lock ────────────────────────────────────────────────────────
-    let mut unchecked = false;
-    // One `CHECKSUMS` entry per build the lock names, each pinned to its
-    // own patched archive. The last one first: an entry the section lacks
-    // goes right under the header, so several end up in `checksums` order.
-    let mut checksum_edits: Vec<FileEdit> = Vec::new();
-    for (token, sha256) in checksums.iter().rev() {
-        let new_val = format!("{name} ({token}) sha256={sha256}");
-        // The entry for exactly `name (token)`, read with the shared
-        // Bundler-lock grammar the discovery reader uses — whatever digests
-        // it carries (bare, uppercase, several algorithms), so it is
-        // REPLACED, never shadowed by a second, conflicting entry.
-        if let Some((start, end)) = checksum_entry_span(&lk, name, token) {
-            let old_val = lk[start + 2..end].to_string();
-            // Already redirected (re-run): the entry is at the target value.
-            if old_val != new_val {
-                lk.replace_range(start + 2..end, &new_val);
-                lock_changed = true;
-                // The pre-edit entry is recorded verbatim as `original`.
-                checksum_edits.push(FileEdit {
-                    path: lock_name.into(),
-                    kind: "redirect_gemfile_lock_checksum".into(),
-                    action: "rewritten".into(),
-                    key: Some(dep.name.clone()),
-                    original: Some(Value::String(old_val)),
-                    new: Some(Value::String(new_val)),
-                });
-            }
-        } else if GEM_CHECKSUMS_HEADER_RE.is_match(&lk) {
-            // A closure, not a template: the entry is written as it is, in
-            // the header's own line ending (the capture).
-            lk = GEM_CHECKSUMS_HEADER_RE
-                .replace(&lk, |header: &regex::Captures<'_>| {
-                    let cr = &header[1];
-                    format!("CHECKSUMS{cr}\n  {new_val}{cr}")
-                })
-                .to_string();
-            lock_changed = true;
-            checksum_edits.push(FileEdit {
-                path: lock_name.into(),
-                kind: "redirect_gemfile_lock_checksum".into(),
-                action: "added".into(),
-                key: Some(dep.name.clone()),
-                original: None,
-                new: Some(Value::String(new_val)),
-            });
-        } else {
-            unchecked = true;
-        }
-    }
-    staged.edits.extend(checksum_edits.into_iter().rev());
-
+    // Where the `CHECKSUMS` edits go among the plan's edits: they are
+    // decided once the source attribution below is known.
+    let checksum_edits_at = staged.edits.len();
     let mut mixed = false;
     match wiring {
         GemWiring::Option => match layout {
@@ -8528,6 +8510,70 @@ fn plan_gem_redirect(
             mixed = !(converged || merged || (merged_refreshed && bundled_before_2_2(&lk)));
         }
     }
+    // One `CHECKSUMS` entry per build the lock names, each pinned to its
+    // own patched archive. A gem locked as platform builds is pinned only
+    // when its entries really moved: on a lock that stays MIXED they still
+    // resolve from the upstream registry, and a prebuild's sha256 on them
+    // would fail every `bundle install` on a checksum mismatch.
+    let platform_builds = checksums.iter().any(|(token, _)| *token != dep.version);
+    let mut unchecked = false;
+    // The last one first: an entry the section lacks goes right under the
+    // header, so several end up in `checksums` order.
+    let mut checksum_edits: Vec<FileEdit> = Vec::new();
+    let pinned = if mixed && platform_builds {
+        &[][..]
+    } else {
+        checksums
+    };
+    for (token, sha256) in pinned.iter().rev() {
+        let new_val = format!("{name} ({token}) sha256={sha256}");
+        // The entry for exactly `name (token)`, read with the shared
+        // Bundler-lock grammar the discovery reader uses — whatever digests
+        // it carries (bare, uppercase, several algorithms), so it is
+        // REPLACED, never shadowed by a second, conflicting entry.
+        if let Some((start, end)) = checksum_entry_span(&lk, name, token) {
+            let old_val = lk[start + 2..end].to_string();
+            // Already redirected (re-run): the entry is at the target value.
+            if old_val != new_val {
+                lk.replace_range(start + 2..end, &new_val);
+                lock_changed = true;
+                // The pre-edit entry is recorded verbatim as `original`.
+                checksum_edits.push(FileEdit {
+                    path: lock_name.into(),
+                    kind: "redirect_gemfile_lock_checksum".into(),
+                    action: "rewritten".into(),
+                    key: Some(dep.name.clone()),
+                    original: Some(Value::String(old_val)),
+                    new: Some(Value::String(new_val)),
+                });
+            }
+        } else if GEM_CHECKSUMS_HEADER_RE.is_match(&lk) {
+            // A closure, not a template: the entry is written as it is, in
+            // the header's own line ending (the capture).
+            lk = GEM_CHECKSUMS_HEADER_RE
+                .replace(&lk, |header: &regex::Captures<'_>| {
+                    let cr = &header[1];
+                    format!("CHECKSUMS{cr}\n  {new_val}{cr}")
+                })
+                .to_string();
+            lock_changed = true;
+            checksum_edits.push(FileEdit {
+                path: lock_name.into(),
+                kind: "redirect_gemfile_lock_checksum".into(),
+                action: "added".into(),
+                key: Some(dep.name.clone()),
+                original: None,
+                new: Some(Value::String(new_val)),
+            });
+        } else {
+            unchecked = true;
+        }
+    }
+    staged.edits.splice(
+        checksum_edits_at..checksum_edits_at,
+        checksum_edits.into_iter().rev(),
+    );
+
     // A pair bundler would refuse is never committed. (The one state left
     // unchecked is an earlier release's block on a lock that cannot be
     // converged: it is reported, as before, by `redirect_gem_frozen_install`.)
@@ -8613,10 +8659,16 @@ fn rewrite_gem(
     // `PATH`, `PLUGIN SOURCE`): header + whether it is socket-patch's own
     // vendored wiring. Read once — the rewrites below only touch `GEM`
     // sections and CHECKSUMS, never these.
-    let non_registry: BTreeMap<String, (String, bool)> = lock
-        .as_deref()
-        .map(|lk| {
-            crate::formats::gem::parse(lk)
+    // The lock as it was handed in, parsed once for every gem: the
+    // rewrites below move specs and re-pin checksums, and neither changes
+    // which section kinds or which builds the lock names for another gem.
+    let handed_in = files
+        .get(lock_name)
+        .map(|lk| crate::formats::gem::parse(lk));
+    let non_registry: BTreeMap<String, (String, bool)> = handed_in
+        .as_ref()
+        .map(|parsed| {
+            parsed
                 .non_registry_sources()
                 .into_iter()
                 .map(|(name, s)| {
@@ -8705,7 +8757,7 @@ fn rewrite_gem(
 
         // What `CHECKSUMS` pins for the gem: the ruby gem's sha256 under
         // `name (version)`, unless the lock names platform builds.
-        let mut checksums = vec![(dep.version.clone(), sha256)];
+        let mut checksums = vec![(dep.version.clone(), sha256.clone())];
         // Platform-specific builds (`name (version-arm64-darwin)` among the
         // specs or the CHECKSUMS entries): bundler installs the build of
         // the machine it runs on, so the redirect holds only when the patch
@@ -8714,8 +8766,8 @@ fn rewrite_gem(
         // With one missing, a machine of that platform would be sent to a
         // registry that has no gem for it (or keep the upstream build under
         // the ruby gem's sha256): skip the dep entirely.
-        if let Some(lk) = lock.as_deref() {
-            let builds = crate::formats::gem::parse(lk).locked_builds(&dep.name, &dep.version);
+        if let Some(parsed) = &handed_in {
+            let builds = parsed.locked_builds(&dep.name, &dep.version);
             if !builds.platforms.is_empty() {
                 let prebuilt = |platform: &str| {
                     ov.identifiers
@@ -8723,12 +8775,14 @@ fn rewrite_gem(
                         .iter()
                         .find(|prebuild| prebuild.platform == platform)
                 };
-                let entry =
-                    |platform: &&str| format!("`{} ({}-{platform})`", dep.name, dep.version);
-                let missing: Vec<String> = builds
-                    .platforms
-                    .iter()
-                    .filter(|platform| prebuilt(platform).is_none())
+                // Every build the lock names, the ruby-platform one first.
+                let ids = builds.ids(&dep.name, &dep.version);
+                let entry = |id: &crate::patch::gem_source::GemId| {
+                    format!("`{} ({})`", id.name, id.token())
+                };
+                let platform_builds = || ids.iter().filter(|id| id.platform.is_some());
+                let missing: Vec<String> = platform_builds()
+                    .filter(|id| id.platform.as_deref().and_then(prebuilt).is_none())
                     .map(entry)
                     .collect();
                 // Bundler < 2.2 lists every source in one GEM section, where
@@ -8764,27 +8818,25 @@ fn rewrite_gem(
                              {why}; redirect skipped",
                             dep.name,
                             dep.version,
-                            builds
-                                .platforms
-                                .iter()
-                                .map(entry)
-                                .collect::<Vec<_>>()
-                                .join(", "),
+                            platform_builds().map(entry).collect::<Vec<_>>().join(", "),
                         ),
                     });
                     continue;
                 }
-                // The ruby gem's entry stays only where the lock has one
-                // beside the platform builds (the registry serves it too).
-                if !builds.ruby {
-                    checksums.clear();
-                }
-                checksums.extend(builds.platforms.iter().filter_map(|platform| {
-                    Some((
-                        format!("{}-{platform}", dep.version),
-                        prebuilt(platform)?.gem_checksum_sha256.clone(),
-                    ))
-                }));
+                // Each build's entry takes its own archive's sha256. The
+                // ruby gem's is among them only where the lock has that
+                // entry beside the platform builds (the registry serves it
+                // too).
+                checksums = ids
+                    .iter()
+                    .filter_map(|id| {
+                        let sha256 = match id.platform.as_deref() {
+                            Some(platform) => prebuilt(platform)?.gem_checksum_sha256.clone(),
+                            None => sha256.clone(),
+                        };
+                        Some((id.token(), sha256))
+                    })
+                    .collect();
             }
         }
 

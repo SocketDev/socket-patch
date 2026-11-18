@@ -4522,6 +4522,74 @@ mod tests {
         );
     }
 
+    /// One reference response answers for a whole batch. A prebuild entry
+    /// that IS a platform and a checksum, but not in the shape the lock
+    /// takes, fails the grant it rides in and no other: the gem is skipped
+    /// with the field named, and the other package keeps its candidate.
+    #[test]
+    fn a_wrong_gem_prebuild_fails_only_its_own_grant() {
+        const GEM: &str = "pkg:gem/nokogiri@1.18.10";
+        const NPM: &str = "pkg:npm/c@1";
+        const GEM_UUID: &str = "5e6f7081-92a3-4b4c-8d5e-6f708192a3b4";
+        let refs = HashMap::from([
+            (
+                GEM_UUID.to_string(),
+                reference(serde_json::json!({
+                    "status": "granted",
+                    "url": format!("https://patch.example/patch/gem/t/{GEM_UUID}/nokogiri-1.18.10.gem"),
+                    "purl": GEM,
+                    "artifacts": [{"kind": "tarball", "url": null, "integrity": {
+                        "sha256": "a".repeat(64)
+                    }}],
+                    "registryOverride": {
+                        "kind": "rubygems-compact-index",
+                        "indexUrl": format!("https://patch.example/patch-registry/gem/t/{GEM_UUID}/"),
+                        "identifiers": {
+                            "name": "nokogiri", "version": "1.18.10",
+                            "gemChecksumSha256": "a".repeat(64),
+                            "gemPlatforms": [
+                                {"platform": "arm64-darwin", "gemChecksumSha256": "not-a-digest"}
+                            ]
+                        }
+                    }
+                })),
+            ),
+            (
+                PATCH_UUID.to_string(),
+                reference(serde_json::json!({
+                    "status": "granted",
+                    "url": format!("https://patch.example/patch/npm/c/1/tok/{PATCH_UUID}/c-1.tgz"),
+                    "purl": NPM,
+                    "artifacts": [{"kind": "tarball", "url": null, "integrity": {
+                        "sha512": "sha512-x", "sha1": "a".repeat(40)
+                    }}],
+                    "registryOverride": null
+                })),
+            ),
+        ]);
+        let selected = vec![
+            (GEM.to_string(), GEM_UUID.to_string()),
+            (NPM.to_string(), PATCH_UUID.to_string()),
+        ];
+        let (mut skipped, mut warnings) = (Vec::new(), Vec::new());
+        let candidates = build_candidates(&selected, &refs, &[], &mut skipped, &mut warnings);
+        let kept: Vec<&str> = candidates.iter().map(|c| c.purl.as_str()).collect();
+        assert_eq!(kept, [NPM], "{skipped:?}");
+        assert_eq!(skipped.len(), 1, "{skipped:?}");
+        assert_eq!(
+            (skipped[0].purl.as_str(), skipped[0].reason.as_str()),
+            (GEM, GRANT_MALFORMED)
+        );
+        assert!(
+            skipped[0]
+                .detail
+                .as_deref()
+                .unwrap()
+                .contains("its gem platform checksum is not 64 hex digits"),
+            "{skipped:?}"
+        );
+    }
+
     /// A granted cargo reference for `uuid` (a canonical uuid), with no
     /// registry override.
     fn cargo_reference(

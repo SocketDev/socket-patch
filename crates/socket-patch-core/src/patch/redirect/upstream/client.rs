@@ -624,14 +624,17 @@ impl UpstreamClient {
         }
         // The document is read once per gem: the builds of one version
         // (a gem locked for several platforms) are lines of the same one.
-        let info = self.rubygems_info.lock().await.get(name).cloned();
-        let result = match info {
-            Some(info) => info.and_then(|(url, text)| checksum_in(&url, &text, token)),
+        // A build is looked up in the cached copy where it lies.
+        let lookup = |info: &GemInfo| match info {
+            Ok((url, text)) => checksum_in(url, text, token),
+            Err(why) => Err(why.clone()),
+        };
+        let cached = self.rubygems_info.lock().await.get(name).map(lookup);
+        let result = match cached {
+            Some(result) => result,
             None => {
                 let fetched = self.rubygems_info_at(rubygems_secure_base(), name).await;
-                let result = fetched
-                    .clone()
-                    .and_then(|(url, text)| checksum_in(&url, &text, token));
+                let result = lookup(&fetched);
                 self.rubygems_info
                     .lock()
                     .await

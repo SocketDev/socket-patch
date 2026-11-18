@@ -29,6 +29,7 @@ pub(crate) mod ruby;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::OnceLock;
 
+use crate::patch::gem_source::GemId;
 use crate::utils::digest::sha256_hex;
 use crate::utils::purl::simple_purl;
 use crate::vendor::lock_inventory::{http_url, LockIntegrity, LockfileEntry, SourceKind};
@@ -314,6 +315,98 @@ pub(crate) struct LockedBuilds<'t> {
     pub(crate) platforms: BTreeSet<&'t str>,
     /// A ruby-platform `name (version)` entry is among them.
     pub(crate) ruby: bool,
+}
+
+impl LockedBuilds<'_> {
+    /// The builds as releases of `name` at `version`, in Bundler's order:
+    /// the ruby-platform gem (when the lock names it), then each platform
+    /// build. A [`GemId`] spells a build's lock token and its file name,
+    /// so the rewrite, the restore and the refresh all take them from here.
+    pub(crate) fn ids(&self, name: &str, version: &str) -> Vec<GemId> {
+        let id = |platform: Option<&str>| GemId {
+            name: name.to_string(),
+            version: version.to_string(),
+            platform: platform.map(str::to_string),
+        };
+        let ruby = self.ruby.then(|| id(None));
+        ruby.into_iter()
+            .chain(self.platforms.iter().map(|platform| id(Some(platform))))
+            .collect()
+    }
+}
+
+/// One build of a gem version as RubyGems installs it and Bundler's cache
+/// dir archives it: the ruby-platform gem, or a precompiled platform gem.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct GemBuild {
+    /// `<name>-<version>[-<platform>]`: the name of its gem dir, its
+    /// gemspec and its `.gem` archive.
+    pub leaf: String,
+    /// `None` for the ruby-platform gem.
+    pub platform: Option<String>,
+}
+
+impl GemBuild {
+    fn of(id: &GemId) -> GemBuild {
+        GemBuild {
+            leaf: id.full_name(),
+            platform: id.platform.clone(),
+        }
+    }
+
+    /// The ruby-platform build of the gem `purl` (`None`: no gem purl).
+    pub fn ruby(purl: &str) -> Option<GemBuild> {
+        let (name, version) = gem_coordinates(purl)?;
+        Some(GemBuild::of(&GemId {
+            name,
+            version,
+            platform: None,
+        }))
+    }
+
+    /// The build of the gem `purl` that a gem dir or archive named `leaf`
+    /// holds; `None` when `leaf` names no build of that version (another
+    /// gem whose name starts the same way: a platform starts with a
+    /// letter, see `is_platform_dir_of`).
+    pub fn of_leaf(purl: &str, leaf: &str) -> Option<GemBuild> {
+        let ruby = GemBuild::ruby(purl)?;
+        if leaf == ruby.leaf {
+            return Some(ruby);
+        }
+        let (name, version) = gem_coordinates(purl)?;
+        crate::crawlers::ruby_crawler::is_platform_dir_of(leaf, &name, &version).then(|| GemBuild {
+            leaf: leaf.to_string(),
+            platform: Some(leaf[ruby.leaf.len() + 1..].to_string()),
+        })
+    }
+}
+
+/// The name and version of the gem `purl`, qualifiers dropped.
+fn gem_coordinates(purl: &str) -> Option<(String, String)> {
+    let (ecosystem, name, version) = crate::utils::purl::purl_parts(purl)?;
+    (ecosystem == "gem").then_some((name, version))
+}
+
+/// The builds the Bundler lock text `lock` names for each gem of `purls`
+/// ([`GemfileLock::locked_builds`]), the ruby-platform gem first: element
+/// `i` answers `purls[i]`, and is empty when the lock names no build of it
+/// (or it is no gem purl). The lock is parsed once for all of them. This is
+/// the one answer to "which builds of this gem are this project's": an
+/// installed copy or a cached archive of any other build (another project's,
+/// in a shared gem home) is not.
+pub fn locked_gem_builds(lock: &str, purls: &[String]) -> Vec<Vec<GemBuild>> {
+    let lock = crate::utils::line_endings::to_lf(lock);
+    let parsed = parse(&lock);
+    purls
+        .iter()
+        .map(|purl| {
+            let Some((name, version)) = gem_coordinates(purl) else {
+                return Vec::new();
+            };
+            let ids = parsed.locked_builds(&name, &version).ids(&name, &version);
+            ids.iter().map(GemBuild::of).collect()
+        })
+        .collect()
 }
 
 impl<'t> GemfileLock<'t> {
@@ -798,6 +891,44 @@ mod tests {
             lock.locked_builds("nokogiri", "1.18"),
             LockedBuilds::default()
         );
+        // The same reader, as the builds a refresh looks for on disk.
+        let purls = [
+            "pkg:gem/nokogiri@1.18.10?platform=ruby".to_string(),
+            "pkg:gem/racc@1.8.1".to_string(),
+            "pkg:gem/absent@1.0.0".to_string(),
+            "pkg:npm/nokogiri@1.18.10".to_string(),
+        ];
+        let leaves: Vec<Vec<String>> = locked_gem_builds(&text, &purls)
+            .into_iter()
+            .map(|builds| builds.into_iter().map(|build| build.leaf).collect())
+            .collect();
+        assert_eq!(
+            leaves,
+            [
+                vec![
+                    "nokogiri-1.18.10-arm64-darwin".to_string(),
+                    "nokogiri-1.18.10-java".to_string(),
+                    "nokogiri-1.18.10-x86_64-linux-gnu".to_string()
+                ],
+                vec!["racc-1.8.1".to_string()],
+                vec![],
+                vec![],
+            ]
+        );
+        let purl = "pkg:gem/nokogiri@1.18.10";
+        assert_eq!(
+            GemBuild::of_leaf(purl, "nokogiri-1.18.10-arm64-darwin")
+                .and_then(|build| build.platform)
+                .as_deref(),
+            Some("arm64-darwin")
+        );
+        assert_eq!(
+            GemBuild::of_leaf(purl, "nokogiri-1.18.10"),
+            GemBuild::ruby(purl)
+        );
+        // `nokogiri-1.18.10` at version `2.0`, and another version.
+        assert_eq!(GemBuild::of_leaf(purl, "nokogiri-1.18.10-2.0"), None);
+        assert_eq!(GemBuild::of_leaf(purl, "nokogiri-1.18.9-java"), None);
         // The registry inventory lists only gems with a ruby-platform
         // entry; hosted discovery asks for the platform-only ones apart.
         assert_eq!(
