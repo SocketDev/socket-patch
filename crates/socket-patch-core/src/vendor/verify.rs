@@ -131,7 +131,18 @@ pub async fn verify_vendored_patch_record(
         path_str.ends_with(".whl") || path_str.ends_with(".nupkg") || path_str.ends_with(".jar");
     if !is_tarball && !is_zip {
         let cargo_uuid = (entry.ecosystem == "cargo").then_some(entry.uuid.as_str());
-        verify_dir_members(&artifact, record, cargo_uuid).await?;
+        match gem_platform_trees(&artifact, entry).await? {
+            // A gem vendored as precompiled platform gems: bundler loads
+            // the tree of whichever platform it runs on, so every one of
+            // them must carry the patch.
+            Some(trees) => {
+                let inventoried = entry.artifact.file_inventory.is_some();
+                for tree in &trees {
+                    verify_platform_tree_members(tree, record, inventoried).await?;
+                }
+            }
+            None => verify_dir_members(&artifact, record, cargo_uuid).await?,
+        }
         // Whole-tree cross-check: a dir-shaped artifact's bytes are covered
         // by NO lockfile integrity (bundler path sources, cargo path deps,
         // …), so the members above are the only thing the record can vouch
@@ -220,6 +231,93 @@ async fn verify_dir_members(
             VerifyStatus::Ready | VerifyStatus::HashMismatch => {
                 return Err("vendor_hash_mismatch".to_string())
             }
+            VerifyStatus::NotFound => return Err("file_not_found".to_string()),
+        }
+    }
+    Ok(())
+}
+
+/// The prebuild trees of a gem vendored as precompiled platform gems
+/// (`<artifact>/<platform>/`, see [`super::gem`]'s module docs); `None`
+/// for every other dir-shaped artifact, whose files sit in the artifact dir
+/// itself. The ledger entry names the trees. An entry synthesized from a
+/// lockfile reference names none, so the layout is then read off the
+/// artifact: no `<name>.gemspec` at its root (every gem vendored as its own
+/// tree has one there) and one in each platform's subdirectory.
+async fn gem_platform_trees(
+    artifact: &Path,
+    entry: &VendorEntry,
+) -> Result<Option<Vec<PathBuf>>, String> {
+    if entry.ecosystem != "gem" {
+        return Ok(None);
+    }
+    if !entry.gem_platforms.is_empty() {
+        // SECURITY: state.json is committed and tamper-able, and each
+        // platform is about to name a directory that gets stat'd and hashed.
+        if !entry
+            .gem_platforms
+            .iter()
+            .all(|platform| super::gem::is_platform_dir_name(platform))
+        {
+            return Err("vendor_path_unsafe".to_string());
+        }
+        let trees = entry.gem_platforms.iter().map(|p| artifact.join(p));
+        return Ok(Some(trees.collect()));
+    }
+    let Some((name, _)) = crate::utils::purl::parse_gem_purl(&entry.base_purl) else {
+        return Ok(None);
+    };
+    let stub = format!("{name}.gemspec");
+    let is_file = |path: PathBuf| async move {
+        tokio::fs::symlink_metadata(path)
+            .await
+            .is_ok_and(|m| m.is_file())
+    };
+    if is_file(artifact.join(&stub)).await {
+        return Ok(None);
+    }
+    let mut trees = Vec::new();
+    let Ok(mut entries) = tokio::fs::read_dir(artifact).await else {
+        return Ok(None);
+    };
+    while let Ok(Some(child)) = entries.next_entry().await {
+        // `file_type` does not follow links: a linked tree is no tree.
+        if child.file_type().await.is_ok_and(|t| t.is_dir())
+            && is_file(child.path().join(&stub)).await
+        {
+            trees.push(child.path());
+        }
+    }
+    trees.sort();
+    Ok((!trees.is_empty()).then_some(trees))
+}
+
+/// [`verify_dir_members`] for one prebuild tree of a gem vendored as
+/// platform gems: every record file the tree holds must hash to its
+/// afterHash. A record file the tree does NOT hold is the patch of a source
+/// the platform gem never shipped (it ships the compiled extension, built
+/// from the patched source by the patch service), which is accepted only
+/// when the entry's file inventory pins the whole tree to the bytes that
+/// were vendored (`inventoried`); with no inventory a missing member fails,
+/// like in any other artifact.
+async fn verify_platform_tree_members(
+    tree: &Path,
+    record: &PatchRecord,
+    inventoried: bool,
+) -> Result<(), String> {
+    if !tokio::fs::symlink_metadata(tree)
+        .await
+        .is_ok_and(|m| m.is_dir())
+    {
+        return Err("file_not_found".to_string());
+    }
+    for (file_name, info) in &record.files {
+        match verify_file_patch(tree, file_name, info).await.status {
+            VerifyStatus::AlreadyPatched => {}
+            VerifyStatus::Ready | VerifyStatus::HashMismatch => {
+                return Err("vendor_hash_mismatch".to_string())
+            }
+            VerifyStatus::NotFound if inventoried => {}
             VerifyStatus::NotFound => return Err("file_not_found".to_string()),
         }
     }

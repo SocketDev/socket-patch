@@ -104,6 +104,18 @@ impl VerifiedArchive {
         self.sha256_hex
             .get_or_init(|| crate::utils::digest::sha256_hex_of(&self.bytes))
     }
+
+    /// The served artifact of `kind` for the gem platform `platform`, if
+    /// the service lists one.
+    pub(crate) fn platform_secondary(
+        &self,
+        kind: &str,
+        platform: &str,
+    ) -> Option<&SecondaryArtifact> {
+        self.secondary
+            .iter()
+            .find(|a| a.kind == kind && a.platform.as_deref() == Some(platform))
+    }
 }
 
 #[derive(Debug)]
@@ -325,10 +337,32 @@ pub(crate) async fn fetch_verified_secondary(
     archive: &VerifiedArchive,
     kind: &str,
 ) -> SecondaryArtifactResult {
+    fetch_verified_artifact(cfg, archive.secondary.iter().find(|a| a.kind == kind)).await
+}
+
+/// [`fetch_verified_secondary`] for an artifact served once per gem
+/// platform (`gem-platform`, `gem-platform-stub-gemspec`): the one of
+/// `kind` whose `platform` is exactly `platform`, the token `Gemfile.lock`
+/// spells.
+pub(crate) async fn fetch_verified_platform_secondary(
+    cfg: &VendorServiceConfig,
+    archive: &VerifiedArchive,
+    kind: &str,
+    platform: &str,
+) -> SecondaryArtifactResult {
+    fetch_verified_artifact(cfg, archive.platform_secondary(kind, platform)).await
+}
+
+/// Download `artifact` and verify the bytes against its own sha512 SRI;
+/// `Absent` when the service referenced no such artifact.
+async fn fetch_verified_artifact(
+    cfg: &VendorServiceConfig,
+    artifact: Option<&SecondaryArtifact>,
+) -> SecondaryArtifactResult {
     let Some(client) = cfg.client.as_ref() else {
         return SecondaryArtifactResult::Failed("vendor service not configured".to_string());
     };
-    let Some(artifact) = archive.secondary.iter().find(|a| a.kind == kind) else {
+    let Some(artifact) = artifact else {
         return SecondaryArtifactResult::Absent;
     };
 
@@ -753,6 +787,7 @@ mod tests {
             secondary: vec![SecondaryArtifact {
                 prefetched: None,
                 kind: "gem-stub-gemspec".into(),
+                platform: None,
                 url: format!("{}/stub", server.uri()),
                 integrity_sri: PackedTarball::from_bytes(b"x").integrity,
             }],

@@ -1665,6 +1665,7 @@ impl ApiClient {
                 };
                 secondary_artifacts.push(SecondaryArtifact {
                     kind: a.kind.clone(),
+                    platform: a.platform.clone(),
                     url,
                     integrity_sri: normalize_sha512_sri(sha512),
                     prefetched: None,
@@ -2127,6 +2128,9 @@ pub(crate) struct FetchedVendorPackage {
 #[derive(Debug, Clone)]
 pub(crate) struct SecondaryArtifact {
     pub kind: String,
+    /// The gem platform a `gem-platform` / `gem-platform-stub-gemspec`
+    /// artifact is for; `None` on every other kind.
+    pub platform: Option<String>,
     pub url: String,
     /// Normalized `sha512-<b64>` of the artifact bytes.
     pub integrity_sri: String,

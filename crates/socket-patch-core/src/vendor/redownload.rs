@@ -231,17 +231,36 @@ pub async fn restore(
             "gem" => {
                 let (name, _) =
                     parse_gem_purl(&entry.base_purl).ok_or("invalid gem coordinates")?;
-                super::gem::gem_service_copy(
-                    Some(service),
-                    record,
-                    &name,
-                    &stage,
-                    uuid_dir,
-                    true,
-                    &mut warnings,
-                )
-                .await
-                .map_err(|outcome| detail(*outcome))?;
+                // A gem vendored as platform gems is restored from the
+                // prebuild of each platform the ledger names.
+                let copied = match entry.gem_platforms.as_slice() {
+                    [] => {
+                        super::gem::gem_service_copy(
+                            Some(service),
+                            record,
+                            &name,
+                            &stage,
+                            uuid_dir,
+                            true,
+                            &mut warnings,
+                        )
+                        .await
+                    }
+                    platforms => {
+                        super::gem::gem_platform_service_copy(
+                            Some(service),
+                            record,
+                            &name,
+                            platforms,
+                            &stage,
+                            uuid_dir,
+                            true,
+                            &mut warnings,
+                        )
+                        .await
+                    }
+                };
+                copied.map_err(|outcome| detail(*outcome))?;
             }
             "npm" => {
                 let (name, version) = super::npm_common::parse_npm_purl(&entry.base_purl)
