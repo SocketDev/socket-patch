@@ -1371,16 +1371,13 @@ mod tests {
         );
     }
 
-    /// The `event_type` strings depscan's `/v0/orgs/:slug/telemetry`
-    /// endpoint maps onto the `patch-lifecycle` ClickHouse category
-    /// (`PATCH_EVENT_TYPES_BY_STRING` in depscan's
-    /// `workspaces/api-v0/src/endpoints/orgs/telemetry-discriminators.ts`,
-    /// mirroring `TelemetryEventType` in
-    /// `workspaces/analytics-shared/src/telemetry/types.ts`). A type missing
-    /// there is still stored, but lands as `event_type = 'external'` and
-    /// drops out of every patch dashboard — so a new event type here needs
-    /// the depscan map extended first, then this list.
-    const DEPSCAN_PATCH_EVENT_TYPES: &[&str] = &[
+    /// The `event_type` strings the Socket API's `/v0/orgs/:slug/telemetry`
+    /// endpoint maps onto its `patch-lifecycle` category. A type missing
+    /// from the server's map is still stored, but lands as
+    /// `event_type = 'external'` and drops out of every patch dashboard —
+    /// so a new event type here needs the server's map extended first,
+    /// then this list.
+    const SERVER_PATCH_EVENT_TYPES: &[&str] = &[
         "patch_applied",
         "patch_apply_failed",
         "patch_removed",
@@ -1413,18 +1410,18 @@ mod tests {
     fn every_event_type_is_one_the_backend_maps() {
         for event_type in PatchTelemetryEventType::ALL {
             assert!(
-                DEPSCAN_PATCH_EVENT_TYPES.contains(&event_type.as_str()),
-                "{} is not in depscan's patch event map",
+                SERVER_PATCH_EVENT_TYPES.contains(&event_type.as_str()),
+                "{} is not in the server's patch event map",
                 event_type.as_str()
             );
         }
     }
 
-    /// The body shape depscan's v0 telemetry handler reads. It pulls
+    /// The body shape the Socket API's v0 telemetry handler reads. It pulls
     /// `event_sender_created_at` / `event_kind` / `artifact_purl` /
     /// `input_purl` / `client_action` / `alert_action` / `user_agent` out
     /// as columns and keeps the rest as extra-data JSON, deriving the
-    /// ClickHouse discriminators from `event_type` (and `context.source`).
+    /// stored discriminators from `event_type` (and `context.source`).
     /// Two of those matter here:
     ///
     /// * no `event_kind`: an event without one is "required" and is stored

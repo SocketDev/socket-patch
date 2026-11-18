@@ -245,11 +245,7 @@ impl<'a> ViewFallback<'a> {
                     .fetch_patch(uuid)
                     .await
                     .ok()
-                    .flatten()
-                    .map(|view| {
-                        socket_patch_core::manifest::records::record_from_patch_response(&view).1
-                    })
-                    .filter(|record| record.uuid == uuid && !record.files.is_empty()),
+                    .and_then(|view| gem_refresh::view_record(view, uuid)),
                 None => None,
             };
             self.fetched.insert(uuid.to_string(), record);

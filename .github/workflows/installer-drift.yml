@@ -4,9 +4,9 @@ name: Installer drift
 # scripts/install.sh — the README says so, and the whole point of hosting the
 # installer on a Socket domain is that the bytes are auditable against this
 # repository. Nothing enforces that at publish time from this side: the copy is
-# published out of depscan's vendored `submodules/socket-patch` pin, so an
-# installer change merged here is not live until that pin is bumped and depscan
-# deploys (see docs/installer-hosting.md).
+# published by Socket's deploy from a pinned commit of this repository, so an
+# installer change merged here is not live until that pin is bumped and
+# deployed (see docs/installer-hosting.md).
 #
 # This job is the watchdog for that gap. It is deliberately NOT part of CI: it
 # checks a deployed artifact, not the diff, and a red run here means "go bump
@@ -71,7 +71,7 @@ jobs:
         if: steps.fetch.outputs.deployed == 'true'
         run: |
           if ! diff -u scripts/install.sh hosted-install.sh; then
-            echo "::error::install.socket.dev/patch has drifted from scripts/install.sh. Fix: bump submodules/socket-patch in depscan to this commit and deploy — see docs/installer-hosting.md."
+            echo "::error::install.socket.dev/patch has drifted from scripts/install.sh. Fix: Socket has to bump its pinned commit of this repository and deploy — see docs/installer-hosting.md."
             exit 1
           fi
           echo "install.socket.dev/patch matches scripts/install.sh"

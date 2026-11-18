@@ -865,7 +865,7 @@ def main():
                 row["passed"] = False
                 return row
             # Manifest-less VEX over the installed fresh clone (what a hosted /
-            # depscan-vendored checkout has): lockfile discovery + the public
+            # GitHub-app-vendored checkout has): lockfile discovery + the public
             # patch API must attest; offline without ledgers must not; a
             # reverted lock must never keep a leftover ledger alive.
             manifestless_vex(case, fresh, mode, uuid, pristine_lock, check, info)
