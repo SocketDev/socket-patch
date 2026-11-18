@@ -3919,6 +3919,25 @@ mod tests {
         );
     }
 
+    /// #2091: a refusal that another mode does not share says so. `detail`
+    /// names `socket-patch scan --mode <m>` for exactly the modes in
+    /// `modes`, so it never sends the user to a mode that refuses the gem
+    /// as well.
+    fn assert_names_other_modes(detail: &str, modes: &[&str]) {
+        for mode in ["hosted", "agent"] {
+            let named = detail.contains(&format!("--mode {mode}"));
+            assert_eq!(
+                named,
+                modes.contains(&mode),
+                "`--mode {mode}` named={named}: {detail}"
+            );
+        }
+        assert!(
+            detail.contains("`socket-patch scan --mode "),
+            "the remedy is a command the user can run: {detail}"
+        );
+    }
+
     #[tokio::test]
     async fn test_refuses_native_extensions() {
         let (_tmp, root, installed, blobs, record) = fixture(GEMFILE_DIRECT, LOCK_DIRECT).await;
@@ -3939,6 +3958,7 @@ mod tests {
             unwrap_refused(run_vendor(&root, &blobs, &installed, &record, false).await);
         assert_eq!(code, "native_extensions_unsupported");
         assert!(detail.contains("native extensions"));
+        assert_names_other_modes(&detail, &["hosted", "agent"]);
         assert!(!root.join(".socket").exists());
         // Neither file touched.
         assert_eq!(
@@ -3960,9 +3980,11 @@ mod tests {
         let platform_dir = installed.parent().unwrap().join("rack-3.2.6-x86_64-linux");
         tokio::fs::rename(&installed, &platform_dir).await.unwrap();
 
-        let (code, _d) =
+        let (code, detail) =
             unwrap_refused(run_vendor(&root, &blobs, &platform_dir, &record, false).await);
         assert_eq!(code, "platform_gem_unsupported");
+        // Hosted mode refuses a precompiled build too, so it is not named.
+        assert_names_other_modes(&detail, &["agent"]);
         assert!(!root.join(".socket").exists());
     }
 
@@ -3978,8 +4000,10 @@ mod tests {
         let odd_dir = installed.parent().unwrap().join("random-unrelated");
         tokio::fs::rename(&installed, &odd_dir).await.unwrap();
 
-        let (code, _d) = unwrap_refused(run_vendor(&root, &blobs, &odd_dir, &record, false).await);
+        let (code, detail) =
+            unwrap_refused(run_vendor(&root, &blobs, &odd_dir, &record, false).await);
         assert_eq!(code, "platform_gem_unsupported");
+        assert_names_other_modes(&detail, &["agent"]);
         assert!(!root.join(".socket").exists());
     }
 
@@ -3999,6 +4023,7 @@ mod tests {
             detail.contains("x86_64-linux"),
             "refusal names the offending platform: {detail}"
         );
+        assert_names_other_modes(&detail, &["agent"]);
         assert!(!root.join(".socket").exists(), "refusal must write nothing");
     }
 
@@ -4042,6 +4067,12 @@ mod tests {
             unwrap_refused(run_vendor(&root, &blobs, &installed, &record, false).await);
         assert_eq!(code, "gemfile_declaration_not_editable");
         assert!(detail.contains("indented"), "{detail}");
+        // #2091: both ways out are named, the first with this gem's name.
+        assert!(
+            detail.contains("`gem \"rack\", group: :test`"),
+            "names the top-level `group:` form: {detail}"
+        );
+        assert_names_other_modes(&detail, &["hosted"]);
         assert!(!root.join(".socket").exists());
         assert_eq!(
             tokio::fs::read_to_string(root.join(GEMFILE)).await.unwrap(),
@@ -7084,8 +7115,9 @@ mod tests {
             )),
         )
         .await;
-        let (code, _) = unwrap_refused(outcome);
+        let (code, detail) = unwrap_refused(outcome);
         assert_eq!(code, "native_extensions_unsupported");
+        assert_names_other_modes(&detail, &["hosted", "agent"]);
     }
 
     /// `--offline` + `--vendor-source=service` refuses without any network.
@@ -9729,6 +9761,7 @@ mod tests {
         let (code, detail) = refusal.expect("an indented declaration is not editable");
         assert_eq!(code, "gemfile_declaration_not_editable");
         assert!(detail.contains("indented"), "{detail}");
+        assert_names_other_modes(&detail, &["hosted"]);
         // A preflight: the hosted pair is never written, even though the
         // caller's options are a wet run.
         assert_eq!(std::fs::read_to_string(dir.join(GEMFILE)).unwrap(), gemfile);
