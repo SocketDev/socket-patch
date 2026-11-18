@@ -2109,6 +2109,45 @@ async fn scan_project(
         }
         layout_refusals.push((render::PROJECTS_NOT_SCANNED.to_string(), detail));
     }
+    // A bare agent-mode scan patches the copies the crawl above found, so
+    // it covers the one project at `--cwd`. It names the project
+    // directories below whose packages that crawl did not read (#2125):
+    // without it the run reads as empty, or as a success for the checkout.
+    // PATHs scope the run to what the user named, and a run for one
+    // directory of several (`carry`) leaves the rest to its parent.
+    let mut projects_left = false;
+    if apply && args.paths.is_empty() && args.rollout.carry.is_none() {
+        use crate::commands::projects_below;
+        let left =
+            projects_below::not_crawled(&args.common, &invocation.policy, &invocation.repo_root)
+                .await;
+        if let Some(first) = left.dirs.first() {
+            let shown: Vec<String> = left
+                .dirs
+                .iter()
+                .map(|dir| projects_below::shown_project_dir(&args.common.cwd, dir))
+                .collect();
+            // The run for a directory is asked as this one was: only an
+            // explicit `--mode` converts a project (#1088).
+            let scan = if args.sync {
+                "scan --sync"
+            } else if mode_explicit {
+                "scan --mode agent"
+            } else {
+                "scan"
+            };
+            let command = projects_below::project_command(first, &args.common, scan);
+            let detail = render::unscanned_agent_projects_detail(&shown, &command);
+            layout_refusals.push((render::PROJECTS_NOT_SCANNED.to_string(), detail));
+            projects_left = true;
+        }
+        if left.truncated {
+            layout_refusals.push((
+                projects_below::PROJECTS_BELOW_NOT_SEARCHED.to_string(),
+                projects_below::NOT_CRAWLED_TRUNCATED.to_string(),
+            ));
+        }
+    }
     // A token whose org could not be resolved put the whole run on the
     // public proxy (the client already warned on stderr): `--json`
     // consumers get it on the same run-level `warnings[]` channel.
@@ -2570,13 +2609,16 @@ async fn scan_project(
                 ) {
                     println!("{line}");
                 }
-            } else if !lockfile_only.unsupported.is_empty() {
-                // A lockfile or layout that could not be read is why
-                // nothing was found (its warning is on stderr): an install
-                // is not the fix.
+            } else if !lockfile_only.unsupported.is_empty() || projects_left {
+                // A lockfile or layout that could not be read, or project
+                // directories below that this run left, is why nothing
+                // was found (its warning is on stderr): an install is not
+                // the fix.
                 println!(
                     "{}",
-                    render::no_packages_unreadable(lockfile_only.unsupported.len())
+                    render::no_packages_unreadable(
+                        lockfile_only.unsupported.len() + usize::from(projects_left)
+                    )
                 );
             } else if !policy.root_excluded() {
                 println!(
