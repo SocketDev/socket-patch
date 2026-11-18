@@ -350,10 +350,11 @@ fn vex_and_check_refuse_an_unpatched_platform_variant_copy() {
 /// specifications/<leaf>.gemspec cache/<leaf>.gem && bundle install`)
 /// leaves the old platform build's `gems/<leaf>/` dir behind with no
 /// gemspec, beside the installed ruby-platform build. RubyGems and Bundler
-/// load a gem by its gemspec alone, so that dir is not an installed copy: `vex` attests the patched ruby-platform
-/// build, `apply --check` reports it in sync, and `apply` leaves the dir
-/// alone. With its gemspec back, the platform build is a copy again and
-/// both gates refuse it (#1092).
+/// load a gem by its gemspec alone, so that dir is not an installed copy:
+/// `vex` attests the patched ruby-platform build and `apply --check`
+/// reports it in sync. With its gemspec back, the platform build is a copy
+/// again and both gates refuse it (#1092). `apply` and `rollback` write and
+/// restore the dir either way.
 #[test]
 fn the_leftover_dir_of_an_unlisted_platform_build_is_not_a_copy() {
     let tmp = tempfile::tempdir().unwrap();
@@ -376,13 +377,7 @@ fn the_leftover_dir_of_an_unlisted_platform_build_is_not_a_copy() {
         code, 0,
         "apply --check\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
-    let (code, v) = run_json(&root, &["apply"]);
-    assert_eq!(code, 0, "apply; envelope={v}");
-    assert_eq!(
-        std::fs::read(&platform_file).unwrap(),
-        original,
-        "apply must not write to a dir that is not installed; envelope={v}"
-    );
+    assert_eq!(std::fs::read(&platform_file).unwrap(), original);
 
     // The platform build installed again (its gemspec is back): RubyGems
     // loads it, and it is unpatched.
@@ -399,6 +394,20 @@ fn the_leftover_dir_of_an_unlisted_platform_build_is_not_a_copy() {
         "apply --check must flag the installed platform copy\
          \nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
+
+    // The write paths never skipped the dir: with its gemspec gone again,
+    // `apply` still patches it and `rollback` still restores it, so no
+    // patched file is left that nothing tracks.
+    std::fs::remove_file(specs.join("rack-3.1.0-x86_64-linux.gemspec")).unwrap();
+    std::fs::write(&plain_file, &original).unwrap();
+    let (code, v) = run_json(&root, &["apply"]);
+    assert_eq!(code, 0, "apply; envelope={v}");
+    assert_eq!(std::fs::read(&plain_file).unwrap(), patched);
+    assert_eq!(std::fs::read(&platform_file).unwrap(), patched);
+    let (code, v) = run_json(&root, &["rollback", "--yes"]);
+    assert_eq!(code, 0, "rollback; envelope={v}");
+    assert_eq!(std::fs::read(&plain_file).unwrap(), original);
+    assert_eq!(std::fs::read(&platform_file).unwrap(), original);
 }
 
 /// #1092, global mode: `apply -g --global-prefix <gem home>/gems` patches
