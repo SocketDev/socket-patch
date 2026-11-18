@@ -134,11 +134,12 @@ pub async fn vendor_refusals(
         })
         .copied()
         .collect();
-    let takeover_refusals = if takeovers.is_empty()
-        || tokio::fs::metadata(project_root.join("pnpm-lock.yaml"))
-            .await
-            .is_err()
-    {
+    // A pnpm project: its root lock, or a Rush monorepo's own locks.
+    let pnpm_lock = tokio::fs::metadata(project_root.join("pnpm-lock.yaml"))
+        .await
+        .is_ok()
+        || super::pnpm_lock::rush::routes(project_root).await.is_ok();
+    let takeover_refusals = if takeovers.is_empty() || !pnpm_lock {
         HashMap::new()
     } else {
         super::pnpm_takeover_lock_text_refusals(project_root, &takeovers).await

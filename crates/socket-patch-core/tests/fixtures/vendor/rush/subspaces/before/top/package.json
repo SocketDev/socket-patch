@@ -1,0 +1,8 @@
+{
+  "version": "1.0.0",
+  "private": true,
+  "name": "top",
+  "devDependencies": {
+    "minimist": "0.0.8"
+  }
+}

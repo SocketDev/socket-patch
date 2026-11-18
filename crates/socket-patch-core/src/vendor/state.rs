@@ -768,7 +768,7 @@ fn state_path(project_root: &Path) -> PathBuf {
 /// One deliberate exception to fail-closed: a parseable JSON object that is
 /// clearly a DIFFERENT Socket ledger (it carries a `mode` tag and no
 /// `entries` — e.g. an early registry-redirect ledger committed to this path
-/// by the depscan GitHub-app flow) is treated as an empty vendor ledger
+/// by the Socket GitHub-app flow) is treated as an empty vendor ledger
 /// instead of bricking every vendor-adjacent command (`remove`, `vendor`,
 /// `repair`) with `vendor_state_unreadable`. Such a file carries no vendor
 /// data by construction, so nothing is guessed.
@@ -1225,6 +1225,17 @@ async fn wiring_file_refusal(rec: &WiringRecord, project_root: &Path) -> Option<
         "yarn_berry_resolution" | "yarn_berry_lock_entry" | "yarn_berry_lock_entry_pruned" => {
             one_of(&["yarn.lock", "package.json"])
         }
+        // The Rush layout records the same lock kinds against Rush's own
+        // locks, plus its config override and project manifest edits.
+        kind if kind.starts_with("pnpm_lock_") && super::pnpm_lock::rush::is_lock_rel(file) => None,
+        super::pnpm_lock::rush::KIND_GLOBAL_OVERRIDE => unless(
+            super::pnpm_lock::rush::is_pnpm_config(file),
+            "a Rush pnpm-config.json",
+        ),
+        super::pnpm_lock::rush::KIND_PROJECT_DEP => unless(
+            super::pnpm_lock::rush::is_project_manifest(file),
+            "a Rush project's package.json",
+        ),
         kind if kind.starts_with("pnpm_lock_")
             || kind.starts_with("pnpm_pkg_")
             || kind.starts_with("pnpm_ws_") =>
@@ -2387,7 +2398,7 @@ mod tests {
     }
 
     /// A mode-tagged NON-vendor ledger squatting on this path (an early
-    /// registry-redirect ledger committed by the depscan GitHub-app flow)
+    /// registry-redirect ledger committed by the Socket GitHub-app flow)
     /// must read as an EMPTY vendor ledger, not brick `remove`/`vendor`/
     /// `repair` with vendor_state_unreadable. A vendor-shaped file that is
     /// genuinely corrupt stays fail-closed.

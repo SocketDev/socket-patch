@@ -262,7 +262,7 @@ echo "===INSTALLED JSON VERIFIED==="
 
 # Manifest-less VEX legs (in-container, offline: the network is cut). The
 # ledger + committed artifact travelled with the checkout; the manifest is
-# what a depscan PR / detached checkout lacks.
+# what a GitHub-app PR / detached checkout lacks.
 PSR_VER=$(cat /workspace/snap/psr-ver)
 PURL="pkg:composer/psr/log@$PSR_VER"
 PRODUCT="pkg:composer/app@1.0.0"

@@ -1,0 +1,28 @@
+{
+  "$schema": "https://developer.microsoft.com/json-schemas/rush/v5/rush.schema.json",
+  "rushVersion": "5.182.1",
+  "pnpmVersion": "10.34.9",
+  "nodeSupportedVersionRange": ">=18.0.0",
+  "projectFolderMinDepth": 1,
+  "projectFolderMaxDepth": 3,
+  "projects": [
+    {
+      "packageName": "app",
+      "projectFolder": "apps/app"
+    },
+    {
+      "packageName": "util",
+      "projectFolder": "libs/util"
+    },
+    {
+      "packageName": "cli",
+      "projectFolder": "tools/deep/cli",
+      "subspaceName": "team-b"
+    },
+    {
+      "packageName": "top",
+      "projectFolder": "top",
+      "subspaceName": "team-b"
+    }
+  ]
+}
