@@ -368,6 +368,13 @@ fn repoint_both_ways(lock: &str, steps: &[Step]) -> usize {
             })
         };
         let fresh = CargoLock::parse(&text).ok();
+        // The whole model, then the probes themselves.
+        assert_eq!(
+            held.model().map(CargoLock::packages),
+            fresh.as_ref().map(CargoLock::packages),
+            "{}",
+            context()
+        );
         assert_eq!(
             probes(held.model()),
             probes(fresh.as_ref()),
@@ -390,7 +397,7 @@ fn repoint_both_ways(lock: &str, steps: &[Step]) -> usize {
                 text = content;
             }
             if let Some(planned) = planned {
-                assert_eq!(held.commit(planned), edits, "{}", context());
+                assert_eq!(planned.commit(), edits, "{}", context());
             }
         }
     }
@@ -482,33 +489,42 @@ fn a_package_planned_again_is_read_as_its_first_repoint_left_it() {
     assert_eq!(repoint_both_ways(&lock, &steps), 2);
 }
 
-/// A v1 lock with a stray `[metadata]` line for the id a repoint gives the
-/// package: the repoint makes that key a duplicate and the lock stops
-/// parsing. The crates after it are then refused, as they were when every
-/// crate parsed the lock, and none is repointed on a lock cargo cannot
-/// read.
+/// A repoint can leave a lock that no longer parses: a v1 lock with a
+/// stray `[metadata]` line for the id the repoint gives the package (the
+/// key becomes a duplicate), or a block whose `checksum` is a table, which
+/// the checksum line added to the block collides with. The crates after it
+/// are then refused, as they were when every crate parsed the lock, and
+/// none is repointed on a lock cargo cannot read.
 #[test]
 fn a_lock_a_repoint_leaves_unreadable_refuses_the_crates_after_it() {
-    let lock = format!(
+    let stray_metadata = format!(
         "[[package]]\nname = \"p\"\nversion = \"1.0.0\"\nsource = \"{CRATES_IO}\"\n\n[[package]]\nname = \"q\"\nversion = \"2.0.0\"\nsource = \"{CRATES_IO}\"\n\n[metadata]\n\"checksum p 1.0.0 ({CRATES_IO})\" = \"aa\"\n\"checksum p 1.0.0 ({INDEX})\" = \"stale\"\n\"checksum q 2.0.0 ({CRATES_IO})\" = \"cc\"\n"
     );
-    let mut held = CargoHostedLock::new(lock.clone());
-    let CargoLockOutcome::Rewritten(planned) = held.plan("p", "1.0.0", INDEX, "bb") else {
-        panic!("the first crate is repointed");
-    };
-    assert!(!held.commit(planned).is_empty());
-    assert!(held.model().is_none(), "the lock no longer parses");
-    assert!(matches!(
-        held.plan("q", "2.0.0", INDEX, "dd"),
-        CargoLockOutcome::NotFound
-    ));
-    repoint_both_ways(
-        &lock,
-        &[
-            step("p", "1.0.0", INDEX, "bb"),
-            step("q", "2.0.0", INDEX, "dd"),
-        ],
+    let checksum_table = format!(
+        "version = 3\n\n[[package]]\nname = \"p\"\nversion = \"1.0.0\"\nsource = \"{CRATES_IO}\"\n\n[package.checksum]\nx = 1\n\n[[package]]\nname = \"q\"\nversion = \"2.0.0\"\nsource = \"{CRATES_IO}\"\nchecksum = \"cc\"\n"
     );
+    for lock in [stray_metadata, checksum_table] {
+        let mut held = CargoHostedLock::new(lock.clone());
+        let CargoLockOutcome::Rewritten(planned) = held.plan("p", "1.0.0", INDEX, "bb") else {
+            panic!("the first crate is repointed\n{lock}");
+        };
+        assert!(!planned.commit().is_empty());
+        assert!(held.model().is_none(), "the lock no longer parses\n{lock}");
+        assert!(
+            matches!(
+                held.plan("q", "2.0.0", INDEX, "dd"),
+                CargoLockOutcome::NotFound
+            ),
+            "{lock}"
+        );
+        repoint_both_ways(
+            &lock,
+            &[
+                step("p", "1.0.0", INDEX, "bb"),
+                step("q", "2.0.0", INDEX, "dd"),
+            ],
+        );
+    }
 }
 
 /// A lock of `count` crates with inline checksums, each depending on the

@@ -374,6 +374,13 @@ pub struct CargoLock {
     spans: Option<LockSpans>,
 }
 
+#[cfg(test)]
+thread_local! {
+    /// How often this thread has parsed a lock text ([`CargoLock::parse`]),
+    /// for the tests that pin how often a rewrite does.
+    pub(crate) static LOCK_PARSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// The byte spans of a [`CargoLock`] parsed from text.
 #[derive(Debug)]
 pub(crate) struct LockSpans {
@@ -401,6 +408,8 @@ impl CargoLock {
     /// Parse a lock text, keeping every span the hosted splice edits;
     /// `Err` when it is not TOML (cargo itself refuses to build from it).
     pub fn parse(text: &str) -> Result<Self, toml_edit::TomlError> {
+        #[cfg(test)]
+        LOCK_PARSES.with(|parses| parses.set(parses.get() + 1));
         let doc = Document::parse(text)?;
         let root = doc.as_table();
         let mut packages = Vec::new();

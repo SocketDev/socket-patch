@@ -22,14 +22,30 @@ pub(crate) const CARGO_LOCK_REFERENCE_KIND: &str = "redirect_cargo_lock_referenc
 /// One replacement of a byte range of a lock's text.
 pub(crate) type Splice = (Range<usize>, String);
 
-/// Apply non-overlapping `splices` (ranges into `text`) to `text`.
+/// Apply non-overlapping `splices` (ranges into `text`) to `text`, in one
+/// pass. Of two insertions at one offset the later one in `splices` comes
+/// first in the result.
 pub(crate) fn splice(text: &str, mut splices: Vec<Splice>) -> String {
-    splices.sort_by_key(|(r, _)| std::cmp::Reverse(r.start));
-    let mut out = text.to_string();
-    for (range, with) in splices {
-        out.replace_range(range, &with);
+    splices.reverse();
+    splices.sort_by_key(|(range, _)| range.start);
+    let added: usize = splices.iter().map(|(_, with)| with.len()).sum();
+    let mut out = String::with_capacity(text.len() + added);
+    let mut from = 0;
+    for (range, with) in &splices {
+        out.push_str(&text[from..range.start]);
+        out.push_str(with);
+        from = range.end;
     }
+    out.push_str(&text[from..]);
     out
+}
+
+/// Whether `value` is the same text inside a TOML basic string as outside
+/// it: nothing a `"…"` would end on or read as an escape.
+fn spelled_as_it_is(value: &str) -> bool {
+    !value
+        .chars()
+        .any(|c| c == '"' || c == '\\' || c.is_control())
 }
 
 /// Where a line inserted after the one `value` ends sits: just past that
@@ -206,10 +222,15 @@ impl CargoLock {
             edits.push(edit(original, &rebuilt));
             splices.push((block_start..block_end, rebuilt));
         }
-        // With no `[metadata]` line the block itself now holds the index
-        // and the checksum; a full-id reference found below is text
-        // outside it.
-        let mut local = metadata_line.is_none();
+        // Two values replaced where they stand, by text a string holds as
+        // it is: the lock then parses exactly as it did. A line added to
+        // the block, a `[metadata]` line or a full-id reference (below)
+        // is more than that.
+        let mut local = metadata_line.is_none()
+            && at.source.is_some()
+            && at.checksum.is_some()
+            && spelled_as_it_is(index_url)
+            && spelled_as_it_is(cksum);
         if let Some((_, line)) = metadata_line {
             let pinned = format!("\"checksum {crate_name} {version} ({index_url})\" = \"{cksum}\"");
             if content[line.clone()] != pinned {
@@ -300,7 +321,7 @@ impl<R> CargoLockOutcome<R> {
 pub(crate) type CargoLockSplices = CargoLockOutcome<RepointSplices>;
 
 /// What [`CargoHostedLock::plan`] answers.
-pub(crate) type CargoLockRepoint = CargoLockOutcome<PlannedRepoint>;
+pub(crate) type CargoLockRepoint<'a> = CargoLockOutcome<PlannedRepoint<'a>>;
 
 /// The repoint of the `package`th block, as splices into the text the model
 /// was parsed from, with the edits that record them.
@@ -309,27 +330,57 @@ pub(crate) struct RepointSplices {
     pub(crate) package: usize,
     pub(crate) splices: Vec<Splice>,
     pub(crate) edits: Vec<FileEdit>,
-    /// The block's own lines are all that changes, and they now hold the
-    /// index and the checksum. `false` when a v1 `[metadata]` line or a
-    /// full-id reference elsewhere in the lock follows the package.
+    /// The repoint is the block's `source` and inline `checksum` values
+    /// replaced where they stand, and nothing else: the lock parses as it
+    /// did, to the same model but for those two values. `false` when a
+    /// line is added to the block, or a v1 `[metadata]` line or a full-id
+    /// reference elsewhere in the lock follows the package.
     pub(crate) local: bool,
 }
 
-/// A repoint a [`CargoHostedLock`] planned. Its edits are given out by
-/// [`CargoHostedLock::commit`], together with the change to the lock, so
-/// none is recorded for a repoint that was not made.
+/// A repoint a [`CargoHostedLock`] planned, holding the lock until it is
+/// committed or dropped: no other plan can come between the two, and the
+/// edits that record it are given out only as it is made.
 #[derive(Debug)]
-pub(crate) struct PlannedRepoint {
+pub(crate) struct PlannedRepoint<'a> {
+    lock: &'a mut CargoHostedLock,
     repoint: RepointSplices,
     source: String,
     checksum: String,
-    /// Which plan of the lock this is: the lock's next plan makes it stale.
-    plan: usize,
 }
 
-#[cfg(test)]
-impl PlannedRepoint {
-    /// The edits [`CargoHostedLock::commit`] would give for it.
+impl PlannedRepoint<'_> {
+    /// Make the repoint part of the lock, and give the edits that record
+    /// it.
+    pub(crate) fn commit(self) -> Vec<FileEdit> {
+        let PlannedRepoint {
+            lock,
+            repoint,
+            source,
+            checksum,
+        } = self;
+        let RepointSplices {
+            package,
+            splices,
+            edits,
+            local,
+        } = repoint;
+        lock.pending.extend(splices);
+        match lock.model.get_mut() {
+            Some(Some(model)) if local => {
+                if let Some(found) = model.packages.get_mut(package) {
+                    found.source = Some(source);
+                    found.checksum = Some(checksum);
+                }
+                lock.repointed.push(package);
+            }
+            _ => lock.parse_again(),
+        }
+        edits
+    }
+
+    /// The edits [`Self::commit`] would give.
+    #[cfg(test)]
     pub(crate) fn edits(&self) -> &[FileEdit] {
         &self.repoint.edits
     }
@@ -347,13 +398,15 @@ impl PlannedRepoint {
 /// [`Self::model`] and [`Self::plan`] answer exactly as a fresh parse of
 /// the lock as the rewrite has it so far would. Three rules keep that:
 ///
-/// * A repoint that changes nothing but the package's own block
-///   ([`RepointSplices::local`]) writes the block's new `source` and
-///   checksum into the model. Nothing else of the model reads that text.
-/// * Any other repoint (a v1 lock's `[metadata]` line, a full id in
-///   another block) is applied to the text at once, and the text is parsed
-///   again on its next use. If the lock no longer parses, the crates after
-///   it are refused, as they were when every crate parsed the lock.
+/// * A repoint that only replaces the block's `source` and `checksum`
+///   values ([`RepointSplices::local`]) writes the two into the model.
+///   The lock parses as it did, and nothing else of the model reads that
+///   text.
+/// * Any other repoint (a line added to the block, a v1 lock's
+///   `[metadata]` line, a full id in another block) is applied to the text
+///   at once, and the text is parsed again on its next use. If the lock no
+///   longer parses, the crates after it are refused, as they were when
+///   every crate parsed the lock.
 /// * A plan reads the bytes through the parse's spans, so it is made on a
 ///   fresh parse when those bytes are no longer the lock's: for a package
 ///   this rewrite has repointed since the parse, and for a rewrite with a
@@ -369,8 +422,6 @@ pub(crate) struct CargoHostedLock {
     pending: Vec<Splice>,
     /// The packages (by index in the model) repointed since the parse.
     repointed: Vec<usize>,
-    /// How many plans were made: the stamp of the latest [`PlannedRepoint`].
-    plans: usize,
     /// How often the text was parsed.
     #[cfg(test)]
     parses: std::cell::Cell<usize>,
@@ -383,7 +434,6 @@ impl CargoHostedLock {
             model: std::cell::OnceCell::new(),
             pending: Vec::new(),
             repointed: Vec::new(),
-            plans: 0,
             #[cfg(test)]
             parses: std::cell::Cell::new(0),
         }
@@ -407,18 +457,19 @@ impl CargoHostedLock {
     }
 
     /// [`CargoLock::plan_hosted_splices`] for the lock as the rewrite has
-    /// it so far. A rewrite takes effect with [`Self::commit`], once
-    /// everything else of the crate is planned; a plan that is not
-    /// committed before the next one is dropped.
+    /// it so far. A rewrite takes effect with [`PlannedRepoint::commit`],
+    /// once everything else of the crate is planned.
     pub(crate) fn plan(
         &mut self,
         crate_name: &str,
         version: &str,
         index_url: &str,
         cksum: &str,
-    ) -> CargoLockRepoint {
-        self.plans += 1;
-        let plan = self.plans;
+    ) -> CargoLockRepoint<'_> {
+        // The package's own bytes are not the ones parsed any more.
+        if self.has_repointed(crate_name, version) {
+            self.parse_again();
+        }
         let on_this_parse = |lock: &CargoHostedLock| match lock.model() {
             Some(model) => {
                 model.plan_hosted_splices(&lock.text, crate_name, version, index_url, cksum)
@@ -426,45 +477,39 @@ impl CargoHostedLock {
             None => CargoLockOutcome::NotFound,
         };
         let mut found = on_this_parse(self);
-        if !self.as_a_fresh_parse_would(&found, crate_name, version) {
+        // Nor are the bytes of a block an earlier repoint rebuilt, which
+        // this one would write a full id into.
+        let touches_pending = match &found {
+            CargoLockOutcome::Rewritten(repoint) => !repoint
+                .splices
+                .iter()
+                .all(|(range, _)| self.clear_of_pending(range)),
+            _ => false,
+        };
+        if touches_pending {
             self.parse_again();
             found = on_this_parse(self);
         }
         found.map(|repoint| PlannedRepoint {
+            lock: self,
             repoint,
             source: index_url.to_string(),
             checksum: cksum.to_string(),
-            plan,
         })
     }
 
-    /// Whether `found`, planned for `crate_name@version` on the parse held,
-    /// is the plan a parse of the lock as it is now would give.
-    fn as_a_fresh_parse_would(
-        &self,
-        found: &CargoLockSplices,
-        crate_name: &str,
-        version: &str,
-    ) -> bool {
-        let Some(model) = self.model() else {
-            return true;
+    /// Whether this rewrite has repointed `crate_name@version` since the
+    /// parse it holds.
+    fn has_repointed(&self, crate_name: &str, version: &str) -> bool {
+        let Some(Some(model)) = self.model.get() else {
+            return false;
         };
-        let repointed = self.repointed.iter().any(|&package| {
+        self.repointed.iter().any(|&package| {
             model
                 .packages
                 .get(package)
                 .is_some_and(|p| p.name == crate_name && p.version == version)
-        });
-        if repointed {
-            return false;
-        }
-        match found {
-            CargoLockOutcome::Rewritten(repoint) => repoint
-                .splices
-                .iter()
-                .all(|(range, _)| self.clear_of_pending(range)),
-            _ => true,
-        }
+        })
     }
 
     /// Whether `range` neither overlaps nor touches a pending splice (two
@@ -474,38 +519,6 @@ impl CargoHostedLock {
         self.pending
             .iter()
             .all(|(held, _)| range.end < held.start || held.end < range.start)
-    }
-
-    /// Make `planned` part of the lock and give the edits that record it.
-    /// `planned` is the latest plan of this lock: one made before that
-    /// names spans the lock may have moved since, so it changes nothing
-    /// and records nothing.
-    pub(crate) fn commit(&mut self, planned: PlannedRepoint) -> Vec<FileEdit> {
-        debug_assert_eq!(
-            planned.plan, self.plans,
-            "only the latest plan is committed"
-        );
-        if planned.plan != self.plans {
-            return Vec::new();
-        }
-        let RepointSplices {
-            package,
-            splices,
-            edits,
-            local,
-        } = planned.repoint;
-        self.pending.extend(splices);
-        match self.model.get_mut() {
-            Some(Some(model)) if local => {
-                if let Some(found) = model.packages.get_mut(package) {
-                    found.source = Some(planned.source);
-                    found.checksum = Some(planned.checksum);
-                }
-                self.repointed.push(package);
-            }
-            _ => self.parse_again(),
-        }
-        edits
     }
 
     /// Put the pending splices into the text and drop the parse: the next

@@ -2260,8 +2260,8 @@ fn rewrite_cargo_with(
         // one declared dependency (the dependents gate above): the manifest
         // pin alone then forces the next resolution through the managed
         // registry, which serves the patched checksum.
-        enum LockCommit {
-            Write(PlannedRepoint),
+        enum LockCommit<'a> {
+            Write(PlannedRepoint<'a>),
             InPlace,
             Absent,
         }
@@ -2331,12 +2331,9 @@ fn rewrite_cargo_with(
         }
         match lock_commit {
             LockCommit::Write(planned) => {
-                // The lock gives a repoint's edits out as it makes it.
-                if let Some(lock) = cargo_lock.as_mut() {
-                    let edits = lock.commit(planned);
-                    lock_changed |= !edits.is_empty();
-                    result.edits.extend(edits);
-                }
+                // The repoint's edits come out as it is made.
+                result.edits.extend(planned.commit());
+                lock_changed = true;
             }
             LockCommit::InPlace | LockCommit::Absent => {}
         }
