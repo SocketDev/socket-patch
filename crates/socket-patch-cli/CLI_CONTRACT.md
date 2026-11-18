@@ -973,21 +973,37 @@ library under `lib/`, a Ruby file the build generates under a require path. Such
 loaded from where it was built. The staged build is set aside: a gem RubyGems built is rebuilt in
 place (below), a precompiled gem is refused.
 
-**A build that reads nothing of the patch.** A build that exits cleanly has not always built
+**A build that builds nothing of the patch.** A build that exits cleanly has not always built
 the patch: what a gem compiles depends on how its build is configured. A gem set up to link the
 system's copy of a library it packs (nokogiri installed with `--use-system-libraries`) never
 opens the packed copy's sources, so a record that changes only those would be written, rebuilt
-and attested with nothing of it in what Ruby loads. `apply` knows no gem's switches. It watches
-the record's build inputs during the build, staged or in place: on Linux with a kernel watch on
-those files being opened (inotify, which works whatever the mount options), elsewhere by giving
-them an access time in the past and looking at it right after. A build that read NONE of them
-did not build the patch. One read
-is enough, because a record also carries files no build opens. From the stage this fails the
-package with `native_extensions_unsupported` and nothing is written; from the installed tree
-it fails with `native_extension_build_failed` and the sources and the previous build are put
-back. Either way the copy is never attested. Off Linux, where a read leaves no trace in a
-file's access time (a `noatime` mount, Windows by default), which `apply` tests with a file of
-its own, nothing is concluded and the build is taken as it is.
+and attested with nothing of it in what Ruby loads. A gem whose extension script downloads the
+binary it runs (passenger's agent) compiles nothing at all. `apply` knows no gem's switches. It
+watches the record's build inputs during the build, staged or in place: on Linux with a kernel
+watch on those files being opened (inotify, which works whatever the mount options), elsewhere
+by giving them an access time in the past and looking at it right after. A build that read NONE
+of them did not build the patch. One read is enough, because a record also carries files no
+build opens. Neither did a build that left no compiled file: nothing in RubyGems' extension
+directory, and nothing Ruby loads in the gem's own tree.
+
+In both cases the record's files are written into the installed copy and its compiled code is
+left as it was installed: the package's event is `applied`, the run exits 0, and it carries a
+`native_extension_not_rebuilt` warning that names the files and says why. The patch's Ruby files
+are in effect, and a source the gem compiles later on its own (passenger builds its agent the
+first time it starts without one) is the patched one. No build marker is written, so
+`apply --check` reports the package as not in sync and `vex` never attests it. A later `apply`
+runs the build again and says the same. The one exception is a record that changes a build input
+the installed copy no longer holds: only a build from the source gem accounts for a file added
+that way, so that package fails with `native_extensions_unsupported` and nothing is written.
+
+Off Linux, where a read leaves no trace in a file's access time (a `noatime` mount, Windows by
+default), which `apply` tests with a file of its own, nothing is concluded from the reads and
+the build is taken as it is.
+
+**What a build prints.** A build can take many minutes. Each one prints a line to stderr when
+it starts (`Rebuilding the native extension of <gem> from <what>; this can take several
+minutes.`) and one when it ends (`The build of <gem> finished after <time>.`, or `failed
+after`). Neither is printed under `--json` or `--silent`.
 
 **Into the installed copy.** The record's files are written into the copy, and the build takes the
 place of the compiled code:
@@ -1100,9 +1116,9 @@ a file the copy does not hold is not written: the record fails on it as on any m
 | Code | Run result | Meaning |
 |---|---|---|
 | `native_extensions_unsupported` | refused, exit 1 | The record changes build inputs that cannot be rebuilt here: the copy is not a RubyGems install with a `specifications/` entry (a Bundler git checkout); the gem neither declares extensions nor is a platform gem; it is the JRuby (`java`) build; no Ruby that owns the install was found; a precompiled gem cannot be built from its source gem (the archive is neither in the home's `cache/` nor downloadable, is not the copy's own source, the record does not apply to it, a gem its build needs could not be staged, its build leaves a library in the gem's own tree, or the build has no counterpart among the gem's prebuilt binaries); a record changes an input a build removed and the source gem cannot be built. Nothing is written. Also: another run is rebuilding the same gem right now, or an interrupted rebuild could not be undone (the error says which). |
-| `native_extension_build_failed` | refused, exit 1 | The extension did not build from the patched sources (no compiler or Ruby headers, a build error, an in-place build that exited cleanly without compiling anything), or the finished build could not be moved into place. The installed copy is as it was before the run; the error carries the build output's tail (of the build from the source gem and of the in-place one, when both ran), at most 30 lines of each, without mkmf's list of configuration options or its pointer to the `mkmf.log` that was removed with the failed build. For a precompiled gem it says that the rebuild needs what `gem install <name> -v <version> --platform ruby` needs. |
+| `native_extension_build_failed` | refused, exit 1 | The extension did not build from the patched sources (no compiler or Ruby headers, a build error, an in-place build that exited cleanly and kept the library it found instead of compiling it again), or the finished build could not be moved into place. The installed copy is as it was before the run; the error carries the build output's tail (of the build from the source gem and of the in-place one, when both ran), at most 30 lines of each, without mkmf's list of configuration options or its pointer to the `mkmf.log` that was removed with the failed build. For a precompiled gem it says that the rebuild needs what `gem install <name> -v <version> --platform ruby` needs. |
 | `native_extension_rebuilt` | warning | The sources were already patched (by a release before #1996, with `--no-gem-native-rebuild`, or by `apply` under another Ruby version of a precompiled gem) and the extension was rebuilt from them. Under `--dry-run`: the rebuild a real `apply` would run; no Ruby is started and nothing is downloaded to check that it can. |
-| `native_extension_not_rebuilt` | warning | `--no-gem-native-rebuild`: the sources were written without a rebuild; Ruby loads the old build until the caller compiles it. |
+| `native_extension_not_rebuilt` | warning | The record's files were written and no build holds them. With `--no-gem-native-rebuild`: Ruby loads the old build until the caller compiles it. Without it: a build ran and built nothing of the patch (it read none of the files the patch changes, or left no compiled file), so the compiled code is as it was installed. `vex` and `apply --check` do not take the package for patched. |
 | `native_extension_restore_failed` | rollback: that copy fails | The sources were restored, but the original compiled extension could not be put back. Run `gem pristine <gem> --extensions` (a precompiled gem: `gem pristine <gem>`). |
 
 A refusal is printed once on the human path, as the package's `Error: Failed to patch` line. Under

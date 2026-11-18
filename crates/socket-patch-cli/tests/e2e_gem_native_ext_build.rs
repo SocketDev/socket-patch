@@ -210,6 +210,30 @@ fn write_manifest(socket: &Path, before: &str, after: &str) {
     write_blob(socket, &after_hash, after.as_bytes());
 }
 
+/// The detail of the envelope's `native_extension_not_rebuilt` warning:
+/// what a run says of a record it wrote without a build of it.
+fn not_rebuilt_warning(stdout: &str) -> String {
+    let env = parse_json_envelope(stdout);
+    env["warnings"]
+        .as_array()
+        .and_then(|warnings| {
+            warnings
+                .iter()
+                .find(|w| w["code"] == "native_extension_not_rebuilt")
+        })
+        .and_then(|w| w["detail"].as_str())
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// `tree` with the file `rel` holding `bytes`.
+fn tree_with(tree: &[(String, Vec<u8>)], rel: &str, bytes: &[u8]) -> Vec<(String, Vec<u8>)> {
+    let mut out: Vec<_> = tree.iter().filter(|(r, _)| r != rel).cloned().collect();
+    out.push((rel.to_string(), bytes.to_vec()));
+    out.sort();
+    out
+}
+
 fn event_action(stdout: &str) -> String {
     let env = parse_json_envelope(stdout);
     common::envelope::event_for(&env, PURL)["action"]
@@ -739,6 +763,18 @@ stage_build)
     echo "sp_native.c:7: error: this is not C (in the stage)" >&2
     exit 1
   fi
+  # A gem whose extension script downloads the binary it runs compiles
+  # nothing: it reads its sources (the script is one of them), leaves a
+  # finished, empty extension dir, and puts the binary where Ruby does
+  # not load from.
+  if [ -e "$state/builds-nothing" ]; then
+    cat "$5/gems/$full/ext/sp_native/sp_native.c" > /dev/null 2>&1
+    mkdir -p "$ext" "$5/gems/$full/buildout"
+    printf 'a downloaded agent' > "$5/gems/$full/buildout/agent"
+    : > "$ext/gem.build_complete"
+    printf 'sp_built\t%s\n' "$ext"
+    exit 0
+  fi
   mkdir -p "$ext/sp_native" "$5/gems/$full/lib/sp_native"
   # A build that applies the patch files the gem packs reads them; one set
   # up to link the system's copy of that library never opens them.
@@ -846,6 +882,12 @@ esac
     /// as the build of a gem that compiles its packed library does.
     fn apply_patch_files(&self) {
         std::fs::write(self.state.join("applies-patches"), b"").unwrap();
+    }
+
+    /// From now on a staged build compiles nothing, as the build of a gem
+    /// whose extension script downloads the binary it runs.
+    fn build_nothing(&self) {
+        std::fs::write(self.state.join("builds-nothing"), b"").unwrap();
     }
 
     /// Stand in for Ruby 3.3 from now on (3.4 until then).
@@ -1815,12 +1857,15 @@ fn records_reads(dir: &Path) -> bool {
 /// written, "rebuilt" and attested on such an install, with nothing of it
 /// in what Ruby loads. The CLI knows no gem's switches: it marks the
 /// record's build inputs unread, and a build that read none of them is not
-/// a build of the patch. The copy is left as it was, and nothing attests
-/// it. The same record is built by a build that applies the patch file.
+/// a build of the patch. The record's files are written, the compiled code
+/// stays what it was, the run says so, and nothing attests the copy
+/// (#2144). The same record is built by a build that applies the patch
+/// file.
 #[cfg(unix)]
 #[test]
-fn a_build_that_reads_nothing_of_the_patch_does_not_apply_it() {
-    let library_patch: [RecordFile<'_>; 1] = [("patches/libsp/0100-CVE-test.patch", None, "fix\n")];
+fn a_build_that_reads_nothing_of_the_patch_writes_it_and_attests_nothing() {
+    const PATCH_REL: &str = "patches/libsp/0100-CVE-test.patch";
+    let library_patch: [RecordFile<'_>; 1] = [(PATCH_REL, None, "fix\n")];
     let (_tmp, proj, gem_dir, home) = built_gem_with_its_archive();
     if !records_reads(&home) {
         eprintln!("SKIP: no way to tell here whether a build read a file");
@@ -1830,31 +1875,36 @@ fn a_build_that_reads_nothing_of_the_patch_does_not_apply_it() {
     let ruby = FakeRuby::new();
     ruby.serve_source_gem(&c_source(1));
     let tree_before = walk_files(&proj.join("vendor"));
+    let written = tree_with(
+        &tree_before,
+        &format!("bundle/ruby/3.4.0/gems/{FULL_NAME}/{PATCH_REL}"),
+        b"fix\n",
+    );
 
     let (code, stdout, stderr) = ruby.run(&proj, &["apply", "--json", "--offline"], &[]);
-    assert_eq!(code, 1, "ruby ran {:?}\n{stdout}\n{stderr}", ruby.calls());
-    let envelope = parse_json_envelope(&stdout);
-    let error = common::envelope::event_for(&envelope, PURL)["error"]
-        .as_str()
-        .unwrap_or_default()
-        .to_string();
+    assert_eq!(code, 0, "ruby ran {:?}\n{stdout}\n{stderr}", ruby.calls());
+    assert_eq!(event_action(&stdout), "applied", "{stdout}");
+    let warning = not_rebuilt_warning(&stdout);
+    for needle in [
+        "the patch's files were written",
+        "without reading any file the patch changes",
+        PATCH_REL,
+        "vex does not attest the patch",
+    ] {
+        assert!(warning.contains(needle), "no {needle:?} in {warning:?}");
+    }
     assert!(
-        error.contains("native_extensions_unsupported")
-            && error.contains("without reading any file the patch changes")
-            && error.contains("patches/libsp/0100-CVE-test.patch")
-            && error.contains("nothing was written"),
-        "{error}"
-    );
-    assert!(
-        !error.contains("  "),
-        "the message has a gap in it: {error}"
+        !warning.contains("  "),
+        "the message has a gap in it: {warning}"
     );
     assert_eq!(
         ruby.calls(),
         ["extensions_dir", "unpack", "missing_deps", "stage_build"],
         "one build in the stage, and none of the installed tree after it"
     );
-    assert_tree(&proj.join("vendor"), &tree_before, "");
+    // The patch file is in the gem, and nothing else moved: the build the
+    // install made is the one Ruby still loads, with no marker beside it.
+    assert_tree(&proj.join("vendor"), &written, "after the apply");
     let (code, stdout, stderr) = ruby.run(&proj, &["apply", "--check"], &[]);
     assert_ne!(code, 0, "{stdout}\n{stderr}");
     assert!(
@@ -1862,12 +1912,36 @@ fn a_build_that_reads_nothing_of_the_patch_does_not_apply_it() {
         "vex attested a patch that is compiled into nothing"
     );
 
+    // Applying again says the same and changes nothing.
+    let (code, stdout, stderr) = ruby.run(&proj, &["apply", "--json", "--offline"], &[]);
+    assert_eq!(code, 0, "{stdout}\n{stderr}");
+    assert!(
+        not_rebuilt_warning(&stdout).contains("without reading any file the patch changes"),
+        "{stdout}"
+    );
+    assert_tree(&proj.join("vendor"), &written, "after a second apply");
+
+    // The human path says it too, as a warning beside the summary.
+    let (code, stdout, stderr) = ruby.run(&proj, &["apply", "--offline"], &[]);
+    assert_eq!(code, 0, "{stdout}\n{stderr}");
+    assert!(
+        stderr.contains("Warning:") && stderr.contains("vex does not attest the patch"),
+        "{stdout}\n{stderr}"
+    );
+
+    // Rollback takes the file out again.
+    let (code, stdout, stderr) = ruby.run(&proj, &["rollback", "--json", "--offline"], &[]);
+    assert_eq!(code, 0, "rollback failed:\n{stdout}\n{stderr}");
+    assert_tree(&proj.join("vendor"), &tree_before, "after rollback");
+
     // A build that applies the gem's patch files reads this one.
+    write_record(&proj.join(".socket"), PURL, &library_patch);
     ruby.apply_patch_files();
     let (code, stdout, stderr) = ruby.run(&proj, &["apply", "--json", "--offline"], &[]);
     assert_eq!(code, 0, "apply failed:\n{stdout}\n{stderr}");
     assert_eq!(event_action(&stdout), "applied", "{stdout}");
-    assert!(gem_dir.join("patches/libsp/0100-CVE-test.patch").is_file());
+    assert_eq!(not_rebuilt_warning(&stdout), "", "{stdout}");
+    assert!(gem_dir.join(PATCH_REL).is_file());
     assert!(vex_attests(|args| ruby.run(&proj, args, &[])));
 
     // One input read is enough: a record carries files no build opens (a
@@ -1877,24 +1951,24 @@ fn a_build_that_reads_nothing_of_the_patch_does_not_apply_it() {
     write_record(
         &proj.join(".socket"),
         PURL,
-        &[
-            (C_KEY, Some(&before), &after),
-            ("patches/libsp/0100-CVE-test.patch", None, "fix\n"),
-        ],
+        &[(C_KEY, Some(&before), &after), (PATCH_REL, None, "fix\n")],
     );
     let ruby = FakeRuby::new();
     ruby.serve_source_gem(&c_source(1));
     let (code, stdout, stderr) = ruby.run(&proj, &["apply", "--json", "--offline"], &[]);
     assert_eq!(code, 0, "apply failed:\n{stdout}\n{stderr}");
     assert_eq!(event_action(&stdout), "applied", "{stdout}");
+    assert_eq!(not_rebuilt_warning(&stdout), "", "{stdout}");
 }
 
 /// The rebuild of an installed tree (no source gem to stage) is held to the
-/// same: a build that read nothing of the patch is undone, sources and
-/// previous build put back.
+/// same: after a build that read nothing of the patch, the previous build
+/// is put back, the record's files stay written, and nothing attests the
+/// copy.
 #[cfg(unix)]
 #[test]
-fn an_in_place_build_that_reads_nothing_of_the_patch_is_undone() {
+fn an_in_place_build_that_reads_nothing_of_the_patch_keeps_the_previous_build() {
+    const PATCH_REL: &str = "patches/libsp/0001-base.patch";
     let (_tmp, proj, gem_dir) = fake_native_gem(true);
     let home = proj.join("vendor/bundle/ruby/3.4.0");
     if !records_reads(&home) {
@@ -1904,29 +1978,155 @@ fn an_in_place_build_that_reads_nothing_of_the_patch_is_undone() {
     // A build input the installed tree holds and the stand-in build never
     // opens.
     std::fs::create_dir_all(gem_dir.join("patches/libsp")).unwrap();
-    std::fs::write(gem_dir.join("patches/libsp/0001-base.patch"), "base\n").unwrap();
+    std::fs::write(gem_dir.join(PATCH_REL), "base\n").unwrap();
     write_record(
         &proj.join(".socket"),
         PURL,
-        &[(
-            "patches/libsp/0001-base.patch",
-            Some("base\n"),
-            "base, fixed\n",
-        )],
+        &[(PATCH_REL, Some("base\n"), "base, fixed\n")],
     );
     let ruby = FakeRuby::new();
     let tree_before = walk_files(&proj.join("vendor"));
+    let written = tree_with(
+        &tree_before,
+        &format!("bundle/ruby/3.4.0/gems/{FULL_NAME}/{PATCH_REL}"),
+        b"base, fixed\n",
+    );
 
     let (code, stdout, stderr) = ruby.run(&proj, &["apply", "--json", "--offline"], &[]);
-    assert_eq!(code, 1, "{stdout}\n{stderr}");
+    assert_eq!(code, 0, "{stdout}\n{stderr}");
+    assert_eq!(event_action(&stdout), "applied", "{stdout}");
+    let warning = not_rebuilt_warning(&stdout);
     assert!(
-        stdout.contains("native_extension_build_failed")
-            && stdout.contains("without reading any file the patch changes"),
+        warning.contains("without reading any file the patch changes")
+            && warning.contains("vex does not attest the patch"),
         "{stdout}"
     );
     assert_eq!(ruby.calls(), ["extensions_dir", "build"]);
-    assert_tree(&proj.join("vendor"), &tree_before, "");
+    assert_tree(&proj.join("vendor"), &written, "after the apply");
     assert!(!vex_attests(|args| ruby.run(&proj, args, &[])));
+
+    let (code, stdout, stderr) = ruby.run(&proj, &["rollback", "--json", "--offline"], &[]);
+    assert_eq!(code, 0, "rollback failed:\n{stdout}\n{stderr}");
+    assert_tree(&proj.join("vendor"), &tree_before, "after rollback");
+}
+
+/// A gem whose extension script downloads the binary it runs (passenger's
+/// agent) has a build that compiles nothing: a clean exit, a finished and
+/// empty extension dir, and the binary somewhere Ruby does not load from.
+/// Moving that dir in passed for a build of the patch: the run said
+/// "applied" and `vex` attested it while the code the gem runs was
+/// byte-for-byte unchanged (#2144). The record's files are written (the
+/// gem's own Ruby is what compiles such a binary later), the run says the
+/// compiled code is not the patch's, and nothing attests the copy.
+#[cfg(unix)]
+#[test]
+fn a_build_that_leaves_no_compiled_file_writes_the_patch_and_attests_nothing() {
+    let (_tmp, proj, gem_dir, home) = built_gem_with_its_archive();
+    let (before, after) = (c_source(1), c_source(2));
+    write_record(
+        &proj.join(".socket"),
+        PURL,
+        &[(C_KEY, Some(&before), &after)],
+    );
+    let ruby = FakeRuby::new();
+    ruby.serve_source_gem(&c_source(1));
+    ruby.build_nothing();
+    let tree_before = walk_files(&proj.join("vendor"));
+    let written = tree_with(
+        &tree_before,
+        &format!("bundle/ruby/3.4.0/gems/{FULL_NAME}/{C_KEY}"),
+        after.as_bytes(),
+    );
+
+    let (code, stdout, stderr) = ruby.run(&proj, &["apply", "--json", "--offline"], &[]);
+    assert_eq!(code, 0, "ruby ran {:?}\n{stdout}\n{stderr}", ruby.calls());
+    assert_eq!(event_action(&stdout), "applied", "{stdout}");
+    let warning = not_rebuilt_warning(&stdout);
+    for needle in [
+        "the patch's files were written",
+        C_KEY,
+        "left no compiled file",
+        "vex does not attest the patch",
+    ] {
+        assert!(warning.contains(needle), "no {needle:?} in {warning:?}");
+    }
+    assert!(
+        !warning.contains("  "),
+        "the message has a gap in it: {warning}"
+    );
+    assert_eq!(
+        ruby.calls(),
+        ["extensions_dir", "unpack", "missing_deps", "stage_build"]
+    );
+    // The source is patched; the build the install made, its extension dir
+    // and everything else are as they were, and the stage is gone.
+    assert_tree(&proj.join("vendor"), &written, "after the apply");
+    assert!(!home.join(".socket-patch-build").exists());
+    assert!(!gem_dir.join(".socket-patch-native-build.json").exists());
+    let (code, stdout, stderr) = ruby.run(&proj, &["apply", "--check"], &[]);
+    assert_ne!(code, 0, "{stdout}\n{stderr}");
+    assert!(
+        !vex_attests(|args| ruby.run(&proj, args, &[])),
+        "vex attested a patch whose build installed nothing"
+    );
+
+    let (code, stdout, stderr) = ruby.run(&proj, &["rollback", "--json", "--offline"], &[]);
+    assert_eq!(code, 0, "rollback failed:\n{stdout}\n{stderr}");
+    assert_tree(&proj.join("vendor"), &tree_before, "after rollback");
+}
+
+/// A build can take many minutes, and a run that printed nothing until its
+/// summary looked hung (#2144): each build says when it starts and how it
+/// ended, on stderr. The machine channel stays as it was.
+#[cfg(unix)]
+#[test]
+fn a_rebuild_says_when_it_starts_and_how_it_ended() {
+    let record = |proj: &Path| {
+        let (before, after) = (c_source(1), c_source(2));
+        write_record(
+            &proj.join(".socket"),
+            PURL,
+            &[(C_KEY, Some(&before), &after)],
+        );
+    };
+    // A staged build that fails, then the build of the installed tree.
+    let (_tmp, proj, _gem_dir, _home) = built_gem_with_its_archive();
+    record(&proj);
+    let ruby = FakeRuby::new();
+    ruby.serve_source_gem(&c_source(1));
+    ruby.fail_staged_builds();
+    let (code, stdout, stderr) = ruby.run(&proj, &["apply", "--offline"], &[]);
+    assert_eq!(code, 0, "{stdout}\n{stderr}");
+    let said: Vec<&str> = stderr
+        .lines()
+        .filter(|line| line.contains(FULL_NAME))
+        .collect();
+    let expected = [
+        "Rebuilding the native extension of sp_native-1.0.0 from its source gem with the patch \
+         applied; this can take several minutes.",
+        "The build of sp_native-1.0.0 failed after ",
+        "Rebuilding the native extension of sp_native-1.0.0 from the patched sources in the \
+         installed gem; this can take several minutes.",
+        "The build of sp_native-1.0.0 finished after ",
+    ];
+    assert_eq!(said.len(), expected.len(), "{stderr}");
+    for (line, start) in said.iter().zip(expected) {
+        assert!(line.starts_with(start), "{line:?} does not start {start:?}");
+    }
+
+    for quiet in ["--json", "--silent"] {
+        let (_tmp, proj, _gem_dir, _home) = built_gem_with_its_archive();
+        record(&proj);
+        let ruby = FakeRuby::new();
+        ruby.serve_source_gem(&c_source(1));
+        let (code, stdout, stderr) = ruby.run(&proj, &["apply", "--offline", quiet], &[]);
+        assert_eq!(code, 0, "{quiet}: {stdout}\n{stderr}");
+        assert_eq!(ruby.calls().last().map(String::as_str), Some("stage_build"));
+        assert!(
+            !stderr.contains("Rebuilding") && !stderr.contains("The build of"),
+            "{quiet}: {stderr}"
+        );
+    }
 }
 
 /// Without the source gem there is nothing to build from: offline and not

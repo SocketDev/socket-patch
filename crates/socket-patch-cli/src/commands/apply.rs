@@ -3062,6 +3062,7 @@ async fn apply_patches_inner(
                                 cwd: args.common.cwd.clone(),
                                 rebuild: !args.common.no_gem_native_rebuild,
                                 offline: args.common.offline,
+                                progress: args.common.gem_build_progress(),
                             },
                         )
                         .await;

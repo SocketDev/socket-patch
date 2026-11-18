@@ -421,11 +421,12 @@ class NokogiriE2E
       return skip("this release reads no libxml2 patch directory") && nil unless record
       return skip("JRuby loads no libxml2") && nil if @java && @opts[:build] == "ok"
       # Built against the system's libxml2: the build never opens the copy
-      # the gem packs, so a patch to that copy cannot take effect. (Where
-      # the filesystem records no reads the CLI cannot tell, and the leg
-      # says so with --unread-check off.)
+      # the gem packs, so a patch to that copy is compiled into nothing.
+      # Its file is written, the run says so, and nothing attests it.
+      # (Where the filesystem records no reads the CLI cannot tell, and the
+      # leg says so with --unread-check off.)
       if @shape == "system-libraries"
-        return @opts[:unread_check] ? not_applied(record, "native_extensions_unsupported") : skip("no read tracking here")
+        return @opts[:unread_check] ? written_not_built(record) : skip("no read tracking here")
       end
       native(record) do |now|
         now["libxml_patches"].include?(LIBXML2_PATCH) &&
@@ -530,6 +531,36 @@ class NokogiriE2E
 
     code, stdout, stderr, = sp("rollback")
     check(code.zero?, "`rollback` of the unapplied record succeeds", "exit #{code}\n#{tail(stdout)}#{tail(stderr)}")
+  end
+
+  def warning_codes(stdout)
+    JSON.parse(stdout).fetch("warnings", []).map { |w| w["code"] }
+  rescue JSON::ParserError
+    []
+  end
+
+  # A record this install compiles nothing of: `apply` writes its files and
+  # says that no build holds them, Ruby loads the binary it loaded before,
+  # and neither `apply --check` nor `vex` takes the install for patched.
+  def written_not_built(record)
+    write_record(record)
+    code, stdout, stderr, secs = sp("apply", "--json")
+    warned = warning_codes(stdout).include?("native_extension_not_rebuilt")
+    check(code.zero? && action(stdout) == "applied" && warned,
+          "`apply` writes the patch and says that nothing compiles it (#{secs.round}s)",
+          "exit #{code}\n#{tail(stdout)}#{tail(stderr)}")
+    record.each do |path, (_, after)|
+      check(File.file?(File.join(@gem_dir, path)) && installed(path) == after, "#{path} is written")
+    end
+    check(leftovers.empty?, "nothing of a build was left in the gem home", leftovers.join("\n"))
+    check(probe == @baseline, "Ruby loads what it loaded before")
+
+    code, stdout, stderr, = sp("apply", "--check")
+    check(code != 0, "`apply --check` does not report it in sync", "exit #{code}\n#{stdout}#{stderr}")
+    _, statuses, text = vex_statuses
+    check(statuses.empty?, "`vex` does not attest it", "#{statuses.inspect}\n#{tail(text)}")
+
+    rolled_back
   end
 
   def rolled_back
