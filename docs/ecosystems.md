@@ -2208,6 +2208,32 @@ instead of being reported as patched.
 Ruby files are never build inputs outside `ext/` and a build script's directory: a patch that only
 changes `.rb` or `.rbs` files needs no compiler, wherever the gem keeps them.
 
+A rebuild is only taken for a build of the patch when it read at least one of the files the
+patch changes and left compiled code. How a gem builds depends on its configuration: nokogiri
+installed with `--use-system-libraries` links the operating system's libxml2 and never opens the
+copy it packs, so a patch that only adds a fix to that packed copy changes nothing there. A gem
+whose build script downloads the binary it runs (passenger's agent) compiles nothing at all.
+`apply` then writes the patch's files, leaves the compiled code as it was installed, and warns
+with `native_extension_not_rebuilt`, instead of reporting a patch that is in no compiled code:
+
+- The patch's Ruby files are in effect, and a source the gem compiles later on its own is the
+  patched one.
+- `apply --check` reports the package as not in sync, and `vex` does not attest the patch.
+- On a system-libraries install the library is the operating system's package, and updating
+  that package is what fixes it.
+
+A patch to the gem's own C sources is rebuilt as usual. On Linux the check asks the kernel which
+files the build opened. Elsewhere it needs a filesystem that records file reads; on one that
+does not (a `noatime` mount, Windows by default) the build is taken as it is.
+
+A build can take many minutes. `apply` prints a line to stderr when one starts and another when
+it ends (not under `--json` or `--silent`).
+
+A gem RubyGems compiled is rebuilt with the build arguments RubyGems recorded when it was
+installed. A precompiled gem is rebuilt with none: arguments Bundler recorded for it (a
+`build.nokogiri --use-system-libraries` setting kept from before nokogiri shipped precompiled
+gems) were never used to build it, and following them would replace the libraries the gem ships.
+
 The build happens in a stage directory inside the gem home (`.socket-patch-build/`), which is
 removed afterwards. A gem the build needs that the install lacks (a precompiled nokogiri has no
 `mini_portile2`) is installed into that stage, never into your gem home. The installed gem is not

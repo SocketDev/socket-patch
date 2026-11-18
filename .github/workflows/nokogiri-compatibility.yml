@@ -1,0 +1,334 @@
+name: nokogiri patch compatibility
+
+# Agent-mode patches to a real nokogiri install, the gem a native-extension
+# patch has the most ways to miss: tests/nokogiri/nokogiri_e2e.rb installs
+# one nokogiri release with the real Bundler, applies a Ruby-only record, a
+# C source record and a vendored-libxml2 patch record with the real binary,
+# and checks what that install's Ruby loads, `apply --check`, `vex` and a
+# byte-identical `rollback`. The script's header says what each record is.
+#
+# What the legs cover, and why these releases:
+#
+#   precompiled   Bundler's default since nokogiri 1.11: a platform gem with
+#                 one binary per Ruby minor, which `apply` replaces with a
+#                 build of the source gem. 1.11.7 / 1.13.10 / 1.15.7 /
+#                 1.16.8 are the last releases of the lines that ship the
+#                 `x86_64-linux` gem (Rails 5.2 to 7.1 lock them); 1.18 and
+#                 1.19 ship the `-gnu` and `-musl` gems.
+#   source        RubyGems compiles the ruby platform gem with its vendored
+#                 libxml2: the only install before 1.11 (1.6.8.1, 1.8.5 and
+#                 1.10.10 are the Rails 4.2 to 5.2 era, with the patch
+#                 directory and the build script of each period), and what
+#                 `force_ruby_platform` or a Ruby newer than the precompiled
+#                 gem's range gives on a current release.
+#   system-libraries  `--use-system-libraries`: the extension is rebuilt
+#                 with the recorded build arguments, and a patch to the
+#                 vendored libxml2, which such a build does not compile, is
+#                 written and not attested: its build reads nothing of the
+#                 patch, and `apply` says so.
+#                 The `legacy setting` leg is a precompiled install
+#                 in a project that still carries that Bundler setting from
+#                 the years before precompiled gems: its rebuild must keep
+#                 the libxml2 the gem ships, not link the system's.
+#   unavailable   a precompiled install on a machine with no compiler: the
+#                 patch must fail, name what is missing and change nothing.
+#   java          JRuby loads no C extension: a C record is refused.
+#
+# The `native` legs run on the runner with setup-ruby. The `container` legs
+# run the same script inside an official Ruby image, where the gems land in
+# the image's own gem home (/usr/local/bundle) and the C library and
+# compiler are the image's: musl on Alpine, and the Debian releases old
+# Rubies were deployed on. A binary built on the runner needs a newer glibc
+# than those images have, so the `static-cli` job builds one static musl
+# binary, and every x86_64 Linux leg runs it, on the runner too: one build
+# instead of one per leg. The macOS, Windows and ARM legs build their own.
+#
+# Every leg downloads gems from rubygems.org, and a rebuild of a precompiled
+# install downloads the source gem and `mini_portile2` from it too.
+#
+# Not required for merge: no `merge_group` trigger, and no job here is a
+# `needs` of ci.yml's `ci-ok`.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    # Only the files of the gem native-extension rebuild and this test. A
+    # change to shared engine code runs the matrix on the push to main
+    # (when it is in the push filter below) or nightly, or on demand via
+    # workflow_dispatch on the PR branch.
+    paths:
+      - '.github/workflows/nokogiri-compatibility.yml'
+      - 'tests/nokogiri/**'
+      - 'crates/socket-patch-core/src/patch/gem_ext.rs'
+      - 'crates/socket-patch-core/src/patch/gem_source.rs'
+      - 'crates/socket-patch-core/src/crawlers/ruby_crawler.rs'
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/nokogiri-compatibility.yml'
+      - 'tests/nokogiri/**'
+      - 'Cargo.lock'
+      - 'Cargo.toml'
+      - 'crates/*/Cargo.toml'
+      - 'crates/socket-patch-core/src/patch/**'
+      - 'crates/socket-patch-core/src/crawlers/ruby_crawler.rs'
+      - 'crates/socket-patch-core/src/formats/gem/**'
+      - 'crates/socket-patch-core/src/manifest/**'
+      - 'crates/socket-patch-core/src/vex/**'
+      - 'crates/socket-patch-core/src/vendor/registry_fetch.rs'
+      - 'crates/socket-patch-core/src/utils/http.rs'
+      - 'crates/socket-patch-core/src/utils/process.rs'
+      - 'crates/socket-patch-cli/src/commands/apply.rs'
+      - 'crates/socket-patch-cli/src/commands/rollback.rs'
+      - 'crates/socket-patch-cli/src/commands/vex*.rs'
+      - 'rust-toolchain.toml'
+      - '.cargo/**'
+  schedule:
+    # Nightly full matrix, so a main change outside the push filter still
+    # gets a run within a day, and so does a new image or runner toolchain.
+    - cron: '43 5 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Supersede stale PR runs only: main runs are the only rust-cache writers
+# (save-if), so push and dispatch runs are never cancelled mid-save.
+concurrency:
+  group: nokogiri-compat-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  SOCKET_NO_CONFIG: '1'
+  SOCKET_NO_UPDATE_CHECK: '1'
+  SOCKET_TELEMETRY_DISABLED: '1'
+
+jobs:
+  native:
+    name: ${{ matrix.ruby }} / nokogiri ${{ matrix.nokogiri }} ${{ matrix.install }} / ${{ matrix.os }}${{ matrix.note && format(' ({0})', matrix.note) || '' }}
+    if: github.event.pull_request.draft != true
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Precompiled, the x86_64-linux-gnu gem of each line, in a bundle
+          # with the Rails of its years: the test also boots a Rails
+          # application on the patched nokogiri.
+          - {os: ubuntu-latest, ruby: '3.4', nokogiri: '1.19.3', install: precompiled, rails: '~> 8.1.0'}
+          - {os: ubuntu-latest, ruby: '3.4', nokogiri: '1.18.10', install: precompiled, rails: '~> 8.0.0'}
+          - {os: ubuntu-latest, ruby: '3.3', nokogiri: '1.16.8', install: precompiled, rails: '~> 7.1.0'}
+          - {os: ubuntu-latest, ruby: '3.1', nokogiri: '1.15.7', install: precompiled, rails: '~> 7.0.0'}
+          - {os: ubuntu-latest, ruby: '3.0', nokogiri: '1.13.10', install: precompiled, rails: '~> 6.1.0'}
+          - {os: ubuntu-latest, ruby: '2.7', nokogiri: '1.11.7', install: precompiled, rails: '~> 6.0.0'}
+          # Compiled by RubyGems: the releases that have no precompiled gem,
+          # and a current one forced to the ruby platform. Rails 4.2 needs
+          # Bundler 1.
+          - {os: ubuntu-latest, ruby: '2.6', nokogiri: '1.10.10', install: source, rails: '~> 5.2.0'}
+          - {os: ubuntu-latest, ruby: '2.5', nokogiri: '1.8.5', install: source, rails: '~> 5.1.0'}
+          - {os: ubuntu-latest, ruby: '2.3', nokogiri: '1.6.8.1', install: source, rails: '~> 4.2.0', bundler: '1'}
+          - {os: ubuntu-latest, ruby: '3.4', nokogiri: '1.18.10', install: source}
+          - {os: ubuntu-latest, ruby: '3.4', nokogiri: '1.18.10', install: system-libraries, system-libxml2: true}
+          - {os: ubuntu-latest, ruby: '3.4', nokogiri: '1.18.10', install: precompiled, system-libxml2: true, args: '--bundle-setting BUNDLE_BUILD__NOKOGIRI=--use-system-libraries', note: legacy setting}
+          # No compiler on PATH: nothing may change.
+          - {os: ubuntu-latest, ruby: '3.4', nokogiri: '1.18.10', install: precompiled, build: unavailable, args: '--hide-toolchain', note: no toolchain}
+          # JRuby: the Ruby-only record applies, a C record is refused.
+          - {os: ubuntu-latest, ruby: 'jruby-9.4', nokogiri: '1.18.10', install: java, build: refused}
+          # The other platform gems.
+          - {os: ubuntu-24.04-arm, ruby: '3.4', nokogiri: '1.18.10', install: precompiled, cli: build}
+          - {os: macos-latest, ruby: '3.4', nokogiri: '1.18.10', install: precompiled, cli: build}
+          - {os: macos-latest, ruby: '3.4', nokogiri: '1.18.10', install: source, cli: build}
+          # A short project path: the MinGW tools stop at 260 characters,
+          # and a build in the stage is some 60 deeper than one in place.
+          - {os: windows-latest, ruby: '3.4', nokogiri: '1.18.10', install: precompiled, cli: build, args: '--work "$RUNNER_TEMP/n"'}
+    needs: static-cli
+    runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS != 'true' && matrix.os == 'ubuntu-latest' && 'depot-ubuntu-24.04-4' || matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      # `cli: build` legs (not x86_64 Linux) build the binary they run.
+      - if: matrix.cli == 'build'
+        run: rustup show
+      - if: matrix.cli == 'build'
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          shared-key: dev-${{ matrix.os }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Build socket-patch
+        if: matrix.cli == 'build'
+        shell: bash
+        # A relative path: the Ruby of a Windows leg does not read the
+        # `/d/a/...` paths its shell prints.
+        run: |
+          cargo build --locked -p socket-patch-cli
+          echo "SOCKET_PATCH_BIN=target/debug/socket-patch" >> "$GITHUB_ENV"
+      - name: Download the static socket-patch
+        if: matrix.cli != 'build'
+        uses: ./.github/actions/download-artifact
+        with:
+          pattern: nokogiri-static-cli*
+          merge-multiple: 'true'
+          path: static-cli
+          verify: test -s static-cli/socket-patch
+      - name: Use the static socket-patch
+        if: matrix.cli != 'build'
+        run: |
+          chmod +x static-cli/socket-patch
+          echo "SOCKET_PATCH_BIN=static-cli/socket-patch" >> "$GITHUB_ENV"
+      - name: Setup Ruby (attempt 1)
+        # setup-ruby downloads the prebuilt Ruby from a github.com release
+        # asset; a CDN blip there is not a result. Try once more.
+        id: setup-ruby
+        uses: ruby/setup-ruby@319994f95fa847cf3fb3cd3dbe89f6dcde9f178f # v1.295.0
+        continue-on-error: true
+        with:
+          ruby-version: ${{ matrix.ruby }}
+          bundler: ${{ matrix.bundler || 'default' }}
+      - name: Setup Ruby (attempt 2)
+        if: steps.setup-ruby.outcome != 'success'
+        uses: ruby/setup-ruby@319994f95fa847cf3fb3cd3dbe89f6dcde9f178f # v1.295.0
+        with:
+          ruby-version: ${{ matrix.ruby }}
+          bundler: ${{ matrix.bundler || 'default' }}
+      - name: Install the system libxml2 and libxslt headers
+        if: matrix.system-libxml2
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libxml2-dev libxslt1-dev
+      - name: Patch a real nokogiri ${{ matrix.nokogiri }} install
+        shell: bash
+        # The names carry a prefix because a build reads its environment:
+        # libxml2's configure script takes `INSTALL` for the install program.
+        env:
+          E2E_NOKOGIRI: ${{ matrix.nokogiri }}
+          E2E_INSTALL: ${{ matrix.install }}
+          E2E_BUILD: ${{ matrix.build || 'ok' }}
+          E2E_RAILS: ${{ matrix.rails }}
+          E2E_ARGS: ${{ matrix.args }}
+        run: |
+          ruby --version
+          # E2E_ARGS is a shell-quoted list of flags from the matrix above.
+          eval "set -- $E2E_ARGS"
+          ruby tests/nokogiri/nokogiri_e2e.rb --socket-patch "$SOCKET_PATCH_BIN" \
+            --nokogiri "$E2E_NOKOGIRI" --install "$E2E_INSTALL" --build "$E2E_BUILD" \
+            ${E2E_RAILS:+--rails "$E2E_RAILS"} "$@"
+
+  static-cli:
+    name: static socket-patch for the x86_64 Linux legs
+    if: github.event.pull_request.draft != true
+    runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS == 'true' && 'ubuntu-latest' || 'depot-ubuntu-24.04-4' }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - run: |
+          rustup show
+          rustup target add x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          shared-key: nokogiri-static
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Install cross
+        # The tool release.yml builds the musl targets with.
+        uses: taiki-e/install-action@65851e10cd6c377f11a60e600abc07cb08643468 # v2.79.3
+        with:
+          tool: cross@0.2.5
+      - name: Build
+        run: |
+          cross build --locked -p socket-patch-cli --target x86_64-unknown-linux-musl
+          mkdir -p static-cli
+          cp target/x86_64-unknown-linux-musl/debug/socket-patch static-cli/socket-patch
+      - uses: ./.github/actions/upload-artifact
+        with:
+          name: nokogiri-static-cli
+          path: static-cli/socket-patch
+          if-no-files-found: error
+          retention-days: '1'
+
+  container:
+    name: ${{ matrix.image }} / nokogiri ${{ matrix.nokogiri }} ${{ matrix.install }}${{ matrix.note && format(' ({0})', matrix.note) || '' }}
+    if: github.event.pull_request.draft != true
+    needs: static-cli
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # musl: the `x86_64-linux-musl` gem, rebuilt with Alpine's compiler.
+          - image: 'ruby:3.4-alpine'
+            digest: sha256:68d60620b4458fc58c1e1d04a79ee26b85564fdd5387f3071ae077e2c56ae766
+            nokogiri: '1.18.10'
+            install: precompiled
+            setup: apk add --no-cache build-base
+          # The Debian image a Rails app is usually built in.
+          - image: 'ruby:3.4-slim'
+            digest: sha256:65680693964528b522a38d85ec5065538c7ab9e75268802aab9770f39ee56de0
+            nokogiri: '1.18.10'
+            install: precompiled
+            setup: apt-get update -qq && apt-get install -y -qq --no-install-recommends build-essential
+          # The same image as it ships: no compiler at all.
+          - image: 'ruby:3.4-slim'
+            digest: sha256:65680693964528b522a38d85ec5065538c7ab9e75268802aab9770f39ee56de0
+            nokogiri: '1.18.10'
+            install: precompiled
+            build: unavailable
+            note: no toolchain
+            # racc is nokogiri's one dependency and has a C extension. Ruby
+            # 3.4 ships 1.8.1, so pinning it keeps the install from needing
+            # the compiler this leg is about not having.
+            args: --gem 'gem "racc", "1.8.1"'
+          # The Rubies of the Rails 4.2 to 6.0 years, on the Debian release
+          # and the compiler they were deployed with.
+          - image: 'ruby:2.7'
+            digest: sha256:f4420f957a9b4fae91a8d8c7fab8ba43e5a76bd640c87cb2b20ef669039e1319
+            nokogiri: '1.11.7'
+            install: precompiled
+          - image: 'ruby:2.5'
+            digest: sha256:dde6be82028418fa39afcc712ac958af05e67dcb31879a3bd76b688453fe4149
+            nokogiri: '1.8.5'
+            install: source
+          - image: 'ruby:2.3'
+            digest: sha256:78cc821d95c48621e577b6b0d44c9d509f0f2a4e089b9fd0ca2ae86f274773a8
+            nokogiri: '1.6.8.1'
+            install: source
+          # RubyGems 2.2, the oldest that builds an extension into a dir of
+          # its own, which is what `apply` rebuilds.
+          - image: 'ruby:2.1'
+            digest: sha256:568664cfb53cd74147590cc86e356c4e352e00e28a0011ea1443e8664ca5bad5
+            nokogiri: '1.6.8.1'
+            install: source
+    runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS == 'true' && 'ubuntu-latest' || 'depot-ubuntu-24.04-4' }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/download-artifact
+        with:
+          pattern: nokogiri-static-cli*
+          merge-multiple: 'true'
+          path: static-cli
+          verify: test -s static-cli/socket-patch
+      - name: Patch a real nokogiri ${{ matrix.nokogiri }} install in ${{ matrix.image }}
+        env:
+          E2E_IMAGE: ${{ matrix.image }}@${{ matrix.digest }}
+          E2E_NOKOGIRI: ${{ matrix.nokogiri }}
+          E2E_INSTALL: ${{ matrix.install }}
+          E2E_BUILD: ${{ matrix.build || 'ok' }}
+          E2E_SETUP: ${{ matrix.setup || 'true' }}
+          E2E_ARGS: ${{ matrix.args }}
+        # The script and the binary are mounted read-only; the project it
+        # builds lives in the container's own temp dir, and the gems go
+        # where the image's Bundler settings put them.
+        run: |
+          chmod +x static-cli/socket-patch
+          docker run --rm \
+            -v "$PWD/tests/nokogiri:/e2e:ro" -v "$PWD/static-cli:/cli:ro" \
+            -e SOCKET_NO_CONFIG -e SOCKET_NO_UPDATE_CHECK -e SOCKET_TELEMETRY_DISABLED \
+            -e E2E_NOKOGIRI -e E2E_INSTALL -e E2E_BUILD -e E2E_SETUP -e E2E_ARGS \
+            "$E2E_IMAGE" sh -ec '
+              sh -ec "$E2E_SETUP"
+              ruby --version
+              eval "set -- $E2E_ARGS"
+              ruby /e2e/nokogiri_e2e.rb --socket-patch /cli/socket-patch \
+                --nokogiri "$E2E_NOKOGIRI" --install "$E2E_INSTALL" --build "$E2E_BUILD" --gem-home ambient "$@"
+            '

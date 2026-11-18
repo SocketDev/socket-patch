@@ -129,6 +129,7 @@ impl Policy {
                 cwd: common.cwd.clone(),
                 rebuild: !common.no_gem_native_rebuild,
                 offline: common.offline,
+                progress: common.gem_build_progress(),
             },
         }
     }
@@ -1331,6 +1332,7 @@ mod tests {
                 cwd: root.to_path_buf(),
                 rebuild: true,
                 offline: true,
+                progress: None,
             },
         }
     }

@@ -3664,6 +3664,7 @@ pub(crate) async fn rollback_patches_inner(
                             cwd: common.cwd.clone(),
                             rebuild: !common.no_gem_native_rebuild,
                             offline: common.offline,
+                            progress: common.gem_build_progress(),
                         };
                         if let Err(e) = gem_ext::restore_original_build(pkg_path, &env).await {
                             result.success = false;
