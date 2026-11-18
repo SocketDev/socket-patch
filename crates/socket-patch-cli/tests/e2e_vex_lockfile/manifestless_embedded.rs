@@ -1,7 +1,7 @@
 //! Embedded `--vex` on a checkout with NO `.socket/manifest.json`.
 //!
 //! Hosted (`scan --mode hosted`) and vendored (`scan --mode vendored`,
-//! depscan) checkouts carry their patches in the lockfiles and
+//! GitHub-app) checkouts carry their patches in the lockfiles and
 //! `.socket/vendor`, not the manifest. `apply --vex` / `vendor --vex` used
 //! to take the no-manifest early return and exit 0 WITHOUT a
 //! document — a silently missed attestation (and a previous run's document

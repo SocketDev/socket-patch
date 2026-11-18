@@ -1,8 +1,8 @@
 //! Registry-redirect rewriters (the hosted-mode `scan` engine).
 //!
 //! Rewrites lockfiles / registry configs so ONLY the patched dependency points
-//! at Socket's HOSTED vendored patches — the Rust counterpart of the depscan
-//! backend's `@socketsecurity/app/patches/registry-rewrite` TS rewriters. Both
+//! at Socket's HOSTED vendored patches — the Rust counterpart of the TS
+//! rewriters in Socket's backend. Both
 //! sides are held byte-consistent by the SHARED golden fixtures under
 //! `tests/fixtures/redirect/` (see `tests/redirect_golden.rs`): a fixture's
 //! `expected/` bytes are produced identically by the TS backend (the GitHub-app
@@ -62,7 +62,7 @@ use crate::formats::cargo::hosted::CargoLockPlan;
 #[cfg(test)]
 use crate::formats::cargo::hosted::CARGO_LOCK_REFERENCE_KIND;
 use crate::formats::cargo::source_replacement::{crates_io_source, ConfigLayer, CratesIoSource};
-use crate::formats::cargo::CargoLock;
+use crate::formats::cargo::{is_crates_io_patch_table, is_crates_io_source, CargoLock};
 use crate::formats::composer::hosted::rewrite_composer_lock;
 use crate::formats::gem::hosted::{
     bundled_before_2_2, checksum_entry_span, converge_gem_lock_source, lock_layout,
@@ -2563,22 +2563,6 @@ fn cargo_manifest_package_id(
     Some((name.to_string(), version.to_string()))
 }
 
-/// Whether a Cargo.lock `source` (or a `[patch.<url>]` key) names crates.io,
-/// in either the git-index or the sparse spelling. Compared the way cargo's
-/// `CanonicalUrl` does: host casing, a trailing `/` and a `.git` suffix do
-/// not make a different source (and github paths are case-insensitive).
-pub(crate) fn is_crates_io_source(source: &str) -> bool {
-    let url = source.trim();
-    let url = url
-        .strip_prefix("registry+")
-        .or_else(|| url.strip_prefix("sparse+"))
-        .unwrap_or(url)
-        .to_ascii_lowercase();
-    let url = url.trim_end_matches('/');
-    let url = url.strip_suffix(".git").unwrap_or(url);
-    url == "https://github.com/rust-lang/crates.io-index" || url == "https://index.crates.io"
-}
-
 /// Whether a Cargo.lock `source` is a Socket per-patch sparse index
 /// (`sparse+…/<patch uuid>/index/`) — an earlier generation's pin, which a
 /// re-run legitimately repoints.
@@ -2670,7 +2654,12 @@ fn cargo_patch_override_table(
             continue;
         };
         for (registry, table) in patch.iter() {
-            if registry != "crates-io" && !is_crates_io_source(registry) {
+            // Wider than cargo's own reading of a `[patch]` key, on purpose:
+            // cargo applies only `crates-io` and the git-index URL to
+            // crates.io. A table under crates.io's sparse URL is the user's
+            // attempt at an override all the same, and a pin beside it is
+            // refused, not guessed at.
+            if !is_crates_io_patch_table(registry) && !is_crates_io_source(registry) {
                 continue;
             }
             let Some(table) = table.as_table_like() else {
@@ -4616,7 +4605,7 @@ fn preflight_yarn_classic_hosted(
 /// segments, for the `original` / `new` strings of a
 /// `redirect_yarn_classic_entry` edit.
 ///
-/// The record is a cross-language contract: depscan's TS rewriter and the
+/// The record is a cross-language contract: the Socket backend's TS rewriter and the
 /// shared `tests/fixtures/redirect/npm/yarn-classic/*/expected-edits.json`
 /// fixtures record the segment (`split("\n\n")` over the LF-normalized
 /// lock) that holds the block, so a block that follows two blank lines
@@ -8886,8 +8875,8 @@ fn rewrite_gem(
 // ── maven (pom.xml version pin + repository + trusted checksums) ────────────
 //
 // Maven has no lockfile, so the patched jar is pinned two ways depending on
-// whether the reference API captured a rewritable upstream pom (see the TS twin
-// `registry-rewrite/maven-pom.ts` for the full rationale):
+// whether the reference API captured a rewritable upstream pom (the Socket backend's TS
+// twin carries the full rationale):
 //
 //   FAIL-CLOSED — the override carries `identifiers.mavenSuffixedVersion`
 //   (`<base>-socket.<hex8>`) + the `mavenPomSha256` of the served pom. That
@@ -18013,6 +18002,8 @@ mod tests {
             // Spellings cargo canonicalizes to the same crates.io source.
             "[patch.\"https://github.com/rust-lang/crates.io-index.git\"]",
             "[patch.\"https://GitHub.com/Rust-Lang/crates.io-index/\"]",
+            // The sparse URL, which cargo does not apply to crates.io (it
+            // reports the patch as unused): refused all the same.
             "[patch.\"sparse+https://Index.Crates.io/\"]",
         ] {
             let mut files = cargo_files(&format!(

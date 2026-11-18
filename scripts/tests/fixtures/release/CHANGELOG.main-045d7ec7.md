@@ -423,7 +423,7 @@ plain (agent), `(vendored)`, and `(redirected)` (hosted).
   (bundler ≥ 2.6). A dep counts as redirected only when its hosted URL (or
   per-dep registry index) actually landed in a project file; re-runs are
   idempotent (zero new edits over already-rewritten output). The Rust
-  rewriters are held byte-identical to the depscan backend's TS twins (the
+  rewriters are held byte-identical to the Socket backend's TS twins (the
   GitHub-app hosted PR flow) by shared golden fixtures under
   `tests/fixtures/redirect/`. JSON output gains a `redirect` sub-object with
   `mode: "hosted"`, `redirected`, `rewrittenFiles`, `skipped`, `warnings`.
@@ -522,7 +522,7 @@ plain (agent), `(vendored)`, and `(redirected)` (hosted).
   recorded as a `removed` ledger edit, offline, fails closed;
   `redirect_bun_lockb_would_migrate` on `--dry-run`,
   `redirect_bun_lockb_unsupported` if the migration is unavailable). The Rust
-  rewriters are byte-identical to the depscan backend's TS twins via shared
+  rewriters are byte-identical to the Socket backend's TS twins via shared
   golden fixtures.
 - **Hosted mode supports Rush monorepos.** A Rush repo has no root
   `package.json`/lockfile pair — its pnpm source-of-truth lock lives at
@@ -551,7 +551,7 @@ plain (agent), `(vendored)`, and `(redirected)` (hosted).
   the build-once converter; and the default `GOPROXY` chain would leak
   licensed bytes / tokened URLs to the public mirror. The full analysis lives
   in `docs/ecosystems.md#go-directory-replaces-and-gosum`; both the CLI rewriter and the
-  depscan backend twin emit `redirect_golang_unsupported` naming the remedy
+  Socket backend twin emit `redirect_golang_unsupported` naming the remedy
   (use vendored mode, which gives Go everything hosted promises elsewhere).
   The one sanctioned exception — an ephemeral-CI GOPROXY recipe — is
   documentation-only and never written into a repository.
@@ -723,7 +723,7 @@ plain (agent), `(vendored)`, and `(redirected)` (hosted).
   modes refused every lock written by bun ≥ 1.4
   (`redirect_bun_lock_unsupported` / `vendor_lockfile_version_unsupported`).
   The gate now accepts versions 1 and 2 and keeps failing closed on
-  anything else; new shared golden fixture `npm/bun/lock-v2` (the depscan
+  anything else; new shared golden fixture `npm/bun/lock-v2` (the Socket backend
   TS twin needs the matching acceptance + fixture sync).
 - **gem: every coexisting installed copy is patched.** Bundler's scoped
   `<engine>/<abi>/gems` and flat `gems/` stores can coexist under one

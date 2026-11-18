@@ -7,7 +7,7 @@
 //! artifacts. Either way the patch uuid is recoverable from the wired string
 //! itself, which is what lets `socket-patch vex` attest a project with NO
 //! `.socket/manifest.json` — and possibly no `.socket/vendor` ledgers either
-//! (a depscan-opened PR, a clone of a repo that never committed them).
+//! (a GitHub-app PR, a clone of a repo that never committed them).
 //!
 //! [`discover_patched_refs`] reads every supported lockfile / package-manager
 //! config at the project ROOT and returns one [`PatchedRef`] per wired

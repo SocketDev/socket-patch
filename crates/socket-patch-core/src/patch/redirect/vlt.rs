@@ -1,5 +1,5 @@
 //! vlt `vlt-lock.json` hosted rewriter, the byte-for-byte twin of the TS
-//! `registry-rewrite/vlt.ts`.
+//! rewriter in Socket's backend.
 //!
 //! A default-registry node keeps its DepID and has only slot [2] (the
 //! patched sha512) and slot [3] (the hosted URL) spliced into its one-line

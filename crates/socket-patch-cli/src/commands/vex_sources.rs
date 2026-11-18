@@ -14,7 +14,7 @@
 //!    fallback). Kept in memory — this module never writes the manifest.
 //!
 //! plus `vex::discover`'s lockfile references, which contribute two things:
-//! patches that NO ledger or manifest records (a depscan PR, an uncommitted
+//! patches that NO ledger or manifest records (a GitHub-app PR, an uncommitted
 //! ledger), and the WIRING-LIVENESS proof for ledger entries.
 //!
 //! Gates, applied before (and independently of) hash verification — so

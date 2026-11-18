@@ -129,6 +129,7 @@
     "e2e_vendor_npm_build": 1.24,
     "e2e_vendor_pnpm_build": 12.61,
     "e2e_vendor_pypi_build": 34.89,
+    "e2e_vendor_rush": 0.0,
     "e2e_vendor_vlt_build": 0.0,
     "e2e_vendor_yarn_berry_build": 2.22,
     "e2e_vendor_yarn_classic_build": 0.95,

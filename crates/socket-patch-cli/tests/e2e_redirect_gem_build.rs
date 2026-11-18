@@ -68,8 +68,8 @@
 //! and gains the `!`, and where the lock has `CHECKSUMS` the entry holds the
 //! patched sha. The canary proves the converged pair installs patched bytes
 //! on a fresh checkout both FROZEN (`BUNDLE_FROZEN=true`, lock
-//! byte-identical) and unfrozen. The depscan TS twin (registry-rewrite
-//! gem.ts) must be ported to match.
+//! byte-identical) and unfrozen. The Socket backend's TS twin of this
+//! rewriter must be ported to match.
 //!
 //! `rollback` / `remove` take the option off again: the pair is the
 //! pre-scan pair, byte for byte.
@@ -3673,6 +3673,15 @@ fn vendor_eject_keeps_the_hosted_group_pin(fx: &RedirectFixture, dry_run: bool) 
         events[0]["errorCode"], "gemfile_declaration_not_editable",
         "{label}: {env}"
     );
+    // #2091: the refusal says how to get out of it. The gem is declared in
+    // a `group :development do` block, which one top-level option replaces,
+    // and it is hosted already, so hosted mode is the mode to leave it to.
+    let detail = events[0]["error"].as_str().unwrap_or_default();
+    assert!(
+        detail.contains("move it to the top level with the option `group: :development`")
+            && detail.contains(&format!("or leave {DEP} to hosted mode (`--mode hosted`)")),
+        "{label}: the refusal names both ways out: {env}"
+    );
     assert_eq!(env["error"]["code"], "eject_refused", "{label}: {env}");
     assert!(
         !stdout.contains("eject_planned") && !stdout.contains("eject_rolled_back"),
@@ -5267,6 +5276,103 @@ async fn gem_hosted_unwind_names_a_patched_archive_in_vendor_cache() {
     for refresh in [true, false] {
         unwind_names_the_patched_cached_archive(&fx, "rollback", refresh);
         unwind_names_the_patched_cached_archive(&fx, "remove", refresh);
+    }
+}
+
+/// #2092 against a real Bundler: the gem home has no `cache/` dir (Bundler
+/// 4.1's `prune` setting, the `rm -rf "${BUNDLE_PATH}"/ruby/*/cache` of the
+/// Dockerfile Rails generates), so the unwind has no archive to judge the
+/// installed patched gem by. It judges the copy by the pin's patch record
+/// and puts the upstream gem back. Left alone, `bundle install` would call
+/// the bundle complete and keep the patched copy under the upstream lock.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "host capstone: shells out to a real ruby/gem/bundler (>= 1.17; CHECKSUMS arm >= 2.6); \
+            the unpinned `test` job skips it, an e2e job with a pinned toolchain runs it via --ignored"]
+async fn gem_hosted_unwind_restores_an_install_whose_home_cache_was_pruned() {
+    let Some(fx) = redirect_scanned_project(
+        "pruned-unwind",
+        Spelling::Gemfile,
+        false,
+        true,
+        None,
+        Driver::ScanVex,
+    )
+    .await
+    else {
+        return;
+    };
+    for command in ["rollback", "remove"] {
+        let dir = stage_fresh_checkout(&fx, &format!("pruned-{command}"));
+        let install = bundle(&dir, &["install"]);
+        assert!(
+            install.status.success(),
+            "{command}: hosted install:\n{}",
+            String::from_utf8_lossy(&install.stderr)
+        );
+        let installed = fresh_installed_lib(&dir, &format!("{DEP}-{DEP_VERSION}"), "vuln_gem.rb");
+        assert_eq!(
+            std::fs::read(&installed).unwrap(),
+            fx.patched,
+            "{command}: the patched gem is installed (test premise)"
+        );
+        // <home>/gems/<leaf>/lib/<file>
+        let home = installed.ancestors().nth(4).unwrap();
+        std::fs::remove_dir_all(home.join("cache")).unwrap();
+
+        let api = fx._server.uri();
+        let upstream = format!("{api}/upstream");
+        let cwd = dir.to_str().expect("utf8 tmp path");
+        let mut argv = vec![command, PURL, "--json", "--cwd", cwd];
+        if command == "remove" {
+            argv.push("--yes");
+        }
+        argv.extend([
+            "--api-url",
+            &api,
+            "--org",
+            ORG,
+            "--api-token",
+            "fake",
+            "--patch-server-url",
+            &api,
+        ]);
+        let (code, stdout, stderr) =
+            run_socket_env(&dir, &argv, &[("SOCKET_RUBYGEMS_URL", &upstream)]);
+        let env: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_else(|e| {
+            panic!("{command}: not JSON: {e}\nstdout:\n{stdout}\nstderr:\n{stderr}")
+        });
+        assert_eq!(code, 0, "{command}: {env}\nstderr:\n{stderr}");
+        let lock = std::fs::read_to_string(dir.join(fx.lock_name)).unwrap();
+        assert!(
+            !lock.contains(&fx.index_url),
+            "{command}: the lock is back on upstream:\n{lock}"
+        );
+        assert_eq!(
+            std::fs::read(&installed).unwrap(),
+            orig_lib().into_bytes(),
+            "{command}: the installed gem is the upstream one again: {env}"
+        );
+        assert!(
+            env.to_string().contains("upstream_gem_install_refreshed")
+                && !env.to_string().contains("upstream_gem_stale_install"),
+            "{command}: {env}"
+        );
+        assert!(
+            !home.join("cache").exists(),
+            "{command}: a pruned cache dir is not created"
+        );
+        // The restored project installs as it is, and keeps the upstream gem.
+        let install = bundle(&dir, &["install"]);
+        assert!(
+            install.status.success(),
+            "{command}: bundle install after the unwind:\n{}",
+            String::from_utf8_lossy(&install.stderr)
+        );
+        assert_eq!(
+            std::fs::read(&installed).unwrap(),
+            orig_lib().into_bytes(),
+            "{command}: bundle install keeps the upstream bytes"
+        );
     }
 }
 
