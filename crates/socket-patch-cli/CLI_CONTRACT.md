@@ -2107,6 +2107,7 @@ command's integration tests check its output.
 | `redirect_maven_multimodule_unsupported` | `warnings[]` (warning) | scan / get `--mode hosted` (Maven): the root `pom.xml` heads a reactor that cannot be planned: a module pom is missing or not readable as a pom, a `<module>` path is a property or leaves the project, or the grant serves the patched artifact under its original version (a same-GAV grant). The detail carries the reason. The poms and `.mvn/` stay byte-identical and the dep is not counted as redirected. A reactor that can be read is patched module by module: see [Hosted Maven reactors and property versions](#hosted-maven-reactors-and-property-versions). |
 | `redirect_maven_pin_would_move_module` | `warnings[]` (warning) | scan / get `--mode hosted` (Maven reactor): a parent pom resolves the base version itself above a module that resolves another version, so the parent takes no pin (Maven's management always reaches the children); the modules below it that select the base version are pinned. Also reported when a pin an earlier run wrote is taken out because a module it reaches now resolves another version, which the pin would hold back (the `redirect_maven_dep_management` edit has `action: "removed"`). Exit 0. |
 | `redirect_maven_edit_not_reversible` | `warnings[]` (warning) | scan / get `--mode hosted` (Maven): a pom would take an edit that `rollback` could not undo byte for byte from the pom alone. A pin in a `<dependencyManagement>` that holds no entry (which would be left changed or removed) leaves that one pom as it is: the modules it would have wired stay unpatched, and `vex` withholds the statement while one of them resolves the base version. Any other case (a `<repositories>` section that would not come back as it was) refuses the whole plan for the patch: nothing is written and the dep is not counted as redirected. Exit 0. See [Hosted Maven reactors and property versions](#hosted-maven-reactors-and-property-versions). |
+| `redirect_maven_mirror_captures_repository` | `warnings[]` (warning) | scan / get `--mode hosted` (Maven, on disk): the Maven settings of the scanning machine declare a `<mirror>` whose `<mirrorOf>` matches the `socket-patch-<uuid>` repository the pin needs (`*`, `external:*`, or a list without `!socket-patch-<uuid>`), without being a mirror of that repository alone. The mirror does not hold the patched version, so the build could not resolve it: nothing is written for the dep, `pom.xml` and `.mvn/` stay byte-identical, and the dep is not counted as redirected. Exit 0. The detail names the mirror id, its `<mirrorOf>`, the settings file, the exclusion to add and the vendored alternative, and says that only this machine's settings were read. See [Hosted Maven behind a mirror](#hosted-maven-behind-a-mirror) |
 | `redirect_gem_no_checksums_section` | `warnings[]` (warning) | scan/get `--mode hosted` (gem): the lock has no `CHECKSUMS` section (Bundler < 2.6 does not write one), so it cannot record the sha256 of the patched gems. They are redirected all the same (manifest and lock converged, frozen installs accept the pair) and pinned by source alone. Reported once per run, naming the gems; relock with Bundler ≥ 2.6 (`bundle lock --add-checksums`) and re-run to pin the checksums too. |
 | `redirect_gem_merged_lock_layout` | `warnings[]` (warning) | scan/get `--mode hosted` (gem): the lock was written by Bundler < 2.2 (`BUNDLED WITH`), which lists every gem source in ONE `GEM` section, so this run added the patch registry to that section's `remote:` lines. The pair installs with that Bundler, frozen / deployment mode included. Newer Bundlers deprecate such a section and from 2.5 on refuse the pair under frozen / deployment mode: if a newer Bundler installs the project, run `bundle lock` with it, commit the lock and re-run the hosted scan. Raised only by a run that wrote the lock. |
 | `redirect_gem_unrecognized_declaration` | `warnings[]` (warning) | scan/get `--mode hosted` (gem): the gem's declaration cannot take a `source:` option in place (the detail gives the reason). The gem is skipped and the manifest and lock stay byte-identical for it; write the declaration as one `gem "<name>", …` call with literal arguments on a line of its own, or use `--mode vendored` / `--mode agent`. |
@@ -2775,6 +2776,47 @@ management at the patched version, or a declaration at it. A module a pin does
 not reach that resolves the base version, or whose selection cannot be told on
 the machine that runs `vex`, withholds the attestation, with the module named.
 `vendor --check` does not ask this.
+
+### Hosted Maven behind a mirror
+
+A `<mirror>` in Maven's `settings.xml` replaces every repository its
+`<mirrorOf>` matches. A `<mirrorOf>*</mirrorOf>` (or `external:*`) therefore
+replaces the `socket-patch-<uuid>` repository a hosted pin adds, and the
+mirror does not hold the suffixed version: the build fails to resolve it.
+
+Before `scan --mode hosted` writes anything for a Maven patch on disk, it
+reads the mirrors Maven is configured with on that machine and evaluates
+Maven's own rule against the repository the pin would add (its id
+`socket-patch-<patch uuid>`, its `https://` URL, the `default` layout):
+
+* settings read: the user settings (`-s` / `--settings` from `MAVEN_ARGS`,
+  else from `.mvn/maven.config`, else `<user.home>/.m2/settings.xml`) merged
+  over the global settings (`-gs` / `--global-settings` likewise, else
+  `conf/settings.xml` of the Maven Wrapper's unpacked distribution, else of
+  `$MAVEN_HOME` / `$M2_HOME`, else of the `mvn` on `PATH`): the user's
+  mirrors first, then the global ones whose id the user does not declare. A
+  `.mvn/settings.xml` in the project is evaluated the same way as a second
+  set (Maven 4 loads it; a Maven 3 build is often given it with `-s`);
+* a mirror whose whole `<mirrorOf>` is the repository's id wins over every
+  pattern, and is not a capture: it was written for that repository;
+* otherwise the first mirror, in order, whose pattern matches: `*`,
+  `external:*` (not `localhost` / `127.0.0.1`, not `file:`), `external:http:*`
+  (plain HTTP only, so never the Socket repository), or a comma-separated
+  list of ids and wildcards in which `!id` excludes that repository. Ids are
+  whole ids and list segments are compared as written (`*, !id`, with a
+  space, excludes nothing), as in Maven;
+* `<mirrorOfLayouts>` must accept `default`.
+
+When a mirror captures the repository, nothing is written for that dep and
+the run reports `redirect_maven_mirror_captures_repository` (exit 0; the dep
+is not counted as redirected; a pin an earlier run wrote stays as it is).
+The other patches of the run are unaffected.
+
+The repository id is one per patch and Maven has no pattern for a family of
+ids, so a mirror can only leave Socket's repositories out one id at a time.
+The settings read are the scanning machine's: the detail says so, since the
+machine that builds may be configured otherwise. The in-memory engine has no
+machine and reads no settings.
 
 ### Hosted Maven reactors and property versions
 

@@ -781,6 +781,38 @@ async fn read_maven_reactor(
     }
 }
 
+/// Hand the pom rewriter the mirrors Maven is configured with on this
+/// machine
+/// ([`settings_mirror_sets`](crate::crawlers::maven_crawler::settings_mirror_sets)),
+/// under [`MAVEN_MIRRORS_KEY`](crate::patch::redirect::MAVEN_MIRRORS_KEY):
+/// it adds no repository to a pom that one of them would take over (the
+/// gem path's mirror gate, for Maven). On disk only: a memory view has no
+/// machine, and so no settings to read.
+fn read_maven_mirrors(view: &ProjectView<'_>, out: &mut CandidateFiles) {
+    if !out.files.contains_key("pom.xml") {
+        return;
+    }
+    let Some(root) = view.disk_root() else {
+        return;
+    };
+    let sets = crate::crawlers::maven_crawler::settings_mirror_sets(
+        &crate::crawlers::gradle_cache::ProcessEnv,
+        crate::gradle::Os::current(),
+        None,
+        root,
+        out.files
+            .get(crate::patch::redirect::MVN_CONFIG)
+            .map(String::as_str),
+    );
+    if sets.is_empty() {
+        return;
+    }
+    if let Ok(json) = serde_json::to_string(&sets) {
+        out.files
+            .insert(crate::patch::redirect::MAVEN_MIRRORS_KEY.to_string(), json);
+    }
+}
+
 /// An in-memory project's Go files as the hosted engine reads them
 /// ([`read_advisory`]: a link or an entry without content is unreadable,
 /// but still exists).
@@ -1082,6 +1114,7 @@ pub async fn read_candidate_files(
     // the poms of the modules that select it.
     if candidates.iter().any(|c| c.dep.ecosystem == "maven") {
         read_maven_reactor(view, unreadable, &mut out).await;
+        read_maven_mirrors(view, &mut out);
     }
 
     // NuGet merges the user config and every parent directory's config
@@ -6158,6 +6191,73 @@ snapshots:
         let (_, done) = gradle_rewrite(&p).await;
         assert!(done.rewrite.confirmed_gradle_uuids.contains(GRADLE_UUID));
         assert!(done.confirmed.is_empty(), "{:?}", done.confirmed);
+    }
+
+    /// On disk the engine reads the mirrors of the Maven settings the
+    /// build would be started with, and a project whose Socket repository
+    /// one of them would take over is left alone: nothing written, nothing
+    /// confirmed, the reason given, and no refusal of the run. A mirror
+    /// that leaves the repository out wires as usual, and so does the
+    /// same project in memory, where no machine's settings exist.
+    #[tokio::test]
+    async fn a_maven_project_behind_a_capturing_mirror_is_left_alone() {
+        use crate::patch::redirect::MAVEN_MIRRORS_KEY;
+        let pom = "<project>\n  <modelVersion>4.0.0</modelVersion>\n  <groupId>x</groupId>\n  <artifactId>y</artifactId>\n  <version>1</version>\n  <dependencies>\n    <dependency>\n      <groupId>com.socketfixture</groupId>\n      <artifactId>victim</artifactId>\n      <version>1.10.0</version>\n    </dependency>\n  </dependencies>\n</project>\n";
+        // Both settings files are named, so none of this machine's is read.
+        let config = "-s\nsettings.xml\n-gs\nglobal.xml\n";
+        let settings = |mirror_of: &str| {
+            format!(
+                "<settings>\n  <mirrors>\n    <mirror>\n      <id>corp</id>\n      \
+                 <mirrorOf>{mirror_of}</mirrorOf>\n      <url>https://nexus.example/repo</url>\n    \
+                 </mirror>\n  </mirrors>\n</settings>\n"
+            )
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let write = |rel: &str, text: &str| {
+            let path = tmp.path().join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        };
+        write("pom.xml", pom);
+        write(".mvn/maven.config", config);
+        write("global.xml", "<settings/>\n");
+        write("settings.xml", &settings("*"));
+        let view = ProjectView::Disk(tmp.path());
+        let (read, done) = gradle_rewrite_in(&view).await;
+        assert!(read.files.contains_key(MAVEN_MIRRORS_KEY));
+        assert!(done.rewrite.files.is_empty(), "{:?}", done.rewrite.files);
+        assert!(done.confirmed.is_empty(), "{:?}", done.confirmed);
+        let warning = done
+            .rewrite
+            .warnings
+            .iter()
+            .find(|w| w.code == "redirect_maven_mirror_captures_repository")
+            .unwrap_or_else(|| panic!("{:?}", done.rewrite.warnings));
+        assert!(
+            warning.detail.contains("`corp`") && warning.detail.contains("settings.xml"),
+            "{}",
+            warning.detail
+        );
+        assert!(guard(&view, &done, &[gradle_candidate()]).is_none());
+
+        // The mirror leaves the repository out.
+        write(
+            "settings.xml",
+            &settings(&format!("*,!socket-patch-{GRADLE_UUID}")),
+        );
+        let (_, done) = gradle_rewrite_in(&view).await;
+        assert!(done.rewrite.files["pom.xml"].contains("1.10.0-socket.4d5e6f70"));
+        assert_eq!(done.confirmed.len(), 1, "{:?}", done.rewrite.warnings);
+
+        // In memory: the files are there, but no machine to read them for.
+        let mut p = MemoryProject::new();
+        p.insert_text("pom.xml", pom);
+        p.insert_text(".mvn/maven.config", config);
+        p.insert_text("settings.xml", settings("*").as_str());
+        let view = ProjectView::Memory(&p);
+        let (read, done) = gradle_rewrite_in(&view).await;
+        assert!(!read.files.contains_key(MAVEN_MIRRORS_KEY));
+        assert!(done.rewrite.files["pom.xml"].contains("1.10.0-socket.4d5e6f70"));
     }
 
     /// #1809: a Maven 4 root whose subprojects Maven discovers (model
