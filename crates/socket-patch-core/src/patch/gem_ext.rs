@@ -3067,7 +3067,9 @@ fn unread_inputs(gem_dir: &Path, watch: &InputWatch, probe_dir: &Path) -> Option
     if let Some(opens) = &watch.opens {
         return (!opens.fired()).then(|| watch.inputs.clone());
     }
-    if watch.marked.is_empty() {
+    // Every input must have taken the mark: one that did not may be the
+    // one the build read.
+    if watch.inputs.is_empty() || watch.marked.len() != watch.inputs.len() {
         return None;
     }
     let read_any = watch
@@ -3077,7 +3079,7 @@ fn unread_inputs(gem_dir: &Path, watch: &InputWatch, probe_dir: &Path) -> Option
     if read_any || !records_reads(probe_dir) {
         return None;
     }
-    Some(watch.marked.clone())
+    Some(watch.inputs.clone())
 }
 
 /// What a refusal says of a build that read none of the record's inputs.
