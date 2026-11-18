@@ -47,6 +47,7 @@ mod fs_tree;
 #[path = "../hosted_memory_common/mod.rs"]
 mod hosted_memory_common;
 
+mod composer;
 mod go;
 mod harness;
 mod npm;

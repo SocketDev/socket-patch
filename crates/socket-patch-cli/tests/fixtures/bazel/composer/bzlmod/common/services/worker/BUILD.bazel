@@ -1,0 +1,47 @@
+# The packages of this project are made by a build action: `composer install`
+# from composer.lock, with vendor/ as a tar.
+#
+# No Bazel ruleset builds PHP or takes Composer packages, so a PHP project
+# under Bazel writes a genrule like this one by hand. This one stands for
+# those and is kept as small as they are. Composer and PHP are the machine's
+# own, with the machine's Composer home: .bazelrc hands PATH and that home to
+# the action. The action fetches from the network.
+genrule(
+    name = "vendor",
+    srcs = [
+        "composer.json",
+        "composer.lock",
+    ],
+    outs = ["vendor.tar"],
+    cmd = "\n".join([
+        "out=$$PWD/$@",
+        "work=$$(mktemp -d)",
+        "cp $(location composer.json) $(location composer.lock) $$work",
+        "(cd $$work && composer install --no-dev --no-interaction --no-plugins --no-progress --no-scripts --prefer-dist) >&2",
+        "tar -cf $$out -C $$work vendor",
+        "rm -r $$work",
+    ]),
+    tags = [
+        "no-remote",
+        "requires-network",
+    ],
+)
+
+# PHP runs main.php when Bazel builds this, on the vendor tree of the tar;
+# `bazel run` prints what it said.
+genrule(
+    name = "consumer",
+    srcs = [
+        "main.php",
+        ":vendor",
+    ],
+    outs = ["consumer.sh"],
+    cmd = "\n".join([
+        "work=$$(mktemp -d)",
+        "tar -xf $(location :vendor) -C $$work",
+        "{ echo '#!/bin/sh'; echo \"cat <<'EOF'\"; php -n $(location main.php) $$work/vendor/autoload.php; echo EOF; } > $@",
+        "rm -r $$work",
+    ]),
+    executable = True,
+    visibility = ["//visibility:public"],
+)
