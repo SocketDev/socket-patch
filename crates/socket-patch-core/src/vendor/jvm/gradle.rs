@@ -187,23 +187,27 @@ pub fn committed_patched(read: ReadFn<'_>, c: &Coords<'_>) -> Vec<String> {
 
 /// The first patched member (sorted) that the classifier artifact `bytes`
 /// holds with other content than the patched `jar`: a build consuming that
-/// classifier stays unpatched (#533).
-fn unpatched_copy(bytes: &[u8], jar: &[u8], patched: &[String]) -> Option<String> {
-    // Only the patched members are inflated, within the jar limits: the
-    // wheel-sized reader this went through gave up on a large jar, which
-    // then passed unchecked.
+/// classifier stays unpatched (#533). `Err` when either jar cannot be read
+/// to tell: an artifact that is not checked is not taken for patched.
+fn unpatched_copy(bytes: &[u8], jar: &[u8], patched: &[String]) -> Result<Option<String>, String> {
+    // Only the patched members are inflated, within the jar limits.
     use crate::patch::jar_members::Jar;
-    let mut copy = Jar::of_bytes(bytes).ok()?;
-    let mut patched_jar = Jar::of_bytes(jar).ok()?;
+    let mut copy = Jar::of_bytes(bytes).map_err(|e| e.to_string())?;
+    let mut patched_jar = Jar::of_bytes(jar).map_err(|e| format!("the patched jar: {e}"))?;
     let mut names: Vec<&String> = patched.iter().collect();
     names.sort();
-    names
-        .into_iter()
-        .find(|name| match copy.member_git_sha256(name) {
-            Ok(Some(held)) => patched_jar.member_git_sha256(name).ok().flatten() != Some(held),
-            _ => false,
-        })
-        .cloned()
+    for name in names {
+        let Some(held) = copy.member_git_sha256(name).map_err(|e| e.to_string())? else {
+            continue;
+        };
+        let patched = patched_jar
+            .member_git_sha256(name)
+            .map_err(|e| format!("the patched jar: {e}"))?;
+        if patched != Some(held) {
+            return Ok(Some(name.clone()));
+        }
+    }
+    Ok(None)
 }
 
 /// `(classifier, extension)` of a tree file name `<a>-<v>-<c>.<ext>`.
@@ -482,16 +486,20 @@ fn plan_as(
     }
     for x in patch.extra_artifacts {
         files.push((x.file_name(a, v), &x.bytes));
-        if let Some(member) = unpatched_copy(&x.bytes, patch.jar, patch.patched_members) {
-            warnings.push(degraded(
-                "classifier_unpatched_copy",
-                format!(
-                    "{} carries an unpatched copy of {member}; a build consuming that \
-                     classifier stays unpatched",
-                    x.file_name(a, v)
-                ),
-            ));
-        }
+        let detail = match unpatched_copy(&x.bytes, patch.jar, patch.patched_members) {
+            Ok(None) => continue,
+            Ok(Some(member)) => format!(
+                "{} carries an unpatched copy of {member}; a build consuming that classifier \
+                 stays unpatched",
+                x.file_name(a, v)
+            ),
+            Err(why) => format!(
+                "{} could not be checked for unpatched copies of the patched members ({why}); \
+                 a build consuming that classifier may stay unpatched",
+                x.file_name(a, v)
+            ),
+        };
+        warnings.push(degraded("classifier_unpatched_copy", detail));
     }
     files.sort_by(|x, y| x.0.cmp(&y.0));
     files.dedup_by(|x, y| x.0 == y.0);
@@ -5298,6 +5306,23 @@ mod tests {
                 &p.coords(),
             )
         };
+        // A classifier jar that cannot be read is not taken for patched.
+        let unreadable = [extra("all", b"not a zip archive")];
+        let p = JvmPatch {
+            jar: &jar,
+            extra_artifacts: &unreadable,
+            patched_members: &patched,
+            ..patch()
+        };
+        let plan = run(&files, &p).unwrap();
+        assert!(
+            plan.warnings.iter().any(|w| w.code == DEGRADED
+                && w.detail.starts_with("reason: classifier_unpatched_copy: ")
+                && w.detail
+                    .contains("could not be checked for unpatched copies")),
+            "{:?}",
+            plan.warnings
+        );
         for (all, unpatched) in [
             (zip_of(&[(VULN, b"VULNERABLE"), ("A.class", b"A")]), true),
             (zip_of(&[(VULN, b"PATCHED")]), false),

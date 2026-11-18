@@ -1022,7 +1022,7 @@ async fn vendor_maven_jvm(
     let mut warnings: Vec<VendorWarning> = gate_pass.warnings;
     let committed = jvm_committed_patch(shape, purl, project_root, record).await;
     let was_committed = committed.is_some();
-    let (jar_bytes, mut pom_bytes, mut module_bytes, mut extras, mut result) = match committed {
+    let (mut jar_bytes, mut pom_bytes, mut module_bytes, mut extras, mut result) = match committed {
         Some(((jar, pom, module), extras)) => (
             jar,
             pom,
@@ -1060,29 +1060,75 @@ async fn vendor_maven_jvm(
 
     let online = service.is_some_and(|s| !s.offline);
     // Everything the patch does not touch must be upstream's, checked
-    // against the registry-verified upstream jar before anything is
-    // written: on a first vendoring (always online: the jar comes from the
-    // service) as on an online re-run over a committed tree. A service jar
-    // built from another base, or one that adds or drops a class, is never
-    // committed and wired.
+    // before anything is written: on a first vendoring (always online: the
+    // jar comes from the service) as on an online re-run over a committed
+    // tree. A service jar built from another base, or one that adds or
+    // drops a class, is never committed and wired.
+    //
+    // The baseline is the registry-verified upstream jar: a cached copy the
+    // registry's checksum vouches for, else the registry's own download
+    // held to it (the jar agent mode patched in `~/.m2` is no baseline).
+    // A re-run needs that one, as it always did. A first vendoring must not
+    // fail because the registry cannot be reached while the patch service
+    // can: it falls back to the jar in the build's local repository (the
+    // trust agent mode places in the installed jar), and with no jar at all
+    // vendors as served, saying the comparison was not made.
     if online {
-        let upstream = match acquire_jvm_artifact(&local, &gav, None, "jar", service).await {
-            Ok(bytes) => bytes,
-            // A cached copy the registry's checksum does not vouch for (the
-            // jar agent mode patched in `~/.m2`, say) is no baseline: the
-            // registry's own jar is, held to the same checksum.
-            Err(_) => {
-                match acquire_jvm_artifact(&LocalSources::none(), &gav, None, "jar", service).await
-                {
-                    Ok(bytes) => bytes,
-                    Err(e) => return refused("vendor_jvm_upstream_unavailable", e),
-                }
+        let verified = match acquire_jvm_artifact(&local, &gav, None, "jar", service).await {
+            Ok(bytes) => Ok(bytes),
+            Err(_) => acquire_jvm_artifact(&LocalSources::none(), &gav, None, "jar", service).await,
+        };
+        let baseline = match verified {
+            Ok(bytes) => Some(bytes),
+            Err(e) if was_committed => return refused("vendor_jvm_upstream_unavailable", e),
+            Err(why) => {
+                let cached = local.find(&gav, None, "jar", false).await.ok().flatten();
+                local
+                    .unverified
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                let jar = layout::file_name(&artifact_id, &version, None, "jar");
+                warnings.push(VendorWarning::new(
+                    "vendor_jvm_upstream_unverified",
+                    match cached {
+                        Some(_) => format!(
+                            "no registry-verified copy of {jar} could be had ({why}), so the \
+                             members the patch does not touch were compared with the jar in the \
+                             local repository instead"
+                        ),
+                        None => format!(
+                            "no upstream copy of {jar} could be had ({why}), so the members the \
+                             patch does not touch were not compared with upstream; the patch \
+                             service's jar was vendored as served. Run `socket-patch vendor` \
+                             again when the registry can be reached to make the comparison"
+                        ),
+                    },
+                ));
+                cached
             }
         };
-        if let Err((code, detail)) =
-            verify_unpatched_jar_members(&upstream, &jar_bytes, record, was_committed)
-        {
-            return refused(code, detail);
+        if let Some(upstream) = baseline {
+            let names: Vec<String> = record
+                .files
+                .keys()
+                .map(|k| crate::patch::apply::normalize_file_path(k).to_string())
+                .collect();
+            // Off the async workers: a pass inflates up to the jar limits.
+            let compared = tokio::task::spawn_blocking(move || {
+                let verdict =
+                    verify_unpatched_jar_members(&upstream, &jar_bytes, &names, was_committed);
+                (jar_bytes, verdict)
+            })
+            .await;
+            let Ok((bytes, verdict)) = compared else {
+                return refused(
+                    "vendor_prebuilt_integrity_mismatch",
+                    "the comparison with the upstream jar did not finish".to_string(),
+                );
+            };
+            jar_bytes = bytes;
+            if let Err((code, detail)) = verdict {
+                return refused(code, detail);
+            }
         }
     }
     if online && was_committed {
@@ -1481,14 +1527,14 @@ async fn acquire_classifier(
 }
 
 /// The patched jar (the service's on a first vendoring, the committed one
-/// on a re-run) must be the verified upstream jar outside the record's
-/// members and signature files: every other member a JVM would load, the
+/// on a re-run) must be the upstream jar outside the record's members
+/// (`patched_members`, as a jar spells them) and signature files: every other member a JVM would load, the
 /// same in both ([`crate::patch::jar_members`], whose limits also bound
 /// the read). `Err` is the refusal's `(code, detail)`.
 fn verify_unpatched_jar_members(
     upstream: &[u8],
     patched: &[u8],
-    record: &PatchRecord,
+    patched_members: &[String],
     committed: bool,
 ) -> Result<(), (&'static str, String)> {
     use crate::patch::jar_members::{unpatched_difference, Digests, JarError};
@@ -1511,11 +1557,7 @@ fn verify_unpatched_jar_members(
     };
     let original = read(upstream, "the upstream jar")?;
     let candidate = read(patched, whose)?;
-    let names: Vec<&str> = record
-        .files
-        .keys()
-        .map(|k| crate::patch::apply::normalize_file_path(k))
-        .collect();
+    let names: Vec<&str> = patched_members.iter().map(String::as_str).collect();
     let difference = unpatched_difference(&original, &candidate, &names);
     if !difference.is_empty() {
         return Err((
@@ -4386,6 +4428,70 @@ mod tests {
             let (result, entry, _) =
                 unwrap_done(run_jvm(root, &blobs, &installed, &record, Some(&cfg)).await);
             assert!(result.success && entry.is_some(), "{:?}", result.error);
+        }
+    }
+
+    /// A registry that cannot be reached while the patch service can must
+    /// not stop a first vendoring. The jar in the build's local repository
+    /// is then the baseline, a mismatch against it is still a refusal, and
+    /// with no jar at all the service's jar is vendored as served. Each
+    /// says so, and the entry is recorded as not registry-verified.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_first_vendoring_without_the_registry_falls_back_and_says_so() {
+        use crate::patch::jar_members::testing::jar_with_modes;
+        let tampered = jar_with_modes(&[
+            ("META-INF/MANIFEST.MF", b"Manifest-Version: 1.0\n", None),
+            (JAR_FILE, PATCHED, None),
+            (
+                "org/apache/commons/text/StringSubstitutor.class",
+                b"another release's class",
+                None,
+            ),
+        ]);
+        // (the service's jar, a jar in the local repository, the outcome)
+        for (served, local_jar, refusal) in [
+            (make_jar(PATCHED), true, None),
+            (tampered.clone(), true, Some("1 changed")),
+            (make_jar(PATCHED), false, None),
+            (tampered, false, None),
+        ] {
+            let (dir, blobs, installed, record) = reactor_fixture(local_jar).await;
+            let root = dir.path();
+            // The service answers; the registry routes are all 404.
+            let server = mount_granted_jar(&served).await;
+            let _registry = EnvGuard::set("SOCKET_MAVEN_REGISTRY", server.uri());
+            let cfg = service_cfg(
+                Some(&server.uri()),
+                crate::vendor::VendorSource::Service,
+                false,
+            );
+            let outcome = run_jvm(root, &blobs, &installed, &record, Some(&cfg)).await;
+            if let Some(difference) = refusal {
+                let (code, detail) = unwrap_refused(outcome);
+                assert_eq!(code, "vendor_prebuilt_integrity_mismatch");
+                assert!(detail.contains(difference), "{detail}");
+                assert!(!root.join(".socket").exists());
+                continue;
+            }
+            let (result, entry, warnings) = unwrap_done(outcome);
+            assert!(result.success, "local_jar={local_jar}: {:?}", result.error);
+            assert_eq!(upstream_status(&entry.expect("entry")), "local_unverified");
+            let said: Vec<&str> = warnings
+                .iter()
+                .filter(|w| w.code == "vendor_jvm_upstream_unverified")
+                .map(|w| w.detail.as_str())
+                .collect();
+            assert_eq!(said.len(), 1, "{warnings:?}");
+            assert!(
+                said[0].contains(if local_jar {
+                    "were compared with the jar in the local repository instead"
+                } else {
+                    "were not compared with upstream; the patch service's jar was vendored as served"
+                }),
+                "{}",
+                said[0]
+            );
         }
     }
 

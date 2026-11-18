@@ -337,6 +337,45 @@ fn maven_config_local_repository_is_the_one_patched() {
     assert_eq!(poms(), (PRISTINE.to_vec(), PATCHED.to_vec()));
 }
 
+/// A config that names one repository to Maven before 3.9 and another to
+/// later Mavens, with both on disk and no Maven Wrapper to say which Maven
+/// builds the project: neither is patched, and the run says why.
+#[test]
+fn an_ambiguous_maven_config_patches_nothing_and_says_so() {
+    let f = fx(&[]);
+    let later = PathBuf::from(format!("{} -B", f.m2.display()));
+    let later_pom = later.join("com/example/lib/2.0").join(POM);
+    std::fs::create_dir_all(later_pom.parent().unwrap()).unwrap();
+    std::fs::write(&later_pom, PRISTINE).unwrap();
+    std::fs::create_dir_all(f.proj.join(".mvn")).unwrap();
+    std::fs::write(
+        f.proj.join(".mvn/maven.config"),
+        format!("-Dmaven.repo.local={} -B\n", f.m2.display()),
+    )
+    .unwrap();
+    let (_, json, stderr) = run_plain(&f.proj, &["apply", "--offline"], &[]);
+    let warnings = json["warnings"].to_string();
+    assert!(
+        warnings.contains("maven_local_repository_undetermined")
+            && warnings.contains("to Maven before 3.9"),
+        "{json}\n{stderr}"
+    );
+    assert_eq!(std::fs::read(f.dir.join(POM)).unwrap(), PRISTINE);
+    assert_eq!(std::fs::read(&later_pom).unwrap(), PRISTINE);
+
+    // The wrapper settles it.
+    std::fs::create_dir_all(f.proj.join(".mvn/wrapper")).unwrap();
+    std::fs::write(
+        f.proj.join(".mvn/wrapper/maven-wrapper.properties"),
+        "distributionUrl=https://repo.maven.apache.org/maven2/org/apache/maven/apache-maven/3.8.9/apache-maven-3.8.9-bin.zip\n",
+    )
+    .unwrap();
+    let (code, json, stderr) = run_plain(&f.proj, &["apply", "--offline"], &[]);
+    assert_eq!(code, Some(0), "{json}\n{stderr}");
+    assert_eq!(std::fs::read(f.dir.join(POM)).unwrap(), PATCHED);
+    assert_eq!(std::fs::read(&later_pom).unwrap(), PRISTINE);
+}
+
 /// A stored jar of `members`.
 fn jar(members: &[(&str, &[u8])]) -> Vec<u8> {
     use std::io::Write as _;

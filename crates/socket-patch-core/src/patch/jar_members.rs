@@ -31,11 +31,16 @@
 //! # Limits
 //!
 //! The sizes an archive declares for its entries are the author's claim, so
-//! none of the limits trusts them: the count is the central directory's own,
-//! and the byte limits are on what is actually inflated.
+//! the byte limits are on what is actually inflated. The entry count and
+//! the central directory's size are read from the archive's end records
+//! before the zip reader parses the directory, since the reader allocates
+//! for whatever those records declare: a directory of millions of tiny
+//! records is refused unread.
 //!
 //! * [`MAX_ENTRIES`]: 200,000 entries. Eight times the largest jar measured
 //!   above; the jars a 128 MiB download can carry stay well under it.
+//! * [`MAX_CENTRAL_DIRECTORY_BYTES`]: 64 MiB of central directory, some 300
+//!   bytes for each of 200,000 entries (the largest measured is 2 MiB).
 //! * [`MAX_INFLATED_BYTES`]: 1 GiB inflated in one pass over one jar. Eleven
 //!   times the largest measured, and what a jar at the 128 MiB download cap
 //!   inflates to at 8:1, above what class files and resources reach.
@@ -49,7 +54,7 @@
 //! limit and by how much.
 
 use std::collections::BTreeMap;
-use std::io::{Read, Seek};
+use std::io::{Read, Seek, SeekFrom};
 
 use sha2::{Digest, Sha256};
 
@@ -57,6 +62,8 @@ use crate::hash::git_sha256::compute_git_sha256_from_std_reader;
 
 /// Entries one jar may hold (see the module docs).
 pub(crate) const MAX_ENTRIES: usize = 200_000;
+/// Bytes the central directory of one jar may take.
+pub(crate) const MAX_CENTRAL_DIRECTORY_BYTES: u64 = 64 * 1024 * 1024;
 /// Bytes one pass over one jar may inflate.
 pub(crate) const MAX_INFLATED_BYTES: u64 = 1024 * 1024 * 1024;
 /// Inflated bytes allowed per archive byte, past [`RATIO_FLOOR_BYTES`].
@@ -114,7 +121,8 @@ impl<'a> Jar<std::io::Cursor<&'a [u8]>> {
 
 impl<R: Read + Seek> Jar<R> {
     /// A pass over the archive `reader` holds, `archive_len` bytes long.
-    pub(crate) fn open(reader: R, archive_len: u64) -> Result<Self, JarError> {
+    pub(crate) fn open(mut reader: R, archive_len: u64) -> Result<Self, JarError> {
+        check_declared_directory(&mut reader, archive_len)?;
         let zip = zip::ZipArchive::new(reader)
             .map_err(|e| JarError::Unreadable(format!("not a readable zip archive ({e})")))?;
         if zip.len() > MAX_ENTRIES {
@@ -211,6 +219,78 @@ impl<R: Read + Seek> Jar<R> {
             .map(Some)
             .map_err(|e| JarError::Unreadable(format!("member `{name}` cannot be inflated ({e})")))
     }
+}
+
+/// Hold what an archive's end records declare of its central directory to
+/// [`MAX_ENTRIES`] and [`MAX_CENTRAL_DIRECTORY_BYTES`], before the zip reader
+/// parses (and allocates for) it. The reader may settle on any record that
+/// looks like the end of the directory, so every `PK\x05\x06` in the last
+/// 64 KiB is checked, with the zip64 record its locator points at and any
+/// zip64 record in that tail.
+fn check_declared_directory<R: Read + Seek>(reader: &mut R, len: u64) -> Result<(), JarError> {
+    const END: &[u8] = b"PK\x05\x06";
+    const END64: &[u8] = b"PK\x06\x06";
+    const LOCATOR: &[u8] = b"PK\x06\x07";
+    let unread = |e: std::io::Error| JarError::Unreadable(format!("its end cannot be read ({e})"));
+    let le = |bytes: &[u8]| {
+        bytes
+            .iter()
+            .rev()
+            .fold(0u64, |n, b| (n << 8) | u64::from(*b))
+    };
+    let within = |entries: u64, directory: u64| {
+        // A record declaring more than the archive can hold (a central
+        // record is 46 bytes at least) is not its end record: bytes that
+        // happen to spell the signature, which the reader passes over too.
+        if directory > len || entries > len / 46 {
+            return Ok(());
+        }
+        if entries > MAX_ENTRIES as u64 {
+            return Err(JarError::TooLarge(format!(
+                "it holds {entries} entries, over the limit of {MAX_ENTRIES}"
+            )));
+        }
+        if directory > MAX_CENTRAL_DIRECTORY_BYTES {
+            return Err(JarError::TooLarge(format!(
+                "its central directory takes {} MiB, over the limit of {} MiB",
+                mib(directory),
+                mib(MAX_CENTRAL_DIRECTORY_BYTES)
+            )));
+        }
+        Ok(())
+    };
+    // An end record, its comment (at most 64 KiB) and a zip64 locator and
+    // record before it.
+    let tail_len = len.min(22 + 65_535 + 20 + 56);
+    reader
+        .seek(SeekFrom::Start(len - tail_len))
+        .map_err(unread)?;
+    let mut tail = vec![0u8; tail_len as usize];
+    reader.read_exact(&mut tail).map_err(unread)?;
+    for at in 0..tail.len() {
+        let rest = &tail[at..];
+        if rest.len() >= 56 && rest.starts_with(END64) {
+            within(le(&rest[32..40]), le(&rest[40..48]))?;
+        }
+        if rest.len() < 22 || !rest.starts_with(END) {
+            continue;
+        }
+        within(le(&rest[10..12]), le(&rest[12..16]))?;
+        if at < 20 || !tail[at - 20..].starts_with(LOCATOR) {
+            continue;
+        }
+        let offset = le(&tail[at - 12..at - 4]);
+        if offset.checked_add(56).is_some_and(|end| end <= len) {
+            let mut record = [0u8; 56];
+            reader.seek(SeekFrom::Start(offset)).map_err(unread)?;
+            reader.read_exact(&mut record).map_err(unread)?;
+            if record.starts_with(END64) {
+                within(le(&record[32..40]), le(&record[40..48]))?;
+            }
+        }
+    }
+    reader.seek(SeekFrom::Start(0)).map_err(unread)?;
+    Ok(())
 }
 
 /// The content digests of a jar's members ([`Jar::content_digests`]).
@@ -416,6 +496,58 @@ mod tests {
                 MAX_ENTRIES + 1
             )
         );
+    }
+
+    /// The limits on the central directory are held to what the end records
+    /// declare, before the zip reader parses (and allocates for) it: these
+    /// archives have no directory to parse at all, so the refusal can only
+    /// have come from the records.
+    #[test]
+    fn the_central_directory_is_bounded_before_it_is_parsed() {
+        let end = |entries: u16, directory: u32| {
+            let mut record = b"PK\x05\x06\0\0\0\0".to_vec();
+            record.extend_from_slice(&entries.to_le_bytes());
+            record.extend_from_slice(&entries.to_le_bytes());
+            record.extend_from_slice(&directory.to_le_bytes());
+            record.extend_from_slice(&[0; 6]);
+            record
+        };
+        // Millions of 46-byte records fit a download: 200,001 of them here,
+        // declared by a zip64 record and the locator that points at it.
+        let entries = MAX_ENTRIES as u64 + 1;
+        let mut many = vec![0u8; entries as usize * 46];
+        let at = many.len() as u64;
+        many.extend_from_slice(b"PK\x06\x06");
+        many.extend_from_slice(&[0; 20]);
+        many.extend_from_slice(&entries.to_le_bytes());
+        many.extend_from_slice(&entries.to_le_bytes());
+        many.extend_from_slice(&(entries * 46).to_le_bytes());
+        many.extend_from_slice(&[0; 8]);
+        many.extend_from_slice(b"PK\x06\x07\0\0\0\0");
+        many.extend_from_slice(&at.to_le_bytes());
+        many.extend_from_slice(&1u32.to_le_bytes());
+        many.extend_from_slice(&end(u16::MAX, u32::MAX));
+        let err = Jar::of_bytes(&many).err().expect("refused");
+        assert_eq!(
+            err.to_string(),
+            format!("it holds {entries} entries, over the limit of {MAX_ENTRIES}")
+        );
+        assert!(err.is_too_large());
+
+        // A directory of a few entries with 65 MiB of names and comments.
+        let mut wide = vec![0u8; 65 * 1024 * 1024];
+        wide.extend_from_slice(&end(3, 65 * 1024 * 1024));
+        let err = Jar::of_bytes(&wide).err().expect("refused");
+        assert_eq!(
+            err.to_string(),
+            "its central directory takes 65 MiB, over the limit of 64 MiB"
+        );
+
+        // Bytes that spell an end record but declare more than the archive
+        // holds are not one: the real record decides.
+        let lookalike = end(u16::MAX, u32::MAX);
+        let real = jar(&[("a/B.class", &lookalike)]);
+        assert_eq!(Digests::of_bytes(&real).unwrap().len(), 1);
     }
 
     /// What is inflated is bounded, whatever the entry declares: a deflated

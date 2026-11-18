@@ -2832,15 +2832,25 @@ the JVM would load must hold the same content in both, whatever unix mode it car
 the record's members and signature files (`META-INF/*.SF`, `.RSA`, `.DSA`, `.EC`) are
 exempt and directory entries may differ. A jar that adds, drops or changes anything
 else is refused with `vendor_prebuilt_integrity_mismatch`, the detail naming up to
-three such members, and a first vendoring commits and wires nothing. When no upstream
-jar can be verified the refusal is `vendor_jvm_upstream_unavailable`.
+three such members, and a first vendoring commits and wires nothing.
+
+A registry that cannot be reached while the patch service can does not stop a first
+vendoring. The baseline is then, in order: the registry-verified jar; else the jar in
+the build's local repository, as agent mode trusts the installed jar; else none, and
+the service's jar is vendored as served. The last two are reported with
+`vendor_jvm_upstream_unverified` (the detail says which, and that a later run makes
+the comparison) and the entry is recorded as not registry-verified. A mismatch
+against whichever baseline was used is still the refusal above. An online re-run over
+a committed tree needs the registry-verified jar, as before
+(`vendor_jvm_upstream_unavailable` without one).
 
 Jars are read within fixed limits, counted on the bytes actually inflated and on the
-archive's own entry count, never on the sizes an archive declares: 200,000 entries,
-and per pass over one jar 1 GiB inflated and at most 100 times the jar's own size (a
-jar smaller than 655 KiB may still inflate to 64 MiB). A jar past a limit is
-`vendor_artifact_too_large`: a refusal when vendoring (the detail names the limit),
-the `vex` omission tag and the `vendor --check` reason for a committed jar, which
+archive's own entry count, never on the sizes an archive declares: 200,000 entries
+and 64 MiB of central directory (read from the archive's end records before the
+directory is parsed), and per pass over one jar 1 GiB inflated and at most 100 times
+the jar's own size (a jar smaller than 655 KiB may still inflate to 64 MiB). A jar
+past a limit is `vendor_artifact_too_large`: a refusal when vendoring (the detail names the limit),
+the `vex` omission tag and the `vendor --check` reason for a committed jar (naming the limit), which
 `repair` restores from the recorded one, and the error of a `repair` whose own
 download is past them. Jar names are read as the JVM
 reads them, so non-ASCII names and names that differ only in case (`a.class` beside
@@ -3168,6 +3178,7 @@ Run-level `warnings[]` entries for these carry an additive `level` field (`info`
 | `gradle_build_ignores_m2` | `warn` | The build declares no `mavenLocal()`, and modules its locks (or the manifest) name exist only in `~/.m2`; they are not scanned. |
 | `gradle_maven_local_undetermined` | `info` | `mavenLocal()` could not be ruled out (an unreadable script or init script), so `~/.m2` stays a scan root. |
 | `gradle_user_home_differs` | `info` | The passwd home differs from `$HOME`, so Gradle's cache is not under `$HOME/.gradle`. Never emitted with `--global-prefix`. |
+| `maven_local_repository_undetermined` | `warn` | A Maven build's `.mvn/maven.config` names one local repository to Maven before 3.9 (which splits the file on whitespace) and another to Maven 3.9 and later (one argument per line), both directories exist, and the project has no Maven Wrapper to say which Maven builds it. Neither is scanned or patched (also reported by `apply`); set `MAVEN_REPO_LOCAL` to the one the build uses. |
 
 A package crawled from a Gradle cache gets an additive `inLock` boolean when the
 `--cwd` is a Gradle build whose lock files were read (local and global runs): `true`
@@ -3199,7 +3210,11 @@ is the jar the copy was patched from: the record's members at their `beforeHash`
 every other member the patched copy's own. The `.sha1` beside the jar cannot vouch
 for it, since the swap rewrote that file for the patched jar. This is what restores a
 jar that another project, or an earlier workspace over a persistent `~/.m2`, patched:
-a copy that is already patched when `apply` finds it gets no backup here. Such an
+a copy that is already patched when `apply` finds it gets no backup here. The copy
+is read before anything is looked for or downloaded: a `~/.m2` copy that is past the
+jar limits or cannot be read as a jar fails with that cause (`jvm_jar_too_large` for
+the former), never as a missing backup. A Gradle copy's backup is found by its hash
+directory, without reading the copy. Such an
 unread `~/.m2` copy never fails the run: one that holds bytes
 that are neither side of the record (another build applied a different patch there,
 or `mvn install` rebuilt it), lacks a file, or is a swapped jar whose original this
@@ -3216,8 +3231,10 @@ to three added, missing or changed members, and is left as it is; the other copi
 are still swapped.
 
 Jars are read within fixed limits, counted on the bytes actually inflated and on the
-archive's own entry count, never on the sizes an archive declares: 200,000 entries,
-and per pass over one jar 1 GiB inflated and at most 100 times the jar's own size (a
+archive's own entry count, never on the sizes an archive declares: 200,000 entries
+and 64 MiB of central directory (both read from the archive's end records before the
+directory is parsed, so a directory of millions of records is refused unread), and
+per pass over one jar 1 GiB inflated and at most 100 times the jar's own size (a
 jar smaller than 655 KiB may still inflate to 64 MiB). The largest jars measured on
 Maven Central are far inside them (`hive-exec-3.1.3.jar`: 23,728 entries, 93 MiB
 inflated). A jar past a limit is `jvm_jar_too_large`, and the message names the
@@ -3245,7 +3262,7 @@ starts with the code):
 | `jvm_agent_service_required` | refused, exit 1 | A member-keyed record needs the patch service's jar, and the run is offline, the service is disabled or pending, or it did not provide one. Nothing is written. |
 | `jvm_agent_service_integrity` | refused, exit 1 | The service jar failed transfer-integrity verification. Nothing is written. |
 | `jvm_agent_service_jar_mismatch` | refused, exit 1; or that copy fails | The service jar does not carry the record's `afterHash` members or cannot be read: the swap is refused and nothing is written. Or it differs from one installed jar outside the patched members: that copy fails and is left as it is (its `error` starts with the code and names the members), the other copies are still swapped, and the run exits 1. |
-| `jvm_jar_too_large` | refused, exit 1; or that copy fails | A jar is past the limits jars are read within (above). The service's jar refuses the swap with nothing written; an installed jar fails its copy, which is left as it is. The message names the limit that was passed. |
+| `jvm_jar_too_large` | refused, exit 1; or that copy fails | A jar is past the limits jars are read within (above). The service's jar refuses the swap with nothing written; an installed jar fails its copy, which is left as it is. Also reported by `rollback` for a `~/.m2` copy that cannot be compared with a backup or with upstream. The message names the limit that was passed. |
 | `jvm_jar_backup_failed` | refused, exit 1 | The original jar could not be backed up before the swap. Nothing is written. |
 | `gradle_rollback_hash_mismatch` | rollback: that copy fails | A file restored into a Gradle hash directory does not hash to the directory's name (the sha1 Gradle verified on download): the before-blob is not that download. The file is left as it is and the result fails; delete that hash directory so Gradle downloads it again. |
 | `jvm_jar_backup_missing` | rollback: that copy fails | This project's `.socket/jvm-originals/` holds no backup of the original jar (another project or an earlier workspace applied the patch), and no upstream copy could be verified: the run is offline, the registry does not serve the jar or publishes no checksum for it, the download does not match that checksum or is not the jar the copy was patched from, or, for a Gradle copy, it does not hash to the hash directory. The copy is left as it is. The message says which of these it was and how to recover: run the rollback from the project that applied the patch, or delete the version directory so the build downloads the jar again. |
@@ -3388,9 +3405,9 @@ with `reason: <reason>: `:
 |---|---|---|
 | `vendor_jvm_shape_unsupported` | refusal, nothing written | `gradle_below_6_8`, `android_or_kmp` (also `available-at` module redirects), `gradle_exclusive_content_conflict` (a user rule claiming the module, in any script), `gradle_range_excludes_vendored` (no declared selector admits the vendored version), `gradle_classifier_computed` (a declaration of the module names its classifier through a variable, such as `${osdetector.classifier}`: the vendored repository would claim that jar without holding it), `gradle_verification_unparseable`, `gradle_index_unreadable`, `build_file_unreadable` (including a non-UTF-8 settings file), `build_file_outside_root`, `not_build_root` (run from a directory an ancestor settings file includes or may include, from a project with no settings file of its own below one, or below an ancestor settings file that is not UTF-8; `repair` refuses there too), `no_build_file` (no `pom.xml`, Gradle, sbt or scala-cli build at the root), `legacy_maven_root` (the root's ledger still holds a pre-v5 single-POM `maven_pom_repository` entry; the whole root is refused until `vendor --revert`, then vendor again) |
 | `vendor_jvm_upstream_unavailable` | refusal | `classifier_unavailable` (a declared classifier jar no cache or registry has), `module_unavailable` (the pom declares Gradle module metadata that cannot be sourced), `pom_unavailable`, `verification_metadata_unavailable`; for a suffixed Maven / sbt pom also `suffix_unavailable` (the upstream pom computes its own version), `parent_unavailable` (a first vendoring whose upstream parent poms are in no local cache and cannot be fetched, so the suffixed pom cannot be checked) and `inherited_version_unresolvable` (a parent pom names `${project.version}` where the suffixed pom cannot declare the base version instead: in a profile, a management key or a repository URL) |
-| `vendor_jvm_degraded` | applied, VEX withheld | `gradle_unscanned_build_logic`, `unwired_build_logic` (a nonliteral included build), `settings_plugins_unwired`, `classifier_unpatched_copy` (a classifier jar carries an unpatched copy of a patched member), `verification_parent_chain_unhandled`, `gradle_lock_overrides_vendored` (a dependency lock of the build, buildscript and settings classpath locks included, pins the module at a version no vendored row serves), `gradle_settings_lock_unrouted` (a `settings-gradle.lockfile` locks the module but that build's settings script does not hold the in-block repository entry for it), `gradle_lock_unreadable` (a lock file, or a followed custom `lockFile`, is missing, unreadable, outside the checkout or not UTF-8), `gradle_custom_lock_file` (a `lockFile` location that cannot be followed statically: anything but a literal `file(…)` in a project's own build script), `gradle_wiring_uncommitted` (VEX liveness only, never reported by `vendor`: the committed settings files, index, derived `maven-metadata.xml`, script or verification file lack wiring a re-plan would write, such as a removed apply line or in-block entry; the git hygiene files do not count), `conflicting_managed_version` / `management_unresolved` (Maven reactor: an imported BOM or an out-of-checkout parent manages the artifact at another version, or its POM is unavailable; that local root is not pinned), `selection_undetermined` (Maven reactor: what one or more modules resolve cannot be read, so no pin is written where that is so and one already there is left as it is; one event however many modules, naming the first and counting the rest), `pin_would_move_module` (Maven reactor: a parent pom resolves the base version itself above a module that resolves another version, so the parent takes no pin. See [Maven version selection](#maven-version-selection-hosted-and-vendored-maven)) |
+| `vendor_jvm_degraded` | applied, VEX withheld | `gradle_unscanned_build_logic`, `unwired_build_logic` (a nonliteral included build), `settings_plugins_unwired`, `classifier_unpatched_copy` (a classifier jar carries an unpatched copy of a patched member, or cannot be read to check for one), `verification_parent_chain_unhandled`, `gradle_lock_overrides_vendored` (a dependency lock of the build, buildscript and settings classpath locks included, pins the module at a version no vendored row serves), `gradle_settings_lock_unrouted` (a `settings-gradle.lockfile` locks the module but that build's settings script does not hold the in-block repository entry for it), `gradle_lock_unreadable` (a lock file, or a followed custom `lockFile`, is missing, unreadable, outside the checkout or not UTF-8), `gradle_custom_lock_file` (a `lockFile` location that cannot be followed statically: anything but a literal `file(…)` in a project's own build script), `gradle_wiring_uncommitted` (VEX liveness only, never reported by `vendor`: the committed settings files, index, derived `maven-metadata.xml`, script or verification file lack wiring a re-plan would write, such as a removed apply line or in-block entry; the git hygiene files do not count), `conflicting_managed_version` / `management_unresolved` (Maven reactor: an imported BOM or an out-of-checkout parent manages the artifact at another version, or its POM is unavailable; that local root is not pinned), `selection_undetermined` (Maven reactor: what one or more modules resolve cannot be read, so no pin is written where that is so and one already there is left as it is; one event however many modules, naming the first and counting the rest), `pin_would_move_module` (Maven reactor: a parent pom resolves the base version itself above a module that resolves another version, so the parent takes no pin. See [Maven version selection](#maven-version-selection-hosted-and-vendored-maven)) |
 | `vendor_jvm_note` | applied, informational | `range_declared` (a range, prefix or rich selector lists versions from the derived `maven-metadata.xml`), `ide_sources_unavailable` |
-| `vendor_jvm_upstream_unverified` | warning | Upstream metadata was taken offline, or from a local cache while the registry published no checksum for it (a parent pom from a corporate repository), and not authenticated against registry checksums. |
+| `vendor_jvm_upstream_unverified` | warning | Upstream metadata was taken offline, or from a local cache while the registry published no checksum for it (a parent pom from a corporate repository), and not authenticated against registry checksums. Also reported by a first vendoring that could get no registry-verified upstream jar: the members the patch does not touch were compared with the local repository's jar, or, with none, not compared at all. |
 | `vendor_jvm_unattested` | warning (`vendor --check`) | A Maven reactor entry is intact and wired, but a declaration may still build the base release (an executable classifier or type copy, a version a property, profile or unpinned local root may move), so `vex` does not attest it. The entry stays `verified`; the detail names the purl and the declarations (`<pom>:<line>`). |
 
 The Maven half of a root (single-module, reactor or mixed) also reports

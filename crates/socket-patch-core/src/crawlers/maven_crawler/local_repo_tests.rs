@@ -314,6 +314,25 @@ fn maven_args_user_home_does_not_move_the_m2_directory() {
     );
 }
 
+/// A Maven build at `dir`: Maven reads `.mvn/maven.config` for it.
+fn maven_build(dir: &Path) {
+    write(
+        &dir.join("pom.xml"),
+        "<project><modelVersion>4.0.0</modelVersion></project>\n",
+    );
+}
+
+/// The Maven Wrapper of the build rooted at `root`, pinning `version`.
+fn wrapper(root: &Path, version: &str) {
+    write(
+        &root.join(".mvn/wrapper/maven-wrapper.properties"),
+        &format!(
+            "distributionUrl=https://repo.maven.apache.org/maven2/org/apache/maven/apache-maven/\
+             {version}/apache-maven-{version}-bin.zip\n"
+        ),
+    );
+}
+
 /// `-Dmaven.repo.local` in the project's `.mvn/maven.config` is the local
 /// repository of every build run there, in Maven's order: below
 /// `MAVEN_REPO_LOCAL` and the command line (`MAVEN_ARGS`), above
@@ -327,6 +346,7 @@ fn maven_config_local_repository_is_honoured_in_mavens_order() {
     let from_opts = tempfile::tempdir().unwrap();
     let from_args = tempfile::tempdir().unwrap();
     let from_env = tempfile::tempdir().unwrap();
+    maven_build(project.path());
     write(
         &home.path().join(".m2").join("settings.xml"),
         &settings(from_settings.path().to_str().unwrap()),
@@ -378,6 +398,46 @@ fn maven_config_local_repository_is_honoured_in_mavens_order() {
     );
 }
 
+/// Only a Maven build reads `.mvn/maven.config`. A Gradle build below a
+/// directory that holds one (a monorepo with a Maven root), or beside a
+/// `pom.xml`, resolves `mavenLocal()` from the environment's repository,
+/// and so does the crawl.
+#[test]
+fn maven_config_is_not_read_for_a_gradle_build() {
+    let home = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let from_config = tempfile::tempdir().unwrap();
+    let e = env(&[("HOME", home.path())]);
+    let default = Some(home.path().join(".m2").join("repository"));
+    maven_build(root.path());
+    write(
+        &root.path().join(".mvn/maven.config"),
+        &format!("-Dmaven.repo.local={}\n", from_config.path().display()),
+    );
+    assert_eq!(
+        m2_repo_in(&e, root.path()),
+        Some(from_config.path().to_path_buf())
+    );
+
+    let gradle = root.path().join("tools").join("gradle-app");
+    write(
+        &gradle.join("settings.gradle"),
+        "rootProject.name = 'app'\n",
+    );
+    write(&gradle.join("build.gradle"), "plugins { id 'java' }\n");
+    assert_eq!(m2_repo_in(&e, &gradle), default, "a Gradle-only project");
+    let resolved = JvmEnv::resolve_in(&e, Os::current(), None, Some(&gradle));
+    assert_eq!(resolved.m2_undetermined, None);
+
+    maven_build(&gradle);
+    assert_eq!(m2_repo_in(&e, &gradle), default, "Gradle beside a pom.xml");
+
+    // No build at all: nothing Maven would run here.
+    let bare = root.path().join("docs");
+    std::fs::create_dir_all(&bare).unwrap();
+    assert_eq!(m2_repo_in(&e, &bare), default);
+}
+
 /// The config is the one Maven's launcher finds from a module directory:
 /// in the nearest directory above that holds `.mvn`. A relative value is
 /// taken from the directory Maven runs in, and Maven's own placeholders
@@ -387,7 +447,8 @@ fn maven_config_is_found_above_a_module_and_interpolated() {
     let home = tempfile::tempdir().unwrap();
     let root = tempfile::tempdir().unwrap();
     let module = root.path().join("services").join("api");
-    std::fs::create_dir_all(&module).unwrap();
+    maven_build(root.path());
+    maven_build(&module);
     let config = root.path().join(".mvn").join("maven.config");
     let e = env(&[("HOME", home.path())]);
 
@@ -399,17 +460,18 @@ fn maven_config_is_found_above_a_module_and_interpolated() {
     assert_eq!(m2_repo_in(&e, &module), in_root);
     assert_eq!(m2_repo_in(&e, root.path()), in_root);
 
-    write(&config, "-Dmaven.repo.local=${user.home}/cache/m2\n");
+    write(
+        &config,
+        "-Dmaven.repo.local=${user.home}/cache/m2\r\n-B\r\n",
+    );
     assert_eq!(
         m2_repo_in(&e, &module),
         Some(home.path().join("cache").join("m2"))
     );
 
-    // Maven before 3.9 split the whole file on whitespace; the last
-    // occurrence wins either way.
     write(
         &config,
-        "-B -Dmaven.repo.local=first -Dmaven.repo.local=.repo -q\n",
+        "-Dmaven.repo.local=first\n\n-Dmaven.repo.local=.repo\n",
     );
     assert_eq!(m2_repo_in(&e, &module), Some(module.join(".repo")));
     assert_eq!(m2_repo_in(&e, root.path()), Some(root.path().join(".repo")));
@@ -422,14 +484,110 @@ fn maven_config_is_found_above_a_module_and_interpolated() {
     );
 }
 
-/// A config that does not set the property, or is not a file, changes
-/// nothing. One that sets it to a value not used here (empty, or with a
-/// placeholder nothing defines) still decides, as it does in Maven.
+/// Maven before 3.9 splits `maven.config` on whitespace and interpolates
+/// nothing; 3.9 and later take a line as one argument, so a value runs to
+/// the end of its line. The Maven Wrapper says which Maven reads the file;
+/// without one, the reading whose directory exists is the build's.
 #[test]
-fn an_unusable_maven_config_changes_nothing() {
+fn maven_config_is_tokenised_as_the_projects_maven_does() {
+    let home = tempfile::tempdir().unwrap();
+    let e = env(&[("HOME", home.path())]);
+    let default = Some(home.path().join(".m2").join("repository"));
+    let project = || {
+        let dir = tempfile::tempdir().unwrap();
+        maven_build(dir.path());
+        dir
+    };
+    const ONE_LINE: &str = "-Dmaven.repo.local=.m2/repo -B -ntp\n";
+    let (split, whole) = (".m2/repo", ".m2/repo -B -ntp");
+
+    // The wrapper decides, whatever is on disk.
+    for (version, repo) in [
+        ("3.6.3", split),
+        ("3.8.9", split),
+        ("3.9.16", whole),
+        ("4.0.0-rc-7", whole),
+    ] {
+        let p = project();
+        write(&p.path().join(".mvn/maven.config"), ONE_LINE);
+        wrapper(p.path(), version);
+        assert_eq!(
+            m2_repo_in(&e, p.path()),
+            Some(p.path().join(repo)),
+            "{version}"
+        );
+    }
+    // Interpolation came with 3.9.2.
+    for (version, repo) in [
+        ("3.8.9", "${session.rootDirectory}/r"),
+        ("3.9.1", "${session.rootDirectory}/r"),
+        ("3.9.2", "r"),
+    ] {
+        let p = project();
+        write(
+            &p.path().join(".mvn/maven.config"),
+            "-Dmaven.repo.local=${session.rootDirectory}/r\n",
+        );
+        wrapper(p.path(), version);
+        let expected = match repo {
+            "r" => p.path().join("r"),
+            literal => p.path().join(literal),
+        };
+        assert_eq!(m2_repo_in(&e, p.path()), Some(expected), "{version}");
+    }
+
+    // No wrapper: the repository an earlier build left is the one.
+    let p = project();
+    write(&p.path().join(".mvn/maven.config"), ONE_LINE);
+    assert_eq!(
+        m2_repo_in(&e, p.path()),
+        Some(p.path().join(whole)),
+        "neither exists: nothing is installed in either"
+    );
+    std::fs::create_dir_all(p.path().join(split)).unwrap();
+    assert_eq!(m2_repo_in(&e, p.path()), Some(p.path().join(split)));
+    // Both exist: not guessed at, and said.
+    std::fs::create_dir_all(p.path().join(whole)).unwrap();
+    let resolved = JvmEnv::resolve_in(&e, Os::current(), None, Some(p.path()));
+    assert_eq!(resolved.m2_repo, None);
+    let why = resolved.m2_undetermined.expect("the reason");
+    assert!(
+        why.contains("to Maven before 3.9")
+            && why.contains(&p.path().join(whole).display().to_string())
+            && why.contains("set MAVEN_REPO_LOCAL"),
+        "{why}"
+    );
+    std::fs::remove_dir(p.path().join(split)).unwrap();
+    assert_eq!(m2_repo_in(&e, p.path()), Some(p.path().join(whole)));
+
+    // Several arguments on a line that does not start with the property:
+    // only Maven before 3.9 sets it from there.
+    let p = project();
+    write(
+        &p.path().join(".mvn/maven.config"),
+        "-B -Dmaven.repo.local=first -Dmaven.repo.local=.repo -q\n",
+    );
+    assert_eq!(m2_repo_in(&e, p.path()), default);
+    std::fs::create_dir_all(p.path().join(".repo")).unwrap();
+    assert_eq!(m2_repo_in(&e, p.path()), Some(p.path().join(".repo")));
+    // A comment line stops Maven before 3.9, so the file is a later one's.
+    write(
+        &p.path().join(".mvn/maven.config"),
+        "# flags\n-B -Dmaven.repo.local=.repo\n",
+    );
+    assert_eq!(m2_repo_in(&e, p.path()), default);
+}
+
+/// A config that does not set the property, or is not a file, changes
+/// nothing. One that sets it decides, with the value Maven itself makes of
+/// it: an empty one is the directory Maven runs in, and a placeholder
+/// nothing defines stays in the path. `MAVEN_OPTS` is not reached.
+#[test]
+fn a_maven_config_value_is_used_as_maven_uses_it() {
     let home = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();
     let from_opts = tempfile::tempdir().unwrap();
+    maven_build(project.path());
     let config = project.path().join(".mvn").join("maven.config");
     let mut e = env(&[("HOME", home.path())]);
     let default = Some(home.path().join(".m2").join("repository"));
@@ -454,13 +612,14 @@ fn an_unusable_maven_config_changes_nothing() {
     assert_eq!(m2_repo_in(&e, project.path()), opts, "a directory");
     std::fs::remove_dir(&config).unwrap();
 
-    // Set, but not used here: Maven takes the config's value, so the
-    // repository MAVEN_OPTS names (which Maven does not reach) is not it.
-    for text in [
-        "-Dmaven.repo.local=${some.build.property}/m2\n",
-        "-Dmaven.repo.local=\n",
-    ] {
-        write(&config, text);
-        assert_eq!(m2_repo_in(&e, project.path()), default, "{text:?}");
-    }
+    write(&config, "-Dmaven.repo.local=${some.build.property}/m2\n");
+    assert_eq!(
+        m2_repo_in(&e, project.path()),
+        Some(project.path().join("${some.build.property}/m2"))
+    );
+    write(&config, "-Dmaven.repo.local=\n");
+    assert_eq!(
+        m2_repo_in(&e, project.path()).as_deref(),
+        Some(project.path())
+    );
 }

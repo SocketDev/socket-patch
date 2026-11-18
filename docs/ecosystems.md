@@ -1099,13 +1099,28 @@ the project's `.mvn/maven.config`, or in `MAVEN_OPTS`, in that order, then
 (`MAVEN_HOME` or `M2_HOME`), then `.m2/repository` in `user.home`. `M2_HOME` itself
 never names a local repository. On Windows `user.home` is `USERPROFILE`, not `HOME`.
 
-The `.mvn/maven.config` read is the one Maven's launcher finds from the project
-directory: in the nearest directory at or above it that holds a `.mvn` directory. A
-line is one argument (`#` starts a comment), the last `-Dmaven.repo.local=` wins,
-`${session.rootDirectory}`, `${session.topDirectory}`, `${user.home}` and
-`${env.NAME}` are filled in, and a relative path is taken from the project directory,
-where Maven would run. A `--global` run reads no project's config. Maven before 3.9
-does not read `MAVEN_ARGS`; socket-patch reads it whatever Maven is installed.
+`.mvn/maven.config` is read only for a Maven build, where Maven itself reads it: a
+project with a `pom.xml` and no Gradle or Scala-tool build beside it. A Gradle
+build's `mavenLocal()` never reads the file, so a Gradle project below a directory
+that holds one keeps the environment's repository. The file is the one Maven's
+launcher finds from the project directory: in the nearest directory at or above it
+that holds a `.mvn` directory. It is read the way the project's Maven reads it:
+
+- Maven before 3.9 splits the whole file on whitespace and fills in nothing.
+- Maven 3.9 and later takes each line as one argument (`#` starts a comment), so a
+  value runs to the end of its line, and from 3.9.2 fills in
+  `${session.rootDirectory}`, `${session.topDirectory}`, `${user.home}` and
+  `${env.NAME}`.
+
+For both, the last `-Dmaven.repo.local=` wins, a placeholder nothing defines stays in
+the path as written, and a relative path (an empty one included) is taken from the
+project directory, where Maven runs. The Maven Wrapper's version says which reading
+applies. Without a wrapper, when the two readings differ, the one whose directory
+exists is used. When both exist no repository is guessed at: nothing in `~/.m2` is
+scanned or patched and the run warns `maven_local_repository_undetermined`; set
+`MAVEN_REPO_LOCAL` to choose. A `--global` run reads no project's config. Maven
+before 3.9 does not read `MAVEN_ARGS`; socket-patch reads it whatever Maven is
+installed.
 
 A Gradle-only build reads `~/.m2` only through `mavenLocal()`. Scan looks for it in
 every settings, build, `buildSrc`, included-build, applied and init script, including

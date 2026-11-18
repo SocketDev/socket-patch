@@ -1721,6 +1721,22 @@ pub(crate) async fn run_locked(
             // rightly ignores it). It rides the run-warning channel so it
             // is never silent.
             let mut run_warnings = run_warnings;
+            // A Maven build whose `.mvn/maven.config` could not be read one
+            // way: no local repository was guessed at, so say why its
+            // `~/.m2` copies were not found.
+            let maven = |purl: &str| Ecosystem::from_purl(purl) == Some(Ecosystem::Maven);
+            if !args.common.is_global()
+                && (unmatched.iter().any(|purl| maven(purl))
+                    || results.iter().any(|r| maven(&r.package_key)))
+            {
+                use socket_patch_core::crawlers::maven_crawler::JvmEnv;
+                if let Some(why) = JvmEnv::for_project(&args.common.cwd).m2_undetermined {
+                    run_warnings.push(RunWarning {
+                        code: "maven_local_repository_undetermined".to_string(),
+                        detail: why,
+                    });
+                }
+            }
             // A nested apply's caller (get, scan) already reported the
             // overrides it approved; repeating them would double each line.
             // Skips are new to `get`, which checked only its selection; a
@@ -3699,18 +3715,18 @@ async fn apply_maven_base(m: &MavenBase<'_>) -> MavenApplied {
             };
             match Box::pin(jvm_jar::apply_jar_swap(&swap, &dirs, m.service)).await {
                 Err(refusal) => out.refuse(variant, &dirs[0], refusal.code, refusal.message),
-                Ok(results) => {
-                    for mut result in results {
+                Ok(swapped) => {
+                    for copy in swapped {
+                        let jvm_jar::SwappedCopy {
+                            mut result,
+                            refusal,
+                        } = copy;
                         check_derived_copies(&mut out, &mut result, &jar_leaf, args, m.derived)
                             .await;
                         // A copy's own coded refusal is a run warning too,
                         // as a whole-swap one is.
-                        let coded = result.error.as_deref().and_then(|error| {
-                            let code = jvm_jar::copy_failure_code(error)?;
-                            Some((code, error[code.len() + 2..].to_string()))
-                        });
-                        if let Some((code, detail)) = coded {
-                            out.warn(code, detail);
+                        if let Some(refusal) = refusal {
+                            out.warn(refusal.code, refusal.message);
                         }
                         out.record(args, result);
                     }

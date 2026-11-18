@@ -940,6 +940,29 @@ pub async fn describe_artifact_failure(
             };
             format!("Bun workspace copy {mirror} {cause} ({reason}){canonical}; {repair}")
         }
+        ArtifactHealth::Corrupt { reason } if reason == ARTIFACT_TOO_LARGE => {
+            // Which limit: the archive's own (entries, central directory),
+            // else a patched member's inflated size.
+            let jar = project_root.join(path);
+            let limit = tokio::task::spawn_blocking(move || {
+                let (file, metadata) = crate::utils::fs::open_regular_file_sync(&jar).ok()?;
+                let reader = std::io::BufReader::new(file);
+                match crate::patch::jar_members::Jar::open(reader, metadata.len()) {
+                    Err(e) if e.is_too_large() => Some(e.to_string()),
+                    _ => None,
+                }
+            })
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| {
+                "a patched member inflates past what a jar of its size may".to_string()
+            });
+            format!(
+                "committed artifact {path} is past the limits jars are read within: {limit} \
+                 ({reason}); {repair}"
+            )
+        }
         ArtifactHealth::Corrupt { reason } => {
             let cause = match reason.as_str() {
                 "vendor_sha256_mismatch" => "does not match the sha256 in the vendor ledger",
