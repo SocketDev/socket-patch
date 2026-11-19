@@ -39,8 +39,9 @@
 //!   root included, where the checkout's `package.json` shows up again:
 //!   both commands see the package as they do in a checkout without the
 //!   links. The hosted scan reports the patch applied again and the
-//!   vendored one reports it `already_vendored`, `vex` attests the package,
-//!   no file changes, and the build is still the patched one.
+//!   vendored one reports it `already_vendored`, each writes the VEX
+//!   document of its run, `vex` attests the package, no file changes, and
+//!   the build is still the patched one.
 //! - (d) The undo (`rollback --yes`, or `vendor --revert`): every file of
 //!   the checkout is the one of before, byte for byte, and the build prints
 //!   the unpatched marker again.
@@ -49,6 +50,8 @@
 //!   pinned place holds other bytes: the patch host serves them (hosted),
 //!   or they replace the committed file (vendored). The build fails on the
 //!   checksum and does not take the registry's tarball in its place.
+//!
+//! Both flows assert the VEX document of their patch as `main.rs` says.
 //!
 //! A marker is read from what Bazel built. Bazel's downloader keeps every
 //! file it fetches in the repository cache, under its checksum, and hands it
@@ -83,7 +86,8 @@ use socket_patch_core::utils::purl::canonical_purl;
 
 use crate::envelope::event_triples;
 use crate::harness::{
-    changed, fixture_path, rewrite, Cell, Fixture, Ran, Run, StandIn, Tree, CONSUMER, NOTHING,
+    changed, fixture_path, rewrite, with_vex, Cell, Claim, Fixture, How, Ran, Run, StandIn, Tree,
+    CONSUMER, NOTHING,
 };
 use crate::hosted_memory_common::{Patch, ORG};
 
@@ -109,6 +113,9 @@ const VERSION: &str = "1.0.0";
 /// Socket API's purl of a scoped package. `scan` takes either spelling and
 /// names a patch in its events as the API did.
 const PURL: &str = "pkg:npm/%40socketsecurity/bazel-fixture-upstream@1.0.0";
+/// The product `vex` reads from the fixture's own `package.json`: its name
+/// and its version.
+const PRODUCT: &str = "pkg:npm/socket-fixture@0.0.0";
 /// The file name of its tarball on the registry and on the patch host: the
 /// name without its scope.
 const TGZ: &str = "bazel-fixture-upstream-1.0.0.tgz";
@@ -406,15 +413,17 @@ fn second_machine(
 /// built in and that holds the files of `patched`. Beside Bazel's links,
 /// `scan --mode <mode> --yes` scans the package and reports the one event
 /// `seen` for it (an action and an error code), which is what it reports in
-/// a checkout without those links; `vex` attests the package in its
-/// document; no file of the checkout changes; and the build still prints
-/// `marker`.
+/// a checkout without those links; the document of that run, and those of
+/// `vex` and of `vex --no-verify`, attest `claim`; `vex` without a product
+/// names the fixture's own; no file of the checkout changes; and the build
+/// still prints `marker`.
 fn runs_again(
     cell: &Cell,
     standin: &StandIn,
     mode: &str,
     seen: (&str, &str),
     patched: &Tree,
+    claim: &Claim,
     marker: &str,
 ) {
     let test = &cell.test;
@@ -430,30 +439,26 @@ fn runs_again(
     }
     let one = |action: &str, code: &str| [(canonical_purl(PURL), action.into(), code.into())];
 
-    let scan = socket_patch(cell, standin, &["scan", "--mode", mode, "--yes"]);
+    let again = cell.document("again");
+    let scan = ["scan", "--mode", mode, "--yes"];
+    let scan = socket_patch(cell, standin, &[&scan[..], &with_vex(&again)].concat());
     let said = &scan.dump;
     assert_eq!(scan.code, 0, "{test}: {said}");
     assert_eq!(scan.envelope["status"], "success", "{test}: {said}");
     let seen = one(seen.0, seen.1);
     assert_eq!(reported(&scan.envelope), seen, "{test}: {said}");
     assert_eq!(scan.envelope["scannedPackages"], 1, "{test}: {said}");
+    cell.wrote_in_run(&scan, &again, claim);
 
-    // The document goes beside the checkout, into the scratch root of the
-    // cell, where nothing has that name: it is no file of the checkout, and
-    // none of the machine's shared temp directory.
-    let document = checkout.parent().expect("a scratch root").join("vex.json");
-    assert!(!document.exists(), "{test}: {}", document.display());
-    let output = document.to_string_lossy();
-    let vex = socket_patch(cell, standin, &["vex", "--output", &output]);
-    let said = &vex.dump;
-    assert_eq!(vex.code, 0, "{test}: {said}");
-    let attested = one("verified", "");
-    assert_eq!(reported(&vex.envelope), attested, "{test}: {said}");
-    let written = std::fs::read_to_string(&document).unwrap_or_default();
-    // With its closing quote, as the document writes `"@id": "<purl>"`: a
-    // longer version that only starts so is another package.
-    let names = written.contains(&format!("\"{PURL}\""));
-    assert!(names, "{test}: {said}\n{written}");
+    // `vex` says the same of the build that printed the patched marker,
+    // and with `--no-verify` that it checked no file.
+    let run = |cell: &Cell, args: &[&str]| socket_patch(cell, standin, args);
+    cell.stands_alone(run, claim, true);
+    cell.stands_alone(run, claim, false);
+    // Without a product, as a user types it: the same document for the
+    // project of the checkout's own `package.json`, which Bazel's links
+    // show a second time.
+    cell.detects_product(run, Some(PRODUCT));
 
     assert_eq!(changed(patched, &cell.tree()), NOTHING, "{test}");
     cell.builds_patched(patched, marker);
@@ -507,7 +512,11 @@ fn hosted_npm_translate_lock() {
     // (b) The one command of hosted mode. It rewrites those two files and
     // no other: the entry of the package names the patched tarball, by its
     // sum and by its URL on the patch host.
-    let scan = socket_patch(&cell, &standin, &["scan", "--mode", "hosted", "--yes"]);
+    let hosted = ["scan", "--mode", "hosted", "--yes"];
+    let claim = Claim::new(PURL, &patch.uuid, How::Hosted);
+    let run = |cell: &Cell, args: &[&str]| socket_patch(cell, &standin, args);
+    let in_run = cell.document("in-run");
+    let scan = run(&cell, &[&hosted[..], &with_vex(&in_run)].concat());
     let written = [LOCK, "pnpm-workspace.yaml"];
     let pinned = cell.pinned_by(&scan, PURL, &patch.uuid, &before, &written);
     let lock = text(&pinned, LOCK);
@@ -519,6 +528,10 @@ fn hosted_npm_translate_lock() {
     assert!(lock.contains(&entry), "{test}: {LOCK}:\n{lock}");
     let workspace = text(&pinned, "pnpm-workspace.yaml");
     assert_eq!(workspace, TRUSTING_WORKSPACE, "{test}");
+    // The document of that run and the one of `vex` say so, in a checkout
+    // Bazel has built in, before the patched build.
+    cell.wrote_in_run(&scan, &in_run, &claim);
+    cell.stands_alone(run, &claim, true);
 
     // (c) The same build, no step in between: patched, from the patch host.
     let patched_fetches = standin.asked(&patch.route);
@@ -530,11 +543,15 @@ fn hosted_npm_translate_lock() {
 
     // The same command and `vex`, now that Bazel has built in the checkout.
     let (seen, marker) = (("applied", ""), &patch.package.marker);
-    runs_again(&cell, &standin, "hosted", seen, &pinned, marker);
+    runs_again(&cell, &standin, "hosted", seen, &pinned, &claim, marker);
 
-    // (d) The undo: every file is the one of before, and so is the build.
+    // (d) The undo: every file is the one of before, and so is the build,
+    // and `vex` has no document for it.
     let undo = socket_patch(&cell, &standin, &["rollback", "--yes"]);
     cell.undone(&undo, "rolledBack", &before, &upstream.marker);
+    cell.attests_nothing(run, 2, "manifest_not_found");
+    // The same two documents where no Bazel has built.
+    cell.attests_unbuilt(run, &hosted, &before, &pinned, &claim);
 
     // (e) A second machine, a second patch, and a patch host that serves
     // other bytes at the URL the lock pins: still a tarball of the package,
@@ -583,7 +600,11 @@ fn vendored_npm_translate_lock() {
     let before = builds_upstream(&cell, &standin, &upstream);
 
     // (b) The one command of vendored mode.
-    let scan = socket_patch(&cell, &standin, &["scan", "--mode", "vendored", "--yes"]);
+    let vendoring = ["scan", "--mode", "vendored", "--yes"];
+    let claim = Claim::new(PURL, &patch.uuid, How::Vendored);
+    let run = |cell: &Cell, args: &[&str]| socket_patch(cell, &standin, args);
+    let in_run = cell.document("in-run");
+    let scan = run(&cell, &[&vendoring[..], &with_vex(&in_run)].concat());
     let said = &scan.dump;
     assert_eq!(scan.code, 0, "{test}: {said}");
     assert_eq!(scan.envelope["status"], "success", "{test}: {said}");
@@ -622,6 +643,10 @@ fn vendored_npm_translate_lock() {
     assert_eq!(*overridden, format!("file:{copy}"), "{test}: {manifest:#}");
     let workspace = text(&vendored, "pnpm-workspace.yaml");
     assert_eq!(workspace, overriding_workspace(&copy), "{test}");
+    // The document of that run and the one of `vex` say so, in a checkout
+    // Bazel has built in, before the patched build.
+    cell.wrote_in_run(&scan, &in_run, &claim);
+    cell.stands_alone(run, &claim, true);
 
     // (c) The same build, no step in between: patched, from the committed
     // file. Bazel asks the stand-in for nothing.
@@ -631,11 +656,15 @@ fn vendored_npm_translate_lock() {
 
     // The same command and `vex`, now that Bazel has built in the checkout.
     let (seen, marker) = (("skipped", "already_vendored"), &patch.package.marker);
-    runs_again(&cell, &standin, "vendored", seen, &vendored, marker);
+    runs_again(&cell, &standin, "vendored", seen, &vendored, &claim, marker);
 
-    // (d) The undo: every file is the one of before, and so is the build.
+    // (d) The undo: every file is the one of before, and so is the build,
+    // and `vex` has no document for it.
     let undo = socket_patch(&cell, &standin, &["vendor", "--revert"]);
     cell.undone(&undo, "removed", &before, &upstream.marker);
+    cell.attests_nothing(run, 2, "manifest_not_found");
+    // The same two documents where no Bazel has built.
+    cell.attests_unbuilt(run, &vendoring, &before, &vendored, &claim);
 
     // (e) A second machine and a second patch, vendored there, and then
     // other bytes in the committed file: still a tarball of the package,
@@ -675,9 +704,10 @@ fn vendored_npm_translate_lock() {
 /// fixture's directories and the legs of its workflow are those of its
 /// table; the fixture's lock holds the one entry a test pins, with the
 /// placeholder and no URL, and pinning changes nothing else; the fixture
-/// depends on the package at the version of that entry; two runs serve two
-/// upstream tarballs; and the names written out above are those of the one
-/// package, under the organisation's scope.
+/// depends on the package at the version of that entry and has the name
+/// and the version of [`PRODUCT`]; two runs serve two upstream tarballs; and
+/// the names written out above are those of the one package, under the
+/// organisation's scope.
 #[test]
 fn a_test_pins_the_one_entry_of_the_fixture_lock() {
     FIXTURE.check();
@@ -694,6 +724,8 @@ fn a_test_pins_the_one_entry_of_the_fixture_lock() {
 
     let fixture: Value = serde_json::from_str(&read("package.json")).expect("package.json");
     assert_eq!(fixture["dependencies"][NAME], VERSION);
+    let named = [&fixture["name"], &fixture["version"]].map(|field| field.as_str().expect("text"));
+    assert_eq!(PRODUCT, format!("pkg:npm/{}@{}", named[0], named[1]));
     let manifest: Value = serde_json::from_str(MANIFEST).expect("the package's package.json");
     assert_eq!(manifest["name"], NAME);
     assert_eq!(manifest["version"], VERSION);

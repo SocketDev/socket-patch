@@ -306,7 +306,7 @@ pub async fn gem_vendor_target_preflight(
             .ok()?,
     };
     plan_gemfile_edit(&gemfile_text, &name, &version, &copy_rel)
-        .and_then(|plan| refuse_append_of_direct_dependency(plan, &lock_text, &name))
+        .and_then(|plan| refuse_append_of_direct_dependency(plan, &gemfile_text, &lock_text, &name))
         .and_then(|plan| {
             let after = apply_gemfile_plan(&gemfile_text, &plan);
             gemspec_merge_refusal(project_root, &after, &lock_text, &name, &version)
@@ -392,7 +392,8 @@ async fn gem_prelude(
             return Err(refused(
                 "platform_gem_unsupported",
                 format!(
-                    "`{name}@{version}` is a platform-specific gem build (`platform={platform}`); precompiled platform gems cannot be vendored portably"
+                    "`{name}@{version}` is a platform-specific gem build (`platform={platform}`); precompiled platform gems cannot be vendored portably. {}",
+                    platform_gem_remedy(name)
                 ),
             ));
         }
@@ -412,7 +413,8 @@ async fn gem_prelude(
         return Err(refused(
             "platform_gem_unsupported",
             format!(
-                "installed dir `{dir_name}` is not the portable `{leaf}` gem (platform-specific or unexpected gem builds cannot be vendored portably)"
+                "installed dir `{dir_name}` is not the portable `{leaf}` gem (platform-specific or unexpected gem builds cannot be vendored portably). {}",
+                    platform_gem_remedy(name)
             ),
         ));
     }
@@ -489,7 +491,8 @@ async fn gem_prelude(
             return Err(refused(
                 "native_extensions_unsupported",
                 format!(
-                    "{leaf}.gemspec declares native extensions; bundler does not build extensions for path-sourced gems"
+                    "{leaf}.gemspec declares native extensions; bundler does not build extensions for path-sourced gems. {}",
+                    native_extensions_remedy(name, !declaration_selects_source(&gemfile_text, name))
                 ),
             ));
         }
@@ -576,8 +579,14 @@ fn gem_edits(
     }
     // ── Gemfile edit plan (refusals before any write) ────────────────────
     let plan = match plan_gemfile_edit(&prelude.gemfile_text, name, version, &prelude.copy_rel)
-        .and_then(|plan| refuse_append_of_direct_dependency(plan, &prelude.lock_text, name))
-    {
+        .and_then(|plan| {
+            refuse_append_of_direct_dependency(
+                plan,
+                &prelude.gemfile_text,
+                &prelude.lock_text,
+                name,
+            )
+        }) {
         Ok(p) => p,
         Err(detail) => {
             return Err(Box::new(refused(
@@ -1045,7 +1054,10 @@ pub(super) async fn gem_service_copy(
             "native_extensions_unsupported",
             format!(
                 "the served stub gemspec for {name} declares native extensions; bundler does \
-                 not build extensions for path-sourced gems"
+                 not build extensions for path-sourced gems. {}",
+                // The Gemfile plan passed before the service was asked, so
+                // the declaration is one hosted mode can edit too.
+                native_extensions_remedy(name, true)
             ),
         ));
     }
@@ -1338,6 +1350,130 @@ enum GemfilePlan {
     Append { block: String },
 }
 
+/// The way out of a native-extension refusal (#2091): the modes that
+/// compile the extension ("Ruby gems: native extensions" in
+/// `docs/ecosystems.md`). Worded as hosted mode words its own refusals
+/// ("patch <gem> with `--mode vendored` or `--mode agent`"): it names the
+/// mode for this gem, not a whole-project command. `hosted` is false when
+/// hosted mode would refuse the gem's declaration as well
+/// ([`declaration_selects_source`]), and agent mode alone is named.
+fn native_extensions_remedy(name: &str, hosted: bool) -> String {
+    let modes = if hosted {
+        "`--mode hosted` or `--mode agent`, which build"
+    } else {
+        "`--mode agent`, which builds"
+    };
+    format!("Patch {name} with {modes} the extension")
+}
+
+/// Whether a `gem "<name>"` declaration of the Gemfile `text` picks the
+/// gem's source: it sits inside a `source` / `git` / `github` / `path`
+/// block, or carries a source option, read by the shared
+/// [`gemfile::source_option`] that hosted mode refuses with (so `gitlab:`
+/// and custom `git_source` keys count too). Hosted mode refuses such a gem
+/// (`redirect_gem_source_option`), so a remedy must not name it. Errs
+/// towards `true`: a mode left out of a remedy costs less than one that
+/// refuses.
+fn declaration_selects_source(text: &str, name: &str) -> bool {
+    let mut line_start = 0;
+    for line in text.split('\n') {
+        let start = line_start;
+        line_start += line.len() + 1;
+        let trimmed = line.trim_start();
+        if trimmed.starts_with('#') {
+            continue;
+        }
+        let Some(decl) = gem_declaration(trimmed, name) else {
+            continue;
+        };
+        if crate::formats::gem::ruby::block_stack(text, start)
+            .iter()
+            .any(|frame| frame.source.is_some())
+        {
+            return true;
+        }
+        if gemfile::source_option(decl.rest).is_some() {
+            return true;
+        }
+    }
+    false
+}
+
+/// The way out of a platform-build refusal (#2091). Agent mode only: hosted
+/// mode refuses a precompiled build as well
+/// (`redirect_gem_platform_unsupported`).
+fn platform_gem_remedy(name: &str) -> String {
+    format!(
+        "Patch {name} with `--mode agent`, which patches a precompiled gem where it is installed"
+    )
+}
+
+/// The way out of an indented-declaration refusal (#2091), for the
+/// declaration on the line that starts at byte `line_start` of `text`.
+///
+/// - Inside a `source` / `git` / `github` / `path` block, hosted mode
+///   refuses the gem as well (`redirect_gem_source_option`), so agent mode
+///   is the one named.
+/// - Otherwise the top level is a way out, and so is hosted mode, which
+///   edits a declaration where it is. When exactly one block is open and it
+///   is a plain `group … do`, the `group:` option that replaces it is
+///   spelled out ([`group_option`]). The takeover and eject of a hosted gem
+///   raise this refusal too, so hosted mode is worded as the mode to leave
+///   the gem to, which reads true whether or not it is hosted already.
+fn indented_declaration_remedy(text: &str, line_start: usize, name: &str) -> String {
+    let frames = crate::formats::gem::ruby::block_stack(text, line_start);
+    if frames.iter().any(|frame| frame.source.is_some()) {
+        return format!("patch {name} with `--mode agent`");
+    }
+    let top_level = match frames.as_slice() {
+        [] => "write it without indentation".to_string(),
+        [frame] if frame.line == frame.opener => {
+            let header = text[frame.line..].lines().next().unwrap_or_default();
+            match group_option(header) {
+                Some(option) => format!("move it to the top level with the option `{option}`"),
+                None => "move it to the top level".to_string(),
+            }
+        }
+        _ => "move it to the top level".to_string(),
+    };
+    format!("{top_level}, or leave {name} to hosted mode (`--mode hosted`)")
+}
+
+/// The `group:` option that stands for the block `header` opens:
+/// `group: :test` for `group :test do`, `group: [:development, :test]` for
+/// `group :development, :test do`. `None` unless the line is a `group` call
+/// whose arguments are all plain symbols: a `group` with options
+/// (`optional: true`), a block parameter or a string name has no one-option
+/// spelling that is sure to mean the same.
+fn group_option(header: &str) -> Option<String> {
+    let args = header
+        .trim()
+        .strip_prefix("group")?
+        .strip_suffix("do")?
+        .trim();
+    let args = args
+        .strip_prefix('(')
+        .and_then(|a| a.strip_suffix(')'))
+        .unwrap_or(args);
+    let mut groups = Vec::new();
+    for arg in args.split(',') {
+        let arg = arg.trim();
+        let mut chars = arg.strip_prefix(':')?.chars();
+        let plain = chars
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+            && chars.all(|c| c.is_ascii_alphanumeric() || c == '_');
+        if !plain {
+            return None;
+        }
+        groups.push(arg);
+    }
+    Some(match groups.as_slice() {
+        [one] => format!("group: {one}"),
+        many => format!("group: [{}]", many.join(", ")),
+    })
+}
+
 /// Decide how to edit the Gemfile, or explain why it cannot be edited.
 ///
 /// Deliberately conservative: only a single, top-level, statically-parseable
@@ -1411,8 +1547,11 @@ fn plan_gemfile_edit(
     let cr = if lines[idx].ends_with('\r') { "\r" } else { "" };
     let rest = rest.strip_suffix('\r').unwrap_or(&rest);
     if !top_level {
+        let line_start: usize = lines[..idx].iter().map(|line| line.len() + 1).sum();
+        let remedy = indented_declaration_remedy(text, line_start, name);
         return Err(format!(
-            "the `gem \"{name}\"` declaration is indented (inside a group/conditional block)"
+            "the `gem \"{name}\"` declaration is indented (inside a group/conditional block); \
+             {remedy}"
         ));
     }
     if paren {
@@ -1502,8 +1641,11 @@ fn plan_gemfile_edit(
 /// declares it somewhere the line grammar cannot see (`eval_gemfile`, a
 /// loop, a gemspec). The managed block would declare it a second time and
 /// bundler refuses every install (#482). Every other plan passes through.
+/// `gemfile_text` is the Gemfile the plan was made for; the refusal reads
+/// it to word its way out ([`out_of_sight_declaration_remedy`]).
 fn refuse_append_of_direct_dependency(
     plan: GemfilePlan,
+    gemfile_text: &str,
     lock_text: &str,
     name: &str,
 ) -> Result<GemfilePlan, String> {
@@ -1514,10 +1656,41 @@ fn refuse_append_of_direct_dependency(
             "Gemfile.lock lists \"{name}\" as a direct dependency, but the Gemfile declares \
              it somewhere the line grammar cannot edit (an `eval_gemfile`d file, a loop, a \
              gemspec); refusing to append a second declaration (bundler hard-fails on \
-             duplicates)"
+             duplicates); {}",
+            out_of_sight_declaration_remedy(gemfile_text, name)
         ));
     }
     Ok(plan)
+}
+
+/// The way out of [`refuse_append_of_direct_dependency`] (#2151): a `gem`
+/// line the line grammar can edit, or agent mode. Hosted mode is not named:
+/// it refuses a gem declared in a gemspec, an `eval_gemfile`d file or a
+/// loop for the same reason (`redirect_gem_declaration_not_visible`).
+///
+/// The line stands in place of a `gem` call that declares the gem out of
+/// sight, never next to it: the rewrite gives the line an exact version
+/// and a `path:`, and bundler refuses a Gemfile whose two declarations of
+/// a gem differ. A gemspec's development dependency is no `gem` call and
+/// stays.
+///
+/// Where the Gemfile has a `gemspec` directive, the line goes above it: a
+/// gemspec development dependency on the gem merged into a line below the
+/// directive is refused next ([`gemspec_merge_refusal`]). A Gemfile whose
+/// directives cannot be read gets no such hint, which would not help it:
+/// that refusal cannot tell either way and names hosted mode.
+fn out_of_sight_declaration_remedy(gemfile_text: &str, name: &str) -> String {
+    let above_gemspec = crate::formats::gem::gemspec::gemspec_directives(gemfile_text)
+        .is_ok_and(|directives| !directives.is_empty());
+    let place = if above_gemspec {
+        " above `gemspec`"
+    } else {
+        ""
+    };
+    format!(
+        "declare it with one literal `gem \"{name}\"` line{place} in the Gemfile, in place \
+         of any other `gem` call that declares it, or patch {name} with `--mode agent`"
+    )
 }
 
 /// Looser "declared at all?" probe — the redirect rewriter's `declared_re`
@@ -3919,6 +4092,102 @@ mod tests {
         );
     }
 
+    /// #2091: the remedy of an indented declaration names only ways out
+    /// that work for the block it sits in, and spells the `group:` option
+    /// only where one option means the same as the block.
+    #[test]
+    fn indented_declaration_remedy_fits_the_enclosing_block() {
+        let remedy = |gemfile: &str| {
+            let at = gemfile.find("gem \"rack\"").unwrap();
+            let line_start = gemfile[..at].rfind('\n').map_or(0, |i| i + 1);
+            indented_declaration_remedy(gemfile, line_start, "rack")
+        };
+        let hosted_too = ", or leave rack to hosted mode (`--mode hosted`)";
+        for (gemfile, top_level) in [
+            (
+                "group :test do\n  gem \"rack\", \"~> 3.1\", require: false\nend\n",
+                "move it to the top level with the option `group: :test`",
+            ),
+            // CRLF, a comment and a sibling between the header and the gem.
+            (
+                "group :test do\r\n  gem \"puma\"\r\n\r\n  # web\r\n  gem \"rack\"\r\nend\r\n",
+                "move it to the top level with the option `group: :test`",
+            ),
+            (
+                "group :development, :test do\n\tgem \"rack\"\nend\n",
+                "move it to the top level with the option `group: [:development, :test]`",
+            ),
+            (
+                "group(:test) do\n  gem \"rack\"\nend\n",
+                "move it to the top level with the option `group: :test`",
+            ),
+            // No single option is sure to mean the same as these.
+            (
+                "group :test, optional: true do\n  gem \"rack\"\nend\n",
+                "move it to the top level",
+            ),
+            (
+                "group \"test\" do\n  gem \"rack\"\nend\n",
+                "move it to the top level",
+            ),
+            (
+                "platforms :mri do\n  gem \"rack\"\nend\n",
+                "move it to the top level",
+            ),
+            (
+                "if ENV[\"CI\"]\n  gem \"rack\"\nend\n",
+                "move it to the top level",
+            ),
+            // Two blocks are open, however the inner one is indented.
+            (
+                "group :test do\nplatforms :mri do\n  gem \"rack\"\nend\nend\n",
+                "move it to the top level",
+            ),
+            (
+                "platforms :mri do\n  group :test do\n    gem \"rack\"\n  end\nend\n",
+                "move it to the top level",
+            ),
+            // A closed block above is not the one around the gem.
+            (
+                "group :test do\n  gem \"puma\"\nend\n  gem \"rack\"\n",
+                "write it without indentation",
+            ),
+        ] {
+            assert_eq!(
+                remedy(gemfile),
+                format!("{top_level}{hosted_too}"),
+                "{gemfile:?}"
+            );
+        }
+        // Hosted mode refuses a gem inside a source-selecting block too
+        // (`redirect_gem_source_option`), so it is never named there.
+        for gemfile in [
+            "source \"https://gems.example\" do\n  gem \"rack\"\nend\n",
+            "git \"https://git.example/rack.git\" do\n  gem \"rack\"\nend\n",
+            "group :test do\n  source \"https://gems.example\" do\n    gem \"rack\"\n  end\nend\n",
+        ] {
+            assert_eq!(
+                remedy(gemfile),
+                "patch rack with `--mode agent`",
+                "{gemfile:?}"
+            );
+        }
+    }
+
+    /// #2091: a refusal that another mode does not share says so. `detail`
+    /// names `--mode <m>` for exactly the modes in `modes`, so it never
+    /// sends the user to a mode that refuses the gem as well.
+    fn assert_names_other_modes(detail: &str, modes: &[&str]) {
+        for mode in ["hosted", "agent"] {
+            let named = detail.contains(&format!("`--mode {mode}`"));
+            assert_eq!(
+                named,
+                modes.contains(&mode),
+                "`--mode {mode}` named={named}: {detail}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn test_refuses_native_extensions() {
         let (_tmp, root, installed, blobs, record) = fixture(GEMFILE_DIRECT, LOCK_DIRECT).await;
@@ -3939,6 +4208,7 @@ mod tests {
             unwrap_refused(run_vendor(&root, &blobs, &installed, &record, false).await);
         assert_eq!(code, "native_extensions_unsupported");
         assert!(detail.contains("native extensions"));
+        assert_names_other_modes(&detail, &["hosted", "agent"]);
         assert!(!root.join(".socket").exists());
         // Neither file touched.
         assert_eq!(
@@ -3953,6 +4223,62 @@ mod tests {
         );
     }
 
+    /// #2091 (review): hosted mode refuses a gem whose declaration picks
+    /// its source, so the native-extension remedy names agent mode alone
+    /// for it.
+    #[tokio::test]
+    async fn test_native_extension_remedy_skips_hosted_for_a_source_selecting_declaration() {
+        for gemfile in [
+            "source \"https://rubygems.org\"\n\nsource \"https://gems.example\" do\n  gem \"rack\", \"~> 3.1\"\nend\n",
+            "source \"https://rubygems.org\"\n\ngem \"rack\", git: \"https://git.example/rack.git\"\n",
+            "source \"https://rubygems.org\"\n\ngem \"rack\", \"~> 3.1\", :source => \"https://gems.example\"\n",
+        ] {
+            let (_tmp, root, installed, blobs, record) = fixture(gemfile, LOCK_DIRECT).await;
+            let spec = installed
+                .parent()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .join("specifications/rack-3.2.6.gemspec");
+            tokio::fs::write(
+                &spec,
+                "Gem::Specification.new do |s|\n  s.name = \"rack\"\n  s.extensions = [\"ext/rack/extconf.rb\"]\nend\n",
+            )
+            .await
+            .unwrap();
+            let (code, detail) =
+                unwrap_refused(run_vendor(&root, &blobs, &installed, &record, false).await);
+            assert_eq!(code, "native_extensions_unsupported", "{gemfile:?}");
+            assert_names_other_modes(&detail, &["agent"]);
+        }
+    }
+
+    #[test]
+    fn declaration_selects_source_reads_blocks_and_options() {
+        for (gemfile, want) in [
+            ("gem \"rack\"\n", false),
+            ("gem \"rack\", \"~> 3.1\", require: false, group: :test\n", false),
+            ("group :test do\n  gem \"rack\"\nend\n", false),
+            // Another gem's source is not this gem's.
+            ("gem \"puma\", git: \"https://git.example/puma.git\"\ngem \"rack\"\n", false),
+            ("gem \"rack\" # path: \"../rack\"\n", false),
+            ("gem \"rack\", path: \"../rack\"\n", true),
+            ("gem \"rack\", github: \"rack/rack\"\r\n", true),
+            ("gem \"rack\", :git => \"https://git.example/rack.git\"\n", true),
+            ("gem \"rack\", source: \"https://gems.example\"\n", true),
+            // Hosted mode refuses every source key, not only the built-in ones.
+            ("gem \"rack\", gitlab: \"rack/rack\"\n", true),
+            ("gem \"rack\", \"~> 3.1\", forge: \"rack/rack\"\n", true),
+            ("path \"components\" do\n  gem \"rack\"\nend\n", true),
+            (
+                "group :test do\n  source \"https://gems.example\" do\n    gem \"rack\"\n  end\nend\n",
+                true,
+            ),
+        ] {
+            assert_eq!(declaration_selects_source(gemfile, "rack"), want, "{gemfile:?}");
+        }
+    }
+
     #[tokio::test]
     async fn test_refuses_platform_suffixed_dir() {
         let (_tmp, root, installed, blobs, record) = fixture(GEMFILE_DIRECT, LOCK_DIRECT).await;
@@ -3960,9 +4286,11 @@ mod tests {
         let platform_dir = installed.parent().unwrap().join("rack-3.2.6-x86_64-linux");
         tokio::fs::rename(&installed, &platform_dir).await.unwrap();
 
-        let (code, _d) =
+        let (code, detail) =
             unwrap_refused(run_vendor(&root, &blobs, &platform_dir, &record, false).await);
         assert_eq!(code, "platform_gem_unsupported");
+        // Hosted mode refuses a precompiled build too, so it is not named.
+        assert_names_other_modes(&detail, &["agent"]);
         assert!(!root.join(".socket").exists());
     }
 
@@ -3978,8 +4306,10 @@ mod tests {
         let odd_dir = installed.parent().unwrap().join("random-unrelated");
         tokio::fs::rename(&installed, &odd_dir).await.unwrap();
 
-        let (code, _d) = unwrap_refused(run_vendor(&root, &blobs, &odd_dir, &record, false).await);
+        let (code, detail) =
+            unwrap_refused(run_vendor(&root, &blobs, &odd_dir, &record, false).await);
         assert_eq!(code, "platform_gem_unsupported");
+        assert_names_other_modes(&detail, &["agent"]);
         assert!(!root.join(".socket").exists());
     }
 
@@ -3999,6 +4329,7 @@ mod tests {
             detail.contains("x86_64-linux"),
             "refusal names the offending platform: {detail}"
         );
+        assert_names_other_modes(&detail, &["agent"]);
         assert!(!root.join(".socket").exists(), "refusal must write nothing");
     }
 
@@ -4042,6 +4373,12 @@ mod tests {
             unwrap_refused(run_vendor(&root, &blobs, &installed, &record, false).await);
         assert_eq!(code, "gemfile_declaration_not_editable");
         assert!(detail.contains("indented"), "{detail}");
+        // #2091: both ways out are named, the first with the block's option.
+        assert!(
+            detail.contains("move it to the top level with the option `group: :test`"),
+            "names the top-level `group:` form: {detail}"
+        );
+        assert_names_other_modes(&detail, &["hosted"]);
         assert!(!root.join(".socket").exists());
         assert_eq!(
             tokio::fs::read_to_string(root.join(GEMFILE)).await.unwrap(),
@@ -7084,8 +7421,9 @@ mod tests {
             )),
         )
         .await;
-        let (code, _) = unwrap_refused(outcome);
+        let (code, detail) = unwrap_refused(outcome);
         assert_eq!(code, "native_extensions_unsupported");
+        assert_names_other_modes(&detail, &["hosted", "agent"]);
     }
 
     /// `--offline` + `--vendor-source=service` refuses without any network.
@@ -7301,7 +7639,8 @@ mod tests {
     }
 
     /// #482: a DIRECT dependency declared where the line grammar cannot see
-    /// it (`eval_gemfile`, a loop) is listed under the lock's DEPENDENCIES.
+    /// it (`eval_gemfile`, a loop, a gemspec) is listed under the lock's
+    /// DEPENDENCIES.
     /// Appending the managed block would declare it twice and bundler
     /// refuses every install, so the plan must refuse before any write.
     #[tokio::test]
@@ -7309,12 +7648,36 @@ mod tests {
         for gemfile in [
             "source \"https://rubygems.org\"\n\ngem \"puma\"\neval_gemfile \"Gemfile.common\"\n",
             "source \"https://rubygems.org\"\n\ngem \"puma\"\n%w[rack].each { |g| gem g, \"~> 3.1\" }\n",
+            // A gem only the gemspec declares (a development dependency).
+            "source \"https://rubygems.org\"\n\ngem \"puma\"\ngemspec\n",
+            "source \"https://rubygems.org\"\r\n\r\ngem \"puma\"\r\ngemspec path: \"gems/mylib\"\r\n",
+            // No directive: a variable of that name, which a loop reads.
+            "source \"https://rubygems.org\"\n\ngem \"puma\"\ngemspec_file = Gem::Specification.load(\"x.gemspec\")\ngemspec_file.development_dependencies.each { |d| gem d.name }\n",
+            "source \"https://rubygems.org\"\n\ngem \"puma\"\nspec = Gem::Specification.load(\"x.gemspec\")\n\ngemspec = spec\ngemspec.development_dependencies.each { |d| gem d.name }\n",
         ] {
             let (_tmp, root, installed, blobs, record) = fixture(gemfile, LOCK_DIRECT).await;
             let (code, detail) =
                 unwrap_refused(run_vendor(&root, &blobs, &installed, &record, false).await);
             assert_eq!(code, "gemfile_declaration_not_editable", "{gemfile}");
             assert!(detail.contains("direct dependency"), "{detail}");
+            // #2151: the refusal names its way out, and no mode that
+            // refuses the gem as well (hosted mode does, for this reason).
+            assert!(
+                detail.contains("one literal `gem \"rack\"` line"),
+                "{detail}"
+            );
+            assert_names_other_modes(&detail, &["agent"]);
+            // The line replaces a `gem` call out of sight: next to it,
+            // the vendored pin would be a second, differing declaration.
+            assert!(
+                detail.contains("in place of any other `gem` call that declares it"),
+                "{detail}"
+            );
+            assert_eq!(
+                detail.contains("above `gemspec`"),
+                gemfile.contains("\ngemspec\n") || gemfile.contains("\ngemspec path:"),
+                "{detail}"
+            );
             assert!(!root.join(".socket").exists());
             assert_eq!(
                 tokio::fs::read_to_string(root.join(GEMFILE)).await.unwrap(),
@@ -9729,6 +10092,9 @@ mod tests {
         let (code, detail) = refusal.expect("an indented declaration is not editable");
         assert_eq!(code, "gemfile_declaration_not_editable");
         assert!(detail.contains("indented"), "{detail}");
+        // #2091: the gem is hosted already; the remedy reads true for it.
+        assert!(detail.contains("leave rails to hosted mode"), "{detail}");
+        assert_names_other_modes(&detail, &["hosted"]);
         // A preflight: the hosted pair is never written, even though the
         // caller's options are a wet run.
         assert_eq!(std::fs::read_to_string(dir.join(GEMFILE)).unwrap(), gemfile);

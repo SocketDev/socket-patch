@@ -626,6 +626,54 @@ mod jvm_env_selftests {
         assert!(std::path::Path::new(&home).is_dir());
     }
 
+    /// The neutral Maven settings can never break a real Maven. The file
+    /// the socket-patch child is pointed at exists and is a valid, empty
+    /// settings file (a real Maven refuses to start on a settings file
+    /// that is named and missing); only a command built for the
+    /// socket-patch binary carries it; and a Maven child, which is isolated
+    /// through the same `isolate_cli`, is started with no `MAVEN_ARGS` at
+    /// all, whatever the test process's environment holds.
+    #[test]
+    fn the_neutral_maven_settings_are_a_real_file_and_never_reach_a_maven_child() {
+        use crate::common::hermetic;
+        let maven_args = |cmd: &Command| -> Option<Option<String>> {
+            cmd.get_envs()
+                .find(|(k, _)| *k == "MAVEN_ARGS")
+                .map(|(_, v)| v.map(|v| v.to_string_lossy().into_owned()))
+        };
+        let settings = hermetic::neutral_maven_settings();
+        assert!(settings.is_absolute(), "{}", settings.display());
+        assert!(settings.is_file(), "{}", settings.display());
+        let text = std::fs::read_to_string(&settings).unwrap();
+        assert!(
+            text.contains("<settings") && !text.contains("<mirror"),
+            "{text}"
+        );
+        // Handed out again, it is the same file, still there.
+        assert_eq!(hermetic::neutral_maven_settings(), settings);
+
+        // The socket-patch child: both settings files are that one.
+        let mut cli = hermetic::command(std::path::Path::new("socket-patch"));
+        let args = hermetic::neutral_maven_args();
+        assert_eq!(maven_args(&cli), Some(Some(args.clone())));
+        let path = settings.to_string_lossy();
+        assert_eq!(args.matches(path.as_ref()).count(), 2, "{args}");
+        assert!(args.starts_with("-s ") && args.contains(" -gs "), "{args}");
+        // ... and it survives the JVM isolation, which removes the
+        // ambient value.
+        isolate_cli(&mut cli);
+        assert_eq!(maven_args(&cli), Some(Some(args)));
+
+        // A Maven child is not built by `hermetic::command`: it gets none,
+        // and an ambient one is removed.
+        let mut mvn = Command::new("mvn");
+        isolate_cli(&mut mvn);
+        assert_eq!(maven_args(&mvn), Some(None));
+        // A test's own value, set after the isolation, still lands last.
+        mvn.env("MAVEN_ARGS", "-o");
+        assert_eq!(maven_args(&mvn), Some(Some("-o".to_string())));
+    }
+
     /// Without an explicit cache the Gradle user home is the stand-in's
     /// `.gradle`: the CLI resolves Gradle's home from the passwd entry on
     /// Unix, so pinning `HOME` alone would leak the real `~/.gradle`.

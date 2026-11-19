@@ -21,7 +21,7 @@
 //!   re-pins the lock) → fresh checkout, cold cache, `dotnet restore
 //!   --locked-mode` extracts the patched bytes from the committed feed.
 //!
-//! Then, on the fresh checkout (the shape a depscan-opened PR / CI clone
+//! Then, on the fresh checkout (the shape a GitHub-app PR / CI clone
 //! has), the manifest-less VEX matrix:
 //!
 //! | step | shape | expectation |

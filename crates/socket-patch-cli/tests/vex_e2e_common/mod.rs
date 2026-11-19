@@ -2,7 +2,7 @@
 //! patches, one suite per package manager).
 //!
 //! A hosted (`scan --mode hosted`) or vendored (`scan --mode vendored`,
-//! `get --mode vendored`, a depscan-opened PR) checkout has NO
+//! `get --mode vendored`, a GitHub-app PR) checkout has NO
 //! `.socket/manifest.json`: the patches live in the lockfiles/configs, the
 //! committed `.socket/vendor/` artifacts and (optionally) the two ledgers.
 //! These helpers take a project a real package manager produced, strip it
@@ -26,7 +26,7 @@
 //!                &[("GHSA-xxxx-yyyy-zzzz", &["CVE-2026-1"])]),
 //! )]);
 //! // ... `socket-patch scan --mode hosted` + `npm ci` in `project` ...
-//! strip_manifest(project);          // the depscan / lockfile-only shape
+//! strip_manifest(project);          // the GitHub-app / lockfile-only shape
 //! strip_ledgers(project);           // optional: lockfile wiring alone
 //!
 //! // Offline first: zero network, the record is unavailable.
@@ -118,7 +118,7 @@ pub mod hermetic;
 // ── Project shaping ───────────────────────────────────────────────────
 
 /// Delete `.socket/manifest.json` (if present): the shape a hosted /
-/// vendored / depscan checkout has (both modes are manifest-free, so this
+/// vendored / GitHub-app checkout has (both modes are manifest-free, so this
 /// only removes a manifest a test seeded or an agent-mode run left).
 /// Everything else under `.socket/` (vendored artifacts, ledgers) is kept.
 pub fn strip_manifest(project: &Path) {

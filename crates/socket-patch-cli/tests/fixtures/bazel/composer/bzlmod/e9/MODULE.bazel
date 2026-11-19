@@ -1,0 +1,10 @@
+module(name = "socket_fixture", version = "0.0.0")
+
+# No ruleset: the repository rule is the workspace's own, composer.bzl.
+composer_install = use_repo_rule("//:composer.bzl", "composer_install")
+
+composer_install(
+    name = "php_vendor",
+    composer_json = "//services/api:composer.json",
+    composer_lock = "//services/api:composer.lock",
+)
