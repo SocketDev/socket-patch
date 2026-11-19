@@ -420,23 +420,18 @@ pub fn path_with_fake_hatch(scratch: &Path) -> std::ffi::OsString {
     std::env::join_paths(paths).unwrap()
 }
 
-/// A virtualenv outside the project that holds one package unrelated to the
-/// fixture, for a scan to find installed. Hatch has no lockfile, so `scan`
-/// learns a Hatch project's packages only from what is installed, and the
-/// hosted cells wire a checkout with nothing installed. [`ScanApi`] answers
-/// any batch query with the fixture's patch, so one installed package of
-/// any name is enough for the scan to ask. Without it the scan asks only
-/// when the host's own Python holds a package the project declares.
-fn placeholder_venv(scratch: &Path) -> PathBuf {
-    let venv = "placeholder-venv";
-    put(
-        scratch,
-        &format!(
-            "{}/placeholder-0.0.0.dist-info/METADATA",
-            site_packages_rel(venv)
-        ),
-        b"Metadata-Version: 2.1\nName: placeholder\nVersion: 0.0.0\n",
-    );
+/// A virtualenv outside the project with the fixture's package installed
+/// at its patched bytes, as it is once reinstalled from the hosted wheel.
+/// Hatch has no lockfile, so `scan` learns a Hatch project's packages only
+/// from what is installed, and the hosted cells wire a checkout with
+/// nothing installed in it. Activating this environment for the scan gives
+/// it the fixture's package to ask the API about. An unpatched copy would
+/// not do: the hosted stale-install guard reports it and keeps it out of
+/// the same-run VEX. Without the environment the scan asks only when the
+/// host's own Python holds a package the project declares.
+fn installed_fixture_venv(scratch: &Path) -> PathBuf {
+    let venv = "installed-fixture-venv";
+    install(scratch, venv, PATCHED);
     put(
         scratch,
         &format!("{venv}/pyvenv.cfg"),
@@ -480,9 +475,9 @@ pub fn run_scan(
     let mut cmd = cli();
     cmd.env("PATH", path_with_fake_hatch(scratch));
     // A hosted scan of a project with no lock and no environment has
-    // nothing to ask the API about: see `placeholder_venv`.
+    // nothing to ask the API about: see `installed_fixture_venv`.
     if mode == Mode::Hosted && !cwd.join("pdm.lock").exists() && !cwd.join(".venv").exists() {
-        cmd.env("VIRTUAL_ENV", placeholder_venv(scratch));
+        cmd.env("VIRTUAL_ENV", installed_fixture_venv(scratch));
     }
     let out = cmd
         .args(&args)

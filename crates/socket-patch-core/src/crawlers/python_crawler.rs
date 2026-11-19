@@ -385,6 +385,21 @@ fn venv_root_of_site(site: &Path) -> Option<PathBuf> {
         .map(Path::to_path_buf)
 }
 
+/// The environment a `site-packages` dir belongs to, when it is one a
+/// project has to itself: a venv ([`venv_root_of_site`]) or a conda
+/// environment, whose root holds `conda-meta`. `None` for an interpreter
+/// installed for the whole machine (the distro's, Homebrew's, python.org's,
+/// a version manager's).
+fn own_environment_of_site(site: &Path) -> Option<PathBuf> {
+    venv_root_of_site(site).or_else(|| {
+        site.ancestors()
+            .skip(1)
+            .take(3)
+            .find(|dir| dir.join("conda-meta").is_dir())
+            .map(Path::to_path_buf)
+    })
+}
+
 /// The base interpreter's prefix for a venv whose `pyvenv.cfg` names `home`:
 /// the nearest ancestor of `home` (or of the resolved interpreter in it, for
 /// a symlinked one such as Homebrew's `opt/python@3.X/bin`) holding the
@@ -3479,7 +3494,10 @@ async fn local_site_packages_with(
 /// the process environment), plus whether the dirs are the shared
 /// interpreter's ([`project_interpreter_site_packages`]) rather than an
 /// environment of the project's own. What is installed in a shared
-/// interpreter is not all this project's: see [`scope`].
+/// interpreter is not all this project's: see [`scope`]. An interpreter on
+/// `PATH` that sits in a venv or a conda environment (a Docker image's
+/// `ENV PATH=/opt/venv/bin:$PATH`, with no `VIRTUAL_ENV`) is the project's
+/// own environment, like an activated one.
 async fn local_sites_with(
     cwd: &Path,
     var: &impl Fn(&str) -> Option<String>,
@@ -3505,7 +3523,15 @@ async fn local_sites_with(
         return (Vec::new(), false);
     }
     if is_python_project(cwd).await {
-        return (project_interpreter_site_packages(cwd).await, true);
+        let sites = project_interpreter_site_packages(cwd).await;
+        let probed = sites.clone();
+        let own = run_blocking(move || {
+            probed
+                .iter()
+                .any(|site| own_environment_of_site(site).is_some())
+        })
+        .await;
+        return (sites, !own);
     }
     (Vec::new(), false)
 }
@@ -3630,17 +3656,37 @@ impl PythonCrawler {
         self.crawl_all_with(options, &var).await
     }
 
+    /// [`Self::crawl_all`] without the declared-package scope: every
+    /// package installed where the project installs. For a caller that was
+    /// told which package to look for (`get <name>`): the name says the
+    /// package is wanted, whether or not the project declares it.
+    pub async fn crawl_all_installed(&self, options: &CrawlerOptions) -> Vec<CrawledPackage> {
+        let var = |name: &str| std::env::var(name).ok();
+        self.crawl_with(options, &var, false).await
+    }
+
     /// [`Self::crawl_all`] over an explicit environment.
     async fn crawl_all_with(
         &self,
         options: &CrawlerOptions,
         var: &impl Fn(&str) -> Option<String>,
     ) -> Vec<CrawledPackage> {
+        self.crawl_with(options, var, true).await
+    }
+
+    /// The crawl behind [`Self::crawl_all`] (`declared_only`) and
+    /// [`Self::crawl_all_installed`].
+    async fn crawl_with(
+        &self,
+        options: &CrawlerOptions,
+        var: &impl Fn(&str) -> Option<String>,
+        declared_only: bool,
+    ) -> Vec<CrawledPackage> {
         let mut packages = Vec::new();
         let mut seen = HashSet::new();
 
         let (sp_paths, shared) = self.sites_with(options, var).await;
-        let scope = if shared {
+        let scope = if shared && declared_only {
             scope::project_scope(&options.cwd, &sp_paths).await
         } else {
             None

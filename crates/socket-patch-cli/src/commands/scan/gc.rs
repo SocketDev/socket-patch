@@ -286,7 +286,8 @@ async fn apply_gc_locked(
     };
     let mut prunable = detect_prunable(&manifest, scanned_purls, vendored);
     keep_project_entries(common, &mut prunable).await;
-    let kept = keep_patched_cargo_copies(common, &manifest, socket_dir, &mut prunable).await;
+    let mut kept = keep_patched_cargo_copies(common, &manifest, socket_dir, &mut prunable).await;
+    kept.extend(keep_patched_pypi_copies(common, &manifest, socket_dir, &mut prunable).await);
     for purl in &prunable {
         manifest.patches.remove(purl);
     }
@@ -405,6 +406,45 @@ async fn keep_patched_cargo_copies(
         .collect()
 }
 
+/// Drop from `prunable` every PyPI entry whose agent-mode patch is still
+/// on disk in a copy the crawl does not report: a project with no
+/// environment of its own is crawled for the packages it declares, in the
+/// one interpreter it installs into, but a package it stopped declaring,
+/// or one an earlier release patched in another interpreter or a tool's
+/// environment, keeps its patched copy. The manifest record holds the only
+/// before-blobs that can restore that copy, so it is kept, with one
+/// `pypi_installed_patch_kept` warning per entry naming the `rollback` that
+/// restores the copy and then drops the record.
+async fn keep_patched_pypi_copies(
+    common: &GlobalArgs,
+    manifest: &PatchManifest,
+    socket_dir: &Path,
+    prunable: &mut Vec<String>,
+) -> Vec<(&'static str, String)> {
+    let kept = crate::ecosystem_dispatch::pypi_copies_still_patched(
+        manifest,
+        prunable.iter(),
+        &common.crawler_options(),
+        &socket_dir.join("blobs"),
+    )
+    .await;
+    prunable.retain(|p| !kept.contains(p));
+    kept.into_iter()
+        .map(|purl| {
+            (
+                "pypi_installed_patch_kept",
+                format!(
+                    "kept {purl}: the scan no longer reports it as one of the project's \
+                     packages, but an installed copy is still patched (or could not be \
+                     read to tell); run `socket-patch rollback {purl}` (with `--global` \
+                     when the copy is in another interpreter or a tool's environment) \
+                     to restore that copy and drop the entry"
+                ),
+            )
+        })
+        .collect()
+}
+
 /// The vendored-state half of the GC alone, for a `--prune` whose crawl
 /// found nothing (the manifest half is skipped there: pruning against an
 /// empty crawl would drop every entry). Reverting entries whose patch left
@@ -470,6 +510,7 @@ async fn preview_apply_gc(
     let mut prunable = detect_prunable(&manifest, scanned_purls, vendored);
     keep_project_entries(common, &mut prunable).await;
     let _ = keep_patched_cargo_copies(common, &manifest, socket_dir, &mut prunable).await;
+    let _ = keep_patched_pypi_copies(common, &manifest, socket_dir, &mut prunable).await;
     // The sweep derives the referenced set from this in-memory manifest.
     for purl in &prunable {
         manifest.patches.remove(purl);
@@ -1628,6 +1669,114 @@ mod tests {
                  undo the drift and re-run `vendor --revert` to finish."
                     .to_string(),
             ]
+        );
+    }
+
+    /// A PyPI entry the crawl does not report is kept while an installed
+    /// copy still carries its patch. A project with no environment of its
+    /// own is crawled only for the packages it declares, so a package it
+    /// stopped declaring drops out of the crawl with its copy still
+    /// patched, and the record's before-blobs are the only way to restore
+    /// that copy. An entry whose copy is back to the original is pruned.
+    #[tokio::test]
+    async fn prune_keeps_a_pypi_entry_whose_installed_copy_is_still_patched() {
+        use socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes as hash;
+        const ORIGINAL: &[u8] = b"VERSION = 'original'\n";
+        const PATCHED: &[u8] = b"VERSION = 'patched'\n";
+
+        let tmp = tempfile::tempdir().unwrap();
+        let site = tmp.path().join("site-packages");
+        for (name, module) in [("stillpatched", PATCHED), ("restored", ORIGINAL)] {
+            let dist = site.join(format!("{name}-1.0.0.dist-info"));
+            std::fs::create_dir_all(&dist).unwrap();
+            std::fs::write(
+                dist.join("METADATA"),
+                format!("Metadata-Version: 2.1\nName: {name}\nVersion: 1.0.0\n"),
+            )
+            .unwrap();
+            std::fs::create_dir_all(site.join(name)).unwrap();
+            std::fs::write(site.join(name).join("__init__.py"), module).unwrap();
+        }
+
+        let project = tmp.path().join("project");
+        let socket_dir = project.join(".socket");
+        let blobs = socket_dir.join("blobs");
+        std::fs::create_dir_all(&blobs).unwrap();
+        for content in [ORIGINAL, PATCHED] {
+            std::fs::write(blobs.join(hash(content)), content).unwrap();
+        }
+        let record = |name: &str, uuid: &str| {
+            serde_json::json!({
+                "uuid": uuid,
+                "exportedAt": "2026-01-01T00:00:00Z",
+                "files": { format!("{name}/__init__.py"): {
+                    "beforeHash": hash(ORIGINAL),
+                    "afterHash": hash(PATCHED),
+                }},
+                "vulnerabilities": {},
+                "description": "seed",
+                "license": "MIT",
+                "tier": "free",
+            })
+        };
+        let kept = "pkg:pypi/stillpatched@1.0.0";
+        let pruned = "pkg:pypi/restored@1.0.0";
+        let manifest_path = socket_dir.join("manifest.json");
+        let manifest = serde_json::json!({ "patches": {
+            kept: record("stillpatched", "22222222-2222-4222-8222-222222222222"),
+            pruned: record("restored", "33333333-3333-4333-8333-333333333333"),
+        }});
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        // The crawl reported neither package. `--global-prefix` names the
+        // site dir their copies are looked up in by PURL.
+        let scanned = scanned(&["pkg:pypi/declared@1.0.0"]);
+        for dry_run in [true, false] {
+            let common = crate::args::GlobalArgs {
+                cwd: project.clone(),
+                global_prefix: Some(site.clone()),
+                dry_run,
+                ..Default::default()
+            };
+            let gc = if dry_run {
+                preview_apply_gc(
+                    &common,
+                    &manifest_path,
+                    &socket_dir,
+                    &scanned,
+                    &no_vendored(),
+                )
+                .await
+            } else {
+                run_apply_gc(
+                    &common,
+                    &manifest_path,
+                    &socket_dir,
+                    &scanned,
+                    &no_vendored(),
+                )
+                .await
+            };
+            assert_eq!(gc.pruned, vec![pruned.to_string()], "dry_run={dry_run}");
+            if !dry_run {
+                assert!(
+                    gc.warnings.iter().any(|(code, detail)| {
+                        *code == "pypi_installed_patch_kept" && detail.contains(kept)
+                    }),
+                    "the kept entry must be explained: {gc:?}"
+                );
+            }
+        }
+        let manifest = read_manifest(&manifest_path).await.unwrap().unwrap();
+        assert!(manifest.patches.contains_key(kept), "{manifest:?}");
+        assert!(!manifest.patches.contains_key(pruned), "{manifest:?}");
+        assert!(
+            blobs.join(hash(ORIGINAL)).exists(),
+            "the kept entry's before-blob is its only restore data"
         );
     }
 }

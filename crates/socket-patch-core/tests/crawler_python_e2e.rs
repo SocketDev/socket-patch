@@ -1288,6 +1288,26 @@ async fn crawl_all_in_a_shared_interpreter_keeps_only_the_projects_packages() {
         .unwrap();
     assert!(found.contains_key(&certifi), "{found:?}");
 
+    // A caller that names a package asks about everything installed
+    // there, declared or not.
+    let mut installed: Vec<String> = with_project_env(home.path(), &bin, || async {
+        crawler.crawl_all_installed(&opts).await
+    })
+    .await
+    .into_iter()
+    .map(|package| package.purl)
+    .collect();
+    installed.sort();
+    assert_eq!(
+        installed,
+        [
+            "pkg:pypi/certifi@2026.7.22",
+            "pkg:pypi/flask@3.0.0",
+            "pkg:pypi/setuptools@80.10.2",
+            "pkg:pypi/werkzeug@3.0.1",
+        ]
+    );
+
     // `setup.py` decides the dependencies in code, so the crawl is not
     // scoped. It still reads only the project's interpreter.
     std::fs::write(project.path().join("setup.py"), "").unwrap();
@@ -1300,6 +1320,54 @@ async fn crawl_all_in_a_shared_interpreter_keeps_only_the_projects_packages() {
             "pkg:pypi/werkzeug@3.0.1",
         ]
     );
+}
+
+/// An interpreter on `PATH` that sits in a venv or a conda environment is
+/// the project's own environment, with or without `VIRTUAL_ENV` (a Docker
+/// image's `ENV PATH=/opt/venv/bin:$PATH`). Everything installed there is
+/// the project's, declared or not, as in an activated environment.
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn crawl_all_of_an_environment_on_path_is_not_scoped() {
+    for marker in ["pyvenv.cfg", "conda-meta"] {
+        let project = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let machine = tempfile::tempdir().unwrap();
+        std::fs::write(project.path().join("requirements.txt"), "flask\n").unwrap();
+        let prefix = machine.path().join("opt/env");
+        let site = prefix.join("lib/python3.12/site-packages");
+        install_dist(&site, "Flask", "3.0.0", &[]);
+        // Installed by hand, named in no requirements file.
+        install_dist(&site, "gunicorn", "22.0.0", &[]);
+        if marker == "pyvenv.cfg" {
+            std::fs::write(prefix.join(marker), "home = /usr/bin\n").unwrap();
+        } else {
+            std::fs::create_dir_all(prefix.join(marker)).unwrap();
+        }
+        let bin = prefix.join("bin");
+        install_fake_python(&bin, &[&site]);
+
+        let crawler = PythonCrawler::new();
+        let opts = CrawlerOptions {
+            cwd: project.path().to_path_buf(),
+            global: false,
+            global_prefix: None,
+        };
+        let mut purls: Vec<String> = with_project_env(home.path(), &bin, || async {
+            crawler.crawl_all(&opts).await
+        })
+        .await
+        .into_iter()
+        .map(|package| package.purl)
+        .collect();
+        purls.sort();
+        assert_eq!(
+            purls,
+            ["pkg:pypi/flask@3.0.0", "pkg:pypi/gunicorn@22.0.0"],
+            "{marker}"
+        );
+    }
 }
 
 /// #964: a uv project (`uv.lock`) and a PEP 723 script lock (`*.py.lock`)

@@ -958,19 +958,24 @@ the interpreter on `PATH`. socket-patch reads that interpreter: it asks
 `python3` (else `python`, else `py`), run from the project directory, for
 its site-packages and user site, and reads only those directories.
 
-That interpreter is shared. Homebrew formulae, distro packages and other
-projects install into it too, so a package being installed there does not
-make it this project's. `scan` keeps only:
+An interpreter on `PATH` that sits in a virtualenv or a conda environment
+(a Docker image's `ENV PATH=/opt/venv/bin:$PATH`) is the project's own
+environment, like an activated one, and everything in it is the project's.
 
-- the packages the project declares: every requirement in a top-level
-  `*requirements*.txt` or `*requirements*.in` file, in a `.txt` or `.in`
-  file of a top-level `requirements/` directory and in their `-r`
-  includes, plus the `[project]` `dependencies` and
-  `optional-dependencies` and the `[dependency-groups]` of
-  `pyproject.toml`;
+Any other interpreter is shared. Homebrew formulae, distro packages and
+other projects install into it too, so a package being installed there does
+not make it this project's. `scan` keeps only:
+
+- the packages the project declares: every requirement in a
+  `*requirements*.txt` or `*requirements*.in` file at the top level or one
+  directory down (`docs/requirements.txt`), in a `.txt` or `.in` file of a
+  top-level `requirements/` directory and in their `-r` includes, plus the
+  `[project]` `dependencies` and `optional-dependencies` and the
+  `[dependency-groups]` of `pyproject.toml`;
 - the installed packages those require, through their `Requires-Dist`
-  metadata. Markers and extras are not evaluated, so an optional
-  requirement that is installed is kept.
+  metadata. A requirement behind an extra counts only when that extra is
+  asked for (`requests[socks]`). Other markers, such as a platform test,
+  are not evaluated.
 
 A project that declares nothing, or whose declared packages are not
 installed, has no packages there. Install them first
@@ -980,8 +985,11 @@ The filter is skipped, and every package in the interpreter is reported,
 when socket-patch cannot read every declaration: a `setup.py` or
 `setup.cfg`, a `poetry.lock`, `pdm.lock`, `uv.lock` or PEP 751 lock,
 `dynamic` dependencies, dependencies in a `[tool.poetry]`, `[tool.pdm]`,
-`[tool.uv]` or `[tool.flit]` table, a requirement on a local directory, a
-`${VAR}` in a requirements line, or an include that cannot be read.
+`[tool.uv]`, `[tool.rye]` or `[tool.flit]` table, Hatch environments
+(`hatch.toml` or a `[tool.hatch.envs]` table), a requirement on a local
+directory other than the project itself or on an archive that is not a
+wheel, a `${VAR}` in a requirements line, or a declaration that cannot be
+read.
 
 The other interpreters on the machine, and the environments tools keep for
 themselves (`uv tool install`, pipx apps, the Poetry installer, PDM's
@@ -989,7 +997,16 @@ global project), are never read for a project. Use `--global` to patch
 those.
 
 `apply`, `rollback` and `vex` find the packages of recorded patches by name
-and version in the same interpreter. The filter applies to discovery only.
+and version in the same interpreter, and `socket-patch get <name>` resolves
+a name among everything installed there. The filter applies to `scan`
+discovery only.
+
+`scan --prune` does not drop the record of a patch whose package is no
+longer reported while an installed copy is still patched
+(`pypi_installed_patch_kept`): the record holds the only data that can
+restore that copy. `socket-patch rollback <purl>` restores it and drops the
+record; add `--global` when the copy is in another interpreter or a tool's
+environment.
 
 ## Maven & NuGet caveats
 
