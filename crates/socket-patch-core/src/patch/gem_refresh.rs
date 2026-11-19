@@ -694,6 +694,7 @@ mod tests {
             cwd: cwd.to_path_buf(),
             rebuild: true,
             offline: true,
+            progress: None,
         }
     }
 
@@ -1112,6 +1113,7 @@ mod tests {
                 cwd: tmp.path().to_path_buf(),
                 rebuild: false,
                 offline: true,
+                progress: None,
             },
         )
         .await;
