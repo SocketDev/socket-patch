@@ -36,26 +36,33 @@
 //! nothing of this one: a project of the checkout that Bazel does not
 //! build keeps what socket-patch says of it.
 //!
+//! Only a call that is a statement of its own counts ([`Call::whole`]):
+//! it runs, once. One in a comprehension, behind an `and`, in a
+//! conditional or in the arguments of another call may never run, and is
+//! passed over.
+//!
 //! A lock is read like a file of the workspace ([`disk`]): never through a
 //! link that leads out of the Bazel root, although Bazel follows such a
 //! link. It is read only when it lies where the project's own lock can
-//! lie, once however many calls name it, and up to [`MAX_LOCK`].
+//! lie, once however many calls name it, and up to 64 MiB. Of a pnpm lock
+//! the project documents are read, for their keys alone: rules_js links
+//! nothing of the document pnpm 11 keeps for its own configuration.
 //!
-//! Not looked at: whether the call runs (a call in a comprehension is read
-//! like any other), what a `--override_repository` or an rc file changes,
+//! Not looked at: what a `--override_repository` or an rc file changes,
 //! BUILD files, and hubs of other rulesets.
 //!
 //! [`Tags::doubts`]: super::workspace::Tags::doubts
 
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
-use std::path::Path;
+use std::path::{Component, Path};
 
 use super::starlark::{Call, Value};
 use super::workspace::{disk, Extension, Repo, Workspace};
 use crate::formats::gem::locked_specs;
+use crate::formats::pnpm::grammar::documents;
 use crate::formats::pnpm::workspace::lock_text_member_importers;
-use crate::formats::pnpm::{pnpm_registry_key, PnpmLock};
+use crate::formats::pnpm::{pnpm_registry_key, PnpmDocument, PnpmLock};
 use crate::utils::fs::{open_regular_file_sync, run_blocking};
 use crate::utils::group_commit;
 use crate::utils::purl::purl_parts;
@@ -122,8 +129,11 @@ const HUBS: [Hub; 3] = [
         tag: "npm_translate_lock",
         files: &["pnpm_lock"],
         lists: |text| {
-            let lock = PnpmLock::parse(text);
-            let keys = lock.packages().iter();
+            let project = documents(text).into_iter();
+            let project = project.filter(|(_, kind)| *kind == PnpmDocument::Project);
+            let locks = project.map(|(span, _)| PnpmLock::parse_keys(&text[span]));
+            let locks: Vec<_> = locks.collect();
+            let keys = locks.iter().flat_map(|lock| lock.packages());
             owned(keys.filter_map(|package| pnpm_registry_key(package.key)))
         },
         members: lock_text_member_importers,
@@ -219,13 +229,17 @@ const MAX_LOCK: u64 = 64 << 20;
 
 /// The text of the lock `file` of the workspace at `root`, a canonical
 /// path, read as [`disk`] reads a file of the workspace: a file this run
-/// wrote and has not committed yet as the run left it, and nothing through
-/// a link that leads out of the workspace. `None` for that, for what is no
-/// file or not UTF-8, and for a file over [`MAX_LOCK`].
+/// wrote and has not committed yet as the run left it, when `file` names it
+/// in plain parts, and nothing through a link that leads out of the
+/// workspace. `None` for that, for what is no file (a directory, which
+/// Windows does not even open, like any other) or not UTF-8, and for a
+/// file over [`MAX_LOCK`].
 fn lock_text(root: &Path, file: &str) -> Option<String> {
     let path = root.join(file);
     let mut bytes = Vec::new();
-    match group_commit::read(&path) {
+    let plain = |part| matches!(part, Component::Normal(_));
+    let plain = Path::new(file).components().all(plain);
+    match group_commit::read(&path).filter(|_| plain) {
         Some(pending) => bytes = pending.ok()?,
         None => {
             let real = std::fs::canonicalize(&path).ok()?;
@@ -265,7 +279,7 @@ fn judge(
         // and once for all the calls that name it: `None` for a file that
         // is not the project's lock or cannot be read.
         let mut listed = HashMap::new();
-        for tag in &tags.calls {
+        for tag in tags.calls.iter().filter(|tag| tag.call.whole) {
             for lock in files(workspace, tag.call, hub.files) {
                 for &at in &ours {
                     let package = &packages[at];
@@ -363,8 +377,8 @@ mod tests {
     const UUID: &str = "7a11e000-0000-4000-8000-0000000000b1";
 
     /// A workspace with the three hubs: the npm one of `web`, two Python
-    /// ones (one in a comprehension, one with a file per platform) and the
-    /// Ruby one in a file the root includes.
+    /// ones (one with a file per platform) and the Ruby one in a file the
+    /// root includes.
     const ROOT: &str = r#"module(name = "shop", version = "0.0.0")
 
 bazel_dep(name = "aspect_rules_js", version = "3.6.0")
@@ -379,14 +393,11 @@ npm.npm_translate_lock(
 use_repo(npm, "npm")
 
 pip = use_extension("@rules_python//python/extensions:pip.bzl", "pip")
-[
-    pip.parse(
-        hub_name = "pypi",
-        python_version = version,
-        requirements_lock = "//api:requirements.txt",
-    )
-    for version in ["3.11", "3.12"]
-]
+pip.parse(
+    hub_name = "pypi",
+    python_version = "3.11",
+    requirements_lock = "//api:requirements.txt",
+)
 pip.parse(
     hub_name = "tools",
     python_version = "3.11",
@@ -497,14 +508,14 @@ use_repo(ruby, "bundle")
         assert_eq!(installed("web", "pkg:npm/left-pad@1.3.0"), NPM);
         assert_eq!(installed("web", "pkg:npm/%40shop/ui@2.0.0"), NPM);
         assert_eq!(installed("web", "pkg:npm/@shop/ui@2.0.0?x=1"), NPM);
-        // A call in a comprehension, a pin with hashes, a name pip folds.
-        let pypi = "pip.parse MODULE.bazel:16 api/requirements.txt";
+        // A pin with hashes, a name pip folds.
+        let pypi = "pip.parse MODULE.bazel:15 api/requirements.txt";
         assert_eq!(installed("api", "pkg:pypi/flask-cors@4.0.0"), pypi);
         assert_eq!(installed("api", "pkg:pypi/Flask_Cors@4.0.0"), pypi);
         // A file per platform: each is one the hub builds from.
-        let linux = "pip.parse MODULE.bazel:23 tools/requirements_linux.txt";
+        let linux = "pip.parse MODULE.bazel:20 tools/requirements_linux.txt";
         assert_eq!(installed("tools", "pkg:pypi/idna@3.6"), linux);
-        let darwin = "pip.parse MODULE.bazel:23 tools/requirements_darwin.txt";
+        let darwin = "pip.parse MODULE.bazel:20 tools/requirements_darwin.txt";
         assert_eq!(installed("tools", "pkg:pypi/idna@3.7"), darwin);
         // A hub in an included file, and a gem of one platform.
         let gem = "ruby.bundle_fetch billing/ruby.MODULE.bazel:2 billing/Gemfile.lock";
@@ -603,7 +614,7 @@ use_repo(ruby, "bundle")
     #[test]
     fn a_committed_copy_is_not_built_from_a_line_that_points_at_it() {
         let vendored = |project, purl, pins: &[&str]| said(&SHOP, project, purl, Some(pins));
-        let pypi = "pip.parse MODULE.bazel:16 api/requirements.txt";
+        let pypi = "pip.parse MODULE.bazel:15 api/requirements.txt";
         let requests = "pkg:pypi/requests@2.31.0";
         assert_eq!(vendored("api", requests, &["requirements.txt"]), pypi);
         assert_eq!(vendored("api", requests, &["./requirements.txt"]), pypi);
@@ -695,6 +706,72 @@ use_repo(ruby, "bundle")
         assert_eq!(npm(&SHOP[1..]), "");
     }
 
+    /// Only a call that is a statement of its own is known to run. One in
+    /// a comprehension, behind an `and`, in a conditional or in the
+    /// arguments of another call may never run: it withholds nothing, for
+    /// an installed copy and for a committed one.
+    #[test]
+    fn a_call_that_may_not_run_withholds_nothing() {
+        let hub = "npm.npm_translate_lock(\n    name = \"npm\",\n    pnpm_lock = \"//web:pnpm-lock.yaml\",\n)\n";
+        let npm = |call: &str| {
+            let root = ROOT.replace(hub, &format!("{call}\n"));
+            assert_ne!(root, ROOT, "{call}");
+            let root: &'static str = Box::leak(root.into_boxed_str());
+            let files = with("MODULE.bazel", root);
+            said(&files, "web", "pkg:npm/left-pad@1.3.0", None)
+        };
+        let call = "npm.npm_translate_lock(pnpm_lock = \"//web:pnpm-lock.yaml\")";
+        assert_eq!(npm(call), NPM);
+        assert_eq!(npm(&format!("hub = {call}")), NPM);
+        for may_not_run in [
+            format!("[{call} for version in []]"),
+            format!("ENABLE and {call}"),
+            format!("{call} if ENABLE else None"),
+            format!("print({call})"),
+        ] {
+            assert_eq!(npm(&may_not_run), "", "{may_not_run}");
+        }
+        let pip = "pip.parse(\n    hub_name = \"pypi\",\n    python_version = \"3.11\",\n    requirements_lock = \"//api:requirements.txt\",\n)\n";
+        let looped =
+            "[pip.parse(requirements_lock = \"//api:requirements.txt\") for version in []]\n";
+        let root = ROOT.replace(pip, looped);
+        assert_ne!(root, ROOT);
+        let root: &'static str = Box::leak(root.into_boxed_str());
+        let files = with("MODULE.bazel", root);
+        let requests = "pkg:pypi/requests@2.31.0";
+        assert_eq!(
+            said(&files, "api", requests, Some(&["requirements.txt"])),
+            ""
+        );
+        assert_eq!(said(&files, "api", "pkg:pypi/flask-cors@4.0.0", None), "");
+        // A call of the same hub that does run is judged as before.
+        assert_ne!(said(&files, "tools", "pkg:pypi/idna@3.6", None), "");
+    }
+
+    /// pnpm 11 keeps the packages of its own configuration in a first
+    /// document of the lock. rules_js links what the project documents
+    /// list: a package of that document alone is not one the hub builds.
+    #[test]
+    fn a_package_of_the_env_document_of_a_pnpm_lock_is_not_listed() {
+        let env =
+            "---\nlockfileVersion: '9.0'\n\nimporters:\n\n  .:\n    configDependencies:\n      \
+            is-odd:\n        specifier: 3.0.1\n        version: 3.0.1\n\npackages:\n\n  \
+            is-odd@3.0.1:\n    resolution: {integrity: sha512-DDDD}\n\nsnapshots:\n\n  \
+            is-odd@3.0.1: {}\n\n---\n";
+        let lock: &'static str = Box::leak(format!("{env}{PNPM_LOCK}").into_boxed_str());
+        let files = with("web/pnpm-lock.yaml", lock);
+        assert_eq!(said(&files, "web", "pkg:npm/is-odd@3.0.1", None), "");
+        assert_eq!(said(&files, "web", "pkg:npm/left-pad@1.3.0", None), NPM);
+        // The same entry in a lock of one document is a package of the
+        // project.
+        let one = lock
+            .replace("---\n", "")
+            .replace("configDependencies", "dependencies");
+        let one: &'static str = Box::leak(one.into_boxed_str());
+        let files = with("web/pnpm-lock.yaml", one);
+        assert_eq!(said(&files, "web", "pkg:npm/is-odd@3.0.1", None), NPM);
+    }
+
     #[test]
     fn only_a_label_written_out_in_the_main_repository_names_a_file() {
         let npm = |label: &str| {
@@ -784,7 +861,13 @@ use_repo(ruby, "bundle")
         let pins = Some(vec!["requirements.txt".to_string()]);
         let vendored = vec![package("pkg:pypi/requests@2.31.0", pins)];
         let found = unbuilt(&root.join("api"), vendored.clone()).await;
-        assert_eq!(found[0].as_ref().map(|found| found.line), Some(16));
+        assert_eq!(found[0].as_ref().map(|found| found.line), Some(15));
+        // A directory is no lock, on every system.
+        assert_eq!(
+            lock_text(&root, "web/pnpm-lock.yaml").as_deref(),
+            Some(PNPM_LOCK)
+        );
+        assert_eq!(lock_text(&root, "web"), None);
 
         // No package of a hub: the project is not even looked for.
         let found = unbuilt(&root.join("no/such/project"), packages[..1].to_vec()).await;
@@ -862,6 +945,11 @@ use_repo(ruby, "bundle")
         atomic_write_bytes(&lock, pinned.as_bytes()).await.unwrap();
         assert_eq!(std::fs::read_to_string(&lock).unwrap(), PNPM_LOCK);
         assert!(!withheld().await, "the lock as the run left it");
+        // Only a path of plain parts is asked of the run, as for every
+        // file of the workspace: another spelling reads the disk.
+        assert_eq!(lock_text(&root, name).as_deref(), Some(pinned.as_str()));
+        let dotted = "./web/pnpm-lock.yaml";
+        assert_eq!(lock_text(&root, dotted).as_deref(), Some(PNPM_LOCK));
         drop(run);
         assert!(withheld().await);
     }

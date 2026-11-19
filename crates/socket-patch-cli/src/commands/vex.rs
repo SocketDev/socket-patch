@@ -330,48 +330,12 @@ impl VexGenError {
         out
     }
 
-    /// Whether this failure of an embedded `--vex` fails its host command.
-    /// One does not: nothing is attested, and at least one patch was
-    /// withheld because Bazel does not build its patched copy
-    /// ([`BAZEL_NOT_IN_BUILD`]). Without that step the run attested that
-    /// patch, wrote its document and passed, whatever else it omitted: the
-    /// command did what it was run for, and an `apply --vex` in an install
-    /// hook must not start failing the installs of a project because that
-    /// project is also built with Bazel. No document is written, a previous
-    /// one at the path is removed, and the warnings say why, as for every
-    /// failure.
-    pub(crate) fn fails_host(&self) -> bool {
-        let withheld = |f: &FailedPatch| f.reason == BAZEL_NOT_IN_BUILD;
-        self.code != "no_applicable_patches" || !self.failed.iter().any(withheld)
-    }
-
-    /// Mark the envelope of the host command with an embedded `--vex`
-    /// failure, where it fails the host ([`Self::fails_host`]), and give
-    /// the exit code it adds to the host's.
-    pub(crate) fn mark(&self, env: &mut Envelope) -> i32 {
-        if self.fails_host() {
-            env.mark_error(EnvelopeError::new(self.code, self.message.clone()));
-        }
-        i32::from(self.fails_host())
-    }
-
     /// Human stderr for an embedded `--vex` failure: the error line — even
     /// under `--silent` ("errors only", never "nothing": exit 1 with no
     /// message would be undiagnosable) — and, under `--silent`, each omitted
     /// patch, as standalone `vex --silent` lists them (a louder run already
-    /// printed a `Warning: omitting …` line per omission). A failure that
-    /// leaves the host its exit code ([`Self::fails_host`]) is a note on
-    /// stdout instead, and nothing under `--silent`.
+    /// printed a `Warning: omitting …` line per omission).
     pub(crate) fn print_embedded(&self, common: &GlobalArgs) {
-        if !self.fails_host() {
-            if !common.silent {
-                println!(
-                    "No VEX document written: Bazel does not build the patched copy of any \
-                     package this run could attest (see the warnings above)."
-                );
-            }
-            return;
-        }
         eprintln!("Error: VEX generation failed: {}", self.message);
         if common.silent {
             for f in &self.failed {
@@ -552,15 +516,16 @@ pub(crate) fn format_vex_dry_run_skip(done: &str) -> String {
     format!("Skipping VEX generation (--dry-run: nothing was {done}).")
 }
 
-/// The note an embedded `--vex` on a manifest-less command prints when
-/// nothing anywhere references a patch
-/// ([`ManifestlessVex::NothingToAttest`]): the requested document was not
-/// written (the command still exits 0).
-pub(crate) fn format_vex_nothing_to_attest() -> String {
-    "No VEX document written: no manifest, .socket/vendor ledger record or lockfile \
-     references a patch."
-        .to_string()
-}
+/// The two lines of [`EmbeddedVex::NotWritten`]: the requested document
+/// was not written, and the command exits as it does without `--vex`.
+/// This one is a manifest-less command's, where nothing anywhere
+/// references a patch.
+const VEX_NOTHING_TO_ATTEST: &str = "No VEX document written: no manifest, .socket/vendor \
+     ledger record or lockfile references a patch.";
+/// And this one any host's, where Bazel does not build what the run could
+/// attest.
+const VEX_NOT_BUILT: &str = "No VEX document written: Bazel does not build the patched copy \
+     of any package this run could attest (see the warnings above).";
 
 /// The `--dry-run` twin of [`format_vex_written`]: nothing was written.
 pub(crate) fn format_vex_dry_run(statements: usize, path: &Path) -> String {
@@ -1871,7 +1836,13 @@ const BAZEL_NOT_IN_BUILD: &str = "vex_bazel_not_in_build";
 /// A hosted pin is left alone, and so is everything outside a Bazel
 /// workspace, in a `--global` run, or behind workspace files that cannot
 /// be read with certainty: the statement stays the one of a project
-/// without Bazel.
+/// without Bazel. So is a patch whose record names no advisory: no run
+/// writes a statement for it, and it is left out for that reason alone.
+///
+/// One project is asked about, `common.cwd`: it is where the installed
+/// copies were looked for, and it is the manifest's project, whose files
+/// the pins of a vendored copy are from. `vex` runs in that project, and
+/// every host command refuses a `--manifest-path` in another one.
 async fn withhold_unbuilt_by_bazel(
     outcome: &mut VerifyOutcome,
     plan: &Plan,
@@ -1883,8 +1854,8 @@ async fn withhold_unbuilt_by_bazel(
     }
     let patched = |purl: &String| {
         let record = plan.view.patches.get(purl)?;
-        let held = !plan.hosted.contains_key(purl);
-        held.then(|| Patched {
+        let judged = !plan.hosted.contains_key(purl) && !record.vulnerabilities.is_empty();
+        judged.then(|| Patched {
             purl: purl.clone(),
             uuid: record.uuid.clone(),
             pins: plan.vendor_pins.get(purl).cloned(),
@@ -2005,15 +1976,16 @@ fn has_iri_scheme(s: &str) -> bool {
 
 /// Read the manifest at `manifest_path`, then [`generate_vex`]. Manifest
 /// read failures are wrapped as [`VexGenError`] so every caller gets a single
-/// error channel. Used by the standalone `vex` command (file or stdout) and
-/// the embedded `--vex` paths of `apply`/`vendor`/`scan` (always a file).
+/// error channel. Used by the standalone `vex` command (file or stdout);
+/// the embedded `--vex` paths of `apply`/`vendor`/`scan` (always a file)
+/// take its result as an [`EmbeddedVex`].
 ///
 /// Failure contract: a run that ends in error leaves NO OpenVEX document at
 /// the output path — including a stale one from a previous run. Attestation
 /// semantics demand it: a pipeline reusing one `--output`/`--vex` path must
 /// not ship yesterday's `not_affected` document for a tree this run could
 /// no longer attest. See [`remove_stale_vex_doc`] for the deletion guard.
-pub(crate) async fn generate_vex_from_manifest_path(
+async fn generate_vex_from_manifest_path(
     common: &GlobalArgs,
     params: &VexBuildParams,
     manifest_path: &Path,
@@ -2021,19 +1993,55 @@ pub(crate) async fn generate_vex_from_manifest_path(
     generate_vex_with_cleanup(common, params, manifest_path, false).await
 }
 
-/// Outcome of [`generate_vex_without_manifest`].
-pub(crate) enum ManifestlessVex {
-    /// Nothing references a patch anywhere (no manifest, no ledger record,
-    /// no lockfile reference): the caller keeps its historical calm
-    /// no-manifest exit 0. Carries the run's advisories (the lockfile-
-    /// discovery diagnostics — an unparseable lock may be WHY nothing was
-    /// found — and a removed stale document) for the `--json` envelope's
-    /// `warnings[]`; human mode already printed them.
-    NothingToAttest(Vec<RunWarning>),
+/// Outcome of an embedded `--vex` ([`generate_vex_embedded`],
+/// [`generate_vex_without_manifest`]). A host command matches on it, and
+/// only [`Self::Failed`] fails the host.
+pub(crate) enum EmbeddedVex {
+    /// No document, and the host keeps its exit code and status. Carries
+    /// the run's advisories for the `--json` envelope's `warnings[]`
+    /// (human mode already printed them), and the line a person is told
+    /// on stdout unless `--silent`. There are two such runs:
+    ///
+    /// - On a manifest-less command, nothing references a patch anywhere
+    ///   (no manifest, no ledger record, no lockfile reference): the
+    ///   historical calm no-manifest exit 0. The advisories are the
+    ///   lockfile-discovery diagnostics (an unparseable lock may be WHY
+    ///   nothing was found) and a removed stale document.
+    /// - On any host, nothing is attested and at least one patch was
+    ///   withheld because Bazel does not build its patched copy
+    ///   ([`BAZEL_NOT_IN_BUILD`]). Without that step the run attested the
+    ///   patch, wrote its document and passed, whatever else it omitted:
+    ///   an `apply --vex` in an install hook must not start failing the
+    ///   installs of a project because that project is also built with
+    ///   Bazel. The advisories name every omission
+    ///   ([`VexGenError::embedded_warnings`]).
+    NotWritten(Vec<RunWarning>, &'static str),
     /// The document was written.
     Written(VexWriteSummary),
-    /// Generation failed: the caller fails the command.
+    /// Generation failed: the host fails the command.
     Failed(VexGenError),
+}
+
+/// What a generation means for the host of an embedded `--vex`.
+fn embedded(result: Result<VexWriteSummary, VexGenError>) -> EmbeddedVex {
+    let withheld = |f: &FailedPatch| f.reason == BAZEL_NOT_IN_BUILD;
+    match result {
+        Ok(summary) => EmbeddedVex::Written(summary),
+        Err(e) if e.code == "no_applicable_patches" && e.failed.iter().any(withheld) => {
+            EmbeddedVex::NotWritten(e.embedded_warnings(), VEX_NOT_BUILT)
+        }
+        Err(e) => EmbeddedVex::Failed(e),
+    }
+}
+
+/// [`generate_vex_from_manifest_path`] for the embedded `--vex` of a host
+/// command that has a manifest, or wrote the lockfiles itself.
+pub(crate) async fn generate_vex_embedded(
+    common: &GlobalArgs,
+    params: &VexBuildParams,
+    manifest_path: &Path,
+) -> EmbeddedVex {
+    embedded(generate_vex_from_manifest_path(common, params, manifest_path).await)
 }
 
 /// Embedded `--vex` for a command that found NO manifest (`apply`,
@@ -2041,7 +2049,7 @@ pub(crate) enum ManifestlessVex {
 /// the `.socket/vendor` ledgers, not the manifest, so a manifest-less
 /// checkout can still have patches to attest and a requested document must
 /// be written (or the command must fail). "Nothing to attest anywhere" is
-/// [`ManifestlessVex::NothingToAttest`], not a failure: an ambient
+/// [`EmbeddedVex::NotWritten`], not a failure: an ambient
 /// `SOCKET_VEX` on a project that never used socket-patch must not start
 /// failing installs, so it sends no failure telemetry. A stale document at
 /// the output path is removed in that case too (same contract as
@@ -2051,11 +2059,12 @@ pub(crate) async fn generate_vex_without_manifest(
     common: &GlobalArgs,
     params: &VexBuildParams,
     manifest_path: &Path,
-) -> ManifestlessVex {
+) -> EmbeddedVex {
     match generate_vex_with_cleanup(common, params, manifest_path, true).await {
-        Ok(summary) => ManifestlessVex::Written(summary),
-        Err(e) if e.code == "manifest_not_found" => ManifestlessVex::NothingToAttest(e.warnings),
-        Err(e) => ManifestlessVex::Failed(e),
+        Err(e) if e.code == "manifest_not_found" => {
+            EmbeddedVex::NotWritten(e.warnings, VEX_NOTHING_TO_ATTEST)
+        }
+        result => embedded(result),
     }
 }
 
@@ -2701,9 +2710,10 @@ mod tests {
     /// An embedded `--vex` that attests nothing fails its host command,
     /// but for one case: a patch of the run was withheld because Bazel
     /// does not build its patched copy, beside whatever else was omitted.
-    /// That run wrote a document and passed before the patch was withheld.
-    /// No patch withheld for that reason, no patch at all, or another
-    /// error, and the host fails as it did.
+    /// That run wrote a document and passed before the patch was withheld:
+    /// it is an outcome of its own, which carries a warning for every
+    /// omission. No patch withheld for that reason, no patch at all, or
+    /// another error, and the host fails as it did.
     #[test]
     fn a_patch_bazel_does_not_build_leaves_the_host_its_exit_code() {
         let bazel = BAZEL_NOT_IN_BUILD;
@@ -2732,13 +2742,20 @@ mod tests {
                 failed: failed.collect(),
                 warnings: Vec::new(),
             };
-            assert_eq!(error.fails_host(), fails, "{code} {reasons:?}");
-            let mut env = Envelope::new(Command::Apply);
-            assert_eq!(error.mark(&mut env), i32::from(fails), "{code} {reasons:?}");
-            let marked = env.to_value().get("error").is_some();
-            assert_eq!(marked, fails, "{code} {reasons:?}");
-            // Either way the envelope names every omission.
-            assert_eq!(error.embedded_warnings().len(), reasons.len());
+            let passes = match embedded(Err(error)) {
+                EmbeddedVex::NotWritten(warnings, note) => {
+                    let omitted = warnings.iter().filter(|w| w.code == "vex_omitted");
+                    assert_eq!(omitted.count(), reasons.len(), "{code} {reasons:?}");
+                    assert_eq!(note, VEX_NOT_BUILT);
+                    true
+                }
+                EmbeddedVex::Failed(error) => {
+                    assert_eq!(error.code, code);
+                    false
+                }
+                EmbeddedVex::Written(_) => panic!("{code} {reasons:?}: no document was written"),
+            };
+            assert_eq!(passes, !fails, "{code} {reasons:?}");
         }
     }
 
@@ -3646,9 +3663,10 @@ mod bazel_tests {
     /// on disk whose hubs read the project's pnpm lock and requirements
     /// file. A project run withholds the npm patch of the installed copy
     /// and the PyPI patch of the committed copy, each with a warning that
-    /// names the call, and leaves the hosted pin and the crate alone. A
-    /// `--global` run, whose packages are not the project's, changes
-    /// nothing.
+    /// names the call, and leaves the hosted pin and the crate alone. So
+    /// it leaves a patch of the installed copy whose record names no
+    /// advisory, which no run attests. A `--global` run, whose packages
+    /// are not the project's, changes nothing.
     #[tokio::test]
     async fn the_bazel_step_withholds_what_no_hub_builds_in_a_project_run_only() {
         let tmp = tempfile::tempdir().unwrap();
@@ -3662,7 +3680,8 @@ mod bazel_tests {
             pip.parse(hub_name = \"pip\", requirements_lock = \"//:requirements.txt\")\n";
         let lock = "lockfileVersion: '9.0'\n\npackages:\n\n  is-odd@3.0.1:\n    \
             resolution: {integrity: sha512-AAAA}\n\n  left-pad@1.3.0:\n    \
-            resolution: {integrity: sha512-BBBB}\n";
+            resolution: {integrity: sha512-BBBB}\n\n  is-even@1.0.0:\n    \
+            resolution: {integrity: sha512-CCCC}\n";
         let files = [
             (".git/HEAD", "ref: refs/heads/main\n"),
             ("MODULE.bazel", module),
@@ -3682,14 +3701,18 @@ mod bazel_tests {
             "pkg:pypi/idna@3.6",
             "pkg:npm/is-odd@3.0.1",
             "pkg:cargo/serde@1.0.0",
+            "pkg:npm/is-even@1.0.0",
         ];
+        let advisory = serde_json::json!({ "GHSA-test-aaaa-bbbb": {
+            "cves": [], "summary": "s", "severity": "high", "description": "d",
+        }});
         let mut view = PatchManifest::new();
         for (index, purl) in purls.iter().enumerate() {
             let record: PatchRecord = serde_json::from_value(serde_json::json!({
                 "uuid": format!("00000000-0000-4000-8000-00000000000{index}"),
                 "exportedAt": "2026-01-01T00:00:00Z",
                 "files": {"index.js": {"beforeHash": "a".repeat(64), "afterHash": "b".repeat(64)}},
-                "vulnerabilities": {},
+                "vulnerabilities": if index < 4 { advisory.clone() } else { serde_json::json!({}) },
                 "description": "test", "license": "MIT", "tier": "free"
             }))
             .unwrap();

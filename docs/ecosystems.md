@@ -2343,6 +2343,13 @@ without a `MODULE.bazel` is not read at all. In each of these the document is th
 project without Bazel. Flags outside the committed files (`--override_repository`, an rc
 file) and BUILD files are not read either.
 
+Three more things withhold nothing. A call counts only when it is a statement of its own,
+which Bazel runs once: one in a comprehension, behind an `and`, in a conditional or in the
+arguments of another call may never run. Of a pnpm lock the project documents are read: a
+package that only the document pnpm 11 keeps for its own configuration lists is not one
+rules_js links. And a patch whose record names no advisory gets no statement from any run,
+so it is not looked at here: a run over such a patch alone ends as it does without Bazel.
+
 The document and the build are tested to agree on real Bazel 9.3.2, 8.8.2 and
 7.7.2 for four shapes, all under Bzlmod: Go through gazelle's
 `go_deps.from_file(go_mod = "//:go.mod")` with
@@ -2360,16 +2367,31 @@ after the undo `vex` writes no document. For PyPI on Bazel 8.5 and later a hoste
 `--lockfile_mode=error` fails until a build that may update the lock has run, and the updated
 lock has to be committed.
 
-In every other Bazel shape nothing checks the document against the build, and in these it was
-measured to be wrong (`not_affected` while Bazel builds the unpatched package): Go under a
-`go_repository` rule of a `WORKSPACE`, in hosted and vendored mode; Go under `go_deps` when
-another Bazel module of the build requires a higher version of the patched module, because
-gazelle then builds that version and drops the replacement; a `pip.parse` or `pip_parse` that
-takes the requirements of the build's platform from another file than the one socket-patch
-rewrote, in hosted mode; and the two withheld kinds above behind a `WORKSPACE` file, where
-they are not withheld yet. Do not publish a document for an artifact that Bazel built outside
-the four shapes. A project that Bazel does not build is not concerned: beside a Bazel
-workspace whose files name none of its locks, `vex` says what it says without Bazel.
+In every other Bazel shape nothing checks the document against the build, and in these the
+document is still wrong (`not_affected` while Bazel builds the unpatched package, or while
+the build is broken):
+
+- **Agent mode beside rules_js, rules_python or rules_ruby**, wherever the statement is not
+  withheld above. The hub reads a lock above the project that does not name the project
+  among its importers. The hub reads a lock below the directory the command runs in: a run
+  at the repository root while the hub reads `web/pnpm-lock.yaml`. A Python or Ruby project
+  lies below the directory of the file the hub reads. The call is not a statement of its
+  own. A `WORKSPACE` file at the root defines something, or the workspace has no
+  `MODULE.bazel`. Measured for rules_js, which builds from the lock and never reads the
+  patched `node_modules`.
+- **Vendored mode for PyPI and RubyGems**, where the workspace is not read with certainty: a
+  `WORKSPACE` file that defines something, no `MODULE.bazel`, a call that is not a statement
+  of its own, a file that is not given as a plain string label. Measured for PyPI, where the
+  build fails.
+- **Hosted mode for PyPI**, when a `pip.parse` or `pip_parse` takes the requirements of the
+  build's platform from another file than the one socket-patch rewrote.
+- **Go** under a `go_repository` rule of a `WORKSPACE`, in hosted and vendored mode; and
+  under `go_deps` when another Bazel module of the build requires a higher version of the
+  patched module, because gazelle then builds that version and drops the replacement.
+
+Do not publish a document for an artifact that Bazel built outside the shapes listed above
+as tested. A project that Bazel does not build is not concerned: beside a Bazel workspace
+whose files name none of its locks, `vex` says what it says without Bazel.
 
 ## Supported platforms
 

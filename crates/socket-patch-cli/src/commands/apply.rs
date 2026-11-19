@@ -29,7 +29,7 @@ use crate::args::{apply_env_toggles, is_local_go, GlobalArgs, RunApiClient};
 use crate::commands::fetch_stage::{stage_patch_sources, StageOutcome};
 use crate::commands::lock_cli::acquire_or_emit;
 use crate::commands::vex::{
-    generate_vex_from_manifest_path, generate_vex_without_manifest, ManifestlessVex, VexEmbedArgs,
+    generate_vex_embedded, generate_vex_without_manifest, EmbeddedVex, VexEmbedArgs,
 };
 use crate::ecosystem_dispatch::{
     distinct_install_dirs, distinct_npm_copies, find_all_packages_for_purls, partition_purls,
@@ -1322,7 +1322,7 @@ pub async fn run(args: ApplyArgs) -> i32 {
             env.dry_run = args.common.dry_run;
             env.warnings.extend(below.warnings());
             match &vex_result {
-                Some(ManifestlessVex::Written(summary)) => {
+                Some(EmbeddedVex::Written(summary)) => {
                     env.vex = Some(VexSummary {
                         path: vex_path().display().to_string(),
                         statements: summary.statements,
@@ -1330,15 +1330,15 @@ pub async fn run(args: ApplyArgs) -> i32 {
                         warnings: summary.warnings.clone(),
                     });
                 }
-                Some(ManifestlessVex::Failed(e)) => {
+                Some(EmbeddedVex::Failed(e)) => {
                     // The discovery diagnostics and the omitted patches are
                     // the only explanation of the failure (why a lockfile
                     // mention is not live wiring, which gate refused what):
                     // same channel as the success path's advisories.
                     env.warnings.extend(e.embedded_warnings());
-                    e.mark(&mut env);
+                    env.mark_error(EnvelopeError::new(e.code, e.message.clone()));
                 }
-                Some(ManifestlessVex::NothingToAttest(warnings)) => {
+                Some(EmbeddedVex::NotWritten(warnings, _)) => {
                     env.warnings.extend(warnings.iter().cloned());
                 }
                 None => {}
@@ -1346,15 +1346,13 @@ pub async fn run(args: ApplyArgs) -> i32 {
             println!("{}", env.to_pretty_json());
         } else {
             match &vex_result {
-                Some(ManifestlessVex::Written(summary)) if !args.common.silent => println!(
+                Some(EmbeddedVex::Written(summary)) if !args.common.silent => println!(
                     "{}",
                     crate::commands::vex::format_vex_written(summary.statements, vex_path())
                 ),
                 // Errors print even under --silent (same as the main path).
-                Some(ManifestlessVex::Failed(e)) => e.print_embedded(&args.common),
-                Some(ManifestlessVex::NothingToAttest(_)) if !args.common.silent => {
-                    println!("{}", crate::commands::vex::format_vex_nothing_to_attest())
-                }
+                Some(EmbeddedVex::Failed(e)) => e.print_embedded(&args.common),
+                Some(EmbeddedVex::NotWritten(_, note)) if !args.common.silent => println!("{note}"),
                 None if !args.common.silent && args.common.dry_run && args.vex.vex.is_some() => {
                     println!(
                         "{}",
@@ -1364,9 +1362,7 @@ pub async fn run(args: ApplyArgs) -> i32 {
                 _ => {}
             }
         }
-        return i32::from(
-            matches!(&vex_result, Some(ManifestlessVex::Failed(e)) if e.fails_host()),
-        );
+        return i32::from(matches!(vex_result, Some(EmbeddedVex::Failed(_))));
     }
 
     // Read-only Go `replace`-redirect verification for CI / GitHub-App auditing.
@@ -1903,11 +1899,11 @@ pub(crate) async fn run_locked(
             // file during --dry-run. Skip instead.
             let vex_result = if success && !args.common.dry_run && args.vex.vex.is_some() {
                 let params = args.vex.to_build_params(client.get());
-                Some(generate_vex_from_manifest_path(&args.common, &params, &manifest_path).await)
+                Some(generate_vex_embedded(&args.common, &params, &manifest_path).await)
             } else {
                 None
             };
-            let vex_failed = matches!(&vex_result, Some(Err(e)) if e.fails_host());
+            let vex_failed = matches!(vex_result, Some(EmbeddedVex::Failed(_)));
             // Every mutation — the patches and the VEX attestation — is
             // done: release the lock before output and telemetry.
             lock.release();
@@ -1996,7 +1992,7 @@ pub(crate) async fn run_locked(
                     env.mark_partial_failure();
                 }
                 match &vex_result {
-                    Some(Ok(summary)) => {
+                    Some(EmbeddedVex::Written(summary)) => {
                         env.vex = Some(VexSummary {
                             path: args
                                 .vex
@@ -2013,9 +2009,12 @@ pub(crate) async fn run_locked(
                             warnings: summary.warnings.clone(),
                         });
                     }
-                    Some(Err(e)) => {
+                    Some(EmbeddedVex::Failed(e)) => {
                         env.warnings.extend(e.embedded_warnings());
-                        e.mark(&mut env);
+                        env.mark_error(EnvelopeError::new(e.code, e.message.clone()));
+                    }
+                    Some(EmbeddedVex::NotWritten(warnings, _)) => {
+                        env.warnings.extend(warnings.iter().cloned());
                     }
                     None => {}
                 }
@@ -2026,7 +2025,7 @@ pub(crate) async fn run_locked(
             // outcome into the envelope above).
             if !args.common.json {
                 match &vex_result {
-                    Some(Ok(summary)) => {
+                    Some(EmbeddedVex::Written(summary)) => {
                         if !args.common.silent {
                             println!(
                                 "{}",
@@ -2040,7 +2039,12 @@ pub(crate) async fn run_locked(
                             );
                         }
                     }
-                    Some(Err(e)) => e.print_embedded(&args.common),
+                    Some(EmbeddedVex::Failed(e)) => e.print_embedded(&args.common),
+                    Some(EmbeddedVex::NotWritten(_, note)) => {
+                        if !args.common.silent {
+                            println!("{note}");
+                        }
+                    }
                     None => {
                         // Only a dry run that itself succeeded skips VEX
                         // *because* of --dry-run; a failed one would have
@@ -2103,7 +2107,7 @@ pub(crate) async fn run_locked(
             } else {
                 collect_apply_failures(&results, &unmatched, &lockfile_only)
             };
-            let run_error = if let Some(Err(e)) = &vex_result {
+            let run_error = if let Some(EmbeddedVex::Failed(e)) = &vex_result {
                 Some((e.code.to_string(), e.message.clone()))
             } else if failures.is_empty() {
                 // Nothing per-patch explains the failure: the run-level

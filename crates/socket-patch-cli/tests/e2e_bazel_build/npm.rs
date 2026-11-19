@@ -1084,6 +1084,53 @@ fn an_installed_patch_is_withheld_beside_a_patch_that_is_omitted_for_another_rea
     assert!(!alone.exists(), "{test}: {said}");
 }
 
+/// Without a Bazel: a patch whose record names no advisory gets no
+/// statement from any run, so the hub decides nothing for it. `apply --vex`
+/// over that patch alone fails beside the hub as it fails in the same
+/// checkout without a workspace file: the same exit code and envelope,
+/// and the same lines for a person, none of them about Bazel.
+#[test]
+fn a_patch_without_an_advisory_fails_the_run_as_it_does_without_bazel() {
+    let (cell, standin, patch, entry) = checkout("");
+    let names = names(&cell, MODULE, LOCK);
+    patches_the_installed_copy(&cell, &standin, "", &patch, &entry, Some(&names));
+
+    let manifest = ".socket/manifest.json";
+    let mut recorded: Value = serde_json::from_str(&text(&cell.tree(), manifest)).expect(manifest);
+    let patches = recorded["patches"].as_object_mut().expect("the patches");
+    for record in patches.values_mut() {
+        record["vulnerabilities"] = json!({});
+    }
+    cell.write(
+        manifest,
+        serde_json::to_vec_pretty(&recorded).expect(manifest),
+    );
+
+    let document = cell.document("no-advisory");
+    let apply = [&["apply"][..], &with_vex(&document)].concat();
+    let origin = standin.origin();
+    let env = [("SOCKET_PATCH_SERVER_URL", origin.as_str())];
+    let run = || {
+        let ran = socket_patch(&cell, &standin, &apply);
+        let person = cell.socket_patch_person(&origin, &apply, &env);
+        (ran.code, ran.envelope, person)
+    };
+    let beside = run();
+    std::fs::remove_file(cell.path(MODULE)).expect(MODULE);
+    assert_eq!(beside, run());
+
+    let (code, envelope, [_, stderr]) = beside;
+    let said = format!("{envelope:#}\n{stderr}");
+    assert_eq!(code, 1, "{said}");
+    let error = json!({
+        "code": "no_applicable_patches",
+        "message": "No applied patches with vulnerability metadata to attest.",
+    });
+    assert_eq!(envelope["error"], error, "{said}");
+    assert!(!said.contains("Bazel"), "{said}");
+    assert!(!document.exists(), "{said}");
+}
+
 /// What a case of a test below does to its checkout before the commands
 /// run.
 type Arrange = fn(&Cell);

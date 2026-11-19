@@ -889,6 +889,53 @@ fn a_wheel_vendored_from_a_manifest_is_withheld_beside_the_hub() {
     cell.withheld_in_run(&vendor, &document, "success", PURL, &names(&cell));
 }
 
+/// Without a Bazel: `vex` with a `--manifest-path` in another project
+/// attests that project, and asks the workspace about the files of that
+/// project. The checkout holds `svc`, where vendored mode pointed
+/// `requirements.txt` at the wheel, and `app`, where the command is run.
+/// While the hub reads the file of `svc`, the statement is withheld and
+/// the warning names that file. While it reads the file of `app`, which
+/// pins the same release, the wheel of `svc` is attested: no call hands
+/// Bazel the file that points at it.
+#[test]
+fn a_vendored_wheel_is_judged_by_the_files_of_the_manifest_s_project() {
+    let with = Vendoring::new();
+    let cell = checkout(&with);
+    std::fs::remove_file(cell.path(REQUIREMENTS)).expect(REQUIREMENTS);
+    for project in ["svc", "app"] {
+        cell.write(
+            &format!("{project}/{REQUIREMENTS}"),
+            requirements(&with.wheels),
+        );
+    }
+    let module = String::from_utf8(cell.tree()["MODULE.bazel"].clone()).expect("a text file");
+    let own = format!("\"//:{REQUIREMENTS}\"");
+    assert!(module.contains(&own), "{module}");
+    let reads = |project: &str| {
+        let label = format!("\"//{project}:{REQUIREMENTS}\"");
+        cell.write("MODULE.bazel", module.replace(&own, &label));
+    };
+    reads("svc");
+    let vendoring = ["scan", "--mode", "vendored", "--yes", "--cwd", "svc"];
+    let scan = with.run(&cell, &vendoring);
+    assert_eq!(scan.envelope["summary"]["applied"], 1, "{}", scan.dump);
+
+    let foreign = [
+        "--cwd",
+        "app",
+        "--manifest-path",
+        "../svc/.socket/manifest.json",
+    ];
+    let run = |cell: &Cell, args: &[&str]| with.run(cell, &[args, &foreign].concat());
+    let mut names = names(&cell);
+    names[0] = format!("which svc/{REQUIREMENTS} points at");
+    cell.withholds(run, PURL, &names, true);
+
+    reads("app");
+    let claim = Claim::new(PURL, &with.uuid, How::Vendored);
+    cell.stands_alone(run, &claim, true);
+}
+
 /// Without a Bazel: the fixture's directories are those of its table, and
 /// the workflow runs each release on its era. The fixture holds no
 /// `requirements.txt`: every era names the one the test writes, which pins
