@@ -3722,6 +3722,50 @@ async fn hosted_declares_the_patch_server_as_a_named_registry() {
     );
 }
 
+/// Named registries are declared only on proof of pnpm 12 or newer (pnpm
+/// 11 drops a registry-verified entry on `pnpm add`). A project pinned to
+/// pnpm 11 and one with no pnpm pin both get today's `trustLockfile`
+/// write; the unpinned one is told what a pin would change.
+#[tokio::test]
+#[serial]
+async fn hosted_named_registry_needs_a_pnpm_12_pin() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_registry_reference(&server).await;
+
+    for (package_manager, hinted) in [(None, true), (Some("pnpm@11.28.13"), false)] {
+        let tmp = tempfile::tempdir().unwrap();
+        write_pnpm_project(tmp.path());
+        if let Some(package_manager) = package_manager {
+            std::fs::write(
+                tmp.path().join("package.json"),
+                format!(
+                    r#"{{ "name": "consumer", "version": "0.0.0", "packageManager": "{package_manager}", "dependencies": {{ "{NAME}": "{VERSION}" }} }}"#
+                ),
+            )
+            .unwrap();
+        }
+        let (code, doc) = run_hosted_json(tmp.path(), &server.uri());
+        assert_eq!(code, Some(0), "{doc}");
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("pnpm-workspace.yaml")).unwrap(),
+            "packages:\n  - '.'\ntrustLockfile: true\n",
+            "{package_manager:?}"
+        );
+        let texts = warning_texts(&doc);
+        assert!(texts.contains("ALL lockfile entries"), "{doc}");
+        assert_eq!(
+            texts.contains(
+                "Pinning pnpm 12 or later (for example with package.json `packageManager`) \
+                 and re-running the scan switches the project to per-package registry \
+                 verification instead of `trustLockfile`"
+            ),
+            hinted,
+            "{package_manager:?}: {doc}"
+        );
+    }
+}
+
 /// `--dry-run` with a registry address: nothing lands on disk, the
 /// workspace file is reported as would-be-rewritten, and the warning says
 /// what the run would declare.

@@ -62,6 +62,28 @@ the scan declares those registries under `namedRegistries` in
 The matrix above installs through `trustLockfile`: its fixture grants carry no
 registry address.
 
+The pnpm 12 requirement comes from what `pnpm add` does to a hosted entry.
+Measured on a lock with three hosted entries, then `pnpm add is-odd@3.0.1`:
+
+| pnpm | `trustLockfile: true` | `namedRegistries` |
+| --- | --- | --- |
+| 11.10.0, 11.20.0, 11.25.0 | hosted entries dropped | hosted entries dropped |
+| 11.28.13 | hosted entries kept | hosted entries re-resolved to the upstream tarball |
+| 12.0.0, 12.4.2, 12.10.0, 12.22.0 | hosted entries kept | hosted entries kept |
+
+Frozen installs pass with `namedRegistries` on every one of these, 11.10
+through 12.22, so the only difference is `pnpm add` on late pnpm 11: there a
+named registry would lose a patch that `trustLockfile` keeps. A pin proves
+pnpm 12 when the lowest version it admits is 12.0 or higher (`12.4.2`, `^12`,
+`>=12`, `12 || 13`); `>=11`, an unreadable range, pins that disagree, or no pin
+leave the project on `trustLockfile`. With no pin at all, and a registry for
+every hosted pin, the warning adds that pinning pnpm 12 or later (for example
+with `packageManager`) and re-running the scan switches the project over.
+
+The registry's version document is dated by the upstream release of that
+version, or carries no date when it is unknown, so pnpm's default one-day
+`minimumReleaseAge` does not hold back a freshly published patch.
+
 `pnpm12_named_registry_frozen_install_verifies_the_hosted_entry` runs with the
 other real-pnpm legs of `e2e_redirect_pnpm_build`, on the pnpm 12 that
 Corepack provides. It covers the declaration over a lock a real pnpm 12 scan

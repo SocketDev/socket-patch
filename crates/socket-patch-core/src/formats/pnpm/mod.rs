@@ -34,7 +34,7 @@ mod version;
 pub(crate) mod workspace;
 
 pub use version::{
-    matches_file_id_build_keys, pins_pnpm_12_or_newer, root_only_workspace_breaks_add,
+    matches_file_id_build_keys, pnpm_12_pins, root_only_workspace_breaks_add, Pnpm12Pins,
 };
 
 pub use grammar::PnpmDocument;

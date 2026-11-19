@@ -29,6 +29,7 @@ use crate::constants::npm_family::VLT_HIDDEN_LOCK_REL;
 use crate::crawlers::maven_selection::MavenSelection;
 use crate::formats::cargo::source_replacement::CratesIoSource;
 use crate::formats::governing_locks::PYPI_REQUIREMENTS;
+use crate::formats::pnpm::Pnpm12Pins;
 use crate::patch::redirect::npmrc::{
     effective_omit_lockfile_registry_resolved, effective_replace_registry_host,
     plan_npmrc_allow_remote_with, replace_registry_host_rewrites, NpmrcPlan, OuterAllowRemote,
@@ -62,8 +63,8 @@ use super::guidance::{
     pnpm_trust_scaffolded_detail, pnpm_trust_workspace_unreadable_detail,
     pnpm_trust_workspace_unsupported_detail, read_npmrc_for_allow_remote, read_workspace_for_trust,
     strip_cli_trust, RegistryWrite, TrustLeftover, TrustPlan, NPM_LOCKS,
-    NPM_OMIT_LOCKFILE_RESOLVED_CODE, NPM_REPLACE_REGISTRY_HOST_CODE, PNPM_TRUST_RUSH_MIXED_NOTE,
-    PNPM_TRUST_TRADEOFF_AND_CAUTION, PNPM_WORKSPACE_REL,
+    NPM_OMIT_LOCKFILE_RESOLVED_CODE, NPM_REPLACE_REGISTRY_HOST_CODE, PNPM_REGISTRY_PIN_HINT,
+    PNPM_TRUST_RUSH_MIXED_NOTE, PNPM_TRUST_TRADEOFF_AND_CAUTION, PNPM_WORKSPACE_REL,
     REDIRECT_PNPM_WORKSPACE_REGISTRY_EDIT_KIND, REDIRECT_PNPM_WORKSPACE_TRUST_EDIT_KIND,
 };
 use super::vlt::bun_lockb_present;
@@ -3010,7 +3011,7 @@ struct PnpmTrust {
 ///
 /// NAMED REGISTRIES, when every hosted tarball of the governing v9 locks
 /// has one ([`pnpm_named_registries`]) and the project's pnpm pins prove
-/// pnpm 12 or newer ([`pins_pnpm_12_or_newer`]): the patch service serves
+/// pnpm 12 or newer ([`pnpm_12_pins`]): the patch service serves
 /// each patch under a one-package npm registry, and pnpm verifies a lock
 /// entry against the named registry whose address its tarball URL starts
 /// with. The run declares one `namedRegistries` entry per pin
@@ -3019,7 +3020,8 @@ struct PnpmTrust {
 /// hosted tarball without a registry (a patch service that serves none, a
 /// pin of an earlier run) keeps the whole run on the path below, as does a
 /// project whose pnpm may be older: pnpm 11 drops a registry-verified
-/// entry on `pnpm add`.
+/// entry on `pnpm add`. A project with no pnpm pin at all is told that a
+/// pin would move it here ([`PNPM_REGISTRY_PIN_HINT`]).
 ///
 /// TRUST, otherwise: the run auto-ensures `trustLockfile: true`, which
 /// switches the verification off for every entry.
@@ -3160,23 +3162,31 @@ fn pnpm_trust(
         .iter()
         .filter_map(|key| rewrite.files.get(*key).or_else(|| files.get(*key)))
         .collect();
-    let registries = root_workspace.as_ref().and_then(|(workspace, _)| {
-        // Only for a pnpm that keeps a registry-verified entry across
-        // `pnpm add`; any other project stays on `trustLockfile`.
-        if !pins_pnpm_12_or_newer(view) {
-            return None;
-        }
-        let declared = match workspace {
-            Ok(Some(text)) => crate::formats::pnpm::named_registries::declared(text),
-            _ => Vec::new(),
-        };
-        let v9: Vec<&String> = governing_texts
-            .iter()
-            .copied()
-            .filter(|text| is_v9(text))
-            .collect();
-        pnpm_named_registries(&v9, overrides, &declared)
-    });
+    // Named registries are declared only for a pnpm that keeps a
+    // registry-verified entry across `pnpm add`: on proof of pnpm 12.
+    let pins = root_workspace.as_ref().map(|_| pnpm_12_pins(view));
+    let covering = root_workspace
+        .as_ref()
+        .filter(|_| pins != Some(Pnpm12Pins::NotProven))
+        .and_then(|(workspace, _)| {
+            let declared = match workspace {
+                Ok(Some(text)) => crate::formats::pnpm::named_registries::declared(text),
+                _ => Vec::new(),
+            };
+            let v9: Vec<&String> = governing_texts
+                .iter()
+                .copied()
+                .filter(|text| is_v9(text))
+                .collect();
+            pnpm_named_registries(&v9, overrides, &declared)
+        });
+    // No pin says which pnpm installs the project, so it stays on
+    // `trustLockfile`; the warning says what a pin would change. Not under
+    // `--no-trust-lockfile-config`, where a re-run writes nothing either
+    // way.
+    let pin_hint =
+        pins == Some(Pnpm12Pins::Unpinned) && covering.is_some() && options.trust_lockfile_config;
+    let registries = covering.filter(|_| pins == Some(Pnpm12Pins::Proven));
     let detail = if all_locks_legacy {
         pnpm_trust_legacy_detail(&server)
     } else if rush_only {
@@ -3321,6 +3331,11 @@ fn pnpm_trust(
                 }
             },
         }
+    };
+    let detail = if pin_hint {
+        format!("{}. {PNPM_REGISTRY_PIN_HINT}", detail.trim_end_matches('.'))
+    } else {
+        detail
     };
     // The `--store` spelling only matters to pnpm 1–4, so it is named only
     // when a touched lock may be that old.
@@ -3624,12 +3639,12 @@ fn pnpm_trust_env_set_detail(server: &str, source: &str) -> String {
     )
 }
 
-/// Whether every pnpm pin the project carries names pnpm 12 or newer (see
-/// [`crate::formats::pnpm::pins_pnpm_12_or_newer`]), read from the files
+/// What the project's pnpm pins say about pnpm 12 (see
+/// [`crate::formats::pnpm::pnpm_12_pins`]), read from the files
 /// [`root_only_workspace_breaks_add`] reads.
-fn pins_pnpm_12_or_newer(view: &ProjectView<'_>) -> bool {
+fn pnpm_12_pins(view: &ProjectView<'_>) -> Pnpm12Pins {
     let read = |rel: &str| read_advisory_text(view, rel);
-    crate::formats::pnpm::pins_pnpm_12_or_newer(
+    crate::formats::pnpm::pnpm_12_pins(
         read(crate::hosted::memory::select::NPM_MANIFEST_REL).as_deref(),
         read("node_modules/.modules.yaml").as_deref(),
     )
@@ -6471,66 +6486,112 @@ snapshots:
 
     /// Named registries are declared only for a project whose pnpm pins
     /// prove pnpm 12 or newer: pnpm 11 drops a registry-verified entry on
-    /// `pnpm add`. Any other project (an older or open-ended pin, pins that
-    /// disagree, no pin) gets today's `trustLockfile` write, byte for byte.
+    /// `pnpm add`. A project pinned to an older pnpm (or to a range that
+    /// reaches one, or by pins that disagree) gets today's `trustLockfile`
+    /// write, byte for byte. So does a project with no pin, whose warning
+    /// adds what a pin would change.
     #[tokio::test]
     async fn named_registries_need_a_project_pinned_to_pnpm_12() {
+        #[derive(Clone, Copy, PartialEq, Debug)]
+        enum Want {
+            Registries,
+            Trust,
+            TrustWithHint,
+        }
         let candidates = [left_pad_registry_candidate()];
         let registries = format!(
             "packages:\n  - '.'\nnamedRegistries:\n{}\n",
             left_pad_alias_line()
         );
         const TRUST: &str = "packages:\n  - '.'\ntrustLockfile: true\n";
+        const HINT: &str = "Pinning pnpm 12 or later (for example with package.json \
+                            `packageManager`) and re-running the scan switches the project \
+                            to per-package registry verification instead of `trustLockfile`. ";
         let mut unpinned = MemoryProject::new();
         unpinned.insert_text("pnpm-lock.yaml", LEFT_PAD_V9_LOCK);
+        // A patch service that serves no registry: today's run, and no hint
+        // (a pin would change nothing).
         let baseline = registry_rewrite(&unpinned, &[left_pad_candidate()]).await;
         assert_eq!(workspace_of(&baseline), Some(TRUST));
+        let baseline_detail = pnpm_trust_detail(&baseline);
+        assert!(
+            !baseline_detail.contains("Pinning pnpm 12"),
+            "{baseline_detail}"
+        );
+        let hinted_detail = baseline_detail.replacen(
+            "After a lock-only change,",
+            &format!("{HINT}After a lock-only change,"),
+            1,
+        );
+        assert_ne!(hinted_detail, baseline_detail);
         for (manifest, modules_yaml, want) in [
-            (None, None, TRUST),
-            (Some(r#"{"name":"app"}"#), None, TRUST),
-            (Some(r#"{"packageManager":"npm@11.0.0"}"#), None, TRUST),
-            (Some(r#"{"packageManager":"pnpm@11.28.13"}"#), None, TRUST),
-            (Some(r#"{"packageManager":"pnpm@10.34.6"}"#), None, TRUST),
-            (Some(r#"{"engines":{"pnpm":">=12"}}"#), None, TRUST),
+            // No pin at all.
+            (None, None, Want::TrustWithHint),
+            (Some(r#"{"name":"app"}"#), None, Want::TrustWithHint),
+            (
+                Some(r#"{"packageManager":"npm@11.0.0"}"#),
+                None,
+                Want::TrustWithHint,
+            ),
+            // A pin below 12, or a range that reaches below it.
+            (
+                Some(r#"{"packageManager":"pnpm@11.28.13"}"#),
+                None,
+                Want::Trust,
+            ),
+            (
+                Some(r#"{"packageManager":"pnpm@10.34.6"}"#),
+                None,
+                Want::Trust,
+            ),
+            (Some(r#"{"engines":{"pnpm":">=11"}}"#), None, Want::Trust),
+            (None, Some("packageManager: pnpm@11.28.13\n"), Want::Trust),
             (
                 Some(r#"{"devEngines":{"packageManager":{"name":"pnpm"}}}"#),
                 None,
-                TRUST,
+                Want::Trust,
             ),
+            // Mixed pins: one says 11, one says 12.
             (
                 Some(r#"{"packageManager":"pnpm@12.4.2","engines":{"pnpm":"11"}}"#),
                 None,
-                TRUST,
+                Want::Trust,
             ),
             (
                 Some(r#"{"packageManager":"pnpm@12.4.2"}"#),
                 Some("packageManager: pnpm@11.28.13\n"),
-                TRUST,
+                Want::Trust,
             ),
+            // Every pin proves 12 or newer.
             (
                 Some(r#"{"packageManager":"pnpm@12.0.0"}"#),
                 None,
-                registries.as_str(),
+                Want::Registries,
             ),
             (
                 Some(r#"{"engines":{"pnpm":"^12.4.0"}}"#),
                 None,
-                registries.as_str(),
+                Want::Registries,
+            ),
+            (
+                Some(r#"{"engines":{"pnpm":">=12"}}"#),
+                None,
+                Want::Registries,
             ),
             (
                 Some(r#"{"packageManager":"pnpm@13.1.0+sha512.abc"}"#),
                 None,
-                registries.as_str(),
+                Want::Registries,
             ),
             (
                 None,
                 Some("packageManager: pnpm@12.22.0\n"),
-                registries.as_str(),
+                Want::Registries,
             ),
             (
                 Some(r#"{"packageManager":"pnpm@12.4.2"}"#),
                 Some("packageManager: pnpm@12.22.0\n"),
-                registries.as_str(),
+                Want::Registries,
             ),
         ] {
             let mut root = unpinned.clone();
@@ -6541,22 +6602,73 @@ snapshots:
                 root.insert_text("node_modules/.modules.yaml", modules_yaml);
             }
             let done = registry_rewrite(&root, &candidates).await;
-            assert_eq!(
-                workspace_of(&done),
-                Some(want),
-                "{manifest:?} {modules_yaml:?}"
-            );
+            let case = format!("{manifest:?} {modules_yaml:?}");
             assert_eq!(
                 done.pnpm_named_registries,
-                want != TRUST,
-                "{manifest:?} {modules_yaml:?}"
+                want == Want::Registries,
+                "{case}"
             );
-            if want == TRUST {
-                // Exactly what a grant with no registry address gets.
-                assert_eq!(done.rewrite.edits, baseline.rewrite.edits);
-                assert_eq!(done.pnpm_warnings, baseline.pnpm_warnings);
+            if want == Want::Registries {
+                assert_eq!(workspace_of(&done), Some(registries.as_str()), "{case}");
+                assert!(
+                    !pnpm_trust_detail(&done).contains("Pinning pnpm 12"),
+                    "{case}"
+                );
+                continue;
+            }
+            // Exactly what a grant with no registry address gets.
+            assert_eq!(workspace_of(&done), Some(TRUST), "{case}");
+            assert_eq!(done.rewrite.edits, baseline.rewrite.edits, "{case}");
+            let detail = pnpm_trust_detail(&done);
+            if want == Want::TrustWithHint {
+                assert_eq!(detail, hinted_detail, "{case}");
+            } else {
+                assert_eq!(detail, baseline_detail, "{case}");
             }
         }
+
+        // The hint rides whatever the trust path says of an unpinned
+        // project: here, a file that already trusts the lock.
+        let mut trusted = unpinned.clone();
+        trusted.insert_text(
+            PNPM_WORKSPACE_REL,
+            "packages:\n  - 'apps/*'\ntrustLockfile: true\n",
+        );
+        let done = registry_rewrite(&trusted, &candidates).await;
+        assert_eq!(workspace_of(&done), None);
+        let detail = pnpm_trust_detail(&done);
+        assert!(
+            detail.contains("already carries `trustLockfile: true`") && detail.contains(HINT),
+            "{detail}"
+        );
+        // Nor does the opted-out run say it: it writes nothing either way.
+        let opted_out = |candidate: Candidate| {
+            let unpinned = unpinned.clone();
+            async move {
+                let done = pnpm_rewrite(
+                    &ProjectView::Memory(&unpinned),
+                    &[candidate],
+                    false,
+                    false,
+                    &no_env,
+                )
+                .await;
+                pnpm_trust_detail(&done).to_string()
+            }
+        };
+        let detail = opted_out(left_pad_registry_candidate()).await;
+        assert!(detail.contains("pnpm install --trust-lockfile"), "{detail}");
+        assert_eq!(detail, opted_out(left_pad_candidate()).await);
+        // One pin without a registry: a pnpm pin would change nothing, so
+        // nothing is said of one.
+        let mut two = MemoryProject::new();
+        two.insert_text("pnpm-lock.yaml", TWO_PACKAGE_V9_LOCK);
+        let done = registry_rewrite(
+            &two,
+            &[left_pad_registry_candidate(), is_number_candidate(false)],
+        )
+        .await;
+        assert!(!pnpm_trust_detail(&done).contains("Pinning pnpm 12"));
 
         // A project pinned to pnpm 9.0–10.4 keeps its own rule (#734): no
         // file, and the trust path's reason.

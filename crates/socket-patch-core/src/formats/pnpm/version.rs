@@ -167,25 +167,103 @@ pub fn root_only_workspace_breaks_add(
     })
 }
 
-/// Whether every pnpm pin the project carries (at least one) names pnpm 12
-/// or newer: the releases hosted mode declares its named registries for.
+/// What a project's pnpm pins say about pnpm 12, the first major hosted
+/// mode declares its named registries for ([`pnpm_12_pins`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pnpm12Pins {
+    /// Every pin the project carries (at least one) admits only pnpm 12 or
+    /// newer.
+    Proven,
+    /// The project carries no pnpm pin: nothing says which pnpm installs
+    /// it.
+    Unpinned,
+    /// A pin admits an older pnpm, or does not parse.
+    NotProven,
+}
+
+/// Whether the project's pnpm pins prove that every pnpm that installs it
+/// is 12 or newer.
 ///
 /// pnpm verifies a lock entry against a named registry from 11.10 on, but
-/// what `pnpm add` then does to a hosted entry differs by release: 11.10
-/// through 11.25 re-resolve it from the default registry (dropping the
-/// patch) under either setting, 11.28 keeps it under `trustLockfile` but
-/// drops it under a named registry, and 12.0 through 12.22 keep it under
-/// both. So a named registry costs nothing only from pnpm 12 on. The
-/// evidence is read as conservatively as
-/// [`root_only_workspace_breaks_add`] reads it: a pin that may be an older
-/// pnpm, one that does not parse, or no pin at all leaves the project on
-/// `trustLockfile`.
-pub fn pins_pnpm_12_or_newer(package_json: Option<&str>, modules_yaml: Option<&str>) -> bool {
+/// what `pnpm add` then does to a hosted entry differs by release
+/// (measured on a lock with three hosted entries and `pnpm add
+/// is-odd@3.0.1`): 11.10.0, 11.20.0 and 11.25.0 re-resolve it to the
+/// upstream tarball under either setting, 11.28.13 keeps it under
+/// `trustLockfile: true` but re-resolves it under a named registry, and
+/// 12.0.0, 12.4.2, 12.10.0 and 12.22.0 keep it under both. So a named
+/// registry costs nothing only from pnpm 12 on, and anything short of
+/// proof leaves the project on `trustLockfile`.
+///
+/// The evidence is every pin [`root_only_workspace_breaks_add`] reads. A
+/// pin proves pnpm 12 when the lowest version it admits is 12.0 or higher
+/// ([`range_floor`]): an exact version, `^12`, `>=12.4`, `12 || 13`. A
+/// range that reaches below 12 (`>=11`), one that does not parse, or pins
+/// that disagree prove nothing.
+pub fn pnpm_12_pins(package_json: Option<&str>, modules_yaml: Option<&str>) -> Pnpm12Pins {
     let pins = pnpm_pins(package_json, modules_yaml);
-    !pins.is_empty()
-        && pins
-            .iter()
-            .all(|(_, spec)| version_span(spec).is_some_and(|(lo, _)| lo >= (12, 0)))
+    if pins.is_empty() {
+        Pnpm12Pins::Unpinned
+    } else if pins
+        .iter()
+        .all(|(_, spec)| range_floor(spec).is_some_and(|floor| floor >= (12, 0)))
+    {
+        Pnpm12Pins::Proven
+    } else {
+        Pnpm12Pins::NotProven
+    }
+}
+
+/// The lowest `(major, minor)` a version range admits: the lowest floor of
+/// its `||` alternatives. `None` for a range this reader cannot follow,
+/// which a caller must not take for a floor.
+fn range_floor(spec: &str) -> Option<MajorMinor> {
+    spec.split("||")
+        .map(alternative_floor)
+        .try_fold(None::<MajorMinor>, |lowest, floor| {
+            let floor = floor?;
+            Some(Some(lowest.map_or(floor, |lowest| lowest.min(floor))))
+        })
+        .flatten()
+}
+
+/// The floor of one `||` alternative: its comparators all hold, so the
+/// highest of their floors. A version ([`version_span`]: exact, `^`, `~`,
+/// wildcard), `>=` and `>` give one (`>` is read as `>=`, which is never
+/// too high), `<` and `<=` give none, and `A - B` starts at `A`.
+fn alternative_floor(alternative: &str) -> Option<MajorMinor> {
+    // An operator may stand apart from its version (`>= 12`).
+    let mut tokens: Vec<String> = Vec::new();
+    let mut operator = "";
+    for word in alternative.split_whitespace() {
+        if matches!(word, ">=" | ">" | "<=" | "<" | "=" | "^" | "~") {
+            if !operator.is_empty() {
+                return None;
+            }
+            operator = word;
+        } else {
+            tokens.push(format!("{operator}{word}"));
+            operator = "";
+        }
+    }
+    if !operator.is_empty() || tokens.is_empty() {
+        return None;
+    }
+    if let [low, dash, high] = tokens.as_slice() {
+        if dash == "-" {
+            version_span(high)?;
+            return version_span(low).map(|(floor, _)| floor);
+        }
+    }
+    let mut floor = (0, 0);
+    for token in &tokens {
+        let lower = token.strip_prefix(">=").or_else(|| token.strip_prefix('>'));
+        let upper = token.strip_prefix("<=").or_else(|| token.strip_prefix('<'));
+        let (this, _) = version_span(lower.or(upper).unwrap_or(token))?;
+        if upper.is_none() {
+            floor = floor.max(this);
+        }
+    }
+    Some(floor)
 }
 
 /// Whether the pnpm the project runs matches build decisions against a
@@ -376,36 +454,64 @@ mod tests {
     }
 
     /// Named registries are declared only on proof of pnpm 12 or newer:
-    /// every pin present (at least one) admits nothing older.
+    /// every pin present (at least one) admits nothing older. No pin at
+    /// all is told apart from a pin that proves nothing.
     #[test]
     fn pnpm_12_is_proven_only_by_every_pin() {
-        let proven = pins_pnpm_12_or_newer;
         for pkg in [
             r#"{"packageManager":"pnpm@12.0.0"}"#,
             r#"{"packageManager":"pnpm@12.22.0+sha512.abc=="}"#,
             r#"{"packageManager":"pnpm@13.0.1"}"#,
             r#"{"engines":{"pnpm":"^12.4.0"}}"#,
             r#"{"engines":{"pnpm":"12"}}"#,
+            r#"{"engines":{"pnpm":">=12"}}"#,
+            r#"{"engines":{"pnpm":">=12.4.0"}}"#,
+            r#"{"engines":{"pnpm":">12"}}"#,
+            r#"{"engines":{"pnpm":">=12 <14"}}"#,
+            r#"{"engines":{"pnpm":">= 12.4.0 <14"}}"#,
+            r#"{"engines":{"pnpm":"12 || 13"}}"#,
+            r#"{"engines":{"pnpm":"^12.0.0 || >=13.2"}}"#,
+            r#"{"engines":{"pnpm":"12.0.0 - 13.5.0"}}"#,
             r#"{"devEngines":{"packageManager":{"name":"pnpm","version":"~12.4.2"}}}"#,
         ] {
-            assert!(proven(Some(pkg), None), "{pkg}");
+            assert_eq!(pnpm_12_pins(Some(pkg), None), Pnpm12Pins::Proven, "{pkg}");
         }
-        assert!(proven(None, Some("packageManager: pnpm@12.22.0\n")));
-        assert!(proven(
-            Some(r#"{"packageManager":"pnpm@12.4.2"}"#),
-            Some(r#"{"packageManager":"pnpm@12.22.0"}"#)
-        ));
+        assert_eq!(
+            pnpm_12_pins(None, Some("packageManager: pnpm@12.22.0\n")),
+            Pnpm12Pins::Proven
+        );
+        assert_eq!(
+            pnpm_12_pins(
+                Some(r#"{"packageManager":"pnpm@12.4.2"}"#),
+                Some(r#"{"packageManager":"pnpm@12.22.0"}"#)
+            ),
+            Pnpm12Pins::Proven
+        );
+        // No pin: nothing says which pnpm installs the project.
+        for pkg in [
+            None,
+            Some(r#"{"name":"app"}"#),
+            Some(r#"{"packageManager":"yarn@4.5.0"}"#),
+            Some("not json"),
+        ] {
+            assert_eq!(pnpm_12_pins(pkg, None), Pnpm12Pins::Unpinned, "{pkg:?}");
+        }
         for (pkg, modules) in [
-            // No pin: nothing says which pnpm installs the project.
-            (None, None),
-            (Some(r#"{"name":"app"}"#), None),
-            (Some(r#"{"packageManager":"yarn@4.5.0"}"#), None),
-            // An older pnpm, or a spec that admits one.
+            // An older pnpm, or a range that reaches one.
             (Some(r#"{"packageManager":"pnpm@11.28.13"}"#), None),
             (Some(r#"{"packageManager":"pnpm@10.34.6"}"#), None),
-            (Some(r#"{"engines":{"pnpm":">=12"}}"#), None),
             (Some(r#"{"engines":{"pnpm":">=11"}}"#), None),
+            // `>11` is read as `>=11`: never too high a floor.
+            (Some(r#"{"engines":{"pnpm":">11"}}"#), None),
+            (Some(r#"{"engines":{"pnpm":">=11.28 <13"}}"#), None),
             (Some(r#"{"engines":{"pnpm":"11 || 12"}}"#), None),
+            (Some(r#"{"engines":{"pnpm":"<13"}}"#), None),
+            (Some(r#"{"engines":{"pnpm":"11.0.0 - 12.5.0"}}"#), None),
+            // A range this reader cannot follow.
+            (Some(r#"{"engines":{"pnpm":"*"}}"#), None),
+            (Some(r#"{"engines":{"pnpm":"latest"}}"#), None),
+            (Some(r#"{"engines":{"pnpm":">= >=12"}}"#), None),
+            (Some(r#"{"engines":{"pnpm":"12 ||"}}"#), None),
             (
                 Some(r#"{"devEngines":{"packageManager":{"name":"pnpm"}}}"#),
                 None,
@@ -420,8 +526,38 @@ mod tests {
                 Some(r#"{"packageManager":"pnpm@12.4.2","engines":{"pnpm":"^11.0.0"}}"#),
                 None,
             ),
+            (None, Some("packageManager: pnpm@11.28.13\n")),
         ] {
-            assert!(!proven(pkg, modules), "{pkg:?} {modules:?}");
+            assert_eq!(
+                pnpm_12_pins(pkg, modules),
+                Pnpm12Pins::NotProven,
+                "{pkg:?} {modules:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn range_floor_is_the_lowest_version_a_range_admits() {
+        for (spec, floor) in [
+            ("12.4.2", Some((12, 4))),
+            ("^12.4.0", Some((12, 4))),
+            ("12", Some((12, 0))),
+            (">=12", Some((12, 0))),
+            (">12.3.0", Some((12, 3))),
+            (">=12.4 <14", Some((12, 4))),
+            (">=11 >=12.1", Some((12, 1))),
+            ("^12 || ^11.28", Some((11, 28))),
+            ("11.5.0 - 12", Some((11, 5))),
+            ("<13", Some((0, 0))),
+            ("<=12.4.0 >=12", Some((12, 0))),
+            ("", None),
+            ("*", None),
+            (">=", None),
+            ("12 - ", None),
+            ("12 - x - 13", None),
+            (">=12 || nope", None),
+        ] {
+            assert_eq!(range_floor(spec), floor, "{spec:?}");
         }
     }
 

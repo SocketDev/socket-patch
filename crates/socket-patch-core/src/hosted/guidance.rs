@@ -348,6 +348,15 @@ pub const PNPM_REGISTRY_CAUTION: &str =
      the vulnerable upstream artifact. pnpm <=10 does not verify lockfile \
      entries and installs work unchanged";
 
+/// The sentence a `trustLockfile` warning adds for a project with no pnpm
+/// pin whose hosted pins all have a named registry to be verified against:
+/// only the missing pin keeps it on `trustLockfile` (named registries are
+/// declared on proof of pnpm 12 or newer).
+pub const PNPM_REGISTRY_PIN_HINT: &str =
+    "Pinning pnpm 12 or later (for example with package.json `packageManager`) and \
+     re-running the scan switches the project to per-package registry verification \
+     instead of `trustLockfile`";
+
 /// The policy preamble shared by every named-registry warning variant:
 /// what was repointed, and what pnpm >=11 checks.
 pub fn pnpm_registry_policy_preamble(server: &str) -> String {
@@ -560,6 +569,15 @@ pub fn pnpm_named_registries(
         .iter()
         .filter_map(|o| Some((o.patch_uuid.as_str(), npm_registry_url(o)?)))
         .collect();
+    // No registry anywhere (a patch service that serves none): nothing can
+    // be covered, and the locks need no reading.
+    if served.is_empty()
+        && !declared
+            .iter()
+            .any(|(alias, _)| named_registries::alias_uuid(alias).is_some())
+    {
+        return None;
+    }
     // pnpm routes a tarball to the named registry whose address, read with
     // a trailing `/`, it starts with.
     let routed_by_declared = |tarball: &str| {

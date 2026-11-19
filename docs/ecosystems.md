@@ -236,7 +236,7 @@ Each Legacy format has an upgrade path and an undo path. Both work in v5:
   registry whose address its tarball URL starts with. When there is such a
   registry for every hosted pin of those locks, and every pnpm pin of the
   project (the same sources as the pnpm 9.0–10.4 rule below, at least one
-  present) names pnpm 12 or newer, the CLI declares one per patched package:
+  present) proves pnpm 12 or newer, the CLI declares one per patched package:
 
   ```yaml
   namedRegistries:
@@ -257,13 +257,22 @@ Each Legacy format has an upgrade path and an undo path. Both work in v5:
   one-line `namedRegistries` map, several YAML documents) is left untouched
   and the warning lists the lines to add, as it does under
   `--no-trust-lockfile-config`. The address is only ever declared as a named
-  registry: it answers for that one package and nothing else. pnpm 11 is left
-  on the setting below because it re-resolves such an entry from the default
-  registry on `pnpm add`, which drops the patch, where pnpm 11.28 keeps an
-  entry under `trustLockfile`.
+  registry: it answers for that one package and nothing else. Its version
+  document is dated by the upstream release (or undated when that is
+  unknown), so pnpm's default `minimumReleaseAge` does not hold back a new
+  patch. A pin proves pnpm 12 when the lowest version it admits is 12.0 or
+  higher (`12.4.2`, `^12`, `>=12`). pnpm 11 is left on the setting below
+  because it re-resolves such an entry from the default registry on
+  `pnpm add`, which drops the patch, where pnpm 11.28 keeps an entry under
+  `trustLockfile` (the measurements are in
+  [pnpm hosted compatibility](testing/pnpm-compatibility.md)).
   **`trustLockfile: true`.** In every other case (a pin the patch service
   serves no registry for, a pin an earlier run left without one, pnpm 11, a
-  project with no pnpm pin) the CLI configures `trustLockfile: true` in
+  project with no pnpm pin) the CLI configures `trustLockfile: true`. A
+  project with no pnpm pin whose hosted pins all have a registry is told
+  that pinning pnpm 12 or later (for example with `packageManager`) and
+  re-running the scan switches it to named registries (not under
+  `--no-trust-lockfile-config`). The key goes in
   the root `pnpm-workspace.yaml` unless
   explicitly disabled by the project or, for pnpm >=11, by a
   `pnpm_config_trust_lockfile=false` environment variable the scan runs with
