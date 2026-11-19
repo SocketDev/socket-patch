@@ -54,6 +54,7 @@ mod hosted_memory_common;
 
 mod go;
 mod harness;
+mod maven;
 mod npm;
 mod pypi;
 mod ruby;
