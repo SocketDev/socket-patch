@@ -1074,18 +1074,14 @@ async fn vendor_maven_jvm(
     // nothing to say. (An offline re-run compares nothing, as before.)
     if !was_committed || online {
         if let Ok(Some(resolved)) = local.find(&gav, None, "jar", false).await {
-            let names: Vec<String> = record
-                .files
-                .keys()
-                .map(|k| crate::patch::apply::normalize_file_path(k).to_string())
-                .collect();
+            let files = record.files.clone();
             let leaf = layout::file_name(&artifact_id, &version, None, "jar");
             // Off the async workers: a pass inflates up to the jar limits.
             let compared = tokio::task::spawn_blocking(move || {
                 let verdict = verify_unpatched_jar_members(
                     (&leaf, &resolved),
                     &jar_bytes,
-                    &names,
+                    &files,
                     was_committed,
                 );
                 (jar_bytes, verdict)
@@ -1500,25 +1496,29 @@ async fn acquire_classifier(
 
 /// The patched jar (the service's on a first vendoring, the committed one
 /// on a re-run) against `resolved`, the jar `(leaf, bytes)` the build
-/// resolves from its local repository: outside the record's members
-/// (`patched_members`, as a jar spells them) and signature files, every
-/// member a JVM would load must be the same in both
-/// ([`crate::patch::jar_members`], whose limits also bound the read). A
-/// local jar that cannot be read gives nothing to compare with. `Err` is
-/// the refusal's `(code, detail)`.
+/// resolves from its local repository: outside the record `files` and
+/// signature files, every member a JVM would load must be the same in both
+/// ([`crate::patch::jar_members`], whose limits also bound the read). For a
+/// jar the service signed again, the manifest may differ as that signing
+/// leaves it: digest lines changed or added, and sections added for
+/// entries it did not list ([`crate::patch::jar_manifest`]). A local jar
+/// that cannot be read gives nothing to compare with. `Err` is the
+/// refusal's `(code, detail)`.
 fn verify_unpatched_jar_members(
     resolved: (&str, &[u8]),
     patched: &[u8],
-    patched_members: &[String],
+    files: &std::collections::HashMap<String, crate::manifest::schema::PatchFileInfo>,
     committed: bool,
 ) -> Result<(), (&'static str, String)> {
-    use crate::patch::jar_members::{unpatched_difference, Digests, JarError};
+    use crate::patch::jar_members::{difference_outside_patch, Digests, JarError};
     let whose = if committed {
         "the committed jar"
     } else {
         "the patch service's jar"
     };
-    let candidate = Digests::of_bytes(patched).map_err(|e| match e {
+    // A jar past a limit is too large, whichever read met the limit; it is
+    // never reported as a jar that differs.
+    let unread = |e: JarError| match e {
         JarError::TooLarge(why) => (
             super::verify::ARTIFACT_TOO_LARGE,
             format!("{whose} cannot be checked: {why}"),
@@ -1527,12 +1527,14 @@ fn verify_unpatched_jar_members(
             "vendor_prebuilt_integrity_mismatch",
             format!("{whose} cannot be read: {why}"),
         ),
-    })?;
+    };
+    let candidate = Digests::of_bytes(patched).map_err(unread)?;
     let Ok(original) = Digests::of_bytes(resolved.1) else {
         return Ok(());
     };
-    let names: Vec<&str> = patched_members.iter().map(String::as_str).collect();
-    let difference = unpatched_difference(&original, &candidate, &names);
+    let difference =
+        difference_outside_patch((resolved.1, &original), (patched, &candidate), files)
+            .map_err(unread)?;
     if !difference.is_empty() {
         return Err((
             "vendor_prebuilt_integrity_mismatch",
@@ -4414,6 +4416,31 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The vendored comparison accepts a jar the patch service re-signed
+    /// (its signature files, and the manifest digests of the member the
+    /// patch changes) and refuses any other manifest change.
+    #[test]
+    fn a_resigned_provider_jar_is_upstream_outside_the_patch() {
+        use crate::patch::jar_manifest::fixture::{edited, record as resigned, SERVED, UPSTREAM};
+        let files = resigned();
+        for committed in [false, true] {
+            assert_eq!(
+                verify_unpatched_jar_members(("lib-1.0.jar", UPSTREAM), SERVED, &files, committed),
+                Ok(())
+            );
+        }
+        let tampered = edited(|m| m.replace("Implementation-Title: ", "Implementation-Title: x"));
+        let (code, detail) =
+            verify_unpatched_jar_members(("lib-1.0.jar", UPSTREAM), &tampered, &files, false)
+                .unwrap_err();
+        assert_eq!(code, "vendor_prebuilt_integrity_mismatch");
+        assert!(
+            detail.contains("1 changed (`META-INF/MANIFEST.MF`)")
+                && detail.contains("its main attributes differ"),
+            "{detail}"
+        );
     }
 
     /// commons-text as log4j-core is published: a sibling's version comes

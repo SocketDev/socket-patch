@@ -3019,7 +3019,10 @@ original jar is already in the build's local repository (the Maven local reposit
 or a Gradle cache), every entry the JVM would load must hold the same content in it
 and in the service's jar, whatever unix mode the entry carries; the record's members
 and signature files (`META-INF/*.SF`, `.RSA`, `.DSA`, `.EC`) are exempt and directory
-entries may differ. A difference means the project builds with a jar that is not the
+entries may differ. The manifest of a jar the patch service signed again may differ
+as that signing leaves it (digest lines changed for the patched members and added for
+the others, sections added for entries it did not list), by the rule under
+[Agent mode](#agent-mode-apply-scan---mode-agent). A difference means the project builds with a jar that is not the
 one the patch was made from (an internal rebuild under the same coordinates, say), so
 the service's jar would change more than the patch: the vendoring is refused with
 `vendor_prebuilt_integrity_mismatch`, the detail naming up to three such members, and
@@ -3631,6 +3634,52 @@ files (`META-INF/*.SF`, `.RSA`, `.DSA`, `.EC`) are exempt, and directory entries
 differ. A copy that differs fails with `jvm_agent_service_jar_mismatch`, naming up
 to three added, missing or changed members, and is left as it is; the other copies
 are still swapped.
+
+One member outside the patch may change, in one way: `META-INF/MANIFEST.MF` of a jar
+the patch service signed again. A signed jar's manifest holds each entry's digests and
+its signature files vouch for the manifest, so patching a class of a signed security
+provider (Bouncy Castle's `bcprov`) means signing the jar again, as a whole:
+upstream's signature files are replaced by the service's (`META-INF/SOCKET.SF`,
+`SOCKET.RSA`) and every file entry is listed under the signing digest. A current JDK
+ignores SHA-1 digests, so a manifest that holds only those gains a SHA-256 line in
+every section, and an entry upstream never listed gains a section. The service's jar
+must carry a signature file, and its manifest may differ from the installed jar's
+only as follows; anything else is the refusal above with the reason added:
+
+1. The main-attributes section is byte for byte the same.
+2. The section of a member the record does not touch keeps every line, byte for byte
+   and in order. It may gain digest attributes, each of which must equal the digest
+   of that member in the service's jar.
+3. The section of a member the record changes may also change the values of its
+   digest attributes. Every digest in it must equal the member's in the service's
+   jar, and no other attribute may change.
+4. A section is added only for a member the record adds or changes, or for an entry
+   that both jars hold with identical bytes and the installed manifest did not list.
+   It holds a `Name` and verified digests alone.
+5. No section is removed.
+
+A digest attribute is one the JDK reads when it verifies a jar: `SHA-256-Digest`,
+`SHA-384-Digest`, `SHA-512-Digest`, `SHA1-Digest`, `SHA-1-Digest`, `MD5-Digest`,
+matched without regard to case. An added or changed attribute of any other name is a
+refusal, the other digests the JDK reads (`SHA-224-Digest`, the SHA-3 ones) among
+them: the service writes none. The manifest is read as the JAR
+specification lays it out (lines end in `\r\n`, `\n` or `\r`, a leading space
+continues a line wrapped at 72 bytes, a blank line ends a section) and its sections
+are compared as the bytes in the file. Blank lines are not compared, so a terminator
+added before appended sections changes nothing, and a last line of the installed
+manifest with no terminator, which a JVM ignores, may be dropped. The signature
+itself is not verified; that is the JVM's. A rollback finds the original of such a
+copy by the same rule.
+
+A jar whose patch record itself lists `META-INF/MANIFEST.MF` is refused for now when
+the service signed it again. The manifest is then a member the record changes, held
+to its `afterHash`, and the signed manifest is that blob with its digests completed,
+not the blob. Accepting it needs the record's blob wherever a member is held to its
+`afterHash`, and `rollback`, `vex` and the vendored check do not have it at hand.
+
+A jar past a limit while its manifest is read is `jvm_jar_too_large` (vendored:
+`vendor_artifact_too_large`), never a mismatch; the manifest has no limit of its own
+below those of the jar.
 
 Jars are read within fixed limits, counted on the bytes actually inflated and on the
 archive's own entry count, never on the sizes an archive declares: 200,000 entries
