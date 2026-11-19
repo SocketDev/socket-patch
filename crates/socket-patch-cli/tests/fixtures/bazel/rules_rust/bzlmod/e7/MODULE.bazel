@@ -1,0 +1,16 @@
+module(name = "socket_fixture", version = "0.0.0")
+
+bazel_dep(name = "rules_rust", version = "0.56.0")
+single_version_override(module_name = "rules_rust", version = "0.56.0")
+
+# The hub of the rules_rust README, and the project's cargo config, which
+# cargo-bazel's cargo reads only when the hub names it. No cargo-bazel lock
+# (`lockfile`): the hub follows Cargo.lock without a repin.
+crate = use_extension("@rules_rust//crate_universe:extensions.bzl", "crate")
+crate.from_cargo(
+    name = "crates",
+    cargo_config = "//:.cargo/config.toml",
+    cargo_lockfile = "//:Cargo.lock",
+    manifests = ["//:Cargo.toml"],
+)
+use_repo(crate, "crates")

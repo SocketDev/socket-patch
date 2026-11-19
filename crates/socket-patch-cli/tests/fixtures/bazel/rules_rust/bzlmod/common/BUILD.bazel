@@ -1,0 +1,10 @@
+load("@rules_rust//rust:defs.bzl", "rust_binary")
+
+# Prints `OUT: PRISTINE <id>` until the crate is patched: a test builds the
+# crate anew, with an id of its own in the library.
+rust_binary(
+    name = "consumer",
+    srcs = ["src/main.rs"],
+    edition = "2021",
+    deps = ["@crates//:socket-patch-bazel-fixture-with-a-name-that-is-too-long-for-crates-io"],
+)
