@@ -1,0 +1,5 @@
+{
+    "require": {
+        "socketsecurity/bazel-fixture-upstream": "1.0.0"
+    }
+}

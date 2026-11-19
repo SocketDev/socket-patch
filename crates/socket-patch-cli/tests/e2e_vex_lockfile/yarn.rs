@@ -3,7 +3,7 @@
 //! vendored, with NO `.socket/manifest.json` and (unless a cell says
 //! otherwise) NO `.socket/vendor/state.json` / `redirect-state.json` ledgers.
 //!
-//! The only input is what a depscan-opened PR (or a checkout whose `.socket/`
+//! The only input is what a GitHub-app PR (or a checkout whose `.socket/`
 //! was never committed) carries: `package.json`, `yarn.lock`, `.yarnrc.yml`
 //! and — vendored — the committed `.socket/vendor/npm/<uuid>/<leaf>.tgz`.
 //! The patch record comes from a wiremock stand-in for the public patch

@@ -295,7 +295,7 @@ class PnpmRequiredGate(unittest.TestCase):
     counts a skip as `ok`, so every row that runs them, on every OS, must set
     the fail-instead-of-skip gate (#1054)."""
 
-    suites = {"e2e_redirect_pnpm_build", "e2e_safety_pnpm", "e2e_redirect_rush_sim"}
+    suites = {"e2e_redirect_pnpm_build", "e2e_safety_pnpm", "e2e_redirect_rush_sim", "e2e_vendor_rush"}
     jobs = ("e2e", "e2e-full", "e2e-extended", "e2e-windows", "e2e-macos")
 
     def test_run_step_reads_the_row_key(self):

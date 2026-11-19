@@ -2586,7 +2586,7 @@ fn patch_view(uuid: &str, purl: &str, file_key: &str, after_hash: &str, ghsa: &s
     })
 }
 
-/// A depscan-style vendored checkout: `package-lock.json` wires lodash to a
+/// A GitHub-app-style vendored checkout: `package-lock.json` wires lodash to a
 /// committed `.socket/vendor/npm/<uuid>/` tarball, and there is NO
 /// `.socket/manifest.json` and NO `.socket/vendor/state.json`.
 fn lockfile_only_vendored_npm(cwd: &Path, uuid: &str, artifact_bytes: &[u8]) -> String {

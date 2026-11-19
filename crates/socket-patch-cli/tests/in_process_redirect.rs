@@ -5,7 +5,7 @@
 //! patch (resolved URL + sha512 integrity) — and (v5) that NO redirect
 //! ledger was written: the lockfile pin is the whole hosted state, and
 //! `rollback` restores the default upstream registry entry.
-//! This is the CLI counterpart of the depscan-side install-verify e2e; the
+//! This is the CLI counterpart of the Socket backend's install-verify e2e; the
 //! rewriter bytes themselves are pinned by the shared golden fixtures.
 
 #[path = "common/hermetic.rs"]

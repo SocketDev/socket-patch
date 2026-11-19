@@ -577,7 +577,14 @@ pub async fn run(args: RemoveArgs) -> i32 {
         // per-purl exit path (restoring the upstream entry IS the removal).
         let hosted_matches = hosted_pins_matching(&hosted_pins, &target, &[]);
         if !hosted_matches.is_empty() {
-            return remove_hosted_only(&args, hosted_matches, &telemetry, commit_recovery).await;
+            return remove_hosted_only(
+                &args,
+                hosted_matches,
+                &telemetry,
+                commit_recovery,
+                &api_client,
+            )
+            .await;
         }
 
         let msg = format!("No patch found matching identifier: {}", args.identifier);
@@ -943,7 +950,7 @@ pub async fn run(args: RemoveArgs) -> i32 {
     if !args.skip_rollback {
         let hosted_matches = hosted_pins_matching(&hosted_pins, &target, &matched_keys);
         if !hosted_matches.is_empty() {
-            let leg = match unwind_hosted(&args.common, &hosted_matches).await {
+            let leg = match unwind_hosted(&args.common, &hosted_matches, &api_client).await {
                 Ok(leg) => {
                     hosted_leg_warnings.extend(leg.warnings.iter().cloned());
                     leg
@@ -1607,8 +1614,9 @@ async fn sweep_target_orphans(
 async fn unwind_hosted(
     common: &GlobalArgs,
     hosted_matches: &[HostedPin],
+    api_client: &RunApiClient,
 ) -> Result<HostedLegOutcome, String> {
-    let leg = run_hosted_leg(common, hosted_matches).await;
+    let leg = run_hosted_leg(common, hosted_matches, api_client).await;
     // Printed as soon as the leg returns, so a human run that then fails
     // still says what it did to the files.
     print_run_warnings(common, &leg.warnings);
@@ -1678,6 +1686,7 @@ async fn remove_hosted_only(
     hosted_matches: Vec<HostedPin>,
     telemetry: &TelemetryAuth,
     commit_recovery: Option<crate::json_envelope::RunWarning>,
+    api_client: &RunApiClient,
 ) -> i32 {
     let loud = !args.common.json && !args.common.silent;
     if args.skip_rollback {
@@ -1730,7 +1739,7 @@ async fn remove_hosted_only(
         return 0;
     }
 
-    let leg = match unwind_hosted(&args.common, &hosted_matches).await {
+    let leg = match unwind_hosted(&args.common, &hosted_matches, api_client).await {
         Ok(leg) => leg,
         Err(err) => {
             track_patch_remove_failed("hosted redirect revert failed", telemetry).await;

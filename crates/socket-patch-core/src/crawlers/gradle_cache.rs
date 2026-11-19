@@ -664,7 +664,7 @@ const WRAPPER_PROPERTIES: &str = "gradle/wrapper/gradle-wrapper.properties";
 /// ends at the first unescaped `=`, `:` or whitespace, and `\t`, `\n`,
 /// `\r`, `\f`, `\uXXXX` and `\<char>` escapes are resolved. A later key
 /// wins.
-fn parse_properties(bytes: &[u8]) -> HashMap<String, String> {
+pub(crate) fn parse_properties(bytes: &[u8]) -> HashMap<String, String> {
     let bytes = crate::formats::text::strip_bom_bytes(bytes);
     let text: String = bytes.iter().map(|&b| b as char).collect();
     let text = text.replace("\r\n", "\n");

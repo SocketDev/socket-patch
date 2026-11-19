@@ -506,6 +506,14 @@ fn maven_env_moves_home_and_keeps_what_the_cli_isolation_carries() {
             "-Duser.home=/nonexistent/maven-production-home"
         ))
     );
+    // A real Maven reads `MAVEN_ARGS` and refuses to start on a settings
+    // file named there that does not exist; it must be started with none,
+    // and with the settings its own command line names.
+    assert_eq!(
+        env.get(std::ffi::OsStr::new("MAVEN_ARGS")),
+        Some(&None),
+        "a Maven child is started with no MAVEN_ARGS"
+    );
     // Everything else the CLI's isolation sets or removes (the
     // version-manager roots among it) reaches Maven unchanged.
     let mut cli = Command::new("socket-patch");

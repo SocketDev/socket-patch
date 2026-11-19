@@ -1,0 +1,26 @@
+{
+  "$schema": "https://developer.microsoft.com/json-schemas/rush/v5/rush.schema.json",
+  "rushVersion": "5.182.1",
+  "pnpmVersion": "11.28.12",
+  "nodeSupportedVersionRange": ">=18.0.0",
+  "projectFolderMinDepth": 1,
+  "projectFolderMaxDepth": 3,
+  "projects": [
+    {
+      "packageName": "app",
+      "projectFolder": "apps/app"
+    },
+    {
+      "packageName": "util",
+      "projectFolder": "libs/util"
+    },
+    {
+      "packageName": "cli",
+      "projectFolder": "tools/deep/cli"
+    },
+    {
+      "packageName": "top",
+      "projectFolder": "top"
+    }
+  ]
+}

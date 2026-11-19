@@ -29,7 +29,7 @@ follow from the install-tree decision. N11 was decided on 2026-11-05.
 | # | Question | Hosted today | Decision |
 |---|---|---|---|
 | J1 | Does a base-version Maven dependency declared in a `<profiles>` block block attestation? | Warns, still pins the top level and counts the package as redirected (`patch/redirect/mod.rs` ~8744) | Vendored's rule: any profile declaration at the base version makes the ref unattested (fixed now in discovery), and the merged planner rewrites profile declarations in both modes. |
-| J3 | Which Maven poms count? | Refuses a reactor root (~8572) | The reactor reader becomes the shared core, so hosted gains reactor support. |
+| J3 | Which Maven poms count? | Reads every pom of a reactor through the vendored reactor planner (`maven_reactor::plan_hosted`); a reactor it cannot read is refused | The reactor reader becomes the shared core, so hosted gains reactor support. |
 | J12 | scala-cli | Guidance only (`patch/redirect/scala_guidance.rs`) | Back-port: hosted wires scala-cli through the merged planner (a same-GAV Socket repository instead of a suffixed version). |
 | P3 | Is a shadowed `pdm.lock` rewritten? | Only when it governs (`pdm_drives`, ~564) | Rewrite it like every other tree, per the install-tree decision. |
 | P4 | Are `-r` includes of `requirements.txt` rewritten? | Root file only (`patch/redirect/requirements.rs` ~208) | Follow includes, per the install-tree decision. An include outside the repository root stays bounded in workspace runs: never read or rewritten (owner, 2026-11-05; #2025 (draft)). |
