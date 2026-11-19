@@ -1,0 +1,7 @@
+[package]
+name = "consumer"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+socket-patch-bazel-fixture-with-a-name-that-is-too-long-for-crates-io = "1.0.0"

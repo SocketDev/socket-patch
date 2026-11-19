@@ -14,6 +14,9 @@
 //!   `lib-range:1.0` → `victim:[1.10.5,1.11.0]`.
 //! * the artifact-level `maven-metadata.xml` of `victim`, which resolves
 //!   the range.
+//! * `sibling:1.10.0`, which shares the victim's base version (and so can
+//!   share a version property with it), and the parent poms `lib-parent`
+//!   and `lib-parent-props`, the latter defining [`PARENT_PROPERTY`].
 //!
 //! One [`Shape`] per row of the bug: which version Maven selects for the
 //! victim, with the base version somewhere else in the graph (deeper,
@@ -214,10 +217,11 @@ fn serve(server: &Server, rel: &str, bytes: &[u8]) {
 
 /// Serve the fixture repository from `server`.
 pub fn publish(server: &Server) {
-    let artifacts: [(&str, &str, &[(&str, &str)]); 8] = [
+    let artifacts: [(&str, &str, &[(&str, &str)]); 9] = [
         (VICTIM, OLDER, &[]),
         (VICTIM, BASE, &[]),
         (VICTIM, NEWER, &[]),
+        (SIBLING, BASE, &[]),
         ("lib-base", "1.0", &[(VICTIM, BASE)]),
         ("lib-new", "1.0", &[(VICTIM, NEWER)]),
         ("lib-old", "1.0", &[(VICTIM, OLDER)]),
@@ -245,6 +249,20 @@ pub fn publish(server: &Server) {
             .replace(
                 "<version>1.0</version>\n",
                 "<version>1.0</version>\n  <packaging>pom</packaging>\n",
+            )
+            .as_bytes(),
+    );
+    // A parent pom that defines the version property its children read.
+    serve(
+        server,
+        &format!("{GROUP_PATH}/{PARENT_WITH_PROPERTY}/1.0/{PARENT_WITH_PROPERTY}-1.0.pom"),
+        fixture_pom(PARENT_WITH_PROPERTY, "1.0", &[])
+            .replace(
+                "<version>1.0</version>\n",
+                &format!(
+                    "<version>1.0</version>\n  <packaging>pom</packaging>\n  <properties>\n    \
+                     <{PARENT_PROPERTY}>{BASE}</{PARENT_PROPERTY}>\n  </properties>\n"
+                ),
             )
             .as_bytes(),
     );
@@ -302,30 +320,33 @@ pub fn module_pom(name: &str, artifact: &str, version: &str) -> String {
     )
 }
 
+/// The root pom `com.example:parent:1.0.0` of a reactor over `modules`,
+/// which every [`module_pom`] inherits: it names the fixture repository.
+pub fn reactor_root_pom(modules: &[&str], server: &Server) -> String {
+    let modules: String = modules
+        .iter()
+        .map(|name| format!("    <module>{name}</module>\n"))
+        .collect();
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <project xmlns=\"http://maven.apache.org/POM/4.0.0\">\n  \
+         <modelVersion>4.0.0</modelVersion>\n  <groupId>com.example</groupId>\n  \
+         <artifactId>parent</artifactId>\n  <version>1.0.0</version>\n  \
+         <packaging>pom</packaging>\n  <modules>\n{modules}  </modules>\n  \
+         <repositories>\n    <repository>\n      <id>fixture</id>\n      \
+         <url>{}{REPO_ROUTE}</url>\n    </repository>\n  </repositories>\n</project>\n",
+        server.uri()
+    )
+}
+
 /// Write a reactor into `dir` (the table's V3): a parent pom that three
 /// modules inherit, `a` reaching the base version two levels down, `b` a
 /// newer version through another artifact, `c` declaring the base version
 /// itself.
 pub fn write_reactor(dir: &Path, server: &Server) {
-    let modules: String = REACTOR_MODULES
-        .iter()
-        .map(|(name, ..)| format!("    <module>{name}</module>\n"))
-        .collect();
+    let names: Vec<&str> = REACTOR_MODULES.iter().map(|(name, ..)| *name).collect();
     std::fs::create_dir_all(dir).unwrap();
-    std::fs::write(
-        dir.join("pom.xml"),
-        format!(
-            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
-             <project xmlns=\"http://maven.apache.org/POM/4.0.0\">\n  \
-             <modelVersion>4.0.0</modelVersion>\n  <groupId>com.example</groupId>\n  \
-             <artifactId>parent</artifactId>\n  <version>1.0.0</version>\n  \
-             <packaging>pom</packaging>\n  <modules>\n{modules}  </modules>\n  \
-             <repositories>\n    <repository>\n      <id>fixture</id>\n      \
-             <url>{}{REPO_ROUTE}</url>\n    </repository>\n  </repositories>\n</project>\n",
-            server.uri()
-        ),
-    )
-    .unwrap();
+    std::fs::write(dir.join("pom.xml"), reactor_root_pom(&names, server)).unwrap();
     for (name, _, artifact, version) in REACTOR_MODULES {
         std::fs::create_dir_all(dir.join(name)).unwrap();
         std::fs::write(
@@ -369,6 +390,82 @@ pub fn resolve_reactor(
 
 /// A parent pom the fixture repository serves.
 pub const PARENT: &str = "lib-parent";
+/// A parent pom the fixture repository serves that defines
+/// [`PARENT_PROPERTY`] as the victim's base version.
+pub const PARENT_WITH_PROPERTY: &str = "lib-parent-props";
+pub const PARENT_PROPERTY: &str = "corp.victim.version";
+/// An artifact published at the victim's base version.
+pub const SIBLING: &str = "sibling";
+
+/// How a project names the victim's version through a property.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Property {
+    /// The project defines it, and only the victim's declaration reads it.
+    Own,
+    /// The project defines it, and [`SIBLING`] reads it too.
+    Shared,
+    /// A parent pom resolved from the repository defines it.
+    OfParent,
+}
+
+impl Property {
+    pub fn name(self) -> &'static str {
+        match self {
+            Property::Own => "property-own",
+            Property::Shared => "property-shared",
+            Property::OfParent => "property-of-parent",
+        }
+    }
+
+    /// The property the victim's `<version>` reads.
+    pub fn reference(self) -> String {
+        match self {
+            Property::Own => "${victim.version}".to_string(),
+            Property::Shared => "${fixture.version}".to_string(),
+            Property::OfParent => format!("${{{PARENT_PROPERTY}}}"),
+        }
+    }
+}
+
+/// The `pom.xml` of a project that declares the base victim through
+/// `property`.
+pub fn property_pom(property: Property, server: &Server) -> String {
+    let reference = property.reference();
+    let pom = project_pom(Shape::Selected, server);
+    let own = |name: &str| {
+        format!(
+            "  <packaging>jar</packaging>\n  <properties>\n    <{name}>{BASE}</{name}>\n  \
+             </properties>\n"
+        )
+    };
+    let (head, dependencies) = match property {
+        Property::Own => (
+            pom.replace("  <packaging>jar</packaging>\n", &own("victim.version")),
+            dependency(VICTIM, &reference, ""),
+        ),
+        Property::Shared => (
+            pom.replace("  <packaging>jar</packaging>\n", &own("fixture.version")),
+            [
+                dependency(VICTIM, &reference, ""),
+                dependency(SIBLING, &reference, ""),
+            ]
+            .concat(),
+        ),
+        Property::OfParent => (
+            pom.replace(
+                "  <groupId>com.example</groupId>\n",
+                &format!(
+                    "  <parent>\n    <groupId>{GROUP}</groupId>\n    \
+                     <artifactId>{PARENT_WITH_PROPERTY}</artifactId>\n    \
+                     <version>1.0</version>\n    <relativePath/>\n  </parent>\n  \
+                     <groupId>com.example</groupId>\n"
+                ),
+            ),
+            dependency(VICTIM, &reference, ""),
+        ),
+    };
+    head.replace(&dependency("lib-deep", "1.0", ""), &dependencies)
+}
 
 /// The `pom.xml` of a project that inherits [`PARENT`] from the repository
 /// and declares the base victim itself.
@@ -530,16 +627,29 @@ pub fn plain_settings(path: &Path) {
     write_settings(path, &[]);
 }
 
-/// Every file under `dir` (relative, forward slashes) with its bytes.
+/// Maven 4's own output directory in a project: it keeps a project-local
+/// repository there (`.mvn/target/project-local-repo`), written on every
+/// build from the poms as they then read, a wired build's included.
+const MAVEN_4_OUTPUT: &str = ".mvn/target";
+
+/// Every file under `dir` (relative, forward slashes) with its bytes, but
+/// what Maven itself writes under [`MAVEN_4_OUTPUT`]: that is neither the
+/// project's nor socket-patch's, and it differs from one build to the next.
 pub fn snapshot(dir: &Path) -> BTreeMap<String, Vec<u8>> {
     fn walk(base: &Path, dir: &Path, out: &mut BTreeMap<String, Vec<u8>>) {
         for entry in std::fs::read_dir(dir).unwrap() {
             let path = entry.unwrap().path();
+            let rel = path
+                .strip_prefix(base)
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/");
             if path.is_dir() {
-                walk(base, &path, out);
+                if rel != MAVEN_4_OUTPUT {
+                    walk(base, &path, out);
+                }
             } else {
-                let rel = path.strip_prefix(base).unwrap().to_string_lossy();
-                out.insert(rel.replace('\\', "/"), std::fs::read(&path).unwrap());
+                out.insert(rel, std::fs::read(&path).unwrap());
             }
         }
     }

@@ -1815,3 +1815,145 @@ async fn scan_apply_json_dry_run_with_vex_does_not_write_attestation() {
         "apply dry run must not write the VEX file even when generation would succeed"
     );
 }
+
+// ---------------------------------------------------------------------------
+// --mode hosted with nothing to redirect: the Maven config an earlier
+// release wrote is still healed
+// ---------------------------------------------------------------------------
+
+/// The six Trusted Checksums settings as releases up to 5.1.0 wrote them
+/// for every project: the directory named through
+/// `${session.rootDirectory}`, which stops Maven 3.9.2 to 3.9.8 from
+/// starting with `-f` from outside the project.
+fn maven_config_of_an_earlier_release() -> String {
+    [
+        "-Daether.artifactResolver.postProcessor.trustedChecksums=true",
+        "-Daether.artifactResolver.postProcessor.trustedChecksums.checksumAlgorithms=SHA-256",
+        "-Daether.artifactResolver.postProcessor.trustedChecksums.failIfMissing=false",
+        "-Daether.trustedChecksumsSource.summaryFile=true",
+        "-Daether.trustedChecksumsSource.summaryFile.basedir=${session.rootDirectory}/.mvn/checksums",
+        "-Daether.trustedChecksumsSource.summaryFile.originAware=false",
+        "",
+    ]
+    .join("\n")
+}
+
+/// A project hosted mode wired once, whose patched dependency has since
+/// been bumped past the patch: a crawled package (so the scan reaches the
+/// redirect step), no patch for it, a `pom.xml` and the config an earlier
+/// release left behind.
+fn project_with_a_stale_maven_config(root: &Path) {
+    write_root_package_json(root);
+    write_npm_package(root, "in-proc-scan", "1.0.0");
+    std::fs::write(
+        root.join("pom.xml"),
+        "<project xmlns=\"http://maven.apache.org/POM/4.0.0\">\n  \
+         <modelVersion>4.0.0</modelVersion>\n  <groupId>t</groupId>\n  \
+         <artifactId>app</artifactId>\n  <version>1</version>\n</project>\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(root.join(".mvn")).unwrap();
+    std::fs::write(
+        root.join(".mvn/maven.config"),
+        maven_config_of_an_earlier_release(),
+    )
+    .unwrap();
+}
+
+/// A hosted scan that finds no patch to redirect still respells that line:
+/// without it a project whose only patched dependency was bumped would
+/// keep, for ever, a line that stops some Maven 3.9 builds from starting.
+/// A dry run previews and writes nothing. The same scan in a project whose
+/// config needs no heal touches nothing, `.socket/` included.
+#[tokio::test]
+#[serial]
+async fn scan_hosted_with_nothing_to_redirect_heals_the_maven_config() {
+    use socket_patch_cli::commands::scan::ScanMode;
+    // The project has a pom: keep the machine's Maven repository and JVM
+    // caches out of the crawl.
+    let _no_jvm_caches = NoJvmCaches::new();
+    let m2 = tempfile::tempdir().unwrap();
+    std::env::set_var("MAVEN_REPO_LOCAL", m2.path());
+    let server = MockServer::start().await;
+    mock_batch_empty(&server).await;
+    let earlier = maven_config_of_an_earlier_release();
+    let healed = earlier.replace(
+        "${session.rootDirectory}",
+        "${maven.multiModuleProjectDirectory}",
+    );
+    assert_ne!(healed, earlier);
+    let args_for = |root: &Path, dry_run: bool| {
+        let mut args = default_args(root);
+        args.common.api_url = Some(server.uri());
+        args.common.dry_run = dry_run;
+        args.mode = Some(ScanMode::Hosted);
+        args
+    };
+    let config = |root: &Path| std::fs::read_to_string(root.join(".mvn/maven.config")).unwrap();
+
+    // Dry: nothing written, no lock taken.
+    let tmp = tempfile::tempdir().unwrap();
+    project_with_a_stale_maven_config(tmp.path());
+    assert_eq!(run_scrubbed(args_for(tmp.path(), true)).await, 0);
+    assert_eq!(config(tmp.path()), earlier);
+    assert!(!tmp.path().join(".socket").exists());
+
+    // Wet: the one line is respelled, every other byte of the project kept.
+    assert_eq!(run_scrubbed(args_for(tmp.path(), false)).await, 0);
+    assert_eq!(config(tmp.path()), healed);
+    assert!(
+        !batch_posts(&recorded(&server).await).is_empty(),
+        "the scan reached the patch API and found nothing to redirect"
+    );
+    // And again: nothing left to do.
+    assert_eq!(run_scrubbed(args_for(tmp.path(), false)).await, 0);
+    assert_eq!(config(tmp.path()), healed);
+
+    // A config with nothing to heal: the run reads it and touches nothing.
+    let settled = tempfile::tempdir().unwrap();
+    project_with_a_stale_maven_config(settled.path());
+    std::fs::write(settled.path().join(".mvn/maven.config"), &healed).unwrap();
+    assert_eq!(run_scrubbed(args_for(settled.path(), false)).await, 0);
+    assert_eq!(config(settled.path()), healed);
+    assert!(
+        !settled.path().join(".socket").exists(),
+        "a run with nothing to write takes no lock"
+    );
+}
+
+/// The heal is never a reason to fail a run that has nothing else to do:
+/// while another run holds the write lock the line is left for the next
+/// scan, and the scan still exits 0.
+#[tokio::test]
+#[serial]
+async fn scan_hosted_heal_waits_when_the_lock_is_held() {
+    use socket_patch_cli::commands::scan::ScanMode;
+    let _no_jvm_caches = NoJvmCaches::new();
+    let m2 = tempfile::tempdir().unwrap();
+    std::env::set_var("MAVEN_REPO_LOCAL", m2.path());
+    let server = MockServer::start().await;
+    mock_batch_empty(&server).await;
+    let earlier = maven_config_of_an_earlier_release();
+    let tmp = tempfile::tempdir().unwrap();
+    project_with_a_stale_maven_config(tmp.path());
+    let run_once = || {
+        let mut args = default_args(tmp.path());
+        args.common.api_url = Some(server.uri());
+        args.mode = Some(ScanMode::Hosted);
+        run_scrubbed(args)
+    };
+    let config = || std::fs::read_to_string(tmp.path().join(".mvn/maven.config")).unwrap();
+    {
+        let _held = socket_patch_core::patch::apply_lock::acquire(
+            &tmp.path().join(".socket"),
+            std::time::Duration::ZERO,
+        )
+        .expect("take the lock");
+        assert_eq!(run_once().await, 0, "a held lock does not fail the scan");
+        assert_eq!(config(), earlier, "and the line waits");
+    }
+    // Released: the next scan heals it.
+    assert_eq!(run_once().await, 0);
+    assert_ne!(config(), earlier);
+    assert!(config().contains("${maven.multiModuleProjectDirectory}/.mvn/checksums"));
+}

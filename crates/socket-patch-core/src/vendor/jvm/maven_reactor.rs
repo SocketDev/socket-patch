@@ -13,9 +13,10 @@ use serde_json::{json, Value};
 
 use crate::crawlers::maven_selection::{MavenSelection, Verdict};
 use crate::formats::maven::{
-    classpath_copy, interpolate_keeping, interpolate_strict, is_executable_classifier,
-    lookup_property, maven_config_properties as cli_properties, profile_combinations, Definitions,
-    Interpolate, PomLayer, MAX_COMBINED_PROFILES, MAX_INTERPOLATION_DEPTH,
+    classpath_copy, declared_maven, interpolate_keeping, interpolate_strict,
+    is_executable_classifier, lookup_property, maven_config_properties as cli_properties,
+    profile_combinations, Definitions, Interpolate, PomLayer, MAX_COMBINED_PROFILES,
+    MAX_INTERPOLATION_DEPTH,
 };
 
 use super::super::state::{WiringAction, WiringRecord};
@@ -26,6 +27,14 @@ use super::{
     JvmUnplan, JvmWarning, ListFn, ReadFn, CONFIG_LINE_KIND, OWNED_FILE_KIND, POM_FRAGMENT_KIND,
     TREE_GITATTRIBUTES,
 };
+
+mod hosted;
+mod reader;
+pub use hosted::{
+    unwire_hosted, HostedEdit, HostedEditKind, HostedPlan, HostedReactor, HostedRepository,
+    HostedSite, RepositoryEdit, ORIGINAL_TAG,
+};
+pub use reader::read_reactor;
 
 /// The committed maven2 tree.
 use super::layout::MAVEN2_TREE as TREE_ROOT;
@@ -107,16 +116,44 @@ pub fn may_discover_subprojects(pom: &str, maven_config: Option<&str>) -> bool {
 pub async fn implicit_subprojects_in(
     view: &crate::vendor::lock_inventory::ProjectView<'_>,
 ) -> Vec<String> {
+    subprojects_in(view, "").await
+}
+
+/// [`implicit_subprojects_in`] under the directory `dir` (`""`: the
+/// root), as names relative to it.
+async fn subprojects_in(
+    view: &crate::vendor::lock_inventory::ProjectView<'_>,
+    dir: &str,
+) -> Vec<String> {
+    let under = |name: &str| match dir {
+        "" => name.to_string(),
+        _ => format!("{dir}/{name}"),
+    };
     let mut out = Vec::new();
-    for entry in view.list_dir("").await.unwrap_or_default() {
-        if entry.name == GIT_DIR || !(entry.is_dir || view.is_symlink(&entry.name)) {
+    for entry in view.list_dir(dir).await.unwrap_or_default() {
+        let path = under(&entry.name);
+        if entry.name == GIT_DIR || !(entry.is_dir || view.is_symlink(&path)) {
             continue;
         }
-        if view.is_file(&format!("{}/{}", entry.name, layout::POM_FILE)) {
+        if view.is_file(&format!("{path}/{}", layout::POM_FILE)) {
             out.push(entry.name);
         }
     }
     out
+}
+
+/// Whether the root pom `pom` of the project `view` reads heads a reactor
+/// ([`is_reactor_root`], for a caller that holds the pom and reads the
+/// project through a view): the one question the hosted rewriter's
+/// discovery and its restore both ask.
+pub async fn heads_reactor_in(
+    view: &crate::vendor::lock_inventory::ProjectView<'_>,
+    pom: &str,
+    maven_config: Option<&str>,
+) -> bool {
+    declares_modules(pom)
+        || (may_discover_subprojects(pom, maven_config)
+            && !implicit_subprojects_in(view).await.is_empty())
 }
 
 /// A checkout's git directory: never a subproject, whatever it holds (the
@@ -267,6 +304,7 @@ pub fn plan_with_selection(
             &mut unpinned,
             &mut managed_roots,
             &mut BTreeSet::new(),
+            &|_, _| None,
         );
     }
 
@@ -316,91 +354,21 @@ pub fn plan_with_selection(
     }
 
     // What the modules at and below each pom select, read once.
-    let under = selection.map(|selection| reactor.under(selection, patch));
+    let under = selection.map(|selection| reactor.under(selection, patch, &|_| false));
     if let Some(under) = &under {
-        // A module that declares another version itself resolves that
-        // version: its declaration is no conflict to report, and the pins
-        // go where the base version is selected.
-        warnings.retain(|w| {
-            !under.iter().any(|(rel, u)| {
-                u.own == Some(Own::Other)
-                    && w.detail.contains(" is declared at ")
-                    && w.detail
-                        .starts_with(&format!("reason: conflicting_literal_version: {rel}:"))
-            })
-        });
+        forget_other_versions(&mut warnings, under);
     }
     // Where the pin goes, and the poms whose pin stays as it is.
-    let mut pins: BTreeSet<String> = BTreeSet::new();
-    let mut held: BTreeSet<String> = BTreeSet::new();
     let closed = |rel: &String| unpinned.contains(rel) || managed_roots.contains(rel);
-    // Where the pins go is decided when a patch is first wired, and the
-    // committed poms are the record of it: what this machine's local
-    // repository happens to hold must not move them, or the same checkout
-    // would plan differently from one machine to the next. A patch the
-    // poms already wire therefore keeps every pin it has and gets no new
-    // one, with or without a selection. The one exception is a pin that
-    // is certain to move a module to another version than Maven selects
-    // for it, which no run should have left: the pins are then placed
-    // afresh.
-    let moves = under.as_ref().is_some_and(|under| {
-        reactor.scope.iter().any(|rel| {
-            pin_of(&reactor.poms[rel].doc, patch).is_some()
-                && under.get(rel).is_some_and(|u| u.other.is_some())
-        })
-    });
-    if reactor.wired_before(patch) && !moves {
-        // (A local root a declaration ruled out stays ruled out.)
-        held.extend(reactor.scope.iter().filter(|rel| !closed(rel)).cloned());
-    } else {
-        let mut stranded: Vec<String> = Vec::new();
-        for root in reactor.wired_roots() {
-            let open = !closed(&root);
-            match &under {
-                None if open => {
-                    pins.insert(root);
-                }
-                None => {}
-                Some(under) => {
-                    let mut placing = Placing {
-                        under,
-                        patch,
-                        pins: &mut pins,
-                        held: &mut held,
-                        stranded: &mut stranded,
-                    };
-                    reactor.place(&root, open, &mut placing, 0);
-                }
-            }
-        }
-        warnings.extend(
-            stranded
-                .into_iter()
-                .map(|detail| degraded("pin_would_move_module", detail)),
-        );
-        // One line for every module that cannot be told, however many.
-        let unknown: Vec<(&String, &String)> = under
-            .iter()
-            .flatten()
-            .filter_map(|(rel, u)| match &u.own {
-                Some(Own::Unknown(why)) => Some((rel, why)),
-                _ => None,
-            })
-            .collect();
-        if let Some((module, why)) = unknown.first() {
-            let more = match unknown.len() - 1 {
-                0 => String::new(),
-                n => format!(", and {n} more"),
-            };
-            warnings.push(degraded(
-                "selection_undetermined",
-                format!(
-                    "which version of {g}:{a} {module} resolves cannot be told ({why}){more}; \
-                     no pin is written where that is so, and one already there is left as it is"
-                ),
-            ));
-        }
-    }
+    let kept = keeps_placement(&reactor, patch, under.as_ref());
+    let (pins, held) = place_pins(
+        &reactor,
+        patch,
+        under.as_ref(),
+        &closed,
+        kept,
+        &mut warnings,
+    );
 
     let banning = reactor
         .scope
@@ -538,6 +506,130 @@ pub fn plan_with_selection(
         tree_dir,
         jar_rel,
     })
+}
+
+/// A module that declares another version itself resolves that version:
+/// its declaration is no conflict to report, and the pins go where the
+/// base version is selected.
+fn forget_other_versions(warnings: &mut Vec<JvmWarning>, under: &BTreeMap<String, Under>) {
+    warnings.retain(|w| {
+        !under.iter().any(|(rel, u)| {
+            u.own == Some(Own::Other)
+                && w.detail.contains(" is declared at ")
+                && w.detail
+                    .starts_with(&format!("reason: conflicting_literal_version: {rel}:"))
+        })
+    });
+}
+
+/// Where `patch`'s pins go, and the poms whose pin stays as it is (held),
+/// by what the modules at and below each pom select (`under`; `None`: not
+/// asked). `closed` holds the local roots that take no pin of their own (a
+/// declaration ruled them out, or they manage the artifact themselves).
+///
+/// Where the pins go is decided when a patch is first wired, and the
+/// committed poms are the record of it: what this machine's local
+/// repository happens to hold must not move them, or the same checkout
+/// would plan differently from one machine to the next. A patch the poms
+/// already wire therefore keeps every pin it has and gets no new one, with
+/// or without a selection. The one exception is a pin that is certain to
+/// move a module to another version than Maven selects for it, which no
+/// run should have left: the pins are then placed afresh. `kept` is that
+/// decision ([`keeps_placement`]), taken on the poms as they were before
+/// the plan rewrote anything.
+fn place_pins(
+    reactor: &Reactor,
+    patch: &JvmPatch<'_>,
+    under: Option<&BTreeMap<String, Under>>,
+    closed: &dyn Fn(&String) -> bool,
+    kept: bool,
+    warnings: &mut Vec<JvmWarning>,
+) -> (BTreeSet<String>, BTreeSet<String>) {
+    let mut pins: BTreeSet<String> = BTreeSet::new();
+    let mut held: BTreeSet<String> = BTreeSet::new();
+    if kept {
+        // (A local root a declaration ruled out stays ruled out.)
+        held.extend(reactor.scope.iter().filter(|rel| !closed(rel)).cloned());
+        return (pins, held);
+    }
+    let mut stranded: Vec<String> = Vec::new();
+    for root in reactor.wired_roots() {
+        let open = !closed(&root);
+        match under {
+            None if open => {
+                pins.insert(root);
+            }
+            None => {}
+            Some(under) => {
+                let mut placing = Placing {
+                    under,
+                    patch,
+                    pins: &mut pins,
+                    held: &mut held,
+                    stranded: &mut stranded,
+                };
+                reactor.place(&root, open, &mut placing, 0);
+            }
+        }
+    }
+    warnings.extend(
+        stranded
+            .into_iter()
+            .map(|detail| degraded("pin_would_move_module", detail)),
+    );
+    warnings.extend(under.and_then(|under| undetermined_note(patch, under)));
+    (pins, held)
+}
+
+/// Whether the pins of `patch` stay where the poms have them: the poms
+/// already wire the patch, and no pin is certain (by `under`) to move a
+/// module to another version than Maven selects for it.
+fn keeps_placement(
+    reactor: &Reactor,
+    patch: &JvmPatch<'_>,
+    under: Option<&BTreeMap<String, Under>>,
+) -> bool {
+    reactor.wired_before(patch) && !pin_moves(reactor, patch, under)
+}
+
+/// Whether a pin of `patch` is certain (by `under`) to move a module to
+/// another version than Maven selects for it.
+fn pin_moves(
+    reactor: &Reactor,
+    patch: &JvmPatch<'_>,
+    under: Option<&BTreeMap<String, Under>>,
+) -> bool {
+    under.is_some_and(|under| {
+        reactor.scope.iter().any(|rel| {
+            pin_of(&reactor.poms[rel].doc, patch).is_some()
+                && under.get(rel).is_some_and(|u| u.other.is_some())
+        })
+    })
+}
+
+/// One line for every module of `under` whose selection cannot be told,
+/// however many: the first, and how many more.
+fn undetermined_note(patch: &JvmPatch<'_>, under: &BTreeMap<String, Under>) -> Option<JvmWarning> {
+    let (g, a) = (patch.group_id, patch.artifact_id);
+    let unknown: Vec<(&String, &String)> = under
+        .iter()
+        .filter_map(|(rel, u)| match &u.own {
+            Some(Own::Unknown(why)) => Some((rel, why)),
+            _ => None,
+        })
+        .collect();
+    let (module, why) = unknown.first()?;
+    let more = match unknown.len() - 1 {
+        0 => String::new(),
+        n => format!(", and {n} more"),
+    };
+    Some(degraded(
+        "selection_undetermined",
+        format!(
+            "which version of {g}:{a} {module} resolves cannot be told ({why}){more}; \
+             no pin is written where that is so, and one already there is left as it is"
+        ),
+    ))
 }
 
 fn op_of_value(op: &Value) -> &str {
@@ -847,27 +939,20 @@ pub fn unattestable_checked(
     list: ListFn<'_>,
     c: &Coords<'_>,
 ) -> Result<Option<String>, JvmRefusal> {
+    Ok(unattestable_in(&Reactor::discover(read, list)?, c))
+}
+
+/// [`unattestable_checked`] over a reactor already read.
+fn unattestable_in(reactor: &Reactor, c: &Coords<'_>) -> Option<String> {
     let sv = c.suffixed_version();
     let ga = format!("{}:{}", c.group_id, c.artifact_id);
-    let reactor = Reactor::discover(read, list)?;
     if !reactor.wires(c) {
-        return Ok(Some(format!(
+        return Some(format!(
             "no dependency or dependencyManagement declaration Maven always reads names \
              {ga}:{sv}"
-        )));
+        ));
     }
-    let patch = JvmPatch {
-        group_id: c.group_id,
-        artifact_id: c.artifact_id,
-        version: c.version,
-        uuid: c.uuid,
-        jar: &[],
-        upstream_pom: &[],
-        upstream_parents: None,
-        upstream_module: None,
-        extra_artifacts: &[],
-        patched_members: &[],
-    };
+    let patch = coords_patch(c);
     let mut edits = BTreeMap::new();
     let mut uncertain = BTreeSet::new();
     for rel in &reactor.scope {
@@ -880,11 +965,12 @@ pub fn unattestable_checked(
             &mut BTreeSet::new(),
             &mut BTreeSet::new(),
             &mut uncertain,
+            &|_, _| None,
         );
     }
     let mut at: Vec<String> = edits.into_keys().collect();
     at.extend(uncertain);
-    Ok((!at.is_empty()).then(|| {
+    (!at.is_empty()).then(|| {
         format!(
             "{} may still build {ga}:{} rather than {sv}: a base version declared since \
              vendoring, a version a property, profile or unpinned root may move, or an \
@@ -892,7 +978,24 @@ pub fn unattestable_checked(
             at.join(", "),
             c.version
         )
-    }))
+    })
+}
+
+/// `c` as a patch with no bytes: for planning that reads only what a
+/// patch is of, never what it holds.
+fn coords_patch<'a>(c: &Coords<'a>) -> JvmPatch<'a> {
+    JvmPatch {
+        group_id: c.group_id,
+        artifact_id: c.artifact_id,
+        version: c.version,
+        uuid: c.uuid,
+        jar: &[],
+        upstream_pom: &[],
+        upstream_parents: None,
+        upstream_module: None,
+        extra_artifacts: &[],
+        patched_members: &[],
+    }
 }
 
 /// `<!-- socket-patch <uuid>:` — the start of `c`'s pin comment.
@@ -1435,11 +1538,17 @@ const MAX_PLACING_DEPTH: usize = 64;
 impl Reactor {
     /// What the modules at and below each pom select for `patch`: every
     /// module is asked once, and its answer marked on each pom of its
-    /// chain.
-    fn under(&self, selection: &MavenSelection, patch: &JvmPatch<'_>) -> BTreeMap<String, Under> {
+    /// chain. A module `skip` names has no say (hosted mode leaves out the
+    /// modules a declaration already wires: a pin changes nothing there).
+    fn under(
+        &self,
+        selection: &MavenSelection,
+        patch: &JvmPatch<'_>,
+        skip: &dyn Fn(&str) -> bool,
+    ) -> BTreeMap<String, Under> {
         let (g, a, v) = (patch.group_id, patch.artifact_id, patch.version);
         let mut out: BTreeMap<String, Under> = BTreeMap::new();
-        for module in &self.reactor {
+        for module in self.reactor.iter().filter(|module| !skip(module)) {
             let (own, version) = match selection.verdict(module, g, a, v) {
                 Verdict::Selected => (Own::Selected, None),
                 Verdict::Other(version) => (Own::Other, Some(version)),
@@ -1574,7 +1683,11 @@ pub fn unwired_modules(
     c: &Coords<'_>,
     selection: &MavenSelection,
 ) -> Result<Option<String>, JvmRefusal> {
-    let reactor = Reactor::discover(read, list)?;
+    Ok(unwired_in(&Reactor::discover(read, list)?, c, selection))
+}
+
+/// [`unwired_modules`] over a reactor already read.
+fn unwired_in(reactor: &Reactor, c: &Coords<'_>, selection: &MavenSelection) -> Option<String> {
     let (g, a, v) = (c.group_id, c.artifact_id, c.version);
     let open: Vec<String> = reactor
         .reactor
@@ -1588,7 +1701,7 @@ pub fn unwired_modules(
             Verdict::Other(_) | Verdict::Absent => None,
         })
         .collect();
-    Ok(open.first().map(|first| {
+    open.first().map(|first| {
         let more = match open.len() - 1 {
             0 => String::new(),
             n => format!(", and {n} more"),
@@ -1597,7 +1710,7 @@ pub fn unwired_modules(
             "the patch of {g}:{a}:{v} is not wired in every module that resolves it: \
              {first}{more}"
         )
-    }))
+    })
 }
 
 /// One pom outside the checkout, parsed.
@@ -2075,10 +2188,8 @@ impl Pom {
             })
             .filter(|(_, props)| !props.is_empty())
             .collect();
-        let infers_parent = doc.child_text(project, "modelVersion").as_deref() == Some("4.1.0")
-            || doc.masked.contains("maven.apache.org/POM/4.1.0");
         Ok(Pom {
-            infers_parent,
+            infers_parent: doc.is_maven_4_model(),
             discovers_subprojects: discovers_subprojects(&doc),
             dir: rel.rsplit_once('/').map_or("", |(d, _)| d).to_string(),
             group: doc.child_text(project, "groupId"),
@@ -2132,6 +2243,9 @@ impl Pom {
 
 struct Reactor {
     poms: BTreeMap<String, Pom>,
+    /// The module directories with a `.mvn` of their own, when the reactor
+    /// was read for hosted mode (vendored mode refuses them).
+    nested_mvn: Vec<String>,
     /// Reactor poms in discovery order.
     reactor: Vec<String>,
     /// Reactor poms plus every in-checkout pom on a reactor parent chain.
@@ -2144,6 +2258,42 @@ struct Reactor {
 
 impl Reactor {
     fn discover(read: ReadFn<'_>, list: ListFn<'_>) -> Result<Reactor, JvmRefusal> {
+        Self::discover_for(read, list, false)
+    }
+
+    /// [`Self::discover`]; `hosted` reads a reactor one of whose modules
+    /// has a `.mvn` of its own. Vendored wiring names a path under the
+    /// project root, which such a module moves when Maven is started in
+    /// it; hosted wiring names none.
+    fn discover_for(
+        read: ReadFn<'_>,
+        list: ListFn<'_>,
+        hosted: bool,
+    ) -> Result<Reactor, JvmRefusal> {
+        Self::discover_with(read, list, hosted, None)
+    }
+
+    /// [`Self::discover_for`]. With `unread`, a module or a parent pom
+    /// that cannot be found or parsed is left out and named there instead
+    /// of refusing the reactor: for finding the wiring a reactor carries,
+    /// never for planning over it.
+    fn discover_with(
+        read: ReadFn<'_>,
+        list: ListFn<'_>,
+        hosted: bool,
+        mut unread: Option<&mut Vec<String>>,
+    ) -> Result<Reactor, JvmRefusal> {
+        // Leave out what cannot be read, when the caller allows it.
+        let mut skip = |refusal: JvmRefusal| -> Result<(), JvmRefusal> {
+            match unread.as_mut() {
+                Some(unread) => {
+                    let why = refusal.detail.strip_prefix("reason: ");
+                    unread.push(why.unwrap_or(&refusal.detail).to_string());
+                    Ok(())
+                }
+                None => Err(refusal),
+            }
+        };
         let root = read("pom.xml")
             .ok_or_else(|| shape_refusal("no_build_file", "no pom.xml at the project root"))?;
         let cli_props = read(MAVEN_CONFIG)
@@ -2152,6 +2302,7 @@ impl Reactor {
         let discovery = discovery_on(&cli_props);
         let mut poms = BTreeMap::new();
         poms.insert("pom.xml".to_string(), Pom::parse("pom.xml", root)?);
+        let mut nested_mvn = Vec::new();
         let mut reactor = vec!["pom.xml".to_string()];
         let mut next = 0;
         while next < reactor.len() {
@@ -2162,18 +2313,33 @@ impl Reactor {
                 modules.extend(implicit_subprojects(list, &poms[&rel].dir));
             }
             for module in modules {
-                let (module_rel, bytes) = resolve_module(read, &poms[&rel].dir, &rel, &module)?;
+                let (module_rel, bytes) = match resolve_module(read, &poms[&rel].dir, &rel, &module)
+                {
+                    Ok(found) => found,
+                    Err(refusal) => {
+                        skip(refusal)?;
+                        continue;
+                    }
+                };
                 if poms.contains_key(&module_rel) {
                     if !reactor.contains(&module_rel) {
                         reactor.push(module_rel);
                     }
                     continue;
                 }
-                let pom = Pom::parse(&module_rel, bytes)?;
+                let pom = match Pom::parse(&module_rel, bytes) {
+                    Ok(pom) => pom,
+                    Err(refusal) => {
+                        skip(refusal)?;
+                        continue;
+                    }
+                };
                 let nested = NESTED_MVN_FILES.iter().find(|f| {
                     !pom.dir.is_empty() && read(&format!("{}/.mvn/{f}", pom.dir)).is_some()
                 });
-                if let Some(f) = nested {
+                if nested.is_some() && hosted {
+                    nested_mvn.push(pom.dir.clone());
+                } else if let Some(f) = nested {
                     return Err(shape_refusal(
                         "nested_mvn_dir",
                         format!(
@@ -2192,8 +2358,13 @@ impl Reactor {
         for rel in &reactor {
             let mut cur = rel.clone();
             while !local_parent.contains_key(&cur) {
-                let Some(parent_rel) = local_parent_of(read, &mut poms, &cur)? else {
-                    break;
+                let parent_rel = match local_parent_of(read, &mut poms, &cur) {
+                    Ok(Some(parent_rel)) => parent_rel,
+                    Ok(None) => break,
+                    Err(refusal) => {
+                        skip(refusal)?;
+                        break;
+                    }
                 };
                 local_parent.insert(cur.clone(), parent_rel.clone());
                 if !scope.contains(&parent_rel) {
@@ -2205,6 +2376,7 @@ impl Reactor {
 
         Ok(Reactor {
             poms,
+            nested_mvn,
             reactor,
             scope,
             local_parent,
@@ -2625,7 +2797,10 @@ impl Reactor {
     /// Rewrite the base declarations of `rel` and record the
     /// warnings, the local roots not to pin, the local roots whose own
     /// top-level management already covers g:a, and the declarations left
-    /// at a version that may still read the base (`uncertain`).
+    /// at a version that may still read the base (`uncertain`). `outside`
+    /// says what a `${...}` version the checkout does not define reads in
+    /// every pom that reads the declaration, when its caller knows (hosted
+    /// mode asks what Maven selects; `None` leaves it `property_unresolved`).
     #[allow(clippy::too_many_arguments)]
     fn rewrite_declarations(
         &self,
@@ -2637,6 +2812,7 @@ impl Reactor {
         unpinned: &mut BTreeSet<String>,
         managed_roots: &mut BTreeSet<String>,
         uncertain: &mut BTreeSet<String>,
+        outside: &dyn Fn(&str, usize) -> Option<String>,
     ) {
         let doc = &self.poms[rel].doc;
         let ga = format!("{}:{}", patch.group_id, patch.artifact_id);
@@ -2712,8 +2888,13 @@ impl Reactor {
                 continue;
             };
             let declared = doc.text_of(version);
+            // What a version the checkout does not define reads in every
+            // pom that reads it, when the caller can tell.
+            let told = (declared.contains("${") && self.interpolate(rel, &declared).is_none())
+                .then(|| outside(rel, dep))
+                .flatten();
             let resolved = if declared.contains("${") {
-                match self.interpolate(rel, &declared) {
+                match self.interpolate(rel, &declared).or_else(|| told.clone()) {
                     Some(v) => v,
                     None => {
                         warnings.push(degraded(
@@ -2740,8 +2921,7 @@ impl Reactor {
                 // profiles: a pom that inherits this declaration and
                 // overrides the property, or a profile that does, must keep
                 // its own version, so the literal SV cannot go here.
-                let overridden = declared
-                    .contains("${")
+                let overridden = (declared.contains("${") && told.is_none())
                     .then(|| self.version_override(rel, &declared, patch.version, sv))
                     .flatten();
                 if let Some((v, p)) = overridden {
@@ -2983,29 +3163,21 @@ fn module_refs(doc: &Doc) -> Vec<String> {
 const DISCOVER_SUBPROJECTS: &str = "maven.project.discoverSubprojects";
 
 /// Whether Maven 4 discovers the subprojects of this pom on its own
-/// (`DefaultModelBuilder`, "subprojects discovery"): its model version is
-/// not 4.0.0 (the `<modelVersion>`, else the POM namespace), it is
-/// packaged `pom`, and it lists no top-level `<subprojects>` or
-/// `<modules>` entry. Maven 3 never discovers, and reads no 4.1.0 pom.
+/// (`DefaultModelBuilder`, "subprojects discovery"): its model is newer
+/// than 4.0.0 ([`Doc::is_maven_4_model`]), it is packaged `pom`, and it
+/// lists no top-level `<subprojects>` or `<modules>` entry. Maven 3 never
+/// discovers, and reads no 4.1.0 pom.
 fn discovers_subprojects(doc: &Doc) -> bool {
     let project = doc.project;
-    let model = doc.child_text(project, "modelVersion").or_else(|| {
-        let at = doc.masked.find(POM_NAMESPACE)? + POM_NAMESPACE.len();
-        let rest = &doc.masked[at..];
-        let end = rest.find(|c: char| !(c.is_ascii_alphanumeric() || c == '.'))?;
-        Some(rest[..end].to_string())
-    });
     let lists = |list: &str, item: &str| {
         doc.child(project, list)
             .is_some_and(|l| doc.children(l, item).next().is_some())
     };
-    model.is_some_and(|v| v != "4.0.0")
+    doc.is_maven_4_model()
         && doc.child_text(project, "packaging").as_deref() == Some("pom")
         && !lists("subprojects", "subproject")
         && !lists("modules", "module")
 }
-
-const POM_NAMESPACE: &str = "maven.apache.org/POM/";
 
 /// The subprojects Maven 4 discovers under the pom at `dir`: every direct
 /// subdirectory holding a `pom.xml`, hidden ones included, as
@@ -3777,6 +3949,19 @@ impl Doc {
 
     fn child_text(&self, n: usize, name: &str) -> Option<String> {
         self.child(n, name).map(|c| self.text_of(c))
+    }
+
+    /// Whether the pom is of a model only Maven 4 reads: the one reading
+    /// of a pom's model version every mode shares
+    /// ([`declared_maven::model_version_of`]: the `<modelVersion>`, else
+    /// the version the namespace names).
+    fn is_maven_4_model(&self) -> bool {
+        let project = &self.nodes[self.project];
+        declared_maven::model_version_of(
+            self.child_text(self.project, "modelVersion").as_deref(),
+            &self.masked[project.start..project.inner_start],
+        )
+        .is_some_and(|version| declared_maven::is_maven_4_model(&version))
     }
 
     /// The span of a text element's value: the trimmed text outside
@@ -8673,6 +8858,21 @@ mod tests {
         assert_eq!(tree(&empty_list, &[]), all);
         let namespace_only = IMPLICIT_ROOT.replace("  <modelVersion>4.1.0</modelVersion>\n", "");
         assert_eq!(tree(&namespace_only, &[]), all);
+        // A 4.0.0 model under the 4.1.0 namespace is a 4.0.0 pom: Maven 4
+        // discovers nothing for it (measured on 4.0.0-rc-7), and Maven 3,
+        // which never looks at the namespace, builds it.
+        let model_4_0_under_4_1 =
+            IMPLICIT_ROOT.replace("<modelVersion>4.1.0", "<modelVersion>4.0.0");
+        assert_ne!(model_4_0_under_4_1, IMPLICIT_ROOT);
+        assert_eq!(tree(&model_4_0_under_4_1, &[]), ["pom.xml"]);
+        // The namespace named only by another attribute is not the pom's.
+        let schema_only = namespace_only.replace(
+            "xmlns=\"http://maven.apache.org/POM/4.1.0\"",
+            "xsi:schemaLocation=\"http://maven.apache.org/POM/4.1.0 \
+             https://maven.apache.org/xsd/maven-4.1.0.xsd\"",
+        );
+        assert_ne!(schema_only, namespace_only);
+        assert_eq!(tree(&schema_only, &[]), ["pom.xml"]);
         for (value, discovers) in [
             ("true", true),
             ("TRUE", true),

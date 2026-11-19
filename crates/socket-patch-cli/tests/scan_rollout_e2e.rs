@@ -953,6 +953,102 @@ async fn hosted_upgrades_land_with_a_cap_of_zero() {
     );
 }
 
+/// A capped run that may admit nothing new still respells a
+/// `.mvn/maven.config` line an earlier release wrote, and takes the write
+/// lock for that. The cap is the rollout plan's, not the lock's: every new
+/// row is deferred whether or not the run holds the lock, so the respelled
+/// line is the only thing the run writes and no pin the cap forbade lands.
+#[tokio::test]
+async fn a_cap_of_zero_with_a_maven_config_to_heal_writes_nothing_but_the_heal() {
+    let mock = MockServer::start().await;
+    mount_api(&mock, |_| Grant::Granted).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let names9: Vec<&str> = PACKAGES.iter().map(|(n, _)| *n).collect();
+    write_project(tmp.path(), &names9);
+    // The six Trusted Checksums settings as releases up to 5.1.0 wrote
+    // them for every project.
+    let earlier = [
+        "-Daether.artifactResolver.postProcessor.trustedChecksums=true",
+        "-Daether.artifactResolver.postProcessor.trustedChecksums.checksumAlgorithms=SHA-256",
+        "-Daether.artifactResolver.postProcessor.trustedChecksums.failIfMissing=false",
+        "-Daether.trustedChecksumsSource.summaryFile=true",
+        "-Daether.trustedChecksumsSource.summaryFile.basedir=${session.rootDirectory}/.mvn/checksums",
+        "-Daether.trustedChecksumsSource.summaryFile.originAware=false",
+        "",
+    ]
+    .join("\n");
+    std::fs::create_dir_all(tmp.path().join(".mvn")).unwrap();
+    std::fs::write(tmp.path().join(".mvn/maven.config"), &earlier).unwrap();
+    // Every file of the project but the one the heal rewrites and the
+    // lock's own directory.
+    let snapshot = |root: &Path| -> std::collections::BTreeMap<String, Vec<u8>> {
+        fn walk(dir: &Path, root: &Path, out: &mut std::collections::BTreeMap<String, Vec<u8>>) {
+            for entry in std::fs::read_dir(dir).unwrap().flatten() {
+                let path = entry.path();
+                let rel = path
+                    .strip_prefix(root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                if rel == ".socket" || rel == ".mvn/maven.config" {
+                    continue;
+                }
+                if path.is_dir() {
+                    walk(&path, root, out);
+                } else {
+                    out.insert(rel, std::fs::read(&path).unwrap());
+                }
+            }
+        }
+        let mut out = std::collections::BTreeMap::new();
+        walk(root, root, &mut out);
+        out
+    };
+    let before = snapshot(tmp.path());
+
+    let capped = [
+        "--mode",
+        "hosted",
+        "--max-new-patches",
+        "0",
+        "--patch-server-url",
+        HOST,
+    ];
+    let v = run_json(tmp.path(), &mock, &capped);
+    // Nothing new was admitted: all nine are deferred, none is pinned.
+    assert_eq!(counts(&v), (0, 9, 0, 0), "{v}");
+    assert_eq!(deferred_names(&v).len(), 9, "{v}");
+    assert_eq!(pinned(tmp.path()), Vec::<String>::new(), "{v}");
+    assert_eq!(
+        snapshot(tmp.path()),
+        before,
+        "no file but the Maven config changed"
+    );
+    // The heal is what the run wrote.
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join(".mvn/maven.config")).unwrap(),
+        earlier.replace(
+            "${session.rootDirectory}",
+            "${maven.multiModuleProjectDirectory}"
+        )
+    );
+
+    // With a budget the same project then takes its pins, as ever.
+    let v = run_json(
+        tmp.path(),
+        &mock,
+        &[
+            "--mode",
+            "hosted",
+            "--max-new-patches",
+            "3",
+            "--patch-server-url",
+            HOST,
+        ],
+    );
+    assert_eq!(pinned(tmp.path()), names(&ORDER[..3]), "{v}");
+}
+
 #[tokio::test]
 async fn a_failed_reference_lookup_defers_new_rows_instead_of_failing() {
     let tmp = tempfile::tempdir().unwrap();
