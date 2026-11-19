@@ -2,9 +2,10 @@ name: Bazel patch compatibility (npm)
 
 # The npm flows of the real-Bazel tests (`npm::` in `e2e_bazel_build`):
 # hosted and vendored mode for a package that aspect_rules_js links from a
-# pnpm lock, on each Bazel release below. bazel-compatibility.yml holds the
-# legs and what every ecosystem shares; this file says when the npm legs run
-# and on which releases.
+# pnpm lock, and agent mode for the copy of it in `node_modules`, on each
+# Bazel release below. bazel-compatibility.yml holds the legs and what
+# every ecosystem shares; this file says when the npm legs run and on which
+# releases.
 #
 # Beyond what every leg needs, an npm leg downloads Node from nodejs.org and
 # ruleset archives from codeload.github.com; its repository cache holds them

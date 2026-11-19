@@ -1,8 +1,8 @@
 name: Bazel patch compatibility (PyPI)
 
-# The PyPI flow of the real-Bazel tests (`pypi::` in `e2e_bazel_build`):
-# hosted mode for a package that rules_python's `pip.parse` resolves from a
-# hashed `requirements.txt`, on each Bazel release below.
+# The PyPI flows of the real-Bazel tests (`pypi::` in `e2e_bazel_build`):
+# hosted and vendored mode for a package that rules_python's `pip.parse`
+# resolves from a hashed `requirements.txt`, on each Bazel release below.
 # bazel-compatibility.yml holds the legs and what every ecosystem shares;
 # this file says when the PyPI legs run and on which releases.
 #

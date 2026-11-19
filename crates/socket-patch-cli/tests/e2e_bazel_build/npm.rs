@@ -1,6 +1,7 @@
-//! Hosted and vendored mode for an npm package that aspect_rules_js links
-//! from a pnpm lock: `npm.npm_translate_lock(pnpm_lock = "//:pnpm-lock.yaml")`
-//! under Bzlmod, with a lock of `lockfileVersion: '9.0'`.
+//! Hosted, vendored and agent mode for an npm package that aspect_rules_js
+//! links from a pnpm lock:
+//! `npm.npm_translate_lock(pnpm_lock = "//:pnpm-lock.yaml")` under Bzlmod,
+//! with a lock of `lockfileVersion: '9.0'`.
 //!
 //! rules_js reads the lock itself. Every entry of `packages:` becomes one
 //! repository, which Bazel's downloader fetches from the entry's `tarball`
@@ -9,8 +10,9 @@
 //! pnpm runs, no `node_modules` of the checkout is read, and the machine
 //! needs no Node: the ruleset downloads the one that runs the consumer.
 //!
-//! Two flows, one test each, on the Bazel the run is given ([`FIXTURE`]
-//! says which ruleset goes with its release), each in a fresh output base:
+//! The hosted and the vendored flow, one test each, on the Bazel the run is
+//! given ([`FIXTURE`] says which ruleset goes with its release), each in a
+//! fresh output base:
 //!
 //! - (a) `bazel build` and `bazel run //:consumer` print the unpatched
 //!   marker, and Bazel fetched the upstream tarball from the stand-in
@@ -53,6 +55,12 @@
 //!
 //! Both flows assert the VEX document of their patch as `main.rs` says.
 //!
+//! A third flow is agent mode ([`agent_npm_translate_lock`]), which patches
+//! the copy of the package that the user's `pnpm install` left in
+//! `node_modules`. rules_js does not read that directory, so the build is
+//! the unpatched one before the command and after it. The flow asserts
+//! that, and what each form of `vex` then says of the package.
+//!
 //! A marker is read from what Bazel built. Bazel's downloader keeps every
 //! file it fetches in the repository cache, under its checksum, and hands it
 //! out again without a request; the tests of a leg share that cache, and CI
@@ -86,10 +94,10 @@ use socket_patch_core::utils::purl::canonical_purl;
 
 use crate::envelope::event_triples;
 use crate::harness::{
-    changed, fixture_path, rewrite, with_vex, Cell, Claim, Fixture, How, Ran, Run, StandIn, Tree,
-    CONSUMER, NOTHING,
+    cell_without_bazel, changed, fixture_path, rewrite, with_vex, Cell, Claim, Fixture, How, Ran,
+    Run, StandIn, Tree, CONSUMER, NOTHING,
 };
-use crate::hosted_memory_common::{Patch, ORG};
+use crate::hosted_memory_common::{read_tree, Patch, ORG};
 
 /// The workspace the tests build, and the ruleset each Bazel release builds
 /// it with.
@@ -314,7 +322,17 @@ fn grant(standin: &StandIn, upstream: &Package, patch: &Patched, served: &[u8]) 
     standin.api(&[granted]);
     // Priority 1: ahead of the shared API mock's patch record, whose hashes
     // are fixed, because vendored mode holds the downloaded file to `afterHash`.
-    let record = json!({
+    let record = record(upstream, patch);
+    let record = serde_json::to_vec(&record).expect("a JSON document");
+    let record_route = format!("/v0/orgs/{ORG}/patches/view/{}", patch.uuid);
+    standin.serve(1, &record_route, &record);
+    standin.serve(5, &patch.route, served);
+}
+
+/// The record of `patch`: the entry file of `upstream` becomes the one of
+/// the patch.
+fn record(upstream: &Package, patch: &Patched) -> Value {
+    json!({
         "uuid": patch.uuid,
         "purl": PURL,
         "publishedAt": "2026-01-01T00:00:00Z",
@@ -328,11 +346,51 @@ fn grant(standin: &StandIn, upstream: &Package, patch: &Patched, served: &[u8]) 
         "description": "fixture",
         "license": "MIT",
         "tier": "free",
-    });
-    let record = serde_json::to_vec(&record).expect("a JSON document");
+    })
+}
+
+/// The Socket API on `standin` for agent mode: `patch` of `upstream`, free
+/// for every caller, with a record that carries both entry files. Agent
+/// mode patches the installed copy from that record and asks for no
+/// tarball.
+fn grant_installed(standin: &StandIn, upstream: &Package, patch: &Patched) {
+    let granted = Patch {
+        purl: PURL.to_string(),
+        uuid: patch.uuid.clone(),
+        reference: json!({ "status": "granted", "purl": PURL }),
+    };
+    standin.api(&[granted]);
+    let b64 = |text: &str| base64::engine::general_purpose::STANDARD.encode(text);
+    let mut record = record(upstream, patch);
+    let file = &mut record["files"]["package/index.js"];
+    file["blobContent"] = b64(&patch.package.index_js).into();
+    file["beforeBlobContent"] = b64(&upstream.index_js).into();
     let record_route = format!("/v0/orgs/{ORG}/patches/view/{}", patch.uuid);
-    standin.serve(1, &record_route, &record);
-    standin.serve(5, &patch.route, served);
+    standin.serve(1, &record_route, record.to_string().as_bytes());
+}
+
+/// The directory of the package in pnpm's virtual store, from the checkout.
+fn store() -> String {
+    let entry = format!("{}@{VERSION}", NAME.replace('/', "+"));
+    format!("node_modules/.pnpm/{entry}/node_modules/{NAME}")
+}
+
+/// What the user's `pnpm install` leaves in the checkout of `cell` for the
+/// package: the two files of `upstream`'s tarball in pnpm's virtual store,
+/// and the link to that directory which a `require` of the project
+/// resolves. No pnpm runs here, so the files pnpm keeps for itself
+/// (`.modules.yaml`, the store's `lock.yaml`) are not there. Gives the entry
+/// file, from the checkout.
+fn install(cell: &Cell, upstream: &Package) -> String {
+    let store = store();
+    cell.write(&format!("{store}/package.json"), MANIFEST);
+    let entry = format!("{store}/index.js");
+    cell.write(&entry, &upstream.index_js);
+    let link = cell.path(&format!("node_modules/{NAME}"));
+    std::fs::create_dir_all(link.parent().expect("the scope")).expect("create the scope");
+    let target = store.replacen("node_modules/", "../", 1);
+    std::os::unix::fs::symlink(target, &link).expect("link the package");
+    entry
 }
 
 /// Send Bazel's downloader to `standin` for the registry's files of the
@@ -698,6 +756,127 @@ fn vendored_npm_translate_lock() {
         standin.asked(&patch.route),
         started.elapsed()
     );
+}
+
+/// Agent mode in the checkout of `cell`, where [`install`] left the
+/// package with the entry file `entry`: `scan --mode agent --yes` patches
+/// the installed copy, from the record of `patch`, and changes no other
+/// file of the project, and the `apply` of a later install finds it
+/// patched. Each of the two writes the document of its run, and `vex` and
+/// `vex --no-verify` write theirs: all four attest the package through the
+/// patch. Gives the files of the checkout.
+fn patches_the_installed_copy(
+    cell: &Cell,
+    standin: &StandIn,
+    patch: &Patched,
+    entry: &str,
+) -> Tree {
+    let test = &cell.test;
+    let before = cell.tree();
+    let claim = Claim::new(PURL, &patch.uuid, How::Agent);
+    let run = |cell: &Cell, args: &[&str]| socket_patch(cell, standin, args);
+
+    let in_run = cell.document("in-run");
+    let agent = ["scan", "--mode", "agent", "--yes"];
+    let scan = run(cell, &[&agent[..], &with_vex(&in_run)].concat());
+    let said = &scan.dump;
+    assert_eq!(scan.code, 0, "{test}: {said}");
+    assert_eq!(scan.envelope["status"], "success", "{test}: {said}");
+    assert_eq!(scan.envelope["summary"]["applied"], 1, "{test}: {said}");
+    let patched = cell.tree();
+    let wrote = changed(&before, &patched);
+    let outside: Vec<&String> = wrote
+        .iter()
+        .filter(|file| !file.starts_with(".socket/"))
+        .collect();
+    assert_eq!(outside, [entry], "{test}: {said}");
+    let installed = patched[entry] == patch.package.index_js.as_bytes();
+    assert!(installed, "{test}: {entry} is not the patched file");
+    cell.wrote_in_run(&scan, &in_run, &claim);
+
+    let again = cell.document("apply");
+    let apply = run(cell, &[&["apply"][..], &with_vex(&again)].concat());
+    cell.wrote_in_run(&apply, &again, &claim);
+    cell.stands_alone(run, &claim, true);
+    cell.stands_alone(run, &claim, false);
+    assert_eq!(changed(&patched, &cell.tree()), NOTHING, "{test}");
+    patched
+}
+
+/// Agent mode beside a hub that builds the package from the lock: what
+/// `socket-patch` does today.
+///
+/// - (a) After the user's `pnpm install` ([`install`]), `bazel build` and
+///   `bazel run //:consumer` print the unpatched marker: rules_js builds
+///   the package from the tarball the lock names, and reads no
+///   `node_modules` of the checkout, which `.bazelignore` names.
+/// - (b) `scan --mode agent --yes` patches the copy in `node_modules`, and
+///   `apply` finds it patched ([`patches_the_installed_copy`]). Every form
+///   of `vex` writes a document that says the package is not affected.
+/// - (c) The same two Bazel commands print the unpatched marker again, and
+///   `vex` writes that document again: it says of the build what holds for
+///   a program that loads `node_modules`.
+#[test]
+#[ignore = "real Bazel; run with --ignored"]
+fn agent_npm_translate_lock() {
+    let test = "npm::agent_npm_translate_lock";
+    let started = Instant::now();
+    let Some((cell, standin, upstream)) = open(test) else {
+        return;
+    };
+    let release = cell.release().to_string();
+    let patch = Patched::new();
+    grant_installed(&standin, &upstream, &patch);
+
+    // (a) The unpatched build, with the installed tree beside it.
+    let entry = install(&cell, &upstream);
+    builds_upstream(&cell, &standin, &upstream);
+
+    // (b) Agent mode patches the installed copy, and attests it.
+    let patched = patches_the_installed_copy(&cell, &standin, &patch, &entry);
+
+    // (c) The build is the one of (a): Bazel never reads the patched copy.
+    cell.builds(&upstream.marker);
+    assert_eq!(changed(&patched, &cell.tree()), NOTHING, "{test}");
+    let claim = Claim::new(PURL, &patch.uuid, How::Agent);
+    let run = |cell: &Cell, args: &[&str]| socket_patch(cell, &standin, args);
+    cell.stands_alone(run, &claim, true);
+
+    println!(
+        "{test}: Bazel {release} built {:?} before and after `scan --mode agent` patched {}; \
+         every form of `vex` attested the package; {:?}",
+        upstream.marker,
+        store(),
+        started.elapsed()
+    );
+}
+
+/// Without a Bazel: the fixture in a checkout of its own, with the lock
+/// that pins the upstream package of this run and the stand-in that holds
+/// it, as [`open`] makes them.
+fn checkout() -> (Cell, StandIn, Package) {
+    let cell = cell_without_bazel("9.3.2");
+    for part in ["common", "e9"] {
+        for (rel, bytes) in read_tree(&fixture_path(FIXTURE.dir).join(part)) {
+            cell.write(&rel, bytes);
+        }
+    }
+    cell.write(".git/HEAD", "ref: refs/heads/main\n");
+    let upstream = Package::upstream();
+    cell.write(LOCK, lock_pinning(&upstream));
+    let standin = registry(&upstream);
+    (cell, standin, upstream)
+}
+
+/// Without a Bazel: step (b) of [`agent_npm_translate_lock`] in the
+/// fixture's checkout, where `MODULE.bazel` hands the lock to rules_js.
+#[test]
+fn an_installed_patch_beside_a_hub_that_reads_the_lock() {
+    let (cell, standin, upstream) = checkout();
+    let patch = Patched::new();
+    grant_installed(&standin, &upstream, &patch);
+    let entry = install(&cell, &upstream);
+    patches_the_installed_copy(&cell, &standin, &patch, &entry);
 }
 
 /// Without a Bazel, what stays fixed now that no sum is committed: the
