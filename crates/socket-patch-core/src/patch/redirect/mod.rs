@@ -32230,6 +32230,118 @@ packages:
         );
     }
 
+    /// A Gemfile with more than one top-level `source` line makes bundler
+    /// 2.2 to 2.7 write ONE `GEM` section naming every one of them (the
+    /// locks below are what 2.5.22 and 2.6.9 write), and `bundle lock`
+    /// leaves that lock as it is. The gem is still refused whole, but the
+    /// warning names the Gemfile's sources as the cause and the remedy that
+    /// works: the extra source in a `source "<url>" do … end` block. It does
+    /// not blame an old bundler, does not send the user to a `bundle lock`
+    /// that changes nothing by itself, and offers agent mode only (vendored
+    /// mode refuses a gem in a `group` block or with a native extension,
+    /// which the planner cannot tell apart here). #2162.
+    #[test]
+    fn gem_lock_of_a_gemfile_with_several_top_level_sources_names_the_block_remedy() {
+        let specs = "  specs:\n    rack (2.2.8)\n    rack-test (2.1.0)\n      rack (>= 1.3)\n\n\
+                     PLATFORMS\n  ruby\n  x86_64-linux\n\n\
+                     DEPENDENCIES\n  rack (= 2.2.8)\n  rack-test (= 2.1.0)\n\n";
+        let remotes = "GEM\n  remote: https://rubygems.org/\n  remote: https://user:secret@gems.acme.example/private/\n";
+        let locks = [
+            format!("{remotes}{specs}BUNDLED WITH\n   2.5.22\n"),
+            format!(
+                "{remotes}{specs}CHECKSUMS\n  rack (2.2.8) sha256={}\n  rack-test (2.1.0) sha256={}\n\n\
+                 BUNDLED WITH\n   2.6.9\n",
+                "2".repeat(64),
+                "3".repeat(64)
+            ),
+        ];
+        let gemfiles = [
+            "source \"https://rubygems.org\"\nsource \"https://user:secret@gems.acme.example/private/\"\n\n\
+             gem \"rack\", \"2.2.8\"\n\ngroup :test do\n  gem \"rack-test\", \"2.1.0\"\nend\n",
+            // CRLF, and the second source in call parentheses.
+            "source 'https://rubygems.org'\r\nsource('https://user:secret@gems.acme.example/private/')\r\n\r\n\
+             gem \"rack\", \"2.2.8\"\r\n\r\ngroup :test do\r\n  gem \"rack-test\", \"2.1.0\"\r\nend\r\n",
+        ];
+        for lock in &locks {
+            for gemfile in gemfiles {
+                let lock = if gemfile.contains('\r') {
+                    lock.replace('\n', "\r\n")
+                } else {
+                    lock.clone()
+                };
+                for (gem, version) in [("rack", "2.2.8"), ("rack-test", "2.1.0")] {
+                    let (out, locked, r) = gem_redirect(gemfile, &lock, gem_override(gem, version));
+                    assert!(
+                        r.files.is_empty() && r.edits.is_empty(),
+                        "neither file may be touched: files={:?} edits={:?}",
+                        r.files.keys(),
+                        r.edits
+                    );
+                    assert_eq!((out.as_str(), &locked), (gemfile, &lock));
+                    assert_eq!(
+                        warning_codes(&r),
+                        vec!["redirect_gem_lock_unconvergeable"],
+                        "{:?}",
+                        r.warnings
+                    );
+                    let detail = &r.warnings[0].detail;
+                    assert!(
+                        detail.contains("Gemfile has 2 top-level `source` lines")
+                            && detail.contains("`source \"<url>\" do … end` block")
+                            && detail.contains("then run `bundle lock`")
+                            && detail.contains(&format!("patch {gem} with `--mode agent`")),
+                        "the cause and the remedy that works: {detail}"
+                    );
+                    assert!(
+                        !detail.contains("bundler < 2.2")
+                            && !detail.contains("with your current bundler")
+                            && !detail.contains("--mode vendored"),
+                        "no old-bundler blame, no bare `bundle lock`, no vendored offer: {detail}"
+                    );
+                    assert!(
+                        !detail.contains("secret"),
+                        "a source's credentials stay out of the warning: {detail}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The same lock under a Gemfile with ONE top-level source is a stale
+    /// lock, which `bundle lock` does rewrite (verified on bundler 2.5.22):
+    /// that remedy stays. A second `source` in a block, or as a `source:`
+    /// option, is no top-level source.
+    #[test]
+    fn gem_stale_multi_remote_lock_keeps_the_bundle_lock_remedy() {
+        let lock = "GEM\n  remote: https://rubygems.org/\n  remote: https://gems.acme.example/\n  specs:\n    \
+                    rack (2.2.8)\n\nPLATFORMS\n  ruby\n\nDEPENDENCIES\n  rack (= 2.2.8)\n\n\
+                    BUNDLED WITH\n   2.5.22\n";
+        for gemfile in [
+            "source \"https://rubygems.org\"\n\ngem \"rack\", \"2.2.8\"\n",
+            "source \"https://rubygems.org\"\nsource \"https://rubygems.org/\"\n\ngem \"rack\", \"2.2.8\"\n",
+            "source \"https://rubygems.org\"\n\ngem \"rack\", \"2.2.8\"\n\n\
+             source \"https://gems.acme.example/\" do\n  gem \"acme\"\nend\n",
+            "source \"https://rubygems.org\"\n\ngem \"rack\", \"2.2.8\"\n\
+             gem \"acme\", source: \"https://gems.acme.example/\"\n",
+        ] {
+            let (_, _, r) = gem_redirect(gemfile, lock, gem_override("rack", "2.2.8"));
+            assert!(r.files.is_empty() && r.edits.is_empty(), "{:?}", r.edits);
+            assert_eq!(
+                warning_codes(&r),
+                vec!["redirect_gem_lock_unconvergeable"],
+                "{:?}",
+                r.warnings
+            );
+            let detail = &r.warnings[0].detail;
+            assert!(
+                detail.contains("names 2 remotes")
+                    && detail.contains("run `bundle lock` with your current bundler")
+                    && !detail.contains("top-level"),
+                "{detail}\n{gemfile}"
+            );
+        }
+    }
+
     /// B1: lock shapes that cannot record the Socket source — a multi-remote
     /// GEM section under a bundler >= 2.2, a spec duplicated across GEM
     /// sections, no DEPENDENCIES section, a lock that names no bundler —
