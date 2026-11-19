@@ -1,8 +1,22 @@
-load("@rules_go//go:def.bzl", "go_binary")
+load("@gazelle//:def.bzl", "gazelle")
+load("@rules_go//go:def.bzl", "go_binary", "go_library")
 
 # Prints OUT: PRISTINE until the module is patched.
 go_binary(
     name = "consumer",
+    embed = [":consumer_lib"],
+    visibility = ["//visibility:public"],
+)
+
+# This file is what `bazel run //:gazelle` writes for it: a run changes
+# nothing here.
+# gazelle:prefix example.com/consumer
+gazelle(name = "gazelle")
+
+go_library(
+    name = "consumer_lib",
     srcs = ["main.go"],
+    importpath = "example.com/consumer",
+    visibility = ["//visibility:private"],
     deps = ["@com_example_upstream//:upstream"],
 )

@@ -53,7 +53,7 @@ pub const GO_PATCHES_DIR: &str = ".socket/go-patches";
 /// Project-relative directory holding `vendor`'s committed module copies
 /// (`<GO_VENDOR_DIR>/<patch-uuid>/<module>@<version>`). A `replace` whose
 /// target path is under this prefix is owned by [`ReplaceOwner::Vendor`].
-const GO_VENDOR_DIR: &str = ".socket/vendor/golang";
+pub(crate) const GO_VENDOR_DIR: &str = ".socket/vendor/golang";
 
 /// Module-path namespace of Socket's hosted patched Go modules. A
 /// module-to-module `replace` whose RIGHT-hand module path is this prefix

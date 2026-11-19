@@ -38,6 +38,12 @@
 //!   5. The source project's `vendor --revert` restores every byte, and
 //!      nothing is left to attest.
 //!
+//! Another test pins which local repository a build uses when the
+//! project's `.mvn/maven.config` names one (`-Dmaven.repo.local`): real
+//! Maven resolves into it rather than the one `MAVEN_OPTS` names, the
+//! command line (`MAVEN_ARGS`, Maven 3.9+) overrides it, and socket-patch
+//! given the same environment patches the artifact in that same repository.
+//!
 //! Gated like the other real-toolchain capstones: `#[ignore]` (network to
 //! Maven Central for the fixture), toolchain selection and the
 //! `SOCKET_PATCH_MAVEN_E2E_{MVN,VERSION,REQUIRED}` gates in
@@ -1251,4 +1257,162 @@ mod mediation {
         // and no pom of this project names it: a range selects another.
         unselected(Shape::Ranged).expect("the local repository is warm");
     }
+}
+
+/// Every file under `from`, copied to the same place under `to`.
+fn copy_tree(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for entry in std::fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        let target = to.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_tree(&entry.path(), &target);
+        } else {
+            std::fs::copy(entry.path(), &target).unwrap();
+        }
+    }
+}
+
+/// The local repository of a build is the one Maven itself takes: the
+/// project's `.mvn/maven.config` (`-Dmaven.repo.local`) over `MAVEN_OPTS`,
+/// and the command line (`MAVEN_ARGS`, which Maven 3.9+ reads) over the
+/// config. Maven is asked first, with no repository on its command line;
+/// socket-patch, in the same environment and with no `MAVEN_REPO_LOCAL`,
+/// then patches and restores the artifact in that same repository.
+#[test]
+#[ignore = "real Maven + Maven Central (fixture); run with --ignored"]
+fn maven_config_local_repository_is_the_one_maven_and_socket_patch_use() {
+    let Some(mvn) = Mvn::detect(SUITE) else {
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let root: PathBuf = tmp.path().canonicalize().unwrap();
+    let proj = root.join("proj");
+    let home = root.join("home");
+    let [from_config, from_opts, from_args] =
+        ["repo-config", "repo-opts", "repo-args"].map(|name| root.join(name));
+    let settings = root.join("settings.xml");
+    write_settings(&settings, &[]);
+    std::fs::create_dir_all(proj.join(".mvn")).unwrap();
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(proj.join("pom.xml"), consumer_pom(VERSION)).unwrap();
+    std::fs::write(
+        proj.join(".mvn/maven.config"),
+        format!("-Dmaven.repo.local={}\n", from_config.display()),
+    )
+    .unwrap();
+    // The JVM's own properties. `user.home` keeps a Maven that took none of
+    // these repositories out of the real `~/.m2`.
+    let opts = format!(
+        "-Duser.home={} -Dmaven.repo.local={}",
+        home.display(),
+        from_opts.display()
+    );
+    let goal = format!("{DEPENDENCY_PLUGIN}:copy-dependencies");
+    let resolve = |settings: &Path, extra: &[&str], maven_args: Option<&str>| {
+        let _ = std::fs::remove_dir_all(proj.join("target"));
+        let mut args = vec![goal.as_str(), "-DoutputDirectory=target/deps"];
+        args.extend_from_slice(extra);
+        mvn.run_unpinned(&proj, settings, &args, |cmd| {
+            cmd.env("MAVEN_OPTS", &opts);
+            if let Some(value) = maven_args {
+                cmd.env("MAVEN_ARGS", value);
+            }
+        })
+    };
+    let pom_leaf = format!("{ARTIFACT}-{VERSION}.pom");
+    let cached = |repo: &Path| repo_dir(repo, VERSION).join(&pom_leaf);
+
+    // 1. Maven: the config's repository, not the one MAVEN_OPTS names.
+    let out = with_central_fallback(SUITE, "maven.config resolution", &settings, |s, extra| {
+        resolve(s, extra, None)
+    });
+    if !ok(&out) {
+        skip(
+            SUITE,
+            &format!("resolving against Maven Central failed:\n{}", dump(&out)),
+        );
+        return;
+    }
+    assert!(
+        cached(&from_config).is_file(),
+        "Maven {} did not resolve into the repository .mvn/maven.config names:\n{}",
+        mvn.version,
+        dump(&out)
+    );
+    assert!(
+        !from_opts.exists() && !home.join(".m2/repository").exists(),
+        "Maven {} used another repository as well",
+        mvn.version
+    );
+
+    // 2. socket-patch: the same repository.
+    let pristine = std::fs::read(cached(&from_config)).unwrap();
+    let patched = [
+        pristine.as_slice(),
+        b"<!-- socket-patch maven.config e2e -->\n",
+    ]
+    .concat();
+    stage_manifest_of(
+        &proj,
+        &purl(),
+        &format!("package/{pom_leaf}"),
+        &pristine,
+        &patched,
+    );
+    std::fs::write(
+        proj.join(".socket/blobs").join(git_sha256(&pristine)),
+        &pristine,
+    )
+    .unwrap();
+    // `--preserve-state`: a rollback otherwise drops the record it restored.
+    let agent = |command: &str, maven_args: Option<&str>| {
+        let mut cmd = hermetic::command(&binary());
+        hermetic::scrub_extra(&mut cmd, &[hermetic::Extra::Venv]);
+        prebuilt_common::jvm_env::isolate_cli(&mut cmd);
+        if command == "rollback" {
+            cmd.args(["rollback", "--preserve-state"]);
+        } else {
+            cmd.arg(command);
+        }
+        cmd.args(["--json", "--offline", "--cwd"])
+            .arg(&proj)
+            .env("MAVEN_OPTS", &opts)
+            .env_remove("MAVEN_REPO_LOCAL")
+            .env_remove("M2_HOME");
+        if let Some(value) = maven_args {
+            cmd.env("MAVEN_ARGS", value);
+        }
+        let out = cmd.output().expect("run socket-patch");
+        assert!(out.status.success(), "{command}: {}", dump(&out));
+    };
+    agent("apply", None);
+    assert_eq!(std::fs::read(cached(&from_config)).unwrap(), patched);
+    agent("rollback", None);
+    assert_eq!(std::fs::read(cached(&from_config)).unwrap(), pristine);
+
+    // 3. The command line is merged over the config. Maven before 3.9 does
+    //    not read MAVEN_ARGS.
+    if mvn.numeric() < vec![3, 9, 0] {
+        println!(
+            "{SUITE}: Maven {} does not read MAVEN_ARGS; the command-line leg is skipped",
+            mvn.version
+        );
+        return;
+    }
+    copy_tree(&from_config, &from_args);
+    std::fs::remove_dir_all(repo_dir(&from_config, VERSION)).unwrap();
+    let args_value = format!("-Dmaven.repo.local={}", from_args.display());
+    // Offline, only the repository that still holds the artifact resolves.
+    let out = resolve(&settings, &["-o"], Some(&args_value));
+    assert!(
+        ok(&out),
+        "Maven {} did not take the repository MAVEN_ARGS names over the config's:\n{}",
+        mvn.version,
+        dump(&out)
+    );
+    agent("apply", Some(&args_value));
+    assert_eq!(std::fs::read(cached(&from_args)).unwrap(), patched);
+    agent("rollback", Some(&args_value));
+    assert_eq!(std::fs::read(cached(&from_args)).unwrap(), pristine);
 }

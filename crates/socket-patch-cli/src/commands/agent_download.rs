@@ -309,30 +309,40 @@ pub(crate) fn files_with_both_hashes(patch: &PatchResponse) -> HashMap<String, P
     files
 }
 
-/// The summary after the multi-patch download loop. A run that changed
-/// nothing says so instead of claiming the patches were "saved".
-pub(crate) fn format_save_summary(
+/// The result line of a download that applies nothing after the save
+/// (`--save-only`): `Saved 2 patches to .socket/manifest.json (1 updated,
+/// 1 skipped).` A run that changed nothing says so instead of claiming the
+/// patches were saved.
+pub(crate) fn format_save_line(
     manifest_path: &Path,
     added: usize,
     updated: usize,
     skipped: usize,
     failed: usize,
 ) -> String {
-    let mut out = if added + updated > 0 {
-        format!("Patches saved to {}", manifest_path.display())
+    let saved = added + updated;
+    let mut out = if saved > 0 {
+        format!(
+            "Saved {} to {}",
+            crate::ui::plural(saved, "patch", "patches"),
+            manifest_path.display()
+        )
     } else {
         format!("No changes to {}", manifest_path.display())
     };
-    out.push_str(&format!("\n  Added: {added}"));
-    for (label, n) in [
-        ("Updated", updated),
-        ("Skipped", skipped),
-        ("Failed", failed),
-    ] {
-        if n > 0 {
-            out.push_str(&format!("\n  {label}: {n}"));
-        }
+    let notes: Vec<String> = [
+        (updated, "updated"),
+        (skipped, "skipped"),
+        (failed, "failed"),
+    ]
+    .into_iter()
+    .filter(|(n, _)| *n > 0)
+    .map(|(n, what)| format!("{n} {what}"))
+    .collect();
+    if !notes.is_empty() {
+        out.push_str(&format!(" ({})", notes.join(", ")));
     }
+    out.push('.');
     out
 }
 
@@ -1298,7 +1308,7 @@ pub(crate) async fn fetch_selected_patches(
     // The narrowing queries the API: show that something is happening
     // once selection (and get's confirm prompt) is done.
     let mut status = crate::ui::StatusLine::stderr(params.json, params.silent);
-    status.set("Preparing download...");
+    status.set("Preparing download");
     let (selected, warnings, views) = filter_to_installed_releases(
         selected,
         params.all_releases,
@@ -1309,14 +1319,12 @@ pub(crate) async fn fetch_selected_patches(
     .await;
     status.finish();
     prefetched.extend(views);
-    // No leading blank line: the caller's prompt or summary already ended
-    // its line.
-    if matches!(store, RecordStore::Manifest(_)) && !quiet {
-        eprintln!(
-            "Downloading {}...",
-            crate::ui::plural(selected.len(), "patch", "patches")
-        );
-    }
+    // The callers have already listed the patches (`scan`'s rows, `get`'s
+    // listing), so a downloaded patch is not named again here: the
+    // download shows on the status line. It shows only across each network
+    // wait below and is cleared before anything else can print, so a skip
+    // or error line never lands on it.
+    let mut progress = crate::ui::StatusLine::stderr(params.json, params.silent);
 
     let mut batch = FetchBatch {
         skipped: 0,
@@ -1357,7 +1365,7 @@ pub(crate) async fn fetch_selected_patches(
         |uuid| async move { (uuid, hold_back_debug(api_client.fetch_patch(uuid)).await) },
     ));
 
-    for search_result in &selected {
+    for (done, search_result) in selected.iter().enumerate() {
         let (purl, uuid) = (search_result.purl.as_str(), search_result.uuid.as_str());
 
         // Refusal FIRST (the dry-run preview's precedence): a preserved
@@ -1414,18 +1422,23 @@ pub(crate) async fn fetch_selected_patches(
         // these turns.
         let view = match prefetched.remove(uuid) {
             Some(patch) => Ok(Some(patch)),
-            None => match views.next().await {
-                Some((planned, view)) if planned == uuid => view.release(),
-                // Unreachable (the plan mirrors this loop's checks); a
-                // live fetch keeps the outcome right regardless.
-                _ => {
-                    debug_assert!(
-                        false,
-                        "view prefetch plan out of step with the download loop"
-                    );
-                    api_client.fetch_patch(uuid).await
+            None => {
+                progress.progress("Downloading patches", done, selected.len());
+                let next = views.next().await;
+                progress.finish();
+                match next {
+                    Some((planned, view)) if planned == uuid => view.release(),
+                    // Unreachable (the plan mirrors this loop's checks); a
+                    // live fetch keeps the outcome right regardless.
+                    _ => {
+                        debug_assert!(
+                            false,
+                            "view prefetch plan out of step with the download loop"
+                        );
+                        api_client.fetch_patch(uuid).await
+                    }
                 }
-            },
+            }
         };
         let patch = match view {
             Ok(Some(patch)) => patch,
@@ -1466,9 +1479,9 @@ pub(crate) async fn fetch_selected_patches(
             },
         };
         if action == PatchAction::Skipped {
-            if !quiet {
-                eprintln!("{}", format_record_skip(&patch.purl, "already in manifest"));
-            }
+            // No line of its own: the caller has listed the patch, and the
+            // run's result says it (`Applied 0 of 1 patch: 1 already
+            // patched.`, `No changes to <manifest> (1 skipped).`).
             batch.events.push(
                 PatchEvent::new(EventAction::Skipped, patch.purl.as_str())
                     .with_uuid(patch.uuid.as_str())
@@ -1542,6 +1555,7 @@ pub(crate) async fn fetch_selected_patches(
             }
             _ => PatchEvent::new(EventAction::Downloaded, patch.purl.as_str()),
         };
+        // A replaced record is worth its line; a new one has been listed.
         if let PatchAction::Updated { old_uuid } = &action {
             if !quiet {
                 // Defensive: a malformed/short UUID in the store must not
@@ -1552,8 +1566,6 @@ pub(crate) async fn fetch_selected_patches(
                     crate::ui::short_uuid(old_uuid)
                 );
             }
-        } else if !quiet {
-            eprintln!("  [{tag}] {}", normalize_purl(&patch.purl));
         }
         event = event.with_uuid(patch.uuid.as_str()).with_details(details);
         batch.events.push(tag_mode(event, batch.mode));
@@ -2302,21 +2314,18 @@ pub async fn download_and_apply_patches_into(
     }
     env.warnings.extend(warnings);
 
-    if !quiet {
-        eprintln!();
+    // The apply below says the run's result. With no apply to follow
+    // (`--save-only`), the save is the result.
+    if !quiet && apply_lock.is_none() {
         eprintln!(
             "{}",
-            format_save_summary(&manifest_path, added, updated, batch.skipped, batch.failed)
+            format_save_line(&manifest_path, added, updated, batch.skipped, batch.failed)
         );
     }
 
     // Auto-apply unless --save-only (the lock decision above).
     let mut apply_report: Option<ApplyRunReport> = None;
     if let Some(lock) = apply_lock {
-        if !quiet {
-            eprintln!();
-            eprintln!("Applying patches...");
-        }
         // Past the network, about to write to installed packages: a
         // hot-patch pass is no longer dropped at its time limit.
         crate::hot_patch::mark_apply_started();

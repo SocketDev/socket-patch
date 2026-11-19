@@ -180,7 +180,7 @@ pub fn project_dependency_set(root: &Path) -> Option<ProjectDependencySet> {
 /// bytes ([`locate_artifact`]), never for discovery. See
 /// [`all_local_roots_with`].
 pub fn all_local_roots(cwd: &Path) -> Vec<JvmCacheRoot> {
-    all_local_roots_with(cwd, &super::maven_crawler::JvmEnv::from_process())
+    all_local_roots_with(cwd, &super::maven_crawler::JvmEnv::for_project(cwd))
 }
 
 /// [`all_local_roots`] under the caches `env` names: the Gradle user home's

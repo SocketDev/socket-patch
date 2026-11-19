@@ -511,6 +511,13 @@ enum Driver {
     /// [`Driver::ScanVexSourceBlock`] whose `source … do` follows another
     /// statement and a `;` on its line (#1531).
     ScanVexSourceBlockAfterSemicolon,
+    /// [`Driver::ScanVex`] on a Gemfile with a second top-level `source`
+    /// line (#2162). Bundler 2.2 to 2.7 lock such a Gemfile into ONE `GEM`
+    /// section naming both remotes, which `bundle lock` writes again as it
+    /// is: the run refuses the gem, names the Gemfile's sources as the
+    /// cause, and the remedy it prescribes (the second source in a block,
+    /// `bundle lock`) makes the next scan wire the gem.
+    ScanVexTwoGlobalSources,
     /// A heredoc option continues beyond the declaration's physical line.
     ScanVexHeredocDeclaration,
     /// A double-quoted interpolation can itself contain a heredoc opener.
@@ -605,6 +612,9 @@ impl Driver {
             Driver::ScanVexTwin => "scan --mode hosted (Gemfile + gems.rb twin)",
             Driver::ScanVexGroupBlock => "scan --mode hosted (gem in a group block)",
             Driver::ScanVexSourceBlock => "scan --mode hosted (gem in a source block)",
+            Driver::ScanVexTwoGlobalSources => {
+                "scan --mode hosted (Gemfile with two top-level sources)"
+            }
             Driver::ScanVexSourceBlockAssignment => {
                 "scan --mode hosted (gem in a source block after `v = if … end`)"
             }
@@ -739,6 +749,11 @@ async fn redirect_scanned_project(
             if !bundler.at_least(4, 0) =>
         {
             Some("custom lockfiles need bundler >= 4")
+        }
+        // Before 2.2 the lock is the merged layout anyway; bundler 4
+        // refuses the Gemfile.
+        Driver::ScanVexTwoGlobalSources if !bundler.at_least(2, 2) || bundler.at_least(4, 0) => {
+            Some("a Gemfile with two top-level sources is locked into one multi-remote GEM section by bundler 2.2 to 2.7 only")
         }
         _ => None,
     };
@@ -919,6 +934,30 @@ async fn redirect_scanned_project(
             "source \"{up}/upstream\"\n\nsource \"{up}/upstream\" do\n  gem \"{DEP}\", \"{DEP_VERSION}\"\nend\n",
             up = server.uri()
         ),
+        Driver::ScanVexTwoGlobalSources => {
+            // A second gem server with a gem of its own, as a private
+            // server beside rubygems.org has.
+            let gem = build_gem(
+                &stage,
+                SECOND_SOURCE_GEM,
+                "1.0.0",
+                "second_only.rb",
+                TINY_LIB,
+                &[],
+            );
+            let second = IndexGem {
+                name: SECOND_SOURCE_GEM,
+                version: "1.0.0",
+                deps: vec![],
+                gem,
+            };
+            mount_compact_index(&server, "/second", &[second]).await;
+            format!(
+                "source \"{up}/upstream\"\nsource \"{up}/second\"\n\ngem \"{DEP}\"\n\
+                 gem \"{SECOND_SOURCE_GEM}\"\n",
+                up = server.uri()
+            )
+        }
         Driver::ScanVexSourceBlockAssignment => format!(
             "source \"{up}/upstream\"\n\nsource \"{up}/upstream\" do\n  v = if ENV[\"ZZ\"]\n    \"a\"\n  \
              else\n    \"b\"\n  end\n  w = case ENV[\"ZZ\"]\n      when \"x\" then \"a\"\n      \
@@ -1211,6 +1250,7 @@ async fn redirect_scanned_project(
         | Driver::ScanVexEvalGemfile
         | Driver::ScanVexGroupBlock
         | Driver::ScanVexSourceBlock
+        | Driver::ScanVexTwoGlobalSources
         | Driver::ScanVexSourceBlockAssignment
         | Driver::ScanVexSourceBlockMultiLineOpener
         | Driver::ScanVexSourceBlockBraces
@@ -1329,6 +1369,7 @@ async fn redirect_scanned_project(
         | Driver::ScanVexSourceBlockMultiLineOpener
         | Driver::ScanVexSourceBlockBraces
         | Driver::ScanVexSourceBlockAfterSemicolon => Some("redirect_gem_source_option"),
+        Driver::ScanVexTwoGlobalSources => Some("redirect_gem_lock_unconvergeable"),
         Driver::ScanVexHeredocDeclaration | Driver::ScanVexInterpolatedHeredocDeclaration => {
             Some("redirect_gem_unrecognized_declaration")
         }
@@ -1348,6 +1389,9 @@ async fn redirect_scanned_project(
             &pristine_gemfile,
             &pristine_lock,
         );
+        if driver == Driver::ScanVexTwoGlobalSources {
+            assert_two_global_sources_remedy_wires(&proj, &api, &index_url, &lock_before, &stdout);
+        }
         return None;
     }
     assert_eq!(
@@ -1449,6 +1493,7 @@ async fn redirect_scanned_project(
         | Driver::ScanVexMirrorAllEnv
         | Driver::ScanVexCustomGitSource
         | Driver::ScanVexSourceBlock
+        | Driver::ScanVexTwoGlobalSources
         | Driver::ScanVexSourceBlockAssignment
         | Driver::ScanVexSourceBlockMultiLineOpener
         | Driver::ScanVexSourceBlockBraces
@@ -1590,6 +1635,108 @@ fn assert_unwirable_declaration_redirects_nothing(
         "bundler {} must still install the untouched project:\n{}",
         bundler.version,
         String::from_utf8_lossy(&install.stderr)
+    );
+}
+
+/// The gem only the second source of [`Driver::ScanVexTwoGlobalSources`]
+/// serves.
+const SECOND_SOURCE_GEM: &str = "second_only";
+
+/// #2162, after the refused scan of [`Driver::ScanVexTwoGlobalSources`]:
+/// the fixture lock is the one multi-remote `GEM` section the report is
+/// about and `bundle lock` leaves it alone; the warning names the Gemfile's
+/// top-level sources and the block remedy, never an old bundler or
+/// vendored mode; and that remedy works: with the second source in a
+/// block, `bundle lock` gives each source a section, the next scan wires
+/// the gem, and bundler installs the pair frozen.
+fn assert_two_global_sources_remedy_wires(
+    proj: &Path,
+    api: &str,
+    index_url: &str,
+    lock_before: &str,
+    refused_stdout: &str,
+) {
+    assert_eq!(gem_remotes(lock_before).len(), 2, "{lock_before}");
+    assert_eq!(
+        lock_before.matches("GEM\n").count(),
+        1,
+        "one GEM section names both remotes:\n{lock_before}"
+    );
+    let relock = bundle(proj, &["lock"]);
+    assert!(relock.status.success(), "bundle lock failed");
+    assert_eq!(
+        std::fs::read_to_string(proj.join("Gemfile.lock")).unwrap(),
+        lock_before,
+        "`bundle lock` leaves the two-remote lock as it is"
+    );
+    for said in [
+        "Gemfile has 2 top-level `source` lines",
+        "do … end` block",
+        "--mode agent",
+    ] {
+        assert!(
+            refused_stdout.contains(said),
+            "the warning says {said:?}:\n{refused_stdout}"
+        );
+    }
+    for unsaid in ["bundler < 2.2", "--mode vendored"] {
+        assert!(
+            !refused_stdout.contains(unsaid),
+            "the warning must not say {unsaid:?}:\n{refused_stdout}"
+        );
+    }
+
+    // The remedy the warning names.
+    let gemfile = std::fs::read_to_string(proj.join("Gemfile")).unwrap();
+    let second = gemfile
+        .lines()
+        .nth(1)
+        .filter(|line| line.starts_with("source \"") && line.ends_with("/second\""))
+        .unwrap_or_else(|| panic!("the second top-level source: {gemfile}"));
+    let own_gem = format!("gem \"{SECOND_SOURCE_GEM}\"\n");
+    assert!(gemfile.ends_with(&own_gem), "{gemfile}");
+    let remedied = format!(
+        "{}\n{second} do\n  {own_gem}end\n",
+        gemfile
+            .replacen(&format!("{second}\n"), "", 1)
+            .replacen(&own_gem, "", 1)
+    );
+    std::fs::write(proj.join("Gemfile"), &remedied).unwrap();
+    let relock = bundle(proj, &["lock"]);
+    assert!(
+        relock.status.success(),
+        "bundle lock over the remedied Gemfile failed:\n{}",
+        String::from_utf8_lossy(&relock.stderr)
+    );
+    // The install the helper above ran is stale for the scan to come.
+    std::fs::remove_dir_all(proj.join("vendor")).expect("remove the materialization");
+    let (code, stdout, stderr) = run_hosted_scan(proj, api);
+    assert_eq!(code, 0, "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(
+        !stdout.contains("redirect_gem_lock_unconvergeable"),
+        "the remedied project is wired:\n{stdout}"
+    );
+    let wired = std::fs::read_to_string(proj.join("Gemfile")).unwrap();
+    assert_eq!(
+        wired,
+        with_source_option(&remedied, &format!("gem \"{DEP}\""), index_url),
+        "the declaration gains the `source:` option"
+    );
+    let lock = std::fs::read_to_string(proj.join("Gemfile.lock")).unwrap();
+    assert!(
+        gem_remotes(&lock).contains(&index_url),
+        "the lock records the patch source:\n{lock}"
+    );
+    let install = bundle_env(proj, &["install"], &[("BUNDLE_FROZEN", "true")]);
+    assert!(
+        install.status.success(),
+        "a frozen install must accept the wired pair:\n{}",
+        String::from_utf8_lossy(&install.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(proj.join("Gemfile.lock")).unwrap(),
+        lock,
+        "the frozen install leaves the lock alone"
     );
 }
 
@@ -3731,6 +3878,29 @@ async fn gem_hosted_gem_in_a_user_source_block_is_refused_and_still_installs() {
             redirect_scanned_project(label, Spelling::Gemfile, false, true, None, driver).await;
         assert!(fx.is_none(), "the {label} driver asserts in place");
     }
+}
+
+/// #2162: a Gemfile with two top-level `source` lines, which bundler 2.2 to
+/// 2.7 lock into one `GEM` section with two remotes. The scan refuses the
+/// gem and leaves the project installable, as for any lock it cannot
+/// follow; the warning names the two top-level sources and the remedy
+/// (the second source in a block, `bundle lock`), and after that remedy
+/// the same scan wires the gem and bundler installs it frozen. See
+/// [`assert_two_global_sources_remedy_wires`].
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "host capstone: shells out to a real ruby/gem/bundler (2.2 to 2.7 for this arm); \
+            the unpinned `test` job skips it, an e2e job with a pinned toolchain runs it via --ignored"]
+async fn gem_hosted_two_top_level_sources_are_refused_with_the_block_remedy() {
+    let fx = redirect_scanned_project(
+        "two-global-sources",
+        Spelling::Gemfile,
+        false,
+        true,
+        None,
+        Driver::ScanVexTwoGlobalSources,
+    )
+    .await;
+    assert!(fx.is_none(), "the driver asserts in place");
 }
 
 /// A pin socket-patch 5.0 / 5.1 wrote: the declaration replaced by a

@@ -10,6 +10,80 @@ pub fn plural(n: usize, one: &str, many: &str) -> String {
 
 const ELLIPSIS: &str = "...";
 
+/// `text` as it may be printed: without its control characters. For
+/// text that came from a service or a project's files, which is shown
+/// for reading and must never move the cursor, retitle the terminal or
+/// write to its clipboard. One-line fields only: a tab or a newline is a
+/// control character too.
+pub fn printable(text: &str) -> String {
+    text.chars().filter(|c| !c.is_control()).collect()
+}
+
+/// The worst severity (upper-cased; empty when none is named) and the
+/// ids to show for a set of advisories, each given as its id, its
+/// severity and its CVEs: an advisory is named by its CVEs, or by its own
+/// id when it has none. The ids are sorted, each once.
+pub fn worst_and_ids<'a>(
+    advisories: impl Iterator<Item = (&'a str, &'a str, &'a [String])>,
+) -> (String, Vec<String>) {
+    use socket_patch_core::api::ranking::severity_order;
+    let mut worst: Option<&str> = None;
+    let mut ids = Vec::new();
+    for (id, severity, cves) in advisories {
+        let severity = severity.trim();
+        if !severity.is_empty()
+            && worst.is_none_or(|w| severity_order(Some(severity)) < severity_order(Some(w)))
+        {
+            worst = Some(severity);
+        }
+        if cves.is_empty() {
+            ids.push(id.to_string());
+        } else {
+            ids.extend(cves.iter().cloned());
+        }
+    }
+    ids.sort();
+    ids.dedup();
+    (worst.map(str::to_uppercase).unwrap_or_default(), ids)
+}
+
+/// How a listing names the packages `purls` name: `name@version` when
+/// they are all of one ecosystem (the lines around them say which), the
+/// purl otherwise, where a bare name could be either's. The purl is in
+/// its display spelling (`canonical_purl`: no qualifiers, percent-decoded).
+/// One rule for `scan`, `list` and `vex`, so a package reads the same in
+/// each.
+pub fn package_names(purls: &[&str]) -> Vec<String> {
+    use socket_patch_core::utils::purl::{canonical_purl, purl_parts};
+    let parts: Vec<_> = purls.iter().map(|purl| purl_parts(purl)).collect();
+    let first = parts.first().and_then(|p| p.as_ref().map(|(ty, _, _)| ty));
+    let one_type = first.is_some()
+        && parts
+            .iter()
+            .all(|p| p.as_ref().map(|(ty, _, _)| ty) == first);
+    purls
+        .iter()
+        .zip(&parts)
+        .map(|(purl, parts)| match parts {
+            Some((_, name, version)) if one_type => format!("{name}@{version}"),
+            _ => canonical_purl(purl),
+        })
+        .collect()
+}
+
+/// `items` for a sentence, the first `shown` of them named: `a, b, c and
+/// 5 more`.
+pub fn folded(items: &[String], shown: usize) -> String {
+    if items.len() <= shown {
+        return items.join(", ");
+    }
+    format!(
+        "{} and {} more",
+        items[..shown].join(", "),
+        items.len() - shown
+    )
+}
+
 /// How far back from the cut point a word boundary is still preferred
 /// over a hard mid-word cut.
 const WORD_BOUNDARY_WINDOW: usize = 15;
@@ -273,6 +347,73 @@ pub(crate) fn shell_word(word: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn packages_of_one_ecosystem_are_named_without_it() {
+        assert_eq!(
+            package_names(&["pkg:npm/%40scope/a@1.0.0", "pkg:npm/b@2.0.0?x=1"]),
+            ["@scope/a@1.0.0", "b@2.0.0"]
+        );
+        assert_eq!(
+            package_names(&["pkg:npm/%40scope/a@1.0.0", "pkg:pypi/b@2.0.0"]),
+            ["pkg:npm/@scope/a@1.0.0", "pkg:pypi/b@2.0.0"]
+        );
+        assert_eq!(package_names(&["not a purl"]), ["not a purl"]);
+        assert!(package_names(&[]).is_empty());
+    }
+
+    /// One rule for the severity and the ids of a set of advisories,
+    /// wherever a patch is named in a line: the `list` row, `show`'s
+    /// title and the patch menu.
+    #[test]
+    fn worst_and_ids_names_advisories_by_cve_and_skips_blank_severities() {
+        let cves = |ids: &[&str]| ids.iter().map(|id| id.to_string()).collect::<Vec<_>>();
+        let (two, none, shared) = (cves(&["CVE-2", "CVE-1"]), cves(&[]), cves(&["CVE-1"]));
+        let advisories = [
+            ("GHSA-b", "moderate", two.as_slice()),
+            ("GHSA-a", " High ", none.as_slice()),
+            ("GHSA-c", "", shared.as_slice()),
+        ];
+        assert_eq!(
+            worst_and_ids(advisories.into_iter()),
+            (
+                "HIGH".to_string(),
+                vec![
+                    "CVE-1".to_string(),
+                    "CVE-2".to_string(),
+                    "GHSA-a".to_string()
+                ]
+            )
+        );
+        // No severity named at all: none is shown, not an empty one.
+        assert_eq!(
+            worst_and_ids([("GHSA-c", "  ", none.as_slice())].into_iter()),
+            (String::new(), vec!["GHSA-c".to_string()])
+        );
+        assert_eq!(
+            worst_and_ids(std::iter::empty()),
+            (String::new(), Vec::new())
+        );
+    }
+
+    #[test]
+    fn printable_drops_every_control_character() {
+        assert_eq!(printable("lib/a.js"), "lib/a.js");
+        assert_eq!(
+            printable("a\u{1b}]0;title\u{7}b\u{1b}[2Jc\r\n\td"),
+            "a]0;titleb[2Jcd"
+        );
+        assert_eq!(printable("é 漢字 \u{9b}31m"), "é 漢字 31m");
+    }
+
+    #[test]
+    fn folded_names_the_first_few_and_counts_the_rest() {
+        let items: Vec<String> = ["a", "b", "c", "d", "e"].map(String::from).to_vec();
+        assert_eq!(folded(&items, 3), "a, b, c and 2 more");
+        assert_eq!(folded(&items[..3], 3), "a, b, c");
+        assert_eq!(folded(&items[..1], 3), "a");
+        assert_eq!(folded(&[], 3), "");
+    }
 
     #[test]
     fn plural_counts() {

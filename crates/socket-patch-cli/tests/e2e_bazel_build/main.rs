@@ -6,7 +6,7 @@
 //! binary in it the way a user does, and builds again. What a test asserts,
 //! it reads from what Bazel built: the line `bazel run //:consumer` prints.
 //!
-//! The tests are `#[ignore]`d: they need a Bazel release and the network
+//! Those tests are `#[ignore]`d: they need a Bazel release and the network
 //! (the Bazel registry, the ruleset archives and the language toolchain),
 //! and a host that does not answer fails them. The package under test and
 //! every Socket host are loopback stand-ins.
@@ -19,12 +19,34 @@
 //! cargo test -p socket-patch-cli --test e2e_bazel_build -- --ignored go:: --nocapture
 //! ```
 //!
-//! A test takes its release from the Bazel it runs: the one
+//! The other tests of the target need neither and run with a plain
+//! `cargo test`: the checks of the harness and of the fixtures, and in
+//! `go.rs` the tests that run `socket-patch` in a checkout no Bazel builds
+//! and read the files it wrote.
+//!
+//! An `#[ignore]`d test takes its release from the Bazel it runs: the one
 //! `SOCKET_PATCH_BAZEL_E2E_BAZEL` names, else `bazel` on `PATH` (a bazelisk
 //! there picks its release as it does anywhere, from `USE_BAZEL_VERSION`).
-//! With no Bazel a test prints `SKIP <why>` and passes; with
+//! With no Bazel it prints `SKIP <why>` and passes; with
 //! `SOCKET_PATCH_BAZEL_E2E_REQUIRED=1` (CI) it fails instead. `harness.rs`
 //! lists the other variables.
+//!
+//! Every flow whose build is patched also holds `socket-patch` to the VEX
+//! document it writes about that build. The command of the mode writes one
+//! for its own run (`--vex`), in the checkout Bazel has built in; `vex`
+//! writes one before the patched build and after it, and one with
+//! `--no-verify`; after the undo `vex` writes none and removes the last;
+//! and the command and `vex` write the same two in a checkout with the
+//! same files that no Bazel has built in. Each document is one statement:
+//! the package under test is `not_affected`, through the patch of this
+//! run. The documents of a flow are also held to each other: they differ
+//! in their id, their times and the mark of `--no-verify`, and in no other
+//! string. Every form is told one product; `vex` without one, as a user
+//! types it, runs once after the patched build, where it names the project
+//! of the checkout's own `package.json` or `go.mod`, or writes no document
+//! where the fixture has no such file. Nothing in `socket-patch` reads a
+//! Bazel file for it, so these tests say for which workspaces the document
+//! and the build agree.
 //!
 //! A flow is one `#[ignore]`d test in its ecosystem's module, and its
 //! fixture is one directory of files that every release builds beside one

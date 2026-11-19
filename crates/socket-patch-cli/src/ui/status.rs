@@ -1,15 +1,34 @@
-//! A single self-rewriting status line ("Scanning packages...",
-//! "Querying API... (batch 3/7)").
+//! A single self-rewriting status line ("Scanning packages",
+//! "Reading patches [####----] 8/24").
 //!
-//! Deterministic by construction: no timer, no background thread, and
-//! every byte is written synchronously by a method call, so a `Vec<u8>`
-//! sink captures exactly what a terminal would receive.
+//! Every byte a method writes is written synchronously by that call, so a
+//! `Vec<u8>` sink captures exactly what a terminal would receive. The one
+//! thing that moves by itself is the activity mark of a command's stderr
+//! line: on a live terminal a ticker thread turns it, so a long step reads
+//! as work whether the command is waiting on the network or busy on the
+//! CPU. The ticker and the line's own methods write under one lock, and
+//! the ticker only ever redraws the line the last method call left, so it
+//! cannot interleave with them or outlive a cleared line.
 
 use std::fmt::Display;
-use std::io::{self, IsTerminal, Write};
+use std::io::{self, Write};
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
 
 /// Return to column 0 and erase the whole line.
 const CLEAR: &str = "\r\x1b[2K";
+
+/// Width of the bar in a [`StatusLine::progress`] line.
+const PROGRESS_CELLS: usize = 20;
+
+/// The activity mark's frames where glyphs are shown, and elsewhere. Each
+/// is one column wide.
+const TURNS: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+const TURNS_ASCII: [&str; 4] = ["|", "/", "-", "\\"];
+
+/// How often the ticker turns the mark.
+const TURN_EVERY: Duration = Duration::from_millis(80);
 
 /// A transient progress line on a terminal, or nothing at all elsewhere.
 ///
@@ -17,8 +36,8 @@ const CLEAR: &str = "\r\x1b[2K";
 ///   `TERM` is not `dumb`, not `--json`/`--silent`, not `SOCKET_DEBUG`):
 ///   [`set`](Self::set) redraws the line in place, always clearing first,
 ///   so a shorter message never leaves the tail of a longer one behind.
-///   Messages are cut to `width - 1` characters: a line that wraps can't
-///   be rewritten by `\r`.
+///   Messages are cut to fit: a line that wraps can't be rewritten by
+///   `\r`.
 /// - **not live**: `set` is a no-op and no `\r` or escape sequence is
 ///   ever written. [`finish_with`](Self::finish_with) still writes its
 ///   plain final line when `report` is on, so logs and pipes keep the
@@ -27,30 +46,146 @@ const CLEAR: &str = "\r\x1b[2K";
 /// Anything else printed while a line is showing must go through
 /// [`println`](Self::println), which clears the line, prints, and redraws.
 /// Dropping the value clears a still-visible line.
+///
+/// A command's line ([`stderr`](Self::stderr)) opens with an activity
+/// mark that keeps turning for as long as the line shows.
 pub(crate) struct StatusLine<W: Write> {
     out: W,
     live: bool,
     report: bool,
     width: usize,
-    current: Option<String>,
+    /// What the terminal's line holds, shared with the ticker.
+    shown: Arc<Mutex<Shown>>,
+    /// Turns the mark of a live stderr line; stopped on drop.
+    ticker: Option<Ticker>,
+}
+
+/// The state both writers of a line draw from.
+struct Shown {
+    /// The visible status, without its mark; `None` once cleared.
+    line: Option<String>,
+    /// The line opens with the activity mark.
+    activity: bool,
+    /// Which frame of the mark shows.
+    turn: usize,
+    /// How a progress bar and the mark are drawn.
+    style: super::Style,
+}
+
+/// The activity mark at `turn`, painted: the same mark wherever a wait
+/// is shown (the status line, the full-screen browser).
+pub(crate) fn activity_mark(turn: usize, style: super::Style) -> String {
+    let frame = if style.glyphs {
+        TURNS[turn % TURNS.len()]
+    } else {
+        TURNS_ASCII[turn % TURNS_ASCII.len()]
+    };
+    super::paint(frame, "36", style.color)
+}
+
+impl Shown {
+    /// The activity mark and its space, or nothing on a line without one.
+    fn mark(&self) -> String {
+        if !self.activity {
+            return String::new();
+        }
+        format!("{} ", activity_mark(self.turn, self.style))
+    }
+
+    /// The bytes that put the current line on the terminal's line, in one
+    /// write; `None` when nothing shows.
+    fn frame(&self) -> Option<String> {
+        self.line
+            .as_ref()
+            .map(|line| format!("{CLEAR}{}{line}", self.mark()))
+    }
+}
+
+/// A lock no panic elsewhere can take away: the state is a line of text.
+fn locked(shown: &Mutex<Shown>) -> MutexGuard<'_, Shown> {
+    shown
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// The thread that turns a live stderr line's mark. It holds the line's
+/// lock for each redraw and draws only what a method call left showing.
+struct Ticker {
+    /// Dropped to wake the thread and end it.
+    stop: Option<mpsc::Sender<()>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Ticker {
+    /// Turn the mark of `shown`, writing each redraw with `write`. `None`
+    /// if the thread cannot start: the mark then stands still, which costs
+    /// nothing but the motion.
+    fn start(
+        shown: Arc<Mutex<Shown>>,
+        mut write: impl FnMut(&[u8]) + Send + 'static,
+    ) -> Option<Ticker> {
+        let (stop, stopped) = mpsc::channel::<()>();
+        let thread = std::thread::Builder::new()
+            .name("status-line".to_string())
+            .spawn(move || {
+                // A timeout is a turn; a dropped sender is the end.
+                while let Err(RecvTimeoutError::Timeout) = stopped.recv_timeout(TURN_EVERY) {
+                    let mut shown = locked(&shown);
+                    if shown.line.is_none() {
+                        continue;
+                    }
+                    shown.turn = shown.turn.wrapping_add(1);
+                    if let Some(frame) = shown.frame() {
+                        write(frame.as_bytes());
+                    }
+                }
+            })
+            .ok()?;
+        Some(Ticker {
+            stop: Some(stop),
+            thread: Some(thread),
+        })
+    }
+}
+
+impl Drop for Ticker {
+    fn drop(&mut self) {
+        drop(self.stop.take());
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
 }
 
 impl StatusLine<io::Stderr> {
     /// The status line for a command's stderr. It reports (writes
     /// [`finish_with`](Self::finish_with) lines) unless `json` or
     /// `silent`, and is live only when it reports on a terminal that
-    /// understands escape sequences.
+    /// understands escape sequences and has a person at it
+    /// ([`super::attended`]: an agent's terminal gets no line, as a pipe
+    /// gets none). A live line opens with the activity mark, and a ticker
+    /// keeps it turning.
     ///
     /// Under `SOCKET_DEBUG` the line is never live: core's debug logging
     /// writes straight to stderr and would land on the end of the status.
     pub(crate) fn stderr(json: bool, silent: bool) -> Self {
         let human = !json && !silent;
         let live = human
-            && io::stderr().is_terminal()
+            && super::attended(super::Stream::Stderr)
             && super::vt().1
             && !std::env::var("TERM").is_ok_and(|t| t == "dumb")
             && !socket_patch_core::utils::env_compat::is_debug_enabled();
-        StatusLine::new(io::stderr(), live, human, super::stderr_width())
+        let mut line = StatusLine::new(io::stderr(), live, human, super::stderr_width())
+            .with_style(super::Style::stderr())
+            .with_activity();
+        if live {
+            line.ticker = Ticker::start(Arc::clone(&line.shown), |frame| {
+                let mut err = io::stderr().lock();
+                let _ = err.write_all(frame);
+                let _ = err.flush();
+            });
+        }
+        line
     }
 }
 
@@ -63,24 +198,101 @@ impl<W: Write> StatusLine<W> {
             live,
             report,
             width,
-            current: None,
+            shown: Arc::new(Mutex::new(Shown {
+                line: None,
+                activity: false,
+                turn: 0,
+                style: super::Style::PLAIN,
+            })),
+            ticker: None,
         }
     }
 
-    /// Show `msg` as the current status (replacing any previous one).
+    /// Draw progress bars and the mark in `style` (plain unless told).
+    pub fn with_style(self, style: super::Style) -> Self {
+        locked(&self.shown).style = style;
+        self
+    }
+
+    /// Open the line with the activity mark.
+    pub fn with_activity(self) -> Self {
+        locked(&self.shown).activity = true;
+        self
+    }
+
+    /// Show `msg` as the current status (replacing any previous one). On
+    /// a line with the activity mark a trailing `...` is dropped: the
+    /// turning mark already says the work is going on.
     pub fn set(&mut self, msg: impl Display) {
         if !self.live {
             return;
         }
-        let msg: String = msg.to_string();
+        let msg = msg.to_string();
+        let msg = if locked(&self.shown).activity {
+            msg.trim_end().trim_end_matches("...").trim_end()
+        } else {
+            msg.as_str()
+        };
         let fitted: String = msg
             .chars()
             .filter(|c| !c.is_control())
-            .take(self.width.saturating_sub(1).max(1))
+            .take(self.room())
             .collect();
-        let _ = write!(self.out, "{CLEAR}{fitted}");
+        self.draw(fitted);
+    }
+
+    /// Characters a status may hold: one short of the width, since a line
+    /// that wraps can't be rewritten by `\r`, less the activity mark and
+    /// its space.
+    fn room(&self) -> usize {
+        let mark = if locked(&self.shown).activity { 2 } else { 0 };
+        self.width.saturating_sub(1 + mark).max(1)
+    }
+
+    /// Redraw the line as `line`, which already fits.
+    fn draw(&mut self, line: String) {
+        let mut shown = locked(&self.shown);
+        shown.line = Some(line);
+        if let Some(frame) = shown.frame() {
+            let _ = self.out.write_all(frame.as_bytes());
+        }
         let _ = self.out.flush();
-        self.current = Some(fitted);
+    }
+
+    /// Show counted work as the current status: `label`, a bar and
+    /// `done/total`, e.g. `Reading patches [####--------] 8/24`. A `total`
+    /// of one has nothing to count, so it shows `label` alone (`label...`
+    /// on a line without the activity mark), and a terminal too narrow for
+    /// the bar shows the count without it.
+    pub fn progress(&mut self, label: impl Display, done: usize, total: usize) {
+        if !self.live {
+            return;
+        }
+        let (activity, style) = {
+            let shown = locked(&self.shown);
+            (shown.activity, shown.style)
+        };
+        if total <= 1 {
+            // The turning mark says "working"; without one the dots do.
+            return if activity {
+                self.set(label)
+            } else {
+                self.set(format!("{label}..."))
+            };
+        }
+        let label: String = label
+            .to_string()
+            .chars()
+            .filter(|c| !c.is_control())
+            .collect();
+        let count = format!("{done}/{total}");
+        let with_bar =
+            label.chars().count() + 1 + style.bar_width(PROGRESS_CELLS) + 1 + count.chars().count();
+        if with_bar > self.room() {
+            return self.set(format!("{label} {count}"));
+        }
+        let bar = style.bar(done, total, PROGRESS_CELLS);
+        self.draw(format!("{label} {bar} {count}"));
     }
 
     /// Print a permanent line (a warning or error) without garbling the
@@ -98,10 +310,13 @@ impl<W: Write> StatusLine<W> {
             .chars()
             .filter(|&c| c == '\n' || c == '\t' || !c.is_control())
             .collect();
-        self.clear();
+        let shown = locked(&self.shown);
+        if self.live && shown.line.is_some() {
+            let _ = write!(self.out, "{CLEAR}");
+        }
         let _ = writeln!(self.out, "{line}");
-        if let Some(cur) = &self.current {
-            let _ = write!(self.out, "{CLEAR}{cur}");
+        if let Some(frame) = shown.frame() {
+            let _ = self.out.write_all(frame.as_bytes());
         }
         let _ = self.out.flush();
     }
@@ -109,8 +324,11 @@ impl<W: Write> StatusLine<W> {
     /// Replace the status with a permanent result line (written when
     /// `report` is on, live or not).
     pub fn finish_with(&mut self, line: impl Display) {
-        self.clear();
-        self.current = None;
+        let mut shown = locked(&self.shown);
+        if self.live && shown.line.is_some() {
+            let _ = write!(self.out, "{CLEAR}");
+        }
+        shown.line = None;
         if self.report {
             let _ = writeln!(self.out, "{line}");
         }
@@ -119,16 +337,12 @@ impl<W: Write> StatusLine<W> {
 
     /// Erase the status, leaving nothing behind.
     pub fn finish(&mut self) {
-        self.clear();
-        self.current = None;
-        let _ = self.out.flush();
-    }
-
-    /// Erase the visible line (keeps `current` for a redraw).
-    fn clear(&mut self) {
-        if self.live && self.current.is_some() {
+        let mut shown = locked(&self.shown);
+        if self.live && shown.line.is_some() {
             let _ = write!(self.out, "{CLEAR}");
         }
+        shown.line = None;
+        let _ = self.out.flush();
     }
 
     /// The sink, for tests.
@@ -312,6 +526,199 @@ mod tests {
         let mut s = StatusLine::new(Vec::new(), true, true, 0);
         s.set("abc");
         assert_eq!(bytes(&s), "\r\x1b[2Ka");
+    }
+
+    #[test]
+    fn progress_draws_a_bar_and_a_count() {
+        let mut s = live();
+        s.progress("Reading patches", 5, 20);
+        assert_eq!(
+            render(bytes(&s).as_bytes()),
+            vec!["Reading patches [#####---------------] 5/20"]
+        );
+        s.progress("Reading patches", 20, 20);
+        assert_eq!(
+            render(bytes(&s).as_bytes()),
+            vec!["Reading patches [####################] 20/20"]
+        );
+        // One step has nothing to count.
+        s.progress("Checking 3 packages for patches", 0, 1);
+        assert_eq!(
+            render(bytes(&s).as_bytes()),
+            vec!["Checking 3 packages for patches..."]
+        );
+        // A terminal too narrow for the bar keeps the count; it never
+        // wraps.
+        let mut s = StatusLine::new(Vec::new(), true, true, 24);
+        s.progress("Reading patches", 5, 20);
+        assert_eq!(render(bytes(&s).as_bytes()), vec!["Reading patches 5/20"]);
+        let mut s = StatusLine::new(Vec::new(), true, true, 12);
+        s.progress("Reading patches", 5, 20);
+        assert_eq!(render(bytes(&s).as_bytes()), vec!["Reading pat"]);
+        // On a terminal that shows them, the bar is drawn in glyphs, and a
+        // line printed over it redraws it whole.
+        let fancy = crate::ui::Style {
+            color: true,
+            glyphs: true,
+        };
+        let mut s = StatusLine::new(Vec::new(), true, true, 80).with_style(fancy);
+        s.progress("Reading patches", 5, 20);
+        s.println("Warning: w");
+        assert_eq!(
+            render(bytes(&s).as_bytes()),
+            vec![
+                "Warning: w".to_string(),
+                format!("Reading patches {}{} 5/20", "━".repeat(5), "─".repeat(15)),
+            ]
+        );
+        // Not live: nothing at all.
+        let mut s = StatusLine::new(Vec::new(), false, true, 80);
+        s.progress("Reading patches", 5, 20);
+        assert!(s.into_inner().is_empty());
+    }
+
+    fn working() -> StatusLine<Vec<u8>> {
+        StatusLine::new(Vec::new(), true, true, 80).with_activity()
+    }
+
+    #[test]
+    fn an_activity_line_opens_with_the_mark_and_keeps_its_room() {
+        let mut s = working();
+        s.set("Scanning packages");
+        assert_eq!(bytes(&s), "\r\x1b[2K| Scanning packages");
+        s.println("Warning: w");
+        assert_eq!(
+            render(bytes(&s).as_bytes()),
+            vec!["Warning: w", "| Scanning packages"]
+        );
+        s.finish_with("Found 2 packages");
+        assert_eq!(
+            render(bytes(&s).as_bytes()),
+            vec!["Warning: w", "Found 2 packages"]
+        );
+        // The mark says the work is going on, so a message's own dots go.
+        let mut s = working();
+        s.set("Fetching patch 5435d265...");
+        assert_eq!(
+            render(bytes(&s).as_bytes()),
+            vec!["| Fetching patch 5435d265"]
+        );
+        // The mark and its space come out of the line's room: it never
+        // wraps.
+        let mut s = StatusLine::new(Vec::new(), true, true, 10).with_activity();
+        s.set("Scanning packages");
+        assert_eq!(render(bytes(&s).as_bytes()), vec!["| Scannin"]);
+        // Glyph terminals get the dots.
+        let fancy = crate::ui::Style {
+            color: false,
+            glyphs: true,
+        };
+        let mut s = working().with_style(fancy);
+        s.set("Scanning packages");
+        assert_eq!(render(bytes(&s).as_bytes()), vec!["⠋ Scanning packages"]);
+    }
+
+    /// What a ticker drew, and the sink it draws into.
+    fn ticking(s: &mut StatusLine<Vec<u8>>) -> Arc<Mutex<Vec<u8>>> {
+        let drawn = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&drawn);
+        s.ticker = Ticker::start(Arc::clone(&s.shown), move |frame| {
+            sink.lock().unwrap().extend_from_slice(frame)
+        });
+        assert!(s.ticker.is_some());
+        drawn
+    }
+
+    fn frames(drawn: &Mutex<Vec<u8>>) -> Vec<String> {
+        String::from_utf8(drawn.lock().unwrap().clone())
+            .unwrap()
+            .split(CLEAR)
+            .filter(|f| !f.is_empty())
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// Wait (up to a few seconds: the suite may be busy) for `enough`.
+    fn wait_for(enough: impl Fn() -> bool) {
+        for _ in 0..500 {
+            if enough() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("the ticker never drew");
+    }
+
+    /// The mark keeps turning while a line shows, whatever the command is
+    /// doing: nothing here awaits or calls the line between the turns.
+    #[test]
+    fn the_ticker_turns_the_mark_of_a_showing_line() {
+        let mut s = working();
+        let drawn = ticking(&mut s);
+        s.set("Scanning packages");
+        wait_for(|| frames(&drawn).len() >= 3);
+        let seen = frames(&drawn);
+        // Every redraw is the whole line, cleared first, and the mark
+        // walks its frames in order.
+        assert!(
+            seen.iter().all(|f| f.ends_with(" Scanning packages")),
+            "{seen:?}"
+        );
+        assert_eq!(
+            seen[..3],
+            [
+                "/ Scanning packages",
+                "- Scanning packages",
+                "\\ Scanning packages"
+            ]
+        );
+        assert!(!String::from_utf8(drawn.lock().unwrap().clone())
+            .unwrap()
+            .contains('\n'));
+        // A new status opens on the frame the mark has reached: it does
+        // not jump back.
+        let before = frames(&drawn).len();
+        s.set("Reading lockfiles");
+        wait_for(|| frames(&drawn).len() > before);
+        assert!(
+            frames(&drawn)
+                .last()
+                .unwrap()
+                .ends_with(" Reading lockfiles"),
+            "{:?}",
+            frames(&drawn)
+        );
+    }
+
+    /// The ticker draws only a line a method call left showing: nothing
+    /// before the first status, nothing after it is cleared, so a result
+    /// printed after `finish` can never be overwritten.
+    #[test]
+    fn the_ticker_draws_nothing_without_a_showing_line() {
+        let mut s = working();
+        let drawn = ticking(&mut s);
+        std::thread::sleep(TURN_EVERY * 3);
+        assert!(drawn.lock().unwrap().is_empty());
+        s.set("Scanning packages");
+        wait_for(|| !frames(&drawn).is_empty());
+        s.finish_with("Found 2 packages");
+        let after = drawn.lock().unwrap().len();
+        std::thread::sleep(TURN_EVERY * 3);
+        assert_eq!(drawn.lock().unwrap().len(), after);
+        // Dropping the line stops the thread.
+        drop(s);
+        assert_eq!(Arc::strong_count(&drawn), 1);
+    }
+
+    /// Off a terminal a command's line has no ticker at all (the test
+    /// process's stderr is not a terminal, or it is and the line is
+    /// cleared at once).
+    #[test]
+    fn a_line_that_is_not_live_starts_no_ticker() {
+        let s = StatusLine::stderr(true, false);
+        assert!(s.ticker.is_none());
+        let s = StatusLine::stderr(false, true);
+        assert!(s.ticker.is_none());
     }
 
     #[test]

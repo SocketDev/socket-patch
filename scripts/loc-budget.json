@@ -1,5 +1,11 @@
 {
   "groups": {
+    "bazel": {
+      "paths": [
+        "crates/socket-patch-core/src/bazel/"
+      ],
+      "max": 1134
+    },
     "lock-readers": {
       "paths": [
         "crates/socket-patch-core/src/origin.rs",

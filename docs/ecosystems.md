@@ -17,7 +17,7 @@ The backticked slug in each row is the value `-e`/`--ecosystems` accepts (e.g.
 | npm (`npm`) — pnpm / yarn / berry / bun / vlt | ✅ any install layout, vlt's `node_modules/.vlt` store included (every store copy, copy-on-write) | ✅ seven lockfile flavors: package-lock, yarn classic, yarn berry (node-modules linker; PnP refused), pnpm v9, pnpm legacy v5.4/v6.0 (`pnpm 7/8` — frozen installs are path-bound because those majors absolutize `file:` override specifiers; moved checkouts run one `pnpm install --offline --no-frozen-lockfile`, surfaced as `vendor_pnpm_legacy_absolute_specifier`), bun text `bun.lock` lockfileVersion 0/1/2/3 and native binary `bun.lockb` revisions 1/2/3 (binary locks stay binary; text workspace vendoring requires lockfileVersion 2 — see [Bun compatibility](testing/bun-compatibility.md)), vlt `vlt-lock.json` lockfileVersion 0/1 (patched package directories for direct dependencies of the root or a workspace member; transitive targets refused — see [vlt notes](#npm-vlt-notes)). Rush monorepos on pnpm 9 and newer are wired through `pnpm-config.json` and each directly-depending project's `package.json` — see [Rush notes](#npm-rush-monorepos) | ✅ package-lock / npm-shrinkwrap, pnpm-lock.yaml and legacy shrinkwrap.yaml (pnpm majors 1–12; block and flow resolutions), yarn classic, yarn berry, bun, vlt (`vlt-lock.json` without `lockfileVersion`, 0 or 1) — pnpm, berry, bun and vlt carry constraints, see [npm hosted-mode notes](#npm-hosted-mode-notes) and [vlt notes](#npm-vlt-notes) |
 | PyPI (`pypi`) — uv / poetry / pdm / pipenv / pip | ✅ in place | ✅ uv project/script locks, PEP 751 `pylock.toml` / `pylock.<name>.toml`, poetry, pdm, pipenv (Pipenv 2018 or later — every `Pipfile.lock` category is rewired, lock-only checkouts included; Pipenv 2023+ does not hash-check local wheels — `vendor_integrity_unverified`; Pipenv 2023.7.9+ exports the vendored wheel without a hash, so `pipenv requirements --hash` output fails pip's hash-checking mode — `pypi_pipenv_hash_export_unsupported`; a venv still holding the upstream release is reported as `pypi_pipenv_stale_install`; see [Pipenv compatibility](testing/pipenv-compatibility.md)), and requirements.txt. Native uv vendoring requires uv ≥ 0.2.35 (the `[[package]]` lock grammar); hosted mode covers native `uv.lock` from uv 0.1.45 (the first release whose `uv lock` writes one) and requirements from uv 0.0.5; see [uv compatibility](testing/uv-compatibility.md). | ✅ requirements.txt including hash continuations, uv project/script locks, and PEP 751 locks. Version/source ambiguity is refused; see [uv compatibility](testing/uv-compatibility.md). Poetry 1.x and 2.x locks are supported; Poetry 0.x ignores URL sources and is refused. See [Poetry compatibility](testing/poetry-compatibility.md). Pipenv `Pipfile.lock` (pipfile-spec 6 — Pipenv 7 and later; `path` references for 7–11, `file` from 2018; lock-only checkouts and Pipenv's out-of-tree venv are discovered; a warm venv that Pipenv will not reinstall over warns `redirect_pypi_stale_install`; see [Pipenv compatibility](testing/pipenv-compatibility.md)). `pdm.lock` is supported for the lock formats PDM 0.12–1.4 and 2.8.1+ write (`lock_version` 2 / 4.3–4.5.1); the identity-losing 3.1 / 4.0–4.2 formats (PDM 1.8–2.7) are refused. PDM 2.8.0 writes an indistinguishable `4.3` lock but shares that identity-loss bug, so a rewritten 2.8.0 lock crashes `pdm sync` — upgrade to ≥ 2.8.1. See [PDM compatibility](testing/pdm-compatibility.md). |
 | Cargo (`cargo`) | ✅ in-place + `.cargo-checksum.json` rewrite (shared registry-cache caveat — see [Cargo: shared registry cache](#cargo-shared-registry-cache)) | ✅ `[patch.crates-io]` path entry in the root `Cargo.toml` (v5; per-version Socket keys; pre-v5 `.cargo/config*` wiring migrates on re-run) | ✅ per-patch sparse registry (`[registries.socket-patch-<uuid>]` + Cargo.lock source/checksum); needs cargo 1.68+ (sparse registries) — a project whose `rust-version` or `rust-toolchain[.toml]` declares an older cargo is refused (`redirect_cargo_old_cargo`), use `--mode vendored`; direct dependencies only — a crate another dependency also pulls in is refused, use `--mode vendored`; a crate the user overrides with `[patch]` (path, git or another registry) is refused too, the override is left alone; a `cargo vendor` or `cargo local-registry` project (crates.io replaced by an on-disk source in the project's, a parent directory's or `$CARGO_HOME`'s `.cargo/config*`) is refused, use agent mode; with no `Cargo.lock` the graph is unknown, so only a project whose sole dependency is the patched crate is redirected |
-| RubyGems (`gem`) | ✅ in place | ✅ Gemfile + Gemfile.lock path pair (a CRLF `Gemfile.lock`, as a `core.autocrlf` checkout leaves it, is edited and reverted in its own line ending, and a lock mixing CRLF and LF fails closed; `Gemfile` spelling only — a `gems.rb` twin, which bundler ≥ 2 loads instead, or a `BUNDLE_GEMFILE`-configured manifest makes vendoring refuse with `gemfile_not_loaded` before any write) | ✅ a `source:` option on the gem's own declaration, the lock converged to match (see [Ruby gems: hosted mode](#ruby-gems-hosted-mode)) — edits `gems.rb` + `gems.locked` or `Gemfile` + `Gemfile.lock`, whichever the project holds (a `Gemfile` + `gems.rb` twin is refused with `redirect_gem_twin_manifest_ambiguous`: bundler 1.x loads the `Gemfile`, bundler ≥ 2 loads `gems.rb`, and nothing in the project says which bundler installs it; bundler 4's `BUNDLE_LOCKFILE` (environment, app config or global config) naming any other lock is refused with `redirect_gem_bundle_lockfile_unsupported`, as is vendoring with `gemfile_not_loaded`; spellings that diverge beyond Socket's own edits fail closed with `redirect_gem_gemfile_spellings_diverge`; `BUNDLE_GEMFILE` from `.bundle/config` (which outranks the environment, as in bundler), the environment, or the global `~/.bundle/config` / `$BUNDLE_USER_CONFIG` (lowest, as in bundler) is followed when it names the project's `Gemfile` / `gems.rb`, and any other configured manifest is refused with `redirect_gem_bundle_gemfile_unsupported`); a Bundler all-source, exact-source or hostname mirror in app config or the scan environment can capture the patch registry, so the redirect is refused with `redirect_gem_mirror_overrides_source` without printing mirror URLs (scope mirrors to `mirror.https://rubygems.org`; user-global config and mirrors set only in a later install environment are not inspected); the `CHECKSUMS` pin needs bundler ≥ 2.6 (an older lock is still pinned by source and installs frozen; the run says once, with `redirect_gem_no_checksums_section`, that it cannot record the checksums); a stale pre-redirect materialization that `bundle install` would reuse instead of refetching is replaced with the verified patched gem when it is the project's own, else flagged `redirect_gem_stale_install` with the remedy (see "Ruby gems: gems already installed" below and CLI_CONTRACT.md's "Gem stale-install guard") |
+| RubyGems (`gem`) | ✅ in place | ✅ Gemfile + Gemfile.lock path pair (a CRLF `Gemfile.lock`, as a `core.autocrlf` checkout leaves it, is edited and reverted in its own line ending, and a lock mixing CRLF and LF fails closed; a gem locked as precompiled platform gems is vendored from prebuilt patched platform gems, see [Ruby gems: native extensions](#ruby-gems-native-extensions); `Gemfile` spelling only — a `gems.rb` twin, which bundler ≥ 2 loads instead, or a `BUNDLE_GEMFILE`-configured manifest makes vendoring refuse with `gemfile_not_loaded` before any write) | ✅ a `source:` option on the gem's own declaration, the lock converged to match (see [Ruby gems: hosted mode](#ruby-gems-hosted-mode)) — edits `gems.rb` + `gems.locked` or `Gemfile` + `Gemfile.lock`, whichever the project holds (a `Gemfile` + `gems.rb` twin is refused with `redirect_gem_twin_manifest_ambiguous`: bundler 1.x loads the `Gemfile`, bundler ≥ 2 loads `gems.rb`, and nothing in the project says which bundler installs it; bundler 4's `BUNDLE_LOCKFILE` (environment, app config or global config) naming any other lock is refused with `redirect_gem_bundle_lockfile_unsupported`, as is vendoring with `gemfile_not_loaded`; spellings that diverge beyond Socket's own edits fail closed with `redirect_gem_gemfile_spellings_diverge`; `BUNDLE_GEMFILE` from `.bundle/config` (which outranks the environment, as in bundler), the environment, or the global `~/.bundle/config` / `$BUNDLE_USER_CONFIG` (lowest, as in bundler) is followed when it names the project's `Gemfile` / `gems.rb`, and any other configured manifest is refused with `redirect_gem_bundle_gemfile_unsupported`); a Bundler all-source, exact-source or hostname mirror in app config or the scan environment can capture the patch registry, so the redirect is refused with `redirect_gem_mirror_overrides_source` without printing mirror URLs (scope mirrors to `mirror.https://rubygems.org`; user-global config and mirrors set only in a later install environment are not inspected); the `CHECKSUMS` pin needs bundler ≥ 2.6 (an older lock is still pinned by source and installs frozen; the run says once, with `redirect_gem_no_checksums_section`, that it cannot record the checksums); a stale pre-redirect materialization that `bundle install` would reuse instead of refetching is replaced with the verified patched gem when it is the project's own, else flagged `redirect_gem_stale_install` with the remedy (see "Ruby gems: gems already installed" below and CLI_CONTRACT.md's "Gem stale-install guard") |
 | Go (`golang`) | ✅ `go.mod` `replace` → `.socket/go-patches/` — see [Go: directory replaces and go.sum](#go-directory-replaces-and-gosum) | ✅ `replace` → the committed vendor tree | ✅ (free tier) fork-style `replace` → `patch.socket.dev/gopatch/<uuid>` + committed `go.sum` pin; see [Go notes](#go-directory-replaces-and-gosum). Paid hosted patches are unsupported; `redirect_golang_unsupported` names the vendored remedy |
 | Maven (`maven`) — Maven and Gradle | ✅ in place in every copy the build consumes: each `~/.m2` copy it reads and each Gradle `files-2.1` copy; `~/.m2` `.sha1`/`.md5` sidecars are rewritten, Gradle copies get advisories; jar-member records swap in the patch service's whole jar — prefer vendored / hosted, see [Maven & NuGet caveats](#maven--nuget-caveats) and [Gradle](#gradle) | ✅ suffixed Maven repository (`<version>-socket.<hex8>` pin + `.mvn/maven.config` + fallback file repository) for every pom root, single-module or reactor, or Gradle 6.8+ same-GAV repository with settings wiring and SHA-256 checks (a root with both `pom.xml` and a Gradle build wires both); see [JVM vendoring](design/maven-vendoring.md) and [Gradle](#gradle) | ✅ fail-closed by a Socket-only `<version>-socket.<hex8>` suffix: pom projects get a pinned `<version>` (`${property}` versions are refused); Gradle 6.8+ builds get an owned settings script, lock-entry rewrites and a resolution tripwire — see [Maven & NuGet caveats](#maven--nuget-caveats) and [Gradle](#gradle) |
 | sbt / Mill / scala-cli (`maven`) | ✅ Coursier caches (sbt 1.3+, sbt 2, Mill, scala-cli) and Ivy caches (sbt 0.13–1.2, `useCoursier := false`) patched in place, Coursier checksum sidecars resynced — see [Scala build tools](#scala-build-tools-sbt-mill-scala-cli) | ✅ sbt 0.13.18+: generated `socket-patch-vendor.sbt` over the committed suffixed `.socket/vendor/maven2` tree; scala-cli directory builds: owned `socket-patch.scala` + same-GAV `.socket/vendor/coursier` tree (Linux / macOS); Mill: not wired (agent or hosted guidance) | ✅ sbt 0.13.18+: one generated `socket-patch.sbt`, gated on sbt's own `sbt update` records; Mill / scala-cli: paste-able snippets only (`redirect_mill_manual_snippet`, `redirect_scala_cli_manual_snippet`) |
@@ -533,8 +533,8 @@ Each Legacy format has an upgrade path and an undo path. Both work in v5:
     them where they are installed.
   - **A hosted or vendored package disappears from `bun audit` and `bun outdated`.** Bun
     checks registry resolutions only, so it stops reporting the package at all, including
-    advisories the applied patch does not fix. `socket-patch scan` lists those as
-    `still unpatched`.
+    advisories the applied patch does not fix. `socket-patch scan` counts those on the
+    package's row (`2 unpatched`) and names them under `--verbose`.
 
   In vendored mode the patched tarballs are files in the repository, so a build that
   copies only `package.json` and `bun.lock` before `bun install` (a common Dockerfile
@@ -1046,8 +1046,9 @@ Honest limits of the Maven and NuGet flows — documented behavior, not bugs:
   A `${property}` groupId or artifactId is resolved from the pom's own `<properties>`
   before matching, so `<groupId>${ct.group}</groupId>` is rewritten like a literal. One
   the pom does not define (a parent's) may be the patched GA, and then its own version
-  wins: the dep is refused with nothing written (`redirect_maven_coordinate_unresolved`),
-  and `vex` does not attest a pin past such a declaration.
+  wins: the dep is refused and the run writes nothing for it
+  (`redirect_maven_coordinate_unresolved`), and `vex` does not attest a pin past such a
+  declaration.
   The grant serves the main jar only: a `<classifier>` variant keeps its version
   (`redirect_maven_classifier_unsupported`), and the literal-or-pin decision is made from
   the classifier-less declarations. A `sources` / `javadoc` variant at the patched release
@@ -1063,7 +1064,7 @@ Honest limits of the Maven and NuGet flows — documented behavior, not bugs:
   cached `maven-metadata-*.xml` lists. When the build selects another version (a newer
   or older one nearer the root, the project's own declaration, an excluded path, a
   range), or does not resolve the artifact at all, the patch for that base version has
-  nothing to patch: nothing is written, the run exits 0, and one line names the version
+  nothing to patch: the run writes nothing for it, exits 0, and one line names the version
   Maven selects instead (`redirect_maven_version_not_selected`, vendored
   `vendor_maven_version_not_selected`). A patch for the version that is selected is
   still looked up and applied. When the selection cannot be read (most often because
@@ -1096,11 +1097,11 @@ Honest limits of the Maven and NuGet flows — documented behavior, not bugs:
   Checksums stay in the project root's `.mvn/`, which Maven also reads when it is
   started in a module directory or with `-f`; a module with a `.mvn` of its own is
   reported (`redirect_maven_trusted_checksums_unenforced`), since a Maven started there
-  reads that one. A reactor one of whose poms cannot be read is left untouched
-  (`redirect_maven_multimodule_unsupported`, with the reason). A pom that is there but is
-  not UTF-8 text (re-saved as Latin-1 or UTF-16, say) is never taken for a missing one:
-  the scan refuses the run and names it (`candidate_file_unreadable`), `vex` reports it
-  as unreadable and attests no pin of that reactor, and `rollback` / `remove` change
+  reads that one. When a pom of a reactor cannot be read, the run writes nothing for the
+  patch (`redirect_maven_multimodule_unsupported`, with the reason). A pom that is there
+  but is not UTF-8 text (re-saved as Latin-1 or UTF-16, say) is never taken for a missing
+  one: the scan refuses the run and names it (`candidate_file_unreadable`), `vex` reports
+  it as unreadable and attests no pin of that reactor, and `rollback` / `remove` change
   nothing until it is UTF-8 again, since it may hold part of a pin. The plan for a patch is
   written whole or not at all: a pom is never left naming a patched version without the
   repository that serves it, its checksum lines, and wiring a rollback can find. So a
@@ -1227,8 +1228,9 @@ Honest limits of the Maven and NuGet flows — documented behavior, not bugs:
   `originAware=false` and `failIfMissing=false`, so one checksum matches the artifact
   from any repository and a dependency with no committed checksum still resolves — only a
   *mismatch* fails. A grant whose sha256 is not 64 hex digits writes no checksum line
-  (and drops any line an earlier run wrote for that suffixed version) and warns
-  `redirect_maven_trusted_checksums_invalid_hash`. `vex` takes a pin's checksum as the
+  and warns `redirect_maven_trusted_checksums_invalid_hash`; a line an earlier run wrote
+  for that suffixed version goes once the pin lands or is in place, and stays untouched
+  for a dep the run refuses or skips. `vex` takes a pin's checksum as the
   content the project pins only when the pin is known to be enforced: `maven.config`
   enforces the file as Maven 3.9+ reads it (all five settings above with the values
   hosted writes, the directory in either form; `failIfMissing` aside), and the Maven the
@@ -1288,8 +1290,8 @@ Honest limits of the Maven and NuGet flows — documented behavior, not bugs:
   included. The patch resolves only at its suffixed version, which the mirror does not
   hold, so a project wired behind such a mirror **fails to build**. `scan --mode hosted`
   therefore reads the Maven settings of the machine it runs on before it writes a Maven
-  pin, and wires nothing for a patch whose repository a mirror would take over: the
-  poms and `.mvn/` stay as they are, the scan exits 0, and
+  pin, and wires nothing for a patch whose repository a mirror would take over: the run
+  writes nothing for it (no pin in a pom, no line or file under `.mvn/`), exits 0, and
   `redirect_maven_mirror_captures_repository` names the mirror, the settings file that
   declares it, and the two ways forward:
   - **Leave the repository out of the mirror.** Add `!socket-patch-<uuid>` to its
@@ -1323,7 +1325,9 @@ Honest limits of the Maven and NuGet flows — documented behavior, not bugs:
   behind a mirror that takes every repository, and a project skipped here may have built
   there. The in-memory engine (a Socket-opened pull request) reads no settings at all.
   A project an earlier scan wired is left as it is and reported the same way, and is no
-  longer counted as redirected or attested by that scan's `--vex`. The skip is only for
+  longer counted as redirected or attested by that scan's `--vex`. Its warning also says
+  that the earlier wiring is still in the poms, that a build behind the mirror fails on
+  it, and how to take it out (`socket-patch rollback <purl>`). The skip is only for
   a patch that would get the repository: one the scan would not wire anyway (the build
   selects another version) is reported under its own reason.
 * **Gradle (hosted Maven).** Gradle builds get automated wiring, not a pasted snippet:
@@ -1363,10 +1367,43 @@ then `.gradle` in the account's home directory. On Unix that is the passwd entry
 `$HOME`; when they differ, scan notes `gradle_user_home_differs`.
 
 `~/.m2` here means the Maven local repository, found the way Maven finds it:
-`MAVEN_REPO_LOCAL`, then `-Dmaven.repo.local` in `MAVEN_ARGS` or `MAVEN_OPTS`, then
+`MAVEN_REPO_LOCAL`, then `-Dmaven.repo.local` in `MAVEN_ARGS` (the command line), in
+the project's `.mvn/maven.config`, or in `MAVEN_OPTS`, in that order, then
 `<localRepository>` in `~/.m2/settings.xml`, then in the install's `conf/settings.xml`
 (`MAVEN_HOME` or `M2_HOME`), then `.m2/repository` in `user.home`. `M2_HOME` itself
 never names a local repository. On Windows `user.home` is `USERPROFILE`, not `HOME`.
+
+`.mvn/maven.config` is read only for a Maven build, where Maven itself reads it: a
+project with a `pom.xml` and no Gradle or Scala-tool build beside it. A Gradle
+build's `mavenLocal()` never reads the file, so a Gradle project below a directory
+that holds one keeps the environment's repository. The file is the one Maven's
+launcher finds from the project directory: in the nearest directory at or above it
+that holds a `.mvn` directory. It is read the way the project's Maven reads it:
+
+- Maven before 3.9 splits the whole file on whitespace and fills in nothing.
+- Maven 3.9 and later takes each line as one argument (`#` starts a comment), so a
+  value runs to the end of its line, and from 3.9.2 fills in
+  `${session.rootDirectory}`, `${session.topDirectory}`, `${user.home}` and
+  `${env.NAME}`.
+
+For both, the last `-Dmaven.repo.local=` wins, a placeholder nothing defines stays in
+the path as written, and a relative path (an empty one included) is taken from the
+project directory, where Maven runs. The Maven Wrapper's version says which reading
+applies. Without a wrapper, when the two readings differ, the one whose directory
+exists is used. When both exist no repository is guessed at: nothing in `~/.m2` is
+scanned or patched and the run warns `maven_local_repository_undetermined`; set
+`MAVEN_REPO_LOCAL` to choose. A `--global` run reads no project's config. Maven
+before 3.9 does not read `MAVEN_ARGS`; socket-patch reads it whatever Maven is
+installed.
+
+This means a project's `.mvn/maven.config` chooses where agent mode writes. It can
+point `apply`, `rollback` and `remove` at any directory laid out as a Maven
+repository, including one outside the project and outside your home directory, exactly
+as it points Maven there when the project is built. In that directory socket-patch
+does what it does in `~/.m2`: it replaces a jar that matches the known original of a
+patch with the patch service's build of it, rewrites the checksum files beside it
+(`.sha1`, `.md5`), and restores both on rollback. Set `MAVEN_REPO_LOCAL` to name the
+repository yourself, whatever the project's config says.
 
 A Gradle-only build reads `~/.m2` only through `mavenLocal()`. Scan looks for it in
 every settings, build, `buildSrc`, included-build, applied and init script, including
@@ -1381,8 +1418,24 @@ cannot be read literally, `~/.m2` stays in the scan and scan notes
 `apply` patches every copy the build consumes. Gradle keeps one hash directory per
 download of a version, and each one holding the patched files is patched. Records
 keyed by members inside a jar swap in the patch service's build of the whole jar, so
-they need network access (`jvm_agent_service_required` offline). The original is
-backed up under `.socket/jvm-originals/` and `rollback` restores from it. `rollback`
+they need network access (`jvm_agent_service_required` offline). Before the swap the
+service's jar is compared with the installed one member by member: everything the
+JVM would load outside the patched members and signature files must be identical, or
+that copy is left alone (`jvm_agent_service_jar_mismatch`, naming the members). A
+signed jar the patch service signed again (a security provider such as Bouncy
+Castle's) may also differ in its manifest, as that signing leaves it: digest lines
+changed for the patched members and added for the others, and sections added for
+entries the manifest did not list. Nothing else of the manifest may differ; the CLI
+contract has the rule. Jars
+of up to 200,000 entries and 1 GiB inflated are handled; one past that is
+`jvm_jar_too_large`. The original is
+backed up under `.socket/jvm-originals/` and `rollback` restores from it. A `~/.m2`
+jar that another project (or an earlier workspace over a cached `~/.m2`) patched has
+no backup in this project: online, `rollback` downloads the original from the
+registry and uses it only when it matches the registry's checksum and is the jar the
+copy was patched from; otherwise it fails with `jvm_jar_backup_missing` and says how
+to recover (roll back from the project that applied the patch, or delete the version
+directory so the build downloads the jar again). `rollback`
 and `remove` restore every patched writable copy, including a `~/.m2` copy the build
 no longer reads (an earlier apply patched it while `mavenLocal()` was declared).
 Such a copy never fails the run: one another build re-patched or rebuilt, or whose
@@ -1970,6 +2023,118 @@ with the command that does, and
 | `go_vendor_modules_txt_out_of_sync` | A committed `vendor/` directory (`go mod vendor`; `go work vendor` for a workspace) whose `vendor/modules.txt` does not record a socket `replace`, or still records one that was removed. go builds with `-mod=vendor` and fails with "inconsistent vendoring" | `go mod vendor` (or `go work vendor`), then commit `vendor/` |
 | `go_requirements_out_of_sync` | The patched module's own `go.mod` requires a dependency at a version above the one the project's `go.mod` lists (agent and vendored modes; `apply` also reports a requirement the patch added). The default `-mod=readonly` build fails with "updates to go.mod needed" or "missing go.sum entry" | `go mod tidy`, then commit `go.mod` and `go.sum` |
 
+### Bazel workspaces: `.bazelignore`
+
+In a Bazel workspace the module copies of vendored and agent mode are directories that Bazel
+and gazelle walk like any other. A BUILD file in a copy (one the module ships, or the one
+`bazel run //:gazelle` writes there) is then a package of the workspace, gazelle's `go_deps`
+copies the directory with that file, and every target that uses the module fails to load
+(`No repository visible as '@rules_go'`). So socket-patch keeps the copies out of the
+workspace's packages with `.bazelignore`.
+
+A project is in a Bazel workspace when its directory, or one above it up to the root of its git
+checkout, holds a regular file `MODULE.bazel`, `REPO.bazel`, `WORKSPACE` or `WORKSPACE.bazel`
+(the names Bazel itself looks for); the nearest such directory is the Bazel root. The checkout
+is the one the `socket.yml` lookup takes for the repository root: on Unix its `.git` belongs to
+you, to root, or to the user `sudo` ran for (a root process takes any owner's). A project in no
+such checkout is looked for in its own directory only: nothing above it is read or written. In
+a Bazel workspace, every command that can write or remove a copy (`scan`, `get`, `apply`,
+`vendor`, `vendor --revert`, `rollback`, `remove`, `repair`) ends by bringing the root's
+`.bazelignore` in line with the copies on disk, unless it is a dry run. A command whose
+`--ecosystems` leaves `golang` out adds no line; it still takes away the pair of a copy that is
+gone:
+
+- While `<project>/.socket/vendor/golang` (vendored mode) or `<project>/.socket/go-patches`
+  (agent mode) exists, the file names that directory by its path from the Bazel root, on a line
+  of its own under the comment line
+  `# socket-patch: patched Go module copies, not Bazel packages (to opt out, comment out the next line)`.
+  The two lines are added at the end of the file, in its line breaks, and the file is created
+  when it is missing. Nothing is added when a line already covers the directory: its path or a
+  directory above it. Bazel reads a line literally, so a pattern, or a line with a space before
+  or after it, covers nothing.
+- Once the directory is gone, the pair is removed, and the file is the one of before, byte for
+  byte: a last line that had no line break has none again. A file that is left empty is
+  deleted, also when it was an empty file of yours. socket-patch knows its pair by the start
+  of the comment line, `# socket-patch:`: a path line under a line that starts so is its own,
+  whatever the rest of that line says, and a line without one above it is never changed. Only a
+  directory that is not there is gone: one that cannot be looked at (a directory above it that
+  you may not search) keeps its pair, and gets none. `rollback --preserve-state` keeps a
+  vendored copy on disk, and with it the line.
+- To keep the copies visible to Bazel (see the first limit below), comment the path line out
+  and leave the comment line above it: `# .socket/vendor/golang`. socket-patch then adds no
+  line for that directory, gives no warning about it, and never touches the two lines again.
+  The commented path may end in one `/` or start with `./`. Deleting both lines is no opt-out:
+  the next command writes them back. Neither is commenting out both lines, or a path line
+  changed in any other way (a space after it, a second `#`, a blank line above it).
+
+Commit `.bazelignore` with `go.mod` and the copy. A command that changed the file says so
+(`Updated <path>` or `Removed <path>`, on stdout, not under `--json` or `--silent`). With a
+`--manifest-path` into another project, the agent copies are those of `--cwd` and the vendored
+ones those of the manifest's project, and the command brings the file of each project's Bazel
+root in line. Bazel 8 and 9 also take `ignore_directories` in `REPO.bazel`, which socket-patch
+does not read: a workspace that ignores `.socket` there gets the line as well, and both
+together are fine.
+
+When the file cannot be written (a symbolic link or a directory in its place, a read-only
+directory, a read-only file, which is neither replaced nor deleted), the command still succeeds
+and warns `bazelignore_not_updated` with the line to add, or, for a copy that is gone, that its
+two lines can be deleted.
+
+Side effects and limits:
+
+- Bazel leaves an ignored directory out of every `glob()` of a package above it as well. A
+  target that hands the project's Go files to a `go` command of its own through such a glob (a
+  `genrule` that runs `go build`, a source archive, an image layer) no longer receives the
+  copies, and its `go build` fails in the sandbox:
+  `replacement directory ./.socket/vendor/golang/... does not exist` (Bazel 9.3.2). Without the
+  line the same target builds until the first `bazel run //:gazelle`, whose BUILD file in the
+  copy takes the copy out of the glob in the same way. With the line it builds when it names
+  the files of the copy one by one beside the glob, or runs outside the sandbox. Such a
+  workspace can opt out as above.
+- Only Go module copies are covered. The unpacked packages other ecosystems keep under
+  `.socket/vendor/` get no line.
+- A Bazel root that socket-patch does not look for gets no line, and no warning is given: add
+  the line by hand, with the directory's path from that root. That is a root above the root of
+  the project's git checkout (the project is a git submodule, or several checkouts sit below
+  one Bazel workspace), and a root above a project that is in no git checkout (a Docker build
+  context, an unpacked source archive) or in a checkout of another user. Nothing outside the
+  checkout, or above such a project, is read.
+- The Bazel root is the nearest directory with a workspace file. When that workspace is nested
+  in a larger one (`outer/MODULE.bazel`, `outer/inner/MODULE.bazel`, the project in `inner`),
+  the line is in `inner/.bazelignore`, which only a Bazel or gazelle run from `inner` reads. A
+  run from `outer` takes `inner` for part of its own tree (Bazel 9.3.2, gazelle 0.54.0):
+  `bazel build //...` loads the packages under `inner`, a BUILD file in the copy among them,
+  and `bazel run //:gazelle` writes a `BUILD.bazel` into the copy, after which the build in
+  `inner` fails as above. Unless `outer/.bazelignore` already names `inner`, add the line there
+  with the path from the outer root: `inner/.socket/vendor/golang`.
+- A project patched by an earlier socket-patch gets its line from the next `scan` or `get`
+  that patches in the project's mode, `repair`, `rollback`, `remove` or `vendor --revert`, and
+  from `apply` or `vendor` where the project has a manifest (a project that is only vendored
+  has none, and both end before this step). A `scan` that writes nothing else (hosted mode with
+  nothing to pin, `patches.enabled: false` in `socket.yml`) does not write this file either,
+  and `list`, `vex` and the `--check` audits never do. So the first such command after an
+  upgrade changes `.bazelignore` in a workspace that already has a copy: commit it. The line
+  does not undo what gazelle wrote before: a gazelle run may have left a `BUILD.bazel` inside
+  the copy, and the build stays broken until that file is gone. In vendored mode the next
+  `scan --mode vendored` rebuilds the copy; in agent mode delete the `BUILD.bazel` files under
+  `.socket/go-patches` by hand.
+- `scan --prune` removes vendored copies the project no longer uses after the scan's own step
+  has brought the file in line, and then takes away the pair of a copy it removed. A warning
+  the scan gave for that copy before is then out of date, and a file that pass cannot write is
+  reported by the next command.
+- Two projects under one Bazel root share the file. Each command edits it under an advisory
+  lock on the root directory itself (no lock file is made anywhere, and a command with nothing
+  to change takes no lock), so commands that run at the same moment each keep their lines.
+  Without the lock (on Windows, where a directory cannot be locked this way; on a file system
+  without such locks; when the lock stays held for a second) a pair that one project adds while
+  another project's pair is removed can be lost until the next command in that project. Pairs
+  that are only added are safe without it: each is one write at the end of the file. A command
+  that fails after it removed a copy can leave the pair of that copy behind, which ignores
+  nothing; the next command removes it.
+- A project directory whose path from the Bazel root starts with `#` or white space, or holds
+  `*`, `?` or `[`, cannot be named in `.bazelignore`: the line is written, and Bazel or gazelle
+  does not honour it.
+
 ### Go workspaces (go.work)
 
 Every Go path (`apply`, `vendor`, `scan --mode hosted`, `vex`, `list`,
@@ -2241,7 +2406,7 @@ wire is skipped, neither file changes for it, and the warning says why and what 
 | `redirect_gem_declared_more_than_once` | the Gemfile declares it more than once. Merge the declarations into one. |
 | `redirect_gem_declaration_not_visible` | the lock lists it as a direct dependency, but it is declared where the scan cannot edit: an `eval_gemfile`d file, a loop, a gemspec. Declare it with a literal `gem "<name>"` line in the Gemfile, in place of any other `gem` call that declares it (a gemspec's development dependency stays), or patch it with `--mode agent`. Vendored mode refuses it for the same reason. |
 | `redirect_gem_dependency_not_locked` | the Gemfile declares it and the lock's `DEPENDENCIES` does not list it. Run `bundle lock` and re-run. |
-| `redirect_gem_lock_unconvergeable` | the lock cannot be brought in line with the Gemfile: it has no `BUNDLED WITH` section to say which layout its Bundler accepts, or a Bundler < 2.2 lock lists its sources in an order the Gemfile's `source` lines do not explain. Run `bundle lock` with your current Bundler and re-run. |
+| `redirect_gem_lock_unconvergeable` | the lock cannot be brought in line with the Gemfile: it has no `BUNDLED WITH` section to say which layout its Bundler accepts, or a Bundler < 2.2 lock lists its sources in an order the Gemfile's `source` lines do not explain. Run `bundle lock` with your current Bundler and re-run. Also a Gemfile with more than one top-level `source` line: Bundler 2.2 to 2.7 lock all its gems in one `GEM` section that names every source, which hosted mode does not rewrite, and `bundle lock` writes the same lock again. Keep the source that serves the gem as the one top-level `source` and move each other one into a `source "<url>" do … end` block around the gems that come from it (Bundler's own deprecation warning asks for the same), then run `bundle lock` and re-run; or use `--mode agent`. A Bundler 2.2 release before 2.2.25 keeps the one section even then, so run that `bundle lock` with a later Bundler; the warning says so when the lock was written by one. |
 | `redirect_gem_platform_unsupported` | the lock holds a platform-specific build of the gem (`nokogiri (1.18.10-x86_64-linux-gnu)`) that the patch has no patched build for. The warning names the builds the lock holds, the ones that are missing, and what the patch registry serves. See "Precompiled platform gems" below. |
 
 `--mode agent` can still patch a gem hosted mode skips. `--mode vendored` can too, unless it
@@ -2414,7 +2579,7 @@ How each mode gets the patched code running:
 | Mode | What happens |
 |---|---|
 | Hosted | Bundler installs the patched `.gem` from the patch registry, and RubyGems compiles it like any registry gem. A gem the lock pins as precompiled platform gems (`x86_64-linux-gnu`) is installed from the patched platform gem the registry serves for that platform, with nothing to compile; it is skipped with `redirect_gem_platform_unsupported` only while the patch has no patched build for one of the locked platforms. |
-| Vendored | Refused with `native_extensions_unsupported`: Bundler builds no extensions for path-sourced gems. Use hosted or agent mode for the gem. |
+| Vendored | A gem `Gemfile.lock` pins as precompiled platform gems (one entry per platform, such as `nokogiri (1.18.10-x86_64-linux-gnu)`) is vendored from prebuilt patched platform gems. The patch service builds one for each platform, and the vendored directory holds each of them unpacked (`<name>-<version>/<platform>/`), so Bundler loads the one for the platform it runs on and builds nothing. Every platform in the lock needs one. While the patch service has none for one of them the gem is skipped with `vendor_prebuilt_platform_pending`, which names the platforms that have none: the run does not fail, nothing is written, a patch that is already vendored stays in place, and a later run vendors the gem once every platform has one. A lock that also holds the plain `nokogiri (1.18.10)` entry of the `ruby` platform is refused with `platform_gem_unsupported`, and so is a lock written by a Bundler older than 2.3 (its `BUNDLED WITH`), the oldest version the layout is verified on. The vendored directory carries its own `.gitignore` and `.gitattributes`, so a project rule such as `*.so` or a Git LFS filter does not keep the prebuilt binaries out of the commit or change their bytes. Bundler cannot add a platform the vendored directory has no gem for: to add one later, revert the gem (`vendor --revert`), run `bundle lock --add-platform <platform>` and vendor again. A gem with a native extension that is locked for the `ruby` platform alone is refused (`native_extensions_unsupported`, or `platform_gem_unsupported` when the installed copy is a precompiled one): Bundler builds no extensions for path-sourced gems. Use hosted or agent mode for that gem. |
 | Agent (`apply`) | The extension is rebuilt from the gem's source archive with the patch laid over it, using RubyGems' builder and the Ruby that owns the install, and the build is put where Ruby loads it: the extension directory of a gem RubyGems built, the prebuilt binary of a precompiled gem. |
 
 `apply` takes the source gem (`<name>-<version>.gem`) from the gem home's `cache/` directory,
@@ -2431,8 +2596,43 @@ mirror of rubygems.org, set `SOCKET_RUBYGEMS_URL` to it. The mirror must be reac
 (plain `http` is accepted only for a mirror on the same machine, such as `http://localhost:9292`,
 and such a request never goes through a proxy): the gem's build scripts run, so its archive and
 checksum are not fetched over a connection someone else could rewrite. Credentials in the URL
-are never printed. The JRuby (`-java`) build of a gem ships
-jars and is always refused for such a patch.
+are never printed.
+
+JRuby is different. It installs a gem's `java` build (`nokogiri-1.18.10-java`), which runs jars
+and has no C extension, so `apply` builds nothing there and needs no compiler. (A `java` gem that
+does compile something when it is installed, such as jruby-launcher, is rebuilt like any other
+gem with an extension.) Patches are written for the gem's `ruby` build, and on JRuby `apply`
+takes from such a patch what is part of the `java` build:
+
+- A file the patch changes is updated when the installed gem has it: the gem's Ruby code, and
+  also a C source the `java` gem ships, though nothing on JRuby compiles it.
+- A file that only a C build reads is skipped when the installed gem doesn't have it: a C
+  source or build file, or anything under `ext/`, `patches/` or `ports/`. So is a new file of
+  that kind, such as a new C source or a new `patches/libxml2/*.patch`.
+- Every other file the patch changes must be there. A Ruby file that is missing from the
+  installed gem is an error, as it is in any other gem: `apply` fails and changes nothing.
+
+The patch then counts as applied: `apply --check` reports it in sync, `vex` attests it, and
+`rollback` restores the files `apply` changed. When no file of a patch is part of the `java`
+build (a patch to the libxml2 that nokogiri packs for its C extension), the vulnerable code is not
+in that build at all. `apply` exits 0, changes nothing and prints a note saying so (a `skipped`
+event with `not_in_platform_build` under `--json`). Nothing was patched, so `vex` says what is
+true instead: the vulnerability is `not_affected` with the justification
+`vulnerable_code_not_present`. `rollback` reports that there was nothing to restore.
+
+The one exception is a patch that changes what the gem's jars are built from (a Java, Kotlin or
+Scala source, or a Maven, Ant or Gradle build file) and doesn't bring the rebuilt jars. `apply`
+can't rebuild a jar, so that patch is incomplete: `apply` writes the patch's files, leaves them
+written, and exits 1 with an error that says the jars are not the patch's
+(`native_extension_not_rebuilt`). Neither `apply --check` nor `vex` reports the gem as patched.
+A patch that replaces a jar itself is different: the patched jar is what JRuby loads, so the
+patch is applied and attested like any other, along with any source it changes beside the jar.
+
+A patch written for the `java` build itself (its purl carries `?platform=java`) is applied whole,
+like a patch for any other gem: every file it changes must be in the installed gem. When the
+manifest has both that patch and the one for the gem's `ruby` build, only the `java` one belongs
+to a JRuby install. `apply` doesn't apply the other one there, and `apply --check`, `vex` and
+`rollback` don't look for it there either.
 
 A gem that builds a library into its own directory and loads it from there (an FFI gem such as
 scrypt, a Rakefile build such as digest-crc) is always rebuilt from its installed tree. The
@@ -2450,14 +2650,17 @@ patch changes and left compiled code. How a gem builds depends on its configurat
 installed with `--use-system-libraries` links the operating system's libxml2 and never opens the
 copy it packs, so a patch that only adds a fix to that packed copy changes nothing there. A gem
 whose build script downloads the binary it runs (passenger's agent) compiles nothing at all.
-`apply` then writes the patch's files, leaves the compiled code as it was installed, and warns
-with `native_extension_not_rebuilt`, instead of reporting a patch that is in no compiled code:
+The patch is then incomplete, and `apply` says so instead of reporting a patch that is in no
+compiled code. It writes the patch's files, leaves the compiled code as it was installed, and
+exits 1 with `Error: Patch of <package> is incomplete: …` (`native_extension_not_rebuilt`):
 
-- The patch's Ruby files are in effect, and a source the gem compiles later on its own is the
-  patched one.
+- The patch's files stay written: its Ruby files are in effect, and a source the gem compiles
+  later on its own is the patched one. Nothing is rolled back for you; `rollback` undoes it.
 - `apply --check` reports the package as not in sync, and `vex` does not attest the patch.
+- A gem installed in more than one place counts as patched only when no copy is incomplete.
 - On a system-libraries install the library is the operating system's package, and updating
   that package is what fixes it.
+- `scan --mode agent` and `get` exit 1 for such a patch as well, and keep it recorded.
 
 A patch to the gem's own C sources is rebuilt as usual. On Linux the check asks the kernel which
 files the build opened. Elsewhere it needs a filesystem that records file reads; on one that
@@ -2518,6 +2721,41 @@ stage directory it leaves is removed by the next `apply` or `rollback`. A rebuil
 installed tree leaves the gem with its patched sources and no finished extension until Socket
 Patch runs again: `apply` puts the previous build back and completes the rebuild, and `rollback`
 restores the original sources and build.
+
+## Bazel workspaces: VEX
+
+`vex` and `--vex` read what socket-patch wrote and what the project's own package manager
+installed. They read no `MODULE.bazel`, `WORKSPACE` or BUILD file, so in a Bazel workspace a
+document says what was patched, and that is what Bazel builds only where Bazel builds from
+the files socket-patch rewrote. The two are tested to agree on real Bazel 9.3.2, 8.8.2 and
+7.7.2 for four shapes, all under Bzlmod: Go through gazelle's
+`go_deps.from_file(go_mod = "//:go.mod")` with
+`go_deps.config(check_direct_dependencies = "error")` and the module required directly in
+`go.mod` (hosted, vendored and agent mode), npm through
+aspect_rules_js's `npm.npm_translate_lock(pnpm_lock = "//:pnpm-lock.yaml")` (hosted and
+vendored), PyPI through rules_python's `pip.parse(requirements_lock = "//:requirements.txt")`
+(hosted), and RubyGems through rules_ruby's
+`ruby.bundle_fetch(gemfile_lock = "//:Gemfile.lock")` without `gem_checksums` (hosted). There
+the build prints the patched package, and the document of the run (`--vex`), of `vex` and of
+`vex --no-verify` is one `not_affected` statement that names the package and the patch; the
+first two are the same in a checkout with the same files that Bazel has not built in, and
+after the undo `vex` writes no document. For PyPI on Bazel 8.5 and later a hosted scan leaves
+`MODULE.bazel.lock` stale, so the document is there before a frozen build passes: a build with
+`--lockfile_mode=error` fails until a build that may update the lock has run, and the updated
+lock has to be committed.
+
+In every other Bazel shape nothing checks the document against the build, and in these it was
+measured to be wrong (`not_affected` while Bazel builds the unpatched package, or while the
+build is broken): agent mode beside rules_js, which builds from the lock and never reads the
+patched `node_modules`; Go under a `go_repository` rule of a `WORKSPACE`, in hosted and
+vendored mode; Go under `go_deps` when another Bazel module of the build requires a higher
+version of the patched module, because gazelle then builds that version and drops the
+replacement; a
+`pip.parse` or `pip_parse` that takes the requirements of the build's platform from another
+file than the one socket-patch rewrote; vendored mode for PyPI. Do not publish a document for
+an artifact that Bazel built outside those four shapes. A project that Bazel does not build is
+not concerned: beside a Bazel workspace whose files name none of its locks, `vex` says what it
+says without Bazel.
 
 ## Supported platforms
 

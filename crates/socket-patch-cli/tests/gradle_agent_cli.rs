@@ -1030,32 +1030,107 @@ fn offline_member_record_writes_nothing() {
 }
 
 /// A service jar carrying a member the installed jar does not have is not
-/// the installed jar plus the patch: refused, nothing written, no backup.
+/// the installed jar plus the patch: every copy fails with
+/// `jvm_agent_service_jar_mismatch` naming the member, the run carries the
+/// code as a warning, and nothing is written, no backup either. The entry's
+/// unix mode is beside the point: the JVM loads a class from an entry that
+/// carries a symlink's mode bits like any other.
 #[test]
 fn tampered_service_jar_writes_nothing() {
+    const BACKDOOR: &str = "com/example/Backdoor.class";
+    for symlink_mode in [false, true] {
+        let f = fx("    mavenLocal()\n    mavenCentral()\n");
+        f.m2(&as_refs(&pristine_files()));
+        f.gradle(&as_refs(&pristine_files()));
+        f.member_manifest();
+        let before = f.snapshot();
+        let mut honest = zip::ZipArchive::new(std::io::Cursor::new(service_jar())).unwrap();
+        let mut tampered = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let opts = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        for i in 0..honest.len() {
+            use std::io::Read as _;
+            let mut entry = honest.by_index(i).unwrap();
+            let mut buf = Vec::new();
+            entry.read_to_end(&mut buf).unwrap();
+            tampered.start_file(entry.name(), opts).unwrap();
+            tampered.write_all(&buf).unwrap();
+        }
+        if symlink_mode {
+            tampered.add_symlink(BACKDOOR, "evil", opts).unwrap();
+        } else {
+            tampered.start_file(BACKDOOR, opts).unwrap();
+            tampered.write_all(b"evil").unwrap();
+        }
+        let (_rt, server) = service(&tampered.finish().unwrap().into_inner());
+        let out = f.run(&["apply", "--vendor-url", &server.uri()]);
+        out.failed().has("jvm_agent_service_jar_mismatch");
+        let errors: Vec<&str> = out.json["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|e| e["error"].as_str())
+            .collect();
+        assert_eq!(errors.len(), 2, "one per copy: {}", out.json);
+        for error in errors {
+            assert!(
+                error.starts_with(
+                    "jvm_agent_service_jar_mismatch: the patch service's jar differs from "
+                ) && error.contains(&format!(
+                    "outside the patched members: 1 added (`{BACKDOOR}`)"
+                )),
+                "symlink_mode={symlink_mode}: {error}"
+            );
+        }
+        assert_eq!(f.snapshot(), before, "symlink_mode={symlink_mode}");
+        assert!(!f.proj.join(".socket/jvm-originals").exists());
+    }
+}
+
+/// A jar over the limits jars once shared with Python wheels (10,000
+/// entries, 64 MiB inflated) is patched in every copy, attested, and
+/// rolled back byte for byte.
+#[test]
+fn a_jar_over_the_old_reader_limits_applies_attests_and_rolls_back() {
+    let big = |notice: &[u8]| {
+        let mut zw = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let opts = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored)
+            .last_modified_time(zip::DateTime::default());
+        zw.start_file(NOTICE, opts).unwrap();
+        zw.write_all(notice).unwrap();
+        let mut body = vec![0x5au8; 6800];
+        for i in 0..10_001u64 {
+            body[..8].copy_from_slice(&i.to_le_bytes());
+            zw.start_file(format!("p/C{i}.class"), opts).unwrap();
+            zw.write_all(&body).unwrap();
+        }
+        zw.finish().unwrap().into_inner()
+    };
+    let (pristine, patched) = (big(b"pristine\n"), big(b"patched\n"));
+    assert!(pristine.len() > 64 * 1024 * 1024);
+
     let f = fx("    mavenLocal()\n    mavenCentral()\n");
-    f.m2(&as_refs(&pristine_files()));
-    f.gradle(&as_refs(&pristine_files()));
+    let m2 = f.m2(&[(JAR, &pristine), (POM, PRISTINE_POM)]);
+    let version = f.gradle(&[(JAR, &pristine), (POM, PRISTINE_POM)]);
     f.member_manifest();
     let before = f.snapshot();
-    let mut tampered = zip::ZipArchive::new(std::io::Cursor::new(service_jar())).unwrap();
-    let mut members = Vec::new();
-    for i in 0..tampered.len() {
-        use std::io::Read as _;
-        let mut entry = tampered.by_index(i).unwrap();
-        let mut buf = Vec::new();
-        entry.read_to_end(&mut buf).unwrap();
-        members.push((entry.name().to_string(), buf));
-    }
-    members.push(("com/example/Backdoor.class".to_string(), b"evil".to_vec()));
-    let refs: Vec<(&str, &[u8])> = members
-        .iter()
-        .map(|(n, b)| (n.as_str(), b.as_slice()))
+    let (_rt, server) = service(&patched);
+
+    f.run(&["apply", "--vendor-url", &server.uri()]).ok();
+    assert!(std::fs::read(m2.join(JAR)).unwrap() == patched);
+    assert!(hash_copies(&version, JAR)[0].1 == patched);
+    let (out, statements) = f.vex(&[]);
+    out.ok();
+    assert!(statements > 0, "{}", out.json);
+
+    f.run(&["rollback", "--offline"]).ok();
+    let after: BTreeMap<String, String> = f
+        .snapshot()
+        .into_iter()
+        .filter(|(k, _)| !k.contains(".socket/jvm-originals"))
         .collect();
-    let (_rt, server) = service(&jar(&refs));
-    f.run(&["apply", "--vendor-url", &server.uri()]).failed();
-    assert_eq!(f.snapshot(), before);
-    assert!(!f.proj.join(".socket/jvm-originals").exists());
+    assert!(after == before, "rollback must restore every copy");
 }
 
 /// A swap is one transaction across every consumed copy: when the write of

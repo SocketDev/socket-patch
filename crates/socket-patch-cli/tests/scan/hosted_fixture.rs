@@ -533,33 +533,21 @@ pub(crate) fn scan_hosted_json_or_release_fifo(
     }
 }
 
-/// Stdout below the discovery report: human hosted `scan` prints the
-/// results table and its `Summary:` block (plus any indented continuation
-/// lines) before the engine's own output.
+/// The project's own output of a human hosted `scan`: stdout without the
+/// invocation's closing totals (the lines under its last blank line, which
+/// `scan_render.rs` and the report's unit tests pin).
 pub(crate) fn engine_stdout(stdout: &str) -> String {
-    let mut lines = stdout.lines().peekable();
-    let mut seen_summary = false;
-    let mut out = Vec::new();
-    while let Some(line) = lines.next() {
-        if !seen_summary {
-            if line.starts_with("Summary: ") {
-                seen_summary = true;
-                while lines.peek().is_some_and(|l| l.starts_with(' ')) {
-                    lines.next();
-                }
-            }
-            continue;
+    match stdout.rfind("\n\n") {
+        Some(end)
+            if ["Patched ", "Would patch "]
+                .iter()
+                .any(|opening| stdout[end + 2..].starts_with(opening))
+                || stdout[end + 2..].contains(" left to patch") =>
+        {
+            stdout[..=end].to_string()
         }
-        out.push(line);
+        _ => stdout.to_string(),
     }
-    if !seen_summary {
-        return stdout.to_string();
-    }
-    let mut joined = out.join("\n");
-    if !out.is_empty() {
-        joined.push('\n');
-    }
-    joined
 }
 
 /// Yarn classic project: package.json (with `package_manager` when given) +
