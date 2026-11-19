@@ -477,7 +477,7 @@ pub(crate) fn bundled_before_2_2(lock: &str) -> bool {
 
 /// The `major.minor` of the bundler the lock's `BUNDLED WITH` names, and
 /// the version as written.
-fn bundled_with_version(lock: &str) -> Option<((u32, u32), &str)> {
+pub(crate) fn bundled_with_version(lock: &str) -> Option<((u32, u32), &str)> {
     let mut lines = lock.lines().map(|l| l.trim_end_matches('\r'));
     let version = lines
         .by_ref()

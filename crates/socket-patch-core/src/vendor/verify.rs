@@ -5,13 +5,17 @@
 //! manifest claims the patch modified must hash (git-blob sha256) to its
 //! `afterHash` inside that artifact — the same standard `vex::verify` applies
 //! to installed trees. Dir-shaped ecosystems are hashed in place; npm
-//! tarballs and zip artifacts (`.whl`/`.nupkg`/`.jar`) are decoded in memory
+//! tarballs and zip artifacts (`.whl`/`.nupkg`) are decoded in memory
 //! (bounded — the artifacts are committed and tamper-able, so a crafted
-//! archive must not OOM an audit).
+//! archive must not OOM an audit). A `.jar` has its record members hashed
+//! as they are inflated, within the jar limits of
+//! [`crate::patch::jar_members`]: released jars are larger than the
+//! wheel-sized caps of the in-memory reader allow.
 //!
 //! Fail-closed order (each failure is a stable snake_case routing tag):
 //! `no_files` → `vendor_path_unsafe` → `vendor_uuid_mismatch` →
 //! `vendor_artifact_missing` → `vendor_artifact_unreadable` /
+//! `vendor_artifact_too_large` /
 //! `file_not_found` / `vendor_hash_mismatch` / `vendor_inventory_mismatch` /
 //! `vendor_manifest_unverifiable`
 //! (dir-shaped artifacts with a recorded [`file_inventory`] additionally
@@ -26,7 +30,10 @@ use std::path::{Path, PathBuf};
 
 use crate::hash::git_sha256::compute_git_sha256_from_bytes;
 use crate::manifest::schema::{PatchFileInfo, PatchRecord};
-use crate::patch::apply::{normalize_file_path, verify_file_patch, VerifyStatus};
+use crate::patch::apply::{
+    is_missing_path, is_safe_relative_subpath, normalize_file_path, verify_file_patch, VerifyStatus,
+};
+use crate::patch::file_hash::compute_file_git_sha256;
 use crate::patch::package::read_archive_to_map;
 
 use super::path::parse_vendor_path;
@@ -126,12 +133,29 @@ pub async fn verify_vendored_patch_record(
         return super::pypi_distribution::verify_members(&members, &entry.artifact.path, record);
     }
     let path_str = artifact.to_string_lossy();
+    if path_str.ends_with(".jar") {
+        let files = record.files.clone();
+        tokio::task::spawn_blocking(move || verify_jar_file_members(&artifact, &files))
+            .await
+            .map_err(|_| "vendor_artifact_unreadable".to_string())??;
+        return super::bun_workspace::verify(project_root, entry).await;
+    }
     let is_tarball = path_str.ends_with(".tgz") || path_str.ends_with(".tar.gz");
-    let is_zip =
-        path_str.ends_with(".whl") || path_str.ends_with(".nupkg") || path_str.ends_with(".jar");
+    let is_zip = path_str.ends_with(".whl") || path_str.ends_with(".nupkg");
     if !is_tarball && !is_zip {
         let cargo_uuid = (entry.ecosystem == "cargo").then_some(entry.uuid.as_str());
-        verify_dir_members(&artifact, record, cargo_uuid).await?;
+        match gem_platform_trees(&artifact, entry).await? {
+            // A gem vendored as precompiled platform gems: bundler loads
+            // the tree of whichever platform it runs on, so every one of
+            // them must carry the patch.
+            Some(trees) => {
+                let voucher = TreeVoucher::Ledger(entry.artifact.file_inventory.as_ref());
+                for tree in &trees {
+                    verify_platform_tree(tree, &record.files, voucher).await?;
+                }
+            }
+            None => verify_dir_members(&artifact, record, cargo_uuid).await?,
+        }
         // Whole-tree cross-check: a dir-shaped artifact's bytes are covered
         // by NO lockfile integrity (bundler path sources, cargo path deps,
         // …), so the members above are the only thing the record can vouch
@@ -221,6 +245,161 @@ async fn verify_dir_members(
                 return Err("vendor_hash_mismatch".to_string())
             }
             VerifyStatus::NotFound => return Err("file_not_found".to_string()),
+        }
+    }
+    Ok(())
+}
+
+/// The prebuild trees of a gem vendored as precompiled platform gems
+/// (`<artifact>/<platform>/`, see [`super::gem`]'s module docs); `None`
+/// for every other dir-shaped artifact, whose files sit in the artifact dir
+/// itself. The ledger entry names the trees. An entry synthesized from a
+/// lockfile reference names none, so the layout is then read off the
+/// artifact: no `<name>.gemspec` at its root (every gem vendored as its own
+/// tree has one there) and one in each platform's subdirectory.
+async fn gem_platform_trees(
+    artifact: &Path,
+    entry: &VendorEntry,
+) -> Result<Option<Vec<PathBuf>>, String> {
+    if entry.ecosystem != "gem" {
+        return Ok(None);
+    }
+    if !entry.gem_platforms.is_empty() {
+        // SECURITY: state.json is committed and tamper-able, and each
+        // platform is about to name a directory that gets stat'd and hashed.
+        if !entry
+            .gem_platforms
+            .iter()
+            .all(|platform| super::gem::is_platform_dir_name(platform))
+        {
+            return Err("vendor_path_unsafe".to_string());
+        }
+        let trees = entry.gem_platforms.iter().map(|p| artifact.join(p));
+        return Ok(Some(trees.collect()));
+    }
+    let Some((name, _)) = crate::utils::purl::parse_gem_purl(&entry.base_purl) else {
+        return Ok(None);
+    };
+    let stub = format!("{name}.gemspec");
+    let is_file = |path: PathBuf| async move {
+        tokio::fs::symlink_metadata(path)
+            .await
+            .is_ok_and(|m| m.is_file())
+    };
+    if is_file(artifact.join(&stub)).await {
+        return Ok(None);
+    }
+    let mut trees = Vec::new();
+    let Ok(mut entries) = tokio::fs::read_dir(artifact).await else {
+        return Ok(None);
+    };
+    while let Ok(Some(child)) = entries.next_entry().await {
+        // `file_type` does not follow links: a linked tree is no tree.
+        if child.file_type().await.is_ok_and(|t| t.is_dir())
+            && is_file(child.path().join(&stub)).await
+        {
+            trees.push(child.path());
+        }
+    }
+    trees.sort();
+    Ok((!trees.is_empty()).then_some(trees))
+}
+
+/// What vouches for the bytes of a prebuild tree beyond the patched files
+/// it holds (see [`verify_platform_tree`]).
+#[derive(Clone, Copy)]
+pub(crate) enum TreeVoucher<'a> {
+    /// The tree was just unpacked from a prebuild archive whose bytes
+    /// passed the integrity digest the patch service states for that
+    /// platform. No unverified archive is ever unpacked.
+    VerifiedDownload,
+    /// The ledger's file inventory of the vendored copy (keyed
+    /// `<platform>/<path>`), taken when the copy was vendored; `None` for
+    /// an entry that records none.
+    Ledger(Option<&'a BTreeMap<String, String>>),
+}
+
+/// The rule one prebuild tree of a gem vendored as precompiled platform
+/// gems must meet (`tree` is `<artifact>/<platform>/`, `files` the patch
+/// record's). One rule for every place that judges such a tree: the
+/// download gate, the in-sync test of a re-run, and `vendor --check` /
+/// `vex` / `repair`.
+///
+/// * A patched file the tree holds hashes to its `afterHash`.
+/// * A patched file the tree does NOT hold is no mismatch, even when it
+///   holds none of them. A platform gem ships the compiled extension and
+///   often not what it was built from: the usual nokogiri patch adds a
+///   file under `patches/` or edits `dependencies.yml`, which no
+///   precompiled gem ships, so the patch lives entirely in the binaries
+///   the patch service rebuilt. What stands for those bytes is `voucher`:
+///   the integrity check of the download while the tree is staged, and
+///   afterwards the ledger's inventory, which every file of the tree must
+///   match (a file it lists that is gone or changed is a mismatch, and so
+///   is one it does not list).
+/// * With neither — an entry with no inventory — the tree must hold at
+///   least one patched file: otherwise nothing vouches for it.
+///
+/// The error is a stable routing tag (see the module docs).
+pub(crate) async fn verify_platform_tree(
+    tree: &Path,
+    files: &HashMap<String, PatchFileInfo>,
+    voucher: TreeVoucher<'_>,
+) -> Result<(), String> {
+    if !tokio::fs::symlink_metadata(tree)
+        .await
+        .is_ok_and(|m| m.is_dir())
+    {
+        return Err("file_not_found".to_string());
+    }
+    let mut holds_patched_file = false;
+    for (file_name, info) in files {
+        let normalized = normalize_file_path(file_name);
+        // SECURITY: never hash through a record key that escapes the tree.
+        if !is_safe_relative_subpath(normalized) {
+            return Err("file_not_found".to_string());
+        }
+        match compute_file_git_sha256(&tree.join(normalized)).await {
+            Ok(hash) if hash == info.after_hash => holds_patched_file = true,
+            Ok(_) => return Err("vendor_hash_mismatch".to_string()),
+            Err(e) if is_missing_path(&e) => {}
+            Err(_) => return Err("file_not_found".to_string()),
+        }
+    }
+    match voucher {
+        TreeVoucher::VerifiedDownload => Ok(()),
+        TreeVoucher::Ledger(Some(inventory)) => verify_tree_inventory(tree, inventory).await,
+        TreeVoucher::Ledger(None) if holds_patched_file => Ok(()),
+        TreeVoucher::Ledger(None) => Err("file_not_found".to_string()),
+    }
+}
+
+/// [`verify_dir_inventory`] for one prebuild tree: the files under `tree`
+/// are exactly the ones the copy's `inventory` lists below
+/// `<platform>/`, with the recorded bytes.
+async fn verify_tree_inventory(
+    tree: &Path,
+    inventory: &BTreeMap<String, String>,
+) -> Result<(), String> {
+    let mismatch = || "vendor_inventory_mismatch".to_string();
+    let platform = tree
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(mismatch)?;
+    let prefix = format!("{platform}/");
+    let recorded: BTreeMap<&str, &str> = inventory
+        .iter()
+        .filter_map(|(file, hash)| Some((file.strip_prefix(&prefix)?, hash.as_str())))
+        .collect();
+    let actual = compute_dir_inventory(tree)
+        .await
+        .map_err(|_| "vendor_artifact_unreadable".to_string())?;
+    if actual.len() != recorded.len() {
+        return Err(mismatch());
+    }
+    for (file, hash) in recorded {
+        match actual.get(file) {
+            Some(live) if live.eq_ignore_ascii_case(hash) => {}
+            _ => return Err(mismatch()),
         }
     }
     Ok(())
@@ -441,6 +620,76 @@ async fn untagged_manifest_matches(dir: &Path, uuid: &str, after_hash: &str) -> 
         .is_some_and(|b| compute_git_sha256_from_bytes(&b).eq_ignore_ascii_case(after_hash))
 }
 
+/// A jar past the limits of [`crate::patch::jar_members`]: its own tag, so
+/// the omission says the jar is too large, not that it cannot be read.
+pub(crate) const ARTIFACT_TOO_LARGE: &str = "vendor_artifact_too_large";
+
+fn jar_error_tag(e: crate::patch::jar_members::JarError) -> String {
+    if e.is_too_large() {
+        ARTIFACT_TOO_LARGE.to_string()
+    } else {
+        "vendor_artifact_unreadable".to_string()
+    }
+}
+
+/// Every record file at its `afterHash` in the committed jar at `jar`:
+/// only those members are inflated, each through the hasher.
+fn verify_jar_file_members(
+    jar: &Path,
+    files: &HashMap<String, PatchFileInfo>,
+) -> Result<(), String> {
+    // The shared guarded opener, as for a wheel: a FIFO planted at the
+    // artifact path fails the audit instead of wedging it.
+    let (file, metadata) = crate::utils::fs::open_regular_file_sync(jar)
+        .map_err(|_| "vendor_artifact_unreadable".to_string())?;
+    let jar = crate::patch::jar_members::Jar::open(std::io::BufReader::new(file), metadata.len())
+        .map_err(jar_error_tag)?;
+    verify_jar_members(jar, files).map_err(|(tag, _)| tag)
+}
+
+/// [`verify_jar_file_members`] over a jar already in memory. The error is
+/// `(routing tag, what a limit or the archive said)`.
+pub(crate) fn verify_jar_bytes_members(
+    jar: &[u8],
+    files: &HashMap<String, PatchFileInfo>,
+) -> Result<(), (String, String)> {
+    let jar = crate::patch::jar_members::Jar::of_bytes(jar)
+        .map_err(|e| (jar_error_tag(e.clone()), e.to_string()))?;
+    verify_jar_members(jar, files)
+}
+
+fn verify_jar_members<R: Read + std::io::Seek>(
+    mut jar: crate::patch::jar_members::Jar<R>,
+    files: &HashMap<String, PatchFileInfo>,
+) -> Result<(), (String, String)> {
+    for (file_name, info) in files {
+        // The two spellings `verify_member_map` looks a member up by.
+        let key = normalize_file_path(file_name);
+        let mut hash = None;
+        for name in [key, file_name.as_str()] {
+            hash = jar
+                .member_git_sha256(name)
+                .map_err(|e| (jar_error_tag(e.clone()), e.to_string()))?;
+            if hash.is_some() || key == file_name {
+                break;
+            }
+        }
+        let Some(hash) = hash else {
+            return Err((
+                "file_not_found".to_string(),
+                format!("it has no member `{key}`"),
+            ));
+        };
+        if !hash.eq_ignore_ascii_case(&info.after_hash) {
+            return Err((
+                "vendor_hash_mismatch".to_string(),
+                format!("its member `{key}` is not the patched file"),
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn read_wheel_to_map(whl: &Path) -> Result<HashMap<String, Vec<u8>>, String> {
     // The shared guarded opener: non-blocking open + regular-file check on
     // the handle, so a FIFO planted at the artifact path fails the audit
@@ -454,7 +703,10 @@ fn read_wheel_to_map(whl: &Path) -> Result<HashMap<String, Vec<u8>>, String> {
 
 /// [`read_wheel_to_map`] over in-memory zip bytes — the same entry and
 /// decompressed-size caps — for callers that hash and decode the SAME
-/// buffer (a committed wheel read exactly once).
+/// buffer (a committed wheel read exactly once). Jars have their own
+/// reader ([`crate::patch::jar_members`]), which leaves this one to the
+/// fixtures and the tests.
+#[cfg(any(test, feature = "test-fixtures"))]
 pub(crate) fn read_zip_bytes_to_map(bytes: &[u8]) -> Result<HashMap<String, Vec<u8>>, String> {
     read_zip_to_map(std::io::Cursor::new(bytes), false)
 }
@@ -707,7 +959,8 @@ pub enum ArtifactHealth {
     Missing,
     /// Present but failing verification: rebuildable. `reason` is the
     /// stable routing tag (`vendor_hash_mismatch`, `file_not_found`,
-    /// `vendor_artifact_unreadable`, `vendor_sha256_mismatch`,
+    /// `vendor_artifact_unreadable`, `vendor_artifact_too_large`,
+    /// `vendor_sha256_mismatch`,
     /// `vendor_inventory_mismatch`, `vendor_workspace_artifact_missing`,
     /// `vendor_workspace_artifact_corrupt`).
     Corrupt { reason: String },
@@ -773,6 +1026,7 @@ pub async fn check_vendored_artifact(
                 "vendor_hash_mismatch"
                 | "file_not_found"
                 | "vendor_artifact_unreadable"
+                | ARTIFACT_TOO_LARGE
                 | "vendor_artifact_non_canonical"
                 | "vendor_inventory_mismatch"
                 | "vendor_workspace_artifact_missing"
@@ -854,6 +1108,29 @@ pub async fn describe_artifact_failure(
                 format!("; the committed artifact {path} it mirrors is intact")
             };
             format!("Bun workspace copy {mirror} {cause} ({reason}){canonical}; {repair}")
+        }
+        ArtifactHealth::Corrupt { reason } if reason == ARTIFACT_TOO_LARGE => {
+            // Which limit: the archive's own (entries, central directory),
+            // else a patched member's inflated size.
+            let jar = project_root.join(path);
+            let limit = tokio::task::spawn_blocking(move || {
+                let (file, metadata) = crate::utils::fs::open_regular_file_sync(&jar).ok()?;
+                let reader = std::io::BufReader::new(file);
+                match crate::patch::jar_members::Jar::open(reader, metadata.len()) {
+                    Err(e) if e.is_too_large() => Some(e.to_string()),
+                    _ => None,
+                }
+            })
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| {
+                "a patched member inflates past what a jar of its size may".to_string()
+            });
+            format!(
+                "committed artifact {path} is past the limits jars are read within: {limit} \
+                 ({reason}); {repair}"
+            )
         }
         ArtifactHealth::Corrupt { reason } => {
             let cause = match reason.as_str() {

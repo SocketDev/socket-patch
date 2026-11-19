@@ -801,14 +801,19 @@ fn print_coverage(
 }
 
 /// The uuids of the patches an agent run left applied: the ones its nested
-/// apply wrote, and the ones it found already in place.
+/// apply wrote, the ones it found already in place, and the ones whose
+/// code is not in the build installed here
+/// ([`skip_leaves_patched`](crate::json_envelope::skip_leaves_patched)),
+/// as `apply --check` and `vex` count them.
 fn patched_uuids(outcome: &Envelope) -> HashSet<&str> {
     outcome
         .events
         .iter()
         .filter(|event| match event.action {
             PatchAction::Applied => true,
-            PatchAction::Skipped => event.error_code.as_deref() == Some("already_patched"),
+            PatchAction::Skipped => {
+                crate::json_envelope::skip_leaves_patched(event.error_code.as_deref())
+            }
             _ => false,
         })
         .filter_map(|event| event.uuid.as_deref())
@@ -1291,6 +1296,11 @@ pub(super) const GRADLE_MAVEN_LOCAL_UNDETERMINED: &str = "gradle_maven_local_und
 /// `$HOME/.gradle`.
 pub(super) const GRADLE_USER_HOME_DIFFERS: &str = "gradle_user_home_differs";
 
+/// Run-level warning: the project's `.mvn/maven.config` names one local
+/// repository to Maven before 3.9 and another to later Mavens, both exist
+/// and nothing says which Maven builds it, so neither was scanned.
+pub(crate) const MAVEN_LOCAL_REPOSITORY_UNDETERMINED: &str = "maven_local_repository_undetermined";
+
 /// What a scan learned about the Gradle side of discovery.
 #[derive(Default)]
 struct GradleScan {
@@ -1381,7 +1391,11 @@ async fn gradle_scan(
             &cwd,
             socket_patch_core::vendor::jvm::layout::BuildTool::Gradle,
         );
-        let env = JvmEnv::from_process();
+        let env = if global {
+            JvmEnv::from_process()
+        } else {
+            JvmEnv::for_project(&cwd)
+        };
         let gate = (!global && gradle_build).then(|| m2_gate(&cwd, &env));
         // The cwd's build locks annotate Gradle-cached packages in a global
         // run too; without a Gradle build at the cwd there is nothing to
@@ -1454,6 +1468,10 @@ async fn gradle_scan(
             }
         }
         _ => {}
+    }
+    if let Some(why) = &env.m2_undetermined {
+        out.notes
+            .push((MAVEN_LOCAL_REPOSITORY_UNDETERMINED.to_string(), why.clone()));
     }
     if let Some((home, passwd)) = mismatch {
         out.notes.push((
@@ -3921,6 +3939,56 @@ async fn scan_project(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The patches an agent run left in place, for the coverage lines: the
+    /// ones it wrote, the ones already there, and the ones whose code is
+    /// not in the build installed here, which `apply --check` and `vex`
+    /// count as patched too. An incomplete patch (its files written, its
+    /// compiled part not in effect), a failed one and one that is not
+    /// installed are not among them.
+    #[test]
+    fn patched_uuids_are_the_patches_the_run_left_in_place() {
+        let mut env = Envelope::new(JsonCommand::Scan);
+        let skip = |purl: &str, uuid: &str, code: &str| {
+            PatchEvent::new(PatchAction::Skipped, purl)
+                .with_uuid(uuid)
+                .with_reason(code, "why")
+        };
+        env.record(PatchEvent::new(PatchAction::Applied, "pkg:gem/a@1").with_uuid("applied"));
+        env.record(skip("pkg:gem/b@1", "in-place", "already_patched"));
+        env.record(skip(
+            "pkg:gem/nokogiri@1.18.10?platform=ruby",
+            "not-in-build",
+            "not_in_platform_build",
+        ));
+        // An incomplete patch: its files are written and what the copy
+        // compiles is not the patch's. The apply reports it as failed
+        // under its own code, on the run that wrote the files and on
+        // every later one, and it is no patch left in place.
+        env.record(
+            PatchEvent::new(PatchAction::Failed, "pkg:gem/c@1")
+                .with_uuid("incomplete")
+                .with_error(
+                    "native_extension_not_rebuilt",
+                    "the patch's files were written, but not built",
+                ),
+        );
+        // Neither is a skip that carries that code.
+        env.record(skip(
+            "pkg:gem/c2@1",
+            "not-rebuilt",
+            "native_extension_not_rebuilt",
+        ));
+        env.record(skip("pkg:gem/d@1", "absent", "package_not_installed"));
+        env.record(
+            PatchEvent::new(PatchAction::Failed, "pkg:gem/e@1")
+                .with_uuid("failed")
+                .with_error("apply_failed", "no"),
+        );
+        let mut landed: Vec<&str> = patched_uuids(&env).into_iter().collect();
+        landed.sort_unstable();
+        assert_eq!(landed, ["applied", "in-place", "not-in-build"]);
+    }
 
     #[test]
     fn pypi_equivalents_add_spellings_only_for_lockfile_only_pypi_pins() {

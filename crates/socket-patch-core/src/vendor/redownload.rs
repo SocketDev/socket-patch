@@ -158,19 +158,31 @@ pub async fn restore(
         {
             return Err("the downloaded artifact does not match the recorded size".into());
         }
-        let members = if entry.ecosystem == "pypi" {
-            super::pypi_distribution::read_members(&archive.bytes, &entry.artifact.path)?
-        } else if entry.artifact.path.ends_with(".tgz") || entry.artifact.path.ends_with(".tar.gz")
-        {
-            crate::patch::package::read_archive_bytes_to_map_strict(&archive.bytes)
-                .map_err(|e| e.to_string())?
+        if entry.artifact.path.ends_with(".jar") {
+            // A jar is read by name, case and all, by the JVM: the
+            // installer-shaped strictness of the wheel reader (ASCII names,
+            // no case-colliding pair) refuses obfuscated jars that hold
+            // both `a.class` and `A.class`, and its size caps refuse large
+            // ones. The record's members are hashed within the jar limits.
+            super::verify::verify_jar_bytes_members(&archive.bytes, &record.files).map_err(
+                |(tag, why)| format!("{tag}: the downloaded jar cannot be verified: {why}"),
+            )?;
         } else {
-            super::verify::read_zip_bytes_to_map_strict(&archive.bytes)?
-        };
-        if entry.ecosystem == "pypi" {
-            super::pypi_distribution::verify_members(&members, &entry.artifact.path, record)?;
-        } else {
-            super::verify::verify_member_map(&members, record)?;
+            let members = if entry.ecosystem == "pypi" {
+                super::pypi_distribution::read_members(&archive.bytes, &entry.artifact.path)?
+            } else if entry.artifact.path.ends_with(".tgz")
+                || entry.artifact.path.ends_with(".tar.gz")
+            {
+                crate::patch::package::read_archive_bytes_to_map_strict(&archive.bytes)
+                    .map_err(|e| e.to_string())?
+            } else {
+                super::verify::read_zip_bytes_to_map_strict(&archive.bytes)?
+            };
+            if entry.ecosystem == "pypi" {
+                super::pypi_distribution::verify_members(&members, &entry.artifact.path, record)?;
+            } else {
+                super::verify::verify_member_map(&members, record)?;
+            }
         }
         tokio::fs::create_dir_all(uuid_dir)
             .await
@@ -231,17 +243,36 @@ pub async fn restore(
             "gem" => {
                 let (name, _) =
                     parse_gem_purl(&entry.base_purl).ok_or("invalid gem coordinates")?;
-                super::gem::gem_service_copy(
-                    Some(service),
-                    record,
-                    &name,
-                    &stage,
-                    uuid_dir,
-                    true,
-                    &mut warnings,
-                )
-                .await
-                .map_err(|outcome| detail(*outcome))?;
+                // A gem vendored as platform gems is restored from the
+                // prebuild of each platform the ledger names.
+                let copied = match entry.gem_platforms.as_slice() {
+                    [] => {
+                        super::gem::gem_service_copy(
+                            Some(service),
+                            record,
+                            &name,
+                            &stage,
+                            uuid_dir,
+                            true,
+                            &mut warnings,
+                        )
+                        .await
+                    }
+                    platforms => {
+                        super::gem::gem_platform_service_copy(
+                            Some(service),
+                            record,
+                            &name,
+                            platforms,
+                            &stage,
+                            uuid_dir,
+                            true,
+                            &mut warnings,
+                        )
+                        .await
+                    }
+                };
+                copied.map_err(|outcome| detail(*outcome))?;
             }
             "npm" => {
                 let (name, version) = super::npm_common::parse_npm_purl(&entry.base_purl)
@@ -378,6 +409,16 @@ pub async fn restore(
             super::pypi::restore_uuid_metadata(&root.join(rel))
                 .await
                 .map_err(|e| e.to_string())?;
+        }
+    }
+    // Likewise a gem vendored as platform gems: only the artifact dir was
+    // swapped in from the stage, and without the uuid dir's own metadata a
+    // `*.so` / `*.bundle` rule drops the prebuilt binaries from the commit.
+    if entry.ecosystem == "gem" && !entry.gem_platforms.is_empty() {
+        if let Some(rel) = super::path::vendor_uuid_dir_rel("gem", &entry.uuid) {
+            super::gem::restore_uuid_metadata(&root.join(rel))
+                .await
+                .map_err(|e| format!("cannot restore the vendored dir's git metadata: {e}"))?;
         }
     }
     Ok(warnings)
