@@ -18,23 +18,48 @@
 //! and what Bazel is told outside these files (`--ignore_dev_dependency`,
 //! an override on the command line) is not known here.
 //!
-//! Reading and each query look at every byte, call, binding and use a
-//! bounded number of times, so their work grows with the size of the
-//! files, which is bounded too.
+//! The repositories of a `WORKSPACE` file are in no answer. Bazel 7 reads
+//! that file beside `MODULE.bazel`, Bazel 8 only when it is told to and
+//! Bazel 9 never, and which Bazel runs is not known here, so such a file
+//! is reported apart ([`Workspace::legacy`]) with its calls: an answer
+//! is certain only for a caller who finds none there or knows that Bazel
+//! does not read the file. The `.bzl` files it loads are not read yet.
 //!
-//! `WORKSPACE` files and the `.bzl` files they load are not read yet.
+//! Reading and each query look at every byte, call, binding and use a
+//! bounded number of times, and what is read is bounded: [`MAX_BYTES`]
+//! for a file, 256 files, 8 MiB of text and [`MAX_TOKENS`] tokens for a
+//! workspace, 1,024 doubts for a list. Past a bound there is a doubt. So
+//! no workspace takes long, and none makes a reader hold more than a few
+//! tens of MiB. Two files Bazel builds are refused: one with a byte that
+//! is not UTF-8, also in a comment, and one over a bound.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::{ErrorKind, Read as _};
-use std::path::Path;
+use std::io::{ErrorKind, Read};
+use std::path::{Component, Path};
 
-use super::starlark::{self, Bound, Call, File, How, Value, MAX_BYTES};
+use super::starlark::{self, Bound, Call, File, How, Value, MAX_BYTES, MAX_TOKENS};
 use crate::utils::fs::open_regular_file_sync;
+use crate::utils::group_commit;
 
-/// How many files of one workspace are asked for, and how many bytes are
-/// read in all.
+/// How many files of one workspace are asked for, beside the names of its
+/// `WORKSPACE` file, and how many bytes are read in all.
 const MAX_FILES: usize = 256;
 const MAX_TOTAL: usize = 8 << 20;
+const OVER_TOTAL: &str = "the files of the workspace are larger than 8 MiB in all";
+
+/// How many doubts a list keeps, the first ones: one more says nothing
+/// new. And how long the label of an included file may be: no file
+/// system has a longer path, and a doubt names the path of its file.
+const MAX_DOUBTS: usize = 1024;
+const MAX_LABEL: usize = 4096;
+
+/// The names of the file of the older `WORKSPACE` system, in the order
+/// Bazel takes one: `WorkspaceFileFunction` and `ExternalPackageHelper` at
+/// 7.7.2 and 8.8.2. 9.3.2 has neither.
+const LEGACY: [&str; 3] = ["WORKSPACE.bzlmod", "WORKSPACE.bazel", "WORKSPACE"];
+
+/// What [`disk`] says of a directory, a FIFO or a device.
+const NOT_A_FILE: &str = "it is not a regular file";
 
 /// What a view of the workspace has at a path. The path is from the Bazel
 /// root, with `/` between its parts.
@@ -48,21 +73,28 @@ pub enum Entry {
 
 /// The view of the checkout at `root`, the Bazel root. It opens nothing
 /// outside it: a path or a link that leads out is unreadable, like a
-/// directory, a file that is not UTF-8 and one over [`MAX_BYTES`].
+/// directory, a file that is not UTF-8 and one over [`MAX_BYTES`]. A file
+/// that this run has written or removed and not committed yet
+/// ([`group_commit`]) reads as the run left it. The root is resolved once
+/// and each path when it is asked for, so this holds for a tree that no
+/// other process changes meanwhile: one that swaps a directory for a link
+/// between the two steps of a read is not seen.
 pub fn disk(root: &Path) -> impl Fn(&str) -> Entry + '_ {
+    let top = std::fs::canonicalize(root);
     move |path| {
         let read = || -> std::io::Result<String> {
-            let real = std::fs::canonicalize(root.join(path))?;
-            if !real.starts_with(std::fs::canonicalize(root)?) {
+            let top = top.as_ref().map_err(|e| std::io::Error::from(e.kind()))?;
+            let plain = |part| matches!(part, Component::Normal(_));
+            if Path::new(path).components().all(plain) {
+                if let Some(pending) = group_commit::read(&top.join(path)) {
+                    return text(&pending?[..]);
+                }
+            }
+            let real = std::fs::canonicalize(top.join(path))?;
+            if !real.starts_with(top) {
                 return Err(std::io::Error::other("it leads out of the Bazel workspace"));
             }
-            let (file, meta) = open_regular_file_sync(&real)?;
-            if meta.len() > MAX_BYTES as u64 {
-                return Err(std::io::Error::other("it is larger than 1 MiB"));
-            }
-            let mut text = String::new();
-            file.take(MAX_BYTES as u64).read_to_string(&mut text)?;
-            Ok(text)
+            text(open_regular_file_sync(&real)?.0)
         };
         let unreadable = |why: &str| Entry::Unreadable(why.to_string());
         match read() {
@@ -72,11 +104,30 @@ pub fn disk(root: &Path) -> impl Fn(&str) -> Entry + '_ {
                 ErrorKind::InvalidData => unreadable("it is not UTF-8"),
                 // The opener's own words for a directory or a FIFO name
                 // the path on this machine.
-                ErrorKind::InvalidInput => unreadable("it is not a regular file"),
+                ErrorKind::InvalidInput => unreadable(NOT_A_FILE),
                 _ => unreadable(&e.to_string()),
             },
         }
     }
+}
+
+/// The text of `from`, read to its end. One byte more than [`MAX_BYTES`]
+/// is asked for: a file that grew since its size was taken is refused,
+/// not cut there and read as if it were whole.
+fn text(from: impl Read) -> std::io::Result<String> {
+    let mut bytes = Vec::new();
+    from.take(MAX_BYTES as u64 + 1).read_to_end(&mut bytes)?;
+    if bytes.len() > MAX_BYTES {
+        return Err(std::io::Error::other("it is larger than 1 MiB"));
+    }
+    String::from_utf8(bytes).map_err(|e| std::io::Error::new(ErrorKind::InvalidData, e))
+}
+
+/// The index of `text`, taken from the `room` of its workspace, or the
+/// line and the reason it has none.
+fn indexed(text: &str, room: &mut usize) -> Result<File, (usize, String)> {
+    let index = starlark::index_within(text.as_bytes(), room);
+    index.map_err(|unreadable| (unreadable.line, unreadable.why.to_string()))
 }
 
 /// The repository a label is in.
@@ -204,7 +255,7 @@ pub struct Tags<'a> {
     /// Why there may be other calls of this extension than these, beyond
     /// what [`Workspace::doubts`] says of every answer. Empty: the
     /// extension's proxies are only ever called and handed to `use_repo`
-    /// or `inject_repo`.
+    /// or `inject_repo`. The first 1,024 are kept.
     pub doubts: Vec<Doubt>,
 }
 
@@ -217,14 +268,30 @@ pub struct Workspace {
     pub files: Vec<(String, File)>,
     /// What could not be read of the files and of the names in them: a
     /// doubt about every answer of [`Self::tags`], which does not repeat
-    /// them.
+    /// them. The first 1,024 are kept.
     pub doubts: Vec<Doubt>,
+    /// The file of the older `WORKSPACE` system at the Bazel root, when
+    /// it says more than `workspace(...)`: its name (`WORKSPACE.bzlmod`,
+    /// else `WORKSPACE.bazel`, else `WORKSPACE`, as Bazel takes one) and
+    /// its calls, or why it could not be read. `None` without such a
+    /// file, and for one that is empty or only names the workspace.
+    ///
+    /// The repositories it defines are in no answer of [`Self::tags`].
+    /// It is no entry of [`Self::doubts`], because whether Bazel reads it
+    /// is not in these files: 7.x does by default, 8.x under
+    /// `--enable_workspace`, 9.x never. A caller that knows the release
+    /// can pass over it, and one that looks for a ruleset can see whether
+    /// the file calls it. Without either, an answer is certain only when
+    /// this is `None` too.
+    pub legacy: Option<Result<(String, File), Doubt>>,
     /// The name of the root module, and the name the main repository has
     /// for itself.
     module: String,
     own: Option<String>,
     /// The module behind each repository name a `bazel_dep` gives.
     deps: BTreeMap<String, String>,
+    /// What [`handed`] finds in each of `files`.
+    handed: Vec<BTreeSet<(usize, usize)>>,
 }
 
 /// The functions a proxy may be handed to. `override_repo` is none: it
@@ -278,6 +345,11 @@ impl Workspace {
     /// itself, and an `include` of another form, is a doubt. Bazel fails
     /// on each but one: 9.3.2 takes `dev_dependency` as a second argument.
     /// A name that starts with a dot is read, as 7.7.2 reads it.
+    ///
+    /// Then the `WORKSPACE` file is asked for ([`Self::legacy`]), with or
+    /// without a `MODULE.bazel`. Bazel takes the first of the three names
+    /// that is a file, so a directory of that name is passed over: a disk
+    /// that folds case has one for `workspace`.
     pub fn read(view: &dyn Fn(&str) -> Entry) -> Workspace {
         let mut ws = Workspace::default();
         // The files to read, last first: the path, the file that includes
@@ -286,6 +358,7 @@ impl Workspace {
         // The file that includes each of `ws.files`.
         let mut includers: Vec<Option<usize>> = Vec::new();
         let (mut budget, mut failed) = (MAX_TOTAL, BTreeSet::new());
+        let mut room = MAX_TOKENS;
         while let Some((path, includer, line)) = todo.pop() {
             // One doubt has said that it cannot be had.
             if failed.contains(&path) {
@@ -320,14 +393,12 @@ impl Workspace {
                 Entry::Absent => Err((0, "it does not exist".to_string())),
                 Entry::Unreadable(why) => Err((0, format!("it cannot be read: {why}"))),
                 Entry::Text(text) if text.len() > budget => {
-                    let why = "the files of the workspace are larger than 8 MiB in all";
-                    ws.doubt(&path, 0, format!("{why}{by}"));
+                    ws.doubt(&path, 0, format!("{OVER_TOTAL}{by}"));
                     break;
                 }
                 Entry::Text(text) => {
                     budget -= text.len();
-                    let index = starlark::index(text.as_bytes());
-                    index.map_err(|unreadable| (unreadable.line, unreadable.why.to_string()))
+                    indexed(&text, &mut room)
                 }
             };
             match file {
@@ -343,12 +414,32 @@ impl Workspace {
                 }
             }
         }
+        // The `WORKSPACE` file Bazel would take, within the same bounds.
+        for name in LEGACY {
+            let read = match view(name) {
+                Entry::Absent => continue,
+                // Bazel takes a file only, and goes on to the next name.
+                Entry::Unreadable(why) if why == NOT_A_FILE => continue,
+                Entry::Unreadable(why) => Err((0, format!("it cannot be read: {why}"))),
+                Entry::Text(text) if text.len() > budget => Err((0, OVER_TOTAL.to_string())),
+                Entry::Text(text) => indexed(&text, &mut room),
+            };
+            let file = name.to_string();
+            let says = |call: &Call| call.bind.is_some() || call.callee != "workspace";
+            ws.legacy = match read {
+                Ok(read) => read.calls.iter().any(says).then_some(Ok((file, read))),
+                Err((line, why)) => Some(Err(Doubt { file, line, why })),
+            };
+            break;
+        }
         ws
     }
 
     fn doubt(&mut self, file: &str, line: usize, why: impl Into<String>) {
-        let (file, why) = (file.to_string(), why.into());
-        self.doubts.push(Doubt { file, line, why });
+        if self.doubts.len() < MAX_DOUBTS {
+            let (file, why) = (file.to_string(), why.into());
+            self.doubts.push(Doubt { file, line, why });
+        }
     }
 
     /// Takes from `file` what it says of the workspace itself: the names
@@ -371,7 +462,8 @@ impl Workspace {
                 "include" => {
                     let alone = call.whole && call.args.len() == 1 && !named.contains(&at);
                     let label = string(call.positional(0)).filter(|label| {
-                        alone && label.starts_with("//") && label.ends_with(".MODULE.bazel")
+                        let form = label.starts_with("//") && label.ends_with(".MODULE.bazel");
+                        alone && form && label.len() <= MAX_LABEL
                     });
                     let label = label.and_then(|label| Label::parse(label, ""));
                     includes.extend(label.iter().map(|label| (label.path(), call.line)));
@@ -384,6 +476,8 @@ impl Workspace {
                     let placed = call.whole || handed.contains(&span);
                     placed && extension(call).is_some()
                 }
+                // Bazel takes none here, and what it binds is not followed.
+                "load" => false,
                 _ => true,
             };
             if !read {
@@ -407,6 +501,13 @@ impl Workspace {
                 self.doubt(path, line, format!("`{name}` may be given another value"));
             }
         }
+        // What stands below one of these may not run, or run often
+        // (`DotBazelFileSyntaxChecker`, as `load` above).
+        for (line, word) in &file.blocks {
+            let why = format!("`{word}` starts a statement, which Bazel refuses here");
+            self.doubt(path, *line, why);
+        }
+        self.handed.push(handed);
         includes
     }
 
@@ -486,8 +587,7 @@ impl Workspace {
     /// argument of `use_repo` or `inject_repo`, is a doubt.
     pub fn tags(&self, extension: &Extension, tag: &str) -> Tags<'_> {
         let mut tags = Tags::default();
-        for (path, file) in &self.files {
-            let handed = handed(file);
+        for ((path, file), handed) in self.files.iter().zip(&self.handed) {
             // The `use_extension` calls that ask for the extension, and
             // whether each makes a dev dependency. Each call is looked at
             // once, however many names it has.
@@ -504,6 +604,9 @@ impl Workspace {
                     asked.insert(at, dev);
                 }
             }
+            if asked.is_empty() {
+                continue;
+            }
             // The bindings that stand for the extension.
             let mut proxies = BTreeMap::new();
             for (at, bind) in file.binds.iter().enumerate() {
@@ -512,8 +615,10 @@ impl Workspace {
                 }
             }
             let mut doubt = |line, why: String| {
-                let file = path.clone();
-                tags.doubts.push(Doubt { file, line, why });
+                if tags.doubts.len() < MAX_DOUBTS {
+                    let file = path.clone();
+                    tags.doubts.push(Doubt { file, line, why });
+                }
             };
             for used in &file.uses {
                 let proxy = used.bind.is_some_and(|bind| proxies.contains_key(&bind));
@@ -1291,6 +1396,7 @@ use_repo(go_deps, "com_github_google_uuid", "org_golang_x_net")
         let root = "this `module` cannot be read";
         let extension = "this `use_extension` cannot be read";
         let include = "this `include` cannot be read";
+        let long = format!("include('//:{}.MODULE.bazel')", "a".repeat(MAX_LABEL));
         for (text, why) in [
             // The name a module has in the workspace.
             ("bazel_dep(name = NAME, repo_name = 'rules_python')", dep),
@@ -1382,6 +1488,8 @@ use_repo(go_deps, "com_github_google_uuid", "org_golang_x_net")
             // One statement of its own with one argument, at every release;
             // `dev_dependency`, which 9.3.2 takes, is not read.
             ("include('//:a.MODULE.bazel', '//:b.MODULE.bazel')", include),
+            // A name longer than any path: a doubt names its file.
+            (long.as_str(), include),
             ("x = include('//:a.MODULE.bazel')", include),
             ("[include('//:a.MODULE.bazel') for _ in [1]]", include),
             ("None if x else include('//:a.MODULE.bazel')", include),
@@ -1531,10 +1639,10 @@ use_repo(go_deps, "com_github_google_uuid", "org_golang_x_net")
             }
         };
         let ws = Workspace::read(&view);
-        assert_eq!(
-            *asked.borrow(),
-            ["MODULE.bazel", "bad.MODULE.bazel", "gone.MODULE.bazel"]
-        );
+        // Each once, and then the three names of a `WORKSPACE` file.
+        let mut all = vec!["MODULE.bazel", "bad.MODULE.bazel", "gone.MODULE.bazel"];
+        all.extend(LEGACY);
+        assert_eq!(*asked.borrow(), all);
         assert_eq!(
             doubts(&ws.doubts),
             [
@@ -1552,31 +1660,31 @@ use_repo(go_deps, "com_github_google_uuid", "org_golang_x_net")
                 _ => Entry::Absent,
             }
         });
-        assert_eq!((asked.get(), ws.doubts.len()), (256, 256));
+        assert_eq!((asked.get(), ws.doubts.len()), (256 + 3, 256));
         let want = "255.MODULE.bazel:0: it is one more than the 256 files that are asked for; \
                     MODULE.bazel:256 includes it";
         assert_eq!(doubts(&ws.doubts)[255], want);
     }
 
     /// One query looks at each call, binding and use of a file once. A
-    /// proxy with as many names as fit in the largest file, made by a call
+    /// proxy with as many names as a file has room for, made by a call
     /// with many arguments or a long label, is the shape that a query
-    /// which looked at the call again for each name takes minutes on.
+    /// which looked at the call again for each name takes long on.
     #[test]
     fn a_query_grows_with_the_size_of_the_files() {
         let label = "@rules_python//python/extensions:pip.bzl";
         let fill = |head: String| {
-            let names = "a=p\n".repeat((MAX_BYTES - head.len() - 16) / 4);
+            let names = "a=p\n".repeat(MAX_TOKENS / 6);
             module(&format!("{head}{names}a.parse()\n"))
         };
         let started = std::time::Instant::now();
-        let many = ",x".repeat(MAX_BYTES / 6);
+        let many = ",x".repeat(MAX_TOKENS / 8);
         let many = fill(format!("p = use_extension('{label}', 'pip'{many})\n"));
         let long = "x".repeat(MAX_BYTES / 2);
         let long = fill(format!("p = use_extension('{label}{long}', 'pip')\n"));
         for (ws, calls) in [(many, 1), (long, 0)] {
             assert_eq!((ws.files.len(), &ws.doubts), (1, &vec![]));
-            assert!(ws.files[0].1.binds.len() > MAX_BYTES / 16);
+            assert!(ws.files[0].1.binds.len() > MAX_TOKENS / 8);
             let tags = ws.tags(&PIP, "parse");
             assert_eq!((tags.calls.len(), doubts(&tags.doubts)), (calls, vec![]));
         }
@@ -1719,17 +1827,13 @@ use_repo(go_deps, "com_github_google_uuid", "org_golang_x_net")
         let asked = std::cell::Cell::new(0);
         let ws = Workspace::read(&|path| {
             asked.set(asked.get() + 1);
-            let at: usize = path
-                .split('.')
-                .next()
-                .and_then(|at| at.parse().ok())
-                .unwrap_or(0);
-            match at < 300 {
-                true => Entry::Text(format!("include('//:{}')\n", chain(at + 1))),
-                false => Entry::Absent,
+            let at: Option<usize> = path.split('.').next().and_then(|at| at.parse().ok());
+            match at.or((path == "MODULE.bazel").then_some(0)) {
+                Some(at) if at < 300 => Entry::Text(format!("include('//:{}')\n", chain(at + 1))),
+                _ => Entry::Absent,
             }
         });
-        assert_eq!((ws.files.len(), asked.get()), (256, 256));
+        assert_eq!((ws.files.len(), asked.get()), (256, 256 + 3));
         let want = "256.MODULE.bazel:0: it is one more than the 256 files that are asked for; \
                     255.MODULE.bazel:1 includes it";
         assert_eq!(doubts(&ws.doubts), [want]);
@@ -1746,11 +1850,386 @@ use_repo(go_deps, "com_github_google_uuid", "org_golang_x_net")
         let want = "8.MODULE.bazel:0: the files of the workspace are larger than 8 MiB in all; \
                     MODULE.bazel:9 includes it";
         assert_eq!(doubts(&ws.doubts), [want]);
+        // The `WORKSPACE` file is one of the files of the workspace.
+        let (file, why) = ("WORKSPACE.bzlmod".to_string(), OVER_TOTAL.to_string());
+        assert_eq!(ws.legacy, Some(Err(Doubt { file, line: 0, why })));
         // One file over the limit of a file.
         let ws = module(&" ".repeat(MAX_BYTES + 1));
         assert_eq!(
             doubts(&ws.doubts),
             ["MODULE.bazel:1: it is larger than 1 MiB"]
+        );
+    }
+
+    /// How many calls, arguments, bindings and uses a workspace holds.
+    fn held(ws: &Workspace) -> usize {
+        let args = |call: &Call| 1 + call.args.len();
+        let of = |file: &File| {
+            file.calls.iter().map(args).sum::<usize>() + file.binds.len() + file.uses.len()
+        };
+        let legacy = ws.legacy.iter().flatten().map(|(_, file)| of(file));
+        ws.files
+            .iter()
+            .map(|(_, file)| of(file))
+            .chain(legacy)
+            .sum()
+    }
+
+    const TOO_LARGE: &str =
+        "it is too large to read with certainty: more tokens, with the files before it, than are read";
+
+    /// The files of a workspace share the tokens of one file. A file that
+    /// has more than are left is a doubt, and takes none: a smaller one
+    /// after it is read.
+    #[test]
+    fn the_tokens_of_a_workspace_are_bounded() {
+        let names = "a\n".repeat(60_000);
+        let pip =
+            "pip = use_extension('@rules_python//python/extensions:pip.bzl', 'pip')\npip.parse()\n";
+        let ws = Workspace::read(&|path| match path {
+            "MODULE.bazel" => {
+                let includes = (0..4).map(|at| format!("include('//:{at}.MODULE.bazel')\n"));
+                Entry::Text(includes.collect())
+            }
+            "3.MODULE.bazel" => Entry::Text(pip.to_string()),
+            "WORKSPACE" => Entry::Text(format!("{names}pip_parse()\n")),
+            path if path.ends_with(".MODULE.bazel") => Entry::Text(names.clone()),
+            _ => Entry::Absent,
+        });
+        let read: Vec<&str> = ws.files.iter().map(|(path, _)| path.as_str()).collect();
+        assert_eq!(
+            read,
+            [
+                "MODULE.bazel",
+                "0.MODULE.bazel",
+                "1.MODULE.bazel",
+                "3.MODULE.bazel"
+            ]
+        );
+        // 16 tokens in the root, 60,000 in each of two files: 11,056 are left.
+        let line = MAX_TOKENS - 16 - 120_000 + 1;
+        let want = format!("2.MODULE.bazel:{line}: {TOO_LARGE}; MODULE.bazel:3 includes it");
+        assert_eq!(doubts(&ws.doubts), [want]);
+        assert_eq!(sites(&ws.tags(&PIP, "parse")), ["3.MODULE.bazel:2"]);
+        // The `WORKSPACE` file is read last, in what the others left.
+        let (file, why) = ("WORKSPACE".to_string(), TOO_LARGE.to_string());
+        let line = line - 13;
+        assert_eq!(ws.legacy, Some(Err(Doubt { file, line, why })));
+        assert!(held(&ws) <= MAX_TOKENS);
+    }
+
+    /// Files in the shapes that an index holds most of: at 1 MiB each,
+    /// seven of them made a reader hold hundreds of MiB. Now a file that
+    /// does not fit in the tokens of a workspace is a doubt, and what is
+    /// held of the others is bounded by their tokens.
+    #[test]
+    fn no_workspace_makes_a_reader_hold_much() {
+        let read = |unit: &str, tail: &str, files: usize, size: usize| {
+            let times = size / (unit.len() + tail.len());
+            let text = [unit.repeat(times), tail.repeat(times)].concat();
+            let includes = (0..files).map(|at| format!("include('//:{at}.MODULE.bazel')\n"));
+            let root: String = includes.collect();
+            let ws = Workspace::read(&|path| match path {
+                "MODULE.bazel" => Entry::Text(root.clone()),
+                path if path.ends_with(".MODULE.bazel") => Entry::Text(text.clone()),
+                _ => Entry::Absent,
+            });
+            assert!(held(&ws) <= MAX_TOKENS, "{unit:?}: {}", held(&ws));
+            // Every file is read or is a doubt, and the first doubt says why.
+            assert_eq!(ws.files.len() + ws.doubts.len(), files + 1, "{unit:?}");
+            assert!(ws.doubts[0].why.starts_with(TOO_LARGE), "{unit:?}");
+            ws.files.len() - 1
+        };
+        let started = std::time::Instant::now();
+        // Many calls, arguments, uses and bindings; deep nesting; the
+        // strings of a list and of a dict.
+        for (unit, tail) in [
+            ("f(a,b,c,d)\n", ""),
+            ("f(a,", ")"),
+            ("f(a=b,", ")"),
+            ("a ", ""),
+            ("a=b\n", ""),
+            ("f(", ")"),
+            ("[", "]"),
+            ("f([\"\",", "])"),
+            ("f({\"\":\"\",", "})"),
+        ] {
+            // Of three files of 120 KiB one fits, or two.
+            assert!(read(unit, tail, 3, 120 << 10) >= 1, "{unit:?}");
+        }
+        // Seven files of 1 MiB: none fits. And of many small files, four.
+        assert_eq!(read("f(a,b,c,d)\n", "", 7, MAX_BYTES - 64), 0);
+        assert_eq!(read("f(a,b,c,d)\n", "", 40, 32_000), 4);
+        // A doubt for each use would be as large as the index: a list
+        // keeps the first ones. So does the list of an answer.
+        let pip = "p = use_extension('@rules_python//python/extensions:pip.bzl', 'pip')\n";
+        let ws = module(&format!("{pip}{}", "use_repo p ".repeat(MAX_TOKENS / 4)));
+        assert_eq!(ws.files[0].1.uses.len(), MAX_TOKENS / 2);
+        assert_eq!(ws.doubts.len(), MAX_DOUBTS);
+        assert_eq!(ws.tags(&PIP, "parse").doubts.len(), MAX_DOUBTS);
+        let took = started.elapsed();
+        assert!(took < std::time::Duration::from_secs(60), "{took:?}");
+    }
+
+    /// Bazel refuses a `MODULE.bazel` that holds an `if`, a `for` or a
+    /// `def` statement, or a `load` (`DotBazelFileSyntaxChecker`, the same
+    /// at 7.7.2, 8.8.2 and 9.3.2). The calls below one are listed as
+    /// statements that run, so each is a doubt about every answer.
+    #[test]
+    fn a_statement_bazel_refuses_in_a_module_file_is_a_doubt() {
+        let pip = "pip = use_extension('@rules_python//python/extensions:pip.bzl', 'pip')\n";
+        let refused = |word: &str| format!("`{word}` starts a statement, which Bazel refuses here");
+        for (text, why, calls, whole) in [
+            (
+                "if False:\n    pip.parse(hub_name = 'never')\n",
+                refused("if"),
+                1,
+                1,
+            ),
+            (
+                "for hub in []:\n    pip.parse(hub_name = hub)\n",
+                refused("for"),
+                1,
+                1,
+            ),
+            (
+                "def hubs():\n    pip.parse(hub_name = 'uncalled')\n",
+                refused("def"),
+                1,
+                1,
+            ),
+            ("x = 1; if x: pip.parse()\n", refused("if"), 1, 0),
+            // What a `load` binds is not followed: this is not Bazel's
+            // `use_extension`.
+            (
+                "load('//:defs.bzl', 'use_extension')\n",
+                "this `load` cannot be read".to_string(),
+                0,
+                0,
+            ),
+        ] {
+            for files in [
+                vec![("MODULE.bazel", format!("{pip}{text}"))],
+                vec![
+                    ("MODULE.bazel", "include('//:a.MODULE.bazel')\n".to_string()),
+                    ("a.MODULE.bazel", format!("{pip}{text}")),
+                ],
+            ] {
+                let files: Vec<(&str, &str)> = (files.iter())
+                    .map(|(path, text)| (*path, text.as_str()))
+                    .collect();
+                let ws = workspace(&files);
+                let want = format!("{}:2: {why}", files[files.len() - 1].0);
+                assert_eq!(doubts(&ws.doubts), [want], "{text}");
+                // The call in the body is listed, on a line of its own as
+                // a statement that runs: only the doubt says otherwise.
+                let tags = ws.tags(&PIP, "parse");
+                let runs = tags.calls.iter().filter(|tag| tag.call.whole).count();
+                assert_eq!((tags.calls.len(), runs), (calls, whole), "{text}");
+            }
+        }
+        // A conditional expression and a comprehension are no statements.
+        let ws = module(&format!(
+            "{pip}pip.parse() if x else None\n[pip.parse(hub_name = hub) for hub in hubs if hub]\n"
+        ));
+        assert_eq!(ws.doubts, []);
+    }
+
+    /// Bazel 7 takes repositories from a `WORKSPACE` file beside
+    /// `MODULE.bazel`, Bazel 8 when it is told to, Bazel 9 never. The file
+    /// it would take is reported apart from the doubts, with its calls,
+    /// when it says more than `workspace(...)`.
+    #[test]
+    fn a_workspace_file_that_defines_something_is_reported_apart() {
+        let root = "module(name = 'shop')\n";
+        let pip_parse = "load('@rules_python//python:pip.bzl', 'pip_parse')\n\
+                         pip_parse(name = 'pypi', requirements_lock = '//:requirements.txt')\n";
+        let legacy = |files: &[(&str, &str)]| {
+            let ws = workspace(files);
+            // No call of the tag and no doubt: the answer from MODULE.bazel.
+            assert_eq!(ws.tags(&PIP, "parse"), Tags::default(), "{files:?}");
+            assert_eq!(ws.doubts, [], "{files:?}");
+            ws.legacy.map(|legacy| match legacy {
+                Ok((file, read)) => {
+                    let callees: Vec<&str> =
+                        read.calls.iter().map(|call| call.callee.as_str()).collect();
+                    format!("{file}: {}", callees.join(" "))
+                }
+                Err(doubt) => format!("{}:{}: {}", doubt.file, doubt.line, doubt.why),
+            })
+        };
+        let hub = Some("WORKSPACE: load pip_parse".to_string());
+        assert_eq!(
+            legacy(&[("MODULE.bazel", root), ("WORKSPACE", pip_parse)]),
+            hub
+        );
+        // Without a MODULE.bazel too.
+        assert_eq!(legacy(&[("WORKSPACE", pip_parse)]), hub);
+        // The first of the three names is the file Bazel takes: an empty
+        // `WORKSPACE.bzlmod` is how a workspace turns the old file off.
+        let other = "http_archive(name = 'x')\n";
+        for (files, want) in [
+            (
+                vec![("WORKSPACE", pip_parse), ("WORKSPACE.bazel", other)],
+                Some("WORKSPACE.bazel: http_archive"),
+            ),
+            (
+                vec![("WORKSPACE.bazel", pip_parse), ("WORKSPACE.bzlmod", other)],
+                Some("WORKSPACE.bzlmod: http_archive"),
+            ),
+            (
+                vec![("WORKSPACE", pip_parse), ("WORKSPACE.bzlmod", "")],
+                None,
+            ),
+            // A file that defines nothing says nothing.
+            (vec![("WORKSPACE", "")], None),
+            (vec![("WORKSPACE", "# pip_parse(name = 'pypi')\n")], None),
+            (vec![("WORKSPACE", "workspace(name = 'shop')\n")], None),
+            (
+                vec![("WORKSPACE", "NAME = 'shop'\nworkspace(name = NAME)\n")],
+                None,
+            ),
+            // Any other call does, also one under the name of `workspace`.
+            (
+                vec![("WORKSPACE", "workspace(name = name())\n")],
+                Some("WORKSPACE: workspace name"),
+            ),
+            (
+                vec![(
+                    "WORKSPACE",
+                    "workspace = pip_parse\nworkspace(name = 'pypi')\n",
+                )],
+                Some("WORKSPACE: workspace"),
+            ),
+            // And a file that cannot be read may define anything.
+            (
+                vec![("WORKSPACE", "workspace(name = 'shop')\npip_parse(\n")],
+                Some("WORKSPACE:2: a bracket is never closed"),
+            ),
+        ] {
+            let mut all = vec![("MODULE.bazel", root)];
+            all.extend(files);
+            assert_eq!(legacy(&all).as_deref(), want, "{all:?}");
+        }
+        // What the view cannot give is told apart from a file that is
+        // read; a directory of that name is passed over, as Bazel does.
+        let ws = Workspace::read(&|path| match path {
+            "MODULE.bazel" => Entry::Text(root.to_string()),
+            "WORKSPACE.bazel" => Entry::Unreadable(NOT_A_FILE.to_string()),
+            "WORKSPACE" => Entry::Unreadable("it is not UTF-8".to_string()),
+            _ => Entry::Absent,
+        });
+        let (file, why) = (
+            "WORKSPACE".to_string(),
+            "it cannot be read: it is not UTF-8".to_string(),
+        );
+        assert_eq!(ws.legacy, Some(Err(Doubt { file, line: 0, why })));
+        assert_eq!(ws.doubts, []);
+    }
+
+    /// A file that grows after it was opened is refused: cut at the bound
+    /// it would be read as if it ended there.
+    #[test]
+    fn a_file_that_grows_past_the_bound_is_not_cut_there() {
+        let read = |len: u64| text(std::io::repeat(b'#').take(len));
+        assert_eq!(read(MAX_BYTES as u64).unwrap().len(), MAX_BYTES);
+        for len in [MAX_BYTES as u64 + 1, u64::MAX] {
+            let refused = read(len).unwrap_err();
+            assert_eq!(refused.to_string(), "it is larger than 1 MiB", "{len}");
+        }
+        assert_eq!(
+            text(&b"caf\xe9"[..]).unwrap_err().kind(),
+            ErrorKind::InvalidData
+        );
+        assert_eq!(text(&b"caf\xc3\xa9"[..]).unwrap(), "caf\u{e9}");
+    }
+
+    /// A command that has written `MODULE.bazel` in a group commit reads
+    /// what it wrote, before the commit puts it on disk.
+    #[tokio::test]
+    async fn a_write_the_run_still_holds_is_what_is_read() {
+        use crate::utils::fs::{atomic_write_bytes, remove_file};
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let hub = |name: &str| {
+            let pip = "pip = use_extension('@rules_python//python/extensions:pip.bzl', 'pip')";
+            format!("{pip}\npip.parse(hub_name = '{name}')\n")
+        };
+        let include = |name: &str| format!("include('//tools:{name}.MODULE.bazel')\n");
+        std::fs::create_dir(root.join("tools")).unwrap();
+        let on_disk = [include("kept"), include("gone")].concat();
+        std::fs::write(root.join("MODULE.bazel"), &on_disk).unwrap();
+        std::fs::write(root.join("tools/kept.MODULE.bazel"), hub("disk")).unwrap();
+        std::fs::write(root.join("tools/gone.MODULE.bazel"), hub("gone")).unwrap();
+        let hubs = || {
+            let ws = Workspace::read(&disk(root));
+            let tags = ws.tags(&PIP, "parse");
+            let name = |tag: &Tag| string(tag.call.arg("hub_name")).to_string();
+            (
+                tags.calls.iter().map(name).collect::<Vec<_>>(),
+                doubts(&ws.doubts),
+            )
+        };
+        assert_eq!(
+            hubs(),
+            (vec!["disk".to_string(), "gone".to_string()], vec![])
+        );
+
+        // The run rewrites the root and one included file, adds a file
+        // and removes one. Nothing of it is on disk.
+        let run = crate::utils::group_commit::GroupCommit::begin(root);
+        let pending = [on_disk.as_str(), &include("new"), &hub("root")].concat();
+        let write = |path: &str, text: String| {
+            let path = root.join(path);
+            async move { atomic_write_bytes(&path, text.as_bytes()).await.unwrap() }
+        };
+        write("MODULE.bazel", pending).await;
+        write("tools/kept.MODULE.bazel", hub("rewritten")).await;
+        write("tools/new.MODULE.bazel", hub("new")).await;
+        remove_file(&root.join("tools/gone.MODULE.bazel"))
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(root.join("MODULE.bazel")).unwrap(),
+            on_disk
+        );
+        assert!(!root.join("tools/new.MODULE.bazel").exists());
+        let gone = "tools/gone.MODULE.bazel:0: it does not exist; MODULE.bazel:2 includes it";
+        assert_eq!(
+            hubs(),
+            (
+                vec![
+                    "root".to_string(),
+                    "rewritten".to_string(),
+                    "new".to_string()
+                ],
+                vec![gone.to_string()]
+            )
+        );
+        // A write that is held is bounded and checked like a file.
+        let view = disk(root);
+        write("tools/new.MODULE.bazel", "#".repeat(MAX_BYTES + 1)).await;
+        let big = Entry::Unreadable("it is larger than 1 MiB".to_string());
+        assert_eq!(view("tools/new.MODULE.bazel"), big);
+        atomic_write_bytes(&root.join("tools/new.MODULE.bazel"), b"# caf\xe9\n")
+            .await
+            .unwrap();
+        let latin1 = Entry::Unreadable("it is not UTF-8".to_string());
+        assert_eq!(view("tools/new.MODULE.bazel"), latin1);
+        // And none is read from outside the root that is asked.
+        let out = Entry::Unreadable("it leads out of the Bazel workspace".to_string());
+        let below = root.join("tools");
+        assert_eq!(disk(&below)("../MODULE.bazel"), out);
+        assert_eq!(
+            disk(&below)(root.join("MODULE.bazel").to_str().unwrap()),
+            out
+        );
+
+        // The run is dropped without a commit: the disk is what is read.
+        drop(run);
+        assert_eq!(
+            hubs(),
+            (vec!["disk".to_string(), "gone".to_string()], vec![])
         );
     }
 
@@ -1766,6 +2245,7 @@ use_repo(go_deps, "com_github_google_uuid", "org_golang_x_net")
         let ws = Workspace::read(&disk(&root));
         assert_eq!(ws.doubts, []);
         assert_eq!(ws.files.len(), 3);
+        assert_eq!(ws.legacy, None);
         let memory = workspace(&SHOP);
         for (extension, tag) in [
             (NPM, "npm_translate_lock"),
@@ -1803,6 +2283,19 @@ use_repo(go_deps, "com_github_google_uuid", "org_golang_x_net")
         assert_eq!(view("big.MODULE.bazel"), big);
         std::fs::write(root.join("full.MODULE.bazel"), vec![b'#'; MAX_BYTES]).unwrap();
         assert!(matches!(view("full.MODULE.bazel"), Entry::Text(_)));
+        // A `WORKSPACE` file beside them, under a directory that has
+        // another of its names: Bazel takes the first that is a file.
+        std::fs::create_dir(root.join("WORKSPACE.bazel")).unwrap();
+        std::fs::write(root.join("WORKSPACE"), "maven_install(artifacts = [])\n").unwrap();
+        let ws = Workspace::read(&disk(&root));
+        let Some(Ok((file, read))) = &ws.legacy else {
+            panic!("{:?}", ws.legacy);
+        };
+        assert_eq!(
+            (file.as_str(), read.calls[0].callee.as_str()),
+            ("WORKSPACE", "maven_install")
+        );
+        assert_eq!((ws.files.len(), &ws.doubts), (3, &vec![]));
         // And a root that is not there at all.
         assert_eq!(
             disk(&tmp.path().join("gone"))("MODULE.bazel"),

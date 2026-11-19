@@ -18,10 +18,11 @@
 //! whole. A reader of such a file has to tell the functions apart first.
 //!
 //! It takes bytes and panics on none. Every step consumes a byte or a
-//! token, nothing recurses, the literal of an argument is given up at its
-//! first token that is not part of one, and a name that is bound again
-//! shares what it stands for, so time and memory grow with the size of the
-//! file, which [`MAX_BYTES`] bounds. The tests hold that for the shapes
+//! token, nothing recurses, and the literal of an argument is given up at
+//! its first token that is not part of one, so time grows with the size of
+//! the file, which [`MAX_BYTES`] bounds. What an index holds grows with the
+//! number of tokens, which [`MAX_TOKENS`] bounds, and with the bytes of
+//! the names and strings it copies. The tests hold that for the shapes
 //! they name. Bytes that are not UTF-8 are content in a comment or a
 //! string, as they are for Bazel; a string that holds them has no value.
 //!
@@ -29,15 +30,27 @@
 //! string or a bracket that is never closed, a bracket closed by another
 //! kind. Other text Bazel rejects (`$`, a tab as indentation) becomes
 //! tokens: Bazel builds nothing from such a file, so no reading of it is
-//! acted on.
+//! acted on. `load` is listed as a call and binds no name: the reader of
+//! a file that may hold one has to follow it.
 
 use std::collections::HashMap;
 use std::ops::Range;
-use std::sync::Arc;
 
 /// The largest file that is read. The largest of 17,842 workspace and
 /// `.bzl` files of the rulesets and the Bazel Central Registry is 0.6 MiB.
 pub const MAX_BYTES: usize = 1 << 20;
+
+/// The most tokens that are read, of one file and of the files of one
+/// workspace together. An index holds one call, argument, binding, use,
+/// statement or string of a list for a token at most, so this bounds
+/// what a reader holds whatever the text is. The largest of those 17,842
+/// files has 39,954 tokens, and the largest of 13,664 workspaces 4,669
+/// in 70 files.
+pub const MAX_TOKENS: usize = 1 << 17;
+
+/// Why a file with more tokens than there is room for is not read.
+const TOO_LARGE: &str =
+    "it is too large to read with certainty: more tokens, with the files before it, than are read";
 
 /// Why a file is not read, and the line the reason is on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -88,9 +101,9 @@ fn word(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
 }
 
-/// The tokens of a file. Blanks, comments, line ends and the backslash
-/// that joins two lines are not tokens.
-fn tokens(src: &[u8]) -> Result<Vec<Token>, Unreadable> {
+/// The tokens of a file, which may have `room` of them. Blanks, comments,
+/// line ends and the backslash that joins two lines are not tokens.
+fn tokens(src: &[u8], room: usize) -> Result<Vec<Token>, Unreadable> {
     let fail = |line, why| Err(Unreadable { line, why });
     if src.len() > MAX_BYTES {
         return fail(1, "it is larger than 1 MiB");
@@ -125,6 +138,9 @@ fn tokens(src: &[u8]) -> Result<Vec<Token>, Unreadable> {
             return fail(line, "a string is never closed");
         };
         if let Some(kind) = kind {
+            if out.len() == room {
+                return fail(line, TOO_LARGE);
+            }
             let (mut mate, outside) = (0, open.is_empty());
             if kind == Kind::Open {
                 // `)` follows `(` in ASCII; `]` and `}` are two after theirs.
@@ -346,15 +362,11 @@ pub enum Bound {
     /// The result of a call, an index into [`File::calls`]: `x = f(...)`.
     /// `y = x` binds `y` to the same.
     Call(usize),
-    /// A symbol of another file: the `load` call, an index into
-    /// [`File::calls`], and the symbol's name there. `load(file, "f")`
-    /// binds `f` to `f`, `load(file, g = "f")` binds `g` to `f`.
-    Loaded(usize, Arc<str>),
     /// Anything else.
     Other,
 }
 
-/// A statement `name = ...`, or one symbol of a `load`.
+/// A statement `name = ...`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Bind {
     pub name: String,
@@ -389,10 +401,18 @@ pub struct File {
     pub calls: Vec<Call>,
     pub binds: Vec<Bind>,
     pub uses: Vec<Use>,
+    /// The statements that start with `def`, `for` or `if`, each as its
+    /// line and that word. What stands below one may run never or often,
+    /// and its calls are listed like any other; Bazel takes no such
+    /// statement in a `MODULE.bazel` or a `WORKSPACE` file.
+    pub blocks: Vec<(usize, &'static str)>,
 }
 
 /// Words of the language: never a callee, never a use.
 const KEYWORDS: &[u8] = b"and break continue def elif else for if in lambda not or pass return";
+
+/// The ones that start a statement with a body.
+const BLOCKS: [&str; 3] = ["def", "for", "if"];
 
 /// An open bracket; the first one of the stack stands for the statement.
 #[derive(Default)]
@@ -435,9 +455,16 @@ struct Reader<'a> {
     inside: [Vec<Range<usize>>; 2],
 }
 
-/// The calls, bindings and uses of a file.
+/// The calls, bindings and uses of a file of at most [`MAX_TOKENS`] tokens.
 pub fn index(src: &[u8]) -> Result<File, Unreadable> {
-    let (tokens, frames) = (tokens(src)?, vec![Frame::default()]);
+    index_within(src, &mut { MAX_TOKENS })
+}
+
+/// [`index`] for a file that may have `room` tokens: what it has is taken
+/// from `room`, so that the files of one workspace share one bound.
+pub(super) fn index_within(src: &[u8], room: &mut usize) -> Result<File, Unreadable> {
+    let (tokens, frames) = (tokens(src, *room)?, vec![Frame::default()]);
+    *room -= tokens.len();
     let mut reader = Reader {
         src,
         tokens,
@@ -563,6 +590,11 @@ impl<'a> Reader<'a> {
             _ => {}
         }
         if KEYWORDS.split(|b| *b == b' ').any(|word| word == text) {
+            let starts = top && at == self.statement;
+            let block = BLOCKS.iter().find(|word| starts && word.as_bytes() == text);
+            self.file
+                .blocks
+                .extend(block.map(|word| (token.line, *word)));
             return;
         }
         let target = if top {
@@ -704,23 +736,6 @@ impl<'a> Reader<'a> {
             };
             self.bind(self.name(start), line, to);
         }
-        // `load(file, "name", other = "name")` binds its symbols.
-        let load = call.filter(|call| {
-            let call = &self.file.calls[*call];
-            call.callee == "load" && call.bind.is_none()
-        });
-        let symbols = load.map_or(Vec::new(), |load| self.file.calls[load].args.clone());
-        for arg in symbols.into_iter().skip(1) {
-            let (Some(load), Value::Str(symbol)) = (load, arg.value) else {
-                continue;
-            };
-            let name = match arg.how {
-                How::Positional => symbol.clone(),
-                How::Keyword(name) => name,
-                How::Star | How::StarStar => continue,
-            };
-            self.bind(name, line, Bound::Loaded(load, symbol.into()));
-        }
         self.targets = self.file.uses.len();
     }
 
@@ -735,6 +750,11 @@ impl<'a> Reader<'a> {
 mod tests {
     use super::*;
     use crate::test_rng::Rng;
+
+    /// The tokens of a file read alone.
+    fn tokens(src: &[u8]) -> Result<Vec<Token>, Unreadable> {
+        super::tokens(src, MAX_TOKENS)
+    }
 
     /// The tokens of `src`, each as its kind and its text; `^` marks the
     /// first token of a statement.
@@ -963,6 +983,31 @@ mod tests {
         assert!(index(&vec![b'a'; 5 << 20]).is_err());
     }
 
+    /// A file may have as many tokens as there is room for, and takes
+    /// what it has from the room; one token more and it is refused at the
+    /// line of that token, and takes nothing.
+    #[test]
+    fn a_file_with_more_tokens_than_there_is_room_for_is_refused() {
+        let src = "f(a)\nd = 1\n";
+        let mut room = 7;
+        let file = index_within(src.as_bytes(), &mut room).unwrap();
+        assert_eq!((file.calls.len(), file.binds.len(), room), (1, 1, 0));
+        for (mut room, line) in [(6, 2), (0, 1)] {
+            let (left, why) = (room, TOO_LARGE);
+            let refused = index_within(src.as_bytes(), &mut room);
+            assert_eq!(refused, Err(Unreadable { line, why }));
+            assert_eq!(room, left, "nothing is taken");
+        }
+        // Read alone, a file has the room of a workspace.
+        let full = "a\n".repeat(MAX_TOKENS);
+        assert_eq!(index(full.as_bytes()).unwrap().uses.len(), MAX_TOKENS);
+        let over = Unreadable {
+            line: MAX_TOKENS + 1,
+            why: TOO_LARGE,
+        };
+        assert_eq!(index(format!("{full}b").as_bytes()), Err(over));
+    }
+
     #[test]
     fn every_argument_class() {
         let file = read(
@@ -1082,7 +1127,37 @@ mod tests {
         let words = "def f(a, b = g()):\n    return (a)\nif (a) and (b) or not (c) in (d): pass\n\
                      for (x) in (y): pass\nz = lambda (w): w\nprint(1)\n";
         assert_eq!(callees(words), ["g", "print"]);
-        assert_eq!(callees("load('//:a.bzl', 'b')"), ["load"]);
+        // `load` is a call like any other, and binds nothing.
+        let file = read("load('//:a.bzl', 'b', c = 'd')\nb()\nc()\n");
+        let bound: Vec<_> = file.calls.iter().map(|call| call.bind).collect();
+        assert_eq!(
+            (file.calls[0].callee.as_str(), bound),
+            ("load", vec![None; 3])
+        );
+        assert_eq!(file.binds, []);
+    }
+
+    /// A statement that starts with `def`, `for` or `if` is listed with
+    /// its line: what stands below it is read as statements of its own.
+    #[test]
+    fn a_statement_with_a_body_is_listed() {
+        let file = read(
+            "if False:\n    a()\nelif x:\n    b()\nelse:\n    c()\n\
+             for v in w: d(v)\n\
+             def f(g = h()):\n    return i()\n\
+             x = 1; if y: j()\n\
+             k() if l else m()\n\
+             n = [o(p) for p in q if r]\n\
+             s(def = 1, for = 2)\n\
+             t = lambda: u()\n",
+        );
+        assert_eq!(file.blocks, [(1, "if"), (7, "for"), (8, "def"), (10, "if")]);
+        // The calls below one are whole statements like any other.
+        let whole: Vec<&str> = (file.calls.iter())
+            .filter(|call| call.whole)
+            .map(|call| call.callee.as_str())
+            .collect();
+        assert_eq!(whole, ["a", "b", "c", "s"]);
     }
 
     /// Bazel reads a name that ends a line and a parenthesis that starts
@@ -1203,60 +1278,6 @@ mod tests {
     }
 
     #[test]
-    fn load_binds_its_symbols() {
-        let file = read(
-            "load('@rules_python//python:pip.bzl', 'pip_parse', parse = 'pip_parse', bad = 1)\n\
-             pip_parse(name = 'a')\n\
-             parse(name = 'b')\n\
-             f(load('//:x.bzl', 'inner'))\n\
-             inner()\n\
-             load = g\n\
-             load('//:y.bzl', 'late')\n\
-             late()\n",
-        );
-        let loaded = |symbol: &str| Bound::Loaded(0, symbol.into());
-        let binds: Vec<(&str, &Bound)> = (file.binds.iter())
-            .map(|bind| (bind.name.as_str(), &bind.to))
-            .collect();
-        assert_eq!(
-            binds,
-            [
-                ("pip_parse", &loaded("pip_parse")),
-                ("parse", &loaded("pip_parse")),
-                // A `load` inside a call, and one after `load` was bound
-                // to something else, bind nothing.
-                ("load", &Bound::Other),
-            ]
-        );
-        assert_eq!(
-            file.calls[0].positional(0),
-            Some(&string("@rules_python//python:pip.bzl"))
-        );
-        assert_eq!(calls(&file, "pip_parse")[0].bind, Some(0));
-        assert_eq!(calls(&file, "parse")[0].bind, Some(1));
-        assert_eq!(calls(&file, "inner")[0].bind, None);
-        assert_eq!(calls(&file, "late")[0].bind, None);
-    }
-
-    /// The names bound to one loaded symbol hold its name once: a copy
-    /// each would be the square of the file.
-    #[test]
-    fn the_names_of_one_loaded_symbol_share_it() {
-        let (symbol, aliases) = ("s".repeat(32 << 10), "a=s\n".repeat(8 << 10));
-        let src = format!("load('//:f.bzl', s = '{symbol}')\n{aliases}");
-        let file = read(&src);
-        assert_eq!(file.binds.len(), (8 << 10) + 1);
-        let mut held = std::collections::BTreeMap::new();
-        for bind in &file.binds {
-            let Bound::Loaded(_, symbol) = &bind.to else {
-                panic!("{:?}", bind.name);
-            };
-            held.insert(symbol.as_ptr(), symbol.len());
-        }
-        assert!(held.values().sum::<usize>() <= src.len());
-    }
-
-    #[test]
     fn every_use_of_a_name_but_calling_it_is_listed() {
         let file = read(
             "pip = use_extension('//:e.bzl', 'pip')\n\
@@ -1367,9 +1388,7 @@ mod tests {
             }
         }
         for bind in &file.binds {
-            assert!(
-                !matches!(bind.to, Bound::Call(call) | Bound::Loaded(call, _) if call >= file.calls.len())
-            );
+            assert!(!matches!(bind.to, Bound::Call(call) if call >= file.calls.len()));
         }
     }
 
@@ -1433,20 +1452,41 @@ mod tests {
         }
     }
 
+    /// How many calls, arguments, bindings, uses, statements with a body
+    /// and strings of a list or a dict the index of a file holds.
+    fn held(file: &File) -> usize {
+        fn strings(value: &Value) -> usize {
+            match value {
+                Value::List(items) => items.len(),
+                Value::Dict(items) => items.iter().map(|(_, item)| 1 + strings(item)).sum(),
+                _ => 0,
+            }
+        }
+        let args = |call: &Call| -> usize {
+            let each = call.args.iter().map(|arg| 1 + strings(&arg.value));
+            1 + each.sum::<usize>()
+        };
+        let calls: usize = file.calls.iter().map(args).sum();
+        calls + file.binds.len() + file.uses.len() + file.blocks.len()
+    }
+
     /// The largest file that is read, in each shape that nests or repeats
-    /// without end, and with one long thing that many names stand for. One
-    /// pass over 1 MiB takes well under a second; a pass that walked the
-    /// nesting again at each level, or copied the long thing for each
-    /// name, would take 10^12 steps.
+    /// without end: as much of it as fits in the bytes and in the tokens
+    /// of one file. One pass over it takes well under a second; a pass
+    /// that walked the nesting again at each level would take 10^10 steps.
+    /// And its index holds one thing for a token at most, whatever the
+    /// shape: that is what bounds the memory of a reader.
     #[test]
-    fn the_work_grows_with_the_size_of_the_file() {
+    fn the_work_and_the_index_grow_with_the_tokens_of_the_file() {
         let fill = |unit: &str, tail: &str| -> Vec<u8> {
+            let build = |times: usize| [unit.repeat(times), tail.repeat(times)].concat();
             let times = MAX_BYTES / (unit.len() + tail.len());
-            let mut src = unit.repeat(times);
-            src.push_str(&tail.repeat(times));
-            src.into_bytes()
+            let all = super::tokens(build(times).as_bytes(), usize::MAX);
+            let all = all.map_or(MAX_TOKENS, |tokens| tokens.len().max(MAX_TOKENS));
+            build(times * MAX_TOKENS / all).into_bytes()
         };
         let started = std::time::Instant::now();
+        let mut read = 0;
         for (unit, tail) in [
             ("(", ""),
             ("(", ")"),
@@ -1476,22 +1516,26 @@ mod tests {
             ("# \\\n", ""),
             ("\0", ""),
             ("\u{e9}", ""),
+            ("if\n", ""),
+            ("f(a=b,", ")"),
         ] {
             let src = fill(unit, tail);
-            assert!(
-                src.len() <= MAX_BYTES && src.len() > MAX_BYTES - 64,
-                "{unit:?}"
-            );
+            assert!(src.len() <= MAX_BYTES, "{unit:?}");
             sound(&src);
+            let (Ok(tokens), Ok(file)) = (tokens(&src), index(&src)) else {
+                continue;
+            };
+            read += 1;
+            assert!(held(&file) <= tokens.len(), "{unit:?}");
+            // Each shape is as large as a file gets, in bytes or in tokens.
+            let full = tokens.len() > MAX_TOKENS - 16 || src.len() > MAX_BYTES - 64;
+            assert!(full, "{unit:?}: {} tokens", tokens.len());
         }
-        let (long, args) = ("s".repeat(MAX_BYTES / 2), "x,".repeat(MAX_BYTES / 4));
-        for head in [
-            format!("load('//:f.bzl', s = '{long}')\n"),
-            format!("s = f({args})\n"),
-        ] {
-            let names = "a=s\n".repeat((MAX_BYTES - head.len()) / 4);
-            sound(format!("{head}{names}").as_bytes());
-        }
+        // All but the three that end in an open bracket or an open string.
+        assert_eq!(read, 27);
+        // One call with many arguments that many names stand for.
+        let (args, names) = ("x,".repeat(MAX_TOKENS / 8), "a=s\n".repeat(MAX_TOKENS / 6));
+        sound(format!("s = f({args})\n{names}").as_bytes());
         let took = started.elapsed();
         assert!(took < std::time::Duration::from_secs(120), "{took:?}");
     }

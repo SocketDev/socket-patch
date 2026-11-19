@@ -4,7 +4,7 @@
       "paths": [
         "crates/socket-patch-core/src/bazel/"
       ],
-      "max": 1082
+      "max": 1131
     },
     "lock-readers": {
       "paths": [
