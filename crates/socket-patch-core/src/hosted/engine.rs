@@ -2796,11 +2796,17 @@ async fn rewrite_once(
         (files, rewrite)
     };
     // The Maven rewriter's respelling of `.mvn/maven.config` is a courtesy,
-    // never the reason a run is refused: through a symbolic link the write
-    // would replace the link, which the guard refuses for every write, so
-    // the line is left as it is.
-    if view.is_symlink(crate::patch::redirect::MVN_CONFIG) {
-        crate::patch::redirect::withhold_maven_heal(&mut rewrite);
+    // never the reason a run is refused or fails: where the file cannot be
+    // replaced (a symbolic link, which the guard refuses for every write;
+    // a directory that does not take the write) the line is left as it is.
+    if crate::patch::redirect::carries_maven_heal(&rewrite) {
+        let writable = match view {
+            ProjectView::Disk(root) => crate::patch::redirect::maven_config_writable(root).await,
+            _ => !view.is_symlink(crate::patch::redirect::MVN_CONFIG),
+        };
+        if !writable {
+            crate::patch::redirect::withhold_maven_heal(&mut rewrite);
+        }
     }
     // The gem files were withheld on purpose: say why, not "no Gemfile".
     if let Some(warning) = gem_refusal {
@@ -6187,6 +6193,19 @@ snapshots:
         std::fs::write(tmp.path().join(MVN_CONFIG), checksums_block(Session)).unwrap();
         let done = heal_only(&view).await.expect("the block is read");
         assert_eq!(done.rewritten, [MVN_CONFIG]);
+
+        // Nor is it planned into a directory that does not take the write:
+        // the commit would fail a run that had nothing else to do. (Root
+        // writes anywhere, so there is nothing to see as root.)
+        if unsafe { libc::geteuid() } != 0 {
+            use std::os::unix::fs::PermissionsExt as _;
+            let dir = tmp.path().join(".mvn");
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+            let done = heal_only(&view).await.expect("the block is read");
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+            assert!(done.rewrite.files.is_empty() && done.rewritten.is_empty());
+            assert!(done.rewrite.edits.is_empty() && done.rewrite.warnings.is_empty());
+        }
     }
 
     /// The Gradle pass reads the script graph's scripts and every build's

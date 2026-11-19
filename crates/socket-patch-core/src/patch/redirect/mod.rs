@@ -9909,16 +9909,37 @@ const MVN_CONFIG_HEAL_TRADE: &str = "redirect_maven_trusted_checksums_maven3_onl
 /// config afterwards (the block holds every setting), so the file's whole
 /// change is the heal.
 pub(crate) fn withhold_maven_heal(result: &mut RewriteResult) -> bool {
-    let is_heal = |edit: &FileEdit| {
-        edit.path == MVN_CONFIG && edit.key.as_deref() == Some(MVN_CONFIG_HEAL_KEY)
-    };
-    if !result.edits.iter().any(is_heal) {
+    if !carries_maven_heal(result) {
         return false;
     }
     result.files.remove(MVN_CONFIG);
-    result.edits.retain(|edit| !is_heal(edit));
+    result.edits.retain(|edit| !is_maven_heal(edit));
     result.warnings.retain(|w| w.code != MVN_CONFIG_HEAL_TRADE);
     true
+}
+
+fn is_maven_heal(edit: &FileEdit) -> bool {
+    edit.path == MVN_CONFIG && edit.key.as_deref() == Some(MVN_CONFIG_HEAL_KEY)
+}
+
+/// Whether `result` respells `.mvn/maven.config` ([`heal_mvn_config`]).
+pub(crate) fn carries_maven_heal(result: &RewriteResult) -> bool {
+    result.edits.iter().any(is_maven_heal)
+}
+
+/// Whether the writers could replace the `.mvn/maven.config` under `root`:
+/// what every staged write is checked for before anything is written
+/// ([`staged::preflight`]). A symbolic link (a rename-over would replace
+/// it with a detached copy), anything else that is not a regular file, and
+/// a directory that does not take the write all refuse the whole run they
+/// are part of, which a heal must never do.
+pub(crate) async fn maven_config_writable(root: &std::path::Path) -> bool {
+    let pending = vec![staged::Pending {
+        rel: MVN_CONFIG,
+        content: Some(b"".as_slice()),
+        read: None,
+    }];
+    staged::preflight(root, pending).await.is_ok()
 }
 
 /// What rewriting the Trusted Checksums directory line of the

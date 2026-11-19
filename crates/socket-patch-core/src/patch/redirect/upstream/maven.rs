@@ -478,7 +478,8 @@ async fn drop_checksums(
 /// `dir` declares ([`trusted_checksums::heal_basedir`]): the lines are left
 /// in place, but the one an earlier release wrote must not go on stopping
 /// Maven 3.9.2 to 3.9.8 from starting with `-f` from outside the project.
-/// What that trades away on Maven 4 is said, as the scan says it.
+/// What that trades away on Maven 4 is said, as the scan says it. Left out
+/// where the config cannot be written ([`View::write_if_writable`]).
 async fn heal_mvn_config(
     view: &mut View<'_>,
     dir: &str,
@@ -503,12 +504,18 @@ async fn heal_mvn_config(
     else {
         return;
     };
-    if let Some(detail) = heal_trade_detail(&healed, &declared, dir) {
+    let trade = heal_trade_detail(&healed, &declared, dir);
+    // A courtesy, never the reason a restore is refused: a config the
+    // flush would not write (a symbolic link, say) keeps its line, as it
+    // did before there was a heal, and the pins are restored all the same.
+    if !view.write_if_writable(config_rel, healed).await {
+        return;
+    }
+    if let Some(detail) = trade {
         result
             .warnings
             .push(("maven_trusted_checksums_maven3_only", detail));
     }
-    view.write(config_rel, healed);
 }
 
 #[cfg(test)]
@@ -1013,6 +1020,63 @@ mod tests {
         let (outcome, after) = run(&files(theirs.clone(), None)).await;
         assert_eq!(after[".mvn/maven.config"], theirs);
         assert_eq!(codes(&outcome), [left]);
+    }
+
+    /// The heal is a courtesy. The flush is all or nothing and will not
+    /// write through a symbolic link, so a linked config that keeps the
+    /// block is left exactly as it is, and the pin is restored all the
+    /// same, as it was before there was a heal. (`rollback` and `remove`
+    /// both restore through here.)
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_linked_config_keeps_its_line_and_the_pin_is_still_restored() {
+        use super::trusted_checksums::{self, Basedir::Session};
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let put = |rel: &str, text: &str| {
+            let path = root.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        };
+        let config = format!(
+            "-Dmaven.test.skip=true\n{}\n",
+            trusted_checksums::config_args(Session).join("\n")
+        );
+        put("pom.xml", &fixture("basic", "expected", "pom.xml"));
+        put(
+            ".mvn/checksums/checksums.sha256",
+            &fixture("basic", "expected", ".mvn/checksums/checksums.sha256"),
+        );
+        put("ci/maven.config", &config);
+        std::os::unix::fs::symlink("../ci/maven.config", root.join(".mvn/maven.config")).unwrap();
+        let pins = [HostedPin {
+            purl: "pkg:maven/org.slf4j/slf4j-api@1.7.36".into(),
+            uuid: UUID.into(),
+            files: vec!["pom.xml".into()],
+        }];
+        let opts = RestoreOptions {
+            offline: true,
+            ..RestoreOptions::default()
+        };
+        let outcome = restore_upstream(root, &pins, &opts).await;
+        assert_eq!(outcome.flush_error, None);
+        assert_eq!(outcome.pins[0].status, PinStatus::Restored);
+        assert_eq!(
+            std::fs::read_to_string(root.join("pom.xml")).unwrap(),
+            fixture("basic", "input", "pom.xml")
+        );
+        assert!(!root.join(".mvn/checksums/checksums.sha256").exists());
+        let link = std::fs::symlink_metadata(root.join(".mvn/maven.config")).unwrap();
+        assert!(link.file_type().is_symlink(), "the link is still a link");
+        assert_eq!(
+            std::fs::read_to_string(root.join("ci/maven.config")).unwrap(),
+            config,
+            "and what it points at is untouched"
+        );
+        // The leftover lines are reported; no trade is claimed for a line
+        // that was not changed.
+        let codes: Vec<&str> = outcome.warnings.iter().map(|(code, _)| *code).collect();
+        assert_eq!(codes, ["maven_trusted_checksums_left"]);
     }
 
     #[tokio::test]
