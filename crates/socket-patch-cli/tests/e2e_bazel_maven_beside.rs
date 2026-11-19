@@ -647,6 +647,142 @@ fn a_pinned_hub_gets_its_block_and_the_undo_takes_it_out() {
 /// The Bazel files of a checkout, each with its text.
 type Files = Vec<(&'static str, String)>;
 
+/// A Maven pin is not always one edit of the root `pom.xml`. In a reactor
+/// it goes to the module that selects the version, with the repository in
+/// the root; a version that a property sets is pinned through the
+/// property; and behind a mirror of the machine's Maven settings that
+/// would take the Socket repository there is no pin at all, and the run
+/// says so. Beside a pinned hub each of those runs still writes the hub's
+/// block: Bazel fetches the jar of an entry by its URL, through no mirror
+/// of Maven's. The pin is one, in the block and in every pom that holds
+/// part of it, and the undo takes all of it out, to the byte.
+#[test]
+fn the_hub_gets_its_block_whatever_the_maven_pin_is() {
+    let machine = Machine::start();
+    let root = "<project>\n  <modelVersion>4.0.0</modelVersion>\n  \
+                <groupId>com.example</groupId>\n  <artifactId>root</artifactId>\n  \
+                <version>1</version>\n  <packaging>pom</packaging>\n  <modules>\n    \
+                <module>app</module>\n  </modules>\n</project>\n";
+    let module = PROJECT_POM.replace(
+        "  <groupId>com.example</groupId>\n  <artifactId>app</artifactId>\n  <version>1</version>\n",
+        "  <parent>\n    <groupId>com.example</groupId>\n    <artifactId>root</artifactId>\n    \
+         <version>1</version>\n  </parent>\n  <artifactId>app</artifactId>\n",
+    );
+    let property = PROJECT_POM
+        .replace("<version>1.10.0<", "<version>${victim.version}<")
+        .replace(
+            "  <dependencies>\n",
+            "  <properties>\n    <victim.version>1.10.0</victim.version>\n  </properties>\n  \
+             <dependencies>\n",
+        );
+    assert!(module.contains("<parent>") && property.contains("<properties>"));
+    let mirror = "<settings>\n  <mirrors>\n    <mirror>\n      <id>corp</id>\n      \
+                  <mirrorOf>*</mirrorOf>\n      <url>https://repo.example/maven2</url>\n    \
+                  </mirror>\n  </mirrors>\n</settings>\n";
+    // The poms of the checkout, those of them that take part of the pin,
+    // the settings of the machine, and what the run warns of.
+    let rows: [(&str, Files, &[&str], Option<&str>, &[&str]); 3] = [
+        (
+            "a reactor",
+            vec![("pom.xml", root.to_string()), ("app/pom.xml", module)],
+            &["app/pom.xml", "pom.xml"],
+            None,
+            &[],
+        ),
+        (
+            "a property",
+            vec![("pom.xml", property)],
+            &["pom.xml"],
+            None,
+            &[],
+        ),
+        (
+            "a mirror",
+            vec![("pom.xml", PROJECT_POM.to_string())],
+            &[],
+            Some(mirror),
+            &["redirect_maven_mirror_captures_repository"],
+        ),
+    ];
+    for (shape, poms, pinned_poms, settings, warns) in rows {
+        machine.make(&[pinned(), poms].concat(), false, false);
+        if let Some(settings) = settings {
+            let m2 = machine.root.join("home/.m2");
+            std::fs::create_dir_all(&m2).expect("the user's Maven directory");
+            std::fs::write(m2.join("settings.xml"), settings).expect("the settings");
+        }
+        let before = machine.files();
+
+        let get = machine.step(COMMANDS[0]);
+        let envelope = get.envelope();
+        assert_eq!(get.code, Some(0), "{shape}: {get:?}");
+        assert_eq!(
+            event_for(&envelope, PURL)["action"],
+            "applied",
+            "{shape}: {get:?}"
+        );
+        assert_eq!(warning_codes(&envelope), warns, "{shape}: {get:?}");
+        // The block, the poms of the pin, and the checksum files of a
+        // Maven pin when there is one.
+        let pin: Vec<&str> = [&["MODULE.bazel"], pinned_poms].concat();
+        let mut wrote: Vec<String> = pin.iter().map(|file| format!("proj/{file}")).collect();
+        let checksums = &POM_FILES[..2 * usize::from(!pinned_poms.is_empty())];
+        wrote.extend(checksums.iter().map(|file| file.to_string()));
+        wrote.sort_unstable();
+        assert_eq!(
+            get.wrote.keys().collect::<Vec<_>>(),
+            wrote.iter().collect::<Vec<_>>(),
+            "{shape}: {get:?}"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&get.wrote[MODULE]),
+            format!("{HUB}\n{BLOCK}"),
+            "{shape}"
+        );
+
+        // `list` shows one pin, in those files, and `vex` states it once.
+        let of_the_patch = |envelope: &Value| -> Vec<Value> {
+            let events = envelope::events(envelope).iter();
+            events
+                .filter(|event| event["purl"] == PURL)
+                .cloned()
+                .collect()
+        };
+        let listed = of_the_patch(&machine.step(&["list", "--json"]).envelope());
+        assert_eq!(listed.len(), 1, "{shape}: {listed:?}");
+        assert_eq!(
+            listed[0]["details"]["lockfiles"],
+            json!(pin),
+            "{shape}: {listed:?}"
+        );
+        let vex = ["vex", "--json", "--output", "vex.json"];
+        let vex = machine.step(&[&vex[..], &["--product", "pkg:generic/proj"]].concat());
+        let stated = of_the_patch(&vex.envelope());
+        assert_eq!(stated.len(), 1, "{shape}: {vex:?}");
+        assert_eq!(
+            stated[0]["details"]["status"], "not_affected",
+            "{shape}: {vex:?}"
+        );
+        std::fs::remove_file(machine.root.join("proj/vex.json")).expect("the document");
+
+        // A second run finds all of it in place, and the undo leaves none.
+        let again = machine.step(COMMANDS[0]);
+        assert_eq!(
+            (again.code, &again.wrote),
+            (Some(0), &BTreeMap::new()),
+            "{shape}: {again:?}"
+        );
+        let undo = machine.step(&["rollback", "--yes", "--json"]);
+        assert_eq!(undo.code, Some(0), "{shape}: {undo:?}");
+        assert_eq!(
+            undo.envelope()["summary"]["rolledBack"],
+            1,
+            "{shape}: {undo:?}"
+        );
+        assert_eq!(machine.files(), before, "{shape}: {undo:?}");
+    }
+}
+
 /// Where the block cannot be shown to work the run writes nothing for
 /// the hub and says why: alone in a tree only Bazel builds, and beside
 /// the Maven pin, which still lands, in a tree that Maven builds too.

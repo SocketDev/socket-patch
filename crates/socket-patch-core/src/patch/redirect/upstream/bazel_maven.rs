@@ -103,6 +103,50 @@ mod tests {
         );
     }
 
+    /// A checkout that Maven builds too holds the patch in its `pom.xml`
+    /// as well: one pin, wired in two files. Each restorer takes the pin
+    /// out of its own file, and both are as they were before.
+    #[tokio::test]
+    async fn a_pin_that_a_pom_holds_too_is_taken_out_of_both_files() {
+        let [plain, lock, ours] = sample(UUID);
+        // The golden pom of the Maven rewriter, for the sample's jar.
+        let pom = |side: &str| {
+            let fixtures = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures");
+            let path = format!("{fixtures}/redirect/maven/pom/basic/{side}/pom.xml");
+            std::fs::read_to_string(path)
+                .unwrap()
+                .replace("org.slf4j", "io.netty")
+                .replace("slf4j-api", "netty-tcnative-classes")
+                .replace("77777777-7777-7777-7777-777777777777", UUID)
+                .replace("1.7.36-socket.77777777", "2.0.61.Final-socket.7c8d9e0f")
+                .replace("1.7.36", "2.0.61.Final")
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let files = [
+            (FILE, &ours),
+            ("maven_install.json", &lock),
+            ("pom.xml", &pom("expected")),
+        ];
+        for (rel, text) in files {
+            std::fs::write(dir.path().join(rel), text).unwrap();
+        }
+        let disk = crate::vendor::lock_inventory::ProjectView::Disk(dir.path());
+        let pins = HostedPin::discover(disk, &[]).await;
+        let both = HostedPin {
+            files: vec![FILE.to_string(), "pom.xml".to_string()],
+            ..pin(PURL, UUID)
+        };
+        assert_eq!(pins, [both]);
+        let options = RestoreOptions {
+            offline: true,
+            ..Default::default()
+        };
+        let out = restore_upstream(dir.path(), &pins, &options).await;
+        assert_eq!((out.refused().count(), &out.flush_error), (0, &None));
+        let left = |rel: &str| std::fs::read_to_string(dir.path().join(rel)).unwrap();
+        assert_eq!((left(FILE), left("pom.xml")), (plain, pom("input")));
+    }
+
     #[tokio::test]
     async fn what_is_not_an_entry_of_the_pin_is_refused_and_nothing_is_written() {
         let [plain, _, ours] = sample(UUID);
