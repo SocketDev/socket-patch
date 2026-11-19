@@ -149,11 +149,15 @@ fn fixture(root: &Path, shape: Shape, packages: &[(&str, &str)]) {
 }
 
 /// `socket-patch <args> --offline --cwd <root>/proj`, with `--json` or as a
-/// person runs it: what it printed and how it ended.
-fn spawn(root: &Path, args: &[&str], json: bool) -> std::process::Output {
+/// person runs it, and the download fixture it needs while it runs.
+fn command(
+    root: &Path,
+    args: &[&str],
+    json: bool,
+) -> (std::process::Command, Option<prebuilt_common::Server>) {
     let mut cmd = hermetic::binary_command();
     let proj = root.join("proj");
-    let _fixture = prebuilt_common::prepare_command(
+    let fixture = prebuilt_common::prepare_command(
         &mut cmd,
         &proj,
         args,
@@ -162,9 +166,14 @@ fn spawn(root: &Path, args: &[&str], json: bool) -> std::process::Output {
     cmd.args(json.then_some("--json"))
         .args(["--cwd", proj.to_str().unwrap()])
         .env("MAVEN_REPO_LOCAL", root.join("m2"))
-        .env_remove("M2_HOME")
-        .output()
-        .expect("run socket-patch")
+        .env_remove("M2_HOME");
+    (cmd, fixture)
+}
+
+/// What [`command`] printed and how it ended.
+fn spawn(root: &Path, args: &[&str], json: bool) -> std::process::Output {
+    let (mut cmd, _fixture) = command(root, args, json);
+    cmd.output().expect("run socket-patch")
 }
 
 /// `socket-patch <args> --json --offline --cwd <root>/proj`; `(exit, envelope)`.
@@ -1673,10 +1682,51 @@ fn a_bazel_hub_that_builds_a_vendored_jar_adds_one_warning_and_nothing_else() {
     );
     let warning = serde_json::json!({ "code": "maven_bazel_hub_unpatched", "detail": detail });
     assert_eq!(warnings, [without.2, vec![warning]].concat());
-    // A person reads it once, on stderr.
-    let tmp = checkout(Some(lock("foo")));
-    let out = spawn(tmp.path(), &["vendor"], false);
-    let stderr = String::from_utf8_lossy(&out.stderr);
+    // A person reads it once, on stderr, and not under `--silent`; a
+    // program reads it in the envelope alone.
     let line = format!("Warning: {detail}");
-    assert_eq!(stderr.matches(&line).count(), 1, "{stderr}");
+    for (args, json, times) in [
+        (&["vendor"][..], false, 1),
+        (&["vendor", "--silent"], false, 0),
+        (&["vendor"], true, 0),
+    ] {
+        let tmp = checkout(Some(lock("foo")));
+        let out = spawn(tmp.path(), args, json);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(stderr.matches(&line).count(), times, "{args:?}: {stderr}");
+    }
+    // And reads it above the summary of the run and its next steps: both
+    // streams in one file, in the order they were written.
+    let tmp = checkout(Some(lock("foo")));
+    let (mut cmd, _fixture) = command(tmp.path(), &["vendor"], false);
+    let log = std::fs::File::create(tmp.path().join("log")).unwrap();
+    let status = cmd
+        .stdout(log.try_clone().unwrap())
+        .stderr(log)
+        .status()
+        .unwrap();
+    let said = std::fs::read_to_string(tmp.path().join("log")).unwrap();
+    assert!(status.success(), "{said}");
+    let at = [line.as_str(), "Vendored 2 packages.", "Next steps:"].map(|text| said.find(text));
+    assert!(at[0].is_some() && at[0] < at[1] && at[1] < at[2], "{said}");
+    // A run whose `--ecosystems` leaves Maven out vendors no Maven patch
+    // and says nothing of the hub, as without the workspace: here the one
+    // npm patch of the manifest, whose package is not installed.
+    let others = |lock: Option<String>| {
+        let tmp = checkout(lock);
+        let manifest = tmp.path().join("proj/.socket/manifest.json");
+        let mut patches: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&manifest).unwrap()).unwrap();
+        patches["patches"]["pkg:npm/left-pad@1.3.0"] = patches["patches"][purl("foo")].clone();
+        std::fs::write(&manifest, patches.to_string()).unwrap();
+        // No server: the run downloads nothing.
+        let npm = ["vendor", "--ecosystems", "npm", "--offline"];
+        let nowhere = ["--patch-server-url", "http://127.0.0.1:9"];
+        let (_, env) = socket(tmp.path(), &[npm.as_slice(), &nowhere].concat());
+        let about = env["events"].as_array().unwrap().iter();
+        let about: Vec<_> = about.map(|event| event["purl"].clone()).collect();
+        assert_eq!(about, ["pkg:npm/left-pad@1.3.0"], "{env}");
+        env["warnings"].clone()
+    };
+    assert_eq!(others(Some(lock("foo"))), others(None));
 }

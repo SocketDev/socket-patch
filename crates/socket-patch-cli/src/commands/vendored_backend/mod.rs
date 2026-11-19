@@ -128,7 +128,7 @@ impl<'a> VendoredBackend<'a> {
             mem_blobs: None,
         };
         let records = &req.manifest.patches;
-        let failed = Box::pin(vendor_records_reusing(
+        Box::pin(vendor_records_reusing(
             common,
             records,
             &sources,
@@ -141,17 +141,7 @@ impl<'a> VendoredBackend<'a> {
             req.eject,
             self.closing_lines,
         ))
-        .await;
-        // A hub of a Bazel workspace builds the jar of its own lock,
-        // whatever was vendored for the Maven or the Gradle build.
-        let purls = records.keys().map(String::as_str);
-        for warning in super::bazel_maven_notices(common, purls).await {
-            if !common.json && !common.silent {
-                eprintln!("Warning: {}", warning.detail);
-            }
-            env.warnings.push(warning);
-        }
-        failed
+        .await
     }
 
     /// Revert the ledger entries `keys` (in order) with `opts`, mutating

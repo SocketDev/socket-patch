@@ -1716,25 +1716,6 @@ async fn run_redirect_selected_untracked(
         );
     }
 
-    // What a rules_jvm_external hub of a Bazel workspace builds, no pin of
-    // this run reaches: said for each such artifact. In a tree that only
-    // Bazel builds it is said in the place of "no pom.xml" when a hub is
-    // named for every Maven patch of the run; otherwise that one stays,
-    // the only word about a patch that no hub builds.
-    let hub = selected.iter().map(|(purl, _)| purl.as_str());
-    let hub = crate::commands::bazel_maven_notices(common, hub).await;
-    let maven = |(purl, _): &&(String, String)| purl.starts_with("pkg:maven/");
-    let named = |w: &&RunWarning| w.code == socket_patch_core::bazel::maven::HUB_UNPATCHED;
-    let every = hub.iter().filter(named).count() == selected.iter().filter(maven).count();
-    let warnings = &mut done.rewrite.warnings;
-    if every && !hub.is_empty() {
-        warnings.retain(|w| w.code != "redirect_maven_no_pom");
-    }
-    warnings.extend(hub.into_iter().map(|w| {
-        let (code, detail) = (w.code, w.detail);
-        socket_patch_core::patch::redirect::RewriteWarning { code, detail }
-    }));
-
     let rewrite = &done.rewrite;
     // Paths whose existence the commit below changes as discovery's reads
     // around the overlaid view (directory listings) see the disk: written
@@ -2104,6 +2085,12 @@ async fn run_redirect_selected_untracked(
         .iter()
         .map(|w| RunWarning::new(w.code.as_str(), w.detail.as_str()))
         .collect();
+    // What a rules_jvm_external hub of a Bazel workspace builds, no pin of
+    // this run reaches: said for each such artifact, beside whatever the
+    // rewriters said and never in their list, which is what explains a
+    // lock entry that was not pinned.
+    let hub = selected.iter().map(|(purl, _)| purl.as_str());
+    warnings.extend(crate::commands::bazel_maven_notices(common, hub, false).await);
     warnings.extend(gem_stale.warnings.iter().map(run_warning_of));
     warnings.extend(nuget_stale.warnings.iter().map(run_warning_of));
     warnings.extend(python_stale.warnings.iter().map(run_warning_of));

@@ -1402,53 +1402,69 @@ the repository list, so it is left as a
 ## Bazel workspaces: Maven
 
 A rules_jvm_external hub (`maven.install` in `MODULE.bazel`) builds the jars that its own lock,
-`maven_install.json`, names, each at the sha256 the lock holds. It reads no `pom.xml`, no Gradle
-file and no jar of a local repository or cache. So a Maven patch does not reach what Bazel
+`maven_install.json`, names, each at the sha256 the lock holds. It reads no `pom.xml` and no
+Gradle file. A lock with `m2local` takes a jar that none of its repositories lists from the
+Maven local repository, at the lock's sha256 too. So a Maven patch does not reach what Bazel
 builds, in hosted, vendored or agent mode, and socket-patch does not patch a hub yet. It says
 when a hub builds an artifact it has a patch for.
 
 When the project is in a Bazel workspace (the rule is under
 [Bazel workspaces: `.bazelignore`](#bazel-workspaces-bazelignore)), a `get`, `scan`, `vendor` or
 `apply` that has a Maven patch reads the root `MODULE.bazel` and the files it includes for the
-`install` and `override` tags of the `maven` extension of `rules_jvm_external`, under whatever
-name the file gives the ruleset and the extension, and reads the lock each hub names with
-`lock_file` (format 2 or 3, up to 16 MiB). Nothing is evaluated, no Bazel is run and nothing is
-written. A `--global` run reads none of it: its target is not the project.
+tags of the `maven` extension of `rules_jvm_external`, under whatever name the file gives the
+ruleset and the extension. A hub is the `install`, `artifact` and `from_toml` tags of one
+`name`, and `override` replaces an artifact of one. Then it reads the lock each hub names with
+the `lock_file` of its `install` (format 2 or 3, up to 16 MiB; each other file up to 1 MiB).
+Nothing is evaluated, no Bazel is run and nothing is written. A `--global` run reads none of
+it: its target is not the project, and a `vendor` whose `--ecosystems` leaves Maven out reads
+none either.
 
 - `maven_bazel_hub_unpatched`: a pinned hub fetches the jar of the artifact at the patch's
   version. One warning per artifact names the lock, the hub, and the file and line of its
   `maven.install`. The events, the exit code and every file the command writes are those of the
   same run without the workspace: a `pom.xml` or a Gradle build of the checkout is patched as
-  before, and the Bazel build keeps the upstream jar. In a hosted run of a tree without a
-  `pom.xml` the warning takes the place of `redirect_maven_no_pom` when every Maven patch of the
-  run gets it; otherwise both are given.
+  before, and the Bazel build keeps the upstream jar. No other warning is removed or replaced
+  for it: a hosted run of a tree without a `pom.xml` gives `redirect_maven_no_pom` and, after
+  it, this one.
 - `maven_bazel_unreadable`: whether a hub builds the jar could not be told, because something
   could not be read with certainty. The warning names the file, the line and the reason.
-  - When no hub that was read holds the jar: a hub without `lock_file` (Bazel resolves what it
-    builds when it builds); tags of one hub that name different locks; a lock that is missing,
-    empty (the hub is not pinned yet), not format 2 or 3, larger than 16 MiB or no JSON (a
-    merge conflict); and the `WORKSPACE` file Bazel would take (`WORKSPACE.bzlmod`, else
-    `WORKSPACE.bazel`, else `WORKSPACE`) when it calls `maven_install` or cannot be read, unless
-    `.bazeliskrc` or `.bazelversion` names Bazel 9 or later, which reads no such file.
-  - Whether or not a hub's lock holds the jar: a `name` or `lock_file` that is not a plain
-    string, a `maven.install` that is not a statement of its own, and a construct of
-    `MODULE.bazel` that cannot be read without running it. The ruleset takes a hub's lock from
-    the last of its tags, and a tag that was not read may be the last of any hub, so no lock is
-    named beside one.
+  - When no hub that was read holds the jar: a hub without `lock_file`, which is also a hub
+    that only `maven.artifact` or `maven.from_toml` tags make (Bazel resolves what it builds
+    when it builds); one of those two tags that cannot be read; `install` tags of one hub that
+    name different locks; a lock that is missing, empty (the hub is not pinned yet), not format
+    2 or 3, larger than 16 MiB or no JSON (a merge conflict); and the `WORKSPACE` file Bazel
+    would take (`WORKSPACE.bzlmod`, else `WORKSPACE.bazel`, else `WORKSPACE`) when it calls
+    `maven_install` or cannot be read, unless the Bazel root names Bazel 9 or later, which
+    reads no such file.
+  - Whether or not a hub's lock holds the jar: a `maven.install` whose `name` or `lock_file` is
+    not a plain string or that is not a statement of its own, and a construct of `MODULE.bazel`
+    that cannot be read without running it. The ruleset takes a hub's lock from the last of its
+    `install` tags, and one that was not read may be the last of any hub, so no lock is named
+    beside one.
   - When a hub's lock holds the jar: a `maven.override` of the artifact, which puts a target of
     the checkout in the jar's place, and one whose `coordinates` cannot be read.
 - Nothing is said when every hub was read and none holds the artifact as a jar without a
   classifier at the patch's version, and nothing for a project outside a Bazel workspace.
 
+The Bazel release is the one that `.bazeliskrc` (`USE_BAZEL_VERSION`) or else `.bazelversion`
+at the Bazel root names, read as bazelisk reads them: the last `USE_BAZEL_VERSION` line counts,
+without the blanks around the name and the value, and an empty one leaves it to the first line
+of `.bazelversion`, taken as it is written. Only one release of three numbers (`9.3.2`) names a
+release: with `latest`, `9.x`, a release candidate, a fork's release, or a file that cannot be
+read, the `WORKSPACE` file counts as one Bazel may read.
+
 Limits:
 
 - Not seen: a hub or a `maven.override` that another Bazel module declares, a `maven_install`
   inside a function of a `.bzl` file, a jar that reaches Bazel without a hub (`http_jar`, a
-  checked-in jar, the target of a `maven.override`), and what a flag or an rc file tells Bazel
-  (`--ignore_dev_dependency`, `--override_repository`).
+  checked-in jar, the target of a `maven.override`), what a flag or an rc file tells Bazel
+  (`--ignore_dev_dependency`, `--override_repository`), and a `USE_BAZEL_VERSION` of the
+  environment or of the `.bazeliskrc` in the home directory, which a bazelisk asks before
+  `.bazelversion`.
 - A vendored or agent `get` that fails before it patches anything says what it said before: in
   a tree that only Bazel builds those are `vendor_jvm_shape_unsupported` and
-  `package_not_installed`.
+  `package_not_installed`. So does a `vendor` that is refused before it vendors anything (a
+  ledger that cannot be read, or one that git ignores).
 - `socket-patch vex` does not look at the hub yet: a patch that the `pom.xml` pin or a patched
   jar attests is attested, although the Bazel build does not have it.
 

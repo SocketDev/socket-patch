@@ -4,9 +4,9 @@
 //! @fixture_maven//:pin`.
 //!
 //! Such a hub fetches each jar its lock names, with the sha256 the lock
-//! holds, and reads no `pom.xml`, no Gradle file and no Maven local
-//! repository. So nothing `socket-patch` does for a Maven artifact reaches
-//! a Bazel build yet, and these flows hold what a user sees instead, on
+//! holds, and reads no `pom.xml` and no Gradle file. So nothing
+//! `socket-patch` does for a Maven artifact reaches a Bazel build yet, and
+//! these flows hold what a user sees instead, on
 //! the Bazel the run is given ([`FIXTURE`] says which ruleset goes with
 //! its release):
 //!
@@ -22,9 +22,10 @@
 //! In both the command says what the build shows: one warning,
 //! `maven_bazel_hub_unpatched`, that Bazel builds the artifact from
 //! `maven_install.json`, with the hub and the line of its `maven.install`.
-//! In the second it stands in the place of `redirect_maven_no_pom`, "no
-//! pom.xml present". The lock each ruleset release writes is the one
-//! socket-patch reads it from ([`Lock`]).
+//! In the second it stands after `redirect_maven_no_pom`, "no pom.xml
+//! present", which the command says as it does without a Bazel workspace.
+//! The lock each ruleset release writes is the one socket-patch reads it
+//! from ([`Lock`]).
 //!
 //! The artifacts are made here, for the run, under the group
 //! `dev.socket.fixture`, which only the owner of `socket.dev` can publish
@@ -356,8 +357,9 @@ impl Pinned {
     }
 
     /// What the command says of the hub: one warning, that Bazel builds
-    /// the victim from the lock that the hub's `maven.install` names.
-    fn names_the_hub(&self, get: &Ran) {
+    /// the victim from the lock that the hub's `maven.install` names,
+    /// after the warnings `others` of the same run without a workspace.
+    fn names_the_hub(&self, get: &Ran, others: &[Value]) {
         let detail = format!(
             "{PURL}: Bazel takes this artifact from maven_install.json (hub \"{HUB}\", \
              `maven.install` at MODULE.bazel:{}), which pins the upstream jar. socket-patch \
@@ -367,7 +369,8 @@ impl Pinned {
         );
         let warning = json!({ "code": "maven_bazel_hub_unpatched", "detail": detail });
         let (test, said) = (&self.cell.test, &get.dump);
-        assert_eq!(get.envelope["warnings"], json!([warning]), "{test}: {said}");
+        let warnings = [others, &[warning]].concat();
+        assert_eq!(get.envelope["warnings"], json!(warnings), "{test}: {said}");
     }
 
     /// The step after the command: the build prints the upstream marker
@@ -400,7 +403,7 @@ fn a_pom_patch_beside_a_pinned_hub() {
     let pinned = flow
         .cell
         .pinned_by(&get, PURL, &flow.uuid, &before, &PINNED);
-    flow.names_the_hub(&get);
+    flow.names_the_hub(&get, &[]);
     flow.still_builds_upstream(&pinned);
 
     let undo = flow.socket_patch(&["rollback", "--yes"]);
@@ -415,8 +418,8 @@ fn a_pom_patch_beside_a_pinned_hub() {
     );
 }
 
-/// The same checkout without a `pom.xml`: the command writes nothing and
-/// says which lock builds the artifact, not that there is no pom.
+/// The same checkout without a `pom.xml`: the command writes nothing,
+/// says that there is no pom, and says which lock builds the artifact.
 #[test]
 #[ignore = "real Bazel; run with --ignored"]
 fn a_tree_only_bazel_builds() {
@@ -435,7 +438,11 @@ fn a_tree_only_bazel_builds() {
         (&json!("skipped"), &json!("redirect_unconfirmed")),
         "{test}: {said}"
     );
-    flow.names_the_hub(&get);
+    let no_pom = "no pom.xml present; maven redirect skipped";
+    flow.names_the_hub(
+        &get,
+        &[json!({ "code": "redirect_maven_no_pom", "detail": no_pom })],
+    );
     assert_eq!(
         changed(&before, &flow.cell.tree()),
         NOTHING,

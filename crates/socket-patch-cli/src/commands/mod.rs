@@ -113,21 +113,30 @@ pub(crate) async fn sync_bazelignore(
 /// lock pins, whatever a `pom.xml`, a Gradle build or an installed jar
 /// holds (`socket_patch_core::bazel::maven`). A command that pins or
 /// applies patches calls this once with the purls it was about, and hands
-/// what it gets to its own warnings: one for each Maven jar among them
-/// that a hub builds, or may build. Nothing for a `--global` run, whose
-/// target is not the project, and no file is looked for when no purl is a
-/// Maven one.
+/// what it gets to the warnings of its run: one for each Maven jar among
+/// them that a hub builds, or may build. Nothing for a `--global` run,
+/// whose target is not the project, and no file is looked for when no purl
+/// is a Maven one.
+///
+/// With `tell`, a human run is told here, as [`sync_bazelignore`] tells
+/// it. A command that prints the warnings of its run itself passes
+/// `false`.
 pub(crate) async fn bazel_maven_notices<'a>(
     common: &crate::args::GlobalArgs,
     purls: impl Iterator<Item = &'a str>,
+    tell: bool,
 ) -> Vec<crate::json_envelope::RunWarning> {
-    use crate::json_envelope::RunWarning;
     if common.is_global() {
         return Vec::new();
     }
     let purls = purls.map(str::to_string).collect();
     let said = socket_patch_core::bazel::maven::notices(&common.cwd, purls).await;
-    let warning = |(code, detail)| RunWarning::new(code, detail);
+    let warning = |(code, detail): (&str, String)| {
+        if tell && !common.json && !common.silent {
+            eprintln!("Warning: {detail}");
+        }
+        crate::json_envelope::RunWarning::new(code, detail)
+    };
     said.into_iter().map(warning).collect()
 }
 

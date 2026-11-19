@@ -8,9 +8,8 @@
 //! has no rules_jvm_external hub, and in one whose pinned hub does not hold
 //! the artifact. A change that turns it red has changed what a project
 //! that no hub builds gets. The others hold the one difference a hub
-//! makes: a warning of the run, which takes the place of "no pom.xml" in a
-//! tree that only Bazel builds when it names the hub, and none under
-//! `--global`.
+//! makes: one more warning of the run, also beside "no pom.xml" in a tree
+//! that only Bazel builds, and none under `--global`.
 //!
 //! The vendored twin is in `vendor_jvm_cli.rs`, which has the fixture of a
 //! vendored Maven run. `e2e_bazel_build/maven.rs` holds the hosted flows
@@ -372,7 +371,7 @@ fn a_hub_that_pins_the_artifact_adds_one_warning_and_nothing_else() {
 }
 
 #[test]
-fn a_hub_only_tree_names_the_lock_that_builds_it() {
+fn a_hub_only_tree_names_the_lock_beside_the_missing_pom() {
     let machine = Machine::start();
     let [plain, _, elsewhere, hub] = checkouts();
     let lockless = HUB.replace("    lock_file = \"//:maven_install.json\",\n", "");
@@ -383,9 +382,9 @@ fn a_hub_only_tree_names_the_lock_that_builds_it() {
         // Without a hub that holds it, the release's answer.
         (&plain, &[no_pom][..]),
         (&elsewhere, &[no_pom]),
-        // A hub that is named for every Maven patch of the run takes its
-        // place; one that could not be read stands beside it.
-        (&hub, &["maven_bazel_hub_unpatched"]),
+        // What is said of a hub stands after it: no warning of the run
+        // is taken away for it.
+        (&hub, &[no_pom, "maven_bazel_hub_unpatched"]),
         (&unreadable, &[no_pom, "maven_bazel_unreadable"]),
     ] {
         let ran = machine.run(bazel, false, json);
@@ -399,15 +398,23 @@ fn a_hub_only_tree_names_the_lock_that_builds_it() {
         assert_eq!(warning_codes(&envelope), codes, "{ran:?}");
         assert_eq!(ran.wrote, BTreeMap::new(), "{codes:?}");
     }
-    // A person is pointed at the warning, which is the one about the hub.
-    let ran = machine.run(&hub, false, COMMANDS[1]);
-    let pointed = "no lockfile entry pinning it could be rewritten (see the warning below)";
-    assert!(ran.stderr.contains(pointed), "{ran:?}");
-    assert!(
-        ran.stderr.contains(&format!("Warning: {HUB_WARNING}")),
-        "{ran:?}"
-    );
-    assert!(!ran.stderr.to_lowercase().contains("no pom.xml"), "{ran:?}");
+    // A person is pointed at one warning, the lock rewriter's, which says
+    // why no lock entry was pinned, and reads the one about the hub below
+    // it: that one is no reason for a missing lock entry, of this package
+    // or of another.
+    let pointed = "no lockfile entry pinning it could be rewritten (see the warning below)\n";
+    let no_pom = "Warning: No pom.xml present; maven redirect skipped\n";
+    for (bazel, about_the_hub) in [
+        (&hub, format!("Warning: {HUB_WARNING}\n")),
+        (
+            &unreadable,
+            format!("Warning: {PURL}: socket-patch could not tell"),
+        ),
+    ] {
+        let ran = machine.run(bazel, false, COMMANDS[1]);
+        let at = [pointed, no_pom, &about_the_hub].map(|line| ran.stderr.find(line));
+        assert!(at[0].is_some() && at[0] < at[1] && at[1] < at[2], "{ran:?}");
+    }
     let detail = machine.run(&unreadable, false, json).envelope()["warnings"][1]["detail"].clone();
     let why = "pkg:maven/dev.socket.fixture/victim@1.10.0: socket-patch could not tell whether \
                Bazel takes this artifact from a rules_jvm_external hub: MODULE.bazel:4: hub \
