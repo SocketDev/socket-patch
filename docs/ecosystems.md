@@ -989,13 +989,32 @@ pixi install && socket-patch apply
   workspace root's `.pixi/envs`. Run from a directory below it, socket-patch uses the
   environment `pixi run` or `pixi shell` activated for that workspace; without an
   activation it finds none there.
-- **A conda build is patched when its files are the PyPI release's.** A patch records
-  the hash of each file it replaces, taken from the PyPI release. conda-forge builds
-  pure-Python packages from the same sources, so those hashes match and the patch
-  applies. A build whose patched files differ (a recipe that changes the source, or a
-  compiled extension module, which conda builds itself) is left untouched and `apply`
-  fails for it with `no matching variant found`, saying the copy is in a conda
-  environment and is not the PyPI release's bytes.
+- **A conda build is patched only as the PyPI release it repackages.** A patch is
+  made from a PyPI release and records the hash of each file it replaces there. A
+  copy conda built (its `INSTALLER` says `conda`, or it has none) takes that patch
+  only when all of this holds, and no flag changes it, `--force` and
+  `--allow-patch-conflicts` included:
+  - the patch is for a pure-Python wheel (`…-none-any`) and the copy does not say it
+    holds compiled code (`Root-Is-Purelib: false` in its `WHEEL`). A compiled conda
+    package is built separately from the PyPI wheel and links conda's own libraries,
+    so it is never that release, even when the Python file a patch touches is
+    identical;
+  - every file the patch replaces has the release's bytes, and the patch replaces at
+    least one file. A file that differs (a recipe that changes the source) is never
+    overwritten, and nothing of the copy is changed.
+
+  `scan --mode agent` leaves such a patch out, with the warning
+  `conda_build_not_pypi_release`, when no installed copy can take it because it is a
+  compiled conda build; nothing is recorded and the run exits 0. A patch already in
+  the manifest that a copy cannot take makes `apply` fail for that copy with the same
+  code, or with `no matching variant found` when a replaced file differs. A wheel
+  that pip or uv installed into the environment (`[pypi-dependencies]`, or `pip
+  install` in a conda environment) is the PyPI release itself and is patched as
+  anywhere else. **Not compared:** the files a patch leaves alone. A patch record
+  holds no hashes for them, so a recipe that changes another module of an otherwise
+  identical build is not seen. In one project's 51 pure-Python conda-forge packages,
+  45 were the PyPI wheel byte for byte and 6 differed in a file (a generated version
+  file in most; one module in `setuptools`).
 - **What undoes a patch.** `pixi install` and `pixi run` leave an installed
   environment's files alone, so a patch survives them. `pixi reinstall`, `pixi clean`,
   a deleted `.pixi/` and any change that makes pixi relink the package restore the

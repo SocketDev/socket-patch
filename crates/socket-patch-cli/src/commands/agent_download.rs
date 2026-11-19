@@ -711,6 +711,10 @@ pub(crate) struct FetchBatch {
     events: Vec<PatchEvent>,
     /// Release-narrowing fallbacks (uninstalled base, no matching variant).
     warnings: Vec<String>,
+    /// Manifest store only: the patches left out because conda built every
+    /// installed copy as something other than the PyPI release (see
+    /// [`leave_out_patches_no_conda_build_takes`]), as `<purl>: <reason>`.
+    conda_refusals: Vec<String>,
     /// `Some("vendored")` for the ledger store (see [`tag_mode`]).
     mode: Option<&'static str>,
 }
@@ -1307,6 +1311,17 @@ pub(crate) async fn fetch_selected_patches(
         api_client,
     )
     .await;
+    // Agent mode writes into the installed copies. A patch no copy can
+    // take, because conda built each of them as something other than the
+    // pure-Python PyPI release, is left out here instead of being recorded
+    // and then refused by every later `apply`. `--all-releases` asks for
+    // records other environments use, so it keeps them.
+    let (selected, conda_refusals) =
+        if matches!(store, RecordStore::Manifest(_)) && !params.all_releases {
+            leave_out_patches_no_conda_build_takes(selected, &params.crawler_options(), quiet).await
+        } else {
+            (selected, Vec::new())
+        };
     status.finish();
     prefetched.extend(views);
     // No leading blank line: the caller's prompt or summary already ended
@@ -1326,6 +1341,7 @@ pub(crate) async fn fetch_selected_patches(
         reused: Vec::new(),
         events: Vec::new(),
         warnings,
+        conda_refusals,
         mode: match store {
             RecordStore::Ledger(_) => Some("vendored"),
             RecordStore::Manifest(_) => None,
@@ -1602,6 +1618,60 @@ fn release_warnings(warnings: Vec<String>) -> Vec<RunWarning> {
         .into_iter()
         .map(|w| RunWarning::new(RELEASE_NARROWING, w))
         .collect()
+}
+
+/// Warning code: a PyPI patch was left out of an agent-mode run because
+/// conda built every installed copy as something other than the PyPI
+/// release the patch was made from.
+pub(crate) const CONDA_BUILD_NOT_PYPI_RELEASE: &str =
+    socket_patch_core::patch::conda_copy::REFUSAL_CODE;
+
+/// The PyPI patches of `selected` that at least one installed copy can
+/// take, and a `<purl>: <reason>` line for each one left out: every copy
+/// of its package is a conda build the patch is never applied to (a
+/// compiled build, or one nothing shows to be pure Python; see
+/// `socket_patch_core::patch::conda_copy`). A package that is not
+/// installed, or has a copy pip or uv installed, keeps its patch. Whether
+/// a pure-Python conda build's files are the release's is the apply
+/// engine's check, as for any other copy.
+async fn leave_out_patches_no_conda_build_takes(
+    selected: Vec<PatchSearchResult>,
+    crawler_options: &CrawlerOptions,
+    quiet: bool,
+) -> (Vec<PatchSearchResult>, Vec<String>) {
+    use socket_patch_core::patch::conda_copy::static_refusal;
+    let pypi: Vec<String> = selected
+        .iter()
+        .filter(|sr| Ecosystem::from_purl(&sr.purl) == Some(Ecosystem::Pypi))
+        .map(|sr| sr.purl.clone())
+        .collect();
+    if pypi.is_empty() {
+        return (selected, Vec::new());
+    }
+    let copies =
+        find_all_packages_for_rollback(&partition_purls(&pypi, None), crawler_options, true).await;
+    let mut kept = Vec::with_capacity(selected.len());
+    let mut refused = Vec::new();
+    for sr in selected {
+        let mut reason = None;
+        for copy in copies.get(&sr.purl).map(Vec::as_slice).unwrap_or_default() {
+            reason = static_refusal(&sr.purl, copy).await;
+            if reason.is_none() {
+                break;
+            }
+        }
+        match reason {
+            Some(reason) => {
+                let line = format!("{}: {reason}", normalize_purl(&sr.purl));
+                if !quiet {
+                    eprintln!("  [note] {line}");
+                }
+                refused.push(line);
+            }
+            None => kept.push(sr),
+        }
+    }
+    (kept, refused)
 }
 
 /// Warning code: release narrowing kept every variant of a base (the base
@@ -2294,6 +2364,12 @@ pub async fn download_and_apply_patches_into(
     // later. (`scan` never hits this: it filters vendored purls before
     // download.) The nested apply below skips the vendored purl either way.
     let mut warnings = release_warnings(batch.warnings);
+    warnings.extend(
+        batch
+            .conda_refusals
+            .into_iter()
+            .map(|detail| RunWarning::new(CONDA_BUILD_NOT_PYPI_RELEASE, detail)),
+    );
     warnings.extend(rollback_warnings);
     warn_on_vendored_uuid_drift(&params.project_root(), quiet, &changed, &mut warnings).await;
     if !recorded.is_empty() {
@@ -2540,6 +2616,80 @@ mod tests {
         assert!(
             maven[2].contains("after every dependency install,"),
             "{maven:?}"
+        );
+    }
+
+    /// Agent mode records only what an installed copy can take. A compiled
+    /// conda build takes no PyPI patch, so its patch is left out with the
+    /// reason; a pure-Python conda build, a wheel uv installed into the
+    /// same environment, a package that is not installed and another
+    /// ecosystem's patch are all kept.
+    #[tokio::test]
+    async fn patches_no_conda_build_takes_are_left_out_of_an_agent_run() {
+        fn selection(purl: &str) -> PatchSearchResult {
+            PatchSearchResult {
+                uuid: "20000001-0000-4001-8001-000000000099".to_string(),
+                purl: purl.to_string(),
+                published_at: String::new(),
+                description: String::new(),
+                license: String::new(),
+                tier: "free".to_string(),
+                vulnerabilities: HashMap::new(),
+            }
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path();
+        std::fs::write(project.join("pixi.toml"), "[workspace]\n").unwrap();
+        let prefix = project.join(".pixi").join("envs").join("default");
+        std::fs::create_dir_all(prefix.join("conda-meta")).unwrap();
+        let site = if cfg!(windows) {
+            prefix.join("Lib").join("site-packages")
+        } else {
+            prefix.join("lib").join("python3.13").join("site-packages")
+        };
+        let install = |name: &str, version: &str, installer: &str, purelib: bool| {
+            let dist = site.join(format!("{name}-{version}.dist-info"));
+            std::fs::create_dir_all(&dist).unwrap();
+            std::fs::write(
+                dist.join("METADATA"),
+                format!("Metadata-Version: 2.4\nName: {name}\nVersion: {version}\n"),
+            )
+            .unwrap();
+            std::fs::write(dist.join("INSTALLER"), format!("{installer}\n")).unwrap();
+            std::fs::write(
+                dist.join("WHEEL"),
+                format!("Wheel-Version: 1.0\nRoot-Is-Purelib: {purelib}\n"),
+            )
+            .unwrap();
+        };
+        install("pillow", "12.3.0", "conda", false);
+        install("certifi", "2026.7.22", "conda", true);
+        install("numpy", "2.4.4", "uv-pixi", false);
+
+        let compiled = "pkg:pypi/pillow@12.3.0?artifact_id=cp313-cp313-manylinux_2_28_x86_64-whl";
+        let kept = [
+            "pkg:npm/minimist@1.2.2",
+            "pkg:pypi/certifi@2026.7.22?artifact_id=py3-none-any-whl",
+            "pkg:pypi/numpy@2.4.4?artifact_id=cp313-cp313-manylinux_2_28_x86_64-whl",
+            "pkg:pypi/requests@2.33.1?artifact_id=py3-none-any-whl",
+        ];
+        let mut selected: Vec<PatchSearchResult> = kept.iter().map(|p| selection(p)).collect();
+        selected.insert(2, selection(compiled));
+        let options = CrawlerOptions {
+            cwd: project.to_path_buf(),
+            global: false,
+            global_prefix: None,
+        };
+        let (taken, refused) =
+            leave_out_patches_no_conda_build_takes(selected, &options, true).await;
+        let taken: Vec<&str> = taken.iter().map(|sr| sr.purl.as_str()).collect();
+        assert_eq!(taken, kept);
+        assert_eq!(refused.len(), 1, "{refused:?}");
+        assert!(
+            refused[0].starts_with("pkg:pypi/pillow@12.3.0")
+                && refused[0].contains(CONDA_BUILD_NOT_PYPI_RELEASE)
+                && refused[0].contains("compiled conda package"),
+            "{refused:?}"
         );
     }
 

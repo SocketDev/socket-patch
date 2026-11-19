@@ -438,6 +438,249 @@ fn pixi_project_apply_refuses_a_conda_build_that_differs_from_the_release() {
 }
 
 // ─────────────────────────────────────────────────────────────────────
+// conda builds are patched only as the PyPI release they repackage
+// ─────────────────────────────────────────────────────────────────────
+
+const CONDA_REFUSAL: &str = "conda_build_not_pypi_release";
+
+/// One installed distribution in the `default` pixi environment of `cwd`,
+/// with one file, and a manifest record replacing that file (the PyPI
+/// release's bytes are `release`). `installer` is the copy's `INSTALLER`
+/// (`None`: none written) and `purelib` its `WHEEL` purity.
+struct CondaCopy<'a> {
+    name: &'a str,
+    version: &'a str,
+    purl: &'a str,
+    installer: Option<&'a str>,
+    purelib: bool,
+    file: &'a str,
+    installed: &'a [u8],
+    release: &'a [u8],
+}
+
+const CONDA_PATCHED: &[u8] = b"# patched\n";
+
+fn stage_conda_copy(cwd: &Path, copy: &CondaCopy<'_>) -> std::path::PathBuf {
+    std::fs::write(cwd.join("pixi.toml"), "[workspace]\nname = \"a\"\n").unwrap();
+    let prefix = cwd.join(".pixi").join("envs").join("default");
+    std::fs::create_dir_all(prefix.join("conda-meta")).unwrap();
+    std::fs::write(prefix.join("conda-meta").join("pixi"), "{}").unwrap();
+    let site_packages = if cfg!(windows) {
+        prefix.join("Lib").join("site-packages")
+    } else {
+        prefix.join("lib").join("python3.13").join("site-packages")
+    };
+    let dist_info = site_packages.join(format!("{}-{}.dist-info", copy.name, copy.version));
+    std::fs::create_dir_all(&dist_info).unwrap();
+    std::fs::write(
+        dist_info.join("METADATA"),
+        format!(
+            "Metadata-Version: 2.4\nName: {}\nVersion: {}\n",
+            copy.name, copy.version
+        ),
+    )
+    .unwrap();
+    if let Some(installer) = copy.installer {
+        std::fs::write(dist_info.join("INSTALLER"), format!("{installer}\n")).unwrap();
+    }
+    std::fs::write(
+        dist_info.join("WHEEL"),
+        format!("Wheel-Version: 1.0\nRoot-Is-Purelib: {}\n", copy.purelib),
+    )
+    .unwrap();
+    let target = site_packages.join(copy.file);
+    std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+    std::fs::write(&target, copy.installed).unwrap();
+
+    let socket_dir = cwd.join(".socket");
+    write_minimal_manifest(
+        &socket_dir,
+        copy.purl,
+        "20000001-0000-4001-8001-000000000088",
+        &[PatchEntry {
+            file_name: copy.file,
+            before_hash: &git_sha256(copy.release),
+            after_hash: &git_sha256(CONDA_PATCHED),
+        }],
+    );
+    write_blob(&socket_dir, &git_sha256(CONDA_PATCHED), CONDA_PATCHED);
+    target
+}
+
+fn apply_in(cwd: &Path, extra: &[&str]) -> (i32, String, String) {
+    let mut args = vec!["apply", "--cwd", cwd.to_str().unwrap()];
+    args.extend_from_slice(extra);
+    run_with_env(cwd, &args, &[])
+}
+
+/// A compiled conda package is built separately from the PyPI wheel and
+/// links conda's own libraries. Its Python files are often the wheel's
+/// byte for byte, as here, and that is not enough: a patch made from the
+/// wheel is not applied to it, with or without `--force`.
+#[test]
+fn a_compiled_conda_build_takes_no_pypi_patch_even_when_the_file_matches() {
+    let release = b"# PIL/TarIO.py as PyPI ships it\n";
+    for flags in [&[][..], &["--force"][..], &["--allow-patch-conflicts"][..]] {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let target = stage_conda_copy(
+            tmp.path(),
+            &CondaCopy {
+                name: "pillow",
+                version: "12.3.0",
+                purl: "pkg:pypi/pillow@12.3.0?artifact_id=cp313-cp313-manylinux_2_28_x86_64-whl",
+                installer: Some("conda"),
+                purelib: false,
+                file: "PIL/TarIO.py",
+                installed: release,
+                release,
+            },
+        );
+        let (code, stdout, stderr) = apply_in(tmp.path(), flags);
+        assert_eq!(code, 1, "{flags:?}\nstdout:\n{stdout}\nstderr:\n{stderr}");
+        assert_eq!(std::fs::read(&target).unwrap(), release, "{flags:?}");
+        assert!(
+            stderr.contains(CONDA_REFUSAL) && stderr.contains("compiled conda package"),
+            "{flags:?}\nstderr:\n{stderr}"
+        );
+    }
+}
+
+/// The same copy with a patch made from a pure-Python wheel: the copy's
+/// own metadata says it holds compiled code, so it is still not the
+/// release the patch was made for.
+#[test]
+fn a_conda_build_that_says_it_is_compiled_takes_no_pure_python_patch() {
+    let release = b"# PIL/TarIO.py as PyPI ships it\n";
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let target = stage_conda_copy(
+        tmp.path(),
+        &CondaCopy {
+            name: "pillow",
+            version: "12.3.0",
+            purl: "pkg:pypi/pillow@12.3.0?artifact_id=py3-none-any-whl",
+            installer: Some("conda"),
+            purelib: false,
+            file: "PIL/TarIO.py",
+            installed: release,
+            release,
+        },
+    );
+    let (code, stdout, stderr) = apply_in(tmp.path(), &[]);
+    assert_eq!(code, 1, "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert_eq!(std::fs::read(&target).unwrap(), release);
+    assert!(
+        stderr.contains(CONDA_REFUSAL) && stderr.contains("Root-Is-Purelib: false"),
+        "stderr:\n{stderr}"
+    );
+}
+
+/// A pure-Python conda build whose file is not the release's (a recipe
+/// that changes the source): `--force` and `--allow-patch-conflicts` let
+/// a patch overwrite local changes to the distribution it was made for,
+/// but a conda build that differs is another distribution, and its file
+/// is never overwritten.
+#[test]
+fn no_flag_overwrites_a_conda_build_file_that_is_not_the_release() {
+    let conda_build = b"# changed by the conda recipe\n";
+    // A record keyed by the bare purl names no release artifact, so the
+    // apply command hands it straight to the engine: the same answer.
+    for purl in [
+        "pkg:pypi/certifi@2026.7.22?artifact_id=py3-none-any-whl",
+        "pkg:pypi/certifi@2026.7.22",
+    ] {
+        for flags in [&["--force"][..], &["--allow-patch-conflicts"][..]] {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let target = stage_conda_copy(
+                tmp.path(),
+                &CondaCopy {
+                    name: "certifi",
+                    version: "2026.7.22",
+                    purl,
+                    installer: Some("conda"),
+                    purelib: true,
+                    file: "certifi/core.py",
+                    installed: conda_build,
+                    release: b"# the PyPI release's file\n",
+                },
+            );
+            let (code, stdout, stderr) = apply_in(tmp.path(), flags);
+            assert_eq!(
+                code, 1,
+                "{purl} {flags:?}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+            );
+            assert_eq!(
+                std::fs::read(&target).unwrap(),
+                conda_build,
+                "{purl} {flags:?}"
+            );
+        }
+    }
+}
+
+/// pip and uv install the PyPI wheel itself into a conda prefix (pixi's
+/// `[pypi-dependencies]`, or `pip install` in a conda environment). That
+/// copy is the release the patch was made from, compiled or not, and is
+/// patched as anywhere else.
+#[test]
+fn a_wheel_pip_or_uv_installed_into_a_conda_prefix_is_patched() {
+    let release = b"# PIL/TarIO.py as PyPI ships it\n";
+    for installer in ["pip", "uv-pixi"] {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let target = stage_conda_copy(
+            tmp.path(),
+            &CondaCopy {
+                name: "pillow",
+                version: "12.3.0",
+                purl: "pkg:pypi/pillow@12.3.0?artifact_id=cp313-cp313-manylinux_2_28_x86_64-whl",
+                installer: Some(installer),
+                purelib: false,
+                file: "PIL/TarIO.py",
+                installed: release,
+                release,
+            },
+        );
+        let (code, stdout, stderr) = apply_in(tmp.path(), &[]);
+        assert_eq!(code, 0, "{installer}\nstdout:\n{stdout}\nstderr:\n{stderr}");
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            CONDA_PATCHED,
+            "{installer}"
+        );
+        assert!(!stderr.contains(CONDA_REFUSAL), "{installer}\n{stderr}");
+    }
+}
+
+/// What an earlier Socket patch wrote into a pure-Python conda build is
+/// not a difference between that build and the PyPI release: a newer
+/// patch for the same release still replaces it, as on any other copy.
+#[test]
+fn an_earlier_socket_patch_still_gives_way_on_a_pure_python_conda_build() {
+    let earlier_patch = b"# what the earlier patch wrote\n";
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let target = stage_conda_copy(
+        tmp.path(),
+        &CondaCopy {
+            name: "certifi",
+            version: "2026.7.22",
+            purl: "pkg:pypi/certifi@2026.7.22",
+            installer: Some("conda"),
+            purelib: true,
+            file: "certifi/core.py",
+            installed: earlier_patch,
+            release: b"# the PyPI release's file\n",
+        },
+    );
+    write_blob(
+        &tmp.path().join(".socket"),
+        &git_sha256(earlier_patch),
+        earlier_patch,
+    );
+    let (code, stdout, stderr) = apply_in(tmp.path(), &[]);
+    assert_eq!(code, 0, "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert_eq!(std::fs::read(&target).unwrap(), CONDA_PATCHED);
+}
+
+// ─────────────────────────────────────────────────────────────────────
 // Gem — advisory-only, code = gem_bundle_install_reverts
 // ─────────────────────────────────────────────────────────────────────
 

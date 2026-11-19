@@ -1568,6 +1568,26 @@ async fn apply_package_patch_at(
         return result;
     }
 
+    // A copy conda built is patched only as the PyPI release the patch was
+    // made from (see `conda_copy`): never a compiled build, and never by
+    // overwriting a file that is not the release's. Refused before anything
+    // is verified or written, dry run included, and no policy relaxes it:
+    // `--force` and `--allow-patch-conflicts` consent to losing local
+    // changes, not to writing another distribution's files into this one.
+    // Content an earlier Socket patch wrote still gives way to its update.
+    let policy = match crate::patch::conda_copy::conda_build(package_key, pkg_path).await {
+        Some(_) => {
+            if let Some(refused) =
+                crate::patch::conda_copy::refusal(package_key, pkg_path, files).await
+            {
+                result.error = Some(refused);
+                return result;
+            }
+            MismatchPolicy::SocketContent
+        }
+        None => policy,
+    };
+
     // First, verify all files
     for (file_name, file_info) in files_in_order(files) {
         // SECURITY: reject any manifest key that would escape the package dir

@@ -63,10 +63,12 @@ and no Socket token. POSIX only.
 
 ## Limits
 
-- **Conda builds that differ from the PyPI release.** A patch applies to a conda
-  package when the files it replaces are the PyPI release's bytes. That holds for
-  conda-forge's pure-Python builds; a compiled extension module is built separately
-  for conda and never matches. The backtest covers a pure-Python package.
+- **Conda builds that are not the PyPI release.** A conda build takes a patch only
+  as the pure-Python PyPI release it repackages (see
+  [PyPI: pixi projects](../ecosystems.md#pypi-pixi-projects)). The backtest patches a
+  pure-Python package; the refusals (a compiled build, a replaced file that differs,
+  `--force`) are covered without pixi by `patch::conda_copy`'s unit tests, the
+  `apply` suite (`e2e_safety_advisories`) and the `scan` suite (`scan_sync_e2e`).
 - **conda packages that are not Python distributions** (OpenSSL, libxml2, the
   `ca-certificates` bundle) are outside what socket-patch patches.
 - **Windows** is not in the matrix. Discovery uses the conda layout there
