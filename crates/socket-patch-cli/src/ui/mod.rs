@@ -185,6 +185,153 @@ fn env_var(k: &str) -> Option<String> {
     std::env::var(k).ok()
 }
 
+/// One of the process's standard streams, for [`attended`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Stream {
+    Stdin,
+    Stdout,
+    Stderr,
+}
+
+/// Whether `stream` is a terminal with a person at it: a terminal, and
+/// not one an AI coding agent runs the command in ([`plain_output`]).
+///
+/// Every choice of how to draw for a person asks this, never
+/// `is_terminal()` itself: the animated status line, color, marks and
+/// bars, the full-screen browser, the arrow-key menus, text fitted to
+/// the terminal's width. So an agent gets what a pipe gets, however its
+/// harness wires the streams. Some run commands on a pseudo-terminal,
+/// where the status line's redraws alone would be most of what the agent
+/// reads back, and the browser would wait for keys nobody presses.
+///
+/// A typed yes/no question ([`confirm`]) does not ask this: it is a
+/// safeguard, not decoration, and the environment is not what waives it
+/// (`--yes` is).
+pub(crate) fn attended(stream: Stream) -> bool {
+    let terminal = match stream {
+        Stream::Stdin => std::io::stdin().is_terminal(),
+        Stream::Stdout => std::io::stdout().is_terminal(),
+        Stream::Stderr => std::io::stderr().is_terminal(),
+    };
+    terminal && plain() == Plain::No
+}
+
+/// [`plain_output`] of this process's environment, read once: it does
+/// not change during a run.
+fn plain() -> Plain {
+    static PLAIN: std::sync::OnceLock<Plain> = std::sync::OnceLock::new();
+    *PLAIN.get_or_init(|| plain_output(env_var))
+}
+
+/// Say once, on stderr, why this terminal is not getting the interactive
+/// output it would: an agent's variable is set. Called where a command
+/// prints instead of opening the full-screen browser or a menu, for
+/// someone working in a terminal an agent started, who would otherwise
+/// look for the reason in vain. Nothing when stdin or stderr is not a
+/// terminal, when `SOCKET_PLAIN` decided, or under `--json` / `--silent`.
+pub(crate) fn note_agent_terminal(common: &GlobalArgs) {
+    static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let Plain::Agent(variable) = plain() else {
+        return;
+    };
+    if common.json
+        || common.silent
+        || !std::io::stdin().is_terminal()
+        || !std::io::stderr().is_terminal()
+        || SAID.swap(true, std::sync::atomic::Ordering::Relaxed)
+    {
+        return;
+    }
+    eprintln!("{}", agent_terminal_note(variable));
+}
+
+/// The line [`note_agent_terminal`] prints.
+fn agent_terminal_note(variable: &str) -> String {
+    format!(
+        "Note: {variable} is set, so this terminal gets the plain output of an AI coding \
+         agent's. A person at it can set SOCKET_PLAIN=0 for the interactive output."
+    )
+}
+
+/// The variables AI coding agents put in the environment of the commands
+/// they run: `AI_AGENT` first (any agent may set it, to its name), then
+/// each tool's own. Only variables an agent injects into its commands
+/// are here. One an editor sets in every terminal, a person's included
+/// (`CURSOR_TRACE_ID`, `REPL_ID`), is not, and neither is the bare
+/// `AGENT`, which is set for too many other reasons.
+pub const AGENT_ENV_VARS: &[&str] = &[
+    "AI_AGENT",
+    // Claude Code
+    "CLAUDECODE",
+    "CLAUDE_CODE",
+    // Cursor
+    "CURSOR_AGENT",
+    // OpenAI Codex
+    "CODEX_SANDBOX",
+    "CODEX_THREAD_ID",
+    "CODEX_CI",
+    // Gemini CLI, Antigravity
+    "GEMINI_CLI",
+    "ANTIGRAVITY_AGENT",
+    // VS Code and GitHub Copilot
+    "VSCODE_AGENT",
+    "COPILOT_AGENT",
+    "COPILOT_CLI",
+    // OpenCode
+    "OPENCODE",
+    "OPENCODE_CLIENT",
+    // Amp, Goose, Augment, Cline, Roo Code, Qwen Code, Pi
+    "AMP_CURRENT_THREAD_ID",
+    "GOOSE_TERMINAL",
+    "AUGMENT_AGENT",
+    "CLINE_ACTIVE",
+    "ROO_ACTIVE",
+    "ROO_CODE_TASK_ID",
+    "QWEN_CODE",
+    "PI_CODING_AGENT",
+];
+
+/// Why output is kept plain on a terminal too (see [`attended`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Plain {
+    /// It is not: a terminal has a person at it.
+    No,
+    /// `SOCKET_PLAIN` asks for it.
+    Asked,
+    /// An agent runs the command: this one of [`AGENT_ENV_VARS`] is set.
+    Agent(&'static str),
+}
+
+/// Whether, and why, output is kept plain on a terminal, pure over the
+/// environment:
+///
+/// - `SOCKET_PLAIN` decides when it is set to anything: a truthy value
+///   (`1`, `true`, `yes`, `on`, `y`, `t`: the vocabulary of every other
+///   `SOCKET_*` toggle) asks for plain output; any other value keeps the
+///   terminal output whatever else is set (someone at a terminal an
+///   agent started).
+/// - Otherwise an agent's variable decides: the first of
+///   [`AGENT_ENV_VARS`] set to something other than `0`, `false`, `no`,
+///   `off`, `n` or `f`.
+pub(crate) fn plain_output(env: impl Fn(&str) -> Option<String>) -> Plain {
+    let set = |k: &str| {
+        env(k)
+            .map(|v| v.trim().to_ascii_lowercase())
+            .filter(|v| !v.is_empty())
+    };
+    if let Some(asked) = set("SOCKET_PLAIN") {
+        return match asked.as_str() {
+            "1" | "true" | "yes" | "on" | "y" | "t" => Plain::Asked,
+            _ => Plain::No,
+        };
+    }
+    let off = |v: &str| matches!(v, "0" | "false" | "no" | "off" | "n" | "f");
+    AGENT_ENV_VARS
+        .iter()
+        .find(|name| set(name).is_some_and(|v| !off(&v)))
+        .map_or(Plain::No, |name| Plain::Agent(name))
+}
+
 /// Whether the Unicode marks and bars may be drawn, pure over its inputs:
 /// only with `color` on (so `NO_COLOR` turns both off) and only on a
 /// terminal (a pipe or log gets ASCII, whatever forced its colors), and
@@ -225,13 +372,14 @@ pub(crate) fn glyphs_enabled(
 
 /// Whether someone is at a terminal that can show the full-screen browser
 /// ([`browser`]): stdin, stdout and stderr (where it is drawn) are all
-/// terminals, and the terminal renders escape sequences (not `TERM=dumb`,
-/// not a console without VT processing). The browser is drawn with
-/// nothing else, so anywhere this is false a command prints instead.
+/// terminals with a person at them ([`attended`]), and the terminal
+/// renders escape sequences (not `TERM=dumb`, not a console without VT
+/// processing). The browser is drawn with nothing else, so anywhere this
+/// is false a command prints instead.
 pub(crate) fn full_screen() -> bool {
-    std::io::stdin().is_terminal()
-        && std::io::stdout().is_terminal()
-        && std::io::stderr().is_terminal()
+    attended(Stream::Stdin)
+        && attended(Stream::Stdout)
+        && attended(Stream::Stderr)
         && vt() == (true, true)
         && env_var("TERM").is_none_or(|term| term != "dumb")
 }
@@ -271,12 +419,12 @@ impl Style {
 
     /// The style of stdout (results).
     pub(crate) fn stdout() -> Style {
-        Style::of(std::io::stdout().is_terminal(), stdout_color())
+        Style::of(attended(Stream::Stdout), stdout_color())
     }
 
     /// The style of stderr (status lines, warnings).
     pub(crate) fn stderr() -> Style {
-        Style::of(std::io::stderr().is_terminal(), stderr_color())
+        Style::of(attended(Stream::Stderr), stderr_color())
     }
 
     fn of(is_tty: bool, color: bool) -> Style {
@@ -327,18 +475,20 @@ fn filled_cells(done: usize, total: usize, cells: usize) -> usize {
     }
 }
 
-/// [`color_enabled`] for stdout; a terminal must also render escapes
-/// ([`vt`]).
+/// [`color_enabled`] for stdout, where a terminal counts when a person
+/// is at it ([`attended`]); any terminal, attended or not, must also
+/// render escapes ([`vt`]).
 pub(crate) fn stdout_color() -> bool {
-    let tty = std::io::stdout().is_terminal();
-    color_enabled(tty, env_var) && (!tty || vt().0)
+    let terminal = std::io::stdout().is_terminal();
+    color_enabled(attended(Stream::Stdout), env_var) && (!terminal || vt().0)
 }
 
-/// [`color_enabled`] for stderr; a terminal must also render escapes
-/// ([`vt`]).
+/// [`color_enabled`] for stderr, where a terminal counts when a person
+/// is at it ([`attended`]); any terminal, attended or not, must also
+/// render escapes ([`vt`]).
 pub(crate) fn stderr_color() -> bool {
-    let tty = std::io::stderr().is_terminal();
-    color_enabled(tty, env_var) && (!tty || vt().1)
+    let terminal = std::io::stderr().is_terminal();
+    color_enabled(attended(Stream::Stderr), env_var) && (!terminal || vt().1)
 }
 
 /// Columns of the terminal on stderr (status lines, prompts): its size,
@@ -486,6 +636,71 @@ mod tests {
         assert_eq!(
             display_copy_path("/p/node_modules/é", std::path::Path::new("/p")),
             "node_modules/é"
+        );
+    }
+
+    /// An agent's terminal is not a terminal with a person at it: any one
+    /// of the variables agents set for their commands makes the output
+    /// plain, and `SOCKET_PLAIN` has the last word either way.
+    #[test]
+    fn plain_output_follows_the_agent_variables_and_the_override() {
+        let env = |vars: &'static [(&'static str, &'static str)]| {
+            move |k: &str| {
+                vars.iter()
+                    .find(|(name, _)| *name == k)
+                    .map(|(_, v)| v.to_string())
+            }
+        };
+        assert_eq!(plain_output(env(&[])), Plain::No);
+        // Each agent's own variable, by name.
+        for name in AGENT_ENV_VARS {
+            let named = move |k: &str| (k == *name).then(|| "1".to_string());
+            assert_eq!(plain_output(named), Plain::Agent(name), "{name}");
+        }
+        assert_eq!(
+            plain_output(env(&[("AI_AGENT", "claude-code_2-1-327_agent")])),
+            Plain::Agent("AI_AGENT")
+        );
+        // Set to nothing, or to "off", is not set.
+        for value in ["", "  ", "0", "false", "FALSE", "no", "off", "n", "f"] {
+            let unset = move |k: &str| (k == "CLAUDECODE").then(|| value.to_string());
+            assert_eq!(plain_output(unset), Plain::No, "{value:?}");
+        }
+        // A variable set for other reasons, or by an editor in every
+        // terminal, says nothing.
+        assert_eq!(
+            plain_output(env(&[
+                ("AGENT", "build-agent-7"),
+                ("CURSOR_TRACE_ID", "abc"),
+                ("REPL_ID", "abc"),
+                ("TERM_PROGRAM", "vscode"),
+            ])),
+            Plain::No
+        );
+        // The override. Anything but a truthy value keeps the terminal
+        // output, an agent or not: a typo never turns the UI off.
+        for value in ["0", "false", "no", "off", "n", "flase"] {
+            let kept = move |k: &str| match k {
+                "SOCKET_PLAIN" => Some(value.to_string()),
+                "CLAUDECODE" => Some("1".to_string()),
+                _ => None,
+            };
+            assert_eq!(plain_output(kept), Plain::No, "{value:?}");
+        }
+        for value in ["1", "true", "YES", "on", "y", "t"] {
+            let asked = move |k: &str| (k == "SOCKET_PLAIN").then(|| value.to_string());
+            assert_eq!(plain_output(asked), Plain::Asked, "{value:?}");
+        }
+        // Set to nothing, it decides nothing.
+        assert_eq!(
+            plain_output(env(&[("SOCKET_PLAIN", ""), ("CLAUDECODE", "1")])),
+            Plain::Agent("CLAUDECODE")
+        );
+        // The note names the variable and the way back.
+        assert_eq!(
+            agent_terminal_note("CLAUDECODE"),
+            "Note: CLAUDECODE is set, so this terminal gets the plain output of an AI coding \
+             agent's. A person at it can set SOCKET_PLAIN=0 for the interactive output."
         );
     }
 

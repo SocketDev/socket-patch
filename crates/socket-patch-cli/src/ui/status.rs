@@ -11,7 +11,7 @@
 //! cannot interleave with them or outlive a cleared line.
 
 use std::fmt::Display;
-use std::io::{self, IsTerminal, Write};
+use std::io::{self, Write};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
@@ -161,15 +161,17 @@ impl StatusLine<io::Stderr> {
     /// The status line for a command's stderr. It reports (writes
     /// [`finish_with`](Self::finish_with) lines) unless `json` or
     /// `silent`, and is live only when it reports on a terminal that
-    /// understands escape sequences. A live line opens with the activity
-    /// mark, and a ticker keeps it turning.
+    /// understands escape sequences and has a person at it
+    /// ([`super::attended`]: an agent's terminal gets no line, as a pipe
+    /// gets none). A live line opens with the activity mark, and a ticker
+    /// keeps it turning.
     ///
     /// Under `SOCKET_DEBUG` the line is never live: core's debug logging
     /// writes straight to stderr and would land on the end of the status.
     pub(crate) fn stderr(json: bool, silent: bool) -> Self {
         let human = !json && !silent;
         let live = human
-            && io::stderr().is_terminal()
+            && super::attended(super::Stream::Stderr)
             && super::vt().1
             && !std::env::var("TERM").is_ok_and(|t| t == "dumb")
             && !socket_patch_core::utils::env_compat::is_debug_enabled();

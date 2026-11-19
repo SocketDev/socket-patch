@@ -191,6 +191,53 @@ async fn scan_progress_on_a_tty_renders_without_stale_tail() {
     }
 }
 
+/// A scan an AI coding agent runs on a pseudo-terminal draws nothing for
+/// a person: no status line (every redraw of it would be read back into
+/// the agent's context), no color, no glyphs. What reaches the agent is
+/// the result lines a pipe gets, and not one escape sequence or carriage
+/// return besides the terminal's own line endings.
+#[tokio::test(flavor = "multi_thread")]
+async fn scan_on_an_agents_terminal_draws_no_status_line() {
+    let mock = MockServer::start().await;
+    let purl = MINIMIST;
+    mount_batch_one(&mock, purl, UUID, "free", &[], false).await;
+    mount_by_package(&mock, purl, UUID, serde_json::json!({})).await;
+
+    let tmp = minimist_project(b"x\n");
+
+    let uri = mock.uri();
+    let cwd = tmp.path().to_path_buf();
+    let run = tokio::task::spawn_blocking(move || {
+        pty_io::run_command(
+            common::hermetic::pty_binary_command(),
+            &[&["scan"][..], &api_args(&uri)].concat(),
+            &cwd,
+            &[("AI_AGENT", "some-agent_1-2-3_agent")],
+            &[],
+            Duration::from_secs(60),
+        )
+    })
+    .await
+    .expect("spawn_blocking join");
+    let output = run.output;
+    assert_eq!(run.code, 0, "output:\n{output}");
+
+    assert!(!output.contains('\x1b'), "raw={output:?}");
+    assert!(
+        !output.replace("\r\n", "\n").contains('\r'),
+        "raw={output:?}"
+    );
+    for transient in ["Scanning packages", "Checking 1 package", "Reading patches"] {
+        assert!(!output.contains(transient), "{transient:?} in {output:?}");
+    }
+    for line in [
+        "Found 1 package (1 npm)\r\n",
+        "Switched 0 packages to hosted patches; rewrote 0 files.\r\n",
+    ] {
+        assert!(output.contains(line), "{line:?} in {output:?}");
+    }
+}
+
 /// Under `SOCKET_DEBUG` core prints `[socket-patch debug] ...` lines
 /// straight to stderr. The live status line is off then, so those
 /// lines never land glued onto the end of a progress message.

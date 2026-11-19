@@ -10,7 +10,8 @@ use crate::args::GlobalArgs;
 const NON_INTERACTIVE_PROCEED: &str = "Non-interactive mode detected, proceeding automatically.";
 /// Same, for a prompt whose default is "no".
 const NON_INTERACTIVE_DECLINE: &str = "Non-interactive mode detected, declining by default.";
-/// Same, for [`select_one`], which takes the first option.
+/// Same, for [`select_one`], which takes the first option when nobody is
+/// at a terminal on stdin (a pipe, or an AI coding agent's terminal).
 const NON_INTERACTIVE_SELECT_FIRST: &str =
     "Non-interactive mode detected, selecting the first option.";
 
@@ -130,7 +131,8 @@ const MENU_ROWS: usize = 12;
 /// - `--json`: `Err(JsonModeNeedsExplicit)`.
 /// - Empty `options`: `Err(Cancelled)` — there is nothing to select, and
 ///   `Ok(0)` would hand callers an out-of-bounds index.
-/// - stdin not a terminal: the first option, with
+/// - Nobody at a terminal on stdin ([`super::attended`]: a pipe, or an
+///   AI coding agent's terminal): the first option, with
 ///   [`NON_INTERACTIVE_SELECT_FIRST`] unless `--silent` or the process is
 ///   quiet ([`super::quiet`]).
 /// - Interactive: Esc/q/Ctrl-C cancel; the cursor is always restored.
@@ -156,10 +158,13 @@ pub fn select_from(
     if options.is_empty() {
         return Err(SelectError::Cancelled);
     }
-    if !io::stdin().is_terminal() {
+    // An arrow-key menu needs a person at the keys: an agent's terminal
+    // takes the first option, as a pipe does.
+    if !super::attended(super::Stream::Stdin) {
         if !common.silent && !super::quiet() {
             eprintln!("{NON_INTERACTIVE_SELECT_FIRST}");
         }
+        super::note_agent_terminal(common);
         return Ok(0);
     }
     let (prompt, options) = fit_menu(prompt, options, super::stderr_width());

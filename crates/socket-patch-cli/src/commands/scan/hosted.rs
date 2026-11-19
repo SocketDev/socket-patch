@@ -2284,10 +2284,11 @@ async fn run_redirect_selected_untracked(
         emit_scan(&env);
     } else {
         if !common.silent {
-            // Wrap long warnings only on a terminal: logs and pipes keep one
-            // line per sentence so CI can grep them.
+            // Wrap long warnings only on a terminal with a person at it:
+            // logs, pipes and agents keep one line per sentence, so CI can
+            // grep them and an agent reads whole sentences.
             let width =
-                std::io::IsTerminal::is_terminal(&std::io::stderr()).then(crate::ui::stderr_width);
+                crate::ui::attended(crate::ui::Stream::Stderr).then(crate::ui::stderr_width);
             for purl in &takeover_migrated {
                 eprintln!("{}", format_takeover_line(purl, common.dry_run));
             }

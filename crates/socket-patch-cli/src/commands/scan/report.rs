@@ -15,7 +15,6 @@
 //! run does its work.
 
 use std::collections::{HashMap, HashSet};
-use std::io::IsTerminal;
 use std::time::{Duration, Instant};
 
 use socket_patch_core::api::client::ApiClient;
@@ -952,7 +951,7 @@ impl Run {
         if !self.human {
             return Vec::new();
         }
-        let cap = std::io::stdout().is_terminal().then(ui::stdout_width);
+        let cap = ui::attended(ui::Stream::Stdout).then(ui::stdout_width);
         rows(
             plan,
             landed,
@@ -993,9 +992,7 @@ impl Run {
         let mut counts = self.counts;
         counts.verify(&self.patched, &self.measured);
         counts.free_only = self.free_only;
-        let elapsed = std::io::stdout()
-            .is_terminal()
-            .then(|| self.started.elapsed());
+        let elapsed = ui::attended(ui::Stream::Stdout).then(|| self.started.elapsed());
         let lines = closing(
             &counts,
             self.projects,

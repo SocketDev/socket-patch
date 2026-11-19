@@ -9,7 +9,6 @@
 //! was never measured, or whose answer fails, simply shows none.
 
 use std::collections::HashMap;
-use std::io::IsTerminal;
 
 use socket_patch_core::api::client::{hold_back_debug, ApiClient, ApiError, HeldBack};
 use socket_patch_core::api::types::{PatchRatio, PatchStatistics};
@@ -33,7 +32,7 @@ const LISTING_WAIT: std::time::Duration = std::time::Duration::from_millis(1500)
 /// `--silent`) whose stdout is a terminal. A pipe, a log and a script make
 /// no extra request and read the same every time.
 pub(crate) fn wanted(common: &GlobalArgs) -> bool {
-    !common.json && !common.silent && std::io::stdout().is_terminal()
+    !common.json && !common.silent && crate::ui::attended(crate::ui::Stream::Stdout)
 }
 
 /// Ask the patch service what it measured about each of `uuids`.

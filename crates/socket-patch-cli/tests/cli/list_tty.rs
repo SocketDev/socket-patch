@@ -88,6 +88,18 @@ impl Terminal {
     }
 
     fn run(command: &str, cwd: &Path, args: &[&str], cols: u16, rows: u16) -> Terminal {
+        Terminal::run_with(command, cwd, args, &[], cols, rows)
+    }
+
+    /// [`Self::run`] with `env` added to the child's environment.
+    fn run_with(
+        command: &str,
+        cwd: &Path,
+        args: &[&str],
+        env: &[(&str, &str)],
+        cols: u16,
+        rows: u16,
+    ) -> Terminal {
         let pair = portable_pty::native_pty_system()
             .openpty(size(cols, rows))
             .expect("openpty");
@@ -100,6 +112,9 @@ impl Terminal {
         cmd.env("TERM", "xterm-256color");
         // No color, so a frame's lines are its text; glyphs go with color.
         cmd.env("NO_COLOR", "1");
+        for (name, value) in env {
+            cmd.env(name, value);
+        }
         let child = pair.slave.spawn_command(cmd).expect("spawn in PTY");
         drop(pair.slave);
         let output = PtyOutput::spawn(pair.master.try_clone_reader().expect("clone reader"));
@@ -688,6 +703,67 @@ fn show_yes_prints_the_patch_at_once_and_opens_nothing() {
         assert!(output.contains(line), "{line:?} in {output:?}");
     }
     assert!(!output.contains("Open a file"), "{output:?}");
+}
+
+/// An AI coding agent that runs `list` on a pseudo-terminal gets what a
+/// pipe gets: the full entries, printed, and a run that ends by itself.
+/// The full-screen table would wait for keys nobody presses, and every
+/// redraw of it would land in the agent's context. The agent is known by
+/// a variable it sets for the commands it runs. Someone working in a
+/// terminal an agent started says so with `SOCKET_PLAIN=0` and gets the
+/// table.
+#[test]
+fn list_on_an_agents_terminal_prints_and_opens_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_manifest(tmp.path(), 3);
+    for agent in [
+        ("AI_AGENT", "some-agent_1-2-3_agent"),
+        ("CLAUDECODE", "1"),
+        ("CURSOR_AGENT", "1"),
+        ("CODEX_SANDBOX", "seatbelt"),
+        ("SOCKET_PLAIN", "1"),
+    ] {
+        let term = Terminal::run_with("list", tmp.path(), &["--offline"], &[agent], 100, 16);
+        let (code, output) = term.finish();
+        assert_eq!(code, 0, "{agent:?}: {output}");
+        assert!(!output.contains('\x1b'), "{agent:?}: {output:?}");
+        assert!(
+            output.contains("Found 3 patches:\r\n"),
+            "{agent:?}: {output:?}"
+        );
+        assert!(
+            output.contains("Package: pkg:npm/list-tty-package-00@1.0.0\r\n"),
+            "{agent:?}: {output:?}"
+        );
+        // One line says why there is no table, for a person who finds
+        // themselves here, and names the variable; asking for plain
+        // output oneself needs no explaining.
+        let note = format!(
+            "Note: {} is set, so this terminal gets the plain output of an AI coding agent's. \
+             A person at it can set SOCKET_PLAIN=0 for the interactive output.\r\n",
+            agent.0
+        );
+        let expected = usize::from(agent.0 != "SOCKET_PLAIN");
+        assert_eq!(output.matches("Note: ").count(), expected, "{output:?}");
+        assert_eq!(output.matches(&note).count(), expected, "{output:?}");
+    }
+
+    let mut term = Terminal::run_with(
+        "list",
+        tmp.path(),
+        &["--offline"],
+        &[
+            ("AI_AGENT", "some-agent_1-2-3_agent"),
+            ("SOCKET_PLAIN", "0"),
+        ],
+        100,
+        16,
+    );
+    term.wait_for("1/3", 1);
+    term.press(b"q");
+    let (code, output) = term.finish();
+    assert_eq!(code, 0, "{output}");
+    assert!(output.contains(ENTER_SCREEN), "{output:?}");
 }
 
 /// `--yes`, like a pipe, keeps the full entries and opens no browser: the

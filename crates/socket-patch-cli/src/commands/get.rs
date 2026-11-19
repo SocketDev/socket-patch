@@ -523,8 +523,8 @@ fn selection_prompted(
     can_access_paid: bool,
     common: &GlobalArgs,
 ) -> bool {
-    use std::io::IsTerminal;
-    selection_has_choice(candidates, can_access_paid, common) && std::io::stdin().is_terminal()
+    selection_has_choice(candidates, can_access_paid, common)
+        && crate::ui::attended(crate::ui::Stream::Stdin)
 }
 
 /// The "which patch will be installed" block printed before the prompt
@@ -4659,11 +4659,11 @@ mod tests {
         assert!(!selection_prompted(&two, false, &json));
         // A single free candidate is auto-picked.
         assert!(!selection_prompted(&one_plus_paid, false, &plain));
-        // Several free candidates prompt exactly when stdin is a terminal.
-        use std::io::IsTerminal;
+        // Several free candidates prompt exactly when someone is at the
+        // terminal on stdin.
         assert_eq!(
             selection_prompted(&two, false, &plain),
-            std::io::stdin().is_terminal()
+            crate::ui::attended(crate::ui::Stream::Stdin)
         );
     }
 

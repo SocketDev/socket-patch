@@ -821,6 +821,10 @@ pub async fn run(args: ListArgs) -> i32 {
     // Someone at a terminal browses the patches; everyone else gets them
     // printed.
     let browsing = interactive(&args.common);
+    if !browsing && !args.common.yes && !args.common.verbose {
+        // On a terminal this would have been the table: say why not.
+        crate::ui::note_agent_terminal(&args.common);
+    }
     // Finding and reading the projects walks the checkout and parses its
     // lockfiles: the status line says so while it lasts. What a project
     // has to say on stderr is held back until the line is down.

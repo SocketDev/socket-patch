@@ -238,6 +238,45 @@ fn module_edges() -> BTreeSet<(String, String)> {
     edges
 }
 
+/// Whether a stream is a terminal is asked in one place, `ui::attended`,
+/// which also knows an AI coding agent's terminal from a person's. A
+/// check written with `std::io::IsTerminal` anywhere else would draw for
+/// a person where an agent reads, so outside `src/ui/` there is none.
+/// Inside it, only `mod.rs` (`attended` itself and the color gate) and
+/// `prompt.rs` (the typed yes/no question, which is deliberately asked on
+/// any terminal, and the cursor guard of a menu already open) ask.
+#[test]
+fn terminal_checks_go_through_ui_attended() {
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut files = Vec::new();
+    rust_files(&src, &mut files);
+    assert!(files.len() > 20, "the scan found the sources: {files:?}");
+    let allowed = [
+        src.join("ui").join("mod.rs"),
+        src.join("ui").join("prompt.rs"),
+    ];
+    let offenders: Vec<String> = files
+        .iter()
+        .filter(|file| !allowed.contains(file))
+        .filter_map(|file| {
+            let code = std::fs::read_to_string(file).ok()?;
+            let lines: Vec<String> = code
+                .lines()
+                .enumerate()
+                .filter(|(_, line)| !line.trim_start().starts_with("//"))
+                .filter(|(_, line)| line.contains("is_terminal") || line.contains("IsTerminal"))
+                .map(|(n, line)| format!("{}:{}: {}", file.display(), n + 1, line.trim()))
+                .collect();
+            (!lines.is_empty()).then(|| lines.join("\n"))
+        })
+        .collect();
+    assert!(
+        offenders.is_empty(),
+        "ask `ui::attended(Stream::..)` instead of `is_terminal()`:\n{}",
+        offenders.join("\n")
+    );
+}
+
 #[test]
 fn edge_scanner_sees_every_import_form() {
     let names = |code: &str, depth: usize| -> Vec<String> {

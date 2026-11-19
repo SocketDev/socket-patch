@@ -13,8 +13,6 @@
 //! opens ([`load_page`]). Anywhere else (a pipe, `--no-pager`, `--yes`)
 //! the same text is printed at once, like `git show`.
 
-use std::io::IsTerminal;
-
 use base64::Engine as _;
 use clap::Args;
 use socket_patch_core::api::client::{
@@ -602,8 +600,8 @@ pub async fn run(args: ShowArgs) -> i32 {
                 let menu = !common.json
                     && !common.silent
                     && !common.yes
-                    && std::io::stdin().is_terminal()
-                    && std::io::stderr().is_terminal();
+                    && ui::attended(ui::Stream::Stdin)
+                    && ui::attended(ui::Stream::Stderr);
                 let labels: Vec<String> = many.iter().map(candidate_label).collect();
                 if menu {
                     match select_one("Which patch?", &labels, common) {
@@ -680,8 +678,12 @@ pub async fn run(args: ShowArgs) -> i32 {
     // no such screen (a pipe, `--no-pager`, `--yes`, a terminal that
     // shows no escape sequences or cannot be set up), the same text
     // prints below.
-    let reads =
-        !args.stat && !args.no_pager && !common.yes && !selected.is_empty() && ui::full_screen();
+    let wanted = !args.stat && !args.no_pager && !common.yes && !selected.is_empty();
+    let reads = wanted && ui::full_screen();
+    if wanted && !reads {
+        // On a terminal this would have been the page: say why not.
+        ui::note_agent_terminal(common);
+    }
     let read = reads && ui::browser::read(shown.page(&selected, style));
     // The summary is what stays on the terminal either way.
     for line in summary(patch, files, style) {
