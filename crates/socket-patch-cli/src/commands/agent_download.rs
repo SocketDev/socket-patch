@@ -2358,6 +2358,9 @@ fn install_command(ecosystem: Ecosystem, has_file: &dyn Fn(&str) -> bool) -> Opt
         Ecosystem::Pypi if has_file("poetry.lock") => "poetry install",
         Ecosystem::Pypi if has_file("Pipfile.lock") => "pipenv install",
         Ecosystem::Pypi if has_file("pdm.lock") => "pdm install",
+        // pixi links the packages of a project into its own environments,
+        // conda and PyPI ones alike.
+        Ecosystem::Pypi if has_file("pixi.lock") => "pixi install",
         Ecosystem::Pypi => "pip install",
         Ecosystem::Gem => "bundle install",
         Ecosystem::Composer => "composer install",
@@ -2489,6 +2492,7 @@ mod tests {
             ("bun.lock", "pkg:npm/a@1", "bun install"),
             ("uv.lock", "pkg:pypi/a@1", "uv sync"),
             ("poetry.lock", "pkg:pypi/a@1", "poetry install"),
+            ("pixi.lock", "pkg:pypi/a@1", "pixi install"),
         ] {
             let dir = tempfile::tempdir().unwrap();
             std::fs::write(dir.path().join(lock), "").unwrap();

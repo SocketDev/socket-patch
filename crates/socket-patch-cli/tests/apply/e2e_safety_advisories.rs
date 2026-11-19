@@ -332,6 +332,105 @@ fn pypi_apply_emits_pypi_record_stale_advisory() {
     );
 }
 
+/// A pixi project as `pixi install` leaves it: `pixi.toml`, `pixi.lock`
+/// and one package (`certifi`, a single data file) in the `default`
+/// environment under `.pixi/envs`, a conda prefix. The manifest holds a
+/// patch for that file under the release-qualified purl the patch service
+/// records. Returns the installed file.
+fn pixi_project_with_patch(cwd: &Path, installed: &[u8]) -> std::path::PathBuf {
+    std::fs::write(
+        cwd.join("pixi.toml"),
+        "[workspace]\nname = \"analysis\"\nchannels = [\"conda-forge\"]\nplatforms = [\"linux-64\"]\n",
+    )
+    .unwrap();
+    std::fs::write(cwd.join("pixi.lock"), "version: 6\n").unwrap();
+    let prefix = cwd.join(".pixi").join("envs").join("default");
+    std::fs::create_dir_all(prefix.join("conda-meta")).unwrap();
+    std::fs::write(prefix.join("conda-meta").join("pixi"), "{}").unwrap();
+    let site_packages = if cfg!(windows) {
+        prefix.join("Lib").join("site-packages")
+    } else {
+        prefix.join("lib").join("python3.13").join("site-packages")
+    };
+    let dist_info = site_packages.join("certifi-2026.7.22.dist-info");
+    std::fs::create_dir_all(&dist_info).unwrap();
+    std::fs::write(
+        dist_info.join("METADATA"),
+        "Metadata-Version: 2.4\nName: certifi\nVersion: 2026.7.22\n",
+    )
+    .unwrap();
+    std::fs::write(dist_info.join("INSTALLER"), "conda\n").unwrap();
+    std::fs::create_dir_all(site_packages.join("certifi")).unwrap();
+    let target = site_packages.join("certifi").join("cacert.pem");
+    std::fs::write(&target, installed).unwrap();
+
+    let socket_dir = cwd.join(".socket");
+    write_minimal_manifest(
+        &socket_dir,
+        "pkg:pypi/certifi@2026.7.22?artifact_id=py3-none-any-whl",
+        "20000001-0000-4001-8001-000000000077",
+        &[PatchEntry {
+            file_name: "certifi/cacert.pem",
+            before_hash: &git_sha256(PIXI_UPSTREAM),
+            after_hash: &git_sha256(PIXI_PATCHED),
+        }],
+    );
+    write_blob(&socket_dir, &git_sha256(PIXI_PATCHED), PIXI_PATCHED);
+    target
+}
+
+const PIXI_UPSTREAM: &[u8] = b"# the PyPI release's bundle\n";
+const PIXI_PATCHED: &[u8] = b"# the patched bundle\n";
+
+/// `socket-patch apply` after `pixi install` runs with nothing activated
+/// (no `pixi run`, no `CONDA_PREFIX`): it finds the package in
+/// `.pixi/envs/default`, patches it, and its advisory names what reverts a
+/// pixi install, not `pip`, which a pixi environment has none of.
+#[test]
+fn pixi_project_apply_needs_no_activation_and_names_pixi() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let cwd = tmp.path();
+    let target = pixi_project_with_patch(cwd, PIXI_UPSTREAM);
+
+    let (code, stdout, stderr) = run_with_env(cwd, &["apply", "--cwd", cwd.to_str().unwrap()], &[]);
+    assert_eq!(code, 0, "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert_eq!(std::fs::read(&target).unwrap(), PIXI_PATCHED);
+    assert!(
+        stderr.contains("pixi installed these packages")
+            && stderr.contains("`pixi reinstall`")
+            && stderr.contains("`socket-patch apply`"),
+        "stderr:\n{stderr}"
+    );
+    assert!(!stderr.contains("pip check"), "stderr:\n{stderr}");
+
+    // The second run finds the same copy, already patched.
+    let (code, stdout, stderr) = run_with_env(cwd, &["apply", "--cwd", cwd.to_str().unwrap()], &[]);
+    assert_eq!(code, 0, "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(stdout.contains("already patched"), "stdout:\n{stdout}");
+}
+
+/// A conda build is not always the PyPI release byte for byte. A copy whose
+/// file is neither side of the patch is left exactly as it is, and the
+/// failure says why: the copy is installed, in a conda environment, and
+/// its bytes are not the release's.
+#[test]
+fn pixi_project_apply_refuses_a_conda_build_that_differs_from_the_release() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let cwd = tmp.path();
+    let conda_build = b"# the PyPI release's bundle, changed by the conda recipe\n";
+    let target = pixi_project_with_patch(cwd, conda_build);
+
+    let (code, stdout, stderr) = run_with_env(cwd, &["apply", "--cwd", cwd.to_str().unwrap()], &[]);
+    assert_eq!(code, 1, "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert_eq!(std::fs::read(&target).unwrap(), conda_build);
+    assert!(
+        stderr.contains("Failed to patch pkg:pypi/certifi@2026.7.22: no matching variant found")
+            && stderr.contains("conda environment")
+            && stderr.contains("not the PyPI release's"),
+        "stderr:\n{stderr}"
+    );
+}
+
 // ─────────────────────────────────────────────────────────────────────
 // Gem — advisory-only, code = gem_bundle_install_reverts
 // ─────────────────────────────────────────────────────────────────────

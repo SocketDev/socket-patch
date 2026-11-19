@@ -92,6 +92,34 @@ fn advisory_only_payload(
     }
 }
 
+/// What to tell the operator after an in-place patch of a Python package:
+/// its install records still describe the unpatched files, and a reinstall
+/// by whatever installed it reverts the patch. A package in a conda prefix
+/// was installed by pixi or conda, which has no `pip` to check or
+/// reinstall with (a pixi environment usually ships none).
+fn pypi_advisory_message(pkg_path: &Path) -> &'static str {
+    use crate::crawlers::pixi_env::{conda_prefix_of, is_pixi_prefix};
+    match conda_prefix_of(pkg_path) {
+        Some(prefix) if is_pixi_prefix(prefix) => {
+            "PyPI: pixi installed these packages, and its records of them (conda-meta, \
+             .dist-info/RECORD) still describe the unpatched files. `pixi reinstall`, or \
+             an environment pixi rebuilds, will revert these patches; run `socket-patch \
+             apply` after it."
+        }
+        Some(_) => {
+            "PyPI: these packages are in a conda environment, whose records of them \
+             (conda-meta, .dist-info/RECORD) still describe the unpatched files. `conda \
+             install --force-reinstall`, or recreating the environment, will revert these \
+             patches."
+        }
+        None => {
+            "PyPI: run `pip check` (or `uv pip check`) to verify \
+             .dist-info/RECORD consistency. `pip install --force-reinstall` \
+             or `uv pip install --reinstall` will revert these patches."
+        }
+    }
+}
+
 /// Uniform `Error`-severity record for a fixup/resync that raised.
 /// Both apply's and rollback's best-effort boundaries convert a
 /// [`SidecarError`] into this shape (empty `files`, advisory code
@@ -160,9 +188,7 @@ pub async fn dispatch_fixup_with(
         Ecosystem::Pypi => Some(advisory_only_payload(
             SidecarAdvisoryCode::PypiRecordStale,
             SidecarSeverity::Warning,
-            "PyPI: run `pip check` (or `uv pip check`) to verify \
-             .dist-info/RECORD consistency. `pip install --force-reinstall` \
-             or `uv pip install --reinstall` will revert these patches.",
+            pypi_advisory_message(pkg_path),
         )),
         Ecosystem::Gem => Some(advisory_only_payload(
             SidecarAdvisoryCode::GemBundleInstallReverts,
@@ -374,6 +400,63 @@ mod tests {
         assert_eq!(advisory.code, SidecarAdvisoryCode::PypiRecordStale);
         assert_eq!(advisory.severity, SidecarSeverity::Warning);
         assert!(advisory.message.contains("pip"));
+    }
+
+    /// A package in a conda prefix was installed by pixi or conda, which
+    /// has no `pip` to check or reinstall with: the advisory names what
+    /// does revert the patch there.
+    #[tokio::test]
+    async fn pypi_advisory_names_what_reverts_a_conda_or_pixi_install() {
+        let d = tempfile::tempdir().unwrap();
+        let message_in = |prefix: &Path| {
+            let site = prefix.join("lib").join("python3.13").join("site-packages");
+            std::fs::create_dir_all(&site).unwrap();
+            async move {
+                dispatch_fixup(
+                    "pkg:pypi/certifi@2026.7.22",
+                    &site,
+                    &["certifi/cacert.pem".to_string()],
+                )
+                .await
+                .unwrap()
+                .and_then(|record| record.advisory)
+                .expect("pypi must carry an advisory")
+            }
+        };
+
+        let pixi = d.path().join(".pixi").join("envs").join("default");
+        std::fs::create_dir_all(pixi.join("conda-meta")).unwrap();
+        std::fs::write(pixi.join("conda-meta").join("pixi"), "{}").unwrap();
+        let advisory = message_in(&pixi).await;
+        assert_eq!(advisory.code, SidecarAdvisoryCode::PypiRecordStale);
+        assert!(
+            advisory.message.contains("`pixi reinstall`")
+                && advisory.message.contains("`socket-patch apply`")
+                && !advisory.message.contains("pip check"),
+            "{}",
+            advisory.message
+        );
+
+        let conda = d.path().join("miniconda3").join("envs").join("science");
+        std::fs::create_dir_all(conda.join("conda-meta")).unwrap();
+        let advisory = message_in(&conda).await;
+        assert!(
+            advisory
+                .message
+                .contains("`conda install --force-reinstall`")
+                && !advisory.message.contains("pixi")
+                && !advisory.message.contains("pip check"),
+            "{}",
+            advisory.message
+        );
+
+        let venv = d.path().join(".venv");
+        let advisory = message_in(&venv).await;
+        assert!(
+            advisory.message.contains("pip check"),
+            "{}",
+            advisory.message
+        );
     }
 
     #[tokio::test]

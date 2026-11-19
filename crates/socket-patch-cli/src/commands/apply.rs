@@ -3186,7 +3186,7 @@ async fn apply_patches_inner(
                         // under --silent.
                         eprintln!(
                             "{}",
-                            format_patch_failure(&base_purl, "no matching variant found")
+                            format_patch_failure(&base_purl, no_variant_reason(pkg_path))
                         );
                     }
                 }
@@ -4037,6 +4037,22 @@ fn print_lockfile_only_note(
 /// `Error: Failed to patch <purl>: <why>` (stderr, even under --silent).
 fn format_patch_failure(purl: &str, why: &str) -> String {
     format!("Error: Failed to patch {purl}: {why}")
+}
+
+/// Why no release variant in the manifest matched the installed copy at
+/// `pkg_path`. A copy in a conda prefix (a conda or pixi environment) was
+/// installed from a conda package, and a conda build is not always the
+/// PyPI release byte for byte: a recipe may patch the sources, and a
+/// compiled extension module is built for conda. Such a copy is installed,
+/// but a patch made from the PyPI release cannot be applied to it.
+fn no_variant_reason(pkg_path: &Path) -> &'static str {
+    if socket_patch_core::crawlers::pixi_env::conda_prefix_of(pkg_path).is_some() {
+        "no matching variant found: this copy is in a conda environment and its files \
+         are not the PyPI release's (a conda build can differ from the release it \
+         repackages), so the patch made for that release was not applied"
+    } else {
+        "no matching variant found"
+    }
 }
 
 /// The failing "no targeted patch matched an installed package" report:

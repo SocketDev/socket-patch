@@ -233,3 +233,80 @@ fn the_detail_names_every_input_looked_for() {
         assert!(detail.contains(input), "{input}: {detail}");
     }
 }
+
+const PIXI_CODE: &str = "redirect_pypi_pixi_project";
+
+/// A pixi project installs from its own lock, and mostly from conda
+/// channels: pinning the package in a requirements file or another tool's
+/// lock would change nothing pixi installs. It is sent to agent mode
+/// instead, once per run, whichever of pixi's two files is there, and never
+/// told to write a requirements.txt.
+#[test]
+fn a_pixi_project_is_sent_to_agent_mode() {
+    let overrides = [
+        six("aaaaaaaa-0000-4000-8000-000000000638"),
+        six("bbbbbbbb-0000-4000-8000-000000000638"),
+    ];
+    let manifest = "[workspace]\nchannels = [\"conda-forge\"]\nplatforms = [\"linux-64\"]\n\n[dependencies]\nsix = \"1.16.0.*\"\n";
+    let layouts: [(&str, BTreeMap<String, String>); 3] = [
+        ("pixi.toml only", files(&[("pixi.toml", manifest)])),
+        (
+            "pixi.toml and pixi.lock",
+            files(&[("pixi.toml", manifest), ("pixi.lock", "version: 6\n")]),
+        ),
+        (
+            "a pyproject manifest and pixi.lock",
+            files(&[
+                ("pyproject.toml", UV_PROJECT),
+                ("pixi.lock", "version: 6\n"),
+            ]),
+        ),
+    ];
+    for (layout, files) in layouts {
+        let result = rewrite_registry_redirect(&files, &overrides);
+        assert!(result.files.is_empty(), "{layout}: {:?}", result.files);
+        let pixi: Vec<&RewriteWarning> = result
+            .warnings
+            .iter()
+            .filter(|w| w.code == PIXI_CODE)
+            .collect();
+        assert_eq!(pixi.len(), 1, "{layout}: {:?}", codes(&result));
+        let detail = &pixi[0].detail;
+        for expected in [
+            "`socket-patch scan --mode agent`",
+            "`pixi install`",
+            "`socket-patch apply`",
+        ] {
+            assert!(detail.contains(expected), "{layout}: {detail}");
+        }
+        assert!(
+            no_lockfile_warnings(&result).is_empty(),
+            "{layout}: {:?}",
+            codes(&result)
+        );
+    }
+}
+
+/// A file a PyPI rewriter reads still owns the project's diagnostics in a
+/// pixi project (pip installing a requirements file into the pixi
+/// environment), and no pypi patch means nothing to say.
+#[test]
+fn a_pixi_project_with_a_wired_file_or_no_pypi_patch_is_silent() {
+    let overrides = [six("aaaaaaaa-0000-4000-8000-000000000638")];
+    let result = rewrite_registry_redirect(
+        &files(&[
+            ("pixi.toml", "[workspace]\n"),
+            ("requirements.txt", "six==1.16.0\n"),
+        ]),
+        &overrides,
+    );
+    assert!(!codes(&result).contains(&PIXI_CODE), "{:?}", codes(&result));
+    assert!(
+        result.files.contains_key("requirements.txt"),
+        "{:?}",
+        result.files
+    );
+
+    let result = rewrite_registry_redirect(&files(&[("pixi.toml", "[workspace]\n")]), &[]);
+    assert!(result.warnings.is_empty(), "{:?}", codes(&result));
+}

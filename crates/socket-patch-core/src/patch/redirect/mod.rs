@@ -1128,6 +1128,23 @@ fn warn_no_pypi_wiring(
     if wired || crate::utils::hatch::is_hatch(files) {
         return;
     }
+    // A pixi project: a requirements file or another tool's lock would
+    // pin nothing, since pixi installs from its own lock, and mostly from
+    // conda channels.
+    let pixi_files = crate::crawlers::pixi_env::PIXI_FILES;
+    if pixi_files.iter().any(|file| files.contains_key(*file)) {
+        result.warnings.push(RewriteWarning {
+            code: "redirect_pypi_pixi_project".into(),
+            detail: "pixi installs this project (pixi.toml / pixi.lock), most of it from \
+                     conda channels, and hosted mode cannot point a pixi lock at Socket's \
+                     patched packages; patch the installed packages in place instead: run \
+                     `socket-patch scan --mode agent` after `pixi install`, commit \
+                     .socket/, and run `socket-patch apply` after every later `pixi \
+                     install`"
+                .into(),
+        });
+        return;
+    }
     result.warnings.push(RewriteWarning {
         code: "redirect_pypi_no_lockfile".into(),
         detail: format!(
