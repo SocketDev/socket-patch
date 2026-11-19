@@ -2101,6 +2101,11 @@ with a native extension is installed into a staging directory by RubyGems, with 
 owns the installed copy, and swapped in once it has compiled; with no such Ruby, or with
 `--no-gem-native-rebuild`, it is left alone. After the scan `bundle exec` runs the patched code,
 and every kind of reinstall keeps it. `rollback` and `remove` do the same with the upstream gem.
+That holds in a gem home with no `cache/` directory too (Bundler 4.1's `prune` setting, an image
+that deletes it, `gem cleanup`): with no archive to compare, the installed files are checked
+against the patch itself, in both directions. If the patch can't be looked up during a `rollback`
+or `remove`, the copy is left alone and the run warns (`upstream_gem_stale_install`), naming the
+files to remove before `bundle install`.
 Vendoring a gem that was hosted (`vendor`, `scan --mode vendored`) leaves the installed copies as
 they are: Bundler loads the vendored copy from then on. When that vendored gem is later unwound
 (`rollback`, `remove`, `vendor --revert`), Bundler loads the installed copy again, so the unwind
@@ -2141,6 +2146,25 @@ A shared gem home also holds gem versions this project doesn't use: the gems Rub
 mode warns `redirect_gem_version_not_locked`, vendored mode reports a `skipped` event with
 `vendor_gem_version_not_locked` and doesn't download its patch. The run exits 0.
 
+## Ruby gems: gems vendored mode refuses
+
+Vendored mode rewrites one top-level `gem` line to a `path:` source, and Bundler builds nothing
+for a path-sourced gem. It refuses a gem that doesn't fit and changes nothing for it; the other
+gems of the run are still vendored, and the run exits 1. These three refusals name another mode
+that can patch the gem:
+
+| Code | The gem | What the error offers |
+|---|---|---|
+| `gemfile_declaration_not_editable` ("is indented") | is declared inside a block: `group :test do`, `platforms … do`, a conditional. Every Rails Gemfile declares its development and test gems this way. | Move the declaration to the top level (for a plain `group` block the error spells the option that replaces it, `group: :test`), or patch the gem with `--mode hosted`, which edits a declaration where it is. Inside a `source`, `git`, `github` or `path` block hosted mode refuses the gem too, and the error names `--mode agent`. |
+| `native_extensions_unsupported` | builds a native extension (puma, bootsnap). | `--mode hosted` or `--mode agent`. Both build the extension. Only `--mode agent` when the declaration picks the gem's source (a `source`, `git`, `github` or `path` block or option), which hosted mode refuses. |
+| `platform_gem_unsupported` | is installed as a precompiled platform build (`nokogiri-1.18.3-x86_64-linux-gnu`). | `--mode agent`. Hosted mode refuses a precompiled build too. |
+
+To patch one gem in another mode, name it: `socket-patch get <gem> --mode hosted`. A whole-project
+`scan --mode hosted` leaves vendored gems as they are, but it moves the vendored patches of the
+other ecosystems (npm, PyPI, Cargo, Go, Composer, Gradle) to hosted mode. Once a project holds
+patches of two modes, a `scan` with no `--mode` stops and asks which mode to use, so pass `--mode`
+on later runs.
+
 ## Ruby gems: native extensions
 
 Some gem fixes change only what a native extension is built from: its C sources
@@ -2153,7 +2177,7 @@ How each mode gets the patched code running:
 | Mode | What happens |
 |---|---|
 | Hosted | Bundler installs the patched `.gem` from the patch registry, and RubyGems compiles it like any registry gem. A precompiled platform gem (`x86_64-linux`) is refused with `redirect_gem_platform_unsupported`. |
-| Vendored | Refused with `native_extensions_unsupported`: Bundler builds no extensions for path-sourced gems. |
+| Vendored | Refused with `native_extensions_unsupported`: Bundler builds no extensions for path-sourced gems. Use hosted or agent mode for the gem. |
 | Agent (`apply`) | The extension is rebuilt from the gem's source archive with the patch laid over it, using RubyGems' builder and the Ruby that owns the install, and the build is put where Ruby loads it: the extension directory of a gem RubyGems built, the prebuilt binary of a precompiled gem. |
 
 `apply` takes the source gem (`<name>-<version>.gem`) from the gem home's `cache/` directory,
@@ -2183,6 +2207,32 @@ instead of being reported as patched.
 
 Ruby files are never build inputs outside `ext/` and a build script's directory: a patch that only
 changes `.rb` or `.rbs` files needs no compiler, wherever the gem keeps them.
+
+A rebuild is only taken for a build of the patch when it read at least one of the files the
+patch changes and left compiled code. How a gem builds depends on its configuration: nokogiri
+installed with `--use-system-libraries` links the operating system's libxml2 and never opens the
+copy it packs, so a patch that only adds a fix to that packed copy changes nothing there. A gem
+whose build script downloads the binary it runs (passenger's agent) compiles nothing at all.
+`apply` then writes the patch's files, leaves the compiled code as it was installed, and warns
+with `native_extension_not_rebuilt`, instead of reporting a patch that is in no compiled code:
+
+- The patch's Ruby files are in effect, and a source the gem compiles later on its own is the
+  patched one.
+- `apply --check` reports the package as not in sync, and `vex` does not attest the patch.
+- On a system-libraries install the library is the operating system's package, and updating
+  that package is what fixes it.
+
+A patch to the gem's own C sources is rebuilt as usual. On Linux the check asks the kernel which
+files the build opened. Elsewhere it needs a filesystem that records file reads; on one that
+does not (a `noatime` mount, Windows by default) the build is taken as it is.
+
+A build can take many minutes. `apply` prints a line to stderr when one starts and another when
+it ends (not under `--json` or `--silent`).
+
+A gem RubyGems compiled is rebuilt with the build arguments RubyGems recorded when it was
+installed. A precompiled gem is rebuilt with none: arguments Bundler recorded for it (a
+`build.nokogiri --use-system-libraries` setting kept from before nokogiri shipped precompiled
+gems) were never used to build it, and following them would replace the libraries the gem ships.
 
 The build happens in a stage directory inside the gem home (`.socket-patch-build/`), which is
 removed afterwards. A gem the build needs that the install lacks (a precompiled nokogiri has no

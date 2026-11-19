@@ -70,21 +70,13 @@ pub const CARGO_TOML: &str = "Cargo.toml";
 /// (`<name>-socket-<first 8 hex of the uuid>`).
 pub const SOCKET_KEY_INFIX: &str = "-socket-";
 
-/// The index URL cargo maps the `crates-io` `[patch]` key to.
-pub const CRATES_IO_INDEX_URL: &str = "https://github.com/rust-lang/crates.io-index";
-
-/// Does a `[patch.<source>]` key spell the crates.io index by URL
-/// (case, a trailing `/`, and a `.git` suffix ignored — conservative)?
-pub fn is_crates_io_url_alias(source: &str) -> bool {
-    let lower = source.trim().to_ascii_lowercase();
-    let trimmed = lower.trim_end_matches('/');
-    trimmed.strip_suffix(".git").unwrap_or(trimmed) == CRATES_IO_INDEX_URL
-}
-
-/// Does a `[patch.<source>]` key name crates.io (`crates-io` or the URL)?
-pub fn is_crates_io_source(source: &str) -> bool {
-    source == "crates-io" || is_crates_io_url_alias(source)
-}
+/// The index URL cargo maps the `crates-io` `[patch]` key to, whether a
+/// `[patch.<source>]` key spells that index by URL, and whether it names
+/// crates.io at all (`crates-io` or the URL): one rule each, kept with the
+/// rule for a lock `source`.
+pub use crate::formats::cargo::{
+    is_crates_io_git_index as is_crates_io_url_alias, is_crates_io_patch_table, CRATES_IO_INDEX_URL,
+};
 
 /// The `[patch.<url>]` keys of a document that spell crates.io by URL.
 pub fn crates_io_url_alias_tables(doc: &DocumentMut) -> Vec<String> {
@@ -133,12 +125,12 @@ pub struct ManifestPatchEntry {
 }
 
 /// Every crates.io `[patch]` item of a parsed manifest (or config) —
-/// `[patch.crates-io]` and its URL spellings ([`is_crates_io_source`]) — in
+/// `[patch.crates-io]` and its URL spellings ([`is_crates_io_patch_table`]) — in
 /// document order, header, dotted, sub-table and inline forms alike.
 pub fn crates_io_patch_entries(doc: &DocumentMut) -> Vec<ManifestPatchEntry> {
     patch_entries(doc)
         .into_iter()
-        .filter(|entry| is_crates_io_source(entry.source))
+        .filter(|entry| is_crates_io_patch_table(entry.source))
         .map(|entry| ManifestPatchEntry {
             source: entry.source.to_string(),
             key: entry.key.to_string(),
@@ -940,8 +932,8 @@ mod tests {
             "{PKG}\n[patch.\"https://example.com/index\"]\nitoa = {{ path = \"../itoa\" }}\n"
         );
         assert!(add(&src, "cfg-if", "1.0.4", UUID).content.is_some());
-        assert!(is_crates_io_source("crates-io"));
-        assert!(!is_crates_io_source("https://example.com/index"));
+        assert!(is_crates_io_patch_table("crates-io"));
+        assert!(!is_crates_io_patch_table("https://example.com/index"));
     }
 
     /// `toml_edit` drops a leading BOM; the edit and the revert put it back.

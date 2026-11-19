@@ -768,7 +768,7 @@ fn state_path(project_root: &Path) -> PathBuf {
 /// One deliberate exception to fail-closed: a parseable JSON object that is
 /// clearly a DIFFERENT Socket ledger (it carries a `mode` tag and no
 /// `entries` — e.g. an early registry-redirect ledger committed to this path
-/// by the depscan GitHub-app flow) is treated as an empty vendor ledger
+/// by the Socket GitHub-app flow) is treated as an empty vendor ledger
 /// instead of bricking every vendor-adjacent command (`remove`, `vendor`,
 /// `repair`) with `vendor_state_unreadable`. Such a file carries no vendor
 /// data by construction, so nothing is guessed.
@@ -2398,7 +2398,7 @@ mod tests {
     }
 
     /// A mode-tagged NON-vendor ledger squatting on this path (an early
-    /// registry-redirect ledger committed by the depscan GitHub-app flow)
+    /// registry-redirect ledger committed by the Socket GitHub-app flow)
     /// must read as an EMPTY vendor ledger, not brick `remove`/`vendor`/
     /// `repair` with vendor_state_unreadable. A vendor-shaped file that is
     /// genuinely corrupt stays fail-closed.

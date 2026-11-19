@@ -19,7 +19,7 @@
 //!
 //! [`ManifestlessVex::run`] is the step each flow appends once it has
 //! produced its committed state and a REAL yarn has installed it into a
-//! fresh checkout: the depscan / never-committed-`.socket/manifest.json`
+//! fresh checkout: the GitHub-app / never-committed-`.socket/manifest.json`
 //! shape, attested from the lockfile wiring alone.
 //!
 //! Pull it in AFTER the shared vex helper (it refers to it by that name):

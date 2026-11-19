@@ -10,7 +10,7 @@
 //! committed index names) onto it, and every other repository onto the
 //! fake Central. The suffixed artifacts are the patched jar, the upstream
 //! pom re-versioned to the suffixed version and — like the patch service
-//! (depscan) — the upstream `.module` with its component version and jar
+//! — the upstream `.module` with its component version and jar
 //! file entry rewritten to the suffixed, patched jar.
 //!
 //! Every test is `#[ignore]` and prefixed `gradle_hosted_` (the CI filter

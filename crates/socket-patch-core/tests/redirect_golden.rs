@@ -1,7 +1,7 @@
 //! Shared golden-fixture test for the registry-redirect rewriters — the Rust
 //! CLI half of the cross-language consistency contract. Consumes the SAME
-//! `tests/fixtures/redirect/<eco>/<flavor>/<case>/` fixtures the depscan
-//! backend's TS `golden.test.ts` consumes, and asserts this CLI produces the
+//! `tests/fixtures/redirect/<eco>/<flavor>/<case>/` fixtures the golden test
+//! of Socket's TS backend consumes, and asserts this CLI produces the
 //! byte-identical `expected/` files + `expected-edits.json`. A fixture's
 //! `expected/` bytes were authored by the TS backend, so a match here proves a
 //! customer gets the same lockfile whether Socket opens the PR (backend) or

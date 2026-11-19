@@ -312,7 +312,7 @@ jobs:
           # The releases the download step staged: the matrix release or the
           # dispatch override, minus any pre-1.1.0 release skipped on Windows.
           BUN_VERSIONS: ${{ steps.bun.outputs.versions }}
-          # Provenance for the captures the depscan SBOM fixtures import:
+          # Provenance for the captures the Socket backend's SBOM fixtures import:
           # `cliRevision` is the branch-resolvable head commit (PR head, or the
           # pushed commit on main); `cliBuildSha` is the commit actions/checkout
           # actually built (refs/pull/N/merge on PRs) — they diverge once main

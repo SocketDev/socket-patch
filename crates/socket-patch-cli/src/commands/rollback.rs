@@ -2389,7 +2389,7 @@ async fn run_project(args: RollbackArgs, below: BelowNotes) -> i32 {
                 .filter(|pin| hosted_scope.contains(&pin.purl))
                 .cloned()
                 .collect();
-            let hosted_leg = run_hosted_leg(&args.common, &in_scope).await;
+            let hosted_leg = run_hosted_leg(&args.common, &in_scope, &api_client).await;
             // An unscoped rollback promises to unwind EVERY hosted patch:
             // contested wiring it cannot restore fails the leg (a scoped run
             // names its own targets and leaves unrelated wiring alone).
@@ -3664,6 +3664,7 @@ pub(crate) async fn rollback_patches_inner(
                             cwd: common.cwd.clone(),
                             rebuild: !common.no_gem_native_rebuild,
                             offline: common.offline,
+                            progress: common.gem_build_progress(),
                         };
                         if let Err(e) = gem_ext::restore_original_build(pkg_path, &env).await {
                             result.success = false;

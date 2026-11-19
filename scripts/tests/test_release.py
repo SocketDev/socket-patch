@@ -40,6 +40,9 @@ def tearDownModule():
     _ENV.stop()
 
 
+# CHANGELOG.md as it was on main at 045d7ec7, except that four lines of its
+# 4.0.0 section were reworded later because they named a private repository.
+# Don't regenerate the file from that commit without redoing the rewording.
 MAIN_SNAPSHOT = (FIXTURES / "CHANGELOG.main-045d7ec7.md").read_text(encoding="utf-8")
 TRAIN = (FIXTURES / "CHANGELOG.train.md").read_text(encoding="utf-8")
 LEGACY_TAGS = ["1.1.0", "1.2.0", "2.1.4", "3.1.0", "3.2.0", "3.3.0", "4.0.0"]
