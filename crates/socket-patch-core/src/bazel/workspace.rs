@@ -94,6 +94,11 @@ pub fn disk(root: &Path) -> impl Fn(&str) -> Entry + '_ {
             if !real.starts_with(top) {
                 return Err(std::io::Error::other("it leads out of the Bazel workspace"));
             }
+            // Windows refuses to open a directory ("Access is denied"),
+            // so the opener's own check never sees one there.
+            if real.is_dir() {
+                return Err(ErrorKind::InvalidInput.into());
+            }
             text(open_regular_file_sync(&real)?.0)
         };
         let unreadable = |why: &str| Entry::Unreadable(why.to_string());
