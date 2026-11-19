@@ -44,9 +44,18 @@
 //! string. Every form is told one product; `vex` without one, as a user
 //! types it, runs once after the patched build, where it names the project
 //! of the checkout's own `package.json` or `go.mod`, or writes no document
-//! where the fixture has no such file. Nothing in `socket-patch` reads a
-//! Bazel file for it, so these tests say for which workspaces the document
-//! and the build agree.
+//! where the fixture has no such file.
+//!
+//! `socket-patch` reads `MODULE.bazel` for the calls that hand a lock to a
+//! ruleset, and writes no statement for a patch that such a ruleset does
+//! not build: one in the copy a package manager installed, or a PyPI or
+//! RubyGems one in a copy committed under `.socket/vendor`. Two flows hold
+//! it to that (`npm::agent_npm_translate_lock`,
+//! `pypi::vendored_pip_parse`): the build is not the patched one, no form
+//! of `vex` writes a document, each names the call and the file Bazel
+//! builds from, and after what the warning says to do the build is patched
+//! and the document is there. So these tests say for which workspaces the
+//! document and the build agree, and for which there is no document.
 //!
 //! A flow is one `#[ignore]`d test in its ecosystem's module, and its
 //! fixture is one directory of files that every release builds beside one

@@ -36,10 +36,12 @@ on:
     # call, and that are no other project manager's own, are listed with
     # them: the finder of a project's Python lock files, the spelling of a
     # version in a wheel's file name, and the hosted scan's check of an
-    # installed wheel. Last, the VEX code: `vex/` of the core and the files
-    # of the `vex` command. Every flow holds the exact document socket-patch
-    # writes about its patched build, so a change to how a document is built
-    # or worded starts the legs of every ecosystem. Nothing else that
+    # installed wheel. Last, the VEX code: `vex/` of the core, the files of
+    # the `vex` command, and `bazel/` of the core, which reads the workspace
+    # files and decides whether Bazel builds what was patched. Every flow
+    # holds the exact document socket-patch writes about its build, or that
+    # it writes none, so a change to how a document is built, worded or
+    # withheld starts the legs of every ecosystem. Nothing else that
     # another ecosystem's flow owns is here, so any other change to one
     # ecosystem starts that ecosystem's legs only.
     #
@@ -73,6 +75,7 @@ on:
       - 'crates/socket-patch-core/src/vendor/pypi_requirements.rs'
       - 'crates/socket-patch-core/src/vendor/pypi_wheel.rs'
       - 'crates/socket-patch-core/src/vex/discover/pypi_other.rs'
+      - 'crates/socket-patch-core/src/bazel/**'
       - 'crates/socket-patch-core/src/vex/**'
       - 'crates/socket-patch-cli/src/commands/vex*.rs'
   push:
@@ -106,6 +109,7 @@ on:
       - 'crates/socket-patch-core/src/vendor/pypi_requirements.rs'
       - 'crates/socket-patch-core/src/vendor/pypi_wheel.rs'
       - 'crates/socket-patch-core/src/vex/discover/pypi_other.rs'
+      - 'crates/socket-patch-core/src/bazel/**'
       - 'crates/socket-patch-core/src/vex/**'
       - 'crates/socket-patch-cli/src/commands/vex*.rs'
       - 'crates/socket-patch-cli/tests/e2e_bazel_build/main.rs'

@@ -21,6 +21,7 @@ use std::path::{Path, PathBuf};
 
 use clap::Args;
 use socket_patch_core::api::client::ApiClient;
+use socket_patch_core::bazel::built::{unbuilt, Patched, Unbuilt};
 use socket_patch_core::manifest::schema::PatchManifest;
 use socket_patch_core::telemetry::{track_vex_failed, track_vex_generated, TelemetryAuth};
 use socket_patch_core::vex::verify::{npm_manifest_after_hash, DEPENDENCY_NOT_INSTALLED};
@@ -329,12 +330,48 @@ impl VexGenError {
         out
     }
 
+    /// Whether this failure of an embedded `--vex` fails its host command.
+    /// One does not: nothing is attested, and at least one patch was
+    /// withheld because Bazel does not build its patched copy
+    /// ([`BAZEL_NOT_IN_BUILD`]). Without that step the run attested that
+    /// patch, wrote its document and passed, whatever else it omitted: the
+    /// command did what it was run for, and an `apply --vex` in an install
+    /// hook must not start failing the installs of a project because that
+    /// project is also built with Bazel. No document is written, a previous
+    /// one at the path is removed, and the warnings say why, as for every
+    /// failure.
+    pub(crate) fn fails_host(&self) -> bool {
+        let withheld = |f: &FailedPatch| f.reason == BAZEL_NOT_IN_BUILD;
+        self.code != "no_applicable_patches" || !self.failed.iter().any(withheld)
+    }
+
+    /// Mark the envelope of the host command with an embedded `--vex`
+    /// failure, where it fails the host ([`Self::fails_host`]), and give
+    /// the exit code it adds to the host's.
+    pub(crate) fn mark(&self, env: &mut Envelope) -> i32 {
+        if self.fails_host() {
+            env.mark_error(EnvelopeError::new(self.code, self.message.clone()));
+        }
+        i32::from(self.fails_host())
+    }
+
     /// Human stderr for an embedded `--vex` failure: the error line — even
     /// under `--silent` ("errors only", never "nothing": exit 1 with no
     /// message would be undiagnosable) — and, under `--silent`, each omitted
     /// patch, as standalone `vex --silent` lists them (a louder run already
-    /// printed a `Warning: omitting …` line per omission).
+    /// printed a `Warning: omitting …` line per omission). A failure that
+    /// leaves the host its exit code ([`Self::fails_host`]) is a note on
+    /// stdout instead, and nothing under `--silent`.
     pub(crate) fn print_embedded(&self, common: &GlobalArgs) {
+        if !self.fails_host() {
+            if !common.silent {
+                println!(
+                    "No VEX document written: Bazel does not build the patched copy of any \
+                     package this run could attest (see the warnings above)."
+                );
+            }
+            return;
+        }
         eprintln!("Error: VEX generation failed: {}", self.message);
         if common.silent {
             for f in &self.failed {
@@ -1276,6 +1313,12 @@ async fn generate_vex(
         outcome.applied = kept;
     }
 
+    // What the checks above verified is what the project's own package
+    // manager uses. Where a Bazel hub builds the package from a lock, that
+    // is another copy, and the last word: every form of the command comes
+    // through here, `--no-verify` and the in-run ones included.
+    withhold_unbuilt_by_bazel(&mut outcome, &plan, common, warnings).await;
+
     // The plan's gate omissions (record_unavailable / record_mismatch /
     // vendor_unwired / redirect_unwired / wiring_conflict) join the omission
     // channel so they surface as per-purl `skipped` events like any
@@ -1810,6 +1853,88 @@ async fn withhold_stale_go_tools(
             purl,
             reason: GO_INSTALLED_TOOL_STALE.to_string(),
         }));
+}
+
+/// Omission tag and run warning: the files of the project's Bazel
+/// workspace show that Bazel builds the package from a file that does not
+/// hold the patch.
+const BAZEL_NOT_IN_BUILD: &str = "vex_bazel_not_in_build";
+
+/// In a Bazel workspace, a hub of aspect_rules_js, rules_python or
+/// rules_ruby builds a package from the lock a workspace file names, never
+/// from the copy a package manager installed, and the last two build
+/// nothing from a line that points at a copy under `.socket/vendor`
+/// ([`socket_patch_core::bazel::built`]). A patch that is only in such a
+/// copy is in no build of Bazel's: withhold it, and say in a run warning
+/// which call reads which file and what to do.
+///
+/// A hosted pin is left alone, and so is everything outside a Bazel
+/// workspace, in a `--global` run, or behind workspace files that cannot
+/// be read with certainty: the statement stays the one of a project
+/// without Bazel.
+async fn withhold_unbuilt_by_bazel(
+    outcome: &mut VerifyOutcome,
+    plan: &Plan,
+    common: &GlobalArgs,
+    warnings: &mut Vec<RunWarning>,
+) {
+    if common.is_global() {
+        return;
+    }
+    let patched = |purl: &String| {
+        let record = plan.view.patches.get(purl)?;
+        let held = !plan.hosted.contains_key(purl);
+        held.then(|| Patched {
+            purl: purl.clone(),
+            uuid: record.uuid.clone(),
+            pins: plan.vendor_pins.get(purl).cloned(),
+        })
+    };
+    let packages: Vec<Patched> = outcome.applied.iter().filter_map(patched).collect();
+    let calls = unbuilt(&common.cwd, packages.clone()).await;
+    for (package, call) in packages.iter().zip(calls) {
+        let Some(call) = call else { continue };
+        note_warning(
+            warnings,
+            common,
+            BAZEL_NOT_IN_BUILD,
+            bazel_not_in_build_detail(package, &call),
+        );
+        outcome.applied.retain(|purl| *purl != package.purl);
+        outcome.failed.push(FailedPatch {
+            purl: package.purl.clone(),
+            reason: BAZEL_NOT_IN_BUILD.to_string(),
+        });
+    }
+}
+
+/// The [`BAZEL_NOT_IN_BUILD`] detail for `package`: where its patch is,
+/// the call that builds the package from another file, and what to do.
+/// Hosted mode pins a patch in the lock of the project it runs in, so the
+/// remedy names the directory of the lock.
+fn bazel_not_in_build_detail(package: &Patched, call: &Unbuilt) -> String {
+    let Patched { purl, uuid, pins } = package;
+    let Unbuilt {
+        call: tag,
+        file,
+        line,
+        lock,
+    } = call;
+    match pins {
+        None => format!(
+            "{purl}: patch {uuid} is in the installed copy, which Bazel does not build from. \
+             `{tag}` ({file}:{line}) builds this package from {lock}, which does not name the \
+             patch. Run `socket-patch scan --mode hosted` in the directory of that lock to pin \
+             the patch there."
+        ),
+        Some(_) => format!(
+            "{purl}: patch {uuid} is the copy committed under .socket/vendor, which {lock} \
+             points at. `{tag}` ({file}:{line}) hands that file to Bazel, and its ruleset \
+             builds no package from such a line: the build fails, or takes the registry's \
+             package. Run `socket-patch vendor --revert`, then `socket-patch scan --mode \
+             hosted`."
+        ),
+    }
 }
 
 /// The `vendored_tree_out_of_sync` detail for `purl`. `copies` are the
@@ -2462,6 +2587,10 @@ fn omission_phrase(reason: &str) -> &'static str {
             "the lockfiles wire this package to different patches, so which one the build \
              installs cannot be determined"
         }
+        BAZEL_NOT_IN_BUILD => {
+            "Bazel does not build the patched copy of this package; the run warning names \
+             what it builds from"
+        }
         _ => "the patch could not be verified",
     }
 }
@@ -2566,6 +2695,50 @@ mod tests {
                 text.ends_with("re-run your package manager's install to resync it. Hatch note."),
                 "{text}"
             );
+        }
+    }
+
+    /// An embedded `--vex` that attests nothing fails its host command,
+    /// but for one case: a patch of the run was withheld because Bazel
+    /// does not build its patched copy, beside whatever else was omitted.
+    /// That run wrote a document and passed before the patch was withheld.
+    /// No patch withheld for that reason, no patch at all, or another
+    /// error, and the host fails as it did.
+    #[test]
+    fn a_patch_bazel_does_not_build_leaves_the_host_its_exit_code() {
+        let bazel = BAZEL_NOT_IN_BUILD;
+        let cases: [(&'static str, &[&str], bool); 8] = [
+            ("no_applicable_patches", &[bazel], false),
+            ("no_applicable_patches", &[bazel, bazel], false),
+            (
+                "no_applicable_patches",
+                &[bazel, "package_not_found"],
+                false,
+            ),
+            ("no_applicable_patches", &["hash_mismatch", bazel], false),
+            ("no_applicable_patches", &["hash_mismatch"], true),
+            ("no_applicable_patches", &[], true),
+            ("product_undetected", &[bazel], true),
+            ("write_failed", &[], true),
+        ];
+        for (code, reasons, fails) in cases {
+            let failed = reasons.iter().map(|reason| FailedPatch {
+                purl: "pkg:npm/left-pad@1.3.0".into(),
+                reason: reason.to_string(),
+            });
+            let error = VexGenError {
+                code,
+                message: "nothing".into(),
+                failed: failed.collect(),
+                warnings: Vec::new(),
+            };
+            assert_eq!(error.fails_host(), fails, "{code} {reasons:?}");
+            let mut env = Envelope::new(Command::Apply);
+            assert_eq!(error.mark(&mut env), i32::from(fails), "{code} {reasons:?}");
+            let marked = env.to_value().get("error").is_some();
+            assert_eq!(marked, fails, "{code} {reasons:?}");
+            // Either way the envelope names every omission.
+            assert_eq!(error.embedded_warnings().len(), reasons.len());
         }
     }
 
@@ -3119,6 +3292,7 @@ mod mirror_refusal_tests {
                 let plan = Plan {
                     view,
                     vendor_entries: HashMap::from([(purls[3].to_string(), vendor_entry)]),
+                    vendor_pins: HashMap::new(),
                     redirected: vec![purls[0].to_string(), purls[2].to_string()],
                     lockfile_basis: HashSet::from([purls[0].to_string(), purls[2].to_string()]),
                     hosted,
@@ -3240,6 +3414,7 @@ mod mirror_refusal_tests {
             let plan = Plan {
                 view,
                 vendor_entries: HashMap::new(),
+                vendor_pins: HashMap::new(),
                 redirected: vec![gem.to_string(), npm.to_string()],
                 lockfile_basis: HashSet::from([gem.to_string(), npm.to_string()]),
                 hosted,
@@ -3415,6 +3590,7 @@ mod unjudged_tests {
             let plan = Plan {
                 view,
                 vendor_entries: HashMap::new(),
+                vendor_pins: HashMap::new(),
                 redirected: purls.map(str::to_string).to_vec(),
                 lockfile_basis: purls
                     .map(str::to_string)
@@ -3455,6 +3631,128 @@ mod unjudged_tests {
                 ],
                 "no_verify={no_verify}"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod bazel_tests {
+    use super::*;
+    use crate::commands::vex_sources::HostedWiring;
+    use socket_patch_core::manifest::schema::PatchRecord;
+    use std::collections::BTreeMap;
+
+    /// The step that withholds what Bazel does not build, on a workspace
+    /// on disk whose hubs read the project's pnpm lock and requirements
+    /// file. A project run withholds the npm patch of the installed copy
+    /// and the PyPI patch of the committed copy, each with a warning that
+    /// names the call, and leaves the hosted pin and the crate alone. A
+    /// `--global` run, whose packages are not the project's, changes
+    /// nothing.
+    #[tokio::test]
+    async fn the_bazel_step_withholds_what_no_hub_builds_in_a_project_run_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let module = "module(name = \"shop\")\n\
+            bazel_dep(name = \"aspect_rules_js\", version = \"3.6.0\")\n\
+            bazel_dep(name = \"rules_python\", version = \"2.5.0\")\n\
+            npm = use_extension(\"@aspect_rules_js//npm:extensions.bzl\", \"npm\")\n\
+            npm.npm_translate_lock(name = \"npm\", pnpm_lock = \"//:pnpm-lock.yaml\")\n\
+            pip = use_extension(\"@rules_python//python/extensions:pip.bzl\", \"pip\")\n\
+            pip.parse(hub_name = \"pip\", requirements_lock = \"//:requirements.txt\")\n";
+        let lock = "lockfileVersion: '9.0'\n\npackages:\n\n  is-odd@3.0.1:\n    \
+            resolution: {integrity: sha512-AAAA}\n\n  left-pad@1.3.0:\n    \
+            resolution: {integrity: sha512-BBBB}\n";
+        let files = [
+            (".git/HEAD", "ref: refs/heads/main\n"),
+            ("MODULE.bazel", module),
+            ("pnpm-lock.yaml", lock),
+            (
+                "requirements.txt",
+                "./.socket/vendor/pypi/u/idna-3.6-py3-none-any.whl\n",
+            ),
+        ];
+        for (path, text) in files {
+            let path = root.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        }
+        let purls = [
+            "pkg:npm/left-pad@1.3.0",
+            "pkg:pypi/idna@3.6",
+            "pkg:npm/is-odd@3.0.1",
+            "pkg:cargo/serde@1.0.0",
+        ];
+        let mut view = PatchManifest::new();
+        for (index, purl) in purls.iter().enumerate() {
+            let record: PatchRecord = serde_json::from_value(serde_json::json!({
+                "uuid": format!("00000000-0000-4000-8000-00000000000{index}"),
+                "exportedAt": "2026-01-01T00:00:00Z",
+                "files": {"index.js": {"beforeHash": "a".repeat(64), "afterHash": "b".repeat(64)}},
+                "vulnerabilities": {},
+                "description": "test", "license": "MIT", "tier": "free"
+            }))
+            .unwrap();
+            view.patches.insert(purl.to_string(), record);
+        }
+        let wiring = HostedWiring {
+            uuid: view.patches[purls[2]].uuid.clone(),
+            refs: Vec::new(),
+        };
+        let plan = Plan {
+            view,
+            vendor_entries: HashMap::new(),
+            vendor_pins: HashMap::from([(purls[1].to_string(), vec!["requirements.txt".into()])]),
+            redirected: vec![purls[2].to_string()],
+            lockfile_basis: HashSet::new(),
+            hosted: BTreeMap::from([(purls[2].to_string(), wiring)]),
+            gated: Vec::new(),
+            notes: Vec::new(),
+        };
+        for global in [false, true] {
+            let common = GlobalArgs {
+                cwd: root.clone(),
+                json: true,
+                no_telemetry: true,
+                global,
+                ..Default::default()
+            };
+            let mut outcome = VerifyOutcome {
+                applied: purls.map(str::to_string).to_vec(),
+                ..Default::default()
+            };
+            let mut warnings = Vec::new();
+            withhold_unbuilt_by_bazel(&mut outcome, &plan, &common, &mut warnings).await;
+            let withheld: Vec<(&str, &str)> = (outcome.failed.iter())
+                .map(|failed| (failed.purl.as_str(), failed.reason.as_str()))
+                .collect();
+            let details: Vec<&str> = warnings.iter().map(|w| w.detail.as_str()).collect();
+            if global {
+                assert_eq!(outcome.applied, purls, "--global");
+                assert_eq!((withheld, details), (vec![], vec![]), "--global");
+                continue;
+            }
+            assert_eq!(outcome.applied, purls[2..]);
+            assert_eq!(
+                withheld,
+                [
+                    (purls[0], BAZEL_NOT_IN_BUILD),
+                    (purls[1], BAZEL_NOT_IN_BUILD)
+                ]
+            );
+            let codes: Vec<&str> = warnings.iter().map(|w| w.code.as_str()).collect();
+            assert_eq!(codes, [BAZEL_NOT_IN_BUILD; 2]);
+            let installed = "pkg:npm/left-pad@1.3.0: patch 00000000-0000-4000-8000-000000000000 \
+                is in the installed copy, which Bazel does not build from. \
+                `npm.npm_translate_lock` (MODULE.bazel:5) builds this package from \
+                pnpm-lock.yaml, which does not name the patch. Run `socket-patch scan --mode \
+                hosted` in the directory of that lock to pin the patch there.";
+            let committed = "pkg:pypi/idna@3.6: patch 00000000-0000-4000-8000-000000000001 is \
+                the copy committed under .socket/vendor, which requirements.txt points at. \
+                `pip.parse` (MODULE.bazel:7) hands that file to Bazel, and its ruleset builds \
+                no package from such a line: the build fails, or takes the registry's package. \
+                Run `socket-patch vendor --revert`, then `socket-patch scan --mode hosted`.";
+            assert_eq!(details, [installed, committed]);
         }
     }
 }

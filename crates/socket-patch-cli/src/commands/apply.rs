@@ -1336,7 +1336,7 @@ pub async fn run(args: ApplyArgs) -> i32 {
                     // mention is not live wiring, which gate refused what):
                     // same channel as the success path's advisories.
                     env.warnings.extend(e.embedded_warnings());
-                    env.mark_error(EnvelopeError::new(e.code, e.message.clone()));
+                    e.mark(&mut env);
                 }
                 Some(ManifestlessVex::NothingToAttest(warnings)) => {
                     env.warnings.extend(warnings.iter().cloned());
@@ -1364,7 +1364,9 @@ pub async fn run(args: ApplyArgs) -> i32 {
                 _ => {}
             }
         }
-        return i32::from(matches!(vex_result, Some(ManifestlessVex::Failed(_))));
+        return i32::from(
+            matches!(&vex_result, Some(ManifestlessVex::Failed(e)) if e.fails_host()),
+        );
     }
 
     // Read-only Go `replace`-redirect verification for CI / GitHub-App auditing.
@@ -1905,7 +1907,7 @@ pub(crate) async fn run_locked(
             } else {
                 None
             };
-            let vex_failed = matches!(vex_result, Some(Err(_)));
+            let vex_failed = matches!(&vex_result, Some(Err(e)) if e.fails_host());
             // Every mutation — the patches and the VEX attestation — is
             // done: release the lock before output and telemetry.
             lock.release();
@@ -2013,7 +2015,7 @@ pub(crate) async fn run_locked(
                     }
                     Some(Err(e)) => {
                         env.warnings.extend(e.embedded_warnings());
-                        env.mark_error(EnvelopeError::new(e.code, e.message.clone()));
+                        e.mark(&mut env);
                     }
                     None => {}
                 }

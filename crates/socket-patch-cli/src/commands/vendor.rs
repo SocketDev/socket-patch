@@ -1126,7 +1126,7 @@ pub async fn run(args: VendorArgs) -> i32 {
                 }
                 Some(ManifestlessVex::Failed(e)) => {
                     env.warnings.extend(e.embedded_warnings());
-                    env.mark_error(EnvelopeError::new(e.code, e.message.clone()));
+                    e.mark(&mut env);
                 }
                 Some(ManifestlessVex::NothingToAttest(warnings)) => {
                     env.warnings.extend(warnings.iter().cloned());
@@ -1160,7 +1160,9 @@ pub async fn run(args: VendorArgs) -> i32 {
                 _ => {}
             }
         }
-        return i32::from(matches!(vex_result, Some(ManifestlessVex::Failed(_))));
+        return i32::from(
+            matches!(&vex_result, Some(ManifestlessVex::Failed(e)) if e.fails_host()),
+        );
     }
 
     // The API client and vendoring-service config exist for the vendoring
@@ -1266,7 +1268,7 @@ pub async fn run(args: VendorArgs) -> i32 {
                     }
                     Err(e) => {
                         env.warnings.extend(e.embedded_warnings());
-                        env.mark_error(EnvelopeError::new(e.code, e.message.clone()));
+                        exit = e.mark(&mut env);
                         // The envelope only prints under --json; in human mode
                         // this error is the sole explanation for the flipped
                         // exit code, so it prints even under --silent ("errors
@@ -1274,7 +1276,6 @@ pub async fn run(args: VendorArgs) -> i32 {
                         if !args.common.json {
                             e.print_embedded(&args.common);
                         }
-                        exit = 1;
                     }
                 }
             }
@@ -2486,11 +2487,10 @@ async fn run_eject(
                     }
                     ManifestlessVex::Failed(e) => {
                         env.warnings.extend(e.embedded_warnings());
-                        env.mark_error(EnvelopeError::new(e.code, e.message.clone()));
+                        exit = e.mark(&mut env);
                         if !common.json {
                             e.print_embedded(common);
                         }
-                        exit = 1;
                     }
                 }
             }

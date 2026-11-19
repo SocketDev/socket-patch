@@ -465,9 +465,8 @@ async fn embed_vex_into_json(
             0
         }
         Err(e) => {
-            env.mark_error(EnvelopeError::new(e.code.to_string(), e.message.clone()));
             append_vex_error_warnings(env, &e.embedded_warnings());
-            1
+            e.mark(env)
         }
     }
 }
@@ -528,7 +527,7 @@ async fn embed_vex_human(
         }
         Err(e) => {
             e.print_embedded(common);
-            1
+            i32::from(e.fails_host())
         }
     }
 }

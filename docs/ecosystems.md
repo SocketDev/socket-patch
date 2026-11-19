@@ -2276,9 +2276,74 @@ restores the original sources and build.
 ## Bazel workspaces: VEX
 
 `vex` and `--vex` read what socket-patch wrote and what the project's own package manager
-installed. They read no `MODULE.bazel`, `WORKSPACE` or BUILD file, so in a Bazel workspace a
-document says what was patched, and that is what Bazel builds only where Bazel builds from
-the files socket-patch rewrote. The two are tested to agree on real Bazel 9.3.2, 8.8.2 and
+installed. In a Bazel workspace (the Bazel root of the section on `.bazelignore` above) they
+also read `MODULE.bazel` and the files it includes, for the calls of three rulesets that hand
+a lock to Bazel:
+
+| Call | Files it names |
+|---|---|
+| aspect_rules_js `npm.npm_translate_lock` | `pnpm_lock` |
+| rules_python `pip.parse` | `requirements_lock`, `requirements_by_platform`, `requirements_darwin`, `requirements_linux`, `requirements_windows` |
+| rules_ruby `ruby.bundle_fetch` | `gemfile_lock`, `gemfile` |
+
+Each of them builds a package from what those files name, in a repository of Bazel's own,
+and never from `node_modules`, a virtualenv or a gem home. So two kinds of patch are in no
+build of Bazel's, and get no statement (`vex_bazel_not_in_build`):
+
+- **A patch in the installed copy** (agent mode) of an npm, PyPI or RubyGems package, when
+  such a call names the project's own lock and that lock lists the package at that version
+  without naming the patch. The project's own lock is the one in the project's directory, or
+  the lock of a pnpm workspace above it that names that directory among its `importers`.
+  Measured for rules_js 3.6.0 on Bazel 9.3.2, 8.8.2 and 7.7.2: the build prints the
+  unpatched package before `scan --mode agent` and after it.
+- **A PyPI or RubyGems patch committed under `.socket/vendor`** (vendored mode), when such a
+  call names the file that points at the copy. rules_python 2.5.0-rc4 takes the path of the
+  line for the name of a project, and the build of everything the hub serves fails (same
+  three releases). rules_ruby runs `bundle install` where the path does not exist; a
+  `bundle_fetch` with `srcs`, which may copy the gem there, is left alone, and no test here
+  builds a vendored gem. A vendored npm tarball is built by rules_js and keeps its statement.
+
+The run warning of that code names the patch, the call with its file and line, the file
+Bazel builds the package from, and what to do:
+
+```
+Warning: pkg:npm/left-pad@1.3.0: patch 7a11e000-... is in the installed copy, which Bazel does not build from. `npm.npm_translate_lock` (MODULE.bazel:6) builds this package from pnpm-lock.yaml, which does not name the patch. Run `socket-patch scan --mode hosted` in the directory of that lock to pin the patch there.
+Warning: omitting pkg:npm/left-pad@1.3.0 from VEX: Bazel does not build the patched copy of this package; the run warning names what it builds from (vex_bazel_not_in_build)
+```
+
+For a vendored PyPI or RubyGems package it says to run `socket-patch vendor --revert`, then
+`socket-patch scan --mode hosted`. Both ways out are tested on real Bazel: after the hosted
+scan the build prints the patched package and `vex` attests it. `vex` exits 1
+(`no_applicable_patches`) when no other package is attested. `scan --vex`, `apply --vex` and
+`vendor --vex` keep their own exit code and status when nothing is attested and at least one
+patch was withheld for this reason, whatever else the run omitted: before the patch was
+withheld that run wrote a document and passed, so an `apply --vex` in an install hook does
+not start failing installs. They write no document then, remove one an earlier run left at
+the path, print `No VEX document written: ...` (nothing under `--silent`), and their `--json`
+envelope has no `vex` key and carries the warning and one `vex_omitted` per omitted package.
+When other patches are attested, the document holds them.
+
+Nothing changes where the files do not show such a call: outside a Bazel workspace, in a
+`--global` run, for a hosted pin, for a project whose own lock no call names, and wherever
+the workspace is not read with certainty. A lock elsewhere that lists the same package is the
+lock of another project and decides nothing for this one: in a directory beside the project,
+below it, or above it without naming it among the importers of a pnpm workspace (a pnpm app
+beside a Java build; a project with a lock of its own under a root whose lock a hub reads; a
+Python or Ruby project below the directory of the file a hub reads). The workspace is not
+read with certainty when a module file is missing, cannot be read or holds a statement the
+reader does not follow (a `load`, an `if`, a hub proxy handed to anything but `use_repo` or
+`inject_repo`); when the call gives its file as anything but a plain string label of the
+main repository; when the lock cannot be read, is larger than 64 MiB, or is a link that
+leads out of the Bazel root (Bazel follows such a link; socket-patch reads no file outside
+the root); and when a `WORKSPACE`, `WORKSPACE.bazel` or `WORKSPACE.bzlmod` at the root holds
+more than a `workspace(...)` call. Bazel 7 reads that file beside `MODULE.bazel`, and its
+calls are not read yet; Bazel 9 never reads it, so a workspace on Bazel 9 that still has
+such a file keeps both statements although nothing builds the patched copy. A workspace
+without a `MODULE.bazel` is not read at all. In each of these the document is the one of a
+project without Bazel. Flags outside the committed files (`--override_repository`, an rc
+file) and BUILD files are not read either.
+
+The document and the build are tested to agree on real Bazel 9.3.2, 8.8.2 and
 7.7.2 for four shapes, all under Bzlmod: Go through gazelle's
 `go_deps.from_file(go_mod = "//:go.mod")` with
 `go_deps.config(check_direct_dependencies = "error")` and the module required directly in
@@ -2296,17 +2361,15 @@ after the undo `vex` writes no document. For PyPI on Bazel 8.5 and later a hoste
 lock has to be committed.
 
 In every other Bazel shape nothing checks the document against the build, and in these it was
-measured to be wrong (`not_affected` while Bazel builds the unpatched package, or while the
-build is broken): agent mode beside rules_js, which builds from the lock and never reads the
-patched `node_modules`; Go under a `go_repository` rule of a `WORKSPACE`, in hosted and
-vendored mode; Go under `go_deps` when another Bazel module of the build requires a higher
-version of the patched module, because gazelle then builds that version and drops the
-replacement; a
-`pip.parse` or `pip_parse` that takes the requirements of the build's platform from another
-file than the one socket-patch rewrote; vendored mode for PyPI. Do not publish a document for
-an artifact that Bazel built outside those four shapes. A project that Bazel does not build is
-not concerned: beside a Bazel workspace whose files name none of its locks, `vex` says what it
-says without Bazel.
+measured to be wrong (`not_affected` while Bazel builds the unpatched package): Go under a
+`go_repository` rule of a `WORKSPACE`, in hosted and vendored mode; Go under `go_deps` when
+another Bazel module of the build requires a higher version of the patched module, because
+gazelle then builds that version and drops the replacement; a `pip.parse` or `pip_parse` that
+takes the requirements of the build's platform from another file than the one socket-patch
+rewrote, in hosted mode; and the two withheld kinds above behind a `WORKSPACE` file, where
+they are not withheld yet. Do not publish a document for an artifact that Bazel built outside
+the four shapes. A project that Bazel does not build is not concerned: beside a Bazel
+workspace whose files name none of its locks, `vex` says what it says without Bazel.
 
 ## Supported platforms
 

@@ -125,6 +125,16 @@ const PRODUCT: &str = "pkg:generic/socket-fixture@0.0.0";
 /// shared API stand-in, and of the records a flow writes itself.
 const ADVISORY: &str = "GHSA-test-aaaa-bbbb";
 
+/// The code under which `socket-patch` withholds the statement of a package
+/// whose patched copy Bazel does not build: of its warning, and of the
+/// event that skips the package.
+pub const NOT_IN_BUILD: &str = "vex_bazel_not_in_build";
+
+/// What a command that was asked for a document tells a person on stdout
+/// when it writes none for that reason and passes.
+const NO_DOCUMENT: &str = "No VEX document written: Bazel does not build the patched copy of any \
+    package this run could attest (see the warnings above).";
+
 /// The mode a flow patched its package in, which a document says after the
 /// patch id.
 #[derive(Clone, Copy)]
@@ -1075,6 +1085,43 @@ impl Cell {
         [out.stdout, out.stderr].map(|stream| String::from_utf8_lossy(&stream).into_owned())
     }
 
+    /// [`Cell::socket_patch_person`] for a command that is given
+    /// [`with_vex`] for `path` among `args`, in a checkout where Bazel does
+    /// not build the patched copy of any package the run could attest. The
+    /// command passes and leaves no document. It prints each line of
+    /// `warned` on stderr and no error, and on stdout the note that no
+    /// document was written. With `--silent` among `args` it prints nothing
+    /// at all, as for every other document it does not write and passes.
+    pub fn tells_a_person(
+        &self,
+        api: &str,
+        args: &[&str],
+        env: &[(&str, &str)],
+        path: &Path,
+        warned: &[String],
+    ) {
+        let mut cmd = self.socket_patch_command(api, args, env);
+        let out = cmd.output().expect("spawn socket-patch");
+        let code = out.status.code();
+        let [stdout, stderr] =
+            [out.stdout, out.stderr].map(|stream| String::from_utf8_lossy(&stream).into_owned());
+        let test = &self.test;
+        let said =
+            format!("{test}: {args:?}\nexit {code:?}\n--- stdout\n{stdout}\n--- stderr\n{stderr}");
+        assert_eq!(code, Some(0), "{said}");
+        assert!(!path.exists(), "a document is left: {said}");
+        if args.contains(&"--silent") {
+            assert_eq!([stdout.as_str(), stderr.as_str()], ["", ""], "{said}");
+            return;
+        }
+        assert!(stdout.lines().any(|line| line == NO_DOCUMENT), "{said}");
+        for line in warned {
+            let printed = stderr.lines().any(|said| said == line);
+            assert!(printed, "no {line:?}:\n{said}");
+        }
+        assert!(!stderr.contains("Error"), "{said}");
+    }
+
     /// Where a flow has `socket-patch` write the VEX document `name`:
     /// beside the workspace copy, so it is no file of the checkout, and no
     /// comparison of the checkout's files sees it.
@@ -1249,6 +1296,111 @@ impl Cell {
         let warned = codes_in(&ran.envelope["warnings"]);
         let removed = warned.iter().any(|code| code == "vex_stale_doc_removed");
         assert!(removed, "{test}: {said}");
+    }
+
+    /// For a finished command that was given [`with_vex`] for `path`, in a
+    /// checkout where Bazel does not build the patched copy of `purl`: the
+    /// command passed with `status`, its own, and wrote no document and
+    /// reports none. It warns once that the package is withheld, in words
+    /// that hold each of `names` (the call's file and line, the file Bazel
+    /// builds the package from, what to do), and once that it is omitted.
+    pub fn withheld_in_run(
+        &self,
+        ran: &Ran,
+        path: &Path,
+        status: &str,
+        purl: &str,
+        names: &[String],
+    ) {
+        self.withheld_beside(ran, path, status, purl, names, 0);
+    }
+
+    /// [`Cell::withheld_in_run`] for a run that omits `others` more
+    /// packages, each for a reason of its own: it warns once more for each
+    /// that it is omitted, and passes all the same.
+    pub fn withheld_beside(
+        &self,
+        ran: &Ran,
+        path: &Path,
+        status: &str,
+        purl: &str,
+        names: &[String],
+        others: usize,
+    ) {
+        let (test, said) = (&self.test, &ran.dump);
+        assert_eq!(ran.code, 0, "{test}: {said}");
+        assert_eq!(ran.envelope["status"], status, "{test}: {said}");
+        let reported = ["vex", "error"].map(|key| ran.envelope.get(key).is_some());
+        assert_eq!(reported, [false, false], "{test}: {said}");
+        assert!(!path.exists(), "{test}: a document is left: {said}");
+        let warnings = &ran.envelope["warnings"];
+        let about_vex = |code: &String| code.starts_with("vex_");
+        let codes: Vec<String> = codes_in(warnings).into_iter().filter(about_vex).collect();
+        let mut expected = vec![NOT_IN_BUILD];
+        expected.resize(2 + others, "vex_omitted");
+        assert_eq!(codes, expected, "{test}: {said}");
+        self.names_the_build(warnings, purl, names, said);
+    }
+
+    /// The stand-alone `vex` of such a checkout, through `run`
+    /// (`vex --no-verify` when `verified` is false): it exits 1 with
+    /// `no_applicable_patches`, its one event says the package is skipped
+    /// because Bazel does not build the patched copy, its one warning is
+    /// the one of [`Cell::withheld_in_run`], and it leaves no document.
+    pub fn withholds(
+        &self,
+        run: impl Fn(&Cell, &[&str]) -> Ran,
+        purl: &str,
+        names: &[String],
+        verified: bool,
+    ) {
+        let path = self.document("stand-alone");
+        let unchecked: &[&str] = if verified { &[] } else { &["--no-verify"] };
+        let ran = run(self, &[&vex(&path), unchecked].concat());
+        let (test, said) = (&self.test, &ran.dump);
+        assert_eq!(ran.code, 1, "{test}: {said}");
+        let error = &ran.envelope["error"]["code"];
+        assert_eq!(*error, "no_applicable_patches", "{test}: {said}");
+        let [event] = events(&ran.envelope) else {
+            panic!("{test}: not one event: {said}");
+        };
+        assert_eq!(event["action"], "skipped", "{test}: {said}");
+        assert_eq!(event["errorCode"], NOT_IN_BUILD, "{test}: {said}");
+        let skipped = normalize_purl(event["purl"].as_str().unwrap_or_default());
+        assert_eq!(skipped, normalize_purl(purl), "{test}: {said}");
+        assert!(!path.exists(), "{test}: a document is left: {said}");
+        let warnings = &ran.envelope["warnings"];
+        assert_eq!(codes_in(warnings), [NOT_IN_BUILD], "{test}: {said}");
+        self.names_the_build(warnings, purl, names, said);
+    }
+
+    /// The one [`NOT_IN_BUILD`] warning of `warnings` is about `purl` and
+    /// holds each of `names`.
+    fn names_the_build(&self, warnings: &Value, purl: &str, names: &[String], said: &str) {
+        let test = &self.test;
+        let ours = |warning: &&Value| warning["code"] == NOT_IN_BUILD;
+        let ours: Vec<&Value> = warnings
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(ours)
+            .collect();
+        let [warning] = ours[..] else {
+            panic!("{test}: not one {NOT_IN_BUILD} warning: {said}");
+        };
+        let detail = warning["detail"].as_str().unwrap_or_default();
+        let (about, rest) = detail.split_once(": ").unwrap_or_default();
+        assert_eq!(
+            normalize_purl(about),
+            normalize_purl(purl),
+            "{test}: {said}"
+        );
+        for name in names {
+            assert!(
+                rest.contains(name.as_str()),
+                "{test}: no {name:?} in {detail:?}"
+            );
+        }
     }
 
     /// `bazel shutdown`, when the pid file of a server is there. No command

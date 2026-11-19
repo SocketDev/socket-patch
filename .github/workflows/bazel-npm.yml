@@ -39,9 +39,11 @@ on:
     # file also holds the Composer, Cargo and Go parts of the gate, so a
     # change to those starts the npm legs too. The `*pnpm*` globs name that
     # one crate, so no bench fixture is here. Last, the VEX code: `vex/` of
-    # the core and the files of the `vex` command. Every flow holds the
-    # exact document socket-patch writes about its patched build, so a
-    # change to how a document is built or worded starts the legs of every
+    # the core, the files of the `vex` command, and `bazel/` of the core,
+    # which reads the workspace files and decides whether Bazel builds what
+    # was patched. Every flow holds the exact document socket-patch writes
+    # about its build, or that it writes none, so a change to how a
+    # document is built, worded or withheld starts the legs of every
     # ecosystem. Nothing else that another ecosystem's flow owns is here:
     # any other change to one ecosystem starts that ecosystem's legs only.
     #
@@ -70,6 +72,7 @@ on:
       - 'crates/socket-patch-core/src/crawlers/npm_crawler.rs'
       - 'crates/socket-patch-core/src/formats/package_json.rs'
       - 'crates/socket-patch-core/src/patch/user_patches.rs'
+      - 'crates/socket-patch-core/src/bazel/**'
       - 'crates/socket-patch-core/src/vex/**'
       - 'crates/socket-patch-cli/src/commands/vex*.rs'
   push:
@@ -98,6 +101,7 @@ on:
       - 'crates/socket-patch-core/src/crawlers/npm_crawler.rs'
       - 'crates/socket-patch-core/src/formats/package_json.rs'
       - 'crates/socket-patch-core/src/patch/user_patches.rs'
+      - 'crates/socket-patch-core/src/bazel/**'
       - 'crates/socket-patch-core/src/vex/**'
       - 'crates/socket-patch-cli/src/commands/vex*.rs'
       - 'crates/socket-patch-cli/tests/e2e_bazel_build/main.rs'

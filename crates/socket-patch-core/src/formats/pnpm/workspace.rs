@@ -173,46 +173,58 @@ pub(crate) fn is_keyless(text: &str) -> bool {
     })
 }
 
-/// Whether a pnpm lock's project document (`lines`) lists an importer
-/// besides the root `.`. A pnpm-workspace.yaml with no keys reads as every
-/// nested package on pnpm 8–10.4 (`packages` defaults to `['.', '**']`) but
-/// as the root alone on pnpm >= 10.5, so a lock made from one with member
-/// importers comes from pnpm <= 10.4, and the root-only
-/// [`PACKAGES_SCAFFOLD`] would drop those members. The same answer marks a
-/// root lock as a SHARED workspace lock (`utils::pnpm_workspace`). Comment
-/// lines are neither keys nor section ends (#1952).
-pub(crate) fn lock_has_member_importers<S: AsRef<str>>(lines: &[S]) -> bool {
+/// The importers of a pnpm lock's project document (`lines`) besides the
+/// root `.`, as the lock names them: the directories of the workspace's
+/// members, each from the directory of the lock. Comment lines are neither
+/// keys nor section ends (#1952).
+fn member_importers<S: AsRef<str>>(lines: &[S]) -> impl Iterator<Item = &str> {
     // CRLF-blind: a Windows checkout's lock reads like its LF twin.
     let mut in_importers = false;
-    for line in lines {
+    lines.iter().filter_map(move |line| {
         let line = line.as_ref();
         let line = line.strip_suffix('\r').unwrap_or(line);
         if line.trim_start().starts_with('#') {
-            continue;
+            return None;
         }
         if !line.is_empty() && !line.starts_with([' ', '\t']) {
             in_importers = line.trim_end() == "importers:";
-        } else if in_importers
-            && super::lines::parse_key_line(line, 2).is_some_and(|(key, _, _)| key != ".")
-        {
-            return true;
+            return None;
         }
-    }
-    false
+        let (key, _, _) = super::lines::parse_key_line(line, 2).filter(|_| in_importers)?;
+        (key != ".").then_some(key)
+    })
 }
 
-/// [`lock_has_member_importers`] of a whole `pnpm-lock.yaml` text: its
+/// Whether a pnpm lock's project document (`lines`) lists an importer
+/// besides the root `.` ([`member_importers`]). A pnpm-workspace.yaml with
+/// no keys reads as every nested package on pnpm 8–10.4 (`packages`
+/// defaults to `['.', '**']`) but as the root alone on pnpm >= 10.5, so a
+/// lock made from one with member importers comes from pnpm <= 10.4, and
+/// the root-only [`PACKAGES_SCAFFOLD`] would drop those members. The same
+/// answer marks a root lock as a SHARED workspace lock
+/// (`utils::pnpm_workspace`).
+pub(crate) fn lock_has_member_importers<S: AsRef<str>>(lines: &[S]) -> bool {
+    member_importers(lines).next().is_some()
+}
+
+/// The [`member_importers`] of a whole `pnpm-lock.yaml` text: of its
 /// project documents alone ([`super::grammar::documents`]), so importers
 /// of a pnpm 11+ env document never count.
-pub(crate) fn lock_text_has_member_importers(text: &str) -> bool {
+pub(crate) fn lock_text_member_importers(text: &str) -> Vec<String> {
     use super::grammar::{documents, PnpmDocument};
-    documents(text)
-        .into_iter()
-        .filter(|(_, kind)| *kind == PnpmDocument::Project)
-        .any(|(span, _)| {
-            let doc = strip_bom(&text[span]);
-            lock_has_member_importers(&doc.split('\n').collect::<Vec<_>>())
-        })
+    let mut members = Vec::new();
+    for (span, kind) in documents(text) {
+        if kind == PnpmDocument::Project {
+            let doc: Vec<&str> = strip_bom(&text[span]).split('\n').collect();
+            members.extend(member_importers(&doc).map(str::to_string));
+        }
+    }
+    members
+}
+
+/// [`lock_has_member_importers`] of a whole `pnpm-lock.yaml` text.
+pub(crate) fn lock_text_has_member_importers(text: &str) -> bool {
+    !lock_text_member_importers(text).is_empty()
 }
 
 /// Insert `block` at line `at` of `lines` (a file split at `\n`), ending
@@ -674,6 +686,26 @@ mod tests {
                 .map(|l| format!("{l}\r"))
                 .collect();
         assert!(lock_has_member_importers(&crlf));
+    }
+
+    /// The members a lock names, in the key spelling of each lock
+    /// generation, and none from an env document.
+    #[test]
+    fn member_importers_are_named_as_the_lock_names_them() {
+        let v9 = "lockfileVersion: '9.0'\n\nimporters:\n\n  .:\n    dependencies: {}\n\n  \
+                  apps/web:\n    dependencies:\n      a:\n        specifier: 1.0.0\n\n  \
+                  packages/ui: {}\n\npackages:\n\n  a@1.0.0:\n    resolution: {}\n";
+        assert_eq!(lock_text_member_importers(v9), ["apps/web", "packages/ui"]);
+        let v6 = "lockfileVersion: '6.0'\r\nimporters:\r\n  '.': {}\r\n  'packages/a': {}\r\n";
+        assert_eq!(lock_text_member_importers(v6), ["packages/a"]);
+        let env = "---\nlockfileVersion: '9.0'\n\nimporters:\n\n  .: {}\n\n  tooling:\n    \
+                   configDependencies: {}\n\n";
+        assert_eq!(
+            lock_text_member_importers(&format!("{env}---\n{v9}")),
+            ["apps/web", "packages/ui"]
+        );
+        let none: [&str; 0] = [];
+        assert_eq!(lock_text_member_importers("lockfileVersion: '9.0'\n"), none);
     }
 
     /// #1952: a commented-out importer is not a member, a column-0 comment

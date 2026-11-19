@@ -2040,7 +2040,7 @@ async fn run_redirect_selected_untracked(
                 vex_warnings = summary.warnings;
             }
             Err(e) => {
-                vex_code = 1;
+                vex_code = i32::from(e.fails_host());
                 vex_warnings = e.embedded_warnings();
                 vex_error = Some(e);
             }
@@ -2157,7 +2157,7 @@ async fn run_redirect_selected_untracked(
                 warnings,
             });
         } else if let Some(e) = &vex_error {
-            env.mark_error(EnvelopeError::new(e.code.to_string(), e.message.clone()));
+            e.mark(&mut env);
             super::append_vex_error_warnings(&mut env, &vex_warnings);
         } else if vex.vex.is_some() && common.dry_run {
             env.warnings.push(super::vex_dry_run_warning());
