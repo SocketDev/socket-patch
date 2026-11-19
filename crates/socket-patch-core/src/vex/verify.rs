@@ -318,10 +318,18 @@ pub async fn applied_patches_with_copies(
 /// [`installed_copies`](crate::crawlers::gradle_cache::installed_copies):
 /// every hash directory holding a record file must verify.
 pub async fn verify_patch_record(pkg_path: &Path, record: &PatchRecord) -> Result<(), String> {
-    if record.files.is_empty() {
+    verify_patch_files(pkg_path, &record.files).await
+}
+
+/// [`verify_patch_record`] over a record's `files`.
+async fn verify_patch_files(
+    pkg_path: &Path,
+    files: &HashMap<String, crate::manifest::schema::PatchFileInfo>,
+) -> Result<(), String> {
+    if files.is_empty() {
         return Err("no_files".to_string());
     }
-    for (dir, files) in crate::crawlers::gradle_cache::installed_copies(pkg_path, &record.files) {
+    for (dir, files) in crate::crawlers::gradle_cache::installed_copies(pkg_path, files) {
         let mut keys: Vec<&String> = files.keys().collect();
         keys.sort();
         for file_name in keys {
@@ -489,10 +497,24 @@ async fn verify_every_copy(paths: &[PathBuf], record: &PatchRecord) -> Result<()
 /// A copy holding the patched sources over the install-time build is
 /// `native_extension_not_rebuilt`. Hosted copies are judged without this:
 /// RubyGems compiled the patched gem when Bundler installed it.
+///
+/// A copy is judged by the files of the record it takes
+/// ([`installed_files`](crate::patch::gem_ext::installed_files)): the JVM
+/// build of a gem, which JRuby installs, has no use for what only a C
+/// build reads, and `apply` writes none of it there. When it takes no file
+/// of the record at all, the code the patch changes is not in that build,
+/// and the copy passes.
 async fn verify_every_gem_copy(paths: &[PathBuf], record: &PatchRecord) -> Result<(), String> {
+    use crate::patch::gem_ext;
+    if record.files.is_empty() {
+        return Err("no_files".to_string());
+    }
     for path in paths {
-        verify_patch_record(path, record).await?;
-        crate::patch::gem_ext::verify_native_build(path, &record.files).await?;
+        let files = gem_ext::installed_files(path, &record.files).await;
+        if !files.is_empty() {
+            verify_patch_files(path, &files).await?;
+        }
+        gem_ext::verify_native_build(path, &record.files).await?;
     }
     Ok(())
 }

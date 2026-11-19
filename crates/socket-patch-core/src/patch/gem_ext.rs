@@ -43,9 +43,8 @@
 //!    to try; a gem RubyGems built must have its extension dir on disk; a
 //!    precompiled one must have a way to its source gem (the cached
 //!    archive, or a run that may download it). Otherwise the purl is
-//!    refused with [`UNSUPPORTED_CODE`] and nothing is written. So is the
-//!    JRuby build of a gem, whose jars no source gem's build scripts
-//!    produce.
+//!    refused with [`UNSUPPORTED_CODE`] and nothing is written. (The JRuby
+//!    build of a gem never gets here: see "The JVM build of a gem".)
 //! 2. The record's files are verified against the copy, and the Ruby that
 //!    owns the install is found (or the purl is refused as in 1).
 //! 3. The source gem is unpacked into a stage inside the gem home
@@ -122,6 +121,38 @@
 //! same marker and backup (`built_state`). `rollback` puts the backed-up
 //! original build back ([`restore_original_build`]), prebuilt binaries
 //! byte for byte.
+//!
+//! # The JVM build of a gem
+//!
+//! JRuby installs a gem's `java` platform build (`nokogiri-1.18.10-java`),
+//! whose compiled code is jars. It builds no C extension, so nothing above
+//! applies to it: no Ruby is started, nothing is built and no marker is
+//! written. The records are written for the `ruby` platform gem, and such
+//! a copy takes of one what is part of its own build (`jvm_takes`):
+//!
+//! * A file the record replaces is verified and written when the copy
+//!   holds it, like any patch file. That covers the gem's Ruby files and a
+//!   C source the JVM build ships anyway (dead code there). A file the
+//!   copy does not hold is not part of that platform's gem and is skipped.
+//! * A file the record adds is created, unless it is an input of a C
+//!   build by its path (under `ext/`, `patches/`, `ports/`, or a source or
+//!   build file by name), which means nothing to a gem with no C build.
+//!
+//! With its applicable files written the record is applied: `apply
+//! --check` and `vex` judge the copy by those files alone
+//! ([`installed_files`]), and `rollback` undoes those. A record none of
+//! whose files is part of the build changes code that is not in it: the
+//! run writes nothing, says so ([`NOT_IN_BUILD_CODE`]) and succeeds, and
+//! the copy counts as patched. It is the rule Socket's backend follows
+//! when it builds a patched `java` platform gem, so a copy patched in
+//! place holds the same files as one installed from that gem.
+//!
+//! The one thing that cannot be done here is rebuild a jar. A record that
+//! names a JVM build input (`is_jvm_build_input`: a Java, Kotlin or Scala
+//! source, a Maven, Ant or Gradle build file, a jar or a class file) has
+//! its applicable files written and nothing built, the run warns with
+//! [`NOT_REBUILT_REASON`], and nothing ever attests the copy
+//! ([`verify_native_build`]).
 //!
 //! # What is executed, and when
 //!
@@ -244,6 +275,11 @@ pub const RESTORE_FAILED_CODE: &str = "native_extension_restore_failed";
 /// The `vex` / `apply --check` routing tag of a copy whose sources carry
 /// the patch while its compiled extension was not built from them.
 pub const NOT_REBUILT_REASON: &str = "native_extension_not_rebuilt";
+/// The reason of a copy `apply` skips because no file of the record is part
+/// of the build installed there: the JVM build of a gem (what JRuby
+/// installs) has none of the C code a record for the `ruby` platform gem
+/// may be all about. Nothing is written, and the copy counts as patched.
+pub const NOT_IN_BUILD_CODE: &str = "not_in_platform_build";
 
 /// The build marker, in the gem dir (see [`BuildMarker`]).
 pub const MARKER_FILE: &str = ".socket-patch-native-build.json";
@@ -672,6 +708,12 @@ impl SpecFacts {
             release,
         }
     }
+
+    /// The platform of a gem built for the JVM ([`is_java_platform`]):
+    /// what JRuby installs, whose compiled code is jars.
+    fn jvm_platform(&self) -> Option<&str> {
+        self.platform.as_deref().filter(|p| is_java_platform(p))
+    }
 }
 
 /// Whether `platform` is JRuby's: a `java` gem ships its compiled code as
@@ -680,6 +722,108 @@ fn is_java_platform(platform: &str) -> bool {
     platform
         .split('-')
         .any(|part| part.eq_ignore_ascii_case("java") || part.eq_ignore_ascii_case("jruby"))
+}
+
+/// What the jars of a JVM gem are built from, and what they are built
+/// into, by extension.
+const JVM_BUILD_EXTENSIONS: &[&str] = &["java", "kt", "scala", "jar", "class"];
+
+/// The build files of the tools that build those jars, in lowercase: the
+/// name is matched whatever its case.
+const JVM_BUILD_FILES: &[&str] = &[
+    "pom.xml",
+    "build.xml",
+    "build.gradle",
+    "build.gradle.kts",
+    "mavenfile",
+];
+
+/// Whether a (normalized) gem file path is a JVM build input by its name: a
+/// Java, Kotlin or Scala source, a build file of Maven, Ant or Gradle, or
+/// a jar or class file itself. The jars a JVM gem runs were built from
+/// these, and nothing here rebuilds a jar.
+fn is_jvm_build_input(path: &str) -> bool {
+    let leaf = leaf_of(path).to_ascii_lowercase();
+    JVM_BUILD_FILES.contains(&leaf.as_str())
+        || leaf
+            .rsplit_once('.')
+            .is_some_and(|(stem, ext)| !stem.is_empty() && JVM_BUILD_EXTENSIONS.contains(&ext))
+}
+
+/// Whether a file a patch adds is an input of a C build by its path: a
+/// file under `ext/`, a patch or a port of a library the gem packs
+/// (`patches/**`, `ports/**`), or a source or build file by name.
+fn is_native_input_by_path(path: &str) -> bool {
+    ["ext/", "patches/", "ports/"]
+        .iter()
+        .any(|dir| path.starts_with(dir))
+        || is_native_by_name(path)
+        || is_build_file_by_name(path)
+}
+
+/// Whether the JVM build of a gem takes one file of a record: `path`
+/// (normalized) with the record's `info`, in a copy that holds a file at
+/// that path or not (`held`).
+///
+/// The records are written for the `ruby` platform gem, and the JVM build
+/// of the same release is another archive: it ships the gem's Ruby files,
+/// often its C sources too (dead weight there: nothing on JRuby compiles
+/// them), and none of what only a C build reads.
+///
+/// * A file the record replaces (it has a `beforeHash`) is part of this
+///   build when the copy holds it. It is then verified and written like
+///   any patch file. One the copy does not hold is not part of this
+///   platform's gem.
+/// * A file the record adds is part of this build unless it is an input of
+///   a C build by its path ([`is_native_input_by_path`]): a new C source or
+///   a new patch to a packed library means nothing to a gem with no C
+///   build.
+///
+/// A path that could leave the gem dir is always taken, so that the apply
+/// engine refuses the record for it.
+fn jvm_takes(path: &str, info: &PatchFileInfo, held: bool) -> bool {
+    if !is_safe_relative_subpath(path) {
+        return true;
+    }
+    if info.before_hash.is_empty() {
+        !is_native_input_by_path(path)
+    } else {
+        held
+    }
+}
+
+/// A record as the JVM build of a gem takes it ([`jvm_takes`]).
+#[derive(Debug, Clone, Default, PartialEq)]
+struct JvmRecord {
+    /// The record's files that are part of this build.
+    files: HashMap<String, PatchFileInfo>,
+    /// The record's keys that are JVM build inputs
+    /// ([`is_jvm_build_input`]), sorted, whether the copy holds them or
+    /// not: the jars it runs may have been built from them.
+    jvm_inputs: Vec<String>,
+}
+
+/// The record `files` as the JVM gem copy in `gem_dir` takes it.
+async fn jvm_record(gem_dir: &Path, files: &HashMap<String, PatchFileInfo>) -> JvmRecord {
+    let mut out = JvmRecord::default();
+    for (key, info) in files {
+        let path = normalize_file_path(key);
+        if is_jvm_build_input(path) {
+            out.jvm_inputs.push(key.clone());
+        }
+        // Only a file the record replaces is looked for.
+        let held = info.before_hash.is_empty()
+            || !is_safe_relative_subpath(path)
+            || !matches!(
+                tokio::fs::symlink_metadata(gem_dir.join(path)).await,
+                Err(e) if crate::patch::apply::is_missing_path(&e)
+            );
+        if jvm_takes(path, info, held) {
+            out.files.insert(key.clone(), info.clone());
+        }
+    }
+    out.jvm_inputs.sort();
+    out
 }
 
 /// Whether a (normalized) gem file path is a native-extension build input by
@@ -881,13 +1025,10 @@ fn classify(facts: &SpecFacts, files: &HashMap<String, PatchFileInfo>) -> Native
     }
 }
 
-/// The record's native scope on the copy at `pkg_path`, and the copy when it
-/// is a RubyGems install whose spec could be read. `None` scope inputs mean
-/// the record is plain Ruby for this copy.
-async fn scope_of(
-    pkg_path: &Path,
-    files: &HashMap<String, PatchFileInfo>,
-) -> (NativeScope, Option<GemCopy>) {
+/// What the installed gemspec of the copy at `pkg_path` says, and the copy
+/// when it is a RubyGems install whose spec could be read (the facts are
+/// empty otherwise).
+async fn facts_of(pkg_path: &Path) -> (SpecFacts, Option<GemCopy>) {
     let copy = GemCopy::of(pkg_path);
     let spec_text = match &copy {
         Some(c) => crate::utils::fs::read_regular_to_string(&c.spec_path)
@@ -899,10 +1040,47 @@ async fn scope_of(
         (Some(copy), Some(text)) => SpecFacts::of(text, &copy.full_name),
         _ => SpecFacts::default(),
     };
-    let scope = classify(&facts, files);
+    (facts, copy.filter(|_| spec_text.is_some()))
+}
+
+/// The record's native scope on the copy at `pkg_path`, and the copy when it
+/// is a RubyGems install whose spec could be read. `None` scope inputs mean
+/// the record is plain Ruby for this copy.
+#[cfg(test)]
+async fn scope_of(
+    pkg_path: &Path,
+    files: &HashMap<String, PatchFileInfo>,
+) -> (NativeScope, Option<GemCopy>) {
+    let (facts, copy) = facts_of(pkg_path).await;
     // Without a readable spec nothing proves which scripts the gem builds;
     // name-matched inputs still count, and the copy is unusable for a build.
-    (scope, copy.filter(|_| spec_text.is_some()))
+    (classify(&facts, files), copy)
+}
+
+/// The JVM gem copy at `pkg_path`, when the copy is one: a RubyGems
+/// install whose platform is a JVM one ([`SpecFacts::jvm_platform`]).
+async fn jvm_copy_at(pkg_path: &Path) -> Option<(GemCopy, String)> {
+    let (facts, copy) = facts_of(pkg_path).await;
+    let platform = facts.jvm_platform()?.to_string();
+    Some((copy?, platform))
+}
+
+/// The record `files` as the gem copy at `pkg_path` takes it. The JVM
+/// build of a gem (what JRuby installs) takes the files that are part of
+/// that build ([`jvm_takes`]); any other copy takes the record as it is.
+///
+/// Whatever compares a record with an installed copy reads it through
+/// this (`vex`, `apply --check`, `rollback`), as `apply` wrote it: a file
+/// the JVM build has no use for is neither missing from the copy nor there
+/// to restore.
+pub async fn installed_files<'f>(
+    pkg_path: &Path,
+    files: &'f HashMap<String, PatchFileInfo>,
+) -> std::borrow::Cow<'f, HashMap<String, PatchFileInfo>> {
+    match jvm_copy_at(pkg_path).await {
+        Some((copy, _)) => std::borrow::Cow::Owned(jvm_record(&copy.gem_dir, files).await.files),
+        None => std::borrow::Cow::Borrowed(files),
+    }
 }
 
 /// The build marker written into the gem dir after a rebuild.
@@ -1167,11 +1345,28 @@ fn built_state(
 /// at install time, the marker of its rebuilt extension dir; for a
 /// precompiled platform gem, the marker of the prebuilt binaries replaced
 /// by a build of the source gem. Errors carry [`NOT_REBUILT_REASON`].
+///
+/// The JVM build of a gem compiles nothing of a record but what its jars
+/// were built from, and nothing here rebuilds a jar: a record that names a
+/// JVM build input ([`is_jvm_build_input`]) never passes on such a copy,
+/// and any other record passes with no marker (its files are judged
+/// through [`installed_files`]).
 pub async fn verify_native_build(
     pkg_path: &Path,
     files: &HashMap<String, PatchFileInfo>,
 ) -> Result<(), String> {
-    let (scope, copy) = scope_of(pkg_path, files).await;
+    let (facts, copy) = facts_of(pkg_path).await;
+    if facts.jvm_platform().is_some() {
+        let changes_a_jar = files
+            .keys()
+            .any(|key| is_jvm_build_input(normalize_file_path(key)));
+        return if changes_a_jar {
+            Err(NOT_REBUILT_REASON.to_string())
+        } else {
+            Ok(())
+        };
+    }
+    let scope = classify(&facts, files);
     if scope.inputs.is_empty() {
         return Ok(());
     }
@@ -4653,9 +4848,16 @@ pub fn names_platform(key: &str, platform: &str) -> bool {
 /// build input of the ruby-platform record that an installed native gem
 /// does not hold ([`files_as_installed`]): its absence says the copy was
 /// built, not that it is another gem, and the source gem is where its
-/// content is checked. Those files are left out. Any other record or copy:
-/// `files` as they are (a `java` record stays unmatched on an MRI copy, and
-/// the ruby record on a JRuby copy, which nothing here rebuilds).
+/// content is checked. Those files are left out.
+///
+/// On the JVM build of a gem (what JRuby installs) the ruby-platform
+/// record is matched by the files that build takes of it
+/// ([`installed_files`]): one the copy holds must hold the record's
+/// content, and one it does not hold says nothing.
+///
+/// Any other record or copy: `files` as they are (a `java` record stays
+/// unmatched on an MRI copy, and a record qualified for another platform
+/// on a JRuby one).
 pub async fn discriminating_files<'f>(
     pkg_path: &Path,
     key: &str,
@@ -4669,16 +4871,15 @@ pub async fn discriminating_files<'f>(
     if !is_gem || !ruby_record {
         return Cow::Borrowed(files);
     }
-    let (scope, copy) = scope_of(pkg_path, files).await;
+    let (facts, copy) = facts_of(pkg_path).await;
+    if let (Some(_), Some(copy)) = (facts.jvm_platform(), &copy) {
+        return Cow::Owned(jvm_record(&copy.gem_dir, files).await.files);
+    }
+    let scope = classify(&facts, files);
     let Some(copy) = copy.filter(|_| !scope.inputs.is_empty()) else {
         return Cow::Borrowed(files);
     };
-    let rebuilt_from_source = scope.builds_extensions
-        || scope
-            .precompiled
-            .as_deref()
-            .is_some_and(|platform| !is_java_platform(platform));
-    if !rebuilt_from_source {
+    if !scope.builds_extensions && scope.precompiled.is_none() {
         return Cow::Borrowed(files);
     }
     let (_, absent) = files_as_installed(&copy, &scope, files).await;
@@ -4693,13 +4894,15 @@ pub async fn discriminating_files<'f>(
 /// The record's files as `rollback` undoes them on the gem copy at
 /// `pkg_path`. A build input `apply` added to a copy that did not hold it
 /// ([`files_as_installed`]; the copy's backup lists them) is removed, not
-/// restored to the content it has in the source gem. Any other copy:
-/// `files` as they are.
+/// restored to the content it has in the source gem. On the JVM build of a
+/// gem, only the files `apply` wrote there are undone
+/// ([`installed_files`]): one it skipped is not there to restore. Any
+/// other copy: `files` as they are.
 pub async fn rollback_files(
     pkg_path: &Path,
     files: &HashMap<String, PatchFileInfo>,
 ) -> HashMap<String, PatchFileInfo> {
-    let mut out = files.clone();
+    let mut out = installed_files(pkg_path, files).await.into_owned();
     let Some(copy) = GemCopy::of(pkg_path) else {
         return out;
     };
@@ -4950,10 +5153,154 @@ impl Job<'_> {
 const HOSTED_HINT: &str = "Use `socket-patch scan --mode hosted`, which installs the patched gem \
                            through Bundler so RubyGems compiles it.";
 
+/// Why the jars of a JVM gem are not a build of a record that changes what
+/// they were built from ([`Job::not_compiled`]).
+const JARS_NOT_REBUILT: &str = "the gem's jars were built from Java sources the patch changes, \
+                                and they cannot be rebuilt here";
+
+/// The `(code, detail)` of a result that left its copy as it was on
+/// purpose, and says so in its note (`error` on a successful result, as
+/// `<code>: <detail>`): no file of the record is part of the copy's build
+/// ([`NOT_IN_BUILD_CODE`]), or none is and the record changes what the
+/// copy's jars were built from ([`NOT_REBUILT_REASON`]). The caller reports
+/// the copy as skipped with that reason, not as applied.
+pub fn skipped_copy(result: &ApplyResult) -> Option<(&str, &str)> {
+    if !result.success || !result.files_verified.is_empty() || !result.files_patched.is_empty() {
+        return None;
+    }
+    let (code, detail) = result.error.as_deref()?.split_once(": ")?;
+    [NOT_IN_BUILD_CODE, NOT_REBUILT_REASON]
+        .contains(&code)
+        .then_some((code, detail))
+}
+
+/// One record applied to the JVM build of a gem: the copy JRuby installs,
+/// whose compiled code is jars. Nothing is built and no Ruby is started.
+/// The files that are part of that build are written ([`jvm_takes`]), and
+/// that is the whole patch unless the record names a JVM build input
+/// ([`is_jvm_build_input`]): the jars were built from those, so the copy's
+/// compiled code is then not the patch's, and the run says so
+/// ([`NOT_REBUILT_REASON`]).
+struct JvmApply<'a> {
+    read_scope: crate::utils::repo_root::ReadScope,
+    package_key: &'a str,
+    pkg_path: &'a Path,
+    sources: &'a PatchSources<'a>,
+    dry_run: bool,
+    policy: MismatchPolicy,
+    env: &'a RubyEnv,
+    copy: &'a GemCopy,
+    /// The copy's platform (`java`).
+    platform: &'a str,
+    release: Option<GemId>,
+}
+
+impl JvmApply<'_> {
+    /// The result of a copy this run leaves as it is on purpose
+    /// ([`skipped_copy`]).
+    fn untouched(&self, code: &str, detail: &str) -> ApplyResult {
+        ApplyResult {
+            package_key: self.package_key.to_string(),
+            package_path: self.pkg_path.display().to_string(),
+            success: true,
+            files_verified: Vec::new(),
+            files_patched: Vec::new(),
+            applied_via: HashMap::new(),
+            error: Some(format!("{code}: {detail}")),
+            sidecar: None,
+        }
+    }
+
+    async fn plain(&self, files: &HashMap<String, PatchFileInfo>) -> GemApplied {
+        plain_apply(
+            self.read_scope,
+            self.package_key,
+            self.pkg_path,
+            files,
+            self.sources,
+            self.dry_run,
+            self.policy,
+        )
+        .await
+    }
+
+    async fn apply(&self, files: &HashMap<String, PatchFileInfo>) -> GemApplied {
+        let record = jvm_record(&self.copy.gem_dir, files).await;
+        let full_name = &self.copy.full_name;
+        if record.jvm_inputs.is_empty() {
+            // The code the record changes is not in this build at all.
+            if record.files.is_empty() && !files.is_empty() {
+                let detail = format!(
+                    "none of the patch's files are part of the JRuby build of this gem \
+                     ({full_name}): the code the patch changes is not in that build, so there \
+                     is nothing to patch and nothing was written"
+                );
+                return GemApplied {
+                    result: self.untouched(NOT_IN_BUILD_CODE, &detail),
+                    warning: None,
+                };
+            }
+            return self.plain(&record.files).await;
+        }
+
+        // The record changes what the gem's jars were built from.
+        let scope = NativeScope {
+            inputs: record.jvm_inputs.clone(),
+            builds_extensions: false,
+            precompiled: Some(self.platform.to_string()),
+            release: self.release.clone(),
+        };
+        let inputs = list_inputs(&scope);
+        if record.files.is_empty() {
+            let detail = format!(
+                "{}: none of the patch's files are in the JRuby build of this gem ({full_name}) \
+                 to write, and it changes sources of the gem's jars ({inputs}): \
+                 {JARS_NOT_REBUILT}. Nothing was written, and vex does not attest the patch",
+                self.package_key
+            );
+            return GemApplied {
+                result: self.untouched(NOT_REBUILT_REASON, &detail),
+                warning: Some((NOT_REBUILT_REASON.to_string(), detail)),
+            };
+        }
+        if self.dry_run {
+            let mut applied = self.plain(&record.files).await;
+            if applied.result.success {
+                applied.warning = Some((
+                    NOT_REBUILT_REASON.to_string(),
+                    format!(
+                        "{}: dry run: apply would write the patch's files, but its \
+                         native-extension sources ({inputs}) would not be in the compiled code \
+                         this install runs: {JARS_NOT_REBUILT}. vex would not attest the patch",
+                        self.package_key
+                    ),
+                ));
+            }
+            return applied;
+        }
+        let job = Job {
+            read_scope: self.read_scope,
+            package_key: self.package_key,
+            pkg_path: self.pkg_path,
+            files: &record.files,
+            installed_files: &record.files,
+            sources: self.sources,
+            policy: self.policy,
+            env: self.env,
+            copy: self.copy,
+            scope: &scope,
+            inputs: &inputs,
+        };
+        job.write_without_build(&[], JARS_NOT_REBUILT).await
+    }
+}
+
 /// [`apply_package_patch`] for one installed gem copy, rebuilding its
 /// native extension when the record changes a build input (see the module
 /// docs). A record without native inputs is applied exactly as
-/// [`apply_package_patch`] applies it.
+/// [`apply_package_patch`] applies it. The JVM build of a gem is never
+/// rebuilt: it takes the record's files that are part of that build
+/// ([`JvmApply`]).
 #[allow(clippy::too_many_arguments)]
 pub async fn apply_gem_package_patch(
     read_scope: crate::utils::repo_root::ReadScope,
@@ -4965,7 +5312,25 @@ pub async fn apply_gem_package_patch(
     policy: MismatchPolicy,
     env: &RubyEnv,
 ) -> GemApplied {
-    let (scope, copy) = scope_of(pkg_path, files).await;
+    let (facts, copy) = facts_of(pkg_path).await;
+    // The JVM build of a gem has no extension to rebuild: the record is
+    // applied as far as it concerns that build.
+    if let (Some(platform), Some(copy)) = (facts.jvm_platform(), &copy) {
+        let jvm = JvmApply {
+            read_scope,
+            package_key,
+            pkg_path,
+            sources,
+            dry_run,
+            policy,
+            env,
+            copy,
+            platform,
+            release: facts.release.clone(),
+        };
+        return jvm.apply(files).await;
+    }
+    let scope = classify(&facts, files);
     if scope.inputs.is_empty() {
         return plain_apply(
             read_scope,
@@ -5047,19 +5412,6 @@ pub async fn apply_gem_package_patch(
                  builds no extension at install time and is not a precompiled platform gem, \
                  so nothing here compiles them and they cannot take effect; nothing was \
                  written."
-            ),
-        );
-    }
-    if let Some(platform) = scope.precompiled.as_deref().filter(|p| is_java_platform(p)) {
-        return refusal(
-            package_key,
-            pkg_path,
-            UNSUPPORTED_CODE,
-            format!(
-                "the patch changes native-extension sources ({inputs}), but the installed gem \
-                 is the JRuby build ({platform}), whose compiled code ships as jars built from \
-                 Java sources; they cannot be rebuilt from the source gem here, so the patch \
-                 cannot take effect; nothing was written."
             ),
         );
     }
@@ -6844,35 +7196,293 @@ mod tests {
         assert_eq!(with_ext.inputs, ["ext/x.c"]);
     }
 
-    /// The JRuby build of a gem ships jars: its Java sources are inputs
-    /// (nothing here rebuilds them, so the patch is refused, never called
-    /// applied), while its Ruby files and a jar replaced whole are plain.
+    /// The JRuby build of a gem is told by its platform, from the gem's
+    /// dir name or its gemspec, whatever else the gemspec says.
     #[test]
-    fn classify_java_gem() {
+    fn a_jvm_gem_is_told_by_its_platform() {
         let spec = to_ruby("nokogiri", Some("java"), &[]);
         let facts = SpecFacts::of(&spec, "nokogiri-1.18.3-java");
-        let scope = classify(
-            &facts,
-            &files(&[
-                "ext/java/nokogiri/XmlNode.java",
-                "lib/nokogiri/xml/node.rb",
-                "lib/nokogiri/nokogiri.jar",
-                "lib/nokogiri/internals/Helper.java",
-            ]),
-        );
-        assert_eq!(
-            scope.inputs,
-            [
-                "ext/java/nokogiri/XmlNode.java",
-                "lib/nokogiri/internals/Helper.java"
-            ]
-        );
-        assert_eq!(scope.precompiled.as_deref(), Some("java"));
+        assert_eq!(facts.jvm_platform(), Some("java"));
+        let declares = to_ruby("jar_gem", Some("java"), &["ext/Rakefile"]);
+        let facts = SpecFacts::of(&declares, "jar_gem-1.18.3-java");
+        assert_eq!(facts.jvm_platform(), Some("java"));
+        let universal = to_ruby("json", Some("universal-java-17"), &[]);
+        let facts = SpecFacts::of(&universal, "json-1.18.3-universal-java-17");
+        assert_eq!(facts.jvm_platform(), Some("universal-java-17"));
+        for platform in [None, Some("arm64-darwin"), Some("x86_64-linux-gnu")] {
+            let spec = to_ruby("nokogiri", platform, &[]);
+            let full_name = match platform {
+                Some(p) => format!("nokogiri-1.18.3-{p}"),
+                None => "nokogiri-1.18.3".to_string(),
+            };
+            assert_eq!(
+                SpecFacts::of(&spec, &full_name).jvm_platform(),
+                None,
+                "{platform:?}"
+            );
+        }
         assert!(is_java_platform("java"));
+        assert!(is_java_platform("jruby"));
         assert!(is_java_platform("universal-java-17"));
         for platform in ["arm64-darwin", "x86_64-linux-gnu", "x64-mingw-ucrt"] {
             assert!(!is_java_platform(platform), "{platform}");
         }
+    }
+
+    /// What a JVM gem's jars are built from, by name: sources, the build
+    /// files of the tools that build them, and the jars and classes
+    /// themselves.
+    #[test]
+    fn jvm_build_inputs_are_told_by_name() {
+        for path in [
+            "ext/java/nokogiri/XmlNode.java",
+            "lib/nokogiri/internals/Helper.JAVA",
+            "src/main/kotlin/A.kt",
+            "src/main/scala/B.scala",
+            "pom.xml",
+            "ext/POM.XML",
+            "build.xml",
+            "build.gradle",
+            "build.gradle.kts",
+            "Mavenfile",
+            "ext/mavenfile",
+            "lib/nokogiri/nokogiri.jar",
+            "lib/a/B.class",
+        ] {
+            assert!(is_jvm_build_input(path), "{path}");
+        }
+        for path in [
+            "lib/nokogiri/xml/node.rb",
+            "ext/nokogiri/xml_node.c",
+            "ext/nokogiri/extconf.rb",
+            "dependencies.yml",
+            "patches/libxml2/0001.patch",
+            "lib/java.rb",
+            "lib/jar",
+            "lib/.java",
+            "pom.xml.bak",
+            "docs/build.gradle.md",
+            "settings.xml",
+        ] {
+            assert!(!is_jvm_build_input(path), "{path}");
+        }
+    }
+
+    /// The per-file rule of a JVM copy: a file the record replaces is
+    /// taken when the copy holds it; a file the record adds is taken
+    /// unless only a C build would read it.
+    #[test]
+    fn a_jvm_copy_takes_the_files_of_its_own_build() {
+        let replaces = info(&"a".repeat(64));
+        let adds = PatchFileInfo {
+            before_hash: String::new(),
+            after_hash: "a".repeat(64),
+        };
+        // Replaced files: held or not is all that counts, whatever the file.
+        for path in [
+            "lib/nokogiri/xml/node.rb",
+            "ext/nokogiri/xml_node.c",
+            "ext/java/nokogiri/XmlNode.java",
+            "dependencies.yml",
+            "patches/libxml2/0001.patch",
+            "lib/nokogiri/nokogiri.jar",
+        ] {
+            assert!(jvm_takes(path, &replaces, true), "held {path}");
+            assert!(!jvm_takes(path, &replaces, false), "not held {path}");
+        }
+        // Added files a C build alone would read: skipped, even where the
+        // copy happens to hold something at the path.
+        for path in [
+            "ext/nokogiri/new_source.c",
+            "ext/nokogiri/include/new.h",
+            "ext/java/nokogiri/New.java",
+            "patches/libxml2/0100-fix.patch",
+            "ports/patches/libxml2/0100-fix.patch",
+            "ports/archives/libxml2-2.13.9.tar.xz",
+            "lib/nokogiri/extra.h",
+            "gumbo-parser/src/new.c",
+            "Cargo.toml",
+            "CMakeLists.txt",
+            "extconf.rb",
+        ] {
+            assert!(!jvm_takes(path, &adds, false), "{path}");
+            assert!(!jvm_takes(path, &adds, true), "held {path}");
+        }
+        // Any other added file is created.
+        for path in [
+            "lib/nokogiri/xml/new_helper.rb",
+            "lib/nokogiri/data.yml",
+            "data/entities.json",
+            "lib/nokogiri/extra.jar",
+            "README.md",
+        ] {
+            assert!(jvm_takes(path, &adds, false), "{path}");
+        }
+        // A key that could leave the gem dir is never dropped quietly: the
+        // apply engine refuses the record for it.
+        for path in ["../outside.c", "/etc/passwd", "ext/../../x.c", ""] {
+            assert!(jvm_takes(path, &adds, false), "{path:?}");
+            assert!(jvm_takes(path, &replaces, false), "{path:?}");
+        }
+    }
+
+    /// A hand-laid JVM copy of the gem `a`: its Ruby file, a C source it
+    /// ships as dead weight, a Java source and the jar built from it.
+    fn jvm_gem(home: &Path) -> GemCopy {
+        let gem_dir = home.join("gems/a-1-java");
+        for (rel, bytes) in [
+            ("lib/a.rb", &b"require 'a/a.jar'\n"[..]),
+            ("lib/a/a.jar", b"PK jar"),
+            ("ext/a/a.c", b"int a;"),
+            ("ext/java/a/A.java", b"class A {}"),
+        ] {
+            let path = gem_dir.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, bytes).unwrap();
+        }
+        std::fs::create_dir_all(home.join("specifications")).unwrap();
+        std::fs::write(
+            home.join("specifications/a-1-java.gemspec"),
+            "Gem::Specification.new do |s|\n  s.name = \"a\".freeze\n  \
+             s.version = \"1\".freeze\n  s.platform = \"java\".freeze\n  \
+             s.require_paths = [\"lib\".freeze]\nend\n",
+        )
+        .unwrap();
+        GemCopy::of(&gem_dir).unwrap()
+    }
+
+    fn sorted_keys(files: &HashMap<String, PatchFileInfo>) -> Vec<String> {
+        let mut keys: Vec<String> = files.keys().cloned().collect();
+        keys.sort();
+        keys
+    }
+
+    /// The record a JVM copy is judged by, wherever a record is compared
+    /// with an installed copy: matching a release variant, `apply --check`,
+    /// `vex` and `rollback` all read it through the same rule.
+    #[tokio::test]
+    async fn a_jvm_copy_is_judged_by_the_files_it_takes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let copy = jvm_gem(&tmp.path().join("jruby"));
+        let added = |after: &str| PatchFileInfo {
+            before_hash: String::new(),
+            after_hash: after.repeat(64),
+        };
+        let record: HashMap<String, PatchFileInfo> = [
+            ("lib/a.rb".to_string(), info(&"1".repeat(64))),
+            ("ext/a/a.c".to_string(), info(&"2".repeat(64))),
+            // Replaced files this build does not ship.
+            ("ext/a/gone.c".to_string(), info(&"3".repeat(64))),
+            ("lib/a/mri_only.rb".to_string(), info(&"4".repeat(64))),
+            // Added files: a library patch, and a Ruby file.
+            ("patches/lib/0001.patch".to_string(), added("5")),
+            ("lib/a/new.rb".to_string(), added("6")),
+        ]
+        .into();
+        let taken = ["ext/a/a.c", "lib/a.rb", "lib/a/new.rb"];
+
+        let view = jvm_record(&copy.gem_dir, &record).await;
+        assert_eq!(sorted_keys(&view.files), taken);
+        assert!(view.jvm_inputs.is_empty(), "{:?}", view.jvm_inputs);
+        assert_eq!(
+            sorted_keys(&*installed_files(&copy.gem_dir, &record).await),
+            taken
+        );
+        assert_eq!(
+            sorted_keys(&rollback_files(&copy.gem_dir, &record).await),
+            taken
+        );
+        // The ruby-platform record, qualified or not, is matched by them.
+        for purl in ["pkg:gem/a@1", "pkg:gem/a@1?platform=ruby"] {
+            let telling = discriminating_files(&copy.gem_dir, purl, &record).await;
+            assert_eq!(sorted_keys(&telling), taken, "{purl}");
+        }
+        // A record written for another platform keeps every file: one the
+        // copy lacks says it is not that platform's gem.
+        for purl in [
+            "pkg:gem/a@1?platform=arm64-darwin",
+            "pkg:gem/a@1?platform=java",
+        ] {
+            let telling = discriminating_files(&copy.gem_dir, purl, &record).await;
+            assert_eq!(sorted_keys(&telling), sorted_keys(&record), "{purl}");
+        }
+        // Nothing is built for such a copy, so no marker is asked for: C
+        // sources and a library patch are no build inputs there.
+        assert_eq!(verify_native_build(&copy.gem_dir, &record).await, Ok(()));
+
+        // A record of a C build alone: no file of it is part of this build.
+        let c_only: HashMap<String, PatchFileInfo> =
+            [("patches/lib/0001.patch".to_string(), added("5"))].into();
+        assert!(installed_files(&copy.gem_dir, &c_only).await.is_empty());
+        assert!(rollback_files(&copy.gem_dir, &c_only).await.is_empty());
+        assert_eq!(verify_native_build(&copy.gem_dir, &c_only).await, Ok(()));
+
+        // A record that changes what the jars were built from is never
+        // attested, whether the copy ships that source or not.
+        for jvm_key in ["ext/java/a/A.java", "ext/java/a/Gone.java", "pom.xml"] {
+            let mut with_java = record.clone();
+            with_java.insert(jvm_key.to_string(), info(&"7".repeat(64)));
+            let view = jvm_record(&copy.gem_dir, &with_java).await;
+            assert_eq!(view.jvm_inputs, [jvm_key]);
+            assert_eq!(
+                view.files.contains_key(jvm_key),
+                jvm_key == "ext/java/a/A.java",
+                "{jvm_key}"
+            );
+            assert_eq!(
+                verify_native_build(&copy.gem_dir, &with_java).await,
+                Err(NOT_REBUILT_REASON.to_string()),
+                "{jvm_key}"
+            );
+        }
+
+        // Any other copy takes the record as it is.
+        let mri = precompiled_gem(&tmp.path().join("mri"));
+        let whole = installed_files(&mri.gem_dir, &record).await;
+        assert!(matches!(whole, std::borrow::Cow::Borrowed(_)));
+        assert_eq!(*whole, record);
+        assert_eq!(*installed_files(tmp.path(), &record).await, record);
+    }
+
+    /// A copy `apply` leaves as it is on purpose says so in the note of a
+    /// successful result that verified and wrote nothing; no other result
+    /// reads as one.
+    #[test]
+    fn a_copy_left_as_it_was_says_why() {
+        let result = |success: bool, error: Option<&str>| ApplyResult {
+            package_key: "pkg:gem/a@1".to_string(),
+            package_path: "/h/gems/a-1-java".to_string(),
+            success,
+            files_verified: Vec::new(),
+            files_patched: Vec::new(),
+            applied_via: HashMap::new(),
+            error: error.map(str::to_string),
+            sidecar: None,
+        };
+        let note = format!("{NOT_IN_BUILD_CODE}: none of the patch's files are part of it");
+        assert_eq!(
+            skipped_copy(&result(true, Some(&note))),
+            Some((
+                NOT_IN_BUILD_CODE,
+                "none of the patch's files are part of it"
+            ))
+        );
+        let jars = format!("{NOT_REBUILT_REASON}: the jars: were not rebuilt");
+        assert_eq!(
+            skipped_copy(&result(true, Some(&jars))),
+            Some((NOT_REBUILT_REASON, "the jars: were not rebuilt"))
+        );
+        // A failure, another note, no note, or a result that wrote a file.
+        assert_eq!(skipped_copy(&result(false, Some(&note))), None);
+        assert_eq!(
+            skipped_copy(&result(true, Some("ownership could not be restored"))),
+            None
+        );
+        assert_eq!(skipped_copy(&result(true, Some("apply_failed: x"))), None);
+        assert_eq!(skipped_copy(&result(true, None)), None);
+        let mut wrote = result(true, Some(&note));
+        wrote.files_patched.push("lib/a.rb".to_string());
+        assert_eq!(skipped_copy(&wrote), None);
     }
 
     /// A build system's manifest is an input wherever it sits, and a gem
@@ -7681,20 +8291,12 @@ mod tests {
         let telling = discriminating_files(&built.gem_dir, "pkg:gem/a@1", &removed).await;
         assert!(telling.is_empty(), "{:?}", keys(&telling));
 
-        // The JRuby build is not rebuilt from the source gem: a file it
-        // lacks still says the ruby record is not its record.
-        let java_home = tmp.path().join("java");
-        let java_dir = java_home.join("gems/a-1-java");
-        std::fs::create_dir_all(java_dir.join("lib")).unwrap();
-        std::fs::create_dir_all(java_home.join("specifications")).unwrap();
-        std::fs::write(
-            java_home.join("specifications/a-1-java.gemspec"),
-            "Gem::Specification.new do |s|\n  s.name = \"a\".freeze\n  \
-             s.version = \"1\".freeze\n  s.platform = \"java\".freeze\nend\n",
-        )
-        .unwrap();
-        let telling = discriminating_files(&java_dir, "pkg:gem/a@1", &record).await;
-        assert_eq!(keys(&telling), keys(&record));
+        // The JRuby build is another archive of the same release: a file
+        // of the ruby record it does not ship says nothing about it, and
+        // one it ships is what tells (`a_jvm_copy_is_judged_by_the_files_it_takes`).
+        let java = jvm_gem(&tmp.path().join("java"));
+        let telling = discriminating_files(&java.gem_dir, "pkg:gem/a@1", &record).await;
+        assert_eq!(keys(&telling), ["ext/a/a.c"]);
     }
 
     /// A gem tree can come from the repository being scanned, so nothing in

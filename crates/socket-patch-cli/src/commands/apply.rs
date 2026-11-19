@@ -1022,8 +1022,10 @@ pub(crate) fn representative_file(
 ///
 /// Action mapping (in priority order):
 ///   * `!result.success`                         → `Failed`
-///   * `dry_run` and any file was Ready/Patched → `Verified`
 ///   * all `files_verified` are AlreadyPatched   → `Skipped` (already_patched)
+///   * no file of the patch is in the copy's build → `Skipped`
+///     (`not_in_platform_build`; see [`gem_ext::skipped_copy`])
+///   * `dry_run` and any file was Ready/Patched → `Verified`
 ///   * something was actually patched on disk    → `Applied`
 ///
 /// `files` enumerates only the files that participated in the action —
@@ -1055,6 +1057,13 @@ pub(crate) fn result_to_event(result: &ApplyResult, dry_run: bool) -> PatchEvent
     if all_files_already_patched(result) {
         return PatchEvent::new(PatchAction::Skipped, purl)
             .with_reason("already_patched", "All files already match afterHash");
+    }
+
+    // A gem copy left as it was on purpose: the JRuby build of a gem that
+    // holds none of the patch's files. A no-op with its own reason, never
+    // an `applied` event with no files.
+    if let Some((code, detail)) = gem_ext::skipped_copy(result) {
+        return PatchEvent::new(PatchAction::Skipped, purl).with_reason(code, detail);
     }
 
     if dry_run {
@@ -1809,6 +1818,21 @@ pub(crate) async fn run_locked(
                 for skip in &fallback_skips {
                     eprintln!("Warning: {}", skip.detail());
                 }
+                // A gem build that holds none of a patch's files (the JRuby
+                // build of a gem patched in its C code): nothing to do, said
+                // in plain words, each distinct one once. It is the copy's
+                // `skipped` event under `--json`. The form that changes the
+                // gem's jars is a run warning, printed above.
+                let mut noted = HashSet::new();
+                for result in &results {
+                    if let Some((gem_ext::NOT_IN_BUILD_CODE, detail)) =
+                        gem_ext::skipped_copy(result)
+                    {
+                        if noted.insert((result.package_key.as_str(), detail)) {
+                            eprintln!("Note: {}: {detail}", normalize_purl(&result.package_key));
+                        }
+                    }
+                }
                 // A package's sidecar advisory (the PyPI `RECORD`, a gem
                 // `--redownload`, `go mod verify`, a signed NuGet package,
                 // a Gradle cache copy) is `sidecars[]` under `--json`; a
@@ -2324,15 +2348,23 @@ struct ApplyTally {
     /// Owned by `socket-patch vendor` (its committed artifact is the
     /// patch; apply does no work for it).
     vendored: usize,
+    /// No copy had anything to patch: every one is a build of the package
+    /// that holds none of the patch's files ([`gem_ext::skipped_copy`]).
+    not_applicable: usize,
 }
 
 fn tally_results(results: &[ApplyResult]) -> ApplyTally {
     let mut by_purl: std::collections::BTreeMap<&str, Vec<&ApplyResult>> =
         std::collections::BTreeMap::new();
     let mut vendored: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    let mut not_applicable: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
     for r in results {
         if r.package_path == VENDOR_OWNED_MARKER {
             vendored.insert(r.package_key.as_str());
+            continue;
+        }
+        if gem_ext::skipped_copy(r).is_some() {
+            not_applicable.insert(r.package_key.as_str());
             continue;
         }
         by_purl.entry(r.package_key.as_str()).or_default().push(r);
@@ -2341,6 +2373,10 @@ fn tally_results(results: &[ApplyResult]) -> ApplyTally {
         vendored: vendored
             .iter()
             .filter(|k| !by_purl.contains_key(*k))
+            .count(),
+        not_applicable: not_applicable
+            .iter()
+            .filter(|k| !by_purl.contains_key(*k) && !vendored.contains(*k))
             .count(),
         ..ApplyTally::default()
     };
@@ -2382,6 +2418,9 @@ fn format_summary_line(tally: &ApplyTally, targeted: usize, not_found: usize) ->
     if tally.vendored > 0 {
         parts.push(format!("{} vendored", tally.vendored));
     }
+    if tally.not_applicable > 0 {
+        parts.push(format!("{} not applicable", tally.not_applicable));
+    }
     if tally.failed > 0 {
         parts.push(format!("{} failed", tally.failed));
     }
@@ -2402,6 +2441,12 @@ fn format_dry_run_summary(tally: &ApplyTally, not_found: usize) -> Vec<String> {
         lines.push(format!(
             "  {} already patched",
             plural(tally.already, "package", "packages")
+        ));
+    }
+    if tally.not_applicable > 0 {
+        lines.push(format!(
+            "  {} not applicable",
+            plural(tally.not_applicable, "package", "packages")
         ));
     }
     if tally.failed > 0 {
@@ -3029,7 +3074,9 @@ async fn apply_patches_inner(
                         // A native gem's copy does not hold every build
                         // input of its source gem (a build removes them; a
                         // precompiled gem never shipped them): those cannot
-                        // tell distributions apart.
+                        // tell distributions apart. Neither can a file the
+                        // JRuby build of a gem has no use for: such a copy
+                        // is matched by the files it takes of the record.
                         let telling =
                             gem_ext::discriminating_files(pkg_path, variant_purl, &patch.files)
                                 .await;
@@ -3050,7 +3097,9 @@ async fn apply_patches_inner(
                     // A gem patch to native-extension sources rebuilds the
                     // extension (#1996). One it cannot build is refused
                     // with nothing written; one whose build compiles
-                    // nothing of it is written with a warning (#2144).
+                    // nothing of it is written with a warning (#2144). The
+                    // JRuby build of a gem takes the files that are part of
+                    // it, and builds nothing.
                     let result = if Ecosystem::from_purl(purl) == Some(Ecosystem::Gem) {
                         let applied = gem_ext::apply_gem_package_patch(
                             args.common.read_scope(),
@@ -4601,6 +4650,7 @@ mod tests {
                 can_patch: 0,
                 failed: 1,
                 vendored: 1,
+                not_applicable: 0,
             }
         );
         assert_eq!(
@@ -4611,6 +4661,90 @@ mod tests {
         assert_eq!(tally_results(&[]), ApplyTally::default());
     }
 
+    /// A gem copy `apply` left as it was on purpose (the JRuby build of a
+    /// gem that holds none of the patch's files): a successful result
+    /// that verified and wrote nothing, with the reason in its note.
+    fn left_as_it_was(purl: &str, code: &str) -> ApplyResult {
+        ApplyResult {
+            package_key: purl.to_string(),
+            package_path: "/p/vendor/bundle/jruby/3.1.0/gems/nokogiri-1.18.10-java".to_string(),
+            success: true,
+            files_verified: Vec::new(),
+            files_patched: Vec::new(),
+            applied_via: HashMap::new(),
+            error: Some(format!("{code}: none of the patch's files are part of it")),
+            sidecar: None,
+        }
+    }
+
+    /// Such a copy is a `skipped` event with its own reason, wet or dry:
+    /// never an `applied` (or `verified`) event with no files.
+    #[test]
+    fn a_copy_with_nothing_of_the_patch_is_a_skip_with_its_reason() {
+        let purl = "pkg:gem/nokogiri@1.18.10?platform=ruby";
+        for code in [gem_ext::NOT_IN_BUILD_CODE, gem_ext::NOT_REBUILT_REASON] {
+            for dry_run in [false, true] {
+                let event = result_to_event(&left_as_it_was(purl, code), dry_run);
+                let v: serde_json::Value =
+                    serde_json::from_str(&serde_json::to_string(&event).unwrap()).unwrap();
+                assert_eq!(v["action"], "skipped", "{code} dry_run={dry_run}");
+                assert_eq!(v["errorCode"], code, "dry_run={dry_run}");
+                assert_eq!(
+                    v["reason"], "none of the patch's files are part of it",
+                    "{code} dry_run={dry_run}"
+                );
+                assert_eq!(v["purl"], purl);
+            }
+        }
+        // Any other note of a successful result stays what it was.
+        let mut advisory = left_as_it_was(purl, gem_ext::NOT_IN_BUILD_CODE);
+        advisory.error = Some("ownership could not be restored".to_string());
+        assert_eq!(
+            serde_json::to_value(result_to_event(&advisory, false)).unwrap()["action"],
+            "applied"
+        );
+    }
+
+    /// The summary accounts for it under its own heading: not applied, not
+    /// already patched, and nothing a wet run could patch. Another copy of
+    /// the same package that was patched makes the package applied.
+    #[test]
+    fn tally_counts_a_package_with_nothing_to_patch_as_not_applicable() {
+        let purl = "pkg:gem/nokogiri@1.18.10?platform=ruby";
+        let skipped = left_as_it_was(purl, gem_ext::NOT_IN_BUILD_CODE);
+        let t = tally_results(std::slice::from_ref(&skipped));
+        assert_eq!(
+            t,
+            ApplyTally {
+                not_applicable: 1,
+                ..ApplyTally::default()
+            }
+        );
+        assert_eq!(
+            format_summary_line(&t, 1, 0),
+            "Summary: 0 of 1 targeted patch applied, 0 already patched, 1 not applicable, \
+             0 not found on disk"
+        );
+        assert_eq!(
+            format_dry_run_summary(&t, 0),
+            vec![
+                "Patch verification complete:",
+                "  0 packages can be patched",
+                "  1 package not applicable",
+            ]
+        );
+        assert!(format_results_block(&[skipped.clone()], false, Path::new("/p")).is_empty());
+
+        let mut patched = copy_at(
+            "/p/vendor/bundle/ruby/3.4.0/gems/nokogiri-1.18.10",
+            VerifyStatus::Ready,
+            true,
+        );
+        patched.package_key = purl.to_string();
+        let t = tally_results(&[skipped, patched]);
+        assert_eq!((t.applied, t.not_applicable), (1, 0));
+    }
+
     #[test]
     fn dry_run_summary_lists_every_nonzero_bucket() {
         let t = ApplyTally {
@@ -4619,6 +4753,7 @@ mod tests {
             failed: 1,
             applied: 0,
             vendored: 0,
+            not_applicable: 1,
         };
         assert_eq!(
             format_dry_run_summary(&t, 3),
@@ -4626,6 +4761,7 @@ mod tests {
                 "Patch verification complete:",
                 "  1 package can be patched",
                 "  2 packages already patched",
+                "  1 package not applicable",
                 "  1 package cannot be patched",
                 "  3 packages not found on disk",
             ]
