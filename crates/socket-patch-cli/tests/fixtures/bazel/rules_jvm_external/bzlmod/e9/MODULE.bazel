@@ -1,8 +1,15 @@
-module(name = "socket_fixture", version = "0.0.0")
+module(
+    name = "socket_fixture",
+    version = "0.0.0",
+)
 
 bazel_dep(name = "rules_jvm_external", version = "7.2")
 bazel_dep(name = "rules_java", version = "9.3.0")
-single_version_override(module_name = "rules_jvm_external", version = "7.2")
+
+single_version_override(
+    module_name = "rules_jvm_external",
+    version = "7.2",
+)
 
 # The hub has a name of its own. A hub named "maven" also takes the
 # artifacts that other Bazel modules of the build add to a hub of that name

@@ -11,25 +11,49 @@
 //! reach what Bazel builds, and [`notices`] says so for each artifact a
 //! hub builds.
 //!
+//! Hosted mode patches a pinned hub. The hub fetches each jar through a
+//! repository of its own, named after the group, the artifact and the
+//! version, and Bazel's `override_repo` (7.4.0 and later) puts another
+//! repository in its place. So socket-patch keeps one block at the end of
+//! the root `MODULE.bazel` ([`BEGIN`]): per patch a repository that
+//! downloads the patched jar at its sha256, and an `override_repo` of the
+//! hub's one. The hub, its lock, every label and `MODULE.bazel.lock` stay
+//! as they are. [`jars`] are the patches of a run that a hub can take,
+//! [`site`] says for each whether its entry may be written, [`rewrite`]
+//! writes it, [`pins`] reads the block for `list`, `rollback`, `remove`
+//! and `vex`, and [`without`] takes an entry out.
+//! The block is recognised by its text alone: one that is not, byte for
+//! byte, what socket-patch writes for its entries was changed by hand, and
+//! is neither written to nor trusted.
+//!
 //! Everything is read from the checkout through [`super::workspace`]: the
 //! root `MODULE.bazel` with the files it includes, the locks its hubs
-//! name, the `WORKSPACE` file and what names the Bazel release. Nothing is
-//! evaluated, no Bazel is run and nothing is written. What cannot be read
-//! with certainty is said as such ([`UNREADABLE`]) and never guessed.
+//! name, the `WORKSPACE` file, what names the Bazel release and the rc
+//! files. Nothing is evaluated and no Bazel is run. What cannot be read
+//! with certainty is said as such ([`UNREADABLE`]) and never guessed: a
+//! jar whose entry cannot be shown to work is declined with a reason.
 //!
 //! Not seen: a hub or an override that another Bazel module declares, a
 //! `maven_install` inside a function of a `.bzl` file, a jar that reaches
-//! Bazel without a hub, and what a flag or an rc file tells Bazel.
+//! Bazel without a hub, and what a flag or an rc file outside the checkout
+//! tells Bazel.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::ops::Range;
 use std::path::Path;
 
-use super::rc::declared_release;
-use super::starlark::{Call, How, Value};
+use super::rc::{declared_release, mentions, ModuleLock};
+use super::starlark::{Bound, Call, How, Value};
 use super::workspace::{disk, disk_up_to, Doubt, Entry, Extension, Repo, Tag, Workspace};
 use crate::formats::maven::is_variant;
+use crate::patch::redirect::{
+    bare_sha256_hex, maven_coordinates, DepOverride, RewriteResult, RewriteWarning,
+};
+use crate::utils::digest::is_hex64_lower;
 use crate::utils::fs::run_blocking;
+use crate::utils::line_endings::terminator;
 use crate::utils::purl::{parse_maven_purl, purl_qualifier};
+use crate::vendor::jvm::layout::artifact_path;
 
 /// The extension whose tags make a hub.
 pub const EXTENSION: Extension<'static> = Extension {
@@ -44,6 +68,51 @@ pub const HUB_UNPATCHED: &str = "maven_bazel_hub_unpatched";
 /// The warning for an artifact when the hubs of the workspace cannot be
 /// read: a hub may build it.
 pub const UNREADABLE: &str = "maven_bazel_unreadable";
+
+/// The warnings of a hosted run for a jar that a hub builds, or may
+/// build, and whose entry it does not write. Each says why, and that the
+/// Bazel build keeps the upstream jar. With [`UNREADABLE`]:
+///
+/// - the project is below the root of its Bazel workspace, where the
+///   block belongs;
+pub const NOT_AT_ROOT: &str = "maven_bazel_not_at_root";
+/// - a hub has no lock, so Bazel resolves its jars when it builds;
+pub const NOT_PINNED: &str = "maven_bazel_not_pinned";
+/// - the Bazel that builds the checkout may have no `override_repo`, or
+///   the release of the ruleset, which names the repository, is not known;
+pub const RELEASE: &str = "maven_bazel_release";
+/// - the repository of this jar cannot be named, or the patch lacks what
+///   an entry holds;
+pub const ARTIFACT: &str = "maven_bazel_artifact";
+/// - the build would pass on the upstream jar with the entry in place;
+pub const NO_EFFECT: &str = "maven_bazel_no_effect";
+/// - Bazel may not be able to download the patched jar.
+pub const DOWNLOAD: &str = "maven_bazel_download";
+
+/// The file of the block, and the key under which a hosted run hands
+/// [`Site`] to [`rewrite`] among its candidate files: no path of a file.
+pub const FILE: &str = "MODULE.bazel";
+pub const SITE_KEY: &str = "<socket-patch:bazel-maven>";
+
+/// The first and the last line of the block.
+pub const BEGIN: &str = "# >>> socket-patch: Maven patches for Bazel (managed block: socket-patch \
+                         writes and removes it) >>>";
+const END: &str = "# <<< socket-patch <<<";
+
+/// The releases of rules_jvm_external whose way to name the repository of
+/// a jar was read: `escape(coordinates)` in
+/// `private/extensions/download_pinned_deps.bzl` from 6.4 to 6.7 and
+/// `to_repository_name` in `private/coursier_utilities.bzl` from 6.8 on.
+/// No older release is here: none was read for the name or built. The
+/// extension is marked reproducible, which keeps it out of
+/// `MODULE.bazel.lock`, from 6.2 (`private/extensions/maven.bzl`), and
+/// not at 6.0 and 6.1.
+const RULESETS: [&str; 10] = [
+    "6.4", "6.5", "6.6", "6.7", "6.8", "6.9", "6.10", "7.0", "7.1", "7.2",
+];
+
+/// What a doubt about a hub without a lock ends with.
+const NO_LOCK: &str = "has no `lock_file`";
 
 /// The largest lock that is read.
 const MAX_LOCK: usize = 16 << 20;
@@ -65,6 +134,33 @@ pub struct Hub {
     /// The lock its tags name, from the Bazel root. `None`: the hub is not
     /// pinned, and Bazel resolves what it builds when it builds.
     pub lock: Option<String>,
+    /// The label of the `use_extension` that its first tag is called on,
+    /// as it is written there. `None` when one of its tags is called on a
+    /// usage that cannot be read or is isolated: an `override_repo` on
+    /// another usage does not reach the repositories of that one.
+    pub proxy: Option<String>,
+}
+
+/// The label of the `use_extension` call behind the proxy that `tag` is
+/// called on, when that usage is shared with every other one of the
+/// extension (`isolate` is not given, or is `False`) and its label holds
+/// nothing a string of the block would have to escape.
+fn proxy(ws: &Workspace, tag: &Tag) -> Option<String> {
+    let (_, file) = ws.files.iter().find(|(path, _)| path == tag.file)?;
+    let Bound::Call(made) = file.binds.get(tag.call.bind?)?.to else {
+        return None;
+    };
+    let made = file.calls.get(made)?;
+    let shared = match made.arg("isolate") {
+        None => true,
+        Some(Value::Name(isolate)) => isolate == "False",
+        Some(_) => false,
+    };
+    let plain = |b: u8| b.is_ascii_alphanumeric() || b"@/:._-+~".contains(&b);
+    match made.positional(0) {
+        Some(Value::Str(label)) if shared && label.bytes().all(plain) => Some(label.clone()),
+        _ => None,
+    }
 }
 
 const NOT_A_FILE: &str = "the `lock_file` of this hub is not a file of this repository";
@@ -125,15 +221,18 @@ pub fn hubs(ws: &Workspace) -> (Vec<Hub>, Vec<Doubt>) {
                 continue;
             }
         };
-        let Some(hub) = hubs.iter().find(|hub| hub.name == name) else {
+        let proxy = proxy(ws, tag);
+        let Some(hub) = hubs.iter_mut().find(|hub| hub.name == name) else {
             hubs.push(Hub {
                 name,
                 file,
                 line,
                 lock,
+                proxy,
             });
             continue;
         };
+        hub.proxy = hub.proxy.take().filter(|_| proxy.is_some());
         if pins && hub.lock != lock {
             let (first, at) = (&hub.file, hub.line);
             let why = format!("this tag and the one at {first}:{at} name different locks");
@@ -164,6 +263,11 @@ pub struct Lock {
     pub format: u8,
     /// The jar without a classifier of each `group:artifact`.
     jars: HashMap<String, Pinned>,
+    /// The `group:artifact` that a repository of the lock lists. For a jar
+    /// that only `m2local` gives, the ruleset makes a repository on a
+    /// machine whose Maven local repository holds the jar, and none on
+    /// another (`download_pinned_deps` at 6.5 and 7.2).
+    listed: HashSet<String>,
 }
 
 impl Lock {
@@ -212,7 +316,12 @@ impl Lock {
             (key.matches(':').count() == 1).then_some((key, pinned))
         };
         let jars = raw.artifacts.into_iter().filter_map(jar).collect();
-        Ok(Lock { format, jars })
+        let listed = raw.repositories.into_values().flatten().collect();
+        Ok(Lock {
+            format,
+            jars,
+            listed,
+        })
     }
 
     /// The jar of `group:artifact` without a classifier, when the lock
@@ -235,6 +344,18 @@ fn target(coordinates: &str) -> String {
 /// Why a hub that fetches a jar may not build it.
 const OVERRIDDEN: &str = "a `maven.override` gives this artifact another target";
 
+/// What kind of doubt one is: a hosted run gives its warning by it. What
+/// the reader itself doubts is [`Kind::Unread`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kind<'a> {
+    /// Something could not be read.
+    Unread,
+    /// The hub of this name has no lock.
+    Unpinned(&'a str),
+    /// A `maven.override` may put another target in the jar's place.
+    Overridden,
+}
+
 /// Whether Bazel builds an artifact through a hub of the workspace.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Built<'a> {
@@ -245,7 +366,80 @@ pub enum Built<'a> {
     /// It is not known. No hub that was read fetches its jar and this
     /// could not be read, or one does and this `maven.override` may put
     /// another target in the jar's place.
-    Unknown(&'a Doubt),
+    Unknown(&'a Doubt, Kind<'a>),
+}
+
+/// What the root module says of the release of the ruleset that Bazel
+/// builds with. Bazel takes an override from the root module alone, and
+/// before any `bazel_dep` (`applyOverrides`: InterimModule.java at 7.4.0,
+/// Discovery.java lines 158 and 159 at 7.7.2, 178 and 179 at 8.8.2 and
+/// 9.3.2).
+#[derive(Debug, PartialEq, Eq)]
+enum Asked {
+    /// No version is given.
+    Nothing,
+    /// A `bazel_dep` asks for this release: Bazel selects it or a newer
+    /// one that another module asks for.
+    AtLeast(String),
+    /// A `single_version_override` pins this release, whatever is asked.
+    Exactly(String),
+    /// An override takes the ruleset from no registry (`archive_override`,
+    /// `git_override`, `local_path_override`), keeps more than one release
+    /// of it (`multiple_version_override`) or pins a version that is no
+    /// string: where it is, for a warning.
+    Unknown(String),
+}
+
+/// A version of a Bazel module in the order Bazel has for them
+/// (`Version.java` of `bazel/bzlmod`, the same order at 7.4.0, 7.7.2,
+/// 8.8.2 and 9.3.2): by the identifiers between the dots of its release,
+/// a number before a word and by its value; a release before a longer one
+/// that starts with it; a prerelease before its release; and nothing of
+/// what follows a `+`.
+fn ordered(version: &str) -> impl Ord + '_ {
+    fn identifiers(part: &str) -> Vec<(bool, u64, &str)> {
+        let parts = part.split('.').filter(|id| !id.is_empty());
+        let identifier = |id| match str::parse::<u64>(id) {
+            Ok(number) => (false, number, id),
+            Err(_) => (true, 0, id),
+        };
+        parts.map(identifier).collect()
+    }
+    let version = version.split('+').next().unwrap_or(version);
+    let (release, pre) = version.split_once('-').unwrap_or((version, ""));
+    (identifiers(release), pre.is_empty(), identifiers(pre))
+}
+
+/// What the root module of `ws` says of the ruleset's release: by its
+/// calls that name the ruleset, a `bazel_dep` and the overrides, which are
+/// the functions whose name ends in `_override`.
+fn asked(ws: &Workspace) -> Asked {
+    let named = Some(&Value::Str(EXTENSION.module.to_string()));
+    let names = |call: &&Call| {
+        call.bind.is_none() && [call.arg("name"), call.arg("module_name")].contains(&named)
+    };
+    let mut calls = Vec::new();
+    for (file, read) in &ws.files {
+        calls.extend(read.calls.iter().filter(names).map(|call| (file, call)));
+    }
+    let version = |callee: &str| {
+        let call = calls.iter().find(|(_, call)| call.callee == callee);
+        call.and_then(|(_, call)| call.arg("version"))
+    };
+    let pin = "single_version_override";
+    let unknown = |(_, call): &&(&String, &Call)| {
+        let read = matches!(call.arg("version"), None | Some(Value::Str(_)));
+        call.callee.ends_with("_override") && (call.callee != pin || !read)
+    };
+    if let Some((file, call)) = calls.iter().find(unknown) {
+        let at = format!("{file}:{}: with this `{}`", call.line, call.callee);
+        return Asked::Unknown(at);
+    }
+    match (version(pin), version("bazel_dep")) {
+        (Some(Value::Str(pinned)), _) if !pinned.is_empty() => Asked::Exactly(pinned.clone()),
+        (_, Some(Value::Str(least))) if !least.is_empty() => Asked::AtLeast(least.clone()),
+        _ => Asked::Nothing,
+    }
 }
 
 /// What the hubs of a workspace build: read once, asked per artifact.
@@ -259,6 +453,15 @@ pub struct Hubs {
     overrides: Vec<(Option<String>, Doubt)>,
     /// The first thing that could not be read.
     doubt: Option<Doubt>,
+    /// The hub whose missing lock that doubt is, when it is one.
+    lockless: Option<String>,
+    /// The patches of the block in the root `MODULE.bazel`. None when the
+    /// block was changed by hand, which is a doubt.
+    pub block: Vec<Patch>,
+    /// The line of a block that was changed by hand.
+    edited: Option<usize>,
+    /// What the root says of the release of the ruleset.
+    asked: Asked,
 }
 
 impl Hubs {
@@ -269,8 +472,38 @@ impl Hubs {
     /// `maven_install` or cannot be read while Bazel may read it (the
     /// workspace names no release, or one before 9) are doubts.
     pub fn read(view: &dyn Fn(&str) -> Entry, locks: &dyn Fn(&str) -> Entry) -> Hubs {
+        // The block is socket-patch's own: the workspace is read without
+        // it, as the user wrote it, and with every line where it was. A
+        // block that was changed by hand is read like any other text.
+        let (mut block, mut edited, mut hidden) = (Vec::new(), None, None);
+        if let Entry::Text(module) = view(FILE) {
+            match find(&module) {
+                Block::None => {}
+                Block::Edited(line) => edited = Some(line),
+                Block::Ours(at, _, patches) => {
+                    let lines = "\n".repeat(module[at.clone()].matches('\n').count());
+                    let (head, tail) = (&module[..at.start], &module[at.end..]);
+                    hidden = Some(format!("{head}{lines}{tail}"));
+                    block = patches;
+                }
+            }
+        }
+        let view = |path: &str| match &hidden {
+            Some(module) if path == FILE => Entry::Text(module.clone()),
+            _ => view(path),
+        };
+        let view: &dyn Fn(&str) -> Entry = &view;
         let ws = Workspace::read(view);
         let (hubs, mut doubts) = hubs(&ws);
+        doubts.splice(
+            0..0,
+            edited.map(|line| Doubt {
+                file: FILE.to_string(),
+                line,
+                why: "the block that socket-patch keeps there was changed by hand".to_string(),
+            }),
+        );
+        let asked = asked(&ws);
         let overrides = ws.tags(&EXTENSION, "override").calls.into_iter();
         let overrides = overrides.map(|Tag { file, call, .. }| {
             let (replaced, why) = match call.arg("coordinates") {
@@ -281,7 +514,7 @@ impl Hubs {
             (replaced, Doubt { file, line, why })
         });
         let overrides = overrides.collect();
-        let mut pinned = Vec::new();
+        let (mut pinned, mut lockless) = (Vec::new(), None);
         for hub in hubs {
             // Where a doubt about its lock is: the lock, or the tag.
             let (file, line) = match &hub.lock {
@@ -289,14 +522,18 @@ impl Hubs {
                 None => (hub.file.clone(), hub.line),
             };
             let lock = match hub.lock.as_deref().map(locks) {
-                None => Err(format!("hub \"{}\" has no `lock_file`", hub.name)),
+                None => Err(format!("hub \"{}\" {NO_LOCK}", hub.name)),
                 Some(Entry::Text(text)) => Lock::parse(&text),
                 Some(Entry::Absent) => Err("it does not exist".to_string()),
                 Some(Entry::Unreadable(why)) => Err(format!("it cannot be read: {why}")),
             };
             match lock {
                 Ok(lock) => pinned.push((hub, lock)),
-                Err(why) => doubts.push(Doubt { file, line, why }),
+                Err(why) => {
+                    let first = hub.lock.is_none() && doubts.is_empty();
+                    lockless = lockless.or(first.then(|| hub.name.clone()));
+                    doubts.push(Doubt { file, line, why });
+                }
             }
         }
         let before_9 = || declared_release(view).is_none_or(|release| release < (9, 0, 0));
@@ -324,6 +561,10 @@ impl Hubs {
             pinned,
             overrides,
             doubt: doubts.into_iter().next(),
+            lockless,
+            block,
+            edited,
+            asked,
         }
     }
 
@@ -340,11 +581,704 @@ impl Hubs {
         let named = Some(target(&format!("{group}:{artifact}")));
         let over = |(of, _): &&(Option<String>, Doubt)| of.is_none() || *of == named;
         match self.overrides.iter().find(over) {
-            _ if by.is_empty() => self.doubt.as_ref().map_or(Built::No, Built::Unknown),
-            Some((_, tag)) => Built::Unknown(tag),
+            _ if by.is_empty() => self
+                .doubt()
+                .map_or(Built::No, |(doubt, kind)| Built::Unknown(doubt, kind)),
+            Some((Some(_), tag)) => Built::Unknown(tag, Kind::Overridden),
+            Some((None, tag)) => Built::Unknown(tag, Kind::Unread),
             None => Built::Yes(by),
         }
     }
+
+    /// The first thing that could not be read, and its kind.
+    fn doubt(&self) -> Option<(&Doubt, Kind<'_>)> {
+        let unpinned = self.lockless.as_deref().map(Kind::Unpinned);
+        Some((self.doubt.as_ref()?, unpinned.unwrap_or(Kind::Unread)))
+    }
+
+    /// [`Hubs::built`] for a run that writes an entry or trusts one: not
+    /// known either beside a hub that fetches the jar, when anything was
+    /// not read. That may be another hub that builds the upstream one.
+    fn sure(&self, group: &str, artifact: &str, version: &str) -> Built<'_> {
+        match (self.built(group, artifact, version), self.doubt()) {
+            (Built::Yes(_), Some((doubt, kind))) => Built::Unknown(doubt, kind),
+            (built, _) => built,
+        }
+    }
+}
+
+/// One patch in the block: the jar that takes the place of the one a hub
+/// fetches for `group:artifact` at `version`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Patch {
+    pub group: String,
+    pub artifact: String,
+    pub version: String,
+    pub uuid: String,
+    /// The sha256 of the patched jar, which Bazel checks its download by.
+    pub sha256: String,
+    pub url: String,
+}
+
+impl Patch {
+    pub fn purl(&self) -> String {
+        let (group, artifact) = (&self.group, &self.artifact);
+        format!("pkg:maven/{group}/{artifact}@{}", self.version)
+    }
+
+    fn repository(&self) -> String {
+        repository_name(&self.group, &self.artifact, &self.version).unwrap_or_default()
+    }
+}
+
+/// The name of the repository through which a hub fetches the jar of
+/// `group:artifact` at `version`, on every release of [`RULESETS`]: the
+/// three joined by `_`, with `_` for each `.` and `-`. `None` for a
+/// coordinate with any character but letters, digits, `.`, `_` and `-`:
+/// the ruleset's two functions agree, and were read, for those alone.
+pub fn repository_name(group: &str, artifact: &str, version: &str) -> Option<String> {
+    let plain = |b: u8| b.is_ascii_alphanumeric() || b"._-".contains(&b);
+    let parts = [group, artifact, version];
+    let named = |part: &&str| !part.is_empty() && part.bytes().all(plain);
+    let named = parts.iter().all(named);
+    named.then(|| parts.join("_").replace(['.', '-'], "_"))
+}
+
+/// The block for `patches` under the label of the hub's `use_extension`,
+/// from [`BEGIN`] to [`END`], with a line feed between its lines: the
+/// patches by the name of their repository, each with an `override_repo`
+/// of its own, so that Bazel names the line of the one entry whose jar
+/// the hub's lock no longer pins. `bazel mod tidy` keeps this text.
+fn render(label: &str, patches: &[Patch]) -> String {
+    let entry = |patch: &Patch| {
+        let (group, artifact, version) = (&patch.group, &patch.artifact, &patch.version);
+        let (name, purl, uuid) = (patch.repository(), patch.purl(), &patch.uuid);
+        let (sha256, url) = (&patch.sha256, &patch.url);
+        let file = artifact_path(group, artifact, version, None, "jar");
+        format!(
+            "# {purl}, Socket patch {uuid}\n\
+             socket_patch_http_file(\n    \
+             name = \"socket_patch_{name}\",\n    \
+             downloaded_file_path = \"v1/{file}\",\n    \
+             sha256 = \"{sha256}\",\n    \
+             urls = [\"{url}\"],\n)\n\n\
+             # If Bazel stops at the next line (\"does not generate repository\"), the hub's \
+             lock no longer pins\n\
+             # {group}:{artifact} at {version}: run `socket-patch rollback {purl}`.\n\
+             # Do not change it to inject_repo(): the build would pass without the patch.\n\
+             override_repo(\n    socket_patch_maven,\n    \
+             {name} = \"socket_patch_{name}\",\n)\n"
+        )
+    };
+    let mut patches: Vec<&Patch> = patches.iter().collect();
+    patches.sort_by_key(|patch| patch.repository());
+    let entries: Vec<String> = patches.into_iter().map(entry).collect();
+    format!(
+        "{BEGIN}\nsocket_patch_http_file = use_repo_rule(\
+         \"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_file\")\n\n\
+         socket_patch_maven = use_extension(\"{label}\", \"maven\")\n\n{}{END}",
+        entries.join("\n")
+    )
+}
+
+/// The label and the patches that the lines of a block name, when each
+/// patch has every field.
+fn parse(body: &str) -> Option<(String, Vec<Patch>)> {
+    let lines: Vec<&str> = body.lines().collect();
+    let between = |line: &str, open: &str, close: &str| {
+        Some(line.strip_prefix(open)?.strip_suffix(close)?.to_string())
+    };
+    let proxy = ("socket_patch_maven = use_extension(\"", "\", \"maven\")");
+    let label = lines
+        .iter()
+        .find_map(|line| between(line, proxy.0, proxy.1))?;
+    let mut patches = Vec::new();
+    for (at, line) in lines.iter().enumerate() {
+        let Some(named) = line.strip_prefix("# pkg:maven/") else {
+            continue;
+        };
+        let (coordinates, uuid) = named.split_once(", Socket patch ")?;
+        let (name, version) = coordinates.rsplit_once('@')?;
+        let (group, artifact) = name.split_once('/')?;
+        let field = |open: &str, close: &str| {
+            let below = lines.get(at + 1..)?.iter().take(6);
+            below.copied().find_map(|line| between(line, open, close))
+        };
+        patches.push(Patch {
+            group: group.to_string(),
+            artifact: artifact.to_string(),
+            version: version.to_string(),
+            uuid: uuid.to_string(),
+            sha256: field("    sha256 = \"", "\",")?,
+            url: field("    urls = [\"", "\"],")?,
+        });
+    }
+    Some((label, patches))
+}
+
+/// What a `MODULE.bazel` holds of the block.
+#[derive(Debug, PartialEq, Eq)]
+enum Block {
+    None,
+    /// The block as socket-patch writes it: where it is, from the first
+    /// byte of [`BEGIN`] to the last of [`END`], its label and its patches.
+    Ours(Range<usize>, String, Vec<Patch>),
+    /// A block that is not what socket-patch writes for the patches it
+    /// names: the line of its [`BEGIN`].
+    Edited(usize),
+}
+
+/// Whether `line` is the first line of a block, as it is written or
+/// touched (a blank after it, another end): [`BEGIN`] up to its bracket.
+/// A file without such a line holds no block.
+pub fn begins(line: &str) -> bool {
+    let mark = BEGIN.split(" (").next().unwrap_or(BEGIN);
+    line.trim_start().starts_with(mark)
+}
+
+fn find(text: &str) -> Block {
+    let (mut at, mut begin, mut end) = (0, None, None);
+    for (line, whole) in text.split_inclusive('\n').enumerate() {
+        let bare = whole.strip_suffix('\n').unwrap_or(whole);
+        let bare = bare.strip_suffix('\r').unwrap_or(bare);
+        match (bare, begin, end) {
+            (BEGIN, None, _) => begin = Some((at, line + 1)),
+            // A second first line, or one that is not as it is written.
+            _ if begins(bare) => {
+                return Block::Edited(begin.map_or(line + 1, |(_, first)| first));
+            }
+            (END, Some(_), None) => end = Some(at + bare.len()),
+            _ => {}
+        }
+        at += whole.len();
+    }
+    let Some((start, line)) = begin else {
+        return Block::None;
+    };
+    // In the line break of its own lines, whatever the rest of a file
+    // with both has.
+    let ours = end.and_then(|end| {
+        let (label, entries) = parse(&text[start..end])?;
+        let written = render(&label, &entries).replace('\n', terminator(&text[start..end]));
+        (written == text[start..end]).then_some((start..end, label, entries))
+    });
+    ours.map_or(Block::Edited(line), |(at, label, patches)| {
+        Block::Ours(at, label, patches)
+    })
+}
+
+/// `module` with `patch` in its block, in the place of any patch for the
+/// same repository: in the block that is there, in the line break of its
+/// lines, or in a new one at the end of the file, after one blank line,
+/// in the line break of the file ([`terminator`]: the more frequent one
+/// of a file with both). A file whose last line has no line break gets a
+/// block without one, so that [`without`] can tell. `None` when the block
+/// that is there was changed by hand.
+fn with_patch(module: &str, label: &str, patch: Patch) -> Option<String> {
+    let (at, mut patches) = match find(module) {
+        Block::Edited(_) => return None,
+        Block::None => (None, Vec::new()),
+        Block::Ours(at, _, patches) => (Some(at), patches),
+    };
+    patches.retain(|other| other.repository() != patch.repository());
+    patches.push(patch);
+    let ended = module.is_empty() || module.ends_with('\n');
+    let eol = terminator(at.as_ref().map_or(module, |at| &module[at.clone()]));
+    let block = render(label, &patches).replace('\n', eol);
+    Some(match at {
+        Some(at) => format!("{}{block}{}", &module[..at.start], &module[at.end..]),
+        None if ended => format!("{module}{eol}{block}{eol}"),
+        None => format!("{module}{eol}{eol}{block}"),
+    })
+}
+
+/// `module` without the patches of its block that `gone` names. With the
+/// last one the block goes, and what [`with_patch`] put before it: the
+/// file is then byte for byte what it was before its first patch. `None`
+/// when the block is not there as socket-patch writes it.
+pub fn without(module: &str, gone: &mut dyn FnMut(&Patch) -> bool) -> Option<String> {
+    let Block::Ours(at, label, mut entries) = find(module) else {
+        return None;
+    };
+    entries.retain(|patch| !gone(patch));
+    let (head, tail) = (&module[..at.start], &module[at.end..]);
+    if !entries.is_empty() {
+        let block = render(&label, &entries).replace('\n', terminator(&module[at]));
+        return Some(format!("{head}{block}{tail}"));
+    }
+    // The line break before the block and, when it ends a blank line, that
+    // line; then the block's own line break or, for a block that ends the
+    // file without one, the one that was added to the last line. A line
+    // break is one of either kind: a file can have both.
+    let cut =
+        |text: &str| text.len() - text.ends_with('\n') as usize - text.ends_with("\r\n") as usize;
+    let blank = |head: &str| cut(head) == 0 || head[..cut(head)].ends_with('\n');
+    let after = tail.strip_prefix('\r').unwrap_or(tail).strip_prefix('\n');
+    let (head, tail) = match after {
+        Some(tail) if blank(head) => (&head[..cut(head)], tail),
+        None if tail.is_empty() && blank(head) => (&head[..cut(&head[..cut(head)])], tail),
+        Some(tail) => (head, tail),
+        None => (head, tail),
+    };
+    Some(format!("{head}{tail}"))
+}
+
+/// What a hosted run does in the root `MODULE.bazel` for one patch.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Verdict {
+    /// Its entry is written, under this label for the block's
+    /// `use_extension`; or nothing is written: the code of the warning,
+    /// and why.
+    pub entry: Result<String, (String, String)>,
+    /// The id of the patch whose entry the block of the root holds for
+    /// the jar of this one, when it holds one.
+    pub held: Option<String>,
+}
+
+/// The verdict for each patch whose jar a hub builds or may build, by the
+/// id of the patch. A patch whose jar no hub builds has none, and neither
+/// has one that is not among the [`jars`] of the run.
+pub type Site = BTreeMap<String, Verdict>;
+
+/// A patch of the plain jar of an artifact: its id, and the group, the
+/// artifact and the version of the jar.
+pub type Jar = (String, String, String, String);
+
+/// A code of this module, and why.
+type Declined = (&'static str, String);
+
+/// What a warning says after the reason, when the block holds no entry
+/// for the jar.
+const KEEPS: &str = "socket-patch wrote nothing to MODULE.bazel for it, so the Bazel build keeps \
+                     the upstream jar";
+
+/// Why no entry is written for a jar that a hub may build.
+fn unknown(doubt: &Doubt, kind: Kind) -> Declined {
+    let Doubt { file, line, why } = doubt;
+    let at = match line {
+        0 => file.clone(),
+        line => format!("{file}:{line}"),
+    };
+    match kind {
+        Kind::Unpinned(hub) => {
+            let why = format!(
+                "{at}: {why}, so Bazel resolves its jars when it builds and none can be \
+                 replaced: give the hub a `lock_file` and pin it (`REPIN=1 bazel run \
+                 @{hub}//:pin`)"
+            );
+            (NOT_PINNED, why)
+        }
+        Kind::Overridden => {
+            let remedy = "patch that target, or remove the override";
+            let why = format!("{at}: {why}, so Bazel would not build a patched jar: {remedy}");
+            (NO_EFFECT, why)
+        }
+        Kind::Unread => {
+            let why = format!(
+                "socket-patch could not tell whether Bazel takes this artifact from a \
+                 rules_jvm_external hub: {at}: {why}"
+            );
+            (UNREADABLE, why)
+        }
+    }
+}
+
+/// What in the rc files of the checkout stands against an entry, for the
+/// Bazel `release` the checkout names, in the order it is read: an option
+/// that leaves the entry without effect ([`NO_EFFECT`]) or its jar out of
+/// reach ([`DOWNLOAD`]), or an rc file that cannot be read
+/// ([`UNREADABLE`]), which may hold either.
+fn rc(view: &dyn Fn(&str) -> Entry, release: Option<super::rc::Release>) -> Vec<Declined> {
+    let flags = [
+        "ignore_dev_dependency",
+        "enable_bzlmod",
+        "downloader_config",
+        "repository_disable_download",
+        "vendor_dir",
+    ];
+    let against = |(file, line, word): (String, usize, String)| {
+        // On or off as Bazel reads a boolean option (`BooleanConverter`
+        // in Converters.java at 7.4.0, 7.7.2, 8.8.2 and 9.3.2): by a `no`
+        // before its name, or by a value, in any case.
+        let (name, value) = word.split_once('=').unwrap_or((&word, ""));
+        let (given, value) = (word.contains('='), value.to_ascii_lowercase());
+        let is = |values: [&str; 5]| values.contains(&&*value);
+        let no = name.starts_with("--no");
+        let on = name.starts_with("--") && !no && (!given || is(["true", "1", "yes", "t", "y"]));
+        let off = (no && !given) || (!no && is(["false", "0", "no", "f", "n"]));
+        let bzlmod = word.contains(flags[1]);
+        let valued = word.contains(flags[2]) || word.contains(flags[4]);
+        // What changes nothing: Bzlmod switched on, which Bazel 9 always
+        // has, and another option switched off. A word that is neither
+        // for certain is taken for the one that does harm.
+        let always = release.is_some_and(|r| r >= (9, 0, 0));
+        if (bzlmod && (on || always)) || (!bzlmod && !valued && off) {
+            return None;
+        }
+        let (code, why) = match (bzlmod, word.contains(flags[0])) {
+            (true, _) => (
+                NO_EFFECT,
+                "which switches off the file an entry is written to",
+            ),
+            (_, true) => (NO_EFFECT, "under which Bazel can drop the tags of a hub"),
+            _ => (
+                DOWNLOAD,
+                "under which Bazel may not download the patched jar from the Socket patch host",
+            ),
+        };
+        Some((code, format!("{file}:{line} names `{word}`, {why}")))
+    };
+    match mentions(view, &flags) {
+        Ok(found) => found.into_iter().filter_map(against).collect(),
+        Err(file) => {
+            let why = format!("the rc file {file} cannot be read, and may switch an entry off");
+            vec![(UNREADABLE, why)]
+        }
+    }
+}
+
+/// What must hold of the workspace at `root` for any entry: the file can
+/// be written, Bazel has `override_repo`, the release of the ruleset is
+/// one of [`RULESETS`], and no rc file switches an entry off.
+fn settings(
+    root: &Path,
+    view: &dyn Fn(&str) -> Entry,
+    locks: &dyn Fn(&str) -> Entry,
+    asked: &Asked,
+) -> Result<(), Declined> {
+    let link = std::fs::symlink_metadata(root.join(FILE)).is_ok_and(|meta| meta.is_symlink());
+    if link {
+        let why = format!("{FILE} is a symbolic link, which socket-patch does not write through");
+        return Err((UNREADABLE, why));
+    }
+    let lock = match locks("MODULE.bazel.lock") {
+        Entry::Text(lock) => ModuleLock::parse(&lock),
+        _ => ModuleLock::default(),
+    };
+    let release = declared_release(view);
+    match release {
+        Some((major, minor, patch)) if (major, minor, patch) < (7, 4, 0) => {
+            let why = format!(
+                "the checkout names Bazel {major}.{minor}.{patch} (`.bazeliskrc` or \
+                 `.bazelversion`), and an entry needs `override_repo`, which Bazel has from 7.4.0"
+            );
+            return Err((RELEASE, why));
+        }
+        None if lock.version.is_none_or(|version| version < 13) => {
+            let why = "no file of the checkout says that Bazel 7.4.0 or later builds it, and an \
+                       older Bazel fails on the `override_repo` an entry needs: name the release \
+                       in `.bazelversion`";
+            return Err((RELEASE, why.to_string()));
+        }
+        _ => {}
+    }
+    // A lock that holds another release than the root now takes is one
+    // that Bazel has not written since: older than what is asked for, or
+    // any other than the one a `single_version_override` pins.
+    let module = EXTENSION.module;
+    let stale = |selected: &str| match asked {
+        Asked::Exactly(pinned) => ordered(pinned) != ordered(selected),
+        Asked::AtLeast(least) => ordered(least) > ordered(selected),
+        Asked::Nothing | Asked::Unknown(_) => false,
+    };
+    let wanted = match asked {
+        Asked::Exactly(wanted) | Asked::AtLeast(wanted) => wanted.as_str(),
+        Asked::Nothing | Asked::Unknown(_) => "",
+    };
+    let why = match (asked, &lock.selected(module)[..]) {
+        (Asked::Unknown(at), _) => format!(
+            "{at} of {module} socket-patch cannot tell which release of the ruleset Bazel \
+             builds with, and the name of a jar's repository depends on it"
+        ),
+        (_, [selected]) if !RULESETS.contains(selected) => format!(
+            "Bazel selected {module} {selected}, and how the ruleset names the repository of a \
+             jar is known for its releases 6.4 to 7.2: update socket-patch"
+        ),
+        (_, [selected]) if stale(selected) => format!(
+            "{FILE} asks for {module} {wanted} and MODULE.bazel.lock holds {selected}: build once \
+             so that Bazel updates its lock"
+        ),
+        (_, [_]) => return rc(view, release).into_iter().next().map_or(Ok(()), Err),
+        _ => format!(
+            "MODULE.bazel.lock does not say which release of {module} Bazel selected, and the \
+             name of a jar's repository depends on it: build once so that Bazel writes its lock"
+        ),
+    };
+    Err((RELEASE, why))
+}
+
+impl Hubs {
+    /// The label for the block of the jar of `group:artifact` at
+    /// `version`, which a pinned hub fetches, or why no entry for it can
+    /// be written.
+    fn label(&self, group: &str, artifact: &str, version: &str) -> Result<String, Declined> {
+        let (key, mut label) = (format!("{group}:{artifact}"), None);
+        if repository_name(group, artifact, version).is_none() {
+            let why = format!(
+                "the repository a hub fetches {key}:{version} through has a name socket-patch \
+                 knows only for coordinates of letters, digits, `.`, `_` and `-`"
+            );
+            return Err((ARTIFACT, why));
+        }
+        let fetches = |lock: &Lock| {
+            let jar = lock.plain_jar(group, artifact);
+            jar.is_some_and(|jar| jar.fetched && jar.version == version)
+        };
+        for (hub, lock) in self.pinned.iter().filter(|(_, lock)| fetches(lock)) {
+            let from = hub.lock.as_deref().unwrap_or_default();
+            if !lock.listed.contains(&key) {
+                let why = format!(
+                    "{from} lists no repository for {key}: the hub takes the jar from the Maven \
+                     local repository, and on a machine without it there is no repository for \
+                     an entry to replace"
+                );
+                return Err((ARTIFACT, why));
+            }
+            let Some(proxy) = &hub.proxy else {
+                let why = format!(
+                    "{}:{}: a tag of hub \"{}\" is called on a `use_extension` that is isolated \
+                     or cannot be read, which no `override_repo` of another usage reaches",
+                    hub.file, hub.line, hub.name
+                );
+                return Err((UNREADABLE, why));
+            };
+            label.get_or_insert_with(|| proxy.clone());
+        }
+        label.ok_or_else(|| (UNREADABLE, format!("no hub that fetches {key} was read")))
+    }
+}
+
+/// Whether the Maven purl names the jar a lock names by group and
+/// artifact alone: one without a classifier, of no other packaging.
+fn plain(purl: &str) -> bool {
+    !is_variant(
+        purl_qualifier(purl, "type"),
+        purl_qualifier(purl, "classifier"),
+    )
+}
+
+/// The plain jars among the patches of a hosted run, each given by its
+/// purl and its grant, under the group and the artifact the pom lane pins
+/// ([`maven_coordinates`]). A patch of a jar with a classifier, or of
+/// another packaging, is none: [`site`] has no verdict for it, so
+/// [`rewrite`] writes no entry for it and the hub confirms nothing of it,
+/// whatever patch of the plain jar runs beside it.
+pub fn jars<'a>(patches: impl Iterator<Item = (&'a str, &'a DepOverride)>) -> Vec<Jar> {
+    let jar = |(purl, dep): (&str, &DepOverride)| {
+        let (_, group, artifact) = maven_coordinates(dep);
+        let jar = (dep.patch_uuid.clone(), group, artifact, dep.version.clone());
+        (dep.ecosystem == "maven" && plain(purl)).then_some(jar)
+    };
+    patches.filter_map(jar).collect()
+}
+
+/// What a hosted run in `project` may write for each of `jars`: read once
+/// per run from the checkout. `module` is the text of the project's own
+/// `MODULE.bazel` as the run has it, when it has read it. Empty for a
+/// project in no Bazel workspace and when no hub builds, or may build,
+/// any of the jars: nothing changes for such a run. An entry is written
+/// only when nothing of the workspace's hubs is in doubt: a hub without a
+/// lock, or one that could not be read, may build the upstream jar beside
+/// the hub that would get the patched one. A project below the root gets
+/// no entry: the root is read all the same, for what its block holds.
+pub fn site(project: &Path, module: Option<&str>, jars: &[Jar]) -> Site {
+    let mut site = Site::new();
+    let Some(root) = super::bazel_root(project) else {
+        return site;
+    };
+    let at_root = root.project.as_os_str().is_empty();
+    let on_disk = disk(&root.dir);
+    let view = |path: &str| match module {
+        Some(module) if at_root && path == FILE => Entry::Text(module.to_string()),
+        _ => on_disk(path),
+    };
+    let locks = disk_up_to(&root.dir, MAX_LOCK);
+    let hubs = Hubs::read(&view, &locks);
+    // What holds for every jar is asked once, and only for a jar a hub builds.
+    let mut workspace = None;
+    for (uuid, group, artifact, version) in jars {
+        let entry = match hubs.sure(group, artifact, version) {
+            Built::No => continue,
+            Built::Unknown(doubt, kind) => Err(unknown(doubt, kind)),
+            Built::Yes(_) if !at_root => {
+                let why = format!(
+                    "a hub of the Bazel workspace at {} builds this artifact, and this project \
+                     is not its root, where the patch of a hub is written: run the command there",
+                    root.dir.display()
+                );
+                Err((NOT_AT_ROOT, why))
+            }
+            Built::Yes(_) => hubs.label(group, artifact, version).and_then(|label| {
+                let all = workspace
+                    .get_or_insert_with(|| settings(&root.dir, &view, &locks, &hubs.asked));
+                all.clone().map(|()| label)
+            }),
+        };
+        let jar = |patch: &&Patch| {
+            (&patch.group, &patch.artifact, &patch.version) == (group, artifact, version)
+        };
+        let verdict = Verdict {
+            entry: entry.map_err(|(code, why)| (code.to_string(), why)),
+            held: hubs.block.iter().find(jar).map(|patch| patch.uuid.clone()),
+        };
+        site.insert(uuid.clone(), verdict);
+    }
+    site
+}
+
+/// The [`Site`] among the candidate files of a hosted run: empty without
+/// one. The pom lane asks it which patches a hub decides, and says "no
+/// pom.xml" of the others alone.
+pub fn handed(files: &BTreeMap<String, String>) -> Site {
+    let site = files.get(SITE_KEY).map(|site| serde_json::from_str(site));
+    site.and_then(Result::ok).unwrap_or_default()
+}
+
+/// The hosted lane for the hubs of a Bazel workspace, after the pom lane:
+/// for each patch of `overrides` that the [`Site`] among `files` has a
+/// verdict for, its entry in the block of `MODULE.bazel`, or the warning
+/// that says why there is none and what the block holds for the jar. A
+/// patch whose entry is in the block, written now or before, is
+/// confirmed. Without a site nothing is done.
+pub fn rewrite(
+    files: &BTreeMap<String, String>,
+    overrides: &[DepOverride],
+    result: &mut RewriteResult,
+) {
+    let site = handed(files);
+    let mut module = files.get(FILE).cloned();
+    // The file of the block: not the project's own below the Bazel root.
+    let file = match module {
+        Some(_) => FILE.to_string(),
+        None => format!("the {FILE} at the root"),
+    };
+    for dep in overrides {
+        let Some(verdict) = site.get(&dep.patch_uuid) else {
+            continue;
+        };
+        let (maven2, group, artifact) = maven_coordinates(dep);
+        let purl = format!("pkg:maven/{group}/{artifact}@{}", dep.version);
+        let written = verdict.entry.clone().and_then(|label| {
+            let incomplete = |what: &str| (ARTIFACT.to_string(), what.to_string());
+            let suffixed = maven2.and_then(|ov| ov.identifiers.maven_suffixed_version.as_deref());
+            let sha256 = dep.integrity.sha256.as_deref().map(bare_sha256_hex);
+            let sha256 = sha256.filter(|sum| is_hex64_lower(sum));
+            let (Some(ov), Some(suffixed), Some(sha256)) = (maven2, suffixed, sha256) else {
+                let what = "the patch comes without the version its jar is served under, or \
+                            without the jar's sha256";
+                return Err(incomplete(what));
+            };
+            let file = artifact_path(&group, &artifact, suffixed, None, "jar");
+            let url = format!("{}/{file}", ov.index_url.trim_end_matches('/'));
+            let quoted = |b: u8| !b.is_ascii_graphic() || b == b'"' || b == b'\\';
+            if url.bytes().chain(dep.patch_uuid.bytes()).any(quoted) {
+                return Err(incomplete(
+                    "the URL of the patched jar cannot stand in a string",
+                ));
+            }
+            let patch = Patch {
+                group: group.clone(),
+                artifact: artifact.clone(),
+                version: dep.version.clone(),
+                uuid: dep.patch_uuid.clone(),
+                sha256,
+                url,
+            };
+            let module = module
+                .as_deref()
+                .and_then(|module| with_patch(module, &label, patch));
+            module.ok_or_else(|| incomplete("the block there cannot be written to"))
+        });
+        let (code, why) = match written {
+            Ok(text) => {
+                module = Some(text);
+                result
+                    .confirmed_bazel_maven_uuids
+                    .insert(dep.patch_uuid.clone());
+                continue;
+            }
+            Err(declined) => declined,
+        };
+        // What the Bazel build has of the jar: nothing of socket-patch's,
+        // the entry of this patch from an earlier run, which is still its
+        // pin, or the entry of another patch, which is not this run's to
+        // take out. An entry that the reason of the decline leaves without
+        // effect is no pin: the patch is not reported as applied for it.
+        let ends = match verdict.held.as_deref() {
+            None => KEEPS.to_string(),
+            Some(held) if held == dep.patch_uuid && code == NO_EFFECT => format!(
+                "socket-patch left the entry that {file} holds for it as it is, and while that \
+                 stands the entry has no effect: the Bazel build keeps the upstream jar"
+            ),
+            Some(held) if held == dep.patch_uuid => {
+                let uuid = dep.patch_uuid.clone();
+                result.confirmed_bazel_maven_uuids.insert(uuid);
+                format!("socket-patch left the entry that {file} holds for it as it is")
+            }
+            Some(held) => format!(
+                "socket-patch wrote nothing to {file} for it: the entry of patch {held} remains \
+                 there, and where the block is in effect the Bazel build takes that patch's jar"
+            ),
+        };
+        let detail = format!("{purl}: {why}. {ends}");
+        result.warnings.push(RewriteWarning { code, detail });
+    }
+    if let Some(module) = module.filter(|module| Some(module) != files.get(FILE)) {
+        result.files.insert(FILE.to_string(), module);
+    }
+}
+
+/// A patch of the block, as lockfile discovery reads it.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Pin {
+    pub patch: Patch,
+    /// Why a Bazel build may pass without the jar of this entry: no pinned
+    /// hub fetches the artifact at that version any more (Bazel then
+    /// stops at the entry), it cannot be read whether one does, or an rc
+    /// file switches the entry off, or cannot be read and so may. `None`:
+    /// a build takes the patched jar, or fails.
+    pub unbuilt: Option<String>,
+}
+
+/// The patches in the block of `module`, the text of the `MODULE.bazel`
+/// at the Bazel root `root`, or why the block is no record of any: it was
+/// changed by hand.
+pub fn pins(root: &Path, module: &str) -> Result<Vec<Pin>, String> {
+    let on_disk = disk(root);
+    let view = |path: &str| match path {
+        FILE => Entry::Text(module.to_string()),
+        _ => on_disk(path),
+    };
+    let hubs = Hubs::read(&view, &disk_up_to(root, MAX_LOCK));
+    if let Some(line) = hubs.edited {
+        return Err(format!(
+            "{FILE}:{line}: the block that socket-patch keeps there was changed by hand"
+        ));
+    }
+    // Everything the rc files hold is read: an option under which a
+    // download may fail leaves a build that takes the patched jar or
+    // fails, and the first of the others is why an entry is not built.
+    let against = rc(&view, declared_release(&view)).into_iter();
+    let off = { against }.find_map(|(code, why)| (code != DOWNLOAD).then_some(why));
+    let pin = |patch: &Patch| {
+        let Patch {
+            group,
+            artifact,
+            version,
+            ..
+        } = patch;
+        let unbuilt = match hubs.sure(group, artifact, version) {
+            Built::Yes(_) => off.clone(),
+            Built::Unknown(doubt, kind) => Some(unknown(doubt, kind).1),
+            Built::No => Some(format!(
+                "no pinned hub takes {group}:{artifact} at {version} any more, so Bazel stops \
+                 at its entry"
+            )),
+        };
+        let patch = patch.clone();
+        Pin { patch, unbuilt }
+    };
+    Ok(hubs.block.iter().map(pin).collect())
 }
 
 /// The warnings for the patches `purls` of a command that ran in
@@ -360,15 +1294,7 @@ pub async fn notices(project: &Path, purls: Vec<String>) -> Vec<(&'static str, S
 fn notices_blocking(project: &Path, mut purls: Vec<String>) -> Vec<(&'static str, String)> {
     purls.sort();
     purls.dedup();
-    // A classifier or another packaging is not the jar that a lock names
-    // by group and artifact alone.
-    let jar = |purl| {
-        let variant = is_variant(
-            purl_qualifier(purl, "type"),
-            purl_qualifier(purl, "classifier"),
-        );
-        Some((purl, parse_maven_purl(purl).filter(|_| !variant)?))
-    };
+    let jar = |purl| Some((purl, parse_maven_purl(purl).filter(|_| plain(purl))?));
     let jars: Vec<_> = purls.iter().map(String::as_str).filter_map(jar).collect();
     let root = (!jars.is_empty()).then(|| super::bazel_root(project));
     let Some(root) = root.flatten() else {
@@ -377,8 +1303,13 @@ fn notices_blocking(project: &Path, mut purls: Vec<String>) -> Vec<(&'static str
     let hubs = Hubs::read(&disk(&root.dir), &disk_up_to(&root.dir, MAX_LOCK));
     let mut said = Vec::new();
     for (purl, (group, artifact, version)) in jars {
+        let in_block = |patch: &Patch| {
+            (&*patch.group, &*patch.artifact, &*patch.version) == (&*group, &*artifact, &*version)
+        };
         let (code, detail) = match hubs.built(&group, &artifact, &version) {
             Built::No => continue,
+            // Bazel takes the jar of the block's entry.
+            Built::Yes(_) if hubs.block.iter().any(in_block) => continue,
             Built::Yes(by) => {
                 let from = |(hub, _): &(&Hub, &Pinned)| {
                     let (lock, name) = (hub.lock.as_deref().unwrap_or_default(), &hub.name);
@@ -387,14 +1318,15 @@ fn notices_blocking(project: &Path, mut purls: Vec<String>) -> Vec<(&'static str
                 };
                 let from = by.iter().map(from).collect::<Vec<_>>().join(" and ");
                 let detail = format!(
-                    "Bazel takes this artifact from {from}, which pins the upstream jar. \
-                     socket-patch does not patch a rules_jvm_external hub yet, so the Bazel \
-                     build stays unpatched whatever this command did for another build of the \
-                     checkout"
+                    "Bazel takes this artifact from {from}, which pins the upstream jar, and \
+                     this command does not patch a rules_jvm_external hub: the Bazel build \
+                     stays unpatched whatever it did for another build of the checkout. \
+                     `socket-patch get {purl} --mode hosted` at the Bazel root patches a \
+                     pinned hub"
                 );
                 (HUB_UNPATCHED, detail)
             }
-            Built::Unknown(Doubt { file, line, why }) => {
+            Built::Unknown(Doubt { file, line, why }, _) => {
                 let at = match line {
                     0 => file.clone(),
                     line => format!("{file}:{line}"),
@@ -412,8 +1344,18 @@ fn notices_blocking(project: &Path, mut purls: Vec<String>) -> Vec<(&'static str
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    /// For the tests of what reads the block elsewhere: the `MODULE.bazel`
+    /// of a checkout whose pinned hub fetches netty's jar, the lock of
+    /// that hub, and the same `MODULE.bazel` with the block for a patch
+    /// `uuid` of that jar.
+    pub(crate) fn sample(uuid: &str) -> [String; 3] {
+        let patch = patch("netty-tcnative-classes", uuid);
+        let ours = with_patch(PINNED, LABEL, patch).expect("a block");
+        [PINNED.to_string(), lock_72(), ours]
+    }
 
     /// A pinned hub, as teams write one.
     const PINNED: &str = r#"bazel_dep(name = "rules_jvm_external", version = "7.2")
@@ -546,7 +1488,7 @@ use_repo(maven, "maven")
         let said = match hubs.built("io.netty", "netty-tcnative-classes", "2.0.61.Final") {
             Built::No => "no".to_string(),
             Built::Yes(by) => format!("yes, {}", by.len()),
-            Built::Unknown(doubt) => format!("{}:{}: {}", doubt.file, doubt.line, doubt.why),
+            Built::Unknown(doubt, _) => format!("{}:{}: {}", doubt.file, doubt.line, doubt.why),
         };
         said
     }
@@ -1027,7 +1969,7 @@ jvm.artifact(group = "com.example", artifact = "a", version = "1")
         let files = [("MODULE.bazel", PINNED)];
         let unreadable = |_: &str| Entry::Unreadable("it is larger than 16 MiB".to_string());
         let hubs = Hubs::read(&view(&files), &unreadable);
-        let Built::Unknown(doubt) =
+        let Built::Unknown(doubt, Kind::Unread) =
             hubs.built("io.netty", "netty-tcnative-classes", "2.0.61.Final")
         else {
             panic!("read");
@@ -1126,9 +2068,10 @@ jvm.artifact(group = "com.example", artifact = "a", version = "1")
         let said = notices_blocking(dir.path(), asked);
         let detail = format!(
             "{NETTY_PURL}: Bazel takes this artifact from maven_install.json (hub \"maven\", \
-             `maven.install` at MODULE.bazel:4), which pins the upstream jar. socket-patch does \
-             not patch a rules_jvm_external hub yet, so the Bazel build stays unpatched whatever \
-             this command did for another build of the checkout"
+             `maven.install` at MODULE.bazel:4), which pins the upstream jar, and this command \
+             does not patch a rules_jvm_external hub: the Bazel build stays unpatched whatever \
+             it did for another build of the checkout. `socket-patch get {NETTY_PURL} --mode \
+             hosted` at the Bazel root patches a pinned hub"
         );
         assert_eq!(said, [(HUB_UNPATCHED, detail.clone())]);
         // The same for a project below the Bazel root of its checkout.
@@ -1227,5 +2170,1230 @@ jvm.artifact(group = "com.example", artifact = "a", version = "1")
         let others = others.map(String::from).to_vec();
         assert_eq!(notices_blocking(broken.path(), others), []);
         assert_eq!(notices_blocking(broken.path(), Vec::new()), []);
+    }
+
+    // The block, and what a hosted run writes of it.
+
+    const NETTY_UUID: &str = "0e77a000-0000-4000-8000-0000000000a1";
+    const OTHER_UUID: &str = "0e77a000-0000-4000-8000-0000000000b2";
+
+    /// A patch of `io.netty:<artifact>` at the version of the locks.
+    fn patch(artifact: &str, uuid: &str) -> Patch {
+        let served = format!("2.0.61.Final-socket.{}", &uuid[..8]);
+        Patch {
+            group: "io.netty".to_string(),
+            artifact: artifact.to_string(),
+            version: "2.0.61.Final".to_string(),
+            uuid: uuid.to_string(),
+            sha256: "5".repeat(64),
+            url: format!(
+                "https://patch.socket.dev/patch-registry/maven/token/{uuid}/maven2/io/netty/\
+                 {artifact}/{served}/{artifact}-{served}.jar"
+            ),
+        }
+    }
+
+    fn netty() -> Patch {
+        patch("netty-tcnative-classes", NETTY_UUID)
+    }
+
+    /// The block of [`netty`], as it stands in a file: the measured text,
+    /// with the remedy that this release has for a stale entry.
+    const BLOCK: &str = r#"# >>> socket-patch: Maven patches for Bazel (managed block: socket-patch writes and removes it) >>>
+socket_patch_http_file = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "http_file")
+
+socket_patch_maven = use_extension("@rules_jvm_external//:extensions.bzl", "maven")
+
+# pkg:maven/io.netty/netty-tcnative-classes@2.0.61.Final, Socket patch 0e77a000-0000-4000-8000-0000000000a1
+socket_patch_http_file(
+    name = "socket_patch_io_netty_netty_tcnative_classes_2_0_61_Final",
+    downloaded_file_path = "v1/io/netty/netty-tcnative-classes/2.0.61.Final/netty-tcnative-classes-2.0.61.Final.jar",
+    sha256 = "5555555555555555555555555555555555555555555555555555555555555555",
+    urls = ["https://patch.socket.dev/patch-registry/maven/token/0e77a000-0000-4000-8000-0000000000a1/maven2/io/netty/netty-tcnative-classes/2.0.61.Final-socket.0e77a000/netty-tcnative-classes-2.0.61.Final-socket.0e77a000.jar"],
+)
+
+# If Bazel stops at the next line ("does not generate repository"), the hub's lock no longer pins
+# io.netty:netty-tcnative-classes at 2.0.61.Final: run `socket-patch rollback pkg:maven/io.netty/netty-tcnative-classes@2.0.61.Final`.
+# Do not change it to inject_repo(): the build would pass without the patch.
+override_repo(
+    socket_patch_maven,
+    io_netty_netty_tcnative_classes_2_0_61_Final = "socket_patch_io_netty_netty_tcnative_classes_2_0_61_Final",
+)
+# <<< socket-patch <<<"#;
+
+    const LABEL: &str = "@rules_jvm_external//:extensions.bzl";
+
+    /// `escape` of the ruleset's `download_pinned_deps.bzl` (6.4 to 6.7)
+    /// and `to_repository_name` of `coursier_utilities.bzl` (6.8 to 7.2)
+    /// give one name for a jar whose coordinates hold letters, digits,
+    /// `.`, `_` and `-`. Another character has no name here: the two
+    /// differ over `$`, and none was read for the rest.
+    #[test]
+    fn a_repository_is_named_only_where_every_ruleset_release_agrees() {
+        for ((group, artifact, version), name) in [
+            (
+                ("dev.socket.fixture", "victim", "1.10.0"),
+                Some("dev_socket_fixture_victim_1_10_0"),
+            ),
+            (
+                ("com.google.guava", "guava", "31.1-jre"),
+                Some("com_google_guava_guava_31_1_jre"),
+            ),
+            (
+                ("org.scala-lang", "scala_library", "2.13.12"),
+                Some("org_scala_lang_scala_library_2_13_12"),
+            ),
+            (("g", "a$b", "1"), None),
+            (("g", "a", "1+build.2"), None),
+            (("g", "a", "[1,2)"), None),
+            (("g", "a:jar:tests", "1"), None),
+            (("g", "a b", "1"), None),
+            (("g\u{e9}", "a", "1"), None),
+            (("g", "", "1"), None),
+            (("", "a", "1"), None),
+            (("g", "a", ""), None),
+        ] {
+            let named = repository_name(group, artifact, version);
+            assert_eq!(named.as_deref(), name, "{group}:{artifact}:{version}");
+        }
+    }
+
+    /// The text of the block is fixed: it is how the block is recognised.
+    #[test]
+    fn the_block_is_written_as_it_was_measured() {
+        assert_eq!(render(LABEL, &[netty()]), BLOCK);
+        assert_eq!(
+            parse(BLOCK),
+            Some((LABEL.to_string(), vec![netty()])),
+            "what is written is what is read"
+        );
+        // Each patch has its own `override_repo`, and they stand by the
+        // name of their repository whatever the order they came in.
+        let other = patch("netty-tcnative-boringssl-static", OTHER_UUID);
+        let both = render("@rje//:extensions.bzl", &[netty(), other.clone()]);
+        assert_eq!(both, render("@rje//:extensions.bzl", &[other, netty()]));
+        let at = |text: &str| both.find(text).expect(text);
+        assert!(at(OTHER_UUID) < at(NETTY_UUID), "{both}");
+        assert_eq!(both.matches("\noverride_repo(\n").count(), 2, "{both}");
+        assert_eq!(both.matches("use_repo_rule(").count(), 1, "{both}");
+        assert!(
+            both.contains("use_extension(\"@rje//:extensions.bzl\", \"maven\")"),
+            "{both}"
+        );
+    }
+
+    /// The files a block is added to: with and without a last line break,
+    /// with blank lines at the end, with either line break, and with
+    /// both: the other one on the first line, or on the last.
+    fn modules() -> Vec<String> {
+        let ends = ["\n", "", "\n\n\n"].map(|end| format!("{}{end}", PINNED.trim_end()));
+        let crlf = ends.iter().map(|module| module.replace('\n', "\r\n"));
+        let first = ends[..2]
+            .iter()
+            .map(|module| module.replacen('\n', "\r\n", 1));
+        let last = [format!("{}\r\n", PINNED.trim_end())];
+        let both = first.chain(last);
+        ends.iter().cloned().chain(crlf).chain(both).collect()
+    }
+
+    #[test]
+    fn a_patch_is_added_once_and_taken_out_to_the_byte() {
+        for module in modules() {
+            let eol = terminator(&module);
+            let one = with_patch(&module, LABEL, netty()).expect("a block");
+            // After one blank line, in the line break of the file: the
+            // more frequent one of a file with both.
+            let block = BLOCK.replace('\n', eol);
+            let ended = module.ends_with('\n');
+            let expected = match ended {
+                true => format!("{module}{eol}{block}{eol}"),
+                false => format!("{module}{eol}{eol}{block}"),
+            };
+            assert_eq!(one, expected, "{module:?}");
+            let crlf = module.matches("\r\n").count();
+            let more = crlf > module.matches('\n').count() - crlf;
+            assert_eq!(more, eol == "\r\n", "{module:?}");
+            let added = &one[module.len()..];
+            assert_eq!(
+                added.matches('\n').count(),
+                added.matches(eol).count(),
+                "{module:?}"
+            );
+            // Again, and with the same patch under a newer id: one entry.
+            assert_eq!(with_patch(&one, LABEL, netty()), Some(one.clone()));
+            let newer = with_patch(&one, LABEL, patch("netty-tcnative-classes", OTHER_UUID));
+            let newer = newer.expect("a block");
+            assert!(
+                !newer.contains(NETTY_UUID) && newer.contains(OTHER_UUID),
+                "{newer}"
+            );
+            assert_eq!(newer.matches(BEGIN).count(), 1, "{newer}");
+            // A second patch, then out again in either order.
+            let other = patch("netty-tcnative-boringssl-static", OTHER_UUID);
+            let two = with_patch(&one, LABEL, other.clone()).expect("a block");
+            let gone = |uuid: &'static str| move |patch: &Patch| patch.uuid == uuid;
+            assert_eq!(
+                without(&two, &mut gone(OTHER_UUID)),
+                Some(one.clone()),
+                "{module:?}"
+            );
+            let left = without(&two, &mut gone(NETTY_UUID)).expect("a block");
+            assert_eq!(
+                Some(left.clone()),
+                with_patch(&module, LABEL, other),
+                "{module:?}"
+            );
+            for last in [
+                without(&left, &mut gone(OTHER_UUID)),
+                without(&one, &mut gone(NETTY_UUID)),
+                without(&two, &mut |_| true),
+            ] {
+                assert_eq!(last.as_deref(), Some(module.as_str()), "{module:?}");
+            }
+            // Nothing to take out leaves the file as it is.
+            assert_eq!(without(&one, &mut |_| false), Some(one.clone()));
+            // What the user wrote below the block stays below it.
+            let below = format!("{one}{}bazel_dep(name = \"x\", version = \"1\"){eol}", {
+                match ended {
+                    true => "",
+                    false => eol,
+                }
+            });
+            let kept = without(&below, &mut |_| true).expect("a block");
+            assert!(
+                kept.starts_with(module.trim_end()) && kept.ends_with(&format!("\"1\"){eol}")),
+                "{kept:?}"
+            );
+            assert!(!kept.contains("socket"), "{kept:?}");
+        }
+        assert_eq!(without(PINNED, &mut |_| true), None, "no block");
+        // A block keeps its own line break in a file that gets the other
+        // one on another line afterwards.
+        let one = with_patch(PINNED, LABEL, netty()).expect("a block");
+        let (other, plain) = (
+            one.replacen('\n', "\r\n", 1),
+            PINNED.replacen('\n', "\r\n", 1),
+        );
+        assert_eq!(with_patch(&other, LABEL, netty()), Some(other.clone()));
+        assert_eq!(without(&other, &mut |_| true), Some(plain));
+    }
+
+    /// A block that is not what socket-patch writes for the patches it
+    /// names is never written to, and is a doubt about what a hub builds.
+    #[test]
+    fn a_block_that_was_changed_by_hand_is_left_alone() {
+        let lock = lock_72();
+        let ours = with_patch(PINNED, LABEL, netty()).expect("a block");
+        let line = PINNED.lines().count() + 2;
+        // The first thing that could not be read of a workspace.
+        let doubt = |module: &str| {
+            let files = [("MODULE.bazel", module), ("maven_install.json", &lock)];
+            let doubt = read(&files).doubt;
+            doubt.map(|Doubt { file, line, why }| format!("{file}:{line}: {why}"))
+        };
+        assert_eq!(doubt(&ours), None);
+        for (edited, what) in [
+            (
+                ours.replace("override_repo(", "inject_repo("),
+                "another call",
+            ),
+            (
+                ours.replace("# Do not change it", "# do not change it"),
+                "a comment",
+            ),
+            (ours.replace(END, "# <<< socket-patch"), "no last line"),
+            (ours.replace("    socket_patch_maven,\n", ""), "a line less"),
+            (format!("{ours}{BEGIN}\n{END}\n"), "a second block"),
+            (
+                ours.replace(".jar\"],\n)", ".jar\"],\n    integrity = \"\",\n)"),
+                "a line more",
+            ),
+            (ours.replace("\n# <<<", "\n\n# <<<"), "a blank line"),
+            (
+                ours.replace(BEGIN, &format!("{BEGIN} ")),
+                "a blank after the first line",
+            ),
+            (
+                ours.replace(BEGIN, &BEGIN.replace("(managed", "(my")),
+                "another first line",
+            ),
+        ] {
+            assert_ne!(edited, ours, "{what}");
+            assert_eq!(find(&edited), Block::Edited(line), "{what}");
+            assert_eq!(with_patch(&edited, LABEL, netty()), None, "{what}");
+            assert_eq!(without(&edited, &mut |_| true), None, "{what}");
+            let why = "the block that socket-patch keeps there was changed by hand";
+            let said = Some(format!("MODULE.bazel:{line}: {why}"));
+            assert_eq!(doubt(&edited), said, "{what}");
+        }
+        // Without its first line it is no block: text of the user's, which
+        // hands a proxy to `override_repo`.
+        let unmarked = ours.replace(BEGIN, "# mine now");
+        assert_eq!(find(&unmarked), Block::None);
+        let said = doubt(&unmarked).unwrap_or_default();
+        assert!(said.ends_with("is used other than to call a tag"), "{said}");
+    }
+
+    /// With the block in place the workspace reads as the user wrote it:
+    /// the same hubs on the same lines, and no doubt about a proxy that is
+    /// handed to `override_repo`.
+    #[test]
+    fn the_workspace_reads_as_it_did_before_the_block() {
+        let lock = lock_72();
+        let below = "\nmaven.install(name = \"tools\", lock_file = \"//:maven_install.json\")\n";
+        let ours = with_patch(PINNED, LABEL, netty()).expect("a block") + below;
+        let plain = format!("{PINNED}{}{below}", "\n".repeat(BLOCK.lines().count() + 1));
+        let hubs = |module: &str| {
+            let files = [("MODULE.bazel", module), ("maven_install.json", &lock)];
+            let read = read(&files);
+            let hub = |(hub, _): &(Hub, Lock)| format!("{} {}:{}", hub.name, hub.file, hub.line);
+            let hubs: Vec<String> = read.pinned.iter().map(hub).collect();
+            (hubs, read.doubt, built(&files))
+        };
+        let line = PINNED.lines().count() + BLOCK.lines().count() + 3;
+        let both = [
+            "maven MODULE.bazel:4".to_string(),
+            format!("tools MODULE.bazel:{line}"),
+        ];
+        assert_eq!(hubs(&ours), (both.to_vec(), None, "yes, 2".to_string()));
+        assert_eq!(hubs(&ours), hubs(&plain));
+        assert_eq!(read(&[("MODULE.bazel", ours.as_str())]).block, [netty()]);
+        assert_eq!(read(&[("MODULE.bazel", PINNED)]).block, []);
+    }
+
+    /// A checkout with the files `files`, where a hosted run may write.
+    fn checkout(files: &[(&str, &str)]) -> tempfile::TempDir {
+        let lock = lock_72();
+        let bcr = "https://bcr.bazel.build/modules/rules_jvm_external";
+        let module_lock = format!(
+            "{{\"lockFileVersion\": 13, \"registryFileHashes\": {{\"{bcr}/6.5/MODULE.bazel\": \
+             \"0\", \"{bcr}/7.2/MODULE.bazel\": \"1\", \"{bcr}/7.2/source.json\": \"2\"}}}}"
+        );
+        let base = [
+            ("MODULE.bazel", PINNED),
+            ("maven_install.json", &lock),
+            ("MODULE.bazel.lock", &module_lock),
+        ];
+        let dir = project(&base);
+        for (path, text) in files {
+            let path = dir.path().join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        }
+        dir
+    }
+
+    /// The patch [`NETTY_UUID`] of the jar `io.netty:<artifact>` at
+    /// `version`.
+    fn jar(artifact: &str, version: &str) -> Vec<Jar> {
+        let jar = [NETTY_UUID, "io.netty", artifact, version].map(String::from);
+        vec![jar.into()]
+    }
+
+    fn netty_jar() -> Vec<Jar> {
+        jar("netty-tcnative-classes", "2.0.61.Final")
+    }
+
+    /// What [`site`] says of netty's jar in the checkout: `write <label>`,
+    /// `<code>: <why>`, or `-`.
+    fn verdict(dir: &Path) -> String {
+        match site(dir, None, &netty_jar()).remove(NETTY_UUID) {
+            None => "-".to_string(),
+            Some(Verdict { entry, held }) => {
+                assert_eq!(held, None);
+                match entry {
+                    Ok(label) => format!("write {label}"),
+                    Err((code, why)) => format!("{code}: {why}"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn an_entry_is_written_for_a_jar_that_a_pinned_hub_fetches() {
+        let write = format!("write {LABEL}");
+        assert_eq!(verdict(checkout(&[]).path()), write);
+        // The label is the user's own, under the name the checkout has
+        // for the ruleset, also for a hub in a file the root includes and
+        // for a proxy of development dependencies.
+        let renamed = PINNED
+            .replace(
+                "version = \"7.2\")",
+                "version = \"7.2\", repo_name = \"rje\")",
+            )
+            .replace("@rules_jvm_external//", "@rje//");
+        let (root, hub) = renamed.split_once("\n\n").expect("two parts");
+        let root = format!("{root}\ninclude(\"//third_party:jvm.MODULE.bazel\")\n");
+        let dev = hub.replace("\"maven\")", "\"maven\", dev_dependency = True)");
+        for files in [
+            vec![("MODULE.bazel", renamed.as_str())],
+            vec![
+                ("MODULE.bazel", root.as_str()),
+                ("third_party/jvm.MODULE.bazel", hub),
+            ],
+            vec![
+                ("MODULE.bazel", root.as_str()),
+                ("third_party/jvm.MODULE.bazel", &dev),
+            ],
+        ] {
+            assert_eq!(
+                verdict(checkout(&files).path()),
+                "write @rje//:extensions.bzl"
+            );
+        }
+        // Each of these says enough of the Bazel that builds the checkout.
+        let old_lock = "{\"lockFileVersion\": 11, \"registryFileHashes\": {\"https://bcr.bazel.\
+                        build/modules/rules_jvm_external/6.5/source.json\": \"0\"}}";
+        let asks_65 = PINNED.replace("\"7.2\"", "\"6.5\"");
+        for files in [
+            vec![
+                (".bazelversion", "7.4.0\n"),
+                ("MODULE.bazel.lock", old_lock),
+                ("MODULE.bazel", asks_65.as_str()),
+            ],
+            vec![(".bazeliskrc", "USE_BAZEL_VERSION=9.3.2\n")],
+            // Options that leave an entry in effect.
+            vec![(
+                ".bazelrc",
+                "common --enable_bzlmod\nbuild --noignore_dev_dependency\n",
+            )],
+            vec![(
+                ".bazelrc",
+                "# common --noenable_bzlmod\nbuild --norepository_disable_download\n",
+            )],
+            vec![(
+                ".bazelrc",
+                "common --enable_bzlmod=True --experimental_enable_bzlmod=1\n\
+                 build --ignore_dev_dependency=F --repository_disable_download=no\n",
+            )],
+            vec![
+                (".bazelrc", "common --noenable_bzlmod\n"),
+                (".bazelversion", "9.3.2\n"),
+            ],
+        ] {
+            assert_eq!(verdict(checkout(&files).path()), write, "{files:?}");
+        }
+        // What the root asks of the ruleset, and a lock that agrees with
+        // it: a release that a `single_version_override` pins below the
+        // one the `bazel_dep` names, an override without a version, which
+        // leaves the release to the graph, a `bazel_dep` of three numbers
+        // below the release Bazel selected, and an override of another
+        // module.
+        let bcr = "https://bcr.bazel.build/modules/rules_jvm_external";
+        let lock_69 = format!(
+            "{{\"lockFileVersion\": 13, \"registryFileHashes\": {{\"{bcr}/6.9/source.json\": \
+             \"0\"}}}}"
+        );
+        let over = |rest: &str| format!("{PINNED}single_version_override(module_name = {rest})\n");
+        let pins_69 = over("\"rules_jvm_external\", version = \"6.9\"");
+        let patched = over("\"rules_jvm_external\", patches = [\"//:rje.patch\"]");
+        let asks_715 = PINNED.replace("\"7.2\"", "\"7.1.5\"");
+        let other = format!("{PINNED}archive_override(module_name = \"rules_java\", urls = [])\n");
+        for files in [
+            vec![
+                ("MODULE.bazel", pins_69.as_str()),
+                ("MODULE.bazel.lock", lock_69.as_str()),
+            ],
+            vec![("MODULE.bazel", patched.as_str())],
+            vec![("MODULE.bazel", asks_715.as_str())],
+            vec![("MODULE.bazel", other.as_str())],
+        ] {
+            assert_eq!(verdict(checkout(&files).path()), write, "{files:?}");
+        }
+        // A jar that no hub fetches has no verdict at all, and neither has
+        // any jar outside a Bazel workspace.
+        let elsewhere = checkout(&[("maven_install.json", LOCK_SKIPS)]);
+        assert_eq!(site(elsewhere.path(), None, &netty_jar()), Site::new());
+        let plain = project(&[("pom.xml", "<project/>")]);
+        assert_eq!(site(plain.path(), None, &netty_jar()), Site::new());
+        // The text the run has of `MODULE.bazel` is the one that is read.
+        let lockless = PINNED.replace("    lock_file = \"//:maven_install.json\",\n", "");
+        let dir = checkout(&[]);
+        let said = site(dir.path(), Some(&lockless), &netty_jar());
+        let declined = |verdict: &Verdict| verdict.entry.is_err();
+        assert!(said.values().next().is_some_and(declined), "{said:?}");
+    }
+
+    /// One row per reason for which no entry is written.
+    #[test]
+    fn each_decline_has_its_code_and_says_why() {
+        let lockless = PINNED.replace("    lock_file = \"//:maven_install.json\",\n", "");
+        let beside = format!("{PINNED}maven.install(name = \"tools\")\n");
+        let computed = PINNED.replace("\"//:maven_install.json\"", "LOCK");
+        let isolated = PINNED.replace("\"maven\")", "\"maven\", isolate = True)");
+        let maybe = PINNED.replace("\"maven\")", "\"maven\", isolate = not SHARED)");
+        // A name for the ruleset that could not stand in a string of the
+        // block: the reader takes no such label for the extension.
+        let quoted = PINNED
+            .replace("\"7.2\")", "\"7.2\", repo_name = \"r\\\"je\")")
+            .replace("@rules_jvm_external//", "@r\\\"je//");
+        let over = format!(
+            "{PINNED}maven.override(coordinates = \"io.netty:netty-tcnative-classes\", target = \
+             \"//:own\")\n"
+        );
+        let edited = with_patch(PINNED, LABEL, netty())
+            .expect("a block")
+            .replace("# Do", "# do");
+        let asks_73 = PINNED.replace("\"7.2\"", "\"7.3\"");
+        let asks_721 = PINNED.replace("\"7.2\"", "\"7.2.1\"");
+        let pins = |version: &str| {
+            let dep = PINNED.replace("\"7.2\"", "\"6.5\"");
+            format!(
+                "{dep}single_version_override(module_name = \"rules_jvm_external\", version = \
+                 \"{version}\")\n"
+            )
+        };
+        let (pins_69, pins_72) = (pins("6.9"), pins("7.2"));
+        // An override that takes the ruleset from no registry, keeps more
+        // than one release of it, or pins a version that is no string.
+        let replaced = |call: &str| format!("{PINNED}{call}\n");
+        let unknown_release = |callee: &str| {
+            format!(
+                "{RELEASE}: MODULE.bazel:9: with this `{callee}` of rules_jvm_external \
+                 socket-patch cannot tell which release of the ruleset Bazel builds with, and \
+                 the name of a jar's repository depends on it"
+            )
+        };
+        let overrides = [
+            (
+                "archive_override",
+                "urls = [\"https://example.com/rje.tar.gz\"]",
+            ),
+            (
+                "git_override",
+                "remote = \"https://example.com/rje.git\", commit = \"0\"",
+            ),
+            ("local_path_override", "path = \"third_party/rje\""),
+            ("multiple_version_override", "versions = [\"6.5\", \"7.2\"]"),
+            ("single_version_override", "version = RJE"),
+        ]
+        .map(|(callee, rest)| {
+            let call = format!("{callee}(module_name = \"rules_jvm_external\", {rest})");
+            (replaced(&call), unknown_release(callee))
+        });
+        let bcr = "https://bcr.bazel.build/modules/rules_jvm_external";
+        let selected = |release: &str| {
+            format!(
+                "{{\"lockFileVersion\": 13, \"registryFileHashes\": {{\"{bcr}/{release}/source.\
+                 json\": \"0\"}}}}"
+            )
+        };
+        let (newer, older, lock_69) = (selected("7.3"), selected("6.3"), selected("6.9"));
+        let two = format!(
+            "{{\"lockFileVersion\": 13, \"registryFileHashes\": {{\"{bcr}/7.1/source.json\": \
+             \"0\", \"{bcr}/7.2/source.json\": \"1\"}}}}"
+        );
+        let local = lock_72()
+            .replace(
+                "\"io.netty:netty-tcnative-classes\"\n    ]",
+                "\"x:y\"\n    ]",
+            )
+            .replace(
+                "\"version\": \"3\"",
+                "\"m2local\": true, \"version\": \"3\"",
+            );
+        let release = "no file of the checkout says that Bazel 7.4.0 or later builds it, and an \
+                       older Bazel fails on the `override_repo` an entry needs: name the release \
+                       in `.bazelversion`";
+        let unknown = "socket-patch could not tell whether Bazel takes this artifact from a \
+                       rules_jvm_external hub";
+        let rows: Vec<(Vec<(&str, &str)>, String)> = vec![
+            (
+                vec![("MODULE.bazel", &lockless)],
+                format!(
+                    "{NOT_PINNED}: MODULE.bazel:4: hub \"maven\" has no `lock_file`, so Bazel \
+                     resolves its jars when it builds and none can be replaced: give the hub a \
+                     `lock_file` and pin it (`REPIN=1 bazel run @maven//:pin`)"
+                ),
+            ),
+            // Also beside the pinned hub that fetches the jar.
+            (
+                vec![("MODULE.bazel", &beside)],
+                format!(
+                    "{NOT_PINNED}: MODULE.bazel:9: hub \"tools\" has no `lock_file`, so Bazel \
+                     resolves its jars when it builds and none can be replaced: give the hub a \
+                     `lock_file` and pin it (`REPIN=1 bazel run @tools//:pin`)"
+                ),
+            ),
+            (
+                vec![("MODULE.bazel", &computed)],
+                format!(
+                    "{UNREADABLE}: {unknown}: MODULE.bazel:4: the `lock_file` of this hub is \
+                     not a file of this repository"
+                ),
+            ),
+            (
+                vec![("maven_install.json", "")],
+                format!(
+                    "{UNREADABLE}: {unknown}: maven_install.json: it is empty: the hub is not \
+                     pinned yet"
+                ),
+            ),
+            (
+                vec![("WORKSPACE", "maven_install(artifacts = [])\n")],
+                format!(
+                    "{UNREADABLE}: {unknown}: WORKSPACE:1: a `maven_install` of a WORKSPACE \
+                     file is not read"
+                ),
+            ),
+            (
+                vec![("MODULE.bazel", &edited)],
+                format!(
+                    "{UNREADABLE}: {unknown}: MODULE.bazel:{}: the block that socket-patch \
+                     keeps there was changed by hand",
+                    PINNED.lines().count() + 2
+                ),
+            ),
+            (
+                vec![("MODULE.bazel", &isolated)],
+                format!(
+                    "{UNREADABLE}: MODULE.bazel:4: a tag of hub \"maven\" is called on a \
+                     `use_extension` that is isolated or cannot be read, which no \
+                     `override_repo` of another usage reaches"
+                ),
+            ),
+            (
+                vec![("MODULE.bazel", &maybe)],
+                format!(
+                    "{UNREADABLE}: MODULE.bazel:4: a tag of hub \"maven\" is called on a \
+                     `use_extension` that is isolated or cannot be read, which no \
+                     `override_repo` of another usage reaches"
+                ),
+            ),
+            (
+                vec![("MODULE.bazel", &quoted)],
+                format!("{UNREADABLE}: {unknown}: MODULE.bazel:3: this `use_extension` cannot be read"),
+            ),
+            (
+                vec![(".bazelrc", "import %workspace%/ci.bazelrc\n"), ("ci.bazelrc/a", "")],
+                format!("{UNREADABLE}: the rc file ci.bazelrc cannot be read, and may switch an entry off"),
+            ),
+            // A line that Bazel reads in a way its own source calls an
+            // oversight: the file, and that line.
+            (
+                vec![(".bazelrc", "build --jobs=4\ncommon '--noenable_bzlmod\n")],
+                format!("{UNREADABLE}: the rc file .bazelrc:2 cannot be read, and may switch an entry off"),
+            ),
+            (
+                vec![("MODULE.bazel", &over)],
+                format!(
+                    "{NO_EFFECT}: MODULE.bazel:9: a `maven.override` gives this artifact \
+                     another target, so Bazel would not build a patched jar: patch that target, \
+                     or remove the override"
+                ),
+            ),
+            (
+                vec![(".bazelrc", "build:ci --ignore_dev_dependency\n")],
+                format!(
+                    "{NO_EFFECT}: .bazelrc:1 names `--ignore_dev_dependency`, under which Bazel \
+                     can drop the tags of a hub"
+                ),
+            ),
+            (
+                vec![(".bazelrc", "\ntry-import %workspace%/tools/ci.bazelrc\n"), ("tools/ci.bazelrc", "common --enable_bzlmod=false\n")],
+                format!(
+                    "{NO_EFFECT}: tools/ci.bazelrc:1 names `--enable_bzlmod=false`, which \
+                     switches off the file an entry is written to"
+                ),
+            ),
+            (
+                vec![(".bazelrc", "common --noenable_bzlmod\n"), (".bazelversion", "8.8.2\n")],
+                format!(
+                    "{NO_EFFECT}: .bazelrc:1 names `--noenable_bzlmod`, which switches off the \
+                     file an entry is written to"
+                ),
+            ),
+            // An import that only a newer Bazel takes, and one that Bazel
+            // opens from where it runs.
+            (
+                vec![
+                    (".bazelrc", "try-import-if-bazel-version >=8.0.0 %workspace%/new.bazelrc\n"),
+                    ("new.bazelrc", "common --noenable_bzlmod\n"),
+                ],
+                format!(
+                    "{NO_EFFECT}: new.bazelrc:1 names `--noenable_bzlmod`, which switches off the \
+                     file an entry is written to"
+                ),
+            ),
+            (
+                vec![
+                    (".bazelrc", "import tools/ci.bazelrc\n"),
+                    ("tools/ci.bazelrc", "common --downloader_config=dl.cfg\n"),
+                ],
+                format!(
+                    "{DOWNLOAD}: tools/ci.bazelrc:1 names `--downloader_config=dl.cfg`, under \
+                     which Bazel may not download the patched jar from the Socket patch host"
+                ),
+            ),
+            (
+                vec![(".bazelrc", "common --experimental_downloader_config=mirror.cfg\n")],
+                format!(
+                    "{DOWNLOAD}: .bazelrc:1 names `--experimental_downloader_config=mirror.cfg`, \
+                     under which Bazel may not download the patched jar from the Socket patch \
+                     host"
+                ),
+            ),
+            (
+                vec![(".bazelrc", "\n\nfetch --repository_disable_download\n")],
+                format!(
+                    "{DOWNLOAD}: .bazelrc:3 names `--repository_disable_download`, under which \
+                     Bazel may not download the patched jar from the Socket patch host"
+                ),
+            ),
+            (
+                vec![(".bazelrc", "common --vendor_dir=third_party/bazel\n")],
+                format!(
+                    "{DOWNLOAD}: .bazelrc:1 names `--vendor_dir=third_party/bazel`, under which \
+                     Bazel may not download the patched jar from the Socket patch host"
+                ),
+            ),
+            (
+                vec![(".bazelversion", "7.3.2\n")],
+                format!(
+                    "{RELEASE}: the checkout names Bazel 7.3.2 (`.bazeliskrc` or \
+                     `.bazelversion`), and an entry needs `override_repo`, which Bazel has \
+                     from 7.4.0"
+                ),
+            ),
+            (vec![("MODULE.bazel.lock", "{\"lockFileVersion\": 11}")], format!("{RELEASE}: {release}")),
+            (vec![("MODULE.bazel.lock", "")], format!("{RELEASE}: {release}")),
+            (vec![(".bazelversion", "8.x\n"), ("MODULE.bazel.lock", "{}")], format!("{RELEASE}: {release}")),
+            (
+                vec![("MODULE.bazel.lock", &newer)],
+                format!(
+                    "{RELEASE}: Bazel selected rules_jvm_external 7.3, and how the ruleset \
+                     names the repository of a jar is known for its releases 6.4 to 7.2: update \
+                     socket-patch"
+                ),
+            ),
+            (
+                vec![("MODULE.bazel.lock", &older)],
+                format!(
+                    "{RELEASE}: Bazel selected rules_jvm_external 6.3, and how the ruleset \
+                     names the repository of a jar is known for its releases 6.4 to 7.2: update \
+                     socket-patch"
+                ),
+            ),
+            (
+                vec![("MODULE.bazel", &asks_73)],
+                format!(
+                    "{RELEASE}: MODULE.bazel asks for rules_jvm_external 7.3 and \
+                     MODULE.bazel.lock holds 7.2: build once so that Bazel updates its lock"
+                ),
+            ),
+            // A `single_version_override` pins the release whatever the
+            // `bazel_dep` asks for: a lock that holds another one, older
+            // or newer, is one Bazel has not written since.
+            (
+                vec![("MODULE.bazel", &pins_69)],
+                format!(
+                    "{RELEASE}: MODULE.bazel asks for rules_jvm_external 6.9 and \
+                     MODULE.bazel.lock holds 7.2: build once so that Bazel updates its lock"
+                ),
+            ),
+            (
+                vec![("MODULE.bazel", &pins_72), ("MODULE.bazel.lock", &lock_69)],
+                format!(
+                    "{RELEASE}: MODULE.bazel asks for rules_jvm_external 7.2 and \
+                     MODULE.bazel.lock holds 6.9: build once so that Bazel updates its lock"
+                ),
+            ),
+            // Three numbers are above two that they start with.
+            (
+                vec![("MODULE.bazel", &asks_721)],
+                format!(
+                    "{RELEASE}: MODULE.bazel asks for rules_jvm_external 7.2.1 and \
+                     MODULE.bazel.lock holds 7.2: build once so that Bazel updates its lock"
+                ),
+            ),
+            (
+                vec![("MODULE.bazel.lock", "{\"lockFileVersion\": 13}")],
+                format!(
+                    "{RELEASE}: MODULE.bazel.lock does not say which release of \
+                     rules_jvm_external Bazel selected, and the name of a jar's repository \
+                     depends on it: build once so that Bazel writes its lock"
+                ),
+            ),
+            (
+                vec![("MODULE.bazel.lock", &two)],
+                format!(
+                    "{RELEASE}: MODULE.bazel.lock does not say which release of \
+                     rules_jvm_external Bazel selected, and the name of a jar's repository \
+                     depends on it: build once so that Bazel writes its lock"
+                ),
+            ),
+            (
+                vec![("maven_install.json", &local)],
+                format!(
+                    "{ARTIFACT}: maven_install.json lists no repository for \
+                     io.netty:netty-tcnative-classes: the hub takes the jar from the Maven \
+                     local repository, and on a machine without it there is no repository for \
+                     an entry to replace"
+                ),
+            ),
+        ];
+        // Every wrong row in one message: what it says, and what it should.
+        let mut wrong = Vec::new();
+        let replaced = overrides.iter();
+        let replaced =
+            replaced.map(|(module, said)| (vec![("MODULE.bazel", &**module)], said.clone()));
+        for (files, said) in rows.into_iter().chain(replaced) {
+            let verdict = verdict(checkout(&files).path());
+            wrong.extend((verdict != said).then_some((verdict, said)));
+        }
+        // Each way Bazel reads "off" for Bzlmod, and a word that is not
+        // "on" for certain. The option is named as Bazel reads it: without
+        // its quotes, and joined over a line that ends in `\`.
+        for (written, read) in [
+            ("--enable_bzlmod=False", "--enable_bzlmod=False"),
+            ("--enable_bzlmod=f", "--enable_bzlmod=f"),
+            ("--enable_bzlmod=N", "--enable_bzlmod=N"),
+            ("--enable_bzlmod=0", "--enable_bzlmod=0"),
+            ("--enable_bzlmod=no", "--enable_bzlmod=no"),
+            ("--enable_bzlmod=", "--enable_bzlmod="),
+            ("\"--noenable_bzlmod\"", "--noenable_bzlmod"),
+            ("--noenable_\"bzl\"mod", "--noenable_bzlmod"),
+            ("--noenable_\\\nbzlmod", "--noenable_bzlmod"),
+            ("--enable_bzlmod='fal'se", "--enable_bzlmod=false"),
+        ] {
+            let rc = format!("common {written}\n");
+            let verdict = verdict(checkout(&[(".bazelrc", &rc)]).path());
+            let said = format!(
+                "{NO_EFFECT}: .bazelrc:1 names `{read}`, which switches off the file an entry is \
+                 written to"
+            );
+            wrong.extend((verdict != said).then_some((verdict, said)));
+        }
+        // A project below the root of its workspace, whose file is not its
+        // own to write.
+        let dir = checkout(&[]);
+        let below = dir.path().join("services/billing");
+        std::fs::create_dir_all(&below).unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let said = format!(
+            "{NOT_AT_ROOT}: a hub of the Bazel workspace at {} builds this artifact, and this \
+             project is not its root, where the patch of a hub is written: run the command there",
+            root.display()
+        );
+        wrong.extend((verdict(&below) != said).then(|| (verdict(&below), said)));
+        assert_eq!(wrong, []);
+        // The root is read for such a project too: the verdict says what
+        // its block holds for the jar, as it does for a project at the
+        // root.
+        let ours = with_patch(PINNED, LABEL, netty()).expect("a block");
+        std::fs::write(dir.path().join("MODULE.bazel"), &ours).unwrap();
+        for project in [dir.path(), below.as_path()] {
+            let held = site(project, None, &netty_jar()).remove(NETTY_UUID);
+            let held = held.and_then(|verdict| verdict.held);
+            assert_eq!(held.as_deref(), Some(NETTY_UUID), "{project:?}");
+        }
+        // A coordinate whose repository has no known name.
+        let odd = lock_72().replace(
+            "\"version\": \"2.0.61.Final\"\n    }\n  }",
+            "\"version\": \"2.0.61+b\"\n    }\n  }",
+        );
+        let dir = checkout(&[("maven_install.json", &odd)]);
+        let said = site(dir.path(), None, &jar("netty-tcnative-classes", "2.0.61+b"));
+        let Some(Err((code, why))) = said.values().next().map(|verdict| &verdict.entry) else {
+            panic!("{said:?}");
+        };
+        assert_eq!(code, ARTIFACT);
+        assert!(
+            why.contains("only for coordinates of letters, digits, `.`, `_` and `-`"),
+            "{why}"
+        );
+    }
+
+    /// The label of a hub's `use_extension` is copied into a string of the
+    /// block, so only one that holds nothing a string would have to
+    /// escape is taken, whatever the reader takes for the extension.
+    #[test]
+    fn a_label_is_copied_only_where_it_can_stand_in_a_string() {
+        let label = |written: &str| {
+            let module = format!("maven = use_extension({written}, \"maven\")\nmaven.install()\n");
+            let files = [("MODULE.bazel", module.as_str())];
+            let ws = Workspace::read(&view(&files));
+            let (file, read) = &ws.files[0];
+            let install = |call: &&Call| call.callee == "maven.install";
+            let call = read.calls.iter().find(install).expect("the tag");
+            let tag = Tag {
+                file,
+                call,
+                dev_dependency: Some(false),
+            };
+            proxy(&ws, &tag)
+        };
+        for plain in [
+            "@rje//:extensions.bzl",
+            "@@rules_jvm_external+//:extensions.bzl",
+        ] {
+            assert_eq!(label(&format!("\"{plain}\"")).as_deref(), Some(plain));
+        }
+        for odd in [
+            "\"@r je//:extensions.bzl\"",
+            "\"@rje//:ext$(x).bzl\"",
+            "\"@rje//:ext'.bzl\"",
+            "\"@rje//:ext\\\".bzl\"",
+            "\"@rje//:ext\u{e9}.bzl\"",
+            "LABEL",
+            "\"@rje//:extensions.bzl\", isolate = True",
+        ] {
+            assert_eq!(label(odd), None, "{odd}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_module_file_that_is_a_link_is_not_written_through() {
+        let dir = checkout(&[]);
+        let module = dir.path().join("MODULE.bazel");
+        std::fs::rename(&module, dir.path().join("real.MODULE.bazel")).unwrap();
+        std::os::unix::fs::symlink("real.MODULE.bazel", &module).unwrap();
+        let said = verdict(dir.path());
+        let why = "MODULE.bazel is a symbolic link, which socket-patch does not write through";
+        assert_eq!(said, format!("{UNREADABLE}: {why}"));
+    }
+
+    /// The grant of [`netty`], as a hosted run has it.
+    fn granted() -> DepOverride {
+        let patch = netty();
+        let index = patch.url.split_once("/io/netty/").expect("a path").0;
+        serde_json::from_value(serde_json::json!({
+            "ecosystem": "maven",
+            "name": patch.artifact,
+            "namespace": patch.group,
+            "version": patch.version,
+            "token": "token",
+            "patchUuid": patch.uuid,
+            "artifactUrl": "https://patch.socket.dev/patch/maven/token/x.jar",
+            "integrity": { "sha256": patch.sha256 },
+            "registryOverride": { "kind": "maven2", "indexUrl": index, "identifiers": {
+                "name": "io.netty/netty-tcnative-classes",
+                "version": patch.version,
+                "mavenGroupId": patch.group,
+                "mavenArtifactId": patch.artifact,
+                "mavenSuffixedVersion": "2.0.61.Final-socket.0e77a000",
+            } },
+        }))
+        .expect("a grant")
+    }
+
+    /// The candidate files of a run: `module`, the project's own
+    /// `MODULE.bazel` when it has one, and a site whose verdict for the
+    /// patch [`NETTY_UUID`] is `entry`, beside a block that holds the
+    /// entry of the patch `held` for its jar.
+    fn candidates(
+        module: Option<&str>,
+        entry: Result<&str, (&str, &str)>,
+        held: Option<&str>,
+    ) -> BTreeMap<String, String> {
+        let verdict = Verdict {
+            entry: entry
+                .map(String::from)
+                .map_err(|(code, why)| (code.to_string(), why.to_string())),
+            held: held.map(String::from),
+        };
+        let site = Site::from([(NETTY_UUID.to_string(), verdict)]);
+        let site = (SITE_KEY, serde_json::to_string(&site).unwrap());
+        let files = module.map(|module| (FILE, module.to_string()));
+        let files = files.into_iter().chain([site]);
+        files.map(|(path, text)| (path.to_string(), text)).collect()
+    }
+
+    /// What the lane does for `deps` with the candidate files `files`.
+    fn ran(files: &BTreeMap<String, String>, deps: &[DepOverride]) -> RewriteResult {
+        let mut result = RewriteResult::default();
+        rewrite(files, deps, &mut result);
+        result
+    }
+
+    /// The patch ids the lane confirmed.
+    fn confirmed(result: &RewriteResult) -> Vec<&str> {
+        let confirmed = result.confirmed_bazel_maven_uuids.iter();
+        confirmed.map(String::as_str).collect()
+    }
+
+    #[test]
+    fn the_lane_writes_the_entry_or_says_why_not() {
+        let write = Ok(LABEL);
+        let ours = with_patch(PINNED, LABEL, netty()).expect("a block");
+        // The entry is written, and the patch is confirmed.
+        let result = ran(&candidates(Some(PINNED), write, None), &[granted()]);
+        assert_eq!(
+            result.files,
+            BTreeMap::from([(FILE.to_string(), ours.clone())])
+        );
+        assert_eq!(
+            (&result.warnings, confirmed(&result)),
+            (&vec![], vec![NETTY_UUID])
+        );
+        // Already there: confirmed, and nothing to write.
+        let files = candidates(Some(&ours), write, Some(NETTY_UUID));
+        let again = ran(&files, &[granted()]);
+        assert_eq!(
+            (again.files.len(), confirmed(&again)),
+            (0, vec![NETTY_UUID])
+        );
+        // A patch that lacks what an entry holds.
+        for broken in ["mavenSuffixedVersion", "sha256", "url"] {
+            let mut dep = granted();
+            let ov = dep.registry_override.as_mut().unwrap();
+            match broken {
+                "mavenSuffixedVersion" => ov.identifiers.maven_suffixed_version = None,
+                "sha256" => dep.integrity.sha256 = Some("sha256-AAAA".to_string()),
+                _ => ov.index_url = "https://patch.socket.dev/a\"b".to_string(),
+            }
+            let result = ran(&candidates(Some(PINNED), write, None), &[dep]);
+            let codes: Vec<&str> = result.warnings.iter().map(|w| w.code.as_str()).collect();
+            assert_eq!((result.files.len(), codes), (0, vec![ARTIFACT]), "{broken}");
+            assert_eq!(confirmed(&result), [""; 0], "{broken}");
+            let detail = &result.warnings[0].detail;
+            assert!(
+                detail.starts_with(NETTY_PURL) && detail.ends_with(KEEPS),
+                "{detail}"
+            );
+        }
+        // A run without a site is not touched at all.
+        let mut files = candidates(Some(PINNED), write, None);
+        files.remove(SITE_KEY);
+        assert!(ran(&files, &[granted()]) == RewriteResult::default());
+    }
+
+    /// A lock names the plain jar by group and artifact alone, and the
+    /// site has a verdict for its patch alone. Another patch of the same
+    /// coordinates in the run, as that of a jar with a classifier is, gets
+    /// no entry, takes no entry and is not confirmed, whichever comes
+    /// first.
+    #[test]
+    fn a_patch_that_is_not_of_the_plain_jar_gets_nothing_of_the_hub() {
+        let ours = with_patch(PINNED, LABEL, netty()).expect("a block");
+        let mut variant = granted();
+        variant.patch_uuid = OTHER_UUID.to_string();
+        variant.integrity.sha256 = Some("6".repeat(64));
+        let files = candidates(Some(PINNED), Ok(LABEL), None);
+        for deps in [[granted(), variant.clone()], [variant.clone(), granted()]] {
+            let result = ran(&files, &deps);
+            assert_eq!(result.files.get(FILE), Some(&ours));
+            assert_eq!(
+                (&result.warnings, confirmed(&result)),
+                (&vec![], vec![NETTY_UUID])
+            );
+        }
+        assert!(ran(&files, &[variant.clone()]) == RewriteResult::default());
+        // The jars of a run: by the purl of each patch, not its grant.
+        let purl = |qualifiers: &str| format!("{NETTY_PURL}{qualifiers}");
+        let plain = [purl(""), purl("?type=jar"), purl("?type=pom")];
+        let variants = [purl("?classifier=tests"), purl("?type=test-jar")];
+        let patches = plain
+            .iter()
+            .chain(&variants)
+            .map(|purl| (purl.as_str(), &variant));
+        let jar = [
+            OTHER_UUID,
+            "io.netty",
+            "netty-tcnative-classes",
+            "2.0.61.Final",
+        ];
+        let jar: Jar = jar.map(String::from).into();
+        assert_eq!(jars(patches), vec![jar; 3]);
+        let mut npm = granted();
+        npm.ecosystem = "npm".to_string();
+        assert_eq!(jars([(NETTY_PURL, &npm)].into_iter()), []);
+    }
+
+    /// A decline is the warning of the site, and it ends with what the
+    /// block holds for the jar: nothing; the entry of this patch from an
+    /// earlier run, which stays its pin; or the entry of another patch,
+    /// which is not this run's to take out. Below the Bazel root the
+    /// project has no `MODULE.bazel` of its own, and the file is named as
+    /// the root's.
+    #[test]
+    fn a_decline_says_what_the_block_holds_for_the_jar() {
+        let ours = with_patch(PINNED, LABEL, netty()).expect("a block");
+        let remains = |file: &str| {
+            format!(
+                "socket-patch wrote nothing to {file} for it: the entry of patch {OTHER_UUID} \
+                 remains there, and where the block is in effect the Bazel build takes that \
+                 patch's jar"
+            )
+        };
+        let left =
+            |file: &str| format!("socket-patch left the entry that {file} holds for it as it is");
+        let (root, own) = ("the MODULE.bazel at the root", [NETTY_UUID]);
+        for (module, held, pinned, ends) in [
+            (Some(PINNED), None, &own[..0], KEEPS.to_string()),
+            (
+                Some(&*ours),
+                Some(NETTY_UUID),
+                &own[..],
+                left("MODULE.bazel"),
+            ),
+            (
+                Some(&*ours),
+                Some(OTHER_UUID),
+                &own[..0],
+                remains("MODULE.bazel"),
+            ),
+            (None, None, &own[..0], KEEPS.to_string()),
+            (None, Some(NETTY_UUID), &own[..], left(root)),
+            (None, Some(OTHER_UUID), &own[..0], remains(root)),
+        ] {
+            let files = candidates(module, Err((RELEASE, "why")), held);
+            let result = ran(&files, &[granted()]);
+            let warning = RewriteWarning {
+                code: RELEASE.into(),
+                detail: format!("{NETTY_PURL}: why. {ends}"),
+            };
+            assert_eq!(result.warnings, [warning]);
+            assert_eq!(
+                (result.files.len(), confirmed(&result)),
+                (0, pinned.to_vec())
+            );
+        }
+        // An entry that the reason of the decline leaves without effect (an
+        // rc file that switches the block off, an override of the jar) is
+        // not this patch's pin: the build takes the upstream jar, and the
+        // patch is not confirmed for it.
+        for (module, file) in [(Some(&*ours), "MODULE.bazel"), (None, root)] {
+            let files = candidates(module, Err((NO_EFFECT, "why")), Some(NETTY_UUID));
+            let result = ran(&files, &[granted()]);
+            let detail = format!(
+                "{NETTY_PURL}: why. socket-patch left the entry that {file} holds for it as it \
+                 is, and while that stands the entry has no effect: the Bazel build keeps the \
+                 upstream jar"
+            );
+            let code = NO_EFFECT.into();
+            assert_eq!(result.warnings, [RewriteWarning { code, detail }]);
+            assert_eq!((result.files.len(), confirmed(&result)), (0, vec![]));
+        }
+        // And so does a patch that lacks what an entry holds.
+        let mut dep = granted();
+        dep.integrity.sha256 = None;
+        let files = candidates(Some(&ours), Ok(LABEL), Some(OTHER_UUID));
+        let result = ran(&files, &[dep]);
+        assert_eq!(result.warnings.len(), 1, "{result:?}");
+        assert!(result.warnings[0]
+            .detail
+            .ends_with(&remains("MODULE.bazel")));
+    }
+
+    /// The pom lane says "no pom.xml" of a Maven patch in a tree without
+    /// one, and not of a patch that a hub decides: the lane of the hubs
+    /// writes its entry or says why not.
+    #[test]
+    fn no_pom_is_said_only_of_a_patch_that_no_hub_decides() {
+        let codes = |files: &BTreeMap<String, String>, deps: &[DepOverride]| {
+            let result = crate::patch::redirect::rewrite_registry_redirect(files, deps);
+            let codes = result.warnings.into_iter().map(|warning| warning.code);
+            codes.collect::<Vec<_>>()
+        };
+        let mut other = granted();
+        other.patch_uuid = OTHER_UUID.to_string();
+        let no_pom = "redirect_maven_no_pom";
+        let written = candidates(Some(PINNED), Ok(LABEL), None);
+        let declined = candidates(Some(PINNED), Err((RELEASE, "why")), None);
+        assert_eq!(codes(&written, &[granted()]), [""; 0]);
+        assert_eq!(codes(&declined, &[granted()]), [RELEASE]);
+        for deps in [[granted(), other.clone()], [other.clone(), granted()]] {
+            assert_eq!(codes(&written, &deps), [no_pom]);
+        }
+        let mut plain = written.clone();
+        plain.remove(SITE_KEY);
+        assert_eq!(codes(&plain, &[granted()]), [no_pom]);
+    }
+
+    /// What discovery reads of the block: a patch whose jar a pinned hub
+    /// still fetches is built, and any other is said not to be.
+    #[test]
+    fn a_pin_is_built_while_a_pinned_hub_fetches_its_jar() {
+        let ours = with_patch(PINNED, LABEL, netty()).expect("a block");
+        let unbuilt = |files: &[(&str, &str)], module: &str| {
+            let read = pins(checkout(files).path(), module).expect("the block");
+            assert_eq!(read.len(), 1, "{read:?}");
+            assert_eq!(read[0].patch, netty());
+            read.into_iter().next().and_then(|pin| pin.unbuilt)
+        };
+        assert_eq!(unbuilt(&[], &ours), None);
+        // Whatever names the Bazel or the ruleset: a wrong one fails the
+        // build, and none builds the upstream jar.
+        assert_eq!(unbuilt(&[("MODULE.bazel.lock", "")], &ours), None);
+        assert_eq!(
+            unbuilt(&[(".bazelrc", "build --vendor_dir=v\n")], &ours),
+            None
+        );
+        let moved = unbuilt(&[("maven_install.json", LOCK_SKIPS)], &ours);
+        let why = "no pinned hub takes io.netty:netty-tcnative-classes at 2.0.61.Final any more, \
+                   so Bazel stops at its entry";
+        assert_eq!(moved.as_deref(), Some(why));
+        let off = unbuilt(&[(".bazelrc", "common --ignore_dev_dependency\n")], &ours);
+        assert!(off.is_some_and(|why| why.starts_with(".bazelrc:1 names")));
+        // Every line is read: an option that leaves the entry in effect
+        // does not hide one below it that switches it off. And an rc file
+        // that cannot be read, or a line of one, may switch it off.
+        for (files, why) in [
+            (
+                [
+                    (
+                        ".bazelrc",
+                        "build --vendor_dir=v\ncommon --noenable_bzlmod\n",
+                    ),
+                    ("", ""),
+                ],
+                ".bazelrc:2 names `--noenable_bzlmod`, which switches off the file an entry is \
+                 written to",
+            ),
+            (
+                [
+                    (".bazelrc", "import %workspace%/ci.bazelrc\n"),
+                    ("ci.bazelrc/a", ""),
+                ],
+                "the rc file ci.bazelrc cannot be read, and may switch an entry off",
+            ),
+            (
+                [
+                    (".bazelrc", "build --jobs=4\ncommon \"--enable_bzlmod\n"),
+                    ("", ""),
+                ],
+                "the rc file .bazelrc:2 cannot be read, and may switch an entry off",
+            ),
+        ] {
+            let files: Vec<_> = files
+                .into_iter()
+                .filter(|file| !file.0.is_empty())
+                .collect();
+            assert_eq!(unbuilt(&files, &ours).as_deref(), Some(why));
+        }
+        let unread = unbuilt(&[("maven_install.json", "")], &ours);
+        assert!(unread.is_some_and(|why| why.contains("could not tell")));
+        let over = ours.replace(
+            "use_repo(maven, \"maven\")\n",
+            "use_repo(maven, \"maven\")\nmaven.override(coordinates = \
+             \"io.netty:netty-tcnative-classes\", target = \"//:own\")\n",
+        );
+        assert!(unbuilt(&[], &over).is_some_and(|why| why.contains("maven.override")));
+        // A block that was changed by hand is no record of a patch.
+        let edited = ours.replace("# Do", "# do");
+        let said = pins(checkout(&[]).path(), &edited);
+        let line = PINNED.lines().count() + 2;
+        let why = format!(
+            "MODULE.bazel:{line}: the block that socket-patch keeps there was changed by hand"
+        );
+        assert_eq!(said, Err(why));
+        assert_eq!(pins(checkout(&[]).path(), PINNED), Ok(vec![]));
+    }
+
+    /// A jar that the block patches is not said to be unpatched.
+    #[test]
+    fn no_notice_for_a_jar_whose_entry_is_in_the_block() {
+        let lock = lock_72();
+        let ours = with_patch(PINNED, LABEL, netty()).expect("a block");
+        let dir = project(&[("MODULE.bazel", &ours), ("maven_install.json", &lock)]);
+        let other = "pkg:maven/io.netty/netty-tcnative-boringssl-static@2.0.61.Final";
+        let said = notices_blocking(dir.path(), vec![NETTY_PURL.to_string(), other.to_string()]);
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert!(
+            said[0].0 == HUB_UNPATCHED && said[0].1.starts_with(other),
+            "{said:?}"
+        );
     }
 }

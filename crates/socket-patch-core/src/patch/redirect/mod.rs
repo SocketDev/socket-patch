@@ -501,6 +501,16 @@ pub struct RewriteResult {
         serde(skip_serializing_if = "std::collections::BTreeSet::is_empty")
     )]
     pub refused_sbt_uuids: std::collections::BTreeSet<String>,
+    /// Maven patch uuids whose entry is in the block of the root
+    /// `MODULE.bazel` of a Bazel workspace, written by this run or already
+    /// there ([`crate::bazel::maven::rewrite`]): the jar a
+    /// rules_jvm_external hub builds is the patched one. Confirms a Maven
+    /// purl whatever a `pom.xml` or a Gradle build beside the hub holds.
+    #[cfg_attr(
+        test,
+        serde(skip_serializing_if = "std::collections::BTreeSet::is_empty")
+    )]
+    pub confirmed_bazel_maven_uuids: std::collections::BTreeSet<String>,
 }
 
 /// The derived `Debug` shape, with the Gradle sets shown only when
@@ -546,6 +556,10 @@ impl std::fmt::Debug for RewriteResult {
             ("refused_gradle_uuids", &self.refused_gradle_uuids),
             ("confirmed_sbt_uuids", &self.confirmed_sbt_uuids),
             ("refused_sbt_uuids", &self.refused_sbt_uuids),
+            (
+                "confirmed_bazel_maven_uuids",
+                &self.confirmed_bazel_maven_uuids,
+            ),
         ] {
             if !set.is_empty() {
                 d.field(name, set);
@@ -594,6 +608,23 @@ fn serialize_json_like(value: &Value, original: &str) -> String {
 /// silently dropped from the redirected count.
 fn registry_override_of_kind<'a>(dep: &'a DepOverride, kind: &str) -> Option<&'a RegistryOverride> {
     dep.registry_override.as_ref().filter(|ov| ov.kind == kind)
+}
+
+/// The `maven2` override of a Maven patch, and the group and the artifact
+/// the patch is pinned under: those of the grant, else those of the purl.
+/// The pom rewriter and the lane for the hubs of a Bazel workspace
+/// ([`crate::bazel::maven`]) both go by it, so that one run pins the same
+/// artifact for both builds.
+pub(crate) fn maven_coordinates(dep: &DepOverride) -> (Option<&RegistryOverride>, String, String) {
+    let ov = registry_override_of_kind(dep, "maven2");
+    let ids = ov.map(|ov| &ov.identifiers);
+    let group = ids.and_then(|ids| ids.maven_group_id.clone());
+    let artifact = ids.and_then(|ids| ids.maven_artifact_id.clone());
+    (
+        ov,
+        group.or_else(|| dep.namespace.clone()).unwrap_or_default(),
+        artifact.unwrap_or_else(|| dep.name.clone()),
+    )
 }
 
 /// Run every rewriter and merge the results (each owns distinct files).
@@ -840,7 +871,10 @@ fn rewriter_groups<'a>(
         Box::new(move |result| rewrite_composer_lock(files, overrides, result)),
         Box::new(move |result| rewrite_nuget(files, overrides, result)),
         Box::new(move |result| rewrite_gem(files, overrides, result)),
-        Box::new(move |result| rewrite_maven_pom(files, overrides, maven, result)),
+        Box::new(move |result| {
+            rewrite_maven_pom(files, overrides, maven, result);
+            crate::bazel::maven::rewrite(files, overrides, result);
+        }),
         Box::new(move |result| {
             gradle::rewrite_gradle_hosted(files, gradle_unreadable, overrides, result)
         }),
@@ -934,6 +968,7 @@ fn merge_group_delta(result: &mut RewriteResult, delta: RewriteResult) {
         confirmed_maven_reactor_uuids,
         confirmed_sbt_uuids,
         refused_sbt_uuids,
+        confirmed_bazel_maven_uuids,
     } = delta;
     result.files.extend(files);
     result.binary_files.extend(binary_files);
@@ -990,6 +1025,9 @@ fn merge_group_delta(result: &mut RewriteResult, delta: RewriteResult) {
     }
     result.confirmed_sbt_uuids.extend(confirmed_sbt_uuids);
     result.refused_sbt_uuids.extend(refused_sbt_uuids);
+    result
+        .confirmed_bazel_maven_uuids
+        .extend(confirmed_bazel_maven_uuids);
 }
 
 /// [`rewrite_groups_serial`], with the groups run concurrently under
@@ -9411,25 +9449,19 @@ fn rewrite_maven_poms(
     // unenforced-pin warning must fire on re-scans too.
     let mut pinned_jar_paths: Vec<String> = vec![];
 
+    // A patch whose jar a rules_jvm_external hub of a Bazel workspace
+    // builds, or may build, is decided by the lane of the hubs, which says
+    // why when it writes nothing: "no pom.xml" is not said of it.
+    let hub = crate::bazel::maven::handed(files);
+
     for dep in &maven {
-        let Some(ov) = registry_override_of_kind(dep, "maven2") else {
+        let (Some(ov), group_id, artifact_id) = maven_coordinates(dep) else {
             result.warnings.push(RewriteWarning {
                 code: "redirect_maven_missing_override".into(),
                 detail: format!("{} has no maven2 registry override", full_name(dep)),
             });
             continue;
         };
-        let group_id = ov
-            .identifiers
-            .maven_group_id
-            .clone()
-            .or_else(|| dep.namespace.clone())
-            .unwrap_or_default();
-        let artifact_id = ov
-            .identifiers
-            .maven_artifact_id
-            .clone()
-            .unwrap_or_else(|| dep.name.clone());
         let suffixed_version = ov.identifiers.maven_suffixed_version.clone();
         // The jar and served-pom sha256 a Trusted Checksums pin needs, as
         // the bare lowercase hex Maven compares; a grant hash of any other
@@ -9475,7 +9507,7 @@ fn rewrite_maven_poms(
             // A Gradle-only project is legitimately pom-less — the Gradle
             // planner is its redirect path. Otherwise say why nothing landed
             // (parity with `redirect_npm_no_lockfile`), once per run.
-            if !gradle_build_present && !warned_no_pom {
+            if !gradle_build_present && !warned_no_pom && !hub.contains_key(&dep.patch_uuid) {
                 warned_no_pom = true;
                 result.warnings.push(RewriteWarning {
                     code: "redirect_maven_no_pom".into(),

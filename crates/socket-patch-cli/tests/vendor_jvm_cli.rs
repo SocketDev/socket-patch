@@ -1742,10 +1742,11 @@ fn a_bazel_hub_that_builds_a_vendored_jar_adds_one_warning_and_nothing_else() {
     let (events, tree, warnings) = vendor(Some(lock("foo")));
     assert_eq!((&events, &tree), (&without.0, &without.1));
     let detail = format!(
-        "{}: Bazel takes this artifact from maven_install.json (hub \"maven\", `maven.install` \
-         at MODULE.bazel:3), which pins the upstream jar. socket-patch does not patch a \
-         rules_jvm_external hub yet, so the Bazel build stays unpatched whatever this command \
-         did for another build of the checkout",
+        "{0}: Bazel takes this artifact from maven_install.json (hub \"maven\", `maven.install` \
+         at MODULE.bazel:3), which pins the upstream jar, and this command does not patch a \
+         rules_jvm_external hub: the Bazel build stays unpatched whatever it did for another \
+         build of the checkout. `socket-patch get {0} --mode hosted` at the Bazel root patches \
+         a pinned hub",
         purl("foo")
     );
     let warning = serde_json::json!({ "code": "maven_bazel_hub_unpatched", "detail": detail });
@@ -1797,4 +1798,148 @@ fn a_bazel_hub_that_builds_a_vendored_jar_adds_one_warning_and_nothing_else() {
         env["warnings"].clone()
     };
     assert_eq!(others(Some(lock("foo"))), others(None));
+}
+
+/// Vendored mode patches no rules_jvm_external hub, and takes none over.
+/// The entry that hosted mode keeps for a jar in the block of
+/// `MODULE.bazel` is a hosted pin of that jar, and `vendor` and `vendor
+/// --revert` leave it as it is: the Bazel build keeps the patched jar.
+/// Everything else is the run without the workspace, and nothing is said
+/// of a hub that the block patches. That holds for an entry alone, and
+/// for one whose patch a hosted run also pinned in the poms of the
+/// reactor: `vendor` takes the poms' part of that pin over, as it does
+/// without the workspace.
+#[test]
+fn vendor_leaves_the_hosted_entry_of_a_bazel_hub_in_place() {
+    let module = format!(
+        r#"bazel_dep(name = "rules_jvm_external", version = "7.2")
+maven = use_extension("@rules_jvm_external//:extensions.bzl", "maven")
+maven.install(lock_file = "//:maven_install.json")
+
+# >>> socket-patch: Maven patches for Bazel (managed block: socket-patch writes and removes it) >>>
+socket_patch_http_file = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "http_file")
+
+socket_patch_maven = use_extension("@rules_jvm_external//:extensions.bzl", "maven")
+
+# pkg:maven/org.example/foo@1.0, Socket patch {FOO_UUID}
+socket_patch_http_file(
+    name = "socket_patch_org_example_foo_1_0",
+    downloaded_file_path = "v1/org/example/foo/1.0/foo-1.0.jar",
+    sha256 = "{sum}",
+    urls = ["https://patch.socket.dev/patch-registry/maven/token/{FOO_UUID}/maven2/org/example/foo/1.0-socket.1d3c1fd2/foo-1.0-socket.1d3c1fd2.jar"],
+)
+
+# If Bazel stops at the next line ("does not generate repository"), the hub's lock no longer pins
+# org.example:foo at 1.0: run `socket-patch rollback pkg:maven/org.example/foo@1.0`.
+# Do not change it to inject_repo(): the build would pass without the patch.
+override_repo(
+    socket_patch_maven,
+    org_example_foo_1_0 = "socket_patch_org_example_foo_1_0",
+)
+# <<< socket-patch <<<
+"#,
+        sum = "a".repeat(64)
+    );
+    let lock = "{\"artifacts\": {\"org.example:foo\": {\"shasums\": {\"jar\": \"00\"}, \
+                \"version\": \"1.0\"}}, \"repositories\": {\"https://repo1.maven.org/maven2/\": \
+                [\"org.example:foo\"]}, \"version\": \"3\"}\n";
+    // The pin `list` reads from the block, when there is one.
+    let hosted = |root: &Path| {
+        let (code, list) = socket(root, &["list"]);
+        assert_eq!(code, Some(0), "{list}");
+        let events = list["events"].as_array().unwrap().iter();
+        let pin = |event: &&serde_json::Value| {
+            event["purl"] == purl("foo") && event["details"]["mode"] == "hosted"
+        };
+        events
+            .filter(pin)
+            .map(|event| event["details"]["lockfiles"].clone())
+            .collect::<Vec<_>>()
+    };
+    // The pin of a hosted run in the poms of the reactor: the version in
+    // the module, the repository in the root.
+    let repository = format!(
+        "  <repositories>\n    <repository>\n      <id>socket-patch-{FOO_UUID}</id>\n      \
+         <url>https://patch.socket.dev/patch-registry/maven/token/{FOO_UUID}/maven2</url>\n      \
+         <releases>\n        <enabled>true</enabled>\n        \
+         <checksumPolicy>fail</checksumPolicy>\n      </releases>\n      <snapshots>\n        \
+         <enabled>false</enabled>\n      </snapshots>\n    </repository>\n  \
+         </repositories>\n</project>"
+    );
+    let pin_poms = |root: &Path| {
+        for (pom, from, to) in [
+            (
+                "proj/a/pom.xml",
+                "<version>1.0<",
+                "<version>1.0-socket.1d3c1fd2<",
+            ),
+            ("proj/pom.xml", "</project>", repository.as_str()),
+        ] {
+            let text = std::fs::read_to_string(root.join(pom)).unwrap();
+            assert_eq!(text.matches(from).count(), 1, "{pom}");
+            write(root, pom, text.replace(from, to).as_bytes());
+        }
+    };
+    // The API of the patch record, which the eject of a hosted pin asks
+    // for. Without a pin in the poms no record is asked for: an eject
+    // would ask the port of `nowhere` for one.
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let api = runtime.block_on(wiremock::MockServer::start());
+    let serve_record = |root: &Path| {
+        let manifest = std::fs::read(root.join("proj/.socket/manifest.json")).unwrap();
+        let manifest: serde_json::Value = serde_json::from_slice(&manifest).unwrap();
+        let mut view = manifest["patches"][purl("foo")].clone();
+        view["purl"] = purl("foo").into();
+        view["publishedAt"] = view["exportedAt"].clone();
+        let record = wiremock::ResponseTemplate::new(200).set_body_json(view);
+        let asked = wiremock::Mock::given(wiremock::matchers::method("GET")).respond_with(record);
+        runtime.block_on(asked.mount(&api));
+        api.uri()
+    };
+    let nowhere = "http://127.0.0.1:9".to_string();
+    let run = |bazel: bool, in_poms: bool| {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fixture(root, Shape::Reactor, &[("foo", FOO_UUID)]);
+        let mut pinned_in = Vec::new();
+        if bazel {
+            write(root, "proj/MODULE.bazel", module.as_bytes());
+            write(root, "proj/maven_install.json", lock.as_bytes());
+            pinned_in.push("MODULE.bazel");
+        }
+        let records = if in_poms {
+            pin_poms(root);
+            pinned_in.extend(["a/pom.xml", "pom.xml"]);
+            serve_record(root)
+        } else {
+            nowhere.clone()
+        };
+        let pins = usize::from(bazel || in_poms);
+        assert_eq!(hosted(root), [serde_json::json!(pinned_in)][..pins]);
+        let mut steps = Vec::new();
+        for args in [&["vendor"][..], &["vendor", "--revert"]] {
+            let env = ok(root, &[args, &["--proxy-url", &records]].concat());
+            let mut tree = snapshot(root);
+            let module = tree.remove("MODULE.bazel").flatten();
+            tree.remove("maven_install.json");
+            steps.push((events(&env), env["warnings"].clone(), tree, module));
+            // The entry is the hosted pin that is left, and all of it.
+            let entry = [serde_json::json!(["MODULE.bazel"])];
+            assert_eq!(hosted(root), entry[..usize::from(bazel)], "{args:?}");
+        }
+        steps
+    };
+    for in_poms in [false, true] {
+        let (without, beside) = (run(false, in_poms), run(true, in_poms));
+        let vendored = (purl("foo"), "applied".to_string(), String::new());
+        assert!(without[0].0.contains(&vendored), "{:?}", without[0].0);
+        for (beside, without) in beside.iter().zip(&without) {
+            assert_eq!(
+                (&beside.0, &beside.1, &beside.2),
+                (&without.0, &without.1, &without.2),
+                "{in_poms}"
+            );
+            assert_eq!(beside.3.as_deref(), Some(module.as_bytes()), "{in_poms}");
+        }
+    }
 }
