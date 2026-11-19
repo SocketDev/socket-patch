@@ -1056,14 +1056,67 @@ Honest limits of the Maven and NuGet flows — documented behavior, not bugs:
   Older releases leave the `.mvn/*` files inert, and only the transport `.sha1` check
   guards the Socket-served bytes. The version suffixing above still fails closed on its
   own.
-  - **3.9.0 / 3.9.1** do not interpolate the `${session.rootDirectory}` basedir the config
-    uses, so the summary file is never found.
+  - **3.9.0 / 3.9.1** do not interpolate the basedir the config uses, so the summary
+    file is never found.
   - **3.9.2 / 3.9.3** ignore `checksumAlgorithms=SHA-256` and check SHA-1 only.
   - **Below 3.9** there is no Trusted Checksums post-processor.
+  - **Maven 4** enforces the pin only in a project that declares Maven 4 (below).
 
-  When `.mvn/wrapper/maven-wrapper.properties` pins a Maven older than 3.9.4, the rewriter
-  still writes the files and warns `redirect_maven_trusted_checksums_unenforced`. Without
-  a Maven Wrapper, the CLI can't tell which Maven builds the project, so it doesn't warn.
+  **How the directory is named.** Maven reads a relative `basedir` from the local
+  repository, so the config names `.mvn/checksums` through a property, and no property
+  is right on every Maven:
+  - `${maven.multiModuleProjectDirectory}/.mvn/checksums` is what hosted mode writes by
+    default. Every Maven 3 launcher defines it wherever the build is started (the
+    project root, a module directory, `mvn -f <project>/pom.xml` from another
+    directory), so the line breaks no build and the pin is enforced from 3.9.4 on.
+    Maven 4 does not interpolate it: a Maven 4 build of such a project runs as if the
+    pin were not there.
+  - `${session.rootDirectory}/.mvn/checksums` is written for a project that declares
+    Maven 4: its Maven Wrapper pins Apache Maven 4, or its root `pom.xml` is of a model
+    newer than 4.0.0 (its `<modelVersion>`, or with none, the version its namespace
+    names; `<modelVersion>4.0.0</modelVersion>` under the 4.1.0 namespace is a 4.0.0 pom,
+    which Maven 3 builds). Maven 4 defines the property in every invocation. Releases up
+    to 5.1.0 wrote this form for every project, which stopped **Maven 3.9.2 to 3.9.8**
+    from starting at all with `-f` from outside the project (`Illegal use of undefined
+    property: session.rootDirectory`).
+
+  If Maven 4 builds your project and nothing in the checkout says so, declare it: with
+  the default form a Maven 4 build does not enforce the pin, and the CLI cannot see
+  which Maven you run.
+
+  **A project wired by an earlier release is healed.** Every `scan --mode hosted` that
+  finds the six settings standing together as hosted mode wrote them, in the spelling
+  that is not this project's, rewrites that one line in place (`redirect_maven_config`,
+  `rewritten`, `key: "trustedChecksumsDirectory"`). It does so whatever the scan
+  redirects: when no patch applies any more (a dependency bumped past its patched
+  version), in a reactor root, when no checksum line is left, when a later line switches
+  the pin off. A scan with nothing to redirect reads `.mvn/maven.config` for this alone
+  and takes the write lock for the change when it can. The heal never fails a run: when
+  the lock is held elsewhere, or `.mvn/maven.config` is a symbolic link, the line is
+  left for a later scan. `rollback` and `remove` do the same to a config they leave in
+  place. A directory line you wrote yourself (one
+  that stands apart from the other five) is yours and is left alone, as is any other
+  setting; `rollback` and `remove` recognise either form.
+
+  The heal can trade something away, and says so. Taking `${session.rootDirectory}` out
+  of a project that declares no Maven means a Maven 4 build of it no longer enforces the
+  pin (Maven 3.9.4 and later 3.x still do). The run that changes the line warns
+  `redirect_maven_trusted_checksums_maven3_only` (`maven_trusted_checksums_maven3_only`
+  from `rollback` / `remove`). Declare Maven 4 and scan again to get the form Maven 4
+  reads back.
+
+  When the Maven the project declares does not enforce the pin as the config stands, the
+  rewriter still writes the files and warns `redirect_maven_trusted_checksums_unenforced`,
+  on every scan while that holds:
+  - `.mvn/wrapper/maven-wrapper.properties` pins a Maven older than 3.9.4 (upgrade the
+    wrapper);
+  - the project declares Maven 4 and the directory line is one you wrote in the
+    launcher's spelling, which Maven 4 does not read (set it to
+    `${session.rootDirectory}/.mvn/checksums`). The scan that first meets that line also
+    reports it as `redirect_maven_trusted_checksums_conflict`.
+
+  Without a Maven Wrapper or a newer model, the CLI can't tell which Maven builds the
+  project, so it doesn't warn.
   On Maven **3.9.4–3.9.8** a *mismatch* is enforced but reported unclearly; the
   readability fix landed in **3.9.9**
   ([MNG-8182](https://issues.apache.org/jira/browse/MNG-8182)). The args are
@@ -1071,10 +1124,16 @@ Honest limits of the Maven and NuGet flows — documented behavior, not bugs:
   from any repository and a dependency with no committed checksum still resolves — only a
   *mismatch* fails. A grant whose sha256 is not 64 hex digits writes no checksum line
   (and drops any line an earlier run wrote for that suffixed version) and warns
-  `redirect_maven_trusted_checksums_invalid_hash`. `vex` attests a pin's checksum only
-  when `maven.config` enforces the file as Maven 3.9+ reads it (all five settings above
-  with the values hosted writes; `failIfMissing` aside) and the wrapper, if any, pins
-  Maven 3.9.4 or later.
+  `redirect_maven_trusted_checksums_invalid_hash`. `vex` takes a pin's checksum as the
+  content the project pins only when the pin is known to be enforced: `maven.config`
+  enforces the file as Maven 3.9+ reads it (all five settings above with the values
+  hosted writes, the directory in either form; `failIfMissing` aside), and the Maven the
+  project declares reads the directory as the config spells it (a wrapper that pins
+  Maven 3.9.4 or later, and below Maven 4 for the default form; Maven 4, by the wrapper
+  or the model, for the `${session.rootDirectory}` form). A project that declares no
+  Maven and carries the default form is enforced by Maven 3 only, so its checksum is not
+  taken; the statement itself does not depend on it, since the suffixed version is the
+  pin.
 * **A Maven project's scan is scoped to its dependency graph.** The Maven local
   repository is shared by every project on the machine, so in project mode (no
   `--global` / `--global-prefix`) a Maven build's crawl (a `pom.xml`, no Gradle or
@@ -2040,12 +2099,13 @@ wire is skipped, neither file changes for it, and the warning says why and what 
 | `redirect_gem_unrecognized_declaration` | its declaration cannot be edited in place: a heredoc or a `do` block among its arguments, other code before it on its line, a last argument that may be an options hash (`gem "rack", OPTS`). Write it as one `gem "<name>", …` call with literal arguments on a line of its own. |
 | `redirect_gem_source_option` | the declaration already selects a source (`source:`, `git:`, `github:`, `path:`, a `**opts` splat that may hold one), sits inside a `source` / `git` / `github` / `path` block, or the lock resolves the gem from a `GIT` / `PATH` section. Bundler allows one source per gem. |
 | `redirect_gem_declared_more_than_once` | the Gemfile declares it more than once. Merge the declarations into one. |
-| `redirect_gem_declaration_not_visible` | the lock lists it as a direct dependency, but it is declared where the scan cannot edit: an `eval_gemfile`d file, a loop, a gemspec. |
+| `redirect_gem_declaration_not_visible` | the lock lists it as a direct dependency, but it is declared where the scan cannot edit: an `eval_gemfile`d file, a loop, a gemspec. Declare it with a literal `gem "<name>"` line in the Gemfile, in place of any other `gem` call that declares it (a gemspec's development dependency stays), or patch it with `--mode agent`. Vendored mode refuses it for the same reason. |
 | `redirect_gem_dependency_not_locked` | the Gemfile declares it and the lock's `DEPENDENCIES` does not list it. Run `bundle lock` and re-run. |
 | `redirect_gem_lock_unconvergeable` | the lock cannot be brought in line with the Gemfile: it has no `BUNDLED WITH` section to say which layout its Bundler accepts, or a Bundler < 2.2 lock lists its sources in an order the Gemfile's `source` lines do not explain. Run `bundle lock` with your current Bundler and re-run. |
 | `redirect_gem_platform_unsupported` | the lock holds a platform-specific build of the gem (`nokogiri (1.18.10-x86_64-linux-gnu)`) that the patch has no patched build for. The warning names the builds the lock holds, the ones that are missing, and what the patch registry serves. See "Precompiled platform gems" below. |
 
-`--mode vendored` or `--mode agent` can still patch a gem hosted mode skips.
+`--mode agent` can still patch a gem hosted mode skips. `--mode vendored` can too, unless it
+refuses the gem itself (see "Ruby gems: gems vendored mode refuses").
 
 **Precompiled platform gems.** Bundler installs a gem such as nokogiri as a precompiled platform
 gem, and the lock then has one entry per platform the project supports, usually with no plain
@@ -2166,6 +2226,16 @@ the shared gem home. Another project that pins the upstream build of the same ge
 loads the patched code too, and its `bundle pristine` fails on the checksum until it is patched
 as well.
 
+`rollback` and `remove` take `--gem-refresh-shared` as well, on the run that removes the patch:
+it then puts the upstream gem back in the shared gem home. Without it the run warns that the
+shared copy still holds the patched build. Running the command again doesn't help, because the
+patch is already removed and there is nothing left to roll back. The warning names what to run
+instead: the `bundle config` line above, or an `rm -f` of the gem's `specifications/` entry and
+its `cache/` archive followed by `bundle install`, which fetches the upstream gem into the shared
+gem home. Another project that still pins the patched build of that gem version then loads the
+upstream code; a `socket-patch scan` there reports it, and `--gem-refresh-shared` on that scan
+puts the patched build back.
+
 A shared gem home also holds gem versions this project doesn't use: the gems Ruby ships (`rake`,
 `rexml`, ...) and the versions other projects installed. Hosted and vendored mode patch what
 `Gemfile.lock` resolves, so a version the lock doesn't list is skipped, never a failure: hosted
@@ -2176,12 +2246,13 @@ mode warns `redirect_gem_version_not_locked`, vendored mode reports a `skipped` 
 
 Vendored mode rewrites one top-level `gem` line to a `path:` source, and Bundler builds nothing
 for a path-sourced gem. It refuses a gem that doesn't fit and changes nothing for it; the other
-gems of the run are still vendored, and the run exits 1. These three refusals name another mode
+gems of the run are still vendored, and the run exits 1. These four refusals name another mode
 that can patch the gem:
 
 | Code | The gem | What the error offers |
 |---|---|---|
 | `gemfile_declaration_not_editable` ("is indented") | is declared inside a block: `group :test do`, `platforms … do`, a conditional. Every Rails Gemfile declares its development and test gems this way. | Move the declaration to the top level (for a plain `group` block the error spells the option that replaces it, `group: :test`), or patch the gem with `--mode hosted`, which edits a declaration where it is. Inside a `source`, `git`, `github` or `path` block hosted mode refuses the gem too, and the error names `--mode agent`. |
+| `gemfile_declaration_not_editable` ("as a direct dependency") | is a direct dependency the Gemfile declares out of sight: in a gemspec (a gem library's development dependency), an `eval_gemfile`d file, a loop. | Declare it with one literal `gem "<name>"` line in the Gemfile (above `gemspec`, where the Gemfile has that directive), in place of any other `gem` call that declares it, or patch the gem with `--mode agent`. Hosted mode refuses a gem declared in those places too. |
 | `native_extensions_unsupported` | builds a native extension (puma, bootsnap). | `--mode hosted` or `--mode agent`. Both build the extension. Only `--mode agent` when the declaration picks the gem's source (a `source`, `git`, `github` or `path` block or option), which hosted mode refuses. |
 | `platform_gem_unsupported` | is installed as a precompiled platform build (`nokogiri-1.18.3-x86_64-linux-gnu`). | `--mode agent`. Hosted mode refuses a precompiled build too. |
 

@@ -143,7 +143,15 @@ impl Policy {
     /// `.bundle/config` `path` or `cache_path` naming another directory, a
     /// `vendor/bundle` that is a symlink. The repository picks those, so
     /// they are written only on the same request as a shared gem home.
-    fn may_replace(&self, path: &Path, project_local: bool) -> Result<(), Why> {
+    ///
+    /// The out-of-tree reason names `--gem-refresh-shared` only where a
+    /// re-run with it can still act: an unwind's can't (see `retry_hint`).
+    fn may_replace(
+        &self,
+        path: &Path,
+        project_local: bool,
+        direction: Direction,
+    ) -> Result<(), Why> {
         if !project_local && !self.shared {
             return Err(Why::Shared);
         }
@@ -152,8 +160,14 @@ impl Policy {
         }
         if !self.shared && !resolves_inside(&self.root, path) {
             return Err(Why::Failed(
-                "it is outside the project directory; `--gem-refresh-shared` refreshes it too"
-                    .to_string(),
+                match direction {
+                    Direction::Patched => {
+                        "it is outside the project directory; `--gem-refresh-shared` refreshes \
+                         it too"
+                    }
+                    Direction::Upstream => "it is outside the project directory",
+                }
+                .to_string(),
             ));
         }
         Ok(())
@@ -260,7 +274,7 @@ pub(crate) async fn attempt(
                 .map(|path| (Target::CacheArchive(path.clone()), true)),
         ];
         for (target, project_local) in candidates.into_iter().flatten() {
-            match policy.may_replace(target.path(), project_local) {
+            match policy.may_replace(target.path(), project_local, direction) {
                 Ok(()) => targets.push(target),
                 Err(why) => {
                     out.left.insert(target.path().to_path_buf(), why);
@@ -394,6 +408,37 @@ fn retry_hint(direction: Direction, why: Option<&Why>) -> &'static str {
     }
 }
 
+/// What replacing a shared copy with the upstream gem costs another
+/// project: one whose lock still pins the hosted patch of that gem version
+/// has it installed already, so its `bundle install` keeps the upstream
+/// copy (the mirror of what `--gem-refresh-shared` costs on a scan).
+fn other_projects_cost(gems: usize) -> String {
+    let them = if gems == 1 { "it" } else { "them" };
+    format!(
+        "another project that still pins the hosted patch of {them} then loads the upstream \
+         code, which `socket-patch scan` reports there"
+    )
+}
+
+/// `path` as one word of a POSIX shell command: as it is when every
+/// character is safe unquoted, else single-quoted.
+fn shell_word(path: &Path) -> String {
+    let text = path.display().to_string();
+    let safe = |c: char| c.is_ascii_alphanumeric() || "_@%+=:,./-".contains(c);
+    if !text.is_empty() && text.chars().all(safe) {
+        text
+    } else {
+        format!("'{}'", text.replace('\'', "'\\''"))
+    }
+}
+
+/// The `rm -f … && bundle install` that makes Bundler fetch again the gems
+/// `files` belong to.
+fn reinstall_command(files: &[PathBuf]) -> String {
+    let words: Vec<String> = files.iter().map(|path| shell_word(path)).collect();
+    format!("rm -f {} && bundle install", words.join(" "))
+}
+
 /// `action` after `hint` (which ends mid-sentence), or as a sentence of
 /// its own when there is none.
 fn after_hint(hint: &str, action: &str) -> String {
@@ -466,9 +511,18 @@ pub(crate) fn stale_detail(direction: Direction, gem: &StaleGem, why: Option<&Wh
         Some((dir, false)) if !matches!(why, Some(Why::Disabled | Why::Failed(_))) => format!(
             "{purl} {switched}, but the shared gem home still holds its {stale} install at \
              {}, and {reuse}. Other projects may load that gem home, so it was left alone. \
-             Install the {wanted} gem for this project only with `{LOCAL_PATH_REMEDY}`, or \
-             re-run with `--gem-refresh-shared` to replace the shared copy",
-            dir.display()
+             Install the {wanted} gem for this project only with `{LOCAL_PATH_REMEDY}`, or {}",
+            dir.display(),
+            match direction {
+                Direction::Patched => {
+                    "re-run with `--gem-refresh-shared` to replace the shared copy".to_string()
+                }
+                Direction::Upstream => format!(
+                    "replace the shared copy: remove {} and run `bundle install` ({})",
+                    display_list(&files_to_remove(gem)),
+                    other_projects_cost(1)
+                ),
+            }
         ),
         Some((dir, _)) => format!(
             "{purl} {switched}, but its {stale} install at {} was not refreshed{}, and \
@@ -638,6 +692,9 @@ pub(crate) fn report(
     let mut local: BTreeMap<Why, Vec<&StaleGem>> = BTreeMap::new();
     // The gems left alone in a shared home that are patched in place.
     let mut shared_in_place = 0;
+    // What to remove so `bundle install` fetches the gems left alone in a
+    // shared home again.
+    let mut shared_files: Vec<PathBuf> = Vec::new();
     for gem in stale {
         let why = why_stale(gem, attempt);
         if why == Why::Shared && gem.installed.is_some() && gem.in_place {
@@ -649,6 +706,7 @@ pub(crate) fn report(
         ));
         match (&why, &gem.installed) {
             (Why::Shared, Some((dir, _))) => {
+                shared_files.extend(files_to_remove(gem));
                 let home = dir.parent().and_then(Path::parent).unwrap_or(dir);
                 shared
                     .entry(home.display().to_string())
@@ -742,15 +800,24 @@ pub(crate) fn report(
                  place from the upstream archive beside it. ",
             );
         }
-        bullets.push(format!(
-            "{why}To install {them} for this project only, run `{LOCAL_PATH_REMEDY}`, or re-run \
-             with `--gem-refresh-shared` to replace the shared {copies}."
-        ));
+        bullets.push(match direction {
+            Direction::Patched => format!(
+                "{why}To install {them} for this project only, run `{LOCAL_PATH_REMEDY}`, or \
+                 re-run with `--gem-refresh-shared` to replace the shared {copies}."
+            ),
+            // An unwind can't be re-run (see `retry_hint`), so the shared
+            // copies are replaced by hand (#2086).
+            Direction::Upstream => format!(
+                "{why}To install {them} for this project only, run `{LOCAL_PATH_REMEDY}`. To \
+                 replace the shared {copies}, run `{}`; {}.",
+                reinstall_command(&shared_files),
+                other_projects_cost(shared_gems)
+            ),
+        });
     }
     for (why, gems) in &local {
         let files: Vec<PathBuf> = gems.iter().flat_map(|gem| files_to_remove(gem)).collect();
-        let files: Vec<String> = files.iter().map(|p| p.display().to_string()).collect();
-        let reinstall = format!("run `rm -f {} && bundle install`", files.join(" "));
+        let reinstall = format!("run `{}`", reinstall_command(&files));
         let names = labels(gems.iter().map(|gem| gem.purl.as_str()));
         bullets.push(match why {
             Why::Unverified(_) => format!(
@@ -1531,6 +1598,144 @@ mod tests {
         assert!(fixed < 480, "the whole warning stays short: {fixed}");
     }
 
+    /// #2086: an unwind leaves nothing for a second run to unwind, so the
+    /// warning about a shared gem home names no re-run with
+    /// `--gem-refresh-shared`. It names what works once the wiring is
+    /// gone: the project-local path, or the files to remove before
+    /// `bundle install` fetches the upstream gem into the shared home.
+    #[tokio::test]
+    async fn an_unwind_names_no_rerun_for_a_shared_home() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (proj, home) = (tmp.path().join("proj"), tmp.path().join("gemhome"));
+        std::fs::create_dir_all(&proj).unwrap();
+        let stale = vec![
+            installed("rack", &home, false),
+            installed("rexml", &home, false),
+        ];
+        let policy = policy(&proj, true, false, false);
+        let pass = attempt(
+            &stale,
+            unobtainable,
+            &Source::DiskOnly,
+            &policy,
+            Direction::Upstream,
+        )
+        .await;
+        assert!(pass.refreshed.is_empty(), "a shared home is never tried");
+        let out = report(Direction::Upstream, &stale, &pass, &policy);
+        let file = |dir: &str, name: &str| home.join(dir).join(name).display().to_string();
+
+        assert_eq!(out.warnings.len(), 2, "one --json warning per gem");
+        for ((code, detail), name) in out.warnings.iter().zip(["rack", "rexml"]) {
+            assert_eq!(*code, "upstream_gem_stale_install");
+            assert!(
+                !detail.contains("--gem-refresh-shared")
+                    && !detail.to_lowercase().contains("re-run"),
+                "a second unwind has nothing to unwind: {detail}"
+            );
+            for needle in [
+                "the shared gem home still holds its patched install",
+                LOCAL_PATH_REMEDY,
+                &file("specifications", &format!("{name}-1.0.0.gemspec")),
+                &file("cache", &format!("{name}-1.0.0.gem")),
+                "and run `bundle install`",
+            ] {
+                assert!(detail.contains(needle), "missing {needle:?}: {detail}");
+            }
+        }
+
+        let summary = out.summary.expect("a summary");
+        assert_eq!(
+            summary.headline,
+            "2 gems still hold the patched build on disk after the switch back to the upstream \
+             registry"
+        );
+        assert_eq!(
+            summary.bullets,
+            vec![
+                format!(
+                    "Shared gem home {} (left alone, other projects may load it): rack 1.0.0, \
+                     rexml 1.0.0.",
+                    home.display()
+                ),
+                format!(
+                    "`bundle install` reuses an installed gem instead of fetching the upstream \
+                     one. To install them for this project only, run `bundle config set --local \
+                     path vendor/bundle && bundle install`. To replace the shared copies, run \
+                     `rm -f {} {} {} {} && bundle install`; another project that still pins \
+                     the hosted patch of them then loads the upstream code, which \
+                     `socket-patch scan` reports there.",
+                    shell_word(&home.join("specifications/rack-1.0.0.gemspec")),
+                    shell_word(&home.join("cache/rack-1.0.0.gem")),
+                    shell_word(&home.join("specifications/rexml-1.0.0.gemspec")),
+                    shell_word(&home.join("cache/rexml-1.0.0.gem")),
+                ),
+            ]
+        );
+    }
+
+    /// A path in the `rm -f` remedy is one shell word: a gem home under a
+    /// directory with a space or a quote in its name is quoted, so the
+    /// command removes the files it names.
+    #[tokio::test]
+    async fn the_rm_remedy_quotes_a_path_the_shell_would_split() {
+        assert_eq!(
+            shell_word(Path::new("/opt/gems/rack-1.0.0.gem")),
+            "/opt/gems/rack-1.0.0.gem"
+        );
+        assert_eq!(
+            shell_word(Path::new("/Users/Jane Doe/.gem")),
+            "'/Users/Jane Doe/.gem'"
+        );
+        assert_eq!(
+            shell_word(Path::new("/tmp/it's/$HOME")),
+            r"'/tmp/it'\''s/$HOME'"
+        );
+
+        let tmp = tempfile::tempdir().unwrap();
+        let (proj, home) = (tmp.path().join("proj"), tmp.path().join("Jane Doe/gemhome"));
+        std::fs::create_dir_all(&proj).unwrap();
+        let file = |dir: &str, name: &str| home.join(dir).join(name).display().to_string();
+        let expected = format!(
+            "run `rm -f '{}' '{}' && bundle install`",
+            file("specifications", "rack-1.0.0.gemspec"),
+            file("cache", "rack-1.0.0.gem")
+        );
+
+        // A shared home after an unwind.
+        let stale = vec![installed("rack", &home, false)];
+        let policy_on = policy(&proj, true, false, false);
+        let upstream = |policy: &Policy| {
+            let (stale, policy) = (stale.clone(), policy.clone());
+            async move {
+                let pass = attempt(
+                    &stale,
+                    unobtainable,
+                    &Source::DiskOnly,
+                    &policy,
+                    Direction::Upstream,
+                )
+                .await;
+                report(Direction::Upstream, &stale, &pass, &policy)
+                    .summary
+                    .expect("a summary")
+                    .paragraph()
+            }
+        };
+        let summary = upstream(&policy_on).await;
+        assert!(summary.contains(&expected), "{summary}");
+
+        // A project-local copy the run did not refresh.
+        let stale = vec![installed("rack", &home, true)];
+        let policy_off = policy(&proj, false, false, false);
+        let pass = pass(&stale, &policy_off).await;
+        let summary = report(Direction::Patched, &stale, &pass, &policy_off)
+            .summary
+            .expect("a summary")
+            .paragraph();
+        assert!(summary.contains(&expected), "{summary}");
+    }
+
     /// A copy that could not be checked against the upstream gem (the
     /// registry that would say is refused) is reported with the reason and
     /// the files to remove, apart from the copies known to be stale: it is
@@ -2092,5 +2297,30 @@ mod tests {
             !summary.contains("Re-run without") && summary.contains("Run `rm -f "),
             "{summary}"
         );
+
+        // Nor the flag a re-run would take (#2086): the out-of-tree path
+        // is named with the files to remove alone.
+        let tried = attempt(
+            &gems,
+            unobtainable,
+            &Source::DiskOnly,
+            &policy_default,
+            Direction::Upstream,
+        )
+        .await;
+        let out = report(Direction::Upstream, &gems, &tried, &policy_default);
+        for (_, detail) in &out.warnings {
+            assert!(!detail.contains("--gem-refresh-shared"), "{detail}");
+        }
+        assert!(
+            out.warnings[2]
+                .1
+                .contains("(it is outside the project directory)")
+                && out.warnings[2].1.contains("and run `bundle install`"),
+            "{}",
+            out.warnings[2].1
+        );
+        let summary = out.summary.expect("stale gems").paragraph();
+        assert!(!summary.contains("--gem-refresh-shared"), "{summary}");
     }
 }

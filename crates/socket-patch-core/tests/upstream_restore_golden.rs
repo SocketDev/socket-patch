@@ -3702,8 +3702,9 @@ async fn vlt_goldens_round_trip() {
 #[tokio::test]
 #[serial]
 async fn maven_goldens_round_trip() {
-    // mvn-config-merge: `.mvn/maven.config` existed, so whether the appended
-    // resolver lines were the user's is not derivable; they stay (warned).
+    // mvn-config-merge, maven4-launcher-line-conflict: `.mvn/maven.config`
+    // existed, so whether the appended resolver lines were the user's is
+    // not derivable; they stay (warned).
     // no-suffix-fallback: a same-GAV repository is tied to no artifact, so
     // discovery reports no pin to restore.
     // self-closed-repositories / self-closed-depmgmt: the rewriter expanded
@@ -3712,6 +3713,7 @@ async fn maven_goldens_round_trip() {
     // maven unit tests).
     let not_invertible = [
         "mvn-config-merge",
+        "maven4-launcher-line-conflict",
         "no-suffix-fallback",
         "self-closed-repositories",
         "self-closed-depmgmt",
