@@ -345,8 +345,7 @@ fn format_search_results(
     color: bool,
     measured: &super::measured::Measured,
 ) -> String {
-    let mut patches: Vec<&PatchSearchResult> = patches.to_vec();
-    patches.sort_by(|a, b| natural_cmp(&a.purl, &b.purl).then_with(|| cmp_search_results(a, b)));
+    let patches = listing_order(patches);
 
     let mut out = format!(
         "Found {}:\n\n",
@@ -413,21 +412,36 @@ fn format_search_results(
     out
 }
 
+/// The order a listing shows `patches` in ([`format_search_results`]): by
+/// package, each package's patches best ranked first.
+fn listing_order<'a>(patches: &[&'a PatchSearchResult]) -> Vec<&'a PatchSearchResult> {
+    let mut patches: Vec<&PatchSearchResult> = patches.to_vec();
+    patches.sort_by(|a, b| natural_cmp(&a.purl, &b.purl).then_with(|| cmp_search_results(a, b)));
+    patches
+}
+
+/// The patches of a listing whose measurements are asked for: the first
+/// [`MEASURED_LISTED`] in the order the listing shows them
+/// ([`listing_order`]), so a long listing has its measurements at the
+/// top, not scattered over rows further down.
+fn measured_uuids(listed: &[&PatchSearchResult]) -> Vec<String> {
+    listing_order(listed)
+        .into_iter()
+        .take(MEASURED_LISTED)
+        .map(|p| p.uuid.clone())
+        .collect()
+}
+
 /// What Socket measured about the patches a listing is about to show, for
 /// [`format_search_results`]: asked for only when someone is watching
 /// ([`super::measured::wanted`]), and only for the first
-/// [`MEASURED_LISTED`] of a long listing.
+/// [`MEASURED_LISTED`] of a long listing ([`measured_uuids`]).
 async fn measure_listed(
     common: &GlobalArgs,
     api_client: &ApiClient,
     listed: &[&PatchSearchResult],
 ) -> super::measured::Measured {
-    let uuids: Vec<String> = listed
-        .iter()
-        .take(MEASURED_LISTED)
-        .map(|p| p.uuid.clone())
-        .collect();
-    super::measured::fetch(common, api_client, uuids).await
+    super::measured::fetch(common, api_client, measured_uuids(listed)).await
 }
 
 /// Most patches of one listing whose measurements are asked for.
@@ -4355,6 +4369,37 @@ mod tests {
             Ordering::Greater
         );
         assert_eq!(natural_cmp("é2", "é10"), Ordering::Less);
+    }
+
+    /// A long listing asks for the measurements of the patches at its
+    /// top: the first of them in the order it shows them, whatever order
+    /// the search returned them in. Measured in search order, they would
+    /// land on rows further down and leave the first ones bare.
+    #[test]
+    fn a_long_listing_measures_the_patches_it_shows_first() {
+        let total = MEASURED_LISTED + 8;
+        // As a search returns them: the reverse of how they are listed.
+        let found: Vec<PatchSearchResult> = (0..total)
+            .rev()
+            .map(|i| {
+                mk_patch(
+                    &format!("uuid-{i:02}"),
+                    &format!("pkg:npm/lodash@4.17.{i}"),
+                    "free",
+                    "2024-01-01",
+                )
+            })
+            .collect();
+        let found: Vec<&PatchSearchResult> = found.iter().collect();
+        let shown: Vec<String> = listing_order(&found)
+            .iter()
+            .map(|p| p.uuid.clone())
+            .collect();
+        assert_eq!(shown[0], "uuid-00");
+        assert_eq!(shown[total - 1], format!("uuid-{:02}", total - 1));
+        assert_eq!(measured_uuids(&found), shown[..MEASURED_LISTED]);
+        // A short one measures them all.
+        assert_eq!(measured_uuids(&found[..3]).len(), 3);
     }
 
     #[test]

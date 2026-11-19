@@ -175,6 +175,39 @@ fn keys(bytes: &[u8]) -> (Vec<Key>, &[u8]) {
     (keys, &bytes[at..])
 }
 
+/// How a wait for input ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Wait {
+    /// There is input to read.
+    Ready,
+    /// The time passed with none.
+    TimedOut,
+    /// A signal cut the wait short (the terminal was resized, a child
+    /// exited): nothing is known yet.
+    Interrupted,
+}
+
+/// Whether input arrives within `limit`, waiting with `wait` (which is
+/// given the time left). A wait a signal cuts short is taken up again
+/// for what is left of the time: read as the time having passed, it
+/// would take the first byte of an arrow key for the Esc key by itself,
+/// and close the page under a terminal being resized.
+fn arrives_within(
+    limit: std::time::Duration,
+    mut wait: impl FnMut(std::time::Duration) -> std::io::Result<Wait>,
+) -> std::io::Result<bool> {
+    let deadline = std::time::Instant::now() + limit;
+    loop {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        match wait(left)? {
+            Wait::Ready => return Ok(true),
+            Wait::TimedOut => return Ok(false),
+            Wait::Interrupted if left.is_zero() => return Ok(false),
+            Wait::Interrupted => {}
+        }
+    }
+}
+
 /// How far a sideways step moves a page.
 const SIDEWAYS: usize = 8;
 
@@ -807,7 +840,7 @@ mod screen {
     use std::sync::mpsc::{Receiver, TryRecvError};
     use std::time::Duration;
 
-    use super::{decode, keys, Key, Page, State, Step, Table, Update};
+    use super::{arrives_within, decode, keys, Key, Page, State, Step, Table, Update, Wait};
 
     /// Enter the alternate screen and hide the cursor; leave and show.
     const ENTER: &str = "\x1b[?1049h\x1b[?25l";
@@ -876,10 +909,9 @@ mod screen {
     /// nothing after it for this long is the Esc key.
     const REST_OF_KEY: Duration = Duration::from_millis(40);
 
-    /// Whether stdin has bytes to read within `wait`. `Err` when it
-    /// cannot be waited on; a signal (the terminal was resized) reads as
-    /// nothing yet.
-    fn readable(wait: Duration) -> std::io::Result<bool> {
+    /// Wait up to `wait` for stdin to have bytes to read. `Err` when it
+    /// cannot be waited on.
+    fn wait_readable(wait: Duration) -> std::io::Result<Wait> {
         // `select`, not `poll`: macOS's `poll` does not report terminal
         // devices reliably.
         // SAFETY: `fd_set` is plain data the FD_* macros initialise and
@@ -904,12 +936,16 @@ mod screen {
         if ready < 0 {
             let e = std::io::Error::last_os_error();
             return if e.kind() == std::io::ErrorKind::Interrupted {
-                Ok(false)
+                Ok(Wait::Interrupted)
             } else {
                 Err(e)
             };
         }
-        Ok(ready > 0)
+        Ok(if ready > 0 {
+            Wait::Ready
+        } else {
+            Wait::TimedOut
+        })
     }
 
     /// Read what stdin has into `bytes`. `Err` when stdin is gone
@@ -939,7 +975,9 @@ mod screen {
     /// The keys pressed within a [`TICK`], in order: none when no key
     /// came. `Err` when stdin is gone.
     fn next_keys() -> std::io::Result<Vec<Key>> {
-        if !readable(TICK)? {
+        // A signal that cuts the tick short is the end of the tick: the
+        // caller looks at the terminal's size again.
+        if wait_readable(TICK)? != Wait::Ready {
             return Ok(Vec::new());
         }
         let mut bytes = Vec::new();
@@ -954,7 +992,7 @@ mod screen {
             // The start of a key: its rest is on its way, or it is the
             // Esc key by itself.
             let rest = rest.to_vec();
-            if !readable(REST_OF_KEY)? {
+            if !arrives_within(REST_OF_KEY, wait_readable)? {
                 pressed.push(decode(&rest));
                 return Ok(pressed);
             }
@@ -1198,6 +1236,45 @@ mod tests {
         assert_eq!(all(b"\x1b[1;5Cj"), (vec![Key::Other, Key::Down], vec![]));
         assert_eq!(all("éj".as_bytes()), (vec![Key::Other, Key::Down], vec![]));
         assert_eq!(all(b""), (vec![], vec![]));
+    }
+
+    /// The wait for the rest of a key rides out a signal: an interrupted
+    /// wait is taken up again for the time that is left, so a resize in
+    /// the middle of an arrow key never turns its first byte into Esc.
+    /// Only the time passing ends the wait with nothing.
+    #[test]
+    fn the_wait_for_the_rest_of_a_key_rides_out_signals() {
+        use std::time::Duration;
+        let limit = Duration::from_millis(40);
+        let scripted = |script: &'static [Wait]| {
+            let mut calls = 0;
+            let result = arrives_within(limit, |left| {
+                assert!(left <= limit);
+                calls += 1;
+                Ok(script[(calls - 1).min(script.len() - 1)])
+            });
+            (result.unwrap(), calls)
+        };
+        assert_eq!(scripted(&[Wait::Ready]), (true, 1));
+        assert_eq!(scripted(&[Wait::TimedOut]), (false, 1));
+        // Interrupted, then the rest arrives: the key is whole.
+        assert_eq!(
+            scripted(&[Wait::Interrupted, Wait::Interrupted, Wait::Ready]),
+            (true, 3)
+        );
+        // Interrupted, then nothing in what was left of the time.
+        assert_eq!(scripted(&[Wait::Interrupted, Wait::TimedOut]), (false, 2));
+        // Signals without end stop at the limit, not never.
+        let started = std::time::Instant::now();
+        let ended = arrives_within(limit, |left| {
+            std::thread::sleep(left.min(Duration::from_millis(5)));
+            Ok(Wait::Interrupted)
+        });
+        assert!(!ended.unwrap());
+        assert!(started.elapsed() >= limit);
+        assert!(started.elapsed() < Duration::from_secs(5));
+        // A wait that fails is the failure.
+        assert!(arrives_within(limit, |_| Err(std::io::ErrorKind::Other.into())).is_err());
     }
 
     #[test]
