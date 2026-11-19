@@ -10,6 +10,34 @@ pub fn plural(n: usize, one: &str, many: &str) -> String {
 
 const ELLIPSIS: &str = "...";
 
+/// The worst severity (upper-cased; empty when none is named) and the
+/// ids to show for a set of advisories, each given as its id, its
+/// severity and its CVEs: an advisory is named by its CVEs, or by its own
+/// id when it has none. The ids are sorted, each once.
+pub fn worst_and_ids<'a>(
+    advisories: impl Iterator<Item = (&'a str, &'a str, &'a [String])>,
+) -> (String, Vec<String>) {
+    use socket_patch_core::api::ranking::severity_order;
+    let mut worst: Option<&str> = None;
+    let mut ids = Vec::new();
+    for (id, severity, cves) in advisories {
+        let severity = severity.trim();
+        if !severity.is_empty()
+            && worst.is_none_or(|w| severity_order(Some(severity)) < severity_order(Some(w)))
+        {
+            worst = Some(severity);
+        }
+        if cves.is_empty() {
+            ids.push(id.to_string());
+        } else {
+            ids.extend(cves.iter().cloned());
+        }
+    }
+    ids.sort();
+    ids.dedup();
+    (worst.map(str::to_uppercase).unwrap_or_default(), ids)
+}
+
 /// How a listing names the packages `purls` name: `name@version` when
 /// they are all of one ecosystem (the lines around them say which), the
 /// purl otherwise, where a bare name could be either's. The purl is in
@@ -323,6 +351,40 @@ mod tests {
         );
         assert_eq!(package_names(&["not a purl"]), ["not a purl"]);
         assert!(package_names(&[]).is_empty());
+    }
+
+    /// One rule for the severity and the ids of a set of advisories,
+    /// wherever a patch is named in a line: the `list` row, `show`'s
+    /// title and the patch menu.
+    #[test]
+    fn worst_and_ids_names_advisories_by_cve_and_skips_blank_severities() {
+        let cves = |ids: &[&str]| ids.iter().map(|id| id.to_string()).collect::<Vec<_>>();
+        let (two, none, shared) = (cves(&["CVE-2", "CVE-1"]), cves(&[]), cves(&["CVE-1"]));
+        let advisories = [
+            ("GHSA-b", "moderate", two.as_slice()),
+            ("GHSA-a", " High ", none.as_slice()),
+            ("GHSA-c", "", shared.as_slice()),
+        ];
+        assert_eq!(
+            worst_and_ids(advisories.into_iter()),
+            (
+                "HIGH".to_string(),
+                vec![
+                    "CVE-1".to_string(),
+                    "CVE-2".to_string(),
+                    "GHSA-a".to_string()
+                ]
+            )
+        );
+        // No severity named at all: none is shown, not an empty one.
+        assert_eq!(
+            worst_and_ids([("GHSA-c", "  ", none.as_slice())].into_iter()),
+            (String::new(), vec!["GHSA-c".to_string()])
+        );
+        assert_eq!(
+            worst_and_ids(std::iter::empty()),
+            (String::new(), Vec::new())
+        );
     }
 
     #[test]

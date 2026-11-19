@@ -7,19 +7,19 @@
 //! run-time cost), the files it changes with their line counts, and the
 //! unified diff of each file.
 //!
-//! On a terminal a patch that changes several files opens a menu of them,
-//! and each diff is shown through the pager (`$PAGER`, else `less`); Esc
-//! leaves. Piped, with `--no-pager`, or with `--file`, everything asked
-//! for is printed at once, like `git show`.
+//! There is one way a patch is read ([`Source`], [`Shown::read`]) and one
+//! screen it is read on: on a terminal `show` opens the patch as a page of the
+//! full-screen browser ([`ui::browser`]), the same page a row of `list`
+//! opens ([`load_page`]). Anywhere else (a pipe, `--no-pager`, `--yes`)
+//! the same text is printed at once, like `git show`.
 
-use std::collections::HashMap;
 use std::io::IsTerminal;
 
 use base64::Engine as _;
 use clap::Args;
 use socket_patch_core::api::client::{
     build_proxy_fallback_client, get_api_client_with_overrides, is_fallback_candidate, ApiClient,
-    ApiError,
+    ApiClientEnvOverrides, ApiError,
 };
 use socket_patch_core::api::ranking::{cmp_search_results, severity_order};
 use socket_patch_core::api::types::{PatchFileResponse, PatchResponse, PatchSearchResult};
@@ -56,8 +56,8 @@ pub struct ShowArgs {
     #[arg(long, default_value_t = false)]
     pub stat: bool,
 
-    /// Print everything at once instead of opening the file menu and the
-    /// pager (what a pipe gets)
+    /// Print everything at once instead of opening the patch full-screen
+    /// (what a pipe gets)
     #[arg(long = "no-pager", default_value_t = false)]
     pub no_pager: bool,
 }
@@ -220,10 +220,15 @@ fn summary(patch: &PatchResponse, files: &[ShownFile], style: Style) -> Vec<Stri
             .cmp(&severity_order(Some(&b.1.severity)))
             .then_with(|| a.0.cmp(b.0))
     });
-    let worst = vulns.first().map(|(_, v)| v.severity.to_uppercase());
+    // The worst severity, as the row of `list` and the patch menu have it.
+    let (worst, _) = ui::worst_and_ids(
+        vulns
+            .iter()
+            .map(|(id, v)| (id.as_str(), v.severity.as_str(), v.cves.as_slice())),
+    );
     let mut head = ui::bold(&normalize_purl(&patch.purl), color);
-    if let Some(severity) = &worst {
-        head.push_str(&format!("  {}", ui::severity(severity, color)));
+    if !worst.is_empty() {
+        head.push_str(&format!("  {}", ui::severity(&worst, color)));
     }
     head.push_str(&format!("  [{}]", patch.tier.to_uppercase()));
     let mut about = format!("Patch {}", patch.uuid);
@@ -322,53 +327,141 @@ fn diff_text(file: &ShownFile) -> String {
     }
 }
 
-/// The patch as a page of the full-screen browser: under the package as
-/// its title, what the patch fixes and what was measured about it (the
-/// summary), then the diff of each of `shown`, with a mark at each so the
-/// reader can step from file to file.
-fn page_of(
-    patch: &PatchResponse,
-    files: &[ShownFile],
-    shown: &[&ShownFile],
-    style: Style,
-) -> ui::browser::Page {
-    let summary = summary(patch, files, style);
-    let title = summary.first().map(|head| ui::strip_ansi(head));
-    let mut lines: Vec<String> = summary.into_iter().skip(1).collect();
-    let mut marks = Vec::new();
-    for file in shown {
-        lines.push(String::new());
-        marks.push((lines.len(), file.path.clone()));
-        lines.extend(diff_text(file).lines().map(str::to_string));
+/// The patch service as one run reads patches from it: the run's own
+/// client and, for a read the service refuses that client's token (401 /
+/// 403), the public service, which has the free patches. The public
+/// client is built once, on the first refusal.
+pub(crate) struct Source {
+    client: ApiClient,
+    overrides: ApiClientEnvOverrides,
+    public: std::sync::OnceLock<ApiClient>,
+}
+
+impl Source {
+    pub(crate) fn new(client: ApiClient, overrides: ApiClientEnvOverrides) -> Source {
+        Source {
+            client,
+            overrides,
+            public: std::sync::OnceLock::new(),
+        }
     }
-    ui::browser::Page {
-        title: title.unwrap_or_default(),
-        lines,
-        marks,
+
+    /// The run's own client.
+    pub(crate) fn client(&self) -> &ApiClient {
+        &self.client
+    }
+
+    /// Ask the service with `read`: the client that answered, and its
+    /// answer. A refusal the public service cannot make good (it has no
+    /// such patch, or cannot be reached) stays the answer: it is the
+    /// cause, and the public service's "no such patch" would hide it.
+    pub(crate) async fn ask<'s, T, F, Fut>(
+        &'s self,
+        read: F,
+    ) -> (&'s ApiClient, Result<Option<T>, ApiError>)
+    where
+        F: Fn(&'s ApiClient) -> Fut,
+        Fut: std::future::Future<Output = Result<Option<T>, ApiError>>,
+    {
+        let answer = read(&self.client).await;
+        let refused = matches!(&answer, Err(e) if is_fallback_candidate(e));
+        if refused && !self.client.uses_public_proxy() {
+            let public = self
+                .public
+                .get_or_init(|| build_proxy_fallback_client(&self.overrides));
+            if let Ok(Some(found)) = read(public).await {
+                return (public, Ok(Some(found)));
+            }
+        }
+        (&self.client, answer)
     }
 }
 
-/// Patch `uuid` as a page of the full-screen browser ([`page_of`], every
-/// file), read from the patch service with `client`. `Err` is why there
-/// is none, as a sentence to show in its place. Nothing is printed: the
-/// caller has the screen.
+/// A patch as the patch service has it, with the diff of each file it
+/// changes: everything `show` prints and everything the page shows.
+struct Shown {
+    patch: PatchResponse,
+    files: Vec<ShownFile>,
+}
+
+/// Why a patch could not be read: the code `--json` reports it under, and
+/// the reason as the end of a sentence (`Error: <message>`).
+struct Unread {
+    code: &'static str,
+    message: String,
+}
+
+impl Shown {
+    /// Read patch `uuid` and the content of its files from the patch
+    /// service ([`Source::ask`]): the one way a patch is read, for `show`
+    /// and for the page a `list` row opens. `style` colors the diff
+    /// lines.
+    async fn read(source: &Source, uuid: &str, style: Style) -> Result<Shown, Unread> {
+        let (client, view) = source
+            .ask(|client| client.fetch_patch_with_sources(uuid))
+            .await;
+        let patch = match view {
+            Ok(Some(patch)) => patch,
+            Ok(None) => {
+                return Err(Unread {
+                    code: "patch_not_found",
+                    message: format!("no patch found with UUID {uuid}"),
+                })
+            }
+            Err(e) => {
+                let message = match &e {
+                    ApiError::Forbidden(_) => format!(
+                        "patch {uuid} needs a paid Socket plan, or access this token does not \
+                         have ({e})"
+                    ),
+                    _ => e.to_string(),
+                };
+                return Err(Unread {
+                    code: "patch_fetch_failed",
+                    message,
+                });
+            }
+        };
+        let files = shown_files(client, &patch, style).await;
+        Ok(Shown { patch, files })
+    }
+
+    /// The patch as a page of the full-screen browser: under the package
+    /// as its title, what the patch fixes and what was measured about it
+    /// (the summary), then the diff of each of `selected`, with a mark at
+    /// each so the reader can step from file to file.
+    fn page(&self, selected: &[&ShownFile], style: Style) -> ui::browser::Page {
+        let summary = summary(&self.patch, &self.files, style);
+        let title = summary.first().map(|head| ui::strip_ansi(head));
+        let mut lines: Vec<String> = summary.into_iter().skip(1).collect();
+        let mut marks = Vec::new();
+        for file in selected {
+            lines.push(String::new());
+            marks.push((lines.len(), file.path.clone()));
+            lines.extend(diff_text(file).lines().map(str::to_string));
+        }
+        ui::browser::Page {
+            title: title.unwrap_or_default(),
+            lines,
+            marks,
+        }
+    }
+}
+
+/// Patch `uuid` as the page `show` opens for it, every file's diff
+/// included ([`Shown::read`], [`Shown::page`]): what a row of `list`
+/// opens. `Err` is why there is none, as the end of a sentence. Nothing
+/// is printed: the caller has the screen.
 pub(crate) async fn load_page(
-    client: &ApiClient,
+    source: &Source,
     uuid: &str,
     style: Style,
 ) -> Result<ui::browser::Page, String> {
-    match client.fetch_patch_with_sources(uuid).await {
-        Ok(Some(patch)) => {
-            let files = shown_files(client, &patch, style).await;
-            let all: Vec<&ShownFile> = files.iter().collect();
-            Ok(page_of(&patch, &files, &all, style))
-        }
-        Ok(None) => Err(format!("No patch found with UUID {uuid}.")),
-        Err(e @ ApiError::Forbidden(_)) => Err(format!(
-            "Patch {uuid} needs a paid Socket plan, or access this token does not have ({e})."
-        )),
-        Err(e) => Err(format!("The patch could not be read: {e}")),
-    }
+    let shown = Shown::read(source, uuid, style)
+        .await
+        .map_err(|unread| unread.message)?;
+    let all: Vec<&ShownFile> = shown.files.iter().collect();
+    Ok(shown.page(&all, style))
 }
 
 /// The files `--file` selects: each spec names a path of the patch, or
@@ -402,85 +495,15 @@ fn select_files<'a>(
         .collect())
 }
 
-/// Show `text` through the user's pager (`$PAGER`, else `less`, which is
-/// told to pass colors through, to exit when the text fits one screen and
-/// to leave it on the screen: `LESS=FRX`, unless `LESS` is set). `false`
-/// when no pager could be started; the caller then prints the text.
-///
-/// While the pager is up, Ctrl-C is its own to handle (`less` stops a
-/// search with it): this process ignores it, as git does, rather than
-/// exit and leave the pager on the terminal.
-#[cfg(unix)]
-fn page(text: &str) -> bool {
-    use std::io::Write;
-    let pager = std::env::var("PAGER")
-        .ok()
-        .filter(|p| !p.trim().is_empty())
-        .unwrap_or_else(|| "less".to_string());
-    let mut words = pager.split_whitespace();
-    let Some(program) = words.next() else {
-        return false;
-    };
-    let mut command = std::process::Command::new(program);
-    command.args(words).stdin(std::process::Stdio::piped());
-    if std::env::var_os("LESS").is_none() {
-        command.env("LESS", "FRX");
-    }
-    let Ok(mut child) = command.spawn() else {
-        return false;
-    };
-    // SAFETY: `signal` only swaps this process's disposition of SIGINT,
-    // and the previous one is put back below once the pager has exited.
-    let previous = unsafe { libc::signal(libc::SIGINT, libc::SIG_IGN) };
-    if let Some(mut stdin) = child.stdin.take() {
-        // A pager quit early closes the pipe: nothing more to show.
-        let _ = stdin.write_all(text.as_bytes());
-        let _ = stdin.write_all(b"\n");
-    }
-    let _ = child.wait();
-    // SAFETY: see above.
-    unsafe {
-        libc::signal(libc::SIGINT, previous);
-    }
-    true
-}
-
-/// No pager is assumed on Windows: the text is printed.
-#[cfg(not(unix))]
-fn page(_text: &str) -> bool {
-    false
-}
-
-/// Print `text` through the pager when `paged`, else straight to stdout.
-fn present(text: &str, paged: bool) {
-    if !(paged && page(text)) {
-        println!("{text}");
-    }
-}
-
 /// One line of the patch menu: `8be53d06  pkg:npm/undici@8.10.0  HIGH
 /// CVE-2026-84961, CVE-2026-85024`.
 fn candidate_label(patch: &PatchSearchResult) -> String {
-    let mut ids: Vec<String> = patch
-        .vulnerabilities
-        .iter()
-        .flat_map(|(id, vuln)| {
-            if vuln.cves.is_empty() {
-                vec![id.clone()]
-            } else {
-                vuln.cves.clone()
-            }
-        })
-        .collect();
-    ids.sort();
-    ids.dedup();
-    let severity = patch
-        .vulnerabilities
-        .values()
-        .map(|v| v.severity.as_str())
-        .min_by_key(|s| severity_order(Some(s)))
-        .unwrap_or("")
-        .to_uppercase();
+    let (severity, ids) = ui::worst_and_ids(
+        patch
+            .vulnerabilities
+            .iter()
+            .map(|(id, vuln)| (id.as_str(), vuln.severity.as_str(), vuln.cves.as_slice())),
+    );
     format!(
         "{}  {}  {severity}  {}",
         ui::short_uuid(&patch.uuid),
@@ -545,7 +568,7 @@ pub async fn run(args: ShowArgs) -> i32 {
     }
     let target = Target::parse(&args.identifier);
     let overrides = common.api_client_overrides();
-    let (mut client, mut on_proxy) = get_api_client_with_overrides(overrides.clone()).await;
+    let (mut client, _) = get_api_client_with_overrides(overrides.clone()).await;
     let mut status = ui::StatusLine::stderr(common.json, common.silent);
 
     // Which patch: the UUID given, or the pick among the ones found.
@@ -554,11 +577,11 @@ pub async fn run(args: ShowArgs) -> i32 {
     } else {
         status.set(format!("Finding patches for {target}..."));
         let mut found = candidates(&args, &target, &client).await;
-        if let (Err(_), false) = (&found, on_proxy) {
+        if let (Err(_), false) = (&found, client.uses_public_proxy()) {
             // A refused token still reaches the free patches.
             let proxy = build_proxy_fallback_client(&overrides);
             if let Ok(free) = candidates(&args, &target, &proxy).await {
-                (client, on_proxy, found) = (proxy, true, Ok(free));
+                (client, found) = (proxy, Ok(free));
             }
         }
         status.finish();
@@ -604,42 +627,19 @@ pub async fn run(args: ShowArgs) -> i32 {
     };
 
     status.set(format!("Reading patch {}...", ui::short_uuid(&uuid)));
-    let mut view = client.fetch_patch_with_sources(&uuid).await;
-    if let (Err(e), false) = (&view, on_proxy) {
-        if is_fallback_candidate(e) {
-            client = build_proxy_fallback_client(&overrides);
-            view = client.fetch_patch_with_sources(&uuid).await;
-        }
-    }
-    let patch = match view {
-        Ok(Some(patch)) => patch,
-        Ok(None) => {
-            status.finish();
-            return fail(
-                common,
-                "patch_not_found",
-                &format!("no patch found with UUID {uuid}"),
-            );
-        }
-        Err(e) => {
-            status.finish();
-            let message = match &e {
-                ApiError::Forbidden(_) => format!(
-                    "patch {uuid} needs a paid Socket plan, or access this token does not \
-                     have ({e})"
-                ),
-                _ => e.to_string(),
-            };
-            return fail(common, "patch_fetch_failed", &message);
-        }
-    };
     let style = if common.json {
         Style::PLAIN
     } else {
         Style::stdout()
     };
-    let files = shown_files(&client, &patch, style).await;
+    let source = Source::new(client, overrides);
+    let shown = Shown::read(&source, &uuid, style).await;
     status.finish();
+    let shown = match shown {
+        Ok(shown) => shown,
+        Err(unread) => return fail(common, unread.code, &unread.message),
+    };
+    let (patch, files) = (&shown.patch, &shown.files);
 
     if common.json {
         ui::print_json(&serde_json::json!({
@@ -670,68 +670,29 @@ pub async fn run(args: ShowArgs) -> i32 {
         return 0;
     }
 
-    let selected = match select_files(&files, &args.files) {
+    let selected = match select_files(files, &args.files) {
         Ok(selected) => selected,
         Err(message) => return fail(common, "file_not_in_patch", &message),
     };
-    // Someone at a terminal reads the patch full-screen: the summary and
-    // every selected diff on one page that scrolls, steps from file to
-    // file and follows the terminal's size. Where there is no such screen
-    // (a pipe, `--no-pager`, `--yes`, a terminal that shows no escape
-    // sequences or cannot be set up), the same text prints below.
+    // Someone at a terminal reads the patch on the page a row of `list`
+    // opens: the summary and every selected diff, which scrolls, steps
+    // from file to file and follows the terminal's size. Where there is
+    // no such screen (a pipe, `--no-pager`, `--yes`, a terminal that
+    // shows no escape sequences or cannot be set up), the same text
+    // prints below.
     let reads =
         !args.stat && !args.no_pager && !common.yes && !selected.is_empty() && ui::full_screen();
-    let read = reads && ui::browser::read(page_of(&patch, &files, &selected, style));
+    let read = reads && ui::browser::read(shown.page(&selected, style));
     // The summary is what stays on the terminal either way.
-    for line in summary(&patch, &files, style) {
+    for line in summary(patch, files, style) {
         println!("{line}");
     }
     if args.stat || selected.is_empty() || read {
         return 0;
     }
-
-    let on_terminal = std::io::stdout().is_terminal();
-    let paged = on_terminal && !args.no_pager;
-    let by_path: HashMap<&str, &ShownFile> =
-        selected.iter().map(|f| (f.path.as_str(), *f)).collect();
-    // A menu of the files, for someone at the keyboard who asked for none
-    // in particular.
-    let menu = paged
-        && args.files.is_empty()
-        && selected.len() > 1
-        && !common.yes
-        && std::io::stdin().is_terminal();
-    if !menu {
-        let all: Vec<String> = selected.iter().map(|f| diff_text(f)).collect();
-        println!();
-        present(&all.join("\n"), paged);
-        return 0;
-    }
-    let path_w = selected
-        .iter()
-        .map(|f| f.path.chars().count())
-        .max()
-        .unwrap_or(0);
-    let mut options = vec![format!("All {} files", selected.len())];
-    options.extend(selected.iter().map(|f| {
-        format!(
-            "{}  {}",
-            ui::pad(&f.path, path_w),
-            ui::strip_ansi(&change_label(f, false))
-        )
-    }));
     println!();
-    // Until Esc: pick a file, read its diff, come back.
-    while let Ok(picked) = select_one("Open a file's diff (Esc to leave)", &options, common) {
-        let text = match picked {
-            0 => selected
-                .iter()
-                .map(|f| diff_text(f))
-                .collect::<Vec<_>>()
-                .join("\n"),
-            n => diff_text(by_path[selected[n - 1].path.as_str()]),
-        };
-        present(&text, true);
+    for file in &selected {
+        println!("{}", diff_text(file));
     }
     0
 }
@@ -741,6 +702,7 @@ mod tests {
     use super::*;
     use crate::commands::measured::tests::stats;
     use socket_patch_core::api::types::VulnerabilityResponse;
+    use std::collections::HashMap;
 
     fn file(path: &str, before: Option<&str>, after: &str) -> ShownFile {
         ShownFile {
@@ -818,6 +780,25 @@ mod tests {
                 "  lib/new.js  +1 -0",
                 "  big.bin     (the file is too large to diff)",
             ]
+        );
+        // An advisory that names no severity leaves none in the title:
+        // the same rule as the row of `list` this page opens from.
+        let blank = PatchResponse {
+            vulnerabilities: [(
+                "GHSA-c".to_string(),
+                VulnerabilityResponse {
+                    cves: Vec::new(),
+                    summary: String::new(),
+                    severity: " ".to_string(),
+                    description: String::new(),
+                },
+            )]
+            .into(),
+            ..patch()
+        };
+        assert_eq!(
+            summary(&blank, &files[..1], Style::PLAIN)[0],
+            "pkg:npm/@scope/undici@8.10.0  [PAID]"
         );
         // No advisories, no measurements: those sections are left out.
         let bare = PatchResponse {

@@ -65,7 +65,7 @@ fn write_manifest(root: &Path, n: usize) {
     .unwrap();
 }
 
-/// `list` running on a PTY whose size the test controls.
+/// A command running on a PTY whose size the test controls.
 struct Terminal {
     master: Box<dyn portable_pty::MasterPty + Send>,
     writer: Box<dyn Write + Send>,
@@ -84,11 +84,15 @@ fn size(cols: u16, rows: u16) -> portable_pty::PtySize {
 
 impl Terminal {
     fn list(cwd: &Path, args: &[&str], cols: u16, rows: u16) -> Terminal {
+        Terminal::run("list", cwd, args, cols, rows)
+    }
+
+    fn run(command: &str, cwd: &Path, args: &[&str], cols: u16, rows: u16) -> Terminal {
         let pair = portable_pty::native_pty_system()
             .openpty(size(cols, rows))
             .expect("openpty");
         let mut cmd = common::hermetic::pty_binary_command();
-        cmd.arg("list");
+        cmd.arg(command);
         for arg in args {
             cmd.arg(arg);
         }
@@ -491,6 +495,199 @@ fn list_fills_its_rows_in_from_the_patch_service() {
             .all(|r| r.url.query() == Some("include_blobs=false")),
         "{requests:#?}"
     );
+}
+
+/// A row of `list` and `show` open one and the same page: the patch is
+/// read the same way and shown on the same screen, so Enter on a row and
+/// `show <its uuid>` draw the same lines, down to the key line. There is
+/// no second way to read a patch on a terminal.
+#[test]
+fn a_list_row_opens_the_page_show_opens() {
+    use base64::Engine as _;
+    let b64 = |text: &str| base64::engine::general_purpose::STANDARD.encode(text);
+    let (before, after, added) = (
+        b64("one\ntwo\nthree\n"),
+        b64("one\nTWO\nthree\n"),
+        b64("new\n"),
+    );
+    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+    let mock = rt.block_on(async {
+        let mock = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex(format!(
+                r"^/v0/orgs/{ORG_SLUG}/patches/view/[0-9a-f-]+$"
+            )))
+            .respond_with(move |request: &wiremock::Request| {
+                let uuid = request.url.path().rsplit('/').next().unwrap().to_string();
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "uuid": uuid,
+                    "purl": "pkg:npm/list-tty-package-00@1.0.0",
+                    "publishedAt": "Sat, 14 Nov 2026 07:13:44 GMT",
+                    "description": "A patch",
+                    "license": "MIT",
+                    "tier": "free",
+                    "files": {
+                        "package/index.js": {
+                            "beforeHash": "b".repeat(64),
+                            "afterHash": "a".repeat(64),
+                            "beforeBlobContent": before,
+                            "blobContent": after,
+                        },
+                        "package/new.js": { "afterHash": "c".repeat(64), "blobContent": added },
+                    },
+                    "vulnerabilities": { "GHSA-aaaa-bbbb-0000": {
+                        "cves": ["CVE-2026-01000"],
+                        "summary": "A summary",
+                        "severity": "critical",
+                        "description": "A description",
+                    }},
+                    "statistics": {
+                        "diff": { "linesAdded": 2, "linesRemoved": 1, "filesChanged": 2 },
+                        "tests": { "after": { "count": 34, "total": 35 } },
+                        "pocs": { "blockedAfter": { "count": 2, "total": 2 } },
+                        "performance": { "hotWallChange": 0.008 },
+                    },
+                }))
+            })
+            .mount(&mock)
+            .await;
+        mock
+    });
+    let uri = mock.uri();
+    let service = [
+        "--api-url",
+        uri.as_str(),
+        "--api-token",
+        "fake-token",
+        "--org",
+        ORG_SLUG,
+    ];
+    let tmp = tempfile::tempdir().unwrap();
+    write_manifest(tmp.path(), 1);
+    const LAST_DIFF: &str = "+++ b/package/new.js";
+
+    // From the table: Enter on the row, then back and out.
+    let mut term = Terminal::list(tmp.path(), &service, 100, 40);
+    term.wait_for("1/1", 1);
+    term.press(b"\r");
+    term.wait_for(LAST_DIFF, 1);
+    term.press(b"qq");
+    let (code, from_list) = term.finish();
+    assert_eq!(code, 0, "{from_list}");
+
+    // By its uuid: `show`.
+    let patch = uuid(0);
+    let mut args = vec![patch.as_str()];
+    args.extend(service);
+    let mut term = Terminal::run("show", tmp.path(), &args, 100, 40);
+    term.wait_for(LAST_DIFF, 1);
+    term.press(b"q");
+    let (code, from_show) = term.finish();
+    assert_eq!(code, 0, "{from_show}");
+
+    let page = |output: &str| {
+        frames(output)
+            .into_iter()
+            .rev()
+            .find(|frame| frame.iter().any(|line| line == LAST_DIFF))
+            .unwrap_or_else(|| panic!("no page: {output:?}"))
+    };
+    let (opened, shown) = (page(&from_list), page(&from_show));
+    assert_eq!(opened, shown);
+    // And it is the patch: its title, what it fixes, what was measured,
+    // each file's diff, the keys.
+    assert_eq!(shown.len(), 40, "{shown:#?}");
+    assert_eq!(
+        shown[0],
+        "pkg:npm/list-tty-package-00@1.0.0  CRITICAL  [FREE]"
+    );
+    for line in [
+        "Fixes:",
+        "  CRITICAL  CVE-2026-01000  A summary",
+        "Measured by Socket:",
+        "2 files changed: +2 -1",
+        "--- a/package/index.js",
+        "-two",
+        "+TWO",
+        "--- /dev/null",
+        "+new",
+    ] {
+        assert!(shown.iter().any(|l| l == line), "{line:?} in {shown:#?}");
+    }
+    assert!(
+        shown[39].starts_with("Up/Down scroll   PgUp/PgDn page   n/p file   q back"),
+        "{shown:#?}"
+    );
+    // `show` leaves the summary on the terminal; `list` its rows.
+    assert!(after_leaving(&from_show).contains("Measured by Socket:"));
+    assert!(after_leaving(&from_list).starts_with("Found 1 patch:\n"));
+}
+
+/// `show --yes` on a terminal opens nothing: the summary and every diff
+/// print at once, as a pipe gets them, and the run ends by itself. There
+/// is no menu of files and no pager to wait on.
+#[test]
+fn show_yes_prints_the_patch_at_once_and_opens_nothing() {
+    use base64::Engine as _;
+    let content = base64::engine::general_purpose::STANDARD.encode("new\n");
+    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+    let mock = rt.block_on(async {
+        let mock = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex(format!(
+                r"^/v0/orgs/{ORG_SLUG}/patches/view/[0-9a-f-]+$"
+            )))
+            .respond_with(move |request: &wiremock::Request| {
+                let uuid = request.url.path().rsplit('/').next().unwrap().to_string();
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "uuid": uuid,
+                    "purl": "pkg:npm/list-tty-package-00@1.0.0",
+                    "publishedAt": "Sat, 14 Nov 2026 07:13:44 GMT",
+                    "description": "A patch",
+                    "license": "MIT",
+                    "tier": "free",
+                    "files": {
+                        "package/a.js": { "afterHash": "a".repeat(64), "blobContent": content },
+                        "package/b.js": { "afterHash": "c".repeat(64), "blobContent": content },
+                    },
+                    "vulnerabilities": {},
+                }))
+            })
+            .mount(&mock)
+            .await;
+        mock
+    });
+    let uri = mock.uri();
+    let patch = uuid(0);
+    let tmp = tempfile::tempdir().unwrap();
+    let term = Terminal::run(
+        "show",
+        tmp.path(),
+        &[
+            patch.as_str(),
+            "--yes",
+            "--api-url",
+            uri.as_str(),
+            "--api-token",
+            "fake-token",
+            "--org",
+            ORG_SLUG,
+        ],
+        100,
+        20,
+    );
+    let (code, output) = term.finish();
+    assert_eq!(code, 0, "{output}");
+    assert!(!output.contains(ENTER_SCREEN), "{output:?}");
+    for line in [
+        "pkg:npm/list-tty-package-00@1.0.0  [FREE]",
+        "2 files changed: +2 -0",
+        "+++ b/package/a.js",
+        "+++ b/package/b.js",
+    ] {
+        assert!(output.contains(line), "{line:?} in {output:?}");
+    }
+    assert!(!output.contains("Open a file"), "{output:?}");
 }
 
 /// `--yes`, like a pipe, keeps the full entries and opens no browser: the

@@ -280,6 +280,50 @@ async fn show_resolves_a_purl_to_its_best_ranked_patch() {
     );
 }
 
+/// A token the patch service refuses is not the end of it: the public
+/// service, which has the free patches, is asked for the patch. When it
+/// has none either, the refusal is what is reported: it is the cause, and
+/// the public service's "no such patch" would hide it.
+#[tokio::test(flavor = "multi_thread")]
+async fn show_reads_from_the_public_service_when_the_token_is_refused() {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(format!("/v0/orgs/{ORG}/patches/view/{UUID}")))
+        .respond_with(ResponseTemplate::new(401))
+        .mount(&mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/v0/orgs/{ORG}/patches/view/{OTHER}")))
+        .respond_with(ResponseTemplate::new(401))
+        .mount(&mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/patch/view/{UUID}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(view(true)))
+        .mount(&mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/patch/view/{OTHER}")))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&mock)
+        .await;
+    let tmp = tempfile::tempdir().unwrap();
+    let public = mock.uri();
+
+    let (code, stdout, stderr) = run_show(tmp.path(), &mock, &[UUID, "--proxy-url", &public]);
+    assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
+    assert_eq!(stdout, format!("{SUMMARY}\n{DIFF_A}{DIFF_NEW}"));
+
+    let (code, stdout, stderr) = run_show(tmp.path(), &mock, &[OTHER, "--proxy-url", &public]);
+    assert_eq!(code, 1, "stdout={stdout}; stderr={stderr}");
+    assert!(stdout.is_empty(), "{stdout:?}");
+    assert!(
+        stderr.contains("Error: Unauthorized: Invalid API token"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("no patch found"), "{stderr}");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn show_failures_are_coded_and_exit_one() {
     let mock = MockServer::start().await;

@@ -148,9 +148,10 @@ pub enum Commands {
     /// Reads the patch from the patch service and changes nothing. Prints
     /// the advisories the patch fixes, what Socket measured about it
     /// (exploits blocked, tests passing, size, run-time cost), the files it
-    /// changes and the diff of each. On a terminal a patch that changes
-    /// several files opens a menu of them, and diffs are shown through
-    /// your pager; piped, or with --no-pager, everything prints at once.
+    /// changes and the diff of each. On a terminal the patch opens
+    /// full-screen, as the page a row of `list` opens: the arrow keys
+    /// scroll, n and p step between files, q leaves. Piped, or with
+    /// --no-pager, everything prints at once.
     Show(commands::show::ShowArgs),
 
     /// Show this project's patches in every mode

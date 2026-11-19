@@ -250,35 +250,20 @@ struct Browse {
     detail: String,
 }
 
-/// The worst severity (upper-cased) and the ids to show for a set of
-/// advisories: each one's CVEs, or its own id when it has none.
+/// The worst severity and the ids to show for a set of advisories
+/// ([`crate::ui::worst_and_ids`]), cleaned of control characters: they
+/// may come from the project's own files.
 fn fixes<'a>(
-    vulnerabilities: impl Iterator<Item = (&'a String, &'a str, &'a [String])>,
+    advisories: impl Iterator<Item = (&'a String, &'a str, &'a [String])>,
 ) -> (String, Vec<String>) {
-    use socket_patch_core::api::ranking::severity_order;
-    let mut worst: Option<&str> = None;
-    let mut ids = Vec::new();
-    for (id, severity, cves) in vulnerabilities {
-        let severity = severity.trim();
-        if !severity.is_empty()
-            && worst.is_none_or(|w| severity_order(Some(severity)) < severity_order(Some(w)))
-        {
-            worst = Some(severity);
-        }
-        if cves.is_empty() {
-            ids.push(sanitize(id));
-        } else {
-            ids.extend(cves.iter().map(|cve| sanitize(cve)));
-        }
-    }
+    let (worst, ids) = crate::ui::worst_and_ids(
+        advisories.map(|(id, severity, cves)| (id.as_str(), severity, cves)),
+    );
+    // Two ids that differ only in what is cleaned off are one id.
+    let mut ids: Vec<String> = ids.iter().map(|id| sanitize(id)).collect();
     ids.sort();
     ids.dedup();
-    (
-        worst
-            .map(|s| sanitize(s).to_uppercase())
-            .unwrap_or_default(),
-        ids,
-    )
+    (sanitize(&worst), ids)
 }
 
 impl Browse {
@@ -383,12 +368,21 @@ impl Browse {
     }
 
     /// The patch as a page of the browser from what the project records
-    /// about it, under `why` the patch service's own account is missing.
+    /// about it, under `why` the patch service's own account is missing
+    /// (the end of a sentence: an error's text, which may run over
+    /// several lines or end in a period of its own).
     fn local_page(&self, why: Option<&str>) -> Page {
         let mut lines: Vec<String> = why
             .map(|why| {
+                let why = sanitize(why)
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ");
                 vec![
-                    why.to_string(),
+                    format!(
+                        "The patch could not be read: {}.",
+                        why.trim_end_matches('.')
+                    ),
                     String::new(),
                     "What this project records:".to_string(),
                     String::new(),
@@ -494,7 +488,9 @@ async fn browse(rows: Vec<(Browse, Option<String>)>, common: &GlobalArgs) -> Tab
     // While the browser has the screen, core's advisories are muted: a
     // line printed under it would land in the middle of the table. The
     // one that explains what the table shows is printed after.
-    let connection = tokio::sync::OnceCell::<socket_patch_core::api::client::ApiClient>::new();
+    // Both reads go through `show`'s source of patches, so a row and the
+    // page it opens are read the same way, a refused token included.
+    let connection = tokio::sync::OnceCell::<crate::commands::show::Source>::new();
     let connect = || async {
         if common.offline {
             return None;
@@ -502,11 +498,13 @@ async fn browse(rows: Vec<(Browse, Option<String>)>, common: &GlobalArgs) -> Tab
         Some(
             connection
                 .get_or_init(|| async {
-                    socket_patch_core::api::client::get_api_client_with_overrides(
-                        common.api_client_overrides(),
+                    let overrides = common.api_client_overrides();
+                    let client = socket_patch_core::api::client::get_api_client_with_overrides(
+                        overrides.clone(),
                     )
                     .await
-                    .0
+                    .0;
+                    crate::commands::show::Source::new(client, overrides)
                 })
                 .await,
         )
@@ -525,7 +523,7 @@ async fn browse(rows: Vec<(Browse, Option<String>)>, common: &GlobalArgs) -> Tab
         })
     });
     let details = async {
-        let Some(client) = connect().await else {
+        let Some(source) = connect().await else {
             return;
         };
         let mut uuids: Vec<String> = rows.iter().map(|(row, _)| row.uuid.clone()).collect();
@@ -535,10 +533,13 @@ async fn browse(rows: Vec<(Browse, Option<String>)>, common: &GlobalArgs) -> Tab
         let _ = updates.send(Update::Note(format!("loading details 0/{total}")));
         let mut answers = futures_util::stream::iter(uuids)
             .map(|uuid| async move {
-                let answer = client.fetch_patch_summary(&uuid).await;
+                let (_, answer) = source.ask(|client| client.fetch_patch_summary(&uuid)).await;
                 (uuid, answer)
             })
-            .buffer_unordered(api_concurrency_for(client.uses_public_proxy(), total));
+            .buffer_unordered(api_concurrency_for(
+                source.client().uses_public_proxy(),
+                total,
+            ));
         let mut done = 0;
         while let Some((uuid, answer)) = answers.next().await {
             done += 1;
@@ -559,6 +560,9 @@ async fn browse(rows: Vec<(Browse, Option<String>)>, common: &GlobalArgs) -> Tab
             let _ = updates.send(Update::Note(note));
         }
     };
+    // A row opens as the page `show` opens for its patch, read the way
+    // `show` reads it; only a patch the service cannot be asked about
+    // opens as the project's own record.
     let style = crate::ui::Style::stderr();
     let page = |index: usize| {
         let (rows, connect, updates) = (&rows, &connect, &updates);
@@ -567,8 +571,8 @@ async fn browse(rows: Vec<(Browse, Option<String>)>, common: &GlobalArgs) -> Tab
                 return;
             };
             let page = match connect().await {
-                Some(client) => {
-                    match crate::commands::show::load_page(client, &row.uuid, style).await {
+                Some(source) => {
+                    match crate::commands::show::load_page(source, &row.uuid, style).await {
                         Ok(page) => page,
                         Err(why) => row.local_page(Some(&why)),
                     }
@@ -595,7 +599,10 @@ async fn browse(rows: Vec<(Browse, Option<String>)>, common: &GlobalArgs) -> Tab
     // now (a token whose organization could not be found reads the
     // public service, which knows free patches only).
     socket_patch_core::utils::notice::set_output_mode(common.silent, common.json);
-    if let Some(reason) = connection.get().and_then(|client| client.org_unresolved()) {
+    if let Some(reason) = connection
+        .get()
+        .and_then(|source| source.client().org_unresolved())
+    {
         eprintln!("Warning: {reason}");
     }
     match left {
@@ -620,8 +627,10 @@ async fn browse(rows: Vec<(Browse, Option<String>)>, common: &GlobalArgs) -> Tab
 }
 
 /// The inline stand-in for the full-screen browser: an arrow-key menu of
-/// the rows under the printed listing; a pick prints what `show` prints
-/// for the patch and comes back to the menu.
+/// the rows under the printed listing; a pick prints `show`'s summary of
+/// the patch (`show --stat`: its fixes, measurements and files, without
+/// the diffs, which would push the menu off the screen) and comes back
+/// to the menu.
 async fn browse_inline(rows: &[(Browse, Option<String>)], table: &Table, common: &GlobalArgs) {
     let options: Vec<String> =
         crate::ui::browser::table_lines(table, usize::MAX, crate::ui::Style::PLAIN)
@@ -640,7 +649,7 @@ async fn browse_inline(rows: &[(Browse, Option<String>)], table: &Table, common:
                 identifier: patch.uuid.clone(),
                 common: common.clone(),
                 files: Vec::new(),
-                stat: false,
+                stat: true,
                 no_pager: false,
             })
             .await
@@ -1436,10 +1445,9 @@ mod tests {
         );
         assert!(page.marks.is_empty());
         assert_eq!(
-            row.local_page(Some("The patch could not be read: timed out"))
-                .lines,
+            row.local_page(Some("timed out")).lines,
             [
-                "The patch could not be read: timed out",
+                "The patch could not be read: timed out.",
                 "",
                 "What this project records:",
                 "",
@@ -1447,6 +1455,26 @@ mod tests {
                 "  UUID: 1234"
             ]
         );
+        // An error's text is one line of the page whatever its shape: a
+        // period of its own is not doubled, and a body that runs over
+        // several lines, or carries an escape sequence, cannot break the
+        // frame.
+        for (why, line) in [
+            (
+                "Rate limit exceeded. Please try again later.",
+                "The patch could not be read: Rate limit exceeded. Please try again later.",
+            ),
+            (
+                "status 500:\n  upstream\tfailed\r\n",
+                "The patch could not be read: status 500: upstream failed.",
+            ),
+            (
+                "bad \u{1b}[31mbody",
+                "The patch could not be read: bad [31mbody.",
+            ),
+        ] {
+            assert_eq!(row.local_page(Some(why)).lines[0], line);
+        }
     }
 
     /// A manifest with several patches, each carrying multiple
