@@ -278,6 +278,12 @@ any file, so it also attests an agent-mode patch whose files are unpatched or mi
 It never does so silently: the run warns how many statements it emitted that way, and
 each one ends its impact statement with `; not verified on disk`.
 
+In a Bazel workspace the document describes what Bazel builds from the project's lock, and
+says `affected` of a package whose patch is only in the installed copy (see
+[Bazel workspaces: VEX](ecosystems.md#bazel-workspaces-vex)). `--no-bazel` (`--vex-no-bazel`
+on `scan`, `apply` and `vendor`, or `SOCKET_VEX_NO_BAZEL` in the environment) makes it describe
+what the package manager installed; use it when the installed tree is what you ship.
+
 The product identifier is inferred from the Git origin or project metadata. Use
 `--product <identifier>` when inference is unavailable or unsuitable. A project
 with neither (an application with no Git remote and no named project file) must

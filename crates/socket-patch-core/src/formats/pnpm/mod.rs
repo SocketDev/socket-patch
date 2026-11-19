@@ -430,7 +430,7 @@ impl<'t> PnpmLock<'t> {
     /// [`PnpmPackage::resolution`] is `None`) or document tags (every
     /// entry is [`PnpmDocument::Project`]), for a reader of keys and entry
     /// fields only: its document queries mean nothing.
-    fn parse_keys(text: &'t str) -> Self {
+    pub(crate) fn parse_keys(text: &'t str) -> Self {
         PnpmLock {
             text,
             packages: pnpm_packages(text, Resolve::No),

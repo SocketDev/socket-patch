@@ -71,6 +71,7 @@ fn defaults_match_contract() {
     assert_eq!(args.vex.vex, None);
     assert_eq!(args.vex.vex_product, None);
     assert!(!args.vex.vex_no_verify);
+    assert!(!args.vex.vex_no_bazel);
     assert_eq!(args.vex.vex_doc_id, None);
     assert!(!args.vex.vex_compact);
 }
@@ -93,6 +94,7 @@ fn vex_passthrough_flags() {
         "--vex-product",
         "pkg:npm/app@1.0.0",
         "--vex-no-verify",
+        "--vex-no-bazel",
         "--vex-doc-id",
         "urn:uuid:fixed",
         "--vex-compact",
@@ -100,6 +102,7 @@ fn vex_passthrough_flags() {
     assert_eq!(args.vex.vex, Some(std::path::PathBuf::from("out.vex.json")));
     assert_eq!(args.vex.vex_product.as_deref(), Some("pkg:npm/app@1.0.0"));
     assert!(args.vex.vex_no_verify);
+    assert!(args.vex.vex_no_bazel);
     assert_eq!(args.vex.vex_doc_id.as_deref(), Some("urn:uuid:fixed"));
     assert!(args.vex.vex_compact);
 }

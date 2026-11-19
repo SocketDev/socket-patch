@@ -1137,6 +1137,7 @@ pub async fn run(args: VendorArgs) -> i32 {
                             .display()
                             .to_string(),
                         statements: summary.statements,
+                        affected: summary.affected,
                         format: "openvex-0.2.0".to_string(),
                         warnings: summary.warnings.clone(),
                     });
@@ -1157,6 +1158,7 @@ pub async fn run(args: VendorArgs) -> i32 {
                     "{}",
                     crate::commands::vex::format_vex_written(
                         summary.statements,
+                        summary.affected,
                         args.vex
                             .vex
                             .as_ref()
@@ -1274,6 +1276,7 @@ pub async fn run(args: VendorArgs) -> i32 {
                         env.vex = Some(VexSummary {
                             path: vex_path.display().to_string(),
                             statements: summary.statements,
+                            affected: summary.affected,
                             format: "openvex-0.2.0".to_string(),
                             // note_warning suppressed these on stderr under
                             // --json; the envelope copy is their only
@@ -2498,6 +2501,7 @@ async fn run_eject(
                         env.vex = Some(VexSummary {
                             path: vex_path.display().to_string(),
                             statements: summary.statements,
+                            affected: summary.affected,
                             format: "openvex-0.2.0".to_string(),
                             warnings: summary.warnings,
                         });

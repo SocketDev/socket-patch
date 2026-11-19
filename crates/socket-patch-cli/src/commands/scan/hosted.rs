@@ -2088,6 +2088,7 @@ async fn run_redirect_selected_untracked(
     // `commands::vex_sources`). Requested-but-failed VEX (including "nothing
     // to attest") flips the exit code.
     let mut vex_statements: Option<usize> = None;
+    let mut vex_affected = 0;
     // VEX run-level advisories: `note_warning` keeps them off stderr under
     // --json, so the envelope's `vex.warnings` is their only channel there.
     let mut vex_warnings: Vec<crate::json_envelope::RunWarning> = Vec::new();
@@ -2163,6 +2164,7 @@ async fn run_redirect_selected_untracked(
         match generate_vex_from_manifest_path(common, &params, &manifest_path).await {
             Ok(summary) => {
                 vex_statements = Some(summary.statements);
+                vex_affected = summary.affected;
                 vex_warnings = summary.warnings;
             }
             Err(e) => {
@@ -2285,6 +2287,7 @@ async fn run_redirect_selected_untracked(
                     .display()
                     .to_string(),
                 statements,
+                affected: vex_affected,
                 format: "openvex-0.2.0".to_string(),
                 warnings,
             });
@@ -2431,11 +2434,12 @@ async fn run_redirect_selected_untracked(
             }
             if let Some(statements) = vex_statements {
                 eprintln!(
-                    "Wrote OpenVEX document with {} to {} (hosted patches are attested \
+                    "Wrote OpenVEX document with {}{} to {} (hosted patches are attested \
                      from their patch records, not hash-verified — their bytes are fetched at install \
                      time; run `socket-patch vex` after installing to verify against the \
                      installed tree).",
                     crate::ui::plural(statements, "statement", "statements"),
+                    crate::commands::vex::affected_note(vex_affected),
                     vex.vex
                         .as_ref()
                         .expect("vex_statements is Some only when --vex was given")
