@@ -2824,28 +2824,29 @@ entries use ecosystem `jvm` with Maven PURLs. Revert, remove, rollback and repai
 share the v5 vendored backend; existing prototype wiring remains readable.
 See [the JVM design](../../docs/design/maven-vendoring.md) for supported shapes.
 
-A vendored jar must be upstream's jar outside the patch. Online, the jar (the patch
-service's on a first vendoring, the committed one on a re-run) is compared with the
-upstream jar before anything is written: a cached copy the registry's checksum
-vouches for, else the registry's own download held to the same checksum. Every entry
-the JVM would load must hold the same content in both, whatever unix mode it carries;
-the record's members and signature files (`META-INF/*.SF`, `.RSA`, `.DSA`, `.EC`) are
-exempt and directory entries may differ. The manifest of a jar the patch service
-signed again may differ as that signing leaves it (digest lines changed for the
-patched members and added for the others, sections added for entries it did not
-list), by the rule under [Agent mode](#agent-mode-apply-scan---mode-agent). A jar that adds, drops or changes anything
-else is refused with `vendor_prebuilt_integrity_mismatch`, the detail naming up to
-three such members, and a first vendoring commits and wires nothing.
+Vendoring a Maven or Gradle patch takes its jar from the patch service and needs no
+upstream registry for it. The service's jar is checked as it was served (transfer
+integrity, and every member of the patch record at its `afterHash`) and committed. No
+copy of the original jar is downloaded to compare it with, and none is missed: a
+registry that cannot be reached neither refuses the vendoring nor adds a warning.
 
-A registry that cannot be reached while the patch service can does not stop a first
-vendoring. The baseline is then, in order: the registry-verified jar; else the jar in
-the build's local repository, as agent mode trusts the installed jar; else none, and
-the service's jar is vendored as served. The last two are reported with
-`vendor_jvm_upstream_unverified` (the detail says which, and that a later run makes
-the comparison) and the entry is recorded as not registry-verified. A mismatch
-against whichever baseline was used is still the refusal above. An online re-run over
-a committed tree needs the registry-verified jar, as before
-(`vendor_jvm_upstream_unavailable` without one).
+One comparison is made, because it costs no network and protects the build. When the
+original jar is already in the build's local repository (the Maven local repository
+or a Gradle cache), every entry the JVM would load must hold the same content in it
+and in the service's jar, whatever unix mode the entry carries; the record's members
+and signature files (`META-INF/*.SF`, `.RSA`, `.DSA`, `.EC`) are exempt and directory
+entries may differ. The manifest of a jar the patch service signed again may differ
+as that signing leaves it (digest lines changed for the patched members and added for
+the others, sections added for entries it did not list), by the rule under
+[Agent mode](#agent-mode-apply-scan---mode-agent). A difference means the project builds with a jar that is not the
+one the patch was made from (an internal rebuild under the same coordinates, say), so
+the service's jar would change more than the patch: the vendoring is refused with
+`vendor_prebuilt_integrity_mismatch`, the detail naming up to three such members, and
+nothing is committed or wired. With no local copy there is nothing to compare. An
+online re-run over a committed tree makes the same comparison with the committed jar
+and needs no registry for the jar either. Upstream metadata (the pom, its parents,
+Gradle module metadata, classifier jars) is still read from the local caches and the
+registry, as before.
 
 Jars are read within fixed limits, counted on the bytes actually inflated and on the
 archive's own entry count, never on the sizes an archive declares: 200,000 entries
@@ -3224,6 +3225,18 @@ or `mvn install` rebuilt it), lacks a file, or is a swapped jar whose original t
 project never backed up is left as it is with `gradle_m2_copy_not_restored`, and
 `remove` still drops the record.
 
+A project's `.mvn/maven.config` chooses where these commands write. For a Maven
+build, `-Dmaven.repo.local` there names the local repository, so it can point `apply`,
+`rollback` and `remove` at any directory laid out as a Maven repository, one outside
+the project and the home directory included, exactly as it points Maven there when the
+project is built. What socket-patch does in that directory is what it does in
+`~/.m2`: it replaces a jar (or a file of a version directory) whose content is the
+known original of a patch record with the patch service's build of it, rewrites the
+checksum files beside it (`.sha1`, `.md5`) to match, and puts both back on rollback.
+It writes nothing else there. Anyone who points a build's local repository somewhere
+has chosen that for Maven as well. `MAVEN_REPO_LOCAL` takes the choice back: it names
+the repository whatever the project's config says.
+
 Before a swap the service's jar is compared with each installed jar, member by
 member, hashing as it goes: every entry the JVM would load must hold the same content
 in both, whatever unix mode the entry carries (the JVM ignores it, so an entry with
@@ -3459,7 +3472,7 @@ with `reason: <reason>: `:
 | `vendor_jvm_upstream_unavailable` | refusal | `classifier_unavailable` (a declared classifier jar no cache or registry has), `module_unavailable` (the pom declares Gradle module metadata that cannot be sourced), `pom_unavailable`, `verification_metadata_unavailable`; for a suffixed Maven / sbt pom also `suffix_unavailable` (the upstream pom computes its own version), `parent_unavailable` (a first vendoring whose upstream parent poms are in no local cache and cannot be fetched, so the suffixed pom cannot be checked) and `inherited_version_unresolvable` (a parent pom names `${project.version}` where the suffixed pom cannot declare the base version instead: in a profile, a management key or a repository URL) |
 | `vendor_jvm_degraded` | applied, VEX withheld | `gradle_unscanned_build_logic`, `unwired_build_logic` (a nonliteral included build), `settings_plugins_unwired`, `classifier_unpatched_copy` (a classifier jar carries an unpatched copy of a patched member, or cannot be read to check for one), `verification_parent_chain_unhandled`, `gradle_lock_overrides_vendored` (a dependency lock of the build, buildscript and settings classpath locks included, pins the module at a version no vendored row serves), `gradle_settings_lock_unrouted` (a `settings-gradle.lockfile` locks the module but that build's settings script does not hold the in-block repository entry for it), `gradle_lock_unreadable` (a lock file, or a followed custom `lockFile`, is missing, unreadable, outside the checkout or not UTF-8), `gradle_custom_lock_file` (a `lockFile` location that cannot be followed statically: anything but a literal `file(…)` in a project's own build script), `gradle_wiring_uncommitted` (VEX liveness only, never reported by `vendor`: the committed settings files, index, derived `maven-metadata.xml`, script or verification file lack wiring a re-plan would write, such as a removed apply line or in-block entry; the git hygiene files do not count), `conflicting_managed_version` / `management_unresolved` (Maven reactor: an imported BOM or an out-of-checkout parent manages the artifact at another version, or its POM is unavailable; that local root is not pinned), `selection_undetermined` (Maven reactor: what one or more modules resolve cannot be read, so no pin is written where that is so and one already there is left as it is; one event however many modules, naming the first and counting the rest), `pin_would_move_module` (Maven reactor: a parent pom resolves the base version itself above a module that resolves another version, so the parent takes no pin. See [Maven version selection](#maven-version-selection-hosted-and-vendored-maven)) |
 | `vendor_jvm_note` | applied, informational | `range_declared` (a range, prefix or rich selector lists versions from the derived `maven-metadata.xml`), `ide_sources_unavailable` |
-| `vendor_jvm_upstream_unverified` | warning | Upstream metadata was taken offline, or from a local cache while the registry published no checksum for it (a parent pom from a corporate repository), and not authenticated against registry checksums. Also reported by a first vendoring that could get no registry-verified upstream jar: the members the patch does not touch were compared with the local repository's jar, or, with none, not compared at all. |
+| `vendor_jvm_upstream_unverified` | warning | Upstream metadata was taken offline, or from a local cache while the registry published no checksum for it (a parent pom from a corporate repository), and not authenticated against registry checksums. |
 | `vendor_jvm_unattested` | warning (`vendor --check`) | A Maven reactor entry is intact and wired, but a declaration may still build the base release (an executable classifier or type copy, a version a property, profile or unpinned local root may move), so `vex` does not attest it. The entry stays `verified`; the detail names the purl and the declarations (`<pom>:<line>`). |
 
 The Maven half of a root (single-module, reactor or mixed) also reports
