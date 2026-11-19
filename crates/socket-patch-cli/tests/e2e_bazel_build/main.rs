@@ -51,5 +51,6 @@ mod cargo;
 mod go;
 mod harness;
 mod npm;
+mod nuget;
 mod pypi;
 mod ruby;
