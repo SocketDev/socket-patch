@@ -1059,70 +1059,42 @@ async fn vendor_maven_jvm(
     };
 
     let online = service.is_some_and(|s| !s.offline);
-    // Everything the patch does not touch must be upstream's, checked
-    // before anything is written: on a first vendoring (always online: the
-    // jar comes from the service) as on an online re-run over a committed
-    // tree. A service jar built from another base, or one that adds or
-    // drops a class, is never committed and wired.
+    // The jar is the patch service's, checked as it was served (transfer
+    // integrity, the record's members at their `afterHash`), or the
+    // committed one. No copy of the original is fetched to hold it to:
+    // vendoring needs the patch service and this machine, not the registry.
     //
-    // The baseline is the registry-verified upstream jar: a cached copy the
-    // registry's checksum vouches for, else the registry's own download
-    // held to it (the jar agent mode patched in `~/.m2` is no baseline).
-    // A re-run needs that one, as it always did. A first vendoring must not
-    // fail because the registry cannot be reached while the patch service
-    // can: it falls back to the jar in the build's local repository (the
-    // trust agent mode places in the installed jar), and with no jar at all
-    // vendors as served, saying the comparison was not made.
-    if online {
-        let verified = match acquire_jvm_artifact(&local, &gav, None, "jar", service).await {
-            Ok(bytes) => Ok(bytes),
-            Err(_) => acquire_jvm_artifact(&LocalSources::none(), &gav, None, "jar", service).await,
-        };
-        let baseline = match verified {
-            Ok(bytes) => Some(bytes),
-            Err(e) if was_committed => return refused("vendor_jvm_upstream_unavailable", e),
-            Err(why) => {
-                let cached = local.find(&gav, None, "jar", false).await.ok().flatten();
-                local
-                    .unverified
-                    .store(true, std::sync::atomic::Ordering::Relaxed);
-                let jar = layout::file_name(&artifact_id, &version, None, "jar");
-                warnings.push(VendorWarning::new(
-                    "vendor_jvm_upstream_unverified",
-                    match cached {
-                        Some(_) => format!(
-                            "no registry-verified copy of {jar} could be had ({why}), so the \
-                             members the patch does not touch were compared with the jar in the \
-                             local repository instead"
-                        ),
-                        None => format!(
-                            "no upstream copy of {jar} could be had ({why}), so the members the \
-                             patch does not touch were not compared with upstream; the patch \
-                             service's jar was vendored as served. Run `socket-patch vendor` \
-                             again when the registry can be reached to make the comparison"
-                        ),
-                    },
-                ));
-                cached
-            }
-        };
-        if let Some(upstream) = baseline {
+    // One comparison costs no network and protects the build. When the
+    // original jar is already in the build's local repository, the members
+    // the patch does not touch must be that jar's, as agent mode requires
+    // before a swap. A difference means the project builds with a jar that
+    // is not the one the patch was made from (an internal rebuild under the
+    // same coordinates, say), and the service's jar would change more than
+    // the patch. With no local copy there is nothing to compare, and
+    // nothing to say. (An offline re-run compares nothing, as before.)
+    if !was_committed || online {
+        if let Ok(Some(resolved)) = local.find(&gav, None, "jar", false).await {
             let names: Vec<String> = record
                 .files
                 .keys()
                 .map(|k| crate::patch::apply::normalize_file_path(k).to_string())
                 .collect();
+            let leaf = layout::file_name(&artifact_id, &version, None, "jar");
             // Off the async workers: a pass inflates up to the jar limits.
             let compared = tokio::task::spawn_blocking(move || {
-                let verdict =
-                    verify_unpatched_jar_members(&upstream, &jar_bytes, &names, was_committed);
+                let verdict = verify_unpatched_jar_members(
+                    (&leaf, &resolved),
+                    &jar_bytes,
+                    &names,
+                    was_committed,
+                );
                 (jar_bytes, verdict)
             })
             .await;
             let Ok((bytes, verdict)) = compared else {
                 return refused(
                     "vendor_prebuilt_integrity_mismatch",
-                    "the comparison with the upstream jar did not finish".to_string(),
+                    "the comparison with the local repository's jar did not finish".to_string(),
                 );
             };
             jar_bytes = bytes;
@@ -1527,12 +1499,15 @@ async fn acquire_classifier(
 }
 
 /// The patched jar (the service's on a first vendoring, the committed one
-/// on a re-run) must be the upstream jar outside the record's members
-/// (`patched_members`, as a jar spells them) and signature files: every other member a JVM would load, the
-/// same in both ([`crate::patch::jar_members`], whose limits also bound
-/// the read). `Err` is the refusal's `(code, detail)`.
+/// on a re-run) against `resolved`, the jar `(leaf, bytes)` the build
+/// resolves from its local repository: outside the record's members
+/// (`patched_members`, as a jar spells them) and signature files, every
+/// member a JVM would load must be the same in both
+/// ([`crate::patch::jar_members`], whose limits also bound the read). A
+/// local jar that cannot be read gives nothing to compare with. `Err` is
+/// the refusal's `(code, detail)`.
 fn verify_unpatched_jar_members(
-    upstream: &[u8],
+    resolved: (&str, &[u8]),
     patched: &[u8],
     patched_members: &[String],
     committed: bool,
@@ -1543,27 +1518,30 @@ fn verify_unpatched_jar_members(
     } else {
         "the patch service's jar"
     };
-    let read = |jar: &[u8], whose: &str| {
-        Digests::of_bytes(jar).map_err(|e| match e {
-            JarError::TooLarge(why) => (
-                super::verify::ARTIFACT_TOO_LARGE,
-                format!("{whose} cannot be checked: {why}"),
-            ),
-            JarError::Unreadable(why) => (
-                "vendor_prebuilt_integrity_mismatch",
-                format!("{whose} cannot be read: {why}"),
-            ),
-        })
+    let candidate = Digests::of_bytes(patched).map_err(|e| match e {
+        JarError::TooLarge(why) => (
+            super::verify::ARTIFACT_TOO_LARGE,
+            format!("{whose} cannot be checked: {why}"),
+        ),
+        JarError::Unreadable(why) => (
+            "vendor_prebuilt_integrity_mismatch",
+            format!("{whose} cannot be read: {why}"),
+        ),
+    })?;
+    let Ok(original) = Digests::of_bytes(resolved.1) else {
+        return Ok(());
     };
-    let original = read(upstream, "the upstream jar")?;
-    let candidate = read(patched, whose)?;
     let names: Vec<&str> = patched_members.iter().map(String::as_str).collect();
     let difference = unpatched_difference(&original, &candidate, &names);
     if !difference.is_empty() {
         return Err((
             "vendor_prebuilt_integrity_mismatch",
             format!(
-                "{whose} differs from the verified upstream jar outside the patched members: {}",
+                "{whose} differs from {}, the jar this build resolves from its local \
+                 repository, outside the patched members: {}. The build uses a jar that is not \
+                 the one the patch was made from, so the vendored jar would change more than \
+                 the patch",
+                resolved.0,
                 difference.describe()
             ),
         ));
@@ -4309,35 +4287,17 @@ mod tests {
         );
     }
 
-    /// The registry's files for the fixture's upstream jar and pom, served
-    /// from `server` with the `.sha1` Maven Central publishes beside them.
-    async fn mount_upstream(server: &wiremock::MockServer, jar: &[u8]) -> EnvGuard {
-        use wiremock::matchers::{method, path};
-        use wiremock::{Mock, ResponseTemplate};
-        let base = "/org/apache/commons/commons-text/1.10.0/commons-text-1.10.0";
-        for (ext, bytes) in [("jar", jar), ("pom", UPSTREAM_POM)] {
-            Mock::given(method("GET"))
-                .and(path(format!("{base}.{ext}")))
-                .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes.to_vec()))
-                .mount(server)
-                .await;
-            Mock::given(method("GET"))
-                .and(path(format!("{base}.{ext}.sha1")))
-                .respond_with(ResponseTemplate::new(200).set_body_string(sha1_hex(bytes)))
-                .mount(server)
-                .await;
-        }
-        EnvGuard::set("SOCKET_MAVEN_REGISTRY", server.uri())
-    }
-
-    /// A first vendoring holds the service's jar to upstream outside the
-    /// patched members, as agent mode does, before anything is written: a
-    /// jar built from another base, one with a class added (whatever unix
-    /// mode its entry carries: the JVM loads it all the same) and one with a
-    /// class dropped are refused, and the project is left as it was.
+    /// Vendoring needs the patch service and this machine, not the
+    /// registry: no upstream jar is fetched to compare with, and none is
+    /// missed. The one comparison is with the jar the build already
+    /// resolves from its local repository. With none there, the service's
+    /// jar is committed, whatever it holds beside the patch, and nothing is
+    /// said. With one that matches outside the patch (the original, or the
+    /// jar agent mode patched there) it is committed. With one that
+    /// differs it is refused, naming the members, and nothing is written.
     #[tokio::test]
     #[serial_test::serial]
-    async fn a_first_vendoring_refuses_a_service_jar_that_is_not_upstream_outside_the_patch() {
+    async fn a_first_vendoring_compares_with_the_local_jar_and_asks_the_registry_for_none() {
         use crate::patch::jar_members::testing::jar_with_modes;
         const MANIFEST: (&str, &[u8], Option<u32>) =
             ("META-INF/MANIFEST.MF", b"Manifest-Version: 1.0\n", None);
@@ -4345,120 +4305,61 @@ mod tests {
         const CLASS: &str = "org/apache/commons/text/StringSubstitutor.class";
         const CODE: (&str, &[u8], Option<u32>) = (CLASS, b"\xca\xfe\xba\xbe-fake-class", None);
         const ADDED: &str = "org/apache/commons/text/Added.class";
-
-        let cases: Vec<(Vec<u8>, String)> = vec![
+        let honest = make_jar(PATCHED);
+        let another_base =
+            jar_with_modes(&[MANIFEST, NOTICE, (CLASS, b"another release's class", None)]);
+        let with_signatures = jar_with_modes(&[
+            ("META-INF/", b"", None),
+            MANIFEST,
+            ("META-INF/APACHE.SF", b"signature", None),
+            ("META-INF/APACHE.RSA", b"signature", None),
+            (JAR_FILE, PRISTINE, None),
+            ("org/apache/commons/text/", b"", None),
+            CODE,
+        ]);
+        // (the service's jar, the jar in the local repository, the refusal)
+        let cases: Vec<(Vec<u8>, Option<Vec<u8>>, Option<String>)> = vec![
+            (honest.clone(), None, None),
+            (another_base.clone(), None, None),
+            (honest.clone(), Some(make_jar(PRISTINE)), None),
+            // Directory entries and signature files may differ.
+            (honest.clone(), Some(with_signatures), None),
+            // The jar agent mode patched there, with the `.sha1` it wrote.
+            (honest.clone(), Some(honest.clone()), None),
             (
-                jar_with_modes(&[MANIFEST, NOTICE, (CLASS, b"another release's class", None)]),
-                format!("1 changed (`{CLASS}`)"),
+                another_base,
+                Some(make_jar(PRISTINE)),
+                Some(format!("1 changed (`{CLASS}`)")),
             ),
             (
                 jar_with_modes(&[MANIFEST, NOTICE, CODE, (ADDED, b"\xca\xfe\xba\xbe", None)]),
-                format!("1 added (`{ADDED}`)"),
+                Some(make_jar(PRISTINE)),
+                Some(format!("1 added (`{ADDED}`)")),
             ),
             (
                 // A symlink-mode entry is not a regular file to a zip
                 // reader, and is a class to the JVM.
                 jar_with_modes(&[MANIFEST, NOTICE, CODE, (ADDED, b"target", Some(0o120777))]),
-                format!("1 added (`{ADDED}`)"),
+                Some(make_jar(PRISTINE)),
+                Some(format!("1 added (`{ADDED}`)")),
             ),
             (
                 jar_with_modes(&[MANIFEST, NOTICE]),
-                format!("1 missing (`{CLASS}`)"),
+                Some(make_jar(PRISTINE)),
+                Some(format!("1 missing (`{CLASS}`)")),
             ),
         ];
-        for (service_jar, difference) in cases {
-            let (dir, blobs, installed, record) = reactor_fixture(true).await;
+        for (served, local_jar, refusal) in cases {
+            let (dir, blobs, installed, record) = reactor_fixture(false).await;
             let root = dir.path();
-            assert!(
-                zip_bytes_match_after_hashes(&service_jar, &record.files),
-                "{difference}: the jar carries the patch"
-            );
-            let server = mount_granted_jar(&service_jar).await;
-            let _registry = mount_upstream(&server, &make_jar(PRISTINE)).await;
-            let cfg = service_cfg(
-                Some(&server.uri()),
-                crate::vendor::VendorSource::Service,
-                false,
-            );
-            let before = crate::vendor::test_support::tree_snapshot(root);
-            let (code, detail) =
-                unwrap_refused(run_jvm(root, &blobs, &installed, &record, Some(&cfg)).await);
-            assert_eq!(code, "vendor_prebuilt_integrity_mismatch", "{difference}");
-            assert_eq!(
-                detail,
-                format!(
-                    "the patch service's jar differs from the verified upstream jar outside \
-                     the patched members: {difference}"
-                )
-            );
-            assert_eq!(
-                crate::vendor::test_support::tree_snapshot(root),
-                before,
-                "{difference}: nothing is written"
-            );
-            assert!(!root.join(".socket").exists(), "{difference}");
-        }
-
-        // The honest jar vendors. Directory entries and signature files are
-        // the two things that may differ: the service's builds drop both.
-        for upstream in [
-            make_jar(PRISTINE),
-            jar_with_modes(&[
-                ("META-INF/", b"", None),
-                MANIFEST,
-                ("META-INF/APACHE.SF", b"signature", None),
-                ("META-INF/APACHE.RSA", b"signature", None),
-                (JAR_FILE, PRISTINE, None),
-                ("org/apache/commons/text/", b"", None),
-                CODE,
-            ]),
-        ] {
-            let (dir, blobs, installed, record) = reactor_fixture(true).await;
-            let root = dir.path();
-            tokio::fs::write(installed.join("commons-text-1.10.0.jar"), &upstream)
-                .await
-                .unwrap();
-            let server = mount_granted_jar(&make_jar(PATCHED)).await;
-            let _registry = mount_upstream(&server, &upstream).await;
-            let cfg = service_cfg(
-                Some(&server.uri()),
-                crate::vendor::VendorSource::Service,
-                false,
-            );
-            let (result, entry, _) =
-                unwrap_done(run_jvm(root, &blobs, &installed, &record, Some(&cfg)).await);
-            assert!(result.success && entry.is_some(), "{:?}", result.error);
-        }
-    }
-
-    /// A registry that cannot be reached while the patch service can must
-    /// not stop a first vendoring. The jar in the build's local repository
-    /// is then the baseline, a mismatch against it is still a refusal, and
-    /// with no jar at all the service's jar is vendored as served. Each
-    /// says so, and the entry is recorded as not registry-verified.
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn a_first_vendoring_without_the_registry_falls_back_and_says_so() {
-        use crate::patch::jar_members::testing::jar_with_modes;
-        let tampered = jar_with_modes(&[
-            ("META-INF/MANIFEST.MF", b"Manifest-Version: 1.0\n", None),
-            (JAR_FILE, PATCHED, None),
-            (
-                "org/apache/commons/text/StringSubstitutor.class",
-                b"another release's class",
-                None,
-            ),
-        ]);
-        // (the service's jar, a jar in the local repository, the outcome)
-        for (served, local_jar, refusal) in [
-            (make_jar(PATCHED), true, None),
-            (tampered.clone(), true, Some("1 changed")),
-            (make_jar(PATCHED), false, None),
-            (tampered, false, None),
-        ] {
-            let (dir, blobs, installed, record) = reactor_fixture(local_jar).await;
-            let root = dir.path();
-            // The service answers; the registry routes are all 404.
+            if let Some(local_jar) = &local_jar {
+                let jar = installed.join("commons-text-1.10.0.jar");
+                tokio::fs::write(&jar, local_jar).await.unwrap();
+                tokio::fs::write(jar.with_extension("jar.sha1"), sha1_hex(local_jar))
+                    .await
+                    .unwrap();
+            }
+            // The service answers; every registry route is a 404.
             let server = mount_granted_jar(&served).await;
             let _registry = EnvGuard::set("SOCKET_MAVEN_REGISTRY", server.uri());
             let cfg = service_cfg(
@@ -4466,62 +4367,53 @@ mod tests {
                 crate::vendor::VendorSource::Service,
                 false,
             );
+            let before = crate::vendor::test_support::tree_snapshot(root);
             let outcome = run_jvm(root, &blobs, &installed, &record, Some(&cfg)).await;
-            if let Some(difference) = refusal {
-                let (code, detail) = unwrap_refused(outcome);
-                assert_eq!(code, "vendor_prebuilt_integrity_mismatch");
-                assert!(detail.contains(difference), "{detail}");
-                assert!(!root.join(".socket").exists());
-                continue;
-            }
-            let (result, entry, warnings) = unwrap_done(outcome);
-            assert!(result.success, "local_jar={local_jar}: {:?}", result.error);
-            assert_eq!(upstream_status(&entry.expect("entry")), "local_unverified");
-            let said: Vec<&str> = warnings
+            let asked_for_a_jar = server
+                .received_requests()
+                .await
+                .unwrap()
                 .iter()
-                .filter(|w| w.code == "vendor_jvm_upstream_unverified")
-                .map(|w| w.detail.as_str())
-                .collect();
-            assert_eq!(said.len(), 1, "{warnings:?}");
-            assert!(
-                said[0].contains(if local_jar {
-                    "were compared with the jar in the local repository instead"
-                } else {
-                    "were not compared with upstream; the patch service's jar was vendored as served"
-                }),
-                "{}",
-                said[0]
-            );
+                .any(|r| r.url.path().starts_with("/org/") && r.url.path().contains(".jar"));
+            assert!(!asked_for_a_jar, "no jar is asked of the registry");
+            match refusal {
+                Some(difference) => {
+                    let (code, detail) = unwrap_refused(outcome);
+                    assert_eq!(code, "vendor_prebuilt_integrity_mismatch", "{difference}");
+                    assert_eq!(
+                        detail,
+                        format!(
+                            "the patch service's jar differs from commons-text-1.10.0.jar, the \
+                             jar this build resolves from its local repository, outside the \
+                             patched members: {difference}. The build uses a jar that is not \
+                             the one the patch was made from, so the vendored jar would change \
+                             more than the patch"
+                        )
+                    );
+                    assert_eq!(
+                        crate::vendor::test_support::tree_snapshot(root),
+                        before,
+                        "{difference}: nothing is written"
+                    );
+                    assert!(!root.join(".socket").exists(), "{difference}");
+                }
+                None => {
+                    let (result, entry, warnings) = unwrap_done(outcome);
+                    assert!(result.success && entry.is_some(), "{:?}", result.error);
+                    assert!(
+                        !warnings
+                            .iter()
+                            .any(|w| w.code == "vendor_jvm_upstream_unverified"),
+                        "nothing is said of a comparison that was not made: {warnings:?}"
+                    );
+                    // A re-run over the committed tree needs no jar either.
+                    crate::vendor::test_support::persist(root, PURL, entry.unwrap()).await;
+                    let (again, _, _) =
+                        unwrap_done(run_jvm(root, &blobs, &installed, &record, Some(&cfg)).await);
+                    assert!(again.success, "{:?}", again.error);
+                }
+            }
         }
-    }
-
-    /// The jar agent mode patched in `~/.m2` is not upstream's: the first
-    /// vendoring compares with the registry's own jar instead of refusing.
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn a_first_vendoring_over_an_agent_patched_local_jar_compares_with_the_registry() {
-        let (dir, blobs, installed, record) = reactor_fixture(true).await;
-        let root = dir.path();
-        let patched = make_jar(PATCHED);
-        tokio::fs::write(installed.join("commons-text-1.10.0.jar"), &patched)
-            .await
-            .unwrap();
-        tokio::fs::write(
-            installed.join("commons-text-1.10.0.jar.sha1"),
-            sha1_hex(&patched),
-        )
-        .await
-        .unwrap();
-        let server = mount_granted_jar(&patched).await;
-        let _registry = mount_upstream(&server, &make_jar(PRISTINE)).await;
-        let cfg = service_cfg(
-            Some(&server.uri()),
-            crate::vendor::VendorSource::Service,
-            false,
-        );
-        let (result, entry, _) =
-            unwrap_done(run_jvm(root, &blobs, &installed, &record, Some(&cfg)).await);
-        assert!(result.success && entry.is_some(), "{:?}", result.error);
     }
 
     /// commons-text as log4j-core is published: a sibling's version comes

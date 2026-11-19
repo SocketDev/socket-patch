@@ -1122,6 +1122,15 @@ scanned or patched and the run warns `maven_local_repository_undetermined`; set
 before 3.9 does not read `MAVEN_ARGS`; socket-patch reads it whatever Maven is
 installed.
 
+This means a project's `.mvn/maven.config` chooses where agent mode writes. It can
+point `apply`, `rollback` and `remove` at any directory laid out as a Maven
+repository, including one outside the project and outside your home directory, exactly
+as it points Maven there when the project is built. In that directory socket-patch
+does what it does in `~/.m2`: it replaces a jar that matches the known original of a
+patch with the patch service's build of it, rewrites the checksum files beside it
+(`.sha1`, `.md5`), and restores both on rollback. Set `MAVEN_REPO_LOCAL` to name the
+repository yourself, whatever the project's config says.
+
 A Gradle-only build reads `~/.m2` only through `mavenLocal()`. Scan looks for it in
 every settings, build, `buildSrc`, included-build, applied and init script, including
 the wrapper distribution's `init.d`. Without it, `~/.m2` is not scanned, and modules
