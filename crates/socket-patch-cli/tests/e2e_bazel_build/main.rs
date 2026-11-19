@@ -31,6 +31,23 @@
 //! `SOCKET_PATCH_BAZEL_E2E_REQUIRED=1` (CI) it fails instead. `harness.rs`
 //! lists the other variables.
 //!
+//! Every flow whose build is patched also holds `socket-patch` to the VEX
+//! document it writes about that build. The command of the mode writes one
+//! for its own run (`--vex`), in the checkout Bazel has built in; `vex`
+//! writes one before the patched build and after it, and one with
+//! `--no-verify`; after the undo `vex` writes none and removes the last;
+//! and the command and `vex` write the same two in a checkout with the
+//! same files that no Bazel has built in. Each document is one statement:
+//! the package under test is `not_affected`, through the patch of this
+//! run. The documents of a flow are also held to each other: they differ
+//! in their id, their times and the mark of `--no-verify`, and in no other
+//! string. Every form is told one product; `vex` without one, as a user
+//! types it, runs once after the patched build, where it names the project
+//! of the checkout's own `package.json` or `go.mod`, or writes no document
+//! where the fixture has no such file. Nothing in `socket-patch` reads a
+//! Bazel file for it, so these tests say for which workspaces the document
+//! and the build agree.
+//!
 //! A flow is one `#[ignore]`d test in its ecosystem's module, and its
 //! fixture is one directory of files that every release builds beside one
 //! `MODULE.bazel` per era of rulesets; the fixture's table in the test code

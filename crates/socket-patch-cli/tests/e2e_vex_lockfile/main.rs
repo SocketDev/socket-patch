@@ -35,6 +35,7 @@ mod vex_pdm_hatch_common;
 #[path = "../vex_pipenv_pip_common/mod.rs"]
 mod vex_pipenv_pip_common;
 
+mod bazel_beside;
 mod bun;
 mod cargo;
 mod common_selftest;

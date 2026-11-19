@@ -2659,6 +2659,41 @@ installed tree leaves the gem with its patched sources and no finished extension
 Patch runs again: `apply` puts the previous build back and completes the rebuild, and `rollback`
 restores the original sources and build.
 
+## Bazel workspaces: VEX
+
+`vex` and `--vex` read what socket-patch wrote and what the project's own package manager
+installed. They read no `MODULE.bazel`, `WORKSPACE` or BUILD file, so in a Bazel workspace a
+document says what was patched, and that is what Bazel builds only where Bazel builds from
+the files socket-patch rewrote. The two are tested to agree on real Bazel 9.3.2, 8.8.2 and
+7.7.2 for four shapes, all under Bzlmod: Go through gazelle's
+`go_deps.from_file(go_mod = "//:go.mod")` with
+`go_deps.config(check_direct_dependencies = "error")` and the module required directly in
+`go.mod` (hosted, vendored and agent mode), npm through
+aspect_rules_js's `npm.npm_translate_lock(pnpm_lock = "//:pnpm-lock.yaml")` (hosted and
+vendored), PyPI through rules_python's `pip.parse(requirements_lock = "//:requirements.txt")`
+(hosted), and RubyGems through rules_ruby's
+`ruby.bundle_fetch(gemfile_lock = "//:Gemfile.lock")` without `gem_checksums` (hosted). There
+the build prints the patched package, and the document of the run (`--vex`), of `vex` and of
+`vex --no-verify` is one `not_affected` statement that names the package and the patch; the
+first two are the same in a checkout with the same files that Bazel has not built in, and
+after the undo `vex` writes no document. For PyPI on Bazel 8.5 and later a hosted scan leaves
+`MODULE.bazel.lock` stale, so the document is there before a frozen build passes: a build with
+`--lockfile_mode=error` fails until a build that may update the lock has run, and the updated
+lock has to be committed.
+
+In every other Bazel shape nothing checks the document against the build, and in these it was
+measured to be wrong (`not_affected` while Bazel builds the unpatched package, or while the
+build is broken): agent mode beside rules_js, which builds from the lock and never reads the
+patched `node_modules`; Go under a `go_repository` rule of a `WORKSPACE`, in hosted and
+vendored mode; Go under `go_deps` when another Bazel module of the build requires a higher
+version of the patched module, because gazelle then builds that version and drops the
+replacement; a
+`pip.parse` or `pip_parse` that takes the requirements of the build's platform from another
+file than the one socket-patch rewrote; vendored mode for PyPI. Do not publish a document for
+an artifact that Bazel built outside those four shapes. A project that Bazel does not build is
+not concerned: beside a Bazel workspace whose files name none of its locks, `vex` says what it
+says without Bazel.
+
 ## Supported platforms
 
 Prebuilt binaries are published for:

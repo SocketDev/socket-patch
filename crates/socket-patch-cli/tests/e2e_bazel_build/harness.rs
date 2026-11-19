@@ -10,12 +10,16 @@ use std::ffi::{OsStr, OsString};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::sync::OnceLock;
 
 use serde_json::{json, Value};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-use crate::envelope::event_for;
+use socket_patch_core::utils::purl::normalize_purl;
+use socket_patch_core::vex::NOT_VERIFIED_SUFFIX;
+
+use crate::envelope::{codes_in, event_for, events};
 use crate::fs_tree;
 use crate::hosted_memory_common::hermetic::{self, Extra};
 use crate::hosted_memory_common::{mount_api, read_tree, Patch, ORG};
@@ -139,6 +143,103 @@ pub type Tree = BTreeMap<String, Vec<u8>>;
 /// What [`changed`] gives for two equal trees.
 pub const NOTHING: [&str; 0] = [];
 
+/// The product the forms of `vex` are told, so that the documents of every
+/// flow name one, whatever its fixture lets `socket-patch` detect: the PyPI
+/// and the RubyGems fixture have no project file. One run per flow goes
+/// without it ([`Cell::detects_product`]).
+const PRODUCT: &str = "pkg:generic/socket-fixture@0.0.0";
+
+/// The advisory of every patch record a flow is served: the one of the
+/// shared API stand-in, and of the records a flow writes itself.
+const ADVISORY: &str = "GHSA-test-aaaa-bbbb";
+
+/// The mode a flow patched its package in, which a document says after the
+/// patch id.
+#[derive(Clone, Copy)]
+pub enum How {
+    Hosted,
+    Vendored,
+    Agent,
+}
+
+impl How {
+    fn words(self) -> &'static str {
+        match self {
+            How::Hosted => " (redirected)",
+            How::Vendored => " (vendored)",
+            How::Agent => "",
+        }
+    }
+}
+
+/// What a document has to say: the package `purl` is not affected, through
+/// the patch `uuid` of this run. The id is new for every run, so no
+/// document of an earlier run says it.
+pub struct Claim<'a> {
+    pub purl: &'a str,
+    pub uuid: &'a str,
+    pub how: How,
+}
+
+impl<'a> Claim<'a> {
+    pub fn new(purl: &'a str, uuid: &'a str, how: How) -> Claim<'a> {
+        Claim { purl, uuid, how }
+    }
+}
+
+/// `path` as an argument of `socket-patch`.
+fn argument(path: &Path) -> &str {
+    path.to_str().expect("a UTF-8 path")
+}
+
+/// The stand-alone `vex` that writes its document to `path`.
+fn vex(path: &Path) -> [&str; 5] {
+    ["vex", "--output", argument(path), "--product", PRODUCT]
+}
+
+/// What the document at `path` holds.
+fn document_at(test: &str, path: &Path) -> (String, Value) {
+    let text = std::fs::read_to_string(path)
+        .unwrap_or_else(|e| panic!("{test}: no document {}: {e}", path.display()));
+    let document =
+        serde_json::from_str(&text).unwrap_or_else(|e| panic!("{test}: no JSON ({e}):\n{text}"));
+    (text, document)
+}
+
+/// `document` without what each run and each form writes for itself: the
+/// id of the document, its times and those of its statements, and the mark
+/// of `vex --no-verify` at the end of an impact statement. What is left is
+/// what a document says and the strings it says it with: the product, the
+/// package, the advisory and its aliases, the status, the justification
+/// and the patch.
+fn wording(mut document: Value) -> Value {
+    fn without(of: &mut Value, fields: &[&str]) {
+        let Some(object) = of.as_object_mut() else {
+            return;
+        };
+        for field in fields {
+            object.remove(*field);
+        }
+    }
+    without(&mut document, &["@id", "timestamp", "last_updated"]);
+    let statements = document["statements"].as_array_mut();
+    for statement in statements.into_iter().flatten() {
+        without(statement, &["timestamp", "last_updated"]);
+        let Some(impact) = statement["impact_statement"].as_str() else {
+            continue;
+        };
+        let unmarked = impact.strip_suffix(NOT_VERIFIED_SUFFIX).unwrap_or(impact);
+        statement["impact_statement"] = unmarked.to_string().into();
+    }
+    document
+}
+
+/// What a `scan` or an `apply` is given to write the document of its own
+/// run to `path`.
+pub fn with_vex(path: &Path) -> [&str; 4] {
+    ["--vex", argument(path), "--vex-product", PRODUCT]
+}
+
 /// `name`'s value when it is set and non-empty.
 fn var(name: &str) -> Option<OsString> {
     std::env::var_os(name).filter(|value| !value.is_empty())
@@ -258,6 +359,28 @@ pub fn fixture_path(rel: &str) -> PathBuf {
         .join(rel)
 }
 
+/// The marker file of a vendored copy, in the directory of its patch.
+const MARKER: &str = "/socket-patch.vendor.json";
+
+/// `tree` with every [`MARKER`] as its JSON value without `vendoredAt`,
+/// the one field that holds a time: two runs that vendor the same patch
+/// of the same package write markers that are equal in this, and a marker
+/// that names another package, patch or advisory is not. A marker that is
+/// no JSON object stays as it is.
+fn undated(tree: &Tree) -> Tree {
+    let mut tree = tree.clone();
+    for (file, bytes) in &mut tree {
+        if !file.ends_with(MARKER) {
+            continue;
+        }
+        if let Ok(Value::Object(mut fields)) = serde_json::from_slice(bytes) {
+            fields.remove("vendoredAt");
+            *bytes = Value::Object(fields).to_string().into_bytes();
+        }
+    }
+    tree
+}
+
 /// The names under which `before` and `after` differ.
 pub fn changed(before: &Tree, after: &Tree) -> Vec<String> {
     let names = before.keys().chain(after.keys());
@@ -301,6 +424,9 @@ struct Scratch {
     /// The downloader config, which only [`Cell::route_downloads`] writes.
     /// Beside the workspace copy, so it is no file of the checkout.
     downloads: PathBuf,
+    /// The VEX documents of a flow ([`Cell::document`]), beside the
+    /// workspace copy for the same reason.
+    documents: PathBuf,
     /// Removed on drop, after [`Scratch::drop`] made it removable.
     dir: tempfile::TempDir,
 }
@@ -330,6 +456,7 @@ impl Scratch {
             repository_cache: made(repository_cache.unwrap_or_else(|| root.join("cache"))),
             contents_cache: made(root.join("contents")),
             downloads: root.join("downloader.cfg"),
+            documents: made(root.join("vex")),
             dir,
         }
     }
@@ -644,6 +771,9 @@ pub struct Cell {
     socket_bin: Option<PathBuf>,
     /// The rules of the downloader config, once a flow has asked for one.
     downloads: Option<Vec<String>>,
+    /// The [`wording`] of the first document [`Cell::attests`] read in
+    /// this checkout, which every later one is held to.
+    wording: OnceLock<Value>,
     // Dropped after `Cell::drop` has stopped the server.
     scratch: Scratch,
 }
@@ -700,6 +830,7 @@ impl Cell {
             numbers,
             socket_bin,
             downloads: None,
+            wording: OnceLock::new(),
             scratch,
         })
     }
@@ -725,23 +856,33 @@ impl Cell {
         if let Err(why) = self.shutdown() {
             panic!("{}: {why}", self.test);
         }
-        let mut twin = Cell {
+        self.unbuilt(&self.tree())
+    }
+
+    /// A checkout that no Bazel has built in: `files` in a workspace copy
+    /// of its own, which has no output base and none of Bazel's `bazel-*`
+    /// links, with the settings of this cell. Nothing but `socket-patch`
+    /// runs in it unless the caller builds there ([`Cell::twin`]), so this
+    /// cell's server keeps running.
+    pub fn unbuilt(&self, files: &Tree) -> Cell {
+        let mut copy = Cell {
             test: self.test.clone(),
             repo_env: self.repo_env.clone(),
             bazel: self.bazel.clone(),
             numbers: self.numbers,
             socket_bin: self.socket_bin.clone(),
             downloads: None,
+            wording: OnceLock::new(),
             scratch: Scratch::new(Some(self.scratch.repository_cache.clone())),
         };
-        for (rel, bytes) in self.tree() {
-            twin.write(&rel, bytes);
+        for (rel, bytes) in files {
+            copy.write(rel, bytes);
         }
-        std::fs::create_dir(twin.scratch.workspace.join(".git")).expect("create .git");
+        std::fs::create_dir(copy.scratch.workspace.join(".git")).expect("create .git");
         if let Some(rules) = &self.downloads {
-            twin.route_downloads(rules);
+            copy.route_downloads(rules);
         }
-        twin
+        copy
     }
 
     /// Send the downloads of Bazel's own downloader where `rules` say: the
@@ -962,6 +1103,182 @@ impl Cell {
         [out.stdout, out.stderr].map(|stream| String::from_utf8_lossy(&stream).into_owned())
     }
 
+    /// Where a flow has `socket-patch` write the VEX document `name`:
+    /// beside the workspace copy, so it is no file of the checkout, and no
+    /// comparison of the checkout's files sees it.
+    pub fn document(&self, name: &str) -> PathBuf {
+        self.scratch.documents.join(format!("{name}.vex.json"))
+    }
+
+    /// The document at `path` says `claim` and nothing else: one statement,
+    /// `not_affected` for the one advisory, with the package as the one
+    /// subcomponent of the one product and the patch of this run in its
+    /// impact statement, which ends with `; not verified on disk` exactly
+    /// when the run did not check the files (`verified` is false). And it
+    /// says so in the words of every other document read in this checkout:
+    /// the forms spell the product, the package, the advisory and the
+    /// status alike, and differ in nothing but what [`wording`] leaves out.
+    fn attests(&self, path: &Path, claim: &Claim, verified: bool) {
+        let test = &self.test;
+        let (text, document) = document_at(test, path);
+        let context = "https://openvex.dev/ns/v0.2.0";
+        assert_eq!(document["@context"], context, "{test}: {text}");
+        let statements = document["statements"].as_array();
+        let Some([statement]) = statements.map(Vec::as_slice) else {
+            panic!("{test}: not one statement:\n{text}");
+        };
+        assert_eq!(statement["status"], "not_affected", "{test}: {text}");
+        let justification = "inline_mitigations_already_exist";
+        assert_eq!(statement["justification"], justification, "{test}: {text}");
+        let advisory = &statement["vulnerability"]["name"];
+        assert_eq!(*advisory, ADVISORY, "{test}: {text}");
+        // The package is named as its record names it: with `%40` or with
+        // `@` for the scope of an npm name.
+        let named = statement["products"][0]["subcomponents"][0]["@id"].as_str();
+        let named = named.unwrap_or_default();
+        let purl = normalize_purl(claim.purl);
+        assert_eq!(normalize_purl(named), purl, "{test}: {text}");
+        let products = json!([{ "@id": PRODUCT, "subcomponents": [{ "@id": named }] }]);
+        assert_eq!(statement["products"], products, "{test}: {text}");
+        let (uuid, how) = (claim.uuid, claim.how.words());
+        let mut impact = format!("Patched via Socket patch {uuid}{how}");
+        if !verified {
+            impact += NOT_VERIFIED_SUFFIX;
+        }
+        assert_eq!(statement["impact_statement"], impact, "{test}: {text}");
+        let said = wording(document);
+        let first = self.wording.get_or_init(|| said.clone());
+        assert_eq!(
+            said, *first,
+            "{test}: not the words of the first document of this checkout:\n{text}"
+        );
+    }
+
+    /// The stand-alone `vex` of this checkout, through `run`, the flow's way
+    /// to run `socket-patch` in a cell. It attests `claim` and nothing
+    /// else, in its envelope and in the document it writes, which is not
+    /// the one of an earlier call. `verified` is false for
+    /// `vex --no-verify`, which says in a warning, and in the document,
+    /// that it checked no file.
+    pub fn stands_alone(&self, run: impl Fn(&Cell, &[&str]) -> Ran, claim: &Claim, verified: bool) {
+        let path = self.document("stand-alone");
+        let _ = std::fs::remove_file(&path);
+        let unchecked: &[&str] = if verified { &[] } else { &["--no-verify"] };
+        let ran = run(self, &[&vex(&path), unchecked].concat());
+        let (test, said) = (&self.test, &ran.dump);
+        assert_eq!(ran.code, 0, "{test}: {said}");
+        assert_eq!(ran.envelope["status"], "success", "{test}: {said}");
+        let [event] = events(&ran.envelope) else {
+            panic!("{test}: not one event: {said}");
+        };
+        assert_eq!(event["action"], "verified", "{test}: {said}");
+        let purl = normalize_purl(event["purl"].as_str().unwrap_or_default());
+        assert_eq!(purl, normalize_purl(claim.purl), "{test}: {said}");
+        let details = &event["details"];
+        assert_eq!(details["status"], "not_affected", "{test}: {said}");
+        assert_eq!(details["vulnerability"], ADVISORY, "{test}: {said}");
+        let warned: &[&str] = if verified { &[] } else { &["vex_not_verified"] };
+        let warnings = codes_in(&ran.envelope["warnings"]);
+        assert_eq!(warnings, warned, "{test}: {said}");
+        self.attests(&path, claim, verified);
+    }
+
+    /// `vex --output <file>` as a user types it, with no `--product`,
+    /// through `run`, in this checkout that Bazel has built in: beside the
+    /// project's own files are Bazel's links, and behind them those files
+    /// again. `product` is what `vex` reads from the project file of the
+    /// checkout: it writes the document every other form wrote here, for
+    /// that product, and warns of nothing. With `None` the checkout has no
+    /// file `vex` reads a product from: it exits 2 with
+    /// `product_undetected` and writes no document.
+    pub fn detects_product(&self, run: impl Fn(&Cell, &[&str]) -> Ran, product: Option<&str>) {
+        let path = self.document("no-product");
+        let ran = run(self, &["vex", "--output", argument(&path)]);
+        let (test, said) = (&self.test, &ran.dump);
+        let Some(product) = product else {
+            assert_eq!(ran.code, 2, "{test}: {said}");
+            let error = &ran.envelope["error"]["code"];
+            assert_eq!(*error, "product_undetected", "{test}: {said}");
+            assert!(!path.exists(), "{test}: a document is left: {said}");
+            return;
+        };
+        assert_eq!(ran.code, 0, "{test}: {said}");
+        assert_eq!(
+            codes_in(&ran.envelope["warnings"]),
+            NOTHING,
+            "{test}: {said}"
+        );
+        let (text, document) = document_at(test, &path);
+        let mut named = self.wording.get().cloned().expect("a document here");
+        named["statements"][0]["products"][0]["@id"] = product.into();
+        assert_eq!(wording(document), named, "{test}: {said}\n{text}");
+    }
+
+    /// For a finished command that was given [`with_vex`] for `path`: it
+    /// passed, and wrote the document of its own run, which attests
+    /// `claim` and nothing else. A hosted scan says of its document that
+    /// no file was hashed for it: the lock names the patch, and the bytes
+    /// come with the next build.
+    pub fn wrote_in_run(&self, ran: &Ran, path: &Path, claim: &Claim) {
+        let (test, said) = (&self.test, &ran.dump);
+        assert_eq!(ran.code, 0, "{test}: {said}");
+        let vex = &ran.envelope["vex"];
+        assert_eq!(vex["statements"], 1, "{test}: {said}");
+        assert_eq!(vex["format"], "openvex-0.2.0", "{test}: {said}");
+        assert_eq!(vex["path"], argument(path), "{test}: {said}");
+        let warned: &[&str] = match claim.how {
+            How::Hosted => &["vex_hosted_unverified"],
+            How::Vendored | How::Agent => &[],
+        };
+        assert_eq!(codes_in(&vex["warnings"]), warned, "{test}: {said}");
+        self.attests(path, claim, true);
+    }
+
+    /// The same two documents from a checkout that no Bazel has built in:
+    /// one with the files `before`, where `command`, the command of the
+    /// mode, applies the patch and writes the document of its run, and the
+    /// stand-alone `vex` writes its own, both in the words of this
+    /// checkout's documents. The command leaves the files `patched`, those
+    /// the patched build started from, so both checkouts attest the same
+    /// files. One field of one file is left out: `vendoredAt`, the time of
+    /// its run in the marker of a vendored copy.
+    pub fn attests_unbuilt(
+        &self,
+        run: impl Fn(&Cell, &[&str]) -> Ran,
+        command: &[&str],
+        before: &Tree,
+        patched: &Tree,
+        claim: &Claim,
+    ) {
+        let fresh = self.unbuilt(before);
+        let in_run = fresh.document("in-run");
+        let ran = run(&fresh, &[command, &with_vex(&in_run)].concat());
+        let (test, said) = (&self.test, &ran.dump);
+        assert_eq!(ran.envelope["summary"]["applied"], 1, "{test}: {said}");
+        fresh.wrote_in_run(&ran, &in_run, claim);
+        let differ = changed(&undated(patched), &undated(&fresh.tree()));
+        assert_eq!(differ, NOTHING, "{test}: {said}");
+        fresh.stands_alone(run, claim, true);
+        let (here, there) = (self.wording.get(), fresh.wording.get());
+        assert_eq!(there, here, "{test}: the two checkouts word it apart");
+    }
+
+    /// The stand-alone `vex` of a checkout that holds no patch any more,
+    /// through `run`: it exits `code` with the error `error` and leaves no
+    /// document, and says that it removed the one [`Cell::stands_alone`]
+    /// left.
+    pub fn attests_nothing(&self, run: impl Fn(&Cell, &[&str]) -> Ran, code: i32, error: &str) {
+        let path = self.document("stand-alone");
+        let ran = run(self, &vex(&path));
+        let (test, said) = (&self.test, &ran.dump);
+        assert_eq!(ran.code, code, "{test}: {said}");
+        assert_eq!(ran.envelope["error"]["code"], error, "{test}: {said}");
+        assert!(!path.exists(), "{test}: a document is left: {said}");
+        let warned = codes_in(&ran.envelope["warnings"]);
+        let removed = warned.iter().any(|code| code == "vex_stale_doc_removed");
+        assert!(removed, "{test}: {said}");
+    }
+
     /// `bazel shutdown`, when the pid file of a server is there. No command
     /// options: the startup options are what address the server.
     fn shutdown(&self) -> Result<(), String> {
@@ -1038,6 +1355,7 @@ pub fn cell_without_bazel(release: &str) -> Cell {
         numbers: numbers(release).expect("a release"),
         socket_bin: None,
         downloads: None,
+        wording: OnceLock::new(),
         scratch: Scratch::new(None),
     }
 }
@@ -1083,6 +1401,67 @@ fn a_downloader_config_is_named_by_the_option_of_the_release() {
         }
         assert_ne!(cell.scratch.downloads, twin.scratch.downloads, "{release}");
     }
+}
+
+/// Without a Bazel: a document is no file of the checkout it is about, nor
+/// of a checkout made from it, which has documents of its own.
+#[test]
+fn a_document_is_no_file_of_the_checkout() {
+    let cell = cell_without_bazel("9.3.2");
+    cell.write("MODULE.bazel", "");
+    let fresh = cell.unbuilt(&cell.tree());
+    assert_eq!(changed(&cell.tree(), &fresh.tree()), NOTHING);
+    let documents = [cell.document("one"), fresh.document("one")];
+    assert_ne!(documents[0], documents[1]);
+    for document in &documents {
+        assert!(document.parent().is_some_and(Path::is_dir), "{document:?}");
+        for copy in [&cell, &fresh] {
+            assert!(!document.starts_with(&copy.scratch.workspace));
+        }
+    }
+}
+
+/// Without a Bazel: two documents are held to each other in every string
+/// but the id, the times and the mark of `--no-verify`, so the two
+/// spellings of an npm scope are two wordings; and two trees in every
+/// byte but the `vendoredAt` of a marker.
+#[test]
+fn documents_and_markers_are_compared_but_for_their_ids_and_times() {
+    let (escaped, plain) = ("pkg:npm/%40scope/name@1.0.0", "pkg:npm/@scope/name@1.0.0");
+    let document = |n: u32, package: &str, impact: &str| {
+        let time = format!("2026-01-0{n}T00:00:00Z");
+        wording(json!({
+            "@id": format!("urn:uuid:{n}"),
+            "timestamp": time,
+            "statements": [{
+                "timestamp": time,
+                "products": [{ "@id": PRODUCT, "subcomponents": [{ "@id": package }] }],
+                "impact_statement": impact,
+            }],
+        }))
+    };
+    let patched = "Patched via Socket patch one (vendored)";
+    let first = document(1, escaped, patched);
+    let unchecked = format!("{patched}{NOT_VERIFIED_SUFFIX}");
+    assert_eq!(document(2, escaped, &unchecked), first);
+    assert_ne!(document(1, plain, patched), first);
+    assert_ne!(document(1, escaped, "Patched via Socket patch two"), first);
+
+    let tree = |file: &str, purl: &str, n: u32| {
+        let marker = json!({ "purl": purl, "vendoredAt": format!("2026-01-0{n}T00:00:00Z") });
+        undated(&Tree::from([(
+            file.to_string(),
+            marker.to_string().into_bytes(),
+        )]))
+    };
+    let marker = format!(".socket/vendor/npm/one{MARKER}");
+    let first = tree(&marker, escaped, 1);
+    assert_eq!(changed(&first, &tree(&marker, escaped, 2)), NOTHING);
+    assert_eq!(changed(&first, &tree(&marker, plain, 1)), [marker.as_str()]);
+    // No other file is read for a time.
+    let ledger = ".socket/vendor/state.json";
+    let other = changed(&tree(ledger, escaped, 1), &tree(ledger, escaped, 2));
+    assert_eq!(other, [ledger]);
 }
 
 /// Set in the copy of this test binary that the next test starts, which
