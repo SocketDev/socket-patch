@@ -2341,33 +2341,52 @@ pub async fn download_and_apply_patches_into(
     run_outcome(batch.failed > 0, apply_failed)
 }
 
-/// The install command whose fresh run undoes the in-place patches of an
+/// The install commands whose fresh run undoes the in-place patches of an
 /// ecosystem's packages: the package manager the project's lockfile names
 /// (`has_file` answers for the project root), else the ecosystem's default.
-/// `None` where no one install step does (Maven, Gradle, sbt), or where
-/// none undoes the patch (Go builds from the committed copies).
-fn install_command(ecosystem: Ecosystem, has_file: &dyn Fn(&str) -> bool) -> Option<&'static str> {
+/// Empty where no one install step does (Maven, Gradle, sbt), or where
+/// none undoes the patch (Go builds from the committed copies). A Python
+/// project pixi installs gets `pixi install` beside any other tool's
+/// install: pixi keeps its own environments, whatever venv that tool
+/// fills.
+fn install_commands(ecosystem: Ecosystem, has_file: &dyn Fn(&str) -> bool) -> Vec<&'static str> {
     use socket_patch_core::constants::npm_family::{BUN_LOCK, BUN_LOCKB, PNPM_LOCK, VLT_LOCK};
-    Some(match ecosystem {
-        Ecosystem::Npm if has_file(PNPM_LOCK) => "pnpm install",
-        Ecosystem::Npm if has_file("yarn.lock") => "yarn install",
-        Ecosystem::Npm if has_file(BUN_LOCK) || has_file(BUN_LOCKB) => "bun install",
-        Ecosystem::Npm if has_file(VLT_LOCK) => "vlt install",
-        Ecosystem::Npm => "npm install",
-        Ecosystem::Pypi if has_file("uv.lock") => "uv sync",
-        Ecosystem::Pypi if has_file("poetry.lock") => "poetry install",
-        Ecosystem::Pypi if has_file("Pipfile.lock") => "pipenv install",
-        Ecosystem::Pypi if has_file("pdm.lock") => "pdm install",
-        // pixi links the packages of a project into its own environments,
-        // conda and PyPI ones alike.
-        Ecosystem::Pypi if has_file("pixi.lock") => "pixi install",
-        Ecosystem::Pypi => "pip install",
-        Ecosystem::Gem => "bundle install",
-        Ecosystem::Composer => "composer install",
-        Ecosystem::Cargo => "cargo fetch",
-        Ecosystem::Nuget => "dotnet restore",
-        Ecosystem::Golang | Ecosystem::Maven | Ecosystem::Deno => return None,
-    })
+    let one = |command: &'static str| vec![command];
+    match ecosystem {
+        Ecosystem::Npm if has_file(PNPM_LOCK) => one("pnpm install"),
+        Ecosystem::Npm if has_file("yarn.lock") => one("yarn install"),
+        Ecosystem::Npm if has_file(BUN_LOCK) || has_file(BUN_LOCKB) => one("bun install"),
+        Ecosystem::Npm if has_file(VLT_LOCK) => one("vlt install"),
+        Ecosystem::Npm => one("npm install"),
+        Ecosystem::Pypi => {
+            let mut commands: Vec<&'static str> = [
+                ("uv.lock", "uv sync"),
+                ("poetry.lock", "poetry install"),
+                ("Pipfile.lock", "pipenv install"),
+                ("pdm.lock", "pdm install"),
+            ]
+            .into_iter()
+            .find(|(lock, _)| has_file(lock))
+            .map(|(_, command)| command)
+            .into_iter()
+            .collect();
+            // pixi links the packages of a project into its own
+            // environments, conda and PyPI ones alike.
+            let pixi_files = socket_patch_core::crawlers::pixi_env::PIXI_FILES;
+            if pixi_files.iter().any(|file| has_file(file)) {
+                commands.push("pixi install");
+            }
+            if commands.is_empty() {
+                commands.push("pip install");
+            }
+            commands
+        }
+        Ecosystem::Gem => one("bundle install"),
+        Ecosystem::Composer => one("composer install"),
+        Ecosystem::Cargo => one("cargo fetch"),
+        Ecosystem::Nuget => one("dotnet restore"),
+        Ecosystem::Golang | Ecosystem::Maven | Ecosystem::Deno => Vec::new(),
+    }
 }
 
 /// The "Next steps:" block that ends a wet agent-mode run (`get`,
@@ -2398,7 +2417,7 @@ pub(crate) fn next_steps(
     let has_file = |name: &str| project_root.join(name).is_file();
     let mut installs: Vec<&str> = ecosystems
         .iter()
-        .filter_map(|ecosystem| install_command(*ecosystem, &has_file))
+        .flat_map(|ecosystem| install_commands(*ecosystem, &has_file))
         .collect();
     installs.sort_unstable();
     installs.dedup();
@@ -2493,6 +2512,7 @@ mod tests {
             ("uv.lock", "pkg:pypi/a@1", "uv sync"),
             ("poetry.lock", "pkg:pypi/a@1", "poetry install"),
             ("pixi.lock", "pkg:pypi/a@1", "pixi install"),
+            ("pixi.toml", "pkg:pypi/a@1", "pixi install"),
         ] {
             let dir = tempfile::tempdir().unwrap();
             std::fs::write(dir.path().join(lock), "").unwrap();
@@ -2502,6 +2522,18 @@ mod tests {
                 "{lock}: {named:?}"
             );
         }
+
+        // pixi keeps its own environments beside another tool's venv: both
+        // installs undo a patch.
+        let both = tempfile::tempdir().unwrap();
+        for file in ["uv.lock", "pixi.toml"] {
+            std::fs::write(both.path().join(file), "").unwrap();
+        }
+        let named = steps(&["pkg:pypi/a@1"], both.path());
+        assert!(
+            named[2].contains("after every `pixi install` and `uv sync`,"),
+            "{named:?}"
+        );
 
         // No single install command: the step still says when to re-apply.
         let maven = steps(&["pkg:maven/g/a@1"], root);

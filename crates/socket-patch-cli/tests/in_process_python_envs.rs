@@ -1144,3 +1144,39 @@ async fn pixi_fresh_checkout_never_scans_the_system_python() {
         }
     }
 }
+
+/// A `requirements.txt` beside pixi's files is what pip installs from, so
+/// the project's packages may be in an interpreter outside pixi's
+/// environments (a container image that runs `pip install -r
+/// requirements.txt`). With no pixi environment installed, such a project
+/// still gets the crawl a requirements project always had, here reaching
+/// the conda root under the stubbed HOME, in every mode.
+#[tokio::test]
+#[serial]
+async fn pixi_project_that_pip_also_installs_keeps_the_interpreter_crawl() {
+    use socket_patch_cli::commands::scan::ScanMode;
+    for mode in [ScanMode::Agent, ScanMode::Vendored, ScanMode::Hosted] {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("service");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("pixi.toml"), "[workspace]\n").unwrap();
+        std::fs::write(project.join("pixi.lock"), "version: 6\n").unwrap();
+        std::fs::write(project.join("requirements.txt"), "image-pkg==1.0.0\n").unwrap();
+        let home = tmp.path().join("home");
+        let system = home
+            .join("anaconda3")
+            .join("lib")
+            .join("python3.11")
+            .join("site-packages");
+        std::fs::create_dir_all(&system).unwrap();
+        write_dist_info(&system, "image_pkg", "1.0.0");
+
+        let server = MockServer::start().await;
+        mock_batch_empty(&server).await;
+        let mut args = default_args(&project, server.uri());
+        args.mode = Some(mode);
+        let code = scan_unactivated(args, &home).await;
+        assert_eq!(code, 0, "{mode:?}");
+        assert_discovered(&batch_bodies(&server).await, "pkg:pypi/image-pkg@1.0.0");
+    }
+}

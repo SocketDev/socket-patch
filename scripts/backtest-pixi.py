@@ -19,8 +19,10 @@ install` does:
   hosted    scan (the default mode) -> nothing is written, and the run
             warns `redirect_pypi_pixi_project`, which names agent mode.
   vendored  scan --mode vendored -> the patch is refused, nothing written.
-  fresh     a checkout with no environment installed: no package is read
-            from the Python on PATH.
+  fresh     a checkout with no environment installed, and a decoy
+            interpreter holding one package first on PATH: nothing is read
+            from it, until a requirements.txt (which pip, not pixi,
+            installs from) says another installer may fill it.
 
 Shapes: conda (the package from conda-forge, the usual pixi project),
 pypi (the same release from PyPI through `[pypi-dependencies]`, installed
@@ -292,8 +294,6 @@ def run_case(job, ctx):
     env = dict(ctx["env"])
     env["PIXI_HOME"] = str(case / "pixi-home")
     env["PIXI_CACHE_DIR"] = str(ctx["root"] / "cache" / version)
-    # A decoy on PATH must never be read: the project's packages are only
-    # in pixi's environments.
     pixi, cli = ctx["pixi"][version], ctx["cli"]
     row = dict(version=version, shape=shape, mode=mode, checks={}, passed=False)
     step = [0]
@@ -325,13 +325,40 @@ def run_case(job, ctx):
                 )
 
         if mode == "fresh":
-            # A lock but no environment, as a fresh checkout has.
+            # A lock but no environment, as a fresh checkout has, and a decoy
+            # interpreter with one package first on PATH (not activated: the
+            # fallback under test asks whichever `python3` PATH finds).
+            # Dry runs only: a regression must not patch the decoy's
+            # neighbours on the host.
             (project / "pixi.lock").write_text("version: 6\n")
-            scan = sp("scan", "--mode", "agent", "--json", name="scan-fresh")
+            decoy = case / "decoy"
+            require(
+                Run([sys.executable, "-m", "venv", "--without-pip", decoy], case, env, log("decoy-venv")),
+                "decoy venv",
+            )
+            decoy_site = next(decoy.glob("lib/python3.*/site-packages"))
+            dist = decoy_site / "decoy_pkg-6.6.6.dist-info"
+            dist.mkdir()
+            (dist / "METADATA").write_text("Metadata-Version: 2.1\nName: decoy-pkg\nVersion: 6.6.6\n")
+            env["PATH"] = f"{decoy / 'bin'}{os.pathsep}{env['PATH']}"
+
+            scan = sp("scan", "--mode", "agent", "--dry-run", "--json", name="scan-fresh")
             envelope = scan.json()
             check("scanExitsZero", scan.ok(), scan.err[-500:])
             check("nothingReadFromPath", envelope.get("scannedPackages", 0) == 0, envelope.get("scannedPackages"))
             check("noEnvironmentCreated", not (project / ".pixi" / "envs").exists())
+
+            # The other half of the rule: pip installs from a
+            # requirements.txt, so with one the interpreter on PATH may hold
+            # the project's packages and is still asked.
+            (project / "requirements.txt").write_text(f"{PACKAGE}=={PACKAGE_VERSION}\n")
+            scan = sp("scan", "--mode", "agent", "--dry-run", "--json", name="scan-fresh-with-requirements")
+            envelope = scan.json()
+            check(
+                "pathInterpreterKeptForAPipProject",
+                scan.ok() and envelope.get("scannedPackages", 0) >= 1,
+                envelope.get("scannedPackages"),
+            )
             row["passed"] = all(row["checks"].values())
             return row
 
@@ -476,9 +503,13 @@ def main():
             if shape == "detached" and vtuple(version) < DETACHED_SINCE:
                 continue
             for mode in args.modes:
-                # One fresh-checkout and one refusal probe per version: they
-                # do not depend on where the package comes from.
-                if mode in ("fresh", "vendored") and shape not in ("conda", "pyproject"):
+                # The refusal does not depend on where the package comes
+                # from. The fresh-checkout probe needs a Python marker beside
+                # pixi's files (a `pyproject.toml`): without one no release
+                # ever asked the interpreter on PATH.
+                if mode == "vendored" and shape not in ("conda", "pyproject"):
+                    continue
+                if mode == "fresh" and shape != "pyproject":
                     continue
                 row = run_case((version, shape, mode), ctx)
                 rows.append(row)

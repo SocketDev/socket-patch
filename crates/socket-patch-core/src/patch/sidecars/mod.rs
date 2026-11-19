@@ -94,9 +94,10 @@ fn advisory_only_payload(
 
 /// What to tell the operator after an in-place patch of a Python package:
 /// its install records still describe the unpatched files, and a reinstall
-/// by whatever installed it reverts the patch. A package in a conda prefix
-/// was installed by pixi or conda, which has no `pip` to check or
-/// reinstall with (a pixi environment usually ships none).
+/// by whatever installed it reverts the patch. pixi reinstalls everything
+/// in its environments, conda packages and PyPI wheels alike, and usually
+/// ships no `pip` to check with. A conda environment may hold packages pip
+/// installed beside conda's, so both reinstalls are named.
 fn pypi_advisory_message(pkg_path: &Path) -> &'static str {
     use crate::crawlers::pixi_env::{conda_prefix_of, is_pixi_prefix};
     match conda_prefix_of(pkg_path) {
@@ -108,9 +109,10 @@ fn pypi_advisory_message(pkg_path: &Path) -> &'static str {
         }
         Some(_) => {
             "PyPI: these packages are in a conda environment, whose records of them \
-             (conda-meta, .dist-info/RECORD) still describe the unpatched files. `conda \
-             install --force-reinstall`, or recreating the environment, will revert these \
-             patches."
+             (conda-meta, .dist-info/RECORD) still describe the unpatched files. \
+             Reinstalling one (`conda install --force-reinstall`, or `pip install \
+             --force-reinstall` for a package pip installed there), or recreating the \
+             environment, will revert these patches."
         }
         None => {
             "PyPI: run `pip check` (or `uv pip check`) to verify \
@@ -444,6 +446,7 @@ mod tests {
             advisory
                 .message
                 .contains("`conda install --force-reinstall`")
+                && advisory.message.contains("`pip install --force-reinstall`")
                 && !advisory.message.contains("pixi")
                 && !advisory.message.contains("pip check"),
             "{}",

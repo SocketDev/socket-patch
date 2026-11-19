@@ -425,8 +425,14 @@ fn pixi_project_apply_refuses_a_conda_build_that_differs_from_the_release() {
     assert_eq!(std::fs::read(&target).unwrap(), conda_build);
     assert!(
         stderr.contains("Failed to patch pkg:pypi/certifi@2026.7.22: no matching variant found")
-            && stderr.contains("conda environment")
-            && stderr.contains("not the PyPI release's"),
+            && stderr.contains("is in a conda environment")
+            && stderr.contains("match none of the releases the patch was made for"),
+        "stderr:\n{stderr}"
+    );
+    // The copy is named: a project may hold one per environment.
+    let site_packages = target.parent().unwrap().parent().unwrap();
+    assert!(
+        stderr.contains(&site_packages.display().to_string()),
         "stderr:\n{stderr}"
     );
 }

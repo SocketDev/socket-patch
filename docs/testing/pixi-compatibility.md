@@ -23,7 +23,7 @@ does.
 | agent | `scan --mode agent` exits 0 and records the patch; the patched files of every environment hash to the patch's `afterHash`; no project file changes; pixi's package cache still holds the upstream bytes (an environment's files are hard links into it on Linux); `apply` is idempotent; `pixi install` and `pixi run` keep the patch and the environment's Python imports the package; `vex` attests it; rebuilt environments hold the upstream bytes again and `apply` restores the patch; `rollback` restores every byte |
 | hosted | `scan` (default mode) exits 0, finds the package, changes no project file and warns `redirect_pypi_pixi_project` |
 | vendored | `scan --mode vendored` finds the package, refuses it (`pypi_no_requirements` or `pypi_pyproject_only`, exit 1) and writes nothing |
-| fresh | With pixi's files but no environment installed, no package is read from the Python on `PATH` |
+| fresh | With pixi's files, a `pyproject.toml` and no environment installed, a decoy interpreter holding one package is first on `PATH`: nothing is read from it. With a `requirements.txt` added, which pip installs from, it is read (dry runs only) |
 
 | Shape | Project |
 | --- | --- |

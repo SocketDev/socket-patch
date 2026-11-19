@@ -968,18 +968,27 @@ git add .socket && git commit      # keep the patches
 pixi install && socket-patch apply
 ```
 
-- **Discovery needs no activation.** `scan`, `apply`, `rollback`, `remove`, `repair`,
-  `list` and `vex` find every environment under `.pixi/envs/` from the project root,
-  without `pixi run` or `pixi shell`. With pixi's `detached-environments` setting the
+- **Discovery needs no activation.** `scan`, `apply`, `rollback`, `remove`, `repair`
+  and `vex` find every environment under `.pixi/envs/` from the project root, without
+  `pixi run` or `pixi shell`. With pixi's `detached-environments` setting the
   environments live under pixi's cache and `.pixi/envs` is a link to them, which is
   followed (pixi leaves no such link on Windows; run socket-patch through `pixi run`
   there, which names the activated environment). A venv another tool keeps in the same
   project (`./.venv`, an activated `VIRTUAL_ENV`) is still crawled, ahead of pixi's
   environments. `scan --global` also reads the tool environments `pixi global install`
   creates under `$PIXI_HOME/envs` (default `~/.pixi/envs`).
-- **A pixi project never falls back to the Python on `PATH`.** With a `pixi.toml` or
-  `pixi.lock` at the root and no environment installed, nothing is installed for the
-  project; the scan says so instead of crawling the system interpreter.
+- **A project only pixi installs never falls back to the Python on `PATH`.** With a
+  `pixi.toml` or `pixi.lock` at the root and no environment installed, nothing is
+  installed for the project; the scan says so instead of crawling the system
+  interpreter. A `requirements.txt`, `setup.py` or `setup.cfg` beside pixi's files
+  keeps that fallback: pip installs from those, so the interpreter on `PATH` may hold
+  the project's packages (a container image that runs `pip install -r
+  requirements.txt`). A `pyproject.toml` does not: pixi reads it as its manifest, or
+  installs the project it describes.
+- **From a workspace member directory, use `pixi run`.** The environments are under the
+  workspace root's `.pixi/envs`. Run from a directory below it, socket-patch uses the
+  environment `pixi run` or `pixi shell` activated for that workspace; without an
+  activation it finds none there.
 - **A conda build is patched when its files are the PyPI release's.** A patch records
   the hash of each file it replaces, taken from the PyPI release. conda-forge builds
   pure-Python packages from the same sources, so those hashes match and the patch
@@ -1002,7 +1011,10 @@ pixi install && socket-patch apply
   (exit 0). `scan --mode vendored` refuses each patch (`pypi_no_requirements`, or
   `pypi_pyproject_only` when the project keeps a `pyproject.toml`), writes nothing and
   exits 1; its message names agent mode too. `pixi.lock` is not read as a lockfile: a
-  fresh checkout has no packages until `pixi install` has run.
+  fresh checkout has no packages until `pixi install` has run. A project that also
+  has a lock another tool installs from (a `uv.lock` for a `.venv` beside pixi's
+  environments) is still rewired for that tool; the copy in the pixi environment is
+  then reported as `redirect_pypi_stale_install`, whose remedy names agent mode.
 - **Tested against real pixi.** `scripts/backtest-pixi.py` runs these flows on pinned
   pixi releases; see [pixi compatibility](testing/pixi-compatibility.md).
 

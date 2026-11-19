@@ -1130,9 +1130,13 @@ fn warn_no_pypi_wiring(
     }
     // A pixi project: a requirements file or another tool's lock would
     // pin nothing, since pixi installs from its own lock, and mostly from
-    // conda channels.
+    // conda channels. A project whose own files name another lock tool (a
+    // Pipfile, a `[tool.uv]` table) is installed by that tool too, and
+    // keeps its remedy.
     let pixi_files = crate::crawlers::pixi_env::PIXI_FILES;
-    if pixi_files.iter().any(|file| files.contains_key(*file)) {
+    if pixi_files.iter().any(|file| files.contains_key(*file))
+        && pypi_named_lock_step(files).is_none()
+    {
         result.warnings.push(RewriteWarning {
             code: "redirect_pypi_pixi_project".into(),
             detail: "pixi installs this project (pixi.toml / pixi.lock), most of it from \
@@ -1166,12 +1170,26 @@ fn warn_no_pypi_wiring(
 /// both remedies are offered.
 fn pypi_no_lockfile_remedy(files: &BTreeMap<String, String>) -> String {
     const PIN: &str = "pin the package in a root requirements.txt";
-    if files.contains_key("Pipfile") {
-        return "run `pipenv lock` and commit Pipfile.lock, then re-run".into();
+    if let Some(step) = pypi_named_lock_step(files) {
+        return step;
     }
-    let Some(pyproject) = files.get("pyproject.toml") else {
+    if !files.contains_key("pyproject.toml") {
         return format!("{PIN} or commit the project's lock, then re-run");
-    };
+    }
+    format!(
+        "{PIN}, or, if a lock tool installs the project, generate and commit its \
+         lock (`uv lock`, `poetry lock`, `pdm lock`), then re-run"
+    )
+}
+
+/// The lock step of the tool the project's own files name: `pipenv lock`
+/// for a Pipfile, else the lock of the tool a pyproject names with a
+/// `[tool.<tool>]` table or its build backend. `None` when they name none.
+fn pypi_named_lock_step(files: &BTreeMap<String, String>) -> Option<String> {
+    if files.contains_key("Pipfile") {
+        return Some("run `pipenv lock` and commit Pipfile.lock, then re-run".into());
+    }
+    let pyproject = files.get("pyproject.toml")?;
     let document = pyproject.parse::<toml_edit::DocumentMut>().ok();
     let backend = document
         .as_ref()
@@ -1187,19 +1205,14 @@ fn pypi_no_lockfile_remedy(files: &BTreeMap<String, String>) -> String {
             || backend.starts_with(&format!("{tool}."))
             || backend.starts_with(&format!("{tool}_"))
     };
-    for (tool, command) in [
+    [
         ("uv", "uv lock"),
         ("poetry", "poetry lock"),
         ("pdm", "pdm lock"),
-    ] {
-        if names(tool) {
-            return format!("run `{command}` and commit its lock, then re-run");
-        }
-    }
-    format!(
-        "{PIN}, or, if a lock tool installs the project, generate and commit its \
-         lock (`uv lock`, `poetry lock`, `pdm lock`), then re-run"
-    )
+    ]
+    .into_iter()
+    .find(|(tool, _)| names(tool))
+    .map(|(_, command)| format!("run `{command}` and commit its lock, then re-run"))
 }
 
 fn rewrite_hatch(

@@ -287,6 +287,44 @@ fn a_pixi_project_is_sent_to_agent_mode() {
     }
 }
 
+/// A pixi project whose own files name another lock tool is installed by
+/// that tool as well: it keeps that tool's lock step, which the pixi
+/// warning would otherwise hide.
+#[test]
+fn a_pixi_project_that_names_a_lock_tool_keeps_that_tools_remedy() {
+    let overrides = [six("aaaaaaaa-0000-4000-8000-000000000638")];
+    let cases: [(&str, &str, &str); 2] = [
+        (
+            "Pipfile",
+            "[packages]\nsix = \"==1.16.0\"\n",
+            "`pipenv lock`",
+        ),
+        (
+            "pyproject.toml",
+            "[project]\nname = \"app\"\n\n[tool.uv]\npackage = false\n",
+            "`uv lock`",
+        ),
+    ];
+    for (name, text, step) in cases {
+        let result = rewrite_registry_redirect(
+            &files(&[("pixi.toml", "[workspace]\n"), (name, text)]),
+            &overrides,
+        );
+        assert!(
+            !codes(&result).contains(&PIXI_CODE),
+            "{name}: {:?}",
+            codes(&result)
+        );
+        let warnings = no_lockfile_warnings(&result);
+        assert_eq!(warnings.len(), 1, "{name}: {:?}", codes(&result));
+        assert!(
+            warnings[0].detail.contains(step),
+            "{name}: {}",
+            warnings[0].detail
+        );
+    }
+}
+
 /// A file a PyPI rewriter reads still owns the project's diagnostics in a
 /// pixi project (pip installing a requirements file into the pixi
 /// environment), and no pypi patch means nothing to say.

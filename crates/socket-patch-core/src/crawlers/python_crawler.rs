@@ -3507,10 +3507,12 @@ async fn local_site_packages_with(
     if poetry_owns_project_env(cwd, var).await {
         return Vec::new();
     }
-    // A pixi project installs only into pixi's own environments (see
-    // `pixi_env`). With none installed yet nothing is installed for it; the
-    // OS Python, or whichever one is on PATH, is never its env.
-    if super::pixi_env::is_pixi_project(cwd) {
+    // A project only pixi installs has its packages in pixi's own
+    // environments (see `pixi_env`). With none installed yet nothing is
+    // installed for it; the OS Python, or whichever one is on PATH, is
+    // never its env. One that pip installs too (a `requirements.txt` beside
+    // pixi's files) keeps the interpreter fallback below.
+    if super::pixi_env::pixi_owns_project_env(cwd) {
         return Vec::new();
     }
     if is_python_project(cwd).await {
@@ -3579,7 +3581,7 @@ impl PythonCrawler {
     ///      Pipenv's own (`is_pipenv_project`), uv's own (see
     ///      `uv_owns_project_env`), Poetry's own (see
     ///      `poetry_owns_project_env`) or pixi's own (see
-    ///      `pixi_env::is_pixi_project`), fall through
+    ///      `pixi_env::pixi_owns_project_env`), fall through
     ///      to `get_global_python_site_packages`. This mirrors the
     ///      cargo / ruby / go pattern where a project marker
     ///      indicates "scan this ecosystem globally for this project".
@@ -4455,6 +4457,39 @@ mod tests {
             find_local_venv_site_packages_with(&project, &activated).await,
             vec![activated_site, pixi_site]
         );
+    }
+
+    /// `pixi run` from a workspace member activates the workspace's
+    /// environment: that is where the member's packages are, also when the
+    /// member has a `pixi.toml` of its own and so counts as a pixi project
+    /// with no environments in it.
+    #[tokio::test]
+    async fn pixi_environment_activated_from_a_member_directory_is_crawled() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("workspace");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("pixi.toml"), "[workspace]\n").unwrap();
+        let site = fake_pixi_env(&root, "default");
+        let member = root.join("packages").join("foo");
+        std::fs::create_dir_all(&member).unwrap();
+        std::fs::write(member.join("pixi.toml"), "[package]\nname = \"foo\"\n").unwrap();
+        std::fs::write(
+            member.join("pyproject.toml"),
+            "[project]\nname = \"foo\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        let prefix = root.join(".pixi").join("envs").join("default");
+        let activated = env_of(&[
+            ("PIXI_PROJECT_ROOT", root.to_string_lossy().into_owned()),
+            ("CONDA_PREFIX", prefix.to_string_lossy().into_owned()),
+        ]);
+        assert_eq!(
+            local_site_packages_with(&member, &activated).await,
+            vec![site]
+        );
+        // Without the activation the member has nothing installed, and the
+        // Python on PATH is not asked.
+        assert!(local_site_packages_with(&member, &no_env).await.is_empty());
     }
 
     /// A pixi project with no environment installed yet has nothing
