@@ -47,9 +47,11 @@ on:
     # rewriter's index of a pom, the model of what Maven selects with the
     # pom walk under it (the hosted lane pins only where Maven selects the
     # patch's version), the crawler that says where the Maven local
-    # repository is, lock discovery and the upstream restore of `rollback`.
-    # Nothing another ecosystem's flow owns is here, so a change to one
-    # ecosystem starts that ecosystem's legs only.
+    # repository is, lock discovery and the upstream restore of `rollback`,
+    # and what socket-patch reads only in a Bazel workspace (`bazel/`: the
+    # hubs of MODULE.bazel and their locks). Nothing another ecosystem's
+    # flow owns is here, so a change to one ecosystem starts that
+    # ecosystem's legs only.
     #
     # What it does not cover: shared engine code (`rewrite_maven_pom` is in
     # patch/redirect/mod.rs, the file of every ecosystem's rewriter; hosted/,
@@ -73,6 +75,7 @@ on:
       - 'crates/socket-patch-core/src/crawlers/maven_crawler.rs'
       - 'crates/socket-patch-core/src/vex/discover/maven.rs'
       - 'crates/socket-patch-core/src/patch/redirect/upstream/maven.rs'
+      - 'crates/socket-patch-core/src/bazel/**'
   push:
     branches: [main]
     # The pull request paths, and what only a push to main covers: the
@@ -96,6 +99,7 @@ on:
       - 'crates/socket-patch-core/src/crawlers/maven_crawler.rs'
       - 'crates/socket-patch-core/src/vex/discover/maven.rs'
       - 'crates/socket-patch-core/src/patch/redirect/upstream/maven.rs'
+      - 'crates/socket-patch-core/src/bazel/**'
       - 'crates/socket-patch-cli/tests/e2e_bazel_build/main.rs'
       - 'crates/socket-patch-core/src/patch/redirect/**'
       - 'crates/socket-patch-core/src/hosted/**'

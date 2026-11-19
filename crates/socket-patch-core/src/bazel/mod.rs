@@ -9,6 +9,8 @@ pub const WORKSPACE_FILES: [&str; 4] =
     ["MODULE.bazel", "REPO.bazel", "WORKSPACE", "WORKSPACE.bazel"];
 
 pub mod ignore;
+pub mod maven;
+pub mod rc;
 pub mod starlark;
 pub mod workspace;
 

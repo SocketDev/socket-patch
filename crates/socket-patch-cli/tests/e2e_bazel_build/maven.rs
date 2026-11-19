@@ -6,7 +6,7 @@
 //! Such a hub fetches each jar its lock names, with the sha256 the lock
 //! holds, and reads no `pom.xml`, no Gradle file and no Maven local
 //! repository. So nothing `socket-patch` does for a Maven artifact reaches
-//! a Bazel build today, and these flows hold what a user sees instead, on
+//! a Bazel build yet, and these flows hold what a user sees instead, on
 //! the Bazel the run is given ([`FIXTURE`] says which ruleset goes with
 //! its release):
 //!
@@ -19,10 +19,12 @@
 //!   The same command writes nothing and reports the patch `skipped`
 //!   (`redirect_unconfirmed`), and the build is as before.
 //!
-//! In both the command says nothing about the hub: the first reports a
-//! patch that the Bazel build does not have, and the second explains itself
-//! with `redirect_maven_no_pom`, "no pom.xml present". That is what the
-//! release does, and what these tests assert.
+//! In both the command says what the build shows: one warning,
+//! `maven_bazel_hub_unpatched`, that Bazel builds the artifact from
+//! `maven_install.json`, with the hub and the line of its `maven.install`.
+//! In the second it stands in the place of `redirect_maven_no_pom`, "no
+//! pom.xml present". The lock each ruleset release writes is the one
+//! socket-patch reads it from ([`Lock`]).
 //!
 //! The artifacts are made here, for the run, under the group
 //! `dev.socket.fixture`, which only the owner of `socket.dev` can publish
@@ -48,7 +50,8 @@
 //! resolve from Maven Central, and nothing but the fixture adds to this
 //! one. Its one repository is the stand-in, and [`Pinned::open`] holds
 //! that the lock names the two artifacts and that repository, and nothing
-//! else.
+//! else. A hub of the default name, whose lock also holds what other
+//! modules added, is read without a Bazel in `e2e_bazel_maven_beside.rs`.
 //!
 //! What the stand-in lacks still comes from the network: the Bazel
 //! registry, the ruleset archives, Coursier itself and the JDK that
@@ -64,8 +67,9 @@ use std::time::Instant;
 use serde_json::{json, Value};
 use sha1::Sha1;
 use sha2::{Digest, Sha256};
+use socket_patch_core::bazel::maven::{Lock, Pinned as Jar};
 
-use crate::envelope::{event_for, warning_codes};
+use crate::envelope::event_for;
 use crate::harness::{changed, Cell, Fixture, Ran, StandIn, Tree, NOTHING};
 use crate::hosted_memory_common::Patch;
 
@@ -169,6 +173,8 @@ struct Pinned {
     /// fills when it pins; `gradle`, which nothing fills.
     tools: tempfile::TempDir,
     uuid: String,
+    /// The line of `maven.install` in the checkout's `MODULE.bazel`.
+    install: usize,
     /// What `//:consumer` prints while Bazel builds the upstream jar.
     upstream: String,
     /// The routes of the upstream and of the patched jar on the stand-in.
@@ -262,6 +268,8 @@ impl Pinned {
         // the empty file the ruleset's documentation starts from.
         let module = std::fs::read_to_string(cell.path("MODULE.bazel")).expect("MODULE.bazel");
         assert_eq!(module.matches(PLACEHOLDER).count(), 1, "{test}: {module}");
+        let install = module.lines().position(|line| line == "maven.install(");
+        let install = install.expect("the fixture's maven.install") + 1;
         let repository = format!("{origin}/{UPSTREAM}");
         cell.write("MODULE.bazel", module.replace(PLACEHOLDER, &repository));
         cell.write("maven_install.json", "");
@@ -282,8 +290,8 @@ impl Pinned {
         // jar, in the format of the era.
         let pin = cell.bazel_env("run", &[&format!("@{HUB}//:pin")], &[("REPIN", "1")]);
         assert!(pin.ok(), "{test}: {}", pin.dump());
-        let lock = std::fs::read(cell.path("maven_install.json")).expect("the lock");
-        let raw: Value = serde_json::from_slice(&lock).expect("the lock is JSON");
+        let lock = std::fs::read_to_string(cell.path("maven_install.json")).expect("the lock");
+        let raw: Value = serde_json::from_str(&lock).expect("the lock is JSON");
         // Nothing else is in it: no other Bazel module added to the hub,
         // and its one repository is the stand-in.
         let keys = |of: &str| {
@@ -298,30 +306,24 @@ impl Pinned {
             ),
             "{test}: {raw:#}"
         );
-        let format = if cell.numbers() >= (9, 0, 0) {
-            "3"
-        } else {
-            "2"
+        let lock = Lock::parse(&lock).unwrap_or_else(|why| panic!("{test}: {why}:\n{lock}"));
+        let format = if cell.numbers() >= (9, 0, 0) { 3 } else { 2 };
+        let jar = Jar {
+            version: VERSION.to_string(),
+            jar_sha256: Some(sha256_hex(&upstream_jar)),
+            fetched: true,
         };
-        let pinned = &raw["artifacts"][format!("{GROUP}:{VICTIM}")];
         assert_eq!(
-            (
-                &raw["version"],
-                &pinned["version"],
-                &pinned["shasums"]["jar"]
-            ),
-            (
-                &json!(format),
-                &json!(VERSION),
-                &json!(sha256_hex(&upstream_jar))
-            ),
-            "{test}: {raw:#}"
+            (lock.format, lock.plain_jar(GROUP, VICTIM)),
+            (format, Some(&jar)),
+            "{test}: {lock:?}"
         );
         Some(Pinned {
             cell,
             standin,
             tools,
             uuid,
+            install,
             upstream: format!("OUT: PRISTINE {run}"),
             upstream_route: format!("/{UPSTREAM}/{}", repo_path(VICTIM, VERSION, "jar")),
             patched_route,
@@ -353,6 +355,21 @@ impl Pinned {
         self.cell.socket_patch(&self.standin.origin(), args, &env)
     }
 
+    /// What the command says of the hub: one warning, that Bazel builds
+    /// the victim from the lock that the hub's `maven.install` names.
+    fn names_the_hub(&self, get: &Ran) {
+        let detail = format!(
+            "{PURL}: Bazel takes this artifact from maven_install.json (hub \"{HUB}\", \
+             `maven.install` at MODULE.bazel:{}), which pins the upstream jar. socket-patch \
+             does not patch a rules_jvm_external hub yet, so the Bazel build stays unpatched \
+             whatever this command did for another build of the checkout",
+            self.install
+        );
+        let warning = json!({ "code": "maven_bazel_hub_unpatched", "detail": detail });
+        let (test, said) = (&self.cell.test, &get.dump);
+        assert_eq!(get.envelope["warnings"], json!([warning]), "{test}: {said}");
+    }
+
     /// The step after the command: the build prints the upstream marker
     /// as before and changed no file of `after`, and no request for the
     /// patched jar reached the stand-in.
@@ -378,17 +395,12 @@ fn a_pom_patch_beside_a_pinned_hub() {
     let before = flow.builds_upstream();
 
     // The one command of hosted mode: the three files of a Maven pin, and
-    // no word about the hub whose lock still names the upstream jar.
+    // the warning about the hub whose lock still names the upstream jar.
     let get = flow.socket_patch(&["get", PURL, "--mode", "hosted", "--yes"]);
     let pinned = flow
         .cell
         .pinned_by(&get, PURL, &flow.uuid, &before, &PINNED);
-    assert_eq!(
-        warning_codes(&get.envelope),
-        NOTHING,
-        "{test}: {}",
-        get.dump
-    );
+    flow.names_the_hub(&get);
     flow.still_builds_upstream(&pinned);
 
     let undo = flow.socket_patch(&["rollback", "--yes"]);
@@ -396,7 +408,7 @@ fn a_pom_patch_beside_a_pinned_hub() {
         .undone(&undo, "rolledBack", &before, &flow.upstream);
     println!(
         "{test}: Bazel {} built {:?} before and after `get --mode hosted` pinned {PURL} in \
-         pom.xml and reported it applied; {:?}",
+         pom.xml, reported it applied and named the hub; {:?}",
         flow.cell.release(),
         flow.upstream,
         flow.started.elapsed()
@@ -404,7 +416,7 @@ fn a_pom_patch_beside_a_pinned_hub() {
 }
 
 /// The same checkout without a `pom.xml`: the command writes nothing and
-/// says that there is no pom.
+/// says which lock builds the artifact, not that there is no pom.
 #[test]
 #[ignore = "real Bazel; run with --ignored"]
 fn a_tree_only_bazel_builds() {
@@ -423,8 +435,7 @@ fn a_tree_only_bazel_builds() {
         (&json!("skipped"), &json!("redirect_unconfirmed")),
         "{test}: {said}"
     );
-    let codes = warning_codes(&get.envelope);
-    assert_eq!(codes, ["redirect_maven_no_pom"], "{test}: {said}");
+    flow.names_the_hub(&get);
     assert_eq!(
         changed(&before, &flow.cell.tree()),
         NOTHING,
@@ -433,7 +444,7 @@ fn a_tree_only_bazel_builds() {
     flow.still_builds_upstream(&before);
     println!(
         "{test}: Bazel {} built {:?} before and after `get --mode hosted` skipped {PURL} \
-         ({codes:?}); {:?}",
+         and named the hub; {:?}",
         flow.cell.release(),
         flow.upstream,
         flow.started.elapsed()

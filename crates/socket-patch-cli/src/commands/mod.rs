@@ -109,6 +109,28 @@ pub(crate) async fn sync_bazelignore(
     warnings
 }
 
+/// In a Bazel workspace a rules_jvm_external hub builds the jars its own
+/// lock pins, whatever a `pom.xml`, a Gradle build or an installed jar
+/// holds (`socket_patch_core::bazel::maven`). A command that pins or
+/// applies patches calls this once with the purls it was about, and hands
+/// what it gets to its own warnings: one for each Maven jar among them
+/// that a hub builds, or may build. Nothing for a `--global` run, whose
+/// target is not the project, and no file is looked for when no purl is a
+/// Maven one.
+pub(crate) async fn bazel_maven_notices<'a>(
+    common: &crate::args::GlobalArgs,
+    purls: impl Iterator<Item = &'a str>,
+) -> Vec<crate::json_envelope::RunWarning> {
+    use crate::json_envelope::RunWarning;
+    if common.is_global() {
+        return Vec::new();
+    }
+    let purls = purls.map(str::to_string).collect();
+    let said = socket_patch_core::bazel::maven::notices(&common.cwd, purls).await;
+    let warning = |(code, detail)| RunWarning::new(code, detail);
+    said.into_iter().map(warning).collect()
+}
+
 /// The vendor-ledger keys (`ledger`, the project's
 /// [`VendorState::purl_keys`]) that own this run's installed copies. In
 /// project scope that is the whole ledger. Under global scope the ledger

@@ -148,8 +148,9 @@ fn fixture(root: &Path, shape: Shape, packages: &[(&str, &str)]) {
     }
 }
 
-/// `socket-patch <args> --json --offline --cwd <root>/proj`; `(exit, envelope)`.
-fn socket(root: &Path, args: &[&str]) -> (Option<i32>, serde_json::Value) {
+/// `socket-patch <args> --offline --cwd <root>/proj`, with `--json` or as a
+/// person runs it: what it printed and how it ended.
+fn spawn(root: &Path, args: &[&str], json: bool) -> std::process::Output {
     let mut cmd = hermetic::binary_command();
     let proj = root.join("proj");
     let _fixture = prebuilt_common::prepare_command(
@@ -158,12 +159,17 @@ fn socket(root: &Path, args: &[&str]) -> (Option<i32>, serde_json::Value) {
         args,
         &[("MAVEN_REPO_LOCAL", root.join("m2").to_str().unwrap())],
     );
-    let out = cmd
-        .args(["--json", "--cwd", proj.to_str().unwrap()])
+    cmd.args(json.then_some("--json"))
+        .args(["--cwd", proj.to_str().unwrap()])
         .env("MAVEN_REPO_LOCAL", root.join("m2"))
         .env_remove("M2_HOME")
         .output()
-        .expect("run socket-patch");
+        .expect("run socket-patch")
+}
+
+/// `socket-patch <args> --json --offline --cwd <root>/proj`; `(exit, envelope)`.
+fn socket(root: &Path, args: &[&str]) -> (Option<i32>, serde_json::Value) {
+    let out = spawn(root, args, true);
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
     let env = serde_json::from_str(&stdout).unwrap_or_else(|e| {
         panic!(
@@ -1609,4 +1615,68 @@ fn gradle_vendor_395_repair_refuses_a_linked_gradle_tree() {
     assert_ne!(code, Some(0), "{env}");
     assert!(env.to_string().contains("vendor_path_unsafe"), "{env}");
     assert_eq!(listing(&outside.join("org/example/foo/1.0")), before);
+}
+
+/// A rules_jvm_external hub of a Bazel workspace builds the jar its own
+/// lock pins, not the vendored one. `vendor` beside such a hub warns once
+/// for each jar the hub builds, in the envelope or as a line a person
+/// reads, and its events and every file it writes are those of the same
+/// run without the workspace. A hub that does not build a vendored jar
+/// adds nothing.
+#[test]
+fn a_bazel_hub_that_builds_a_vendored_jar_adds_one_warning_and_nothing_else() {
+    let module = "bazel_dep(name = \"rules_jvm_external\", version = \"7.2\")\n\
+                  maven = use_extension(\"@rules_jvm_external//:extensions.bzl\", \"maven\")\n\
+                  maven.install(lock_file = \"//:maven_install.json\")\n";
+    let lock = |artifact: &str| {
+        format!(
+            "{{\"artifacts\": {{\"org.example:{artifact}\": {{\"shasums\": {{\"jar\": \"00\"}}, \
+             \"version\": \"1.0\"}}}}, \"repositories\": {{\"https://repo1.maven.org/maven2/\": \
+             [\"org.example:{artifact}\"]}}, \"version\": \"3\"}}\n"
+        )
+    };
+    let checkout = |lock: Option<String>| {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fixture(
+            root,
+            Shape::Reactor,
+            &[("foo", FOO_UUID), ("bar", BAR_UUID)],
+        );
+        if let Some(lock) = lock {
+            write(root, "proj/MODULE.bazel", module.as_bytes());
+            write(root, "proj/maven_install.json", lock.as_bytes());
+        }
+        tmp
+    };
+    let vendor = |lock: Option<String>| {
+        let tmp = checkout(lock);
+        let root = tmp.path();
+        let env = ok(root, &["vendor"]);
+        let mut tree = snapshot(root);
+        tree.retain(|rel, _| rel != "MODULE.bazel" && rel != "maven_install.json");
+        let warnings = env["warnings"].as_array().cloned().unwrap_or_default();
+        (events(&env), tree, warnings)
+    };
+    let without = vendor(None);
+    let applied = without.0.iter().filter(|event| event.1 == "applied");
+    assert_eq!(applied.count(), 2, "{:?}", without.0);
+    assert_eq!(vendor(Some(lock("other"))), without);
+    let (events, tree, warnings) = vendor(Some(lock("foo")));
+    assert_eq!((&events, &tree), (&without.0, &without.1));
+    let detail = format!(
+        "{}: Bazel takes this artifact from maven_install.json (hub \"maven\", `maven.install` \
+         at MODULE.bazel:3), which pins the upstream jar. socket-patch does not patch a \
+         rules_jvm_external hub yet, so the Bazel build stays unpatched whatever this command \
+         did for another build of the checkout",
+        purl("foo")
+    );
+    let warning = serde_json::json!({ "code": "maven_bazel_hub_unpatched", "detail": detail });
+    assert_eq!(warnings, [without.2, vec![warning]].concat());
+    // A person reads it once, on stderr.
+    let tmp = checkout(Some(lock("foo")));
+    let out = spawn(tmp.path(), &["vendor"], false);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let line = format!("Warning: {detail}");
+    assert_eq!(stderr.matches(&line).count(), 1, "{stderr}");
 }

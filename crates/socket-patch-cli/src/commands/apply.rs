@@ -1735,6 +1735,8 @@ pub(crate) async fn run_locked(
                 .collect();
             run_warnings.extend(user_patch_warnings.iter().cloned());
             run_warnings.extend(unsupported_warning);
+            let patched = results.iter().map(|r| r.package_key.as_str());
+            run_warnings.extend(crate::commands::bazel_maven_notices(&args.common, patched).await);
             run_warnings.extend(results.iter().flat_map(|r| {
                 let note = r.error.as_deref().filter(|_| r.success).unwrap_or_default();
                 socket_patch_core::patch::apply::advisory_warning_codes(note)
