@@ -13,9 +13,10 @@ use serde_json::{json, Value};
 
 use crate::crawlers::maven_selection::{MavenSelection, Verdict};
 use crate::formats::maven::{
-    classpath_copy, interpolate_keeping, interpolate_strict, is_executable_classifier,
-    lookup_property, maven_config_properties as cli_properties, profile_combinations, Definitions,
-    Interpolate, PomLayer, MAX_COMBINED_PROFILES, MAX_INTERPOLATION_DEPTH,
+    classpath_copy, declared_maven, interpolate_keeping, interpolate_strict,
+    is_executable_classifier, lookup_property, maven_config_properties as cli_properties,
+    profile_combinations, Definitions, Interpolate, PomLayer, MAX_COMBINED_PROFILES,
+    MAX_INTERPOLATION_DEPTH,
 };
 
 use super::super::state::{WiringAction, WiringRecord};
@@ -2187,10 +2188,8 @@ impl Pom {
             })
             .filter(|(_, props)| !props.is_empty())
             .collect();
-        let infers_parent = doc.child_text(project, "modelVersion").as_deref() == Some("4.1.0")
-            || doc.masked.contains("maven.apache.org/POM/4.1.0");
         Ok(Pom {
-            infers_parent,
+            infers_parent: doc.is_maven_4_model(),
             discovers_subprojects: discovers_subprojects(&doc),
             dir: rel.rsplit_once('/').map_or("", |(d, _)| d).to_string(),
             group: doc.child_text(project, "groupId"),
@@ -3164,29 +3163,21 @@ fn module_refs(doc: &Doc) -> Vec<String> {
 const DISCOVER_SUBPROJECTS: &str = "maven.project.discoverSubprojects";
 
 /// Whether Maven 4 discovers the subprojects of this pom on its own
-/// (`DefaultModelBuilder`, "subprojects discovery"): its model version is
-/// not 4.0.0 (the `<modelVersion>`, else the POM namespace), it is
-/// packaged `pom`, and it lists no top-level `<subprojects>` or
-/// `<modules>` entry. Maven 3 never discovers, and reads no 4.1.0 pom.
+/// (`DefaultModelBuilder`, "subprojects discovery"): its model is newer
+/// than 4.0.0 ([`Doc::is_maven_4_model`]), it is packaged `pom`, and it
+/// lists no top-level `<subprojects>` or `<modules>` entry. Maven 3 never
+/// discovers, and reads no 4.1.0 pom.
 fn discovers_subprojects(doc: &Doc) -> bool {
     let project = doc.project;
-    let model = doc.child_text(project, "modelVersion").or_else(|| {
-        let at = doc.masked.find(POM_NAMESPACE)? + POM_NAMESPACE.len();
-        let rest = &doc.masked[at..];
-        let end = rest.find(|c: char| !(c.is_ascii_alphanumeric() || c == '.'))?;
-        Some(rest[..end].to_string())
-    });
     let lists = |list: &str, item: &str| {
         doc.child(project, list)
             .is_some_and(|l| doc.children(l, item).next().is_some())
     };
-    model.is_some_and(|v| v != "4.0.0")
+    doc.is_maven_4_model()
         && doc.child_text(project, "packaging").as_deref() == Some("pom")
         && !lists("subprojects", "subproject")
         && !lists("modules", "module")
 }
-
-const POM_NAMESPACE: &str = "maven.apache.org/POM/";
 
 /// The subprojects Maven 4 discovers under the pom at `dir`: every direct
 /// subdirectory holding a `pom.xml`, hidden ones included, as
@@ -3958,6 +3949,19 @@ impl Doc {
 
     fn child_text(&self, n: usize, name: &str) -> Option<String> {
         self.child(n, name).map(|c| self.text_of(c))
+    }
+
+    /// Whether the pom is of a model only Maven 4 reads: the one reading
+    /// of a pom's model version every mode shares
+    /// ([`declared_maven::model_version_of`]: the `<modelVersion>`, else
+    /// the version the namespace names).
+    fn is_maven_4_model(&self) -> bool {
+        let project = &self.nodes[self.project];
+        declared_maven::model_version_of(
+            self.child_text(self.project, "modelVersion").as_deref(),
+            &self.masked[project.start..project.inner_start],
+        )
+        .is_some_and(|version| declared_maven::is_maven_4_model(&version))
     }
 
     /// The span of a text element's value: the trimmed text outside
@@ -8854,6 +8858,21 @@ mod tests {
         assert_eq!(tree(&empty_list, &[]), all);
         let namespace_only = IMPLICIT_ROOT.replace("  <modelVersion>4.1.0</modelVersion>\n", "");
         assert_eq!(tree(&namespace_only, &[]), all);
+        // A 4.0.0 model under the 4.1.0 namespace is a 4.0.0 pom: Maven 4
+        // discovers nothing for it (measured on 4.0.0-rc-7), and Maven 3,
+        // which never looks at the namespace, builds it.
+        let model_4_0_under_4_1 =
+            IMPLICIT_ROOT.replace("<modelVersion>4.1.0", "<modelVersion>4.0.0");
+        assert_ne!(model_4_0_under_4_1, IMPLICIT_ROOT);
+        assert_eq!(tree(&model_4_0_under_4_1, &[]), ["pom.xml"]);
+        // The namespace named only by another attribute is not the pom's.
+        let schema_only = namespace_only.replace(
+            "xmlns=\"http://maven.apache.org/POM/4.1.0\"",
+            "xsi:schemaLocation=\"http://maven.apache.org/POM/4.1.0 \
+             https://maven.apache.org/xsd/maven-4.1.0.xsd\"",
+        );
+        assert_ne!(schema_only, namespace_only);
+        assert_eq!(tree(&schema_only, &[]), ["pom.xml"]);
         for (value, discovers) in [
             ("true", true),
             ("TRUE", true),

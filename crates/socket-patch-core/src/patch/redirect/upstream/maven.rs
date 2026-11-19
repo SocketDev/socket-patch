@@ -35,10 +35,12 @@ use std::collections::BTreeMap;
 use regex::Regex;
 
 use super::{by_uuid, read_or_refuse, Ctx, FormatResult, HostedPin, View};
+use crate::formats::maven::declared_maven::DeclaredMaven;
 use crate::formats::maven::trusted_checksums;
 use crate::patch::redirect::{
-    generation, maven_repositories_with_id, maven_tag_inner_range, maven_tag_text_in,
-    remove_maven_repository, MAVEN_DEPENDENCY_BLOCK_RE, MVN_CHECKSUMS, MVN_CONFIG, MVN_CONFIG_ARGS,
+    generation, heal_trade_detail, maven_repositories_with_id, maven_tag_inner_range,
+    maven_tag_text_in, remove_maven_repository, MAVEN_DEPENDENCY_BLOCK_RE, MVN_CHECKSUMS,
+    MVN_CONFIG, MVN_WRAPPER_PROPERTIES,
 };
 
 /// The line break and indent `insert_maven_dependency_management` writes
@@ -577,17 +579,42 @@ pub(crate) async fn restore(
 }
 
 /// Drop the restored pins' trusted-checksum lines, and the `.mvn` files
-/// themselves when nothing but hosted mode's content is left.
+/// themselves when nothing but hosted mode's content is left. A config
+/// that stays is healed ([`heal_mvn_config`]).
 async fn restore_mvn(
     view: &mut View<'_>,
     dir: &str,
     checksum_dirs: &[String],
     result: &mut FormatResult,
 ) {
-    let sums_rel = format!("{dir}{MVN_CHECKSUMS}");
     let config_rel = format!("{dir}{MVN_CONFIG}");
+    let config = view.read(&config_rel).await.ok().flatten();
+    let removed = drop_checksums(
+        view,
+        dir,
+        &config_rel,
+        config.as_deref(),
+        checksum_dirs,
+        result,
+    )
+    .await;
+    if let Some(config) = config.filter(|_| !removed) {
+        heal_mvn_config(view, dir, &config_rel, &config, result).await;
+    }
+}
+
+/// The checksum half of [`restore_mvn`]. Whether it removed the config.
+async fn drop_checksums(
+    view: &mut View<'_>,
+    dir: &str,
+    config_rel: &str,
+    config: Option<&str>,
+    checksum_dirs: &[String],
+    result: &mut FormatResult,
+) -> bool {
+    let sums_rel = format!("{dir}{MVN_CHECKSUMS}");
     let Ok(Some(sums)) = view.read(&sums_rel).await else {
-        return;
+        return false;
     };
     let rest = trusted_checksums::edit(
         &sums,
@@ -595,31 +622,24 @@ async fn restore_mvn(
         &[],
     );
     if rest == sums {
-        return;
+        return false;
     }
-    let config = view.read(&config_rel).await.ok().flatten();
-    let written_config = format!("{}\n", MVN_CONFIG_ARGS.join("\n"));
     // Whether settings hosted mode may have written are left over, read as
-    // `trusted_checksums::config_enforces` reads them but by presence: a
-    // partial or switched-off set is still lines the user may want gone.
-    let has_resolver_lines = config
-        .as_deref()
-        .is_some_and(trusted_checksums::config_has_written_settings);
+    // `trusted_checksums::Settings` reads them but by presence: a partial
+    // or switched-off set is still lines the user may want gone.
+    let has_resolver_lines = config.is_some_and(trusted_checksums::config_has_written_settings);
     if rest.trim().is_empty() {
         view.remove(&sums_rel);
-        if config.as_deref() == Some(written_config.as_str()) {
-            view.remove(&config_rel);
-            return;
+        // (In either spelling of the directory: the one this release
+        // writes, or an earlier release's.)
+        if config.is_some_and(trusted_checksums::is_written_config) {
+            view.remove(config_rel);
+            return true;
         }
     } else {
         view.write(&sums_rel, rest.clone());
     }
-    let other_hosted = trusted_checksums::entries(&rest).any(|e| {
-        e.path
-            .split('/')
-            .any(|seg| crate::formats::maven::split_socket_version(seg).is_some())
-    });
-    if has_resolver_lines && !other_hosted {
+    if has_resolver_lines && !trusted_checksums::names_hosted_artifact(&rest) {
         result.warnings.push((
             "maven_trusted_checksums_left",
             format!(
@@ -628,6 +648,58 @@ async fn restore_mvn(
                  if nothing else does"
             ),
         ));
+    }
+    false
+}
+
+/// The block hosted mode wrote into a `.mvn/maven.config` that stays
+/// (`config`, at `config_rel`), respelled for the Maven the project under
+/// `dir` declares ([`trusted_checksums::heal_basedir`]): the lines are left
+/// in place, but the one an earlier release wrote must not go on stopping
+/// Maven 3.9.2 to 3.9.8 from starting with `-f` from outside the project.
+/// What that trades away on Maven 4 is said, as the scan says it. Left out
+/// where the config cannot be written ([`View::write_if_writable`]).
+async fn heal_mvn_config(
+    view: &mut View<'_>,
+    dir: &str,
+    config_rel: &str,
+    config: &str,
+    result: &mut FormatResult,
+) {
+    use trusted_checksums::Basedir;
+    // The cheap test first: only a config that holds a block in either
+    // spelling is worth reading the wrapper and the pom for.
+    if !trusted_checksums::holds_written_block(config) {
+        return;
+    }
+    // The flush refuses a write through a symbolic link, and the whole
+    // restore with it: a linked config keeps its line, as a scan keeps it.
+    let path = view.root().join(config_rel);
+    if crate::utils::containment::linked_level(view.root(), &path).is_some() {
+        return;
+    }
+    let wrapper = view
+        .read(&format!("{dir}{MVN_WRAPPER_PROPERTIES}"))
+        .await
+        .ok()
+        .flatten();
+    let pom = view.read(&format!("{dir}pom.xml")).await.ok().flatten();
+    let declared = DeclaredMaven::of(wrapper.as_deref(), pom.as_deref());
+    let Some(healed) = trusted_checksums::heal_basedir(config, Basedir::for_maven(&declared))
+    else {
+        return;
+    };
+    let trade = heal_trade_detail(&healed, &declared, dir);
+    // A courtesy, never the reason a restore is refused: a config the
+    // flush would not write (a symbolic link, say) keeps its line, as it
+    // did before there was a heal, and the pins are restored all the same.
+    if !view.write_if_writable(config_rel, healed).await {
+        return;
+    }
+    if let Some(detail) = trade {
+        result
+            .warnings
+            .push(("maven_trusted_checksums_maven3_only", detail));
     }
 }
 
@@ -1670,11 +1742,43 @@ mod tests {
         assert_eq!(after["child/pom.xml"], child);
     }
 
+    /// The `.mvn` files hosted mode wrote are removed whichever way the
+    /// checksums directory is spelled: as this release writes it for a
+    /// Maven 3 project, or with the session's root directory, as an
+    /// earlier release wrote it and as a Maven 4 project still has it.
+    #[tokio::test]
+    async fn the_mvn_files_are_removed_in_either_spelling_of_the_directory() {
+        use super::trusted_checksums::{
+            self,
+            Basedir::{Launcher, Session},
+        };
+        for form in [Launcher, Session] {
+            let config = format!("{}\n", trusted_checksums::config_args(form).join("\n"));
+            let files = vec![
+                ("pom.xml", fixture("basic", "expected", "pom.xml")),
+                (".mvn/maven.config", config),
+                (
+                    ".mvn/checksums/checksums.sha256",
+                    fixture("basic", "expected", ".mvn/checksums/checksums.sha256"),
+                ),
+            ];
+            let (outcome, after) = run(&files).await;
+            assert_eq!(outcome.pins[0].status, PinStatus::Restored, "{form:?}");
+            assert_eq!(
+                after.keys().collect::<Vec<_>>(),
+                ["pom.xml"],
+                "{form:?}: {:?}",
+                outcome.warnings
+            );
+            assert_eq!(after["pom.xml"], fixture("basic", "input", "pom.xml"));
+        }
+    }
+
     #[tokio::test]
     async fn existing_mvn_lines_are_kept_and_warned() {
         let config = format!(
             "-Dmaven.test.skip=true\n{}\n",
-            super::MVN_CONFIG_ARGS.join("\n")
+            super::trusted_checksums::CONFIG_ARGS.join("\n")
         );
         let files = vec![
             ("pom.xml", fixture("basic", "expected", "pom.xml")),
@@ -1697,6 +1801,208 @@ mod tests {
             "{:?}",
             outcome.warnings
         );
+    }
+
+    /// A rollback that leaves hosted mode's settings beside the user's
+    /// own must not leave the line an earlier release wrote, which stops
+    /// Maven 3.9.2 to 3.9.8 from starting with `-f` from outside the
+    /// project: the block is respelled for the Maven the project declares,
+    /// and what that trades away on Maven 4 is said.
+    #[tokio::test]
+    async fn a_block_the_rollback_leaves_is_healed() {
+        use super::trusted_checksums::{
+            self, basedir_value,
+            Basedir::{Launcher, Session},
+            BASEDIR_KEY,
+        };
+        let beside = |form| {
+            format!(
+                "-Dmaven.test.skip=true\n{}\n",
+                trusted_checksums::config_args(form).join("\n")
+            )
+        };
+        let wrapper = |version: &str| {
+            format!(
+                "distributionUrl=https://repo.maven.apache.org/maven2/org/apache/maven/\
+                 apache-maven/{version}/apache-maven-{version}-bin.zip\n"
+            )
+        };
+        let files = |config: String, maven: Option<&str>| {
+            let mut files = vec![
+                ("pom.xml", fixture("basic", "expected", "pom.xml")),
+                (".mvn/maven.config", config),
+                (
+                    ".mvn/checksums/checksums.sha256",
+                    fixture("basic", "expected", ".mvn/checksums/checksums.sha256"),
+                ),
+            ];
+            if let Some(version) = maven {
+                files.push((".mvn/wrapper/maven-wrapper.properties", wrapper(version)));
+            }
+            files
+        };
+        let codes = |outcome: &RestoreOutcome| -> Vec<&'static str> {
+            outcome.warnings.iter().map(|(code, _)| *code).collect()
+        };
+        let (left, trade) = (
+            "maven_trusted_checksums_left",
+            "maven_trusted_checksums_maven3_only",
+        );
+
+        // No Maven declared: healed to the form that breaks no build, and
+        // the trade is said beside the leftover-lines warning.
+        let (outcome, after) = run(&files(beside(Session), None)).await;
+        assert_eq!(outcome.pins[0].status, PinStatus::Restored);
+        assert_eq!(after["pom.xml"], fixture("basic", "input", "pom.xml"));
+        assert_eq!(after[".mvn/maven.config"], beside(Launcher));
+        assert_eq!(codes(&outcome), [left, trade], "{:?}", outcome.warnings);
+        let said = &outcome.warnings[1].1;
+        assert!(
+            said.contains("A Maven 4 build of this project no longer does")
+                && said.contains(".mvn/maven.config"),
+            "{said}"
+        );
+
+        // A Maven 3 named by the wrapper enforces either spelling: healed,
+        // nothing traded.
+        let (outcome, after) = run(&files(beside(Session), Some("3.9.9"))).await;
+        assert_eq!(after[".mvn/maven.config"], beside(Launcher));
+        assert_eq!(codes(&outcome), [left]);
+
+        // A project that declares Maven 4 keeps the spelling Maven 4
+        // reads, and gets it when the block is in the launcher's.
+        let (outcome, after) = run(&files(beside(Session), Some("4.0.0"))).await;
+        assert_eq!(after[".mvn/maven.config"], beside(Session));
+        assert_eq!(codes(&outcome), [left]);
+        let (outcome, after) = run(&files(beside(Launcher), Some("4.0.0"))).await;
+        assert_eq!(after[".mvn/maven.config"], beside(Session));
+        assert_eq!(codes(&outcome), [left]);
+
+        // Already this project's spelling: the bytes are not touched.
+        let (outcome, after) = run(&files(beside(Launcher), None)).await;
+        assert_eq!(after[".mvn/maven.config"], beside(Launcher));
+        assert_eq!(codes(&outcome), [left]);
+
+        // A directory line that stands apart is the user's, and stays.
+        let theirs = format!(
+            "-D{BASEDIR_KEY}={}\n-Dmaven.test.skip=true\n",
+            basedir_value(Session)
+        );
+        let (outcome, after) = run(&files(theirs.clone(), None)).await;
+        assert_eq!(after[".mvn/maven.config"], theirs);
+        assert_eq!(codes(&outcome), [left]);
+    }
+
+    /// A leftover block in a `.mvn/maven.config` that is a symbolic link is
+    /// not healed: the flush refuses a linked file, so the heal would
+    /// refuse a restore that has nothing else against it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_linked_config_the_rollback_leaves_is_not_healed() {
+        use super::trusted_checksums::{self, Basedir::Session};
+        let config = format!(
+            "-Dmaven.test.skip=true\n{}\n",
+            trusted_checksums::config_args(Session).join("\n")
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(".mvn/checksums")).unwrap();
+        std::fs::create_dir_all(root.join("ci")).unwrap();
+        std::fs::write(
+            root.join("pom.xml"),
+            fixture("basic", "expected", "pom.xml"),
+        )
+        .unwrap();
+        std::fs::write(
+            root.join(".mvn/checksums/checksums.sha256"),
+            fixture("basic", "expected", ".mvn/checksums/checksums.sha256"),
+        )
+        .unwrap();
+        std::fs::write(root.join("ci/maven.config"), &config).unwrap();
+        std::os::unix::fs::symlink("../ci/maven.config", root.join(".mvn/maven.config")).unwrap();
+        let pins = [HostedPin {
+            purl: "pkg:maven/org.slf4j/slf4j-api@1.7.36".into(),
+            uuid: UUID.into(),
+            files: vec!["pom.xml".into()],
+        }];
+        let opts = RestoreOptions {
+            offline: true,
+            ..RestoreOptions::default()
+        };
+        let outcome = restore_upstream(root, &pins, &opts).await;
+        assert_eq!(outcome.flush_error, None);
+        assert_eq!(outcome.pins[0].status, PinStatus::Restored);
+        assert_eq!(
+            std::fs::read_to_string(root.join("pom.xml")).unwrap(),
+            fixture("basic", "input", "pom.xml")
+        );
+        assert!(root.join(".mvn/maven.config").is_symlink());
+        assert_eq!(
+            std::fs::read_to_string(root.join("ci/maven.config")).unwrap(),
+            config
+        );
+    }
+
+    /// The same holds for anything else the flush will not write, which
+    /// is all or nothing: a `.mvn` directory that does not take the write
+    /// keeps the config as it is, and the pins are restored all the same,
+    /// as they were before there was a heal. (Root writes anywhere, so
+    /// there is nothing to see as root.)
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_config_the_flush_could_not_write_is_not_healed() {
+        use super::trusted_checksums::{self, Basedir::Session};
+        use std::os::unix::fs::PermissionsExt as _;
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let config = format!(
+            "-Dmaven.test.skip=true\n{}\n",
+            trusted_checksums::config_args(Session).join("\n")
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(".mvn/checksums")).unwrap();
+        std::fs::write(
+            root.join("pom.xml"),
+            fixture("basic", "expected", "pom.xml"),
+        )
+        .unwrap();
+        std::fs::write(
+            root.join(".mvn/checksums/checksums.sha256"),
+            fixture("basic", "expected", ".mvn/checksums/checksums.sha256"),
+        )
+        .unwrap();
+        std::fs::write(root.join(".mvn/maven.config"), &config).unwrap();
+        // The config's own directory is read-only; the checksums
+        // directory below it still takes the removal of its file.
+        let mvn = root.join(".mvn");
+        std::fs::set_permissions(&mvn, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let pins = [HostedPin {
+            purl: "pkg:maven/org.slf4j/slf4j-api@1.7.36".into(),
+            uuid: UUID.into(),
+            files: vec!["pom.xml".into()],
+        }];
+        let opts = RestoreOptions {
+            offline: true,
+            ..RestoreOptions::default()
+        };
+        let outcome = restore_upstream(root, &pins, &opts).await;
+        std::fs::set_permissions(&mvn, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(outcome.flush_error, None);
+        assert_eq!(outcome.pins[0].status, PinStatus::Restored);
+        assert_eq!(
+            std::fs::read_to_string(root.join("pom.xml")).unwrap(),
+            fixture("basic", "input", "pom.xml")
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join(".mvn/maven.config")).unwrap(),
+            config
+        );
+        // The leftover lines are reported; no trade is claimed for a line
+        // that was not changed.
+        let codes: Vec<&str> = outcome.warnings.iter().map(|(code, _)| *code).collect();
+        assert_eq!(codes, ["maven_trusted_checksums_left"]);
     }
 
     #[tokio::test]

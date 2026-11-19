@@ -30,9 +30,18 @@
 //!      patched jar and the commons-lang3 transitive resolves.
 //!   5. TAMPER probes: a stale `.sha1` is rejected by `checksumPolicy=fail`
 //!      on every Maven line; a jar re-signed with a MATCHING `.sha1` is
-//!      rejected by the trusted-checksums summary on Maven ≥ 3.9 (older
-//!      lines ignore the `aether.*` properties — asserted, so a change in
-//!      either direction is noticed).
+//!      rejected by the trusted-checksums summary on Maven ≥ 3.9.4 (older
+//!      lines do not read it: asserted, so a change in either direction
+//!      is noticed). Both hold when the build is started with
+//!      `-f <checkout>/pom.xml` from outside the project, which every
+//!      Maven must survive: the line naming the checksums directory once
+//!      stopped Maven 3.9.2 to 3.9.8 from starting there. The project's
+//!      Maven Wrapper pins the Maven under test, so on Maven 4 the
+//!      directory is spelled the one way Maven 4 reads. The same checkout
+//!      without that pin is then scanned again: it takes the default
+//!      spelling, the scan says what that trades away on Maven 4, and the
+//!      Maven under test must start and resolve against it (on Maven 4,
+//!      without enforcing the pin: asserted).
 //!   6. MANIFEST-LESS VEX over the fresh checkout (`vex_e2e_common`):
 //!      * online → attested from the pom wiring + the API record (the
 //!        installed suffixed copy hash-verifies, `(redirected)`);
@@ -388,6 +397,172 @@ fn maven_scan_hosted_fresh_checkout_install_and_manifestless_vex() {
     );
     let installed = repo_dir(&m2, &sfx).join(format!("{ARTIFACT}-{sfx}.jar"));
     assert_eq!(std::fs::read(&installed).unwrap(), patched_jar);
+    std::fs::remove_dir_all(fresh.join("target")).unwrap();
+
+    // 4b. FROM OUTSIDE THE PROJECT: `mvn -f <checkout>/pom.xml` started in
+    // another directory, as CI jobs commonly do. The line that names the
+    // checksums directory must not stop any Maven from starting: spelled
+    // with `${session.rootDirectory}`, as releases up to 5.1.0 wrote it,
+    // Maven 3.9.2 to 3.9.8 refuse to start here (`Illegal use of undefined
+    // property`). And where the pin is enforced it is enforced from here
+    // too: the re-signed jar is rejected by the same Mavens as in 5b.
+    let elsewhere = root.join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    let fresh_pom = fresh.join("pom.xml");
+    let goal = format!("{DEPENDENCY_PLUGIN}:copy-dependencies");
+    let from_outside = |settings: &Path, out_dir: &Path| {
+        purge(&m2);
+        let out_arg = format!("-DoutputDirectory={}", out_dir.display());
+        mvn.run(
+            &elsewhere,
+            &m2,
+            settings,
+            &["-f", fresh_pom.to_str().unwrap(), &goal, &out_arg],
+        )
+    };
+    let outside = root.join("outside-dep");
+    let out = from_outside(&mirrored, &outside);
+    assert!(
+        ok(&out),
+        "Maven {} started with -f from outside the project:\n{}",
+        mvn.version,
+        dump(&out)
+    );
+    assert_eq!(
+        std::fs::read(outside.join(format!("{ARTIFACT}-{sfx}.jar"))).unwrap(),
+        patched_jar,
+        "and it resolves the patched jar"
+    );
+    let out = from_outside(&resigned_settings, &root.join("outside-resigned"));
+    assert_eq!(
+        !ok(&out),
+        mvn.enforces_trusted_checksums(),
+        "Maven {}: the re-signed jar, with -f from outside the project:\n{}",
+        mvn.version,
+        dump(&out)
+    );
+    if !ok(&out) {
+        let log = dump(&out).to_ascii_lowercase();
+        assert!(
+            log.contains("checksum") && log.contains(&sha256_hex(&patched_jar)),
+            "the rejection is the trusted sha256 pin, not the line itself:\n{}",
+            dump(&out)
+        );
+    }
+    let _ = std::fs::remove_dir_all(fresh.join("target"));
+
+    // 4c. NO MAVEN DECLARED: the same checkout without the Maven Wrapper
+    // pin, so nothing in it says which Maven builds it, scanned again. It
+    // then takes the default spelling, the one that stops no Maven 3 from
+    // starting, which Maven 4 does not read. So on the Maven 4 leg this is
+    // Maven 4 run against the default spelling: the scan respells the
+    // line and says what that trades away, the build starts and resolves
+    // the patched jar, and the re-signed jar is no longer rejected. On a
+    // Maven 3 leg the line already has that spelling and nothing changes.
+    let undeclared = root.join("undeclared");
+    fresh_checkout(&fresh, &undeclared);
+    std::fs::remove_file(undeclared.join(".mvn/wrapper/maven-wrapper.properties")).unwrap();
+    let config_before = std::fs::read_to_string(undeclared.join(".mvn/maven.config")).unwrap();
+    let launcher_line = "basedir=${maven.multiModuleProjectDirectory}/.mvn/checksums";
+    let session_line = "basedir=${session.rootDirectory}/.mvn/checksums";
+    assert_eq!(
+        config_before.contains(session_line),
+        mvn.major() >= 4,
+        "the wrapper pinned Maven {}:\n{config_before}",
+        mvn.version
+    );
+    let (code, env, stderr) = socket(
+        &undeclared,
+        &m2,
+        &[
+            "scan",
+            "--mode",
+            "hosted",
+            "--json",
+            "--yes",
+            "--cwd",
+            undeclared.to_str().unwrap(),
+            "--api-url",
+            &server.uri(),
+            "--org",
+            ORG,
+            "--api-token",
+            "fake",
+        ],
+    );
+    assert_eq!(code, Some(0), "rescan without a wrapper: {env}\n{stderr}");
+    let config_after = std::fs::read_to_string(undeclared.join(".mvn/maven.config")).unwrap();
+    assert!(
+        config_after.contains(launcher_line) && !config_after.contains(session_line),
+        "a project that declares no Maven takes the default spelling:\n{config_after}"
+    );
+    let warned = |code: &str| {
+        env["warnings"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|w| w["code"] == code)
+    };
+    assert_eq!(
+        warned("redirect_maven_trusted_checksums_maven3_only"),
+        mvn.major() >= 4,
+        "Maven {}: the scan says so when it trades the pin's enforcement on Maven 4 \
+         away, and only then: {env}",
+        mvn.version
+    );
+    assert!(
+        !warned("redirect_maven_trusted_checksums_unenforced"),
+        "no Maven is named, so none is said to ignore the pin: {env}"
+    );
+    assert_eq!(
+        std::fs::read(undeclared.join("pom.xml")).unwrap(),
+        std::fs::read(fresh.join("pom.xml")).unwrap(),
+        "the pin itself is untouched"
+    );
+    let undeclared_pom = undeclared.join("pom.xml");
+    let undeclared_from_outside = |settings: &Path, out_dir: &Path| {
+        purge(&m2);
+        let out_arg = format!("-DoutputDirectory={}", out_dir.display());
+        mvn.run(
+            &elsewhere,
+            &m2,
+            settings,
+            &["-f", undeclared_pom.to_str().unwrap(), &goal, &out_arg],
+        )
+    };
+    let outside = root.join("undeclared-dep");
+    let out = undeclared_from_outside(&mirrored, &outside);
+    assert!(
+        ok(&out),
+        "Maven {} against the default spelling, with -f from outside the project:\n{}",
+        mvn.version,
+        dump(&out)
+    );
+    assert_eq!(
+        std::fs::read(outside.join(format!("{ARTIFACT}-{sfx}.jar"))).unwrap(),
+        patched_jar,
+        "and it resolves the patched jar"
+    );
+    purge(&m2);
+    let out = mvn.copy_dependencies(&undeclared, &m2, &mirrored, "target/dep");
+    assert!(ok(&out), "and from the project root:\n{}", dump(&out));
+    // Enforced by Maven 3.9.4 and later 3.x, as the warning says: a Maven
+    // 4 build of a project that does not declare Maven 4 runs as if the
+    // pin were not there. (If a later Maven 4 starts reading the
+    // launcher's property, this is where it shows.)
+    let out = undeclared_from_outside(&resigned_settings, &root.join("undeclared-resigned"));
+    assert_eq!(
+        !ok(&out),
+        mvn.enforces_trusted_checksums() && mvn.major() < 4,
+        "Maven {}: the re-signed jar against the default spelling:\n{}",
+        mvn.version,
+        dump(&out)
+    );
+    let _ = std::fs::remove_dir_all(undeclared.join("target"));
+
+    purge(&m2);
+    let out = mvn.copy_dependencies(&fresh, &m2, &mirrored, "target/dep");
+    assert!(ok(&out), "{}", dump(&out));
     std::fs::remove_dir_all(fresh.join("target")).unwrap();
 
     // 6. MANIFEST-LESS VEX.

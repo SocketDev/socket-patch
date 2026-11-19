@@ -38,6 +38,8 @@ pub use bun_binary::{preflight_bun_binary, rewrite_bun_binary};
 #[cfg(test)]
 mod cargo_lock_equivalence_tests;
 #[cfg(test)]
+mod cargo_rewrite_order_tests;
+#[cfg(test)]
 mod composer_equivalence_tests;
 pub(crate) mod generation;
 #[cfg(test)]
@@ -58,9 +60,9 @@ mod pipenv_pylock_tests;
 pub mod presence;
 // The pnpm hosted planner lives with the format's model.
 use crate::crawlers::maven_selection::{MavenSelection, Verdict};
-use crate::formats::cargo::hosted::CargoLockPlan;
 #[cfg(test)]
 use crate::formats::cargo::hosted::CARGO_LOCK_REFERENCE_KIND;
+use crate::formats::cargo::hosted::{CargoHostedLock, CargoLockRepoint, PlannedRepoint};
 use crate::formats::cargo::source_replacement::{crates_io_source, ConfigLayer, CratesIoSource};
 use crate::formats::cargo::{is_crates_io_patch_table, is_crates_io_source, CargoLock};
 use crate::formats::composer::hosted::rewrite_composer_lock;
@@ -69,7 +71,10 @@ use crate::formats::gem::hosted::{
     merge_gem_lock_remote, refresh_merged_gem_lock_remote, DependencyPin, LockLayout,
 };
 use crate::formats::gem::locked_specs as gem_locked_specs;
-use crate::formats::maven::trusted_checksums::{self, CONFIG_ARGS as MVN_CONFIG_ARGS};
+use crate::formats::maven::declared_maven::DeclaredMaven;
+use crate::formats::maven::trusted_checksums;
+#[cfg(test)]
+use crate::formats::maven::trusted_checksums::CONFIG_ARGS as MVN_CONFIG_ARGS;
 #[cfg(test)]
 use crate::formats::pnpm::hosted::pnpm_unrewritten_instances;
 use crate::formats::pnpm::plan_hosted;
@@ -1967,10 +1972,11 @@ fn rewrite_cargo_with(
     let edits_before = result.edits.len();
     let mut changed_manifests: std::collections::BTreeSet<String> =
         std::collections::BTreeSet::new();
+    // Parsed once, by the first probe or plan below that reads it.
     let mut cargo_lock = files
         .get("Cargo.lock")
         .cloned()
-        .map(|t| to_lf("Cargo.lock", t));
+        .map(|t| CargoHostedLock::new(to_lf("Cargo.lock", t)));
     // Cargo reads the LEGACY extensionless `.cargo/config` in preference to
     // `config.toml` when both exist (it warns about the duplicate), so a
     // managed `[registries.…]` block written to `config.toml` there is
@@ -2169,8 +2175,8 @@ fn rewrite_cargo_with(
             });
             continue;
         }
-        let other_versions =
-            cargo_lock_other_versions(cargo_lock.as_deref(), &dep.name, &dep.version);
+        let lock_model = cargo_lock.as_ref().and_then(CargoHostedLock::model);
+        let other_versions = cargo_lock_other_versions(lock_model, &dep.name, &dep.version);
         let (toml_plans, excluded) =
             match plan_cargo_tomls(&manifests, &dep.name, &dep.version, &other_versions, &reg) {
                 Ok(planned) => planned,
@@ -2196,7 +2202,7 @@ fn rewrite_cargo_with(
                     &dep.name,
                     &dep.version,
                     &excluded,
-                    cargo_lock.as_deref(),
+                    lock_model,
                 ),
             });
             continue;
@@ -2208,7 +2214,7 @@ fn rewrite_cargo_with(
                     &dep.name,
                     &dep.version,
                     manifests.len(),
-                    cargo_lock.as_deref(),
+                    lock_model,
                 ),
             });
             continue;
@@ -2235,14 +2241,14 @@ fn rewrite_cargo_with(
         // package whose manifest was not planned (outside the project, behind
         // a symlink) — keeps resolving it from crates.io, so the repointed
         // lock is unsatisfiable and that consumer compiles the unpatched copy.
-        if let Some(lock_text) = cargo_lock.as_deref() {
+        if let Some(lock) = cargo_lock.as_ref() {
             let pinned_packages: std::collections::BTreeSet<(&str, &str)> = toml_plans
                 .iter()
                 .filter_map(|(i, _)| manifest_packages[*i].as_ref())
                 .map(|(name, version)| (name.as_str(), version.as_str()))
                 .collect();
             let blocking =
-                cargo_unpinnable_dependents(lock_text, &dep.name, &dep.version, &pinned_packages);
+                cargo_unpinnable_dependents(lock, &dep.name, &dep.version, &pinned_packages);
             if !blocking.is_empty() {
                 result.warnings.push(RewriteWarning {
                     code: "redirect_cargo_transitive_dependents".into(),
@@ -2279,17 +2285,16 @@ fn rewrite_cargo_with(
         // one declared dependency (the dependents gate above): the manifest
         // pin alone then forces the next resolution through the managed
         // registry, which serves the patched checksum.
-        enum LockCommit {
-            Write(String, Vec<FileEdit>),
+        enum LockCommit<'a> {
+            Write(PlannedRepoint<'a>),
             InPlace,
             Absent,
         }
-        let lock_commit = if let Some(lock_text) = cargo_lock.as_ref() {
+        let lock_commit = if let Some(lock) = cargo_lock.as_mut() {
             // A lock that does not parse never reaches here: the dependents
             // check above refuses it.
-            let parsed = CargoLock::parse(lock_text).ok();
-            let overridden = parsed.as_ref().and_then(|lock| {
-                cargo_lock_override_source(lock, &dep.name, &dep.version, || {
+            let overridden = lock.model().and_then(|model| {
+                cargo_lock_override_source(model, &dep.name, &dep.version, || {
                     cargo_patch_override_table(&manifests, files, &dep.name)
                 })
             });
@@ -2299,13 +2304,10 @@ fn rewrite_cargo_with(
                     .push(cargo_overridden_warning(&dep.name, &dep.version, &how));
                 continue;
             }
-            let plan = parsed.map_or(CargoLockPlan::NotFound, |lock| {
-                lock.plan_hosted(lock_text, &dep.name, &dep.version, index_url, &cksum)
-            });
-            match plan {
-                CargoLockPlan::Rewritten { content, edits } => LockCommit::Write(content, edits),
-                CargoLockPlan::AlreadyRedirected => LockCommit::InPlace,
-                CargoLockPlan::NotFound => {
+            match lock.plan(&dep.name, &dep.version, index_url, &cksum) {
+                CargoLockRepoint::Rewritten(planned) => LockCommit::Write(planned),
+                CargoLockRepoint::AlreadyRedirected => LockCommit::InPlace,
+                CargoLockRepoint::NotFound => {
                     result.warnings.push(RewriteWarning {
                         code: "redirect_cargo_lock_pkg_not_found".into(),
                         detail: format!(
@@ -2316,7 +2318,7 @@ fn rewrite_cargo_with(
                     });
                     continue;
                 }
-                CargoLockPlan::Ambiguous => {
+                CargoLockRepoint::Ambiguous => {
                     result.warnings.push(RewriteWarning {
                         code: "redirect_cargo_lock_pkg_ambiguous".into(),
                         detail: format!(
@@ -2353,15 +2355,17 @@ fn rewrite_cargo_with(
             }
         }
         match lock_commit {
-            LockCommit::Write(content, edits) => {
-                cargo_lock = Some(content);
-                result.edits.extend(edits);
+            LockCommit::Write(planned) => {
+                // The repoint's edits come out as it is made.
+                result.edits.extend(planned.commit());
                 lock_changed = true;
             }
             LockCommit::InPlace | LockCommit::Absent => {}
         }
         result.confirmed_cargo_uuids.insert(dep.patch_uuid.clone());
     }
+
+    let cargo_lock: Option<String> = cargo_lock.map(CargoHostedLock::into_text);
 
     // A re-pin to a superseding patch moved every declaration off the old
     // generation's registry: its `[registries.socket-patch-<old>]` block is
@@ -2472,7 +2476,7 @@ fn cargo_not_declared_detail(
     crate_name: &str,
     version: &str,
     manifests: usize,
-    lock: Option<&str>,
+    lock: Option<&CargoLock>,
 ) -> String {
     let scope = if manifests > 1 {
         format!("any of the {manifests} workspace manifests")
@@ -2502,7 +2506,7 @@ fn cargo_requirement_excludes_detail(
     crate_name: &str,
     version: &str,
     excluded: &[(String, String)],
-    lock: Option<&str>,
+    lock: Option<&CargoLock>,
 ) -> String {
     let declared = excluded
         .iter()
@@ -2696,12 +2700,12 @@ fn cargo_patch_override_table(
 /// `"name version (source)"` id — so a v1 lock and a twin's full id are
 /// covered alike. A lock that does not parse yields one entry saying so.
 fn cargo_unpinnable_dependents(
-    lock: &str,
+    lock: &CargoHostedLock,
     crate_name: &str,
     version: &str,
     pinned_packages: &std::collections::BTreeSet<(&str, &str)>,
 ) -> Vec<String> {
-    let Ok(lock) = CargoLock::parse(lock) else {
+    let Some(lock) = lock.model() else {
         return vec!["Cargo.lock (it does not parse as TOML)".to_string()];
     };
     let mut out = Vec::new();
@@ -3739,17 +3743,18 @@ enum CargoWorkspaceEntry {
 
 /// Whether a Cargo.lock (when there is one, and it parses) resolves
 /// `crate_name`@`version`.
-fn cargo_lock_holds(lock: Option<&str>, crate_name: &str, version: &str) -> bool {
-    lock.and_then(|lock| CargoLock::parse(lock).ok())
-        .is_some_and(|lock| lock.is_locked(crate_name, version))
+fn cargo_lock_holds(lock: Option<&CargoLock>, crate_name: &str, version: &str) -> bool {
+    lock.is_some_and(|lock| lock.is_locked(crate_name, version))
 }
 
-/// Every version of `crate_name` a Cargo.lock holds other than `version`.
-fn cargo_lock_other_versions(lock: Option<&str>, crate_name: &str, version: &str) -> Vec<String> {
+/// Every version of `crate_name` a Cargo.lock (when there is one, and it
+/// parses) holds other than `version`.
+fn cargo_lock_other_versions(
+    lock: Option<&CargoLock>,
+    crate_name: &str,
+    version: &str,
+) -> Vec<String> {
     let Some(lock) = lock else {
-        return Vec::new();
-    };
-    let Ok(lock) = CargoLock::parse(lock) else {
         return Vec::new();
     };
     let mut versions = lock.locked_versions(crate_name);
@@ -8276,7 +8281,11 @@ fn plan_gem_redirect(
         // Not declared where the rewriter can see it, yet bundler resolved
         // it as a DIRECT dependency: the Gemfile declares it out of sight
         // (`eval_gemfile`, a loop, a gemspec). Adding a line would declare
-        // it twice (#482).
+        // it twice (#482). Vendored mode refuses the gem for the same
+        // reason, so the way out names agent mode alone (#2151). The
+        // literal line replaces a `gem` call out of sight: next to it,
+        // the line's `source:` option gives the gem two sources and
+        // bundler refuses the manifest.
         return Err(refuse(
             "redirect_gem_declaration_not_visible",
             format!(
@@ -8284,7 +8293,8 @@ fn plan_gem_redirect(
                  it somewhere the rewriter cannot edit (an `eval_gemfile`d file, a loop, a \
                  gemspec); adding a second declaration would make bundler refuse the Gemfile — \
                  redirect skipped (declare it with a literal `gem \"{name}\"` line in \
-                 {gemfile_name}, or patch it with `--mode vendored` or `--mode agent`)"
+                 {gemfile_name}, in place of any other `gem` call that declares it, or patch \
+                 it with `--mode agent`)"
             ),
         ));
     } else {
@@ -9017,6 +9027,31 @@ fn rewrite_maven_pom(
         .iter()
         .filter(|o| o.ecosystem == "maven")
         .collect();
+    // Nothing to redirect for Maven and no block hosted mode wrote to
+    // heal: nothing to do, and no pom to read to find that out.
+    let holds_block = files
+        .get(MVN_CONFIG)
+        .is_some_and(|config| trusted_checksums::holds_written_block(config));
+    if maven.is_empty() && !holds_block {
+        return;
+    }
+    // The Maven the project declares, and so how its `.mvn/maven.config`
+    // spells the Trusted Checksums directory: the form that breaks no
+    // Maven 3 build, unless the project declares Maven 4.
+    let declared = DeclaredMaven::of(
+        files.get(MVN_WRAPPER_PROPERTIES).map(String::as_str),
+        files.get("pom.xml").map(String::as_str),
+    );
+    let basedir = trusted_checksums::Basedir::for_maven(&declared);
+    // First, and whatever this run redirects: the block an earlier run or
+    // an earlier release wrote in the other spelling is rewritten to this
+    // project's. The line stops Maven 3.9.2 to 3.9.8 from starting with
+    // `-f` from outside the project whether or not a pin still needs it,
+    // so no return below (nothing to redirect for Maven, a root another
+    // rewriter owns, a reactor root) may come before it.
+    let healed = holds_block
+        .then(|| heal_mvn_config(files, basedir, &declared, result))
+        .flatten();
     if maven.is_empty() {
         return;
     }
@@ -9065,8 +9100,14 @@ fn rewrite_maven_pom(
         .iter()
         .filter_map(|(id, _)| generation::pin_name_uuid(id, false).map(str::to_string))
         .collect();
-    let mut mvn_config = files.get(MVN_CONFIG).cloned().unwrap_or_default();
+    let mut mvn_config = healed
+        .or_else(|| files.get(MVN_CONFIG).cloned())
+        .unwrap_or_default();
     let mut mvn_config_changed = false;
+    // The Trusted Checksums settings are merged in once per run, with the
+    // first dependency that carries checksums; the settings found set to
+    // another value are reported for each such dependency.
+    let mut mvn_conflicts: Option<Vec<(&'static str, String)>> = None;
     // (local-repo-relative path, bare sha256 hex) entries to merge in.
     let mut checksum_entries: Vec<(String, String)> = vec![];
     // Trusted-checksum paths of superseded generations' suffixed artifacts:
@@ -9201,8 +9242,13 @@ fn rewrite_maven_pom(
                     (&group_id, &artifact_id, suffixed),
                     checksum_hashes.as_ref(),
                     bad_checksum_hashes,
-                    &mut mvn_config,
-                    &mut mvn_config_changed,
+                    &mut MavenChecksumSettings {
+                        config: &mut mvn_config,
+                        changed: &mut mvn_config_changed,
+                        basedir,
+                        declared: &declared,
+                        conflicts: &mut mvn_conflicts,
+                    },
                     &mut checksum_entries,
                     result,
                 );
@@ -9584,8 +9630,13 @@ fn rewrite_maven_pom(
                     (&group_id, &artifact_id, &suffixed_version),
                     checksum_hashes.as_ref(),
                     bad_checksum_hashes,
-                    &mut mvn_config,
-                    &mut mvn_config_changed,
+                    &mut MavenChecksumSettings {
+                        config: &mut mvn_config,
+                        changed: &mut mvn_config_changed,
+                        basedir,
+                        declared: &declared,
+                        conflicts: &mut mvn_conflicts,
+                    },
                     &mut checksum_entries,
                     result,
                 );
@@ -9798,8 +9849,13 @@ fn rewrite_maven_pom(
             (&group_id, &artifact_id, &suffixed_version),
             checksum_hashes.as_ref(),
             bad_checksum_hashes,
-            &mut mvn_config,
-            &mut mvn_config_changed,
+            &mut MavenChecksumSettings {
+                config: &mut mvn_config,
+                changed: &mut mvn_config_changed,
+                basedir,
+                declared: &declared,
+                conflicts: &mut mvn_conflicts,
+            },
             &mut checksum_entries,
             result,
         );
@@ -9841,31 +9897,39 @@ fn rewrite_maven_pom(
 
     // The pin is written regardless (a later wrapper upgrade enforces it, and
     // the version suffix is fail-closed on its own), but a project whose
-    // wrapper pins a Maven that ignores it must not read it as client-side
-    // content pinning. Judged on the files as they stand after this run, so a
+    // declared Maven ignores it must not read it as client-side content
+    // pinning. Judged on the files as they stand after this run, so a
     // re-scan of an already-pinned project warns as well.
     let final_text = |rel: &str| result.files.get(rel).or_else(|| files.get(rel));
-    let pin_in_place = final_text(MVN_CONFIG)
-        .is_some_and(|c| trusted_checksums::config_enforces(c))
-        && final_text(MVN_CHECKSUMS).is_some_and(|c| {
-            let pinned = trusted_checksums::pinned(c);
-            pinned_jar_paths.iter().any(|p| pinned.contains_key(p))
-        });
-    if let Some(version) = files
-        .get(MVN_WRAPPER_PROPERTIES)
-        .and_then(|props| trusted_checksums::wrapper_maven_version(props))
-        .filter(|v| pin_in_place && !trusted_checksums::maven_enforces(v))
-    {
+    let pinned_here = final_text(MVN_CHECKSUMS).is_some_and(|c| {
+        let pinned = trusted_checksums::pinned(c);
+        pinned_jar_paths.iter().any(|p| pinned.contains_key(p))
+    });
+    let enforcement = match final_text(MVN_CONFIG).filter(|_| pinned_here) {
+        Some(config) => {
+            trusted_checksums::enforcement(&trusted_checksums::Settings::read(config), &declared)
+        }
+        None => trusted_checksums::Enforcement::Off,
+    };
+    if let Some(detail) = unenforced_detail(&enforcement, &declared) {
         result.warnings.push(RewriteWarning {
             code: "redirect_maven_trusted_checksums_unenforced".into(),
-            detail: format!(
-                "{MVN_WRAPPER_PROPERTIES} pins Maven {version}, which does not enforce the \
-                 Trusted Checksums pin in {MVN_CHECKSUMS} (Maven enforces it from 3.9.4); \
-                 only the transport .sha1 check guards the Socket-served artifacts. \
-                 Upgrade the Maven Wrapper to 3.9.4 or later"
-            ),
+            detail,
         });
     }
+}
+
+/// The `.mvn/maven.config` of one run as the Trusted Checksums settings
+/// are merged into it: the text, whether it changed, how this project
+/// spells the checksums directory (one rule for every path that pins: a
+/// literal version, a property, a reactor), and the settings found at
+/// another value once the merge has run.
+struct MavenChecksumSettings<'a> {
+    config: &'a mut String,
+    changed: &'a mut bool,
+    basedir: trusted_checksums::Basedir,
+    declared: &'a DeclaredMaven,
+    conflicts: &'a mut Option<Vec<(&'static str, String)>>,
 }
 
 /// The Trusted Checksums pin of one dep whose version pin landed this run:
@@ -9878,8 +9942,7 @@ fn pin_maven_checksums(
     (group_id, artifact_id, suffixed_version): (&str, &str, &str),
     checksum_hashes: Option<&(String, String)>,
     bad_checksum_hashes: bool,
-    mvn_config: &mut String,
-    mvn_config_changed: &mut bool,
+    settings: &mut MavenChecksumSettings<'_>,
     checksum_entries: &mut Vec<(String, String)>,
     result: &mut RewriteResult,
 ) {
@@ -9896,28 +9959,38 @@ fn pin_maven_checksums(
     let Some((jar, pom_hash)) = checksum_hashes else {
         return;
     };
-    let (merged, conflicts) = merge_mvn_config(mvn_config, &format!("{group_id}:{artifact_id}"));
-    for conflict in conflicts {
+    // The settings are merged in once per run, with the first dependency
+    // that carries checksums; a setting found at another value is
+    // reported for each such dependency.
+    if settings.conflicts.is_none() {
+        let (merged, conflicts) =
+            merge_mvn_config(settings.config, settings.basedir, settings.declared);
+        if merged != *settings.config {
+            let action = if files.contains_key(MVN_CONFIG) {
+                "rewritten"
+            } else {
+                "added"
+            };
+            *settings.config = merged;
+            *settings.changed = true;
+            result.edits.push(FileEdit {
+                path: MVN_CONFIG.into(),
+                kind: "redirect_maven_config".into(),
+                action: action.into(),
+                key: Some("trustedChecksums".into()),
+                original: None,
+                new: None,
+            });
+        }
+        *settings.conflicts = Some(conflicts);
+    }
+    for (key, existing_value) in settings.conflicts.iter().flatten() {
         result.warnings.push(RewriteWarning {
             code: "redirect_maven_trusted_checksums_conflict".into(),
-            detail: conflict,
-        });
-    }
-    if merged != *mvn_config {
-        let action = if files.contains_key(MVN_CONFIG) {
-            "rewritten"
-        } else {
-            "added"
-        };
-        *mvn_config = merged;
-        *mvn_config_changed = true;
-        result.edits.push(FileEdit {
-            path: MVN_CONFIG.into(),
-            kind: "redirect_maven_config".into(),
-            action: action.into(),
-            key: Some("trustedChecksums".into()),
-            original: None,
-            new: None,
+            detail: format!(
+                "{group_id}:{artifact_id}: {MVN_CONFIG} already sets -D{key}= to a \
+                 different value (-D{key}={existing_value}); leaving it as-is"
+            ),
         });
     }
     for (ext, hash) in [("jar", jar), ("pom", pom_hash)] {
@@ -10325,6 +10398,156 @@ impl MavenReactorRewrite {
     }
 }
 
+/// Rewrite the Trusted Checksums block of `.mvn/maven.config` to `basedir`
+/// when it stands in the other spelling
+/// ([`trusted_checksums::heal_basedir`]): the file and its edit go into
+/// `result`, and the healed text is returned.
+///
+/// Rewriting `${session.rootDirectory}` to the launcher's property in a
+/// project that declares no Maven trades something away: a Maven 4 build
+/// enforced the pin before and does not after. That is said, never done
+/// silently (`redirect_maven_trusted_checksums_maven3_only`).
+fn heal_mvn_config(
+    files: &BTreeMap<String, String>,
+    basedir: trusted_checksums::Basedir,
+    declared: &DeclaredMaven,
+    result: &mut RewriteResult,
+) -> Option<String> {
+    let healed = trusted_checksums::heal_basedir(files.get(MVN_CONFIG)?, basedir)?;
+    result.edits.push(FileEdit {
+        path: MVN_CONFIG.into(),
+        kind: "redirect_maven_config".into(),
+        action: "rewritten".into(),
+        key: Some(MVN_CONFIG_HEAL_KEY.into()),
+        original: None,
+        new: None,
+    });
+    if let Some(detail) = heal_trade_detail(&healed, declared, "") {
+        result.warnings.push(RewriteWarning {
+            code: MVN_CONFIG_HEAL_TRADE.into(),
+            detail,
+        });
+    }
+    result.files.insert(MVN_CONFIG.into(), healed.clone());
+    Some(healed)
+}
+
+/// The `key` of the `redirect_maven_config` edit that respells the Trusted
+/// Checksums directory line ([`heal_mvn_config`]), which tells it from the
+/// edit that merges the settings in (`trustedChecksums`).
+pub(crate) const MVN_CONFIG_HEAL_KEY: &str = "trustedChecksumsDirectory";
+
+/// The warning a heal carries when it trades the pin's enforcement on
+/// Maven 4 away ([`heal_trade_detail`]).
+const MVN_CONFIG_HEAL_TRADE: &str = "redirect_maven_trusted_checksums_maven3_only";
+
+/// Take the respelling of `.mvn/maven.config` back out of `result`: the
+/// file, its edit and the warning that goes with it. `true` when there was
+/// one.
+///
+/// The heal is a courtesy to a project an earlier release wired, never the
+/// reason a run fails: a caller that cannot write the file (it is a
+/// symbolic link, which a write would replace; the write lock could not be
+/// had) leaves the line as it is. A run that heals merges nothing into the
+/// config afterwards (the block holds every setting), so the file's whole
+/// change is the heal.
+pub(crate) fn withhold_maven_heal(result: &mut RewriteResult) -> bool {
+    if !carries_maven_heal(result) {
+        return false;
+    }
+    result.files.remove(MVN_CONFIG);
+    result.edits.retain(|edit| !is_maven_heal(edit));
+    result.warnings.retain(|w| w.code != MVN_CONFIG_HEAL_TRADE);
+    true
+}
+
+fn is_maven_heal(edit: &FileEdit) -> bool {
+    edit.path == MVN_CONFIG && edit.key.as_deref() == Some(MVN_CONFIG_HEAL_KEY)
+}
+
+/// Whether `result` respells `.mvn/maven.config` ([`heal_mvn_config`]).
+pub(crate) fn carries_maven_heal(result: &RewriteResult) -> bool {
+    result.edits.iter().any(is_maven_heal)
+}
+
+/// Whether the writers could replace the `.mvn/maven.config` under `root`:
+/// what every staged write is checked for before anything is written
+/// ([`staged::preflight`]). A symbolic link (a rename-over would replace
+/// it with a detached copy), anything else that is not a regular file, and
+/// a directory that does not take the write all refuse the whole run they
+/// are part of, which a heal must never do.
+pub(crate) async fn maven_config_writable(root: &std::path::Path) -> bool {
+    let pending = vec![staged::Pending {
+        rel: MVN_CONFIG,
+        content: Some(b"".as_slice()),
+        read: None,
+    }];
+    staged::preflight(root, pending).await.is_ok()
+}
+
+/// What rewriting the Trusted Checksums directory line of the
+/// `.mvn/maven.config` under `dir` (`""`, or a path ending in `/`) to the
+/// launcher's property traded away, when `healed` (the config after the
+/// rewrite) is enforced by Maven 3 only: `None` when nothing was traded (the
+/// project declares its Maven, or the config enforces nothing).
+pub(crate) fn heal_trade_detail(
+    healed: &str,
+    declared: &DeclaredMaven,
+    dir: &str,
+) -> Option<String> {
+    use trusted_checksums::{basedir_value, Basedir, Enforcement, Settings};
+    (trusted_checksums::enforcement(&Settings::read(healed), declared) == Enforcement::Maven3Only)
+        .then(|| {
+            format!(
+                "{dir}{MVN_CONFIG} named the Trusted Checksums directory as {session}, which \
+                 stops Maven 3.9.2 to 3.9.8 from starting when a build is run with -f from \
+                 outside the project; the line now names it as {launcher}. Maven 3.9.4 and \
+                 later 3.x enforce the checksums in {dir}{MVN_CHECKSUMS} as before. A Maven 4 \
+                 build of this project no longer does: Maven 4 does not read that property. \
+                 If Maven 4 builds this project, declare it (a Maven Wrapper that pins Maven \
+                 4, or a root pom of model 4.1.0): the next hosted scan then writes the form \
+                 Maven 4 reads",
+                session = basedir_value(Basedir::Session),
+                launcher = basedir_value(Basedir::Launcher),
+            )
+        })
+}
+
+/// Why the Trusted Checksums pin is not enforced by the Maven the project
+/// declares, and what changes that; `None` when it is, or when the project
+/// declares no Maven to judge by ([`trusted_checksums::Enforcement`]).
+fn unenforced_detail(
+    enforcement: &trusted_checksums::Enforcement,
+    declared: &DeclaredMaven,
+) -> Option<String> {
+    use trusted_checksums::{basedir_value, Basedir, Enforcement};
+    let unguarded = "only the transport .sha1 check guards the Socket-served artifacts";
+    match enforcement {
+        Enforcement::TooOld(version) => Some(format!(
+            "{MVN_WRAPPER_PROPERTIES} pins Maven {version}, which does not enforce the \
+             Trusted Checksums pin in {MVN_CHECKSUMS} (Maven enforces it from 3.9.4); \
+             {unguarded}. Upgrade the Maven Wrapper to 3.9.4 or later"
+        )),
+        Enforcement::UnreadByMaven4 => {
+            let declares = match declared.release() {
+                Some(version) if !declared.maven_4_model() => {
+                    format!("{MVN_WRAPPER_PROPERTIES} pins Maven {version}")
+                }
+                _ => "pom.xml is of a model only Maven 4 reads".to_string(),
+            };
+            Some(format!(
+                "{declares}, and Maven 4 does not read {property}, through which {MVN_CONFIG} \
+                 names the Trusted Checksums directory, so the pin in {MVN_CHECKSUMS} is not \
+                 enforced; {unguarded}. Set the line to -D{key}={session}",
+                property = Basedir::Launcher.property(),
+                session = basedir_value(Basedir::Session),
+                key = trusted_checksums::BASEDIR_KEY,
+            ))
+        }
+        Enforcement::Off | Enforcement::Maven3Only | Enforcement::Enforced => None,
+    }
+}
+
 static MAVEN_REPOSITORY_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?s)<repository>.*?</repository>").expect("static repository regex is valid")
 });
@@ -10371,30 +10594,35 @@ pub(crate) fn maven_repository_removal(pom: &str, id: &str) -> Option<(usize, us
 
 /// Merge trusted-checksums resolver args into `.mvn/maven.config` (one arg per
 /// line). A setting is present when Maven 3.9+ reads it from the file
-/// ([`crate::formats::maven::maven_config_line_properties`], the reader
-/// discovery's [`trusted_checksums::config_enforces`] uses: `-Dk=v`,
+/// ([`trusted_checksums::Settings`], the reader discovery uses: `-Dk=v`,
 /// `--define k=v`, indented or quoted lines, the last definition winning).
 /// A present setting is left untouched (existing value wins); a different
-/// value is reported as a conflict. Returns the merged text + those
-/// conflict messages. Twin of the TS `mergeMvnConfig`.
-fn merge_mvn_config(existing: &str, coordinate: &str) -> (String, Vec<String>) {
-    let present = crate::formats::maven::maven_config_line_properties(existing);
+/// value is a conflict. The directory setting in the other spelling hosted
+/// mode writes ([`trusted_checksums::Basedir`]) is no conflict where it
+/// names the same directory, which is everywhere but in a project that
+/// declares Maven 4 (`declared`): Maven 4 does not read the launcher's
+/// property, so that line names no directory there. Returns the merged
+/// text and each conflicting setting as `(key, the value in place)`. The
+/// rewriter's other implementation, in Socket's backend, merges the same
+/// way.
+fn merge_mvn_config(
+    existing: &str,
+    basedir: trusted_checksums::Basedir,
+    declared: &DeclaredMaven,
+) -> (String, Vec<(&'static str, String)>) {
+    let present = trusted_checksums::Settings::read(existing);
     let mut conflicts = vec![];
     let mut appended: Vec<&str> = vec![];
-    for arg in MVN_CONFIG_ARGS {
-        let (key, value) = arg
-            .strip_prefix("-D")
-            .and_then(|def| def.split_once('='))
-            .expect("every MVN_CONFIG_ARGS entry is -Dkey=value");
-        match present.get(key) {
-            None => appended.push(arg),
-            Some(existing_value) if existing_value != value => {
-                conflicts.push(format!(
-                    "{coordinate}: {MVN_CONFIG} already sets -D{key}= to a different value \
-                     (-D{key}={existing_value}); leaving it as-is"
-                ));
-            }
-            Some(_) => {}
+    for (arg, key, value) in trusted_checksums::config_settings(basedir) {
+        let Some(existing_value) = present.get(key) else {
+            appended.push(arg);
+            continue;
+        };
+        let same_directory = key == trusted_checksums::BASEDIR_KEY
+            && trusted_checksums::basedir_of_value(existing_value)
+                .is_some_and(|theirs| !theirs.unread_by(declared));
+        if existing_value != value && !same_directory {
+            conflicts.push((key, existing_value.to_string()));
         }
     }
     if appended.is_empty() {
@@ -12707,6 +12935,428 @@ mod tests {
         assert!(checksums.contains(&format!("{}  ", "d".repeat(64))));
     }
 
+    /// The Trusted Checksums directory is spelled so that no Maven the
+    /// project may be built with refuses to start: through the launcher's
+    /// property, unless the project declares Maven 4 (its wrapper, or a
+    /// 4.1.0 model), which reads only the session's. A project an earlier
+    /// release wired with the session's is healed on its next scan, in
+    /// that one line; a directory line the user wrote is not.
+    #[test]
+    fn maven_checksums_directory_follows_the_maven_the_project_declares() {
+        use trusted_checksums::Basedir::{Launcher, Session};
+        let pom = pom_with_dep("\n      <version>1.7.36</version>", "");
+        let run = |files: &BTreeMap<String, String>| {
+            rewrite_registry_redirect(files, &[maven_override()])
+        };
+        let form =
+            |r: &RewriteResult| trusted_checksums::Settings::read(&r.files[MVN_CONFIG]).basedir();
+        let value = trusted_checksums::basedir_value;
+        let codes = |r: &RewriteResult| -> Vec<String> {
+            r.warnings.iter().map(|w| w.code.clone()).collect()
+        };
+        let plain = BTreeMap::from([("pom.xml".to_string(), pom.clone())]);
+        let wired = run(&plain);
+        assert_eq!(form(&wired), Some(Launcher));
+        for (wrapper, expected) in [
+            ("3.9.2", Launcher),
+            ("3.9.8", Launcher),
+            ("3.9.16", Launcher),
+            ("4.0.0-rc-7", Session),
+            ("4.0.0", Session),
+        ] {
+            let mut files = plain.clone();
+            files.insert(MVN_WRAPPER_PROPERTIES.to_string(), maven_wrapper(wrapper));
+            let r = run(&files);
+            assert_eq!(form(&r), Some(expected), "{wrapper}");
+            // Each of those Mavens enforces the form it is given, but the
+            // two that predate SHA-256 support.
+            assert_eq!(
+                codes(&r).contains(&"redirect_maven_trusted_checksums_unenforced".to_string()),
+                wrapper == "3.9.2",
+                "{wrapper}: {:?}",
+                r.warnings
+            );
+        }
+        let model_4_1 = BTreeMap::from([(
+            "pom.xml".to_string(),
+            pom.replace("<modelVersion>4.0.0", "<modelVersion>4.1.0"),
+        )]);
+        assert_ne!(model_4_1["pom.xml"], pom);
+        assert_eq!(form(&run(&model_4_1)), Some(Session));
+
+        // An earlier release's wiring: the same files, the session's form.
+        let mut earlier = plain.clone();
+        earlier.extend(wired.files.clone());
+        let old = earlier[MVN_CONFIG].replace(value(Launcher), value(Session));
+        assert_ne!(old, earlier[MVN_CONFIG]);
+        earlier.insert(MVN_CONFIG.to_string(), old);
+        let healed = run(&earlier);
+        assert_eq!(healed.files.keys().collect::<Vec<_>>(), [MVN_CONFIG]);
+        assert_eq!(healed.files[MVN_CONFIG], wired.files[MVN_CONFIG]);
+        assert_eq!(
+            healed
+                .edits
+                .iter()
+                .map(|e| (e.path.as_str(), e.kind.as_str(), e.action.as_str()))
+                .collect::<Vec<_>>(),
+            [(MVN_CONFIG, "redirect_maven_config", "rewritten")]
+        );
+        // The project declares no Maven, so the heal trades the pin's
+        // enforcement on Maven 4 for a build that starts everywhere, and
+        // says so.
+        assert_eq!(
+            codes(&healed),
+            ["redirect_maven_trusted_checksums_maven3_only"],
+            "{:?}",
+            healed.warnings
+        );
+        let said = &healed.warnings[0].detail;
+        for part in [
+            "Maven 3.9.2 to 3.9.8",
+            "Maven 3.9.4 and later 3.x enforce",
+            "A Maven 4 build of this project no longer does",
+            "a Maven Wrapper that pins Maven 4, or a root pom of model 4.1.0",
+            value(Session),
+            value(Launcher),
+        ] {
+            assert!(said.contains(part), "{part}: {said}");
+        }
+        // Once, with the change: the next scan has nothing to say.
+        let mut settled = earlier.clone();
+        settled.extend(healed.files.clone());
+        let rescan = run(&settled);
+        assert!(rescan.files.is_empty());
+        assert!(rescan.warnings.is_empty(), "{:?}", rescan.warnings);
+        // A project whose wrapper names a Maven 3 that enforces either
+        // spelling trades nothing, so its heal is silent.
+        let mut maven_3 = earlier.clone();
+        maven_3.insert(MVN_WRAPPER_PROPERTIES.to_string(), maven_wrapper("3.9.9"));
+        let healed_3 = run(&maven_3);
+        assert_eq!(healed_3.files[MVN_CONFIG], wired.files[MVN_CONFIG]);
+        assert!(healed_3.warnings.is_empty(), "{:?}", healed_3.warnings);
+        // The same wiring in a project that declares Maven 4 is right as
+        // it is, and the launcher's form there is healed the other way.
+        let mut maven_4 = earlier.clone();
+        maven_4.insert(
+            MVN_WRAPPER_PROPERTIES.to_string(),
+            maven_wrapper("4.0.0-rc-7"),
+        );
+        assert!(run(&maven_4).files.is_empty());
+        maven_4.insert(MVN_CONFIG.to_string(), wired.files[MVN_CONFIG].clone());
+        let to_session = run(&maven_4);
+        assert_eq!(form(&to_session), Some(Session));
+        assert!(to_session.warnings.is_empty(), "{:?}", to_session.warnings);
+
+        // A directory line the user wrote, in the form Maven's own
+        // documentation gives: no conflict (it names the same directory),
+        // the missing settings are appended, and the line stays theirs.
+        let theirs = format!("-D{}={}\n", trusted_checksums::BASEDIR_KEY, value(Session));
+        let users = BTreeMap::from([
+            ("pom.xml".to_string(), pom.clone()),
+            (MVN_CONFIG.to_string(), theirs.clone()),
+        ]);
+        let r = run(&users);
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        assert!(r.files[MVN_CONFIG].starts_with(&theirs));
+        assert_eq!(form(&r), Some(Session));
+        assert!(trusted_checksums::config_enforces(&r.files[MVN_CONFIG]));
+        let mut again = users.clone();
+        again.extend(r.files.clone());
+        assert!(run(&again).files.is_empty());
+    }
+
+    /// The line an earlier release wrote stops Maven 3.9.2 to 3.9.8 from
+    /// starting whatever this run redirects. So the heal is tied to
+    /// nothing but the block hosted mode wrote: not to a Maven patch in
+    /// this run, not to a pin's checksum line, not to a root the pom
+    /// rewriter edits, not to a config that still enforces anything.
+    #[test]
+    fn maven_checksums_block_is_healed_whatever_the_run_redirects() {
+        use trusted_checksums::Basedir::{Launcher, Session};
+        let block = |form| format!("{}\n", trusted_checksums::config_args(form).join("\n"));
+        let config_edits = |r: &RewriteResult| -> Vec<(String, String)> {
+            r.edits
+                .iter()
+                .filter(|e| e.path == MVN_CONFIG)
+                .map(|e| (e.kind.clone(), e.action.clone()))
+                .collect()
+        };
+        let one_rewrite = [("redirect_maven_config".to_string(), "rewritten".to_string())];
+        let trade = "redirect_maven_trusted_checksums_maven3_only";
+        let pinned = pom_with_dep("\n      <version>1.7.36</version>", "");
+        // The dependency was bumped past the patched version: no patch
+        // applies any more, the block and a stale checksum line stay.
+        let bumped = BTreeMap::from([
+            (
+                "pom.xml".to_string(),
+                pom_with_dep("\n      <version>2.0.9</version>", ""),
+            ),
+            (MVN_CONFIG.to_string(), block(Session)),
+            (
+                MVN_CHECKSUMS.to_string(),
+                format!(
+                    "{}  org/slf4j/slf4j-api/1.7.36-socket.77777777/slf4j-api-1.7.36-socket.77777777.jar\n",
+                    "a".repeat(64)
+                ),
+            ),
+        ]);
+        let r = rewrite_registry_redirect(&bumped, &[]);
+        assert_eq!(r.files.keys().collect::<Vec<_>>(), [MVN_CONFIG]);
+        assert_eq!(r.files[MVN_CONFIG], block(Launcher));
+        assert_eq!(config_edits(&r), one_rewrite);
+        assert_eq!(warning_codes(&r), [trade]);
+
+        // No checksum line names a hosted artifact, or no checksum file is
+        // there at all (a rollback left the block beside the user's own
+        // settings): the block alone is the evidence.
+        for sums in [Some("# mine\n".to_string()), None] {
+            let mut left = bumped.clone();
+            left.insert(MVN_CONFIG.to_string(), format!("-T4\n{}", block(Session)));
+            match &sums {
+                Some(text) => left.insert(MVN_CHECKSUMS.to_string(), text.clone()),
+                None => left.remove(MVN_CHECKSUMS),
+            };
+            let r = rewrite_registry_redirect(&left, &[]);
+            assert_eq!(r.files.keys().collect::<Vec<_>>(), [MVN_CONFIG], "{sums:?}");
+            assert_eq!(r.files[MVN_CONFIG], format!("-T4\n{}", block(Launcher)));
+            assert_eq!(warning_codes(&r), [trade], "{sums:?}");
+        }
+
+        // A config that no longer enforces the pin (a later line switches
+        // it off) still stops those Mavens. Nothing is traded there, so
+        // nothing is said.
+        let off = format!(
+            "{}-D{}=false\n",
+            block(Session),
+            trusted_checksums::SWITCH_KEY
+        );
+        let mut unenforcing = bumped.clone();
+        unenforcing.insert(MVN_CONFIG.to_string(), off.clone());
+        let r = rewrite_registry_redirect(&unenforcing, &[]);
+        assert_eq!(
+            r.files[MVN_CONFIG],
+            off.replace(
+                trusted_checksums::basedir_value(Session),
+                trusted_checksums::basedir_value(Launcher)
+            )
+        );
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+
+        // A reactor root, which the pom rewriter refuses whole.
+        let reactor = BTreeMap::from([
+            (
+                "pom.xml".to_string(),
+                pinned.replace(
+                    "  <dependencies>",
+                    "  <packaging>pom</packaging>\n  <modules>\n    <module>app</module>\n  </modules>\n  <dependencies>",
+                ),
+            ),
+            (MVN_CONFIG.to_string(), block(Session)),
+        ]);
+        assert!(maven_reactor_root(&reactor));
+        let r = rewrite_registry_redirect(&reactor, &[maven_override()]);
+        assert_eq!(r.files.keys().collect::<Vec<_>>(), [MVN_CONFIG]);
+        assert_eq!(r.files[MVN_CONFIG], block(Launcher));
+        assert_eq!(
+            warning_codes(&r),
+            [trade, "redirect_maven_multimodule_unsupported"]
+        );
+
+        // A root the sbt rewriter owns (no pom.xml beside the build).
+        let sbt_root = BTreeMap::from([
+            (
+                "project/build.properties".to_string(),
+                "sbt.version=1.10.7\n".to_string(),
+            ),
+            ("build.sbt".to_string(), "name := \"demo\"\n".to_string()),
+            (MVN_CONFIG.to_string(), block(Session)),
+        ]);
+        assert!(sbt::owns_maven_root(&sbt_root));
+        let r = rewrite_registry_redirect(&sbt_root, &[maven_override()]);
+        assert_eq!(r.files[MVN_CONFIG], block(Launcher));
+        assert_eq!(config_edits(&r), one_rewrite);
+
+        // A scan that also pins: one edit of the config, the heal. The
+        // settings are all there, so nothing is merged after it.
+        let mut repinned = bumped.clone();
+        repinned.insert("pom.xml".to_string(), pinned.clone());
+        repinned.remove(MVN_CHECKSUMS);
+        let r = rewrite_registry_redirect(&repinned, &[maven_override()]);
+        assert_eq!(r.files[MVN_CONFIG], block(Launcher));
+        assert_eq!(config_edits(&r), one_rewrite);
+        assert!(r.files.contains_key(MVN_CHECKSUMS) && r.files.contains_key("pom.xml"));
+        assert_eq!(warning_codes(&r), [trade]);
+
+        // The other way, for a project that declares Maven 4 by its model
+        // alone: the launcher's block gets the spelling Maven 4 reads, and
+        // nothing is traded.
+        let maven_4 = BTreeMap::from([
+            (
+                "pom.xml".to_string(),
+                pinned.replace("<modelVersion>4.0.0", "<modelVersion>4.1.0"),
+            ),
+            (MVN_CONFIG.to_string(), block(Launcher)),
+        ]);
+        let r = rewrite_registry_redirect(&maven_4, &[]);
+        assert_eq!(r.files[MVN_CONFIG], block(Session));
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+
+        // Nothing to heal, nothing written: this project's own spelling,
+        // or no block.
+        for config in [block(Launcher), "-T4\n".to_string()] {
+            let mut settled = bumped.clone();
+            settled.insert(MVN_CONFIG.to_string(), config);
+            let r = rewrite_registry_redirect(&settled, &[]);
+            assert!(r.files.is_empty() && r.edits.is_empty() && r.warnings.is_empty());
+        }
+    }
+
+    /// A launcher-spelled directory line that stands apart is the user's
+    /// and is never rewritten. In a project that declares Maven 4, which
+    /// does not read that property, it names no directory: that is a
+    /// conflict, the pin is reported unenforced with the remedy that works
+    /// on Maven 4, and it is so whether the wrapper or only the root pom's
+    /// model declares Maven 4.
+    #[test]
+    fn maven_checksums_launcher_line_conflicts_in_a_project_that_declares_maven_4() {
+        use trusted_checksums::Basedir::{Launcher, Session};
+        use trusted_checksums::{basedir_value, Enforcement, Settings, BASEDIR_KEY};
+        let theirs = format!("-D{BASEDIR_KEY}={}\n", basedir_value(Launcher));
+        let pom = pom_with_dep("\n      <version>1.7.36</version>", "");
+        let by_wrapper = BTreeMap::from([
+            ("pom.xml".to_string(), pom.clone()),
+            (MVN_CONFIG.to_string(), theirs.clone()),
+            (MVN_WRAPPER_PROPERTIES.to_string(), maven_wrapper("4.0.0")),
+        ]);
+        let by_model = BTreeMap::from([
+            (
+                "pom.xml".to_string(),
+                pom.replace("<modelVersion>4.0.0", "<modelVersion>4.1.0"),
+            ),
+            (MVN_CONFIG.to_string(), theirs.clone()),
+        ]);
+        assert_ne!(by_model["pom.xml"], pom);
+        for (files, declares) in [
+            (
+                &by_wrapper,
+                format!("{MVN_WRAPPER_PROPERTIES} pins Maven 4.0.0"),
+            ),
+            (
+                &by_model,
+                "pom.xml is of a model only Maven 4 reads".to_string(),
+            ),
+        ] {
+            let r = rewrite_registry_redirect(files, &[maven_override()]);
+            // The user's line stays; the five other settings are appended.
+            let config = &r.files[MVN_CONFIG];
+            assert!(config.starts_with(&theirs), "{config}");
+            assert!(!config.contains(basedir_value(Session)), "{config}");
+            assert_eq!(
+                warning_codes(&r),
+                [
+                    "redirect_maven_trusted_checksums_conflict",
+                    "redirect_maven_trusted_checksums_unenforced"
+                ],
+                "{declares}"
+            );
+            let conflict = &r.warnings[0].detail;
+            assert!(
+                conflict.contains(&format!("-D{BASEDIR_KEY}={}", basedir_value(Launcher))),
+                "{conflict}"
+            );
+            let unenforced = &r.warnings[1].detail;
+            for part in [
+                declares.as_str(),
+                "Maven 4 does not read",
+                "is not enforced",
+                &format!("-D{BASEDIR_KEY}={}", basedir_value(Session)),
+            ] {
+                assert!(unenforced.contains(part), "{part}: {unenforced}");
+            }
+            assert!(
+                !unenforced.contains("Upgrade the Maven Wrapper"),
+                "{unenforced}"
+            );
+            // What discovery reads the same files as: not enforced.
+            let declared = DeclaredMaven::of(
+                files.get(MVN_WRAPPER_PROPERTIES).map(String::as_str),
+                files.get("pom.xml").map(String::as_str),
+            );
+            assert_eq!(
+                trusted_checksums::enforcement(&Settings::read(config), &declared),
+                Enforcement::UnreadByMaven4
+            );
+            // A rescan merges nothing, and still says the pin is inert.
+            let mut again = files.clone();
+            again.extend(r.files.clone());
+            let rescan = rewrite_registry_redirect(&again, &[maven_override()]);
+            assert!(rescan.files.is_empty(), "{declares}");
+            assert_eq!(
+                warning_codes(&rescan),
+                ["redirect_maven_trusted_checksums_unenforced"]
+            );
+        }
+        // The same line in a project that declares a Maven 3, or none: it
+        // names the directory there, so it is no conflict.
+        let mut maven_3 = by_wrapper.clone();
+        maven_3.insert(MVN_WRAPPER_PROPERTIES.to_string(), maven_wrapper("3.9.9"));
+        let mut undeclared = by_wrapper.clone();
+        undeclared.remove(MVN_WRAPPER_PROPERTIES);
+        for files in [&maven_3, &undeclared] {
+            let r = rewrite_registry_redirect(files, &[maven_override()]);
+            assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+            assert!(r.files[MVN_CONFIG].starts_with(&theirs));
+        }
+    }
+
+    /// Several patched dependencies in one run merge the settings once and
+    /// report a setting the user holds at another value for each of them.
+    #[test]
+    fn maven_checksums_conflict_is_reported_for_each_dependency() {
+        let mut second = maven_override();
+        second.name = "slf4j-simple".into();
+        second.patch_uuid = "uuid2".into();
+        let ov = second.registry_override.as_mut().unwrap();
+        ov.index_url = ov.index_url.replace("/uuid/", "/uuid2/");
+        ov.identifiers.name = "org.slf4j/slf4j-simple".into();
+        ov.identifiers.maven_artifact_id = Some("slf4j-simple".into());
+        ov.identifiers.maven_suffixed_version = Some("1.7.36-socket.88888888".into());
+        let pom = pom_with_dep("\n      <version>1.7.36</version>", "").replace(
+            "  </dependencies>",
+            "    <dependency>\n      <groupId>org.slf4j</groupId>\n      <artifactId>slf4j-simple</artifactId>\n      <version>1.7.36</version>\n    </dependency>\n  </dependencies>",
+        );
+        let files = BTreeMap::from([
+            ("pom.xml".to_string(), pom),
+            (
+                MVN_CONFIG.to_string(),
+                "-Daether.trustedChecksumsSource.summaryFile.originAware=true\n".to_string(),
+            ),
+        ]);
+        let r = rewrite_registry_redirect(&files, &[maven_override(), second]);
+        let conflicts: Vec<&str> = r
+            .warnings
+            .iter()
+            .filter(|w| w.code == "redirect_maven_trusted_checksums_conflict")
+            .map(|w| w.detail.as_str())
+            .collect();
+        assert_eq!(conflicts.len(), 2, "{:?}", r.warnings);
+        assert!(
+            conflicts[0].starts_with("org.slf4j:slf4j-api: "),
+            "{conflicts:?}"
+        );
+        assert!(
+            conflicts[1].starts_with("org.slf4j:slf4j-simple: "),
+            "{conflicts:?}"
+        );
+        assert_eq!(
+            r.edits
+                .iter()
+                .filter(|e| e.kind == "redirect_maven_config")
+                .count(),
+            1
+        );
+    }
+
     /// A user `.mvn/maven.config` key set to a different value is preserved
     /// (never overridden) and a conflict warning is emitted.
     /// A Maven Wrapper `maven-wrapper.properties` with the given
@@ -12811,45 +13461,6 @@ mod tests {
             assert!(r.files.contains_key(MVN_CHECKSUMS), "{wrapper}");
             assert!(r.warnings.is_empty(), "{wrapper}: {:?}", r.warnings);
         }
-    }
-
-    /// The `distributionUrl` parse: escaped or plain `:`, `=`/`:`/space
-    /// separators, `.tar.gz` distributions, comments and CRLF.
-    #[test]
-    fn maven_wrapper_version_parses_distribution_url() {
-        assert_eq!(
-            trusted_checksums::wrapper_maven_version(&maven_wrapper("3.9.3")).as_deref(),
-            Some("3.9.3")
-        );
-        assert_eq!(
-            trusted_checksums::wrapper_maven_version(
-                "distributionUrl : https://archive.apache.org/dist/maven/maven-3/3.9.2/binaries/apache-maven-3.9.2-bin.tar.gz\r\n"
-            )
-            .as_deref(),
-            Some("3.9.2")
-        );
-        assert_eq!(
-            trusted_checksums::wrapper_maven_version(
-                "! comment\r\ndistributionUrl=https\\://repo/apache-maven-4.0.0-rc-6-bin.zip\r\n"
-            )
-            .as_deref(),
-            Some("4.0.0-rc-6")
-        );
-        assert_eq!(
-            trusted_checksums::wrapper_maven_version("wrapperVersion=3.3.2\n"),
-            None
-        );
-        assert_eq!(
-            trusted_checksums::wrapper_maven_version(
-                "distributionUrlOld=https://x/apache-maven-3.9.3-bin.zip\n"
-            ),
-            None
-        );
-        assert!(!trusted_checksums::maven_enforces("3.9.3"));
-        assert!(trusted_checksums::maven_enforces("3.9.4"));
-        assert!(trusted_checksums::maven_enforces("3.10.0-rc-1"));
-        assert!(trusted_checksums::maven_enforces("4.0.0"));
-        assert!(!trusted_checksums::maven_enforces("3.8.9"));
     }
 
     #[test]
@@ -20160,9 +20771,21 @@ mod tests {
             assert_eq!(warning_codes(&r), vec![code], "{decl}: {:?}", r.warnings);
             let detail = &r.warnings[0].detail;
             assert!(detail.contains(why), "{decl}: {detail}");
+            // #2151: vendored mode refuses a declaration out of sight for
+            // the same reason, so that refusal does not name it.
+            let remedy = match code {
+                "redirect_gem_declaration_not_visible" => "--mode agent",
+                "redirect_gem_dependency_not_locked" => "bundle lock",
+                _ => "--mode vendored",
+            };
             assert!(
-                detail.contains("--mode vendored") || detail.contains("bundle lock"),
+                detail.contains(remedy),
                 "{decl}: the refusal names a remedy: {detail}"
+            );
+            assert_eq!(
+                detail.contains("--mode vendored"),
+                remedy == "--mode vendored",
+                "{decl}: {detail}"
             );
         }
         // An opaque last argument the lock shows to be a version requirement
@@ -21392,6 +22015,8 @@ mod tests {
         for gemfile in [
             "source \"https://rubygems.org\"\neval_gemfile \"Gemfile.common\"\n",
             "source \"https://rubygems.org\"\n%w[rack].each { |g| gem g, \"~> 3.1\" }\n",
+            // A gem only the gemspec declares (a development dependency).
+            "source \"https://rubygems.org\"\n\ngemspec\n",
         ] {
             let mut files = BTreeMap::new();
             files.insert("Gemfile".to_string(), gemfile.to_string());
@@ -21410,6 +22035,17 @@ mod tests {
                 "{gemfile}: {:?}",
                 r.warnings
             );
+            // #2151: every way out the warning names works. Vendored mode
+            // refuses the gem for the same reason, so it is not one.
+            let detail = &r.warnings[0].detail;
+            assert!(
+                detail.contains(
+                    "a literal `gem \"rack\"` line in Gemfile, in place of any other `gem` \
+                     call that declares it"
+                ) && detail.contains("`--mode agent`"),
+                "{gemfile}: {detail}"
+            );
+            assert!(!detail.contains("vendored"), "{gemfile}: {detail}");
         }
         // Control: a genuinely transitive gem (absent from DEPENDENCIES) is
         // still appended.

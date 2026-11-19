@@ -963,6 +963,33 @@ async fn read_go_workspace(
     }
 }
 
+/// The files a hosted scan with nothing to redirect still reads, so that
+/// the Maven rewriter can heal a `.mvn/maven.config` an earlier release
+/// wrote: `None` unless that file holds the Trusted Checksums block in a
+/// spelling some project is healed out of
+/// ([`crate::formats::maven::trusted_checksums::heal_basedir`]), and then
+/// it, the Maven Wrapper's properties and the root pom, which say which
+/// spelling this project takes. The line an earlier release wrote stops
+/// Maven 3.9.2 to 3.9.8 from starting with `-f` from outside the project
+/// whether or not a patch still applies, so a project whose only patched
+/// dependency was bumped past the patch must not keep it for ever.
+pub async fn read_maven_heal_files(view: &ProjectView<'_>) -> Option<CandidateFiles> {
+    use crate::formats::maven::trusted_checksums::holds_written_block;
+    use crate::patch::redirect::{MVN_CONFIG, MVN_WRAPPER_PROPERTIES};
+    let none = BTreeSet::new();
+    let mut out = CandidateFiles::default();
+    if !out.read(view, &none, MVN_CONFIG).await {
+        return None;
+    }
+    if !holds_written_block(out.files.get(MVN_CONFIG)?) {
+        return None;
+    }
+    for rel in [MVN_WRAPPER_PROPERTIES, "pom.xml"] {
+        out.read(view, &none, rel).await;
+    }
+    Some(out)
+}
+
 /// Read the project's candidate files: [`REDIRECT_CANDIDATE_FILES`], the
 /// Cargo workspace members (when a cargo candidate meets a root
 /// `Cargo.toml`), the Python locks and their scripts, the Rush locks, and
@@ -2143,6 +2170,19 @@ pub struct Rewritten {
     pub final_discovery: Option<FinalDiscovery>,
 }
 
+impl Rewritten {
+    /// Take the Maven rewriter's respelling of `.mvn/maven.config` back
+    /// out of what this run writes and reports
+    /// ([`crate::patch::redirect::withhold_maven_heal`]): for a caller that
+    /// could not take the write lock.
+    pub fn withhold_maven_heal(&mut self) {
+        if crate::patch::redirect::withhold_maven_heal(&mut self.rewrite) {
+            self.rewritten
+                .retain(|rel| rel != crate::patch::redirect::MVN_CONFIG);
+        }
+    }
+}
+
 /// Where [`Rewritten::final_discovery`] lives.
 #[derive(Debug)]
 pub enum FinalDiscovery {
@@ -2826,6 +2866,19 @@ async fn rewrite_once(
         );
         (files, rewrite)
     };
+    // The Maven rewriter's respelling of `.mvn/maven.config` is a courtesy,
+    // never the reason a run is refused or fails: where the file cannot be
+    // replaced (a symbolic link, which the guard refuses for every write;
+    // a directory that does not take the write) the line is left as it is.
+    if crate::patch::redirect::carries_maven_heal(&rewrite) {
+        let writable = match view {
+            ProjectView::Disk(root) => crate::patch::redirect::maven_config_writable(root).await,
+            _ => !view.is_symlink(crate::patch::redirect::MVN_CONFIG),
+        };
+        if !writable {
+            crate::patch::redirect::withhold_maven_heal(&mut rewrite);
+        }
+    }
     // The gem files were withheld on purpose: say why, not "no Gemfile".
     if let Some(warning) = gem_refusal {
         rewrite
@@ -6076,6 +6129,180 @@ snapshots:
         let read = read_candidate_files(view, &BTreeSet::new(), &candidates).await;
         let done = rewrite(view, read.clone(), &candidates, BTreeMap::new(), options).await;
         (read, done)
+    }
+
+    /// A run with nothing to redirect: [`read_maven_heal_files`] then
+    /// [`rewrite`] with no candidate.
+    async fn heal_only(view: &ProjectView<'_>) -> Option<Rewritten> {
+        let outer = OuterAllowRemote::default;
+        let options = RewriteOptions {
+            dry_run: false,
+            targets_pipenv_lock: false,
+            pipenv_major: None,
+            pipenv_unknown_detail: String::new(),
+            trust_lockfile_config: true,
+            npm_allow_remote_config: true,
+            npm_outer: &outer,
+            yarn_classic_outer: &OuterYarnMirror::default,
+            cargo_outer: &no_cargo_outer,
+            maven_selection: &no_maven_selection,
+            pnpm_env: &no_env,
+            blocking: false,
+            takeover_uuids: Default::default(),
+            patch_server_origins: Vec::new(),
+            prior_discovery: None,
+        };
+        let read = read_maven_heal_files(view).await?;
+        Some(rewrite(view, read, &[], BTreeMap::new(), options).await)
+    }
+
+    const PLAIN_POM: &str = "<project xmlns=\"http://maven.apache.org/POM/4.0.0\">\n  \
+        <modelVersion>4.0.0</modelVersion>\n  <groupId>t</groupId>\n  \
+        <artifactId>app</artifactId>\n  <version>1</version>\n</project>\n";
+
+    fn checksums_block(form: crate::formats::maven::trusted_checksums::Basedir) -> String {
+        format!(
+            "{}\n",
+            crate::formats::maven::trusted_checksums::config_args(form).join("\n")
+        )
+    }
+
+    /// A scan that redirects nothing reads the Maven files only when
+    /// `.mvn/maven.config` holds a block to heal, and then heals it: on
+    /// disk and in memory alike.
+    #[tokio::test]
+    async fn a_run_with_nothing_to_redirect_heals_the_maven_config() {
+        use crate::formats::maven::trusted_checksums::Basedir::{Launcher, Session};
+        use crate::patch::redirect::{MVN_CONFIG, MVN_WRAPPER_PROPERTIES};
+        let wrapper_4 = "distributionUrl=https://repo.maven.apache.org/maven2/org/apache/maven/\
+                         apache-maven/4.0.0/apache-maven-4.0.0-bin.zip\n";
+        // (the config, a Maven 4 wrapper, what the heal leaves)
+        for (config, maven_4, healed) in [
+            (
+                checksums_block(Session),
+                false,
+                Some(checksums_block(Launcher)),
+            ),
+            (
+                checksums_block(Launcher),
+                true,
+                Some(checksums_block(Session)),
+            ),
+            (
+                format!("-T4\n{}", checksums_block(Session)),
+                false,
+                Some(format!("-T4\n{}", checksums_block(Launcher))),
+            ),
+            // This project's own spelling, or no block: nothing to do.
+            (checksums_block(Launcher), false, None),
+            (checksums_block(Session), true, None),
+            ("-T4\n".to_string(), false, None),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut memory = MemoryProject::new();
+            let mut put = |rel: &str, text: &str| {
+                let path = tmp.path().join(rel);
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(path, text).unwrap();
+                memory.insert_text(rel, text);
+            };
+            put("pom.xml", PLAIN_POM);
+            put(MVN_CONFIG, &config);
+            if maven_4 {
+                put(MVN_WRAPPER_PROPERTIES, wrapper_4);
+            }
+            for view in [ProjectView::Disk(tmp.path()), ProjectView::Memory(&memory)] {
+                let done = heal_only(&view).await;
+                let Some(healed) = &healed else {
+                    // A block in the other spelling is read, and found to
+                    // be this project's; no block is not read at all.
+                    assert!(
+                        done.is_none_or(
+                            |done| done.rewrite.files.is_empty() && done.rewrite.edits.is_empty()
+                        ),
+                        "{config:?} / Maven 4: {maven_4}"
+                    );
+                    continue;
+                };
+                let mut done = done.expect("a block to heal");
+                assert_eq!(
+                    done.rewrite.files.keys().collect::<Vec<_>>(),
+                    [MVN_CONFIG],
+                    "{config:?}"
+                );
+                assert_eq!(&done.rewrite.files[MVN_CONFIG], healed);
+                assert_eq!(done.rewritten, [MVN_CONFIG]);
+                assert!(done.confirmed.is_empty());
+                assert!(guard(&view, &done, &[]).is_none());
+                let codes: Vec<&str> = done
+                    .rewrite
+                    .warnings
+                    .iter()
+                    .map(|w| w.code.as_str())
+                    .collect();
+                // Only the heal that takes the session's property out of a
+                // project that declares no Maven trades anything away.
+                let trade: &[&str] = if maven_4 {
+                    &[]
+                } else {
+                    &["redirect_maven_trusted_checksums_maven3_only"]
+                };
+                assert_eq!(codes, trade, "{config:?}");
+
+                // A caller that cannot write withholds all of it.
+                done.withhold_maven_heal();
+                assert!(done.rewrite.files.is_empty());
+                assert!(done.rewrite.edits.is_empty());
+                assert!(done.rewrite.warnings.is_empty());
+                assert!(done.rewritten.is_empty());
+            }
+        }
+        // No config at all: nothing is read.
+        let empty = tempfile::tempdir().unwrap();
+        std::fs::write(empty.path().join("pom.xml"), PLAIN_POM).unwrap();
+        assert!(heal_only(&ProjectView::Disk(empty.path())).await.is_none());
+    }
+
+    /// The heal is a courtesy, never the reason a run is refused. A write
+    /// through a symbolic link would replace the link, which the guard
+    /// refuses for every write: a `.mvn/maven.config` that is a link keeps
+    /// its line, and the run goes on as if there were nothing to heal.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_symlinked_maven_config_is_left_unhealed_and_refuses_nothing() {
+        use crate::formats::maven::trusted_checksums::Basedir::Session;
+        use crate::patch::redirect::MVN_CONFIG;
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("pom.xml"), PLAIN_POM).unwrap();
+        std::fs::create_dir_all(tmp.path().join(".mvn")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("ci")).unwrap();
+        std::fs::write(tmp.path().join("ci/maven.config"), checksums_block(Session)).unwrap();
+        std::os::unix::fs::symlink("../ci/maven.config", tmp.path().join(MVN_CONFIG)).unwrap();
+        let view = ProjectView::Disk(tmp.path());
+        let done = heal_only(&view).await.expect("the block is read");
+        assert!(done.rewrite.files.is_empty(), "{:?}", done.rewrite.files);
+        assert!(done.rewrite.edits.is_empty() && done.rewrite.warnings.is_empty());
+        assert!(done.rewritten.is_empty());
+        assert!(guard(&view, &done, &[]).is_none());
+
+        // Control: the same file, not a link, is healed.
+        std::fs::remove_file(tmp.path().join(MVN_CONFIG)).unwrap();
+        std::fs::write(tmp.path().join(MVN_CONFIG), checksums_block(Session)).unwrap();
+        let done = heal_only(&view).await.expect("the block is read");
+        assert_eq!(done.rewritten, [MVN_CONFIG]);
+
+        // Nor is it planned into a directory that does not take the write:
+        // the commit would fail a run that had nothing else to do. (Root
+        // writes anywhere, so there is nothing to see as root.)
+        if unsafe { libc::geteuid() } != 0 {
+            use std::os::unix::fs::PermissionsExt as _;
+            let dir = tmp.path().join(".mvn");
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+            let done = heal_only(&view).await.expect("the block is read");
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+            assert!(done.rewrite.files.is_empty() && done.rewritten.is_empty());
+            assert!(done.rewrite.edits.is_empty() && done.rewrite.warnings.is_empty());
+        }
     }
 
     /// The Gradle pass reads the script graph's scripts and every build's

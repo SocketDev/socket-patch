@@ -14,10 +14,11 @@
 //!   crate (the hosted planner's unpinnable-dependents refusal);
 //! * [`CargoLock::vendored_in_use`] — whether the lock builds a vendored
 //!   `[patch]` copy ([`CopyClaim`]);
-//! * [`CargoLock::plan_hosted`] ([`hosted`]) — the hosted planner's lock
-//!   splice, at the byte spans [`CargoLock::parse`] records, and the
+//! * [`CargoLock::plan_hosted_splices`] ([`hosted`]) — the hosted planner's
+//!   lock splice, at the byte spans [`CargoLock::parse`] records, and the
 //!   [`CargoLock::is_locked`] / [`CargoLock::locked_versions`] probes the
-//!   hosted rewriter reads with;
+//!   hosted rewriter reads with, all through the one parse a
+//!   [`hosted::CargoHostedLock`] holds for a rewrite;
 //! * the vendored planner (`vendor::cargo_lock`) edits the same document
 //!   with `toml_edit`;
 //!
@@ -434,6 +435,13 @@ pub struct CargoLock {
     spans: Option<LockSpans>,
 }
 
+#[cfg(test)]
+thread_local! {
+    /// How often this thread has parsed a lock text ([`CargoLock::parse`]),
+    /// for the tests that pin how often a rewrite does.
+    pub(crate) static LOCK_PARSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// The byte spans of a [`CargoLock`] parsed from text.
 #[derive(Debug)]
 pub(crate) struct LockSpans {
@@ -461,6 +469,8 @@ impl CargoLock {
     /// Parse a lock text, keeping every span the hosted splice edits;
     /// `Err` when it is not TOML (cargo itself refuses to build from it).
     pub fn parse(text: &str) -> Result<Self, toml_edit::TomlError> {
+        #[cfg(test)]
+        LOCK_PARSES.with(|parses| parses.set(parses.get() + 1));
         let doc = Document::parse(text)?;
         let root = doc.as_table();
         let mut packages = Vec::new();

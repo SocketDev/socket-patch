@@ -47,8 +47,10 @@ mod fs_tree;
 #[path = "../hosted_memory_common/mod.rs"]
 mod hosted_memory_common;
 
+mod cargo;
 mod go;
 mod harness;
 mod npm;
+mod nuget;
 mod pypi;
 mod ruby;

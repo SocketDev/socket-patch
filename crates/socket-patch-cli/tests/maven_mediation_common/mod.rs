@@ -627,16 +627,29 @@ pub fn plain_settings(path: &Path) {
     write_settings(path, &[]);
 }
 
-/// Every file under `dir` (relative, forward slashes) with its bytes.
+/// Maven 4's own output directory in a project: it keeps a project-local
+/// repository there (`.mvn/target/project-local-repo`), written on every
+/// build from the poms as they then read, a wired build's included.
+const MAVEN_4_OUTPUT: &str = ".mvn/target";
+
+/// Every file under `dir` (relative, forward slashes) with its bytes, but
+/// what Maven itself writes under [`MAVEN_4_OUTPUT`]: that is neither the
+/// project's nor socket-patch's, and it differs from one build to the next.
 pub fn snapshot(dir: &Path) -> BTreeMap<String, Vec<u8>> {
     fn walk(base: &Path, dir: &Path, out: &mut BTreeMap<String, Vec<u8>>) {
         for entry in std::fs::read_dir(dir).unwrap() {
             let path = entry.unwrap().path();
+            let rel = path
+                .strip_prefix(base)
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/");
             if path.is_dir() {
-                walk(base, &path, out);
+                if rel != MAVEN_4_OUTPUT {
+                    walk(base, &path, out);
+                }
             } else {
-                let rel = path.strip_prefix(base).unwrap().to_string_lossy();
-                out.insert(rel.replace('\\', "/"), std::fs::read(&path).unwrap());
+                out.insert(rel, std::fs::read(&path).unwrap());
             }
         }
     }
