@@ -1023,3 +1023,124 @@ async fn uv_project_environment_is_scanned_not_a_stray_dot_venv() {
         assert_not_discovered(&bodies, "pkg:pypi/activated-decoy@6.6.6");
     }
 }
+
+// ---------------------------------------------------------------------------
+// pixi (`.pixi/envs/<name>`, conda prefixes pixi installs the project into)
+// ---------------------------------------------------------------------------
+
+/// A pixi environment at `project/.pixi/envs/<name>` as pixi leaves one: a
+/// conda prefix with pixi's own record. Returns its site-packages.
+fn pixi_env(project: &Path, name: &str) -> std::path::PathBuf {
+    let prefix = project.join(".pixi").join("envs").join(name);
+    let meta = prefix.join("conda-meta");
+    std::fs::create_dir_all(&meta).unwrap();
+    std::fs::write(
+        meta.join("pixi"),
+        format!("{{\"environment_name\": \"{name}\"}}"),
+    )
+    .unwrap();
+    let site = venv_site_packages(&prefix, "python3.13");
+    std::fs::create_dir_all(&site).unwrap();
+    site
+}
+
+/// Run `scan` with no venv or pixi activation in the environment and HOME
+/// pointed at `home`, restoring HOME afterwards.
+async fn scan_unactivated(args: ScanArgs, home: &Path) -> i32 {
+    let prev_home = std::env::var_os("HOME");
+    let prev_profile = std::env::var_os("USERPROFILE");
+    std::env::set_var("HOME", home);
+    std::env::set_var("USERPROFILE", home);
+    for var in [
+        "VIRTUAL_ENV",
+        "UV_PROJECT_ENVIRONMENT",
+        "CONDA_PREFIX",
+        "PIXI_PROJECT_ROOT",
+        "PIXI_WORKSPACE_ROOT",
+    ] {
+        std::env::remove_var(var);
+    }
+    let code = scan_run(args).await;
+    match prev_home {
+        Some(v) => std::env::set_var("HOME", v),
+        None => std::env::remove_var("HOME"),
+    }
+    match prev_profile {
+        Some(v) => std::env::set_var("USERPROFILE", v),
+        None => std::env::remove_var("USERPROFILE"),
+    }
+    code
+}
+
+/// A pixi project's packages are in `.pixi/envs/<name>`, and a plain
+/// `socket-patch scan` after `pixi install` (CI's shape: no `pixi run`, no
+/// `pixi shell`) finds them in every environment and every mode, with only
+/// pixi's own files at the root: no `pyproject.toml`, no requirements file.
+#[tokio::test]
+#[serial]
+async fn pixi_environments_are_scanned_without_activation() {
+    use socket_patch_cli::commands::scan::ScanMode;
+    for mode in [ScanMode::Agent, ScanMode::Vendored, ScanMode::Hosted] {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("analysis");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(
+            project.join("pixi.toml"),
+            "[workspace]\nname = \"analysis\"\nchannels = [\"conda-forge\"]\nplatforms = [\"linux-64\"]\n\n[dependencies]\npython = \"3.13.*\"\n",
+        )
+        .unwrap();
+        std::fs::write(project.join("pixi.lock"), "version: 6\n").unwrap();
+        write_dist_info(&pixi_env(&project, "default"), "conda_pkg", "1.0.0");
+        write_dist_info(&pixi_env(&project, "test"), "test_env_pkg", "2.0.0");
+
+        let server = MockServer::start().await;
+        mock_batch_empty(&server).await;
+        let mut args = default_args(&project, server.uri());
+        args.mode = Some(mode);
+        let code = scan_unactivated(args, &tmp.path().join("home")).await;
+        assert_eq!(code, 0, "{mode:?}");
+        let bodies = batch_bodies(&server).await;
+        assert_discovered(&bodies, "pkg:pypi/conda-pkg@1.0.0");
+        assert_discovered(&bodies, "pkg:pypi/test-env-pkg@2.0.0");
+    }
+}
+
+/// A pixi project with no environment installed yet has nothing installed.
+/// A `pyproject.toml` beside the pixi files (project metadata only, as
+/// pixi projects often keep one) must not send the crawl to the Python on
+/// PATH or the user-wide interpreters (here a conda root under the stubbed
+/// HOME), in any mode.
+#[tokio::test]
+#[serial]
+async fn pixi_fresh_checkout_never_scans_the_system_python() {
+    use socket_patch_cli::commands::scan::ScanMode;
+    for marker in ["pixi.toml", "pixi.lock"] {
+        for mode in [ScanMode::Agent, ScanMode::Vendored, ScanMode::Hosted] {
+            let tmp = tempfile::tempdir().unwrap();
+            let project = tmp.path().join("analysis");
+            std::fs::create_dir_all(&project).unwrap();
+            std::fs::write(
+                project.join("pyproject.toml"),
+                "[project]\nname = \"analysis\"\nversion = \"0.1.0\"\n",
+            )
+            .unwrap();
+            std::fs::write(project.join(marker), "").unwrap();
+            let home = tmp.path().join("home");
+            let system = home
+                .join("anaconda3")
+                .join("lib")
+                .join("python3.11")
+                .join("site-packages");
+            std::fs::create_dir_all(&system).unwrap();
+            write_dist_info(&system, "system_decoy", "6.6.6");
+
+            let server = MockServer::start().await;
+            mock_batch_empty(&server).await;
+            let mut args = default_args(&project, server.uri());
+            args.mode = Some(mode);
+            let code = scan_unactivated(args, &home).await;
+            assert_eq!(code, 0, "{marker} {mode:?}");
+            assert_not_discovered(&batch_bodies(&server).await, "pkg:pypi/system-decoy@6.6.6");
+        }
+    }
+}
