@@ -71,6 +71,7 @@ pub(crate) mod go_sum_backup;
 pub mod go_sum_edit;
 pub mod go_workspace;
 pub mod golang;
+pub(crate) mod jsonc;
 pub mod jvm;
 pub(crate) mod ledger_snapshots;
 pub mod lock_inventory;
@@ -128,6 +129,7 @@ pub use source::PackageSource;
 // `vex::discover` validates lockfile-recorded npm names with the same rule the
 // npm backends apply to their own coordinates.
 pub(crate) use npm_common::is_safe_npm_name;
+pub use pnpm_lock::rush::wiring_files as rush_wiring_files;
 pub use pypi_requirements::requirements_include_names;
 pub use state::{
     carry_forward_wiring, file_gitignored, ledger_gitignore_refusal, load_state, lookup_entry,
@@ -1034,9 +1036,15 @@ pub async fn pnpm_takeover_lock_text_refusals(
     project_root: &Path,
     candidates: &[(&str, &str)],
 ) -> HashMap<String, (&'static str, String)> {
+    // A Rush monorepo's locks are pnpm v9 too, and its gates read the same
+    // text (plus Rush's config and project manifests, which the hosted
+    // restore never touches).
     if !matches!(
-        npm_flavor::detect_npm_lock_flavor(project_root).await,
-        Ok((npm_flavor::NpmLockFlavor::Pnpm, _))
+        npm_flavor::detect_vendorable_npm_flavor(project_root).await,
+        Ok((
+            npm_flavor::NpmLockFlavor::Pnpm | npm_flavor::NpmLockFlavor::RushPnpm,
+            _
+        ))
     ) {
         return HashMap::new();
     }

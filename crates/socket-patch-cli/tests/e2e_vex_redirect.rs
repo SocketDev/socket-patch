@@ -805,7 +805,7 @@ fn stale_redirect_ledger_is_not_attested_even_with_no_verify() {
 }
 
 // ──────────────────────────────────────────────────────────────────────
-// 6. manifest-less, LEDGER-less hosted VEX (a depscan-opened PR, or a
+// 6. manifest-less, LEDGER-less hosted VEX (a GitHub-app PR, or a
 // checkout whose `.socket/` was never committed): the lockfile's Socket-host
 // reference is the only input; the record comes from the patch API.
 // ──────────────────────────────────────────────────────────────────────

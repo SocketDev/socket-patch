@@ -439,14 +439,51 @@ fn bun_reinstall_advised<'a>(mut codes: impl Iterator<Item = &'a str>) -> bool {
     })
 }
 
-/// The qualifiers the generic reinstall note gets next to a Bun (#764) or
-/// PyPI (#477) reinstall advisory.
-fn reinstall_qualifiers(bun: bool, pypi: bool) -> String {
+/// Appended to the generic reinstall note next to a gem the unwind left on
+/// its patched build (#2086): Bundler counts an installed gem as satisfied.
+const GEM_REINSTALL_QUALIFIER: &str =
+    " (Bundler: `bundle install` keeps an installed gem; see the gem warning for what to run)";
+
+/// True when the run's leg warnings name a gem still on its patched build.
+fn gem_reinstall_advised<'a>(mut codes: impl Iterator<Item = &'a str>) -> bool {
+    codes.any(|c| c == crate::commands::gem_refresh::Direction::Upstream.stale_code())
+}
+
+/// The package managers whose reinstall advisory qualifies the generic
+/// reinstall note: Bun (#764), PyPI (#477) and Bundler (#2086).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ReinstallAdvised {
+    bun: bool,
+    pypi: bool,
+    gem: bool,
+}
+
+impl ReinstallAdvised {
+    fn of<'a>(codes: impl Iterator<Item = &'a str> + Clone) -> Self {
+        Self {
+            bun: bun_reinstall_advised(codes.clone()),
+            pypi: crate::commands::pypi_reinstall::advised(codes.clone()),
+            gem: gem_reinstall_advised(codes),
+        }
+    }
+}
+
+/// The qualifiers the generic reinstall note gets next to those advisories.
+fn reinstall_qualifiers(advised: ReinstallAdvised) -> String {
     format!(
-        "{}{}",
-        if bun { BUN_REINSTALL_QUALIFIER } else { "" },
-        if pypi {
+        "{}{}{}",
+        if advised.bun {
+            BUN_REINSTALL_QUALIFIER
+        } else {
+            ""
+        },
+        if advised.pypi {
             crate::commands::pypi_reinstall::NOTE_QUALIFIER
+        } else {
+            ""
+        },
+        if advised.gem {
+            GEM_REINSTALL_QUALIFIER
         } else {
             ""
         }
@@ -455,7 +492,7 @@ fn reinstall_qualifiers(bun: bool, pypi: bool) -> String {
 
 /// The reinstall note for packages whose wiring was undone but whose
 /// installed tree still holds patched bytes.
-fn format_reinstall_note(still_patched: usize, dry_run: bool, bun: bool, pypi: bool) -> String {
+fn format_reinstall_note(still_patched: usize, dry_run: bool, advised: ReinstallAdvised) -> String {
     let keep = match (still_patched == 1, dry_run) {
         (true, false) => "keeps its",
         (true, true) => "would keep its",
@@ -466,7 +503,7 @@ fn format_reinstall_note(still_patched: usize, dry_run: bool, bun: bool, pypi: b
         "Note: {} {keep} patched bytes in installed trees until the next \
          package-manager install{}.",
         plural(still_patched, "unwired package", "unwired packages"),
-        reinstall_qualifiers(bun, pypi)
+        reinstall_qualifiers(advised)
     )
 }
 
@@ -2389,7 +2426,7 @@ async fn run_project(args: RollbackArgs, below: BelowNotes) -> i32 {
                 .filter(|pin| hosted_scope.contains(&pin.purl))
                 .cloned()
                 .collect();
-            let hosted_leg = run_hosted_leg(&args.common, &in_scope).await;
+            let hosted_leg = run_hosted_leg(&args.common, &in_scope, &api_client).await;
             // An unscoped rollback promises to unwind EVERY hosted patch:
             // contested wiring it cannot restore fails the leg (a scoped run
             // names its own targets and leaves unrelated wiring alone).
@@ -2566,14 +2603,7 @@ async fn run_project(args: RollbackArgs, below: BelowNotes) -> i32 {
             let unwired_any = !vendored_leg.reverted.is_empty()
                 || !vendored_leg.preserved.is_empty()
                 || !hosted_leg.reverted.is_empty();
-            let bun_advised = bun_reinstall_advised(
-                vendored_leg
-                    .warnings
-                    .iter()
-                    .chain(hosted_leg.warnings.iter())
-                    .map(|(code, _)| code.as_str()),
-            );
-            let pypi_advised = crate::commands::pypi_reinstall::advised(
+            let advised = ReinstallAdvised::of(
                 vendored_leg
                     .warnings
                     .iter()
@@ -2586,7 +2616,7 @@ async fn run_project(args: RollbackArgs, below: BelowNotes) -> i32 {
                     format!(
                         "unwired packages keep their patched bytes in installed trees until \
                          the next package-manager install{}",
-                        reinstall_qualifiers(bun_advised, pypi_advised)
+                        reinstall_qualifiers(advised)
                     ),
                 ));
             }
@@ -2864,12 +2894,7 @@ async fn run_project(args: RollbackArgs, below: BelowNotes) -> i32 {
                 if still_patched > 0 {
                     println!(
                         "\n{}",
-                        format_reinstall_note(
-                            still_patched,
-                            args.common.dry_run,
-                            bun_advised,
-                            pypi_advised
-                        )
+                        format_reinstall_note(still_patched, args.common.dry_run, advised)
                     );
                 }
             }
@@ -3664,6 +3689,7 @@ pub(crate) async fn rollback_patches_inner(
                             cwd: common.cwd.clone(),
                             rebuild: !common.no_gem_native_rebuild,
                             offline: common.offline,
+                            progress: common.gem_build_progress(),
                         };
                         if let Err(e) = gem_ext::restore_original_build(pkg_path, &env).await {
                             result.success = false;
@@ -6589,12 +6615,12 @@ mod tests {
     #[test]
     fn reinstall_note_tense_and_number() {
         assert_eq!(
-            format_reinstall_note(1, false, false, false),
+            format_reinstall_note(1, false, ReinstallAdvised::default()),
             "Note: 1 unwired package keeps its patched bytes in installed trees until the \
              next package-manager install."
         );
         assert_eq!(
-            format_reinstall_note(2, true, false, false),
+            format_reinstall_note(2, true, ReinstallAdvised::default()),
             "Note: 2 unwired packages would keep their patched bytes in installed trees \
              until the next package-manager install."
         );
@@ -6605,7 +6631,14 @@ mod tests {
     #[test]
     fn reinstall_note_defers_to_the_bun_advisory() {
         assert_eq!(
-            format_reinstall_note(1, false, true, false),
+            format_reinstall_note(
+                1,
+                false,
+                ReinstallAdvised {
+                    bun: true,
+                    ..Default::default()
+                }
+            ),
             "Note: 1 unwired package keeps its patched bytes in installed trees until the \
              next package-manager install (Bun: a plain `bun install` keeps them; run \
              `bun install --force`)."
@@ -6962,11 +6995,47 @@ mod tests {
         assert_eq!(rollback_failure_code(&r), "rollback_failed");
     }
 
+    /// #2086: next to a gem the unwind left on its patched build, the note
+    /// must not imply that the next `bundle install` replaces it.
+    #[test]
+    fn reinstall_note_defers_to_the_gem_warning() {
+        let advised =
+            ReinstallAdvised::of(["cleanup_failed", "upstream_gem_stale_install"].into_iter());
+        assert_eq!(
+            advised,
+            ReinstallAdvised {
+                gem: true,
+                ..Default::default()
+            }
+        );
+        assert_eq!(
+            format_reinstall_note(1, false, advised),
+            "Note: 1 unwired package keeps its patched bytes in installed trees until the \
+             next package-manager install (Bundler: `bundle install` keeps an installed gem; \
+             see the gem warning for what to run)."
+        );
+        // The scan direction's warning is not an unwind's.
+        assert!(!gem_reinstall_advised(
+            [
+                "redirect_gem_stale_install",
+                "upstream_gem_install_refreshed"
+            ]
+            .into_iter()
+        ));
+    }
+
     /// #477: next to a PyPI reinstall advisory the note must not imply
     /// that the next sync refreshes the copy.
     #[test]
     fn reinstall_note_defers_to_the_pypi_advisory() {
-        let note = format_reinstall_note(1, false, false, true);
+        let note = format_reinstall_note(
+            1,
+            false,
+            ReinstallAdvised {
+                pypi: true,
+                ..Default::default()
+            },
+        );
         assert!(
             note.contains("(pip, PDM, uv and Pipenv keep a same-version install through a plain install or sync")
                 && note.contains("pypi_reinstall_required"),

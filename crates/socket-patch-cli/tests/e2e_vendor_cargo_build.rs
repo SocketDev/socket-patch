@@ -453,7 +453,7 @@ impl ManifestlessVendored {
         let run = self.vex_run(&api, &self.fresh_home);
         let embedded = [VexVia::Apply, VexVia::Vendor];
 
-        // (1) The manifest deleted (a detached / depscan checkout), the
+        // (1) The manifest deleted (a detached / GitHub-app checkout), the
         //     vendor ledger kept: its embedded record attests — no API.
         strip_manifest(fresh);
         assert!(ledger_path.is_file(), "the vendor ledger travels");

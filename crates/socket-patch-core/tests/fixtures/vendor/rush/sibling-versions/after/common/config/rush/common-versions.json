@@ -1,0 +1,17 @@
+{
+  "$schema": "https://developer.microsoft.com/json-schemas/rush/v5/common-versions.schema.json",
+
+  "preferredVersions": {
+    // "some-library": "1.2.3"
+  },
+
+  // "implicitlyPreferredVersions": false,
+
+  // "ensureConsistentVersions": true,
+
+  "allowedAlternativeVersions": {
+    // "typescript": [
+    //   "~2.4.0"
+    // ]
+  }
+}

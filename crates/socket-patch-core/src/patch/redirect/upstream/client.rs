@@ -137,7 +137,13 @@ pub(crate) fn secure_gem_registry(base: String) -> Result<String, String> {
 /// gem lookup of a native-extension rebuild (`patch::gem_source`).
 pub(crate) fn is_rubygems_remote(remote: &str) -> bool {
     use crate::formats::gem::same_remote;
-    same_remote(remote, DEFAULT_RUBYGEMS) || same_remote(remote, &rubygems_base())
+    use crate::utils::redact::strip_url_userinfo;
+    // A lock names a gem server without the credentials Bundler keeps in
+    // its own config, while `SOCKET_RUBYGEMS_URL` may carry them: both
+    // name one server.
+    let remote = strip_url_userinfo(remote);
+    same_remote(&remote, DEFAULT_RUBYGEMS)
+        || same_remote(&remote, &strip_url_userinfo(&rubygems_base()))
 }
 
 /// Packagist's composer v2 metadata repository; override with

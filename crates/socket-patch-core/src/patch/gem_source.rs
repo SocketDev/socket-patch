@@ -99,6 +99,14 @@ impl GemId {
     }
 }
 
+/// Whether `source`, a lock's source as [`resolved_elsewhere`] names it,
+/// is a gem server that could be a mirror of the registry and could be
+/// named in `SOCKET_RUBYGEMS_URL`: reached over https (a download is taken
+/// over nothing else), and not Socket's patch registry.
+fn may_be_a_mirror(source: &str) -> bool {
+    source.starts_with("https://") && !source.contains("/patch-registry/")
+}
+
 /// The gems a Bundler lock resolves from somewhere that is not the default
 /// registry, each with that source as the lock names it (credentials
 /// redacted): whatever version it pins, the registry's gem of that name is
@@ -242,8 +250,20 @@ impl GemSource {
             format!("{}.gem", id.full_name()),
             home.join("cache").display().to_string(),
         );
-        if self.elsewhere.contains_key(&id.name) {
-            return format!("Put {file} in {cache}.");
+        if let Some(source) = self.elsewhere.get(&id.name) {
+            // A gem server the lock names may be a mirror of the registry
+            // (Artifactory, a pull-through cache): it serves this archive,
+            // and only the user can say it is one. Said only where naming
+            // it can work: a download is allowed in this run, and the
+            // server is one a download is taken from (https, and not
+            // Socket's patch registry, which serves patched gems only).
+            let mirror = if !self.offline && may_be_a_mirror(source) {
+                ", or, if that server is a mirror of rubygems.org, set SOCKET_RUBYGEMS_URL to \
+                 its URL and apply again"
+            } else {
+                ""
+            };
+            return format!("Put {file} in {cache}{mirror}.");
         }
         match &self.registry {
             Ok(_) => format!(
@@ -751,6 +771,39 @@ mod tests {
         racc (1.8.1) sha256=4a7f6929691dbec8b5209a0b373bc2614882b55fc5d2e447a21aaa691303d62f\n\n\
         BUNDLED WITH\n  4.0.15\n";
 
+    /// A lock names a gem server without the credentials
+    /// `SOCKET_RUBYGEMS_URL` names it with, and the hint to name a mirror
+    /// is for a server a download could be taken from.
+    #[test]
+    fn a_server_is_the_same_with_or_without_credentials() {
+        for (with, without) in [
+            (
+                "https://user:tok@gems.example.test/api/gems/",
+                "https://gems.example.test/api/gems/",
+            ),
+            ("https://tok@gems.example.test", "https://gems.example.test"),
+            (
+                "https://gems.example.test/a@b",
+                "https://gems.example.test/a@b",
+            ),
+            ("not a url", "not a url"),
+        ] {
+            assert_eq!(crate::utils::redact::strip_url_userinfo(with), without);
+        }
+        assert!(may_be_a_mirror("https://gems.example.test/api/gems"));
+        assert!(may_be_a_mirror(
+            "https://<redacted>@gems.example.test/private"
+        ));
+        for source in [
+            "http://gems.example.test",
+            "a git source",
+            "a path source",
+            "https://patch.socket.dev/patch-registry/gem/token/uuid",
+        ] {
+            assert!(!may_be_a_mirror(source), "{source}");
+        }
+    }
+
     /// A gem locked only as platform gems is still the registry's gem, so
     /// its ruby-platform archive may be fetched there. A gem any section
     /// resolves from another source is not, whatever version is asked for:
@@ -839,6 +892,10 @@ mod tests {
         let remedy = online.remedy(&home, &private);
         assert!(!remedy.contains("network access"), "{remedy}");
         assert!(remedy.contains("inhouse-9.9.9.gem"), "{remedy}");
+        // The lock names a gem server, which may be a mirror: the remedy
+        // says how to name it.
+        assert!(remedy.contains("SOCKET_RUBYGEMS_URL"), "{remedy}");
+        assert!(!remedy.contains("secret"), "{remedy}");
         // In the home's cache, even a private gem's archive is its source.
         std::fs::write(cache_path(&home, &private), b"private").unwrap();
         assert_eq!(online.archive(&home, &private).await.unwrap(), b"private");

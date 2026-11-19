@@ -2413,7 +2413,8 @@ fn omission_phrase(reason: &str) -> &'static str {
         }
         "native_extension_not_rebuilt" => {
             "the patched native-extension sources were not compiled into the extension Ruby \
-             loads; run socket-patch apply to rebuild it"
+             loads; socket-patch apply rebuilds it, or says why this install's build compiles \
+             nothing of the patch"
         }
         COMPOSER_INSTALL_UNREAD => {
             "composer.json's config.vendor-dir puts the install outside the project, where \

@@ -6,6 +6,7 @@ use super::gradle_cache;
 use super::jvm_cache::{self, JvmCacheLayout, JvmCacheRoot};
 use super::types::{CrawledPackage, CrawlerOptions};
 use super::walk_pool::{par_map, run_walk};
+use crate::formats::maven::declared_maven::{release, DeclaredMaven, RootDirectory};
 use crate::gradle::graph::MavenLocal;
 use crate::gradle::home::GradleHome;
 use crate::gradle::{Env, Os};
@@ -800,16 +801,20 @@ enum ConfigRepo {
 /// * Maven before 3.9 splits the whole file on whitespace and interpolates
 ///   nothing; a `#` is an argument like any other (and stops the build).
 /// * Maven 3.9 and later takes one argument per line, skipping blank lines
-///   and lines that start with `#`, so a value runs to the end of its line.
-///   From 3.9.2 on it fills in `${session.rootDirectory}` and
-///   `${maven.multiModuleProjectDirectory}` (that directory),
-///   `${session.topDirectory}` and `${user.dir}` (`project`) and what
-///   `lookup` knows (`${user.home}`, `${env.NAME}`).
+///   and lines that start with `#`, so a value runs to the end of its line
+///   (`formats::maven::maven_config_line_properties`, which also reads the
+///   `--define` and quoted spellings). From 3.9.2 on it fills in
+///   `${session.rootDirectory}` and `${maven.multiModuleProjectDirectory}`
+///   (that directory; Maven 4 does not fill in the second, see
+///   [`RootDirectory`]), `${session.topDirectory}` and `${user.dir}`
+///   (`project`) and what `lookup` knows (`${user.home}`, `${env.NAME}`).
 ///
 /// For both the last occurrence wins, a placeholder nothing defines stays
 /// in the path as written, a relative path (an empty one included) is
 /// taken from `project`, where Maven runs, and no later source is asked.
-/// The Maven Wrapper's version says which reading applies. Without one,
+/// The Maven the project declares ([`DeclaredMaven`]: its wrapper's
+/// release, or a root pom only Maven 4 reads) says which reading applies.
+/// When it declares none,
 /// both are made: when they differ, the one whose directory exists is
 /// taken, the newer reading when neither does (nothing is installed in
 /// either), and none when both do.
@@ -839,40 +844,48 @@ fn maven_config_repo_local(project: &Path, lookup: &dyn Fn(&str) -> Option<Strin
         return ConfigRepo::Unset;
     };
     let at = |value: &str| project.join(value);
+    // Which Maven the project declares: its wrapper's release, or a root
+    // pom only Maven 4 reads (the answer every Maven reader here shares).
+    let root_pom = crate::utils::fs::read_regular_to_string_sync(&root.join("pom.xml")).ok();
+    let declared = DeclaredMaven::of(
+        read("wrapper/maven-wrapper.properties").as_deref(),
+        root_pom.as_deref(),
+    );
+    // Before 3.9: every `-Dmaven.repo.local=` token of the whole file. (The
+    // shared readers answer for 3.9 and later, or merge the two readings;
+    // which reading applies is what is being decided here.)
     let before_3_9 = text
         .split_whitespace()
         .filter_map(|arg| arg.strip_prefix(FLAG))
         .next_back()
         .map(at);
-    let per_line = text
-        .lines()
-        .map(str::trim_end)
-        .filter(|line| !line.is_empty() && !line.starts_with('#'))
-        .filter_map(|line| line.strip_prefix(FLAG))
-        .next_back();
-    let lookup = |name: &str| match name {
-        "session.rootDirectory" | "maven.multiModuleProjectDirectory" => {
-            Some(root.display().to_string())
+    // 3.9 and later: the shared reader of one argument per line.
+    let per_line =
+        crate::formats::maven::maven_config_line_properties(&text).remove("maven.repo.local");
+    let lookup = |name: &str| {
+        // The two spellings of the root directory, and which of them the
+        // declared Maven does not interpolate.
+        let root_property = [RootDirectory::Session, RootDirectory::Launcher]
+            .into_iter()
+            .find(|property| property.property() == format!("${{{name}}}"));
+        match (root_property, name) {
+            (Some(property), _) if property.unread_by(&declared) => None,
+            (Some(_), _) => Some(root.display().to_string()),
+            (None, "session.topDirectory" | "user.dir") => Some(project.display().to_string()),
+            (None, _) => lookup(name),
         }
-        "session.topDirectory" | "user.dir" => Some(project.display().to_string()),
-        _ => lookup(name),
     };
     let from_3_9 = |interpolates: bool| {
-        per_line.map(|value| match interpolates {
+        per_line.as_deref().map(|value| match interpolates {
             true => at(&interpolate_defined(value, &lookup)),
             false => at(value),
         })
     };
-    let version = read("wrapper/maven-wrapper.properties")
-        .and_then(|props| crate::formats::maven::trusted_checksums::wrapper_maven_version(&props))
-        .map(|version| {
-            let mut parts = version
-                .split(['.', '-'])
-                .map(|part| part.parse::<u32>().unwrap_or(0));
-            [0; 3].map(|_| parts.next().unwrap_or(0))
-        });
+    let version = declared.release().map(release);
     let found = |repo: Option<PathBuf>| repo.map_or(ConfigRepo::Unset, ConfigRepo::Path);
     match version {
+        // A root pom only Maven 4 reads: whatever the wrapper pins.
+        _ if declared.is_maven_4() => found(from_3_9(true)),
         Some(version) if version < [3, 9, 0] => found(before_3_9),
         Some(version) => found(from_3_9(version >= [3, 9, 2])),
         // A comment line stops Maven before 3.9: the file is for a later one.
