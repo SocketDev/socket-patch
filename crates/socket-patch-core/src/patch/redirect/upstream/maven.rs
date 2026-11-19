@@ -26,10 +26,12 @@ use std::collections::BTreeMap;
 use regex::Regex;
 
 use super::{by_uuid, read_or_refuse, refuse_all_in, Ctx, FormatResult, HostedPin, View};
+use crate::formats::maven::declared_maven::DeclaredMaven;
 use crate::formats::maven::trusted_checksums;
 use crate::patch::redirect::{
-    generation, maven_repositories_with_id, maven_tag_inner_range, maven_tag_text_in,
-    remove_maven_repository, MAVEN_DEPENDENCY_BLOCK_RE, MVN_CHECKSUMS, MVN_CONFIG,
+    generation, heal_trade_detail, maven_repositories_with_id, maven_tag_inner_range,
+    maven_tag_text_in, remove_maven_repository, MAVEN_DEPENDENCY_BLOCK_RE, MVN_CHECKSUMS,
+    MVN_CONFIG, MVN_WRAPPER_PROPERTIES,
 };
 
 /// The line break and indent `insert_maven_dependency_management` writes
@@ -398,17 +400,42 @@ pub(crate) async fn restore(
 }
 
 /// Drop the restored pins' trusted-checksum lines, and the `.mvn` files
-/// themselves when nothing but hosted mode's content is left.
+/// themselves when nothing but hosted mode's content is left. A config
+/// that stays is healed ([`heal_mvn_config`]).
 async fn restore_mvn(
     view: &mut View<'_>,
     dir: &str,
     checksum_dirs: &[String],
     result: &mut FormatResult,
 ) {
-    let sums_rel = format!("{dir}{MVN_CHECKSUMS}");
     let config_rel = format!("{dir}{MVN_CONFIG}");
+    let config = view.read(&config_rel).await.ok().flatten();
+    let removed = drop_checksums(
+        view,
+        dir,
+        &config_rel,
+        config.as_deref(),
+        checksum_dirs,
+        result,
+    )
+    .await;
+    if let Some(config) = config.filter(|_| !removed) {
+        heal_mvn_config(view, dir, &config_rel, &config, result).await;
+    }
+}
+
+/// The checksum half of [`restore_mvn`]. Whether it removed the config.
+async fn drop_checksums(
+    view: &mut View<'_>,
+    dir: &str,
+    config_rel: &str,
+    config: Option<&str>,
+    checksum_dirs: &[String],
+    result: &mut FormatResult,
+) -> bool {
+    let sums_rel = format!("{dir}{MVN_CHECKSUMS}");
     let Ok(Some(sums)) = view.read(&sums_rel).await else {
-        return;
+        return false;
     };
     let rest = trusted_checksums::edit(
         &sums,
@@ -416,35 +443,24 @@ async fn restore_mvn(
         &[],
     );
     if rest == sums {
-        return;
+        return false;
     }
-    let config = view.read(&config_rel).await.ok().flatten();
     // Whether settings hosted mode may have written are left over, read as
-    // `trusted_checksums::config_enforces` reads them but by presence: a
-    // partial or switched-off set is still lines the user may want gone.
-    let has_resolver_lines = config
-        .as_deref()
-        .is_some_and(trusted_checksums::config_has_written_settings);
+    // `trusted_checksums::Settings` reads them but by presence: a partial
+    // or switched-off set is still lines the user may want gone.
+    let has_resolver_lines = config.is_some_and(trusted_checksums::config_has_written_settings);
     if rest.trim().is_empty() {
         view.remove(&sums_rel);
         // (In either spelling of the directory: the one this release
         // writes, or an earlier release's.)
-        if config
-            .as_deref()
-            .is_some_and(trusted_checksums::is_written_config)
-        {
-            view.remove(&config_rel);
-            return;
+        if config.is_some_and(trusted_checksums::is_written_config) {
+            view.remove(config_rel);
+            return true;
         }
     } else {
         view.write(&sums_rel, rest.clone());
     }
-    let other_hosted = trusted_checksums::entries(&rest).any(|e| {
-        e.path
-            .split('/')
-            .any(|seg| crate::formats::maven::split_socket_version(seg).is_some())
-    });
-    if has_resolver_lines && !other_hosted {
+    if has_resolver_lines && !trusted_checksums::names_hosted_artifact(&rest) {
         result.warnings.push((
             "maven_trusted_checksums_left",
             format!(
@@ -454,6 +470,45 @@ async fn restore_mvn(
             ),
         ));
     }
+    false
+}
+
+/// The block hosted mode wrote into a `.mvn/maven.config` that stays
+/// (`config`, at `config_rel`), respelled for the Maven the project under
+/// `dir` declares ([`trusted_checksums::heal_basedir`]): the lines are left
+/// in place, but the one an earlier release wrote must not go on stopping
+/// Maven 3.9.2 to 3.9.8 from starting with `-f` from outside the project.
+/// What that trades away on Maven 4 is said, as the scan says it.
+async fn heal_mvn_config(
+    view: &mut View<'_>,
+    dir: &str,
+    config_rel: &str,
+    config: &str,
+    result: &mut FormatResult,
+) {
+    use trusted_checksums::Basedir;
+    // The cheap test first: only a config that holds a block in either
+    // spelling is worth reading the wrapper and the pom for.
+    if !trusted_checksums::holds_written_block(config) {
+        return;
+    }
+    let wrapper = view
+        .read(&format!("{dir}{MVN_WRAPPER_PROPERTIES}"))
+        .await
+        .ok()
+        .flatten();
+    let pom = view.read(&format!("{dir}pom.xml")).await.ok().flatten();
+    let declared = DeclaredMaven::of(wrapper.as_deref(), pom.as_deref());
+    let Some(healed) = trusted_checksums::heal_basedir(config, Basedir::for_maven(&declared))
+    else {
+        return;
+    };
+    if let Some(detail) = heal_trade_detail(&healed, &declared, dir) {
+        result
+            .warnings
+            .push(("maven_trusted_checksums_maven3_only", detail));
+    }
+    view.write(config_rel, healed);
 }
 
 #[cfg(test)]
@@ -868,6 +923,96 @@ mod tests {
             "{:?}",
             outcome.warnings
         );
+    }
+
+    /// A rollback that leaves hosted mode's settings beside the user's
+    /// own must not leave the line an earlier release wrote, which stops
+    /// Maven 3.9.2 to 3.9.8 from starting with `-f` from outside the
+    /// project: the block is respelled for the Maven the project declares,
+    /// and what that trades away on Maven 4 is said.
+    #[tokio::test]
+    async fn a_block_the_rollback_leaves_is_healed() {
+        use super::trusted_checksums::{
+            self, basedir_value,
+            Basedir::{Launcher, Session},
+            BASEDIR_KEY,
+        };
+        let beside = |form| {
+            format!(
+                "-Dmaven.test.skip=true\n{}\n",
+                trusted_checksums::config_args(form).join("\n")
+            )
+        };
+        let wrapper = |version: &str| {
+            format!(
+                "distributionUrl=https://repo.maven.apache.org/maven2/org/apache/maven/\
+                 apache-maven/{version}/apache-maven-{version}-bin.zip\n"
+            )
+        };
+        let files = |config: String, maven: Option<&str>| {
+            let mut files = vec![
+                ("pom.xml", fixture("basic", "expected", "pom.xml")),
+                (".mvn/maven.config", config),
+                (
+                    ".mvn/checksums/checksums.sha256",
+                    fixture("basic", "expected", ".mvn/checksums/checksums.sha256"),
+                ),
+            ];
+            if let Some(version) = maven {
+                files.push((".mvn/wrapper/maven-wrapper.properties", wrapper(version)));
+            }
+            files
+        };
+        let codes = |outcome: &RestoreOutcome| -> Vec<&'static str> {
+            outcome.warnings.iter().map(|(code, _)| *code).collect()
+        };
+        let (left, trade) = (
+            "maven_trusted_checksums_left",
+            "maven_trusted_checksums_maven3_only",
+        );
+
+        // No Maven declared: healed to the form that breaks no build, and
+        // the trade is said beside the leftover-lines warning.
+        let (outcome, after) = run(&files(beside(Session), None)).await;
+        assert_eq!(outcome.pins[0].status, PinStatus::Restored);
+        assert_eq!(after["pom.xml"], fixture("basic", "input", "pom.xml"));
+        assert_eq!(after[".mvn/maven.config"], beside(Launcher));
+        assert_eq!(codes(&outcome), [left, trade], "{:?}", outcome.warnings);
+        let said = &outcome.warnings[1].1;
+        assert!(
+            said.contains("A Maven 4 build of this project no longer does")
+                && said.contains(".mvn/maven.config"),
+            "{said}"
+        );
+
+        // A Maven 3 named by the wrapper enforces either spelling: healed,
+        // nothing traded.
+        let (outcome, after) = run(&files(beside(Session), Some("3.9.9"))).await;
+        assert_eq!(after[".mvn/maven.config"], beside(Launcher));
+        assert_eq!(codes(&outcome), [left]);
+
+        // A project that declares Maven 4 keeps the spelling Maven 4
+        // reads, and gets it when the block is in the launcher's.
+        let (outcome, after) = run(&files(beside(Session), Some("4.0.0"))).await;
+        assert_eq!(after[".mvn/maven.config"], beside(Session));
+        assert_eq!(codes(&outcome), [left]);
+        let (outcome, after) = run(&files(beside(Launcher), Some("4.0.0"))).await;
+        assert_eq!(after[".mvn/maven.config"], beside(Session));
+        assert_eq!(codes(&outcome), [left]);
+
+        // Already this project's spelling: the bytes are not touched.
+        let (outcome, after) = run(&files(beside(Launcher), None)).await;
+        assert_eq!(after[".mvn/maven.config"], beside(Launcher));
+        assert_eq!(codes(&outcome), [left]);
+
+        // A directory line that stands apart is the user's, and stays.
+        let theirs = format!(
+            "-D{BASEDIR_KEY}={}\n-Dmaven.test.skip=true\n",
+            basedir_value(Session)
+        );
+        let (outcome, after) = run(&files(theirs.clone(), None)).await;
+        assert_eq!(after[".mvn/maven.config"], theirs);
+        assert_eq!(codes(&outcome), [left]);
     }
 
     #[tokio::test]

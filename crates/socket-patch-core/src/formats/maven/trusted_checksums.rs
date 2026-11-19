@@ -15,6 +15,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use super::declared_maven::{launcher_root, release, session_root, DeclaredMaven};
 use super::maven_config_line_properties;
 use crate::utils::digest::{is_hex64_lower, sha256_hex};
 
@@ -30,14 +31,30 @@ macro_rules! summary_file {
         "aether.trustedChecksumsSource.summaryFile"
     };
 }
-macro_rules! launcher_basedir {
+// The summary file's directory, under the project's root directory.
+macro_rules! checksums_dir {
     () => {
-        "${maven.multiModuleProjectDirectory}/.mvn/checksums"
+        "/.mvn/checksums"
     };
 }
-macro_rules! session_basedir {
-    () => {
-        "${session.rootDirectory}/.mvn/checksums"
+// The six lines, with the project's root directory named through the
+// property `$root` expands to: one definition for both spellings.
+macro_rules! config_args {
+    ($root:ident) => {
+        &[
+            concat!("-D", post_processor!(), "=true"),
+            concat!("-D", post_processor!(), ".checksumAlgorithms=SHA-256"),
+            concat!("-D", post_processor!(), ".failIfMissing=false"),
+            concat!("-D", summary_file!(), "=true"),
+            concat!(
+                "-D",
+                summary_file!(),
+                ".basedir=",
+                $root!(),
+                checksums_dir!()
+            ),
+            concat!("-D", summary_file!(), ".originAware=false"),
+        ]
     };
 }
 
@@ -49,114 +66,43 @@ const SUMMARY_FILE_KEY: &str = summary_file!();
 pub(crate) const BASEDIR_KEY: &str = concat!(summary_file!(), ".basedir");
 const ORIGIN_AWARE_KEY: &str = concat!(summary_file!(), ".originAware");
 
-/// How `.mvn/maven.config` spells the directory of the summary file.
+/// How `.mvn/maven.config` spells the directory of the summary file:
+/// `.mvn/checksums` under the project's root directory, named through one
+/// of the two properties a config line can name that directory through
+/// ([`RootDirectory`], where the measurements are). Maven reads a relative
+/// `basedir` from the local repository, so the directory in the checkout
+/// has to be named through a property, and no property is right on every
+/// Maven.
 ///
-/// Maven reads a relative `basedir` from the local repository, so the
-/// directory in the checkout has to be named through a property the
-/// launcher defines, and no property is right on every Maven. Measured
-/// with real Maven (3.6.3, 3.8.9, 3.9.0, 3.9.2 to 3.9.9, 3.9.16,
-/// 4.0.0-rc-7), from the project root, from a module directory and with
-/// `-f <project>/pom.xml` from outside the project, each with a genuine
-/// and a tampered artifact:
+/// What the spelling means for the pin, measured with a genuine and a
+/// tampered artifact from the project root, from a module directory and
+/// with `-f <project>/pom.xml` from outside the project:
 ///
-/// * `${session.rootDirectory}` is undefined on Maven 3.9.2 to 3.9.8 when
-///   the build is started with `-f` from outside the project, and Maven
-///   then does not start at all (`Illegal use of undefined property:
-///   session.rootDirectory`). From 3.9.9 on, and on Maven 4, it is defined
-///   in every invocation.
-/// * `${maven.multiModuleProjectDirectory}` is defined by every Maven 3
-///   launcher in every invocation, so it breaks no build and the pin is
-///   enforced from 3.9.4 on wherever the build is started. Maven 4 does
-///   not interpolate it: the directory is then not found, nothing is
-///   enforced, and the build runs as if the line were not there.
+/// * [`Basedir::Launcher`] breaks no build, and the pin is enforced from
+///   Maven 3.9.4 on wherever the build is started. On Maven 4 the directory
+///   is not found, nothing is enforced, and the build runs as if the line
+///   were not there.
+/// * [`Basedir::Session`] is enforced from Maven 3.9.4 on and on Maven 4,
+///   wherever the property is defined; where it is not (`-f` from outside
+///   the project on 3.9.2 to 3.9.8) Maven does not start.
 ///
 /// A Maven that interpolates neither (before 3.9.2) reads no summary file
 /// under either spelling.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Basedir {
-    /// `${maven.multiModuleProjectDirectory}`: breaks no build. The form
-    /// for every project that does not declare Maven 4.
-    Launcher,
-    /// `${session.rootDirectory}`: the form for a project that declares
-    /// Maven 4, the only Maven that needs it.
-    Session,
-}
+pub(crate) use super::declared_maven::RootDirectory as Basedir;
 
-impl Basedir {
-    /// The setting's value.
-    pub(crate) const fn value(self) -> &'static str {
-        match self {
-            Basedir::Launcher => launcher_basedir!(),
-            Basedir::Session => session_basedir!(),
-        }
-    }
-
-    const fn other(self) -> Basedir {
-        match self {
-            Basedir::Launcher => Basedir::Session,
-            Basedir::Session => Basedir::Launcher,
-        }
-    }
-
-    /// The form whose value is `value`.
-    pub(crate) fn from_value(value: &str) -> Option<Basedir> {
-        [Basedir::Launcher, Basedir::Session]
-            .into_iter()
-            .find(|form| form.value() == value)
-    }
-
-    /// The form `config` holds, as Maven 3.9+ reads the file.
-    pub(crate) fn of(config: &str) -> Option<Basedir> {
-        maven_config_line_properties(config)
-            .get(BASEDIR_KEY)
-            .and_then(|value| Basedir::from_value(value))
-    }
-
-    /// The form for a project, from what the project itself declares:
-    /// [`Basedir::Session`] when its Maven Wrapper (`wrapper`, the
-    /// properties file) pins Apache Maven 4 or later, or its root pom
-    /// (`root_pom`) is of a model only Maven 4 reads (4.1.0 or later,
-    /// named by `<modelVersion>` or by the pom's namespace); else
-    /// [`Basedir::Launcher`], which breaks no build.
-    pub(crate) fn for_project(wrapper: Option<&str>, root_pom: Option<&str>) -> Basedir {
-        let wrapped = wrapper
-            .and_then(wrapper_maven_version)
-            .is_some_and(|version| release(&version)[0] >= 4);
-        if wrapped || root_pom.is_some_and(is_maven_4_model) {
-            Basedir::Session
-        } else {
-            Basedir::Launcher
-        }
+/// The setting's value under `form`.
+pub(crate) const fn basedir_value(form: Basedir) -> &'static str {
+    match form {
+        Basedir::Launcher => concat!(launcher_root!(), checksums_dir!()),
+        Basedir::Session => concat!(session_root!(), checksums_dir!()),
     }
 }
 
-/// Whether `pom` is of a model newer than 4.0.0, which only Maven 4 reads.
-fn is_maven_4_model(pom: &str) -> bool {
-    use crate::formats::xml;
-    let newer = |version: &str| {
-        let mut parts = version.trim().split('.');
-        parts.next() == Some("4")
-            && parts
-                .next()
-                .and_then(|minor| minor.parse::<u32>().ok())
-                .is_some_and(|minor| minor >= 1)
-    };
-    let Ok(text) = xml::blank_non_markup(pom) else {
-        return false;
-    };
-    let Some(project) = xml::elements(&text, "project")
-        .ok()
-        .and_then(|found| found.first().copied())
-    else {
-        return false;
-    };
-    let model = xml::children(&text, &project, "modelVersion")
-        .ok()
-        .and_then(|found| found.first().map(|e| e.inner(&text).to_string()));
-    model.as_deref().is_some_and(newer)
-        || xml::attr(project.open_tag(&text), "xmlns")
-            .and_then(|namespace| namespace.rsplit('/').next())
-            .is_some_and(newer)
+/// The form whose value is `value`.
+pub(crate) fn basedir_of_value(value: &str) -> Option<Basedir> {
+    [Basedir::Launcher, Basedir::Session]
+        .into_iter()
+        .find(|form| basedir_value(*form) == value)
 }
 
 /// The `.mvn/maven.config` lines hosted mode writes, one argument each:
@@ -165,31 +111,30 @@ fn is_maven_4_model(pom: &str) -> bool {
 /// fails), and the summary-file source on, at `.mvn/checksums`, origin
 /// unaware (one checksum matches the artifact from any repository). The
 /// directory is spelled as [`Basedir::Launcher`]; see [`config_args`].
-pub(crate) const CONFIG_ARGS: &[&str] = &[
-    concat!("-D", post_processor!(), "=true"),
-    concat!("-D", post_processor!(), ".checksumAlgorithms=SHA-256"),
-    concat!("-D", post_processor!(), ".failIfMissing=false"),
-    concat!("-D", summary_file!(), "=true"),
-    concat!("-D", summary_file!(), ".basedir=", launcher_basedir!()),
-    concat!("-D", summary_file!(), ".originAware=false"),
-];
+pub(crate) const CONFIG_ARGS: &[&str] = config_args!(launcher_root);
 
-/// [`CONFIG_ARGS`] with the directory spelled as [`Basedir::Session`].
-const SESSION_CONFIG_ARGS: &[&str] = &[
-    concat!("-D", post_processor!(), "=true"),
-    concat!("-D", post_processor!(), ".checksumAlgorithms=SHA-256"),
-    concat!("-D", post_processor!(), ".failIfMissing=false"),
-    concat!("-D", summary_file!(), "=true"),
-    concat!("-D", summary_file!(), ".basedir=", session_basedir!()),
-    concat!("-D", summary_file!(), ".originAware=false"),
-];
+/// Where the directory line stands among the six.
+const BASEDIR_AT: usize = 4;
 
 /// The lines hosted mode writes for a project whose form is `form`.
 pub(crate) fn config_args(form: Basedir) -> &'static [&'static str] {
     match form {
         Basedir::Launcher => CONFIG_ARGS,
-        Basedir::Session => SESSION_CONFIG_ARGS,
+        Basedir::Session => config_args!(session_root),
     }
+}
+
+/// Each line of [`config_args`] as the `(key, value)` it sets.
+pub(crate) fn config_settings(
+    form: Basedir,
+) -> impl Iterator<Item = (&'static str, &'static str, &'static str)> {
+    config_args(form).iter().map(|arg| {
+        let (key, value) = arg
+            .strip_prefix("-D")
+            .and_then(|def| def.split_once('='))
+            .expect("every Trusted Checksums line hosted mode writes is -Dkey=value");
+        (*arg, key, value)
+    })
 }
 
 /// Whether `config` is exactly what hosted mode writes into a file of its
@@ -200,42 +145,47 @@ pub(crate) fn is_written_config(config: &str) -> bool {
         .any(|form| config == format!("{}\n", config_args(form).join("\n")))
 }
 
-/// `config` with the summary file's directory spelled as `form`, when it
-/// holds the six lines hosted mode writes in the other form: the one line
-/// is rewritten in place, every other byte kept. `None` when there is
-/// nothing to change.
+/// `config` with the summary file's directory spelled as `form`, wherever
+/// it holds the six lines hosted mode writes in the other form: that one
+/// line of each such block is rewritten in place, every other byte kept.
+/// `None` when there is nothing to change.
 ///
 /// The six lines must stand together, in the order hosted mode writes
-/// them, as it writes them into a config that set none of them. A
-/// directory line that stands apart was there before hosted mode came (it
-/// then appended only the settings that were missing), so it is the
-/// user's, and stays as they wrote it.
+/// them, as it writes them into a config that set none of them: that block
+/// is what tells hosted mode's settings from the user's, whatever else the
+/// file holds and whatever a later line sets. A directory line that stands
+/// apart was there before hosted mode came (it then appended only the
+/// settings that were missing), or is spelled exactly as Maven's own
+/// documentation spells it by a user who wrote it, and stays as written.
 ///
 /// This is how a project wired by an earlier release, whose line stops
 /// Maven 3.9.2 to 3.9.8 from starting with `-f` from outside the project,
-/// is healed on its next scan.
+/// is healed; and how a project that has since declared Maven 4 gets the
+/// spelling Maven 4 reads.
 pub(crate) fn heal_basedir(config: &str, form: Basedir) -> Option<String> {
-    if !config_enforces(config) || Basedir::of(config) != Some(form.other()) {
+    let written = config_args(form.other());
+    // The cheap test first: almost no config holds the other spelling.
+    if !config.contains(written[BASEDIR_AT]) {
         return None;
     }
-    let written = config_args(form.other());
     let lines: Vec<&str> = config.split_inclusive('\n').collect();
     let body = |line: &str| -> usize { line.trim_end_matches(['\r', '\n']).len() };
-    let block = (0..lines.len().checked_sub(written.len() - 1)?).find(|&at| {
-        written
-            .iter()
-            .enumerate()
-            .all(|(k, arg)| &lines[at + k][..body(lines[at + k])] == *arg)
-    })?;
-    let at = block
-        + written
-            .iter()
-            .position(|arg| arg.contains(BASEDIR_KEY))
-            .expect("the directory is one of the settings");
+    let healed: BTreeSet<usize> = (0..(lines.len() + 1).checked_sub(written.len())?)
+        .filter(|&at| {
+            written
+                .iter()
+                .zip(&lines[at..])
+                .all(|(arg, line)| &line[..body(line)] == *arg)
+        })
+        .map(|at| at + BASEDIR_AT)
+        .collect();
+    if healed.is_empty() {
+        return None;
+    }
     let mut out = String::with_capacity(config.len() + 32);
     for (i, line) in lines.iter().enumerate() {
-        if i == at {
-            out.push_str(&format!("-D{BASEDIR_KEY}={}", form.value()));
+        if healed.contains(&i) {
+            out.push_str(config_args(form)[BASEDIR_AT]);
             out.push_str(&line[body(line)..]);
         } else {
             out.push_str(line);
@@ -244,36 +194,83 @@ pub(crate) fn heal_basedir(config: &str, form: Basedir) -> Option<String> {
     Some(out)
 }
 
-/// Whether `.mvn/maven.config` makes Maven check artifacts against
-/// `.mvn/checksums/checksums.sha256` — the one rule every mode shares.
+/// Whether `config` holds the six lines hosted mode writes, standing
+/// together, in either spelling: whether some project is healed out of it
+/// ([`heal_basedir`]). A substring test for nearly every config, so a
+/// caller asks this before it reads anything else to find out which
+/// spelling the project takes.
+pub(crate) fn holds_written_block(config: &str) -> bool {
+    [Basedir::Launcher, Basedir::Session]
+        .into_iter()
+        .any(|form| heal_basedir(config, form).is_some())
+}
+
+/// The Trusted Checksums settings of a `.mvn/maven.config`, read once.
 ///
 /// `maven.config` is read as Maven 3.9+ reads it (the only line that
 /// enforces Trusted Checksums at all): one argument per LINE, `#`
 /// comments, `-Dk=v` / `--define`, `-Dk` alone meaning `true`, a later
 /// definition winning ([`maven_config_line_properties`]); a `-Dk=v` token
-/// inside a longer line is not an argument there. Each setting is then
-/// judged as the resolver judges it, with its default when unset:
-/// - the post-processor on (`ConfigUtils.getBoolean`, i.e. Java
-///   `Boolean.parseBoolean`: `true` in any case; default off);
-/// - its comma-separated `checksumAlgorithms` naming `SHA-256` (default
-///   `SHA-1`, which never reads a `.sha256` file);
-/// - the summary-file source on (default off);
-/// - its `basedir` exactly the `.mvn/checksums` hosted mode writes, in
-///   either spelling ([`Basedir`]; the default is `.checksums` under the
-///   local repository; any other value is not this file);
-/// - `originAware` off (default on, which reads a per-repository
-///   `checksums-<repo id>.sha256` instead).
-///
-/// `failIfMissing` does not decide whether a committed line is checked.
+/// inside a longer line is not an argument there.
+pub(crate) struct Settings(BTreeMap<String, String>);
+
+impl Settings {
+    /// Read `config`, a `.mvn/maven.config`'s text.
+    pub(crate) fn read(config: &str) -> Settings {
+        Settings(maven_config_line_properties(config))
+    }
+
+    /// What the config sets `key` to.
+    pub(crate) fn get(&self, key: &str) -> Option<&str> {
+        self.0.get(key).map(String::as_str)
+    }
+
+    /// The form the directory is spelled in, when it is one hosted mode
+    /// writes.
+    pub(crate) fn basedir(&self) -> Option<Basedir> {
+        self.get(BASEDIR_KEY).and_then(basedir_of_value)
+    }
+
+    /// Whether the config makes Maven check artifacts against
+    /// `.mvn/checksums/checksums.sha256` — the one rule every mode shares.
+    ///
+    /// Each setting is judged as the resolver judges it, with its default
+    /// when unset:
+    /// - the post-processor on (`ConfigUtils.getBoolean`, i.e. Java
+    ///   `Boolean.parseBoolean`: `true` in any case; default off);
+    /// - its comma-separated `checksumAlgorithms` naming `SHA-256` (default
+    ///   `SHA-1`, which never reads a `.sha256` file);
+    /// - the summary-file source on (default off);
+    /// - its `basedir` exactly the `.mvn/checksums` hosted mode writes, in
+    ///   either spelling ([`Basedir`]; the default is `.checksums` under
+    ///   the local repository; any other value is not this file);
+    /// - `originAware` off (default on, which reads a per-repository
+    ///   `checksums-<repo id>.sha256` instead).
+    ///
+    /// `failIfMissing` does not decide whether a committed line is checked.
+    /// Whether the Maven that builds the project then reads the directory
+    /// is [`enforcement`]'s to say.
+    pub(crate) fn enforce(&self) -> bool {
+        let is_true = |key: &str| {
+            self.get(key)
+                .is_some_and(|v| v.eq_ignore_ascii_case("true"))
+        };
+        is_true(SWITCH_KEY)
+            && self
+                .get(ALGORITHMS_KEY)
+                .is_some_and(|v| v.split(',').any(|a| a.trim() == "SHA-256"))
+            && is_true(SUMMARY_FILE_KEY)
+            && self.basedir().is_some()
+            && self
+                .get(ORIGIN_AWARE_KEY)
+                .is_some_and(|v| !v.eq_ignore_ascii_case("true"))
+    }
+}
+
+/// [`Settings::enforce`] of a config's text.
+#[cfg(test)]
 pub(crate) fn config_enforces(config: &str) -> bool {
-    let props = maven_config_line_properties(config);
-    let get = |key: &str| props.get(key).map(String::as_str);
-    let is_true = |key: &str| get(key).is_some_and(|v| v.eq_ignore_ascii_case("true"));
-    is_true(SWITCH_KEY)
-        && get(ALGORITHMS_KEY).is_some_and(|v| v.split(',').any(|a| a.trim() == "SHA-256"))
-        && is_true(SUMMARY_FILE_KEY)
-        && get(BASEDIR_KEY).is_some_and(|v| Basedir::from_value(v).is_some())
-        && get(ORIGIN_AWARE_KEY).is_some_and(|v| !v.eq_ignore_ascii_case("true"))
+    Settings::read(config).enforce()
 }
 
 /// Whether any setting hosted mode writes is present in `config`, whatever
@@ -282,10 +279,7 @@ pub(crate) fn config_enforces(config: &str) -> bool {
 /// warning keys on presence, not on enforcement.
 pub(crate) fn config_has_written_settings(config: &str) -> bool {
     let props = crate::formats::maven::maven_config_properties(config);
-    CONFIG_ARGS
-        .iter()
-        .filter_map(|arg| arg.strip_prefix("-D")?.split_once('='))
-        .any(|(key, _)| props.contains_key(key))
+    config_settings(Basedir::Launcher).any(|(_, key, _)| props.contains_key(key))
 }
 
 /// The first Maven release that enforces the `.mvn/*` Trusted Checksums
@@ -295,64 +289,70 @@ pub(crate) fn config_has_written_settings(config: &str) -> bool {
 /// no Trusted Checksums post-processor at all.
 const MIN_MAVEN: [u32; 3] = [3, 9, 4];
 
-/// The Apache Maven release a `maven-wrapper.properties` pins, taken from its
-/// `distributionUrl` (`…/apache-maven-<version>-bin.zip` or `.tar.gz`). None
-/// for a missing key or any other distribution (e.g. mvnd), which is then
-/// taken to enforce.
-pub(crate) fn wrapper_maven_version(props: &str) -> Option<String> {
-    props.lines().find_map(|line| {
-        let line = line.trim();
-        if line.starts_with('#') || line.starts_with('!') {
-            return None;
-        }
-        let rest = line.strip_prefix("distributionUrl")?;
-        if !rest.starts_with(|c: char| c == '=' || c == ':' || c.is_whitespace()) {
-            return None;
-        }
-        let value = rest
-            .trim_start()
-            .strip_prefix(['=', ':'])
-            .unwrap_or(rest)
-            .trim();
-        let file = value.rsplit('/').next()?;
-        let version = file
-            .strip_prefix("apache-maven-")?
-            .strip_suffix(".zip")
-            .or_else(|| file.strip_prefix("apache-maven-")?.strip_suffix(".tar.gz"))?
-            .strip_suffix("-bin")?;
-        (!version.is_empty()).then(|| version.to_string())
-    })
+/// Whether the summary file is an enforced pin, as far as the project
+/// says which Maven builds it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Enforcement {
+    /// The config does not make Maven read the summary file
+    /// ([`Settings::enforce`]).
+    Off,
+    /// The Maven Wrapper pins this Apache Maven release, which is older
+    /// than 3.9.4 and enforces no such file.
+    TooOld(String),
+    /// The project declares Maven 4 and the directory is spelled as
+    /// [`Basedir::Launcher`], which Maven 4 does not interpolate.
+    UnreadByMaven4,
+    /// The project declares no Maven and the directory is spelled as
+    /// [`Basedir::Launcher`]: Maven 3.9.4 and later 3.x enforce the pin, a
+    /// Maven 4 build does not. Nothing in the checkout says which builds
+    /// it, so the pin is not known to be enforced.
+    Maven3Only,
+    /// The Maven the project declares enforces the pin; or it declares
+    /// none, and the directory is spelled so that every Maven that
+    /// enforces Trusted Checksums at all finds it.
+    Enforced,
 }
 
-/// `[major, minor, patch]` of a Maven version (a pre-release suffix such as
-/// `-rc-6` compares as its release).
-fn release(version: &str) -> [u32; 3] {
-    let mut parts = [0u32; 3];
-    for (slot, part) in parts.iter_mut().zip(version.split(['.', '-'])) {
-        *slot = part.parse().unwrap_or(0);
+/// Whether the Maven the project declares (`maven`) enforces a pin whose
+/// directory is spelled as `form`, in a config that otherwise enforces it
+/// ([`Settings::enforce`]). The one answer to that question: the conflict
+/// check, the heal, the unenforced warning and discovery all ask it here.
+/// Never [`Enforcement::Off`].
+pub(crate) fn form_enforcement(form: Basedir, maven: &DeclaredMaven) -> Enforcement {
+    // A wrapper that pins a Maven 3 cannot build a pom only Maven 4 reads,
+    // so its release then says nothing about the Maven that does.
+    if let Some(version) = maven.release().filter(|_| !maven.maven_4_model()) {
+        if release(version) < MIN_MAVEN {
+            return Enforcement::TooOld(version.to_string());
+        }
     }
-    parts
+    if form.unread_by(maven) {
+        Enforcement::UnreadByMaven4
+    } else if form == Basedir::Launcher && maven.release().is_none() {
+        Enforcement::Maven3Only
+    } else {
+        Enforcement::Enforced
+    }
 }
 
-/// Whether Maven `version` enforces the Trusted Checksums files when the
-/// config spells their directory as `form`: from 3.9.4 on, and for
-/// [`Basedir::Launcher`] only below Maven 4, which does not interpolate
-/// that property.
-pub(crate) fn maven_enforces(version: &str, form: Basedir) -> bool {
-    let parts = release(version);
-    parts >= MIN_MAVEN && (form == Basedir::Session || parts[0] < 4)
+/// Whether the summary file is an enforced pin under `settings` in a
+/// project that declares `maven`.
+pub(crate) fn enforcement(settings: &Settings, maven: &DeclaredMaven) -> Enforcement {
+    match settings.basedir().filter(|_| settings.enforce()) {
+        Some(form) => form_enforcement(form, maven),
+        None => Enforcement::Off,
+    }
 }
 
-/// Whether the summary file is an enforced pin: [`config_enforces`], and a
-/// Maven Wrapper (`wrapper`, its properties) that names no Apache Maven
-/// release that does not enforce the config's form ([`maven_enforces`]).
-/// No wrapper, or one naming another distribution, is taken to enforce —
-/// the hosted rewriter's rule, which warns only on a release it can name.
-pub(crate) fn enforced(config: &str, wrapper: Option<&str>) -> bool {
-    config_enforces(config)
-        && wrapper
-            .and_then(wrapper_maven_version)
-            .is_none_or(|v| Basedir::of(config).is_some_and(|form| maven_enforces(&v, form)))
+/// Whether `text`, a `.mvn/checksums/checksums.sha256`, still names an
+/// artifact hosted mode pins: a path under a `<base>-socket.<hex8>`
+/// version, in any spelling of its line.
+pub(crate) fn names_hosted_artifact(text: &str) -> bool {
+    entries(text).any(|e| {
+        e.path
+            .split('/')
+            .any(|seg| super::split_socket_version(seg).is_some())
+    })
 }
 
 /// One non-comment line of the summary file, read as two fields.
@@ -750,62 +750,173 @@ mod tests {
         assert!(!config_has_written_settings(&format!("# {switch_line}")));
     }
 
+    fn wrapper(version: &str) -> String {
+        format!(
+            "distributionUrl=https\\://repo.maven.apache.org/maven2/org/apache/maven/\
+             apache-maven/{version}/apache-maven-{version}-bin.zip\n"
+        )
+    }
+
+    fn pom(model: &str) -> String {
+        format!(
+            "<project xmlns=\"http://maven.apache.org/POM/{model}\">\n  \
+             <modelVersion>{model}</modelVersion>\n</project>\n"
+        )
+    }
+
+    /// The two spellings are one definition: they differ in the directory
+    /// line alone, which stands where [`BASEDIR_AT`] says and names the
+    /// property of its form.
     #[test]
-    fn enforced_follows_the_wrapper_maven() {
-        let all = CONFIG_ARGS.join("\n");
-        let wrapper = |v: &str| {
-            format!("distributionUrl=https://repo/apache-maven/{v}/apache-maven-{v}-bin.zip\n")
-        };
-        assert!(enforced(&all, None));
-        assert!(enforced(&all, Some(&wrapper("3.9.4"))));
-        assert!(enforced(
-            &all,
-            Some("distributionUrl=https://x/maven-mvnd-1.0.2.zip\n")
+    fn the_two_spellings_differ_in_the_directory_line_alone() {
+        use Basedir::{Launcher, Session};
+        let (launcher, session) = (config_args(Launcher), config_args(Session));
+        assert_eq!(launcher, CONFIG_ARGS);
+        assert_eq!(launcher.len(), session.len());
+        for (i, (a, b)) in launcher.iter().zip(session).enumerate() {
+            assert_eq!(a == b, i != BASEDIR_AT, "{a} / {b}");
+        }
+        for form in [Launcher, Session] {
+            let line = config_args(form)[BASEDIR_AT];
+            assert_eq!(line, format!("-D{BASEDIR_KEY}={}", basedir_value(form)));
+            assert_eq!(
+                basedir_value(form),
+                format!("{}/.mvn/checksums", form.property())
+            );
+            assert_eq!(basedir_of_value(basedir_value(form)), Some(form));
+            let keys: Vec<&str> = config_settings(form).map(|(_, key, _)| key).collect();
+            assert_eq!(keys[BASEDIR_AT], BASEDIR_KEY);
+            assert_eq!(keys.len(), 6);
+        }
+        assert_eq!(basedir_of_value(".mvn/checksums"), None);
+    }
+
+    /// One function answers whether the Maven a project declares enforces
+    /// a spelling: from the wrapper AND the model.
+    #[test]
+    fn enforcement_follows_the_maven_the_project_declares() {
+        use Basedir::{Launcher, Session};
+        use Enforcement::{Enforced, Maven3Only, TooOld, UnreadByMaven4};
+        let declared = |wrapper: Option<&str>, pom: Option<&str>| DeclaredMaven::of(wrapper, pom);
+        let by_wrapper = |version: &str| declared(Some(&wrapper(version)), Some(&pom("4.0.0")));
+        // Too old for Trusted Checksums, whatever the spelling.
+        for old in ["3.6.3", "3.8.9", "3.9.0", "3.9.3"] {
+            for form in [Launcher, Session] {
+                assert_eq!(
+                    form_enforcement(form, &by_wrapper(old)),
+                    TooOld(old.to_string()),
+                    "{old}"
+                );
+            }
+        }
+        // A Maven 3 that enforces reads either spelling.
+        for maven_3 in ["3.9.4", "3.9.8", "3.9.16", "3.10.0-rc-1"] {
+            for form in [Launcher, Session] {
+                assert_eq!(form_enforcement(form, &by_wrapper(maven_3)), Enforced);
+            }
+        }
+        // Maven 4 reads only the session property: declared by the wrapper,
+        // by the model alone, or by the model under a Maven 3 wrapper that
+        // cannot build it.
+        for maven_4 in [
+            by_wrapper("4.0.0"),
+            by_wrapper("4.0.0-rc-7"),
+            declared(None, Some(&pom("4.1.0"))),
+            declared(Some(&wrapper("3.9.9")), Some(&pom("4.1.0"))),
+            declared(Some(&wrapper("3.8.9")), Some(&pom("4.1.0"))),
+        ] {
+            assert_eq!(form_enforcement(Session, &maven_4), Enforced, "{maven_4:?}");
+            assert_eq!(
+                form_enforcement(Launcher, &maven_4),
+                UnreadByMaven4,
+                "{maven_4:?}"
+            );
+        }
+        // Nothing declared (no wrapper, another distribution, a 4.0.0
+        // model): the launcher spelling is enforced by Maven 3 only, and
+        // which Maven builds the project is not known.
+        let mvnd = "distributionUrl=https://x/maven-mvnd-1.0.2-bin.zip\n";
+        for unknown in [
+            declared(None, None),
+            declared(None, Some(&pom("4.0.0"))),
+            declared(Some(mvnd), Some(&pom("4.0.0"))),
+        ] {
+            assert_eq!(form_enforcement(Launcher, &unknown), Maven3Only);
+            assert_eq!(form_enforcement(Session, &unknown), Enforced);
+        }
+    }
+
+    #[test]
+    fn enforcement_needs_a_config_that_reads_the_file() {
+        use Basedir::{Launcher, Session};
+        let written = |form| Settings::read(&config_args(form).join("\n"));
+        let unknown = DeclaredMaven::default();
+        assert_eq!(
+            enforcement(&written(Launcher), &unknown),
+            Enforcement::Maven3Only
+        );
+        assert_eq!(
+            enforcement(&written(Session), &unknown),
+            Enforcement::Enforced
+        );
+        let maven_3 = DeclaredMaven::of(Some(&wrapper("3.9.9")), None);
+        assert_eq!(
+            enforcement(&written(Launcher), &maven_3),
+            Enforcement::Enforced
+        );
+        // A config that does not enforce is off whatever the Maven, and
+        // never "too old": there is no pin for a Maven to ignore.
+        let off = Settings::read(&format!(
+            "{}\n-D{SWITCH_KEY}=false\n",
+            CONFIG_ARGS.join("\n")
         ));
-        assert!(!enforced(&all, Some(&wrapper("3.9.3"))));
-        assert!(!enforced("", None));
+        let old = DeclaredMaven::of(Some(&wrapper("3.9.0")), None);
+        for maven in [&unknown, &maven_3, &old] {
+            assert_eq!(enforcement(&off, maven), Enforcement::Off);
+            assert_eq!(enforcement(&Settings::read(""), maven), Enforcement::Off);
+        }
+        assert_eq!(
+            enforcement(&written(Launcher), &old),
+            Enforcement::TooOld("3.9.0".into())
+        );
     }
 
     #[test]
     fn the_directory_is_spelled_for_the_maven_the_project_declares() {
         use Basedir::{Launcher, Session};
-        let wrapper = |v: &str| {
-            format!(
-                "distributionUrl=https\\://repo.maven.apache.org/maven2/org/apache/maven/\
-                 apache-maven/{v}/apache-maven-{v}-bin.zip\n"
-            )
+        let form = |wrapper: Option<&str>, pom: Option<&str>| {
+            Basedir::for_maven(&DeclaredMaven::of(wrapper, pom))
         };
-        let pom = |model: &str| {
-            format!(
-                "<project xmlns=\"http://maven.apache.org/POM/4.0.0\">\n  \
-                 <modelVersion>{model}</modelVersion>\n</project>\n"
-            )
-        };
-        assert_eq!(Basedir::for_project(None, None), Launcher);
-        assert_eq!(Basedir::for_project(None, Some(&pom("4.0.0"))), Launcher);
+        assert_eq!(form(None, None), Launcher);
+        assert_eq!(form(None, Some(&pom("4.0.0"))), Launcher);
         for maven_3 in ["3.6.3", "3.9.2", "3.9.8", "3.9.16"] {
             assert_eq!(
-                Basedir::for_project(Some(&wrapper(maven_3)), Some(&pom("4.0.0"))),
+                form(Some(&wrapper(maven_3)), Some(&pom("4.0.0"))),
                 Launcher,
                 "{maven_3}"
             );
         }
         for maven_4 in ["4.0.0", "4.0.0-rc-7", "4.1.2"] {
             assert_eq!(
-                Basedir::for_project(Some(&wrapper(maven_4)), Some(&pom("4.0.0"))),
+                form(Some(&wrapper(maven_4)), Some(&pom("4.0.0"))),
                 Session,
                 "{maven_4}"
             );
         }
         // A model only Maven 4 reads, named by the element or the namespace.
-        assert_eq!(Basedir::for_project(None, Some(&pom("4.1.0"))), Session);
+        assert_eq!(form(None, Some(&pom("4.1.0"))), Session);
         let by_namespace = "<project xmlns=\"http://maven.apache.org/POM/4.1.0\">\n</project>\n";
-        assert_eq!(Basedir::for_project(None, Some(by_namespace)), Session);
+        assert_eq!(form(None, Some(by_namespace)), Session);
+        // A 4.0.0 model under the 4.1.0 namespace is a pom Maven 3.9.2 to
+        // 3.9.8 build, so it must not get the line that stops them.
+        let mixed = "<project xmlns=\"http://maven.apache.org/POM/4.1.0\">\n  \
+                     <modelVersion>4.0.0</modelVersion>\n</project>\n";
+        assert_eq!(form(None, Some(mixed)), Launcher);
         // A commented-out model is not the pom's.
         let commented = "<project>\n  <!-- <modelVersion>4.1.0</modelVersion> -->\n  \
                          <modelVersion>4.0.0</modelVersion>\n</project>\n";
-        assert_eq!(Basedir::for_project(None, Some(commented)), Launcher);
-        assert_eq!(Basedir::for_project(None, Some("not a pom")), Launcher);
+        assert_eq!(form(None, Some(commented)), Launcher);
+        assert_eq!(form(None, Some("not a pom")), Launcher);
     }
 
     #[test]
@@ -815,7 +926,7 @@ mod tests {
         for (form, other) in [(Launcher, Session), (Session, Launcher)] {
             let config = written(form);
             assert!(config_enforces(&config) && is_written_config(&config));
-            assert_eq!(Basedir::of(&config), Some(form));
+            assert_eq!(Settings::read(&config).basedir(), Some(form));
             assert_eq!(heal_basedir(&config, form), None);
             assert_eq!(
                 heal_basedir(&config, other).as_deref(),
@@ -827,11 +938,11 @@ mod tests {
         let mixed = format!("-B\r\n{}\r\n# end", config_args(Session).join("\r\n"));
         assert_eq!(
             heal_basedir(&mixed, Launcher),
-            Some(mixed.replace(Session.value(), Launcher.value()))
+            Some(mixed.replace(basedir_value(Session), basedir_value(Launcher)))
         );
         // A directory line that stands apart from the other five was there
         // before hosted mode appended them: the user's, left as written.
-        let theirs = format!("-D{BASEDIR_KEY}={}\n", Session.value());
+        let theirs = format!("-D{BASEDIR_KEY}={}\n", basedir_value(Session));
         let appended: Vec<&str> = config_args(Session)
             .iter()
             .copied()
@@ -841,7 +952,65 @@ mod tests {
         assert!(config_enforces(&merged));
         assert_eq!(heal_basedir(&merged, Launcher), None);
         assert_eq!(heal_basedir(&theirs, Launcher), None);
+        assert!(!holds_written_block(&merged) && !holds_written_block(&theirs));
+        assert!(holds_written_block(&mixed) && holds_written_block(&written(Launcher)));
+        assert!(!holds_written_block(""));
         assert!(!is_written_config(&merged));
         assert!(!is_written_config(&format!("-B\n{}", written(Launcher))));
+    }
+
+    /// The block is what marks the line as hosted mode's, not what the
+    /// settings come to: the line stops Maven from starting whether or not
+    /// the pin is enforced.
+    #[test]
+    fn the_block_is_healed_whatever_else_the_config_sets() {
+        use Basedir::{Launcher, Session};
+        let block = |form| config_args(form).join("\n");
+        for extra in [
+            // A later line switches the pin off, or names another directory.
+            format!("-D{SWITCH_KEY}=false"),
+            format!("-D{BASEDIR_KEY}=/opt/checksums"),
+            "-Daether.trustedChecksumsSource.summaryFile.originAware=true".to_string(),
+            "-T4".to_string(),
+        ] {
+            let config = format!("{}\n{extra}\n", block(Session));
+            assert_eq!(
+                heal_basedir(&config, Launcher),
+                Some(format!("{}\n{extra}\n", block(Launcher))),
+                "{extra}"
+            );
+        }
+        // Every block in the file, when an earlier run left two.
+        let twice = format!("{}\n-B\n{}\n", block(Session), block(Session));
+        assert_eq!(
+            heal_basedir(&twice, Launcher),
+            Some(format!("{}\n-B\n{}\n", block(Launcher), block(Launcher)))
+        );
+        // Five of the six, or the six in another order, are not the block.
+        let five = config_args(Session)[1..].join("\n");
+        assert_eq!(heal_basedir(&five, Launcher), None);
+        let mut shuffled = config_args(Session).to_vec();
+        shuffled.swap(0, 1);
+        assert_eq!(heal_basedir(&shuffled.join("\n"), Launcher), None);
+        // An indented or quoted line is not the line hosted mode wrote.
+        let indented = block(Session).replace(
+            "-Daether.trustedChecksumsSource",
+            " -Daether.trustedChecksumsSource",
+        );
+        assert_eq!(heal_basedir(&indented, Launcher), None);
+    }
+
+    #[test]
+    fn a_checksum_file_names_a_hosted_artifact_by_its_suffixed_version() {
+        assert!(names_hosted_artifact(&format!("{A}  {OURS}\n")));
+        // In any spelling of the line: it is still hosted mode's path.
+        assert!(names_hosted_artifact(&format!(
+            "{}\t*{OURS}\r\n",
+            A.to_uppercase()
+        )));
+        assert!(!names_hosted_artifact(&format!(
+            "{A}  org/x/1.0/x-1.0.jar\n# {B}  {OURS}\n"
+        )));
+        assert!(!names_hosted_artifact(""));
     }
 }

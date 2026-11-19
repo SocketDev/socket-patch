@@ -1072,21 +1072,51 @@ Honest limits of the Maven and NuGet flows — documented behavior, not bugs:
     Maven 4 does not interpolate it: a Maven 4 build of such a project runs as if the
     pin were not there.
   - `${session.rootDirectory}/.mvn/checksums` is written for a project that declares
-    Maven 4: its Maven Wrapper pins Apache Maven 4, or its root `pom.xml` is of model
-    4.1.0 or later. Maven 4 defines it in every invocation. Releases up to 5.1.0 wrote
-    this form for every project, which stopped **Maven 3.9.2 to 3.9.8** from starting at
-    all with `-f` from outside the project (`Illegal use of undefined property:
-    session.rootDirectory`).
+    Maven 4: its Maven Wrapper pins Apache Maven 4, or its root `pom.xml` is of a model
+    newer than 4.0.0 (its `<modelVersion>`, or with none, the version its namespace
+    names; `<modelVersion>4.0.0</modelVersion>` under the 4.1.0 namespace is a 4.0.0 pom,
+    which Maven 3 builds). Maven 4 defines the property in every invocation. Releases up
+    to 5.1.0 wrote this form for every project, which stopped **Maven 3.9.2 to 3.9.8**
+    from starting at all with `-f` from outside the project (`Illegal use of undefined
+    property: session.rootDirectory`).
 
-  A project wired by an earlier release is healed by its next `scan --mode hosted`: the
-  one line is rewritten in place (`redirect_maven_config`, `rewritten`), provided the six
-  settings stand together as hosted mode wrote them. A directory line you wrote yourself
-  is yours and is left alone, as is any other setting; `rollback` and `remove` recognise
-  either form.
+  If Maven 4 builds your project and nothing in the checkout says so, declare it: with
+  the default form a Maven 4 build does not enforce the pin, and the CLI cannot see
+  which Maven you run.
 
-  When `.mvn/wrapper/maven-wrapper.properties` pins a Maven older than 3.9.4, the rewriter
-  still writes the files and warns `redirect_maven_trusted_checksums_unenforced`. Without
-  a Maven Wrapper, the CLI can't tell which Maven builds the project, so it doesn't warn.
+  **A project wired by an earlier release is healed.** Every `scan --mode hosted` that
+  finds the six settings standing together as hosted mode wrote them, in the spelling
+  that is not this project's, rewrites that one line in place (`redirect_maven_config`,
+  `rewritten`, `key: "trustedChecksumsDirectory"`). It does so whatever the scan
+  redirects: when no patch applies any more (a dependency bumped past its patched
+  version), in a reactor root, when no checksum line is left, when a later line switches
+  the pin off. A scan with nothing to redirect reads `.mvn/maven.config` for this alone
+  and takes the write lock for the change when it can. The heal never fails a run: when
+  the lock is held elsewhere, or `.mvn/maven.config` is a symbolic link, the line is
+  left for a later scan. `rollback` and `remove` do the same to a config they leave in
+  place. A directory line you wrote yourself (one
+  that stands apart from the other five) is yours and is left alone, as is any other
+  setting; `rollback` and `remove` recognise either form.
+
+  The heal can trade something away, and says so. Taking `${session.rootDirectory}` out
+  of a project that declares no Maven means a Maven 4 build of it no longer enforces the
+  pin (Maven 3.9.4 and later 3.x still do). The run that changes the line warns
+  `redirect_maven_trusted_checksums_maven3_only` (`maven_trusted_checksums_maven3_only`
+  from `rollback` / `remove`). Declare Maven 4 and scan again to get the form Maven 4
+  reads back.
+
+  When the Maven the project declares does not enforce the pin as the config stands, the
+  rewriter still writes the files and warns `redirect_maven_trusted_checksums_unenforced`,
+  on every scan while that holds:
+  - `.mvn/wrapper/maven-wrapper.properties` pins a Maven older than 3.9.4 (upgrade the
+    wrapper);
+  - the project declares Maven 4 and the directory line is one you wrote in the
+    launcher's spelling, which Maven 4 does not read (set it to
+    `${session.rootDirectory}/.mvn/checksums`). The scan that first meets that line also
+    reports it as `redirect_maven_trusted_checksums_conflict`.
+
+  Without a Maven Wrapper or a newer model, the CLI can't tell which Maven builds the
+  project, so it doesn't warn.
   On Maven **3.9.4–3.9.8** a *mismatch* is enforced but reported unclearly; the
   readability fix landed in **3.9.9**
   ([MNG-8182](https://issues.apache.org/jira/browse/MNG-8182)). The args are
@@ -1094,11 +1124,16 @@ Honest limits of the Maven and NuGet flows — documented behavior, not bugs:
   from any repository and a dependency with no committed checksum still resolves — only a
   *mismatch* fails. A grant whose sha256 is not 64 hex digits writes no checksum line
   (and drops any line an earlier run wrote for that suffixed version) and warns
-  `redirect_maven_trusted_checksums_invalid_hash`. `vex` attests a pin's checksum only
-  when `maven.config` enforces the file as Maven 3.9+ reads it (all five settings above
-  with the values hosted writes, the directory in either form; `failIfMissing` aside) and
-  the wrapper, if any, pins a Maven that enforces that form (3.9.4 or later, and below
-  Maven 4 for the default form).
+  `redirect_maven_trusted_checksums_invalid_hash`. `vex` takes a pin's checksum as the
+  content the project pins only when the pin is known to be enforced: `maven.config`
+  enforces the file as Maven 3.9+ reads it (all five settings above with the values
+  hosted writes, the directory in either form; `failIfMissing` aside), and the Maven the
+  project declares reads the directory as the config spells it (a wrapper that pins
+  Maven 3.9.4 or later, and below Maven 4 for the default form; Maven 4, by the wrapper
+  or the model, for the `${session.rootDirectory}` form). A project that declares no
+  Maven and carries the default form is enforced by Maven 3 only, so its checksum is not
+  taken; the statement itself does not depend on it, since the suffixed version is the
+  pin.
 * **A Maven project's scan is scoped to its dependency graph.** The Maven local
   repository is shared by every project on the machine, so in project mode (no
   `--global` / `--global-prefix`) a Maven build's crawl (a `pom.xml`, no Gradle or
