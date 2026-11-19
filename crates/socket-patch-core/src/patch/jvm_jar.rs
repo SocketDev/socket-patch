@@ -1920,21 +1920,9 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn a_copy_past_the_limits_is_refused_before_it_is_parsed() {
-        let entries = 200_001u64;
-        let mut hostile = vec![0u8; entries as usize * 46];
-        let at = hostile.len() as u64;
-        hostile.extend_from_slice(b"PK\x06\x06");
-        hostile.extend_from_slice(&[0; 20]);
-        hostile.extend_from_slice(&entries.to_le_bytes());
-        hostile.extend_from_slice(&entries.to_le_bytes());
-        hostile.extend_from_slice(&(entries * 46).to_le_bytes());
-        hostile.extend_from_slice(&[0; 8]);
-        hostile.extend_from_slice(b"PK\x06\x07\0\0\0\0");
-        hostile.extend_from_slice(&at.to_le_bytes());
-        hostile.extend_from_slice(&1u32.to_le_bytes());
-        hostile.extend_from_slice(b"PK\x05\x06\0\0\0\0");
-        hostile.extend_from_slice(&[0xff; 12]);
-        hostile.extend_from_slice(&[0; 2]);
+        // With bytes after its end records: the reader finds them all the same.
+        let mut hostile = crate::patch::jar_members::testing::declares_entries(200_001, 0);
+        hostile.extend_from_slice(&[0u8; 70_000]);
         let limit = "it holds 200001 entries, over the limit of 200000";
         let files = record();
         assert_eq!(
