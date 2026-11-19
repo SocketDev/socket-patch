@@ -2386,6 +2386,11 @@ fn omission_phrase(reason: &str) -> &'static str {
         "go_vendor_content_mismatch" => "the native Go vendor tree does not contain the patch; run go mod vendor (or go work vendor for a workspace)",
         "vendor_artifact_missing" => "the vendored artifact is missing",
         "vendor_artifact_unreadable" => "the vendored artifact cannot be read",
+        "vendor_artifact_too_large" => {
+            "the vendored jar is past the limits jars are read within (200,000 entries, or 1 GiB \
+             and 100 times its own size inflated), so its contents were not checked; run \
+             socket-patch repair to restore the recorded jar"
+        }
         "vendor_artifact_non_canonical" => {
             "the vendored tarball holds a second entry the package manager would extract \
              over a patched file (another top-level directory, a second spelling of the \
@@ -2688,6 +2693,7 @@ mod tests {
             "no_files",
             "vendor_hash_mismatch",
             "vendor_artifact_missing",
+            "vendor_artifact_too_large",
             "vendor_manifest_unverifiable",
             "stale_install",
             STALE_INSTALL_UNVERIFIED,

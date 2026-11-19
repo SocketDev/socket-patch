@@ -1296,6 +1296,11 @@ pub(super) const GRADLE_MAVEN_LOCAL_UNDETERMINED: &str = "gradle_maven_local_und
 /// `$HOME/.gradle`.
 pub(super) const GRADLE_USER_HOME_DIFFERS: &str = "gradle_user_home_differs";
 
+/// Run-level warning: the project's `.mvn/maven.config` names one local
+/// repository to Maven before 3.9 and another to later Mavens, both exist
+/// and nothing says which Maven builds it, so neither was scanned.
+pub(crate) const MAVEN_LOCAL_REPOSITORY_UNDETERMINED: &str = "maven_local_repository_undetermined";
+
 /// What a scan learned about the Gradle side of discovery.
 #[derive(Default)]
 struct GradleScan {
@@ -1386,7 +1391,11 @@ async fn gradle_scan(
             &cwd,
             socket_patch_core::vendor::jvm::layout::BuildTool::Gradle,
         );
-        let env = JvmEnv::from_process();
+        let env = if global {
+            JvmEnv::from_process()
+        } else {
+            JvmEnv::for_project(&cwd)
+        };
         let gate = (!global && gradle_build).then(|| m2_gate(&cwd, &env));
         // The cwd's build locks annotate Gradle-cached packages in a global
         // run too; without a Gradle build at the cwd there is nothing to
@@ -1459,6 +1468,10 @@ async fn gradle_scan(
             }
         }
         _ => {}
+    }
+    if let Some(why) = &env.m2_undetermined {
+        out.notes
+            .push((MAVEN_LOCAL_REPOSITORY_UNDETERMINED.to_string(), why.clone()));
     }
     if let Some((home, passwd)) = mismatch {
         out.notes.push((

@@ -4384,6 +4384,11 @@ const PINNED_REFERENCES: &[(&str, &str, &str)] = &[
         "fetch_registry_bytes(url, MAX_POM_BYTES as u64).await",
     ),
     (
+        "vendor/maven_repo.rs",
+        "fetch_registry_bytes",
+        "let upstream = fetch_registry_bytes(&url, super::registry_fetch::MAX_DOWNLOAD_BYTES).await;",
+    ),
+    (
         "vendor/lock_inventory/mod.rs",
         "recover_lock_entry",
         "pub use self::recover::recover_lock_entry;",

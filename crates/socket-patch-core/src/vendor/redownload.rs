@@ -158,19 +158,31 @@ pub async fn restore(
         {
             return Err("the downloaded artifact does not match the recorded size".into());
         }
-        let members = if entry.ecosystem == "pypi" {
-            super::pypi_distribution::read_members(&archive.bytes, &entry.artifact.path)?
-        } else if entry.artifact.path.ends_with(".tgz") || entry.artifact.path.ends_with(".tar.gz")
-        {
-            crate::patch::package::read_archive_bytes_to_map_strict(&archive.bytes)
-                .map_err(|e| e.to_string())?
+        if entry.artifact.path.ends_with(".jar") {
+            // A jar is read by name, case and all, by the JVM: the
+            // installer-shaped strictness of the wheel reader (ASCII names,
+            // no case-colliding pair) refuses obfuscated jars that hold
+            // both `a.class` and `A.class`, and its size caps refuse large
+            // ones. The record's members are hashed within the jar limits.
+            super::verify::verify_jar_bytes_members(&archive.bytes, &record.files).map_err(
+                |(tag, why)| format!("{tag}: the downloaded jar cannot be verified: {why}"),
+            )?;
         } else {
-            super::verify::read_zip_bytes_to_map_strict(&archive.bytes)?
-        };
-        if entry.ecosystem == "pypi" {
-            super::pypi_distribution::verify_members(&members, &entry.artifact.path, record)?;
-        } else {
-            super::verify::verify_member_map(&members, record)?;
+            let members = if entry.ecosystem == "pypi" {
+                super::pypi_distribution::read_members(&archive.bytes, &entry.artifact.path)?
+            } else if entry.artifact.path.ends_with(".tgz")
+                || entry.artifact.path.ends_with(".tar.gz")
+            {
+                crate::patch::package::read_archive_bytes_to_map_strict(&archive.bytes)
+                    .map_err(|e| e.to_string())?
+            } else {
+                super::verify::read_zip_bytes_to_map_strict(&archive.bytes)?
+            };
+            if entry.ecosystem == "pypi" {
+                super::pypi_distribution::verify_members(&members, &entry.artifact.path, record)?;
+            } else {
+                super::verify::verify_member_map(&members, record)?;
+            }
         }
         tokio::fs::create_dir_all(uuid_dir)
             .await

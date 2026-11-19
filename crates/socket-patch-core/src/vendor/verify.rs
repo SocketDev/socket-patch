@@ -5,13 +5,17 @@
 //! manifest claims the patch modified must hash (git-blob sha256) to its
 //! `afterHash` inside that artifact — the same standard `vex::verify` applies
 //! to installed trees. Dir-shaped ecosystems are hashed in place; npm
-//! tarballs and zip artifacts (`.whl`/`.nupkg`/`.jar`) are decoded in memory
+//! tarballs and zip artifacts (`.whl`/`.nupkg`) are decoded in memory
 //! (bounded — the artifacts are committed and tamper-able, so a crafted
-//! archive must not OOM an audit).
+//! archive must not OOM an audit). A `.jar` has its record members hashed
+//! as they are inflated, within the jar limits of
+//! [`crate::patch::jar_members`]: released jars are larger than the
+//! wheel-sized caps of the in-memory reader allow.
 //!
 //! Fail-closed order (each failure is a stable snake_case routing tag):
 //! `no_files` → `vendor_path_unsafe` → `vendor_uuid_mismatch` →
 //! `vendor_artifact_missing` → `vendor_artifact_unreadable` /
+//! `vendor_artifact_too_large` /
 //! `file_not_found` / `vendor_hash_mismatch` / `vendor_inventory_mismatch` /
 //! `vendor_manifest_unverifiable`
 //! (dir-shaped artifacts with a recorded [`file_inventory`] additionally
@@ -129,9 +133,15 @@ pub async fn verify_vendored_patch_record(
         return super::pypi_distribution::verify_members(&members, &entry.artifact.path, record);
     }
     let path_str = artifact.to_string_lossy();
+    if path_str.ends_with(".jar") {
+        let files = record.files.clone();
+        tokio::task::spawn_blocking(move || verify_jar_file_members(&artifact, &files))
+            .await
+            .map_err(|_| "vendor_artifact_unreadable".to_string())??;
+        return super::bun_workspace::verify(project_root, entry).await;
+    }
     let is_tarball = path_str.ends_with(".tgz") || path_str.ends_with(".tar.gz");
-    let is_zip =
-        path_str.ends_with(".whl") || path_str.ends_with(".nupkg") || path_str.ends_with(".jar");
+    let is_zip = path_str.ends_with(".whl") || path_str.ends_with(".nupkg");
     if !is_tarball && !is_zip {
         let cargo_uuid = (entry.ecosystem == "cargo").then_some(entry.uuid.as_str());
         match gem_platform_trees(&artifact, entry).await? {
@@ -610,6 +620,76 @@ async fn untagged_manifest_matches(dir: &Path, uuid: &str, after_hash: &str) -> 
         .is_some_and(|b| compute_git_sha256_from_bytes(&b).eq_ignore_ascii_case(after_hash))
 }
 
+/// A jar past the limits of [`crate::patch::jar_members`]: its own tag, so
+/// the omission says the jar is too large, not that it cannot be read.
+pub(crate) const ARTIFACT_TOO_LARGE: &str = "vendor_artifact_too_large";
+
+fn jar_error_tag(e: crate::patch::jar_members::JarError) -> String {
+    if e.is_too_large() {
+        ARTIFACT_TOO_LARGE.to_string()
+    } else {
+        "vendor_artifact_unreadable".to_string()
+    }
+}
+
+/// Every record file at its `afterHash` in the committed jar at `jar`:
+/// only those members are inflated, each through the hasher.
+fn verify_jar_file_members(
+    jar: &Path,
+    files: &HashMap<String, PatchFileInfo>,
+) -> Result<(), String> {
+    // The shared guarded opener, as for a wheel: a FIFO planted at the
+    // artifact path fails the audit instead of wedging it.
+    let (file, metadata) = crate::utils::fs::open_regular_file_sync(jar)
+        .map_err(|_| "vendor_artifact_unreadable".to_string())?;
+    let jar = crate::patch::jar_members::Jar::open(std::io::BufReader::new(file), metadata.len())
+        .map_err(jar_error_tag)?;
+    verify_jar_members(jar, files).map_err(|(tag, _)| tag)
+}
+
+/// [`verify_jar_file_members`] over a jar already in memory. The error is
+/// `(routing tag, what a limit or the archive said)`.
+pub(crate) fn verify_jar_bytes_members(
+    jar: &[u8],
+    files: &HashMap<String, PatchFileInfo>,
+) -> Result<(), (String, String)> {
+    let jar = crate::patch::jar_members::Jar::of_bytes(jar)
+        .map_err(|e| (jar_error_tag(e.clone()), e.to_string()))?;
+    verify_jar_members(jar, files)
+}
+
+fn verify_jar_members<R: Read + std::io::Seek>(
+    mut jar: crate::patch::jar_members::Jar<R>,
+    files: &HashMap<String, PatchFileInfo>,
+) -> Result<(), (String, String)> {
+    for (file_name, info) in files {
+        // The two spellings `verify_member_map` looks a member up by.
+        let key = normalize_file_path(file_name);
+        let mut hash = None;
+        for name in [key, file_name.as_str()] {
+            hash = jar
+                .member_git_sha256(name)
+                .map_err(|e| (jar_error_tag(e.clone()), e.to_string()))?;
+            if hash.is_some() || key == file_name {
+                break;
+            }
+        }
+        let Some(hash) = hash else {
+            return Err((
+                "file_not_found".to_string(),
+                format!("it has no member `{key}`"),
+            ));
+        };
+        if !hash.eq_ignore_ascii_case(&info.after_hash) {
+            return Err((
+                "vendor_hash_mismatch".to_string(),
+                format!("its member `{key}` is not the patched file"),
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn read_wheel_to_map(whl: &Path) -> Result<HashMap<String, Vec<u8>>, String> {
     // The shared guarded opener: non-blocking open + regular-file check on
     // the handle, so a FIFO planted at the artifact path fails the audit
@@ -623,7 +703,10 @@ fn read_wheel_to_map(whl: &Path) -> Result<HashMap<String, Vec<u8>>, String> {
 
 /// [`read_wheel_to_map`] over in-memory zip bytes — the same entry and
 /// decompressed-size caps — for callers that hash and decode the SAME
-/// buffer (a committed wheel read exactly once).
+/// buffer (a committed wheel read exactly once). Jars have their own
+/// reader ([`crate::patch::jar_members`]), which leaves this one to the
+/// fixtures and the tests.
+#[cfg(any(test, feature = "test-fixtures"))]
 pub(crate) fn read_zip_bytes_to_map(bytes: &[u8]) -> Result<HashMap<String, Vec<u8>>, String> {
     read_zip_to_map(std::io::Cursor::new(bytes), false)
 }
@@ -876,7 +959,8 @@ pub enum ArtifactHealth {
     Missing,
     /// Present but failing verification: rebuildable. `reason` is the
     /// stable routing tag (`vendor_hash_mismatch`, `file_not_found`,
-    /// `vendor_artifact_unreadable`, `vendor_sha256_mismatch`,
+    /// `vendor_artifact_unreadable`, `vendor_artifact_too_large`,
+    /// `vendor_sha256_mismatch`,
     /// `vendor_inventory_mismatch`, `vendor_workspace_artifact_missing`,
     /// `vendor_workspace_artifact_corrupt`).
     Corrupt { reason: String },
@@ -942,6 +1026,7 @@ pub async fn check_vendored_artifact(
                 "vendor_hash_mismatch"
                 | "file_not_found"
                 | "vendor_artifact_unreadable"
+                | ARTIFACT_TOO_LARGE
                 | "vendor_artifact_non_canonical"
                 | "vendor_inventory_mismatch"
                 | "vendor_workspace_artifact_missing"
@@ -1023,6 +1108,29 @@ pub async fn describe_artifact_failure(
                 format!("; the committed artifact {path} it mirrors is intact")
             };
             format!("Bun workspace copy {mirror} {cause} ({reason}){canonical}; {repair}")
+        }
+        ArtifactHealth::Corrupt { reason } if reason == ARTIFACT_TOO_LARGE => {
+            // Which limit: the archive's own (entries, central directory),
+            // else a patched member's inflated size.
+            let jar = project_root.join(path);
+            let limit = tokio::task::spawn_blocking(move || {
+                let (file, metadata) = crate::utils::fs::open_regular_file_sync(&jar).ok()?;
+                let reader = std::io::BufReader::new(file);
+                match crate::patch::jar_members::Jar::open(reader, metadata.len()) {
+                    Err(e) if e.is_too_large() => Some(e.to_string()),
+                    _ => None,
+                }
+            })
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| {
+                "a patched member inflates past what a jar of its size may".to_string()
+            });
+            format!(
+                "committed artifact {path} is past the limits jars are read within: {limit} \
+                 ({reason}); {repair}"
+            )
         }
         ArtifactHealth::Corrupt { reason } => {
             let cause = match reason.as_str() {
