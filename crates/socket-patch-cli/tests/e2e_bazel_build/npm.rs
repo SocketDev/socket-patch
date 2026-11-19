@@ -61,10 +61,12 @@
 //! the unpatched one before the command and after it. The flow asserts
 //! that; that every form of `vex` writes a document that says the package
 //! is affected, and names the call of `MODULE.bazel` that builds it from
-//! the lock; and that hosted mode, which the document names, then ends in
-//! the patched build and in a document that says not affected. Tests that
-//! need no Bazel run the same steps in a copy of the fixture, and in
-//! workspaces where the statement must stay as it is without Bazel.
+//! the lock; that `vex --no-bazel`, for a repository that ships the
+//! installed tree, says not affected of that tree while the build is still
+//! the unpatched one; and that hosted mode, which the document names, then
+//! ends in the patched build and in a document that says not affected.
+//! Tests that need no Bazel run the same steps in a copy of the fixture,
+//! and in workspaces where the statement must stay as it is without Bazel.
 //!
 //! A marker is read from what Bazel built. Bazel's downloader keeps every
 //! file it fetches in the repository cache, under its checksum, and hands it
@@ -885,7 +887,11 @@ fn pins_the_lock(cell: &Cell, standin: &StandIn, patch: &Patched) -> Tree {
 ///   from, the call of `MODULE.bazel` that reads it, and hosted mode,
 ///   which patches that lock.
 /// - (c) The same two Bazel commands print the unpatched marker again, as
-///   the document said, and `vex` says affected again.
+///   the document said, and `vex` says affected again. `vex --no-bazel`
+///   says not affected ([`speaks_of_the_installed_tree`]): its document
+///   then speaks of `node_modules`, which holds the patch, and not of the
+///   Bazel build, which is still the unpatched one. It is for a repository
+///   that ships what its package manager installed.
 /// - (d) What the document says to do: `scan --mode hosted --yes` pins the
 ///   patch in the lock ([`pins_the_lock`]), the same two Bazel commands
 ///   print the patched marker, with the tarball from the stand-in patch
@@ -915,6 +921,9 @@ fn agent_npm_translate_lock() {
     assert_eq!(changed(&patched, &cell.tree()), NOTHING, "{test}");
     let run = |cell: &Cell, args: &[&str]| socket_patch(cell, &standin, args);
     cell.stands_alone(run, &Claim::unbuilt(PURL, &patch.uuid, &names), true);
+    // Told that the installed tree is what ships, `vex` attests that tree.
+    speaks_of_the_installed_tree(&cell, &standin, &patch);
+    assert_eq!(changed(&patched, &cell.tree()), NOTHING, "{test}");
 
     // (d) Hosted mode patches what Bazel builds, and `vex` says so.
     let pinned = pins_the_lock(&cell, &standin, &patch);
@@ -928,7 +937,8 @@ fn agent_npm_translate_lock() {
 
     println!(
         "{test}: Bazel {release} built {:?} before and after `scan --mode agent` patched {}; \
-         every form of `vex` said the package is affected, and named {names:?}; after \
+         every form of `vex` said the package is affected, and named {names:?}, and \
+         `vex --no-bazel` said it is not affected in the installed tree; after \
          `scan --mode hosted` it built {:?}, and `vex` said it is not affected; {:?}",
         upstream.marker,
         store(),
@@ -987,12 +997,14 @@ fn checkout(project: &str) -> (Cell, StandIn, Patched, String) {
 
 /// The action statement of a package of the fixture's checkout that is
 /// affected because `patch` is in its installed copy alone: it names the
-/// lock and its `call` as [`names`] gives them first.
+/// lock and its `call` as [`names`] gives them first, and ends with the
+/// option for a repository that ships the installed tree.
 fn action(patch: &Patched, call: &str) -> String {
     format!(
         "Bazel builds this package {call}, which does not name Socket patch {}: the patch is \
          only in the installed copy. Run `socket-patch scan --mode hosted` in the directory of \
-         that lock to pin the patch there.",
+         that lock to pin the patch there. If what you ship is the installed tree and not what \
+         Bazel builds, pass `--no-bazel` (`--vex-no-bazel` on scan, apply and vendor).",
         patch.uuid
     )
 }
@@ -1038,6 +1050,113 @@ fn an_installed_patch_is_affected_beside_a_hub_that_reads_the_lock() {
 
     // What the document says to do ends in one that says not affected.
     pins_the_lock(&cell, &standin, &patch);
+}
+
+/// `vex --no-bazel` in the checkout of `cell`, where `patch` is in the
+/// installed copy alone and a hub builds the package from the lock, so
+/// that `vex` says affected: it exits 0, reports the package as verified
+/// and warns of nothing, and its one statement says not affected, through
+/// the patch. The document then speaks of `node_modules`, which a
+/// repository that ships its installed tree puts in what it ships, and not
+/// of what Bazel builds.
+fn speaks_of_the_installed_tree(cell: &Cell, standin: &StandIn, patch: &Patched) {
+    let path = cell.document("installed");
+    let args = ["vex", "--no-bazel", "--output"];
+    let vex = socket_patch(
+        cell,
+        standin,
+        &[&args[..], &[path.to_str().expect("a path")]].concat(),
+    );
+    let (test, said) = (&cell.test, &vex.dump);
+    assert_eq!(vex.code, 0, "{test}: {said}");
+    assert_eq!(vex.envelope["status"], "success", "{test}: {said}");
+    let verified = [(canonical_purl(PURL), "verified".into(), String::new())];
+    assert_eq!(reported(&vex.envelope), verified, "{test}: {said}");
+    let warned = codes_in(&vex.envelope["warnings"]);
+    assert_eq!(warned, NOTHING, "{test}: {said}");
+    let written = std::fs::read_to_string(&path).expect("a document");
+    let document: Value = serde_json::from_str(&written).expect("a JSON document");
+    let statements = document["statements"].as_array().map(Vec::as_slice);
+    let Some([statement]) = statements else {
+        panic!("{test}: not one statement:\n{written}");
+    };
+    let says = ["status", "impact_statement", "action_statement"].map(|key| &statement[key]);
+    let impact = json!(format!("Patched via Socket patch {}", patch.uuid));
+    let expected = [&json!("not_affected"), &impact, &Value::Null];
+    assert_eq!(says, expected, "{test}: {written}");
+}
+
+/// Without a Bazel: a repository that ships what its package manager
+/// installed, beside a hub that reads the same lock. Every form says
+/// affected, as [`an_installed_patch_is_affected_beside_a_hub_that_reads_the_lock`]
+/// holds. With `--no-bazel` on `vex`, `--vex-no-bazel` on `apply` and on
+/// `scan --mode agent`, or `SOCKET_VEX_NO_BAZEL=1` on any of them, the
+/// document attests the package through the patch, and the run is the one
+/// of the same checkout without its `MODULE.bazel`, to a script and to a
+/// person: the exit code, both streams byte for byte, and what the document
+/// says. In that checkout, which is no Bazel workspace, the option changes
+/// nothing and no run remarks on it.
+#[test]
+fn the_option_makes_the_run_the_one_of_a_checkout_without_bazel() {
+    let (cell, standin, patch, entry) = checkout("");
+    let names = names(&cell, MODULE, LOCK);
+    patches_the_installed_copy(&cell, &standin, "", &patch, &entry, Some(&names));
+    speaks_of_the_installed_tree(&cell, &standin, &patch);
+
+    let origin = standin.origin();
+    let registry = format!("{origin}/{REGISTRY}");
+    let env = [
+        ("SOCKET_PATCH_SERVER_URL", origin.as_str()),
+        ("SOCKET_NPM_REGISTRY", registry.as_str()),
+        ("SOCKET_VEX_NO_BAZEL", "1"),
+    ];
+    let document = cell.document("shipped");
+    let scan = ["scan", "--mode", "agent", "--yes"];
+    let forms = [
+        (
+            vec!["vex", "--output", document.to_str().expect("a path")],
+            "--no-bazel",
+        ),
+        (
+            [&["apply"][..], &with_vex(&document)].concat(),
+            "--vex-no-bazel",
+        ),
+        ([&scan[..], &with_vex(&document)].concat(), "--vex-no-bazel"),
+    ];
+    let gives = |args: &[&str], env: &[(&str, &str)]| cell.gives(&origin, args, env, &document);
+    let claim = Claim::new(PURL, &patch.uuid, How::Agent);
+    let mut beside_the_hub = Vec::new();
+    for (args, option) in &forms {
+        let with_option = [&args[..], &[*option]].concat();
+        if args[0] != "vex" {
+            let ran = socket_patch(&cell, &standin, &with_option);
+            cell.wrote_in_run(&ran, &document, &claim);
+        }
+        beside_the_hub.push([gives(&with_option, &env[..2]), gives(args, &env)]);
+    }
+
+    let patched = cell.tree();
+    std::fs::remove_file(cell.path(MODULE)).expect(MODULE);
+    for ((args, option), [by_option, by_variable]) in forms.iter().zip(&beside_the_hub) {
+        let without_bazel = gives(args, &env[..2]);
+        assert_eq!(*by_option, without_bazel, "{args:?} {option}");
+        assert_eq!(
+            *by_variable, without_bazel,
+            "{args:?}, SOCKET_VEX_NO_BAZEL=1"
+        );
+        let outside = gives(&[&args[..], &[*option]].concat(), &env[..2]);
+        assert_eq!(outside, without_bazel, "{args:?} {option}, no {MODULE}");
+        for run in without_bazel.as_array().into_iter().flatten() {
+            let says = [&run["code"], &run["document"]["statements"][0]["status"]];
+            assert_eq!(
+                says,
+                [&json!(0), &json!("not_affected")],
+                "{args:?}: {run:#}"
+            );
+        }
+        println!("{args:?} with {option}, and without {MODULE}:\n{without_bazel:#}");
+    }
+    assert_eq!(changed(&patched, &cell.tree()), [MODULE], "{}", cell.test);
 }
 
 /// Without a Bazel: the installed patch is affected beside a second patch

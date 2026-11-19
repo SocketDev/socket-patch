@@ -755,6 +755,7 @@ pub const LOCAL_ARG_ENV_VARS: &[&str] = &[
     "SOCKET_VEX_OUTPUT",
     "SOCKET_VEX_PRODUCT",
     "SOCKET_VEX_NO_VERIFY",
+    "SOCKET_VEX_NO_BAZEL",
     "SOCKET_VEX_DOC_ID",
     "SOCKET_VEX_COMPACT",
 ];
@@ -1558,10 +1559,12 @@ mod tests {
             ("SOCKET_DOWNLOAD_ONLY", &["socket-patch", "repair"]),
             ("SOCKET_VENDOR_REVERT", &["socket-patch", "vendor"]),
             ("SOCKET_VEX_NO_VERIFY", &["socket-patch", "vex"]),
+            ("SOCKET_VEX_NO_BAZEL", &["socket-patch", "vex"]),
             ("SOCKET_VEX_COMPACT", &["socket-patch", "vex"]),
             // The embedded `--vex-*` twins share the same env vars and must
             // not abort host commands (e.g. apply from a CI step).
             ("SOCKET_VEX_NO_VERIFY", &["socket-patch", "apply"]),
+            ("SOCKET_VEX_NO_BAZEL", &["socket-patch", "vendor"]),
             ("SOCKET_VEX_COMPACT", &["socket-patch", "scan"]),
         ];
 

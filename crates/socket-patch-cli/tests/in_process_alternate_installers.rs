@@ -1250,6 +1250,7 @@ async fn apply_check_and_vex_see_unpatched_member_named_like_a_build_dir() {
             output: Some(vex_path.clone()),
             product: Some("pkg:npm/root@1.0.0".to_string()),
             no_verify: false,
+            no_bazel: false,
             doc_id: None,
             compact: false,
         })
@@ -1321,6 +1322,7 @@ async fn apply_check_and_vex_see_unpatched_member_in_a_hidden_dir() {
             output: Some(vex_path.clone()),
             product: Some("pkg:npm/root@1.0.0".to_string()),
             no_verify: false,
+            no_bazel: false,
             doc_id: None,
             compact: false,
         })

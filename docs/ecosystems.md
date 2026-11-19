@@ -2319,11 +2319,13 @@ merged into one such statement, so each action statement is about one package; t
     { "@id": "pkg:npm/shop@1.0.0", "subcomponents": [{ "@id": "pkg:npm/left-pad@1.3.0" }] }
   ],
   "status": "affected",
-  "action_statement": "Bazel builds this package from pnpm-lock.yaml (`npm.npm_translate_lock`, MODULE.bazel:6), which does not name Socket patch 7a11e000-...: the patch is only in the installed copy. Run `socket-patch scan --mode hosted` in the directory of that lock to pin the patch there."
+  "action_statement": "Bazel builds this package from pnpm-lock.yaml (`npm.npm_translate_lock`, MODULE.bazel:6), which does not name Socket patch 7a11e000-...: the patch is only in the installed copy. Run `socket-patch scan --mode hosted` in the directory of that lock to pin the patch there. If what you ship is the installed tree and not what Bazel builds, pass `--no-bazel` (`--vex-no-bazel` on scan, apply and vendor)."
 }
 ```
 
-For a vendored PyPI package the action statement is:
+The last sentence is for a repository that ships the installed tree (see `--no-bazel` below).
+For a vendored PyPI package the action statement does not have it, since the installed tree is
+not the patched one there either:
 
 ```
 Bazel builds no package from the line of requirements.txt that points at the copy of Socket patch 7a11e000-... under .socket/vendor (`pip.parse`, MODULE.bazel:15): the build fails, or takes the registry's package. Run `socket-patch vendor --revert`, then `socket-patch scan --mode hosted`.
@@ -2335,7 +2337,7 @@ package and the document says `not_affected`.
 A run tells a person the same in a warning (`vex_bazel_not_in_build`, one per package):
 
 ```
-Warning: pkg:npm/left-pad@1.3.0: the VEX document says affected. Bazel builds this package from pnpm-lock.yaml (`npm.npm_translate_lock`, MODULE.bazel:6), which does not name Socket patch 7a11e000-...: the patch is only in the installed copy. Run `socket-patch scan --mode hosted` in the directory of that lock to pin the patch there.
+Warning: pkg:npm/left-pad@1.3.0: the VEX document says affected. Bazel builds this package from pnpm-lock.yaml (`npm.npm_translate_lock`, MODULE.bazel:6), which does not name Socket patch 7a11e000-...: the patch is only in the installed copy. Run `socket-patch scan --mode hosted` in the directory of that lock to pin the patch there. If what you ship is the installed tree and not what Bazel builds, pass `--no-bazel` (`--vex-no-bazel` on scan, apply and vendor).
 ```
 
 Nothing is left out of the document for this reason, so the document is always written:
@@ -2352,8 +2354,13 @@ person reads counts them too: `Wrote OpenVEX document with 2 statements (1 affec
 out.json`. `--no-verify` changes none of this.
 
 When a hub reads the project's own lock, the document describes what Bazel builds from that
-lock, also for a repository that ships what its package manager installed and keeps the
-hub for something else, such as its tests.
+lock. A repository that ships what its package manager installed (a container image built
+with `pnpm install` and `socket-patch apply`, say) and keeps the hub for something else, such
+as its tests, says so with `--no-bazel` on `vex`, with `--vex-no-bazel` on `scan`, `apply` and
+`vendor`, or with `SOCKET_VEX_NO_BAZEL=1` in the environment. The Bazel workspace is then not
+read: the document describes the installed tree, and it, the warnings, the exit code and
+every line of the run are those of the same checkout without its Bazel files. The option
+changes nothing outside a Bazel workspace.
 
 Nothing changes where the files do not show such a call: outside a Bazel workspace, in a
 `--global` run, for a hosted pin, for a project whose own lock no call names, and wherever

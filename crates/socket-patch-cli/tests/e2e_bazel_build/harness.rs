@@ -1150,6 +1150,27 @@ impl Cell {
         assert!(!stderr.contains("Error"), "{said}");
     }
 
+    /// What `socket-patch <args>`, a command that is to write its document
+    /// to `path`, gives a script and a person: of a run with `--json` and
+    /// of one without, the exit code, all it printed on stdout and on
+    /// stderr, and what the document it wrote says ([`wording`]: all but
+    /// its id and its times), null when it left none. Two commands that
+    /// give the same differ in nothing a script or a person sees.
+    pub fn gives(&self, api: &str, args: &[&str], env: &[(&str, &str)], path: &Path) -> Value {
+        let run = |form: &[&str]| {
+            let _ = std::fs::remove_file(path);
+            let mut cmd = self.socket_patch_command(api, &[args, form].concat(), env);
+            let out = cmd.output().expect("spawn socket-patch");
+            let [stdout, stderr] = [out.stdout, out.stderr]
+                .map(|stream| String::from_utf8_lossy(&stream).into_owned());
+            let written = path
+                .exists()
+                .then(|| wording(document_at(&self.test, path).1));
+            json!({ "code": out.status.code(), "stdout": stdout, "stderr": stderr, "document": written })
+        };
+        json!([run(&["--json"]), run(&[])])
+    }
+
     /// Where a flow has `socket-patch` write the VEX document `name`:
     /// beside the workspace copy, so it is no file of the checkout, and no
     /// comparison of the checkout's files sees it.

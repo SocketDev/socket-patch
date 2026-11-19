@@ -301,6 +301,7 @@ fn short_help_hidden_own(sub: &str) -> &'static [&'static str] {
             "all_releases",
             "vex_product",
             "vex_no_verify",
+            "vex_no_bazel",
             "vex_doc_id",
             "vex_compact",
             "no_socket_yml",
@@ -308,9 +309,21 @@ fn short_help_hidden_own(sub: &str) -> &'static [&'static str] {
             "max_new_patches",
         ],
         "get" => &["id", "cve", "ghsa", "package", "save_only", "all_releases"],
-        "vex" => &["doc_id", "compact"],
-        "apply" => &["vex_product", "vex_no_verify", "vex_doc_id", "vex_compact"],
-        "vendor" => &["vex_product", "vex_no_verify", "vex_doc_id", "vex_compact"],
+        "vex" => &["no_bazel", "doc_id", "compact"],
+        "apply" => &[
+            "vex_product",
+            "vex_no_verify",
+            "vex_no_bazel",
+            "vex_doc_id",
+            "vex_compact",
+        ],
+        "vendor" => &[
+            "vex_product",
+            "vex_no_verify",
+            "vex_no_bazel",
+            "vex_doc_id",
+            "vex_compact",
+        ],
         _ => &[],
     }
 }
