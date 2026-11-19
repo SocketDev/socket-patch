@@ -803,7 +803,7 @@ fn print_coverage(
 /// The uuids of the patches an agent run left applied: the ones its nested
 /// apply wrote, the ones it found already in place, and the ones whose
 /// code is not in the build installed here
-/// ([`skip_leaves_patched`](crate::commands::apply::skip_leaves_patched)),
+/// ([`skip_leaves_patched`](crate::json_envelope::skip_leaves_patched)),
 /// as `apply --check` and `vex` count them.
 fn patched_uuids(outcome: &Envelope) -> HashSet<&str> {
     outcome
@@ -812,7 +812,7 @@ fn patched_uuids(outcome: &Envelope) -> HashSet<&str> {
         .filter(|event| match event.action {
             PatchAction::Applied => true,
             PatchAction::Skipped => {
-                crate::commands::apply::skip_leaves_patched(event.error_code.as_deref())
+                crate::json_envelope::skip_leaves_patched(event.error_code.as_deref())
             }
             _ => false,
         })

@@ -366,7 +366,7 @@ fn summary_line(
     let in_place = distinct(
         &mut events(reports, "skipped")
             .filter(|event| {
-                crate::commands::apply::skip_leaves_patched(text(event, "errorCode").as_deref())
+                crate::json_envelope::skip_leaves_patched(text(event, "errorCode").as_deref())
             })
             .filter(|event| !applied.contains(&text(event, "purl"))),
     );

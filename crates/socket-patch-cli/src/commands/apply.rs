@@ -2611,20 +2611,6 @@ impl LeftCopy {
     }
 }
 
-/// Whether a `skipped` apply event with this `errorCode` reports a package
-/// that is patched as far as it can be on this install: every file already
-/// holds the patch (`already_patched`), or the build installed there holds
-/// none of the code the patch changes (`not_in_platform_build`). Whatever
-/// counts the patches a run left in place reads it through this, so that
-/// it agrees with `apply --check` and `vex`. A `native_extension_not_rebuilt`
-/// skip is not one: that patch is not in effect.
-pub(crate) fn skip_leaves_patched(error_code: Option<&str>) -> bool {
-    matches!(
-        error_code,
-        Some("already_patched") | Some(gem_ext::NOT_IN_BUILD_CODE)
-    )
-}
-
 /// One gem-env fallback-home copy the fan-out skipped best-effort (a
 /// bundle-store copy applied; this shared-home copy mismatched or failed
 /// to write). Carries what the warning must name: the package, the copy's
@@ -4766,26 +4752,6 @@ mod tests {
             assert_eq!(v["errorCode"], code);
             assert_eq!(v["reason"], "not part of it", "{code}");
             assert_eq!(v["purl"], purl, "{code}");
-        }
-    }
-
-    /// Only a skip that leaves the package patched as far as it can be
-    /// counts as landed: one already patched, and one whose code is not
-    /// in the build installed here. A patch written without effect, a
-    /// package that is not installed and a vendored one are not.
-    #[test]
-    fn only_a_skip_with_nothing_left_to_do_leaves_the_package_patched() {
-        assert!(skip_leaves_patched(Some("already_patched")));
-        assert!(skip_leaves_patched(Some(gem_ext::NOT_IN_BUILD_CODE)));
-        assert!(skip_leaves_patched(Some("not_in_platform_build")));
-        for code in [
-            Some(gem_ext::NOT_REBUILT_REASON),
-            Some("package_not_installed"),
-            Some("vendored"),
-            Some("gem_fallback_home_skipped"),
-            None,
-        ] {
-            assert!(!skip_leaves_patched(code), "{code:?}");
         }
     }
 
