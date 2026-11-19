@@ -65,6 +65,20 @@ const PATCHED_LIB: &str = "module StaleProbeGem\n  def self.status\n    \"PATCHE
 const UPSTREAM_ARCHIVE: &[u8] = b"upstream-gem-archive-bytes";
 const PATCHED_ARCHIVE: &[u8] = b"patched-gem-archive-bytes";
 
+/// `path` as the CLI prints it in a suggested shell command: unquoted when
+/// every character is safe, else single-quoted (mirrors `gem_refresh`'s
+/// `shell_word`), so the expectations hold on Windows and in a temp dir
+/// whose path has a space.
+fn shell_word(path: &Path) -> String {
+    let text = path.display().to_string();
+    let safe = |c: char| c.is_ascii_alphanumeric() || "_@%+=:,./-".contains(c);
+    if !text.is_empty() && text.chars().all(safe) {
+        text
+    } else {
+        format!("'{}'", text.replace('\'', "'\\''"))
+    }
+}
+
 fn patched_archive_sha256() -> String {
     use sha2::Digest as _;
     hex::encode(sha2::Sha256::digest(PATCHED_ARCHIVE))
@@ -2562,6 +2576,153 @@ async fn refresh_after_rollback_restores_the_upstream_gem() {
     );
 }
 
+/// #2086: `rollback` / `remove` of a hosted gem whose patched copy sits in
+/// a shared gem home leave that copy alone and warn about it. The warning
+/// names no re-run with `--gem-refresh-shared`: the first run removed the
+/// wiring, so a second one has nothing to unwind. It names the
+/// project-local path, and the files whose removal makes `bundle install`
+/// fetch the upstream gem into the shared home. The generic reinstall note
+/// does not claim that the next install replaces the copy.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn hosted_unwind_names_no_rerun_for_a_shared_gem_home() {
+    const UNWINDS: [&[&str]; 2] = [&["rollback", "--yes"], &["remove", PURL, "--yes"]];
+    for (unwind, json) in UNWINDS
+        .into_iter()
+        .flat_map(|unwind| [(unwind, false), (unwind, true)])
+    {
+        let case = format!("{unwind:?} json={json}");
+        let server = MockServer::start().await;
+        let (patched, upstream) = (real_gem(PATCHED_LIB), real_gem(UPSTREAM_LIB));
+        mount_api_for(&server, None, &sha256_of(&patched)).await;
+        serve_patched_gem(&server, patched.clone()).await;
+        serve_upstream_gem(&server, &upstream).await;
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        write_manifest_pair(&proj);
+        let home = tmp.path().join("system-home");
+        let bin_dir = tmp.path().join("fake-bin");
+        stage_system_home_copy(&home, &bin_dir);
+        let gem_dir = install_real_gem(&home, UPSTREAM_LIB);
+        let leaf = format!("{DEP}-{DEP_VERSION}");
+        let cache = home.join("cache").join(format!("{leaf}.gem"));
+        let spec = home.join("specifications").join(format!("{leaf}.gemspec"));
+
+        // The shared copy becomes the patched build.
+        let uri = server.uri();
+        let rubygems = format!("{uri}/upstream");
+        let env = [
+            ("PATH", bin_dir.to_str().unwrap()),
+            ("SOCKET_RUBYGEMS_URL", rubygems.as_str()),
+        ];
+        let (code, _, stderr) = common::run_with_env(
+            &proj,
+            &scan_args(&proj, &uri, &["--json", "--gem-refresh-shared"]),
+            &env,
+        );
+        assert_eq!(code, 0, "{case}: {stderr}");
+        assert_eq!(installed_lib(&gem_dir), PATCHED_LIB, "{case}: premise");
+        std::fs::write(proj.join("Gemfile.lock"), converged_lock(&uri)).unwrap();
+        let held_before = snapshot(&home);
+
+        let mut args = unwind.to_vec();
+        args.extend([
+            "--cwd",
+            proj.to_str().unwrap(),
+            "--api-url",
+            uri.as_str(),
+            "--org",
+            ORG,
+            "--api-token",
+            "fake",
+            "--patch-server-url",
+            uri.as_str(),
+        ]);
+        if json {
+            args.push("--json");
+        }
+        let (code, stdout, stderr) = common::run_with_env(&proj, &args, &env);
+        assert_eq!(code, 0, "{case}:\n{stdout}\n{stderr}");
+        let lock = std::fs::read_to_string(proj.join("Gemfile.lock")).unwrap();
+        assert!(!lock.contains("/patch-registry/"), "{case}:\n{lock}");
+        assert!(
+            snapshot(&home) == held_before,
+            "{case}: the shared gem home is left alone"
+        );
+
+        let remove_files = format!("{} {}", shell_word(&spec), shell_word(&cache));
+        let warning = if json {
+            let env = common::parse_json_envelope(&stdout);
+            let details = details_with_code(&env, "upstream_gem_stale_install");
+            assert_eq!(details.len(), 1, "{case}: {env}");
+            // rollback's run-level advisory defers to the gem warning.
+            if unwind[0] == "rollback" {
+                let reinstall = details_with_code(&env, "reinstall_required");
+                assert_eq!(reinstall.len(), 1, "{case}: {env}");
+                assert!(
+                    reinstall[0].contains("`bundle install` keeps an installed gem"),
+                    "{case}: {}",
+                    reinstall[0]
+                );
+            }
+            assert!(
+                details[0].contains(&format!(
+                    "remove {}, {} and run `bundle install`",
+                    spec.display(),
+                    cache.display()
+                )),
+                "{case}: {}",
+                details[0]
+            );
+            details[0].clone()
+        } else {
+            assert_eq!(
+                stderr.matches("still holds the patched build").count(),
+                1,
+                "{case}: one warning:\n{stderr}"
+            );
+            assert!(
+                stderr.contains(&format!("run `rm -f {remove_files} && bundle install`")),
+                "{case}: the remedy as a command:\n{stderr}"
+            );
+            if unwind[0] == "rollback" {
+                assert!(
+                    stdout.contains("1 unwired package keeps its patched bytes")
+                        && stdout.contains("`bundle install` keeps")
+                        && !stdout.contains("package-manager install."),
+                    "{case}: the note defers to the gem warning:\n{stdout}"
+                );
+            }
+            stderr.clone()
+        };
+        assert!(
+            warning.contains("bundle config set --local path vendor/bundle && bundle install"),
+            "{case}: {warning}"
+        );
+        assert!(
+            !warning.contains("--gem-refresh-shared") && !warning.to_lowercase().contains("re-run"),
+            "{case}: a second unwind has nothing to unwind: {warning}"
+        );
+
+        // Why no re-run is named: the wiring is gone.
+        let mut again = args.clone();
+        again.push("--gem-refresh-shared");
+        let (code, stdout, stderr) = common::run_with_env(&proj, &again, &env);
+        assert_eq!(code, 1, "{case}: premise:\n{stdout}\n{stderr}");
+        let nothing = match (json, unwind[0]) {
+            (true, _) => "\"status\": \"error\"",
+            (false, "rollback") => "nothing to roll back",
+            (false, _) => "nothing to remove",
+        };
+        assert!(
+            format!("{stdout}{stderr}").contains(nothing),
+            "{case}: premise: a second unwind finds nothing:\n{stdout}\n{stderr}"
+        );
+        assert!(snapshot(&home) == held_before, "{case}");
+    }
+}
+
 /// A registry that is refused (plain http, and not this machine) is not
 /// asked what the upstream gem is. `rollback` still puts the lock back,
 /// leaves the installed copy as it is, and says so: the copy is reported as
@@ -3435,8 +3596,14 @@ async fn vendored_unwind_warns_once_in_a_human_run() {
                        back to the upstream registry";
         assert_eq!(stderr.matches(warning).count(), 1, "{unwind:?}: {stderr}");
         assert!(
-            stderr.contains(&format!("rm -f {}", project_home(&proj).display()))
-                && stderr.contains(&format!("{} && bundle install", archive.display())),
+            stderr.contains(&format!(
+                "rm -f {}",
+                shell_word(
+                    &project_home(&proj)
+                        .join("specifications")
+                        .join(format!("{DEP}-{DEP_VERSION}.gemspec"))
+                )
+            )) && stderr.contains(&format!("{} && bundle install", shell_word(&archive))),
             "{unwind:?}: {stderr}"
         );
         assert!(
