@@ -1418,6 +1418,81 @@ mod tests {
         assert!(fixed < 480, "the whole warning stays short: {fixed}");
     }
 
+    /// #2086: an unwind leaves nothing for a second run to unwind, so the
+    /// warning about a shared gem home names no re-run with
+    /// `--gem-refresh-shared`. It names what works once the wiring is
+    /// gone: the project-local path, or the files to remove before
+    /// `bundle install` fetches the upstream gem into the shared home.
+    #[tokio::test]
+    async fn an_unwind_names_no_rerun_for_a_shared_home() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (proj, home) = (tmp.path().join("proj"), tmp.path().join("gemhome"));
+        std::fs::create_dir_all(&proj).unwrap();
+        let stale = vec![
+            installed("rack", &home, false),
+            installed("rexml", &home, false),
+        ];
+        let policy = policy(&proj, true, false, false);
+        let pass = attempt(
+            &stale,
+            unobtainable,
+            &Source::DiskOnly,
+            &policy,
+            Direction::Upstream,
+        )
+        .await;
+        assert!(pass.refreshed.is_empty(), "a shared home is never tried");
+        let out = report(Direction::Upstream, &stale, &pass, &policy);
+        let file = |dir: &str, name: &str| home.join(dir).join(name).display().to_string();
+
+        assert_eq!(out.warnings.len(), 2, "one --json warning per gem");
+        for ((code, detail), name) in out.warnings.iter().zip(["rack", "rexml"]) {
+            assert_eq!(*code, "upstream_gem_stale_install");
+            assert!(
+                !detail.contains("--gem-refresh-shared")
+                    && !detail.to_lowercase().contains("re-run"),
+                "a second unwind has nothing to unwind: {detail}"
+            );
+            for needle in [
+                "the shared gem home still holds its patched install",
+                LOCAL_PATH_REMEDY,
+                &file("specifications", &format!("{name}-1.0.0.gemspec")),
+                &file("cache", &format!("{name}-1.0.0.gem")),
+                "and run `bundle install`",
+            ] {
+                assert!(detail.contains(needle), "missing {needle:?}: {detail}");
+            }
+        }
+
+        let summary = out.summary.expect("a summary");
+        assert_eq!(
+            summary.headline,
+            "2 gems still hold the patched build on disk after the switch back to the upstream \
+             registry"
+        );
+        assert_eq!(
+            summary.bullets,
+            vec![
+                format!(
+                    "Shared gem home {} (left alone, other projects may load it): rack 1.0.0, \
+                     rexml 1.0.0.",
+                    home.display()
+                ),
+                format!(
+                    "`bundle install` reuses an installed gem instead of fetching the upstream \
+                     one. To install them for this project only, run `bundle config set --local \
+                     path vendor/bundle && bundle install`. To replace the shared copies, run \
+                     `rm -f {} {} {} {} && bundle install`; another project that loads them \
+                     needs a `bundle install` too.",
+                    file("specifications", "rack-1.0.0.gemspec"),
+                    file("cache", "rack-1.0.0.gem"),
+                    file("specifications", "rexml-1.0.0.gemspec"),
+                    file("cache", "rexml-1.0.0.gem"),
+                ),
+            ]
+        );
+    }
+
     /// A copy that could not be checked against the upstream gem (the
     /// registry that would say is refused) is reported with the reason and
     /// the files to remove, apart from the copies known to be stale: it is
