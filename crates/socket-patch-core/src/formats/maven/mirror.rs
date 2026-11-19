@@ -132,8 +132,15 @@ fn matches_layout(layouts: Option<&str>, layout: &str) -> bool {
     matched
 }
 
+/// Whether `mirror` names the repository `id`: its `<mirrorOf>` is the
+/// id, or lists it as an id of its own (`central,socket-patch-<uuid>`),
+/// each segment compared as written, as Maven compares it.
+fn names(mirror: &Mirror, id: &str) -> bool {
+    mirror.mirror_of.split(',').any(|segment| segment == id)
+}
+
 /// The mirror Maven uses for the repository `id` at `url`, and whether it
-/// names that repository alone (its `<mirrorOf>` is the id).
+/// names that repository ([`names`]).
 pub(crate) fn select<'m>(mirrors: &'m [Mirror], id: &str, url: &str) -> Option<(&'m Mirror, bool)> {
     let layout_ok = |m: &&Mirror| matches_layout(m.layouts.as_deref(), LAYOUT);
     let exact = mirrors.iter().filter(layout_ok).find(|m| m.mirror_of == id);
@@ -142,7 +149,7 @@ pub(crate) fn select<'m>(mirrors: &'m [Mirror], id: &str, url: &str) -> Option<(
             .iter()
             .filter(layout_ok)
             .find(|m| matches_pattern(&m.mirror_of, id, url))
-            .map(|m| (m, false))
+            .map(|m| (m, names(m, id)))
     })
 }
 
@@ -160,8 +167,10 @@ pub(crate) fn merge(dominant: Vec<Mirror>, recessive: Vec<Mirror>) -> Vec<Mirror
 
 /// The mirror that would take over the repository `id` at `url` without
 /// naming it, in any of `sets` (each the merged mirrors of one way Maven
-/// may be started). A mirror whose `<mirrorOf>` is exactly the id was
-/// written for that repository, and is not one.
+/// may be started). A mirror whose `<mirrorOf>` names the id, alone or as
+/// one id of a list, was written for that repository: whoever runs it
+/// chose to serve the Socket repository there, and it is not one. (Nor
+/// would the exclusion the warning suggests change anything for it.)
 pub(crate) fn capturing<'m>(sets: &'m [Vec<Mirror>], id: &str, url: &str) -> Option<&'m Mirror> {
     sets.iter()
         .find_map(|mirrors| match select(mirrors, id, url) {
@@ -247,6 +256,38 @@ mod tests {
         // A lone `!` is not an exclusion, and matches nothing.
         assert!(!matches_pattern("!", ID, URL));
         assert!(!matches_pattern("", ID, URL));
+    }
+
+    /// A mirror that lists the repository's id among others was written
+    /// for it: whoever runs that mirror chose to serve the Socket
+    /// repository there, so it is no capture (and excluding the id from a
+    /// list that names it would change nothing).
+    #[test]
+    fn a_mirror_that_lists_the_repository_is_no_capture() {
+        for of in [
+            format!("central,{ID}"),
+            format!("{ID},central"),
+            format!("*,{ID}"),
+            format!("external:*,{ID},!other"),
+        ] {
+            let mirrors = vec![mirror("internal", &of)];
+            assert_eq!(
+                select(&mirrors, ID, URL).map(|(m, named)| (m.id.as_str(), named)),
+                Some(("internal", true)),
+                "{of}"
+            );
+            assert_eq!(capturing(&[mirrors], ID, URL), None, "{of}");
+        }
+        // Naming another id, or the id with a space before it (a segment
+        // is compared as written), is not naming this repository.
+        for of in ["*,central".to_string(), format!("*, {ID}")] {
+            let mirrors = vec![mirror("corp", &of)];
+            assert_eq!(
+                capturing(&[mirrors], ID, URL).map(|m| m.id.as_str()),
+                Some("corp"),
+                "{of}"
+            );
+        }
     }
 
     #[test]

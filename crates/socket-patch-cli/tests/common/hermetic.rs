@@ -108,8 +108,21 @@ pub fn command(bin: &Path) -> Command {
     // binary's exit: lift the short grace it gives telemetry still in
     // flight (the send's own 5 s request timeout still ends the wait).
     cmd.env("SOCKET_TELEMETRY_GRACE_MS", "30000");
+    // Hosted mode weighs the mirrors of the machine's Maven settings before
+    // it adds a repository to a pom. The settings of whoever runs a suite
+    // (a `mirrorOf=*` in `~/.m2/settings.xml`, or in the installation's)
+    // must not decide what its scan wires.
+    cmd.env("MAVEN_ARGS", NO_MAVEN_SETTINGS);
     cmd
 }
+
+/// A `MAVEN_ARGS` that names two Maven settings files which do not exist.
+/// `MAVEN_ARGS` is where the CLI looks for the `-s` / `-gs` a build would
+/// be started with, so with this value it reads no settings of the
+/// machine at all. The binary never starts Maven itself, so nothing else
+/// reads the value. A suite that tests the mirror guard sets its own.
+pub const NO_MAVEN_SETTINGS: &str =
+    "-s /socket-patch-tests/no-settings.xml -gs /socket-patch-tests/no-global-settings.xml";
 
 /// [`command`] for the `socket-patch` binary cargo built for this test run.
 pub fn binary_command() -> Command {

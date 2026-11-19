@@ -10,7 +10,10 @@
 //! * the global settings: `-gs` / `--global-settings` likewise; else
 //!   `conf/settings.xml` of the Maven that would run: the Maven Wrapper's
 //!   distribution when the project has a wrapper and that distribution is
-//!   unpacked, else `$MAVEN_HOME` / `$M2_HOME`, else the `mvn` on `PATH`.
+//!   unpacked, else the `mvn` on `PATH` (since Maven 3.5 the launcher
+//!   takes its home from where it stands and ignores `$MAVEN_HOME` /
+//!   `$M2_HOME`), else, with no `mvn` on `PATH`, the installation those
+//!   two variables name (a build that calls `$MAVEN_HOME/bin/mvn`).
 //!
 //! A `.mvn/settings.xml` in the project is read as well, as a second way
 //! the build may be started: Maven 4 loads it as the project settings, and
@@ -28,9 +31,11 @@ use crate::gradle::home::{split_opts, system_property};
 use crate::gradle::{Env, Os};
 
 /// The `<mirror>`s the settings file text `raw` declares, in order. A
-/// mirror without an id or a `<mirrorOf>` is one Maven rejects, and is
-/// left out. Values are trimmed and `${…}` placeholders resolved through
-/// `lookup` (one that is undefined stays as written), as Maven reads them.
+/// mirror without a `<mirrorOf>` is one Maven rejects, and is left out;
+/// one without an `<id>` has Maven's default id, `default`, and is a
+/// mirror like any other. Values are trimmed and `${…}` placeholders
+/// resolved through `lookup` (one that is undefined stays as written), as
+/// Maven reads them.
 pub(crate) fn parse_mirrors(
     raw: &str,
     source: &str,
@@ -56,12 +61,11 @@ pub(crate) fn parse_mirrors(
     let mut out = Vec::new();
     for mirrors in xml::children(&text, &settings, "mirrors").unwrap_or_default() {
         for mirror in xml::children(&text, &mirrors, "mirror").unwrap_or_default() {
-            let (Some(id), Some(mirror_of)) = (value(&mirror, "id"), value(&mirror, "mirrorOf"))
-            else {
+            let Some(mirror_of) = value(&mirror, "mirrorOf") else {
                 continue;
             };
             out.push(Mirror {
-                id,
+                id: value(&mirror, "id").unwrap_or_else(|| DEFAULT_MIRROR_ID.to_string()),
                 mirror_of,
                 layouts: value(&mirror, "mirrorOfLayouts"),
                 source: source.to_string(),
@@ -70,6 +74,9 @@ pub(crate) fn parse_mirrors(
     }
     out
 }
+
+/// The id Maven's settings model gives a `<mirror>` that declares none.
+const DEFAULT_MIRROR_ID: &str = "default";
 
 /// The value of the option `short` / `long` in `args`: `-s path`,
 /// `--settings path` or `--settings=path`. The first one wins, as in Maven.
@@ -159,12 +166,12 @@ pub(crate) fn settings_mirror_sets(
     });
     let global = named("-gs", "--global-settings").or_else(|| {
         wrapper_settings(root, set("MAVEN_USER_HOME"), user_home.as_deref())
+            .or_else(|| path_settings(set("PATH"), os))
             .or_else(|| {
                 set("MAVEN_HOME")
                     .or_else(|| set("M2_HOME"))
                     .map(|home| PathBuf::from(home).join("conf").join("settings.xml"))
             })
-            .or_else(|| path_settings(set("PATH"), os))
     });
     let project = root.join(".mvn").join("settings.xml");
 
@@ -196,8 +203,14 @@ pub(crate) fn settings_mirror_sets(
 }
 
 /// `conf/settings.xml` of the Maven distribution the project's Maven
-/// Wrapper runs, when it is unpacked on this machine:
-/// `<maven user home>/wrapper/dists/<archive name>/<hash>/<dir>/conf/`.
+/// Wrapper runs, when it is unpacked on this machine, under
+/// `<maven user home>/wrapper/dists/`. The wrapper has two layouts:
+///
+/// * the `only-script` wrapper (the default since Maven Wrapper 3.3)
+///   unpacks to `<archive name without -bin>/<hash>/conf/`, e.g.
+///   `apache-maven-3.9.6/1a2b3c/conf/`;
+/// * the wrapper jar unpacks to `<archive name>/<hash>/<dir>/conf/`, e.g.
+///   `apache-maven-3.9.6-bin/1a2b3c/apache-maven-3.9.6/conf/`.
 fn wrapper_settings(
     root: &Path,
     maven_user_home: Option<String>,
@@ -207,12 +220,9 @@ fn wrapper_settings(
         .join(".mvn")
         .join("wrapper")
         .join("maven-wrapper.properties");
-    let props = crate::utils::fs::read_regular_to_string_sync(&props).ok()?;
-    let url = props.lines().find_map(|line| {
-        let (key, value) = line.split_once('=')?;
-        (key.trim() == "distributionUrl").then(|| value.trim().replace("\\:", ":"))
-    })?;
-    let archive = url.rsplit('/').next()?;
+    let props = crate::utils::fs::read_regular_to_bytes_sync(&props).ok()?;
+    let url = crate::crawlers::gradle_cache::parse_properties(&props).remove("distributionUrl")?;
+    let archive = url.trim().rsplit('/').next()?;
     let name = archive
         .strip_suffix(".zip")
         .or_else(|| archive.strip_suffix(".tar.gz"))?;
@@ -220,17 +230,29 @@ fn wrapper_settings(
         .map(PathBuf::from)
         .or_else(|| user_home.map(|h| h.join(".m2")))?
         .join("wrapper")
-        .join("dists")
-        .join(name);
+        .join("dists");
     let mut found: Vec<PathBuf> = Vec::new();
-    for hash in std::fs::read_dir(dists).ok()?.flatten() {
-        let Ok(unpacked) = std::fs::read_dir(hash.path()) else {
+    let mut names = vec![name];
+    names.extend(name.strip_suffix("-bin"));
+    for name in names {
+        let Ok(hashes) = std::fs::read_dir(dists.join(name)) else {
             continue;
         };
-        for dir in unpacked.flatten() {
-            let settings = dir.path().join("conf").join("settings.xml");
-            if settings.is_file() {
-                found.push(settings);
+        for hash in hashes.flatten() {
+            // The script's layout: the distribution is the hash directory.
+            let direct = hash.path().join("conf").join("settings.xml");
+            if direct.is_file() {
+                found.push(direct);
+                continue;
+            }
+            let Ok(unpacked) = std::fs::read_dir(hash.path()) else {
+                continue;
+            };
+            for dir in unpacked.flatten() {
+                let settings = dir.path().join("conf").join("settings.xml");
+                if settings.is_file() {
+                    found.push(settings);
+                }
             }
         }
     }
@@ -329,6 +351,28 @@ mod tests {
         for broken in ["", "<settings>", "<project><mirrors/></project>"] {
             assert_eq!(parse_mirrors(broken, "s", &none), Vec::new(), "{broken}");
         }
+        // A mirror with no <id> is one Maven accepts, under the id
+        // `default`: it takes repositories like any other, and a user's
+        // one shadows a global one of that id.
+        let anonymous = "<settings><mirrors><mirror><mirrorOf>*</mirrorOf>\
+                         <url>https://nexus.example/repo</url></mirror></mirrors></settings>";
+        let mirrors = parse_mirrors(anonymous, "settings.xml", &none);
+        assert_eq!(mirrors.len(), 1);
+        assert_eq!(
+            (mirrors[0].id.as_str(), mirrors[0].mirror_of.as_str()),
+            ("default", "*")
+        );
+        assert_eq!(captured(&[mirrors.clone()]), Some("default"));
+        let global = parse_mirrors(
+            &settings(&[("default", "central"), ("corp", "*")]),
+            "global.xml",
+            &none,
+        );
+        let merged = merge(mirrors, global);
+        assert_eq!(
+            merged.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            ["default", "corp"]
+        );
     }
 
     #[test]
@@ -344,7 +388,7 @@ mod tests {
         );
         write(&root.join("conf/team.xml"), &settings(&[("team", "*")]));
         let sets = |env: &BTreeMap<String, String>, config: Option<&str>| {
-            settings_mirror_sets(env, Os::Unix, None, &root, config)
+            settings_mirror_sets(env, Os::current(), None, &root, config)
         };
 
         // `~/.m2/settings.xml`.
@@ -395,7 +439,7 @@ mod tests {
         );
         let base = env(&[("HOME", &home), ("MAVEN_HOME", &maven)]);
         let sets = |env: &BTreeMap<String, String>, config: Option<&str>| {
-            settings_mirror_sets(env, Os::Unix, None, &root, config)
+            settings_mirror_sets(env, Os::current(), None, &root, config)
         };
         // The installation's settings alone.
         assert_eq!(captured(&sets(&base, None)), Some("corp"));
@@ -414,26 +458,48 @@ mod tests {
             captured(&sets(&base, Some("-gs\nglobal.xml\n"))),
             Some("other")
         );
-        // The Maven on PATH, when nothing names an installation.
+        // The Maven on PATH is the one that runs, whatever `MAVEN_HOME`
+        // says: the launcher takes its home from where it stands.
         let bin = tmp.path().join("dist/bin");
-        write(&bin.join("mvn"), "#!/bin/sh\n");
+        let launcher = if cfg!(windows) { "mvn.cmd" } else { "mvn" };
+        write(&bin.join(launcher), "#!/bin/sh\n");
         write(
             &tmp.path().join("dist/conf/settings.xml"),
             &settings(&[("on-path", "*")]),
         );
         let on_path = env(&[("HOME", &home), ("PATH", &bin)]);
         assert_eq!(captured(&sets(&on_path, None)), Some("on-path"));
+        let both = env(&[("HOME", &home), ("PATH", &bin), ("MAVEN_HOME", &maven)]);
+        assert_eq!(captured(&sets(&both, None)), Some("on-path"));
         // The wrapper's distribution, once unpacked, is the Maven that runs.
         write(
             &root.join(".mvn/wrapper/maven-wrapper.properties"),
             "distributionUrl=https\\://repo.example/apache-maven-3.9.6-bin.zip\n",
         );
         assert_eq!(captured(&sets(&on_path, None)), Some("on-path"));
-        write(
-            &home.join(".m2/wrapper/dists/apache-maven-3.9.6-bin/abc123/apache-maven-3.9.6/conf/settings.xml"),
-            &settings(&[("wrapped", "*")]),
+        // The wrapper jar's layout: <archive name>/<hash>/<dir>/conf.
+        let jar_layout = home.join(
+            ".m2/wrapper/dists/apache-maven-3.9.6-bin/abc123/apache-maven-3.9.6/conf/settings.xml",
         );
+        write(&jar_layout, &settings(&[("wrapped", "*")]));
         assert_eq!(captured(&sets(&on_path, None)), Some("wrapped"));
+        // The script's layout (the default since Maven Wrapper 3.3): the
+        // archive name without `-bin`, and the distribution in the hash
+        // directory itself.
+        std::fs::remove_file(&jar_layout).unwrap();
+        assert_eq!(captured(&sets(&on_path, None)), Some("on-path"));
+        write(
+            &home.join(".m2/wrapper/dists/apache-maven-3.9.6/def456/conf/settings.xml"),
+            &settings(&[("only-script", "*")]),
+        );
+        assert_eq!(captured(&sets(&on_path, None)), Some("only-script"));
+        // The properties file is read as Java reads one (`:` separator,
+        // a continued line).
+        write(
+            &root.join(".mvn/wrapper/maven-wrapper.properties"),
+            "distributionType=only-script\ndistributionUrl: https\\://repo.example/\\\n  apache-maven-3.9.6-bin.zip\n",
+        );
+        assert_eq!(captured(&sets(&on_path, None)), Some("only-script"));
         // A settings file the project keeps is a second way to be started.
         let quiet = env(&[("HOME", &home)]);
         std::fs::remove_file(root.join(".mvn/wrapper/maven-wrapper.properties")).unwrap();

@@ -1186,16 +1186,20 @@ Honest limits of the Maven and NuGet flows — documented behavior, not bugs:
   What is read: the user settings (`-s` / `--settings` in `MAVEN_ARGS`, then in
   `.mvn/maven.config`, else `~/.m2/settings.xml`) merged over the global settings (`-gs`
   / `--global-settings` likewise, else `conf/settings.xml` of the Maven Wrapper's
-  unpacked distribution, of `$MAVEN_HOME` / `$M2_HOME`, or of the `mvn` on `PATH`), and
-  a `.mvn/settings.xml` the project keeps. The matching is Maven's own: a mirror whose
-  `<mirrorOf>` is exactly the repository's id was written for that repository and is
-  not a reason to skip; `external:http:*` (the blocker Maven ships) never matches the
+  unpacked distribution, of the `mvn` on `PATH`, or, with none there, of `$MAVEN_HOME`
+  / `$M2_HOME`), and a `.mvn/settings.xml` the project keeps. The matching is Maven's
+  own: a mirror whose `<mirrorOf>` names the repository's id, alone or in a list
+  (`central,socket-patch-<uuid>`), was written for that repository and is not a reason
+  to skip; a mirror with no `<id>` counts under Maven's default id; `external:http:*` (the blocker Maven ships) never matches the
   HTTPS Socket repository; `<mirrorOfLayouts>` is honoured. **Only the scanning
   machine's settings are known.** A build machine with another `settings.xml` (a CI
   image, a colleague's laptop) is not seen: a project wired here still fails there
   behind a mirror that takes every repository, and a project skipped here may have built
   there. The in-memory engine (a Socket-opened pull request) reads no settings at all.
-  A project an earlier scan wired is left as it is and reported the same way.
+  A project an earlier scan wired is left as it is and reported the same way, and is no
+  longer counted as redirected or attested by that scan's `--vex`. The skip is only for
+  a patch that would get the repository: one the scan would not wire anyway (the build
+  selects another version) is reported under its own reason.
 * **Gradle (hosted Maven).** Gradle builds get automated wiring, not a pasted snippet:
   an owned settings script pins the suffixed version, every lock file is rewritten,
   and a tripwire fails the build if the base version still resolves. See

@@ -406,10 +406,12 @@ pub struct RewriteResult {
         serde(skip_serializing_if = "std::collections::BTreeSet::is_empty")
     )]
     pub refused_gradle_uuids: std::collections::BTreeSet<String>,
-    /// Maven patch uuids the reactor planner decided (a reactor root, or a
-    /// single pom's `${property}` version): their pins may sit in module
-    /// poms, a property or a comment-recorded declaration, so the pom
-    /// rewriter's own report confirms them, never a substring.
+    /// Maven patch uuids the pom rewriter decided itself, so its own
+    /// report confirms them, never a substring: those the reactor planner
+    /// planned (a reactor root, or a single pom's `${property}` version;
+    /// their pins may sit in module poms, a property or a comment-recorded
+    /// declaration), and those the mirror gate held back, which are never
+    /// confirmed whatever an earlier run left in the poms.
     #[cfg_attr(
         test,
         serde(skip_serializing_if = "std::collections::BTreeSet::is_empty")
@@ -9012,7 +9014,97 @@ pub fn maven_reactor_root(files: &BTreeMap<String, String>) -> bool {
     crate::vendor::jvm::maven_reactor::is_reactor_root(&read, &list)
 }
 
+/// The Maven pom rewriter, behind the mirror gate.
+///
+/// The mirrors of the scanning machine's Maven settings come in under
+/// [`MAVEN_MIRRORS_KEY`]. A mirror that takes every repository takes a
+/// Socket one too, and does not hold the patched version: a pin whose
+/// repository such a mirror captures would break the build it is meant to
+/// patch. So a dep is gated before anything is written for it, and only
+/// where a repository is at stake:
+///
+/// * the dep is planned on its own, with no mirror in sight, and is gated
+///   when that plan would declare its repository in a pom, or a pom
+///   already declares it (an earlier run wired it). A dep the rewriter
+///   would not wire anyway (its version is not selected, its pom cannot
+///   take the pin) is not gated: it goes through as usual and is told its
+///   own reason;
+/// * a gated dep gets the mirror's warning and nothing else: no pom, no
+///   `.mvn` file, no checksum line is touched for it. It is recorded as
+///   decided and not confirmed ([`RewriteResult::maven_reactor_uuids`]),
+///   so wiring an earlier run left is not counted as a redirect, or
+///   attested, by a substring it still matches.
 fn rewrite_maven_pom(
+    files: &BTreeMap<String, String>,
+    overrides: &[DepOverride],
+    selection: Option<&MavenSelection>,
+    result: &mut RewriteResult,
+) {
+    let mirror_sets: Vec<Vec<crate::formats::maven::mirror::Mirror>> = files
+        .get(MAVEN_MIRRORS_KEY)
+        .and_then(|json| serde_json::from_str(json).ok())
+        .unwrap_or_default();
+    let captured = |dep: &DepOverride| {
+        let ov = registry_override_of_kind(dep, "maven2")?;
+        let repo_id = generation::hosted_pin_name(&dep.patch_uuid);
+        crate::formats::maven::mirror::capturing(&mirror_sets, &repo_id, &ov.index_url)
+            .map(|mirror| (repo_id, mirror))
+    };
+    if !overrides
+        .iter()
+        .any(|dep| dep.ecosystem == "maven" && captured(dep).is_some())
+    {
+        return rewrite_maven_poms(files, overrides, selection, result);
+    }
+    let declares = |texts: &BTreeMap<String, String>, repo_id: &str| {
+        let id = format!("<id>{repo_id}</id>");
+        texts
+            .iter()
+            .any(|(rel, text)| !sbt::is_synthetic_key(rel) && text.contains(&id))
+    };
+    let mut wired: Vec<DepOverride> = Vec::with_capacity(overrides.len());
+    for dep in overrides {
+        let gate = (dep.ecosystem == "maven")
+            .then(|| captured(dep))
+            .flatten()
+            .filter(|(repo_id, _)| {
+                declares(files, repo_id) || {
+                    let mut alone = RewriteResult::default();
+                    rewrite_maven_poms(files, std::slice::from_ref(dep), selection, &mut alone);
+                    declares(&alone.files, repo_id)
+                }
+            });
+        let Some((repo_id, mirror)) = gate else {
+            wired.push(dep.clone());
+            continue;
+        };
+        let ga = match registry_override_of_kind(dep, "maven2") {
+            Some(ov) => format!(
+                "{}:{}",
+                ov.identifiers
+                    .maven_group_id
+                    .as_deref()
+                    .or(dep.namespace.as_deref())
+                    .unwrap_or_default(),
+                ov.identifiers
+                    .maven_artifact_id
+                    .as_deref()
+                    .unwrap_or(&dep.name)
+            ),
+            None => full_name(dep),
+        };
+        result.warnings.push(RewriteWarning {
+            code: "redirect_maven_mirror_captures_repository".into(),
+            detail: maven_mirror_detail(&ga, &repo_id, mirror),
+        });
+        result.maven_reactor_uuids.insert(dep.patch_uuid.clone());
+    }
+    rewrite_maven_poms(files, &wired, selection, result);
+}
+
+/// The Maven pom rewriter proper: every dep it is given is one no mirror
+/// of the machine's settings captures ([`rewrite_maven_pom`]).
+fn rewrite_maven_poms(
     files: &BTreeMap<String, String>,
     overrides: &[DepOverride],
     selection: Option<&MavenSelection>,
@@ -9070,13 +9162,6 @@ fn rewrite_maven_pom(
         .iter()
         .filter_map(|(id, _)| generation::pin_name_uuid(id, false).map(str::to_string))
         .collect();
-    // The mirrors of the scanning machine's Maven settings: a repository
-    // one of them would take over is not added to the pom (see
-    // [`maven_mirror_detail`]).
-    let mirror_sets: Vec<Vec<crate::formats::maven::mirror::Mirror>> = files
-        .get(MAVEN_MIRRORS_KEY)
-        .and_then(|json| serde_json::from_str(json).ok())
-        .unwrap_or_default();
     let mut mvn_config = files.get(MVN_CONFIG).cloned().unwrap_or_default();
     let mut mvn_config_changed = false;
     // (local-repo-relative path, bare sha256 hex) entries to merge in.
@@ -9157,19 +9242,6 @@ fn rewrite_maven_pom(
         };
         // Unique-per-patch repository id (valid chars: alnum, `-`, `_`, `.`).
         let repo_id = generation::hosted_pin_name(&dep.patch_uuid);
-        // A mirror that takes every repository takes this one too, and
-        // does not hold the patched version: a pin written here would
-        // break the build it is meant to patch. Nothing is written for
-        // the dep, whatever an earlier run wired.
-        if let Some(mirror) =
-            crate::formats::maven::mirror::capturing(&mirror_sets, &repo_id, &ov.index_url)
-        {
-            result.warnings.push(RewriteWarning {
-                code: "redirect_maven_mirror_captures_repository".into(),
-                detail: maven_mirror_detail(&format!("{group_id}:{artifact_id}"), &repo_id, mirror),
-            });
-            continue;
-        }
         // Every match and anchor is read through the pom's live scope; a pom
         // that is not readable as one is never edited (fail-closed).
         let idx = match index.as_mut().expect("a pom has an index") {
@@ -11439,8 +11511,12 @@ mod tests {
                         "{shape}, {captures}: {names}: {detail}"
                     );
                 }
+                // Decided, and not confirmed: nothing an earlier run left
+                // in a pom may count as a redirect by a substring.
                 assert!(
-                    r.maven_reactor_uuids.is_empty() && r.confirmed_maven_reactor_uuids.is_empty()
+                    r.maven_reactor_uuids.contains(&dep.patch_uuid)
+                        && r.confirmed_maven_reactor_uuids.is_empty(),
+                    "{shape}, {captures}"
                 );
             }
             // A mirror that leaves the repository alone, or one written for
@@ -11449,11 +11525,15 @@ mod tests {
             let plain = rewrite_registry_redirect(&files(&[]), std::slice::from_ref(&dep));
             assert!(plain.files.contains_key("pom.xml"), "{shape}");
             let excluded = format!("*,!{id}");
+            // A mirror that lists the repository among others serves it
+            // on purpose: the operator's choice, not a capture.
+            let listed = format!("central,{id}");
             for leaves in [
                 vec![("corp", "central")],
                 vec![("blocker", "external:http:*")],
                 vec![("corp", excluded.as_str())],
                 vec![("corp", "*"), ("socket", id.as_str())],
+                vec![("internal", listed.as_str())],
             ] {
                 let r = rewrite_registry_redirect(&files(&leaves), std::slice::from_ref(&dep));
                 assert_eq!(r.files, plain.files, "{shape}: {leaves:?}");
@@ -11477,6 +11557,135 @@ mod tests {
             warning_codes(&r),
             ["redirect_maven_mirror_captures_repository"]
         );
+        // And not confirmed, though every file still names the patch: the
+        // build behind that mirror cannot resolve it.
+        assert!(
+            r.maven_reactor_uuids.contains(MAVEN_UUID)
+                && r.confirmed_maven_reactor_uuids.is_empty()
+        );
+    }
+
+    /// The gate is for a dep that would get a repository. One the rewriter
+    /// would not wire anyway is told its own reason, with no advice about
+    /// a mirror that plays no part in it.
+    #[test]
+    fn maven_mirror_gate_leaves_a_dep_that_would_not_be_wired_to_its_own_reason() {
+        // The pom declares another version than the patch is for.
+        let other_version = pom_with_dep("\n      <version>2.0.9</version>", "");
+        // The dependency is not declared with a version the pom can take.
+        let no_pom: Vec<(&str, String)> = vec![];
+        for (shape, poms) in [
+            ("another version", vec![("pom.xml", other_version)]),
+            ("no pom", no_pom),
+        ] {
+            let files = |mirrors: &[(&str, &str)]| -> BTreeMap<String, String> {
+                poms.iter()
+                    .map(|(rel, text)| (rel.to_string(), text.clone()))
+                    .chain(mirrors.first().map(|_| maven_mirrors(mirrors)))
+                    .collect()
+            };
+            let dep = granted_maven_override();
+            let plain = rewrite_registry_redirect(&files(&[]), std::slice::from_ref(&dep));
+            assert!(
+                !plain.files.contains_key("pom.xml"),
+                "{shape}: not wired to begin with"
+            );
+            let r = rewrite_registry_redirect(&files(&[("corp", "*")]), std::slice::from_ref(&dep));
+            assert_eq!(warning_codes(&r), warning_codes(&plain), "{shape}");
+            assert!(
+                !warning_codes(&r).contains(&"redirect_maven_mirror_captures_repository"),
+                "{shape}"
+            );
+            assert_eq!(r.files, plain.files, "{shape}");
+            assert!(r.maven_reactor_uuids.is_empty(), "{shape}");
+        }
+    }
+
+    /// A gated dep has nothing written for it at all: not even the
+    /// checksum lines a grant with a malformed hash would otherwise have
+    /// dropped. The warning says `.mvn/` was left as it is, and it is.
+    #[test]
+    fn maven_mirror_gate_touches_no_file_of_a_gated_dep() {
+        let mut dep = granted_maven_override();
+        dep.integrity.sha256 = Some("sha256-q83vEjRWeJA=".into());
+        let stale = format!(
+            "{}  org/slf4j/slf4j-api/{MAVEN_SUFFIXED}/slf4j-api-{MAVEN_SUFFIXED}.jar\n",
+            "c".repeat(64)
+        );
+        let base = BTreeMap::from([
+            (
+                "pom.xml".to_string(),
+                pom_with_dep("\n      <version>1.7.36</version>", ""),
+            ),
+            (MVN_CHECKSUMS.to_string(), stale.clone()),
+        ]);
+        // With no mirror the stale line goes (and the pin lands).
+        let plain = rewrite_registry_redirect(&base, std::slice::from_ref(&dep));
+        assert!(
+            plain
+                .files
+                .get(MVN_CHECKSUMS)
+                .is_some_and(|sums| !sums.contains(MAVEN_SUFFIXED)),
+            "{:?}",
+            plain.files.keys()
+        );
+        let mut gated = base.clone();
+        gated.extend([maven_mirrors(&[("corp", "*")])]);
+        let r = rewrite_registry_redirect(&gated, std::slice::from_ref(&dep));
+        assert!(r.files.is_empty(), "{:?}", r.files.keys());
+        assert!(r.edits.is_empty(), "{:?}", r.edits);
+        assert_eq!(
+            warning_codes(&r),
+            ["redirect_maven_mirror_captures_repository"]
+        );
+    }
+
+    /// A dep the gate holds back does not keep another dep of the same
+    /// run from being wired, and the other dep's files are the only ones
+    /// written.
+    #[test]
+    fn maven_mirror_gate_is_per_dep() {
+        let second_uuid = "88888888-8888-4888-8888-888888888888";
+        let mut second = granted_maven_override();
+        second.name = "slf4j-simple".into();
+        second.patch_uuid = second_uuid.into();
+        let ov = second.registry_override.as_mut().unwrap();
+        ov.index_url =
+            format!("https://patch.socket.dev/patch-registry/maven/tok/{second_uuid}/maven2");
+        ov.identifiers.name = "org.slf4j/slf4j-simple".into();
+        ov.identifiers.maven_artifact_id = Some("slf4j-simple".into());
+        ov.identifiers.maven_suffixed_version = Some("1.7.36-socket.88888888".into());
+        let pom = pom_with_dep("\n      <version>1.7.36</version>", "").replace(
+            "  </dependencies>",
+            "    <dependency>\n      <groupId>org.slf4j</groupId>\n      \
+             <artifactId>slf4j-simple</artifactId>\n      <version>1.7.36</version>\n    \
+             </dependency>\n  </dependencies>",
+        );
+        // The mirror takes every repository but the second patch's.
+        let of = format!("*,!socket-patch-{second_uuid}");
+        let files: BTreeMap<String, String> = [("pom.xml".to_string(), pom)]
+            .into_iter()
+            .chain([maven_mirrors(&[("corp", of.as_str())])])
+            .collect();
+        let r = rewrite_registry_redirect(&files, &[granted_maven_override(), second]);
+        let wired = &r.files["pom.xml"];
+        assert!(
+            wired.contains("1.7.36-socket.88888888")
+                && wired.contains(&format!("<id>socket-patch-{second_uuid}</id>")),
+            "{wired}"
+        );
+        assert!(
+            !wired.contains(MAVEN_SUFFIXED)
+                && !wired.contains(&format!("<id>socket-patch-{MAVEN_UUID}</id>")),
+            "{wired}"
+        );
+        assert_eq!(
+            warning_codes(&r),
+            ["redirect_maven_mirror_captures_repository"]
+        );
+        assert!(r.warnings[0].detail.starts_with("org.slf4j:slf4j-api: "));
+        assert!(r.maven_reactor_uuids.contains(MAVEN_UUID));
+        assert!(!r.maven_reactor_uuids.contains(second_uuid));
     }
 
     /// [`maven_override`] as the patch service grants it: the suffix is the

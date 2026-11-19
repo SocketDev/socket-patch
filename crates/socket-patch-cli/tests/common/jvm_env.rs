@@ -104,7 +104,15 @@ pub fn isolate_cli(cmd: &mut Command) -> &mut Command {
         }
     }
     let home = stand_in_home();
+    // `MAVEN_ARGS` is scrubbed above for the local-repository lookup; the
+    // hosted mirror guard reads the settings files it names. With the home
+    // moved no user settings are left, and these two missing files keep
+    // the installation's `conf/settings.xml` out as well.
     cmd.env("HOME", &home)
         .env("USERPROFILE", &home)
         .env("GRADLE_USER_HOME", home.join(".gradle"))
+        .env(
+            "MAVEN_ARGS",
+            "-s /socket-patch-tests/no-settings.xml -gs /socket-patch-tests/no-global-settings.xml",
+        )
 }

@@ -840,7 +840,11 @@ async fn read_maven_reactor(
 /// it adds no repository to a pom that one of them would take over (the
 /// gem path's mirror gate, for Maven). On disk only: a memory view has no
 /// machine, and so no settings to read.
-fn read_maven_mirrors(view: &ProjectView<'_>, out: &mut CandidateFiles) {
+fn read_maven_mirrors(
+    view: &ProjectView<'_>,
+    env: &(dyn crate::gradle::Env + Sync),
+    out: &mut CandidateFiles,
+) {
     if !out.files.contains_key("pom.xml") {
         return;
     }
@@ -848,7 +852,7 @@ fn read_maven_mirrors(view: &ProjectView<'_>, out: &mut CandidateFiles) {
         return;
     };
     let sets = crate::crawlers::maven_crawler::settings_mirror_sets(
-        &crate::crawlers::gradle_cache::ProcessEnv,
+        env,
         crate::gradle::Os::current(),
         None,
         root,
@@ -1004,6 +1008,26 @@ pub async fn read_candidate_files(
     view: &ProjectView<'_>,
     unreadable: &BTreeSet<String>,
     candidates: &[Candidate],
+) -> CandidateFiles {
+    read_candidate_files_in(
+        view,
+        unreadable,
+        candidates,
+        &crate::crawlers::gradle_cache::ProcessEnv,
+    )
+    .await
+}
+
+/// [`read_candidate_files`] with the environment the machine's own
+/// configuration is looked up through (today: where Maven's settings
+/// files are, for the mirror gate). The process environment in
+/// production; a test hands in its own, so what a developer keeps in
+/// `~/.m2/settings.xml` decides nothing.
+pub async fn read_candidate_files_in(
+    view: &ProjectView<'_>,
+    unreadable: &BTreeSet<String>,
+    candidates: &[Candidate],
+    env: &(dyn crate::gradle::Env + Sync),
 ) -> CandidateFiles {
     let mut out = CandidateFiles::default();
     for name in REDIRECT_CANDIDATE_FILES.iter() {
@@ -1166,7 +1190,7 @@ pub async fn read_candidate_files(
     // the poms of the modules that select it.
     if candidates.iter().any(|c| c.dep.ecosystem == "maven") {
         read_maven_reactor(view, unreadable, &mut out).await;
-        read_maven_mirrors(view, &mut out);
+        read_maven_mirrors(view, env, &mut out);
     }
 
     // NuGet merges the user config and every parent directory's config
@@ -6086,7 +6110,18 @@ snapshots:
         gradle_rewrite_in(&ProjectView::Memory(p)).await
     }
 
+    /// Over `view`, with no machine behind it: an empty environment, so
+    /// no home, no `PATH` and no settings file of whoever runs the tests
+    /// decides what a Maven project is wired to.
     async fn gradle_rewrite_in(view: &ProjectView<'_>) -> (CandidateFiles, Rewritten) {
+        gradle_rewrite_with(view, &BTreeMap::new()).await
+    }
+
+    /// [`gradle_rewrite_in`] on a machine whose environment is `env`.
+    async fn gradle_rewrite_with(
+        view: &ProjectView<'_>,
+        env: &BTreeMap<String, String>,
+    ) -> (CandidateFiles, Rewritten) {
         let outer = OuterAllowRemote::default;
         let options = RewriteOptions {
             dry_run: false,
@@ -6106,7 +6141,7 @@ snapshots:
             prior_discovery: None,
         };
         let candidates = vec![gradle_candidate()];
-        let read = read_candidate_files(view, &BTreeSet::new(), &candidates).await;
+        let read = read_candidate_files_in(view, &BTreeSet::new(), &candidates, env).await;
         let done = rewrite(view, read.clone(), &candidates, BTreeMap::new(), options).await;
         (read, done)
     }
@@ -6410,6 +6445,54 @@ snapshots:
         let (_, done) = gradle_rewrite_in(&view).await;
         assert!(done.rewrite.files["pom.xml"].contains("1.10.0-socket.4d5e6f70"));
         assert_eq!(done.confirmed.len(), 1, "{:?}", done.rewrite.warnings);
+
+        // A project an earlier run wired, on a machine whose mirror now
+        // takes the repository: the pom still names the patch, and the
+        // build behind that mirror cannot resolve it. Nothing is written,
+        // and the patch is not confirmed by the text it still matches.
+        let wired = done.rewrite.files.clone();
+        for (rel, text) in &wired {
+            write(rel, text);
+        }
+        write("settings.xml", &settings("*"));
+        let (_, done) = gradle_rewrite_in(&view).await;
+        assert!(done.rewrite.files.is_empty(), "{:?}", done.rewrite.files);
+        assert!(
+            std::fs::read_to_string(tmp.path().join("pom.xml"))
+                .unwrap()
+                .contains("1.10.0-socket.4d5e6f70"),
+            "the wiring is left as it is"
+        );
+        assert!(done.confirmed.is_empty(), "{:?}", done.confirmed);
+        assert!(done
+            .rewrite
+            .warnings
+            .iter()
+            .any(|w| w.code == "redirect_maven_mirror_captures_repository"));
+        write("pom.xml", pom);
+
+        // The settings are found through the environment the engine is
+        // given, never the test process's own: a settings file named in
+        // that environment's `MAVEN_ARGS` is the one read.
+        std::fs::remove_file(tmp.path().join(".mvn/maven.config")).unwrap();
+        write("ci/settings.xml", &settings("*"));
+        let (_, done) = gradle_rewrite_in(&view).await;
+        assert!(
+            done.rewrite.files["pom.xml"].contains("1.10.0-socket.4d5e6f70"),
+            "no environment, no settings: wired"
+        );
+        let ci = BTreeMap::from([(
+            "MAVEN_ARGS".to_string(),
+            format!(
+                "-s {} -gs {}",
+                tmp.path().join("ci/settings.xml").display(),
+                tmp.path().join("global.xml").display()
+            ),
+        )]);
+        let (read, done) = gradle_rewrite_with(&view, &ci).await;
+        assert!(read.files.contains_key(MAVEN_MIRRORS_KEY));
+        assert!(done.rewrite.files.is_empty(), "{:?}", done.rewrite.files);
+        write(".mvn/maven.config", config);
 
         // In memory: the files are there, but no machine to read them for.
         let mut p = MemoryProject::new();
