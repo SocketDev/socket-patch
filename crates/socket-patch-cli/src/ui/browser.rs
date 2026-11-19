@@ -341,17 +341,30 @@ fn fit(text: &str, max: usize) -> String {
     format!("{}{ELLIPSIS}", kept.trim_end())
 }
 
+/// Columns between the tab stops of a page's lines.
+const TAB_STOP: usize = 4;
+
 /// The part of `line` that falls in columns `skip..skip + take`. Color
 /// sequences are kept (they take no column) and closed at the end, so a
 /// cut line never colors the one after it; any other escape sequence is
-/// dropped, since it could move the cursor; and a character that is not
-/// one column wide (a tab, a wide or a control character) is shown as one
-/// that is, so every line takes exactly the columns it is given.
+/// dropped, since it could move the cursor. Every character takes the
+/// columns a terminal gives it, so a line takes exactly the columns it
+/// is given: a tab runs to the next [`TAB_STOP`] (the indentation of
+/// code is kept), a wide character takes its two columns (or shows as a
+/// space where the window cuts it in half), one that takes none rides on
+/// the one before it, and any other control character is a space.
 fn window(line: &str, skip: usize, take: usize) -> String {
+    let end = skip + take;
     let mut out = String::new();
     let mut column = 0usize;
     let mut colored = false;
     let mut chars = line.chars().peekable();
+    // Blank columns `from..to`, where they fall in the window.
+    let blank = |out: &mut String, from: usize, to: usize| {
+        for _ in from.max(skip)..to.min(end) {
+            out.push(' ');
+        }
+    };
     while let Some(c) = chars.next() {
         if c == '\x1b' {
             // A CSI sequence: `ESC [`, parameters, one final letter.
@@ -371,15 +384,33 @@ fn window(line: &str, skip: usize, take: usize) -> String {
             }
             continue;
         }
-        if column >= skip + take {
+        let width = if c == '\t' {
+            TAB_STOP - column % TAB_STOP
+        } else if c.is_control() {
+            1
+        } else {
+            console::measure_text_width(c.encode_utf8(&mut [0; 4]))
+        };
+        if width == 0 {
+            // A combining mark: part of the character before it, when
+            // that one is shown.
+            if column > skip && column <= end {
+                out.push(c);
+            }
+            continue;
+        }
+        if column >= end {
             break;
         }
-        if column >= skip {
-            let one_column =
-                !c.is_control() && console::measure_text_width(c.encode_utf8(&mut [0; 4])) == 1;
-            out.push(if one_column { c } else { ' ' });
+        if c == '\t' || c.is_control() {
+            blank(&mut out, column, column + width);
+        } else if column >= skip && column + width <= end {
+            out.push(c);
+        } else {
+            // Cut by an edge of the window: its columns that are inside.
+            blank(&mut out, column, column + width);
         }
-        column += 1;
+        column += width;
     }
     if colored {
         out.push_str("\x1b[0m");
@@ -1646,9 +1677,25 @@ mod tests {
             window("\x1b[32m+added line\x1b[0m", 7, 4),
             "\x1b[32mline\x1b[0m\x1b[0m"
         );
-        assert_eq!(window("a\tb\x07c", 0, 9), "a b c");
+        assert_eq!(window("a\x07c", 0, 9), "a c");
         assert_eq!(window("a\x1b[2Jb\x1b[Hc", 0, 9), "abc");
-        assert_eq!(window("日本語", 0, 9), "   ");
+        // A tab runs to the next stop, so code keeps its indentation,
+        // wherever the window starts.
+        assert_eq!(window("\tif x {", 0, 12), "    if x {");
+        assert_eq!(window("+\t\treturn", 0, 20), "+       return");
+        assert_eq!(window("ab\tc", 0, 9), "ab  c");
+        assert_eq!(window("\t\tx", 6, 9), "  x");
+        assert_eq!(window("\tx", 0, 2), "  ");
+        // A wide character takes its two columns, and shows as a space
+        // where an edge of the window cuts it in half.
+        assert_eq!(window("日本語", 0, 9), "日本語");
+        assert_eq!(window("日本語", 0, 4), "日本");
+        assert_eq!(window("日本語", 0, 3), "日 ");
+        assert_eq!(window("日本語", 1, 4), " 本 ");
+        assert_eq!(window("a日b", 0, 4), "a日b");
+        // One that takes no column rides on the one before it.
+        assert_eq!(window("e\u{301}x", 0, 2), "e\u{301}x");
+        assert_eq!(window("e\u{301}x", 1, 2), "x");
         // Shifted sideways, a page shows the rest of its long lines.
         let mut state = State::of_page(
             Page {

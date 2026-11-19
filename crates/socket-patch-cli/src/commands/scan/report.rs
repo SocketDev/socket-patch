@@ -731,6 +731,9 @@ pub(crate) struct Run {
     measured: Measured,
     /// The measurement requests still out ([`Self::measure`]).
     measuring: Vec<tokio::task::JoinHandle<Vec<Measurement>>>,
+    /// The window every round of measurement requests shares, with the
+    /// route it is for (`true`: the public proxy).
+    window: Option<(bool, measured::Window)>,
     /// The patches whose measurements have been asked for.
     requested: HashSet<String>,
     /// The selected uuids of every package a patch landed in, for the
@@ -761,6 +764,7 @@ impl Run {
             reachability: false,
             measured: Measured::new(),
             measuring: Vec::new(),
+            window: None,
             requested: HashSet::new(),
             patched: Vec::new(),
             client: None,
@@ -889,9 +893,20 @@ impl Run {
         if uuids.is_empty() {
             return;
         }
+        // One window for every round of the run: the rounds of a scan of
+        // many directories are all out at once.
+        let proxy = client.uses_public_proxy();
+        let window = match &self.window {
+            Some((route, window)) if *route == proxy => window.clone(),
+            _ => {
+                let window = measured::window(client);
+                self.window = Some((proxy, window.clone()));
+                window
+            }
+        };
         let client = client.clone();
         self.measuring.push(tokio::spawn(async move {
-            measured::request(&client, uuids).await
+            measured::request(&client, uuids, &window).await
         }));
     }
 

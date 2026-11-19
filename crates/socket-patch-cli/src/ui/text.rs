@@ -10,6 +10,15 @@ pub fn plural(n: usize, one: &str, many: &str) -> String {
 
 const ELLIPSIS: &str = "...";
 
+/// `text` as it may be printed: without its control characters. For
+/// text that came from a service or a project's files, which is shown
+/// for reading and must never move the cursor, retitle the terminal or
+/// write to its clipboard. One-line fields only: a tab or a newline is a
+/// control character too.
+pub fn printable(text: &str) -> String {
+    text.chars().filter(|c| !c.is_control()).collect()
+}
+
 /// The worst severity (upper-cased; empty when none is named) and the
 /// ids to show for a set of advisories, each given as its id, its
 /// severity and its CVEs: an advisory is named by its CVEs, or by its own
@@ -385,6 +394,16 @@ mod tests {
             worst_and_ids(std::iter::empty()),
             (String::new(), Vec::new())
         );
+    }
+
+    #[test]
+    fn printable_drops_every_control_character() {
+        assert_eq!(printable("lib/a.js"), "lib/a.js");
+        assert_eq!(
+            printable("a\u{1b}]0;title\u{7}b\u{1b}[2Jc\r\n\td"),
+            "a]0;titleb[2Jcd"
+        );
+        assert_eq!(printable("é 漢字 \u{9b}31m"), "é 漢字 31m");
     }
 
     #[test]

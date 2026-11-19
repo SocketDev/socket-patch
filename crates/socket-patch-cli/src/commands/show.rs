@@ -160,9 +160,12 @@ async fn shown_files(client: &ApiClient, patch: &PatchResponse, style: Style) ->
             );
             let after = side(client, file.blob_content.as_ref(), file.after_hash.as_ref());
             let diff = match (before.await, after.await) {
-                (Ok(before), Ok(Some(after))) => {
-                    Ok(file_diff(path, before.as_deref(), &after, style))
-                }
+                (Ok(before), Ok(Some(after))) => Ok(file_diff(
+                    &ui::printable(path),
+                    before.as_deref(),
+                    &after,
+                    style,
+                )),
                 (Ok(_), Ok(None)) => Err("the patch carries no content for it".to_string()),
                 (Err(e), _) | (_, Err(e)) => Err(e),
             };
@@ -190,7 +193,7 @@ fn change_label(file: &ShownFile, color: bool) -> String {
             ui::paint(&format!("+{}", diff.added), "32", color),
             ui::paint(&format!("-{}", diff.removed), "31", color)
         ),
-        Err(why) => format!("({why})"),
+        Err(why) => format!("({})", ui::printable(why)),
     }
 }
 
@@ -212,6 +215,10 @@ fn change_label(file: &ShownFile, color: bool) -> String {
 /// ```
 fn summary(patch: &PatchResponse, files: &[ShownFile], style: Style) -> Vec<String> {
     let color = style.color;
+    // What the service says is text to read, never to act on: a control
+    // character in a summary, a license or a path is left out, so nothing
+    // in a patch's record can move the cursor or retitle the terminal.
+    let patch = &printable_patch(patch);
     let mut vulns: Vec<_> = patch.vulnerabilities.iter().collect();
     vulns.sort_by(|a, b| {
         severity_order(Some(&a.1.severity))
@@ -301,27 +308,59 @@ fn summary(patch: &PatchResponse, files: &[ShownFile], style: Style) -> Vec<Stri
     ));
     let path_w = files
         .iter()
-        .map(|f| f.path.chars().count())
+        .map(|f| ui::printable(&f.path).chars().count())
         .max()
         .unwrap_or(0);
     for file in files {
         lines.push(format!(
             "  {}  {}",
-            ui::pad(&file.path, path_w),
+            ui::pad(&ui::printable(&file.path), path_w),
             change_label(file, color)
         ));
     }
     lines
 }
 
+/// `patch` with every piece of text it carries made printable
+/// ([`ui::printable`]), for showing. `--json` prints the record as it
+/// came: JSON escapes what it carries.
+fn printable_patch(patch: &PatchResponse) -> PatchResponse {
+    let text = |s: &str| ui::printable(s);
+    PatchResponse {
+        uuid: text(&patch.uuid),
+        purl: text(&patch.purl),
+        published_at: text(&patch.published_at),
+        description: text(&patch.description),
+        license: text(&patch.license),
+        tier: text(&patch.tier),
+        vulnerabilities: patch
+            .vulnerabilities
+            .iter()
+            .map(|(id, vuln)| {
+                let mut vuln = vuln.clone();
+                vuln.cves = vuln.cves.iter().map(|cve| text(cve)).collect();
+                vuln.summary = text(&vuln.summary);
+                vuln.severity = text(&vuln.severity);
+                (text(id), vuln)
+            })
+            .collect(),
+        ..patch.clone()
+    }
+}
+
 /// The diff of one file as text: its lines, or why there is none.
 fn diff_text(file: &ShownFile) -> String {
     match &file.diff {
         Ok(diff) => diff.lines.join("\n"),
-        Err(why) => format!(
-            "--- a/{}\n+++ b/{}\nNo diff: {why} (before {}, after {}).",
-            file.path, file.path, file.before_hash, file.after_hash
-        ),
+        Err(why) => {
+            let path = ui::printable(&file.path);
+            format!(
+                "--- a/{path}\n+++ b/{path}\nNo diff: {} (before {}, after {}).",
+                ui::printable(why),
+                ui::printable(&file.before_hash),
+                ui::printable(&file.after_hash)
+            )
+        }
     }
 }
 
@@ -435,7 +474,7 @@ impl Shown {
         let mut marks = Vec::new();
         for file in selected {
             lines.push(String::new());
-            marks.push((lines.len(), file.path.clone()));
+            marks.push((lines.len(), ui::printable(&file.path)));
             lines.extend(diff_text(file).lines().map(str::to_string));
         }
         ui::browser::Page {
@@ -455,6 +494,11 @@ pub(crate) async fn load_page(
     uuid: &str,
     style: Style,
 ) -> Result<ui::browser::Page, String> {
+    // The uuid comes from a project's own files: only one that is a UUID
+    // goes into a request to the patch service.
+    if !socket_patch_core::utils::target::is_uuid_shaped(uuid) {
+        return Err("the project records no valid patch UUID for it".to_string());
+    }
     let shown = Shown::read(source, uuid, style)
         .await
         .map_err(|unread| unread.message)?;
@@ -510,13 +554,34 @@ fn candidate_label(patch: &PatchSearchResult) -> String {
     )
 }
 
+/// The patches a target names, best first, and whether the account may
+/// read the paid ones among them.
+struct Found {
+    patches: Vec<PatchSearchResult>,
+    can_access_paid: bool,
+}
+
+/// Why the patches a target names could not be looked up.
+enum Lookup {
+    /// The patch service's own answer. A refusal of the token among them
+    /// is what the public service may make good.
+    Service(ApiError),
+    /// The target itself: a name no installed package has, or too many.
+    Target(String),
+}
+
+impl Lookup {
+    fn message(&self) -> String {
+        match self {
+            Lookup::Service(e) => e.to_string(),
+            Lookup::Target(message) => message.clone(),
+        }
+    }
+}
+
 /// The patches `target` names, best first: an advisory's or a purl's by
 /// search, a name's by searching each installed package it matches.
-async fn candidates(
-    args: &ShowArgs,
-    target: &Target,
-    client: &ApiClient,
-) -> Result<Vec<PatchSearchResult>, String> {
+async fn candidates(args: &ShowArgs, target: &Target, client: &ApiClient) -> Result<Found, Lookup> {
     let searched = match target.kind() {
         TargetKind::Cve => client.search_patches_by_cve(target.as_str()).await,
         TargetKind::Ghsa => client.search_patches_by_ghsa(target.as_str()).await,
@@ -526,31 +591,49 @@ async fn candidates(
             let (packages, _, _) = crawl_ecosystems(&args.common.crawler_options(), only).await;
             let matched = installed_target_matches(target, &packages);
             if matched.is_empty() {
-                return Err(format!(
+                return Err(Lookup::Target(format!(
                     "no installed package is named `{target}`; pass a PURL (pkg:npm/{target}@1.2.3) \
                      or a patch UUID"
-                ));
+                )));
             }
             if matched.len() > MAX_NAME_MATCHES {
-                return Err(format!(
+                return Err(Lookup::Target(format!(
                     "`{target}` names {} installed packages; pass the PURL of one",
                     matched.len()
-                ));
+                )));
             }
-            let mut patches = Vec::new();
+            let mut found = Found {
+                patches: Vec::new(),
+                can_access_paid: true,
+            };
             for purl in &matched {
-                match client.search_patches_by_package(purl).await {
-                    Ok(found) => patches.extend(found.patches),
-                    Err(e) => return Err(e.to_string()),
-                }
+                let answer = client
+                    .search_patches_by_package(purl)
+                    .await
+                    .map_err(Lookup::Service)?;
+                found.patches.extend(answer.patches);
+                found.can_access_paid &= answer.can_access_paid_patches;
             }
-            patches.sort_by(cmp_search_results);
-            return Ok(patches);
+            found.patches.sort_by(cmp_search_results);
+            return Ok(found);
         }
     };
     searched
-        .map(|found| found.patches)
-        .map_err(|e| e.to_string())
+        .map(|answer| Found {
+            patches: answer.patches,
+            can_access_paid: answer.can_access_paid_patches,
+        })
+        .map_err(Lookup::Service)
+}
+
+/// The patch to show of several that match, when nobody is asked: the
+/// best ranked one the account can read, so a paid patch ranked first
+/// does not stand in the way of a free one; the best ranked when it can
+/// read none.
+fn best_readable(many: &[PatchSearchResult], can_access_paid: bool) -> usize {
+    many.iter()
+        .position(|patch| can_access_paid || patch.tier != "paid")
+        .unwrap_or(0)
 }
 
 pub async fn run(args: ShowArgs) -> i32 {
@@ -575,19 +658,27 @@ pub async fn run(args: ShowArgs) -> i32 {
     } else {
         status.set(format!("Finding patches for {target}..."));
         let mut found = candidates(&args, &target, &client).await;
-        if let (Err(_), false) = (&found, client.uses_public_proxy()) {
-            // A refused token still reaches the free patches.
-            let proxy = build_proxy_fallback_client(&overrides);
-            if let Ok(free) = candidates(&args, &target, &proxy).await {
-                (client, found) = (proxy, Ok(free));
+        // A refused token still reaches the free patches: the public
+        // service is asked, and its answer stands in when it has any.
+        // When it has none, the refusal stays the answer: it is the
+        // cause. Any other failure (the service down, a name that
+        // matches nothing) is reported as it is.
+        if let Err(Lookup::Service(refusal)) = &found {
+            if !client.uses_public_proxy() && is_fallback_candidate(refusal) {
+                let proxy = build_proxy_fallback_client(&overrides);
+                if let Ok(free) = candidates(&args, &target, &proxy).await {
+                    if !free.patches.is_empty() {
+                        (client, found) = (proxy, Ok(free));
+                    }
+                }
             }
         }
         status.finish();
         let found = match found {
             Ok(found) => found,
-            Err(message) => return fail(common, "patch_lookup_failed", &message),
+            Err(lookup) => return fail(common, "patch_lookup_failed", &lookup.message()),
         };
-        match found.as_slice() {
+        match found.patches.as_slice() {
             [] => {
                 return fail(
                     common,
@@ -609,16 +700,17 @@ pub async fn run(args: ShowArgs) -> i32 {
                         Err(_) => return 0,
                     }
                 } else {
+                    let shown = best_readable(many, found.can_access_paid);
                     if !common.json && !common.silent {
                         eprintln!(
                             "{} match {target}; showing the best ranked. The others:",
                             plural(many.len(), "patch", "patches")
                         );
-                        for label in &labels[1..] {
+                        for (_, label) in labels.iter().enumerate().filter(|(i, _)| *i != shown) {
                             eprintln!("  {label}");
                         }
                     }
-                    many[0].uuid.clone()
+                    many[shown].uuid.clone()
                 }
             }
         }
@@ -638,6 +730,12 @@ pub async fn run(args: ShowArgs) -> i32 {
         Err(unread) => return fail(common, unread.code, &unread.message),
     };
     let (patch, files) = (&shown.patch, &shown.files);
+    // Before any form of output: a `--file` the patch does not change is
+    // an error under `--json` and `--silent` too.
+    let selected = match select_files(files, &args.files) {
+        Ok(selected) => selected,
+        Err(message) => return fail(common, "file_not_in_patch", &message),
+    };
 
     if common.json {
         ui::print_json(&serde_json::json!({
@@ -668,10 +766,6 @@ pub async fn run(args: ShowArgs) -> i32 {
         return 0;
     }
 
-    let selected = match select_files(files, &args.files) {
-        Ok(selected) => selected,
-        Err(message) => return fail(common, "file_not_in_patch", &message),
-    };
     // Someone at a terminal reads the patch on the page a row of `list`
     // opens: the summary and every selected diff, which scrolls, steps
     // from file to file and follows the terminal's size. Where there is
@@ -872,6 +966,27 @@ mod tests {
         assert_eq!(short_date("Fri, 27 Mar 2026 19:12:42 GMT"), "27 Mar 2026");
         assert_eq!(short_date("2024-01-01T00:00:00Z"), "2024-01-01");
         assert_eq!(short_date("yesterday"), "yesterday");
+    }
+
+    /// Nobody asked which of several patches: the best ranked one the
+    /// account can read is shown, so a paid patch ranked first does not
+    /// fail the run when a free one is there.
+    #[test]
+    fn the_patch_shown_of_several_is_one_the_account_can_read() {
+        let patch = |tier: &str| PatchSearchResult {
+            uuid: String::new(),
+            purl: "pkg:npm/x@1.0.0".to_string(),
+            published_at: String::new(),
+            description: String::new(),
+            license: String::new(),
+            tier: tier.to_string(),
+            vulnerabilities: HashMap::new(),
+        };
+        let many = [patch("paid"), patch("paid"), patch("free"), patch("free")];
+        assert_eq!(best_readable(&many, true), 0);
+        assert_eq!(best_readable(&many, false), 2);
+        assert_eq!(best_readable(&many[..2], false), 0);
+        assert_eq!(best_readable(&many[2..], false), 0);
     }
 
     #[test]

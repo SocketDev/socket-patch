@@ -324,6 +324,80 @@ async fn show_reads_from_the_public_service_when_the_token_is_refused() {
     assert!(!stderr.contains("no patch found"), "{stderr}");
 }
 
+/// A lookup the patch service fails for any reason other than refusing
+/// the token is that failure: the public service is not asked, so its
+/// "nothing for this package" (it has the free patches only) never
+/// stands in for an outage. A `--file` the patch does not change is an
+/// error in every output form. What the service says is shown as text:
+/// a control sequence in an advisory's summary is not passed on.
+#[tokio::test(flavor = "multi_thread")]
+async fn show_reports_failures_as_what_they_are() {
+    let by_package = format!(
+        "/v0/orgs/{ORG}/patches/by-package/{}",
+        PURL.replace(':', "%3A")
+            .replace('/', "%2F")
+            .replace('@', "%40")
+    );
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(by_package))
+        .respond_with(ResponseTemplate::new(500).set_body_string("upstream down"))
+        .mount(&mock)
+        .await;
+    // The public service would answer "no patches".
+    Mock::given(method("GET"))
+        .and(wiremock::matchers::path_regex("^/patch/by-package/.*$"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "patches": [], "canAccessPaidPatches": false
+        })))
+        .mount(&mock)
+        .await;
+    let mut hostile = view(true);
+    hostile["vulnerabilities"]["GHSA-aaaa-bbbb-cccc"]["summary"] =
+        serde_json::json!("TLS \u{1b}]0;owned\u{7}validation\u{1b}[2J bypass");
+    mount_view(&mock, hostile).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let public = mock.uri();
+
+    let (code, stdout, stderr) =
+        run_show(tmp.path(), &mock, &[PURL, "--json", "--proxy-url", &public]);
+    assert_eq!(code, 1, "stdout={stdout}; stderr={stderr}");
+    let doc: serde_json::Value = serde_json::from_str(&stdout).expect("one JSON document");
+    assert_eq!(doc["error"]["code"], "patch_lookup_failed", "{doc:#}");
+    let requests = mock.received_requests().await.unwrap_or_default();
+    assert!(
+        requests
+            .iter()
+            .all(|r| !r.url.path().starts_with("/patch/")),
+        "the public service is asked only after a refusal: {requests:#?}"
+    );
+
+    for form in [&["--json"][..], &["--silent"], &[]] {
+        let args = [&[UUID, "--file", "nope.js"], form].concat();
+        let (code, stdout, stderr) = run_show(tmp.path(), &mock, &args);
+        assert_eq!(code, 1, "{form:?}: stdout={stdout}; stderr={stderr}");
+        if form.contains(&"--json") {
+            let doc: serde_json::Value = serde_json::from_str(&stdout).expect("JSON");
+            assert_eq!(doc["error"]["code"], "file_not_in_patch", "{doc:#}");
+        } else {
+            assert!(stdout.is_empty(), "{form:?}: {stdout:?}");
+            assert!(
+                stderr.contains("`nope.js` is not a file of this patch"),
+                "{form:?}: {stderr}"
+            );
+        }
+    }
+
+    let (code, stdout, stderr) = run_show(tmp.path(), &mock, &[UUID, "--stat"]);
+    assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
+    assert!(!stdout.contains('\u{1b}'), "{stdout:?}");
+    assert!(!stdout.contains('\u{7}'), "{stdout:?}");
+    assert!(
+        stdout.contains("  HIGH  CVE-2026-84961  TLS ]0;ownedvalidation[2J bypass\n"),
+        "{stdout:?}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn show_failures_are_coded_and_exit_one() {
     let mock = MockServer::start().await;

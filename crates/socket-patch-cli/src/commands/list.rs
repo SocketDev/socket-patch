@@ -526,9 +526,19 @@ async fn browse(rows: Vec<(Browse, Option<String>)>, common: &GlobalArgs) -> Tab
         let Some(source) = connect().await else {
             return;
         };
-        let mut uuids: Vec<String> = rows.iter().map(|(row, _)| row.uuid.clone()).collect();
+        // What the project records as a patch's uuid comes from its own
+        // files (a manifest anyone can write): only one that is a UUID
+        // goes into a request to the patch service.
+        let mut uuids: Vec<String> = rows
+            .iter()
+            .map(|(row, _)| row.uuid.clone())
+            .filter(|uuid| socket_patch_core::utils::target::is_uuid_shaped(uuid))
+            .collect();
         uuids.sort_unstable();
         uuids.dedup();
+        if uuids.is_empty() {
+            return;
+        }
         let total = uuids.len();
         let _ = updates.send(Update::Note(format!("loading details 0/{total}")));
         let mut answers = futures_util::stream::iter(uuids)
@@ -644,7 +654,9 @@ async fn browse_inline(rows: &[(Browse, Option<String>)], table: &Table, common:
     {
         at = picked;
         let patch = &rows[picked].0;
+        // A recorded uuid that is not one is no identifier to look up.
         let shown = !common.offline
+            && socket_patch_core::utils::target::is_uuid_shaped(&patch.uuid)
             && crate::commands::show::run(crate::commands::show::ShowArgs {
                 identifier: patch.uuid.clone(),
                 common: common.clone(),

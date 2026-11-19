@@ -766,6 +766,111 @@ fn list_on_an_agents_terminal_prints_and_opens_nothing() {
     assert!(output.contains(ENTER_SCREEN), "{output:?}");
 }
 
+/// What a project records as a patch's uuid comes from its own files,
+/// which anyone can write. Only one that is a UUID goes into a request
+/// to the patch service: a record whose "uuid" is a path is never sent
+/// (with the user's token) to wherever it points, its row keeps what the
+/// project records, and opening it shows that record under the reason.
+#[test]
+fn list_asks_the_patch_service_about_uuids_only() {
+    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+    let mock = rt.block_on(async {
+        let mock = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(|request: &wiremock::Request| {
+                let uuid = request.url.path().rsplit('/').next().unwrap().to_string();
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "uuid": uuid,
+                    "purl": "pkg:npm/list-tty-package-00@1.0.0",
+                    "publishedAt": "Sat, 14 Nov 2026 07:13:44 GMT",
+                    "files": {},
+                    "vulnerabilities": {},
+                    "description": "A patch",
+                    "license": "MIT",
+                    "tier": "free",
+                    "statistics": { "tests": { "after": { "count": 34, "total": 35 } } },
+                }))
+            })
+            .mount(&mock)
+            .await;
+        mock
+    });
+    let uri = mock.uri();
+    let tmp = tempfile::tempdir().unwrap();
+    write_manifest(tmp.path(), 2);
+    // The second record's uuid points somewhere else on the API host.
+    let manifest = tmp.path().join(".socket/manifest.json");
+    let hostile = "../../../../v0/hostile?x=1#y";
+    let text = std::fs::read_to_string(&manifest).unwrap();
+    assert!(text.contains(&uuid(1)));
+    std::fs::write(&manifest, text.replace(&uuid(1), hostile)).unwrap();
+
+    let mut term = Terminal::list(
+        tmp.path(),
+        &[
+            "--api-url",
+            &uri,
+            "--api-token",
+            "fake-token",
+            "--org",
+            ORG_SLUG,
+        ],
+        140,
+        12,
+    );
+    // The one real patch fills in; then the other row is opened.
+    term.wait_for("34/35", 1);
+    term.press(b"\x1b[B\r");
+    term.wait_for("The patch could not be read", 1);
+    term.press(b"qq");
+    let (code, output) = term.finish();
+    assert_eq!(code, 0, "{output}");
+
+    let frames = frames(&output);
+    let page = frames
+        .iter()
+        .find(|frame| {
+            frame
+                .iter()
+                .any(|l| l.starts_with("The patch could not be read"))
+        })
+        .unwrap_or_else(|| panic!("no page: {frames:#?}"));
+    assert_eq!(
+        page[1],
+        "The patch could not be read: the project records no valid patch UUID for it."
+    );
+    let requests = rt.block_on(mock.received_requests()).unwrap_or_default();
+    assert!(!requests.is_empty());
+    for request in &requests {
+        assert_eq!(
+            request.url.path(),
+            format!("/v0/orgs/{ORG_SLUG}/patches/view/{}", uuid(0)),
+            "{requests:#?}"
+        );
+    }
+}
+
+/// Under `SOCKET_DEBUG` the browser stays down, as the status line does:
+/// the debug lines go straight to stderr, where they would land in the
+/// middle of a frame and be gone with the screen. The entries print.
+#[test]
+fn list_under_debug_logging_prints_and_opens_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_manifest(tmp.path(), 2);
+    let term = Terminal::run_with(
+        "list",
+        tmp.path(),
+        &["--offline"],
+        &[("SOCKET_DEBUG", "1")],
+        100,
+        16,
+    );
+    let (code, output) = term.finish();
+    assert_eq!(code, 0, "{output}");
+    assert!(!output.contains(ENTER_SCREEN), "{output:?}");
+    assert!(output.contains("Found 2 patches:"), "{output:?}");
+}
+
 /// `--yes`, like a pipe, keeps the full entries and opens no browser: the
 /// run ends by itself, and asks the patch service nothing.
 #[test]

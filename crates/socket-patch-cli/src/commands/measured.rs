@@ -44,7 +44,15 @@ pub(crate) fn wanted(common: &GlobalArgs) -> bool {
 /// are scarce), and one that is throttled is given up, not retried. A
 /// retry would open the run's one retry window, which the downloads that
 /// follow may need.
-pub(crate) async fn request(client: &ApiClient, uuids: Vec<String>) -> Vec<Measurement> {
+///
+/// Every request takes a slot of `window` first ([`window`]): a run that
+/// asks in several rounds (a scan of many project directories asks once
+/// for each) keeps to one window for all of them, not one each.
+pub(crate) async fn request(
+    client: &ApiClient,
+    uuids: Vec<String>,
+    window: &Window,
+) -> Vec<Measurement> {
     use futures_util::StreamExt;
     use socket_patch_core::api::retry::{ApiRetryPolicy, RetryHooks};
     use socket_patch_core::utils::concurrent::api_concurrency_for;
@@ -55,12 +63,27 @@ pub(crate) async fn request(client: &ApiClient, uuids: Vec<String>) -> Vec<Measu
     let client = &client;
     futures_util::stream::iter(uuids)
         .map(|uuid| async move {
+            // Never closed, so the slot is always given.
+            let _slot = window.acquire().await;
             let answer = hold_back_debug(client.fetch_patch_statistics(&uuid)).await;
             (uuid, answer)
         })
         .buffer_unordered(at_once)
         .collect()
         .await
+}
+
+/// The measurement requests a run may have out at once, whoever asks:
+/// the patch API's own window for `client`'s route.
+pub(crate) type Window = std::sync::Arc<tokio::sync::Semaphore>;
+
+/// A [`Window`] for `client`'s route.
+pub(crate) fn window(client: &ApiClient) -> Window {
+    use socket_patch_core::utils::concurrent::api_concurrency_for;
+    std::sync::Arc::new(tokio::sync::Semaphore::new(api_concurrency_for(
+        client.uses_public_proxy(),
+        usize::MAX,
+    )))
 }
 
 /// Fold `answers` into `measured`, printing each request's `--debug`
@@ -80,7 +103,10 @@ pub(crate) fn collect(measured: &mut Measured, answers: Vec<Measurement>) {
 pub(crate) async fn fetch(common: &GlobalArgs, client: &ApiClient, uuids: Vec<String>) -> Measured {
     let mut measured = Measured::new();
     if wanted(common) && !uuids.is_empty() {
-        if let Ok(answers) = tokio::time::timeout(LISTING_WAIT, request(client, uuids)).await {
+        let window = window(client);
+        if let Ok(answers) =
+            tokio::time::timeout(LISTING_WAIT, request(client, uuids, &window)).await
+        {
             collect(&mut measured, answers);
         }
     }

@@ -1573,6 +1573,47 @@ async fn scan_hosted_paths_run_once_per_project_directory() {
     );
 }
 
+/// The read made ahead of a multi-directory scan asks the patch service
+/// only what each directory's own scan would ask: a package the project
+/// patches itself is protected before any question, there as in the
+/// scan, and so is one a selection filter leaves out.
+#[tokio::test]
+async fn scan_of_several_directories_asks_about_no_package_a_scan_leaves_out() {
+    // Without and with the projects' own patch of `left-pad`: the first
+    // shows the package is asked about when nothing protects it.
+    for patched in [false, true] {
+        let mock = MockServer::start().await;
+        mount_batch_one(&mock, MINIMIST, UUID, "free", &[], false).await;
+        mount_by_package(&mock, MINIMIST, UUID, serde_json::json!({})).await;
+        mount_forbidden_reference(&mock, MINIMIST).await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        for app in ["apps/a", "apps/b"] {
+            let dir = tmp.path().join(app);
+            std::fs::create_dir_all(&dir).unwrap();
+            write_root_package_json(&dir);
+            write_npm_package(&dir, "minimist", "1.2.2", b"x\n");
+            write_npm_package(&dir, "left-pad", "1.3.0", b"x\n");
+            if patched {
+                std::fs::create_dir_all(dir.join("patches")).unwrap();
+                std::fs::write(dir.join("patches/left-pad+1.3.0.patch"), "diff\n").unwrap();
+            }
+        }
+
+        let (code, stdout, stderr) = run_scan_api(tmp.path(), &mock.uri(), &["apps/*"]);
+        assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
+        let bodies = batch_bodies(&recorded(&mock).await);
+        assert_eq!(bodies.len(), 1, "one lookup for the run: {bodies:#?}");
+        assert!(bodies[0].contains("minimist"), "{bodies:#?}");
+        assert_eq!(
+            bodies[0].contains("left-pad"),
+            !patched,
+            "patched={patched}: a package the project patches itself is not asked about: \
+             {bodies:#?}"
+        );
+    }
+}
+
 /// The PnP layout refusal rides a NON-empty human scan (polyglot repo):
 /// another ecosystem's discovery does not silently bless the structurally
 /// invisible npm half.

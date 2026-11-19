@@ -53,6 +53,42 @@ pub(crate) struct InvocationPolicy {
     pub scanned_dirs: std::sync::OnceLock<Vec<PathBuf>>,
 }
 
+impl InvocationPolicy {
+    /// The project at `root_dir` as the policy names it (its path below
+    /// the repository root), and whether the policy admits it as a whole.
+    fn root_verdict(
+        &self,
+        root_dir: &Path,
+        explicit: bool,
+        global: bool,
+    ) -> (String, Result<(), FilterReason>) {
+        let root_dir = std::fs::canonicalize(root_dir).unwrap_or_else(|_| root_dir.to_path_buf());
+        let project = repo_relative_checked(&self.repo_root, &root_dir).unwrap_or_default();
+        let verdict = if global {
+            Ok(())
+        } else {
+            let markers = dir_markers(&root_dir);
+            self.policy.admits_root(&Root {
+                rel_dir: &project,
+                markers: &markers,
+                explicit,
+            })
+        };
+        (project, verdict)
+    }
+
+    /// Whether the scan of the project at `root_dir` may ask the patch
+    /// service about a package: the policy admits the project as a whole
+    /// and the package. What [`ScanPolicy::for_root`] and
+    /// [`ScanPolicy::admit_crawled`] decide for a scan, without their
+    /// report, for the read made ahead of the scans: a package the
+    /// policy leaves out is not asked about there either.
+    pub(crate) fn asks_about(&self, root_dir: &Path, explicit: bool) -> impl Fn(&str) -> bool + '_ {
+        let admitted = self.root_verdict(root_dir, explicit, false).1.is_ok();
+        move |purl| admitted && self.policy.admits_purl(purl).is_ok()
+    }
+}
+
 /// Load the policy for `args` (4.5): `--global` scans have no repo and read
 /// no file; everything else reads the repo root's socket.yml. The
 /// invocation's selection filter narrows either.
@@ -166,18 +202,7 @@ impl ScanPolicy {
         explicit: bool,
         global: bool,
     ) -> Self {
-        let root_dir = std::fs::canonicalize(root_dir).unwrap_or_else(|_| root_dir.to_path_buf());
-        let project = repo_relative_checked(&invocation.repo_root, &root_dir).unwrap_or_default();
-        let root_verdict = if global {
-            Ok(())
-        } else {
-            let markers = dir_markers(&root_dir);
-            invocation.policy.admits_root(&Root {
-                rel_dir: &project,
-                markers: &markers,
-                explicit,
-            })
-        };
+        let (project, root_verdict) = invocation.root_verdict(root_dir, explicit, global);
         let mut warnings = invocation.warnings.clone();
         if !invocation.policy.enabled() {
             warnings.push(PolicyWarning {

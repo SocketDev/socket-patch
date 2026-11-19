@@ -1753,7 +1753,7 @@ async fn run_project_dirs(
     // The slow, read-only half of every directory's scan, for all of them
     // at once (see `ahead`). The directories are then scanned one by one,
     // in order, as before: their output and the patch budget stay ordered.
-    let mut crawled = ahead(&args, &dirs, report).await.into_iter();
+    let mut crawled = ahead(&args, &dirs, invocation, report).await.into_iter();
     let mut code = 0;
     for (dir, explicit) in &dirs {
         if dirs.len() > 1 && !args.common.silent {
@@ -1791,6 +1791,9 @@ struct Crawled {
     packages: Vec<socket_patch_core::crawlers::CrawledPackage>,
     skipped_bundle_config_path: Option<String>,
     npm: Option<crate::ecosystem_dispatch::NpmCrawlSnapshot>,
+    /// What the project patches itself, read with the crawl: the scan
+    /// takes it instead of reading the project's files again.
+    user_patches: Option<socket_patch_core::patch::user_patches::UserPatchIndex>,
 }
 
 impl Crawled {
@@ -1843,6 +1846,7 @@ const AHEAD_AT_ONCE: usize = 8;
 async fn ahead(
     args: &ScanArgs,
     dirs: &[(PathBuf, bool)],
+    invocation: &InvocationPolicy,
     report: &mut report::Run,
 ) -> Vec<Option<Crawled>> {
     use futures_util::StreamExt as _;
@@ -1876,10 +1880,14 @@ async fn ahead(
     let mut status = StatusLine::stderr(args.common.json, args.common.silent);
 
     // Every directory's crawl, and the purls its scan may ask about: what
-    // is installed, and what only its lockfiles and vendor ledger name.
+    // is installed, and what only its lockfiles and vendor ledger name,
+    // less what its scan leaves out before it asks (a package the
+    // socket.yml policy or a selection filter excludes, and one the
+    // project patches itself): nothing is asked here that the directory's
+    // own scan would not ask.
     status.progress("Scanning projects", 0, dirs.len());
     let mut crawls = futures_util::stream::iter(dirs.iter().enumerate())
-        .map(|(index, (dir, _))| async move {
+        .map(|(index, (dir, explicit))| async move {
             let mut common = args.common.clone();
             common.cwd = dir.clone();
             let options = common.crawler_options();
@@ -1901,6 +1909,15 @@ async fn ahead(
                 .chain(&ledger.packages)
                 .map(|package| package.purl.clone())
                 .collect();
+            let user_patches = super::user_patches::inspect(&common).await;
+            let asks = invocation.asks_about(dir, *explicit);
+            let purls: Vec<String> = purls
+                .into_iter()
+                .filter(|purl| asks(purl))
+                .filter(|purl| {
+                    args.common.allow_patch_conflicts || user_patches.conflicts(purl).is_empty()
+                })
+                .collect();
             let purls = with_pypi_equivalents(&purls, &lockfile_only.purls);
             let crawled = Crawled {
                 options,
@@ -1908,6 +1925,7 @@ async fn ahead(
                 packages,
                 skipped_bundle_config_path,
                 npm,
+                user_patches: Some(user_patches),
             };
             (index, crawled, purls)
         })
@@ -2370,11 +2388,21 @@ async fn scan_project(
         }
     };
     // The project's own patches (the consent gate below) are read beside
-    // the crawl ([`Beside`]), and collected where they were always used.
-    let mut project_patches = Beside::start({
-        let common = args.common.clone();
-        async move { super::user_patches::inspect(&common).await }
-    });
+    // the crawl ([`Beside`]), and collected where they were always used;
+    // a run over several project directories read them ahead, with this
+    // directory's crawl.
+    let mut ahead = ahead;
+    let mut patches_read_ahead = ahead
+        .as_mut()
+        .and_then(|crawled| crawled.user_patches.take());
+    let mut project_patches = if patches_read_ahead.is_some() {
+        None
+    } else {
+        Beside::start({
+            let common = args.common.clone();
+            async move { super::user_patches::inspect(&common).await }
+        })
+    };
     // A run over several project directories crawled this one ahead of
     // its turn (`ahead`): that crawl stands in for this one when it was
     // made the same way.
@@ -2721,9 +2749,10 @@ async fn scan_project(
     let mut filtered_crawled = policy.admit_crawled_copies(filtered_crawled, &supplement_purls);
     // Keep the full crawl above for GC: a protected package is still installed.
     // Protect before querying/selecting, in every mode and in dry-run previews.
-    let user_patches = match project_patches.take() {
-        Some(started) => started.done().await,
-        None => super::user_patches::inspect(&args.common).await,
+    let user_patches = match (patches_read_ahead.take(), project_patches.take()) {
+        (Some(read), _) => read,
+        (None, Some(started)) => started.done().await,
+        (None, None) => super::user_patches::inspect(&args.common).await,
     };
     let mut user_patch_withheld = 0usize;
     // Of those, the ones held back only because a project file could not
@@ -3215,6 +3244,32 @@ async fn scan_project(
         }
     }
 
+    // The project directories below that this run did not read, now that
+    // the lookup is in (and before a lookup that failed ends the run:
+    // that this run would not have covered them is news either way): usually found by now, else the status says what
+    // the run is waiting for.
+    if searches_below {
+        status.set("Looking for other projects");
+        let left = match left_below.take() {
+            Some(started) => started.done().await,
+            None => {
+                search_below(
+                    args.common.clone(),
+                    invocation.policy.clone(),
+                    invocation.repo_root.clone(),
+                )
+                .await
+            }
+        };
+        let warnings = projects_left_warnings(&left);
+        if human {
+            for (_, detail) in &warnings {
+                status.println(format!("Warning: {detail}"));
+            }
+        }
+        layout_refusals.splice(projects_left_at..projects_left_at, warnings);
+    }
+
     // If every batch errored, surface a full scan failure rather than
     // silently reporting zero patches.
     if total_batches > 0 && batch_error_count == total_batches {
@@ -3252,31 +3307,6 @@ async fn scan_project(
     // A package the lookup missed could have been NEW, like one in a
     // failed batch.
     let lookup_incomplete = batch_error_count > 0 || !unanswered.is_empty();
-
-    // The project directories below that this run did not read, now that
-    // the lookup is in: usually found by now, else the status says what
-    // the run is waiting for.
-    if searches_below {
-        status.set("Looking for other projects");
-        let left = match left_below.take() {
-            Some(started) => started.done().await,
-            None => {
-                search_below(
-                    args.common.clone(),
-                    invocation.policy.clone(),
-                    invocation.repo_root.clone(),
-                )
-                .await
-            }
-        };
-        let warnings = projects_left_warnings(&left);
-        if human {
-            for (_, detail) in &warnings {
-                status.println(format!("Warning: {detail}"));
-            }
-        }
-        layout_refusals.splice(projects_left_at..projects_left_at, warnings);
-    }
 
     // The lookup's outcome is the run's result line on stdout below (what
     // was patched, or "No patches available for installed packages."), so
