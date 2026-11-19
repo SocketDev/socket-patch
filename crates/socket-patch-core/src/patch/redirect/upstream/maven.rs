@@ -454,8 +454,14 @@ pub(crate) async fn restore(
     let mut checksum_dirs: Vec<String> = Vec::new();
     let mut restored: Vec<&str> = Vec::new();
     for pin in pins.values() {
+        // The poms among the pin's files. A checkout that another build
+        // reads too wires the pin in a file of that build as well (the
+        // sbt file, the Gradle index), which is its own restorer's to
+        // take out.
+        let own = pin.files.iter().filter(|rel| files.contains(rel));
+        let mut poms: Vec<String> = own.cloned().collect();
         // A file that could not be read refused the pin above.
-        if pin.files.iter().any(|rel| !originals.contains_key(rel)) {
+        if poms.iter().any(|rel| !originals.contains_key(rel)) {
             continue;
         }
         let Some((name, base)) = pin.name_version() else {
@@ -477,7 +483,6 @@ pub(crate) async fn restore(
             crate::vendor::jvm::maven_reactor::PIN_TAG,
             pin.uuid
         );
-        let mut poms: Vec<String> = pin.files.clone();
         for (rel, text) in &reactor_poms {
             let carries =
                 text.contains(&suffixed) || text.contains(&repository_id) || text.contains(&tag);
@@ -1688,6 +1693,31 @@ mod tests {
         let why = refusal(&outcome);
         assert!(why.contains("a/pom.xml"), "{why}");
         assert_eq!(read_tree(tmp.path()), wired, "nothing changed");
+    }
+
+    /// A pin is one patch of one package in every file that wires it, and
+    /// a checkout that two builds read is wired in a file of each: here
+    /// `pom.xml` beside the `socket-patch.sbt` of an sbt build (the Gradle
+    /// index is another). Each restorer takes the pin out of its own
+    /// files, so the pom comes back whatever else the pin lists.
+    #[tokio::test]
+    async fn a_pin_another_build_wires_too_is_restored_in_its_pom() {
+        let case = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/sbt/redirect/pom-also-present");
+        let before = read_tree(&case.join("input"));
+        let tmp = tempfile::tempdir().unwrap();
+        for tree in [&before, &read_tree(&case.join("expected"))] {
+            let files: Vec<(&str, String)> = tree
+                .iter()
+                .map(|(rel, text)| (rel.as_str(), text.clone()))
+                .collect();
+            write_tree(tmp.path(), &files);
+        }
+        let pins = discovered(tmp.path()).await;
+        assert_eq!(pins.len(), 1, "{pins:?}");
+        assert_eq!(pins[0].files, ["pom.xml", "socket-patch.sbt"]);
+        roll_back("a pom beside an sbt build", tmp.path()).await;
+        assert_eq!(read_tree(tmp.path()), before);
     }
 
     /// An earlier release's pin is read by its shape only in a single pom.
