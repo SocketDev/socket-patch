@@ -6494,6 +6494,26 @@ snapshots:
         assert!(done.rewrite.files.is_empty(), "{:?}", done.rewrite.files);
         write(".mvn/maven.config", config);
 
+        // A settings path with a space, on a line of its own as Maven 3.9
+        // and later read `maven.config`: the file is opened whole, and the
+        // mirror in it gates the pin.
+        write("team settings/settings.xml", &settings("*"));
+        write(
+            ".mvn/maven.config",
+            "-s\nteam settings/settings.xml\n-gs\nglobal.xml\n",
+        );
+        write("settings.xml", &settings("central"));
+        let (read, done) = gradle_rewrite_in(&view).await;
+        assert!(read.files.contains_key(MAVEN_MIRRORS_KEY));
+        assert!(done.rewrite.files.is_empty(), "{:?}", done.rewrite.files);
+        assert!(done
+            .rewrite
+            .warnings
+            .iter()
+            .any(|w| w.code == "redirect_maven_mirror_captures_repository"
+                && w.detail.contains("team settings")));
+        write(".mvn/maven.config", config);
+
         // In memory: the files are there, but no machine to read them for.
         let mut p = MemoryProject::new();
         p.insert_text("pom.xml", pom);

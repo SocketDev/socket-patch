@@ -26,6 +26,7 @@
 use std::path::{Path, PathBuf};
 
 use super::{character_data, interpolate};
+use crate::formats::maven::maven_config_line_args;
 use crate::formats::maven::mirror::{merge, Mirror};
 use crate::gradle::home::{split_opts, system_property};
 use crate::gradle::{Env, Os};
@@ -78,9 +79,23 @@ pub(crate) fn parse_mirrors(
 /// The id Maven's settings model gives a `<mirror>` that declares none.
 const DEFAULT_MIRROR_ID: &str = "default";
 
-/// The value of the option `short` / `long` in `args`: `-s path`,
-/// `--settings path` or `--settings=path`. The first one wins, as in Maven.
-fn option_value(args: &[String], short: &str, long: &str) -> Option<String> {
+/// The value of the option `short` / `long` in `args`, in the spellings
+/// Maven takes (measured on 3.8.9, 3.9.9 and 4.0.0-rc-7): `-s path`,
+/// `--settings path` (the value is the next argument), `--settings=path`,
+/// and `-spath`, the value joined to the short option. A joined value is
+/// taken as Maven takes it when it begins with a blank (`-s path` held in
+/// ONE argument, which is what a Maven that reads one argument per line
+/// makes of such a line: it then looks for a file whose name begins with
+/// that blank, finds none, and does not start). Any other joined value is
+/// taken only when `is_file` says it names a file: other options begin
+/// with the same letters, and a name taken by mistake would stand in for
+/// the settings Maven really reads. The first one wins, as in Maven.
+fn option_value(
+    args: &[String],
+    short: &str,
+    long: &str,
+    is_file: &dyn Fn(&str) -> bool,
+) -> Option<String> {
     let mut args = args.iter();
     while let Some(arg) = args.next() {
         if arg == short || arg == long {
@@ -92,19 +107,42 @@ fn option_value(args: &[String], short: &str, long: &str) -> Option<String> {
         {
             return Some(value.to_string());
         }
+        if let Some(value) = arg
+            .strip_prefix(short)
+            .filter(|value| !arg.starts_with("--") && !value.is_empty())
+        {
+            if value.starts_with(char::is_whitespace) || is_file(value) {
+                return Some(value.to_string());
+            }
+        }
     }
     None
 }
 
-/// The arguments of a `.mvn/maven.config`, as either Maven splits it: one
-/// per line (3.9+), or on whitespace (before). `#` lines are comments.
-fn config_args(config: &str) -> Vec<String> {
-    config
+/// The arguments of a `.mvn/maven.config`, as the project's Maven reads
+/// the file: one per line, so a path may hold spaces (Maven 3.9 and later,
+/// Maven 4: [`maven_config_line_args`]), or split on whitespace, where it
+/// may not (before 3.9). `#` lines are comments.
+///
+/// `maven` is the release the project's Maven Wrapper pins, which decides
+/// the reading. With no wrapper nothing says which Maven reads the file,
+/// so where the two readings differ both are weighed, each a way the
+/// build may be started (the whitespace one first: a line it splits is
+/// one a Maven 3.9 does not start with).
+fn config_readings(config: &str, maven: Option<(u32, u32, u32)>) -> Vec<Vec<String>> {
+    let by_line: Vec<String> = maven_config_line_args(config).map(str::to_string).collect();
+    let by_whitespace: Vec<String> = config
         .lines()
         .filter(|line| !line.trim_start().starts_with('#'))
         .flat_map(str::split_whitespace)
         .map(str::to_string)
-        .collect()
+        .collect();
+    match maven {
+        Some(release) if release >= (3, 9, 0) => vec![by_line],
+        Some(_) => vec![by_whitespace],
+        None if by_line == by_whitespace => vec![by_line],
+        None => vec![by_whitespace, by_line],
+    }
 }
 
 /// The merged mirrors of each way Maven may be started for the project at
@@ -144,37 +182,6 @@ pub(crate) fn settings_mirror_sets(
                 .filter(|h| is_usable_home(h))
                 .map(Path::to_path_buf)
         });
-    // The command line (MAVEN_ARGS) wins over `.mvn/maven.config`.
-    let mut args = set("MAVEN_ARGS")
-        .map(|opts| split_opts(&opts, os))
-        .unwrap_or_default();
-    args.extend(maven_config.map(config_args).unwrap_or_default());
-    let named = |short: &str, long: &str| {
-        option_value(&args, short, long).map(|path| {
-            let path = PathBuf::from(path);
-            if path.has_root() {
-                path
-            } else {
-                root.join(path)
-            }
-        })
-    };
-    let user = named("-s", "--settings").or_else(|| {
-        user_home
-            .as_ref()
-            .map(|h| h.join(".m2").join("settings.xml"))
-    });
-    let global = named("-gs", "--global-settings").or_else(|| {
-        wrapper_settings(root, set("MAVEN_USER_HOME"), user_home.as_deref())
-            .or_else(|| path_settings(set("PATH"), os))
-            .or_else(|| {
-                set("MAVEN_HOME")
-                    .or_else(|| set("M2_HOME"))
-                    .map(|home| PathBuf::from(home).join("conf").join("settings.xml"))
-            })
-    });
-    let project = root.join(".mvn").join("settings.xml");
-
     let lookup = |name: &str| match name {
         "user.home" => user_home.as_ref().map(|h| h.display().to_string()),
         _ => match name.strip_prefix("env.") {
@@ -189,13 +196,62 @@ pub(crate) fn settings_mirror_sets(
             Err(_) => Vec::new(),
         }
     };
-    let global = global.as_deref().map(read).unwrap_or_default();
-    let mut sets = vec![merge(
-        user.as_deref().map(read).unwrap_or_default(),
-        global.clone(),
-    )];
-    if project.is_file() && user.as_deref() != Some(project.as_path()) {
-        sets.push(merge(read(&project), global));
+    let rooted = |path: &str| {
+        let path = PathBuf::from(path);
+        if path.has_root() {
+            path
+        } else {
+            root.join(path)
+        }
+    };
+    let is_file = |path: &str| rooted(path).is_file();
+    let project = root.join(".mvn").join("settings.xml");
+    // The command line (MAVEN_ARGS) wins over `.mvn/maven.config`, which
+    // is read both ways a Maven reads it.
+    let command_line = set("MAVEN_ARGS")
+        .map(|opts| split_opts(&opts, os))
+        .unwrap_or_default();
+    let wrapper_maven = crate::utils::fs::read_regular_to_bytes_sync(
+        &root
+            .join(".mvn")
+            .join("wrapper")
+            .join("maven-wrapper.properties"),
+    )
+    .ok()
+    .and_then(|props| crate::crawlers::gradle_cache::wrapper_distribution_version(&props, "maven"));
+    let readings = match maven_config {
+        Some(config) => config_readings(config, wrapper_maven),
+        None => vec![Vec::new()],
+    };
+    let mut sets = Vec::new();
+    for reading in readings {
+        let mut args = command_line.clone();
+        args.extend(reading);
+        let named = |short: &str, long: &str| {
+            option_value(&args, short, long, &is_file).map(|p| rooted(&p))
+        };
+        let user = named("-s", "--settings").or_else(|| {
+            user_home
+                .as_ref()
+                .map(|h| h.join(".m2").join("settings.xml"))
+        });
+        let global = named("-gs", "--global-settings").or_else(|| {
+            wrapper_settings(root, set("MAVEN_USER_HOME"), user_home.as_deref())
+                .or_else(|| path_settings(set("PATH"), os))
+                .or_else(|| {
+                    set("MAVEN_HOME")
+                        .or_else(|| set("M2_HOME"))
+                        .map(|home| PathBuf::from(home).join("conf").join("settings.xml"))
+                })
+        });
+        let global = global.as_deref().map(&read).unwrap_or_default();
+        sets.push(merge(
+            user.as_deref().map(&read).unwrap_or_default(),
+            global.clone(),
+        ));
+        if project.is_file() && user.as_deref() != Some(project.as_path()) {
+            sets.push(merge(read(&project), global));
+        }
     }
     sets.retain(|mirrors| !mirrors.is_empty());
     sets.dedup();
@@ -424,6 +480,107 @@ mod tests {
         assert_eq!(sets(&missing, None), Vec::<Vec<Mirror>>::new());
         // No home at all: nothing to read.
         assert_eq!(sets(&BTreeMap::new(), None), Vec::<Vec<Mirror>>::new());
+    }
+
+    /// `.mvn/maven.config` is read both ways a Maven reads it. Maven 3.9
+    /// and later take one argument per line, so a settings path may hold
+    /// a space; before 3.9 the file is split on whitespace. Measured on
+    /// Maven 3.8.9, 3.9.9 and 4.0.0-rc-7. A path the line reading names is
+    /// opened whole: read split, it would name no file, the mirror in it
+    /// would go unseen, and the pin would be written into a build that
+    /// cannot resolve it.
+    #[test]
+    fn maven_config_is_read_one_argument_per_line_and_split_on_whitespace() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let root = tmp.path().join("proj");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        write(
+            &root.join("my settings/team settings.xml"),
+            &settings(&[("spaced", "*")]),
+        );
+        write(&root.join("conf/team.xml"), &settings(&[("team", "*")]));
+        let base = env(&[("HOME", &home)]);
+        let sets =
+            |config: &str| settings_mirror_sets(&base, Os::current(), None, &root, Some(config));
+        // One argument per line: every spelling Maven 3.9+ takes.
+        for config in [
+            "-s\nmy settings/team settings.xml\n",
+            "--settings\nmy settings/team settings.xml\n",
+            "--settings=my settings/team settings.xml\n",
+            "-smy settings/team settings.xml\n",
+            "\"-s\"\n\"my settings/team settings.xml\"\n",
+            "-B\n# the team's settings\n  -s  \n  my settings/team settings.xml  \n-o\n",
+            // The global settings are named the same way.
+            "-gs\nmy settings/team settings.xml\n",
+            "--global-settings=my settings/team settings.xml\n",
+        ] {
+            assert_eq!(captured(&sets(config)), Some("spaced"), "{config:?}");
+        }
+        // Split on whitespace: what a Maven before 3.9 makes of one line.
+        for config in [
+            "-B -s conf/team.xml\n",
+            "-B --settings conf/team.xml -o\n",
+            "-o -gs conf/team.xml\n",
+        ] {
+            assert_eq!(captured(&sets(config)), Some("team"), "{config:?}");
+        }
+        // An option that only begins like `-s` names no settings file, and
+        // does not stand in for the ones Maven reads.
+        write(&home.join(".m2/settings.xml"), &settings(&[("home", "*")]));
+        assert_eq!(captured(&sets("-sadp\n-ntp\n")), Some("home"));
+        // `-s path` on one line: a Maven that reads one argument per line
+        // looks for a file whose name begins with the blank and does not
+        // start, so that reading names no settings (and the default ones
+        // are not read instead); split on whitespace it names the file.
+        assert_eq!(captured(&sets("-s conf/team.xml\n")), Some("team"));
+        std::fs::remove_file(root.join("conf/team.xml")).unwrap();
+        assert_eq!(captured(&sets("-s conf/team.xml\n")), None);
+        // The arguments themselves. With no wrapper nothing says which
+        // Maven reads the file, so both readings are weighed where they
+        // differ; a wrapper's Maven decides.
+        let (line, split) = (
+            vec!["-s".to_string(), "my settings/x.xml".to_string()],
+            vec![
+                "-s".to_string(),
+                "my".to_string(),
+                "settings/x.xml".to_string(),
+            ],
+        );
+        let spaced = "-s\nmy settings/x.xml\n";
+        assert_eq!(config_readings(spaced, None), [split.clone(), line.clone()]);
+        assert_eq!(config_readings(spaced, Some((3, 9, 0))), [line.clone()]);
+        assert_eq!(config_readings(spaced, Some((4, 0, 0))), [line]);
+        assert_eq!(config_readings(spaced, Some((3, 8, 9))), [split]);
+        assert_eq!(
+            config_readings("-B\n-ntp\n", None),
+            [vec!["-B".to_string(), "-ntp".to_string()]]
+        );
+
+        // The same through the settings lookup. Under a wrapper that pins
+        // a Maven before 3.9 a path with a space names no file (and that
+        // Maven does not start); under one that pins 3.9 or later a line
+        // of several options names none.
+        std::fs::remove_file(home.join(".m2/settings.xml")).unwrap();
+        write(&root.join("conf/team.xml"), &settings(&[("team", "*")]));
+        let wrapper = |version: &str| {
+            write(
+                &root.join(".mvn/wrapper/maven-wrapper.properties"),
+                &format!(
+                    "distributionUrl=https\\://repo.maven.apache.org/maven2/org/apache/maven/\
+                     apache-maven/{version}/apache-maven-{version}-bin.zip\n"
+                ),
+            );
+        };
+        let spaced = "-s\nmy settings/team settings.xml\n";
+        let several = "-B -s conf/team.xml\n";
+        wrapper("3.9.9");
+        assert_eq!(captured(&sets(spaced)), Some("spaced"));
+        assert_eq!(captured(&sets(several)), None);
+        wrapper("3.8.9");
+        assert_eq!(captured(&sets(spaced)), None);
+        assert_eq!(captured(&sets(several)), Some("team"));
     }
 
     #[test]

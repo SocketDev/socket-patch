@@ -1180,15 +1180,24 @@ Honest limits of the Maven and NuGet flows — documented behavior, not bugs:
     it, on every machine that builds, then scan again. Maven compares whole repository
     ids: there is no pattern for "every Socket repository" (`!socket-patch-*` excludes
     nothing), and each patch has its own id, so each new patch needs its own exclusion.
-  - **Use vendored mode.** `scan --mode vendored` commits the patched artifact and reads
-    it through `maven.repo.local.tail`, which no mirror redirects (Maven 3.9.2+).
+  - **Use vendored mode, on Maven 3.9.2 or later.** `scan --mode vendored` commits the
+    patched artifact and reads it through `maven.repo.local.tail`, which no mirror
+    redirects. Maven reads that setting from 3.9.2 on. An older Maven reads a vendored
+    patch through the `socket-patch-vendor` file repository, which a mirror of everything
+    takes as well, so there vendored mode needs the mirror to leave `socket-patch-vendor`
+    out (one id for every vendored patch). The warning says which applies: when the
+    project's Maven Wrapper pins a Maven older than 3.9.2 it does not offer vendored mode
+    as the project stands.
 
   What is read: the user settings (`-s` / `--settings` in `MAVEN_ARGS`, then in
   `.mvn/maven.config`, else `~/.m2/settings.xml`) merged over the global settings (`-gs`
   / `--global-settings` likewise, else `conf/settings.xml` of the Maven Wrapper's
   unpacked distribution, of the `mvn` on `PATH`, or, with none there, of `$MAVEN_HOME`
-  / `$M2_HOME`), and a `.mvn/settings.xml` the project keeps. The matching is Maven's
-  own: a mirror whose `<mirrorOf>` names the repository's id, alone or in a list
+  / `$M2_HOME`), and a `.mvn/settings.xml` the project keeps. `.mvn/maven.config` is
+  read as the project's Maven reads it: one argument per line from Maven 3.9 on (so a
+  settings path may hold spaces), split on whitespace before; the Maven Wrapper's
+  release decides, and without a wrapper both readings are weighed. The matching is
+  Maven's own: a mirror whose `<mirrorOf>` names the repository's id, alone or in a list
   (`central,socket-patch-<uuid>`), was written for that repository and is not a reason
   to skip; a mirror with no `<id>` counts under Maven's default id; `external:http:*` (the blocker Maven ships) never matches the
   HTTPS Socket repository; `<mirrorOfLayouts>` is honoured. **Only the scanning

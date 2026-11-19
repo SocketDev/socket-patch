@@ -9062,6 +9062,12 @@ fn rewrite_maven_pom(
             .iter()
             .any(|(rel, text)| !sbt::is_synthetic_key(rel) && text.contains(&id))
     };
+    // The Maven the project's wrapper pins, as vendored mode reads it: the
+    // warning's advice depends on it.
+    let wrapper = crate::vendor::jvm::wrapper_version(
+        &|rel: &str| files.get(rel).map(|text| text.as_bytes().to_vec()),
+        "maven",
+    );
     let mut wired: Vec<DepOverride> = Vec::with_capacity(overrides.len());
     for dep in overrides {
         let gate = (dep.ecosystem == "maven")
@@ -9095,7 +9101,7 @@ fn rewrite_maven_pom(
         };
         result.warnings.push(RewriteWarning {
             code: "redirect_maven_mirror_captures_repository".into(),
-            detail: maven_mirror_detail(&ga, &repo_id, mirror),
+            detail: maven_mirror_detail(&ga, &repo_id, mirror, wrapper),
         });
         result.maven_reactor_uuids.insert(dep.patch_uuid.clone());
     }
@@ -10031,23 +10037,58 @@ fn pin_maven_checksums(
     }
 }
 
-/// Why a dep is not wired behind `mirror`, and the two ways forward. The
+/// Why a dep is not wired behind `mirror`, and the ways forward. The
 /// settings read are the scanning machine's, which the line says: the
 /// machine that builds may be configured otherwise.
+///
+/// The second way forward is vendored mode, and only where it is one. A
+/// vendored patch gets past a mirror through `maven.repo.local.tail`,
+/// which Maven reads from 3.9.2 on; an older Maven reads it through
+/// vendored mode's own file repository, which a mirror of everything takes
+/// like any other. So the advice names that bound, and for a project whose
+/// Maven Wrapper pins an older Maven (`wrapper`, as vendored mode itself
+/// reads it) it does not offer vendored mode as it stands, but says what
+/// makes it work.
 fn maven_mirror_detail(
     ga: &str,
     repo_id: &str,
     mirror: &crate::formats::maven::mirror::Mirror,
+    wrapper: Option<(u32, u32, u32)>,
 ) -> String {
+    let vendor_repo = crate::vendor::jvm::maven_reactor::REPO_ID;
+    let exclude = format!(
+        "exclude the repository from that mirror (<mirrorOf>{of},!{repo_id}</mirrorOf>; Maven \
+         matches whole repository ids, so each patch needs its own exclusion) and re-run",
+        of = mirror.mirror_of,
+    );
+    let ways = match wrapper {
+        Some((major, minor, patch)) if (major, minor, patch) < (3, 9, 2) => format!(
+            "To patch it, {exclude}. `scan --mode vendored` is no way round the mirror for \
+             this project as it stands: its Maven Wrapper pins Maven {major}.{minor}.{patch}, \
+             and a Maven before 3.9.2 reads a vendored patch through the `{vendor_repo}` file \
+             repository, which this mirror would take as well. Vendored mode does work once \
+             the wrapper pins Maven 3.9.2 or later, or once the mirror also leaves \
+             `{vendor_repo}` out (one id for every vendored patch)"
+        ),
+        Some((major, minor, patch)) => format!(
+            "Either {exclude}, or patch with `scan --mode vendored`, which commits the patched \
+             artifact: Maven {major}.{minor}.{patch}, which the Maven Wrapper pins, reads it \
+             through maven.repo.local.tail, which no mirror redirects"
+        ),
+        None => format!(
+            "Either {exclude}, or patch with `scan --mode vendored`, which commits the patched \
+             artifact: Maven 3.9.2 and later read it through maven.repo.local.tail, which no \
+             mirror redirects (an older Maven reads it through the `{vendor_repo}` file \
+             repository, which this mirror would take as well unless it leaves that id out \
+             too)"
+        ),
+    };
     format!(
         "{ga}: on this machine Maven's settings send the {repo_id} repository to the mirror \
          `{id}` (<mirrorOf>{of}</mirrorOf> in {source}), which does not serve the patched \
          artifact, so the build could not resolve it; pom.xml and .mvn/ were left as they are \
-         and the dep is not counted as redirected. Either exclude the repository from that \
-         mirror (<mirrorOf>{of},!{repo_id}</mirrorOf>; Maven matches whole repository ids, so \
-         each patch needs its own exclusion) and re-run, or patch with `scan --mode vendored`, \
-         which commits the patched artifact and works behind a mirror. Only this machine's \
-         settings were read: the machine that builds needs the same exclusion",
+         and the dep is not counted as redirected. {ways}. Only this machine's settings were \
+         read: the machine that builds needs the same exclusion",
         id = mirror.id,
         of = mirror.mirror_of,
         source = mirror.source,
@@ -11563,6 +11604,84 @@ mod tests {
             r.maven_reactor_uuids.contains(MAVEN_UUID)
                 && r.confirmed_maven_reactor_uuids.is_empty()
         );
+    }
+
+    /// The advice of the warning must lead somewhere. Vendored mode gets
+    /// past a mirror through `maven.repo.local.tail`, which Maven reads
+    /// from 3.9.2 on; an older Maven reads a vendored patch through the
+    /// `socket-patch-vendor` file repository, which the same mirror takes.
+    /// So the bound is in the text, and a project whose wrapper pins an
+    /// older Maven is not sent to vendored mode as it stands.
+    #[test]
+    fn maven_mirror_warning_offers_vendored_mode_only_where_it_works() {
+        let pom = pom_with_dep("\n      <version>1.7.36</version>", "");
+        let detail = |wrapper: Option<&str>| -> String {
+            let mut files: BTreeMap<String, String> = [("pom.xml".to_string(), pom.clone())]
+                .into_iter()
+                .chain([maven_mirrors(&[("corp", "*")])])
+                .collect();
+            if let Some(version) = wrapper {
+                files.insert(MVN_WRAPPER_PROPERTIES.to_string(), maven_wrapper(version));
+            }
+            let r = rewrite_registry_redirect(&files, &[granted_maven_override()]);
+            assert_eq!(
+                warning_codes(&r),
+                ["redirect_maven_mirror_captures_repository"],
+                "{wrapper:?}"
+            );
+            assert!(r.files.is_empty(), "{wrapper:?}");
+            r.warnings[0].detail.clone()
+        };
+        let exclusion = format!("<mirrorOf>*,!socket-patch-{MAVEN_UUID}</mirrorOf>");
+
+        // No wrapper: the Maven is not known, so the bound is given, with
+        // what an older Maven needs.
+        let unknown = detail(None);
+        for part in [
+            exclusion.as_str(),
+            "or patch with `scan --mode vendored`",
+            "Maven 3.9.2 and later read it through maven.repo.local.tail",
+            "an older Maven reads it through the `socket-patch-vendor` file repository",
+        ] {
+            assert!(unknown.contains(part), "{part}: {unknown}");
+        }
+
+        // A wrapper that pins a Maven which reads the tail: offered, and
+        // said of that Maven.
+        for version in ["3.9.2", "3.9.16", "4.0.0"] {
+            let offered = detail(Some(version));
+            for part in [
+                exclusion.as_str(),
+                "or patch with `scan --mode vendored`",
+                &format!("Maven {version}, which the Maven Wrapper pins, reads it through"),
+            ] {
+                assert!(offered.contains(part), "{version}: {part}: {offered}");
+            }
+            assert!(!offered.contains("is no way round"), "{version}: {offered}");
+        }
+
+        // A wrapper that pins an older Maven: vendored mode is not a way
+        // out as the project stands, and the text says what is.
+        for version in ["3.6.3", "3.8.9", "3.9.1"] {
+            let withheld = detail(Some(version));
+            for part in [
+                exclusion.as_str(),
+                "`scan --mode vendored` is no way round the mirror",
+                &format!("its Maven Wrapper pins Maven {version}"),
+                "once the wrapper pins Maven 3.9.2 or later",
+                "once the mirror also leaves `socket-patch-vendor` out",
+            ] {
+                assert!(withheld.contains(part), "{version}: {part}: {withheld}");
+            }
+            assert!(
+                !withheld.contains("or patch with `scan --mode vendored`"),
+                "{version}: {withheld}"
+            );
+        }
+        // One line of prose each way.
+        for text in [detail(None), detail(Some("3.9.16")), detail(Some("3.8.9"))] {
+            assert!(!text.contains("  "), "{text:?}");
+        }
     }
 
     /// The gate is for a dep that would get a repository. One the rewriter
