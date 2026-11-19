@@ -4167,3 +4167,302 @@ async fn an_agent_patched_install_the_run_may_not_replace_is_warned_about() {
     assert_eq!(std::fs::read(&cache).unwrap(), patched);
     assert!(gem_dir.join(".socket-patch-kept").is_file());
 }
+
+// ── a hosted gem whose patch was superseded, taken over by vendored ───
+
+/// The newer patch the service publishes for the fixture gem once the
+/// project is hosted on [`UUID`].
+const NEWER_UUID: &str = "9b0c1d2e-3f4a-4b5c-8d7e-8f9a0b1c2d3e";
+const NEWER_PATCHED_LIB: &str =
+    "module StaleProbeGem\n  def self.status\n    \"PATCHED AGAIN\"\n  end\nend\n";
+
+/// The patch API once [`NEWER_UUID`] supersedes [`UUID`] (mount it on a
+/// reset server): discovery, selection and the view name only the newer
+/// patch, and its grant carries the vendored artifacts (the patched `.gem`
+/// and the stub gemspec a path source loads) beside the hosted override.
+async fn mount_newer_patch(server: &MockServer) {
+    use base64::Engine as _;
+    use sha2::Digest as _;
+    let sri = |bytes: &[u8]| {
+        format!(
+            "sha512-{}",
+            base64::engine::general_purpose::STANDARD.encode(sha2::Sha512::digest(bytes))
+        )
+    };
+    let patched = real_gem(NEWER_PATCHED_LIB);
+    let stub = format!(
+        "Gem::Specification.new do |s|\n  s.name = \"{DEP}\".freeze\n  s.version = \
+         \"{DEP_VERSION}\".freeze\n  s.authors = [\"e2e\".freeze]\n  s.summary = \
+         \"fixture\".freeze\n  s.files = [\"lib/stale_probe_gem.rb\".freeze]\n  s.require_paths \
+         = [\"lib\".freeze]\nend\n"
+    )
+    .into_bytes();
+    let leaf = format!("{DEP}-{DEP_VERSION}");
+    let base = format!("/artifacts/{NEWER_UUID}");
+    let gem_url = format!("{}{base}/{leaf}.gem", server.uri());
+    let stub_url = format!("{}{base}/{leaf}.gemspec", server.uri());
+    Mock::given(method("POST"))
+        .and(path(format!("/v0/orgs/{ORG}/patches/batch")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "packages": [{
+                "purl": PURL,
+                "patches": [{
+                    "uuid": NEWER_UUID, "purl": PURL, "tier": "free",
+                    "cveIds": [], "ghsaIds": [], "severity": "high",
+                    "title": "gem stale-install fixture, newer patch"
+                }]
+            }],
+            "canAccessPaidPatches": false,
+        })))
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path_regex(format!(
+            "^/v0/orgs/{ORG}/patches/by-package/.+$"
+        )))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "patches": [{
+                "uuid": NEWER_UUID, "purl": PURL,
+                "publishedAt": "2026-02-01T00:00:00Z",
+                "description": "x", "license": "MIT", "tier": "free",
+                "vulnerabilities": {}
+            }],
+            "canAccessPaidPatches": false,
+        })))
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/v0/orgs/{ORG}/patches/view/{NEWER_UUID}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "uuid": NEWER_UUID,
+            "purl": PURL,
+            "publishedAt": "2026-02-01T00:00:00Z",
+            "files": {
+                "lib/stale_probe_gem.rb": {
+                    "beforeHash": compute_git_sha256_from_bytes(UPSTREAM_LIB.as_bytes()),
+                    "afterHash": compute_git_sha256_from_bytes(NEWER_PATCHED_LIB.as_bytes()),
+                }
+            },
+            "vulnerabilities": {
+                GHSA: {
+                    "cves": ["CVE-2026-4444"],
+                    "summary": "gem stale-install fixture vuln",
+                    "severity": "high",
+                    "description": "d"
+                }
+            },
+            "description": "x", "license": "MIT", "tier": "free"
+        })))
+        .mount(server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(format!("/v0/orgs/{ORG}/patches/package")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "results": {
+                NEWER_UUID: {
+                    "status": "granted",
+                    "url": gem_url,
+                    "purl": PURL,
+                    "artifacts": [
+                        { "kind": "tarball", "url": gem_url,
+                          "integrity": { "sha512": sri(&patched), "sha256": sha256_of(&patched) } },
+                        { "kind": "gem-stub-gemspec", "url": stub_url,
+                          "integrity": { "sha512": sri(&stub) } }
+                    ],
+                    "registryOverride": {
+                        "kind": "rubygems-compact-index",
+                        "indexUrl": format!(
+                            "{}/patch-registry/gem/{TOKEN}/{NEWER_UUID}/",
+                            server.uri()
+                        ),
+                        "identifiers": {
+                            "name": DEP,
+                            "version": DEP_VERSION,
+                            "gemChecksumSha256": sha256_of(&patched),
+                        }
+                    }
+                }
+            }
+        })))
+        .mount(server)
+        .await;
+    for (file, bytes) in [
+        (format!("{leaf}.gem"), patched),
+        (format!("{leaf}.gemspec"), stub),
+    ] {
+        Mock::given(method("GET"))
+            .and(path(format!("{base}/{file}")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes))
+            .mount(server)
+            .await;
+    }
+    serve_upstream_gem(server, &real_gem(UPSTREAM_LIB)).await;
+}
+
+/// A project hosted on [`UUID`], with the lock as `bundle install` leaves
+/// it and the installed copy holding that patch's bytes, after the service
+/// replaced the patch with [`NEWER_UUID`]. Returns the gem home.
+async fn hosted_on_a_superseded_patch(server: &MockServer, proj: &Path) -> PathBuf {
+    let patched = real_gem(PATCHED_LIB);
+    mount_api_for(server, None, &sha256_of(&patched)).await;
+    serve_patched_gem(server, patched).await;
+    std::fs::create_dir_all(proj).unwrap();
+    write_manifest_pair(proj);
+    let home = project_home(proj);
+    let gem_dir = install_real_gem(&home, UPSTREAM_LIB);
+    let uri = server.uri();
+    let (code, _, stderr) = common::run_with_env(proj, &scan_args(proj, &uri, &["--json"]), &[]);
+    assert_eq!(code, 0, "hosted scan:\n{stderr}");
+    std::fs::write(proj.join("Gemfile.lock"), converged_lock(&uri)).unwrap();
+    assert_eq!(installed_lib(&gem_dir), PATCHED_LIB, "premise");
+    server.reset().await;
+    mount_newer_patch(server).await;
+    home
+}
+
+/// The events of `env` that name the fixture gem, as `action/errorCode`.
+fn gem_events(env: &serde_json::Value) -> Vec<String> {
+    env["events"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|e| e["purl"].as_str().is_some_and(|p| p.starts_with(PURL)))
+        .map(|e| {
+            format!(
+                "{}/{}",
+                e["action"].as_str().unwrap_or_default(),
+                e["errorCode"].as_str().unwrap_or_default()
+            )
+        })
+        .collect()
+}
+
+/// #2129: a gem on a hosted patch whose installed copy holds that patch's
+/// bytes, after a newer patch was published for the same version. The
+/// installed copy matches neither side of the newer patch, but the gem is
+/// installed and its lock entry is ours: `scan --mode vendored` vendors
+/// the newer patch, as it does on a checkout with no gems installed, and
+/// leaves the installed copy alone. The dry run previews the same.
+#[tokio::test(flavor = "multi_thread")]
+async fn vendored_takeover_of_a_hosted_gem_whose_patch_was_superseded() {
+    let server = MockServer::start().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    let home = hosted_on_a_superseded_patch(&server, &proj).await;
+    let uri = server.uri();
+    let held_before = snapshot(&home);
+    let pair_before = (
+        std::fs::read_to_string(proj.join("Gemfile")).unwrap(),
+        std::fs::read_to_string(proj.join("Gemfile.lock")).unwrap(),
+    );
+
+    let (code, stdout, stderr) = unwind_run(
+        &proj,
+        &uri,
+        &["scan", "--mode", "vendored", "--yes", "--json", "--dry-run"],
+    );
+    let env = common::parse_json_envelope(&stdout);
+    assert_eq!(code, 0, "dry run: {env}\nstderr:\n{stderr}");
+    assert!(
+        !env.to_string().contains("package_not_installed"),
+        "dry run: {env}"
+    );
+    assert_eq!(
+        (
+            std::fs::read_to_string(proj.join("Gemfile")).unwrap(),
+            std::fs::read_to_string(proj.join("Gemfile.lock")).unwrap(),
+        ),
+        pair_before,
+        "the dry run wrote nothing"
+    );
+    assert!(!proj.join(".socket").join("vendor").exists());
+
+    let (code, stdout, stderr) = unwind_run(
+        &proj,
+        &uri,
+        &["scan", "--mode", "vendored", "--yes", "--json"],
+    );
+    let env = common::parse_json_envelope(&stdout);
+    assert_eq!(code, 0, "{env}\nstderr:\n{stderr}");
+    assert!(
+        !env.to_string().contains("package_not_installed"),
+        "the gem is installed: {env}"
+    );
+    let copy_rel = format!(".socket/vendor/gem/{NEWER_UUID}/{DEP}-{DEP_VERSION}");
+    let pair = format!(
+        "{}{}",
+        std::fs::read_to_string(proj.join("Gemfile")).unwrap(),
+        std::fs::read_to_string(proj.join("Gemfile.lock")).unwrap()
+    );
+    assert!(
+        pair.matches(&copy_rel).count() >= 2 && !pair.contains("/patch-registry/"),
+        "the pair names the newer patch's copy and no hosted pin:\n{pair}\n{env}"
+    );
+    assert_eq!(
+        installed_lib(&proj.join(&copy_rel)),
+        NEWER_PATCHED_LIB,
+        "the vendored copy is the newer patch"
+    );
+    assert!(
+        snapshot(&home) == held_before,
+        "the takeover left the installed copy alone: {env}"
+    );
+}
+
+/// #2129, the native-extension half: a hosted gem that builds an
+/// extension cannot be vendored, superseded patch or not. The refusal
+/// names that (`native_extensions_unsupported`), not a gem that is "not
+/// installed", and the hosted pin stays.
+#[tokio::test(flavor = "multi_thread")]
+async fn vendored_takeover_of_a_superseded_native_gem_names_the_extension() {
+    for dry_run in [true, false] {
+        let server = MockServer::start().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("proj");
+        let home = hosted_on_a_superseded_patch(&server, &proj).await;
+        let spec = home
+            .join("specifications")
+            .join(format!("{DEP}-{DEP_VERSION}.gemspec"));
+        let text = std::fs::read_to_string(&spec).unwrap();
+        std::fs::write(
+            &spec,
+            text.replace(
+                "  s.require_paths",
+                "  s.extensions = [\"ext/probe/extconf.rb\".freeze]\n  s.require_paths",
+            ),
+        )
+        .unwrap();
+        let pair_before = (
+            std::fs::read_to_string(proj.join("Gemfile")).unwrap(),
+            std::fs::read_to_string(proj.join("Gemfile.lock")).unwrap(),
+        );
+
+        let mut args = vec!["scan", "--mode", "vendored", "--yes", "--json"];
+        if dry_run {
+            args.push("--dry-run");
+        }
+        let (code, stdout, stderr) = unwind_run(&proj, &server.uri(), &args);
+        let env = common::parse_json_envelope(&stdout);
+        let events = gem_events(&env);
+        assert!(
+            events
+                .iter()
+                .any(|e| e.ends_with("/native_extensions_unsupported")),
+            "dry_run={dry_run}: {events:?}\n{env}\nstderr:\n{stderr}"
+        );
+        assert!(
+            !env.to_string().contains("package_not_installed"),
+            "dry_run={dry_run}: {env}"
+        );
+        assert_ne!(code, 0, "dry_run={dry_run}: {env}");
+        assert_eq!(
+            (
+                std::fs::read_to_string(proj.join("Gemfile")).unwrap(),
+                std::fs::read_to_string(proj.join("Gemfile.lock")).unwrap(),
+            ),
+            pair_before,
+            "dry_run={dry_run}: the hosted pin stays"
+        );
+        assert!(!proj.join(".socket").join("vendor").exists());
+    }
+}
