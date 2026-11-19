@@ -2373,8 +2373,43 @@ mirror of rubygems.org, set `SOCKET_RUBYGEMS_URL` to it. The mirror must be reac
 (plain `http` is accepted only for a mirror on the same machine, such as `http://localhost:9292`,
 and such a request never goes through a proxy): the gem's build scripts run, so its archive and
 checksum are not fetched over a connection someone else could rewrite. Credentials in the URL
-are never printed. The JRuby (`-java`) build of a gem ships
-jars and is always refused for such a patch.
+are never printed.
+
+JRuby is different. It installs a gem's `java` build (`nokogiri-1.18.10-java`), which runs jars
+and has no C extension, so `apply` builds nothing there and needs no compiler. (A `java` gem that
+does compile something when it is installed, such as jruby-launcher, is rebuilt like any other
+gem with an extension.) Patches are written for the gem's `ruby` build, and on JRuby `apply`
+takes from such a patch what is part of the `java` build:
+
+- A file the patch changes is updated when the installed gem has it: the gem's Ruby code, and
+  also a C source the `java` gem ships, though nothing on JRuby compiles it.
+- A file that only a C build reads is skipped when the installed gem doesn't have it: a C
+  source or build file, or anything under `ext/`, `patches/` or `ports/`. So is a new file of
+  that kind, such as a new C source or a new `patches/libxml2/*.patch`.
+- Every other file the patch changes must be there. A Ruby file that is missing from the
+  installed gem is an error, as it is in any other gem: `apply` fails and changes nothing.
+
+The patch then counts as applied: `apply --check` reports it in sync, `vex` attests it, and
+`rollback` restores the files `apply` changed. When no file of a patch is part of the `java`
+build (a patch to the libxml2 that nokogiri packs for its C extension), the vulnerable code is not
+in that build at all. `apply` exits 0, changes nothing and prints a note saying so (a `skipped`
+event with `not_in_platform_build` under `--json`). Nothing was patched, so `vex` says what is
+true instead: the vulnerability is `not_affected` with the justification
+`vulnerable_code_not_present`. `rollback` reports that there was nothing to restore.
+
+The one exception is a patch that changes what the gem's jars are built from (a Java, Kotlin or
+Scala source, or a Maven, Ant or Gradle build file) and doesn't bring the rebuilt jars. `apply`
+can't rebuild a jar, so that patch is incomplete: `apply` writes the patch's files, leaves them
+written, and exits 1 with an error that says the jars are not the patch's
+(`native_extension_not_rebuilt`). Neither `apply --check` nor `vex` reports the gem as patched.
+A patch that replaces a jar itself is different: the patched jar is what JRuby loads, so the
+patch is applied and attested like any other, along with any source it changes beside the jar.
+
+A patch written for the `java` build itself (its purl carries `?platform=java`) is applied whole,
+like a patch for any other gem: every file it changes must be in the installed gem. When the
+manifest has both that patch and the one for the gem's `ruby` build, only the `java` one belongs
+to a JRuby install. `apply` doesn't apply the other one there, and `apply --check`, `vex` and
+`rollback` don't look for it there either.
 
 A gem that builds a library into its own directory and loads it from there (an FFI gem such as
 scrypt, a Rakefile build such as digest-crc) is always rebuilt from its installed tree. The
@@ -2392,14 +2427,17 @@ patch changes and left compiled code. How a gem builds depends on its configurat
 installed with `--use-system-libraries` links the operating system's libxml2 and never opens the
 copy it packs, so a patch that only adds a fix to that packed copy changes nothing there. A gem
 whose build script downloads the binary it runs (passenger's agent) compiles nothing at all.
-`apply` then writes the patch's files, leaves the compiled code as it was installed, and warns
-with `native_extension_not_rebuilt`, instead of reporting a patch that is in no compiled code:
+The patch is then incomplete, and `apply` says so instead of reporting a patch that is in no
+compiled code. It writes the patch's files, leaves the compiled code as it was installed, and
+exits 1 with `Error: Patch of <package> is incomplete: …` (`native_extension_not_rebuilt`):
 
-- The patch's Ruby files are in effect, and a source the gem compiles later on its own is the
-  patched one.
+- The patch's files stay written: its Ruby files are in effect, and a source the gem compiles
+  later on its own is the patched one. Nothing is rolled back for you; `rollback` undoes it.
 - `apply --check` reports the package as not in sync, and `vex` does not attest the patch.
+- A gem installed in more than one place counts as patched only when no copy is incomplete.
 - On a system-libraries install the library is the operating system's package, and updating
   that package is what fixes it.
+- `scan --mode agent` and `get` exit 1 for such a patch as well, and keep it recorded.
 
 A patch to the gem's own C sources is rebuilt as usual. On Linux the check asks the kernel which
 files the build opened. Elsewhere it needs a filesystem that records file reads; on one that

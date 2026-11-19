@@ -657,7 +657,7 @@ Contract details:
 
 ### VEX provenance markers (contract)
 
-Every VEX statement's impact string records which patch-application mode persists the patch. The three marker strings are **stable contract surfaces** — scanners and policy engines match on them, so renaming or reformatting any of them is a MAJOR change:
+Every VEX statement's impact string records which patch-application mode persists the patch (one kind of statement has no patch in place to name: see "Code not present" below). The three marker strings are **stable contract surfaces** — scanners and policy engines match on them, so renaming or reformatting any of them is a MAJOR change:
 
 | Impact statement | Mode | Verification evidence |
 |---|---|---|
@@ -666,6 +666,8 @@ Every VEX statement's impact string records which patch-application mode persist
 | `Patched via Socket patch <uuid> (redirected)` | hosted | the lockfile's hosted integrity pin; in-run `scan --mode hosted --vex` attests from the patch records THIS RUN fetched (v5.0: held in memory; hosted mode persists none) WITHOUT hash verification (the JSON `vex` summary carries `verified: false`), while a post-install `socket-patch vex` re-proves the lockfile wiring and hash-verifies the installed copy the build consumes — or, with nothing installed, attests a discovered lockfile reference from its integrity pin (see "Manifest-less VEX") |
 
 `vendored` and `redirected` are disjoint in practice (the modes conflict); if a PURL somehow appears in both sets, `vendored` wins.
+
+**Code not present (additive).** One verified agent-mode attestation carries none of the markers, because no patch is in place: a gem whose installed build holds no file of its patch (the JRuby build of a gem, for a patch to what only a C build reads; `apply` reports it as `not_in_platform_build`). Its impact-statement part reads `The code this vulnerability is in is not in the installed build of the package: no file of Socket patch <uuid> is part of it`. A statement all of whose packages are of that kind has the justification `vulnerable_code_not_present`. Every other statement keeps `inline_mitigations_already_exist`, including one that covers such a package beside a patched one: its impact statement then carries one part per package, each saying what is true of that package. A package with any installed copy that took a file of the patch is a patched package, with the usual marker. Under `--no-verify` nothing is looked at on disk, so the package gets the unverified `Patched via …; not verified on disk` part like any other.
 
 **Unverified statements (`--no-verify`).** `--no-verify` / `--vex-no-verify` (and an ambient `SOCKET_VEX_NO_VERIFY`) skip every on-disk hash check, so a statement emitted under it rests on the patch records and the wiring gates alone — for an agent-mode patch on nothing but the manifest, even when the installed files are unpatched or absent. Such a run is never silent. Each purl it attests ends its impact-statement part with `; not verified on disk`, appended AFTER the marker, so the three marker strings above stay intact as prefixes (`Patched via Socket patch <uuid> (vendored); not verified on disk`), and the run raises the `vex_not_verified` warning (stderr in human mode, `warnings[]` / `vex.warnings` under `--json`) naming how many statements carry the suffix. The purls an in-run `scan --mode hosted --vex` confirmed are attested from that run's own evidence in either mode and never carry it. A default (verifying) run's document is unchanged: it never contains the suffix.
 
@@ -891,7 +893,9 @@ runs) and puts the build where Ruby loads it, using the Ruby that owns the insta
 `--cwd`.
 
 **Build inputs.** A gem is native when its installed gemspec declares `extensions`, or its
-platform is not `ruby` (a precompiled gem). In a native gem:
+platform is not `ruby` (a precompiled gem). The JRuby build of a gem (the `java` platform, with
+no `extensions` declared) is the exception: it has no extension to rebuild, and takes a record by
+the rule under "The JRuby build of a gem" below. In a native gem:
 
 - Always an input, wherever it sits: a `.c`, `.h`, `.cc`, `.cpp`, `.cxx`, `.hh`, `.hpp`, `.hxx`,
   `.m`, `.y`, `.rl`, `.java` or `.rs` file, an `extconf.rb`, a `CMakeLists.txt`, `Makefile`,
@@ -987,15 +991,41 @@ of them did not build the patch. One read is enough, because a record also carri
 build opens. Neither did a build that left no compiled file: nothing in RubyGems' extension
 directory, and nothing Ruby loads in the gem's own tree.
 
-In both cases the record's files are written into the installed copy and its compiled code is
-left as it was installed: the package's event is `applied`, the run exits 0, and it carries a
-`native_extension_not_rebuilt` warning that names the files and says why. The patch's Ruby files
-are in effect, and a source the gem compiles later on its own (passenger builds its agent the
-first time it starts without one) is the patched one. No build marker is written, so
-`apply --check` reports the package as not in sync and `vex` never attests it. A later `apply`
-runs the build again and says the same. The one exception is a record that changes a build input
-the installed copy no longer holds: only a build from the source gem accounts for a file added
-that way, so that package fails with `native_extensions_unsupported` and nothing is written.
+In both cases the patch is **incomplete**. The record's files are written into the installed
+copy and stay written, its compiled code is left as it was installed, and the run fails:
+
+- `apply` exits 1 (`partialFailure`). Nothing is put back: the patch's Ruby files are in effect,
+  and a source the gem compiles later on its own (passenger builds its agent the first time it
+  starts without one) is the patched one.
+- The package's event is `failed` with `errorCode` `native_extension_not_rebuilt`, never
+  `applied`. Its `error` says that the patch's files were written, names the sources that are in
+  no compiled code and says why; its `files` lists what this run wrote (none on a later run that
+  finds them written). `warnings[]` carries the same code and text.
+- On the human path the package gets one line on stderr, also under `--silent`:
+  `Error: Patch of <purl> is incomplete: the patch's files were written, but …`. The warning is
+  not printed beside it, the package is not listed under `Patched packages:`, and the summary
+  counts it as `N not in effect`, not as applied or already patched.
+- No build marker is written, so `apply --check` reports the package as not in sync and `vex`
+  never attests it. A later `apply` runs the build again and ends the same way.
+- The patch stays recorded in the manifest, so `rollback` restores the written files. The apply
+  that `get` and `scan --mode agent` run reports it as any failed package (a `failed` event with
+  this code, `Error: Some patches could not be applied.`, exit 1) and keeps the record too.
+- A package is in effect only when no copy of it is incomplete. With several installed copies
+  each has its own event (`applied` for one that took the patch, `failed` for the incomplete
+  one), and the package is counted once, as `N not in effect`: it is not listed under `Patched
+  packages:`, not counted as applied or already patched, and not handed to `get` /
+  `scan --mode agent` as applied.
+- A `gem env` fallback-home copy that is patched best-effort (see above) is the exception, as
+  for a failure there: its incomplete patch is that copy's `gem_fallback_home_skipped` event and
+  warning, and the run stands. An incomplete bundle-store copy does not count as the applied
+  copy that makes a fallback-home copy best-effort.
+
+A dry run cannot see either case, since only a build shows it: it reports the pending rebuild as
+before. With `--no-gem-native-rebuild` nothing is incomplete: the caller compiles (below).
+
+The one exception is a record that changes a build input the installed copy no longer holds:
+only a build from the source gem accounts for a file added that way, so that package fails with
+`native_extensions_unsupported` and nothing is written.
 
 Off Linux, where a read leaves no trace in a file's access time (a `noatime` mount, Windows by
 default), which `apply` tests with a file of its own, nothing is concluded from the reads and
@@ -1031,8 +1061,12 @@ also does not count against the ruby-platform record (`?platform=ruby`, or no qu
 release variant is matched to the installed copy, as a missing file otherwise does; a record
 qualified for another platform is matched as before. When the manifest holds a record whose
 `platform` qualifier names a platform gem copy's own platform (`x86_64-linux` and
-`x86_64-linux-gnu` are one) and that record matches the copy, it alone is applied to the copy:
-the ruby-platform record of the same version is not applied on top.
+`x86_64-linux-gnu` are one) and that record matches the copy, it is the copy's only record. It
+alone is applied to the copy: the ruby-platform record of the same version is not applied on
+top. Every other reader follows `apply` in this: `apply --check`, `vex`, `rollback` and the
+lookup of `get` / `scan` do not judge the ruby-platform record on that copy either. With no
+other installed copy to match, that record is `package_not_installed` in `apply` and in
+`apply --check` alike, and `vex` omits it as not installed.
 
 **Without a build from the source gem.** Whatever keeps a gem RubyGems built from being rebuilt
 from its source gem, before anything of the installed copy is written, leaves it the rebuild it
@@ -1048,16 +1082,101 @@ refused instead. The one case with no fallback is another run building the same 
 precompiled gem has no in-place rebuild: it is refused with `native_extensions_unsupported`
 (`native_extension_build_failed` for a failed build), and the message says what is needed (one run
 with network access to the registry, or the source gem in the home's `cache/`; for a gem the lock
-resolves from another source, only the latter). The JRuby build of a gem (the `java` platform)
-ships jars compiled from Java sources, which no source gem's build produces: a record that changes
-its build inputs is always refused.
+resolves from another source, only the latter).
+
+**The JRuby build of a gem.** JRuby installs a gem's `java` platform build
+(`nokogiri-1.18.10-java`; also a `jruby` or `universal-java-*` platform), whose compiled code is
+jars: there is no C extension, and nothing to rebuild. That is a JVM-platform gem whose gemspec
+declares no `extensions`. One that does declare them (jruby-launcher compiles a native launcher
+when it is installed) is a gem RubyGems built, and its records are rebuilt as described above,
+like those of any such gem.
+
+The patch records are written for the `ruby` platform gem, and the `java` gem of the same release
+is another archive. It ships the gem's Ruby files, often its C sources too (nothing on JRuby
+compiles them), and none of what only a C build reads. `apply` gives such a copy the files of the
+ruby-platform record (no `platform` qualifier, or `?platform=ruby`) that are part of its own
+build, file by file, starts no Ruby, builds nothing and writes no marker or backup:
+
+- A file the record replaces (it has a `beforeHash`) that the copy holds is verified and written
+  like any patch file: content that is neither the `beforeHash` nor the `afterHash` content is
+  the usual mismatch. A C source the `java` gem ships is updated this way.
+- An input of a C build that the copy does not hold is not part of that platform's gem. It is
+  skipped: not written, not required, and not counted as missing. Such an input is told by its
+  path alone: anything under `ext/`, `patches/` or `ports/`, or a file with one of the source or
+  build file names under "Build inputs" above. One the record adds is skipped the same way: a
+  new C source or a new patch to a packed library means nothing to a gem with no C build.
+- Every other file of the record is part of every build of the gem. One the record adds is
+  created. One it replaces that the copy does not hold (a Ruby file under `lib/` that was
+  deleted from the copy) is the usual missing file: the patch fails with nothing written,
+  `apply --check` is out of sync and `vex` does not attest it. A missing file is never taken for
+  a patch with nothing to do there.
+
+With those files written the patch is applied: the event is `applied` and lists the files
+written, `apply --check` is in sync, `vex` attests it, a second `apply` reports `already_patched`,
+and `rollback` restores exactly the files `apply` wrote. Each of them reads the record by the same
+rule, as does matching the ruby-platform record to the copy: a C build input the copy has no use
+for never counts against it. So a copy that takes only a C source it ships, which nothing there
+compiles, counts as patched, and a C build input that was deleted from the copy reads as one the
+gem never shipped (nothing here knows the `java` gem's file list, and nothing on JRuby reads
+such a file). A copy patched this way holds the same files as one installed from the patched
+`java` platform gem that Socket's backend builds.
+
+A record qualified for a platform names the archive it was written for, and gets none of this:
+the copy's own (`?platform=java`), or another one that was matched to the copy. Every file of it
+is required, in `apply`, `apply --check`, `vex` and `rollback` alike: one the copy does not hold
+is the usual missing file, and one it adds is created wherever it goes.
+
+When no file of the ruby-platform record is part of the copy's build (a record that only adds
+`patches/libxml2/<n>.patch`), the code the patch changes is not in that build. The run writes
+nothing and exits 0; the patch's event is `skipped` with `not_in_platform_build`, and its reason
+says that none of the patch's files are part of the JRuby build of the gem (on the human path: a
+`Note:` line on stderr, and `N not applicable` in the summary). `apply --check` is in sync, and
+whatever counts the patches a run left in place counts it as it counts `already_patched` (the
+advisory lines of `scan --mode agent`). `vex` attests the package with the reason that is true
+of it. Nothing was patched, so the statement does not say `Patched via …`: it is `not_affected`
+with the justification `vulnerable_code_not_present`, and its impact statement reads `The code
+this vulnerability is in is not in the installed build of the package: no file of Socket patch
+<uuid> is part of it` (see "VEX provenance markers"). `rollback` has nothing to restore there
+and says that: the patch's event is `skipped` with `not_in_platform_build` and a reason that
+nothing of the patch was applied to that build, not `no_files`. Its record is removed as usual.
+
+The one thing `apply` cannot do there is rebuild a jar. A record that changes a JVM build input
+and brings no compiled code for it has its files written, as above, and is incomplete in the
+sense of "A build that builds nothing of the patch": the files stay written, the run exits 1,
+the event is `failed` with `native_extension_not_rebuilt` (the gem's jars were built from
+sources the patch changes, and are as they were installed), and the warning of that code goes
+with it. `apply --check` reports that package as not in sync and `vex` never attests it, on
+this run or a later one. A JVM build input is, by file name alone, wherever the file sits and
+whatever its case: a `.java`, `.kt` or `.scala` source, or a `pom.xml`, `build.xml`,
+`build.gradle`, `build.gradle.kts` or `Mavenfile`. It counts whether the copy holds the file or
+not, since a gem need not ship the sources of its jars. When the copy takes none of the record's
+files, nothing is written and the patch is incomplete all the same: the `failed` event lists no
+files, and the summary counts the package as `N not in effect`, never as not applicable. Files
+alone show all of this, so `apply --dry-run` ends the same way without writing: exit 1, the
+`failed` event, and an `error` that says what `apply` would write and what would not be in
+effect. With `--no-gem-native-rebuild` the caller builds the jars: the files the copy takes are
+written and the run exits 0 with the warning, as for an extension. A dry run with that flag
+writes nothing, and its warning says what `apply` would do (`dry run: … apply would write them
+without rebuilding the jars`), as it does for an extension.
+
+Two records are not held up by a JVM build input, because the compiled code they need is theirs:
+
+- A record that itself replaces or adds a `.jar` or `.class` file. Those are not build inputs:
+  the record puts the patched code where the JVM loads it, and a source it changes beside the
+  jar is the source that jar was built from.
+- A record qualified for the copy's own platform (`?platform=java` on a `java` gem). It was
+  written against that gem's archive, and its files are the patch of that build.
+
+Either is verified and written like any patch, with no warning, and the copy is in sync and
+attested.
 
 What runs, and when: whether a record needs a rebuild is decided from files alone. The installed
 gemspec is read as text for its `extensions`, `platform` and `require_paths`, never evaluated, so
 `apply --dry-run`, `apply --check` and `vex` start no Ruby and download nothing. A dry run reports
-the pending rebuild as a `native_extension_rebuilt` warning ("apply would …") and refuses only what
-it can see without one (no extension directory, no `ruby` to run, a JRuby gem, a source gem that is
-needed, not cached, and out of reach offline or withheld by the lock). A real run starts Ruby only
+the pending rebuild as a `native_extension_rebuilt` warning ("apply would …") and fails only what
+it can see without one, the way the real run would (no extension directory, no `ruby` to run, a
+source gem that is needed, not cached, and out of reach offline or withheld by the lock; on the
+JRuby build of a gem, a record that changes sources of its jars). A real run starts Ruby only
 once every file of the record verified against the installed copy (it holds the record's
 `beforeHash` or `afterHash` content, or a mismatch the run was told to overwrite): first the host
 Ruby alone, asked where it builds extensions for that gem home and what it is, which loads
@@ -1110,20 +1229,29 @@ as it is, with its `redirect_gem_stale_install` warning; see the "Gem stale-inst
 `--no-gem-native-rebuild` (env `SOCKET_NO_GEM_NATIVE_REBUILD`) is for a caller that compiles the
 extension itself (the patches evaluation harness): the patched sources are written as before #1996,
 with no Ruby run, no download and no backup or marker, and the run succeeds with a
-`native_extension_not_rebuilt` warning. `vex` and `apply --check` then omit the patch until a
+`native_extension_not_rebuilt` warning. Under `--dry-run` nothing is written, and that warning
+says what `apply` would do (`dry run: … apply would write them without rebuilding the
+extension`). `vex` and `apply --check` then omit the patch until a
 rebuild by `apply` records it. It covers every build input above, on a precompiled gem too (where
-a file the copy does not hold is not written: the record fails on it as on any missing file).
+a file the copy does not hold is not written: the record fails on it as on any missing file), and
+the sources of a JRuby gem's jars. Under this flag a patch is never incomplete for want of a
+build, with one exception: a JRuby gem that holds none of the files of a record that changes
+sources of its jars has nothing for the caller to build from, and fails as without the flag.
 
 | Code | Run result | Meaning |
 |---|---|---|
-| `native_extensions_unsupported` | refused, exit 1 | The record changes build inputs that cannot be rebuilt here: the copy is not a RubyGems install with a `specifications/` entry (a Bundler git checkout); the gem neither declares extensions nor is a platform gem; it is the JRuby (`java`) build; no Ruby that owns the install was found; a precompiled gem cannot be built from its source gem (the archive is neither in the home's `cache/` nor downloadable, is not the copy's own source, the record does not apply to it, a gem its build needs could not be staged, its build leaves a library in the gem's own tree, or the build has no counterpart among the gem's prebuilt binaries); a record changes an input a build removed and the source gem cannot be built. Nothing is written. Also: another run is rebuilding the same gem right now, or an interrupted rebuild could not be undone (the error says which). |
+| `native_extensions_unsupported` | refused, exit 1 | The record changes build inputs that cannot be rebuilt here: the copy is not a RubyGems install with a `specifications/` entry (a Bundler git checkout); the gem neither declares extensions nor is a platform gem; no Ruby that owns the install was found; a precompiled gem cannot be built from its source gem (the archive is neither in the home's `cache/` nor downloadable, is not the copy's own source, the record does not apply to it, a gem its build needs could not be staged, its build leaves a library in the gem's own tree, or the build has no counterpart among the gem's prebuilt binaries); a record changes an input a build removed and the source gem cannot be built. Nothing is written. Also: another run is rebuilding the same gem right now, or an interrupted rebuild could not be undone (the error says which). |
 | `native_extension_build_failed` | refused, exit 1 | The extension did not build from the patched sources (no compiler or Ruby headers, a build error, an in-place build that exited cleanly and kept the library it found instead of compiling it again), or the finished build could not be moved into place. The installed copy is as it was before the run; the error carries the build output's tail (of the build from the source gem and of the in-place one, when both ran), at most 30 lines of each, without mkmf's list of configuration options or its pointer to the `mkmf.log` that was removed with the failed build. For a precompiled gem it says that the rebuild needs what `gem install <name> -v <version> --platform ruby` needs. |
 | `native_extension_rebuilt` | warning | The sources were already patched (by a release before #1996, with `--no-gem-native-rebuild`, or by `apply` under another Ruby version of a precompiled gem) and the extension was rebuilt from them. Under `--dry-run`: the rebuild a real `apply` would run; no Ruby is started and nothing is downloaded to check that it can. |
-| `native_extension_not_rebuilt` | warning | The record's files were written and no build holds them. With `--no-gem-native-rebuild`: Ruby loads the old build until the caller compiles it. Without it: a build ran and built nothing of the patch (it read none of the files the patch changes, or left no compiled file), so the compiled code is as it was installed. `vex` and `apply --check` do not take the package for patched. |
+| `native_extension_not_rebuilt` | incomplete: `failed` event and warning, exit 1 (with `--no-gem-native-rebuild`: warning only, exit 0) | The record's files were written and no build holds them. Without `--no-gem-native-rebuild` the patch is incomplete: a build ran and built nothing of the patch (it read none of the files the patch changes, or left no compiled file), so the compiled code is as it was installed; or, on the JRuby build of a gem, the ruby-platform record changes what the gem's jars were built from (a Java, Kotlin or Scala source, a Maven, Ant or Gradle build file) and brings no `.jar` or `.class` file of its own, and nothing here rebuilds a jar. The files stay written and the patch stays recorded; the run exits 1 with the package's `failed` event under this code and the warning. With `--no-gem-native-rebuild`: Ruby loads the old build until the caller compiles it, and the run exits 0 with the warning alone. Either way `vex` and `apply --check` do not take the package for patched. |
+| `not_in_platform_build` | `skipped` event, exit 0 | No file of the ruby-platform record is part of the build installed there: the JRuby (`java`) build of a gem, for a record that only changes what a C build reads. Nothing is written. The code the patch changes is not in that build, so `apply --check` is in sync and `vex` attests the package as `not_affected` with the justification `vulnerable_code_not_present`. `rollback` of such a copy is a `skipped` event with this code too: nothing of the patch was applied there. |
 | `native_extension_restore_failed` | rollback: that copy fails | The sources were restored, but the original compiled extension could not be put back. Run `gem pristine <gem> --extensions` (a precompiled gem: `gem pristine <gem>`). |
 
 A refusal is printed once on the human path, as the package's `Error: Failed to patch` line. Under
-`--json` it is the package's error and, under its code, a `warnings[]` entry.
+`--json` it is the package's error and, under its code, a `warnings[]` entry. An incomplete patch
+is printed once too, as `Error: Patch of <purl> is incomplete: …`; under `--json` it is the
+package's `failed` event, whose `errorCode` is `native_extension_not_rebuilt` itself, and the
+`warnings[]` entry of that code.
 
 `vex` and `apply --check` attest such a copy only while its marker matches the record's patched
 sources and every artifact it lists, a precompiled gem's replaced binary included; otherwise the
@@ -1797,6 +1925,7 @@ v5.0 replaces v4's per-purl reverts and whole-ledger reverse replay (`revert_rem
 | Agent leg: a copy restored | `rolledBack` (`verified` on `--dry-run`); `files` = the restored (would-be restored) files, `details.path` = the installed copy. One event per copy |
 | Agent leg: already original | `skipped` `already_original` |
 | Agent leg: patch record lists no files | `skipped` `no_files` |
+| Agent leg: no file of the record is part of the installed build (the JRuby build of a gem) | `skipped` `not_in_platform_build`, on `--dry-run` too; `details.path` = the installed copy |
 | Agent leg: copy failed | `failed`; `errorCode` from the first blocking file (`hash_mismatch`, `file_not_found`, `missing_blob`), else `rollback_failed`; `details.filesVerified[{file, status, message, currentHash, expectedHash, targetHash}]` with camelCase `status` (`ready`, `alreadyOriginal`, `hashMismatch`, `notFound`, `missingBlob`). A before-blob gate abort is one `missing_blob` failure per gated package |
 | In-scope entry not installed | `skipped` `package_not_installed` (never flips status or exit). Nothing was restored for it; when its record is dropped, the human warning adds that a copy the run did not find stays patched until the package is reinstalled |
 | Vendored leg: reverted / preserved (`--preserve-state`) | `rolledBack` (`verified` on `--dry-run`), `details.mode: "vendored"`; preserved adds `details.preserved: true` |
@@ -2150,8 +2279,10 @@ command's integration tests check its output.
 | Tag                       | Action(s)        | Context |
 |---------------------------|------------------|---------|
 | `already_patched`         | `skipped`        | apply: every file's hash already matches `afterHash`. |
+| `not_in_platform_build`   | `skipped`        | apply (gem): the installed copy is the JRuby (`java`) build of the gem and no file of the patch is part of that build (a patch to the C extension or a library it packs). Nothing was written and nothing is left to do: the code the patch changes is not in that build, `apply --check` is in sync and `vex` attests the package (`vulnerable_code_not_present`), and a nested `scan --mode agent` counts the patch among those in place, as it counts `already_patched`. `reason` says so in plain words. rollback (gem): the same copy; nothing of the patch was applied to it, so nothing was restored. See "The JRuby build of a gem". |
 | `package_not_installed`   | `skipped`        | apply: manifest entry has no matching installed package. When the project's lockfiles resolve the purl (a platform-gated optional dependency, a devDependency under `--omit=dev`), the detail says it is lockfile-only and the entry never fails the run, even when no other patch matched; only an all-miss run with an unmatched purl that no lock resolves exits 1 (`partialFailure`). **Cargo is never lockfile-only (v5.0, #616)**: `cargo fetch` unpacks every `Cargo.lock` entry (target-gated ones included), so a locked crate missing from `$CARGO_HOME/registry/src` was simply not fetched yet (a cold CI cache, a pruned `registry/src`) and the next `cargo build` would compile it unpatched; it counts as an unresolved purl (an all-miss run exits 1, as in 4.x) and its detail, the human error and the human warning say to run `cargo fetch` first. A crate `Cargo.lock` takes from a path, git, `[patch]` or `[replace]` source is never looked up in the registry cache (#506): cargo does not build that copy, so the same detail also names that case. |
 | `apply_failed`            | `failed`         | apply: hash mismatch, write error, archive read error. Also a manifest key that is not a purl (see `invalid_purl`). The copy is left as it was: every file is staged (its blob read and hash-checked, with the file's final mode and owner) before the first is renamed into place, and a rename that fails puts the files already replaced back. The `error` names the file (`Cannot apply patch: <file> - <cause>`); a blob that does not hold its hash's bytes is named with the remedy (`blob <path> is corrupt … Run \`socket-patch repair\``). Only when putting a file back fails too does the `error` end with the files left changed; the original of such a file is kept beside it as `.socket-kept-<file>-<uuid>`, a name no later run removes. A run killed between two renames can still leave some files patched; the next `apply` finishes it. A killed run also leaves `.socket-stage-<file>-<uuid>` / `.socket-orig-<file>-<uuid>` files beside the patch's files (staged content and the second names of the files being replaced, never the package's own content); an `apply` or `rollback` of that package removes them once they are ten minutes old. |
+| `native_extension_not_rebuilt` | `failed` | apply (gem), and the apply that `get` / `scan --mode agent` run: the patch is incomplete. Its files were written into the installed copy and are left there (unlike `apply_failed`, where the copy is as it was), and the compiled code the copy runs is not the patch's: the build compiled nothing of it, or, on the JRuby build of a gem, the patch changes sources of the gem's jars and does not bring the jars. `error` says what was written and what is not in effect; `files` lists what this run wrote. The run exits 1 (`partialFailure`), the patch stays recorded, `apply --check` is out of sync and `vex` does not attest it; `rollback` restores the files. The same code is a `warnings[]` entry of the run, and the `apply --check` / `vex` tag of such a copy. See "A build that builds nothing of the patch". |
 | `unsupported_ecosystem`   | `skipped` + run-level `warnings[]`; remove: top-level error | apply (incl. `--check`), rollback, and the nested apply of `get` / `scan --mode agent` (additive): a manifest record whose purl type this CLI has no crawler for — an ecosystem a newer socket-patch recorded, or a known type in another case (`pkg:NPM/…`; the detail then names the lowercase spelling). The record is left alone, named in one `skipped` event each and in one warning (human: one `Warning:` line on stderr), and never changes the exit: a newer CLI's ecosystem in a committed manifest must not fail an older CLI's run (`scan --prune` exempts such records for the same reason). `apply --check` does not count it as checked: its result line reads `N checked patches are in sync; K patches not checked (unsupported ecosystem).` (or `No patches checked: …`) instead of `Patches are in sync`. `rollback` leaves it out of the confirmation prompt and keeps its record. `remove` refuses it before any mutation (exit 1, top-level `error.code`) unless `--skip-rollback` is given: it could not restore what the record patched. Not reported under `--ecosystems`, which scopes the run to ecosystems this CLI knows. |
 | `invalid_purl`            | apply `--check` / rollback: `failed`; remove: top-level error | A manifest key that is not a `pkg:<type>/<name>` purl at all (a hand-edited manifest): no version of the CLI can match it to a package. `apply` fails it by name as `apply_failed` (exit 1; every other patch still applies), `apply --check` reports it as drift, `rollback` as a failed entry whose record is kept (exit 1), and `remove` refuses it unless `--skip-rollback` is given. Correct the key or remove the entry. |
 | `no_local_source` | `skipped`/`failed` | Agent patch application cannot obtain the required local or downloaded patch source. Vendored mode consumes complete server artifacts and no longer stages patch blobs. |
@@ -2477,7 +2608,7 @@ outcome for a selected record, rather than inferring a write from exit 0.
 | `repair`    | `Downloaded` (or `Verified` on dry-run; `details: {count, downloadMode: "file"}` — `downloadMode` is always `"file"` since v5.0 removed the diff download path; `details.corrupt` when some of the blobs replaced corrupt cache entries) · `Rebuilt` (vendored artifacts; `Verified` previews on dry-run; every vendored-phase event carries `details.mode: "vendored"`) · `Skipped` (vendor_uuid_mismatch, cleanup_failed) · artifact-level `Removed` (or `Verified`) GC carrier (`details.count`, `details.checked`, `bytes`) · `Failed` events (`download_failed`; `--offline`: one `offline_missing_sources` / `blob_corrupt` per blob it could not restore) · top-level `gc` (absent under `--download-only`) |
 | `vex`        | `Verified` (one per attested subcomponent) · `Skipped` (omissions) — only under `--json --output` |
 | `remove`     | `Removed` (per purl; `Verified` on dry-run) · `RolledBack` (one per installed copy the in-place rollback restored; `summary.rolledBack`) · vendored/hosted-leg `Removed`/`Skipped` events with `details.mode` · artifact-level `Removed`/`Verified` GC carrier (`details: {count, checked}`, `bytes`; only when the sweep removed something — v5.0, MAJOR: replaces `details.blobsRemoved` / `archivesRemoved` / `rolledBack`) · top-level `gc` (absent under `--preserve-state`) · `cleanup_failed` warnings |
-| `rollback`   | `RolledBack` (agent copies; vendored / hosted unwinds with `details.mode`) · `Verified` (dry-run previews, manifest removals included) · `Skipped` (already_original / no_files / package_not_installed) · `Failed` (per copy or leg; artifact-level `hosted_write_failed` / `hosted_wiring_contested`) · `Removed` (manifest entries, `details.manifest: true`) · top-level `gc` (absent under `--preserve-state`) |
+| `rollback`   | `RolledBack` (agent copies; vendored / hosted unwinds with `details.mode`) · `Verified` (dry-run previews, manifest removals included) · `Skipped` (already_original / no_files / not_in_platform_build / package_not_installed) · `Failed` (per copy or leg; artifact-level `hosted_write_failed` / `hosted_wiring_contested`) · `Removed` (manifest entries, `details.manifest: true`) · top-level `gc` (absent under `--preserve-state`) |
 | `get`, `scan` | Agent mode: `Downloaded` / `Updated` (+`oldUuid`) / `Skipped` (`already_in_manifest`, `vendored`, `package_not_installed`, …) / `Failed` per patch, then `Applied` / `Skipped` / `Failed` for the nested apply · Hosted: `Applied` (pin written) / `Skipped` (`details.mode: "hosted"`) · Vendored: `Downloaded` / `Failed`, then the vendor engine's events (`details.mode: "vendored"`) · dry runs: `Verified` / `Skipped` · `scan --prune`: `Removed` (`details.manifest: true`, or a vendored revert) / `Skipped` + top-level `gc` · `get` search outcomes: `Skipped` (`paid_required`, `package_not_installed`, …) — see [`scan` and `get` JSON](#scan-and-get-json-v50-major) |
 | `--update`   | `Downloaded` → `Updated` (success) · `Skipped` (already_latest) · `Verified` (dry-run check, reason update_check) — see the Self-update contract section for details fields and top-level error codes |
 
