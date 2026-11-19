@@ -1299,6 +1299,8 @@ pub async fn run(args: VendorArgs) -> i32 {
     }
 
     note_classic_migration_risk(&mut env, &args.common.cwd, &args.common);
+    env.warnings
+        .extend(crate::commands::sync_bazelignore(&args.common, true).await);
 
     // Everything below is output and telemetry, so release the lock before
     // the telemetry round-trip.
@@ -2470,6 +2472,10 @@ async fn run_eject(
         print_vendor_closing(common, &env, 0, &capture.wired_flavors, true, None);
     }
     note_classic_migration_risk(&mut env, &common.cwd, common);
+    // After the rollback, so that the file names no copy the eject made
+    // and took away again.
+    env.warnings
+        .extend(crate::commands::sync_bazelignore(common, true).await);
     drop(guard);
 
     // Embedded VEX: same contract as the manifest-driven arm — only on
@@ -5392,6 +5398,11 @@ pub(crate) async fn run_vendor_gc(
     for (unit, e) in &sweep.failed {
         let warning = orphan_removal_failed(unit, e);
         out.write_failures.push((warning.code, warning.detail));
+    }
+    // A pass that took a vendored copy away may have taken the last Go one,
+    // after the scan's own step was done with the file: its pair goes too.
+    if !dry_run && (ledger_dirty || out.orphan_dirs > 0) {
+        crate::commands::sync_bazelignore(common, false).await;
     }
     out
 }

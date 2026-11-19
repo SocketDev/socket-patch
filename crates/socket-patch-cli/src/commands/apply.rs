@@ -1900,6 +1900,9 @@ pub(crate) async fn run_locked(
                     }
                 }
             }
+            // The copies under `.socket/go-patches` are as this run leaves
+            // them (a reconcile may have removed the last one).
+            run_warnings.extend(crate::commands::sync_bazelignore(&args.common, true).await);
 
             // Human per-package report BEFORE the embedded VEX runs, so
             // the VEX step's own notes follow the report instead of

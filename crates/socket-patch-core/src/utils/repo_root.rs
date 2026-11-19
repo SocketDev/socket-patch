@@ -390,7 +390,7 @@ fn home_repo_beyond(dirs: &[PathBuf], home: Option<&Path>) -> Option<PathBuf> {
 
 /// The checkout at the last directory of a [`search_dirs`] walk, if the
 /// walk ended on one.
-fn repo_at_end_of(mut dirs: Vec<PathBuf>) -> Option<GitRepo> {
+pub(crate) fn repo_at_end_of(mut dirs: Vec<PathBuf>) -> Option<GitRepo> {
     let root = dirs.pop()?;
     let meta = dot_git_metadata(&root)?;
     Some(GitRepo {
