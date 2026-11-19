@@ -56,8 +56,10 @@
 //! 4. The record is laid over it with [`apply_package_patch`]: every
 //!    `beforeHash` must hold in the pristine gem, or the archive is not
 //!    the gem the patch was written for.
-//! 5. RubyGems builds the staged gem's extension in the stage, with the
-//!    build arguments it recorded for the installed copy. A gem the build
+//! 5. RubyGems builds the staged gem's extension in the stage: a gem it
+//!    built, with the build arguments it recorded for the installed copy;
+//!    a precompiled gem, as its publisher built it, with none
+//!    ([`RubyRun::StageBuild`]). A gem the build
 //!    needs and the install lacks (a precompiled nokogiri has no
 //!    `mini_portile2`) is installed into the stage home, never into the
 //!    user's. A build that leaves what Ruby loads in the gem's own tree
@@ -89,6 +91,25 @@
 //! another run building the same gem right now.) A precompiled gem has no
 //! such fallback and is refused, with what it needs: network access to the
 //! registry once, or the source gem in the home's `cache/`.
+//!
+//! A build that exits cleanly has not always built the patch. A gem's
+//! build takes what it compiles from its configuration: one set up to link
+//! the system's copy of a library the gem packs (nokogiri installed with
+//! `--use-system-libraries`) never opens the packed copy's sources, so a
+//! record that changes only those would be written, "rebuilt" and attested
+//! with nothing of it in what Ruby loads. So the record's build inputs are
+//! marked unread before the build, and a build that read none of them is
+//! not taken for a build of the patch (`unread_inputs`). Neither is one
+//! that leaves no compiled file at all: a gem whose extension script
+//! downloads the binary it runs (passenger's agent) has nothing a build
+//! could put where Ruby loads it. Either way the record's files are
+//! written, the compiled code stays what it was, no marker is written, and
+//! the run warns with [`NOT_REBUILT_REASON`] (`Job::write_without_build`):
+//! the patch's Ruby files are in effect, a source the gem compiles later on
+//! its own is the patched one, and nothing attests the copy.
+//!
+//! A build can take many minutes. The run says when one starts and when
+//! it ends ([`RubyEnv::progress`]).
 //!
 //! `vex` and `apply --check` attest a copy only when its marker matches the
 //! record's patched sources and every recorded artifact still hashes as
@@ -352,9 +373,10 @@ const GENERATED_GRAMMAR_EXTENSIONS: &[&str] = &["y", "rl"];
 /// staged gem, and of the gems that meet them, that no gem on `GEM_PATH`
 /// meets: what its build scripts may `require` and would not find.
 ///
-/// `stage_build <staged gemspec> <stage home> <installed home> <installed
-/// full name>` builds the staged gem's extensions inside the stage home,
-/// with the build arguments RubyGems recorded for the installed copy. It
+/// `stage_build <staged gemspec> <stage home> <installed home> [<installed
+/// full name>]` builds the staged gem's extensions inside the stage home,
+/// with the build arguments RubyGems recorded for the installed copy when
+/// it is named (a precompiled copy is not: see [`RubyRun::StageBuild`]). It
 /// loads the gemspec `unpack` wrote and runs the archive's build scripts
 /// over the staged tree.
 const RUBY_SCRIPT: &str = "require 'rubygems'; mode, a, b, c, d = ARGV; \
@@ -418,7 +440,7 @@ abort(\"#{a} declares no extensions\") if spec.extensions.empty?; \
 require 'rubygems/ext'; \
 Gem::DefaultUserInteraction.ui = Gem::SilentUI.new; \
 info = File.join(c, 'build_info', \"#{d}.info\"); \
-args = File.file?(info) ? File.readlines(info).map { |l| l.chomp } : []; \
+args = (d && File.file?(info)) ? File.readlines(info).map { |l| l.chomp } : []; \
 Gem::Ext::Builder.new(spec, args).build_extensions; \
 puts \"sp_built\\t#{File.expand_path(spec.extension_dir)}\"; \
 else \
@@ -1169,7 +1191,9 @@ pub async fn verify_native_build(
 }
 
 /// [`apply_gem_package_patch`]'s outcome: the copy's result, and a run
-/// warning `(code, detail)` the caller surfaces next to it.
+/// warning `(code, detail)` the caller surfaces next to it. A result that
+/// succeeded with a [`NOT_REBUILT_REASON`] warning wrote the record's files
+/// and built nothing: the copy's compiled code is not the patch's.
 #[derive(Debug, Clone)]
 pub struct GemApplied {
     pub result: ApplyResult,
@@ -1189,6 +1213,58 @@ pub struct RubyEnv {
     /// `--offline`: a source gem that is not in the gem home's `cache/` is
     /// not downloaded, and neither is a gem its build needs.
     pub offline: bool,
+    /// Where a line about a build goes while the run is still going: one
+    /// when it starts and one when it ends ([`run_build`]). A build can
+    /// take many minutes, and a run that prints nothing until its summary
+    /// looks hung (#2144). `None`: nothing is said (`--json`, `--silent`).
+    pub progress: Option<fn(&str)>,
+}
+
+impl RubyEnv {
+    fn say(&self, line: &str) {
+        if let Some(progress) = self.progress {
+            progress(line);
+        }
+    }
+}
+
+/// `90` → `1m 30s`: how long a build took, for a person.
+fn took(elapsed: Duration) -> String {
+    let secs = elapsed.as_secs();
+    match (secs / 60, secs % 60) {
+        (0, s) => format!("{s}s"),
+        (m, s) => format!("{m}m {s}s"),
+    }
+}
+
+/// Run a build of `copy`'s extension (`run`, `from`: "its source gem with
+/// the patch applied", "its patched gem"), saying when it starts and how it
+/// ended
+/// ([`RubyEnv::progress`]). What the build was worth is the caller's to
+/// say: one that exits cleanly may still have built nothing of the patch.
+async fn run_build(
+    probe: &Probe,
+    run: RubyRun<'_>,
+    copy: &GemCopy,
+    env: &RubyEnv,
+    from: &str,
+) -> Result<String, String> {
+    env.say(&format!(
+        "Rebuilding the native extension of {} from {from}; this can take several minutes.",
+        copy.full_name
+    ));
+    let started = std::time::Instant::now();
+    let built = run_ruby(&probe.ruby, run, copy, env, BUILD_TIMEOUT).await;
+    let ended = match &built {
+        Ok(_) => "finished",
+        Err(_) => "failed",
+    };
+    env.say(&format!(
+        "The build of {} {ended} after {}.",
+        copy.full_name,
+        took(started.elapsed())
+    ));
+    built
 }
 
 /// The Ruby that builds a gem copy's extension, and where the build lands.
@@ -1349,9 +1425,20 @@ enum RubyRun<'a> {
     },
     /// Build the extensions of the staged gem at `spec` inside
     /// `stage_home`: runs the staged tree's build scripts.
+    ///
+    /// `recorded_args`: the installed copy is one RubyGems built, and the
+    /// rebuild is given the arguments RubyGems recorded for it, as `gem
+    /// pristine` gives them. A precompiled copy was built by its publisher,
+    /// not here: arguments recorded for it were never used to build it
+    /// (Bundler's `build.<gem>` setting is recorded for a platform gem
+    /// too), so its rebuild takes none. Given them, a setting a project
+    /// kept from the years a gem had no precompiled build
+    /// (`build.nokogiri --use-system-libraries`) made the rebuild replace
+    /// the library the gem ships with whichever the system has.
     StageBuild {
         spec: &'a Path,
         stage_home: &'a Path,
+        recorded_args: bool,
     },
 }
 
@@ -1423,13 +1510,19 @@ async fn run_ruby(
             }
             "missing_deps"
         }
-        RubyRun::StageBuild { spec, stage_home } => {
+        RubyRun::StageBuild {
+            spec,
+            stage_home,
+            recorded_args,
+        } => {
             command
                 .arg("stage_build")
                 .arg(spec)
                 .arg(stage_home)
-                .arg(&copy.home)
-                .arg(&copy.full_name);
+                .arg(&copy.home);
+            if recorded_args {
+                command.arg(&copy.full_name);
+            }
             // The stage home first: the gems the build needs and the
             // install lacks were put there, and nowhere else.
             if let Some(gem_path) = gem_path_for(&[stage_home, &copy.home]) {
@@ -2093,7 +2186,7 @@ pub(crate) async fn install_staged(
         archive,
         stage_home,
     };
-    let stdout = run_ruby(&probe.ruby, run, &copy, env, BUILD_TIMEOUT).await?;
+    let stdout = run_build(&probe, run, &copy, env, "its patched gem").await?;
     let (full_name, built) = parse_installed(&stdout)
         .ok_or_else(|| format!("{}: unreadable install output", probe.ruby.display()))?;
     let staged = StagedInstall {
@@ -2882,6 +2975,225 @@ fn in_tree_artifacts(
     rels
 }
 
+/// The access time a build input is given before its build: earlier than
+/// any file's modification time, so that a filesystem that records reads
+/// lazily (Linux `relatime`, APFS) records the first read after it.
+fn unread_time() -> std::time::SystemTime {
+    std::time::UNIX_EPOCH + Duration::from_secs(1_000_000_000)
+}
+
+fn accessed(path: &Path) -> Option<std::time::SystemTime> {
+    std::fs::symlink_metadata(path).ok()?.accessed().ok()
+}
+
+/// Give `path` the access time [`unread_time`]. `false` when the file
+/// cannot take it, or the filesystem does not keep it as given.
+fn mark_unread(path: &Path) -> bool {
+    let times = std::fs::FileTimes::new().set_accessed(unread_time());
+    // A file's owner sets its times through any handle on Unix, and a
+    // patched file can be read-only (it keeps the gem's mode); Windows
+    // wants a handle opened for writing. Opening a file is not a read.
+    let set = [false, true].into_iter().any(|write| {
+        std::fs::OpenOptions::new()
+            .read(!write)
+            .write(write)
+            .open(path)
+            .is_ok_and(|file| file.set_times(times).is_ok())
+    });
+    set && accessed(path) == Some(unread_time())
+}
+
+/// Whether a read of a file in `dir` shows in its access time. A
+/// filesystem mounted `noatime`, and Windows by default, record none.
+fn records_reads(dir: &Path) -> bool {
+    let probe = dir.join(".socket-patch-read-probe");
+    let recorded = std::fs::write(&probe, b"probe").is_ok()
+        && mark_unread(&probe)
+        && std::fs::read(&probe).is_ok()
+        && accessed(&probe).is_some_and(|at| at != unread_time());
+    let _ = std::fs::remove_file(&probe);
+    recorded
+}
+
+/// A kernel watch on files for being opened or read (Linux inotify). It
+/// sees a read whatever the mount options: CI runners and container hosts
+/// are often mounted `noatime`, where an access time says nothing.
+#[cfg(target_os = "linux")]
+struct OpenWatch(std::os::fd::OwnedFd);
+
+#[cfg(target_os = "linux")]
+impl OpenWatch {
+    /// A watch on every one of `paths`, or none at all: a file that cannot
+    /// be watched could be the one the build reads.
+    fn on(paths: &[PathBuf]) -> Option<OpenWatch> {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        use std::os::unix::ffi::OsStrExt;
+        // SAFETY: a plain syscall; the fd it returns is owned from here on.
+        let raw = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
+        if raw < 0 {
+            return None;
+        }
+        // SAFETY: `raw` is a fresh fd nothing else holds.
+        let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+        for path in paths {
+            let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+            // SAFETY: `c_path` is a NUL-terminated string that outlives the call.
+            let watch = unsafe {
+                libc::inotify_add_watch(
+                    fd.as_raw_fd(),
+                    c_path.as_ptr(),
+                    libc::IN_OPEN | libc::IN_ACCESS,
+                )
+            };
+            if watch < 0 {
+                return None;
+            }
+        }
+        Some(OpenWatch(fd))
+    }
+
+    /// Whether any watched file was opened, read or replaced since the
+    /// watch was set (a replaced file ends its watch, which is an event
+    /// too: nothing is concluded about a file that is no longer the one
+    /// watched).
+    fn fired(&self) -> bool {
+        use std::os::fd::AsRawFd;
+        let mut events = [0u8; 4096];
+        // SAFETY: the buffer is valid for `events.len()` bytes; the fd is
+        // non-blocking, so a queue with no event returns at once.
+        let read =
+            unsafe { libc::read(self.0.as_raw_fd(), events.as_mut_ptr().cast(), events.len()) };
+        read > 0
+    }
+}
+
+/// What tells, after a build, whether it read any of a record's build
+/// inputs ([`watch_inputs`]).
+struct InputWatch {
+    /// The record's build inputs that are files under the gem dir (one the
+    /// record deletes is not there to read).
+    inputs: Vec<String>,
+    /// Those given the access time [`unread_time`].
+    marked: Vec<String>,
+    #[cfg(target_os = "linux")]
+    opens: Option<OpenWatch>,
+}
+
+/// Start watching the record's build inputs under `gem_dir` for a read,
+/// right before a build of them: a kernel watch where there is one
+/// ([`OpenWatch`]), and an access time in the past everywhere, for the
+/// filesystems that record reads.
+fn watch_inputs(gem_dir: &Path, scope: &NativeScope) -> InputWatch {
+    let inputs: Vec<String> = scope
+        .inputs
+        .iter()
+        .map(|key| normalize_file_path(key).to_string())
+        .filter(|rel| is_safe_relative_subpath(rel) && is_real_file(&gem_dir.join(rel)))
+        .collect();
+    let marked = inputs
+        .iter()
+        .filter(|rel| mark_unread(&gem_dir.join(rel)))
+        .cloned()
+        .collect();
+    // After the marks: setting one opens the file.
+    #[cfg(target_os = "linux")]
+    let opens = {
+        let paths: Vec<PathBuf> = inputs.iter().map(|rel| gem_dir.join(rel)).collect();
+        (!paths.is_empty()).then(|| OpenWatch::on(&paths)).flatten()
+    };
+    InputWatch {
+        inputs,
+        marked,
+        #[cfg(target_os = "linux")]
+        opens,
+    }
+}
+
+/// The build inputs of a record that a build which has just exited cleanly
+/// did not read, when it read NONE of them and that can be told (`watch`:
+/// [`watch_inputs`]'s, set on `gem_dir` before the build; `probe_dir`: a
+/// writable dir on the same filesystem).
+///
+/// A compiler reads what it compiles, and a build script reads the patch
+/// files it applies. A build that opened none of the files the patch
+/// changes compiled the same code it would have without them: the gem is
+/// set up not to build that part of itself (the packed library of a gem
+/// built against the system's copy), and the patch is not in what Ruby
+/// loads. One read is enough to pass: the classification of inputs is
+/// broad on purpose, and a build does not read every file a record
+/// carries (a manifest listing the files it adds).
+///
+/// `None` wherever a read leaves no trace (no kernel watch, and a
+/// filesystem that records no access): nothing is concluded from silence.
+fn unread_inputs(gem_dir: &Path, watch: &InputWatch, probe_dir: &Path) -> Option<Vec<String>> {
+    #[cfg(target_os = "linux")]
+    if let Some(opens) = &watch.opens {
+        return (!opens.fired()).then(|| watch.inputs.clone());
+    }
+    // Every input must have taken the mark: one that did not may be the
+    // one the build read.
+    if watch.inputs.is_empty() || watch.marked.len() != watch.inputs.len() {
+        return None;
+    }
+    let read_any = watch
+        .marked
+        .iter()
+        .any(|rel| accessed(&gem_dir.join(rel)) != Some(unread_time()));
+    if read_any || !records_reads(probe_dir) {
+        return None;
+    }
+    Some(watch.inputs.clone())
+}
+
+/// What is said of a build that read none of the record's build inputs,
+/// after a message that has just listed them.
+const NOT_READ: &str = "the build exited cleanly without reading any of those files, so nothing \
+                        of the patch is compiled into the extension: this install's build does \
+                        not use them. A gem set up to build against the system's copy of a \
+                        library it packs (`--use-system-libraries`) does this to a patch for the \
+                        packed copy (what the install runs is then the operating system's \
+                        library, and updating that package is what fixes it), and so does a gem \
+                        whose build downloads the binary it runs";
+
+/// What is said of a build that exited cleanly and left no compiled file.
+const NOTHING_BUILT: &str = "the build exited cleanly and left no compiled file to put where \
+                             Ruby loads it: what this gem runs is not a product of its extension \
+                             build (a gem whose build downloads the binary it runs, or leaves one \
+                             outside the extension dir, does this)";
+
+/// Why [`rebuild`] left the copy's previous build in place.
+#[derive(Debug)]
+enum NotRebuilt {
+    /// The build failed, or what it made could not be kept: the diagnostic.
+    Failed(String),
+    /// The build exited cleanly and showed that this install compiles
+    /// nothing of the record: it read none of the record's build inputs
+    /// ([`unread_inputs`]), or it left no compiled file at all. The reason,
+    /// as a clause.
+    NotOfPatch(String),
+}
+
+impl NotRebuilt {
+    fn into_detail(self) -> String {
+        match self {
+            NotRebuilt::Failed(detail) | NotRebuilt::NotOfPatch(detail) => detail,
+        }
+    }
+}
+
+/// Whether a build that has just exited left compiled code: an artifact in
+/// the extension dir, or a changed file in the gem's own tree that Ruby
+/// could load.
+fn left_compiled_code(probe: &Probe, changes: &TreeChanges) -> bool {
+    let dlext = probe.facts.as_ref().map(|facts| facts.dlext.as_str());
+    !artifact_rels(&probe.extension_dir).is_empty()
+        || changes
+            .replaced
+            .iter()
+            .chain(&changes.created)
+            .any(|rel| is_loadable(rel, &probe.require_paths, dlext))
+}
+
 /// Why a build that exited cleanly is not one of the sources on disk, when
 /// that shows in the files it left: `None` when nothing does.
 ///
@@ -2921,13 +3233,7 @@ fn stale_build(
         .files
         .keys()
         .any(|rel| is_library_name(leaf_of(rel), dlext));
-    let compiled = !artifact_rels(&probe.extension_dir).is_empty()
-        || changes
-            .replaced
-            .iter()
-            .chain(&changes.created)
-            .any(|rel| is_loadable(rel, &probe.require_paths, dlext));
-    (keeps_library && !compiled).then(|| {
+    (keeps_library && !left_compiled_code(probe, changes)).then(|| {
         "the build exited cleanly but compiled nothing: it left no artifact in the extension \
          dir and changed no file of the gem's own tree that Ruby loads, so the gem still runs \
          the library that was there (a build script that takes the library it finds for \
@@ -2946,10 +3252,12 @@ fn stale_build(
 /// finished build replaced or added there is backed up with the original
 /// build and attested by the marker like the extension dir's artifacts.
 /// On failure every build product, in the extension dir and in the gem's
-/// tree, is put back as it was; `Err` is the build's diagnostic. A build
+/// tree, is put back as it was; `Err` says why ([`NotRebuilt`]). A build
 /// that exits cleanly without building the sources fails too
 /// ([`stale_build`]): that holds for a rollback's rebuild of the restored
-/// sources as for a patch's.
+/// sources as for a patch's. So does a build of a record (`files`) that
+/// shows this install compiles nothing of it
+/// ([`NotRebuilt::NotOfPatch`]): the previous build is what the copy keeps.
 async fn rebuild(
     copy: &GemCopy,
     probe: &Probe,
@@ -2958,7 +3266,7 @@ async fn rebuild(
     env: &RubyEnv,
     back_up: bool,
     stale: &[String],
-) -> Result<(), String> {
+) -> Result<(), NotRebuilt> {
     // A backup this rebuild made is dropped again when the build does not
     // land: the install-time build is back in place, so the copy is as it
     // was before the run.
@@ -3026,9 +3334,24 @@ async fn rebuild(
                 }
             }
         })
-        .await?
+        .await
+        .map_err(NotRebuilt::Failed)?
     };
-    let built = run_ruby(&probe.ruby, RubyRun::Build(probe), copy, env, BUILD_TIMEOUT).await;
+    // Nothing reads the tree between here and the check after the build
+    // but the build. A rebuild without record files (a rollback's, of the
+    // original sources) has no patch to look for.
+    let watch = if files.is_empty() {
+        None
+    } else {
+        let (gem_dir, scope) = (copy.gem_dir.clone(), scope.clone());
+        Some(crate::utils::fs::run_blocking(move || watch_inputs(&gem_dir, &scope)).await)
+    };
+    let from = if files.is_empty() {
+        "the sources in the installed gem"
+    } else {
+        "the patched sources in the installed gem"
+    };
+    let built = run_build(probe, RubyRun::Build(probe), copy, env, from).await;
     let (copy, probe, scope, files) = (copy.clone(), probe.clone(), scope.clone(), files.clone());
     crate::utils::fs::run_blocking(move || {
         // A build whose record cannot be written is undone like a failed
@@ -3036,38 +3359,57 @@ async fn rebuild(
         // puts the original sources back. So is one that exits cleanly
         // without an extension dir: the old one was moved aside for it.
         let committed = match built {
-            Ok(_) if !probe.extension_dir.is_dir() => Err(format!(
+            Ok(_) if !probe.extension_dir.is_dir() => Err(NotRebuilt::Failed(format!(
                 "the build exited cleanly but left no extension in {}",
                 probe.extension_dir.display()
-            )),
+            ))),
             Ok(_) => {
+                // Before anything else reads the tree.
+                let unread = watch
+                    .as_ref()
+                    .and_then(|watch| unread_inputs(&copy.gem_dir, watch, &snapshot.dir));
                 let changes = tree_changes(&copy, &snapshot);
-                match stale_build(&copy, &probe, &removed, &snapshot, &changes) {
-                    Some(why) => Err(why),
+                let stale = stale_build(&copy, &probe, &removed, &snapshot, &changes);
+                match (stale, unread) {
+                    // A build that took the products it found for current
+                    // read nothing either, and a fresh build would: that
+                    // is the failure to name.
+                    (Some(why), _) => Err(NotRebuilt::Failed(why)),
+                    (None, Some(_)) => Err(NotRebuilt::NotOfPatch(NOT_READ.to_string())),
+                    // A record's build that leaves no compiled code has
+                    // nothing for the record to be in (#2144). A rollback's
+                    // (no record) leaves the gem as its install did.
+                    (None, None)
+                        if !files.is_empty()
+                            && removed.is_empty()
+                            && !left_compiled_code(&probe, &changes) =>
+                    {
+                        Err(NotRebuilt::NotOfPatch(NOTHING_BUILT.to_string()))
+                    }
                     // The backup learns of the tree's changes before the
                     // marker says the build is done: a run that dies in
                     // between is undone from the snapshot.
-                    None => back_up_tree_changes(&copy, &snapshot, &removed, &changes)
+                    (None, None) => back_up_tree_changes(&copy, &snapshot, &removed, &changes)
                         .and_then(|()| {
                             let in_tree = in_tree_artifacts(&copy, &probe, &removed, &changes);
                             commit_build(&copy, &probe, &scope, &files, &aside, &in_tree)
                         })
                         .map_err(|e| {
-                            format!(
+                            NotRebuilt::Failed(format!(
                                 "the extension built, but its build record could not be \
                                  written: {e}"
-                            )
+                            ))
                         }),
                 }
             }
-            Err(diagnostic) => Err(diagnostic),
+            Err(diagnostic) => Err(NotRebuilt::Failed(diagnostic)),
         };
-        let diagnostic = match committed {
+        let why = match committed {
             Ok(()) => {
                 let _ = remove_dir_if_exists(&snapshot.dir);
                 return Ok(());
             }
-            Err(diagnostic) => diagnostic,
+            Err(why) => why,
         };
         // The gem's own tree first, while the parked build still says a
         // rebuild is under way: if it cannot be put back, the parked build
@@ -3077,13 +3419,16 @@ async fn rebuild(
         match undone {
             Ok(()) => {
                 drop_new_backup(&copy, made_backup);
-                Err(diagnostic)
+                Err(why)
             }
-            Err(e) => Err(format!(
-                "{diagnostic}\n(the previous build could not be put back: {e}; run `gem pristine {} \
+            // A copy whose previous build is not back is a failure,
+            // whatever the build showed.
+            Err(e) => Err(NotRebuilt::Failed(format!(
+                "{}\n(the previous build could not be put back: {e}; run `gem pristine {} \
                  --extensions` to rebuild it)",
+                why.into_detail(),
                 gem_name_of(&copy.full_name)
-            )),
+            ))),
         }
     })
     .await
@@ -3303,6 +3648,10 @@ enum StageFailure {
     Dependencies(String),
     /// RubyGems' builder failed: the build's diagnostic.
     Build(String),
+    /// The build read none of the record's build inputs ([`unread_inputs`]):
+    /// it is no build of the patch, and neither would one of the installed
+    /// tree be.
+    NotRead,
     /// The build leaves what Ruby loads in the gem's own tree
     /// ([`in_tree_products`]), where a build staged elsewhere cannot stand
     /// in for it.
@@ -3332,6 +3681,7 @@ impl StageFailure {
             StageFailure::Build(diagnostic) => {
                 format!("the source gem did not build:\n{diagnostic}")
             }
+            StageFailure::NotRead => NOT_READ.to_string(),
             StageFailure::InTree { products, .. } => format!(
                 "the source gem's build leaves {} in the gem's own tree, which is where it is \
                  loaded from, and a build staged elsewhere cannot take its place",
@@ -3593,6 +3943,12 @@ async fn stage_dependencies(
                 stage_home: &stage.home,
             };
             stage.beat();
+            // A gem the build needs may have an extension of its own.
+            env.say(&format!(
+                "Installing {} into the build stage: the build of {} needs it.",
+                id.full_name(),
+                copy.full_name
+            ));
             let stdout = run_ruby(&probe.ruby, run, copy, env, BUILD_TIMEOUT)
                 .await
                 .map_err(|why| format!("{needed} and did not install into the stage:\n{why}"))?;
@@ -3798,11 +4154,35 @@ async fn build_in_stage(
     let run = RubyRun::StageBuild {
         spec: &staged.spec_path,
         stage_home: &stage.home,
+        // The source gem of a copy RubyGems built is the copy's own gem; a
+        // precompiled copy's is the ruby-platform gem of its version.
+        recorded_args: source.full_name() == copy.full_name,
     };
     stage.beat();
-    let stdout = run_ruby(&probe.ruby, run, copy, env, BUILD_TIMEOUT)
+    // Nothing reads the staged tree between here and the check below but
+    // the build.
+    let watch = match record {
+        Some(record) => {
+            let (gem_dir, scope) = (staged.gem_dir.clone(), record.scope.clone());
+            Some(crate::utils::fs::run_blocking(move || watch_inputs(&gem_dir, &scope)).await)
+        }
+        None => None,
+    };
+    let from = match record {
+        Some(_) => "its source gem with the patch applied",
+        None => "its source gem",
+    };
+    let stdout = run_build(probe, run, copy, env, from)
         .await
         .map_err(StageFailure::Build)?;
+    if let Some(watch) = watch {
+        let (gem_dir, root) = (staged.gem_dir.clone(), stage.root.clone());
+        let unread =
+            crate::utils::fs::run_blocking(move || unread_inputs(&gem_dir, &watch, &root)).await;
+        if unread.is_some() {
+            return Err(StageFailure::NotRead);
+        }
+    }
     let reported = tagged_lines(&stdout, "sp_built")
         .into_iter()
         .find_map(|fields| fields.first().map(PathBuf::from))
@@ -4491,6 +4871,49 @@ impl Job<'_> {
         GemApplied { result, warning }
     }
 
+    /// The warning of a copy that holds the record's files while its
+    /// compiled code is what it was: a clean build showed that this install
+    /// compiles nothing of the record (`why`). No marker is written, so
+    /// `vex` and `apply --check` do not take the copy for patched
+    /// ([`verify_native_build`]).
+    fn not_compiled(&self, why: &str) -> (String, String) {
+        (
+            NOT_REBUILT_REASON.to_string(),
+            format!(
+                "{}: the patch's files were written, but its native-extension sources ({}) \
+                 are not in the compiled code this install runs: {why}. That code is as it was \
+                 installed, only the patch's other files are in effect, and vex does not \
+                 attest the patch",
+                self.package_key, self.inputs
+            ),
+        )
+    }
+
+    /// Write the record's files into a copy whose build showed that it
+    /// compiles nothing of them (`why`), and say so
+    /// ([`not_compiled`](Self::not_compiled)): the patch's Ruby files take
+    /// effect, and a file the gem compiles later on its own (one that
+    /// builds its binary when it first runs) is the patched one (#2144).
+    /// A record with a build input the copy does not hold (`absent`) is
+    /// refused instead: only a build from the source gem accounts for a
+    /// file added that way ([`files_as_installed`]).
+    async fn write_without_build(&self, absent: &[String], why: &str) -> GemApplied {
+        if !absent.is_empty() {
+            return self.refuse(
+                UNSUPPORTED_CODE,
+                format!(
+                    "the patch changes native-extension sources ({}), and they cannot take \
+                     effect on this install: {why}; nothing was written.",
+                    self.inputs
+                ),
+            );
+        }
+        let originals = self.originals().await;
+        let result = self.write_sources(&originals).await;
+        let warning = result.success.then(|| self.not_compiled(why));
+        GemApplied { result, warning }
+    }
+
     /// The outcome of a copy that is as it was before the run, because
     /// `detail` (a [`BUILD_FAILED_CODE`] failure).
     async fn not_built(
@@ -4877,7 +5300,18 @@ pub async fn apply_gem_package_patch(
     };
     let failure = match staged {
         Ok((stage, built)) => {
-            let applied = if precompiled {
+            // A gem RubyGems built loads what its build leaves in the
+            // extension dir. A build that leaves nothing there (and nothing
+            // Ruby loads in the gem's tree: `in_tree_products`) made
+            // nothing to install, and moving its empty dir in would pass
+            // for a build of the patch (#2144).
+            let nothing_built = !precompiled && {
+                let dir = built.extension_dir.clone();
+                crate::utils::fs::run_blocking(move || artifact_rels(&dir).is_empty()).await
+            };
+            let applied = if nothing_built {
+                job.write_without_build(&absent, NOTHING_BUILT).await
+            } else if precompiled {
                 graft_into_copy(&job, &probe, &built, &absent).await
             } else {
                 move_into_copy(&job, &probe, &built, &absent).await
@@ -4894,6 +5328,9 @@ pub async fn apply_gem_package_patch(
     match failure {
         // Another run is building this gem: nothing else is tried.
         StageFailure::Busy(why) => unbuildable(why),
+        // A build of the installed tree would read as little: the patch's
+        // native part has nothing to take effect in on this install.
+        StageFailure::NotRead => job.write_without_build(&absent, NOT_READ).await,
         // A gem RubyGems built can still be built where it is installed,
         // as it was before there was a stage: nothing was written yet.
         failure if !precompiled => {
@@ -4986,7 +5423,12 @@ async fn rebuild_in_place(
     };
     match rebuild(job.copy, probe, job.scope, job.files, job.env, true, stale).await {
         Ok(()) => job.built(result),
-        Err(diagnostic) => {
+        // The previous build is back, and the sources stay written.
+        Err(NotRebuilt::NotOfPatch(why)) => {
+            let warning = Some(job.not_compiled(&why));
+            GemApplied { result, warning }
+        }
+        Err(NotRebuilt::Failed(diagnostic)) => {
             // An installed tree may no longer hold what its build needs
             // (nokogiri's deletes `ports/`): the source gem would.
             let remedy = remedy.map(|r| format!(" {r}")).unwrap_or_default();
@@ -5246,7 +5688,9 @@ pub async fn restore_original_build(pkg_path: &Path, env: &RubyEnv) -> Result<bo
         Ok(rebuilt) => rebuilt,
         Err(stale) => {
             let scope = NativeScope::default();
-            rebuild(&copy, &probe, &scope, &HashMap::new(), env, false, &stale).await
+            rebuild(&copy, &probe, &scope, &HashMap::new(), env, false, &stale)
+                .await
+                .map_err(NotRebuilt::into_detail)
         }
     };
     rebuilt.map_err(|diagnostic| {
@@ -5752,6 +6196,7 @@ mod tests {
             cwd: tmp.path().to_path_buf(),
             rebuild: true,
             offline: true,
+            progress: None,
         };
         let mut preflight = Preflight {
             installed: installed_extension_dirs(&copy),
@@ -5789,6 +6234,7 @@ mod tests {
             cwd: tmp.path().to_path_buf(),
             rebuild: true,
             offline: true,
+            progress: None,
         };
         for require_path in ["../../elsewhere", "/abs"] {
             let home = tmp.path().join(require_path.replace(['/', '.'], "_"));
@@ -5818,6 +6264,7 @@ mod tests {
             cwd: tmp.path().to_path_buf(),
             rebuild: true,
             offline: true,
+            progress: None,
         };
         // Without a `ruby` on PATH the preflight still refuses, for that.
         match rebuild_preflight(&copy, &env, false).await {
@@ -6064,6 +6511,7 @@ mod tests {
                 cwd: home.clone(),
                 rebuild: true,
                 offline: true,
+                progress: None,
             };
             assert!(restore_original_build(&gem_dir, &env).await.is_err());
             assert!(
@@ -6091,6 +6539,7 @@ mod tests {
             cwd: home.clone(),
             rebuild: true,
             offline: true,
+            progress: None,
         };
         let restored = tokio::time::timeout(
             std::time::Duration::from_secs(10),
@@ -6116,6 +6565,7 @@ mod tests {
                 cwd: home.to_path_buf(),
                 rebuild: true,
                 offline: true,
+                progress: None,
             };
             assert_eq!(restore_original_build(&gem_dir, &env).await, Ok(true));
             let ext = home.join("extensions/p/3.4.0/a-1");
@@ -6258,6 +6708,59 @@ mod tests {
             .copied()
             .collect();
         files(&all)
+    }
+
+    /// A build that read none of a record's inputs is told from one that
+    /// read any of them, and nothing is concluded where a read leaves no
+    /// trace.
+    #[test]
+    fn a_build_that_read_none_of_the_inputs_is_told_from_one_that_read_any() {
+        let tmp = tempfile::tempdir().unwrap();
+        // A kernel watch on Linux, access times elsewhere when the
+        // filesystem keeps them.
+        if !cfg!(target_os = "linux") && !records_reads(tmp.path()) {
+            eprintln!("SKIP: this filesystem does not record reads in access times");
+            return;
+        }
+        let gem_dir = tmp.path().join("gem");
+        std::fs::create_dir_all(gem_dir.join("patches/lib")).unwrap();
+        std::fs::create_dir_all(gem_dir.join("ext/a")).unwrap();
+        std::fs::write(gem_dir.join("ext/a/a.c"), "int a;\n").unwrap();
+        std::fs::write(gem_dir.join("patches/lib/0001.patch"), "fix\n").unwrap();
+        let scope = NativeScope {
+            inputs: vec![
+                "ext/a/a.c".to_string(),
+                "ext/a/deleted.c".to_string(),
+                "patches/lib/0001.patch".to_string(),
+            ],
+            builds_extensions: true,
+            ..NativeScope::default()
+        };
+        let both = [
+            "ext/a/a.c".to_string(),
+            "patches/lib/0001.patch".to_string(),
+        ];
+
+        // An input the record deletes is not there to watch.
+        let watch = watch_inputs(&gem_dir, &scope);
+        assert_eq!(watch.inputs, both);
+        // Looking at a file, or listing its dir, is not reading it.
+        std::fs::metadata(gem_dir.join("ext/a/a.c")).unwrap();
+        assert_eq!(std::fs::read_dir(gem_dir.join("ext/a")).unwrap().count(), 1);
+        assert_eq!(
+            unread_inputs(&gem_dir, &watch, tmp.path()),
+            Some(both.to_vec())
+        );
+
+        // One read is a build of something the patch changes.
+        let watch = watch_inputs(&gem_dir, &scope);
+        std::fs::read(gem_dir.join("patches/lib/0001.patch")).unwrap();
+        assert_eq!(unread_inputs(&gem_dir, &watch, tmp.path()), None);
+
+        // Nothing to watch, nothing concluded.
+        let none = watch_inputs(&gem_dir, &NativeScope::default());
+        assert_eq!(unread_inputs(&gem_dir, &none, tmp.path()), None);
+        assert!(!tmp.path().join(".socket-patch-read-probe").exists());
     }
 
     /// In the source-built gem (its gemspec declares the extension)
@@ -6783,6 +7286,7 @@ mod tests {
             cwd: home.clone(),
             rebuild: true,
             offline: true,
+            progress: None,
         };
         assert_eq!(restore_original_build(&copy.gem_dir, &env).await, Ok(true));
         assert_eq!(std::fs::read(&target).unwrap(), PREBUILT);
@@ -6959,6 +7463,7 @@ mod tests {
             cwd: home.clone(),
             rebuild: true,
             offline: true,
+            progress: None,
         };
         assert_eq!(restore_original_build(&copy.gem_dir, &env).await, Ok(true));
         assert_eq!(std::fs::read(ext.join("a/a.so")).unwrap(), b"original");
@@ -7070,6 +7575,7 @@ mod tests {
             cwd: tmp.path().to_path_buf(),
             rebuild: true,
             offline: true,
+            progress: None,
         };
         let bin = tmp.path().join("bin");
         let preflight = |candidates: Vec<PathBuf>| {
@@ -7336,6 +7842,7 @@ mod tests {
             cwd: tmp.path().to_path_buf(),
             rebuild: true,
             offline: true,
+            progress: None,
         };
         mode(&copy.gem_dir, 0o000);
         let restored = restore_original_build(&copy.gem_dir, &env).await;
@@ -7379,6 +7886,7 @@ mod tests {
             cwd: tmp.path().to_path_buf(),
             rebuild: true,
             offline: true,
+            progress: None,
         };
         assert_eq!(read_marker_strict(&copy.gem_dir).unwrap(), None);
         assert_eq!(restore_original_build(&copy.gem_dir, &env).await, Ok(false));
@@ -7529,6 +8037,7 @@ mod tests {
             cwd: home.clone(),
             rebuild: true,
             offline: true,
+            progress: None,
         };
         assert_eq!(restore_original_build(&copy.gem_dir, &env).await, Ok(true));
         for binary in [&for_33, &for_34] {
