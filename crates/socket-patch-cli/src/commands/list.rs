@@ -436,24 +436,10 @@ fn columns(projects: bool) -> Vec<Column> {
     columns
 }
 
-/// How the table names each of `rows`' packages: `name@version` when
-/// they are all of one ecosystem, the purl otherwise, where a bare name
-/// could be either's.
+/// How the table names each of `rows`' packages
+/// ([`crate::ui::package_names`]).
 fn names(rows: &[&Browse]) -> Vec<String> {
-    use socket_patch_core::utils::purl::purl_parts;
-    let parts: Vec<_> = rows.iter().map(|row| purl_parts(&row.purl)).collect();
-    let first = parts.first().and_then(|p| p.as_ref().map(|(ty, _, _)| ty));
-    let one_type = first.is_some()
-        && parts
-            .iter()
-            .all(|p| p.as_ref().map(|(ty, _, _)| ty) == first);
-    rows.iter()
-        .zip(&parts)
-        .map(|(row, parts)| match parts {
-            Some((_, name, version)) if one_type => format!("{name}@{version}"),
-            _ => row.purl.clone(),
-        })
-        .collect()
+    crate::ui::package_names(&rows.iter().map(|row| row.purl.as_str()).collect::<Vec<_>>())
 }
 
 /// The table an interactive run opens with: what the project's own
@@ -478,18 +464,11 @@ fn table_of(rows: &[(Browse, Option<String>)]) -> Table {
 }
 
 /// Whether this run is someone at a terminal who can be shown a table to
-/// browse: a human run with stdin, stdout and stderr (where the browser
-/// is drawn) all on a terminal, that `--yes` did not ask to run
+/// browse: a human run on a terminal that can show the full-screen
+/// browser ([`crate::ui::full_screen`]), that `--yes` did not ask to run
 /// unattended. `--verbose` keeps the full listing.
 fn interactive(common: &GlobalArgs) -> bool {
-    use std::io::IsTerminal;
-    !common.json
-        && !common.silent
-        && !common.yes
-        && !common.verbose
-        && std::io::stdin().is_terminal()
-        && std::io::stdout().is_terminal()
-        && std::io::stderr().is_terminal()
+    !common.json && !common.silent && !common.yes && !common.verbose && crate::ui::full_screen()
 }
 
 /// Browse `rows` full-screen: the table goes up at once with what the
@@ -508,18 +487,31 @@ async fn browse(rows: Vec<(Browse, Option<String>)>, common: &GlobalArgs) -> Tab
 
     let table = table_of(&rows);
     let names = names(&rows.iter().map(|(row, _)| row).collect::<Vec<_>>());
-    // Built before the browser takes the screen: it may print advisories.
-    let client = if common.offline {
-        None
-    } else {
+    // The patch service's client is built once the table is up, by
+    // whichever read needs it first: building it can mean a request (a
+    // token with no organization named has its organization looked up),
+    // and the listing itself needs none, so it never waits for one.
+    // While the browser has the screen, core's advisories are muted: a
+    // line printed under it would land in the middle of the table. The
+    // one that explains what the table shows is printed after.
+    let connection = tokio::sync::OnceCell::<socket_patch_core::api::client::ApiClient>::new();
+    let connect = || async {
+        if common.offline {
+            return None;
+        }
         Some(
-            socket_patch_core::api::client::get_api_client_with_overrides(
-                common.api_client_overrides(),
-            )
-            .await
-            .0,
+            connection
+                .get_or_init(|| async {
+                    socket_patch_core::api::client::get_api_client_with_overrides(
+                        common.api_client_overrides(),
+                    )
+                    .await
+                    .0
+                })
+                .await,
         )
     };
+    socket_patch_core::utils::notice::set_output_mode(true, common.json);
     let (updates, received) = std::sync::mpsc::channel::<Update>();
     let (opened, mut opening) = tokio::sync::mpsc::unbounded_channel::<usize>();
 
@@ -533,7 +525,9 @@ async fn browse(rows: Vec<(Browse, Option<String>)>, common: &GlobalArgs) -> Tab
         })
     });
     let details = async {
-        let Some(client) = &client else { return };
+        let Some(client) = connect().await else {
+            return;
+        };
         let mut uuids: Vec<String> = rows.iter().map(|(row, _)| row.uuid.clone()).collect();
         uuids.sort_unstable();
         uuids.dedup();
@@ -567,12 +561,12 @@ async fn browse(rows: Vec<(Browse, Option<String>)>, common: &GlobalArgs) -> Tab
     };
     let style = crate::ui::Style::stderr();
     let page = |index: usize| {
-        let (rows, client, updates) = (&rows, &client, &updates);
+        let (rows, connect, updates) = (&rows, &connect, &updates);
         async move {
             let Some((row, _)) = rows.get(index) else {
                 return;
             };
-            let page = match client {
+            let page = match connect().await {
                 Some(client) => {
                     match crate::commands::show::load_page(client, &row.uuid, style).await {
                         Ok(page) => page,
@@ -595,6 +589,15 @@ async fn browse(rows: Vec<(Browse, Option<String>)>, common: &GlobalArgs) -> Tab
             Some(()) = pages.next(), if !pages.is_empty() => {}
         }
     };
+    drop(pages);
+    // The screen is the terminal's again: advisories print as before,
+    // and the one the browser withheld that explains its rows is said
+    // now (a token whose organization could not be found reads the
+    // public service, which knows free patches only).
+    socket_patch_core::utils::notice::set_output_mode(common.silent, common.json);
+    if let Some(reason) = connection.get().and_then(|client| client.org_unresolved()) {
+        eprintln!("Warning: {reason}");
+    }
     match left {
         Ok(Ok(table)) => table,
         // No full-screen browser here (the terminal could not be set up

@@ -3708,10 +3708,11 @@ pub(crate) async fn rollback_patches_inner(
     let mut warnings: Vec<(String, String)> = Vec::new();
     let mut superseded_left: Vec<String> = Vec::new();
 
-    // The restores show as counted progress: a package with a native
-    // extension to rebuild, or a large tree of copies, takes a while, and
-    // nothing in the loop prints while the line is up (a failure prints
-    // here only under `--silent`, where there is no line).
+    // The restores show as counted progress: a large tree of copies takes
+    // a while. Nothing prints while the line is up: a failure prints here
+    // only under `--silent`, where there is no line, and the line comes
+    // down before a gem's native extension is rebuilt, which reports its
+    // own progress.
     let mut restoring = StatusLine::stderr(common.json, common.silent);
     let verb = if common.dry_run {
         "Checking packages"
@@ -3772,6 +3773,7 @@ pub(crate) async fn rollback_patches_inner(
                             offline: common.offline,
                             progress: common.gem_build_progress(),
                         };
+                        restoring.finish();
                         if let Err(e) = gem_ext::restore_original_build(pkg_path, &env).await {
                             result.success = false;
                             result.error = Some(format!("{}: {e}", gem_ext::RESTORE_FAILED_CODE));

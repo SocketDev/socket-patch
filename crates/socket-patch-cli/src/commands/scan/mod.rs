@@ -1849,8 +1849,18 @@ async fn ahead(
     let mut out: Vec<Option<Crawled>> = dirs.iter().map(|_| None).collect();
     // One directory waits for nothing but itself. A pruning scan crawls a
     // scope its policy settles, a global one has no project directories,
-    // and an offline one is refused before it asks anything.
-    if dirs.len() < 2 || args.prune || args.sync || args.common.offline || args.common.is_global() {
+    // and an offline one is refused before it asks anything. Where file
+    // descriptors are scarce the crawls run one at a time, each in its
+    // directory's turn, as every other part of a run does there: a crawl
+    // that runs out of descriptors reads a directory it could not open as
+    // one that is not there, and comes back short.
+    if dirs.len() < 2
+        || args.prune
+        || args.sync
+        || args.common.offline
+        || args.common.is_global()
+        || socket_patch_core::crawlers::walk_pool::fd_limit_is_tight()
+    {
         return out;
     }
     report.share_lookups();
@@ -4085,7 +4095,7 @@ async fn scan_project(
         report.settle().await;
         if !silent && !verbose {
             println!("Patches available:");
-            for row in report.rows(&plan, &offered) {
+            for row in report.rows_offered(&plan, &offered) {
                 println!("{row}");
             }
             println!();

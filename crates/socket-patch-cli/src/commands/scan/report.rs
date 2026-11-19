@@ -22,7 +22,6 @@ use socket_patch_core::api::client::ApiClient;
 use socket_patch_core::api::ranking::{cmp_batch_infos, severity_order};
 use socket_patch_core::api::types::{BatchPackagePatches, PatchSearchResult, PatchStatistics};
 use socket_patch_core::policy::filter::{Reachability, SelectionFilter};
-use socket_patch_core::utils::purl::{canonical_purl, purl_parts};
 use socket_patch_core::utils::purl_key::PurlKey;
 
 use crate::args::GlobalArgs;
@@ -352,19 +351,8 @@ fn percent_left(fixed: usize, left: usize) -> Option<String> {
 /// project is of one ecosystem (the scan line above names it), the full
 /// purl otherwise, where a bare name could be either's.
 fn display_names(packages: &[&Package]) -> Vec<String> {
-    let parts: Vec<Option<(String, String, String)>> =
-        packages.iter().map(|p| purl_parts(&p.purl)).collect();
-    let mut types = parts.iter().map(|p| p.as_ref().map(|(ty, _, _)| ty));
-    let first = types.next().flatten();
-    let one_type = first.is_some() && types.all(|ty| ty == first);
-    packages
-        .iter()
-        .zip(&parts)
-        .map(|(pkg, parts)| match parts {
-            Some((_, name, version)) if one_type => format!("{name}@{version}"),
-            _ => canonical_purl(&pkg.purl),
-        })
-        .collect()
+    let purls: Vec<&str> = packages.iter().map(|p| p.purl.as_str()).collect();
+    ui::package_names(&purls)
 }
 
 /// A row's advisory cell at `shown` ids: `CVE-1, CVE-2 (+3)`; every id
@@ -393,8 +381,10 @@ fn ids_cell(ids: &[String], shown: Option<usize>) -> String {
 /// package stay unpatched. On a terminal `cap` columns wide it names
 /// fewer ids, and then drops the measurements, rather than wrap.
 /// `--verbose` names every id, and lists the unpatched ones on a line of
-/// their own. `style` opens each row with a check mark where the terminal
-/// shows one.
+/// their own. Where the terminal shows one, `style` opens each row of a
+/// patch that is in place (`done`) with a check mark; the rows of a dry
+/// run and of a report, whose patches are only on offer, keep the column
+/// and leave it blank.
 pub(crate) fn rows(
     plan: &[Package],
     landed: &HashSet<&str>,
@@ -402,6 +392,7 @@ pub(crate) fn rows(
     verbose: bool,
     style: Style,
     cap: Option<usize>,
+    done: bool,
 ) -> Vec<String> {
     let mut patched: Vec<&Package> = plan.iter().filter(|p| p.landed(landed)).collect();
     if patched.is_empty() {
@@ -462,7 +453,7 @@ pub(crate) fn rows(
             .map(|i| {
                 let mut row = format!(
                     "{} {}  {}",
-                    style.check(),
+                    if done { style.check() } else { " ".to_string() },
                     ui::pad(&ui::severity(&severities[i], color), sev_w),
                     ui::pad(&super::render::elide_purl(&names[i], name_w), name_w),
                 );
@@ -561,8 +552,10 @@ pub(crate) fn closing(
     // With glyphs every line has a two-column gutter: a check mark for
     // what was done, blank otherwise.
     let done = |line: String| {
-        if style.glyphs {
+        if style.glyphs && !dry_run {
             format!("{} {line}", style.check())
+        } else if style.glyphs {
+            format!("  {line}")
         } else {
             line
         }
@@ -942,8 +935,20 @@ impl Run {
     }
 
     /// The rows [`Self::project`] prints, for a caller that prints them
-    /// itself: none under `--json` or `--silent`.
+    /// itself: none under `--json` or `--silent`. They carry the mark of
+    /// a patch in place unless this is a dry run.
     pub(crate) fn rows(&self, plan: &[Package], landed: &HashSet<&str>) -> Vec<String> {
+        self.rows_marked(plan, landed, !self.dry_run)
+    }
+
+    /// The rows of the packages a patch is on offer for (`offered`), for
+    /// a run that reports and patches nothing: no row carries the mark of
+    /// a patch in place.
+    pub(crate) fn rows_offered(&self, plan: &[Package], offered: &HashSet<&str>) -> Vec<String> {
+        self.rows_marked(plan, offered, false)
+    }
+
+    fn rows_marked(&self, plan: &[Package], landed: &HashSet<&str>, done: bool) -> Vec<String> {
         if !self.human {
             return Vec::new();
         }
@@ -955,6 +960,7 @@ impl Run {
             self.verbose,
             Style::stdout(),
             cap,
+            done,
         )
     }
 
@@ -1306,7 +1312,7 @@ mod tests {
         ];
         let all = landed(&["u", "s", "n"]);
         assert_eq!(
-            rows(&plan, &all, &none(), false, PLAIN, None),
+            rows(&plan, &all, &none(), false, PLAIN, None, true),
             vec![
                 "  CRITICAL  shell-quote@1.10.0  CVE-102422",
                 "  HIGH      nuxt@4.5.0          CVE-1, CVE-2 (+2)     1 unpatched",
@@ -1314,11 +1320,11 @@ mod tests {
             ]
         );
         // Nothing landed: no rows at all.
-        assert!(rows(&plan, &landed(&[]), &none(), false, PLAIN, None).is_empty());
+        assert!(rows(&plan, &landed(&[]), &none(), false, PLAIN, None, true).is_empty());
         // Color wraps the cells without moving a column.
-        let colored = rows(&plan, &all, &none(), false, COLOR, None);
+        let colored = rows(&plan, &all, &none(), false, COLOR, None, true);
         let plain: Vec<String> = colored.iter().map(|r| ui::strip_ansi(r)).collect();
-        assert_eq!(plain, rows(&plan, &all, &none(), false, PLAIN, None));
+        assert_eq!(plain, rows(&plan, &all, &none(), false, PLAIN, None, true));
         assert!(colored[0].contains("\x1b[91mCRITICAL\x1b[0m"));
         assert!(colored[2].contains("\x1b[33m3 unpatched\x1b[0m"));
     }
@@ -1342,7 +1348,7 @@ mod tests {
             ),
         ];
         let all = landed(&["u", "n"]);
-        let at = |cap| rows(&plan, &all, &none(), false, PLAIN, Some(cap));
+        let at = |cap| rows(&plan, &all, &none(), false, PLAIN, Some(cap), true);
         assert_eq!(
             at(80),
             vec![
@@ -1368,7 +1374,7 @@ mod tests {
             assert!(at(cap).iter().all(|row| row.chars().count() < cap), "{cap}");
         }
         // Narrower than the counts: the full form, wrapped by the terminal.
-        assert_eq!(at(10), rows(&plan, &all, &none(), false, PLAIN, None));
+        assert_eq!(at(10), rows(&plan, &all, &none(), false, PLAIN, None, true));
     }
 
     #[test]
@@ -1381,7 +1387,7 @@ mod tests {
             &["CVE-8", "CVE-9"],
         )];
         assert_eq!(
-            rows(&plan, &landed(&["u"]), &none(), true, PLAIN, Some(20)),
+            rows(&plan, &landed(&["u"]), &none(), true, PLAIN, Some(20), true),
             vec![
                 "  HIGH  undici@8.10.0  CVE-1, CVE-2, CVE-3  2 unpatched",
                 "      still unpatched: CVE-8, CVE-9",
@@ -1396,7 +1402,15 @@ mod tests {
             pkg("pkg:pypi/requests@2.31.0", "b", "LOW", &["CVE-1"], &[]),
         ];
         assert_eq!(
-            rows(&plan, &landed(&["a", "b"]), &none(), false, PLAIN, None),
+            rows(
+                &plan,
+                &landed(&["a", "b"]),
+                &none(),
+                false,
+                PLAIN,
+                None,
+                true
+            ),
             vec![
                 "  LOW  pkg:npm/requests@1.0.0",
                 "  LOW  pkg:pypi/requests@2.31.0  CVE-1",
@@ -1409,25 +1423,33 @@ mod tests {
             ..Package::default()
         }];
         assert_eq!(
-            rows(&scoped, &landed(&["a"]), &none(), false, PLAIN, None),
+            rows(&scoped, &landed(&["a"]), &none(), false, PLAIN, None, true),
             vec!["  UNKNOWN  @scope/a@1.0.0"]
         );
         // A patch that names no advisory leaves no gap where its ids
         // would be: the measurements follow the name.
         let measured: Measured = [("a".to_string(), stats(1, 25, 25))].into();
         assert_eq!(
-            rows(&scoped, &landed(&["a"]), &measured, false, PLAIN, None),
+            rows(
+                &scoped,
+                &landed(&["a"]),
+                &measured,
+                false,
+                PLAIN,
+                None,
+                true
+            ),
             vec!["  UNKNOWN  @scope/a@1.0.0  exploit blocked, 25/25 tests"]
         );
         // The severity reads the same whatever the source's spelling.
         let lower = vec![pkg("pkg:npm/a@1.0.0", "a", "moderate", &["CVE-1"], &[])];
         assert_eq!(
-            rows(&lower, &landed(&["a"]), &none(), false, PLAIN, None),
+            rows(&lower, &landed(&["a"]), &none(), false, PLAIN, None, true),
             vec!["  MODERATE  a@1.0.0  CVE-1"]
         );
         let long = format!("pkg:npm/@typescript-eslint/{}@6.0.0", "x".repeat(60));
         let long = vec![pkg(&long, "a", "HIGH", &["CVE-1"], &[])];
-        let row = &rows(&long, &landed(&["a"]), &none(), false, PLAIN, None)[0];
+        let row = &rows(&long, &landed(&["a"]), &none(), false, PLAIN, None, true)[0];
         assert!(
             row.contains("...") && row.contains("@6.0.0  CVE-1"),
             "{row}"
@@ -1567,7 +1589,7 @@ mod tests {
         ];
         let all = landed(&["u", "n"]);
         let measured: Measured = [("u".to_string(), stats(2, 35, 35))].into();
-        let at = |cap| rows(&plan, &all, &measured, false, PLAIN, cap);
+        let at = |cap| rows(&plan, &all, &measured, false, PLAIN, cap, true);
         // A package whose patch was not measured has no such cell.
         assert_eq!(
             at(None),
@@ -1589,11 +1611,17 @@ mod tests {
         );
         // Where the terminal shows glyphs, a check mark takes the first
         // column and nothing else moves.
-        let fancy = rows(&plan, &all, &measured, false, FANCY, None);
+        let fancy = rows(&plan, &all, &measured, false, FANCY, None, true);
         let stripped: Vec<String> = fancy.iter().map(|r| ui::strip_ansi(r)).collect();
         let marked: Vec<String> = at(None).iter().map(|r| format!("✔{}", &r[1..])).collect();
         assert_eq!(stripped, marked);
         assert!(fancy[0].starts_with("\x1b[32m✔\x1b[0m "), "{:?}", fancy[0]);
+        // A patch that is only on offer (a dry run, a report) is not
+        // marked as in place: the column is blank and nothing else moves.
+        let offered = rows(&plan, &all, &measured, false, FANCY, None, false);
+        let stripped: Vec<String> = offered.iter().map(|r| ui::strip_ansi(r)).collect();
+        assert_eq!(stripped, at(None));
+        assert!(!offered.iter().any(|row| row.contains('✔')), "{offered:?}");
     }
 
     #[test]

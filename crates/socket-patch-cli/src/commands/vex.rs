@@ -1891,39 +1891,6 @@ fn note_warning(warnings: &mut Vec<RunWarning>, _common: &GlobalArgs, code: &str
 const SHOWN_OF_A_KIND: usize = 1;
 const NAMES_SHOWN: usize = 3;
 
-/// `names` for a sentence, the first [`NAMES_SHOWN`] named: `a, b, c and
-/// 5 more`.
-fn folded_names(names: &[String]) -> String {
-    if names.len() <= NAMES_SHOWN {
-        return names.join(", ");
-    }
-    format!(
-        "{} and {} more",
-        names[..NAMES_SHOWN].join(", "),
-        names.len() - NAMES_SHOWN
-    )
-}
-
-/// The packages `purls` name, as a listing names them: `name@version`
-/// when they are all of one ecosystem, the purl otherwise.
-fn package_names(purls: &[&str]) -> Vec<String> {
-    use socket_patch_core::utils::purl::{canonical_purl, purl_parts};
-    let parts: Vec<_> = purls.iter().map(|purl| purl_parts(purl)).collect();
-    let first = parts.first().and_then(|p| p.as_ref().map(|(ty, _, _)| ty));
-    let one_type = first.is_some()
-        && parts
-            .iter()
-            .all(|p| p.as_ref().map(|(ty, _, _)| ty) == first);
-    purls
-        .iter()
-        .zip(&parts)
-        .map(|(purl, parts)| match parts {
-            Some((_, name, version)) if one_type => format!("{name}@{version}"),
-            _ => canonical_purl(purl),
-        })
-        .collect()
-}
-
 /// The human lines of `warnings`: each kind's first advisory in full,
 /// then one line for the rest of that kind, naming the packages they are
 /// about where each opens with one (`pkg:npm/glob@10.3.16: ...`).
@@ -1966,7 +1933,7 @@ fn warning_lines(warnings: &[RunWarning], verbose: bool) -> Vec<String> {
             format!(
                 "  ... and {} more like {like}: {} (--verbose lists them all)",
                 rest.len(),
-                folded_names(&package_names(&purls))
+                crate::ui::folded(&crate::ui::package_names(&purls), NAMES_SHOWN)
             )
         } else {
             format!(
@@ -2658,7 +2625,7 @@ fn omission_lines(failed: &[FailedPatch], verbose: bool) -> Vec<String> {
                 "Warning: omitting {} packages from VEX: {} ({reason}): {}{}",
                 purls.len(),
                 omission_phrase(reason),
-                folded_names(&package_names(&purls)),
+                crate::ui::folded(&crate::ui::package_names(&purls), NAMES_SHOWN),
                 if purls.len() > NAMES_SHOWN {
                     " (--verbose lists them all)"
                 } else {

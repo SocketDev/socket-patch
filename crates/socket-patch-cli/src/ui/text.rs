@@ -10,6 +10,43 @@ pub fn plural(n: usize, one: &str, many: &str) -> String {
 
 const ELLIPSIS: &str = "...";
 
+/// How a listing names the packages `purls` name: `name@version` when
+/// they are all of one ecosystem (the lines around them say which), the
+/// purl otherwise, where a bare name could be either's. The purl is in
+/// its display spelling (`canonical_purl`: no qualifiers, percent-decoded).
+/// One rule for `scan`, `list` and `vex`, so a package reads the same in
+/// each.
+pub fn package_names(purls: &[&str]) -> Vec<String> {
+    use socket_patch_core::utils::purl::{canonical_purl, purl_parts};
+    let parts: Vec<_> = purls.iter().map(|purl| purl_parts(purl)).collect();
+    let first = parts.first().and_then(|p| p.as_ref().map(|(ty, _, _)| ty));
+    let one_type = first.is_some()
+        && parts
+            .iter()
+            .all(|p| p.as_ref().map(|(ty, _, _)| ty) == first);
+    purls
+        .iter()
+        .zip(&parts)
+        .map(|(purl, parts)| match parts {
+            Some((_, name, version)) if one_type => format!("{name}@{version}"),
+            _ => canonical_purl(purl),
+        })
+        .collect()
+}
+
+/// `items` for a sentence, the first `shown` of them named: `a, b, c and
+/// 5 more`.
+pub fn folded(items: &[String], shown: usize) -> String {
+    if items.len() <= shown {
+        return items.join(", ");
+    }
+    format!(
+        "{} and {} more",
+        items[..shown].join(", "),
+        items.len() - shown
+    )
+}
+
 /// How far back from the cut point a word boundary is still preferred
 /// over a hard mid-word cut.
 const WORD_BOUNDARY_WINDOW: usize = 15;
@@ -273,6 +310,29 @@ pub(crate) fn shell_word(word: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn packages_of_one_ecosystem_are_named_without_it() {
+        assert_eq!(
+            package_names(&["pkg:npm/%40scope/a@1.0.0", "pkg:npm/b@2.0.0?x=1"]),
+            ["@scope/a@1.0.0", "b@2.0.0"]
+        );
+        assert_eq!(
+            package_names(&["pkg:npm/%40scope/a@1.0.0", "pkg:pypi/b@2.0.0"]),
+            ["pkg:npm/@scope/a@1.0.0", "pkg:pypi/b@2.0.0"]
+        );
+        assert_eq!(package_names(&["not a purl"]), ["not a purl"]);
+        assert!(package_names(&[]).is_empty());
+    }
+
+    #[test]
+    fn folded_names_the_first_few_and_counts_the_rest() {
+        let items: Vec<String> = ["a", "b", "c", "d", "e"].map(String::from).to_vec();
+        assert_eq!(folded(&items, 3), "a, b, c and 2 more");
+        assert_eq!(folded(&items[..3], 3), "a, b, c");
+        assert_eq!(folded(&items[..1], 3), "a");
+        assert_eq!(folded(&[], 3), "");
+    }
 
     #[test]
     fn plural_counts() {

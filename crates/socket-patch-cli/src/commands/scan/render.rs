@@ -206,19 +206,6 @@ fn shown_source(source: &str, cwd: &std::path::Path) -> String {
         .to_string()
 }
 
-/// `items` joined for a sentence, the first `shown` of them named:
-/// `a, b, c and 5 more`.
-fn folded(items: &[String], shown: usize) -> String {
-    if items.len() <= shown {
-        return items.join(", ");
-    }
-    format!(
-        "{} and {} more",
-        items[..shown].join(", "),
-        items.len() - shown
-    )
-}
-
 fn notice_block(
     lines: &mut Vec<String>,
     group: &[&Protected],
@@ -226,7 +213,7 @@ fn notice_block(
     verbose: bool,
     cwd: &std::path::Path,
 ) {
-    use socket_patch_core::utils::purl::{canonical_purl, purl_parts};
+    use socket_patch_core::utils::purl::canonical_purl;
     use std::collections::{BTreeMap, BTreeSet};
 
     // One entry per package: a crawl finds a release once per installed
@@ -241,21 +228,7 @@ fn notice_block(
     if packages.is_empty() {
         return;
     }
-    // `name@version` when the block is of one ecosystem, else the purl.
-    let parts: Vec<_> = packages.keys().map(|purl| purl_parts(purl)).collect();
-    let first = parts.first().and_then(|p| p.as_ref().map(|(ty, _, _)| ty));
-    let one_type = first.is_some()
-        && parts
-            .iter()
-            .all(|p| p.as_ref().map(|(ty, _, _)| ty) == first);
-    let names: Vec<String> = packages
-        .keys()
-        .zip(&parts)
-        .map(|(purl, parts)| match parts {
-            Some((_, name, version)) if one_type => format!("{name}@{version}"),
-            _ => purl.clone(),
-        })
-        .collect();
+    let names = ui::package_names(&packages.keys().map(String::as_str).collect::<Vec<_>>());
     let sources: Vec<String> = packages
         .values()
         .flatten()
@@ -263,7 +236,7 @@ fn notice_block(
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect();
-    let files = folded(&sources, PROTECTED_NAMED);
+    let files = ui::folded(&sources, PROTECTED_NAMED);
     let count = plural(names.len(), "package", "packages");
     let (it, lists) = if names.len() == 1 {
         ("it", "")
@@ -275,7 +248,7 @@ fn notice_block(
     let named = if verbose && names.len() > PROTECTED_NAMED {
         String::new()
     } else {
-        format!(": {}", folded(&names, PROTECTED_NAMED))
+        format!(": {}", ui::folded(&names, PROTECTED_NAMED))
     };
     let more = if names.len() > PROTECTED_NAMED && !verbose {
         lists

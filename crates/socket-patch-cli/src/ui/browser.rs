@@ -132,6 +132,49 @@ fn decode(bytes: &[u8]) -> Key {
     }
 }
 
+/// The keys in `bytes`, what a terminal sent since the last read, and
+/// the bytes at its end that are the start of a key not all here yet.
+///
+/// A read is not a key press: a held key or a slow link delivers several
+/// at once, and an escape sequence can arrive in two reads. Each key is
+/// cut off and decoded on its own ([`decode`]). An Esc at the very end is
+/// left over rather than taken for the Esc key, since it may be the first
+/// byte of an arrow: the caller waits a moment for the rest.
+fn keys(bytes: &[u8]) -> (Vec<Key>, &[u8]) {
+    let mut keys = Vec::new();
+    let mut at = 0;
+    while at < bytes.len() {
+        let rest = &bytes[at..];
+        let len = match rest {
+            [0x1b] => break,
+            // CSI: parameters, then one final byte.
+            [0x1b, b'[', after @ ..] => {
+                match after.iter().position(|b| (0x40..=0x7e).contains(b)) {
+                    Some(end) => 2 + end + 1,
+                    None => break,
+                }
+            }
+            // SS3: one byte.
+            [0x1b, b'O'] => break,
+            [0x1b, b'O', ..] => 3,
+            // Esc, then a key of its own.
+            [0x1b, ..] => 1,
+            // One character, however many bytes it is.
+            [first, ..] => match first {
+                0xf0..=0xff => 4,
+                0xe0..=0xef => 3,
+                0xc0..=0xdf => 2,
+                _ => 1,
+            }
+            .min(rest.len()),
+            [] => break,
+        };
+        keys.push(decode(&rest[..len]));
+        at += len;
+    }
+    (keys, &bytes[at..])
+}
+
 /// How far a sideways step moves a page.
 const SIDEWAYS: usize = 8;
 
@@ -764,7 +807,7 @@ mod screen {
     use std::sync::mpsc::{Receiver, TryRecvError};
     use std::time::Duration;
 
-    use super::{decode, Key, Page, State, Step, Table, Update};
+    use super::{decode, keys, Key, Page, State, Step, Table, Update};
 
     /// Enter the alternate screen and hide the cursor; leave and show.
     const ENTER: &str = "\x1b[?1049h\x1b[?25l";
@@ -828,9 +871,15 @@ mod screen {
         (usize::from(columns).max(1), usize::from(lines).max(1))
     }
 
-    /// The next key, or `None` when none came within a [`TICK`]. `Err`
-    /// when stdin is gone (closed, or no longer a terminal).
-    fn next_key() -> std::io::Result<Option<Key>> {
+    /// How long a key that is not all here is waited for: the rest of an
+    /// escape sequence follows its first byte at once, so an Esc with
+    /// nothing after it for this long is the Esc key.
+    const REST_OF_KEY: Duration = Duration::from_millis(40);
+
+    /// Whether stdin has bytes to read within `wait`. `Err` when it
+    /// cannot be waited on; a signal (the terminal was resized) reads as
+    /// nothing yet.
+    fn readable(wait: Duration) -> std::io::Result<bool> {
         // `select`, not `poll`: macOS's `poll` does not report terminal
         // devices reliably.
         // SAFETY: `fd_set` is plain data the FD_* macros initialise and
@@ -842,7 +891,7 @@ mod screen {
             libc::FD_SET(libc::STDIN_FILENO, &mut readable);
             let mut wait = libc::timeval {
                 tv_sec: 0,
-                tv_usec: TICK.as_micros() as libc::suseconds_t,
+                tv_usec: wait.as_micros() as libc::suseconds_t,
             };
             libc::select(
                 libc::STDIN_FILENO + 1,
@@ -854,32 +903,63 @@ mod screen {
         };
         if ready < 0 {
             let e = std::io::Error::last_os_error();
-            // A signal (the terminal was resized) is a reason to look at
-            // the size again, like a timeout.
             return if e.kind() == std::io::ErrorKind::Interrupted {
-                Ok(None)
+                Ok(false)
             } else {
                 Err(e)
             };
         }
-        if ready == 0 {
-            return Ok(None);
-        }
-        let mut bytes = [0u8; 16];
+        Ok(ready > 0)
+    }
+
+    /// Read what stdin has into `bytes`. `Err` when stdin is gone
+    /// (closed, or no longer a terminal).
+    fn read_into(bytes: &mut Vec<u8>) -> std::io::Result<()> {
+        let mut chunk = [0u8; 64];
         // SAFETY: reads at most the buffer's length into it.
         let read =
-            unsafe { libc::read(libc::STDIN_FILENO, bytes.as_mut_ptr().cast(), bytes.len()) };
+            unsafe { libc::read(libc::STDIN_FILENO, chunk.as_mut_ptr().cast(), chunk.len()) };
         match read {
-            n if n > 0 => Ok(Some(decode(&bytes[..n as usize]))),
+            n if n > 0 => {
+                bytes.extend_from_slice(&chunk[..n as usize]);
+                Ok(())
+            }
             0 => Err(std::io::ErrorKind::UnexpectedEof.into()),
             _ => {
                 let e = std::io::Error::last_os_error();
                 if e.kind() == std::io::ErrorKind::Interrupted {
-                    Ok(None)
+                    Ok(())
                 } else {
                     Err(e)
                 }
             }
+        }
+    }
+
+    /// The keys pressed within a [`TICK`], in order: none when no key
+    /// came. `Err` when stdin is gone.
+    fn next_keys() -> std::io::Result<Vec<Key>> {
+        if !readable(TICK)? {
+            return Ok(Vec::new());
+        }
+        let mut bytes = Vec::new();
+        read_into(&mut bytes)?;
+        let mut pressed = Vec::new();
+        loop {
+            let (found, rest) = keys(&bytes);
+            pressed.extend(found);
+            if rest.is_empty() {
+                return Ok(pressed);
+            }
+            // The start of a key: its rest is on its way, or it is the
+            // Esc key by itself.
+            let rest = rest.to_vec();
+            if !readable(REST_OF_KEY)? {
+                pressed.push(decode(&rest));
+                return Ok(pressed);
+            }
+            bytes = rest;
+            read_into(&mut bytes)?;
         }
     }
 
@@ -935,17 +1015,21 @@ mod screen {
                 draw(&state.frame(style));
                 redraw = false;
             }
-            match next_key() {
-                Ok(Some(key)) => match state.key(key) {
-                    Step::Leave => return state,
-                    Step::Open(row) => {
-                        open(row);
-                        redraw = true;
+            match next_keys() {
+                Ok(pressed) if !pressed.is_empty() => {
+                    for key in pressed {
+                        match state.key(key) {
+                            Step::Leave => return state,
+                            Step::Open(row) => {
+                                open(row);
+                                redraw = true;
+                            }
+                            Step::Redraw => redraw = true,
+                            Step::Stay => {}
+                        }
                     }
-                    Step::Redraw => redraw = true,
-                    Step::Stay => {}
-                },
-                Ok(None) => {
+                }
+                Ok(_) => {
                     let now = size();
                     if now != (state.width, state.height) {
                         state.resize(now.0, now.1);
@@ -1075,6 +1159,45 @@ mod tests {
         ] {
             assert_eq!(decode(bytes), key, "{bytes:?}");
         }
+    }
+
+    /// A read is not a key press. Several presses that arrive together
+    /// are each a key, and the start of an escape sequence at the end of
+    /// a read is left for the next one: it is never taken for the Esc
+    /// key, which would close the page under a held arrow.
+    #[test]
+    fn a_read_is_cut_into_its_keys() {
+        let all = |bytes: &'static [u8]| {
+            let (found, rest) = keys(bytes);
+            (found, rest.to_vec())
+        };
+        assert_eq!(
+            all(b"\x1b[B\x1b[B\x1b[B"),
+            (vec![Key::Down, Key::Down, Key::Down], vec![])
+        );
+        assert_eq!(
+            all(b"jj\x1b[6~k\r"),
+            (
+                vec![Key::Down, Key::Down, Key::PageDown, Key::Up, Key::Open],
+                vec![]
+            )
+        );
+        assert_eq!(all(b"\x1bOA\x1bOB"), (vec![Key::Up, Key::Down], vec![]));
+        // Split after the Esc, after `[`, inside the parameters, after `O`.
+        assert_eq!(all(b"\x1b[B\x1b"), (vec![Key::Down], b"\x1b".to_vec()));
+        assert_eq!(all(b"\x1b["), (vec![], b"\x1b[".to_vec()));
+        assert_eq!(all(b"j\x1b[5"), (vec![Key::Down], b"\x1b[5".to_vec()));
+        assert_eq!(all(b"\x1bO"), (vec![], b"\x1bO".to_vec()));
+        // The rest arrives: the key is whole.
+        assert_eq!(all(b"\x1b[5~"), (vec![Key::PageUp], vec![]));
+        // Esc followed by a key of its own is Esc, then that key.
+        assert_eq!(all(b"\x1bq"), (vec![Key::Back, Key::Back], vec![]));
+        assert_eq!(all(b"\x1bj"), (vec![Key::Back, Key::Down], vec![]));
+        // A sequence the browser does not know is one key it ignores, and
+        // a character of several bytes is one key too.
+        assert_eq!(all(b"\x1b[1;5Cj"), (vec![Key::Other, Key::Down], vec![]));
+        assert_eq!(all("éj".as_bytes()), (vec![Key::Other, Key::Down], vec![]));
+        assert_eq!(all(b""), (vec![], vec![]));
     }
 
     #[test]

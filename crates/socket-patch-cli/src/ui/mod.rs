@@ -30,8 +30,8 @@ pub(crate) use prompt::confirm;
 pub use prompt::{select_from, select_one, SelectError};
 pub(crate) use status::StatusLine;
 pub(crate) use text::{
-    agent_next_steps, manifest_error_message, next_steps, next_steps_installed, plural,
-    sentence_case, shell_word, short_uuid, sweep_failure, truncate,
+    agent_next_steps, folded, manifest_error_message, next_steps, next_steps_installed,
+    package_names, plural, sentence_case, shell_word, short_uuid, sweep_failure, truncate,
 };
 
 /// [`text::no_patches_message`] for this run: the manifest path is named
@@ -220,6 +220,19 @@ pub(crate) fn glyphs_enabled(
             let locale = locale.to_ascii_lowercase();
             locale.contains("utf-8") || locale.contains("utf8")
         })
+}
+
+/// Whether someone is at a terminal that can show the full-screen browser
+/// ([`browser`]): stdin, stdout and stderr (where it is drawn) are all
+/// terminals, and the terminal renders escape sequences (not `TERM=dumb`,
+/// not a console without VT processing). The browser is drawn with
+/// nothing else, so anywhere this is false a command prints instead.
+pub(crate) fn full_screen() -> bool {
+    std::io::stdin().is_terminal()
+        && std::io::stdout().is_terminal()
+        && std::io::stderr().is_terminal()
+        && vt() == (true, true)
+        && env_var("TERM").is_none_or(|term| term != "dumb")
 }
 
 /// Await `work` with `label` on a status line of its own, so a step

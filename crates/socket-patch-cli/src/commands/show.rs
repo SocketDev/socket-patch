@@ -677,15 +677,10 @@ pub async fn run(args: ShowArgs) -> i32 {
     // Someone at a terminal reads the patch full-screen: the summary and
     // every selected diff on one page that scrolls, steps from file to
     // file and follows the terminal's size. Where there is no such screen
-    // (a pipe, `--no-pager`, `--yes`, a terminal that cannot be set up),
-    // the same text prints below.
-    let reads = !args.stat
-        && !args.no_pager
-        && !common.yes
-        && !selected.is_empty()
-        && std::io::stdin().is_terminal()
-        && std::io::stdout().is_terminal()
-        && std::io::stderr().is_terminal();
+    // (a pipe, `--no-pager`, `--yes`, a terminal that shows no escape
+    // sequences or cannot be set up), the same text prints below.
+    let reads =
+        !args.stat && !args.no_pager && !common.yes && !selected.is_empty() && ui::full_screen();
     let read = reads && ui::browser::read(page_of(&patch, &files, &selected, style));
     // The summary is what stays on the terminal either way.
     for line in summary(&patch, &files, style) {

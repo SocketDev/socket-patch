@@ -350,6 +350,44 @@ fn list_opens_a_patch_as_a_page_and_comes_back() {
     assert!(after_leaving(&output).starts_with("Found 3 patches:\n"));
 }
 
+/// Keys that arrive together are each acted on, in order: a held arrow,
+/// a paste and a slow link all deliver several presses in one read. Two
+/// arrows and Enter written at once open the third row's page; read as
+/// one key they would be a sequence the browser does not know, and
+/// nothing would happen. Esc by itself is still the Esc key: it comes
+/// back from the page, and then leaves the table.
+#[test]
+fn list_acts_on_every_key_that_arrives_at_once() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_manifest(tmp.path(), 3);
+    let mut term = Terminal::list(tmp.path(), &["--offline"], 100, 16);
+    term.wait_for("1/3", 1);
+    term.press(b"\x1b[B\x1b[B\r");
+    term.wait_for("Package: pkg:npm/list-tty-package-02@1.0.2", 1);
+    term.press(b"\x1b");
+    term.wait_for("> HIGH      list-tty-package-02", 1);
+    term.press(b"\x1b");
+    let (code, output) = term.finish();
+    assert_eq!(code, 0, "{output}");
+
+    let frames = frames(&output);
+    assert!(
+        frames
+            .iter()
+            .any(|frame| frame[0] == "pkg:npm/list-tty-package-02@1.0.2"),
+        "no page: {frames:#?}"
+    );
+    // The table came back on the row the keys reached.
+    let back = frames.last().unwrap();
+    assert_eq!(back[0], "3 patches in this project");
+    assert!(
+        back[4].starts_with("> HIGH      list-tty-package-02"),
+        "{back:#?}"
+    );
+    assert!(back[15].ends_with("3/3"), "{back:#?}");
+    assert!(after_leaving(&output).starts_with("Found 3 patches:\n"));
+}
+
 /// The table goes up with what the project records, and the patch
 /// service's account of each patch fills its row in as it arrives: what
 /// was measured about it, the size and cost of the change, and when it

@@ -24,8 +24,10 @@ pub(crate) type Measured = HashMap<String, PatchStatistics>;
 /// `--debug` lines held back until the caller's turn to print.
 pub(crate) type Measurement = (String, HeldBack<Result<Option<PatchStatistics>, ApiError>>);
 
-/// Patch measurements asked for at once.
-const CONCURRENCY: usize = 16;
+/// How long a listing waits for its measurements ([`fetch`]). The ones
+/// still out by then are left off: a listing is not held up for a
+/// courtesy.
+const LISTING_WAIT: std::time::Duration = std::time::Duration::from_millis(1500);
 
 /// Whether this run shows measurements: a human run (neither `--json` nor
 /// `--silent`) whose stdout is a terminal. A pipe, a log and a script make
@@ -34,16 +36,30 @@ pub(crate) fn wanted(common: &GlobalArgs) -> bool {
     !common.json && !common.silent && std::io::stdout().is_terminal()
 }
 
-/// Ask the patch service what it measured about each of `uuids`, at most
-/// [`CONCURRENCY`] at once. Answers come back as they arrive.
+/// Ask the patch service what it measured about each of `uuids`.
+/// Answers come back as they arrive.
+///
+/// The requests are a courtesy beside the run's real ones, so they stay
+/// out of their way: they keep to the patch API's own window (the public
+/// proxy's is small, and one request at a time where file descriptors
+/// are scarce), and one that is throttled is given up, not retried. A
+/// retry would open the run's one retry window, which the downloads that
+/// follow may need.
 pub(crate) async fn request(client: &ApiClient, uuids: Vec<String>) -> Vec<Measurement> {
     use futures_util::StreamExt;
+    use socket_patch_core::api::retry::{ApiRetryPolicy, RetryHooks};
+    use socket_patch_core::utils::concurrent::api_concurrency_for;
+    let at_once = api_concurrency_for(client.uses_public_proxy(), uuids.len().max(1));
+    let client = client
+        .clone()
+        .with_api_retry(ApiRetryPolicy::none(), RetryHooks::default());
+    let client = &client;
     futures_util::stream::iter(uuids)
         .map(|uuid| async move {
             let answer = hold_back_debug(client.fetch_patch_statistics(&uuid)).await;
             (uuid, answer)
         })
-        .buffer_unordered(CONCURRENCY)
+        .buffer_unordered(at_once)
         .collect()
         .await
 }
@@ -60,11 +76,14 @@ pub(crate) fn collect(measured: &mut Measured, answers: Vec<Measurement>) {
 }
 
 /// [`request`] and [`collect`] in one step, for a caller that shows the
-/// measurements right away. Empty when the run does not show them.
+/// measurements right away. Empty when the run does not show them, and
+/// when they are not all in within [`LISTING_WAIT`].
 pub(crate) async fn fetch(common: &GlobalArgs, client: &ApiClient, uuids: Vec<String>) -> Measured {
     let mut measured = Measured::new();
     if wanted(common) && !uuids.is_empty() {
-        collect(&mut measured, request(client, uuids).await);
+        if let Ok(answers) = tokio::time::timeout(LISTING_WAIT, request(client, uuids)).await {
+            collect(&mut measured, answers);
+        }
     }
     measured
 }

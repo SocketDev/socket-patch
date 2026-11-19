@@ -47,8 +47,42 @@ pub struct PatchResponse {
     pub license: String,
     pub tier: String,
     /// What Socket measured about the patch, when it has been measured.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Read leniently ([`lenient`]): the measurements are shown beside a
+    /// patch and nothing depends on them, so a `statistics` object this
+    /// build cannot read is one it does not show, never a patch view it
+    /// cannot read. Reading the view is how a patch is downloaded.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "lenient_object"
+    )]
     pub statistics: Option<PatchStatistics>,
+}
+
+/// Deserialize an optional part of a response that nothing depends on:
+/// whatever does not read as a `T` (a `null`, another shape, a number out
+/// of range) is `None`, where the derived reading would fail the whole
+/// response it is part of.
+fn lenient<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(value.and_then(|value| serde_json::from_value(value).ok()))
+}
+
+/// [`lenient`] for a part that is an object: anything else is `None` (a
+/// derived struct would also read from an array, field by field).
+fn lenient_object<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(value
+        .filter(serde_json::Value::is_object)
+        .and_then(|value| serde_json::from_value(value).ok()))
 }
 
 /// `count` of `total`: tests that passed, exploits that reproduced or
@@ -108,14 +142,21 @@ pub struct PatchPerformance {
 
 /// What Socket measured about one patch: the view endpoint's `statistics`.
 /// Every part is optional, since a patch is measured in stages (and an
-/// older patch may never have been).
+/// older patch may never have been), and each is read on its own
+/// ([`lenient`]): a part that does not read (a run with no result yet)
+/// is left out, and the others still show.
 #[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct PatchStatistics {
+    #[serde(deserialize_with = "lenient_object")]
     pub diff: Option<PatchDiffSize>,
+    #[serde(deserialize_with = "lenient")]
     pub functions_changed: Option<u64>,
+    #[serde(deserialize_with = "lenient_object")]
     pub tests: Option<PatchTestRuns>,
+    #[serde(deserialize_with = "lenient_object")]
     pub pocs: Option<PatchExploitRuns>,
+    #[serde(deserialize_with = "lenient_object")]
     pub performance: Option<PatchPerformance>,
 }
 
@@ -125,7 +166,7 @@ pub struct PatchStatistics {
 /// [`ApiClient::fetch_patch_statistics`]: crate::api::client::ApiClient::fetch_patch_statistics
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct PatchStatisticsView {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient_object")]
     pub statistics: Option<PatchStatistics>,
 }
 
@@ -307,6 +348,83 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn view(statistics: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "uuid": "11111111-1111-4111-8111-111111111111",
+            "purl": "pkg:npm/a@1.0.0",
+            "publishedAt": "2026-01-01T00:00:00Z",
+            "files": {},
+            "vulnerabilities": {},
+            "description": "",
+            "license": "MIT",
+            "tier": "free",
+            "statistics": statistics,
+        })
+    }
+
+    /// The measurements ride the patch view a download reads. Whatever
+    /// shape they come in, the view still reads: a part this build cannot
+    /// read is left out and the others are kept, and a `statistics` that
+    /// is not an object at all is no measurements.
+    #[test]
+    fn statistics_this_build_cannot_read_never_fail_the_patch_view() {
+        use serde_json::json;
+        let whole = json!({
+            "diff": { "linesAdded": 9, "linesRemoved": 2, "filesChanged": 2 },
+            "functionsChanged": 3,
+            "tests": { "before": { "count": 24, "total": 25 }, "after": { "count": 25, "total": 25 } },
+            "pocs": { "reproducedBefore": { "count": 1, "total": 1 }, "blockedAfter": { "count": 1, "total": 1 } },
+            "performance": { "hotWallChange": 0.036 },
+        });
+        let patch: PatchResponse = serde_json::from_value(view(whole)).unwrap();
+        let stats = patch.statistics.expect("measured");
+        assert_eq!(stats.diff.map(|d| d.lines_added), Some(9));
+        assert_eq!(stats.functions_changed, Some(3));
+        assert!(stats.tests.is_some_and(|t| t.after.is_all()));
+        assert!(stats.pocs.is_some_and(|p| p.blocked_after.is_all()));
+
+        // A patch measured in stages: runs with no result yet, a size
+        // missing a field, a count that is not a count.
+        let partial = json!({
+            "diff": { "linesAdded": 9, "linesRemoved": 2 },
+            "functionsChanged": -1,
+            "tests": { "before": { "count": 24, "total": 25 }, "after": null },
+            "pocs": { "reproducedBefore": { "count": 1, "total": 1 }, "blockedAfter": { "count": 1.5, "total": 1 } },
+            "performance": { "hotWallChange": 0.036 },
+            "somethingNew": [1, 2, 3],
+        });
+        let patch: PatchResponse = serde_json::from_value(view(partial)).unwrap();
+        let stats = patch.statistics.expect("the parts that read are kept");
+        assert_eq!(stats.diff, None);
+        assert_eq!(stats.functions_changed, None);
+        assert_eq!(stats.tests, None);
+        assert_eq!(stats.pocs, None);
+        assert_eq!(
+            stats.performance.and_then(|p| p.hot_wall_change),
+            Some(0.036)
+        );
+
+        for odd in [
+            json!(null),
+            json!("soon"),
+            json!([1, 2]),
+            json!(7),
+            json!({}),
+        ] {
+            let patch: PatchResponse = serde_json::from_value(view(odd.clone())).unwrap();
+            let expected = (odd == json!({})).then(PatchStatistics::default);
+            assert_eq!(patch.statistics, expected, "{odd}");
+            let only: PatchStatisticsView =
+                serde_json::from_value(json!({ "statistics": odd })).unwrap();
+            assert_eq!(only.statistics, expected);
+        }
+        // No `statistics` at all, as before this field existed.
+        let mut bare = view(json!(null));
+        bare.as_object_mut().unwrap().remove("statistics");
+        let patch: PatchResponse = serde_json::from_value(bare).unwrap();
+        assert_eq!(patch.statistics, None);
+    }
 
     // The structs are serde DTOs: these pin the JSON field-name contract by
     // deserializing payloads in the exact shape the live endpoints emit.
