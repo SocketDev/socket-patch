@@ -8257,7 +8257,10 @@ fn plan_gem_redirect(
         // it as a DIRECT dependency: the Gemfile declares it out of sight
         // (`eval_gemfile`, a loop, a gemspec). Adding a line would declare
         // it twice (#482). Vendored mode refuses the gem for the same
-        // reason, so the way out names agent mode alone (#2151).
+        // reason, so the way out names agent mode alone (#2151). The
+        // literal line replaces a `gem` call out of sight: next to it,
+        // the line's `source:` option gives the gem two sources and
+        // bundler refuses the manifest.
         return Err(refuse(
             "redirect_gem_declaration_not_visible",
             format!(
@@ -8265,7 +8268,8 @@ fn plan_gem_redirect(
                  it somewhere the rewriter cannot edit (an `eval_gemfile`d file, a loop, a \
                  gemspec); adding a second declaration would make bundler refuse the Gemfile — \
                  redirect skipped (declare it with a literal `gem \"{name}\"` line in \
-                 {gemfile_name}, or patch it with `--mode agent`)"
+                 {gemfile_name}, in place of any other `gem` call that declares it, or patch \
+                 it with `--mode agent`)"
             ),
         ));
     } else {
@@ -20481,8 +20485,10 @@ mod tests {
             // refuses the gem for the same reason, so it is not one.
             let detail = &r.warnings[0].detail;
             assert!(
-                detail.contains("a literal `gem \"rack\"` line in Gemfile")
-                    && detail.contains("`--mode agent`"),
+                detail.contains(
+                    "a literal `gem \"rack\"` line in Gemfile, in place of any other `gem` \
+                     call that declares it"
+                ) && detail.contains("`--mode agent`"),
                 "{gemfile}: {detail}"
             );
             assert!(!detail.contains("vendored"), "{gemfile}: {detail}");

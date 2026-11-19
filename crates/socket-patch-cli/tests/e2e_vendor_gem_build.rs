@@ -1791,6 +1791,56 @@ fn gem_vendor_refuses_an_eval_gemfile_direct_dep() {
             String::from_utf8_lossy(&install.stderr)
         );
     }
+
+    // #2151: the refusal names its way out, and following it works. The
+    // literal line takes the hidden declaration's place: left next to it,
+    // the vendored pin would be a second declaration that differs, which
+    // bundler refuses.
+    let error = event["error"].as_str().unwrap_or_default();
+    assert!(
+        error.contains(
+            "one literal `gem \"rack\"` line in the Gemfile, in place of any other `gem` call \
+             that declares it"
+        ) && error.contains("`--mode agent`"),
+        "the refusal names its ways out: {event}"
+    );
+    assert!(
+        !error.contains("--mode hosted"),
+        "hosted mode refuses this gem for the same reason: {event}"
+    );
+    std::fs::write(proj.join("Gemfile.common"), "# shared gems\n").unwrap();
+    std::fs::write(
+        proj.join("Gemfile"),
+        "source \"https://rubygems.org\"\n\ngem \"rack\", \"~> 3.1\"\neval_gemfile \"Gemfile.common\"\n",
+    )
+    .unwrap();
+    let relock = bundle(&proj, &["install"], false);
+    assert!(
+        relock.status.success(),
+        "the Gemfile installs with the remedy followed (test premise):\n{}",
+        String::from_utf8_lossy(&relock.stderr)
+    );
+    let (code, stdout, stderr) = run_socket(
+        &proj,
+        &[
+            "vendor",
+            "--json",
+            "--offline",
+            "--cwd",
+            proj.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(
+        code, 0,
+        "vendor failed with the remedy followed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert_eq!(parse_json_envelope(&stdout)["summary"]["applied"], 1);
+    let install = bundle(&proj, &["install"], true);
+    assert!(
+        install.status.success(),
+        "frozen install of the vendored pair failed:\n{}",
+        String::from_utf8_lossy(&install.stderr)
+    );
 }
 
 /// A static `file://` rubygems source serving one empty gem,

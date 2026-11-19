@@ -2040,13 +2040,13 @@ wire is skipped, neither file changes for it, and the warning says why and what 
 | `redirect_gem_unrecognized_declaration` | its declaration cannot be edited in place: a heredoc or a `do` block among its arguments, other code before it on its line, a last argument that may be an options hash (`gem "rack", OPTS`). Write it as one `gem "<name>", …` call with literal arguments on a line of its own. |
 | `redirect_gem_source_option` | the declaration already selects a source (`source:`, `git:`, `github:`, `path:`, a `**opts` splat that may hold one), sits inside a `source` / `git` / `github` / `path` block, or the lock resolves the gem from a `GIT` / `PATH` section. Bundler allows one source per gem. |
 | `redirect_gem_declared_more_than_once` | the Gemfile declares it more than once. Merge the declarations into one. |
-| `redirect_gem_declaration_not_visible` | the lock lists it as a direct dependency, but it is declared where the scan cannot edit: an `eval_gemfile`d file, a loop, a gemspec. Declare it with a literal `gem "<name>"` line in the Gemfile, or patch it with `--mode agent`. Vendored mode refuses it for the same reason. |
+| `redirect_gem_declaration_not_visible` | the lock lists it as a direct dependency, but it is declared where the scan cannot edit: an `eval_gemfile`d file, a loop, a gemspec. Declare it with a literal `gem "<name>"` line in the Gemfile, in place of any other `gem` call that declares it (a gemspec's development dependency stays), or patch it with `--mode agent`. Vendored mode refuses it for the same reason. |
 | `redirect_gem_dependency_not_locked` | the Gemfile declares it and the lock's `DEPENDENCIES` does not list it. Run `bundle lock` and re-run. |
 | `redirect_gem_lock_unconvergeable` | the lock cannot be brought in line with the Gemfile: it has no `BUNDLED WITH` section to say which layout its Bundler accepts, or a Bundler < 2.2 lock lists its sources in an order the Gemfile's `source` lines do not explain. Run `bundle lock` with your current Bundler and re-run. |
 | `redirect_gem_platform_unsupported` | the lock holds a platform-specific build of the gem (`nokogiri (1.16.0-x86_64-linux)`); the patch registry serves the `ruby` platform gem only. |
 
-`--mode agent` can still patch a gem hosted mode skips, and so can `--mode vendored` where the
-warning names it.
+`--mode agent` can still patch a gem hosted mode skips. `--mode vendored` can too, unless it
+refuses the gem itself (see "Ruby gems: gems vendored mode refuses").
 
 **Undoing it.** `rollback` and `remove` take the option (or the added line) off again and
 restore the lock: the pair is the pre-scan pair byte for byte, with LF or CRLF line endings.
@@ -2157,7 +2157,7 @@ that can patch the gem:
 | Code | The gem | What the error offers |
 |---|---|---|
 | `gemfile_declaration_not_editable` ("is indented") | is declared inside a block: `group :test do`, `platforms … do`, a conditional. Every Rails Gemfile declares its development and test gems this way. | Move the declaration to the top level (for a plain `group` block the error spells the option that replaces it, `group: :test`), or patch the gem with `--mode hosted`, which edits a declaration where it is. Inside a `source`, `git`, `github` or `path` block hosted mode refuses the gem too, and the error names `--mode agent`. |
-| `gemfile_declaration_not_editable` ("as a direct dependency") | is a direct dependency the Gemfile declares out of sight: in a gemspec (a gem library's development dependency), an `eval_gemfile`d file, a loop. | Declare it with one literal `gem "<name>"` line in the Gemfile (above `gemspec`, where the Gemfile has that directive), or patch the gem with `--mode agent`. Hosted mode refuses the gem too. |
+| `gemfile_declaration_not_editable` ("as a direct dependency") | is a direct dependency the Gemfile declares out of sight: in a gemspec (a gem library's development dependency), an `eval_gemfile`d file, a loop. | Declare it with one literal `gem "<name>"` line in the Gemfile (above `gemspec`, where the Gemfile has that directive), in place of any other `gem` call that declares it, or patch the gem with `--mode agent`. Hosted mode refuses a gem declared in those places too. |
 | `native_extensions_unsupported` | builds a native extension (puma, bootsnap). | `--mode hosted` or `--mode agent`. Both build the extension. Only `--mode agent` when the declaration picks the gem's source (a `source`, `git`, `github` or `path` block or option), which hosted mode refuses. |
 | `platform_gem_unsupported` | is installed as a precompiled platform build (`nokogiri-1.18.3-x86_64-linux-gnu`). | `--mode agent`. Hosted mode refuses a precompiled build too. |
 

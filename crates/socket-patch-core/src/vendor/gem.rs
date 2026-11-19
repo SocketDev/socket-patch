@@ -1665,24 +1665,31 @@ fn refuse_append_of_direct_dependency(
 
 /// The way out of [`refuse_append_of_direct_dependency`] (#2151): a `gem`
 /// line the line grammar can edit, or agent mode. Hosted mode is not named:
-/// it refuses the gem for the same reason
-/// (`redirect_gem_declaration_not_visible`).
+/// it refuses a gem declared in a gemspec, an `eval_gemfile`d file or a
+/// loop for the same reason (`redirect_gem_declaration_not_visible`).
 ///
-/// Where the Gemfile has a `gemspec` directive (or one that cannot be
-/// read), the line goes above it: a gemspec development dependency on the
-/// gem merged into a line below the directive is refused next
-/// ([`gemspec_merge_refusal`]).
+/// The line stands in place of a `gem` call that declares the gem out of
+/// sight, never next to it: the rewrite gives the line an exact version
+/// and a `path:`, and bundler refuses a Gemfile whose two declarations of
+/// a gem differ. A gemspec's development dependency is no `gem` call and
+/// stays.
+///
+/// Where the Gemfile has a `gemspec` directive, the line goes above it: a
+/// gemspec development dependency on the gem merged into a line below the
+/// directive is refused next ([`gemspec_merge_refusal`]). A Gemfile whose
+/// directives cannot be read gets no such hint, which would not help it:
+/// that refusal cannot tell either way and names hosted mode.
 fn out_of_sight_declaration_remedy(gemfile_text: &str, name: &str) -> String {
     let above_gemspec = crate::formats::gem::gemspec::gemspec_directives(gemfile_text)
-        .map_or(true, |directives| !directives.is_empty());
+        .is_ok_and(|directives| !directives.is_empty());
     let place = if above_gemspec {
         " above `gemspec`"
     } else {
         ""
     };
     format!(
-        "declare it with one literal `gem \"{name}\"` line{place} in the Gemfile, or patch \
-         {name} with `--mode agent`"
+        "declare it with one literal `gem \"{name}\"` line{place} in the Gemfile, in place \
+         of any other `gem` call that declares it, or patch {name} with `--mode agent`"
     )
 }
 
@@ -7644,6 +7651,9 @@ mod tests {
             // A gem only the gemspec declares (a development dependency).
             "source \"https://rubygems.org\"\n\ngem \"puma\"\ngemspec\n",
             "source \"https://rubygems.org\"\r\n\r\ngem \"puma\"\r\ngemspec path: \"gems/mylib\"\r\n",
+            // No directive: a variable of that name, which a loop reads.
+            "source \"https://rubygems.org\"\n\ngem \"puma\"\ngemspec_file = Gem::Specification.load(\"x.gemspec\")\ngemspec_file.development_dependencies.each { |d| gem d.name }\n",
+            "source \"https://rubygems.org\"\n\ngem \"puma\"\nspec = Gem::Specification.load(\"x.gemspec\")\n\ngemspec = spec\ngemspec.development_dependencies.each { |d| gem d.name }\n",
         ] {
             let (_tmp, root, installed, blobs, record) = fixture(gemfile, LOCK_DIRECT).await;
             let (code, detail) =
@@ -7657,9 +7667,15 @@ mod tests {
                 "{detail}"
             );
             assert_names_other_modes(&detail, &["agent"]);
+            // The line replaces a `gem` call out of sight: next to it,
+            // the vendored pin would be a second, differing declaration.
+            assert!(
+                detail.contains("in place of any other `gem` call that declares it"),
+                "{detail}"
+            );
             assert_eq!(
                 detail.contains("above `gemspec`"),
-                gemfile.contains("\ngemspec"),
+                gemfile.contains("\ngemspec\n") || gemfile.contains("\ngemspec path:"),
                 "{detail}"
             );
             assert!(!root.join(".socket").exists());
