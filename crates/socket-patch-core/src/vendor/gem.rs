@@ -7599,7 +7599,8 @@ mod tests {
     }
 
     /// #482: a DIRECT dependency declared where the line grammar cannot see
-    /// it (`eval_gemfile`, a loop) is listed under the lock's DEPENDENCIES.
+    /// it (`eval_gemfile`, a loop, a gemspec) is listed under the lock's
+    /// DEPENDENCIES.
     /// Appending the managed block would declare it twice and bundler
     /// refuses every install, so the plan must refuse before any write.
     #[tokio::test]
@@ -7607,12 +7608,27 @@ mod tests {
         for gemfile in [
             "source \"https://rubygems.org\"\n\ngem \"puma\"\neval_gemfile \"Gemfile.common\"\n",
             "source \"https://rubygems.org\"\n\ngem \"puma\"\n%w[rack].each { |g| gem g, \"~> 3.1\" }\n",
+            // A gem only the gemspec declares (a development dependency).
+            "source \"https://rubygems.org\"\n\ngem \"puma\"\ngemspec\n",
+            "source \"https://rubygems.org\"\r\n\r\ngem \"puma\"\r\ngemspec path: \"gems/mylib\"\r\n",
         ] {
             let (_tmp, root, installed, blobs, record) = fixture(gemfile, LOCK_DIRECT).await;
             let (code, detail) =
                 unwrap_refused(run_vendor(&root, &blobs, &installed, &record, false).await);
             assert_eq!(code, "gemfile_declaration_not_editable", "{gemfile}");
             assert!(detail.contains("direct dependency"), "{detail}");
+            // #2151: the refusal names its way out, and no mode that
+            // refuses the gem as well (hosted mode does, for this reason).
+            assert!(
+                detail.contains("one literal `gem \"rack\"` line"),
+                "{detail}"
+            );
+            assert_names_other_modes(&detail, &["agent"]);
+            assert_eq!(
+                detail.contains("above `gemspec`"),
+                gemfile.contains("\ngemspec"),
+                "{detail}"
+            );
             assert!(!root.join(".socket").exists());
             assert_eq!(
                 tokio::fs::read_to_string(root.join(GEMFILE)).await.unwrap(),

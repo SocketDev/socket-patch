@@ -2366,6 +2366,162 @@ fn gem_vendor_gemspec_dev_dependency_refuses_or_installs_frozen() {
     );
 }
 
+/// #2151: a gem only the gemspec declares (a development dependency of a
+/// gem library) is refused, and both ways out the refusal names work when
+/// followed. Hosted mode's warning used to send the user here, where the
+/// refusal named no way out at all. With the literal `gem` line above
+/// `gemspec` the gem vendors and installs frozen; with the Gemfile left as
+/// it was, agent mode patches the installed gem.
+#[test]
+#[ignore = "host capstone: shells out to a real bundler >= 1.17; the unpinned `test` job \
+            skips it, the e2e job runs it with a pinned toolchain via --ignored"]
+fn gem_vendor_gemspec_only_dependency_refusal_names_remedies_that_work() {
+    let Some((_tmp, proj, _bundler, purl)) = staged_rack_project("gemspec-only dependency") else {
+        return;
+    };
+    let version = purl.rsplit('@').next().unwrap();
+    let hidden = "source \"https://rubygems.org\"\n\ngemspec\n";
+    let cwd = proj.to_str().unwrap();
+    let vendor = |proj: &Path| run_socket(proj, &["vendor", "--json", "--offline", "--cwd", cwd]);
+    let locked = |proj: &Path| {
+        let lock = std::fs::read_to_string(proj.join("Gemfile.lock")).unwrap();
+        locked_gem_version(&lock, DEP)
+    };
+
+    gemspec_library(&proj, hidden);
+    assert_eq!(locked(&proj).as_deref(), Some(version), "test premise");
+    let lock_before = std::fs::read(proj.join("Gemfile.lock")).unwrap();
+    let (code, stdout, stderr) = vendor(&proj);
+    assert_ne!(
+        code, 0,
+        "vendor must refuse.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    let env = parse_json_envelope(&stdout);
+    let event = env["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["purl"] == purl)
+        .unwrap_or_else(|| panic!("an event for {purl}: {env}"));
+    assert_eq!(
+        event["errorCode"], "gemfile_declaration_not_editable",
+        "event: {event}"
+    );
+    let error = event["error"].as_str().unwrap_or_default();
+    assert!(
+        error.contains("one literal `gem \"rack\"` line above `gemspec`")
+            && error.contains("`--mode agent`"),
+        "the refusal names its ways out: {event}"
+    );
+    assert!(
+        !error.contains("--mode hosted"),
+        "hosted mode refuses this gem for the same reason: {event}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(proj.join("Gemfile")).unwrap(),
+        hidden
+    );
+    assert_eq!(
+        std::fs::read(proj.join("Gemfile.lock")).unwrap(),
+        lock_before
+    );
+    assert!(
+        !proj.join(".socket/vendor/gem").exists(),
+        "no vendored copy is written"
+    );
+
+    // The first way out: one literal `gem` line above `gemspec`.
+    let declared = "source \"https://rubygems.org\"\n\ngem \"rack\"\n\ngemspec\n";
+    gemspec_library(&proj, declared);
+    assert_eq!(locked(&proj).as_deref(), Some(version), "test premise");
+    let lock_declared = std::fs::read(proj.join("Gemfile.lock")).unwrap();
+    let (code, stdout, stderr) = vendor(&proj);
+    assert_eq!(
+        code, 0,
+        "vendor failed with the remedy followed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    let env = parse_json_envelope(&stdout);
+    assert_eq!(env["summary"]["applied"], 1, "{env}");
+    let wired = std::fs::read_to_string(proj.join("Gemfile.lock")).unwrap();
+    let install = bundle(&proj, &["install"], true);
+    assert!(
+        install.status.success(),
+        "frozen install of the vendored pair failed:\n{wired}\n{}",
+        String::from_utf8_lossy(&install.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(proj.join("Gemfile.lock")).unwrap(),
+        wired,
+        "the frozen install keeps the lock byte-identical"
+    );
+    let gem_path = |proj: &Path| {
+        let probe = bundle(
+            proj,
+            &[
+                "exec",
+                "ruby",
+                "-e",
+                "print Gem.loaded_specs.fetch(\"rack\").full_gem_path",
+            ],
+            true,
+        );
+        assert!(
+            probe.status.success(),
+            "rack must load:\n{}",
+            String::from_utf8_lossy(&probe.stderr)
+        );
+        String::from_utf8_lossy(&probe.stdout).into_owned()
+    };
+    let loaded = gem_path(&proj);
+    assert!(
+        loaded.contains(".socket/vendor/gem/"),
+        "rack must load from the vendored path ({purl}), got {loaded:?}"
+    );
+    let (code, stdout, stderr) = run_socket(&proj, &["vendor", "--revert", "--json", "--cwd", cwd]);
+    assert_eq!(
+        code, 0,
+        "revert failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(proj.join("Gemfile")).unwrap(),
+        declared,
+        "revert restores the Gemfile byte-identical"
+    );
+    assert_eq!(
+        std::fs::read(proj.join("Gemfile.lock")).unwrap(),
+        lock_declared,
+        "revert restores Gemfile.lock byte-identical"
+    );
+
+    // The second way out: agent mode, with the Gemfile as it was.
+    gemspec_library(&proj, hidden);
+    assert_eq!(locked(&proj).as_deref(), Some(version), "test premise");
+    let installed_rb = PathBuf::from(gem_path(&proj)).join("lib/rack.rb");
+    let marker = "SOCKET-PATCH-VENDOR-E2E-MARKER";
+    assert!(
+        !std::fs::read_to_string(&installed_rb)
+            .unwrap()
+            .contains(marker),
+        "the installed gem starts unpatched (test premise)"
+    );
+    let (code, stdout, stderr) = run_socket(&proj, &["apply", "--json", "--offline", "--cwd", cwd]);
+    assert_eq!(
+        code, 0,
+        "agent mode failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        std::fs::read_to_string(&installed_rb)
+            .unwrap()
+            .contains(marker),
+        "agent mode patches the installed gem"
+    );
+    assert_eq!(
+        std::fs::read_to_string(proj.join("Gemfile")).unwrap(),
+        hidden,
+        "agent mode leaves the Gemfile alone"
+    );
+}
+
 /// #1808: a CRLF `Gemfile.lock` (a Git for Windows `autocrlf` checkout, or
 /// `eol=crlf`; bundler keeps CRLF on purpose) vendors like an LF one. The
 /// dry run and the wet run both succeed, the wired lock keeps CRLF on every

@@ -19212,9 +19212,21 @@ mod tests {
             assert_eq!(warning_codes(&r), vec![code], "{decl}: {:?}", r.warnings);
             let detail = &r.warnings[0].detail;
             assert!(detail.contains(why), "{decl}: {detail}");
+            // #2151: vendored mode refuses a declaration out of sight for
+            // the same reason, so that refusal does not name it.
+            let remedy = match code {
+                "redirect_gem_declaration_not_visible" => "--mode agent",
+                "redirect_gem_dependency_not_locked" => "bundle lock",
+                _ => "--mode vendored",
+            };
             assert!(
-                detail.contains("--mode vendored") || detail.contains("bundle lock"),
+                detail.contains(remedy),
                 "{decl}: the refusal names a remedy: {detail}"
+            );
+            assert_eq!(
+                detail.contains("--mode vendored"),
+                remedy == "--mode vendored",
+                "{decl}: {detail}"
             );
         }
         // An opaque last argument the lock shows to be a version requirement
@@ -20444,6 +20456,8 @@ mod tests {
         for gemfile in [
             "source \"https://rubygems.org\"\neval_gemfile \"Gemfile.common\"\n",
             "source \"https://rubygems.org\"\n%w[rack].each { |g| gem g, \"~> 3.1\" }\n",
+            // A gem only the gemspec declares (a development dependency).
+            "source \"https://rubygems.org\"\n\ngemspec\n",
         ] {
             let mut files = BTreeMap::new();
             files.insert("Gemfile".to_string(), gemfile.to_string());
@@ -20462,6 +20476,15 @@ mod tests {
                 "{gemfile}: {:?}",
                 r.warnings
             );
+            // #2151: every way out the warning names works. Vendored mode
+            // refuses the gem for the same reason, so it is not one.
+            let detail = &r.warnings[0].detail;
+            assert!(
+                detail.contains("a literal `gem \"rack\"` line in Gemfile")
+                    && detail.contains("`--mode agent`"),
+                "{gemfile}: {detail}"
+            );
+            assert!(!detail.contains("vendored"), "{gemfile}: {detail}");
         }
         // Control: a genuinely transitive gem (absent from DEPENDENCIES) is
         // still appended.
