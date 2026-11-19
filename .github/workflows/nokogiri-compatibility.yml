@@ -24,15 +24,24 @@ name: nokogiri patch compatibility
 #   system-libraries  `--use-system-libraries`: the extension is rebuilt
 #                 with the recorded build arguments, and a patch to the
 #                 vendored libxml2, which such a build does not compile, is
-#                 written and not attested: its build reads nothing of the
-#                 patch, and `apply` says so.
+#                 written and incomplete: its build reads nothing of the
+#                 patch, so `apply` exits 1 and says so, and nothing
+#                 attests it.
 #                 The `legacy setting` leg is a precompiled install
 #                 in a project that still carries that Bundler setting from
 #                 the years before precompiled gems: its rebuild must keep
 #                 the libxml2 the gem ships, not link the system's.
 #   unavailable   a precompiled install on a machine with no compiler: the
 #                 patch must fail, name what is missing and change nothing.
-#   java          JRuby loads no C extension: a C record is refused.
+#   java          JRuby installs the `java` platform gem, which runs jars:
+#                 no C extension, no libxml2, nothing to build. It takes of
+#                 a record what is part of that build. The Ruby record is
+#                 applied; the C record's file is written, since the gem
+#                 ships the C sources too, and the patch is in sync and
+#                 attested with the same jars loaded; the libxml2 record
+#                 has no file in that gem, so `apply` exits 0, writes
+#                 nothing and says so, and the install is attested. 9.4 is
+#                 the Ruby 3.1 line, 10.1 the newest (Ruby 4.0).
 #
 # The `native` legs run on the runner with setup-ruby. The `container` legs
 # run the same script inside an official Ruby image, where the gems land in
@@ -48,6 +57,13 @@ name: nokogiri patch compatibility
 # patch service (tests/nokogiri/patch_service.rb) that serves a patched build
 # of each real platform gem; then a frozen install from a fresh checkout,
 # `vex` and a byte-identical `rollback`. On JRuby the platform is `java`.
+#
+# The `vendored` legs run the script's vendored scenario instead: a vendored
+# scan of a lock that pins nokogiri as platform gems, against a stand-in for
+# the patch service (tests/nokogiri/patch_service.rb) that serves a patched
+# build of each real platform gem; then a frozen install from a fresh
+# checkout with the service unreachable, `vex` and a `rollback` to the lock
+# as it was. On JRuby the platform is `java`.
 #
 # Every leg downloads gems from rubygems.org, and a rebuild of a precompiled
 # install downloads the source gem and `mini_portile2` from it too.
@@ -74,6 +90,11 @@ on:
       - 'crates/socket-patch-core/src/patch/redirect/grant.rs'
       - 'crates/socket-patch-core/src/patch/redirect/upstream/gem.rs'
       - 'crates/socket-patch-cli/src/commands/gem_refresh.rs'
+      # Vendored mode's gem backend.
+      - 'crates/socket-patch-core/src/vendor/gem.rs'
+      - 'crates/socket-patch-core/src/vendor/verify.rs'
+      - 'crates/socket-patch-core/src/vendor/redownload.rs'
+      - 'crates/socket-patch-core/src/vendor/service_fetch.rs'
   push:
     branches: [main]
     paths:
@@ -143,8 +164,10 @@ jobs:
           - {os: ubuntu-latest, ruby: '3.4', nokogiri: '1.18.10', install: precompiled, system-libxml2: true, args: '--bundle-setting BUNDLE_BUILD__NOKOGIRI=--use-system-libraries', note: legacy setting}
           # No compiler on PATH: nothing may change.
           - {os: ubuntu-latest, ruby: '3.4', nokogiri: '1.18.10', install: precompiled, build: unavailable, args: '--hide-toolchain', note: no toolchain}
-          # JRuby: the Ruby-only record applies, a C record is refused.
-          - {os: ubuntu-latest, ruby: 'jruby-9.4', nokogiri: '1.18.10', install: java, build: refused}
+          # JRuby: the `java` gem takes the files of a record that are part
+          # of it, and nothing is built.
+          - {os: ubuntu-latest, ruby: 'jruby-9.4', nokogiri: '1.18.10', install: java}
+          - {os: ubuntu-latest, ruby: 'jruby-10.1', nokogiri: '1.18.10', install: java}
           # The other platform gems.
           - {os: ubuntu-24.04-arm, ruby: '3.4', nokogiri: '1.18.10', install: precompiled, cli: build}
           - {os: macos-latest, ruby: '3.4', nokogiri: '1.18.10', install: precompiled, cli: build}
@@ -161,6 +184,16 @@ jobs:
           - {os: ubuntu-latest, ruby: '3.1', nokogiri: '1.15.7', install: precompiled, args: '--scenarios hosted', note: hosted}
           - {os: macos-latest, ruby: '3.4', nokogiri: '1.18.10', install: precompiled, cli: build, args: '--scenarios hosted', note: hosted}
           - {os: ubuntu-latest, ruby: 'jruby-9.4', nokogiri: '1.18.10', install: java, args: '--scenarios hosted', note: hosted}
+          # Vendored mode on a lock that pins nokogiri as platform gems: the
+          # scan commits a patched build of each real platform gem, served
+          # by a stand-in for the patch service, under `.socket/vendor/gem`,
+          # and a fresh checkout installs from that tree with the lock
+          # frozen and the service unreachable. On JRuby the platform is
+          # `java`.
+          - {os: ubuntu-latest, ruby: '3.4', nokogiri: '1.18.10', install: precompiled, args: '--scenarios vendored', note: vendored}
+          - {os: ubuntu-latest, ruby: '3.1', nokogiri: '1.15.7', install: precompiled, args: '--scenarios vendored', note: vendored}
+          - {os: macos-latest, ruby: '3.4', nokogiri: '1.18.10', install: precompiled, cli: build, args: '--scenarios vendored', note: vendored}
+          - {os: ubuntu-latest, ruby: 'jruby-9.4', nokogiri: '1.18.10', install: java, args: '--scenarios vendored', note: vendored}
     needs: static-cli
     runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS != 'true' && matrix.os == 'ubuntu-latest' && 'depot-ubuntu-24.04-4' || matrix.os }}
     timeout-minutes: 60
@@ -197,18 +230,26 @@ jobs:
         run: |
           chmod +x static-cli/socket-patch
           echo "SOCKET_PATCH_BIN=static-cli/socket-patch" >> "$GITHUB_ENV"
+      - name: Setup Java 21 (JRuby legs)
+        # JRuby 10 runs on Java 21 or newer, and 9.4 on it as well. With
+        # this, the leg does not depend on which JDKs the runner image has.
+        if: startsWith(matrix.ruby, 'jruby')
+        uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+        with:
+          distribution: temurin
+          java-version: '21'
       - name: Setup Ruby (attempt 1)
         # setup-ruby downloads the prebuilt Ruby from a github.com release
         # asset; a CDN blip there is not a result. Try once more.
         id: setup-ruby
-        uses: ruby/setup-ruby@319994f95fa847cf3fb3cd3dbe89f6dcde9f178f # v1.295.0
+        uses: ruby/setup-ruby@b3aaceaef7e0ee231b499e7b5f49c03fc1d32199 # v1.338.0
         continue-on-error: true
         with:
           ruby-version: ${{ matrix.ruby }}
           bundler: ${{ matrix.bundler || 'default' }}
       - name: Setup Ruby (attempt 2)
         if: steps.setup-ruby.outcome != 'success'
-        uses: ruby/setup-ruby@319994f95fa847cf3fb3cd3dbe89f6dcde9f178f # v1.295.0
+        uses: ruby/setup-ruby@b3aaceaef7e0ee231b499e7b5f49c03fc1d32199 # v1.338.0
         with:
           ruby-version: ${{ matrix.ruby }}
           bundler: ${{ matrix.bundler || 'default' }}

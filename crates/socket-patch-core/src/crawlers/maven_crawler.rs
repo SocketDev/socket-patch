@@ -6,6 +6,7 @@ use super::gradle_cache;
 use super::jvm_cache::{self, JvmCacheLayout, JvmCacheRoot};
 use super::types::{CrawledPackage, CrawlerOptions};
 use super::walk_pool::{par_map, run_walk};
+use crate::formats::maven::declared_maven::{release, DeclaredMaven, RootDirectory};
 use crate::gradle::graph::MavenLocal;
 use crate::gradle::home::GradleHome;
 use crate::gradle::{Env, Os};
@@ -535,12 +536,18 @@ fn coursier_repo_root(path: PathBuf) -> JvmCacheRoot {
 
 /// The JVM caches a run resolves against: the Maven local repository and
 /// the Gradle user home. [`JvmEnv::from_process`] reads the process
-/// environment; [`JvmEnv::resolve`] an explicit one (tests).
+/// environment, [`JvmEnv::for_project`] also the project's
+/// `.mvn/maven.config`; [`JvmEnv::resolve`] an explicit one (tests).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JvmEnv {
     /// The Maven local repository (see [`MavenCrawler::get_maven_repo_paths`]);
     /// `None` when nothing names one and there is no usable home.
     pub m2_repo: Option<PathBuf>,
+    /// Why [`Self::m2_repo`] is `None` although the project names a local
+    /// repository: its `.mvn/maven.config` reads differently to different
+    /// Maven lines and nothing says which one builds the project. No
+    /// repository is guessed at.
+    pub m2_undetermined: Option<String>,
     /// The Gradle user home; `None` when none can be resolved.
     pub gradle: Option<GradleHome>,
 }
@@ -551,15 +558,56 @@ impl JvmEnv {
     pub fn from_process() -> Self {
         Self {
             m2_repo: MavenCrawler::m2_repo_path(),
+            m2_undetermined: None,
             gradle: gradle_cache::home_from_process_env(),
+        }
+    }
+
+    /// [`Self::from_process`] for the build Maven would run in `project`:
+    /// a `-Dmaven.repo.local` in its `.mvn/maven.config` names the local
+    /// repository too ([`m2_repo_path_in`]). For a project run; a `--global`
+    /// one is about the machine's caches and keeps [`Self::from_process`].
+    pub fn for_project(project: &Path) -> Self {
+        let (m2_repo, m2_undetermined) = m2_repo_in(
+            &gradle_cache::ProcessEnv,
+            Os::current(),
+            None,
+            Some(project),
+        );
+        Self {
+            m2_repo,
+            m2_undetermined,
+            gradle: gradle_cache::home_from_process_env(),
+        }
+    }
+
+    /// The caches of a crawl with `options`: the project's
+    /// ([`Self::for_project`]) unless the crawl is global.
+    pub fn for_crawl(options: &CrawlerOptions) -> Self {
+        if options.global || options.global_prefix.is_some() {
+            Self::from_process()
+        } else {
+            Self::for_project(&options.cwd)
         }
     }
 
     /// The caches `env` names. `home_dir` is the account's home (on Unix
     /// the passwd entry's), which Gradle prefers to `$HOME`.
     pub fn resolve(env: &dyn Env, os: Os, home_dir: Option<&Path>) -> Self {
+        Self::resolve_in(env, os, home_dir, None)
+    }
+
+    /// [`Self::resolve`] for the build Maven would run in `project`.
+    pub fn resolve_in(
+        env: &dyn Env,
+        os: Os,
+        home_dir: Option<&Path>,
+        project: Option<&Path>,
+    ) -> Self {
+        let (m2_repo, m2_undetermined) = m2_repo_in(env, os, home_dir, project);
         Self {
-            m2_repo: m2_repo_path_with(env, os, home_dir),
+            m2_repo,
+            m2_undetermined,
             gradle: GradleHome::resolve(env, os, home_dir),
         }
     }
@@ -599,10 +647,20 @@ pub fn is_ro_root(path: &Path) -> bool {
     JvmEnv::from_process().is_ro_root(path)
 }
 
-/// The Maven local repository `env` names, in Maven's own order (#423):
+/// [`m2_repo_path_in`] with no project: the environment alone.
+pub fn m2_repo_path_with(env: &dyn Env, os: Os, home_dir: Option<&Path>) -> Option<PathBuf> {
+    m2_repo_path_in(env, os, home_dir, None)
+}
+
+/// The Maven local repository `env` names for a build run in `project`,
+/// in Maven's own order (#423):
 ///
 /// 1. `$MAVEN_REPO_LOCAL` (socket-patch's override);
-/// 2. `-Dmaven.repo.local` in `$MAVEN_ARGS`, then `$MAVEN_OPTS`;
+/// 2. `-Dmaven.repo.local` in `$MAVEN_ARGS`, then in the project's
+///    `.mvn/maven.config` ([`maven_config_repo_local`]), then in
+///    `$MAVEN_OPTS`. Maven puts the config file's arguments before the
+///    command line's, so the command line wins, and both are user
+///    properties, which it reads before the JVM's system properties;
 /// 3. `<localRepository>` in the user settings
 ///    (`<user.home>/.m2/settings.xml`), then in the global settings
 ///    (`conf/settings.xml` under `$MAVEN_HOME`, else `$M2_HOME`);
@@ -619,13 +677,32 @@ pub fn is_ro_root(path: &Path) -> bool {
 /// when nothing names a repository and there is no usable home: a relative
 /// or literal `~` would resolve against the working directory and treat a
 /// `~/.m2` inside the scanned project as the user's local repository (B66).
-pub fn m2_repo_path_with(env: &dyn Env, os: Os, home_dir: Option<&Path>) -> Option<PathBuf> {
+/// A relative `-Dmaven.repo.local` in `.mvn/maven.config` is the one
+/// exception: it is the project's own statement about the build run there,
+/// and is resolved against `project`, as Maven resolves it.
+pub fn m2_repo_path_in(
+    env: &dyn Env,
+    os: Os,
+    home_dir: Option<&Path>,
+    project: Option<&Path>,
+) -> Option<PathBuf> {
+    m2_repo_in(env, os, home_dir, project).0
+}
+
+/// [`m2_repo_path_in`], and why there is no repository when the project's
+/// config names one that cannot be told ([`ConfigRepo::Undetermined`]).
+fn m2_repo_in(
+    env: &dyn Env,
+    os: Os,
+    home_dir: Option<&Path>,
+    project: Option<&Path>,
+) -> (Option<PathBuf>, Option<String>) {
     use crate::gradle::home::system_property;
     use crate::utils::fs::is_usable_home;
 
     let set = |k: &str| env.var(k).filter(|v| !v.is_empty());
     if let Some(repo_local) = set("MAVEN_REPO_LOCAL") {
-        return Some(PathBuf::from(repo_local));
+        return (Some(PathBuf::from(repo_local)), None);
     }
     // Later sources override earlier ones on the JVM: command-line `-D`s
     // (MAVEN_ARGS) are set over the launcher's MAVEN_OPTS.
@@ -635,6 +712,11 @@ pub fn m2_repo_path_with(env: &dyn Env, os: Os, home_dir: Option<&Path>) -> Opti
                 .and_then(|opts| system_property(&opts, name, os))
                 .filter(|v| !v.is_empty())
         })
+    };
+    let argument = |k: &str| {
+        set(k)
+            .and_then(|opts| system_property(&opts, "maven.repo.local", os))
+            .filter(|v| !v.is_empty())
     };
     // `user.home` is fixed when the JVM starts: the launcher's MAVEN_OPTS
     // can move it, a command-line `-D` (MAVEN_ARGS) comes too late for the
@@ -655,11 +737,29 @@ pub fn m2_repo_path_with(env: &dyn Env, os: Os, home_dir: Option<&Path>) -> Opti
                 .filter(|h| is_usable_home(h))
                 .map(Path::to_path_buf)
         });
-    if let Some(repo) = property("maven.repo.local")
-        .map(PathBuf::from)
-        .filter(|p| p.has_root())
-    {
-        return Some(repo);
+    // The first source that sets the property decides, as in Maven: a
+    // command-line value it cannot use does not fall back to the next.
+    let lookup = |name: &str| match name {
+        "user.home" => user_home.as_ref().map(|h| h.display().to_string()),
+        _ => match name.strip_prefix("env.") {
+            Some(var) => set(var),
+            None => property(name),
+        },
+    };
+    let rooted = |value: Option<String>| value.map(PathBuf::from).filter(|p| p.has_root());
+    // The first source that sets the property decides, as in Maven: the
+    // config's value is used as Maven uses it, and a command-line value
+    // this lookup cannot use does not fall back to the next source.
+    let repo_local = match argument("MAVEN_ARGS") {
+        Some(value) => rooted(Some(value)),
+        None => match project.map_or(ConfigRepo::Unset, |p| maven_config_repo_local(p, &lookup)) {
+            ConfigRepo::Path(repo) => return (Some(repo), None),
+            ConfigRepo::Undetermined(why) => return (None, Some(why)),
+            ConfigRepo::Unset => rooted(argument("MAVEN_OPTS")),
+        },
+    };
+    if let Some(repo) = repo_local {
+        return (Some(repo), None);
     }
     let maven_home = set("MAVEN_HOME").or_else(|| set("M2_HOME"));
     let settings_files = [
@@ -668,19 +768,174 @@ pub fn m2_repo_path_with(env: &dyn Env, os: Os, home_dir: Option<&Path>) -> Opti
             .map(|h| h.join(".m2").join("settings.xml")),
         maven_home.map(|m| PathBuf::from(m).join("conf").join("settings.xml")),
     ];
-    let lookup = |name: &str| match name {
-        "user.home" => user_home.as_ref().map(|h| h.display().to_string()),
-        _ => match name.strip_prefix("env.") {
-            Some(var) => set(var),
-            None => property(name),
-        },
-    };
     for path in settings_files.into_iter().flatten() {
         if let Some(repo) = settings_local_repository(&path, &lookup) {
-            return Some(repo);
+            return (Some(repo), None);
         }
     }
-    Some(user_home?.join(".m2").join("repository"))
+    (user_home.map(|h| h.join(".m2").join("repository")), None)
+}
+
+/// The largest `.mvn/maven.config` read: it holds a handful of arguments.
+const MAX_MAVEN_CONFIG_BYTES: u64 = 256 * 1024;
+
+/// What a project's `.mvn/maven.config` says of the local repository.
+#[derive(Debug, PartialEq, Eq)]
+enum ConfigRepo {
+    /// No config Maven would read here sets `-Dmaven.repo.local`.
+    Unset,
+    /// The repository Maven uses for it.
+    Path(PathBuf),
+    /// It names one repository to Maven before 3.9 and another to later
+    /// Mavens, both exist, and no Maven Wrapper says which builds this.
+    Undetermined(String),
+}
+
+/// The local repository a `-Dmaven.repo.local=…` in `.mvn/maven.config`
+/// names for the Maven build in `project`, read the way Maven reads it
+/// (checked against 3.6.3, 3.8.9, 3.9.16 and 4.0.0-rc-7).
+///
+/// Only a Maven build reads the file: a Gradle or Scala-tool build's
+/// `mavenLocal()` never does, so a project that is one (alone, or beside a
+/// `pom.xml`) keeps the environment's repository. The file is the one
+/// Maven's launcher finds: `.mvn/maven.config` in the nearest directory at
+/// or above `project` that holds a `.mvn` directory.
+///
+/// * Maven before 3.9 splits the whole file on whitespace and interpolates
+///   nothing; a `#` is an argument like any other (and stops the build).
+/// * Maven 3.9 and later takes one argument per line, skipping blank lines
+///   and lines that start with `#`, so a value runs to the end of its line
+///   (`formats::maven::maven_config_line_properties`, which also reads the
+///   `--define` and quoted spellings). From 3.9.2 on it fills in
+///   `${session.rootDirectory}` and `${maven.multiModuleProjectDirectory}`
+///   (that directory; Maven 4 does not fill in the second, see
+///   [`RootDirectory`]), `${session.topDirectory}` and `${user.dir}`
+///   (`project`) and what `lookup` knows (`${user.home}`, `${env.NAME}`).
+///
+/// For both the last occurrence wins, a placeholder nothing defines stays
+/// in the path as written, a relative path (an empty one included) is
+/// taken from `project`, where Maven runs, and no later source is asked.
+/// The Maven the project declares ([`DeclaredMaven`]: its wrapper's
+/// release, or a root pom only Maven 4 reads) says which reading applies.
+/// When it declares none,
+/// both are made: when they differ, the one whose directory exists is
+/// taken, the newer reading when neither does (nothing is installed in
+/// either), and none when both do.
+fn maven_config_repo_local(project: &Path, lookup: &dyn Fn(&str) -> Option<String>) -> ConfigRepo {
+    const FLAG: &str = "-Dmaven.repo.local=";
+    let Ok(project) = std::path::absolute(project) else {
+        return ConfigRepo::Unset;
+    };
+    if !layout::has_build(&project, BuildTool::Maven)
+        || layout::has_build(&project, BuildTool::Gradle)
+        || layout::is_scala_tool_build(&project)
+    {
+        return ConfigRepo::Unset;
+    }
+    let Some(root) = project.ancestors().find(|dir| dir.join(".mvn").is_dir()) else {
+        return ConfigRepo::Unset;
+    };
+    let read = |rel: &str| {
+        let path = root.join(".mvn").join(rel);
+        // Bounded, and FIFO-safe: the files are in the project's own tree.
+        let small = std::fs::metadata(&path).ok()?.len() <= MAX_MAVEN_CONFIG_BYTES;
+        small
+            .then(|| crate::utils::fs::read_regular_to_string_sync(&path).ok())
+            .flatten()
+    };
+    let Some(text) = read("maven.config") else {
+        return ConfigRepo::Unset;
+    };
+    let at = |value: &str| project.join(value);
+    // Which Maven the project declares: its wrapper's release, or a root
+    // pom only Maven 4 reads (the answer every Maven reader here shares).
+    let root_pom = crate::utils::fs::read_regular_to_string_sync(&root.join("pom.xml")).ok();
+    let declared = DeclaredMaven::of(
+        read("wrapper/maven-wrapper.properties").as_deref(),
+        root_pom.as_deref(),
+    );
+    // Before 3.9: every `-Dmaven.repo.local=` token of the whole file. (The
+    // shared readers answer for 3.9 and later, or merge the two readings;
+    // which reading applies is what is being decided here.)
+    let before_3_9 = text
+        .split_whitespace()
+        .filter_map(|arg| arg.strip_prefix(FLAG))
+        .next_back()
+        .map(at);
+    // 3.9 and later: the shared reader of one argument per line.
+    let per_line =
+        crate::formats::maven::maven_config_line_properties(&text).remove("maven.repo.local");
+    let lookup = |name: &str| {
+        // The two spellings of the root directory, and which of them the
+        // declared Maven does not interpolate.
+        let root_property = [RootDirectory::Session, RootDirectory::Launcher]
+            .into_iter()
+            .find(|property| property.property() == format!("${{{name}}}"));
+        match (root_property, name) {
+            (Some(property), _) if property.unread_by(&declared) => None,
+            (Some(_), _) => Some(root.display().to_string()),
+            (None, "session.topDirectory" | "user.dir") => Some(project.display().to_string()),
+            (None, _) => lookup(name),
+        }
+    };
+    let from_3_9 = |interpolates: bool| {
+        per_line.as_deref().map(|value| match interpolates {
+            true => at(&interpolate_defined(value, &lookup)),
+            false => at(value),
+        })
+    };
+    let version = declared.release().map(release);
+    let found = |repo: Option<PathBuf>| repo.map_or(ConfigRepo::Unset, ConfigRepo::Path);
+    match version {
+        // A root pom only Maven 4 reads: whatever the wrapper pins.
+        _ if declared.is_maven_4() => found(from_3_9(true)),
+        Some(version) if version < [3, 9, 0] => found(before_3_9),
+        Some(version) => found(from_3_9(version >= [3, 9, 2])),
+        // A comment line stops Maven before 3.9: the file is for a later one.
+        None if text.lines().any(|line| line.starts_with('#')) => found(from_3_9(true)),
+        None => {
+            let newer = from_3_9(true);
+            let exists = |repo: &Option<PathBuf>| repo.as_ref().is_some_and(|p| p.is_dir());
+            match (exists(&before_3_9), exists(&newer)) {
+                _ if before_3_9 == newer => found(newer),
+                (true, false) => found(before_3_9),
+                (true, true) => ConfigRepo::Undetermined(format!(
+                    "{} names the local repository {} to Maven before 3.9 and {} to Maven 3.9 \
+                     and later, both exist, and the project has no Maven Wrapper to say which \
+                     Maven builds it; set MAVEN_REPO_LOCAL to the one the build uses",
+                    root.join(".mvn").join("maven.config").display(),
+                    before_3_9.as_deref().unwrap_or(Path::new("")).display(),
+                    newer.as_deref().unwrap_or(Path::new("")).display()
+                )),
+                _ => found(newer),
+            }
+        }
+    }
+}
+
+/// `text` with every `${name}` `lookup` defines replaced; one it does not
+/// define, or that is not closed, stays as written (Maven 3.9.2 and later
+/// treat a `maven.config` argument so).
+fn interpolate_defined(text: &str, lookup: &dyn Fn(&str) -> Option<String>) -> String {
+    let mut out = String::new();
+    let mut rest = text;
+    while let Some(at) = rest.find("${") {
+        out.push_str(&rest[..at]);
+        let Some(end) = rest[at..].find('}').map(|end| end + at) else {
+            break;
+        };
+        match lookup(&rest[at + 2..end]) {
+            Some(value) => out.push_str(&value),
+            None => out.push_str(&rest[at..=end]),
+        }
+        rest = &rest[end + 1..];
+    }
+    // An unclosed `${` leaves `rest` at the text before it; take it from there.
+    out.push_str(match rest.find("${") {
+        Some(at) => &rest[at..],
+        None => rest,
+    });
+    out
 }
 
 /// The `<localRepository>` a Maven `settings.xml` at `path` names, with
@@ -814,13 +1069,13 @@ pub fn m2_gate(cwd: &Path, env: &JvmEnv) -> M2Gate {
 /// Whether a Gradle-only build at `cwd` ignores the Maven local repository
 /// (process environment; see [`m2_gate`]).
 pub fn gradle_m2_ignored(cwd: &Path) -> bool {
-    m2_gate(cwd, &JvmEnv::from_process()) == M2Gate::Ignored
+    m2_gate(cwd, &JvmEnv::for_project(cwd)) == M2Gate::Ignored
 }
 
 /// Why `mavenLocal()` could not be ruled out for the Gradle build at
 /// `cwd`, when m2 is kept for that reason (process environment).
 pub fn maven_local_undetermined(cwd: &Path) -> Option<String> {
-    match m2_gate(cwd, &JvmEnv::from_process()) {
+    match m2_gate(cwd, &JvmEnv::for_project(cwd)) {
         M2Gate::Undetermined(why) => Some(why),
         _ => None,
     }
@@ -913,7 +1168,7 @@ impl MavenCrawler {
     /// its layout ([`Self::get_jvm_cache_roots_with`] over the process
     /// environment).
     pub async fn get_jvm_cache_roots(&self, options: &CrawlerOptions) -> Vec<JvmCacheRoot> {
-        self.get_jvm_cache_roots_with(options, &JvmEnv::from_process())
+        self.get_jvm_cache_roots_with(options, &JvmEnv::for_crawl(options))
             .await
     }
 
@@ -1019,7 +1274,7 @@ impl MavenCrawler {
         &self,
         options: &CrawlerOptions,
     ) -> Result<Vec<PathBuf>, std::io::Error> {
-        self.get_maven_repo_paths_with(options, &JvmEnv::from_process())
+        self.get_maven_repo_paths_with(options, &JvmEnv::for_crawl(options))
             .await
     }
 
@@ -1045,7 +1300,7 @@ impl MavenCrawler {
         &self,
         options: &CrawlerOptions,
     ) -> Result<Vec<PathBuf>, std::io::Error> {
-        self.get_maven_copy_paths_with(options, &JvmEnv::from_process())
+        self.get_maven_copy_paths_with(options, &JvmEnv::for_crawl(options))
             .await
     }
 
@@ -1091,7 +1346,8 @@ impl MavenCrawler {
     /// #265): another project's cached artifacts are not this project's
     /// packages. A root pom that is not readable leaves the crawl unscoped.
     pub async fn crawl_all(&self, options: &CrawlerOptions) -> Vec<CrawledPackage> {
-        self.crawl_all_with(options, &JvmEnv::from_process()).await
+        self.crawl_all_with(options, &JvmEnv::for_crawl(options))
+            .await
     }
 
     /// [`Self::crawl_all`] under the caches `env` names.
@@ -2795,6 +3051,7 @@ mod tests {
         }
         let env = JvmEnv {
             m2_repo: Some(repo.clone()),
+            m2_undetermined: None,
             gradle: None,
         };
         let purls = |packages: Vec<CrawledPackage>| {
