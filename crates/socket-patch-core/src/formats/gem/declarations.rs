@@ -28,7 +28,7 @@
 
 use super::gemfile::NON_SOURCE_KEYS;
 use super::is_plain_gem_token;
-use super::ruby::{is_ident_byte, masked_source, ruby_words, source_call_args};
+use super::ruby::{block_stack, is_ident_byte, masked_source, ruby_words, source_call_args};
 use crate::utils::line_endings;
 
 /// The trailing comment of a line the hosted rewriter ADDED for a gem the
@@ -647,56 +647,9 @@ fn remove_line(lines: &mut Vec<String>, k: usize) {
 /// that is not a plain string literal is left out, so a caller must check
 /// the answer against the lock bundler wrote before relying on it.
 pub(crate) fn rubygems_sources(text: &str) -> Vec<String> {
-    let (global, mut scoped) = source_calls(text);
-    for decl in declarations(text).literal {
-        if let Some((arg, Some(url))) = decl.source() {
-            scoped.push((arg.start, url.to_string()));
-        }
-    }
-    scoped.sort_by_key(|(at, _)| *at);
-    let mut out: Vec<String> = Vec::new();
-    let same = super::same_remote;
-    for url in global {
-        if !out.iter().any(|seen| same(seen, &url)) {
-            out.push(url);
-        }
-    }
-    let globals = out.len();
-    for (_, url) in scoped {
-        if out[..globals].iter().any(|seen| same(seen, &url)) {
-            continue;
-        }
-        // Bundler moves a source it meets again to the end.
-        out.retain(|seen| !same(seen, &url));
-        out.push(url);
-    }
-    out
-}
-
-/// The top-level sources of a manifest: each `source "<url>"` call with no
-/// block, in file order, one written twice counted once. Bundler 2.2 to 2.7
-/// lock a manifest with more than one of them into ONE `GEM` section that
-/// names them all (and deprecate it; bundler 4 refuses the manifest). A
-/// source that is not a plain string literal is left out.
-pub(crate) fn global_rubygems_sources(text: &str) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    for url in source_calls(text).0 {
-        if !out.iter().any(|seen| super::same_remote(seen, &url)) {
-            out.push(url);
-        }
-    }
-    out
-}
-
-/// The sources [`source_calls`] reads off a manifest's `source` calls: the
-/// url of each call with no block, then `(byte offset, url)` of each call
-/// with one.
-type SourceCalls = (Vec<String>, Vec<(usize, String)>);
-
-/// The literal `source "<url>"` calls of a manifest, in file order.
-fn source_calls(text: &str) -> SourceCalls {
     let masked = masked_source(text);
     let mut global: Vec<String> = Vec::new();
+    // (byte offset, url) of each block or option source.
     let mut scoped: Vec<(usize, String)> = Vec::new();
     for (word, start, end) in ruby_words(&masked) {
         if word != "source" {
@@ -739,7 +692,87 @@ fn source_calls(text: &str) -> SourceCalls {
             scoped.push((start, value.to_string()));
         }
     }
-    (global, scoped)
+    for decl in declarations(text).literal {
+        if let Some((arg, Some(url))) = decl.source() {
+            scoped.push((arg.start, url.to_string()));
+        }
+    }
+    scoped.sort_by_key(|(at, _)| *at);
+    let mut out: Vec<String> = Vec::new();
+    let same = super::same_remote;
+    for url in global {
+        if !out.iter().any(|seen| same(seen, &url)) {
+            out.push(url);
+        }
+    }
+    let globals = out.len();
+    for (_, url) in scoped {
+        if out[..globals].iter().any(|seen| same(seen, &url)) {
+            continue;
+        }
+        // Bundler moves a source it meets again to the end.
+        out.retain(|seen| !same(seen, &url));
+        out.push(url);
+    }
+    out
+}
+
+/// How many top-level sources a manifest declares: its `source <url>`
+/// calls that take no block and sit outside every other construct, a
+/// literal url written twice counted once. Bundler 2.2 to 2.7 lock a
+/// manifest with more than one of them into ONE `GEM` section that names
+/// them all (and deprecate it; bundler 4 refuses the manifest).
+///
+/// A url that is computed counts too, since only the number matters. A
+/// call inside an `if`, a `group` or any other construct does not (bundler
+/// may never run it), nor does one whose arguments run past its line: the
+/// count is a floor, for a caller that words a diagnosis with it.
+pub(crate) fn top_level_source_count(text: &str) -> usize {
+    let masked = masked_source(text);
+    let mut literal: Vec<&str> = Vec::new();
+    let mut computed = 0;
+    for (word, start, end) in ruby_words(&masked) {
+        if word != "source" {
+            continue;
+        }
+        let line_start = masked[..start].rfind('\n').map_or(0, |i| i + 1);
+        let lead = masked[line_start..start].trim();
+        let Some(paren) = source_call_args(&masked[end..]) else {
+            continue;
+        };
+        if !(lead.is_empty() || lead.ends_with(';')) {
+            continue;
+        }
+        let line_end = masked[end..].find('\n').map_or(masked.len(), |i| end + i);
+        let call = masked[end..line_end].trim_end();
+        // A block (`do`, `do |x|`, `{`), a trailing modifier (`… if x`),
+        // or arguments that go on: not known to be a top-level source.
+        let qualified = call.contains('{')
+            || ruby_words(call).any(|(word, _, _)| {
+                matches!(word, "do" | "if" | "unless" | "while" | "until" | "rescue")
+            })
+            || (paren && !call.contains(')'))
+            || call.ends_with([',', '\\']);
+        if qualified || !block_stack(text, line_start).is_empty() {
+            continue;
+        }
+        // Past the `(` or the blank that follows the word.
+        let args = &masked[end + 1..line_end];
+        let arg_at = end + 1 + (args.len() - args.trim_start().len());
+        let url = masked[arg_at..line_end]
+            .chars()
+            .next()
+            .filter(|q| matches!(q, '"' | '\''))
+            .and_then(|q| masked[arg_at + 1..line_end].find(q))
+            .map(|len| &text[arg_at + 1..arg_at + 1 + len])
+            .filter(|url| !url.contains('\\') && !url.contains("#{"));
+        match url {
+            Some(url) if literal.iter().any(|seen| super::same_remote(seen, url)) => {}
+            Some(url) => literal.push(url),
+            None => computed += 1,
+        }
+    }
+    literal.len() + computed
 }
 
 #[cfg(test)]
@@ -1053,22 +1086,37 @@ mod tests {
         assert!(!is_added_line(&text, &one(&text)));
     }
 
-    /// Only a `source "<url>"` call with no block is a top-level source;
-    /// one written twice (a trailing slash apart) counts once.
+    /// Only a block-less `source` call outside every construct is a
+    /// top-level source; a literal url written twice (a trailing slash
+    /// apart) counts once, a computed one counts.
     #[test]
-    fn global_rubygems_sources_are_the_blockless_source_calls() {
-        let text = "source \"https://rubygems.org\"\r\n\
-                    source('https://second.example/')\r\n\
-                    source \"https://rubygems.org/\"\r\n\
-                    # source \"https://commented.example\"\r\n\
-                    source COMPUTED\r\n\
-                    source \"https://block.example\" do\r\n  gem \"c\"\r\nend\r\n\
-                    gem \"a\", source: \"https://a.example/\"\r\n";
-        assert_eq!(
-            global_rubygems_sources(text),
-            ["https://rubygems.org", "https://second.example/"]
-        );
-        assert!(global_rubygems_sources("gem \"a\"\n").is_empty());
+    fn top_level_source_count_is_the_blockless_calls_outside_any_construct() {
+        let two = "source \"https://rubygems.org\"\r\n\
+                   source('https://second.example/')\r\n\
+                   source \"https://rubygems.org/\"\r\n\
+                   # source \"https://commented.example\"\r\n\
+                   source \"https://block.example\" do\r\n  gem \"c\"\r\nend\r\n\
+                   source(\"https://brace.example\") { gem \"d\" }\r\n\
+                   gem \"a\", source: \"https://a.example/\"\r\n";
+        assert_eq!(top_level_source_count(two), 2);
+        // A computed url is a source all the same.
+        for computed in [
+            "source \"https://rubygems.org\"\nsource ENV[\"GEM_SOURCE\"]\n",
+            "source \"https://rubygems.org\"\nsource \"https://#{ENV['TOKEN']}@gems.acme.example/\"\n",
+            "source 'https://rubygems.org'; source PRIVATE_SOURCE\n",
+        ] {
+            assert_eq!(top_level_source_count(computed), 2, "{computed}");
+        }
+        // Bundler runs one branch of a conditional, and maybe none.
+        for one in [
+            "if ENV['MIRROR']\n  source \"https://mirror.example\"\nelse\n  source \"https://rubygems.org\"\nend\n",
+            "source \"https://rubygems.org\"\nsource \"https://mirror.example\" if ENV['MIRROR']\n",
+            "source \"https://rubygems.org\"\nsource(\n  \"https://block.example\"\n) do\n  gem \"c\"\nend\n",
+            "source \"https://rubygems.org\"\nsource = \"https://not-a-call.example\"\n",
+        ] {
+            assert!(top_level_source_count(one) < 2, "{one}");
+        }
+        assert_eq!(top_level_source_count("gem \"a\"\n"), 0);
     }
 
     /// Bundler < 2.2 lists the global sources first, then each block or

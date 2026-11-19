@@ -67,8 +67,8 @@ use crate::formats::cargo::source_replacement::{crates_io_source, ConfigLayer, C
 use crate::formats::cargo::{is_crates_io_patch_table, is_crates_io_source, CargoLock};
 use crate::formats::composer::hosted::rewrite_composer_lock;
 use crate::formats::gem::hosted::{
-    bundled_before_2_2, checksum_entry_span, converge_gem_lock_source, lock_layout,
-    merge_gem_lock_remote, refresh_merged_gem_lock_remote, shared_gem_section_remotes,
+    bundled_before_2_2, bundler_keeps_merged_section, checksum_entry_span,
+    converge_gem_lock_source, lock_layout, merge_gem_lock_remote, refresh_merged_gem_lock_remote,
     DependencyPin, LockLayout,
 };
 use crate::formats::gem::locked_specs as gem_locked_specs;
@@ -8399,31 +8399,38 @@ fn plan_gem_redirect(
                     &mut staged,
                 )
                 .map_err(|why| {
-                    // A lock this bundler wrote for a manifest with several
-                    // top-level sources: `bundle lock` writes the same lock
-                    // again, so the way out is the manifest (#2162). The
-                    // urls stay out of the text: a source can carry
-                    // credentials. Vendored mode is not offered: it refuses
-                    // a gem in a `group` block or with a native extension,
-                    // which this plan cannot tell.
-                    let globals = declarations::global_rubygems_sources(&gf).len();
-                    if let Some(remotes) =
-                        shared_gem_section_remotes(&lk, dep).filter(|_| globals > 1)
-                    {
+                    // A multi-remote section under a manifest with several
+                    // top-level sources is what this bundler writes for
+                    // it, and `bundle lock` writes it again: the way out
+                    // is the manifest (#2162). The urls stay out of the
+                    // text: a source can carry credentials. Vendored mode
+                    // is not offered: it refuses a gem in a `group` block
+                    // or with a native extension, which this plan cannot
+                    // tell.
+                    let globals = declarations::top_level_source_count(&gf);
+                    if let Some(remotes) = why.shared_remotes.filter(|_| globals > 1) {
+                        let relock = match bundler_keeps_merged_section(&lk) {
+                            Some(bundler) => format!(
+                                "then run `bundle lock` with bundler 2.2.25 or later (bundler \
+                                 {bundler}, which wrote {lock_name}, keeps the one section)"
+                            ),
+                            None => "then run `bundle lock`".to_string(),
+                        };
                         return refuse(
                             "redirect_gem_lock_unconvergeable",
                             format!(
                                 "{gemfile_name} has {globals} top-level `source` lines, and \
                                  for such a manifest bundler locks every gem in one GEM \
                                  section that names every source ({lock_name} lists \
-                                 {remotes} remotes over `{name} ({})`), where no gem can be \
-                                 given the Socket source alone; nothing was changed for \
-                                 {name} — keep one top-level `source` line and move each \
-                                 other one into a `source \"<url>\" do … end` block around \
-                                 the gems that come from it (bundler's own deprecation \
-                                 warning asks for the same), then run `bundle lock`, commit \
-                                 {gemfile_name} and {lock_name} and re-run the hosted scan, \
-                                 or patch {name} with `--mode agent`",
+                                 {remotes} remotes over `{name} ({})`), which hosted mode \
+                                 does not rewrite; nothing was changed for {name} — keep \
+                                 the source that serves {name} as the one top-level \
+                                 `source` line and move each other one into a \
+                                 `source \"<url>\" do … end` block around the gems that \
+                                 come from it (bundler's own deprecation warning asks for \
+                                 the same), {relock}, commit {gemfile_name} \
+                                 and {lock_name} and re-run the hosted scan, or patch \
+                                 {name} with `--mode agent`",
                                 dep.version
                             ),
                         );
@@ -32288,6 +32295,9 @@ packages:
         let gemfiles = [
             "source \"https://rubygems.org\"\nsource \"https://user:secret@gems.acme.example/private/\"\n\n\
              gem \"rack\", \"2.2.8\"\n\ngroup :test do\n  gem \"rack-test\", \"2.1.0\"\nend\n",
+            // A url the Gemfile computes is a top-level source all the same.
+            "source \"https://rubygems.org\"\nsource \"https://#{ENV['GEM_USER']}:secret@gems.acme.example/private/\"\n\n\
+             gem \"rack\", \"2.2.8\"\n\ngroup :test do\n  gem \"rack-test\", \"2.1.0\"\nend\n",
             // CRLF, and the second source in call parentheses.
             "source 'https://rubygems.org'\r\nsource('https://user:secret@gems.acme.example/private/')\r\n\r\n\
              gem \"rack\", \"2.2.8\"\r\n\r\ngroup :test do\r\n  gem \"rack-test\", \"2.1.0\"\r\nend\r\n",
@@ -32317,6 +32327,7 @@ packages:
                     let detail = &r.warnings[0].detail;
                     assert!(
                         detail.contains("Gemfile has 2 top-level `source` lines")
+                            && detail.contains(&format!("keep the source that serves {gem} as"))
                             && detail.contains("`source \"<url>\" do … end` block")
                             && detail.contains("then run `bundle lock`")
                             && detail.contains(&format!("patch {gem} with `--mode agent`")),
@@ -32353,6 +32364,9 @@ packages:
              source \"https://gems.acme.example/\" do\n  gem \"acme\"\nend\n",
             "source \"https://rubygems.org\"\n\ngem \"rack\", \"2.2.8\"\n\
              gem \"acme\", source: \"https://gems.acme.example/\"\n",
+            // Bundler runs one branch only.
+            "if ENV[\"MIRROR\"]\n  source \"https://gems.acme.example/\"\nelse\n  \
+             source \"https://rubygems.org\"\nend\n\ngem \"rack\", \"2.2.8\"\n",
         ] {
             let (_, _, r) = gem_redirect(gemfile, lock, gem_override("rack", "2.2.8"));
             assert!(r.files.is_empty() && r.edits.is_empty(), "{:?}", r.edits);
@@ -32370,6 +32384,55 @@ packages:
                 "{detail}\n{gemfile}"
             );
         }
+    }
+
+    /// Bundler 2.2.15 keeps the one section on `bundle lock` even once the
+    /// second source sits in a block (run against the real thing), so for
+    /// a lock an early 2.2 release wrote the remedy names a bundler that
+    /// splits it.
+    #[test]
+    fn gem_lock_of_an_early_bundler_2_2_names_a_bundler_that_splits_it() {
+        let gemfile = "source \"https://rubygems.org\"\nsource \"https://gems.acme.example/\"\n\n\
+                       gem \"rack\", \"2.2.8\"\n";
+        let lock = "GEM\n  remote: https://rubygems.org/\n  remote: https://gems.acme.example/\n  specs:\n    \
+                    rack (2.2.8)\n\nPLATFORMS\n  ruby\n\nDEPENDENCIES\n  rack (= 2.2.8)\n\n\
+                    BUNDLED WITH\n   2.2.15\n";
+        let (_, _, r) = gem_redirect(gemfile, lock, gem_override("rack", "2.2.8"));
+        assert!(r.files.is_empty() && r.edits.is_empty(), "{:?}", r.edits);
+        let detail = &r.warnings[0].detail;
+        assert!(
+            detail.contains("Gemfile has 2 top-level `source` lines")
+                && detail.contains(
+                    "then run `bundle lock` with bundler 2.2.25 or later (bundler 2.2.15, \
+                     which wrote Gemfile.lock, keeps the one section)"
+                ),
+            "{detail}"
+        );
+    }
+
+    /// A lock refused for another reason keeps that reason, whatever the
+    /// Gemfile's sources: here the gem is listed in two `GEM` sections.
+    #[test]
+    fn gem_lock_refused_for_another_reason_is_not_blamed_on_the_sources() {
+        let gemfile = "source \"https://rubygems.org\"\nsource \"https://gems.acme.example/\"\n\n\
+                       gem \"rack\", \"2.2.8\"\n";
+        let lock = "GEM\n  remote: https://rubygems.org/\n  remote: https://gems.acme.example/\n  specs:\n    \
+                    rack (2.2.8)\n\nGEM\n  remote: https://other.example/\n  specs:\n    rack (2.2.8)\n\n\
+                    PLATFORMS\n  ruby\n\nDEPENDENCIES\n  rack (= 2.2.8)\n\nBUNDLED WITH\n   2.5.22\n";
+        let (_, _, r) = gem_redirect(gemfile, lock, gem_override("rack", "2.2.8"));
+        assert!(r.files.is_empty() && r.edits.is_empty(), "{:?}", r.edits);
+        assert_eq!(
+            warning_codes(&r),
+            vec!["redirect_gem_lock_unconvergeable"],
+            "{:?}",
+            r.warnings
+        );
+        let detail = &r.warnings[0].detail;
+        assert!(
+            detail.contains("more than one GEM section lists `rack (2.2.8)`")
+                && !detail.contains("top-level"),
+            "{detail}"
+        );
     }
 
     /// B1: lock shapes that cannot record the Socket source — a multi-remote
