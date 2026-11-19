@@ -1210,6 +1210,31 @@ the model is **not uniform** today:
   `composer.json`) is handled by invoking the tool **once per subproject** (`--cwd` each), as a
   per-directory CI step would.
 
+  *Python projects with no environment of their own (a refinement of "cwd-only"):* a project with a
+  Python marker (`pyproject.toml`, `setup.py`, `setup.cfg`, `requirements.txt` or a Python lock) and
+  none of the environments above installs into the interpreter on `PATH`, so that interpreter is the
+  one read: `python3` (else `python`, else `py`) is asked, from `--cwd`, for its
+  `site.getsitepackages()` and user site, and only those directories are read. The other
+  interpreters on the machine and the environments tools keep for themselves (`uv tool install`,
+  pipx apps, the Poetry installer, PDM's global project, uv- and PDM-managed interpreters) are read
+  only under `--global`. When no interpreter answers, the well-known interpreter locations (`/usr`,
+  `/usr/local`, `~/.local`, Homebrew, the python.org framework, pyenv, conda) stand in for it. That
+  interpreter is shared with everything else installed there, so `scan` discovery keeps only the
+  packages the project declares and the installed packages those require (their `Requires-Dist`,
+  transitively; markers and extras are not evaluated). The declarations read are the requirements
+  of every top-level `*requirements*.txt` / `*requirements*.in` file, of every `.txt` / `.in` file
+  in a top-level `requirements/` directory and of their `-r` includes, plus the PEP 621 `[project]`
+  `dependencies` / `optional-dependencies` and the PEP 735 `[dependency-groups]` of
+  `pyproject.toml`. A project that declares nothing, or whose declared packages are not installed,
+  has no packages there. Discovery is left unscoped (every package in that interpreter, as before)
+  when a declaration is not read in full: a `setup.py` or `setup.cfg`; a `poetry.lock`, `pdm.lock`,
+  `uv.lock` or PEP 751 / PEP 723 lock; `dynamic` dependencies; dependencies in a `[tool.poetry]`,
+  `[tool.pdm]`, `[tool.uv]` or `[tool.flit]` table; a requirement on a local directory or on a url
+  that names no package; a `${VAR}` in a requirements line; or an include that cannot be read.
+  `apply`, `rollback` and `vex` look a recorded patch's package up by PURL in the same interpreter
+  and are not scoped. A project whose environment only its manager creates (uv, Pipenv, Poetry with
+  its virtualenvs on) still has nothing installed until that environment exists.
+
   *Gem install roots (a refinement of "cwd-only", not an exception to the one-project model):* the
   crawler probes the project's Bundler install roots in **bundler's own precedence order** — the app
   config file's `BUNDLE_PATH:` (`$BUNDLE_APP_CONFIG/config`, else `<cwd>/.bundle/config` — what

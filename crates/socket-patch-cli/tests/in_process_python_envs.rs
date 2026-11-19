@@ -985,6 +985,96 @@ async fn uv_fresh_checkout_never_scans_the_system_python() {
     }
 }
 
+/// A project whose only Python manifest is `requirements.txt`, with no
+/// venv, installs into the interpreter on `PATH`, which other projects and
+/// tools share. Only the packages it declares, and what those require,
+/// reach the patch query, in every mode. A package that is merely installed
+/// in that interpreter, or in another tool's own environment under HOME, is
+/// not the project's: hosted mode has no line to pin it on, vendored mode
+/// would add it to the project, and agent mode would patch a copy the
+/// project never uses.
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn requirements_project_without_a_venv_scans_only_what_it_declares() {
+    use socket_patch_cli::commands::scan::ScanMode;
+    use std::os::unix::fs::PermissionsExt;
+
+    for (requirements, declared_is_found) in [
+        // Nothing declared: nothing in the interpreter is the project's.
+        ("# only the standard library\n", false),
+        ("declared_pkg\n", true),
+    ] {
+        for mode in [ScanMode::Agent, ScanMode::Vendored, ScanMode::Hosted] {
+            let tmp = tempfile::tempdir().unwrap();
+            let project = tmp.path().join("proj");
+            std::fs::create_dir_all(&project).unwrap();
+            std::fs::write(project.join("requirements.txt"), requirements).unwrap();
+            // The interpreter on PATH, and what is installed in it.
+            let site = tmp.path().join("system/lib/python3.12/site-packages");
+            std::fs::create_dir_all(&site).unwrap();
+            write_dist_info(&site, "declared_pkg", "1.0.0");
+            write_dist_info(&site, "system_decoy", "6.6.6");
+            let bin = tmp.path().join("bin");
+            std::fs::create_dir_all(&bin).unwrap();
+            let python = bin.join("python3");
+            std::fs::write(
+                &python,
+                format!(
+                    "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'Python 3.12.0'; exit 0; fi\n\
+                     printf '%s\\n' '{}'\n",
+                    site.display()
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&python, std::fs::Permissions::from_mode(0o755)).unwrap();
+            // A pipx app's own environment under HOME.
+            let home = tmp.path().join("home");
+            let tool = home.join(".local/pipx/venvs/hatch/lib/python3.12/site-packages");
+            std::fs::create_dir_all(&tool).unwrap();
+            write_dist_info(&tool, "tool_decoy", "6.6.6");
+
+            let server = MockServer::start().await;
+            mock_batch_empty(&server).await;
+            let saved: Vec<(&str, Option<std::ffi::OsString>)> =
+                ["HOME", "PATH", "PIPX_HOME", "XDG_DATA_HOME"]
+                    .into_iter()
+                    .map(|key| (key, std::env::var_os(key)))
+                    .collect();
+            // The stub goes in front of the host's PATH, which the scan
+            // still needs for its other tools.
+            let mut path = vec![bin.clone()];
+            path.extend(std::env::split_paths(
+                &std::env::var_os("PATH").unwrap_or_default(),
+            ));
+            std::env::set_var("PATH", std::env::join_paths(path).unwrap());
+            std::env::set_var("HOME", &home);
+            std::env::remove_var("PIPX_HOME");
+            std::env::remove_var("XDG_DATA_HOME");
+            let mut args = default_args(&project, server.uri());
+            args.mode = Some(mode);
+            let code = scan_scrubbed(args).await;
+            for (key, value) in saved {
+                match value {
+                    Some(v) => std::env::set_var(key, v),
+                    None => std::env::remove_var(key),
+                }
+            }
+
+            let context = format!("{requirements:?} {mode:?}");
+            assert_eq!(code, 0, "{context}");
+            let bodies = batch_bodies(&server).await;
+            if declared_is_found {
+                assert_discovered(&bodies, "pkg:pypi/declared-pkg@1.0.0");
+            } else {
+                assert_not_discovered(&bodies, "pkg:pypi/declared-pkg");
+            }
+            assert_not_discovered(&bodies, "pkg:pypi/system-decoy");
+            assert_not_discovered(&bodies, "pkg:pypi/tool-decoy");
+        }
+    }
+}
+
 /// #525: uv syncs into `UV_PROJECT_ENVIRONMENT`, absolute or relative to the
 /// project, and ignores an activated `VIRTUAL_ENV` for project commands.
 #[tokio::test]

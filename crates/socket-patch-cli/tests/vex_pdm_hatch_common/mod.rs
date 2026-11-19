@@ -420,6 +420,31 @@ pub fn path_with_fake_hatch(scratch: &Path) -> std::ffi::OsString {
     std::env::join_paths(paths).unwrap()
 }
 
+/// A virtualenv outside the project that holds one package unrelated to the
+/// fixture, for a scan to find installed. Hatch has no lockfile, so `scan`
+/// learns a Hatch project's packages only from what is installed, and the
+/// hosted cells wire a checkout with nothing installed. [`ScanApi`] answers
+/// any batch query with the fixture's patch, so one installed package of
+/// any name is enough for the scan to ask. Without it the scan asks only
+/// when the host's own Python holds a package the project declares.
+fn placeholder_venv(scratch: &Path) -> PathBuf {
+    let venv = "placeholder-venv";
+    put(
+        scratch,
+        &format!(
+            "{}/placeholder-0.0.0.dist-info/METADATA",
+            site_packages_rel(venv)
+        ),
+        b"Metadata-Version: 2.1\nName: placeholder\nVersion: 0.0.0\n",
+    );
+    put(
+        scratch,
+        &format!("{venv}/pyvenv.cfg"),
+        b"include-system-site-packages = false\n",
+    );
+    scratch.join(venv)
+}
+
 /// `scan --json` (hosted: `--mode hosted`; vendored: `--mode vendored --vendor-source
 /// build`) in `cwd` against `api`.
 pub fn run_scan(
@@ -451,8 +476,15 @@ pub fn run_scan(
         }
     }
     args.extend(extra.iter().map(|s| s.to_string()));
-    let out = cli()
-        .env("PATH", path_with_fake_hatch(cwd.parent().unwrap()))
+    let scratch = cwd.parent().unwrap();
+    let mut cmd = cli();
+    cmd.env("PATH", path_with_fake_hatch(scratch));
+    // A hosted scan of a project with no lock and no environment has
+    // nothing to ask the API about: see `placeholder_venv`.
+    if mode == Mode::Hosted && !cwd.join("pdm.lock").exists() && !cwd.join(".venv").exists() {
+        cmd.env("VIRTUAL_ENV", placeholder_venv(scratch));
+    }
+    let out = cmd
         .args(&args)
         .current_dir(cwd)
         .output()

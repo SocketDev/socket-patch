@@ -950,6 +950,47 @@ so they do not depend on the order.
 socket-patch release that adds vlt support: an older release does not understand them.
 Hosted vlt pins need no ledger (v5.0): `rollback` restores them from the npm registry.
 
+## PyPI: projects without a virtualenv
+
+A Python project with no environment of its own (no `.venv` or `venv`, no
+activated environment, no environment its manager created) installs into
+the interpreter on `PATH`. socket-patch reads that interpreter: it asks
+`python3` (else `python`, else `py`), run from the project directory, for
+its site-packages and user site, and reads only those directories.
+
+That interpreter is shared. Homebrew formulae, distro packages and other
+projects install into it too, so a package being installed there does not
+make it this project's. `scan` keeps only:
+
+- the packages the project declares: every requirement in a top-level
+  `*requirements*.txt` or `*requirements*.in` file, in a `.txt` or `.in`
+  file of a top-level `requirements/` directory and in their `-r`
+  includes, plus the `[project]` `dependencies` and
+  `optional-dependencies` and the `[dependency-groups]` of
+  `pyproject.toml`;
+- the installed packages those require, through their `Requires-Dist`
+  metadata. Markers and extras are not evaluated, so an optional
+  requirement that is installed is kept.
+
+A project that declares nothing, or whose declared packages are not
+installed, has no packages there. Install them first
+(`pip install -r requirements.txt`), preferably into a virtualenv.
+
+The filter is skipped, and every package in the interpreter is reported,
+when socket-patch cannot read every declaration: a `setup.py` or
+`setup.cfg`, a `poetry.lock`, `pdm.lock`, `uv.lock` or PEP 751 lock,
+`dynamic` dependencies, dependencies in a `[tool.poetry]`, `[tool.pdm]`,
+`[tool.uv]` or `[tool.flit]` table, a requirement on a local directory, a
+`${VAR}` in a requirements line, or an include that cannot be read.
+
+The other interpreters on the machine, and the environments tools keep for
+themselves (`uv tool install`, pipx apps, the Poetry installer, PDM's
+global project), are never read for a project. Use `--global` to patch
+those.
+
+`apply`, `rollback` and `vex` find the packages of recorded patches by name
+and version in the same interpreter. The filter applies to discovery only.
+
 ## Maven & NuGet caveats
 
 Honest limits of the Maven and NuGet flows — documented behavior, not bugs:

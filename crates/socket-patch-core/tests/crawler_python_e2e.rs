@@ -1044,73 +1044,262 @@ async fn get_global_python_site_packages_discovers_pdm_global_project_out_of_tre
 
 // ── project-marker fallback in get_site_packages_paths ────────
 
-/// A project with `pyproject.toml` but no `.venv` must fall through
-/// to global discovery — without this fallback, a fresh clone before
-/// `uv sync` returns zero packages even when the project clearly
-/// targets a Python ecosystem.
+/// Env vars that pick a project's environment or interpreter. The
+/// project-fallback tests unset them so an ambient value on the host
+/// (an activated venv, a conda prefix) can't decide the result.
+const PROJECT_ENV_VARS: &[&str] = &[
+    "VIRTUAL_ENV",
+    "CONDA_PREFIX",
+    "PYENV_ROOT",
+    "POETRY_HOME",
+    "PYTHONUSERBASE",
+];
+
+/// Run `f` with HOME and PATH rebound and every [`PROJECT_ENV_VARS`] and
+/// [`TOOL_DIR_VARS`] entry unset, restoring all of them after. PATH picks
+/// the interpreter a project with no environment of its own installs into:
+/// a directory holding [`install_fake_python`]'s shim, or an empty one for
+/// a machine with no interpreter.
+async fn with_project_env<F, Fut, T>(home: &Path, path: &Path, f: F) -> T
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = T>,
+{
+    let mut keys: Vec<&str> = vec!["HOME", "PATH"];
+    keys.extend(PROJECT_ENV_VARS);
+    keys.extend(TOOL_DIR_VARS);
+    let saved: Vec<(&str, Option<std::ffi::OsString>)> =
+        keys.iter().map(|k| (*k, std::env::var_os(k))).collect();
+    for key in &keys {
+        std::env::remove_var(key);
+    }
+    std::env::set_var("HOME", home);
+    std::env::set_var("PATH", path);
+    let out = f().await;
+    for (key, value) in saved {
+        match value {
+            Some(v) => std::env::set_var(key, v),
+            None => std::env::remove_var(key),
+        }
+    }
+    out
+}
+
+/// Install a fake `python3` into `bin_dir` that answers `--version` and
+/// prints `sites` for every other invocation, as the crawler's `site`
+/// query does for a real interpreter.
+#[cfg(unix)]
+fn install_fake_python(bin_dir: &Path, sites: &[&Path]) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::create_dir_all(bin_dir).unwrap();
+    let mut script = String::from(
+        "#!/bin/sh\nif [ \"$1\" = --version ]; then\n  echo 'Python 3.12.0'\n  exit 0\nfi\n",
+    );
+    for site in sites {
+        script.push_str(&format!("printf '%s\\n' '{}'\n", site.display()));
+    }
+    let bin = bin_dir.join("python3");
+    std::fs::write(&bin, script).unwrap();
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// A `.dist-info` install of `name` in `site`, requiring `requires`.
+#[cfg(unix)]
+fn install_dist(site: &Path, name: &str, version: &str, requires: &[&str]) {
+    let dist_info = site.join(format!("{name}-{version}.dist-info"));
+    std::fs::create_dir_all(&dist_info).unwrap();
+    let mut metadata = format!("Metadata-Version: 2.1\nName: {name}\nVersion: {version}\n");
+    for requirement in requires {
+        metadata.push_str(&format!("Requires-Dist: {requirement}\n"));
+    }
+    std::fs::write(dist_info.join("METADATA"), metadata).unwrap();
+}
+
+/// The `uv tool install` environment of `tool` under the stubbed HOME, in
+/// the layout uv uses on this OS.
+#[cfg(unix)]
+fn uv_tool_site_packages(home: &Path, tool: &str) -> std::path::PathBuf {
+    let data = if cfg!(target_os = "macos") {
+        home.join("Library").join("Application Support")
+    } else {
+        home.join(".local").join("share")
+    };
+    data.join("uv")
+        .join("tools")
+        .join(tool)
+        .join("lib")
+        .join("python3.12")
+        .join("site-packages")
+}
+
+/// A project with a Python marker and no venv installs into the interpreter
+/// on `PATH`, so that interpreter's own site-packages are the project's.
+/// The environments other tools keep for themselves (`uv tool install`,
+/// pipx) and the other interpreters on the machine are not: only `--global`
+/// reads those.
+#[cfg(unix)]
 #[tokio::test]
 #[serial]
-async fn get_site_packages_paths_falls_back_via_pyproject_marker() {
+async fn get_site_packages_paths_falls_back_to_the_interpreter_on_path() {
     let project = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
-    // Marker without venv.
-    tokio::fs::write(
+    let machine = tempfile::tempdir().unwrap();
+    std::fs::write(
         project.path().join("pyproject.toml"),
-        b"[project]\nname = \"x\"\n",
+        "[project]\nname = \"x\"\n",
     )
-    .await
     .unwrap();
-    // Stage a uv-tools layout under the stubbed HOME so global
-    // discovery has something to find.
-    #[cfg(target_os = "macos")]
-    let staged = home
-        .path()
-        .join("Library")
-        .join("Application Support")
-        .join("uv")
-        .join("tools")
-        .join("ruff")
-        .join("lib")
-        .join("python3.11")
-        .join("site-packages");
-    #[cfg(all(not(target_os = "macos"), not(windows)))]
-    let staged = home
-        .path()
-        .join(".local")
-        .join("share")
-        .join("uv")
-        .join("tools")
-        .join("ruff")
-        .join("lib")
-        .join("python3.11")
-        .join("site-packages");
-    #[cfg(windows)]
-    let staged = home.path().join("uv-fake-staged");
-    tokio::fs::create_dir_all(&staged).await.unwrap();
+    let system_site = machine.path().join("lib/python3.12/site-packages");
+    let user_site = home.path().join("user-site");
+    std::fs::create_dir_all(&system_site).unwrap();
+    install_fake_python(&machine.path().join("bin"), &[&system_site, &user_site]);
+    // Other environments on the machine.
+    let uv_tool = uv_tool_site_packages(home.path(), "poetry");
+    let pipx = pipx_venv_site_packages(&home.path().join(".local").join("pipx"), "hatch");
+    let conda = home.path().join("anaconda3/lib/python3.11/site-packages");
+    for other in [&uv_tool, &pipx, &conda] {
+        std::fs::create_dir_all(other).unwrap();
+    }
 
-    let prev_home = std::env::var("HOME").ok();
-    std::env::set_var("HOME", home.path());
     let crawler = PythonCrawler::new();
     let opts = CrawlerOptions {
         cwd: project.path().to_path_buf(),
         global: false,
         global_prefix: None,
     };
-    let result = crawler.get_site_packages_paths(&opts).await.unwrap();
-    if let Some(v) = prev_home {
-        std::env::set_var("HOME", v);
+    let bin = machine.path().join("bin");
+    let result = with_project_env(home.path(), &bin, || async {
+        crawler.get_site_packages_paths(&opts).await.unwrap()
+    })
+    .await;
+    assert_eq!(result, vec![system_site.clone(), user_site]);
+
+    // `--global` still reads every one of them.
+    let global = CrawlerOptions {
+        global: true,
+        ..opts
+    };
+    let result = with_project_env(home.path(), &bin, || async {
+        crawler.get_site_packages_paths(&global).await.unwrap()
+    })
+    .await;
+    for site in [&system_site, &uv_tool, &pipx, &conda] {
+        assert_surfaces(&result, site, "a --global site");
+    }
+}
+
+/// With no interpreter on `PATH` to ask, the well-known interpreter
+/// locations stand in for it. Tool environments still don't.
+#[tokio::test]
+#[serial]
+async fn get_site_packages_paths_without_an_interpreter_reads_the_well_known_locations() {
+    let project = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let empty_path = tempfile::tempdir().unwrap();
+    std::fs::write(project.path().join("requirements.txt"), "six\n").unwrap();
+    let conda = home.path().join("anaconda3/lib/python3.11/site-packages");
+    let pipx = pipx_venv_site_packages(&home.path().join(".local").join("pipx"), "hatch");
+    for site in [&conda, &pipx] {
+        std::fs::create_dir_all(site).unwrap();
     }
 
+    let crawler = PythonCrawler::new();
+    let opts = CrawlerOptions {
+        cwd: project.path().to_path_buf(),
+        global: false,
+        global_prefix: None,
+    };
+    let result = with_project_env(home.path(), empty_path.path(), || async {
+        crawler.get_site_packages_paths(&opts).await.unwrap()
+    })
+    .await;
     #[cfg(not(windows))]
-    assert!(
-        result.iter().any(|p| p == &staged),
-        "pyproject.toml marker must trigger global fallback; got {result:?}"
-    );
-    // On Windows the staged layout doesn't match the global crawler's
-    // search paths (different env var), so we only assert the gate
-    // engaged at all — i.e. some kind of result was produced.
+    {
+        assert_surfaces(&result, &conda, "a well-known interpreter location");
+        assert!(
+            !result.contains(&pipx),
+            "a pipx app's environment is not the project's; got {result:?}"
+        );
+    }
     #[cfg(windows)]
     let _ = result;
+}
+
+/// A project that installs into a shared interpreter is crawled for the
+/// packages it declares and what those require, not for everything else
+/// installed there.
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn crawl_all_in_a_shared_interpreter_keeps_only_the_projects_packages() {
+    let project = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let machine = tempfile::tempdir().unwrap();
+    let site = machine.path().join("lib/python3.12/site-packages");
+    install_dist(&site, "Flask", "3.0.0", &["Werkzeug>=3.0.0"]);
+    install_dist(&site, "werkzeug", "3.0.1", &[]);
+    install_dist(&site, "certifi", "2026.7.22", &[]);
+    install_dist(&site, "setuptools", "80.10.2", &[]);
+    let bin = machine.path().join("bin");
+    install_fake_python(&bin, &[&site]);
+    // Another tool's environment holds a package of its own.
+    let uv_tool = uv_tool_site_packages(home.path(), "poetry");
+    install_dist(&uv_tool, "anyio", "4.13.0", &[]);
+
+    let crawler = PythonCrawler::new();
+    let opts = CrawlerOptions {
+        cwd: project.path().to_path_buf(),
+        global: false,
+        global_prefix: None,
+    };
+    let crawl = || async {
+        let mut purls: Vec<String> = with_project_env(home.path(), &bin, || async {
+            crawler.crawl_all(&opts).await
+        })
+        .await
+        .into_iter()
+        .map(|package| package.purl)
+        .collect();
+        purls.sort();
+        purls
+    };
+    let requirements = project.path().join("requirements.txt");
+
+    // Nothing declared: nothing in the interpreter is the project's.
+    std::fs::write(&requirements, "# stdlib only\n").unwrap();
+    assert_eq!(crawl().await, Vec::<String>::new());
+
+    // Declared but not installed.
+    std::fs::write(&requirements, "requests\nrich\n").unwrap();
+    assert_eq!(crawl().await, Vec::<String>::new());
+
+    // Declared and installed: the package and what it requires.
+    std::fs::write(&requirements, "flask\n").unwrap();
+    assert_eq!(
+        crawl().await,
+        ["pkg:pypi/flask@3.0.0", "pkg:pypi/werkzeug@3.0.1"]
+    );
+
+    // A lookup by PURL is not scoped: a recorded patch names its package.
+    let certifi = "pkg:pypi/certifi@2026.7.22".to_string();
+    let found = crawler
+        .find_by_purls(&site, std::slice::from_ref(&certifi))
+        .await
+        .unwrap();
+    assert!(found.contains_key(&certifi), "{found:?}");
+
+    // `setup.py` decides the dependencies in code, so the crawl is not
+    // scoped. It still reads only the project's interpreter.
+    std::fs::write(project.path().join("setup.py"), "").unwrap();
+    assert_eq!(
+        crawl().await,
+        [
+            "pkg:pypi/certifi@2026.7.22",
+            "pkg:pypi/flask@3.0.0",
+            "pkg:pypi/setuptools@80.10.2",
+            "pkg:pypi/werkzeug@3.0.1",
+        ]
+    );
 }
 
 /// #964: a uv project (`uv.lock`) and a PEP 723 script lock (`*.py.lock`)
@@ -1218,28 +1407,24 @@ async fn get_site_packages_paths_uv_lock_beside_poetry_keeps_fallback() {
         .join("site-packages");
     tokio::fs::create_dir_all(&staged).await.unwrap();
 
-    let prev_virtual_env = std::env::var("VIRTUAL_ENV").ok();
-    std::env::remove_var("VIRTUAL_ENV");
-    let prev_home = std::env::var("HOME").ok();
-    std::env::set_var("HOME", home.path());
+    // No interpreter on PATH: the well-known locations, which the staged
+    // conda prefix is one of, stand in for it.
+    let empty_path = tempfile::tempdir().unwrap();
     let crawler = PythonCrawler::new();
     let opts = CrawlerOptions {
         cwd: project.path().to_path_buf(),
         global: false,
         global_prefix: None,
     };
-    let result = crawler.get_site_packages_paths(&opts).await.unwrap();
-    if let Some(v) = prev_home {
-        std::env::set_var("HOME", v);
-    }
-    if let Some(v) = prev_virtual_env {
-        std::env::set_var("VIRTUAL_ENV", v);
-    }
+    let result = with_project_env(home.path(), empty_path.path(), || async {
+        crawler.get_site_packages_paths(&opts).await.unwrap()
+    })
+    .await;
 
     #[cfg(not(windows))]
     assert!(
         result.iter().any(|p| p == &staged),
-        "uv.lock + poetry.lock must keep the global fallback; got {result:?}"
+        "uv.lock + poetry.lock must keep the interpreter fallback; got {result:?}"
     );
     #[cfg(windows)]
     let _ = (result, staged);
