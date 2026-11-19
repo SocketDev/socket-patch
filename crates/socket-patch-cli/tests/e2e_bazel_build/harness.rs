@@ -1059,6 +1059,9 @@ fn settings_of_a_shell() -> Vec<String> {
         "PYTHONHOME",
         "PYTHONPATH",
         "PYTHONSTARTUP",
+        // (Also what `hermetic::command` itself sets for the socket-patch
+        // binary: neither the shell's value nor that one reaches a child.)
+        "MAVEN_ARGS",
         // One name under each of `REMOVED_PREFIXES`.
         "BAZELISK_SETTING",
         "PIP_SETTING",
