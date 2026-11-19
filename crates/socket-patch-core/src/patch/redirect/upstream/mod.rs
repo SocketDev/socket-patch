@@ -29,6 +29,7 @@ use std::path::Path;
 
 use crate::vex::discover::{Discovery, PatchedRef, WiringMode};
 
+mod bazel_maven;
 mod bun_lockb;
 pub(super) mod cargo;
 mod client;
@@ -888,6 +889,8 @@ enum Format {
     Gradle,
     /// The generated `socket-patch.sbt`.
     Sbt,
+    /// The block in the root `MODULE.bazel` of a Bazel workspace.
+    BazelMaven,
     NuGet,
     Unsupported,
 }
@@ -922,6 +925,7 @@ fn format_of(rel: &str) -> Format {
         "pom.xml" => Format::Maven,
         "hosted-index.tsv" => Format::Gradle,
         crate::formats::sbt::owned_file::HOSTED_FILE if !rel.contains('/') => Format::Sbt,
+        crate::bazel::maven::FILE if !rel.contains('/') => Format::BazelMaven,
         "nuget.config" | "NuGet.config" | "NuGet.Config" | "packages.lock.json" => Format::NuGet,
         _ => Format::Unsupported,
     }
@@ -1118,6 +1122,7 @@ async fn restore_pass(view: &mut View<'_>, active: &[&HostedPin], ctx: &Ctx<'_>)
             Format::Maven => maven::restore(view, &pins, &files, ctx).await,
             Format::Gradle => gradle::restore(view, &pins, &files, ctx).await,
             Format::Sbt => sbt::restore(view, &pins, &files, ctx).await,
+            Format::BazelMaven => bazel_maven::restore(view, &pins).await,
             Format::NuGet => nuget::restore(view, &pins, &files, ctx).await,
             Format::Unsupported | Format::BunLockb => {
                 let mut r = FormatResult::default();

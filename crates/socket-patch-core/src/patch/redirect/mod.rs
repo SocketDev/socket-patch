@@ -423,6 +423,16 @@ pub struct RewriteResult {
         serde(skip_serializing_if = "std::collections::BTreeSet::is_empty")
     )]
     pub refused_sbt_uuids: std::collections::BTreeSet<String>,
+    /// Maven patch uuids whose entry is in the block of the root
+    /// `MODULE.bazel` of a Bazel workspace, written by this run or already
+    /// there ([`crate::bazel::maven::rewrite`]): the jar a
+    /// rules_jvm_external hub builds is the patched one. Confirms a Maven
+    /// purl whatever a `pom.xml` or a Gradle build beside the hub holds.
+    #[cfg_attr(
+        test,
+        serde(skip_serializing_if = "std::collections::BTreeSet::is_empty")
+    )]
+    pub confirmed_bazel_maven_uuids: std::collections::BTreeSet<String>,
 }
 
 /// The derived `Debug` shape, with the Gradle sets shown only when
@@ -468,6 +478,10 @@ impl std::fmt::Debug for RewriteResult {
             ("refused_gradle_uuids", &self.refused_gradle_uuids),
             ("confirmed_sbt_uuids", &self.confirmed_sbt_uuids),
             ("refused_sbt_uuids", &self.refused_sbt_uuids),
+            (
+                "confirmed_bazel_maven_uuids",
+                &self.confirmed_bazel_maven_uuids,
+            ),
         ] {
             if !set.is_empty() {
                 d.field(name, set);
@@ -762,7 +776,10 @@ fn rewriter_groups<'a>(
         Box::new(move |result| rewrite_composer_lock(files, overrides, result)),
         Box::new(move |result| rewrite_nuget(files, overrides, result)),
         Box::new(move |result| rewrite_gem(files, overrides, result)),
-        Box::new(move |result| rewrite_maven_pom(files, overrides, maven, result)),
+        Box::new(move |result| {
+            rewrite_maven_pom(files, overrides, maven, result);
+            crate::bazel::maven::rewrite(files, overrides, result);
+        }),
         Box::new(move |result| {
             gradle::rewrite_gradle_hosted(files, gradle_unreadable, overrides, result)
         }),
@@ -854,6 +871,7 @@ fn merge_group_delta(result: &mut RewriteResult, delta: RewriteResult) {
         refused_gradle_uuids,
         confirmed_sbt_uuids,
         refused_sbt_uuids,
+        confirmed_bazel_maven_uuids,
     } = delta;
     result.files.extend(files);
     result.binary_files.extend(binary_files);
@@ -906,6 +924,9 @@ fn merge_group_delta(result: &mut RewriteResult, delta: RewriteResult) {
     }
     result.confirmed_sbt_uuids.extend(confirmed_sbt_uuids);
     result.refused_sbt_uuids.extend(refused_sbt_uuids);
+    result
+        .confirmed_bazel_maven_uuids
+        .extend(confirmed_bazel_maven_uuids);
 }
 
 /// [`rewrite_groups_serial`], with the groups run concurrently under

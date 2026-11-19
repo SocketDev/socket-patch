@@ -2085,12 +2085,6 @@ async fn run_redirect_selected_untracked(
         .iter()
         .map(|w| RunWarning::new(w.code.as_str(), w.detail.as_str()))
         .collect();
-    // What a rules_jvm_external hub of a Bazel workspace builds, no pin of
-    // this run reaches: said for each such artifact, beside whatever the
-    // rewriters said and never in their list, which is what explains a
-    // lock entry that was not pinned.
-    let hub = selected.iter().map(|(purl, _)| purl.as_str());
-    warnings.extend(crate::commands::bazel_maven_notices(common, hub, false).await);
     warnings.extend(gem_stale.warnings.iter().map(run_warning_of));
     warnings.extend(nuget_stale.warnings.iter().map(run_warning_of));
     warnings.extend(python_stale.warnings.iter().map(run_warning_of));

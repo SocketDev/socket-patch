@@ -1674,10 +1674,11 @@ fn a_bazel_hub_that_builds_a_vendored_jar_adds_one_warning_and_nothing_else() {
     let (events, tree, warnings) = vendor(Some(lock("foo")));
     assert_eq!((&events, &tree), (&without.0, &without.1));
     let detail = format!(
-        "{}: Bazel takes this artifact from maven_install.json (hub \"maven\", `maven.install` \
-         at MODULE.bazel:3), which pins the upstream jar. socket-patch does not patch a \
-         rules_jvm_external hub yet, so the Bazel build stays unpatched whatever this command \
-         did for another build of the checkout",
+        "{0}: Bazel takes this artifact from maven_install.json (hub \"maven\", `maven.install` \
+         at MODULE.bazel:3), which pins the upstream jar, and this command does not patch a \
+         rules_jvm_external hub: the Bazel build stays unpatched whatever it did for another \
+         build of the checkout. `socket-patch get {0} --mode hosted` at the Bazel root patches \
+         a pinned hub",
         purl("foo")
     );
     let warning = serde_json::json!({ "code": "maven_bazel_hub_unpatched", "detail": detail });
@@ -1729,4 +1730,91 @@ fn a_bazel_hub_that_builds_a_vendored_jar_adds_one_warning_and_nothing_else() {
         env["warnings"].clone()
     };
     assert_eq!(others(Some(lock("foo"))), others(None));
+}
+
+/// Vendored mode patches no rules_jvm_external hub, and takes none over.
+/// The entry that hosted mode keeps for a jar in the block of
+/// `MODULE.bazel` is a hosted pin of that jar, and `vendor` and `vendor
+/// --revert` leave it as it is: the Bazel build keeps the patched jar.
+/// Everything else is the run without the workspace, and nothing is said
+/// of a hub that the block patches.
+#[test]
+fn vendor_leaves_the_hosted_entry_of_a_bazel_hub_in_place() {
+    let module = format!(
+        r#"bazel_dep(name = "rules_jvm_external", version = "7.2")
+maven = use_extension("@rules_jvm_external//:extensions.bzl", "maven")
+maven.install(lock_file = "//:maven_install.json")
+
+# >>> socket-patch: Maven patches for Bazel (managed block: socket-patch writes and removes it) >>>
+socket_patch_http_file = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "http_file")
+
+socket_patch_maven = use_extension("@rules_jvm_external//:extensions.bzl", "maven")
+
+# pkg:maven/org.example/foo@1.0, Socket patch {FOO_UUID}
+socket_patch_http_file(
+    name = "socket_patch_org_example_foo_1_0",
+    downloaded_file_path = "v1/org/example/foo/1.0/foo-1.0.jar",
+    sha256 = "{sum}",
+    urls = ["https://patch.socket.dev/patch-registry/maven/token/{FOO_UUID}/maven2/org/example/foo/1.0-socket.1d3c1fd2/foo-1.0-socket.1d3c1fd2.jar"],
+)
+
+# If Bazel stops at the next line ("does not generate repository"), the hub's lock no longer pins
+# org.example:foo at 1.0: run `socket-patch rollback pkg:maven/org.example/foo@1.0`.
+# Do not change it to inject_repo(): the build would pass without the patch.
+override_repo(
+    socket_patch_maven,
+    org_example_foo_1_0 = "socket_patch_org_example_foo_1_0",
+)
+# <<< socket-patch <<<
+"#,
+        sum = "a".repeat(64)
+    );
+    let lock = "{\"artifacts\": {\"org.example:foo\": {\"shasums\": {\"jar\": \"00\"}, \
+                \"version\": \"1.0\"}}, \"repositories\": {\"https://repo1.maven.org/maven2/\": \
+                [\"org.example:foo\"]}, \"version\": \"3\"}\n";
+    // The pin `list` reads from the block, when there is one.
+    let hosted = |root: &Path| {
+        let (code, list) = socket(root, &["list"]);
+        assert_eq!(code, Some(0), "{list}");
+        let events = list["events"].as_array().unwrap().iter();
+        let pin = |event: &&serde_json::Value| {
+            event["purl"] == purl("foo") && event["details"]["mode"] == "hosted"
+        };
+        events
+            .filter(pin)
+            .map(|event| event["details"]["lockfiles"].clone())
+            .collect::<Vec<_>>()
+    };
+    // No patch record is asked for: an eject would ask this port for one.
+    let nowhere = ["--proxy-url", "http://127.0.0.1:9"];
+    let run = |bazel: bool| {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fixture(root, Shape::Reactor, &[("foo", FOO_UUID)]);
+        if bazel {
+            write(root, "proj/MODULE.bazel", module.as_bytes());
+            write(root, "proj/maven_install.json", lock.as_bytes());
+            assert_eq!(hosted(root), [serde_json::json!(["MODULE.bazel"])]);
+        }
+        let mut steps = Vec::new();
+        for args in [&["vendor"][..], &["vendor", "--revert"]] {
+            let env = ok(root, &[args, &nowhere].concat());
+            let mut tree = snapshot(root);
+            let module = tree.remove("MODULE.bazel").flatten();
+            tree.remove("maven_install.json");
+            steps.push((events(&env), env["warnings"].clone(), tree, module));
+            assert_eq!(hosted(root).len(), usize::from(bazel), "{args:?}");
+        }
+        steps
+    };
+    let (without, beside) = (run(false), run(true));
+    let vendored = (purl("foo"), "applied".to_string(), String::new());
+    assert!(without[0].0.contains(&vendored), "{:?}", without[0].0);
+    for (beside, without) in beside.iter().zip(&without) {
+        assert_eq!(
+            (&beside.0, &beside.1, &beside.2),
+            (&without.0, &without.1, &without.2)
+        );
+        assert_eq!(beside.3.as_deref(), Some(module.as_bytes()));
+    }
 }

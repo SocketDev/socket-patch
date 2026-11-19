@@ -1,6 +1,8 @@
 //! What the files beside a Bazel workspace say about the Bazel that builds
 //! it.
 
+use std::path::Path;
+
 use super::workspace::Entry;
 
 /// A Bazel release as three numbers: `9.3.2` is `(9, 3, 2)`.
@@ -54,6 +56,107 @@ pub fn declared_release(view: &dyn Fn(&str) -> Entry) -> Option<Release> {
         [major, minor, patch] => Some((major, minor, patch)),
         _ => None,
     }
+}
+
+/// What `MODULE.bazel.lock` says of the Bazel that wrote it and of the
+/// modules it selected. Bazel writes the file at a build, so a checkout
+/// that was built has it whether it is committed or not.
+#[derive(Debug, Default, serde::Deserialize)]
+pub struct ModuleLock {
+    /// 11 from Bazel 7.2.0 to 7.4.1 and 13 from 7.5.0 (read in Bazel's
+    /// source); 13 on 7.7.2 and 28 on 8.8.2 and 9.3.2 (measured).
+    #[serde(rename = "lockFileVersion")]
+    pub version: Option<u64>,
+    /// The registry files the resolution read, by URL.
+    #[serde(default, rename = "registryFileHashes")]
+    files: std::collections::BTreeMap<String, serde::de::IgnoredAny>,
+}
+
+impl ModuleLock {
+    /// The lock `text`, or an empty one when it is no JSON of this shape.
+    pub fn parse(text: &str) -> ModuleLock {
+        serde_json::from_str(text).unwrap_or_default()
+    }
+
+    /// The releases of `module` whose `source.json` the resolution read.
+    /// Bazel reads that file for the release it selects and for no other,
+    /// and the `MODULE.bazel` of every release it considers (measured on
+    /// 7.4.0, 7.7.2, 8.8.2 and 9.3.2). None for a module that an override
+    /// takes from somewhere else than a registry.
+    pub fn selected(&self, module: &str) -> Vec<&str> {
+        fn release<'a>(url: &'a str, of: &str) -> Option<&'a str> {
+            let (_, rest) = url.split_once(of)?;
+            let release = rest.strip_suffix("/source.json")?;
+            (!release.contains('/')).then_some(release)
+        }
+        let of = format!("/modules/{module}/");
+        let urls = self.files.keys();
+        urls.filter_map(|url| release(url, &of)).collect()
+    }
+}
+
+/// How many rc files of one workspace are read.
+const MAX_RC_FILES: usize = 32;
+
+/// Where the rc files of the checkout name one of `flags`: the file, the
+/// line, and the word of that line that holds the name, which is an
+/// option as it is written (`--noenable_bzlmod`, `--vendor_dir=third_party`).
+/// The files are `.bazelrc` at the Bazel root and what it imports, up to
+/// [`MAX_RC_FILES`], as Bazel's `RcFile::ParseFile` takes an import
+/// (src/main/cpp/rc_file.cc at 7.4.0, 7.7.2, 8.8.2 and 9.3.2): the word
+/// after `import` and `try-import`, and the one after the condition of
+/// `try-import-if-bazel-version` (8.7.0 and later), which is not
+/// evaluated here. A path under `%workspace%/` is the workspace's, and
+/// any other path that is not absolute is one Bazel opens from where it
+/// runs: it is read from the Bazel root. A line that starts with `#` is a
+/// comment. An rc file that is there and cannot be read, an import whose
+/// path holds a quote or a backslash, which Bazel reads another way, and
+/// one file more than the bound are an error: the path.
+///
+/// Not seen: the rc files of the machine and of the home directory, an
+/// import of an absolute path, and the command line.
+pub fn mentions(
+    view: &dyn Fn(&str) -> Entry,
+    flags: &[&str],
+) -> Result<Vec<(String, usize, String)>, String> {
+    let (mut todo, mut read) = (vec![".bazelrc".to_string()], Vec::new());
+    let mut found = Vec::new();
+    while let Some(file) = todo.pop() {
+        if read.contains(&file) {
+            continue;
+        }
+        if read.len() == MAX_RC_FILES {
+            return Err(file);
+        }
+        let text = match view(&file) {
+            Entry::Text(text) => text,
+            Entry::Absent => continue,
+            Entry::Unreadable(_) => return Err(file),
+        };
+        for (at, line) in text.lines().enumerate() {
+            let mut words = line.split_whitespace().peekable();
+            match words.peek().copied() {
+                Some(word) if word.starts_with('#') => {}
+                Some(import @ ("import" | "try-import" | "try-import-if-bazel-version")) => {
+                    let Some(path) = words.nth(1 + usize::from(import.ends_with("version"))) else {
+                        continue;
+                    };
+                    if path.contains(['"', '\'', '\\']) {
+                        return Err(path.to_string());
+                    }
+                    let path = path.strip_prefix("%workspace%/").unwrap_or(path);
+                    todo.extend((!Path::new(path).has_root()).then(|| path.to_string()));
+                }
+                _ => {
+                    let names = |word: &&str| flags.iter().any(|flag| word.contains(flag));
+                    let named = words.filter(names);
+                    found.extend(named.map(|word| (file.clone(), at + 1, word.to_string())));
+                }
+            }
+        }
+        read.push(file);
+    }
+    Ok(found)
 }
 
 #[cfg(test)]
@@ -182,5 +285,134 @@ mod tests {
             _ => Entry::Text("7.7.2\n".to_string()),
         };
         assert_eq!(declared_release(&unreadable), None);
+    }
+
+    /// The view of the files `files`, where a file whose text is `\0`
+    /// cannot be read.
+    fn view<'a>(files: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Entry + 'a {
+        move |path| match files.iter().find(|(name, _)| *name == path) {
+            Some((_, "\0")) => Entry::Unreadable("it is not UTF-8".to_string()),
+            Some((_, text)) => Entry::Text(text.to_string()),
+            None => Entry::Absent,
+        }
+    }
+
+    /// The lock Bazel 9.3.2 wrote for a workspace that asks for
+    /// rules_jvm_external 6.5 beside a module that needs 6.7, cut down to
+    /// the files of that ruleset and one of another: the `MODULE.bazel` of
+    /// each release the resolution looked at, and the `source.json` of the
+    /// one it selected.
+    #[test]
+    fn a_module_lock_names_the_release_bazel_selected() {
+        let bcr = "https://bcr.bazel.build/modules";
+        let lock = format!(
+            r#"{{
+  "lockFileVersion": 28,
+  "registryFileHashes": {{
+    "{bcr}/rules_jvm_external/6.3/MODULE.bazel": "a",
+    "{bcr}/rules_jvm_external/6.5/MODULE.bazel": "b",
+    "{bcr}/rules_jvm_external/6.7/MODULE.bazel": "c",
+    "{bcr}/rules_jvm_external/6.7/source.json": "d",
+    "{bcr}/rules_java/9.3.0/source.json": "e",
+    "{bcr}/not_rules_jvm_external/1.0/source.json": "f",
+    "{bcr}/rules_jvm_external/6.7/patches/source.json": "g"
+  }},
+  "selectedYankedVersions": {{}},
+  "moduleExtensions": {{}}
+}}"#
+        );
+        let lock = ModuleLock::parse(&lock);
+        assert_eq!(lock.version, Some(28));
+        assert_eq!(lock.selected("rules_jvm_external"), ["6.7"]);
+        assert_eq!(lock.selected("rules_java"), ["9.3.0"]);
+        assert_eq!(lock.selected("rules_python"), [""; 0]);
+        // A lock that is empty, cut off or of another shape says nothing.
+        for unread in ["", "{", "[]", "{\"lockFileVersion\": \"13\"}"] {
+            let lock = ModuleLock::parse(unread);
+            assert_eq!(
+                (lock.version, lock.selected("rules_jvm_external").len()),
+                (None, 0)
+            );
+        }
+        let old = ModuleLock::parse("{\"lockFileVersion\": 11}");
+        assert_eq!(
+            (old.version, old.selected("rules_jvm_external").len()),
+            (Some(11), 0)
+        );
+    }
+
+    #[test]
+    fn an_option_is_found_in_the_rc_files_of_the_workspace() {
+        let flags = ["enable_bzlmod", "vendor_dir"];
+        let found = |files: &[(&str, &str)]| mentions(&view(files), &flags);
+        let at = |file: &str, line, word: &str| (file.to_string(), line, word.to_string());
+        assert_eq!(found(&[]), Ok(vec![]));
+        let rc = "# common --noenable_bzlmod\n\
+                  common --enable_bzlmod --lockfile_mode=error\n  \
+                  build:ci --vendor_dir=third_party # --enable_bzlmod=false\n\
+                  import %workspace%/tools/ci.bazelrc\n\
+                  try-import %workspace%/user.bazelrc\n\
+                  try-import /etc/bazel.bazelrc\n\
+                  import ../outside.bazelrc\n\
+                  try-import-if-bazel-version >=8.0.0 %workspace%/new.bazelrc\n\
+                  try-import-if-bazel-version\n\
+                  import\n";
+        let ci = "import %workspace%/.bazelrc\nfetch --noexperimental_enable_bzlmod\n\
+                  import tools/more.bazelrc\n";
+        let files = [
+            (".bazelrc", rc),
+            ("tools/ci.bazelrc", ci),
+            ("tools/more.bazelrc", "build --vendor_dir=v\n"),
+            ("new.bazelrc", "common --noenable_bzlmod\n"),
+            ("../outside.bazelrc", "common --enable_bzlmod=0\n"),
+            ("/etc/bazel.bazelrc", "common --enable_bzlmod=f\n"),
+            (">=8.0.0", "common --enable_bzlmod=n\n"),
+        ];
+        // Every word of a line that is no comment, also behind a `#` that
+        // may stand in a value. A file that is imported twice is read
+        // once, and one that is not there is passed over. The file of a
+        // conditional import is the word after its condition. A path that
+        // is not absolute is asked for from the root, also one that leads
+        // out of it, which the view of a checkout refuses; an absolute one
+        // is not asked for. The last file a file imports is read first.
+        let expected = vec![
+            at(".bazelrc", 2, "--enable_bzlmod"),
+            at(".bazelrc", 3, "--vendor_dir=third_party"),
+            at(".bazelrc", 3, "--enable_bzlmod=false"),
+            at("new.bazelrc", 1, "--noenable_bzlmod"),
+            at("../outside.bazelrc", 1, "--enable_bzlmod=0"),
+            at("tools/ci.bazelrc", 2, "--noexperimental_enable_bzlmod"),
+            at("tools/more.bazelrc", 1, "--vendor_dir=v"),
+        ];
+        assert_eq!(found(&files), Ok(expected));
+        // A path that Bazel would unquote or join with the next line is
+        // not the word that stands there.
+        for import in [
+            "import \"%workspace%/a b.bazelrc\"\n",
+            "try-import 'tools/ci.bazelrc'\n",
+            "import \\\n%workspace%/tools/ci.bazelrc\n",
+        ] {
+            let word = import.split_whitespace().nth(1).expect("a path");
+            assert_eq!(found(&[(".bazelrc", import)]), Err(word.to_string()));
+        }
+        // What cannot be read may hold anything, and so may the file after
+        // the last one that is read.
+        let unreadable = [
+            (".bazelrc", "import %workspace%/a.bazelrc\n"),
+            ("a.bazelrc", "\0"),
+        ];
+        assert_eq!(found(&unreadable), Err("a.bazelrc".to_string()));
+        let chain = |at: usize| format!("import %workspace%/{}.bazelrc\n", at + 1);
+        let texts: Vec<(String, String)> = (0..MAX_RC_FILES)
+            .map(|at| (format!("{at}.bazelrc"), chain(at)))
+            .collect();
+        let mut files = vec![(".bazelrc", "import %workspace%/1.bazelrc\n")];
+        files.extend(
+            texts
+                .iter()
+                .map(|(path, text)| (path.as_str(), text.as_str())),
+        );
+        assert_eq!(found(&files), Err(format!("{MAX_RC_FILES}.bazelrc")));
+        assert_eq!(found(&files[..MAX_RC_FILES]), Ok(vec![]));
     }
 }
