@@ -29,7 +29,9 @@
 //! of its own.
 //!
 //! The marker is read from what Bazel built, and the patched one holds an
-//! id made for the run, so no cache of an earlier run can supply it.
+//! id made for the run, so no cache of an earlier run can supply it. Each
+//! flow asserts the VEX document of its patch as `main.rs` says; agent mode
+//! also has its `apply` write one.
 //!
 //! One loopback server stands in for four hosts, by route prefix: the
 //! Socket API, `proxy.golang.org` (the upstream module), `patch.socket.dev`
@@ -58,7 +60,8 @@ use socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes;
 
 use crate::envelope::find_event;
 use crate::harness::{
-    cell_without_bazel, changed, fixture_path, Cell, Fixture, Ran, StandIn, Tree, CONSUMER, NOTHING,
+    cell_without_bazel, changed, fixture_path, with_vex, Cell, Claim, Fixture, How, Ran, StandIn,
+    Tree, CONSUMER, NOTHING,
 };
 use crate::hosted_memory_common::{Patch, ORG};
 
@@ -80,6 +83,9 @@ const FIXTURE: Fixture = Fixture {
 const MODULE: &str = "example.com/upstream";
 const VERSION: &str = "v1.0.0";
 const PURL: &str = "pkg:golang/example.com/upstream@v1.0.0";
+/// The product `vex` reads from the fixture's own `go.mod`, which records
+/// a module and no version.
+const PRODUCT: &str = "pkg:golang/example.com/consumer";
 /// Its two files. The fixture's `go.sum` holds the `h1:` of these bytes.
 const GO_MOD: &[u8] = b"module example.com/upstream\n\ngo 1.21\n";
 const UPSTREAM_LIB: &[u8] = b"package upstream\n\nfunc Greeting() string { return \"PRISTINE\" }\n";
@@ -304,7 +310,10 @@ fn hosted_go_deps() {
     // (b) The one command of hosted mode. It rewrites those two files and
     // no other: the one `replace` line, and the two sums of the Socket
     // module in place of the upstream module's.
-    let scan = socket_patch(&cell, &["scan", "--mode", "hosted", "--yes"]);
+    let hosted = ["scan", "--mode", "hosted", "--yes"];
+    let claim = Claim::new(PURL, &uuid, How::Hosted);
+    let in_run = cell.document("in-run");
+    let scan = socket_patch(&cell, &[&hosted[..], &with_vex(&in_run)].concat());
     let said = &scan.dump;
     let pinned = cell.pinned_by(&scan, PURL, &uuid, &before, &["go.mod", "go.sum"]);
     let text = |rel: &str| String::from_utf8(pinned[rel].clone()).expect("a text file");
@@ -315,6 +324,10 @@ fn hosted_go_deps() {
     let mut sums: Vec<&str> = go_sum.lines().collect();
     sums.sort_unstable();
     assert_eq!(sums, socket.go_sum(), "{test}: go.sum:\n{go_sum}");
+    // The document of that run and the one of `vex` say so, in a checkout
+    // Bazel has built in, before anything has fetched the Socket module.
+    cell.wrote_in_run(&scan, &in_run, &claim);
+    cell.stands_alone(socket_patch, &claim, true);
     assert_eq!(standin.asked(&socket_zip), 0, "{test}: {said}");
 
     // (c) The same build, no step in between: patched, from the patch
@@ -330,10 +343,21 @@ fn hosted_go_deps() {
         upstream_fetches,
         "{test}: the patched build fetched the upstream module"
     );
+    // `vex` says the same of the build that printed the patched marker,
+    // and with `--no-verify` that it checked no file.
+    cell.stands_alone(socket_patch, &claim, true);
+    cell.stands_alone(socket_patch, &claim, false);
+    // Without a product, as a user types it: the same document for the
+    // module of the checkout's own `go.mod`.
+    cell.detects_product(socket_patch, Some(PRODUCT));
 
-    // (d) The undo: every file is the one of before, and so is the build.
+    // (d) The undo: every file is the one of before, and so is the build,
+    // and `vex` has no document for it.
     let undo = socket_patch(&cell, &["rollback", "--yes"]);
     cell.undone(&undo, "rolledBack", &before, UNPATCHED);
+    cell.attests_nothing(socket_patch, 2, "manifest_not_found");
+    // The same two documents where no Bazel has built.
+    cell.attests_unbuilt(socket_patch, &hosted, &before, &pinned, &claim);
 
     // (e) A second machine with the rewritten files, and a patch host that
     // serves other bytes at the pinned URL: still a module zip `go`
@@ -434,6 +458,14 @@ impl Kept {
         match self {
             Kept::Vendored => format!("{}/{uuid}/{MODULE}@{VERSION}", self.copies()),
             Kept::Agent => format!("{}/{MODULE}@{VERSION}", self.copies()),
+        }
+    }
+
+    /// What a VEX document says of a patch of the mode.
+    fn how(self) -> How {
+        match self {
+            Kept::Vendored => How::Vendored,
+            Kept::Agent => How::Agent,
         }
     }
 
@@ -647,11 +679,17 @@ fn kept_copy_flow(test: &str, mode: Kept, ships_build: bool) {
 
     // (b) The command of the mode: the copy, the one `replace` line, and
     // the line that keeps Bazel and gazelle out of the copies.
-    let scan = with.run(&cell, &mode.scan());
+    let claim = Claim::new(PURL, &with.uuid, mode.how());
+    let run = |cell: &Cell, args: &[&str]| with.ran(cell, args);
+    let in_run = cell.document("in-run");
+    let scan = with.run(&cell, &[&mode.scan()[..], &with_vex(&in_run)].concat());
     let event = find_event(&scan.envelope, "applied", None);
     assert_eq!(event["purl"], PURL, "{test}: {}", scan.dump);
+    cell.wrote_in_run(&scan, &in_run, &claim);
     if mode == Kept::Agent {
-        with.run(&cell, &["apply"]);
+        let again = cell.document("apply");
+        let apply = with.run(&cell, &[&["apply"][..], &with_vex(&again)].concat());
+        cell.wrote_in_run(&apply, &again, &claim);
     }
     let pinned = cell.tree();
     let wrote = changed(&before, &pinned);
@@ -667,9 +705,15 @@ fn kept_copy_flow(test: &str, mode: Kept, ships_build: bool) {
     let replace = format!("replace {MODULE} {VERSION} => ./{copy_dir}");
     let replaces = go_mod.lines().filter(|line| line.trim() == replace).count();
     assert_eq!(replaces, 1, "{test}: go.mod:\n{go_mod}");
+    cell.stands_alone(run, &claim, true);
 
-    // (c) The next build is patched, from the copy.
+    // (c) The next build is patched, from the copy, and `vex` says so; with
+    // `--no-verify` it says that it checked no file, and without a product
+    // it says the same for the module of the checkout's own `go.mod`.
     cell.builds_patched(&pinned, &patched);
+    cell.stands_alone(run, &claim, true);
+    cell.stands_alone(run, &claim, false);
+    cell.detects_product(run, Some(PRODUCT));
 
     // (d) The user's next step: gazelle writes nothing into the copy, the
     // build stays patched, and no package of the checkout is under
@@ -682,13 +726,20 @@ fn kept_copy_flow(test: &str, mode: Kept, ships_build: bool) {
     let all = cell.bazel("build", &["//..."]);
     assert!(all.ok(), "{test}: {}", all.dump());
 
-    // (e) The undo. An agent rollback keeps its emptied manifest.
-    let (undo, counted, left): (&[&str], &str, &[&str]) = match mode {
-        Kept::Vendored => (&["vendor", "--revert", "--yes"], "removed", &[]),
+    // (e) The undo. An agent rollback keeps its emptied manifest, which
+    // `vex` then finds empty, where the other undo leaves it none to find.
+    let (undo, counted, left, nothing): (&[&str], &str, &[&str], (i32, &str)) = match mode {
+        Kept::Vendored => (
+            &["vendor", "--revert", "--yes"],
+            "removed",
+            &[],
+            (2, "manifest_not_found"),
+        ),
         Kept::Agent => (
             &["rollback", "--yes"],
             "rolledBack",
             &[".socket/manifest.json"],
+            (1, "no_patches"),
         ),
     };
     let undo = with.run(&cell, undo);
@@ -702,6 +753,9 @@ fn kept_copy_flow(test: &str, mode: Kept, ships_build: bool) {
     );
     cell.builds(UNPATCHED);
     assert_eq!(changed(&before, &cell.tree()), left, "{test}");
+    cell.attests_nothing(run, nothing.0, nothing.1);
+    // The same two documents where no Bazel has built.
+    cell.attests_unbuilt(run, &mode.scan(), &before, &pinned, &claim);
 
     let next = if ships_build {
         "`bazel build //...` passed"
@@ -1529,9 +1583,10 @@ fn a_manifest_in_another_project_brings_the_file_of_both_projects_in_line() {
     }
 }
 
-/// Without a Bazel: the fixture's directories are those of its table, and
-/// its `go.sum` pins the module the test serves, which holds the `h1:`
-/// arithmetic here to sums that `go` computed.
+/// Without a Bazel: the fixture's directories are those of its table, its
+/// `go.sum` pins the module the test serves, which holds the `h1:`
+/// arithmetic here to sums that `go` computed, and its `go.mod` names the
+/// module of [`PRODUCT`].
 #[test]
 fn the_fixture_pins_the_upstream_module_the_test_serves() {
     FIXTURE.check();
@@ -1539,4 +1594,8 @@ fn the_fixture_pins_the_upstream_module_the_test_serves() {
     let go_sum = std::fs::read_to_string(&path).expect("the fixture's go.sum");
     let lines: Vec<&str> = go_sum.lines().collect();
     assert_eq!(lines, upstream().go_sum(), "{}", path.display());
+    let go_mod = std::fs::read_to_string(path.with_file_name("go.mod")).expect("go.mod");
+    let module = PRODUCT.strip_prefix("pkg:golang/").expect("a Go module");
+    let line = format!("module {module}");
+    assert!(go_mod.lines().any(|named| named == line), "{go_mod}");
 }

@@ -7,7 +7,7 @@
 //! artifacts. Either way the patch uuid is recoverable from the wired string
 //! itself, which is what lets `socket-patch vex` attest a project with NO
 //! `.socket/manifest.json` — and possibly no `.socket/vendor` ledgers either
-//! (a depscan-opened PR, a clone of a repo that never committed them).
+//! (a GitHub-app PR, a clone of a repo that never committed them).
 //!
 //! [`discover_patched_refs`] reads every supported lockfile / package-manager
 //! config at the project ROOT and returns one [`PatchedRef`] per wired
@@ -2303,6 +2303,31 @@ impl<'a> DiscoverCtx<'a> {
     /// Whether `rel` is a lock the package manager never reads here.
     fn is_ignored(&self, rel: &str) -> bool {
         self.ignored.contains(&rel)
+    }
+
+    /// [`Self::read_text`] for a path that may be no file at all (one the
+    /// Maven reactor reader asks about: a module named by its directory, a
+    /// module's `.mvn` file): missing, or not a file that can be opened, it
+    /// is `Ok(None)` with no diagnostic. What is read is recognized and
+    /// logged all the same. A file that is there but is not UTF-8 text is
+    /// `Err`, with the reader's message: its content is unknown, which the
+    /// caller must say rather than take the file for absent.
+    pub(crate) async fn read_text_quiet(&self, rel: &str) -> Result<Option<String>, String> {
+        if self.is_ignored(rel) {
+            return Ok(None);
+        }
+        match self.view.read_text(rel).await {
+            Ok(text) => {
+                self.log_read(rel, true);
+                self.recognize_text(rel, &text);
+                Ok(Some(text))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+                self.log_read(rel, false);
+                Err(e.to_string())
+            }
+            Err(_) => Ok(None),
+        }
     }
 
     /// Guarded UTF-8 read of root-relative `rel`: `None` when missing

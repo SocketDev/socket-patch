@@ -23,12 +23,17 @@ on:
     # What a pull request run covers: the Go flow and its fixture, the
     # harness and the workflows that run it, the Bazel installer and its
     # pins, the Go files the flow runs through, as go-compatibility.yml
-    # lists them, and what socket-patch does only in a Bazel workspace
-    # (`bazel/`). Nothing another ecosystem's flow owns is here, so a change
-    # to one ecosystem starts that ecosystem's legs only.
+    # lists them, what socket-patch does only in a Bazel workspace
+    # (`bazel/`), and the VEX code: `vex/` of the core and the files of the
+    # `vex` command. Every flow holds the exact document socket-patch writes
+    # about its patched build, so a change to how a document is built or
+    # worded starts the legs of every ecosystem. Nothing else that another
+    # ecosystem's flow owns is here, so any other change to one ecosystem
+    # starts that ecosystem's legs only.
     #
     # What it does not cover: shared engine code (patch/redirect/mod.rs,
-    # hosted/, commands/), the shared test helpers and the toolchain files.
+    # hosted/, the rest of commands/), the shared test helpers and the
+    # toolchain files.
     # A change there gets its run on the push to main (when the file is in
     # the list below) or in the nightly run, not on the pull request: that
     # is the price of not running every ecosystem's legs on every shared
@@ -45,6 +50,8 @@ on:
       - 'crates/*/src/**/*golang*/**'
       - 'crates/socket-patch-core/src/vendor/go*.rs'
       - 'crates/socket-patch-core/src/bazel/**'
+      - 'crates/socket-patch-core/src/vex/**'
+      - 'crates/socket-patch-cli/src/commands/vex*.rs'
   push:
     branches: [main]
     # The pull request paths, and what only a push to main covers: the
@@ -65,6 +72,8 @@ on:
       - 'crates/*/src/**/*golang*/**'
       - 'crates/socket-patch-core/src/vendor/go*.rs'
       - 'crates/socket-patch-core/src/bazel/**'
+      - 'crates/socket-patch-core/src/vex/**'
+      - 'crates/socket-patch-cli/src/commands/vex*.rs'
       - 'crates/socket-patch-cli/tests/e2e_bazel_build/main.rs'
       - 'crates/socket-patch-core/src/patch/redirect/**'
       - 'crates/socket-patch-core/src/hosted/**'

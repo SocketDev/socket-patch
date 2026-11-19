@@ -37,7 +37,7 @@ mod composer;
 mod gem;
 mod golang;
 mod gradle;
-mod maven;
+pub(crate) mod maven;
 pub(crate) mod npm;
 mod nuget;
 mod pypi;
@@ -746,6 +746,29 @@ impl<'a> View<'a> {
         self.staged.insert(rel.to_string(), None);
     }
 
+    /// Stage `content` for `rel` only when the flush could write it;
+    /// `false` when it was left out. For a write that is a courtesy and
+    /// must never be the reason a restore is refused: the flush is all or
+    /// nothing, and one file it will not write (a symbolic link, a
+    /// directory that does not take the write, a file edited since it was
+    /// read) leaves every pin unrestored.
+    pub(crate) async fn write_if_writable(&mut self, rel: &str, content: String) -> bool {
+        let read = self
+            .originals
+            .get(rel)
+            .map(|original| original.as_deref().map(str::as_bytes));
+        let pending = vec![Pending {
+            rel,
+            content: Some(content.as_bytes()),
+            read,
+        }];
+        if preflight(self.root, pending).await.is_err() {
+            return false;
+        }
+        self.write(rel, content);
+        true
+    }
+
     /// Files whose staged state differs from what was read from disk.
     fn changed(&self) -> Staged {
         self.staged
@@ -951,35 +974,23 @@ pub async fn gem_stale_cache_after_unwind(
     gem::unwound_stale_cache(root, purl, offline).await
 }
 
-/// The upstream `.gem` of a gem `purl` that is back on its registry entry
-/// in the project at `root`: its sha256 and download url
-/// ([`UpstreamArchive::Known`]). The sha256 is what the restored lock pins
-/// (its `CHECKSUMS` entry, else the rubygems.org compact index, unless
-/// `offline`); the url is set when the lock resolves the gem from
-/// rubygems.org. `staged` is a restore's [`RestoreOutcome::staged_text`]:
-/// the restored lock is read from it when it is there (a dry run's lock is
-/// not on disk), else from disk. `None` when nothing proves the sha256, so
-/// there is nothing to judge an installed copy or a cached archive by;
-/// [`UpstreamArchive::Unverified`] when the registry that would is refused
-/// (plain http), which the caller reports.
-pub async fn gem_upstream_archive(
+pub use gem::GemUpstream;
+
+/// What the lock of the project at `root` says of the gems an unwind put
+/// back on their upstream entries ([`GemUpstream`]): the builds it names
+/// for each, and each build's upstream `.gem`. `staged` is a restore's
+/// [`RestoreOutcome::staged_text`]: the restored lock is read from it when
+/// it is there (a dry run's lock is not on disk), else from disk. `offline`
+/// skips the rubygems.org lookup a lock without `CHECKSUMS` needs.
+pub async fn gem_upstream(
     root: &Path,
     staged: &BTreeMap<String, Option<String>>,
-    purl: &str,
     offline: bool,
-) -> Option<UpstreamArchive> {
+) -> GemUpstream {
     let restored = crate::formats::gem::BUNDLER_LOCKS
         .iter()
         .find_map(|lock| staged.get(*lock)?.as_deref());
-    gem::upstream_archive(root, restored, purl, offline).await
-}
-
-/// Whether the lock on disk at `root` resolves the ruby-platform gem `purl`
-/// from rubygems.org: the gem is then on its upstream registry entry, also
-/// where [`gem_upstream_archive`] is `None` because nothing proves the
-/// archive's sha256 (an offline run, a registry error).
-pub async fn gem_resolves_from_rubygems(root: &Path, purl: &str) -> bool {
-    gem::resolves_from_rubygems(root, purl).await
+    GemUpstream::load(root, restored, offline).await
 }
 
 /// Restore every pin in `pins` to its default upstream registry entry.

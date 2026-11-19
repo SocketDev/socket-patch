@@ -568,7 +568,7 @@ fn cells() -> impl Iterator<Item = (Flavor, Mode)> {
 // a) no manifest, no ledgers, online → attested
 // ──────────────────────────────────────────────────────────────────────
 
-/// A depscan-opened PR / a checkout whose `.socket/` ledgers were never
+/// A GitHub-app PR / a checkout whose `.socket/` ledgers were never
 /// committed: the lock wiring is the only input, the record comes from the
 /// patch API (exactly one fetch), hosted refs attest from the pinned wiring
 /// (nothing installed), vendored refs from the hashed artifact.

@@ -768,7 +768,7 @@ fn uv_vendor_fresh_checkout_frozen_offline_and_revert() {
     assert_fresh_checkout_frozen_offline(&uv, tmp.path(), &proj, &lock_wired, python.as_deref());
 
     // Manifest-less VEX over that fresh checkout (a `scan --mode vendored` /
-    // depscan checkout's shape once the manifest is gone).
+    // GitHub-app checkout's shape once the manifest is gone).
     manifestless_vex_tail(
         &uv,
         tmp.path(),

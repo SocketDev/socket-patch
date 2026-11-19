@@ -1,0 +1,21 @@
+# The packages of this project are the vendor/ tree that `composer install`
+# made and the project committed: Bazel reads them as source files.
+filegroup(
+    name = "vendor",
+    srcs = glob(["vendor/**"]),
+)
+
+# PHP runs main.php when Bazel builds this, on the committed vendor tree;
+# `bazel run` prints what it said.
+genrule(
+    name = "consumer",
+    srcs = [
+        "main.php",
+        "vendor/autoload.php",
+        ":vendor",
+    ],
+    outs = ["consumer.sh"],
+    cmd = "{ echo '#!/bin/sh'; echo \"cat <<'EOF'\"; php -n $(location main.php) $(location vendor/autoload.php); echo EOF; } > $@",
+    executable = True,
+    visibility = ["//visibility:public"],
+)

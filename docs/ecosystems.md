@@ -14,7 +14,7 @@ The backticked slug in each row is the value `-e`/`--ecosystems` accepts (e.g.
 
 | Ecosystem | agent (`--mode agent`) | vendored (`--mode vendored`) | hosted (`--mode hosted`) |
 |-----------|------------------------|------------------------------|--------------------------|
-| npm (`npm`) — pnpm / yarn / berry / bun / vlt | ✅ any install layout, vlt's `node_modules/.vlt` store included (every store copy, copy-on-write) | ✅ seven lockfile flavors: package-lock, yarn classic, yarn berry (node-modules linker; PnP refused), pnpm v9, pnpm legacy v5.4/v6.0 (`pnpm 7/8` — frozen installs are path-bound because those majors absolutize `file:` override specifiers; moved checkouts run one `pnpm install --offline --no-frozen-lockfile`, surfaced as `vendor_pnpm_legacy_absolute_specifier`), bun text `bun.lock` lockfileVersion 0/1/2/3 and native binary `bun.lockb` revisions 1/2/3 (binary locks stay binary; text workspace vendoring requires lockfileVersion 2 — see [Bun compatibility](testing/bun-compatibility.md)), vlt `vlt-lock.json` lockfileVersion 0/1 (patched package directories for direct dependencies of the root or a workspace member; transitive targets refused — see [vlt notes](#npm-vlt-notes)). Rush monorepos refused (`vendor_rush_unsupported`) — see [Rush notes](#npm-rush-monorepos) | ✅ package-lock / npm-shrinkwrap, pnpm-lock.yaml and legacy shrinkwrap.yaml (pnpm majors 1–12; block and flow resolutions), yarn classic, yarn berry, bun, vlt (`vlt-lock.json` without `lockfileVersion`, 0 or 1) — pnpm, berry, bun and vlt carry constraints, see [npm hosted-mode notes](#npm-hosted-mode-notes) and [vlt notes](#npm-vlt-notes) |
+| npm (`npm`) — pnpm / yarn / berry / bun / vlt | ✅ any install layout, vlt's `node_modules/.vlt` store included (every store copy, copy-on-write) | ✅ seven lockfile flavors: package-lock, yarn classic, yarn berry (node-modules linker; PnP refused), pnpm v9, pnpm legacy v5.4/v6.0 (`pnpm 7/8` — frozen installs are path-bound because those majors absolutize `file:` override specifiers; moved checkouts run one `pnpm install --offline --no-frozen-lockfile`, surfaced as `vendor_pnpm_legacy_absolute_specifier`), bun text `bun.lock` lockfileVersion 0/1/2/3 and native binary `bun.lockb` revisions 1/2/3 (binary locks stay binary; text workspace vendoring requires lockfileVersion 2 — see [Bun compatibility](testing/bun-compatibility.md)), vlt `vlt-lock.json` lockfileVersion 0/1 (patched package directories for direct dependencies of the root or a workspace member; transitive targets refused — see [vlt notes](#npm-vlt-notes)). Rush monorepos on pnpm 9 and newer are wired through `pnpm-config.json` and each directly-depending project's `package.json` — see [Rush notes](#npm-rush-monorepos) | ✅ package-lock / npm-shrinkwrap, pnpm-lock.yaml and legacy shrinkwrap.yaml (pnpm majors 1–12; block and flow resolutions), yarn classic, yarn berry, bun, vlt (`vlt-lock.json` without `lockfileVersion`, 0 or 1) — pnpm, berry, bun and vlt carry constraints, see [npm hosted-mode notes](#npm-hosted-mode-notes) and [vlt notes](#npm-vlt-notes) |
 | PyPI (`pypi`) — uv / poetry / pdm / pipenv / pip | ✅ in place | ✅ uv project/script locks, PEP 751 `pylock.toml` / `pylock.<name>.toml`, poetry, pdm, pipenv (Pipenv 2018 or later — every `Pipfile.lock` category is rewired, lock-only checkouts included; Pipenv 2023+ does not hash-check local wheels — `vendor_integrity_unverified`; Pipenv 2023.7.9+ exports the vendored wheel without a hash, so `pipenv requirements --hash` output fails pip's hash-checking mode — `pypi_pipenv_hash_export_unsupported`; a venv still holding the upstream release is reported as `pypi_pipenv_stale_install`; see [Pipenv compatibility](testing/pipenv-compatibility.md)), and requirements.txt. Native uv vendoring requires uv ≥ 0.2.35 (the `[[package]]` lock grammar); hosted mode covers native `uv.lock` from uv 0.1.45 (the first release whose `uv lock` writes one) and requirements from uv 0.0.5; see [uv compatibility](testing/uv-compatibility.md). | ✅ requirements.txt including hash continuations, uv project/script locks, and PEP 751 locks. Version/source ambiguity is refused; see [uv compatibility](testing/uv-compatibility.md). Poetry 1.x and 2.x locks are supported; Poetry 0.x ignores URL sources and is refused. See [Poetry compatibility](testing/poetry-compatibility.md). Pipenv `Pipfile.lock` (pipfile-spec 6 — Pipenv 7 and later; `path` references for 7–11, `file` from 2018; lock-only checkouts and Pipenv's out-of-tree venv are discovered; a warm venv that Pipenv will not reinstall over warns `redirect_pypi_stale_install`; see [Pipenv compatibility](testing/pipenv-compatibility.md)). `pdm.lock` is supported for the lock formats PDM 0.12–1.4 and 2.8.1+ write (`lock_version` 2 / 4.3–4.5.1); the identity-losing 3.1 / 4.0–4.2 formats (PDM 1.8–2.7) are refused. PDM 2.8.0 writes an indistinguishable `4.3` lock but shares that identity-loss bug, so a rewritten 2.8.0 lock crashes `pdm sync` — upgrade to ≥ 2.8.1. See [PDM compatibility](testing/pdm-compatibility.md). |
 | Cargo (`cargo`) | ✅ in-place + `.cargo-checksum.json` rewrite (shared registry-cache caveat — see [Cargo: shared registry cache](#cargo-shared-registry-cache)) | ✅ `[patch.crates-io]` path entry in the root `Cargo.toml` (v5; per-version Socket keys; pre-v5 `.cargo/config*` wiring migrates on re-run) | ✅ per-patch sparse registry (`[registries.socket-patch-<uuid>]` + Cargo.lock source/checksum); needs cargo 1.68+ (sparse registries) — a project whose `rust-version` or `rust-toolchain[.toml]` declares an older cargo is refused (`redirect_cargo_old_cargo`), use `--mode vendored`; direct dependencies only — a crate another dependency also pulls in is refused, use `--mode vendored`; a crate the user overrides with `[patch]` (path, git or another registry) is refused too, the override is left alone; a `cargo vendor` or `cargo local-registry` project (crates.io replaced by an on-disk source in the project's, a parent directory's or `$CARGO_HOME`'s `.cargo/config*`) is refused, use agent mode; with no `Cargo.lock` the graph is unknown, so only a project whose sole dependency is the patched crate is redirected |
 | RubyGems (`gem`) | ✅ in place | ✅ Gemfile + Gemfile.lock path pair (a CRLF `Gemfile.lock`, as a `core.autocrlf` checkout leaves it, is edited and reverted in its own line ending, and a lock mixing CRLF and LF fails closed; `Gemfile` spelling only — a `gems.rb` twin, which bundler ≥ 2 loads instead, or a `BUNDLE_GEMFILE`-configured manifest makes vendoring refuse with `gemfile_not_loaded` before any write) | ✅ a `source:` option on the gem's own declaration, the lock converged to match (see [Ruby gems: hosted mode](#ruby-gems-hosted-mode)) — edits `gems.rb` + `gems.locked` or `Gemfile` + `Gemfile.lock`, whichever the project holds (a `Gemfile` + `gems.rb` twin is refused with `redirect_gem_twin_manifest_ambiguous`: bundler 1.x loads the `Gemfile`, bundler ≥ 2 loads `gems.rb`, and nothing in the project says which bundler installs it; bundler 4's `BUNDLE_LOCKFILE` (environment, app config or global config) naming any other lock is refused with `redirect_gem_bundle_lockfile_unsupported`, as is vendoring with `gemfile_not_loaded`; spellings that diverge beyond Socket's own edits fail closed with `redirect_gem_gemfile_spellings_diverge`; `BUNDLE_GEMFILE` from `.bundle/config` (which outranks the environment, as in bundler), the environment, or the global `~/.bundle/config` / `$BUNDLE_USER_CONFIG` (lowest, as in bundler) is followed when it names the project's `Gemfile` / `gems.rb`, and any other configured manifest is refused with `redirect_gem_bundle_gemfile_unsupported`); a Bundler all-source, exact-source or hostname mirror in app config or the scan environment can capture the patch registry, so the redirect is refused with `redirect_gem_mirror_overrides_source` without printing mirror URLs (scope mirrors to `mirror.https://rubygems.org`; user-global config and mirrors set only in a later install environment are not inspected); the `CHECKSUMS` pin needs bundler ≥ 2.6 (an older lock is still pinned by source and installs frozen; the run says once, with `redirect_gem_no_checksums_section`, that it cannot record the checksums); a stale pre-redirect materialization that `bundle install` would reuse instead of refetching is replaced with the verified patched gem when it is the project's own, else flagged `redirect_gem_stale_install` with the remedy (see "Ruby gems: gems already installed" below and CLI_CONTRACT.md's "Gem stale-install guard") |
@@ -679,9 +679,80 @@ live at `common/config/rush/pnpm-lock.yaml` (plus one per subspace under
 - **Hosted** ✅ — `scan --mode hosted` discovers and repoints those locks in place
   (subspaces included). On pnpm >=11 the install needs extra Rush settings (below).
 - **Agent** ✅ — works through the generated project symlink farm.
-- **Vendored** ❌ — refused (`vendor_rush_unsupported`): `rush install` copies the lock
-  into `common/temp` and runs pnpm there, so vendor's relative `file:` specs can't
-  survive the copy — the refusal routes you to hosted mode.
+- **Vendored** ✅ — on lockfileVersion 9.0 (pnpm 9 and newer) with pnpm workspaces
+  (`useWorkspaces: true`), subspaces included. Run it from the folder that holds
+  `rush.json`. It edits project `package.json` files for direct dependencies (below).
+
+### Vendored mode in a Rush repo
+
+`rush install` copies each lock into `common/temp` (a subspace's into
+`common/temp/<name>`) and runs pnpm there, so the lock spells the vendored tarball
+relative to that folder (`file:../../.socket/vendor/npm/<uuid>/…`). Vendoring commits the
+tarball and edits three kinds of file:
+
+- **The Rush lock(s) that install the package.** The entry is rekeyed to the tarball, the
+  same fragments as in a plain pnpm project.
+- **`pnpm-config.json`** (the subspace's own, else `common/config/rush/`). Each package
+  that depends on the patched one gets a `globalOverrides` entry,
+  `"<parent>@<version>><name>@<version>"`. Rush hands these to pnpm, so the patch survives
+  `rush update` and `rush update --full`. Every lock that reads the same config gets the
+  entry in its `overrides:` too, as Rush itself writes it.
+- **The `package.json` of every project that lists the package itself.** Its spec becomes
+  `file:<path to the tarball from that project>`.
+
+That last edit is specific to Rush. `rush install` compares each project's `package.json`
+with the lockfile and fails when they differ, so a direct dependency cannot be redirected by
+an override alone, the way it is in a plain pnpm project. The run names the files it edited
+(`vendor_rush_package_json_edited`), and `vendor --revert` puts the registry versions back.
+Things to know:
+
+- **Published projects.** A project the repo publishes (`shouldPublish` or a version policy
+  in `rush.json`) would publish the `file:` spec, which its consumers cannot install. The
+  warning names such projects: depend on a fixed release there.
+- **`ensureConsistentVersions`.** A `file:` spec is relative to each project's folder, so
+  projects at different folder depths get different spellings, which that policy rejects.
+  Vendoring refuses this case (`vendor_rush_inconsistent_versions`) and writes nothing. List
+  the specs it names under `allowedAlternativeVersions` in `common-versions.json` and run it
+  again. A `preferredVersions` entry for the package counts as one more spec.
+- **Peer dependencies.** A project that lists the package under `peerDependencies` gets it
+  installed by pnpm and locked under `dependencies`, with or without a `devDependencies`
+  spec beside it. The project has no spec vendoring can move, so the package is refused
+  (`vendor_rush_project_manifest`). Hosted mode covers it.
+- **Subspaces that share a `pnpm-config.json`.** The overrides go to every lock that reads
+  the config. When another of those locks resolves the package to a different release for
+  the same dependent, pnpm would move it to the vendored release the next time it resolves,
+  so vendoring refuses (`vendor_rush_unsupported`). Give one subspace its own
+  `pnpm-config.json`.
+- **`extends` in `pnpm-config.json`.** Rush replaces an inherited `globalOverrides` table
+  with the one the extending file declares. Vendoring writes only into a table the file
+  already has, and refuses otherwise (`vendor_rush_unsupported`): add the table, holding the
+  entries the file inherits.
+- **New dependents.** A project or package that starts depending on the patched version
+  later installs the registry copy until `socket-patch scan --mode vendored` runs again.
+  Installs keep working in the meantime, and `vex` and `vendor --check` report the
+  unpatched copy.
+
+- **Build scripts.** A decision in `pnpm-config.json` that lets the package run (or
+  forbids) its install scripts by name (`globalOnlyBuiltDependencies`,
+  `globalNeverBuiltDependencies`, `globalAllowBuilds`) stops matching once the package
+  installs from the tarball. Vendoring does not carry it over; the
+  `vendor_pnpm_build_approval_lost` warning names the id to add.
+
+With `preventManualShrinkwrapChanges` on, run `rush update` once after vendoring. It refreshes
+the lock hash in `repo-state.json` and changes nothing else (`vendor_rush_repo_state_stale`).
+The same holds for a repo with injected workspace dependencies when a project behind one of
+them got its spec edited: Rush hashes those `package.json` files in `repo-state.json` too.
+
+`vendor --revert` refuses (`vendor_lock_still_wired_revert_blocked`) while a Rush lock the vendoring never wrote,
+such as a subspace added since, still installs the tarball.
+
+Not wired, and refused before anything is written: a Rush repo that installs with npm or
+yarn, one with no pnpm lock yet, installs without pnpm workspaces (`vendor_rush_unsupported`),
+and pnpm 8 or older locks (`vendor_lockfile_version_unsupported`). Hosted mode covers those.
+Each wired shape is what Rush 5.182.1 itself writes, byte for byte, on pnpm 9.15.9, 10.34.9,
+11.28.12 and 12.21.0.
+
+### Hosted mode in a Rush repo
 
 Editing a Rush lock outside `rush update` desyncs the `pnpmShrinkwrapHash` in
 `common/config/rush/repo-state.json` (with subspaces enabled, in the
@@ -893,9 +964,9 @@ Honest limits of the Maven and NuGet flows — documented behavior, not bugs:
   so a resolver that can't reach the Socket repo, or is handed different bytes, has
   nowhere to fall through to: the build **hard-fails** instead of silently resolving the
   unpatched upstream artifact. The `<repository>`'s `checksumPolicy=fail` still verifies
-  the transport-level `.jar.sha1` sidecar on top. A `${property}` version is refused
-  (`redirect_maven_dep_unpinned`) — a literal edit would break the property reference and
-  a depMgmt pin could strand sibling artifacts sharing the property. A literal version
+  the transport-level `.jar.sha1` sidecar on top. A `${property}` version is patched
+  without stranding an artifact that shares the property (see **Property versions**
+  below). A literal version
   that matches neither the base nor the suffixed value is skipped
   (`redirect_maven_dep_version_mismatch`). A `<base>-socket.<hex8>` literal left by an
   earlier hosted patch for the same release (the pom declares that patch's
@@ -952,13 +1023,59 @@ Honest limits of the Maven and NuGet flows — documented behavior, not bugs:
   to patch and is left out of an agent scan. Maven 4 builds, profiles that declare
   dependencies or management, relocations and dependency cycles are not modelled: the
   artifacts they touch count as not readable.
-* **Multi-module reactors are vendored-only (hosted Maven).** Hosted mode reads only
-  the root `pom.xml`, and a module's own literal `<version>` always beats a root
-  `<dependencyManagement>` pin, so a root pin would leave that module on the unpatched
-  upstream jar. A root that declares `<modules>` or `<subprojects>` (directly or in a
-  profile) is therefore refused with `redirect_maven_multimodule_unsupported` (`pom.xml` and
-  `.mvn/` are left untouched and the dep is not counted as redirected); use `scan --mode vendored`, whose reactor planner rewrites each module's
-  declaration. `vex` likewise does not attest a hosted pin found in a reactor root.
+* **Multi-module reactors (hosted Maven).** A root that declares `<modules>` or
+  `<subprojects>` (directly or in a profile, or a Maven 4 root whose subprojects Maven
+  discovers) is patched module by module, with pom edits only, by the planner vendored
+  mode uses. A declaration that names the patched version is rewritten where it stands,
+  in whichever pom holds it. The `<dependencyManagement>` pin goes in the highest pom
+  whose modules all resolve the artifact at that version or not at all: the root when
+  the whole reactor agrees, else the modules that do, down to one module's own
+  `pom.xml`. A module that resolves another version is never reached and resolves what
+  it resolved before. Such a pin carries the comment vendored pins carry
+  (`<!-- socket-patch <uuid>: g:a:v -->`), which is how a later run tells it from the
+  project's own management. The `<repository>` goes in the local root every wired pom
+  inherits (a module whose parent is not in the checkout gets its own), and the Trusted
+  Checksums stay in the project root's `.mvn/`, which Maven also reads when it is
+  started in a module directory or with `-f`; a module with a `.mvn` of its own is
+  reported (`redirect_maven_trusted_checksums_unenforced`), since a Maven started there
+  reads that one. A reactor one of whose poms cannot be read is left untouched
+  (`redirect_maven_multimodule_unsupported`, with the reason). A pom that is there but is
+  not UTF-8 text (re-saved as Latin-1 or UTF-16, say) is never taken for a missing one:
+  the scan refuses the run and names it (`candidate_file_unreadable`), `vex` reports it
+  as unreadable and attests no pin of that reactor, and `rollback` / `remove` change
+  nothing until it is UTF-8 again, since it may hold part of a pin. The plan for a patch is
+  written whole or not at all: a pom is never left naming a patched version without the
+  repository that serves it, its checksum lines, and wiring a rollback can find. So a
+  declaration only a `<profile>` holds is not rewritten on its own
+  (`redirect_maven_profile_dependency_unpatched`), and neither is anything when the pom
+  that must take the repository cannot (`redirect_maven_pom_unreadable`), or when a
+  rollback could not put a pom back exactly (`redirect_maven_edit_not_reversible`). When
+  a later scan takes out the last pin of a patch (the module it reached moved to another
+  version), the repository and the checksum lines go with it. `vex` attests the patch
+  only when every module that resolves the patched version, or may, is reached by a pin
+  or a declaration; otherwise it withholds the statement and names the module
+  (`vex_maven_reactor_root`). `rollback` and `remove` undo the wiring in every pom that
+  carries part of it, or in none, and restore each byte for byte.
+* **Property versions (hosted Maven).** A declaration whose `<version>` is a
+  `${property}` is patched in one of two ways, and neither moves another artifact. When
+  the reactor's own poms define the property once and nothing but declarations of the
+  patched artifact reads it, the property's value takes the patched version and the
+  declarations keep their text. Otherwise (a sibling artifact reads it too, a profile or
+  `.mvn/maven.config` may redefine it, or a parent pom outside the checkout defines it)
+  the one declaration takes the literal patched version, and the text it replaced is
+  recorded in a comment right after it:
+  `<version>1.2-socket.0a1b2c3d</version><!-- socket-patch:version ${lib.version} -->`.
+  Rollback reads that comment back, so the declaration returns to its `${...}` text
+  exactly. Such a declaration no longer follows the property: bump the property and the
+  patched artifact stays where it is until the next `scan`. A property no pom of the
+  checkout defines is read from what Maven selects for the modules that read the
+  declaration; when that cannot be told (the parent pom is not in the local Maven
+  repository yet) the declaration is left as it is (`redirect_maven_dep_unpinned`).
+  A version-less declaration a parent or BOM manages needs no edit of its own: the
+  `<dependencyManagement>` pin overrides the management. A single pom that inherits
+  from a parent pom inside the checkout is read together with it: a property that parent
+  defines is rewritten there, and the repository goes in the parent the pom inherits it
+  from; `list`, `vex`, `rollback` and `remove` read both poms.
 * **A parent pom can override a managed pin (hosted Maven).** For a dependency with no
   literal `<version>` in the root pom (a transitive one, or one whose version a parent
   manages), hosted mode pins it in the root pom's `<dependencyManagement>`
@@ -985,14 +1102,67 @@ Honest limits of the Maven and NuGet flows — documented behavior, not bugs:
   Older releases leave the `.mvn/*` files inert, and only the transport `.sha1` check
   guards the Socket-served bytes. The version suffixing above still fails closed on its
   own.
-  - **3.9.0 / 3.9.1** do not interpolate the `${session.rootDirectory}` basedir the config
-    uses, so the summary file is never found.
+  - **3.9.0 / 3.9.1** do not interpolate the basedir the config uses, so the summary
+    file is never found.
   - **3.9.2 / 3.9.3** ignore `checksumAlgorithms=SHA-256` and check SHA-1 only.
   - **Below 3.9** there is no Trusted Checksums post-processor.
+  - **Maven 4** enforces the pin only in a project that declares Maven 4 (below).
 
-  When `.mvn/wrapper/maven-wrapper.properties` pins a Maven older than 3.9.4, the rewriter
-  still writes the files and warns `redirect_maven_trusted_checksums_unenforced`. Without
-  a Maven Wrapper, the CLI can't tell which Maven builds the project, so it doesn't warn.
+  **How the directory is named.** Maven reads a relative `basedir` from the local
+  repository, so the config names `.mvn/checksums` through a property, and no property
+  is right on every Maven:
+  - `${maven.multiModuleProjectDirectory}/.mvn/checksums` is what hosted mode writes by
+    default. Every Maven 3 launcher defines it wherever the build is started (the
+    project root, a module directory, `mvn -f <project>/pom.xml` from another
+    directory), so the line breaks no build and the pin is enforced from 3.9.4 on.
+    Maven 4 does not interpolate it: a Maven 4 build of such a project runs as if the
+    pin were not there.
+  - `${session.rootDirectory}/.mvn/checksums` is written for a project that declares
+    Maven 4: its Maven Wrapper pins Apache Maven 4, or its root `pom.xml` is of a model
+    newer than 4.0.0 (its `<modelVersion>`, or with none, the version its namespace
+    names; `<modelVersion>4.0.0</modelVersion>` under the 4.1.0 namespace is a 4.0.0 pom,
+    which Maven 3 builds). Maven 4 defines the property in every invocation. Releases up
+    to 5.1.0 wrote this form for every project, which stopped **Maven 3.9.2 to 3.9.8**
+    from starting at all with `-f` from outside the project (`Illegal use of undefined
+    property: session.rootDirectory`).
+
+  If Maven 4 builds your project and nothing in the checkout says so, declare it: with
+  the default form a Maven 4 build does not enforce the pin, and the CLI cannot see
+  which Maven you run.
+
+  **A project wired by an earlier release is healed.** Every `scan --mode hosted` that
+  finds the six settings standing together as hosted mode wrote them, in the spelling
+  that is not this project's, rewrites that one line in place (`redirect_maven_config`,
+  `rewritten`, `key: "trustedChecksumsDirectory"`). It does so whatever the scan
+  redirects: when no patch applies any more (a dependency bumped past its patched
+  version), in a reactor root, when no checksum line is left, when a later line switches
+  the pin off. A scan with nothing to redirect reads `.mvn/maven.config` for this alone
+  and takes the write lock for the change when it can. The heal never fails a run: when
+  the lock is held elsewhere, or `.mvn/maven.config` is a symbolic link, the line is
+  left for a later scan. `rollback` and `remove` do the same to a config they leave in
+  place. A directory line you wrote yourself (one
+  that stands apart from the other five) is yours and is left alone, as is any other
+  setting; `rollback` and `remove` recognise either form.
+
+  The heal can trade something away, and says so. Taking `${session.rootDirectory}` out
+  of a project that declares no Maven means a Maven 4 build of it no longer enforces the
+  pin (Maven 3.9.4 and later 3.x still do). The run that changes the line warns
+  `redirect_maven_trusted_checksums_maven3_only` (`maven_trusted_checksums_maven3_only`
+  from `rollback` / `remove`). Declare Maven 4 and scan again to get the form Maven 4
+  reads back.
+
+  When the Maven the project declares does not enforce the pin as the config stands, the
+  rewriter still writes the files and warns `redirect_maven_trusted_checksums_unenforced`,
+  on every scan while that holds:
+  - `.mvn/wrapper/maven-wrapper.properties` pins a Maven older than 3.9.4 (upgrade the
+    wrapper);
+  - the project declares Maven 4 and the directory line is one you wrote in the
+    launcher's spelling, which Maven 4 does not read (set it to
+    `${session.rootDirectory}/.mvn/checksums`). The scan that first meets that line also
+    reports it as `redirect_maven_trusted_checksums_conflict`.
+
+  Without a Maven Wrapper or a newer model, the CLI can't tell which Maven builds the
+  project, so it doesn't warn.
   On Maven **3.9.4–3.9.8** a *mismatch* is enforced but reported unclearly; the
   readability fix landed in **3.9.9**
   ([MNG-8182](https://issues.apache.org/jira/browse/MNG-8182)). The args are
@@ -1000,10 +1170,16 @@ Honest limits of the Maven and NuGet flows — documented behavior, not bugs:
   from any repository and a dependency with no committed checksum still resolves — only a
   *mismatch* fails. A grant whose sha256 is not 64 hex digits writes no checksum line
   (and drops any line an earlier run wrote for that suffixed version) and warns
-  `redirect_maven_trusted_checksums_invalid_hash`. `vex` attests a pin's checksum only
-  when `maven.config` enforces the file as Maven 3.9+ reads it (all five settings above
-  with the values hosted writes; `failIfMissing` aside) and the wrapper, if any, pins
-  Maven 3.9.4 or later.
+  `redirect_maven_trusted_checksums_invalid_hash`. `vex` takes a pin's checksum as the
+  content the project pins only when the pin is known to be enforced: `maven.config`
+  enforces the file as Maven 3.9+ reads it (all five settings above with the values
+  hosted writes, the directory in either form; `failIfMissing` aside), and the Maven the
+  project declares reads the directory as the config spells it (a wrapper that pins
+  Maven 3.9.4 or later, and below Maven 4 for the default form; Maven 4, by the wrapper
+  or the model, for the `${session.rootDirectory}` form). A project that declares no
+  Maven and carries the default form is enforced by Maven 3 only, so its checksum is not
+  taken; the statement itself does not depend on it, since the suffixed version is the
+  pin.
 * **A Maven project's scan is scoped to its dependency graph.** The Maven local
   repository is shared by every project on the machine, so in project mode (no
   `--global` / `--global-prefix`) a Maven build's crawl (a `pom.xml`, no Gradle or
@@ -1048,14 +1224,50 @@ Honest limits of the Maven and NuGet flows — documented behavior, not bugs:
   applied. To clear them, add a Maven Wrapper pinned to Maven 3.9.9 or later, or make
   sure your `settings.xml` mirrors exclude `socket-patch-vendor` (for example
   `<mirrorOf>external:*</mirrorOf>` or `<mirrorOf>*,!socket-patch-vendor</mirrorOf>`).
-* **`mirrorOf` mirrors (hosted Maven).** A `settings.xml` `<mirror>` with
-  `<mirrorOf>*</mirrorOf>` (common in corporate environments) reroutes *all* repositories
-  — including the injected `socket-patch-<uuid>` repository — through the mirror. Because
-  the patch resolves only at the suffixed version, the mirror (which does not carry it)
-  can't serve it and the **build fails loudly** rather than silently going unpatched.
-  Scope the mirror to exclude the Socket repos (e.g.
-  `<mirrorOf>*,!socket-patch-*</mirrorOf>`) so the redirect resolves; the
-  `originAware=false` Trusted Checksums act as a backstop when present.
+* **`mirrorOf` mirrors (hosted Maven).** A `settings.xml` `<mirror>` whose
+  `<mirrorOf>` is `*` or `external:*` (common in corporate environments) sends *every*
+  repository to the mirror, the `socket-patch-<uuid>` repository hosted mode adds
+  included. The patch resolves only at its suffixed version, which the mirror does not
+  hold, so a project wired behind such a mirror **fails to build**. `scan --mode hosted`
+  therefore reads the Maven settings of the machine it runs on before it writes a Maven
+  pin, and wires nothing for a patch whose repository a mirror would take over: the
+  poms and `.mvn/` stay as they are, the scan exits 0, and
+  `redirect_maven_mirror_captures_repository` names the mirror, the settings file that
+  declares it, and the two ways forward:
+  - **Leave the repository out of the mirror.** Add `!socket-patch-<uuid>` to its
+    `<mirrorOf>` (`<mirrorOf>*,!socket-patch-<uuid></mirrorOf>`), with no space around
+    it, on every machine that builds, then scan again. Maven compares whole repository
+    ids: there is no pattern for "every Socket repository" (`!socket-patch-*` excludes
+    nothing), and each patch has its own id, so each new patch needs its own exclusion.
+  - **Use vendored mode, on Maven 3.9.2 or later.** `scan --mode vendored` commits the
+    patched artifact and reads it through `maven.repo.local.tail`, which no mirror
+    redirects. Maven reads that setting from 3.9.2 on. An older Maven reads a vendored
+    patch through the `socket-patch-vendor` file repository, which a mirror of everything
+    takes as well, so there vendored mode needs the mirror to leave `socket-patch-vendor`
+    out (one id for every vendored patch). The warning says which applies: when the
+    project's Maven Wrapper pins a Maven older than 3.9.2 it does not offer vendored mode
+    as the project stands.
+
+  What is read: the user settings (`-s` / `--settings` in `MAVEN_ARGS`, then in
+  `.mvn/maven.config`, else `~/.m2/settings.xml`) merged over the global settings (`-gs`
+  / `--global-settings` likewise, else `conf/settings.xml` of the Maven Wrapper's
+  unpacked distribution, of the `mvn` on `PATH`, or, with none there, of `$MAVEN_HOME`
+  / `$M2_HOME`), and a `.mvn/settings.xml` the project keeps. `.mvn/maven.config` is
+  read as the project's Maven reads it: one argument per line from Maven 3.9 on (so a
+  settings path may hold spaces), split on whitespace before; the Maven Wrapper's
+  release decides, and without a wrapper both readings are weighed. The matching is
+  Maven's own: a mirror whose `<mirrorOf>` names the repository's id, alone or in a list
+  (`central,socket-patch-<uuid>`), was written for that repository and is not a reason
+  to skip; a mirror with no `<id>` counts under Maven's default id; `external:http:*` (the blocker Maven ships) never matches the
+  HTTPS Socket repository; `<mirrorOfLayouts>` is honoured. **Only the scanning
+  machine's settings are known.** A build machine with another `settings.xml` (a CI
+  image, a colleague's laptop) is not seen: a project wired here still fails there
+  behind a mirror that takes every repository, and a project skipped here may have built
+  there. The in-memory engine (a Socket-opened pull request) reads no settings at all.
+  A project an earlier scan wired is left as it is and reported the same way, and is no
+  longer counted as redirected or attested by that scan's `--vex`. The skip is only for
+  a patch that would get the repository: one the scan would not wire anyway (the build
+  selects another version) is reported under its own reason.
 * **Gradle (hosted Maven).** Gradle builds get automated wiring, not a pasted snippet:
   an owned settings script pins the suffixed version, every lock file is rewritten,
   and a tripwire fails the build if the base version still resolves. See
@@ -2255,12 +2467,39 @@ wire is skipped, neither file changes for it, and the warning says why and what 
 | `redirect_gem_unrecognized_declaration` | its declaration cannot be edited in place: a heredoc or a `do` block among its arguments, other code before it on its line, a last argument that may be an options hash (`gem "rack", OPTS`). Write it as one `gem "<name>", …` call with literal arguments on a line of its own. |
 | `redirect_gem_source_option` | the declaration already selects a source (`source:`, `git:`, `github:`, `path:`, a `**opts` splat that may hold one), sits inside a `source` / `git` / `github` / `path` block, or the lock resolves the gem from a `GIT` / `PATH` section. Bundler allows one source per gem. |
 | `redirect_gem_declared_more_than_once` | the Gemfile declares it more than once. Merge the declarations into one. |
-| `redirect_gem_declaration_not_visible` | the lock lists it as a direct dependency, but it is declared where the scan cannot edit: an `eval_gemfile`d file, a loop, a gemspec. |
+| `redirect_gem_declaration_not_visible` | the lock lists it as a direct dependency, but it is declared where the scan cannot edit: an `eval_gemfile`d file, a loop, a gemspec. Declare it with a literal `gem "<name>"` line in the Gemfile, in place of any other `gem` call that declares it (a gemspec's development dependency stays), or patch it with `--mode agent`. Vendored mode refuses it for the same reason. |
 | `redirect_gem_dependency_not_locked` | the Gemfile declares it and the lock's `DEPENDENCIES` does not list it. Run `bundle lock` and re-run. |
 | `redirect_gem_lock_unconvergeable` | the lock cannot be brought in line with the Gemfile: it has no `BUNDLED WITH` section to say which layout its Bundler accepts, or a Bundler < 2.2 lock lists its sources in an order the Gemfile's `source` lines do not explain. Run `bundle lock` with your current Bundler and re-run. |
-| `redirect_gem_platform_unsupported` | the lock holds a platform-specific build of the gem (`nokogiri (1.16.0-x86_64-linux)`); the patch registry serves the `ruby` platform gem only. |
+| `redirect_gem_platform_unsupported` | the lock holds a platform-specific build of the gem (`nokogiri (1.18.10-x86_64-linux-gnu)`) that the patch has no patched build for. The warning names the builds the lock holds, the ones that are missing, and what the patch registry serves. See "Precompiled platform gems" below. |
 
-`--mode vendored` or `--mode agent` can still patch a gem hosted mode skips.
+`--mode agent` can still patch a gem hosted mode skips. `--mode vendored` can too, unless it
+refuses the gem itself (see "Ruby gems: gems vendored mode refuses").
+
+**Precompiled platform gems.** Bundler installs a gem such as nokogiri as a precompiled platform
+gem, and the lock then has one entry per platform the project supports, usually with no plain
+`nokogiri (1.18.10)`:
+
+```text
+    nokogiri (1.18.10-arm64-darwin)
+      racc (~> 1.4)
+    nokogiri (1.18.10-x86_64-linux-gnu)
+      racc (~> 1.4)
+```
+
+For such a gem the patch registry serves a patched platform gem (a "prebuild") per platform: the
+upstream platform gem with the patch's files replaced, under the same file name. When the patch
+has a prebuild for every platform the lock names, the scan wires the gem like any other. The
+Gemfile edit is the same, every platform entry moves to the patch registry's `GEM` section with
+its dependency lines (and a plain `nokogiri (1.18.10)` entry beside them moves too),
+`DEPENDENCIES` gains the `!`, and each `CHECKSUMS` entry takes the sha256 of its own prebuild.
+`bundle install` then fetches the one patched platform gem of the machine it runs on and
+compiles nothing, in frozen and deployment mode too.
+
+When the patch has no prebuild for one of the locked platforms, the gem is skipped with
+`redirect_gem_platform_unsupported` and neither file changes: a machine of that platform would
+otherwise be sent to a registry that has no gem for it. Remove the platform from the lock if the
+project does not need it (`bundle lock --remove-platform <platform>`) and re-run, or wait for the
+prebuild.
 
 **Undoing it.** `rollback` and `remove` take the option (or the added line) off again and
 restore the lock: the pair is the pre-scan pair byte for byte, with LF or CRLF line endings.
@@ -2316,6 +2555,11 @@ with a native extension is installed into a staging directory by RubyGems, with 
 owns the installed copy, and swapped in once it has compiled; with no such Ruby, or with
 `--no-gem-native-rebuild`, it is left alone. After the scan `bundle exec` runs the patched code,
 and every kind of reinstall keeps it. `rollback` and `remove` do the same with the upstream gem.
+That holds in a gem home with no `cache/` directory too (Bundler 4.1's `prune` setting, an image
+that deletes it, `gem cleanup`): with no archive to compare, the installed files are checked
+against the patch itself, in both directions. If the patch can't be looked up during a `rollback`
+or `remove`, the copy is left alone and the run warns (`upstream_gem_stale_install`), naming the
+files to remove before `bundle install`.
 Vendoring a gem that was hosted (`vendor`, `scan --mode vendored`) leaves the installed copies as
 they are: Bundler loads the vendored copy from then on. When that vendored gem is later unwound
 (`rollback`, `remove`, `vendor --revert`), Bundler loads the installed copy again, so the unwind
@@ -2350,11 +2594,41 @@ the shared gem home. Another project that pins the upstream build of the same ge
 loads the patched code too, and its `bundle pristine` fails on the checksum until it is patched
 as well.
 
+`rollback` and `remove` take `--gem-refresh-shared` as well, on the run that removes the patch:
+it then puts the upstream gem back in the shared gem home. Without it the run warns that the
+shared copy still holds the patched build. Running the command again doesn't help, because the
+patch is already removed and there is nothing left to roll back. The warning names what to run
+instead: the `bundle config` line above, or an `rm -f` of the gem's `specifications/` entry and
+its `cache/` archive followed by `bundle install`, which fetches the upstream gem into the shared
+gem home. Another project that still pins the patched build of that gem version then loads the
+upstream code; a `socket-patch scan` there reports it, and `--gem-refresh-shared` on that scan
+puts the patched build back.
+
 A shared gem home also holds gem versions this project doesn't use: the gems Ruby ships (`rake`,
 `rexml`, ...) and the versions other projects installed. Hosted and vendored mode patch what
 `Gemfile.lock` resolves, so a version the lock doesn't list is skipped, never a failure: hosted
 mode warns `redirect_gem_version_not_locked`, vendored mode reports a `skipped` event with
 `vendor_gem_version_not_locked` and doesn't download its patch. The run exits 0.
+
+## Ruby gems: gems vendored mode refuses
+
+Vendored mode rewrites one top-level `gem` line to a `path:` source, and Bundler builds nothing
+for a path-sourced gem. It refuses a gem that doesn't fit and changes nothing for it; the other
+gems of the run are still vendored, and the run exits 1. These four refusals name another mode
+that can patch the gem:
+
+| Code | The gem | What the error offers |
+|---|---|---|
+| `gemfile_declaration_not_editable` ("is indented") | is declared inside a block: `group :test do`, `platforms … do`, a conditional. Every Rails Gemfile declares its development and test gems this way. | Move the declaration to the top level (for a plain `group` block the error spells the option that replaces it, `group: :test`), or patch the gem with `--mode hosted`, which edits a declaration where it is. Inside a `source`, `git`, `github` or `path` block hosted mode refuses the gem too, and the error names `--mode agent`. |
+| `gemfile_declaration_not_editable` ("as a direct dependency") | is a direct dependency the Gemfile declares out of sight: in a gemspec (a gem library's development dependency), an `eval_gemfile`d file, a loop. | Declare it with one literal `gem "<name>"` line in the Gemfile (above `gemspec`, where the Gemfile has that directive), in place of any other `gem` call that declares it, or patch the gem with `--mode agent`. Hosted mode refuses a gem declared in those places too. |
+| `native_extensions_unsupported` | builds a native extension (puma, bootsnap). | `--mode hosted` or `--mode agent`. Both build the extension. Only `--mode agent` when the declaration picks the gem's source (a `source`, `git`, `github` or `path` block or option), which hosted mode refuses. |
+| `platform_gem_unsupported` | is installed as a precompiled platform build (`nokogiri-1.18.3-x86_64-linux-gnu`). | `--mode agent`. Hosted mode refuses a precompiled build too. |
+
+To patch one gem in another mode, name it: `socket-patch get <gem> --mode hosted`. A whole-project
+`scan --mode hosted` leaves vendored gems as they are, but it moves the vendored patches of the
+other ecosystems (npm, PyPI, Cargo, Go, Composer, Gradle) to hosted mode. Once a project holds
+patches of two modes, a `scan` with no `--mode` stops and asks which mode to use, so pass `--mode`
+on later runs.
 
 ## Ruby gems: native extensions
 
@@ -2367,8 +2641,8 @@ How each mode gets the patched code running:
 
 | Mode | What happens |
 |---|---|
-| Hosted | Bundler installs the patched `.gem` from the patch registry, and RubyGems compiles it like any registry gem. A precompiled platform gem (`x86_64-linux`) is refused with `redirect_gem_platform_unsupported`. |
-| Vendored | Refused with `native_extensions_unsupported`: Bundler builds no extensions for path-sourced gems. |
+| Hosted | Bundler installs the patched `.gem` from the patch registry, and RubyGems compiles it like any registry gem. A gem the lock pins as precompiled platform gems (`x86_64-linux-gnu`) is installed from the patched platform gem the registry serves for that platform, with nothing to compile; it is skipped with `redirect_gem_platform_unsupported` only while the patch has no patched build for one of the locked platforms. |
+| Vendored | Refused with `native_extensions_unsupported`: Bundler builds no extensions for path-sourced gems. Use hosted or agent mode for the gem. |
 | Agent (`apply`) | The extension is rebuilt from the gem's source archive with the patch laid over it, using RubyGems' builder and the Ruby that owns the install, and the build is put where Ruby loads it: the extension directory of a gem RubyGems built, the prebuilt binary of a precompiled gem. |
 
 `apply` takes the source gem (`<name>-<version>.gem`) from the gem home's `cache/` directory,
@@ -2398,6 +2672,32 @@ instead of being reported as patched.
 
 Ruby files are never build inputs outside `ext/` and a build script's directory: a patch that only
 changes `.rb` or `.rbs` files needs no compiler, wherever the gem keeps them.
+
+A rebuild is only taken for a build of the patch when it read at least one of the files the
+patch changes and left compiled code. How a gem builds depends on its configuration: nokogiri
+installed with `--use-system-libraries` links the operating system's libxml2 and never opens the
+copy it packs, so a patch that only adds a fix to that packed copy changes nothing there. A gem
+whose build script downloads the binary it runs (passenger's agent) compiles nothing at all.
+`apply` then writes the patch's files, leaves the compiled code as it was installed, and warns
+with `native_extension_not_rebuilt`, instead of reporting a patch that is in no compiled code:
+
+- The patch's Ruby files are in effect, and a source the gem compiles later on its own is the
+  patched one.
+- `apply --check` reports the package as not in sync, and `vex` does not attest the patch.
+- On a system-libraries install the library is the operating system's package, and updating
+  that package is what fixes it.
+
+A patch to the gem's own C sources is rebuilt as usual. On Linux the check asks the kernel which
+files the build opened. Elsewhere it needs a filesystem that records file reads; on one that
+does not (a `noatime` mount, Windows by default) the build is taken as it is.
+
+A build can take many minutes. `apply` prints a line to stderr when one starts and another when
+it ends (not under `--json` or `--silent`).
+
+A gem RubyGems compiled is rebuilt with the build arguments RubyGems recorded when it was
+installed. A precompiled gem is rebuilt with none: arguments Bundler recorded for it (a
+`build.nokogiri --use-system-libraries` setting kept from before nokogiri shipped precompiled
+gems) were never used to build it, and following them would replace the libraries the gem ships.
 
 The build happens in a stage directory inside the gem home (`.socket-patch-build/`), which is
 removed afterwards. A gem the build needs that the install lacks (a precompiled nokogiri has no
@@ -2446,6 +2746,41 @@ stage directory it leaves is removed by the next `apply` or `rollback`. A rebuil
 installed tree leaves the gem with its patched sources and no finished extension until Socket
 Patch runs again: `apply` puts the previous build back and completes the rebuild, and `rollback`
 restores the original sources and build.
+
+## Bazel workspaces: VEX
+
+`vex` and `--vex` read what socket-patch wrote and what the project's own package manager
+installed. They read no `MODULE.bazel`, `WORKSPACE` or BUILD file, so in a Bazel workspace a
+document says what was patched, and that is what Bazel builds only where Bazel builds from
+the files socket-patch rewrote. The two are tested to agree on real Bazel 9.3.2, 8.8.2 and
+7.7.2 for four shapes, all under Bzlmod: Go through gazelle's
+`go_deps.from_file(go_mod = "//:go.mod")` with
+`go_deps.config(check_direct_dependencies = "error")` and the module required directly in
+`go.mod` (hosted, vendored and agent mode), npm through
+aspect_rules_js's `npm.npm_translate_lock(pnpm_lock = "//:pnpm-lock.yaml")` (hosted and
+vendored), PyPI through rules_python's `pip.parse(requirements_lock = "//:requirements.txt")`
+(hosted), and RubyGems through rules_ruby's
+`ruby.bundle_fetch(gemfile_lock = "//:Gemfile.lock")` without `gem_checksums` (hosted). There
+the build prints the patched package, and the document of the run (`--vex`), of `vex` and of
+`vex --no-verify` is one `not_affected` statement that names the package and the patch; the
+first two are the same in a checkout with the same files that Bazel has not built in, and
+after the undo `vex` writes no document. For PyPI on Bazel 8.5 and later a hosted scan leaves
+`MODULE.bazel.lock` stale, so the document is there before a frozen build passes: a build with
+`--lockfile_mode=error` fails until a build that may update the lock has run, and the updated
+lock has to be committed.
+
+In every other Bazel shape nothing checks the document against the build, and in these it was
+measured to be wrong (`not_affected` while Bazel builds the unpatched package, or while the
+build is broken): agent mode beside rules_js, which builds from the lock and never reads the
+patched `node_modules`; Go under a `go_repository` rule of a `WORKSPACE`, in hosted and
+vendored mode; Go under `go_deps` when another Bazel module of the build requires a higher
+version of the patched module, because gazelle then builds that version and drops the
+replacement; a
+`pip.parse` or `pip_parse` that takes the requirements of the build's platform from another
+file than the one socket-patch rewrote; vendored mode for PyPI. Do not publish a document for
+an artifact that Bazel built outside those four shapes. A project that Bazel does not build is
+not concerned: beside a Bazel workspace whose files name none of its locks, `vex` says what it
+says without Bazel.
 
 ## Supported platforms
 
