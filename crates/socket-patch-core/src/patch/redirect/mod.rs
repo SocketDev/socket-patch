@@ -8256,7 +8256,11 @@ fn plan_gem_redirect(
         // Not declared where the rewriter can see it, yet bundler resolved
         // it as a DIRECT dependency: the Gemfile declares it out of sight
         // (`eval_gemfile`, a loop, a gemspec). Adding a line would declare
-        // it twice (#482).
+        // it twice (#482). Vendored mode refuses the gem for the same
+        // reason, so the way out names agent mode alone (#2151). The
+        // literal line replaces a `gem` call out of sight: next to it,
+        // the line's `source:` option gives the gem two sources and
+        // bundler refuses the manifest.
         return Err(refuse(
             "redirect_gem_declaration_not_visible",
             format!(
@@ -8264,7 +8268,8 @@ fn plan_gem_redirect(
                  it somewhere the rewriter cannot edit (an `eval_gemfile`d file, a loop, a \
                  gemspec); adding a second declaration would make bundler refuse the Gemfile — \
                  redirect skipped (declare it with a literal `gem \"{name}\"` line in \
-                 {gemfile_name}, or patch it with `--mode vendored` or `--mode agent`)"
+                 {gemfile_name}, in place of any other `gem` call that declares it, or patch \
+                 it with `--mode agent`)"
             ),
         ));
     } else {
@@ -19212,9 +19217,21 @@ mod tests {
             assert_eq!(warning_codes(&r), vec![code], "{decl}: {:?}", r.warnings);
             let detail = &r.warnings[0].detail;
             assert!(detail.contains(why), "{decl}: {detail}");
+            // #2151: vendored mode refuses a declaration out of sight for
+            // the same reason, so that refusal does not name it.
+            let remedy = match code {
+                "redirect_gem_declaration_not_visible" => "--mode agent",
+                "redirect_gem_dependency_not_locked" => "bundle lock",
+                _ => "--mode vendored",
+            };
             assert!(
-                detail.contains("--mode vendored") || detail.contains("bundle lock"),
+                detail.contains(remedy),
                 "{decl}: the refusal names a remedy: {detail}"
+            );
+            assert_eq!(
+                detail.contains("--mode vendored"),
+                remedy == "--mode vendored",
+                "{decl}: {detail}"
             );
         }
         // An opaque last argument the lock shows to be a version requirement
@@ -20444,6 +20461,8 @@ mod tests {
         for gemfile in [
             "source \"https://rubygems.org\"\neval_gemfile \"Gemfile.common\"\n",
             "source \"https://rubygems.org\"\n%w[rack].each { |g| gem g, \"~> 3.1\" }\n",
+            // A gem only the gemspec declares (a development dependency).
+            "source \"https://rubygems.org\"\n\ngemspec\n",
         ] {
             let mut files = BTreeMap::new();
             files.insert("Gemfile".to_string(), gemfile.to_string());
@@ -20462,6 +20481,17 @@ mod tests {
                 "{gemfile}: {:?}",
                 r.warnings
             );
+            // #2151: every way out the warning names works. Vendored mode
+            // refuses the gem for the same reason, so it is not one.
+            let detail = &r.warnings[0].detail;
+            assert!(
+                detail.contains(
+                    "a literal `gem \"rack\"` line in Gemfile, in place of any other `gem` \
+                     call that declares it"
+                ) && detail.contains("`--mode agent`"),
+                "{gemfile}: {detail}"
+            );
+            assert!(!detail.contains("vendored"), "{gemfile}: {detail}");
         }
         // Control: a genuinely transitive gem (absent from DEPENDENCIES) is
         // still appended.
