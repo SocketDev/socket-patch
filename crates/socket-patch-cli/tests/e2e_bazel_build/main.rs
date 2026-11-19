@@ -73,6 +73,7 @@ mod cargo;
 mod composer;
 mod go;
 mod harness;
+mod maven;
 mod npm;
 mod nuget;
 mod pypi;

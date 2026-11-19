@@ -4441,6 +4441,12 @@ pub(crate) async fn vendor_records_reusing(
         }
     }
 
+    // A hub of a Bazel workspace builds the jar of its own lock, whatever
+    // this run vendored for the Maven or the Gradle build.
+    let vendored = vendorable.iter().map(String::as_str);
+    env.warnings
+        .extend(crate::commands::bazel_maven_notices(common, vendored, true).await);
+
     // A rolled-back eject's summary would describe a vendoring that was
     // undone: the eject prints it itself once it knows the outcome (#1005).
     match eject {

@@ -1,0 +1,5 @@
+# One JDK for everything: the one this era's rules_java runs javac on
+# compiles for itself, runs the tools of the build and runs //:consumer.
+# So a build takes no Java from the machine and downloads one JDK.
+build --java_language_version=25 --java_runtime_version=remotejdk_25
+build --tool_java_language_version=25 --tool_java_runtime_version=remotejdk_25
