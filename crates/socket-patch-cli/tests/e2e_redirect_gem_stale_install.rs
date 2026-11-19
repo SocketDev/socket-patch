@@ -65,6 +65,20 @@ const PATCHED_LIB: &str = "module StaleProbeGem\n  def self.status\n    \"PATCHE
 const UPSTREAM_ARCHIVE: &[u8] = b"upstream-gem-archive-bytes";
 const PATCHED_ARCHIVE: &[u8] = b"patched-gem-archive-bytes";
 
+/// `path` as the CLI prints it in a suggested shell command: unquoted when
+/// every character is safe, else single-quoted (mirrors `gem_refresh`'s
+/// `shell_word`), so the expectations hold on Windows and in a temp dir
+/// whose path has a space.
+fn shell_word(path: &Path) -> String {
+    let text = path.display().to_string();
+    let safe = |c: char| c.is_ascii_alphanumeric() || "_@%+=:,./-".contains(c);
+    if !text.is_empty() && text.chars().all(safe) {
+        text
+    } else {
+        format!("'{}'", text.replace('\'', "'\\''"))
+    }
+}
+
 fn patched_archive_sha256() -> String {
     use sha2::Digest as _;
     hex::encode(sha2::Sha256::digest(PATCHED_ARCHIVE))
@@ -2637,7 +2651,7 @@ async fn hosted_unwind_names_no_rerun_for_a_shared_gem_home() {
             "{case}: the shared gem home is left alone"
         );
 
-        let remove_files = format!("{} {}", spec.display(), cache.display());
+        let remove_files = format!("{} {}", shell_word(&spec), shell_word(&cache));
         let warning = if json {
             let env = common::parse_json_envelope(&stdout);
             let details = details_with_code(&env, "upstream_gem_stale_install");
@@ -3582,8 +3596,14 @@ async fn vendored_unwind_warns_once_in_a_human_run() {
                        back to the upstream registry";
         assert_eq!(stderr.matches(warning).count(), 1, "{unwind:?}: {stderr}");
         assert!(
-            stderr.contains(&format!("rm -f {}", project_home(&proj).display()))
-                && stderr.contains(&format!("{} && bundle install", archive.display())),
+            stderr.contains(&format!(
+                "rm -f {}",
+                shell_word(
+                    &project_home(&proj)
+                        .join("specifications")
+                        .join(format!("{DEP}-{DEP_VERSION}.gemspec"))
+                )
+            )) && stderr.contains(&format!("{} && bundle install", shell_word(&archive))),
             "{unwind:?}: {stderr}"
         );
         assert!(
