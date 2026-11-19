@@ -98,3 +98,16 @@ for the tested PURLs — what's validated is that the crawler discovers
 real installed packages and the CLI dispatches correctly through the
 ecosystem.
 
+
+## JRuby image (`Dockerfile.jruby`)
+
+`Dockerfile.jruby` is not used by a `docker_e2e_*` suite. It is a JDK with
+JRuby and Bundler, for running the real-nokogiri harness
+(`tests/nokogiri/nokogiri_e2e.rb`) on JRuby on a machine that has neither:
+Bundler installs nokogiri's `java` platform gem there, which `apply`
+patches without building anything. The image holds no `socket-patch`. The
+binary under test is mounted, so it needs no `Dockerfile.base` and is not
+rebuilt after a code change. The header of the Dockerfile has the build
+commands for JRuby 9.4 and 10.1 and the `docker run` line for the harness.
+CI runs the same harness on both JRubies in `nokogiri-compatibility.yml`,
+on the runner.
