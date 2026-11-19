@@ -220,7 +220,7 @@ pub async fn applied_patches_with_copies(
                 }
                 first_failure.map_or(Ok(()), Err)
             } else if Ecosystem::from_purl(purl) == Some(Ecosystem::Gem) {
-                verify_every_gem_copy(paths, record).await
+                verify_every_gem_copy(purl, paths, record).await
             } else {
                 verify_every_copy(paths, record).await
             }
@@ -498,23 +498,35 @@ async fn verify_every_copy(paths: &[PathBuf], record: &PatchRecord) -> Result<()
 /// `native_extension_not_rebuilt`. Hosted copies are judged without this:
 /// RubyGems compiled the patched gem when Bundler installed it.
 ///
-/// A copy is judged by the files of the record it takes
-/// ([`installed_files`](crate::patch::gem_ext::installed_files)): the JVM
-/// build of a gem, which JRuby installs, has no use for what only a C
-/// build reads, and `apply` writes none of it there. When it takes no file
-/// of the record at all, the code the patch changes is not in that build,
-/// and the copy passes.
-async fn verify_every_gem_copy(paths: &[PathBuf], record: &PatchRecord) -> Result<(), String> {
-    use crate::patch::gem_ext;
+/// A copy is judged by the files of the record `purl` it takes
+/// ([`InstalledGem::record_files`](crate::patch::gem_ext::InstalledGem::record_files)):
+/// the JVM build of a gem, which JRuby installs, has no use for what only
+/// a C build reads, and `apply` writes none of the ruby-platform record's
+/// there. Its gemspec is read once for both questions.
+///
+/// Two outcomes of that are meant. A JVM copy that takes no file of the
+/// record, or only a C source nothing there compiles, passes: the code
+/// the patch fixes is not in that build, and a copy installed from the
+/// patched `java` gem gets the same verdict. And a file of the build that
+/// was deleted from the copy is not held against it, because it reads as
+/// one the build never had: nothing here knows the `java` gem's file list,
+/// and failing a patch that is applied is the worse error.
+async fn verify_every_gem_copy(
+    purl: &str,
+    paths: &[PathBuf],
+    record: &PatchRecord,
+) -> Result<(), String> {
+    use crate::patch::gem_ext::InstalledGem;
     if record.files.is_empty() {
         return Err("no_files".to_string());
     }
     for path in paths {
-        let files = gem_ext::installed_files(path, &record.files).await;
+        let gem = InstalledGem::at(path).await;
+        let files = gem.record_files(purl, &record.files).await;
         if !files.is_empty() {
             verify_patch_files(path, &files).await?;
         }
-        gem_ext::verify_native_build(path, &record.files).await?;
+        gem.verify_native_build(&record.files).await?;
     }
     Ok(())
 }

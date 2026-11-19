@@ -3643,7 +3643,7 @@ pub(crate) async fn rollback_patches_inner(
                     // hold it (a precompiled gem never shipped it; a build
                     // removed it) is removed, not restored.
                     let gem_files = if is_gem {
-                        Some(gem_ext::rollback_files(pkg_path, &patch.files).await)
+                        Some(gem_ext::rollback_files(pkg_path, purl, &patch.files).await)
                     } else {
                         None
                     };

@@ -1023,8 +1023,6 @@ pub(crate) fn representative_file(
 /// Action mapping (in priority order):
 ///   * `!result.success`                         → `Failed`
 ///   * all `files_verified` are AlreadyPatched   → `Skipped` (already_patched)
-///   * no file of the patch is in the copy's build → `Skipped`
-///     (`not_in_platform_build`; see [`gem_ext::skipped_copy`])
 ///   * `dry_run` and any file was Ready/Patched → `Verified`
 ///   * something was actually patched on disk    → `Applied`
 ///
@@ -1057,13 +1055,6 @@ pub(crate) fn result_to_event(result: &ApplyResult, dry_run: bool) -> PatchEvent
     if all_files_already_patched(result) {
         return PatchEvent::new(PatchAction::Skipped, purl)
             .with_reason("already_patched", "All files already match afterHash");
-    }
-
-    // A gem copy left as it was on purpose: the JRuby build of a gem that
-    // holds none of the patch's files. A no-op with its own reason, never
-    // an `applied` event with no files.
-    if let Some((code, detail)) = gem_ext::skipped_copy(result) {
-        return PatchEvent::new(PatchAction::Skipped, purl).with_reason(code, detail);
     }
 
     if dry_run {
@@ -1716,6 +1707,7 @@ pub(crate) async fn run_locked(
             lockfile_only,
             run_warnings,
             fallback_skips,
+            left_copies,
             targeted,
             show_summary,
         }) => {
@@ -1824,12 +1816,10 @@ pub(crate) async fn run_locked(
                 // `skipped` event under `--json`. The form that changes the
                 // gem's jars is a run warning, printed above.
                 let mut noted = HashSet::new();
-                for result in &results {
-                    if let Some((gem_ext::NOT_IN_BUILD_CODE, detail)) =
-                        gem_ext::skipped_copy(result)
-                    {
-                        if noted.insert((result.package_key.as_str(), detail)) {
-                            eprintln!("Note: {}: {detail}", normalize_purl(&result.package_key));
+                for left in &left_copies {
+                    if let gem_ext::LeftAsIs::NotInBuild(detail) = &left.why {
+                        if noted.insert((left.purl.as_str(), detail.as_str())) {
+                            eprintln!("Note: {}: {detail}", normalize_purl(&left.purl));
                         }
                     }
                 }
@@ -1896,7 +1886,7 @@ pub(crate) async fn run_locked(
                     print_verbose_verification(&results);
                 }
                 if show_summary {
-                    let tally = tally_results(&results);
+                    let tally = tally_results(&results, &left_copies);
                     println!();
                     if args.common.dry_run {
                         for line in format_dry_run_summary(&tally, unmatched.len()) {
@@ -1985,6 +1975,12 @@ pub(crate) async fn run_locked(
                         PatchEvent::new(PatchAction::Skipped, purl.clone())
                             .with_reason("package_not_installed", detail),
                     );
+                }
+                // Gem copies left as they were on purpose: one Skipped event
+                // each, with the reason. Never an `applied` event with no
+                // files.
+                for left in &left_copies {
+                    env.record(left.event());
                 }
                 // Best-effort gem-env fallback-home copies left unpatched:
                 // one non-fatal Skipped event each, with the copy's path
@@ -2100,11 +2096,15 @@ pub(crate) async fn run_locked(
                     .filter(|w| !is_stage_failure_code(&w.code))
                     .cloned(),
             );
+            // A copy left as it was is a skip of the nested caller's too:
+            // dropped there when another copy of the package was written.
+            let mut skips = user_patch_skips;
+            skips.extend(left_copies.iter().map(LeftCopy::event));
             let (applied, skipped) = collect_apply_outcomes(
                 &results,
                 &unmatched,
                 &lockfile_only,
-                user_patch_skips,
+                skips,
                 args.common.dry_run,
             );
             // A requested-but-failed VEX flips an otherwise-successful
@@ -2277,6 +2277,10 @@ struct ApplyOutcome {
     /// (best-effort class): one non-fatal `Skipped` event each in the
     /// envelope, one gated stderr line each on the human path.
     fallback_skips: Vec<FallbackHomeSkip>,
+    /// Gem copies the run left as they were on purpose
+    /// ([`gem_ext::LeftAsIs`]): one `Skipped` event each, with the reason.
+    /// They are not among [`Self::results`].
+    left_copies: Vec<LeftCopy>,
     /// In-scope (`--ecosystems`-filtered) manifest patches: the human
     /// summary's denominator.
     targeted: usize,
@@ -2349,35 +2353,49 @@ struct ApplyTally {
     /// patch; apply does no work for it).
     vendored: usize,
     /// No copy had anything to patch: every one is a build of the package
-    /// that holds none of the patch's files ([`gem_ext::skipped_copy`]).
+    /// that holds none of the code the patch changes
+    /// ([`gem_ext::LeftAsIs::NotInBuild`]). Nothing is left to do.
     not_applicable: usize,
+    /// No copy had a file of the patch to write, and the patch does
+    /// concern the build installed there: it changes what the gem's jars
+    /// were built from ([`gem_ext::LeftAsIs::NotRebuilt`]). The package is
+    /// not patched.
+    not_in_effect: usize,
 }
 
-fn tally_results(results: &[ApplyResult]) -> ApplyTally {
+fn tally_results(results: &[ApplyResult], left: &[LeftCopy]) -> ApplyTally {
     let mut by_purl: std::collections::BTreeMap<&str, Vec<&ApplyResult>> =
         std::collections::BTreeMap::new();
     let mut vendored: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
-    let mut not_applicable: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
     for r in results {
         if r.package_path == VENDOR_OWNED_MARKER {
             vendored.insert(r.package_key.as_str());
             continue;
         }
-        if gem_ext::skipped_copy(r).is_some() {
-            not_applicable.insert(r.package_key.as_str());
+        by_purl.entry(r.package_key.as_str()).or_default().push(r);
+    }
+    // A copy left as it was counts for its package only when no copy of
+    // the package has a result of its own.
+    let mut not_applicable: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    let mut not_in_effect: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    for copy in left {
+        let purl = copy.purl.as_str();
+        if by_purl.contains_key(purl) || vendored.contains(purl) {
             continue;
         }
-        by_purl.entry(r.package_key.as_str()).or_default().push(r);
+        match copy.why {
+            gem_ext::LeftAsIs::NotInBuild(_) => not_applicable.insert(purl),
+            gem_ext::LeftAsIs::NotRebuilt(_) => not_in_effect.insert(purl),
+        };
     }
     let mut tally = ApplyTally {
         vendored: vendored
             .iter()
             .filter(|k| !by_purl.contains_key(*k))
             .count(),
-        not_applicable: not_applicable
-            .iter()
-            .filter(|k| !by_purl.contains_key(*k) && !vendored.contains(*k))
-            .count(),
+        // A package with a copy the patch is not in effect in is not done.
+        not_applicable: not_applicable.difference(&not_in_effect).count(),
+        not_in_effect: not_in_effect.len(),
         ..ApplyTally::default()
     };
     for copies in by_purl.values() {
@@ -2421,6 +2439,9 @@ fn format_summary_line(tally: &ApplyTally, targeted: usize, not_found: usize) ->
     if tally.not_applicable > 0 {
         parts.push(format!("{} not applicable", tally.not_applicable));
     }
+    if tally.not_in_effect > 0 {
+        parts.push(format!("{} not in effect", tally.not_in_effect));
+    }
     if tally.failed > 0 {
         parts.push(format!("{} failed", tally.failed));
     }
@@ -2447,6 +2468,12 @@ fn format_dry_run_summary(tally: &ApplyTally, not_found: usize) -> Vec<String> {
         lines.push(format!(
             "  {} not applicable",
             plural(tally.not_applicable, "package", "packages")
+        ));
+    }
+    if tally.not_in_effect > 0 {
+        lines.push(format!(
+            "  {} would not take effect",
+            plural(tally.not_in_effect, "package", "packages")
         ));
     }
     if tally.failed > 0 {
@@ -2568,6 +2595,36 @@ fn expected_hash_label(hash: &str) -> &str {
     }
 }
 
+/// One gem copy `apply` left as it was on purpose, with a typed reason
+/// ([`gem_ext::LeftAsIs`]): the JRuby build of a gem that takes no file of
+/// the patch. It is a `Skipped` event of the patch, not an apply result.
+struct LeftCopy {
+    /// The manifest key of the patch.
+    purl: String,
+    why: gem_ext::LeftAsIs,
+}
+
+impl LeftCopy {
+    fn event(&self) -> PatchEvent {
+        PatchEvent::new(PatchAction::Skipped, self.purl.clone())
+            .with_reason(self.why.code(), self.why.detail())
+    }
+}
+
+/// Whether a `skipped` apply event with this `errorCode` reports a package
+/// that is patched as far as it can be on this install: every file already
+/// holds the patch (`already_patched`), or the build installed there holds
+/// none of the code the patch changes (`not_in_platform_build`). Whatever
+/// counts the patches a run left in place reads it through this, so that
+/// it agrees with `apply --check` and `vex`. A `native_extension_not_rebuilt`
+/// skip is not one: that patch is not in effect.
+pub(crate) fn skip_leaves_patched(error_code: Option<&str>) -> bool {
+    matches!(
+        error_code,
+        Some("already_patched") | Some(gem_ext::NOT_IN_BUILD_CODE)
+    )
+}
+
 /// One gem-env fallback-home copy the fan-out skipped best-effort (a
 /// bundle-store copy applied; this shared-home copy mismatched or failed
 /// to write). Carries what the warning must name: the package, the copy's
@@ -2635,6 +2692,7 @@ async fn apply_patches_inner(
                 lockfile_only: HashSet::new(),
                 run_warnings: vec![stage_failure_warning(args.common.offline)],
                 fallback_skips: Vec::new(),
+                left_copies: Vec::new(),
                 targeted: target_manifest_purls.len(),
                 show_summary: false,
             })
@@ -2676,6 +2734,7 @@ async fn apply_patches_inner(
             lockfile_only: HashSet::new(),
             run_warnings: Vec::new(),
             fallback_skips: Vec::new(),
+            left_copies: Vec::new(),
             targeted: 0,
             show_summary: false,
         });
@@ -2749,6 +2808,7 @@ async fn apply_patches_inner(
         }
     }
     let mut fallback_skips: Vec<FallbackHomeSkip> = Vec::new();
+    let mut left_copies: Vec<LeftCopy> = Vec::new();
     let mut go_pristine_mods: HashMap<String, PathBuf> = HashMap::new();
 
     // Multi-copy aware: npm nests genuine duplicates of one `name@version`
@@ -2831,6 +2891,7 @@ async fn apply_patches_inner(
             lockfile_only,
             run_warnings,
             fallback_skips,
+            left_copies: Vec::new(),
             targeted: target_manifest_purls.len(),
             show_summary: true,
         });
@@ -3101,7 +3162,7 @@ async fn apply_patches_inner(
                     // JRuby build of a gem takes the files that are part of
                     // it, and builds nothing.
                     let result = if Ecosystem::from_purl(purl) == Some(Ecosystem::Gem) {
-                        let applied = gem_ext::apply_gem_package_patch(
+                        let outcome = gem_ext::apply_gem_package_patch(
                             args.common.read_scope(),
                             variant_purl,
                             pkg_path,
@@ -3119,13 +3180,26 @@ async fn apply_patches_inner(
                         .await;
                         // A best-effort fallback-home copy's refusal is
                         // its per-copy skip below, not a run warning.
-                        if let Some((code, detail)) = applied
+                        if let Some((code, detail)) = outcome
                             .warning
-                            .filter(|_| applied.result.success || !best_effort)
+                            .filter(|_| outcome.result.success || !best_effort)
                         {
                             run_warnings.push(RunWarning { code, detail });
                         }
-                        applied.result
+                        // A copy left as it was on purpose (the JRuby build
+                        // of a gem that takes no file of the patch) is the
+                        // installed distribution, handled: its own skip,
+                        // with the reason, and no result.
+                        if let Some(why) = outcome.left_as_is {
+                            matched_manifest_purls.insert(variant_purl.clone());
+                            applied = true;
+                            left_copies.push(LeftCopy {
+                                purl: variant_purl.clone(),
+                                why,
+                            });
+                            continue;
+                        }
+                        outcome.result
                     } else {
                         apply_package_patch(
                             args.common.read_scope(),
@@ -3384,6 +3458,7 @@ async fn apply_patches_inner(
         lockfile_only,
         run_warnings,
         fallback_skips,
+        left_copies,
         targeted: target_manifest_purls.len(),
         show_summary: true,
     })
@@ -4624,7 +4699,7 @@ mod tests {
                 true,
             ),
         ];
-        let t = tally_results(&results);
+        let t = tally_results(&results, &[]);
         assert_eq!(t.applied, 1);
         assert_eq!(t.already, 0);
         assert_eq!(t.failed, 0);
@@ -4641,7 +4716,7 @@ mod tests {
         let mut vendored = sample_applied(VerifyStatus::Ready);
         vendored.package_key = "pkg:npm/vend@1.0.0".into();
         vendored.package_path = VENDOR_OWNED_MARKER.into();
-        let t = tally_results(&[already, failed, vendored]);
+        let t = tally_results(&[already, failed, vendored], &[]);
         assert_eq!(
             t,
             ApplyTally {
@@ -4651,6 +4726,7 @@ mod tests {
                 failed: 1,
                 vendored: 1,
                 not_applicable: 0,
+                not_in_effect: 0,
             }
         );
         assert_eq!(
@@ -4658,61 +4734,73 @@ mod tests {
             "Summary: 0 of 3 targeted patches applied, 1 already patched, 1 vendored, 1 failed, \
              0 not found on disk"
         );
-        assert_eq!(tally_results(&[]), ApplyTally::default());
+        assert_eq!(tally_results(&[], &[]), ApplyTally::default());
     }
 
     /// A gem copy `apply` left as it was on purpose (the JRuby build of a
-    /// gem that holds none of the patch's files): a successful result
-    /// that verified and wrote nothing, with the reason in its note.
-    fn left_as_it_was(purl: &str, code: &str) -> ApplyResult {
-        ApplyResult {
-            package_key: purl.to_string(),
-            package_path: "/p/vendor/bundle/jruby/3.1.0/gems/nokogiri-1.18.10-java".to_string(),
-            success: true,
-            files_verified: Vec::new(),
-            files_patched: Vec::new(),
-            applied_via: HashMap::new(),
-            error: Some(format!("{code}: none of the patch's files are part of it")),
-            sidecar: None,
+    /// gem that takes no file of the patch), with its typed reason.
+    fn left(purl: &str, why: gem_ext::LeftAsIs) -> LeftCopy {
+        LeftCopy {
+            purl: purl.to_string(),
+            why,
         }
     }
 
-    /// Such a copy is a `skipped` event with its own reason, wet or dry:
+    /// Such a copy is a `skipped` event with the reason's code and words:
     /// never an `applied` (or `verified`) event with no files.
     #[test]
-    fn a_copy_with_nothing_of_the_patch_is_a_skip_with_its_reason() {
+    fn a_copy_left_as_it_was_is_a_skip_with_its_reason() {
         let purl = "pkg:gem/nokogiri@1.18.10?platform=ruby";
-        for code in [gem_ext::NOT_IN_BUILD_CODE, gem_ext::NOT_REBUILT_REASON] {
-            for dry_run in [false, true] {
-                let event = result_to_event(&left_as_it_was(purl, code), dry_run);
-                let v: serde_json::Value =
-                    serde_json::from_str(&serde_json::to_string(&event).unwrap()).unwrap();
-                assert_eq!(v["action"], "skipped", "{code} dry_run={dry_run}");
-                assert_eq!(v["errorCode"], code, "dry_run={dry_run}");
-                assert_eq!(
-                    v["reason"], "none of the patch's files are part of it",
-                    "{code} dry_run={dry_run}"
-                );
-                assert_eq!(v["purl"], purl);
-            }
+        for (why, code) in [
+            (
+                gem_ext::LeftAsIs::NotInBuild("not part of it".to_string()),
+                "not_in_platform_build",
+            ),
+            (
+                gem_ext::LeftAsIs::NotRebuilt("not part of it".to_string()),
+                "native_extension_not_rebuilt",
+            ),
+        ] {
+            let v = serde_json::to_value(left(purl, why).event()).unwrap();
+            assert_eq!(v["action"], "skipped", "{code}");
+            assert_eq!(v["errorCode"], code);
+            assert_eq!(v["reason"], "not part of it", "{code}");
+            assert_eq!(v["purl"], purl, "{code}");
         }
-        // Any other note of a successful result stays what it was.
-        let mut advisory = left_as_it_was(purl, gem_ext::NOT_IN_BUILD_CODE);
-        advisory.error = Some("ownership could not be restored".to_string());
-        assert_eq!(
-            serde_json::to_value(result_to_event(&advisory, false)).unwrap()["action"],
-            "applied"
-        );
     }
 
-    /// The summary accounts for it under its own heading: not applied, not
-    /// already patched, and nothing a wet run could patch. Another copy of
-    /// the same package that was patched makes the package applied.
+    /// Only a skip that leaves the package patched as far as it can be
+    /// counts as landed: one already patched, and one whose code is not
+    /// in the build installed here. A patch written without effect, a
+    /// package that is not installed and a vendored one are not.
     #[test]
-    fn tally_counts_a_package_with_nothing_to_patch_as_not_applicable() {
+    fn only_a_skip_with_nothing_left_to_do_leaves_the_package_patched() {
+        assert!(skip_leaves_patched(Some("already_patched")));
+        assert!(skip_leaves_patched(Some(gem_ext::NOT_IN_BUILD_CODE)));
+        assert!(skip_leaves_patched(Some("not_in_platform_build")));
+        for code in [
+            Some(gem_ext::NOT_REBUILT_REASON),
+            Some("package_not_installed"),
+            Some("vendored"),
+            Some("gem_fallback_home_skipped"),
+            None,
+        ] {
+            assert!(!skip_leaves_patched(code), "{code:?}");
+        }
+    }
+
+    /// The summary accounts for a copy left as it was under the heading of
+    /// its reason: "not applicable" when the code is not in the build
+    /// (nothing left to do), "not in effect" when the patch concerns the
+    /// build and its jars were not rebuilt. Another copy of the same
+    /// package with a result of its own decides for the package.
+    #[test]
+    fn tally_tells_nothing_to_do_from_not_in_effect() {
         let purl = "pkg:gem/nokogiri@1.18.10?platform=ruby";
-        let skipped = left_as_it_was(purl, gem_ext::NOT_IN_BUILD_CODE);
-        let t = tally_results(std::slice::from_ref(&skipped));
+        let not_in_build = || left(purl, gem_ext::LeftAsIs::NotInBuild("n".to_string()));
+        let not_rebuilt = || left(purl, gem_ext::LeftAsIs::NotRebuilt("j".to_string()));
+
+        let t = tally_results(&[], &[not_in_build()]);
         assert_eq!(
             t,
             ApplyTally {
@@ -4733,7 +4821,32 @@ mod tests {
                 "  1 package not applicable",
             ]
         );
-        assert!(format_results_block(&[skipped.clone()], false, Path::new("/p")).is_empty());
+
+        let t = tally_results(&[], &[not_rebuilt()]);
+        assert_eq!(
+            t,
+            ApplyTally {
+                not_in_effect: 1,
+                ..ApplyTally::default()
+            }
+        );
+        assert_eq!(
+            format_summary_line(&t, 1, 0),
+            "Summary: 0 of 1 targeted patch applied, 0 already patched, 1 not in effect, \
+             0 not found on disk"
+        );
+        assert_eq!(
+            format_dry_run_summary(&t, 0),
+            vec![
+                "Patch verification complete:",
+                "  0 packages can be patched",
+                "  1 package would not take effect",
+            ]
+        );
+        // Two copies of one package count once, and a copy the patch is
+        // not in effect in keeps the package from reading as done.
+        let t = tally_results(&[], &[not_in_build(), not_in_build(), not_rebuilt()]);
+        assert_eq!((t.not_applicable, t.not_in_effect), (0, 1));
 
         let mut patched = copy_at(
             "/p/vendor/bundle/ruby/3.4.0/gems/nokogiri-1.18.10",
@@ -4741,8 +4854,8 @@ mod tests {
             true,
         );
         patched.package_key = purl.to_string();
-        let t = tally_results(&[skipped, patched]);
-        assert_eq!((t.applied, t.not_applicable), (1, 0));
+        let t = tally_results(&[patched], &[not_in_build(), not_rebuilt()]);
+        assert_eq!((t.applied, t.not_applicable, t.not_in_effect), (1, 0, 0));
     }
 
     #[test]
@@ -4754,6 +4867,7 @@ mod tests {
             applied: 0,
             vendored: 0,
             not_applicable: 1,
+            not_in_effect: 2,
         };
         assert_eq!(
             format_dry_run_summary(&t, 3),
@@ -4762,6 +4876,7 @@ mod tests {
                 "  1 package can be patched",
                 "  2 packages already patched",
                 "  1 package not applicable",
+                "  2 packages would not take effect",
                 "  1 package cannot be patched",
                 "  3 packages not found on disk",
             ]

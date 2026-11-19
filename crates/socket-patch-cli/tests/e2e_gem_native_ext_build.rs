@@ -2824,10 +2824,14 @@ fn a_ruby_of_another_platform_does_not_rebuild_a_precompiled_copy() {
 // such a copy takes of one what is part of its own build: the files it
 // holds, and the files the patch adds that are not inputs of a C build.
 // Nothing is built and no Ruby is started. Only a record that changes what
-// the jars were built from is never attested.
+// the jars were built from (their sources, not a jar replaced whole) is
+// never attested. A record qualified for a platform is applied whole, and
+// a `java` gem that declares extensions is rebuilt like any built gem.
 
 /// The record of the `ruby` platform gem, as the patch service keys it.
 const RUBY_PLATFORM_PURL: &str = "pkg:gem/sp_native@1.0.0?platform=ruby";
+/// A record written for the `java` platform gem itself.
+const JAVA_PLATFORM_PURL: &str = "pkg:gem/sp_native@1.0.0?platform=java";
 const JAVA_KEY: &str = "ext/java/sp/SpNative.java";
 const JAVA_SOURCE: &str = "class SpNative { int v = 1; }\n";
 const PATCHED_JAVA_SOURCE: &str = "class SpNative { int v = 2; }\n";
@@ -3281,11 +3285,226 @@ fn a_patch_to_a_java_gems_sources_is_written_and_never_attested() {
         "{stdout}"
     );
     gem.assert_vendor(&gem.pristine, "a record of a Java source it does not ship");
+    // For a person: a warning, and a summary that does not read as done.
+    let (code, stdout, stderr) = gem.run(&["apply"]);
+    assert_eq!(code, 0, "{stdout}\n{stderr}");
+    assert!(
+        stderr.contains("Warning:") && stderr.contains(jars_not_rebuilt),
+        "{stderr}"
+    );
+    assert!(
+        stdout.contains("1 not in effect") && !stdout.contains("not applicable"),
+        "{stdout}"
+    );
     let (code, stdout, _) = gem.run(&["apply", "--check", "--json"]);
     assert_ne!(code, 0, "{stdout}");
     assert!(!gem.attested(), "vex attested a jar that was not rebuilt");
     gem.assert_rolls_back();
     gem.assert_no_ruby_ran();
+}
+
+/// A jar the record replaces whole is the code JRuby loads: it is written
+/// like any file of the patch, with no warning, and the copy is in sync
+/// and attested. Only the sources of a jar cannot take effect here.
+#[test]
+fn a_jar_the_patch_replaces_whole_is_written_and_attested() {
+    const JAR_KEY: &str = "lib/sp_native/sp_native.jar";
+    for purl in [PURL, RUBY_PLATFORM_PURL] {
+        let gem = JavaGem::new();
+        gem.record(
+            purl,
+            &[
+                (JAR_KEY, Some("PK jar"), "PK patched jar"),
+                ("lib/sp_native.rb", Some(LIB_RB), PATCHED_RB),
+            ],
+        );
+        let patched = tree_with(
+            &tree_with(
+                &gem.pristine,
+                &gem.vendor_rel("lib/sp_native.rb"),
+                PATCHED_RB.as_bytes(),
+            ),
+            &gem.vendor_rel(JAR_KEY),
+            b"PK patched jar",
+        );
+
+        let (code, stdout, stderr) = gem.run(&["apply", "--json"]);
+        assert_eq!(code, 0, "{purl}: apply failed:\n{stdout}\n{stderr}");
+        assert_eq!(gem.event(&stdout, purl).0, "applied", "{purl}: {stdout}");
+        assert!(
+            !stdout.contains("native_extension"),
+            "{purl}: a replaced jar is no build input: {stdout}"
+        );
+        gem.assert_vendor(&patched, purl);
+
+        let (code, stdout, stderr) = gem.run(&["apply", "--check"]);
+        assert_eq!(code, 0, "{purl}: {stdout}\n{stderr}");
+        assert!(gem.attested(), "{purl}: vex did not attest the patched jar");
+        let (code, stdout, stderr) = gem.run(&["apply", "--json"]);
+        assert_eq!(code, 0, "{purl}: {stdout}\n{stderr}");
+        assert_eq!(
+            gem.event(&stdout, purl),
+            ("skipped".to_string(), "already_patched".to_string()),
+            "{purl}: {stdout}"
+        );
+
+        gem.assert_rolls_back();
+        gem.assert_no_ruby_ran();
+    }
+}
+
+/// The per-file rule is for the record of the `ruby` platform gem. A
+/// record qualified for a platform names the archive it was written for,
+/// the copy's own `java` included: every file of it is required, so a file
+/// the copy lacks fails the patch like any missing file, and a file it
+/// adds is created wherever it goes.
+#[test]
+fn a_record_qualified_for_a_platform_is_applied_whole_on_a_java_gem() {
+    // A file the copy does not hold: the usual failure, nothing written.
+    for purl in [
+        JAVA_PLATFORM_PURL,
+        "pkg:gem/sp_native@1.0.0?platform=x86_64-linux",
+    ] {
+        let gem = JavaGem::new();
+        gem.record(
+            purl,
+            &[
+                ("lib/sp_native.rb", Some(LIB_RB), PATCHED_RB),
+                (
+                    "lib/sp_native/zz_not_in_this_gem.rb",
+                    Some("before\n"),
+                    "after\n",
+                ),
+            ],
+        );
+        for args in [&["apply", "--json"][..], &["apply", "--json", "--dry-run"]] {
+            let (code, stdout, stderr) = gem.run(args);
+            assert_eq!(code, 1, "{purl} {args:?}: {stdout}\n{stderr}");
+            assert_eq!(gem.event(&stdout, purl).0, "failed", "{purl}: {stdout}");
+            assert!(
+                stdout.contains("zz_not_in_this_gem.rb"),
+                "{purl} {args:?}: the missing file is named: {stdout}"
+            );
+            gem.assert_vendor(&gem.pristine, &format!("{purl} {args:?}"));
+        }
+        let (code, stdout, _) = gem.run(&["apply", "--check", "--json"]);
+        assert_ne!(code, 0, "{purl}: {stdout}");
+        assert!(!gem.attested(), "{purl}: vex attested a failed patch");
+        gem.assert_no_ruby_ran();
+    }
+
+    // A file it adds under `patches/` is part of that record's gem.
+    let gem = JavaGem::new();
+    gem.record(
+        JAVA_PLATFORM_PURL,
+        &[
+            ("lib/sp_native.rb", Some(LIB_RB), PATCHED_RB),
+            (LIBRARY_PATCH_KEY, None, "a file of the java gem's record\n"),
+        ],
+    );
+    let patched = tree_with(
+        &tree_with(
+            &gem.pristine,
+            &gem.vendor_rel("lib/sp_native.rb"),
+            PATCHED_RB.as_bytes(),
+        ),
+        &gem.vendor_rel(LIBRARY_PATCH_KEY),
+        b"a file of the java gem's record\n",
+    );
+    let (code, stdout, stderr) = gem.run(&["apply", "--json"]);
+    assert_eq!(code, 0, "apply failed:\n{stdout}\n{stderr}");
+    assert_eq!(
+        gem.event(&stdout, JAVA_PLATFORM_PURL).0,
+        "applied",
+        "{stdout}"
+    );
+    gem.assert_vendor(&patched, "the java record");
+    let (code, stdout, stderr) = gem.run(&["apply", "--check"]);
+    assert_eq!(code, 0, "{stdout}\n{stderr}");
+    assert!(gem.attested(), "vex did not attest the java record");
+    gem.assert_rolls_back();
+    gem.assert_no_ruby_ran();
+}
+
+/// A `java` gem whose gemspec declares extensions is no JRuby build of a
+/// gem in this sense: RubyGems compiled something for it when it was
+/// installed (jruby-launcher builds a native launcher), so a patch to that
+/// source is rebuilt like any built gem's. Without a Ruby it is refused
+/// with nothing written; it is never written and attested without a build.
+#[cfg(unix)]
+#[test]
+fn a_java_gem_that_declares_extensions_keeps_the_native_rebuild() {
+    const BUILT_JAVA: &str = "sp_native-1.0.0-java";
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tmp.path().to_path_buf();
+    let home = proj.join("vendor/bundle/jruby/3.4.0");
+    let gem_dir = home.join("gems").join(BUILT_JAVA);
+    std::fs::create_dir_all(gem_dir.join("ext/sp_native")).unwrap();
+    std::fs::create_dir_all(gem_dir.join("lib/sp_native")).unwrap();
+    std::fs::write(gem_dir.join(C_KEY), c_source(1)).unwrap();
+    std::fs::write(gem_dir.join("lib/sp_native.rb"), LIB_RB).unwrap();
+    std::fs::write(
+        gem_dir.join("lib/sp_native/sp_native.so"),
+        b"\x7fELF original",
+    )
+    .unwrap();
+    let ext = home.join("extensions/x86_64-linux/3.4.0").join(BUILT_JAVA);
+    std::fs::create_dir_all(ext.join("sp_native")).unwrap();
+    std::fs::write(ext.join("sp_native/sp_native.so"), b"\x7fELF original").unwrap();
+    std::fs::write(ext.join("gem.build_complete"), b"").unwrap();
+    std::fs::create_dir_all(home.join("specifications")).unwrap();
+    std::fs::write(
+        home.join("specifications")
+            .join(format!("{BUILT_JAVA}.gemspec")),
+        "Gem::Specification.new do |s|\n  s.name = \"sp_native\".freeze\n  \
+         s.version = \"1.0.0\".freeze\n  s.platform = \"java\".freeze\n  \
+         s.require_paths = [\"lib\".freeze]\n  \
+         s.extensions = [\"ext/sp_native/extconf.rb\".freeze]\nend\n",
+    )
+    .unwrap();
+    std::fs::write(
+        proj.join("Gemfile"),
+        "source \"https://rubygems.org\"\ngem \"sp_native\"\n",
+    )
+    .unwrap();
+    write_manifest(&proj.join(".socket"), &c_source(1), &c_source(2));
+    let tree_before = walk_files(&proj.join("vendor"));
+
+    // No Ruby to build with: refused, and nothing is written.
+    let (code, stdout, stderr) = run_without_ruby(&proj, &["apply", "--json"]);
+    assert_eq!(code, 1, "{stdout}\n{stderr}");
+    assert!(stdout.contains("native_extensions_unsupported"), "{stdout}");
+    assert_tree(&proj.join("vendor"), &tree_before, "without a Ruby");
+    let (code, stdout, _) = run_without_ruby(&proj, &["apply", "--check", "--json"]);
+    assert_ne!(code, 0, "{stdout}");
+
+    // With the Ruby that owns the install: built by RubyGems' builder.
+    let ruby = FakeRuby::new();
+    let (code, stdout, stderr) = ruby.run(&proj, &["apply", "--json"], &[]);
+    assert_eq!(code, 0, "apply failed:\n{stdout}\n{stderr}");
+    assert_eq!(event_action(&stdout), "applied", "{stdout}");
+    assert_eq!(ruby.calls(), ["extensions_dir", "build"]);
+    assert_eq!(
+        std::fs::read_to_string(gem_dir.join(C_KEY)).unwrap(),
+        c_source(2)
+    );
+    assert_eq!(
+        std::fs::read(gem_dir.join("lib/sp_native/sp_native.so")).unwrap(),
+        b"rebuilt"
+    );
+    assert!(gem_dir.join(".socket-patch-native-build.json").is_file());
+    let (code, stdout, stderr) = ruby.run(&proj, &["apply", "--check"], &[]);
+    assert_eq!(code, 0, "{stdout}\n{stderr}");
+
+    // The patched source over the install-time build is not a patched gem.
+    let (code, stdout, stderr) = ruby.run(&proj, &["rollback", "--json"], &[]);
+    assert_eq!(code, 0, "rollback failed:\n{stdout}\n{stderr}");
+    assert_tree(&proj.join("vendor"), &tree_before, "after rollback");
+    write_manifest(&proj.join(".socket"), &c_source(1), &c_source(2));
+    std::fs::write(gem_dir.join(C_KEY), c_source(2)).unwrap();
+    let (code, stdout, _) = run_without_ruby(&proj, &["apply", "--check", "--json"]);
+    assert_ne!(code, 0, "{stdout}");
+    assert!(stdout.contains("native_extension_not_rebuilt"), "{stdout}");
 }
 
 /// A file the JRuby gem ships is held to the record like any patch file:
