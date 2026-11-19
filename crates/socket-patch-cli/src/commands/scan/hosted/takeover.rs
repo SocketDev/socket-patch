@@ -188,7 +188,13 @@ impl Takeover {
             if let Some(refusal) = socket_patch_core::hosted::engine::undecodable_guard(
                 &read.undecodable_reads,
                 candidates,
-            ) {
+            )
+            .or_else(|| {
+                socket_patch_core::hosted::engine::undecodable_maven_guard(
+                    &read.undecodable_maven_poms,
+                    candidates,
+                )
+            }) {
                 return Err(refusal);
             }
         }

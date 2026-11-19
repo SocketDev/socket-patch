@@ -63,6 +63,9 @@ const REMOVED: &[&str] = &[
     // must do the same on a runner and on a developer's machine.
     "CI",
     "GITHUB_ACTIONS",
+    // Composer: another `composer.json` than the project's, for the
+    // Composer a repository rule starts.
+    "COMPOSER",
     // Ruby and RubyGems: where gems are installed and looked up. rvm,
     // chruby and direnv export them for the Ruby of the shell, which is
     // not the Ruby a ruleset downloads.
@@ -77,6 +80,11 @@ const REMOVED: &[&str] = &[
     "PYTHONHOME",
     "PYTHONPATH",
     "PYTHONSTARTUP",
+    // Maven: `hermetic::command` gives the socket-patch binary a
+    // `MAVEN_ARGS` that names an empty settings file, so the machine's
+    // mirrors decide nothing. It is that process's alone: a Maven a
+    // ruleset started would take those settings over its own.
+    "MAVEN_ARGS",
     // rules_rust: its switch for a repin of a crate hub, which it reads
     // under this name and under `CARGO_BAZEL_REPIN` (a prefix below).
     "REPIN",
@@ -88,6 +96,11 @@ const REMOVED_PREFIXES: &[&str] = &[
     // where it gets a release from. `BAZELISK_HOME` is set again, to
     // [`launcher_cache`].
     "BAZELISK_",
+    // Composer: any of its settings (`COMPOSER_AUTH`,
+    // `COMPOSER_DISABLE_NETWORK`, a vendor directory), which the Composer
+    // a repository rule starts reads from the client's environment. A flow
+    // sets the ones it needs after this ([`Cell::repo_env`]).
+    "COMPOSER_",
     // pip: any option of its command line (an index, a proxy, a cache).
     "PIP_",
     // uv: the same.
@@ -1063,6 +1076,7 @@ fn settings_of_a_shell() -> Vec<String> {
         "XDG_STATE_HOME",
         "CI",
         "GITHUB_ACTIONS",
+        "COMPOSER",
         "GEM_HOME",
         "GEM_PATH",
         "NODE_OPTIONS",
@@ -1070,9 +1084,13 @@ fn settings_of_a_shell() -> Vec<String> {
         "PYTHONHOME",
         "PYTHONPATH",
         "PYTHONSTARTUP",
+        // (Also what `hermetic::command` itself sets for the socket-patch
+        // binary: neither the shell's value nor that one reaches a child.)
+        "MAVEN_ARGS",
         "REPIN",
         // One name under each of `REMOVED_PREFIXES`.
         "BAZELISK_SETTING",
+        "COMPOSER_SETTING",
         "PIP_SETTING",
         "UV_SETTING",
         "CARGO_SETTING",

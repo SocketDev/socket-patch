@@ -36,7 +36,7 @@ mod composer;
 mod gem;
 mod golang;
 mod gradle;
-mod maven;
+pub(crate) mod maven;
 pub(crate) mod npm;
 mod nuget;
 mod pypi;

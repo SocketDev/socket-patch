@@ -149,6 +149,20 @@ fn mount_api(s: &Server, jar: &[u8], pom: &[u8], view: &serde_json::Value) {
 /// (`tests/common/hermetic.rs`) with the per-test local repository as the
 /// crawler's maven repo.
 fn socket(cwd: &Path, m2: &Path, args: &[&str]) -> (Option<i32>, serde_json::Value, String) {
+    socket_with(cwd, m2, args, &[])
+}
+
+/// [`socket`] with `env` on top. Unless `env` says otherwise, the Maven
+/// settings the CLI reads are the harness's empty ones
+/// (`hermetic::neutral_maven_args`: `MAVEN_ARGS` is where the CLI looks
+/// for the `-s` / `-gs` Maven would be started with): the mirrors of
+/// whoever runs the suite must not decide a scan.
+fn socket_with(
+    cwd: &Path,
+    m2: &Path,
+    args: &[&str],
+    env: &[(&str, &str)],
+) -> (Option<i32>, serde_json::Value, String) {
     let mut cmd = hermetic::command(&binary());
     hermetic::scrub_extra(&mut cmd, &[hermetic::Extra::Venv]);
     let out = cmd
@@ -156,6 +170,8 @@ fn socket(cwd: &Path, m2: &Path, args: &[&str]) -> (Option<i32>, serde_json::Val
         .current_dir(cwd)
         .env("MAVEN_REPO_LOCAL", m2)
         .env_remove("M2_HOME")
+        .env_remove("MAVEN_HOME")
+        .envs(env.iter().copied())
         .output()
         .expect("run socket-patch");
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
@@ -700,6 +716,8 @@ fn maven_scan_hosted_fresh_checkout_install_and_manifestless_vex() {
 // ── a pin follows the version Maven selects ─────────────────────────────
 
 mod mediation {
+    use std::collections::BTreeMap;
+
     use super::maven_mediation_common::{self as fixture, Shape};
     use super::*;
 
@@ -905,5 +923,875 @@ mod mediation {
         // The base version now sits in the local repository, jar and all,
         // and no pom of this project names it: a range selects another.
         unselected(Shape::Ranged).expect("the local repository is warm");
+    }
+    /// What a hosted mediation test runs against: the fixture repository,
+    /// the patch API and the Socket repository of [`PATCH`] on one server,
+    /// a cold local repository, and Maven settings without and with the
+    /// Socket repository mirrored to that server.
+    struct Bench {
+        _tmp: tempfile::TempDir,
+        root: PathBuf,
+        m2: PathBuf,
+        plain: PathBuf,
+        mirrored: PathBuf,
+        server: Server,
+        patched_jar: Vec<u8>,
+        suffixed: String,
+        view: serde_json::Value,
+    }
+
+    impl Bench {
+        fn new() -> Bench {
+            let tmp = tempfile::tempdir().unwrap();
+            let root: PathBuf = tmp.path().canonicalize().unwrap();
+            let plain = root.join("settings-plain.xml");
+            write_settings(&plain, &[]);
+            let server = Server::start();
+            fixture::publish(&server);
+            let patched_jar = fixture::patched_victim_jar();
+            let suffixed = PATCH.suffixed();
+            let served_pom = fixture::served_victim_pom(&suffixed).into_bytes();
+            let view = patch_view(
+                UUID,
+                &fixture::purl(),
+                &[(
+                    &fixture::victim_jar_name(fixture::BASE),
+                    &git_sha256(&patched_jar),
+                )],
+                &[(PATCH.ghsa, &[PATCH.cve])],
+            );
+            hosted_maven_common::mount_api(&server, &PATCH, &patched_jar, &served_pom, &view);
+            fixture::answer_lookups_only_for(&server, ORG, &fixture::purl()["pkg:maven/".len()..]);
+            server.serve_repo(&PATCH, &patched_jar, &served_pom, None);
+            let mirrored = root.join("settings-socket.xml");
+            let mirror_url = format!("{}{}", server.uri(), PATCH.repo_path());
+            write_settings(&mirrored, &[(&format!("socket-patch-{UUID}"), &mirror_url)]);
+            Bench {
+                m2: root.join("m2"),
+                _tmp: tmp,
+                root,
+                plain,
+                mirrored,
+                server,
+                patched_jar,
+                suffixed,
+                view,
+            }
+        }
+
+        fn scan(&self, proj: &Path) -> (Option<i32>, serde_json::Value, String) {
+            self.scan_with(proj, &[])
+        }
+
+        /// [`Self::scan`] with extra environment for the CLI.
+        fn scan_with(
+            &self,
+            proj: &Path,
+            env: &[(&str, &str)],
+        ) -> (Option<i32>, serde_json::Value, String) {
+            socket_with(
+                proj,
+                &self.m2,
+                &[
+                    "scan",
+                    "--mode",
+                    "hosted",
+                    "--json",
+                    "--yes",
+                    "--cwd",
+                    proj.to_str().unwrap(),
+                    "--api-url",
+                    &self.server.uri(),
+                    "--org",
+                    ORG,
+                    "--api-token",
+                    "fake",
+                ],
+                env,
+            )
+        }
+
+        /// Roll the project back (Maven's restore needs no network), and
+        /// check that it is the hosted pin of the victim that went.
+        fn rollback(&self, proj: &Path) {
+            let (code, env, stderr) = socket(
+                proj,
+                &self.m2,
+                &[
+                    "rollback",
+                    "--json",
+                    "--offline",
+                    "--cwd",
+                    proj.to_str().unwrap(),
+                ],
+            );
+            assert_eq!(code, Some(0), "rollback: {env}\n{stderr}");
+            assert_eq!(
+                rollback_json::hosted_reverted(&env),
+                serde_json::json!([fixture::purl()]),
+                "rollback restores the hosted pin: {env}"
+            );
+        }
+
+        /// A second scan finds the wiring of the first and writes nothing.
+        fn assert_rescan_is_a_no_op(&self, proj: &Path) {
+            let pinned = fixture::snapshot(proj);
+            let (code, env, stderr) = self.scan(proj);
+            assert_eq!(code, Some(0), "rescan: {env}\n{stderr}");
+            assert_eq!(
+                fixture::snapshot(proj),
+                pinned,
+                "a rescan is a no-op: {env}"
+            );
+        }
+
+        /// The invariant: `after` holds the artifacts of `before`, the
+        /// base victim in its patched build and every other jar as it was.
+        fn assert_only_the_victim_is_patched(
+            &self,
+            what: &str,
+            before: &BTreeMap<String, Vec<u8>>,
+            after: &BTreeMap<String, Vec<u8>>,
+        ) {
+            assert_eq!(
+                fixture::unsuffixed(after.keys()),
+                before.keys().cloned().collect(),
+                "{what}: the same artifacts, the victim in its patched build"
+            );
+            assert_eq!(
+                after.get(&fixture::victim_jar_name(&self.suffixed)),
+                Some(&self.patched_jar),
+                "{what}: Maven resolves the patched jar: {:?}",
+                after.keys()
+            );
+            for (name, bytes) in before {
+                if *name != fixture::victim_jar_name(fixture::BASE) {
+                    assert_eq!(after.get(name), Some(bytes), "{what}: {name} is untouched");
+                }
+            }
+        }
+    }
+
+    /// A `${property}` version is patched in hosted mode, with pom edits
+    /// only, and no artifact that shares the property is moved:
+    ///
+    /// - a property only the patched artifact reads is rewritten itself;
+    /// - a property a sibling artifact reads too stays as it is, and the
+    ///   one declaration takes the patched version, the text it replaced
+    ///   recorded beside it;
+    /// - so does a declaration whose property a parent pom resolved from a
+    ///   repository defines.
+    ///
+    /// In each, Maven resolves what it resolved before but for the patched
+    /// build of the victim, a second scan writes nothing, and a rollback
+    /// restores every file byte for byte and leaves none behind.
+    #[test]
+    #[ignore = "real Maven + Maven Central (dependency plugin); run with --ignored"]
+    fn maven_hosted_patches_a_property_version_and_rolls_back_clean() {
+        use fixture::Property;
+        let Some(mvn) = Mvn::detect(SUITE) else {
+            return;
+        };
+        let bench = Bench::new();
+        let suffixed = &bench.suffixed;
+        for property in [Property::Own, Property::Shared, Property::OfParent] {
+            let what = property.name();
+            let proj = bench.root.join(what);
+            std::fs::create_dir_all(&proj).unwrap();
+            std::fs::write(
+                proj.join("pom.xml"),
+                fixture::property_pom(property, &bench.server),
+            )
+            .unwrap();
+            let Some(before) =
+                fixture::resolve(SUITE, &mvn, &proj, &bench.m2, &bench.plain, "target/before")
+            else {
+                return;
+            };
+            assert!(
+                before.contains_key(&fixture::victim_jar_name(fixture::BASE)),
+                "{what}: {:?}",
+                before.keys()
+            );
+            let pristine = fixture::snapshot(&proj);
+
+            let (code, env, stderr) = bench.scan(&proj);
+            assert_eq!(code, Some(0), "{what}: {env}\n{stderr}");
+            assert_eq!(env["summary"]["applied"], 1, "{what}: {env}");
+            let wired = std::fs::read_to_string(proj.join("pom.xml")).unwrap();
+            let reference = property.reference();
+            match property {
+                Property::Own => assert!(
+                    wired.contains(&format!("<victim.version>{suffixed}</victim.version>"))
+                        && wired.contains(&format!("<version>{reference}</version>")),
+                    "the property takes the patched version, the declaration keeps its \
+                     text:\n{wired}"
+                ),
+                Property::Shared | Property::OfParent => assert!(
+                    wired.contains(&format!(
+                        "<version>{suffixed}</version><!-- socket-patch:version {reference} -->"
+                    )),
+                    "{what}: the declaration takes the patched version, and says what it \
+                     replaced:\n{wired}"
+                ),
+            }
+            if property == Property::Shared {
+                assert!(
+                    wired.contains(&format!(
+                        "<fixture.version>{}</fixture.version>",
+                        fixture::BASE
+                    )) && wired.contains(&fixture::dependency(fixture::SIBLING, &reference, "")),
+                    "the property and the sibling that reads it are as they were:\n{wired}"
+                );
+            }
+            assert!(
+                wired.contains(&format!("<id>socket-patch-{UUID}</id>")),
+                "{what}:\n{wired}"
+            );
+
+            let after =
+                fixture::resolve_warm(&mvn, &proj, &bench.m2, &bench.mirrored, "target/after", &[]);
+            bench.assert_only_the_victim_is_patched(what, &before, &after);
+            bench.assert_rescan_is_a_no_op(&proj);
+
+            bench.rollback(&proj);
+            assert_eq!(
+                fixture::snapshot(&proj),
+                pristine,
+                "{what}: rollback restores every file byte for byte and leaves none behind"
+            );
+        }
+    }
+
+    /// A multi-module reactor is patched in hosted mode module by module
+    /// (the table's V3): the module that reaches the base version through
+    /// another artifact gets the pin in its own pom, the module that
+    /// declares it has that declaration rewritten, and the module that
+    /// resolves a newer version is not touched and resolves what it
+    /// resolved before. The repository and the Trusted Checksums sit at
+    /// the root every module inherits, so a Maven started in a module
+    /// directory resolves the patched jar too. `vex` attests the patch
+    /// while every module that resolves the base version is wired, and
+    /// withholds it, naming the module, once one is not. A rollback
+    /// restores every pom byte for byte and removes what the scan created.
+    #[test]
+    #[ignore = "real Maven + Maven Central (dependency plugin); run with --ignored"]
+    fn maven_hosted_patches_a_reactor_module_by_module_and_rolls_back_clean() {
+        let Some(mvn) = Mvn::detect(SUITE) else {
+            return;
+        };
+        let bench = Bench::new();
+        let suffixed = &bench.suffixed;
+        let proj = bench.root.join("reactor");
+        fixture::write_reactor(&proj, &bench.server);
+        let Some(before) =
+            fixture::resolve_reactor(SUITE, &mvn, &proj, &bench.m2, &bench.plain, "target/before")
+        else {
+            return;
+        };
+        let pristine = fixture::snapshot(&proj);
+        let was = |rel: &str| String::from_utf8(pristine[rel].clone()).unwrap();
+        let now = |rel: &str| std::fs::read_to_string(proj.join(rel)).unwrap();
+
+        let (code, env, stderr) = bench.scan(&proj);
+        assert_eq!(code, Some(0), "{env}\n{stderr}");
+        assert_eq!(env["summary"]["applied"], 1, "{env}");
+        assert!(
+            warning(&env, "redirect_maven_multimodule_unsupported").is_none(),
+            "{env}"
+        );
+        let a = now("a/pom.xml");
+        assert!(
+            a.contains(&format!(
+                "<!-- socket-patch {UUID}: {}:{}:{} -->",
+                fixture::GROUP,
+                fixture::VICTIM,
+                fixture::BASE
+            )) && a.contains(&format!("<version>{suffixed}</version>")),
+            "a reaches the base version through another artifact, and is pinned:\n{a}"
+        );
+        assert_eq!(
+            now("c/pom.xml"),
+            was("c/pom.xml").replace(
+                &format!("<version>{}</version>", fixture::BASE),
+                &format!("<version>{suffixed}</version>")
+            ),
+            "c declares the base version, and only that version text changes"
+        );
+        assert_eq!(
+            now("b/pom.xml"),
+            was("b/pom.xml"),
+            "b resolves another version and is not touched"
+        );
+        let root = now("pom.xml");
+        assert!(
+            root.contains(&format!("<id>socket-patch-{UUID}</id>")) && !root.contains(suffixed),
+            "the root takes the repository every module inherits, and no pin:\n{root}"
+        );
+        assert!(proj.join(".mvn/checksums/checksums.sha256").is_file());
+        for module in ["a", "b", "c"] {
+            assert!(
+                !proj.join(module).join(".mvn").exists(),
+                "{module}: the Trusted Checksums are the root's"
+            );
+        }
+
+        let after = fixture::resolve_reactor(
+            SUITE,
+            &mvn,
+            &proj,
+            &bench.m2,
+            &bench.mirrored,
+            "target/after",
+        )
+        .expect("the local repository is warm");
+        for (module, selects, ..) in fixture::REACTOR_MODULES {
+            if selects == fixture::BASE {
+                bench.assert_only_the_victim_is_patched(module, &before[module], &after[module]);
+            } else {
+                assert_eq!(
+                    after[module], before[module],
+                    "{module} resolves what it resolved before"
+                );
+            }
+        }
+        // Started in a module directory, Maven reads the parent pom for the
+        // repository and the root's `.mvn` for the checksums.
+        let from_module = fixture::resolve_warm(
+            &mvn,
+            &proj.join("a"),
+            &bench.m2,
+            &bench.mirrored,
+            "target/from-module",
+            &[],
+        );
+        bench.assert_only_the_victim_is_patched(
+            "a, from its directory",
+            &before["a"],
+            &from_module,
+        );
+        bench.assert_rescan_is_a_no_op(&proj);
+
+        // VEX: attested while every module that resolves the base version
+        // is wired.
+        let api = PatchApi::start(vec![(UUID.to_string(), bench.view.clone())]);
+        let run = VexRun {
+            proxy_url: Some(api.uri()),
+            ..vex_run(&bench.m2)
+        };
+        let out = run_vex(&binary(), &proj, &run);
+        assert_eq!(out.code, Some(0), "{out}");
+        assert_attested(
+            out.doc(),
+            &fixture::purl(),
+            UUID,
+            Marker::Redirected,
+            &[(PATCH.ghsa, &[PATCH.cve])],
+        );
+        // A module that comes to declare the base version itself builds the
+        // unpatched jar, whatever its siblings are wired to.
+        let wired_b = now("b/pom.xml");
+        std::fs::write(
+            proj.join("b/pom.xml"),
+            fixture::module_pom("b", fixture::VICTIM, fixture::BASE),
+        )
+        .unwrap();
+        let out = run_vex(&binary(), &proj, &run);
+        assert_omitted(
+            &out,
+            &fixture::purl(),
+            "vex_maven_reactor_root",
+            "a module that builds the unpatched version",
+        );
+        assert!(
+            out.envelope.to_string().contains("b/pom.xml"),
+            "the note names the module: {out}"
+        );
+        std::fs::write(proj.join("b/pom.xml"), wired_b).unwrap();
+
+        bench.rollback(&proj);
+        assert_eq!(
+            fixture::snapshot(&proj),
+            pristine,
+            "rollback restores every pom byte for byte and removes what the scan created"
+        );
+    }
+
+    /// A declaration Maven reads only while a profile is active is not
+    /// rewritten on its own: the scan would leave a version with no
+    /// repository to serve it, which a build with that profile could not
+    /// resolve and no rollback could find. The scan exits 0, says why, and
+    /// writes nothing; the build with the profile resolves what it did.
+    #[test]
+    #[ignore = "real Maven + Maven Central (dependency plugin); run with --ignored"]
+    fn maven_hosted_leaves_a_declaration_only_a_profile_holds() {
+        let Some(mvn) = Mvn::detect(SUITE) else {
+            return;
+        };
+        let bench = Bench::new();
+        let proj = bench.root.join("profile-only");
+        std::fs::create_dir_all(proj.join("a")).unwrap();
+        std::fs::create_dir_all(proj.join("b")).unwrap();
+        std::fs::write(
+            proj.join("pom.xml"),
+            fixture::reactor_root_pom(&["a", "b"], &bench.server),
+        )
+        .unwrap();
+        let profiled = fixture::module_pom("a", "lib-old", "1.0").replace(
+            "</project>",
+            &format!(
+                "  <profiles>\n    <profile>\n      <id>with-victim</id>\n      \
+                 <dependencies>\n{}      </dependencies>\n    </profile>\n  </profiles>\n</project>",
+                fixture::dependency(fixture::VICTIM, fixture::BASE, "")
+            ),
+        );
+        std::fs::write(proj.join("a/pom.xml"), profiled).unwrap();
+        std::fs::write(
+            proj.join("b/pom.xml"),
+            fixture::module_pom("b", "lib-new", "1.0"),
+        )
+        .unwrap();
+        // Warm the local repository (the dependency plugin, and the base
+        // version the profile brings in).
+        if fixture::resolve(
+            SUITE,
+            &mvn,
+            &proj.join("b"),
+            &bench.m2,
+            &bench.plain,
+            "target/warm",
+        )
+        .is_none()
+        {
+            return;
+        }
+        let with_profile = |out: &str| {
+            fixture::resolve_warm(
+                &mvn,
+                &proj.join("a"),
+                &bench.m2,
+                &bench.plain,
+                out,
+                &["-Pwith-victim"],
+            )
+        };
+        let before = with_profile("target/before");
+        assert!(
+            before.contains_key(&fixture::victim_jar_name(fixture::BASE)),
+            "{:?}",
+            before.keys()
+        );
+        let pristine = fixture::snapshot(&proj);
+
+        let (code, env, stderr) = bench.scan(&proj);
+        assert_eq!(code, Some(0), "{env}\n{stderr}");
+        assert_eq!(
+            fixture::snapshot(&proj),
+            pristine,
+            "the scan writes nothing: {env}"
+        );
+        assert!(
+            warning(&env, "redirect_maven_profile_dependency_unpatched").is_some(),
+            "the scan says why: {env}"
+        );
+        assert_eq!(env["summary"]["failed"], 0, "{env}");
+        assert_eq!(
+            with_profile("target/after"),
+            before,
+            "the profile's build resolves what it did"
+        );
+    }
+
+    /// A single pom that inherits from a parent pom inside the checkout
+    /// (no `<modules>`), its version a property that parent defines: the
+    /// property and the repository are written in the parent's pom, where
+    /// `rollback` finds them. Maven resolves the patched jar, and the
+    /// rollback restores both poms byte for byte.
+    #[test]
+    #[ignore = "real Maven + Maven Central (dependency plugin); run with --ignored"]
+    fn maven_hosted_patches_through_a_parent_pom_of_the_checkout() {
+        let Some(mvn) = Mvn::detect(SUITE) else {
+            return;
+        };
+        let bench = Bench::new();
+        let suffixed = &bench.suffixed;
+        let proj = bench.root.join("local-parent");
+        std::fs::create_dir_all(proj.join("parent")).unwrap();
+        let property = format!(
+            "  <properties>\n    <victim.version>{}</victim.version>\n  </properties>\n",
+            fixture::BASE
+        );
+        let child = fixture::property_pom(fixture::Property::Own, &bench.server)
+            .replace(&property, "")
+            .replace(
+                "  <groupId>com.example</groupId>\n",
+                "  <parent>\n    <groupId>com.example</groupId>\n    \
+                 <artifactId>base</artifactId>\n    <version>1.0.0</version>\n    \
+                 <relativePath>parent/pom.xml</relativePath>\n  </parent>\n  \
+                 <groupId>com.example</groupId>\n",
+            );
+        assert!(!child.contains("<properties>"), "{child}");
+        std::fs::write(proj.join("pom.xml"), &child).unwrap();
+        std::fs::write(
+            proj.join("parent/pom.xml"),
+            format!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+                 <project xmlns=\"http://maven.apache.org/POM/4.0.0\">\n  \
+                 <modelVersion>4.0.0</modelVersion>\n  <groupId>com.example</groupId>\n  \
+                 <artifactId>base</artifactId>\n  <version>1.0.0</version>\n  \
+                 <packaging>pom</packaging>\n{property}</project>\n"
+            ),
+        )
+        .unwrap();
+        let Some(before) =
+            fixture::resolve(SUITE, &mvn, &proj, &bench.m2, &bench.plain, "target/before")
+        else {
+            return;
+        };
+        let pristine = fixture::snapshot(&proj);
+
+        let (code, env, stderr) = bench.scan(&proj);
+        assert_eq!(code, Some(0), "{env}\n{stderr}");
+        assert_eq!(env["summary"]["applied"], 1, "{env}");
+        let parent = std::fs::read_to_string(proj.join("parent/pom.xml")).unwrap();
+        assert!(
+            parent.contains(&format!("<victim.version>{suffixed}</victim.version>"))
+                && parent.contains(&format!("<id>socket-patch-{UUID}</id>")),
+            "the parent takes the property and the repository:\n{parent}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(proj.join("pom.xml")).unwrap(),
+            child,
+            "the pom that declares it keeps its text"
+        );
+        let after =
+            fixture::resolve_warm(&mvn, &proj, &bench.m2, &bench.mirrored, "target/after", &[]);
+        bench.assert_only_the_victim_is_patched("a local parent", &before, &after);
+        bench.assert_rescan_is_a_no_op(&proj);
+
+        bench.rollback(&proj);
+        assert_eq!(
+            fixture::snapshot(&proj),
+            pristine,
+            "rollback restores both poms byte for byte and leaves no file behind"
+        );
+    }
+
+    /// A newer patch of the same version takes the place of an earlier
+    /// one only where the poms let it. A module that still reads the
+    /// earlier patch's version (through a property a profile may redefine,
+    /// which no scan rewrites) keeps resolving it: the earlier patch's
+    /// repository and checksum lines stay for as long as any pom of the
+    /// reactor names it, so Maven resolves both modules.
+    #[test]
+    #[ignore = "real Maven + Maven Central (dependency plugin); run with --ignored"]
+    fn maven_hosted_keeps_an_earlier_patch_served_while_a_module_names_it() {
+        const NEWER_UUID: &str = "8192a3b4-c5d6-4e7f-8a9b-0c1d2e3f4a5b";
+        const NEWER: Hosted = Hosted {
+            org: ORG,
+            uuid: NEWER_UUID,
+            hex8: "8192a3b4",
+            token: "44444444-5555-4666-8777-888888888888",
+            ghsa: "GHSA-mediation-maven-newer",
+            cve: "CVE-2026-7204",
+            group: fixture::GROUP,
+            artifact: fixture::VICTIM,
+            version: fixture::BASE,
+            title: "maven mediation capstone, superseding",
+        };
+        let Some(mvn) = Mvn::detect(SUITE) else {
+            return;
+        };
+        let bench = Bench::new();
+        let earlier = &bench.suffixed;
+        let proj = bench.root.join("superseded");
+        std::fs::create_dir_all(proj.join("a")).unwrap();
+        std::fs::create_dir_all(proj.join("b")).unwrap();
+        std::fs::write(
+            proj.join("pom.xml"),
+            fixture::reactor_root_pom(&["a", "b"], &bench.server),
+        )
+        .unwrap();
+        std::fs::write(
+            proj.join("a/pom.xml"),
+            fixture::module_pom("a", "lib-deep", "1.0"),
+        )
+        .unwrap();
+        let b = fixture::module_pom("b", fixture::VICTIM, "${victim.version}").replace(
+            "  <dependencies>\n",
+            &format!(
+                "  <properties>\n    <victim.version>{}</victim.version>\n  </properties>\n  \
+                 <dependencies>\n",
+                fixture::BASE
+            ),
+        );
+        std::fs::write(proj.join("b/pom.xml"), b).unwrap();
+        let resolve_module = |module: &str, settings: &Path, out: &str| {
+            fixture::resolve_warm(&mvn, &proj.join(module), &bench.m2, settings, out, &[])
+        };
+        if fixture::resolve(
+            SUITE,
+            &mvn,
+            &proj.join("a"),
+            &bench.m2,
+            &bench.plain,
+            "target/before",
+        )
+        .is_none()
+        {
+            return;
+        }
+        resolve_module("b", &bench.plain, "target/before");
+
+        // The earlier patch: both modules resolve its build.
+        let (code, env, stderr) = bench.scan(&proj);
+        assert_eq!(code, Some(0), "{env}\n{stderr}");
+        assert_eq!(env["summary"]["applied"], 1, "{env}");
+        let read = |rel: &str| std::fs::read_to_string(proj.join(rel)).unwrap();
+        assert!(
+            read("b/pom.xml").contains(&format!("<victim.version>{earlier}</victim.version>")),
+            "{}",
+            read("b/pom.xml")
+        );
+        for module in ["a", "b"] {
+            let jars = resolve_module(module, &bench.mirrored, "target/earlier");
+            assert!(
+                jars.contains_key(&fixture::victim_jar_name(earlier)),
+                "{module}: {:?}",
+                jars.keys()
+            );
+        }
+        // b's property comes to be redefined by a profile: from here on no
+        // scan may rewrite it, since that profile's build keeps its own.
+        let profiled = read("b/pom.xml").replace(
+            "</project>",
+            &format!(
+                "  <profiles>\n    <profile>\n      <id>older</id>\n      <properties>\n        \
+                 <victim.version>{}</victim.version>\n      </properties>\n    </profile>\n  \
+                 </profiles>\n</project>",
+                fixture::OLDER
+            ),
+        );
+        std::fs::write(proj.join("b/pom.xml"), &profiled).unwrap();
+
+        // The newer patch, from its own server.
+        let server = Server::start();
+        let patched_jar = fixture::patched_victim_jar();
+        let newer = NEWER.suffixed();
+        let served_pom = fixture::served_victim_pom(&newer).into_bytes();
+        let view = patch_view(
+            NEWER_UUID,
+            &fixture::purl(),
+            &[(
+                &fixture::victim_jar_name(fixture::BASE),
+                &git_sha256(&patched_jar),
+            )],
+            &[(NEWER.ghsa, &[NEWER.cve])],
+        );
+        hosted_maven_common::mount_api(&server, &NEWER, &patched_jar, &served_pom, &view);
+        fixture::answer_lookups_only_for(&server, ORG, &fixture::purl()["pkg:maven/".len()..]);
+        server.serve_repo(&NEWER, &patched_jar, &served_pom, None);
+        let (code, env, stderr) = socket(
+            &proj,
+            &bench.m2,
+            &[
+                "scan",
+                "--mode",
+                "hosted",
+                "--json",
+                "--yes",
+                "--cwd",
+                proj.to_str().unwrap(),
+                "--api-url",
+                &server.uri(),
+                "--org",
+                ORG,
+                "--api-token",
+                "fake",
+            ],
+        );
+        assert_eq!(code, Some(0), "{env}\n{stderr}");
+        assert_eq!(read("b/pom.xml"), profiled, "b is left as it is: {env}");
+        assert!(
+            read("a/pom.xml").contains(&newer) || read("pom.xml").contains(&newer),
+            "a moves to the newer patch: {env}"
+        );
+        let root = read("pom.xml");
+        assert!(
+            root.contains(&format!("<id>socket-patch-{UUID}</id>"))
+                && root.contains(&format!("<id>socket-patch-{NEWER_UUID}</id>")),
+            "both patches are still served: {root}"
+        );
+        let sums = read(".mvn/checksums/checksums.sha256");
+        assert!(
+            sums.contains(earlier.as_str()) && sums.contains(&newer),
+            "both patches keep their checksum lines:\n{sums}"
+        );
+
+        // Maven resolves both modules, each from the repository of the
+        // patch its pom names; the earlier one is fetched afresh.
+        let _ = std::fs::remove_dir_all(fixture::victim_dir(&bench.m2, earlier));
+        let both = bench.root.join("settings-both.xml");
+        write_settings(
+            &both,
+            &[
+                (
+                    &format!("socket-patch-{UUID}"),
+                    &format!("{}{}", bench.server.uri(), PATCH.repo_path()),
+                ),
+                (
+                    &format!("socket-patch-{NEWER_UUID}"),
+                    &format!("{}{}", server.uri(), NEWER.repo_path()),
+                ),
+            ],
+        );
+        let a = resolve_module("a", &both, "target/newer");
+        assert!(
+            a.contains_key(&fixture::victim_jar_name(&newer)),
+            "a builds the newer patch: {:?}",
+            a.keys()
+        );
+        let b = resolve_module("b", &both, "target/newer");
+        assert!(
+            b.contains_key(&fixture::victim_jar_name(earlier)),
+            "b still builds the earlier patch, from its repository: {:?}",
+            b.keys()
+        );
+    }
+
+    /// Every file under `from`, copied into the new directory `to`.
+    fn copy_tree(from: &Path, to: &Path) {
+        std::fs::create_dir_all(to).unwrap();
+        for entry in std::fs::read_dir(from).unwrap() {
+            let entry = entry.unwrap();
+            let target = to.join(entry.file_name());
+            if entry.file_type().unwrap().is_dir() {
+                copy_tree(&entry.path(), &target);
+            } else {
+                std::fs::copy(entry.path(), &target).unwrap();
+            }
+        }
+    }
+
+    /// A company's `<mirrorOf>*</mirrorOf>` sends every repository to its
+    /// repository manager, the Socket one included, and the manager does
+    /// not hold the patched version:
+    ///
+    /// - a project wired where no such mirror is configured no longer
+    ///   builds behind it (the bug);
+    /// - a scan that finds the mirror in the settings Maven would be
+    ///   started with writes nothing, exits 0 and says why, naming the
+    ///   mirror, its settings file and the two ways forward, and the
+    ///   project builds behind the mirror as it did;
+    /// - once the mirror leaves the Socket repository out, the same scan
+    ///   wires the project, and it builds behind the mirror with the
+    ///   patched jar.
+    #[test]
+    #[ignore = "real Maven + Maven Central (dependency plugin); run with --ignored"]
+    fn maven_hosted_is_not_wired_behind_a_mirror_that_takes_every_repository() {
+        let Some(mvn) = Mvn::detect(SUITE) else {
+            return;
+        };
+        let b = Bench::new();
+        let proj = b.root.join("guarded");
+        fixture::write_project(&proj, Shape::Selected, &b.server);
+        let Some(before) = fixture::resolve(SUITE, &mvn, &proj, &b.m2, &b.plain, "target/before")
+        else {
+            return;
+        };
+        let pristine = fixture::snapshot(&proj);
+        // The company's repository manager serves what the fixture
+        // repository serves. (It keeps the id `central`, so the dependency
+        // plugin the local repository holds is not fetched again.)
+        let id = format!("socket-patch-{UUID}");
+        let manager = format!("{}{}", b.server.uri(), fixture::REPO_ROUTE);
+        let corp = b.root.join("settings-corp.xml");
+        write_settings_with_ids(&corp, &[("central", "*", &manager)]);
+        let maven_args = |settings: &Path| format!("-s {}", settings.display());
+        // A local repository with the dependency plugin and none of the
+        // project's artifacts: what a build behind the mirror starts from.
+        // (Maven only probes, with a HEAD the test's server does not
+        // answer, for an artifact it holds from another repository id.)
+        let cold = |tag: &str| -> PathBuf {
+            let m2 = b.root.join(format!("m2-{tag}"));
+            copy_tree(&b.m2, &m2);
+            std::fs::remove_dir_all(m2.join("com").join("socketfixture")).unwrap();
+            m2
+        };
+
+        // Unguarded: wired where no mirror is configured, then built
+        // behind the mirror.
+        let wired = b.root.join("wired");
+        fixture::write_project(&wired, Shape::Selected, &b.server);
+        let (code, env, stderr) = b.scan(&wired);
+        assert_eq!(code, Some(0), "{env}\n{stderr}");
+        assert_eq!(env["summary"]["applied"], 1, "{env}");
+        let out = mvn.copy_dependencies(&wired, &cold("unguarded"), &corp, "target/after");
+        assert!(
+            !ok(&out) && dump(&out).contains(&b.suffixed),
+            "the mirror cannot serve the patched version:\n{}",
+            dump(&out)
+        );
+
+        // Guarded: the scan reads the settings Maven would be started with.
+        let (code, env, stderr) = b.scan_with(&proj, &[("MAVEN_ARGS", &maven_args(&corp))]);
+        assert_eq!(code, Some(0), "{env}\n{stderr}");
+        assert_eq!(env["summary"]["applied"], 0, "{env}");
+        assert_eq!(env["summary"]["failed"], 0, "{env}");
+        let detail = warning(&env, "redirect_maven_mirror_captures_repository")
+            .unwrap_or_else(|| panic!("the scan says why: {env}"))["detail"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        for names in [
+            "`central`",
+            "<mirrorOf>*</mirrorOf>",
+            corp.to_str().unwrap(),
+            &format!("<mirrorOf>*,!{id}</mirrorOf>"),
+            "scan --mode vendored",
+            "Only this machine's settings were read",
+        ] {
+            assert!(detail.contains(names), "{names}: {detail}");
+        }
+        assert_eq!(
+            fixture::snapshot(&proj),
+            pristine,
+            "the project is left untouched: {env}"
+        );
+        assert_eq!(
+            fixture::resolve_warm(&mvn, &proj, &cold("guarded"), &corp, "target/guarded", &[]),
+            before,
+            "and builds behind the mirror as it did"
+        );
+
+        // The first way forward: the mirror leaves the repository out.
+        // (The Socket repository is itself mirrored onto the test's
+        // server, under its own id, which is what a mirror written for
+        // that one repository looks like.)
+        let excluding = b.root.join("settings-corp-excluding.xml");
+        let socket_url = format!("{}{}", b.server.uri(), PATCH.repo_path());
+        write_settings_with_ids(
+            &excluding,
+            &[
+                ("central", &format!("*,!{id}"), &manager),
+                (&id, &id, &socket_url),
+            ],
+        );
+        let (code, env, stderr) = b.scan_with(&proj, &[("MAVEN_ARGS", &maven_args(&excluding))]);
+        assert_eq!(code, Some(0), "{env}\n{stderr}");
+        assert_eq!(env["summary"]["applied"], 1, "{env}");
+        assert!(
+            warning(&env, "redirect_maven_mirror_captures_repository").is_none(),
+            "{env}"
+        );
+        let after = fixture::resolve_warm(
+            &mvn,
+            &proj,
+            &cold("excluding"),
+            &excluding,
+            "target/excluded",
+            &[],
+        );
+        b.assert_only_the_victim_is_patched("behind the excluding mirror", &before, &after);
     }
 }

@@ -964,9 +964,9 @@ Honest limits of the Maven and NuGet flows — documented behavior, not bugs:
   so a resolver that can't reach the Socket repo, or is handed different bytes, has
   nowhere to fall through to: the build **hard-fails** instead of silently resolving the
   unpatched upstream artifact. The `<repository>`'s `checksumPolicy=fail` still verifies
-  the transport-level `.jar.sha1` sidecar on top. A `${property}` version is refused
-  (`redirect_maven_dep_unpinned`) — a literal edit would break the property reference and
-  a depMgmt pin could strand sibling artifacts sharing the property. A literal version
+  the transport-level `.jar.sha1` sidecar on top. A `${property}` version is patched
+  without stranding an artifact that shares the property (see **Property versions**
+  below). A literal version
   that matches neither the base nor the suffixed value is skipped
   (`redirect_maven_dep_version_mismatch`). A `<base>-socket.<hex8>` literal left by an
   earlier hosted patch for the same release (the pom declares that patch's
@@ -1023,13 +1023,59 @@ Honest limits of the Maven and NuGet flows — documented behavior, not bugs:
   to patch and is left out of an agent scan. Maven 4 builds, profiles that declare
   dependencies or management, relocations and dependency cycles are not modelled: the
   artifacts they touch count as not readable.
-* **Multi-module reactors are vendored-only (hosted Maven).** Hosted mode reads only
-  the root `pom.xml`, and a module's own literal `<version>` always beats a root
-  `<dependencyManagement>` pin, so a root pin would leave that module on the unpatched
-  upstream jar. A root that declares `<modules>` or `<subprojects>` (directly or in a
-  profile) is therefore refused with `redirect_maven_multimodule_unsupported` (`pom.xml` and
-  `.mvn/` are left untouched and the dep is not counted as redirected); use `scan --mode vendored`, whose reactor planner rewrites each module's
-  declaration. `vex` likewise does not attest a hosted pin found in a reactor root.
+* **Multi-module reactors (hosted Maven).** A root that declares `<modules>` or
+  `<subprojects>` (directly or in a profile, or a Maven 4 root whose subprojects Maven
+  discovers) is patched module by module, with pom edits only, by the planner vendored
+  mode uses. A declaration that names the patched version is rewritten where it stands,
+  in whichever pom holds it. The `<dependencyManagement>` pin goes in the highest pom
+  whose modules all resolve the artifact at that version or not at all: the root when
+  the whole reactor agrees, else the modules that do, down to one module's own
+  `pom.xml`. A module that resolves another version is never reached and resolves what
+  it resolved before. Such a pin carries the comment vendored pins carry
+  (`<!-- socket-patch <uuid>: g:a:v -->`), which is how a later run tells it from the
+  project's own management. The `<repository>` goes in the local root every wired pom
+  inherits (a module whose parent is not in the checkout gets its own), and the Trusted
+  Checksums stay in the project root's `.mvn/`, which Maven also reads when it is
+  started in a module directory or with `-f`; a module with a `.mvn` of its own is
+  reported (`redirect_maven_trusted_checksums_unenforced`), since a Maven started there
+  reads that one. A reactor one of whose poms cannot be read is left untouched
+  (`redirect_maven_multimodule_unsupported`, with the reason). A pom that is there but is
+  not UTF-8 text (re-saved as Latin-1 or UTF-16, say) is never taken for a missing one:
+  the scan refuses the run and names it (`candidate_file_unreadable`), `vex` reports it
+  as unreadable and attests no pin of that reactor, and `rollback` / `remove` change
+  nothing until it is UTF-8 again, since it may hold part of a pin. The plan for a patch is
+  written whole or not at all: a pom is never left naming a patched version without the
+  repository that serves it, its checksum lines, and wiring a rollback can find. So a
+  declaration only a `<profile>` holds is not rewritten on its own
+  (`redirect_maven_profile_dependency_unpatched`), and neither is anything when the pom
+  that must take the repository cannot (`redirect_maven_pom_unreadable`), or when a
+  rollback could not put a pom back exactly (`redirect_maven_edit_not_reversible`). When
+  a later scan takes out the last pin of a patch (the module it reached moved to another
+  version), the repository and the checksum lines go with it. `vex` attests the patch
+  only when every module that resolves the patched version, or may, is reached by a pin
+  or a declaration; otherwise it withholds the statement and names the module
+  (`vex_maven_reactor_root`). `rollback` and `remove` undo the wiring in every pom that
+  carries part of it, or in none, and restore each byte for byte.
+* **Property versions (hosted Maven).** A declaration whose `<version>` is a
+  `${property}` is patched in one of two ways, and neither moves another artifact. When
+  the reactor's own poms define the property once and nothing but declarations of the
+  patched artifact reads it, the property's value takes the patched version and the
+  declarations keep their text. Otherwise (a sibling artifact reads it too, a profile or
+  `.mvn/maven.config` may redefine it, or a parent pom outside the checkout defines it)
+  the one declaration takes the literal patched version, and the text it replaced is
+  recorded in a comment right after it:
+  `<version>1.2-socket.0a1b2c3d</version><!-- socket-patch:version ${lib.version} -->`.
+  Rollback reads that comment back, so the declaration returns to its `${...}` text
+  exactly. Such a declaration no longer follows the property: bump the property and the
+  patched artifact stays where it is until the next `scan`. A property no pom of the
+  checkout defines is read from what Maven selects for the modules that read the
+  declaration; when that cannot be told (the parent pom is not in the local Maven
+  repository yet) the declaration is left as it is (`redirect_maven_dep_unpinned`).
+  A version-less declaration a parent or BOM manages needs no edit of its own: the
+  `<dependencyManagement>` pin overrides the management. A single pom that inherits
+  from a parent pom inside the checkout is read together with it: a property that parent
+  defines is rewritten there, and the repository goes in the parent the pom inherits it
+  from; `list`, `vex`, `rollback` and `remove` read both poms.
 * **A parent pom can override a managed pin (hosted Maven).** For a dependency with no
   literal `<version>` in the root pom (a transitive one, or one whose version a parent
   manages), hosted mode pins it in the root pom's `<dependencyManagement>`
@@ -1178,14 +1224,50 @@ Honest limits of the Maven and NuGet flows — documented behavior, not bugs:
   applied. To clear them, add a Maven Wrapper pinned to Maven 3.9.9 or later, or make
   sure your `settings.xml` mirrors exclude `socket-patch-vendor` (for example
   `<mirrorOf>external:*</mirrorOf>` or `<mirrorOf>*,!socket-patch-vendor</mirrorOf>`).
-* **`mirrorOf` mirrors (hosted Maven).** A `settings.xml` `<mirror>` with
-  `<mirrorOf>*</mirrorOf>` (common in corporate environments) reroutes *all* repositories
-  — including the injected `socket-patch-<uuid>` repository — through the mirror. Because
-  the patch resolves only at the suffixed version, the mirror (which does not carry it)
-  can't serve it and the **build fails loudly** rather than silently going unpatched.
-  Scope the mirror to exclude the Socket repos (e.g.
-  `<mirrorOf>*,!socket-patch-*</mirrorOf>`) so the redirect resolves; the
-  `originAware=false` Trusted Checksums act as a backstop when present.
+* **`mirrorOf` mirrors (hosted Maven).** A `settings.xml` `<mirror>` whose
+  `<mirrorOf>` is `*` or `external:*` (common in corporate environments) sends *every*
+  repository to the mirror, the `socket-patch-<uuid>` repository hosted mode adds
+  included. The patch resolves only at its suffixed version, which the mirror does not
+  hold, so a project wired behind such a mirror **fails to build**. `scan --mode hosted`
+  therefore reads the Maven settings of the machine it runs on before it writes a Maven
+  pin, and wires nothing for a patch whose repository a mirror would take over: the
+  poms and `.mvn/` stay as they are, the scan exits 0, and
+  `redirect_maven_mirror_captures_repository` names the mirror, the settings file that
+  declares it, and the two ways forward:
+  - **Leave the repository out of the mirror.** Add `!socket-patch-<uuid>` to its
+    `<mirrorOf>` (`<mirrorOf>*,!socket-patch-<uuid></mirrorOf>`), with no space around
+    it, on every machine that builds, then scan again. Maven compares whole repository
+    ids: there is no pattern for "every Socket repository" (`!socket-patch-*` excludes
+    nothing), and each patch has its own id, so each new patch needs its own exclusion.
+  - **Use vendored mode, on Maven 3.9.2 or later.** `scan --mode vendored` commits the
+    patched artifact and reads it through `maven.repo.local.tail`, which no mirror
+    redirects. Maven reads that setting from 3.9.2 on. An older Maven reads a vendored
+    patch through the `socket-patch-vendor` file repository, which a mirror of everything
+    takes as well, so there vendored mode needs the mirror to leave `socket-patch-vendor`
+    out (one id for every vendored patch). The warning says which applies: when the
+    project's Maven Wrapper pins a Maven older than 3.9.2 it does not offer vendored mode
+    as the project stands.
+
+  What is read: the user settings (`-s` / `--settings` in `MAVEN_ARGS`, then in
+  `.mvn/maven.config`, else `~/.m2/settings.xml`) merged over the global settings (`-gs`
+  / `--global-settings` likewise, else `conf/settings.xml` of the Maven Wrapper's
+  unpacked distribution, of the `mvn` on `PATH`, or, with none there, of `$MAVEN_HOME`
+  / `$M2_HOME`), and a `.mvn/settings.xml` the project keeps. `.mvn/maven.config` is
+  read as the project's Maven reads it: one argument per line from Maven 3.9 on (so a
+  settings path may hold spaces), split on whitespace before; the Maven Wrapper's
+  release decides, and without a wrapper both readings are weighed. The matching is
+  Maven's own: a mirror whose `<mirrorOf>` names the repository's id, alone or in a list
+  (`central,socket-patch-<uuid>`), was written for that repository and is not a reason
+  to skip; a mirror with no `<id>` counts under Maven's default id; `external:http:*` (the blocker Maven ships) never matches the
+  HTTPS Socket repository; `<mirrorOfLayouts>` is honoured. **Only the scanning
+  machine's settings are known.** A build machine with another `settings.xml` (a CI
+  image, a colleague's laptop) is not seen: a project wired here still fails there
+  behind a mirror that takes every repository, and a project skipped here may have built
+  there. The in-memory engine (a Socket-opened pull request) reads no settings at all.
+  A project an earlier scan wired is left as it is and reported the same way, and is no
+  longer counted as redirected or attested by that scan's `--vex`. The skip is only for
+  a patch that would get the repository: one the scan would not wire anyway (the build
+  selects another version) is reported under its own reason.
 * **Gradle (hosted Maven).** Gradle builds get automated wiring, not a pasted snippet:
   an owned settings script pins the suffixed version, every lock file is rewritten,
   and a tripwire fails the build if the base version still resolves. See

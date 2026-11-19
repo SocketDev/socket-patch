@@ -17,6 +17,7 @@ pub(crate) use properties::{
 
 use super::xml::{blank_non_markup, child_text, elements, open_tags, Element};
 
+pub(crate) mod mirror;
 pub(crate) mod declared_maven;
 pub(crate) mod trusted_checksums;
 pub(crate) mod version;
@@ -1009,20 +1010,28 @@ fn java_trim(s: &str) -> &str {
     s.trim_matches(|c: char| c <= ' ')
 }
 
-/// [`maven_config_properties`] as Maven 3.9+ alone reads it: only the
-/// argument a whole line holds, never a token of the older whitespace split.
-pub(crate) fn maven_config_line_properties(config: &str) -> BTreeMap<String, String> {
-    let trim = java_trim;
+/// The arguments of a `maven.config` as Maven 3.9+ (and Maven 4) reads the
+/// file: one per line, so an argument may hold spaces (a settings path,
+/// say); each line trimmed, a wholly quoted one unquoted, `#` lines and
+/// empty ones dropped. Maven before 3.9 splits the whole file on
+/// whitespace instead.
+pub(crate) fn maven_config_line_args(config: &str) -> impl Iterator<Item = &str> {
     fn unquote(s: &str) -> &str {
         s.strip_prefix('"')
             .and_then(|s| s.strip_suffix('"'))
             .map_or(s, java_trim)
     }
-    let mut args = config
+    config
         .lines()
-        .map(|line| unquote(trim(line)))
+        .map(|line| unquote(java_trim(line)))
         .filter(|arg| !arg.is_empty() && !arg.starts_with('#'))
-        .peekable();
+}
+
+/// [`maven_config_properties`] as Maven 3.9+ alone reads it: only the
+/// argument a whole line holds, never a token of the older whitespace split.
+pub(crate) fn maven_config_line_properties(config: &str) -> BTreeMap<String, String> {
+    let trim = java_trim;
+    let mut args = maven_config_line_args(config).peekable();
     let mut props = BTreeMap::new();
     while let Some(arg) = args.next() {
         let def = match arg.strip_prefix("--define") {
