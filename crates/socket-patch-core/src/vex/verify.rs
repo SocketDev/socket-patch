@@ -61,6 +61,13 @@ pub struct VerifyOutcome {
     /// purl that does not verify — the copy a build may still load
     /// unpatched. Callers name them (`vex_gradle_unpatched_copy`).
     pub unpatched_copies: Vec<(String, PathBuf)>,
+    /// The subset of `applied` that is attested with nothing applied: in
+    /// every installed copy, no file of the patch is part of the build
+    /// installed there (the JRuby build of a gem, for a patch to its C
+    /// extension). The code the patch changes is not present, which is
+    /// what the statement must say: it is not a mitigation that was put
+    /// in place.
+    pub code_not_present: Vec<String>,
 }
 
 /// Vendored-patch context for [`applied_patches_with_vendor`].
@@ -220,7 +227,14 @@ pub async fn applied_patches_with_copies(
                 }
                 first_failure.map_or(Ok(()), Err)
             } else if Ecosystem::from_purl(purl) == Some(Ecosystem::Gem) {
-                verify_every_gem_copy(purl, paths, record).await
+                match verify_every_gem_copy(purl, paths, record).await {
+                    Ok(GemVerdict::CodeNotPresent) => {
+                        out.code_not_present.push(purl.clone());
+                        Ok(())
+                    }
+                    Ok(GemVerdict::Patched) => Ok(()),
+                    Err(reason) => Err(reason),
+                }
             } else {
                 verify_every_copy(paths, record).await
             }
@@ -512,24 +526,42 @@ async fn verify_every_copy(paths: &[PathBuf], record: &PatchRecord) -> Result<()
 /// the build never had: nothing here knows the `java` gem's file list,
 /// and failing a patch that is applied is the worse error. (Any other
 /// file the record replaces must be there: a missing Ruby file fails.)
+///
+/// When no copy takes any file of the record, nothing was applied
+/// anywhere and the verdict says so ([`GemVerdict::CodeNotPresent`]): the
+/// statement is then about code that is not present, not about a patch
+/// that was put in place.
 async fn verify_every_gem_copy(
     purl: &str,
     paths: &[PathBuf],
     record: &PatchRecord,
-) -> Result<(), String> {
+) -> Result<GemVerdict, String> {
     use crate::patch::gem_ext::InstalledGem;
     if record.files.is_empty() {
         return Err("no_files".to_string());
     }
+    let mut verdict = GemVerdict::CodeNotPresent;
     for path in paths {
         let gem = InstalledGem::at(path).await;
         let files = gem.record_files(purl, &record.files).await;
         if !files.is_empty() {
             verify_patch_files(path, &files).await?;
+            verdict = GemVerdict::Patched;
         }
         gem.verify_native_build(purl, &record.files).await?;
     }
-    Ok(())
+    Ok(verdict)
+}
+
+/// Why the installed copies of a gem pass ([`verify_every_gem_copy`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GemVerdict {
+    /// Some copy holds the patch's files, and every copy that takes any
+    /// of them holds them patched.
+    Patched,
+    /// No copy takes any file of the patch: the code it changes is in no
+    /// build installed here.
+    CodeNotPresent,
 }
 
 /// [`HostedCopies`] verdict: no consumed copy is `package_not_found`; every
@@ -3000,5 +3032,106 @@ mod tests {
         crate::patch::apply::normalize_file_path(name)
             .trim_start_matches(['/', '.'])
             .to_string()
+    }
+
+    /// A hand-laid JRuby copy of the gem `a` (its `java` platform build):
+    /// a Ruby file and the jar it runs.
+    fn jruby_gem(home: &Path) -> PathBuf {
+        let gem_dir = home.join("gems/a-1-java");
+        std::fs::create_dir_all(gem_dir.join("lib/a")).unwrap();
+        std::fs::write(gem_dir.join("lib/a.rb"), b"patched").unwrap();
+        std::fs::write(gem_dir.join("lib/a/a.jar"), b"PK jar").unwrap();
+        std::fs::create_dir_all(home.join("specifications")).unwrap();
+        std::fs::write(
+            home.join("specifications/a-1-java.gemspec"),
+            "Gem::Specification.new do |s|\n  s.name = \"a\".freeze\n  \
+             s.version = \"1\".freeze\n  s.platform = \"java\".freeze\n  \
+             s.require_paths = [\"lib\".freeze]\nend\n",
+        )
+        .unwrap();
+        gem_dir
+    }
+
+    /// A JRuby copy that takes no file of a ruby-platform record is
+    /// attested, and the outcome says on what basis: the code the patch
+    /// changes is not present. A copy that holds a patched file of the
+    /// record is patched, with one copy of each the package is patched,
+    /// and a Ruby file the copy lacks is a missing file, not absent code.
+    #[tokio::test]
+    async fn a_gem_copy_with_none_of_the_patchs_code_is_code_not_present() {
+        let tmp = tempfile::tempdir().unwrap();
+        let jruby = jruby_gem(&tmp.path().join("jruby"));
+        let purl = "pkg:gem/a@1?platform=ruby".to_string();
+        let file = |before: &str, after: &str| PatchFileInfo {
+            before_hash: before.to_string(),
+            after_hash: after.to_string(),
+        };
+        let record_of = |files: &[(&str, PatchFileInfo)]| {
+            let mut record = record_with_one_file("unused");
+            record.files = files
+                .iter()
+                .map(|(key, info)| (key.to_string(), info.clone()))
+                .collect();
+            record
+        };
+        let outcome = |record: PatchRecord, copies: Vec<PathBuf>| {
+            let purl = purl.clone();
+            async move {
+                let mut manifest = PatchManifest::new();
+                manifest.patches.insert(purl.clone(), record);
+                let copies = HashMap::from([(purl, copies)]);
+                applied_patches_with_copies(&manifest, &copies, None).await
+            }
+        };
+        let patched_hash = compute_git_sha256_from_bytes(b"patched");
+
+        // A patch to the C build alone: nothing of it is in the JRuby gem.
+        let c_only = record_of(&[
+            ("patches/lib/0001.patch", file("", "bbbb")),
+            ("ext/a/a.c", file("aaaa", "bbbb")),
+        ]);
+        let out = outcome(c_only.clone(), vec![jruby.clone()]).await;
+        assert_eq!(out.applied, vec![purl.clone()]);
+        assert_eq!(out.code_not_present, vec![purl.clone()]);
+
+        // A record whose Ruby file the copy holds patched: patched.
+        let with_ruby = record_of(&[
+            ("lib/a.rb", file("aaaa", &patched_hash)),
+            ("patches/lib/0001.patch", file("", "bbbb")),
+        ]);
+        let out = outcome(with_ruby.clone(), vec![jruby.clone()]).await;
+        assert_eq!(out.applied, vec![purl.clone()]);
+        assert!(out.code_not_present.is_empty());
+
+        // The same package in two homes, one of which holds the patch.
+        let mri = tmp.path().join("mri/gems/a-1");
+        std::fs::create_dir_all(mri.join("patches/lib")).unwrap();
+        std::fs::create_dir_all(mri.join("lib")).unwrap();
+        std::fs::write(mri.join("lib/a.rb"), b"patched").unwrap();
+        std::fs::write(mri.join("patches/lib/0001.patch"), b"p").unwrap();
+        let both = record_of(&[
+            ("lib/a.rb", file("aaaa", &patched_hash)),
+            (
+                "patches/lib/0001.patch",
+                file("", &compute_git_sha256_from_bytes(b"p")),
+            ),
+        ]);
+        let out = outcome(both, vec![jruby.clone(), mri]).await;
+        assert_eq!(out.applied, vec![purl.clone()]);
+        assert!(out.code_not_present.is_empty());
+
+        // A Ruby file the JRuby copy lacks is missing: the patch is not
+        // applied, and nothing is said about absent code.
+        let deleted = record_of(&[("lib/a/gone.rb", file("aaaa", "bbbb"))]);
+        let out = outcome(deleted, vec![jruby]).await;
+        assert!(out.applied.is_empty());
+        assert!(out.code_not_present.is_empty());
+        assert_eq!(
+            out.failed,
+            vec![FailedPatch {
+                purl: purl.clone(),
+                reason: "file_not_found".to_string(),
+            }]
+        );
     }
 }
