@@ -36,6 +36,19 @@
 # `apply` again (nothing to do), `vex` and `rollback`, and then compares
 # every file of the gem home with the install it started from.
 #
+# JRuby installs nokogiri's `java` platform gem, which runs jars and has no
+# C extension and no libxml2. It takes of a record what is part of that
+# build, and nothing is built there:
+#
+#   ruby     applied, as on any Ruby.
+#   c        the `java` gem ships the C sources too (nothing compiles them),
+#            so the file is written and the patch is in sync and attested;
+#            JRuby loads no C constant and the jars it loaded before.
+#   libxml2  the `java` gem has no libxml2 patch directory: no file of the
+#            record is part of it. `apply` exits 0, writes nothing and says
+#            so, and the install is in sync and attested: the code the
+#            patch fixes is not in that build.
+#
 #   ruby tests/nokogiri/nokogiri_e2e.rb --socket-patch target/debug/socket-patch \
 #     --nokogiri 1.18.10 --install precompiled
 #
@@ -267,8 +280,9 @@ class NokogiriE2E
              elsif lib == "system" then "system-libraries"
              else "source"
              end
+    loads = @java ? "#{@baseline['jars'].size} jars" : (@baseline["binary"] || "no native binary")
     puts "Installed #{@full_name}: #{@shape}, libxml2 #{@baseline['libxml_loaded']} (#{lib}), " \
-         "#{@baseline['libxml_patches'].size} libxml2 patches, loads #{@baseline['binary'] || 'no native binary'}"
+         "#{@baseline['libxml_patches'].size} libxml2 patches, loads #{loads}"
     if @opts[:rails]
       puts "Rails #{@baseline['rails']} boots and sanitizes HTML through it: #{@baseline['rails_sanitize'].inspect}"
       check(@baseline["rails"].to_s.start_with?(@opts[:rails].sub(/\A[^0-9]*/, "")[/\A\d+\.\d+/]),
@@ -279,6 +293,10 @@ class NokogiriE2E
     end
     want = @opts.fetch(:install)
     check(want == "any" || want == @shape, "the install is #{want}", "it is #{@shape}: #{@full_name}")
+    if @java
+      check(@baseline["jars"].keys.include?("nokogiri.jar") && @baseline["binary"].nil?,
+            "JRuby loads nokogiri's jars and no C extension", @baseline["jars"].keys.inspect)
+    end
     check(@baseline[RB_CONST].nil? && @baseline[C_CONST].nil?, "a fresh install carries no test marker")
     check(leftovers.empty?, "a fresh install holds nothing of socket-patch", leftovers.inspect)
   end
@@ -395,6 +413,9 @@ class NokogiriE2E
   def libxml2_patch_dir
     return "patches/libxml2" if File.directory?(File.join(@gem_dir, "patches"))
     return "ports/patches/libxml2" if File.directory?(File.join(@gem_dir, "ports", "patches"))
+    # The JRuby gem ships neither, and may ship no build script: the record
+    # is the one written for the ruby platform gem of a current release.
+    return "patches/libxml2" if @java && !File.file?(File.join(@gem_dir, "ext/nokogiri/extconf.rb"))
     # A precompiled gem ships neither; its build script still says which.
     extconf = installed("ext/nokogiri/extconf.rb")
     return "ports/patches/libxml2" if extconf =~ /File\.join\(portsdir, *"patches"/
@@ -415,12 +436,19 @@ class NokogiriE2E
     case name
     when "ruby" then applied(ruby_record, :native => false) { |now| now[RB_CONST] == 1 && now[C_CONST].nil? }
     when "c"
-      return skip("JRuby loads no C extension") && nil if @java && @opts[:build] == "ok"
+      # The JRuby gem ships the C source and compiles nothing: the file is
+      # written, no build is made, and JRuby loads what it loaded before.
+      if @java
+        return applied(c_record, :native => false, :what => "JRuby loads no C constant, and the jars it loaded before") do |now|
+          now[C_CONST].nil? && now[RB_CONST].nil? && now["jars"] == @baseline["jars"]
+        end
+      end
       native(c_record) { |now| now[C_CONST] == 1 }
     when "libxml2"
       record = libxml2_record
       return skip("this release reads no libxml2 patch directory") && nil unless record
-      return skip("JRuby loads no libxml2") && nil if @java && @opts[:build] == "ok"
+      # The JRuby gem packs no libxml2: nothing of the record is in it.
+      return not_in_build(record) if @java
       # Built against the system's libxml2: the build never opens the copy
       # the gem packs, so a patch to that copy is compiled into nothing.
       # Its file is written, the run says so, and nothing attests it.
@@ -446,7 +474,6 @@ class NokogiriE2E
     case @opts.fetch(:build)
     when "ok" then applied(record, :native => true, &effect)
     when "unavailable" then not_applied(record, "native_extension_build_failed")
-    when "refused" then not_applied(record, "native_extensions_unsupported")
     end
   end
 
@@ -456,9 +483,13 @@ class NokogiriE2E
     []
   end
 
+  def event(stdout)
+    events(stdout).find { |e| e["purl"].to_s.start_with?("pkg:gem/nokogiri@#{@version}") }
+  end
+
   def action(stdout)
-    event = events(stdout).find { |e| e["purl"].to_s.start_with?("pkg:gem/nokogiri@#{@version}") }
-    event ? event["action"] : nil
+    found = event(stdout)
+    found ? found["action"] : nil
   end
 
   # The `vex` statuses for nokogiri: `["not_affected"]` when the patch is
@@ -474,7 +505,7 @@ class NokogiriE2E
     [code, statuses, stdout + stderr]
   end
 
-  def applied(record, native:, &effect)
+  def applied(record, native:, what: "Ruby loads the patched code", &effect)
     write_record(record)
 
     code, stdout, stderr, = sp("apply", "--check", "--json")
@@ -484,8 +515,17 @@ class NokogiriE2E
     check(code.zero? && action(stdout) == "applied", "`apply` applies it (#{secs.round}s)",
           "exit #{code}\n#{tail(stdout)}#{tail(stderr)}")
 
+    # A JRuby gem is patched file by file: every file of the record it
+    # takes is on disk as the patch wrote it.
+    if @java
+      record.each do |path, (_, after)|
+        check(File.file?(File.join(@gem_dir, path)) && installed(path) == after, "#{path} is written")
+      end
+      check(leftovers.empty?, "nothing of a build was left in the gem home", leftovers.join("\n"))
+    end
+
     now = probe
-    check(effect.call(now), "Ruby loads the patched code", JSON.pretty_generate(now))
+    check(effect.call(now), what, JSON.pretty_generate(now))
     check(now["smoke"] == @baseline["smoke"], "nokogiri still parses, queries, transforms and validates",
           "before #{@baseline['smoke'].inspect}\nafter  #{now['smoke'].inspect}")
     if @opts[:rails]
@@ -534,6 +574,40 @@ class NokogiriE2E
     check(code.zero?, "`rollback` of the unapplied record succeeds", "exit #{code}\n#{tail(stdout)}#{tail(stderr)}")
   end
 
+  # A record with no file in this install's build of the gem (the JRuby
+  # gem packs no libxml2, so a patch to it has nothing to change there):
+  # `apply` succeeds without writing anything and says why, in the event of
+  # the patch and, for a person, on stderr. The install counts as patched,
+  # because the code the patch fixes is not in it: `apply --check` is in
+  # sync and `vex` attests it.
+  def not_in_build(record)
+    write_record(record)
+
+    code, stdout, stderr, secs = sp("apply", "--json")
+    found = event(stdout) || {}
+    check(code.zero? && found["action"] == "skipped" && found["errorCode"] == "not_in_platform_build",
+          "`apply` succeeds and reports the patch as not part of this build (#{secs.round}s)",
+          "exit #{code}\n#{tail(stdout)}#{tail(stderr)}")
+    check(found["reason"].to_s.include?("none of the patch's files are part of the JRuby build"),
+          "and says so in plain words", found["reason"].inspect)
+    check(warning_codes(stdout).empty?, "without a warning", warning_codes(stdout).inspect)
+    code, stdout, stderr, = sp("apply")
+    check(code.zero? && stderr.include?("none of the patch's files are part of the JRuby build"),
+          "a person reads the same on stderr, and the run exits 0", "exit #{code}\n#{tail(stdout)}#{tail(stderr)}")
+
+    diff = tree_diff(snapshot)
+    check(diff.empty?, "nothing of the install was changed", diff.join("\n"))
+    check(leftovers.empty?, "and nothing was left in the gem home", leftovers.join("\n"))
+    check(probe == @baseline, "Ruby loads what it loaded before")
+
+    code, stdout, stderr, = sp("apply", "--check")
+    check(code.zero?, "`apply --check` is in sync", "exit #{code}\n#{stdout}#{stderr}")
+    code, statuses, text = vex_statuses
+    check(code.zero? && statuses == ["not_affected"], "`vex` attests the patch", "exit #{code} #{statuses.inspect}\n#{tail(text)}")
+
+    rolled_back
+  end
+
   def warning_codes(stdout)
     JSON.parse(stdout).fetch("warnings", []).map { |w| w["code"] }
   rescue JSON::ParserError
@@ -575,7 +649,8 @@ class NokogiriE2E
 
   # Loads nokogiri and prints one `sp_probe` line of JSON: what was loaded
   # and whether it works. Old and new releases name things differently
-  # (`libxml2_patches` before 1.11), and JRuby has no libxml2 at all.
+  # (`libxml2_patches` before 1.11), and JRuby has no libxml2 at all: what
+  # it loads is the gem's jars.
   PROBE = <<-'RUBY'
 require "json"
 require "digest"
@@ -583,6 +658,11 @@ require "nokogiri"
 info = Nokogiri::VERSION_INFO
 lx = info["libxml"] || {}
 binary = $LOADED_FEATURES.grep(/nokogiri\.(bundle|so|dll)\z/).first
+# The jars JRuby loaded (none on any other Ruby), each with its digest.
+jars = {}
+$LOADED_FEATURES.grep(/\.jar\z/).each do |jar|
+  jars[File.basename(jar)] = File.file?(jar) ? Digest::SHA256.file(jar).hexdigest : nil
+end
 patches = lx["patches"] || lx["libxml2_patches"] || []
 patches = patches.split(" ") if patches.is_a?(String)
 doc = Nokogiri::XML("<r xmlns:n='urn:x'><a id='1'>one</a><n:b k='v'>two</n:b></r>")
@@ -607,6 +687,7 @@ result = {
   "version" => Nokogiri::VERSION,
   "binary" => binary && File.basename(File.dirname(binary)) + "/" + File.basename(binary),
   "binary_sha256" => binary && Digest::SHA256.file(binary).hexdigest,
+  "jars" => jars,
   "libxml_source" => lx["source"],
   "libxml_loaded" => lx["loaded"],
   "libxml_patches" => patches,
@@ -646,9 +727,9 @@ parser = OptionParser.new do |o|
        "libxml2), java, or any (default)") { |v| opts[:install] = v }
   o.on("--[no-]unread-check", "whether this filesystem records file reads (default: yes), which is what tells",
        "socket-patch that a system-libraries build read nothing of a libxml2 patch") { |v| opts[:unread_check] = v }
-  o.on("--build RESULT", %w[ok unavailable refused],
+  o.on("--build RESULT", %w[ok unavailable],
        "what a patch that needs a rebuild must do: ok (default), unavailable (no toolchain: fail,",
-       "change nothing), refused (a JRuby install)") { |v| opts[:build] = v }
+       "change nothing). A JRuby install builds nothing either way") { |v| opts[:build] = v }
   o.on("--hide-toolchain", "run socket-patch with no compiler or make on PATH (with --build unavailable)") do
     opts[:hide_toolchain] = true
   end
