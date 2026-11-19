@@ -1132,8 +1132,8 @@ mod tests {
     }
 
     /// The progress line of a native gem's staged build names the gem
-    /// that is built (#2152): `rollback` and `remove` build the upstream
-    /// gem, and the line said "from its patched gem" for them as well.
+    /// that is built (#2152): an unwind (`rollback`, `remove`) builds the
+    /// upstream gem, and the line said "from its patched gem" for it too.
     #[cfg(unix)]
     #[tokio::test]
     async fn a_native_build_names_the_gem_it_builds() {
@@ -1198,6 +1198,7 @@ mod tests {
                 ..wanted(&new, &[&source])
             };
             let targets = [Target::Installed(gem_dir.clone())];
+            std::fs::write(gem_dir.join("lib/rack.rb"), "INSTALLED\n").unwrap();
             // A sibling test forking while the script was being written
             // holds its write fd until it execs: ETXTBSY (os error 26).
             let out = loop {
