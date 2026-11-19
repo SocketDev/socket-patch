@@ -2214,8 +2214,9 @@ in that build at all. `apply` exits 0, changes nothing and prints a note saying 
 event with `not_in_platform_build` under `--json`), and `vex` attests the patch.
 
 The one exception is a patch that changes what the gem's jars are built from: a Java, Kotlin or
-Scala source, or a Maven, Ant or Gradle build file. `apply` can't rebuild a jar. It writes the
-patch's files and warns with `native_extension_not_rebuilt`, and neither `apply --check` nor
+Scala source, or a Maven, Ant or Gradle build file. `apply` can't rebuild a jar, so that patch is
+incomplete: `apply` writes the patch's files, leaves them written, and exits 1 with an error that
+says the jars are not the patch's (`native_extension_not_rebuilt`). Neither `apply --check` nor
 `vex` reports the gem as patched. A patch that replaces a jar itself is different: the patched
 jar is what JRuby loads, so it is applied and attested like any other file.
 
@@ -2238,14 +2239,16 @@ patch changes and left compiled code. How a gem builds depends on its configurat
 installed with `--use-system-libraries` links the operating system's libxml2 and never opens the
 copy it packs, so a patch that only adds a fix to that packed copy changes nothing there. A gem
 whose build script downloads the binary it runs (passenger's agent) compiles nothing at all.
-`apply` then writes the patch's files, leaves the compiled code as it was installed, and warns
-with `native_extension_not_rebuilt`, instead of reporting a patch that is in no compiled code:
+The patch is then incomplete, and `apply` says so instead of reporting a patch that is in no
+compiled code. It writes the patch's files, leaves the compiled code as it was installed, and
+exits 1 with `Error: Patch of <package> is incomplete: …` (`native_extension_not_rebuilt`):
 
-- The patch's Ruby files are in effect, and a source the gem compiles later on its own is the
-  patched one.
+- The patch's files stay written: its Ruby files are in effect, and a source the gem compiles
+  later on its own is the patched one. Nothing is rolled back for you; `rollback` undoes it.
 - `apply --check` reports the package as not in sync, and `vex` does not attest the patch.
 - On a system-libraries install the library is the operating system's package, and updating
   that package is what fixes it.
+- `scan --mode agent` and `get` exit 1 for such a patch as well, and keep it recorded.
 
 A patch to the gem's own C sources is rebuilt as usual. On Linux the check asks the kernel which
 files the build opened. Elsewhere it needs a filesystem that records file reads; on one that

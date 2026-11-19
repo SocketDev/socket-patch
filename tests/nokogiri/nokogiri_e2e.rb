@@ -28,8 +28,9 @@
 #            1.6.7). nokogiri's build applies it to its vendored libxml2 and
 #            compiles the patch's name into the extension. An install built
 #            with `--use-system-libraries` compiles no vendored libxml2, so
-#            there the record's file is written, `apply` says that nothing
-#            compiles it, and nothing attests it.
+#            there the patch is incomplete: the record's file is written
+#            and stays written, `apply` fails (exit 1) and says that
+#            nothing compiles it, and nothing attests it.
 #
 # Each scenario runs `apply --check` (not in sync), `apply`, a load of
 # nokogiri through `bundle exec` in a fresh Ruby, `apply --check` (in sync),
@@ -451,7 +452,8 @@ class NokogiriE2E
       return not_in_build(record) if @java
       # Built against the system's libxml2: the build never opens the copy
       # the gem packs, so a patch to that copy is compiled into nothing.
-      # Its file is written, the run says so, and nothing attests it.
+      # Its file is written, the run fails and says so, and nothing
+      # attests it.
       # (Where the filesystem records no reads the CLI cannot tell, and the
       # leg says so with --unread-check off.)
       if @shape == "system-libraries"
@@ -614,21 +616,34 @@ class NokogiriE2E
     []
   end
 
-  # A record this install compiles nothing of: `apply` writes its files and
-  # says that no build holds them, Ruby loads the binary it loaded before,
-  # and neither `apply --check` nor `vex` takes the install for patched.
+  # A record this install compiles nothing of. The patch is incomplete:
+  # `apply` writes its files, which stay written, exits 1 and says that no
+  # build holds them (a `failed` event with `native_extension_not_rebuilt`,
+  # the warning of the same code, and an `Error:` line for a person). Ruby
+  # loads the binary it loaded before, and neither `apply --check` nor
+  # `vex` takes the install for patched. `rollback` takes the files out.
   def written_not_built(record)
     write_record(record)
     code, stdout, stderr, secs = sp("apply", "--json")
+    found = event(stdout) || {}
     warned = warning_codes(stdout).include?("native_extension_not_rebuilt")
-    check(code.zero? && action(stdout) == "applied" && warned,
-          "`apply` writes the patch and says that nothing compiles it (#{secs.round}s)",
+    check(code == 1 && found["action"] == "failed" && found["errorCode"] == "native_extension_not_rebuilt" && warned,
+          "`apply` fails: the patch is incomplete, because nothing compiles it (#{secs.round}s)",
           "exit #{code}\n#{tail(stdout)}#{tail(stderr)}")
+    check(found["error"].to_s.include?("the patch's files were written"),
+          "and says that its files were written", found["error"].inspect)
     record.each do |path, (_, after)|
       check(File.file?(File.join(@gem_dir, path)) && installed(path) == after, "#{path} is written")
     end
     check(leftovers.empty?, "nothing of a build was left in the gem home", leftovers.join("\n"))
     check(probe == @baseline, "Ruby loads what it loaded before")
+
+    code, stdout, stderr, = sp("apply")
+    check(code == 1 && stderr.include?("is incomplete: the patch's files were written"),
+          "a person reads the same as an error, and the run exits 1", "exit #{code}\n#{tail(stdout)}#{tail(stderr)}")
+    record.each do |path, (_, after)|
+      check(installed(path) == after, "#{path} stays written")
+    end
 
     code, stdout, stderr, = sp("apply", "--check")
     check(code != 0, "`apply --check` does not report it in sync", "exit #{code}\n#{stdout}#{stderr}")

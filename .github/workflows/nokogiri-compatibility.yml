@@ -24,8 +24,9 @@ name: nokogiri patch compatibility
 #   system-libraries  `--use-system-libraries`: the extension is rebuilt
 #                 with the recorded build arguments, and a patch to the
 #                 vendored libxml2, which such a build does not compile, is
-#                 written and not attested: its build reads nothing of the
-#                 patch, and `apply` says so.
+#                 written and incomplete: its build reads nothing of the
+#                 patch, so `apply` exits 1 and says so, and nothing
+#                 attests it.
 #                 The `legacy setting` leg is a precompiled install
 #                 in a project that still carries that Bundler setting from
 #                 the years before precompiled gems: its rebuild must keep
