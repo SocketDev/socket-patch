@@ -2140,6 +2140,14 @@ the shared gem home. Another project that pins the upstream build of the same ge
 loads the patched code too, and its `bundle pristine` fails on the checksum until it is patched
 as well.
 
+`rollback` and `remove` take `--gem-refresh-shared` as well, on the run that removes the patch:
+it then puts the upstream gem back in the shared gem home. Without it the run warns that the
+shared copy still holds the patched build. Running the command again doesn't help, because the
+patch is already removed and there is nothing left to roll back. The warning names what to run
+instead: the `bundle config` line above, or an `rm -f` of the gem's `specifications/` entry and
+its `cache/` archive followed by `bundle install`, which fetches the upstream gem into the shared
+gem home. Another project that loads that copy needs a `bundle install` afterwards too.
+
 A shared gem home also holds gem versions this project doesn't use: the gems Ruby ships (`rake`,
 `rexml`, ...) and the versions other projects installed. Hosted and vendored mode patch what
 `Gemfile.lock` resolves, so a version the lock doesn't list is skipped, never a failure: hosted

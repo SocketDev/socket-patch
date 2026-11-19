@@ -393,6 +393,13 @@ fn retry_hint(direction: Direction, why: Option<&Why>) -> &'static str {
     }
 }
 
+/// What replacing a shared copy by hand costs the other projects that load
+/// it: until their own `bundle install`, the gem is missing for them.
+fn other_projects_reinstall(gems: usize) -> String {
+    let them = if gems == 1 { "it" } else { "them" };
+    format!("another project that loads {them} needs a `bundle install` too")
+}
+
 /// `action` after `hint` (which ends mid-sentence), or as a sentence of
 /// its own when there is none.
 fn after_hint(hint: &str, action: &str) -> String {
@@ -465,9 +472,18 @@ pub(crate) fn stale_detail(direction: Direction, gem: &StaleGem, why: Option<&Wh
         Some((dir, false)) if !matches!(why, Some(Why::Disabled | Why::Failed(_))) => format!(
             "{purl} {switched}, but the shared gem home still holds its {stale} install at \
              {}, and {reuse}. Other projects may load that gem home, so it was left alone. \
-             Install the {wanted} gem for this project only with `{LOCAL_PATH_REMEDY}`, or \
-             re-run with `--gem-refresh-shared` to replace the shared copy",
-            dir.display()
+             Install the {wanted} gem for this project only with `{LOCAL_PATH_REMEDY}`, or {}",
+            dir.display(),
+            match direction {
+                Direction::Patched => {
+                    "re-run with `--gem-refresh-shared` to replace the shared copy".to_string()
+                }
+                Direction::Upstream => format!(
+                    "replace the shared copy: remove {} and run `bundle install` ({})",
+                    display_list(&files_to_remove(gem)),
+                    other_projects_reinstall(1)
+                ),
+            }
         ),
         Some((dir, _)) => format!(
             "{purl} {switched}, but its {stale} install at {} was not refreshed{}, and \
@@ -637,6 +653,9 @@ pub(crate) fn report(
     let mut local: BTreeMap<Why, Vec<&StaleGem>> = BTreeMap::new();
     // The gems left alone in a shared home that are patched in place.
     let mut shared_in_place = 0;
+    // What to remove so `bundle install` fetches the gems left alone in a
+    // shared home again.
+    let mut shared_files: Vec<PathBuf> = Vec::new();
     for gem in stale {
         let why = why_stale(gem, attempt);
         if why == Why::Shared && gem.installed.is_some() && gem.in_place {
@@ -648,6 +667,7 @@ pub(crate) fn report(
         ));
         match (&why, &gem.installed) {
             (Why::Shared, Some((dir, _))) => {
+                shared_files.extend(files_to_remove(gem));
                 let home = dir.parent().and_then(Path::parent).unwrap_or(dir);
                 shared
                     .entry(home.display().to_string())
@@ -741,10 +761,24 @@ pub(crate) fn report(
                  place from the upstream archive beside it. ",
             );
         }
-        bullets.push(format!(
-            "{why}To install {them} for this project only, run `{LOCAL_PATH_REMEDY}`, or re-run \
-             with `--gem-refresh-shared` to replace the shared {copies}."
-        ));
+        bullets.push(match direction {
+            Direction::Patched => format!(
+                "{why}To install {them} for this project only, run `{LOCAL_PATH_REMEDY}`, or \
+                 re-run with `--gem-refresh-shared` to replace the shared {copies}."
+            ),
+            // An unwind can't be re-run (see `retry_hint`), so the shared
+            // copies are replaced by hand (#2086).
+            Direction::Upstream => format!(
+                "{why}To install {them} for this project only, run `{LOCAL_PATH_REMEDY}`. To \
+                 replace the shared {copies}, run `rm -f {} && bundle install`; {}.",
+                shared_files
+                    .iter()
+                    .map(|p| p.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                other_projects_reinstall(shared_gems)
+            ),
+        });
     }
     for (why, gems) in &local {
         let files: Vec<PathBuf> = gems.iter().flat_map(|gem| files_to_remove(gem)).collect();
