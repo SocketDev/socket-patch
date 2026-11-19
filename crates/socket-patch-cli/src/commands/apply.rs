@@ -980,10 +980,8 @@ async fn own_platform_variant<'v>(
     if variants.len() < 2 {
         return None;
     }
-    let platform = gem_ext::copy_platform(pkg_path).await?;
-    let own = variants
-        .iter()
-        .find(|variant| gem_ext::names_platform(variant, &platform))?;
+    let own = gem_ext::own_platform_record(pkg_path, variants.iter().map(String::as_str)).await?;
+    let own = variants.iter().find(|variant| variant.as_str() == own)?;
     if force {
         return Some(own);
     }
@@ -1071,7 +1069,18 @@ pub(crate) fn result_to_event(result: &ApplyResult, dry_run: bool) -> PatchEvent
         return PatchEvent::new(PatchAction::Verified, purl).with_files(files);
     }
 
-    let files = result
+    // Sidecar data is NOT attached here — it's surfaced at the
+    // envelope level under `Envelope.sidecars[]` by the run loop.
+    // Keeping events clean of sidecar info means each event describes
+    // only the apply action; sidecar reporting is a separate,
+    // JOIN-able list.
+    PatchEvent::new(PatchAction::Applied, purl).with_files(patched_files(result))
+}
+
+/// The files `result`'s run wrote, as an event lists them: each with the
+/// source its patched bytes came from.
+fn patched_files(result: &ApplyResult) -> Vec<PatchEventFile> {
+    result
         .files_patched
         .iter()
         .map(|f| PatchEventFile {
@@ -1083,13 +1092,7 @@ pub(crate) fn result_to_event(result: &ApplyResult, dry_run: bool) -> PatchEvent
                 .copied()
                 .map(AppliedVia::from_core),
         })
-        .collect();
-    // Sidecar data is NOT attached here — it's surfaced at the
-    // envelope level under `Envelope.sidecars[]` by the run loop.
-    // Keeping events clean of sidecar info means each event describes
-    // only the apply action; sidecar reporting is a separate,
-    // JOIN-able list.
-    PatchEvent::new(PatchAction::Applied, purl).with_files(files)
+        .collect()
 }
 
 /// True when the manifest records at least one npm patch — the only kind a
@@ -1512,7 +1515,11 @@ fn collect_apply_outcomes(
     for result in results {
         let event = caveats.event_of(result, dry_run);
         match event.action {
-            PatchAction::Applied | PatchAction::Verified => {
+            // Another copy of a package whose patch is incomplete somewhere
+            // does not make the package applied.
+            PatchAction::Applied | PatchAction::Verified
+                if !caveats.is_incomplete(&result.package_key) =>
+            {
                 applied.push(result.package_key.clone());
             }
             PatchAction::Skipped => skipped.push(event),
@@ -1533,7 +1540,7 @@ fn collect_apply_outcomes(
     let applied_keys: HashSet<&str> = applied.iter().map(String::as_str).collect();
     let failed_keys: HashSet<&str> = results
         .iter()
-        .filter(|r| !r.success || caveats.incomplete_of(r).is_some())
+        .filter(|r| !r.success || caveats.is_incomplete(&r.package_key))
         .map(|r| r.package_key.as_str())
         .collect();
     skipped.retain(|event| {
@@ -2385,9 +2392,10 @@ fn tally_results(results: &[ApplyResult], caveats: &GemCaveats) -> ApplyTally {
             vendored.insert(r.package_key.as_str());
             continue;
         }
-        // The result of an incomplete patch wrote files and is no patched
-        // copy: it counts for its package under its own heading alone.
-        if caveats.incomplete_of(r).is_some() {
+        // A package with an incomplete patch on any copy is not in
+        // effect, once: its results, the incomplete one that wrote files
+        // and any other copy's, count under that heading alone.
+        if caveats.is_incomplete(&r.package_key) {
             not_in_effect.insert(r.package_key.as_str());
             continue;
         }
@@ -2531,10 +2539,11 @@ fn format_results_block(
         *copies.entry(r.package_key.as_str()).or_default() += 1;
     }
     let mut lines: Vec<String> = Vec::new();
-    // A copy whose patch is incomplete is no patched package: its
-    // `Error:` line says what was written and what is not in effect.
+    // A package whose patch is incomplete on some copy is no patched
+    // package: its `Error:` line says what was written and what is not in
+    // effect.
     for result in results.iter().filter(|r| {
-        r.success && r.package_path != VENDOR_OWNED_MARKER && caveats.incomplete_of(r).is_none()
+        r.success && r.package_path != VENDOR_OWNED_MARKER && !caveats.is_incomplete(&r.package_key)
     }) {
         let detail = if !result.files_patched.is_empty() {
             // Summarize the per-file strategy used by this package: if
@@ -2652,22 +2661,9 @@ struct IncompleteCopy {
 impl IncompleteCopy {
     /// The copy's event: `failed`, with the files this run wrote.
     fn event(&self, result: &ApplyResult) -> PatchEvent {
-        let files = result
-            .files_patched
-            .iter()
-            .map(|f| PatchEventFile {
-                path: f.clone(),
-                verified: true,
-                applied_via: result
-                    .applied_via
-                    .get(f)
-                    .copied()
-                    .map(AppliedVia::from_core),
-            })
-            .collect();
         PatchEvent::new(PatchAction::Failed, self.purl.clone())
             .with_error(gem_ext::NOT_REBUILT_REASON, self.detail.as_str())
-            .with_files(files)
+            .with_files(patched_files(result))
     }
 
     /// The run warning that says the same as this copy's `Error:` line.
@@ -2693,6 +2689,13 @@ impl GemCaveats {
         self.incomplete
             .iter()
             .find(|copy| copy.purl == result.package_key && copy.path == result.package_path)
+    }
+
+    /// Whether some copy of the package `purl` has an incomplete patch.
+    /// That package is not in effect, whatever its other copies say: it is
+    /// never counted or listed as applied.
+    fn is_incomplete(&self, purl: &str) -> bool {
+        self.incomplete.iter().any(|copy| copy.purl == purl)
     }
 
     /// [`result_to_event`], or the `failed` event of an incomplete patch.
@@ -3152,6 +3155,10 @@ async fn apply_patches_inner(
             let mut any_store_copy_applied = false;
 
             let mut any_copy_applied = false;
+            // A copy's patch was incomplete. The package was dealt with (it
+            // is not gone over again under another of its manifest keys,
+            // which would run its build a second time), and not applied.
+            let mut any_copy_incomplete = false;
             for (pkg_path, is_store_copy) in store_copies
                 .into_iter()
                 .map(|p| (p, true))
@@ -3316,10 +3323,14 @@ async fn apply_patches_inner(
                             }
                             // An incomplete patch fails the run. Its files
                             // are written and stay written, so the result
-                            // is recorded as the write it is; the entry
-                            // here makes it read as not patched.
+                            // is recorded as the write it is, and the entry
+                            // here makes it read as not patched. The copy
+                            // never counts as one that applied: a
+                            // fallback-home copy after it is not best
+                            // effort, and the package is not in effect.
                             Some(gem_ext::GemCaveat::Incomplete(detail)) => {
                                 has_errors = true;
+                                any_copy_incomplete = true;
                                 if args.prints_errors() {
                                     eprintln!("{}", format_patch_incomplete(variant_purl, &detail));
                                 }
@@ -3328,6 +3339,10 @@ async fn apply_patches_inner(
                                     path: outcome.result.package_path.clone(),
                                     detail,
                                 });
+                                warn_mismatch_overwrites(&outcome.result, &args.common);
+                                matched_manifest_purls.insert(variant_purl.clone());
+                                results.push(outcome.result);
+                                continue;
                             }
                             None => {}
                         }
@@ -3447,7 +3462,7 @@ async fn apply_patches_inner(
                 }
             }
 
-            if any_copy_applied {
+            if any_copy_applied || any_copy_incomplete {
                 applied_base_purls.insert(base_purl.clone());
             }
         } else {
@@ -5105,6 +5120,59 @@ mod tests {
         assert_eq!((t.not_applicable, t.not_in_effect), (0, 1));
         let t = tally_results(&[result], &not_in_build());
         assert_eq!((t.applied, t.not_applicable, t.not_in_effect), (1, 0, 0));
+    }
+
+    /// A package with an incomplete patch on one copy is not in effect,
+    /// once, whatever its other copies say: a copy that applied cleanly
+    /// does not make it applied in the summary, list it under the patched
+    /// packages, or hand it to a nested caller as applied. Each copy keeps
+    /// its own event.
+    #[test]
+    fn a_package_with_an_incomplete_copy_is_never_applied() {
+        let (incomplete_copy, caveats) = incomplete(true);
+        let mut fine = copy_at(
+            "/p/vendor/bundle/ruby/3.4.0/gems/nokogiri-1.18.10-arm64-darwin",
+            VerifyStatus::Ready,
+            true,
+        );
+        fine.package_key = GEM_PURL.to_string();
+        for results in [
+            vec![fine.clone(), incomplete_copy.clone()],
+            vec![incomplete_copy.clone(), fine.clone()],
+        ] {
+            let t = tally_results(&results, &caveats);
+            assert_eq!(
+                t,
+                ApplyTally {
+                    not_in_effect: 1,
+                    ..ApplyTally::default()
+                }
+            );
+            assert_eq!(
+                format_summary_line(&t, 1, 0),
+                "Summary: 0 of 1 targeted patch applied, 0 already patched, 1 not in effect, \
+                 0 not found on disk"
+            );
+            assert!(format_results_block(&results, &caveats, false, Path::new("/p")).is_empty());
+            let (applied, skipped) =
+                collect_apply_outcomes(&results, &caveats, &[], &HashSet::new(), Vec::new(), false);
+            assert!(applied.is_empty(), "{applied:?}");
+            assert!(skipped.is_empty());
+            let failures = collect_apply_failures(&results, &caveats, &[], &HashSet::new());
+            assert_eq!(failures.len(), 1);
+            assert_eq!(failures[0].code, "native_extension_not_rebuilt");
+        }
+        // The copies' own events stay what each copy is.
+        let event = |result: &ApplyResult| {
+            serde_json::to_value(caveats.event_of(result, false)).unwrap()["action"].clone()
+        };
+        assert_eq!(event(&fine), "applied");
+        assert_eq!(event(&incomplete_copy), "failed");
+        // Another package is not touched by it.
+        let other = copy_at("/p/node_modules/nuxt", VerifyStatus::Ready, true);
+        let t = tally_results(&[other.clone(), incomplete_copy], &caveats);
+        assert_eq!((t.applied, t.not_in_effect), (1, 1));
+        assert!(!format_results_block(&[other], &caveats, false, Path::new("/p")).is_empty());
     }
 
     #[test]

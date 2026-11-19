@@ -507,10 +507,11 @@ async fn verify_every_copy(paths: &[PathBuf], record: &PatchRecord) -> Result<()
 /// Two outcomes of that are meant. A JVM copy that takes no file of the
 /// record, or only a C source nothing there compiles, passes: the code
 /// the patch fixes is not in that build, and a copy installed from the
-/// patched `java` gem gets the same verdict. And a file of the build that
-/// was deleted from the copy is not held against it, because it reads as
-/// one the build never had: nothing here knows the `java` gem's file list,
-/// and failing a patch that is applied is the worse error.
+/// patched `java` gem gets the same verdict. And a C build input that was
+/// deleted from the copy is not held against it, because it reads as one
+/// the build never had: nothing here knows the `java` gem's file list,
+/// and failing a patch that is applied is the worse error. (Any other
+/// file the record replaces must be there: a missing Ruby file fails.)
 async fn verify_every_gem_copy(
     purl: &str,
     paths: &[PathBuf],
@@ -526,7 +527,7 @@ async fn verify_every_gem_copy(
         if !files.is_empty() {
             verify_patch_files(path, &files).await?;
         }
-        gem.verify_native_build(&record.files).await?;
+        gem.verify_native_build(purl, &record.files).await?;
     }
     Ok(())
 }
