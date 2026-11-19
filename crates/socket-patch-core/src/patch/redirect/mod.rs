@@ -68,7 +68,8 @@ use crate::formats::cargo::{is_crates_io_patch_table, is_crates_io_source, Cargo
 use crate::formats::composer::hosted::rewrite_composer_lock;
 use crate::formats::gem::hosted::{
     bundled_before_2_2, checksum_entry_span, converge_gem_lock_source, lock_layout,
-    merge_gem_lock_remote, refresh_merged_gem_lock_remote, DependencyPin, LockLayout,
+    merge_gem_lock_remote, refresh_merged_gem_lock_remote, shared_gem_section_remotes,
+    DependencyPin, LockLayout,
 };
 use crate::formats::gem::locked_specs as gem_locked_specs;
 use crate::formats::maven::declared_maven::DeclaredMaven;
@@ -8398,6 +8399,35 @@ fn plan_gem_redirect(
                     &mut staged,
                 )
                 .map_err(|why| {
+                    // A lock this bundler wrote for a manifest with several
+                    // top-level sources: `bundle lock` writes the same lock
+                    // again, so the way out is the manifest (#2162). The
+                    // urls stay out of the text: a source can carry
+                    // credentials. Vendored mode is not offered: it refuses
+                    // a gem in a `group` block or with a native extension,
+                    // which this plan cannot tell.
+                    let globals = declarations::global_rubygems_sources(&gf).len();
+                    if let Some(remotes) =
+                        shared_gem_section_remotes(&lk, dep).filter(|_| globals > 1)
+                    {
+                        return refuse(
+                            "redirect_gem_lock_unconvergeable",
+                            format!(
+                                "{gemfile_name} has {globals} top-level `source` lines, and \
+                                 for such a manifest bundler locks every gem in one GEM \
+                                 section that names every source ({lock_name} lists \
+                                 {remotes} remotes over `{name} ({})`), where no gem can be \
+                                 given the Socket source alone; nothing was changed for \
+                                 {name} — keep one top-level `source` line and move each \
+                                 other one into a `source \"<url>\" do … end` block around \
+                                 the gems that come from it (bundler's own deprecation \
+                                 warning asks for the same), then run `bundle lock`, commit \
+                                 {gemfile_name} and {lock_name} and re-run the hosted scan, \
+                                 or patch {name} with `--mode agent`",
+                                dep.version
+                            ),
+                        );
+                    }
                     refuse(
                         "redirect_gem_lock_unconvergeable",
                         format!(

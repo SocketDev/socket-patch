@@ -531,6 +531,20 @@ pub(crate) fn lock_layout(lock: &str) -> Option<LockLayout> {
     }
 }
 
+/// How many remotes the `GEM` section that locks `dep` names, when it names
+/// more than one: the section [`converge_gem_lock_source`] refuses, since
+/// no spec of it can be given a source of its own.
+pub(crate) fn shared_gem_section_remotes(lock: &str, dep: &DepOverride) -> Option<usize> {
+    let model = super::parse(lock);
+    let section = model.gem_sections().find(|section| {
+        section
+            .specs
+            .iter()
+            .any(|spec| spec.locks(&dep.name, &dep.version))
+    })?;
+    (section.remotes.len() > 1).then_some(section.remotes.len())
+}
+
 /// Converge a bundler < 2.2 lock ([`LockLayout::Merged`]) for one
 /// redirected dep: the patch registry joins the `remote:` lines of the
 /// lock's one `GEM` section and DEPENDENCIES source-pins the gem as `pin`

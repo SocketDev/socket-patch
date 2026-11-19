@@ -647,9 +647,56 @@ fn remove_line(lines: &mut Vec<String>, k: usize) {
 /// that is not a plain string literal is left out, so a caller must check
 /// the answer against the lock bundler wrote before relying on it.
 pub(crate) fn rubygems_sources(text: &str) -> Vec<String> {
+    let (global, mut scoped) = source_calls(text);
+    for decl in declarations(text).literal {
+        if let Some((arg, Some(url))) = decl.source() {
+            scoped.push((arg.start, url.to_string()));
+        }
+    }
+    scoped.sort_by_key(|(at, _)| *at);
+    let mut out: Vec<String> = Vec::new();
+    let same = super::same_remote;
+    for url in global {
+        if !out.iter().any(|seen| same(seen, &url)) {
+            out.push(url);
+        }
+    }
+    let globals = out.len();
+    for (_, url) in scoped {
+        if out[..globals].iter().any(|seen| same(seen, &url)) {
+            continue;
+        }
+        // Bundler moves a source it meets again to the end.
+        out.retain(|seen| !same(seen, &url));
+        out.push(url);
+    }
+    out
+}
+
+/// The top-level sources of a manifest: each `source "<url>"` call with no
+/// block, in file order, one written twice counted once. Bundler 2.2 to 2.7
+/// lock a manifest with more than one of them into ONE `GEM` section that
+/// names them all (and deprecate it; bundler 4 refuses the manifest). A
+/// source that is not a plain string literal is left out.
+pub(crate) fn global_rubygems_sources(text: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for url in source_calls(text).0 {
+        if !out.iter().any(|seen| super::same_remote(seen, &url)) {
+            out.push(url);
+        }
+    }
+    out
+}
+
+/// The sources [`source_calls`] reads off a manifest's `source` calls: the
+/// url of each call with no block, then `(byte offset, url)` of each call
+/// with one.
+type SourceCalls = (Vec<String>, Vec<(usize, String)>);
+
+/// The literal `source "<url>"` calls of a manifest, in file order.
+fn source_calls(text: &str) -> SourceCalls {
     let masked = masked_source(text);
     let mut global: Vec<String> = Vec::new();
-    // (byte offset, url) of each block or option source.
     let mut scoped: Vec<(usize, String)> = Vec::new();
     for (word, start, end) in ruby_words(&masked) {
         if word != "source" {
@@ -692,29 +739,7 @@ pub(crate) fn rubygems_sources(text: &str) -> Vec<String> {
             scoped.push((start, value.to_string()));
         }
     }
-    for decl in declarations(text).literal {
-        if let Some((arg, Some(url))) = decl.source() {
-            scoped.push((arg.start, url.to_string()));
-        }
-    }
-    scoped.sort_by_key(|(at, _)| *at);
-    let mut out: Vec<String> = Vec::new();
-    let same = super::same_remote;
-    for url in global {
-        if !out.iter().any(|seen| same(seen, &url)) {
-            out.push(url);
-        }
-    }
-    let globals = out.len();
-    for (_, url) in scoped {
-        if out[..globals].iter().any(|seen| same(seen, &url)) {
-            continue;
-        }
-        // Bundler moves a source it meets again to the end.
-        out.retain(|seen| !same(seen, &url));
-        out.push(url);
-    }
-    out
+    (global, scoped)
 }
 
 #[cfg(test)]
@@ -1026,6 +1051,24 @@ mod tests {
         // The user's own declaration with the option appended is no added line.
         let text = format!("gem \"rack\", \"1.0.0\"{}\n", source_option(URL));
         assert!(!is_added_line(&text, &one(&text)));
+    }
+
+    /// Only a `source "<url>"` call with no block is a top-level source;
+    /// one written twice (a trailing slash apart) counts once.
+    #[test]
+    fn global_rubygems_sources_are_the_blockless_source_calls() {
+        let text = "source \"https://rubygems.org\"\r\n\
+                    source('https://second.example/')\r\n\
+                    source \"https://rubygems.org/\"\r\n\
+                    # source \"https://commented.example\"\r\n\
+                    source COMPUTED\r\n\
+                    source \"https://block.example\" do\r\n  gem \"c\"\r\nend\r\n\
+                    gem \"a\", source: \"https://a.example/\"\r\n";
+        assert_eq!(
+            global_rubygems_sources(text),
+            ["https://rubygems.org", "https://second.example/"]
+        );
+        assert!(global_rubygems_sources("gem \"a\"\n").is_empty());
     }
 
     /// Bundler < 2.2 lists the global sources first, then each block or
