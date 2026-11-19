@@ -768,6 +768,71 @@ fn a_decline_leaves_the_entry_of_an_earlier_run_in_place() {
     }
 }
 
+/// A run below the Bazel root writes nothing. When the block of the root
+/// already holds the entry of the patch, the Bazel build takes the patched
+/// jar: the run says that the entry stands, and reports the patch as a
+/// decline beside its own entry at the root does.
+#[test]
+fn a_run_below_the_root_says_that_the_entry_at_the_root_stands() {
+    let machine = Machine::start();
+    machine.make(&pinned(), false, false);
+    assert_eq!(machine.step(COMMANDS[0]).wrote.len(), 1);
+    let below = machine.root.join("proj/services/billing");
+    std::fs::create_dir_all(&below).expect("a project");
+    let ran = machine.step_in(&below, COMMANDS[0]);
+    let envelope = ran.envelope();
+    assert_eq!(
+        (ran.code, &ran.wrote),
+        (Some(0), &BTreeMap::new()),
+        "{ran:?}"
+    );
+    assert_eq!(event_for(&envelope, PURL)["action"], "applied", "{ran:?}");
+    assert_eq!(
+        warning_codes(&envelope),
+        ["maven_bazel_not_at_root"],
+        "{ran:?}"
+    );
+    let detail = envelope["warnings"][0]["detail"]
+        .as_str()
+        .expect("its text");
+    let stands = "run the command there. socket-patch left the entry that the MODULE.bazel at \
+                  the root holds for it as it is";
+    assert!(
+        detail.starts_with(PURL) && detail.ends_with(stands),
+        "{detail}"
+    );
+}
+
+/// A decline beside the entry of another patch of the same jar: that entry
+/// is not this run's to replace, so it remains, and the warning names it
+/// in the place of "keeps the upstream jar".
+#[test]
+fn a_decline_names_the_entry_of_another_patch_that_remains() {
+    let machine = Machine::start();
+    let other = "0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d";
+    let mut files = pinned();
+    files[0].1 = format!("{HUB}\n{}", BLOCK.replace(UUID, other));
+    files.truncate(2);
+    for maven in [false, true] {
+        let ran = machine.run(&files, maven, COMMANDS[0]);
+        let envelope = ran.envelope();
+        let (action, wrote) = match maven {
+            true => ("applied", POM_FILES.to_vec()),
+            false => ("skipped", Vec::new()),
+        };
+        assert_eq!(ran.code, Some(0), "{ran:?}");
+        assert_eq!(event_for(&envelope, PURL)["action"], action, "{ran:?}");
+        assert_eq!(ran.wrote.keys().collect::<Vec<_>>(), wrote, "{ran:?}");
+        assert_eq!(warning_codes(&envelope), ["maven_bazel_release"], "{ran:?}");
+        let remains = format!(
+            "{PURL}: {NO_RELEASE}. socket-patch wrote nothing to MODULE.bazel for it: the entry \
+             of patch {other} remains there, and where the block is in effect the Bazel build \
+             takes that patch's jar"
+        );
+        assert_eq!(envelope["warnings"][0]["detail"], remains, "{ran:?}");
+    }
+}
+
 /// A block that was changed by hand, also in its first line alone, is no
 /// pin that a command manages: `get` writes nothing to it, and `rollback`
 /// and `list` refuse and name the file to restore.

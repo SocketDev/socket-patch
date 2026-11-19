@@ -7,7 +7,8 @@
 //!   is a ref: a build takes the patched jar, at the sha256 of the entry,
 //!   or fails.
 //! - An entry whose version no lock of a hub holds any more (Bazel stops
-//!   at it), whose hub cannot be read, or which an rc file switches off is
+//!   at it), whose hub cannot be read, or which an rc file switches off,
+//!   on whatever line, or may switch off because it cannot be read, is
 //!   withheld from attestation ([`Discovery::shadow`]): `rollback`,
 //!   `remove` and `list` still see it.
 //! - A block that was changed by hand yields nothing: its patch ids are
@@ -121,8 +122,9 @@ mod tests {
     }
 
     /// An entry that a build may pass without (the lock moved on, a hub
-    /// cannot be read, an rc file switches it off) attests nothing, and is
-    /// still a pin of one package version that the undo takes out.
+    /// cannot be read, an rc file switches it off below an option that
+    /// does not, or cannot be read) attests nothing, and is still a pin
+    /// of one package version that the undo takes out.
     #[tokio::test]
     async fn an_entry_bazel_may_not_build_is_withheld_and_still_a_pin() {
         let [_, lock, ours] = sample(UUID_A);
@@ -144,9 +146,20 @@ mod tests {
                 "common --ignore_dev_dependency\n",
                 ".bazelrc:1 names `--ignore_dev_dependency`",
             ),
+            (
+                &lock,
+                "build --repository_disable_download\ncommon --noenable_bzlmod\n",
+                ".bazelrc:2 names `--noenable_bzlmod`, which switches off the file",
+            ),
+            (
+                &lock,
+                "common --lockfile_mode=error\nimport %workspace%/ci.bazelrc\n",
+                "the rc file ci.bazelrc cannot be read, and may switch an entry off",
+            ),
         ] {
             let p = project(&ours, lock);
-            p.write(".bazelrc", rc);
+            // An rc file that is a directory cannot be read.
+            p.write(".bazelrc", rc).write("ci.bazelrc/a", "");
             let out = extracted(&p).await;
             assert_refs(&out, &[]);
             assert_eq!(diag_codes(&out), [DIAG_REF_UNATTRIBUTABLE], "{why}");

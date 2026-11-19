@@ -1262,16 +1262,8 @@ pub async fn read_candidate_files(
     // beside it, which is where the hub lane writes. A project that is in
     // no Bazel workspace, or whose hubs build none of the candidates, gets
     // neither, and its run is the one it was.
-    let jar = |c: &Candidate| {
-        // A classifier or another packaging is not the jar a lock names.
-        let variant = crate::formats::maven::is_variant(
-            crate::utils::purl::purl_qualifier(&c.purl, "type"),
-            crate::utils::purl::purl_qualifier(&c.purl, "classifier"),
-        );
-        let (group, artifact) = crate::bazel::maven::coordinates(&c.dep);
-        (c.dep.ecosystem == "maven" && !variant).then(|| (group, artifact, c.dep.version.clone()))
-    };
-    let jars: Vec<_> = candidates.iter().filter_map(jar).collect();
+    let patches = candidates.iter().map(|c| (c.purl.as_str(), &c.dep));
+    let jars = crate::bazel::maven::jars(patches);
     if let Some(root) = view.disk_root().filter(|_| !jars.is_empty()) {
         use crate::bazel::maven::{site, FILE, SITE_KEY};
         let (root, module) = (root.to_path_buf(), view.read_text(FILE).await.ok());

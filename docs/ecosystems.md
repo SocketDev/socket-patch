@@ -1454,8 +1454,10 @@ to the `)` of its `override_repo`, and the entries stand in the order of their r
   and the warning below says when the Bazel build did not.
 - **The undo.** `socket-patch rollback` and `socket-patch remove` take the entry out, and with
   the last entry the block and the blank line before it: the file is then byte for byte what it
-  was. `socket-patch list` shows the pin with `MODULE.bazel` as its file, and `socket-patch
-  vex` attests it while a pinned hub fetches the jar at the entry's version.
+  was. A new block is written in the line break of the file, the more frequent one when the
+  file has both. `socket-patch list` shows the pin with `MODULE.bazel` as its file, and
+  `socket-patch vex` attests it while a pinned hub fetches the jar at the entry's version and
+  no rc file of the checkout switches the entry off, on whatever line, or cannot be read.
 - **A version bump of a patched artifact.** The relock passes. Then every Bazel command that
   evaluates the hub stops at the entry's `override_repo(` with `does not generate repository
   "<repository>", yet it is overridden via override_repo()`, until `socket-patch rollback
@@ -1476,6 +1478,9 @@ the ruleset and the extension (a hub is the `install`, `artifact` and `from_toml
 up to 1 MiB); `.bazeliskrc`, `.bazelversion`, `MODULE.bazel.lock` and `.bazelrc` with the files
 it imports (`import`, `try-import` and `try-import-if-bazel-version`, whose condition is not
 evaluated; a path under `%workspace%/`, or a relative one, which is read from the Bazel root).
+An rc file is read as Bazel reads one: a `\` before a line break joins two lines, a `#`
+outside quotes starts a comment, a word loses its quotes and the `\` before an escaped
+character, and the first word of a line is its command, not an option.
 Nothing is evaluated and no Bazel is run. When the project is in
 no Bazel workspace (the rule is under
 [Bazel workspaces: `.bazelignore`](#bazel-workspaces-bazelignore)), or no hub holds the artifact
@@ -1486,17 +1491,25 @@ A hosted run writes no entry where it cannot show from the checkout that the blo
 then gives one warning, which says why and that the Bazel build keeps the upstream jar. In a
 tree that only Bazel builds the patch is `skipped` (`redirect_unconfirmed`) and the warning
 stands in the place of `redirect_maven_no_pom`; beside a `pom.xml` or Gradle pin that landed,
-the patch is `applied` and the warning stands beside it. The exit code is 0 either way. When
-the block already holds the entry of the patch from an earlier run, that entry stays: the patch
-is `applied`, and the warning ends "socket-patch left the entry that MODULE.bazel holds for it
-as it is".
+the patch is `applied` and the warning stands beside it. The exit code is 0 either way.
+
+The last sentence of the warning says what the block of the root holds for the jar, also for a
+project below the root, whose warning names the file as "the MODULE.bazel at the root":
+
+- nothing: "socket-patch wrote nothing to MODULE.bazel for it, so the Bazel build keeps the
+  upstream jar";
+- the entry of this patch, from an earlier run: that entry stays, the patch is `applied`, and
+  the warning ends "socket-patch left the entry that MODULE.bazel holds for it as it is";
+- the entry of another patch of the same jar: it is not this run's to take out, and the
+  warning ends "socket-patch wrote nothing to MODULE.bazel for it: the entry of patch <id>
+  remains there, and where the block is in effect the Bazel build takes that patch's jar".
 
 | Code | When |
 |---|---|
 | `maven_bazel_not_at_root` | The project is below the root of its Bazel workspace. The block belongs in the root's `MODULE.bazel`: run the command there. |
 | `maven_bazel_not_pinned` | A hub has no `lock_file` (also one that only `maven.artifact` or `maven.from_toml` tags make): Bazel resolves its jars when it builds. Also beside a pinned hub that holds the artifact, because the hub without a lock may build the upstream jar. Give it a `lock_file` and pin it. |
-| `maven_bazel_unreadable` | Something could not be read with certainty: a `maven.install` whose `name` or `lock_file` is not a plain string, `install` tags of one hub that name different locks, a construct of `MODULE.bazel` the reader does not follow, a lock that is missing, empty, not format 2 or 3, larger than 16 MiB or no JSON, a `WORKSPACE` file that calls `maven_install` while Bazel may read it, a hub on a `use_extension` with `isolate`, an rc file that cannot be read (also one that an import takes from outside the workspace by a relative path, and an import whose path is quoted), a `MODULE.bazel` that is a symbolic link, or a block that was changed by hand. |
-| `maven_bazel_release` | The Bazel or the ruleset release is not known to be one the block works with. Bazel: `.bazeliskrc` or `.bazelversion` names a release before 7.4.0, or neither names a release of three numbers and `MODULE.bazel.lock` is missing or older than the format Bazel 7.5.0 writes (add a `.bazelversion`). Ruleset: `MODULE.bazel.lock` does not hold the `source.json` of exactly one rules_jvm_external release (build once), that release is not one of 6.4 to 7.2 (update socket-patch), or `MODULE.bazel` asks for a newer one than the lock holds (build once). The `bazel_dep` line alone is not taken: Bazel can select a newer release. |
+| `maven_bazel_unreadable` | Something could not be read with certainty: a `maven.install` whose `name` or `lock_file` is not a plain string, `install` tags of one hub that name different locks, a construct of `MODULE.bazel` the reader does not follow, a lock that is missing, empty, not format 2 or 3, larger than 16 MiB or no JSON, a `WORKSPACE` file that calls `maven_install` while Bazel may read it, a hub on a `use_extension` with `isolate`, an rc file that cannot be read (also one that an import takes from outside the workspace by a relative path, and one with a line whose reading Bazel's own source calls an oversight: a quote that is never closed, a `\` with nothing after it; the warning names the line), a `MODULE.bazel` that is a symbolic link, or a block that was changed by hand. |
+| `maven_bazel_release` | The Bazel or the ruleset release is not known to be one the block works with. Bazel: `.bazeliskrc` or `.bazelversion` names a release before 7.4.0, or neither names a release of three numbers and `MODULE.bazel.lock` is missing or older than the format Bazel 7.5.0 writes (add a `.bazelversion`). Ruleset: `MODULE.bazel.lock` does not hold the `source.json` of exactly one rules_jvm_external release (build once), that release is not one of 6.4 to 7.2 (update socket-patch), or the lock holds another release than `MODULE.bazel` now takes: an older one than its `bazel_dep` asks for, or any other than the one a `single_version_override` of the ruleset pins (build once). Versions are compared as Bazel compares them (`7.2` is below `7.2.1`). The `bazel_dep` line alone is not taken: Bazel can select a newer release, and a `single_version_override` with a version that the lock agrees with can pin an older one. An `archive_override`, `git_override`, `local_path_override` or `multiple_version_override` of the ruleset, and a `single_version_override` whose version is no plain string, leave the release unknown: the warning names the override's line. |
 | `maven_bazel_artifact` | The repository of this jar has no known name (a character other than letters, digits, `.`, `_` and `-` in its group, artifact or version), the lock lists no repository for the jar (it comes from the Maven local repository under `m2local`), or the patch comes without its served version or a sha256. |
 | `maven_bazel_no_effect` | The build would pass on the upstream jar with the block in place: the root has a `maven.override` for the artifact, or an rc file of the checkout names `--ignore_dev_dependency` without switching it off, or names `enable_bzlmod` other than switched on (`--noenable_bzlmod`, `--enable_bzlmod=false`, and Bazel's other words for it: `0`, `no`, `f`, `n`, in any case) while the checkout names no Bazel 9 or later. |
 | `maven_bazel_download` | An rc file of the checkout names a downloader config, `--repository_disable_download` or `--vendor_dir`: Bazel may not be able to download the patched jar. |

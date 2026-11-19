@@ -532,6 +532,23 @@ fn registry_override_of_kind<'a>(dep: &'a DepOverride, kind: &str) -> Option<&'a
     dep.registry_override.as_ref().filter(|ov| ov.kind == kind)
 }
 
+/// The `maven2` override of a Maven patch, and the group and the artifact
+/// the patch is pinned under: those of the grant, else those of the purl.
+/// The pom rewriter and the lane for the hubs of a Bazel workspace
+/// ([`crate::bazel::maven`]) both go by it, so that one run pins the same
+/// artifact for both builds.
+pub(crate) fn maven_coordinates(dep: &DepOverride) -> (Option<&RegistryOverride>, String, String) {
+    let ov = registry_override_of_kind(dep, "maven2");
+    let ids = ov.map(|ov| &ov.identifiers);
+    let group = ids.and_then(|ids| ids.maven_group_id.clone());
+    let artifact = ids.and_then(|ids| ids.maven_artifact_id.clone());
+    (
+        ov,
+        group.or_else(|| dep.namespace.clone()).unwrap_or_default(),
+        artifact.unwrap_or_else(|| dep.name.clone()),
+    )
+}
+
 /// Run every rewriter and merge the results (each owns distinct files).
 pub fn rewrite_registry_redirect(
     files: &BTreeMap<String, String>,
@@ -9105,25 +9122,19 @@ fn rewrite_maven_pom(
     // unenforced-pin warning must fire on re-scans too.
     let mut pinned_jar_paths: Vec<String> = vec![];
 
+    // A patch whose jar a rules_jvm_external hub of a Bazel workspace
+    // builds, or may build, is decided by the lane of the hubs, which says
+    // why when it writes nothing: "no pom.xml" is not said of it.
+    let hub = crate::bazel::maven::handed(files);
+
     for dep in &maven {
-        let Some(ov) = registry_override_of_kind(dep, "maven2") else {
+        let (Some(ov), group_id, artifact_id) = maven_coordinates(dep) else {
             result.warnings.push(RewriteWarning {
                 code: "redirect_maven_missing_override".into(),
                 detail: format!("{} has no maven2 registry override", full_name(dep)),
             });
             continue;
         };
-        let group_id = ov
-            .identifiers
-            .maven_group_id
-            .clone()
-            .or_else(|| dep.namespace.clone())
-            .unwrap_or_default();
-        let artifact_id = ov
-            .identifiers
-            .maven_artifact_id
-            .clone()
-            .unwrap_or_else(|| dep.name.clone());
         let suffixed_version = ov.identifiers.maven_suffixed_version.clone();
         // The jar and served-pom sha256 a Trusted Checksums pin needs, as
         // the bare lowercase hex Maven compares; a grant hash of any other
@@ -9160,7 +9171,7 @@ fn rewrite_maven_pom(
             // A Gradle-only project is legitimately pom-less — the Gradle
             // planner is its redirect path. Otherwise say why nothing landed
             // (parity with `redirect_npm_no_lockfile`), once per run.
-            if !gradle_build_present && !warned_no_pom {
+            if !gradle_build_present && !warned_no_pom && !hub.contains_key(&dep.patch_uuid) {
                 warned_no_pom = true;
                 result.warnings.push(RewriteWarning {
                     code: "redirect_maven_no_pom".into(),
