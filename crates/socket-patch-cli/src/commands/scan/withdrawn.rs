@@ -177,7 +177,17 @@ pub(super) async fn sweep(
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect();
-    let references = match api_client.fetch_registry_references(&uuids).await {
+    // A network round trip between the lookup and the patch records.
+    let asked = crate::ui::busy(
+        common,
+        format!(
+            "Checking {}",
+            crate::ui::plural(uuids.len(), "hosted patch", "hosted patches")
+        ),
+        api_client.fetch_registry_references(&uuids),
+    )
+    .await;
+    let references = match asked {
         Ok(references) => references,
         Err(e) => {
             out.warn(

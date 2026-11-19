@@ -59,6 +59,15 @@ Empty environment values are treated as unset.
   and refuse offline operation. Other commands can use locally available state;
   missing records or artifacts can still prevent completion.
 - `SOCKET_NO_UPDATE_CHECK=1` disables the passive update notice.
+- A command an AI coding agent runs gets plain output even on a terminal: no
+  animated status line, no color, no full-screen `list` or `show`, no arrow-key
+  menus. It is what a pipe gets, so an agent's context holds the results and
+  nothing else. Agents are recognized by the variables they set for the commands
+  they run (`AI_AGENT`, `CLAUDECODE`, `CURSOR_AGENT`, `CODEX_SANDBOX`,
+  `GEMINI_CLI`, `VSCODE_AGENT` and others). `SOCKET_PLAIN=1` asks for the same
+  output anywhere, and `SOCKET_PLAIN=0` keeps the full terminal output for a
+  person working in a terminal an agent started. Yes/no confirmations are not
+  affected: `--yes` is what answers them.
 
 For other settings, precedence is flag → environment → default, except for the
 repository policy scalars below. Socket Patch does not automatically load `.env`

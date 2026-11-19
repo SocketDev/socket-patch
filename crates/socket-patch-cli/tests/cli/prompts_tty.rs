@@ -69,6 +69,45 @@ fn write_remove_manifest(root: &Path) {
     std::fs::write(socket.join("manifest.json"), REMOVE_MANIFEST).unwrap();
 }
 
+/// A typed yes/no question is a safeguard, not decoration: on an AI
+/// coding agent's terminal it is still asked, and `n` still declines.
+/// Only presentation follows the agent's variables; nothing in the
+/// environment answers a confirmation (`--yes` does).
+#[test]
+fn remove_still_asks_on_an_agents_terminal() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_remove_manifest(tmp.path());
+
+    let run = pty_io::run_command(
+        common::hermetic::pty_binary_command(),
+        &[
+            "remove",
+            "pkg:npm/__prompts_tty_remove__@1.0.0",
+            "--skip-rollback",
+        ],
+        tmp.path(),
+        &[("AI_AGENT", "some-agent_1-2-3_agent")],
+        &[b"n\n"],
+        Duration::from_secs(15),
+    );
+    let output = run.output;
+    assert!(
+        output.contains("Remove 1 patch from the manifest without rolling back its files?"),
+        "the confirmation must still be asked; got: {output}"
+    );
+    assert!(output.contains("[Y/n]"), "{output}");
+    assert!(
+        !output.contains("Non-interactive mode detected"),
+        "nothing may answer for the user; got: {output}"
+    );
+    // Declined: the manifest still records the patch.
+    let manifest = std::fs::read_to_string(tmp.path().join(".socket/manifest.json")).unwrap();
+    assert!(
+        manifest.contains("__prompts_tty_remove__"),
+        "a declined removal must change nothing; manifest: {manifest}"
+    );
+}
+
 #[test]
 fn remove_interactive_bare_enter_proceeds_with_default_yes() {
     // `ui::confirm`'s empty-answer arm returns `default_yes`, and every
@@ -135,13 +174,34 @@ fn remove_interactive_bare_enter_proceeds_with_default_yes() {
 /// Collect the paths of every request the mock actually received. Used to
 /// prove which code path the binary really took (vs. fabricating the right
 /// output without touching the network it claims to touch).
+///
+/// On a terminal `get` also asks what Socket measured about each patch it
+/// lists: a view request that carries no file content
+/// (`?include_blobs=false`). Those are not downloads of a patch, and are
+/// left out.
 async fn received_paths(mock: &MockServer) -> Vec<String> {
     mock.received_requests()
         .await
         .expect("wiremock must record received requests")
         .iter()
+        .filter(|r| r.url.query() != Some("include_blobs=false"))
         .map(|r| r.url.path().to_string())
         .collect()
+}
+
+/// The patches whose measurements the listing asked for
+/// (`view/<uuid>?include_blobs=false`), by uuid.
+async fn measured_uuids(mock: &MockServer) -> Vec<String> {
+    let mut uuids: Vec<String> = mock
+        .received_requests()
+        .await
+        .expect("wiremock must record received requests")
+        .iter()
+        .filter(|r| r.url.query() == Some("include_blobs=false"))
+        .filter_map(|r| r.url.path().rsplit('/').next().map(str::to_string))
+        .collect();
+    uuids.sort();
+    uuids
 }
 
 /// A single-file patch-view `files` map that survives the "patch has
@@ -276,7 +336,7 @@ fn get_interactive_dialoguer_enter_accepts_first_ranked_option() {
     );
     // Enter accepted the first-ranked option and get proceeded to save it.
     assert!(
-        output.contains("Added: 1"),
+        output.contains("Saved 1 patch to "),
         "get must have saved the selected patch; got: {output}"
     );
     let body = std::fs::read_to_string(tmp.path().join(".socket/manifest.json"))
@@ -301,6 +361,12 @@ fn get_interactive_dialoguer_enter_accepts_first_ranked_option() {
             .iter()
             .any(|p| p.ends_with(&format!("/patches/view/{UUID_B}"))),
         "the non-selected patch must not be fetched; recorded paths={paths:?}"
+    );
+    // The listing asked what was measured about both candidates, without
+    // their file content.
+    assert_eq!(
+        rt.block_on(measured_uuids(&mock)),
+        [UUID_A.to_string(), UUID_B.to_string()]
     );
 }
 
@@ -419,7 +485,7 @@ fn get_interactive_dialoguer_quit_cancels_with_exit_zero() {
     );
     // Cancelled means NOTHING was downloaded or recorded.
     assert!(
-        !output.contains("Patches saved"),
+        !output.contains("Saved "),
         "cancelled selection must not save anything; got: {output}"
     );
     assert!(

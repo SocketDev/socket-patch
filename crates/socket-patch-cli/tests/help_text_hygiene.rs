@@ -203,14 +203,15 @@ fn root_command_list_leads_with_the_v5_workflow() {
         .filter_map(|l| l.split_whitespace().next())
         .filter(|w| {
             [
-                "scan", "vex", "vendor", "list", "get", "apply", "rollback", "remove", "repair",
+                "scan", "vex", "vendor", "list", "get", "show", "apply", "rollback", "remove",
+                "repair",
             ]
             .contains(w)
         })
         .collect();
     assert_eq!(
-        &order[..9],
-        ["scan", "get", "list", "remove", "rollback", "vex", "vendor", "apply", "repair"],
+        &order[..10],
+        ["scan", "get", "show", "list", "remove", "rollback", "vex", "vendor", "apply", "repair"],
         "{text}"
     );
     assert!(

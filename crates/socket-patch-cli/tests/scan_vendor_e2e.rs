@@ -764,13 +764,13 @@ async fn scan_vendor_fetch_failure_reports_error() {
         "the failed fetch must be reported on stderr, not swallowed; \
          stdout={stdout}; stderr={stderr}"
     );
-    // With --yes no prompt was answered, so the header gets no blank line
-    // of its own (the listing's trailing blank line separates the sections).
+    // The failure line follows the crawl line directly: a scan prints no
+    // download header and no per-patch progress lines.
     assert!(
-        stderr.contains("Downloading 1 patch...")
-            && !stderr.starts_with('\n')
-            && !stderr.contains("\n\nDownloading"),
-        "no extra blank line before the header under --yes; stderr={stderr}"
+        stderr.contains("Found 1 package (1 npm)\n  [fail] pkg:npm/left-pad@1.3.0 ")
+            && !stderr.contains("Downloading")
+            && !stderr.contains("[fetch]"),
+        "stderr={stderr}"
     );
     assert!(
         stdout.contains("Nothing was vendored: 1 patch failed (see above)."),
@@ -1947,10 +1947,14 @@ async fn scan_discovers_lockfile_only_packages_with_warning() {
     assert_eq!(v["lockfileOnlyPackages"], 1, "{v}");
     assert_eq!(v["packages"][0]["notInstalled"], true, "{v}");
 
-    // Human output: the table marker + the note.
+    // Human output of an agent-mode scan, which patches installed copies:
+    // the note, and the package's `[skip]` line. (A hosted or vendored scan
+    // patches from the lockfile, so "not installed" is not news to it.)
     let out = hermetic_command(&binary())
         .args([
             "scan",
+            "--mode",
+            "agent",
             "--api-url",
             &mock.uri(),
             "--api-token",
@@ -1966,12 +1970,31 @@ async fn scan_discovers_lockfile_only_packages_with_warning() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stdout.contains("[NOT INSTALLED]"),
+        stdout.contains("  [skip] pkg:npm/left-pad@1.3.0 (not installed; "),
         "stdout={stdout}; stderr={stderr}"
     );
     assert!(
         stderr.contains("not yet installed (lockfile-only)"),
         "stderr={stderr}"
+    );
+    let hosted = hermetic_command(&binary())
+        .args([
+            "scan",
+            "--api-url",
+            &mock.uri(),
+            "--api-token",
+            "fake-token",
+            "--org",
+            ORG_SLUG,
+            "--dry-run",
+        ])
+        .current_dir(tmp.path())
+        .output()
+        .expect("run");
+    assert!(
+        !String::from_utf8_lossy(&hosted.stderr).contains("not yet installed"),
+        "a hosted scan does not note it: {}",
+        String::from_utf8_lossy(&hosted.stderr)
     );
 }
 
@@ -2084,11 +2107,13 @@ async fn scan_flags_scoped_lockfile_only_package_despite_api_purl_encoding() {
         "notInstalled must bridge the API's percent-encoded purl: {v}"
     );
 
-    // Human table: the [NOT INSTALLED] marker must match through the
-    // encoding difference too.
+    // Human output: an agent-mode scan's not-installed `[skip]` line must
+    // match through the encoding difference too.
     let out = hermetic_command(&binary())
         .args([
             "scan",
+            "--mode",
+            "agent",
             "--api-url",
             &mock.uri(),
             "--api-token",
@@ -2104,7 +2129,7 @@ async fn scan_flags_scoped_lockfile_only_package_despite_api_purl_encoding() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stdout.contains("[NOT INSTALLED]"),
+        stdout.contains("  [skip] pkg:npm/@scope/left-pad@1.3.0 (not installed; "),
         "stdout={stdout}; stderr={stderr}"
     );
 }

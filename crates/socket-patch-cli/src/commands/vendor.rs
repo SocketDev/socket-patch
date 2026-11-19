@@ -1137,6 +1137,7 @@ pub async fn run(args: VendorArgs) -> i32 {
                             .display()
                             .to_string(),
                         statements: summary.statements,
+                        affected: summary.affected,
                         format: "openvex-0.2.0".to_string(),
                         warnings: summary.warnings.clone(),
                     });
@@ -1157,6 +1158,7 @@ pub async fn run(args: VendorArgs) -> i32 {
                     "{}",
                     crate::commands::vex::format_vex_written(
                         summary.statements,
+                        summary.affected,
                         args.vex
                             .vex
                             .as_ref()
@@ -1274,6 +1276,7 @@ pub async fn run(args: VendorArgs) -> i32 {
                         env.vex = Some(VexSummary {
                             path: vex_path.display().to_string(),
                             statements: summary.statements,
+                            affected: summary.affected,
                             format: "openvex-0.2.0".to_string(),
                             // note_warning suppressed these on stderr under
                             // --json; the envelope copy is their only
@@ -2515,6 +2518,7 @@ async fn run_eject(
                         env.vex = Some(VexSummary {
                             path: vex_path.display().to_string(),
                             statements: summary.statements,
+                            affected: summary.affected,
                             format: "openvex-0.2.0".to_string(),
                             warnings: summary.warnings,
                         });
@@ -4545,16 +4549,10 @@ fn print_vendor_closing(
                 cmds.join(" and ")
             )
         } else if installs.is_empty() {
-            "Reinstall from the updated lockfile so the installed packages pick up the \
-             vendored artifacts"
-                .to_string()
+            "Reinstall from the updated lockfile".to_string()
         } else {
             let cmds: Vec<String> = installs.iter().map(|c| format!("`{c}`")).collect();
-            format!(
-                "Run {} to update the installed tree (vendoring rewires the lockfile \
-                 only; the current install keeps the unpatched bytes until reinstalled)",
-                cmds.join(" and ")
-            )
+            format!("Run {} to update the installed tree", cmds.join(" and "))
         };
         let mut extra = Vec::new();
         if wired_flavors.contains("bun") && common.cwd.join("bun.lockb").exists() {

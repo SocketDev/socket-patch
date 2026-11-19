@@ -49,6 +49,7 @@ fn bool_flags(a: &ApplyArgs) -> Vec<(&'static str, bool)> {
         ("force", a.force),
         ("check", a.check),
         ("vex_no_verify", a.vex.vex_no_verify),
+        ("vex_no_bazel", a.vex.vex_no_bazel),
         ("vex_compact", a.vex.vex_compact),
     ]
 }
@@ -112,6 +113,7 @@ fn defaults_match_contract() {
     assert_eq!(a.vex.vex, None);
     assert_eq!(a.vex.vex_product, None);
     assert!(!a.vex.vex_no_verify);
+    assert!(!a.vex.vex_no_bazel);
     assert_eq!(a.vex.vex_doc_id, None);
     assert!(!a.vex.vex_compact);
 
@@ -152,6 +154,7 @@ fn vex_passthrough_flags() {
         "--vex-product",
         "pkg:npm/app@1.0.0",
         "--vex-no-verify",
+        "--vex-no-bazel",
         "--vex-doc-id",
         "urn:uuid:fixed",
         "--vex-compact",
@@ -159,11 +162,12 @@ fn vex_passthrough_flags() {
     assert_eq!(a.vex.vex, Some(PathBuf::from("out.vex.json")));
     assert_eq!(a.vex.vex_product.as_deref(), Some("pkg:npm/app@1.0.0"));
     assert!(a.vex.vex_no_verify);
+    assert!(a.vex.vex_no_bazel);
     assert_eq!(a.vex.vex_doc_id.as_deref(), Some("urn:uuid:fixed"));
     assert!(a.vex.vex_compact);
-    // Only the two vex booleans should be set; nothing else (e.g. --force) may
-    // ride along on the vex passthrough.
-    assert_only_true(&a, &["vex_no_verify", "vex_compact"]);
+    // Only the three vex booleans should be set; nothing else (e.g. --force)
+    // may ride along on the vex passthrough.
+    assert_only_true(&a, &["vex_no_verify", "vex_no_bazel", "vex_compact"]);
 }
 
 /// The `manifest_path` default is contract — many scripts hard-code

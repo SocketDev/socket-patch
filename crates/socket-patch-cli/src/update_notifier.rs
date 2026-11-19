@@ -17,7 +17,6 @@
 //! - it can never delay a command beyond the grace budget;
 //! - state corruption/unwritability is silently absorbed.
 
-use std::io::IsTerminal;
 use std::time::Duration;
 
 use socket_patch_core::update::{
@@ -68,7 +67,7 @@ impl SkipReason {
             SkipReason::Silent => "--silent",
             SkipReason::Json => "--json",
             SkipReason::Ci => "CI environment",
-            SkipReason::NotATty => "stderr is not a terminal",
+            SkipReason::NotATty => "stderr is not a terminal with a person at it",
             SkipReason::NoStateDir => "no resolvable state directory",
         }
     }
@@ -121,7 +120,7 @@ impl GuardCtx {
                     .is_empty(),
             // The notice prints on stderr; stdout may be legitimately piped
             // (`list | jq`) in a perfectly interactive session.
-            stderr_tty: std::io::stderr().is_terminal(),
+            stderr_tty: crate::ui::attended(crate::ui::Stream::Stderr),
             forced: env_truthy("SOCKET_UPDATE_NOTIFIER_FORCE"),
             state_dir_resolvable: core_update::state::state_dir().is_some(),
         }

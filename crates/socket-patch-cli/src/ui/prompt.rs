@@ -10,7 +10,8 @@ use crate::args::GlobalArgs;
 const NON_INTERACTIVE_PROCEED: &str = "Non-interactive mode detected, proceeding automatically.";
 /// Same, for a prompt whose default is "no".
 const NON_INTERACTIVE_DECLINE: &str = "Non-interactive mode detected, declining by default.";
-/// Same, for [`select_one`], which takes the first option.
+/// Same, for [`select_one`], which takes the first option when nobody is
+/// at a terminal on stdin (a pipe, or an AI coding agent's terminal).
 const NON_INTERACTIVE_SELECT_FIRST: &str =
     "Non-interactive mode detected, selecting the first option.";
 
@@ -120,13 +121,18 @@ pub enum SelectError {
     JsonModeNeedsExplicit,
 }
 
+/// How many options a menu shows at once; a longer list scrolls (and
+/// pages with the left and right arrows). Fewer on a shorter terminal.
+const MENU_ROWS: usize = 12;
+
 /// Prompt the user to select one option from a list (arrow-key menu on
 /// stderr). Takes the same `common` flags as [`confirm`].
 ///
 /// - `--json`: `Err(JsonModeNeedsExplicit)`.
 /// - Empty `options`: `Err(Cancelled)` — there is nothing to select, and
 ///   `Ok(0)` would hand callers an out-of-bounds index.
-/// - stdin not a terminal: the first option, with
+/// - Nobody at a terminal on stdin ([`super::attended`]: a pipe, or an
+///   AI coding agent's terminal): the first option, with
 ///   [`NON_INTERACTIVE_SELECT_FIRST`] unless `--silent` or the process is
 ///   quiet ([`super::quiet`]).
 /// - Interactive: Esc/q/Ctrl-C cancel; the cursor is always restored.
@@ -135,16 +141,30 @@ pub fn select_one(
     options: &[String],
     common: &GlobalArgs,
 ) -> Result<usize, SelectError> {
+    select_from(prompt, options, 0, common)
+}
+
+/// [`select_one`] with the menu opened on option `start`: a menu shown
+/// again after a pick comes back where the user left it.
+pub fn select_from(
+    prompt: &str,
+    options: &[String],
+    start: usize,
+    common: &GlobalArgs,
+) -> Result<usize, SelectError> {
     if common.json {
         return Err(SelectError::JsonModeNeedsExplicit);
     }
     if options.is_empty() {
         return Err(SelectError::Cancelled);
     }
-    if !io::stdin().is_terminal() {
+    // An arrow-key menu needs a person at the keys: an agent's terminal
+    // takes the first option, as a pipe does.
+    if !super::attended(super::Stream::Stdin) {
         if !common.silent && !super::quiet() {
             eprintln!("{NON_INTERACTIVE_SELECT_FIRST}");
         }
+        super::note_agent_terminal(common);
         return Ok(0);
     }
     let (prompt, options) = fit_menu(prompt, options, super::stderr_width());
@@ -152,7 +172,8 @@ pub fn select_one(
     let picked = dialoguer::Select::with_theme(&dialoguer::theme::ColorfulTheme::default())
         .with_prompt(prompt)
         .items(&options)
-        .default(0)
+        .default(start.min(options.len() - 1))
+        .max_length(MENU_ROWS)
         .interact_opt();
     match picked {
         Ok(Some(idx)) => Ok(idx),
@@ -171,9 +192,36 @@ fn fit_menu(prompt: &str, options: &[String], width: usize) -> (String, Vec<Stri
     let prompt = super::truncate(prompt, width.saturating_sub(6).max(MIN));
     let options = options
         .iter()
-        .map(|o| super::truncate(o, width.saturating_sub(3).max(MIN)))
+        .map(|o| fit_option(o, width.saturating_sub(3).max(MIN)))
         .collect();
     (prompt, options)
+}
+
+/// One menu option on one line of at most `max` characters. Unlike
+/// [`super::truncate`] it keeps runs of spaces, so options laid out in
+/// columns stay in them; a line break or tab (API free text) becomes a
+/// space, since either would break the menu apart.
+fn fit_option(option: &str, max: usize) -> String {
+    const ELLIPSIS: &str = "...";
+    let flat: String = option
+        .chars()
+        .map(|c| {
+            if c.is_whitespace() || c.is_control() {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect();
+    let flat = flat.trim_end();
+    if flat.chars().count() <= max {
+        return flat.to_string();
+    }
+    let kept: String = flat
+        .chars()
+        .take(max.saturating_sub(ELLIPSIS.len()))
+        .collect();
+    format!("{}{ELLIPSIS}", kept.trim_end())
 }
 
 /// dialoguer hides the cursor while its menu is up. Its own error paths
