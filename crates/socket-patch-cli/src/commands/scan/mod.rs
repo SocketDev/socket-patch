@@ -3924,9 +3924,9 @@ mod tests {
     /// The patches an agent run left in place, for the coverage lines: the
     /// ones it wrote, the ones already there, and the ones whose code is
     /// not in the build installed here, which `apply --check` and `vex`
-    /// count as patched too. A patch that was written but is not in
-    /// effect, a failed one and one that is not installed are not among
-    /// them.
+    /// count as patched too. An incomplete patch (its files written, its
+    /// compiled part not in effect), a failed one and one that is not
+    /// installed are not among them.
     #[test]
     fn patched_uuids_are_the_patches_the_run_left_in_place() {
         let mut env = Envelope::new(JsonCommand::Scan);
@@ -3942,8 +3942,21 @@ mod tests {
             "not-in-build",
             "not_in_platform_build",
         ));
+        // An incomplete patch: its files are written and what the copy
+        // compiles is not the patch's. The apply reports it as failed
+        // under its own code, on the run that wrote the files and on
+        // every later one, and it is no patch left in place.
+        env.record(
+            PatchEvent::new(PatchAction::Failed, "pkg:gem/c@1")
+                .with_uuid("incomplete")
+                .with_error(
+                    "native_extension_not_rebuilt",
+                    "the patch's files were written, but not built",
+                ),
+        );
+        // Neither is a skip that carries that code.
         env.record(skip(
-            "pkg:gem/c@1",
+            "pkg:gem/c2@1",
             "not-rebuilt",
             "native_extension_not_rebuilt",
         ));

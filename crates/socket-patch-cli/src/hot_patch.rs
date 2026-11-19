@@ -708,22 +708,26 @@ mod tests {
     }
 
     /// A patch whose code is not in the build installed here is in place
-    /// as far as it can be, like one already applied; one that was written
-    /// with no effect on the compiled code is not.
+    /// as far as it can be, like one already applied. An incomplete patch
+    /// (its files written, its compiled part not in effect) is not: it is
+    /// a patch that was not applied, on the run that wrote the files and
+    /// on every later one.
     #[test]
     fn a_patch_with_nothing_to_change_here_counts_as_in_place() {
-        let project = json!({ "status": "success", "scannedPackages": 12, "events": [
+        let project = json!({ "status": "partialFailure", "scannedPackages": 12, "events": [
             { "action": "skipped", "purl": "pkg:gem/nokogiri@1.18.10",
               "errorCode": "not_in_platform_build" },
             { "action": "skipped", "purl": "pkg:gem/rack@3.1.0", "errorCode": "already_patched" },
-            { "action": "skipped", "purl": "pkg:gem/other@1.0.0",
-              "errorCode": "native_extension_not_rebuilt" },
+            { "action": "failed", "purl": "pkg:gem/other@1.0.0",
+              "errorCode": "native_extension_not_rebuilt",
+              "error": "the patch's files were written, but not built" },
             { "action": "skipped", "purl": "pkg:gem/absent@1.0.0",
               "errorCode": "package_not_installed" },
         ]});
         assert_eq!(
             summary_line(&[(PROJECT, project)], false, LIMIT, "0.4s"),
-            "2 patches already in place [12 project packages checked, 0.4s]"
+            "2 patches already in place; 1 patch not applied (pkg:gem/other@1.0.0: the patch's \
+             files were written, but not built) [12 project packages checked, 0.4s]"
         );
     }
 

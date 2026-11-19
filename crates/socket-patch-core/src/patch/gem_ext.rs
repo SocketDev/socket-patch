@@ -103,9 +103,12 @@
 //! downloads the binary it runs (passenger's agent) has nothing a build
 //! could put where Ruby loads it. Either way the record's files are
 //! written, the compiled code stays what it was, no marker is written, and
-//! the run warns with [`NOT_REBUILT_REASON`] (`Job::write_without_build`):
-//! the patch's Ruby files are in effect, a source the gem compiles later on
-//! its own is the patched one, and nothing attests the copy.
+//! the patch is incomplete ([`GemCaveat::Incomplete`],
+//! `Job::write_without_build`): the patch's Ruby files are in effect, a
+//! source the gem compiles later on its own is the patched one, and
+//! nothing attests the copy. The result is not a failed one, so nothing is
+//! put back; the caller fails the run on the caveat and warns with
+//! [`NOT_REBUILT_REASON`].
 //!
 //! A build can take many minutes. The run says when one starts and when
 //! it ends ([`RubyEnv::progress`]).
@@ -158,8 +161,9 @@
 //! The one thing that cannot be done here is rebuild a jar. A record that
 //! names a JVM build input (`is_jvm_build_input`: a Java, Kotlin or Scala
 //! source, a Maven, Ant or Gradle build file) has its files written and
-//! nothing built, the run warns with [`NOT_REBUILT_REASON`], and nothing
-//! ever attests the copy ([`verify_native_build`]). A jar or a class file
+//! nothing built, the patch is incomplete ([`GemCaveat::Incomplete`], with
+//! the [`NOT_REBUILT_REASON`] warning), and nothing ever attests the copy
+//! ([`verify_native_build`]). A jar or a class file
 //! the record replaces whole is no build input: the patched code is then
 //! where the JVM loads it, and the copy is attested like any other.
 //!
@@ -1480,35 +1484,40 @@ impl InstalledGem {
     }
 }
 
-/// Why `apply` left a gem copy as it was, on purpose: nothing was verified
-/// or written, and the run succeeds. The caller reports the copy as
-/// skipped with the reason's code, never as applied.
+/// What a gem apply whose result succeeded says beyond that result, when
+/// the result alone would read as a copy the patch was applied to and it
+/// is not one. The text is the reason in words, without the purl.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum LeftAsIs {
+pub enum GemCaveat {
     /// No file of the record is part of the build installed there
-    /// ([`NOT_IN_BUILD_CODE`]): the code the patch changes is not in it,
-    /// so nothing is left to do and the copy counts as patched.
+    /// ([`NOT_IN_BUILD_CODE`]): nothing was verified or written, the code
+    /// the patch changes is not in that build, nothing is left to do and
+    /// the copy counts as patched. The caller reports it as skipped.
     NotInBuild(String),
-    /// No file of the record is in the copy to write, and the record
-    /// changes what the copy's jars were built from
-    /// ([`NOT_REBUILT_REASON`]): the patch concerns the build and is not
-    /// in effect. The same text is the run's warning.
-    NotRebuilt(String),
+    /// The patch is incomplete on this copy ([`NOT_REBUILT_REASON`]): the
+    /// record's files that the copy takes are written (there may be none),
+    /// and the compiled code it runs is not the patch's, with nothing here
+    /// to make it so. `result` says what was written, and none of it is
+    /// undone: the patch's Ruby half stays in effect, and a gem that
+    /// compiles its patched source later on its own relies on it. The
+    /// caller fails the run on it. The same text, after the purl, is the
+    /// run's warning.
+    Incomplete(String),
 }
 
-impl LeftAsIs {
+impl GemCaveat {
     /// The reason code the copy is reported with.
     pub fn code(&self) -> &'static str {
         match self {
-            LeftAsIs::NotInBuild(_) => NOT_IN_BUILD_CODE,
-            LeftAsIs::NotRebuilt(_) => NOT_REBUILT_REASON,
+            GemCaveat::NotInBuild(_) => NOT_IN_BUILD_CODE,
+            GemCaveat::Incomplete(_) => NOT_REBUILT_REASON,
         }
     }
 
     /// The reason in words.
     pub fn detail(&self) -> &str {
         match self {
-            LeftAsIs::NotInBuild(detail) | LeftAsIs::NotRebuilt(detail) => detail,
+            GemCaveat::NotInBuild(detail) | GemCaveat::Incomplete(detail) => detail,
         }
     }
 }
@@ -1516,14 +1525,32 @@ impl LeftAsIs {
 /// [`apply_gem_package_patch`]'s outcome: the copy's result, and a run
 /// warning `(code, detail)` the caller surfaces next to it. A result that
 /// succeeded with a [`NOT_REBUILT_REASON`] warning wrote the record's files
-/// and built nothing: the copy's compiled code is not the patch's.
+/// and built nothing: the copy's compiled code is not the patch's. Unless
+/// the caller compiles it itself (`--no-gem-native-rebuild`), that patch
+/// is incomplete, which `caveat` says in a typed way.
 #[derive(Debug, Clone)]
 pub struct GemApplied {
     pub result: ApplyResult,
     pub warning: Option<(String, String)>,
-    /// Set when the run left the copy as it was on purpose: `result` then
-    /// succeeded with nothing verified and nothing written.
-    pub left_as_is: Option<LeftAsIs>,
+    /// Set when `result` succeeded and is not the whole story
+    /// ([`GemCaveat`]).
+    pub caveat: Option<GemCaveat>,
+}
+
+impl GemApplied {
+    /// The outcome of a copy whose patch is incomplete because `detail`
+    /// ([`GemCaveat::Incomplete`]): `result` stands as it is, and the run
+    /// warning carries the same text.
+    fn incomplete(result: ApplyResult, package_key: &str, detail: String) -> GemApplied {
+        GemApplied {
+            result,
+            warning: Some((
+                NOT_REBUILT_REASON.to_string(),
+                format!("{package_key}: {detail}"),
+            )),
+            caveat: Some(GemCaveat::Incomplete(detail)),
+        }
+    }
 }
 
 /// Where the Ruby that builds a copy's extension is looked for and run.
@@ -5088,7 +5115,7 @@ fn untouched_result(package_key: &str, pkg_path: &Path, error: Option<String>) -
 
 fn refusal(package_key: &str, pkg_path: &Path, code: &str, detail: String) -> GemApplied {
     GemApplied {
-        left_as_is: None,
+        caveat: None,
         result: untouched_result(package_key, pkg_path, Some(format!("{code}: {detail}"))),
         warning: Some((code.to_string(), detail)),
     }
@@ -5120,7 +5147,7 @@ async fn plain_apply(
     policy: MismatchPolicy,
 ) -> GemApplied {
     GemApplied {
-        left_as_is: None,
+        caveat: None,
         result: apply_package_patch(
             read_scope,
             package_key,
@@ -5135,32 +5162,27 @@ async fn plain_apply(
     }
 }
 
-/// The [`NOT_REBUILT_REASON`] warning of a copy that holds the record's
-/// files (or, on a `dry_run`, would hold them once `apply` ran) while its
-/// compiled code stays what it was, because `why`. `inputs` names the
-/// record's sources that are in no compiled code ([`list_inputs`]).
-fn not_compiled_warning(
-    package_key: &str,
-    inputs: &str,
-    why: &str,
-    dry_run: bool,
-) -> (String, String) {
-    let detail = if dry_run {
+/// What is wrong with a copy that holds the record's files (or, on a
+/// `dry_run`, would hold them once `apply` ran) while its compiled code
+/// stays what it was, because `why`: the text of an incomplete patch
+/// ([`GemCaveat::Incomplete`]). `inputs` names the record's sources that
+/// are in no compiled code ([`list_inputs`]).
+fn not_compiled_detail(inputs: &str, why: &str, dry_run: bool) -> String {
+    if dry_run {
         format!(
-            "{package_key}: dry run: apply would write the patch's files, but its \
-             native-extension sources ({inputs}) would not be in the compiled code this \
-             install runs: {why}. That code would stay as it was installed, only the patch's \
-             other files would be in effect, and vex would not attest the patch"
+            "dry run: apply would write the patch's files, but its native-extension sources \
+             ({inputs}) would not be in the compiled code this install runs: {why}. That code \
+             would stay as it was installed, only the patch's other files would be in effect, \
+             and vex would not attest the patch"
         )
     } else {
         format!(
-            "{package_key}: the patch's files were written, but its native-extension sources \
-             ({inputs}) are not in the compiled code this install runs: {why}. That code is as \
-             it was installed, only the patch's other files are in effect, and vex does not \
-             attest the patch"
+            "the patch's files were written, but its native-extension sources ({inputs}) are \
+             not in the compiled code this install runs: {why}. That code is as it was \
+             installed, only the patch's other files are in effect, and vex does not attest \
+             the patch"
         )
-    };
-    (NOT_REBUILT_REASON.to_string(), detail)
+    }
 }
 
 /// One gem copy's record, verified against the copy and about to be built.
@@ -5241,21 +5263,27 @@ impl Job<'_> {
         GemApplied {
             result,
             warning,
-            left_as_is: None,
+            caveat: None,
         }
     }
 
-    /// The warning of a copy that holds the record's files while its
-    /// compiled code is what it was: a clean build showed that this install
-    /// compiles nothing of the record (`why`). No marker is written, so
-    /// `vex` and `apply --check` do not take the copy for patched
-    /// ([`verify_native_build`]).
-    fn not_compiled(&self, why: &str) -> (String, String) {
-        not_compiled_warning(self.package_key, self.inputs, why, false)
+    /// The outcome of a copy that holds the record's files (`result` wrote
+    /// them, or found them written) while its compiled code is what it
+    /// was: a clean build showed that this install compiles nothing of the
+    /// record (`why`). The patch is incomplete
+    /// ([`GemCaveat::Incomplete`]), and nothing is put back. No marker is
+    /// written, so `vex` and `apply --check` do not take the copy for
+    /// patched ([`verify_native_build`]).
+    fn not_compiled(&self, result: ApplyResult, why: &str) -> GemApplied {
+        GemApplied::incomplete(
+            result,
+            self.package_key,
+            not_compiled_detail(self.inputs, why, false),
+        )
     }
 
     /// Write the record's files into a copy whose build showed that it
-    /// compiles nothing of them (`why`), and say so
+    /// compiles nothing of them (`why`), and report the patch as incomplete
     /// ([`not_compiled`](Self::not_compiled)): the patch's Ruby files take
     /// effect, and a file the gem compiles later on its own (one that
     /// builds its binary when it first runs) is the patched one (#2144).
@@ -5275,12 +5303,14 @@ impl Job<'_> {
         }
         let originals = self.originals().await;
         let result = self.write_sources(&originals).await;
-        let warning = result.success.then(|| self.not_compiled(why));
-        GemApplied {
-            result,
-            warning,
-            left_as_is: None,
+        if !result.success {
+            return GemApplied {
+                result,
+                warning: None,
+                caveat: None,
+            };
         }
+        self.not_compiled(result, why)
     }
 
     /// The outcome of a copy that is as it was before the run, because
@@ -5308,7 +5338,7 @@ impl Job<'_> {
         }
         result.error = Some(format!("{BUILD_FAILED_CODE}: {detail}"));
         GemApplied {
-            left_as_is: None,
+            caveat: None,
             result,
             warning: Some((BUILD_FAILED_CODE.to_string(), detail)),
         }
@@ -5330,8 +5360,8 @@ const JARS_NOT_REBUILT: &str = "the gem's jars were built from Java sources the 
 /// The files the copy takes of the record are written ([`jvm_record`]),
 /// and that is the whole patch unless the record names a JVM build input
 /// ([`is_jvm_build_input`]): the jars were built from those, so the copy's
-/// compiled code is then not the patch's, and the run says so
-/// ([`NOT_REBUILT_REASON`]).
+/// compiled code is then not the patch's, and the patch is incomplete
+/// ([`GemCaveat::Incomplete`]).
 struct JvmApply<'a> {
     read_scope: crate::utils::repo_root::ReadScope,
     package_key: &'a str,
@@ -5347,14 +5377,9 @@ struct JvmApply<'a> {
 }
 
 impl JvmApply<'_> {
-    /// The outcome of a copy this run leaves as it is on purpose (`why`),
-    /// with the run warning that goes with it, if any.
-    fn left_as_is(&self, why: LeftAsIs, warning: Option<(String, String)>) -> GemApplied {
-        GemApplied {
-            result: untouched_result(self.package_key, self.pkg_path, None),
-            warning,
-            left_as_is: Some(why),
-        }
+    /// The result of a copy this run verifies and writes nothing in.
+    fn untouched(&self) -> ApplyResult {
+        untouched_result(self.package_key, self.pkg_path, None)
     }
 
     async fn plain(&self, files: &HashMap<String, PatchFileInfo>) -> GemApplied {
@@ -5381,7 +5406,11 @@ impl JvmApply<'_> {
                      ({full_name}): the code the patch changes is not in that build, so there \
                      is nothing to patch and nothing was written"
                 );
-                return self.left_as_is(LeftAsIs::NotInBuild(detail), None);
+                return GemApplied {
+                    result: self.untouched(),
+                    warning: None,
+                    caveat: Some(GemCaveat::NotInBuild(detail)),
+                };
             }
             return self.plain(&record.files).await;
         }
@@ -5394,27 +5423,47 @@ impl JvmApply<'_> {
             release: self.release.clone(),
         };
         let inputs = list_inputs(&scope);
+        // Nothing of the record is in the copy to write, and its jars may
+        // hold the code the patch fixes: incomplete, whoever compiles.
         if record.files.is_empty() {
             let detail = format!(
-                "{}: none of the patch's files are in the JRuby build of this gem ({full_name}) \
-                 to write, and it changes sources of the gem's jars ({inputs}): \
-                 {JARS_NOT_REBUILT}. Nothing was written, and vex does not attest the patch",
-                self.package_key
+                "none of the patch's files are in the JRuby build of this gem ({full_name}) to \
+                 write, and it changes sources of the gem's jars ({inputs}): \
+                 {JARS_NOT_REBUILT}. Nothing was written, and vex does not attest the patch"
             );
-            let warning = (NOT_REBUILT_REASON.to_string(), detail.clone());
-            return self.left_as_is(LeftAsIs::NotRebuilt(detail), Some(warning));
+            return GemApplied::incomplete(self.untouched(), self.package_key, detail);
         }
-        if self.dry_run {
+        // `--no-gem-native-rebuild`: the caller compiles what the patch
+        // changes itself, so the files are written and the rest is the
+        // caller's, as for an extension.
+        if !self.env.rebuild {
             let mut applied = self.plain(&record.files).await;
             if applied.result.success {
-                applied.warning = Some(not_compiled_warning(
-                    self.package_key,
-                    &inputs,
-                    JARS_NOT_REBUILT,
-                    true,
+                applied.warning = Some((
+                    NOT_REBUILT_REASON.to_string(),
+                    format!(
+                        "{}: the patch changes sources of the gem's jars ({inputs}), written \
+                         without rebuilding them (--no-gem-native-rebuild); JRuby loads the old \
+                         jars until they are rebuilt, and vex does not attest it",
+                        self.package_key
+                    ),
                 ));
             }
             return applied;
+        }
+        // Files alone show what a real run comes to here, so a dry run
+        // says the same: the record verifies, and the patch would be
+        // incomplete.
+        if self.dry_run {
+            let verified = self.plain(&record.files).await;
+            if !verified.result.success {
+                return verified;
+            }
+            return GemApplied::incomplete(
+                verified.result,
+                self.package_key,
+                not_compiled_detail(&inputs, JARS_NOT_REBUILT, true),
+            );
         }
         let job = Job {
             read_scope: self.read_scope,
@@ -5685,7 +5734,7 @@ pub async fn apply_gem_package_patch(
     .await;
     if !verified.success {
         return GemApplied {
-            left_as_is: None,
+            caveat: None,
             result: verified,
             warning: None,
         };
@@ -5736,7 +5785,7 @@ pub async fn apply_gem_package_patch(
             ),
         };
         return GemApplied {
-            left_as_is: None,
+            caveat: None,
             result: verified,
             warning: Some((REBUILT_CODE.to_string(), detail)),
         };
@@ -5906,7 +5955,7 @@ async fn rebuild_in_place(
     let result = job.write_sources(&originals).await;
     if !result.success {
         return GemApplied {
-            left_as_is: None,
+            caveat: None,
             result,
             warning: None,
         };
@@ -5919,14 +5968,7 @@ async fn rebuild_in_place(
     match rebuild(job.copy, probe, job.scope, job.files, job.env, true, stale).await {
         Ok(()) => job.built(result),
         // The previous build is back, and the sources stay written.
-        Err(NotRebuilt::NotOfPatch(why)) => {
-            let warning = Some(job.not_compiled(&why));
-            GemApplied {
-                result,
-                warning,
-                left_as_is: None,
-            }
-        }
+        Err(NotRebuilt::NotOfPatch(why)) => job.not_compiled(result, &why),
         Err(NotRebuilt::Failed(diagnostic)) => {
             // An installed tree may no longer hold what its build needs
             // (nokogiri's deletes `ports/`): the source gem would.
@@ -5969,7 +6011,7 @@ async fn move_into_copy(
     let result = job.write_sources(&originals).await;
     if !result.success {
         return GemApplied {
-            left_as_is: None,
+            caveat: None,
             result,
             warning: None,
         };
@@ -6048,7 +6090,7 @@ async fn graft_into_copy(
     if !result.success {
         drop_new_backup().await;
         return GemApplied {
-            left_as_is: None,
+            caveat: None,
             result,
             warning: None,
         };
@@ -7679,28 +7721,22 @@ mod tests {
         );
     }
 
-    /// `apply` on a JVM copy that takes no file of a record leaves it as
-    /// it is and says why in a typed outcome: the code is not in that
-    /// build (a patch of the C build alone), or the record changes
-    /// sources of the jars and has nothing to write. Neither starts a Ruby
-    /// or reads a blob.
+    /// `apply` on a JVM copy that takes no file of a record writes nothing
+    /// and says what that means in a typed caveat: the code is not in
+    /// that build (a patch of the C build alone, which leaves nothing to
+    /// do), or the record changes sources of the jars and the patch is
+    /// incomplete. Neither starts a Ruby or reads a blob.
     #[tokio::test]
-    async fn a_jvm_copy_with_nothing_to_write_is_left_as_it_is() {
+    async fn a_jvm_copy_with_nothing_to_write_says_what_that_means() {
         let tmp = tempfile::tempdir().unwrap();
         let copy = jvm_gem(&tmp.path().join("jruby"));
         let blobs = tmp.path().join("blobs");
-        let env = RubyEnv {
-            cwd: tmp.path().to_path_buf(),
-            rebuild: true,
-            offline: true,
-            progress: None,
-        };
         let added = PatchFileInfo {
             before_hash: String::new(),
             after_hash: "5".repeat(64),
         };
-        let apply = |purl: &'static str, record: HashMap<String, PatchFileInfo>| {
-            let (copy, blobs, env) = (copy.clone(), blobs.clone(), env.clone());
+        let apply = |purl: &'static str, record: HashMap<String, PatchFileInfo>, rebuild: bool| {
+            let (copy, blobs, cwd) = (copy.clone(), blobs.clone(), tmp.path().to_path_buf());
             async move {
                 apply_gem_package_patch(
                     crate::utils::repo_root::ReadScope::Workspace,
@@ -7710,7 +7746,12 @@ mod tests {
                     &PatchSources::blobs_only(&blobs),
                     false,
                     MismatchPolicy::Strict,
-                    &env,
+                    &RubyEnv {
+                        cwd,
+                        rebuild,
+                        offline: true,
+                        progress: None,
+                    },
                 )
                 .await
             }
@@ -7719,42 +7760,92 @@ mod tests {
         let c_only: HashMap<String, PatchFileInfo> =
             [("patches/lib/0001.patch".to_string(), added.clone())].into();
 
-        let applied = apply(ruby_purl, c_only.clone()).await;
+        let applied = apply(ruby_purl, c_only.clone(), true).await;
         assert!(applied.result.success, "{:?}", applied.result.error);
         assert!(applied.result.files_verified.is_empty());
         assert!(applied.result.files_patched.is_empty());
         assert_eq!(applied.result.error, None);
         assert_eq!(applied.warning, None);
-        let why = applied.left_as_is.expect("left as it is");
-        assert_eq!(why.code(), NOT_IN_BUILD_CODE);
+        let caveat = applied.caveat.expect("a caveat");
+        assert!(matches!(caveat, GemCaveat::NotInBuild(_)));
+        assert_eq!(caveat.code(), NOT_IN_BUILD_CODE);
         assert!(
-            why.detail().contains(
+            caveat.detail().contains(
                 "none of the patch's files are part of the JRuby build of this gem (a-1-java)"
             ),
             "{}",
-            why.detail()
+            caveat.detail()
         );
-        assert!(matches!(why, LeftAsIs::NotInBuild(_)));
 
-        // A Java source the copy does not ship: the jars may hold it.
+        // A Java source the copy does not ship: the jars may hold it. The
+        // patch is incomplete, and it is whoever compiles: the flag that
+        // leaves compiling to the caller leaves nothing to compile here.
         let java_only: HashMap<String, PatchFileInfo> =
             [("ext/java/a/Gone.java".to_string(), info(&"7".repeat(64)))].into();
-        let applied = apply(ruby_purl, java_only).await;
-        assert!(applied.result.success);
-        let why = applied.left_as_is.expect("left as it is");
-        assert!(matches!(why, LeftAsIs::NotRebuilt(_)));
-        assert_eq!(why.code(), NOT_REBUILT_REASON);
-        let (code, detail) = applied.warning.expect("a warning");
-        assert_eq!(code, NOT_REBUILT_REASON);
-        assert_eq!(detail, why.detail());
-        assert!(detail.contains(JARS_NOT_REBUILT), "{detail}");
+        for rebuild in [true, false] {
+            let applied = apply(ruby_purl, java_only.clone(), rebuild).await;
+            // The result is not a failure: nothing here undoes anything.
+            assert!(applied.result.success, "rebuild={rebuild}");
+            assert_eq!(applied.result.error, None);
+            let caveat = applied.caveat.expect("a caveat");
+            assert!(matches!(caveat, GemCaveat::Incomplete(_)));
+            assert_eq!(caveat.code(), NOT_REBUILT_REASON);
+            assert!(
+                caveat.detail().contains(JARS_NOT_REBUILT)
+                    && caveat.detail().contains("Nothing was written"),
+                "{}",
+                caveat.detail()
+            );
+            // The warning says the same, after the purl.
+            assert_eq!(
+                applied.warning,
+                Some((
+                    NOT_REBUILT_REASON.to_string(),
+                    format!("{ruby_purl}: {}", caveat.detail())
+                ))
+            );
+        }
 
         // The same record written for the copy's own platform is applied
         // strictly: the file it adds is to be written, and with no blob to
-        // write it from, that fails. It is not left as it is.
-        let applied = apply("pkg:gem/a@1?platform=java", c_only).await;
+        // write it from, that fails. It carries no caveat.
+        let applied = apply("pkg:gem/a@1?platform=java", c_only, true).await;
         assert!(!applied.result.success);
-        assert_eq!(applied.left_as_is, None);
+        assert_eq!(applied.caveat, None);
+    }
+
+    /// The text of an incomplete patch says that the files were written,
+    /// which sources are in no compiled code and why, and carries no purl:
+    /// the caller puts it after one (the warning, the `Error:` line) or
+    /// beside one (the event). A dry run says what `apply` would leave.
+    #[test]
+    fn the_incomplete_text_says_what_was_written_and_what_is_not_in_effect() {
+        let wet = not_compiled_detail("ext/a/a.c", "the build read none of it", false);
+        assert!(
+            wet.starts_with("the patch's files were written, but its native-extension sources (ext/a/a.c) are not in the compiled code this install runs: the build read none of it."),
+            "{wet}"
+        );
+        assert!(wet.contains("vex does not attest the patch"), "{wet}");
+        let dry = not_compiled_detail("ext/a/a.c", "the build read none of it", true);
+        assert!(
+            dry.starts_with("dry run: apply would write the patch's files, but"),
+            "{dry}"
+        );
+        assert!(dry.contains("would not be in the compiled code"), "{dry}");
+        let applied = GemApplied::incomplete(
+            untouched_result("pkg:gem/a@1", Path::new("/h/gems/a-1"), None),
+            "pkg:gem/a@1",
+            wet.clone(),
+        );
+        assert!(applied.result.success);
+        assert_eq!(applied.caveat, Some(GemCaveat::Incomplete(wet.clone())));
+        assert_eq!(
+            applied.warning,
+            Some((
+                NOT_REBUILT_REASON.to_string(),
+                format!("pkg:gem/a@1: {wet}")
+            ))
+        );
     }
 
     /// A build system's manifest is an input wherever it sits, and a gem
