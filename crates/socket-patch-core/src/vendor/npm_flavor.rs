@@ -59,6 +59,11 @@ pub(crate) enum NpmLockFlavor {
     Bun,
     /// `vlt-lock.json`, lockfileVersion 0 or 1.
     Vlt,
+    /// A Rush monorepo's pnpm locks (`common/config/rush/pnpm-lock.yaml`
+    /// and each subspace's), lockfileVersion 9.0. Only the vendor router
+    /// yields it ([`detect_vendorable_npm_flavor`]): the lock probe finds
+    /// no root lock to route in such a repository.
+    RushPnpm,
 }
 
 impl NpmLockFlavor {
@@ -67,7 +72,9 @@ impl NpmLockFlavor {
         match self {
             NpmLockFlavor::PackageLock => NpmLockFamily::Npm,
             NpmLockFlavor::YarnClassic | NpmLockFlavor::YarnBerry => NpmLockFamily::Yarn,
-            NpmLockFlavor::Pnpm | NpmLockFlavor::PnpmLegacy => NpmLockFamily::Pnpm,
+            NpmLockFlavor::Pnpm | NpmLockFlavor::PnpmLegacy | NpmLockFlavor::RushPnpm => {
+                NpmLockFamily::Pnpm
+            }
             NpmLockFlavor::Bun => NpmLockFamily::Bun,
             NpmLockFlavor::Vlt => NpmLockFamily::Vlt,
         }
@@ -83,6 +90,7 @@ impl NpmLockFlavor {
             NpmLockFlavor::PnpmLegacy => pnpm_lock_legacy::FLAVOR,
             NpmLockFlavor::Bun => "bun",
             NpmLockFlavor::Vlt => vlt_lock::FLAVOR,
+            NpmLockFlavor::RushPnpm => pnpm_lock::rush::FLAVOR,
         }
     }
 
@@ -99,6 +107,7 @@ impl NpmLockFlavor {
             Some(pnpm_lock_legacy::FLAVOR) => Some(NpmLockFlavor::PnpmLegacy),
             Some("bun") => Some(NpmLockFlavor::Bun),
             Some(vlt_lock::FLAVOR) => Some(NpmLockFlavor::Vlt),
+            Some(pnpm_lock::rush::FLAVOR) => Some(NpmLockFlavor::RushPnpm),
             Some(_) => None,
         }
     }
@@ -150,9 +159,10 @@ pub(crate) async fn detect_npm_lock_flavor(
 ///      `vendor_lockfile_version_unsupported`;
 ///    - `npm-shrinkwrap.json` | `package-lock.json` → PackageLock;
 /// 3. nothing recognized, but `rush.json` present → Err
-///    `vendor_rush_unsupported` (Rush's generated-workspace install model
-///    can't carry vendor's relative `file:` specs — hosted mode edits the
-///    lock in place instead);
+///    `vendor_rush_unsupported`: a Rush monorepo has no root lock for this
+///    probe to route. The vendor router turns that into
+///    [`NpmLockFlavor::RushPnpm`] when Rush's own pnpm locks exist
+///    ([`detect_vendorable_npm_flavor`]);
 /// 4. nothing → Err `vendor_lockfile_missing`.
 ///
 /// `Ok` carries one `vendor_multiple_lockfiles` warning per OTHER known
@@ -221,23 +231,18 @@ pub(crate) async fn detect_npm_lock_flavor_in(
         Some(family) => sniff_family(view, family).await?,
         None => {
             // 3. nothing recognizable at the root. A Rush monorepo keeps its
-            //    single source-of-truth lock under common/config/rush/ (no
-            //    root package.json/lock pair), and its overrides live in
-            //    common/config/rush/pnpm-config.json rather than the
-            //    lockfile — so vendor's file:-relative rewiring cannot
-            //    survive Rush's generated-workspace install (installs run
-            //    from common/temp). Point the user at hosted mode, which
-            //    edits the lock in place.
+            //    locks under common/config/ (no root package.json/lock
+            //    pair) and installs them from common/temp, so no root lock
+            //    is routed here. The vendor router wires those locks
+            //    through the pnpm backend's Rush layout
+            //    ([`pnpm_lock::rush`]); every other consumer of this probe
+            //    reads Rush's locks itself.
             if crate::vendor::lock_inventory::pnpm::is_rush(*view).await {
                 return Err((
-                    "vendor_rush_unsupported",
+                    pnpm_lock::rush::VENDOR_RUSH_UNSUPPORTED,
                     format!(
-                        "found rush.json: this is a Rush monorepo — its single pnpm lockfile \
-                         lives at {lock}, overrides are declared in \
-                         common/config/rush/pnpm-config.json (globalOverrides), and `rush \
-                         install` copies the lock into common/temp and runs pnpm there, so \
-                         vendor's relative file: specs cannot survive the copy; use \
-                         `socket-patch scan --mode hosted`, which edits {lock} in place",
+                        "found rush.json: this is a Rush monorepo — it has no root lockfile, \
+                         its pnpm lockfile lives at {lock} and installs from common/temp",
                         lock = crate::constants::npm_family::RUSH_COMMON_LOCK_REL
                     ),
                 ));
@@ -392,7 +397,15 @@ async fn detect_vendorable_npm_flavor_with(
     project_root: &Path,
     linker: impl FnOnce() -> Option<String>,
 ) -> Result<(NpmLockFlavor, Vec<VendorWarning>), (&'static str, String)> {
-    let found = detect_npm_lock_flavor(project_root).await?;
+    let found = match detect_npm_lock_flavor(project_root).await {
+        // A Rush monorepo: its own pnpm locks are wired, or the layout's
+        // refusal says why they are not.
+        Err((pnpm_lock::rush::VENDOR_RUSH_UNSUPPORTED, _)) => {
+            pnpm_lock::rush::routes(project_root).await?;
+            (NpmLockFlavor::RushPnpm, Vec::new())
+        }
+        found => found?,
+    };
     if found.0 != NpmLockFlavor::YarnBerry {
         return Ok(found);
     }
@@ -536,6 +549,7 @@ pub async fn vendor_npm_any<'a>(
         NpmLockFlavor::PnpmLegacy => vend!(pnpm_lock_legacy::vendor_pnpm_legacy),
         NpmLockFlavor::Bun => vend!(bun_lock::vendor_bun),
         NpmLockFlavor::Vlt => vend!(vlt_lock::vendor_vlt),
+        NpmLockFlavor::RushPnpm => vend!(pnpm_lock::rush::vendor_rush_pnpm),
     };
     // Probe warnings (e.g. a sibling lockfile that will install UNPATCHED
     // bytes) precede the backend's own; the ledger records which flavor wired
@@ -699,6 +713,9 @@ pub async fn preflight_packages(
         }
         NpmLockFlavor::Bun => bun_lock::preflight_packages(project_root, packages).await,
         NpmLockFlavor::Vlt => vlt_lock::preflight_packages(project_root, packages).await,
+        NpmLockFlavor::RushPnpm => {
+            pnpm_lock::rush::preflight_packages(project_root, packages).await
+        }
     }
 }
 
@@ -732,6 +749,7 @@ pub async fn lock_text_refusals(
             | NpmLockFlavor::Pnpm
             | NpmLockFlavor::YarnClassic
             | NpmLockFlavor::YarnBerry
+            | NpmLockFlavor::RushPnpm
     ) {
         return vec![None; packages.len()];
     }
@@ -1000,6 +1018,9 @@ pub async fn revert_npm_any_opts(
         }
         NpmLockFlavor::Bun => bun_lock::revert_bun_opts(entry, project_root, opts).await,
         NpmLockFlavor::Vlt => vlt_lock::revert_vlt_opts(entry, project_root, opts).await,
+        NpmLockFlavor::RushPnpm => {
+            pnpm_lock::rush::revert_rush_pnpm_opts(entry, project_root, opts).await
+        }
     }
 }
 
@@ -1412,9 +1433,11 @@ mod tests {
             PnpmLegacy,
             Bun,
             Vlt,
+            RushPnpm,
         ] {
             match flavor {
-                PackageLock | YarnClassic | YarnBerry | Pnpm | PnpmLegacy | Bun | Vlt => {}
+                PackageLock | YarnClassic | YarnBerry | Pnpm | PnpmLegacy | Bun | Vlt
+                | RushPnpm => {}
             }
             assert_eq!(
                 NpmLockFlavor::from_recorded(Some(flavor.as_str())),
@@ -1427,6 +1450,7 @@ mod tests {
         assert_eq!(NpmLockFlavor::Pnpm.as_str(), "pnpm");
         assert_eq!(NpmLockFlavor::PnpmLegacy.as_str(), "pnpm-legacy");
         assert_eq!(NpmLockFlavor::Bun.as_str(), "bun");
+        assert_eq!(NpmLockFlavor::RushPnpm.as_str(), "rush-pnpm");
         assert_eq!(NpmLockFlavor::Vlt.as_str(), "vlt");
     }
 
@@ -1843,17 +1867,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rush_json_without_root_lock_refuses_pointing_at_hosted_mode() {
+    async fn rush_json_without_root_lock_is_no_root_lock_to_route() {
         // A Rush monorepo has no root package.json/lock pair — only
         // rush.json and its generated-workspace lock under common/config.
+        // The lock probe names that; the vendor router wires Rush's own
+        // locks (`pnpm_lock::rush`, where the routing is tested).
         let tmp = tempfile::tempdir().unwrap();
         touch(tmp.path(), "rush.json", r#"{"rushVersion":"5.0.0"}"#).await;
         let (code, detail) = detect_npm_lock_flavor(tmp.path()).await.unwrap_err();
         assert_eq!(code, "vendor_rush_unsupported");
-        // Names the install model and routes to hosted mode.
-        assert!(detail.contains("pnpm-config.json"), "{detail}");
         assert!(detail.contains("common/temp"), "{detail}");
-        assert!(detail.contains("scan --mode hosted"), "{detail}");
         assert!(
             detail.contains("common/config/rush/pnpm-lock.yaml"),
             "{detail}"

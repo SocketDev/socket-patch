@@ -26,7 +26,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::formats::cargo::floor;
+use crate::formats::cargo::{floor, is_crates_io_source};
 use crate::manifest::schema::PatchRecord;
 use crate::patch::apply::PatchSources;
 use crate::patch::copy_tree::remove_tree;
@@ -578,9 +578,7 @@ async fn lock_source_refusal(
     if let cargo_lock::LockEntryProbe::Source(source) =
         cargo_lock::probe_lock_entry(project_root, name, version).await
     {
-        if source != "registry+https://github.com/rust-lang/crates.io-index"
-            && source != "sparse+https://index.crates.io/"
-        {
+        if !is_crates_io_source(&source) {
             return Some(refused("vendor_source_unsupported", format!("{name}@{version} resolves from {source}; server patches require the crates.io package")));
         }
     }
@@ -1937,7 +1935,7 @@ pub async fn revert_cargo_vendor_opts(
                 "lock_restore_skipped",
                 format!(
                     "the Cargo.lock entry for {name}@{version} keeps the tagged version of \
-                     the removed copy ({e}); re-lock it with `cargo update -p {name}`"
+                     the removed copy ({e}); re-lock it with `cargo update -p {name}@{version}`"
                 ),
             ));
         }

@@ -1,4 +1,4 @@
-//! Depscan-sized and seeded pnpm-lock.yaml sweeps for the indexed hosted
+//! Monorepo-sized and seeded pnpm-lock.yaml sweeps for the indexed hosted
 //! rewriter (one parse per lock, every dep spliced from it): output bytes,
 //! the FileEdit list (order and `original` fragments), warnings and
 //! refusals are pinned per case by `tests/equivalence/pnpm_*.golden`,
@@ -208,17 +208,17 @@ fn packages(n: usize, rng: &mut Rng) -> Vec<Pkg> {
         .collect()
 }
 
-/// A depscan-sized lock set (~5.5k instances across a root v9 lock plus a
+/// A monorepo-sized lock set (~5.5k instances across a root v9 lock plus a
 /// nested v6 lock and a nested block-resolution v5.1 lock) with ~110 overrides
 /// covering every outcome: rewritten single and peer-suffixed multi-instance
 /// deps, duplicate overrides of one name@version (same and different URL),
 /// already-hosted, residual (unbalanced peer suffix), vendored, not-found and
 /// missing-sha512 deps, plus a non-npm override the rewriter must ignore.
 #[test]
-fn indexed_pnpm_rewrite_matches_golden_on_depscan_sized_lock_set() {
+fn indexed_pnpm_rewrite_matches_golden_on_monorepo_sized_lock_set() {
     let sweep = Sweep::start(
-        "pnpm_depscan_sized",
-        "A depscan-sized seeded pnpm-lock.yaml set + shuffled overrides.",
+        "pnpm_monorepo_sized",
+        "A monorepo-sized seeded pnpm-lock.yaml set + shuffled overrides.",
     );
     let mut rng = Rng(0x5eed_cafe_f00d_0001);
     let root = packages(4000, &mut rng);
@@ -525,7 +525,7 @@ fn indexed_pnpm_rewrite_matches_golden_on_random_lock_sets() {
         }
     }
     // (`redirect_pnpm_entry_vendored` is not generated here; the
-    // depscan-sized sweep above requires it.)
+    // monorepo-sized sweep above requires it.)
     for want in [
         "edit",
         "refused",

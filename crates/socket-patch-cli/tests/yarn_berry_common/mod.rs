@@ -46,7 +46,7 @@
 //! # The manifest-less VEX matrix ([`run_manifestless_vex_matrix`])
 //!
 //! A hosted (`scan --mode hosted`) or vendored (`vendor`, `get --mode
-//! vendored`, a depscan-opened PR) berry checkout may carry no
+//! vendored`, a GitHub-app PR) berry checkout may carry no
 //! `.socket/manifest.json` — and often no ledgers either. After a flow has
 //! produced its committed state, the matrix proves `socket-patch vex`
 //! attests (and refuses to attest) from what such a checkout carries,

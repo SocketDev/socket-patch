@@ -95,10 +95,12 @@
 //! `<sha256>  <g-path>/<a>/<v>/<a>-<v>.jar` under the SUFFIXED version, made
 //! effective by `-Daether.artifactResolver.postProcessor.trustedChecksums=true`
 //! in `.mvn/maven.config`. That jar line becomes
-//! [`LockIntegrity::Sha256Hex`] only while Maven enforces the file
-//! ([`crate::formats::maven::trusted_checksums::enforced`]: every setting
-//! hosted writes, read as Maven 3.9+ reads `maven.config`, and no wrapper
-//! pinning a Maven older than 3.9.4).
+//! [`LockIntegrity::Sha256Hex`] only while the pin is known to be enforced
+//! ([`crate::formats::maven::trusted_checksums::enforcement`]: every
+//! setting hosted writes, read as Maven 3.9+ reads `maven.config`, and a
+//! directory spelling the Maven the project declares reads; a project that
+//! declares no Maven is known to enforce only the spelling every enforcing
+//! Maven reads, `${session.rootDirectory}`).
 //! `integrity_required` is FALSE (but for a managed pin under an unread
 //! parent, above): the rewriter writes checksums only when both hashes are
 //! known, and the suffixed version itself is the fail-closed pin (no other
@@ -485,7 +487,7 @@ async fn extract_hosted(
             continue;
         };
         if checksums.is_none() {
-            checksums = Some(trusted_checksums(ctx, config, out).await);
+            checksums = Some(trusted_checksums(ctx, config, raw, out).await);
         }
         let jar = layout::artifact_path(group, artifact, pinned, None, "jar");
         let integrity = checksums
@@ -671,22 +673,36 @@ impl Ancestors {
 }
 
 /// `path -> sha256 hex` from `.mvn/checksums/checksums.sha256`, or empty
-/// when Maven does not enforce it: `config` (`.mvn/maven.config`'s text,
-/// read once by [`extract`]) lacks a setting it reads the file by, or the
-/// Maven Wrapper pins a Maven older than 3.9.4. Judged by the hosted
-/// rewriter's own rule, and only a line Maven checks attests
-/// (`formats::maven::trusted_checksums`).
+/// unless the pin is known to be enforced
+/// ([`crate::formats::maven::trusted_checksums::Enforcement::Enforced`]):
+/// `config` (`.mvn/maven.config`'s text, read once by [`extract`]) holds
+/// every setting Maven reads the file by, and the Maven the project
+/// declares (its Maven Wrapper, the model of its root pom `pom`) reads
+/// the directory as the config spells it. A pin that only Maven 3 enforces,
+/// in a project that does not say which Maven builds it, is not known to
+/// be enforced, so it is not recorded as the content the lock pins.
+/// Judged by the hosted rewriter's own rule, and only a line Maven checks
+/// attests (`formats::maven::trusted_checksums`).
 async fn trusted_checksums(
     ctx: &DiscoverCtx<'_>,
     config: Option<&str>,
+    pom: &str,
     out: &mut Discovery,
 ) -> BTreeMap<String, String> {
-    use crate::formats::maven::trusted_checksums::{enforced, pinned};
+    use crate::formats::maven::declared_maven::DeclaredMaven;
+    use crate::formats::maven::trusted_checksums::{enforcement, pinned, Enforcement, Settings};
     let Some(config) = config else {
         return BTreeMap::new();
     };
+    let settings = Settings::read(config);
+    // The cheap test first: a config that enforces nothing needs no
+    // wrapper read.
+    if !settings.enforce() {
+        return BTreeMap::new();
+    }
     let wrapper = ctx.read_text(MVN_WRAPPER_PROPERTIES, out).await;
-    if !enforced(config, wrapper.as_deref()) {
+    let declared = DeclaredMaven::of(wrapper.as_deref(), Some(pom));
+    if enforcement(&settings, &declared) != Enforcement::Enforced {
         return BTreeMap::new();
     }
     ctx.read_text(MVN_CHECKSUMS, out)
@@ -1493,17 +1509,26 @@ mod tests {
             "self-closed-repositories",
             "depmgmt-comment",
             "self-closed-depmgmt",
+            // A project that declares Maven 4 (a 4.1.0 model), wired with
+            // the spelling Maven 4 reads.
+            "maven4-model",
         ] {
             let out = run(&fixture(case)).await;
             assert_refs(&out, &[(FX_PURL, FX_UUID, WiringMode::Hosted)]);
             assert!(out.diagnostics.is_empty(), "{case}: {:?}", out.diagnostics);
             let r = &out.refs[0];
             assert_eq!(r.source_file, std::path::PathBuf::from("pom.xml"), "{case}");
-            // mvn-config-merge keeps the user's `originAware=true`, under
-            // which Maven reads a per-repository summary file, not this one:
-            // its checksums pin nothing.
+            // The checksum is the content the lock pins only where the pin
+            // is known to be enforced. The fixtures that declare no Maven
+            // carry the default spelling, which Maven 3 enforces and Maven
+            // 4 does not: nothing says which builds them, so nothing is
+            // recorded. (mvn-config-merge besides keeps the user's
+            // `originAware=true`, under which Maven reads a per-repository
+            // summary file, not this one.) Only the project that declares
+            // Maven 4 and has the spelling Maven 4 reads is known to
+            // enforce its pin.
             let integrity =
-                (case != "mvn-config-merge").then(|| LockIntegrity::Sha256Hex(FX_JAR_SHA.into()));
+                (case == "maven4-model").then(|| LockIntegrity::Sha256Hex(FX_JAR_SHA.into()));
             assert_eq!(r.locked_integrity, integrity, "{case}");
             assert!(!r.integrity_required, "{case}");
             assert!(r.lockfile_basis_ok(), "{case}");
@@ -1521,6 +1546,17 @@ mod tests {
         p.copy_fixture("redirect/maven/pom/rerun-noop/input");
         let out = run(&p).await;
         assert_refs(&out, &[(FX_PURL, FX_UUID, WiringMode::Hosted)]);
+        // Wired, and attested from the pin alone: the checksum counts as
+        // the content the lock pins once the project names a Maven that
+        // enforces the spelling it carries.
+        assert!(out.refs[0].lockfile_basis_ok());
+        assert_eq!(out.refs[0].locked_integrity, None);
+        p.write(
+            ".mvn/wrapper/maven-wrapper.properties",
+            "distributionUrl=https://repo/apache-maven/3.9.9/apache-maven-3.9.9-bin.zip\n"
+                .to_string(),
+        );
+        let out = run(&p).await;
         assert!(out.refs[0].locked_integrity.is_some());
     }
 
@@ -1845,66 +1881,155 @@ mod tests {
         );
     }
 
-    /// Integrity attests only what Maven enforces, judged by the hosted
-    /// rewriter's own rule: every `maven.config` setting Maven reads the
-    /// summary file by, each a whole-line argument (CRLF and a bare `-Dk`
-    /// switch count); no wrapper Maven older than 3.9.4; and a jar line in
-    /// the exact lowercase `<sha256>  <path>` shape. A tolerated spelling
-    /// (one space, a `*` marker, uppercase hex) is a line Maven skips or
-    /// fails on, so it pins nothing.
+    /// Integrity attests only what Maven is known to enforce, judged by the
+    /// hosted rewriter's own rule: every `maven.config` setting Maven reads
+    /// the summary file by, each a whole-line argument (CRLF and a bare
+    /// `-Dk` switch count); a directory spelling the Maven the project
+    /// declares reads, and no wrapper Maven older than 3.9.4; and a jar
+    /// line in the exact lowercase `<sha256>  <path>` shape. A tolerated
+    /// spelling (one space, a `*` marker, uppercase hex) is a line Maven
+    /// skips or fails on, so it pins nothing.
     #[tokio::test]
     async fn checksums_attest_only_what_maven_enforces() {
-        use crate::formats::maven::trusted_checksums::{CONFIG_ARGS, SWITCH_KEY};
+        use crate::formats::maven::trusted_checksums::{
+            config_args,
+            Basedir::{Launcher, Session},
+            SWITCH_KEY,
+        };
         let jar = "org/slf4j/slf4j-api/1.7.36-socket.77777777/slf4j-api-1.7.36-socket.77777777.jar";
-        let all = CONFIG_ARGS.join("\n");
+        // The spelling every enforcing Maven reads, so the rows below that
+        // name no Maven turn on the one thing each changes.
+        let all = config_args(Session).join("\n");
+        let launcher = config_args(Launcher).join("\n");
         let switch = format!("-D{SWITCH_KEY}=true");
         let wrapper = |v: &str| {
             format!("distributionUrl=https://repo/apache-maven/{v}/apache-maven-{v}-bin.zip\n")
         };
         let line = format!("{FX_JAR_SHA}  {jar}\n");
         let upper = FX_JAR_SHA.to_uppercase();
-        for (config, wrapper, sums, attests) in [
+        // (maven.config, the wrapper's Maven, a 4.1.0 root pom, the
+        // checksums, attested)
+        for (config, wrapper, model_4_1, sums, attests) in [
             (
-                CONFIG_ARGS.join("\r\n"),
+                config_args(Session).join("\r\n"),
                 None,
+                false,
                 format!("{FX_JAR_SHA}  {jar}\r\n"),
                 true,
             ),
             (
                 all.replace(&switch, &format!("-D{SWITCH_KEY}")),
                 None,
+                false,
                 format!("# pins\n{FX_JAR_SHA}  {jar}"),
                 true,
             ),
-            (all.clone(), Some(wrapper("3.9.4")), line.clone(), true),
-            (all.clone(), Some(wrapper("3.9.3")), line.clone(), false),
-            (switch.clone(), None, line.clone(), false),
+            (
+                all.clone(),
+                Some(wrapper("3.9.4")),
+                false,
+                line.clone(),
+                true,
+            ),
+            (
+                all.clone(),
+                Some(wrapper("3.9.3")),
+                false,
+                line.clone(),
+                false,
+            ),
+            (switch.clone(), None, false, line.clone(), false),
             (
                 all.replace(&switch, &format!("-B {switch}")),
                 None,
+                false,
                 line.clone(),
                 false,
             ),
             (
                 all.replace("originAware=false", "originAware=true"),
                 None,
+                false,
                 line.clone(),
                 false,
             ),
             (
                 format!("{all}\n-D{SWITCH_KEY}=false"),
                 None,
+                false,
                 line.clone(),
                 false,
             ),
-            (all.clone(), None, format!("{FX_JAR_SHA} {jar}\n"), false),
-            (all.clone(), None, format!("{FX_JAR_SHA} *{jar}\n"), false),
-            (all.clone(), None, format!("{upper}  {jar}\n"), false),
+            (
+                all.clone(),
+                None,
+                false,
+                format!("{FX_JAR_SHA} {jar}\n"),
+                false,
+            ),
+            (
+                all.clone(),
+                None,
+                false,
+                format!("{FX_JAR_SHA} *{jar}\n"),
+                false,
+            ),
+            (all.clone(), None, false, format!("{upper}  {jar}\n"), false),
+            // The launcher's spelling, which hosted mode writes by default:
+            // a Maven 3 the wrapper names enforces it. With no Maven named
+            // it is enforced by Maven 3 only, and nothing says which Maven
+            // builds the project, so it is not attested.
+            (
+                launcher.clone(),
+                Some(wrapper("3.9.4")),
+                false,
+                line.clone(),
+                true,
+            ),
+            (
+                launcher.clone(),
+                Some(wrapper("3.9.16")),
+                false,
+                line.clone(),
+                true,
+            ),
+            (
+                launcher.clone(),
+                Some(wrapper("3.9.3")),
+                false,
+                line.clone(),
+                false,
+            ),
+            (launcher.clone(), None, false, line.clone(), false),
+            // A project that declares Maven 4, by its wrapper or by its
+            // model alone: Maven 4 reads only the session's spelling.
+            (
+                launcher.clone(),
+                Some(wrapper("4.0.0")),
+                false,
+                line.clone(),
+                false,
+            ),
+            (launcher.clone(), None, true, line.clone(), false),
+            (
+                all.clone(),
+                Some(wrapper("4.0.0")),
+                false,
+                line.clone(),
+                true,
+            ),
+            (all.clone(), None, true, line.clone(), true),
         ] {
             let p = fixture("basic");
             p.write(".mvn/maven.config", config.clone());
             if let Some(props) = &wrapper {
                 p.write(".mvn/wrapper/maven-wrapper.properties", props.clone());
+            }
+            if model_4_1 {
+                let pom = std::fs::read_to_string(p.root().join("pom.xml")).expect("pom");
+                let newer = pom.replace("<modelVersion>4.0.0", "<modelVersion>4.1.0");
+                assert_ne!(newer, pom);
+                p.write("pom.xml", newer);
             }
             p.write(".mvn/checksums/checksums.sha256", sums.clone());
             let out = run(&p).await;
@@ -1912,8 +2037,10 @@ mod tests {
             assert_eq!(
                 out.refs[0].locked_integrity,
                 attests.then(|| LockIntegrity::Sha256Hex(FX_JAR_SHA.into())),
-                "{config:?} / {wrapper:?} / {sums:?}"
+                "{config:?} / {wrapper:?} / model 4.1.0: {model_4_1} / {sums:?}"
             );
+            // The pin itself never needs the checksum.
+            assert!(out.refs[0].lockfile_basis_ok());
         }
     }
 

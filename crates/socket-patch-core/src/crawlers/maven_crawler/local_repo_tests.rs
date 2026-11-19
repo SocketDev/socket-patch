@@ -536,6 +536,35 @@ fn maven_config_is_tokenised_as_the_projects_maven_does() {
         assert_eq!(m2_repo_in(&e, p.path()), Some(expected), "{version}");
     }
 
+    // A root pom only Maven 4 reads declares its Maven without a wrapper,
+    // and Maven 4 does not fill in `${maven.multiModuleProjectDirectory}`.
+    let p = project();
+    write(
+        &p.path().join("pom.xml"),
+        "<project><modelVersion>4.1.0</modelVersion></project>\n",
+    );
+    write(&p.path().join(".mvn/maven.config"), ONE_LINE);
+    std::fs::create_dir_all(p.path().join(split)).unwrap();
+    assert_eq!(m2_repo_in(&e, p.path()), Some(p.path().join(whole)));
+    for (config, repo) in [
+        ("-Dmaven.repo.local=${session.rootDirectory}/r\n", "r"),
+        (
+            "-Dmaven.repo.local=${maven.multiModuleProjectDirectory}/r\n",
+            "${maven.multiModuleProjectDirectory}/r",
+        ),
+        // The other spellings of a definition, as the shared reader has them.
+        ("--define maven.repo.local=d\n", "d"),
+        ("-D\nmaven.repo.local=n\n", "n"),
+        ("\"-Dmaven.repo.local=q\"\n", "q"),
+    ] {
+        write(&p.path().join(".mvn/maven.config"), config);
+        assert_eq!(
+            m2_repo_in(&e, p.path()),
+            Some(p.path().join(repo)),
+            "{config}"
+        );
+    }
+
     // No wrapper: the repository an earlier build left is the one.
     let p = project();
     write(&p.path().join(".mvn/maven.config"), ONE_LINE);

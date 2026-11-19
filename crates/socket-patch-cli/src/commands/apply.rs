@@ -1263,7 +1263,7 @@ pub async fn run(args: ApplyArgs) -> i32 {
         // Nothing to apply — but `--vex` may still have something to
         // attest: hosted / vendored patches are wired by the lockfiles (and
         // the `.socket/vendor` ledgers), not the manifest, and a
-        // `scan --mode hosted|vendored` or depscan checkout (both modes are
+        // `scan --mode hosted|vendored` or GitHub-app checkout (both modes are
         // manifest-free) has none. Before, this branch returned before VEX
         // generation, so `apply --vex` exited 0 having written NO document
         // (and left a previous run's at the path). Nothing referenced
@@ -3064,7 +3064,9 @@ async fn apply_patches_inner(
 
                     attempted = true;
                     // A gem patch to native-extension sources rebuilds the
-                    // extension, or is refused with nothing written (#1996).
+                    // extension (#1996). One it cannot build is refused
+                    // with nothing written; one whose build compiles
+                    // nothing of it is written with a warning (#2144).
                     let result = if Ecosystem::from_purl(purl) == Some(Ecosystem::Gem) {
                         let applied = gem_ext::apply_gem_package_patch(
                             args.common.read_scope(),
@@ -3078,6 +3080,7 @@ async fn apply_patches_inner(
                                 cwd: args.common.cwd.clone(),
                                 rebuild: !args.common.no_gem_native_rebuild,
                                 offline: args.common.offline,
+                                progress: args.common.gem_build_progress(),
                             },
                         )
                         .await;

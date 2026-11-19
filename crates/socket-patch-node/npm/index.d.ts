@@ -23,12 +23,12 @@ export function engineVersion(): string                  // "<crate version>+<gi
 export type ProviderErrorKind = 'unauthorized' | 'forbidden' | 'rate_limited' | 'network' | 'parse' | 'not_found' | 'other'
 export type ProviderResult<T> = { ok: true; value: T } | { ok: false; error: { kind: ProviderErrorKind; message: string } }
 
-// Request/response bodies are EXACTLY the api-v0 HTTP JSON bodies (camelCase), so the Rust serde types are reused unchanged.
+// Request/response bodies are EXACTLY the v0 API's HTTP JSON bodies (camelCase), so the Rust serde types are reused unchanged.
 export interface BatchPatchInfo { uuid: string; purl: string; tier: string; cveIds: string[]; ghsaIds: string[]; severity: string | null; title: string; publishedAt?: string }
 export interface BatchSearchResponse { packages: { purl: string; patches: BatchPatchInfo[] }[]; canAccessPaidPatches: boolean }
 export interface PatchSearchResult { uuid: string; purl: string; publishedAt: string; description: string; license: string; tier: string; vulnerabilities: Record<string, { cves: string[]; summary: string; severity: string; description: string }> }
 export interface SearchResponse { patches: PatchSearchResult[]; canAccessPaidPatches: boolean }
-export interface PackageVendorResult { status: string; url: string | null; purl: string | null; artifacts: unknown[] | null; registryOverride: unknown | null }   // exact api-v0 package.ts serialization (null-filled)
+export interface PackageVendorResult { status: string; url: string | null; purl: string | null; artifacts: unknown[] | null; registryOverride: unknown | null }   // exactly what the v0 API serializes
 export interface PatchResponse { uuid: string; purl: string; publishedAt: string; files: Record<string, { beforeHash?: string; afterHash?: string; socketBlob?: string }>; vulnerabilities: Record<string, unknown>; description: string; license: string; tier: string }
 
 export interface PatchProvider {

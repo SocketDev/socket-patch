@@ -37,7 +37,7 @@
 //! ([`crate::vendor::service_preflight`], npm's
 //! [`crate::vendor::npm_flavor::preflight_packages`]) — and leaves out the
 //! re-runs a backend answers without the service, so a package the loop
-//! refuses is never granted on its behalf (on a depscan vendored run, 71
+//! refuses is never granted on its behalf (on one large-monorepo vendored run, 71
 //! grants — the serial loop's own count). The task is still bounded in
 //! requests, not just in time, as a second line of defence should a plan
 //! ever name a position the loop then passes over:

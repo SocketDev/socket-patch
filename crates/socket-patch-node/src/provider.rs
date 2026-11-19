@@ -1,7 +1,7 @@
 //! [`PatchApi`] served by the host's JavaScript `PatchProvider`.
 //!
 //! Each provider method crosses as a threadsafe function. The JSON methods
-//! take the api-v0 request body as a JSON string and resolve with a
+//! take the v0 API request body as a JSON string and resolve with a
 //! `ProviderResult` envelope as a JSON string; `downloadArtifact` resolves
 //! with a [`NativeDownload`] so the bytes stay a `Buffer`. The loader
 //! (npm/index.js) wraps every provider method so these promises always

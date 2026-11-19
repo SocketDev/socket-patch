@@ -2860,8 +2860,8 @@ impl StagedSource {
 /// story after a hosted scan (#1105): `uv sync` / `poetry install` from
 /// the hosted lock installs a hosted patch's bytes, whichever generation
 /// the pin names now. The pin names no release variant, so it only answers
-/// for a sole candidate; gems keep their installed dir, which the gem
-/// backend reads to refuse a platform gem.
+/// for a sole candidate. A gem in that state is not superseded but
+/// [`hosted_gem_install`]: it keeps its installed dir.
 fn superseded_install(
     ledger: &VendorState,
     candidate: &str,
@@ -2874,6 +2874,22 @@ fn superseded_install(
     }) || (sole_candidate
         && hosted_pinned
         && matches!(Ecosystem::from_purl(candidate), Some(Ecosystem::Pypi)))
+}
+
+/// Whether an installed gem that fails `candidate`'s variant probe is still
+/// `candidate` itself, under a live hosted pin (#2129): a hosted scan or a
+/// `bundle install` from the hosted lock put a hosted patch's bytes there,
+/// and the patch has since been superseded, so they match neither side of
+/// this record. The gem backend takes no file of the installed copy (the
+/// vendored copy is the service's build), so the candidate goes on with
+/// its installed dir as the source: the backend still reads that dir's
+/// name and gemspec to refuse a platform gem or a native extension. As for
+/// PyPI, the pin names no release variant, so it only answers for a sole
+/// candidate.
+fn hosted_gem_install(candidate: &str, sole_candidate: bool, hosted_pinned: bool) -> bool {
+    sole_candidate
+        && hosted_pinned
+        && matches!(Ecosystem::from_purl(candidate), Some(Ecosystem::Gem))
 }
 
 /// The stand-in source of a superseded install (see [`superseded_install`]),
@@ -3004,16 +3020,22 @@ impl<'a> CandidateGates<'a> {
                     if !variant_matches_installed(Some(
                         &verify_file_patch(dir, file, info).await.status,
                     )) {
-                        if !superseded_install(
-                            ledger,
-                            candidate,
-                            record,
-                            group.candidates.len() == 1,
-                            (self.hosted_pinned)(candidate),
-                        ) {
-                            return CandidateVerdict::Skip;
+                        let sole_candidate = group.candidates.len() == 1;
+                        let hosted_pinned = (self.hosted_pinned)(candidate);
+                        // The hosted gem is asked first: it goes on from
+                        // its installed dir, whatever the ledger records.
+                        if !hosted_gem_install(candidate, sole_candidate, hosted_pinned) {
+                            if !superseded_install(
+                                ledger,
+                                candidate,
+                                record,
+                                sole_candidate,
+                                hosted_pinned,
+                            ) {
+                                return CandidateVerdict::Skip;
+                            }
+                            superseded = true;
                         }
-                        superseded = true;
                     }
                 }
             } else if group.candidates.len() > 1
@@ -4571,6 +4593,9 @@ fn commit_hint(wired: &HashSet<String>, pnpm_workspace: bool) -> String {
                 pnpm-workspace.yaml)"
             .to_string();
     }
+    if wired.contains("rush-pnpm") {
+        return RUSH_COMMIT_HINT.to_string();
+    }
     if wired.contains("vlt") {
         return VLT_COMMIT_HINT.to_string();
     }
@@ -4598,6 +4623,12 @@ fn commit_hint(wired: &HashSet<String>, pnpm_workspace: bool) -> String {
     }
 }
 
+/// What a Rush-wired run commits (the "Commit …" next step): the wiring
+/// is spread over the locks, the config Rush generates pnpm's overrides
+/// from, and the manifest of each project that depends on the package
+/// directly.
+const RUSH_COMMIT_HINT: &str = ".socket/vendor/, the pnpm-lock.yaml and pnpm-config.json files      under common/config/, and each project package.json this run edited, to make the patches      portable";
+
 /// What a vlt-wired run commits (the "Commit …" next step).
 const VLT_COMMIT_HINT: &str = "package.json (and workspace package.json files), \
      vlt-lock.json and .socket/vendor/ (the .gitignore there re-includes the payload and keeps \
@@ -4617,6 +4648,8 @@ fn flavor_install_command(flavor: &str) -> Option<&'static str> {
         // the moved-checkout recovery — pnpm <= 8 absolutizes file: override
         // specifiers, so `--frozen-lockfile` only passes at the vendoring path.
         "pnpm" | "pnpm-legacy" => Some("pnpm install"),
+        // Rush runs pnpm itself, from the lock it copies into common/temp.
+        "rush-pnpm" => Some("rush install"),
         "bun" => Some("bun install"),
         "vlt" => Some("vlt install"),
         // Not an install: the JVM build re-resolves from the vendored tree.
@@ -4910,7 +4943,12 @@ async fn run_revert(args: &VendorArgs, env: &mut Envelope) -> i32 {
                 .filter(|pin| reverted.contains(&PurlKey::new(&pin.purl)))
                 .collect();
         if !rehosted.is_empty() {
-            let leg = crate::commands::hosted_unwind::run_hosted_leg(common, &rehosted).await;
+            let leg = crate::commands::hosted_unwind::run_hosted_leg(
+                common,
+                &rehosted,
+                &crate::args::RunApiClient::new(),
+            )
+            .await;
             for purl in &leg.reverted {
                 record_warning(
                     env,
@@ -5435,6 +5473,75 @@ mod plan_gate_tests {
             true,
             true
         ));
+    }
+
+    /// #2129: a live hosted pin lets a sole gem candidate past a failed
+    /// variant probe with its installed dir as the source. Other ecosystems
+    /// and a gem with several variant records are not its business.
+    #[test]
+    fn hosted_pin_keeps_a_gem_install_as_the_source() {
+        let gem = "pkg:gem/rack@3.2.8";
+        assert!(hosted_gem_install(gem, true, true));
+        assert!(!hosted_gem_install(gem, false, true));
+        assert!(!hosted_gem_install(gem, true, false));
+        assert!(!hosted_gem_install("pkg:pypi/six@1.16.0", true, true));
+    }
+
+    /// #2129 at the gate: an installed gem that matches neither side of
+    /// the record is skipped, unless the lockfiles pin it hosted. Then it
+    /// is vendored from its installed dir (never the stand-in a superseded
+    /// install gets), even when the ledger also records it at an older
+    /// uuid, so the backend still sees the dir's name and gemspec.
+    #[tokio::test]
+    async fn judge_sends_a_hosted_gem_on_from_its_installed_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let purl = "pkg:gem/rack@3.2.8";
+        let dir = root.join("gems/rack-3.2.8");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("index.php"), "an older patch's bytes").unwrap();
+        let all_packages = vec![(purl.to_string(), StagedSource::Installed(dir))];
+        let records = HashMap::from([(purl.to_string(), record(UUID_B))]);
+        let none = HashSet::new();
+        let groups = candidate_groups(&all_packages, &HashMap::new());
+        let unpinned = gates(root, &records, &none);
+        let pinned = CandidateGates {
+            hosted_pinned: &|_| true,
+            ..gates(root, &records, &none)
+        };
+        let mut older = VendorState::default();
+        older.entries.insert(
+            purl.to_string(),
+            VendorEntry::new(
+                "gem".to_string(),
+                purl.to_string(),
+                UUID_A.to_string(),
+                socket_patch_core::vendor::state::VendorArtifact {
+                    yarn_berry10c0: None,
+                    path: format!(".socket/vendor/gem/{UUID_A}/rack-3.2.8"),
+                    sha256: String::new(),
+                    size: None,
+                    platform_locked: None,
+                    file_inventory: None,
+                },
+                Vec::new(),
+            ),
+        );
+        let fresh = VendorState::default();
+
+        assert!(matches!(
+            unpinned.judge(&fresh, &groups[0], purl).await,
+            CandidateVerdict::Skip
+        ));
+        for ledger in [&fresh, &older] {
+            assert!(matches!(
+                pinned.judge(ledger, &groups[0], purl).await,
+                CandidateVerdict::Vendor {
+                    superseded: false,
+                    ..
+                }
+            ));
+        }
     }
 
     /// Gates with no vendored refusals, no hosted pins and no `--force`.
@@ -7317,6 +7424,7 @@ mod scope_and_hint_tests {
         assert_eq!(flavor_install_command("yarn-berry"), Some("yarn install"));
         assert_eq!(flavor_install_command("pnpm"), Some("pnpm install"));
         assert_eq!(flavor_install_command("pnpm-legacy"), Some("pnpm install"));
+        assert_eq!(flavor_install_command("rush-pnpm"), Some("rush install"));
         assert_eq!(flavor_install_command("bun"), Some("bun install"));
         assert_eq!(flavor_install_command("vlt"), Some("vlt install"));
         assert_eq!(flavor_install_command("cargo"), None);
@@ -7326,6 +7434,22 @@ mod scope_and_hint_tests {
             flavor_install_command("scala-cli"),
             Some("scala-cli compile --test .")
         );
+    }
+
+    /// A Rush run wires three kinds of file, and a commit that leaves one
+    /// out fails `rush install` on the next checkout.
+    #[test]
+    fn rush_commit_hint_names_the_config_and_the_manifests() {
+        let wired: HashSet<String> = ["rush-pnpm".to_string()].into();
+        let hint = commit_hint(&wired, false);
+        for part in [
+            ".socket/vendor/",
+            "pnpm-lock.yaml",
+            "pnpm-config.json",
+            "package.json",
+        ] {
+            assert!(hint.contains(part), "{hint}");
+        }
     }
 
     #[test]

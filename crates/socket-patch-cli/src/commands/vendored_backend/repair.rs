@@ -187,7 +187,8 @@ async fn scan_vendor_references_folding(
 /// Every wiring-bearing file name the vendor backends may rewrite, relative
 /// to `project_root`: every file the registry says a vendored run writes
 /// ([`registry::VENDORED`]: `nuget.config`, `pom.xml` and `hatch.toml`
-/// included), vlt importer manifests, the Python
+/// included), vlt importer manifests, a Rush repository's locks, configs
+/// and project manifests, the Python
 /// locks the root lists (and their scripts) and the requirements `-r`
 /// include tree. Sorted and deduplicated; entries need not exist.
 async fn wiring_files(project_root: &Path) -> Vec<String> {
@@ -196,6 +197,7 @@ async fn wiring_files(project_root: &Path) -> Vec<String> {
         .map(str::to_string)
         .collect();
     files.extend(vendor::vlt_lock::vlt_importer_package_jsons(project_root).await);
+    files.extend(vendor::rush_wiring_files(project_root).await);
     if let Ok(paths) = socket_patch_core::utils::python_lock::python_lock_paths(project_root) {
         for path in paths {
             if let Some(script) =
@@ -1025,6 +1027,58 @@ mod tests {
         );
         assert!(result.warnings.is_empty(), "{:?}", result.warnings);
         result.binary_files.remove("bun.lockb").unwrap()
+    }
+
+    /// A Rush repository keeps its wiring under `common/config/` and in
+    /// the projects' manifests, none of which is a root lockfile: without
+    /// them the orphan sweep would delete a tarball `rush install` needs.
+    #[tokio::test]
+    async fn rush_references_are_scanned_without_a_ledger() {
+        let root = tempfile::tempdir().unwrap();
+        let write = |rel: &str, text: String| {
+            let path = root.path().join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        };
+        let lock_uuid = "11111111-1111-4111-8111-111111111111";
+        let subspace_uuid = "22222222-2222-4222-8222-222222222222";
+        let manifest_uuid = "33333333-3333-4333-8333-333333333333";
+        write(
+            "rush.json",
+            r#"{ "pnpmVersion": "10.34.9", "projects": [ { "packageName": "util", "projectFolder": "libs/util" } ] }"#
+                .to_string(),
+        );
+        write(
+            "common/config/rush/pnpm-lock.yaml",
+            format!(
+                "lockfileVersion: '9.0'\n\npackages:\n\n  minimist@file:../../.socket/vendor/npm/{lock_uuid}/minimist-0.0.8.tgz:\n    resolution: {{integrity: sha512-x, tarball: file:../../.socket/vendor/npm/{lock_uuid}/minimist-0.0.8.tgz}}\n"
+            ),
+        );
+        write(
+            "common/config/subspaces/team-b/pnpm-lock.yaml",
+            format!(
+                "lockfileVersion: '9.0'\n\noverrides:\n  mkdirp@0.5.1>minimist@0.0.10: file:../../../.socket/vendor/npm/{subspace_uuid}/minimist-0.0.10.tgz\n"
+            ),
+        );
+        write(
+            "libs/util/package.json",
+            format!(
+                r#"{{ "name": "util", "dependencies": {{ "left-pad": "file:../../.socket/vendor/npm/{manifest_uuid}/left-pad-1.3.0.tgz" }} }}"#
+            ),
+        );
+        let mut uuids: Vec<String> = scan_vendor_references(root.path())
+            .await
+            .into_iter()
+            .map(|(eco, uuid, _)| format!("{eco}/{uuid}"))
+            .collect();
+        uuids.sort();
+        assert_eq!(
+            uuids,
+            [lock_uuid, subspace_uuid, manifest_uuid].map(|uuid| format!("npm/{uuid}"))
+        );
+        // The same files outside a Rush repository are not wiring files.
+        std::fs::remove_file(root.path().join("rush.json")).unwrap();
+        assert!(scan_vendor_references(root.path()).await.is_empty());
     }
 
     #[tokio::test]

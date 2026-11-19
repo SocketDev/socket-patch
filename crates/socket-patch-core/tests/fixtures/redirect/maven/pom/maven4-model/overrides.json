@@ -1,0 +1,28 @@
+[
+  {
+    "ecosystem": "maven",
+    "name": "slf4j-api",
+    "namespace": "org.slf4j",
+    "version": "1.7.36",
+    "token": "11111111-1111-1111-1111-111111111111",
+    "patchUuid": "77777777-7777-7777-7777-777777777777",
+    "artifactUrl": "https://patch.socket.dev/patch/maven/org.slf4j/slf4j-api/1.7.36/11111111-1111-1111-1111-111111111111/77777777-7777-7777-7777-777777777777/slf4j-api-1.7.36.jar",
+    "registryOverride": {
+      "kind": "maven2",
+      "indexUrl": "https://patch.socket.dev/patch-registry/maven/11111111-1111-1111-1111-111111111111/77777777-7777-7777-7777-777777777777/maven2",
+      "identifiers": {
+        "name": "org.slf4j/slf4j-api",
+        "version": "1.7.36",
+        "mavenGroupId": "org.slf4j",
+        "mavenArtifactId": "slf4j-api",
+        "mavenSuffixedVersion": "1.7.36-socket.77777777",
+        "mavenPomSha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+      }
+    },
+    "integrity": {
+      "sha1": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "md5": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+    }
+  }
+]

@@ -198,12 +198,17 @@ impl Mvn {
     }
 
     /// Maven ≥ 3.9.4 enforces the trusted-checksums summary file the hosted
-    /// rewriter commits under `.mvn/checksums/` (#258). 3.9.0 / 3.9.1 leave
-    /// `${session.rootDirectory}` in `maven.config` uninterpolated, so the
-    /// file is never found; 3.9.2 / 3.9.3 ignore `checksumAlgorithms=SHA-256`
-    /// and check SHA-1 only; older lines have no trusted-checksums support.
-    /// Below 3.9.4 only the transport `checksumPolicy=fail` sidecar check
-    /// protects the download.
+    /// rewriter commits under `.mvn/checksums/` (#258), wherever the build
+    /// is started. 3.9.0 / 3.9.1 do not interpolate the directory in
+    /// `maven.config`, so the file is never found; 3.9.2 / 3.9.3 ignore
+    /// `checksumAlgorithms=SHA-256` and check SHA-1 only; older lines have
+    /// no trusted-checksums support. Below 3.9.4 only the transport
+    /// `checksumPolicy=fail` sidecar check protects the download.
+    ///
+    /// Maven 4 reads the directory only when it is spelled with
+    /// `${session.rootDirectory}`, which the rewriter writes for a project
+    /// that declares Maven 4. The capstone's project does: its Maven
+    /// Wrapper pins the Maven under test.
     pub fn enforces_trusted_checksums(&self) -> bool {
         self.numeric() >= vec![3, 9, 4]
     }
