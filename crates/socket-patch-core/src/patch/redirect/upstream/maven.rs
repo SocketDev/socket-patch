@@ -1695,29 +1695,100 @@ mod tests {
         assert_eq!(read_tree(tmp.path()), wired, "nothing changed");
     }
 
-    /// A pin is one patch of one package in every file that wires it, and
-    /// a checkout that two builds read is wired in a file of each: here
-    /// `pom.xml` beside the `socket-patch.sbt` of an sbt build (the Gradle
-    /// index is another). Each restorer takes the pin out of its own
-    /// files, so the pom comes back whatever else the pin lists.
-    #[tokio::test]
-    async fn a_pin_another_build_wires_too_is_restored_in_its_pom() {
+    /// The fixture `sbt/redirect/pom-also-present` under `root` as a hosted
+    /// scan leaves it: one pin, in `pom.xml` and in the `socket-patch.sbt`
+    /// of the sbt build beside it. The tree before the scan.
+    fn pom_beside_sbt(root: &std::path::Path) -> BTreeMap<String, String> {
         let case = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/sbt/redirect/pom-also-present");
         let before = read_tree(&case.join("input"));
-        let tmp = tempfile::tempdir().unwrap();
         for tree in [&before, &read_tree(&case.join("expected"))] {
             let files: Vec<(&str, String)> = tree
                 .iter()
                 .map(|(rel, text)| (rel.as_str(), text.clone()))
                 .collect();
-            write_tree(tmp.path(), &files);
+            write_tree(root, &files);
         }
-        let pins = discovered(tmp.path()).await;
-        assert_eq!(pins.len(), 1, "{pins:?}");
-        assert_eq!(pins[0].files, ["pom.xml", "socket-patch.sbt"]);
-        roll_back("a pom beside an sbt build", tmp.path()).await;
-        assert_eq!(read_tree(tmp.path()), before);
+        before
+    }
+
+    /// A pin is one patch of one package in every file that wires it, and
+    /// a checkout that two builds read is wired in a file of each: `pom.xml`
+    /// beside the `socket-patch.sbt` of an sbt build, or beside the hosted
+    /// index of a Gradle build. Each restorer takes the pin out of its own
+    /// files, so the pom comes back whatever else the pin lists.
+    #[tokio::test]
+    async fn a_pin_another_build_wires_too_is_restored_in_its_pom() {
+        let sbt = tempfile::tempdir().unwrap();
+        let before_sbt = pom_beside_sbt(sbt.path());
+
+        let gradle = tempfile::tempdir().unwrap();
+        let slf4j = "org.slf4j:slf4j-api:1.7.36";
+        let build = format!("dependencies {{ implementation '{slf4j}' }}\n");
+        let files = [
+            ("pom.xml", fixture("basic", "input", "pom.xml")),
+            ("settings.gradle", "rootProject.name = 'app'\n".to_string()),
+            ("build.gradle", build),
+            ("gradle.lockfile", format!("{slf4j}=runtimeClasspath\n")),
+        ];
+        write_tree(gradle.path(), &files);
+        let before_gradle = read_tree(gradle.path());
+        let scanned = scan(gradle.path(), UUID, &[("pom.xml", Ok("1.7.36"))]);
+        assert!(scanned.confirmed_gradle_uuids.contains(UUID));
+
+        for (root, wired_in, before) in [
+            (sbt.path(), ["pom.xml", "socket-patch.sbt"], before_sbt),
+            (
+                gradle.path(),
+                [".socket/gradle/hosted-index.tsv", "pom.xml"],
+                before_gradle,
+            ),
+        ] {
+            let case = wired_in.join(" and ");
+            let pins = discovered(root).await;
+            assert_eq!(pins.len(), 1, "{case}: {pins:?}");
+            assert_eq!(pins[0].files, wired_in);
+            roll_back(&case, root).await;
+            assert_eq!(read_tree(root), before, "{case}");
+        }
+    }
+
+    /// Two restorers act on such a pin, and a pin is restored in every
+    /// file that wires it or in none. Whichever of the two refuses, the
+    /// pin is refused and nothing is written: not `pom.xml` and the `.mvn`
+    /// files when `socket-patch.sbt` was edited, and not `socket-patch.sbt`
+    /// when the pom names the patched version where no scan put it. (The
+    /// pin is read before the edit: discovery does not list an edited
+    /// `socket-patch.sbt`.)
+    #[tokio::test]
+    async fn a_pin_one_of_two_builds_refuses_is_restored_in_neither() {
+        let named = "</dependencies>\n  <build>\n    <finalName>app-3.11-socket.abcdef12</finalName>\n  </build>";
+        for (rel, from, to, needle) in [
+            ("socket-patch.sbt", "Do not edit", "Do edit", "was edited"),
+            (
+                "pom.xml",
+                "</dependencies>",
+                named,
+                "outside a <dependency> version",
+            ),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            pom_beside_sbt(tmp.path());
+            let pins = discovered(tmp.path()).await;
+            assert_eq!(pins[0].files, ["pom.xml", "socket-patch.sbt"]);
+            let edited = read_tree(tmp.path())[rel].replace(from, to);
+            assert!(edited.contains(to), "{rel}");
+            std::fs::write(tmp.path().join(rel), edited).unwrap();
+            let wired = read_tree(tmp.path());
+            let opts = RestoreOptions {
+                offline: true,
+                ..RestoreOptions::default()
+            };
+            let outcome = restore_upstream(tmp.path(), &pins, &opts).await;
+            let why = refusal(&outcome);
+            assert!(why.contains(needle), "{rel}: {why}");
+            assert_eq!(read_tree(tmp.path()), wired, "{rel}: nothing changed");
+        }
     }
 
     /// An earlier release's pin is read by its shape only in a single pom.
