@@ -1,0 +1,141 @@
+name: Bazel patch compatibility (Cargo)
+
+# The Cargo flows of the real-Bazel tests (`cargo::` in `e2e_bazel_build`):
+# hosted and vendored mode for a crate that rules_rust's crate_universe
+# resolves from a Cargo workspace (`crate.from_cargo`, with the project's
+# cargo config and no cargo-bazel lock), on each Bazel release below.
+# bazel-compatibility.yml holds the legs and what every ecosystem shares;
+# this file says when the Cargo legs run and on which releases.
+#
+# Beyond what every leg needs, a Cargo leg downloads the Rust toolchain
+# from static.rust-lang.org, the cargo-bazel binary and ruleset archives
+# from github.com, and the crates rules_rust builds its own tools from, from
+# static.crates.io (60 of them with rules_rust 0.75.0, one with 0.56.0).
+# Its repository cache holds all of it. For the era of rules_rust 0.75.0
+# it comes to about 230 MB after one Bazel release and about 240 MB once
+# both releases of the era have used it, and to about 155 MB for the era of
+# 0.56.0 (macOS arm64). Every workspace copy unpacks the toolchain for
+# itself, about 1.8 GB, and a leg has two at a time, one per test: a test
+# removes its first copy before its second machine builds (3.6 GB at the
+# peak on Bazel 9.3.2, macOS arm64).
+#
+# No leg asks crates.io about the crate under test. cargo-bazel's cargo
+# reads no downloader config, so the test's workspace names a mirror of
+# crates.io in its `.cargo/config.toml`, the loopback stand-in, and the
+# crate has a name crates.io cannot hold. A crate file under test passes
+# through the repository cache as well: Bazel's downloader fetches it and
+# keeps it under its sha256. So a test builds the upstream crate file and
+# each patched one anew, with an id of the run in the library, and writes
+# the upstream checksum into the Cargo.lock of its workspace copy. No cache
+# holds a crate file of the run, and the test counts the requests for the
+# upstream one.
+#
+# Not required for merge: no `merge_group` trigger, and no job here is a
+# `needs` of ci.yml's `ci-ok`.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    # What a pull request run covers: the Cargo flows and their fixture, the
+    # harness and the workflows that run it, the Bazel installer and its
+    # pins, and the Cargo files of socket-patch-core, which the two globs
+    # name by the `cargo` in a file's or a directory's name: the Cargo.lock
+    # and Cargo.toml models with the hosted planner and the reader of a
+    # source replacement (formats/cargo/), the vendored backend
+    # (vendor/cargo*, the lock inventory), the upstream restore of
+    # `rollback`, the crawler every `scan` starts, the cargo home and
+    # workspace lookups, and the reader of a Cargo project that `vex` runs
+    # (vex/discover/cargo.rs). They also match Cargo files no flow runs
+    # (agent mode's sidecars and build cache), which are no other
+    # ecosystem's either. One more file is here for what the flows
+    # run through: patch/user_patches.rs, the inspection of the project's
+    # own patches, which reads the Cargo.toml and the cargo config of every
+    # scan. That file also holds the npm, Composer and Go parts of the
+    # gate, so a change to those starts the Cargo legs too. The globs name
+    # that one crate, so no bench fixture is here, and nothing another
+    # ecosystem's flow owns: a change to one ecosystem starts that
+    # ecosystem's legs only.
+    #
+    # What it does not cover: shared engine code (patch/redirect/mod.rs,
+    # the rest of vendor/, hosted/, commands/), the shared test helpers and
+    # the toolchain files. A change there gets its run on the push to main
+    # (when the file is in the list below) or in the nightly run, not on the
+    # pull request: that is the price of not running every ecosystem's legs
+    # on every shared change. On demand, workflow_dispatch runs the legs on
+    # any branch.
+    paths:
+      - '.github/workflows/bazel-cargo.yml'
+      - '.github/workflows/bazel-compatibility.yml'
+      - 'scripts/install-bazel.sh'
+      - 'scripts/bazel-pins.txt'
+      - 'crates/socket-patch-cli/tests/e2e_bazel_build/cargo.rs'
+      - 'crates/socket-patch-cli/tests/e2e_bazel_build/harness.rs'
+      - 'crates/socket-patch-cli/tests/fixtures/bazel/rules_rust/**'
+      - 'crates/socket-patch-core/src/**/*cargo*'
+      - 'crates/socket-patch-core/src/**/*cargo*/**'
+      - 'crates/socket-patch-core/src/patch/user_patches.rs'
+  push:
+    branches: [main]
+    # The pull request paths, and what only a push to main covers: the
+    # root of the test target (it changes when an ecosystem's module is
+    # added; ci.yml builds the target and runs its hermetic tests on every
+    # pull request), the shared engine code and test helpers the flows run
+    # through, and the toolchain files. A main push outside this list waits
+    # for the nightly run below.
+    paths:
+      - '.github/workflows/bazel-cargo.yml'
+      - '.github/workflows/bazel-compatibility.yml'
+      - 'scripts/install-bazel.sh'
+      - 'scripts/bazel-pins.txt'
+      - 'crates/socket-patch-cli/tests/e2e_bazel_build/cargo.rs'
+      - 'crates/socket-patch-cli/tests/e2e_bazel_build/harness.rs'
+      - 'crates/socket-patch-cli/tests/fixtures/bazel/rules_rust/**'
+      - 'crates/socket-patch-core/src/**/*cargo*'
+      - 'crates/socket-patch-core/src/**/*cargo*/**'
+      - 'crates/socket-patch-core/src/patch/user_patches.rs'
+      - 'crates/socket-patch-cli/tests/e2e_bazel_build/main.rs'
+      - 'crates/socket-patch-core/src/patch/redirect/**'
+      - 'crates/socket-patch-core/src/vendor/**'
+      - 'crates/socket-patch-core/src/hosted/**'
+      - 'crates/socket-patch-cli/src/commands/**'
+      - 'crates/socket-patch-cli/tests/common/**'
+      - 'crates/socket-patch-cli/tests/hosted_memory_common/**'
+      - 'Cargo.lock'
+      - 'Cargo.toml'
+      - 'crates/*/Cargo.toml'
+      - 'rust-toolchain.toml'
+      - '.cargo/**'
+  schedule:
+    # Nightly, so a main change outside the push list still gets a run
+    # within a day. The macOS leg runs here and on demand only.
+    - cron: '57 4 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# The nightly run has a group of its own. A group holds one pending run, so
+# in the group of main's pushes a second push would replace a nightly that
+# waits behind the first, and the nightly is the only run with the macOS leg.
+concurrency:
+  group: bazel-cargo-${{ github.event.pull_request.number || github.ref }}${{ github.event_name == 'schedule' && '-nightly' || '' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  cargo:
+    uses: ./.github/workflows/bazel-compatibility.yml
+    with:
+      eco: cargo
+      fixtures: rules_rust/bzlmod
+      # One leg per line: a Bazel release, and the era of the fixture that
+      # `cargo::FIXTURE` gives it.
+      releases: >-
+        [
+          {"bazel": "9.3.2", "era": "e9"},
+          {"bazel": "8.8.2", "era": "e9"},
+          {"bazel": "7.7.2", "era": "e7"}
+        ]
+      macos: >-
+        [
+          {"bazel": "9.3.2", "era": "e9"}
+        ]
