@@ -1445,23 +1445,8 @@ impl ApiClient {
         vendor_url: Option<&str>,
         patch_server_url: Option<&str>,
     ) -> VendorServiceOutcome {
-        if !is_uuid_shaped(uuid) {
-            return VendorServiceOutcome::Failed(ApiError::InvalidHash(format!(
-                "Invalid patch UUID: {uuid}"
-            )));
-        }
-        // Circuit breaker: after consecutive retryable failures the service
-        // is down for this run — skip it without any I/O instead of paying
-        // every package's retries (and mixing sources package by package).
-        let failures = self.vendor_outage.load(Ordering::Relaxed);
-        if failures >= VENDOR_BREAKER_THRESHOLD {
-            // Worded to read inside the callers' "patch service request
-            // failed (...)" wrapper: no request was made, and the skip is
-            // scoped to this run.
-            return VendorServiceOutcome::Failed(ApiError::Other(format!(
-                "not attempted: the service failed for the previous {failures} packages in \
-                 this run"
-            )));
+        if let Some(refused) = self.vendor_request_refused(uuid) {
+            return VendorServiceOutcome::Failed(refused);
         }
         // A download the attached plan already fetched stands in for the
         // live requests; everything around it (the breaker check above, the
@@ -1485,7 +1470,35 @@ impl ApiClient {
                     .await
             }
         };
-        match &outcome {
+        self.note_vendor_outcome(&outcome, retryable_failure);
+        outcome
+    }
+
+    /// Why a vendor-service call for `uuid` is answered without any I/O, if
+    /// it is: a malformed uuid, or the run-level circuit breaker — after
+    /// consecutive retryable failures the service is down for this run, so
+    /// it is skipped instead of paying every package's retries (and mixing
+    /// sources package by package).
+    fn vendor_request_refused(&self, uuid: &str) -> Option<ApiError> {
+        if !is_uuid_shaped(uuid) {
+            return Some(ApiError::InvalidHash(format!("Invalid patch UUID: {uuid}")));
+        }
+        let failures = self.vendor_outage.load(Ordering::Relaxed);
+        // Worded to read inside the callers' "patch service request failed
+        // (...)" wrapper: no request was made, and the skip is scoped to
+        // this run.
+        (failures >= VENDOR_BREAKER_THRESHOLD).then(|| {
+            ApiError::Other(format!(
+                "not attempted: the service failed for the previous {failures} packages in \
+                 this run"
+            ))
+        })
+    }
+
+    /// Fold one vendor-service outcome into the circuit breaker's count of
+    /// consecutive retryable failures.
+    fn note_vendor_outcome<T>(&self, outcome: &VendorServiceOutcome<T>, retryable_failure: bool) {
+        match outcome {
             VendorServiceOutcome::Failed(_) if retryable_failure => {
                 self.vendor_outage.fetch_add(1, Ordering::Relaxed);
             }
@@ -1494,6 +1507,41 @@ impl ApiClient {
             VendorServiceOutcome::Failed(_) => {}
             _ => self.vendor_outage.store(0, Ordering::Relaxed),
         }
+    }
+
+    /// Step 1 of [`Self::fetch_vendor_package`] on its own: what the
+    /// service lists for the patch besides its archive (the per-platform
+    /// gem prebuilds and their stub gemspecs), each with its host-rewritten
+    /// URL and sha512, and NO archive download. A backend that takes only
+    /// those artifacts learns here which exist. Same grant, statuses, retry
+    /// ladder and circuit breaker as the full fetch; a uuid the attached
+    /// plan names is answered from its reference batch.
+    pub(crate) async fn fetch_vendor_reference(
+        &self,
+        uuid: &str,
+        free_only: bool,
+        vendor_url: Option<&str>,
+        patch_server_url: Option<&str>,
+    ) -> VendorServiceOutcome<Vec<SecondaryArtifact>> {
+        if let Some(refused) = self.vendor_request_refused(uuid) {
+            return VendorServiceOutcome::Failed(refused);
+        }
+        let (outcome, retryable_failure) = match self
+            .request_vendor_package(uuid, free_only, vendor_url)
+            .await
+        {
+            Ok(result) => (
+                reference_miss(&result.status).unwrap_or_else(|| {
+                    VendorServiceOutcome::Ready(served_secondary_artifacts(
+                        &result,
+                        patch_server_url,
+                    ))
+                }),
+                false,
+            ),
+            Err((e, retryable)) => (VendorServiceOutcome::Failed(e), retryable),
+        };
+        self.note_vendor_outcome(&outcome, retryable_failure);
         outcome
     }
 
@@ -1583,22 +1631,8 @@ impl ApiClient {
             Err((e, retryable)) => return (VendorServiceOutcome::Failed(e), retryable),
         };
         // Classify the build/grant status before attempting any download.
-        match result.status.as_str() {
-            "granted" | "reused" => {}
-            "pending_build" => return done(VendorServiceOutcome::Pending),
-            "build_failed" | "withdrawn" | "not_found" => {
-                return done(VendorServiceOutcome::Unavailable(result.status.clone()))
-            }
-            "forbidden" => {
-                return done(VendorServiceOutcome::Failed(ApiError::Forbidden(
-                    "Forbidden: not entitled to this patch (paid tier or no org access).".into(),
-                )))
-            }
-            other => {
-                return done(VendorServiceOutcome::Unavailable(format!(
-                    "unknown status `{other}`"
-                )))
-            }
+        if let Some(miss) = reference_miss(&result.status) {
+            return done(miss);
         }
 
         // Select the native tarball artifact and its sha512 (the universal
@@ -1642,36 +1676,7 @@ impl ApiClient {
             return done(VendorServiceOutcome::Unavailable(PYPI_NOT_A_WHEEL.into()));
         }
 
-        // Surface the OTHER served artifacts (e.g. the gem path-source stub
-        // gemspec) — their host-rewritten URL + normalized sha512 — so a
-        // backend that needs one can download + verify it lazily. Each is
-        // skipped unless it carries both a url and a sha512.
-        let mut secondary_artifacts: Vec<SecondaryArtifact> = Vec::new();
-        if let Some(arts) = result.artifacts.as_ref() {
-            for a in arts {
-                if a.kind == "tarball" {
-                    continue;
-                }
-                let (Some(url), Some(sha512)) = (a.url.as_deref(), a.integrity.sha512.as_deref())
-                else {
-                    continue;
-                };
-                let url = match patch_server_url {
-                    Some(base) => match rewrite_url_host(url, base) {
-                        Ok(u) => u,
-                        Err(_) => continue,
-                    },
-                    None => url.to_string(),
-                };
-                secondary_artifacts.push(SecondaryArtifact {
-                    kind: a.kind.clone(),
-                    platform: a.platform.clone(),
-                    url,
-                    integrity_sri: normalize_sha512_sri(sha512),
-                    prefetched: None,
-                });
-            }
-        }
+        let secondary_artifacts = served_secondary_artifacts(&result, patch_server_url);
 
         // ── Step 2: download the prebuilt archive ──────────────────────────
         let downloaded = self.download_vendor_archive(&download_url, None).await;
@@ -2195,15 +2200,17 @@ impl std::fmt::Debug for PrefetchedSecondary {
     }
 }
 
-/// Outcome of [`ApiClient::fetch_vendor_package`].
+/// Outcome of [`ApiClient::fetch_vendor_package`], and, with the served
+/// artifact list in place of the archive, of
+/// [`ApiClient::fetch_vendor_reference`].
 ///
 /// The vendor backends map these onto the `auto`/`service`/`build` policy:
 /// `Ready` → use the service archive; `Pending`/`Unavailable`/`Failed` → fall
 /// back to a local build under `auto`, or hard-fail under `service`.
 #[derive(Debug)]
-pub(crate) enum VendorServiceOutcome {
+pub(crate) enum VendorServiceOutcome<T = FetchedVendorPackage> {
     /// Archive downloaded; integrity carried for the caller to verify.
-    Ready(FetchedVendorPackage),
+    Ready(T),
     /// The archive is still building (`pending_build` status or serve 408) —
     /// retryable.
     Pending,
@@ -2212,6 +2219,59 @@ pub(crate) enum VendorServiceOutcome {
     Unavailable(String),
     /// A request/transport/auth failure (401/403 grant, 5xx, network, malformed).
     Failed(ApiError),
+}
+
+/// What a package reference's build/grant `status` settles on its own,
+/// before any download: `None` for a granted one.
+fn reference_miss<T>(status: &str) -> Option<VendorServiceOutcome<T>> {
+    match status {
+        "granted" | "reused" => None,
+        "pending_build" => Some(VendorServiceOutcome::Pending),
+        "build_failed" | "withdrawn" | "not_found" => {
+            Some(VendorServiceOutcome::Unavailable(status.to_string()))
+        }
+        "forbidden" => Some(VendorServiceOutcome::Failed(ApiError::Forbidden(
+            "Forbidden: not entitled to this patch (paid tier or no org access).".into(),
+        ))),
+        other => Some(VendorServiceOutcome::Unavailable(format!(
+            "unknown status `{other}`"
+        ))),
+    }
+}
+
+/// The served artifacts of a granted reference OTHER than the archive (the
+/// gem path-source stub gemspec, the per-platform gem prebuilds, …) — their
+/// host-rewritten URL + normalized sha512 — so a backend that needs one can
+/// download + verify it lazily. Each is skipped unless it carries both a
+/// url and a sha512.
+fn served_secondary_artifacts(
+    result: &PackageVendorResult,
+    patch_server_url: Option<&str>,
+) -> Vec<SecondaryArtifact> {
+    let mut secondary_artifacts: Vec<SecondaryArtifact> = Vec::new();
+    for a in result.artifacts.iter().flatten() {
+        if a.kind == "tarball" {
+            continue;
+        }
+        let (Some(url), Some(sha512)) = (a.url.as_deref(), a.integrity.sha512.as_deref()) else {
+            continue;
+        };
+        let url = match patch_server_url {
+            Some(base) => match rewrite_url_host(url, base) {
+                Ok(u) => u,
+                Err(_) => continue,
+            },
+            None => url.to_string(),
+        };
+        secondary_artifacts.push(SecondaryArtifact {
+            kind: a.kind.clone(),
+            platform: a.platform.clone(),
+            url,
+            integrity_sri: normalize_sha512_sri(sha512),
+            prefetched: None,
+        });
+    }
+    secondary_artifacts
 }
 
 /// A serve GET's answer short of a failure.

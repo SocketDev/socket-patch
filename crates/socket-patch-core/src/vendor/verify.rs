@@ -26,7 +26,10 @@ use std::path::{Path, PathBuf};
 
 use crate::hash::git_sha256::compute_git_sha256_from_bytes;
 use crate::manifest::schema::{PatchFileInfo, PatchRecord};
-use crate::patch::apply::{normalize_file_path, verify_file_patch, VerifyStatus};
+use crate::patch::apply::{
+    is_missing_path, is_safe_relative_subpath, normalize_file_path, verify_file_patch, VerifyStatus,
+};
+use crate::patch::file_hash::compute_file_git_sha256;
 use crate::patch::package::read_archive_to_map;
 
 use super::path::parse_vendor_path;
@@ -136,9 +139,9 @@ pub async fn verify_vendored_patch_record(
             // the tree of whichever platform it runs on, so every one of
             // them must carry the patch.
             Some(trees) => {
-                let inventoried = entry.artifact.file_inventory.is_some();
+                let inventory = entry.artifact.file_inventory.as_ref();
                 for tree in &trees {
-                    verify_platform_tree_members(tree, record, inventoried).await?;
+                    verify_platform_tree(tree, &record.files, inventory).await?;
                 }
             }
             None => verify_dir_members(&artifact, record, cargo_uuid).await?,
@@ -292,18 +295,30 @@ async fn gem_platform_trees(
     Ok((!trees.is_empty()).then_some(trees))
 }
 
-/// [`verify_dir_members`] for one prebuild tree of a gem vendored as
-/// platform gems: every record file the tree holds must hash to its
-/// afterHash. A record file the tree does NOT hold is the patch of a source
-/// the platform gem never shipped (it ships the compiled extension, built
-/// from the patched source by the patch service), which is accepted only
-/// when the entry's file inventory pins the whole tree to the bytes that
-/// were vendored (`inventoried`); with no inventory a missing member fails,
-/// like in any other artifact.
-async fn verify_platform_tree_members(
+/// The rule one prebuild tree of a gem vendored as precompiled platform
+/// gems must meet to count as carrying the patch (`tree` is
+/// `<artifact>/<platform>/`, `files` the patch record's). One rule for
+/// every place that judges such a tree: the download gate, the in-sync
+/// test of a re-run, and `vendor --check` / `vex` / `repair`.
+///
+/// * Every patched file the tree holds hashes to its `afterHash`.
+/// * A patched file the tree does NOT hold is accepted when the platform
+///   gem never shipped it: such a gem ships the compiled extension and
+///   often not the sources it was built from, so a patch of those sources
+///   reaches the tree only through its binary, which the patch service
+///   built and whose bytes the download's integrity check and the ledger's
+///   file inventory cover. `inventory` (the ledger's, keyed
+///   `<platform>/<path>`) is what says "never shipped": a file it lists and
+///   the tree no longer holds was vendored and then lost, a mismatch.
+///   Without an inventory nothing says which, and absence is accepted.
+/// * The tree holds at least one patched file. A tree with none shows
+///   nothing of the patch, so it never passes.
+///
+/// The error is a stable routing tag (see the module docs).
+pub(crate) async fn verify_platform_tree(
     tree: &Path,
-    record: &PatchRecord,
-    inventoried: bool,
+    files: &HashMap<String, PatchFileInfo>,
+    inventory: Option<&BTreeMap<String, String>>,
 ) -> Result<(), String> {
     if !tokio::fs::symlink_metadata(tree)
         .await
@@ -311,17 +326,34 @@ async fn verify_platform_tree_members(
     {
         return Err("file_not_found".to_string());
     }
-    for (file_name, info) in &record.files {
-        match verify_file_patch(tree, file_name, info).await.status {
-            VerifyStatus::AlreadyPatched => {}
-            VerifyStatus::Ready | VerifyStatus::HashMismatch => {
-                return Err("vendor_hash_mismatch".to_string())
+    let platform = tree.file_name().and_then(|name| name.to_str());
+    let mut holds_patched_file = false;
+    for (file_name, info) in files {
+        let normalized = normalize_file_path(file_name);
+        // SECURITY: never hash through a record key that escapes the tree.
+        if !is_safe_relative_subpath(normalized) {
+            return Err("file_not_found".to_string());
+        }
+        match compute_file_git_sha256(&tree.join(normalized)).await {
+            Ok(hash) if hash == info.after_hash => holds_patched_file = true,
+            Ok(_) => return Err("vendor_hash_mismatch".to_string()),
+            Err(e) if is_missing_path(&e) => {
+                let vendored = inventory
+                    .zip(platform)
+                    .is_some_and(|(inventory, platform)| {
+                        inventory.contains_key(&format!("{platform}/{normalized}"))
+                    });
+                if vendored {
+                    return Err("file_not_found".to_string());
+                }
             }
-            VerifyStatus::NotFound if inventoried => {}
-            VerifyStatus::NotFound => return Err("file_not_found".to_string()),
+            Err(_) => return Err("file_not_found".to_string()),
         }
     }
-    Ok(())
+    match holds_patched_file {
+        true => Ok(()),
+        false => Err("file_not_found".to_string()),
+    }
 }
 
 /// A vlt package-dir entry: npm, flavor `vlt`, not a tarball. The vendored

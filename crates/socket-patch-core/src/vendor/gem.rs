@@ -84,13 +84,22 @@
 //! * EVERY platform block of the gem moves into the section, and every
 //!   `CHECKSUMS` line of the gem becomes bare;
 //! * the trees hold compiled extensions (`*.so`, `*.bundle`, a JRuby gem's
-//!   `*.jar`), which stock ignore templates name, so the uuid dir gets a
-//!   `.gitignore` of `!*` that re-includes them, and a tree git would still
-//!   not commit in full is refused: wired without its binary, the gem
-//!   would install everywhere and fail to load;
-//! * every locked platform needs a prebuild. One without, or a plain
+//!   `*.jar`), which stock ignore templates name, so the uuid dir gets the
+//!   `.gitignore` (`!*`) and `.gitattributes` every backend that commits
+//!   binaries writes: they re-include the trees and keep a project filter
+//!   (a Git LFS rule, EOL conversion) off their bytes. A `.gitignore` a
+//!   prebuild ships inside its own tree would override that, so it is
+//!   emptied in the copy. A tree git would still not commit in full is
+//!   refused: wired without its binary, the gem would install everywhere
+//!   and fail to load;
+//! * every locked platform needs a prebuild. While the service lists none
+//!   for one of them the gem is left as it is and reported as a skip
+//!   ([`super::VENDOR_PREBUILT_PLATFORM_PENDING`]): a prebuild is listed
+//!   only once built, so the next run may find it. A plain
 //!   `<name> (<version>)` entry beside the platform ones (the ruby platform,
-//!   which no prebuilt tree serves), is refused with nothing written.
+//!   which no prebuilt tree serves) is refused with nothing written, and so
+//!   is a lock written by a bundler older than the layout was run against
+//!   (`PLATFORM_LAYOUT_MIN_BUNDLER`).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -99,11 +108,8 @@ use serde_json::Value;
 
 use crate::formats::gem::gemfile;
 use crate::manifest::schema::{PatchFileInfo, PatchRecord};
-use crate::patch::apply::{
-    is_safe_relative_subpath, normalize_file_path, ApplyResult, PatchSources,
-};
+use crate::patch::apply::{normalize_file_path, ApplyResult, PatchSources};
 use crate::patch::copy_tree::remove_tree;
-use crate::patch::file_hash::compute_file_git_sha256;
 use crate::patch::path_safety::is_safe_single_segment;
 use crate::patch::redirect::gem_line_tail_blocks_edit;
 use crate::utils::fs::{atomic_write_bytes_preserving_mode, read_regular_to_string};
@@ -119,15 +125,18 @@ use super::path::{parse_vendor_path, vendor_uuid_dir_rel};
 use super::registry_fetch::{extract_gem_data, extract_on_blocking_pool};
 use super::revert::{self, KeepPolicy};
 use super::service_fetch::{
-    claim_prestaged, fetch_verified_archive, fetch_verified_platform_secondary,
-    fetch_verified_secondary, SecondaryArtifactResult, ServicePolicy,
+    claim_prestaged, downloaded_warning, fetch_served_artifacts, fetch_verified_archive,
+    fetch_verified_platform_secondary, fetch_verified_secondary, SecondaryArtifactResult,
+    ServedArtifacts, ServicePolicy,
 };
 use super::source::PackageSource;
 use super::state::{
     write_marker_or_warn, VendorArtifact, VendorEntry, VendorMarker, WiringAction, WiringRecord,
 };
 use super::{RevertOpts, RevertOutcome, VendorOutcome, VendorServiceConfig, VendorWarning};
-use crate::formats::gem::{is_plain_gem_token, listed_specs, split_checksum_entry, split_entry};
+use crate::formats::gem::{
+    is_plain_gem_token, listed_specs, split_checksum_entry, split_entry, GemfileLock,
+};
 
 const GEMFILE: &str = "Gemfile";
 const GEMFILE_LOCK: &str = "Gemfile.lock";
@@ -207,21 +216,29 @@ struct GemPrelude {
 }
 
 /// What `Gemfile.lock` resolves `name`@`version` to, read from every source
-/// section (a lock already vendored holds the entries in our `PATH`
-/// section): the plain `name (version)` entry of the ruby platform, and the
-/// platforms of its platform-suffixed entries
-/// (`name (version-arm64-darwin)`), in lock order.
+/// section (`GEM`, `PATH`, `GIT`, `PLUGIN SOURCE`; a lock already vendored
+/// holds the entries in our `PATH` section): the plain `name (version)`
+/// entry of the ruby platform, and the platforms of its platform-suffixed
+/// entries (`name (version-arm64-darwin)`), in lock order.
 struct LockedGem {
     plain: bool,
     platforms: Vec<String>,
 }
 
-fn locked_gem(lock_text: &str, name: &str, version: &str) -> LockedGem {
+impl LockedGem {
+    /// No section resolves the gem at this version (#2075): there is no
+    /// entry to move into a `PATH` section. What [`listed_specs`] says of
+    /// the same lock.
+    fn absent(&self) -> bool {
+        !self.plain && self.platforms.is_empty()
+    }
+}
+
+fn locked_gem(lock: &GemfileLock<'_>, name: &str, version: &str) -> LockedGem {
     let mut locked = LockedGem {
         plain: false,
         platforms: Vec::new(),
     };
-    let lock = crate::formats::gem::parse(lock_text);
     let specs = lock
         .sections
         .iter()
@@ -295,19 +312,28 @@ fn version_not_locked_detail(name: &str, version: &str) -> String {
     )
 }
 
-/// The gem purls of `purls` whose version the project's `Gemfile.lock`
-/// doesn't resolve, each with the [`GEM_VERSION_NOT_LOCKED`] refusal the
-/// backend raises for it. A project that installs to a shared gem home
-/// (the Bundler default) is crawled together with the versions Ruby ships
-/// and the ones other projects installed; vendoring is a `Gemfile.lock`
-/// edit, and for those versions there is no entry to edit (#2075, the
-/// vendored twin of hosted mode's `redirect_gem_version_not_locked`).
-/// A spec entry in any source section counts as resolved
-/// ([`listed_specs`]).
+/// The refusals the backend raises for the gem purls of `purls` from
+/// `Gemfile.lock` alone, each with its purl, decided before the patch
+/// service is asked for anything:
 ///
-/// Read-only. Nothing is returned when bundler loads another manifest or
-/// the lock can't be read: the backend reports those itself.
-pub async fn gem_version_not_locked_refusals(
+/// * [`GEM_VERSION_NOT_LOCKED`] for a version the lock doesn't resolve. A
+///   project that installs to a shared gem home (the Bundler default) is
+///   crawled together with the versions Ruby ships and the ones other
+///   projects installed; vendoring is a `Gemfile.lock` edit, and for those
+///   versions there is no entry to edit (#2075, the vendored twin of hosted
+///   mode's `redirect_gem_version_not_locked`). A spec entry in any source
+///   section counts as resolved.
+/// * [`platform_lock_refusal`] for a gem the lock pins as platform gems in
+///   a way that cannot be vendored (the ruby platform locked beside them, a
+///   lock written by an older bundler). The CLI raises it with its other
+///   pre-download refusals, so a gem under a hosted pin is refused BEFORE
+///   the hosted→vendored takeover restores its upstream entry; refused by
+///   the backend afterwards, it would end up unpatched in both modes.
+///
+/// Read-only: the lock is read and parsed once for every purl. Nothing is
+/// returned when bundler loads another manifest or the lock can't be read:
+/// the backend reports those itself.
+pub async fn gem_lock_refusals(
     project_root: &Path,
     purls: &[&str],
 ) -> Vec<(String, (&'static str, String))> {
@@ -324,19 +350,30 @@ pub async fn gem_version_not_locked_refusals(
     let Ok(lock_text) = read_regular_to_string(&project_root.join(GEMFILE_LOCK)).await else {
         return Vec::new();
     };
-    let listed = listed_specs(&lock_text);
+    let lock = crate::formats::gem::parse(&lock_text);
     gems.into_iter()
-        .filter(|(_, name, version)| !listed.contains(&(name.as_str(), version.as_str())))
-        .map(|(purl, name, version)| {
-            (
-                purl.to_string(),
-                (
+        .filter_map(|(purl, name, version)| {
+            let locked = locked_gem(&lock, &name, &version);
+            let refusal = match locked.absent() {
+                true => (
                     GEM_VERSION_NOT_LOCKED,
                     version_not_locked_detail(&name, &version),
                 ),
-            )
+                false => platform_lock_refusal(&name, &version, &locked, &lock_text)?,
+            };
+            Some((purl.to_string(), refusal))
         })
         .collect()
+}
+
+/// The [`GEM_VERSION_NOT_LOCKED`] refusals of [`gem_lock_refusals`].
+pub async fn gem_version_not_locked_refusals(
+    project_root: &Path,
+    purls: &[&str],
+) -> Vec<(String, (&'static str, String))> {
+    let mut refusals = gem_lock_refusals(project_root, purls).await;
+    refusals.retain(|(_, (code, _))| *code == GEM_VERSION_NOT_LOCKED);
+    refusals
 }
 
 /// The per-gem twin of [`gem_manifest_refusal`] for the hosted→vendored
@@ -561,8 +598,8 @@ async fn gem_prelude(
     };
     let (lock_eol, lock_text) = lock_lf_form(lock_text);
     // A version the lock doesn't resolve has no entry to move into a PATH
-    // section: an expected skip (see [`gem_version_not_locked_refusals`]),
-    // decided before the patch service is asked for anything.
+    // section: an expected skip (see [`gem_lock_refusals`]), decided before
+    // the patch service is asked for anything.
     if !listed_specs(&lock_text).contains(&(name, version)) {
         return Err(refused(
             GEM_VERSION_NOT_LOCKED,
@@ -575,7 +612,7 @@ async fn gem_prelude(
     // `name (version)` entry, the patch service's prebuilds for
     // platform-suffixed ones (see the module docs). Decided here, before
     // the patch service is asked for anything.
-    let locked = locked_gem(&lock_text, name, version);
+    let locked = locked_gem(&crate::formats::gem::parse(&lock_text), name, version);
     if locked.platforms.is_empty() {
         // Locked for the ruby platform alone: the copy to vendor is the
         // ruby gem's tree, which a precompiled install is not (and whose
@@ -583,7 +620,7 @@ async fn gem_prelude(
         if platform_install {
             return Err(not_portable());
         }
-    } else if let Some((code, detail)) = platform_lock_refusal(name, version, &locked) {
+    } else if let Some((code, detail)) = platform_lock_refusal(name, version, &locked, &lock_text) {
         return Err(refused(code, detail));
     }
 
@@ -642,7 +679,17 @@ async fn gem_prelude(
                     copy_matches_after_hashes(&copy_dir, &record.files).await
                         && stub_gemspec_valid(&copy_dir, name).await
                 }
-                platforms => platform_copy_intact(&copy_dir, name, platforms, &record.files).await,
+                platforms => {
+                    let inventory = recorded_inventory(project_root, &record.uuid, &copy_rel).await;
+                    platform_copy_intact(
+                        &copy_dir,
+                        name,
+                        platforms,
+                        &record.files,
+                        inventory.as_ref(),
+                    )
+                    .await
+                }
             };
         } else {
             // Wired everywhere EXCEPT the lock's CHECKSUMS entry, which still
@@ -663,6 +710,22 @@ async fn gem_prelude(
             ));
         }
     }
+    // ── prebuilt trees git would not commit ──────────────────────────────
+    // Short of the in-sync no-op, this run (or the wet run a dry run
+    // previews) writes prebuilt binaries under the uuid dir. A rule that
+    // ignores the dir itself (`.socket/`) cannot be overridden from inside
+    // it, so the commit would drop the trees the lock names: refused here,
+    // dry run or not, before anything is downloaded. Rules that ignore
+    // single files are for [`keep_platform_trees_committable`], once the
+    // trees are known.
+    let in_sync = lock_wired && copy_ok;
+    if !locked.platforms.is_empty() && !in_sync {
+        if let Some((code, detail)) =
+            super::npm_dir::ignored_root_refusal(project_root, &uuid_dir_rel).await
+        {
+            return Err(refused(code, detail));
+        }
+    }
     Ok(GemPrelude {
         name: name.to_string(),
         version: version.to_string(),
@@ -680,16 +743,27 @@ async fn gem_prelude(
     })
 }
 
+/// The oldest bundler whose lock is wired to a directory of prebuilt
+/// platform gems: the oldest one the layout is run against (the gate of the
+/// real-bundler capstone in the CLI's `e2e_vendor_gem_build` suite, which
+/// frozen-installs it on 2.3 up to 4.x). Whether an older bundler locks
+/// one spec per platform for such a directory and loads the tree of the
+/// running platform is not known, so its lock is left alone.
+const PLATFORM_LAYOUT_MIN_BUNDLER: (u32, u32) = (2, 3);
+
 /// Why a gem the lock pins as platform gems cannot be vendored from
 /// prebuilds, when the lock alone says so: it also locks the plain
 /// `name (version)` entry — the ruby platform, which no prebuilt tree
-/// serves and whose extensions bundler never builds for a `path:` gem — or
-/// one of its platforms is no directory name. `None` for a gem the lock
-/// does not pin as platform gems.
+/// serves and whose extensions bundler never builds for a `path:` gem —
+/// one of its platforms is no directory name, or the bundler that wrote
+/// the lock (`BUNDLED WITH`) is unknown or older than
+/// [`PLATFORM_LAYOUT_MIN_BUNDLER`]. `None` for a gem the lock does not pin
+/// as platform gems.
 fn platform_lock_refusal(
     name: &str,
     version: &str,
     locked: &LockedGem,
+    lock_text: &str,
 ) -> Option<(&'static str, String)> {
     if locked.platforms.is_empty() {
         return None;
@@ -709,44 +783,34 @@ fn platform_lock_refusal(
         ));
     }
     // SECURITY: each platform names a directory under the copy dir.
-    let unsafe_platform = locked.platforms.iter().find(|p| !is_platform_dir_name(p))?;
+    if let Some(unsafe_platform) = locked.platforms.iter().find(|p| !is_platform_dir_name(p)) {
+        return Some((
+            "unsafe_coordinates",
+            format!("unsafe gem platform `{unsafe_platform}` for `{name}` @ `{version}`"),
+        ));
+    }
+    let (major, minor) = PLATFORM_LAYOUT_MIN_BUNDLER;
+    let written_by = match crate::formats::gem::hosted::bundled_with_version(lock_text) {
+        Some((bundler, _)) if bundler >= PLATFORM_LAYOUT_MIN_BUNDLER => return None,
+        Some((_, written)) => format!("was written by Bundler {written}"),
+        None => "does not say which Bundler wrote it (no `BUNDLED WITH`)".to_string(),
+    };
     Some((
-        "unsafe_coordinates",
-        format!("unsafe gem platform `{unsafe_platform}` for `{name}` @ `{version}`"),
+        "platform_gem_unsupported",
+        format!(
+            "{GEMFILE_LOCK} locks `{name}` as precompiled platform gems and {written_by}: a vendored directory of prebuilt platform gems needs Bundler {major}.{minor} or later, the oldest it is verified on. Re-lock with Bundler {major}.{minor} or later (`bundle update --bundler`) to vendor {name}"
+        ),
     ))
 }
 
-/// The gem purls of `purls` whose version `Gemfile.lock` pins as platform
-/// gems in a way the backend refuses from the lock alone
-/// ([`platform_lock_refusal`]: the ruby platform locked beside them), each
-/// with that refusal. The CLI raises it with its other pre-download
-/// refusals, so a gem under a hosted pin is refused BEFORE the
-/// hosted→vendored takeover restores its upstream entry; refused by the
-/// backend afterwards, it would end up unpatched in both modes.
-///
-/// Read-only. Nothing is returned when bundler loads another manifest or
-/// the lock can't be read: the backend reports those itself.
+/// The [`platform_lock_refusal`]s of [`gem_lock_refusals`].
 pub async fn gem_platform_lock_refusals(
     project_root: &Path,
     purls: &[&str],
 ) -> Vec<(String, (&'static str, String))> {
-    if gem_manifest_refusal(project_root).await.is_some() {
-        return Vec::new();
-    }
-    let Ok(lock_text) = read_regular_to_string(&project_root.join(GEMFILE_LOCK)).await else {
-        return Vec::new();
-    };
-    purls
-        .iter()
-        .filter_map(|purl| {
-            let (name, version) = parse_gem_purl(purl)?;
-            let locked = locked_gem(&lock_text, &name, &version);
-            Some((
-                purl.to_string(),
-                platform_lock_refusal(&name, &version, &locked)?,
-            ))
-        })
-        .collect()
+    let mut refusals = gem_lock_refusals(project_root, purls).await;
+    refusals.retain(|(_, (code, _))| *code != GEM_VERSION_NOT_LOCKED);
+    refusals
 }
 
 /// Whether a gem platform may name a directory under the vendored dir: one
@@ -767,44 +831,44 @@ async fn stub_gemspec_valid(tree: &Path, name: &str) -> bool {
     }
 }
 
-/// Whether the prebuild tree of one platform carries the patch: every
-/// patched file the tree holds hashes to its `afterHash`. A patched file
-/// the tree does not hold is not a mismatch: a platform gem ships the
-/// compiled extension and often not the sources it was built from, so a
-/// patch of those sources reaches such a tree only through its binary,
-/// which the patch service built and whose bytes the download's integrity
-/// check and the ledger's file inventory cover.
-async fn platform_tree_carries_patch(tree: &Path, files: &HashMap<String, PatchFileInfo>) -> bool {
-    if !tokio::fs::metadata(tree).await.is_ok_and(|m| m.is_dir()) {
-        return false;
-    }
-    for (file_name, info) in files {
-        let normalized = normalize_file_path(file_name);
-        // SECURITY: never hash through a manifest key that escapes the tree.
-        if !is_safe_relative_subpath(normalized) {
-            return false;
-        }
-        match compute_file_git_sha256(&tree.join(normalized)).await {
-            Ok(hash) if hash == info.after_hash => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            _ => return false,
-        }
-    }
-    true
+/// The file inventory the vendor ledger records for the copy at
+/// `copy_rel` of the patch `uuid`: what says which files a prebuild tree
+/// was vendored with (see [`verify_platform_tree`]). `None` when the ledger
+/// has no entry for that copy, records no inventory for it, or cannot be
+/// read.
+///
+/// [`verify_platform_tree`]: super::verify::verify_platform_tree
+async fn recorded_inventory(
+    project_root: &Path,
+    uuid: &str,
+    copy_rel: &str,
+) -> Option<std::collections::BTreeMap<String, String>> {
+    let state = super::state::load_state_shared(project_root).await.ok()?;
+    state
+        .entries
+        .values()
+        .find(|e| {
+            e.ecosystem == "gem" && e.uuid == uuid && e.artifact.path.replace('\\', "/") == copy_rel
+        })
+        .and_then(|e| e.artifact.file_inventory.clone())
 }
 
 /// The in-sync test of a copy vendored as platform gems: the tree of every
 /// locked platform is there, carries the patch
-/// ([`platform_tree_carries_patch`]) and has a valid stub gemspec.
+/// ([`super::verify::verify_platform_tree`], against the ledger's
+/// `inventory` of the copy when it has one) and has a valid stub gemspec.
 async fn platform_copy_intact(
     copy_dir: &Path,
     name: &str,
     platforms: &[String],
     files: &HashMap<String, PatchFileInfo>,
+    inventory: Option<&std::collections::BTreeMap<String, String>>,
 ) -> bool {
     for platform in platforms {
         let tree = copy_dir.join(platform);
-        if !platform_tree_carries_patch(&tree, files).await
+        if super::verify::verify_platform_tree(&tree, files, inventory)
+            .await
+            .is_err()
             || !stub_gemspec_valid(&tree, name).await
         {
             return false;
@@ -892,11 +956,14 @@ fn gem_edits(
     Ok((plan, lock_edit))
 }
 
-/// Whether [`vendor_gem`] — a wet run with the service enabled — asks the
-/// patch service for `record`: past every refusal it raises first
+/// The archive download [`vendor_gem`] — a wet run with the service
+/// enabled — makes for `record`: past every refusal it raises first
 /// ([`gem_prelude`], [`gem_edits`]) and not answered by the in-sync hot
 /// path. The vendor loop's download plan consults this; the `.gem`'s
-/// `gem-stub-gemspec` secondary rides the same planned download.
+/// `gem-stub-gemspec` secondary rides the same planned download. `None`
+/// for a gem the lock pins as platform gems: it is vendored from the
+/// prebuilds the service's package reference lists
+/// ([`stage_platform_prebuilds`]), and the ruby gem is never downloaded.
 pub(crate) async fn service_preflight(
     purl: &str,
     installed_path: &Path,
@@ -910,14 +977,7 @@ pub(crate) async fn service_preflight(
         true => !prelude.copy_ok,
         false => gem_edits(purl, &prelude).is_ok(),
     };
-    asks.then(|| {
-        let archive = crate::api::client::PlannedDownload::archive(record.uuid.clone());
-        if !prelude.platforms.is_empty() {
-            // `gem_platform_service_copy` takes the prebuilds the service's
-            // answer lists: nothing of the ruby gem that comes with that
-            // answer is extracted, and its stub is not fetched.
-            return archive;
-        }
+    (asks && prelude.platforms.is_empty()).then(|| {
         // `gem_service_copy` fetches the stub gemspec right after the `.gem`,
         // and extracts the `.gem`'s data.tar.gz into the copy dir's stage.
         crate::api::client::PlannedDownload {
@@ -927,7 +987,7 @@ pub(crate) async fn service_preflight(
                 &prelude.copy_dir,
                 extract_gem_data,
             )),
-            ..archive
+            ..crate::api::client::PlannedDownload::archive(record.uuid.clone())
         }
     })
 }
@@ -976,10 +1036,26 @@ pub async fn vendor_gem<'a>(
     // originals.
     if lock_wired {
         if copy_ok {
+            // The uuid dir's `.gitignore` / `.gitattributes` are not part
+            // of the copy: one that was deleted (or never written) is put
+            // back, or a project `*.so` rule drops the binaries from the
+            // next commit.
+            let mut warnings: Vec<VendorWarning> = Vec::new();
+            if !platforms.is_empty() && !dry_run {
+                if let Err(e) = restore_uuid_metadata(uuid_dir).await {
+                    warnings.push(VendorWarning::new(
+                        super::npm_dir::GITIGNORE_UNCHECKED,
+                        super::npm_dir::gitignore_unchecked_detail(
+                            copy_rel,
+                            &format!("cannot write the vendored dir's git metadata: {e}"),
+                        ),
+                    ));
+                }
+            }
             return done(
                 already_patched_result(purl, copy_dir, &record.files),
                 None,
-                Vec::new(),
+                warnings,
             );
         }
         // Wired (Gemfile + lock + CHECKSUMS) but the committed copy is
@@ -1010,7 +1086,7 @@ pub async fn vendor_gem<'a>(
             .await
             {
                 Ok(result) => result,
-                Err(outcome) => return *outcome,
+                Err(outcome) => return rebuild_needs_every_prebuild(*outcome),
             };
             if !result.success {
                 return done(result, None, warnings);
@@ -1056,7 +1132,10 @@ pub async fn vendor_gem<'a>(
             platforms => preview_platform_prebuilds(service, record, name, platforms).await,
         };
         if let Err(outcome) = previewed {
-            return *outcome;
+            return match lock_wired {
+                true => rebuild_needs_every_prebuild(*outcome),
+                false => *outcome,
+            };
         }
         return done(
             super::common::preview_result(purl, copy_dir, &record.files),
@@ -1279,6 +1358,23 @@ pub async fn vendor_gem<'a>(
     done(result, Some(entry), warnings)
 }
 
+/// The outcome of rebuilding a copy the lock is ALREADY wired to when the
+/// service lists no prebuild for one of its platforms. For a gem that is
+/// not vendored yet that is a skip
+/// ([`super::VENDOR_PREBUILT_PLATFORM_PENDING`]): nothing depends on the
+/// copy. Here the lock names a tree that is missing or damaged, and no
+/// older patch stands in for it, so it is the plain miss, a failure.
+fn rebuild_needs_every_prebuild(outcome: VendorOutcome) -> VendorOutcome {
+    match outcome {
+        VendorOutcome::Refused { code, detail }
+            if code == super::VENDOR_PREBUILT_PLATFORM_PENDING =>
+        {
+            refused(super::VENDOR_PREBUILT_REQUIRED, detail)
+        }
+        other => other,
+    }
+}
+
 /// The ledger entry for a vendored gem copy: `wiring` is the Gemfile + lock
 /// records on a full vendor, empty on an artifact-only rebuild (see the hot
 /// path). `platforms` are the platform trees of a copy vendored as platform
@@ -1473,19 +1569,30 @@ fn refuse_unusable_stub(
 pub(crate) const GEM_PLATFORM_ARTIFACT_KIND: &str = "gem-platform";
 pub(crate) const GEM_PLATFORM_STUB_ARTIFACT_KIND: &str = "gem-platform-stub-gemspec";
 
+/// How many platforms' prebuilds (a platform gem and its stub gemspec
+/// each) are downloaded at once.
+const PREBUILD_DOWNLOADS_AT_ONCE: usize = 4;
+
 /// Download and verify the prebuild of each of `platforms` and its stub
 /// gemspec, and unpack them into `stage`: `<stage>/<platform>/` holds the
 /// platform gem's files and `<name>.gemspec` (see the module docs).
-/// Refused before `stage` is created unless the service lists both
-/// artifacts for EVERY platform; a later failure leaves a partial `stage`
-/// for the caller to remove. Returns the advisory naming the download.
+///
+/// Which prebuilds exist is read off the service's package reference
+/// alone; the ruby gem that reference also names is never downloaded
+/// (bundler would have to build its extensions). While the service lists
+/// no prebuild, or no stub, for one of `platforms`, nothing is downloaded
+/// and the gem is skipped ([`super::VENDOR_PREBUILT_PLATFORM_PENDING`]). A
+/// later failure leaves a partial `stage` for the caller to remove.
+/// Returns the run's advisories: the download, and the ignore files that
+/// were emptied.
 async fn stage_platform_prebuilds(
     cfg: &VendorServiceConfig,
     record: &PatchRecord,
     name: &str,
     platforms: &[String],
     stage: &Path,
-) -> Result<VendorWarning, Box<VendorOutcome>> {
+) -> Result<Vec<VendorWarning>, Box<VendorOutcome>> {
+    use futures_util::StreamExt as _;
     let policy = ServicePolicy::Refused;
     // SECURITY: a platform names a directory under the stage, and the
     // ledger a restore reads them from is committed, tamper-able data.
@@ -1495,19 +1602,19 @@ async fn stage_platform_prebuilds(
             format!("unsafe gem platform `{platform}` for `{name}`"),
         ));
     }
-    // The service's answer for the patch lists its prebuilds beside the
-    // ruby gem, which is downloaded and verified with it and not used
-    // here: bundler would have to build its extensions.
-    let fetched = fetch_verified_archive(cfg, &record.uuid).await;
-    let archive = policy.settle(fetched, ".gem", &format!(".gem for {name}"))?;
+    let listed = fetch_served_artifacts(cfg, &record.uuid).await;
+    let served = policy.settle(listed, "platform gem", &format!("platform gems for {name}"))?;
 
-    let served = |kind: &str, platform: &str| archive.platform_secondary(kind, platform);
     let missing: Vec<&str> = platforms
         .iter()
         .map(String::as_str)
         .filter(|platform| {
-            served(GEM_PLATFORM_ARTIFACT_KIND, platform).is_none()
-                || served(GEM_PLATFORM_STUB_ARTIFACT_KIND, platform).is_none()
+            served
+                .platform(GEM_PLATFORM_ARTIFACT_KIND, platform)
+                .is_none()
+                || served
+                    .platform(GEM_PLATFORM_STUB_ARTIFACT_KIND, platform)
+                    .is_none()
         })
         .collect();
     if !missing.is_empty() {
@@ -1527,37 +1634,50 @@ async fn stage_platform_prebuilds(
             [] => "it has none of the locked platforms".to_string(),
             built => format!("it has {}", quoted(built)),
         };
-        return Err(policy.hard(
-            "platform_gem_unsupported",
+        // Not a failure: a prebuild is listed only once it is built, so
+        // this is as likely "not yet" as "never", and nothing was touched.
+        return Err(Box::new(refused(
+            super::VENDOR_PREBUILT_PLATFORM_PENDING,
             format!(
-                "{GEMFILE_LOCK} locks `{name}` as precompiled platform gems, and the patch \
-                 service has no patched build of it for {} ({built}); bundler never builds a \
-                 `path:` gem's extensions, so every locked platform needs a prebuilt one",
+                "the patch service has no prebuilt platform gem of `{name}` for {} yet \
+                 ({built}); {GEMFILE_LOCK} locks {name} as precompiled platform gems and bundler \
+                 never builds a `path:` gem's extensions, so the patch is not vendored until \
+                 every locked platform has one",
                 quoted(&missing)
             ),
-        ));
+        )));
     }
 
-    for platform in platforms {
-        let subject = format!("{name} ({platform})");
-        let gem = platform_artifact(
-            cfg,
-            &archive,
-            GEM_PLATFORM_ARTIFACT_KIND,
-            platform,
-            "platform gem",
-            &subject,
-        )
-        .await?;
-        let stub = platform_artifact(
-            cfg,
-            &archive,
-            GEM_PLATFORM_STUB_ARTIFACT_KIND,
-            platform,
-            "stub gemspec",
-            &subject,
-        )
-        .await?;
+    // The prebuilds, a few platforms at a time and taken in lock order.
+    let served = &served;
+    let mut downloads = std::pin::pin!(futures_util::stream::iter(platforms)
+        .map(|platform| async move {
+            let subject = format!("{name} ({platform})");
+            let gem = platform_artifact(
+                cfg,
+                served,
+                GEM_PLATFORM_ARTIFACT_KIND,
+                platform,
+                "platform gem",
+                &subject,
+            )
+            .await?;
+            let stub = platform_artifact(
+                cfg,
+                served,
+                GEM_PLATFORM_STUB_ARTIFACT_KIND,
+                platform,
+                "stub gemspec",
+                &subject,
+            )
+            .await?;
+            Ok::<_, Box<VendorOutcome>>((platform, subject, gem, stub))
+        })
+        .buffered(PREBUILD_DOWNLOADS_AT_ONCE));
+
+    let mut emptied: Vec<String> = Vec::new();
+    while let Some(downloaded) = downloads.next().await {
+        let (platform, subject, gem, stub) = downloaded?;
         refuse_unusable_stub(policy, name, &subject, &String::from_utf8_lossy(&stub))?;
 
         let tree = stage.join(platform);
@@ -1573,23 +1693,113 @@ async fn stage_platform_prebuilds(
                 format!("cannot extract the prebuilt platform gem for {subject}: {e}"),
             ));
         }
+        match empty_shipped_gitignores(&tree, &record.files).await {
+            Ok(files) => emptied.extend(files.into_iter().map(|file| format!("{platform}/{file}"))),
+            Err(e) => {
+                return Err(policy.hard(
+                    "vendor_prebuilt_write_failed",
+                    format!("cannot empty a `.gitignore` the prebuilt platform gem for {subject} ships: {e}"),
+                ));
+            }
+        }
         if let Err(e) = tokio::fs::write(tree.join(format!("{name}.gemspec")), &stub).await {
             return Err(policy.hard(
                 "vendor_prebuilt_write_failed",
                 format!("cannot write the stub gemspec for {subject} into the vendored dir: {e}"),
             ));
         }
-        if !platform_tree_carries_patch(&tree, &record.files).await {
+        if let Err(reason) = super::verify::verify_platform_tree(&tree, &record.files, None).await {
+            let why = match reason.as_str() {
+                "vendor_hash_mismatch" => "a patched file it ships is not the patched one",
+                _ => "it ships none of the patched files, so nothing shows it carries the patch",
+            };
             return Err(policy.miss(format!(
-                "prebuilt platform gem for {subject} does not carry the patch (a patched \
-                 file it ships is not the patched one)"
+                "prebuilt platform gem for {subject} does not carry the patch ({why})"
             )));
         }
     }
-    Ok(archive.downloaded_warning(format_args!(
-        "{name} as prebuilt platform gems ({})",
-        platforms.join(", ")
-    )))
+
+    let source_url = platforms
+        .first()
+        .and_then(|platform| served.platform(GEM_PLATFORM_ARTIFACT_KIND, platform))
+        .map(|artifact| artifact.url.as_str())
+        .unwrap_or_default();
+    let mut warnings = vec![downloaded_warning(
+        format_args!(
+            "{name} as prebuilt platform gems ({})",
+            platforms.join(", ")
+        ),
+        source_url,
+    )];
+    if !emptied.is_empty() {
+        warnings.push(VendorWarning::new(
+            GITIGNORE_NEUTRALIZED,
+            format!(
+                "{name}: the prebuilt platform gems ship their own `.gitignore` ({}), whose \
+                 rules would keep git from committing files of the vendored trees; emptied in \
+                 the vendored copy (commit it)",
+                super::npm_dir::summarize_rules(&emptied)
+            ),
+        ));
+    }
+    Ok(warnings)
+}
+
+/// The advisory of [`empty_shipped_gitignores`]: the vendored trees differ
+/// from the prebuilds in the ignore files named.
+const GITIGNORE_NEUTRALIZED: &str = "vendor_gem_gitignore_neutralized";
+
+/// Empty every `.gitignore` a prebuild ships inside `tree`. Git reads one
+/// at any depth, and for the files below it its rules win over the uuid
+/// dir's `!*`: a `*.so` rule the gem's own repository used would leave the
+/// binary out of the commit, with no rule of the project's to remove. The
+/// file stays, empty, so the tree keeps the gem's file list — the way the
+/// Composer backend neutralises the filters of a mirrored copy. Done while
+/// the tree is staged, so the ledger's inventory and `repair`'s restore
+/// see the same bytes.
+///
+/// A `.gitignore` the patch itself rewrites is left as the patch has it
+/// (its hash is the record's); what it ignores is then for
+/// [`keep_platform_trees_committable`] to refuse. Returns the paths
+/// emptied, relative to `tree`.
+async fn empty_shipped_gitignores(
+    tree: &Path,
+    files: &HashMap<String, PatchFileInfo>,
+) -> std::io::Result<Vec<String>> {
+    let root = tree.to_path_buf();
+    let shipped = tokio::task::spawn_blocking(move || {
+        let mut shipped: Vec<(PathBuf, String)> = Vec::new();
+        // Links are not followed (and none is extracted): only the
+        // regular files of the tree itself.
+        for entry in walkdir::WalkDir::new(&root).sort_by_file_name() {
+            let entry = entry?;
+            if entry.file_name() != ".gitignore"
+                || !entry.file_type().is_file()
+                || entry.metadata()?.len() == 0
+            {
+                continue;
+            }
+            let rel = entry
+                .path()
+                .strip_prefix(&root)
+                .map_err(std::io::Error::other)?
+                .to_string_lossy()
+                .replace('\\', "/");
+            shipped.push((entry.into_path(), rel));
+        }
+        Ok::<_, std::io::Error>(shipped)
+    })
+    .await
+    .map_err(std::io::Error::other)??;
+    let mut emptied = Vec::new();
+    for (path, rel) in shipped {
+        if files.keys().any(|key| normalize_file_path(key) == rel) {
+            continue;
+        }
+        atomic_write_bytes_preserving_mode(&path, b"").await?;
+        emptied.push(rel);
+    }
+    Ok(emptied)
 }
 
 /// One per-platform artifact of `kind` (`what`, for messages about
@@ -1597,14 +1807,14 @@ async fn stage_platform_prebuilds(
 /// the ruby gem's stub: a mismatch is never vendored.
 async fn platform_artifact(
     cfg: &VendorServiceConfig,
-    archive: &super::service_fetch::VerifiedArchive,
+    served: &ServedArtifacts,
     kind: &str,
     platform: &str,
     what: &str,
     subject: &str,
 ) -> Result<Vec<u8>, Box<VendorOutcome>> {
     let policy = ServicePolicy::Refused;
-    match fetch_verified_platform_secondary(cfg, archive, kind, platform).await {
+    match fetch_verified_platform_secondary(cfg, served, kind, platform).await {
         SecondaryArtifactResult::Ready(bytes) => Ok(bytes),
         SecondaryArtifactResult::Absent => {
             Err(policy.miss(format!("the patch service served no {what} for {subject}")))
@@ -1625,7 +1835,9 @@ async fn platform_artifact(
 /// [`gem_service_copy`] for a gem the lock pins as platform gems: the copy
 /// is the verified prebuild of each of `platforms`, staged in full and then
 /// swapped into place, so a failure leaves any pre-existing (possibly
-/// live-wired) copy untouched and no husk behind.
+/// live-wired) copy untouched and no husk behind. The uuid dir's git
+/// metadata is the caller's to write ([`restore_uuid_metadata`]):
+/// `copy_dir` may itself sit in a stage (`repair`'s restore).
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn gem_platform_service_copy(
     service: Option<&VendorServiceConfig>,
@@ -1642,8 +1854,8 @@ pub(super) async fn gem_platform_service_copy(
         .ok_or_else(|| Box::new(super::service_fetch::required()))?;
     let stage = stage_dir_for(copy_dir);
     let _ = remove_tree(&stage).await;
-    let downloaded = match stage_platform_prebuilds(cfg, record, name, platforms, &stage).await {
-        Ok(downloaded) => downloaded,
+    let staged = match stage_platform_prebuilds(cfg, record, name, platforms, &stage).await {
+        Ok(staged) => staged,
         Err(outcome) => {
             cleanup_failed_stage(&stage, uuid_dir, unwind_uuid_dir).await;
             return Err(outcome);
@@ -1656,14 +1868,7 @@ pub(super) async fn gem_platform_service_copy(
             format!("cannot move the extracted platform gems into place: {e}"),
         ));
     }
-    if let Err(e) = write_uuid_gitignore(uuid_dir).await {
-        if unwind_uuid_dir {
-            let _ = remove_tree(uuid_dir).await;
-            prune_empty_vendor_levels(uuid_dir).await;
-        }
-        return Err(ServicePolicy::Refused.hard("vendor_prebuilt_write_failed", e));
-    }
-    warnings.push(downloaded);
+    warnings.extend(staged);
     Ok(())
 }
 
@@ -1674,28 +1879,23 @@ pub(super) async fn gem_platform_service_copy(
 /// gem vendored as its own tree is source files and gets none.
 const UUID_GITIGNORE: &str = "!*\n";
 
-/// Write `<uuid>/.gitignore` ([`UUID_GITIGNORE`]) unless it already holds
-/// it, in either line ending (a `core.autocrlf` checkout spells it CRLF,
-/// and rewriting that would dirty the tree on every re-vendor).
-async fn write_uuid_gitignore(uuid_dir: &Path) -> Result<(), String> {
-    let path = uuid_dir.join(".gitignore");
-    if read_regular_to_string(&path)
-        .await
-        .is_ok_and(|text| text.replace("\r\n", "\n") == UUID_GITIGNORE)
-    {
-        return Ok(());
-    }
-    crate::utils::fs::atomic_write_bytes(&path, UUID_GITIGNORE.as_bytes())
-        .await
-        .map_err(|e| format!("cannot write {}: {e}", path.display()))
+/// Rewrite `<uuid>/.gitignore` ([`UUID_GITIGNORE`]) and
+/// `<uuid>/.gitattributes` of a gem vendored as platform gems when absent
+/// or different, with the writer every backend that commits binaries
+/// shares: the attributes keep a project rule such as `*.so filter=lfs`,
+/// or an EOL conversion, from changing the bytes git commits. Neither file
+/// is part of the copy, so writing them is no rebuild. `true` when either
+/// was rewritten.
+pub(crate) async fn restore_uuid_metadata(uuid_dir: &Path) -> std::io::Result<bool> {
+    super::npm_dir::write_uuid_metadata(uuid_dir, UUID_GITIGNORE).await
 }
 
 /// Ask git whether it would commit every file of the platform trees just
-/// written (`inventory`: the copy's files) and the uuid dir's `.gitignore`.
-/// A rule the `.gitignore` cannot override (one that ignores a directory
-/// above it) refuses `vendor_artifact_gitignored`, and the caller unwinds;
-/// git failing to answer is only a warning. Nothing is asked without an
-/// inventory, whose absence is already reported.
+/// written (`inventory`: the copy's files) and the uuid dir's `.gitignore`
+/// and `.gitattributes`. A rule the `.gitignore` cannot override refuses
+/// `vendor_artifact_gitignored`, and the caller unwinds; git failing to
+/// answer is only a warning. Nothing is asked without an inventory, whose
+/// absence is already reported.
 async fn keep_platform_trees_committable(
     project_root: &Path,
     copy_rel: &str,
@@ -1711,6 +1911,7 @@ async fn keep_platform_trees_committable(
         .collect();
     if let Some((uuid_dir_rel, _)) = copy_rel.rsplit_once('/') {
         paths.push(format!("{uuid_dir_rel}/.gitignore"));
+        paths.push(format!("{uuid_dir_rel}/.gitattributes"));
     }
     match super::npm_dir::gitignore_probe(project_root, &paths).await {
         Ok(Some(rules)) => Err(refused(
@@ -1752,7 +1953,8 @@ async fn preview_platform_prebuilds(
 
 /// Acquire a verified service copy without replacing the prior copy on
 /// failure: the gem's own tree, or one prebuild tree per platform in
-/// `platforms` when the lock pins the gem as platform gems.
+/// `platforms` when the lock pins the gem as platform gems (with the uuid
+/// dir's git metadata, see [`restore_uuid_metadata`]).
 #[allow(clippy::too_many_arguments)]
 async fn materialise_patched_copy(
     purl: &str,
@@ -1789,7 +1991,20 @@ async fn materialise_patched_copy(
                 unwind_uuid_dir,
                 warnings,
             )
-            .await?
+            .await?;
+            if let Err(e) = restore_uuid_metadata(uuid_dir).await {
+                if unwind_uuid_dir {
+                    let _ = remove_tree(uuid_dir).await;
+                    prune_empty_vendor_levels(uuid_dir).await;
+                }
+                return Err(ServicePolicy::Refused.hard(
+                    "vendor_prebuilt_write_failed",
+                    format!(
+                        "cannot write the git metadata of {}: {e}",
+                        uuid_dir.display()
+                    ),
+                ));
+            }
         }
     }
     Ok(already_patched_result(purl, copy_dir, &record.files))
@@ -11660,11 +11875,14 @@ mod tests {
             }
         }
 
-        /// Every locked platform needs a prebuild and its stub: with one
-        /// missing, a dry run and a wet run both refuse, name the platform,
-        /// and write nothing.
+        /// Every locked platform needs a prebuild and its stub. While the
+        /// service lists none for one of them (it lists a prebuild only once
+        /// built), a dry run and a wet run both leave the gem alone under
+        /// the benign pending code: they name the gem and the platforms,
+        /// ask the service for the package reference and nothing else, and
+        /// write nothing.
         #[tokio::test]
-        async fn a_locked_platform_without_a_prebuild_is_refused_with_nothing_written() {
+        async fn a_locked_platform_without_a_prebuild_is_a_skip_that_downloads_nothing() {
             let no_stub = || Served {
                 stub: None,
                 ..served(LINUX)
@@ -11672,32 +11890,111 @@ mod tests {
             let cases: [(Vec<Served>, Vec<&str>); 3] = [
                 (
                     Vec::new(),
-                    vec!["`arm64-darwin`, `x86_64-linux-gnu`", "none"],
+                    vec![
+                        "of `nokogiri` for `arm64-darwin`, `x86_64-linux-gnu` yet",
+                        "none of the locked platforms",
+                    ],
                 ),
                 (
                     vec![served(DARWIN)],
-                    vec!["for `x86_64-linux-gnu` (it has `arm64-darwin`)"],
+                    vec!["for `x86_64-linux-gnu` yet (it has `arm64-darwin`)"],
                 ),
                 (
                     vec![served(DARWIN), no_stub()],
-                    vec!["for `x86_64-linux-gnu` ("],
+                    vec!["for `x86_64-linux-gnu` yet ("],
                 ),
             ];
             for (prebuilds, expected) in cases {
                 let (_tmp, root, record) = project(&lock(Some(&checksums(&sha('a'), "")))).await;
                 let before = ts::tree_snapshot(&root);
-                let (_server, cfg) = service(UUID, &prebuilds).await;
+                let (server, cfg) = service(UUID, &prebuilds).await;
+                for dry_run in [true, false] {
+                    let asked = ts::request_count(&server).await;
+                    let (code, detail) = unwrap_refused(
+                        vendor(&root, &not_installed(&root), &record, &cfg, dry_run).await,
+                    );
+                    assert_eq!(code, "vendor_prebuilt_platform_pending", "{detail}");
+                    assert!(crate::vendor::is_unserved(code));
+                    assert!(crate::vendor::refusals::refusal_is_benign(code));
+                    for text in &expected {
+                        assert!(detail.contains(text), "{detail}");
+                    }
+                    assert_eq!(ts::tree_snapshot(&root), before, "dry_run={dry_run}");
+                    assert_eq!(
+                        ts::request_count(&server).await,
+                        asked + 1,
+                        "the package reference is the one request: no gem is downloaded"
+                    );
+                }
+            }
+        }
+
+        /// A copy the lock is ALREADY wired to cannot wait for a prebuild.
+        /// When one of its trees is lost and the service does not list that
+        /// platform, the rebuild is the plain miss, a failure, dry run or
+        /// not, and what is left of the copy stays as it was.
+        #[tokio::test]
+        async fn a_wired_copy_that_cannot_be_rebuilt_fails_instead_of_skipping() {
+            let (_tmp, root, record) = project(&lock(None)).await;
+            let (_server, cfg) = service(UUID, &[served(DARWIN), served(LINUX)]).await;
+            vendor_and_persist(&root, &record, &cfg).await;
+            tokio::fs::remove_dir_all(root.join(rel(UUID)).join(LINUX))
+                .await
+                .unwrap();
+            let before = ts::tree_snapshot(&root);
+            let (_server, cfg) = service(UUID, &[served(DARWIN)]).await;
+            for dry_run in [true, false] {
+                let (code, detail) = unwrap_refused(
+                    vendor(&root, &not_installed(&root), &record, &cfg, dry_run).await,
+                );
+                assert_eq!(code, "vendor_prebuilt_required", "{detail}");
+                assert!(detail.contains("for `x86_64-linux-gnu` yet"), "{detail}");
+                assert_eq!(ts::tree_snapshot(&root), before, "dry_run={dry_run}");
+            }
+        }
+
+        /// The layout is wired only for a lock written by a bundler it was
+        /// run against: a lock that names an older one, or none, is refused
+        /// by the version it needs, from the lock alone (so before a
+        /// takeover too), with the service not asked and nothing written.
+        #[tokio::test]
+        async fn a_lock_from_a_bundler_older_than_the_layout_is_verified_on_is_refused() {
+            for (bundled_with, says) in [
+                ("BUNDLED WITH\n   2.2.33\n", "was written by Bundler 2.2.33"),
+                ("BUNDLED WITH\n   1.17.3\n", "was written by Bundler 1.17.3"),
+                ("", "does not say which Bundler wrote it"),
+            ] {
+                let old = lock(None).replace("BUNDLED WITH\n   2.5.22\n", bundled_with);
+                let (_tmp, root, record) = project(&old).await;
+                let before = ts::tree_snapshot(&root);
+                let (server, cfg) = service(UUID, &[served(DARWIN), served(LINUX)]).await;
                 for dry_run in [true, false] {
                     let (code, detail) = unwrap_refused(
                         vendor(&root, &not_installed(&root), &record, &cfg, dry_run).await,
                     );
                     assert_eq!(code, "platform_gem_unsupported", "{detail}");
-                    for text in &expected {
-                        assert!(detail.contains(text), "{detail}");
-                    }
-                    assert_eq!(ts::tree_snapshot(&root), before, "dry_run={dry_run}");
+                    assert!(detail.contains(says), "{detail}");
+                    assert!(detail.contains("needs Bundler 2.3 or later"), "{detail}");
                 }
+                assert_eq!(ts::tree_snapshot(&root), before);
+                assert_eq!(ts::request_count(&server).await, 0);
+                let early = gem_platform_lock_refusals(&root, &[NOKO]).await;
+                assert_eq!(early.len(), 1, "{early:?}");
+                assert_eq!(early[0].1 .0, "platform_gem_unsupported");
             }
+            // The floor itself, and a gem the lock does not pin as platform
+            // gems, whatever bundler wrote it.
+            let floor = lock(None).replace("   2.5.22\n", "   2.3.0\n");
+            let (_tmp, root, record) = project(&floor).await;
+            let (_server, cfg) = service(UUID, &[served(DARWIN), served(LINUX)]).await;
+            let (result, ..) =
+                unwrap_done(vendor(&root, &not_installed(&root), &record, &cfg, false).await);
+            assert!(result.success, "{:?}", result.error);
+            let locked = LockedGem {
+                plain: true,
+                platforms: Vec::new(),
+            };
+            assert!(platform_lock_refusal("rack", "3.2.6", &locked, "").is_none());
         }
 
         /// A plain `name (version)` entry beside the platform ones is the
@@ -11780,8 +12077,9 @@ mod tests {
 
         /// The installed copy of a platform-locked gem is a platform gem dir
         /// (`gems/nokogiri-1.18.10-arm64-darwin`): it vendors, from the
-        /// prebuilds and not from that dir. One plain archive download is
-        /// planned: no stub of the ruby gem, nothing staged from it.
+        /// prebuilds and not from that dir. No archive download is planned
+        /// and the ruby gem is never downloaded: the package reference
+        /// names the prebuilds, and they are all that is fetched.
         #[tokio::test]
         async fn an_installed_platform_gem_dir_vendors_from_the_prebuilds() {
             let (tmp, root, record) = project(&lock(None)).await;
@@ -11796,15 +12094,31 @@ mod tests {
                 .unwrap();
             assert_eq!(
                 service_preflight(NOKO, &installed, &root, &record).await,
-                Some(crate::api::client::PlannedDownload::archive(
-                    UUID.to_string()
-                ))
+                None
             );
-            let (_server, cfg) = service(UUID, &[served(DARWIN), served(LINUX)]).await;
+            let (server, cfg) = service(UUID, &[served(DARWIN), served(LINUX)]).await;
             let (result, entry, _) =
                 unwrap_done(vendor(&root, &installed, &record, &cfg, false).await);
             assert!(result.success, "{:?}", result.error);
             assert_eq!(entry.unwrap().gem_platforms, [DARWIN, LINUX]);
+            let asked: Vec<String> = server
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .iter()
+                .map(|request| request.url.path().to_string())
+                .collect();
+            assert!(
+                !asked
+                    .iter()
+                    .any(|path| path.ends_with("/nokogiri-1.18.10.gem")),
+                "the ruby gem is not downloaded: {asked:?}"
+            );
+            assert_eq!(
+                asked.len(),
+                5,
+                "the package reference, then a platform gem and its stub per platform: {asked:?}"
+            );
             assert_eq!(
                 tokio::fs::read(root.join(rel(UUID)).join(LINUX).join(RB))
                     .await
@@ -11890,20 +12204,33 @@ mod tests {
 
         /// A patch of a source the platform gem never shipped (it ships the
         /// compiled extension) vendors: the prebuild carries the patched
-        /// files it does ship. The copy then verifies against the ledger's
-        /// inventory, which pins every tree; an entry with no inventory has
-        /// nothing to vouch for the missing member with.
+        /// files it does ship. One rule then judges a tree wherever it is
+        /// judged (the download, a re-run's in-sync test, the check): a
+        /// patched file it holds is the patched one; one it lacks is
+        /// accepted unless the ledger's inventory says it was vendored; and
+        /// a tree holding none of them never passes.
         #[tokio::test]
         async fn a_patch_of_unshipped_sources_vendors_and_verifies_by_inventory() {
+            const EXTRA: &str = "lib/nokogiri/extra.rb";
+            const EXTRA_PATCHED: &[u8] = b"# extra, patched\n";
+            let with_extra = |platform: &'static str| Served {
+                gem: Some(make_gem(&[
+                    (RB, RB_PATCHED),
+                    (EXTRA, EXTRA_PATCHED),
+                    (SO, platform.as_bytes()),
+                ])),
+                ..served(platform)
+            };
             let (_tmp, root, _) = project(&lock(None)).await;
             let record = record(
                 UUID,
                 &[
                     (RB, RB_PRISTINE, RB_PATCHED),
+                    (EXTRA, &b"# extra\n"[..], EXTRA_PATCHED),
                     (C, &b"pristine C\n"[..], &b"patched C\n"[..]),
                 ],
             );
-            let (_server, cfg) = service(UUID, &[served(DARWIN), served(LINUX)]).await;
+            let (_server, cfg) = service(UUID, &[with_extra(DARWIN), with_extra(LINUX)]).await;
             let entry = vendor_and_persist(&root, &record, &cfg).await;
             let tree = root.join(rel(UUID)).join(LINUX);
             assert!(!tree.join(C).exists());
@@ -11915,25 +12242,54 @@ mod tests {
                 reason: reason.to_string(),
             };
 
-            // No inventory: the missing member is not vouched for. The same
-            // holds for an entry synthesized from the lock (no platforms
-            // either), which reads the trees off the artifact.
+            // No inventory says which files were vendored: the unshipped
+            // source is accepted, also for an entry synthesized from the
+            // lock (no platforms either), which reads the trees off the
+            // artifact.
             let mut bare = entry.clone();
             bare.artifact.file_inventory = None;
             assert_eq!(
                 check_vendored_artifact(&root, &bare, &record).await,
-                corrupt("file_not_found")
+                ArtifactHealth::Healthy
             );
             bare.gem_platforms.clear();
             assert_eq!(
                 check_vendored_artifact(&root, &bare, &record).await,
+                ArtifactHealth::Healthy
+            );
+            // A tree holding none of the patched files shows nothing of the
+            // patch, inventory or not.
+            let unshipped = record_of(&record, &[C]);
+            for entry in [&entry, &bare] {
+                assert_eq!(
+                    check_vendored_artifact(&root, entry, &unshipped).await,
+                    corrupt("file_not_found")
+                );
+            }
+
+            // A patched file the inventory lists and the tree no longer
+            // holds was vendored and then lost. The check says so, and the
+            // next run rebuilds the copy instead of calling it in sync.
+            tokio::fs::remove_file(tree.join(EXTRA)).await.unwrap();
+            assert_eq!(
+                check_vendored_artifact(&root, &entry, &record).await,
                 corrupt("file_not_found")
             );
-            let shipped = record_of_shipped(&record);
+            let (result, rebuilt, warnings) =
+                unwrap_done(vendor(&root, &not_installed(&root), &record, &cfg, false).await);
+            assert!(result.success, "{:?}", result.error);
+            assert!(
+                warnings.iter().any(|w| w.code == "vendor_artifact_rebuilt"),
+                "{warnings:?}"
+            );
+            assert!(rebuilt.is_some(), "a refreshed entry");
             assert_eq!(
-                check_vendored_artifact(&root, &bare, &shipped).await,
-                ArtifactHealth::Healthy,
-                "every member present: the synthesized entry verifies both trees"
+                tokio::fs::read(tree.join(EXTRA)).await.unwrap(),
+                EXTRA_PATCHED
+            );
+            assert_eq!(
+                check_vendored_artifact(&root, &entry, &record).await,
+                ArtifactHealth::Healthy
             );
 
             // Drift in ONE platform's tree fails the whole copy.
@@ -11947,7 +12303,7 @@ mod tests {
             tokio::fs::write(tree.join(RB), RB_PRISTINE).await.unwrap();
             for entry in [&entry, &bare] {
                 assert_eq!(
-                    check_vendored_artifact(&root, entry, &shipped).await,
+                    check_vendored_artifact(&root, entry, &record).await,
                     corrupt("vendor_hash_mismatch")
                 );
             }
@@ -11963,11 +12319,32 @@ mod tests {
             );
         }
 
-        /// `record` less the files no prebuild ships.
-        fn record_of_shipped(record: &PatchRecord) -> PatchRecord {
-            let mut shipped = record.clone();
-            shipped.files.remove(C);
-            shipped
+        /// A prebuild that ships none of the patch's files shows nothing of
+        /// the patch: it is not vendored, dry run or not.
+        #[tokio::test]
+        async fn a_prebuild_holding_none_of_the_patched_files_is_refused() {
+            let (_tmp, root, _) = project(&lock(None)).await;
+            let record = record(UUID, &[(C, &b"pristine C\n"[..], &b"patched C\n"[..])]);
+            let before = ts::tree_snapshot(&root);
+            let (_server, cfg) = service(UUID, &[served(DARWIN), served(LINUX)]).await;
+            for dry_run in [true, false] {
+                let (code, detail) = unwrap_refused(
+                    vendor(&root, &not_installed(&root), &record, &cfg, dry_run).await,
+                );
+                assert_eq!(code, "vendor_prebuilt_required", "{detail}");
+                assert!(
+                    detail.contains("ships none of the patched files"),
+                    "{detail}"
+                );
+                assert_eq!(ts::tree_snapshot(&root), before, "dry_run={dry_run}");
+            }
+        }
+
+        /// `record` with only `files`.
+        fn record_of(record: &PatchRecord, files: &[&str]) -> PatchRecord {
+            let mut only = record.clone();
+            only.files.retain(|file, _| files.contains(&file.as_str()));
+            only
         }
 
         /// A wired copy that lost one platform's tree is rebuilt in full by
@@ -11976,7 +12353,7 @@ mod tests {
         #[tokio::test]
         async fn a_lost_platform_tree_is_rebuilt_by_a_rerun_and_by_restore() {
             let (_tmp, root, record) = project(&lock(Some(&checksums(&sha('a'), &sha('b'))))).await;
-            let (_server, cfg) = service(UUID, &[served(DARWIN), served(LINUX)]).await;
+            let (server, cfg) = service(UUID, &[served(DARWIN), served(LINUX)]).await;
             let entry = vendor_and_persist(&root, &record, &cfg).await;
             let tree = root.join(rel(UUID)).join(LINUX);
             let wired = (
@@ -12004,6 +12381,18 @@ mod tests {
                 wired
             );
 
+            // The uuid dir's git metadata is not part of the copy: restore
+            // swaps the copy in from a stage of its own and writes the
+            // metadata where the project keeps it.
+            let uuid_dir = root.join(format!(".socket/vendor/gem/{UUID}"));
+            let metadata = [
+                (".gitignore", "!*\n"),
+                (".gitattributes", crate::vendor::npm_dir::UUID_GITATTRIBUTES),
+            ];
+            for (file, text_of) in metadata {
+                assert_eq!(text(uuid_dir.join(file)).await, text_of, "{file}");
+                tokio::fs::remove_file(uuid_dir.join(file)).await.unwrap();
+            }
             tokio::fs::remove_dir_all(&tree).await.unwrap();
             assert_eq!(
                 check_vendored_artifact(&root, &entry, &record).await,
@@ -12018,6 +12407,29 @@ mod tests {
                 check_vendored_artifact(&root, &entry, &record).await,
                 ArtifactHealth::Healthy
             );
+            for (file, text_of) in metadata {
+                assert_eq!(text(uuid_dir.join(file)).await, text_of, "restore: {file}");
+            }
+
+            // An in-sync re-run puts back metadata that went missing, asks
+            // the service nothing, and leaves a dry run's tree alone.
+            let requests = ts::request_count(&server).await;
+            for (file, _) in metadata {
+                tokio::fs::remove_file(uuid_dir.join(file)).await.unwrap();
+            }
+            let lost = ts::tree_snapshot(&root);
+            let (preview, ..) =
+                unwrap_done(vendor(&root, &not_installed(&root), &record, &cfg, true).await);
+            assert!(preview.success, "{:?}", preview.error);
+            assert_eq!(ts::tree_snapshot(&root), lost, "a dry run writes nothing");
+            let (again, entry_again, warnings) =
+                unwrap_done(vendor(&root, &not_installed(&root), &record, &cfg, false).await);
+            assert!(again.success, "{:?}", again.error);
+            assert!(entry_again.is_none() && warnings.is_empty(), "{warnings:?}");
+            for (file, text_of) in metadata {
+                assert_eq!(text(uuid_dir.join(file)).await, text_of, "re-run: {file}");
+            }
+            assert_eq!(ts::request_count(&server).await, requests);
         }
 
         /// A lock wired to the copy whose CHECKSUMS entry of one platform
@@ -12088,11 +12500,28 @@ mod tests {
             assert!(!root.join(format!(".socket/vendor/gem/{UUID_B}")).exists());
         }
 
-        /// The prebuilt binaries are committable: a project rule that
-        /// ignores them by pattern (`*.so`) is overridden by the uuid dir's
-        /// own `.gitignore`, and a rule nothing under the uuid dir can
-        /// override (one that ignores a directory above it) refuses the
-        /// gem before either project file is written.
+        /// What git says of `path` (project-relative) in the work tree at
+        /// `root`: `git <args> -- <path>`, trimmed.
+        fn git(root: &Path, args: &[&str], path: &str) -> String {
+            let git = crate::utils::process::resolve_tool("git").expect("git");
+            let out = std::process::Command::new(git)
+                .arg("-C")
+                .arg(root)
+                .args(args)
+                .arg("--")
+                .arg(path)
+                .output()
+                .expect("git runs");
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        }
+
+        /// The prebuilt binaries are committable, byte for byte: a project
+        /// rule that ignores them by pattern (`*.so`) is overridden by the
+        /// uuid dir's own `.gitignore`, and a project filter on them (a Git
+        /// LFS rule) by its `.gitattributes`, the pair every backend that
+        /// commits binaries writes. A rule nothing under the uuid dir can
+        /// override (one that ignores a directory above it) refuses the gem
+        /// before anything is downloaded, in a dry run as in a wet one.
         #[tokio::test]
         async fn prebuilt_binaries_git_would_not_commit_are_re_included_or_refused() {
             for (rules, refused_code) in [
@@ -12103,11 +12532,18 @@ mod tests {
                 if ts::git_project(&root, rules).is_none() {
                     return; // no git, nothing to commit
                 }
-                let (_server, cfg) = service(UUID, &[served(DARWIN), served(LINUX)]).await;
-                let outcome = vendor(&root, &not_installed(&root), &record, &cfg, false).await;
+                tokio::fs::write(
+                    root.join(".gitattributes"),
+                    "*.so filter=lfs diff=lfs merge=lfs -text\n",
+                )
+                .await
+                .unwrap();
+                let (server, cfg) = service(UUID, &[served(DARWIN), served(LINUX)]).await;
                 let uuid_dir = root.join(format!(".socket/vendor/gem/{UUID}"));
                 match refused_code {
                     None => {
+                        let outcome =
+                            vendor(&root, &not_installed(&root), &record, &cfg, false).await;
                         let (result, entry, warnings) = unwrap_done(outcome);
                         assert!(result.success, "{:?}", result.error);
                         assert!(entry.is_some());
@@ -12116,22 +12552,139 @@ mod tests {
                             "{warnings:?}"
                         );
                         assert_eq!(text(uuid_dir.join(".gitignore")).await, "!*\n");
+                        assert_eq!(
+                            text(uuid_dir.join(".gitattributes")).await,
+                            crate::vendor::npm_dir::UUID_GITATTRIBUTES
+                        );
                         let binary = format!("{}/{DARWIN}/{SO}", rel(UUID));
                         assert_eq!(
-                            crate::vendor::npm_dir::gitignored(&root, &[binary]).await,
+                            crate::vendor::npm_dir::gitignored(&root, &[binary.clone()]).await,
                             None,
                             "git commits the prebuilt binary"
                         );
+                        assert_eq!(
+                            git(&root, &["check-attr", "filter"], &binary),
+                            format!("{binary}: filter: unset"),
+                            "and commits its bytes, not what the project's LFS filter makes of them"
+                        );
                     }
                     Some(code) => {
-                        let (refused, detail) = unwrap_refused(outcome);
-                        assert_eq!(refused, code, "{detail}");
-                        assert_eq!(text(root.join(GEMFILE)).await, GEMFILE_NOKO);
-                        assert_eq!(text(root.join(GEMFILE_LOCK)).await, lock(None));
+                        let before = ts::tree_snapshot(&root);
+                        for dry_run in [true, false] {
+                            let (refused, detail) = unwrap_refused(
+                                vendor(&root, &not_installed(&root), &record, &cfg, dry_run).await,
+                            );
+                            assert_eq!(refused, code, "dry_run={dry_run}: {detail}");
+                            assert_eq!(ts::tree_snapshot(&root), before, "dry_run={dry_run}");
+                        }
+                        assert_eq!(
+                            ts::request_count(&server).await,
+                            0,
+                            "refused before the service is asked for anything"
+                        );
                         assert!(!root.join(".socket/vendor").exists());
                     }
                 }
             }
+        }
+
+        /// A prebuild that ships a `.gitignore` of its own (its repository's,
+        /// swept into the gem) would hide files from git below the uuid
+        /// dir's `!*`, where no rule of the project's reaches. Each is
+        /// emptied in the copy, at any depth, and reported; the ledger's
+        /// inventory is of the tree as vendored, so the check passes and
+        /// `repair`'s restore reproduces it. One the patch itself rewrites
+        /// keeps the patch's bytes.
+        #[tokio::test]
+        async fn a_gitignore_a_prebuild_ships_is_emptied_in_the_copy() {
+            const NESTED: &str = "lib/nokogiri/.gitignore";
+            const PATCHED_IGNORE: &str = "ext/.gitignore";
+            let shipping = |platform: &'static str| Served {
+                gem: Some(make_gem(&[
+                    (RB, RB_PATCHED),
+                    (SO, platform.as_bytes()),
+                    (".gitignore", &b"*.so\n*.bundle\n"[..]),
+                    (NESTED, &b"nokogiri.so\n"[..]),
+                    (PATCHED_IGNORE, &b"# the patch's own\n"[..]),
+                ])),
+                ..served(platform)
+            };
+            let (_tmp, root, _) = project(&lock(None)).await;
+            let record = record(
+                UUID,
+                &[
+                    (RB, RB_PRISTINE, RB_PATCHED),
+                    (PATCHED_IGNORE, &b"*.o\n"[..], &b"# the patch's own\n"[..]),
+                ],
+            );
+            if ts::git_project(&root, "*.so\n").is_none() {
+                return; // no git, nothing to commit
+            }
+            let (_server, cfg) = service(UUID, &[shipping(DARWIN), shipping(LINUX)]).await;
+            let (result, entry, warnings) =
+                unwrap_done(vendor(&root, &not_installed(&root), &record, &cfg, false).await);
+            assert!(result.success, "{:?}", result.error);
+            let neutralized: Vec<_> = warnings
+                .iter()
+                .filter(|w| w.code == "vendor_gem_gitignore_neutralized")
+                .collect();
+            assert_eq!(neutralized.len(), 1, "{warnings:?}");
+            for file in [
+                format!("{DARWIN}/.gitignore"),
+                format!("{DARWIN}/{NESTED}"),
+                format!("{LINUX}/.gitignore"),
+            ] {
+                assert!(neutralized[0].detail.contains(&file), "{neutralized:?}");
+            }
+            assert!(
+                !neutralized[0].detail.contains(PATCHED_IGNORE),
+                "{neutralized:?}"
+            );
+            ts::persist(&root, NOKO, entry.expect("a ledger entry")).await;
+            let entry = crate::vendor::load_state(&root).await.unwrap().entries[NOKO].clone();
+
+            let copy = root.join(rel(UUID));
+            let emptied = |copy: &Path| {
+                for platform in [DARWIN, LINUX] {
+                    let tree = copy.join(platform);
+                    for file in [".gitignore", NESTED] {
+                        assert_eq!(std::fs::read(tree.join(file)).unwrap(), b"", "{file}");
+                    }
+                    assert_eq!(
+                        std::fs::read(tree.join(PATCHED_IGNORE)).unwrap(),
+                        b"# the patch's own\n"
+                    );
+                }
+            };
+            emptied(&copy);
+            let binary = format!("{}/{LINUX}/{SO}", rel(UUID));
+            assert_eq!(
+                crate::vendor::npm_dir::gitignored(&root, &[binary]).await,
+                None,
+                "git commits the prebuilt binary"
+            );
+            // The inventory is of the tree as vendored: it lists the
+            // emptied files, the check passes, and a second run is in sync.
+            let inventory = entry.artifact.file_inventory.as_ref().expect("inventory");
+            assert!(inventory.contains_key(&format!("{LINUX}/{NESTED}")));
+            assert_eq!(
+                check_vendored_artifact(&root, &entry, &record).await,
+                ArtifactHealth::Healthy
+            );
+            let (again, rerun_entry, _) =
+                unwrap_done(vendor(&root, &not_installed(&root), &record, &cfg, false).await);
+            assert!(again.success && rerun_entry.is_none(), "{:?}", again.error);
+
+            // `repair`'s restore reproduces the same tree from the service.
+            tokio::fs::remove_dir_all(copy.join(LINUX)).await.unwrap();
+            crate::vendor::redownload::restore(&root, &entry, &record, &cfg)
+                .await
+                .expect("restore");
+            emptied(&copy);
+            assert_eq!(
+                check_vendored_artifact(&root, &entry, &record).await,
+                ArtifactHealth::Healthy
+            );
         }
 
         /// A platform names a directory under the vendored dir, and the lock

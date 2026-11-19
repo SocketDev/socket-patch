@@ -90,13 +90,7 @@ impl VerifiedArchive {
     /// it has used these bytes for `subject`. The source URL carries the
     /// org's grant token; [`VendorWarning::new`] quotes it redacted.
     pub(crate) fn downloaded_warning(&self, subject: impl std::fmt::Display) -> VendorWarning {
-        VendorWarning::new(
-            "vendor_prebuilt_downloaded",
-            format!(
-                "vendored {subject} from the patch service ({})",
-                self.source_url
-            ),
-        )
+        downloaded_warning(subject, &self.source_url)
     }
 
     /// Hex sha256 of [`Self::bytes`], digested once on first ask.
@@ -104,23 +98,42 @@ impl VerifiedArchive {
         self.sha256_hex
             .get_or_init(|| crate::utils::digest::sha256_hex_of(&self.bytes))
     }
+}
 
+/// The `vendor_prebuilt_downloaded` advisory for `subject`, vendored from
+/// `source_url` (see [`VerifiedArchive::downloaded_warning`]).
+pub(crate) fn downloaded_warning(
+    subject: impl std::fmt::Display,
+    source_url: &str,
+) -> VendorWarning {
+    VendorWarning::new(
+        "vendor_prebuilt_downloaded",
+        format!("vendored {subject} from the patch service ({source_url})"),
+    )
+}
+
+/// What the patch service lists for a patch besides its archive, learned
+/// from the package reference alone ([`fetch_served_artifacts`]): still
+/// unverified, and nothing of the patch is downloaded yet.
+#[derive(Debug)]
+pub(crate) struct ServedArtifacts(pub Vec<SecondaryArtifact>);
+
+impl ServedArtifacts {
     /// The served artifact of `kind` for the gem platform `platform`, if
     /// the service lists one.
-    pub(crate) fn platform_secondary(
-        &self,
-        kind: &str,
-        platform: &str,
-    ) -> Option<&SecondaryArtifact> {
-        self.secondary
+    pub(crate) fn platform(&self, kind: &str, platform: &str) -> Option<&SecondaryArtifact> {
+        self.0
             .iter()
             .find(|a| a.kind == kind && a.platform.as_deref() == Some(platform))
     }
 }
 
+/// What the service has for a patch: its verified archive
+/// ([`fetch_verified_archive`]), or the list of its other artifacts
+/// ([`fetch_served_artifacts`]).
 #[derive(Debug)]
-pub(crate) enum ServiceArtifact {
-    Ready(VerifiedArchive),
+pub(crate) enum ServiceArtifact<T = VerifiedArchive> {
+    Ready(T),
     /// Archive still building (retryable).
     Pending,
     /// Terminal miss for this input (not built / withdrawn / not found / no
@@ -189,6 +202,35 @@ pub(crate) async fn fetch_verified_archive(
     })
 }
 
+/// Ask the service which artifacts it serves for `uuid` besides the
+/// archive, without downloading the archive: the package reference names
+/// them. For a backend that vendors only those (a gem's per-platform
+/// prebuilds), so a patch that has none costs one request and no download.
+pub(crate) async fn fetch_served_artifacts(
+    cfg: &VendorServiceConfig,
+    uuid: &str,
+) -> ServiceArtifact<ServedArtifacts> {
+    let Some(client) = cfg.client.as_ref() else {
+        return ServiceArtifact::Unavailable("vendor service not configured".to_string());
+    };
+    let outcome = client
+        .fetch_vendor_reference(
+            uuid,
+            cfg.use_public_proxy,
+            cfg.vendor_url.as_deref(),
+            cfg.patch_server_url.as_deref(),
+        )
+        .await;
+    match outcome {
+        VendorServiceOutcome::Ready(artifacts) => {
+            ServiceArtifact::Ready(ServedArtifacts(artifacts))
+        }
+        VendorServiceOutcome::Pending => ServiceArtifact::Pending,
+        VendorServiceOutcome::Unavailable(reason) => ServiceArtifact::Unavailable(reason),
+        VendorServiceOutcome::Failed(err) => ServiceArtifact::Failed(err.to_string()),
+    }
+}
+
 /// Move the tree the download plan pre-staged from `archive`'s bytes (see
 /// [`crate::vendor::prestage`]) into `stage`, the backend's stage for
 /// `copy_dir`, where the backend would otherwise extract them. `false` —
@@ -244,12 +286,12 @@ impl ServicePolicy<'_> {
     }
 
     /// `noun` names the artifact kind; `subject` identifies it in error messages.
-    pub(crate) fn settle(
+    pub(crate) fn settle<T>(
         &self,
-        artifact: ServiceArtifact,
+        artifact: ServiceArtifact<T>,
         noun: &str,
         subject: &str,
-    ) -> Result<VerifiedArchive, Box<VendorOutcome>> {
+    ) -> Result<T, Box<VendorOutcome>> {
         match artifact {
             ServiceArtifact::Ready(archive) => Ok(archive),
             ServiceArtifact::IntegrityMismatch(reason) => Err(self.hard(
@@ -346,11 +388,11 @@ pub(crate) async fn fetch_verified_secondary(
 /// spells.
 pub(crate) async fn fetch_verified_platform_secondary(
     cfg: &VendorServiceConfig,
-    archive: &VerifiedArchive,
+    served: &ServedArtifacts,
     kind: &str,
     platform: &str,
 ) -> SecondaryArtifactResult {
-    fetch_verified_artifact(cfg, archive.platform_secondary(kind, platform)).await
+    fetch_verified_artifact(cfg, served.platform(kind, platform)).await
 }
 
 /// Download `artifact` and verify the bytes against its own sha512 SRI;

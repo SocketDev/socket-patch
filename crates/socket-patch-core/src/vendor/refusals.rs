@@ -198,11 +198,11 @@ async fn maven_refusals(
     .unwrap_or_default()
 }
 
-/// The gem candidates whose version `Gemfile.lock` doesn't resolve
-/// ([`gem::gem_version_not_locked_refusals`]), installed or not, and the
-/// ones it locks both as platform gems and for the ruby platform
-/// ([`gem::gem_platform_lock_refusals`]): the backend refuses either before
-/// it asks the patch service for anything.
+/// The gem candidates the backend refuses from `Gemfile.lock` alone
+/// ([`gem::gem_lock_refusals`]), installed or not: a version the lock
+/// doesn't resolve, and a gem it locks as platform gems in a way that
+/// cannot be vendored. The backend refuses either before it asks the patch
+/// service for anything.
 async fn gem_refusals(
     project_root: &Path,
     candidates: &[(&str, &str)],
@@ -215,9 +215,7 @@ async fn gem_refusals(
     if gems.is_empty() {
         return Vec::new();
     }
-    let mut refusals = gem::gem_version_not_locked_refusals(project_root, &gems).await;
-    refusals.extend(gem::gem_platform_lock_refusals(project_root, &gems).await);
-    refusals
+    gem::gem_lock_refusals(project_root, &gems).await
 }
 
 fn refuse(out: &mut VendorRefusals, purl: &str, code: &'static str, detail: &str) {

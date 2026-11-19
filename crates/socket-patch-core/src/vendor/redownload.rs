@@ -399,6 +399,16 @@ pub async fn restore(
                 .map_err(|e| e.to_string())?;
         }
     }
+    // Likewise a gem vendored as platform gems: only the artifact dir was
+    // swapped in from the stage, and without the uuid dir's own metadata a
+    // `*.so` / `*.bundle` rule drops the prebuilt binaries from the commit.
+    if entry.ecosystem == "gem" && !entry.gem_platforms.is_empty() {
+        if let Some(rel) = super::path::vendor_uuid_dir_rel("gem", &entry.uuid) {
+            super::gem::restore_uuid_metadata(&root.join(rel))
+                .await
+                .map_err(|e| format!("cannot restore the vendored dir's git metadata: {e}"))?;
+        }
+    }
     Ok(warnings)
 }
 

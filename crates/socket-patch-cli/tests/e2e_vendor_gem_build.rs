@@ -2559,12 +2559,18 @@ end
 File.write("platforms", platforms.join("\n"))
 "##;
 
-/// A patch service answering for [`UUID`] the way the wire contract of gem
-/// prebuilds has it: the ruby gem as the `tarball` (with its stub), and a
-/// `gem-platform` gem + `gem-platform-stub-gemspec` for each of
-/// `prebuilds`, each naming its `platform`. The URLs name the production
-/// host, so the run reaches them only through `--patch-server-url`.
-async fn platform_patch_service(service: &Path, purl: &str, prebuilds: &[String]) -> MockServer {
+/// A patch service answering for the patch `uuid` the way the wire
+/// contract of gem prebuilds has it: the ruby gem as the `tarball` (with
+/// its stub), and a `gem-platform` gem + `gem-platform-stub-gemspec` for
+/// each of `prebuilds`, each naming its `platform`. The URLs name the
+/// production host, so the run reaches them only through
+/// `--patch-server-url`.
+async fn platform_patch_service(
+    service: &Path,
+    purl: &str,
+    uuid: &str,
+    prebuilds: &[String],
+) -> MockServer {
     use base64::Engine as _;
     use sha2::{Digest as _, Sha512};
     let server = MockServer::start().await;
@@ -2588,7 +2594,7 @@ async fn platform_patch_service(service: &Path, purl: &str, prebuilds: &[String]
     let mut artifacts = Vec::new();
     for (kind, platform, file) in served {
         let bytes = std::fs::read(service.join(&file)).unwrap();
-        let route = format!("/patch/gem/{PLAT}/{PLAT_VERSION}/grant-token/{UUID}/{file}");
+        let route = format!("/patch/gem/{PLAT}/{PLAT_VERSION}/grant-token/{uuid}/{file}");
         let mut artifact = serde_json::json!({
             "kind": kind,
             "url": format!("https://patch.socket.dev{route}"),
@@ -2612,7 +2618,7 @@ async fn platform_patch_service(service: &Path, purl: &str, prebuilds: &[String]
     Mock::given(method("POST"))
         .and(path_regex(r"/(patch|patches)/package$"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "results": { UUID: {
+            "results": { uuid: {
                 "status": "granted",
                 "purl": purl,
                 "url": artifacts[0]["url"],
@@ -2622,6 +2628,21 @@ async fn platform_patch_service(service: &Path, purl: &str, prebuilds: &[String]
         .mount(&server)
         .await;
     server
+}
+
+/// A second patch of the fixture gem, published after [`UUID`].
+const UUID_NEXT: &str = "4d5e6f7a-8b9c-4b2c-9d3e-123456789abc";
+
+/// The artifacts `server` has been asked to serve, by file name.
+async fn artifact_downloads(server: &MockServer) -> Vec<String> {
+    server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter(|r| r.url.path().starts_with("/patch/gem/"))
+        .filter_map(|r| r.url.path().rsplit('/').next().map(str::to_string))
+        .collect()
 }
 
 /// How many grants and artifact downloads `server` has answered.
@@ -2644,8 +2665,9 @@ async fn service_requests(server: &MockServer) -> usize {
 ///   1. the REAL bundler resolves the fixture gem from a local source that
 ///      publishes it as platform gems only, and locks this machine's
 ///      platform and two foreign ones;
-///   2. a service that lacks one platform's prebuild refuses the gem by
-///      that platform's name, with nothing written;
+///   2. while the service lacks one platform's prebuild the gem is
+///      skipped, by that platform's name: the run does not fail, downloads
+///      no gem and writes nothing;
 ///   3. with every prebuild served, `vendor` unpacks one tree per platform
 ///      (each with its stub gemspec), moves every platform block into one
 ///      `PATH` section and wires the Gemfile;
@@ -2655,7 +2677,9 @@ async fn service_requests(server: &MockServer) -> usize {
 ///      the patch service — installs frozen with a byte-stable lock, loads
 ///      the PATCHED file from the tree of the running platform, and an
 ///      unfrozen install and `bundle lock` regenerate the same lock;
-///   6. a second `vendor` run changes nothing and asks the service nothing;
+///   6. a second `vendor` run changes nothing and asks the service nothing,
+///      and a newer patch whose prebuild for one platform is not built yet
+///      keeps the vendored one;
 ///   7. `vendor --revert` restores the Gemfile and the lock byte for byte
 ///      (the registry CHECKSUMS tokens included) and removes the trees.
 ///
@@ -2801,25 +2825,35 @@ async fn platform_gems_capstone(bundler: &bundler_e2e::Bundler, declared: &str) 
         )
     };
 
-    // 2. One locked platform without a prebuild: refused, by name, with
-    //    nothing written.
-    let partial = platform_patch_service(&fixture.join("service"), &purl, &platforms[..2]).await;
+    // 2. One locked platform without a prebuild (the service lists one
+    //    only once it is built): the gem is skipped, by name, the run does
+    //    not fail, no gem is downloaded and nothing is written.
+    let partial =
+        platform_patch_service(&fixture.join("service"), &purl, UUID, &platforms[..2]).await;
     let (code, stdout, stderr) = vendor(&partial);
-    assert_ne!(
+    assert_eq!(
         code, 0,
-        "vendor must not succeed without every prebuild.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        "a prebuild that is not built yet is no failure.\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
     let env = parse_json_envelope(&stdout);
     assert_eq!(env["summary"]["applied"], 0, "nothing vendored: {env}");
-    let refused = env["events"]
+    assert_eq!(env["summary"]["failed"], 0, "and nothing failed: {env}");
+    let skipped = env["events"]
         .as_array()
         .unwrap()
         .iter()
-        .find(|e| e["errorCode"] == "platform_gem_unsupported")
-        .unwrap_or_else(|| panic!("a platform_gem_unsupported event: {env}"));
+        .find(|e| e["errorCode"] == "vendor_prebuilt_platform_pending")
+        .unwrap_or_else(|| panic!("a vendor_prebuilt_platform_pending event: {env}"));
+    assert_eq!(skipped["action"], "skipped", "{skipped}");
+    let said = skipped.to_string();
     assert!(
-        refused.to_string().contains(&format!("`{}`", platforms[2])),
-        "the refusal names the platform with no prebuild: {refused}"
+        said.contains(&format!("`{PLAT}`")) && said.contains(&format!("`{}`", platforms[2])),
+        "the skip names the gem and the platform with no prebuild: {skipped}"
+    );
+    assert_eq!(
+        artifact_downloads(&partial).await,
+        Vec::<String>::new(),
+        "the package reference says what is built: nothing is downloaded"
     );
     assert_eq!(std::fs::read(&gemfile_path).unwrap(), gemfile_before);
     assert_eq!(std::fs::read(&lock_path).unwrap(), lock_before);
@@ -2830,7 +2864,7 @@ async fn platform_gems_capstone(bundler: &bundler_e2e::Bundler, declared: &str) 
     drop(partial);
 
     // 3. Every prebuild served: vendor.
-    let server = platform_patch_service(&fixture.join("service"), &purl, &platforms).await;
+    let server = platform_patch_service(&fixture.join("service"), &purl, UUID, &platforms).await;
     let (code, stdout, stderr) = vendor(&server);
     assert_eq!(
         code, 0,
@@ -2840,6 +2874,16 @@ async fn platform_gems_capstone(bundler: &bundler_e2e::Bundler, declared: &str) 
     assert_eq!(env["status"], "success", "envelope: {env}");
     assert_eq!(env["summary"]["applied"], 1, "one package vendored: {env}");
     assert_eq!(env["summary"]["failed"], 0, "no failures: {env}");
+    // The prebuilds and their stubs are all that is downloaded: the ruby
+    // gem the same reference names is not.
+    let mut downloaded = artifact_downloads(&server).await;
+    downloaded.sort();
+    let mut prebuilds: Vec<String> = platforms
+        .iter()
+        .flat_map(|p| ["gem", "gemspec"].map(|ext| format!("{PLAT}-{PLAT_VERSION}-{p}.{ext}")))
+        .collect();
+    prebuilds.sort();
+    assert_eq!(downloaded, prebuilds);
 
     // One prebuild tree per platform, each with its own stub gemspec.
     let copy_rel = format!(".socket/vendor/gem/{UUID}/{PLAT}-{PLAT_VERSION}");
@@ -3096,6 +3140,51 @@ async fn platform_gems_capstone(bundler: &bundler_e2e::Bundler, declared: &str) 
         served_before,
         "an in-sync re-run downloads nothing"
     );
+
+    // A newer patch of the gem whose prebuild for one platform is not
+    // built yet: the vendored patch stays in force, and the run says so
+    // and does not fail.
+    let manifest_path = proj.join(".socket/manifest.json");
+    let manifest = std::fs::read_to_string(&manifest_path).unwrap();
+    std::fs::write(&manifest_path, manifest.replace(UUID, UUID_NEXT)).unwrap();
+    let update =
+        platform_patch_service(&fixture.join("service"), &purl, UUID_NEXT, &platforms[..2]).await;
+    let (code, stdout, stderr) = vendor(&update);
+    assert_eq!(
+        code, 0,
+        "an update that is not built yet is no failure.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    let env3 = parse_json_envelope(&stdout);
+    assert_eq!(env3["summary"]["failed"], 0, "nothing failed: {env3}");
+    let kept = env3["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["errorCode"] == "vendor_prebuilt_platform_pending")
+        .unwrap_or_else(|| panic!("a vendor_prebuilt_platform_pending event: {env3}"));
+    assert_eq!(kept["action"], "skipped", "{kept}");
+    let said = kept.to_string();
+    assert!(
+        said.contains(&format!("kept the vendored patch {UUID}"))
+            && said.contains(&format!("`{}`", platforms[2]))
+            && said.contains(UUID_NEXT),
+        "the skip names the kept patch, the new one and the platform: {kept}"
+    );
+    assert_eq!(std::fs::read(&gemfile_path).unwrap(), gemfile_wired);
+    assert_eq!(std::fs::read(&lock_path).unwrap(), lock_wired);
+    assert_eq!(
+        std::fs::read(proj.join(".socket/vendor/state.json")).unwrap(),
+        state_wired
+    );
+    assert!(
+        !proj
+            .join(format!(".socket/vendor/gem/{UUID_NEXT}"))
+            .exists(),
+        "nothing of the unbuilt patch is written"
+    );
+    assert_eq!(artifact_downloads(&update).await, Vec::<String>::new());
+    drop(update);
+    std::fs::write(&manifest_path, manifest).unwrap();
 
     // 7. Revert: both files byte for byte, every tree gone.
     let (code, stdout, stderr) = run_socket(
