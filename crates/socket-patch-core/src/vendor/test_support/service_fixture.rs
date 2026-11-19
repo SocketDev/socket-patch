@@ -112,6 +112,24 @@ impl Fixture {
 
 pub type Secondary = Vec<(&'static str, String, Vec<u8>)>;
 
+/// Every file member of a jar, whatever its size: a fixture jar may be past
+/// the wheel-sized caps of `read_zip_bytes_to_map`.
+fn jar_members(jar: &[u8]) -> Result<BTreeMap<String, Vec<u8>>, String> {
+    use std::io::Read as _;
+    let mut zip = zip::ZipArchive::new(std::io::Cursor::new(jar)).map_err(|e| e.to_string())?;
+    let mut members = BTreeMap::new();
+    for i in 0..zip.len() {
+        let mut entry = zip.by_index(i).map_err(|e| e.to_string())?;
+        if entry.is_dir() {
+            continue;
+        }
+        let mut bytes = Vec::new();
+        entry.read_to_end(&mut bytes).map_err(|e| e.to_string())?;
+        members.insert(entry.name().to_string(), bytes);
+    }
+    Ok(members)
+}
+
 pub async fn archive(
     purl: &str,
     dir: &Path,
@@ -127,7 +145,7 @@ pub async fn archive(
             crate::utils::fs::read_regular_to_bytes(&dir.join(format!("{artifact}-{version}.jar")))
                 .await
                 .map_err(|e| e.to_string())?;
-        members.extend(crate::vendor::verify::read_zip_bytes_to_map(&bytes)?);
+        members.extend(jar_members(&bytes)?);
     } else if let Some((name, version)) = parse_nuget_purl(purl) {
         let bytes = crate::utils::fs::read_regular_to_bytes(&dir.join(format!(
             "{}.{}.nupkg",

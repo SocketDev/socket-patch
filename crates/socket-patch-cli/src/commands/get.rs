@@ -3466,6 +3466,36 @@ mod tests {
         assert!(env.error.is_none());
     }
 
+    /// An incomplete patch (its files written, its compiled part not in
+    /// effect) reaches the caller as a failure of the nested apply under
+    /// its own code: the recorded patch is `failed` with that code and the
+    /// apply's words, never `applied`, and the run is a partial failure.
+    #[test]
+    fn record_apply_outcome_reports_an_incomplete_patch_under_its_own_code() {
+        let mut env = Envelope::new(JsonCommand::Get);
+        let purl = "pkg:gem/nokogiri@1.18.10?platform=ruby";
+        let report = report_with(
+            vec![failure(
+                purl,
+                "native_extension_not_rebuilt",
+                "the patch's files were written, but not built",
+            )],
+            &[],
+        );
+        let recs = recorded(&[(purl, "un")]);
+        record_apply_outcome(&mut env, &recs, Some(&report), |_| None);
+        assert_eq!(
+            outcomes(&env),
+            vec![o("failed", purl, "un", "native_extension_not_rebuilt")]
+        );
+        assert_eq!(
+            env.events[0].error.as_deref(),
+            Some("the patch's files were written, but not built")
+        );
+        assert_eq!(env.status, Status::PartialFailure);
+        assert_eq!(env.summary.applied, 0);
+    }
+
     #[test]
     fn record_apply_outcome_matches_percent_encoded_and_base_purl_keys() {
         let mut env = Envelope::new(JsonCommand::Get);

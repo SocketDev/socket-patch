@@ -144,7 +144,8 @@ impl MavenSelection {
     }
 
     /// The selection of the project at `project_root` over the Maven local
-    /// repository this process resolves against.
+    /// repository its builds resolve against (the environment's, or the one
+    /// its `.mvn/maven.config` names).
     pub fn for_project(project_root: &Path) -> Self {
         Self::for_project_in(project_root, None)
     }
@@ -154,7 +155,7 @@ impl MavenSelection {
     pub fn for_project_in(project_root: &Path, repo: Option<&Path>) -> Self {
         let repo = match repo {
             Some(repo) => Some(repo.to_path_buf()),
-            None => super::maven_crawler::JvmEnv::from_process().m2_repo,
+            None => super::maven_crawler::JvmEnv::for_project(project_root).m2_repo,
         };
         match repo {
             Some(repo) => Self::of(project_root, &repo),

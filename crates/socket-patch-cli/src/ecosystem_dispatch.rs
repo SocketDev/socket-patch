@@ -1368,14 +1368,15 @@ impl JvmScope {
     pub(crate) async fn of(common: &GlobalArgs) -> Self {
         use socket_patch_core::crawlers::gradle_cache;
         use socket_patch_core::crawlers::maven_crawler::{m2_gate, JvmEnv};
-        let env = JvmEnv::from_process();
         if common.is_global() {
             return Self {
-                env,
+                env: JvmEnv::from_process(),
                 gate: None,
                 verification_metadata: None,
             };
         }
+        // A project run: its `.mvn/maven.config` can name the repository.
+        let env = JvmEnv::for_project(&common.cwd);
         let cwd = common.cwd.clone();
         let probe_env = env.clone();
         let probe = move || {
