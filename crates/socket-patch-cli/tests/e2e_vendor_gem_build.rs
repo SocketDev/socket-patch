@@ -226,7 +226,7 @@ struct Vendored<'a> {
     pristine_lock: &'a [u8],
 }
 
-/// Manifest-less VEX over a vendored checkout, the depscan shape:
+/// Manifest-less VEX over a vendored checkout, the GitHub-app shape:
 ///
 ///   1. `.socket/manifest.json` deleted: `vex --offline` attests
 ///      `(vendored)` from the lock's `PATH` wiring + the vendor ledger's

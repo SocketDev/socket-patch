@@ -15,7 +15,7 @@ use socket_patch_core::manifest::schema::PatchRecord;
 use socket_patch_core::patch::gem_ext::RubyEnv;
 use socket_patch_core::patch::gem_refresh::{refresh, Source, Target, Wanted};
 
-use crate::args::GlobalArgs;
+use crate::args::{GlobalArgs, RunApiClient};
 use crate::ui::plural;
 
 /// What the lock now pins: the hosted patch, or the upstream registry
@@ -657,18 +657,24 @@ pub(crate) fn report(
         }
     }
     // A gem whose copy could not be checked is not known to be stale: it
-    // is counted apart from the ones that are.
-    let unchecked: BTreeSet<&str> = local
-        .iter()
-        .filter(|(why, _)| matches!(why, Why::Unverified(_)))
-        .flat_map(|(_, gems)| gems.iter().map(|gem| gem.purl.as_str()))
+    // is counted apart from the ones that are. A gem with a copy of each
+    // kind (two gem homes) is known to be stale.
+    let purls_where = |unverified: bool| {
+        local
+            .iter()
+            .filter(move |(why, _)| matches!(why, Why::Unverified(_)) == unverified)
+            .flat_map(|(_, gems)| gems.iter().map(|gem| gem.purl.as_str()))
+    };
+    let known_stale: BTreeSet<&str> = shared
+        .values()
+        .flatten()
+        .copied()
+        .chain(purls_where(false))
         .collect();
-    let count = stale
-        .iter()
-        .map(|gem| gem.purl.as_str())
-        .filter(|purl| !unchecked.contains(purl))
-        .collect::<BTreeSet<_>>()
-        .len();
+    let unchecked: BTreeSet<&str> = purls_where(true)
+        .filter(|purl| !known_stale.contains(purl))
+        .collect();
+    let count = known_stale.len();
     let switch = match direction {
         Direction::Patched => "the switch to hosted patches",
         Direction::Upstream => "the switch back to the upstream registry",
@@ -768,13 +774,17 @@ async fn installed_with_archives(common: &GlobalArgs, purls: &[String]) -> Vec<I
     use socket_patch_core::crawlers::types::CrawlerOptions;
     use socket_patch_core::crawlers::RubyCrawler;
 
+    let mut out = Vec::new();
+    // No gem to look for: no gem home is discovered.
+    if purls.is_empty() {
+        return out;
+    }
     let crawler = RubyCrawler::new();
     let options = CrawlerOptions {
         cwd: common.cwd.clone(),
         global: common.global,
         global_prefix: common.global_prefix.clone(),
     };
-    let mut out = Vec::new();
     for home in crawler.bundler_install_homes(&options).await {
         let found = crawler.find_each_by_purl(&home.gems_dir, purls).await;
         for (purl, pkg) in purls.iter().zip(found) {
@@ -934,18 +944,178 @@ pub(crate) struct RestoreRefresh {
     pub(crate) refreshed_installs: BTreeSet<String>,
 }
 
-/// After a hosted unwind restored the gems `restored` to their upstream
+/// After a hosted unwind restored the gems of `pins` to their upstream
 /// entries: bring their installed copies and cached archives back to the
 /// upstream gem, and report what is still the patched build. `staged` is
 /// the restore's staged text (the restored lock). Only installed copies
 /// are reported as still stale here: the restore itself names an archive
 /// left in Bundler's cache dir (`upstream_gem_stale_cache`).
+///
+/// `pins` is the patch uuids each restored gem was pinned to, by purl. An
+/// installed copy whose gem home keeps no archive of it (a pruned `cache/`:
+/// Bundler 4.1's `prune`, a slim image, `gem cleanup`) is judged by those
+/// patches' records, as the hosted scan judges it (#2092): see
+/// [`PinJudge`]. `api` is the run's API client, built only if such a copy
+/// needs a record.
 pub(crate) async fn after_restore(
     common: &GlobalArgs,
-    restored: &[String],
     staged: &BTreeMap<String, Option<String>>,
+    pins: &BTreeMap<String, Vec<String>>,
+    api: &RunApiClient,
 ) -> RestoreRefresh {
-    refresh_restored(common, restored, staged, &BTreeMap::new(), Scope::All).await
+    let judge = PinJudge {
+        common,
+        api,
+        pins,
+        fetched: BTreeMap::new(),
+        unreachable: false,
+    };
+    let restored: Vec<String> = pins.keys().cloned().collect();
+    refresh_restored(
+        common,
+        &restored,
+        staged,
+        &BTreeMap::new(),
+        Some(judge),
+        Scope::All,
+    )
+    .await
+}
+
+/// The patch record a `/patches/view/<uuid>` response gives for `uuid`;
+/// `None` when it has none to judge by (no such patch, another patch's
+/// record, or one listing no files).
+pub(crate) fn view_record(
+    view: Option<socket_patch_core::api::types::PatchResponse>,
+    uuid: &str,
+) -> Option<PatchRecord> {
+    view.map(|view| socket_patch_core::manifest::records::record_from_patch_response(&view).1)
+        .filter(|record| record.uuid == uuid && !record.files.is_empty())
+}
+
+/// Why a hosted unwind has no patch record to judge an installed copy by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NoRecord {
+    /// `--offline`: nothing is fetched.
+    Offline,
+    /// The fetch failed, or was not tried after one the API did not answer.
+    Unfetched,
+    /// The API answered, with no record of that patch to judge by (a
+    /// withdrawn patch, one listing no files).
+    NotServed,
+}
+
+/// What judges the installed copies a hosted unwind's archive check cannot
+/// (#2092): those whose gem home keeps no readable `<home>/cache/<leaf>.gem`.
+/// Nothing else tells such a copy from the patched build the hosted scan
+/// may have replaced it with, and no later `bundle install` replaces it.
+/// Each is judged on its own files, by the record of a patch its gem was
+/// pinned to (`pins`): a copy whose files all hash to a record's
+/// `afterHash` values holds that patch.
+struct PinJudge<'a> {
+    common: &'a GlobalArgs,
+    api: &'a RunApiClient,
+    pins: &'a BTreeMap<String, Vec<String>>,
+    /// The record fetched for each uuid asked for so far, or why there is
+    /// none.
+    fetched: BTreeMap<String, Result<PatchRecord, NoRecord>>,
+    /// A request got no answer from the API (a network error, a timeout):
+    /// no other is sent, so an API out of reach costs one timeout, not one
+    /// per gem.
+    unreachable: bool,
+}
+
+impl PinJudge<'_> {
+    /// `uuid`'s patch record, fetched at most once.
+    async fn record(&mut self, uuid: &str) -> Result<&PatchRecord, NoRecord> {
+        use socket_patch_core::api::client::ApiError;
+        if !self.fetched.contains_key(uuid) {
+            let record = if self.common.offline {
+                Err(NoRecord::Offline)
+            } else if self.unreachable {
+                Err(NoRecord::Unfetched)
+            } else {
+                let api = self.common.api_client(self.api).await;
+                match api.fetch_patch(uuid).await {
+                    Ok(view) => view_record(view, uuid).ok_or(NoRecord::NotServed),
+                    Err(e) => {
+                        self.unreachable = matches!(e, ApiError::Network(_));
+                        Err(NoRecord::Unfetched)
+                    }
+                }
+            };
+            self.fetched.insert(uuid.to_string(), record);
+        }
+        match self.fetched.get(uuid) {
+            Some(Ok(record)) => Ok(record),
+            Some(Err(why)) => Err(*why),
+            None => Err(NoRecord::Unfetched),
+        }
+    }
+
+    /// The installed copies of `purls` with no readable archive in their
+    /// gem home: those that hold a pinned patch (stale), and those nothing
+    /// could judge, each with why (the reason completes "could not be
+    /// checked against the upstream gem (…)"). A copy is neither when a
+    /// record judged it and found files that are not its patch's, and no
+    /// other pin of its gem is left unjudged. A run with no such copy
+    /// fetches nothing.
+    async fn probe(&mut self, purls: &[String]) -> (Vec<StaleGem>, Vec<(StaleGem, String)>) {
+        use socket_patch_core::vendor::file_sha256_hex;
+        use socket_patch_core::vex::verify::judge_installed_record;
+
+        let (mut stale, mut unjudged) = (Vec::new(), Vec::new());
+        for copy in installed_with_archives(self.common, purls).await {
+            // The same test as `stale_after_restore`'s: an archive it can
+            // hash is its to judge the copy by.
+            if file_sha256_hex(&copy.archive).await.is_some() {
+                continue;
+            }
+            // Why the copy is not known to be free of a pinned patch: a pin
+            // with no record, or a record whose files could not be read.
+            let (mut patched, mut open) = (false, None);
+            for uuid in self.pins.get(&copy.purl).into_iter().flatten() {
+                match self.record(uuid).await {
+                    Ok(record) => {
+                        let judged = judge_installed_record(&copy.dir, record).await;
+                        if judged.patched {
+                            patched = true;
+                            break;
+                        }
+                        if !judged.stale_evidence {
+                            open.get_or_insert(
+                                "the files its patch record lists could not be read",
+                            );
+                        }
+                    }
+                    Err(why) => {
+                        open.get_or_insert(match why {
+                            NoRecord::Offline => {
+                                "`--offline` is set, so its patch record was not fetched"
+                            }
+                            NoRecord::Unfetched => "its patch record could not be fetched",
+                            NoRecord::NotServed => "the patch API has no record of its patch",
+                        });
+                    }
+                }
+            }
+            let gem = StaleGem {
+                purl: copy.purl,
+                leaf: copy.leaf,
+                installed: Some((copy.dir, copy.project_local)),
+                cache_archive: None,
+                in_place: false,
+            };
+            match (patched, open) {
+                (true, _) => stale.push(gem),
+                (false, Some(why)) => {
+                    unjudged.push((gem, format!("its gem home has no archive of it and {why}")))
+                }
+                (false, None) => {}
+            }
+        }
+        (stale, unjudged)
+    }
 }
 
 /// After a wet vendored unwind put the gems `unwound` back on their
@@ -985,6 +1155,7 @@ pub(crate) async fn after_vendored_unwind(
         &installed,
         &BTreeMap::new(),
         records,
+        None,
         Scope::Installed,
     )
     .await
@@ -995,6 +1166,7 @@ async fn refresh_restored(
     restored: &[String],
     staged: &BTreeMap<String, Option<String>>,
     records: &BTreeMap<String, PatchRecord>,
+    mut pin_judge: Option<PinJudge<'_>>,
     scope: Scope,
 ) -> RestoreRefresh {
     use socket_patch_core::patch::redirect::upstream::{
@@ -1016,6 +1188,10 @@ async fn refresh_restored(
     // error, under a lock without `CHECKSUMS`): it is then reported, not
     // refreshed.
     let mut judged: BTreeMap<String, PatchRecord> = BTreeMap::new();
+    // The gems a hosted unwind's [`PinJudge`] covers. Each is back on its
+    // upstream entry, whatever remote that is and whether or not anything
+    // proves the upstream sha256: the restore that ran says so.
+    let mut pinned: Vec<String> = Vec::new();
     for purl in restored
         .iter()
         .filter(|p| Ecosystem::from_purl(p) == Some(Ecosystem::Gem))
@@ -1037,6 +1213,9 @@ async fn refresh_restored(
                 if let Some(record) = records.get(purl) {
                     judged.insert(purl.clone(), record.clone());
                 }
+                if pin_judge.is_some() {
+                    pinned.push(purl.clone());
+                }
             }
             // (Only a gem the lock resolves from rubygems.org comes back
             // unverified, so the vendored unwind's rule holds for it too.)
@@ -1049,17 +1228,28 @@ async fn refresh_restored(
                         judged.insert(purl.clone(), record.clone());
                     }
                 }
+                if pin_judge.is_some() {
+                    pinned.push(purl.clone());
+                }
             }
         }
     }
-    if shas.is_empty() && unverified.is_empty() && judged.is_empty() {
+    if shas.is_empty() && unverified.is_empty() && judged.is_empty() && pinned.is_empty() {
         return RestoreRefresh::default();
     }
-    let stale = stale_after_restore(common, &shas, &judged, scope).await;
+    // A hosted unwind's copies with no archive to judge them by: stale
+    // when they hold a pinned patch, reported when no record says (#2092).
+    let (pin_stale, no_record) = match &mut pin_judge {
+        Some(judge) => judge.probe(&pinned).await,
+        None => Default::default(),
+    };
+    let pin_stale_any = !pin_stale.is_empty();
+    let mut stale = stale_after_restore(common, &shas, &judged, scope).await;
+    stale.extend(pin_stale);
     let unjudged = unverified.keys().map(|purl| (purl.clone(), None)).collect();
     let unchecked =
         stale_after_restore(common, &unjudged, &BTreeMap::new(), Scope::Installed).await;
-    if stale.is_empty() && unchecked.is_empty() {
+    if stale.is_empty() && unchecked.is_empty() && no_record.is_empty() {
         return RestoreRefresh::default();
     }
     let wanted = |gem: &StaleGem| {
@@ -1080,7 +1270,12 @@ async fn refresh_restored(
     };
     let mut pass = attempt(&stale, wanted, &source, &policy, direction).await;
     let still = if pass.changed(&policy) {
-        stale_after_restore(common, &shas, &judged, scope).await
+        let mut still = stale_after_restore(common, &shas, &judged, scope).await;
+        // (A copy no record judged is not one the pass could change.)
+        if let Some(judge) = pin_judge.as_mut().filter(|_| pin_stale_any) {
+            still.extend(judge.probe(&pinned).await.0);
+        }
+        still
     } else {
         stale
     };
@@ -1092,7 +1287,9 @@ async fn refresh_restored(
         .refreshed
         .iter()
         .filter(|(purl, target)| {
-            matches!(target, Target::Installed(_)) && !installed.iter().any(|gem| &gem.purl == purl)
+            matches!(target, Target::Installed(_))
+                && !installed.iter().any(|gem| &gem.purl == purl)
+                && !no_record.iter().any(|(gem, _)| &gem.purl == purl)
         })
         .map(|(purl, _)| purl.clone())
         .collect();
@@ -1100,6 +1297,12 @@ async fn refresh_restored(
         if let (Some((dir, _)), Some(why)) = (&gem.installed, unverified.get(&gem.purl)) {
             pass.left
                 .insert(dir.clone(), Why::Unverified(why.to_string()));
+            installed.push(gem);
+        }
+    }
+    for (gem, why) in no_record {
+        if let Some((dir, _)) = &gem.installed {
+            pass.left.insert(dir.clone(), Why::Unverified(why));
             installed.push(gem);
         }
     }
@@ -1300,6 +1503,171 @@ mod tests {
         };
         let out = report(Direction::Upstream, &all, &pass, &dry);
         assert!(out.summary.is_none());
+    }
+
+    /// A gem with a copy known to be stale in one gem home and a copy
+    /// that could not be checked in another is counted once, as stale:
+    /// the headline never drops a copy known to hold the patched build.
+    #[tokio::test]
+    async fn a_gem_with_a_stale_copy_and_an_unchecked_one_counts_as_stale() {
+        let tmp = tempfile::tempdir().unwrap();
+        let stale = installed("rack", &tmp.path().join("vendor/bundle/ruby/3.4.0"), true);
+        let unchecked = installed("rack", &tmp.path().join("gems/ruby/3.4.0"), true);
+        let policy = policy(tmp.path(), true, false, false);
+        let mut pass = attempt(
+            std::slice::from_ref(&stale),
+            unobtainable,
+            &Source::DiskOnly,
+            &policy,
+            Direction::Upstream,
+        )
+        .await;
+        let (dir, _) = unchecked.installed.clone().unwrap();
+        pass.left
+            .insert(dir, Why::Unverified("no record".to_string()));
+
+        let out = report(Direction::Upstream, &[stale, unchecked], &pass, &policy);
+        assert_eq!(out.warnings.len(), 2);
+        let summary = out.summary.expect("a summary");
+        assert_eq!(
+            summary.headline,
+            "1 gem still holds the patched build on disk after the switch back to the upstream \
+             registry"
+        );
+        assert_eq!(summary.bullets.len(), 2, "{:?}", summary.bullets);
+    }
+
+    /// #2092: [`PinJudge`] judges each installed copy with no archive in
+    /// its gem home on its own files, by the record of any patch its gem
+    /// was pinned to. A copy with its archive is the archive check's.
+    #[tokio::test]
+    async fn pin_judge_judges_an_archiveless_copy_by_any_of_its_pins() {
+        use socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes as git_sha;
+        use socket_patch_core::manifest::schema::PatchFileInfo;
+
+        const PURL: &str = "pkg:gem/rack@1.0.0";
+        let record = |uuid: &str, after: &str| PatchRecord {
+            uuid: uuid.to_string(),
+            exported_at: String::new(),
+            files: [(
+                "lib/rack.rb".to_string(),
+                PatchFileInfo {
+                    before_hash: git_sha(b"upstream\n"),
+                    after_hash: git_sha(after.as_bytes()),
+                },
+            )]
+            .into(),
+            vulnerabilities: Default::default(),
+            description: String::new(),
+            license: String::new(),
+            tier: String::new(),
+        };
+        // A project whose own gem home holds `rack 1.0.0` with `lib`.
+        let project = |lib: &str, archive: bool| {
+            let tmp = tempfile::tempdir().unwrap();
+            let home = tmp.path().join("vendor/bundle/ruby/3.4.0");
+            let gem = home.join("gems/rack-1.0.0");
+            std::fs::create_dir_all(gem.join("lib")).unwrap();
+            std::fs::write(gem.join("lib/rack.rb"), lib).unwrap();
+            std::fs::create_dir_all(home.join("specifications")).unwrap();
+            std::fs::write(
+                home.join("specifications/rack-1.0.0.gemspec"),
+                "Gem::Specification.new do |s|\n  s.name = \"rack\"\n  s.version = \"1.0.0\"\nend\n",
+            )
+            .unwrap();
+            if archive {
+                std::fs::create_dir_all(home.join("cache")).unwrap();
+                std::fs::write(home.join("cache/rack-1.0.0.gem"), b"archive").unwrap();
+            }
+            tmp
+        };
+        let pins = BTreeMap::from([(
+            PURL.to_string(),
+            vec!["uuid-a".to_string(), "uuid-b".to_string()],
+        )]);
+        // `--offline`: only the records seeded below are there to judge by.
+        let probe = |tmp: &tempfile::TempDir, fetched: Vec<(&str, Option<PatchRecord>)>| {
+            let fetched = fetched
+                .into_iter()
+                .map(|(uuid, record)| (uuid, record.ok_or(NoRecord::NotServed)));
+            let common = GlobalArgs {
+                cwd: tmp.path().to_path_buf(),
+                offline: true,
+                ..GlobalArgs::default()
+            };
+            let pins = pins.clone();
+            let fetched: BTreeMap<String, Result<PatchRecord, NoRecord>> = fetched
+                .map(|(uuid, record)| (uuid.to_string(), record))
+                .collect();
+            async move {
+                let api = RunApiClient::new();
+                let mut judge = PinJudge {
+                    common: &common,
+                    api: &api,
+                    pins: &pins,
+                    fetched,
+                    unreachable: false,
+                };
+                let (stale, unjudged) = judge.probe(&[PURL.to_string()]).await;
+                assert!(api.get().is_none(), "an offline probe builds no client");
+                (stale.len(), unjudged)
+            }
+        };
+        let (a, b) = (record("uuid-a", "patch a\n"), record("uuid-b", "patch b\n"));
+        let both = || vec![("uuid-a", Some(a.clone())), ("uuid-b", Some(b.clone()))];
+
+        // The copy holds the second pin's patch.
+        let tmp = project("patch b\n", false);
+        let (stale, unjudged) = probe(&tmp, both()).await;
+        assert_eq!((stale, unjudged.len()), (1, 0));
+
+        // Every record judged it, and it holds neither patch.
+        let tmp = project("upstream\n", false);
+        let (stale, unjudged) = probe(&tmp, both()).await;
+        assert_eq!((stale, unjudged.len()), (0, 0));
+
+        // One pin has no record, and the other's patch is not the copy's:
+        // nothing says the copy is not the first pin's patched build.
+        let (stale, unjudged) = probe(&tmp, vec![("uuid-b", Some(b.clone()))]).await;
+        assert_eq!((stale, unjudged.len()), (0, 1));
+        assert_eq!(
+            unjudged[0].1,
+            "its gem home has no archive of it and `--offline` is set, so its patch record \
+             was not fetched"
+        );
+
+        // A record that proves the patch settles it, whatever is missing.
+        let tmp = project("patch b\n", false);
+        let (stale, unjudged) = probe(&tmp, vec![("uuid-b", Some(b.clone()))]).await;
+        assert_eq!((stale, unjudged.len()), (1, 0));
+
+        // The API has no record of one pin's patch: the reason says so.
+        let tmp = project("upstream\n", false);
+        let (_, unjudged) = probe(&tmp, vec![("uuid-a", None), ("uuid-b", Some(b.clone()))]).await;
+        assert_eq!(
+            unjudged[0].1,
+            "its gem home has no archive of it and the patch API has no record of its patch"
+        );
+
+        // A record judges only files it could read: a copy without the file
+        // the record lists is not known to be free of the patch.
+        std::fs::remove_file(
+            tmp.path()
+                .join("vendor/bundle/ruby/3.4.0/gems/rack-1.0.0/lib/rack.rb"),
+        )
+        .unwrap();
+        let (stale, unjudged) = probe(&tmp, both()).await;
+        assert_eq!(stale, 0);
+        assert_eq!(
+            unjudged[0].1,
+            "its gem home has no archive of it and the files its patch record lists could not \
+             be read"
+        );
+
+        // A copy with its archive is judged by the archive, not here.
+        let tmp = project("patch b\n", true);
+        let (stale, unjudged) = probe(&tmp, both()).await;
+        assert_eq!((stale, unjudged.len()), (0, 0));
     }
 
     /// A project-local copy the refresh could not fix says why and names

@@ -85,6 +85,10 @@ use crate::formats::pnpm::sniff_lock_grammar;
 use crate::formats::pnpm::workspace;
 use crate::formats::pnpm::{vendored_npm_uuids, PnpmLockGrammar};
 
+/// The Rush layout of this backend: the same lock fragments, wired through
+/// Rush's own config files.
+pub(crate) mod rush;
+
 const PACKAGE_JSON: &str = "package.json";
 use crate::utils::line_endings::LineEndings;
 use crate::utils::pnpm_workspace::{governing_workspace_file, PNPM_WORKSPACE};

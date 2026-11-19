@@ -17,9 +17,8 @@
 //!   upstream reference, and a `preferred` mirror is tried before the hosted
 //!   url (then fails the sha1 pin, or falls back to `source`).
 //!
-//! Byte-for-byte twin of depscan's TS
-//! `app/src/patches/registry-rewrite/composer-lock-members.ts`; the shared
-//! goldens under `tests/fixtures/redirect/composer/` pin the parity.
+//! Byte-for-byte twin of the TypeScript scanner in Socket's backend; the
+//! shared goldens under `tests/fixtures/redirect/composer/` pin the parity.
 //! Every delimiter the scanner looks for is ASCII, so byte offsets are always
 //! char boundaries.
 

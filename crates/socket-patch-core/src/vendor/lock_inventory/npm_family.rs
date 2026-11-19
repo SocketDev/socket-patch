@@ -259,6 +259,9 @@ async fn inventory_npm_router_lock_raw_in(
             }
         }
         NpmLockFlavor::Vlt => inventory_vlt_in(view).await,
+        // The lock probe never yields the Rush layout (the vendor router
+        // does); Rush's locks are read by the caller either way.
+        NpmLockFlavor::RushPnpm => None,
     };
     Ok(raw.map(|raw| (flavor, guard_npm(raw))))
 }
